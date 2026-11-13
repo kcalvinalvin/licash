@@ -15,6 +15,8 @@ research implementation; it has not had a security review.
   statements). The crate docs map modules to paper sections.
 - `crates/licash-hub`: a hub's operations over its own SQLite ledger.
 - `crates/licash-api`: the hub's HTTP API bodies and error codes.
+- `crates/licash-wallet`: a wallet over its own SQLite file: hubs, notes,
+  payments made and taken, unlinking, and resuming after interruptions.
 - `crates/licash-groth16`: RISC Zero Groth16 receipt verification, used
   inside the holder's program and on the host.
 - `r0/`: the holder's and the hub's programs for the RISC Zero zkVM, and a
