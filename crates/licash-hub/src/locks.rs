@@ -211,29 +211,50 @@ impl Hub {
             let mut activated = Vec::new();
             for (txid, output, secret) in &found {
                 let lock = lock_hash(secret);
-                tx.execute(
+                let new = tx.execute(
                     "INSERT INTO activations (block, txid, output, hash, secret, height)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT DO NOTHING",
                     params![hash, txid, output, lock, secret, height],
                 )?;
-                let ids: Vec<[u8; 32]> = tx
-                    .prepare("SELECT id FROM locks WHERE hash = ?1 AND preimage IS NULL")?
-                    .query_map([lock], |r| r.get(0))?
+                tx.execute(
+                    "UPDATE locks SET preimage = ?2 WHERE hash = ?1 AND preimage IS NULL",
+                    params![lock, secret],
+                )?;
+                if new == 0 {
+                    continue;
+                }
+                // The locks it makes pay: a refunded one is owed twice.
+                let hit: Vec<([u8; 32], bool)> = tx
+                    .prepare(
+                        "SELECT l.id, l.settled IS 'refund' FROM locks l
+                         JOIN checkpoints c ON c.commitment = l.checkpoint
+                         WHERE l.hash = ?1 AND c.height < ?2 AND ?2 < l.expiry
+                           AND l.settled IS NOT 'pay'",
+                    )?
+                    .query_map(params![lock, height], |r| Ok((r.get(0)?, r.get(1)?)))?
                     .collect::<Result<_, _>>()?;
-                for id in ids {
-                    tx.execute(
-                        "UPDATE locks SET preimage = ?2 WHERE id = ?1",
-                        params![id, secret],
-                    )?;
+                for (id, refunded) in hit {
                     let proposal = hex::encode(id);
-                    notify(tx, &Notice::Activated { proposal, height })?;
-                    activated.push(id);
+                    notify(
+                        tx,
+                        &Notice::Activated {
+                            proposal,
+                            height,
+                            refunded,
+                        },
+                    )?;
+                    activated.push((id, refunded));
                 }
             }
             Ok(activated)
         })?;
-        for id in activated {
-            tracing::warn!(proposal = %hex::encode(id), height, "lock activated on Bitcoin");
+        for (id, refunded) in activated {
+            let proposal = hex::encode(id);
+            if refunded {
+                tracing::error!(%proposal, height, "a refunded lock was activated in time");
+            } else {
+                tracing::warn!(%proposal, height, "lock activated on Bitcoin");
+            }
         }
         Ok(())
     }
@@ -258,6 +279,7 @@ impl Hub {
             Ok(false)
         })?;
         if deep {
+            *self.synced_at.lock().unwrap_or_else(|e| e.into_inner()) = None;
             tracing::error!(height, "Bitcoin reorganized a checkpoint: the scan stops");
             return Err(Refusal::Block("a reorganization of a checkpoint").into());
         }
@@ -265,9 +287,13 @@ impl Hub {
         Ok(())
     }
 
-    /// The scan reached the chain's tip, as the operator's backend sees it.
-    pub fn synced(&self) {
-        *self.synced_at.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+    /// The operator's backend has its best chain's tip at `height`, block
+    /// `hash`: the scan is synced while it reached that tip, for at most
+    /// [`Timing::max_lag`], and not at all otherwise. Whether it reached it.
+    pub fn synced(&self, height: u32, hash: &[u8; 32]) -> Result<bool, Error> {
+        let reached = self.store.read(tip)? == Some((height, *hash));
+        *self.synced_at.lock().unwrap_or_else(|e| e.into_inner()) = reached.then(Instant::now);
+        Ok(reached)
     }
 
     fn is_synced(&self) -> bool {
@@ -293,9 +319,13 @@ impl Hub {
         if !matches!(signed.authorization(), Authorization::Plain) {
             return Err(Refusal::NotALock.into());
         }
+        let id = proposal.id();
+        // Admitted under whatever policy held then.
+        if let Some(row) = self.store.read(|c| self.row(c, &id))? {
+            return Ok(row.lock.certificate);
+        }
         let ys = signed.verify(keyset, notes)?;
         let charge = self.lock_charge(proposal)?;
-        let id = proposal.id();
         for (paid, due) in [
             (charge.pay, self.policy.lock.due(charge.amount)),
             (charge.refund, self.policy.refund.due(charge.amount)),
@@ -345,7 +375,9 @@ impl Hub {
     /// the refund branch returns to the hub, which issues nothing on it.
     /// The notes are backed by what the caller holds for the hash, such as
     /// an accepted HTLC, which it must keep until the lock is settled or
-    /// refunded. One own lock per hash: the same request gets it again.
+    /// refunded. One own lock per hash, ever: the same request gets it
+    /// again, settled or not, so that no retry backs a second payment with
+    /// what the caller holds.
     pub fn lock_own(
         &self,
         keyset: &[u8; 32],
@@ -382,7 +414,9 @@ impl Hub {
             let r = back.derive(&address, denom, Branch::Refund, i)?;
             refund.push(Output::from_derivation(&r)?);
         }
-        let amount = pay.iter().map(Output::denomination).sum();
+        let amount = pay
+            .iter()
+            .fold(0u64, |sum, o| sum.saturating_add(o.denomination()));
         let expiry = terms.expiry();
         let lock = TimedLock::new(terms.clone(), refund)?;
         let proposal = Proposal::new(keyset, &notes, ephemeral, pay.clone(), Some(lock))?;
@@ -459,10 +493,14 @@ impl Hub {
                 Some(Settled::Refund) => return Err(Refusal::Settled.into()),
                 None => {}
             }
-            if !hub_payee {
-                let in_time = synced && tip(tx)?.is_some_and(|(top, _)| top < terms.expiry());
-                if !in_time && !activated(tx, &terms, anchor)? {
+            if !hub_payee && !activated(tx, &terms, anchor)? {
+                let (top, _) = tip(tx)?.ok_or(Refusal::NoChain)?;
+                if top >= terms.expiry() {
                     return Err(Refusal::LockExpired.into());
+                }
+                // It may have expired on a chain the hub has not scanned.
+                if !synced {
+                    return Err(Refusal::Unsynced.into());
                 }
             }
             self.issue(tx, id, keyset, outputs, &issuances, &income)?;

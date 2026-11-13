@@ -167,6 +167,12 @@ impl Chain {
         self.height()
     }
 
+    /// Tell the hub the backend's tip is this chain's.
+    fn sync(&self, hub: &Hub) {
+        let tip = self.blocks.last().unwrap().block_hash().to_byte_array();
+        assert!(hub.synced(self.height(), &tip).unwrap());
+    }
+
     /// Drop the blocks from `height` on, for the hub too.
     fn reorg(&mut self, hub: &Hub, height: u32) {
         hub.rewind(height).unwrap();
@@ -202,7 +208,7 @@ fn setup(policy: Policy) -> (Files, Hub, Chain) {
     let mut chain = Chain::new();
     hub.add_checkpoint(&chain.checkpoint(0)).unwrap();
     chain.mine(&hub, 10);
-    hub.synced();
+    chain.sync(&hub);
     (files, hub, chain)
 }
 
@@ -438,8 +444,12 @@ fn a_hub_behind_the_chain_admits_no_lock_and_pays_no_third_party() {
         Refusal::Unsynced
     );
     // The lock may have expired on a chain the hub has not scanned.
-    assert_eq!(refused(hub.settle(&l.id(), &SECRET)), Refusal::LockExpired);
-    hub.synced();
+    assert_eq!(refused(hub.settle(&l.id(), &SECRET)), Refusal::Unsynced);
+    // The backend is ahead of the scan.
+    let ahead = hub.synced(chain.height() + 1, &[1; 32]).unwrap();
+    assert!(!ahead);
+    assert_eq!(refused(hub.settle(&l.id(), &SECRET)), Refusal::Unsynced);
+    chain.sync(&hub);
     hub.settle(&l.id(), &SECRET).unwrap();
 }
 
@@ -454,7 +464,15 @@ fn an_activation_in_time_pays_even_once_its_block_is_reorganized_away() {
     assert_eq!(hub.locked(&l.id()).unwrap().preimage, Some(SECRET));
     let activated = hub.events(0, 10).unwrap().pop().unwrap().notice();
     let proposal = hex::encode(l.id().as_bytes());
-    assert_eq!(activated, Some(Notice::Activated { proposal, height }));
+    let refunded = false;
+    assert_eq!(
+        activated,
+        Some(Notice::Activated {
+            proposal,
+            height,
+            refunded
+        })
+    );
     // The block leaves the best chain; the lock expires at depth on the new one.
     chain.reorg(&hub, height);
     chain.mine(&hub, expiry + 3 - chain.height());
@@ -548,7 +566,7 @@ fn admission_checks_the_terms_against_the_chain_and_the_timing() {
     };
     drop(hub);
     let hub = Hub::open(&files.seed, &files.db, deep).unwrap();
-    hub.synced();
+    chain.sync(&hub);
     let refusal = |terms: TimedTerms| {
         let l = standard(&files, &hub, terms);
         refused(hub.lock(&l.signed, &l.notes))
@@ -786,8 +804,12 @@ fn the_scan_extends_its_tip_from_checkpoints_that_are_buried_blocks_of_it() {
     assert_eq!(hub.checkpoint().unwrap().height(), 4);
 
     // A reorganization of a checkpoint is refused, and alerted once.
+    chain.sync(&hub);
     let deep = block("a reorganization of a checkpoint");
     assert_eq!(refused(hub.rewind(4)), deep);
+    // The scan stopped: the hub is not synced.
+    let l = standard(&files, &hub, terms(&hub, chain.height() + 5, 1));
+    assert_eq!(refused(hub.lock(&l.signed, &l.notes)), Refusal::Unsynced);
     assert_eq!(refused(hub.rewind(2)), deep);
     chain.reorg(&hub, 5);
     assert_eq!(hub.scanned().unwrap().unwrap().0, 4);
@@ -813,8 +835,98 @@ fn the_scan_extends_its_tip_from_checkpoints_that_are_buried_blocks_of_it() {
         Some(chain.blocks[5].block_hash().to_byte_array())
     );
     assert_eq!(hub.checkpoint().unwrap().height(), 4);
-    hub.synced();
+    chain.sync(&hub);
     let l = standard(&files, &hub, terms(&hub, 7, 1));
     let budget = Refusal::Timing("beyond the checkpoint's header budget");
     assert_eq!(refused(hub.lock(&l.signed, &l.notes)), budget);
+}
+
+#[test]
+fn locks_settlements_and_refunds_replay_after_a_restart() {
+    let (files, hub, mut chain) = setup(policy());
+    let (_, keyset) = issuer(&files);
+    let expiry = chain.height() + 5;
+    let paid = standard(&files, &hub, terms(&hub, expiry, 1));
+    let certificate = hub.lock(&paid.signed, &paid.notes).unwrap();
+    let settled = hub.settle(&paid.id(), &SECRET).unwrap();
+    let back = standard(&files, &hub, terms(&hub, expiry, 1));
+    hub.lock(&back.signed, &back.notes).unwrap();
+    let alice = owner(3).address();
+    let e = Ephemeral::random();
+    let d = e.derive(&alice, 2, Branch::Pay, 0).unwrap();
+    let own = vec![Output::from_derivation(&d).unwrap()];
+    let own_terms = || {
+        let checkpoint = hub.checkpoint().unwrap().commitment();
+        let hash = lock_hash(&[9; 32]);
+        TimedTerms::new(
+            ChainProfile::Core30DefaultRegtest,
+            checkpoint,
+            expiry,
+            1,
+            hash,
+        )
+        .unwrap()
+    };
+    let own_lock = hub
+        .lock_own(keyset.id(), e.public(), own.clone(), own_terms())
+        .unwrap();
+    let own_terms = own_terms();
+    chain.mine(&hub, expiry + 1 - chain.height());
+    let refunded = hub.refund(&back.id()).unwrap();
+
+    // Restarted under a dearer policy, behind the chain.
+    drop(hub);
+    let dearer = Policy {
+        lock: Fee { base: 5, ppm: 0 },
+        ..policy()
+    };
+    let hub = Hub::open(&files.seed, &files.db, dearer).unwrap();
+    let again = hub.lock(&paid.signed, &paid.notes).unwrap();
+    assert_eq!(again.to_bytes(), certificate.to_bytes());
+    let bytes = |issued: &[MintResponse]| -> Vec<Vec<u8>> {
+        issued.iter().map(MintResponse::to_bytes).collect()
+    };
+    let replayed = hub.settle(&paid.id(), &SECRET).unwrap();
+    assert_eq!(bytes(&replayed), bytes(&settled));
+    opened(&keyset, &replayed[..2], &paid.pay[..2]);
+    assert_eq!(bytes(&hub.refund(&back.id()).unwrap()), bytes(&refunded));
+    let same = hub
+        .lock_own(keyset.id(), e.public(), own, own_terms)
+        .unwrap();
+    assert_eq!(same.proposal.id(), own_lock.proposal.id());
+}
+
+#[test]
+fn a_refunded_lock_activated_in_time_after_a_reorganization_is_alerted() {
+    let (files, hub, mut chain) = setup(policy());
+    let expiry = chain.height() + 3;
+    let l = standard(&files, &hub, terms(&hub, expiry, 1));
+    hub.lock(&l.signed, &l.notes).unwrap();
+    chain.mine(&hub, expiry + 1 - chain.height());
+    // Activated after the expiry: no claim on the lock, no alert.
+    chain.activate(&hub, SECRET);
+    hub.refund(&l.id()).unwrap();
+    assert!(!kinds(&hub).contains(&"activated".to_owned()));
+    // A reorganization brings an activation before the expiry.
+    chain.reorg(&hub, expiry - 1);
+    let height = chain.activate(&hub, SECRET);
+    assert!(height < expiry);
+    let alert = hub.events(0, 100).unwrap().pop().unwrap().notice();
+    let proposal = hex::encode(l.id().as_bytes());
+    let refunded = true;
+    assert_eq!(
+        alert,
+        Some(Notice::Activated {
+            proposal,
+            height,
+            refunded
+        })
+    );
+    // The same block scanned again after a reorganization back alerts no more.
+    let block = chain.blocks.pop().unwrap();
+    hub.rewind(height).unwrap();
+    hub.observe(height, &block).unwrap();
+    let alerts = kinds(&hub).iter().filter(|k| *k == "activated").count();
+    assert_eq!(alerts, 1);
+    assert_eq!(refused(hub.settle(&l.id(), &SECRET)), Refusal::Settled);
 }

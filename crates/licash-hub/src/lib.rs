@@ -201,8 +201,14 @@ pub enum Notice {
         fee: u64,
         branch: Settled,
     },
-    /// The preimage of a lock was published on Bitcoin at `height`.
-    Activated { proposal: String, height: u32 },
+    /// The preimage of a lock was published on Bitcoin at `height`, in
+    /// time: the lock pays. If the hub `refunded` it already, after a
+    /// reorganization, it owes both branches.
+    Activated {
+        proposal: String,
+        height: u32,
+        refunded: bool,
+    },
     /// Bitcoin reorganized at `height`, at or below a checkpoint: the hub
     /// scans no more until its operator acts.
     Reorg { height: u32 },
