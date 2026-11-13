@@ -1,0 +1,23 @@
+# The hub service. Build from the repository root:
+#   docker build -f apps/hub/Dockerfile -t licash-hub .
+FROM rust:1-slim-trixie AS build
+WORKDIR /src
+COPY . .
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/src/apps/target \
+    cargo build --locked --release --manifest-path apps/Cargo.toml -p licash-hub-service \
+    && cp apps/target/release/licash-hub /usr/local/bin/licash-hub
+
+FROM debian:trixie-slim
+RUN useradd --system --uid 10001 --home-dir /data --shell /usr/sbin/nologin licash \
+    && mkdir -p /data && chown licash /data && chmod 700 /data
+COPY --from=build /usr/local/bin/licash-hub /usr/local/bin/licash-hub
+USER 10001
+ENV LICASH_HUB_DATA=/data LICASH_HUB_LISTEN=0.0.0.0:8338
+VOLUME /data
+EXPOSE 8338
+# Unhealthy once the hub halts (see the README).
+HEALTHCHECK --interval=30s --timeout=5s \
+    CMD ["bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/${LICASH_HUB_LISTEN##*:} && printf 'GET /health HTTP/1.0\\r\\n\\r\\n' >&3 && head -n1 <&3 | grep -q ' 200 '"]
+ENTRYPOINT ["licash-hub"]
+CMD ["run"]

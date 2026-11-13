@@ -1,0 +1,10 @@
+# Images build from the repository root, from the SDK crates and the
+# applications only.
+*
+!Cargo.toml
+!Cargo.lock
+!crates/licash
+!crates/licash-api
+!crates/licash-hub
+!apps
+**/target

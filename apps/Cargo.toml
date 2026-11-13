@@ -1,0 +1,24 @@
+# The applications on the Licash SDK, a workspace of their own so that
+# their runtime dependencies stay out of the SDK's.
+[workspace]
+resolver = "2"
+members = ["hub"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+licash = { path = "../crates/licash" }
+licash-api = { path = "../crates/licash-api" }
+licash-hub = { path = "../crates/licash-hub" }
+anyhow = "1"
+axum = "0.8"
+clap = { version = "4.6", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1.54", features = ["macros", "net", "rt-multi-thread", "signal"] }
+tower-http = { version = "0.7", features = ["trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
