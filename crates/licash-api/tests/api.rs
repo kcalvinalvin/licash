@@ -3,11 +3,13 @@ use licash::{
     authorization::{Authorization, PreparedGrant, SignedProposal},
     claim::Branch,
     note::{Derivation, Evidence, IssuerKeys, Keyset, Note},
-    spend::{Output, Proposal},
+    source::Certificate,
+    spend::{lock_hash, ChainProfile, Output, Proposal, ProposalId, TimedLock, TimedTerms},
     unlink::{Nonce, Session},
 };
 use licash_api::{
-    Code, Fee, Fees, Hex, Info, Offer, Offered, Problem, Release, Released, Unlink, Unlinked,
+    Code, Fee, Fees, Hex, Info, Issued, Lock, LockState, Locked, Offer, Offered, Problem, Refund,
+    Release, Released, Settle, Settled, Unlink, Unlinked,
 };
 use serde::{de::DeserializeOwned, Serialize};
 
@@ -84,11 +86,13 @@ fn bodies_carry_the_canonical_bytes_through_json() {
 
     let fees = Fees {
         spend: Fee { base: 1, ppm: 2 },
+        ..Fees::default()
     };
     let info = json(&Info::new(
         std::slice::from_ref(&f.keyset),
         f.owner.address(),
         fees,
+        None,
     ));
     assert_eq!(info.keysets().unwrap(), vec![f.keyset.clone()]);
     assert_eq!(info.address, f.owner.address());
@@ -194,11 +198,134 @@ fn problems_and_their_statuses_are_the_wire_contract() {
         (Code::Fee, "fee", 409),
         (Code::Unlinked, "unlinked", 409),
         (Code::Expired, "expired", 409),
+        (Code::UnknownLock, "unknown_lock", 404),
+        (Code::NotALock, "not_a_lock", 409),
+        (Code::Checkpoint, "checkpoint", 409),
+        (Code::Timing, "timing", 409),
+        (Code::Preimage, "preimage", 409),
+        (Code::Settled, "settled", 409),
+        (Code::LockExpired, "lock_expired", 409),
+        (Code::Unexpired, "unexpired", 409),
+        (Code::Activated, "activated", 409),
         (Code::Unavailable, "unavailable", 503),
     ] {
         assert_eq!(serde_json::to_string(&code).unwrap(), format!("\"{name}\""));
         assert_eq!(code.status(), status);
     }
     assert_eq!(licash_api::OFFER, "/v1/offer");
+    let id = ProposalId::from_bytes([0xab; 32]);
+    let path = licash_api::lock_state(&id);
+    assert_eq!(path, format!("/v1/lock/{}", "ab".repeat(32)));
+    assert_eq!(licash_api::lock_id(&path[9..]).unwrap(), id);
+    assert_eq!(licash_api::lock_id("ab").unwrap_err().code, Code::Invalid);
+    assert_eq!(licash_api::lock_id("zz").unwrap_err().code, Code::Invalid);
+    // Info and fees of a hub that predates locks.
+    let fees: Fees = serde_json::from_str(r#"{"spend":{"base":1,"ppm":0}}"#).unwrap();
+    assert_eq!((fees.lock, fees.refund), (Fee::default(), Fee::default()));
     assert_eq!(format!("{:?}", Hex(vec![1, 2])), "Hex(2 bytes)");
+}
+
+#[test]
+fn lock_bodies_carry_a_lock_and_its_settlement() {
+    let f = fixture();
+    let lookup = |id: &[u8; 32]| (id == f.keyset.id()).then_some(&f.keyset);
+    let notes = vec![f.input.0.clone()];
+    let preimage = [7; 32];
+    let terms = TimedTerms::new(
+        ChainProfile::Core30DefaultRegtest,
+        [3; 32],
+        100,
+        1,
+        lock_hash(&preimage),
+    )
+    .unwrap();
+    let secret = f
+        .input
+        .1
+        .ownership()
+        .owner_secret(f.owner.spend_secret())
+        .unwrap();
+    // A lock of the fixture's outputs, refunding to a fresh output.
+    let lock = || {
+        let back = Ephemeral::random()
+            .derive(&f.owner.address(), 8, Branch::Refund, 0)
+            .unwrap();
+        let refund = vec![Output::from_derivation(&back).unwrap()];
+        let proposal = Proposal::new(
+            &f.keyset,
+            &notes,
+            f.proposal.ephemeral(),
+            f.proposal.outputs().to_vec(),
+            Some(TimedLock::new(terms.clone(), refund).unwrap()),
+        )
+        .unwrap();
+        SignedProposal::sign(&f.keyset, proposal, &notes, Authorization::Plain, &[secret]).unwrap()
+    };
+    let signed = lock();
+    let (decoded, decoded_notes) = json(&Lock::new(&signed, &notes)).decode(lookup).unwrap();
+    assert_eq!(decoded.to_bytes(), signed.to_bytes());
+    assert_eq!(decoded_notes, notes);
+
+    let certificate = Certificate::attest(&f.keys, &signed, &notes).unwrap();
+    let locked = json(&Locked::new(&certificate));
+    let checked = locked.decode(&f.keyset, &signed, &notes).unwrap();
+    assert_eq!(checked.to_bytes(), certificate.to_bytes());
+    // Another lock's certificate is refused.
+    let foreign = Certificate::attest(&f.keys, &lock(), &notes).unwrap();
+    let wrong = Locked::new(&foreign).decode(&f.keyset, &signed, &notes);
+    assert_eq!(wrong.unwrap_err().code, Code::Invalid);
+
+    let id = signed.proposal().id();
+    let open = LockState::new(signed.proposal(), &certificate, None, None);
+    let view = json(&open).decode(lookup).unwrap();
+    assert_eq!(view.proposal.id(), id);
+    assert_eq!((view.settled, view.preimage), (None, None));
+    let paid = LockState::new(
+        signed.proposal(),
+        &certificate,
+        Some(Settled::Pay),
+        Some(preimage),
+    );
+    let view = json(&paid).decode(lookup).unwrap();
+    assert_eq!(
+        (view.settled, view.preimage),
+        (Some(Settled::Pay), Some(preimage))
+    );
+    let lying = LockState::new(signed.proposal(), &certificate, None, Some([8; 32]));
+    assert_eq!(lying.decode(lookup).unwrap_err().code, Code::Invalid);
+    let swapped = LockState::new(signed.proposal(), &foreign, None, None);
+    assert_eq!(swapped.decode(lookup).unwrap_err().code, Code::Invalid);
+    let plain = LockState::new(&f.proposal, &foreign, None, None);
+    assert_eq!(plain.decode(lookup).unwrap_err().code, Code::Invalid);
+    let none = |_: &[u8; 32]| None;
+    assert_eq!(open.decode(none).unwrap_err().code, Code::UnknownKeyset);
+    assert_eq!(
+        serde_json::to_value(&paid).unwrap()["settled"],
+        serde_json::json!("pay")
+    );
+
+    assert_eq!(
+        json(&Settle::new(&id, &preimage)).decode().unwrap(),
+        (id, preimage)
+    );
+    assert_eq!(json(&Refund::new(&id)).decode().unwrap(), id);
+    let short = Settle {
+        lock: Hex(vec![0; 32]),
+        preimage: Hex(vec![0; 31]),
+    };
+    assert_eq!(short.decode().unwrap_err().code, Code::Invalid);
+
+    let issuances: Vec<_> = signed
+        .proposal()
+        .outputs()
+        .iter()
+        .map(|o| Nonce::new(&f.keyset, o).unwrap().issue(&f.keys).unwrap())
+        .collect();
+    let decoded = json(&Issued::new(&issuances)).decode(&f.keyset).unwrap();
+    for (issuance, d) in decoded.iter().zip(&f.outputs) {
+        issuance.open(&f.keyset, d).unwrap();
+    }
+    let mut broken = Issued::new(&issuances);
+    broken.issuances[0].0.pop();
+    assert_eq!(broken.decode(&f.keyset).unwrap_err().code, Code::Invalid);
 }

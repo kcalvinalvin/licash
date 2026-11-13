@@ -120,7 +120,9 @@ async fn info(State(hub): State<Arc<Hub>>) -> Json<Info> {
                 base: spend.base,
                 ppm: spend.ppm,
             },
+            ..Fees::default()
         },
+        None,
     ))
 }
 
