@@ -43,6 +43,7 @@ fn service(fee: u64) -> Service {
     Hub::init(&seed, &db, MAX_POW).unwrap();
     let policy = Policy {
         spend: Fee { base: fee, ppm: 0 },
+        ..Policy::default()
     };
     let hub = Arc::new(Hub::open(&seed, &db, policy).unwrap());
     let mut secret = [0; 32];

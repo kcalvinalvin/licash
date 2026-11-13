@@ -15,20 +15,26 @@
 //! can no longer be unlinked ([`Refusal::Expired`]); their holders keep
 //! the value and can swap them for fresh outputs.
 //!
+//! Timed locks ([`Hub::lock`]) pay on a preimage or refund once expired,
+//! as the hub's scan of Bitcoin decides ([`Hub::observe`]).
+//!
 //! [`Ledger`] reads the database beside a running hub, for monitoring.
 
+mod locks;
 mod store;
 
 use std::{
     collections::{BTreeMap, HashMap},
     io::Write,
     path::Path,
-    sync::{Mutex, PoisonError},
+    sync::{atomic::AtomicBool, Mutex, PoisonError},
+    time::Instant,
 };
 
 use licash::{
     address::{Address, OwnerKeys},
     authorization::{Grant, PreparedGrant, SignedProposal, Unlock},
+    chain::Checkpoint,
     crypto::{tagged_hash, Point},
     note::{IssuerKeys, Keyset, Note},
     spend::{Output, Proposal, ProposalId},
@@ -38,6 +44,8 @@ use rand_core::{OsRng, RngCore};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use store::{now, setup_io, Store};
+
+pub use locks::{Lock, Settled, Timing};
 
 /// The largest denomination exponent a hub issues: its ledger keeps
 /// denominations as SQLite integers.
@@ -81,8 +89,34 @@ impl From<rusqlite::Error> for Error {
 pub enum Refusal {
     #[error("unknown keyset")]
     UnknownKeyset,
-    #[error("timed spends are not served")]
+    #[error("a timed spend is served as a lock")]
     Timed,
+    #[error("not a plainly authorized timed lock")]
+    NotALock,
+    #[error("checkpoint: {0}")]
+    Checkpoint(&'static str),
+    #[error("lock timing: {0}")]
+    Timing(&'static str),
+    #[error("the hub's view of Bitcoin is behind")]
+    Unsynced,
+    #[error("the hub follows no chain yet: add a checkpoint")]
+    NoChain,
+    #[error("block: {0}")]
+    Block(&'static str),
+    #[error("unknown lock")]
+    UnknownLock,
+    #[error("not the preimage of the lock's hash")]
+    Preimage,
+    #[error("the lock was settled the other way")]
+    Settled,
+    #[error("the lock expired: it is refunded")]
+    LockExpired,
+    #[error("the lock has not expired at depth")]
+    Unexpired,
+    #[error("the lock was activated in time: it pays")]
+    Activated,
+    #[error("an own lock under this hash exists")]
+    Exists,
     #[error("an input is already spent")]
     Spent,
     #[error("an output is already issued")]
@@ -115,11 +149,17 @@ impl Fee {
     }
 }
 
-/// What the hub charges. A spend pays its fee in outputs to the hub's
-/// address ([`Info::address`]).
+/// What the hub charges and the locks it admits. A spend pays its fee in
+/// outputs to the hub's address ([`Info::address`]), a lock in each branch.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Policy {
     pub spend: Fee,
+    /// In a lock's pay branch.
+    pub lock: Fee,
+    /// In a lock's refund branch.
+    pub refund: Fee,
+    pub timing: Timing,
 }
 
 #[derive(Clone, Debug)]
@@ -145,6 +185,27 @@ pub enum Notice {
     /// The owners of inputs another spend retired signed `proposal`. Once
     /// per proposal.
     DoubleSpend { proposal: String, spent_by: String },
+    /// A lock of `amount` until `expiry` was admitted, paying `fee` to the
+    /// hub if it pays; `own` if the hub locked notes it issued itself.
+    Locked {
+        proposal: String,
+        amount: u64,
+        fee: u64,
+        expiry: u32,
+        own: bool,
+    },
+    /// A lock was paid or refunded, `fee` of it to the hub.
+    Settled {
+        proposal: String,
+        amount: u64,
+        fee: u64,
+        branch: Settled,
+    },
+    /// The preimage of a lock was published on Bitcoin at `height`.
+    Activated { proposal: String, height: u32 },
+    /// Bitcoin reorganized at `height`, at or below a checkpoint: the hub
+    /// scans no more until its operator acts.
+    Reorg { height: u32 },
 }
 
 impl Notice {
@@ -153,6 +214,10 @@ impl Notice {
             Self::Started { .. } => "started",
             Self::Released { .. } => "released",
             Self::DoubleSpend { .. } => "double_spend",
+            Self::Locked { .. } => "locked",
+            Self::Settled { .. } => "settled",
+            Self::Activated { .. } => "activated",
+            Self::Reorg { .. } => "reorg",
         }
     }
 }
@@ -180,6 +245,9 @@ impl Event {
 pub struct Stats {
     pub offers: u64,
     pub released: u64,
+    pub locks: u64,
+    /// Locks neither paid nor refunded.
+    pub open_locks: u64,
     pub spent: u64,
     pub issued: u64,
     pub unlinked: u64,
@@ -218,10 +286,12 @@ impl Ledger {
             Ok(self.conn.query_row(sql, [], |r| r.get::<_, i64>(0))? as u64)
         };
         Ok(Stats {
-            offers: count("SELECT count(*) FROM proposals")?,
-            released: count("SELECT count(*) FROM proposals WHERE released_at IS NOT NULL")?,
+            offers: count("SELECT count(*) FROM grants")?,
+            released: count("SELECT count(*) FROM grants WHERE released_at IS NOT NULL")?,
+            locks: count("SELECT count(*) FROM locks")?,
+            open_locks: count("SELECT count(*) FROM locks WHERE settled IS NULL")?,
             spent: count("SELECT count(*) FROM spent")?,
-            issued: count("SELECT count(*) FROM issued")?,
+            issued: count("SELECT count(*) FROM issued WHERE boot IS NOT NULL")?,
             unlinked: count("SELECT count(*) FROM issued WHERE answered IS NOT NULL")?,
             income: count("SELECT coalesce(sum(denom), 0) FROM income")?,
             events: count(LAST_EVENT)?,
@@ -266,6 +336,12 @@ pub struct Hub {
     /// It outlives no nonce, so it is the authority over them.
     answered: Mutex<HashMap<[u8; 32], [u8; 32]>>,
     policy: Policy,
+    /// The newest checkpoint, as stored.
+    newest: Mutex<Option<Checkpoint>>,
+    /// When the scan last reached the chain's tip.
+    synced_at: Mutex<Option<Instant>>,
+    /// Whether this process alerted a reorganization of a checkpoint.
+    reorg_alerted: AtomicBool,
 }
 
 impl Hub {
@@ -321,6 +397,7 @@ impl Hub {
         if keysets.is_empty() {
             return Err(Error::Setup("the database has no keyset".into()));
         }
+        let newest = store.read(locks::newest_checkpoint)?;
         let (mut boot, mut drawn) = ([0; 16], [0; 32]);
         OsRng.fill_bytes(&mut boot);
         OsRng.fill_bytes(&mut drawn);
@@ -333,6 +410,9 @@ impl Hub {
             boot_key: tagged_hash("licash-hub/boot", &[&secret, &drawn]),
             answered: Mutex::default(),
             policy,
+            newest: Mutex::new(newest),
+            synced_at: Mutex::default(),
+            reorg_alerted: AtomicBool::default(),
         };
         let boot = hex::encode(boot);
         tracing::info!(keysets = hub.keysets.len(), %boot, "hub started");
@@ -465,7 +545,7 @@ impl Hub {
             }
             let offered: Option<Vec<u8>> = tx
                 .query_row(
-                    "SELECT offer FROM proposals WHERE id = ?1",
+                    "SELECT offer FROM grants WHERE id = ?1",
                     [id.as_bytes()],
                     |r| r.get(0),
                 )
@@ -479,9 +559,12 @@ impl Hub {
                 }
             }
             tx.execute(
-                "INSERT INTO proposals (id, keyset, offer, salt, boot, offered_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![id.as_bytes(), keyset.id(), offer, salt, self.boot, now()],
+                "INSERT INTO proposals (id, keyset, created_at) VALUES (?1, ?2, ?3)",
+                params![id.as_bytes(), keyset.id(), now()],
+            )?;
+            tx.execute(
+                "INSERT INTO grants (id, offer, salt, boot) VALUES (?1, ?2, ?3, ?4)",
+                params![id.as_bytes(), offer, salt, self.boot],
             )?;
             Ok(grant)
         })
@@ -496,7 +579,7 @@ impl Hub {
         let id = proposal.id();
         let offered: Option<(Vec<u8>, [u8; 32], [u8; 16])> = self.store.read(|c| {
             Ok(c.query_row(
-                "SELECT offer, salt, boot FROM proposals WHERE id = ?1",
+                "SELECT offer, salt, boot FROM grants WHERE id = ?1",
                 [id.as_bytes()],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
@@ -526,27 +609,16 @@ impl Hub {
         let mut spent_by = None;
         let released = self.store.write(|tx| {
             let released: Option<i64> = tx.query_row(
-                "SELECT released_at FROM proposals WHERE id = ?1",
+                "SELECT released_at FROM grants WHERE id = ?1",
                 [id.as_bytes()],
                 |r| r.get(0),
             )?;
             if released.is_some() {
                 return Ok(false);
             }
-            for (position, (y, note)) in (0i64..).zip(ys.iter().zip(notes)) {
-                let inserted = tx.execute(
-                    "INSERT INTO spent (y, proposal, position, note) VALUES (?1, ?2, ?3, ?4)
-                     ON CONFLICT DO NOTHING",
-                    params![&y.0, id.as_bytes(), position, note.to_bytes()],
-                )?;
-                if inserted == 0 {
-                    spent_by = Some(tx.query_row(
-                        "SELECT proposal FROM spent WHERE y = ?1",
-                        [&y.0],
-                        |r| r.get::<_, [u8; 32]>(0),
-                    )?);
-                    return Err(Refusal::Spent.into());
-                }
+            if let Some(by) = retire(tx, &id, &ys, notes)? {
+                spent_by = Some(by);
+                return Err(Refusal::Spent.into());
             }
             for (position, output) in (0i64..).zip(proposal.outputs()) {
                 let inserted = tx.execute(
@@ -578,7 +650,7 @@ impl Hub {
                 )?;
             }
             tx.execute(
-                "UPDATE proposals SET signed = ?2, released_at = ?3 WHERE id = ?1",
+                "UPDATE grants SET signed = ?2, released_at = ?3 WHERE id = ?1",
                 params![id.as_bytes(), signed.to_bytes(), now()],
             )?;
             let proposal = hex::encode(id.as_bytes());
@@ -624,7 +696,7 @@ impl Hub {
         );
         let request_hash = tagged_hash("licash-hub/unlink-request", &[&request.to_bytes()]);
         self.store.write(|tx| {
-            type Row = ([u8; 32], [u8; 32], [u8; 16], Option<Vec<u8>>);
+            type Row = ([u8; 32], [u8; 32], Option<[u8; 16]>, Option<Vec<u8>>);
             let row: Option<Row> = tx
                 .query_row(
                     "SELECT commitment, proposal, boot, answered FROM issued
@@ -633,8 +705,10 @@ impl Hub {
                     |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
                 )
                 .optional()?;
+            // A reserved output has no boot: it is not issued yet.
             let (commitment, proposal, boot, stored) = row
                 .filter(|(commitment, ..)| *commitment == request.unlink_commitment())
+                .and_then(|(c, p, boot, s)| Some((c, p, boot?, s)))
                 .ok_or(Refusal::NotIssued)?;
             let mut answered = self.answered.lock().unwrap_or_else(PoisonError::into_inner);
             match (answered.get(&output_hash), stored) {
@@ -694,4 +768,29 @@ fn issued(tx: &Transaction<'_>, keyset: &[u8; 32], output: &Output) -> Result<bo
         )
         .optional()?
         .is_some())
+}
+
+/// Retire the inputs `ys` of proposal `id`, spent by `notes`: none, or
+/// the proposal that retired one of them first.
+fn retire(
+    tx: &Transaction<'_>,
+    id: &ProposalId,
+    ys: &[Point],
+    notes: &[Note],
+) -> Result<Option<[u8; 32]>, Error> {
+    for (position, (y, note)) in (0i64..).zip(ys.iter().zip(notes)) {
+        let inserted = tx.execute(
+            "INSERT INTO spent (y, proposal, position, note) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT DO NOTHING",
+            params![&y.0, id.as_bytes(), position, note.to_bytes()],
+        )?;
+        if inserted == 0 {
+            return Ok(Some(tx.query_row(
+                "SELECT proposal FROM spent WHERE y = ?1",
+                [&y.0],
+                |r| r.get(0),
+            )?));
+        }
+    }
+    Ok(None)
 }

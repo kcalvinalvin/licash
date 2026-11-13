@@ -471,6 +471,7 @@ dependencies = [
 name = "licash-hub"
 version = "0.0.1"
 dependencies = [
+ "bitcoin",
  "hex",
  "licash",
  "rand_core",

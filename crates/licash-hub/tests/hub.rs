@@ -36,6 +36,7 @@ fn open(files: &Files, policy: Policy) -> Hub {
 fn fee(base: u64, ppm: u64) -> Policy {
     Policy {
         spend: Fee { base, ppm },
+        ..Policy::default()
     }
 }
 
@@ -827,6 +828,8 @@ fn the_ledger_reads_beside_the_running_hub_and_writes_nothing() {
     let stats = Stats {
         offers: 2,
         released: 1,
+        locks: 0,
+        open_locks: 0,
         spent: 1,
         issued: 3,
         unlinked: 1,

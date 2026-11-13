@@ -168,6 +168,7 @@ fn command(cli: Cli) -> anyhow::Result<()> {
                     base: spend_fee_base,
                     ppm: spend_fee_ppm,
                 },
+                ..Policy::default()
             };
             let targets = notify.targets()?;
             // Before the hub opens, so that new targets hear of its start.

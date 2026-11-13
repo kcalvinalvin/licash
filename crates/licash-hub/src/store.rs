@@ -32,20 +32,73 @@ CREATE TABLE keysets (
     max_pow INTEGER NOT NULL,
     created_at INTEGER NOT NULL
 ) STRICT;
--- Offered grants. The unlock derives from the seed and the salt, the
--- unlink nonces from the boot that made the offer.
+-- Every proposal the hub served: a grant or a lock.
 CREATE TABLE proposals (
     id BLOB PRIMARY KEY,
     keyset BLOB NOT NULL REFERENCES keysets (id),
-    offer BLOB NOT NULL,
-    salt BLOB NOT NULL,
-    boot BLOB NOT NULL,
-    offered_at INTEGER NOT NULL,
-    signed BLOB,
-    released_at INTEGER,
+    created_at INTEGER NOT NULL,
     -- When a spend of its inputs by another proposal was first refused.
     double_spent_at INTEGER
 ) STRICT;
+-- Offered grants. The unlock derives from the seed and the salt, the
+-- unlink nonces from the boot that made the offer.
+CREATE TABLE grants (
+    id BLOB PRIMARY KEY REFERENCES proposals (id),
+    offer BLOB NOT NULL,
+    salt BLOB NOT NULL,
+    boot BLOB NOT NULL,
+    signed BLOB,
+    released_at INTEGER
+) STRICT;
+-- Checkpoints the terms of a lock may name.
+CREATE TABLE checkpoints (
+    commitment BLOB PRIMARY KEY,
+    height INTEGER NOT NULL,
+    bytes BLOB NOT NULL,
+    added_at INTEGER NOT NULL
+) STRICT;
+-- The best chain as scanned, each block linked to the one before, from
+-- the first checkpoint's.
+CREATE TABLE blocks (
+    height INTEGER PRIMARY KEY,
+    hash BLOB NOT NULL,
+    prev BLOB NOT NULL
+) STRICT;
+-- Every activation ever scanned, in the best chain or not: a holder may
+-- prove one on any chain from a checkpoint. Never deleted.
+CREATE TABLE activations (
+    block BLOB NOT NULL,
+    txid BLOB NOT NULL,
+    output INTEGER NOT NULL,
+    hash BLOB NOT NULL,
+    secret BLOB NOT NULL,
+    height INTEGER NOT NULL,
+    PRIMARY KEY (block, txid, output)
+) STRICT;
+CREATE INDEX activations_hash ON activations (hash);
+-- Timed locks: their pay branch is issued on the preimage, their refund
+-- branch once they expired unactivated. `own` locks spend notes the hub
+-- issued itself, backed by what the caller holds (an HTLC).
+CREATE TABLE locks (
+    id BLOB PRIMARY KEY REFERENCES proposals (id),
+    hash BLOB NOT NULL,
+    checkpoint BLOB NOT NULL REFERENCES checkpoints (commitment),
+    expiry INTEGER NOT NULL,
+    depth INTEGER NOT NULL,
+    -- Height by which the hub answers a refund request: expiry, depth and
+    -- its reaction.
+    decide_by INTEGER NOT NULL,
+    proposal BLOB NOT NULL,
+    signed BLOB NOT NULL,
+    certificate BLOB NOT NULL,
+    amount INTEGER NOT NULL,
+    own INTEGER NOT NULL,
+    preimage BLOB,
+    settled TEXT CHECK (settled IN ('pay', 'refund')),
+    settled_at INTEGER
+) STRICT;
+CREATE INDEX locks_hash ON locks (hash);
+CREATE UNIQUE INDEX own_locks ON locks (hash) WHERE own = 1;
 -- Each retired input, by its identifier, with the note that spent it.
 CREATE TABLE spent (
     y BLOB PRIMARY KEY,
@@ -53,7 +106,9 @@ CREATE TABLE spent (
     position INTEGER NOT NULL,
     note BLOB NOT NULL
 ) STRICT;
--- Each issued output and, once answered, its unlink record.
+-- Each output the hub issued or, without a boot, reserved for a lock's
+-- branch; a lock's with its issuance, and once answered, its unlink
+-- record. A reserved output is issued to nobody else.
 CREATE TABLE issued (
     keyset BLOB NOT NULL REFERENCES keysets (id),
     denom INTEGER NOT NULL,
@@ -61,11 +116,12 @@ CREATE TABLE issued (
     commitment BLOB NOT NULL,
     proposal BLOB NOT NULL REFERENCES proposals (id),
     position INTEGER NOT NULL,
-    boot BLOB NOT NULL,
-    answered BLOB,
+    boot BLOB,
+    issuance BLOB CHECK (issuance IS NULL OR boot IS NOT NULL),
+    answered BLOB CHECK (answered IS NULL OR boot IS NOT NULL),
     PRIMARY KEY (keyset, denom, blinded)
 ) STRICT;
--- Notes paid to the hub.
+-- Notes paid to the hub, a lock's refund branch from `REFUND_INDEX`.
 CREATE TABLE income (
     proposal BLOB NOT NULL REFERENCES proposals (id),
     position INTEGER NOT NULL,
