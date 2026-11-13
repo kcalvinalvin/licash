@@ -1,11 +1,12 @@
 //! licash: owner-bound ecash with local Bitcoin recovery.
 //!
 //! The protocol is specified in the paper (`paper/licash.pdf`). Modules by
-//! section: notes and owner keys (`note`, `crypto`, `ec`); contracts and
-//! reading Bitcoin (`base`, `opening`, `request`, `chain`, `payout`);
-//! payments and grants (`spend`, `authorization`); recovery (`claim`,
-//! `hold`, `recovery`, `statement`, `disclosure`, `wots`, `guest`);
-//! interoperability (`source`, `route`).
+//! section: notes and owner keys (`note`, `address`, `crypto`, `ec`);
+//! contracts and reading Bitcoin (`base`, `opening`, `request`, `chain`,
+//! `payout`); payments, grants and unlinking (`spend`, `authorization`,
+//! `unlink`); recovery (`claim`, `hold`, `recovery`, `statement`,
+//! `disclosure`, `wots`, `guest`); interoperability (`source`, `route`).
+//! `codec` holds the canonical bytes of what parties exchange.
 
 pub mod address;
 pub mod authorization;
