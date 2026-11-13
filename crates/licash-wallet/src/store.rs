@@ -73,8 +73,8 @@ CREATE TABLE notes (
     ephemeral BLOB NOT NULL,
     branch INTEGER NOT NULL,
     position INTEGER NOT NULL,
-    -- The send that spends it, from when that send chose it.
-    spent_by BLOB REFERENCES sends (id),
+    -- The send or lock that spends it, from when it chose it.
+    spent_by BLOB,
     -- 1 unlinked, 0 linked, -1 linked for good: its hub unlinks it no more.
     unlinked INTEGER NOT NULL DEFAULT 0,
     -- An unlink under way: its session, to ask the hub again.
@@ -85,7 +85,29 @@ CREATE TABLE notes (
     added_at INTEGER NOT NULL
 ) STRICT;
 CREATE INDEX notes_spent_by ON notes (spent_by);
--- Payments taken.
+-- Notes locked to a payee on the preimage of `hash` until `expiry`, else
+-- refunded: the lock asked for (a Lock body), then the hub's certificate,
+-- then the branch its hub settled, once the wallet kept its notes of it.
+-- An uncertified lock is given up only once its hub refused it, which
+-- proves the hub never recorded it.
+CREATE TABLE locks (
+    id BLOB PRIMARY KEY,
+    hub INTEGER NOT NULL REFERENCES hubs (id),
+    payee BLOB NOT NULL,
+    hash BLOB NOT NULL,
+    expiry INTEGER NOT NULL,
+    amount INTEGER NOT NULL,
+    fee INTEGER NOT NULL,
+    request TEXT NOT NULL,
+    certificate BLOB,
+    -- 'pay' or 'refund'.
+    settled TEXT,
+    preimage BLOB,
+    created_at INTEGER NOT NULL,
+    done_at INTEGER,
+    abandoned TEXT
+) STRICT;
+-- Payments taken, and locks claimed.
 CREATE TABLE receipts (
     id BLOB PRIMARY KEY,
     keyset BLOB NOT NULL REFERENCES keysets (id),

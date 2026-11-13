@@ -1,4 +1,7 @@
-//! Hubs in process, behind URLs, with requests that fail on demand.
+//! Hubs in process, behind URLs, with requests that fail on demand, each
+//! following a regtest chain of its own.
+
+mod chain;
 
 use std::{
     collections::HashMap,
@@ -15,10 +18,10 @@ use licash::{
     unlink::Nonce,
 };
 use licash_api::{
-    Check, Checked, Code, Fee, Fees, Info, Offer, Offered, Payment, Problem, Release, Released,
-    Unlink, Unlinked,
+    Check, Checked, Code, Fee, Issued, Lock, LockState, Locked, Offer, Offered, Payment, Problem,
+    Refund, Release, Released, Settle, Unlink, Unlinked,
 };
-use licash_hub::{Error, Hub, Policy, Refusal};
+use licash_hub::{Error, Hub, Policy, Settled, Timing};
 use licash_wallet::{Response, Transport};
 
 pub const MAX_POW: u32 = 6;
@@ -39,7 +42,18 @@ struct Site {
     seed: PathBuf,
     db: PathBuf,
     policy: Policy,
+    chain: Arc<Mutex<chain::Chain>>,
 }
+
+/// The timing of the hubs' locks: short, to expire them in a test.
+pub const TIMING: Timing = Timing {
+    window: 20,
+    reaction: 2,
+    min_depth: 1,
+    max_headers: 4032,
+    bury: 6,
+    max_lag: 120,
+};
 
 #[derive(Default)]
 pub struct Net {
@@ -55,24 +69,46 @@ impl Net {
         Arc::default()
     }
 
-    /// A new hub at `url`, charging `fee` on spends.
+    /// A new hub at `url`, charging `fee` on spends and in each branch of
+    /// a lock, at height 3 of its chain.
     pub fn start(&self, url: &str, fee: Fee) {
         let dir = tempfile::tempdir().unwrap();
         let (seed, db) = (dir.path().join("seed"), dir.path().join("hub.sqlite"));
         Hub::init(&seed, &db, MAX_POW).unwrap();
         let policy = Policy {
             spend: fee,
-            ..Policy::default()
+            lock: fee,
+            refund: fee,
+            timing: TIMING,
         };
-        let hub = Some(Arc::new(Hub::open(&seed, &db, policy).unwrap()));
+        let hub = Arc::new(Hub::open(&seed, &db, policy).unwrap());
+        let chain = chain::Chain::new();
+        hub.add_checkpoint(&chain.checkpoint(0)).unwrap();
         self.dirs.lock().unwrap().push(dir);
         let site = Site {
-            hub,
+            hub: Some(hub),
             seed,
             db,
             policy,
+            chain: Arc::new(Mutex::new(chain)),
         };
         self.sites.lock().unwrap().insert(url.into(), site);
+        self.mine(url, 3, None);
+    }
+
+    /// Mine `blocks` on the chain of the hub at `url`, the first with an
+    /// activation of `secret` if given, which its hub scans.
+    pub fn mine(&self, url: &str, blocks: u32, mut secret: Option<[u8; 32]>) {
+        let (hub, chain) = {
+            let sites = self.sites.lock().unwrap();
+            (sites[url].hub.clone().unwrap(), sites[url].chain.clone())
+        };
+        let mut chain = chain.lock().unwrap();
+        for _ in 0..blocks {
+            let block = chain.mine(secret.take()).clone();
+            hub.observe(chain.height(), &block).unwrap();
+        }
+        assert!(hub.synced(chain.height(), &chain.tip()).unwrap());
     }
 
     /// `url` serves the hub at `at` too.
@@ -84,6 +120,7 @@ impl Net {
             seed: site.seed.clone(),
             db: site.db.clone(),
             policy: site.policy,
+            chain: site.chain.clone(),
         };
         sites.insert(url.into(), alias);
     }
@@ -93,9 +130,10 @@ impl Net {
         let mut sites = self.sites.lock().unwrap();
         let site = sites.get_mut(url).unwrap();
         drop(site.hub.take());
-        site.hub = Some(Arc::new(
-            Hub::open(&site.seed, &site.db, site.policy).unwrap(),
-        ));
+        let hub = Hub::open(&site.seed, &site.db, site.policy).unwrap();
+        let chain = site.chain.lock().unwrap();
+        assert!(hub.synced(chain.height(), &chain.tip()).unwrap());
+        site.hub = Some(Arc::new(hub));
     }
 
     /// The next request to `path` fails so.
@@ -145,6 +183,7 @@ impl Net {
         let hub = hub.ok_or("no such host")?;
         let answer = match (path, body) {
             (licash_api::INFO, None) => self.info(&hub),
+            (path, None) if path.starts_with("/v1/lock/") => lock_state(&hub, &path[9..]),
             (path, Some(body)) => post(&hub, path, &body),
             _ => Err(Problem::invalid("no such route")),
         };
@@ -161,14 +200,11 @@ impl Net {
     }
 
     fn info(&self, hub: &Hub) -> Result<Vec<u8>, Problem> {
-        let info = hub.info();
-        let spend = self.stale.lock().unwrap().unwrap_or(info.policy.spend);
-        let fees = Fees {
-            spend,
-            lock: info.policy.lock,
-            refund: info.policy.refund,
-        };
-        Ok(serde_json::to_vec(&Info::new(&info.keysets, info.address, fees, None)).unwrap())
+        let mut info = hub.advertise().map_err(problem)?;
+        if let Some(stale) = *self.stale.lock().unwrap() {
+            info.fees.spend = stale;
+        }
+        Ok(serde_json::to_vec(&info).unwrap())
     }
 }
 
@@ -198,25 +234,42 @@ fn post(hub: &Hub, path: &str, body: &[u8]) -> Result<Vec<u8>, Problem> {
             let spent = hub.spent(&check.decode()?).map_err(problem)?;
             serde_json::to_vec(&Checked { spent })
         }
+        licash_api::LOCK => {
+            let lock: Lock = serde_json::from_slice(body).map_err(json)?;
+            let (signed, notes) = lock.decode(lookup)?;
+            let certificate = hub.lock(&signed, &notes).map_err(problem)?;
+            serde_json::to_vec(&Locked::new(&certificate))
+        }
+        licash_api::SETTLE => {
+            let settle: Settle = serde_json::from_slice(body).map_err(json)?;
+            let (id, preimage) = settle.decode()?;
+            let issued = hub.settle(&id, &preimage).map_err(problem)?;
+            serde_json::to_vec(&Issued::new(&issued))
+        }
+        licash_api::REFUND => {
+            let refund: Refund = serde_json::from_slice(body).map_err(json)?;
+            let issued = hub.refund(&refund.decode()?).map_err(problem)?;
+            serde_json::to_vec(&Issued::new(&issued))
+        }
         _ => return Err(Problem::invalid("no such route")),
     };
     Ok(answer.unwrap())
 }
 
+fn lock_state(hub: &Hub, id: &str) -> Result<Vec<u8>, Problem> {
+    let lock = hub.locked(&licash_api::lock_id(id)?).map_err(problem)?;
+    let settled = lock.settled.map(|branch| match branch {
+        Settled::Pay => licash_api::Settled::Pay,
+        Settled::Refund => licash_api::Settled::Refund,
+    });
+    let state = LockState::new(&lock.proposal, &lock.certificate, settled, lock.preimage);
+    Ok(serde_json::to_vec(&state).unwrap())
+}
+
 /// As the hub service answers.
 fn problem(e: Error) -> Problem {
     let code = match &e {
-        Error::Refused(refusal) => match refusal {
-            Refusal::UnknownKeyset => Code::UnknownKeyset,
-            Refusal::Spent => Code::Spent,
-            Refusal::Reissued => Code::Reissued,
-            Refusal::Fee { .. } => Code::Fee,
-            Refusal::UnknownOffer => Code::UnknownOffer,
-            Refusal::NotIssued => Code::NotIssued,
-            Refusal::Unlinked => Code::Unlinked,
-            Refusal::Expired => Code::Expired,
-            _ => Code::Invalid,
-        },
+        Error::Refused(refusal) => refusal.code(),
         Error::Invalid(_) => Code::Invalid,
         _ => Code::Unavailable,
     };

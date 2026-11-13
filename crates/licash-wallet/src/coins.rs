@@ -64,6 +64,23 @@ pub fn select<T: Copy>(notes: &[(u64, T)], amount: u64, fee: &Fee) -> Result<Sel
     })
 }
 
+/// Of `notes`, `(denomination, id)`, the largest first that make `amount`
+/// exactly, at most [`MAX_INPUTS`]: found whenever any are, if each
+/// denomination divides the larger ones.
+pub fn exact<T: Copy>(notes: &[(u64, T)], amount: u64) -> Option<Vec<T>> {
+    let mut sorted = notes.to_vec();
+    sorted.sort_by_key(|&(denom, _)| std::cmp::Reverse(denom));
+    let mut left = amount;
+    let mut inputs = Vec::new();
+    for (denom, id) in sorted {
+        if denom <= left && inputs.len() < MAX_INPUTS {
+            left -= denom;
+            inputs.push(id);
+        }
+    }
+    (left == 0 && !inputs.is_empty()).then_some(inputs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -113,6 +130,18 @@ mod tests {
         let s = select(&notes, MAX_INPUTS as u64, &FREE).unwrap();
         assert_eq!(s.inputs.len(), MAX_INPUTS);
         assert_eq!(select(&notes, MAX_INPUTS as u64 + 1, &FREE), Err(65));
+    }
+
+    #[test]
+    fn exact_takes_notes_worth_the_amount_or_none() {
+        let notes = [(1, 'a'), (8, 'b'), (2, 'c'), (4, 'd'), (4, 'e')];
+        assert_eq!(exact(&notes, 9), Some(vec!['b', 'a']));
+        assert_eq!(exact(&notes, 10), Some(vec!['b', 'c']));
+        assert_eq!(exact(&notes, 16), Some(vec!['b', 'd', 'e']));
+        assert_eq!(exact(&notes, 19), Some(vec!['b', 'd', 'e', 'c', 'a']));
+        assert_eq!(exact(&notes, 20), None);
+        assert_eq!(exact(&notes, 0), None);
+        assert_eq!(exact(&[(16, 'a')], 8), None);
     }
 
     #[test]
