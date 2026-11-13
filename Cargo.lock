@@ -457,6 +457,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "licash-api"
+version = "0.0.1"
+dependencies = [
+ "hex",
+ "licash",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "licash-hub"
 version = "0.0.1"
 dependencies = [

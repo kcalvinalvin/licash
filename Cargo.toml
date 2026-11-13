@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/licash", "crates/licash-hub"]
+members = ["crates/licash", "crates/licash-api", "crates/licash-hub"]
 # r0/ (RISC Zero guests and host) and regtest/ (Bitcoin integration, needs
 # ../lichen and ../ln-gap) are workspaces of their own.
 exclude = ["r0", "regtest", "crates/licash-groth16"]

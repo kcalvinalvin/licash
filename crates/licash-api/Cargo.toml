@@ -1,0 +1,15 @@
+[package]
+name = "licash-api"
+description = "Licash hub API: request and response bodies over the protocol's canonical bytes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+licash = { path = "../licash" }
+serde.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
