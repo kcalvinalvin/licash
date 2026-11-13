@@ -9,7 +9,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && cp apps/target/release/licash-hub /usr/local/bin/licash-hub
 
 FROM debian:trixie-slim
-# Root certificates, for notifications over HTTPS.
+# Root certificates, for notifications and Esplora over HTTPS.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*

@@ -120,6 +120,15 @@ impl std::fmt::Debug for Source {
     }
 }
 
+/// The checkpoint profile of `network`'s chain, if Licash has one.
+pub fn profile(network: Network) -> anyhow::Result<ChainProfile> {
+    match network {
+        Network::Bitcoin => Ok(ChainProfile::Core30Mainnet),
+        Network::Regtest => Ok(ChainProfile::Core30DefaultRegtest),
+        other => bail!("no checkpoint profile for {other}"),
+    }
+}
+
 fn client() -> anyhow::Result<reqwest::Client> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     Ok(reqwest::Client::builder()
@@ -235,11 +244,7 @@ impl Source {
     /// of the eleven blocks to it and, on mainnet, the time of the first
     /// block of its retarget period.
     pub async fn checkpoint(&self, height: u32) -> anyhow::Result<Checkpoint> {
-        let profile = match self.network().await? {
-            Network::Bitcoin => ChainProfile::Core30Mainnet,
-            Network::Regtest => ChainProfile::Core30DefaultRegtest,
-            other => bail!("no checkpoint profile for {other}"),
-        };
+        let profile = profile(self.network().await?)?;
         let mut headers: Vec<Header> = Vec::new();
         for h in height.saturating_sub(10)..=height {
             let header = self.header(&self.hash(h).await?).await?;

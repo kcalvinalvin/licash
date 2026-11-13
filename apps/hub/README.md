@@ -6,7 +6,8 @@ environment variables.
 
 ```sh
 licash-hub --data ./hub init
-licash-hub --data ./hub run --listen 0.0.0.0:8338 --notify tgram://BOT_TOKEN/CHAT_ID
+licash-hub --data ./hub run --listen 0.0.0.0:8338 --chain esplora+https://esplora.example/api \
+  --notify tgram://BOT_TOKEN/CHAT_ID
 licash-hub --data ./hub status
 licash-hub --data ./hub events --follow
 ```

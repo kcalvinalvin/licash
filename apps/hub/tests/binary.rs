@@ -199,6 +199,23 @@ fn failures_exit_nonzero_and_log_as_asked() {
     assert!(!out.status.success());
     let out = output(&missing, &["run", "--spend-fee-ppm", "1000001"]);
     assert!(!out.status.success());
+    // A chain URL it cannot follow, its password unshown.
+    for url in [
+        "ftp://user:hunter2@node:8332",
+        "http://user:hunter2@node:8332?x=1",
+    ] {
+        let out = output(&missing, &["run", "--chain", url]);
+        assert!(!out.status.success());
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("--chain") && !stderr.contains("hunter2"),
+            "{stderr}"
+        );
+    }
+    let poll = ["run", "--chain", "http://node:8332", "--chain-poll", "120"];
+    let out = output(&missing, &poll);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--max-lag"));
+    assert!(!missing.exists());
 }
 
 /// A JSON webhook on a thread: its `json://` URL, and the titles it took.

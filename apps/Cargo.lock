@@ -1063,6 +1063,7 @@ dependencies = [
  "http-body-util",
  "licash",
  "licash-api",
+ "licash-chain-client",
  "licash-hub",
  "licash-notify",
  "rusqlite",

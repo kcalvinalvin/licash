@@ -11,8 +11,12 @@ use std::{
 
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use licash_chain_client::Source;
 use licash_hub::{Fee, Hub, Ledger, Policy, Timing};
-use licash_hub_service::notify::{self, Notifier};
+use licash_hub_service::{
+    notify::{self, Notifier},
+    watch::watch,
+};
 use licash_notify::{Message, Priority, Target};
 use tracing_subscriber::EnvFilter;
 
@@ -67,6 +71,39 @@ impl Notify {
                     .with_context(|| format!("notification target {}", i + 1))
             })
             .collect()
+    }
+}
+
+/// The chain the hub follows, for locks.
+#[derive(Args)]
+struct Chain {
+    /// Follow Bitcoin at this URL: a node's JSON-RPC,
+    /// `http[s]://[user:pass@]host:port[?cookie=PATH]`, or an Esplora API,
+    /// `esplora+http[s]://host[:port][/path]`. Without it, locks are refused.
+    #[arg(
+        long = "chain",
+        value_name = "URL",
+        env = "LICASH_HUB_CHAIN",
+        hide_env_values = true
+    )]
+    url: Option<String>,
+    /// Seconds between rounds of the scan, below `--max-lag`.
+    #[arg(long, env = "LICASH_HUB_CHAIN_POLL", default_value_t = 10,
+          value_parser = clap::value_parser!(u64).range(1..))]
+    chain_poll: u64,
+}
+
+impl Chain {
+    fn source(&self, policy: &Policy) -> anyhow::Result<Option<(Source, Duration)>> {
+        let Some(url) = &self.url else {
+            return Ok(None);
+        };
+        anyhow::ensure!(
+            self.chain_poll < policy.timing.max_lag,
+            "--chain-poll must be below --max-lag"
+        );
+        let source = url.parse().context("--chain")?;
+        Ok(Some((source, Duration::from_secs(self.chain_poll))))
     }
 }
 
@@ -158,6 +195,8 @@ enum Command {
         #[command(flatten)]
         policy: PolicyArgs,
         #[command(flatten)]
+        chain: Chain,
+        #[command(flatten)]
         notify: Notify,
         /// Notify only of these kinds of event [default: all].
         #[arg(long, value_name = "KIND", env = "LICASH_HUB_NOTIFY_KINDS", value_delimiter = ',',
@@ -221,10 +260,12 @@ fn command(cli: Cli) -> anyhow::Result<()> {
         Command::Run {
             listen,
             policy,
+            chain,
             notify,
             notify_kinds,
         } => {
             let policy = policy.policy();
+            let chain = chain.source(&policy)?;
             let targets = notify.targets()?;
             // Before the hub opens, so that new targets hear of its start.
             let notifier = if targets.is_empty() {
@@ -236,7 +277,8 @@ fn command(cli: Cli) -> anyhow::Result<()> {
                 Some(notifier)
             };
             let hub = Hub::open(&seed, &db, policy).context("open the hub")?;
-            tokio::runtime::Runtime::new()?.block_on(serve(Arc::new(hub), listen, policy, notifier))
+            let hub = Arc::new(hub);
+            tokio::runtime::Runtime::new()?.block_on(serve(hub, listen, policy, chain, notifier))
         }
         Command::TestNotify { notify } => test_notify(&notify),
         Command::Status { json } => status(&db, json),
@@ -264,6 +306,7 @@ async fn serve(
     hub: Arc<Hub>,
     listen: SocketAddr,
     policy: Policy,
+    chain: Option<(Source, Duration)>,
     notifier: Option<Notifier>,
 ) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(listen)
@@ -279,9 +322,16 @@ async fn serve(
         tracing::info!(targets = %targets.join(", "), "notifying");
         tokio::spawn(notifier.run(hub.clone()))
     });
+    let watching = chain.map(|(source, every)| tokio::spawn(watch(hub.clone(), source, every)));
+    if watching.is_none() {
+        tracing::warn!("following no chain (--chain): locks are refused");
+    }
     axum::serve(listener, licash_hub_service::router(hub))
         .with_graceful_shutdown(shutdown())
         .await?;
+    if let Some(watching) = watching {
+        watching.abort();
+    }
     if let (Some(notifying), Some(notifier)) = (notifying, notifier) {
         // Events not yet sent go out after the next start.
         notifying.abort();

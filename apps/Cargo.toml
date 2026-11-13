@@ -13,6 +13,7 @@ license = "MIT"
 licash = { path = "../crates/licash" }
 licash-api = { path = "../crates/licash-api" }
 licash-hub = { path = "../crates/licash-hub" }
+licash-chain-client = { path = "chain-client" }
 licash-notify = { path = "notify" }
 anyhow = "1"
 axum = "0.8"

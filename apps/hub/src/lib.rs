@@ -1,6 +1,7 @@
 //! The hub service: a [`Hub`] behind the v1 HTTP API of [`licash_api`].
 
 pub mod notify;
+pub mod watch;
 
 use std::sync::Arc;
 
