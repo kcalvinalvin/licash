@@ -1,7 +1,10 @@
 //! The service over its router, in process: each endpoint's body, status
 //! and problem code.
 
-use std::sync::Arc;
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use axum::{
     body::Body,
@@ -19,6 +22,8 @@ use licash::{
 };
 use licash_api::{Code, Info, Offer, Offered, Problem, Release, Released, Unlink, Unlinked};
 use licash_hub::{Fee, Hub, Policy};
+use licash_hub_service::notify::Notifier;
+use licash_notify::Timing;
 use serde::de::DeserializeOwned;
 use tower::ServiceExt;
 
@@ -26,6 +31,7 @@ const MAX_POW: u32 = 6;
 
 struct Service {
     dir: tempfile::TempDir,
+    hub: Arc<Hub>,
     app: Router,
     keys: IssuerKeys,
     keyset: Keyset,
@@ -38,14 +44,15 @@ fn service(fee: u64) -> Service {
     let policy = Policy {
         spend: Fee { base: fee, ppm: 0 },
     };
-    let hub = Hub::open(&seed, &db, policy).unwrap();
+    let hub = Arc::new(Hub::open(&seed, &db, policy).unwrap());
     let mut secret = [0; 32];
     hex::decode_to_slice(std::fs::read_to_string(&seed).unwrap().trim(), &mut secret).unwrap();
     let keys = IssuerKeys::from_seed(&secret, 0, MAX_POW).unwrap();
     let keyset = keys.keyset().unwrap();
     Service {
         dir,
-        app: licash_hub_service::router(Arc::new(hub)),
+        app: licash_hub_service::router(hub.clone()),
+        hub,
         keys,
         keyset,
     }
@@ -361,4 +368,88 @@ async fn a_halted_hub_is_unhealthy_and_serves_nothing() {
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     let problem: Problem = serde_json::from_slice(&body).unwrap();
     assert_eq!(problem.code, Code::Unavailable);
+}
+
+/// A JSON webhook, and the titles it took.
+async fn hook() -> (licash_notify::Target, Arc<Mutex<Vec<String>>>) {
+    let titles = Arc::new(Mutex::new(Vec::new()));
+    let took = titles.clone();
+    let app = Router::new().fallback(move |body: axum::body::Bytes| {
+        let took = took.clone();
+        async move {
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            took.lock()
+                .unwrap()
+                .push(body["title"].as_str().unwrap().to_owned());
+            StatusCode::OK
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target = format!("json://{}/hook", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (target.parse().unwrap(), titles)
+}
+
+async fn until(what: &str, mut done: impl FnMut() -> bool) {
+    let start = std::time::Instant::now();
+    while !done() {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "timed out: {what}"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+#[tokio::test]
+async fn the_operator_hears_of_spends_a_halt_and_the_stop() {
+    let service = service(0);
+    let (target, titles) = hook().await;
+    let dir = service.dir.path();
+    let fast = Timing {
+        poll: Duration::from_millis(10),
+        retry: Duration::from_millis(10),
+        max_retry: Duration::from_millis(40),
+    };
+    let notifier = Notifier::new(
+        &dir.join("hub.sqlite"),
+        "north",
+        vec![target],
+        &dir.join("notify.json"),
+        vec![],
+    )
+    .unwrap()
+    .timing(fast);
+    let running = tokio::spawn(notifier.clone().run(service.hub.clone()));
+
+    let alice = owner(1);
+    let coin = service.mint(&alice, 8);
+    let (proposal, _) = spend(&service.keyset, &coin, &[(owner(2).address(), 8)]);
+    let notes = vec![coin.note.clone()];
+    let offered: Offered = service
+        .post(licash_api::OFFER, &Offer::new(&proposal, &notes))
+        .await;
+    let grant = Authorization::Granted(Box::new(offered.decode().unwrap()));
+    let signed = sign(&service.keyset, &coin, &proposal, grant);
+    let _: Released = service
+        .post(licash_api::RELEASE, &Release::new(&signed, &notes))
+        .await;
+    until("released", || titles.lock().unwrap().len() == 1).await;
+    assert_eq!(titles.lock().unwrap()[0], "north: Spend released");
+
+    // The database changed under the hub.
+    rusqlite::Connection::open(dir.join("hub.sqlite"))
+        .unwrap()
+        .execute("UPDATE meta SET seq = seq + 7", [])
+        .unwrap();
+    let (proposal, _) = spend(&service.keyset, &coin, &[(alice.address(), 8)]);
+    service
+        .problem(licash_api::OFFER, json(&Offer::new(&proposal, &notes)))
+        .await;
+    until("halted", || titles.lock().unwrap().len() == 2).await;
+    assert_eq!(titles.lock().unwrap()[1], "north: Hub halted");
+
+    running.abort();
+    notifier.stopped().await;
+    assert_eq!(titles.lock().unwrap()[2..], ["north: Hub stopped"]);
 }

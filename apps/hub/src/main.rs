@@ -10,8 +10,10 @@ use std::{
 };
 
 use anyhow::Context;
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use licash_hub::{Fee, Hub, Ledger, Policy};
+use licash_hub_service::notify::{self, Notifier};
+use licash_notify::{Message, Priority, Target};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -33,6 +35,39 @@ struct Cli {
     log: Log,
     #[command(subcommand)]
     command: Command,
+}
+
+#[derive(Args)]
+struct Notify {
+    /// Notify of the hub's events at this Apprise-style URL: gotify://,
+    /// tgram://, ntfy://, json:// or apprise:// (see the README). Repeat it,
+    /// or separate URLs with commas, for more targets.
+    #[arg(
+        long = "notify",
+        value_name = "URL",
+        env = "LICASH_HUB_NOTIFY",
+        value_delimiter = ',',
+        hide_env_values = true
+    )]
+    urls: Vec<String>,
+    /// The name heading notification titles, to tell hubs apart.
+    #[arg(long, env = "LICASH_HUB_NAME", default_value = "licash-hub")]
+    name: String,
+}
+
+impl Notify {
+    /// The targets, refused without quoting their URLs, which hold tokens.
+    fn targets(&self) -> anyhow::Result<Vec<Target>> {
+        self.urls
+            .iter()
+            .enumerate()
+            .filter(|(_, url)| !url.trim().is_empty())
+            .map(|(i, url)| {
+                url.parse()
+                    .with_context(|| format!("notification target {}", i + 1))
+            })
+            .collect()
+    }
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -60,6 +95,18 @@ enum Command {
         /// The fee on each spend, in parts per million of its inputs.
         #[arg(long, env = "LICASH_HUB_SPEND_FEE_PPM", default_value_t = 0, value_parser = clap::value_parser!(u64).range(0..=1_000_000))]
         spend_fee_ppm: u64,
+        #[command(flatten)]
+        notify: Notify,
+        /// Notify only of these kinds of event [default: all].
+        #[arg(long, value_name = "KIND", env = "LICASH_HUB_NOTIFY_KINDS", value_delimiter = ',',
+              value_parser = clap::builder::PossibleValuesParser::new(notify::KINDS))]
+        notify_kinds: Vec<String>,
+    },
+    /// Send a test notification to each `--notify` target. Fails if any
+    /// target does not take it.
+    TestNotify {
+        #[command(flatten)]
+        notify: Notify,
     },
     /// Counts over the ledger, beside the running hub or without it.
     Status {
@@ -113,6 +160,8 @@ fn command(cli: Cli) -> anyhow::Result<()> {
             listen,
             spend_fee_base,
             spend_fee_ppm,
+            notify,
+            notify_kinds,
         } => {
             let policy = Policy {
                 spend: Fee {
@@ -120,9 +169,20 @@ fn command(cli: Cli) -> anyhow::Result<()> {
                     ppm: spend_fee_ppm,
                 },
             };
+            let targets = notify.targets()?;
+            // Before the hub opens, so that new targets hear of its start.
+            let notifier = if targets.is_empty() {
+                None
+            } else {
+                let cursors = cli.data.join("notify.json");
+                let notifier = Notifier::new(&db, &notify.name, targets, &cursors, notify_kinds)
+                    .context("set up notifications")?;
+                Some(notifier)
+            };
             let hub = Hub::open(&seed, &db, policy).context("open the hub")?;
-            tokio::runtime::Runtime::new()?.block_on(serve(Arc::new(hub), listen, policy))
+            tokio::runtime::Runtime::new()?.block_on(serve(Arc::new(hub), listen, policy, notifier))
         }
+        Command::TestNotify { notify } => test_notify(&notify),
         Command::Status { json } => status(&db, json),
         Command::Events {
             after,
@@ -144,7 +204,12 @@ fn init(data: &Path, seed: &Path, db: &Path, max_pow: u32) -> anyhow::Result<()>
     Ok(())
 }
 
-async fn serve(hub: Arc<Hub>, listen: SocketAddr, policy: Policy) -> anyhow::Result<()> {
+async fn serve(
+    hub: Arc<Hub>,
+    listen: SocketAddr,
+    policy: Policy,
+    notifier: Option<Notifier>,
+) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(listen)
         .await
         .with_context(|| format!("listen on {listen}"))?;
@@ -154,10 +219,49 @@ async fn serve(hub: Arc<Hub>, listen: SocketAddr, policy: Policy) -> anyhow::Res
         spend_fee_ppm = policy.spend.ppm,
         "serving"
     );
+    let notifying = notifier.clone().map(|notifier| {
+        let targets: Vec<_> = notifier.targets().iter().map(Target::to_string).collect();
+        tracing::info!(targets = %targets.join(", "), "notifying");
+        tokio::spawn(notifier.run(hub.clone()))
+    });
     axum::serve(listener, licash_hub_service::router(hub))
         .with_graceful_shutdown(shutdown())
         .await?;
+    if let (Some(notifying), Some(notifier)) = (notifying, notifier) {
+        // Events not yet sent go out after the next start.
+        notifying.abort();
+        notifier.stopped().await;
+    }
     tracing::info!("stopped");
+    Ok(())
+}
+
+fn test_notify(notify: &Notify) -> anyhow::Result<()> {
+    let targets = notify.targets()?;
+    anyhow::ensure!(!targets.is_empty(), "no target: give --notify URL");
+    let client = licash_notify::client()?;
+    let message = notify::titled(
+        &notify.name,
+        Message::new(
+            Priority::Normal,
+            "Test",
+            "Notifications of this hub reach you here.",
+        ),
+    );
+    let failed = tokio::runtime::Runtime::new()?.block_on(async {
+        let mut failed = 0;
+        for target in &targets {
+            match target.send(&client, &message).await {
+                Ok(()) => println!("sent    {target}"),
+                Err(e) => {
+                    println!("failed  {target}: {e:#}");
+                    failed += 1;
+                }
+            }
+        }
+        failed
+    });
+    anyhow::ensure!(failed == 0, "{failed} of {} targets failed", targets.len());
     Ok(())
 }
 

@@ -9,6 +9,10 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && cp apps/target/release/licash-hub /usr/local/bin/licash-hub
 
 FROM debian:trixie-slim
+# Root certificates, for notifications over HTTPS.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 RUN useradd --system --uid 10001 --home-dir /data --shell /usr/sbin/nologin licash \
     && mkdir -p /data && chown licash /data && chmod 700 /data
 COPY --from=build /usr/local/bin/licash-hub /usr/local/bin/licash-hub

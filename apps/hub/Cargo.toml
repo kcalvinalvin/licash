@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 licash-api.workspace = true
 licash-hub.workspace = true
+licash-notify.workspace = true
 anyhow.workspace = true
 axum.workspace = true
 clap.workspace = true

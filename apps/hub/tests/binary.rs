@@ -1,10 +1,11 @@
 //! The `licash-hub` binary end to end: create, run, watch and stop a hub.
 
 use std::{
-    io::{Read, Write},
+    io::{BufRead, BufReader, Read, Write},
     net::{TcpListener, TcpStream},
     path::Path,
     process::{Child, Command, Output, Stdio},
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -16,6 +17,9 @@ fn hub(data: &Path, args: &[&str]) -> Command {
         .args(args)
         .env_remove("LICASH_HUB_SEED")
         .env_remove("LICASH_HUB_LISTEN")
+        .env_remove("LICASH_HUB_NOTIFY")
+        .env_remove("LICASH_HUB_NOTIFY_KINDS")
+        .env_remove("LICASH_HUB_NAME")
         .env("RUST_LOG", "info");
     command
 }
@@ -195,4 +199,113 @@ fn failures_exit_nonzero_and_log_as_asked() {
     assert!(!out.status.success());
     let out = output(&missing, &["run", "--spend-fee-ppm", "1000001"]);
     assert!(!out.status.success());
+}
+
+/// A JSON webhook on a thread: its `json://` URL, and the titles it took.
+fn webhook() -> (String, Arc<Mutex<Vec<String>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("json://{}/hook", listener.local_addr().unwrap());
+    let titles = Arc::new(Mutex::new(Vec::new()));
+    let took = titles.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let mut reader = BufReader::new(stream.unwrap());
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line.trim().is_empty() {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':') {
+                    if name.eq_ignore_ascii_case("content-length") {
+                        length = value.trim().parse().unwrap();
+                    }
+                }
+            }
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            took.lock()
+                .unwrap()
+                .push(body["title"].as_str().unwrap().to_owned());
+            let mut stream = reader.into_inner();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                .unwrap();
+        }
+    });
+    (url, titles)
+}
+
+#[test]
+fn the_operator_is_notified_of_starts_and_stops() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("hub");
+    stdout(&data, &["init", "--max-pow", "6"]);
+    let (url, titles) = webhook();
+    let taken = || titles.lock().unwrap().clone();
+
+    // Refused without quoting the URL, which holds the token.
+    let out = output(&data, &["run", "--notify", "tgram://123:SecretPart"]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("notification target 1") && stderr.contains("chat"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("SecretPart"), "{stderr}");
+    let help = hub(&data, &["run", "--help"])
+        .env("LICASH_HUB_NOTIFY", "tgram://123:SecretPart/1")
+        .output()
+        .unwrap();
+    assert!(help.status.success());
+    assert!(!String::from_utf8_lossy(&help.stdout).contains("SecretPart"));
+    let out = output(
+        &data,
+        &["run", "--notify", &url, "--notify-kinds", "minted"],
+    );
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("double_spend"));
+
+    let sent = stdout(&data, &["test-notify", "--notify", &url]);
+    let shown = url.replace("/hook", "/***");
+    assert_eq!(sent.trim(), format!("sent    {shown}"));
+    assert_eq!(taken(), ["licash-hub: Test"]);
+    let closed = format!("json://127.0.0.1:{}/hook", free_port());
+    let out = output(
+        &data,
+        &["test-notify", "--notify", &format!("{url},{closed}")],
+    );
+    assert!(!out.status.success());
+    let printed = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        printed.contains(&format!("failed  {}", closed.replace("/hook", "/***"))),
+        "{printed}"
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("1 of 2 targets failed"));
+    titles.lock().unwrap().clear();
+
+    let port = free_port();
+    let mut running = Running(
+        hub(&data, &["run", "--listen", &format!("127.0.0.1:{port}")])
+            .env("LICASH_HUB_NOTIFY", &url)
+            .env("LICASH_HUB_NAME", "north")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    // A new target hears of the start it was added for.
+    until("started", || (!taken().is_empty()).then_some(()));
+    assert_eq!(taken(), ["north: Hub started"]);
+    assert!(data.join("notify.json").exists());
+    let pid = running.0.id().to_string();
+    assert!(Command::new("kill")
+        .args(["-TERM", &pid])
+        .status()
+        .unwrap()
+        .success());
+    assert!(until("stop", || running.0.try_wait().unwrap()).success());
+    assert_eq!(taken(), ["north: Hub started", "north: Hub stopped"]);
 }

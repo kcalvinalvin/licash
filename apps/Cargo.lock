@@ -1043,6 +1043,7 @@ dependencies = [
  "licash",
  "licash-api",
  "licash-hub",
+ "licash-notify",
  "rusqlite",
  "serde",
  "serde_json",
