@@ -12,6 +12,7 @@ pub mod authorization;
 pub mod base;
 pub mod chain;
 pub mod claim;
+mod codec;
 pub mod crypto;
 pub mod disclosure;
 pub mod ec;

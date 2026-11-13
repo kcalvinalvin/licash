@@ -14,6 +14,7 @@
 use k256::{ProjectivePoint, Scalar};
 
 use crate::{
+    codec::{put_blob, put_u32, Reader},
     crypto::{self, Dleq, DleqCommit, Point, ScalarBytes, Signature},
     ec::Pt,
     note::Evidence,
@@ -31,6 +32,11 @@ pub type Unlock = [u8; 32];
 
 /// Sealed bytes of one packet: the blind signature (33) and its DLEQ (64).
 pub const SEALED_BYTES: usize = 33 + 64;
+
+const GRANT_TAG: &[u8] = b"LICASH-GR\x02";
+const SIGNED_TAG: &[u8] = b"LICASH-SS\x02";
+/// A packet's denomination, target, seal and unlink commitment.
+const PACKET_BYTES: usize = 8 + 33 + SEALED_BYTES + 33 + 33;
 
 /// `H(t)`, bound to the proposal so one unlock answers one grant.
 pub fn unlock_hash(proposal: &ProposalId, unlock: &Unlock) -> [u8; 32] {
@@ -102,7 +108,7 @@ impl Grant {
         if count == 0 {
             return Err(bad("empty grant"));
         }
-        let mut bytes = b"LICASH-GR\x02".to_vec();
+        let mut bytes = GRANT_TAG.to_vec();
         bytes.extend(self.keyset);
         bytes.extend(self.proposal.as_bytes());
         bytes.extend(self.lock);
@@ -121,9 +127,52 @@ impl Grant {
     }
 
     pub fn commitment(&self) -> Result<[u8; 32], Error> {
+        Ok(crypto::tagged_hash(
+            "licash/grant-commitment/v2",
+            &[&self.to_bytes()?],
+        ))
+    }
+
+    /// The signed body followed by the issuer's signature: the bytes the
+    /// owners commit to.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
         let mut bytes = self.body()?;
         bytes.extend(self.sig.0);
-        Ok(crypto::tagged_hash("licash/grant-commitment/v2", &[&bytes]))
+        Ok(bytes)
+    }
+
+    /// Structural decoding of `to_bytes`. Nothing is verified: call
+    /// `verify` with the expected keyset and the proposal.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
+        let mut r = Reader::new(bytes, "grant", GRANT_TAG)?;
+        let keyset = r.array()?;
+        let proposal = ProposalId::from_bytes(r.array()?);
+        let lock = r.array()?;
+        let count = r.count(PACKET_BYTES)?;
+        if count == 0 {
+            return Err(bad("empty grant"));
+        }
+        let mut packets = Vec::with_capacity(count);
+        for _ in 0..count {
+            packets.push(Packet {
+                denom: r.u64()?,
+                blinded: Point(r.array()?),
+                sealed: r.take(SEALED_BYTES)?.to_vec(),
+                commit: DleqCommit {
+                    r1: Point(r.array()?),
+                    r2: Point(r.array()?),
+                },
+            });
+        }
+        let sig = Signature(r.array()?);
+        r.finish()?;
+        Ok(Self {
+            keyset,
+            proposal,
+            lock,
+            packets,
+            sig,
+        })
     }
 
     /// Keyset must be authenticated by the caller. This verifies the public
@@ -473,6 +522,46 @@ impl SignedProposal {
         };
         signed.verify(keyset, notes)?;
         Ok(signed)
+    }
+
+    /// `LICASH-SS\x02 ‖ proposal ‖ authorization ‖ signatures`: the
+    /// proposal's commitment bytes and the grant's bytes length-prefixed,
+    /// the authorization a tag (0 Plain, 1 Granted).
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes = SIGNED_TAG.to_vec();
+        put_blob(&mut bytes, &self.proposal.commitment_bytes()).expect("bounded proposal");
+        match &self.authorization {
+            Authorization::Plain => bytes.push(0),
+            Authorization::Granted(grant) => {
+                bytes.push(1);
+                // Signing and decoding verified the grant, so it encodes.
+                let grant = grant.to_bytes().expect("verified grant");
+                put_blob(&mut bytes, &grant).expect("bounded grant");
+            }
+        }
+        put_u32(&mut bytes, self.signatures.len()).expect("bounded signatures");
+        for sig in &self.signatures {
+            bytes.extend(sig.0);
+        }
+        bytes
+    }
+
+    /// Decode `to_bytes` and verify it, as `from_parts` does, against the
+    /// expected keyset and the notes it spends.
+    pub fn from_bytes(keyset: &Keyset, notes: &[Note], bytes: &[u8]) -> Result<Self, Error> {
+        let mut r = Reader::new(bytes, "signed proposal", SIGNED_TAG)?;
+        let proposal = Proposal::from_commitment_bytes(r.blob()?)?;
+        let authorization = match r.byte()? {
+            0 => Authorization::Plain,
+            1 => Authorization::Granted(Box::new(Grant::from_bytes(r.blob()?)?)),
+            _ => return Err(bad("unknown authorization")),
+        };
+        let count = r.count(64)?;
+        let signatures = (0..count)
+            .map(|_| r.array().map(Signature))
+            .collect::<Result<_, _>>()?;
+        r.finish()?;
+        Self::from_parts(keyset, proposal, notes, authorization, signatures)
     }
 
     pub fn proposal(&self) -> &Proposal {

@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    codec::Reader,
     crypto::{
         dleq_verify_blinded, dleq_verify_unblinded, generator_mul, scalar_from_hash, tagged_hash,
         Dleq, DleqCommit, Point, ScalarBytes,
@@ -20,6 +21,7 @@ use crate::{
 };
 
 const TAG: &[u8] = b"licash/note/v2";
+const NOTE_TAG: &[u8] = b"LICASH-NT\x02";
 const DST: &[u8] = b"LICASH-V2-secp256k1_XMD:SHA-256_SSWU_RO_";
 const KEYSET_TAG: &[u8] = b"LICASH-KS\x02";
 const MAX_KEYS: usize = 64;
@@ -351,6 +353,93 @@ impl Note {
             &crate::ec::Pt::from_point(&self.message.identifier()?)?,
             &crate::ec::Pt::from_point(&self.signature)?,
         )
+    }
+
+    /// `LICASH-NT\x02 ‖ keyset ‖ public fields ‖ C ‖ evidence`, the evidence
+    /// a tag (0 Unlinked, 1 Linked, 2 Granted) and its fields in order.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes = NOTE_TAG.to_vec();
+        bytes.extend(self.keyset);
+        bytes.extend(self.message.public_fields());
+        bytes.extend(self.signature.0);
+        let put_dleq = |bytes: &mut Vec<u8>, d: &Dleq| {
+            bytes.extend(d.e.0);
+            bytes.extend(d.s.0);
+        };
+        match &self.evidence {
+            Evidence::Unlinked(dleq) => {
+                bytes.push(0);
+                put_dleq(&mut bytes, dleq);
+            }
+            Evidence::Linked {
+                dleq,
+                blinding,
+                commit,
+            } => {
+                bytes.push(1);
+                put_dleq(&mut bytes, dleq);
+                bytes.extend(blinding.0);
+                bytes.extend(commit.r1.0);
+                bytes.extend(commit.r2.0);
+            }
+            Evidence::Granted {
+                dleq,
+                blinding,
+                commit,
+                unlock,
+            } => {
+                bytes.push(2);
+                put_dleq(&mut bytes, dleq);
+                bytes.extend(blinding.0);
+                bytes.extend(commit.r1.0);
+                bytes.extend(commit.r2.0);
+                bytes.extend(unlock.0);
+            }
+        }
+        bytes
+    }
+
+    /// Decode `to_bytes` and verify the note under `keyset`, the issuer
+    /// keyset the caller expects (never one the bytes merely name).
+    pub fn from_bytes(keyset: &Keyset, bytes: &[u8]) -> Result<Self, Error> {
+        let mut r = Reader::new(bytes, "note", NOTE_TAG)?;
+        let claimed = r.array()?;
+        let message = Message::from_public_fields(r.take(PUBLIC_FIELDS_BYTES)?)?;
+        let signature = Point(r.array()?);
+        let dleq = |r: &mut Reader| -> Result<Dleq, Error> {
+            Ok(Dleq {
+                e: ScalarBytes(r.array()?),
+                s: ScalarBytes(r.array()?),
+            })
+        };
+        let evidence = match r.byte()? {
+            0 => Evidence::Unlinked(dleq(&mut r)?),
+            tag @ (1 | 2) => {
+                let dleq = dleq(&mut r)?;
+                let blinding = ScalarBytes(r.array()?);
+                let commit = DleqCommit {
+                    r1: Point(r.array()?),
+                    r2: Point(r.array()?),
+                };
+                if tag == 1 {
+                    Evidence::Linked {
+                        dleq,
+                        blinding,
+                        commit,
+                    }
+                } else {
+                    Evidence::Granted {
+                        dleq,
+                        blinding,
+                        commit,
+                        unlock: ScalarBytes(r.array()?),
+                    }
+                }
+            }
+            _ => return Err(bad("unknown note evidence")),
+        };
+        r.finish()?;
+        Self::from_parts(keyset, claimed, message, signature, evidence)
     }
 }
 
