@@ -222,3 +222,69 @@ fn a_restored_backup_drops_the_notes_spent_since() {
     assert_eq!(json(&alice, &["check"])["dropped"], 32);
     assert_eq!(available(&alice), (7, 0));
 }
+
+#[test]
+fn a_lock_pays_on_its_preimage_or_returns_once_expired() {
+    let hub = Server::start(FEE);
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, alice_at) = party(dir.path(), "alice", Some(&hub));
+    let (bob, bob_at) = party(dir.path(), "bob", Some(&hub));
+    let funds = serde_json::to_string(&hub.pay(&address(&alice_at), 64)).unwrap();
+    ok(wallet(&alice, &["receive"], Some(&funds)));
+
+    // Bob keeps a secret and hands Alice its hash.
+    let secret = json(&bob, &["secret"]);
+    let preimage = secret["preimage"].as_str().unwrap();
+    let hash = secret["hash"].as_str().unwrap();
+    let lock = json(&alice, &["lock", &bob_at, "10", hash]);
+    let id = lock["id"].as_str().unwrap();
+    assert_eq!(
+        (lock["state"].as_str(), lock["amount"].as_u64()),
+        (Some("locked"), Some(10))
+    );
+    // The latest expiry the hub admits at height 3: its window of 20, less
+    // the depth of 1 and its reaction of 2.
+    assert_eq!(
+        (lock["fee"].as_u64(), lock["expiry"].as_u64()),
+        (Some(1), Some(20))
+    );
+    assert_eq!(available(&alice), (0, 64));
+    failed(
+        wallet(&bob, &["claim", id, &"00".repeat(32)], None),
+        1,
+        "not the preimage",
+    );
+    let claimed = json(&bob, &["claim", id, preimage]);
+    assert_eq!(
+        (claimed["id"].as_str(), claimed["amount"].as_u64()),
+        (Some(id), Some(10))
+    );
+    assert_eq!(available(&bob), (10, 0));
+    let resumed = json(&alice, &["resume"]);
+    let paid = &resumed["locks"][0];
+    assert_eq!(
+        (paid["state"].as_str(), paid["preimage"].as_str()),
+        (Some("paid"), Some(preimage))
+    );
+    assert_eq!(available(&alice), (53, 0));
+
+    // Unclaimed, a lock returns to its payer once expired, less the hub's
+    // refund fee.
+    let lock = json(&alice, &["lock", &bob_at, "10", hash, "--expiry", "8"]);
+    let id = lock["id"].as_str().unwrap();
+    hub.mine(6, None);
+    failed(wallet(&bob, &["claim", id, preimage], None), 1, "too late");
+    let resumed = json(&alice, &["resume"]);
+    assert_eq!(resumed["locks"][0]["state"], "refunded");
+    assert_eq!(available(&alice), (52, 0));
+    let text = ok(wallet(&alice, &["locks"], None));
+    assert!(
+        text.contains("lock refunded  10 + 1  until 8") && text.contains("lock paid"),
+        "{text}"
+    );
+    failed(
+        wallet(&alice, &["lock", &bob_at, "1", "abc"], None),
+        1,
+        "not 32 bytes in hex",
+    );
+}

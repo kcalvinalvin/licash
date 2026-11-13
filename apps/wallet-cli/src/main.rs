@@ -10,9 +10,9 @@ use std::{
 
 use anyhow::{bail, Context};
 use clap::{Parser, Subcommand, ValueEnum};
-use licash::address::Address;
+use licash::{address::Address, spend::lock_hash};
 use licash_api::Payment;
-use licash_wallet::{Error, State, Wallet};
+use licash_wallet::{Error, Lock, LockState, State, Wallet};
 use rand_core::{OsRng, RngCore};
 use serde_json::json;
 use tracing_subscriber::EnvFilter;
@@ -104,6 +104,34 @@ enum Command {
     },
     /// Give up a payment its hub never signed for, freeing its notes.
     Abandon { id: String },
+    /// A new secret to lock payments to: its preimage, to keep, and its
+    /// hash, to hand the payer.
+    Secret,
+    /// Lock AMOUNT to ADDRESS, paid on the preimage of HASH until the
+    /// lock expires, else refunded; the hub's fee on top. Prints the lock,
+    /// whose id the payee claims it with.
+    Lock {
+        address: String,
+        amount: u64,
+        hash: String,
+        /// Through this hub [default: the one holding the most].
+        #[arg(long)]
+        hub: Option<String>,
+        /// The height the lock expires at [default: the latest the hub
+        /// admits].
+        #[arg(long)]
+        expiry: Option<u32>,
+    },
+    /// The locks made, newest first.
+    Locks,
+    /// Take what lock ID pays this wallet, revealing PREIMAGE.
+    Claim {
+        id: String,
+        preimage: String,
+        /// The hub holding the lock [default: the only one trusted].
+        #[arg(long)]
+        hub: Option<String>,
+    },
     /// Unlink the notes held from the payments they came in.
     Unlink,
 }
@@ -286,6 +314,57 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 "abandoned; its notes are free".into(),
             );
         }
+        Command::Secret => {
+            let mut preimage = [0; 32];
+            OsRng.fill_bytes(&mut preimage);
+            let hash = hex::encode(lock_hash(&preimage));
+            let preimage = hex::encode(preimage);
+            show(
+                json,
+                json!({ "preimage": preimage, "hash": hash }),
+                format!("preimage {preimage}\nhash {hash}"),
+            );
+        }
+        Command::Lock {
+            address,
+            amount,
+            hash,
+            hub,
+            expiry,
+        } => {
+            let payee = decode(&address)?;
+            let hub = match hub {
+                Some(hub) => hub,
+                None => richest(&wallet)?,
+            };
+            let lock = wallet
+                .lock(&hub, &payee, amount, bytes(&hash)?, expiry)
+                .await?;
+            show(json, lock_json(&lock), lock_line(&lock));
+        }
+        Command::Locks => {
+            let locks = wallet.locks()?;
+            let lines = locks.iter().map(lock_line).collect::<Vec<_>>();
+            show(
+                json,
+                locks.iter().map(lock_json).collect(),
+                lines.join("\n"),
+            );
+        }
+        Command::Claim { id, preimage, hub } => {
+            let hub = match hub {
+                Some(hub) => hub,
+                None => only_hub(&wallet)?,
+            };
+            let received = wallet.claim(&hub, &id, &bytes(&preimage)?).await?;
+            let unlinked = unlink(&wallet).await;
+            let amount = received.amount;
+            show(
+                json,
+                json!({ "id": received.id, "hub": received.hub, "amount": amount, "unlinked": unlinked }),
+                format!("received {amount}"),
+            );
+        }
         Command::Unlink => {
             let unlinked = wallet.unlink().await?;
             show(
@@ -333,6 +412,7 @@ async fn resume(wallet: &Wallet<Http>, json: bool) -> anyhow::Result<()> {
             "done {id}: `licash-wallet payment {id}` prints its payment"
         ));
     }
+    lines.extend(resumed.locks.iter().map(lock_line));
     for (id, reason) in &resumed.abandoned {
         lines.push(format!("abandoned {id}: {reason}"));
     }
@@ -355,6 +435,7 @@ async fn resume(wallet: &Wallet<Http>, json: bool) -> anyhow::Result<()> {
         json,
         json!({
             "paid": paid.collect::<Vec<_>>(),
+            "locks": resumed.locks.iter().map(lock_json).collect::<Vec<_>>(),
             "abandoned": abandoned.collect::<Vec<_>>(),
             "pending": pending.collect::<Vec<_>>(),
             "unlinked": unlinked,
@@ -385,6 +466,59 @@ fn richest(wallet: &Wallet<Http>) -> anyhow::Result<String> {
     Ok(richest
         .context("no hub: `licash-wallet add-hub URL` trusts one")?
         .hub)
+}
+
+/// The only hub trusted.
+fn only_hub(wallet: &Wallet<Http>) -> anyhow::Result<String> {
+    let hubs = wallet.hubs()?;
+    match &hubs[..] {
+        [(url, _)] => Ok(url.clone()),
+        [] => bail!("no hub: `licash-wallet add-hub URL` trusts one"),
+        _ => bail!("several hubs trusted: name one with --hub"),
+    }
+}
+
+fn lock_state(state: &LockState) -> String {
+    match state {
+        LockState::Requested => "requested".into(),
+        LockState::Locked => "locked".into(),
+        LockState::Paid(_) => "paid".into(),
+        LockState::Refunded => "refunded".into(),
+        LockState::Abandoned(reason) => format!("abandoned ({reason})"),
+        _ => "unknown".into(),
+    }
+}
+
+fn lock_json(lock: &Lock) -> serde_json::Value {
+    let preimage = match &lock.state {
+        LockState::Paid(preimage) => Some(hex::encode(preimage)),
+        _ => None,
+    };
+    json!({
+        "id": lock.id, "hub": lock.hub, "payee": encode(&lock.payee), "amount": lock.amount,
+        "fee": lock.fee, "hash": hex::encode(lock.hash), "expiry": lock.expiry,
+        "state": lock_state(&lock.state), "preimage": preimage, "created_at": lock.created_at,
+    })
+}
+
+fn lock_line(lock: &Lock) -> String {
+    format!(
+        "{}  lock {}  {} + {}  until {}  via {}  {}",
+        lock.created_at,
+        lock_state(&lock.state),
+        lock.amount,
+        lock.fee,
+        lock.expiry,
+        lock.hub,
+        lock.id
+    )
+}
+
+/// 32 bytes, in hex.
+fn bytes(hex: &str) -> anyhow::Result<[u8; 32]> {
+    let mut bytes = [0; 32];
+    hex::decode_to_slice(hex.trim(), &mut bytes).context("not 32 bytes in hex")?;
+    Ok(bytes)
 }
 
 fn state(state: &State) -> String {

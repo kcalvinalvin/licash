@@ -26,6 +26,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
+bitcoin = { version = "=0.32.102", default-features = false, features = ["std"] }
 licash-hub.workspace = true
 licash-hub-service = { path = "../hub" }
 axum.workspace = true

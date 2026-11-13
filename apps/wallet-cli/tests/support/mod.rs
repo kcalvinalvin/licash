@@ -1,11 +1,14 @@
-//! A hub service on a local port that can go down and come back, and a
-//! payer outside any wallet.
+//! A hub service on a local port that can go down and come back, following
+//! a regtest chain of its own, and a payer outside any wallet.
+
+#[path = "../../../hub/tests/chain/mod.rs"]
+mod chain;
 
 use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
-    sync::Arc,
+    sync::{Arc, Mutex},
     thread::JoinHandle,
 };
 
@@ -18,12 +21,23 @@ use licash::{
     unlink::Nonce,
 };
 use licash_api::{Fee, Payment};
-use licash_hub::{Hub, Policy};
+use licash_hub::{Hub, Policy, Timing};
 
 const MAX_POW: u32 = 6;
 
+/// The timing of the hub's locks: short, to expire them in a test.
+const TIMING: Timing = Timing {
+    window: 20,
+    reaction: 2,
+    min_depth: 1,
+    max_headers: 4032,
+    bury: 6,
+    max_lag: 120,
+};
+
 pub struct Server {
     pub hub: Arc<Hub>,
+    chain: Mutex<chain::Chain>,
     addr: SocketAddr,
     seed: PathBuf,
     running: Option<(tokio::sync::oneshot::Sender<()>, JoinHandle<()>)>,
@@ -31,24 +45,43 @@ pub struct Server {
 }
 
 impl Server {
+    /// A hub charging `fee` on spends and in each branch of a lock, at
+    /// height 3 of its chain.
     pub fn start(fee: Fee) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let (seed, db) = (dir.path().join("seed"), dir.path().join("hub.sqlite"));
         Hub::init(&seed, &db, MAX_POW).unwrap();
         let policy = Policy {
             spend: fee,
-            ..Policy::default()
+            lock: fee,
+            refund: fee,
+            timing: TIMING,
         };
         let hub = Arc::new(Hub::open(&seed, &db, policy).unwrap());
+        let chain = chain::Chain::new();
+        hub.add_checkpoint(&chain.checkpoint(0)).unwrap();
         let mut server = Self {
             hub,
+            chain: Mutex::new(chain),
             addr: "127.0.0.1:0".parse().unwrap(),
             seed,
             running: None,
             _dir: dir,
         };
+        server.mine(3, None);
         server.up();
         server
+    }
+
+    /// Mine `blocks`, the first with an activation of `secret` if given,
+    /// which the hub scans.
+    pub fn mine(&self, blocks: u32, mut secret: Option<[u8; 32]>) {
+        let mut chain = self.chain.lock().unwrap();
+        for _ in 0..blocks {
+            let block = chain.mine(secret.take()).clone();
+            self.hub.observe(chain.height(), &block).unwrap();
+        }
+        assert!(self.hub.synced(chain.height(), &chain.tip()).unwrap());
     }
 
     pub fn url(&self) -> String {
