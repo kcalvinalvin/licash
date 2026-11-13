@@ -5,6 +5,7 @@ use licash::{
     note::Evidence,
     note::{Derivation, HoldRoot, IssuerKeys, Keyset, Note},
     spend::{ChainProfile, Output, Proposal, TimedLock, TimedTerms},
+    unlink,
 };
 
 fn point(key: u64) -> Point {
@@ -201,6 +202,75 @@ fn a_complete_grant_opens_each_coin_with_one_shared_unlock_after_owner_authoriza
     assert_eq!(format!("{prepared:?}"), "PreparedGrant(..)");
     assert_eq!(format!("{grant:?}"), "Grant(..)");
     assert_eq!(format!("{:?}", grant.packets[0]), "GrantPacket(..)");
+}
+
+#[test]
+fn a_derived_grant_rebuilds_from_its_secrets_and_releases_against_the_stored_offer() {
+    let (keys, keyset, notes, proposal) = fixture();
+    let (unlock, nonce_secret) = ([41; 32], [43; 32]);
+    let prepared = PreparedGrant::derive(&keys, &proposal, unlock, &nonce_secret).unwrap();
+    let grant = prepared.offer();
+    grant.verify(&keyset, &proposal).unwrap();
+    // The secrets fix the lock and the unlink commitments; proofs and the
+    // issuer signature are fresh, so an issuer keeps the offer it sent.
+    let again = PreparedGrant::derive(&keys, &proposal, unlock, &nonce_secret)
+        .unwrap()
+        .offer();
+    assert_eq!(again.lock, grant.lock);
+    for (a, b) in again.packets.iter().zip(&grant.packets) {
+        assert_eq!(
+            (a.denom, a.blinded, a.commit),
+            (b.denom, b.blinded, b.commit)
+        );
+    }
+    assert_ne!(again, grant);
+    let other = PreparedGrant::derive(&keys, &proposal, unlock, &[44; 32])
+        .unwrap()
+        .offer();
+    assert_eq!(other.lock, grant.lock);
+    assert_ne!(other.packets[0].commit, grant.packets[0].commit);
+    for (nonce, output) in prepared.unlink_nonces().iter().zip(proposal.outputs()) {
+        let derived = unlink::Nonce::derive(&nonce_secret, &keyset, output).unwrap();
+        assert_eq!(nonce.commit().unwrap(), derived.commit().unwrap());
+    }
+    let signed = SignedProposal::sign(
+        &keyset,
+        proposal.clone(),
+        &notes,
+        Authorization::Granted(Box::new(grant.clone())),
+        &owners(),
+    )
+    .unwrap();
+    grant
+        .verify_release(&keyset, &notes, &signed, &unlock)
+        .unwrap();
+    assert_eq!(prepared.release(&keyset, &notes, &signed).unwrap(), unlock);
+    let note = signed
+        .open_granted_output(&keyset, &notes, 0, &derive(10), &unlock)
+        .unwrap();
+    note.verify(&keyset).unwrap();
+    assert!(grant
+        .verify_release(&keyset, &notes, &signed, &[42; 32])
+        .is_err());
+    assert!(again
+        .verify_release(&keyset, &notes, &signed, &unlock)
+        .is_err());
+    assert!(grant
+        .verify_release(&keyset, &notes[..1], &signed, &unlock)
+        .is_err());
+    let plain = SignedProposal::sign(
+        &keyset,
+        proposal.clone(),
+        &notes,
+        Authorization::Plain,
+        &owners(),
+    )
+    .unwrap();
+    assert!(grant
+        .verify_release(&keyset, &notes, &plain, &unlock)
+        .is_err());
+    let foreign = IssuerKeys::random(3).unwrap();
+    assert!(PreparedGrant::derive(&foreign, &proposal, unlock, &nonce_secret).is_err());
 }
 
 #[test]

@@ -251,6 +251,23 @@ impl Grant {
         Ok(())
     }
 
+    /// `unlock` may be released: the owners of `notes` signed `signed`, which
+    /// authorizes exactly this offer, and `unlock` opens it. The same
+    /// limits as [`PreparedGrant::release`] apply.
+    pub fn verify_release(
+        &self,
+        keyset: &Keyset,
+        notes: &[Note],
+        signed: &SignedProposal,
+        unlock: &Unlock,
+    ) -> Result<(), Error> {
+        signed.verify(keyset, notes)?;
+        if !matches!(signed.authorization(), Authorization::Granted(grant) if **grant == *self) {
+            return Err(bad("unlock release requires the exact authorized offer"));
+        }
+        self.verify_unlock(keyset, unlock)
+    }
+
     /// This grant's unlock among published disclosure slots, by its hash.
     pub fn unlock_in(&self, slots: &[[u8; 32]]) -> Option<Unlock> {
         slots
@@ -332,12 +349,26 @@ impl PreparedGrant {
     /// Curve/signing primitive only. A service must separately authenticate
     /// inputs, authorize admission and retain durable intent before replying.
     pub fn new(keys: &IssuerKeys, proposal: &Proposal) -> Result<Self, Error> {
+        let unlock: Unlock = ScalarBytes::from_scalar(&crypto::random_scalar()).0;
+        let nonce_secret = ScalarBytes::from_scalar(&crypto::random_scalar()).0;
+        Self::derive(keys, proposal, unlock, &nonce_secret)
+    }
+
+    /// The grant for `proposal` under issuer-chosen secrets, so an issuer
+    /// that keeps the offer it sent can derive its unlock and unlink nonces
+    /// again instead of storing them. `unlock` must be unpredictable to
+    /// everyone else; the nonces follow [`unlink::Nonce::derive`].
+    pub fn derive(
+        keys: &IssuerKeys,
+        proposal: &Proposal,
+        unlock: Unlock,
+        nonce_secret: &[u8; 32],
+    ) -> Result<Self, Error> {
         let keyset = keys.keyset()?;
         if proposal.keyset_id() != keyset.id() || proposal.lock().is_some() {
             return Err(bad("unsupported grant proposal"));
         }
         let id = proposal.id();
-        let unlock: Unlock = ScalarBytes::from_scalar(&crypto::random_scalar()).0;
         let mut records = Vec::new();
         for (index, output) in proposal.outputs().iter().enumerate() {
             let secret = keys.denomination_secret(output.denomination())?;
@@ -356,7 +387,7 @@ impl PreparedGrant {
             }
             records.push(PacketRecord {
                 sealed,
-                nonce: unlink::Nonce::new(&keyset, output)?,
+                nonce: unlink::Nonce::derive(nonce_secret, &keyset, output)?,
             });
         }
         let mut offer = Grant {
@@ -405,11 +436,8 @@ impl PreparedGrant {
         notes: &[Note],
         signed: &SignedProposal,
     ) -> Result<Unlock, Error> {
-        signed.verify(keyset, notes)?;
-        if !matches!(signed.authorization(), Authorization::Granted(grant) if **grant == self.offer())
-        {
-            return Err(bad("unlock release requires the exact authorized offer"));
-        }
+        self.offer()
+            .verify_release(keyset, notes, signed, &self.unlock)?;
         Ok(self.unlock)
     }
 }
