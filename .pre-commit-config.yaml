@@ -16,6 +16,12 @@ repos:
         language: system
         types: [rust]
         pass_filenames: false
+      - id: apps-fmt-clippy
+        name: apps fmt and clippy
+        entry: sh -c 'cargo fmt --manifest-path apps/Cargo.toml --all -- --check && cargo clippy --locked --manifest-path apps/Cargo.toml --workspace --all-targets -- -D warnings'
+        language: system
+        files: ^(apps/|crates/licash(-api|-hub)?/)
+        pass_filenames: false
       - id: regtest-clippy
         name: regtest cargo clippy
         entry: cargo clippy --locked --manifest-path regtest/Cargo.toml --all-targets --no-deps -- -D warnings
