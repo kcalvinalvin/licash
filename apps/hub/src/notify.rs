@@ -11,7 +11,7 @@ use licash_hub::{Event, Hub, Ledger, Notice, Settled};
 use licash_notify::{Item, Message, Outbox, Priority, Relay, Target, Timing};
 
 /// The kinds of the hub's events.
-pub const KINDS: [&str; 7] = [
+pub const KINDS: [&str; 9] = [
     "started",
     "released",
     "double_spend",
@@ -19,6 +19,8 @@ pub const KINDS: [&str; 7] = [
     "settled",
     "activated",
     "reorg",
+    "forwarded",
+    "alert",
 ];
 
 /// How long a stopping hub tries to say so.
@@ -241,6 +243,28 @@ pub fn message(event: &Event) -> Message {
                  scans no further, so admits and refunds no lock, until its operator acts."
             ),
         ),
+        Some(Notice::Forwarded {
+            proposal,
+            amount,
+            failed: None,
+        }) => Message::new(
+            Priority::Low,
+            "Payment forwarded",
+            format!("Paid outside the ledger for a lock of {amount}. Proposal {proposal}."),
+        ),
+        Some(Notice::Forwarded {
+            proposal,
+            amount,
+            failed: Some(reason),
+        }) => Message::new(
+            Priority::Normal,
+            "Forward failed",
+            format!(
+                "The payment for a lock of {amount} failed ({reason}); the lock is refunded. \
+                 Proposal {proposal}."
+            ),
+        ),
+        Some(Notice::Alert { message }) => Message::new(Priority::High, "Hub alert", message),
         _ => Message::new(
             Priority::Normal,
             format!("Hub event {}", event.kind),
@@ -307,6 +331,14 @@ mod tests {
                 refunded: false,
             },
             Notice::Reorg { height: 800 },
+            Notice::Forwarded {
+                proposal: "p".into(),
+                amount: 4,
+                failed: Some("no route".into()),
+            },
+            Notice::Alert {
+                message: "look".into(),
+            },
         ];
         let kinds: Vec<_> = notices.iter().map(Notice::kind).collect();
         assert_eq!(kinds, KINDS);
@@ -328,6 +360,12 @@ mod tests {
         assert_eq!(messages[5].priority, Priority::High);
         assert!(messages[5].body.contains("block 899"));
         assert_eq!(messages[6].priority, Priority::High);
+        assert_eq!(messages[7].title, "Forward failed");
+        assert!(messages[7].body.contains("no route"));
+        assert_eq!(
+            (messages[8].priority, messages[8].body.as_str()),
+            (Priority::High, "look")
+        );
         // Each own variant reads as its own message too.
         let own = Notice::Locked {
             proposal: "p4".into(),

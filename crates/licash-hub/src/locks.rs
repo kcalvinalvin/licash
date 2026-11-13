@@ -24,7 +24,7 @@ use licash::{
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 
-use crate::{notify, now, retire, sql, Error, Hub, Notice, Refusal};
+use crate::{forwards, notify, now, retire, sql, Error, Hub, Notice, Refusal};
 
 /// The timing of the locks a hub admits, in blocks unless named.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -223,13 +223,16 @@ impl Hub {
                 if new == 0 {
                     continue;
                 }
-                // The locks it makes pay: a refunded one is owed twice.
+                // The locks it makes pay: a refunded one is owed twice,
+                // unless the hub gave up its pay branch on a failed forward.
                 let hit: Vec<([u8; 32], bool)> = tx
                     .prepare(
                         "SELECT l.id, l.settled IS 'refund' FROM locks l
                          JOIN checkpoints c ON c.commitment = l.checkpoint
                          WHERE l.hash = ?1 AND c.height < ?2 AND ?2 < l.expiry
-                           AND l.settled IS NOT 'pay'",
+                           AND l.settled IS NOT 'pay'
+                           AND NOT EXISTS (SELECT 1 FROM forwards f
+                                           WHERE f.lock = l.id AND f.state = 'failed')",
                     )?
                     .query_map(params![lock, height], |r| Ok((r.get(0)?, r.get(1)?)))?
                     .collect::<Result<_, _>>()?;
@@ -296,7 +299,7 @@ impl Hub {
         Ok(reached)
     }
 
-    fn is_synced(&self) -> bool {
+    pub(crate) fn is_synced(&self) -> bool {
         let max_lag = Duration::from_secs(self.policy.timing.max_lag);
         self.synced_at
             .lock()
@@ -460,6 +463,7 @@ impl Hub {
     /// its hash, unless the hub refunded it. Where the payee is not the
     /// hub, only while the lock has not expired or once an activation
     /// published the preimage in time: the payer may count on a refund.
+    /// A payment under way for the lock is paid ([`Hub::forward`]).
     pub fn settle(&self, id: &ProposalId, preimage: &[u8; 32]) -> Result<Vec<MintResponse>, Error> {
         let Row {
             lock,
@@ -508,6 +512,7 @@ impl Hub {
                 "UPDATE locks SET preimage = ?2, settled = 'pay', settled_at = ?3 WHERE id = ?1",
                 params![id.as_bytes(), preimage, now()],
             )?;
+            forwards::paid(tx, id, preimage)?;
             let proposal = hex::encode(id.as_bytes());
             let (amount, fee) = (lock_amount(tx, id)?, charge.pay);
             notify(
@@ -529,9 +534,29 @@ impl Hub {
     }
 
     /// The issuances of the refund branch of lock `id`, once the scan shows
-    /// it expired at depth unactivated, unless the hub paid it. An own
-    /// lock's refund returns to the hub, which issues nothing.
+    /// it expired at depth unactivated, unless the hub paid it, or a
+    /// payment for it is under way ([`Hub::forward`]). An own lock's refund
+    /// returns to the hub, which issues nothing.
     pub fn refund(&self, id: &ProposalId) -> Result<Vec<MintResponse>, Error> {
+        self.refund_as(id, None)
+    }
+
+    /// Refund lock `id`, of which the hub gets `amount`, at once: its
+    /// forward failed for `reason`.
+    pub(crate) fn refund_failed(
+        &self,
+        id: &ProposalId,
+        reason: &str,
+        amount: u64,
+    ) -> Result<(), Error> {
+        self.refund_as(id, Some((reason, amount))).map(drop)
+    }
+
+    fn refund_as(
+        &self,
+        id: &ProposalId,
+        failed: Option<(&str, u64)>,
+    ) -> Result<Vec<MintResponse>, Error> {
         let Row {
             lock,
             keyset,
@@ -560,22 +585,10 @@ impl Hub {
                 Some(Settled::Pay) => return Err(Refusal::Settled.into()),
                 None => {}
             }
-            let decided = terms.expiry().checked_add(terms.depth());
-            let (top, _) = tip(tx)?.ok_or(Error::Halted)?;
-            if decided.is_none_or(|at| top < at) {
-                return Err(Refusal::Unexpired.into());
-            }
-            // Every block from the checkpoint to the tip was scanned.
-            let scanned: u32 = tx.query_row(
-                "SELECT count(*) FROM blocks WHERE height > ?1 AND height <= ?2",
-                params![anchor, top],
-                |r| r.get(0),
-            )?;
-            if scanned != top - anchor {
-                return Err(Error::Halted);
-            }
-            if activated(tx, &terms, anchor)? {
-                return Err(Refusal::Activated.into());
+            match failed {
+                // The hub gives up its claim, which it never paid for.
+                Some((reason, amount)) => forwards::fail(tx, id, reason, amount)?,
+                None => self.expired(tx, id, &terms, anchor)?,
             }
             if !lock.own {
                 self.issue(tx, id, keyset, outputs, &issuances, &income)?;
@@ -607,10 +620,48 @@ impl Hub {
             .read(|c| self.issued_branch(c, id, keyset, Branch::Refund))
     }
 
+    /// Check that lock `id`, of `terms` from the checkpoint at `anchor`, is
+    /// refunded: expired at depth unactivated on every block scanned, and
+    /// no payment for it under way.
+    fn expired(
+        &self,
+        tx: &Transaction<'_>,
+        id: &ProposalId,
+        terms: &TimedTerms,
+        anchor: u32,
+    ) -> Result<(), Error> {
+        if forwards::pending(tx, id)? {
+            return Err(Refusal::Forwarding.into());
+        }
+        let decided = terms.expiry().checked_add(terms.depth());
+        let (top, _) = tip(tx)?.ok_or(Error::Halted)?;
+        if decided.is_none_or(|at| top < at) {
+            return Err(Refusal::Unexpired.into());
+        }
+        // Every block from the checkpoint to the tip was scanned.
+        let scanned: u32 = tx.query_row(
+            "SELECT count(*) FROM blocks WHERE height > ?1 AND height <= ?2",
+            params![anchor, top],
+            |r| r.get(0),
+        )?;
+        if scanned != top - anchor {
+            return Err(Error::Halted);
+        }
+        if activated(tx, terms, anchor)? {
+            return Err(Refusal::Activated.into());
+        }
+        Ok(())
+    }
+
     /// Lock `id` as the hub holds it.
     pub fn locked(&self, id: &ProposalId) -> Result<Lock, Error> {
         let row = self.store.read(|c| self.row(c, id))?;
         Ok(row.ok_or(Refusal::UnknownLock)?.lock)
+    }
+
+    /// The hub's own lock under `hash`, if any ([`Hub::lock_own`]).
+    pub fn own_lock_of(&self, hash: &[u8; 32]) -> Result<Option<Lock>, Error> {
+        self.store.read(|c| self.own_lock(c, hash))
     }
 }
 
@@ -853,7 +904,7 @@ impl Hub {
     }
 
     /// What `proposal`, a lock, moves, and the hub's outputs in each branch.
-    fn lock_charge(&self, proposal: &Proposal) -> Result<Charge, Error> {
+    pub(crate) fn lock_charge(&self, proposal: &Proposal) -> Result<Charge, Error> {
         let amount = proposal
             .inputs()
             .iter()
@@ -877,16 +928,16 @@ impl Hub {
 }
 
 /// A lock's amount and the hub's outputs in it.
-struct Charge {
+pub(crate) struct Charge {
     amount: u64,
     /// The value of the hub's outputs in each branch.
-    pay: u64,
+    pub(crate) pay: u64,
     refund: u64,
     received: Vec<licash::address::Received>,
 }
 
 impl Charge {
-    fn count(&self, branch: Branch) -> usize {
+    pub(crate) fn count(&self, branch: Branch) -> usize {
         self.received.iter().filter(|r| r.branch == branch).count()
     }
 
@@ -908,7 +959,7 @@ impl Charge {
     }
 }
 
-fn tip(c: &Connection) -> Result<Option<(u32, [u8; 32])>, Error> {
+pub(crate) fn tip(c: &Connection) -> Result<Option<(u32, [u8; 32])>, Error> {
     Ok(c.query_row(
         "SELECT height, hash FROM blocks ORDER BY height DESC LIMIT 1",
         [],
@@ -948,7 +999,7 @@ pub(crate) fn newest_checkpoint(c: &Connection) -> Result<Option<Checkpoint>, Er
     bytes.map(|b| Ok(Checkpoint::from_bytes(&b)?)).transpose()
 }
 
-fn settled_of(c: &Connection, id: &ProposalId) -> Result<Option<Settled>, Error> {
+pub(crate) fn settled_of(c: &Connection, id: &ProposalId) -> Result<Option<Settled>, Error> {
     let settled: Option<String> = c.query_row(
         "SELECT settled FROM locks WHERE id = ?1",
         [id.as_bytes()],

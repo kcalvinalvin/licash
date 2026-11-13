@@ -20,6 +20,7 @@
 //!
 //! [`Ledger`] reads the database beside a running hub, for monitoring.
 
+mod forwards;
 mod locks;
 mod store;
 
@@ -46,6 +47,7 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use store::{now, setup_io, Store};
 
+pub use forwards::{Forward, Forwarded};
 pub use locks::{Lock, Settled, Timing};
 
 /// The largest denomination exponent a hub issues: its ledger keeps
@@ -133,6 +135,10 @@ pub enum Refusal {
     Unlinked,
     #[error("unlinking closed by a hub restart: swap the note instead")]
     Expired,
+    #[error("cannot forward: {0}")]
+    Forward(&'static str),
+    #[error("a payment for the lock is under way")]
+    Forwarding,
 }
 
 impl Refusal {
@@ -151,7 +157,8 @@ impl Refusal {
             Self::NotALock => Code::NotALock,
             Self::Checkpoint(_) => Code::Checkpoint,
             Self::Timing(_) => Code::Timing,
-            Self::Unsynced | Self::NoChain => Code::Unavailable,
+            Self::Unsynced | Self::NoChain | Self::Forwarding => Code::Unavailable,
+            Self::Forward(_) => Code::Forward,
             Self::UnknownLock => Code::UnknownLock,
             Self::Preimage => Code::Preimage,
             Self::Settled => Code::Settled,
@@ -229,6 +236,15 @@ pub enum Notice {
     /// Bitcoin reorganized at `height`, at or below a checkpoint: the hub
     /// scans no more until its operator acts.
     Reorg { height: u32 },
+    /// A payment outside the ledger for a lock of `amount` paid, or
+    /// `failed`, and why: the lock is refunded.
+    Forwarded {
+        proposal: String,
+        amount: u64,
+        failed: Option<String>,
+    },
+    /// Something the operator must look at, from a service on the hub.
+    Alert { message: String },
 }
 
 impl Notice {
@@ -241,6 +257,8 @@ impl Notice {
             Self::Settled { .. } => "settled",
             Self::Activated { .. } => "activated",
             Self::Reorg { .. } => "reorg",
+            Self::Forwarded { .. } => "forwarded",
+            Self::Alert { .. } => "alert",
         }
     }
 }
@@ -495,6 +513,19 @@ impl Hub {
     /// The events after `seq`, oldest first, at most `limit`.
     pub fn events(&self, after: u64, limit: u32) -> Result<Vec<Event>, Error> {
         self.store.read(|c| events(c, after, limit))
+    }
+
+    /// Tell the operator `message`, through the notification outbox.
+    pub fn alert(&self, message: &str) -> Result<(), Error> {
+        tracing::error!(message, "alert");
+        self.store.write(|tx| {
+            notify(
+                tx,
+                &Notice::Alert {
+                    message: message.to_owned(),
+                },
+            )
+        })
     }
 
     fn keys(&self, id: &[u8; 32]) -> Result<(&IssuerKeys, &Keyset), Error> {

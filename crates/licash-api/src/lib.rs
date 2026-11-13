@@ -328,6 +328,8 @@ pub enum Code {
     Activated,
     /// The hub cannot serve now, or is behind the chain; retry later.
     Unavailable,
+    /// The hub does not make this payment outside its ledger for the lock.
+    Forward,
 }
 
 impl Code {

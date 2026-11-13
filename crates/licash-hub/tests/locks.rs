@@ -20,7 +20,7 @@ use licash::{
     spend::{lock_hash, ChainProfile, Output, Proposal, ProposalId, TimedLock, TimedTerms},
     unlink::{Nonce, Session},
 };
-use licash_hub::{Error, Fee, Hub, Ledger, Notice, Policy, Refusal, Settled, Timing};
+use licash_hub::{Error, Fee, Forwarded, Hub, Ledger, Notice, Policy, Refusal, Settled, Timing};
 
 const MAX_POW: u32 = 6;
 const SECRET: [u8; 32] = [7; 32];
@@ -929,4 +929,200 @@ fn a_refunded_lock_activated_in_time_after_a_reorganization_is_alerted() {
     let alerts = kinds(&hub).iter().filter(|k| *k == "activated").count();
     assert_eq!(alerts, 1);
     assert_eq!(refused(hub.settle(&l.id(), &SECRET)), Refusal::Settled);
+}
+
+/// A lock of 4 paying the hub only, refunding the payer 4.
+fn to_hub(files: &Files, hub: &Hub, terms: TimedTerms) -> Locking {
+    let pay = [(hub.info().address, 4)];
+    locking(files, &pay, &[(owner(1).address(), 4)], terms)
+}
+
+#[test]
+fn a_forward_settles_its_lock_on_the_preimage_it_bought() {
+    let (files, hub, mut chain) = setup(policy());
+    let expiry = chain.height() + 5;
+    let l = to_hub(&files, &hub, terms(&hub, expiry, 1));
+    hub.lock(&l.signed, &l.notes).unwrap();
+    assert!(matches!(
+        refused(hub.forward(&l.id(), &lock_hash(&SECRET), "lnbcrt1", "node", 5)),
+        Refusal::Fee { due: 5, paid: 4 }
+    ));
+    let forward = hub
+        .forward(&l.id(), &lock_hash(&SECRET), "lnbcrt1", "node", 4)
+        .unwrap();
+    assert_eq!(
+        (forward.hash, forward.amount, forward.expiry, &forward.state),
+        (lock_hash(&SECRET), 4, expiry, &Forwarded::Pending)
+    );
+    assert_eq!(
+        hub.forward(&l.id(), &lock_hash(&SECRET), "lnbcrt1", "node", 4)
+            .unwrap(),
+        forward
+    );
+    assert!(matches!(
+        refused(hub.forward(&l.id(), &lock_hash(&SECRET), "lnbcrt2", "node", 4)),
+        Refusal::Forward(_)
+    ));
+    assert_eq!(hub.forwards().unwrap(), vec![forward]);
+    // One live payment per hash.
+    let other = to_hub(&files, &hub, terms(&hub, expiry, 1));
+    hub.lock(&other.signed, &other.notes).unwrap();
+    assert!(matches!(
+        refused(hub.forward(&other.id(), &lock_hash(&SECRET), "lnbcrt1", "node", 4)),
+        Refusal::Forward(_)
+    ));
+
+    // While the payment is under way, the lock is not refunded.
+    chain.mine(&hub, 6);
+    chain.sync(&hub);
+    assert_eq!(refused(hub.refund(&l.id())), Refusal::Forwarding);
+    assert_eq!(
+        refused(hub.forward_paid(&l.id(), &[8; 32])),
+        Refusal::Preimage
+    );
+    hub.forward_paid(&l.id(), &SECRET).unwrap();
+    hub.forward_paid(&l.id(), &SECRET).unwrap();
+    let lock = hub.locked(&l.id()).unwrap();
+    assert_eq!(
+        (lock.settled, lock.preimage),
+        (Some(Settled::Pay), Some(SECRET))
+    );
+    assert_eq!(
+        hub.forward_of(&l.id()).unwrap().unwrap().state,
+        Forwarded::Paid(SECRET)
+    );
+    assert!(hub.forwards().unwrap().is_empty());
+    assert_eq!(
+        refused(hub.forward_failed(&l.id(), "late")),
+        Refusal::Settled
+    );
+    assert_eq!(Ledger::open(&files.db).unwrap().stats().unwrap().income, 4);
+    let forwarded = hub.events(0, 100).unwrap();
+    let forwarded: Vec<_> = forwarded.iter().filter_map(|e| e.notice()).collect();
+    assert!(forwarded.contains(&Notice::Forwarded {
+        proposal: hex::encode(l.id().as_bytes()),
+        amount: 4,
+        failed: None,
+    }));
+    // Expired, the other lock is forwarded no more.
+    assert_eq!(
+        refused(hub.forward(&other.id(), &lock_hash(&SECRET), "lnbcrt3", "node", 4)),
+        Refusal::LockExpired
+    );
+}
+
+#[test]
+fn a_failed_forward_refunds_its_lock_at_once() {
+    let (files, hub, mut chain) = setup(policy());
+    let (_, keyset) = issuer(&files);
+    let l = to_hub(&files, &hub, terms(&hub, chain.height() + 5, 1));
+    hub.lock(&l.signed, &l.notes).unwrap();
+    hub.forward(&l.id(), &lock_hash(&SECRET), "lnbcrt1", "node", 4)
+        .unwrap();
+    hub.forward_failed(&l.id(), "no route").unwrap();
+    hub.forward_failed(&l.id(), "no route").unwrap();
+    assert_eq!(
+        hub.forward_of(&l.id()).unwrap().unwrap().state,
+        Forwarded::Failed("no route".into())
+    );
+    assert_eq!(hub.locked(&l.id()).unwrap().settled, Some(Settled::Refund));
+    let refunded = hub.refund(&l.id()).unwrap();
+    assert_eq!(opened(&keyset, &refunded, &l.refund).len(), 1);
+    // Neither made again nor paid: paid after all, the hub alerts.
+    assert!(matches!(
+        refused(hub.forward(&l.id(), &lock_hash(&SECRET), "lnbcrt1", "node", 4)),
+        Refusal::Forward(_)
+    ));
+    assert!(!kinds(&hub).contains(&"alert".to_owned()));
+    assert!(matches!(
+        refused(hub.forward_paid(&l.id(), &SECRET)),
+        Refusal::Forward(_)
+    ));
+    assert!(kinds(&hub).contains(&"alert".to_owned()));
+    assert_eq!(refused(hub.settle(&l.id(), &SECRET)), Refusal::Settled);
+    // Its hash activated in time owes no one: the hub gave up its claim.
+    chain.activate(&hub, SECRET);
+    assert!(!kinds(&hub).contains(&"activated".to_owned()));
+    // A failed payment leaves its hash free.
+    let again = to_hub(&files, &hub, terms(&hub, chain.height() + 5, 1));
+    hub.lock(&again.signed, &again.notes).unwrap();
+    hub.forward(&again.id(), &lock_hash(&SECRET), "lnbcrt1", "node", 4)
+        .unwrap();
+    assert!(kinds(&hub).contains(&"forwarded".to_owned()));
+}
+
+#[test]
+fn only_a_lock_paying_the_hub_alone_is_forwarded() {
+    let (files, hub, chain) = setup(policy());
+    let (_, keyset) = issuer(&files);
+    let l = standard(&files, &hub, terms(&hub, chain.height() + 5, 1));
+    hub.lock(&l.signed, &l.notes).unwrap();
+    assert!(matches!(
+        refused(hub.forward(&l.id(), &lock_hash(&SECRET), "lnbcrt1", "node", 1)),
+        Refusal::Forward(_)
+    ));
+    assert_eq!(
+        refused(hub.forward(
+            &ProposalId::from_bytes([9; 32]),
+            &lock_hash(&SECRET),
+            "lnbcrt1",
+            "node",
+            1
+        )),
+        Refusal::UnknownLock
+    );
+    let e = Ephemeral::random();
+    let d = e.derive(&owner(3).address(), 4, Branch::Pay, 0).unwrap();
+    let own = hub
+        .lock_own(
+            keyset.id(),
+            e.public(),
+            vec![Output::from_derivation(&d).unwrap()],
+            terms(&hub, chain.height() + 5, 1),
+        )
+        .unwrap();
+    let id = own.proposal.id();
+    assert_eq!(
+        hub.own_lock_of(&lock_hash(&SECRET))
+            .unwrap()
+            .unwrap()
+            .proposal
+            .id(),
+        id
+    );
+    assert!(hub.own_lock_of(&[0; 32]).unwrap().is_none());
+    assert!(matches!(
+        refused(hub.forward(&id, &lock_hash(&SECRET), "lnbcrt1", "node", 1)),
+        Refusal::Forward(_)
+    ));
+}
+
+#[test]
+fn a_forward_is_paid_by_its_lock_settled_from_elsewhere() {
+    let (files, hub, chain) = setup(policy());
+    let l = to_hub(&files, &hub, terms(&hub, chain.height() + 5, 1));
+    hub.lock(&l.signed, &l.notes).unwrap();
+    assert!(matches!(
+        refused(hub.forward(&l.id(), &[8; 32], "lnbcrt1", "node", 4)),
+        Refusal::Forward(_)
+    ));
+    hub.forward(&l.id(), &lock_hash(&SECRET), "lnbcrt1", "node", 4)
+        .unwrap();
+    hub.settle(&l.id(), &SECRET).unwrap();
+    assert_eq!(
+        hub.forward_of(&l.id()).unwrap().unwrap().state,
+        Forwarded::Paid(SECRET)
+    );
+    assert!(hub.forwards().unwrap().is_empty());
+    assert_eq!(
+        refused(hub.forward_failed(&l.id(), "late")),
+        Refusal::Settled
+    );
+    assert_eq!(
+        refused(hub.forward(&l.id(), &lock_hash(&SECRET), "lnbcrt1", "node", 4)),
+        Refusal::Settled
+    );
+    hub.forward_paid(&l.id(), &SECRET).unwrap();
+    let forwarded = kinds(&hub).iter().filter(|k| *k == "forwarded").count();
+    assert_eq!(forwarded, 1);
 }

@@ -129,6 +129,24 @@ CREATE TABLE income (
     note BLOB NOT NULL,
     PRIMARY KEY (proposal, position)
 ) STRICT;
+-- Payments the hub makes outside its ledger, such as over Lightning, for a
+-- lock that pays it only, settled by the preimage they buy. A pending one
+-- keeps its lock from a refund; a failed one refunded it. One live
+-- payment per hash.
+CREATE TABLE forwards (
+    lock BLOB PRIMARY KEY REFERENCES locks (id),
+    hash BLOB NOT NULL,
+    request TEXT NOT NULL,
+    node TEXT NOT NULL,
+    amount INTEGER NOT NULL,
+    expiry INTEGER NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('pending', 'paid', 'failed')),
+    preimage BLOB,
+    reason TEXT,
+    created_at INTEGER NOT NULL,
+    resolved_at INTEGER
+) STRICT;
+CREATE UNIQUE INDEX live_forwards ON forwards (hash) WHERE state IN ('pending', 'paid');
 -- The notification outbox.
 CREATE TABLE events (
     seq INTEGER PRIMARY KEY AUTOINCREMENT,
