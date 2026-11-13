@@ -467,9 +467,9 @@ impl Opened {
         let bytes = values.to_bytes();
         let mut offset = 0;
         let mut signatures = vec![];
-        for i in 0..5 {
+        for (i, key) in self.p.disclosure.iter().enumerate() {
             let end = offset + licash::disclosure::CHUNK_BYTES[i];
-            signatures.push(crate::sig(&self.p.disclosure[i].sign(&bytes[offset..end])?));
+            signatures.push(crate::sig(&key.sign(&bytes[offset..end])?));
             offset = end;
         }
         Ok(licash::disclosure::SignedDisclosures {
