@@ -145,3 +145,30 @@ fn the_full_u64_binary_denomination_range_has_distinct_keys() {
     assert!(keyset.key(3).is_err());
     assert_eq!(Keyset::from_bytes(&keyset.to_bytes()).unwrap(), keyset);
 }
+
+#[test]
+fn seeded_issuer_keys_are_deterministic_and_independent_per_index_and_size() {
+    let keys = IssuerKeys::from_seed(&[5; 32], 0, 3).unwrap();
+    let keyset = keys.keyset().unwrap();
+    assert_eq!(keys.id(), keyset.id());
+    // Hubs check their stored keysets against this derivation at startup.
+    assert_eq!(
+        hex::encode(keyset.id()),
+        "d07fb47c6d3af0b59fa96c581d16afc581c8e12f9dbbdd412ebe4bb0347f3630"
+    );
+    let again = IssuerKeys::from_seed(&[5; 32], 0, 3).unwrap();
+    assert_eq!(again.keyset().unwrap(), keyset);
+    for (seed, index, max_pow) in [([5; 32], 1, 3), ([5; 32], 0, 4), ([6; 32], 0, 3)] {
+        let other = IssuerKeys::from_seed(&seed, index, max_pow)
+            .unwrap()
+            .keyset()
+            .unwrap();
+        assert_ne!(other.id(), keyset.id());
+        assert_ne!(other.issuer(), keyset.issuer());
+        for denom in [1, 2, 4, 8] {
+            assert_ne!(other.key(denom).unwrap(), keyset.key(denom).unwrap());
+        }
+    }
+    assert!(keyset.key(16).is_err());
+    assert!(IssuerKeys::from_seed(&[5; 32], 0, 64).is_err());
+}

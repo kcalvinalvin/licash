@@ -160,7 +160,7 @@ impl Keyset {
     }
 }
 
-/// Fresh issuer keys. This is not Hub state, an admission service or a
+/// Issuer keys. This is not Hub state, an admission service or a
 /// durable issuance API. The Schnorr admission secret needs the same custody as denomination secrets:
 /// a certificate can acknowledge pending debt without producing an actual coin.
 #[derive(Clone)]
@@ -196,17 +196,41 @@ impl IssuerKeys {
         if max_pow >= 64 {
             return Err(bad("denomination exponent exceeds u64"));
         }
-        let mut notes = BTreeMap::new();
-        let mut public = BTreeMap::new();
-        for power in 0..=max_pow {
-            let scalar = crate::crypto::random_scalar();
-            public.insert(
-                1u64 << power,
-                Point::from_projective(&generator_mul(&scalar)),
-            );
-            notes.insert(1u64 << power, scalar);
+        let notes = (0..=max_pow)
+            .map(|power| (1u64 << power, crate::crypto::random_scalar()))
+            .collect();
+        Self::from_secrets(notes, crate::crypto::random_scalar())
+    }
+
+    /// The keys of keyset `index` of an issuer seed, denominations 1 to
+    /// `2^max_pow`. Each `(index, max_pow)` gives independent keys.
+    pub fn from_seed(seed: &[u8; 32], index: u32, max_pow: u32) -> Result<Self, Error> {
+        if max_pow >= 64 {
+            return Err(bad("denomination exponent exceeds u64"));
         }
-        let issuer = crate::crypto::random_scalar();
+        let path = [index.to_be_bytes(), max_pow.to_be_bytes()].concat();
+        let notes = (0..=max_pow)
+            .map(|power| {
+                let denom = 1u64 << power;
+                let hash = tagged_hash(
+                    "licash/issuer/denomination/v2",
+                    &[seed, &path, &denom.to_be_bytes()],
+                );
+                (denom, scalar_from_hash(&hash))
+            })
+            .collect();
+        let issuer = tagged_hash("licash/issuer/admission/v2", &[seed, &path]);
+        Self::from_secrets(notes, scalar_from_hash(&issuer))
+    }
+
+    fn from_secrets(notes: BTreeMap<u64, Scalar>, issuer: Scalar) -> Result<Self, Error> {
+        if issuer == Scalar::ZERO || notes.values().any(|k| *k == Scalar::ZERO) {
+            return Err(Error::InvalidScalar);
+        }
+        let public = notes
+            .iter()
+            .map(|(denom, k)| (*denom, Point::from_projective(&generator_mul(k))))
+            .collect();
         let keyset = Keyset::from_parts(public, crate::crypto::x_only_pub(&issuer))?;
         Ok(Self {
             notes,
