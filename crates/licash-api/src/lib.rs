@@ -14,10 +14,12 @@
 //! | `POST /v1/refund`  | [`Refund`]  | [`Issued`]   |
 //!
 //! Anything else is a [`Problem`], with the HTTP status of its [`Code`].
+//!
+//! A payer hands its payee a [`Payment`], by whatever channel they share.
 
 use licash::{
     address::Address,
-    authorization::{Grant, SignedProposal, Unlock},
+    authorization::{Authorization, Grant, SignedProposal, Unlock},
     chain::Checkpoint,
     note::{Keyset, MintResponse, Note},
     source::Certificate,
@@ -182,6 +184,17 @@ pub struct Release {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Released {
+    pub unlock: Hex,
+}
+
+/// A released spend and its unlock, as its payer hands it to a payee at
+/// the hub `hub`: the payee opens the outputs to its address. Only an
+/// output's owner can open it, so a payment is safe to send in the clear.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Payment {
+    pub hub: String,
+    #[serde(flatten)]
+    pub release: Release,
     pub unlock: Hex,
 }
 
@@ -410,6 +423,34 @@ fn signed<'k>(
     let notes = self::notes(keyset, notes)?;
     let signed = SignedProposal::from_bytes(keyset, &notes, &signed.0)?;
     Ok((signed, notes))
+}
+
+impl Payment {
+    pub fn new(hub: &str, signed: &SignedProposal, notes: &[Note], unlock: &Unlock) -> Self {
+        Self {
+            hub: hub.to_owned(),
+            release: Release::new(signed, notes),
+            unlock: Hex(unlock.to_vec()),
+        }
+    }
+
+    /// The granted spend, its notes and its unlock, under `keyset` among
+    /// `keysets`: the unlock checked to open every output of the grant.
+    pub fn decode<'k>(
+        &self,
+        keysets: impl Fn(&[u8; 32]) -> Option<&'k Keyset>,
+    ) -> Result<(SignedProposal, Vec<Note>, Unlock), Problem> {
+        let id = self.release.keyset.array("keyset")?;
+        let keyset =
+            keysets(&id).ok_or_else(|| Problem::new(Code::UnknownKeyset, "unknown keyset"))?;
+        let (signed, notes) = self.release.decode(|_| Some(keyset))?;
+        let Authorization::Granted(grant) = signed.authorization() else {
+            return Err(Problem::invalid("not a granted spend"));
+        };
+        let unlock = self.unlock.array("unlock")?;
+        grant.verify_unlock(keyset, &unlock)?;
+        Ok((signed, notes, unlock))
+    }
 }
 
 impl Released {

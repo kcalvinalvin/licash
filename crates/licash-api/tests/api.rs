@@ -8,8 +8,8 @@ use licash::{
     unlink::{Nonce, Session},
 };
 use licash_api::{
-    Code, Fee, Fees, Hex, Info, Issued, Lock, LockState, Locked, Offer, Offered, Problem, Refund,
-    Release, Released, Settle, Settled, Unlink, Unlinked,
+    Code, Fee, Fees, Hex, Info, Issued, Lock, LockState, Locked, Offer, Offered, Payment, Problem,
+    Refund, Release, Released, Settle, Settled, Unlink, Unlinked,
 };
 use serde::{de::DeserializeOwned, Serialize};
 
@@ -129,6 +129,27 @@ fn bodies_carry_the_canonical_bytes_through_json() {
     assert_eq!(decoded, notes);
     let unlock = prepared.release(&f.keyset, &notes, &signed).unwrap();
     assert_eq!(json(&Released::new(&unlock)).decode().unwrap(), unlock);
+
+    // The payee's view of it.
+    let payment = json(&Payment::new(
+        "http://hub.example",
+        &signed,
+        &notes,
+        &unlock,
+    ));
+    assert_eq!(payment.hub, "http://hub.example");
+    let (paid, paid_notes, paid_unlock) = payment.decode(lookup).unwrap();
+    assert_eq!(paid.to_bytes(), signed.to_bytes());
+    assert_eq!((paid_notes, paid_unlock), (notes.clone(), unlock));
+    let mut wrong = payment.clone();
+    wrong.unlock = Hex(vec![0; 32]);
+    assert_eq!(wrong.decode(lookup).unwrap_err().code, Code::Invalid);
+    let none = |_: &[u8; 32]| None;
+    assert_eq!(payment.decode(none).unwrap_err().code, Code::UnknownKeyset);
+    let fields = serde_json::to_value(&payment).unwrap();
+    let mut keys: Vec<_> = fields.as_object().unwrap().keys().cloned().collect();
+    keys.sort();
+    assert_eq!(keys, ["hub", "keyset", "notes", "signed", "unlock"]);
 
     let paid = signed
         .open_granted_output(&f.keyset, &notes, 0, &f.outputs[0], &unlock)
@@ -262,6 +283,9 @@ fn lock_bodies_carry_a_lock_and_its_settlement() {
         SignedProposal::sign(&f.keyset, proposal, &notes, Authorization::Plain, &[secret]).unwrap()
     };
     let signed = lock();
+    // A plain spend pays no one through a payment.
+    let plain = Payment::new("h", &signed, &notes, &[0; 32]);
+    assert_eq!(plain.decode(lookup).unwrap_err().code, Code::Invalid);
     let (decoded, decoded_notes) = json(&Lock::new(&signed, &notes)).decode(lookup).unwrap();
     assert_eq!(decoded.to_bytes(), signed.to_bytes());
     assert_eq!(decoded_notes, notes);
