@@ -11,7 +11,7 @@ use std::{
 
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use licash_hub::{Fee, Hub, Ledger, Policy};
+use licash_hub::{Fee, Hub, Ledger, Policy, Timing};
 use licash_hub_service::notify::{self, Notifier};
 use licash_notify::{Message, Priority, Target};
 use tracing_subscriber::EnvFilter;
@@ -70,6 +70,72 @@ impl Notify {
     }
 }
 
+/// What the hub charges and the locks it admits.
+#[derive(Args)]
+struct PolicyArgs {
+    /// The fee on each spend, in the smallest unit.
+    #[arg(long, env = "LICASH_HUB_SPEND_FEE_BASE", default_value_t = 0)]
+    spend_fee_base: u64,
+    /// The fee on each spend, in parts per million of its inputs.
+    #[arg(long, env = "LICASH_HUB_SPEND_FEE_PPM", default_value_t = 0, value_parser = ppm())]
+    spend_fee_ppm: u64,
+    /// The fee in a lock's pay branch, in the smallest unit.
+    #[arg(long, env = "LICASH_HUB_LOCK_FEE_BASE", default_value_t = 0)]
+    lock_fee_base: u64,
+    /// The fee in a lock's pay branch, in parts per million of its inputs.
+    #[arg(long, env = "LICASH_HUB_LOCK_FEE_PPM", default_value_t = 0, value_parser = ppm())]
+    lock_fee_ppm: u64,
+    /// The fee in a lock's refund branch, in the smallest unit.
+    #[arg(long, env = "LICASH_HUB_REFUND_FEE_BASE", default_value_t = 0)]
+    refund_fee_base: u64,
+    /// The fee in a lock's refund branch, in parts per million of its inputs.
+    #[arg(long, env = "LICASH_HUB_REFUND_FEE_PPM", default_value_t = 0, value_parser = ppm())]
+    refund_fee_ppm: u64,
+    /// A lock's expiry, depth and reaction fit within this many blocks of
+    /// the scanned tip: the response window of the hub's contracts.
+    #[arg(long, env = "LICASH_HUB_LOCK_WINDOW", default_value_t = Timing::default().window)]
+    lock_window: u32,
+    /// Blocks the hub needs to produce and confirm a response.
+    #[arg(long, env = "LICASH_HUB_LOCK_REACTION", default_value_t = Timing::default().reaction)]
+    lock_reaction: u32,
+    /// Least activation depth of a lock. Keep it above 1 on mainnet.
+    #[arg(long, env = "LICASH_HUB_LOCK_MIN_DEPTH", default_value_t = Timing::default().min_depth)]
+    lock_min_depth: u32,
+    /// Blocks from its checkpoint within which a lock is decided.
+    #[arg(long, env = "LICASH_HUB_LOCK_MAX_HEADERS", default_value_t = Timing::default().max_headers)]
+    lock_max_headers: u32,
+    /// Confirmations of a block before it becomes a checkpoint.
+    #[arg(long, env = "LICASH_HUB_CHECKPOINT_BURY", default_value_t = Timing::default().bury)]
+    checkpoint_bury: u32,
+    /// Seconds after the scan last reached the tip that the hub stops
+    /// admitting locks.
+    #[arg(long, env = "LICASH_HUB_MAX_LAG", default_value_t = Timing::default().max_lag)]
+    max_lag: u64,
+}
+
+fn ppm() -> clap::builder::RangedU64ValueParser<u64> {
+    clap::value_parser!(u64).range(0..=1_000_000)
+}
+
+impl PolicyArgs {
+    fn policy(&self) -> Policy {
+        let fee = |base, ppm| Fee { base, ppm };
+        Policy {
+            spend: fee(self.spend_fee_base, self.spend_fee_ppm),
+            lock: fee(self.lock_fee_base, self.lock_fee_ppm),
+            refund: fee(self.refund_fee_base, self.refund_fee_ppm),
+            timing: Timing {
+                window: self.lock_window,
+                reaction: self.lock_reaction,
+                min_depth: self.lock_min_depth,
+                max_headers: self.lock_max_headers,
+                bury: self.checkpoint_bury,
+                max_lag: self.max_lag,
+            },
+        }
+    }
+}
+
 #[derive(Clone, Copy, ValueEnum)]
 enum Log {
     Text,
@@ -89,12 +155,8 @@ enum Command {
     Run {
         #[arg(long, env = "LICASH_HUB_LISTEN", default_value = "127.0.0.1:8338")]
         listen: SocketAddr,
-        /// The fee on each spend, in the smallest unit.
-        #[arg(long, env = "LICASH_HUB_SPEND_FEE_BASE", default_value_t = 0)]
-        spend_fee_base: u64,
-        /// The fee on each spend, in parts per million of its inputs.
-        #[arg(long, env = "LICASH_HUB_SPEND_FEE_PPM", default_value_t = 0, value_parser = clap::value_parser!(u64).range(0..=1_000_000))]
-        spend_fee_ppm: u64,
+        #[command(flatten)]
+        policy: PolicyArgs,
         #[command(flatten)]
         notify: Notify,
         /// Notify only of these kinds of event [default: all].
@@ -158,18 +220,11 @@ fn command(cli: Cli) -> anyhow::Result<()> {
         Command::Init { max_pow } => init(&cli.data, &seed, &db, max_pow),
         Command::Run {
             listen,
-            spend_fee_base,
-            spend_fee_ppm,
+            policy,
             notify,
             notify_kinds,
         } => {
-            let policy = Policy {
-                spend: Fee {
-                    base: spend_fee_base,
-                    ppm: spend_fee_ppm,
-                },
-                ..Policy::default()
-            };
+            let policy = policy.policy();
             let targets = notify.targets()?;
             // Before the hub opens, so that new targets hear of its start.
             let notifier = if targets.is_empty() {
@@ -216,8 +271,7 @@ async fn serve(
         .with_context(|| format!("listen on {listen}"))?;
     tracing::info!(
         listen = %listener.local_addr()?,
-        spend_fee_base = policy.spend.base,
-        spend_fee_ppm = policy.spend.ppm,
+        policy = %serde_json::to_string(&policy)?,
         "serving"
     );
     let notifying = notifier.clone().map(|notifier| {
@@ -292,13 +346,15 @@ fn status(db: &Path, json: bool) -> anyhow::Result<()> {
     for (name, value) in [
         ("offers", stats.offers),
         ("released", stats.released),
+        ("locks", stats.locks),
+        ("open_locks", stats.open_locks),
         ("spent", stats.spent),
         ("issued", stats.issued),
         ("unlinked", stats.unlinked),
         ("income", stats.income),
         ("events", stats.events),
     ] {
-        println!("{name:<9} {value}");
+        println!("{name:<10} {value}");
     }
     Ok(())
 }

@@ -7,11 +7,19 @@ use std::{
     time::Duration,
 };
 
-use licash_hub::{Event, Hub, Ledger, Notice};
+use licash_hub::{Event, Hub, Ledger, Notice, Settled};
 use licash_notify::{Item, Message, Outbox, Priority, Relay, Target, Timing};
 
 /// The kinds of the hub's events.
-pub const KINDS: [&str; 3] = ["started", "released", "double_spend"];
+pub const KINDS: [&str; 7] = [
+    "started",
+    "released",
+    "double_spend",
+    "locked",
+    "settled",
+    "activated",
+    "reorg",
+];
 
 /// How long a stopping hub tries to say so.
 const STOP_WITHIN: Duration = Duration::from_secs(5);
@@ -153,6 +161,86 @@ pub fn message(event: &Event) -> Message {
             "Double spend refused",
             format!("Proposal {proposal} spends inputs that {spent_by} spent."),
         ),
+        Some(Notice::Locked {
+            proposal,
+            amount,
+            fee,
+            expiry,
+            own: false,
+        }) => Message::new(
+            Priority::Low,
+            "Lock admitted",
+            format!(
+                "{amount} locked until block {expiry}, {fee} of it to the hub if it pays. \
+                 Proposal {proposal}."
+            ),
+        ),
+        Some(Notice::Locked {
+            proposal,
+            amount,
+            expiry,
+            own: true,
+            ..
+        }) => Message::new(
+            Priority::Low,
+            "Own lock admitted",
+            format!(
+                "{amount} of the hub's own notes locked until block {expiry}, against what \
+                 it holds for the hash. Proposal {proposal}."
+            ),
+        ),
+        Some(Notice::Settled {
+            proposal,
+            amount,
+            fee,
+            branch: Settled::Pay,
+        }) => Message::new(
+            Priority::Low,
+            "Lock paid",
+            format!("{amount} paid, {fee} of it to the hub. Proposal {proposal}."),
+        ),
+        Some(Notice::Settled {
+            proposal,
+            amount,
+            fee,
+            branch: Settled::Refund,
+        }) => Message::new(
+            Priority::Normal,
+            "Lock refunded",
+            format!("{amount} refunded, {fee} of it to the hub. Proposal {proposal}."),
+        ),
+        Some(Notice::Activated {
+            proposal,
+            height,
+            refunded: false,
+        }) => Message::new(
+            Priority::High,
+            "Lock activated on Bitcoin",
+            format!(
+                "The preimage of proposal {proposal} was published at block {height}: \
+                 the lock pays."
+            ),
+        ),
+        Some(Notice::Activated {
+            proposal,
+            height,
+            refunded: true,
+        }) => Message::new(
+            Priority::High,
+            "Refunded lock activated",
+            format!(
+                "The preimage of proposal {proposal}, which the hub refunded, was published \
+                 at block {height} after a reorganization: the hub owes both branches."
+            ),
+        ),
+        Some(Notice::Reorg { height }) => Message::new(
+            Priority::High,
+            "Checkpoint reorganized",
+            format!(
+                "Bitcoin reorganized at block {height}, at or below a checkpoint. The hub \
+                 scans no further, so admits and refunds no lock, until its operator acts."
+            ),
+        ),
         _ => Message::new(
             Priority::Normal,
             format!("Hub event {}", event.kind),
@@ -200,6 +288,25 @@ mod tests {
                 proposal: "p2".into(),
                 spent_by: "p1".into(),
             },
+            Notice::Locked {
+                proposal: "p3".into(),
+                amount: 8,
+                fee: 1,
+                expiry: 900,
+                own: false,
+            },
+            Notice::Settled {
+                proposal: "p3".into(),
+                amount: 8,
+                fee: 1,
+                branch: Settled::Refund,
+            },
+            Notice::Activated {
+                proposal: "p3".into(),
+                height: 899,
+                refunded: false,
+            },
+            Notice::Reorg { height: 800 },
         ];
         let kinds: Vec<_> = notices.iter().map(Notice::kind).collect();
         assert_eq!(kinds, KINDS);
@@ -213,6 +320,36 @@ mod tests {
         );
         assert_eq!(messages[2].priority, Priority::High);
         assert!(messages[2].body.contains("p2") && messages[2].body.contains("p1"));
+        assert_eq!(
+            messages[3].body,
+            "8 locked until block 900, 1 of it to the hub if it pays. Proposal p3."
+        );
+        assert_eq!(messages[4].title, "Lock refunded");
+        assert_eq!(messages[5].priority, Priority::High);
+        assert!(messages[5].body.contains("block 899"));
+        assert_eq!(messages[6].priority, Priority::High);
+        // Each own variant reads as its own message too.
+        let own = Notice::Locked {
+            proposal: "p4".into(),
+            amount: 2,
+            fee: 0,
+            expiry: 7,
+            own: true,
+        };
+        assert_eq!(message(&event(&own)).title, "Own lock admitted");
+        let paid = Notice::Settled {
+            proposal: "p4".into(),
+            amount: 2,
+            fee: 0,
+            branch: Settled::Pay,
+        };
+        assert_eq!(message(&event(&paid)).title, "Lock paid");
+        let twice = Notice::Activated {
+            proposal: "p4".into(),
+            height: 6,
+            refunded: true,
+        };
+        assert_eq!(message(&event(&twice)).title, "Refunded lock activated");
     }
 
     #[test]

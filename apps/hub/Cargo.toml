@@ -24,6 +24,7 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 licash.workspace = true
+bitcoin = { version = "=0.32.102", default-features = false, features = ["std"] }
 hex = "0.4"
 rusqlite = "0.42"
 serde = "1"

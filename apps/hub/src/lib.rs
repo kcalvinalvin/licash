@@ -5,16 +5,17 @@ pub mod notify;
 use std::sync::Arc;
 
 use axum::{
-    extract::{rejection::JsonRejection, DefaultBodyLimit, State},
+    extract::{rejection::JsonRejection, DefaultBodyLimit, Path, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
 use licash_api::{
-    Code, Fee, Fees, Info, Offer, Offered, Problem, Release, Released, Unlink, Unlinked,
+    Code, Fee, Fees, Hex, Info, Issued, Lock, LockState, Locked, Locks, Offer, Offered, Problem,
+    Refund, Release, Released, Settle, Unlink, Unlinked,
 };
-use licash_hub::{Error, Hub, Refusal};
+use licash_hub::{Error, Hub, Refusal, Settled};
 use tower_http::trace::TraceLayer;
 
 /// The largest request body: a spend of the most inputs and outputs the
@@ -30,6 +31,10 @@ pub fn router(hub: Arc<Hub>) -> Router {
         .route(licash_api::OFFER, post(offer))
         .route(licash_api::RELEASE, post(release))
         .route(licash_api::UNLINK, post(unlink))
+        .route(licash_api::LOCK, post(lock))
+        .route(licash_api::LOCK_STATE, get(lock_state))
+        .route(licash_api::SETTLE, post(settle))
+        .route(licash_api::REFUND, post(refund))
         .route(HEALTH, get(health))
         .layer(DefaultBodyLimit::max(BODY_LIMIT))
         .layer(TraceLayer::new_for_http())
@@ -72,6 +77,16 @@ impl From<Error> for Failure {
                 Refusal::NotIssued => Code::NotIssued,
                 Refusal::Unlinked => Code::Unlinked,
                 Refusal::Expired => Code::Expired,
+                Refusal::NotALock => Code::NotALock,
+                Refusal::Checkpoint(_) => Code::Checkpoint,
+                Refusal::Timing(_) => Code::Timing,
+                Refusal::Unsynced | Refusal::NoChain => Code::Unavailable,
+                Refusal::UnknownLock => Code::UnknownLock,
+                Refusal::Preimage => Code::Preimage,
+                Refusal::Settled => Code::Settled,
+                Refusal::LockExpired => Code::LockExpired,
+                Refusal::Unexpired => Code::Unexpired,
+                Refusal::Activated => Code::Activated,
                 _ => Code::Invalid,
             },
             Error::Invalid(_) => Code::Invalid,
@@ -109,21 +124,33 @@ async fn health(State(hub): State<Arc<Hub>>) -> Result<&'static str, Failure> {
     Ok("ok")
 }
 
-async fn info(State(hub): State<Arc<Hub>>) -> Json<Info> {
-    let info = hub.info();
-    let spend = info.policy.spend;
-    Json(Info::new(
-        &info.keysets,
-        info.address,
-        Fees {
-            spend: Fee {
-                base: spend.base,
-                ppm: spend.ppm,
-            },
-            ..Fees::default()
-        },
-        None,
-    ))
+async fn info(State(hub): State<Arc<Hub>>) -> Answer<Info> {
+    blocking(hub, |hub| {
+        let info = hub.info();
+        let (policy, timing) = (info.policy, info.policy.timing);
+        let fee = |fee: licash_hub::Fee| Fee {
+            base: fee.base,
+            ppm: fee.ppm,
+        };
+        let fees = Fees {
+            spend: fee(policy.spend),
+            lock: fee(policy.lock),
+            refund: fee(policy.refund),
+        };
+        let locks = match (hub.checkpoint(), hub.scanned()?) {
+            (Some(checkpoint), Some((height, _))) => Some(Locks {
+                checkpoint: Hex(checkpoint.to_bytes()),
+                height,
+                window: timing.window,
+                reaction: timing.reaction,
+                min_depth: timing.min_depth,
+                max_headers: timing.max_headers,
+            }),
+            _ => None,
+        };
+        Ok(Info::new(&info.keysets, info.address, fees, locks))
+    })
+    .await
 }
 
 async fn offer(
@@ -158,6 +185,58 @@ async fn unlink(
     let Json(body) = body?;
     blocking(hub, move |hub| {
         Ok(Unlinked::new(&hub.unlink(&body.decode()?)?))
+    })
+    .await
+}
+
+async fn lock(
+    State(hub): State<Arc<Hub>>,
+    body: Result<Json<Lock>, JsonRejection>,
+) -> Answer<Locked> {
+    let Json(body) = body?;
+    blocking(hub, move |hub| {
+        let (signed, notes) = body.decode(|id| hub.keyset(id))?;
+        Ok(Locked::new(&hub.lock(&signed, &notes)?))
+    })
+    .await
+}
+
+async fn lock_state(State(hub): State<Arc<Hub>>, Path(id): Path<String>) -> Answer<LockState> {
+    blocking(hub, move |hub| {
+        let lock = hub.locked(&licash_api::lock_id(&id)?)?;
+        let settled = lock.settled.map(|branch| match branch {
+            Settled::Pay => licash_api::Settled::Pay,
+            Settled::Refund => licash_api::Settled::Refund,
+        });
+        Ok(LockState::new(
+            &lock.proposal,
+            &lock.certificate,
+            settled,
+            lock.preimage,
+        ))
+    })
+    .await
+}
+
+async fn settle(
+    State(hub): State<Arc<Hub>>,
+    body: Result<Json<Settle>, JsonRejection>,
+) -> Answer<Issued> {
+    let Json(body) = body?;
+    blocking(hub, move |hub| {
+        let (id, preimage) = body.decode()?;
+        Ok(Issued::new(&hub.settle(&id, &preimage)?))
+    })
+    .await
+}
+
+async fn refund(
+    State(hub): State<Arc<Hub>>,
+    body: Result<Json<Refund>, JsonRejection>,
+) -> Answer<Issued> {
+    let Json(body) = body?;
+    blocking(hub, move |hub| {
+        Ok(Issued::new(&hub.refund(&body.decode()?)?))
     })
     .await
 }

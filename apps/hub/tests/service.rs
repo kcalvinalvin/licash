@@ -17,10 +17,13 @@ use licash::{
     authorization::{Authorization, SignedProposal},
     claim::Branch,
     note::{Derivation, Evidence, IssuerKeys, Keyset, Note},
-    spend::{Output, Proposal},
+    spend::{lock_hash, ChainProfile, Output, Proposal, TimedLock, TimedTerms},
     unlink::{Nonce, Session},
 };
-use licash_api::{Code, Info, Offer, Offered, Problem, Release, Released, Unlink, Unlinked};
+use licash_api::{
+    Code, Info, Issued, Lock, LockState, Locked, Locks, Offer, Offered, Problem, Refund, Release,
+    Released, Settle, Settled, Unlink, Unlinked,
+};
 use licash_hub::{Fee, Hub, Policy};
 use licash_hub_service::notify::Notifier;
 use licash_notify::Timing;
@@ -38,13 +41,16 @@ struct Service {
 }
 
 fn service(fee: u64) -> Service {
+    service_with(Policy {
+        spend: Fee { base: fee, ppm: 0 },
+        ..Policy::default()
+    })
+}
+
+fn service_with(policy: Policy) -> Service {
     let dir = tempfile::tempdir().unwrap();
     let (seed, db) = (dir.path().join("seed"), dir.path().join("hub.sqlite"));
     Hub::init(&seed, &db, MAX_POW).unwrap();
-    let policy = Policy {
-        spend: Fee { base: fee, ppm: 0 },
-        ..Policy::default()
-    };
     let hub = Arc::new(Hub::open(&seed, &db, policy).unwrap());
     let mut secret = [0; 32];
     hex::decode_to_slice(std::fs::read_to_string(&seed).unwrap().trim(), &mut secret).unwrap();
@@ -453,4 +459,246 @@ async fn the_operator_hears_of_spends_a_halt_and_the_stop() {
     running.abort();
     notifier.stopped().await;
     assert_eq!(titles.lock().unwrap()[2..], ["north: Hub stopped"]);
+}
+
+mod chain;
+
+const SECRET: [u8; 32] = [7; 32];
+
+impl Service {
+    async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T, Problem> {
+        let (status, body) = self.call(Method::GET, path, None).await;
+        if status == StatusCode::OK {
+            return Ok(serde_json::from_slice(&body).unwrap());
+        }
+        let problem: Problem = serde_json::from_slice(&body).unwrap();
+        assert_eq!(status.as_u16(), problem.code.status(), "{problem:?}");
+        Err(problem)
+    }
+
+    /// Follow `chain` from genesis, mined to `height` and scanned.
+    fn follow(&self, chain: &mut chain::Chain, height: u32) {
+        if self.hub.checkpoint().is_none() {
+            self.hub.add_checkpoint(&chain.checkpoint(0)).unwrap();
+        }
+        while chain.height() < height {
+            let block = chain.mine(None).clone();
+            self.hub.observe(chain.height(), &block).unwrap();
+        }
+        assert!(self.hub.synced(chain.height(), &chain.tip()).unwrap());
+    }
+}
+
+/// A timed lock of `coin`: `pay` on the preimage of `SECRET`'s hash, else
+/// `refund`, each with the derivations of its outputs.
+struct Locking {
+    signed: SignedProposal,
+    notes: Vec<Note>,
+    pay: Vec<Derivation>,
+    refund: Vec<Derivation>,
+}
+
+fn locking(
+    keyset: &Keyset,
+    coin: &Coin,
+    pay: &[(Address, u64)],
+    refund: &[(Address, u64)],
+    terms: TimedTerms,
+) -> Locking {
+    let e = Ephemeral::random();
+    let derive = |outputs: &[(Address, u64)], branch| -> Vec<Derivation> {
+        (0..)
+            .zip(outputs)
+            .map(|(i, (to, denom))| e.derive(to, *denom, branch, i).unwrap())
+            .collect()
+    };
+    let (pay, refund) = (derive(pay, Branch::Pay), derive(refund, Branch::Refund));
+    let outputs = |ds: &[Derivation]| -> Vec<Output> {
+        ds.iter()
+            .map(|d| Output::from_derivation(d).unwrap())
+            .collect()
+    };
+    let lock = TimedLock::new(terms, outputs(&refund)).unwrap();
+    let notes = vec![coin.note.clone()];
+    let proposal = Proposal::new(keyset, &notes, e.public(), outputs(&pay), Some(lock)).unwrap();
+    let signed = sign(keyset, coin, &proposal, Authorization::Plain);
+    Locking {
+        signed,
+        notes,
+        pay,
+        refund,
+    }
+}
+
+fn terms(locks: &Locks, expiry: u32, depth: u32) -> TimedTerms {
+    let checkpoint = locks.checkpoint().unwrap().commitment();
+    let hash = lock_hash(&SECRET);
+    TimedTerms::new(
+        ChainProfile::Core30DefaultRegtest,
+        checkpoint,
+        expiry,
+        depth,
+        hash,
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn a_lock_is_paid_or_refunded_through_the_api() {
+    let service = service_with(Policy {
+        lock: Fee { base: 1, ppm: 0 },
+        timing: licash_hub::Timing {
+            window: 20,
+            reaction: 2,
+            min_depth: 1,
+            ..licash_hub::Timing::default()
+        },
+        ..Policy::default()
+    });
+    let keyset = &service.keyset;
+    let info = service.info().await;
+    assert_eq!(info.fees.lock, licash_api::Fee { base: 1, ppm: 0 });
+    assert!(info.locks.is_none());
+    let mut chain = chain::Chain::new();
+    service.follow(&mut chain, 3);
+    let info = service.info().await;
+    let locks = info.locks.clone().unwrap();
+    let checkpoint = locks.checkpoint().unwrap();
+    assert_eq!((checkpoint.height(), locks.height), (0, 3));
+    assert_eq!((locks.window, locks.reaction, locks.min_depth), (20, 2, 1));
+
+    let (alice, bob) = (owner(1), owner(2));
+    let pay = [(bob.address(), 4), (bob.address(), 2), (info.address, 2)];
+    let refund = [(alice.address(), 8)];
+    let coin = service.mint(&alice, 8);
+    let l = locking(keyset, &coin, &pay, &refund, terms(&locks, 6, 1));
+    let id = l.signed.proposal().id();
+    let locked: Locked = service
+        .post(licash_api::LOCK, &Lock::new(&l.signed, &l.notes))
+        .await;
+    locked.decode(keyset, &l.signed, &l.notes).unwrap();
+    let path = licash_api::lock_state(&id);
+    let state: LockState = service.get(&path).await.unwrap();
+    let view = state
+        .decode(|k| (k == keyset.id()).then_some(keyset))
+        .unwrap();
+    assert_eq!(
+        (view.proposal.id(), view.settled, view.preimage),
+        (id, None, None)
+    );
+
+    // A lock is not offered, a plain spend not locked.
+    let offer = json(&Offer::new(l.signed.proposal(), &l.notes));
+    assert_eq!(
+        service.problem(licash_api::OFFER, offer).await.code,
+        Code::Timed
+    );
+    let other = service.mint(&alice, 4);
+    let (plain, _) = spend(keyset, &other, &[(bob.address(), 4)]);
+    let plain = sign(keyset, &other, &plain, Authorization::Plain);
+    let body = json(&Lock::new(&plain, std::slice::from_ref(&other.note)));
+    assert_eq!(
+        service.problem(licash_api::LOCK, body).await.code,
+        Code::NotALock
+    );
+
+    let wrong = json(&Settle::new(&id, &[8; 32]));
+    assert_eq!(
+        service.problem(licash_api::SETTLE, wrong).await.code,
+        Code::Preimage
+    );
+    let early = json(&Refund::new(&id));
+    assert_eq!(
+        service.problem(licash_api::REFUND, early).await.code,
+        Code::Unexpired
+    );
+    let paid: Issued = service
+        .post(licash_api::SETTLE, &Settle::new(&id, &SECRET))
+        .await;
+    let paid = paid.decode(keyset).unwrap();
+    for (issued, d) in paid.iter().zip(&l.pay[..2]) {
+        issued.open(keyset, d).unwrap();
+    }
+    let late = json(&Refund::new(&id));
+    assert_eq!(
+        service.problem(licash_api::REFUND, late).await.code,
+        Code::Settled
+    );
+    let state: LockState = service.get(&path).await.unwrap();
+    assert_eq!(state.settled, Some(Settled::Pay));
+    assert_eq!(state.preimage.unwrap().0, SECRET);
+
+    // Another expires at depth and is refunded.
+    let coin = service.mint(&alice, 8);
+    let l = locking(keyset, &coin, &pay, &refund, terms(&locks, 5, 1));
+    let id = l.signed.proposal().id();
+    let _: Locked = service
+        .post(licash_api::LOCK, &Lock::new(&l.signed, &l.notes))
+        .await;
+    service.follow(&mut chain, 6);
+    let expired = json(&Settle::new(&id, &SECRET));
+    assert_eq!(
+        service.problem(licash_api::SETTLE, expired).await.code,
+        Code::LockExpired
+    );
+    let refunded: Issued = service.post(licash_api::REFUND, &Refund::new(&id)).await;
+    refunded.decode(keyset).unwrap()[0]
+        .open(keyset, &l.refund[0])
+        .unwrap();
+    let state: LockState = service.get(&licash_api::lock_state(&id)).await.unwrap();
+    assert_eq!(
+        (state.settled, state.preimage),
+        (Some(Settled::Refund), None)
+    );
+}
+
+#[tokio::test]
+async fn locks_out_of_the_hubs_terms_or_view_are_problems() {
+    let service = service_with(Policy {
+        timing: licash_hub::Timing {
+            window: 20,
+            reaction: 2,
+            min_depth: 1,
+            ..licash_hub::Timing::default()
+        },
+        ..Policy::default()
+    });
+    let keyset = &service.keyset;
+    let alice = owner(1);
+    let pay = [(owner(2).address(), 8)];
+    let refund = [(alice.address(), 8)];
+    let lock = |terms| {
+        let l = locking(keyset, &service.mint(&alice, 8), &pay, &refund, terms);
+        json(&Lock::new(&l.signed, &l.notes))
+    };
+    let unknown = licash_api::lock_state(&licash::spend::ProposalId::from_bytes([1; 32]));
+    assert_eq!(
+        service.get::<LockState>(&unknown).await.unwrap_err().code,
+        Code::UnknownLock
+    );
+    let bad = service.get::<LockState>("/v1/lock/zz").await.unwrap_err();
+    assert_eq!(bad.code, Code::Invalid);
+
+    let mut chain = chain::Chain::new();
+    service.follow(&mut chain, 3);
+    let locks = service.info().await.locks.unwrap();
+    let elsewhere = Locks {
+        checkpoint: licash_api::Hex(chain.checkpoint(2).to_bytes()),
+        ..locks.clone()
+    };
+    let code = |p: Problem| p.code;
+    let problem = service
+        .problem(licash_api::LOCK, lock(terms(&elsewhere, 6, 1)))
+        .await;
+    assert_eq!(code(problem), Code::Checkpoint);
+    let problem = service
+        .problem(licash_api::LOCK, lock(terms(&locks, 30, 1)))
+        .await;
+    assert_eq!(code(problem), Code::Timing);
+    // The backend's tip is one the hub has not scanned.
+    assert!(!service.hub.synced(4, &[0; 32]).unwrap());
+    let problem = service
+        .problem(licash_api::LOCK, lock(terms(&locks, 6, 1)))
+        .await;
+    assert_eq!(code(problem), Code::Unavailable);
 }
