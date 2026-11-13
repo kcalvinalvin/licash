@@ -770,17 +770,8 @@ impl Activation {
             .outputs()
             .get(index)
             .ok_or_else(|| bad("activation output missing"))?;
-        let script = &output.script;
-        let payload = ACTIVATION_MAGIC.len() + 32;
-        if script.len() != payload + 2
-            || script[..2] != [0x6a, payload as u8]
-            || &script[2..2 + ACTIVATION_MAGIC.len()] != ACTIVATION_MAGIC
-        {
-            return Err(bad("activation record encoding"));
-        }
-        let secret: [u8; 32] = script[2 + ACTIVATION_MAGIC.len()..]
-            .try_into()
-            .expect("checked preimage width");
+        let secret =
+            activation_secret(&output.script).ok_or_else(|| bad("activation record encoding"))?;
         if <[u8; 32]>::from(Sha256::digest(secret)) != *terms.hash() {
             return Err(bad("activation preimage hash"));
         }
@@ -788,11 +779,21 @@ impl Activation {
     }
 }
 
+/// The output script that publishes `secret`, activating every lock under
+/// its hash that has not expired.
 pub fn activation_script(secret: &[u8; 32]) -> Vec<u8> {
     let mut bytes = vec![0x6a, (ACTIVATION_MAGIC.len() + 32) as u8];
     bytes.extend(ACTIVATION_MAGIC);
     bytes.extend(secret);
     bytes
+}
+
+/// The secret an output script publishes, if it is an
+/// [`activation_script`]: what a watcher reads from each block.
+pub fn activation_secret(script: &[u8]) -> Option<[u8; 32]> {
+    let payload = ACTIVATION_MAGIC.len() + 32;
+    let rest = script.strip_prefix(&[0x6a, payload as u8])?;
+    rest.strip_prefix(ACTIVATION_MAGIC)?.try_into().ok()
 }
 
 #[cfg(test)]

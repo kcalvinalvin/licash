@@ -493,3 +493,20 @@ fn parsed_body_views_are_canonical_bytes_not_a_claim_of_inclusion() {
     );
     assert!(chain::Transaction::parse(&serialize(&blocks[0].txdata[1]), 100_000).is_err());
 }
+
+#[test]
+fn activation_scripts_read_back_their_secret_and_nothing_else() {
+    let script = chain::activation_script(&[83; 32]);
+    assert_eq!(chain::activation_secret(&script), Some([83; 32]));
+    // Cut, lengthened, another push size or another magic.
+    assert_eq!(chain::activation_secret(&script[..script.len() - 1]), None);
+    let mut longer = script.clone();
+    longer.push(0);
+    assert_eq!(chain::activation_secret(&longer), None);
+    for at in [0, 1, 2, 5] {
+        let mut other = script.clone();
+        other[at] ^= 1;
+        assert_eq!(chain::activation_secret(&other), None, "byte {at}");
+    }
+    assert_eq!(chain::activation_secret(&[]), None);
+}
