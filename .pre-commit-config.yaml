@@ -1,0 +1,30 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+        # Preserve the exact verifier-vector bytes.
+        exclude: ^crates/licash-groth16/tests/data/(babe-60-42|babe-claim-60-42)\.hex$
+      - id: check-yaml
+      - id: check-merge-conflict
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt
+        entry: sh -c 'cargo fmt --all -- --check && cargo fmt --manifest-path r0/native-guest/Cargo.toml -- --check && cargo fmt --manifest-path r0/native-counter-guest/Cargo.toml -- --check && cargo fmt --manifest-path r0/host/Cargo.toml -- --check && cargo fmt --manifest-path regtest/Cargo.toml -- --check'
+        language: system
+        types: [rust]
+        pass_filenames: false
+      - id: regtest-clippy
+        name: regtest cargo clippy
+        entry: cargo clippy --locked --manifest-path regtest/Cargo.toml --all-targets --no-deps -- -D warnings
+        language: system
+        types: [rust]
+        pass_filenames: false
+      - id: cargo-clippy
+        name: cargo clippy
+        entry: cargo clippy --workspace --all-targets -- -D warnings
+        language: system
+        types: [rust]
+        pass_filenames: false

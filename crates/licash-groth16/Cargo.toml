@@ -1,0 +1,19 @@
+[package]
+name = "licash-groth16"
+description = "RISC Zero Groth16 receipt verification for the licash guests and host checks"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+# From Lichen d01bb5b (MIT), with RISC Zero's verifying key (Apache-2.0).
+# A workspace of its own: its comparison tests depend on sibling ln-gap.
+[workspace]
+resolver = "2"
+
+[dependencies]
+substrate-bn = "0.6"
+sha2 = { version = "0.10", default-features = false }
+
+[dev-dependencies]
+lngap-zk = { path = "../../../ln-gap/crates/apps/zk" }
+hex = "0.4"

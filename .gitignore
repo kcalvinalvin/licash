@@ -1,0 +1,5 @@
+target/
+*.log
+tmp/
+# Locally built guests (r0/build-guest.sh).
+r0/guests/

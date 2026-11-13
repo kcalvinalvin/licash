@@ -1,0 +1,55 @@
+name: ci
+on:
+  push:
+  pull_request:
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo test --locked --workspace
+  regtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: licash
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: AdamISZ/lichen
+          ref: f025f81c646fe62d138f4476c52bdaf3f03faec2
+          path: lichen
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: AdamISZ/ln-gap
+          ref: 1f0db8ca9f78c36c75c1a69b42946ae1639bb4b8
+          path: ln-gap
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: licash/regtest
+      - working-directory: licash
+        run: cargo fmt --manifest-path regtest/Cargo.toml -- --check
+      - working-directory: licash
+        run: cargo clippy --locked --manifest-path regtest/Cargo.toml --all-targets --no-deps -- -D warnings
+      - name: Groth16 verifier agrees with golden receipts
+        working-directory: licash
+        run: CARGO_TARGET_DIR=regtest/target cargo test --locked --manifest-path crates/licash-groth16/Cargo.toml
+      - name: Bitcoin Core regtest (mock proofs)
+        working-directory: licash
+        run: regtest/run.sh -- --test-threads=1
+      - name: Lightning gateway against pinned LND
+        working-directory: licash
+        run: regtest/lightning.sh

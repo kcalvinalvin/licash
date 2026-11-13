@@ -1,0 +1,26 @@
+[package]
+name = "licash"
+description = "Owner-bound ecash with local Bitcoin recovery"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bitcoin = { version = "=0.32.102", default-features = false, features = ["std"] }
+k256 = { workspace = true, features = ["hash2curve"] }
+sha2.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+rand_core.workspace = true
+bincode.workspace = true
+serde_bytes.workspace = true
+
+# The guest's accelerated curve operations (see src/ec.rs); the same
+# version the risc0 fork of k256 depends on.
+[target.'cfg(all(target_os = "zkvm", target_arch = "riscv32"))'.dependencies]
+risc0-bigint2 = { version = "1.2", features = ["unstable"] }
+
+[dev-dependencies]
+anyhow.workspace = true
