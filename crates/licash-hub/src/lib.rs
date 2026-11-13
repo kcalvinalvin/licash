@@ -134,20 +134,8 @@ pub enum Refusal {
     Expired,
 }
 
-/// A fee: `base` plus `ppm` parts per million of the amount moved.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Fee {
-    pub base: u64,
-    pub ppm: u64,
-}
-
-impl Fee {
-    /// The fee on moving `amount`, rounded up.
-    pub fn due(&self, amount: u64) -> u64 {
-        let rate = (u128::from(amount) * u128::from(self.ppm)).div_ceil(1_000_000);
-        u64::try_from(rate).map_or(u64::MAX, |rate| rate.saturating_add(self.base))
-    }
-}
+/// A fee, as the hub advertises it: what it charges is what payers compute.
+pub use licash_api::Fee;
 
 /// What the hub charges and the locks it admits. A spend pays its fee in
 /// outputs to the hub's address ([`Info::address`]), a lock in each branch.

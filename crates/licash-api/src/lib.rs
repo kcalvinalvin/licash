@@ -88,6 +88,14 @@ pub struct Fee {
     pub ppm: u64,
 }
 
+impl Fee {
+    /// The fee on moving `amount`, rounded up, saturating.
+    pub fn due(&self, amount: u64) -> u64 {
+        let rate = (u128::from(amount) * u128::from(self.ppm)).div_ceil(1_000_000);
+        u64::try_from(rate).map_or(u64::MAX, |rate| rate.saturating_add(self.base))
+    }
+}
+
 /// What a hub charges, in outputs to [`Info::address`]: a spend's fee in
 /// its outputs, a lock's in each branch.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

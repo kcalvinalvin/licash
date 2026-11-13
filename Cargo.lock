@@ -474,6 +474,7 @@ dependencies = [
  "bitcoin",
  "hex",
  "licash",
+ "licash-api",
  "rand_core",
  "rusqlite",
  "serde",

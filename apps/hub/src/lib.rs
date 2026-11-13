@@ -13,8 +13,8 @@ use axum::{
     Json, Router,
 };
 use licash_api::{
-    Code, Fee, Fees, Hex, Info, Issued, Lock, LockState, Locked, Locks, Offer, Offered, Problem,
-    Refund, Release, Released, Settle, Unlink, Unlinked,
+    Code, Fees, Hex, Info, Issued, Lock, LockState, Locked, Locks, Offer, Offered, Problem, Refund,
+    Release, Released, Settle, Unlink, Unlinked,
 };
 use licash_hub::{Error, Hub, Refusal, Settled};
 use tower_http::trace::TraceLayer;
@@ -129,14 +129,10 @@ async fn info(State(hub): State<Arc<Hub>>) -> Answer<Info> {
     blocking(hub, |hub| {
         let info = hub.info();
         let (policy, timing) = (info.policy, info.policy.timing);
-        let fee = |fee: licash_hub::Fee| Fee {
-            base: fee.base,
-            ppm: fee.ppm,
-        };
         let fees = Fees {
-            spend: fee(policy.spend),
-            lock: fee(policy.lock),
-            refund: fee(policy.refund),
+            spend: policy.spend,
+            lock: policy.lock,
+            refund: policy.refund,
         };
         let locks = match (hub.checkpoint(), hub.scanned()?) {
             (Some(checkpoint), Some((height, _))) => Some(Locks {
