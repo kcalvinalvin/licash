@@ -6,5 +6,6 @@
 !crates/licash
 !crates/licash-api
 !crates/licash-hub
+!crates/licash-wallet
 !apps
 **/target
