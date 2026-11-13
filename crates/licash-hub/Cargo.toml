@@ -1,0 +1,19 @@
+[package]
+name = "licash-hub"
+description = "Licash hub engine: offers, spends and unlinking over a durable ledger"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+licash = { path = "../licash" }
+rusqlite = { version = "0.42", features = ["bundled"] }
+serde.workspace = true
+serde_json.workspace = true
+hex.workspace = true
+rand_core.workspace = true
+thiserror.workspace = true
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3.27"
