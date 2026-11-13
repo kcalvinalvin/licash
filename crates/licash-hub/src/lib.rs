@@ -40,6 +40,7 @@ use licash::{
     spend::{Output, Proposal, ProposalId},
     unlink::{self, Answer, Answered, Request},
 };
+use licash_api::Code;
 use rand_core::{OsRng, RngCore};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
@@ -132,6 +133,34 @@ pub enum Refusal {
     Unlinked,
     #[error("unlinking closed by a hub restart: swap the note instead")]
     Expired,
+}
+
+impl Refusal {
+    /// The code the API answers this refusal with.
+    pub fn code(&self) -> Code {
+        match self {
+            Self::UnknownKeyset => Code::UnknownKeyset,
+            Self::Timed => Code::Timed,
+            Self::Spent => Code::Spent,
+            Self::Reissued => Code::Reissued,
+            Self::Fee { .. } => Code::Fee,
+            Self::UnknownOffer => Code::UnknownOffer,
+            Self::NotIssued => Code::NotIssued,
+            Self::Unlinked => Code::Unlinked,
+            Self::Expired => Code::Expired,
+            Self::NotALock => Code::NotALock,
+            Self::Checkpoint(_) => Code::Checkpoint,
+            Self::Timing(_) => Code::Timing,
+            Self::Unsynced | Self::NoChain => Code::Unavailable,
+            Self::UnknownLock => Code::UnknownLock,
+            Self::Preimage => Code::Preimage,
+            Self::Settled => Code::Settled,
+            Self::LockExpired => Code::LockExpired,
+            Self::Unexpired => Code::Unexpired,
+            Self::Activated => Code::Activated,
+            Self::Block(_) | Self::Exists => Code::Invalid,
+        }
+    }
 }
 
 /// A fee, as the hub advertises it: what it charges is what payers compute.
@@ -427,6 +456,35 @@ impl Hub {
             address: self.owner.address(),
             policy: self.policy,
         }
+    }
+
+    /// What the hub says of itself at [`licash_api::INFO`]: with the locks
+    /// it admits once it follows a chain.
+    pub fn advertise(&self) -> Result<licash_api::Info, Error> {
+        let info = self.info();
+        let (policy, timing) = (info.policy, info.policy.timing);
+        let fees = licash_api::Fees {
+            spend: policy.spend,
+            lock: policy.lock,
+            refund: policy.refund,
+        };
+        let locks = match (self.checkpoint(), self.scanned()?) {
+            (Some(checkpoint), Some((height, _))) => Some(licash_api::Locks {
+                checkpoint: licash_api::Hex(checkpoint.to_bytes()),
+                height,
+                window: timing.window,
+                reaction: timing.reaction,
+                min_depth: timing.min_depth,
+                max_headers: timing.max_headers,
+            }),
+            _ => None,
+        };
+        Ok(licash_api::Info::new(
+            &info.keysets,
+            info.address,
+            fees,
+            locks,
+        ))
     }
 
     /// The hub's keyset `id`, to decode requests under.

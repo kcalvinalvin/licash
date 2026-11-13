@@ -13,10 +13,10 @@ use axum::{
     Json, Router,
 };
 use licash_api::{
-    Check, Checked, Code, Fees, Hex, Info, Issued, Lock, LockState, Locked, Locks, Offer, Offered,
-    Problem, Refund, Release, Released, Settle, Unlink, Unlinked,
+    Check, Checked, Code, Info, Issued, Lock, LockState, Locked, Offer, Offered, Problem, Refund,
+    Release, Released, Settle, Unlink, Unlinked,
 };
-use licash_hub::{Error, Hub, Refusal, Settled};
+use licash_hub::{Error, Hub, Settled};
 use tower_http::trace::TraceLayer;
 
 /// The largest request body: a spend of the most inputs and outputs the
@@ -69,28 +69,7 @@ impl From<JsonRejection> for Failure {
 impl From<Error> for Failure {
     fn from(e: Error) -> Self {
         let code = match &e {
-            Error::Refused(refusal) => match refusal {
-                Refusal::UnknownKeyset => Code::UnknownKeyset,
-                Refusal::Timed => Code::Timed,
-                Refusal::Spent => Code::Spent,
-                Refusal::Reissued => Code::Reissued,
-                Refusal::Fee { .. } => Code::Fee,
-                Refusal::UnknownOffer => Code::UnknownOffer,
-                Refusal::NotIssued => Code::NotIssued,
-                Refusal::Unlinked => Code::Unlinked,
-                Refusal::Expired => Code::Expired,
-                Refusal::NotALock => Code::NotALock,
-                Refusal::Checkpoint(_) => Code::Checkpoint,
-                Refusal::Timing(_) => Code::Timing,
-                Refusal::Unsynced | Refusal::NoChain => Code::Unavailable,
-                Refusal::UnknownLock => Code::UnknownLock,
-                Refusal::Preimage => Code::Preimage,
-                Refusal::Settled => Code::Settled,
-                Refusal::LockExpired => Code::LockExpired,
-                Refusal::Unexpired => Code::Unexpired,
-                Refusal::Activated => Code::Activated,
-                _ => Code::Invalid,
-            },
+            Error::Refused(refusal) => refusal.code(),
             Error::Invalid(_) => Code::Invalid,
             _ => {
                 tracing::error!(error = %e, "request failed");
@@ -127,28 +106,7 @@ async fn health(State(hub): State<Arc<Hub>>) -> Result<&'static str, Failure> {
 }
 
 async fn info(State(hub): State<Arc<Hub>>) -> Answer<Info> {
-    blocking(hub, |hub| {
-        let info = hub.info();
-        let (policy, timing) = (info.policy, info.policy.timing);
-        let fees = Fees {
-            spend: policy.spend,
-            lock: policy.lock,
-            refund: policy.refund,
-        };
-        let locks = match (hub.checkpoint(), hub.scanned()?) {
-            (Some(checkpoint), Some((height, _))) => Some(Locks {
-                checkpoint: Hex(checkpoint.to_bytes()),
-                height,
-                window: timing.window,
-                reaction: timing.reaction,
-                min_depth: timing.min_depth,
-                max_headers: timing.max_headers,
-            }),
-            _ => None,
-        };
-        Ok(Info::new(&info.keysets, info.address, fees, locks))
-    })
-    .await
+    blocking(hub, |hub| Ok(hub.advertise()?)).await
 }
 
 async fn offer(
