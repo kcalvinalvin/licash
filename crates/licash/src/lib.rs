@@ -27,6 +27,7 @@ pub mod route;
 pub mod source;
 pub mod spend;
 pub mod statement;
+pub mod unlink;
 pub mod wots;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]

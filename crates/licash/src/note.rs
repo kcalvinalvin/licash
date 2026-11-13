@@ -187,6 +187,11 @@ impl IssuerKeys {
         &self.issuer
     }
 
+    /// The id of [`Self::keyset`], without deriving the public keys.
+    pub fn id(&self) -> &[u8; 32] {
+        &self.id
+    }
+
     pub fn random(max_pow: u32) -> Result<Self, Error> {
         if max_pow >= 64 {
             return Err(bad("denomination exponent exceeds u64"));
@@ -677,6 +682,20 @@ impl Message {
     }
 }
 
+/// `to_bytes`, hex in JSON.
+impl serde::Serialize for Message {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        crate::crypto::serialize_fixed(&self.to_bytes(), s)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Message {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let bytes = crate::crypto::deserialize_fixed::<D, MESSAGE_BYTES>(d, "note message")?;
+        Self::from_bytes(&bytes).map_err(serde::de::Error::custom)
+    }
+}
+
 /// Long-lived hold authority, not a spending key. Exporting it delegates
 /// holds on future receipts too; it cannot be revoked.
 #[derive(Clone)]
@@ -855,6 +874,12 @@ impl Derivation {
         unlink_commitment(&self.seed)
     }
 
+    /// The private authority the commitment commits to, revealed to the
+    /// issuer only in an unlink request.
+    pub(crate) fn unlink_capability(&self) -> [u8; 32] {
+        unlink_capability(&self.seed)
+    }
+
     pub fn blinded(&self) -> Result<Point, Error> {
         let point = self.message.identifier()?.to_projective()?
             + generator_mul(&self.blinding.to_scalar()?);
@@ -970,7 +995,11 @@ fn unlink_capability(seed: &[u8; 32]) -> [u8; 32] {
 /// Public output commitment to its private unlink authority. Separate
 /// domains keep the commitment, capability, and note derivations distinct.
 pub fn unlink_commitment(seed: &[u8; 32]) -> [u8; 32] {
-    tagged_hash("licash/unlink-commitment", &[&unlink_capability(seed)])
+    unlink_commitment_of(&unlink_capability(seed))
+}
+
+pub(crate) fn unlink_commitment_of(capability: &[u8; 32]) -> [u8; 32] {
+    tagged_hash("licash/unlink-commitment", &[capability])
 }
 
 /// The one-time key's tweak for root `spend` and output seed `seed`:

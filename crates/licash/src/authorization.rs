@@ -20,7 +20,7 @@ use crate::{
     note::Evidence,
     note::{non_identity, Derivation, IssuerKeys, Keyset, Note},
     spend::{Proposal, ProposalId},
-    Error,
+    unlink, Error,
 };
 
 fn bad(reason: &str) -> Error {
@@ -296,31 +296,23 @@ impl Grant {
 
 #[derive(Clone)]
 struct PacketRecord {
-    denom: u64,
-    blinded: Point,
     sealed: Vec<u8>,
-    unlink_nonce: Scalar,
+    nonce: unlink::Nonce,
 }
 
 impl PacketRecord {
     fn packet(&self) -> Packet {
         Packet {
-            denom: self.denom,
-            blinded: self.blinded,
+            denom: self.nonce.denomination(),
+            blinded: self.nonce.blinded(),
             sealed: self.sealed.clone(),
-            commit: crypto::dleq_commit(
-                &self.unlink_nonce,
-                &self
-                    .blinded
-                    .to_projective()
-                    .expect("validated grant target"),
-            ),
+            commit: self.nonce.commit().expect("validated grant target"),
         }
     }
 }
 
 /// In-memory retained offer and secrets. Clones replay exactly, but do not
-/// establish exclusive or durable authority. There is no unlink-answer API.
+/// establish exclusive or durable authority.
 #[derive(Clone)]
 pub struct PreparedGrant {
     keyset: [u8; 32],
@@ -363,10 +355,8 @@ impl PreparedGrant {
                 *byte ^= pad;
             }
             records.push(PacketRecord {
-                denom: output.denomination(),
-                blinded: output.blinded(),
                 sealed,
-                unlink_nonce: crypto::random_scalar(),
+                nonce: unlink::Nonce::new(&keyset, output)?,
             });
         }
         let mut offer = Grant {
@@ -387,6 +377,13 @@ impl PreparedGrant {
             records,
             sig: offer.sig,
         })
+    }
+
+    /// The unlink nonce of each packet, in order, for the issuer to keep
+    /// once the grant is released ([`unlink::Nonce`]). Each answers one
+    /// request, so take them into the issuer's store once.
+    pub fn unlink_nonces(&self) -> Vec<unlink::Nonce> {
+        self.records.iter().map(|r| r.nonce.clone()).collect()
     }
 
     pub fn offer(&self) -> Grant {
