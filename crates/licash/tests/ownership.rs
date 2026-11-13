@@ -32,6 +32,23 @@ fn derived_and_retained_witnesses_recompute_the_existing_bound_tweak_rule() {
 }
 
 #[test]
+fn the_owner_secret_signs_for_the_messages_owner() {
+    let output = output();
+    let witness = output.ownership();
+    let secret = witness.owner_secret(&Scalar::from(17u64)).unwrap();
+    let seed = licash::note::derive_output(&point(17), &[23; 32], 3)
+        .unwrap()
+        .seed;
+    let tweak =
+        crypto::scalar_from_hash(&crypto::tagged_hash("licash/tweak", &[&point(17).0, &seed]));
+    assert_eq!(secret, Scalar::from(17u64) + tweak);
+    assert_eq!(&crypto::x_only_pub(&secret), output.message().owner());
+    let other = witness.owner_secret(&Scalar::from(19u64)).unwrap();
+    assert_ne!(&crypto::x_only_pub(&other), output.message().owner());
+    assert!(witness.owner_secret(&Scalar::ZERO).is_err());
+}
+
+#[test]
 fn wrong_roots_seeds_and_invalid_points_do_not_establish_ownership() {
     let output = output();
     let witness = output.ownership();

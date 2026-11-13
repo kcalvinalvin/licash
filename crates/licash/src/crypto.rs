@@ -59,7 +59,7 @@ impl std::fmt::Debug for Point {
 /// Fixed-size byte strings: hex in human-readable formats (JSON), raw
 /// bytes in binary ones (bincode, the guest's input), where hex costs
 /// cycles.
-fn serialize_fixed<S: serde::Serializer>(bytes: &[u8], s: S) -> Result<S::Ok, S::Error> {
+pub(crate) fn serialize_fixed<S: serde::Serializer>(bytes: &[u8], s: S) -> Result<S::Ok, S::Error> {
     if s.is_human_readable() {
         s.serialize_str(&hex::encode(bytes))
     } else {
@@ -67,7 +67,7 @@ fn serialize_fixed<S: serde::Serializer>(bytes: &[u8], s: S) -> Result<S::Ok, S:
     }
 }
 
-fn deserialize_fixed<'de, D: serde::Deserializer<'de>, const N: usize>(
+pub(crate) fn deserialize_fixed<'de, D: serde::Deserializer<'de>, const N: usize>(
     d: D,
     what: &'static str,
 ) -> Result<[u8; N], D::Error> {

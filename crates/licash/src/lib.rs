@@ -7,6 +7,7 @@
 //! `hold`, `recovery`, `statement`, `disclosure`, `wots`, `guest`);
 //! interoperability (`source`, `route`).
 
+pub mod address;
 pub mod authorization;
 pub mod base;
 pub mod chain;

@@ -679,6 +679,16 @@ impl Ownership {
         Ok(())
     }
 
+    /// The signing secret of the one-time owner key under the spend root
+    /// whose secret is `spend`: `spend + H("licash/tweak", spend G, seed)`.
+    pub fn owner_secret(&self, spend: &Scalar) -> Result<Scalar, Error> {
+        if *spend == Scalar::ZERO {
+            return Err(Error::InvalidScalar);
+        }
+        let root = Point::from_projective(&generator_mul(spend));
+        Ok(*spend + bound_tweak(&root, &self.seed).to_scalar()?)
+    }
+
     /// Public source-output linkage, not an unlink answer or release authority.
     pub fn unlink_commitment(&self) -> [u8; 32] {
         unlink_commitment(&self.seed)
