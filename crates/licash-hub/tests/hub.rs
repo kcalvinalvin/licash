@@ -6,9 +6,9 @@ use licash::{
     claim::Branch,
     note::{Derivation, Evidence, IssuerKeys, Keyset, Note},
     spend::{ChainProfile, Output, Proposal, TimedLock, TimedTerms},
-    unlink::{Nonce, Session},
+    unlink::{Nonce, Request, Session},
 };
-use licash_hub::{Error, Fee, Hub, Notice, Policy, Refusal};
+use licash_hub::{Error, Fee, Hub, Ledger, Notice, Policy, Refusal, Stats};
 
 const MAX_POW: u32 = 6;
 
@@ -203,8 +203,15 @@ fn notices(hub: &Hub) -> Vec<Notice> {
     hub.events(0, 100)
         .unwrap()
         .into_iter()
-        .map(|e| e.notice)
+        .map(|e| e.notice().unwrap())
         .collect()
+}
+
+/// `request` with another capability.
+fn forge(request: &Request) -> Request {
+    let mut bytes = request.to_bytes();
+    bytes[10 + 32 + 8 + 33] ^= 1;
+    Request::from_bytes(&bytes).unwrap()
 }
 
 fn sql(db: &Path) -> rusqlite::Connection {
@@ -487,12 +494,12 @@ fn issued_outputs_unlink_once_and_only_until_the_hub_restarts() {
     let notes = spend.complete(&hub, &keyset);
     let (paid, change) = (spend.coin(&notes, 0, &bob), spend.coin(&notes, 1, &alice));
 
-    let session = Session::start(&keyset, &paid.note, &paid.derivation).unwrap();
-    // Without the output's capability the nonce stays unused.
-    let mut forged = session.request().to_bytes();
-    forged[10 + 32 + 8 + 33] ^= 1;
-    let forged = licash::unlink::Request::from_bytes(&forged).unwrap();
-    assert!(matches!(hub.unlink(&forged), Err(Error::Invalid(_))));
+    let asked = Session::start(&keyset, &paid.note, &paid.derivation).unwrap();
+    let session = asked.clone();
+    // Without the output's capability the nonce stays unused, and the
+    // output looks unknown.
+    let forged = forge(session.request());
+    assert_eq!(refused(hub.unlink(&forged)), Refusal::NotIssued);
     let answer = hub.unlink(session.request()).unwrap();
     let unlinked = session.finish(&keyset, &answer).unwrap();
     unlinked.verify(&keyset).unwrap();
@@ -500,6 +507,7 @@ fn issued_outputs_unlink_once_and_only_until_the_hub_restarts() {
     assert_eq!(hub.unlink(session.request()).unwrap(), answer);
     let other = Session::start(&keyset, &paid.note, &paid.derivation).unwrap();
     assert_eq!(refused(hub.unlink(other.request())), Refusal::Unlinked);
+    assert_eq!(refused(hub.unlink(&forged)), Refusal::NotIssued);
 
     let unknown = mint(&files, &bob, 4);
     let session = Session::start(&keyset, &unknown.note, &unknown.derivation).unwrap();
@@ -509,8 +517,14 @@ fn issued_outputs_unlink_once_and_only_until_the_hub_restarts() {
     let hub = open(&files, Policy::default());
     let late = Session::start(&keyset, &change.note, &change.derivation).unwrap();
     assert_eq!(refused(hub.unlink(late.request())), Refusal::Expired);
+    assert_eq!(
+        refused(hub.unlink(&forge(late.request()))),
+        Refusal::NotIssued
+    );
     let first = Session::start(&keyset, &paid.note, &paid.derivation).unwrap();
     assert_eq!(refused(hub.unlink(first.request())), Refusal::Unlinked);
+    // The answer to the same request is kept across restarts.
+    assert_eq!(hub.unlink(asked.request()).unwrap(), answer);
     // The change is still spendable, and its swap unlinks.
     let swap = Spend::new(&keyset, &[change], &[(alice.address(), 4)]);
     let swapped = swap.coin(&swap.complete(&hub, &keyset), 0, &alice);
@@ -572,4 +586,280 @@ fn a_database_changed_under_the_running_hub_halts_it() {
 fn a_hub_is_shared_across_threads() {
     fn shared<T: Send + Sync>() {}
     shared::<Hub>();
+}
+
+#[test]
+fn a_hub_that_answered_halts_when_its_database_forgets_the_answer() {
+    let files = files();
+    let hub = open(&files, Policy::default());
+    let (_, keyset) = issuer(&files);
+    let (alice, bob) = (owner(1), owner(2));
+    let spend = Spend::new(&keyset, &[mint(&files, &alice, 8)], &[(bob.address(), 8)]);
+    let paid = spend.coin(&spend.complete(&hub, &keyset), 0, &bob);
+    let first = Session::start(&keyset, &paid.note, &paid.derivation).unwrap();
+    hub.unlink(first.request()).unwrap();
+    // As a file restored under the hub would read, with the write count
+    // unchanged: the nonce looks unanswered.
+    sql(&files.db)
+        .execute("UPDATE issued SET answered = NULL", [])
+        .unwrap();
+    let second = Session::start(&keyset, &paid.note, &paid.derivation).unwrap();
+    assert_eq!(refused(hub.unlink(second.request())), Refusal::Unlinked);
+    assert!(matches!(hub.unlink(first.request()), Err(Error::Halted)));
+    assert!(matches!(hub.unlink(second.request()), Err(Error::Halted)));
+}
+
+#[test]
+fn outputs_offered_before_a_restart_and_released_after_it_do_not_unlink() {
+    let files = files();
+    let (_, keyset) = issuer(&files);
+    let (alice, bob) = (owner(1), owner(2));
+    let spend = Spend::new(&keyset, &[mint(&files, &alice, 8)], &[(bob.address(), 8)]);
+    let hub = open(&files, Policy::default());
+    spend.offer(&hub).unwrap();
+    drop(hub);
+    let hub = open(&files, Policy::default());
+    let paid = spend.coin(&spend.complete(&hub, &keyset), 0, &bob);
+    let session = Session::start(&keyset, &paid.note, &paid.derivation).unwrap();
+    assert_eq!(refused(hub.unlink(session.request())), Refusal::Expired);
+}
+
+#[test]
+fn racing_releases_retire_an_input_once() {
+    let files = files();
+    let hub = open(&files, Policy::default());
+    let (_, keyset) = issuer(&files);
+    let (alice, bob) = (owner(1), owner(2));
+    let signed = |coin: &Coin| {
+        let spend = Spend::new(&keyset, std::slice::from_ref(coin), &[(bob.address(), 8)]);
+        let grant = spend.offer(&hub).unwrap();
+        let signed = spend.sign(&keyset, Authorization::Granted(Box::new(grant)));
+        (signed, spend.notes())
+    };
+    let race = |releases: &[(SignedProposal, Vec<Note>)]| -> Vec<Result<_, Error>> {
+        std::thread::scope(|scope| {
+            let tasks: Vec<_> = releases
+                .iter()
+                .map(|(signed, notes)| scope.spawn(|| hub.release(signed, notes)))
+                .collect();
+            tasks.into_iter().map(|t| t.join().unwrap()).collect()
+        })
+    };
+    // The same release four times at once.
+    let same = signed(&mint(&files, &alice, 8));
+    let unlocks: Vec<_> = race(&vec![same; 4])
+        .into_iter()
+        .map(Result::unwrap)
+        .collect();
+    assert!(unlocks.iter().all(|unlock| *unlock == unlocks[0]));
+    // Four spends of one input at once.
+    let coin = mint(&files, &alice, 8);
+    let rivals: Vec<_> = (0..4).map(|_| signed(&coin)).collect();
+    let results = race(&rivals);
+    assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+    for result in results.into_iter().filter(Result::is_err) {
+        assert_eq!(refused(result), Refusal::Spent);
+    }
+    let released = notices(&hub)
+        .iter()
+        .filter(|n| matches!(n, Notice::Released { .. }))
+        .count();
+    assert_eq!(released, 2);
+}
+
+#[test]
+fn a_double_spend_is_alerted_once_per_proposal() {
+    let files = files();
+    let hub = open(&files, Policy::default());
+    let (_, keyset) = issuer(&files);
+    let (alice, bob) = (owner(1), owner(2));
+    let coin = mint(&files, &alice, 8);
+    let late = Spend::new(&keyset, std::slice::from_ref(&coin), &[(bob.address(), 8)]);
+    let grant = late.offer(&hub).unwrap();
+    Spend::new(&keyset, &[coin], &[(bob.address(), 8)]).complete(&hub, &keyset);
+    let signed = late.sign(&keyset, Authorization::Granted(Box::new(grant)));
+    for _ in 0..3 {
+        assert_eq!(refused(hub.release(&signed, &late.notes())), Refusal::Spent);
+    }
+    let alerts = notices(&hub)
+        .iter()
+        .filter(|n| matches!(n, Notice::DoubleSpend { .. }))
+        .count();
+    assert_eq!(alerts, 1);
+}
+
+#[test]
+fn an_empty_database_beside_a_seed_is_no_hub() {
+    let files = files();
+    let empty = files.db.with_file_name("empty.sqlite");
+    std::fs::File::create(&empty).unwrap();
+    let why = setup_error(Hub::open(&files.seed, &empty, Policy::default()));
+    assert!(why.contains("schema 0"), "{why}");
+    let other = files.db.with_file_name("other-seed");
+    setup_error(Hub::init(&other, &empty, MAX_POW));
+    assert!(!other.exists());
+    assert!(Ledger::open(&empty).is_err());
+}
+
+#[test]
+fn only_outputs_derived_for_the_hub_at_their_position_pay_its_fee() {
+    let files = files();
+    let hub = open(&files, fee(2, 0));
+    let (_, keyset) = issuer(&files);
+    let (alice, bob) = (owner(1), owner(2));
+    let address = hub.info().address;
+    let coin = mint(&files, &alice, 8);
+    let spend = Spend::new(
+        &keyset,
+        std::slice::from_ref(&coin),
+        &[(address, 2), (bob.address(), 4), (bob.address(), 2)],
+    );
+    // The hub's output moved to another position is not the hub's.
+    let mut outputs = spend.proposal.outputs().to_vec();
+    outputs.swap(0, 2);
+    let moved = Proposal::new(
+        &keyset,
+        std::slice::from_ref(&coin.note),
+        spend.proposal.ephemeral(),
+        outputs,
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        refused(hub.offer(&moved, std::slice::from_ref(&coin.note))),
+        Refusal::Fee { due: 2, paid: 0 }
+    );
+    // Nor is one under another unlink commitment.
+    let mut outputs = spend.proposal.outputs().to_vec();
+    outputs[0] = Output::new(2, outputs[0].blinded(), [9; 32]).unwrap();
+    let recommitted = Proposal::new(
+        &keyset,
+        std::slice::from_ref(&coin.note),
+        spend.proposal.ephemeral(),
+        outputs,
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        refused(hub.offer(&recommitted, std::slice::from_ref(&coin.note))),
+        Refusal::Fee { due: 2, paid: 0 }
+    );
+    spend.offer(&hub).unwrap();
+}
+
+#[test]
+fn the_largest_denomination_is_spent_and_unlinked() {
+    let dir = tempfile::tempdir().unwrap();
+    let (seed, db) = (dir.path().join("seed"), dir.path().join("hub.sqlite"));
+    Hub::init(&seed, &db, licash_hub::MAX_POW).unwrap();
+    let hub = Hub::open(&seed, &db, Policy::default()).unwrap();
+    let mut secret = [0; 32];
+    hex::decode_to_slice(std::fs::read_to_string(&seed).unwrap().trim(), &mut secret).unwrap();
+    let keys = IssuerKeys::from_seed(&secret, 0, licash_hub::MAX_POW).unwrap();
+    let keyset = keys.keyset().unwrap();
+    let (alice, bob) = (owner(1), owner(2));
+    let top = 1u64 << licash_hub::MAX_POW;
+    let spend = Spend::new(
+        &keyset,
+        &[mint_under(&keys, &keyset, &alice, top)],
+        &[(bob.address(), top)],
+    );
+    let paid = spend.coin(&spend.complete(&hub, &keyset), 0, &bob);
+    let session = Session::start(&keyset, &paid.note, &paid.derivation).unwrap();
+    let answer = hub.unlink(session.request()).unwrap();
+    session.finish(&keyset, &answer).unwrap();
+    assert!(
+        matches!(notices(&hub).last(), Some(Notice::Released { amount, .. }) if *amount == top)
+    );
+    setup_error(Hub::init(
+        &dir.path().join("s"),
+        &dir.path().join("d"),
+        licash_hub::MAX_POW + 1,
+    ));
+}
+
+#[test]
+fn events_of_unknown_kinds_are_read_as_stored() {
+    let files = files();
+    let hub = open(&files, Policy::default());
+    sql(&files.db)
+        .execute(
+            "INSERT INTO events (at, kind, json) VALUES (1, 'future', '{\"kind\":\"future\"}'),
+             (2, 'broken', 'not json')",
+            [],
+        )
+        .unwrap();
+    let events = hub.events(0, 10).unwrap();
+    assert_eq!(events.len(), 3);
+    assert!(matches!(events[0].notice(), Some(Notice::Started { .. })));
+    assert_eq!(events[1].kind, "future");
+    assert_eq!(events[1].notice(), None);
+    assert_eq!(events[2].data, serde_json::Value::from("not json"));
+}
+
+#[test]
+fn the_ledger_reads_beside_the_running_hub_and_writes_nothing() {
+    let files = files();
+    let hub = open(&files, Policy::default());
+    let (_, keyset) = issuer(&files);
+    let (alice, bob) = (owner(1), owner(2));
+    let spend = Spend::new(
+        &keyset,
+        &[mint(&files, &alice, 8)],
+        &[
+            (bob.address(), 4),
+            (bob.address(), 2),
+            (hub.info().address, 2),
+        ],
+    );
+    let paid = spend.coin(&spend.complete(&hub, &keyset), 0, &bob);
+    let session = Session::start(&keyset, &paid.note, &paid.derivation).unwrap();
+    hub.unlink(session.request()).unwrap();
+    let offer = |hub: &Hub| {
+        Spend::new(&keyset, &[mint(&files, &alice, 4)], &[(bob.address(), 4)])
+            .offer(hub)
+            .unwrap()
+    };
+    offer(&hub);
+    let ledger = Ledger::open(&files.db).unwrap();
+    let stats = Stats {
+        offers: 2,
+        released: 1,
+        spent: 1,
+        issued: 3,
+        unlinked: 1,
+        income: 2,
+        events: 2,
+    };
+    assert_eq!(ledger.stats().unwrap(), stats);
+    assert_eq!(ledger.events(0, 10).unwrap(), hub.events(0, 10).unwrap());
+    // The hub goes on writing beside it, and restarts beside it.
+    offer(&hub);
+    assert_eq!(ledger.stats().unwrap().offers, 3);
+    drop(hub);
+    let hub = open(&files, Policy::default());
+    assert_eq!(ledger.stats().unwrap().events, 3);
+    drop(hub);
+    let seq = |db: &Path| -> i64 {
+        sql(db)
+            .query_row("SELECT seq FROM meta", [], |r| r.get(0))
+            .unwrap()
+    };
+    let before = seq(&files.db);
+    let ledger = Ledger::open(&files.db).unwrap();
+    ledger.stats().unwrap();
+    ledger.events(0, 10).unwrap();
+    drop(ledger);
+    assert_eq!(seq(&files.db), before);
+}
+
+#[cfg(unix)]
+#[test]
+fn one_hub_runs_on_a_database_by_any_path() {
+    let files = files();
+    let alias = files.db.with_file_name("alias.sqlite");
+    std::os::unix::fs::symlink(&files.db, &alias).unwrap();
+    let _hub = open(&files, Policy::default());
+    let why = setup_error(Hub::open(&files.seed, &alias, Policy::default()));
+    assert!(why.contains("another hub"), "{why}");
 }

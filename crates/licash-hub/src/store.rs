@@ -42,7 +42,9 @@ CREATE TABLE proposals (
     boot BLOB NOT NULL,
     offered_at INTEGER NOT NULL,
     signed BLOB,
-    released_at INTEGER
+    released_at INTEGER,
+    -- When a spend of its inputs by another proposal was first refused.
+    double_spent_at INTEGER
 ) STRICT;
 -- Each retired input, by its identifier, with the note that spent it.
 CREATE TABLE spent (
@@ -138,11 +140,12 @@ impl Store {
                 path.display()
             )));
         }
+        // One lock per file, by whatever path the hub is given.
         let lock = OpenOptions::new()
             .create(true)
             .truncate(false)
             .write(true)
-            .open(suffixed(path, ".lock"))?;
+            .open(suffixed(&path.canonicalize()?, ".lock"))?;
         match lock.try_lock() {
             Ok(()) => {}
             Err(TryLockError::WouldBlock) => {
@@ -154,12 +157,7 @@ impl Store {
             Err(TryLockError::Error(e)) => return Err(e.into()),
         }
         let conn = connect(path)?;
-        let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if version != VERSION {
-            return Err(Error::Setup(format!(
-                "database schema {version}, this hub reads {VERSION}"
-            )));
-        }
+        check_version(&conn)?;
         let seq = conn.query_row("SELECT seq FROM meta", [], |r| r.get(0))?;
         Ok(Self {
             inner: Mutex::new(Inner { conn, seq }),
@@ -210,6 +208,34 @@ impl Store {
         tracing::error!("{why}: the hub serves nothing more");
         Error::Halted
     }
+}
+
+/// A connection to the ledger at `path` that cannot write it.
+pub(crate) fn inspect(path: &Path) -> Result<Connection, Error> {
+    if !path.is_file() {
+        return Err(Error::Setup(format!(
+            "no hub database at {}",
+            path.display()
+        )));
+    }
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    conn.busy_timeout(Duration::from_secs(10))?;
+    conn.pragma_update(None, "query_only", true)?;
+    check_version(&conn)?;
+    Ok(conn)
+}
+
+fn check_version(conn: &Connection) -> Result<(), Error> {
+    let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    if version != VERSION {
+        return Err(Error::Setup(format!(
+            "database schema {version}, this hub reads {VERSION}"
+        )));
+    }
+    Ok(())
 }
 
 fn connect(path: &Path) -> Result<Connection, Error> {

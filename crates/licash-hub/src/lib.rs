@@ -8,14 +8,23 @@
 //! commits one transaction before it replies.
 //!
 //! Unlink nonces derive from a key drawn at each start and never stored,
-//! so no restored or copied database can make the hub answer twice under
-//! one nonce. Outputs issued before a restart can therefore no longer be
-//! unlinked ([`Refusal::Expired`]); their holders keep the value and can
-//! swap them for fresh outputs.
+//! and the hub also remembers what it answered since, so that neither a
+//! database restored or copied before a start nor one replaced under the
+//! running hub makes it answer twice under one nonce. A snapshot of the
+//! process's memory resumed twice would. Outputs issued before a restart
+//! can no longer be unlinked ([`Refusal::Expired`]); their holders keep
+//! the value and can swap them for fresh outputs.
+//!
+//! [`Ledger`] reads the database beside a running hub, for monitoring.
 
 mod store;
 
-use std::{collections::BTreeMap, io::Write, path::Path};
+use std::{
+    collections::{BTreeMap, HashMap},
+    io::Write,
+    path::Path,
+    sync::{Mutex, PoisonError},
+};
 
 use licash::{
     address::{Address, OwnerKeys},
@@ -26,7 +35,7 @@ use licash::{
     unlink::{self, Answer, Answered, Request},
 };
 use rand_core::{OsRng, RngCore};
-use rusqlite::{params, OptionalExtension, Transaction};
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use store::{now, setup_io, Store};
 
@@ -35,6 +44,7 @@ use store::{now, setup_io, Store};
 pub const MAX_POW: u32 = 62;
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     /// The request is valid but the hub will not serve it.
     #[error("refused: {0}")]
@@ -50,12 +60,24 @@ pub enum Error {
     #[error("halted: the hub database changed under it")]
     Halted,
     #[error("storage: {0}")]
-    Storage(#[from] rusqlite::Error),
+    Storage(#[source] StorageError),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }
 
+/// A database error, opaque so that the storage engine stays private.
+#[derive(Debug, thiserror::Error)]
+#[error(transparent)]
+pub struct StorageError(rusqlite::Error);
+
+impl From<rusqlite::Error> for Error {
+    fn from(e: rusqlite::Error) -> Self {
+        Self::Storage(StorageError(e))
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum Refusal {
     #[error("unknown keyset")]
     UnknownKeyset,
@@ -69,6 +91,7 @@ pub enum Refusal {
     Fee { due: u64, paid: u64 },
     #[error("no offer for this proposal")]
     UnknownOffer,
+    /// Or not to the capability the request carries.
     #[error("not issued by this hub")]
     NotIssued,
     #[error("already unlinked under another request")]
@@ -109,6 +132,7 @@ pub struct Info {
 /// Something a hub operator may want to hear about.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum Notice {
     /// The hub started. Outputs issued before can no longer be unlinked.
     Started { boot: String },
@@ -118,7 +142,8 @@ pub enum Notice {
         amount: u64,
         fee: u64,
     },
-    /// The owners of inputs another spend retired signed `proposal`.
+    /// The owners of inputs another spend retired signed `proposal`. Once
+    /// per proposal.
     DoubleSpend { proposal: String, spent_by: String },
 }
 
@@ -132,13 +157,92 @@ impl Notice {
     }
 }
 
-/// A [`Notice`] in the hub's outbox, in order of `seq`.
+/// A [`Notice`] in the hub's outbox, in order of `seq`: its kind and its
+/// JSON as stored, which a hub of another version may have written.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Event {
     pub seq: u64,
     /// Unix seconds.
     pub at: u64,
-    pub notice: Notice,
+    pub kind: String,
+    pub data: serde_json::Value,
+}
+
+impl Event {
+    /// The notice, if this version knows it.
+    pub fn notice(&self) -> Option<Notice> {
+        serde_json::from_value(self.data.clone()).ok()
+    }
+}
+
+/// Counts over a hub's ledger.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Stats {
+    pub offers: u64,
+    pub released: u64,
+    pub spent: u64,
+    pub issued: u64,
+    pub unlinked: u64,
+    /// The value of the notes paid to the hub.
+    pub income: u64,
+    /// The last event's `seq`.
+    pub events: u64,
+}
+
+/// A read-only view of a hub's database, beside the running hub or
+/// without one. It needs no seed, takes no lock and writes nothing.
+pub struct Ledger {
+    conn: Connection,
+}
+
+impl Ledger {
+    pub fn open(db: &Path) -> Result<Self, Error> {
+        Ok(Self {
+            conn: store::inspect(db)?,
+        })
+    }
+
+    pub fn events(&self, after: u64, limit: u32) -> Result<Vec<Event>, Error> {
+        events(&self.conn, after, limit)
+    }
+
+    pub fn stats(&self) -> Result<Stats, Error> {
+        let count = |sql: &str| -> Result<u64, Error> {
+            Ok(self.conn.query_row(sql, [], |r| r.get::<_, i64>(0))? as u64)
+        };
+        Ok(Stats {
+            offers: count("SELECT count(*) FROM proposals")?,
+            released: count("SELECT count(*) FROM proposals WHERE released_at IS NOT NULL")?,
+            spent: count("SELECT count(*) FROM spent")?,
+            issued: count("SELECT count(*) FROM issued")?,
+            unlinked: count("SELECT count(*) FROM issued WHERE answered IS NOT NULL")?,
+            income: count("SELECT coalesce(sum(denom), 0) FROM income")?,
+            events: count("SELECT coalesce(max(seq), 0) FROM events")?,
+        })
+    }
+}
+
+fn events(conn: &Connection, after: u64, limit: u32) -> Result<Vec<Event>, Error> {
+    let mut rows = conn
+        .prepare("SELECT seq, at, kind, json FROM events WHERE seq > ?1 ORDER BY seq LIMIT ?2")?;
+    let rows = rows.query_map(params![sql(after), limit], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, i64>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
+        ))
+    })?;
+    rows.map(|row| {
+        let (seq, at, kind, json) = row?;
+        Ok(Event {
+            seq: seq as u64,
+            at: at as u64,
+            kind,
+            data: serde_json::from_str(&json).unwrap_or(serde_json::Value::String(json)),
+        })
+    })
+    .collect()
 }
 
 pub struct Hub {
@@ -149,6 +253,9 @@ pub struct Hub {
     /// This process's public boot id and its key, never stored.
     boot: [u8; 16],
     boot_key: [u8; 32],
+    /// What this process answered: the hash of each request by its output.
+    /// It outlives no nonce, so it is the authority over them.
+    answered: Mutex<HashMap<[u8; 32], [u8; 32]>>,
     policy: Policy,
 }
 
@@ -215,6 +322,7 @@ impl Hub {
             unlock_secret: tagged_hash("licash-hub/unlock", &[&secret]),
             boot,
             boot_key: tagged_hash("licash-hub/boot", &[&secret, &drawn]),
+            answered: Mutex::default(),
             policy,
         };
         let boot = hex::encode(boot);
@@ -239,28 +347,7 @@ impl Hub {
 
     /// The events after `seq`, oldest first, at most `limit`.
     pub fn events(&self, after: u64, limit: u32) -> Result<Vec<Event>, Error> {
-        self.store.read(|c| {
-            let mut rows =
-                c.prepare("SELECT seq, at, json FROM events WHERE seq > ?1 ORDER BY seq LIMIT ?2")?;
-            let rows = rows.query_map(params![sql(after), limit], |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, i64>(1)?,
-                    r.get::<_, String>(2)?,
-                ))
-            })?;
-            rows.map(|row| {
-                let (seq, at, json) = row?;
-                let notice = serde_json::from_str(&json)
-                    .map_err(|e| Error::Setup(format!("event {seq}: {e}")))?;
-                Ok(Event {
-                    seq: seq as u64,
-                    at: at as u64,
-                    notice,
-                })
-            })
-            .collect()
-        })
+        self.store.read(|c| events(c, after, limit))
     }
 
     fn keys(&self, id: &[u8; 32]) -> Result<(&IssuerKeys, &Keyset), Error> {
@@ -486,8 +573,17 @@ impl Hub {
         if let Some(by) = spent_by {
             let (proposal, spent_by) = (hex::encode(id.as_bytes()), hex::encode(by));
             tracing::warn!(%proposal, %spent_by, "double spend refused");
-            self.store
-                .write(|tx| notify(tx, &Notice::DoubleSpend { proposal, spent_by }))?;
+            self.store.write(|tx| {
+                let first = tx.execute(
+                    "UPDATE proposals SET double_spent_at = ?2
+                     WHERE id = ?1 AND double_spent_at IS NULL",
+                    params![id.as_bytes(), now()],
+                )?;
+                if first == 1 {
+                    notify(tx, &Notice::DoubleSpend { proposal, spent_by })?;
+                }
+                Ok(())
+            })?;
         }
         if released? {
             tracing::info!(proposal = %hex::encode(id.as_bytes()), amount, fee, "released");
@@ -496,51 +592,63 @@ impl Hub {
     }
 
     /// The answer to an unlink request for an output this hub issued since
-    /// it started, or the same answer again for the same request.
+    /// it started, or the same answer again for the same request. Only the
+    /// holder of the output's capability learns more than [`Refusal::NotIssued`].
     pub fn unlink(&self, request: &Request) -> Result<Answer, Error> {
         let (keys, keyset) = self.keys(request.keyset())?;
         keyset.key(request.denomination())?;
-        let key = params![
-            keyset.id(),
-            sql(request.denomination()),
-            &request.blinded().0
-        ];
+        let denom = sql(request.denomination());
+        let blinded = request.blinded();
+        let output_hash = tagged_hash(
+            "licash-hub/issued",
+            &[
+                keyset.id(),
+                &request.denomination().to_be_bytes(),
+                &blinded.0,
+            ],
+        );
+        let request_hash = tagged_hash("licash-hub/unlink-request", &[&request.to_bytes()]);
         self.store.write(|tx| {
             type Row = ([u8; 32], [u8; 32], [u8; 16], Option<Vec<u8>>);
             let row: Option<Row> = tx
                 .query_row(
                     "SELECT commitment, proposal, boot, answered FROM issued
                      WHERE keyset = ?1 AND denom = ?2 AND blinded = ?3",
-                    key,
+                    params![keyset.id(), denom, &blinded.0],
                     |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
                 )
                 .optional()?;
-            let (commitment, proposal, boot, answered) = row.ok_or(Refusal::NotIssued)?;
-            if let Some(answered) = answered {
-                return Answered::from_bytes(&answered)?
+            let (commitment, proposal, boot, stored) = row
+                .filter(|(commitment, ..)| *commitment == request.unlink_commitment())
+                .ok_or(Refusal::NotIssued)?;
+            let mut answered = self.answered.lock().unwrap_or_else(PoisonError::into_inner);
+            match (answered.get(&output_hash), stored) {
+                (Some(asked), _) if *asked != request_hash => Err(Refusal::Unlinked.into()),
+                // This process answered, and the database forgot.
+                (Some(_), None) => Err(Error::Halted),
+                (_, Some(stored)) => Answered::from_bytes(&stored)?
                     .replay(request)
-                    .map_err(|_| Refusal::Unlinked.into());
+                    .map_err(|_| Refusal::Unlinked.into()),
+                (None, None) => {
+                    if boot != self.boot {
+                        return Err(Refusal::Expired.into());
+                    }
+                    let output = Output::new(request.denomination(), blinded, commitment)?;
+                    let nonce =
+                        unlink::Nonce::derive(&self.nonce_secret(&proposal), keyset, &output)?;
+                    let record = nonce.answer(keys, request)?;
+                    let updated = tx.execute(
+                        "UPDATE issued SET answered = ?4
+                         WHERE keyset = ?1 AND denom = ?2 AND blinded = ?3 AND answered IS NULL",
+                        params![keyset.id(), denom, &blinded.0, record.to_bytes()],
+                    )?;
+                    if updated != 1 {
+                        return Err(Error::Halted);
+                    }
+                    answered.insert(output_hash, request_hash);
+                    Ok(record.answer())
+                }
             }
-            if boot != self.boot {
-                return Err(Refusal::Expired.into());
-            }
-            let output = Output::new(request.denomination(), request.blinded(), commitment)?;
-            let answered = unlink::Nonce::derive(&self.nonce_secret(&proposal), keyset, &output)?
-                .answer(keys, request)?;
-            let updated = tx.execute(
-                "UPDATE issued SET answered = ?4
-                 WHERE keyset = ?1 AND denom = ?2 AND blinded = ?3 AND answered IS NULL",
-                params![
-                    keyset.id(),
-                    sql(request.denomination()),
-                    &request.blinded().0,
-                    answered.to_bytes()
-                ],
-            )?;
-            if updated != 1 {
-                return Err(Error::Halted);
-            }
-            Ok(answered.answer())
         })
     }
 

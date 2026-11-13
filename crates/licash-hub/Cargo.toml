@@ -3,6 +3,8 @@ name = "licash-hub"
 description = "Licash hub engine: offers, spends and unlinking over a durable ledger"
 version.workspace = true
 edition.workspace = true
+# File::try_lock
+rust-version = "1.89"
 license.workspace = true
 
 [dependencies]
