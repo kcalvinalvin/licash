@@ -5,7 +5,7 @@ use licash::{
     crypto::{self, Point, ScalarBytes},
     note::{Derivation, Evidence, IssuerKeys, Keyset, Note},
     spend::{Output, Proposal},
-    unlink::{Answer, Answered, Nonce, Request, Session, REQUEST_BYTES},
+    unlink::{Answer, Answered, Nonce, Request, Session, ANSWERED_BYTES, REQUEST_BYTES},
 };
 
 /// Tag, keyset, public fields, C, evidence tag, DLEQ.
@@ -30,11 +30,16 @@ impl Issuer {
     fn issue(&self, d: &Derivation) -> (Note, Nonce) {
         let output = Output::from_derivation(d).unwrap();
         let nonce = Nonce::new(&self.keyset, &output).unwrap();
+        (self.issue_under(d, &nonce), nonce)
+    }
+
+    fn issue_under(&self, d: &Derivation, nonce: &Nonce) -> Note {
+        let output = Output::from_derivation(d).unwrap();
         let proof = self
             .keys
             .prove_blinded(output.denomination(), output.blinded())
             .unwrap();
-        let note = Note::from_parts(
+        Note::from_parts(
             &self.keyset,
             *self.keyset.id(),
             d.message().clone(),
@@ -45,8 +50,7 @@ impl Issuer {
                 commit: nonce.commit().unwrap(),
             },
         )
-        .unwrap();
-        (note, nonce)
+        .unwrap()
     }
 
     fn unlink(&self, note: &Note, d: &Derivation, nonce: Nonce) -> Note {
@@ -270,16 +274,57 @@ fn requests_roundtrip_and_refuse_malformed_bytes() {
 }
 
 #[test]
-fn sessions_nonces_and_answers_persist() {
+fn derived_nonces_are_fixed_by_their_secret_and_output() {
     let issuer = issuer();
     let d = received(&owner(2), 4);
-    let (note, nonce) = issuer.issue(&d);
+    let output = Output::from_derivation(&d).unwrap();
+    let commit = |secret: &[u8; 32], keyset: &Keyset, output: &Output| {
+        Nonce::derive(secret, keyset, output)
+            .unwrap()
+            .commit()
+            .unwrap()
+    };
+    let nonce = commit(&[9; 32], &issuer.keyset, &output);
+    assert_eq!(commit(&[9; 32], &issuer.keyset, &output), nonce);
+    assert_ne!(commit(&[8; 32], &issuer.keyset, &output), nonce);
+    let other = Output::from_derivation(&received(&owner(2), 4)).unwrap();
+    assert_ne!(commit(&[9; 32], &issuer.keyset, &other), nonce);
+    let unlinkable = Output::new(4, output.blinded(), [3; 32]).unwrap();
+    assert_ne!(commit(&[9; 32], &issuer.keyset, &unlinkable), nonce);
+    let keyset = IssuerKeys::random(3).unwrap().keyset().unwrap();
+    assert_ne!(commit(&[9; 32], &keyset, &output), nonce);
+    let big = Output::new(16, output.blinded(), *output.unlink_commitment()).unwrap();
+    assert!(Nonce::derive(&[9; 32], &issuer.keyset, &big).is_err());
+}
+
+#[test]
+fn sessions_persist_and_issuers_keep_nonce_secrets_and_answers() {
+    let issuer = issuer();
+    let d = received(&owner(2), 4);
+    let output = Output::from_derivation(&d).unwrap();
+    let note = issuer.issue_under(
+        &d,
+        &Nonce::derive(&[9; 32], &issuer.keyset, &output).unwrap(),
+    );
     let session = Session::start(&issuer.keyset, &note, &d).unwrap();
     let session: Session = bincode::deserialize(&bincode::serialize(&session).unwrap()).unwrap();
     let session: Session = serde_json::from_str(&serde_json::to_string(&session).unwrap()).unwrap();
-    let nonce: Nonce = bincode::deserialize(&bincode::serialize(&nonce).unwrap()).unwrap();
+    // The issuer keeps the secret, not the nonce, and derives it again.
+    let nonce = Nonce::derive(&[9; 32], &issuer.keyset, &output).unwrap();
+    assert_eq!(format!("{nonce:?}"), "UnlinkNonce(..)");
     let answered = nonce.answer(&issuer.keys, session.request()).unwrap();
-    let answered: Answered = bincode::deserialize(&bincode::serialize(&answered).unwrap()).unwrap();
+    let bytes = answered.to_bytes();
+    assert_eq!(bytes.len(), ANSWERED_BYTES);
+    assert_eq!(&bytes[..REQUEST_BYTES], &session.request().to_bytes());
+    let answered = Answered::from_bytes(&bytes).unwrap();
+    for length in [0, REQUEST_BYTES, ANSWERED_BYTES - 1, ANSWERED_BYTES + 1] {
+        let mut wrong = bytes.to_vec();
+        wrong.resize(length, 0);
+        assert!(Answered::from_bytes(&wrong).is_err());
+    }
+    let mut overflow = bytes;
+    overflow[REQUEST_BYTES..].fill(0xff);
+    assert!(Answered::from_bytes(&overflow).is_err());
     let answer = answered.replay(session.request()).unwrap();
     let answer: Answer = serde_json::from_str(&serde_json::to_string(&answer).unwrap()).unwrap();
     let unlinked = session.finish(&issuer.keyset, &answer).unwrap();
@@ -287,6 +332,4 @@ fn sessions_nonces_and_answers_persist() {
     assert_eq!(format!("{session:?}"), "UnlinkSession(..)");
     assert_eq!(format!("{answered:?}"), "UnlinkAnswered(..)");
     assert_eq!(format!("{:?}", session.request()), "UnlinkRequest(..)");
-    let (_, nonce) = issuer.issue(&d);
-    assert_eq!(format!("{nonce:?}"), "UnlinkNonce(..)");
 }

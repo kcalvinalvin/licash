@@ -11,7 +11,8 @@
 //! it answered ([`Answered`]) in place of the nonce, durably before
 //! releasing the answer, and repeats it only for the identical request. A
 //! store restored from before an answer holds the nonce again: answering
-//! from it is unsafe. The holder keeps its session durably before sending
+//! from it is unsafe, and so is a nonce derived again ([`Nonce::derive`])
+//! from a secret that outlived its answers. The holder keeps its session durably before sending
 //! the request, so that a retry repeats the challenge; a session that is
 //! lost leaves the note with its linked evidence and its value.
 
@@ -20,8 +21,8 @@ use serde::{Deserialize, Serialize};
 use crate::{
     codec::Reader,
     crypto::{
-        dleq_answer, dleq_blind, dleq_commit, dleq_unblind, random_scalar, DleqCommit, Point,
-        ScalarBytes,
+        dleq_answer, dleq_blind, dleq_commit, dleq_unblind, random_scalar, scalar_from_hash,
+        tagged_hash, DleqCommit, Point, ScalarBytes,
     },
     ec::Pt,
     note::{
@@ -34,6 +35,8 @@ use crate::{
 const REQUEST_TAG: &[u8] = b"LICASH-UL\x02";
 /// Tag, keyset, denomination, blinded point, capability, challenge.
 pub const REQUEST_BYTES: usize = REQUEST_TAG.len() + 32 + 8 + 33 + 32 + 32;
+/// The request and the answer.
+pub const ANSWERED_BYTES: usize = REQUEST_BYTES + 32;
 
 fn bad(reason: &str) -> Error {
     Error::Protocol(reason.into())
@@ -134,7 +137,7 @@ impl Answer {
 
 /// The issuer's secret nonce for unlinking one issued output, and the
 /// output it was drawn for. It answers one request, ever.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone)]
 pub struct Nonce {
     keyset: [u8; 32],
     denom: u64,
@@ -152,14 +155,38 @@ impl std::fmt::Debug for Nonce {
 impl Nonce {
     /// A fresh nonce for issuing `output` under `keyset`.
     pub fn new(keyset: &Keyset, output: &Output) -> Result<Self, Error> {
+        Self::with(keyset, output, random_scalar())
+    }
+
+    /// The nonce for issuing `output` under `keyset` derived from `secret`.
+    /// A secret must not outlive the issuer's record of what it answered:
+    /// losing that record would re-arm the same nonce.
+    pub fn derive(secret: &[u8; 32], keyset: &Keyset, output: &Output) -> Result<Self, Error> {
+        let w = scalar_from_hash(&tagged_hash(
+            "licash/unlink-nonce/v2",
+            &[
+                secret,
+                keyset.id(),
+                &output.denomination().to_be_bytes(),
+                &output.blinded().0,
+                output.unlink_commitment(),
+            ],
+        ));
+        Self::with(keyset, output, w)
+    }
+
+    fn with(keyset: &Keyset, output: &Output, w: k256::Scalar) -> Result<Self, Error> {
         keyset.key(output.denomination())?;
         non_identity(&output.blinded())?;
+        if w == k256::Scalar::ZERO {
+            return Err(Error::InvalidScalar);
+        }
         Ok(Self {
             keyset: *keyset.id(),
             denom: output.denomination(),
             blinded: output.blinded(),
             commitment: *output.unlink_commitment(),
-            w: ScalarBytes::from_scalar(&random_scalar()),
+            w: ScalarBytes::from_scalar(&w),
         })
     }
 
@@ -209,7 +236,7 @@ impl Nonce {
 }
 
 /// What the issuer answered under a nonce, kept in its place.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Answered {
     request: Request,
     answer: Answer,
@@ -229,6 +256,25 @@ impl Answered {
 
     pub fn answer(&self) -> Answer {
         self.answer
+    }
+
+    /// `request ‖ answer`.
+    pub fn to_bytes(&self) -> [u8; ANSWERED_BYTES] {
+        let mut bytes = [0; ANSWERED_BYTES];
+        bytes[..REQUEST_BYTES].copy_from_slice(&self.request.to_bytes());
+        bytes[REQUEST_BYTES..].copy_from_slice(&self.answer.to_bytes());
+        bytes
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
+        if bytes.len() != ANSWERED_BYTES {
+            return Err(bad("unlink answer record length"));
+        }
+        let answer: [u8; 32] = bytes[REQUEST_BYTES..].try_into().expect("checked length");
+        Ok(Self {
+            request: Request::from_bytes(&bytes[..REQUEST_BYTES])?,
+            answer: Answer::from_bytes(answer)?,
+        })
     }
 
     /// The answer again for the identical request, and nothing for any
