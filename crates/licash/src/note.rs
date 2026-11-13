@@ -108,6 +108,10 @@ impl Keyset {
             .copied()
             .ok_or(Error::UnknownDenomination(denom))
     }
+    /// The denominations it issues, smallest first.
+    pub fn denominations(&self) -> impl DoubleEndedIterator<Item = u64> + '_ {
+        self.keys.keys().copied()
+    }
 
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = KEYSET_TAG.to_vec();

@@ -214,3 +214,14 @@ fn signed_proposals_roundtrip_with_both_authorizations() {
         assert!(SignedProposal::from_bytes(&f.keyset, &f.notes(), &b).is_err());
     }
 }
+
+#[test]
+fn a_keyset_lists_its_denominations_and_keeps_them_through_its_bytes() {
+    let keyset = IssuerKeys::from_seed(&[5; 32], 0, 3)
+        .unwrap()
+        .keyset()
+        .unwrap();
+    assert_eq!(keyset.denominations().collect::<Vec<_>>(), [1, 2, 4, 8]);
+    let back = Keyset::from_bytes(&keyset.to_bytes()).unwrap();
+    assert_eq!(back.denominations().rev().collect::<Vec<_>>(), [8, 4, 2, 1]);
+}
