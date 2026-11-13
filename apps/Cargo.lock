@@ -1018,6 +1018,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "licash-chain-client"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "axum",
+ "bitcoin",
+ "hex",
+ "licash",
+ "percent-encoding",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "licash-hub"
 version = "0.0.1"
 dependencies = [
