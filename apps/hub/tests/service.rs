@@ -21,8 +21,8 @@ use licash::{
     unlink::{Nonce, Session},
 };
 use licash_api::{
-    Code, Info, Issued, Lock, LockState, Locked, Locks, Offer, Offered, Problem, Refund, Release,
-    Released, Settle, Settled, Unlink, Unlinked,
+    Check, Checked, Code, Info, Issued, Lock, LockState, Locked, Locks, Offer, Offered, Problem,
+    Refund, Release, Released, Settle, Settled, Unlink, Unlinked,
 };
 use licash_hub::{Fee, Hub, Policy};
 use licash_hub_service::notify::Notifier;
@@ -236,6 +236,9 @@ async fn a_wallet_spends_and_unlinks_through_the_api() {
     let paid = signed
         .open_granted_output(keyset, &notes, 0, &outputs[0], &unlock)
         .unwrap();
+    let ys = [&coin.note, &paid].map(|n| n.message().identifier().unwrap());
+    let checked: Checked = service.post(licash_api::CHECK, &Check::new(&ys)).await;
+    assert_eq!(checked.spent, [true, false]);
 
     let session = Session::start(keyset, &paid, &outputs[0]).unwrap();
     let unlinked: Unlinked = service

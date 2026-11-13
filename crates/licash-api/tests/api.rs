@@ -8,8 +8,8 @@ use licash::{
     unlink::{Nonce, Session},
 };
 use licash_api::{
-    Code, Fee, Fees, Hex, Info, Issued, Lock, LockState, Locked, Offer, Offered, Payment, Problem,
-    Refund, Release, Released, Settle, Settled, Unlink, Unlinked,
+    Check, Code, Fee, Fees, Hex, Info, Issued, Lock, LockState, Locked, Offer, Offered, Payment,
+    Problem, Refund, Release, Released, Settle, Settled, Unlink, Unlinked,
 };
 use serde::{de::DeserializeOwned, Serialize};
 
@@ -161,6 +161,31 @@ fn bodies_carry_the_canonical_bytes_through_json() {
     let answer = nonce.answer(&f.keys, &request).unwrap().answer();
     let answer = json(&Unlinked::new(&answer)).decode().unwrap();
     session.finish(&f.keyset, &answer).unwrap();
+
+    let y = f.input.0.message().identifier().unwrap();
+    let check = json(&Check::new(&[y]));
+    assert_eq!(
+        serde_json::to_string(&check).unwrap(),
+        format!(r#"{{"identifiers":["{}"]}}"#, hex::encode(y.0))
+    );
+    assert_eq!(check.decode().unwrap(), vec![y]);
+}
+
+#[test]
+fn a_check_asks_of_whole_identifiers_and_a_bounded_number() {
+    let y = Hex(vec![2; 33]);
+    let check = Check {
+        identifiers: vec![y.clone(); licash_api::MAX_CHECK],
+    };
+    assert_eq!(check.decode().unwrap().len(), licash_api::MAX_CHECK);
+    let many = Check {
+        identifiers: vec![y; licash_api::MAX_CHECK + 1],
+    };
+    assert_eq!(many.decode().unwrap_err().code, Code::Invalid);
+    let short = Check {
+        identifiers: vec![Hex(vec![2; 32])],
+    };
+    assert_eq!(short.decode().unwrap_err().code, Code::Invalid);
 }
 
 #[test]

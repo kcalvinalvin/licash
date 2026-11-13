@@ -373,7 +373,11 @@ fn an_input_is_spent_once_and_a_second_signed_spend_is_alerted() {
         &[(carol.address(), 8)],
     );
     let second_grant = second.offer(&hub).unwrap();
+    let y = coin.note.message().identifier().unwrap();
+    let other = mint(&files, &alice, 8).note.message().identifier().unwrap();
+    assert_eq!(hub.spent(&[y, other]).unwrap(), [false, false]);
     first.complete(&hub, &keyset);
+    assert_eq!(hub.spent(&[y, other, y]).unwrap(), [true, false, true]);
     let signed = second.sign(&keyset, Authorization::Granted(Box::new(second_grant)));
     assert_eq!(
         refused(hub.release(&signed, &second.notes())),

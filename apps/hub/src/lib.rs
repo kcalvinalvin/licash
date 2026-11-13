@@ -13,8 +13,8 @@ use axum::{
     Json, Router,
 };
 use licash_api::{
-    Code, Fees, Hex, Info, Issued, Lock, LockState, Locked, Locks, Offer, Offered, Problem, Refund,
-    Release, Released, Settle, Unlink, Unlinked,
+    Check, Checked, Code, Fees, Hex, Info, Issued, Lock, LockState, Locked, Locks, Offer, Offered,
+    Problem, Refund, Release, Released, Settle, Unlink, Unlinked,
 };
 use licash_hub::{Error, Hub, Refusal, Settled};
 use tower_http::trace::TraceLayer;
@@ -32,6 +32,7 @@ pub fn router(hub: Arc<Hub>) -> Router {
         .route(licash_api::OFFER, post(offer))
         .route(licash_api::RELEASE, post(release))
         .route(licash_api::UNLINK, post(unlink))
+        .route(licash_api::CHECK, post(check))
         .route(licash_api::LOCK, post(lock))
         .route(licash_api::LOCK_STATE, get(lock_state))
         .route(licash_api::SETTLE, post(settle))
@@ -182,6 +183,18 @@ async fn unlink(
     let Json(body) = body?;
     blocking(hub, move |hub| {
         Ok(Unlinked::new(&hub.unlink(&body.decode()?)?))
+    })
+    .await
+}
+
+async fn check(
+    State(hub): State<Arc<Hub>>,
+    body: Result<Json<Check>, JsonRejection>,
+) -> Answer<Checked> {
+    let Json(body) = body?;
+    blocking(hub, move |hub| {
+        let spent = hub.spent(&body.decode()?)?;
+        Ok(Checked { spent })
     })
     .await
 }

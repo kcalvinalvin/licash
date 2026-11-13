@@ -672,6 +672,18 @@ impl Hub {
         Ok(unlock)
     }
 
+    /// Whether each of the notes with these identifiers is spent: retired
+    /// by a released spend or a lock.
+    pub fn spent(&self, identifiers: &[Point]) -> Result<Vec<bool>, Error> {
+        self.store.read(|c| {
+            let mut stmt = c.prepare_cached("SELECT 1 FROM spent WHERE y = ?1")?;
+            identifiers
+                .iter()
+                .map(|y| Ok(stmt.exists([&y.0])?))
+                .collect()
+        })
+    }
+
     /// The answer to an unlink request for an output this hub issued since
     /// it started, or the same answer again for the same request. Only the
     /// holder of the output's capability learns more than [`Refusal::NotIssued`].

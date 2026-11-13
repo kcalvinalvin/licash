@@ -8,6 +8,7 @@
 //! | `POST /v1/offer`   | [`Offer`]   | [`Offered`]  |
 //! | `POST /v1/release` | [`Release`] | [`Released`] |
 //! | `POST /v1/unlink`  | [`Unlink`]  | [`Unlinked`] |
+//! | `POST /v1/check`   | [`Check`]   | [`Checked`]  |
 //! | `POST /v1/lock`    | [`Lock`]    | [`Locked`]   |
 //! | `GET /v1/lock/{id}` |            | [`LockState`] |
 //! | `POST /v1/settle`  | [`Settle`]  | [`Issued`]   |
@@ -21,6 +22,7 @@ use licash::{
     address::Address,
     authorization::{Authorization, Grant, SignedProposal, Unlock},
     chain::Checkpoint,
+    crypto::Point,
     note::{Keyset, MintResponse, Note},
     source::Certificate,
     spend::{lock_hash, Proposal, ProposalId},
@@ -32,6 +34,7 @@ pub const INFO: &str = "/v1/info";
 pub const OFFER: &str = "/v1/offer";
 pub const RELEASE: &str = "/v1/release";
 pub const UNLINK: &str = "/v1/unlink";
+pub const CHECK: &str = "/v1/check";
 pub const LOCK: &str = "/v1/lock";
 /// A lock's state, at [`lock_state`] for a lock's identifier.
 pub const LOCK_STATE: &str = "/v1/lock/{id}";
@@ -206,6 +209,22 @@ pub struct Unlink {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Unlinked {
     pub answer: Hex,
+}
+
+/// The most notes one [`Check`] asks about.
+pub const MAX_CHECK: usize = 1000;
+
+/// Ask which of the notes with these identifiers are spent: at most
+/// [`MAX_CHECK`]. The hub learns that one party holds them all.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Check {
+    pub identifiers: Vec<Hex>,
+}
+
+/// Whether each note asked about is spent, in the order asked.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Checked {
+    pub spent: Vec<bool>,
 }
 
 /// Lock `notes` as `signed`, a plainly authorized timed spend, makes them.
@@ -486,6 +505,26 @@ impl Unlinked {
 
     pub fn decode(&self) -> Result<Answer, Problem> {
         Ok(Answer::from_bytes(self.answer.array("answer")?)?)
+    }
+}
+
+impl Check {
+    pub fn new(identifiers: &[Point]) -> Self {
+        Self {
+            identifiers: identifiers.iter().map(|y| Hex(y.0.to_vec())).collect(),
+        }
+    }
+
+    pub fn decode(&self) -> Result<Vec<Point>, Problem> {
+        if self.identifiers.len() > MAX_CHECK {
+            return Err(Problem::invalid(format!(
+                "at most {MAX_CHECK} notes a check"
+            )));
+        }
+        self.identifiers
+            .iter()
+            .map(|y| Ok(Point(y.array("identifier")?)))
+            .collect()
     }
 }
 
