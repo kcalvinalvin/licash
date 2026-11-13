@@ -7,7 +7,6 @@ use anyhow::{bail, ensure, Context};
 use bitcoin::{
     block::Header,
     consensus::{deserialize, serialize},
-    hashes::Hash,
     Block, BlockHash, Network,
 };
 use licash::{chain::Checkpoint, spend::ChainProfile};
@@ -48,31 +47,6 @@ enum Auth {
 pub struct Tip {
     pub height: u32,
     pub hash: BlockHash,
-}
-
-/// A secret published by an activation output ([`licash::chain::activation_script`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Published {
-    pub secret: [u8; 32],
-    pub txid: [u8; 32],
-    pub output: u32,
-}
-
-/// The activations `block` carries, in block order.
-pub fn activations(block: &Block) -> Vec<Published> {
-    let mut found = Vec::new();
-    for tx in &block.txdata {
-        for (output, out) in (0u32..).zip(&tx.output) {
-            if let Some(secret) = licash::chain::activation_secret(out.script_pubkey.as_bytes()) {
-                found.push(Published {
-                    secret,
-                    txid: tx.compute_txid().to_byte_array(),
-                    output,
-                });
-            }
-        }
-    }
-    found
 }
 
 impl FromStr for Source {

@@ -19,16 +19,10 @@ use bitcoin::{
     transaction, Amount, Block, BlockHash, Network, OutPoint, ScriptBuf, Sequence, Transaction,
     TxIn, TxMerkleNode, TxOut, Witness,
 };
-use licash::{
-    chain::{activation_script, Checkpoint},
-    spend::ChainProfile,
-};
-use licash_chain_client::{activations, Published, Source};
+use licash::{chain::Checkpoint, spend::ChainProfile};
+use licash_chain_client::Source;
 use serde_json::{json, Value};
 
-const SECRET: [u8; 32] = [7; 32];
-/// The block that carries the activation.
-const ACTIVATED: u32 = 9;
 /// `user:p@ss w` and `__cookie__:c00k1e`.
 const PASSWORD: &str = "Basic dXNlcjpwQHNzIHc=";
 const COOKIE: &str = "Basic X19jb29raWVfXzpjMDBrMWU=";
@@ -39,22 +33,15 @@ struct Chain {
     auth: &'static str,
 }
 
-/// Genesis and `n` blocks mined on it, block `ACTIVATED` with an
-/// activation output in its coinbase.
+/// Genesis and `n` blocks mined on it.
 fn mine(n: u32) -> Vec<Block> {
     let mut blocks = vec![bitcoin::constants::genesis_block(Network::Regtest)];
     for height in 1..=n {
         let previous = blocks.last().unwrap().header;
-        let mut output = vec![TxOut {
+        let output = vec![TxOut {
             value: Amount::from_sat(50),
             script_pubkey: ScriptBuf::new_op_return([1u8]),
         }];
-        if height == ACTIVATED {
-            output.push(TxOut {
-                value: Amount::ZERO,
-                script_pubkey: ScriptBuf::from_bytes(activation_script(&SECRET)),
-            });
-        }
         let coinbase = Transaction {
             version: transaction::Version::TWO,
             lock_time: LockTime::ZERO,
@@ -223,27 +210,6 @@ async fn a_node_and_esplora_read_the_same_chain() {
         commitments.push(checkpoint.commitment());
     }
     assert_eq!(commitments[0], commitments[1]);
-}
-
-#[tokio::test]
-async fn activations_are_read_from_their_block_only() {
-    let blocks = mine(ACTIVATED + 1);
-    for (height, block) in blocks.iter().enumerate() {
-        let found = activations(block);
-        if height as u32 == ACTIVATED {
-            let coinbase = block.txdata[0].compute_txid().to_byte_array();
-            assert_eq!(
-                found,
-                [Published {
-                    secret: SECRET,
-                    txid: coinbase,
-                    output: 1
-                }]
-            );
-        } else {
-            assert!(found.is_empty(), "block {height}");
-        }
-    }
 }
 
 #[tokio::test]
