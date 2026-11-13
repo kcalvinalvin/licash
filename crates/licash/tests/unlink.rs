@@ -3,7 +3,7 @@ use licash::{
     authorization::{Authorization, PreparedGrant, SignedProposal},
     claim::Branch,
     crypto::{self, Point, ScalarBytes},
-    note::{Derivation, Evidence, IssuerKeys, Keyset, Note},
+    note::{Derivation, Evidence, IssuerKeys, Keyset, MintResponse, Note},
     spend::{Output, Proposal},
     unlink::{Answer, Answered, Nonce, Request, Session, ANSWERED_BYTES, REQUEST_BYTES},
 };
@@ -33,24 +33,16 @@ impl Issuer {
         (self.issue_under(d, &nonce), nonce)
     }
 
+    /// The issuance crosses to the holder as bytes.
     fn issue_under(&self, d: &Derivation, nonce: &Nonce) -> Note {
-        let output = Output::from_derivation(d).unwrap();
-        let proof = self
-            .keys
-            .prove_blinded(output.denomination(), output.blinded())
-            .unwrap();
-        Note::from_parts(
-            &self.keyset,
-            *self.keyset.id(),
-            d.message().clone(),
-            proof.open_point(&self.keyset, d).unwrap(),
-            Evidence::Linked {
-                dleq: proof.dleq(),
-                blinding: *d.blinding(),
-                commit: nonce.commit().unwrap(),
-            },
-        )
-        .unwrap()
+        let bytes = nonce.issue(&self.keys).unwrap().to_bytes();
+        let issued = MintResponse::from_bytes(&self.keyset, &bytes).unwrap();
+        let note = issued.open(&self.keyset, d).unwrap();
+        let Evidence::Linked { commit, .. } = note.evidence() else {
+            panic!("a linked note");
+        };
+        assert_eq!(*commit, nonce.commit().unwrap());
+        note
     }
 
     fn unlink(&self, note: &Note, d: &Derivation, nonce: Nonce) -> Note {
@@ -338,4 +330,37 @@ fn sessions_persist_and_issuers_keep_nonce_secrets_and_answers() {
     assert_eq!(format!("{session:?}"), "UnlinkSession(..)");
     assert_eq!(format!("{answered:?}"), "UnlinkAnswered(..)");
     assert_eq!(format!("{:?}", session.request()), "UnlinkRequest(..)");
+}
+
+#[test]
+fn issuances_roundtrip_under_their_keyset_only() {
+    let issuer = issuer();
+    let d = received(&owner(2), 4);
+    let output = Output::from_derivation(&d).unwrap();
+    let nonce = Nonce::new(&issuer.keyset, &output).unwrap();
+    let issued = nonce.issue(&issuer.keys).unwrap();
+    let bytes = issued.to_bytes();
+    // Tag, keyset, denomination, B, C', DLEQ, R1, R2.
+    assert_eq!(bytes.len(), 10 + 32 + 8 + 33 + 33 + 64 + 33 + 33);
+    assert_eq!(
+        MintResponse::from_bytes(&issuer.keyset, &bytes).unwrap(),
+        issued
+    );
+    let other = self::issuer();
+    assert!(MintResponse::from_bytes(&other.keyset, &bytes).is_err());
+    assert!(nonce.issue(&other.keys).is_err());
+    // Any change to the signature or proof, or a cut, is refused.
+    for at in [10 + 32 + 8 + 33 + 5, 10 + 32 + 8 + 33 + 33 + 7] {
+        let mut bad = bytes.clone();
+        bad[at] ^= 1;
+        assert!(MintResponse::from_bytes(&issuer.keyset, &bad).is_err());
+    }
+    assert!(MintResponse::from_bytes(&issuer.keyset, &bytes[..bytes.len() - 1]).is_err());
+    let mut longer = bytes.clone();
+    longer.push(0);
+    assert!(MintResponse::from_bytes(&issuer.keyset, &longer).is_err());
+    // Only the holder of the derivation opens it.
+    assert!(issued
+        .open(&issuer.keyset, &received(&owner(3), 4))
+        .is_err());
 }

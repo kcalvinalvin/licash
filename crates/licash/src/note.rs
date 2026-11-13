@@ -24,6 +24,7 @@ const TAG: &[u8] = b"licash/note/v2";
 const NOTE_TAG: &[u8] = b"LICASH-NT\x02";
 const DST: &[u8] = b"LICASH-V2-secp256k1_XMD:SHA-256_SSWU_RO_";
 const KEYSET_TAG: &[u8] = b"LICASH-KS\x02";
+const ISSUED_TAG: &[u8] = b"LICASH-IS\x02";
 const MAX_KEYS: usize = 64;
 pub const PUBLIC_FIELDS_BYTES: usize = 8 + 32 + 32 + 32;
 pub const MESSAGE_BYTES: usize = TAG.len() + PUBLIC_FIELDS_BYTES;
@@ -472,8 +473,10 @@ impl Note {
     }
 }
 
-/// Exact in-memory mint reply. The public commitment is replayed from the
-/// retained nonce; no V2 wire format or unlink-answer authority is exposed.
+/// A linked issuance of one output: the issuer's blind signature with its
+/// DLEQ proof, and the commitment of the unlink nonce drawn for the output
+/// ([`crate::unlink::Nonce::issue`]). The output's holder opens it into a
+/// note.
 #[derive(Clone, PartialEq, Eq)]
 pub struct MintResponse {
     proof: BlindProof,
@@ -487,8 +490,53 @@ impl std::fmt::Debug for MintResponse {
 }
 
 impl MintResponse {
+    pub(crate) fn new(proof: BlindProof, commit: crate::crypto::DleqCommit) -> Self {
+        Self { proof, commit }
+    }
+
     pub fn proof(&self) -> &BlindProof {
         &self.proof
+    }
+
+    /// `LICASH-IS\x02 ‖ keyset ‖ denomination ‖ B ‖ C' ‖ DLEQ ‖ R1 ‖ R2`.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let p = &self.proof;
+        let mut bytes = ISSUED_TAG.to_vec();
+        bytes.extend(p.keyset);
+        bytes.extend(p.denom.to_be_bytes());
+        bytes.extend(p.blinded.0);
+        bytes.extend(p.signature.0);
+        bytes.extend(p.proof.e.0);
+        bytes.extend(p.proof.s.0);
+        bytes.extend(self.commit.r1.0);
+        bytes.extend(self.commit.r2.0);
+        bytes
+    }
+
+    /// Decode `to_bytes` and verify the proof under `keyset`, the issuer
+    /// keyset the caller expects. The nonce commitment is checked only for
+    /// its points' encodings: unlinking checks the rest.
+    pub fn from_bytes(keyset: &Keyset, bytes: &[u8]) -> Result<Self, Error> {
+        let mut r = Reader::new(bytes, "issuance", ISSUED_TAG)?;
+        let proof = BlindProof {
+            keyset: r.array()?,
+            denom: r.u64()?,
+            blinded: Point(r.array()?),
+            signature: Point(r.array()?),
+            proof: Dleq {
+                e: ScalarBytes(r.array()?),
+                s: ScalarBytes(r.array()?),
+            },
+        };
+        let commit = crate::crypto::DleqCommit {
+            r1: Point(r.array()?),
+            r2: Point(r.array()?),
+        };
+        r.finish()?;
+        proof.verify(keyset, proof.denom, &proof.blinded)?;
+        non_identity(&commit.r1)?;
+        non_identity(&commit.r2)?;
+        Ok(Self { proof, commit })
     }
 
     pub fn open(&self, keyset: &Keyset, output: &Derivation) -> Result<Note, Error> {

@@ -26,7 +26,8 @@ use crate::{
     },
     ec::Pt,
     note::{
-        non_identity, unlink_commitment_of, Derivation, Evidence, IssuerKeys, Keyset, Message, Note,
+        non_identity, unlink_commitment_of, Derivation, Evidence, IssuerKeys, Keyset, Message,
+        MintResponse, Note,
     },
     spend::Output,
     Error,
@@ -213,6 +214,16 @@ impl Nonce {
             &self.w.to_scalar()?,
             &non_identity(&self.blinded)?,
         ))
+    }
+
+    /// The linked issuance of this nonce's output under `keys`: its blind
+    /// signature, and [`Nonce::commit`] for unlinking it later.
+    pub fn issue(&self, keys: &IssuerKeys) -> Result<MintResponse, Error> {
+        if keys.id() != &self.keyset {
+            return Err(bad("issuance keyset mismatch"));
+        }
+        let proof = keys.prove_blinded(self.denom, self.blinded)?;
+        Ok(MintResponse::new(proof, self.commit()?))
     }
 
     /// Answer `request` for this nonce's output, under `keys`. The caller
