@@ -841,6 +841,7 @@ fn the_ledger_reads_beside_the_running_hub_and_writes_nothing() {
     drop(hub);
     let hub = open(&files, Policy::default());
     assert_eq!(ledger.stats().unwrap().events, 3);
+    assert_eq!(ledger.last_event().unwrap(), 3);
     drop(hub);
     let seq = |db: &Path| -> i64 {
         sql(db)

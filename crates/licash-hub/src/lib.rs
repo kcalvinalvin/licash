@@ -206,6 +206,13 @@ impl Ledger {
         events(&self.conn, after, limit)
     }
 
+    /// The last event's `seq`, or 0: [`Stats::events`] without the counts.
+    pub fn last_event(&self) -> Result<u64, Error> {
+        Ok(self
+            .conn
+            .query_row(LAST_EVENT, [], |r| r.get::<_, i64>(0))? as u64)
+    }
+
     pub fn stats(&self) -> Result<Stats, Error> {
         let count = |sql: &str| -> Result<u64, Error> {
             Ok(self.conn.query_row(sql, [], |r| r.get::<_, i64>(0))? as u64)
@@ -217,10 +224,12 @@ impl Ledger {
             issued: count("SELECT count(*) FROM issued")?,
             unlinked: count("SELECT count(*) FROM issued WHERE answered IS NOT NULL")?,
             income: count("SELECT coalesce(sum(denom), 0) FROM income")?,
-            events: count("SELECT coalesce(max(seq), 0) FROM events")?,
+            events: count(LAST_EVENT)?,
         })
     }
 }
+
+const LAST_EVENT: &str = "SELECT coalesce(max(seq), 0) FROM events";
 
 fn events(conn: &Connection, after: u64, limit: u32) -> Result<Vec<Event>, Error> {
     let mut rows = conn
