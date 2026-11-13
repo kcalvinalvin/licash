@@ -27,8 +27,19 @@ impl Point {
     }
 
     pub fn to_projective(&self) -> Result<ProjectivePoint, Error> {
+        self.to_affine().map(ProjectivePoint::from)
+    }
+
+    /// Decode the canonical encodings only: compressed SEC1 (tag 2 or 3),
+    /// or 33 zero bytes for the identity (as `ec::Pt::to_point` writes it).
+    /// `k256` also decodes SEC1's compact form (tag 5), a second encoding
+    /// of a point that byte comparisons and hashes would take for another.
+    pub(crate) fn to_affine(self) -> Result<AffinePoint, Error> {
+        if !matches!(self.0[0], 0x00 | 0x02 | 0x03) {
+            return Err(Error::InvalidPoint);
+        }
         let affine: Option<AffinePoint> = AffinePoint::from_bytes((&self.0).into()).into();
-        affine.map(ProjectivePoint::from).ok_or(Error::InvalidPoint)
+        affine.ok_or(Error::InvalidPoint)
     }
 
     /// The x-only key (BIP340) of this point.
@@ -472,5 +483,25 @@ mod tests {
         let s = serde_json::to_string(&p).unwrap();
         let back: Point = serde_json::from_str(&s).unwrap();
         assert_eq!(p, back);
+    }
+
+    #[test]
+    fn only_canonical_encodings_decode() {
+        for k in [1u64, 2, 17, 19] {
+            let p = Point::from_projective(&generator_mul(&Scalar::from(k)));
+            assert_eq!(Point::from_projective(&p.to_projective().unwrap()), p);
+            assert_eq!(Pt::from_point(&p).unwrap().to_point(), p);
+            // Every other tag, SEC1's compact form (5) included, which
+            // `k256` decodes to a point whose canonical encoding differs.
+            for tag in (0u8..=255).filter(|t| ![0x02, 0x03].contains(t)) {
+                let mut other = p;
+                other.0[0] = tag;
+                assert_eq!(other.to_projective(), Err(Error::InvalidPoint));
+                assert!(Pt::from_point(&other).is_err());
+            }
+        }
+        let identity = Point([0; 33]);
+        assert_eq!(identity.to_projective(), Ok(ProjectivePoint::IDENTITY));
+        assert!(Pt::from_point(&identity).unwrap().is_identity());
     }
 }

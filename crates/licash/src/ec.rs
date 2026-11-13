@@ -15,7 +15,6 @@ use k256::{AffinePoint, ProjectivePoint, Scalar};
 
 #[cfg(all(target_os = "zkvm", target_arch = "riscv32"))]
 mod imp {
-    use k256::elliptic_curve::group::GroupEncoding;
     use k256::elliptic_curve::sec1::ToEncodedPoint;
     use k256::{AffinePoint, ProjectivePoint, Scalar};
     use risc0_bigint2::ec::{AffinePoint as R0Point, Secp256k1Curve};
@@ -63,8 +62,7 @@ mod imp {
 
         /// Decompress (one square root, in `k256`).
         pub fn from_point(p: &Point) -> Result<Pt, Error> {
-            let a: Option<AffinePoint> = AffinePoint::from_bytes((&p.0).into()).into();
-            a.map(|a| Pt::from_affine(&a)).ok_or(Error::InvalidPoint)
+            p.to_affine().map(|a| Pt::from_affine(&a))
         }
 
         /// Compress: the parity of `y` and `x`, no inversion. The identity
@@ -134,7 +132,6 @@ mod imp {
 
 #[cfg(not(all(target_os = "zkvm", target_arch = "riscv32")))]
 mod imp {
-    use k256::elliptic_curve::group::GroupEncoding;
     use k256::{AffinePoint, ProjectivePoint, Scalar};
 
     use crate::crypto::Point;
@@ -157,8 +154,7 @@ mod imp {
         }
 
         pub fn from_point(p: &Point) -> Result<Pt, Error> {
-            let a: Option<AffinePoint> = AffinePoint::from_bytes((&p.0).into()).into();
-            a.map(|a| Pt::from_affine(&a)).ok_or(Error::InvalidPoint)
+            p.to_affine().map(|a| Pt::from_affine(&a))
         }
 
         pub fn to_point(&self) -> Point {
