@@ -571,7 +571,9 @@ fn a_database_changed_under_the_running_hub_halts_it() {
     sql(&files.db)
         .execute("UPDATE meta SET seq = seq - 1", [])
         .unwrap();
+    assert!(!hub.halted());
     assert!(matches!(spend.offer(&hub), Err(Error::Halted)));
+    assert!(hub.halted());
     assert!(matches!(hub.events(0, 10), Err(Error::Halted)));
     let session =
         Session::start(&keyset, &spend.inputs[0].note, &spend.inputs[0].derivation).unwrap();

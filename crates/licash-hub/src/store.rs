@@ -195,6 +195,10 @@ impl Store {
         op(&self.lock()?.conn)
     }
 
+    pub(crate) fn halted(&self) -> bool {
+        self.halted.load(Ordering::SeqCst)
+    }
+
     fn lock(&self) -> Result<MutexGuard<'_, Inner>, Error> {
         if self.halted.load(Ordering::SeqCst) {
             return Err(Error::Halted);

@@ -332,6 +332,12 @@ impl Hub {
         Ok(hub)
     }
 
+    /// Whether the hub stopped serving ([`Error::Halted`]): a restart
+    /// serves the database as it then is.
+    pub fn halted(&self) -> bool {
+        self.store.halted()
+    }
+
     pub fn info(&self) -> Info {
         Info {
             keysets: self.keysets.values().map(|(_, k)| k.clone()).collect(),
