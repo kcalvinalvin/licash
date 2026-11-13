@@ -67,7 +67,7 @@ enum Command {
     /// What the wallet holds, by hub.
     Balance,
     /// Pay AMOUNT to ADDRESS, the hub's fee on top, and print the payment
-    /// to hand the payee.
+    /// to hand the payee (its id on stderr).
     Send {
         address: String,
         amount: u64,
@@ -82,7 +82,7 @@ enum Command {
     Receive {
         #[arg(default_value = "-")]
         payment: PathBuf,
-        /// Trust the payment's hub if it is not trusted yet.
+        /// Trust the hub the payer names if it is not trusted yet.
         #[arg(long)]
         trust: bool,
     },
@@ -90,6 +90,12 @@ enum Command {
     Resume,
     /// The payments made, newest first.
     History,
+    /// The payments taken, newest first.
+    Received,
+    /// Drop the notes a copy of this wallet spent, as after restoring an
+    /// old backup of its file. Each hub learns which notes are this
+    /// wallet's.
+    Check,
     /// A payment made, to hand its payee again.
     Payment {
         id: String,
@@ -208,13 +214,14 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 Some(hub) => hub,
                 None => richest(&wallet)?,
             };
-            let payment = wallet.send(&hub, &payee, amount).await?;
-            write_payment(&payment, out.as_deref())?;
+            let paid = wallet.send(&hub, &payee, amount).await?;
+            eprintln!("payment {}", paid.id);
+            write_payment(&paid.payment, out.as_deref())?;
         }
         Command::Receive { payment, trust } => {
             let text = read(&payment)?;
             let payment: Payment = serde_json::from_str(&text).context("not a payment")?;
-            let amount = match wallet.receive(&payment) {
+            let received = match wallet.receive(&payment) {
                 Err(Error::UnknownHub(hub)) if trust => {
                     wallet.add_hub(&hub).await?;
                     wallet.receive(&payment)?
@@ -223,9 +230,10 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 received => received?,
             };
             let unlinked = unlink(&wallet).await;
+            let amount = received.amount;
             show(
                 json,
-                json!({ "amount": amount, "unlinked": unlinked }),
+                json!({ "id": received.id, "hub": received.hub, "amount": amount, "unlinked": unlinked }),
                 format!("received {amount}"),
             );
         }
@@ -250,6 +258,24 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 )
             });
             show(json, rows.collect(), lines.collect::<Vec<_>>().join("\n"));
+        }
+        Command::Received => {
+            let receipts = wallet.receipts()?;
+            let rows = receipts.iter().map(|r| {
+                json!({ "id": r.id, "hub": r.hub, "amount": r.amount, "received_at": r.received_at })
+            });
+            let lines = receipts
+                .iter()
+                .map(|r| format!("{}  {}  via {}  {}", r.received_at, r.amount, r.hub, r.id));
+            show(json, rows.collect(), lines.collect::<Vec<_>>().join("\n"));
+        }
+        Command::Check => {
+            let dropped = wallet.check().await?;
+            let text = match dropped {
+                0 => "no note was spent elsewhere".into(),
+                d => format!("dropped {d} spent by a copy of this wallet"),
+            };
+            show(json, json!({ "dropped": dropped }), text);
         }
         Command::Payment { id, out } => write_payment(&wallet.payment(&id)?, out.as_deref())?,
         Command::Abandon { id } => {
@@ -301,13 +327,14 @@ async fn resume(wallet: &Wallet<Http>, json: bool) -> anyhow::Result<()> {
     let resumed = wallet.resume().await?;
     let unlinked = unlink(wallet).await;
     let mut lines = Vec::new();
-    for (id, _) in &resumed.paid {
+    for paid in &resumed.paid {
+        let id = &paid.id;
         lines.push(format!(
             "done {id}: `licash-wallet payment {id}` prints its payment"
         ));
     }
-    for (id, problem) in &resumed.abandoned {
-        lines.push(format!("abandoned {id}: {problem}"));
+    for (id, reason) in &resumed.abandoned {
+        lines.push(format!("abandoned {id}: {reason}"));
     }
     for (id, reason) in &resumed.pending {
         lines.push(format!("pending {id}: {reason}"));
@@ -315,11 +342,11 @@ async fn resume(wallet: &Wallet<Http>, json: bool) -> anyhow::Result<()> {
     let paid = resumed
         .paid
         .iter()
-        .map(|(id, payment)| json!({ "id": id, "payment": payment }));
+        .map(|p| json!({ "id": p.id, "payment": p.payment }));
     let abandoned = resumed
         .abandoned
         .iter()
-        .map(|(id, p)| json!({ "id": id, "problem": p }));
+        .map(|(id, r)| json!({ "id": id, "reason": r }));
     let pending = resumed
         .pending
         .iter()
@@ -366,6 +393,7 @@ fn state(state: &State) -> String {
         State::Signed => "signed".into(),
         State::Done => "done".into(),
         State::Abandoned(reason) => format!("abandoned ({reason})"),
+        _ => "unknown".into(),
     }
 }
 

@@ -15,7 +15,8 @@ use licash::{
     unlink::Nonce,
 };
 use licash_api::{
-    Code, Fee, Fees, Info, Offer, Offered, Payment, Problem, Release, Released, Unlink, Unlinked,
+    Check, Checked, Code, Fee, Fees, Info, Offer, Offered, Payment, Problem, Release, Released,
+    Unlink, Unlinked,
 };
 use licash_hub::{Error, Hub, Policy, Refusal};
 use licash_wallet::{Response, Transport};
@@ -29,6 +30,8 @@ pub enum Fault {
     Lost,
     /// The hub serves it, but its answer is lost.
     Dropped,
+    /// The hub does not serve it, and answers with this problem.
+    Refused(Code),
 }
 
 struct Site {
@@ -122,8 +125,16 @@ impl Net {
             let found = faults.iter().position(|(p, _)| *p == path);
             found.map(|i| faults.remove(i).1)
         };
-        if let Some(Fault::Lost) = fault {
-            return Err("connection refused".into());
+        match fault {
+            Some(Fault::Lost) => return Err("connection refused".into()),
+            Some(Fault::Refused(code)) => {
+                let problem = Problem::new(code, "refused as asked");
+                return Ok(Response {
+                    status: code.status(),
+                    body: serde_json::to_vec(&problem).unwrap(),
+                });
+            }
+            _ => {}
         }
         let hub = self
             .sites
@@ -181,6 +192,11 @@ fn post(hub: &Hub, path: &str, body: &[u8]) -> Result<Vec<u8>, Problem> {
             let unlink: Unlink = serde_json::from_slice(body).map_err(json)?;
             let answer = hub.unlink(&unlink.decode()?).map_err(problem)?;
             serde_json::to_vec(&Unlinked::new(&answer))
+        }
+        licash_api::CHECK => {
+            let check: Check = serde_json::from_slice(body).map_err(json)?;
+            let spent = hub.spent(&check.decode()?).map_err(problem)?;
+            serde_json::to_vec(&Checked { spent })
         }
         _ => return Err(Problem::invalid("no such route")),
     };

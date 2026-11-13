@@ -53,10 +53,8 @@ fn network() -> Arc<Net> {
 async fn a_payment_pays_its_payee_and_the_hub_its_fee() {
     let net = network();
     let (alice, bob) = (party(&net, 1).await, party(&net, 2).await);
-    assert_eq!(
-        alice.receive(&net.pay(HUB, &alice.address(), 100)).unwrap(),
-        100
-    );
+    let received = alice.receive(&net.pay(HUB, &alice.address(), 100)).unwrap();
+    assert_eq!((received.amount, received.hub.as_str()), (100, HUB));
     assert_eq!(
         alice.balance().unwrap(),
         [Balance {
@@ -66,34 +64,42 @@ async fn a_payment_pays_its_payee_and_the_hub_its_fee() {
         }]
     );
 
-    let payment = alice.send(HUB, &bob.address(), 30).await.unwrap();
+    let paid = alice.send(HUB, &bob.address(), 30).await.unwrap();
+    let payment = paid.payment;
     assert_eq!(payment.hub, HUB);
-    assert_eq!(bob.receive(&payment).unwrap(), 30);
+    let received = bob.receive(&payment).unwrap();
+    assert_eq!(
+        (received.id.as_str(), received.amount),
+        (paid.id.as_str(), 30)
+    );
+    assert_eq!(bob.receipts().unwrap(), [received]);
     assert_eq!(available(&alice), (68, 0));
     assert_eq!(available(&bob), (30, 0));
 
     let sends = alice.sends().unwrap();
     assert_eq!(sends.len(), 1);
     let sent = &sends[0];
+    assert_eq!(sent.id, paid.id);
     assert_eq!((sent.amount, sent.fee, &sent.state), (30, 2, &State::Done));
     assert_eq!(sent.payee, bob.address());
     assert!(same(&alice.payment(&sent.id).unwrap(), &payment));
 
     // Received once only, and by its payee only.
-    assert!(matches!(bob.receive(&payment), Err(Error::Invalid(_))));
+    assert!(matches!(bob.receive(&payment), Err(Error::AlreadyReceived)));
     let carol = party(&net, 3).await;
-    assert!(matches!(carol.receive(&payment), Err(Error::Invalid(_))));
+    assert!(matches!(carol.receive(&payment), Err(Error::PaysNothing)));
     let mut forged = payment.clone();
     forged.unlock = Hex(vec![7; 32]);
     assert!(matches!(carol.receive(&forged), Err(Error::Invalid(_))));
 
     // Bob pays on what he received, Alice on her change.
     let back = bob.send(HUB, &alice.address(), 28).await.unwrap();
-    assert_eq!(alice.receive(&back).unwrap(), 28);
+    assert_eq!(alice.receive(&back.payment).unwrap().amount, 28);
     assert_eq!(available(&bob), (0, 0));
     let all = alice.send(HUB, &bob.address(), 94).await.unwrap();
-    assert_eq!(bob.receive(&all).unwrap(), 94);
+    assert_eq!(bob.receive(&all.payment).unwrap().amount, 94);
     assert_eq!(available(&alice), (0, 0));
+    assert_eq!(alice.receipts().unwrap().len(), 2);
 }
 
 #[tokio::test]
@@ -122,8 +128,8 @@ async fn a_payment_cut_off_at_any_step_finishes_on_resume() {
 
         let resumed = alice.resume().await.unwrap();
         assert_eq!(resumed.paid.len(), 1, "{path} {fault:?}: {resumed:?}");
-        assert_eq!(resumed.paid[0].0, id);
-        assert_eq!(bob.receive(&resumed.paid[0].1).unwrap(), 10);
+        assert_eq!(resumed.paid[0].id, id);
+        assert_eq!(bob.receive(&resumed.paid[0].payment).unwrap().amount, 10);
         assert_eq!(available(&alice), (52, 0));
         assert!(alice.resume().await.unwrap().paid.is_empty());
     }
@@ -153,7 +159,7 @@ async fn a_wallet_reopened_resumes_where_it_stopped() {
     let owner = licash::address::OwnerKeys::from_seed(&[1; 32]).unwrap();
     assert_eq!(alice.address(), owner.address());
     let resumed = alice.resume().await.unwrap();
-    assert_eq!(bob.receive(&resumed.paid[0].1).unwrap(), 10);
+    assert_eq!(bob.receive(&resumed.paid[0].payment).unwrap().amount, 10);
     assert_eq!(available(&alice), (52, 0));
     assert!(matches!(
         Wallet::open(Path::new("/nonexistent/w.sqlite"), Link(net)),
@@ -169,8 +175,8 @@ async fn fees_changed_since_the_hub_was_added_are_learned_and_paid_once() {
     *net.stale.lock().unwrap() = None;
     alice.receive(&net.pay(HUB, &alice.address(), 64)).unwrap();
 
-    let payment = alice.send(HUB, &bob.address(), 10).await.unwrap();
-    assert_eq!(bob.receive(&payment).unwrap(), 10);
+    let payment = alice.send(HUB, &bob.address(), 10).await.unwrap().payment;
+    assert_eq!(bob.receive(&payment).unwrap().amount, 10);
     assert_eq!(available(&alice), (52, 0));
     let sends = alice.sends().unwrap();
     assert_eq!((sends[0].fee, &sends[0].state), (2, &State::Done));
@@ -179,49 +185,114 @@ async fn fees_changed_since_the_hub_was_added_are_learned_and_paid_once() {
 }
 
 #[tokio::test]
-async fn a_send_its_hub_refuses_frees_its_notes() {
+async fn a_send_refused_as_spent_is_given_up_and_drops_the_spent_notes() {
     // Two copies of one wallet, as after restoring an old backup: what one
-    // spends, the other learns from the hub.
+    // spends, the other learns from the hub. Each copy holds 64 they share
+    // and the copy 32 of its own.
+    let net = network();
+    let bob = party(&net, 2).await;
+    for signed in [false, true] {
+        let seed = if signed { 4 } else { 1 };
+        let (alice, copy) = (party(&net, seed).await, party(&net, seed).await);
+        let funds = net.pay(HUB, &alice.address(), 64);
+        alice.receive(&funds).unwrap();
+        copy.receive(&funds).unwrap();
+        copy.receive(&net.pay(HUB, &copy.address(), 32)).unwrap();
+
+        if signed {
+            // The hub spent an input otherwise, so it never releases this.
+            net.fail(RELEASE, Fault::Lost);
+            let Err(Error::Pending { id, .. }) = copy.send(HUB, &bob.address(), 10).await else {
+                panic!("not pending");
+            };
+            assert!(matches!(copy.abandon(&id), Err(Error::Invalid(_))));
+            alice.send(HUB, &bob.address(), 10).await.unwrap();
+            let resumed = copy.resume().await.unwrap();
+            assert_eq!((resumed.paid.len(), resumed.pending.len()), (0, 0));
+            assert!(resumed.abandoned[0].1.contains("Spent"), "{resumed:?}");
+            assert!(matches!(copy.payment(&id), Err(Error::Abandoned { .. })));
+        } else {
+            alice.send(HUB, &bob.address(), 10).await.unwrap();
+            let refused = copy.send(HUB, &bob.address(), 10).await;
+            assert!(
+                matches!(&refused, Err(Error::Refused { problem, .. }) if problem.code == Code::Spent),
+                "{refused:?}"
+            );
+        }
+        assert!(matches!(
+            copy.sends().unwrap()[0].state,
+            State::Abandoned(_)
+        ));
+        // The shared note is dropped, not chosen again.
+        assert_eq!(available(&copy), (32, 0));
+        let paid = copy.send(HUB, &bob.address(), 10).await.unwrap();
+        assert_eq!(bob.receive(&paid.payment).unwrap().amount, 10);
+        assert_eq!(available(&copy), (20, 0));
+        assert_eq!(copy.check().await.unwrap(), 0);
+    }
+}
+
+#[tokio::test]
+async fn a_restored_copy_drops_the_notes_spent_since() {
     let net = network();
     let (alice, copy, bob) = (
         party(&net, 1).await,
         party(&net, 1).await,
         party(&net, 2).await,
     );
-    let funds = net.pay(HUB, &alice.address(), 64);
+    let funds = net.pay(HUB, &alice.address(), 100);
     alice.receive(&funds).unwrap();
     copy.receive(&funds).unwrap();
+    alice.send(HUB, &bob.address(), 60).await.unwrap();
+    assert_eq!(available(&copy), (100, 0));
+    assert_eq!(copy.check().await.unwrap(), 64);
+    assert_eq!(available(&copy), (36, 0));
+    assert_eq!(copy.check().await.unwrap(), 0);
+    assert_eq!(alice.check().await.unwrap(), 0);
+    assert_eq!(available(&alice), (38, 0));
+    // A note dropped is not unlinked either.
+    assert_eq!(copy.unlink().await.unwrap(), 2);
+}
 
-    // Refused unsigned: given up at once.
-    alice.send(HUB, &bob.address(), 10).await.unwrap();
-    let refused = copy.send(HUB, &bob.address(), 10).await;
-    assert!(matches!(refused, Err(Error::Refused { problem, .. }) if problem.code == Code::Spent));
-    assert_eq!(available(&copy), (64, 0));
-    assert!(matches!(
-        copy.sends().unwrap()[0].state,
-        State::Abandoned(_)
-    ));
+#[tokio::test]
+async fn a_signed_send_refused_otherwise_stays_pending_and_finishes() {
+    let net = network();
+    let (alice, bob) = (party(&net, 1).await, party(&net, 2).await);
+    alice.receive(&net.pay(HUB, &alice.address(), 64)).unwrap();
+    net.fail(RELEASE, Fault::Refused(Code::UnknownOffer));
+    let Err(Error::Pending { id, reason }) = alice.send(HUB, &bob.address(), 10).await else {
+        panic!("not pending");
+    };
+    assert!(reason.contains("UnknownOffer"), "{reason}");
+    assert_eq!(alice.sends().unwrap()[0].state, State::Signed);
+    assert_eq!(available(&alice), (0, 64));
+    assert!(matches!(alice.payment(&id), Err(Error::Pending { .. })));
+    let resumed = alice.resume().await.unwrap();
+    assert_eq!(resumed.paid[0].id, id);
+    assert_eq!(bob.receive(&resumed.paid[0].payment).unwrap().amount, 10);
+    assert!(same(&alice.payment(&id).unwrap(), &resumed.paid[0].payment));
+}
 
-    // Refused signed: the hub spent an input otherwise, so it never
-    // releases this one.
-    let (alice, copy) = (party(&net, 4).await, party(&net, 4).await);
-    let funds = net.pay(HUB, &alice.address(), 64);
-    alice.receive(&funds).unwrap();
-    copy.receive(&funds).unwrap();
-    net.fail(RELEASE, Fault::Lost);
+#[tokio::test]
+async fn an_unsigned_send_refused_is_given_up() {
+    let net = network();
+    let (alice, bob) = (party(&net, 1).await, party(&net, 2).await);
+    alice.receive(&net.pay(HUB, &alice.address(), 64)).unwrap();
+    net.fail(OFFER, Fault::Refused(Code::Invalid));
+    let refused = alice.send(HUB, &bob.address(), 10).await;
+    assert!(
+        matches!(&refused, Err(Error::Refused { problem, .. }) if problem.code == Code::Invalid),
+        "{refused:?}"
+    );
+    assert_eq!(available(&alice), (64, 0));
+    let id = alice.sends().unwrap()[0].id.clone();
+    assert!(matches!(alice.payment(&id), Err(Error::Abandoned { .. })));
+    let resumed = alice.resume().await.unwrap();
+    assert!(resumed.paid.is_empty() && resumed.abandoned.is_empty());
     assert!(matches!(
-        copy.send(HUB, &bob.address(), 10).await,
-        Err(Error::Pending { .. })
+        alice.payment(&"00".repeat(32)),
+        Err(Error::UnknownPayment(_))
     ));
-    assert!(matches!(
-        copy.abandon(&copy.sends().unwrap()[0].id),
-        Err(Error::Invalid(_))
-    ));
-    alice.send(HUB, &bob.address(), 10).await.unwrap();
-    let resumed = copy.resume().await.unwrap();
-    assert_eq!((resumed.paid.len(), resumed.pending.len()), (0, 0));
-    assert_eq!(resumed.abandoned[0].1.code, Code::Spent);
-    assert_eq!(available(&copy), (64, 0));
 }
 
 #[tokio::test]
@@ -237,7 +308,7 @@ async fn an_owner_gives_up_an_unsigned_send_only() {
     assert_eq!(available(&alice), (64, 0));
     assert!(alice.abandon(&id).is_err());
     assert!(alice.resume().await.unwrap().paid.is_empty());
-    assert!(matches!(alice.payment(&id), Err(Error::Invalid(_))));
+    assert!(matches!(alice.payment(&id), Err(Error::Abandoned { .. })));
     alice.send(HUB, &bob.address(), 10).await.unwrap();
 }
 
@@ -250,7 +321,7 @@ async fn only_hubs_added_are_trusted() {
     let payment = net.pay(OTHER, &bob.address(), 8);
     assert!(matches!(bob.receive(&payment), Err(Error::UnknownHub(hub)) if hub == OTHER));
     bob.add_hub(OTHER).await.unwrap();
-    assert_eq!(bob.receive(&payment).unwrap(), 8);
+    assert_eq!(bob.receive(&payment).unwrap().amount, 8);
     assert_eq!(bob.hubs().unwrap().len(), 2);
 
     // Another URL claiming a hub's keysets is not that hub.
@@ -320,8 +391,8 @@ async fn notes_unlink_and_stay_spendable() {
     assert_eq!(alice.unlink().await.unwrap(), 0);
     assert_eq!(available(&alice), (100, 0));
 
-    let payment = alice.send(HUB, &bob.address(), 98).await.unwrap();
-    assert_eq!(bob.receive(&payment).unwrap(), 98);
+    let payment = alice.send(HUB, &bob.address(), 98).await.unwrap().payment;
+    assert_eq!(bob.receive(&payment).unwrap().amount, 98);
     assert_eq!(available(&alice), (0, 0));
 }
 
@@ -333,8 +404,52 @@ async fn notes_a_restarted_hub_no_longer_unlinks_stay_linked_and_spendable() {
     net.restart(HUB);
     assert_eq!(alice.unlink().await.unwrap(), 0);
     assert_eq!(alice.unlink().await.unwrap(), 0);
-    let payment = alice.send(HUB, &bob.address(), 4).await.unwrap();
-    assert_eq!(bob.receive(&payment).unwrap(), 4);
+    let payment = alice.send(HUB, &bob.address(), 4).await.unwrap().payment;
+    assert_eq!(bob.receive(&payment).unwrap().amount, 4);
+}
+
+#[tokio::test]
+async fn a_note_its_hub_refuses_to_unlink_stays_linked_and_spendable() {
+    let net = network();
+    let (alice, bob) = (party(&net, 1).await, party(&net, 2).await);
+    alice.receive(&net.pay(HUB, &alice.address(), 100)).unwrap();
+    net.fail(UNLINK, Fault::Refused(Code::Invalid));
+    assert_eq!(alice.unlink().await.unwrap(), 2);
+    assert_eq!(alice.unlink().await.unwrap(), 0);
+    let payment = alice.send(HUB, &bob.address(), 98).await.unwrap().payment;
+    assert_eq!(bob.receive(&payment).unwrap().amount, 98);
+}
+
+#[tokio::test]
+async fn a_wallet_whose_seed_is_kept_elsewhere_opens_with_it_only() {
+    let net = network();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("w.sqlite");
+    let link = || Link(net.clone());
+    let address = Wallet::create_without_seed(&path, &[5; 32], link())
+        .unwrap()
+        .address();
+    let seed: Option<Vec<u8>> = rusqlite::Connection::open(&path)
+        .unwrap()
+        .query_row("SELECT seed FROM meta", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(seed, None);
+    assert!(matches!(Wallet::open(&path, link()), Err(Error::Setup(_))));
+    assert!(matches!(
+        Wallet::open_with_seed(&path, &[6; 32], link()),
+        Err(Error::Setup(_))
+    ));
+    let wallet = Wallet::open_with_seed(&path, &[5; 32], link()).unwrap();
+    assert_eq!(wallet.address(), address);
+
+    // A wallet holding its seed opens with it too.
+    let path = dir.path().join("held.sqlite");
+    drop(Wallet::create(&path, &[5; 32], link()).unwrap());
+    Wallet::open_with_seed(&path, &[5; 32], link()).unwrap();
+    assert!(matches!(
+        Wallet::open_with_seed(&path, &[6; 32], link()),
+        Err(Error::Setup(_))
+    ));
 }
 
 #[test]
@@ -348,4 +463,5 @@ fn its_futures_run_on_any_runtime_thread() {
     send(wallet.send(HUB, &to, 1));
     send(wallet.resume());
     send(wallet.unlink());
+    send(wallet.check());
 }

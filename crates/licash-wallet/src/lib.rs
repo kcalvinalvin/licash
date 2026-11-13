@@ -6,7 +6,8 @@
 //! gives it up on [`Wallet::resume`]: a hub answers the same offer and the
 //! same release again. A send its hub refuses before it is signed is
 //! given up and its notes freed; a signed one is only retried, unless its
-//! hub shows it can never be released.
+//! hub shows it can never be released. Notes its hub shows spent by a copy
+//! of the wallet are dropped.
 //!
 //! The wallet reaches hubs through the application's [`Transport`]: HTTP
 //! over TCP or Tor, or a test. Its seed alone does not restore its notes:
@@ -27,7 +28,8 @@ use licash::{
     unlink::Session,
 };
 use licash_api::{
-    Code, Info, Offer, Offered, Payment, Problem, Release, Released, Unlink, Unlinked,
+    Check, Checked, Code, Info, Offer, Offered, Payment, Problem, Release, Released, Unlink,
+    Unlinked, MAX_CHECK,
 };
 use rand_core::{OsRng, RngCore};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
@@ -55,6 +57,7 @@ pub trait Transport: Send + Sync {
 }
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     /// The wallet file is missing, exists already or does not match.
     #[error("{0}")]
@@ -66,17 +69,32 @@ pub enum Error {
     /// No answer, or none that makes sense: retry later.
     #[error("hub {hub} is unavailable: {reason}")]
     Unavailable { hub: String, reason: String },
+    /// Nothing was paid: a payment its hub refused is given up, its notes
+    /// freed, and may be made again.
     #[error("hub {hub} refused: {problem}")]
     Refused { hub: String, problem: Problem },
     /// The payment is recorded, its outcome unknown: [`Wallet::resume`]
     /// finishes it.
     #[error("payment {id} is pending ({reason}): resume finishes it")]
     Pending { id: String, reason: String },
-    /// Not a hub this wallet added, or one that claims another's keyset.
+    /// The payment was given up before, its notes freed: nothing was paid.
+    #[error("payment {id} was given up: {reason}")]
+    Abandoned { id: String, reason: String },
+    /// Not a hub this wallet added. With a payment, the hub its payer
+    /// names: add it only if the owner trusts it.
     #[error("unknown hub {0}: add it first")]
     UnknownHub(String),
+    #[error("no payment {0}")]
+    UnknownPayment(String),
     #[error("{needed} needed, {available} available in one payment")]
     Insufficient { needed: u64, available: u64 },
+    /// Another payment took a note meanwhile: nothing was paid.
+    #[error("another payment took a note meanwhile: try again")]
+    NoteTaken,
+    #[error("the payment is received already")]
+    AlreadyReceived,
+    #[error("the payment pays this wallet nothing")]
+    PaysNothing,
     #[error("{0}")]
     Invalid(String),
 }
@@ -108,6 +126,7 @@ pub struct Sent {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum State {
     /// Not signed yet: its hub may refuse it, which frees its notes.
     Offered,
@@ -118,14 +137,29 @@ pub enum State {
     Abandoned(String),
 }
 
+/// A payment made, by its id, with the payment to hand its payee.
+#[derive(Clone, Debug)]
+pub struct Paid {
+    pub id: String,
+    pub payment: Payment,
+}
+
+/// A payment taken.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Received {
+    pub id: String,
+    pub hub: String,
+    pub amount: u64,
+    pub received_at: i64,
+}
+
 /// What [`Wallet::resume`] did with the payments under way.
 #[derive(Debug, Default)]
 pub struct Resumed {
-    /// Finished, by id, with the payment to hand each payee.
-    pub paid: Vec<(String, Payment)>,
-    /// Refused by their hubs, given up and their notes freed.
-    pub abandoned: Vec<(String, Problem)>,
-    /// Still under way, and why.
+    pub paid: Vec<Paid>,
+    /// Given up, their notes freed, by id and why.
+    pub abandoned: Vec<(String, String)>,
+    /// Still under way, by id and why.
     pub pending: Vec<(String, String)>,
 }
 
@@ -145,10 +179,10 @@ struct Held {
 }
 
 impl<T: Transport> Wallet<T> {
-    /// A new wallet file at `path`, for the owner of `seed`.
+    /// A new wallet file at `path`, holding `seed`, its owner's.
     pub fn create(path: &Path, seed: &[u8; 32], transport: T) -> Result<Self, Error> {
         let owner = OwnerKeys::from_seed(seed)?;
-        let store = Store::create(path, seed)?;
+        let store = Store::create(path, Some(seed), &owner.address().to_bytes())?;
         Ok(Self {
             store,
             owner,
@@ -156,10 +190,39 @@ impl<T: Transport> Wallet<T> {
         })
     }
 
-    /// The wallet file at `path`.
+    /// A new wallet file at `path` for the owner of `seed`, which the
+    /// application keeps, as in a phone's keystore: it opens the wallet
+    /// with [`Wallet::open_with_seed`].
+    pub fn create_without_seed(path: &Path, seed: &[u8; 32], transport: T) -> Result<Self, Error> {
+        let owner = OwnerKeys::from_seed(seed)?;
+        let store = Store::create(path, None, &owner.address().to_bytes())?;
+        Ok(Self {
+            store,
+            owner,
+            transport,
+        })
+    }
+
+    /// The wallet file at `path`, which holds its seed.
     pub fn open(path: &Path, transport: T) -> Result<Self, Error> {
-        let (store, seed) = Store::open(path)?;
-        let owner = OwnerKeys::from_seed(&seed)?;
+        let (store, owner) = Store::open(path)?;
+        let seed = owner.seed.ok_or_else(|| {
+            Error::Setup("the wallet's seed is kept elsewhere: open it with its seed".into())
+        })?;
+        Self::opened(store, &seed, &owner.address, transport)
+    }
+
+    /// The wallet file at `path`, of the owner of `seed`.
+    pub fn open_with_seed(path: &Path, seed: &[u8; 32], transport: T) -> Result<Self, Error> {
+        let (store, owner) = Store::open(path)?;
+        Self::opened(store, seed, &owner.address, transport)
+    }
+
+    fn opened(store: Store, seed: &[u8; 32], address: &[u8], transport: T) -> Result<Self, Error> {
+        let owner = OwnerKeys::from_seed(seed)?;
+        if owner.address().to_bytes()[..] != *address {
+            return Err(Error::Setup("not this wallet's seed".into()));
+        }
         Ok(Self {
             store,
             owner,
@@ -175,13 +238,15 @@ impl<T: Transport> Wallet<T> {
     /// Trust the hub at `url`, and learn its keysets and fees. Again, to
     /// learn what changed.
     pub async fn add_hub(&self, url: &str) -> Result<Info, Error> {
-        self.refresh(&hub_url(url)?).await
+        Ok(self.refresh(&hub_url(url)?).await?.1)
     }
 
-    /// The hubs added, and what each last said of itself.
+    /// The hubs added, by URL, and what each last said of itself.
     pub fn hubs(&self) -> Result<Vec<(String, Info)>, Error> {
         self.store.read(|c| {
-            let mut stmt = c.prepare("SELECT url, info FROM hubs ORDER BY url")?;
+            let mut stmt = c.prepare(
+                "SELECT r.url, h.info FROM hubs h JOIN reach r ON r.hub = h.id ORDER BY r.url",
+            )?;
             let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get::<_, String>(1)?)))?;
             rows.map(|row| {
                 let (url, info) = row?;
@@ -194,14 +259,17 @@ impl<T: Transport> Wallet<T> {
     pub fn balance(&self) -> Result<Vec<Balance>, Error> {
         self.store.read(|c| {
             let mut stmt = c.prepare(
-                "SELECT h.url,
-                    COALESCE(SUM(CASE WHEN n.spent_by IS NULL THEN n.denom END), 0),
-                    COALESCE(SUM(CASE WHEN s.id IS NOT NULL AND s.done_at IS NULL THEN n.denom END), 0)
+                "SELECT r.url,
+                    COALESCE(SUM(CASE WHEN n.spent_by IS NULL AND n.gone_at IS NULL
+                        THEN n.denom END), 0),
+                    COALESCE(SUM(CASE WHEN s.id IS NOT NULL AND s.done_at IS NULL
+                        THEN n.denom END), 0)
                  FROM hubs h
-                 LEFT JOIN keysets k ON k.hub = h.url
+                 JOIN reach r ON r.hub = h.id
+                 LEFT JOIN keysets k ON k.hub = h.id
                  LEFT JOIN notes n ON n.keyset = k.id
                  LEFT JOIN sends s ON s.id = n.spent_by
-                 GROUP BY h.url ORDER BY h.url",
+                 GROUP BY h.id ORDER BY r.url",
             )?;
             let rows = stmt.query_map([], |r| {
                 Ok(Balance {
@@ -214,57 +282,83 @@ impl<T: Transport> Wallet<T> {
         })
     }
 
-    async fn refresh(&self, hub: &str) -> Result<Info, Error> {
-        let info: Info = self.get(hub, licash_api::INFO).await?;
-        let keysets = info.keysets().map_err(|p| unavailable(hub, p))?;
+    /// What the hub at `url` says of itself, kept: its id and info. A
+    /// keyset belongs to the hub that first advertised it.
+    async fn refresh(&self, url: &str) -> Result<(i64, Info), Error> {
+        let info: Info = self.get(url, licash_api::INFO).await?;
+        let keysets = info.keysets().map_err(|p| unavailable(url, p))?;
         let text = serde_json::to_string(&info).map_err(invalid)?;
-        self.store.write(|tx| {
-            tx.execute(
-                "INSERT INTO hubs (url, info, updated_at) VALUES (?1, ?2, ?3)
-                 ON CONFLICT (url) DO UPDATE SET info = ?2, updated_at = ?3",
-                params![hub, text, now()],
-            )?;
+        let hub = self.store.write(|tx| {
+            let known: Option<i64> = tx
+                .query_row("SELECT hub FROM hub_urls WHERE url = ?1", [url], |r| {
+                    r.get(0)
+                })
+                .optional()?;
             for keyset in &keysets {
-                let known: Option<String> = tx
+                let other: Option<String> = tx
                     .query_row(
-                        "SELECT hub FROM keysets WHERE id = ?1",
-                        [keyset.id()],
+                        "SELECT r.url FROM keysets k JOIN reach r ON r.hub = k.hub
+                         WHERE k.id = ?1 AND k.hub IS NOT ?2",
+                        params![keyset.id(), known],
                         |r| r.get(0),
                     )
                     .optional()?;
-                match known {
-                    None => {
-                        tx.execute(
-                            "INSERT INTO keysets (id, hub, bytes) VALUES (?1, ?2, ?3)",
-                            params![keyset.id(), hub, keyset.to_bytes()],
-                        )?;
-                    }
-                    Some(other) if other != hub => {
-                        return Err(Error::Invalid(format!(
-                            "hub {hub} advertises a keyset of hub {other}"
-                        )));
-                    }
-                    Some(_) => {}
+                if let Some(other) = other {
+                    return Err(Error::Invalid(format!(
+                        "hub {url} advertises a keyset of hub {other}"
+                    )));
                 }
             }
-            Ok(())
+            let hub = match known {
+                Some(hub) => {
+                    tx.execute(
+                        "UPDATE hubs SET info = ?2, updated_at = ?3 WHERE id = ?1",
+                        params![hub, text, now()],
+                    )?;
+                    hub
+                }
+                None => {
+                    tx.execute(
+                        "INSERT INTO hubs (info, updated_at) VALUES (?1, ?2)",
+                        params![text, now()],
+                    )?;
+                    let hub = tx.last_insert_rowid();
+                    tx.execute(
+                        "INSERT INTO hub_urls (url, hub) VALUES (?1, ?2)",
+                        params![url, hub],
+                    )?;
+                    hub
+                }
+            };
+            for keyset in &keysets {
+                tx.execute(
+                    "INSERT INTO keysets (id, hub, bytes) VALUES (?1, ?2, ?3)
+                     ON CONFLICT DO NOTHING",
+                    params![keyset.id(), hub, keyset.to_bytes()],
+                )?;
+            }
+            Ok(hub)
         })?;
-        tracing::info!(%hub, keysets = keysets.len(), "hub info");
-        Ok(info)
+        tracing::info!(%url, keysets = keysets.len(), "hub info");
+        Ok((hub, info))
     }
 
-    fn info(&self, hub: &str) -> Result<Info, Error> {
-        let info: Option<String> = self.store.read(|c| {
-            Ok(
-                c.query_row("SELECT info FROM hubs WHERE url = ?1", [hub], |r| r.get(0))
-                    .optional()?,
+    /// The hub at `url`: its id and what it last said of itself.
+    fn hub(&self, url: &str) -> Result<(i64, Info), Error> {
+        let row: Option<(i64, String)> = self.store.read(|c| {
+            Ok(c.query_row(
+                "SELECT h.id, h.info FROM hub_urls u JOIN hubs h ON h.id = u.hub
+                 WHERE u.url = ?1",
+                [url],
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
+            .optional()?)
         })?;
-        let info = info.ok_or_else(|| Error::UnknownHub(hub.to_owned()))?;
-        serde_json::from_str(&info).map_err(invalid)
+        let (hub, info) = row.ok_or_else(|| Error::UnknownHub(url.to_owned()))?;
+        Ok((hub, serde_json::from_str(&info).map_err(invalid)?))
     }
 
-    fn keysets(&self, hub: &str) -> Result<Vec<Keyset>, Error> {
+    fn keysets(&self, hub: i64) -> Result<Vec<Keyset>, Error> {
         self.store.read(|c| {
             let mut stmt = c.prepare("SELECT bytes FROM keysets WHERE hub = ?1")?;
             let rows = stmt.query_map([hub], |r| r.get::<_, Vec<u8>>(0))?;
@@ -317,26 +411,26 @@ impl<T: Transport> Wallet<T> {
 
 /// Payments made.
 impl<T: Transport> Wallet<T> {
-    /// Pay `amount` to `payee` through the hub at `hub`, the hub's fee on
-    /// top, and the payment to hand the payee. A hub that refuses the fee
-    /// it advertised is asked again for its fees, and paid them, once.
-    pub async fn send(&self, hub: &str, payee: &Address, amount: u64) -> Result<Payment, Error> {
-        let hub = hub_url(hub)?;
+    /// Pay `amount` to `payee` through the hub at `url`, the hub's fee on
+    /// top. A hub that refuses the fee it advertised is asked again for its
+    /// fees, and paid them, once.
+    pub async fn send(&self, url: &str, payee: &Address, amount: u64) -> Result<Paid, Error> {
+        let url = hub_url(url)?;
         if amount == 0 {
             return Err(Error::Invalid("nothing to pay".into()));
         }
-        match self.send_once(&hub, payee, amount).await {
+        match self.send_once(&url, payee, amount).await {
             Err(Error::Refused { problem, .. }) if problem.code == Code::Fee => {
-                tracing::info!(%hub, %problem, "fees changed, paying the new ones");
-                self.refresh(&hub).await?;
-                self.send_once(&hub, payee, amount).await
+                tracing::info!(%url, %problem, "fees changed, paying the new ones");
+                self.refresh(&url).await?;
+                self.send_once(&url, payee, amount).await
             }
             sent => sent,
         }
     }
 
-    async fn send_once(&self, hub: &str, payee: &Address, amount: u64) -> Result<Payment, Error> {
-        let info = self.info(hub)?;
+    async fn send_once(&self, url: &str, payee: &Address, amount: u64) -> Result<Paid, Error> {
+        let (hub, info) = self.hub(url)?;
         let (keyset, selection) = self.select(hub, amount, &info.fees.spend)?;
         let inputs = self.store.read(|c| {
             selection
@@ -391,25 +485,25 @@ impl<T: Transport> Wallet<T> {
             for y in &selection.inputs {
                 let taken = tx.execute(
                     "UPDATE notes SET spent_by = ?1
-                     WHERE y = ?2 AND spent_by IS NULL AND session IS NULL",
+                     WHERE y = ?2 AND spent_by IS NULL AND session IS NULL AND gone_at IS NULL",
                     params![id.as_bytes(), y],
                 )?;
                 if taken != 1 {
-                    return Err(Error::Invalid(
-                        "a note was taken meanwhile: try again".into(),
-                    ));
+                    return Err(Error::NoteTaken);
                 }
             }
             Ok(())
         })?;
-        tracing::info!(id = %hex::encode(id.as_bytes()), %hub, amount, fee = selection.fee, "sending");
-        self.advance(&id).await
+        let key = hex::encode(id.as_bytes());
+        tracing::info!(id = %key, %url, amount, fee = selection.fee, "sending");
+        let payment = self.advance(&id).await?;
+        Ok(Paid { id: key, payment })
     }
 
     /// The notes of one keyset of `hub` that pay `amount` and `fee`.
     fn select(
         &self,
-        hub: &str,
+        hub: i64,
         amount: u64,
         fee: &licash_api::Fee,
     ) -> Result<(Keyset, coins::Selection<[u8; 33]>), Error> {
@@ -421,7 +515,7 @@ impl<T: Transport> Wallet<T> {
         let notes = self.store.read(|c| {
             let mut stmt = c.prepare(
                 "SELECT y, keyset, denom FROM notes
-                 WHERE spent_by IS NULL AND session IS NULL",
+                 WHERE spent_by IS NULL AND session IS NULL AND gone_at IS NULL",
             )?;
             let rows = stmt.query_map([], |r| {
                 Ok((
@@ -456,10 +550,11 @@ impl<T: Transport> Wallet<T> {
     }
 
     /// Take send `id` on from where it stands: ask for its offer, sign it,
-    /// ask for its release, then keep its change.
+    /// ask for its release, then keep its change. Refused only if given up
+    /// here; any other failure leaves it pending.
     async fn advance(&self, id: &ProposalId) -> Result<Payment, Error> {
         let pending = |e: Error| match e {
-            Error::Refused { .. } | Error::Pending { .. } => e,
+            Error::Refused { .. } | Error::Pending { .. } | Error::Abandoned { .. } => e,
             e => Error::Pending {
                 id: hex::encode(id.as_bytes()),
                 reason: e.to_string(),
@@ -469,32 +564,45 @@ impl<T: Transport> Wallet<T> {
     }
 
     async fn advance_from(&self, id: &ProposalId) -> Result<Payment, Error> {
-        let row = self.store.read(|c| {
+        type Row = (
+            i64,
+            String,
+            String,
+            Option<String>,
+            Option<[u8; 32]>,
+            Option<String>,
+        );
+        let row: Row = self.store.read(|c| {
             Ok(c.query_row(
-                "SELECT hub, offer, release, unlock, abandoned FROM sends WHERE id = ?1",
+                "SELECT s.hub, r.url, s.offer, s.release, s.unlock, s.abandoned
+                 FROM sends s JOIN reach r ON r.hub = s.hub WHERE s.id = ?1",
                 [id.as_bytes()],
                 |r| {
                     Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, Option<String>>(2)?,
-                        r.get::<_, Option<[u8; 32]>>(3)?,
-                        r.get::<_, Option<String>>(4)?,
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
                     ))
                 },
             )?)
         })?;
-        let (hub, offer, release, unlock, abandoned) = row;
+        let (hub, url, offer, release, unlock, abandoned) = row;
         if let Some(reason) = abandoned {
-            return Err(Error::Invalid(format!("given up: {reason}")));
+            return Err(Error::Abandoned {
+                id: hex::encode(id.as_bytes()),
+                reason,
+            });
         }
-        let keysets = self.keysets(&hub)?;
+        let keysets = self.keysets(hub)?;
         let lookup = |id: &[u8; 32]| keysets.iter().find(|k| k.id() == id);
         let release: Release = match release {
             Some(release) => serde_json::from_str(&release).map_err(invalid)?,
             None => {
                 let offer: Offer = serde_json::from_str(&offer).map_err(invalid)?;
-                self.sign(&hub, id, &offer, lookup).await?
+                self.sign(&url, id, &offer, lookup).await?
             }
         };
         let (signed, notes) = release.decode(lookup).map_err(invalid)?;
@@ -505,7 +613,7 @@ impl<T: Transport> Wallet<T> {
         };
         let unlock = match unlock {
             Some(unlock) => unlock,
-            None => self.release(&hub, id, &release, keyset, grant).await?,
+            None => self.release(&url, id, &release, keyset, grant).await?,
         };
         let change = self
             .owner
@@ -534,14 +642,15 @@ impl<T: Transport> Wallet<T> {
             }
             Ok(())
         })?;
-        Ok(Payment::new(&hub, &signed, &notes, &unlock))
+        Ok(Payment::new(&url, &signed, &notes, &unlock))
     }
 
     /// The hub's offer for `offer`, signed and recorded: from then on the
-    /// send is never given up unasked. Refused, the send is given up.
+    /// send is given up only once its hub refuses it as spent. Refused, the
+    /// send is given up.
     async fn sign<'k>(
         &self,
-        hub: &str,
+        url: &str,
         id: &ProposalId,
         offer: &Offer,
         keysets: impl Fn(&[u8; 32]) -> Option<&'k Keyset>,
@@ -549,17 +658,16 @@ impl<T: Transport> Wallet<T> {
         let (proposal, notes) = offer.decode(&keysets).map_err(invalid)?;
         let keyset = keysets(proposal.keyset_id())
             .ok_or_else(|| Error::Invalid("a send under a keyset its hub no longer has".into()))?;
-        let grant = match self.post::<Offered>(hub, licash_api::OFFER, offer).await {
-            Ok(offered) => offered.decode().map_err(|p| unavailable(hub, p))?,
-            Err(Error::Refused { hub, problem }) => {
-                self.give_up(id, &problem.to_string(), false)?;
-                return Err(Error::Refused { hub, problem });
+        let grant = match self.post::<Offered>(url, licash_api::OFFER, offer).await {
+            Ok(offered) => offered.decode().map_err(|p| unavailable(url, p))?,
+            Err(Error::Refused { problem, .. }) => {
+                return Err(self.refused(url, id, problem, false).await?);
             }
             Err(e) => return Err(e),
         };
         grant
             .verify(keyset, &proposal)
-            .map_err(|e| unavailable(hub, format!("its offer: {e}")))?;
+            .map_err(|e| unavailable(url, format!("its offer: {e}")))?;
         let owners = self.store.read(|c| {
             notes
                 .iter()
@@ -595,43 +703,125 @@ impl<T: Transport> Wallet<T> {
             )?)
         })?;
         if let Some(reason) = abandoned {
-            return Err(Error::Invalid(format!("given up: {reason}")));
+            return Err(Error::Abandoned {
+                id: hex::encode(id.as_bytes()),
+                reason,
+            });
         }
         serde_json::from_str(&release).map_err(invalid)
     }
 
     /// The hub's unlock for the signed `release`, checked to open its
     /// grant. A hub that spent an input otherwise will never release it:
-    /// the send is given up.
+    /// the send is given up. Any other refusal leaves it pending.
     async fn release(
         &self,
-        hub: &str,
+        url: &str,
         id: &ProposalId,
         release: &Release,
         keyset: &Keyset,
         grant: &Grant,
     ) -> Result<Unlock, Error> {
         let released = match self
-            .post::<Released>(hub, licash_api::RELEASE, release)
+            .post::<Released>(url, licash_api::RELEASE, release)
             .await
         {
             Ok(released) => released,
-            Err(Error::Refused { hub, problem }) if problem.code == Code::Spent => {
-                self.give_up(id, &problem.to_string(), true)?;
-                return Err(Error::Refused { hub, problem });
+            Err(Error::Refused { problem, .. }) if problem.code == Code::Spent => {
+                return Err(self.refused(url, id, problem, true).await?);
+            }
+            Err(Error::Refused { problem, .. }) => {
+                return Err(Error::Pending {
+                    id: hex::encode(id.as_bytes()),
+                    reason: format!("hub {url} refused its release: {problem}"),
+                });
             }
             Err(e) => return Err(e),
         };
-        let unlock = released.decode().map_err(|p| unavailable(hub, p))?;
+        let unlock = released.decode().map_err(|p| unavailable(url, p))?;
         grant
             .verify_unlock(keyset, &unlock)
-            .map_err(|e| unavailable(hub, format!("its unlock: {e}")))?;
+            .map_err(|e| unavailable(url, format!("its unlock: {e}")))?;
         Ok(unlock)
     }
 
-    /// Give send `id` up and free its notes, unless it is done, or signed
-    /// and not `signed_too`.
-    fn give_up(&self, id: &ProposalId, reason: &str, signed_too: bool) -> Result<bool, Error> {
+    /// Give send `id` up on its hub's refusal `problem`, unless it is done,
+    /// or signed and not `signed_too`: its notes freed, but those the hub
+    /// shows spent dropped. The error to answer with.
+    async fn refused(
+        &self,
+        url: &str,
+        id: &ProposalId,
+        problem: Problem,
+        signed_too: bool,
+    ) -> Result<Error, Error> {
+        let gone = if problem.code == Code::Spent {
+            self.spent_inputs(url, id).await
+        } else {
+            Vec::new()
+        };
+        let reason = problem.to_string();
+        if self.give_up(id, &reason, signed_too, &gone)? {
+            return Ok(Error::Refused {
+                hub: url.to_owned(),
+                problem,
+            });
+        }
+        // Another process took it on, or gave it up, meanwhile.
+        let abandoned: Option<String> = self.store.read(|c| {
+            Ok(c.query_row(
+                "SELECT abandoned FROM sends WHERE id = ?1",
+                [id.as_bytes()],
+                |r| r.get(0),
+            )?)
+        })?;
+        let id = hex::encode(id.as_bytes());
+        Ok(match abandoned {
+            Some(reason) => Error::Abandoned { id, reason },
+            None => Error::Pending { id, reason },
+        })
+    }
+
+    /// The inputs of send `id` its hub shows spent: none if it cannot tell.
+    async fn spent_inputs(&self, url: &str, id: &ProposalId) -> Vec<[u8; 33]> {
+        let inputs = self.store.read(|c| {
+            let mut stmt = c.prepare("SELECT y FROM notes WHERE spent_by = ?1")?;
+            let rows = stmt.query_map([id.as_bytes()], |r| r.get(0))?;
+            Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        });
+        match inputs {
+            Ok(inputs) => self.spent(url, &inputs).await,
+            Err(e) => Err(e),
+        }
+        .unwrap_or_else(|e| {
+            tracing::warn!(%url, error = %e, "cannot tell which notes are spent");
+            Vec::new()
+        })
+    }
+
+    /// Those of the notes `ys` the hub at `url` shows spent.
+    async fn spent(&self, url: &str, ys: &[[u8; 33]]) -> Result<Vec<[u8; 33]>, Error> {
+        let mut spent = Vec::new();
+        for ys in ys.chunks(MAX_CHECK) {
+            let check = Check::new(&ys.iter().map(|y| Point(*y)).collect::<Vec<_>>());
+            let checked: Checked = self.post(url, licash_api::CHECK, &check).await?;
+            if checked.spent.len() != ys.len() {
+                return Err(unavailable(url, "it checked other notes than asked"));
+            }
+            spent.extend(ys.iter().zip(checked.spent).filter(|s| s.1).map(|s| *s.0));
+        }
+        Ok(spent)
+    }
+
+    /// Give send `id` up and free its notes but drop those `gone`, unless
+    /// it is done, or signed and not `signed_too`.
+    fn give_up(
+        &self,
+        id: &ProposalId,
+        reason: &str,
+        signed_too: bool,
+        gone: &[[u8; 33]],
+    ) -> Result<bool, Error> {
         let given_up = self.store.write(|tx| {
             let given_up = tx.execute(
                 "UPDATE sends SET abandoned = ?2
@@ -640,6 +830,12 @@ impl<T: Transport> Wallet<T> {
                 params![id.as_bytes(), reason, signed_too],
             )? == 1;
             if given_up {
+                for y in gone {
+                    tx.execute(
+                        "UPDATE notes SET gone_at = ?3 WHERE y = ?1 AND spent_by = ?2",
+                        params![y, id.as_bytes(), now()],
+                    )?;
+                }
                 tx.execute(
                     "UPDATE notes SET spent_by = NULL WHERE spent_by = ?1",
                     [id.as_bytes()],
@@ -648,7 +844,8 @@ impl<T: Transport> Wallet<T> {
             Ok(given_up)
         })?;
         if given_up {
-            tracing::warn!(id = %hex::encode(id.as_bytes()), reason, "payment given up");
+            let id = hex::encode(id.as_bytes());
+            tracing::warn!(%id, reason, gone = gone.len(), "payment given up");
         }
         Ok(given_up)
     }
@@ -667,8 +864,12 @@ impl<T: Transport> Wallet<T> {
         for id in ids {
             let key = hex::encode(id);
             match self.advance(&ProposalId::from_bytes(id)).await {
-                Ok(payment) => resumed.paid.push((key, payment)),
-                Err(Error::Refused { problem, .. }) => resumed.abandoned.push((key, problem)),
+                Ok(payment) => resumed.paid.push(Paid { id: key, payment }),
+                Err(Error::Refused { problem, .. }) => {
+                    resumed.abandoned.push((key, problem.to_string()));
+                }
+                Err(Error::Abandoned { reason, .. }) => resumed.abandoned.push((key, reason)),
+                Err(Error::Pending { reason, .. }) => resumed.pending.push((key, reason)),
                 Err(e) => resumed.pending.push((key, e.to_string())),
             }
         }
@@ -679,7 +880,7 @@ impl<T: Transport> Wallet<T> {
     /// hub gone for good. A signed payment its hub may have released.
     pub fn abandon(&self, id: &str) -> Result<(), Error> {
         let id = send_id(id)?;
-        if self.give_up(&id, "abandoned by its owner", false)? {
+        if self.give_up(&id, "abandoned by its owner", false, &[])? {
             return Ok(());
         }
         Err(Error::Invalid(
@@ -689,35 +890,51 @@ impl<T: Transport> Wallet<T> {
 
     /// The payment `id`, once done, to hand its payee again.
     pub fn payment(&self, id: &str) -> Result<Payment, Error> {
+        let key = id;
         let id = send_id(id)?;
-        let (hub, release, unlock): (String, Option<String>, Option<[u8; 32]>) =
-            self.store.read(|c| {
-                c.query_row(
-                    "SELECT hub, release, unlock FROM sends WHERE id = ?1",
-                    [id.as_bytes()],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-                )
-                .optional()?
-                .ok_or_else(|| Error::Invalid("no such payment".into()))
-            })?;
-        let (Some(release), Some(unlock)) = (release, unlock) else {
-            return Err(Error::Invalid("the payment is not done".into()));
+        type Row = (
+            i64,
+            String,
+            Option<String>,
+            Option<[u8; 32]>,
+            Option<String>,
+        );
+        let row: Option<Row> = self.store.read(|c| {
+            Ok(c.query_row(
+                "SELECT s.hub, r.url, s.release, s.unlock, s.abandoned
+                 FROM sends s JOIN reach r ON r.hub = s.hub WHERE s.id = ?1",
+                [id.as_bytes()],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .optional()?)
+        })?;
+        let (hub, url, release, unlock, abandoned) =
+            row.ok_or_else(|| Error::UnknownPayment(key.to_owned()))?;
+        let id = hex::encode(id.as_bytes());
+        let (release, unlock) = match (release, unlock, abandoned) {
+            (_, _, Some(reason)) => return Err(Error::Abandoned { id, reason }),
+            (Some(release), Some(unlock), None) => (release, unlock),
+            _ => {
+                let reason = "under way".into();
+                return Err(Error::Pending { id, reason });
+            }
         };
         let release: Release = serde_json::from_str(&release).map_err(invalid)?;
-        let keysets = self.keysets(&hub)?;
+        let keysets = self.keysets(hub)?;
         let (signed, notes) = release
             .decode(|id| keysets.iter().find(|k| k.id() == id))
             .map_err(invalid)?;
-        Ok(Payment::new(&hub, &signed, &notes, &unlock))
+        Ok(Payment::new(&url, &signed, &notes, &unlock))
     }
 
     /// The payments made, newest first.
     pub fn sends(&self) -> Result<Vec<Sent>, Error> {
         self.store.read(|c| {
             let mut stmt = c.prepare(
-                "SELECT id, hub, payee, amount, fee, release IS NOT NULL, done_at IS NOT NULL,
-                    abandoned, created_at
-                 FROM sends ORDER BY created_at DESC, rowid DESC",
+                "SELECT s.id, r.url, s.payee, s.amount, s.fee, s.release IS NOT NULL,
+                    s.done_at IS NOT NULL, s.abandoned, s.created_at
+                 FROM sends s JOIN reach r ON r.hub = s.hub
+                 ORDER BY s.created_at DESC, s.rowid DESC",
             )?;
             let rows = stmt.query_map([], |r| {
                 let state = match (r.get::<_, Option<String>>(7)?, r.get(6)?, r.get(5)?) {
@@ -753,12 +970,12 @@ impl<T: Transport> Wallet<T> {
     }
 }
 
-/// Payments taken, and unlinking.
+/// Payments taken, unlinking and checking.
 impl<T: Transport> Wallet<T> {
     /// Take `payment`: keep the notes it pays this wallet, its unlock
     /// checked to open them. It must be under a keyset of a hub added
-    /// here, as the wallet takes no hub's notes unasked. The amount.
-    pub fn receive(&self, payment: &Payment) -> Result<u64, Error> {
+    /// here, as the wallet takes no hub's notes unasked.
+    pub fn receive(&self, payment: &Payment) -> Result<Received, Error> {
         let id: [u8; 32] = payment
             .release
             .keyset
@@ -766,16 +983,17 @@ impl<T: Transport> Wallet<T> {
             .as_slice()
             .try_into()
             .map_err(invalid)?;
-        let keyset: Option<Vec<u8>> = self.store.read(|c| {
-            Ok(
-                c.query_row("SELECT bytes FROM keysets WHERE id = ?1", [id], |r| {
-                    r.get(0)
-                })
-                .optional()?,
+        let known: Option<(Vec<u8>, String)> = self.store.read(|c| {
+            Ok(c.query_row(
+                "SELECT k.bytes, r.url FROM keysets k JOIN reach r ON r.hub = k.hub
+                 WHERE k.id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
+            .optional()?)
         })?;
-        let keyset =
-            Keyset::from_bytes(&keyset.ok_or_else(|| Error::UnknownHub(payment.hub.clone()))?)?;
+        let (keyset, url) = known.ok_or_else(|| Error::UnknownHub(payment.hub.clone()))?;
+        let keyset = Keyset::from_bytes(&keyset)?;
         let (signed, notes, unlock) = payment
             .decode(|id| (id == keyset.id()).then_some(&keyset))
             .map_err(invalid)?;
@@ -797,11 +1015,10 @@ impl<T: Transport> Wallet<T> {
             })
             .collect::<Result<Vec<_>, Error>>()?;
         if ours.is_empty() {
-            return Err(Error::Invalid(
-                "the payment pays this wallet nothing".into(),
-            ));
+            return Err(Error::PaysNothing);
         }
         let (pid, ephemeral) = (proposal.id(), proposal.ephemeral());
+        let received_at = now();
         let amount = self.store.write(|tx| {
             let mut amount = 0u64;
             for (r, note) in &ours {
@@ -810,48 +1027,117 @@ impl<T: Transport> Wallet<T> {
                 }
             }
             if amount == 0 {
-                return Err(Error::Invalid("the payment is received already".into()));
+                return Err(Error::AlreadyReceived);
             }
             tx.execute(
                 "INSERT INTO receipts (id, keyset, amount, received_at) VALUES (?1, ?2, ?3, ?4)
                  ON CONFLICT DO NOTHING",
-                params![pid.as_bytes(), keyset.id(), sql(amount), now()],
+                params![pid.as_bytes(), keyset.id(), sql(amount), received_at],
             )?;
             Ok(amount)
         })?;
-        tracing::info!(id = %hex::encode(pid.as_bytes()), amount, "received");
-        Ok(amount)
+        let id = hex::encode(pid.as_bytes());
+        tracing::info!(%id, amount, "received");
+        Ok(Received {
+            id,
+            hub: url,
+            amount,
+            received_at,
+        })
+    }
+
+    /// The payments taken, newest first.
+    pub fn receipts(&self) -> Result<Vec<Received>, Error> {
+        self.store.read(|c| {
+            let mut stmt = c.prepare(
+                "SELECT p.id, r.url, p.amount, p.received_at
+                 FROM receipts p JOIN keysets k ON k.id = p.keyset JOIN reach r ON r.hub = k.hub
+                 ORDER BY p.received_at DESC, p.rowid DESC",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok(Received {
+                    id: hex::encode(r.get::<_, [u8; 32]>(0)?),
+                    hub: r.get(1)?,
+                    amount: r.get::<_, i64>(2)? as u64,
+                    received_at: r.get(3)?,
+                })
+            })?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
+    }
+
+    /// Ask each hub which notes held are spent, and drop those: after
+    /// restoring an old copy of the wallet file, whose notes a newer copy
+    /// may have spent. A hub learns that one party holds the notes asked
+    /// about. The amount dropped.
+    pub async fn check(&self) -> Result<u64, Error> {
+        let held: Vec<(String, [u8; 33])> = self.store.read(|c| {
+            let mut stmt = c.prepare(
+                "SELECT r.url, n.y FROM notes n
+                 JOIN keysets k ON k.id = n.keyset JOIN reach r ON r.hub = k.hub
+                 WHERE n.spent_by IS NULL AND n.gone_at IS NULL ORDER BY r.url",
+            )?;
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })?;
+        let mut dropped = 0;
+        for at in held.chunk_by(|a, b| a.0 == b.0) {
+            let url = &at[0].0;
+            let ys: Vec<[u8; 33]> = at.iter().map(|(_, y)| *y).collect();
+            let spent = self.spent(url, &ys).await?;
+            dropped += self.store.write(|tx| {
+                let mut dropped = 0;
+                for y in &spent {
+                    let denom: Option<i64> = tx
+                        .query_row(
+                            "UPDATE notes SET gone_at = ?2, session = NULL
+                             WHERE y = ?1 AND spent_by IS NULL AND gone_at IS NULL
+                             RETURNING denom",
+                            params![y, now()],
+                            |r| r.get(0),
+                        )
+                        .optional()?;
+                    dropped += denom.map_or(0, |d| d as u64);
+                }
+                Ok(dropped)
+            })?;
+            if !spent.is_empty() {
+                tracing::warn!(%url, notes = spent.len(), "notes spent by a copy of the wallet dropped");
+            }
+        }
+        Ok(dropped)
     }
 
     /// Unlink the notes held linked to their issuance, so that their hub
     /// cannot tell which payment one came from when it is spent. A note
-    /// its hub unlinks no more stays linked. The number unlinked; on an
+    /// its hub refuses to unlink stays linked. The number unlinked; on an
     /// error, those before it are kept and the rest are asked again next
     /// time.
     pub async fn unlink(&self) -> Result<usize, Error> {
         let todo: Vec<([u8; 33], String)> = self.store.read(|c| {
             let mut stmt = c.prepare(
-                "SELECT n.y, k.hub FROM notes n JOIN keysets k ON k.id = n.keyset
-                 WHERE n.unlinked = 0 AND n.spent_by IS NULL
+                "SELECT n.y, r.url FROM notes n
+                 JOIN keysets k ON k.id = n.keyset JOIN reach r ON r.hub = k.hub
+                 WHERE n.unlinked = 0 AND n.spent_by IS NULL AND n.gone_at IS NULL
                  ORDER BY n.session IS NULL, n.added_at",
             )?;
             let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
             Ok(rows.collect::<Result<_, _>>()?)
         })?;
         let mut unlinked = 0;
-        for (y, hub) in todo {
-            if self.unlink_one(&hub, &y).await? {
+        for (y, url) in todo {
+            if self.unlink_one(&url, &y).await? {
                 unlinked += 1;
             }
         }
         Ok(unlinked)
     }
 
-    async fn unlink_one(&self, hub: &str, y: &[u8; 33]) -> Result<bool, Error> {
+    async fn unlink_one(&self, url: &str, y: &[u8; 33]) -> Result<bool, Error> {
         let row: Option<(Vec<u8>, Option<String>)> = self.store.read(|c| {
             Ok(c.query_row(
                 "SELECT k.bytes, n.session FROM notes n JOIN keysets k ON k.id = n.keyset
-                 WHERE n.y = ?1 AND n.unlinked = 0 AND n.spent_by IS NULL",
+                 WHERE n.y = ?1 AND n.unlinked = 0 AND n.spent_by IS NULL AND n.gone_at IS NULL",
                 [y],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
@@ -881,34 +1167,26 @@ impl<T: Transport> Wallet<T> {
             }
         };
         let answer = match self
-            .post::<Unlinked>(hub, licash_api::UNLINK, &Unlink::new(session.request()))
+            .post::<Unlinked>(url, licash_api::UNLINK, &Unlink::new(session.request()))
             .await
         {
-            Ok(answer) => answer.decode().map_err(|p| unavailable(hub, p))?,
-            Err(Error::Refused { problem, .. })
-                if matches!(
-                    problem.code,
-                    Code::Expired | Code::NotIssued | Code::Unlinked
-                ) =>
-            {
-                tracing::info!(%hub, %problem, "a note stays linked");
-                self.store.write(|tx| {
-                    tx.execute(
-                        "UPDATE notes SET unlinked = -1, session = NULL WHERE y = ?1",
-                        [y],
-                    )?;
-                    Ok(())
-                })?;
+            Ok(answer) => answer.decode().map_err(|p| unavailable(url, p))?,
+            // It answers the same request the same: it will never unlink it.
+            Err(Error::Refused { problem, .. }) => {
+                tracing::info!(%url, %problem, "a note stays linked");
+                self.stay_linked(y)?;
                 return Ok(false);
             }
             Err(e) => return Err(e),
         };
-        let note = session
-            .finish(&keyset, &answer)
-            .map_err(|e| unavailable(hub, format!("its unlink answer: {e}")))?;
-        if note.message().identifier()?.0 != *y {
-            return Err(Error::Invalid("an unlinked note changed identity".into()));
-        }
+        let note = match session.finish(&keyset, &answer) {
+            Ok(note) if note.message().identifier()?.0 == *y => note,
+            _ => {
+                tracing::warn!(%url, "its unlink answer does not open: a note stays linked");
+                self.stay_linked(y)?;
+                return Ok(false);
+            }
+        };
         self.store.write(|tx| {
             tx.execute(
                 "UPDATE notes SET note = ?2, unlinked = 1, session = NULL WHERE y = ?1",
@@ -917,6 +1195,16 @@ impl<T: Transport> Wallet<T> {
             Ok(())
         })?;
         Ok(true)
+    }
+
+    fn stay_linked(&self, y: &[u8; 33]) -> Result<(), Error> {
+        self.store.write(|tx| {
+            tx.execute(
+                "UPDATE notes SET unlinked = -1, session = NULL WHERE y = ?1",
+                [y],
+            )?;
+            Ok(())
+        })
     }
 
     fn derivation(&self, held: &Held) -> Result<Derivation, Error> {

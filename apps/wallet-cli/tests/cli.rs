@@ -78,9 +78,17 @@ fn owners_pay_and_get_paid_on_the_command_line() {
     assert_eq!(available(&alice), (100, 0));
 
     // Alice pays Bob; the payment goes from her stdout to his stdin.
-    let paid = ok(wallet(&alice, &["send", &bob_at, "30"], None));
+    let sent = wallet(&alice, &["send", &bob_at, "30"], None);
+    let id = String::from_utf8_lossy(&sent.stderr).trim().to_owned();
+    let paid = ok(sent);
     let received = ok(wallet(&bob, &["receive"], Some(&paid)));
     assert_eq!(received.trim(), "received 30");
+    let receipts = json(&bob, &["received"]);
+    assert_eq!(
+        format!("payment {}", receipts[0]["id"].as_str().unwrap()),
+        id
+    );
+    assert_eq!(receipts[0]["amount"], 30);
     assert_eq!(available(&alice), (69, 0));
     assert_eq!(available(&bob), (30, 0));
     let text = ok(wallet(&alice, &["balance"], None));
@@ -191,4 +199,26 @@ fn a_payment_while_its_hub_is_down_finishes_once_it_is_back() {
     failed(wallet(&alice, &["abandon", &id], None), 1, "unsigned");
     hub.up();
     assert_eq!(json(&alice, &["resume"])["paid"], Value::Array(vec![]));
+}
+
+#[test]
+fn a_restored_backup_drops_the_notes_spent_since() {
+    let hub = Server::start(FEE);
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, alice_at) = party(dir.path(), "alice", Some(&hub));
+    let (_, bob_at) = party(dir.path(), "bob", Some(&hub));
+    let funds = serde_json::to_string(&hub.pay(&address(&alice_at), 100)).unwrap();
+    ok(wallet(&alice, &["receive"], Some(&funds)));
+    let backup = dir.path().join("backup.sqlite");
+    std::fs::copy(&alice, &backup).unwrap();
+
+    ok(wallet(&alice, &["send", &bob_at, "60"], None));
+    assert_eq!(available(&backup), (100, 0));
+    assert_eq!(json(&backup, &["check"])["dropped"], 64);
+    assert_eq!(available(&backup), (36, 0));
+    assert_eq!(json(&backup, &["check"])["dropped"], 0);
+    // Spent from the backup, the 32 is gone from the first file too.
+    ok(wallet(&backup, &["send", &bob_at, "30"], None));
+    assert_eq!(json(&alice, &["check"])["dropped"], 32);
+    assert_eq!(available(&alice), (7, 0));
 }

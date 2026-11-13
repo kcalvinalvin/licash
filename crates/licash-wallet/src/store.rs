@@ -17,28 +17,40 @@ const VERSION: i64 = 1;
 const SCHEMA: &str = "
 CREATE TABLE meta (
     one INTEGER PRIMARY KEY CHECK (one = 1),
-    seed BLOB NOT NULL,
+    -- The owner's seed, unless the application keeps it elsewhere.
+    seed BLOB,
+    -- The owner's address, which the seed opening the wallet must derive.
+    address BLOB NOT NULL,
     created_at INTEGER NOT NULL
 ) STRICT;
--- Hubs the owner trusts, by the URL it added, and what each last said of
--- itself (an Info body).
+-- Hubs the owner trusts, and what each last said of itself (an Info body).
 CREATE TABLE hubs (
-    url TEXT PRIMARY KEY,
+    id INTEGER PRIMARY KEY,
     info TEXT NOT NULL,
     updated_at INTEGER NOT NULL
 ) STRICT;
+-- The URLs each hub is reached at: one each, for now.
+CREATE TABLE hub_urls (
+    url TEXT PRIMARY KEY,
+    hub INTEGER NOT NULL REFERENCES hubs (id)
+) STRICT;
+CREATE INDEX hub_urls_hub ON hub_urls (hub);
+-- Each hub with the URL the wallet reaches it at.
+CREATE VIEW reach (hub, url) AS
+    SELECT hub, url FROM hub_urls
+    WHERE rowid IN (SELECT MIN(rowid) FROM hub_urls GROUP BY hub);
 -- A keyset belongs to the one hub that first advertised it.
 CREATE TABLE keysets (
     id BLOB PRIMARY KEY,
-    hub TEXT NOT NULL REFERENCES hubs (url),
+    hub INTEGER NOT NULL REFERENCES hubs (id),
     bytes BLOB NOT NULL
 ) STRICT;
 -- Payments made, each step recorded before the hub is asked for the next:
 -- the offer asked for, then the release once signed. A signed send is
--- never given up, as its hub may have released it.
+-- given up only once its hub refused it as spent, which it never releases.
 CREATE TABLE sends (
     id BLOB PRIMARY KEY,
-    hub TEXT NOT NULL REFERENCES hubs (url),
+    hub INTEGER NOT NULL REFERENCES hubs (id),
     payee BLOB NOT NULL,
     amount INTEGER NOT NULL,
     fee INTEGER NOT NULL,
@@ -67,6 +79,9 @@ CREATE TABLE notes (
     unlinked INTEGER NOT NULL DEFAULT 0,
     -- An unlink under way: its session, to ask the hub again.
     session TEXT,
+    -- When its hub showed it spent by a payment this file never made, by a
+    -- copy of the wallet: it is never spent here.
+    gone_at INTEGER,
     added_at INTEGER NOT NULL
 ) STRICT;
 CREATE INDEX notes_spent_by ON notes (spent_by);
@@ -79,14 +94,26 @@ CREATE TABLE receipts (
 ) STRICT;
 ";
 
+/// What a wallet file holds of its owner.
+pub(crate) struct Owner {
+    /// Unless the application keeps it.
+    pub(crate) seed: Option<[u8; 32]>,
+    pub(crate) address: Vec<u8>,
+}
+
 pub(crate) struct Store {
     conn: Mutex<Connection>,
 }
 
 impl Store {
-    /// A new wallet file at `path` holding `seed`, readable by its owner
-    /// only. Never over an existing file.
-    pub(crate) fn create(path: &Path, seed: &[u8; 32]) -> Result<Self, Error> {
+    /// A new wallet file at `path` of the owner at `address`, holding its
+    /// `seed` if given, readable by its owner only. Never over an existing
+    /// file.
+    pub(crate) fn create(
+        path: &Path,
+        seed: Option<&[u8; 32]>,
+        address: &[u8],
+    ) -> Result<Self, Error> {
         let mut file = std::fs::OpenOptions::new();
         file.write(true).create_new(true);
         #[cfg(unix)]
@@ -97,30 +124,35 @@ impl Store {
             tx.execute_batch(SCHEMA)?;
             tx.pragma_update(None, "user_version", VERSION)?;
             tx.execute(
-                "INSERT INTO meta (one, seed, created_at) VALUES (1, ?1, ?2)",
-                rusqlite::params![seed, now()],
+                "INSERT INTO meta (one, seed, address, created_at) VALUES (1, ?1, ?2, ?3)",
+                rusqlite::params![seed, address, now()],
             )?;
             Ok(())
         })?;
         Ok(store)
     }
 
-    /// The wallet file at `path`, and its seed.
-    pub(crate) fn open(path: &Path) -> Result<(Self, [u8; 32]), Error> {
+    /// The wallet file at `path`, and what it holds of its owner.
+    pub(crate) fn open(path: &Path) -> Result<(Self, Owner), Error> {
         if !path.exists() {
             return Err(Error::Setup(format!("no wallet at {}", path.display())));
         }
         let store = Self::connect(path)?;
-        let seed = store.read(|c| {
+        let owner = store.read(|c| {
             let version: i64 = c.pragma_query_value(None, "user_version", |r| r.get(0))?;
             if version != VERSION {
                 return Err(Error::Setup(format!(
                     "wallet schema {version}, this version reads {VERSION}"
                 )));
             }
-            Ok(c.query_row("SELECT seed FROM meta", [], |r| r.get(0))?)
+            Ok(c.query_row("SELECT seed, address FROM meta", [], |r| {
+                Ok(Owner {
+                    seed: r.get(0)?,
+                    address: r.get(1)?,
+                })
+            })?)
         })?;
-        Ok((store, seed))
+        Ok((store, owner))
     }
 
     fn connect(path: &Path) -> Result<Self, Error> {

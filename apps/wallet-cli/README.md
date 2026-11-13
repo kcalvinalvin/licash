@@ -14,5 +14,6 @@ licash-wallet resume                      # after a payment ended pending
 A payment is JSON that only its payee can open: hand it over by any
 channel. `send` and `resume` exit with 75 when a payment is recorded but its
 hub has not answered; `resume` finishes it. Back up the wallet file: its
-seed alone does not restore its notes. Onion hubs need a SOCKS proxy for
-now: `--proxy socks5h://127.0.0.1:9050`.
+seed alone does not restore its notes. After restoring an old copy, `check`
+drops the notes spent since. Onion hubs need a SOCKS proxy for now:
+`--proxy socks5h://127.0.0.1:9050`.
