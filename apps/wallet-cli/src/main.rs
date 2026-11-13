@@ -1,0 +1,417 @@
+//! `licash-wallet`: pay and get paid through Licash hubs.
+
+mod http;
+
+use std::{
+    io::{Read, Write},
+    path::{Path, PathBuf},
+    process::ExitCode,
+};
+
+use anyhow::{bail, Context};
+use clap::{Parser, Subcommand, ValueEnum};
+use licash::address::Address;
+use licash_api::Payment;
+use licash_wallet::{Error, State, Wallet};
+use rand_core::{OsRng, RngCore};
+use serde_json::json;
+use tracing_subscriber::EnvFilter;
+
+use http::Http;
+
+/// The exit status of a payment recorded but not finished: retry later.
+const PENDING: u8 = 75;
+
+#[derive(Parser)]
+#[command(
+    name = "licash-wallet",
+    version,
+    about = "Pay and get paid through Licash hubs"
+)]
+struct Cli {
+    /// The wallet file [default: $XDG_DATA_HOME/licash/wallet.sqlite].
+    #[arg(long, global = true, env = "LICASH_WALLET")]
+    wallet: Option<PathBuf>,
+    /// Reach hubs through this proxy, such as socks5h://127.0.0.1:9050 for
+    /// Tor's.
+    #[arg(long, global = true, env = "LICASH_WALLET_PROXY")]
+    proxy: Option<String>,
+    /// Print results as JSON.
+    #[arg(long, global = true)]
+    json: bool,
+    /// Log lines on stderr as text or JSON, filtered by RUST_LOG (default
+    /// warn).
+    #[arg(long, global = true, env = "LICASH_WALLET_LOG", value_enum, default_value_t = Log::Text)]
+    log: Log,
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum Log {
+    Text,
+    Json,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Create a wallet, with a new seed. Back up its file: the seed alone
+    /// does not restore its notes.
+    Init,
+    /// Where others pay this wallet.
+    Address,
+    /// Trust the hub at URL, or learn again what it charges.
+    AddHub { url: String },
+    /// The hubs trusted, and their fees.
+    Hubs,
+    /// What the wallet holds, by hub.
+    Balance,
+    /// Pay AMOUNT to ADDRESS, the hub's fee on top, and print the payment
+    /// to hand the payee.
+    Send {
+        address: String,
+        amount: u64,
+        /// Through this hub [default: the one holding the most].
+        #[arg(long)]
+        hub: Option<String>,
+        /// Write the payment here instead of to stdout.
+        #[arg(long, short)]
+        out: Option<PathBuf>,
+    },
+    /// Take a payment from a file, or from stdin, and unlink its notes.
+    Receive {
+        #[arg(default_value = "-")]
+        payment: PathBuf,
+        /// Trust the payment's hub if it is not trusted yet.
+        #[arg(long)]
+        trust: bool,
+    },
+    /// Finish the payments under way and unlink the notes still linked.
+    Resume,
+    /// The payments made, newest first.
+    History,
+    /// A payment made, to hand its payee again.
+    Payment {
+        id: String,
+        #[arg(long, short)]
+        out: Option<PathBuf>,
+    },
+    /// Give up a payment its hub never signed for, freeing its notes.
+    Abandon { id: String },
+    /// Unlink the notes held from the payments they came in.
+    Unlink,
+}
+
+fn main() -> ExitCode {
+    let cli = Cli::parse();
+    logging(cli.log);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    match runtime.block_on(run(cli)) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            let pending = matches!(e.downcast_ref(), Some(Error::Pending { .. }));
+            eprintln!("error: {e:#}");
+            if pending {
+                ExitCode::from(PENDING)
+            } else {
+                ExitCode::FAILURE
+            }
+        }
+    }
+}
+
+fn logging(format: Log) {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
+    let logs = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
+        .with_writer(std::io::stderr);
+    match format {
+        Log::Text => logs.init(),
+        Log::Json => logs.json().init(),
+    }
+}
+
+async fn run(cli: Cli) -> anyhow::Result<()> {
+    let path = match cli.wallet {
+        Some(path) => path,
+        None => default_path()?,
+    };
+    let transport = Http::new(cli.proxy.as_deref())?;
+    let json = cli.json;
+    if let Command::Init = cli.command {
+        return init(&path, transport, json);
+    }
+    if !path.exists() {
+        bail!(
+            "no wallet at {}: `licash-wallet init` creates one",
+            path.display()
+        );
+    }
+    let wallet = Wallet::open(&path, transport)?;
+    match cli.command {
+        Command::Init => unreachable!("handled above"),
+        Command::Address => {
+            let address = encode(&wallet.address());
+            show(json, json!({ "address": address }), address.clone());
+        }
+        Command::AddHub { url } => {
+            let info = wallet.add_hub(&url).await?;
+            let fee = info.fees.spend;
+            show(
+                json,
+                json!({ "fees": info.fees, "keysets": info.keysets.len(), "locks": info.locks.is_some() }),
+                format!(
+                    "trusted; it charges {} + {} ppm a payment",
+                    fee.base, fee.ppm
+                ),
+            );
+        }
+        Command::Hubs => {
+            let hubs = wallet.hubs()?;
+            let rows = hubs.iter().map(|(url, info)| {
+                json!({ "url": url, "fees": info.fees, "locks": info.locks.is_some() })
+            });
+            let lines = hubs.iter().map(|(url, info)| {
+                let fee = info.fees.spend;
+                format!("{url}  {} + {} ppm", fee.base, fee.ppm)
+            });
+            show(json, rows.collect(), lines.collect::<Vec<_>>().join("\n"));
+        }
+        Command::Balance => {
+            let balance = wallet.balance()?;
+            let rows = balance
+                .iter()
+                .map(|b| json!({ "hub": b.hub, "available": b.available, "pending": b.pending }));
+            let total: u64 = balance.iter().map(|b| b.available).sum();
+            let mut lines: Vec<_> = balance
+                .iter()
+                .map(|b| match b.pending {
+                    0 => format!("{}  {}", b.hub, b.available),
+                    p => format!("{}  {} ({p} pending)", b.hub, b.available),
+                })
+                .collect();
+            lines.push(format!("total  {total}"));
+            show(json, rows.collect(), lines.join("\n"));
+        }
+        Command::Send {
+            address,
+            amount,
+            hub,
+            out,
+        } => {
+            let payee = decode(&address)?;
+            let hub = match hub {
+                Some(hub) => hub,
+                None => richest(&wallet)?,
+            };
+            let payment = wallet.send(&hub, &payee, amount).await?;
+            write_payment(&payment, out.as_deref())?;
+        }
+        Command::Receive { payment, trust } => {
+            let text = read(&payment)?;
+            let payment: Payment = serde_json::from_str(&text).context("not a payment")?;
+            let amount = match wallet.receive(&payment) {
+                Err(Error::UnknownHub(hub)) if trust => {
+                    wallet.add_hub(&hub).await?;
+                    wallet.receive(&payment)?
+                }
+                Err(e @ Error::UnknownHub(_)) => bail!("{e}, or receive with --trust"),
+                received => received?,
+            };
+            let unlinked = unlink(&wallet).await;
+            show(
+                json,
+                json!({ "amount": amount, "unlinked": unlinked }),
+                format!("received {amount}"),
+            );
+        }
+        Command::Resume => resume(&wallet, json).await?,
+        Command::History => {
+            let sends = wallet.sends()?;
+            let rows = sends.iter().map(|s| {
+                json!({
+                    "id": s.id, "hub": s.hub, "payee": encode(&s.payee), "amount": s.amount,
+                    "fee": s.fee, "state": state(&s.state), "created_at": s.created_at,
+                })
+            });
+            let lines = sends.iter().map(|s| {
+                format!(
+                    "{}  {}  {} + {}  via {}  {}",
+                    s.created_at,
+                    state(&s.state),
+                    s.amount,
+                    s.fee,
+                    s.hub,
+                    s.id
+                )
+            });
+            show(json, rows.collect(), lines.collect::<Vec<_>>().join("\n"));
+        }
+        Command::Payment { id, out } => write_payment(&wallet.payment(&id)?, out.as_deref())?,
+        Command::Abandon { id } => {
+            wallet.abandon(&id)?;
+            show(
+                json,
+                json!({ "abandoned": id }),
+                "abandoned; its notes are free".into(),
+            );
+        }
+        Command::Unlink => {
+            let unlinked = wallet.unlink().await?;
+            show(
+                json,
+                json!({ "unlinked": unlinked }),
+                format!("unlinked {unlinked} notes"),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn init(path: &Path, transport: Http, json: bool) -> anyhow::Result<()> {
+    if let Some(dir) = path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+        let mut create = std::fs::DirBuilder::new();
+        create.recursive(true);
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut create, 0o700);
+        create
+            .create(dir)
+            .with_context(|| format!("creating {}", dir.display()))?;
+    }
+    let mut seed = [0; 32];
+    OsRng.fill_bytes(&mut seed);
+    let wallet = Wallet::create(path, &seed, transport)?;
+    let address = encode(&wallet.address());
+    show(
+        json,
+        json!({ "wallet": path, "address": address }),
+        format!(
+            "created {}\naddress {address}\nBack up this file: the seed alone does not restore its notes.",
+            path.display()
+        ),
+    );
+    Ok(())
+}
+
+async fn resume(wallet: &Wallet<Http>, json: bool) -> anyhow::Result<()> {
+    let resumed = wallet.resume().await?;
+    let unlinked = unlink(wallet).await;
+    let mut lines = Vec::new();
+    for (id, _) in &resumed.paid {
+        lines.push(format!(
+            "done {id}: `licash-wallet payment {id}` prints its payment"
+        ));
+    }
+    for (id, problem) in &resumed.abandoned {
+        lines.push(format!("abandoned {id}: {problem}"));
+    }
+    for (id, reason) in &resumed.pending {
+        lines.push(format!("pending {id}: {reason}"));
+    }
+    let paid = resumed
+        .paid
+        .iter()
+        .map(|(id, payment)| json!({ "id": id, "payment": payment }));
+    let abandoned = resumed
+        .abandoned
+        .iter()
+        .map(|(id, p)| json!({ "id": id, "problem": p }));
+    let pending = resumed
+        .pending
+        .iter()
+        .map(|(id, r)| json!({ "id": id, "reason": r }));
+    show(
+        json,
+        json!({
+            "paid": paid.collect::<Vec<_>>(),
+            "abandoned": abandoned.collect::<Vec<_>>(),
+            "pending": pending.collect::<Vec<_>>(),
+            "unlinked": unlinked,
+        }),
+        lines.join("\n"),
+    );
+    match resumed.pending.into_iter().next() {
+        Some((id, reason)) => Err(Error::Pending { id, reason }.into()),
+        None => Ok(()),
+    }
+}
+
+/// Unlink what can be: a failure leaves notes linked until the next try.
+async fn unlink(wallet: &Wallet<Http>) -> Option<usize> {
+    match wallet.unlink().await {
+        Ok(unlinked) => Some(unlinked),
+        Err(e) => {
+            eprintln!("warning: some notes stay linked for now ({e}); resume unlinks them");
+            None
+        }
+    }
+}
+
+/// The hub holding the most.
+fn richest(wallet: &Wallet<Http>) -> anyhow::Result<String> {
+    let balance = wallet.balance()?;
+    let richest = balance.into_iter().max_by_key(|b| b.available);
+    Ok(richest
+        .context("no hub: `licash-wallet add-hub URL` trusts one")?
+        .hub)
+}
+
+fn state(state: &State) -> String {
+    match state {
+        State::Offered => "offered".into(),
+        State::Signed => "signed".into(),
+        State::Done => "done".into(),
+        State::Abandoned(reason) => format!("abandoned ({reason})"),
+    }
+}
+
+fn show(json: bool, value: serde_json::Value, text: String) {
+    if json {
+        println!("{value}");
+    } else if !text.is_empty() {
+        println!("{text}");
+    }
+}
+
+fn write_payment(payment: &Payment, out: Option<&Path>) -> anyhow::Result<()> {
+    let text = serde_json::to_string(payment)?;
+    match out {
+        Some(out) => std::fs::write(out, text + "\n")
+            .with_context(|| format!("writing {}", out.display()))?,
+        None => writeln!(std::io::stdout(), "{text}")?,
+    }
+    Ok(())
+}
+
+fn read(path: &Path) -> anyhow::Result<String> {
+    let mut text = String::new();
+    if path == Path::new("-") {
+        std::io::stdin().read_to_string(&mut text)?;
+    } else {
+        text =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    }
+    Ok(text)
+}
+
+fn encode(address: &Address) -> String {
+    hex::encode(address.to_bytes())
+}
+
+fn decode(address: &str) -> anyhow::Result<Address> {
+    let bytes = hex::decode(address.trim()).context("an address is hex")?;
+    Address::from_bytes(&bytes).context("not an address")
+}
+
+fn default_path() -> anyhow::Result<PathBuf> {
+    let data = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .filter(|dir| dir.is_absolute())
+        .or_else(|| std::env::var_os("HOME").map(|home| Path::new(&home).join(".local/share")))
+        .context("no wallet file: give --wallet")?;
+    Ok(data.join("licash").join("wallet.sqlite"))
+}

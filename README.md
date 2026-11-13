@@ -24,7 +24,8 @@ research implementation; it has not had a security review.
 - `regtest/`: the contract's BABE transaction graph and end-to-end tests on
   Bitcoin Core and LND. See [regtest/README.md](regtest/README.md).
 - `apps/`: the applications, a workspace of their own: the hub service
-  (`apps/hub`) and operator notifications (`apps/notify`).
+  (`apps/hub`), operator notifications (`apps/notify`) and the wallet CLI
+  (`apps/wallet-cli`).
 - `paper/`: the paper's source; `paper/build.sh` rebuilds the PDF (Docker).
 
 ## Quick start

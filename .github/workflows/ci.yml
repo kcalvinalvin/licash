@@ -35,6 +35,8 @@ jobs:
         run: cargo test --locked --workspace
       - name: Hub image
         run: docker build -f apps/hub/Dockerfile .
+      - name: Wallet image
+        run: docker build -f apps/wallet-cli/Dockerfile .
   regtest:
     runs-on: ubuntu-latest
     timeout-minutes: 45

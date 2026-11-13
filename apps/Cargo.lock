@@ -1097,6 +1097,45 @@ dependencies = [
 ]
 
 [[package]]
+name = "licash-wallet"
+version = "0.0.1"
+dependencies = [
+ "hex",
+ "licash",
+ "licash-api",
+ "rand_core",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tracing",
+]
+
+[[package]]
+name = "licash-wallet-cli"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "axum",
+ "clap",
+ "hex",
+ "licash",
+ "licash-api",
+ "licash-hub",
+ "licash-hub-service",
+ "licash-wallet",
+ "rand_core",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
