@@ -72,6 +72,12 @@ impl Request {
         self.blinded
     }
 
+    /// The unlink commitment of the request's capability: an issuer can
+    /// match it to the output before it tells the requester anything.
+    pub fn unlink_commitment(&self) -> [u8; 32] {
+        unlink_commitment_of(&self.capability)
+    }
+
     /// `LICASH-UL\x02 ‖ keyset ‖ denomination ‖ B ‖ capability ‖ e`.
     pub fn to_bytes(&self) -> [u8; REQUEST_BYTES] {
         let mut bytes = [0; REQUEST_BYTES];

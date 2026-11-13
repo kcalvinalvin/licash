@@ -205,6 +205,12 @@ fn answers_need_the_outputs_capability_and_issuance() {
     ] {
         assert!(nonce.clone().answer(&issuer.keys, &request).is_err());
     }
+    let commitment = *Output::from_derivation(&d).unwrap().unlink_commitment();
+    assert_eq!(session.request().unlink_commitment(), commitment);
+    assert_ne!(
+        changed(CAPABILITY_AT, &capability).unlink_commitment(),
+        commitment
+    );
     // Another issuance's nonce, and another issuer's keys.
     let (_, other) = issuer.issue(&received(&owner(2), 4));
     assert!(other.answer(&issuer.keys, session.request()).is_err());
