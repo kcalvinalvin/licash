@@ -103,6 +103,18 @@ async fn used(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     let silent = code.silent.context("a silent payment address")?;
     let licash = code.licash.clone().context("a Licash code")?;
     ensure!(licash.mailbox.is_some(), "no mailbox in {code}");
+    // The same silent payment address shown on its own, for wallets that
+    // pay such addresses only: in upper case, as a QR code holds it best.
+    phone.tap("Receive").await?;
+    phone.tap("Show silent payment address").await?;
+    phone.wait("Show payment code", 10).await?;
+    let shown = phone.qr(30).await?;
+    ensure!(
+        shown == silent.to_string().to_uppercase(),
+        "{shown} shown for {silent}"
+    );
+    phone.back().await?;
+    phone.wait("Send", 30).await?;
 
     // Paid at the fallback address: shown on its way, then found in a
     // block and moved into Licash, the next address shown from then on.

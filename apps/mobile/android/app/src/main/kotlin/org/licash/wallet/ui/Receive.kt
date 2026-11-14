@@ -11,6 +11,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -34,6 +35,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.testTagsAsResourceId
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
@@ -54,6 +56,10 @@ fun Receive(engine: Engine, back: () -> Unit) {
     var error by remember { mutableStateOf<String?>(null) }
     var asking by remember { mutableStateOf(false) }
     var received by remember { mutableStateOf<String?>(null) }
+    // Its silent payment address on its own rather than the code, for
+    // wallets that pay such addresses only.
+    var plain by rememberSaveable { mutableStateOf(false) }
+    val silent = code?.silent?.takeIf { plain }
     // Made again once paid: a fallback address paid gives way to the next.
     LaunchedEffect(amount, received) {
         engine.code(amount?.toULong())
@@ -81,33 +87,53 @@ fun Receive(engine: Engine, back: () -> Unit) {
                 )
                 Spacer(Modifier.height(16.dp))
             }
-            code?.let { QrCode(it.qr) }
+            // In upper case, which a QR code holds in fewer modules.
+            code?.let { QrCode(silent?.uppercase() ?: it.qr) }
             error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
             Spacer(Modifier.height(16.dp))
-            Text(
-                amount?.let { "Asking for ${sat(it.toULong())}" } ?: "Any amount",
-                style = MaterialTheme.typography.titleMedium,
-            )
-            Text(
-                "Anyone can pay this, with Licash or on Bitcoin.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                textAlign = TextAlign.Center,
-            )
-            // For exchanges and the like, which take a plain address only.
-            code?.address?.let { address ->
-                TextButton(onClick = {
-                    val clip = ClipData.newPlainText("Bitcoin address", address)
-                    scope.launch { clipboard.setClipEntry(ClipEntry(clip)) }
-                }) { Text("Copy Bitcoin address") }
+            if (silent != null) {
+                Text("Silent payment address", style = MaterialTheme.typography.titleMedium)
+                SelectionContainer {
+                    Text(
+                        silent,
+                        Modifier.testTag("silent"),
+                        style = MaterialTheme.typography.bodySmall,
+                        fontFamily = FontFamily.Monospace,
+                        textAlign = TextAlign.Center,
+                    )
+                }
+                Text(
+                    "Wallets that pay silent payment addresses can pay this on Bitcoin, " +
+                        "the same every time. It asks for no amount.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    textAlign = TextAlign.Center,
+                )
+            } else {
+                Text(
+                    amount?.let { "Asking for ${sat(it.toULong())}" } ?: "Any amount",
+                    style = MaterialTheme.typography.titleMedium,
+                )
+                Text(
+                    "Anyone can pay this, with Licash or on Bitcoin.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    textAlign = TextAlign.Center,
+                )
+                // For exchanges and the like, which take a plain address only.
+                code?.address?.let { address ->
+                    TextButton(onClick = {
+                        val clip = ClipData.newPlainText("Bitcoin address", address)
+                        scope.launch { clipboard.setClipEntry(ClipEntry(clip)) }
+                    }) { Text("Copy Bitcoin address") }
+                }
             }
             // For wallets that pay silent payment addresses: the same one
             // every time, found paid through a hub's tweaks.
-            code?.silent?.let { silent ->
-                TextButton(onClick = {
-                    val clip = ClipData.newPlainText("Silent payment address", silent)
-                    scope.launch { clipboard.setClipEntry(ClipEntry(clip)) }
-                }) { Text("Copy silent payment address") }
+            if (code?.silent != null) {
+                TextButton(onClick = { plain = !plain }) {
+                    Text(if (plain) "Show payment code" else "Show silent payment address")
+                }
             }
         }
         Row(Modifier.padding(bottom = 24.dp), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -117,7 +143,10 @@ fun Receive(engine: Engine, back: () -> Unit) {
             OutlinedButton(
                 onClick = {
                     code?.let {
-                        val clip = ClipData.newPlainText("Licash code", it.text)
+                        val clip = when (silent) {
+                            null -> ClipData.newPlainText("Licash code", it.text)
+                            else -> ClipData.newPlainText("Silent payment address", silent)
+                        }
                         scope.launch { clipboard.setClipEntry(ClipEntry(clip)) }
                     }
                 },
@@ -125,14 +154,17 @@ fun Receive(engine: Engine, back: () -> Unit) {
             ) { Text("Copy") }
             BigButton("Share", Modifier.weight(1f)) {
                 code?.let {
-                    val send = Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, it.text)
+                    val text = silent ?: it.text
+                    val send = Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, text)
                     context.startActivity(Intent.createChooser(send, null))
                 }
             }
         }
     }
     if (asking) {
-        AmountDialog(amount, onDone = { amount = it; asking = false }, onCancel = { asking = false })
+        // An amount is asked for in the code: shown again, as the address
+        // holds none.
+        AmountDialog(amount, onDone = { amount = it; asking = false; plain = false }, onCancel = { asking = false })
     }
 }
 
