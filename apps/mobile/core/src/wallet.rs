@@ -16,7 +16,8 @@ use crate::{
     chain::Chain,
     deliveries::{self, Delivery},
     Activity, Balance, ChainError, ChainSource, Code, Details, Holding, Hub, InvoiceQuote, Kind,
-    LicashError, Network, Notes, Onchain, Paid, Range, Scan, Scanned, State,
+    LicashError, LightningInvoice, LightningTerms, Network, Notes, Onchain, Paid, Range, Rate,
+    Scan, Scanned, State,
 };
 
 /// The rate deposits are paid at, in sat/vB: above what nodes relay.
@@ -316,6 +317,43 @@ impl Wallet {
         Ok(lightning_activity(&lock, &invoice.request))
     }
 
+    /// Ask the hub trusted taking `amount` over Lightning for least for an
+    /// invoice paying the wallet `amount` in notes, its fee on top for the
+    /// payer. Followed by [`Wallet::follow_invoice`] while shown, and by
+    /// [`Wallet::resume`]: its notes are taken once it is paid.
+    pub fn ask_invoice(&self, amount: u64) -> Result<LightningInvoice, LicashError> {
+        let (mut best, mut any): (Option<(u64, String)>, bool) = (None, false);
+        for (url, info) in self.wallet.hubs()? {
+            let Some(lightning) = &info.lightning else {
+                continue;
+            };
+            any = true;
+            if !(lightning.min_receive..=lightning.max_receive).contains(&amount) {
+                continue;
+            }
+            let fee = lightning.receive.due(amount);
+            if best.as_ref().is_none_or(|(least, _)| fee < *least) {
+                best = Some((fee, url));
+            }
+        }
+        let (_, url) = best.ok_or_else(|| {
+            LicashError::invalid(match any {
+                true => format!("no hub you trust takes {amount} sat over Lightning"),
+                false => "no hub you trust takes payments over Lightning".into(),
+            })
+        })?;
+        let asked = self.runtime.block_on(self.wallet.invoice(&url, amount));
+        self.invoice_now(asked)
+    }
+
+    /// Take on the invoice of `hash`, as [`Wallet::ask_invoice`] asked for
+    /// it: have its hub make it, and take its notes once it is paid. Where
+    /// it stands.
+    pub fn follow_invoice(&self, hash: String) -> Result<LightningInvoice, LicashError> {
+        let followed = self.runtime.block_on(self.wallet.follow_invoice(&hash));
+        self.invoice_now(followed)
+    }
+
     /// What the wallet holds at each hub it trusts.
     pub fn holdings(&self) -> Result<Vec<Holding>, LicashError> {
         let balance = self.wallet.balance()?.into_iter();
@@ -475,11 +513,18 @@ impl Wallet {
             });
         }
         let deposits = self.wallet.deposits()?;
-        // A move's notes are received under its lock: shown as the move.
-        let moved: Vec<&String> = deposits.iter().filter_map(|d| d.lock.as_ref()).collect();
+        let invoices = self.wallet.invoices()?;
+        // A move's notes, and an invoice's, are received under its lock:
+        // shown as the move or the invoice.
+        let locks = deposits.iter().filter_map(|d| d.lock.as_ref());
+        let locks = locks.chain(invoices.iter().filter_map(|i| i.lock.as_ref()));
+        let locks: Vec<&String> = locks.collect();
         let receipts = self.wallet.receipts()?.into_iter();
-        let receipts = receipts.filter(|r| !moved.contains(&&r.id));
+        let receipts = receipts.filter(|r| !locks.contains(&&r.id));
         history.extend(receipts.map(|r| received_activity(&r)));
+        // An invoice is a payment once paid: its hub locked notes to it.
+        let paid = invoices.iter().filter(|i| i.lock.is_some());
+        history.extend(paid.map(invoice_activity));
         // A move its hub never answered moved nothing.
         let answered = deposits
             .iter()
@@ -543,6 +588,16 @@ impl Wallet {
             Kind::Moved => {
                 let deposit = self.wallet.deposits()?.into_iter().find(|d| d.hash == id);
                 self.moved_details(deposit.ok_or_else(unknown)?)
+            }
+            Kind::Invoice => {
+                let invoice = self.wallet.invoices()?.into_iter().find(|i| i.hash == id);
+                let invoice = lightning_invoice(&invoice.ok_or_else(unknown)?, None);
+                Ok(Details::Invoice {
+                    hub: invoice.hub,
+                    invoice: invoice.request,
+                    asks: invoice.asks,
+                    failure: invoice.reason,
+                })
             }
             Kind::Onchain => {
                 let outpoint: OutPoint = id.parse().map_err(|_| unknown())?;
@@ -695,6 +750,25 @@ impl Wallet {
 }
 
 impl Wallet {
+    /// Where an invoice taken on stands: as kept, with why, while its hub
+    /// is yet to answer, which it is asked again until it does.
+    fn invoice_now(
+        &self,
+        followed: Result<licash_wallet::Invoice, licash_wallet::Error>,
+    ) -> Result<LightningInvoice, LicashError> {
+        match followed {
+            Ok(invoice) => Ok(lightning_invoice(&invoice, None)),
+            Err(licash_wallet::Error::Pending { id, reason }) => {
+                let mut invoices = self.wallet.invoices()?.into_iter();
+                match invoices.find(|i| i.hash == id) {
+                    Some(invoice) => Ok(lightning_invoice(&invoice, Some(reason))),
+                    None => Err(LicashError::Pending { reason }),
+                }
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// A move's terms, and its payment: the wallet's own transaction paying
     /// its address, unless its hub saw another pay it.
     fn moved_details(&self, deposit: licash_wallet::Deposit) -> Result<Details, LicashError> {
@@ -957,6 +1031,24 @@ fn hub(url: &str, info: &licash_api::Info) -> Hub {
         silent: info.tweaks.is_some(),
         mailbox: !info.relays.is_empty(),
         lightning_pay: info.lightning.as_ref().map(|l| l.max_pay),
+        lock_fee: rate(info.fees.lock),
+        refund_fee: rate(info.fees.refund),
+        deposit_fee: info.deposits.as_ref().map(|d| rate(d.fee)),
+        lightning: info.lightning.as_ref().map(|l| LightningTerms {
+            pay: rate(l.pay),
+            receive: rate(l.receive),
+            receive_range: Range {
+                min: l.min_receive,
+                max: l.max_receive,
+            },
+        }),
+    }
+}
+
+fn rate(fee: licash_api::Fee) -> Rate {
+    Rate {
+        base: fee.base,
+        ppm: fee.ppm,
     }
 }
 
@@ -1002,6 +1094,46 @@ fn lightning_activity(lock: &licash_wallet::Lock, invoice: &str) -> Activity {
         fee,
         detail,
         at: Some(lock.created_at),
+    }
+}
+
+/// An invoice the wallet asked for, as it stands; `waiting`, why its hub
+/// is yet to answer, if it is.
+fn lightning_invoice(
+    invoice: &licash_wallet::Invoice,
+    waiting: Option<String>,
+) -> LightningInvoice {
+    use licash_wallet::InvoiceState;
+    let (state, reason) = match &invoice.state {
+        InvoiceState::Received => (State::Done, None),
+        InvoiceState::Canceled(why) => (State::Failed, Some(why.clone())),
+        _ => (State::Pending, waiting),
+    };
+    let request = invoice.request.clone();
+    let asks = request.as_deref().map(licash_wallet::Payable::read);
+    LightningInvoice {
+        hash: invoice.hash.clone(),
+        hub: invoice.hub.clone(),
+        amount: invoice.amount,
+        asks: asks.and_then(Result::ok).map(|p| p.amount),
+        request,
+        state,
+        reason,
+    }
+}
+
+/// The line of the history of an invoice paid to the wallet: its notes,
+/// when they came, and no fee, which the payer pays.
+fn invoice_activity(invoice: &licash_wallet::Invoice) -> Activity {
+    let shown = lightning_invoice(invoice, None);
+    Activity {
+        id: shown.hash,
+        kind: Kind::Invoice,
+        state: shown.state,
+        amount: shown.amount,
+        fee: 0,
+        detail: shown.reason.unwrap_or(shown.hub),
+        at: Some(invoice.received_at.unwrap_or(invoice.created_at)),
     }
 }
 

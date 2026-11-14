@@ -43,6 +43,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.launch
 import org.licash.core.Hub
+import org.licash.core.Rate
 import org.licash.wallet.AppLog
 import org.licash.wallet.BuildConfig
 import org.licash.wallet.Engine
@@ -119,15 +120,17 @@ private fun Note(text: String, error: Boolean = false) {
     )
 }
 
+/** A hub trusted, and what it does; tapped, what it charges for each. */
 @Composable
 private fun HubRow(hub: Hub) {
+    var open by remember { mutableStateOf(false) }
     val can = buildList {
         add(fee(hub))
         hub.deposits?.let { add("takes Bitcoin from ${sat(it.min)}") }
         if (hub.silent) add("finds Bitcoin payments")
         if (hub.mailbox) add("mailbox")
     }
-    Column(Modifier.fillMaxWidth().padding(vertical = 12.dp)) {
+    Column(Modifier.fillMaxWidth().clickable { open = !open }.padding(vertical = 12.dp)) {
         Text(hub.url, style = MaterialTheme.typography.bodyLarge, maxLines = 1)
         Spacer(Modifier.height(2.dp))
         Text(
@@ -135,7 +138,44 @@ private fun HubRow(hub: Hub) {
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
+        if (open) Fees(hub)
     }
+}
+
+/** What the hub charges, for each thing it does. */
+@Composable
+private fun Fees(hub: Hub) {
+    Column(Modifier.padding(top = 8.dp)) {
+        Text("Fees", style = MaterialTheme.typography.titleSmall)
+        FeeLine("Paying in Licash", Rate(hub.feeBase, hub.feePpm), "of each payment")
+        hub.lightning?.let {
+            FeeLine("Paying over Lightning", it.pay, "on top of the invoice, routing included")
+            val range = "${sat(it.receiveRange.min)} to ${sat(it.receiveRange.max)}"
+            FeeLine("Receiving over Lightning", it.receive, "on top, paid by the payer; $range")
+        }
+        hub.depositFee?.let { FeeLine("Moving Bitcoin into Licash", it, "of what is moved") }
+        FeeLine("Holding a payment for a condition", hub.lockFee, "as paying an invoice does")
+        FeeLine("Refunding a payment held", hub.refundFee, "if it is not paid")
+    }
+}
+
+@Composable
+private fun FeeLine(what: String, rate: Rate, how: String) {
+    Row(Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
+        Column(Modifier.weight(1f)) {
+            Text(what, style = MaterialTheme.typography.bodyMedium)
+            Text(how, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        Spacer(Modifier.width(12.dp))
+        Text(rate(rate), style = MaterialTheme.typography.bodyMedium)
+    }
+}
+
+private fun rate(rate: Rate): String = when {
+    rate.base == 0uL && rate.ppm == 0uL -> "None"
+    rate.ppm == 0uL -> sat(rate.base)
+    rate.base == 0uL -> "${rate.ppm} ppm"
+    else -> "${sat(rate.base)} + ${rate.ppm} ppm"
 }
 
 private fun fee(hub: Hub): String = when {

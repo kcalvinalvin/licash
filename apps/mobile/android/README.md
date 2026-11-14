@@ -27,8 +27,11 @@ each denomination, and every detail of a payment.
 The app needs a hub taking deposits on the same network: `licash-hub run
 --network signet --chain URL --deposit-sweep-address ADDRESS`, with
 `--nostr-relay` (or `--mailbox-relay`) for payments between wallets through
-their mailboxes, and `--tweaks` for silent payments: the app's code holds a
-silent payment address only if a hub it uses serves tweaks. Silent payments
+their mailboxes, `--tweaks` for silent payments: the app's code holds a
+silent payment address only if a hub it uses serves tweaks, and `--lnd URL
+--lnd-macaroon FILE` for Lightning: the app pays invoices through the hub,
+and Receive over Lightning shows an invoice the hub makes, whose notes the
+app takes once paid. Tapping a hub in Settings lists its fees. Silent payments
 before the first block the hub indexed are not found; payments to the
 fallback address are, from the day before the wallet was made.
 

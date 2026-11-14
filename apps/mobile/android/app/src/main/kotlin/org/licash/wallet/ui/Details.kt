@@ -114,6 +114,7 @@ private fun title(activity: Activity, coming: Boolean): String = when {
         Kind.MOVED -> "From Bitcoin"
         Kind.ONCHAIN -> "On Bitcoin"
         Kind.LIGHTNING -> "Paid over Lightning"
+        Kind.INVOICE -> "Received over Lightning"
     }
 }
 
@@ -129,6 +130,10 @@ private fun status(activity: Activity, coming: Boolean, details: Details?): Stri
         is Details.Coin -> when {
             details.moving != null -> "Moving into Licash"
             else -> "On Bitcoin, moved into Licash once enough"
+        }
+        is Details.Invoice -> when (activity.state) {
+            State.DONE -> "In your Licash"
+            else -> "Paid: taking its notes from the hub"
         }
         else -> when {
             activity.state == State.PENDING -> "Under way"
@@ -173,6 +178,14 @@ private fun Summary(activity: Activity, details: Details?, tx: Onchain?) {
                 Line(if (activity.state == State.FAILED) "Refund fee" else "Fees", sat(activity.fee))
                 if (activity.state != State.FAILED) Line("Total", sat(activity.amount + activity.fee))
                 Line("Paid", "Over Lightning, through ${host(details.hub)}")
+            }
+            is Details.Invoice -> {
+                Line("Into Licash", sat(activity.amount))
+                details.asks?.let {
+                    if (it >= activity.amount) Line("Hub fee, the payer's", sat(it - activity.amount))
+                    Line("Paid by the payer", sat(it))
+                }
+                Line("Arrived", "Over Lightning, into Licash at ${host(details.hub)}")
             }
             else -> if (activity.kind == Kind.SENT) {
                 Line("Paid", sat(activity.amount))
@@ -242,6 +255,12 @@ private fun Technical(activity: Activity, details: Details?, copy: (String, Stri
                 Fact("Hub", details.hub, copy)
                 Fact("Invoice", details.invoice, copy)
                 details.preimage?.let { Fact("Preimage", it, copy) }
+                details.failure?.let { Fact("Failure", it, copy) }
+            }
+            is Details.Invoice -> {
+                Fact("Payment hash", activity.id, copy)
+                Fact("Hub", details.hub, copy)
+                details.invoice?.let { Fact("Invoice", it, copy) }
                 details.failure?.let { Fact("Failure", it, copy) }
             }
             null -> Fact("Id", activity.id, copy)

@@ -7,7 +7,7 @@
 use std::{path::PathBuf, time::Duration};
 
 use anyhow::{ensure, Context};
-use licash_e2e::{phone::Phone, until, Eco};
+use licash_e2e::{phone::Phone, until, Eco, OUTSIDE};
 use licash_nostr::{wallet, Route};
 use licash_wallet::PaymentCode;
 use serde_json::json;
@@ -75,6 +75,43 @@ async fn changed(phone: &Phone, from: u64, secs: u64) -> anyhow::Result<u64> {
         Ok((now != from).then_some(now))
     })
     .await
+}
+
+/// Paid over Lightning: an invoice its hub makes for an amount it enters,
+/// shown as a QR code, which a node outside pays. Its notes are taken while
+/// shown, and the payment is in the history.
+async fn lightning(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
+    let before = phone.balance().await?;
+    phone.tap("Receive").await?;
+    phone.tap("Receive over Lightning").await?;
+    phone.tap_id("amount").await?;
+    phone.type_text("4000").await?;
+    phone.tap("Done").await?;
+    phone
+        .wait("Asking for 4\u{2009}000 sat over Lightning", 10)
+        .await?;
+    // In upper case, as a QR code holds it best.
+    let shown = phone.qr(60).await?;
+    let request = shown.to_lowercase();
+    ensure!(
+        request.starts_with("lnbcrt"),
+        "{shown} shown for an invoice"
+    );
+    let paying = eco.pay(OUTSIDE, &request);
+    phone.wait("Received 4\u{2009}000 sat", 120).await?;
+    ensure!(paying.await??, "the node outside did not pay {request}");
+    phone.tap("Back").await?;
+    phone.wait("Send", 30).await?;
+    let now = changed(phone, before, 30).await?;
+    ensure!(
+        now == before + 4_000,
+        "{now} held after 4000 over Lightning"
+    );
+    phone.tap("Received over Lightning").await?;
+    phone.wait("In your Licash", 10).await?;
+    phone.back().await?;
+    phone.wait("Send", 30).await?;
+    Ok(())
 }
 
 /// Collect Bob's mailbox, for up to `secs`, until it holds payments: their
@@ -185,6 +222,7 @@ async fn used(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     ensure!(now == after + 3_000, "{now} held after 3000 received");
     phone.wait("Received", 10).await?;
 
+    lightning(eco, phone).await?;
     refused(eco, phone, &bobs).await?;
     hub_down(eco, phone, &bob, &bobs).await?;
 

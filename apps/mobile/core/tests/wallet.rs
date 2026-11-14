@@ -38,7 +38,7 @@ use licash_hub_service::{
 };
 use licash_mobile::{
     set_logger, wallet_exists, Activity, Balance, ChainError, ChainSource, Details, Kind,
-    LicashError, Logger, Network, Onchain, Range, Scanned, State, Wallet,
+    LicashError, Logger, Network, Onchain, Range, Rate, Scanned, State, Wallet,
 };
 use licash_wallet::PaymentCode;
 use nostr_sdk::prelude::MockRelay;
@@ -55,7 +55,8 @@ const TIMING: Timing = Timing {
     max_lag: 120,
 };
 
-/// A hub charging 1 on a payment, taking deposits of 1000 to 4000 for 100
+/// A hub charging 1 on a payment, taking deposits of 1000 to 4000 for 100,
+/// paying invoices for 2 and being paid up to 10 000 over Lightning for 3,
 /// and indexing tweaks from block 3, over a mock Esplora; mailbox relays
 /// if asked.
 struct Net {
@@ -126,6 +127,8 @@ impl Net {
             pay: Fee { base: 2, ppm: 0 },
             max_pay: 5_000,
             pay_slack: 4,
+            receive: Fee { base: 3, ppm: 0 },
+            max_receive: 10_000,
             ..lightning::Config::default()
         };
         let path = dir.path().join("lightning.sqlite");
@@ -941,6 +944,86 @@ fn a_phone_pays_a_lightning_invoice_through_its_hub_and_shows_what_it_cost() {
         alice.invoice_quote(more),
         Err(LicashError::Insufficient { .. })
     ));
+}
+
+#[test]
+fn a_phone_paid_over_lightning_takes_the_notes_and_shows_the_invoice() {
+    let net = Net::new(false);
+    let alice = net.wallet("alice", net.height());
+    let hub = alice.hubs().unwrap().remove(0);
+    let terms = hub.lightning.unwrap();
+    let wanted = (
+        Rate { base: 3, ppm: 0 },
+        Range {
+            min: 1,
+            max: 10_000,
+        },
+    );
+    assert_eq!((terms.receive, terms.receive_range), wanted);
+    assert_eq!(terms.pay, Rate { base: 2, ppm: 0 });
+    let fees = (hub.lock_fee, hub.refund_fee, hub.deposit_fee);
+    let one = Rate { base: 1, ppm: 0 };
+    assert_eq!(fees, (one, one, Some(Rate { base: 100, ppm: 0 })));
+    // More than its hub takes over Lightning: said before asking.
+    let refused = invalid(alice.ask_invoice(10_001));
+    assert!(
+        refused.contains("takes 10001 sat over Lightning"),
+        "{refused}"
+    );
+
+    let asked = alice.ask_invoice(500).unwrap();
+    let shown = (asked.hub.as_str(), asked.amount, asked.asks, asked.state);
+    assert_eq!(shown, (hub.url.as_str(), 500, Some(503), State::Pending));
+    let request = asked.request.clone().unwrap();
+    // Waiting for its payer: no payment yet, in the history none.
+    let waiting = alice.follow_invoice(asked.hash.clone()).unwrap();
+    assert_eq!((waiting.state, waiting.reason), (State::Pending, None));
+    assert!(alice.history().unwrap().is_empty());
+    // Another node pays it, its HTLCs lasting the invoice's final delta.
+    let hash = held(&asked.hash);
+    let cltv = net.node.held_cltv(hash).unwrap() as u32;
+    net.node.pay_held(hash, net.height() + cltv);
+    net.runtime.block_on(net.lightning.round());
+    let paid = alice.follow_invoice(asked.hash.clone()).unwrap();
+    assert_eq!((paid.state, paid.reason), (State::Done, None));
+    assert_eq!(notes(&alice), 500);
+
+    // Shown as the invoice alone, not also as the notes it locked.
+    let history = alice.history().unwrap();
+    assert_eq!(history.len(), 1, "{history:?}");
+    let line = &history[0];
+    let shown = (line.kind, line.state, line.amount, line.fee);
+    assert_eq!(shown, (Kind::Invoice, State::Done, 500, 0));
+    assert_eq!(
+        (line.id.as_str(), line.detail.as_str()),
+        (asked.hash.as_str(), hub.url.as_str())
+    );
+    let details = alice.details(Kind::Invoice, asked.hash.clone()).unwrap();
+    let wanted = Details::Invoice {
+        hub: hub.url.clone(),
+        invoice: Some(request),
+        asks: Some(503),
+        failure: None,
+    };
+    assert_eq!(details, wanted);
+
+    // One whose payment its hub refuses, its HTLCs expiring too soon:
+    // canceled unpaid, and in the history no more.
+    let refused = alice.ask_invoice(20).unwrap();
+    net.node.pay_held(held(&refused.hash), net.height() + 1);
+    net.runtime.block_on(net.lightning.round());
+    let canceled = alice.follow_invoice(refused.hash.clone()).unwrap();
+    assert_eq!(canceled.state, State::Failed);
+    assert!(canceled.reason.is_some(), "{canceled:?}");
+    assert_eq!(alice.history().unwrap().len(), 1);
+    assert_eq!(notes(&alice), 500);
+}
+
+/// The payment hash `hash` of an invoice, in hex, as the node holds it.
+fn held(hash: &str) -> [u8; 32] {
+    let mut bytes = [0; 32];
+    hex::decode_to_slice(hash, &mut bytes).unwrap();
+    bytes
 }
 
 fn funded(net: &Net, light: &Arc<Light>, name: &str) -> Arc<Wallet> {

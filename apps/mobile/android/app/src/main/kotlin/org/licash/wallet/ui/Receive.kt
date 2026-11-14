@@ -21,6 +21,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -38,14 +39,24 @@ import androidx.compose.ui.semantics.testTagsAsResourceId
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import org.licash.core.Code
+import org.licash.core.LightningInvoice
+import org.licash.core.State
 import org.licash.wallet.Engine
 import org.licash.wallet.explain
 import org.licash.wallet.sat
 
-/** The wallet's code, to be paid at in Licash or on Bitcoin alike. */
+/** How often an invoice shown is followed, in ms. */
+private const val FOLLOW_MS = 3_000L
+
+/**
+ * The wallet's code, to be paid at in Licash or on Bitcoin alike; or a
+ * Lightning invoice, from a hub taking payments over Lightning.
+ */
 @Composable
 fun Receive(engine: Engine, back: () -> Unit) {
     val context = LocalContext.current
@@ -60,11 +71,50 @@ fun Receive(engine: Engine, back: () -> Unit) {
     // wallets that pay such addresses only.
     var plain by rememberSaveable { mutableStateOf(false) }
     val silent = code?.silent?.takeIf { plain }
+    val ui by engine.ui.collectAsState()
+    // An invoice instead, made by a hub: for an amount, paid once.
+    var lightning by rememberSaveable { mutableStateOf(false) }
+    var invoice by remember { mutableStateOf<LightningInvoice?>(null) }
+    val request = invoice?.request?.takeIf { lightning }
+    val shared = when {
+        lightning -> request?.let { "Lightning invoice" to it }
+        silent != null -> "Silent payment address" to silent
+        else -> code?.let { "Licash code" to it.text }
+    }
     // Made again once paid: a fallback address paid gives way to the next.
     LaunchedEffect(amount, received) {
         engine.code(amount?.toULong())
             .onSuccess { code = it }
             .onFailure { error = explain(it) }
+    }
+    LaunchedEffect(lightning, amount) {
+        invoice = null
+        val asked = amount?.takeIf { lightning } ?: return@LaunchedEffect
+        error = null
+        engine.askInvoice(asked.toULong())
+            .onSuccess { invoice = it }
+            .onFailure { error = explain(it) }
+    }
+    // Followed while shown: its notes taken once it is paid.
+    LaunchedEffect(invoice?.hash) {
+        val hash = invoice?.hash ?: return@LaunchedEffect
+        while (true) {
+            delay(FOLLOW_MS)
+            val followed = engine.followInvoice(hash).getOrNull() ?: continue
+            invoice = followed
+            when (followed.state) {
+                State.DONE -> {
+                    received = "Received ${sat(followed.amount)}"
+                    amount = null
+                    return@LaunchedEffect
+                }
+                State.FAILED -> {
+                    error = "Not paid: ${followed.reason ?: "canceled"}"
+                    return@LaunchedEffect
+                }
+                State.PENDING -> {}
+            }
+        }
     }
     DisposableEffect(Unit) {
         engine.eager = true
@@ -88,10 +138,15 @@ fun Receive(engine: Engine, back: () -> Unit) {
                 Spacer(Modifier.height(16.dp))
             }
             // In upper case, which a QR code holds in fewer modules.
-            code?.let { QrCode(silent?.uppercase() ?: it.qr) }
+            when {
+                lightning -> request?.let { QrCode(it.uppercase()) }
+                else -> code?.let { QrCode(silent?.uppercase() ?: it.qr) }
+            }
             error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
             Spacer(Modifier.height(16.dp))
-            if (silent != null) {
+            if (lightning) {
+                LightningInvoiceText(amount, invoice, request)
+            } else if (silent != null) {
                 Text("Silent payment address", style = MaterialTheme.typography.titleMedium)
                 SelectionContainer {
                     Text(
@@ -130,10 +185,19 @@ fun Receive(engine: Engine, back: () -> Unit) {
             }
             // For wallets that pay silent payment addresses: the same one
             // every time, found paid through a hub's tweaks.
-            if (code?.silent != null) {
+            if (!lightning && code?.silent != null) {
                 TextButton(onClick = { plain = !plain }) {
                     Text(if (plain) "Show payment code" else "Show silent payment address")
                 }
+            }
+            if (ui.hubs.any { it.lightning != null }) {
+                TextButton(onClick = {
+                    lightning = !lightning
+                    plain = false
+                    error = null
+                    // An invoice asks for an amount.
+                    if (lightning && amount == null) asking = true
+                }) { Text(if (lightning) "Show payment code" else "Receive over Lightning") }
             }
         }
         Row(Modifier.padding(bottom = 24.dp), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -142,19 +206,15 @@ fun Receive(engine: Engine, back: () -> Unit) {
             }
             OutlinedButton(
                 onClick = {
-                    code?.let {
-                        val clip = when (silent) {
-                            null -> ClipData.newPlainText("Licash code", it.text)
-                            else -> ClipData.newPlainText("Silent payment address", silent)
-                        }
+                    shared?.let { (label, text) ->
+                        val clip = ClipData.newPlainText(label, text)
                         scope.launch { clipboard.setClipEntry(ClipEntry(clip)) }
                     }
                 },
                 modifier = Modifier.weight(1f).height(56.dp),
             ) { Text("Copy") }
             BigButton("Share", Modifier.weight(1f)) {
-                code?.let {
-                    val text = silent ?: it.text
+                shared?.let { (_, text) ->
                     val send = Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, text)
                     context.startActivity(Intent.createChooser(send, null))
                 }
@@ -165,6 +225,39 @@ fun Receive(engine: Engine, back: () -> Unit) {
         // An amount is asked for in the code: shown again, as the address
         // holds none.
         AmountDialog(amount, onDone = { amount = it; asking = false; plain = false }, onCancel = { asking = false })
+    }
+}
+
+/** What a Lightning invoice shown asks, or why there is none yet. */
+@Composable
+private fun LightningInvoiceText(amount: Long?, invoice: LightningInvoice?, request: String?) {
+    Text(
+        amount?.let { "Asking for ${sat(it.toULong())} over Lightning" } ?: "Choose an amount",
+        style = MaterialTheme.typography.titleMedium,
+    )
+    val asks = invoice?.asks?.let { " The payer pays ${sat(it)}, the hub's fee included." } ?: ""
+    Text(
+        when {
+            amount == null -> "A Lightning invoice asks for an amount."
+            request != null -> "Any Lightning wallet can pay this, once.$asks"
+            invoice?.reason != null -> "Waiting for the hub: ${invoice.reason}"
+            else -> "Asking the hub for an invoice"
+        },
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        textAlign = TextAlign.Center,
+    )
+    // Its start, to tell it by: Copy and Share give all of it.
+    request?.let {
+        Text(
+            it,
+            Modifier.testTag("invoice"),
+            style = MaterialTheme.typography.bodySmall,
+            fontFamily = FontFamily.Monospace,
+            textAlign = TextAlign.Center,
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis,
+        )
     }
 }
 

@@ -139,6 +139,32 @@ pub struct Hub {
     /// The most a Lightning invoice it pays may ask, in sat, if it pays
     /// them.
     pub lightning_pay: Option<u64>,
+    /// Its fees on a lock, which holds notes until a condition is met (as
+    /// paying a Lightning invoice does), and on refunding one.
+    pub lock_fee: Rate,
+    pub refund_fee: Rate,
+    /// On top of the notes moving Bitcoin into them makes, if it does.
+    pub deposit_fee: Option<Rate>,
+    /// Paying and being paid over Lightning, if it does.
+    pub lightning: Option<LightningTerms>,
+}
+
+/// A fee, in sat: `base` plus `ppm` millionths of what it is on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct Rate {
+    pub base: u64,
+    pub ppm: u64,
+}
+
+/// What a hub charges over Lightning, and what it takes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct LightningTerms {
+    /// On top of an invoice it pays, routing included.
+    pub pay: Rate,
+    /// On top of what an invoice it makes pays the wallet: the payer's.
+    pub receive: Rate,
+    /// What an invoice it makes may pay the wallet: at least and at most.
+    pub receive_range: Range,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Record)]
@@ -218,6 +244,25 @@ pub enum Scanned {
     },
 }
 
+/// A Lightning invoice the wallet asked a hub for, to be paid with
+/// ([`Wallet::ask_invoice`]), and where it stands.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct LightningInvoice {
+    /// Its payment hash, in hex: to follow it by.
+    pub hash: String,
+    pub hub: String,
+    /// What it pays the wallet, in notes.
+    pub amount: u64,
+    /// The BOLT11 invoice to hand the payer, once its hub made it, and
+    /// what it asks of them: `amount` and the hub's fee.
+    pub request: Option<String>,
+    pub asks: Option<u64>,
+    /// Done once its notes are taken.
+    pub state: State,
+    /// Why it was canceled, or why it waits on its hub, if it does.
+    pub reason: Option<String>,
+}
+
 /// A payment made.
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct Paid {
@@ -257,6 +302,8 @@ pub enum Kind {
     Onchain,
     /// A Lightning invoice paid through a hub.
     Lightning,
+    /// Paid over Lightning: an invoice the wallet asked a hub for.
+    Invoice,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
@@ -296,6 +343,15 @@ pub enum Details {
         hub: String,
         invoice: String,
         preimage: Option<String>,
+        failure: Option<String>,
+    },
+    /// Paid over Lightning, through `hub`: its `invoice`, once the hub
+    /// made it, and what it `asks` of the payer, the hub's fee on top; why
+    /// it was canceled, if it was.
+    Invoice {
+        hub: String,
+        invoice: Option<String>,
+        asks: Option<u64>,
         failure: Option<String>,
     },
     /// A coin on Bitcoin, output `vout` of `tx`: `change` of the wallet's

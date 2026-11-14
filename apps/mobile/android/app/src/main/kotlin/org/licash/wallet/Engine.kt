@@ -31,10 +31,12 @@ import org.licash.core.Hub
 import org.licash.core.InvoiceQuote
 import org.licash.core.Kind
 import org.licash.core.LicashException
+import org.licash.core.LightningInvoice
 import org.licash.core.Network
 import org.licash.core.Notes
 import org.licash.core.Paid
 import org.licash.core.Scanned
+import org.licash.core.State
 import org.licash.core.Wallet
 import org.licash.core.chainName
 import org.licash.core.explorer
@@ -399,6 +401,20 @@ class Engine(context: Context) {
         refresh()
         poke()
         paid
+    }
+
+    /** Ask the hub taking it for least for a Lightning invoice paying `amount` in notes. */
+    suspend fun askInvoice(amount: ULong): Result<LightningInvoice> = io {
+        val asked = locked { it.askInvoice(amount) }
+        refresh()
+        asked
+    }
+
+    /** Where the invoice of `hash` stands: its notes taken once it is paid. */
+    suspend fun followInvoice(hash: String): Result<LightningInvoice> = io {
+        val followed = locked { it.followInvoice(hash) }
+        if (followed.state != State.PENDING) refresh()
+        followed
     }
 
     /** What the wallet holds at each hub it trusts. */
