@@ -388,3 +388,85 @@ fn owners_pay_invoices_and_get_paid_over_lightning() {
         "at most 100 sat",
     );
 }
+
+#[test]
+fn hubs_announced_on_nostr_are_discovered_where_they_answer_as_the_announcer() {
+    use licash_nostr::{Announcement, Announcer, Role};
+    use nostr_sdk::prelude::MockRelay;
+
+    let hub = Server::start(FEE);
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let relay = runtime.block_on(MockRelay::run()).unwrap();
+    let relays = [runtime.block_on(relay.url()).to_string()];
+    let announce = |secret: [u8; 32], urls: &[&str], network: &str| {
+        let announcement = Announcement {
+            urls: urls.iter().map(|u| u.to_string()).collect(),
+            network: network.into(),
+            name: Some(format!("hub {}", secret[0])),
+        };
+        runtime.block_on(async {
+            let announcer = Announcer::new(&secret, Role::Hub, &relays).await.unwrap();
+            announcer.announce(&announcement).await.unwrap();
+        });
+    };
+    announce(
+        hub.hub.nostr_secret(),
+        &["http://127.0.0.1:1", &hub.url()],
+        "regtest",
+    );
+    // Another key announcing the hub's URL, a hub down, and one of
+    // another network.
+    announce([3; 32], &[&hub.url()], "regtest");
+    announce([4; 32], &["http://127.0.0.1:1"], "regtest");
+    announce([5; 32], &[&hub.url()], "bitcoin");
+
+    let dir = tempfile::tempdir().unwrap();
+    let nowhere = dir.path().join("none.sqlite");
+    let args = ["discover", "--relay", &relays[0], "--network", "regtest"];
+    let found = json(&nowhere, &args);
+    assert_eq!(found.as_array().unwrap().len(), 1, "{found}");
+    let named = hub.hub.advertise().unwrap().nostr.unwrap();
+    assert_eq!(found[0]["key"], named);
+    assert_eq!(found[0]["urls"], serde_json::json!([hub.url()]));
+    assert_eq!(
+        found[0]["name"],
+        format!("hub {}", hub.hub.nostr_secret()[0])
+    );
+    assert_eq!(found[0]["fees"]["spend"]["base"], 1);
+    assert!(!nowhere.exists());
+    let text = ok(wallet(&nowhere, &args, None));
+    assert!(
+        text.starts_with(&format!("{}  1 + 0 ppm  hub ", hub.url())),
+        "{text}"
+    );
+
+    // Then trusted like any other.
+    let (alice, _) = party(dir.path(), "alice", None);
+    ok(wallet(
+        &alice,
+        &["add-hub", found[0]["urls"][0].as_str().unwrap()],
+        None,
+    ));
+    assert_eq!(json(&alice, &["hubs"])[0]["url"], hub.url());
+
+    failed(
+        wallet(&nowhere, &["discover", "--relay", "ws://127.0.0.1:1"], None),
+        1,
+        "no Nostr relay answered",
+    );
+    failed(
+        wallet(
+            &nowhere,
+            &[
+                "--proxy",
+                "http://127.0.0.1:1",
+                "discover",
+                "--relay",
+                &relays[0],
+            ],
+            None,
+        ),
+        1,
+        "socks5h://",
+    );
+}

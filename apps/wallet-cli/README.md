@@ -26,4 +26,7 @@ Through a hub with a Lightning gateway, `pay-invoice <bolt11>` pays an
 invoice with a lock refunded if the payment fails, and `invoice <amount>`
 prints an invoice paying the wallet; `resume` takes the payment once made.
 
+`discover --relay wss://relay.example` lists the hubs announced on Nostr,
+at the URLs that answer as the hub that announced them.
+
 Onion hubs need a SOCKS proxy for now: `--proxy socks5h://127.0.0.1:9050`.

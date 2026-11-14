@@ -6,12 +6,14 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
     process::ExitCode,
+    sync::Arc,
 };
 
 use anyhow::{bail, Context};
 use clap::{Parser, Subcommand, ValueEnum};
 use licash::{address::Address, spend::lock_hash};
 use licash_api::Payment;
+use licash_nostr::Role;
 use licash_wallet::{Error, Invoice, InvoiceState, Lock, LockState, State, Wallet};
 use rand_core::{OsRng, RngCore};
 use serde_json::json;
@@ -157,6 +159,24 @@ enum Command {
     },
     /// The Lightning invoices asked for, newest first.
     Invoices,
+    /// Hubs announced on Nostr relays, at the URLs that answer as the hub
+    /// that announced them. Needs no wallet.
+    Discover {
+        /// A relay to ask, such as `wss://relay.example`. Repeat it, or
+        /// separate relays with commas, for more.
+        #[arg(
+            long = "relay",
+            value_name = "URL",
+            env = "LICASH_WALLET_RELAYS",
+            value_delimiter = ',',
+            required = true
+        )]
+        relays: Vec<String>,
+        /// The Bitcoin network of the hubs: bitcoin, testnet4, signet or
+        /// regtest.
+        #[arg(long, default_value = "bitcoin")]
+        network: String,
+    },
 }
 
 fn main() -> ExitCode {
@@ -199,8 +219,12 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     };
     let transport = Http::new(cli.proxy.as_deref())?;
     let json = cli.json;
-    if let Command::Init = cli.command {
-        return init(&path, transport, json);
+    match cli.command {
+        Command::Init => return init(&path, transport, json),
+        Command::Discover { relays, network } => {
+            return discover(transport, cli.proxy.as_deref(), &relays, &network, json).await
+        }
+        _ => {}
     }
     if !path.exists() {
         bail!(
@@ -210,7 +234,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     }
     let wallet = Wallet::open(&path, transport)?;
     match cli.command {
-        Command::Init => unreachable!("handled above"),
+        Command::Init | Command::Discover { .. } => unreachable!("handled above"),
         Command::Address => {
             let address = encode(&wallet.address());
             show(json, json!({ "address": address }), address.clone());
@@ -484,6 +508,107 @@ async fn pay_invoice(
             failure.map(|f| format!(" ({f})")).unwrap_or_default()
         ),
     }
+}
+
+/// Print the hubs announced on `relays` for `network`, each at the URLs
+/// whose info names the key that announced it.
+async fn discover(
+    http: Http,
+    proxy: Option<&str>,
+    relays: &[String],
+    network: &str,
+    json: bool,
+) -> anyhow::Result<()> {
+    let socks = proxy.map(socks_address).transpose()?;
+    let found = licash_nostr::discover(relays, socks, Role::Hub, network).await?;
+    let http = Arc::new(http);
+    let mut checks = tokio::task::JoinSet::new();
+    for (i, hub) in found.iter().enumerate() {
+        for url in &hub.announcement.urls {
+            if is_onion(url) && proxy.is_none() {
+                tracing::warn!(%url, "skipped: an onion service needs --proxy");
+                continue;
+            }
+            let (http, url) = (http.clone(), url.clone());
+            checks.spawn(async move {
+                let info = tokio::time::timeout(CHECK_TIMEOUT, info_at(&http, &url)).await;
+                let info = info.unwrap_or_else(|_| Err("no answer in time".into()));
+                (i, url, info)
+            });
+        }
+    }
+    let mut answered: Vec<Vec<(String, licash_api::Info)>> = vec![Vec::new(); found.len()];
+    while let Some(checked) = checks.join_next().await {
+        let (i, url, info) = checked?;
+        match info {
+            Ok(info) if found[i].named_by(info.nostr.as_deref()) => answered[i].push((url, info)),
+            Ok(_) => tracing::warn!(%url, "skipped: not the hub that announced it"),
+            Err(e) => tracing::warn!(%url, "skipped: {e}"),
+        }
+    }
+    let mut rows = Vec::new();
+    let mut lines = Vec::new();
+    for (hub, mut at) in found.iter().zip(answered) {
+        if at.is_empty() {
+            continue;
+        }
+        // In the order announced.
+        let urls = &hub.announcement.urls;
+        at.sort_by_key(|(url, _)| urls.iter().position(|u| u == url));
+        let info = &at[0].1;
+        let urls: Vec<&str> = at.iter().map(|(url, _)| url.as_str()).collect();
+        let name = hub.announcement.name.as_deref().unwrap_or_default();
+        let fee = info.fees.spend;
+        let lightning = if info.lightning.is_some() {
+            "  lightning"
+        } else {
+            ""
+        };
+        lines.push(format!(
+            "{}  {} + {} ppm{lightning}  {name}",
+            urls.join(" "),
+            fee.base,
+            fee.ppm
+        ));
+        rows.push(json!({
+            "key": hub.key, "name": hub.announcement.name, "urls": urls, "fees": info.fees,
+            "locks": info.locks.is_some(), "lightning": info.lightning,
+        }));
+    }
+    show(json, rows.into(), lines.join("\n"));
+    Ok(())
+}
+
+/// How long a hub announced has to answer.
+const CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// What the hub at `url` says of itself.
+async fn info_at(http: &Http, url: &str) -> Result<licash_api::Info, String> {
+    let at = format!("{}{}", url.trim_end_matches('/'), licash_api::INFO);
+    let response = licash_wallet::Transport::request(http, &at, None).await?;
+    if response.status != 200 {
+        return Err(format!("status {}", response.status));
+    }
+    serde_json::from_slice(&response.body).map_err(|e| format!("not a hub's info: {e}"))
+}
+
+fn is_onion(url: &str) -> bool {
+    let host = url.split("://").nth(1).unwrap_or(url);
+    let host = host.split(['/', ':']).next().unwrap_or(host);
+    host.ends_with(".onion")
+}
+
+/// The address of a `socks5[h]://host:port` proxy, which Nostr relays are
+/// reached through.
+fn socks_address(proxy: &str) -> anyhow::Result<std::net::SocketAddr> {
+    let at = proxy
+        .strip_prefix("socks5h://")
+        .or_else(|| proxy.strip_prefix("socks5://"))
+        .context("Nostr relays are reached through a socks5h:// proxy only")?;
+    std::net::ToSocketAddrs::to_socket_addrs(at.trim_end_matches('/'))
+        .with_context(|| format!("the proxy {at}"))?
+        .next()
+        .with_context(|| format!("the proxy {at}: no address"))
 }
 
 fn init(path: &Path, transport: Http, json: bool) -> anyhow::Result<()> {
