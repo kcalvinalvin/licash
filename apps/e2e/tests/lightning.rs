@@ -2,7 +2,7 @@
 //! on the stack of `apps/e2e/run.sh`, which runs these.
 
 use licash_api::ReceiveState;
-use licash_e2e::{until, Eco, Wallet, OUTSIDE};
+use licash_e2e::{received, until, Eco, Wallet, OUTSIDE};
 use licash_wallet::{InvoiceState, Lock, LockState};
 
 fn available(wallet: &Wallet) -> u64 {
@@ -24,30 +24,6 @@ async fn settled(wallet: &Wallet, lock: &Lock) -> anyhow::Result<Lock> {
     .await
 }
 
-/// Follow the invoice of `hash` until it is received or canceled.
-async fn received(wallet: &Wallet, hash: &str) -> anyhow::Result<InvoiceState> {
-    until(&format!("invoice {hash}"), 180, || async {
-        Ok(match wallet.follow_invoice(hash).await {
-            Ok(invoice) if invoice.state != InvoiceState::Open => Some(invoice.state),
-            Ok(_) | Err(licash_wallet::Error::Pending { .. }) => None,
-            Err(e) => return Err(e.into()),
-        })
-    })
-    .await
-}
-
-/// `wallet`, paid `amount` from outside through `hub`.
-async fn fund(eco: &Eco, wallet: &Wallet, hub: &str, amount: u64) -> anyhow::Result<()> {
-    let invoice = wallet.invoice(hub, amount).await?;
-    let paying = eco.pay(OUTSIDE, invoice.request.as_deref().unwrap());
-    assert_eq!(
-        received(wallet, &invoice.hash).await?,
-        InvoiceState::Received
-    );
-    assert!(paying.await??, "the outside node's payment succeeded");
-    Ok(())
-}
-
 #[tokio::test]
 #[ignore = "needs the stack of apps/e2e/run.sh"]
 async fn wallets_pay_and_get_paid_over_lightning_across_hubs() -> anyhow::Result<()> {
@@ -57,7 +33,7 @@ async fn wallets_pay_and_get_paid_over_lightning_across_hubs() -> anyhow::Result
     let bob = eco.wallet("bob")?;
 
     // Alice is paid from outside.
-    fund(&eco, &alice, hub1, 50_000).await?;
+    eco.pay_in(&alice, hub1, 50_000).await?;
     assert_eq!(available(&alice), 50_000);
 
     // She pays an outside invoice: its preimage settles her lock.
@@ -147,7 +123,7 @@ async fn hubs_restarted_mid_payment_finish_it() -> anyhow::Result<()> {
     let eco = Eco::up().await?;
     let (hub1, hub2) = (eco.hub(1), eco.hub(2));
     let dave = eco.wallet("dave")?;
-    fund(&eco, &dave, hub1, 30_000).await?;
+    eco.pay_in(&dave, hub1, 30_000).await?;
 
     // Paying out: the outside node holds the payment while hub1 restarts.
     let (request, hash, preimage) = eco.hold_invoice(OUTSIDE, 10_000).await?;

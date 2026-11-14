@@ -1,7 +1,8 @@
 //! The regtest ecosystem of `docker-compose.yml`, for the end-to-end tests:
 //! Bitcoin Core, two hubs with Lightning gateways over their LND nodes, an
-//! outside LND node, and wallets in temporary files. `run.sh` brings the
-//! stack up; [`Eco::up`] funds its nodes and opens their channels once.
+//! outside LND node, a swap provider, and wallets in temporary files.
+//! `run.sh` brings the stack up; [`Eco::up`] funds its nodes and opens their
+//! channels once.
 
 use std::{
     future::Future,
@@ -11,7 +12,8 @@ use std::{
 
 use anyhow::{bail, ensure, Context};
 use licash::spend::lock_hash;
-use licash_api::{Info, ReceiveStatus};
+use licash_api::{swaps, Info, ReceiveStatus};
+use licash_wallet::InvoiceState;
 use rand_core::{OsRng, RngCore};
 use serde_json::{json, Value};
 use tokio::process::Command;
@@ -37,6 +39,8 @@ pub struct Eco {
     hubs: Vec<String>,
     /// The Nostr relay's URL, as published on this host.
     relay: String,
+    /// The swap provider's URL, as published on this host.
+    swaps: String,
     dir: tempfile::TempDir,
 }
 
@@ -74,10 +78,12 @@ impl Eco {
             http: reqwest::Client::new(),
             hubs: Vec::new(),
             relay: String::new(),
+            swaps: String::new(),
             dir: tempfile::tempdir()?,
         };
         eco.core = format!("http://{}", eco.port("bitcoind", 18443).await?);
         eco.relay = format!("ws://{}", eco.port("relay", 8080).await?);
+        eco.swaps = format!("http://{}", eco.port("swaps", 8340).await?);
         for hub in ["hub1", "hub2"] {
             let at = eco.port(hub, 8338).await?;
             eco.hubs.push(format!("http://{at}"));
@@ -118,6 +124,13 @@ impl Eco {
         Ok(published.trim().to_owned())
     }
 
+    /// `args` run in `service`, and what they print.
+    pub async fn exec(&self, service: &str, args: &[&str]) -> anyhow::Result<Vec<u8>> {
+        let mut all = vec!["exec", "-T", service];
+        all.extend(args);
+        self.compose(&all).await
+    }
+
     /// Restart `service`, and wait for it to be healthy.
     pub async fn restart(&self, service: &str) -> anyhow::Result<()> {
         self.compose(&["restart", service]).await?;
@@ -147,6 +160,16 @@ impl Eco {
         let url = format!("{hub}{}", licash_api::INFO);
         let response = self.http.get(url).send().await?.error_for_status()?;
         Ok(response.json().await?)
+    }
+
+    /// `wallet`, paid `amount` from outside through the gateway of `hub`.
+    pub async fn pay_in(&self, wallet: &Wallet, hub: &str, amount: u64) -> anyhow::Result<()> {
+        let invoice = wallet.invoice(hub, amount).await?;
+        let paying = self.pay(OUTSIDE, invoice.request.as_deref().context("a request")?);
+        let state = received(wallet, &invoice.hash).await?;
+        ensure!(state == InvoiceState::Received, "the invoice was {state:?}");
+        ensure!(paying.await??, "the outside node's payment failed");
+        Ok(())
     }
 
     /// Where the gateway of `hub` stands on the payment to a wallet of
@@ -215,6 +238,85 @@ impl Eco {
             })
             .await?;
         }
+        Ok(())
+    }
+}
+
+/// Follow the invoice of `hash` until it is received or canceled.
+pub async fn received(wallet: &Wallet, hash: &str) -> anyhow::Result<InvoiceState> {
+    until(&format!("invoice {hash}"), 180, || async {
+        Ok(match wallet.follow_invoice(hash).await {
+            Ok(invoice) if invoice.state != InvoiceState::Open => Some(invoice.state),
+            Ok(_) | Err(licash_wallet::Error::Pending { .. }) => None,
+            Err(e) => return Err(e.into()),
+        })
+    })
+    .await
+}
+
+/// The swap provider.
+impl Eco {
+    /// The provider's URL, as published on this host.
+    pub fn swaps(&self) -> &str {
+        &self.swaps
+    }
+
+    pub async fn swaps_info(&self) -> anyhow::Result<swaps::Info> {
+        let url = format!("{}{}", self.swaps, swaps::SWAPS_INFO);
+        let response = self.http.get(url).send().await?.error_for_status()?;
+        Ok(response.json().await?)
+    }
+
+    /// Ask the provider for the swap `request` asks for.
+    pub async fn ask_swap(&self, request: &swaps::Request) -> anyhow::Result<swaps::Swap> {
+        let url = format!("{}{}", self.swaps, swaps::SWAPS);
+        let response = self.http.post(url).json(request).send().await?;
+        let status = response.status();
+        let body = response.text().await?;
+        ensure!(status.is_success(), "swap refused, {status}: {body}");
+        Ok(serde_json::from_str(&body)?)
+    }
+
+    /// Where the swap of the client's lock `id`, in hex, stands.
+    pub async fn swap_state(&self, id: &str) -> anyhow::Result<swaps::Swap> {
+        let id = licash_api::lock_id(id).map_err(|p| anyhow::anyhow!(p.message))?;
+        let url = format!("{}{}", self.swaps, swaps::swap_state(&id));
+        let response = self.http.get(url).send().await?.error_for_status()?;
+        Ok(response.json().await?)
+    }
+
+    /// The most the provider locks at hub 2 now.
+    pub async fn stocked(&self) -> anyhow::Result<u64> {
+        let at = self.info(self.hub(2)).await?.address;
+        let info = self.swaps_info().await?;
+        Ok(info.hub(&at).map_or(0, |hub| hub.max))
+    }
+
+    /// The provider able to lock `amount` at hub 2, paid in from outside
+    /// through hub 2's gateway if it is not yet.
+    pub async fn stock(&self, amount: u64) -> anyhow::Result<()> {
+        if self.stocked().await? >= amount {
+            return Ok(());
+        }
+        // Its fee on the lock to come, generously.
+        let asked = (amount + amount / 100 + 100).to_string();
+        let args = [
+            "licash-wallet",
+            "--json",
+            "invoice",
+            &asked,
+            "--hub",
+            "http://hub2:8338",
+        ];
+        let invoice: Value = serde_json::from_slice(&self.exec("swaps", &args).await?)?;
+        let request = invoice["request"].as_str().context("an invoice")?;
+        let paying = self.pay(OUTSIDE, request);
+        // The provider takes it, as it takes its wallet's payments on.
+        until("the provider stocked", 180, || async {
+            Ok((self.stocked().await? >= amount).then_some(()))
+        })
+        .await?;
+        ensure!(paying.await??, "the outside node's payment failed");
         Ok(())
     }
 }
