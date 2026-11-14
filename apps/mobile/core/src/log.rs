@@ -7,7 +7,7 @@ use tracing_subscriber::EnvFilter;
 /// Where the app keeps the wallet's log: on Android, logcat.
 #[uniffi::export(with_foreign)]
 pub trait Logger: Send + Sync {
-    /// One event, formatted, at `level` (`ERROR` to `TRACE`).
+    /// One event at `level` (`ERROR` to `TRACE`), formatted after it.
     fn log(&self, level: String, line: String);
 }
 
@@ -46,7 +46,34 @@ impl Drop for Line {
         if line.is_empty() {
             return;
         }
-        let level = line.split_whitespace().next().unwrap_or("INFO");
-        self.0.log(level.to_owned(), line.to_owned());
+        let (level, line) = line.split_once(' ').unwrap_or(("INFO", line));
+        self.0.log(level.to_owned(), line.trim_start().to_owned());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{io::Write, sync::Mutex};
+
+    use super::*;
+
+    #[derive(Default)]
+    struct Kept(Mutex<Vec<(String, String)>>);
+
+    impl Logger for Kept {
+        fn log(&self, level: String, line: String) {
+            self.0.lock().unwrap().push((level, line));
+        }
+    }
+
+    #[test]
+    fn each_event_is_handed_over_once_its_level_apart() {
+        let kept = Arc::new(Kept::default());
+        for written in [" WARN licash: a hub is down\n", "\n"] {
+            let mut line = Line(kept.clone(), Vec::new());
+            line.write_all(written.as_bytes()).unwrap();
+        }
+        let kept = kept.0.lock().unwrap();
+        assert_eq!(*kept, [("WARN".into(), "licash: a hub is down".into())]);
     }
 }
