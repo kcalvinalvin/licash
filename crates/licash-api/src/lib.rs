@@ -13,6 +13,12 @@
 //! | `GET /v1/lock/{id}` |            | [`LockState`] |
 //! | `POST /v1/settle`  | [`Settle`]  | [`Issued`]   |
 //! | `POST /v1/refund`  | [`Refund`]  | [`Issued`]   |
+//! | `POST /v1/ln/pay`  | [`Pay`]     | [`Paying`]   |
+//! | `POST /v1/ln/receive` | [`Receive`] | [`Receiving`] |
+//! | `GET /v1/ln/receive/{hash}` |    | [`ReceiveStatus`] |
+//!
+//! The Lightning paths are served by hubs that advertise
+//! [`Info::lightning`].
 //!
 //! Anything else is a [`Problem`], with the HTTP status of its [`Code`].
 //!
@@ -25,7 +31,7 @@ use licash::{
     crypto::Point,
     note::{Keyset, MintResponse, Note},
     source::Certificate,
-    spend::{lock_hash, Proposal, ProposalId},
+    spend::{lock_hash, Output, Proposal, ProposalId},
     unlink::{Answer, Request},
 };
 use serde::{Deserialize, Serialize};
@@ -40,6 +46,21 @@ pub const LOCK: &str = "/v1/lock";
 pub const LOCK_STATE: &str = "/v1/lock/{id}";
 pub const SETTLE: &str = "/v1/settle";
 pub const REFUND: &str = "/v1/refund";
+pub const LN_PAY: &str = "/v1/ln/pay";
+pub const LN_RECEIVE: &str = "/v1/ln/receive";
+/// The path of [`ln_receive_state`], as a route.
+pub const LN_RECEIVE_STATE: &str = "/v1/ln/receive/{hash}";
+
+/// Where a receipt over Lightning of `hash` stands.
+pub fn ln_receive_state(hash: &[u8; 32]) -> String {
+    format!("{LN_RECEIVE}/{}", hex::encode(hash))
+}
+
+/// A hash as [`ln_receive_state`] writes it.
+pub fn hash_of(text: &str) -> Result<[u8; 32], Problem> {
+    let bytes = hex::decode(text).map_err(|e| Problem::invalid(format!("hash: {e}")))?;
+    Hex(bytes).array("hash")
+}
 
 /// The path of lock `id`'s state.
 pub fn lock_state(id: &ProposalId) -> String {
@@ -144,6 +165,9 @@ pub struct Info {
     /// None while the hub follows no chain.
     #[serde(default)]
     pub locks: Option<Locks>,
+    /// None unless the hub runs a Lightning gateway.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lightning: Option<Lightning>,
 }
 
 impl Info {
@@ -153,6 +177,7 @@ impl Info {
             address,
             fees,
             locks,
+            lightning: None,
         }
     }
 
@@ -375,6 +400,178 @@ fn notes(keyset: &Keyset, notes: &[Hex]) -> Result<Vec<Note>, Problem> {
         .iter()
         .map(|n| Note::from_bytes(keyset, &n.0).map_err(Problem::from))
         .collect()
+}
+
+/// A hub's Lightning gateway: what it charges, in satoshis, the smallest
+/// unit, and the amounts it takes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Lightning {
+    /// Its node's public key, in hex.
+    pub node: String,
+    /// On top of an invoice's amount, in whole satoshis rounded up, in a
+    /// lock that pays the hub only: routing fees included.
+    pub pay: Fee,
+    /// On top of the notes a receipt pays, in the invoice's amount.
+    pub receive: Fee,
+    /// A lock paying an invoice expires at least this many blocks plus
+    /// the invoice's final CLTV delta, and 3, above the tip.
+    pub pay_slack: u32,
+    /// The most an invoice paid for a lock may ask.
+    pub max_pay: u64,
+    /// The notes a receipt pays: at least and at most.
+    pub min_receive: u64,
+    pub max_receive: u64,
+}
+
+impl Lightning {
+    /// What a lock paying an invoice of `msat` must pay the hub.
+    pub fn pay_lock(&self, msat: u64) -> u64 {
+        let sat = msat.div_ceil(1000);
+        sat.saturating_add(self.pay.due(sat))
+    }
+}
+
+/// Pay `request`, a BOLT11 invoice, for `lock`, which pays the hub only
+/// on the preimage of the invoice's hash. The same request again answers
+/// where the payment stands.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Pay {
+    pub lock: Hex,
+    pub request: String,
+}
+
+impl Pay {
+    pub fn new(lock: &ProposalId, request: &str) -> Self {
+        Self {
+            lock: Hex(lock.as_bytes().to_vec()),
+            request: request.to_owned(),
+        }
+    }
+
+    pub fn lock(&self) -> Result<ProposalId, Problem> {
+        Ok(ProposalId::from_bytes(self.lock.array("lock")?))
+    }
+}
+
+/// Where a payment for a lock stands. Its lock settles with it: it pays
+/// the hub once paid, and is refunded once failed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Paying {
+    pub state: PayState,
+    /// Once paid: the proof of payment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preimage: Option<Hex>,
+    /// Once failed: why.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PayState {
+    Pending,
+    Paid,
+    Failed,
+}
+
+/// An output of a lock the hub makes of its own notes, as its payee
+/// derived it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LockOutput {
+    pub denomination: u64,
+    pub blinded: Hex,
+    pub commitment: Hex,
+}
+
+/// Ask for an invoice whose payment locks the hub's own notes to
+/// `outputs`, under `keyset`, derived with `ephemeral`, on the preimage of
+/// `hash`. The invoice asks for their value and the hub's receive fee.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Receive {
+    pub keyset: Hex,
+    pub ephemeral: Hex,
+    pub outputs: Vec<LockOutput>,
+    pub hash: Hex,
+}
+
+impl Receive {
+    pub fn new(keyset: &[u8; 32], ephemeral: &Point, outputs: &[Output], hash: &[u8; 32]) -> Self {
+        let outputs = outputs
+            .iter()
+            .map(|o| LockOutput {
+                denomination: o.denomination(),
+                blinded: Hex(o.blinded().0.to_vec()),
+                commitment: Hex(o.unlink_commitment().to_vec()),
+            })
+            .collect();
+        Self {
+            keyset: Hex(keyset.to_vec()),
+            ephemeral: Hex(ephemeral.0.to_vec()),
+            outputs,
+            hash: Hex(hash.to_vec()),
+        }
+    }
+
+    /// The outputs to lock, decoded.
+    pub fn outputs(&self) -> Result<Vec<Output>, Problem> {
+        self.outputs
+            .iter()
+            .map(|o| {
+                let blinded = Point(o.blinded.array("blinded")?);
+                Ok(Output::new(
+                    o.denomination,
+                    blinded,
+                    o.commitment.array("commitment")?,
+                )?)
+            })
+            .collect()
+    }
+
+    /// The keyset, ephemeral key and hash, decoded.
+    pub fn terms(&self) -> Result<([u8; 32], Point, [u8; 32]), Problem> {
+        Ok((
+            self.keyset.array("keyset")?,
+            Point(self.ephemeral.array("ephemeral")?),
+            self.hash.array("hash")?,
+        ))
+    }
+}
+
+/// The invoice to hand the payer.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Receiving {
+    pub request: String,
+}
+
+/// Where a receipt over Lightning stands: once the invoice is paid, its
+/// `lock` of the hub's notes, which the payee claims with the preimage.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReceiveStatus {
+    pub state: ReceiveState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lock: Option<Hex>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReceiveState {
+    /// Not paid yet.
+    Open,
+    /// Paid, and the hub's notes locked to the payee.
+    Locked,
+    /// Claimed: the invoice is settled.
+    Settled,
+    /// Expired or canceled unpaid, or the lock refunded.
+    Canceled,
+}
+
+impl ReceiveStatus {
+    pub fn lock(&self) -> Result<Option<ProposalId>, Problem> {
+        self.lock
+            .as_ref()
+            .map(|l| Ok(ProposalId::from_bytes(l.array("lock")?)))
+            .transpose()
+    }
 }
 
 fn hexes(notes: &[Note]) -> Vec<Hex> {
