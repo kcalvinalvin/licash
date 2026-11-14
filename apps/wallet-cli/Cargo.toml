@@ -15,7 +15,7 @@ licash-api.workspace = true
 licash-wallet.workspace = true
 licash-chain-client.workspace = true
 bitcoin = { version = "=0.32.102", default-features = false, features = ["std"] }
-licash-nostr = { workspace = true, features = ["tor"] }
+licash-nostr = { workspace = true, features = ["tor", "wallet"] }
 licash-tor.workspace = true
 licash-transport = { workspace = true, features = ["tor"] }
 anyhow.workspace = true

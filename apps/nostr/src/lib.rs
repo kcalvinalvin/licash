@@ -12,7 +12,8 @@
 //! there names the key that announced it ([`Found::named_by`]), as a hub
 //! does in its `/v1/info`.
 //!
-//! Wallets are paid at their [`mailbox`] on Nostr too.
+//! Wallets are paid at their [`mailbox`] on Nostr too: with the `wallet`
+//! feature, [`wallet`] pays payment codes and takes what a mailbox holds.
 //!
 //! Relays are reached directly, through a SOCKS5 proxy, or, with the `tor`
 //! feature, through a Tor client of the application's own ([`Route`]).
@@ -20,6 +21,8 @@
 pub mod mailbox;
 #[cfg(feature = "tor")]
 mod tor;
+#[cfg(feature = "wallet")]
+pub mod wallet;
 
 use std::{collections::HashMap, net::SocketAddr, time::Duration};
 

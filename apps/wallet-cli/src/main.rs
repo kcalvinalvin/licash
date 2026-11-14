@@ -980,60 +980,19 @@ async fn pay(
     json: bool,
 ) -> anyhow::Result<()> {
     let code: PaymentCode = text.parse()?;
-    code.check(wallet.network())?;
-    let amount = match (amount, code.amount) {
-        (Some(amount), Some(asked)) if amount != asked => {
-            bail!("the code asks for {asked}, not {amount}")
-        }
-        (Some(amount), _) | (None, Some(amount)) => amount,
-        (None, None) => bail!("how much to pay: the code does not say"),
-    };
-    let hub = match &code.licash {
-        Some(licash) => wallet.hub_to_pay(licash, amount)?,
-        None => None,
-    };
-    let (Some(licash), Some(hub)) = (&code.licash, hub) else {
-        let none = format!("no hub it names is one trusted holding {amount} and the fee");
-        let onchain = match (&code.silent, &code.address) {
-            (Some(silent), _) => Some(silent.to_string()),
-            (None, Some(address)) => Some(address.assume_checked_ref().to_string()),
-            (None, None) => None,
-        };
-        match onchain {
-            Some(to) => bail!("{none}: pay {to} on Bitcoin"),
-            None => bail!("{none}"),
-        }
-    };
-    let paid = wallet.send(&hub, &licash.address, amount).await?;
-    eprintln!("payment {}", paid.id);
-    let relays = wallet
-        .hubs()?
-        .into_iter()
-        .find(|(url, _)| *url == hub)
-        .map(|(_, info)| info.relays)
-        .unwrap_or_default();
-    let sent = match licash.mailbox {
-        Some(to) if !relays.is_empty() => {
-            let content = serde_json::to_string(&paid.payment)?;
-            let sent =
-                async { licash_nostr::mailbox::send(&to, &content, &relays, &route()?).await };
-            match sent.await {
-                Ok(relays) => Some(relays),
-                Err(e) => {
-                    eprintln!("warning: not sent to the payee's mailbox ({e:#}): hand it over");
-                    None
-                }
-            }
-        }
-        _ => None,
-    };
-    match sent {
+    let paid = licash_nostr::wallet::pay(wallet, &code, amount, route).await?;
+    let (id, hub, amount) = (&paid.paid.id, &paid.hub, paid.amount);
+    eprintln!("payment {id}");
+    if let Some(reason) = &paid.undelivered {
+        eprintln!("warning: not sent to the payee's mailbox ({reason}): hand it over");
+    }
+    match paid.delivered {
         Some(relays) => show(
             json,
-            json!({ "id": paid.id, "hub": hub, "amount": amount, "relays": relays }),
+            json!({ "id": id, "hub": hub, "amount": amount, "relays": relays }),
             format!("paid {amount} at {hub}: sent to the payee's mailbox"),
         ),
-        None => write_payment(&paid.payment, out)?,
+        None => write_payment(&paid.paid.payment, out)?,
     }
     Ok(())
 }
@@ -1041,40 +1000,19 @@ async fn pay(
 /// Receive the payments in the wallet's mailbox, on the relays its hubs
 /// name: each once, of hubs it trusts only.
 async fn mailbox(wallet: &Wallet<Http>, route: &Route, json: bool) -> anyhow::Result<()> {
-    let mut relays: Vec<String> = Vec::new();
-    for (_, info) in wallet.hubs()? {
-        for relay in info.relays {
-            if !relays.contains(&relay) {
-                relays.push(relay);
-            }
-        }
+    let collected = licash_nostr::wallet::collect(wallet, route).await?;
+    for (id, reason) in &collected.skipped {
+        eprintln!("warning: {id} in the mailbox {reason}");
     }
-    if relays.is_empty() {
-        bail!("no hub trusted names mailbox relays: `licash-wallet add-hub URL` learns them again");
-    }
-    let mail = licash_nostr::mailbox::fetch(&wallet.mailbox_secret(), &relays, route).await?;
-    let mut received = Vec::new();
-    for mail in mail {
-        let payment: Payment = match serde_json::from_str(&mail.content) {
-            Ok(payment) => payment,
-            Err(_) => {
-                eprintln!("warning: {} in the mailbox is not a payment", mail.id);
-                continue;
-            }
-        };
-        match wallet.receive(&payment) {
-            Ok(payment) => received.push(payment),
-            Err(Error::AlreadyReceived) => {}
-            Err(e) => eprintln!("warning: {} in the mailbox not taken: {e}", mail.id),
-        }
-    }
+    let received = collected.received;
     let unlinked = match received.is_empty() {
         true => Some(0),
         false => unlink(wallet).await,
     };
-    let rows = received
+    let rows: Vec<_> = received
         .iter()
-        .map(|r| json!({ "id": r.id, "hub": r.hub, "amount": r.amount }));
+        .map(|r| json!({ "id": r.id, "hub": r.hub, "amount": r.amount }))
+        .collect();
     let mut lines: Vec<String> = received
         .iter()
         .map(|r| format!("received {} at {}", r.amount, r.hub))
@@ -1082,7 +1020,6 @@ async fn mailbox(wallet: &Wallet<Http>, route: &Route, json: bool) -> anyhow::Re
     if lines.is_empty() {
         lines.push("nothing new".into());
     }
-    let rows: Vec<_> = rows.collect();
     show(
         json,
         json!({ "received": rows, "unlinked": unlinked }),
