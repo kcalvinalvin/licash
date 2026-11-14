@@ -225,6 +225,64 @@ pub enum State {
     Failed,
 }
 
+/// More of one line of the history ([`Wallet::details`]).
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum Details {
+    /// A payment in notes, at `hub`.
+    Notes { hub: String },
+    /// Bitcoin moved to notes: a deposit at `hub`, by its `hash`.
+    Moved {
+        hub: String,
+        hash: String,
+        /// What to pay on Bitcoin, the hub's fee in it, and where, once
+        /// the hub answered.
+        pays: Option<u64>,
+        address: Option<String>,
+        /// The payment, once made or seen.
+        payment: Option<Onchain>,
+        /// The confirmations the hub waits for, as it says now.
+        depth: Option<u32>,
+        /// The block its payment must confirm by, and the one after which
+        /// a payment whose notes were never claimed is the wallet's again.
+        fund_by: Option<u32>,
+        timeout: Option<u32>,
+        /// The transaction taking it back, if one did.
+        refund: Option<String>,
+    },
+    /// A coin on Bitcoin, output `vout` of `tx`: `change` of the wallet's
+    /// own, and `moving`, the transaction spending it, if one is.
+    Coin {
+        tx: Onchain,
+        vout: u32,
+        change: bool,
+        moving: Option<String>,
+    },
+}
+
+/// A transaction on Bitcoin, as far as the wallet looked.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct Onchain {
+    pub txid: String,
+    /// Paid to its miners, if the wallet knows.
+    pub fee: Option<u64>,
+    /// The block it is in, if in one.
+    pub height: Option<u32>,
+    /// How many blocks confirm it: 0 while in none.
+    pub confirmations: u32,
+}
+
+/// The block explorer of `network`, to show a transaction at
+/// `{explorer}/tx/{txid}`: none for regtest.
+#[uniffi::export]
+pub fn explorer(network: Network) -> Option<String> {
+    match network {
+        Network::Bitcoin => Some("https://mempool.space".into()),
+        Network::Signet => Some("https://mempool.space/signet".into()),
+        Network::Mutinynet => Some("https://mutinynet.com".into()),
+        Network::Regtest => None,
+    }
+}
+
 /// How far looking for payments on Bitcoin got.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct Scan {

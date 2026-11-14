@@ -5,7 +5,7 @@ use std::{
     sync::{Arc, Mutex, MutexGuard, PoisonError},
 };
 
-use bitcoin::FeeRate;
+use bitcoin::{FeeRate, OutPoint};
 use licash_nostr::Route;
 use licash_transport::Http;
 use licash_wallet::{DepositState, PaymentCode, MAX_HUBS};
@@ -15,8 +15,8 @@ use serde::{Deserialize, Serialize};
 use crate::{
     chain::Chain,
     deliveries::{self, Delivery},
-    Activity, Balance, ChainError, ChainSource, Code, Hub, Kind, LicashError, Network, Paid, Range,
-    Scan, Scanned, State,
+    Activity, Balance, ChainError, ChainSource, Code, Details, Hub, Kind, LicashError, Network,
+    Onchain, Paid, Range, Scan, Scanned, State,
 };
 
 /// The rate deposits are paid at, in sat/vB: above what nodes relay.
@@ -406,6 +406,47 @@ impl Wallet {
         Ok(history)
     }
 
+    /// More of the line of the history of `kind` and `id`: what it cost
+    /// and where it stands on Bitcoin, as far as the wallet looked. A coin
+    /// the wallet does not hold is one on its way, in no block yet.
+    pub fn details(&self, kind: Kind, id: String) -> Result<Details, LicashError> {
+        let unknown = || LicashError::invalid(format!("nothing in the history is {id}"));
+        match kind {
+            Kind::Sent => {
+                let sent = self.wallet.sends()?.into_iter().find(|s| s.id == id);
+                let hub = sent.ok_or_else(unknown)?.hub;
+                Ok(Details::Notes { hub })
+            }
+            Kind::Received => {
+                let got = self.wallet.receipts()?.into_iter().find(|r| r.id == id);
+                let hub = got.ok_or_else(unknown)?.hub;
+                Ok(Details::Notes { hub })
+            }
+            Kind::Moved => {
+                let deposit = self.wallet.deposits()?.into_iter().find(|d| d.hash == id);
+                self.moved_details(deposit.ok_or_else(unknown)?)
+            }
+            Kind::Onchain => {
+                let outpoint: OutPoint = id.parse().map_err(|_| unknown())?;
+                let mut coins = self.wallet.silent_coins()?.into_iter();
+                let coin = coins.find(|c| c.outpoint == outpoint);
+                let height = coin.as_ref().map(|c| c.height);
+                let tx = Onchain {
+                    txid: outpoint.txid.to_string(),
+                    fee: None,
+                    height,
+                    confirmations: confirmations(height, self.wallet.silent_next()?),
+                };
+                Ok(Details::Coin {
+                    tx,
+                    vout: outpoint.vout,
+                    change: coin.as_ref().is_some_and(|c| c.change),
+                    moving: coin.and_then(|c| c.spending).map(|t| t.to_string()),
+                })
+            }
+        }
+    }
+
     /// Look for payments on Bitcoin in the next blocks of `chain`, and
     /// broadcast again the wallet's spends not in a block yet once caught
     /// up. Called until `next` passes `height`, once a hub is trusted. With
@@ -536,6 +577,63 @@ impl Wallet {
 }
 
 impl Wallet {
+    /// A move's terms, and its payment: the wallet's own transaction paying
+    /// its address, unless its hub saw another pay it.
+    fn moved_details(&self, deposit: licash_wallet::Deposit) -> Result<Details, LicashError> {
+        let next = self.wallet.silent_next()?;
+        let hubs = self.wallet.hubs()?.into_iter();
+        let mut hubs = hubs.filter(|(url, _)| *url == deposit.hub);
+        let depth = hubs.next().and_then(|(_, i)| i.deposits.map(|d| d.depth));
+        let terms = deposit.terms.as_ref();
+        // Checked against the network when the hub answered.
+        let script = terms
+            .and_then(|t| t.address.parse::<bitcoin::Address<_>>().ok())
+            .map(|a| a.assume_checked().script_pubkey());
+        let spends = match &script {
+            Some(script) => self.wallet.silent_spends_paying(script)?,
+            None => Vec::new(),
+        };
+        let funding = deposit.funding;
+        let spend = spends
+            .into_iter()
+            .rev()
+            .find(|s| funding.is_none_or(|(outpoint, _)| outpoint.txid == s.tx.compute_txid()));
+        let payment = match (spend, funding) {
+            (Some(spend), _) => {
+                // Its hub may have seen it confirm before the wallet looked.
+                let height = spend.height.or(funding.map(|(_, height)| height));
+                Some(Onchain {
+                    txid: spend.tx.compute_txid().to_string(),
+                    fee: spend.fee,
+                    height,
+                    confirmations: confirmations(height, next),
+                })
+            }
+            (None, Some((outpoint, height))) => Some(Onchain {
+                txid: outpoint.txid.to_string(),
+                fee: None,
+                height: Some(height),
+                confirmations: confirmations(Some(height), next),
+            }),
+            (None, None) => None,
+        };
+        let refund = match &deposit.state {
+            DepositState::Refunded(txid) => Some(txid.to_string()),
+            _ => None,
+        };
+        Ok(Details::Moved {
+            pays: terms.map(|t| t.pays),
+            address: terms.map(|t| t.address.clone()),
+            fund_by: terms.map(|t| t.fund_by),
+            timeout: terms.map(|t| t.timeout),
+            hub: deposit.hub,
+            hash: deposit.hash,
+            payment,
+            depth,
+            refund,
+        })
+    }
+
     fn delivering(&self) -> MutexGuard<'_, ()> {
         self.delivering
             .lock()
@@ -752,6 +850,16 @@ fn received_activity(received: &licash_wallet::Received) -> Activity {
         fee: 0,
         detail: received.hub.clone(),
         at: Some(received.received_at),
+    }
+}
+
+/// The blocks confirming a transaction in block `height`, the wallet
+/// having looked in those before `next`.
+fn confirmations(height: Option<u32>, next: Option<u32>) -> u32 {
+    match (height, next) {
+        (Some(height), Some(next)) => next.saturating_sub(height).max(1),
+        (Some(_), None) => 1,
+        (None, _) => 0,
     }
 }
 

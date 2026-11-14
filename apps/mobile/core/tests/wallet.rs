@@ -33,8 +33,8 @@ use licash_hub_service::{
     Services,
 };
 use licash_mobile::{
-    set_logger, wallet_exists, Activity, Balance, ChainError, ChainSource, Kind, LicashError,
-    Logger, Network, Range, Scanned, State, Wallet,
+    set_logger, wallet_exists, Activity, Balance, ChainError, ChainSource, Details, Kind,
+    LicashError, Logger, Network, Onchain, Range, Scanned, State, Wallet,
 };
 use licash_wallet::PaymentCode;
 use nostr_sdk::prelude::MockRelay;
@@ -1074,4 +1074,100 @@ fn a_phone_reaches_a_hub_named_by_its_host_alone_over_https() {
     assert!(alice.hubs().unwrap().is_empty());
     alice.add_hub(net.url.clone()).unwrap();
     assert_eq!(alice.hubs().unwrap()[0].url, net.url);
+}
+
+#[test]
+fn a_phone_shows_what_a_move_cost_and_how_deep_its_payment_is() {
+    let net = Net::new(false);
+    let light = Light::new(&net);
+    let alice = net.wallet("alice", net.height());
+    let url = alice.hubs().unwrap()[0].url.clone();
+    let code = alice.payment_code(None).unwrap();
+    net.mine(2, Vec::new());
+    let paying = net.pay_silent(&code.qr, 3_000, 1);
+    net.mine(1, vec![paying.clone()]);
+    let paid_in = net.height();
+    net.mine(1, Vec::new());
+    scan(&alice, &light);
+    let id = OutPoint::new(paying.compute_txid(), 0).to_string();
+    let found = Onchain {
+        txid: paying.compute_txid().to_string(),
+        fee: None,
+        height: Some(paid_in),
+        confirmations: 2,
+    };
+    let coin = Details::Coin {
+        tx: found.clone(),
+        vout: 0,
+        change: false,
+        moving: None,
+    };
+    assert_eq!(alice.details(Kind::Onchain, id.clone()).unwrap(), coin);
+
+    // Moved: the hub's fee and the miners', and its payment in no block.
+    let moving = alice.move_to_licash(light.clone()).unwrap();
+    let sent = net.sent().remove(0);
+    let txid = sent.compute_txid().to_string();
+    let coin = Details::Coin {
+        tx: found,
+        vout: 0,
+        change: false,
+        moving: Some(txid.clone()),
+    };
+    assert_eq!(alice.details(Kind::Onchain, id).unwrap(), coin);
+    let paid = |confirmations, height| Onchain {
+        txid: txid.clone(),
+        fee: Some(3_000 - moving.amount - 100),
+        height,
+        confirmations,
+    };
+    let moved = |payment| match alice.details(Kind::Moved, moving.id.clone()).unwrap() {
+        Details::Moved {
+            hub,
+            hash,
+            pays,
+            address,
+            payment: shown,
+            depth,
+            fund_by,
+            timeout,
+            refund,
+        } => {
+            assert_eq!((hub, hash), (url.clone(), moving.id.clone()));
+            assert_eq!(pays, Some(moving.amount + 100));
+            let address: bitcoin::Address<bitcoin::address::NetworkUnchecked> =
+                address.unwrap().parse().unwrap();
+            let script = address.assume_checked().script_pubkey();
+            assert_eq!(script, sent.output[0].script_pubkey);
+            assert_eq!(depth, Some(2));
+            assert!(fund_by.unwrap() < timeout.unwrap());
+            assert_eq!(refund, None);
+            assert_eq!(shown, Some(payment));
+        }
+        other => panic!("{other:?}"),
+    };
+    moved(paid(0, None));
+
+    // In a block once the phone looked in it, deeper with each block.
+    net.confirm_sent();
+    let confirmed = net.height();
+    moved(paid(0, None));
+    scan(&alice, &light);
+    moved(paid(1, Some(confirmed)));
+    net.mine(1, Vec::new());
+    scan(&alice, &light);
+    moved(paid(2, Some(confirmed)));
+    net.round();
+    alice.resume().unwrap();
+    let history = alice.history().unwrap();
+    assert_eq!(
+        (history[0].kind, history[0].state),
+        (Kind::Moved, State::Done)
+    );
+    moved(paid(2, Some(confirmed)));
+
+    let none = invalid(alice.details(Kind::Moved, "00".repeat(32)));
+    assert!(none.contains("nothing in the history"), "{none}");
+    assert!(invalid(alice.details(Kind::Onchain, "no".into())).contains("nothing"));
+    assert!(invalid(alice.details(Kind::Sent, "no".into())).contains("nothing"));
 }
