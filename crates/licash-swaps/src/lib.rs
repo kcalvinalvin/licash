@@ -630,10 +630,19 @@ impl<T: Transport> Provider<T> {
     async fn lock(&self, id: &[u8; 32]) -> Result<(), Error> {
         let row = self.row(id)?.expect("recorded");
         let address = Address::from_bytes(&row.address).map_err(licash_wallet::Error::from)?;
-        let locked = self
-            .wallet
-            .lock(&row.to, &address, row.amount, row.hash, Some(row.expiry))
-            .await;
+        let mut tries = 0;
+        let locked = loop {
+            let locked = self
+                .wallet
+                .lock(&row.to, &address, row.amount, row.hash, Some(row.expiry))
+                .await;
+            // Another payment of the wallet, such as an unlinking, took a
+            // note it chose: nothing was locked.
+            match locked {
+                Err(licash_wallet::Error::NoteTaken) if tries < 3 => tries += 1,
+                locked => break locked,
+            }
+        };
         match locked {
             Ok(lock) => {
                 let lock_id = lock_id(&lock.id)?;
