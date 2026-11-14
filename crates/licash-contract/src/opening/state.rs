@@ -19,7 +19,8 @@
 //! instances' hashlocks; her Consent and her withheld signatures; the
 //! hub's Signed; F signed whole. A hub's: its secret, quote, the id, her
 //! Open and Base; her Keys; its Commit and its instances' hashlocks; her
-//! choice; her Consent and its Signed; F signed whole.
+//! choice; her Consent; its Signed, F with its own inputs signed in it;
+//! F signed whole.
 
 use anyhow::{bail, ensure, Context as _, Result};
 use k256::Scalar;
@@ -154,9 +155,7 @@ impl Holder {
             }
             Phase::Signing => {
                 self.gate(ctx)?;
-                vec![Out::Sign(
-                    self.signed.as_ref().expect(expect).funding.clone(),
-                )]
+                vec![self.to_sign(&self.signed.as_ref().expect(expect).funding)]
             }
             Phase::Funded => vec![self.funded(self.funding.as_ref().expect(expect))],
         })
@@ -341,18 +340,21 @@ pub enum HubPhase {
     Committed,
     /// Her choice taken, the opened instances and hers sent.
     Chosen,
-    /// Her consent taken, its signatures sent.
+    /// Her consent taken through its gate: its own inputs of F to sign.
+    Consented,
+    /// F with its own inputs signed taken, its signatures sent.
     Signed,
     /// F signed whole taken: its to broadcast.
     Funded,
 }
 
 impl HubPhase {
-    const ALL: [HubPhase; 6] = [
+    const ALL: [HubPhase; 7] = [
         HubPhase::Termed,
         HubPhase::Keyed,
         HubPhase::Committed,
         HubPhase::Chosen,
+        HubPhase::Consented,
         HubPhase::Signed,
         HubPhase::Funded,
     ];
@@ -377,6 +379,7 @@ impl Hub {
         [
             (self.funded.is_some(), HubPhase::Funded),
             (self.signed.is_some(), HubPhase::Signed),
+            (self.consent.is_some(), HubPhase::Consented),
             (self.choice.is_some(), HubPhase::Chosen),
             (self.frozen.is_some(), HubPhase::Committed),
             (self.holder.is_some(), HubPhase::Keyed),
@@ -409,8 +412,9 @@ impl Hub {
                 vec![send(Kind::Commit, self.id(), c.encode())]
             }
             HubPhase::Chosen => self.chosen(),
+            HubPhase::Consented => vec![self.to_sign()],
             HubPhase::Signed => {
-                let (_, signed) = self.signed.as_ref().expect(expect);
+                let signed = self.signed.as_ref().expect(expect);
                 vec![send(Kind::Signed, self.id(), signed.encode())]
             }
             HubPhase::Funded => vec![Out::Broadcast(self.funded.clone().expect(expect))],
@@ -452,8 +456,10 @@ impl Hub {
                 .encode(),
             );
         }
-        if let Some((consent, signed)) = &self.signed {
+        if let Some(consent) = &self.consent {
             w.blob(&consent.encode());
+        }
+        if let Some(signed) = &self.signed {
             w.blob(&signed.encode());
         }
         if let Some(funding) = &self.funded {
@@ -531,21 +537,24 @@ impl Hub {
         if phase >= HubPhase::Chosen {
             h.choice = Some(h.check_choose(choice(r.blob()?)?)?);
         }
-        if phase >= HubPhase::Signed {
+        if phase >= HubPhase::Consented {
             let consent = wire::Consent::decode(r.blob()?)?;
             h.check_consent(&consent)?;
             let (frozen, _, _) = h.frozen.as_ref().expect("F before a consent");
             h.base()
                 .verify_owner_consent(&frozen.prefix, &consent.consent)?;
+            h.consent = Some(consent);
+        }
+        if phase >= HubPhase::Signed {
             let signed = wire::Signed::decode(r.blob()?)?;
-            ensure!(signed.funding == frozen.funding, "F not as frozen");
+            h.check_signing(&signed.funding)?;
             let set = &h.choice.as_ref().expect("a choice before a consent").set;
             check_sigs(set, &h.keys.party.public().payment, &signed.sigs, |_| false)?;
-            h.signed = Some((consent, signed));
+            h.signed = Some(signed);
         }
         if phase >= HubPhase::Funded {
             let funding = r.tx()?;
-            h.check_funded(&funding)?;
+            ensure!(h.whole(&funding)? == funding, "F other than its own whole");
             h.funded = Some(funding);
         }
         ensure!(r.0.is_empty(), "bytes past an opening's state");

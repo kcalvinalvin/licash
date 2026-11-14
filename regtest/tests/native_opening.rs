@@ -21,7 +21,7 @@ use licash_regtest::native::{
 use licash_regtest::native_fixture::{point, SEED, SPEND};
 use lichen_babe::setup::{instance, Instance};
 use lngap_btc::bitcoin::hashes::Hash as _;
-use lngap_btc::bitcoin::{Amount, OutPoint, ScriptBuf, TxOut, Txid};
+use lngap_btc::bitcoin::{Amount, OutPoint, ScriptBuf, Transaction, TxOut, Txid, Witness};
 use lngap_btc::regtest::Regtest;
 use std::collections::HashSet;
 
@@ -528,6 +528,106 @@ fn her_deposit_is_a_taproot_coin_worth_her_price() -> Result<()> {
     Ok(())
 }
 
+/// The hub's Signed forged with a coin of its own in F unsigned.
+fn half_signed(bytes: &[u8], deposit: OutPoint) -> Result<Vec<Vec<u8>>> {
+    let bare = forged(bytes, wire::Signed::decode, wire::Signed::encode, |s| {
+        let mut hubs = s.funding.input.iter_mut();
+        let hub = hubs.find(|i| i.previous_output != deposit);
+        hub.expect("a coin of the hub's").witness.clear();
+    })?;
+    Ok(vec![bare, bytes.to_vec()])
+}
+
+/// The holder's Funded forged on her deposit's witness: a signature not
+/// hers, a spend by a script, a signature of F's inputs alone; then her
+/// own, but with the hub's witnesses spoiled.
+fn misspent(bytes: &[u8], deposit: OutPoint) -> Result<Vec<Vec<u8>>> {
+    let f = |change: &dyn Fn(&mut Transaction, usize)| {
+        forged(bytes, wire::Funded::decode, wire::Funded::encode, |m| {
+            let f = &mut m.funding;
+            let i = f.input.iter().position(|i| i.previous_output == deposit);
+            change(f, i.expect("her deposit"));
+        })
+    };
+    Ok(vec![
+        f(&|t, i| {
+            let mut sig = t.input[i].witness[0].to_vec();
+            sig[0] ^= 1;
+            t.input[i].witness = Witness::from_slice(&[sig]);
+        })?,
+        f(&|t, i| t.input[i].witness.push([0x50]))?,
+        f(&|t, i| {
+            let mut sig = t.input[i].witness[0].to_vec();
+            sig.push(0x02);
+            t.input[i].witness = Witness::from_slice(&[sig]);
+        })?,
+        f(&|t, i| {
+            for (j, input) in t.input.iter_mut().enumerate() {
+                if j != i {
+                    input.witness = Witness::from_slice(&[[1]]);
+                }
+            }
+        })?,
+    ])
+}
+
+/// Each party signs only its own coins of F: the hub once she consents,
+/// all of them before its Signed, which she takes only so; she her
+/// deposit alone, by its key over all of F. The hub takes her deposit's
+/// witness alone from her F and broadcasts its own witnesses with it,
+/// whatever she says of them, and F confirms.
+#[test]
+fn each_party_signs_its_own_coins_of_f() -> Result<()> {
+    let rt = Regtest::start_standard()?;
+    let mut deposit = None;
+    let mut seen = HashSet::new();
+    let mut tamper = |kind: Kind, m: Vec<u8>| {
+        if !seen.insert(kind as u8) {
+            return vec![m];
+        }
+        match kind {
+            Kind::Open => {
+                let body = Envelope::from_bytes(&m).expect("a message").body;
+                deposit = Some(wire::Open::decode(&body).expect("an Open").deposit);
+                vec![m]
+            }
+            Kind::Signed => half_signed(&m, deposit.expect("an Open")).expect("forgeries"),
+            Kind::Funded => misspent(&m, deposit.expect("an Open")).expect("forgeries"),
+            _ => vec![m],
+        }
+    };
+    let (c, _, refused) = open_native_with(
+        &rt,
+        "native-signing",
+        (60, 6),
+        holder()?,
+        Authority::mock(),
+        &mut tamper,
+    )?;
+    use licash_regtest::native::Side::{Holder as H, Hub};
+    let expected = [
+        (H, Kind::Signed, "F's other inputs unsigned".to_string()),
+        (Hub, Kind::Funded, "her deposit's signature".into()),
+        (
+            Hub,
+            Kind::Funded,
+            "her deposit spent otherwise than by its key".into(),
+        ),
+        (
+            Hub,
+            Kind::Funded,
+            "her deposit signed SIGHASH_NONE only".into(),
+        ),
+    ];
+    refusals_are(&refused, &expected)?;
+    let d = c.deposit;
+    ensure!(
+        rt.rpc.get_tx_out(&d.txid, d.vout, Some(false))?.is_none(),
+        "F spends the deposit"
+    );
+    Ok(())
+}
+
 /// A man in the middle swaps the hub's response keys in Base: the holder
 /// answers it, but refuses the hub's F, which pays another graph under
 /// another D, and the opening stalls before anyone signs F.
@@ -911,7 +1011,7 @@ fn a_hub_resumes_its_opening_as_it_stored_it() -> Result<()> {
             .hubs
             .keys()
             .copied()
-            .eq([Termed, Keyed, Committed, Chosen, Signed, Funded]),
+            .eq([Termed, Keyed, Committed, Chosen, Consented, Signed, Funded]),
         "{:?}",
         played.hubs.keys()
     );
@@ -962,6 +1062,16 @@ fn a_hub_resumes_its_opening_as_it_stored_it() -> Result<()> {
         funded.pending()? == [Out::Broadcast(o.funding.clone())],
         "F to broadcast otherwise once loaded"
     );
+    // Loaded once she consents, it asks again for its own coins of F
+    // signed: all but her deposit.
+    let asks = machine::Hub::load(&played.hubs[&Consented], &ctx)?.pending()?;
+    ensure!(
+        matches!(&asks[..], [Out::Sign { funding, prevouts, inputs }]
+            if funding.compute_txid() == o.funding.compute_txid()
+                && prevouts.len() == funding.input.len()
+                && inputs.len() + 1 == funding.input.len()),
+        "{asks:?}"
+    );
     let keyed = &played.hubs[&Keyed];
     let changed = |at: usize, byte: u8| {
         let mut b = keyed.clone();
@@ -974,7 +1084,7 @@ fn a_hub_resumes_its_opening_as_it_stored_it() -> Result<()> {
         (changed(5, 2), "of format 2"),
         (changed(6, 2), "keys of derivation 2"),
         (changed(7, 0), "not a hub's opening"),
-        (changed(8, 6), "phase 6"),
+        (changed(8, 7), "phase 7"),
         // Keyed's sections under another phase.
         (changed(8, 0), "bytes past an opening's state"),
         (changed(8, 2), "cut short"),

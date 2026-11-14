@@ -13,7 +13,7 @@
 use crate::contract::{self, Opened, Statement};
 use crate::mock_statement;
 use anyhow::{anyhow, bail, ensure, Context, Result};
-use bitcoincore_rpc::json::{AddressType, FundRawTransactionOptions};
+use bitcoincore_rpc::json::AddressType;
 use bitcoincore_rpc::RpcApi;
 use k256::Scalar;
 use licash::base::{Base, ChainTerms, Fees, FinalDigest, GraphTerms, Limits, Programs, Recipe};
@@ -32,10 +32,15 @@ pub use licash_contract::opening::journal;
 use licash_contract::opening::{self as machine, Input, Out, Quote, Start, Trust};
 use licash_contract::wire::{Kind, Wanted};
 use licash_contract::{INSTANCES, KEPT};
+use lngap_btc::bitcoin::consensus::encode::{deserialize_hex, serialize_hex};
 use lngap_btc::bitcoin::consensus::serialize;
 use lngap_btc::bitcoin::hashes::{sha256, Hash as _};
+use lngap_btc::bitcoin::key::{Keypair, TapTweak};
+use lngap_btc::bitcoin::secp256k1::{Message, Secp256k1};
+use lngap_btc::bitcoin::sighash::{Prevouts, SighashCache, TapSighashType};
 use lngap_btc::bitcoin::{
-    absolute, transaction, Amount, Block, OutPoint, ScriptBuf, Transaction, TxIn, TxOut, Txid,
+    absolute, taproot, transaction, Amount, Block, OutPoint, ScriptBuf, Transaction, TxIn, TxOut,
+    Txid, Witness,
 };
 use lngap_btc::regtest::Regtest;
 use lngap_lamport::winternitz::{WotsParams, WotsSig};
@@ -311,6 +316,35 @@ fn hub_secret(label: &str) -> [u8; 32] {
     sha256::Hash::hash(format!("{label}/hub").as_bytes()).to_byte_array()
 }
 
+/// The key of the holder's deposit in the opening `label`: a coin of no
+/// wallet's, which she signs for herself.
+fn deposit_key(label: &str) -> Result<Keypair> {
+    let secret = sha256::Hash::hash(format!("{label}/deposit").as_bytes());
+    Ok(Keypair::from_seckey_slice(
+        &Secp256k1::new(),
+        &secret.to_byte_array(),
+    )?)
+}
+
+/// Input `i` of `funding` signed by the key `key` (BIP 86's output key
+/// for it), over all of it, spending `prevouts`.
+fn sign_key(funding: &mut Transaction, i: usize, prevouts: &[TxOut], key: &Keypair) -> Result<()> {
+    let secp = Secp256k1::new();
+    let sighash = SighashCache::new(&*funding).taproot_key_spend_signature_hash(
+        i,
+        &Prevouts::All(prevouts),
+        TapSighashType::Default,
+    )?;
+    let message = Message::from_digest(sighash.to_byte_array());
+    let tweaked = key.tap_tweak(&secp, None).to_keypair();
+    let signature = taproot::Signature {
+        signature: secp.sign_schnorr_no_aux_rand(&message, &tweaked),
+        sighash_type: TapSighashType::Default,
+    };
+    funding.input[i].witness = Witness::p2tr_key_spend(&signature);
+    Ok(())
+}
+
 /// An opening as its machines played it: the holder's contract, her kept
 /// instances by commitment as her driver kept them, each party's state as
 /// it stored it at each phase, and the messages refused on the way.
@@ -337,7 +371,11 @@ pub fn play(
         let addr = rt.rpc.get_new_address(None, Some(kind))?;
         Ok(addr.assume_checked().script_pubkey())
     };
-    let (deposit, coin) = rt.fund(&address(AddressType::Bech32m)?, Amount::from_sat(500_000))?;
+    // Her deposit, of her own key, not Core's: Core funds F around it and
+    // signs only the hub's coins, she only hers.
+    let key = deposit_key(label)?;
+    let script = ScriptBuf::new_p2tr(&Secp256k1::new(), key.x_only_public_key().0, None);
+    let (deposit, coin) = rt.fund(&script, Amount::from_sat(500_000))?;
     let h = rt.height()?;
     let checkpoint = checkpoint(rt)?;
     let trust = authority.trust();
@@ -372,7 +410,7 @@ pub fn play(
     let mut hubs = BTreeMap::new();
     let mut refused = vec![];
     let mut funded = false;
-    route(rt, Side::Holder, out, &mut queue, tamper, &mut funded)?;
+    route(rt, Side::Holder, out, &mut queue, tamper, &mut funded, &key)?;
     while let Some((to, input)) = queue.pop_front() {
         let kind = match &input {
             Input::Message(m) => Kind::peek(m),
@@ -414,7 +452,7 @@ pub fn play(
             }
         };
         match step {
-            Ok(out) => route(rt, to, out, &mut queue, tamper, &mut funded)?,
+            Ok(out) => route(rt, to, out, &mut queue, tamper, &mut funded, &key)?,
             Err(e) => refused.push(Refusal {
                 by: to,
                 kind,
@@ -539,6 +577,7 @@ fn route(
     queue: &mut VecDeque<(Side, Input)>,
     tamper: Tamper<'_>,
     funded: &mut bool,
+    key: &Keypair,
 ) -> Result<()> {
     for out in out {
         match out {
@@ -557,12 +596,26 @@ fn route(
                 let (funding, prevouts) = fund(rt, deposit, outputs, &publication)?;
                 queue.push_back((from, Input::Funded { funding, prevouts }));
             }
-            Out::Sign(funding) => {
-                let f = rt
-                    .rpc
-                    .sign_raw_transaction_with_wallet(&funding, None, None)?;
-                ensure!(f.complete, "F signatures");
-                queue.push_back((from, Input::Signed(f.transaction()?)));
+            Out::Sign {
+                mut funding,
+                prevouts,
+                inputs,
+            } => {
+                match from {
+                    // Her deposit, by her key.
+                    Side::Holder => {
+                        for i in inputs {
+                            sign_key(&mut funding, i, &prevouts, key)?;
+                        }
+                    }
+                    // The hub's coins, all Core's: her deposit it cannot.
+                    Side::Hub => {
+                        let rpc = &rt.rpc;
+                        let f = rpc.sign_raw_transaction_with_wallet(&funding, None, None)?;
+                        funding = f.transaction()?;
+                    }
+                }
+                queue.push_back((from, Input::Signed(funding)));
             }
             Out::Broadcast(funding) => {
                 rt.send_and_confirm(&funding)?;
@@ -574,6 +627,11 @@ fn route(
     }
     Ok(())
 }
+
+/// What a taproot input spent by its key weighs: its outpoint, empty
+/// script and sequence (41 bytes, 164 units) and one 64-byte signature
+/// (66 units).
+const KEY_SPEND_WEIGHT: u64 = 230;
 
 /// F from Core's coins, spending `deposit` and paying `outputs` and the
 /// five publication coins, 20 000 sat each, unsigned (its coins stay
@@ -597,18 +655,21 @@ fn fund(
         }],
         output: outputs.into_iter().chain(coins).collect(),
     };
-    let funding = rt
-        .rpc
-        .fund_raw_transaction(
-            &unsigned,
-            Some(&FundRawTransactionOptions {
-                add_inputs: Some(true),
-                lock_unspents: Some(true),
-                ..Default::default()
-            }),
-            None,
-        )?
-        .transaction()?;
+    // Her deposit is no coin of Core's: it looks the coin up on the chain,
+    // and is told what spending it by its key weighs.
+    let options = serde_json::json!({
+        "add_inputs": true,
+        "lock_unspents": true,
+        "input_weights": [{
+            "txid": deposit.txid.to_string(),
+            "vout": deposit.vout,
+            "weight": KEY_SPEND_WEIGHT,
+        }],
+    });
+    let args = [serialize_hex(&unsigned).into(), options];
+    let funded: serde_json::Value = rt.rpc.call("fundrawtransaction", &args)?;
+    let hex = funded["hex"].as_str().context("F funded")?;
+    let funding: Transaction = deserialize_hex(hex)?;
     let prevouts = funding
         .input
         .iter()

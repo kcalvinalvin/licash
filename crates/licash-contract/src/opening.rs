@@ -44,7 +44,9 @@ use lichen_babe::setup::{instance, par, Hash, Instance, DIGITS};
 use lngap_btc::adaptor::AdaptorSig;
 use lngap_btc::bitcoin::consensus::{deserialize, serialize};
 use lngap_btc::bitcoin::hashes::Hash as _;
-use lngap_btc::bitcoin::secp256k1::XOnlyPublicKey;
+use lngap_btc::bitcoin::secp256k1::{Message, Secp256k1, XOnlyPublicKey};
+use lngap_btc::bitcoin::sighash::{Prevouts, SighashCache, TapSighashType};
+use lngap_btc::bitcoin::taproot;
 use lngap_btc::bitcoin::{Amount, OutPoint, ScriptBuf, Transaction, TxOut};
 use lngap_channel::{ChannelParams, PartyPubKeys};
 use lngap_lamport::winternitz::{Wots256Public, WotsParams, WotsPublic};
@@ -116,7 +118,7 @@ pub enum Input {
         funding: Transaction,
         prevouts: Vec<TxOut>,
     },
-    /// The holder's F with her inputs signed: the answer to [`Out::Sign`].
+    /// F with the inputs [`Out::Sign`] named signed: its answer.
     Signed(Transaction),
 }
 
@@ -148,8 +150,15 @@ pub enum Out {
         outputs: Vec<TxOut>,
         publication: [ScriptBuf; 5],
     },
-    /// The holder's: sign her inputs of F; answer [`Input::Signed`].
-    Sign(Transaction),
+    /// Sign F's `inputs` (0-based) and no other, spending `prevouts`, one
+    /// per input, as a taproot signature commits to them all: the hub's
+    /// all its own once she consents, the holder's her deposit once the
+    /// hub has signed. Answer [`Input::Signed`].
+    Sign {
+        funding: Transaction,
+        prevouts: Vec<TxOut>,
+        inputs: Vec<usize>,
+    },
     /// The hub's: F, complete, for the chain.
     Broadcast(Transaction),
 }
@@ -300,6 +309,48 @@ fn check_funds(
         })
         .collect::<Result<_>>()?;
     Ok(coins.try_into().expect("five coins"))
+}
+
+/// Where F, as frozen, spends her `deposit`: once.
+fn at(funding: &Transaction, deposit: OutPoint) -> usize {
+    let at = funding
+        .input
+        .iter()
+        .position(|i| i.previous_output == deposit);
+    at.expect("F spends her deposit")
+}
+
+/// Refused unless input `index` of F is spent by a signature, over all of
+/// F, of the key its coin pays, a taproot output among `prevouts`: of the
+/// key alone, which a hub can check, never a script's.
+fn check_key_spend(funding: &Transaction, index: usize, prevouts: &[TxOut]) -> Result<()> {
+    let script = prevouts[index].script_pubkey.as_bytes();
+    ensure!(script.len() == 34, "her deposit not a taproot coin");
+    let key = XOnlyPublicKey::from_slice(&script[2..])?;
+    let witness = &funding.input[index].witness;
+    ensure!(
+        witness.len() == 1,
+        "her deposit spent otherwise than by its key"
+    );
+    let sig = taproot::Signature::from_slice(&witness[0]).context("her deposit's signature")?;
+    ensure!(
+        matches!(
+            sig.sighash_type,
+            TapSighashType::Default | TapSighashType::All
+        ),
+        "her deposit signed {} only",
+        sig.sighash_type
+    );
+    let sighash = SighashCache::new(funding).taproot_key_spend_signature_hash(
+        index,
+        &Prevouts::All(prevouts),
+        sig.sighash_type,
+    )?;
+    let message = Message::from_digest(sighash.to_byte_array());
+    Secp256k1::verification_only()
+        .verify_schnorr(&sig.signature, &message, &key)
+        .context("her deposit's signature")?;
+    Ok(())
 }
 
 /// The scripts of the publication coins of the graph `draft`.
@@ -1164,9 +1215,19 @@ impl Holder {
         let m = wire::Signed::decode(body)?;
         self.check_signed(&m)?;
         self.gate(ctx)?;
-        let out = vec![Out::Sign(m.funding.clone())];
+        let out = vec![self.to_sign(&m.funding)];
         self.signed = Some(m);
         Ok(out)
+    }
+
+    /// Her deposit to sign on the hub's signed F, `funding`.
+    fn to_sign(&self, funding: &Transaction) -> Out {
+        let (c, _, _) = self.commit.as_ref().expect("Commit before Signed");
+        Out::Sign {
+            funding: funding.clone(),
+            prevouts: c.prevouts.clone(),
+            inputs: vec![at(funding, self.start.deposit)],
+        }
     }
 
     fn check_signed(&self, m: &wire::Signed) -> Result<()> {
@@ -1185,20 +1246,35 @@ impl Holder {
                 .all(|i| i.previous_output != deposit || i.witness.is_empty()),
             "her input of F signed by another"
         );
+        ensure!(
+            m.funding
+                .input
+                .iter()
+                .all(|i| i.previous_output == deposit || !i.witness.is_empty()),
+            "F's other inputs unsigned"
+        );
         let hub = party_pub(&base.parts().parties[1])?.payment;
         check_sigs(&graph.set, &hub, &m.sigs, |_| false)
     }
 
-    /// F with her inputs signed, all of it: hers to send the hub.
+    /// F with her deposit signed: her signature alone taken into the
+    /// hub's F, signed whole then, hers to send the hub.
     fn sign(&mut self, funding: Transaction) -> Result<Vec<Out>> {
-        ensure!(
-            self.signed.is_some(),
-            "F to sign before the hub's signatures"
-        );
+        let signed = self
+            .signed
+            .as_ref()
+            .context("F to sign before the hub's signatures")?;
         ensure!(self.funding.is_none(), "F signed again");
-        self.check_funding(&funding)?;
-        let out = vec![self.funded(&funding)];
-        self.funding = Some(funding);
+        ensure!(
+            funding.compute_txid() == signed.funding.compute_txid(),
+            "F not as frozen"
+        );
+        let i = at(&funding, self.start.deposit);
+        let mut whole = signed.funding.clone();
+        whole.input[i].witness = funding.input[i].witness.clone();
+        self.check_funding(&whole)?;
+        let out = vec![self.funded(&whole)];
+        self.funding = Some(whole);
         Ok(out)
     }
 
@@ -1209,24 +1285,29 @@ impl Holder {
         send(Kind::Funded, self.id, funded.encode())
     }
 
+    /// F as frozen, her deposit spent by her key and the rest as the hub
+    /// signed it.
     fn check_funding(&self, funding: &Transaction) -> Result<()> {
-        ensure!(
-            self.signed.is_some(),
-            "F to sign before the hub's signatures"
-        );
-        let (_, frozen, _) = self.commit.as_ref().expect("Commit before Signed");
+        let signed = self
+            .signed
+            .as_ref()
+            .context("F to sign before the hub's signatures")?;
+        let (c, frozen, _) = self.commit.as_ref().expect("Commit before Signed");
         ensure!(
             funding.compute_txid() == frozen.funding_op.txid,
             "F not as frozen"
         );
+        let i = at(funding, self.start.deposit);
         ensure!(
             funding
                 .input
                 .iter()
-                .all(|i| !i.witness.is_empty() || !i.script_sig.is_empty()),
-            "F not signed whole"
+                .zip(&signed.funding.input)
+                .enumerate()
+                .all(|(j, (a, b))| j == i || a.witness == b.witness),
+            "F signed otherwise than by the hub"
         );
-        Ok(())
+        check_key_spend(funding, i, &c.prevouts)
     }
 
     /// The contract, once F is signed whole.
@@ -1440,8 +1521,10 @@ pub struct Hub {
     /// the instances themselves are dropped, and built again to send.
     frozen: Option<(Frozen, wire::Commit, [Vec<Hash>; STAGES])>,
     choice: Option<Choice>,
-    /// The holder's consent, and its signatures that answered it.
-    signed: Option<(wire::Consent, wire::Signed)>,
+    /// Her consent, through its gate.
+    consent: Option<wire::Consent>,
+    /// Its signatures of the graph, with F its own inputs signed.
+    signed: Option<wire::Signed>,
     funded: Option<Transaction>,
 }
 
@@ -1471,6 +1554,7 @@ impl Hub {
             holder: None,
             frozen: None,
             choice: None,
+            consent: None,
             signed: None,
             funded: None,
         }
@@ -1496,7 +1580,7 @@ impl Hub {
                 }
             }
             Input::Funded { funding, prevouts } => self.fund(funding, prevouts, ctx),
-            Input::Signed(_) => bail!("the holder signs her inputs"),
+            Input::Signed(funding) => self.sign(funding, ctx),
         }
     }
 
@@ -1720,13 +1804,22 @@ impl Hub {
 
     /// M7: the holder's pre-signatures on its dealings, her signatures of
     /// all the graph but the withheld, and her consent, through its gate.
-    /// Its signatures answer.
+    /// Its own inputs of F to sign answer.
     fn consent(&mut self, body: &[u8], ctx: &Context) -> Result<Vec<Out>> {
-        ensure!(self.signed.is_none(), "Consent again");
-        let set = &self.choice.as_ref().context("consent before a choice")?.set;
-        let (frozen, _, _) = self.frozen.as_ref().expect("F before a choice");
+        ensure!(self.consent.is_none(), "Consent again");
+        self.choice.as_ref().context("consent before a choice")?;
         let m = wire::Consent::decode(body)?;
         self.check_consent(&m)?;
+        self.gate(&m, ctx)?;
+        let out = vec![self.to_sign()];
+        self.consent = Some(m);
+        Ok(out)
+    }
+
+    /// Its funding gate at its tip on her consent `m`, refused once its
+    /// deadlines are too near.
+    fn gate(&self, m: &wire::Consent, ctx: &Context) -> Result<()> {
+        let (frozen, _, _) = self.frozen.as_ref().expect("F before a choice");
         let retained = ResponseKeys::new(self.keys.sealed.public())?;
         let d = self.base().hub_gate(
             &frozen.prefix,
@@ -1737,13 +1830,65 @@ impl Hub {
             ctx.tip,
         )?;
         ensure!(d == frozen.d, "the gates agree on D");
+        Ok(())
+    }
+
+    /// Its own inputs of F to sign: all but her deposit.
+    fn to_sign(&self) -> Out {
+        let (frozen, c, _) = self.frozen.as_ref().expect("F before her consent");
+        let (open, _) = self.base.as_ref().expect("Open before F");
+        let deposit = at(&frozen.funding, open.deposit);
+        Out::Sign {
+            funding: frozen.funding.clone(),
+            prevouts: c.prevouts.clone(),
+            inputs: (0..frozen.funding.input.len())
+                .filter(|i| *i != deposit)
+                .collect(),
+        }
+    }
+
+    /// F with its own inputs signed, through its gate at its tip still:
+    /// its signatures of the graph, with F, answer. Sent only once stored
+    /// so, as the holder may complete F from then on.
+    fn sign(&mut self, funding: Transaction, ctx: &Context) -> Result<Vec<Out>> {
+        let m = self
+            .consent
+            .as_ref()
+            .context("F signed before her consent")?;
+        ensure!(self.signed.is_none(), "F signed again");
+        self.gate(m, ctx)?;
+        self.check_signing(&funding)?;
+        let set = &self
+            .choice
+            .as_ref()
+            .expect("a choice before her consent")
+            .set;
         let signed = wire::Signed {
             sigs: sign_all(set, &self.keys.party.payment)?,
-            funding: frozen.funding.clone(),
+            funding,
         };
         let out = vec![send(Kind::Signed, self.id(), signed.encode())];
-        self.signed = Some((m, signed));
+        self.signed = Some(signed);
         Ok(out)
+    }
+
+    /// F as frozen, by txid, with its own inputs signed and her deposit's
+    /// not.
+    fn check_signing(&self, funding: &Transaction) -> Result<()> {
+        let (frozen, _, _) = self.frozen.as_ref().expect("F before signing");
+        ensure!(
+            funding.compute_txid() == frozen.funding_op.txid,
+            "F not as frozen"
+        );
+        let (open, _) = self.base.as_ref().expect("Open before F");
+        ensure!(
+            funding
+                .input
+                .iter()
+                .all(|i| (i.previous_output == open.deposit) == i.witness.is_empty()),
+            "F signed otherwise than its own inputs"
+        );
+        Ok(())
     }
 
     /// Her pre-signatures on its dealings and her signatures of all the
@@ -1776,9 +1921,9 @@ impl Hub {
         ensure!(self.signed.is_some(), "F before the hub signed");
         ensure!(self.funded.is_none(), "F again");
         let m = wire::Funded::decode(body)?;
-        self.check_funded(&m.funding)?;
-        let out = vec![Out::Broadcast(m.funding.clone())];
-        self.funded = Some(m.funding);
+        let whole = self.whole(&m.funding)?;
+        let out = vec![Out::Broadcast(whole.clone())];
+        self.funded = Some(whole);
         Ok(out)
     }
 
@@ -1789,7 +1934,8 @@ impl Hub {
         let (holder, _) = self.holder.expect("Keys before F");
         let (frozen, _, _) = self.frozen.expect("F frozen before F");
         let choice = self.choice.expect("a choice before F");
-        let (consent, signed) = self.signed.expect("its signatures before F");
+        let consent = self.consent.expect("her consent before F");
+        let signed = self.signed.expect("its signatures before F");
         Ok(HubOpening {
             base,
             prefix: frozen.prefix,
@@ -1805,20 +1951,23 @@ impl Hub {
         })
     }
 
-    fn check_funded(&self, funding: &Transaction) -> Result<()> {
-        let (frozen, _, _) = self.frozen.as_ref().expect("F before signing");
+    /// F whole, to broadcast: its own signed F with her deposit's witness
+    /// from `funding`, a signature of her key. What she says of its own
+    /// witnesses is not taken, so she cannot spoil them.
+    fn whole(&self, funding: &Transaction) -> Result<Transaction> {
+        let signed = self.signed.as_ref().context("F before the hub signed")?;
+        let (frozen, c, _) = self.frozen.as_ref().expect("F before signing");
         ensure!(
             funding.compute_txid() == frozen.funding_op.txid,
             "F not as frozen"
         );
-        ensure!(
-            funding
-                .input
-                .iter()
-                .all(|i| !i.witness.is_empty() || !i.script_sig.is_empty()),
-            "F not signed whole"
-        );
-        Ok(())
+        let (open, _) = self.base.as_ref().expect("Open before F");
+        let i = at(funding, open.deposit);
+        ensure!(!funding.input[i].witness.is_empty(), "F not signed whole");
+        let mut whole = signed.funding.clone();
+        whole.input[i].witness = funding.input[i].witness.clone();
+        check_key_spend(&whole, i, &c.prevouts)?;
+        Ok(whole)
     }
 }
 
