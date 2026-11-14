@@ -313,7 +313,7 @@ fn forged_messages_are_refused_and_the_opening_goes_on() -> Result<()> {
 #[test]
 fn a_holder_given_another_hubs_keys_never_funds() -> Result<()> {
     let rt = Regtest::start_standard()?;
-    let other = ResponseKeys::new(HubKeys::from_label("another hub").sealed.public())?;
+    let other = ResponseKeys::new(HubKeys::from_secret(&[9; 32]).sealed.public())?;
     let mut tamper = |kind: Kind, m: Vec<u8>| {
         if kind != Kind::Terms {
             return vec![m];

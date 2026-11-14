@@ -33,7 +33,7 @@ use licash_contract::opening::{self as machine, Input, Out, Policy, Start, Trust
 use licash_contract::wire::{Kind, Wanted};
 use licash_contract::{INSTANCES, KEPT};
 use lngap_btc::bitcoin::consensus::serialize;
-use lngap_btc::bitcoin::hashes::Hash as _;
+use lngap_btc::bitcoin::hashes::{sha256, Hash as _};
 use lngap_btc::bitcoin::{
     absolute, transaction, Amount, Block, OutPoint, ScriptBuf, Transaction, TxIn, TxOut, Txid,
 };
@@ -287,7 +287,6 @@ pub fn open_native_with(
         })
     };
     let start = Start {
-        keys: HolderKeys::from_label(label),
         seed: holder.seed,
         spend: holder.spend,
         keyset: holder.keyset.clone(),
@@ -300,10 +299,8 @@ pub fn open_native_with(
         checkpoint: checkpoint.clone(),
     };
     let (mut alice, out) = machine::Holder::with_choice(start, &ctx()?, [vec![2, 3], vec![2, 3]])?;
-    let mut hub = machine::Hub::new(
-        HubKeys::from_label(label),
-        policy(holder.keyset, checkpoint),
-    );
+    let secret = sha256::Hash::hash(format!("{label}/hub").as_bytes()).to_byte_array();
+    let mut hub = machine::Hub::with_secret(&secret, policy(holder.keyset, checkpoint));
     let mut queue = VecDeque::new();
     let mut refused = vec![];
     let mut funded = false;
@@ -327,13 +324,14 @@ pub fn open_native_with(
         }
     }
     ensure!(funded, "the opening stalled, refusing {refused:?}");
+    let alice_keys = HolderKeys::derive(&holder.seed, &alice.id());
     let o = alice.opening()?;
     rt.mine(u64::from(o.base.parts().graph.to_self_delay))?;
     let [full, corrected] = o.setups;
     Ok((
         Opened {
             set: o.set.into_iter().map(|x| (x.name.clone(), x)).collect(),
-            p: contract::parties(label),
+            p: contract::parties(label, alice_keys, HubKeys::from_secret(&secret)),
             babe: o.babe,
             publication: o.publication,
             signed: o.signed,

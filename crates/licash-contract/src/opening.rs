@@ -440,8 +440,8 @@ fn others(kept: &[Vec<usize>; STAGES]) -> [Vec<usize>; STAGES] {
 
 /// What a holder brings to an opening.
 pub struct Start {
-    pub keys: HolderKeys,
-    /// Her request-key seed: her request keys come from it and Base.
+    /// Her seed: her request keys come from it and Base, her keys of the
+    /// contract from it and the opening's id.
     pub seed: [u8; 32],
     /// Her spending root's secret.
     pub spend: Scalar,
@@ -485,6 +485,7 @@ struct Graph {
 pub struct Holder {
     start: Start,
     id: [u8; 32],
+    keys: HolderKeys,
     fixed: Option<[Vec<usize>; STAGES]>,
     base: Option<(Base, wire::Keys)>,
     commit: Option<(wire::Commit, Frozen, [Vec<usize>; STAGES])>,
@@ -518,9 +519,10 @@ impl Holder {
 
     fn with(start: Start, ctx: &Context, fixed: Option<[Vec<usize>; STAGES]>) -> (Self, Vec<Out>) {
         let id = Base::fresh_nonce();
+        let keys = HolderKeys::derive(&start.seed, &id);
         let open = wire::Open {
             spend_root: spend_root(&start.spend),
-            party: start.keys.party.public(),
+            party: keys.party.public(),
             deposit: start.deposit,
             wanted: start.wanted,
             mock: ctx.trust.mock,
@@ -529,6 +531,7 @@ impl Holder {
         let holder = Self {
             start,
             id,
+            keys,
             fixed,
             base: None,
             commit: None,
@@ -572,7 +575,7 @@ impl Holder {
         let base = Base::from_bytes(body)?;
         let p = base.parts();
         let s = &self.start;
-        let mine = s.keys.party.public();
+        let mine = self.keys.party.public();
         ensure!(p.nonce == self.id, "Base of another opening");
         ensure!(
             p.spend_root == spend_root(&s.spend),
@@ -616,13 +619,9 @@ impl Holder {
             p.chain.checkpoint.commitment() == s.checkpoint.commitment(),
             "a checkpoint not of her chain"
         );
-        let k = &s.keys;
-        let keys = wire::Keys {
-            request: Signer::derive(&s.seed, &base.digest()).public(),
-            lamport: [k.lamport.public(), k.corrected.lamport.public()],
-            adaptor: [k.adaptor.public(), k.corrected.adaptor.public()],
-            corrected_b: k.corrected.b_key.public().digits,
-        };
+        let keys = self
+            .keys
+            .public(Signer::derive(&s.seed, &base.digest()).public());
         // What the hub would refuse to compile, she refuses now.
         compile(&base, &keys, draft_hmsg())?;
         let out = vec![send(Kind::Keys, self.id, keys.encode())];
@@ -809,15 +808,15 @@ impl Holder {
             ctx.tip,
         )?;
         let presigs = [
-            s.keys
+            self.keys
                 .adaptor
                 .presign(&Babe::challenge_sighash(&set)?, &points(&c.dealings[0])),
-            s.keys.corrected.adaptor.presign(
+            self.keys.corrected.adaptor.presign(
                 &Babe::challenge_corrected_sighash(&set)?,
                 &points(&c.dealings[1]),
             ),
         ];
-        let sigs = sign_all(&set, &s.keys.party.payment)?;
+        let sigs = sign_all(&set, &self.keys.party.payment)?;
         let consent = wire::Consent {
             consent,
             presigs: presigs.clone(),
@@ -967,9 +966,24 @@ pub struct Hub {
 }
 
 impl Hub {
-    pub fn new(keys: HubKeys, policy: Policy) -> Self {
+    /// The hub's side of one opening, under a secret drawn for it alone.
+    pub fn new(policy: Policy) -> Self {
+        use rand_core::RngCore;
+        let mut secret = [0; 32];
+        rand_core::OsRng.fill_bytes(&mut secret);
+        Self::with(&secret, policy)
+    }
+
+    /// [`Hub::new`] under `secret`. For fixtures only: a hub must never
+    /// open twice under one secret.
+    #[cfg(feature = "fixture")]
+    pub fn with_secret(secret: &[u8; 32], policy: Policy) -> Self {
+        Self::with(secret, policy)
+    }
+
+    fn with(secret: &[u8; 32], policy: Policy) -> Self {
         Self {
-            keys,
+            keys: HubKeys::from_secret(secret),
             policy,
             id: None,
             base: None,

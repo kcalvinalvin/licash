@@ -77,13 +77,12 @@ pub struct Second {
     pub dealing: Dealing,
 }
 
-/// Both parties' keys of the contract labelled `label`, as each derives
-/// its own ([`licash_contract::keys`]); Alice's `b` and `E` of the graph's
-/// own request too (a native opening's come from her request seed).
-pub fn parties(label: &str) -> Parties {
+/// Both parties' keys of the contract labelled `label`, each side's as it
+/// derived them ([`licash_contract::keys`]); Alice's `b` and `E` of the
+/// graph's own request from the label (a native opening's come from her
+/// request seed).
+pub fn parties(label: &str, alice: HolderKeys, hub: HubKeys) -> Parties {
     let a = Seed::from_label(&format!("{label}/alice"));
-    let alice = HolderKeys::from_label(label);
-    let hub = HubKeys::from_label(label);
     Parties {
         alice: alice.party,
         hub: hub.party,

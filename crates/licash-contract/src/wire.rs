@@ -718,7 +718,7 @@ mod tests {
 
     #[test]
     fn the_holders_messages_read_back() {
-        let keys = HolderKeys::from_label("wire");
+        let keys = HolderKeys::derive(&[1; 32], &[2; 32]);
         let open = Open {
             spend_root: Point([2; 33]),
             party: keys.party.public(),
@@ -745,7 +745,7 @@ mod tests {
             kept: [vec![0, 3], vec![1, 2]],
         };
         assert_eq!(Choose::decode(&choose.encode()).unwrap(), choose);
-        let hub = HubKeys::from_label("wire");
+        let hub = HubKeys::from_secret(&[3; 32]);
         let msg = Message::from_digest([9; 32]);
         let mut sigs = std::collections::HashMap::new();
         sigs.insert("request".to_owned(), vec![4; 64]);
@@ -767,7 +767,7 @@ mod tests {
 
     #[test]
     fn the_hubs_messages_read_back() {
-        let hub = HubKeys::from_label("wire");
+        let hub = HubKeys::from_secret(&[3; 32]);
         let commit = Commit {
             funding: tx(),
             publication: std::array::from_fn(|i| (outpoint(i as u8), tx().output[0].clone())),
