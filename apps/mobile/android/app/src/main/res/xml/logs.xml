@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- What the log export shares: the file it writes, no other. -->
+<paths>
+    <cache-path name="logs" path="logs/" />
+</paths>

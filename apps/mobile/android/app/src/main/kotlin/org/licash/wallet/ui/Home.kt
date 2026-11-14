@@ -64,7 +64,7 @@ fun Home(engine: Engine, ui: Ui, receive: () -> Unit, send: () -> Unit, settings
             }
         }
         Spacer(Modifier.height(28.dp))
-        if (ui.history.isEmpty()) {
+        if (ui.history.isEmpty() && ui.incoming.isEmpty()) {
             Text(
                 "Nothing yet. What you receive and send shows here.",
                 style = MaterialTheme.typography.bodyMedium,
@@ -72,6 +72,10 @@ fun Home(engine: Engine, ui: Ui, receive: () -> Unit, send: () -> Unit, settings
             )
         } else {
             LazyColumn(Modifier.fillMaxSize()) {
+                items(ui.incoming, key = { "coming " + it.id }) { activity ->
+                    ActivityRow(activity, coming = true)
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.4f))
+                }
                 items(ui.history, key = { it.id + it.kind }) { activity ->
                     ActivityRow(activity)
                     HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.4f))
@@ -97,6 +101,8 @@ private fun Total(ui: Ui) {
     val notes = buildList {
         if (b.moving > 0uL) add("${sat(b.moving)} on its way from Bitcoin")
         if (b.onchain > 0uL) add("${sat(b.onchain)} on Bitcoin, moved in once enough")
+        val coming = ui.incoming.sumOf { it.amount }
+        if (coming > 0uL) add("${sat(coming)} coming on Bitcoin, waiting for a block")
         if (b.notesPending > 0uL) add("${sat(b.notesPending)} still settling")
         if (!ui.chain.synced && ui.hubs.isNotEmpty()) add("Catching up with Bitcoin…")
         ui.problem?.let { add(it) }
@@ -150,20 +156,24 @@ private fun ConnectHub(engine: Engine) {
 }
 
 @Composable
-private fun ActivityRow(activity: Activity) {
-    val (title, sign) = when (activity.kind) {
+private fun ActivityRow(activity: Activity, coming: Boolean = false) {
+    val (title, sign) = if (coming) "Coming on Bitcoin" to "+" else when (activity.kind) {
         Kind.SENT -> "Sent" to "−"
         Kind.RECEIVED -> "Received" to "+"
         Kind.MOVED -> "From Bitcoin" to "+"
         Kind.ONCHAIN -> "On Bitcoin" to "+"
     }
-    val detail = when (activity.state) {
-        State.PENDING -> "Under way"
-        State.FAILED -> activity.detail
-        State.DONE -> activity.at?.let { at(it) } ?: activity.detail
+    val detail = when {
+        coming -> "Waiting for a block"
+        else -> when (activity.state) {
+            State.PENDING -> "Under way"
+            State.FAILED -> activity.detail
+            State.DONE -> activity.at?.let { at(it) } ?: activity.detail
+        }
     }
-    val color = when (activity.state) {
-        State.FAILED -> MaterialTheme.colorScheme.error
+    val color = when {
+        coming -> MaterialTheme.colorScheme.onSurfaceVariant
+        activity.state == State.FAILED -> MaterialTheme.colorScheme.error
         else -> MaterialTheme.colorScheme.onSurface
     }
     Row(Modifier.fillMaxWidth().padding(vertical = 14.dp), verticalAlignment = Alignment.CenterVertically) {

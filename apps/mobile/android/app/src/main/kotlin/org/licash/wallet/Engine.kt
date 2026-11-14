@@ -1,7 +1,6 @@
 package org.licash.wallet
 
 import android.content.Context
-import android.util.Log
 import androidx.lifecycle.DefaultLifecycleObserver
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.ProcessLifecycleOwner
@@ -27,6 +26,7 @@ import org.licash.core.Activity
 import org.licash.core.Balance
 import org.licash.core.Code
 import org.licash.core.Hub
+import org.licash.core.Kind
 import org.licash.core.LicashException
 import org.licash.core.Network
 import org.licash.core.Paid
@@ -49,6 +49,8 @@ data class Ui(
     val chain: ChainStatus = ChainStatus(),
     /** The next block to look in for payments on Bitcoin, once looking. */
     val scanned: UInt? = null,
+    /** Payments on Bitcoin on their way: in no block yet. */
+    val incoming: List<Activity> = emptyList(),
     /** Why the last round of syncing fell short, if it did. */
     val problem: String? = null,
 )
@@ -62,8 +64,9 @@ data class Event(val text: String, val received: ULong? = null)
  * The wallet and the light client, and the loop keeping them in step while
  * the app is in sight: looking for payments on Bitcoin, moving them into
  * Licash once there is enough, finishing what is under way and taking
- * what arrives in the mailbox. Every wallet call is on an IO thread, one
- * at a time.
+ * what arrives in the mailbox. Every wallet call is on an IO thread; those
+ * reaching the network or changing what the wallet holds one at a time,
+ * those reading it alongside.
  */
 class Engine(context: Context) {
     val prefs = Prefs(context)
@@ -71,6 +74,7 @@ class Engine(context: Context) {
     private val walletDir = File(files, "wallet").path
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val mutex = Mutex()
+    private val lightLock = Mutex()
     private val state = MutableStateFlow(Ui(developer = prefs.developer, network = prefs.network))
     val ui: StateFlow<Ui> = state.asStateFlow()
     private val notices = MutableSharedFlow<Event>(extraBufferCapacity = 16)
@@ -83,12 +87,27 @@ class Engine(context: Context) {
 
     @Volatile
     private var foreground = false
+
+    @Volatile
     private var wallet: Wallet? = null
+
+    @Volatile
     private var light: LightClient? = null
     private var lightOf: String? = null
 
+    /** The coins on Bitcoin and payments on their way already told of. */
+    private var told: MutableSet<String>? = null
+
+    /** How the light client stood when last logged. */
+    private var logged: ChainStatus? = null
+
+    /** Whether what the hubs trusted serve was learned since the app started. */
+    @Volatile
+    private var hubsLearned = false
+
     init {
-        setLogger(Lines, "info")
+        AppLog.start(File(files, "logs"))
+        setLogger(AppLog, "info,nostr_sdk=warn,nostr_relay_pool=warn")
         ProcessLifecycleOwner.get().lifecycle.addObserver(object : DefaultLifecycleObserver {
             override fun onStart(owner: LifecycleOwner) {
                 foreground = true
@@ -110,33 +129,43 @@ class Engine(context: Context) {
         wake.trySend(Unit)
     }
 
+    /** Open the wallet and show it, then start the light client. */
     private suspend fun load() {
         mutex.withLock {
             if (walletExists(walletDir)) {
                 runCatching { Wallet.open(walletDir, prefs.tor) }
                     .onSuccess { wallet = it }
-                    .onFailure { e -> state.update { it.copy(problem = explain(e)) } }
+                    .onFailure { e ->
+                        AppLog.warn("opening the wallet", e)
+                        state.update { it.copy(problem = explain(e)) }
+                    }
             }
-            startLight()
         }
         refresh()
         state.update { it.copy(loaded = true) }
+        lightLock.withLock { startLight() }
     }
 
     /** Run the light client of the wallet's network, or the one chosen. */
-    private fun startLight() {
+    private suspend fun startLight() {
         val network = wallet?.network() ?: prefs.network
         val key = listOf(chainName(network), prefs.peers, prefs.cdn).joinToString("|")
         if (key == lightOf && light != null) return
-        stopLight()
+        // Between wallet calls: one may be reading through it.
+        mutex.withLock { stopLight() }
         val name = chainName(network)
         val dir = File(files, "chain-$name").path
+        AppLog.info("starting the light client of $name")
         runCatching { Mobile.start(name, dir, prefs.peers, prefs.cdn) }
             .onSuccess {
                 light = it
                 lightOf = key
+                AppLog.info("light client of $name started")
             }
-            .onFailure { e -> state.update { it.copy(problem = explain(e)) } }
+            .onFailure { e ->
+                AppLog.warn("starting the light client", e)
+                state.update { it.copy(problem = explain(e)) }
+            }
     }
 
     private fun stopLight() {
@@ -149,7 +178,7 @@ class Engine(context: Context) {
         while (true) {
             if (foreground) {
                 runCatching { sync() }.onFailure { e ->
-                    Log.w("licash", "sync", e)
+                    AppLog.warn("sync", e)
                     state.update { it.copy(problem = explain(e)) }
                 }
             }
@@ -161,67 +190,136 @@ class Engine(context: Context) {
         val light = light ?: return
         val status = ChainStatus(light.height(), light.peers(), light.synced())
         state.update { it.copy(chain = status) }
-        val hubs = mutex.withLock { wallet?.hubs() } ?: return
+        var hubs = wallet?.let { local { w -> w.hubs() } } ?: return
         if (hubs.isEmpty()) return
+        if (!hubsLearned) {
+            learnHubs(hubs)
+            hubs = local { it.hubs() }
+        }
         val chain = GoChain(light)
         val problems = mutableListOf<String>()
-        if (status.synced && hubs.any { it.silent }) {
+        fun failed(step: String, e: LicashException) {
+            AppLog.warn(step, e)
+            problems += explain(e)
+        }
+        if (status != logged) {
+            logged = status
+            AppLog.info(
+                "block ${status.height}, ${status.peers} peers, " + if (status.synced) "synced" else "syncing",
+            )
+        }
+        var caughtUp = false
+        if (status.synced) {
+            var before: UInt? = null
             while (true) {
                 val scan = try {
                     locked { it.scan(chain) }
                 } catch (e: LicashException) {
-                    problems += explain(e)
+                    failed("looking for payments on Bitcoin", e)
+                    // A hub may serve other blocks now: learn it next round.
+                    hubsLearned = false
                     break
                 }
                 state.update { it.copy(scanned = scan.next) }
                 if (scan.found > 0u) {
-                    notices.tryEmit(Event("${sat(scan.foundValue)} arrived on Bitcoin", scan.foundValue))
+                    AppLog.info("found ${scan.found} coins of ${scan.foundValue} sat to block ${scan.next - 1u}")
                 }
-                if (scan.next > scan.height) break
+                if (scan.next > scan.height) {
+                    caughtUp = true
+                    break
+                }
+                // The hubs' tweaks lag the chain: on next round.
+                if (scan.next == before) break
+                before = scan.next
+                AppLog.info("looked in to block ${scan.next - 1u} of ${scan.height}")
+            }
+        }
+        // Not while looking in blocks again: what it forgot would show as
+        // on its way until found again.
+        if (caughtUp || !status.synced) {
+            try {
+                val incoming = locked { it.incoming(chain) }
+                state.update { it.copy(incoming = incoming) }
+            } catch (e: LicashException) {
+                failed("payments on their way", e)
             }
         }
         try {
             locked { it.resume() }
         } catch (e: LicashException) {
-            problems += explain(e)
+            failed("finishing what is under way", e)
         }
         if (hubs.any { it.mailbox }) {
             try {
                 for (got in locked { it.collect() }) {
+                    AppLog.info("received ${got.amount} sat in the mailbox")
                     notices.tryEmit(Event("Received ${sat(got.amount)}", got.amount))
                 }
             } catch (e: LicashException) {
-                problems += explain(e)
+                failed("the mailbox", e)
             }
         }
-        try {
-            move(chain)
-        } catch (e: LicashException) {
-            problems += explain(e)
+        // Only with every coin found: a partial look could move part.
+        if (caughtUp) {
+            try {
+                move(chain)
+            } catch (e: LicashException) {
+                failed("moving into Licash", e)
+            }
         }
         state.update { it.copy(problem = problems.firstOrNull()) }
         refresh()
+        tell()
+    }
+
+    /** Learn again what each hub trusted serves: it may have changed since added. */
+    private suspend fun learnHubs(hubs: List<Hub>) {
+        for (hub in hubs) {
+            try {
+                locked { it.addHub(hub.url) }
+            } catch (e: LicashException) {
+                AppLog.warn("learning what ${hub.url} serves", e)
+            }
+        }
+        hubsLearned = true
     }
 
     /** Move what was paid on Bitcoin into Licash, all at once, once it is enough. */
     private suspend fun move(chain: GoChain) {
-        val balance = locked { it.balance() }
+        val balance = local { it.balance() }
         if (balance.onchain == 0uL || balance.moving > 0uL) return
         try {
             val moving = locked { it.moveToLicash(chain) }
+            AppLog.info("moving ${moving.amount} sat into Licash")
             notices.tryEmit(Event("Moving ${sat(moving.amount)} into Licash"))
         } catch (_: LicashException.Insufficient) {
             // Too little for the hub yet: more payments may come.
         }
     }
 
-    private suspend fun refresh() {
-        val shown = mutex.withLock {
+    /**
+     * Tell of coins found on Bitcoin and payments on their way not told of
+     * yet: none of those there when the app started, nor coins found again
+     * after looking in blocks again.
+     */
+    private fun tell() {
+        val ui = state.value
+        val coins = ui.history.filter { it.kind == Kind.ONCHAIN }
+        val told = told ?: (coins + ui.incoming).map { it.id }.toMutableSet().also { told = it }
+        val arrived = coins.filter { told.add(it.id) }.sumOf { it.amount }
+        if (arrived > 0uL) notices.tryEmit(Event("${sat(arrived)} arrived on Bitcoin", arrived))
+        val coming = ui.incoming.filter { told.add(it.id) }.sumOf { it.amount }
+        if (coming > 0uL) notices.tryEmit(Event("${sat(coming)} on its way on Bitcoin"))
+    }
+
+    private fun refresh() {
+        val shown = runCatching {
             wallet?.let { Shown(it.network(), it.balance(), it.history(), it.hubs(), it.tor()) }
-        }
+        }.onFailure { AppLog.warn("reading the wallet", it) }.getOrNull()
         state.update {
-            when (shown) {
-                null -> it.copy(wallet = false, network = prefs.network, developer = prefs.developer)
+            when {
+                wallet == null -> it.copy(wallet = false, network = prefs.network, developer = prefs.developer)
+                shown == null -> it
                 else -> it.copy(
                     wallet = true,
                     network = shown.network,
@@ -249,8 +347,9 @@ class Engine(context: Context) {
             val light = light
             val birthday = if (light != null && light.synced()) light.height().toUInt() else 0u
             wallet = Wallet.create(walletDir, prefs.network, birthday, prefs.tor)
-            startLight()
+            AppLog.info("wallet made at block $birthday")
         }
+        lightLock.withLock { startLight() }
         refresh()
         poke()
     }
@@ -262,9 +361,9 @@ class Engine(context: Context) {
         hub
     }
 
-    suspend fun code(amount: ULong?): Result<Code> = io { locked { it.paymentCode(amount) } }
+    suspend fun code(amount: ULong?): Result<Code> = io { local { it.paymentCode(amount) } }
 
-    suspend fun scanned(text: String): Result<Scanned> = io { locked { it.scanned(text) } }
+    suspend fun scanned(text: String): Result<Scanned> = io { local { it.scanned(text) } }
 
     suspend fun pay(code: String, amount: ULong?): Result<Paid> = io {
         val paid = locked { it.pay(code, amount) }
@@ -301,14 +400,14 @@ class Engine(context: Context) {
         mutex.withLock {
             check(wallet == null) { "the wallet's network is chosen once" }
             prefs.network = network
-            startLight()
         }
+        lightLock.withLock { startLight() }
         refresh()
     }
 
     /** The light client's peers and block-dn server, from now on. */
     suspend fun setChain(peers: String, cdn: String): Result<Unit> = io {
-        mutex.withLock {
+        lightLock.withLock {
             prefs.peers = peers
             prefs.cdn = cdn
             startLight()
@@ -321,15 +420,20 @@ class Engine(context: Context) {
         mutex.withLock {
             wallet?.destroy()
             wallet = null
+            told = null
             File(walletDir).deleteRecursively()
+            AppLog.info("wallet deleted")
         }
         state.update { Ui(loaded = true, developer = prefs.developer, network = prefs.network) }
         refresh()
     }
 
-    private suspend fun <T> locked(call: (Wallet) -> T): T = mutex.withLock {
+    /** A call reaching the network or changing what the wallet holds. */
+    private suspend fun <T> locked(call: (Wallet) -> T): T = mutex.withLock { local(call) }
+
+    /** A call reading what the wallet holds, alongside any other. */
+    private fun <T> local(call: (Wallet) -> T): T =
         call(wallet ?: throw LicashException.Invalid("there is no wallet yet"))
-    }
 
     private suspend fun <T> io(call: suspend () -> T): Result<T> =
         withContext(Dispatchers.IO) { runCatching { call() } }
