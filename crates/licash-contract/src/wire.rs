@@ -7,7 +7,10 @@
 use anyhow::{bail, ensure, Context, Result};
 use k256::elliptic_curve::sec1::FromEncodedPoint;
 use k256::{AffinePoint, EncodedPoint, ProjectivePoint};
+use licash::base::{ChainTerms, Fees, GraphTerms, Limits, Recipe};
+use licash::chain::Checkpoint;
 use licash::crypto::{Point, Signature};
+use licash::note::Keyset;
 use lichen_babe::reveal::LamportPub;
 use lichen_babe::setup::{Hash, Secret, DIGITS, VALUES};
 use lichen_babe::vsss::Dealing;
@@ -16,6 +19,8 @@ use lngap_btc::bitcoin::consensus::{deserialize, serialize};
 use lngap_btc::bitcoin::secp256k1::{PublicKey, SecretKey, XOnlyPublicKey};
 use lngap_btc::bitcoin::{OutPoint, ScriptBuf, Transaction, TxOut};
 use lngap_channel::PartyPubKeys;
+
+use crate::opening::Quote;
 
 pub const MAGIC: [u8; 4] = *b"LCOP";
 pub const VERSION: u16 = 1;
@@ -638,6 +643,199 @@ impl Funded {
         let funded = Self { funding: r.tx()? };
         r.end()?;
         Ok(funded)
+    }
+}
+
+/// A quote's fields, each struct destructured whole: a term Base gains
+/// is a term a stored quote must keep, or this does not compile.
+impl Writer {
+    pub fn quote(&mut self, q: &Quote) {
+        let Quote {
+            keyset,
+            cap,
+            graph,
+            recipe,
+            chain,
+            limits,
+            fees,
+        } = q;
+        self.blob(&keyset.to_bytes());
+        self.u32(*cap);
+        let GraphTerms {
+            id,
+            unit_sats,
+            bits,
+            low_bits,
+            deposit_units,
+            close_height,
+            reserve_alice,
+            reserve_hub,
+            to_self_delay,
+            commit_fee,
+            presign_fee,
+            dust,
+            delta,
+            delta_prime,
+            deadline_margin,
+            response_window,
+            assert_height,
+            hub_challenge,
+            holder_answer,
+        } = graph;
+        self.u32(*id);
+        self.u64(*unit_sats);
+        self.u8(*bits);
+        self.u8(*low_bits);
+        self.u32(*deposit_units);
+        self.u32(*close_height);
+        self.u64(*reserve_alice);
+        self.u64(*reserve_hub);
+        self.u16(*to_self_delay);
+        self.u64(*commit_fee);
+        self.u64(*presign_fee);
+        self.u64(*dust);
+        self.u16(*delta);
+        self.u16(*delta_prime);
+        self.u32(*deadline_margin);
+        self.u16(*response_window);
+        self.u32(*assert_height);
+        self.u16(*hub_challenge);
+        self.u16(*holder_answer);
+        let Recipe {
+            graph_version,
+            holder_program,
+            counter_program,
+            full_instances,
+            full_kept,
+            corrected_instances,
+            corrected_kept,
+        } = recipe;
+        self.u32(*graph_version);
+        self.bytes(holder_program);
+        self.bytes(counter_program);
+        for n in [
+            full_instances,
+            full_kept,
+            corrected_instances,
+            corrected_kept,
+        ] {
+            self.u16(*n);
+        }
+        let ChainTerms {
+            checkpoint,
+            funding_depth,
+            request_depth,
+            publication_depth,
+            lookback,
+            observation_margin,
+            max_headers,
+        } = chain;
+        self.blob(&checkpoint.to_bytes());
+        for n in [
+            funding_depth,
+            request_depth,
+            publication_depth,
+            lookback,
+            observation_margin,
+            max_headers,
+        ] {
+            self.u32(*n);
+        }
+        let Limits {
+            max_transaction_bytes,
+            max_publication_bytes,
+            max_authorizations,
+            max_source_inputs,
+        } = limits;
+        for n in [
+            max_transaction_bytes,
+            max_publication_bytes,
+            max_authorizations,
+            max_source_inputs,
+        ] {
+            self.u32(*n);
+        }
+        let Fees {
+            sweep_fee_max,
+            external_fee_max,
+            max_rate_sat_per_kvb,
+            opening_fee_quote,
+        } = fees;
+        for n in [
+            sweep_fee_max,
+            external_fee_max,
+            max_rate_sat_per_kvb,
+            opening_fee_quote,
+        ] {
+            self.u64(*n);
+        }
+    }
+}
+
+impl Reader<'_> {
+    pub fn quote(&mut self) -> Result<Quote> {
+        let keyset = Keyset::from_bytes(self.blob()?)?;
+        let cap = self.u32()?;
+        let graph = GraphTerms {
+            id: self.u32()?,
+            unit_sats: self.u64()?,
+            bits: self.u8()?,
+            low_bits: self.u8()?,
+            deposit_units: self.u32()?,
+            close_height: self.u32()?,
+            reserve_alice: self.u64()?,
+            reserve_hub: self.u64()?,
+            to_self_delay: self.u16()?,
+            commit_fee: self.u64()?,
+            presign_fee: self.u64()?,
+            dust: self.u64()?,
+            delta: self.u16()?,
+            delta_prime: self.u16()?,
+            deadline_margin: self.u32()?,
+            response_window: self.u16()?,
+            assert_height: self.u32()?,
+            hub_challenge: self.u16()?,
+            holder_answer: self.u16()?,
+        };
+        let recipe = Recipe {
+            graph_version: self.u32()?,
+            holder_program: self.array()?,
+            counter_program: self.array()?,
+            full_instances: self.u16()?,
+            full_kept: self.u16()?,
+            corrected_instances: self.u16()?,
+            corrected_kept: self.u16()?,
+        };
+        let chain = ChainTerms {
+            checkpoint: Checkpoint::from_bytes(self.blob()?)?,
+            funding_depth: self.u32()?,
+            request_depth: self.u32()?,
+            publication_depth: self.u32()?,
+            lookback: self.u32()?,
+            observation_margin: self.u32()?,
+            max_headers: self.u32()?,
+        };
+        let limits = Limits {
+            max_transaction_bytes: self.u32()?,
+            max_publication_bytes: self.u32()?,
+            max_authorizations: self.u32()?,
+            max_source_inputs: self.u32()?,
+        };
+        let fees = Fees {
+            sweep_fee_max: self.u64()?,
+            external_fee_max: self.u64()?,
+            max_rate_sat_per_kvb: self.u64()?,
+            opening_fee_quote: self.u64()?,
+        };
+        Ok(Quote {
+            keyset,
+            cap,
+            graph,
+            recipe,
+            chain,
+            limits,
+            fees,
+        })
     }
 }
 

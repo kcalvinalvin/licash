@@ -12,7 +12,7 @@
 
 use crate::contract::{self, Opened, Statement};
 use crate::mock_statement;
-use anyhow::{anyhow, ensure, Context, Result};
+use anyhow::{anyhow, bail, ensure, Context, Result};
 use bitcoincore_rpc::json::{AddressType, FundRawTransactionOptions};
 use bitcoincore_rpc::RpcApi;
 use k256::Scalar;
@@ -39,7 +39,7 @@ use lngap_btc::bitcoin::{
 };
 use lngap_btc::regtest::Regtest;
 use lngap_lamport::winternitz::{WotsParams, WotsSig};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -266,11 +266,70 @@ pub fn open_native(
 pub fn open_native_with(
     rt: &Regtest,
     label: &str,
-    (t_a, w_h): (u32, u16),
+    deadlines: (u32, u16),
     holder: Holder,
     authority: Authority,
     tamper: Tamper<'_>,
 ) -> Result<(Opened, Native, Vec<Refusal>)> {
+    let seed = holder.seed;
+    let played = play(rt, label, deadlines, holder, authority, tamper)?;
+    let o = played.opening;
+    rt.mine(u64::from(o.base.parts().graph.to_self_delay))?;
+    let [full, corrected] = o.setups(|_, _, commitment| {
+        played
+            .kept
+            .get(commitment)
+            .cloned()
+            .context("a kept instance lost")
+    })?;
+    let alice = HolderKeys::derive(&seed, &o.base.parts().nonce);
+    Ok((
+        Opened {
+            set: o.set.into_iter().map(|x| (x.name.clone(), x)).collect(),
+            p: contract::parties(label, alice, HubKeys::from_secret(&hub_secret(label))),
+            babe: o.babe,
+            publication: o.publication,
+            signed: o.signed,
+            kept: o.kept,
+            full,
+            corrected: Some(corrected),
+            deposit: o.deposit,
+        },
+        Native {
+            base: o.base,
+            prefix: o.prefix,
+            d: o.d,
+            seed,
+        },
+        played.refused,
+    ))
+}
+
+/// The fixture hub's secret for the opening labelled `label`.
+fn hub_secret(label: &str) -> [u8; 32] {
+    sha256::Hash::hash(format!("{label}/hub").as_bytes()).to_byte_array()
+}
+
+/// An opening as its machines played it: the holder's contract, her kept
+/// instances by commitment as her driver kept them, and the messages
+/// refused on the way.
+pub struct Played {
+    pub opening: machine::Opening,
+    pub kept: HashMap<[u8; 32], Vec<u8>>,
+    pub refused: Vec<Refusal>,
+}
+
+/// Play an opening's two machines until F is on the chain, every message
+/// through `tamper`, the holder stored and loaded again after each step
+/// she takes: assertion deadline `t_a` blocks ahead, response window `w_h`.
+pub fn play(
+    rt: &Regtest,
+    label: &str,
+    (t_a, w_h): (u32, u16),
+    holder: Holder,
+    authority: Authority,
+    tamper: Tamper<'_>,
+) -> Result<Played> {
     let deposit = {
         let addr = rt
             .rpc
@@ -301,8 +360,10 @@ pub fn open_native_with(
     };
     let hub_quote = start.quote.clone();
     let (mut alice, out) = machine::Holder::with_choice(start, &ctx()?, [vec![2, 3], vec![2, 3]])?;
-    let secret = sha256::Hash::hash(format!("{label}/hub").as_bytes()).to_byte_array();
-    let mut hub = machine::Hub::with_secret(&secret, hub_quote);
+    let secrets = (holder.seed, holder.spend);
+    let mut kept = HashMap::new();
+    let out = stored(&mut alice, None, out, &ctx()?, secrets, &mut kept)?;
+    let mut hub = machine::Hub::with_secret(&hub_secret(label), hub_quote);
     let mut queue = VecDeque::new();
     let mut refused = vec![];
     let mut funded = false;
@@ -312,9 +373,26 @@ pub fn open_native_with(
             Input::Message(m) => Kind::peek(m),
             _ => None,
         };
+        let ctx = ctx()?;
         let step = match to {
-            Side::Holder => alice.step(input, &ctx()?),
-            Side::Hub => hub.step(input, &ctx()?),
+            Side::Holder => {
+                let (before, phase) = (alice.to_bytes(), alice.phase());
+                match alice.step(input, &ctx) {
+                    Ok(out) => Ok(stored(
+                        &mut alice,
+                        Some(phase),
+                        out,
+                        &ctx,
+                        secrets,
+                        &mut kept,
+                    )?),
+                    Err(e) => {
+                        ensure!(alice.to_bytes() == before, "a refusal changed her: {e:#}");
+                        Err(e)
+                    }
+                }
+            }
+            Side::Hub => hub.step(input, &ctx),
         };
         match step {
             Ok(out) => route(rt, to, out, &mut queue, tamper, &mut funded)?,
@@ -326,30 +404,51 @@ pub fn open_native_with(
         }
     }
     ensure!(funded, "the opening stalled, refusing {refused:?}");
-    let alice_keys = HolderKeys::derive(&holder.seed, &alice.id());
-    let o = alice.opening()?;
-    rt.mine(u64::from(o.base.parts().graph.to_self_delay))?;
-    let [full, corrected] = o.setups;
-    Ok((
-        Opened {
-            set: o.set.into_iter().map(|x| (x.name.clone(), x)).collect(),
-            p: contract::parties(label, alice_keys, HubKeys::from_secret(&secret)),
-            babe: o.babe,
-            publication: o.publication,
-            signed: o.signed,
-            kept: o.kept,
-            full,
-            corrected: Some(corrected),
-            deposit: o.deposit,
-        },
-        Native {
-            base: o.base,
-            prefix: o.prefix,
-            d: o.d,
-            seed: holder.seed,
-        },
+    Ok(Played {
+        opening: alice.opening()?,
+        kept,
         refused,
-    ))
+    })
+}
+
+/// What the holder asked after a step from `phase` (none, her first), as
+/// a driver that stores her carries it out: her instances kept in `store`
+/// by commitment, then her state stored and loaded again under her
+/// `secrets`, which must store the same bytes and ask again what a step to
+/// another phase asked (a step within one asks nothing more); the rest to
+/// carry out.
+fn stored(
+    alice: &mut machine::Holder,
+    phase: Option<machine::Phase>,
+    out: Vec<Out>,
+    ctx: &machine::Context,
+    (seed, spend): ([u8; 32], Scalar),
+    store: &mut HashMap<[u8; 32], Vec<u8>>,
+) -> Result<Vec<Out>> {
+    let mut rest = vec![];
+    for out in out {
+        match out {
+            Out::Keep {
+                commitment, bytes, ..
+            } => {
+                store.insert(commitment, bytes);
+            }
+            out => rest.push(out),
+        }
+    }
+    let bytes = alice.to_bytes();
+    *alice = machine::Holder::load(&bytes, seed, spend, ctx)?;
+    ensure!(alice.to_bytes() == bytes, "her state stored otherwise");
+    let now = alice.phase();
+    if phase == Some(now) {
+        ensure!(rest.is_empty(), "{now:?} again, asking {rest:?}");
+    } else {
+        ensure!(
+            alice.pending(ctx)? == rest,
+            "{now:?} asks otherwise once loaded"
+        );
+    }
+    Ok(rest)
 }
 
 /// Carry out what party `from` asks: its messages to the other through
@@ -395,6 +494,7 @@ fn route(
                 rt.send_and_confirm(&funding)?;
                 *funded = true;
             }
+            Out::Keep { .. } => bail!("an instance to keep, not kept first"),
         }
     }
     Ok(())

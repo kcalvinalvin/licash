@@ -2,18 +2,19 @@
 //! forged message of the other's, goes on as it was, and still opens on
 //! the honest one; a holder given another hub's keys never funds.
 
-use anyhow::{bail, ensure, Result};
+use anyhow::{bail, ensure, Context as _, Result};
 use bitcoincore_rpc::RpcApi;
 use k256::Scalar;
-use licash::base::{Base, Parts, ResponseKeys};
+use licash::base::{Base, Parts, Programs, ResponseKeys};
 use licash::note::IssuerKeys;
 use licash_contract::keys::HubKeys;
-use licash_contract::opening::{self as machine, Context, Quote, Start};
+use licash_contract::opening::{self as machine, Context, Input, Out, Phase, Quote, Start, Trust};
 use licash_contract::wire::{self, Envelope, Kind, Wanted};
-use licash_regtest::native::{checkpoint, open_native_with, quote, Authority, Holder};
+use licash_regtest::native::{checkpoint, open_native_with, play, quote, Authority, Holder};
 use licash_regtest::native_fixture::{point, SEED, SPEND};
 use lichen_babe::setup::Instance;
-use lngap_btc::bitcoin::{Amount, OutPoint, ScriptBuf};
+use lngap_btc::bitcoin::hashes::Hash as _;
+use lngap_btc::bitcoin::{Amount, OutPoint, ScriptBuf, Txid};
 use lngap_btc::regtest::Regtest;
 use std::collections::HashSet;
 
@@ -410,5 +411,213 @@ fn a_quote_under_her_floors_is_refused() -> Result<()> {
         machine::Holder::new(start(|_| ()), &ctx).is_ok(),
         "the floors themselves"
     );
+    Ok(())
+}
+
+/// Refused, with a reason saying `why`.
+fn refused<T>(result: Result<T>, why: &str) -> Result<()> {
+    match result {
+        Ok(_) => bail!("not refused: {why}"),
+        Err(e) => {
+            let e = format!("{e:#}");
+            ensure!(e.contains(why), "refused otherwise than {why:?}: {e}");
+            Ok(())
+        }
+    }
+}
+
+/// Her stored opening loads again only as hers: of this format,
+/// derivation and side, whole, under her seed, her spending secret and a
+/// trust of its kind and programs.
+#[test]
+fn a_stored_opening_loads_only_as_hers() -> Result<()> {
+    let rt = Regtest::start_standard()?;
+    let checkpoint = checkpoint(&rt)?;
+    let ctx = Context {
+        tip: rt.height()?,
+        trust: Authority::mock().trust(),
+    };
+    let quote = quote(holder()?.keyset, checkpoint.clone());
+    let h = rt.height()?;
+    let start = Start {
+        seed: SEED,
+        spend: Scalar::from(SPEND),
+        quote: quote.clone(),
+        // Never funded: a coin of no transaction.
+        deposit: OutPoint {
+            txid: Txid::from_byte_array([3; 32]),
+            vout: 0,
+        },
+        wanted: Wanted {
+            assert_height: h + 60,
+            close_height: h + 200,
+            response_window: 6,
+        },
+        checkpoint,
+    };
+    let (mut alice, out) = machine::Holder::new(start, &ctx)?;
+    let started = alice.to_bytes();
+    let mut hub = machine::Hub::with_secret(&[7; 32], quote);
+    let [Out::Send(open)] = &out[..] else {
+        bail!("{out:?}")
+    };
+    let out = hub.step(Input::Message(open.clone()), &ctx)?;
+    let [Out::Send(terms)] = &out[..] else {
+        bail!("{out:?}")
+    };
+    alice.step(Input::Message(terms.clone()), &ctx)?;
+    ensure!(alice.phase() == Phase::Termed, "{:?}", alice.phase());
+    let termed = alice.to_bytes();
+    let load = |bytes: &[u8], seed, spend, ctx: &Context| {
+        machine::Holder::load(bytes, seed, Scalar::from(spend), ctx)
+    };
+    for bytes in [&started, &termed] {
+        let loaded = load(bytes, SEED, SPEND, &ctx)?;
+        ensure!(loaded.to_bytes() == *bytes, "stored otherwise once loaded");
+    }
+    let changed = |at: usize, byte: u8| {
+        let mut b = termed.clone();
+        b[at] = byte;
+        b
+    };
+    let genuine = Context {
+        trust: Trust {
+            mock: false,
+            ..ctx.trust
+        },
+        ..ctx
+    };
+    let distrusted = Context {
+        trust: Trust {
+            programs: Programs {
+                holder: [1; 32],
+                ..ctx.trust.programs
+            },
+            ..ctx.trust
+        },
+        ..ctx
+    };
+    let damaged: [(Vec<u8>, &str); 9] = [
+        (changed(0, b'X'), "not an opening's state"),
+        (changed(5, 2), "of format 2"),
+        (changed(6, 2), "keys of derivation 2"),
+        (changed(7, 1), "not a holder's opening"),
+        (changed(8, 7), "phase 7"),
+        // Termed's sections under another phase.
+        (changed(8, 0), "bytes past an opening's state"),
+        (changed(8, 2), "cut short"),
+        (
+            [termed.clone(), vec![0]].concat(),
+            "bytes past an opening's state",
+        ),
+        (termed[..termed.len() - 1].to_vec(), "past the message"),
+    ];
+    for (bytes, why) in damaged {
+        refused(load(&bytes, SEED, SPEND, &ctx), why)?;
+    }
+    let other = "an opening of another seed or spending secret";
+    refused(load(&started, [9; 32], SPEND, &ctx), other)?;
+    refused(load(&termed, [9; 32], SPEND, &ctx), other)?;
+    refused(load(&termed, SEED, SPEND + 1, &ctx), other)?;
+    refused(
+        load(&termed, SEED, SPEND, &genuine),
+        "an opening under mock proofs, not genuine",
+    )?;
+    refused(
+        load(&termed, SEED, SPEND, &distrusted),
+        "programs she does not trust",
+    )?;
+    Ok(())
+}
+
+/// Her gate runs again on the hub's signatures: blocks past it while they
+/// are on their way, she signs no F, and the opening stalls.
+#[test]
+fn past_her_deadline_she_signs_no_f() -> Result<()> {
+    let rt = Regtest::start_standard()?;
+    let mut tamper = |kind: Kind, m: Vec<u8>| {
+        if kind == Kind::Signed {
+            rt.mine(60).expect("blocks past her deadline");
+        }
+        vec![m]
+    };
+    let played = play(
+        &rt,
+        "native-late",
+        (60, 6),
+        holder()?,
+        Authority::mock(),
+        &mut tamper,
+    );
+    let error = match played {
+        Ok(_) => bail!("F signed past her deadline"),
+        Err(e) => format!("{e:#}"),
+    };
+    ensure!(
+        error.contains("stalled")
+            && error.contains("by: Holder, kind: Some(Signed)")
+            && error.contains("before its deadline"),
+        "{error}"
+    );
+    Ok(())
+}
+
+/// Her driver keeps her instances: each reads back into her setups only
+/// as she kept it, not lost, not another's, not changed.
+#[test]
+fn her_kept_instances_read_back_only_as_she_kept_them() -> Result<()> {
+    let rt = Regtest::start_standard()?;
+    let played = play(
+        &rt,
+        "native-kept",
+        (60, 6),
+        holder()?,
+        Authority::mock(),
+        &mut |_, m| vec![m],
+    )?;
+    let o = &played.opening;
+    let read = |_: usize, _: usize, c: &[u8; 32]| {
+        played.kept.get(c).cloned().context("a kept instance lost")
+    };
+    ensure!(
+        o.instances.iter().all(|k| k.len() == 2),
+        "{:?}",
+        o.instances
+    );
+    let [a, b] = [o.instances[0][0], o.instances[1][1]];
+    o.setups(read)?;
+    refused(
+        o.setups(|s, i, c| match (s, i) {
+            (1, 3) => bail!("a kept instance lost"),
+            _ => read(s, i, c),
+        }),
+        "a kept instance lost",
+    )?;
+    // Another of hers in its place: of her other assertion, or this one.
+    refused(
+        o.setups(|s, i, c| match (s, i) {
+            (0, 3) => read(0, a.index, &a.commitment),
+            _ => read(s, i, c),
+        }),
+        "instance 3 of assertion 0 not the one she kept",
+    )?;
+    refused(
+        o.setups(|s, i, c| match (s, i) {
+            (0, 3) => read(1, b.index, &b.commitment),
+            _ => read(s, i, c),
+        }),
+        "instance 3 of assertion 0 not the one she kept",
+    )?;
+    refused(
+        o.setups(|s, i, c| {
+            let mut bytes = read(s, i, c)?;
+            if (s, i) == (1, 2) {
+                let n = bytes.len() / 2;
+                bytes[n] ^= 1;
+            }
+            Ok(bytes)
+        }),
+        "instance",
+    )?;
     Ok(())
 }
