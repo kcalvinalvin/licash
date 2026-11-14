@@ -14,7 +14,7 @@ repos:
     hooks:
       - id: cargo-fmt
         name: cargo fmt
-        entry: sh -c 'cargo fmt --all -- --check && cargo fmt --manifest-path r0/native-guest/Cargo.toml -- --check && cargo fmt --manifest-path r0/native-counter-guest/Cargo.toml -- --check && cargo fmt --manifest-path r0/host/Cargo.toml -- --check && cargo fmt --manifest-path regtest/Cargo.toml -- --check'
+        entry: sh -c 'cargo fmt --all -- --check && cargo fmt --manifest-path r0/native-guest/Cargo.toml -- --check && cargo fmt --manifest-path r0/native-counter-guest/Cargo.toml -- --check && cargo fmt --manifest-path r0/host/Cargo.toml -- --check && cargo fmt --manifest-path regtest/Cargo.toml -p licash-regtest -p licash-contract -- --check'
         language: system
         types: [rust]
         pass_filenames: false
@@ -33,7 +33,7 @@ repos:
         exclude: ^apps/mobile/chain/upstream/
       - id: regtest-clippy
         name: regtest cargo clippy
-        entry: cargo clippy --locked --manifest-path regtest/Cargo.toml --all-targets --no-deps -- -D warnings
+        entry: cargo clippy --locked --manifest-path regtest/Cargo.toml --workspace --all-targets --no-deps -- -D warnings
         language: system
         types: [rust]
         pass_filenames: false

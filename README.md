@@ -23,12 +23,14 @@ research implementation; it has not had a security review.
   at one hub for notes at another, with a timed lock at each.
 - `crates/licash-onchain`: Bitcoin outside the protocol: silent payments
   (BIP352).
+- `crates/licash-contract`: the contract's BABE transaction graph, on
+  Lichen and ln-gap (built in regtest's workspace).
 - `crates/licash-groth16`: RISC Zero Groth16 receipt verification, used
   inside the holder's program and on the host.
 - `r0/`: the holder's and the hub's programs for the RISC Zero zkVM, and a
   host that executes and proves them. See [r0/README.md](r0/README.md).
-- `regtest/`: the contract's BABE transaction graph and end-to-end tests on
-  Bitcoin Core and LND. See [regtest/README.md](regtest/README.md).
+- `regtest/`: the contract played end to end on Bitcoin Core and LND. See
+  [regtest/README.md](regtest/README.md).
 - `apps/`: the applications, a workspace of their own: the hub service
   (`apps/hub`), the swap provider service (`apps/swaps`), the wallet CLI
   (`apps/wallet-cli`), their HTTP transport (`apps/transport`), Tor

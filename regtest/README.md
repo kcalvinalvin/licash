@@ -1,10 +1,11 @@
 # Bitcoin integration
 
-The contract on Bitcoin: Lichen's BABE transaction graph (`src/graph.rs`,
-played by `src/contract.rs`), opened from licash's Base (`src/native.rs`),
-with end-to-end tests that fund real contracts on a fresh Bitcoin Core 30
-regtest node under the default relay policy. The garbled circuits are real;
-proofs are mocked (a test key) except in `tests/native_real_proof.rs`.
+The contract on Bitcoin: Lichen's BABE transaction graph
+(`crates/licash-contract`, played by `src/contract.rs`), opened from
+licash's Base (`src/native.rs`), with end-to-end tests that fund real
+contracts on a fresh Bitcoin Core 30 regtest node under the default relay
+policy. The garbled circuits are real; proofs are mocked (a test key)
+except in `tests/native_real_proof.rs`.
 
 ## Prerequisites
 

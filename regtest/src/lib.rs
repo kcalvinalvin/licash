@@ -5,7 +5,7 @@
 //! are mocked here (`mock_proof`); `r0/` runs and proves the real guests.
 
 pub mod contract;
-pub mod graph;
+pub use licash_contract::graph;
 pub mod htlc;
 pub mod lnd;
 pub mod native;

@@ -1333,6 +1333,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "licash-contract"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "lichen-babe",
+ "lngap-btc",
+ "lngap-channel",
+ "lngap-lamport",
+ "lngap-sessions",
+ "serde",
+]
+
+[[package]]
 name = "licash-groth16"
 version = "0.1.0"
 dependencies = [
@@ -1353,6 +1366,7 @@ dependencies = [
  "hex",
  "k256",
  "licash",
+ "licash-contract",
  "licash-groth16",
  "lichen-babe",
  "lngap-btc",

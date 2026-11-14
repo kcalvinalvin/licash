@@ -5,12 +5,14 @@ edition = "2021"
 publish = false
 description = "licash's recovery contract on Lichen's BABE graph, played on a local regtest"
 
-# A workspace of its own: it pulls Lichen and ln-gap by path, which the core
-# library must not depend on.
+# A workspace of its own, with the contract library: they pull Lichen and
+# ln-gap by path, which the core library must not depend on.
 [workspace]
+members = ["../crates/licash-contract"]
 
 [dependencies]
 licash = { path = "../crates/licash" }
+licash-contract = { path = "../crates/licash-contract" }
 lichen-babe = { path = "../../lichen/crates/babe" }
 licash-groth16 = { path = "../crates/licash-groth16" }
 lngap-btc = { path = "../../ln-gap/crates/btc" }

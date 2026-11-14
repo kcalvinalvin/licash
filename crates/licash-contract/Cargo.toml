@@ -1,0 +1,21 @@
+[package]
+name = "licash-contract"
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "licash's recovery contract on Lichen's BABE transaction graph"
+# A member of regtest's workspace, not the core one: it pulls Lichen and
+# ln-gap by path, which the core library must not depend on, and shares
+# regtest's lock and its patch of BitVMX-CPU.
+workspace = "../../regtest"
+
+[dependencies]
+anyhow = "1"
+lichen-babe = { path = "../../../lichen/crates/babe" }
+lngap-btc = { path = "../../../ln-gap/crates/btc" }
+lngap-channel = { path = "../../../ln-gap/crates/channel" }
+lngap-lamport = { path = "../../../ln-gap/crates/lamport" }
+lngap-sessions = { path = "../../../ln-gap/crates/apps/sessions" }
+serde = { version = "1", features = ["derive"] }
+

@@ -9,9 +9,9 @@ members = [
     "crates/licash-wallet",
 ]
 # r0/ (RISC Zero guests and host), regtest/ (Bitcoin integration, needs
-# ../lichen and ../ln-gap) and apps/ (the applications) are workspaces of
-# their own.
-exclude = ["r0", "regtest", "apps", "crates/licash-groth16"]
+# ../lichen and ../ln-gap, with crates/licash-contract) and apps/ (the
+# applications) are workspaces of their own.
+exclude = ["r0", "regtest", "apps", "crates/licash-groth16", "crates/licash-contract"]
 
 [workspace.package]
 version = "0.0.1"
