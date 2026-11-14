@@ -333,13 +333,11 @@ pub fn play(
     authority: Authority,
     tamper: Tamper<'_>,
 ) -> Result<Played> {
-    let deposit = {
-        let addr = rt
-            .rpc
-            .get_new_address(None, Some(AddressType::Bech32m))?
-            .assume_checked();
-        rt.fund(&addr.script_pubkey(), Amount::from_sat(500_000))?.0
+    let address = |kind| -> Result<ScriptBuf> {
+        let addr = rt.rpc.get_new_address(None, Some(kind))?;
+        Ok(addr.assume_checked().script_pubkey())
     };
+    let (deposit, coin) = rt.fund(&address(AddressType::Bech32m)?, Amount::from_sat(500_000))?;
     let h = rt.height()?;
     let checkpoint = checkpoint(rt)?;
     let trust = authority.trust();
@@ -354,6 +352,8 @@ pub fn play(
         spend: holder.spend,
         quote: quote(holder.keyset, checkpoint.clone()),
         deposit,
+        coin,
+        change: address(AddressType::Bech32)?,
         wanted: Wanted {
             assert_height: h + t_a,
             close_height: h + t_a + 140,
@@ -550,17 +550,12 @@ fn route(
             }
             Out::Fund {
                 deposit,
-                graph,
+                coin: _,
+                outputs,
                 publication,
             } => {
-                let (funding, publication) = fund(rt, deposit, graph, &publication)?;
-                queue.push_back((
-                    from,
-                    Input::Funded {
-                        funding,
-                        publication: Box::new(publication),
-                    },
-                ));
+                let (funding, prevouts) = fund(rt, deposit, outputs, &publication)?;
+                queue.push_back((from, Input::Funded { funding, prevouts }));
             }
             Out::Sign(funding) => {
                 let f = rt
@@ -580,14 +575,19 @@ fn route(
     Ok(())
 }
 
-/// F from Core's coins, spending `deposit` and paying `graph`, unsigned
-/// (its coins stay reserved), and the five publication coins.
+/// F from Core's coins, spending `deposit` and paying `outputs` and the
+/// five publication coins, 20 000 sat each, unsigned (its coins stay
+/// reserved), and the coins it spends.
 fn fund(
     rt: &Regtest,
     deposit: OutPoint,
-    graph: TxOut,
+    outputs: Vec<TxOut>,
     publication: &[ScriptBuf; 5],
-) -> Result<(Transaction, [(OutPoint, TxOut); 5])> {
+) -> Result<(Transaction, Vec<TxOut>)> {
+    let coins = publication.iter().map(|script| TxOut {
+        value: Amount::from_sat(20_000),
+        script_pubkey: script.clone(),
+    });
     let unsigned = Transaction {
         version: transaction::Version::TWO,
         lock_time: absolute::LockTime::ZERO,
@@ -595,7 +595,7 @@ fn fund(
             previous_output: deposit,
             ..Default::default()
         }],
-        output: vec![graph],
+        output: outputs.into_iter().chain(coins).collect(),
     };
     let funding = rt
         .rpc
@@ -609,11 +609,15 @@ fn fund(
             None,
         )?
         .transaction()?;
-    let mut coins = vec![];
-    for script in publication {
-        coins.push(rt.fund(script, Amount::from_sat(20_000))?);
-    }
-    Ok((funding, coins.try_into().unwrap()))
+    let prevouts = funding
+        .input
+        .iter()
+        .map(|i| {
+            let o = i.previous_output;
+            Ok(rt.get_tx(&o.txid)?.output[o.vout as usize].clone())
+        })
+        .collect::<Result<_>>()?;
+    Ok((funding, prevouts))
 }
 
 /// Where a confirmed transaction is: height, raw block and position.

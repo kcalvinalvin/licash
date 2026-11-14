@@ -15,11 +15,13 @@ use licash_contract::opening::{
 };
 use licash_contract::wire::{self, Envelope, Kind, Wanted};
 use licash_regtest::mock_statement;
-use licash_regtest::native::{checkpoint, open_native_with, play, quote, Authority, Holder};
+use licash_regtest::native::{
+    checkpoint, open_native_with, play, quote, Authority, Holder, Refusal, Side,
+};
 use licash_regtest::native_fixture::{point, SEED, SPEND};
 use lichen_babe::setup::{instance, Instance};
 use lngap_btc::bitcoin::hashes::Hash as _;
-use lngap_btc::bitcoin::{Amount, OutPoint, ScriptBuf, Txid};
+use lngap_btc::bitcoin::{Amount, OutPoint, ScriptBuf, TxOut, Txid};
 use lngap_btc::regtest::Regtest;
 use std::collections::HashSet;
 
@@ -325,6 +327,207 @@ fn forged_messages_are_refused_and_the_opening_goes_on() -> Result<()> {
     Ok(())
 }
 
+/// The hub's Opens forged on her deposit: not a taproot coin, short of her
+/// price, her change to a script not native segwit.
+fn unopened(bytes: &[u8], price: u64) -> Result<Vec<Vec<u8>>> {
+    let o = |f: &dyn Fn(&mut wire::Open)| forged(bytes, wire::Open::decode, wire::Open::encode, f);
+    Ok(vec![
+        o(&|o| o.coin.script_pubkey = change())?,
+        o(&|o| o.coin.value = Amount::from_sat(price - 1))?,
+        o(&|o| o.change = p2pkh())?,
+        bytes.to_vec(),
+    ])
+}
+
+/// The hub's Commits forged on what F takes of her deposit, `open`'s, and
+/// spends besides: her change short, over, twice or not paid, her deposit
+/// said to be another coin, a coin of the hub's not native segwit, a coin
+/// unsaid, a publication coin not F's output.
+fn unfunded(bytes: &[u8], open: &wire::Open) -> Result<Vec<Vec<u8>>> {
+    let honest = wire::Commit::decode(&Envelope::from_bytes(bytes)?.body)?;
+    let f = &honest.funding;
+    let change = f.output.iter().position(|o| o.script_pubkey == open.change);
+    let change = change.context("her change paid")?;
+    let deposit = f
+        .input
+        .iter()
+        .position(|i| i.previous_output == open.deposit);
+    let deposit = deposit.context("her deposit spent")?;
+    let other = (0..f.input.len()).find(|i| *i != deposit);
+    let other = other.context("a coin of the hub's")?;
+    let c = |f: &dyn Fn(&mut wire::Commit)| {
+        forged(bytes, wire::Commit::decode, wire::Commit::encode, f)
+    };
+    let sat = Amount::from_sat(1);
+    Ok(vec![
+        c(&|c| c.funding.output[change].value -= sat)?,
+        c(&|c| c.funding.output[change].value += sat)?,
+        c(&|c| c.funding.output.push(c.funding.output[change].clone()))?,
+        c(&|c| {
+            c.funding.output.remove(change);
+        })?,
+        c(&|c| c.prevouts[deposit].value += sat)?,
+        c(&|c| c.prevouts[deposit].script_pubkey = coin().script_pubkey)?,
+        c(&|c| c.prevouts[other].script_pubkey = p2pkh())?,
+        c(&|c| {
+            c.prevouts.pop();
+        })?,
+        c(&|c| c.publication[0].0.vout += 100)?,
+        bytes.to_vec(),
+    ])
+}
+
+/// The hub opens only on her deposit as a taproot coin worth her price,
+/// her change to native segwit; she takes F only spending her deposit as
+/// she named it among coins she can sign for (native segwit, each said),
+/// paying her change as owed, once, and the publication coins as its
+/// outputs. Each forgery is refused and the opening funds on the honest.
+#[test]
+fn f_spends_her_deposit_as_she_named_it_and_pays_her_change() -> Result<()> {
+    let rt = Regtest::start_standard()?;
+    let q = quote(holder()?.keyset, checkpoint(&rt)?);
+    let price = q.graph.reserve_alice + q.fees.opening_fee_quote;
+    let mut open = None;
+    let mut seen = HashSet::new();
+    let mut tamper = |kind: Kind, m: Vec<u8>| {
+        if !seen.insert(kind as u8) {
+            return vec![m];
+        }
+        match kind {
+            Kind::Open => {
+                let body = Envelope::from_bytes(&m).expect("a message").body;
+                open = Some(wire::Open::decode(&body).expect("an Open"));
+                unopened(&m, price).expect("forgeries")
+            }
+            Kind::Commit => {
+                let open = open.as_ref().expect("an Open before");
+                unfunded(&m, open).expect("forgeries")
+            }
+            _ => vec![m],
+        }
+    };
+    let (c, _, refused) = open_native_with(
+        &rt,
+        "native-unfunded",
+        (60, 6),
+        holder()?,
+        Authority::mock(),
+        &mut tamper,
+    )?;
+    use licash_regtest::native::Side::{Holder as H, Hub};
+    let owed = 500_000 - price;
+    let paying = |v: &[u64]| format!("F pays her change {v:?}, not {owed}");
+    let expected = [
+        (Hub, Kind::Open, "a deposit not a taproot coin".to_string()),
+        (
+            Hub,
+            Kind::Open,
+            format!("a deposit of {} short of her {price}", price - 1),
+        ),
+        (
+            Hub,
+            Kind::Open,
+            "change to a script not native segwit".into(),
+        ),
+        (H, Kind::Commit, paying(&[owed - 1])),
+        (H, Kind::Commit, paying(&[owed + 1])),
+        (H, Kind::Commit, paying(&[owed, owed])),
+        (H, Kind::Commit, paying(&[])),
+        (H, Kind::Commit, "her deposit spent as another coin".into()),
+        (H, Kind::Commit, "her deposit spent as another coin".into()),
+        (H, Kind::Commit, "F spends a coin not native segwit".into()),
+        (H, Kind::Commit, "coins for F's".into()),
+        (H, Kind::Commit, "a publication coin not F's output".into()),
+    ];
+    refusals_are(&refused, &expected)?;
+    let d = c.deposit;
+    ensure!(
+        rt.rpc.get_tx_out(&d.txid, d.vout, Some(false))?.is_none(),
+        "F spends the deposit"
+    );
+    Ok(())
+}
+
+/// A holder saying her deposit is worth more than it is would be paid
+/// change from the hub's coins: given the coins F spends as they are, the
+/// hub commits to no such F, and the opening stalls.
+#[test]
+fn a_hub_pays_no_change_her_deposit_does_not_hold() -> Result<()> {
+    let rt = Regtest::start_standard()?;
+    let mut tamper = |kind: Kind, m: Vec<u8>| match kind {
+        Kind::Open => {
+            let more = |o: &mut wire::Open| o.coin.value += Amount::from_sat(100_000);
+            vec![forged(&m, wire::Open::decode, wire::Open::encode, more).expect("an Open")]
+        }
+        _ => vec![m],
+    };
+    let opened = open_native_with(
+        &rt,
+        "native-inflated",
+        (60, 6),
+        holder()?,
+        Authority::mock(),
+        &mut tamper,
+    );
+    let error = match opened {
+        Ok(_) => bail!("opened paying change her deposit does not hold"),
+        Err(e) => format!("{e:#}"),
+    };
+    ensure!(
+        error.contains("stalled")
+            && error.contains("by: Hub, kind: None")
+            && error.contains("her deposit spent as another coin"),
+        "{error}"
+    );
+    Ok(())
+}
+
+/// She opens only on a deposit F can spend as she signs it: a taproot coin
+/// worth her reserve and her fee, her change paid to native segwit.
+#[test]
+fn her_deposit_is_a_taproot_coin_worth_her_price() -> Result<()> {
+    let rt = Regtest::start_standard()?;
+    let checkpoint = checkpoint(&rt)?;
+    let ctx = Context {
+        tip: rt.height()?,
+        trust: Authority::mock().trust(),
+    };
+    let quote = quote(holder()?.keyset, checkpoint.clone());
+    let price = quote.graph.reserve_alice + quote.fees.opening_fee_quote;
+    let start = |coin: TxOut, change: ScriptBuf| Start {
+        seed: SEED,
+        spend: Scalar::from(SPEND),
+        quote: quote.clone(),
+        deposit: OutPoint::null(),
+        coin,
+        change,
+        wanted: Wanted {
+            assert_height: 200,
+            close_height: 400,
+            response_window: 6,
+        },
+        checkpoint: checkpoint.clone(),
+    };
+    let worth = |sat| TxOut {
+        value: Amount::from_sat(sat),
+        ..coin()
+    };
+    let segwit_v0 = TxOut {
+        script_pubkey: change(),
+        ..coin()
+    };
+    let new = |coin, change| machine::Holder::new(start(coin, change), &ctx);
+    refused(new(segwit_v0, change()), "a deposit not a taproot coin")?;
+    let short = format!("a deposit of {} short of her {price}", price - 1);
+    refused(new(worth(price - 1), change()), &short)?;
+    refused(new(coin(), p2pkh()), "change to a script not native segwit")?;
+    ensure!(
+        new(worth(price), change()).is_ok(),
+        "a deposit of her price"
+    );
+    Ok(())
+}
+
 /// A man in the middle swaps the hub's response keys in Base: the holder
 /// answers it, but refuses the hub's F, which pays another graph under
 /// another D, and the opening stalls before anyone signs F.
@@ -379,6 +582,8 @@ fn a_quote_under_her_floors_is_refused() -> Result<()> {
             spend: Scalar::from(SPEND),
             quote,
             deposit: OutPoint::null(),
+            coin: coin(),
+            change: change(),
             wanted: Wanted {
                 assert_height: 200,
                 close_height: 400,
@@ -419,6 +624,24 @@ fn a_quote_under_her_floors_is_refused() -> Result<()> {
     Ok(())
 }
 
+/// Refused as `expected` says, in delivery order: each refusal's party,
+/// kind and a part of its reason.
+fn refusals_are(refused: &[Refusal], expected: &[(Side, Kind, String)]) -> Result<()> {
+    let matches = refused.len() == expected.len()
+        && refused.iter().zip(expected).all(|(r, (by, kind, why))| {
+            r.by == *by && r.kind == Some(*kind) && r.error.contains(why.as_str())
+        });
+    ensure!(
+        matches,
+        "refused {:#?}",
+        refused
+            .iter()
+            .map(|r| format!("{:?} {:?}: {}", r.by, r.kind, r.error))
+            .collect::<Vec<_>>()
+    );
+    Ok(())
+}
+
 /// Refused, with a reason saying `why`.
 fn refused<T>(result: Result<T>, why: &str) -> Result<()> {
     match result {
@@ -453,6 +676,8 @@ fn a_stored_opening_loads_only_as_hers() -> Result<()> {
             txid: Txid::from_byte_array([3; 32]),
             vout: 0,
         },
+        coin: coin(),
+        change: change(),
         wanted: Wanted {
             assert_height: h + 60,
             close_height: h + 200,
@@ -533,6 +758,24 @@ fn a_stored_opening_loads_only_as_hers() -> Result<()> {
         "programs she does not trust",
     )?;
     Ok(())
+}
+
+/// A deposit of no chain's: a taproot coin of 500 000 sat.
+fn coin() -> TxOut {
+    TxOut {
+        value: Amount::from_sat(500_000),
+        script_pubkey: ScriptBuf::from_bytes([&[0x51, 0x20][..], &[7; 32]].concat()),
+    }
+}
+
+/// A change script of no one's: native segwit, of a key's hash.
+fn change() -> ScriptBuf {
+    ScriptBuf::from_bytes([&[0x00, 0x14][..], &[8; 20]].concat())
+}
+
+/// A script of no one's key's hash, not segwit.
+fn p2pkh() -> ScriptBuf {
+    ScriptBuf::from_bytes([&[0x76, 0xa9, 0x14][..], &[8; 20], &[0x88, 0xac]].concat())
 }
 
 /// Her gate runs again on the hub's signatures: blocks past it while they

@@ -319,6 +319,11 @@ pub struct Open {
     pub spend_root: Point,
     pub party: PartyPubKeys,
     pub deposit: OutPoint,
+    /// Her deposit's coin: a taproot output, whose value F pays her
+    /// reserve, her fee and her change from.
+    pub coin: TxOut,
+    /// Where F pays her change.
+    pub change: ScriptBuf,
     pub wanted: Wanted,
     /// Whether she trusts mock proofs: an opening of either kind only.
     pub mock: bool,
@@ -338,6 +343,8 @@ impl Open {
         w.bytes(&self.spend_root.0);
         w.party(&self.party);
         w.outpoint(&self.deposit);
+        w.txout(&self.coin);
+        w.blob(self.change.as_bytes());
         w.u32(self.wanted.assert_height);
         w.u32(self.wanted.close_height);
         w.u16(self.wanted.response_window);
@@ -350,6 +357,8 @@ impl Open {
             spend_root: Point(r.array()?),
             party: r.party()?,
             deposit: r.outpoint()?,
+            coin: r.txout()?,
+            change: ScriptBuf::from_bytes(r.blob()?.to_vec()),
             wanted: Wanted {
                 assert_height: r.u32()?,
                 close_height: r.u32()?,
@@ -415,12 +424,14 @@ impl Keys {
     }
 }
 
-/// M4, the hub's: F as it funds it, unsigned, the publication coins it
-/// funded, final D, and for each assertion its dealing and its instances'
-/// commitments, all before the holder chooses.
+/// M4, the hub's: F as it funds it, unsigned, the coins it spends (one
+/// per input, in order), the publication coins among its outputs, final
+/// D, and for each assertion its dealing and its instances' commitments,
+/// all before the holder chooses.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Commit {
     pub funding: Transaction,
+    pub prevouts: Vec<TxOut>,
     pub publication: [(OutPoint, TxOut); 5],
     pub d: [u8; 32],
     pub dealings: [Dealing; STAGES],
@@ -431,6 +442,8 @@ impl Commit {
     pub fn encode(&self) -> Vec<u8> {
         let mut w = Writer::default();
         w.tx(&self.funding);
+        w.count(self.prevouts.len());
+        self.prevouts.iter().for_each(|o| w.txout(o));
         for (outpoint, txout) in &self.publication {
             w.outpoint(outpoint);
             w.txout(txout);
@@ -443,11 +456,13 @@ impl Commit {
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         let mut r = Reader(bytes);
         let funding = r.tx()?;
+        let prevouts = (0..r.count(4)?).map(|_| r.txout()).collect::<Result<_>>()?;
         let publication: Vec<(OutPoint, TxOut)> = (0..5)
             .map(|_| Ok((r.outpoint()?, r.txout()?)))
             .collect::<Result<_>>()?;
         let commit = Self {
             funding,
+            prevouts,
             publication: publication.try_into().expect("five coins"),
             d: r.array()?,
             dealings: stages(&mut r, |r| r.dealing())?,
@@ -921,6 +936,8 @@ mod tests {
             spend_root: Point([2; 33]),
             party: keys.party.public(),
             deposit: outpoint(3),
+            coin: tx().output[0].clone(),
+            change: ScriptBuf::from_bytes(vec![0x51, 0x20, 7]),
             wanted: Wanted {
                 assert_height: 160,
                 close_height: 300,
@@ -968,6 +985,7 @@ mod tests {
         let hub = HubKeys::from_secret(&[3; 32]);
         let commit = Commit {
             funding: tx(),
+            prevouts: tx().output,
             publication: std::array::from_fn(|i| (outpoint(i as u8), tx().output[0].clone())),
             d: [4; 32],
             dealings: [hub.full.dealing.clone(), hub.corrected.dealing.clone()],

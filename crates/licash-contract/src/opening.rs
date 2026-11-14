@@ -110,11 +110,11 @@ pub fn journal(base: &Base, d: &FinalDigest, c: u32) -> Journal {
 pub enum Input {
     /// A message from the other party.
     Message(Vec<u8>),
-    /// The hub's F as it funded it, unsigned, and the five publication
-    /// coins: the answer to [`Out::Fund`].
+    /// The hub's F as it funded it, unsigned, and the coins it spends,
+    /// one per input: the answer to [`Out::Fund`].
     Funded {
         funding: Transaction,
-        publication: Box<[(OutPoint, TxOut); 5]>,
+        prevouts: Vec<TxOut>,
     },
     /// The holder's F with her inputs signed: the answer to [`Out::Sign`].
     Signed(Transaction),
@@ -137,12 +137,15 @@ pub enum Out {
     /// The hub's: send the holder her kept instance `index` (0-based) of
     /// assertion `stage`, the message [`Hub::instance`] builds again.
     Serve { stage: usize, index: usize },
-    /// The hub's: fund F, paying `graph` and spending the holder's
-    /// `deposit` among its inputs, and five coins paying `publication`;
+    /// The hub's: fund F, spending the holder's `deposit`, the coin
+    /// `coin`, among native segwit inputs of its own, paying `outputs` as
+    /// they are (the graph's, and her change if she is owed any) and each
+    /// of the `publication` scripts once, worth what the hub chooses;
     /// answer [`Input::Funded`].
     Fund {
         deposit: OutPoint,
-        graph: TxOut,
+        coin: TxOut,
+        outputs: Vec<TxOut>,
         publication: [ScriptBuf; 5],
     },
     /// The holder's: sign her inputs of F; answer [`Input::Signed`].
@@ -188,6 +191,122 @@ fn party_pub(p: &Party) -> Result<PartyPubKeys> {
 
 fn deposit(base: &Base) -> Result<OutPoint> {
     Ok(deserialize(&base.parts().deposit)?)
+}
+
+/// Whether `script` is native segwit, whose spends' scriptSigs are empty:
+/// their signatures cannot change the txid of F, which R and the
+/// publication coins spend before it is signed.
+fn segwit(script: &ScriptBuf) -> bool {
+    script.is_p2wpkh() || script.is_p2wsh() || script.is_p2tr()
+}
+
+/// What the holder pays into F: her reserve and her fee.
+fn price(graph: &GraphTerms, fees: &Fees) -> Result<u64> {
+    graph
+        .reserve_alice
+        .checked_add(fees.opening_fee_quote)
+        .context("a price past money")
+}
+
+/// Refused unless her deposit is a taproot coin worth her price, whose
+/// signature commits to every coin F spends (a coin lied about voids it
+/// rather than letting F spend otherwise), and her change native segwit.
+fn check_deposit(open: &wire::Open, graph: &GraphTerms, fees: &Fees) -> Result<()> {
+    ensure!(
+        open.coin.script_pubkey.is_p2tr(),
+        "a deposit not a taproot coin"
+    );
+    ensure!(segwit(&open.change), "change to a script not native segwit");
+    let price = price(graph, fees)?;
+    ensure!(
+        open.coin.value.to_sat() >= price,
+        "a deposit of {} short of her {price}",
+        open.coin.value.to_sat()
+    );
+    Ok(())
+}
+
+/// The change F owes the holder of `open`: her deposit but her price, none
+/// below dust, which F's fee takes.
+fn change(base: &Base, open: &wire::Open) -> Result<Option<TxOut>> {
+    let p = base.parts();
+    let left = open
+        .coin
+        .value
+        .to_sat()
+        .checked_sub(price(&p.graph, &p.fees)?)
+        .context("a deposit short of her price")?;
+    Ok((left >= p.graph.dust).then(|| TxOut {
+        value: Amount::from_sat(left),
+        script_pubkey: open.change.clone(),
+    }))
+}
+
+/// F funded for the holder of `open`: spending `prevouts`, one per input,
+/// each native segwit and her deposit's as hers; paying her change as
+/// owed, and each of the `scripts` once, the publication coins it gives.
+fn check_funds(
+    base: &Base,
+    open: &wire::Open,
+    funding: &Transaction,
+    prevouts: &[TxOut],
+    scripts: &[ScriptBuf; 5],
+) -> Result<[(OutPoint, TxOut); 5]> {
+    ensure!(
+        prevouts.len() == funding.input.len(),
+        "{} coins for F's {} inputs",
+        prevouts.len(),
+        funding.input.len()
+    );
+    for (input, coin) in funding.input.iter().zip(prevouts) {
+        ensure!(
+            input.previous_output != open.deposit || *coin == open.coin,
+            "her deposit spent as another coin"
+        );
+        ensure!(
+            segwit(&coin.script_pubkey),
+            "F spends a coin not native segwit"
+        );
+    }
+    let paying: Vec<&TxOut> = funding
+        .output
+        .iter()
+        .filter(|o| o.script_pubkey == open.change)
+        .collect();
+    match change(base, open)? {
+        Some(owed) => ensure!(
+            paying == [&owed],
+            "F pays her change {:?}, not {}",
+            paying.iter().map(|o| o.value.to_sat()).collect::<Vec<_>>(),
+            owed.value.to_sat()
+        ),
+        None => ensure!(paying.is_empty(), "F pays her change, none owed"),
+    }
+    let txid = funding.compute_txid();
+    let coins: Vec<(OutPoint, TxOut)> = scripts
+        .iter()
+        .enumerate()
+        .map(|(i, script)| {
+            let at: Vec<usize> = (0..funding.output.len())
+                .filter(|v| funding.output[*v].script_pubkey == *script)
+                .collect();
+            ensure!(
+                at.len() == 1,
+                "F pays publication coin {i} {} times",
+                at.len()
+            );
+            let vout = u32::try_from(at[0])?;
+            Ok((OutPoint { txid, vout }, funding.output[at[0]].clone()))
+        })
+        .collect::<Result<_>>()?;
+    Ok(coins.try_into().expect("five coins"))
+}
+
+/// The scripts of the publication coins of the graph `draft`.
+fn publication_scripts(base: &Base, draft: &Babe) -> Result<[ScriptBuf; 5]> {
+    Ok(draft
+        .publication_trees(&disclosure(base)?)?
+        .map(|t| t.script_pubkey()))
 }
 
 fn spend_root(spend: &Scalar) -> Point {
@@ -488,8 +607,12 @@ pub struct Start {
     pub spend: Scalar,
     /// The hub's terms she opens on, notes of its keyset among them.
     pub quote: Quote,
-    /// Her coin F spends, Base's `O_D`.
+    /// Her coin F spends, Base's `O_D`: a taproot output, `coin`, worth
+    /// at least her reserve and her fee.
     pub deposit: OutPoint,
+    pub coin: TxOut,
+    /// Where F pays her the rest of her deposit: a native segwit script.
+    pub change: ScriptBuf,
     pub wanted: wire::Wanted,
     /// Her own view of the chain, which Base's checkpoint must be.
     pub checkpoint: Checkpoint,
@@ -623,6 +746,8 @@ impl Holder {
         start.quote.check(start.checkpoint.profile())?;
         let id = Base::fresh_nonce();
         let holder = Self::started(start, id, ctx.trust.mock, fixed);
+        let q = &holder.start.quote;
+        check_deposit(&holder.open(), &q.graph, &q.fees)?;
         let out = vec![send(Kind::Open, id, holder.open().encode())];
         Ok((holder, out))
     }
@@ -656,6 +781,8 @@ impl Holder {
             spend_root: spend_root(&self.start.spend),
             party: self.keys.party.public(),
             deposit: self.start.deposit,
+            coin: self.start.coin.clone(),
+            change: self.start.change.clone(),
             wanted: self.start.wanted,
             mock: self.mock,
         }
@@ -779,7 +906,9 @@ impl Holder {
         send(Kind::Choose, self.id, choose.encode())
     }
 
-    /// The hub's commitment checked; F frozen on it.
+    /// The hub's commitment checked: F unsigned, spending her deposit once
+    /// as hers and coins she can sign for with it, paying her change as
+    /// owed and the publication coins it names, frozen on it.
     fn check_commit(&self, c: &wire::Commit) -> Result<Frozen> {
         let (base, keys) = self.base.as_ref().context("Commit before Terms")?;
         let deposit = self.start.deposit;
@@ -806,6 +935,9 @@ impl Holder {
             );
         }
         let frozen = freeze(base, keys, &draft, c.funding.clone(), c.publication.clone())?;
+        let scripts = trees.each_ref().map(|t| t.script_pubkey());
+        let coins = check_funds(base, &self.open(), &c.funding, &c.prevouts, &scripts)?;
+        ensure!(coins == c.publication, "a publication coin not F's output");
         ensure!(*frozen.d.as_bytes() == c.d, "D not hers");
         for (dealing, commitments) in c.dealings.iter().zip(&c.commitments) {
             ensure!(
@@ -1363,10 +1495,7 @@ impl Hub {
                     other => bail!("a hub is not sent {other:?}"),
                 }
             }
-            Input::Funded {
-                funding,
-                publication,
-            } => self.fund(funding, *publication, ctx),
+            Input::Funded { funding, prevouts } => self.fund(funding, prevouts, ctx),
             Input::Signed(_) => bail!("the holder signs her inputs"),
         }
     }
@@ -1388,6 +1517,7 @@ impl Hub {
     fn open(&mut self, id: [u8; 32], body: &[u8], ctx: &Context) -> Result<Vec<Out>> {
         ensure!(self.base.is_none(), "Open again");
         let o = wire::Open::decode(body)?;
+        check_deposit(&o, &self.quote.graph, &self.quote.fees)?;
         let base = self.offer(id, &o, ctx.trust.programs, ctx)?;
         let out = vec![send(Kind::Terms, id, base.to_bytes())];
         self.id = Some(id);
@@ -1428,16 +1558,16 @@ impl Hub {
         Ok(out)
     }
 
-    /// F to fund, paying `draft`'s graph and spending her deposit, and
-    /// the publication coins.
+    /// F to fund, spending her deposit and paying `draft`'s graph, her
+    /// change and the publication coins.
     fn to_fund(&self, draft: &Babe) -> Result<Out> {
-        let base = self.base();
+        let (open, base) = self.base.as_ref().expect("Open before F");
+        let outputs = [Some(graph_output(draft)?), change(base, open)?];
         Ok(Out::Fund {
-            deposit: deposit(base)?,
-            graph: graph_output(draft)?,
-            publication: draft
-                .publication_trees(&disclosure(base)?)?
-                .map(|t| t.script_pubkey()),
+            deposit: open.deposit,
+            coin: open.coin.clone(),
+            outputs: outputs.into_iter().flatten().collect(),
+            publication: publication_scripts(base, draft)?,
         })
     }
 
@@ -1457,13 +1587,13 @@ impl Hub {
     fn fund(
         &mut self,
         funding: Transaction,
-        publication: [(OutPoint, TxOut); 5],
+        prevouts: Vec<TxOut>,
         ctx: &Context,
     ) -> Result<Vec<Out>> {
         ensure!(self.frozen.is_none(), "F funded again");
         self.base.as_ref().context("F before Open")?;
         self.holder.as_ref().context("F before the holder's keys")?;
-        let frozen = self.check_fund(funding, publication)?;
+        let frozen = self.check_fund(funding, &prevouts)?;
         let base = self.base();
         let built: [Vec<(Hash, Hash)>; STAGES] = std::array::from_fn(|s| {
             let st = (ctx.trust.statement)(&journal(base, &frozen.d, s as u32));
@@ -1475,6 +1605,7 @@ impl Hub {
         });
         let commit = wire::Commit {
             funding: frozen.funding.clone(),
+            prevouts,
             publication: frozen.publication.coins.clone(),
             d: *frozen.d.as_bytes(),
             dealings: self.dealt().map(|d| d.dealing.clone()),
@@ -1488,21 +1619,21 @@ impl Hub {
         Ok(out)
     }
 
-    /// F as funded, spending her deposit once, frozen on her keys.
-    fn check_fund(
-        &self,
-        funding: Transaction,
-        publication: [(OutPoint, TxOut); 5],
-    ) -> Result<Frozen> {
+    /// F as funded, spending her deposit once among `prevouts` as the
+    /// holder needs ([`Holder::check_commit`]), frozen on her keys.
+    fn check_fund(&self, funding: Transaction, prevouts: &[TxOut]) -> Result<Frozen> {
         let (keys, draft) = self.holder.as_ref().context("F before the holder's keys")?;
-        let deposit = deposit(self.base())?;
+        let (open, base) = self.base.as_ref().expect("Open before F");
+        let deposit = deposit(base)?;
         let spends = funding
             .input
             .iter()
             .filter(|i| i.previous_output == deposit)
             .count();
         ensure!(spends == 1, "F spends the deposit {spends} times");
-        freeze(self.base(), keys, draft, funding, publication)
+        let scripts = publication_scripts(base, draft)?;
+        let coins = check_funds(base, open, &funding, prevouts, &scripts)?;
+        freeze(base, keys, draft, funding, coins)
     }
 
     /// M5: the holder's choice, kept for good: the same again has the

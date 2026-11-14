@@ -247,6 +247,8 @@ impl Holder {
             spend,
             quote,
             deposit: open.deposit,
+            coin: open.coin.clone(),
+            change: open.change.clone(),
             wanted: open.wanted,
             checkpoint,
         };
@@ -500,7 +502,11 @@ impl Hub {
         }
         if phase >= HubPhase::Committed {
             let c = wire::Commit::decode(r.blob()?)?;
-            let frozen = h.check_fund(c.funding.clone(), c.publication.clone())?;
+            let frozen = h.check_fund(c.funding.clone(), &c.prevouts)?;
+            ensure!(
+                frozen.publication.coins == c.publication,
+                "publication coins other than F's"
+            );
             ensure!(*frozen.d.as_bytes() == c.d, "D other than its own");
             ensure!(
                 c.dealings
