@@ -30,18 +30,59 @@ const COOKIE: &str = "Basic X19jb29raWVfXzpjMDBrMWU=";
 struct Chain {
     blocks: Vec<Block>,
     by_hash: HashMap<String, Block>,
+    /// Every output of the chain.
+    outputs: HashMap<OutPoint, TxOut>,
     auth: &'static str,
 }
 
-/// Genesis and `n` blocks mined on it.
+/// Outputs of each coinbase, which the next block spends.
+const COINBASE_OUTPUTS: u32 = 30;
+
+/// A script of output `i` of the coinbase at `height`, of a key hash.
+fn script(height: u32, i: u32) -> ScriptBuf {
+    let mut bytes = vec![0x00, 0x14, height as u8, i as u8];
+    bytes.resize(22, 0xab);
+    ScriptBuf::from_bytes(bytes)
+}
+
+/// Genesis and `n` blocks mined on it. From block 2, each spends outputs
+/// of the coinbase before it, one or two at a time, and block 3 all of
+/// them: a taproot output pays every other one.
 fn mine(n: u32) -> Vec<Block> {
     let mut blocks = vec![bitcoin::constants::genesis_block(Network::Regtest)];
     for height in 1..=n {
         let previous = blocks.last().unwrap().header;
-        let output = vec![TxOut {
-            value: Amount::from_sat(50),
-            script_pubkey: ScriptBuf::new_op_return([1u8]),
-        }];
+        let output = (0..COINBASE_OUTPUTS)
+            .map(|i| TxOut {
+                value: Amount::from_sat(50),
+                script_pubkey: script(height, i),
+            })
+            .collect();
+        let spent = match height {
+            1 => 0,
+            3 => COINBASE_OUTPUTS,
+            _ => 2,
+        };
+        let spends = (0..spent).map(|i| Transaction {
+            version: transaction::Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: blocks.last().unwrap().txdata[0].compute_txid(),
+                    vout: i,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(40),
+                script_pubkey: match i % 2 {
+                    0 => ScriptBuf::from_bytes([&[0x51, 0x20][..], &[i as u8; 32]].concat()),
+                    _ => script(0, i),
+                },
+            }],
+        });
         let coinbase = Transaction {
             version: transaction::Version::TWO,
             lock_time: LockTime::ZERO,
@@ -62,7 +103,7 @@ fn mine(n: u32) -> Vec<Block> {
                 bits: CompactTarget::from_consensus(0x207f_ffff),
                 nonce: 0,
             },
-            txdata: vec![coinbase],
+            txdata: std::iter::once(coinbase).chain(spends).collect(),
         };
         block.header.merkle_root = block.compute_merkle_root().unwrap();
         while block.header.validate_pow(block.header.target()).is_err() {
@@ -113,6 +154,30 @@ async fn rpc(
             Some(block) => rpc_reply(json!(hex::encode(serialize(block)))),
             None => rpc_error(-5, "Block not found"),
         },
+        "getblock" if params[1] == json!(3) => match by_hash(0) {
+            Some(block) => {
+                let txs: Vec<Value> = block
+                    .txdata
+                    .iter()
+                    .map(|tx| {
+                        let vin: Vec<Value> = tx
+                            .input
+                            .iter()
+                            .map(|input| match chain.outputs.get(&input.previous_output) {
+                                Some(spent) => json!({"prevout": {
+                                    "value": spent.value.to_btc(),
+                                    "scriptPubKey": {"hex": spent.script_pubkey.to_hex_string()},
+                                }}),
+                                None => json!({"coinbase": "00"}),
+                            })
+                            .collect();
+                        json!({"txid": tx.compute_txid().to_string(), "vin": vin})
+                    })
+                    .collect();
+                rpc_reply(json!({"hash": block.block_hash().to_string(), "tx": txs}))
+            }
+            None => rpc_error(-5, "Block not found"),
+        },
         _ => rpc_error(-32601, "Method not found"),
     }
 }
@@ -142,6 +207,40 @@ async fn esplora_block(
     }
 }
 
+async fn esplora_txs(
+    State(chain): State<Arc<Chain>>,
+    Path((hash, start)): Path<(String, usize)>,
+) -> Response {
+    let Some(block) = chain.by_hash.get(&hash) else {
+        return (StatusCode::NOT_FOUND, "Block not found").into_response();
+    };
+    if start % 25 != 0 || start >= block.txdata.len() {
+        return (StatusCode::BAD_REQUEST, "start index out of range").into_response();
+    }
+    let txs: Vec<Value> = block.txdata[start..]
+        .iter()
+        .take(25)
+        .map(|tx| {
+            let vin: Vec<Value> = tx
+                .input
+                .iter()
+                .map(|input| {
+                    let spent = chain.outputs.get(&input.previous_output);
+                    json!({
+                        "is_coinbase": spent.is_none(),
+                        "prevout": spent.map(|o| json!({
+                            "scriptpubkey": o.script_pubkey.to_hex_string(),
+                            "value": o.value.to_sat(),
+                        })),
+                    })
+                })
+                .collect();
+            json!({"txid": tx.compute_txid().to_string(), "vin": vin})
+        })
+        .collect();
+    Json(txs).into_response()
+}
+
 /// Serves `blocks` as a node at `/` and as Esplora under `/api`, with
 /// `tampered` answering for a hash that is not its block's.
 async fn serve(
@@ -156,9 +255,20 @@ async fn serve(
     if let Some((hash, block)) = tampered {
         by_hash.insert(hash.to_string(), block);
     }
+    let outputs = blocks
+        .iter()
+        .flat_map(|b| &b.txdata)
+        .flat_map(|tx| {
+            let txid = tx.compute_txid();
+            (0..)
+                .zip(tx.output.clone())
+                .map(move |(vout, o)| (OutPoint { txid, vout }, o))
+        })
+        .collect();
     let chain = Arc::new(Chain {
         blocks,
         by_hash,
+        outputs,
         auth,
     });
     let app = Router::new()
@@ -166,6 +276,7 @@ async fn serve(
         .route("/api/blocks/tip/height", get(esplora_tip))
         .route("/api/block-height/{height}", get(esplora_hash))
         .route("/api/block/{hash}/{part}", get(esplora_block))
+        .route("/api/block/{hash}/txs/{start}", get(esplora_txs))
         .with_state(chain);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -210,6 +321,34 @@ async fn a_node_and_esplora_read_the_same_chain() {
         commitments.push(checkpoint.commitment());
     }
     assert_eq!(commitments[0], commitments[1]);
+}
+
+#[tokio::test]
+async fn both_read_what_the_transactions_paying_taproot_outputs_spend() {
+    let blocks = mine(4);
+    let address = serve(blocks.clone(), PASSWORD, None).await;
+    for source in sources(&address) {
+        for (height, block) in (0u32..).zip(&blocks) {
+            let spends = source.taproot_spends(block).await.unwrap();
+            let expected: Vec<Option<Vec<ScriptBuf>>> = (0u32..)
+                .zip(&block.txdata)
+                .map(|(i, _)| match i {
+                    // The coinbase, and those paying a key hash.
+                    0 => None,
+                    i if (i - 1) % 2 == 1 => None,
+                    i => Some(vec![script(height - 1, i - 1)]),
+                })
+                .collect();
+            assert_eq!(spends, expected, "{source}: block {height}");
+        }
+        // Spread over two of Esplora's pages.
+        assert_eq!(blocks[3].txdata.len(), 31);
+        // The source's transactions are not those of the block asked of.
+        let mut forged = blocks[2].clone();
+        forged.txdata.swap(1, 2);
+        let error = source.taproot_spends(&forged).await.unwrap_err();
+        assert!(format!("{error:#}").contains("are not its"), "{error:#}");
+    }
 }
 
 #[tokio::test]

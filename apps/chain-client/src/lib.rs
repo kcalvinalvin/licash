@@ -8,7 +8,7 @@ use bitcoin::{
     block::Header,
     consensus::{deserialize, serialize},
     hashes::Hash,
-    Block, BlockHash, Network,
+    Block, BlockHash, Network, ScriptBuf,
 };
 use licash::{chain::Checkpoint, spend::ChainProfile};
 use serde::{de::DeserializeOwned, Deserialize};
@@ -130,6 +130,9 @@ pub fn network(profile: ChainProfile) -> Network {
     }
 }
 
+/// Transactions per page of an Esplora block's.
+const ESPLORA_PAGE: usize = 25;
+
 fn client() -> anyhow::Result<reqwest::Client> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     Ok(reqwest::Client::builder()
@@ -224,6 +227,121 @@ impl Source {
         );
         ensure!(block.check_merkle_root(), "block {hash}: merkle root");
         Ok(block)
+    }
+
+    /// The scripts that the transactions of `block` paying a taproot
+    /// output spend, by input, in the block's order, and None for the
+    /// others, its coinbase among them: what a silent payment's tweak is
+    /// computed from. As the source tells: they are not checked against
+    /// the outputs they name.
+    pub async fn taproot_spends(
+        &self,
+        block: &Block,
+    ) -> anyhow::Result<Vec<Option<Vec<ScriptBuf>>>> {
+        let wanted: Vec<bool> = block
+            .txdata
+            .iter()
+            .enumerate()
+            .map(|(i, tx)| i > 0 && tx.output.iter().any(|o| o.script_pubkey.is_p2tr()))
+            .collect();
+        let mut spends = vec![None; block.txdata.len()];
+        let hash = block.block_hash();
+        let mut take = |i: usize, txid: &str, scripts: Vec<Option<String>>| -> anyhow::Result<()> {
+            let tx = &block.txdata[i];
+            ensure!(
+                txid == tx.compute_txid().to_string() && scripts.len() == tx.input.len(),
+                "block {hash}: the spends of transaction {i} are not its"
+            );
+            let scripts = scripts
+                .into_iter()
+                .map(|s| Ok(ScriptBuf::from_hex(&s.context("an input spends nothing")?)?))
+                .collect::<anyhow::Result<_>>()
+                .with_context(|| format!("block {hash}: transaction {i}"))?;
+            spends[i] = Some(scripts);
+            Ok(())
+        };
+        match &self.kind {
+            _ if !wanted.contains(&true) => {}
+            Kind::Rpc { .. } => {
+                #[derive(Deserialize)]
+                struct Verbose {
+                    tx: Vec<VerboseTx>,
+                }
+                #[derive(Deserialize)]
+                struct VerboseTx {
+                    txid: String,
+                    vin: Vec<VerboseIn>,
+                }
+                #[derive(Deserialize)]
+                struct VerboseIn {
+                    prevout: Option<VerbosePrevout>,
+                }
+                #[derive(Deserialize)]
+                struct VerbosePrevout {
+                    #[serde(rename = "scriptPubKey")]
+                    script: VerboseScript,
+                }
+                #[derive(Deserialize)]
+                struct VerboseScript {
+                    hex: String,
+                }
+                // Each input with what it spends: Bitcoin Core 23 or later.
+                let verbose: Verbose = self.call("getblock", json!([hash.to_string(), 3])).await?;
+                ensure!(
+                    verbose.tx.len() == block.txdata.len(),
+                    "block {hash}: not its transactions"
+                );
+                for (i, tx) in verbose.tx.into_iter().enumerate() {
+                    if wanted[i] {
+                        let scripts = tx.vin.into_iter();
+                        take(
+                            i,
+                            &tx.txid,
+                            scripts.map(|v| Some(v.prevout?.script.hex)).collect(),
+                        )?;
+                    }
+                }
+            }
+            Kind::Esplora { base } => {
+                #[derive(Deserialize)]
+                struct EsploraTx {
+                    txid: String,
+                    vin: Vec<EsploraIn>,
+                }
+                #[derive(Deserialize)]
+                struct EsploraIn {
+                    prevout: Option<EsploraPrevout>,
+                }
+                #[derive(Deserialize)]
+                struct EsploraPrevout {
+                    scriptpubkey: String,
+                }
+                // Only the pages, of 25 transactions, holding a wanted one.
+                for start in (0..wanted.len()).step_by(ESPLORA_PAGE) {
+                    let end = (start + ESPLORA_PAGE).min(wanted.len());
+                    if !wanted[start..end].contains(&true) {
+                        continue;
+                    }
+                    let url = format!("{base}/block/{hash}/txs/{start}");
+                    let page: Vec<EsploraTx> = self.get(&url).await?.json().await?;
+                    ensure!(
+                        page.len() == end - start,
+                        "block {hash}: not its transactions"
+                    );
+                    for (i, tx) in (start..).zip(page) {
+                        if wanted[i] {
+                            let scripts = tx.vin.into_iter();
+                            take(
+                                i,
+                                &tx.txid,
+                                scripts.map(|v| Some(v.prevout?.scriptpubkey)).collect(),
+                            )?;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(spends)
     }
 
     /// The network, from the node or from its genesis block.
