@@ -51,7 +51,8 @@ fun Receive(engine: Engine, back: () -> Unit) {
     var error by remember { mutableStateOf<String?>(null) }
     var asking by remember { mutableStateOf(false) }
     var received by remember { mutableStateOf<String?>(null) }
-    LaunchedEffect(amount) {
+    // Made again once paid: a fallback address paid gives way to the next.
+    LaunchedEffect(amount, received) {
         engine.code(amount?.toULong())
             .onSuccess { code = it }
             .onFailure { error = explain(it) }
@@ -90,6 +91,13 @@ fun Receive(engine: Engine, back: () -> Unit) {
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 textAlign = TextAlign.Center,
             )
+            // For exchanges and the like, which take a plain address only.
+            code?.address?.let { address ->
+                TextButton(onClick = {
+                    val clip = ClipData.newPlainText("Bitcoin address", address)
+                    scope.launch { clipboard.setClipEntry(ClipEntry(clip)) }
+                }) { Text("Copy Bitcoin address") }
+            }
         }
         Row(Modifier.padding(bottom = 24.dp), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
             OutlinedButton(onClick = { asking = true }, modifier = Modifier.weight(1f).height(56.dp)) {

@@ -188,6 +188,10 @@ impl Wallet {
         Ok(Code {
             text: code.to_string(),
             qr: code.qr(),
+            address: code
+                .address
+                .as_ref()
+                .map(|a| a.assume_checked_ref().to_string()),
         })
     }
 

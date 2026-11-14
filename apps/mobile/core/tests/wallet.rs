@@ -219,6 +219,37 @@ impl Net {
             }],
         }
     }
+
+    /// A payment of `value` to `address` from coin `n` of a payer's, of a
+    /// script-hash input, which silent payments skip.
+    fn pay_plain(&self, address: &str, value: u64, n: u8) -> Transaction {
+        let address: bitcoin::Address<bitcoin::address::NetworkUnchecked> =
+            address.parse().unwrap();
+        let script = ScriptBuf::from_bytes(vec![0x51]);
+        let previous_output = OutPoint::new(Txid::from_byte_array([n; 32]), 0);
+        let spent = ScriptBuf::new_p2wsh(&script.wscript_hash());
+        self.backend
+            .lock()
+            .unwrap()
+            .outside
+            .insert(previous_output, spent);
+        let mut witness = Witness::new();
+        witness.push(script.as_bytes());
+        Transaction {
+            version: transaction::Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness,
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(value),
+                script_pubkey: address.assume_checked().script_pubkey(),
+            }],
+        }
+    }
 }
 
 /// A Nostr relay in this process, tried again should another socket take
@@ -387,7 +418,8 @@ fn a_phone_paid_on_bitcoin_moves_it_to_notes_and_pays_in_them() {
     // Paid at the silent payment address in her code: found in the one
     // block whose filter matches, and shown first in her history.
     let code = alice.payment_code(None).unwrap();
-    assert!(code.qr.starts_with("BITCOIN:?SP=TSP1Q"), "{}", code.qr);
+    assert!(code.qr.starts_with("BITCOIN:BCRT1P"), "{}", code.qr);
+    assert!(code.qr.contains("?SP=TSP1Q"), "{}", code.qr);
     assert!(code.qr.contains("&LICASH=TLICASH1Q"), "{}", code.qr);
     net.mine(2, Vec::new());
     let payment = net.pay_silent(&code.qr, 3_000, 1);
@@ -622,4 +654,24 @@ fn a_phone_looks_for_payments_from_its_birthday_or_all_the_hub_indexed() {
     let next = pay(5);
     assert_eq!(scan(&young, &light), (1, 2_000));
     assert_eq!(light.fetched(), [next]);
+}
+
+#[test]
+fn a_phone_paid_at_its_fallback_address_finds_it_and_shows_the_next() {
+    let net = Net::new(true);
+    let light = Light::new(&net);
+    let alice = net.wallet("alice", net.height());
+    let code = alice.payment_code(None).unwrap();
+    let address = code.address.clone().expect("a fallback address");
+    assert!(address.starts_with("bcrt1p"), "{address}");
+    let uri = format!("bitcoin:{address}?sp=");
+    assert!(code.text.starts_with(&uri), "{}", code.text);
+    // The same until paid.
+    assert_eq!(alice.payment_code(None).unwrap(), code);
+    let payment = net.pay_plain(&address, 3_000, 1);
+    net.mine(1, vec![payment]);
+    assert_eq!(scan(&alice, &light), (1, 3_000));
+    assert_eq!(alice.balance().unwrap().onchain, 3_000);
+    let next = alice.payment_code(None).unwrap().address.unwrap();
+    assert_ne!(next, address);
 }

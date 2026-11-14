@@ -156,11 +156,13 @@ pub struct Balance {
     pub moving: u64,
 }
 
-/// A payment code to show: `text` to share, `qr` to draw.
+/// A payment code to show: `text` to share, `qr` to draw, and `address`,
+/// the plain address on Bitcoin in it, for payers that take no codes.
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct Code {
     pub text: String,
     pub qr: String,
+    pub address: Option<String>,
 }
 
 /// What a text scanned or pasted is.
