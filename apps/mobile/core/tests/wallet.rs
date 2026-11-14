@@ -490,6 +490,10 @@ fn a_phone_paid_on_bitcoin_moves_it_to_notes_and_pays_in_them() {
     assert!(code.qr.starts_with("BITCOIN:BCRT1P"), "{}", code.qr);
     assert!(code.qr.contains("?SP=TSP1Q"), "{}", code.qr);
     assert!(code.qr.contains("&LICASH=TLICASH1Q"), "{}", code.qr);
+    // The silent payment address on its own, as in the code.
+    let silent = code.silent.clone().expect("a silent payment address");
+    assert!(silent.starts_with("tsp1q"), "{silent}");
+    assert!(code.text.contains(&format!("sp={silent}")), "{}", code.text);
     net.mine(2, Vec::new());
     let payment = net.pay_silent(&code.qr, 3_000, 1);
     net.mine(1, vec![payment]);
@@ -798,6 +802,7 @@ fn a_phone_whose_hubs_serve_no_tweaks_finds_its_fallback_payments_from_the_day_b
     // No silent payment address, which no hub's tweaks would find paid.
     let code = alice.payment_code(None).unwrap();
     assert!(!code.text.contains("sp="), "{}", code.text);
+    assert_eq!(code.silent, None);
     let address = code.address.unwrap();
     let early = net.pay_plain(&address, 1_000, 1);
     net.mine(1, vec![early]);

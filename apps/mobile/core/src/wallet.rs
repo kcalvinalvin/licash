@@ -218,6 +218,7 @@ impl Wallet {
                 .address
                 .as_ref()
                 .map(|a| a.assume_checked_ref().to_string()),
+            silent: code.silent.as_ref().map(|s| s.to_string()),
         })
     }
 

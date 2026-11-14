@@ -188,13 +188,16 @@ pub struct InvoiceQuote {
     pub description: Option<String>,
 }
 
-/// A payment code to show: `text` to share, `qr` to draw, and `address`,
-/// the plain address on Bitcoin in it, for payers that take no codes.
+/// A payment code to show: `text` to share, `qr` to draw, `address`, the
+/// plain address on Bitcoin in it, for payers that take no codes, and
+/// `silent`, its silent payment address, if a hub trusted finds payments
+/// to it.
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct Code {
     pub text: String,
     pub qr: String,
     pub address: Option<String>,
+    pub silent: Option<String>,
 }
 
 /// What a text scanned or pasted is.

@@ -101,6 +101,14 @@ fun Receive(engine: Engine, back: () -> Unit) {
                     scope.launch { clipboard.setClipEntry(ClipEntry(clip)) }
                 }) { Text("Copy Bitcoin address") }
             }
+            // For wallets that pay silent payment addresses: the same one
+            // every time, found paid through a hub's tweaks.
+            code?.silent?.let { silent ->
+                TextButton(onClick = {
+                    val clip = ClipData.newPlainText("Silent payment address", silent)
+                    scope.launch { clipboard.setClipEntry(ClipEntry(clip)) }
+                }) { Text("Copy silent payment address") }
+            }
         }
         Row(Modifier.padding(bottom = 24.dp), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
             OutlinedButton(onClick = { asking = true }, modifier = Modifier.weight(1f).height(56.dp)) {
