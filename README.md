@@ -36,8 +36,9 @@ research implementation; it has not had a security review.
   notifications (`apps/notify`), announcements on Nostr (`apps/nostr`),
   end-to-end tests of hubs, their Lightning gateways, swap providers and
   wallets on a regtest ecosystem in Docker (`apps/e2e`), and the mobile
-  apps' wallet core (`apps/mobile/core`), light client in Go
-  (`apps/mobile/chain`) and Android app (`apps/mobile/android`).
+  apps' wallet core (`apps/mobile/core`), resumable zkVM prover
+  (`apps/mobile/prover`), light client in Go (`apps/mobile/chain`) and
+  Android app (`apps/mobile/android`).
 - `paper/`: the paper's source; `paper/build.sh` rebuilds the PDF (Docker).
 
 ## Quick start

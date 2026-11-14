@@ -19,7 +19,8 @@ jobs:
           RUSTDOCFLAGS: -D warnings
   apps:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # The mobile prover builds the RISC Zero prover.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
         with:
