@@ -197,8 +197,8 @@ fn check(urls: &[String]) -> anyhow::Result<()> {
     announcement.check()
 }
 
-/// Announce through `tor`, and at `onion`'s URL too, if the service
-/// announces.
+/// Announce through `tor`, unless through --proxy, and at `onion`'s URL
+/// too, if the service announces.
 fn announce_over(
     announcing: &mut Option<Announcing>,
     tor: &Tor,
@@ -207,7 +207,9 @@ fn announce_over(
     let Some(announcing) = announcing else {
         return Ok(());
     };
-    announcing.route = Route::Tor(tor.clone());
+    if let Route::Direct = announcing.route {
+        announcing.route = Route::Tor(tor.clone());
+    }
     if let Some(onion) = onion {
         announcing.urls.push(onion.url().to_owned());
         check(&announcing.urls).context("--onion")?;
@@ -603,5 +605,34 @@ fn events(data: &Path, mut after: u64, limit: u32, follow: bool) -> anyhow::Resu
         if page.is_empty() {
             std::thread::sleep(Duration::from_secs(1));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn announcing(route: Route) -> Option<Announcing> {
+        Some(Announcing {
+            relays: vec!["wss://relay.example".into()],
+            route,
+            urls: vec!["https://swaps.example".into()],
+            name: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn relays_are_reached_through_tor_unless_through_the_proxy() {
+        let dir = tempfile::tempdir().unwrap();
+        let tor = Tor::new(dir.path()).unwrap();
+        let mut direct = announcing(Route::Direct);
+        announce_over(&mut direct, &tor, None).unwrap();
+        assert!(matches!(direct.unwrap().route, Route::Tor(_)));
+        let mut proxied = announcing(Route::socks("socks5h://127.0.0.1:9050").unwrap());
+        announce_over(&mut proxied, &tor, None).unwrap();
+        assert!(matches!(proxied.unwrap().route, Route::Socks(_)));
+        let mut none = None;
+        announce_over(&mut none, &tor, None).unwrap();
+        assert!(none.is_none());
     }
 }
