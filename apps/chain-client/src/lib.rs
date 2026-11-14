@@ -148,6 +148,17 @@ const KNOWN: [&str; 3] = [
     "already in utxo set",
 ];
 
+/// Whether a node's refusal of a transaction says it has it already: by
+/// its message, or by the code of a transaction in the chain already, -27,
+/// which mempool's backend relays alone (`{"code":-27}`) and nodes word
+/// differently from version to version.
+fn known(refusal: &str) -> bool {
+    let refusal = refusal.replace('\\', "");
+    KNOWN.iter().any(|known| refusal.contains(known))
+        || refusal.contains("\"code\":-27")
+        || refusal.ends_with("(-27)")
+}
+
 /// Transactions per page of an Esplora block's.
 const ESPLORA_PAGE: usize = 25;
 
@@ -442,7 +453,7 @@ impl Source {
             }
         };
         match refused {
-            Some(e) if !KNOWN.iter().any(|known| e.contains(known)) => bail!("broadcast: {e}"),
+            Some(e) if !known(&e) => bail!("broadcast: {e}"),
             _ => Ok(tx.compute_txid()),
         }
     }
@@ -468,7 +479,21 @@ impl Source {
             }
             Kind::Esplora { base } => {
                 let url = format!("{base}/fee-estimates");
-                let estimates: HashMap<String, f64> = self.get(&url).await?.json().await?;
+                let response = self
+                    .client
+                    .get(&url)
+                    .send()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{self}: {}", e.without_url()))?;
+                if response.status() == reqwest::StatusCode::NOT_FOUND {
+                    return self
+                        .recommended(base, blocks)
+                        .await
+                        .map(|r| Some(rate(r * 1e3)));
+                }
+                let status = response.status();
+                ensure!(status.is_success(), "{self}: {url}: HTTP {status}");
+                let estimates: HashMap<String, f64> = response.json().await?;
                 let mut estimates: Vec<(u16, f64)> = estimates
                     .into_iter()
                     .filter_map(|(target, r)| Some((target.parse().ok()?, r)))
@@ -479,6 +504,28 @@ impl Source {
                 Ok(within.or(estimates.first()).map(|(_, r)| rate(r * 1e3)))
             }
         }
+    }
+
+    /// What mempool's backend, which serves no `fee-estimates`, recommends
+    /// paying to confirm within `blocks`, in sat/vB: in the next block, in
+    /// about three, six, or later.
+    async fn recommended(&self, base: &str, blocks: u16) -> anyhow::Result<f64> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Recommended {
+            fastest_fee: f64,
+            half_hour_fee: f64,
+            hour_fee: f64,
+            economy_fee: f64,
+        }
+        let url = format!("{base}/v1/fees/recommended");
+        let fees: Recommended = self.get(&url).await?.json().await?;
+        Ok(match blocks {
+            0..=1 => fees.fastest_fee,
+            2..=3 => fees.half_hour_fee,
+            4..=6 => fees.hour_fee,
+            _ => fees.economy_fee,
+        })
     }
 
     /// The outputs paying `address` that are confirmed and unspent, as the

@@ -702,3 +702,55 @@ fn urls_are_checked() {
     let esplora: Source = "esplora+https://esplora.example/api/".parse().unwrap();
     assert_eq!(esplora.to_string(), "esplora+https://esplora.example/api");
 }
+
+/// As mempool's backend answers a transaction it has in a block, or one
+/// spending what it does not know: by the node's code alone.
+async fn mempool_send(State(confirmed): State<Arc<Vec<String>>>, raw: String) -> Response {
+    let code = match confirmed.contains(&raw) {
+        true => -27,
+        false => -25,
+    };
+    let error = format!("sendrawtransaction RPC error: {{\"code\":{code}}}");
+    (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))).into_response()
+}
+
+#[tokio::test]
+async fn mempools_backend_is_read_as_esplora() {
+    let blocks = mine(2);
+    let confirmed = blocks[2].txdata[1].clone();
+    let elsewhere = Transaction {
+        input: vec![TxIn::default()],
+        ..confirmed.clone()
+    };
+    let raw = vec![hex::encode(serialize(&confirmed))];
+    let fees =
+        json!({"fastestFee": 5, "halfHourFee": 4, "hourFee": 3, "economyFee": 2, "minimumFee": 1});
+    let app = Router::new()
+        .route("/api/tx", post(mempool_send))
+        .route(
+            "/api/v1/fees/recommended",
+            get(move || async move { Json(fees) }),
+        )
+        .with_state(Arc::new(raw));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let source: Source = format!("esplora+http://{address}/api").parse().unwrap();
+
+    // It has it in a block: no error.
+    assert_eq!(
+        source.broadcast(&confirmed).await.unwrap(),
+        confirmed.compute_txid()
+    );
+    let refused = source.broadcast(&elsewhere).await.unwrap_err();
+    assert!(format!("{refused:#}").contains("-25"), "{refused:#}");
+    // No fee-estimates: what it recommends instead.
+    for (blocks, rate) in [(1, 5), (3, 4), (6, 3), (144, 2)] {
+        let estimate = source.fee_rate(blocks).await.unwrap();
+        assert_eq!(
+            estimate,
+            Some(FeeRate::from_sat_per_vb_u32(rate)),
+            "{blocks}"
+        );
+    }
+}
