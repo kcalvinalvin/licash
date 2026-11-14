@@ -6,7 +6,7 @@ use licash::{address::Address, spend::lock_hash};
 use licash_api::Fee;
 use licash_hub_service::lightning::{fake::Outcome, HeldState};
 use serde_json::Value;
-use support::{wallet, Server};
+use support::{swaps::Swaps, wallet, Server};
 
 const FEE: Fee = Fee { base: 1, ppm: 0 };
 
@@ -468,5 +468,121 @@ fn hubs_announced_on_nostr_are_discovered_where_they_answer_as_the_announcer() {
         ),
         1,
         "socks5h://",
+    );
+}
+
+#[test]
+fn notes_swap_between_hubs_through_a_provider() {
+    let (a, b) = (Server::start(FEE), Server::start(FEE));
+    let swaps = Swaps::start(&[&a, &b], 200);
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, alice_at) = party(dir.path(), "alice", Some(&a));
+    ok(wallet(&alice, &["add-hub", &b.url()], None));
+    let funds = serde_json::to_string(&a.pay(&address(&alice_at), 100)).unwrap();
+    ok(wallet(&alice, &["receive"], Some(&funds)));
+    let provider = swaps.url();
+    let swap = |amount: &str| {
+        wallet(
+            &alice,
+            &["swap", amount, "--to", &b.url(), "--provider", &provider],
+            None,
+        )
+    };
+
+    // 20 at B for 20, the provider's fee of 1 + 1% and A's lock fee at A.
+    let text = ok(swap("20"));
+    assert_eq!(
+        text.trim(),
+        format!("swapped 20 + 2 at {} for 20 at {}", a.url(), b.url())
+    );
+    let listed = json(&alice, &["swaps"]);
+    assert_eq!(
+        (listed[0]["state"].as_str(), listed[0]["fee"].as_u64()),
+        (Some("done"), Some(2))
+    );
+    let record = swaps.until(|r| r.stage == licash_swaps::Stage::Done);
+    assert_eq!((record.amount, record.fee, record.paid), (20, 2, 22));
+    assert_eq!((swaps.held(&a), swaps.held(&b)), (22, 200 - 20 - 1));
+    ok(wallet(&alice, &["resume"], None));
+    assert_eq!(available(&alice), (100 - 22 - 1 + 20, 0));
+
+    // Beyond what the provider swaps: nothing is locked.
+    failed(swap("151"), 1, "swaps 5 to");
+    assert_eq!(json(&alice, &["swaps"]).as_array().unwrap().len(), 1);
+
+    // The provider does not answer once Alice locked: pending until it does.
+    swaps
+        .refuse
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    failed(swap("10"), 75, "refused as asked");
+    assert_eq!(json(&alice, &["swaps"])[0]["state"], "open");
+    failed(wallet(&alice, &["resume"], None), 75, "refused as asked");
+    swaps
+        .refuse
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    let resumed = json(&alice, &["resume"]);
+    assert_eq!(resumed["swaps"][0]["state"], "done", "{resumed}");
+    assert_eq!(resumed["swaps"][0]["amount"], 10);
+    let text = ok(wallet(&alice, &["swaps"], None));
+    assert!(text.contains("swap done  10 + 2"), "{text}");
+    swaps.until(|r| r.amount == 10 && r.stage == licash_swaps::Stage::Done);
+}
+
+#[test]
+fn swap_providers_announced_on_nostr_are_discovered_where_they_answer() {
+    use licash_nostr::{Announcement, Announcer, Role};
+    use nostr_sdk::prelude::MockRelay;
+
+    let (a, b) = (Server::start(FEE), Server::start(FEE));
+    let swaps = Swaps::start(&[&a, &b], 200);
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let relay = runtime.block_on(MockRelay::run()).unwrap();
+    let relays = [runtime.block_on(relay.url()).to_string()];
+    let announce = |secret: [u8; 32], role: Role, url: String| {
+        let announcement = Announcement {
+            urls: vec![url],
+            network: "regtest".into(),
+            name: Some("swaps".into()),
+        };
+        runtime.block_on(async {
+            let announcer = Announcer::new(&secret, role, &relays).await.unwrap();
+            announcer.announce(&announcement).await.unwrap();
+        });
+    };
+    announce(
+        swaps.provider.nostr_secret().unwrap(),
+        Role::Swaps,
+        swaps.url(),
+    );
+    // The hub announced as a hub, and another key announcing the provider.
+    announce(a.hub.nostr_secret(), Role::Hub, a.url());
+    announce([3; 32], Role::Swaps, swaps.url());
+
+    let dir = tempfile::tempdir().unwrap();
+    let nowhere = dir.path().join("none.sqlite");
+    let args = [
+        "discover",
+        "--swaps",
+        "--relay",
+        &relays[0],
+        "--network",
+        "regtest",
+    ];
+    let found = json(&nowhere, &args);
+    assert_eq!(found.as_array().unwrap().len(), 1, "{found}");
+    assert_eq!(found[0]["urls"], serde_json::json!([swaps.url()]));
+    assert_eq!(
+        (found[0]["min"].as_u64(), found[0]["max"].as_u64()),
+        (Some(5), Some(150))
+    );
+    // It locks only at B, where it holds 200 less the lock fee.
+    let hubs = found[0]["hubs"].as_array().unwrap();
+    let mut max: Vec<u64> = hubs.iter().map(|h| h["max"].as_u64().unwrap()).collect();
+    max.sort();
+    assert_eq!(max, [0, 150]);
+    let text = ok(wallet(&nowhere, &args, None));
+    assert_eq!(
+        text.trim(),
+        format!("{}  1 + 10000 ppm  5 to 150  2 hubs  swaps", swaps.url())
     );
 }

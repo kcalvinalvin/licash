@@ -4,6 +4,7 @@
 
 #[path = "../../../hub/tests/chain/mod.rs"]
 mod chain;
+pub mod swaps;
 
 use std::{
     net::SocketAddr,

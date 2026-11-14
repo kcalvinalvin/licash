@@ -29,6 +29,8 @@ tracing-subscriber.workspace = true
 bitcoin = { version = "=0.32.102", default-features = false, features = ["std"] }
 licash-hub.workspace = true
 licash-hub-service = { path = "../hub", features = ["fake"] }
+licash-swaps.workspace = true
+licash-swaps-service = { path = "../swaps" }
 axum.workspace = true
 nostr-sdk = { version = "0.45.6", features = ["local-relay"] }
 tempfile = "3.27"

@@ -1551,6 +1551,8 @@ dependencies = [
  "licash-hub",
  "licash-hub-service",
  "licash-nostr",
+ "licash-swaps",
+ "licash-swaps-service",
  "licash-transport",
  "licash-wallet",
  "nostr-sdk",

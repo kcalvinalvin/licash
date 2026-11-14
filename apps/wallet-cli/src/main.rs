@@ -13,7 +13,9 @@ use licash::{address::Address, spend::lock_hash};
 use licash_api::Payment;
 use licash_nostr::Role;
 use licash_transport::Http;
-use licash_wallet::{Error, Invoice, InvoiceState, Lock, LockState, State, Wallet};
+use licash_wallet::{
+    Error, Invoice, InvoiceState, Lock, LockState, State, Swap, SwapState, Wallet,
+};
 use rand_core::{OsRng, RngCore};
 use serde_json::json;
 use tracing_subscriber::EnvFilter;
@@ -156,6 +158,22 @@ enum Command {
     },
     /// The Lightning invoices asked for, newest first.
     Invoices,
+    /// Swap notes at one hub for AMOUNT at another through a swap provider,
+    /// its fee and the hub's on top. `resume` takes a pending swap on.
+    Swap {
+        amount: u64,
+        /// The hub to get AMOUNT at.
+        #[arg(long)]
+        to: String,
+        /// The swap provider, by its URL.
+        #[arg(long, env = "LICASH_WALLET_PROVIDER")]
+        provider: String,
+        /// The hub to pay at [default: the other one holding the most].
+        #[arg(long)]
+        from: Option<String>,
+    },
+    /// The swaps made, newest first.
+    Swaps,
     /// Hubs announced on Nostr relays, at the URLs that answer as the hub
     /// that announced them. Needs no wallet.
     Discover {
@@ -173,6 +191,9 @@ enum Command {
         /// regtest.
         #[arg(long, default_value = "bitcoin")]
         network: String,
+        /// Swap providers instead of hubs.
+        #[arg(long)]
+        swaps: bool,
     },
 }
 
@@ -218,8 +239,13 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     let json = cli.json;
     match cli.command {
         Command::Init => return init(&path, transport, json),
-        Command::Discover { relays, network } => {
-            return discover(transport, cli.proxy.as_deref(), &relays, &network, json).await
+        Command::Discover {
+            relays,
+            network,
+            swaps,
+        } => {
+            let proxy = cli.proxy.as_deref();
+            return discover(transport, proxy, &relays, &network, swaps, json).await;
         }
         _ => {}
     }
@@ -455,6 +481,44 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 lines.join("\n"),
             );
         }
+        Command::Swap {
+            amount,
+            to,
+            provider,
+            from,
+        } => {
+            let from = match from {
+                Some(from) => from,
+                None => richest_but(&wallet, &to)?,
+            };
+            let swap = wallet.swap(&provider, &from, &to, amount).await?;
+            let unlinked = unlink(&wallet).await;
+            let mut shown = swap_json(&swap);
+            shown["unlinked"] = json!(unlinked);
+            match &swap.state {
+                SwapState::Failed(reason) => {
+                    show(json, shown, swap_line(&swap));
+                    bail!("the swap failed ({reason}): its lock returns once expired")
+                }
+                _ => show(
+                    json,
+                    shown,
+                    format!(
+                        "swapped {} + {} at {} for {} at {}",
+                        swap.amount, swap.fee, swap.from, swap.amount, swap.to
+                    ),
+                ),
+            }
+        }
+        Command::Swaps => {
+            let swaps = wallet.swaps()?;
+            let lines = swaps.iter().map(swap_line).collect::<Vec<_>>();
+            show(
+                json,
+                swaps.iter().map(swap_json).collect(),
+                lines.join("\n"),
+            );
+        }
     }
     Ok(())
 }
@@ -507,86 +571,140 @@ async fn pay_invoice(
     }
 }
 
-/// Print the hubs announced on `relays` for `network`, each at the URLs
-/// whose info names the key that announced it.
+/// Print the hubs, or swap providers, announced on `relays` for `network`,
+/// each at the URLs whose info names the key that announced it.
 async fn discover(
     http: Http,
     proxy: Option<&str>,
     relays: &[String],
     network: &str,
+    swaps: bool,
     json: bool,
 ) -> anyhow::Result<()> {
     let socks = proxy.map(socks_address).transpose()?;
-    let found = licash_nostr::discover(relays, socks, Role::Hub, network).await?;
+    let role = if swaps { Role::Swaps } else { Role::Hub };
+    let found = licash_nostr::discover(relays, socks, role, network).await?;
     let http = Arc::new(http);
     let mut checks = tokio::task::JoinSet::new();
-    for (i, hub) in found.iter().enumerate() {
-        for url in &hub.announcement.urls {
+    for (i, service) in found.iter().enumerate() {
+        for url in &service.announcement.urls {
             if is_onion(url) && proxy.is_none() {
                 tracing::warn!(%url, "skipped: an onion service needs --proxy");
                 continue;
             }
             let (http, url) = (http.clone(), url.clone());
             checks.spawn(async move {
-                let info = tokio::time::timeout(CHECK_TIMEOUT, info_at(&http, &url)).await;
+                let info = tokio::time::timeout(CHECK_TIMEOUT, info_at(&http, &url, swaps)).await;
                 let info = info.unwrap_or_else(|_| Err("no answer in time".into()));
                 (i, url, info)
             });
         }
     }
-    let mut answered: Vec<Vec<(String, licash_api::Info)>> = vec![Vec::new(); found.len()];
+    let mut answered: Vec<Vec<(String, Answer)>> = Vec::new();
+    answered.resize_with(found.len(), Vec::new);
     while let Some(checked) = checks.join_next().await {
         let (i, url, info) = checked?;
         match info {
-            Ok(info) if found[i].named_by(info.nostr.as_deref()) => answered[i].push((url, info)),
-            Ok(_) => tracing::warn!(%url, "skipped: not the hub that announced it"),
+            Ok(info) if found[i].named_by(info.nostr()) => answered[i].push((url, info)),
+            Ok(_) => tracing::warn!(%url, "skipped: not the service that announced it"),
             Err(e) => tracing::warn!(%url, "skipped: {e}"),
         }
     }
     let mut rows = Vec::new();
     let mut lines = Vec::new();
-    for (hub, mut at) in found.iter().zip(answered) {
+    for (service, mut at) in found.iter().zip(answered) {
         if at.is_empty() {
             continue;
         }
         // In the order announced.
-        let urls = &hub.announcement.urls;
-        at.sort_by_key(|(url, _)| urls.iter().position(|u| u == url));
-        let info = &at[0].1;
+        let announced = &service.announcement.urls;
+        at.sort_by_key(|(url, _)| announced.iter().position(|u| u == url));
         let urls: Vec<&str> = at.iter().map(|(url, _)| url.as_str()).collect();
-        let name = hub.announcement.name.as_deref().unwrap_or_default();
-        let fee = info.fees.spend;
-        let lightning = if info.lightning.is_some() {
-            "  lightning"
-        } else {
-            ""
-        };
-        lines.push(format!(
-            "{}  {} + {} ppm{lightning}  {name}",
-            urls.join(" "),
-            fee.base,
-            fee.ppm
-        ));
-        rows.push(json!({
-            "key": hub.key, "name": hub.announcement.name, "urls": urls, "fees": info.fees,
-            "locks": info.locks.is_some(), "lightning": info.lightning,
-        }));
+        let name = service.announcement.name.as_deref().unwrap_or_default();
+        let (key, shown) = (&service.key, &service.announcement.name);
+        match &at[0].1 {
+            Answer::Hub(info) => {
+                let fee = info.fees.spend;
+                let lightning = if info.lightning.is_some() {
+                    "  lightning"
+                } else {
+                    ""
+                };
+                lines.push(format!(
+                    "{}  {} + {} ppm{lightning}  {name}",
+                    urls.join(" "),
+                    fee.base,
+                    fee.ppm
+                ));
+                rows.push(json!({
+                    "key": key, "name": shown, "urls": urls, "fees": info.fees,
+                    "locks": info.locks.is_some(), "lightning": info.lightning,
+                }));
+            }
+            Answer::Swaps(info) => {
+                let fee = info.fee;
+                lines.push(format!(
+                    "{}  {} + {} ppm  {} to {}  {} hubs  {name}",
+                    urls.join(" "),
+                    fee.base,
+                    fee.ppm,
+                    info.min,
+                    info.max,
+                    info.hubs.len()
+                ));
+                let hubs = info
+                    .hubs
+                    .iter()
+                    .map(|hub| json!({ "address": encode(&hub.address), "max": hub.max }));
+                rows.push(json!({
+                    "key": key, "name": shown, "urls": urls, "fee": fee, "min": info.min,
+                    "max": info.max, "margin": info.margin, "hubs": hubs.collect::<Vec<_>>(),
+                }));
+            }
+        }
     }
     show(json, rows.into(), lines.join("\n"));
     Ok(())
 }
 
-/// How long a hub announced has to answer.
+/// How long a service announced has to answer.
 const CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// What the hub at `url` says of itself.
-async fn info_at(http: &Http, url: &str) -> Result<licash_api::Info, String> {
-    let at = format!("{}{}", url.trim_end_matches('/'), licash_api::INFO);
+/// What a service announced says of itself.
+enum Answer {
+    Hub(Box<licash_api::Info>),
+    Swaps(Box<licash_api::swaps::Info>),
+}
+
+impl Answer {
+    /// The key it announces itself under.
+    fn nostr(&self) -> Option<&str> {
+        match self {
+            Self::Hub(info) => info.nostr.as_deref(),
+            Self::Swaps(info) => info.nostr.as_deref(),
+        }
+    }
+}
+
+/// What the hub, or the swap provider, at `url` says of itself.
+async fn info_at(http: &Http, url: &str, swaps: bool) -> Result<Answer, String> {
+    let path = if swaps {
+        licash_api::swaps::SWAPS_INFO
+    } else {
+        licash_api::INFO
+    };
+    let at = format!("{}{path}", url.trim_end_matches('/'));
     let response = licash_wallet::Transport::request(http, &at, None).await?;
     if response.status != 200 {
         return Err(format!("status {}", response.status));
     }
-    serde_json::from_slice(&response.body).map_err(|e| format!("not a hub's info: {e}"))
+    let body = &response.body;
+    let answer = if swaps {
+        serde_json::from_slice(body).map(|info| Answer::Swaps(Box::new(info)))
+    } else {
+        serde_json::from_slice(body).map(|info| Answer::Hub(Box::new(info)))
+    };
+    answer.map_err(|e| format!("not a service's info: {e}"))
 }
 
 fn is_onion(url: &str) -> bool {
@@ -645,6 +763,7 @@ async fn resume(wallet: &Wallet<Http>, json: bool) -> anyhow::Result<()> {
     }
     lines.extend(resumed.locks.iter().map(lock_line));
     lines.extend(resumed.invoices.iter().map(invoice_line));
+    lines.extend(resumed.swaps.iter().map(swap_line));
     for (id, reason) in &resumed.abandoned {
         lines.push(format!("abandoned {id}: {reason}"));
     }
@@ -669,6 +788,7 @@ async fn resume(wallet: &Wallet<Http>, json: bool) -> anyhow::Result<()> {
             "paid": paid.collect::<Vec<_>>(),
             "locks": resumed.locks.iter().map(lock_json).collect::<Vec<_>>(),
             "invoices": resumed.invoices.iter().map(invoice_json).collect::<Vec<_>>(),
+            "swaps": resumed.swaps.iter().map(swap_json).collect::<Vec<_>>(),
             "abandoned": abandoned.collect::<Vec<_>>(),
             "pending": pending.collect::<Vec<_>>(),
             "unlinked": unlinked,
@@ -698,6 +818,19 @@ fn richest(wallet: &Wallet<Http>) -> anyhow::Result<String> {
     let richest = balance.into_iter().max_by_key(|b| b.available);
     Ok(richest
         .context("no hub: `licash-wallet add-hub URL` trusts one")?
+        .hub)
+}
+
+/// The hub holding the most, other than `other`.
+fn richest_but(wallet: &Wallet<Http>, other: &str) -> anyhow::Result<String> {
+    let other = other.trim_end_matches('/');
+    let balance = wallet.balance()?;
+    let richest = balance
+        .into_iter()
+        .filter(|b| b.hub != other)
+        .max_by_key(|b| b.available);
+    Ok(richest
+        .context("no other hub to pay at: `licash-wallet add-hub URL` trusts one")?
         .hub)
 }
 
@@ -771,6 +904,36 @@ fn invoice_line(invoice: &Invoice) -> String {
         invoice.amount,
         invoice.hub,
         invoice.hash
+    )
+}
+
+fn swap_state(state: &SwapState) -> String {
+    match state {
+        SwapState::Open => "open".into(),
+        SwapState::Done => "done".into(),
+        SwapState::Failed(reason) => format!("failed ({reason})"),
+        _ => "unknown".into(),
+    }
+}
+
+fn swap_json(swap: &Swap) -> serde_json::Value {
+    json!({
+        "hash": swap.hash, "provider": swap.provider, "from": swap.from, "to": swap.to,
+        "amount": swap.amount, "fee": swap.fee, "lock": swap.lock, "theirs": swap.theirs,
+        "state": swap_state(&swap.state), "created_at": swap.created_at,
+    })
+}
+
+fn swap_line(swap: &Swap) -> String {
+    format!(
+        "{}  swap {}  {} + {}  {} -> {}  {}",
+        swap.created_at,
+        swap_state(&swap.state),
+        swap.amount,
+        swap.fee,
+        swap.from,
+        swap.to,
+        swap.hash
     )
 }
 
