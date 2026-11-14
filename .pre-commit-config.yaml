@@ -3,9 +3,11 @@ repos:
     rev: v5.0.0
     hooks:
       - id: trailing-whitespace
+        # Patches keep the whitespace of the lines they apply to.
+        exclude: \.patch$
       - id: end-of-file-fixer
-        # Preserve the exact verifier-vector bytes.
-        exclude: ^crates/licash-groth16/tests/data/(babe-60-42|babe-claim-60-42)\.hex$
+        # Preserve the exact verifier-vector bytes, and patches.
+        exclude: (^crates/licash-groth16/tests/data/(babe-60-42|babe-claim-60-42)\.hex|\.patch)$
       - id: check-yaml
       - id: check-merge-conflict
   - repo: local
@@ -21,7 +23,14 @@ repos:
         entry: sh -c 'cargo fmt --manifest-path apps/Cargo.toml --all -- --check && cargo clippy --locked --manifest-path apps/Cargo.toml --workspace --all-targets -- -D warnings'
         language: system
         files: ^(apps/|crates/licash(-api|-hub)?/)
+        exclude: ^apps/mobile/
         pass_filenames: false
+      - id: gofmt
+        name: gofmt
+        entry: sh -c 'test -z "$(gofmt -l "$@")" || { gofmt -l "$@"; exit 1; }' gofmt
+        language: system
+        files: ^apps/mobile/chain/.*\.go$
+        exclude: ^apps/mobile/chain/upstream/
       - id: regtest-clippy
         name: regtest cargo clippy
         entry: cargo clippy --locked --manifest-path regtest/Cargo.toml --all-targets --no-deps -- -D warnings
