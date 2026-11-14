@@ -1,5 +1,6 @@
 # A regtest ecosystem for the end-to-end tests: Bitcoin Core, two hubs with
-# Lightning gateways over their own LND nodes, an outside LND node that
+# Lightning gateways over their own LND nodes (the first taking deposits on
+# Bitcoin, claimed to a fixed address), an outside LND node that
 # pays and is paid, a swap provider between the hubs, a Nostr relay the
 # hubs and the provider announce themselves on, and a Gotify server their
 # operators are notified on. `run.sh` brings it up, runs the tests and
@@ -96,6 +97,8 @@ services:
         [ -f /data/seed ] || licash-hub init; exec licash-hub run --lnd https://hub1-ln:8080
         --announce-url http://127.0.0.1:${LICASH_E2E_HUB1:-38338} --announce-name hub1
         --name hub1 --notify gotify://gotify/$$(cat /notify/token)
+        --deposit-sweep-address bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080
+        --deposit-depth 1 --deposit-window 6 --deposit-downtime 2 --deposit-sweep-blocks 6
     ports:
       - "127.0.0.1:${LICASH_E2E_HUB1:-38338}:8338"
     volumes:
