@@ -39,6 +39,7 @@ private sealed interface Step {
     data class Paying(val code: String, val asked: ULong?) : Step
     data object Busy : Step
     data class Sent(val amount: ULong, val handover: String?) : Step
+    data object Later : Step
     data class Received(val amount: ULong) : Step
     data class Trust(val payment: String, val hub: String) : Step
     data class Failed(val why: String) : Step
@@ -94,7 +95,7 @@ fun Send(engine: Engine, ui: Ui, link: String?, back: () -> Unit) {
         scope.launch {
             step = engine.pay(code, amount).fold(
                 { Step.Sent(it.amount, it.handover) },
-                { Step.Failed(explain(it)) },
+                { e -> if (e is LicashException.Pending) Step.Later else Step.Failed(explain(e)) },
             )
         }
     }
@@ -119,6 +120,8 @@ fun Send(engine: Engine, ui: Ui, link: String?, back: () -> Unit) {
             is Step.Paying -> Paying(ui, s, asking, { asking = it }) { amount -> pay(s.code, amount) }
             Step.Busy -> Middle("One moment…")
             is Step.Sent -> Sent(s, back)
+            // Not to pay again: it finishes by itself.
+            Step.Later -> Told("Under way: it finishes by itself, and reaches them then.", back)
             is Step.Received -> Done("Received ${sat(s.amount)}", back)
             is Step.Trust -> Ask(
                 "This payment is at a hub you don't use yet:\n${s.hub}\n\nTake it, and use that hub from now on?",
@@ -203,6 +206,16 @@ private fun Done(text: String, back: () -> Unit) {
         Text("✓", style = Figures, color = MaterialTheme.colorScheme.primary)
         Text(text, style = MaterialTheme.typography.headlineSmall)
         Spacer(Modifier.height(48.dp))
+        BigButton("Done", Modifier.fillMaxWidth(), onClick = back)
+    }
+}
+
+@Composable
+private fun Told(text: String, back: () -> Unit) {
+    Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
+        Spacer(Modifier.height(80.dp))
+        Text(text, style = MaterialTheme.typography.bodyLarge, textAlign = TextAlign.Center)
+        Spacer(Modifier.height(40.dp))
         BigButton("Done", Modifier.fillMaxWidth(), onClick = back)
     }
 }
