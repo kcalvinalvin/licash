@@ -276,6 +276,18 @@ fn a_hub_names_one_nostr_key_of_its_seed_across_restarts() {
 }
 
 #[test]
+fn a_hub_claims_each_deposit_with_a_key_of_its_own_seed() {
+    let (a, b) = (files(), files());
+    let hub = open(&a, Policy::default());
+    let (one, two) = (hub.deposit_secret(&[1; 32]), hub.deposit_secret(&[2; 32]));
+    assert_ne!(one, two);
+    assert_ne!(one, hub.nostr_secret());
+    drop(hub);
+    assert_eq!(open(&a, Policy::default()).deposit_secret(&[1; 32]), one);
+    assert_ne!(open(&b, Policy::default()).deposit_secret(&[1; 32]), one);
+}
+
+#[test]
 fn fees_round_up_and_saturate() {
     let fee = Fee { base: 3, ppm: 1 };
     assert_eq!(fee.due(0), 3);

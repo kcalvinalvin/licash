@@ -3,7 +3,8 @@
 //! A hub holds one secret, a 32-byte seed in a file of its own, and derives
 //! from it its issuer keysets ([`IssuerKeys::from_seed`]), the unlock of
 //! each grant it offers, its own address, at which spends pay its fees, and
-//! the key it announces itself under on Nostr ([`Hub::nostr_secret`]).
+//! the key it announces itself under on Nostr ([`Hub::nostr_secret`]) and
+//! those it claims deposits on Bitcoin with ([`Hub::deposit_secret`]).
 //! The database holds no secret: what the hub offered, which inputs it
 //! retired, which outputs it issued and what it answered. Every operation
 //! commits one transaction before it replies.
@@ -382,6 +383,8 @@ pub struct Hub {
     unlock_secret: [u8; 32],
     /// The Nostr key's secret, and its public key, x-only in hex.
     nostr: ([u8; 32], String),
+    /// What each deposit's key derives from.
+    deposit: [u8; 32],
     /// This process's public boot id and its key, never stored.
     boot: [u8; 16],
     boot_key: [u8; 32],
@@ -460,6 +463,7 @@ impl Hub {
             owner: OwnerKeys::from_seed(&tagged_hash("licash-hub/owner", &[&secret]))?,
             unlock_secret: tagged_hash("licash-hub/unlock", &[&secret]),
             nostr: nostr_key(tagged_hash("licash-hub/nostr", &[&secret]))?,
+            deposit: tagged_hash("licash-hub/deposit", &[&secret]),
             boot,
             boot_key: tagged_hash("licash-hub/boot", &[&secret, &drawn]),
             answered: Mutex::default(),
@@ -485,6 +489,13 @@ impl Hub {
     /// public key is the `nostr` of [`Hub::advertise`].
     pub fn nostr_secret(&self) -> [u8; 32] {
         self.nostr.0
+    }
+
+    /// The secret key the hub claims a deposit on Bitcoin under `hash`
+    /// with, each deposit's its own: not a valid key, by chance of about
+    /// one in 2^128, is the caller's to refuse.
+    pub fn deposit_secret(&self, hash: &[u8; 32]) -> [u8; 32] {
+        tagged_hash("licash-hub/deposit-key", &[&self.deposit, hash])
     }
 
     /// What the hub publishes of itself.

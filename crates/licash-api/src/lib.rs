@@ -54,11 +54,19 @@ pub const LN_PAY: &str = "/v1/ln/pay";
 pub const LN_RECEIVE: &str = "/v1/ln/receive";
 /// The path of [`ln_receive_state`], as a route.
 pub const LN_RECEIVE_STATE: &str = "/v1/ln/receive/{hash}";
+pub const DEPOSIT: &str = "/v1/deposit";
+/// The path of [`deposit_state`], as a route.
+pub const DEPOSIT_STATE: &str = "/v1/deposit/{hash}";
 /// The [`BlockTweaks`] of the blocks a [`TweaksQuery`] names, as a list,
 /// up to the newest the hub indexed.
 pub const TWEAKS: &str = "/v1/chain/tweaks";
 /// Most blocks a [`TweaksQuery`] names.
 pub const MAX_TWEAK_BLOCKS: u32 = 144;
+
+/// Where the deposit under `hash` stands.
+pub fn deposit_state(hash: &[u8; 32]) -> String {
+    format!("{DEPOSIT}/{}", hex::encode(hash))
+}
 
 /// Where a receipt over Lightning of `hash` stands.
 pub fn ln_receive_state(hash: &[u8; 32]) -> String {
@@ -186,6 +194,9 @@ pub struct Info {
     /// None unless the hub runs a Lightning gateway.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lightning: Option<Lightning>,
+    /// None unless the hub takes deposits on Bitcoin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deposits: Option<Deposits>,
     /// The key the hub announces itself under on Nostr, x-only in hex: an
     /// announcement of its URL by another key is not the hub's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -204,6 +215,7 @@ impl Info {
             fees,
             locks,
             lightning: None,
+            deposits: None,
             nostr: None,
             tweaks: None,
         }
@@ -624,6 +636,74 @@ impl ReceiveStatus {
             .map(|l| Ok(ProposalId::from_bytes(l.array("lock")?)))
             .transpose()
     }
+}
+
+/// What a hub takes on Bitcoin, in its info: deposits whose payment, once
+/// confirmed, locks the hub's own notes to their payer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Deposits {
+    /// On top of the notes a deposit locks.
+    pub fee: Fee,
+    /// The notes a deposit locks: at least and at most.
+    pub min: u64,
+    pub max: u64,
+    /// Confirmations its payment needs.
+    pub depth: u32,
+    /// Blocks from the request within which its payment must confirm.
+    pub window: u32,
+    /// Blocks from the request to its timeout, after which its payer may
+    /// take the coins back.
+    pub timeout: u32,
+}
+
+impl Deposits {
+    /// What a deposit of notes worth `amount` pays on Bitcoin.
+    pub fn pays(&self, amount: u64) -> Option<u64> {
+        amount.checked_add(self.fee.due(amount))
+    }
+}
+
+/// Ask for a deposit: an address on Bitcoin whose payment locks the hub's
+/// own notes to the outputs of `receive`, as over Lightning, on the
+/// preimage of its hash. `refund`, an x-only key, takes the coins back
+/// after the deposit's timeout.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Deposit {
+    #[serde(flatten)]
+    pub receive: Receive,
+    pub refund: Hex,
+}
+
+/// A deposit's terms: pay exactly `amount` to `address`, in a block up to
+/// `fund_by`. The address is that of the taproot output a hub claims with
+/// the preimage of the hash and its key `claim`, x-only, and its payer
+/// takes back with the key `refund` after block `timeout`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Depositing {
+    pub address: String,
+    pub amount: u64,
+    pub claim: Hex,
+    pub timeout: u32,
+    pub fund_by: u32,
+}
+
+/// Where a deposit stands: as a receipt over Lightning, with its payment
+/// once confirmed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DepositStatus {
+    #[serde(flatten)]
+    pub status: ReceiveStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub funding: Option<Funding>,
+}
+
+/// A deposit's payment: output `vout` of transaction `txid`, confirmed in
+/// the block at `height`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Funding {
+    pub txid: String,
+    pub vout: u32,
+    pub height: u32,
 }
 
 fn hexes(notes: &[Note]) -> Vec<Hex> {

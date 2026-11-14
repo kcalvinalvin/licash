@@ -457,3 +457,87 @@ fn swap_bodies_name_hubs_by_address_and_locks_by_id() {
         ("/v1/swaps", "/v1/swaps/info")
     );
 }
+
+#[test]
+fn deposit_bodies_are_receipts_with_a_refund_key_and_a_payment() {
+    use licash_api::{
+        Deposit, DepositStatus, Depositing, Deposits, Funding, Receive, ReceiveState, ReceiveStatus,
+    };
+    let f = fixture();
+    let outputs: Vec<Output> = f
+        .outputs
+        .iter()
+        .map(|d| Output::from_derivation(d).unwrap())
+        .collect();
+    let ephemeral = Ephemeral::random().public();
+    let receive = Receive::new(f.keyset.id(), &ephemeral, &outputs, &[5; 32]);
+    let deposit = Deposit {
+        receive: receive.clone(),
+        refund: Hex(vec![2; 32]),
+    };
+    // The receipt's fields, and the refund key beside them.
+    let wire = serde_json::to_value(&deposit).unwrap();
+    let mut fields: Vec<&str> = wire
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(|k| k.as_str())
+        .collect();
+    fields.sort();
+    assert_eq!(fields, ["ephemeral", "hash", "keyset", "outputs", "refund"]);
+    let back = json(&deposit);
+    assert_eq!(back.receive.terms().unwrap(), receive.terms().unwrap());
+    assert_eq!(back.receive.outputs().unwrap(), outputs);
+    assert_eq!(back.refund, deposit.refund);
+
+    let depositing = Depositing {
+        address: "bcrt1p".into(),
+        amount: 1_000,
+        claim: Hex(vec![3; 32]),
+        timeout: 300,
+        fund_by: 150,
+    };
+    assert_eq!(json(&depositing), depositing);
+    // Open and unpaid: no lock, no payment, on the wire too.
+    let open = DepositStatus {
+        status: ReceiveStatus {
+            state: ReceiveState::Open,
+            lock: None,
+        },
+        funding: None,
+    };
+    assert_eq!(serde_json::to_string(&open).unwrap(), r#"{"state":"open"}"#);
+    let locked = DepositStatus {
+        status: ReceiveStatus {
+            state: ReceiveState::Locked,
+            lock: Some(Hex(vec![4; 32])),
+        },
+        funding: Some(Funding {
+            txid: "ab".repeat(32),
+            vout: 1,
+            height: 120,
+        }),
+    };
+    assert_eq!(json(&locked), locked);
+    let deposits = Deposits {
+        fee: Fee {
+            base: 500,
+            ppm: 1_000,
+        },
+        min: 10_000,
+        max: 1_000_000,
+        depth: 3,
+        window: 144,
+        timeout: 288,
+    };
+    assert_eq!(deposits.pays(100_000), Some(100_600));
+    assert_eq!(deposits.pays(u64::MAX), None);
+    let mut info = Info::new(
+        std::slice::from_ref(&f.keyset),
+        f.owner.address(),
+        Fees::default(),
+        None,
+    );
+    info.deposits = Some(deposits);
+    assert_eq!(json(&info).deposits, Some(deposits));
+}
