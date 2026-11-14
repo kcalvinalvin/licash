@@ -1337,11 +1337,17 @@ name = "licash-contract"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "ark-bn254",
+ "ark-groth16",
+ "k256",
+ "licash",
  "lichen-babe",
  "lngap-btc",
  "lngap-channel",
  "lngap-lamport",
  "lngap-sessions",
+ "rand_chacha",
+ "rand_core 0.6.4",
  "serde",
 ]
 

@@ -2,7 +2,9 @@
 
 The contract on Bitcoin: Lichen's BABE transaction graph
 (`crates/licash-contract`, played by `src/contract.rs`), opened from
-licash's Base (`src/native.rs`), with end-to-end tests that fund real
+licash's Base by the holder's and the hub's state machines of
+`licash_contract::opening` over a byte pipe (`src/native.rs`, which has
+Bitcoin Core fund and sign F), with end-to-end tests that fund real
 contracts on a fresh Bitcoin Core 30 regtest node under the default relay
 policy. The garbled circuits are real; proofs are mocked (a test key)
 except in `tests/native_real_proof.rs`.
@@ -32,6 +34,8 @@ From the repository root:
 regtest/run.sh -- --test-threads=1                                 # the whole suite
 regtest/run.sh --test native_lifecycle -- --test-threads=1         # recovery outcomes
 regtest/run.sh --test native_interop -- --test-threads=1           # swaps and routes
+regtest/run.sh --test native_opening -- --test-threads=1           # forged opening messages
+cargo test --release --locked --manifest-path regtest/Cargo.toml -p licash-contract  # message codecs
 regtest/lightning.sh                                               # Lightning, two pinned LND nodes
 ```
 

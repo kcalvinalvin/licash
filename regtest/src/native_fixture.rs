@@ -154,14 +154,10 @@ pub fn fixture_under<'a>(
         None => IssuerKeys::random(12)?,
     };
     let keyset = issuer.keyset()?;
-    let gate = |b: &licash::base::Base, p: &_, g: &[u8], tip| {
-        b.holder_gate(p, g, &authority.programs, &SEED, &Scalar::from(root), tip)
-    };
     let holder = Holder {
         keyset: keyset.clone(),
-        spend_root: point(root),
         seed: SEED,
-        gate: &gate,
+        spend: Scalar::from(root),
     };
     let (c, n) = open_native(rt, label, (terms.t_a, terms.w_h), holder, authority)?;
     let ds: Vec<_> = terms

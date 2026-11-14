@@ -24,7 +24,8 @@ research implementation; it has not had a security review.
 - `crates/licash-onchain`: Bitcoin outside the protocol: silent payments
   (BIP352).
 - `crates/licash-contract`: the contract's BABE transaction graph, on
-  Lichen and ln-gap (built in regtest's workspace).
+  Lichen and ln-gap, and its opening between a holder and a hub as two
+  message-driven state machines (built in regtest's workspace).
 - `crates/licash-groth16`: RISC Zero Groth16 receipt verification, used
   inside the holder's program and on the host.
 - `r0/`: the holder's and the hub's programs for the RISC Zero zkVM, and a

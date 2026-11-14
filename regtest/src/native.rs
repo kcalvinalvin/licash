@@ -1,6 +1,8 @@
-//! Opening a contract on Lichen's BABE graph:
+//! Opening a contract on Lichen's BABE graph, the holder and the Hub each
+//! through `licash_contract::opening` over a byte pipe:
 //! Base -> native request keys/leaf -> frozen F/R -> final D -> instances
 //! under the native statement journals -> holder and Hub gates -> funding.
+//! Bitcoin Core funds and signs F for both: its wallet holds the deposit.
 //!
 //! The request leaf signs the native `b` and `E`; the later links (respond,
 //! assert, challenge, payout bits) read those signatures through the request
@@ -8,34 +10,36 @@
 //! checksum). The claim body P is its own transaction, and the counter
 //! response publishes its mandatory unlocks in five signed chunks.
 
-use crate::contract::{self, Opened, Setup, Statement};
-use crate::graph::{Babe, Publication as Coins, Spec};
+use crate::contract::{self, Opened, Statement};
 use crate::mock_statement;
 use anyhow::{anyhow, ensure, Context, Result};
 use bitcoincore_rpc::json::{AddressType, FundRawTransactionOptions};
 use bitcoincore_rpc::RpcApi;
-use licash::base::{
-    Base, ChainTerms, Fees, FinalDigest, GraphTerms, Limits, Parts, Party, Programs, Recipe,
-    ResponseKeys,
-};
+use k256::Scalar;
+use licash::base::{Base, ChainTerms, Fees, FinalDigest, GraphTerms, Limits, Programs, Recipe};
 use licash::chain::{
     self, Activation, ActivationRef, Chain, Checkpoint, HeaderBytes, Inclusion, WitnessInclusion,
 };
-use licash::crypto::{Point, Signature};
 use licash::note::Keyset;
-use licash::opening::{FrozenPrefix, GraphOutput, RequestLeaf};
+use licash::opening::FrozenPrefix;
 use licash::recovery::Publication;
 use licash::request::{Request, Signer};
 use licash::spend::{ChainProfile, TimedTerms};
 use licash::statement::Journal;
 use licash::statement::Observed;
+use licash_contract::keys::{HolderKeys, HubKeys};
+pub use licash_contract::opening::journal;
+use licash_contract::opening::{self as machine, Input, Out, Policy, Start, Trust};
+use licash_contract::wire::{Kind, Wanted};
+use licash_contract::{INSTANCES, KEPT};
 use lngap_btc::bitcoin::consensus::serialize;
 use lngap_btc::bitcoin::hashes::Hash as _;
 use lngap_btc::bitcoin::{
     absolute, transaction, Amount, Block, OutPoint, ScriptBuf, Transaction, TxIn, TxOut, Txid,
 };
 use lngap_btc::regtest::Regtest;
-use lngap_lamport::winternitz::{WotsParams, WotsPublic, WotsSig};
+use lngap_lamport::winternitz::{WotsParams, WotsSig};
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -54,6 +58,8 @@ pub struct Native {
 pub struct Authority {
     pub programs: Programs,
     pub statement: fn(&Journal) -> Statement,
+    /// Whether anyone may "prove" anything under it.
+    pub mock: bool,
 }
 
 impl Authority {
@@ -65,6 +71,7 @@ impl Authority {
                 counter: [13; 32],
             },
             statement: mock_statement,
+            mock: true,
         }
     }
 
@@ -95,7 +102,16 @@ impl Authority {
         Ok(Self {
             programs,
             statement: real_statement,
+            mock: false,
         })
+    }
+
+    fn trust(&self) -> Trust {
+        Trust {
+            programs: self.programs,
+            statement: self.statement,
+            mock: self.mock,
+        }
     }
 }
 
@@ -111,35 +127,12 @@ fn real_statement(journal: &Journal) -> Statement {
     }
 }
 
-/// The holder's funding gate, run on her device: returns her consent.
-pub type HolderGate<'a> =
-    &'a dyn Fn(&Base, &FrozenPrefix, &[u8], u32) -> std::result::Result<Signature, licash::Error>;
-
 /// What the holder brings to an opening: the issuer keyset she will hold
-/// notes of, her spending root, her request-key seed and her funding gate.
-pub struct Holder<'a> {
+/// notes of, her request-key seed and her spending root's secret.
+pub struct Holder {
     pub keyset: Keyset,
-    pub spend_root: Point,
     pub seed: [u8; 32],
-    pub gate: HolderGate<'a>,
-}
-
-/// Native request keys as ln-gap's HASH160 WOTS public keys.
-fn wots_public(elements: &[[u8; 20]], bytes: u32) -> WotsPublic {
-    WotsPublic {
-        params: WotsParams::for_bytes(bytes),
-        digits: elements.to_vec(),
-    }
-}
-
-/// The statement journal the instances encrypt under: `c ‖ D ‖ H(pk_H ‖ O_D)`.
-pub fn journal(base: &Base, d: &FinalDigest, c: u32) -> Journal {
-    let p = base.parts();
-    Journal {
-        c,
-        d: *d.as_bytes(),
-        keys: p.response_keys.keys().digest(&p.deposit),
-    }
+    pub spend: Scalar,
 }
 
 fn checkpoint(rt: &Regtest) -> Result<Checkpoint> {
@@ -161,65 +154,41 @@ fn checkpoint(rt: &Regtest) -> Result<Checkpoint> {
     )?)
 }
 
-fn party(keys: &lngap_channel::PartyPubKeys) -> Party {
-    Party {
-        funding: keys.funding.serialize(),
-        payment: keys.payment.serialize(),
-        delayed: keys.delayed.serialize(),
-        payout_script: keys.payout_spk.to_bytes(),
-    }
-}
-
-/// Base from the graph's own terms, so the gates compare like with like.
-fn base(
-    s: &Spec,
-    p: &contract::Parties,
-    keyset: Keyset,
-    spend_root: Point,
-    deposit: OutPoint,
-    checkpoint: Checkpoint,
-    programs: Programs,
-) -> Result<Base> {
-    let t = &s.terms;
-    let c = &s.params;
-    Ok(Base::new(Parts {
-        nonce: Base::fresh_nonce(),
-        spend_root,
-        claim_key: s.pubs[0].delayed.serialize(),
+/// The fixture Hub's terms: a 21-bit graph of 1-sat units, its challenge
+/// and the holder's answer 12 and 6 blocks.
+fn policy(keyset: Keyset, checkpoint: Checkpoint) -> Policy {
+    Policy {
         keyset,
-        deposit: serialize(&deposit).try_into().unwrap(),
         cap: 4_096,
-        response_keys: ResponseKeys::new(p.sealed_keys.public())?,
-        parties: [party(&s.pubs[0]), party(&s.pubs[1])],
         graph: GraphTerms {
-            id: t.id,
-            unit_sats: t.unit.to_sat(),
-            bits: u8::try_from(t.bits)?,
-            low_bits: u8::try_from(t.low_bits)?,
-            deposit_units: t.deposit,
-            close_height: t.t_close,
-            reserve_alice: t.reserve_alice.to_sat(),
-            reserve_hub: t.reserve_hub.to_sat(),
-            to_self_delay: c.to_self_delay,
-            commit_fee: c.commit_fee.to_sat(),
-            presign_fee: c.presign_fee.to_sat(),
-            dust: c.dust.to_sat(),
-            delta: c.delta,
-            delta_prime: c.delta_prime,
+            id: 7,
+            unit_sats: 1,
+            bits: 21,
+            low_bits: 9,
+            deposit_units: 500_000,
+            close_height: 0,
+            reserve_alice: 20_000,
+            reserve_hub: 100_000,
+            to_self_delay: 6,
+            commit_fee: 1_000,
+            presign_fee: 1_000,
+            dust: 330,
+            delta: 6,
+            delta_prime: 6,
             deadline_margin: 2,
-            response_window: s.windows.w_h,
-            assert_height: s.windows.t_a,
-            hub_challenge: s.windows.delta2,
-            holder_answer: s.windows.delta1,
+            response_window: 0,
+            assert_height: 0,
+            hub_challenge: 12,
+            holder_answer: 6,
         },
         recipe: Recipe {
             graph_version: 1,
-            holder_program: programs.holder,
-            counter_program: programs.counter,
-            full_instances: contract::INSTANCES as u16,
-            full_kept: contract::KEPT as u16,
-            corrected_instances: contract::INSTANCES as u16,
-            corrected_kept: contract::KEPT as u16,
+            holder_program: [0; 32],
+            counter_program: [0; 32],
+            full_instances: INSTANCES as u16,
+            full_kept: KEPT as u16,
+            corrected_instances: INSTANCES as u16,
+            corrected_kept: KEPT as u16,
         },
         chain: ChainTerms {
             checkpoint,
@@ -242,8 +211,36 @@ fn base(
             max_rate_sat_per_kvb: 10_000,
             opening_fee_quote: 3_000,
         },
-    })?)
+    }
 }
+
+/// Which party a message or effect is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Side {
+    Holder,
+    Hub,
+}
+
+impl Side {
+    fn other(self) -> Self {
+        match self {
+            Side::Holder => Side::Hub,
+            Side::Hub => Side::Holder,
+        }
+    }
+}
+
+/// A message a party refused on the way, and why: it went on without it.
+#[derive(Debug)]
+pub struct Refusal {
+    pub by: Side,
+    pub kind: Option<Kind>,
+    pub error: String,
+}
+
+/// What a test does to the messages of an opening: each in turn, with its
+/// kind, becomes the messages it returns, delivered in order.
+pub type Tamper<'a> = &'a mut dyn FnMut(Kind, Vec<u8>) -> Vec<Vec<u8>>;
 
 /// Open a native Corrected contract with assertion deadline `t_a` blocks
 /// ahead and response window `w_h`. F is funded only after both gates pass on
@@ -252,16 +249,27 @@ pub fn open_native(
     rt: &Regtest,
     label: &str,
     (t_a, w_h): (u32, u16),
-    holder: Holder<'_>,
+    holder: Holder,
     authority: Authority,
 ) -> Result<(Opened, Native)> {
-    let Holder {
-        keyset,
-        spend_root,
-        seed,
-        gate: holder_gate,
-    } = holder;
-    let p = contract::parties(label);
+    let (c, n, refused) =
+        open_native_with(rt, label, (t_a, w_h), holder, authority, &mut |_, m| {
+            vec![m]
+        })?;
+    ensure!(refused.is_empty(), "an honest opening refused: {refused:?}");
+    Ok((c, n))
+}
+
+/// [`open_native`], every message through `tamper`; the messages refused
+/// on the way. The holder keeps instances 3 and 4 of each assertion.
+pub fn open_native_with(
+    rt: &Regtest,
+    label: &str,
+    (t_a, w_h): (u32, u16),
+    holder: Holder,
+    authority: Authority,
+    tamper: Tamper<'_>,
+) -> Result<(Opened, Native, Vec<Refusal>)> {
     let deposit = {
         let addr = rt
             .rpc
@@ -270,41 +278,136 @@ pub fn open_native(
         rt.fund(&addr.script_pubkey(), Amount::from_sat(500_000))?.0
     };
     let h = rt.height()?;
-    let spec = |hmsg, hmsg2| {
-        let mut s = contract::spec(&p, hmsg, Some(hmsg2), h + t_a + 140, h + t_a);
-        s.windows.w_h = w_h;
-        s
+    let checkpoint = checkpoint(rt)?;
+    let trust = authority.trust();
+    let ctx = || -> Result<machine::Context> {
+        Ok(machine::Context {
+            tip: rt.height()?,
+            trust,
+        })
     };
-    let draft = spec(vec![[0; 32]], vec![[0; 32]]);
-    let base = base(
-        &draft,
-        &p,
-        keyset,
-        spend_root,
+    let start = Start {
+        keys: HolderKeys::from_label(label),
+        seed: holder.seed,
+        spend: holder.spend,
+        keyset: holder.keyset.clone(),
         deposit,
-        checkpoint(rt)?,
-        authority.programs,
-    )?;
-    // Request keys come from Base, never from final D.
-    let keys = Signer::derive(&seed, &base.digest()).public();
-    let (alice, hub) = (
-        draft.pubs[0].payment.serialize(),
-        draft.pubs[1].payment.serialize(),
+        wanted: Wanted {
+            assert_height: h + t_a,
+            close_height: h + t_a + 140,
+            response_window: w_h,
+        },
+        checkpoint: checkpoint.clone(),
+    };
+    let (mut alice, out) = machine::Holder::with_choice(start, &ctx()?, [vec![2, 3], vec![2, 3]])?;
+    let mut hub = machine::Hub::new(
+        HubKeys::from_label(label),
+        policy(holder.keyset, checkpoint),
     );
-    let delay = draft.params.to_self_delay;
-    let script = keys.request_leaf_for_base(&base.digest(), &alice, &hub, delay)?;
-    let native = |mut s: Spec| -> Result<Babe> {
-        s.b_key = wots_public(keys.amount_elements(), 4);
-        s.exit.as_mut().context("exit")?.e_key = wots_public(keys.claim_elements(), 32);
-        Babe::new(s)?.with_native_request(script.clone())
-    };
-    let draft = native(draft)?;
-    let tree = draft.tree()?;
-    let graph = TxOut {
-        value: draft.value(),
-        script_pubkey: tree.script_pubkey(),
-    };
-    // F is frozen unsigned: no funding signature exists before the gates.
+    let mut queue = VecDeque::new();
+    let mut refused = vec![];
+    let mut funded = false;
+    route(rt, Side::Holder, out, &mut queue, tamper, &mut funded)?;
+    while let Some((to, input)) = queue.pop_front() {
+        let kind = match &input {
+            Input::Message(m) => Kind::peek(m),
+            _ => None,
+        };
+        let step = match to {
+            Side::Holder => alice.step(input, &ctx()?),
+            Side::Hub => hub.step(input, &ctx()?),
+        };
+        match step {
+            Ok(out) => route(rt, to, out, &mut queue, tamper, &mut funded)?,
+            Err(e) => refused.push(Refusal {
+                by: to,
+                kind,
+                error: format!("{e:#}"),
+            }),
+        }
+    }
+    ensure!(funded, "the opening stalled, refusing {refused:?}");
+    let o = alice.opening()?;
+    rt.mine(u64::from(o.base.parts().graph.to_self_delay))?;
+    let [full, corrected] = o.setups;
+    Ok((
+        Opened {
+            set: o.set.into_iter().map(|x| (x.name.clone(), x)).collect(),
+            p: contract::parties(label),
+            babe: o.babe,
+            publication: o.publication,
+            signed: o.signed,
+            kept: o.kept,
+            full,
+            corrected: Some(corrected),
+            deposit: o.deposit,
+        },
+        Native {
+            base: o.base,
+            prefix: o.prefix,
+            d: o.d,
+            seed: holder.seed,
+        },
+        refused,
+    ))
+}
+
+/// Carry out what party `from` asks: its messages to the other through
+/// `tamper`, F funded or signed by Core back to it, F to the chain.
+fn route(
+    rt: &Regtest,
+    from: Side,
+    out: Vec<Out>,
+    queue: &mut VecDeque<(Side, Input)>,
+    tamper: Tamper<'_>,
+    funded: &mut bool,
+) -> Result<()> {
+    for out in out {
+        match out {
+            Out::Send(bytes) => {
+                let kind = Kind::peek(&bytes).context("a message of no kind")?;
+                for m in tamper(kind, bytes) {
+                    queue.push_back((from.other(), Input::Message(m)));
+                }
+            }
+            Out::Fund {
+                deposit,
+                graph,
+                publication,
+            } => {
+                let (funding, publication) = fund(rt, deposit, graph, &publication)?;
+                queue.push_back((
+                    from,
+                    Input::Funded {
+                        funding,
+                        publication: Box::new(publication),
+                    },
+                ));
+            }
+            Out::Sign(funding) => {
+                let f = rt
+                    .rpc
+                    .sign_raw_transaction_with_wallet(&funding, None, None)?;
+                ensure!(f.complete, "F signatures");
+                queue.push_back((from, Input::Signed(f.transaction()?)));
+            }
+            Out::Broadcast(funding) => {
+                rt.send_and_confirm(&funding)?;
+                *funded = true;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// F from Core's coins, spending `deposit` and paying `graph`, unsigned
+/// (its coins stay reserved), and the five publication coins.
+fn fund(
+    rt: &Regtest,
+    deposit: OutPoint,
+    graph: TxOut,
+    publication: &[ScriptBuf; 5],
+) -> Result<(Transaction, [(OutPoint, TxOut); 5])> {
     let unsigned = Transaction {
         version: transaction::Version::TWO,
         lock_time: absolute::LockTime::ZERO,
@@ -312,7 +415,7 @@ pub fn open_native(
             previous_output: deposit,
             ..Default::default()
         }],
-        output: vec![graph.clone()],
+        output: vec![graph],
     };
     let funding = rt
         .rpc
@@ -320,148 +423,17 @@ pub fn open_native(
             &unsigned,
             Some(&FundRawTransactionOptions {
                 add_inputs: Some(true),
-                // F stays unsigned through the gates: keep its coins reserved.
                 lock_unspents: Some(true),
                 ..Default::default()
             }),
             None,
         )?
         .transaction()?;
-    let vout = funding
-        .output
-        .iter()
-        .position(|o| o == &graph)
-        .context("F's graph output")?;
-    let funding_op = OutPoint {
-        txid: funding.compute_txid(),
-        vout: u32::try_from(vout)?,
-    };
-    let keys256 = std::array::from_fn(|i| p.disclosure[i].public());
     let mut coins = vec![];
-    for tree in draft.publication_trees(&keys256)? {
-        coins.push(rt.fund(&tree.script_pubkey(), Amount::from_sat(20_000))?);
+    for script in publication {
+        coins.push(rt.fund(script, Amount::from_sat(20_000))?);
     }
-    let coins = Coins {
-        coins: coins.try_into().unwrap(),
-        keys: keys256,
-    };
-    let draft_set = draft.presign_with_publication(funding_op, Some(&coins))?;
-    let request = &draft_set
-        .iter()
-        .find(|x| x.name == "request")
-        .context("R")?
-        .tx;
-    let parse = |tx: &Transaction| chain::Transaction::parse(&serialize(tx), 100_000);
-    let output = |o: &TxOut| chain::Output {
-        value: o.value.to_sat(),
-        script: o.script_pubkey.to_bytes(),
-    };
-    let prefix = FrozenPrefix::new(
-        parse(&funding)?,
-        parse(request)?,
-        GraphOutput {
-            index: u32::try_from(vout)?,
-            output: output(&graph),
-        },
-        GraphOutput {
-            index: 0,
-            output: output(&request.output[0]),
-        },
-        RequestLeaf::for_base(
-            base.digest(),
-            keys.clone(),
-            alice,
-            hub,
-            delay,
-            tree.control_block("request")?.serialize(),
-        )?,
-    )?;
-    let d = base.final_digest(&prefix)?;
-    // Instances are garbled under journals that bind final D.
-    let (full, full_opened) = contract::instances(
-        label,
-        &p.dealer,
-        &p.dealing,
-        &(authority.statement)(&journal(&base, &d, 0)),
-    )?;
-    let (second, second_opened) = contract::instances(
-        &format!("{label}/corrected"),
-        &p.corrected.dealer,
-        &p.corrected.dealing,
-        &(authority.statement)(&journal(&base, &d, 1)),
-    )?;
-    let hmsg = |kept: &[(u64, lichen_babe::setup::Instance)]| -> Vec<[u8; 32]> {
-        kept.iter().map(|(_, x)| x.hmsg).collect()
-    };
-    let babe = native(spec(hmsg(&full), hmsg(&second)))?;
-    ensure!(
-        babe.tree()?.script_pubkey() == graph.script_pubkey,
-        "instances changed F's graph output"
-    );
-    let set = babe.presign_with_publication(funding_op, Some(&coins))?;
-    let r = &set.iter().find(|x| x.name == "request").context("R")?.tx;
-    ensure!(
-        r.compute_txid().to_byte_array() == prefix.request().txid(),
-        "instances changed R"
-    );
-    // Gates: each side compiles the graph itself and checks the deadline.
-    let graph_script = graph.script_pubkey.to_bytes();
-    let tip = rt.height()?;
-    let consent = holder_gate(&base, &prefix, &graph_script, tip)?;
-    let retained = ResponseKeys::new(p.sealed_keys.public())?;
-    ensure!(
-        base.hub_gate(
-            &prefix,
-            &graph_script,
-            &authority.programs,
-            &retained,
-            &consent,
-            tip
-        )? == d,
-        "the gates agree on D"
-    );
-    let full = Setup {
-        presigs: contract::presign(Babe::challenge_sighash(&set)?, &p.adaptor, &p.dealing)?,
-        instances: full,
-        opened: full_opened,
-    };
-    let corrected = Setup {
-        presigs: contract::presign(
-            Babe::challenge_corrected_sighash(&set)?,
-            &p.corrected.adaptor,
-            &p.corrected.dealing,
-        )?,
-        instances: second,
-        opened: second_opened,
-    };
-    let (signed, kept) = contract::sign(&set, &p)?;
-    let f = rt
-        .rpc
-        .sign_raw_transaction_with_wallet(&funding, None, None)?;
-    ensure!(f.complete, "F signatures");
-    let f = f.transaction()?;
-    ensure!(f.compute_txid() == funding_op.txid, "F's txid moved");
-    rt.send_and_confirm(&f)?;
-    rt.mine(u64::from(delay))?;
-    Ok((
-        Opened {
-            set: set.into_iter().map(|x| (x.name.clone(), x)).collect(),
-            p,
-            babe,
-            publication: coins,
-            signed,
-            kept,
-            full,
-            corrected: Some(corrected),
-            deposit,
-        },
-        Native {
-            base,
-            prefix,
-            d,
-            seed,
-        },
-    ))
+    Ok((funding, coins.try_into().unwrap()))
 }
 
 /// Where a confirmed transaction is: height, raw block and position.

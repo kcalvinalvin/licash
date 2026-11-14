@@ -6,44 +6,37 @@
 //! statement the test supplies, so that a proof opens a kept instance's
 //! hashlock and nothing else does. A Corrected contract has a second
 //! assertion (`assert_corrected`, journal `c = 1`) with its own keys and
-//! setup ([`Stage`]). `native` opens it from licash's Base.
+//! setup ([`Stage`]). `native` opens it from licash's Base, both parties
+//! through `licash_contract::opening`.
 
 use std::collections::HashMap;
 
-use crate::graph::{Babe, Corrected, ExitKeys, Spec, Windows};
+use crate::graph::{Babe, Corrected, ExitKeys};
 use anyhow::{anyhow, Context, Result};
-use ark_bn254::{Bn254, Fr};
-use ark_groth16::{Proof, VerifyingKey};
+use ark_bn254::Bn254;
+use ark_groth16::Proof;
 use bitcoincore_rpc::json::{AddressType, SignRawTransactionInput};
 use bitcoincore_rpc::RpcApi;
 use lichen_babe::garble::evaluate;
-use lichen_babe::reveal::{
-    check_presigs, complete, extract, points, reveal_args, AdaptorKeys, LamportKey, LamportPub,
-};
-use lichen_babe::setup::{instance, Instance, DIGITS};
-use lichen_babe::vsss::{deal, interpolate, Dealer, Dealing};
+use lichen_babe::reveal::{complete, extract, reveal_args, AdaptorKeys, LamportKey, LamportPub};
+use lichen_babe::vsss::{interpolate, Dealer, Dealing};
 use lichen_babe::we::decrypt;
-use lngap_btc::adaptor::AdaptorSig;
-use lngap_btc::bitcoin::hashes::{sha256, Hash as _};
 use lngap_btc::bitcoin::{Amount, OutPoint, Transaction, TxIn};
 use lngap_btc::keys::Seed;
 use lngap_btc::regtest::Regtest;
-use lngap_btc::secp256k1::Message;
 use lngap_btc::sighash::sign_tapscript;
 use lngap_btc::tx::build_tx;
 use lngap_btc::witness::{tapscript_witness, witness_args_consumption_order};
-use lngap_channel::{ChannelParams, PartyKeys, Role};
+use lngap_channel::PartyKeys;
 use lngap_lamport::winternitz::{
     Wots256Secret, Wots256Sig, WotsParams, WotsPublic, WotsSecret, WotsSig,
 };
-use lngap_sessions::session::{bit_tree, Terms};
-use lngap_sessions::skeleton::{sign_all, Presign, Signed};
-use rand_chacha::ChaCha20Rng;
-use rand_core::SeedableRng;
+use lngap_sessions::session::bit_tree;
+use lngap_sessions::skeleton::{Presign, Signed};
 
-/// Instances the hub builds, and how many Alice keeps.
-pub const INSTANCES: usize = 4;
-pub const KEPT: usize = 2;
+use licash_contract::keys::{HolderKeys, HubKeys};
+pub use licash_contract::opening::{OpenedShares, Setup, Statement};
+pub use licash_contract::{INSTANCES, KEPT};
 
 /// Both parties' secrets for one contract. One struct, as a test holds
 /// both sides; which side uses what is noted on each field.
@@ -84,50 +77,35 @@ pub struct Second {
     pub dealing: Dealing,
 }
 
+/// Both parties' keys of the contract labelled `label`, as each derives
+/// its own ([`licash_contract::keys`]); Alice's `b` and `E` of the graph's
+/// own request too (a native opening's come from her request seed).
 pub fn parties(label: &str) -> Parties {
-    let rng = &mut ChaCha20Rng::from_seed(sha256::Hash::hash(label.as_bytes()).to_byte_array());
     let a = Seed::from_label(&format!("{label}/alice"));
-    let h = Seed::from_label(&format!("{label}/hub"));
-    let (dealer, dealing) = deal(DIGITS, INSTANCES - KEPT, rng);
-    let hub256 = |name: &str, bytes: u32| {
-        Wots256Secret::from_entropy(WotsParams::for_bytes(bytes), h.derive_bytes(name))
-    };
-    // the second set has its own randomness: the first is unchanged by it
-    let rng2 = &mut ChaCha20Rng::from_seed(
-        sha256::Hash::hash(format!("{label}/corrected").as_bytes()).to_byte_array(),
-    );
-    let a2 = Seed::from_label(&format!("{label}/alice/corrected"));
-    let (dealer2, dealing2) = deal(DIGITS, INSTANCES - KEPT, rng2);
+    let alice = HolderKeys::from_label(label);
+    let hub = HubKeys::from_label(label);
     Parties {
-        alice: PartyKeys::from_seed(Role::User, a.clone()),
-        hub: PartyKeys::from_seed(Role::Hub, h.clone()),
+        alice: alice.party,
+        hub: hub.party,
         b_key: WotsSecret::from_entropy(WotsParams::for_bytes(4), a.derive_bytes("b")),
         e_key: WotsSecret::from_entropy(WotsParams::for_bytes(32), a.derive_bytes("e")),
-        lamport: LamportKey::new(&a, DIGITS),
-        adaptor: AdaptorKeys::new(&a, DIGITS),
-        hub_b: hub256("b", 4),
-        hub_e_plain: hub256("e_plain", 32),
-        hub_e_counter: hub256("e_counter", 32),
-        hub_k: hub256("k", licash::statement::K_LEN as u32),
-        hub_b_corr: hub256("b_corr", 4),
-        disclosure: std::array::from_fn(|i| {
-            hub256(
-                &format!("disclosure-{i}"),
-                licash::disclosure::CHUNK_BYTES[i] as u32,
-            )
-        }),
-        sealed_keys: licash::statement::SecretKeys::from_entropy(
-            ["b", "e_plain", "e_counter", "k", "b_corr"].map(|n| h.derive_bytes(n)),
-            std::array::from_fn(|i| h.derive_bytes(&format!("disclosure-{i}"))),
-        ),
-        dealer,
-        dealing,
+        lamport: alice.lamport,
+        adaptor: alice.adaptor,
+        hub_b: hub.b,
+        hub_e_plain: hub.e_plain,
+        hub_e_counter: hub.e_counter,
+        hub_k: hub.k,
+        hub_b_corr: hub.b_corr,
+        disclosure: hub.disclosure,
+        sealed_keys: hub.sealed,
+        dealer: hub.full.dealer,
+        dealing: hub.full.dealing,
         corrected: Second {
-            b_key: WotsSecret::from_entropy(WotsParams::for_bytes(4), a2.derive_bytes("b")),
-            lamport: LamportKey::new(&a2, DIGITS),
-            adaptor: AdaptorKeys::new(&a2, DIGITS),
-            dealer: dealer2,
-            dealing: dealing2,
+            b_key: alice.corrected.b_key,
+            lamport: alice.corrected.lamport,
+            adaptor: alice.corrected.adaptor,
+            dealer: hub.corrected.dealer,
+            dealing: hub.corrected.dealing,
         },
     }
 }
@@ -152,57 +130,6 @@ impl Parties {
             &self.hub_b_corr.public(),
             self.sealed_keys.public().disclosure,
         )
-    }
-}
-
-/// The statement BABE encrypts under: its Groth16 verifying key and the
-/// public inputs of the journal fixed at opening.
-pub struct Statement {
-    pub vk: VerifyingKey<Bn254>,
-    pub public: Vec<Fr>,
-}
-
-/// The graph's terms; `hmsg2`, the corrected setup's kept hashlocks, makes
-/// it a Corrected contract's.
-pub(crate) fn spec(
-    p: &Parties,
-    hmsg: Vec<[u8; 32]>,
-    hmsg2: Option<Vec<[u8; 32]>>,
-    t_close: u32,
-    t_a: u32,
-) -> Spec {
-    Spec {
-        terms: Terms {
-            id: 7,
-            unit: Amount::from_sat(1),
-            bits: 21,
-            low_bits: 9,
-            deposit: 500_000,
-            t_close,
-            reserve_alice: Amount::from_sat(20_000),
-            reserve_hub: Amount::from_sat(100_000),
-        },
-        params: ChannelParams::regtest(Amount::from_sat(20_000_000)),
-        pubs: [p.alice.public(), p.hub.public()],
-        b_key: p.b_key.public(),
-        hub_b: p.hub_b.public(),
-        lamport: p.lamport.public(),
-        adaptor: p.adaptor.public(),
-        hmsg,
-        windows: Windows {
-            w_h: 6,
-            t_a,
-            delta2: 12,
-            delta1: 6,
-        },
-        exit: Some(p.exit_keys()),
-        corrected: hmsg2.map(|hmsg| Corrected {
-            hub_b: p.hub_b_corr.public(),
-            b_key: p.corrected.b_key.public(),
-            lamport: p.corrected.lamport.public(),
-            adaptor: p.corrected.adaptor.public(),
-            hmsg,
-        }),
     }
 }
 
@@ -239,35 +166,6 @@ impl Stage {
     }
 }
 
-/// One assertion's setup as Alice holds it: her adaptor pre-signatures of
-/// its challenge, and her kept instances by index (1-based, as the shares).
-pub struct Setup {
-    pub presigs: Vec<[AdaptorSig; 4]>,
-    pub instances: Vec<(u64, Instance)>,
-    /// Shares actually disclosed and checked at opening, held by Alice.
-    pub opened: OpenedShares,
-}
-
-pub type OpenedShares = Vec<(u64, Vec<[[u8; 32]; 4]>)>;
-
-/// Both parties' signatures, Alice's on `wrongly_challenged` kept apart.
-pub(crate) fn sign(set: &[Presign], p: &Parties) -> Result<(Signed, HashMap<String, Vec<u8>>)> {
-    let mut alice = sign_all(set, &p.alice.payment)?;
-    let kept = alice
-        .iter()
-        .filter(|(n, _)| Babe::withheld(n))
-        .map(|(n, s)| (n.clone(), s.clone()))
-        .collect();
-    alice.retain(|n, _| !Babe::withheld(n));
-    Ok((
-        Signed {
-            hub: sign_all(set, &p.hub.payment)?,
-            alice,
-        },
-        kept,
-    ))
-}
-
 /// A contract funded and pre-signed, Alice's kept instances built from
 /// the hub's shares (the opened ones checked), her adaptor pre-signatures
 /// checked by the hub.
@@ -290,55 +188,6 @@ pub struct Opened {
 /// 32-item claim (with arbitrarily large fallback input tables) fits.
 pub const REQUEST_ITEMS: usize = 200;
 pub const REQUEST_BYTES: usize = REQUEST_ITEMS * 80;
-
-pub(crate) fn instances(
-    tag: &str,
-    dealer: &Dealer,
-    dealing: &Dealing,
-    st: &Statement,
-) -> Result<(Vec<(u64, Instance)>, OpenedShares)> {
-    let seeds: Vec<[u8; 32]> = (1..=INSTANCES as u64)
-        .map(|i| sha256::Hash::hash(&[tag.as_bytes(), &i.to_le_bytes()].concat()).to_byte_array())
-        .collect();
-    let built: Vec<(Instance, [u8; 32])> = lichen_babe::setup::par(INSTANCES, |i| {
-        instance(&seeds[i], &dealer.shares(i as u64 + 1), &st.vk, &st.public)
-    });
-    let opened: Vec<(u64, Vec<[lichen_babe::setup::Secret; 4]>)> = (0..INSTANCES - KEPT)
-        .map(|i| (i as u64 + 1, dealer.shares(i as u64 + 1)))
-        .collect();
-    let rng = &mut ChaCha20Rng::from_seed(sha256::Hash::hash(tag.as_bytes()).to_byte_array());
-    anyhow::ensure!(
-        dealing.verify(&opened, rng),
-        "the opened shares lie on the dealing"
-    );
-    for (i, s) in &opened {
-        let c = built[*i as usize - 1].0.commitment();
-        anyhow::ensure!(
-            lichen_babe::setup::check_opened(&c, &seeds[*i as usize - 1], s, &st.vk, &st.public),
-            "opened instance {i} matches its commitment"
-        );
-    }
-    let kept = (INSTANCES - KEPT..INSTANCES)
-        .map(|i| (i as u64 + 1, built[i].0.clone()))
-        .collect();
-    Ok((kept, opened))
-}
-
-/// Alice's adaptor pre-signatures of a challenge's sighash `msg`, on the
-/// dealing's points; the hub checks them.
-pub(crate) fn presign(
-    msg: Message,
-    keys: &AdaptorKeys,
-    dealing: &Dealing,
-) -> Result<Vec<[AdaptorSig; 4]>> {
-    let pts = points(dealing);
-    let presigs = keys.presign(&msg, &pts);
-    anyhow::ensure!(
-        check_presigs(&keys.public(), &msg, &pts, &presigs),
-        "Alice's pre-signatures of the challenge"
-    );
-    Ok(presigs)
-}
 
 impl Opened {
     fn setup(&self, stage: Stage) -> Result<&Setup> {

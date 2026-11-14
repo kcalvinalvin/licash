@@ -12,7 +12,7 @@ members = ["../crates/licash-contract"]
 
 [dependencies]
 licash = { path = "../crates/licash" }
-licash-contract = { path = "../crates/licash-contract" }
+licash-contract = { path = "../crates/licash-contract", features = ["fixture"] }
 lichen-babe = { path = "../../lichen/crates/babe" }
 licash-groth16 = { path = "../crates/licash-groth16" }
 lngap-btc = { path = "../../ln-gap/crates/btc" }

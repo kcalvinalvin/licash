@@ -194,6 +194,9 @@ jobs:
       - name: Groth16 verifier agrees with golden receipts
         working-directory: licash
         run: CARGO_TARGET_DIR=regtest/target cargo test --locked --manifest-path crates/licash-groth16/Cargo.toml
+      - name: The contract's opening messages
+        working-directory: licash
+        run: cargo test --release --locked --manifest-path regtest/Cargo.toml -p licash-contract
       - name: Bitcoin Core regtest (mock proofs)
         working-directory: licash
         run: regtest/run.sh -- --test-threads=1
