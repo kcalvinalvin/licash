@@ -22,7 +22,9 @@ pub struct Notifier {
 impl Notifier {
     /// Notifications of the events of `provider` to `targets`, keeping
     /// their places in the file `cursors`, of the `kinds` of event (all if
-    /// empty), under titles headed by `name`.
+    /// empty), under titles headed by `name`. Targets new to `cursors` hear
+    /// of the events from now on, the alerts the provider raises as it
+    /// starts included.
     pub fn new<T: Transport + 'static>(
         provider: Arc<Provider<T>>,
         name: &str,
@@ -34,7 +36,8 @@ impl Notifier {
             provider,
             name: name.to_owned(),
         });
-        let mut relay = Relay::new(events, targets, cursors)?;
+        let last = events.last()?;
+        let mut relay = Relay::new(events, targets, cursors)?.new_targets_after(last);
         if !kinds.is_empty() {
             relay = relay.only(kinds);
         }

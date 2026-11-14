@@ -1,11 +1,16 @@
-//! The provider's API over a provider whose wallet reaches no hub, and its
-//! binary's commands that need none.
+//! The provider's API and notifications over a provider whose wallet
+//! reaches no hub, and its binary's commands that need none.
 
-use std::{process::Command, sync::Arc};
+use std::{
+    process::Command,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use axum::{
     body::Body,
     http::{Request, StatusCode},
+    routing::post,
     Router,
 };
 use http_body_util::BodyExt;
@@ -152,4 +157,44 @@ fn announcements_are_checked_before_anything_runs() {
         assert!(stderr.contains(says), "{args:?}: {stderr}");
     }
     assert!(!dir.path().join("data").exists());
+}
+
+#[tokio::test]
+async fn a_new_target_hears_of_what_the_provider_says_from_its_start_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, provider) = router(&dir);
+    let heard = Arc::new(Mutex::new(Vec::<String>::new()));
+    let sink = {
+        let heard = heard.clone();
+        Router::new().route(
+            "/",
+            post(move |body: String| async move { heard.lock().unwrap().push(body) }),
+        )
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target = format!("json://{}/", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, sink).await });
+
+    provider.alert("before its start").unwrap();
+    let notifier = licash_swaps_service::notify::Notifier::new(
+        provider.clone(),
+        "swaps",
+        vec![target.parse().unwrap()],
+        &dir.path().join("notify.json"),
+        Vec::new(),
+    )
+    .unwrap();
+    // Raised as it starts, before its notifications run.
+    provider.alert("as it starts").unwrap();
+    tokio::spawn(notifier.run());
+    for _ in 0..100 {
+        if !heard.lock().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let heard = heard.lock().unwrap();
+    assert_eq!(heard.len(), 1, "{heard:?}");
+    assert!(heard[0].contains("as it starts"), "{}", heard[0]);
 }
