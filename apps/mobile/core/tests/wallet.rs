@@ -13,6 +13,7 @@ use std::sync::{
     Arc, Mutex,
 };
 
+use axum::response::IntoResponse;
 use bitcoin::{
     absolute::LockTime,
     bip158::BlockFilter,
@@ -62,6 +63,8 @@ struct Net {
     backend: esplora::Shared,
     url: String,
     relay: Option<MockRelay>,
+    /// The hub answers 503 to everything while set.
+    down: Arc<AtomicBool>,
     dir: tempfile::TempDir,
 }
 
@@ -120,6 +123,7 @@ impl Net {
             backend,
             url: String::new(),
             relay,
+            down: Arc::new(AtomicBool::new(false)),
             dir,
         };
         net.mine(3, Vec::new());
@@ -134,7 +138,18 @@ impl Net {
             relays,
             ..Default::default()
         };
-        let app = licash_hub_service::router(net.hub.clone(), services);
+        let down = net.down.clone();
+        let app = licash_hub_service::router(net.hub.clone(), services).layer(
+            axum::middleware::from_fn(move |request, next: axum::middleware::Next| {
+                let down = down.load(Ordering::SeqCst);
+                async move {
+                    if down {
+                        return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
+                    }
+                    next.run(request).await
+                }
+            }),
+        );
         let listener = net
             .runtime
             .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
@@ -808,4 +823,160 @@ fn a_phone_born_before_its_hubs_tweaks_looks_in_each_block_once() {
     assert_eq!(scan(&alice, &light), (0, 0));
     assert!(light.fetched().is_empty());
     assert_eq!(alice.balance().unwrap().onchain, 5_000);
+}
+
+/// A wallet `name` holding the notes moved in from a payment of 3000 to
+/// its silent payment address.
+fn funded(net: &Net, light: &Arc<Light>, name: &str) -> Arc<Wallet> {
+    let wallet = net.wallet(name, net.height());
+    let code = wallet.payment_code(None).unwrap();
+    let payment = net.pay_silent(&code.qr, 3_000, 1);
+    net.mine(1, vec![payment]);
+    assert_eq!(scan(&wallet, light), (1, 3_000));
+    wallet.move_to_licash(light.clone()).unwrap();
+    net.confirm_sent();
+    net.round();
+    net.mine(1, Vec::new());
+    net.round();
+    wallet.resume().unwrap();
+    assert!(notes(&wallet) > 0);
+    wallet
+}
+
+#[test]
+fn a_phone_paying_while_its_hub_is_down_sends_the_payment_to_the_mailbox_once_made() {
+    let net = Net::new(true);
+    let light = Light::new(&net);
+    let alice = funded(&net, &light, "alice");
+    let held = notes(&alice);
+    let bob = net.wallet("bob", net.height());
+    let asked = bob.payment_code(Some(500)).unwrap();
+
+    // Its hub down: under way, and still so when resumed.
+    net.down.store(true, Ordering::SeqCst);
+    let paid = alice.pay(asked.qr.clone(), None);
+    assert!(matches!(paid, Err(LicashError::Pending { .. })), "{paid:?}");
+    alice.resume().unwrap();
+    assert!(notes(&alice) < held);
+
+    // Back up: made when resumed, and sent to Bob's mailbox, once.
+    net.down.store(false, Ordering::SeqCst);
+    alice.resume().unwrap();
+    assert_eq!(notes(&alice), held - 501);
+    let got = bob.collect().unwrap();
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!((got[0].kind, got[0].amount), (Kind::Received, 500));
+    alice.resume().unwrap();
+    assert!(bob.collect().unwrap().is_empty());
+    assert_eq!(notes(&bob), 500);
+    let kept = std::path::Path::new(&net.dir("alice")).join("deliveries.json");
+    assert_eq!(std::fs::read_to_string(kept).unwrap(), "[]");
+
+    // Paid with its hub up: sent at once, nothing kept to send later.
+    let paid = alice.pay(asked.qr, None).unwrap();
+    assert!(paid.delivered, "{paid:?}");
+    alice.resume().unwrap();
+    assert_eq!(bob.collect().unwrap().len(), 1);
+    assert_eq!(notes(&bob), 1_000);
+}
+
+#[test]
+fn a_phone_stopped_while_paying_sends_the_payment_to_the_mailbox_when_back() {
+    let net = Net::new(true);
+    let light = Light::new(&net);
+    let alice = funded(&net, &light, "alice");
+    let held = notes(&alice);
+    let bob = net.wallet("bob", net.height());
+    let asked = bob.payment_code(Some(500)).unwrap();
+    net.down.store(true, Ordering::SeqCst);
+    let paid = alice.pay(asked.qr, None);
+    assert!(matches!(paid, Err(LicashError::Pending { .. })), "{paid:?}");
+
+    // As if the app stopped before keeping which payment it was, and the
+    // payment was made after, before the app sent it on.
+    let dir = std::path::PathBuf::from(net.dir("alice"));
+    let kept = dir.join("deliveries.json");
+    let mut entries: Vec<serde_json::Value> =
+        serde_json::from_str(&std::fs::read_to_string(&kept).unwrap()).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert!(entries[0].as_object_mut().unwrap().remove("send").is_some());
+    std::fs::write(&kept, serde_json::to_vec(&entries).unwrap()).unwrap();
+    net.down.store(false, Ordering::SeqCst);
+    let http = licash_transport::Http::new(None).unwrap();
+    let sdk = licash_wallet::Wallet::open(&dir.join("wallet.sqlite"), http).unwrap();
+    let resumed = net.runtime.block_on(sdk.resume()).unwrap();
+    assert_eq!(resumed.paid.len(), 1);
+    drop(sdk);
+
+    // Back: the payment made found, and sent to Bob's mailbox.
+    alice.resume().unwrap();
+    assert_eq!(notes(&alice), held - 501);
+    let got = bob.collect().unwrap();
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!((got[0].kind, got[0].amount), (Kind::Received, 500));
+    assert_eq!(std::fs::read_to_string(kept).unwrap(), "[]");
+}
+
+/// Alice's payments kept for mailboxes, each changed by `change`.
+fn change_deliveries(net: &Net, change: impl Fn(&mut serde_json::Map<String, serde_json::Value>)) {
+    let kept = std::path::Path::new(&net.dir("alice")).join("deliveries.json");
+    let mut entries: Vec<serde_json::Value> =
+        serde_json::from_str(&std::fs::read_to_string(&kept).unwrap()).unwrap();
+    for entry in &mut entries {
+        change(entry.as_object_mut().unwrap());
+    }
+    std::fs::write(&kept, serde_json::to_vec(&entries).unwrap()).unwrap();
+}
+
+#[test]
+fn a_phone_sends_a_payment_made_weeks_later_to_the_mailbox_still() {
+    let net = Net::new(true);
+    let light = Light::new(&net);
+    let alice = funded(&net, &light, "alice");
+    let bob = net.wallet("bob", net.height());
+    let asked = bob.payment_code(Some(500)).unwrap();
+    net.down.store(true, Ordering::SeqCst);
+    let paid = alice.pay(asked.qr, None);
+    assert!(matches!(paid, Err(LicashError::Pending { .. })), "{paid:?}");
+    // Paid 15 days ago, its hub down since.
+    let ago = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        - 15 * 86_400;
+    change_deliveries(&net, |entry| {
+        entry.insert("at".into(), ago.into());
+    });
+    net.down.store(false, Ordering::SeqCst);
+    alice.resume().unwrap();
+    let got = bob.collect().unwrap();
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(got[0].amount, 500);
+}
+
+#[test]
+fn a_phone_stopped_twice_while_paying_the_same_sends_both_to_the_mailbox() {
+    let net = Net::new(true);
+    let light = Light::new(&net);
+    let alice = funded(&net, &light, "alice");
+    let held = notes(&alice);
+    let bob = net.wallet("bob", net.height());
+    let asked = bob.payment_code(Some(500)).unwrap();
+    net.down.store(true, Ordering::SeqCst);
+    for _ in 0..2 {
+        let paid = alice.pay(asked.qr.clone(), None);
+        assert!(matches!(paid, Err(LicashError::Pending { .. })), "{paid:?}");
+        // A second apart: the second kept after the first was made.
+        std::thread::sleep(std::time::Duration::from_millis(1_100));
+    }
+    // As if the app stopped each time before keeping which payment it was.
+    change_deliveries(&net, |entry| {
+        assert!(entry.remove("send").is_some());
+    });
+    net.down.store(false, Ordering::SeqCst);
+    alice.resume().unwrap();
+    assert_eq!(notes(&alice), held - 2 * 501);
+    let got = bob.collect().unwrap();
+    assert_eq!(got.len(), 2, "{got:?}");
+    assert_eq!(notes(&bob), 1_000);
 }

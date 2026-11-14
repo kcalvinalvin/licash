@@ -7,6 +7,7 @@
 //! into notes. One payment code ([`Wallet::payment_code`]) takes both.
 
 mod chain;
+mod deliveries;
 mod log;
 mod wallet;
 
