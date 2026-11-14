@@ -14,6 +14,9 @@ pub trait ChainSource: Send + Sync {
     fn height(&self) -> Result<u32, ChainError>;
     /// The hash of the best chain's block at `height`.
     fn hash(&self, height: u32) -> Result<Vec<u8>, ChainError>;
+    /// The time the best chain's block at `height` claims, in seconds since
+    /// the Unix epoch.
+    fn time(&self, height: u32) -> Result<i64, ChainError>;
     /// The basic compact filter (BIP158) of the block of `hash`, checked
     /// against the chain's filter headers.
     fn filter(&self, hash: Vec<u8>) -> Result<Vec<u8>, ChainError>;

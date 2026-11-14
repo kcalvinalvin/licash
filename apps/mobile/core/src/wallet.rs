@@ -13,8 +13,8 @@ use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    chain::Chain, Activity, Balance, ChainSource, Code, Hub, Kind, LicashError, Network, Paid,
-    Range, Scan, Scanned, State,
+    chain::Chain, Activity, Balance, ChainError, ChainSource, Code, Hub, Kind, LicashError,
+    Network, Paid, Range, Scan, Scanned, State,
 };
 
 /// The rate deposits are paid at, in sat/vB: above what nodes relay.
@@ -22,6 +22,9 @@ const DEPOSIT_RATE: u64 = 2;
 
 /// The blocks a scan looks in at most, to report progress between.
 const SCAN_BATCH: u32 = 144;
+
+/// A day, in seconds.
+const DAY: i64 = 86_400;
 
 /// A wallet, kept in a directory of its own.
 #[derive(uniffi::Object)]
@@ -37,8 +40,8 @@ pub struct Wallet {
 #[derive(Default, Serialize, Deserialize)]
 struct Kept {
     /// The chain's height when the wallet was made: none of its payments
-    /// on Bitcoin can be older. Unknown, everything a hub indexed is
-    /// looked in.
+    /// on Bitcoin can be older. Unknown (0), from the blocks of the day
+    /// before its file was made.
     #[serde(default)]
     birthday: u32,
 }
@@ -181,10 +184,19 @@ impl Wallet {
     /// The code to be paid at, `amount` if given: in notes at the hubs
     /// trusted, and on Bitcoin.
     pub fn payment_code(&self, amount: Option<u64>) -> Result<Code, LicashError> {
-        let hubs = self.wallet.hubs()?.into_iter().map(|(url, _)| url);
-        let hubs: Vec<String> = hubs.take(MAX_HUBS).collect();
+        let trusted = self.wallet.hubs()?;
+        let hubs: Vec<String> = trusted
+            .iter()
+            .map(|(url, _)| url.clone())
+            .take(MAX_HUBS)
+            .collect();
         let mut code = self.wallet.payment_code(&hubs, true)?;
         code.amount = amount.filter(|a| *a > 0);
+        // Payers pay a silent payment address rather than the fallback:
+        // only if a hub's tweaks find those payments.
+        if !trusted.iter().any(|(_, info)| info.tweaks.is_some()) {
+            code.silent = None;
+        }
         Ok(Code {
             text: code.to_string(),
             qr: code.qr(),
@@ -347,54 +359,71 @@ impl Wallet {
         Ok(history)
     }
 
-    /// Look for payments on Bitcoin in the next blocks of `chain`, with
-    /// the tweaks of a hub trusted, and broadcast again the wallet's spends
-    /// not in a block yet once caught up. Called until `next` passes
-    /// `height`.
+    /// Look for payments on Bitcoin in the next blocks of `chain`, and
+    /// broadcast again the wallet's spends not in a block yet once caught
+    /// up. Called until `next` passes `height`, once a hub is trusted. With
+    /// the tweaks of a hub trusted serving them; without, of blocks no hub
+    /// trusted serves tweaks of, for the fallback addresses and the coins
+    /// held only.
     pub fn scan(&self, chain: Arc<dyn ChainSource>) -> Result<Scan, LicashError> {
-        let hubs = self.wallet.hubs()?.into_iter();
-        let mut tweaks: Vec<(String, u32)> =
-            hubs.filter_map(|(u, i)| Some((u, i.tweaks?))).collect();
-        tweaks.sort_by_key(|(_, first)| *first);
-        let Some((earliest, first)) = tweaks.first().cloned() else {
+        let hubs = self.wallet.hubs()?;
+        if hubs.is_empty() {
             return Err(LicashError::invalid(
                 "no hub trusted serves what finds payments on Bitcoin",
             ));
-        };
+        }
+        let hubs = hubs.into_iter();
+        let mut tweaks: Vec<(String, u32)> =
+            hubs.filter_map(|(u, i)| Some((u, i.tweaks?))).collect();
+        tweaks.sort_by_key(|(_, first)| *first);
+        let earliest = tweaks.first().map(|(_, first)| *first);
         let next = match self.wallet.silent_next()? {
             Some(next) => next,
             None => {
-                let from = self.kept().birthday.max(first);
-                self.wallet.watch_silent(&earliest, from)?;
+                // Recorded before any block is looked in.
+                let from = self.first_block(chain.as_ref())?;
+                self.wallet.watch_silent(None, from)?;
+                tracing::info!(from, "looking for payments on Bitcoin");
                 from
             }
         };
         let source = Chain(chain.clone());
         let mut failed = None;
+        let mut scanned = None;
         // Any hub serving the blocks: their tweaks are the chain's.
         for (url, _) in tweaks.iter().filter(|(_, first)| *first <= next) {
-            match self
-                .runtime
-                .block_on(self.wallet.scan_silent(url, &source, SCAN_BATCH))
-            {
-                Ok(scanned) => {
-                    if scanned.next > scanned.height {
-                        self.broadcast_again(chain.as_ref());
-                    }
-                    return Ok(Scan {
-                        next: scanned.next,
-                        height: scanned.height,
-                        found: scanned.found.len() as u32,
-                        found_value: scanned.found.iter().map(|c| c.value).sum(),
-                    });
+            let scan = self.wallet.scan_silent(url.as_str(), &source, SCAN_BATCH);
+            match self.runtime.block_on(scan) {
+                Ok(done) => {
+                    scanned = Some(done);
+                    break;
                 }
-                Err(e @ licash_wallet::Error::Unavailable { .. }) => failed = Some(e),
+                Err(e @ licash_wallet::Error::Unavailable { .. }) => {
+                    tracing::warn!(hub = %url, "no tweaks: {e}");
+                    failed = Some(e);
+                }
                 Err(e) => return Err(e.into()),
             }
         }
-        Err(match failed {
-            Some(e) => e.into(),
-            None => LicashError::invalid(format!("no hub trusted serves block {next} on")),
+        let scanned = match (scanned, failed) {
+            (Some(scanned), _) => scanned,
+            // Those serving them are unreachable: wait for one.
+            (None, Some(e)) => return Err(e.into()),
+            // None serves them: without tweaks, up to the first one does.
+            (None, None) => {
+                let max = earliest.map_or(SCAN_BATCH, |first| SCAN_BATCH.min(first - next));
+                let scan = self.wallet.scan_silent(None, &source, max);
+                self.runtime.block_on(scan)?
+            }
+        };
+        if scanned.next > scanned.height {
+            self.broadcast_again(chain.as_ref());
+        }
+        Ok(Scan {
+            next: scanned.next,
+            height: scanned.height,
+            found: scanned.found.len() as u32,
+            found_value: scanned.found.iter().map(|c| c.value).sum(),
         })
     }
 
@@ -465,6 +494,31 @@ impl Wallet {
         if let Err(e) = self.runtime.block_on(self.wallet.unlink()) {
             tracing::warn!(%e, "some notes stay linked for now");
         }
+    }
+
+    /// The first block to look in for payments on Bitcoin: the chain's
+    /// height when the wallet was made, if the app knew it. Else the first
+    /// block claiming a time from a day before the wallet file was made
+    /// on, a margin for block times and clocks: the app makes new seeds
+    /// only, never paid before.
+    fn first_block(&self, chain: &dyn ChainSource) -> Result<u32, LicashError> {
+        let birthday = self.kept().birthday;
+        if birthday > 0 {
+            return Ok(birthday);
+        }
+        let since = self.wallet.created_at()? - DAY;
+        let light = |e: ChainError| LicashError::failed(format!("the light client: {e}"));
+        let height = chain.height().map_err(light)?;
+        let (mut low, mut high) = (1, height + 1);
+        while low < high {
+            let mid = low + (high - low) / 2;
+            if chain.time(mid).map_err(light)? < since {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
+        }
+        Ok(low)
     }
 
     fn broadcast_again(&self, chain: &dyn ChainSource) {

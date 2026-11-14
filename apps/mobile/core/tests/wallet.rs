@@ -9,7 +9,7 @@ mod chain;
 mod esplora;
 
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicI64, Ordering},
     Arc, Mutex,
 };
 
@@ -67,6 +67,12 @@ struct Net {
 
 impl Net {
     fn new(relays: bool) -> Self {
+        Self::with(relays, true)
+    }
+
+    /// The hub serving tweaks only if `tweaks`.
+    fn with(relays: bool, tweaks: bool) -> Self {
+        let serves_tweaks = tweaks;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -124,7 +130,7 @@ impl Net {
         };
         let services = Services {
             deposits: Some(net.deposits.clone()),
-            tweaks: Some(net.tweaks.clone()),
+            tweaks: serves_tweaks.then(|| net.tweaks.clone()),
             relays,
             ..Default::default()
         };
@@ -279,6 +285,8 @@ struct Light {
     backend: esplora::Shared,
     fetched: Mutex<Vec<u32>>,
     failing: AtomicBool,
+    /// Added to the times blocks claim.
+    skew: AtomicI64,
 }
 
 impl Light {
@@ -287,6 +295,7 @@ impl Light {
             backend: net.backend.clone(),
             fetched: Mutex::new(Vec::new()),
             failing: AtomicBool::new(false),
+            skew: AtomicI64::new(0),
         })
     }
 
@@ -358,6 +367,22 @@ impl ChainSource for Light {
             backend.mempool.push(tx);
         }
         Ok(())
+    }
+
+    /// Ten minutes apart, the tip's now: the times its headers claim are
+    /// of 2011.
+    fn time(&self, height: u32) -> Result<i64, ChainError> {
+        let tip = self.backend.lock().unwrap().chain.height();
+        if height > tip {
+            return Err(ChainError::Failed {
+                reason: format!("no block {height}"),
+            });
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        Ok(now - i64::from(tip - height) * 600 + self.skew.load(Ordering::SeqCst))
     }
 
     fn unconfirmed(&self, script: Vec<u8>) -> Result<Vec<u8>, ChainError> {
@@ -710,4 +735,66 @@ fn a_phone_sees_payments_to_its_fallback_address_on_their_way() {
     net.mine(1, vec![payment]);
     assert_eq!(scan(&alice, &light), (1, 3_000));
     assert_eq!(alice.incoming(light.clone()).unwrap(), []);
+}
+
+#[test]
+fn a_phone_whose_hubs_serve_no_tweaks_finds_its_fallback_payments_from_the_day_before_it_was_made()
+{
+    let net = Net::with(false, false);
+    let light = Light::new(&net);
+    // Its birthday unknown.
+    let alice = net.wallet("alice", 0);
+    let made = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    assert!(!alice.hubs().unwrap()[0].silent);
+    // No silent payment address, which no hub's tweaks would find paid.
+    let code = alice.payment_code(None).unwrap();
+    assert!(!code.text.contains("sp="), "{}", code.text);
+    let address = code.address.unwrap();
+    let early = net.pay_plain(&address, 1_000, 1);
+    net.mine(1, vec![early]);
+    let before = net.height();
+    let late = net.pay_plain(&address, 6_000, 2);
+    net.mine(1, vec![late]);
+    // Block `before` claims a time just before the day before the wallet
+    // was made, the next just after.
+    let claimed = light.time(before).unwrap();
+    let skew = made - 86_400 - 300 - claimed;
+    light.skew.store(skew, Ordering::SeqCst);
+    assert_eq!(scan(&alice, &light), (1, 6_000));
+    assert_eq!(light.fetched(), [before + 1]);
+    assert_eq!(alice.balance().unwrap().onchain, 6_000);
+
+    // Moved to notes, more than the hub takes at once: the change found.
+    let moving = alice.move_to_licash(light.clone()).unwrap();
+    let sent = net.sent();
+    let outputs: u64 = sent[0].output.iter().map(|o| o.value.to_sat()).sum();
+    let change = outputs - (moving.amount + moving.fee);
+    assert!(change > 0);
+    net.confirm_sent();
+    assert_eq!(scan(&alice, &light), (1, change));
+    assert_eq!(alice.balance().unwrap().onchain, change);
+}
+
+#[test]
+fn a_phone_born_before_its_hubs_tweaks_looks_in_each_block_once() {
+    let net = Net::new(false);
+    let light = Light::new(&net);
+    // Born at block 1, the hub's tweaks from block 3 on: blocks 1 and 2
+    // looked in without them.
+    let alice = net.wallet("alice", 1);
+    let code = alice.payment_code(None).unwrap();
+    let silent = net.pay_silent(&code.text, 2_000, 1);
+    net.mine(1, vec![silent]);
+    let paid = net.height();
+    let plain = net.pay_plain(&code.address.unwrap(), 3_000, 2);
+    net.mine(1, vec![plain]);
+    assert_eq!(scan(&alice, &light), (2, 5_000));
+    assert_eq!(light.fetched(), [paid, paid + 1]);
+    net.mine(1, Vec::new());
+    assert_eq!(scan(&alice, &light), (0, 0));
+    assert!(light.fetched().is_empty());
+    assert_eq!(alice.balance().unwrap().onchain, 5_000);
 }
