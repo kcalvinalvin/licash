@@ -980,3 +980,98 @@ fn a_phone_stopped_twice_while_paying_the_same_sends_both_to_the_mailbox() {
     assert_eq!(got.len(), 2, "{got:?}");
     assert_eq!(notes(&bob), 1_000);
 }
+
+/// HTTP to a hub, losing every request that posts.
+struct Lossy(licash_transport::Http);
+
+impl licash_wallet::Transport for Lossy {
+    fn request(
+        &self,
+        url: &str,
+        body: Option<Vec<u8>>,
+    ) -> impl std::future::Future<Output = Result<licash_wallet::Response, String>> + Send {
+        let lost = body.is_some();
+        let answer = self.0.request(url, body);
+        async move {
+            match lost {
+                true => Err("connection reset".into()),
+                false => answer.await,
+            }
+        }
+    }
+}
+
+#[test]
+fn a_phone_keeps_no_move_its_hub_never_answered_and_gives_up_those_kept_before() {
+    let net = Net::new(false);
+    let light = Light::new(&net);
+    let alice = net.wallet("alice", 0);
+    let code = alice.payment_code(None).unwrap();
+    net.mine(1, vec![net.pay_silent(&code.text, 3_000, 1)]);
+    assert_eq!(scan(&alice, &light), (1, 3_000));
+    let moves = |wallet: &Wallet| {
+        let history = wallet.history().unwrap();
+        history.iter().filter(|a| a.kind == Kind::Moved).count()
+    };
+
+    // Its hub down: no move kept, however often asked, its coins still on
+    // Bitcoin.
+    net.down.store(true, Ordering::SeqCst);
+    for _ in 0..3 {
+        let moved = alice.move_to_licash(light.clone());
+        assert!(
+            matches!(moved, Err(LicashError::Unavailable { .. })),
+            "{moved:?}"
+        );
+        alice.resume().unwrap();
+    }
+    net.down.store(false, Ordering::SeqCst);
+    assert_eq!(moves(&alice), 0);
+    let onchain = Balance {
+        onchain: 3_000,
+        ..Balance::default()
+    };
+    assert_eq!(alice.balance().unwrap(), onchain);
+    drop(alice);
+
+    // Moves kept unanswered, as earlier versions did: given up on resuming,
+    // never shown again, and the coins moved anew.
+    let path = std::path::Path::new(&net.dir("alice")).join("wallet.sqlite");
+    let http = licash_transport::Http::new(None).unwrap();
+    let earlier = licash_wallet::Wallet::open(&path, Lossy(http)).unwrap();
+    for _ in 0..2 {
+        let kept = net.runtime.block_on(earlier.deposit(&net.url, 2_000));
+        assert!(
+            matches!(kept, Err(licash_wallet::Error::Pending { .. })),
+            "{kept:?}"
+        );
+    }
+    drop(earlier);
+    let alice = Wallet::open(net.dir("alice"), false).unwrap();
+    assert_eq!(moves(&alice), 2);
+    alice.resume().unwrap();
+    assert_eq!(moves(&alice), 0);
+    alice.move_to_licash(light.clone()).unwrap();
+    assert_eq!(moves(&alice), 1);
+    let moving = Balance {
+        moving: 3_000,
+        ..Balance::default()
+    };
+    assert_eq!(alice.balance().unwrap(), moving);
+}
+
+#[test]
+fn a_phone_reaches_a_hub_named_by_its_host_alone_over_https() {
+    let net = Net::new(false);
+    let alice = Wallet::create(net.dir("alice"), Network::Regtest, 0, false).unwrap();
+    // Not over plain HTTP, which the hub here serves on its port.
+    let host = net.url.strip_prefix("http://").unwrap();
+    let secure = alice.add_hub(host.into());
+    assert!(
+        matches!(secure, Err(LicashError::Unavailable { .. })),
+        "{secure:?}"
+    );
+    assert!(alice.hubs().unwrap().is_empty());
+    alice.add_hub(net.url.clone()).unwrap();
+    assert_eq!(alice.hubs().unwrap()[0].url, net.url);
+}

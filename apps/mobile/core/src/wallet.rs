@@ -149,14 +149,22 @@ impl Wallet {
 /// Hubs, and what the wallet holds.
 #[uniffi::export]
 impl Wallet {
-    /// Trust the hub at `url`: take its notes, and pay through it.
+    /// Trust the hub at `url`: take its notes, and pay through it. A host
+    /// alone is reached over HTTPS, or HTTP for an onion service.
     pub fn add_hub(&self, url: String) -> Result<Hub, LicashError> {
         let url = url.trim();
         let host = url.split("://").nth(1).unwrap_or(url);
         let host = host.split(['/', ':']).next().unwrap_or(host);
-        if host.ends_with(".onion") && !self.tor {
+        let onion = host.ends_with(".onion");
+        if onion && !self.tor {
             return Err(LicashError::NeedsTor);
         }
+        let url = match url.contains("://") {
+            true => url.to_owned(),
+            false if onion => format!("http://{url}"),
+            false => format!("https://{url}"),
+        };
+        let url = url.as_str();
         let info = self.runtime.block_on(self.wallet.add_hub(url))?;
         // Its URL as the wallet keeps it.
         let mut kept = self.wallet.hubs()?.into_iter();
@@ -325,6 +333,13 @@ impl Wallet {
     /// Finish what was under way: payments, and moves to notes.
     pub fn resume(&self) -> Result<(), LicashError> {
         let _delivering = self.delivering();
+        // Moves kept before their hub answered, by earlier versions: none
+        // paid them, as no address was named, and a move asks anew.
+        for deposit in self.wallet.deposits()? {
+            if deposit.terms.is_none() && deposit.state == DepositState::Open {
+                self.wallet.abandon_deposit(&deposit.hash)?;
+            }
+        }
         let resumed = self.runtime.block_on(self.wallet.resume())?;
         for (id, reason) in &resumed.abandoned {
             tracing::warn!(%id, %reason, "given up");
@@ -367,7 +382,11 @@ impl Wallet {
         let receipts = self.wallet.receipts()?.into_iter();
         let receipts = receipts.filter(|r| !moved.contains(&&r.id));
         history.extend(receipts.map(|r| received_activity(&r)));
-        history.extend(deposits.iter().map(moved_activity));
+        // A move its hub never answered moved nothing.
+        let answered = deposits
+            .iter()
+            .filter(|d| d.terms.is_some() || d.state == DepositState::Open);
+        history.extend(answered.map(moved_activity));
         for coin in self.wallet.silent_coins()? {
             let state = match coin.spending {
                 Some(_) => State::Pending,
