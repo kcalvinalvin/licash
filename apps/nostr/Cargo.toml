@@ -28,4 +28,4 @@ tempfile = "3.27"
 # Reach relays through a Tor client of the application's own.
 tor = ["dep:async-wsocket", "dep:futures-util", "dep:licash-tor", "dep:tokio-tungstenite"]
 # Pay payment codes and take the mailbox's payments with a Licash wallet.
-wallet = ["dep:licash-api", "dep:licash-wallet"]
+wallet = ["dep:futures-util", "dep:licash-api", "dep:licash-wallet"]

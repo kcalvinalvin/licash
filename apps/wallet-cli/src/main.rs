@@ -14,7 +14,7 @@ use licash::{
     spend::{lock_hash, ChainProfile},
 };
 use licash_api::Payment;
-use licash_nostr::{Role, Route};
+use licash_nostr::{wallet::swap_providers, Role, Route};
 use licash_transport::Http;
 use licash_wallet::{
     Deposit, DepositState, Error, Invoice, InvoiceState, Lock, LockState, PaymentCode, State, Swap,
@@ -241,9 +241,21 @@ enum Command {
         /// The hub to get AMOUNT at.
         #[arg(long)]
         to: String,
-        /// The swap provider, by its URL.
+        /// The swap provider, by its URL [default: of those announced on
+        /// the relays that swap AMOUNT within the limits, one swapped
+        /// through before, else the cheapest].
         #[arg(long, env = "LICASH_WALLET_PROVIDER")]
-        provider: String,
+        provider: Option<String>,
+        /// A relay to find a provider on [default: those the wallet's hubs
+        /// name]. Repeat it, or separate relays with commas, for more.
+        #[arg(
+            long = "relay",
+            value_name = "URL",
+            env = "LICASH_WALLET_RELAYS",
+            value_delimiter = ',',
+            conflicts_with = "provider"
+        )]
+        relays: Vec<String>,
         /// The hub to pay at [default: the other one holding the most].
         #[arg(long)]
         from: Option<String>,
@@ -681,6 +693,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             amount,
             to,
             provider,
+            relays,
             from,
             max_fee,
             max_margin,
@@ -693,6 +706,15 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 fee: max_fee.unwrap_or(SwapLimits::usual(amount).fee),
                 margin: max_margin,
             };
+            let (provider, found) = match provider {
+                Some(provider) => (provider, false),
+                None => {
+                    let route = route(tor.clone(), cli.proxy.as_deref())?;
+                    let pair = (from.as_str(), to.as_str());
+                    let found = find_provider(&wallet, relays, &route, pair, amount, limits);
+                    (found.await?, true)
+                }
+            };
             let swap = wallet.swap(&provider, &from, &to, amount, limits).await?;
             let unlinked = unlink(&wallet).await;
             let mut shown = swap_json(&swap);
@@ -702,14 +724,20 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                     show(json, shown, swap_line(&swap));
                     bail!("the swap failed ({reason}): its lock returns once expired")
                 }
-                _ => show(
-                    json,
-                    shown,
-                    format!(
-                        "swapped {} + {} at {} for {} at {}",
-                        swap.amount, swap.fee, swap.from, swap.amount, swap.to
-                    ),
-                ),
+                _ => {
+                    let through = match found {
+                        true => format!(" through {provider}"),
+                        false => String::new(),
+                    };
+                    show(
+                        json,
+                        shown,
+                        format!(
+                            "swapped {} + {} at {} for {} at {}{through}",
+                            swap.amount, swap.fee, swap.from, swap.amount, swap.to
+                        ),
+                    )
+                }
             }
         }
         Command::Onchain { chain, command } => {
@@ -1098,6 +1126,33 @@ fn richest_but(wallet: &Wallet<Http>, other: &str) -> anyhow::Result<String> {
     Ok(richest
         .context("no other hub to pay at: `licash-wallet add-hub URL` trusts one")?
         .hub)
+}
+
+/// The provider to swap `amount` from hub `from` to hub `to` through
+/// within `limits`: the first [`swap_providers`] finds on `relays`, else
+/// on those the wallet's hubs name.
+async fn find_provider(
+    wallet: &Wallet<Http>,
+    relays: Vec<String>,
+    route: &Route,
+    (from, to): (&str, &str),
+    amount: u64,
+    limits: SwapLimits,
+) -> anyhow::Result<String> {
+    let relays = match relays {
+        relays if !relays.is_empty() => relays,
+        _ => licash_nostr::wallet::hub_relays(wallet)?,
+    };
+    if relays.is_empty() {
+        bail!("no relay to find a provider on: name one with --relay, or a provider");
+    }
+    let found = swap_providers(wallet, &relays, route, (from, to), amount, limits).await?;
+    let found = found.into_iter().next().with_context(|| {
+        format!("no provider announced swaps {amount} from {from} to {to} within the limits")
+    })?;
+    let (fee, known) = (found.quote.fee, found.known);
+    tracing::info!(provider = %found.url, fee, known, "provider found");
+    Ok(found.url)
 }
 
 /// The only hub trusted.

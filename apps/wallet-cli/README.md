@@ -52,7 +52,10 @@ for notes at a hub taking deposits.
 `amount` at `<hub>` through a swap provider, with a lock at each hub:
 nothing is revealed until the provider's lock pays the wallet, and a swap
 that fails leaves the wallet's lock to return once expired. `resume` takes
-a pending swap on.
+a pending swap on. Without `--provider`, the wallet takes one announced on
+Nostr (on `--relay`, else the relays its hubs name) that swaps the amount
+within `--max-fee` and `--max-margin`: one it swapped through before, else
+the cheapest.
 
 `discover --relay wss://relay.example` lists the hubs announced on Nostr,
 at the URLs that answer as the hub that announced them; with `--swaps`, the

@@ -607,6 +607,105 @@ fn swap_providers_announced_on_nostr_are_discovered_where_they_answer() {
 }
 
 #[test]
+fn a_swap_goes_through_a_provider_announced_one_used_before_first_then_the_cheapest() {
+    use licash_nostr::{wallet::swap_providers, Announcement, Announcer, Role, Route};
+    use licash_wallet::SwapLimits;
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let (_relay, relay) = support::relay(&runtime);
+    let relays = vec![relay];
+    // Hubs naming the relay, where their wallets look for providers.
+    let a = Server::with_relays(FEE, relays.clone());
+    let b = Server::with_relays(FEE, relays.clone());
+    let terms = |base, margin| licash_swaps::Config {
+        fee: Fee { base, ppm: 0 },
+        margin,
+        ..support::swaps::CONFIG
+    };
+    // For 20: 1, 2 (1 + 1%, rounded up), too much, too long locked.
+    let cheap = Swaps::with(&[&a, &b], 200, 0x51, terms(1, 6));
+    let usual = Swaps::start(&[&a, &b], 200);
+    let greedy = Swaps::with(&[&a, &b], 200, 0x52, terms(500, 6));
+    let slow = Swaps::with(&[&a, &b], 200, 0x53, terms(1, 30));
+    let announce = |secret: [u8; 32], url: String| {
+        let announcement = Announcement {
+            urls: vec![url],
+            network: "regtest".into(),
+            name: None,
+        };
+        runtime.block_on(async {
+            let announcer = Announcer::new(&secret, Role::Swaps, &relays, &Route::Direct)
+                .await
+                .unwrap();
+            announcer.announce(&announcement).await.unwrap();
+        });
+    };
+    for swaps in [&cheap, &usual, &greedy, &slow] {
+        announce(swaps.provider.nostr_secret().unwrap(), swaps.url());
+    }
+    // Another key announcing the cheapest: not where it answers as that key.
+    announce([3; 32], cheap.url());
+
+    let dir = tempfile::tempdir().unwrap();
+    let funded = |name: &str| {
+        let (file, at) = party(dir.path(), name, Some(&a));
+        ok(wallet(&file, &["add-hub", &b.url()], None));
+        let funds = serde_json::to_string(&a.pay(&address(&at), 100)).unwrap();
+        ok(wallet(&file, &["receive"], Some(&funds)));
+        file
+    };
+    let (alice, bob) = (funded("alice"), funded("bob"));
+    let (from, to) = (a.url(), b.url());
+    let found = |file: &Path, amount: u64| -> Vec<(String, u64, bool)> {
+        runtime.block_on(async {
+            let transport = licash_transport::Http::new(None).unwrap();
+            let wallet = licash_wallet::Wallet::open(file, transport).unwrap();
+            let limits = SwapLimits::usual(amount);
+            let pair = (from.as_str(), to.as_str());
+            let found = swap_providers(&wallet, &relays, &Route::Direct, pair, amount, limits);
+            let found = found.await.unwrap().into_iter();
+            found.map(|p| (p.url, p.quote.fee, p.known)).collect()
+        })
+    };
+    assert_eq!(
+        found(&alice, 20),
+        [(cheap.url(), 1, false), (usual.url(), 2, false)]
+    );
+    // Beyond what any swaps.
+    assert!(found(&alice, 151).is_empty());
+
+    let swap = |file: &Path, amount: &str, more: &[&str]| {
+        let mut args = vec!["swap", amount, "--to", &to];
+        args.extend(more);
+        wallet(file, &args, None)
+    };
+    let text = ok(swap(&alice, "20", &[]));
+    let through = format!("through {}", cheap.url());
+    assert_eq!(
+        text.trim(),
+        format!("swapped 20 + 1 at {from} for 20 at {to} {through}")
+    );
+    failed(
+        swap(&alice, "151", &[]),
+        1,
+        "no provider announced swaps 151",
+    );
+    assert_eq!(json(&alice, &["swaps"]).as_array().unwrap().len(), 1);
+
+    // Bob swapped through the dearer one: he goes through it again.
+    ok(swap(&bob, "20", &["--provider", &usual.url()]));
+    assert_eq!(
+        found(&bob, 20),
+        [(usual.url(), 2, true), (cheap.url(), 1, false)]
+    );
+    let text = ok(swap(&bob, "20", &[]));
+    assert!(
+        text.trim().ends_with(&format!("through {}", usual.url())),
+        "{text}"
+    );
+    drop((greedy, slow));
+}
+
+#[test]
 fn a_tor_client_of_its_own_keeps_its_state_next_to_the_wallet() {
     let dir = tempfile::tempdir().unwrap();
     let (alice, _) = party(dir.path(), "alice", None);

@@ -51,11 +51,16 @@ impl Swaps {
     /// A provider swapping between `hubs`, holding `stock` at the last,
     /// all in the runtime of its own thread, as its wallet's client is.
     pub fn start(hubs: &[&Server], stock: u64) -> Self {
+        Self::with(hubs, stock, 0x50, CONFIG)
+    }
+
+    /// [`Swaps::start`], its wallet of seed `seed`, on terms `config`.
+    pub fn with(hubs: &[&Server], stock: u64, seed: u8, config: Config) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("wallet.sqlite");
         let wallet = Wallet::create(
             &path,
-            &[0x50; 32],
+            &[seed; 32],
             ChainProfile::Core30DefaultRegtest,
             Http::new(None).unwrap(),
         )
@@ -77,7 +82,7 @@ impl Swaps {
                     wallet.add_hub(url).await.unwrap();
                 }
                 wallet.receive(&stocked).unwrap();
-                let provider = Arc::new(Provider::create(&swaps, wallet, CONFIG).unwrap());
+                let provider = Arc::new(Provider::create(&swaps, wallet, config).unwrap());
                 let nostr = licash_nostr::public_key(&provider.nostr_secret().unwrap()).unwrap();
                 let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                 ready
