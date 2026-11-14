@@ -39,8 +39,8 @@ use bitcoin::{
     key::{Keypair, Secp256k1, TweakedPublicKey},
     secp256k1::{Message, PublicKey, SecretKey, XOnlyPublicKey},
     sighash::{Prevouts, SighashCache},
-    transaction, Amount, Block, BlockHash, FeeRate, OutPoint, ScriptBuf, Sequence, TapSighashType,
-    Transaction, TxIn, TxOut, Txid, Witness,
+    transaction, Amount, Block, BlockHash, FeeRate, OutPoint, Script, ScriptBuf, Sequence,
+    TapSighashType, Transaction, TxIn, TxOut, Txid, Witness,
 };
 use licash_api::{BlockTweaks, MAX_TWEAK_BLOCKS, TWEAKS};
 use licash_onchain::silent::{self, Found, Scanner, SpAddress, CHANGE};
@@ -91,6 +91,18 @@ pub struct SilentCoin {
     pub change: bool,
     /// The wallet's transaction spending it, in no block yet.
     pub spending: Option<Txid>,
+}
+
+/// A transaction the wallet made of its coins, and where it stands.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SilentSpend {
+    pub tx: Transaction,
+    /// Paid to its miners: what the coins it spends held, less what it
+    /// pays. Unknown while one of them is, forgotten with its block in a
+    /// reorganization until found again.
+    pub fee: Option<u64>,
+    /// The block it is in, once a scan saw it there.
+    pub height: Option<u32>,
 }
 
 /// What a [`Wallet::scan_silent`] did.
@@ -865,6 +877,49 @@ impl<T: Transport> Wallet<T> {
             let rows = stmt.query_map([], |r| r.get::<_, Vec<u8>>(0))?;
             rows.map(|tx| bitcoin::consensus::deserialize(&tx?).map_err(invalid))
                 .collect()
+        })
+    }
+
+    /// The wallet's transactions of its coins paying `script`, oldest
+    /// first, in a block or not: none given up.
+    pub fn silent_spends_paying(&self, script: &Script) -> Result<Vec<SilentSpend>, Error> {
+        self.store.read(|c| {
+            let mut stmt = c.prepare("SELECT tx FROM silent_spends ORDER BY created_at, txid")?;
+            let rows = stmt.query_map([], |r| r.get::<_, Vec<u8>>(0))?;
+            let raw = rows.collect::<Result<Vec<_>, _>>()?;
+            let mut coin = c.prepare(
+                "SELECT value, spent_by, spent_at FROM silent_coins WHERE txid = ?1 AND vout = ?2",
+            )?;
+            let mut spends = Vec::new();
+            for tx in raw {
+                let tx: Transaction = bitcoin::consensus::deserialize(&tx).map_err(invalid)?;
+                if !tx.output.iter().any(|o| o.script_pubkey == *script) {
+                    continue;
+                }
+                let txid = tx.compute_txid().to_byte_array();
+                let (mut held, mut height) = (Some(0u64), None);
+                for input in &tx.input {
+                    let spent = input.previous_output;
+                    let params = params![spent.txid.to_byte_array(), spent.vout];
+                    let row = coin.query_row(params, |r| {
+                        let by: Option<[u8; 32]> = r.get(1)?;
+                        Ok((r.get::<_, i64>(0)? as u64, by, r.get::<_, Option<u32>>(2)?))
+                    });
+                    match row.optional()? {
+                        Some((value, by, at)) => {
+                            held = held.and_then(|h| h.checked_add(value));
+                            if by == Some(txid) {
+                                height = height.or(at);
+                            }
+                        }
+                        None => held = None,
+                    }
+                }
+                let paid: u64 = tx.output.iter().map(|o| o.value.to_sat()).sum();
+                let fee = held.and_then(|h| h.checked_sub(paid));
+                spends.push(SilentSpend { tx, fee, height });
+            }
+            Ok(spends)
         })
     }
 

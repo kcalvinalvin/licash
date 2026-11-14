@@ -27,7 +27,7 @@ use bitcoin::{
 use licash::spend::ChainProfile;
 use licash_api::{BlockTweaks, Fee, Hex, Info};
 use licash_onchain::silent::{self, SpAddress};
-use licash_wallet::{Blocks, Error, PaymentCode, Response, Transport, Wallet};
+use licash_wallet::{Blocks, Error, PaymentCode, Response, SilentSpend, Transport, Wallet};
 use net::{Net, HUB};
 
 const REGTEST: ChainProfile = ChainProfile::Core30DefaultRegtest;
@@ -573,6 +573,53 @@ async fn payments_are_found_and_spent_with_change_found_again() {
     assert_eq!(all.output.len(), 1);
     let fee = rate().fee_wu(all.weight()).unwrap().to_sat();
     assert_eq!(pays(&all, &elsewhere()), change.value - fee);
+}
+
+#[tokio::test]
+async fn a_spend_shows_its_fee_and_its_block_as_far_as_the_wallet_knows() {
+    let s = setup().await;
+    s.wallet.watch_silent(HUB, 1).unwrap();
+    let paying = s.pay(&[s.address(), s.address()], &[30_000, 20_000]);
+    s.mine(vec![paying]);
+    s.scan().await.unwrap();
+    let paying = |script: &ScriptBuf| s.wallet.silent_spends_paying(script).unwrap();
+    assert!(paying(&elsewhere()).is_empty());
+    let spend = s
+        .wallet
+        .spend_silent(elsewhere(), Some(35_000), rate())
+        .unwrap();
+    let out: u64 = spend.output.iter().map(|o| o.value.to_sat()).sum();
+    let sent = SilentSpend {
+        tx: spend.clone(),
+        fee: Some(50_000 - out),
+        height: None,
+    };
+    assert_eq!(paying(&elsewhere()), std::slice::from_ref(&sent));
+    assert!(paying(&ScriptBuf::new_op_return([1])).is_empty());
+
+    // In block 4, once a scan saw it there.
+    s.mine(vec![spend]);
+    assert_eq!(paying(&elsewhere()), std::slice::from_ref(&sent));
+    s.scan().await.unwrap();
+    let confirmed = SilentSpend {
+        height: Some(4),
+        ..sent.clone()
+    };
+    assert_eq!(paying(&elsewhere()), [confirmed]);
+
+    // Its block replaced: in none again.
+    s.chain.lock().unwrap().fork(4);
+    s.chain.lock().unwrap().mine_empty(2);
+    s.scan().await.unwrap();
+    assert_eq!(paying(&elsewhere()), std::slice::from_ref(&sent));
+
+    // Its coins' block replaced too: what they held is unknown.
+    s.chain.lock().unwrap().fork(3);
+    s.chain.lock().unwrap().mine_empty(4);
+    s.scan().await.unwrap();
+    assert!(s.wallet.silent_coins().unwrap().is_empty());
+    let unknown = SilentSpend { fee: None, ..sent };
+    assert_eq!(paying(&elsewhere()), [unknown]);
 }
 
 #[tokio::test]
