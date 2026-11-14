@@ -41,19 +41,92 @@ impl std::fmt::Debug for ProposalId {
     }
 }
 
-/// Exactly the two static profiles selected for the initial native model.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The chains Licash follows, each under the consensus rules of its node.
+///
+/// The signets are for testing only: their block signature is in the
+/// coinbase, not the header, so header checks alone cannot tell a signet
+/// block from one anybody mined at its low difficulty.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ChainProfile {
     Core30Mainnet,
     Core30DefaultRegtest,
+    /// The default signet.
+    Core30Signet,
+    /// Mutinynet: a signet with blocks every 30 seconds.
+    Mutinynet,
 }
 
 impl ChainProfile {
+    /// Every profile.
+    pub const ALL: [Self; 4] = [
+        Self::Core30Mainnet,
+        Self::Core30DefaultRegtest,
+        Self::Core30Signet,
+        Self::Mutinynet,
+    ];
+
+    /// Its byte in encodings. Tag 2 is unassigned.
     pub(crate) fn tag(self) -> u8 {
         match self {
             Self::Core30Mainnet => 0,
             Self::Core30DefaultRegtest => 1,
+            Self::Core30Signet => 3,
+            Self::Mutinynet => 4,
         }
+    }
+
+    pub(crate) fn from_tag(tag: u8) -> Option<Self> {
+        Self::ALL.into_iter().find(|p| p.tag() == tag)
+    }
+
+    /// Its network's name: `bitcoin`, `regtest`, `signet` or `mutinynet`.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Core30Mainnet => "bitcoin",
+            Self::Core30DefaultRegtest => "regtest",
+            Self::Core30Signet => "signet",
+            Self::Mutinynet => "mutinynet",
+        }
+    }
+
+    /// Whether its coins are for testing only.
+    pub fn is_test(self) -> bool {
+        self != Self::Core30Mainnet
+    }
+
+    /// Blocks between retargets of the difficulty, or none if fixed.
+    pub fn retarget_interval(self) -> Option<u32> {
+        match self {
+            Self::Core30Mainnet | Self::Core30Signet => Some(2016),
+            Self::Mutinynet => Some(40_320),
+            Self::Core30DefaultRegtest => None,
+        }
+    }
+
+    /// The seconds the chain aims to take for a block.
+    pub fn block_seconds(self) -> u32 {
+        match self {
+            Self::Mutinynet => 30,
+            _ => 600,
+        }
+    }
+}
+
+impl std::fmt::Display for ChainProfile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+impl std::str::FromStr for ChainProfile {
+    type Err = Error;
+
+    /// A profile by its network's [`name`](Self::name).
+    fn from_str(name: &str) -> Result<Self, Error> {
+        Self::ALL
+            .into_iter()
+            .find(|p| p.name() == name)
+            .ok_or_else(|| bad("unknown network: bitcoin, regtest, signet or mutinynet"))
     }
 }
 
@@ -134,11 +207,8 @@ impl TimedTerms {
     }
 
     fn decode(reader: &mut Reader<'_>) -> Result<Self, Error> {
-        let profile = match reader.array::<1>()?[0] {
-            0 => ChainProfile::Core30Mainnet,
-            1 => ChainProfile::Core30DefaultRegtest,
-            _ => return Err(bad("unknown activation chain profile")),
-        };
+        let profile = ChainProfile::from_tag(reader.array::<1>()?[0])
+            .ok_or_else(|| bad("unknown activation chain profile"))?;
         Self::new(
             profile,
             reader.array()?,

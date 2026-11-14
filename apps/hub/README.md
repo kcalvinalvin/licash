@@ -12,6 +12,10 @@ licash-hub --data ./hub status
 licash-hub --data ./hub events --follow
 ```
 
+`--network` (`bitcoin` by default, or `regtest`, `signet`, `mutinynet`) is
+the chain `--chain` must follow: the hub scans no other. The signets are for
+testing only: header checks cannot tell their blocks from forged ones.
+
 `<data>/seed` is the hub's only secret: keep a copy offline. Never replace
 `<data>/hub.sqlite` while the hub runs: the hub halts, and `/health` answers
 503, until it is restarted.

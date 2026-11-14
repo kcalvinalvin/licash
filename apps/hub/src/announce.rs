@@ -23,7 +23,7 @@ pub async fn announce(
     };
     let announcement = Announcement {
         urls,
-        network: licash_chain_client::network(profile).to_string(),
+        network: profile.name().to_owned(),
         name,
     };
     match Announcer::new(&hub.nostr_secret(), Role::Hub, &relays, &route).await {

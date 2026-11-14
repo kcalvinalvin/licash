@@ -7,34 +7,34 @@ use std::{sync::Arc, time::Duration};
 
 use anyhow::Context;
 use bitcoin::hashes::Hash;
+use licash::spend::ChainProfile;
 use licash_chain_client::Source;
 use licash_hub::Hub;
 
 /// Most blocks between checkpoints: fresh ones keep a holder's proof short.
 const CHECKPOINT_EVERY: u32 = 144;
 
-/// Follow `source` into `hub`, a round every `every`, for good. Stops only
-/// if `source` follows a chain the hub cannot: another network than its
-/// checkpoints', or one without a checkpoint profile.
-pub async fn watch(hub: Arc<Hub>, source: Source, every: Duration) {
+/// Follow `source` into `hub`, a round every `every`, for good, if both
+/// follow `network`. Stops only if one does not: `source` follows another
+/// chain, or the hub's checkpoints are of another.
+pub async fn watch(hub: Arc<Hub>, source: Source, network: ChainProfile, every: Duration) {
     let mut failing = Failing::default();
-    let network = loop {
-        match source.network().await {
-            Ok(network) => break network,
+    let profile = loop {
+        match source.profile().await {
+            Ok(profile) => break profile,
             Err(e) => failing.failed(&source, &e),
         }
         tokio::time::sleep(every).await;
     };
-    let profile = match licash_chain_client::profile(network) {
-        Ok(profile) => profile,
-        Err(e) => {
-            tracing::error!(chain = %source, "{e:#}: not scanning");
+    if profile != network {
+        tracing::error!(chain = %source, %profile, %network, "the chain is not the hub's network: not scanning");
+        return;
+    }
+    if let Some(other) = hub.checkpoint().map(|c| c.profile()) {
+        if other != network {
+            tracing::error!(chain = %source, %network, checkpoints = %other, "the hub followed another network: not scanning");
             return;
         }
-    };
-    if hub.checkpoint().is_some_and(|c| c.profile() != profile) {
-        tracing::error!(chain = %source, %network, "the hub follows another network: not scanning");
-        return;
     }
     tracing::info!(chain = %source, %network, "following Bitcoin");
     let mut reached = false;

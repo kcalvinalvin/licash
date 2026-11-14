@@ -7,6 +7,7 @@ use anyhow::{bail, ensure, Context};
 use bitcoin::{
     block::Header,
     consensus::{deserialize, serialize},
+    hashes::Hash,
     Block, BlockHash, Network,
 };
 use licash::{chain::Checkpoint, spend::ChainProfile};
@@ -120,20 +121,12 @@ impl std::fmt::Debug for Source {
     }
 }
 
-/// The checkpoint profile of `network`'s chain, if Licash has one.
-pub fn profile(network: Network) -> anyhow::Result<ChainProfile> {
-    match network {
-        Network::Bitcoin => Ok(ChainProfile::Core30Mainnet),
-        Network::Regtest => Ok(ChainProfile::Core30DefaultRegtest),
-        other => bail!("no checkpoint profile for {other}"),
-    }
-}
-
-/// The network of a checkpoint `profile`.
+/// The network whose addresses a checkpoint `profile`'s chain uses.
 pub fn network(profile: ChainProfile) -> Network {
     match profile {
         ChainProfile::Core30Mainnet => Network::Bitcoin,
         ChainProfile::Core30DefaultRegtest => Network::Regtest,
+        ChainProfile::Core30Signet | ChainProfile::Mutinynet => Network::Signet,
     }
 }
 
@@ -248,11 +241,25 @@ impl Source {
         .with_context(|| format!("unknown genesis block {genesis}"))
     }
 
+    /// The checkpoint profile of the chain, from its genesis block and its
+    /// block 1, which tells the signets apart: refused for a chain Licash
+    /// has none for, such as testnet or a signet other than Mutinynet.
+    pub async fn profile(&self) -> anyhow::Result<ChainProfile> {
+        let genesis = self.hash(0).await?.to_byte_array();
+        let first = match self.tip().await?.height {
+            0 => None,
+            _ => Some(self.hash(1).await?.to_byte_array()),
+        };
+        ChainProfile::identify(&genesis, first.as_ref()).context(
+            "a chain Licash has no checkpoint profile for: bitcoin, regtest, signet or mutinynet",
+        )
+    }
+
     /// The checkpoint at `height` of the best chain: its header, the times
-    /// of the eleven blocks to it and, on mainnet, the time of the first
-    /// block of its retarget period.
+    /// of the eleven blocks to it and, where the difficulty retargets, the
+    /// time of the first block of its retarget period.
     pub async fn checkpoint(&self, height: u32) -> anyhow::Result<Checkpoint> {
-        let profile = profile(self.network().await?)?;
+        let profile = self.profile().await?;
         let mut headers: Vec<Header> = Vec::new();
         for h in height.saturating_sub(10)..=height {
             let header = self.header(&self.hash(h).await?).await?;
@@ -266,12 +273,12 @@ impl Source {
             headers.push(header);
         }
         let anchor = *headers.last().expect("at least the anchor");
-        let period_start = match profile {
-            ChainProfile::Core30Mainnet => {
-                let first = height - height % 2016;
+        let period_start = match profile.retarget_interval() {
+            Some(interval) => {
+                let first = height - height % interval;
                 Some(self.header(&self.hash(first).await?).await?.time)
             }
-            ChainProfile::Core30DefaultRegtest => None,
+            None => None,
         };
         let bytes = serialize(&anchor).try_into().expect("a header is 80 bytes");
         let times = headers.iter().map(|h| h.time).collect();

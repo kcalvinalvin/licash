@@ -510,3 +510,145 @@ fn activation_scripts_read_back_their_secret_and_nothing_else() {
     }
     assert_eq!(chain::activation_secret(&[]), None);
 }
+
+fn header_bytes(hex: &str) -> chain::HeaderBytes {
+    hex::decode(hex).unwrap().try_into().unwrap()
+}
+
+fn block_hash(hex: &str) -> [u8; 32] {
+    BlockHash::from_str(hex).unwrap().to_byte_array()
+}
+
+#[test]
+fn real_signet_headers_cross_a_retarget_boundary() {
+    // Retained signet headers 330,623 to 330,625 and their context.
+    let anchor = header_bytes("000000208a0ca8b84973fdee18044b1eb19d3cffa3c2232fe6a56dbdb6262dea01000000ca6b06c69db73f9a6a83dee3b7768537cf7c8fa26c28af7c5fc34fbcb8f10df598a1f66a85cd141d6fb2fe0b");
+    let next = header_bytes("00000020bb759f12532ea29baa8eec23730707c348213e28159fe699818995e913000000d6f994beca0cb6de986df17f9379400b05eefab88907c2d0b67fb43bc12fec93c9a1f66aeefc141dc8c94f01");
+    let after = header_bytes("00000020c7e10e6d41596d38c4af1f23a8ce2b0df64417a441c5bc29011178b10400000029b2d829883e9c476b4c2dd8ce455b2a8acf12926ba91919e68a3adfb37b29e92ea3f66aeefc141d78a5801c");
+    let times = vec![
+        1794544601, 1794544850, 1794545687, 1794545715, 1794545999, 1794546305, 1794546318,
+        1794546575, 1794546815, 1794547290, 1794548120,
+    ];
+    let cp = Checkpoint::new(
+        ChainProfile::Core30Signet,
+        330623,
+        anchor,
+        times.clone(),
+        Some(1793327751),
+    )
+    .unwrap();
+    let chain = Chain::verify(cp.clone(), &cp.commitment(), vec![next, after], 2).unwrap();
+    assert_eq!(chain.tip_height(), 330625);
+    assert_eq!(
+        chain.block_hash(330624).unwrap(),
+        block_hash("00000004b178110129bcc541a41744f60d2bcea8231fafc4386d59416d0ee1c7")
+    );
+    assert_eq!(
+        chain.block_hash(330625).unwrap(),
+        block_hash("0000001127599805aaf9e61b9deba04a4d5f8104680c48d112a2d34447e637b4")
+    );
+    // Mutinynet retargets elsewhere, so the same headers are not its own.
+    let mutinynet = Checkpoint::new(
+        ChainProfile::Mutinynet,
+        330623,
+        anchor,
+        times,
+        Some(1793327751),
+    )
+    .unwrap();
+    assert!(Chain::verify(mutinynet.clone(), &mutinynet.commitment(), vec![next], 1).is_err());
+    assert_ne!(mutinynet.commitment(), cp.commitment());
+}
+
+#[test]
+fn real_mutinynet_headers_retarget_only_every_40320_blocks() {
+    // Retained Mutinynet headers 3,586,463 and 3,586,464, at a multiple of
+    // 2016 but not of 40,320: its difficulty carries over.
+    let anchor = header_bytes("0000002039bbefa2c7484456a7eb4ddcbeb140cee69d7c5e7e887d78aab77b7189000000af6ff38b93b3d2d26dd5b4f40b20b033d3529267c1774c571d962ae15915750d8cd8f66aae77031efb092000");
+    let next = header_bytes("000000205e0759d3912f7df222e1d5a1047f58f3ab023e86858fc3bc0acc3a7973020000b8b6968870402d5442085f21fa9c9c05af6c079e28666959fac36778423980caaad8f66aae77031ef84abd01");
+    let times = vec![
+        1794561878, 1794561908, 1794561940, 1794561971, 1794562003, 1794562033, 1794562064,
+        1794562095, 1794562126, 1794562156, 1794562188,
+    ];
+    let cp = Checkpoint::new(
+        ChainProfile::Mutinynet,
+        3586463,
+        anchor,
+        times.clone(),
+        Some(1793372692),
+    )
+    .unwrap();
+    let chain = Chain::verify(cp.clone(), &cp.commitment(), vec![next], 1).unwrap();
+    assert_eq!(
+        chain.block_hash(3586464).unwrap(),
+        block_hash("000001792de8a87206454d4031e8596fda28e8ed12c891b20c95bdaec9baeb68")
+    );
+    let signet = Checkpoint::new(
+        ChainProfile::Core30Signet,
+        3586463,
+        anchor,
+        times,
+        Some(1793372692),
+    )
+    .unwrap();
+    assert!(Chain::verify(signet.clone(), &signet.commitment(), vec![next], 1).is_err());
+
+    // Headers 40,319 and 40,320: its first retarget, capped at the limit.
+    let anchor = header_bytes("000000206e0d32c507eaa50b61f5ed80824255b026adf4314eec10b26b12d6be0c0300000bb4526aef1c886d9678c52bbec3269d92fadf8d0437d2a5740bf972e636d5b09dac4d64ae77031e9b943e00");
+    let next = header_bytes("0000002079d3d0745188d8678cb18dd669b7faad7ff387545ed400faf5bcc81697000000a9b56049418f1a284c1679d4fc04fb24943df05a188e9d7d87d848a1bfa3d4e7c0ac4d64ae77031edf9c7700");
+    let times = vec![
+        1682811719, 1682811751, 1682811787, 1682811821, 1682811853, 1682811883, 1682811914,
+        1682811958, 1682811988, 1682812021, 1682812061,
+    ];
+    let cp = Checkpoint::new(
+        ChainProfile::Mutinynet,
+        40319,
+        anchor,
+        times,
+        Some(1598918400),
+    )
+    .unwrap();
+    let chain = Chain::verify(cp.clone(), &cp.commitment(), vec![next], 1).unwrap();
+    assert_eq!(
+        chain.block_hash(40320).unwrap(),
+        block_hash("000001ed64fe75ba2de977a1a47000777824a237bb807a1a252e66d3527de09a")
+    );
+}
+
+#[test]
+fn chains_are_told_apart_by_genesis_and_the_signets_by_block_1() {
+    let genesis = |network| {
+        bitcoin::blockdata::constants::genesis_block(network)
+            .block_hash()
+            .to_byte_array()
+    };
+    let signet_1 = block_hash("00000086d6b2636cb2a392d45edc4ec544a10024d30141c9adf4bfd9de533b53");
+    let mutinynet_1 =
+        block_hash("000002855893a0a9b24eaffc5efc770558a326fee4fc10c9da22fc19cd2954f9");
+    let signet = genesis(bitcoin::Network::Signet);
+    for (genesis, first, profile) in [
+        (
+            genesis(bitcoin::Network::Bitcoin),
+            None,
+            Some(ChainProfile::Core30Mainnet),
+        ),
+        (
+            genesis(bitcoin::Network::Regtest),
+            None,
+            Some(ChainProfile::Core30DefaultRegtest),
+        ),
+        (signet, Some(signet_1), Some(ChainProfile::Core30Signet)),
+        (signet, Some(mutinynet_1), Some(ChainProfile::Mutinynet)),
+        // Another signet, or one not yet past genesis.
+        (signet, Some([7; 32]), None),
+        (signet, None, None),
+        (genesis(bitcoin::Network::Testnet4), None, None),
+    ] {
+        assert_eq!(ChainProfile::identify(&genesis, first.as_ref()), profile);
+    }
+    for profile in ChainProfile::ALL {
+        assert_eq!(profile.name().parse::<ChainProfile>().unwrap(), profile);
+        assert_eq!(profile.is_test(), profile != ChainProfile::Core30Mainnet);
+    }
+    assert!("testnet".parse::<ChainProfile>().is_err());
+}

@@ -319,7 +319,8 @@ async fn checkpoints_follow_the_tip_within_the_header_budget() {
 async fn the_watch_follows_the_chain_in_rounds() {
     let s = Setup::new(timing(), 20).await;
     let every = Duration::from_millis(20);
-    let watching = tokio::spawn(watch(s.hub.clone(), s.source.clone(), every));
+    let network = ChainProfile::Core30DefaultRegtest;
+    let watching = tokio::spawn(watch(s.hub.clone(), s.source.clone(), network, every));
     let reached = || async {
         for _ in 0..250 {
             if s.hub.scanned().unwrap() == Some(s.tip()) {
@@ -333,4 +334,17 @@ async fn the_watch_follows_the_chain_in_rounds() {
     s.mine(2);
     reached().await;
     watching.abort();
+}
+
+#[tokio::test]
+async fn the_watch_scans_no_chain_of_another_network() {
+    let s = Setup::new(timing(), 20).await;
+    let every = Duration::from_millis(20);
+    for network in [ChainProfile::Core30Signet, ChainProfile::Mutinynet] {
+        let watching = watch(s.hub.clone(), s.source.clone(), network, every);
+        tokio::time::timeout(Duration::from_secs(10), watching)
+            .await
+            .expect("the watch stops at once");
+        assert_eq!(s.hub.scanned().unwrap(), None);
+    }
 }

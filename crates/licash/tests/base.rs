@@ -117,6 +117,30 @@ fn complete_checkpoint_codec_preserves_the_existing_commitment_preimage() {
 }
 
 #[test]
+fn the_signets_share_a_genesis_block_but_not_a_checkpoint() {
+    let signet = Checkpoint::genesis(ChainProfile::Core30Signet).unwrap();
+    let mutinynet = Checkpoint::genesis(ChainProfile::Mutinynet).unwrap();
+    assert_eq!(signet.header(), mutinynet.header());
+    assert_ne!(signet.commitment(), mutinynet.commitment());
+    let at = b"LICASH-CP\x02".len();
+    for (cp, tag) in [(&signet, 3), (&mutinynet, 4)] {
+        let bytes = cp.to_bytes();
+        assert_eq!(bytes[at], tag);
+        let restored = Checkpoint::from_bytes(&bytes).unwrap();
+        assert_eq!(restored.profile(), cp.profile());
+        assert_eq!(restored.commitment(), cp.commitment());
+        // A signet's genesis under mainnet's tag is refused.
+        let mut changed = bytes.clone();
+        changed[at] = 0;
+        assert!(Checkpoint::from_bytes(&changed).is_err());
+    }
+    // Both retarget, from the genesis block's time on.
+    let start = [&[1][..], &1_598_918_400u32.to_be_bytes()].concat();
+    assert!(signet.to_bytes().ends_with(&start));
+    assert!(mutinynet.to_bytes().ends_with(&start));
+}
+
+#[test]
 fn checkpoint_codec_has_no_missing_timestamp_or_retarget_context_fallback() {
     let bytes = Checkpoint::genesis(ChainProfile::Core30Mainnet)
         .unwrap()

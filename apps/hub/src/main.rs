@@ -11,6 +11,7 @@ use std::{
 
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use licash::spend::ChainProfile;
 use licash_chain_client::Source;
 use licash_hub::{Fee, Hub, Ledger, Policy, Timing};
 use licash_hub_service::{
@@ -91,6 +92,9 @@ struct Chain {
         hide_env_values = true
     )]
     url: Option<String>,
+    /// The network the chain must be: bitcoin, regtest, signet or mutinynet.
+    #[arg(long, env = "LICASH_HUB_NETWORK", default_value_t = ChainProfile::Core30Mainnet)]
+    network: ChainProfile,
     /// Seconds between rounds of the scan, below `--max-lag`.
     #[arg(long, env = "LICASH_HUB_CHAIN_POLL", default_value_t = 10,
           value_parser = clap::value_parser!(u64).range(1..))]
@@ -98,7 +102,7 @@ struct Chain {
 }
 
 impl Chain {
-    fn source(&self, policy: &Policy) -> anyhow::Result<Option<(Source, Duration)>> {
+    fn source(&self, policy: &Policy) -> anyhow::Result<Option<(Source, ChainProfile, Duration)>> {
         let Some(url) = &self.url else {
             return Ok(None);
         };
@@ -107,7 +111,8 @@ impl Chain {
             "--chain-poll must be below --max-lag"
         );
         let source = url.parse().context("--chain")?;
-        Ok(Some((source, Duration::from_secs(self.chain_poll))))
+        let every = Duration::from_secs(self.chain_poll);
+        Ok(Some((source, self.network, every)))
     }
 }
 
@@ -563,7 +568,7 @@ fn init(data: &Path, seed: &Path, db: &Path, max_pow: u32) -> anyhow::Result<()>
 
 /// What runs beside the API, if configured.
 struct Tasks {
-    chain: Option<(Source, Duration)>,
+    chain: Option<(Source, ChainProfile, Duration)>,
     notifier: Option<Notifier>,
     gateway: Option<Arc<Gateway>>,
     announcing: Option<Announcing>,
@@ -595,7 +600,8 @@ async fn serve(
         tracing::info!(targets = %targets.join(", "), "notifying");
         tokio::spawn(notifier.run(hub.clone()))
     });
-    let watching = chain.map(|(source, every)| tokio::spawn(watch(hub.clone(), source, every)));
+    let watching = chain
+        .map(|(source, network, every)| tokio::spawn(watch(hub.clone(), source, network, every)));
     if watching.is_none() {
         tracing::warn!("following no chain (--chain): locks are refused");
     }

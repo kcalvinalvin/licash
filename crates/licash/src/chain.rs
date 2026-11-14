@@ -32,10 +32,12 @@ pub fn sha256d(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(Sha256::digest(bytes)).into()
 }
 
+/// The network whose genesis block and retarget rules the profile shares.
 fn network(profile: ChainProfile) -> Network {
     match profile {
         ChainProfile::Core30Mainnet => Network::Bitcoin,
         ChainProfile::Core30DefaultRegtest => Network::Regtest,
+        ChainProfile::Core30Signet | ChainProfile::Mutinynet => Network::Signet,
     }
 }
 
@@ -44,14 +46,45 @@ fn pow_limit(profile: ChainProfile) -> Target {
     match profile {
         ChainProfile::Core30Mainnet => bytes[..4].fill(0),
         ChainProfile::Core30DefaultRegtest => bytes[0] = 0x7f,
+        ChainProfile::Core30Signet | ChainProfile::Mutinynet => {
+            bytes = [0; 32];
+            bytes[2..5].copy_from_slice(&[0x03, 0x77, 0xae]);
+        }
     }
     Target::from_be_bytes(bytes)
+}
+
+/// Block 1 of the default signet and of Mutinynet, which share its genesis.
+const SIGNET_FIRST: &str = "00000086d6b2636cb2a392d45edc4ec544a10024d30141c9adf4bfd9de533b53";
+const MUTINYNET_FIRST: &str = "000002855893a0a9b24eaffc5efc770558a326fee4fc10c9da22fc19cd2954f9";
+
+impl ChainProfile {
+    /// The profile of the chain whose genesis block hashes to `genesis` and
+    /// block 1 to `first`, hashes in their internal byte order. The signets
+    /// share a genesis block, so they need block 1 to tell apart.
+    pub fn identify(genesis: &[u8; 32], first: Option<&[u8; 32]>) -> Option<Self> {
+        let hash = |hex: &str| {
+            let hash: bitcoin::BlockHash = hex.parse().expect("a block hash");
+            hash.to_byte_array()
+        };
+        let found = Self::ALL
+            .into_iter()
+            .filter(|p| genesis_block(network(*p)).block_hash().to_byte_array() == *genesis);
+        let mut found = found.filter(|p| match p {
+            Self::Core30Signet => first == Some(&hash(SIGNET_FIRST)),
+            Self::Mutinynet => first == Some(&hash(MUTINYNET_FIRST)),
+            _ => true,
+        });
+        found.next()
+    }
 }
 
 fn version_floor(profile: ChainProfile, height: u32) -> i32 {
     let [bip34, bip66, bip65] = match profile {
         ChainProfile::Core30Mainnet => [227_931, 363_725, 388_381],
-        ChainProfile::Core30DefaultRegtest => [1, 1, 1],
+        ChainProfile::Core30DefaultRegtest
+        | ChainProfile::Core30Signet
+        | ChainProfile::Mutinynet => [1, 1, 1],
     };
     if height >= bip65 {
         4
@@ -95,18 +128,19 @@ fn expected_bits(
     let height = previous_height
         .checked_add(1)
         .ok_or_else(|| bad("header height overflow"))?;
-    if profile == ChainProfile::Core30DefaultRegtest {
+    let Some(interval) = profile.retarget_interval() else {
         return Ok(CompactTarget::from_consensus(0x207f_ffff));
-    }
-    if !height.is_multiple_of(2016) {
+    };
+    if !height.is_multiple_of(interval) {
         return Ok(previous.bits);
     }
     let first = period_start.ok_or_else(|| bad("missing retarget context"))?;
+    // Every retargeting profile aims for two weeks a period.
     let elapsed = (i64::from(previous.time) - i64::from(first)).clamp(302_400, 4_838_400) as u64;
     Ok(CompactTarget::from_next_work_required(
         previous.bits,
         elapsed,
-        Network::Bitcoin,
+        network(profile),
     ))
 }
 
@@ -151,15 +185,15 @@ impl Checkpoint {
         if height == 0 && h != genesis_block(network(profile)).header {
             return Err(bad("wrong checkpoint genesis"));
         }
-        match profile {
-            ChainProfile::Core30Mainnet => {
+        match profile.retarget_interval() {
+            Some(interval) => {
                 if period_start.is_none()
-                    || (height.is_multiple_of(2016) && period_start != Some(h.time))
+                    || (height.is_multiple_of(interval) && period_start != Some(h.time))
                 {
                     return Err(bad("checkpoint retarget context"));
                 }
             }
-            ChainProfile::Core30DefaultRegtest => {
+            None => {
                 if period_start.is_some() || h.bits.to_consensus() != 0x207f_ffff {
                     return Err(bad("checkpoint regtest context"));
                 }
@@ -181,7 +215,7 @@ impl Checkpoint {
             0,
             serialize(&h).try_into().expect("80-byte header"),
             vec![h.time],
-            (profile == ChainProfile::Core30Mainnet).then_some(h.time),
+            profile.retarget_interval().map(|_| h.time),
         )
     }
     pub fn profile(&self) -> ChainProfile {
@@ -233,11 +267,8 @@ impl Checkpoint {
         {
             return Err(bad("checkpoint framing"));
         }
-        let profile = match bytes[at] {
-            0 => ChainProfile::Core30Mainnet,
-            1 => ChainProfile::Core30DefaultRegtest,
-            _ => return Err(bad("unknown checkpoint profile")),
-        };
+        let profile =
+            ChainProfile::from_tag(bytes[at]).ok_or_else(|| bad("unknown checkpoint profile"))?;
         let height = u32::from_be_bytes(bytes[at + 1..at + 5].try_into().expect("fixed height"));
         let header = bytes[at + 5..at + 85].try_into().expect("fixed header");
         let count =
@@ -289,8 +320,10 @@ impl Checkpoint {
         {
             return Err(bad("header MTP or version"));
         }
-        if self.profile == ChainProfile::Core30Mainnet && height.is_multiple_of(2016) {
-            self.period_start = Some(h.time);
+        if let Some(interval) = self.profile.retarget_interval() {
+            if height.is_multiple_of(interval) {
+                self.period_start = Some(h.time);
+            }
         }
         self.times.push(h.time);
         if self.times.len() > 11 {
@@ -855,6 +888,39 @@ mod tests {
                 expected_bits(ChainProfile::Core30Mainnet, 32_254, &previous, None).unwrap(),
                 previous.bits
             );
+        }
+    }
+
+    #[test]
+    fn signet_retargets_match_core_at_each_signets_interval() {
+        // Bitcoin Core's CalculateNextWorkRequired, signet's limit and two
+        // weeks a period; the first is the real signet retarget at 330,624.
+        for (first, last, bits, expected) in [
+            (1793327751, 1794548120, 0x1d14cd85, 0x1d14fcee),
+            (0, 1_000_000, 0x1d14cd85, 0x1d1132b6),
+            (0, 10, 0x1d14cd85, 0x1d053361),
+            (0, 10, 0x1e0377ae, 0x1e00ddeb),
+            (0, 100_000_000, 0x1e0377ae, 0x1e0377ae),
+            (100, 2_500_000, 0x1d0fffff, 0x1d211143),
+        ] {
+            let mut previous = genesis_block(Network::Signet).header;
+            previous.time = last;
+            previous.bits = CompactTarget::from_consensus(bits);
+            for profile in [ChainProfile::Core30Signet, ChainProfile::Mutinynet] {
+                let interval = profile.retarget_interval().unwrap();
+                let retarget = expected_bits(profile, 7 * interval - 1, &previous, Some(first));
+                assert_eq!(retarget.unwrap().to_consensus(), expected);
+                let carried = expected_bits(profile, 7 * interval, &previous, None);
+                assert_eq!(carried.unwrap(), previous.bits);
+            }
+            // Mutinynet does not retarget at the default signet's interval.
+            let carried = expected_bits(ChainProfile::Mutinynet, 7 * 2016 - 1, &previous, None);
+            assert_eq!(carried.unwrap(), previous.bits);
+        }
+        for bits in [0x1e0377af, 0x1e037800, 0x1f00ffff] {
+            let bits = CompactTarget::from_consensus(bits);
+            assert!(strict_target(ChainProfile::Core30Signet, bits).is_err());
+            assert!(strict_target(ChainProfile::Mutinynet, bits).is_err());
         }
     }
 
