@@ -481,6 +481,29 @@ impl Scanner {
         }
     }
 
+    /// The output keys that a transaction of `tweak` would pay the receiver
+    /// first, unlabeled then at each label: what a light client looks for
+    /// in a block's compact filter (BIP158), as `OP_1 <key>` scripts, before
+    /// fetching the block. A transaction paying the receiver pays one of
+    /// them, whatever else it pays it.
+    pub fn candidates(&self, tweak: &PublicKey) -> Vec<XOnlyPublicKey> {
+        let ecdh = mul(tweak, &self.scan);
+        let Ok(t) = shared(&ecdh, 0) else {
+            return Vec::new();
+        };
+        let Ok(p) = self.spend.add_exp_tweak(secp(), &Scalar::from(t)) else {
+            return Vec::new();
+        };
+        let labeled = self
+            .labels
+            .values()
+            .filter_map(|(_, point)| p.combine(point).ok());
+        std::iter::once(p)
+            .chain(labeled)
+            .map(|point| point.x_only_public_key().0)
+            .collect()
+    }
+
     /// The outputs among `outputs`, a transaction's taproot output keys,
     /// that pay the receiver, given the transaction's [`tweak`].
     ///

@@ -354,3 +354,58 @@ fn a_wallet_finds_its_change_and_payments_to_its_labels() {
 fn secret(byte: u8) -> SecretKey {
     SecretKey::from_slice(&[byte; 32]).unwrap()
 }
+
+#[test]
+fn a_payment_pays_one_of_the_candidates_of_its_tweak() {
+    let secp = Secp256k1::new();
+    let receiver = Keys::new(secret(1), secret(4), NetworkKind::Test);
+    let other = Keys::from_seed(&[2; 32], NetworkKind::Test).unwrap();
+    let scanner = receiver.scanner([5]);
+    let input = secret(3);
+    let key = bitcoin::CompressedPublicKey(input.public_key(&secp));
+    let prevout = ScriptBuf::new_p2wpkh(&key.wpubkey_hash());
+    let outpoint = OutPoint {
+        txid: Txid::all_zeros(),
+        vout: 1,
+    };
+    for (recipients, paid) in [
+        (vec![receiver.address(), scanner.labeled(5)], true),
+        (vec![scanner.labeled(5), receiver.address()], true),
+        (vec![scanner.labeled(CHANGE)], true),
+        (vec![other.address()], false),
+    ] {
+        let outputs = silent::outputs(&[(input, false)], &[outpoint], &recipients).unwrap();
+        let mut witness = Witness::new();
+        witness.push([0x30; 71]);
+        witness.push(key.to_bytes());
+        let tx = Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: outpoint,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness,
+            }],
+            output: outputs
+                .iter()
+                .map(|k| TxOut {
+                    value: Amount::from_sat(1_000),
+                    script_pubkey: ScriptBuf::new_p2tr_tweaked(
+                        TweakedPublicKey::dangerous_assume_tweaked(*k),
+                    ),
+                })
+                .collect(),
+        };
+        let tweak = silent::tweak(&tx, &[&prevout]).unwrap();
+        let candidates = scanner.candidates(&tweak);
+        // Unlabeled, then CHANGE and 5.
+        assert_eq!(candidates.len(), 3);
+        // The first output to the receiver, whichever address it paid.
+        assert_eq!(candidates.contains(&outputs[0]), paid);
+        assert_eq!(
+            scanner.scan(&tweak, &outputs).len(),
+            recipients.len() * paid as usize
+        );
+    }
+}
