@@ -17,7 +17,10 @@
 //! hub is stored likewise ([`Hub::to_bytes`], [`Hub::load`],
 //! [`Hub::pending`]), its secret in its state; it keeps only its
 //! instances' commitments and hashlocks, and builds each kept one again
-//! to send it ([`Out::Serve`], [`Hub::instance`]).
+//! to send it ([`Out::Serve`], [`Hub::instance`]). Each says whether its
+//! driver may give the opening up ([`Holder::abandonable`],
+//! [`Hub::abandonable`]), and once F is signed whole each keeps its side
+//! of the contract ([`Opening`], [`HubOpening`]).
 
 use std::collections::HashMap;
 
@@ -1257,6 +1260,36 @@ fn offer(
     })?)
 }
 
+/// The holder's choice as its hub took it: the instances she keeps of
+/// each assertion (0-based), and the graph with their hashlocks and its
+/// pre-signed set.
+struct Choice {
+    kept: [Vec<usize>; STAGES],
+    babe: Babe,
+    set: Vec<Presign>,
+}
+
+/// A contract as its hub keeps it once opened: what it agreed with the
+/// holder, to answer her and dispute from.
+pub struct HubOpening {
+    pub base: Base,
+    pub prefix: FrozenPrefix,
+    pub d: FinalDigest,
+    pub babe: Babe,
+    pub set: Vec<Presign>,
+    pub publication: Publication,
+    /// The holder's keys, which the graph compiles with.
+    pub holder: wire::Keys,
+    /// The instances she keeps of each assertion, 0-based.
+    pub kept: [Vec<usize>; STAGES],
+    /// Her consent to D, her pre-signatures of each assertion's challenge
+    /// and her signatures of all the graph but those she withholds.
+    pub consent: wire::Consent,
+    /// Its signatures of all the graph.
+    pub sigs: HashMap<String, Vec<u8>>,
+    pub funding: Transaction,
+}
+
 /// The hub's side of an opening. Each field is a phase's ([`HubPhase`]):
 /// set by the step that reaches it, and by [`Hub::load`].
 pub struct Hub {
@@ -1271,7 +1304,7 @@ pub struct Hub {
     /// F frozen, the commitment to its instances, and each one's hashlock:
     /// the instances themselves are dropped, and built again to send.
     frozen: Option<(Frozen, wire::Commit, [Vec<Hash>; STAGES])>,
-    choice: Option<([Vec<usize>; STAGES], Vec<Presign>)>,
+    choice: Option<Choice>,
     /// The holder's consent, and its signatures that answered it.
     signed: Option<(wire::Consent, wire::Signed)>,
     funded: Option<Transaction>,
@@ -1468,30 +1501,30 @@ impl Hub {
     /// answer.
     fn choose(&mut self, body: &[u8]) -> Result<Vec<Out>> {
         let m = wire::Choose::decode(body)?;
-        if let Some((kept, _)) = &self.choice {
-            ensure!(*kept == m.kept, "a second choice");
+        if let Some(c) = &self.choice {
+            ensure!(c.kept == m.kept, "a second choice");
             return Ok(self.chosen());
         }
         self.frozen
             .as_ref()
             .context("a choice before the commitments")?;
-        let set = self.check_choose(&m.kept)?;
-        self.choice = Some((m.kept, set));
+        self.choice = Some(self.check_choose(m.kept)?);
         Ok(self.chosen())
     }
 
-    /// The graph's set with the instances `kept` the holder keeps.
-    fn check_choose(&self, kept: &[Vec<usize>; STAGES]) -> Result<Vec<Presign>> {
-        check_choice(kept)?;
+    /// The graph with the instances `kept` the holder keeps, and its set.
+    fn check_choose(&self, kept: [Vec<usize>; STAGES]) -> Result<Choice> {
+        check_choice(&kept)?;
         let (keys, _) = self.holder.as_ref().expect("Keys before F");
         let (frozen, _, hmsg) = self.frozen.as_ref().expect("F before a choice");
         let hmsg = std::array::from_fn(|s| kept[s].iter().map(|i| hmsg[s][*i]).collect());
-        Ok(finish(self.base(), keys, frozen, hmsg)?.1)
+        let (babe, set) = finish(self.base(), keys, frozen, hmsg)?;
+        Ok(Choice { kept, babe, set })
     }
 
     /// The opened instances, then each kept one to serve.
     fn chosen(&self) -> Vec<Out> {
-        let (kept, _) = self.choice.as_ref().expect("a choice");
+        let kept = &self.choice.as_ref().expect("a choice").kept;
         let dealt = self.dealt();
         let opened = wire::Opened {
             opened: std::array::from_fn(|s| {
@@ -1516,10 +1549,11 @@ impl Hub {
     /// assertion `stage` ([`Out::Serve`]): built again from the opening's
     /// secret, and refused unless as committed.
     pub fn instance(&self, stage: usize, index: usize, ctx: &Context) -> Result<Vec<u8>> {
-        let (kept, _) = self
+        let kept = &self
             .choice
             .as_ref()
-            .context("an instance before a choice")?;
+            .context("an instance before a choice")?
+            .kept;
         ensure!(
             kept.get(stage).is_some_and(|k| k.contains(&index)),
             "an instance she did not keep"
@@ -1549,7 +1583,7 @@ impl Hub {
     /// Its signatures answer.
     fn consent(&mut self, body: &[u8], ctx: &Context) -> Result<Vec<Out>> {
         ensure!(self.signed.is_none(), "Consent again");
-        let (_, set) = self.choice.as_ref().context("consent before a choice")?;
+        let set = &self.choice.as_ref().context("consent before a choice")?.set;
         let (frozen, _, _) = self.frozen.as_ref().expect("F before a choice");
         let m = wire::Consent::decode(body)?;
         self.check_consent(&m)?;
@@ -1575,7 +1609,7 @@ impl Hub {
     /// Her pre-signatures on its dealings and her signatures of all the
     /// graph but the withheld; not her consent, which its gate checks.
     fn check_consent(&self, m: &wire::Consent) -> Result<()> {
-        let (_, set) = self.choice.as_ref().context("consent before a choice")?;
+        let set = &self.choice.as_ref().context("consent before a choice")?.set;
         let (keys, _) = self.holder.as_ref().expect("Keys before F");
         let sighashes = [
             Babe::challenge_sighash(set)?,
@@ -1606,6 +1640,29 @@ impl Hub {
         let out = vec![Out::Broadcast(m.funding.clone())];
         self.funded = Some(m.funding);
         Ok(out)
+    }
+
+    /// The contract, once F signed whole is in.
+    pub fn opening(self) -> Result<HubOpening> {
+        let funding = self.funded.context("an opening not funded")?;
+        let (_, base) = self.base.expect("Open before F");
+        let (holder, _) = self.holder.expect("Keys before F");
+        let (frozen, _, _) = self.frozen.expect("F frozen before F");
+        let choice = self.choice.expect("a choice before F");
+        let (consent, signed) = self.signed.expect("its signatures before F");
+        Ok(HubOpening {
+            base,
+            prefix: frozen.prefix,
+            d: frozen.d,
+            babe: choice.babe,
+            set: choice.set,
+            publication: frozen.publication,
+            holder,
+            kept: choice.kept,
+            consent,
+            sigs: signed.sigs,
+            funding,
+        })
     }
 
     fn check_funded(&self, funding: &Transaction) -> Result<()> {

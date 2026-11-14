@@ -8,14 +8,16 @@ use bitcoincore_rpc::RpcApi;
 use k256::Scalar;
 use licash::base::{Base, Parts, Programs, ResponseKeys};
 use licash::note::IssuerKeys;
+use licash::statement::Journal;
 use licash_contract::keys::HubKeys;
 use licash_contract::opening::{
     self as machine, Context, HubPhase, Input, Out, Phase, Quote, Start, Trust,
 };
 use licash_contract::wire::{self, Envelope, Kind, Wanted};
+use licash_regtest::mock_statement;
 use licash_regtest::native::{checkpoint, open_native_with, play, quote, Authority, Holder};
 use licash_regtest::native_fixture::{point, SEED, SPEND};
-use lichen_babe::setup::Instance;
+use lichen_babe::setup::{instance, Instance};
 use lngap_btc::bitcoin::hashes::Hash as _;
 use lngap_btc::bitcoin::{Amount, OutPoint, ScriptBuf, Txid};
 use lngap_btc::regtest::Regtest;
@@ -765,5 +767,93 @@ fn a_hub_resumes_its_opening_as_it_stored_it() -> Result<()> {
         "an opening under mock proofs, not genuine",
     )?;
     refused(machine::Hub::load(keyed, &distrusted), offers)?;
+    for (phase, bytes) in &played.hubs {
+        let hub = machine::Hub::load(bytes, &ctx)?;
+        ensure!(
+            hub.abandonable() == (*phase < Signed),
+            "{phase:?} abandonable otherwise"
+        );
+    }
+    Ok(())
+}
+
+/// The holder resumes from each phase as she stored it: she may give the
+/// opening up until she has signed F; resumed before the hub's commitment
+/// she takes it as she did and chooses as she did, and resumed past it she
+/// refuses it again.
+#[test]
+fn a_holder_resumes_her_opening_as_she_stored_it() -> Result<()> {
+    let rt = Regtest::start_standard()?;
+    let played = play(
+        &rt,
+        "native-resumed",
+        (60, 6),
+        holder()?,
+        Authority::mock(),
+        &mut |_, m| vec![m],
+    )?;
+    let ctx = Context {
+        tip: rt.height()?,
+        trust: Authority::mock().trust(),
+    };
+    use Phase::*;
+    ensure!(
+        played
+            .holders
+            .keys()
+            .copied()
+            .eq([Started, Termed, Committed, Opened, Consented, Signing, Funded]),
+        "{:?}",
+        played.holders.keys()
+    );
+    let load =
+        |phase| machine::Holder::load(&played.holders[&phase], SEED, Scalar::from(SPEND), &ctx);
+    for phase in played.holders.keys() {
+        ensure!(
+            load(*phase)?.abandonable() == (*phase < Funded),
+            "{phase:?} abandonable otherwise"
+        );
+    }
+    let hub = machine::Hub::load(&played.hubs[&HubPhase::Committed], &ctx)?;
+    let out = hub.pending()?;
+    let [Out::Send(commit)] = &out[..] else {
+        bail!("{out:?}")
+    };
+    let mut termed = load(Termed)?;
+    let out = termed.step(Input::Message(commit.clone()), &ctx)?;
+    ensure!(
+        out == load(Committed)?.pending(&ctx)?,
+        "she chose otherwise once resumed"
+    );
+    ensure!(
+        termed.to_bytes() == played.holders[&Committed],
+        "she stored otherwise once resumed"
+    );
+    refused(
+        load(Committed)?.step(Input::Message(commit.clone()), &ctx),
+        "Commit again",
+    )?;
+    Ok(())
+}
+
+/// A stored hub serves the holder's instances only as it built them when
+/// it committed: instance 1 of a fixed secret's exit dealing, under a fixed
+/// journal's mock statement, has a known commitment and hashlock. A change
+/// to how instances are built (Lichen's garbling, the hub's derivation)
+/// strands every hub opening stored before it.
+#[test]
+fn a_hub_builds_its_instances_as_it_did() -> Result<()> {
+    let keys = HubKeys::from_secret(&[7; 32]);
+    let st = mock_statement(&Journal {
+        c: 0,
+        d: [1; 32],
+        keys: [2; 32],
+    });
+    let d = &keys.full;
+    let (x, _) = instance(&d.seeds[0], &d.dealer.shares(1), &st.vk, &st.public);
+    const COMMITMENT: &str = "664b2c572a9ab1e26e0a3852fb9213c68a1f76c17465bdd59d19e9c674a421dc";
+    const HMSG: &str = "dc49aebd8e8d22deb72489a29a4c0df5eae45037522045fa601739c5d3f453b8";
+    let known = (hex::encode(x.commitment()), hex::encode(x.hmsg));
+    ensure!(known == (COMMITMENT.into(), HMSG.into()), "{known:?}");
     Ok(())
 }

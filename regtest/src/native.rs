@@ -39,6 +39,7 @@ use lngap_btc::bitcoin::{
 };
 use lngap_btc::regtest::Regtest;
 use lngap_lamport::winternitz::{WotsParams, WotsSig};
+use lngap_sessions::skeleton::Presign;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -311,11 +312,12 @@ fn hub_secret(label: &str) -> [u8; 32] {
 }
 
 /// An opening as its machines played it: the holder's contract, her kept
-/// instances by commitment as her driver kept them, the hub's state as it
-/// stored it at each phase, and the messages refused on the way.
+/// instances by commitment as her driver kept them, each party's state as
+/// it stored it at each phase, and the messages refused on the way.
 pub struct Played {
     pub opening: machine::Opening,
     pub kept: HashMap<[u8; 32], Vec<u8>>,
+    pub holders: BTreeMap<machine::Phase, Vec<u8>>,
     pub hubs: BTreeMap<machine::HubPhase, Vec<u8>>,
     pub refused: Vec<Refusal>,
 }
@@ -364,6 +366,7 @@ pub fn play(
     let secrets = (holder.seed, holder.spend);
     let mut kept = HashMap::new();
     let out = stored(&mut alice, None, out, &ctx()?, secrets, &mut kept)?;
+    let mut holders = BTreeMap::from([(alice.phase(), alice.to_bytes())]);
     let mut hub = machine::Hub::with_secret(&hub_secret(label), hub_quote);
     let mut queue = VecDeque::new();
     let mut hubs = BTreeMap::new();
@@ -380,14 +383,11 @@ pub fn play(
             Side::Holder => {
                 let (before, phase) = (alice.to_bytes(), alice.phase());
                 match alice.step(input, &ctx) {
-                    Ok(out) => Ok(stored(
-                        &mut alice,
-                        Some(phase),
-                        out,
-                        &ctx,
-                        secrets,
-                        &mut kept,
-                    )?),
+                    Ok(out) => {
+                        let out = stored(&mut alice, Some(phase), out, &ctx, secrets, &mut kept)?;
+                        holders.insert(alice.phase(), alice.to_bytes());
+                        Ok(out)
+                    }
                     Err(e) => {
                         ensure!(alice.to_bytes() == before, "a refusal changed her: {e:#}");
                         Err(e)
@@ -423,12 +423,44 @@ pub fn play(
         }
     }
     ensure!(funded, "the opening stalled, refusing {refused:?}");
+    let opening = alice.opening()?;
+    agree(&opening, &hub.opening()?)?;
     Ok(Played {
-        opening: alice.opening()?,
+        opening,
         kept,
+        holders,
         hubs,
         refused,
     })
+}
+
+/// The hub's contract agrees with the holder's: one Base, D, F, set and
+/// choice, her pre-signatures and both parties' signatures.
+fn agree(o: &machine::Opening, h: &machine::HubOpening) -> Result<()> {
+    let txids = |set: &[Presign]| -> Vec<_> {
+        set.iter()
+            .map(|p| (p.name.clone(), p.tx.compute_txid()))
+            .collect()
+    };
+    let kept: Vec<Vec<usize>> = o
+        .instances
+        .iter()
+        .map(|k| k.iter().map(|k| k.index).collect())
+        .collect();
+    ensure!(o.base.digest() == h.base.digest(), "two Bases");
+    ensure!(o.d == h.d && o.funding == h.funding, "two Ds or Fs");
+    ensure!(txids(&o.set) == txids(&h.set), "two graphs");
+    ensure!(kept == h.kept, "two choices");
+    ensure!(
+        o.presigs == h.consent.presigs,
+        "two sets of her pre-signatures"
+    );
+    ensure!(
+        o.signed.alice == h.consent.sigs,
+        "two sets of her signatures"
+    );
+    ensure!(o.signed.hub == h.sigs, "two sets of the hub's signatures");
+    Ok(())
 }
 
 /// What the holder asked after a step from `phase` (none, her first), as

@@ -101,6 +101,14 @@ impl Holder {
         .unwrap_or(Phase::Started)
     }
 
+    /// Whether her driver may give the opening up and spend her deposit
+    /// otherwise: until she has signed F, which the hub may then complete
+    /// and broadcast. Her signed F is sent only once stored as
+    /// [`Phase::Funded`], so a state short of it never let it out.
+    pub fn abandonable(&self) -> bool {
+        self.phase() < Phase::Funded
+    }
+
     /// The instances she chose and has not had yet, by stage and index.
     pub fn missing(&self) -> Vec<(usize, usize)> {
         let Some((_, _, chosen)) = &self.commit else {
@@ -353,6 +361,14 @@ impl Hub {
         .find_map(|(reached, phase)| reached.then_some(phase))
     }
 
+    /// Whether its driver may give the opening up and forget it: until it
+    /// has signed the graph, with which the holder may complete F and the
+    /// contract stands. Its signatures are sent only once stored as
+    /// [`HubPhase::Signed`].
+    pub fn abandonable(&self) -> bool {
+        self.phase() < Some(HubPhase::Signed)
+    }
+
     /// What the step that reached its phase asked: to carry out again on
     /// resuming, as its driver may not have.
     pub fn pending(&self) -> Result<Vec<Out>> {
@@ -403,8 +419,13 @@ impl Hub {
                 hmsg.iter().for_each(|h| w.bytes(h));
             }
         }
-        if let Some((kept, _)) = &self.choice {
-            w.blob(&wire::Choose { kept: kept.clone() }.encode());
+        if let Some(c) = &self.choice {
+            w.blob(
+                &wire::Choose {
+                    kept: c.kept.clone(),
+                }
+                .encode(),
+            );
         }
         if let Some((consent, signed)) = &self.signed {
             w.blob(&consent.encode());
@@ -473,9 +494,7 @@ impl Hub {
             h.frozen = Some((frozen, c, hmsg));
         }
         if phase >= HubPhase::Chosen {
-            let kept = choice(r.blob()?)?;
-            let set = h.check_choose(&kept)?;
-            h.choice = Some((kept, set));
+            h.choice = Some(h.check_choose(choice(r.blob()?)?)?);
         }
         if phase >= HubPhase::Signed {
             let consent = wire::Consent::decode(r.blob()?)?;
@@ -485,7 +504,7 @@ impl Hub {
                 .verify_owner_consent(&frozen.prefix, &consent.consent)?;
             let signed = wire::Signed::decode(r.blob()?)?;
             ensure!(signed.funding == frozen.funding, "F not as frozen");
-            let (_, set) = h.choice.as_ref().expect("a choice before a consent");
+            let set = &h.choice.as_ref().expect("a choice before a consent").set;
             check_sigs(set, &h.keys.party.public().payment, &signed.sigs, |_| false)?;
             h.signed = Some((consent, signed));
         }
