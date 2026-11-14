@@ -49,6 +49,10 @@ pub struct Lock {
     /// Why its hub failed or refused to pay the invoice: the lock is
     /// refunded.
     pub failure: Option<String>,
+    /// What it cost this wallet once settled: the notes it spent less those
+    /// its branch returned, what it paid included; for a refund, the hub's
+    /// refund fee.
+    pub cost: Option<u64>,
     pub created_at: i64,
 }
 
@@ -560,7 +564,9 @@ impl<T: Transport> Wallet<T> {
 
 const LOCKS: &str = "SELECT l.id, r.url, l.payee, l.hash, l.amount, l.fee, l.expiry,
     l.certificate IS NOT NULL, l.settled, l.preimage, l.done_at IS NOT NULL, l.abandoned,
-    l.created_at, l.invoice, l.failure
+    l.created_at, l.invoice, l.failure,
+    (SELECT SUM(n.denom) FROM notes n WHERE n.spent_by = l.id),
+    (SELECT COALESCE(SUM(n.denom), 0) FROM notes n WHERE n.proposal = l.id)
     FROM locks l JOIN reach r ON r.hub = l.hub";
 
 fn lock_of(r: &Row<'_>) -> rusqlite::Result<Result<Lock, Error>> {
@@ -579,6 +585,11 @@ fn lock_of(r: &Row<'_>) -> rusqlite::Result<Result<Lock, Error>> {
         _ if certified => LockState::Locked,
         _ => LockState::Requested,
     };
+    let (spent, kept): (Option<i64>, i64) = (r.get(15)?, r.get(16)?);
+    let cost = match state {
+        LockState::Paid(_) | LockState::Refunded => spent.map(|s| s.saturating_sub(kept) as u64),
+        _ => None,
+    };
     let Ok(payee) = Address::from_bytes(&payee) else {
         return Ok(Err(Error::Invalid("a lock to no address".into())));
     };
@@ -593,6 +604,7 @@ fn lock_of(r: &Row<'_>) -> rusqlite::Result<Result<Lock, Error>> {
         state,
         invoice: r.get(13)?,
         failure: r.get(14)?,
+        cost,
         created_at: r.get(12)?,
     }))
 }

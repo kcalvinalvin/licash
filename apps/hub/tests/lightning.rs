@@ -361,6 +361,9 @@ async fn an_invoice_is_read_and_what_paying_it_costs_said_before_paying() {
     .unwrap();
     let refused = signet.read_invoice(&request).unwrap_err().to_string();
     assert!(refused.contains("another network"), "{refused}");
+    // Read as it is, as for the history, by any wallet.
+    let read = licash_wallet::Payable::read(&format!("lightning:{request}")).unwrap();
+    assert_eq!(read, wallet.read_invoice(&request).unwrap());
 
     // The gateway's 2 on the 21 asked, and 1 to the hub: the lock of 23
     // needs exact notes, made by a payment to itself.
@@ -371,6 +374,8 @@ async fn an_invoice_is_read_and_what_paying_it_costs_said_before_paying() {
     let lock = wallet.follow_lock(&lock.id).await.unwrap();
     assert_eq!(lock.state, LockState::Paid(preimage));
     assert_eq!(available(&wallet), 40 - 23 - 1);
+    // The lock's own cost: the notes made for it exactly.
+    assert_eq!(lock.cost, Some(23));
     // Exact notes held, 8: the gateway's fee alone.
     let exact = net.node.invoice(6_000, [4; 32], 18, Outcome::Hang);
     assert_eq!(wallet.invoice_fee(HUB, &exact).unwrap(), 2);
@@ -382,6 +387,10 @@ async fn an_invoice_is_read_and_what_paying_it_costs_said_before_paying() {
     ));
     let most = net.node.invoice(101_000, [8; 32], 18, Outcome::Hang);
     assert!(wallet.invoice_fee(HUB, &most).is_err());
+    // A final delta longer than the hub's locks leave its gateway.
+    let long = net.node.invoice(6_000, [3; 32], 40, Outcome::Hang);
+    let refused = wallet.invoice_fee(HUB, &long).unwrap_err().to_string();
+    assert!(refused.contains("final delta"), "{refused}");
 }
 
 #[tokio::test]

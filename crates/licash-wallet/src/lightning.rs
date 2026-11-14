@@ -76,6 +76,42 @@ fn decode(request: &str) -> Result<Bolt11Invoice, Error> {
         .map_err(|e| Error::Invalid(format!("not a Lightning invoice: {e}")))
 }
 
+impl Payable {
+    /// The invoice `text` carries, as [`Wallet::read_invoice`] reads it,
+    /// whoever can pay it: of any network, expired or not, if it asks an
+    /// amount.
+    pub fn read(text: &str) -> Result<Self, Error> {
+        let invoice = read(text)?;
+        let msat = invoice
+            .amount_milli_satoshis()
+            .ok_or_else(|| Error::Invalid("an invoice without an amount".into()))?;
+        Ok(Self::of(&invoice, msat))
+    }
+
+    fn of(invoice: &Bolt11Invoice, msat: u64) -> Self {
+        let description = match invoice.description() {
+            lightning_invoice::Bolt11InvoiceDescriptionRef::Direct(d) => Some(d.to_string()),
+            lightning_invoice::Bolt11InvoiceDescriptionRef::Hash(_) => None,
+        };
+        let expires_at = invoice.expires_at().map_or(i64::MAX, |at| {
+            i64::try_from(at.as_secs()).unwrap_or(i64::MAX)
+        });
+        Self {
+            request: invoice.to_string(),
+            amount: msat.div_ceil(1000),
+            description: description.filter(|d| !d.is_empty()),
+            expires_at,
+        }
+    }
+}
+
+/// The invoice `text` carries, decoded.
+fn read(text: &str) -> Result<Bolt11Invoice, Error> {
+    invoice_in(text)
+        .ok_or_else(|| Error::Invalid("no Lightning invoice".into()))
+        .and_then(decode)
+}
+
 /// The invoice `text` carries: bare, as a `lightning:` URI, or as the
 /// `lightning` parameter of a `bitcoin:` URI.
 fn invoice_in(text: &str) -> Option<&str> {
@@ -102,23 +138,9 @@ impl<T: Transport> Wallet<T> {
     /// with an amount, not expired. `text` is the invoice, bare or as a
     /// `lightning:` URI, or a `bitcoin:` URI naming one.
     pub fn read_invoice(&self, text: &str) -> Result<Payable, Error> {
-        let invoice = invoice_in(text)
-            .ok_or_else(|| Error::Invalid("no Lightning invoice".into()))
-            .and_then(decode)?;
+        let invoice = read(text)?;
         let msat = self.payable(&invoice)?;
-        let description = match invoice.description() {
-            lightning_invoice::Bolt11InvoiceDescriptionRef::Direct(d) => Some(d.to_string()),
-            lightning_invoice::Bolt11InvoiceDescriptionRef::Hash(_) => None,
-        };
-        let expires_at = invoice.expires_at().map_or(i64::MAX, |at| {
-            i64::try_from(at.as_secs()).unwrap_or(i64::MAX)
-        });
-        Ok(Payable {
-            request: invoice.to_string(),
-            amount: msat.div_ceil(1000),
-            description: description.filter(|d| !d.is_empty()),
-            expires_at,
-        })
+        Ok(Payable::of(&invoice, msat))
     }
 
     /// What `invoice` asks, in msat, if this wallet can pay it.
@@ -150,6 +172,7 @@ impl<T: Transport> Wallet<T> {
         let msat = self.payable(&invoice)?;
         let (hub, info) = self.hub(&url)?;
         let lightning = gateway(&url, &info, msat)?;
+        lock_expiry(&url, &info, lightning, &invoice)?;
         let lock = lightning.pay_lock(msat);
         let exact = match self.exact(hub, lock)? {
             Some(_) => 0,
@@ -157,6 +180,34 @@ impl<T: Transport> Wallet<T> {
         };
         Ok(lock - msat.div_ceil(1000) + exact)
     }
+}
+
+/// The expiry of a lock paying `invoice` through the hub at `url` saying
+/// `info`, the latest it admits: if that leaves its gateway room for the
+/// invoice's final delta.
+fn lock_expiry(
+    url: &str,
+    info: &licash_api::Info,
+    lightning: &Lightning,
+    invoice: &Bolt11Invoice,
+) -> Result<u32, Error> {
+    let locks = info
+        .locks
+        .as_ref()
+        .ok_or_else(|| Error::Invalid(format!("hub {url} follows no chain: it takes no locks")))?;
+    let expiry = locks
+        .latest_expiry(locks.min_depth.max(1))
+        .map_err(|p| unavailable(url, p))?;
+    let room = expiry
+        .saturating_sub(locks.height)
+        .saturating_sub(lightning.pay_slack);
+    let delta = invoice.min_final_cltv_expiry_delta();
+    if u64::from(room) < delta.saturating_add(CLTV_MARGIN) {
+        return Err(Error::Invalid(format!(
+            "the invoice's final delta of {delta} blocks outlasts the locks of hub {url}"
+        )));
+    }
+    Ok(expiry)
 }
 
 /// The Lightning gateway of the hub at `url` saying `info`, if it pays
@@ -196,21 +247,7 @@ impl<T: Transport> Wallet<T> {
         let msat = self.payable(&invoice)?;
         let (_, info) = self.refresh(&url).await?;
         let lightning = gateway(&url, &info, msat)?;
-        let locks = info.locks.as_ref().ok_or_else(|| {
-            Error::Invalid(format!("hub {url} follows no chain: it takes no locks"))
-        })?;
-        let expiry = locks
-            .latest_expiry(locks.min_depth.max(1))
-            .map_err(|p| unavailable(&url, p))?;
-        let room = expiry
-            .saturating_sub(locks.height)
-            .saturating_sub(lightning.pay_slack);
-        let delta = invoice.min_final_cltv_expiry_delta();
-        if u64::from(room) < delta.saturating_add(CLTV_MARGIN) {
-            return Err(Error::Invalid(format!(
-                "the invoice's final delta of {delta} blocks outlasts the locks of hub {url}"
-            )));
-        }
+        let expiry = lock_expiry(&url, &info, lightning, &invoice)?;
         let hash: [u8; 32] = *invoice.payment_hash().as_ref();
         let amount = lightning.pay_lock(msat);
         let request = invoice.to_string();
