@@ -55,6 +55,7 @@ pub use locks::{Lock, Settled, Timing};
 /// denominations as SQLite integers.
 pub const MAX_POW: u32 = 62;
 
+/// Why the hub did not serve a request, or could not.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
@@ -88,6 +89,7 @@ impl From<rusqlite::Error> for Error {
     }
 }
 
+/// Why the hub will not serve a valid request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum Refusal {
@@ -187,6 +189,7 @@ pub struct Policy {
     pub timing: Timing,
 }
 
+/// What the hub publishes of itself.
 #[derive(Clone, Debug)]
 pub struct Info {
     pub keysets: Vec<Keyset>,
@@ -249,6 +252,7 @@ pub enum Notice {
 }
 
 impl Notice {
+    /// Its kind, as its [`Event`] names it.
     pub fn kind(&self) -> &'static str {
         match self {
             Self::Started { .. } => "started",
@@ -306,12 +310,14 @@ pub struct Ledger {
 }
 
 impl Ledger {
+    /// The hub's database at `db`, read-only.
     pub fn open(db: &Path) -> Result<Self, Error> {
         Ok(Self {
             conn: store::inspect(db)?,
         })
     }
 
+    /// The events after `after`, oldest first, at most `limit`.
     pub fn events(&self, after: u64, limit: u32) -> Result<Vec<Event>, Error> {
         events(&self.conn, after, limit)
     }
@@ -323,6 +329,7 @@ impl Ledger {
             .query_row(LAST_EVENT, [], |r| r.get::<_, i64>(0))? as u64)
     }
 
+    /// Counts over the ledger.
     pub fn stats(&self) -> Result<Stats, Error> {
         let count = |sql: &str| -> Result<u64, Error> {
             Ok(self.conn.query_row(sql, [], |r| r.get::<_, i64>(0))? as u64)
@@ -366,6 +373,8 @@ fn events(conn: &Connection, after: u64, limit: u32) -> Result<Vec<Event>, Error
     .collect()
 }
 
+/// A hub at work: its keys, derived from its seed, over its database,
+/// which it holds for itself while open.
 pub struct Hub {
     store: Store,
     keysets: BTreeMap<[u8; 32], (IssuerKeys, Keyset)>,
@@ -478,6 +487,7 @@ impl Hub {
         self.nostr.0
     }
 
+    /// What the hub publishes of itself.
     pub fn info(&self) -> Info {
         Info {
             keysets: self.keysets.values().map(|(_, k)| k.clone()).collect(),

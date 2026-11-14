@@ -70,14 +70,17 @@ pub trait Transport: Send + Sync {
     ) -> impl Future<Output = Result<Response, String>> + Send;
 }
 
+/// Why a wallet call failed.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
     /// The wallet file is missing, exists already or does not match.
     #[error("{0}")]
     Setup(String),
+    /// The wallet file could not be read or written.
     #[error("wallet database: {0}")]
     Storage(#[from] rusqlite::Error),
+    /// Data failed the protocol's checks.
     #[error("protocol: {0}")]
     Protocol(#[from] licash::Error),
     /// No answer, or none that makes sense: retry later.
@@ -139,6 +142,7 @@ pub struct Sent {
     pub created_at: i64,
 }
 
+/// Where a payment stands.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum State {
@@ -146,6 +150,7 @@ pub enum State {
     Offered,
     /// Signed, waiting for its hub's release.
     Signed,
+    /// Released by its hub: paid.
     Done,
     /// Given up, its notes freed, and why.
     Abandoned(String),
@@ -221,6 +226,9 @@ impl Step {
     }
 }
 
+/// An owner's wallet: its keys, derived from its seed, and its notes and
+/// payments, in one SQLite file. It reaches hubs and swap providers
+/// through `T`, the application's [`Transport`].
 pub struct Wallet<T> {
     store: Store,
     owner: OwnerKeys,
@@ -314,6 +322,7 @@ impl<T: Transport> Wallet<T> {
         })
     }
 
+    /// What the wallet holds at each hub it added, by URL.
     pub fn balance(&self) -> Result<Vec<Balance>, Error> {
         self.store.read(|c| {
             let mut stmt = c.prepare(

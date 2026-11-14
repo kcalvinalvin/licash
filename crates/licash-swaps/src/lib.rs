@@ -40,6 +40,7 @@ use store::{now, Store};
 /// client to claim it, and for the provider to follow it.
 pub const MIN_ROOM: u32 = 6;
 
+/// Why a provider call failed.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
@@ -191,6 +192,7 @@ pub enum Notice {
 }
 
 impl Notice {
+    /// Its kind, as its [`Event`] names it.
     pub fn kind(&self) -> &'static str {
         match self {
             Self::Accepted { .. } => "accepted",
@@ -357,6 +359,8 @@ fn refused(e: licash_wallet::Error) -> Problem {
     }
 }
 
+/// A swap provider: its wallet, which holds its notes at each hub, its
+/// swaps file and its [`Config`].
 pub struct Provider<T: Transport> {
     wallet: Wallet<T>,
     store: Store,
@@ -395,10 +399,12 @@ impl<T: Transport> Provider<T> {
         }
     }
 
+    /// Its wallet, which holds its notes at each hub.
     pub fn wallet(&self) -> &Wallet<T> {
         &self.wallet
     }
 
+    /// What it charges and swaps.
     pub fn config(&self) -> &Config {
         &self.config
     }
@@ -931,6 +937,7 @@ impl<T: Transport> Provider<T> {
         })
     }
 
+    /// Counts over its swaps, and the fees earned.
     pub fn stats(&self) -> Result<Stats, Error> {
         self.store.read(|c| {
             let mut stats = Stats {

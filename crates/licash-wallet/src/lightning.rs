@@ -41,6 +41,7 @@ pub struct Invoice {
     pub created_at: i64,
 }
 
+/// Where an invoice the wallet is paid with stands.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum InvoiceState {
