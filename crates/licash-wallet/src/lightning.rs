@@ -41,6 +41,11 @@ pub struct Invoice {
     pub request: Option<String>,
     pub state: InvoiceState,
     pub created_at: i64,
+    /// The lock of the hub's notes paying it, in hex, once it was paid:
+    /// the notes are received under it.
+    pub lock: Option<String>,
+    /// When its notes were taken, if they were.
+    pub received_at: Option<i64>,
 }
 
 /// Where an invoice the wallet is paid with stands.
@@ -505,7 +510,7 @@ impl<T: Transport> Wallet<T> {
 }
 
 const INVOICES: &str = "SELECT i.hash, r.url, i.amount, i.request, i.done_at IS NOT NULL,
-    i.canceled, i.created_at
+    i.canceled, i.created_at, i.lock, i.done_at
     FROM invoices i JOIN reach r ON r.hub = i.hub";
 
 fn invoice_of(r: &Row<'_>) -> rusqlite::Result<Invoice> {
@@ -521,5 +526,7 @@ fn invoice_of(r: &Row<'_>) -> rusqlite::Result<Invoice> {
         request: r.get(3)?,
         state,
         created_at: r.get(6)?,
+        lock: r.get::<_, Option<[u8; 32]>>(7)?.map(hex::encode),
+        received_at: r.get(8)?,
     })
 }
