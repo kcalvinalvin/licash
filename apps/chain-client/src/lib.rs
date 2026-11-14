@@ -407,9 +407,12 @@ impl Source {
             }
             Kind::Esplora { base } => {
                 let url = format!("{base}/tx");
+                // mempool's backend reads the body only as text/plain:
+                // otherwise Core gets nothing and answers code -1.
                 let response = self
                     .client
                     .post(&url)
+                    .header(reqwest::header::CONTENT_TYPE, "text/plain")
                     .body(hex)
                     .send()
                     .await

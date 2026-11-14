@@ -5,7 +5,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use axum::{
     extract::{Path, State},
-    http::{HeaderMap, StatusCode},
+    http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -260,8 +260,23 @@ fn send(chain: &Chain, raw: &str) -> Result<String, (i64, &'static str)> {
     Ok(txid.to_string())
 }
 
-async fn esplora_send(State(chain): State<Arc<Chain>>, raw: String) -> Response {
-    match send(&chain, &raw) {
+async fn esplora_send(
+    State(chain): State<Arc<Chain>>,
+    headers: HeaderMap,
+    raw: String,
+) -> Response {
+    // As mempool's backend: a body not sent as text/plain goes unread,
+    // and Core is handed nothing.
+    let plain = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.starts_with("text/plain"));
+    let sent = if plain {
+        send(&chain, &raw)
+    } else {
+        Err((-1, ""))
+    };
+    match sent {
         Ok(txid) => txid.into_response(),
         Err((code, message)) => {
             let text = format!(
