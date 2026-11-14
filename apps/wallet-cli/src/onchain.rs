@@ -1,0 +1,315 @@
+//! `licash-wallet onchain`: the coins paid on Bitcoin to the wallet's
+//! silent payment and fallback addresses, found with a hub's tweaks in the
+//! blocks of a chain source, spent, or moved to notes.
+
+use anyhow::{bail, Context};
+use bitcoin::{BlockHash, FeeRate};
+use clap::Subcommand;
+use licash_chain_client::Source;
+use licash_transport::Http;
+use licash_wallet::{Error, Payee, PaymentCode, SilentCoin, Wallet};
+use serde_json::json;
+
+use crate::{deposit_json, show};
+
+/// Blocks a scan looks in at a time, each batch recorded whole.
+const BATCH: u32 = 144;
+
+#[derive(Subcommand)]
+pub enum Onchain {
+    /// Look in the blocks since the last scan for payments and spends of
+    /// the coins, then broadcast again the wallet's spends in no block yet.
+    Scan {
+        /// The block to look from: at the first scan, or an earlier one to
+        /// look again [default: the first a hub trusted serves tweaks of].
+        #[arg(long)]
+        from: Option<u32>,
+    },
+    /// The coins found, not spent in a block yet.
+    Coins,
+    /// Pay AMOUNT to TO, a Bitcoin address, a silent payment address or a
+    /// payment code naming either, the fee on top: its transaction id.
+    Send {
+        to: String,
+        /// In satoshis [default: what the code asks for].
+        amount: Option<u64>,
+        /// Everything, the fee taken from it.
+        #[arg(long, conflicts_with = "amount")]
+        all: bool,
+        /// In sat/vB [default: the chain's estimate within 6 blocks, at
+        /// least 1].
+        #[arg(long)]
+        fee_rate: Option<u64>,
+    },
+    /// Move the coins to notes at a hub taking deposits, up to the most it
+    /// takes: the deposit, which `resume` takes the notes of once its
+    /// payment confirmed.
+    Move {
+        /// At this hub [default: the first trusted taking deposits].
+        #[arg(long)]
+        hub: Option<String>,
+        /// In sat/vB [default: the chain's estimate within 6 blocks, at
+        /// least 1].
+        #[arg(long)]
+        fee_rate: Option<u64>,
+    },
+}
+
+/// A chain source as the wallet reads Bitcoin through it.
+struct Blocks(Source);
+
+fn text(e: anyhow::Error) -> String {
+    format!("{e:#}")
+}
+
+impl licash_wallet::Blocks for Blocks {
+    async fn height(&self) -> Result<u32, String> {
+        Ok(self.0.tip().await.map_err(text)?.height)
+    }
+
+    async fn hash(&self, height: u32) -> Result<BlockHash, String> {
+        self.0.hash(height).await.map_err(text)
+    }
+
+    async fn filter(&self, hash: &BlockHash) -> Result<Option<Vec<u8>>, String> {
+        self.0.filter(hash).await.map_err(text)
+    }
+
+    async fn block(&self, hash: &BlockHash) -> Result<bitcoin::Block, String> {
+        self.0.block(hash).await.map_err(text)
+    }
+}
+
+pub async fn run(
+    wallet: &Wallet<Http>,
+    chain: Option<String>,
+    command: Onchain,
+    json: bool,
+) -> anyhow::Result<()> {
+    let source = || -> anyhow::Result<Source> {
+        let chain = chain.as_deref().context(
+            "--chain: Bitcoin Core as http://user:password@127.0.0.1:8332, \
+             or Esplora as esplora+https://esplora.example/api",
+        )?;
+        chain.parse().context("--chain")
+    };
+    match command {
+        Onchain::Scan { from } => scan(wallet, &source()?, from, json).await,
+        Onchain::Coins => {
+            let coins = wallet.silent_coins()?;
+            let total: u64 = coins.iter().map(|c| c.value).sum();
+            let mut lines: Vec<String> = coins.iter().map(coin_line).collect();
+            lines.push(format!("total  {total}"));
+            show(
+                json,
+                coins.iter().map(coin_json).collect(),
+                lines.join("\n"),
+            );
+            Ok(())
+        }
+        Onchain::Send {
+            to,
+            amount,
+            all,
+            fee_rate,
+        } => {
+            let source = source()?;
+            let code: PaymentCode = to.parse().context("TO")?;
+            let payee = payee(wallet, &code)?;
+            let amount = match (amount, code.amount, all) {
+                (_, _, true) => None,
+                (Some(given), Some(asked), _) if given != asked => {
+                    bail!("the code asks for {asked}, not {given}")
+                }
+                (Some(amount), _, _) | (None, Some(amount), _) => Some(amount),
+                (None, None, false) => bail!("the code does not say how much: an AMOUNT or --all"),
+            };
+            let rate = rate(&source, fee_rate).await?;
+            let tx = wallet.spend_silent(payee, amount, rate)?;
+            let txid = broadcast(wallet, &source, &tx).await?;
+            let paid = tx.output.iter().map(|o| o.value.to_sat()).sum::<u64>();
+            show(
+                json,
+                json!({ "txid": txid.to_string(), "outputs": paid, "vsize": tx.vsize() }),
+                txid.to_string(),
+            );
+            Ok(())
+        }
+        Onchain::Move { hub, fee_rate } => {
+            let source = source()?;
+            let hub = match hub {
+                Some(hub) => hub,
+                None => {
+                    let hubs = wallet.hubs()?.into_iter();
+                    let mut taking = hubs.filter(|(_, info)| info.deposits.is_some());
+                    match taking.next() {
+                        Some((url, _)) => url,
+                        None => bail!("no hub trusted takes deposits"),
+                    }
+                }
+            };
+            let rate = rate(&source, fee_rate).await?;
+            let (deposit, tx) = wallet.deposit_silent(&hub, rate).await?;
+            let txid = broadcast(wallet, &source, &tx).await?;
+            eprintln!(
+                "deposit {}: {} sat in notes once {txid} confirms; `licash-wallet resume` takes them",
+                deposit.hash, deposit.amount
+            );
+            let mut shown = deposit_json(&deposit);
+            shown["txid"] = json!(txid.to_string());
+            show(json, shown, deposit.hash.clone());
+            Ok(())
+        }
+    }
+}
+
+/// Scan from the next block to the chain's height, with the tweaks of the
+/// hubs trusted serving them, the next after one that is unavailable; then
+/// broadcast again the spends in no block yet.
+async fn scan(
+    wallet: &Wallet<Http>,
+    source: &Source,
+    from: Option<u32>,
+    json: bool,
+) -> anyhow::Result<()> {
+    let trusted = wallet.hubs()?.into_iter();
+    let mut hubs: Vec<(String, u32)> = trusted.filter_map(|(u, i)| Some((u, i.tweaks?))).collect();
+    hubs.sort_by_key(|(_, first)| *first);
+    let Some((earliest, first)) = hubs.first().cloned() else {
+        bail!("no hub trusted serves silent payment tweaks");
+    };
+    match (from, wallet.silent_next()?) {
+        (Some(from), _) => wallet.watch_silent(&earliest, from)?,
+        (None, None) => wallet.watch_silent(&earliest, first)?,
+        (None, Some(_)) => {}
+    }
+    let chain = Blocks(source.clone());
+    let (mut found, mut spent, mut fetched) = (Vec::new(), Vec::new(), 0);
+    let scanned = loop {
+        let next = wallet.silent_next()?.expect("watching");
+        let scanned = batch(wallet, &hubs, &chain, next).await?;
+        tracing::info!(next = scanned.next, height = scanned.height, "scanned");
+        found.extend(scanned.found.iter().cloned());
+        spent.extend(scanned.spent.iter().copied());
+        fetched += scanned.fetched;
+        // Caught up, or at the newest block the hubs indexed.
+        if scanned.next > scanned.height || scanned.next == next {
+            break scanned;
+        }
+    };
+    for tx in wallet.silent_spends()? {
+        if let Err(e) = source.broadcast(&tx).await {
+            tracing::warn!(txid = %tx.compute_txid(), "broadcasting again: {e:#}");
+        }
+    }
+    let value: u64 = found.iter().map(|c| c.value).sum();
+    let behind = match scanned.next > scanned.height {
+        true => String::new(),
+        false => format!(
+            " (the hub's tweaks stop there, the chain is at {})",
+            scanned.height
+        ),
+    };
+    show(
+        json,
+        json!({
+            "next": scanned.next, "height": scanned.height, "fetched": fetched,
+            "found": found.iter().map(coin_json).collect::<Vec<_>>(),
+            "spent": spent.iter().map(|o| o.to_string()).collect::<Vec<_>>(),
+        }),
+        format!(
+            "found {} {} of {value} sat, {} spent; looked up to block {}{behind}",
+            found.len(),
+            if found.len() == 1 { "coin" } else { "coins" },
+            spent.len(),
+            scanned.next.saturating_sub(1)
+        ),
+    );
+    Ok(())
+}
+
+/// A batch of blocks from `next`, with the tweaks of the first of `hubs`
+/// serving them that is available.
+async fn batch(
+    wallet: &Wallet<Http>,
+    hubs: &[(String, u32)],
+    chain: &Blocks,
+    next: u32,
+) -> anyhow::Result<licash_wallet::Scanned> {
+    let mut failed = None;
+    for (url, _) in hubs.iter().filter(|(_, first)| *first <= next) {
+        match wallet.scan_silent(url, chain, BATCH).await {
+            Ok(scanned) => return Ok(scanned),
+            Err(e @ Error::Unavailable { .. }) => failed = Some(e),
+            Err(e) => return Err(e.into()),
+        }
+    }
+    match failed {
+        Some(e) => Err(e.into()),
+        None => bail!("no hub trusted serves the tweaks of block {next} on"),
+    }
+}
+
+/// Whom `code` names to pay on Bitcoin: its silent payment address, else
+/// its address, of the wallet's network.
+fn payee(wallet: &Wallet<Http>, code: &PaymentCode) -> anyhow::Result<Payee> {
+    if let Some(silent) = code.silent {
+        return Ok(silent.into());
+    }
+    let Some(address) = &code.address else {
+        bail!("TO names no address on Bitcoin");
+    };
+    let network = licash_chain_client::network(wallet.network());
+    let address = address
+        .clone()
+        .require_network(network)
+        .with_context(|| format!("TO: not an address on {}", wallet.network()))?;
+    Ok(address.script_pubkey().into())
+}
+
+/// `sat_per_vb`, else what `source` estimates confirms within 6 blocks, at
+/// least the least relayed.
+pub async fn rate(source: &Source, sat_per_vb: Option<u64>) -> anyhow::Result<FeeRate> {
+    Ok(match sat_per_vb {
+        Some(rate) => FeeRate::from_sat_per_vb(rate).context("--fee-rate")?,
+        None => source
+            .fee_rate(6)
+            .await?
+            .unwrap_or(FeeRate::BROADCAST_MIN)
+            .max(FeeRate::BROADCAST_MIN),
+    })
+}
+
+/// Broadcast the wallet's spend `tx`, given up if refused: its coins free
+/// again.
+async fn broadcast(
+    wallet: &Wallet<Http>,
+    source: &Source,
+    tx: &bitcoin::Transaction,
+) -> anyhow::Result<bitcoin::Txid> {
+    match source.broadcast(tx).await {
+        Ok(txid) => Ok(txid),
+        Err(e) => {
+            wallet.abandon_silent(&tx.compute_txid())?;
+            Err(e.context("its coins are free again"))
+        }
+    }
+}
+
+fn coin_json(coin: &SilentCoin) -> serde_json::Value {
+    json!({
+        "outpoint": coin.outpoint.to_string(), "value": coin.value, "height": coin.height,
+        "change": coin.change, "spending": coin.spending.map(|t| t.to_string()),
+    })
+}
+
+fn coin_line(coin: &SilentCoin) -> String {
+    let mut line = format!("{}  {}  block {}", coin.outpoint, coin.value, coin.height);
+    if coin.change {
+        line.push_str("  change");
+    }
+    if let Some(txid) = coin.spending {
+        line.push_str(&format!("  spending in {txid}"));
+    }
+    line
+}

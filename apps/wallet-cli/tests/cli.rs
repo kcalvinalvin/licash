@@ -828,3 +828,122 @@ fn owners_pay_payment_codes_through_mailboxes_or_by_hand() {
         "no hub trusted names mailbox relays",
     );
 }
+
+/// The fallback and silent payment addresses of `file`'s code.
+fn on_bitcoin(file: &Path) -> (String, String, String) {
+    let text = json(file, &["code", "--sp"])["code"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let code: licash_wallet::PaymentCode = text.parse().unwrap();
+    let address = code.address.unwrap().assume_checked().to_string();
+    (address, code.silent.unwrap().to_string(), text)
+}
+
+fn values(coins: &Value) -> Vec<u64> {
+    let mut values: Vec<u64> = coins
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["value"].as_u64().unwrap())
+        .collect();
+    values.sort();
+    values
+}
+
+#[test]
+fn coins_paid_on_bitcoin_are_found_spent_and_moved_to_notes() {
+    let hub = Server::with_tweaks(FEE);
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, _) = party(dir.path(), "alice", Some(&hub));
+    let (bob, _) = party(dir.path(), "bob", Some(&hub));
+    let chain = hub.esplora().to_owned();
+    let onchain = |file: &Path, args: &[&str]| {
+        let mut all = vec!["onchain", "--chain", &chain];
+        all.extend(args);
+        wallet(file, &all, None)
+    };
+    let scan = |file: &Path| -> Value {
+        let all = ["--json", "onchain", "--chain", &chain, "scan"];
+        serde_json::from_str(&ok(wallet(file, &all, None))).unwrap()
+    };
+    failed(wallet(&alice, &["onchain", "scan"], None), 1, "--chain");
+    assert_eq!(json(&alice, &["onchain", "coins"]), serde_json::json!([]));
+
+    // Paid at her fallback address and at her silent payment address.
+    let (fallback, sp, _) = on_bitcoin(&alice);
+    assert!(fallback.starts_with("bcrt1p"), "{fallback}");
+    hub.pay_onchain(&fallback, 3_000, 1);
+    hub.pay_silent(&sp, 2_500, 2);
+    hub.round();
+    let scanned = scan(&alice);
+    assert_eq!(values(&scanned["found"]), [2_500, 3_000]);
+    assert_eq!(scanned["next"], hub.height() + 1);
+    assert_eq!(scan(&alice)["found"], serde_json::json!([]));
+    let coins = ok(wallet(&alice, &["onchain", "coins"], None));
+    assert!(coins.ends_with("total  5500\n"), "{coins}");
+    // The address paid gives way to the next.
+    assert_ne!(on_bitcoin(&alice).0, fallback);
+
+    // She pays Bob's code on Bitcoin, at his silent payment address: he
+    // finds it, she her change.
+    let (_, _, code) = on_bitcoin(&bob);
+    failed(onchain(&alice, &["send", &code]), 1, "an AMOUNT or --all");
+    let mainnet = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
+    failed(
+        onchain(&alice, &["send", mainnet, "1000"]),
+        1,
+        "not an address on regtest",
+    );
+    let sent = ok(onchain(&alice, &["send", &code, "1500", "--fee-rate", "2"]));
+    let txid = sent.trim();
+    let spend = hub
+        .sent()
+        .into_iter()
+        .find(|t| t.compute_txid().to_string() == txid);
+    let spend = spend.unwrap_or_else(|| panic!("{txid} not sent"));
+    // The larger coin pays it.
+    assert_eq!(spend.input.len(), 1);
+    assert!(spend.output.iter().all(|o| o.script_pubkey.is_p2tr()));
+    let fee = 3_000 - spend.output.iter().map(|o| o.value.to_sat()).sum::<u64>();
+    let rate = bitcoin::FeeRate::from_sat_per_vb_u32(2);
+    assert_eq!(fee, rate.fee_wu(spend.weight()).unwrap().to_sat());
+    hub.confirm_sent();
+    hub.round();
+    assert_eq!(values(&scan(&bob)["found"]), [1_500]);
+    let scanned = scan(&alice);
+    assert_eq!(scanned["spent"].as_array().unwrap().len(), 1);
+    let change = 3_000 - 1_500 - fee;
+    assert_eq!(values(&scanned["found"]), [change]);
+    assert_eq!(scanned["found"][0]["change"], true);
+
+    // The rest moved to notes, the deposit's fee and the hub's on top:
+    // once at depth, resume takes them.
+    let moved: Value =
+        serde_json::from_str(&ok(onchain(&alice, &["--json", "move", "--fee-rate", "1"]))).unwrap();
+    assert_eq!(moved["state"], "open");
+    let amount = moved["amount"].as_u64().unwrap();
+    let deposit = hub
+        .sent()
+        .into_iter()
+        .find(|t| t.compute_txid().to_string() == moved["txid"].as_str().unwrap());
+    let deposit = deposit.unwrap();
+    assert_eq!((deposit.input.len(), deposit.output.len()), (2, 1));
+    assert_eq!(deposit.output[0].value.to_sat(), amount + 100);
+    let fee = 2_500 + change - amount - 100;
+    let rate = bitcoin::FeeRate::from_sat_per_vb_u32(1);
+    assert_eq!(fee, rate.fee_wu(deposit.weight()).unwrap().to_sat());
+    // Nothing left to move.
+    failed(onchain(&alice, &["move"]), 1, "0 available");
+    hub.confirm_sent();
+    hub.round();
+    hub.mine(1, None);
+    hub.round();
+    assert_eq!(
+        json(&alice, &["resume"])["deposits"][0]["state"],
+        "received"
+    );
+    assert_eq!(available(&alice), (amount, 0));
+    assert_eq!(scan(&alice)["spent"].as_array().unwrap().len(), 2);
+    assert_eq!(json(&alice, &["onchain", "coins"]), serde_json::json!([]));
+}

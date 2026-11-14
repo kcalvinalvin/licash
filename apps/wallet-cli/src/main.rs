@@ -24,6 +24,8 @@ use rand_core::{OsRng, RngCore};
 use serde_json::json;
 use tracing_subscriber::EnvFilter;
 
+mod onchain;
+
 /// The exit status of a payment recorded but not finished: retry later.
 const PENDING: u8 = 75;
 
@@ -84,9 +86,8 @@ enum Command {
         /// [default: the two trusted holding the most].
         #[arg(long)]
         hub: Vec<String>,
-        /// With the wallet's silent payment address, for payers to pay on
-        /// Bitcoin: only if something scans for its payments, as this does
-        /// not.
+        /// With the wallet's silent payment address and a fallback address,
+        /// for payers to pay on Bitcoin: `onchain scan` finds what they pay.
         #[arg(long)]
         sp: bool,
         /// In upper case, which a QR code holds in fewer modules.
@@ -249,6 +250,18 @@ enum Command {
     },
     /// The swaps made, newest first.
     Swaps,
+    /// The coins paid on Bitcoin to the wallet's silent payment and
+    /// fallback addresses: found, spent, or moved to notes.
+    Onchain {
+        /// The chain to read and broadcast to: a Bitcoin Core node as
+        /// `http://user:password@127.0.0.1:8332`, which with
+        /// `-blockfilterindex` spares fetching blocks that pay the wallet
+        /// nothing, or Esplora as `esplora+https://esplora.example/api`.
+        #[arg(long, global = true, env = "LICASH_WALLET_CHAIN")]
+        chain: Option<String>,
+        #[command(subcommand)]
+        command: onchain::Onchain,
+    },
     /// Hubs announced on Nostr relays, at the URLs that answer as the hub
     /// that announced them. Needs no wallet.
     Discover {
@@ -685,6 +698,9 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                     ),
                 ),
             }
+        }
+        Command::Onchain { chain, command } => {
+            return onchain::run(&wallet, chain, command, json).await;
         }
         Command::Swaps => {
             let swaps = wallet.swaps()?;
@@ -1234,14 +1250,7 @@ async fn refund(
             "several payments to the deposit: refunding the oldest, again for the others"
         );
     }
-    let rate = match fee_rate {
-        Some(rate) => bitcoin::FeeRate::from_sat_per_vb(rate).context("--fee-rate")?,
-        None => source
-            .fee_rate(6)
-            .await?
-            .unwrap_or(bitcoin::FeeRate::BROADCAST_MIN)
-            .max(bitcoin::FeeRate::BROADCAST_MIN),
-    };
+    let rate = onchain::rate(&source, fee_rate).await?;
     let tx = wallet.refund_deposit(hash, paid.outpoint, paid.value, to.script_pubkey(), rate)?;
     source.broadcast(&tx).await
 }

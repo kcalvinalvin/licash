@@ -40,6 +40,14 @@ on Bitcoin, the hub's fee on top; `resume` takes the notes once the payment
 confirmed. A deposit never received is taken back after its timeout with
 `refund <hash> --to <address> --chain <url>`.
 
+With `--sp`, the code also names the wallet's silent payment address and a
+fallback address any wallet pays. `onchain --chain <url> scan` finds what
+they pay with the tweaks of a hub serving them (fetching only the blocks
+whose filters match from a node with `-blockfilterindex`); `onchain coins`
+lists the coins, `onchain send <to> <amount>` pays an address, a silent
+payment address or a code on Bitcoin, and `onchain move` deposits the coins
+for notes at a hub taking deposits.
+
 `swap <amount> --to <hub> --provider <url>` swaps notes at another hub for
 `amount` at `<hub>` through a swap provider, with a lock at each hub:
 nothing is revealed until the provider's lock pays the wallet, and a swap

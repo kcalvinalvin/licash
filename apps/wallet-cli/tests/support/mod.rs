@@ -1,6 +1,7 @@
 //! A hub service on a local port that can go down and come back, following
-//! a regtest chain of its own, with a Lightning gateway over a fake node if
-//! asked, and a payer outside any wallet.
+//! a regtest chain of its own, with a Lightning gateway over a fake node, a
+//! deposit gateway or an index of silent payment tweaks if asked, and a
+//! payer outside any wallet.
 
 #[path = "../../../hub/tests/chain/mod.rs"]
 mod chain;
@@ -35,6 +36,7 @@ use licash_hub::{Hub, Policy, Timing};
 use licash_hub_service::{
     deposit,
     lightning::{fake::Fake, Config, Gateway},
+    tweaks::Tweaks,
 };
 
 const MAX_POW: u32 = 6;
@@ -83,6 +85,8 @@ pub struct Server {
     pub lightning: Option<(Arc<Gateway>, Arc<Fake>)>,
     /// The deposit gateway, and the URL of the mock Esplora it follows.
     pub deposits: Option<(Arc<deposit::Gateway>, String)>,
+    /// The index of silent payment tweaks, following the mock Esplora.
+    tweaks: Option<Arc<Tweaks>>,
     /// The mailbox relays its info names.
     relays: Vec<String>,
     backend: esplora::Shared,
@@ -96,28 +100,40 @@ impl Server {
     /// A hub charging `fee` on spends and in each branch of a lock, at
     /// height 3 of its chain.
     pub fn start(fee: Fee) -> Self {
-        Self::started(fee, false, false, Vec::new())
+        Self::started(fee, false, false, false, Vec::new())
     }
 
     /// [`Server::start`], with a gateway charging 2 to pay an invoice and
     /// 1 to take a payment, of 100 at most.
     pub fn with_lightning(fee: Fee) -> Self {
-        Self::started(fee, true, false, Vec::new())
+        Self::started(fee, true, false, false, Vec::new())
     }
 
     /// [`Server::start`], taking deposits of 1000 to 4000 for a fee of
     /// 100, paid by block 10 after they are asked for, claimed to
     /// [`SWEEP`] and refundable [`DEPOSIT_TIMEOUT`] blocks after.
     pub fn with_deposits(fee: Fee) -> Self {
-        Self::started(fee, false, true, Vec::new())
+        Self::started(fee, false, true, false, Vec::new())
+    }
+
+    /// [`Server::with_deposits`], serving the silent payment tweaks of its
+    /// chain from its height on, indexed each [`Server::round`].
+    pub fn with_tweaks(fee: Fee) -> Self {
+        Self::started(fee, false, true, true, Vec::new())
     }
 
     /// [`Server::start`], naming `relays` for its wallets' mailboxes.
     pub fn with_relays(fee: Fee, relays: Vec<String>) -> Self {
-        Self::started(fee, false, false, relays)
+        Self::started(fee, false, false, false, relays)
     }
 
-    fn started(fee: Fee, lightning: bool, deposits: bool, relays: Vec<String>) -> Self {
+    fn started(
+        fee: Fee,
+        lightning: bool,
+        deposits: bool,
+        tweaks: bool,
+        relays: Vec<String>,
+    ) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let (seed, db) = (dir.path().join("seed"), dir.path().join("hub.sqlite"));
         Hub::init(&seed, &db, MAX_POW).unwrap();
@@ -169,10 +185,15 @@ impl Server {
             let gateway = deposit::Gateway::open(hub.clone(), source, profile, config, &path);
             (Arc::new(gateway.unwrap()), url)
         });
+        let tweaks = tweaks.then(|| {
+            let path = dir.path().join("tweaks.sqlite");
+            Arc::new(Tweaks::open(&path).unwrap())
+        });
         let mut server = Self {
             hub,
             lightning,
             deposits,
+            tweaks,
             relays,
             backend,
             addr: "127.0.0.1:0".parse().unwrap(),
@@ -196,8 +217,13 @@ impl Server {
         if let Some((gateway, _)) = &self.lightning {
             runtime.block_on(gateway.round());
         }
-        if let Some((gateway, _)) = &self.deposits {
+        if let Some((gateway, url)) = &self.deposits {
             runtime.block_on(gateway.round());
+            if let Some(tweaks) = &self.tweaks {
+                let source = url.parse().unwrap();
+                let step = licash_hub_service::tweaks::step(tweaks, &source, None);
+                runtime.block_on(step).unwrap();
+            }
         }
     }
 
@@ -246,22 +272,70 @@ impl Server {
     }
 
     /// A payment of `sat` to `address` on Bitcoin, mined, from coins of
-    /// the `n`th payer: what it pays.
+    /// the `n`th payer, of a script hash, which silent payments skip: what
+    /// it pays.
     pub fn pay_onchain(&self, address: &str, sat: u64, n: u8) -> OutPoint {
         let address: bitcoin::Address<_> = address.parse().unwrap();
+        let previous_output = OutPoint {
+            txid: Txid::from_byte_array([n; 32]),
+            vout: 0,
+        };
+        let spent = ScriptBuf::new_p2wsh(&ScriptBuf::from_bytes(vec![0x51]).wscript_hash());
+        self.backend
+            .lock()
+            .unwrap()
+            .outside
+            .insert(previous_output, spent);
         let tx = Transaction {
             version: bitcoin::transaction::Version::TWO,
             lock_time: bitcoin::absolute::LockTime::ZERO,
             input: vec![bitcoin::TxIn {
-                previous_output: OutPoint {
-                    txid: Txid::from_byte_array([n; 32]),
-                    vout: 0,
-                },
+                previous_output,
                 ..Default::default()
             }],
             output: vec![bitcoin::TxOut {
                 value: bitcoin::Amount::from_sat(sat),
                 script_pubkey: address.assume_checked().script_pubkey(),
+            }],
+        };
+        let txid = tx.compute_txid();
+        self.mine_with(1, None, vec![tx]);
+        OutPoint { txid, vout: 0 }
+    }
+
+    /// A silent payment of `sat` to `to`, mined, from a key-hash coin of
+    /// the `n`th payer: what it pays.
+    pub fn pay_silent(&self, to: &str, sat: u64, n: u8) -> OutPoint {
+        let to: licash_onchain::silent::SpAddress = to.parse().unwrap();
+        let secp = Secp256k1::new();
+        let sender = SecretKey::from_slice(&[n; 32]).unwrap();
+        let key = bitcoin::CompressedPublicKey(sender.public_key(&secp));
+        let previous_output = OutPoint {
+            txid: Txid::from_byte_array([n; 32]),
+            vout: 0,
+        };
+        let spent = ScriptBuf::new_p2wpkh(&key.wpubkey_hash());
+        self.backend
+            .lock()
+            .unwrap()
+            .outside
+            .insert(previous_output, spent);
+        let paid = licash_onchain::silent::outputs(&[(sender, false)], &[previous_output], &[to]);
+        let output = TweakedPublicKey::dangerous_assume_tweaked(paid.unwrap()[0]);
+        let mut witness = bitcoin::Witness::new();
+        witness.push([0x30; 71]);
+        witness.push(key.to_bytes());
+        let tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output,
+                witness,
+                ..Default::default()
+            }],
+            output: vec![bitcoin::TxOut {
+                value: bitcoin::Amount::from_sat(sat),
+                script_pubkey: ScriptBuf::new_p2tr_tweaked(output),
             }],
         };
         let txid = tx.compute_txid();
@@ -298,6 +372,7 @@ impl Server {
         let (hub, at) = (self.hub.clone(), self.addr);
         let gateway = self.lightning.as_ref().map(|(gateway, _)| gateway.clone());
         let deposits = self.deposits.as_ref().map(|(gateway, _)| gateway.clone());
+        let tweaks = self.tweaks.clone();
         let relays = self.relays.clone();
         let thread = std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
@@ -315,8 +390,8 @@ impl Server {
                         licash_hub_service::Services {
                             gateway,
                             deposits,
+                            tweaks,
                             relays,
-                            ..Default::default()
                         },
                     ),
                 )
@@ -423,6 +498,7 @@ pub fn wallet(wallet: &Path, args: &[&str], input: Option<&str>) -> Output {
         .arg(wallet)
         .args(args)
         .env_remove("LICASH_WALLET_PROXY")
+        .env_remove("LICASH_WALLET_CHAIN")
         // Its hubs follow regtest.
         .env("LICASH_WALLET_NETWORK", "regtest")
         .stdin(Stdio::piped())
