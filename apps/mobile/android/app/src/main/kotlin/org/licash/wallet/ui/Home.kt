@@ -140,7 +140,7 @@ private fun ConnectHub(engine: Engine) {
                 onValueChange = { url = it },
                 modifier = Modifier.fillMaxWidth(),
                 singleLine = true,
-                placeholder = { Text("https://hub.example") },
+                placeholder = { Text("hub.example") },
             )
             error?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
             Spacer(Modifier.height(12.dp))

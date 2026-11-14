@@ -402,7 +402,7 @@ impl Phone {
 
     /// Connect to the hub at `url`, from Home with no hub yet.
     pub async fn connect(&self, url: &str) -> anyhow::Result<()> {
-        self.fill("https://hub.example", url).await?;
+        self.fill("hub.example", url).await?;
         self.tap("Connect").await?;
         self.wait("Receive", 60).await?;
         Ok(())
