@@ -691,14 +691,15 @@ impl Holder {
     fn terms(&mut self, body: &[u8], ctx: &Context) -> Result<Vec<Out>> {
         ensure!(self.base.is_none(), "Terms again");
         let base = Base::from_bytes(body)?;
-        let keys = self.check_terms(&base, ctx)?;
+        let keys = self.check_terms(&base, ctx.trust.programs)?;
         let out = vec![send(Kind::Keys, self.id, keys.encode())];
         self.base = Some((base, keys));
         Ok(out)
     }
 
-    /// Base checked as hers and as quoted; her keys under it.
-    fn check_terms(&self, base: &Base, ctx: &Context) -> Result<wire::Keys> {
+    /// Base checked as hers and as quoted under the programs `trusted`;
+    /// her keys under it.
+    fn check_terms(&self, base: &Base, trusted: Programs) -> Result<wire::Keys> {
         let p = base.parts();
         let s = &self.start;
         let mine = self.keys.party.public();
@@ -715,14 +716,7 @@ impl Holder {
         );
         ensure!(p.keyset == s.quote.keyset, "notes of another keyset");
         let r = &p.recipe;
-        let programs = Programs {
-            holder: r.holder_program,
-            counter: r.counter_program,
-        };
-        ensure!(
-            programs == ctx.trust.programs,
-            "programs she does not trust"
-        );
+        ensure!(programs(base) == trusted, "programs she does not trust");
         ensure!(
             r.graph_version == 1
                 && [
@@ -749,7 +743,7 @@ impl Holder {
             &s.quote,
             self.id,
             &self.open(),
-            ctx.trust.programs,
+            trusted,
             &s.checkpoint,
             p.parties[1].clone(),
             p.response_keys.clone(),
@@ -1219,6 +1213,15 @@ impl Quote {
     }
 }
 
+/// The programs `base` names.
+fn programs(base: &Base) -> Programs {
+    let r = &base.parts().recipe;
+    Programs {
+        holder: r.holder_program,
+        counter: r.counter_program,
+    }
+}
+
 /// Base on `quote` for the holder of `open`: her side and deadlines,
 /// the `programs` trusted and her `checkpoint`, with the hub's party and
 /// response keys. The hub builds it to offer, she again to check that it
@@ -1385,22 +1388,28 @@ impl Hub {
     fn open(&mut self, id: [u8; 32], body: &[u8], ctx: &Context) -> Result<Vec<Out>> {
         ensure!(self.base.is_none(), "Open again");
         let o = wire::Open::decode(body)?;
-        let base = self.offer(id, &o, ctx)?;
+        let base = self.offer(id, &o, ctx.trust.programs, ctx)?;
         let out = vec![send(Kind::Terms, id, base.to_bytes())];
         self.id = Some(id);
         self.base = Some((o, base));
         Ok(out)
     }
 
-    /// Its quote's Base for the holder of `o`, under its trust.
-    fn offer(&self, id: [u8; 32], o: &wire::Open, ctx: &Context) -> Result<Base> {
+    /// Its quote's Base for the holder of `o`, naming `programs`.
+    fn offer(
+        &self,
+        id: [u8; 32],
+        o: &wire::Open,
+        programs: Programs,
+        ctx: &Context,
+    ) -> Result<Base> {
         same_kind(o.mock, ctx)?;
         let q = &self.quote;
         offer(
             q,
             id,
             o,
-            ctx.trust.programs,
+            programs,
             &q.chain.checkpoint,
             party(&self.keys.party.public()),
             ResponseKeys::new(self.keys.sealed.public())?,

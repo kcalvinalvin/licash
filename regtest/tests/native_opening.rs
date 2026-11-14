@@ -836,6 +836,72 @@ fn a_holder_resumes_her_opening_as_she_stored_it() -> Result<()> {
     Ok(())
 }
 
+/// Past its point of no return (her F signed, the hub's graph signed) a
+/// stored opening loads under programs its party trusts only since, as a
+/// new release may: refusing would strand a contract that may stand.
+/// Short of it, once it has a Base, it is refused; under proofs of the
+/// other kind, always.
+#[test]
+fn a_binding_opening_loads_under_programs_trusted_since() -> Result<()> {
+    let rt = Regtest::start_standard()?;
+    let played = play(
+        &rt,
+        "native-binding",
+        (60, 6),
+        holder()?,
+        Authority::mock(),
+        &mut |_, m| vec![m],
+    )?;
+    let ctx = Context {
+        tip: rt.height()?,
+        trust: Authority::mock().trust(),
+    };
+    let since = Context {
+        trust: Trust {
+            programs: Programs {
+                holder: [1; 32],
+                counter: [2; 32],
+            },
+            ..ctx.trust
+        },
+        ..ctx
+    };
+    let genuine = Context {
+        trust: Trust {
+            mock: false,
+            ..ctx.trust
+        },
+        ..ctx
+    };
+    let kind = "an opening under mock proofs, not genuine";
+    for (phase, bytes) in &played.holders {
+        let load = |ctx| machine::Holder::load(bytes, SEED, Scalar::from(SPEND), ctx);
+        refused(load(&genuine), kind)?;
+        match phase {
+            Phase::Started | Phase::Funded => {
+                let loaded = load(&since).with_context(|| format!("{phase:?}"))?;
+                ensure!(loaded.to_bytes() == *bytes, "{phase:?} stored otherwise");
+            }
+            _ => refused(load(&since), "programs she does not trust")?,
+        }
+    }
+    for (phase, bytes) in &played.hubs {
+        refused(machine::Hub::load(bytes, &genuine), kind)?;
+        match phase {
+            HubPhase::Signed | HubPhase::Funded => {
+                let loaded =
+                    machine::Hub::load(bytes, &since).with_context(|| format!("{phase:?}"))?;
+                ensure!(loaded.to_bytes()? == *bytes, "{phase:?} stored otherwise");
+            }
+            _ => refused(
+                machine::Hub::load(bytes, &since),
+                "Base other than its quote offers",
+            )?,
+        }
+    }
+    Ok(())
+}
+
 /// A stored hub serves the holder's instances only as it built them when
 /// it committed: instance 1 of a fixed secret's exit dealing, under a fixed
 /// journal's mock statement, has a known commitment and hashlock. A change

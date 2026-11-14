@@ -27,8 +27,8 @@ use licash::base::Base;
 use licash::chain::Checkpoint;
 
 use super::{
-    check_choice, check_sigs, compile, draft_hmsg, same_kind, send, Context, Holder, Hub, Out,
-    Start,
+    check_choice, check_sigs, compile, draft_hmsg, programs, same_kind, send, Context, Holder, Hub,
+    Out, Start,
 };
 use crate::keys::DERIVATION;
 use crate::wire::{self, Kind, Reader, Writer, STAGES};
@@ -70,6 +70,15 @@ impl Phase {
         Phase::Signing,
         Phase::Funded,
     ];
+
+    /// Whether the contract may stand from it on: her F signed, which the
+    /// hub may complete and broadcast. Loaded from it on, her opening is
+    /// judged by the programs and the floors it was opened under, not by
+    /// her trust now: a new release may have changed them, and refusing
+    /// would strand her contract.
+    pub fn binding(self) -> bool {
+        self >= Phase::Funded
+    }
 }
 
 fn flag(byte: u8) -> Result<bool> {
@@ -106,7 +115,7 @@ impl Holder {
     /// and broadcast. Her signed F is sent only once stored as
     /// [`Phase::Funded`], so a state short of it never let it out.
     pub fn abandonable(&self) -> bool {
-        self.phase() < Phase::Funded
+        !self.phase().binding()
     }
 
     /// The instances she chose and has not had yet, by stage and index.
@@ -206,7 +215,8 @@ impl Holder {
 
     /// Her opening as [`Holder::to_bytes`] stored it, under her `seed`
     /// and spending secret `spend` and her trust: each part checked as
-    /// the step that took it did, but the opened instances.
+    /// the step that took it did, but the opened instances, and once
+    /// [`Phase::binding`] her trust's programs and her floors.
     pub fn load(bytes: &[u8], seed: [u8; 32], spend: Scalar, ctx: &Context) -> Result<Self> {
         let mut r = Reader(bytes);
         ensure!(r.array::<4>()? == MAGIC, "not an opening's state");
@@ -240,7 +250,9 @@ impl Holder {
             wanted: open.wanted,
             checkpoint,
         };
-        start.quote.check(start.checkpoint.profile())?;
+        if !phase.binding() {
+            start.quote.check(start.checkpoint.profile())?;
+        }
         let mut h = Holder::started(start, id, open.mock, fixed);
         ensure!(
             h.open() == open,
@@ -248,7 +260,11 @@ impl Holder {
         );
         if phase >= Phase::Termed {
             let base = Base::from_bytes(r.blob()?)?;
-            let keys = h.check_terms(&base, ctx)?;
+            let trusted = match phase.binding() {
+                true => programs(&base),
+                false => ctx.trust.programs,
+            };
+            let keys = h.check_terms(&base, trusted)?;
             h.base = Some((base, keys));
         }
         if phase >= Phase::Committed {
@@ -338,6 +354,13 @@ impl HubPhase {
         HubPhase::Signed,
         HubPhase::Funded,
     ];
+
+    /// Whether the contract may stand from it on: its graph signed, with
+    /// which the holder may complete F. Loaded from it on, its opening is
+    /// judged by the programs it was opened under, not by its trust now.
+    pub fn binding(self) -> bool {
+        self >= HubPhase::Signed
+    }
 }
 
 fn dealing(d: &Dealing) -> Vec<u8> {
@@ -366,7 +389,7 @@ impl Hub {
     /// contract stands. Its signatures are sent only once stored as
     /// [`HubPhase::Signed`].
     pub fn abandonable(&self) -> bool {
-        self.phase() < Some(HubPhase::Signed)
+        !self.phase().is_some_and(HubPhase::binding)
     }
 
     /// What the step that reached its phase asked: to carry out again on
@@ -439,8 +462,9 @@ impl Hub {
 
     /// Its opening as [`Hub::to_bytes`] stored it, under its trust: each
     /// part checked as the step that took it did, but its instances, which
-    /// [`Hub::instance`] checks as it builds them again, and its gate,
-    /// whose deadline may have passed since: her consent is checked alone.
+    /// [`Hub::instance`] checks as it builds them again, its gate, whose
+    /// deadline may have passed since (her consent is checked alone), and
+    /// once [`HubPhase::binding`] its trust's programs.
     pub fn load(bytes: &[u8], ctx: &Context) -> Result<Self> {
         let mut r = Reader(bytes);
         ensure!(r.array::<4>()? == MAGIC, "not an opening's state");
@@ -457,9 +481,14 @@ impl Hub {
         let mut h = Hub::with(&secret, r.quote()?);
         let id = r.array()?;
         let open = wire::Open::decode(r.blob()?)?;
-        let base = h.offer(id, &open, ctx)?;
+        let stored = Base::from_bytes(r.blob()?)?;
+        let trusted = match phase.binding() {
+            true => programs(&stored),
+            false => ctx.trust.programs,
+        };
+        let base = h.offer(id, &open, trusted, ctx)?;
         ensure!(
-            Base::from_bytes(r.blob()?)?.digest() == base.digest(),
+            stored.digest() == base.digest(),
             "Base other than its quote offers"
         );
         h.id = Some(id);
