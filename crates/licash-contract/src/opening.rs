@@ -13,7 +13,11 @@
 //! A holder is stored after each step she takes ([`Holder::to_bytes`]):
 //! her driver keeps the instances she asks it to ([`Out::Keep`]), then
 //! stores her, then carries out the rest. Resumed ([`Holder::load`]), she
-//! asks again what the step to her phase asked ([`Holder::pending`]).
+//! asks again what the step to her phase asked ([`Holder::pending`]). A
+//! hub is stored likewise ([`Hub::to_bytes`], [`Hub::load`],
+//! [`Hub::pending`]), its secret in its state; it keeps only its
+//! instances' commitments and hashlocks, and builds each kept one again
+//! to send it ([`Out::Serve`], [`Hub::instance`]).
 
 use std::collections::HashMap;
 
@@ -45,12 +49,12 @@ use lngap_sessions::session::Terms;
 use lngap_sessions::skeleton::{sig_name, sign_all, Presign, Signed};
 
 use crate::graph::{Babe, Corrected, ExitKeys, Publication, Spec, Windows};
-use crate::keys::{HolderKeys, HubKeys};
+use crate::keys::{Dealt, HolderKeys, HubKeys};
 use crate::wire::{self, Envelope, Kind, Shown, STAGES};
 use crate::{INSTANCES, KEPT};
 
 mod state;
-pub use state::Phase;
+pub use state::{HubPhase, Phase};
 
 /// The statement BABE encrypts under: its Groth16 verifying key and the
 /// public inputs of the journal fixed at opening.
@@ -127,6 +131,9 @@ pub enum Out {
         commitment: Hash,
         bytes: Vec<u8>,
     },
+    /// The hub's: send the holder her kept instance `index` (0-based) of
+    /// assertion `stage`, the message [`Hub::instance`] builds again.
+    Serve { stage: usize, index: usize },
     /// The hub's: fund F, paying `graph` and spending the holder's
     /// `deposit` among its inputs, and five coins paying `publication`;
     /// answer [`Input::Funded`].
@@ -1250,18 +1257,24 @@ fn offer(
     })?)
 }
 
-/// The hub's side of an opening.
+/// The hub's side of an opening. Each field is a phase's ([`HubPhase`]):
+/// set by the step that reaches it, and by [`Hub::load`].
 pub struct Hub {
+    /// The opening's own secret, which all its keys derive from.
+    secret: [u8; 32],
     keys: HubKeys,
     quote: Quote,
     id: Option<[u8; 32]>,
-    base: Option<Base>,
+    /// The holder's Open, and the Base that answers it.
+    base: Option<(wire::Open, Base)>,
     holder: Option<(wire::Keys, Babe)>,
-    /// F frozen, and all its instances of each assertion.
-    frozen: Option<(Frozen, [Vec<Instance>; STAGES])>,
+    /// F frozen, the commitment to its instances, and each one's hashlock:
+    /// the instances themselves are dropped, and built again to send.
+    frozen: Option<(Frozen, wire::Commit, [Vec<Hash>; STAGES])>,
     choice: Option<([Vec<usize>; STAGES], Vec<Presign>)>,
-    signed: bool,
-    funded: bool,
+    /// The holder's consent, and its signatures that answered it.
+    signed: Option<(wire::Consent, wire::Signed)>,
+    funded: Option<Transaction>,
 }
 
 impl Hub {
@@ -1282,6 +1295,7 @@ impl Hub {
 
     fn with(secret: &[u8; 32], quote: Quote) -> Self {
         Self {
+            secret: *secret,
             keys: HubKeys::from_secret(secret),
             quote,
             id: None,
@@ -1289,12 +1303,15 @@ impl Hub {
             holder: None,
             frozen: None,
             choice: None,
-            signed: false,
-            funded: false,
+            signed: None,
+            funded: None,
         }
     }
 
     pub fn step(&mut self, input: Input, ctx: &Context) -> Result<Vec<Out>> {
+        if self.base.is_some() {
+            same_kind(self.mock(), ctx)?;
+        }
         match input {
             Input::Message(bytes) => {
                 let m = Envelope::from_bytes(&bytes)?;
@@ -1322,47 +1339,79 @@ impl Hub {
         self.id.expect("an opening's id from its Open")
     }
 
+    fn base(&self) -> &Base {
+        &self.base.as_ref().expect("Open before").1
+    }
+
+    /// Whether the holder opened under mock proofs.
+    fn mock(&self) -> bool {
+        self.base.as_ref().expect("Open before").0.mock
+    }
+
     /// M1: Base, the holder's side and deadlines in it, answers.
     fn open(&mut self, id: [u8; 32], body: &[u8], ctx: &Context) -> Result<Vec<Out>> {
         ensure!(self.base.is_none(), "Open again");
         let o = wire::Open::decode(body)?;
+        let base = self.offer(id, &o, ctx)?;
+        let out = vec![send(Kind::Terms, id, base.to_bytes())];
+        self.id = Some(id);
+        self.base = Some((o, base));
+        Ok(out)
+    }
+
+    /// Its quote's Base for the holder of `o`, under its trust.
+    fn offer(&self, id: [u8; 32], o: &wire::Open, ctx: &Context) -> Result<Base> {
         same_kind(o.mock, ctx)?;
         let q = &self.quote;
-        let base = offer(
+        offer(
             q,
             id,
-            &o,
+            o,
             ctx.trust.programs,
             &q.chain.checkpoint,
             party(&self.keys.party.public()),
             ResponseKeys::new(self.keys.sealed.public())?,
-        )?;
-        let out = vec![send(Kind::Terms, id, base.to_bytes())];
-        self.id = Some(id);
-        self.base = Some(base);
-        Ok(out)
+        )
     }
 
     /// M3: the holder's keys, with which the graph compiles. F to fund
     /// follows.
     fn keys(&mut self, body: &[u8]) -> Result<Vec<Out>> {
         ensure!(self.holder.is_none(), "Keys again");
-        let base = self.base.as_ref().context("Keys before Open")?;
+        let base = &self.base.as_ref().context("Keys before Open")?.1;
         let keys = wire::Keys::decode(body)?;
         let draft = compile(base, &keys, draft_hmsg())?;
-        let fund = Out::Fund {
+        let out = vec![self.to_fund(&draft)?];
+        self.holder = Some((keys, draft));
+        Ok(out)
+    }
+
+    /// F to fund, paying `draft`'s graph and spending her deposit, and
+    /// the publication coins.
+    fn to_fund(&self, draft: &Babe) -> Result<Out> {
+        let base = self.base();
+        Ok(Out::Fund {
             deposit: deposit(base)?,
-            graph: graph_output(&draft)?,
+            graph: graph_output(draft)?,
             publication: draft
                 .publication_trees(&disclosure(base)?)?
                 .map(|t| t.script_pubkey()),
-        };
-        self.holder = Some((keys, draft));
-        Ok(vec![fund])
+        })
+    }
+
+    /// Each assertion's dealing: the exit's, then a Corrected contract's.
+    fn dealt(&self) -> [&Dealt; STAGES] {
+        [&self.keys.full, &self.keys.corrected]
+    }
+
+    /// Assertion `stage`'s statement under F's D.
+    fn statement(&self, stage: usize, ctx: &Context) -> Statement {
+        let (frozen, _, _) = self.frozen.as_ref().expect("F before its statements");
+        (ctx.trust.statement)(&journal(self.base(), &frozen.d, stage as u32))
     }
 
     /// F funded: frozen, D, and the instances under its journals, which it
-    /// commits to.
+    /// commits to, keeping their hashlocks and dropping them.
     fn fund(
         &mut self,
         funding: Transaction,
@@ -1370,43 +1419,48 @@ impl Hub {
         ctx: &Context,
     ) -> Result<Vec<Out>> {
         ensure!(self.frozen.is_none(), "F funded again");
-        let base = self.base.as_ref().context("F before Open")?;
+        self.base.as_ref().context("F before Open")?;
+        self.holder.as_ref().context("F before the holder's keys")?;
+        let frozen = self.check_fund(funding, publication)?;
+        let base = self.base();
+        let built: [Vec<(Hash, Hash)>; STAGES] = std::array::from_fn(|s| {
+            let st = (ctx.trust.statement)(&journal(base, &frozen.d, s as u32));
+            let d = self.dealt()[s];
+            par(INSTANCES, |i| {
+                let x = build(d, i, &st);
+                (x.commitment(), x.hmsg)
+            })
+        });
+        let commit = wire::Commit {
+            funding: frozen.funding.clone(),
+            publication: frozen.publication.coins.clone(),
+            d: *frozen.d.as_bytes(),
+            dealings: self.dealt().map(|d| d.dealing.clone()),
+            commitments: built
+                .each_ref()
+                .map(|b| b.iter().map(|(c, _)| *c).collect()),
+        };
+        let hmsg = built.map(|b| b.into_iter().map(|(_, h)| h).collect());
+        let out = vec![send(Kind::Commit, self.id(), commit.encode())];
+        self.frozen = Some((frozen, commit, hmsg));
+        Ok(out)
+    }
+
+    /// F as funded, spending her deposit once, frozen on her keys.
+    fn check_fund(
+        &self,
+        funding: Transaction,
+        publication: [(OutPoint, TxOut); 5],
+    ) -> Result<Frozen> {
         let (keys, draft) = self.holder.as_ref().context("F before the holder's keys")?;
-        let deposit = deposit(base)?;
+        let deposit = deposit(self.base())?;
         let spends = funding
             .input
             .iter()
             .filter(|i| i.previous_output == deposit)
             .count();
         ensure!(spends == 1, "F spends the deposit {spends} times");
-        let frozen = freeze(base, keys, draft, funding, publication)?;
-        let dealt = [&self.keys.full, &self.keys.corrected];
-        let instances: [Vec<Instance>; STAGES] = std::array::from_fn(|s| {
-            let st = (ctx.trust.statement)(&journal(base, &frozen.d, s as u32));
-            let d = dealt[s];
-            par(INSTANCES, |i| {
-                instance(
-                    &d.seeds[i],
-                    &d.dealer.shares(i as u64 + 1),
-                    &st.vk,
-                    &st.public,
-                )
-                .0
-            })
-        });
-        let commitments = instances
-            .each_ref()
-            .map(|x| x.iter().map(Instance::commitment).collect());
-        let commit = wire::Commit {
-            funding: frozen.funding.clone(),
-            publication: frozen.publication.coins.clone(),
-            d: *frozen.d.as_bytes(),
-            dealings: dealt.map(|d| d.dealing.clone()),
-            commitments,
-        };
-        let out = vec![send(Kind::Commit, self.id(), commit.encode())];
-        self.frozen = Some((frozen, instances));
-        Ok(out)
+        freeze(self.base(), keys, draft, funding, publication)
     }
 
     /// M5: the holder's choice, kept for good: the same again has the
@@ -1418,24 +1472,27 @@ impl Hub {
             ensure!(*kept == m.kept, "a second choice");
             return Ok(self.chosen());
         }
-        let (frozen, instances) = self
-            .frozen
+        self.frozen
             .as_ref()
             .context("a choice before the commitments")?;
-        check_choice(&m.kept)?;
-        let base = self.base.as_ref().expect("Open before F");
-        let (keys, _) = self.holder.as_ref().expect("Keys before F");
-        let hmsg =
-            std::array::from_fn(|s| m.kept[s].iter().map(|i| instances[s][*i].hmsg).collect());
-        let (_, set) = finish(base, keys, frozen, hmsg)?;
+        let set = self.check_choose(&m.kept)?;
         self.choice = Some((m.kept, set));
         Ok(self.chosen())
     }
 
+    /// The graph's set with the instances `kept` the holder keeps.
+    fn check_choose(&self, kept: &[Vec<usize>; STAGES]) -> Result<Vec<Presign>> {
+        check_choice(kept)?;
+        let (keys, _) = self.holder.as_ref().expect("Keys before F");
+        let (frozen, _, hmsg) = self.frozen.as_ref().expect("F before a choice");
+        let hmsg = std::array::from_fn(|s| kept[s].iter().map(|i| hmsg[s][*i]).collect());
+        Ok(finish(self.base(), keys, frozen, hmsg)?.1)
+    }
+
+    /// The opened instances, then each kept one to serve.
     fn chosen(&self) -> Vec<Out> {
         let (kept, _) = self.choice.as_ref().expect("a choice");
-        let (_, instances) = self.frozen.as_ref().expect("F before a choice");
-        let dealt = [&self.keys.full, &self.keys.corrected];
+        let dealt = self.dealt();
         let opened = wire::Opened {
             opened: std::array::from_fn(|s| {
                 others(kept)[s]
@@ -1449,49 +1506,55 @@ impl Hub {
             }),
         };
         let mut out = vec![send(Kind::Opened, self.id(), opened.encode())];
-        for (s, kept) in kept.iter().enumerate() {
-            for i in kept {
-                let kept = wire::Kept {
-                    stage: s,
-                    index: *i,
-                    instance: instances[s][*i].to_bytes(),
-                };
-                out.push(send(Kind::Instance, self.id(), kept.encode()));
-            }
+        for (stage, kept) in kept.iter().enumerate() {
+            out.extend(kept.iter().map(|&index| Out::Serve { stage, index }));
         }
         out
+    }
+
+    /// The message carrying the holder's kept instance `index` of
+    /// assertion `stage` ([`Out::Serve`]): built again from the opening's
+    /// secret, and refused unless as committed.
+    pub fn instance(&self, stage: usize, index: usize, ctx: &Context) -> Result<Vec<u8>> {
+        let (kept, _) = self
+            .choice
+            .as_ref()
+            .context("an instance before a choice")?;
+        ensure!(
+            kept.get(stage).is_some_and(|k| k.contains(&index)),
+            "an instance she did not keep"
+        );
+        same_kind(self.mock(), ctx)?;
+        let (_, c, hmsg) = self.frozen.as_ref().expect("F before a choice");
+        let x = build(self.dealt()[stage], index, &self.statement(stage, ctx));
+        ensure!(
+            x.commitment() == c.commitments[stage][index] && x.hmsg == hmsg[stage][index],
+            "instance {index} of assertion {stage} built otherwise than committed"
+        );
+        let kept = wire::Kept {
+            stage,
+            index,
+            instance: x.to_bytes(),
+        };
+        Ok(Envelope {
+            kind: Kind::Instance,
+            id: self.id(),
+            body: kept.encode(),
+        }
+        .to_bytes())
     }
 
     /// M7: the holder's pre-signatures on its dealings, her signatures of
     /// all the graph but the withheld, and her consent, through its gate.
     /// Its signatures answer.
     fn consent(&mut self, body: &[u8], ctx: &Context) -> Result<Vec<Out>> {
-        ensure!(!self.signed, "Consent again");
+        ensure!(self.signed.is_none(), "Consent again");
         let (_, set) = self.choice.as_ref().context("consent before a choice")?;
-        let (frozen, _) = self.frozen.as_ref().expect("F before a choice");
-        let base = self.base.as_ref().expect("Open before F");
-        let (keys, _) = self.holder.as_ref().expect("Keys before F");
+        let (frozen, _, _) = self.frozen.as_ref().expect("F before a choice");
         let m = wire::Consent::decode(body)?;
-        let sighashes = [
-            Babe::challenge_sighash(set)?,
-            Babe::challenge_corrected_sighash(set)?,
-        ];
-        let dealings = [&self.keys.full.dealing, &self.keys.corrected.dealing];
-        for s in 0..STAGES {
-            ensure!(
-                check_presigs(
-                    &keys.adaptor[s],
-                    &sighashes[s],
-                    &points(dealings[s]),
-                    &m.presigs[s]
-                ),
-                "pre-signatures of assertion {s} not on its dealing"
-            );
-        }
-        let alice = party_pub(&base.parts().parties[0])?.payment;
-        check_sigs(set, &alice, &m.sigs, Babe::withheld)?;
+        self.check_consent(&m)?;
         let retained = ResponseKeys::new(self.keys.sealed.public())?;
-        let d = base.hub_gate(
+        let d = self.base().hub_gate(
             &frozen.prefix,
             &frozen.graph.script_pubkey.to_bytes(),
             &ctx.trust.programs,
@@ -1505,28 +1568,70 @@ impl Hub {
             funding: frozen.funding.clone(),
         };
         let out = vec![send(Kind::Signed, self.id(), signed.encode())];
-        self.signed = true;
+        self.signed = Some((m, signed));
         Ok(out)
+    }
+
+    /// Her pre-signatures on its dealings and her signatures of all the
+    /// graph but the withheld; not her consent, which its gate checks.
+    fn check_consent(&self, m: &wire::Consent) -> Result<()> {
+        let (_, set) = self.choice.as_ref().context("consent before a choice")?;
+        let (keys, _) = self.holder.as_ref().expect("Keys before F");
+        let sighashes = [
+            Babe::challenge_sighash(set)?,
+            Babe::challenge_corrected_sighash(set)?,
+        ];
+        let dealt = self.dealt();
+        for (s, sighash) in sighashes.iter().enumerate() {
+            ensure!(
+                check_presigs(
+                    &keys.adaptor[s],
+                    sighash,
+                    &points(&dealt[s].dealing),
+                    &m.presigs[s]
+                ),
+                "pre-signatures of assertion {s} not on its dealing"
+            );
+        }
+        let alice = party_pub(&self.base().parts().parties[0])?.payment;
+        check_sigs(set, &alice, &m.sigs, Babe::withheld)
     }
 
     /// M9: F as frozen, signed whole, to broadcast.
     fn funded(&mut self, body: &[u8]) -> Result<Vec<Out>> {
-        ensure!(self.signed, "F before the hub signed");
-        ensure!(!self.funded, "F again");
-        let (frozen, _) = self.frozen.as_ref().expect("F before signing");
+        ensure!(self.signed.is_some(), "F before the hub signed");
+        ensure!(self.funded.is_none(), "F again");
         let m = wire::Funded::decode(body)?;
+        self.check_funded(&m.funding)?;
+        let out = vec![Out::Broadcast(m.funding.clone())];
+        self.funded = Some(m.funding);
+        Ok(out)
+    }
+
+    fn check_funded(&self, funding: &Transaction) -> Result<()> {
+        let (frozen, _, _) = self.frozen.as_ref().expect("F before signing");
         ensure!(
-            m.funding.compute_txid() == frozen.funding_op.txid,
+            funding.compute_txid() == frozen.funding_op.txid,
             "F not as frozen"
         );
         ensure!(
-            m.funding
+            funding
                 .input
                 .iter()
                 .all(|i| !i.witness.is_empty() || !i.script_sig.is_empty()),
             "F not signed whole"
         );
-        self.funded = true;
-        Ok(vec![Out::Broadcast(m.funding)])
+        Ok(())
     }
+}
+
+/// Instance `i` (0-based) of dealing `d`, under statement `st`.
+fn build(d: &Dealt, i: usize, st: &Statement) -> Instance {
+    instance(
+        &d.seeds[i],
+        &d.dealer.shares(i as u64 + 1),
+        &st.vk,
+        &st.public,
+    )
+    .0
 }

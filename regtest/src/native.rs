@@ -39,7 +39,7 @@ use lngap_btc::bitcoin::{
 };
 use lngap_btc::regtest::Regtest;
 use lngap_lamport::winternitz::{WotsParams, WotsSig};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -311,11 +311,12 @@ fn hub_secret(label: &str) -> [u8; 32] {
 }
 
 /// An opening as its machines played it: the holder's contract, her kept
-/// instances by commitment as her driver kept them, and the messages
-/// refused on the way.
+/// instances by commitment as her driver kept them, the hub's state as it
+/// stored it at each phase, and the messages refused on the way.
 pub struct Played {
     pub opening: machine::Opening,
     pub kept: HashMap<[u8; 32], Vec<u8>>,
+    pub hubs: BTreeMap<machine::HubPhase, Vec<u8>>,
     pub refused: Vec<Refusal>,
 }
 
@@ -365,6 +366,7 @@ pub fn play(
     let out = stored(&mut alice, None, out, &ctx()?, secrets, &mut kept)?;
     let mut hub = machine::Hub::with_secret(&hub_secret(label), hub_quote);
     let mut queue = VecDeque::new();
+    let mut hubs = BTreeMap::new();
     let mut refused = vec![];
     let mut funded = false;
     route(rt, Side::Holder, out, &mut queue, tamper, &mut funded)?;
@@ -392,7 +394,24 @@ pub fn play(
                     }
                 }
             }
-            Side::Hub => hub.step(input, &ctx),
+            Side::Hub => {
+                let (before, phase) = (hub.to_bytes().ok(), hub.phase());
+                match hub.step(input, &ctx) {
+                    Ok(out) => {
+                        let out = hub_stored(&mut hub, phase, out, &ctx)?;
+                        let now = hub.phase().context("a hub past its Open")?;
+                        hubs.insert(now, hub.to_bytes()?);
+                        Ok(out)
+                    }
+                    Err(e) => {
+                        ensure!(
+                            hub.to_bytes().ok() == before,
+                            "a refusal changed the hub: {e:#}"
+                        );
+                        Err(e)
+                    }
+                }
+            }
         };
         match step {
             Ok(out) => route(rt, to, out, &mut queue, tamper, &mut funded)?,
@@ -407,6 +426,7 @@ pub fn play(
     Ok(Played {
         opening: alice.opening()?,
         kept,
+        hubs,
         refused,
     })
 }
@@ -449,6 +469,33 @@ fn stored(
         );
     }
     Ok(rest)
+}
+
+/// What the hub asked after a step from `phase`, as a driver that stores
+/// it carries it out: its state stored and loaded again, which must store
+/// the same bytes and ask again what a step to another phase asked (a step
+/// within one, a choice again, asks the same or nothing); then the
+/// instances it serves built again by the loaded hub.
+fn hub_stored(
+    hub: &mut machine::Hub,
+    phase: Option<machine::HubPhase>,
+    out: Vec<Out>,
+    ctx: &machine::Context,
+) -> Result<Vec<Out>> {
+    let bytes = hub.to_bytes()?;
+    *hub = machine::Hub::load(&bytes, ctx)?;
+    ensure!(hub.to_bytes()? == bytes, "its state stored otherwise");
+    let now = hub.phase();
+    ensure!(
+        hub.pending()? == out || (phase == now && out.is_empty()),
+        "{now:?} asks otherwise once loaded"
+    );
+    out.into_iter()
+        .map(|out| match out {
+            Out::Serve { stage, index } => Ok(Out::Send(hub.instance(stage, index, ctx)?)),
+            out => Ok(out),
+        })
+        .collect()
 }
 
 /// Carry out what party `from` asks: its messages to the other through
@@ -495,6 +542,7 @@ fn route(
                 *funded = true;
             }
             Out::Keep { .. } => bail!("an instance to keep, not kept first"),
+            Out::Serve { .. } => bail!("an instance to serve, not built first"),
         }
     }
     Ok(())

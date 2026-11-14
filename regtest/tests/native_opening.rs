@@ -1,6 +1,7 @@
 //! The networked opening against a forging peer: each party refuses every
 //! forged message of the other's, goes on as it was, and still opens on
-//! the honest one; a holder given another hub's keys never funds.
+//! the honest one; a holder given another hub's keys never funds. Each
+//! party's stored opening resumes as it was, and loads only as its own.
 
 use anyhow::{bail, ensure, Context as _, Result};
 use bitcoincore_rpc::RpcApi;
@@ -8,7 +9,9 @@ use k256::Scalar;
 use licash::base::{Base, Parts, Programs, ResponseKeys};
 use licash::note::IssuerKeys;
 use licash_contract::keys::HubKeys;
-use licash_contract::opening::{self as machine, Context, Input, Out, Phase, Quote, Start, Trust};
+use licash_contract::opening::{
+    self as machine, Context, HubPhase, Input, Out, Phase, Quote, Start, Trust,
+};
 use licash_contract::wire::{self, Envelope, Kind, Wanted};
 use licash_regtest::native::{checkpoint, open_native_with, play, quote, Authority, Holder};
 use licash_regtest::native_fixture::{point, SEED, SPEND};
@@ -619,5 +622,148 @@ fn her_kept_instances_read_back_only_as_she_kept_them() -> Result<()> {
         }),
         "instance",
     )?;
+    Ok(())
+}
+
+/// `bytes` with a byte of its one copy of `value` flipped.
+fn flipped(bytes: &[u8], value: &[u8; 32]) -> Result<Vec<u8>> {
+    let at: Vec<usize> = bytes
+        .windows(32)
+        .enumerate()
+        .filter_map(|(i, w)| (w == value).then_some(i))
+        .collect();
+    let [at] = at[..] else {
+        bail!("{} copies", at.len())
+    };
+    let mut bytes = bytes.to_vec();
+    bytes[at + 31] ^= 1;
+    Ok(bytes)
+}
+
+/// The hub resumes from each phase as it stored it: the same choice again
+/// has the same answer and another is refused, and it builds the holder's
+/// instances again only as it committed to them; its state loads only as
+/// its own, under its secret and a trust of its kind and programs.
+#[test]
+fn a_hub_resumes_its_opening_as_it_stored_it() -> Result<()> {
+    let rt = Regtest::start_standard()?;
+    let played = play(
+        &rt,
+        "native-hub",
+        (60, 6),
+        holder()?,
+        Authority::mock(),
+        &mut |_, m| vec![m],
+    )?;
+    let ctx = Context {
+        tip: rt.height()?,
+        trust: Authority::mock().trust(),
+    };
+    let o = &played.opening;
+    use HubPhase::*;
+    ensure!(
+        played
+            .hubs
+            .keys()
+            .copied()
+            .eq([Termed, Keyed, Committed, Chosen, Signed, Funded]),
+        "{:?}",
+        played.hubs.keys()
+    );
+    let id = o.base.parts().nonce;
+    let choose = |kept: [Vec<usize>; 2]| {
+        let body = wire::Choose { kept }.encode();
+        Envelope {
+            kind: Kind::Choose,
+            id,
+            body,
+        }
+        .to_bytes()
+    };
+    let chosen = &played.hubs[&Chosen];
+    let mut hub = machine::Hub::load(chosen, &ctx)?;
+    let out = hub.step(Input::Message(choose([vec![2, 3], vec![2, 3]])), &ctx)?;
+    ensure!(out == hub.pending()?, "the same choice answered otherwise");
+    ensure!(
+        matches!(&out[..], [Out::Send(m), ..] if Kind::peek(m) == Some(Kind::Opened)),
+        "{out:?}"
+    );
+    refused(
+        hub.step(Input::Message(choose([vec![1, 3], vec![2, 3]])), &ctx),
+        "a second choice",
+    )?;
+    for (s, kept) in o.instances.iter().enumerate() {
+        for k in kept {
+            let m = Envelope::from_bytes(&hub.instance(s, k.index, &ctx)?)?;
+            let kept = wire::Kept::decode(&m.body)?;
+            ensure!(
+                Some(&kept.instance) == played.kept.get(&k.commitment),
+                "instance {} of assertion {s} built otherwise than served",
+                k.index
+            );
+        }
+    }
+    refused(hub.instance(0, 0, &ctx), "an instance she did not keep")?;
+    let k = o.instances[1][0];
+    for value in [k.commitment, k.hmsg] {
+        let hub = machine::Hub::load(&flipped(chosen, &value)?, &ctx)?;
+        refused(
+            hub.instance(1, k.index, &ctx),
+            "instance 2 of assertion 1 built otherwise than committed",
+        )?;
+    }
+    let funded = machine::Hub::load(&played.hubs[&Funded], &ctx)?;
+    ensure!(
+        funded.pending()? == [Out::Broadcast(o.funding.clone())],
+        "F to broadcast otherwise once loaded"
+    );
+    let keyed = &played.hubs[&Keyed];
+    let changed = |at: usize, byte: u8| {
+        let mut b = keyed.clone();
+        b[at] = byte;
+        b
+    };
+    let offers = "Base other than its quote offers";
+    let damaged: [(Vec<u8>, &str); 9] = [
+        (changed(0, b'X'), "not an opening's state"),
+        (changed(5, 2), "of format 2"),
+        (changed(6, 2), "keys of derivation 2"),
+        (changed(7, 0), "not a hub's opening"),
+        (changed(8, 6), "phase 6"),
+        // Keyed's sections under another phase.
+        (changed(8, 0), "bytes past an opening's state"),
+        (changed(8, 2), "cut short"),
+        // Another secret: other keys than Base's.
+        (changed(9, keyed[9] ^ 1), offers),
+        (
+            [keyed.clone(), vec![0]].concat(),
+            "bytes past an opening's state",
+        ),
+    ];
+    for (bytes, why) in damaged {
+        refused(machine::Hub::load(&bytes, &ctx), why)?;
+    }
+    let genuine = Context {
+        trust: Trust {
+            mock: false,
+            ..ctx.trust
+        },
+        ..ctx
+    };
+    let distrusted = Context {
+        trust: Trust {
+            programs: Programs {
+                counter: [1; 32],
+                ..ctx.trust.programs
+            },
+            ..ctx.trust
+        },
+        ..ctx
+    };
+    refused(
+        machine::Hub::load(keyed, &genuine),
+        "an opening under mock proofs, not genuine",
+    )?;
+    refused(machine::Hub::load(keyed, &distrusted), offers)?;
     Ok(())
 }

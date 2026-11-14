@@ -4,8 +4,8 @@ The contract on Bitcoin: Lichen's BABE transaction graph
 (`crates/licash-contract`, played by `src/contract.rs`), opened from
 licash's Base by the holder's and the hub's state machines of
 `licash_contract::opening` over a byte pipe (`src/native.rs`, which has
-Bitcoin Core fund and sign F, and stores and reloads the holder after
-each step she takes), with end-to-end tests that fund real
+Bitcoin Core fund and sign F, and stores and reloads each party after
+each step it takes), with end-to-end tests that fund real
 contracts on a fresh Bitcoin Core 30 regtest node under the default relay
 policy. The garbled circuits are real; proofs are mocked (a test key)
 except in `tests/native_real_proof.rs`.

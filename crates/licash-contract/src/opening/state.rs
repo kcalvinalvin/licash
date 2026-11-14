@@ -1,31 +1,45 @@
-//! A holder's opening as she stores it, to resume it: what she was sent
-//! and what she drew or signed, never what she derives again (her keys
-//! come from her seed and the opening's id, and she brings the seed and
-//! her spending secret to [`Holder::load`] again). Loading checks each
-//! part as the step that took it did, but for the opened instances it
-//! would rebuild: their shapes are stored. It refuses a state of another
-//! format, derivation, side, seed or trust, and never reads one otherwise.
+//! An opening as each party stores it, to resume it.
+//!
+//! A holder stores what she was sent and what she drew or signed, never
+//! what she derives again (her keys come from her seed and the opening's
+//! id, and she brings the seed and her spending secret to [`Holder::load`]
+//! again). A hub stores its opening's secret, which all its keys derive
+//! from, and what it was sent and signed, not its instances, which it
+//! builds again to send ([`Hub::instance`]). Loading checks each part as
+//! the step that took it did, but for instances it would rebuild (the
+//! holder stores the opened ones' shapes) and the hub's gate, whose
+//! deadline may have passed. It refuses a state of another format,
+//! derivation, side, seed or trust, and never reads one otherwise.
 //!
 //! The format: `LCOS`, u16 [`FORMAT`], u8 [`DERIVATION`], u8 side (0, a
-//! holder's), u8 [`Phase`], then each phase's section up to its own: her
-//! id, quote, Open, checkpoint and any fixture's choice; Base; the hub's
-//! Commit and her choice; its Opened, the opened instances' shapes and her
-//! kept instances' hashlocks; her Consent and her withheld signatures; the
-//! hub's Signed; F signed whole.
+//! holder's; 1, a hub's), u8 phase ([`Phase`], [`HubPhase`]), then each
+//! phase's section up to its own. A holder's: her id, quote, Open,
+//! checkpoint and any fixture's choice; Base; the hub's Commit and her
+//! choice; its Opened, the opened instances' shapes and her kept
+//! instances' hashlocks; her Consent and her withheld signatures; the
+//! hub's Signed; F signed whole. A hub's: its secret, quote, the id, her
+//! Open and Base; her Keys; its Commit and its instances' hashlocks; her
+//! choice; her Consent and its Signed; F signed whole.
 
 use anyhow::{bail, ensure, Context as _, Result};
 use k256::Scalar;
 use licash::base::Base;
 use licash::chain::Checkpoint;
 
-use super::{check_choice, same_kind, send, Context, Holder, Out, Start};
+use super::{
+    check_choice, check_sigs, compile, draft_hmsg, same_kind, send, Context, Holder, Hub, Out,
+    Start,
+};
 use crate::keys::DERIVATION;
 use crate::wire::{self, Kind, Reader, Writer, STAGES};
+use crate::INSTANCES;
+use lichen_babe::vsss::Dealing;
 
 pub const MAGIC: [u8; 4] = *b"LCOS";
 /// The version of the format: a state of another is refused.
 pub const FORMAT: u16 = 1;
 const HOLDER: u8 = 0;
+const HUB: u8 = 1;
 
 /// How far an opening went, by the last message its holder took.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -284,6 +298,201 @@ impl Holder {
             let funding = r.tx()?;
             h.check_funding(&funding)?;
             h.funding = Some(funding);
+        }
+        ensure!(r.0.is_empty(), "bytes past an opening's state");
+        Ok(h)
+    }
+}
+
+/// How far an opening went, by the last input its hub took.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum HubPhase {
+    /// Her Open taken, Base sent.
+    Termed,
+    /// Her keys taken: F its to fund.
+    Keyed,
+    /// F funded and frozen, its commitment sent.
+    Committed,
+    /// Her choice taken, the opened instances and hers sent.
+    Chosen,
+    /// Her consent taken, its signatures sent.
+    Signed,
+    /// F signed whole taken: its to broadcast.
+    Funded,
+}
+
+impl HubPhase {
+    const ALL: [HubPhase; 6] = [
+        HubPhase::Termed,
+        HubPhase::Keyed,
+        HubPhase::Committed,
+        HubPhase::Chosen,
+        HubPhase::Signed,
+        HubPhase::Funded,
+    ];
+}
+
+fn dealing(d: &Dealing) -> Vec<u8> {
+    let mut w = Writer::default();
+    w.dealing(d);
+    w.0
+}
+
+impl Hub {
+    /// How far its opening went: none before an Open.
+    pub fn phase(&self) -> Option<HubPhase> {
+        [
+            (self.funded.is_some(), HubPhase::Funded),
+            (self.signed.is_some(), HubPhase::Signed),
+            (self.choice.is_some(), HubPhase::Chosen),
+            (self.frozen.is_some(), HubPhase::Committed),
+            (self.holder.is_some(), HubPhase::Keyed),
+            (self.base.is_some(), HubPhase::Termed),
+        ]
+        .into_iter()
+        .find_map(|(reached, phase)| reached.then_some(phase))
+    }
+
+    /// What the step that reached its phase asked: to carry out again on
+    /// resuming, as its driver may not have.
+    pub fn pending(&self) -> Result<Vec<Out>> {
+        let expect = "a phase's own";
+        let Some(phase) = self.phase() else {
+            return Ok(vec![]);
+        };
+        Ok(match phase {
+            HubPhase::Termed => vec![send(Kind::Terms, self.id(), self.base().to_bytes())],
+            HubPhase::Keyed => vec![self.to_fund(&self.holder.as_ref().expect(expect).1)?],
+            HubPhase::Committed => {
+                let (_, c, _) = self.frozen.as_ref().expect(expect);
+                vec![send(Kind::Commit, self.id(), c.encode())]
+            }
+            HubPhase::Chosen => self.chosen(),
+            HubPhase::Signed => {
+                let (_, signed) = self.signed.as_ref().expect(expect);
+                vec![send(Kind::Signed, self.id(), signed.encode())]
+            }
+            HubPhase::Funded => vec![Out::Broadcast(self.funded.clone().expect(expect))],
+        })
+    }
+
+    /// Its opening as it stores it, its secret in it: to store after each
+    /// step taken, before carrying out what it asked. Refused before an
+    /// Open, which a hub's secret is drawn for.
+    pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        let phase = self.phase().context("a hub stored before an Open")?;
+        let mut w = Writer::default();
+        w.bytes(&MAGIC);
+        w.u16(FORMAT);
+        w.u8(DERIVATION);
+        w.u8(HUB);
+        w.u8(phase as u8);
+        w.bytes(&self.secret);
+        w.quote(&self.quote);
+        w.bytes(&self.id());
+        let (open, base) = self.base.as_ref().expect("an Open");
+        w.blob(&open.encode());
+        w.blob(&base.to_bytes());
+        if let Some((keys, _)) = &self.holder {
+            w.blob(&keys.encode());
+        }
+        if let Some((_, c, hmsg)) = &self.frozen {
+            w.blob(&c.encode());
+            for hmsg in hmsg {
+                w.count(hmsg.len());
+                hmsg.iter().for_each(|h| w.bytes(h));
+            }
+        }
+        if let Some((kept, _)) = &self.choice {
+            w.blob(&wire::Choose { kept: kept.clone() }.encode());
+        }
+        if let Some((consent, signed)) = &self.signed {
+            w.blob(&consent.encode());
+            w.blob(&signed.encode());
+        }
+        if let Some(funding) = &self.funded {
+            w.tx(funding);
+        }
+        Ok(w.0)
+    }
+
+    /// Its opening as [`Hub::to_bytes`] stored it, under its trust: each
+    /// part checked as the step that took it did, but its instances, which
+    /// [`Hub::instance`] checks as it builds them again, and its gate,
+    /// whose deadline may have passed since: her consent is checked alone.
+    pub fn load(bytes: &[u8], ctx: &Context) -> Result<Self> {
+        let mut r = Reader(bytes);
+        ensure!(r.array::<4>()? == MAGIC, "not an opening's state");
+        let format = r.u16()?;
+        ensure!(format == FORMAT, "an opening's state of format {format}");
+        let derivation = r.u8()?;
+        ensure!(derivation == DERIVATION, "keys of derivation {derivation}");
+        ensure!(r.u8()? == HUB, "not a hub's opening");
+        let phase = r.u8()?;
+        let phase = *HubPhase::ALL
+            .get(usize::from(phase))
+            .with_context(|| format!("phase {phase}"))?;
+        let secret = r.array()?;
+        let mut h = Hub::with(&secret, r.quote()?);
+        let id = r.array()?;
+        let open = wire::Open::decode(r.blob()?)?;
+        let base = h.offer(id, &open, ctx)?;
+        ensure!(
+            Base::from_bytes(r.blob()?)?.digest() == base.digest(),
+            "Base other than its quote offers"
+        );
+        h.id = Some(id);
+        h.base = Some((open, base));
+        if phase >= HubPhase::Keyed {
+            let keys = wire::Keys::decode(r.blob()?)?;
+            let draft = compile(h.base(), &keys, draft_hmsg())?;
+            h.holder = Some((keys, draft));
+        }
+        if phase >= HubPhase::Committed {
+            let c = wire::Commit::decode(r.blob()?)?;
+            let frozen = h.check_fund(c.funding.clone(), c.publication.clone())?;
+            ensure!(*frozen.d.as_bytes() == c.d, "D other than its own");
+            ensure!(
+                c.dealings
+                    .iter()
+                    .zip(h.dealt())
+                    .all(|(a, d)| dealing(a) == dealing(&d.dealing)),
+                "dealings other than its own"
+            );
+            let mut hmsg: [Vec<[u8; 32]>; STAGES] = Default::default();
+            for (s, hmsg) in hmsg.iter_mut().enumerate() {
+                for _ in 0..r.count(32)? {
+                    hmsg.push(r.array()?);
+                }
+                ensure!(
+                    hmsg.len() == INSTANCES && c.commitments[s].len() == INSTANCES,
+                    "{} instances of assertion {s}",
+                    hmsg.len()
+                );
+            }
+            h.frozen = Some((frozen, c, hmsg));
+        }
+        if phase >= HubPhase::Chosen {
+            let kept = choice(r.blob()?)?;
+            let set = h.check_choose(&kept)?;
+            h.choice = Some((kept, set));
+        }
+        if phase >= HubPhase::Signed {
+            let consent = wire::Consent::decode(r.blob()?)?;
+            h.check_consent(&consent)?;
+            let (frozen, _, _) = h.frozen.as_ref().expect("F before a consent");
+            h.base()
+                .verify_owner_consent(&frozen.prefix, &consent.consent)?;
+            let signed = wire::Signed::decode(r.blob()?)?;
+            ensure!(signed.funding == frozen.funding, "F not as frozen");
+            let (_, set) = h.choice.as_ref().expect("a choice before a consent");
+            check_sigs(set, &h.keys.party.public().payment, &signed.sigs, |_| false)?;
+            h.signed = Some((consent, signed));
+        }
+        if phase >= HubPhase::Funded {
+            let funding = r.tx()?;
+            h.check_funded(&funding)?;
+            h.funded = Some(funding);
         }
         ensure!(r.0.is_empty(), "bytes past an opening's state");
         Ok(h)
