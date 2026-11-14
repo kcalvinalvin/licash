@@ -13,7 +13,7 @@ path = "src/main.rs"
 licash.workspace = true
 licash-api.workspace = true
 licash-chain-client.workspace = true
-licash-nostr.workspace = true
+licash-nostr = { workspace = true, features = ["tor"] }
 licash-notify.workspace = true
 licash-swaps.workspace = true
 licash-tor.workspace = true

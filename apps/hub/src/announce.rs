@@ -3,11 +3,18 @@
 use std::{sync::Arc, time::Duration};
 
 use licash_hub::Hub;
-use licash_nostr::{Announcement, Announcer, Role};
+use licash_nostr::{Announcement, Announcer, Role, Route};
 
-/// Announce `hub` at `urls`, named `name`, on `relays`, for good: once its
-/// first checkpoint names the network it follows.
-pub async fn announce(hub: Arc<Hub>, relays: Vec<String>, urls: Vec<String>, name: Option<String>) {
+/// Announce `hub` at `urls`, named `name`, on `relays` reached through
+/// `route`, for good: once its first checkpoint names the network it
+/// follows.
+pub async fn announce(
+    hub: Arc<Hub>,
+    relays: Vec<String>,
+    route: Route,
+    urls: Vec<String>,
+    name: Option<String>,
+) {
     let profile = loop {
         if let Some(checkpoint) = hub.checkpoint() {
             break checkpoint.profile();
@@ -19,7 +26,7 @@ pub async fn announce(hub: Arc<Hub>, relays: Vec<String>, urls: Vec<String>, nam
         network: licash_chain_client::network(profile).to_string(),
         name,
     };
-    match Announcer::new(&hub.nostr_secret(), Role::Hub, &relays).await {
+    match Announcer::new(&hub.nostr_secret(), Role::Hub, &relays, &route).await {
         Ok(announcer) => announcer.run(announcement).await,
         Err(e) => tracing::error!("announcing on Nostr: {e:#}"),
     }

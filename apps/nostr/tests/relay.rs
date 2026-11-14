@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use licash_nostr::{discover, public_key, Announcement, Announcer, Role, KIND, LIFETIME};
+use licash_nostr::{discover, public_key, Announcement, Announcer, Role, Route, KIND, LIFETIME};
 use nostr_sdk::prelude::{
     Client, EventBuilder, FinalizeEvent, Keys, Kind, MockRelay, SecretKey, Tag, Timestamp,
 };
@@ -29,7 +29,9 @@ async fn a_hub_announced_is_discovered_once_by_its_newest_announcement() {
     let url = relay.url().await.to_string();
     let relays = [url.clone()];
     let secret = [7; 32];
-    let hub = Announcer::new(&secret, Role::Hub, &relays).await.unwrap();
+    let hub = Announcer::new(&secret, Role::Hub, &relays, &Route::Direct)
+        .await
+        .unwrap();
     assert_eq!(hub.key(), public_key(&secret).unwrap());
     assert_eq!(
         hub.announce(&announcement("https://hub.example", "regtest"))
@@ -38,7 +40,9 @@ async fn a_hub_announced_is_discovered_once_by_its_newest_announcement() {
         1
     );
 
-    let found = discover(&relays, None, Role::Hub, "regtest").await.unwrap();
+    let found = discover(&relays, &Route::Direct, Role::Hub, "regtest")
+        .await
+        .unwrap();
     assert_eq!(found.len(), 1);
     assert_eq!(found[0].key, hub.key());
     assert_eq!(found[0].announcement.urls, ["https://hub.example"]);
@@ -46,11 +50,11 @@ async fn a_hub_announced_is_discovered_once_by_its_newest_announcement() {
     assert!(found[0].named_by(Some(&hub.key().to_uppercase())));
     assert!(!found[0].named_by(Some(&public_key(&[8; 32]).unwrap())));
     assert!(!found[0].named_by(None));
-    assert!(discover(&relays, None, Role::Hub, "bitcoin")
+    assert!(discover(&relays, &Route::Direct, Role::Hub, "bitcoin")
         .await
         .unwrap()
         .is_empty());
-    assert!(discover(&relays, None, Role::Swaps, "regtest")
+    assert!(discover(&relays, &Route::Direct, Role::Swaps, "regtest")
         .await
         .unwrap()
         .is_empty());
@@ -72,7 +76,9 @@ async fn a_hub_announced_is_discovered_once_by_its_newest_announcement() {
         )
         .unwrap();
     client.send_event(&newer).await.unwrap();
-    let found = discover(&relays, None, Role::Hub, "regtest").await.unwrap();
+    let found = discover(&relays, &Route::Direct, Role::Hub, "regtest")
+        .await
+        .unwrap();
     assert_eq!(found.len(), 1);
     assert_eq!(found[0].announcement.urls, ["https://new.example"]);
 }
@@ -148,7 +154,9 @@ async fn expired_malformed_and_unusable_announcements_are_skipped() {
         // The relay may refuse the expired one itself.
         client.send_event(event).await.ok();
     }
-    let found = discover(&relays, None, Role::Hub, "regtest").await.unwrap();
+    let found = discover(&relays, &Route::Direct, Role::Hub, "regtest")
+        .await
+        .unwrap();
     let mut keys_found: Vec<&str> = found.iter().map(|f| f.key.as_str()).collect();
     keys_found.sort();
     let mut expected = vec![keys[4].public_key().to_hex(), keys[5].public_key().to_hex()];
@@ -173,18 +181,24 @@ async fn a_relay_down_is_skipped_while_another_answers() {
         format!("ws://{}", listener.local_addr().unwrap())
     };
     let relays = [down.clone(), up];
-    let hub = Announcer::new(&[9; 32], Role::Hub, &relays).await.unwrap();
+    let hub = Announcer::new(&[9; 32], Role::Hub, &relays, &Route::Direct)
+        .await
+        .unwrap();
     assert_eq!(
         hub.announce(&announcement("https://hub.example", "regtest"))
             .await
             .unwrap(),
         1
     );
-    let found = discover(&relays, None, Role::Hub, "regtest").await.unwrap();
+    let found = discover(&relays, &Route::Direct, Role::Hub, "regtest")
+        .await
+        .unwrap();
     assert_eq!(found.len(), 1);
 
-    let failed = discover(&[down], None, Role::Hub, "regtest").await;
+    let failed = discover(&[down], &Route::Direct, Role::Hub, "regtest").await;
     let failed = failed.unwrap_err().to_string();
     assert!(failed.contains("no Nostr relay answered"), "{failed}");
-    assert!(discover(&[], None, Role::Hub, "regtest").await.is_err());
+    assert!(discover(&[], &Route::Direct, Role::Hub, "regtest")
+        .await
+        .is_err());
 }

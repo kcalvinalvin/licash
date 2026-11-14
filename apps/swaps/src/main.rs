@@ -12,6 +12,7 @@ use std::{
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use licash_api::Fee;
+use licash_nostr::Route;
 use licash_notify::{Message, Priority, Target};
 use licash_swaps::{Config, Provider};
 use licash_swaps_service::notify::{self, Notifier};
@@ -146,8 +147,14 @@ struct AnnounceArgs {
     announce_name: Option<String>,
 }
 
-/// The relays, URLs and name of the announcement.
-type Announcing = (Vec<String>, Vec<String>, Option<String>);
+/// The provider's announcement: the relays, how it reaches them, and the
+/// URLs and name it announces.
+struct Announcing {
+    relays: Vec<String>,
+    route: Route,
+    urls: Vec<String>,
+    name: Option<String>,
+}
 
 impl AnnounceArgs {
     /// The relays and the announcement's URLs and name, if it announces:
@@ -171,7 +178,12 @@ impl AnnounceArgs {
         if !(onion && urls.is_empty()) {
             check(&urls).context("--announce-url")?;
         }
-        Ok(Some((relays, urls, self.announce_name)))
+        Ok(Some(Announcing {
+            relays,
+            route: Route::Direct,
+            urls,
+            name: self.announce_name,
+        }))
     }
 }
 
@@ -185,14 +197,20 @@ fn check(urls: &[String]) -> anyhow::Result<()> {
     announcement.check()
 }
 
-/// Announce `onion`'s URL too, if the service announces.
-fn announce_onion(
+/// Announce through `tor`, and at `onion`'s URL too, if the service
+/// announces.
+fn announce_over(
     announcing: &mut Option<Announcing>,
+    tor: &Tor,
     onion: Option<&Onion>,
 ) -> anyhow::Result<()> {
-    if let (Some((_, urls, _)), Some(onion)) = (announcing, onion) {
-        urls.push(onion.url().to_owned());
-        check(urls).context("--onion")?;
+    let Some(announcing) = announcing else {
+        return Ok(());
+    };
+    announcing.route = Route::Tor(tor.clone());
+    if let Some(onion) = onion {
+        announcing.urls.push(onion.url().to_owned());
+        check(&announcing.urls).context("--onion")?;
     }
     Ok(())
 }
@@ -216,12 +234,13 @@ enum Command {
         #[arg(long, env = "LICASH_SWAPS_STEP", default_value_t = 10,
               value_parser = clap::value_parser!(u64).range(1..))]
         step: u64,
-        /// Reach hubs through this proxy, such as socks5h://127.0.0.1:9050
-        /// for Tor's.
+        /// Reach hubs, and Nostr relays, through this proxy, such as
+        /// socks5h://127.0.0.1:9050 for Tor's (relays through SOCKS only).
         #[arg(long, env = "LICASH_SWAPS_PROXY")]
         proxy: Option<String>,
-        /// Reach hubs through a Tor client of the provider's own, instead of
-        /// --proxy, keeping its state in `<data>/tor`.
+        /// Reach hubs and Nostr relays through a Tor client of the
+        /// provider's own, instead of --proxy, keeping its state in
+        /// `<data>/tor`.
         #[arg(long, env = "LICASH_SWAPS_TOR", conflicts_with = "proxy",
               value_parser = clap::builder::BoolishValueParser::new())]
         tor: bool,
@@ -306,6 +325,9 @@ fn command(cli: Cli) -> anyhow::Result<()> {
         } => {
             let config = terms.config()?;
             let mut announcing = announce.announcing(onion)?;
+            if let (Some(announcing), Some(proxy)) = (&mut announcing, &proxy) {
+                announcing.route = Route::socks(proxy).context("--proxy")?;
+            }
             let targets = notify.targets()?;
             // Before the Tor client creates its directory.
             let swaps = data.join("swaps.sqlite");
@@ -339,7 +361,9 @@ fn command(cli: Cli) -> anyhow::Result<()> {
                 }
                 _ => None,
             };
-            announce_onion(&mut announcing, onion.as_ref())?;
+            if let Some(client) = &client {
+                announce_over(&mut announcing, client, onion.as_ref())?;
+            }
             let notifier = if targets.is_empty() {
                 None
             } else {
@@ -427,13 +451,15 @@ async fn serve(
         tokio::spawn(notifier.run())
     });
     let stepping = tokio::spawn(licash_swaps_service::step(provider.clone(), every));
-    let announcing = announcing.map(|(relays, urls, name)| {
-        tracing::info!(relays = %relays.join(", "), urls = %urls.join(", "), "announcing on Nostr");
+    let announcing = announcing.map(|a| {
+        let (relays, urls) = (a.relays.join(", "), a.urls.join(", "));
+        tracing::info!(%relays, %urls, "announcing on Nostr");
         tokio::spawn(licash_swaps_service::announce(
             provider.clone(),
-            relays,
-            urls,
-            name,
+            a.relays,
+            a.route,
+            a.urls,
+            a.name,
         ))
     });
     axum::serve(listener, router)

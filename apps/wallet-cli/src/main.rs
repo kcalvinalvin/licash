@@ -11,7 +11,7 @@ use anyhow::{bail, Context};
 use clap::{Parser, Subcommand, ValueEnum};
 use licash::{address::Address, spend::lock_hash};
 use licash_api::Payment;
-use licash_nostr::Role;
+use licash_nostr::{Role, Route};
 use licash_transport::Http;
 use licash_wallet::{
     Error, Invoice, InvoiceState, Lock, LockState, State, Swap, SwapState, Wallet,
@@ -37,10 +37,10 @@ struct Cli {
     /// as socks5h://127.0.0.1:9050 for Tor's.
     #[arg(long, global = true, env = "LICASH_WALLET_PROXY")]
     proxy: Option<String>,
-    /// Reach hubs and swap providers through a Tor client of the wallet's
-    /// own, instead of --proxy, keeping its state in `tor` next to the
-    /// wallet file. Nostr relays still need --proxy.
-    #[arg(long, global = true, env = "LICASH_WALLET_TOR",
+    /// Reach hubs, swap providers and Nostr relays through a Tor client of
+    /// the wallet's own, instead of --proxy, keeping its state in `tor`
+    /// next to the wallet file.
+    #[arg(long, global = true, env = "LICASH_WALLET_TOR", conflicts_with = "proxy",
           value_parser = clap::builder::BoolishValueParser::new())]
     tor: bool,
     /// Print results as JSON.
@@ -241,11 +241,16 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Some(path) => path,
         None => default_path()?,
     };
-    let transport = if cli.tor {
-        let dir = path.parent().unwrap_or(Path::new(".")).join("tor");
-        Http::tor(licash_tor::Tor::new(&dir).context("a Tor client")?)
-    } else {
-        Http::new(cli.proxy.as_deref())?
+    let tor = match cli.tor {
+        true => {
+            let dir = path.parent().unwrap_or(Path::new(".")).join("tor");
+            Some(licash_tor::Tor::new(&dir).context("a Tor client")?)
+        }
+        false => None,
+    };
+    let transport = match &tor {
+        Some(tor) => Http::tor(tor.clone()),
+        None => Http::new(cli.proxy.as_deref())?,
     };
     let json = cli.json;
     match cli.command {
@@ -255,12 +260,12 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             network,
             swaps,
         } => {
-            let proxy = cli.proxy.as_deref();
-            if cli.tor && proxy.is_none() {
-                bail!("Nostr relays are reached over Tor through --proxy only");
-            }
-            let onions = cli.tor || proxy.is_some();
-            return discover(transport, proxy, onions, &relays, &network, swaps, json).await;
+            let route = match (tor, cli.proxy.as_deref()) {
+                (Some(tor), _) => Route::Tor(tor),
+                (None, Some(proxy)) => Route::socks(proxy)?,
+                (None, None) => Route::Direct,
+            };
+            return discover(transport, route, &relays, &network, swaps, json).await;
         }
         _ => {}
     }
@@ -590,16 +595,16 @@ async fn pay_invoice(
 /// each at the URLs whose info names the key that announced it.
 async fn discover(
     http: Http,
-    proxy: Option<&str>,
-    onions: bool,
+    route: Route,
     relays: &[String],
     network: &str,
     swaps: bool,
     json: bool,
 ) -> anyhow::Result<()> {
-    let socks = proxy.map(socks_address).transpose()?;
+    // Onion services are reached the way relays are, if through Tor.
+    let onions = !matches!(route, Route::Direct);
     let role = if swaps { Role::Swaps } else { Role::Hub };
-    let found = licash_nostr::discover(relays, socks, role, network).await?;
+    let found = licash_nostr::discover(relays, &route, role, network).await?;
     let http = Arc::new(http);
     let mut checks = tokio::task::JoinSet::new();
     for (i, service) in found.iter().enumerate() {
@@ -727,19 +732,6 @@ fn is_onion(url: &str) -> bool {
     let host = url.split("://").nth(1).unwrap_or(url);
     let host = host.split(['/', ':']).next().unwrap_or(host);
     host.ends_with(".onion")
-}
-
-/// The address of a `socks5[h]://host:port` proxy, which Nostr relays are
-/// reached through.
-fn socks_address(proxy: &str) -> anyhow::Result<std::net::SocketAddr> {
-    let at = proxy
-        .strip_prefix("socks5h://")
-        .or_else(|| proxy.strip_prefix("socks5://"))
-        .context("Nostr relays are reached through a socks5h:// proxy only")?;
-    std::net::ToSocketAddrs::to_socket_addrs(at.trim_end_matches('/'))
-        .with_context(|| format!("the proxy {at}"))?
-        .next()
-        .with_context(|| format!("the proxy {at}: no address"))
 }
 
 fn init(path: &Path, transport: Http, json: bool) -> anyhow::Result<()> {

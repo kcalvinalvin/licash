@@ -5,7 +5,7 @@ use std::{sync::Arc, time::Duration};
 
 use licash_hub::{Hub, Policy};
 use licash_hub_service::announce::announce;
-use licash_nostr::{discover, Role};
+use licash_nostr::{discover, Role, Route};
 use nostr_sdk::prelude::MockRelay;
 
 mod chain;
@@ -25,20 +25,25 @@ async fn a_hub_announces_its_urls_and_network_once_it_has_a_checkpoint() {
     let announcing = tokio::spawn(announce(
         hub.clone(),
         relays.clone(),
+        Route::Direct,
         urls.clone(),
         Some("a hub".into()),
     ));
 
     // Following no chain yet, it does not know its network.
     tokio::time::sleep(Duration::from_secs(2)).await;
-    let found = discover(&relays, None, Role::Hub, "regtest").await.unwrap();
+    let found = discover(&relays, &Route::Direct, Role::Hub, "regtest")
+        .await
+        .unwrap();
     assert!(found.is_empty());
 
     hub.add_checkpoint(&chain::Chain::new().checkpoint(0))
         .unwrap();
     let start = std::time::Instant::now();
     let found = loop {
-        let found = discover(&relays, None, Role::Hub, "regtest").await.unwrap();
+        let found = discover(&relays, &Route::Direct, Role::Hub, "regtest")
+            .await
+            .unwrap();
         if !found.is_empty() || start.elapsed() > Duration::from_secs(30) {
             break found;
         }

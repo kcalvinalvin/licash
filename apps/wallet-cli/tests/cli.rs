@@ -391,7 +391,7 @@ fn owners_pay_invoices_and_get_paid_over_lightning() {
 
 #[test]
 fn hubs_announced_on_nostr_are_discovered_where_they_answer_as_the_announcer() {
-    use licash_nostr::{Announcement, Announcer, Role};
+    use licash_nostr::{Announcement, Announcer, Role, Route};
     use nostr_sdk::prelude::MockRelay;
 
     let hub = Server::start(FEE);
@@ -405,7 +405,9 @@ fn hubs_announced_on_nostr_are_discovered_where_they_answer_as_the_announcer() {
             name: Some(format!("hub {}", secret[0])),
         };
         runtime.block_on(async {
-            let announcer = Announcer::new(&secret, Role::Hub, &relays).await.unwrap();
+            let announcer = Announcer::new(&secret, Role::Hub, &relays, &Route::Direct)
+                .await
+                .unwrap();
             announcer.announce(&announcement).await.unwrap();
         });
     };
@@ -530,7 +532,7 @@ fn notes_swap_between_hubs_through_a_provider() {
 
 #[test]
 fn swap_providers_announced_on_nostr_are_discovered_where_they_answer() {
-    use licash_nostr::{Announcement, Announcer, Role};
+    use licash_nostr::{Announcement, Announcer, Role, Route};
     use nostr_sdk::prelude::MockRelay;
 
     let (a, b) = (Server::start(FEE), Server::start(FEE));
@@ -545,7 +547,9 @@ fn swap_providers_announced_on_nostr_are_discovered_where_they_answer() {
             name: Some("swaps".into()),
         };
         runtime.block_on(async {
-            let announcer = Announcer::new(&secret, role, &relays).await.unwrap();
+            let announcer = Announcer::new(&secret, role, &relays, &Route::Direct)
+                .await
+                .unwrap();
             announcer.announce(&announcement).await.unwrap();
         });
     };
@@ -595,7 +599,7 @@ fn a_tor_client_of_its_own_keeps_its_state_next_to_the_wallet() {
     let balance = json(&alice, &["--tor", "balance"]);
     assert_eq!(balance, serde_json::json!([]));
     assert!(alice.parent().unwrap().join("tor").is_dir());
-    // Nostr relays are reached through a proxy only.
-    let args = ["--tor", "discover", "--relay", "ws://127.0.0.1:1"];
-    failed(wallet(&alice, &args, None), 1, "through --proxy only");
+    // Tor through the wallet's own client or through a proxy, not both.
+    let args = ["--tor", "--proxy", "socks5h://127.0.0.1:9050", "balance"];
+    failed(wallet(&alice, &args, None), 2, "cannot be used with");
 }

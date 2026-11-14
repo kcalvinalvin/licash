@@ -1,6 +1,7 @@
 //! Tor for the applications, through a Tor client of their own (Arti):
-//! HTTP(S) requests over it, to onion services and to the clear web alike,
-//! and an axum router served as an onion service of their own.
+//! HTTP(S) requests and streams over it, to onion services and to the
+//! clear web alike, and an axum router served as an onion service of their
+//! own.
 //!
 //! Arti may end the process if the Tor network's consensus declares its
 //! version obsolete.
@@ -17,6 +18,7 @@ use hyper::{
     Method, Request, Uri,
 };
 use hyper_util::rt::TokioIo;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_rustls::{rustls, TlsConnector};
 use tor_rtcompat::PreferredRuntime;
 
@@ -76,13 +78,25 @@ impl Tor {
         max: usize,
     ) -> Result<(u16, Vec<u8>), String> {
         let (target, request) = prepare(url, body)?;
+        let stream = self.stream(target).await?;
+        send(TokioIo::new(stream), request, max).await
+    }
+
+    /// A stream over Tor to the host and port of `url`, an `http[s]://` or
+    /// `ws[s]://` URL, within TLS for `https://` and `wss://`.
+    pub async fn connect(&self, url: &str) -> Result<Box<dyn Stream>, String> {
+        let uri: Uri = url.parse().map_err(|e| format!("not a URL: {e}"))?;
+        self.stream(Target::of(&uri)?).await
+    }
+
+    async fn stream(&self, target: Target) -> Result<Box<dyn Stream>, String> {
         let stream = self
             .client
             .connect((target.host.as_str(), target.port))
             .await
             .map_err(|e| format!("over Tor: {e}"))?;
-        if !target.https {
-            return send(TokioIo::new(stream), request, max).await;
+        if !target.tls {
+            return Ok(Box::new(stream));
         }
         let name = rustls::pki_types::ServerName::try_from(target.host)
             .map_err(|e| format!("not a TLS name: {e}"))?;
@@ -91,30 +105,50 @@ impl Tor {
             .connect(name, stream)
             .await
             .map_err(|e| format!("TLS: {e}"))?;
-        send(TokioIo::new(stream), request, max).await
+        Ok(Box::new(stream))
     }
 }
 
-/// Where a request goes.
+/// A byte stream over Tor.
+pub trait Stream: AsyncRead + AsyncWrite + Send + Unpin {}
+
+impl<T: AsyncRead + AsyncWrite + Send + Unpin> Stream for T {}
+
+/// Where a stream goes.
 #[derive(Debug, PartialEq, Eq)]
 struct Target {
     host: String,
     port: u16,
-    https: bool,
+    tls: bool,
+}
+
+impl Target {
+    /// The host of `uri`, and its port or its scheme's, within TLS for
+    /// `https://` and `wss://`.
+    fn of(uri: &Uri) -> Result<Self, String> {
+        let tls = match uri.scheme_str() {
+            Some("https" | "wss") => true,
+            Some("http" | "ws") => false,
+            _ => return Err(format!("not an http[s]:// or ws[s]:// URL: {uri}")),
+        };
+        let authority = uri.authority().ok_or("a URL without a host")?;
+        Ok(Self {
+            host: authority.host().to_owned(),
+            port: authority.port_u16().unwrap_or(if tls { 443 } else { 80 }),
+            tls,
+        })
+    }
 }
 
 /// Where the request for `url` goes, and the request: a POST of `body` as
 /// JSON if given, else a GET.
 fn prepare(url: &str, body: Option<Vec<u8>>) -> Result<(Target, Request<Full<Bytes>>), String> {
     let uri: Uri = url.parse().map_err(|e| format!("not a URL: {e}"))?;
-    let https = match uri.scheme_str() {
-        Some("https") => true,
-        Some("http") => false,
-        _ => return Err(format!("not an http:// or https:// URL: {url}")),
-    };
+    if !matches!(uri.scheme_str(), Some("http" | "https")) {
+        return Err(format!("not an http:// or https:// URL: {url}"));
+    }
+    let target = Target::of(&uri)?;
     let authority = uri.authority().ok_or("a URL without a host")?;
-    let host = authority.host().to_owned();
-    let port = authority.port_u16().unwrap_or(if https { 443 } else { 80 });
     let path = uri.path_and_query().map_or("/", |p| p.as_str());
     let request = Request::builder()
         .uri(path)
@@ -128,7 +162,7 @@ fn prepare(url: &str, body: Option<Vec<u8>>) -> Result<(Target, Request<Full<Byt
         None => request.method(Method::GET).body(Full::default()),
     };
     let request = request.map_err(|e| e.to_string())?;
-    Ok((Target { host, port, https }, request))
+    Ok((target, request))
 }
 
 /// `request` over `io`, one HTTP/1.1 exchange: the answer's status and
@@ -162,11 +196,11 @@ where
 mod tests {
     use super::*;
 
-    fn target(host: &str, port: u16, https: bool) -> Target {
+    fn target(host: &str, port: u16, tls: bool) -> Target {
         Target {
             host: host.into(),
             port,
-            https,
+            tls,
         }
     }
 
@@ -196,12 +230,29 @@ mod tests {
     fn only_http_and_https_urls_are_requested() {
         for url in [
             "ftp://hub.example/",
+            "ws://hub.example/",
             "socks5h://127.0.0.1:9050",
             "/v1/info",
             "hub",
         ] {
             assert!(prepare(url, None).is_err(), "{url}");
         }
+    }
+
+    #[test]
+    fn streams_go_to_the_host_and_port_of_their_url() {
+        let at = |url: &str| Target::of(&url.parse().unwrap());
+        let onion = "2gzyxa5ihm7nsggfxnu52rck2vv4rvmdlkiu3zzui5du4xyclen53wid.onion";
+        assert_eq!(at(&format!("ws://{onion}")), Ok(target(onion, 80, false)));
+        let relay = "relay.example";
+        assert_eq!(at("wss://relay.example/"), Ok(target(relay, 443, true)));
+        assert_eq!(
+            at("wss://relay.example:7777"),
+            Ok(target(relay, 7777, true))
+        );
+        assert_eq!(at("https://relay.example"), Ok(target(relay, 443, true)));
+        assert!(at("ftp://relay.example").is_err());
+        assert!(at("/v1/info").is_err());
     }
 
     /// The Tor Project's check that a request came over Tor.

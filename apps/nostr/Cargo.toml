@@ -7,11 +7,20 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+async-wsocket = { version = "0.17", default-features = false, optional = true }
+futures-util = { version = "0.3", default-features = false, features = ["alloc", "sink"], optional = true }
+licash-tor = { workspace = true, optional = true }
 nostr-sdk = "0.45.6"
 serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["time"] }
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["handshake"], optional = true }
 tracing.workspace = true
 
 [dev-dependencies]
 nostr-sdk = { version = "0.45.6", features = ["local-relay"] }
+tempfile = "3.27"
+
+[features]
+# Reach relays through a Tor client of the application's own.
+tor = ["dep:async-wsocket", "dep:futures-util", "dep:licash-tor", "dep:tokio-tungstenite"]

@@ -8,7 +8,7 @@ use licash_api::{
     Info,
 };
 use licash_e2e::{until, Eco, Wallet};
-use licash_nostr::{discover, Role};
+use licash_nostr::{discover, Role, Route};
 use licash_wallet::{Lock, LockState, SwapState};
 use rand_core::{OsRng, RngCore};
 
@@ -39,7 +39,7 @@ async fn wallets_swap_between_hubs_through_a_provider_they_discover() -> anyhow:
     let (hub1, hub2) = (eco.hub(1), eco.hub(2));
     let relays = [eco.relay().to_owned()];
     let found = until("the provider announced", 120, || async {
-        let found = discover(&relays, None, Role::Swaps, "regtest").await?;
+        let found = discover(&relays, &Route::Direct, Role::Swaps, "regtest").await?;
         Ok((!found.is_empty()).then_some(found))
     })
     .await?;

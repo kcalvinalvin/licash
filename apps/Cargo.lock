@@ -2779,10 +2779,15 @@ name = "licash-nostr"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "async-wsocket",
+ "futures-util",
+ "licash-tor",
  "nostr-sdk",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
+ "tokio-tungstenite",
  "tracing",
 ]
 

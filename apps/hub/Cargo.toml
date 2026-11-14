@@ -14,7 +14,7 @@ licash.workspace = true
 licash-api.workspace = true
 licash-chain-client.workspace = true
 licash-hub.workspace = true
-licash-nostr.workspace = true
+licash-nostr = { workspace = true, features = ["tor"] }
 licash-notify.workspace = true
 licash-tor.workspace = true
 anyhow.workspace = true

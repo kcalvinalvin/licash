@@ -19,7 +19,7 @@ use licash_hub_service::{
     notify::{self, Notifier},
     watch::watch,
 };
-use licash_nostr::Announcement;
+use licash_nostr::{Announcement, Route};
 use licash_notify::{Message, Priority, Target};
 use licash_tor::{Onion, Tor};
 use tracing_subscriber::EnvFilter;
@@ -160,7 +160,12 @@ impl AnnounceArgs {
         if !(onion && urls.is_empty()) {
             check(&urls).context("--announce-url")?;
         }
-        Ok(Some((relays, urls, self.announce_name)))
+        Ok(Some(Announcing {
+            relays,
+            route: Route::Direct,
+            urls,
+            name: self.announce_name,
+        }))
     }
 }
 
@@ -174,20 +179,32 @@ fn check(urls: &[String]) -> anyhow::Result<()> {
     announcement.check()
 }
 
-/// Announce `onion`'s URL too, if the service announces.
-fn announce_onion(
+/// Announce through `tor`, and at `onion`'s URL too, if the service
+/// announces.
+fn announce_over(
     announcing: &mut Option<Announcing>,
+    tor: &Tor,
     onion: Option<&Onion>,
 ) -> anyhow::Result<()> {
-    if let (Some((_, urls, _)), Some(onion)) = (announcing, onion) {
-        urls.push(onion.url().to_owned());
-        check(urls).context("--onion")?;
+    let Some(announcing) = announcing else {
+        return Ok(());
+    };
+    announcing.route = Route::Tor(tor.clone());
+    if let Some(onion) = onion {
+        announcing.urls.push(onion.url().to_owned());
+        check(&announcing.urls).context("--onion")?;
     }
     Ok(())
 }
 
-/// The relays, URLs and name of the hub's announcement.
-type Announcing = (Vec<String>, Vec<String>, Option<String>);
+/// The hub's announcement: the relays, how it reaches them, and the URLs
+/// and name it announces.
+struct Announcing {
+    relays: Vec<String>,
+    route: Route,
+    urls: Vec<String>,
+    name: Option<String>,
+}
 
 /// What the hub charges and the locks it admits.
 #[derive(Args)]
@@ -393,7 +410,7 @@ enum Command {
         announce: Box<AnnounceArgs>,
         /// Also serve the API as an onion service of a Tor client of the
         /// hub's own, at the same address on every start (its key in
-        /// `<data>/tor`), and announce it.
+        /// `<data>/tor`), and announce it, reaching relays through Tor too.
         #[arg(long, env = "LICASH_HUB_ONION",
               value_parser = clap::builder::BoolishValueParser::new())]
         onion: bool,
@@ -502,16 +519,17 @@ fn command(cli: Cli) -> anyhow::Result<()> {
             let router = licash_hub_service::router(hub.clone(), gateway.clone());
             let runtime = tokio::runtime::Runtime::new()?;
             let _entered = runtime.enter();
-            let onion = match onion {
+            // Served until the hub stops.
+            let _onion = match onion {
                 true => {
                     let tor = Tor::new(&cli.data.join("tor")).context("a Tor client")?;
                     let onion = tor.serve("licash-hub", router.clone())?;
                     tracing::info!(url = onion.url(), "serving as an onion service");
+                    announce_over(&mut announcing, &tor, Some(&onion))?;
                     Some(onion)
                 }
                 false => None,
             };
-            announce_onion(&mut announcing, onion.as_ref())?;
             let tasks = Tasks {
                 chain,
                 notifier,
@@ -585,9 +603,10 @@ async fn serve(
         tracing::info!("running a Lightning gateway");
         tokio::spawn(gateway.run())
     });
-    let announcing = announcing.map(|(relays, urls, name)| {
-        tracing::info!(relays = %relays.join(", "), urls = %urls.join(", "), "announcing on Nostr");
-        tokio::spawn(announce(hub.clone(), relays, urls, name))
+    let announcing = announcing.map(|a| {
+        let (relays, urls) = (a.relays.join(", "), a.urls.join(", "));
+        tracing::info!(%relays, %urls, "announcing on Nostr");
+        tokio::spawn(announce(hub.clone(), a.relays, a.route, a.urls, a.name))
     });
     axum::serve(listener, router)
         .with_graceful_shutdown(shutdown())

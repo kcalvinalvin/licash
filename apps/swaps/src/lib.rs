@@ -17,7 +17,7 @@ use licash_api::{
     swaps::{self, Request, Swap},
     Code, Problem,
 };
-use licash_nostr::{Announcement, Announcer, Role};
+use licash_nostr::{Announcement, Announcer, Role, Route};
 use licash_swaps::Provider;
 use licash_wallet::Transport;
 use tower_http::trace::TraceLayer;
@@ -134,11 +134,12 @@ pub fn network<T: Transport>(provider: &Provider<T>) -> Option<String> {
     Some(licash_chain_client::network(checkpoint.profile()).to_string())
 }
 
-/// Announce `provider` at `urls`, named `name`, on `relays`, for good: once
-/// one of its hubs names the network it follows.
+/// Announce `provider` at `urls`, named `name`, on `relays` reached through
+/// `route`, for good: once one of its hubs names the network it follows.
 pub async fn announce<T: Transport + 'static>(
     provider: Arc<Provider<T>>,
     relays: Vec<String>,
+    route: Route,
     urls: Vec<String>,
     name: Option<String>,
 ) {
@@ -157,7 +158,7 @@ pub async fn announce<T: Transport + 'static>(
         network,
         name,
     };
-    match Announcer::new(&secret, Role::Swaps, &relays).await {
+    match Announcer::new(&secret, Role::Swaps, &relays, &route).await {
         Ok(announcer) => announcer.run(announcement).await,
         Err(e) => tracing::error!("announcing on Nostr: {e:#}"),
     }

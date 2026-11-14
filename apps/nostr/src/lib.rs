@@ -11,6 +11,12 @@
 //! Anyone may announce any URL: a client uses one only once the service
 //! there names the key that announced it ([`Found::named_by`]), as a hub
 //! does in its `/v1/info`.
+//!
+//! Relays are reached directly, through a SOCKS5 proxy, or, with the `tor`
+//! feature, through a Tor client of the application's own ([`Route`]).
+
+#[cfg(feature = "tor")]
+mod tor;
 
 use std::{collections::HashMap, net::SocketAddr, time::Duration};
 
@@ -32,6 +38,10 @@ pub const LIFETIME: Duration = Duration::from_secs(2 * 60 * 60);
 
 /// How long to wait for relays to connect, take an event or answer.
 const TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The same through Tor, whose circuits take longer, as may its first
+/// connection.
+const TOR_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// How soon to try again after no relay took an announcement.
 const RETRY: Duration = Duration::from_secs(60);
@@ -131,14 +141,50 @@ fn keys(secret: &[u8; 32]) -> anyhow::Result<Keys> {
     Ok(Keys::new(secret))
 }
 
-/// A client of `relays`, through `proxy` if given (a SOCKS5 proxy, such as
-/// Tor's), not connected yet.
-async fn client(relays: &[String], proxy: Option<SocketAddr>) -> anyhow::Result<Client> {
-    ensure!(!relays.is_empty(), "no Nostr relay");
-    let mut builder = Client::builder();
-    if let Some(proxy) = proxy {
-        builder = builder.proxy(Proxy::all(proxy));
+/// How a client reaches the relays.
+#[derive(Clone, Default)]
+pub enum Route {
+    #[default]
+    Direct,
+    /// Through a SOCKS5 proxy, such as Tor's.
+    Socks(SocketAddr),
+    /// Through a Tor client of the application's own.
+    #[cfg(feature = "tor")]
+    Tor(licash_tor::Tor),
+}
+
+impl Route {
+    /// Through the `socks5[h]://host:port` proxy `url`.
+    pub fn socks(url: &str) -> anyhow::Result<Self> {
+        let at = url
+            .strip_prefix("socks5h://")
+            .or_else(|| url.strip_prefix("socks5://"))
+            .context("Nostr relays are reached through a socks5h:// proxy only")?;
+        let address = std::net::ToSocketAddrs::to_socket_addrs(at.trim_end_matches('/'))
+            .with_context(|| format!("the proxy {at}"))?
+            .next()
+            .with_context(|| format!("the proxy {at}: no address"))?;
+        Ok(Self::Socks(address))
     }
+
+    /// How long to wait for relays to connect, take an event or answer.
+    fn timeout(&self) -> Duration {
+        match self {
+            Self::Direct => TIMEOUT,
+            _ => TOR_TIMEOUT,
+        }
+    }
+}
+
+/// A client of `relays`, through `route`, not connected yet.
+async fn client(relays: &[String], route: &Route) -> anyhow::Result<Client> {
+    ensure!(!relays.is_empty(), "no Nostr relay");
+    let builder = match route {
+        Route::Direct => Client::builder(),
+        Route::Socks(proxy) => Client::builder().proxy(Proxy::all(*proxy)),
+        #[cfg(feature = "tor")]
+        Route::Tor(tor) => Client::builder().websocket_transport(tor::OverTor(tor.clone())),
+    };
     let client = builder.build();
     for relay in relays {
         client
@@ -157,12 +203,17 @@ pub struct Announcer {
 }
 
 impl Announcer {
-    /// An announcer of `role` on `relays`, signing with `secret`. It keeps
-    /// connecting to the relays down.
-    pub async fn new(secret: &[u8; 32], role: Role, relays: &[String]) -> anyhow::Result<Self> {
+    /// An announcer of `role` on `relays`, reached through `route`,
+    /// signing with `secret`. It keeps connecting to the relays down.
+    pub async fn new(
+        secret: &[u8; 32],
+        role: Role,
+        relays: &[String],
+        route: &Route,
+    ) -> anyhow::Result<Self> {
         let keys = keys(secret)?;
-        let client = client(relays, None).await?;
-        client.connect().and_wait(TIMEOUT).await;
+        let client = client(relays, route).await?;
+        client.connect().and_wait(route.timeout()).await;
         Ok(Self { client, keys, role })
     }
 
@@ -226,17 +277,17 @@ impl Announcer {
 }
 
 /// The announcements of `role` for `network` on `relays`, asked through
-/// `proxy` if given: the newest of each key, newest first, unexpired and
+/// `route`: the newest of each key, newest first, unexpired and
 /// well formed. Relays that do not answer in time are skipped; fails only
 /// if none answered.
 pub async fn discover(
     relays: &[String],
-    proxy: Option<SocketAddr>,
+    route: &Route,
     role: Role,
     network: &str,
 ) -> anyhow::Result<Vec<Found>> {
-    let client = client(relays, proxy).await?;
-    let connected = client.try_connect().timeout(TIMEOUT).await;
+    let client = client(relays, route).await?;
+    let connected = client.try_connect().timeout(route.timeout()).await;
     if connected.success.is_empty() {
         let failed: Vec<String> = connected
             .failed
@@ -256,7 +307,7 @@ pub async fn discover(
         .into_keys()
         .map(|relay| (relay, vec![filter.clone()]))
         .collect();
-    let events = client.fetch_events(targets).timeout(TIMEOUT).await;
+    let events = client.fetch_events(targets).timeout(route.timeout()).await;
     client.shutdown().await;
     let events = events.context("ask the Nostr relays")?;
     let mut newest: HashMap<String, Found> = HashMap::new();

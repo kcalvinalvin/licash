@@ -2,7 +2,7 @@
 //! `apps/e2e/run.sh`, which runs these.
 
 use licash_e2e::{until, Eco};
-use licash_nostr::{discover, Role};
+use licash_nostr::{discover, Role, Route};
 
 #[tokio::test]
 #[ignore = "needs the stack of apps/e2e/run.sh"]
@@ -10,7 +10,7 @@ async fn wallets_discover_the_hubs_announced_on_nostr() -> anyhow::Result<()> {
     let eco = Eco::up().await?;
     let relays = [eco.relay().to_owned()];
     let found = until("both hubs announced", 120, || async {
-        let found = discover(&relays, None, Role::Hub, "regtest").await?;
+        let found = discover(&relays, &Route::Direct, Role::Hub, "regtest").await?;
         Ok((found.len() == 2).then_some(found))
     })
     .await?;
@@ -26,7 +26,7 @@ async fn wallets_discover_the_hubs_announced_on_nostr() -> anyhow::Result<()> {
         let other = eco.info(eco.hub(3 - n)).await?;
         assert!(!hub.named_by(other.nostr.as_deref()));
     }
-    assert!(discover(&relays, None, Role::Hub, "bitcoin")
+    assert!(discover(&relays, &Route::Direct, Role::Hub, "bitcoin")
         .await?
         .is_empty());
 
