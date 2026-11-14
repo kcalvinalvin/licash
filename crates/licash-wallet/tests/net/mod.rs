@@ -77,6 +77,11 @@ impl Net {
     /// A new hub at `url`, charging `fee` on spends and in each branch of
     /// a lock, at height 3 of its chain.
     pub fn start(&self, url: &str, fee: Fee) {
+        self.start_timed(url, fee, TIMING);
+    }
+
+    /// [`Net::start`], its locks timed by `timing`.
+    pub fn start_timed(&self, url: &str, fee: Fee, timing: Timing) {
         let dir = tempfile::tempdir().unwrap();
         let (seed, db) = (dir.path().join("seed"), dir.path().join("hub.sqlite"));
         Hub::init(&seed, &db, MAX_POW).unwrap();
@@ -84,7 +89,7 @@ impl Net {
             spend: fee,
             lock: fee,
             refund: fee,
-            timing: TIMING,
+            timing,
         };
         let hub = Arc::new(Hub::open(&seed, &db, policy).unwrap());
         let chain = chain::Chain::new();
@@ -114,6 +119,26 @@ impl Net {
             hub.observe(chain.height(), &block).unwrap();
         }
         assert!(hub.synced(chain.height(), &chain.tip()).unwrap());
+    }
+
+    /// Mine a block holding `txs` on the chain of the hub at `url`, which
+    /// its hub scans.
+    #[allow(dead_code)]
+    pub fn confirm(&self, url: &str, txs: Vec<bitcoin::Transaction>) {
+        let (hub, chain) = {
+            let sites = self.sites.lock().unwrap();
+            (sites[url].hub.clone().unwrap(), sites[url].chain.clone())
+        };
+        let mut chain = chain.lock().unwrap();
+        let block = chain.mine_with(None, txs).clone();
+        hub.observe(chain.height(), &block).unwrap();
+        assert!(hub.synced(chain.height(), &chain.tip()).unwrap());
+    }
+
+    /// The chain of the hub at `url`, as a wallet reads it.
+    #[allow(dead_code)]
+    pub fn view(&self, url: &str) -> View {
+        View(self.sites.lock().unwrap()[url].chain.clone())
     }
 
     /// `url` serves the hub at `at` too.
@@ -380,4 +405,51 @@ fn mint(keys: &IssuerKeys, keyset: &Keyset, to: &Address, denom: u64) -> (Note, 
     )
     .unwrap();
     (note, d)
+}
+
+/// A hub's chain, as a wallet reads it: without filters.
+#[derive(Clone)]
+#[allow(dead_code)]
+pub struct View(Arc<Mutex<chain::Chain>>);
+
+#[allow(dead_code)]
+impl View {
+    pub fn height(&self) -> u32 {
+        self.0.lock().unwrap().height()
+    }
+}
+
+impl licash_wallet::Blocks for View {
+    fn height(&self) -> impl std::future::Future<Output = Result<u32, String>> + Send {
+        std::future::ready(Ok(self.0.lock().unwrap().height()))
+    }
+
+    fn hash(
+        &self,
+        height: u32,
+    ) -> impl std::future::Future<Output = Result<bitcoin::BlockHash, String>> + Send {
+        let chain = self.0.lock().unwrap();
+        let hash = chain.blocks.get(height as usize).map(|b| b.block_hash());
+        std::future::ready(hash.ok_or_else(|| format!("no block {height}")))
+    }
+
+    fn filter(
+        &self,
+        _: &bitcoin::BlockHash,
+    ) -> impl std::future::Future<Output = Result<Option<Vec<u8>>, String>> + Send {
+        std::future::ready(Ok(None))
+    }
+
+    fn block(
+        &self,
+        hash: &bitcoin::BlockHash,
+    ) -> impl std::future::Future<Output = Result<bitcoin::Block, String>> + Send {
+        let chain = self.0.lock().unwrap();
+        let block = chain
+            .blocks
+            .iter()
+            .find(|b| b.block_hash() == *hash)
+            .cloned();
+        std::future::ready(block.ok_or_else(|| format!("no block {hash}")))
+    }
 }

@@ -41,6 +41,11 @@ impl Chain {
 
     /// Mine a block on the tip, with an activation of `secret` if given.
     pub fn mine(&mut self, secret: Option<[u8; 32]>) -> &Block {
+        self.mine_with(secret, Vec::new())
+    }
+
+    /// [`Chain::mine`], the block holding `txs` too, unchecked.
+    pub fn mine_with(&mut self, secret: Option<[u8; 32]>, txs: Vec<Transaction>) -> &Block {
         self.mined += 1;
         let previous = self.blocks.last().unwrap().header;
         let mut output = vec![TxOut {
@@ -73,7 +78,7 @@ impl Chain {
                 bits: CompactTarget::from_consensus(0x207f_ffff),
                 nonce: 0,
             },
-            txdata: vec![coinbase],
+            txdata: std::iter::once(coinbase).chain(txs).collect(),
         };
         block.header.merkle_root = block.compute_merkle_root().unwrap();
         while block.header.validate_pow(block.header.target()).is_err() {

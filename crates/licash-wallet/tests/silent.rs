@@ -888,7 +888,7 @@ async fn a_wallet_file_of_the_first_version_gains_silent_payments() {
     assert_eq!(version(&path), 1);
     let wallet = Wallet::open(&path, Via(hub.clone())).unwrap();
     let address = wallet.silent_keys().address();
-    assert_eq!(version(&path), 4);
+    assert_eq!(version(&path), 5);
     assert_eq!(wallet.hubs().unwrap().len(), 1);
     assert_eq!(wallet.silent_next().unwrap(), None);
     wallet.watch_silent(HUB, 1).unwrap();
@@ -903,14 +903,14 @@ async fn a_wallet_file_of_the_first_version_gains_silent_payments() {
     // A newer version's file is refused, untouched.
     rusqlite::Connection::open(&path)
         .unwrap()
-        .pragma_update(None, "user_version", 5)
+        .pragma_update(None, "user_version", 6)
         .unwrap();
     match Wallet::open(&path, Via(hub)) {
-        Err(Error::Setup(why)) => assert!(why.contains("schema 5"), "{why}"),
+        Err(Error::Setup(why)) => assert!(why.contains("schema 6"), "{why}"),
         Err(other) => panic!("{other:?}"),
         Ok(_) => panic!("opened"),
     }
-    assert_eq!(version(&path), 5);
+    assert_eq!(version(&path), 6);
 }
 
 #[tokio::test]

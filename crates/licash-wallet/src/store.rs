@@ -17,7 +17,47 @@ const VERSION: i64 = 1 + MIGRATIONS.len() as i64;
 
 /// What each version adds to the one before: the first takes 1 to 2. A
 /// file of an older version is brought up to date when opened.
-const MIGRATIONS: &[&str] = &[SILENT, FALLBACK, UNTWEAKED];
+const MIGRATIONS: &[&str] = &[SILENT, FALLBACK, UNTWEAKED, PAYOUTS];
+
+/// Version 5: notes paid out on Bitcoin through a swap provider.
+const PAYOUTS: &str = "
+-- Payouts by the hash of a preimage only the wallet knows, recorded with
+-- it, the key that claims the coin and the payee before the lock to the
+-- provider (in locks, under that hash) is made at from_hub. The provider
+-- locks a coin on chain under the same hash, which the wallet claims
+-- paying script (address, as shown) exactly amount, its fee the rest of
+-- the coin, budget at most. fee is the provider's, its miners' included.
+-- refund_key and timeout are the provider's terms once it took it; the
+-- funding columns the coin once found where the provider says, worth
+-- value. claim_tx is the claim once made, broadcast until it confirms:
+-- the preimage is public from revealed_at on. scanned is the last block
+-- looked in for the coin's spend, spent_height the block of the claim.
+CREATE TABLE payouts (
+    hash BLOB PRIMARY KEY,
+    provider TEXT NOT NULL,
+    preimage BLOB NOT NULL,
+    claim_key BLOB NOT NULL,
+    from_hub INTEGER NOT NULL REFERENCES hubs (id),
+    address TEXT NOT NULL,
+    script BLOB NOT NULL,
+    amount INTEGER NOT NULL,
+    budget INTEGER NOT NULL,
+    fee INTEGER NOT NULL,
+    refund_key BLOB,
+    timeout INTEGER,
+    funding_txid BLOB,
+    funding_vout INTEGER,
+    funding_height INTEGER,
+    value INTEGER,
+    claim_tx BLOB,
+    revealed_at INTEGER,
+    scanned INTEGER,
+    spent_height INTEGER,
+    created_at INTEGER NOT NULL,
+    done_at INTEGER,
+    failed TEXT
+) STRICT;
+";
 
 /// Version 4: blocks looked in without tweaks, for fallback addresses and
 /// the coins held only. None in a file of an older version: it looked in

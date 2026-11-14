@@ -85,7 +85,7 @@ fn hash_id(hash: &str) -> Result<[u8; 32], Error> {
 }
 
 /// A secret key drawn at random.
-fn random_key() -> SecretKey {
+pub(crate) fn random_key() -> SecretKey {
     loop {
         let mut bytes = [0; 32];
         OsRng.fill_bytes(&mut bytes);
@@ -95,7 +95,7 @@ fn random_key() -> SecretKey {
     }
 }
 
-fn x_only(key: &SecretKey) -> XOnlyPublicKey {
+pub(crate) fn x_only(key: &SecretKey) -> XOnlyPublicKey {
     key.x_only_public_key(&Secp256k1::new()).0
 }
 

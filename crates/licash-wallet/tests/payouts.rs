@@ -1,0 +1,666 @@
+//! Payouts of notes on Bitcoin, through a provider played here: it locks
+//! the coins the tests say on the hub's own chain, which the wallet reads.
+
+#[allow(dead_code)]
+mod net;
+
+use std::{
+    collections::HashMap,
+    str::FromStr,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
+};
+
+use bitcoin::{
+    hashes::Hash, secp256k1::SecretKey, transaction, Amount, FeeRate, OutPoint, ScriptBuf,
+    Transaction, TxIn, TxOut, Txid,
+};
+use licash::spend::ChainProfile;
+use licash_api::{
+    swaps::{self, ChainRequest, ChainSwap},
+    Code, Fee, Funding, Hex, Problem,
+};
+use licash_hub::Timing;
+use licash_onchain::deposit::Htlc;
+use licash_wallet::{
+    Error, LockState, Payout, PayoutState, Response, Transport, Wallet, CLAIM_ROOM,
+};
+use net::{Link, Net, View, TIMING};
+
+const A: &str = "http://a.test";
+const PROVIDER: &str = "http://payouts.test";
+const FEE: Fee = Fee { base: 1, ppm: 0 };
+/// Locks of up to 141 blocks, room for a payout's coin to time out first.
+const TIMED: Timing = Timing {
+    window: 144,
+    ..TIMING
+};
+const TERMS: swaps::Chain = swaps::Chain {
+    fee: Fee {
+        base: 1,
+        ppm: 10_000,
+    },
+    miner: 10,
+    rate: 1_000,
+    min: 500,
+    max: 5_000,
+    margin: 36,
+};
+/// A regtest address, P2WPKH: BIP173's.
+const PAYEE: &str = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
+/// Allowed on top of each payout's amount: room for the claim's fee.
+const MAX_FEE: u64 = 2_000;
+const ONE_SAT: FeeRate = FeeRate::from_sat_per_vb_u32(1);
+
+/// A payout the provider took: its answer, and the coin's terms.
+struct Taken {
+    answer: ChainSwap,
+    htlc: Htlc,
+    lock: String,
+}
+
+/// The provider, as its clients reach it: the tests lock its coins.
+struct Desk {
+    net: Arc<Net>,
+    wallet: Wallet<Link>,
+    key: SecretKey,
+    terms: Mutex<Option<swaps::Chain>>,
+    decline: AtomicBool,
+    /// The timeout it names, if not the lock's expiry less its margin.
+    timeout: Mutex<Option<u32>>,
+    taken: Mutex<HashMap<Vec<u8>, Taken>>,
+}
+
+impl Desk {
+    fn info(&self) -> swaps::Info {
+        swaps::Info {
+            address: self.wallet.address(),
+            fee: TERMS.fee,
+            min: 1,
+            max: 0,
+            margin: 6,
+            hubs: vec![swaps::Hub {
+                address: self.net.hub(A).info().address,
+                max: 0,
+            }],
+            nostr: None,
+            chain: *self.terms.lock().unwrap(),
+        }
+    }
+
+    async fn take(&self, request: ChainRequest) -> Result<ChainSwap, Problem> {
+        if self.decline.load(Ordering::Relaxed) {
+            return Err(Problem::new(Code::Declined, "not today"));
+        }
+        if let Some(taken) = self.taken.lock().unwrap().get(&request.lock.0) {
+            return Ok(taken.answer.clone());
+        }
+        let lock = hex::encode(&request.lock.0);
+        let incoming = self.wallet.incoming(A, &lock).await;
+        let incoming = incoming.map_err(|e| Problem::new(Code::Declined, e.to_string()))?;
+        if incoming.amount < TERMS.pays(request.value) {
+            return Err(Problem::new(Code::Declined, "the lock pays too little"));
+        }
+        let claim = request.claim().unwrap();
+        let htlc = Htlc {
+            hash: incoming.hash,
+            claim: bitcoin::secp256k1::XOnlyPublicKey::from_slice(&claim).unwrap(),
+            refund: self.refund_key(),
+            timeout: self
+                .timeout
+                .lock()
+                .unwrap()
+                .unwrap_or(incoming.expiry - TERMS.margin),
+        };
+        let answer = ChainSwap {
+            id: request.lock.clone(),
+            state: swaps::State::Accepted,
+            value: request.value,
+            refund: Hex(self.refund_key().serialize().to_vec()),
+            timeout: htlc.timeout,
+            funding: None,
+            reason: None,
+        };
+        let taken = Taken {
+            answer: answer.clone(),
+            htlc,
+            lock,
+        };
+        self.taken.lock().unwrap().insert(request.lock.0, taken);
+        Ok(answer)
+    }
+
+    fn refund_key(&self) -> bitcoin::secp256k1::XOnlyPublicKey {
+        self.key
+            .x_only_public_key(&bitcoin::secp256k1::Secp256k1::new())
+            .0
+    }
+
+    async fn serve(&self, path: &str, body: Option<Vec<u8>>) -> Result<Response, String> {
+        let answer = match (path, body) {
+            (swaps::SWAPS_INFO, None) => Ok(serde_json::to_vec(&self.info()).unwrap()),
+            (swaps::CHAIN_SWAPS, Some(body)) => {
+                let request: ChainRequest = serde_json::from_slice(&body).unwrap();
+                self.take(request)
+                    .await
+                    .map(|swap| serde_json::to_vec(&swap).unwrap())
+            }
+            _ => Err(Problem::invalid("no such route")),
+        };
+        Ok(match answer {
+            Ok(body) => Response { status: 200, body },
+            Err(problem) => Response {
+                status: problem.code.status(),
+                body: serde_json::to_vec(&problem).unwrap(),
+            },
+        })
+    }
+}
+
+/// What the tests have the provider do on chain.
+impl Desk {
+    /// The one payout taken.
+    fn with<R>(&self, f: impl FnOnce(&mut Taken) -> R) -> R {
+        let mut taken = self.taken.lock().unwrap();
+        assert_eq!(taken.len(), 1);
+        f(taken.values_mut().next().unwrap())
+    }
+
+    /// Lock its coin worth `value`, or what was asked, paying `script`, or
+    /// the coin's terms, in a block of its own: as it says.
+    fn fund(&self, value: Option<u64>, script: Option<ScriptBuf>) -> OutPoint {
+        let (asked, htlc) = self.with(|t| (t.answer.value, t.htlc));
+        let tx = unchecked(
+            OutPoint::new(Txid::from_byte_array([0xf0; 32]), 7),
+            TxOut {
+                value: Amount::from_sat(value.unwrap_or(asked)),
+                script_pubkey: script.unwrap_or_else(|| htlc.script_pubkey()),
+            },
+        );
+        self.net.confirm(A, vec![tx.clone()]);
+        let height = self.net.view(A).height();
+        self.with(|t| {
+            t.answer.state = swaps::State::Locked;
+            t.answer.funding = Some(Funding {
+                txid: tx.compute_txid().to_string(),
+                vout: 0,
+                height,
+            });
+        });
+        OutPoint::new(tx.compute_txid(), 0)
+    }
+
+    /// Take the coin back, by any spend but a claim, in a block of its own.
+    fn refund(&self, coin: OutPoint) {
+        let back = unchecked(
+            coin,
+            TxOut {
+                value: Amount::from_sat(500),
+                script_pubkey: ScriptBuf::new_op_return([1]),
+            },
+        );
+        self.net.confirm(A, vec![back]);
+    }
+
+    /// Claim the client's lock with the preimage `claim` reveals.
+    async fn settle(&self, claim: &Transaction, coin: OutPoint) {
+        let (htlc, lock) = self.with(|t| (t.htlc, t.lock.clone()));
+        let preimage = htlc.preimage_in(claim, coin).expect("the claim's preimage");
+        self.wallet.claim(A, &lock, &preimage).await.unwrap();
+    }
+}
+
+/// A transaction spending `coin` to `output`, its witness none: the hub's
+/// chain checks nothing.
+fn unchecked(coin: OutPoint, output: TxOut) -> Transaction {
+    Transaction {
+        version: transaction::Version::TWO,
+        lock_time: bitcoin::absolute::LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: coin,
+            ..Default::default()
+        }],
+        output: vec![output],
+    }
+}
+
+/// A client's way to the hub and the provider.
+#[derive(Clone)]
+struct Client(Arc<Net>, Arc<Desk>);
+
+impl Transport for Client {
+    fn request(
+        &self,
+        url: &str,
+        body: Option<Vec<u8>>,
+    ) -> impl std::future::Future<Output = Result<Response, String>> + Send {
+        let (net, desk, url) = (self.0.clone(), self.1.clone(), url.to_owned());
+        async move {
+            match url.strip_prefix(PROVIDER) {
+                Some(path) => desk.serve(path, body).await,
+                None => net.serve(&url, body),
+            }
+        }
+    }
+}
+
+struct Eco {
+    net: Arc<Net>,
+    desk: Arc<Desk>,
+    dir: tempfile::TempDir,
+    client: Wallet<Client>,
+    view: View,
+}
+
+impl Eco {
+    /// Hub A at height 3, a provider paying out on its chain, and a client
+    /// holding 3000 at A.
+    async fn new() -> Self {
+        let net = Net::new();
+        net.start_timed(A, FEE, TIMED);
+        let dir = tempfile::tempdir().unwrap();
+        let wallet = Wallet::create(
+            &dir.path().join("provider.sqlite"),
+            &[0x50; 32],
+            ChainProfile::Core30DefaultRegtest,
+            Link(net.clone()),
+        )
+        .unwrap();
+        wallet.add_hub(A).await.unwrap();
+        let desk = Arc::new(Desk {
+            net: net.clone(),
+            wallet,
+            key: SecretKey::from_slice(&[0x5e; 32]).unwrap(),
+            terms: Mutex::new(Some(TERMS)),
+            decline: AtomicBool::new(false),
+            timeout: Mutex::default(),
+            taken: Mutex::default(),
+        });
+        let client = Self::client(&net, &desk, &dir, true).await;
+        client
+            .receive(&net.pay(A, &client.address(), 3000))
+            .unwrap();
+        let view = net.view(A);
+        Self {
+            net,
+            desk,
+            dir,
+            client,
+            view,
+        }
+    }
+
+    /// The client's wallet, made or opened again.
+    async fn client(
+        net: &Arc<Net>,
+        desk: &Arc<Desk>,
+        dir: &tempfile::TempDir,
+        new: bool,
+    ) -> Wallet<Client> {
+        let (path, link) = (
+            dir.path().join("client.sqlite"),
+            Client(net.clone(), desk.clone()),
+        );
+        if !new {
+            return Wallet::open(&path, link).unwrap();
+        }
+        let client =
+            Wallet::create(&path, &[0xc1; 32], ChainProfile::Core30DefaultRegtest, link).unwrap();
+        client.add_hub(A).await.unwrap();
+        client
+    }
+
+    /// Pay `amount` out to [`PAYEE`]: the client's lock made, the provider
+    /// asked.
+    async fn pay_out(&self, amount: u64) -> Payout {
+        let payout = self
+            .client
+            .payout(PROVIDER, A, PAYEE, amount, MAX_FEE, ONE_SAT)
+            .await
+            .unwrap();
+        assert!(payout.lock.is_some(), "{payout:?}");
+        payout
+    }
+
+    async fn follow(&self, payout: &Payout) -> Result<Payout, Error> {
+        self.client.follow_payout(&payout.hash, &self.view).await
+    }
+
+    /// Follow `payout` while it waits: where it stands then.
+    async fn settled(&self, payout: &Payout) -> Payout {
+        match self.follow(payout).await {
+            Ok(payout) => payout,
+            Err(Error::Pending { .. }) => self.client.payouts().unwrap().remove(0),
+            Err(e) => panic!("{e}"),
+        }
+    }
+
+    fn mine(&self, blocks: u32) {
+        self.net.mine(A, blocks, None);
+    }
+
+    /// Mine until the chain is at `height`.
+    fn mine_to(&self, height: u32) {
+        let tip = self.view.height();
+        assert!(tip <= height, "{tip} past {height}");
+        self.mine(height - tip);
+    }
+
+    fn held(&self) -> u64 {
+        let balance = self.client.balance().unwrap();
+        balance
+            .iter()
+            .find(|b| b.hub == A)
+            .map_or(0, |b| b.available)
+    }
+
+    fn timeout(&self) -> u32 {
+        self.desk.with(|t| t.htlc.timeout)
+    }
+}
+
+fn payee() -> ScriptBuf {
+    bitcoin::Address::from_str(PAYEE)
+        .unwrap()
+        .assume_checked()
+        .script_pubkey()
+}
+
+fn pending(result: Result<Payout, Error>, why: &str) {
+    match result {
+        Err(Error::Pending { reason, .. }) => assert!(reason.contains(why), "{reason}"),
+        other => panic!("{other:?}"),
+    }
+}
+
+fn failed(payout: &Payout, why: &str) {
+    match &payout.state {
+        PayoutState::Failed(reason) => assert!(reason.contains(why), "{reason}"),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_payout_pays_the_address_exactly_and_the_provider_its_lock() {
+    let eco = Eco::new().await;
+    let quote = eco
+        .client
+        .payout_quote(PROVIDER, A, PAYEE, 1000, MAX_FEE, ONE_SAT)
+        .await
+        .unwrap();
+    let value = quote.value();
+    assert_eq!(quote.fee, TERMS.pays(value) - value);
+    assert_eq!(quote.lock_fee, FEE.base);
+    let payout = eco.pay_out(1000).await;
+    assert_eq!(payout.state, PayoutState::Open);
+    assert_eq!(
+        (payout.amount, payout.budget, payout.fee),
+        (1000, quote.budget, quote.fee)
+    );
+    // Nothing is claimed before the coin confirms.
+    pending(eco.follow(&payout).await, "not confirmed yet");
+    assert!(eco.client.payout_claims().unwrap().is_empty());
+    let coin = eco.desk.fund(None, None);
+    let claimed = eco.follow(&payout).await.unwrap();
+    assert_eq!(claimed.state, PayoutState::Claimed);
+    assert_eq!(claimed.funding, Some(coin));
+    let claims = eco.client.payout_claims().unwrap();
+    assert_eq!(claims.len(), 1);
+    let claim = &claims[0];
+    assert_eq!(Some(claim.compute_txid()), claimed.claim);
+    assert_eq!(claim.input[0].previous_output, coin);
+    // The payee gets the amount exactly; the rest of the coin is the fee.
+    assert_eq!(claim.output.len(), 1);
+    assert_eq!(claim.output[0].value, Amount::from_sat(1000));
+    assert_eq!(claim.output[0].script_pubkey, payee());
+    assert!(
+        quote.budget as usize >= claim.vsize() * 3,
+        "{}",
+        claim.vsize()
+    );
+    pending(eco.follow(&payout).await, "not confirmed yet");
+    eco.net.confirm(A, claims.clone());
+    let done = eco.follow(&payout).await.unwrap();
+    assert_eq!(done.state, PayoutState::Done);
+    assert!(eco.client.payout_claims().unwrap().is_empty());
+    // The provider claims the client's lock with the preimage revealed.
+    eco.desk.settle(claim, coin).await;
+    let lock = eco
+        .client
+        .follow_lock(payout.lock.as_ref().unwrap())
+        .await
+        .unwrap();
+    assert!(matches!(lock.state, LockState::Paid(_)), "{lock:?}");
+    let total = value + quote.fee;
+    assert_eq!(eco.held(), 3000 - total - FEE.base);
+    assert_eq!(eco.client.payouts().unwrap(), vec![done]);
+}
+
+#[tokio::test]
+async fn a_coin_never_locked_reveals_nothing_and_the_lock_is_refunded() {
+    let eco = Eco::new().await;
+    let payout = eco.pay_out(1000).await;
+    let lock = eco.client.locks().unwrap().remove(0);
+    pending(eco.follow(&payout).await, "not confirmed yet");
+    // Expired, and buried: refunded.
+    eco.mine_to(lock.expiry + 1);
+    let payout = eco.settled(&payout).await;
+    failed(&payout, "its lock was refunded");
+    assert!(eco.client.payout_claims().unwrap().is_empty());
+    assert_eq!(eco.held(), 3000 - FEE.base);
+    // A coin locked late is not claimed.
+    eco.desk.fund(None, None);
+    assert_eq!(eco.settled(&payout).await, payout);
+    assert!(eco.client.payout_claims().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_coin_worth_less_than_asked_is_never_claimed() {
+    let eco = Eco::new().await;
+    let payout = eco.pay_out(1000).await;
+    let asked = payout.amount + payout.budget;
+    eco.desk.fund(Some(asked - 1), None);
+    let payout = eco.follow(&payout).await.unwrap();
+    failed(&payout, &format!("worth {} of {asked}", asked - 1));
+    assert!(eco.client.payout_claims().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_coin_not_where_the_provider_says_is_waited_for() {
+    let eco = Eco::new().await;
+    let payout = eco.pay_out(1000).await;
+    // Paying other terms: no coin of this payout.
+    eco.desk.fund(None, Some(payee()));
+    pending(eco.follow(&payout).await, "not in block");
+    // Said to be in another block.
+    let coin = eco.desk.fund(None, None);
+    eco.desk
+        .with(|t| t.answer.funding.as_mut().unwrap().height -= 1);
+    pending(eco.follow(&payout).await, "not in block");
+    // Said to be in a block not mined yet.
+    eco.desk
+        .with(|t| t.answer.funding.as_mut().unwrap().height += 2);
+    pending(eco.follow(&payout).await, "past the tip");
+    eco.desk
+        .with(|t| t.answer.funding.as_mut().unwrap().height -= 1);
+    let payout = eco.follow(&payout).await.unwrap();
+    assert_eq!(
+        (payout.state, payout.funding),
+        (PayoutState::Claimed, Some(coin))
+    );
+}
+
+#[tokio::test]
+async fn a_coin_too_close_to_its_timeout_is_never_claimed() {
+    let eco = Eco::new().await;
+    let payout = eco.pay_out(1000).await;
+    pending(eco.follow(&payout).await, "not confirmed yet");
+    let timeout = eco.timeout();
+    eco.mine_to(timeout - CLAIM_ROOM);
+    eco.desk.fund(None, None);
+    let payout = eco.follow(&payout).await.unwrap();
+    failed(&payout, "too late to claim");
+    assert!(eco.client.payout_claims().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_claim_made_is_kept_across_a_restart_until_it_confirms() {
+    let eco = Eco::new().await;
+    let payout = eco.pay_out(1000).await;
+    eco.desk.fund(None, None);
+    let claimed = eco.follow(&payout).await.unwrap();
+    let claims = eco.client.payout_claims().unwrap();
+    let Eco {
+        net,
+        desk,
+        dir,
+        client,
+        view,
+    } = eco;
+    drop(client);
+    let client = Eco::client(&net, &desk, &dir, false).await;
+    let eco = Eco {
+        net,
+        desk,
+        dir,
+        client,
+        view,
+    };
+    assert_eq!(eco.client.payouts().unwrap(), vec![claimed.clone()]);
+    assert_eq!(eco.client.payout_claims().unwrap(), claims);
+    // Not confirmed as the provider's coin times out: broadcast still.
+    eco.mine_to(eco.timeout() + 1);
+    pending(eco.follow(&payout).await, "not confirmed yet");
+    assert_eq!(eco.client.payout_claims().unwrap(), claims);
+    eco.net.confirm(A, claims);
+    assert_eq!(eco.follow(&payout).await.unwrap().state, PayoutState::Done);
+}
+
+#[tokio::test]
+async fn a_claim_beaten_by_the_providers_refund_is_lost() {
+    let eco = Eco::new().await;
+    let payout = eco.pay_out(1000).await;
+    let coin = eco.desk.fund(None, None);
+    eco.follow(&payout).await.unwrap();
+    eco.mine_to(eco.timeout() + 1);
+    eco.desk.refund(coin);
+    let payout = eco.follow(&payout).await.unwrap();
+    failed(&payout, "took its coin back first");
+    assert!(payout.claim.is_some());
+    assert!(eco.client.payout_claims().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_provider_declining_fails_the_payout_before_any_coin() {
+    let eco = Eco::new().await;
+    eco.desk.decline.store(true, Ordering::Relaxed);
+    let payout = eco.pay_out(1000).await;
+    failed(&payout, "the provider declined");
+    let lock = eco.client.locks().unwrap().remove(0);
+    eco.mine_to(lock.expiry + 1);
+    eco.client.resume().await.unwrap();
+    assert_eq!(eco.held(), 3000 - FEE.base);
+}
+
+#[tokio::test]
+async fn a_payout_is_refused_beyond_its_terms_before_any_lock() {
+    let eco = Eco::new().await;
+    let quote = |to: &'static str, amount: u64, max_fee: u64| {
+        let client = &eco.client;
+        async move {
+            client
+                .payout_quote(PROVIDER, A, to, amount, max_fee, ONE_SAT)
+                .await
+        }
+    };
+    let refused = |result: Result<_, Error>, why: &str| match result {
+        Err(Error::Invalid(reason)) => assert!(reason.contains(why), "{reason}"),
+        other => panic!("{other:?}"),
+    };
+    let costs = quote(PAYEE, 1000, MAX_FEE).await.unwrap().costs();
+    refused(
+        quote(PAYEE, 1000, costs - 1).await,
+        &format!("asks {costs} sat"),
+    );
+    refused(
+        quote(PAYEE, 100, MAX_FEE).await,
+        "too little to pay on Bitcoin",
+    );
+    refused(
+        quote(PAYEE, 4800, MAX_FEE).await,
+        "pays out coins of 500 to 5000",
+    );
+    let mainnet = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
+    refused(quote(mainnet, 1000, MAX_FEE).await, "not on");
+    refused(quote("bitcoin", 1000, MAX_FEE).await, "not an address");
+    // A rate judged higher than the provider's budgets the claim higher.
+    let rate = FeeRate::from_sat_per_vb_u32(2);
+    let dearer = eco
+        .client
+        .payout_quote(PROVIDER, A, PAYEE, 1000, MAX_FEE, rate)
+        .await
+        .unwrap();
+    let usual = quote(PAYEE, 1000, MAX_FEE).await.unwrap();
+    assert_eq!(dearer.budget, 2 * usual.budget);
+    // A provider naming a rate of its own makes the claim no dearer than
+    // allowed.
+    *eco.desk.terms.lock().unwrap() = Some(swaps::Chain {
+        rate: 50_000,
+        max: 100_000,
+        ..TERMS
+    });
+    refused(quote(PAYEE, 1000, MAX_FEE).await, "more than 2000");
+    *eco.desk.terms.lock().unwrap() = None;
+    refused(
+        quote(PAYEE, 1000, MAX_FEE).await,
+        "pays nothing out on Bitcoin",
+    );
+    let e = eco
+        .client
+        .payout(PROVIDER, A, PAYEE, 1000, MAX_FEE, ONE_SAT)
+        .await
+        .unwrap_err();
+    assert!(matches!(e, Error::Invalid(_)), "{e}");
+    assert!(eco.client.locks().unwrap().is_empty());
+    assert!(eco.client.payouts().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_wallet_file_of_version_4_gains_payouts() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v4.sqlite");
+    let version = |path: &std::path::Path| -> i64 {
+        let c = rusqlite::Connection::open(path).unwrap();
+        c.pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap()
+    };
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute_batch(include_str!("fixtures/wallet-v4.sql"))
+        .unwrap();
+    assert_eq!(version(&path), 4);
+    let wallet = Wallet::open(&path, Link(Net::new())).unwrap();
+    assert_eq!(version(&path), 5);
+    assert_eq!(wallet.hubs().unwrap().len(), 1);
+    assert!(wallet.payouts().unwrap().is_empty());
+    assert!(wallet.payout_claims().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_coin_timed_out_by_a_time_or_after_the_lock_is_never_claimed() {
+    // 500,000,000 on: a time, long past, under OP_CHECKLOCKTIMEVERIFY.
+    for timeout in [bitcoin::absolute::LOCK_TIME_THRESHOLD, 1_000] {
+        let eco = Eco::new().await;
+        *eco.desk.timeout.lock().unwrap() = Some(timeout);
+        let payout = eco.pay_out(1000).await;
+        eco.desk.fund(None, None);
+        let payout = eco.settled(&payout).await;
+        failed(
+            &payout,
+            &format!("times out at {timeout}, not a block before"),
+        );
+        assert!(eco.client.payout_claims().unwrap().is_empty());
+    }
+}
