@@ -58,7 +58,7 @@ pub use lightning::{Invoice, InvoiceState};
 pub use locks::{Incoming, Lock, LockState, CLAIM_MARGIN};
 pub use silent::{Blocks, Payee, Scanned, SilentCoin, SilentSpend};
 use store::{now, sql, Owner, Store};
-pub use swaps::{Swap, SwapState, SWAP_WINDOW};
+pub use swaps::{Swap, SwapLimits, SwapState, SWAP_WINDOW};
 
 /// A hub's answer: its HTTP status and body.
 #[derive(Clone, Debug)]

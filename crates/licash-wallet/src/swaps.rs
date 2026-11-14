@@ -24,6 +24,32 @@ use crate::{hub_url, now, sql, unavailable, Error, LockState, Transport, Wallet}
 /// return soon if the provider never locks.
 pub const SWAP_WINDOW: u32 = 24;
 
+/// The most a swap may cost: refused before the wallet locks anything if
+/// its provider asks more.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SwapLimits {
+    /// The provider's fee at most, in sat.
+    pub fee: u64,
+    /// The provider's margin at most, in blocks: how much longer than
+    /// [`SWAP_WINDOW`] the wallet's notes stay locked if it never locks.
+    pub margin: u32,
+}
+
+impl SwapLimits {
+    /// For a swap of `amount`: a fee of 1% and 100 sat, a margin of 24
+    /// blocks.
+    pub fn usual(amount: u64) -> Self {
+        let fee = licash_api::Fee {
+            base: 100,
+            ppm: 10_000,
+        };
+        Self {
+            fee: fee.due(amount),
+            margin: 24,
+        }
+    }
+}
+
 /// A swap of notes at hub `from` for notes at hub `to`, and where it
 /// stands.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -74,13 +100,15 @@ impl<T: Transport> Wallet<T> {
     /// Swap notes at the hub at `from` for `amount` at the hub at `to`,
     /// both added, through the provider at `provider`: lock the amount and
     /// its fee to the provider at `from`, then claim the provider's lock at
-    /// `to`. Where the swap stands; [`Wallet::follow_swap`] takes it on.
+    /// `to`, unless the provider asks more than `limits`. Where the swap
+    /// stands; [`Wallet::follow_swap`] takes it on.
     pub async fn swap(
         &self,
         provider: &str,
         from: &str,
         to: &str,
         amount: u64,
+        limits: SwapLimits,
     ) -> Result<Swap, Error> {
         let provider = hub_url(provider)?;
         let (from, to) = (hub_url(from)?, hub_url(to)?);
@@ -126,6 +154,18 @@ impl<T: Transport> Wallet<T> {
                 .saturating_add(SWAP_WINDOW),
         );
         let fee = offer.fee.due(amount);
+        if fee > limits.fee {
+            return Err(Error::Invalid(format!(
+                "provider {provider} asks {fee} sat to swap {amount}, more than {}",
+                limits.fee
+            )));
+        }
+        if offer.margin > limits.margin {
+            return Err(Error::Invalid(format!(
+                "provider {provider} keeps a swap's notes locked {} blocks longer, more than {}",
+                offer.margin, limits.margin
+            )));
+        }
         let mut preimage = [0; 32];
         OsRng.fill_bytes(&mut preimage);
         let hash = lock_hash(&preimage);

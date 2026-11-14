@@ -18,7 +18,7 @@ use licash_nostr::{Role, Route};
 use licash_transport::Http;
 use licash_wallet::{
     Deposit, DepositState, Error, Invoice, InvoiceState, Lock, LockState, PaymentCode, State, Swap,
-    SwapState, Wallet,
+    SwapLimits, SwapState, Wallet,
 };
 use rand_core::{OsRng, RngCore};
 use serde_json::json;
@@ -247,6 +247,13 @@ enum Command {
         /// The hub to pay at [default: the other one holding the most].
         #[arg(long)]
         from: Option<String>,
+        /// The provider's fee at most, in sat [default: 1% and 100].
+        #[arg(long)]
+        max_fee: Option<u64>,
+        /// The provider's margin at most, in blocks: how much longer the
+        /// notes stay locked should it never pay.
+        #[arg(long, default_value_t = 24)]
+        max_margin: u32,
     },
     /// The swaps made, newest first.
     Swaps,
@@ -675,12 +682,18 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             to,
             provider,
             from,
+            max_fee,
+            max_margin,
         } => {
             let from = match from {
                 Some(from) => from,
                 None => richest_but(&wallet, &to)?,
             };
-            let swap = wallet.swap(&provider, &from, &to, amount).await?;
+            let limits = SwapLimits {
+                fee: max_fee.unwrap_or(SwapLimits::usual(amount).fee),
+                margin: max_margin,
+            };
+            let swap = wallet.swap(&provider, &from, &to, amount, limits).await?;
             let unlinked = unlink(&wallet).await;
             let mut shown = swap_json(&swap);
             shown["unlinked"] = json!(unlinked);

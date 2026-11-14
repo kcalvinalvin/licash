@@ -16,7 +16,7 @@ use licash_api::{
     Code, Fee, Hex, Problem,
 };
 use licash_swaps::{Config, Notice, Provider, Stage};
-use licash_wallet::{Error, Response, SwapState, Transport, Wallet};
+use licash_wallet::{Error, Response, SwapLimits, SwapState, Transport, Wallet};
 use net::{Fault, Link, Net};
 
 const A: &str = "http://a.test";
@@ -222,7 +222,11 @@ impl Eco {
     /// provider: the client's lock is made.
     async fn pending(&self, amount: u64) -> licash_wallet::Swap {
         self.desk.fail(swaps::SWAPS, Fault::Lost);
-        let e = self.client.swap(PROVIDER, A, B, amount).await.unwrap_err();
+        let e = self
+            .client
+            .swap(PROVIDER, A, B, amount, SwapLimits::usual(amount))
+            .await
+            .unwrap_err();
         assert!(matches!(e, Error::Pending { .. }), "{e}");
         let swap = self.client.swaps().unwrap().remove(0);
         assert_eq!(
@@ -268,7 +272,11 @@ async fn a_swap_moves_notes_from_one_hub_to_another_for_the_providers_fee() {
     assert_eq!(info.hub(&eco.address(A)).unwrap().max, 0);
     assert_eq!(info.address, provider.wallet().address());
 
-    let swap = eco.client.swap(PROVIDER, A, B, 20).await.unwrap();
+    let swap = eco
+        .client
+        .swap(PROVIDER, A, B, 20, SwapLimits::usual(20))
+        .await
+        .unwrap();
     assert_eq!(swap.state, SwapState::Done);
     assert_eq!((swap.amount, swap.fee, swap.from.as_str()), (20, fee, A));
     assert!(swap.lock.is_some() && swap.theirs.is_some());
@@ -311,17 +319,51 @@ async fn a_client_locks_nothing_for_a_swap_the_provider_would_decline() {
     for (from, to, amount) in [(A, B, 4), (A, B, 60), (B, A, 10), (A, A, 10)] {
         let e = eco
             .client
-            .swap(PROVIDER, from, to, amount)
+            .swap(PROVIDER, from, to, amount, SwapLimits::usual(amount))
             .await
             .unwrap_err();
         assert!(matches!(e, Error::Invalid(_)), "{e}");
     }
     assert!(matches!(
-        eco.client.swap(PROVIDER, A, "http://c.test", 10).await,
+        eco.client
+            .swap(PROVIDER, A, "http://c.test", 10, SwapLimits::usual(10))
+            .await,
         Err(Error::UnknownHub(_))
     ));
     assert!(eco.client.swaps().unwrap().is_empty());
     assert_eq!(held(&eco.client, A), 100);
+}
+
+#[tokio::test]
+async fn a_client_locks_nothing_for_a_swap_costing_more_than_it_allows() {
+    let eco = Eco::new(60).await;
+    let (fee, _) = costs(20);
+    let cheaper = SwapLimits {
+        fee: fee - 1,
+        margin: CONFIG.margin,
+    };
+    let sooner = SwapLimits {
+        fee,
+        margin: CONFIG.margin - 1,
+    };
+    for (limits, says) in [(cheaper, "more than"), (sooner, "locked")] {
+        let e = eco.client.swap(PROVIDER, A, B, 20, limits).await;
+        match e {
+            Err(Error::Invalid(why)) => assert!(why.contains(says), "{why}"),
+            other => panic!("{other:?}"),
+        }
+    }
+    assert!(eco.client.swaps().unwrap().is_empty());
+    assert_eq!(held(&eco.client, A), 100);
+    assert!(eco.provider().records(10).unwrap().is_empty());
+
+    // At its limits exactly: swapped.
+    let exact = SwapLimits {
+        fee,
+        margin: CONFIG.margin,
+    };
+    let swap = eco.client.swap(PROVIDER, A, B, 20, exact).await.unwrap();
+    assert_eq!((swap.state, swap.fee), (SwapState::Done, fee));
 }
 
 #[tokio::test]
@@ -387,7 +429,11 @@ async fn the_provider_declines_locks_that_do_not_pay_it_or_leave_it_no_room() {
 #[tokio::test]
 async fn a_swap_asked_again_answers_where_it_stands_and_a_hash_serves_once() {
     let eco = Eco::new(200).await;
-    let swap = eco.client.swap(PROVIDER, A, B, 20).await.unwrap();
+    let swap = eco
+        .client
+        .swap(PROVIDER, A, B, 20, SwapLimits::usual(20))
+        .await
+        .unwrap();
     let provider = eco.provider();
     let (a, b, me) = (eco.address(A), eco.address(B), eco.client.address());
     let id = lock_id(swap.lock.as_ref().unwrap());
@@ -462,7 +508,11 @@ async fn a_lock_its_client_never_claims_returns_to_the_provider() {
     let eco = Eco::new(200).await;
     // The client's claim is lost, and the client gone.
     eco.net.fail(licash_api::SETTLE, Fault::Lost);
-    let e = eco.client.swap(PROVIDER, A, B, 20).await.unwrap_err();
+    let e = eco
+        .client
+        .swap(PROVIDER, A, B, 20, SwapLimits::usual(20))
+        .await
+        .unwrap_err();
     assert!(matches!(e, Error::Pending { .. }), "{e}");
     let swap = eco.client.swaps().unwrap().remove(0);
     assert!(swap.theirs.is_some());
@@ -522,7 +572,11 @@ async fn a_provider_restarted_takes_its_swaps_on() {
 #[tokio::test]
 async fn a_provider_that_claims_too_late_loses_the_swap() {
     let eco = Eco::new(200).await;
-    let swap = eco.client.swap(PROVIDER, A, B, 20).await.unwrap();
+    let swap = eco
+        .client
+        .swap(PROVIDER, A, B, 20, SwapLimits::usual(20))
+        .await
+        .unwrap();
     assert_eq!(swap.state, SwapState::Done);
     // Asleep until the client's lock, expiring at 20, is within 3 blocks.
     eco.mine(14);
@@ -599,7 +653,11 @@ async fn the_operator_is_alerted_once_of_each_hub_the_provider_cannot_swap_to() 
     ));
 
     // Paid at A, it swaps to A again; it holds too little at B now.
-    let swap = eco.client.swap(PROVIDER, A, B, 25).await.unwrap();
+    let swap = eco
+        .client
+        .swap(PROVIDER, A, B, 25, SwapLimits::usual(25))
+        .await
+        .unwrap();
     assert_eq!(swap.state, SwapState::Done);
     assert!(provider.step().await.unwrap().is_empty());
     assert_eq!(provider.check_stock().unwrap(), [B]);

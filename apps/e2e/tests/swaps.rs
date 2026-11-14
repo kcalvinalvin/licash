@@ -9,7 +9,7 @@ use licash_api::{
 };
 use licash_e2e::{until, Eco, Wallet};
 use licash_nostr::{discover, Role, Route};
-use licash_wallet::{Lock, LockState, SwapState};
+use licash_wallet::{Lock, LockState, SwapLimits, SwapState};
 use rand_core::{OsRng, RngCore};
 
 /// What the provider holds at hub 2 for the tests.
@@ -53,7 +53,9 @@ async fn wallets_swap_between_hubs_through_a_provider_they_discover() -> anyhow:
     let alice = eco.wallet("swapper")?;
     eco.pay_in(&alice, hub1, 30_000).await?;
     alice.add_hub(hub2).await?;
-    let swap = alice.swap(eco.swaps(), hub1, hub2, 10_000).await?;
+    let swap = alice
+        .swap(eco.swaps(), hub1, hub2, 10_000, SwapLimits::usual(10_000))
+        .await?;
     assert_eq!(swap.state, SwapState::Done, "{swap:?}");
     // 1 + 5000 ppm of 10 000.
     assert_eq!(swap.fee, 51);
@@ -69,7 +71,7 @@ async fn wallets_swap_between_hubs_through_a_provider_they_discover() -> anyhow:
 
     // Beyond what it holds at hub 2: Alice locks nothing.
     let e = alice
-        .swap(eco.swaps(), hub1, hub2, 190_000)
+        .swap(eco.swaps(), hub1, hub2, 190_000, SwapLimits::usual(190_000))
         .await
         .unwrap_err();
     assert!(matches!(e, licash_wallet::Error::Invalid(_)), "{e}");
