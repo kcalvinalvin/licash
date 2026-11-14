@@ -2694,6 +2694,7 @@ dependencies = [
  "bitcoin",
  "hex",
  "licash",
+ "licash-onchain",
  "percent-encoding",
  "reqwest",
  "rustls",

@@ -8,6 +8,7 @@ publish = false
 
 [dependencies]
 licash.workspace = true
+licash-onchain.workspace = true
 anyhow.workspace = true
 bitcoin = { version = "=0.32.102", default-features = false, features = ["std"] }
 hex = "0.4"

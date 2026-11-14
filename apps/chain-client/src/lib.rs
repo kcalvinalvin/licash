@@ -1,14 +1,14 @@
 //! Reads Bitcoin for Licash services, block by block, from Bitcoin Core's
 //! JSON-RPC or from an Esplora REST server, as a [`Source`] URL names it.
 
-use std::{path::PathBuf, str::FromStr, time::Duration};
+use std::{collections::HashMap, path::PathBuf, str::FromStr, time::Duration};
 
 use anyhow::{bail, ensure, Context};
 use bitcoin::{
     block::Header,
-    consensus::{deserialize, serialize},
+    consensus::{deserialize, encode::serialize_hex, serialize},
     hashes::Hash,
-    Block, BlockHash, Network, ScriptBuf,
+    Address, Amount, Block, BlockHash, FeeRate, Network, OutPoint, ScriptBuf, Transaction, Txid,
 };
 use licash::{chain::Checkpoint, spend::ChainProfile};
 use serde::{de::DeserializeOwned, Deserialize};
@@ -121,14 +121,32 @@ impl std::fmt::Debug for Source {
     }
 }
 
-/// The network whose addresses a checkpoint `profile`'s chain uses.
-pub fn network(profile: ChainProfile) -> Network {
-    match profile {
-        ChainProfile::Core30Mainnet => Network::Bitcoin,
-        ChainProfile::Core30DefaultRegtest => Network::Regtest,
-        ChainProfile::Core30Signet | ChainProfile::Mutinynet => Network::Signet,
-    }
+pub use licash_onchain::network;
+
+/// A step along the best chain, of [`Source::follow`].
+#[derive(Debug)]
+pub enum Follow {
+    /// The block at this height.
+    Next(u32, Box<Block>),
+    /// Forget the blocks from this height up.
+    Rewind(u32),
+    AtTip,
 }
+
+/// An output paying an address, unspent, confirmed at `height`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Unspent {
+    pub outpoint: OutPoint,
+    pub value: Amount,
+    pub height: u32,
+}
+
+/// What a node answers of a transaction it already has.
+const KNOWN: [&str; 3] = [
+    "txn-already-known",
+    "txn-already-in-mempool",
+    "already in utxo set",
+];
 
 /// Transactions per page of an Esplora block's.
 const ESPLORA_PAGE: usize = 25;
@@ -342,6 +360,165 @@ impl Source {
             }
         }
         Ok(spends)
+    }
+
+    /// What comes after `top`, the newest block a follower of the best
+    /// chain read, where `ours` tells the hash it read at a height: the
+    /// next block, from `first` if it read none yet; the height to forget
+    /// blocks from, which left the best chain; or nothing, at the tip.
+    pub async fn follow(
+        &self,
+        top: Option<(u32, BlockHash)>,
+        first: u32,
+        ours: impl Fn(u32) -> anyhow::Result<Option<BlockHash>>,
+    ) -> anyhow::Result<Follow> {
+        let tip = self.tip().await.context("the chain's tip")?;
+        let next = top.map_or(first, |(height, _)| height + 1);
+        if next > tip.height {
+            // At or beyond the tip: the same chain, or one the source left.
+            let Some((height, _)) = top else {
+                return Ok(Follow::AtTip);
+            };
+            let at = height.min(tip.height);
+            return Ok(match ours(at)? {
+                Some(hash) if hash != self.hash(at).await? => Follow::Rewind(at),
+                _ => Follow::AtTip,
+            });
+        }
+        let hash = self.hash(next).await?;
+        let block = self.block(&hash).await?;
+        match top {
+            Some((height, hash)) if block.header.prev_blockhash != hash => {
+                Ok(Follow::Rewind(height))
+            }
+            _ => Ok(Follow::Next(next, Box::new(block))),
+        }
+    }
+
+    /// Hand `tx` to the network: its id. One the source already has, in
+    /// its mempool or its chain, is no error.
+    pub async fn broadcast(&self, tx: &Transaction) -> anyhow::Result<Txid> {
+        let hex = serialize_hex(tx);
+        let refused = match &self.kind {
+            Kind::Rpc { .. } => {
+                let sent: anyhow::Result<String> =
+                    self.call("sendrawtransaction", json!([hex])).await;
+                sent.err().map(|e| format!("{e:#}"))
+            }
+            Kind::Esplora { base } => {
+                let url = format!("{base}/tx");
+                let response = self
+                    .client
+                    .post(&url)
+                    .body(hex)
+                    .send()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{self}: {}", e.without_url()))?;
+                let status = response.status();
+                let text = response.text().await.unwrap_or_default();
+                (!status.is_success()).then(|| format!("{self}: {url}: HTTP {status}: {text}"))
+            }
+        };
+        match refused {
+            Some(e) if !KNOWN.iter().any(|known| e.contains(known)) => bail!("broadcast: {e}"),
+            _ => Ok(tx.compute_txid()),
+        }
+    }
+
+    /// The fee rate the source estimates confirms a transaction within
+    /// `blocks`: None while it has no estimate, as on a chain of few
+    /// transactions.
+    pub async fn fee_rate(&self, blocks: u16) -> anyhow::Result<Option<FeeRate>> {
+        // From satoshis per thousand virtual bytes, rounded up.
+        let rate = |sat_per_kvb: f64| {
+            let sat_per_kvb = sat_per_kvb.round() as u64;
+            FeeRate::from_sat_per_kwu(sat_per_kvb.div_ceil(4))
+        };
+        match &self.kind {
+            Kind::Rpc { .. } => {
+                #[derive(Deserialize)]
+                struct Estimate {
+                    /// In bitcoins per thousand virtual bytes.
+                    feerate: Option<f64>,
+                }
+                let estimate: Estimate = self.call("estimatesmartfee", json!([blocks])).await?;
+                Ok(estimate.feerate.map(|btc| rate(btc * 1e8)))
+            }
+            Kind::Esplora { base } => {
+                let url = format!("{base}/fee-estimates");
+                let estimates: HashMap<String, f64> = self.get(&url).await?.json().await?;
+                let mut estimates: Vec<(u16, f64)> = estimates
+                    .into_iter()
+                    .filter_map(|(target, r)| Some((target.parse().ok()?, r)))
+                    .collect();
+                estimates.sort_by_key(|(target, _)| *target);
+                // The latest within `blocks`, else the soonest.
+                let within = estimates.iter().rev().find(|(target, _)| *target <= blocks);
+                Ok(within.or(estimates.first()).map(|(_, r)| rate(r * 1e3)))
+            }
+        }
+    }
+
+    /// The outputs paying `address` that are confirmed and unspent, as the
+    /// source tells: a node scans its whole set of them, which takes a
+    /// while on a large chain.
+    pub async fn unspent(&self, address: &Address) -> anyhow::Result<Vec<Unspent>> {
+        let parse = |txid: &str, vout, sat, height| {
+            Ok(Unspent {
+                outpoint: OutPoint {
+                    txid: txid.parse().context("a txid")?,
+                    vout,
+                },
+                value: Amount::from_sat(sat),
+                height,
+            })
+        };
+        let mut unspent = match &self.kind {
+            Kind::Rpc { .. } => {
+                #[derive(Deserialize)]
+                struct Scan {
+                    unspents: Vec<Found>,
+                }
+                #[derive(Deserialize)]
+                struct Found {
+                    txid: String,
+                    vout: u32,
+                    /// In bitcoins.
+                    amount: f64,
+                    height: u32,
+                }
+                let descriptor = json!([{ "desc": format!("addr({address})") }]);
+                let scan: Scan = self
+                    .call("scantxoutset", json!(["start", descriptor]))
+                    .await?;
+                let found = scan.unspents.into_iter();
+                found
+                    .map(|f| parse(&f.txid, f.vout, (f.amount * 1e8).round() as u64, f.height))
+                    .collect::<anyhow::Result<Vec<_>>>()?
+            }
+            Kind::Esplora { base } => {
+                #[derive(Deserialize)]
+                struct Found {
+                    txid: String,
+                    vout: u32,
+                    value: u64,
+                    status: Status,
+                }
+                #[derive(Deserialize)]
+                struct Status {
+                    block_height: Option<u32>,
+                }
+                let url = format!("{base}/address/{address}/utxo");
+                let found: Vec<Found> = self.get(&url).await?.json().await?;
+                let confirmed = found.into_iter().filter_map(|f| {
+                    let height = f.status.block_height?;
+                    Some(parse(&f.txid, f.vout, f.value, height))
+                });
+                confirmed.collect::<anyhow::Result<Vec<_>>>()?
+            }
+        };
+        unspent.sort_by_key(|u| (u.height, u.outpoint));
+        Ok(unspent)
     }
 
     /// The network, from the node or from its genesis block.

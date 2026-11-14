@@ -13,7 +13,7 @@ use anyhow::{ensure, Context};
 use bitcoin::{hashes::Hash, secp256k1::PublicKey, BlockHash, Script};
 use licash::spend::ChainProfile;
 use licash_api::{BlockTweaks, Hex};
-use licash_chain_client::Source;
+use licash_chain_client::{Follow, Source};
 use licash_onchain::silent;
 use rusqlite::{params, Connection, OptionalExtension};
 
@@ -220,25 +220,15 @@ pub async fn step(tweaks: &Tweaks, source: &Source, from: Option<u32>) -> anyhow
     };
     loop {
         let top = tweaks.top()?;
-        let next = top.map_or(first, |(height, _)| height + 1);
-        if next > tip.height {
-            // At or beyond the tip: the same chain, or one the source left.
-            let Some((height, _)) = top else { break };
-            let at = height.min(tip.height);
-            match tweaks.hash_at(at)? {
-                Some(ours) if ours != source.hash(at).await? => tweaks.rewind(at)?,
-                _ => break,
-            }
-            continue;
-        }
-        let hash = source.hash(next).await?;
-        let block = source.block(&hash).await?;
-        if let Some((height, ours)) = top {
-            if block.header.prev_blockhash != ours {
+        let (next, block) = match source.follow(top, first, |h| tweaks.hash_at(h)).await? {
+            Follow::Next(next, block) => (next, block),
+            Follow::Rewind(height) => {
                 tweaks.rewind(height)?;
                 continue;
             }
-        }
+            Follow::AtTip => break,
+        };
+        let hash = block.block_hash();
         let spends = source.taproot_spends(&block).await?;
         let found: Vec<PublicKey> = block
             .txdata

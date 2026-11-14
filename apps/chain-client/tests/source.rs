@@ -13,11 +13,11 @@ use axum::{
 use bitcoin::{
     absolute::LockTime,
     block::{Header, Version},
-    consensus::serialize,
+    consensus::{deserialize, serialize},
     hashes::Hash,
     pow::CompactTarget,
-    transaction, Amount, Block, BlockHash, Network, OutPoint, ScriptBuf, Sequence, Transaction,
-    TxIn, TxMerkleNode, TxOut, Witness,
+    transaction, Address, Amount, Block, BlockHash, FeeRate, Network, OutPoint, ScriptBuf,
+    Sequence, Transaction, TxIn, TxMerkleNode, TxOut, Witness,
 };
 use licash::{chain::Checkpoint, spend::ChainProfile};
 use licash_chain_client::Source;
@@ -33,6 +33,8 @@ struct Chain {
     /// Every output of the chain.
     outputs: HashMap<OutPoint, TxOut>,
     auth: &'static str,
+    /// The mempool.
+    sent: std::sync::Mutex<Vec<Transaction>>,
 }
 
 /// Outputs of each coinbase, which the next block spends.
@@ -178,8 +180,125 @@ async fn rpc(
             }
             None => rpc_error(-5, "Block not found"),
         },
+        "sendrawtransaction" => match send(&chain, params[0].as_str().unwrap_or_default()) {
+            Ok(txid) => rpc_reply(json!(txid)),
+            Err((code, message)) => rpc_error(code, message),
+        },
+        "estimatesmartfee" => match params[0].as_u64() {
+            Some(target @ 1..=144) => rpc_reply(json!({"feerate": 0.00012, "blocks": target})),
+            _ => {
+                rpc_reply(json!({"errors": ["Insufficient data or no feerate found"], "blocks": 0}))
+            }
+        },
+        "scantxoutset" => {
+            let descriptor = params[1][0]["desc"].as_str().unwrap_or_default();
+            let address = descriptor
+                .strip_prefix("addr(")
+                .and_then(|d| d.strip_suffix(')'))
+                .and_then(|a| a.parse::<Address<_>>().ok());
+            let Some(address) = address else {
+                return rpc_error(-5, "Invalid descriptor");
+            };
+            let script = address.assume_checked().script_pubkey();
+            let found: Vec<Value> = unspent(&chain, &script)
+                .into_iter()
+                .map(|(o, out, height)| {
+                    json!({"txid": o.txid.to_string(), "vout": o.vout, "amount": out.value.to_btc(),
+                           "scriptPubKey": script.to_hex_string(), "height": height})
+                })
+                .collect();
+            rpc_reply(json!({"success": true, "unspents": found}))
+        }
         _ => rpc_error(-32601, "Method not found"),
     }
+}
+
+/// The outputs paying `script` that no block spends, with their heights.
+fn unspent<'a>(chain: &'a Chain, script: &'a ScriptBuf) -> Vec<(OutPoint, &'a TxOut, u32)> {
+    let spent: std::collections::HashSet<OutPoint> = chain
+        .blocks
+        .iter()
+        .flat_map(|b| &b.txdata)
+        .flat_map(|tx| tx.input.iter().map(|i| i.previous_output))
+        .collect();
+    let mut found = Vec::new();
+    for (height, block) in (0u32..).zip(&chain.blocks) {
+        for tx in &block.txdata {
+            let txid = tx.compute_txid();
+            for (vout, output) in (0u32..).zip(&tx.output) {
+                let outpoint = OutPoint { txid, vout };
+                if output.script_pubkey == *script && !spent.contains(&outpoint) {
+                    found.push((outpoint, output, height));
+                }
+            }
+        }
+    }
+    found
+}
+
+/// Take `tx` into the mempool, as a node does, or why not.
+fn send(chain: &Chain, raw: &str) -> Result<String, (i64, &'static str)> {
+    let tx: Transaction = hex::decode(raw)
+        .ok()
+        .and_then(|raw| deserialize(&raw).ok())
+        .ok_or((-22, "TX decode failed"))?;
+    let txid = tx.compute_txid();
+    let confirmed = chain.blocks.iter().flat_map(|b| &b.txdata);
+    if confirmed.clone().any(|t| t.compute_txid() == txid) {
+        return Err((-27, "Transaction outputs already in utxo set"));
+    }
+    let mut sent = chain.sent.lock().unwrap();
+    if !sent.iter().any(|t| t.compute_txid() == txid) {
+        let spends = confirmed.flat_map(|t| &t.input).map(|i| i.previous_output);
+        let spent: Vec<OutPoint> = spends.collect();
+        let spendable = |o: &OutPoint| chain.outputs.contains_key(o) && !spent.contains(o);
+        if !tx.input.iter().all(|i| spendable(&i.previous_output)) {
+            return Err((-25, "bad-txns-inputs-missingorspent"));
+        }
+        sent.push(tx);
+    }
+    Ok(txid.to_string())
+}
+
+async fn esplora_send(State(chain): State<Arc<Chain>>, raw: String) -> Response {
+    match send(&chain, &raw) {
+        Ok(txid) => txid.into_response(),
+        Err((code, message)) => {
+            let text = format!(
+                "sendrawtransaction RPC error: {{\"code\":{code},\"message\":\"{message}\"}}"
+            );
+            (StatusCode::BAD_REQUEST, text).into_response()
+        }
+    }
+}
+
+async fn esplora_fees() -> Json<Value> {
+    Json(json!({"1": 20.5, "6": 12.0, "144": 1.0}))
+}
+
+async fn esplora_utxo(State(chain): State<Arc<Chain>>, Path(address): Path<String>) -> Response {
+    let Ok(address) = address.parse::<Address<_>>() else {
+        return (StatusCode::BAD_REQUEST, "Invalid Bitcoin address").into_response();
+    };
+    let script = address.assume_checked().script_pubkey();
+    let mut found: Vec<Value> = unspent(&chain, &script)
+        .into_iter()
+        .map(|(o, out, height)| {
+            let status = json!({"confirmed": true, "block_height": height});
+            json!({"txid": o.txid.to_string(), "vout": o.vout, "value": out.value.to_sat(), "status": status})
+        })
+        .collect();
+    // And those of the mempool, unconfirmed.
+    for tx in chain.sent.lock().unwrap().iter() {
+        for (vout, output) in (0u32..).zip(&tx.output) {
+            if output.script_pubkey == script {
+                let txid = tx.compute_txid().to_string();
+                let status = json!({"confirmed": false});
+                found.push(json!({"txid": txid, "vout": vout, "value": output.value.to_sat(), "status": status}));
+            }
+        }
+    }
+    Json(found).into_response()
 }
 
 async fn esplora_tip(State(chain): State<Arc<Chain>>) -> String {
@@ -270,6 +389,7 @@ async fn serve(
         by_hash,
         outputs,
         auth,
+        sent: Default::default(),
     });
     let app = Router::new()
         .route("/", post(rpc))
@@ -277,6 +397,9 @@ async fn serve(
         .route("/api/block-height/{height}", get(esplora_hash))
         .route("/api/block/{hash}/{part}", get(esplora_block))
         .route("/api/block/{hash}/txs/{start}", get(esplora_txs))
+        .route("/api/tx", post(esplora_send))
+        .route("/api/fee-estimates", get(esplora_fees))
+        .route("/api/address/{address}/utxo", get(esplora_utxo))
         .with_state(chain);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -349,6 +472,81 @@ async fn both_read_what_the_transactions_paying_taproot_outputs_spend() {
         let error = source.taproot_spends(&forged).await.unwrap_err();
         assert!(format!("{error:#}").contains("are not its"), "{error:#}");
     }
+}
+
+#[tokio::test]
+async fn both_broadcast_estimate_fees_and_find_what_pays_an_address() {
+    let blocks = mine(4);
+    let address = serve(blocks.clone(), PASSWORD, None).await;
+    let to = |script: ScriptBuf| Address::from_script(&script, Network::Regtest).unwrap();
+    let [node, esplora] = sources(&address);
+    for source in [&node, &esplora] {
+        // Paid by a transaction of each block from 2 on, never spent.
+        let found = source.unspent(&to(script(0, 1))).await.unwrap();
+        let heights: Vec<u32> = found.iter().map(|u| u.height).collect();
+        assert_eq!(heights, [2, 3, 4], "{source}");
+        assert!(found.iter().all(|u| u.value == Amount::from_sat(40)));
+        // Spent by the next block.
+        assert!(source.unspent(&to(script(1, 0))).await.unwrap().is_empty());
+        let tip = source.unspent(&to(script(4, 5))).await.unwrap();
+        let coinbase = blocks[4].txdata[0].compute_txid();
+        assert_eq!(tip.len(), 1);
+        assert_eq!(
+            (tip[0].outpoint.txid, tip[0].outpoint.vout, tip[0].height),
+            (coinbase, 5, 4)
+        );
+        assert_eq!(tip[0].value, Amount::from_sat(50));
+    }
+
+    // 12 sat/vB, or 3000 per thousand weight units.
+    let twelve = FeeRate::from_sat_per_kwu(3000);
+    assert_eq!(node.fee_rate(6).await.unwrap(), Some(twelve));
+    assert_eq!(node.fee_rate(1008).await.unwrap(), None);
+    assert_eq!(esplora.fee_rate(6).await.unwrap(), Some(twelve));
+    // The latest estimate within the blocks asked, else the soonest.
+    let soonest = FeeRate::from_sat_per_kwu(5125);
+    assert_eq!(esplora.fee_rate(3).await.unwrap(), Some(soonest));
+    assert_eq!(esplora.fee_rate(0).await.unwrap(), Some(soonest));
+    assert_eq!(
+        esplora.fee_rate(1000).await.unwrap(),
+        Some(FeeRate::from_sat_per_kwu(250))
+    );
+
+    // A spend of the tip's coinbase, paying the address of many outputs.
+    let spend = Transaction {
+        version: transaction::Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: coinbase_of(&blocks, 4),
+                vout: 7,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(45),
+            script_pubkey: script(0, 1),
+        }],
+    };
+    let txid = spend.compute_txid();
+    for source in [&node, &esplora] {
+        // Again, or once it is in a block: no error.
+        assert_eq!(source.broadcast(&spend).await.unwrap(), txid, "{source}");
+        let mined = &blocks[3].txdata[1];
+        assert_eq!(source.broadcast(mined).await.unwrap(), mined.compute_txid());
+        let mut missing = spend.clone();
+        missing.input[0].previous_output.vout = 99;
+        let error = format!("{:#}", source.broadcast(&missing).await.unwrap_err());
+        assert!(error.contains("bad-txns-inputs-missingorspent"), "{error}");
+    }
+    // Unconfirmed, it pays the address nothing yet.
+    assert_eq!(esplora.unspent(&to(script(0, 1))).await.unwrap().len(), 3);
+}
+
+fn coinbase_of(blocks: &[Block], height: usize) -> bitcoin::Txid {
+    blocks[height].txdata[0].compute_txid()
 }
 
 #[tokio::test]
