@@ -1,6 +1,6 @@
 //! An axum router served as an onion service.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use anyhow::Context;
 use futures_util::StreamExt;
@@ -16,6 +16,9 @@ use crate::Tor;
 
 /// The port the service answers on.
 const PORT: u16 = 80;
+
+/// How soon to try connecting to the Tor network again.
+const RETRY: Duration = Duration::from_secs(60);
 
 /// An onion service, served until dropped.
 pub struct Onion {
@@ -55,7 +58,14 @@ impl Tor {
             .context("the onion service has no address")?;
         let url = format!("http://{}", address.display_unredacted());
         let mut streams = Box::pin(tor_hsservice::handle_rend_requests(requests));
+        let client = self.client.clone();
         let serving = tokio::spawn(async move {
+            // The service publishes itself once the client holds the
+            // network's directory, which only a bootstrap fetches.
+            while let Err(e) = client.bootstrap().await {
+                tracing::warn!("Tor, for the onion service: {e}");
+                tokio::time::sleep(RETRY).await;
+            }
             while let Some(request) = streams.next().await {
                 tokio::spawn(answer(request, router.clone()));
             }
