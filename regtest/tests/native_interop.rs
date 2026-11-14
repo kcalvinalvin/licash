@@ -72,27 +72,27 @@ fn htlc(rt: &Regtest, claim: &Keypair, refund: &Keypair, timeout: u32) -> Result
     )
 }
 
-/// The Hub locks a note of its own to `pay` and certifies the lock: its
-/// promise to the payee, who needs no note evidence of the Hub's input.
+/// The Hub locks notes of its own, one for each output of `pay`, and
+/// certifies the lock: its promise to the payee, who needs no note evidence
+/// of the Hub's inputs.
 fn certified(
     f: &Fixture,
     pay: &[Derivation],
     terms: TimedTerms,
-) -> Result<(SignedProposal, Certificate, Note)> {
-    let value = pay.iter().map(|d| d.message().denomination()).sum();
-    let note = mint(&f.issuer, f.keyset(), &other(value, 0));
-    let lock = TimedLock::new(terms, outputs(&[other(value, 1)])?)?;
-    let notes = std::slice::from_ref(&note);
-    let proposal = Proposal::new(f.keyset(), notes, point(43), outputs(pay)?, Some(lock))?;
-    let signed = SignedProposal::sign(
-        f.keyset(),
-        proposal,
-        notes,
-        Authorization::Plain,
-        &[owner(41, 0)],
-    )?;
-    let certificate = Certificate::attest(&f.issuer, &signed, notes)?;
-    Ok((signed, certificate, note))
+) -> Result<(SignedProposal, Certificate, Vec<Note>)> {
+    let mut notes = vec![];
+    let (mut refund, mut keys) = (vec![], vec![]);
+    for (i, d) in (0u32..).zip(pay) {
+        let value = d.message().denomination();
+        notes.push(mint(&f.issuer, f.keyset(), &other(value, i)));
+        refund.push(other(value, 50 + i));
+        keys.push(owner(41, i));
+    }
+    let lock = TimedLock::new(terms, outputs(&refund)?)?;
+    let proposal = Proposal::new(f.keyset(), &notes, point(43), outputs(pay)?, Some(lock))?;
+    let signed = SignedProposal::sign(f.keyset(), proposal, &notes, Authorization::Plain, &keys)?;
+    let certificate = Certificate::attest(&f.issuer, &signed, &notes)?;
+    Ok((signed, certificate, notes))
 }
 
 /// The preimage an activation published, as anyone reads it from Bitcoin.
@@ -212,7 +212,7 @@ fn swap_in_payment_activated_on_bitcoin_cannot_be_voided() -> Result<()> {
     let terms = f.n.timed(lock_hash(&Z), now + 5, DEPTH)?;
     let pay = [derive(SPEND, &hold(), 1024, 30)];
     let funded = htlc(&rt, &hub, &alice, now + 12)?;
-    let (source, certificate, hub_note) = certified(&f, &pay, terms.clone())?;
+    let (source, certificate, hub_notes) = certified(&f, &pay, terms.clone())?;
     let id = source.proposal().id();
 
     let activation = Native::activate(&rt, &Z)?;
@@ -225,7 +225,7 @@ fn swap_in_payment_activated_on_bitcoin_cannot_be_voided() -> Result<()> {
     expire(&rt, &terms)?;
     let expired = [Evidence::Expired { source: id }];
     ensure!(f.counter(&q, &expired, Some(f.n.chain(&rt)?)).is_err());
-    let notes = std::slice::from_ref(&hub_note);
+    let notes = &hub_notes[..];
     let elsewhere = Proposal::new(
         f.keyset(),
         notes,
@@ -242,7 +242,7 @@ fn swap_in_payment_activated_on_bitcoin_cannot_be_voided() -> Result<()> {
     )?;
     let respent = [Evidence::Spend {
         signed: elsewhere,
-        notes: vec![hub_note],
+        notes: hub_notes,
         unlock: None,
     }];
     ensure!(f.counter(&q, &respent, None).is_err());
@@ -344,144 +344,173 @@ fn hop(window: u32) -> Hop {
     }
 }
 
-/// Response windows along a route, the recipient's Hub first. Each exceeds
-/// the sum of those before it, which is what lets every Hub wait for its
-/// own lock to expire inside its window.
-const WINDOWS: [u32; 3] = [6, 18, 40];
+/// Response window of every Hub along a route. It only has to contain the
+/// Hub's own lock: windows do not nest.
+const WINDOW: u32 = 18;
 
-/// A payment of 1024 across `hubs` Hubs in which every Hub withholds.
+/// The spending root of a Hub's wallet at the Hub upstream of it, where it
+/// is a client with a contract of its own.
+const CLIENT: u64 = 23;
+
+/// A payment across `hubs` Hubs, the recipient's first, in which every Hub
+/// upstream of hers is silent.
 ///
-/// Hub 0 is the recipient's. The payer of the lock at Hub `i` is Hub `i + 1`,
-/// a client of Hub `i` with its own recovery contract there, and the payer at
-/// the last Hub is the sender. Each lock pays the Hub that issued it, except
-/// the first, which pays the recipient under a certificate. Each forwarding
-/// Hub keeps 512.
+/// The lock at Hub 0 pays the recipient, and the lock at Hub `i` pays Hub
+/// `i - 1`, a client of Hub `i`. Every payee has a contract of its own at
+/// the Hub of its lock, on whose checkpoint the lock is timed, and holds
+/// that Hub's certificate of it. The payer of the lock at the last Hub is
+/// the sender. Every other Hub pays its lock itself, with notes it issued to
+/// itself, so it learns the preimage as their issuer: its payee settles the
+/// lock only by revealing the preimage to it or by publishing it on
+/// Bitcoin. The lock at Hub `i` carries 1024 and 512 more per Hub, so each
+/// forwarding Hub keeps 512. Every payee also holds a note of 1024 there,
+/// which keeps each claim within the contract's cap.
 ///
-/// The recipient reveals the preimage to her Hub and is paid. No Hub passes
-/// it on, so each payer asks for its refund on Bitcoin, and each Hub can keep
-/// what it was paid only by publishing the preimage in its response. The
-/// preimage therefore travels up the route on Bitcoin, each payer reads it
-/// before its own incoming lock expires, and the sender ends with it as her
-/// receipt. Every payer is paid the 2048 it did not forward.
+/// The recipient reveals the preimage to her Hub in the last block before
+/// its lock expires, and is paid. No Hub upstream pays its payee, so her Hub
+/// publishes the preimage on Bitcoin once its own lock has expired, in time
+/// for the lock one Hub upstream. That activation activates every lock
+/// upstream, which all expire later, so each forwarding Hub is paid in its
+/// own contract upstream and no expiry voids it. The sender's Hub keeps her
+/// notes only by publishing the preimage in its response to her refund
+/// request: her receipt. She is paid the 2048 she did not send.
 ///
-/// With `silent`, the recipient's Hub does not pay her either. She has a
-/// contract of her own there, on whose checkpoint the first lock is timed, so
-/// she publishes the preimage on Bitcoin before that lock expires and claims
-/// her payment with her notes. The rest is unchanged, except that the first
-/// payer could have read the preimage from her activation.
+/// With `silent`, the recipient's Hub does not pay her either. She
+/// publishes the preimage on Bitcoin before her lock expires and claims her
+/// payment with her notes. Her Hub, which read it from her activation, is
+/// paid upstream with the same activation.
 fn route(hubs: usize, silent: bool) -> Result<()> {
     let rt = Regtest::start_standard()?;
-    let mut fs = vec![];
-    for (i, window) in WINDOWS.iter().take(hubs).enumerate() {
-        let mut denominations = vec![1024];
-        denominations.extend(vec![512; i]);
-        denominations.push(2048);
-        let terms = Terms {
+    let w_h = u16::try_from(WINDOW)?;
+    let last = hubs - 1;
+    let mut sent = vec![1024];
+    sent.extend(vec![512; hubs - 1]);
+    let locked: Vec<usize> = (0..sent.len()).collect();
+    let mut denominations = sent.clone();
+    denominations.push(2048);
+    let sender = fixture_with(
+        &rt,
+        &format!("native-route-{hubs}-from"),
+        Terms {
             denominations,
             t_a: 160,
-            w_h: u16::try_from(*window)?,
+            w_h,
             ..Terms::default()
+        },
+    )?;
+    let mut payees = vec![];
+    for i in 0..hubs {
+        let root = if i == 0 { PAYEE } else { CLIENT };
+        let issuer = (i == last).then(|| sender.issuer.clone());
+        let theirs = Terms {
+            denominations: vec![1024],
+            t_a: 160,
+            w_h,
+            root,
+            issuer,
         };
-        fs.push(fixture_with(
+        payees.push(fixture_with(
             &rt,
             &format!("native-route-{hubs}-{i}"),
-            terms,
+            theirs,
         )?);
     }
-    let recipient = if silent {
-        let hers = Terms {
-            denominations: vec![2048],
-            t_a: 160,
-            root: PAYEE,
-            issuer: Some(fs[0].issuer.clone()),
-            ..Terms::default()
-        };
-        Some(fixture_with(&rt, &format!("native-route-{hubs}-to"), hers)?)
-    } else {
-        None
-    };
-    let route: Vec<Hop> = WINDOWS.iter().take(hubs).map(|w| hop(*w)).collect();
+    let route = vec![hop(WINDOW); hubs];
     let now = rt.height()?;
     let expiries = route::expiries(now + 3, &route).context("route heights")?;
     ensure!(route::admissible(now, &expiries, &route));
 
+    let refund: Vec<_> = (0u32..)
+        .zip(&sent)
+        .map(|(j, value)| derive(SPEND, &hold(), *value, 30 + j))
+        .collect();
+    // Recipient's Hub first: each lock with its terms, certificate and pay
+    // outputs.
     let mut legs = vec![];
-    for (i, f) in fs.iter().enumerate() {
-        let locked: Vec<usize> = (0..=i).collect();
-        let (mut pay, mut refund) = (vec![], vec![]);
-        for j in &locked {
-            let value = f.ds[*j].message().denomination();
-            pay.push(match (&recipient, i) {
-                (Some(_), 0) => derive(PAYEE, &hold(), value, 30 + *j as u32),
-                _ => other(value, *j as u32),
-            });
-            refund.push(derive(SPEND, &hold(), value, 30 + *j as u32));
-        }
-        // A lock is timed on its payee's checkpoint.
-        let timed = match (&recipient, i) {
-            (Some(r), 0) => &r.n,
-            _ => &f.n,
+    for (i, payee) in payees.iter().enumerate() {
+        let pay: Vec<_> = (0u32..)
+            .zip(&sent[..=i])
+            .map(|(j, value)| derive(payee.root, &hold(), *value, 30 + j))
+            .collect();
+        let terms = payee.n.timed(lock_hash(&Z), expiries[i], DEPTH)?;
+        let (lock, certificate) = if i == last {
+            let lock = sender.lock(&locked, &pay, &refund, terms.clone())?;
+            let notes = &sender.notes[..sent.len()];
+            let certificate = Certificate::attest(&sender.issuer, &lock, notes)?;
+            (lock, certificate)
+        } else {
+            let (lock, certificate, _) = certified(payee, &pay, terms.clone())?;
+            (lock, certificate)
         };
-        let terms = timed.timed(lock_hash(&Z), expiries[i], DEPTH)?;
-        let lock = f.lock(&locked, &pay, &refund, terms)?;
-        legs.push((locked, lock, refund, pay));
+        certificate.verify(payee.keyset())?;
+        legs.push((lock, terms, certificate, pay));
     }
-    // The recipient holds her Hub's certificate of the first lock, so she
-    // can activate it on Bitcoin herself when her Hub does not pay her.
-    let certificate = Certificate::attest(&fs[0].issuer, &legs[0].1, &fs[0].notes[..1])?;
-    certificate.verify(fs[0].keyset())?;
 
-    let mut z = Z;
-    let mut received = None;
-    if let Some(r) = &recipient {
+    let activation = if silent {
         let activation = Native::activate(&rt, &Z)?;
         ensure!(activation.reference.height < expiries[0], "in time");
-        // Anyone reads the preimage from her activation, well before the
-        // lock one Hub upstream expires.
-        z = activated(&rt, &activation)?;
-        let height = rt.height()?;
-        ensure!(expiries.get(1).is_none_or(|up| height < *up));
-        received = Some((r, activation));
-    }
-    let mut answered = vec![];
-    for (i, f) in fs.iter().enumerate() {
-        let (locked, lock, refund, _) = &legs[i];
-        let (publication, witness) = f.refund_claim(locked, lock, refund)?;
-        let q = f.request_of(publication)?;
-        let evidence = vec![Evidence::PayPreimage {
-            source: lock.proposal().id(),
-            preimage: z,
-        }];
-        let counter = f.counter(&q, &evidence, None)?;
-        ensure!(counter.owed == 2048, "hub {i} keeps what it was paid");
-        let response = f.respond_counter(&q, &counter, &counter_disclosures(&evidence)?)?;
-        // The payer reads the preimage from the response, in time to use it
-        // one Hub upstream.
-        z = f.published()?[0];
-        ensure!(lock_hash(&z) == lock_hash(&Z), "hub {i} published it");
-        let height = rt.height()?;
-        let bound = route[i].resolved_by(expiries[i]).context("bound")?;
-        ensure!(height <= bound, "resolved at {height}, bound {bound}");
-        ensure!(expiries.get(i + 1).is_none_or(|up| height < *up));
-        answered.push((q, response, witness));
-    }
-    for (f, (q, response, witness)) in fs.iter().zip(answered) {
-        f.paid_corrected(&q, response, witness, 2048)?;
-    }
-    // The recipient's payment, with her own note. The first lock expired
-    // long ago, and her activation keeps the expiry from voiding it.
-    if let Some((r, activation)) = received {
-        let (lock, pay) = (&legs[0].1, &legs[0].3);
-        let (publication, witness) = r.pay_claim(&certificate, lock, pay, Z, Some(activation))?;
-        let q = r.request_of(publication)?;
-        ensure!(q.request.amount == 3072);
+        Some(activation)
+    } else if hubs > 1 {
+        // The recipient's Hub learned the preimage at the last moment, and
+        // publishes it once its own lock has expired.
+        let tip = rt.height()?;
+        if tip < expiries[0] {
+            rt.mine(u64::from(expiries[0] - tip))?;
+        }
+        let activation = Native::activate(&rt, &Z)?;
+        let height = activation.reference.height;
+        ensure!(height >= expiries[0], "after its own lock expired");
+        let bound = route[0].activated_by(expiries[0]).context("bound")?;
+        ensure!(height <= bound, "activated at {height}, bound {bound}");
+        Some(activation)
+    } else {
+        None
+    };
+    // Every lock upstream expires later: that one activation is theirs too.
+    let z = match &activation {
+        Some(a) => {
+            ensure!(expiries[1..].iter().all(|e| a.reference.height < *e));
+            activated(&rt, a)?
+        }
+        None => Z,
+    };
+
+    // The sender asks for her refund, and her Hub counters it with the
+    // preimage it learned from its payee.
+    let lock = &legs[last].0;
+    let (publication, witness) = sender.refund_claim(&locked, lock, &refund)?;
+    let q = sender.request_of(publication)?;
+    let evidence = vec![Evidence::PayPreimage {
+        source: lock.proposal().id(),
+        preimage: z,
+    }];
+    let counter = sender.counter(&q, &evidence, None)?;
+    ensure!(counter.owed == 2048, "her Hub keeps what she sent");
+    let response = sender.respond_counter(&q, &counter, &counter_disclosures(&evidence)?)?;
+    ensure!(sender.published()?[0] == z, "her receipt");
+    sender.paid_corrected(&q, response, witness, 2048)?;
+
+    // Every payee paid on Bitcoin claims its payment with its notes. The
+    // lock expired long ago, and the activation keeps the expiry from
+    // voiding it.
+    let Some(activation) = activation else {
+        return Ok(());
+    };
+    let first = usize::from(!silent);
+    for (payee, (lock, terms, certificate, pay)) in payees.iter().zip(&legs).skip(first) {
+        let a = Some(activation.clone());
+        let (publication, witness) = payee.pay_claim(certificate, lock, pay, Z, a)?;
+        let q = payee.request_of(publication)?;
+        let value: u64 = pay.iter().map(|d| d.message().denomination()).sum();
+        ensure!(u64::from(q.request.amount) == 1024 + value);
+        expire(&rt, terms)?;
         let expired = [Evidence::Expired {
-            source: legs[0].1.proposal().id(),
+            source: lock.proposal().id(),
         }];
-        let chain = r.n.chain(&rt)?;
-        ensure!(r.counter(&q, &expired, Some(chain)).is_err());
-        let plain = r.respond_plain(&q)?;
-        r.paid_in_full(&q, plain, witness)?;
+        let chain = payee.n.chain(&rt)?;
+        ensure!(payee.counter(&q, &expired, Some(chain)).is_err());
+        let plain = payee.respond_plain(&q)?;
+        payee.paid_in_full(&q, plain, witness)?;
     }
     Ok(())
 }
@@ -494,19 +523,109 @@ fn withheld_receipt_of_a_hash_locked_payment_is_forced_onto_bitcoin() -> Result<
 }
 
 #[test]
-fn two_hub_route_resolves_on_bitcoin_when_every_hub_withholds() -> Result<()> {
+fn two_hub_route_pays_the_forwarding_hub_when_the_hub_upstream_is_silent() -> Result<()> {
     route(2, false)
 }
 
 #[test]
-fn three_hub_route_resolves_on_bitcoin_when_every_hub_withholds() -> Result<()> {
+fn three_hub_route_pays_every_forwarding_hub_when_the_hubs_upstream_are_silent() -> Result<()> {
     route(3, false)
 }
 
 /// The recipient's Hub is silent as well: she is paid by activating the
-/// first lock on Bitcoin, and every payer upstream still ends with the
-/// preimage or its refund.
+/// first lock on Bitcoin, and her Hub is paid upstream with her activation.
 #[test]
 fn route_recipient_whose_hub_is_silent_is_paid_by_activating_on_bitcoin() -> Result<()> {
     route(2, true)
+}
+
+/// A provider swapping between two Hubs pays the recipient at her Hub with
+/// notes that Hub issued to it, and is paid by the sender at hers. It learns
+/// the preimage only from the recipient's Hub, which can keep it. So the
+/// provider asks for its refund on Bitcoin once its lock has expired, and
+/// that Hub keeps the provider's notes only by publishing the preimage in
+/// its response, within its window. The lock that pays the provider must
+/// outlive that window: the windows nest, and a Hub with the same window as
+/// the recipient's could not admit it.
+///
+/// The provider reads the preimage in time and, with the sender's Hub
+/// silent too, activates the lock there and is paid on Bitcoin.
+#[test]
+fn provider_paying_at_a_hub_that_withholds_the_preimage_forces_it_in_time() -> Result<()> {
+    let rt = Regtest::start_standard()?;
+    let (to, from) = (hop(6), hop(WINDOW));
+    let contract = |w: &Hop, denominations, root, issuer| -> Result<Terms> {
+        Ok(Terms {
+            denominations,
+            t_a: 160,
+            w_h: u16::try_from(w.window)?,
+            root,
+            issuer,
+        })
+    };
+    let at_to = contract(&to, vec![1024, 2048], SPEND, None)?;
+    let provider = fixture_with(&rt, "native-forced-provider", at_to)?;
+    let sender = fixture_with(
+        &rt,
+        "native-forced-sender",
+        contract(&from, vec![1024, 2048], SPEND, None)?,
+    )?;
+    // The provider is a client of the sender's Hub as well.
+    let at_from = contract(&from, vec![2048], CLIENT, Some(sender.issuer.clone()))?;
+    let paid = fixture_with(&rt, "native-forced-paid", at_from)?;
+
+    let now = rt.height()?;
+    let e_to = now + 3;
+    let e_from = to.forced_upstream_expiry(e_to).context("height")?;
+    ensure!(to.admits(now, e_to) && from.admits(now, e_from));
+    ensure!(!to.admits(now, e_from), "the windows nest");
+
+    let refund = [derive(SPEND, &hold(), 1024, 30)];
+    let to_terms = provider.n.timed(lock_hash(&Z), e_to, DEPTH)?;
+    let to_lock = provider.lock(
+        &[0],
+        &[derive(PAYEE, &hold(), 1024, 30)],
+        &refund,
+        to_terms.clone(),
+    )?;
+    let from_terms = paid.n.timed(lock_hash(&Z), e_from, DEPTH)?;
+    let from_pay = [derive(CLIENT, &hold(), 1024, 30)];
+    let from_lock = sender.lock(&[0], &from_pay, &refund, from_terms.clone())?;
+    let certificate = Certificate::attest(&sender.issuer, &from_lock, &sender.notes[..1])?;
+    certificate.verify(paid.keyset())?;
+
+    // The recipient reveals the preimage to her Hub, which pays her and
+    // keeps it.
+    expire(&rt, &to_terms)?;
+    let (publication, witness) = provider.refund_claim(&[0], &to_lock, &refund)?;
+    let q = provider.request_of(publication)?;
+    let evidence = vec![Evidence::PayPreimage {
+        source: to_lock.proposal().id(),
+        preimage: Z,
+    }];
+    let counter = provider.counter(&q, &evidence, None)?;
+    ensure!(counter.owed == 2048, "the Hub keeps what the provider paid");
+    let response = provider.respond_counter(&q, &counter, &counter_disclosures(&evidence)?)?;
+    let z = provider.published()?[0];
+    ensure!(lock_hash(&z) == lock_hash(&Z), "published in the response");
+    let height = rt.height()?;
+    let bound = to.forced_by(e_to).context("bound")?;
+    ensure!(height <= bound, "read at {height}, bound {bound}");
+    let activation = Native::activate(&rt, &z)?;
+    ensure!(activation.reference.height < e_from, "in time");
+    provider.paid_corrected(&q, response, witness, 2048)?;
+
+    let (publication, witness) =
+        paid.pay_claim(&certificate, &from_lock, &from_pay, z, Some(activation))?;
+    let q = paid.request_of(publication)?;
+    ensure!(q.request.amount == 3072);
+    expire(&rt, &from_terms)?;
+    let expired = [Evidence::Expired {
+        source: from_lock.proposal().id(),
+    }];
+    ensure!(paid
+        .counter(&q, &expired, Some(paid.n.chain(&rt)?))
+        .is_err());
+    let plain = paid.respond_plain(&q)?;
+    paid.paid_in_full(&q, plain, witness)
 }
