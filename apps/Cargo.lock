@@ -1103,6 +1103,7 @@ dependencies = [
  "hex",
  "licash",
  "licash-api",
+ "lightning-invoice",
  "rand_core",
  "rusqlite",
  "serde",
@@ -1134,6 +1135,26 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "lightning-invoice"
+version = "0.34.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5e874476e461bcca94ae30335bc5263f126f9219fdbd7bde6e02b530dbaa6567"
+dependencies = [
+ "bech32",
+ "bitcoin",
+ "lightning-types",
+]
+
+[[package]]
+name = "lightning-types"
+version = "0.3.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c77c676d4a34cceb2ae3756916e446b4d17f9430a24107e099981f0f9aec77e6"
+dependencies = [
+ "bitcoin",
 ]
 
 [[package]]

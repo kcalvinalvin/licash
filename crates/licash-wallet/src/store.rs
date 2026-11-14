@@ -89,7 +89,8 @@ CREATE INDEX notes_spent_by ON notes (spent_by);
 -- refunded: the lock asked for (a Lock body), then the hub's certificate,
 -- then the branch its hub settled, once the wallet kept its notes of it.
 -- An uncertified lock is given up only once its hub refused it, which
--- proves the hub never recorded it.
+-- proves the hub never recorded it. A lock to the hub may pay a Lightning
+-- `invoice` through it, and record why the hub failed or refused to.
 CREATE TABLE locks (
     id BLOB PRIMARY KEY,
     hub INTEGER NOT NULL REFERENCES hubs (id),
@@ -103,9 +104,28 @@ CREATE TABLE locks (
     -- 'pay' or 'refund'.
     settled TEXT,
     preimage BLOB,
+    invoice TEXT,
+    failure TEXT,
     created_at INTEGER NOT NULL,
     done_at INTEGER,
     abandoned TEXT
+) STRICT;
+-- Payments asked for over Lightning, by their hash: the preimage only the
+-- wallet knows and the receipt asked for (a Receive body), recorded before
+-- the hub hears of them, then the hub's invoice and, once it was paid, the
+-- lock of the hub's notes the wallet claims. Done once claimed; canceled
+-- once the hub refused it or canceled the invoice.
+CREATE TABLE invoices (
+    hash BLOB PRIMARY KEY,
+    hub INTEGER NOT NULL REFERENCES hubs (id),
+    preimage BLOB NOT NULL,
+    amount INTEGER NOT NULL,
+    body TEXT NOT NULL,
+    request TEXT,
+    lock BLOB,
+    created_at INTEGER NOT NULL,
+    done_at INTEGER,
+    canceled TEXT
 ) STRICT;
 -- Payments taken, and locks claimed.
 CREATE TABLE receipts (

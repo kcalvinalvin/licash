@@ -45,6 +45,11 @@ pub struct Lock {
     /// The height from which, at its depth, the lock is refunded unpaid.
     pub expiry: u32,
     pub state: LockState,
+    /// The Lightning invoice the lock pays through its hub, if any.
+    pub invoice: Option<String>,
+    /// Why its hub failed or refused to pay the invoice: the lock is
+    /// refunded.
+    pub failure: Option<String>,
     pub created_at: i64,
 }
 
@@ -72,7 +77,7 @@ type Settlement = (Branch, Issued, Option<[u8; 32]>);
 /// The latest expiry the hub admits at `locks.height` for a lock of
 /// `depth`: decided within its response window and the checkpoint's
 /// header budget.
-fn latest_expiry(locks: &Locks, checkpoint: &Checkpoint, depth: u32) -> u32 {
+pub(crate) fn latest_expiry(locks: &Locks, checkpoint: &Checkpoint, depth: u32) -> u32 {
     let slack = depth.saturating_add(locks.reaction);
     let window = locks.height.saturating_add(locks.window);
     let budget = checkpoint.height().saturating_add(locks.max_headers);
@@ -95,6 +100,20 @@ impl<T: Transport> Wallet<T> {
         amount: u64,
         hash: [u8; 32],
         expiry: Option<u32>,
+    ) -> Result<Lock, Error> {
+        self.lock_paying(url, payee, amount, hash, expiry, None)
+            .await
+    }
+
+    /// [`Wallet::lock`], paying `invoice` through the hub once certified.
+    pub(crate) async fn lock_paying(
+        &self,
+        url: &str,
+        payee: &Address,
+        amount: u64,
+        hash: [u8; 32],
+        expiry: Option<u32>,
+        invoice: Option<&str>,
     ) -> Result<Lock, Error> {
         let url = hub_url(url)?;
         if amount == 0 {
@@ -165,8 +184,9 @@ impl<T: Transport> Wallet<T> {
             serde_json::to_string(&licash_api::Lock::new(&signed, &notes)).map_err(invalid)?;
         self.store.write(|tx| {
             tx.execute(
-                "INSERT INTO locks (id, hub, payee, hash, expiry, amount, fee, request, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                "INSERT INTO locks
+                    (id, hub, payee, hash, expiry, amount, fee, request, invoice, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     id.as_bytes(),
                     hub,
@@ -176,6 +196,7 @@ impl<T: Transport> Wallet<T> {
                     sql(amount),
                     sql(fee),
                     request,
+                    invoice,
                     now()
                 ],
             )?;
@@ -228,11 +249,20 @@ impl<T: Transport> Wallet<T> {
     }
 
     async fn advance_lock_from(&self, id: &ProposalId) -> Result<(), Error> {
-        type Row = (i64, String, String, bool, bool, Option<String>);
+        type Row = (
+            i64,
+            String,
+            String,
+            bool,
+            bool,
+            Option<String>,
+            Option<String>,
+        );
         let row: Row = self.store.read(|c| {
             Ok(c.query_row(
                 "SELECT l.hub, r.url, l.request, l.certificate IS NOT NULL,
-                    l.done_at IS NOT NULL, l.abandoned
+                    l.done_at IS NOT NULL, l.abandoned,
+                    CASE WHEN l.failure IS NULL THEN l.invoice END
                  FROM locks l JOIN reach r ON r.hub = l.hub WHERE l.id = ?1",
                 [id.as_bytes()],
                 |r| {
@@ -243,11 +273,12 @@ impl<T: Transport> Wallet<T> {
                         r.get(3)?,
                         r.get(4)?,
                         r.get(5)?,
+                        r.get(6)?,
                     ))
                 },
             )?)
         })?;
-        let (hub, url, request, certified, done, abandoned) = row;
+        let (hub, url, request, certified, done, abandoned, invoice) = row;
         if let Some(reason) = abandoned {
             let id = hex::encode(id.as_bytes());
             return Err(Error::Abandoned { id, reason });
@@ -280,6 +311,9 @@ impl<T: Transport> Wallet<T> {
                 Ok(())
             })?;
             tracing::info!(id = %hex::encode(id.as_bytes()), %url, "locked");
+        }
+        if let Some(invoice) = invoice {
+            self.ask_payment(&url, id, &invoice).await?;
         }
         let terms = signed.proposal().lock().expect("a lock").terms().clone();
         let state: licash_api::LockState = self.get(&url, &licash_api::lock_state(id)).await?;
@@ -471,7 +505,7 @@ impl<T: Transport> Wallet<T> {
 
 const LOCKS: &str = "SELECT l.id, r.url, l.payee, l.hash, l.amount, l.fee, l.expiry,
     l.certificate IS NOT NULL, l.settled, l.preimage, l.done_at IS NOT NULL, l.abandoned,
-    l.created_at
+    l.created_at, l.invoice, l.failure
     FROM locks l JOIN reach r ON r.hub = l.hub";
 
 fn lock_of(r: &Row<'_>) -> rusqlite::Result<Result<Lock, Error>> {
@@ -502,6 +536,8 @@ fn lock_of(r: &Row<'_>) -> rusqlite::Result<Result<Lock, Error>> {
         fee: fee as u64,
         expiry: r.get(6)?,
         state,
+        invoice: r.get(13)?,
+        failure: r.get(14)?,
         created_at: r.get(12)?,
     }))
 }
