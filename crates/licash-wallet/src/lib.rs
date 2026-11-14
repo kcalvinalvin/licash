@@ -32,7 +32,7 @@ mod silent;
 mod store;
 mod swaps;
 
-use std::{cmp::Reverse, future::Future, path::Path};
+use std::{cmp::Reverse, collections::HashSet, future::Future, path::Path, sync::Mutex};
 
 use licash::{
     address::{Address, Ephemeral, OwnerKeys},
@@ -249,6 +249,8 @@ pub struct Wallet<T> {
     keys: code::CodeKeys,
     network: ChainProfile,
     transport: T,
+    /// The hubs reached over plain HTTP asked over HTTPS since opened.
+    asked_secure: Mutex<HashSet<i64>>,
 }
 
 /// A note the wallet holds, with where it was made: the scan key derives
@@ -301,6 +303,7 @@ impl<T: Transport> Wallet<T> {
             keys,
             network,
             transport,
+            asked_secure: Mutex::default(),
         })
     }
 
@@ -334,6 +337,7 @@ impl<T: Transport> Wallet<T> {
             owner,
             network,
             transport,
+            asked_secure: Mutex::default(),
         })
     }
 
@@ -357,9 +361,25 @@ impl<T: Transport> Wallet<T> {
 
     /// Trust the hub at `url`, and learn its keysets and fees. Again, to
     /// learn what changed. Refused if it follows another network than the
-    /// wallet's.
+    /// wallet's. A hub reached over plain HTTP is asked over HTTPS too,
+    /// once a wallet is opened, even if unavailable over plain HTTP: the
+    /// same hub there is reached there from then on, and still known at
+    /// the other URL.
     pub async fn add_hub(&self, url: &str) -> Result<Info, Error> {
-        Ok(self.refresh(&hub_url(url)?).await?.1)
+        let url = hub_url(url)?;
+        let refreshed = self.refresh(&url).await;
+        let hub = match &refreshed {
+            Ok((hub, _)) => Some(*hub),
+            Err(Error::Unavailable { .. }) => self.hub(&url).ok().map(|(hub, _)| hub),
+            Err(_) => None,
+        };
+        if let Some(info) = match hub {
+            Some(hub) => self.secure(hub).await,
+            None => None,
+        } {
+            return Ok(info);
+        }
+        refreshed.map(|(_, info)| info)
     }
 
     /// The hubs added, by URL, and what each last said of itself.
@@ -405,11 +425,69 @@ impl<T: Transport> Wallet<T> {
         })
     }
 
-    /// What the hub at `url` says of itself, kept: its id and info. A
-    /// keyset belongs to the hub that first advertised it.
+    /// What the hub at `url` says of itself, kept: its id and info. A hub
+    /// known at `url` is asked where the wallet reaches it.
     async fn refresh(&self, url: &str) -> Result<(i64, Info), Error> {
+        let reached: Option<String> = self.store.read(|c| {
+            Ok(c.query_row(
+                "SELECT r.url FROM hub_urls u JOIN reach r ON r.hub = u.hub WHERE u.url = ?1",
+                [url],
+                |r| r.get(0),
+            )
+            .optional()?)
+        })?;
+        let url = reached.as_deref().unwrap_or(url);
+        let info = self.info(url).await?;
+        Ok((self.keep_info(url, &info)?, info))
+    }
+
+    /// The hub `hub` asked over HTTPS, at most once since the wallet was
+    /// opened, if reached over plain HTTP: what it says there, if it is
+    /// the same hub, reached there from now on.
+    async fn secure(&self, hub: i64) -> Option<Info> {
+        let reached = self.reached(hub).ok()?;
+        let url = secure_url(&reached)?;
+        if !self.asked_secure.lock().ok()?.insert(hub) {
+            return None;
+        }
+        let info = match self.info(&url).await {
+            Ok(info) => info,
+            Err(e) => {
+                tracing::debug!(%url, "hub not reached over HTTPS: {e}");
+                return None;
+            }
+        };
+        // Not keysets all new to the wallet: another hub, or one it would
+        // take as a hub of its own.
+        let known = self.keysets(hub).ok()?;
+        let theirs = info.keysets().ok()?;
+        if !theirs
+            .iter()
+            .any(|k| known.iter().any(|o| o.id() == k.id()))
+        {
+            tracing::warn!(%url, http = %reached, "another hub over HTTPS than over HTTP");
+            return None;
+        }
+        match self.keep_info(&url, &info) {
+            Ok(kept) if kept == hub => Some(info),
+            Ok(_) => None,
+            Err(e) => {
+                tracing::warn!(%url, "hub not reached over HTTPS: {e}");
+                None
+            }
+        }
+    }
+
+    /// The URL the wallet reaches the hub `hub` at.
+    fn reached(&self, hub: i64) -> Result<String, Error> {
+        self.store
+            .read(|c| Ok(c.query_row("SELECT url FROM reach WHERE hub = ?1", [hub], |r| r.get(0))?))
+    }
+
+    /// What the hub at `url` says of itself, if it follows the wallet's
+    /// network.
+    async fn info(&self, url: &str) -> Result<Info, Error> {
         let info: Info = self.get(url, licash_api::INFO).await?;
-        let keysets = info.keysets().map_err(|p| unavailable(url, p))?;
         if let Some(locks) = &info.locks {
             let profile = locks
                 .checkpoint()
@@ -422,23 +500,53 @@ impl<T: Transport> Wallet<T> {
                 )));
             }
         }
-        let text = serde_json::to_string(&info).map_err(invalid)?;
+        Ok(info)
+    }
+
+    /// Keep `info`, what the hub at `url` says of itself: its id. A keyset
+    /// belongs to the hub that first advertised it: another URL advertising
+    /// it is not that hub, unless it is the URL the hub is reached at, over
+    /// HTTPS rather than plain HTTP. The hub is reached there from then on,
+    /// and still known at the other URL.
+    fn keep_info(&self, url: &str, info: &Info) -> Result<i64, Error> {
+        let keysets = info.keysets().map_err(|p| unavailable(url, p))?;
+        let text = serde_json::to_string(info).map_err(invalid)?;
         let hub = self.store.write(|tx| {
-            let known: Option<i64> = tx
+            let mut known: Option<i64> = tx
                 .query_row("SELECT hub FROM hub_urls WHERE url = ?1", [url], |r| {
                     r.get(0)
                 })
                 .optional()?;
+            let mut others: Vec<(i64, String)> = Vec::new();
             for keyset in &keysets {
-                let other: Option<String> = tx
+                let other = tx
                     .query_row(
-                        "SELECT r.url FROM keysets k JOIN reach r ON r.hub = k.hub
+                        "SELECT r.hub, r.url FROM keysets k JOIN reach r ON r.hub = k.hub
                          WHERE k.id = ?1 AND k.hub IS NOT ?2",
                         params![keyset.id(), known],
-                        |r| r.get(0),
+                        |r| Ok((r.get(0)?, r.get(1)?)),
                     )
                     .optional()?;
-                if let Some(other) = other {
+                if let Some(other) = other.filter(|o| !others.contains(o)) {
+                    others.push(other);
+                }
+            }
+            match (known, others.as_slice()) {
+                (_, []) => {}
+                (None, [(hub, other)]) if secure_url(other).as_deref() == Some(url) => {
+                    // The row's id keeps the URL first, the one reached.
+                    tx.execute(
+                        "UPDATE hub_urls SET url = ?1 WHERE url = ?2",
+                        params![url, other],
+                    )?;
+                    tx.execute(
+                        "INSERT INTO hub_urls (url, hub) VALUES (?1, ?2)",
+                        params![other, hub],
+                    )?;
+                    tracing::info!(%url, http = %other, "hub reached over HTTPS from now on");
+                    known = Some(*hub);
+                }
+                (_, [(_, other), ..]) => {
                     return Err(Error::Invalid(format!(
                         "hub {url} advertises a keyset of hub {other}"
                     )));
@@ -475,7 +583,7 @@ impl<T: Transport> Wallet<T> {
             Ok(hub)
         })?;
         tracing::info!(%url, keysets = keysets.len(), "hub info");
-        Ok((hub, info))
+        Ok(hub)
     }
 
     /// The hub at `url`: its id and what it last said of itself.
@@ -1510,4 +1618,12 @@ fn hub_url(url: &str) -> Result<String, Error> {
         return Err(Error::Invalid(format!("not a hub URL: {url}")));
     }
     Ok(url.to_owned())
+}
+
+/// The hub URL `url`, of plain HTTP, over HTTPS instead: not of an onion
+/// service, which Tor authenticates already.
+fn secure_url(url: &str) -> Option<String> {
+    let rest = url.strip_prefix("http://")?;
+    let host = rest.split(['/', ':']).next().unwrap_or(rest);
+    (!host.ends_with(".onion")).then(|| format!("https://{rest}"))
 }

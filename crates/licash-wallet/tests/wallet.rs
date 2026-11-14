@@ -363,6 +363,80 @@ async fn only_hubs_added_are_trusted() {
 }
 
 #[tokio::test]
+async fn a_hub_over_plain_http_is_reached_over_https_once_it_answers_the_same_there() {
+    const SECURE: &str = "https://hub.test";
+    let net = network();
+    let bob = party(&net, 2).await;
+    bob.receive(&net.pay(HUB, &bob.address(), 8)).unwrap();
+    net.alias(SECURE, HUB);
+    // Asked over HTTPS once since opened: not again.
+    bob.add_hub(HUB).await.unwrap();
+    assert_eq!(bob.hubs().unwrap()[0].0, HUB);
+
+    // Added over HTTPS: the same hub, its notes with it, reached there from
+    // now on, and still known at the other URL.
+    bob.add_hub(SECURE).await.unwrap();
+    let hubs = bob.hubs().unwrap();
+    assert_eq!((hubs.len(), hubs[0].0.as_str()), (1, SECURE));
+    let balance = bob.balance().unwrap();
+    assert_eq!((balance[0].hub.as_str(), balance[0].available), (SECURE, 8));
+    bob.add_hub(HUB).await.unwrap();
+    assert_eq!(bob.hubs().unwrap().len(), 1);
+
+    // A wallet adding it over plain HTTP: reached over HTTPS at once.
+    let alice = party(&net, 1).await;
+    assert_eq!(alice.hubs().unwrap()[0].0, SECURE);
+    let paid = bob.send(HUB, &alice.address(), 4).await.unwrap();
+    assert_eq!(paid.payment.hub, SECURE);
+    assert_eq!(alice.receive(&paid.payment).unwrap().amount, 4);
+    // Never back to plain HTTP from HTTPS.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("w.sqlite");
+    let network = ChainProfile::Core30DefaultRegtest;
+    let carol = Wallet::create(&path, &[3; 32], network, Link(net.clone())).unwrap();
+    carol.add_hub(SECURE).await.unwrap();
+    assert!(matches!(carol.add_hub(HUB).await, Err(Error::Invalid(_))));
+    // Another host's URL over HTTPS is not the hub.
+    net.alias("https://mirror.test", HUB);
+    let mirror = carol.add_hub("https://mirror.test").await;
+    assert!(matches!(mirror, Err(Error::Invalid(_))), "{mirror:?}");
+    assert_eq!(carol.hubs().unwrap().len(), 1);
+
+    // Asked over HTTPS only, even at the other URL: another hub answering
+    // over plain HTTP there is not taken for it.
+    let keysets = bob.hubs().unwrap()[0].1.keysets.clone();
+    net.start(HUB, FEE);
+    bob.add_hub(HUB).await.unwrap();
+    let hubs = bob.hubs().unwrap();
+    assert_eq!(hubs.len(), 1);
+    assert!(hubs[0].1.keysets == keysets);
+}
+
+#[tokio::test]
+async fn a_hub_over_plain_http_is_asked_over_https_again_once_its_wallet_is_opened_again() {
+    let net = network();
+    let bob = party(&net, 2).await;
+    net.alias("https://hub.test", HUB);
+    let path = bob._dir.path().join("w.sqlite");
+    let again = Wallet::open_with_seed(&path, &[2; 32], Link(net.clone())).unwrap();
+    assert_eq!(again.hubs().unwrap()[0].0, HUB);
+    // Even unavailable over plain HTTP, as through Tor to a server only
+    // redirecting to HTTPS.
+    net.fail(licash_api::INFO, Fault::Lost);
+    again.add_hub(HUB).await.unwrap();
+    assert_eq!(again.hubs().unwrap()[0].0, "https://hub.test");
+}
+
+#[tokio::test]
+async fn another_hub_over_https_is_neither_reached_nor_trusted_unasked() {
+    let net = network();
+    net.start("https://hub.test", FEE);
+    let bob = party(&net, 2).await;
+    let hubs = bob.hubs().unwrap();
+    assert_eq!((hubs.len(), hubs[0].0.as_str()), (1, HUB));
+}
+
+#[tokio::test]
 async fn a_payment_beyond_the_balance_is_refused_before_the_hub_hears_of_it() {
     let net = network();
     let (alice, bob) = (party(&net, 1).await, party(&net, 2).await);
