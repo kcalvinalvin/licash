@@ -155,7 +155,7 @@ impl Net {
         (keys, keyset)
     }
 
-    fn serve(&self, url: &str, body: Option<Vec<u8>>) -> Result<Response, String> {
+    pub fn serve(&self, url: &str, body: Option<Vec<u8>>) -> Result<Response, String> {
         let at = url.find("/v1/").ok_or("no such path")?;
         let (site, path) = url.split_at(at);
         let fault = {

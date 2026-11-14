@@ -13,7 +13,9 @@
 //! wallet once it expired unpaid: see [`Wallet::lock`] and
 //! [`Wallet::claim`]. Through a hub's Lightning gateway, the wallet pays
 //! invoices with locks and is paid with locks of the hub's notes: see
-//! [`Wallet::pay_invoice`] and [`Wallet::invoice`].
+//! [`Wallet::pay_invoice`] and [`Wallet::invoice`]. Through a swap
+//! provider, it swaps notes at one hub for notes at another with a lock at
+//! each: see [`Wallet::swap`].
 //!
 //! The wallet reaches hubs through the application's [`Transport`]: HTTP
 //! over TCP or Tor, or a test. Its seed alone does not restore its notes:
@@ -23,6 +25,7 @@ mod coins;
 mod lightning;
 mod locks;
 mod store;
+mod swaps;
 
 use std::{cmp::Reverse, future::Future, path::Path};
 
@@ -45,8 +48,9 @@ use serde::{de::DeserializeOwned, Serialize};
 
 pub use coins::MAX_INPUTS;
 pub use lightning::{Invoice, InvoiceState};
-pub use locks::{Lock, LockState, CLAIM_MARGIN};
+pub use locks::{Incoming, Lock, LockState, CLAIM_MARGIN};
 use store::{now, sql, Store};
+pub use swaps::{Swap, SwapState, SWAP_WINDOW};
 
 /// A hub's answer: its HTTP status and body.
 #[derive(Clone, Debug)]
@@ -171,6 +175,8 @@ pub struct Resumed {
     pub locks: Vec<Lock>,
     /// Invoices taken on, where each stands now.
     pub invoices: Vec<Invoice>,
+    /// Swaps taken on, where each stands now.
+    pub swaps: Vec<Swap>,
     /// Given up, their notes freed, by id and why.
     pub abandoned: Vec<(String, String)>,
     /// Still under way, by id and why.
@@ -854,7 +860,7 @@ impl<T: Transport> Wallet<T> {
     }
 
     /// Finish every payment under way, or give up those their hubs refuse,
-    /// and take every lock and invoice under way on.
+    /// and take every lock, invoice and swap under way on.
     pub async fn resume(&self) -> Result<Resumed, Error> {
         let ids: Vec<[u8; 32]> = self.store.read(|c| {
             let mut stmt = c.prepare(
@@ -900,6 +906,15 @@ impl<T: Transport> Wallet<T> {
         for hash in self.open_invoices()? {
             match self.advance_invoice(&hash).await {
                 Ok(invoice) => resumed.invoices.push(invoice),
+                Err(Error::Pending { reason, .. }) => {
+                    resumed.pending.push((hex::encode(hash), reason));
+                }
+                Err(e) => resumed.pending.push((hex::encode(hash), e.to_string())),
+            }
+        }
+        for hash in self.open_swaps()? {
+            match self.advance_swap(&hash).await {
+                Ok(swap) => resumed.swaps.push(swap),
                 Err(Error::Pending { reason, .. }) => {
                     resumed.pending.push((hex::encode(hash), reason));
                 }

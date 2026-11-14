@@ -258,3 +258,42 @@ async fn a_preimage_revealed_past_expiry_does_not_pay_the_lock() {
     );
     assert_eq!(available(&alice), (62, 0));
 }
+
+#[tokio::test]
+async fn a_payee_sees_what_a_lock_pays_it_before_revealing_anything() {
+    let (net, alice, bob) = parties().await;
+    let lock = alice
+        .lock(HUB, &bob.address(), 10, hash(), Some(12))
+        .await
+        .unwrap();
+    let incoming = bob.incoming(HUB, &lock.id).await.unwrap();
+    assert_eq!(
+        (
+            incoming.amount,
+            incoming.hash,
+            incoming.expiry,
+            incoming.height
+        ),
+        (10, hash(), 12, 3)
+    );
+    assert_eq!((incoming.settled, incoming.preimage), (None, None));
+    // It pays Alice her change, and Carol nothing.
+    assert_eq!(alice.incoming(HUB, &lock.id).await.unwrap().amount, 52);
+    let carol = party(&net, 3).await;
+    assert!(matches!(
+        carol.incoming(HUB, &lock.id).await,
+        Err(Error::PaysNothing)
+    ));
+    assert!(matches!(
+        bob.incoming(HUB, &"00".repeat(32)).await,
+        Err(Error::Refused { problem, .. }) if problem.code == Code::UnknownLock
+    ));
+
+    bob.claim(HUB, &lock.id, &PREIMAGE).await.unwrap();
+    net.mine(HUB, 1, None);
+    let paid = bob.incoming(HUB, &lock.id).await.unwrap();
+    assert_eq!(
+        (paid.settled, paid.preimage, paid.height),
+        (Some(licash_api::Settled::Pay), Some(PREIMAGE), 4)
+    );
+}

@@ -52,6 +52,24 @@ pub struct Lock {
     pub created_at: i64,
 }
 
+/// A lock at a hub that pays this wallet, as its hub holds it: certified,
+/// so that its hub owes one branch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Incoming {
+    pub id: String,
+    pub hub: String,
+    /// What its pay branch pays this wallet.
+    pub amount: u64,
+    pub hash: [u8; 32],
+    pub expiry: u32,
+    /// The height its hub scanned to.
+    pub height: u32,
+    /// The branch its hub issued, if any.
+    pub settled: Option<Settled>,
+    /// Known once it was paid or activated on Bitcoin.
+    pub preimage: Option<[u8; 32]>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum LockState {
@@ -422,6 +440,58 @@ impl<T: Transport> Wallet<T> {
             .collect()
     }
 
+    /// The lock `id` at the hub at `url`, as its hub holds it: what its
+    /// pay branch pays this wallet, under which hash, until when, and where
+    /// it stands. [`Error::PaysNothing`] unless it pays this wallet.
+    pub async fn incoming(&self, url: &str, id: &str) -> Result<Incoming, Error> {
+        let url = hub_url(url)?;
+        let id = payment_id(id)?;
+        let (info, _, view) = self.lock_view(&url, &id).await?;
+        let proposal = &view.proposal;
+        let outputs = proposal.outputs();
+        let amount: u64 = self
+            .owner
+            .scan_key()
+            .receive(proposal)?
+            .iter()
+            .filter(|r| r.branch == Branch::Pay)
+            .map(|r| outputs[r.position as usize].denomination())
+            .sum();
+        if amount == 0 {
+            return Err(Error::PaysNothing);
+        }
+        let terms = proposal.lock().expect("a lock").terms();
+        Ok(Incoming {
+            id: hex::encode(id.as_bytes()),
+            hub: url,
+            amount,
+            hash: *terms.hash(),
+            expiry: terms.expiry(),
+            height: info.locks.map_or(0, |l| l.height),
+            settled: view.settled,
+            preimage: view.preimage,
+        })
+    }
+
+    /// The lock `id` as the hub at `url` holds it, decoded and checked, with
+    /// its keyset and what the hub says of itself.
+    async fn lock_view(
+        &self,
+        url: &str,
+        id: &ProposalId,
+    ) -> Result<(licash_api::Info, Keyset, licash_api::LockView), Error> {
+        let (hub, info) = self.refresh(url).await?;
+        let keysets = self.keysets(hub)?;
+        let lookup = |id: &[u8; 32]| keysets.iter().find(|k| k.id() == id);
+        let state: licash_api::LockState = self.get(url, &licash_api::lock_state(id)).await?;
+        let view = state.decode(lookup).map_err(|p| unavailable(url, p))?;
+        if view.proposal.id() != *id {
+            return Err(unavailable(url, "it answered with another lock"));
+        }
+        let keyset = lookup(view.proposal.keyset_id()).expect("decoded under it");
+        Ok((info, keyset.clone(), view))
+    }
+
     /// Take the notes the lock `id` at the hub at `url` pays this wallet,
     /// revealing `preimage`, the preimage of its hash. Refused without
     /// revealing it within [`CLAIM_MARGIN`] blocks of the lock's expiry, as
@@ -429,20 +499,13 @@ impl<T: Transport> Wallet<T> {
     pub async fn claim(&self, url: &str, id: &str, preimage: &[u8; 32]) -> Result<Received, Error> {
         let url = hub_url(url)?;
         let id = payment_id(id)?;
-        let (hub, info) = self.refresh(&url).await?;
-        let keysets = self.keysets(hub)?;
-        let lookup = |id: &[u8; 32]| keysets.iter().find(|k| k.id() == id);
-        let state: licash_api::LockState = self.get(&url, &licash_api::lock_state(&id)).await?;
-        let view = state.decode(lookup).map_err(|p| unavailable(&url, p))?;
+        let (info, keyset, view) = self.lock_view(&url, &id).await?;
+        let keyset = &keyset;
         let proposal = &view.proposal;
-        if proposal.id() != id {
-            return Err(unavailable(&url, "it answered with another lock"));
-        }
         let terms = proposal.lock().expect("a lock").terms();
         if lock_hash(preimage) != *terms.hash() {
             return Err(Error::Invalid("not the preimage of the lock's hash".into()));
         }
-        let keyset = lookup(proposal.keyset_id()).expect("decoded under it");
         let ours = self.owner.scan_key().receive(proposal)?;
         if !ours.iter().any(|r| r.branch == Branch::Pay) {
             return Err(Error::PaysNothing);

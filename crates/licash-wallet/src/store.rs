@@ -127,6 +127,24 @@ CREATE TABLE invoices (
     done_at INTEGER,
     canceled TEXT
 ) STRICT;
+-- Swaps of notes at one hub for notes at another through a provider, by
+-- the hash of a preimage only the wallet knows, recorded before the lock to
+-- the provider (in locks, under that hash) is made; then the provider's
+-- lock to the wallet at the other hub, which the wallet claims with the
+-- preimage. Done once claimed; failed once the provider did not lock.
+CREATE TABLE swaps (
+    hash BLOB PRIMARY KEY,
+    provider TEXT NOT NULL,
+    preimage BLOB NOT NULL,
+    from_hub INTEGER NOT NULL REFERENCES hubs (id),
+    to_hub INTEGER NOT NULL REFERENCES hubs (id),
+    amount INTEGER NOT NULL,
+    fee INTEGER NOT NULL,
+    theirs BLOB,
+    created_at INTEGER NOT NULL,
+    done_at INTEGER,
+    failed TEXT
+) STRICT;
 -- Payments taken, and locks claimed.
 CREATE TABLE receipts (
     id BLOB PRIMARY KEY,
