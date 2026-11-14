@@ -17,7 +17,7 @@ use rustls::{
 };
 use serde_json::{json, Value};
 
-use super::{Attempt, Call, Currency, Held, HeldState, Node, NodeInfo, Status};
+use super::{Attempt, Call, Currency, Held, HeldState, Liquidity, Node, NodeInfo, Status};
 
 /// How long a call waits for the node.
 const TIMEOUT: Duration = Duration::from_secs(30);
@@ -197,6 +197,19 @@ impl Node for Lnd {
                     .ok_or("LND answered without its height")?,
                 block_hash,
                 currency,
+            })
+        })
+    }
+
+    fn liquidity(&self) -> Call<'_, Liquidity> {
+        Box::pin(async move {
+            let balance = self.get("/v1/balance/channels").await?;
+            let sat = |key: &str| {
+                num(&balance[key]["sat"]).ok_or_else(|| format!("LND answered without {key}"))
+            };
+            Ok(Liquidity {
+                local: sat("local_balance")?,
+                remote: sat("remote_balance")?,
             })
         })
     }

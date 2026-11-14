@@ -13,7 +13,7 @@ use bitcoin::{
 };
 use lightning_invoice::{Bolt11Invoice, Currency, InvoiceBuilder, PaymentSecret};
 
-use super::{Attempt, Call, Held, HeldState, Node, NodeInfo, Status};
+use super::{Attempt, Call, Held, HeldState, Liquidity, Node, NodeInfo, Status};
 
 /// How a payment the node makes ends.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -49,6 +49,8 @@ struct State {
     outcomes: HashMap<[u8; 32], Outcome>,
     sent: Vec<Sent>,
     down: bool,
+    /// Ample unless set.
+    liquidity: Option<Liquidity>,
 }
 
 impl Default for Fake {
@@ -78,6 +80,11 @@ impl Fake {
     pub fn tip(&self, height: u32, hash: [u8; 32]) {
         let mut state = self.state();
         (state.height, state.block_hash) = (height, hash);
+    }
+
+    /// Pay `local` and be paid `remote` over its channels at most.
+    pub fn channels(&self, local: u64, remote: u64) {
+        self.state().liquidity = Some(Liquidity { local, remote });
     }
 
     /// Answer nothing while `down`.
@@ -185,6 +192,16 @@ impl Node for Fake {
             currency: Currency::Regtest,
         });
         Box::pin(async move { info })
+    }
+
+    fn liquidity(&self) -> Call<'_, Liquidity> {
+        let liquidity = self.up().map(|state| {
+            state.liquidity.unwrap_or(Liquidity {
+                local: u64::MAX,
+                remote: u64::MAX,
+            })
+        });
+        Box::pin(async move { liquidity })
     }
 
     fn pay(&self, request: String, fee_limit: u64, cltv_limit: u32, _timeout: u32) -> Call<'_, ()> {

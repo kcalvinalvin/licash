@@ -522,3 +522,41 @@ async fn a_failure_of_an_earlier_payment_of_its_hash_is_not_the_forwards() {
     let second = wallet.follow_lock(&second.id).await.unwrap();
     assert_eq!(second.state, LockState::Paid(preimage));
 }
+
+#[tokio::test]
+async fn the_operator_is_alerted_once_of_each_way_the_node_moves_too_little() {
+    let net = Net::new().await;
+    let said = || -> Vec<String> {
+        let events = net.hub.events(0, 1000).unwrap();
+        let notices = events.iter().filter_map(|e| e.notice());
+        notices
+            .filter_map(|n| match n {
+                licash_hub::Notice::Alert { message } => Some(message),
+                _ => None,
+            })
+            .collect()
+    };
+    assert!(said().is_empty());
+    // config() takes invoices and receipts of up to 100 sat.
+    net.node.channels(99, 100);
+    net.gateway.round().await;
+    net.gateway.round().await;
+    let alerts = said();
+    assert_eq!(alerts.len(), 1, "{alerts:?}");
+    assert!(alerts[0].contains("can pay 99 sat"), "{}", alerts[0]);
+    assert!(alerts[0].contains("--ln-max-pay"), "{}", alerts[0]);
+
+    net.node.channels(100, 0);
+    net.gateway.round().await;
+    net.node.channels(50, 0);
+    net.gateway.round().await;
+    let alerts = said();
+    assert_eq!(alerts.len(), 3, "{alerts:?}");
+    assert!(alerts[1].contains("can receive 0 sat"), "{}", alerts[1]);
+    assert!(alerts[2].contains("can pay 50 sat"), "{}", alerts[2]);
+
+    // Unread channels say nothing.
+    net.node.down(true);
+    net.gateway.round().await;
+    assert_eq!(said().len(), 3);
+}

@@ -49,6 +49,13 @@ pub struct NodeInfo {
     pub currency: Currency,
 }
 
+/// What a node can pay and be paid over its channels now, in satoshis.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Liquidity {
+    pub local: u64,
+    pub remote: u64,
+}
+
 /// The latest attempt of a node to pay a hash.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Attempt {
@@ -86,6 +93,7 @@ pub enum HeldState {
 /// [`lnd::Lnd`].
 pub trait Node: Send + Sync {
     fn info(&self) -> Call<'_, NodeInfo>;
+    fn liquidity(&self) -> Call<'_, Liquidity>;
     /// Start paying `request`, for at most `fee_limit` satoshis of routing
     /// fees, along routes whose timelock ends within `cltv_limit` blocks,
     /// trying for at most `timeout` seconds. A payment already under way
@@ -273,6 +281,7 @@ impl Gateway {
             }
             Err(e) => tracing::warn!(error = %e, "the Lightning node does not answer"),
         }
+        self.check_liquidity().await;
         if let Err(e) = self.follow_payments().await {
             tracing::warn!(error = %e.0.message, "cannot follow Lightning payments");
         }
@@ -308,6 +317,39 @@ impl Gateway {
             return Err(unavailable("the Lightning node follows another chain"));
         }
         Ok(View { info, tip })
+    }
+
+    /// Alert the operator of each way the node can move less than the most
+    /// the gateway takes: once, until it can again.
+    async fn check_liquidity(&self) {
+        let liquidity = match self.node.liquidity().await {
+            Ok(liquidity) => liquidity,
+            Err(e) => return tracing::warn!(error = %e, "cannot read the Lightning channels"),
+        };
+        let ways = [
+            ("pay", liquidity.local, self.config.max_pay, "--ln-max-pay"),
+            (
+                "receive",
+                liquidity.remote,
+                self.config.max_receive,
+                "--ln-max-receive",
+            ),
+        ];
+        for (way, can, most, flag) in ways {
+            let key = format!("liquidity {way}");
+            if can >= most {
+                self.alerted
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&key);
+                continue;
+            }
+            let message = format!(
+                "The Lightning node can {way} {can} sat over its channels, less than the \
+                 {most} sat the gateway takes ({flag}): larger payments fail."
+            );
+            self.alert(key, message).await;
+        }
     }
 
     /// Tell the operator `message` once for `key`.

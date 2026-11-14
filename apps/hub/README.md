@@ -20,7 +20,8 @@ With `--lnd URL --lnd-macaroon FILE` (and `--chain`), the hub also runs a
 Lightning gateway over LND: it pays invoices for locks that pay the hub,
 and makes hold invoices paid with locks of its notes. `--lnd-cert` pins
 LND's certificate. The gateway keeps its invoices in
-`<data>/lightning.sqlite`: back it up with `hub.sqlite`.
+`<data>/lightning.sqlite`: back it up with `hub.sqlite`. An alert says when
+LND's channels can no longer pay or receive the most it takes.
 
 With `--nostr-relay URL --announce-url URL` (and `--chain`), the hub
 announces itself on Nostr relays for wallets to discover, under a key
