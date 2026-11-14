@@ -1,5 +1,6 @@
 package org.licash.wallet.ui
 
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -44,7 +45,14 @@ import org.licash.wallet.explain
 import org.licash.wallet.sat
 
 @Composable
-fun Home(engine: Engine, ui: Ui, receive: () -> Unit, send: () -> Unit, settings: () -> Unit) {
+fun Home(
+    engine: Engine,
+    ui: Ui,
+    receive: () -> Unit,
+    send: () -> Unit,
+    settings: () -> Unit,
+    open: (Activity) -> Unit,
+) {
     Column(Modifier.fillMaxSize().padding(horizontal = 24.dp)) {
         Row(Modifier.fillMaxWidth().padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
             Wordmark()
@@ -74,11 +82,11 @@ fun Home(engine: Engine, ui: Ui, receive: () -> Unit, send: () -> Unit, settings
         } else {
             LazyColumn(Modifier.fillMaxSize()) {
                 items(ui.incoming, key = { "coming " + it.id }) { activity ->
-                    ActivityRow(activity, coming = true)
+                    ActivityRow(activity, coming = true) { open(activity) }
                     HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.4f))
                 }
                 items(ui.history, key = { it.id + it.kind }) { activity ->
-                    ActivityRow(activity)
+                    ActivityRow(activity) { open(activity) }
                     HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.4f))
                 }
             }
@@ -157,7 +165,7 @@ private fun ConnectHub(engine: Engine) {
 }
 
 @Composable
-private fun ActivityRow(activity: Activity, coming: Boolean = false) {
+private fun ActivityRow(activity: Activity, coming: Boolean = false, open: () -> Unit) {
     val (title, sign) = if (coming) "Coming on Bitcoin" to "+" else when (activity.kind) {
         Kind.SENT -> "Sent" to "−"
         Kind.RECEIVED -> "Received" to "+"
@@ -177,7 +185,10 @@ private fun ActivityRow(activity: Activity, coming: Boolean = false) {
         activity.state == State.FAILED -> MaterialTheme.colorScheme.error
         else -> MaterialTheme.colorScheme.onSurface
     }
-    Row(Modifier.fillMaxWidth().padding(vertical = 14.dp), verticalAlignment = Alignment.CenterVertically) {
+    Row(
+        Modifier.fillMaxWidth().clickable(onClick = open).padding(vertical = 14.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
         Column(Modifier.weight(1f)) {
             Text(title, style = MaterialTheme.typography.bodyLarge)
             Text(

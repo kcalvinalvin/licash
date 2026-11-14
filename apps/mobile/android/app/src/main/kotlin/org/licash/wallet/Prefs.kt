@@ -28,6 +28,11 @@ class Prefs(context: Context) {
         get() = prefs.getString("cdn", "default")!!
         set(cdn) = prefs.edit().putString("cdn", cdn.trim()).apply()
 
+    /** The block explorer transactions link to: "default", a URL, or empty for none. */
+    var explorer: String
+        get() = prefs.getString("explorer", "default")!!
+        set(url) = prefs.edit().putString("explorer", url.trim()).apply()
+
     /** Hubs and relays reached through Tor. */
     var tor: Boolean
         get() = prefs.getBoolean("tor", false)

@@ -25,6 +25,7 @@ import org.licash.chain.mobile.Mobile
 import org.licash.core.Activity
 import org.licash.core.Balance
 import org.licash.core.Code
+import org.licash.core.Details
 import org.licash.core.Hub
 import org.licash.core.Kind
 import org.licash.core.LicashException
@@ -33,6 +34,7 @@ import org.licash.core.Paid
 import org.licash.core.Scanned
 import org.licash.core.Wallet
 import org.licash.core.chainName
+import org.licash.core.explorer
 import org.licash.core.setLogger
 import org.licash.core.walletExists
 
@@ -362,6 +364,20 @@ class Engine(context: Context) {
     }
 
     suspend fun code(amount: ULong?): Result<Code> = io { local { it.paymentCode(amount) } }
+
+    /** More of a line of the history, as far as the wallet looked. */
+    suspend fun details(activity: Activity): Result<Details> =
+        io { local { it.details(activity.kind, activity.id) } }
+
+    /** Where to see the transaction `txid`, if anywhere. */
+    fun explorerLink(txid: String): String? {
+        val base = when (val chosen = prefs.explorer) {
+            "default" -> explorer(state.value.network)
+            "" -> null
+            else -> chosen
+        }
+        return base?.trimEnd('/')?.let { "$it/tx/$txid" }
+    }
 
     suspend fun scanned(text: String): Result<Scanned> = io { local { it.scanned(text) } }
 

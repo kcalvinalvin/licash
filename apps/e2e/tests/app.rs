@@ -116,6 +116,14 @@ async fn used(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
         (25_000..29_000).contains(&moved),
         "{moved} of 30000 moved in"
     );
+    // Tapped, the move shows what it cost: the hub's 1000 and the miners'.
+    phone.tap("From Bitcoin").await?;
+    phone.wait("In your Licash", 10).await?;
+    phone.wait("Hub fee", 10).await?;
+    phone.wait("1\u{2009}000 sat", 10).await?;
+    phone.wait("Network fee", 10).await?;
+    phone.back().await?;
+    phone.wait("Receive", 10).await?;
     let next: PaymentCode = phone.code().await?.parse()?;
     ensure!(next.address != code.address, "paid at, and shown again");
     ensure!(next.silent == code.silent, "another silent payment address");

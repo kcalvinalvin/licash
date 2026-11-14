@@ -1,6 +1,9 @@
 package org.licash.wallet.ui
 
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
@@ -8,6 +11,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material3.Button
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -63,6 +67,28 @@ fun TopBar(title: String, back: () -> Unit) {
         Text(title, style = MaterialTheme.typography.titleLarge)
     }
 }
+
+/** A titled card of rows. */
+@Composable
+fun Group(title: String, content: @Composable ColumnScope.() -> Unit) {
+    Spacer(Modifier.height(20.dp))
+    Text(
+        title,
+        modifier = Modifier.padding(start = 4.dp, bottom = 8.dp),
+        style = MaterialTheme.typography.labelLarge,
+        color = MaterialTheme.colorScheme.primary,
+    )
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(20.dp),
+        color = MaterialTheme.colorScheme.surfaceContainer,
+    ) {
+        Column(Modifier.padding(horizontal = 16.dp, vertical = 4.dp), content = content)
+    }
+}
+
+@Composable
+fun Divider() = HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
 
 /** The one thing to do on a screen. */
 @Composable

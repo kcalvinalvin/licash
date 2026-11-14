@@ -3,7 +3,6 @@ package org.licash.wallet.ui
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -20,11 +19,9 @@ import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.FilledTonalButton
-import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -106,28 +103,6 @@ fun Settings(engine: Engine, ui: Ui, back: () -> Unit) {
         Spacer(Modifier.height(48.dp))
     }
 }
-
-/** A titled card of rows. */
-@Composable
-private fun Group(title: String, content: @Composable ColumnScope.() -> Unit) {
-    Spacer(Modifier.height(20.dp))
-    Text(
-        title,
-        modifier = Modifier.padding(start = 4.dp, bottom = 8.dp),
-        style = MaterialTheme.typography.labelLarge,
-        color = MaterialTheme.colorScheme.primary,
-    )
-    Surface(
-        modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(20.dp),
-        color = MaterialTheme.colorScheme.surfaceContainer,
-    ) {
-        Column(Modifier.padding(horizontal = 16.dp, vertical = 4.dp), content = content)
-    }
-}
-
-@Composable
-private fun Divider() = HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
 
 @Composable
 private fun Note(text: String, error: Boolean = false) {
@@ -257,6 +232,7 @@ private fun Developer(engine: Engine, ui: Ui) {
     val scope = rememberCoroutineScope()
     var peers by remember { mutableStateOf(engine.prefs.peers) }
     var cdn by remember { mutableStateOf(engine.prefs.cdn) }
+    var explorer by remember { mutableStateOf(engine.prefs.explorer) }
     var logs by remember { mutableStateOf(false) }
     var deleting by remember { mutableStateOf(false) }
     Group("Developer") {
@@ -283,6 +259,22 @@ private fun Developer(engine: Engine, ui: Ui) {
                 shape = RoundedCornerShape(14.dp),
             )
             FilledTonalButton(onClick = { scope.launch { engine.setChain(peers, cdn) } }) { Text("Apply") }
+        }
+        Divider()
+        Row(
+            Modifier.fillMaxWidth().padding(vertical = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            OutlinedTextField(
+                value = explorer,
+                onValueChange = { explorer = it },
+                modifier = Modifier.weight(1f),
+                singleLine = true,
+                label = { Text("Block explorer (default, a URL, or empty)") },
+                shape = RoundedCornerShape(14.dp),
+            )
+            FilledTonalButton(onClick = { engine.prefs.explorer = explorer }) { Text("Save") }
         }
         Divider()
         Toggle("Show the log", "Its newest lines, here.", logs) { logs = it }

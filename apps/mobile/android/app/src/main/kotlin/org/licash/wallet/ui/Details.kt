@@ -1,0 +1,241 @@
+package org.licash.wallet.ui
+
+import android.content.ClipData
+import android.content.Intent
+import android.net.Uri
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.ClipEntry
+import androidx.compose.ui.platform.LocalClipboard
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.launch
+import org.licash.core.Activity
+import org.licash.core.Details
+import org.licash.core.Kind
+import org.licash.core.Onchain
+import org.licash.core.State
+import org.licash.wallet.AppLog
+import org.licash.wallet.Engine
+import org.licash.wallet.Ui
+import org.licash.wallet.at
+import org.licash.wallet.digits
+import org.licash.wallet.explain
+import org.licash.wallet.sat
+
+/** A line of the history on its own: what it cost and where it stands. */
+@Composable
+fun ActivityDetails(engine: Engine, ui: Ui, shown: Activity, back: () -> Unit) {
+    val context = LocalContext.current
+    val clipboard = LocalClipboard.current
+    val scope = rememberCoroutineScope()
+    // As it stands now: the history changes while shown.
+    val coming = ui.incoming.find { it.id == shown.id }
+    val activity = coming ?: ui.history.find { it.id == shown.id && it.kind == shown.kind } ?: shown
+    var details by remember { mutableStateOf<Details?>(null) }
+    var error by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(activity, ui.scanned) {
+        engine.details(activity)
+            .onSuccess { details = it; error = null }
+            .onFailure { error = explain(it) }
+    }
+    val copy: (String, String) -> Unit = { label, text ->
+        scope.launch { clipboard.setClipEntry(ClipEntry(ClipData.newPlainText(label, text))) }
+    }
+    val tx = when (val d = details) {
+        is Details.Moved -> d.payment
+        is Details.Coin -> d.tx
+        else -> null
+    }
+    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 20.dp)) {
+        TopBar(title(activity, coming != null), back)
+        Spacer(Modifier.height(12.dp))
+        val sign = if (activity.kind == Kind.SENT) "−" else "+"
+        Text(
+            "$sign${digits(activity.amount)} sat",
+            modifier = Modifier.padding(horizontal = 4.dp),
+            style = MaterialTheme.typography.displaySmall,
+        )
+        Text(
+            status(activity, coming != null, details),
+            modifier = Modifier.padding(horizontal = 4.dp, vertical = 4.dp),
+            style = MaterialTheme.typography.bodyLarge,
+            color = if (activity.state == State.FAILED) {
+                MaterialTheme.colorScheme.error
+            } else {
+                MaterialTheme.colorScheme.onSurfaceVariant
+            },
+        )
+        error?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
+        Summary(activity, details, tx)
+        tx?.let { engine.explorerLink(it.txid) }?.let { link ->
+            Spacer(Modifier.height(16.dp))
+            OutlinedButton(
+                onClick = {
+                    runCatching { context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(link))) }
+                        .onFailure { AppLog.warn("opening $link", it) }
+                },
+                modifier = Modifier.fillMaxWidth().height(52.dp),
+            ) { Text("View on a block explorer") }
+        }
+        if (ui.developer) Technical(activity, details, copy)
+        Spacer(Modifier.height(48.dp))
+    }
+}
+
+private fun title(activity: Activity, coming: Boolean): String = when {
+    coming -> "Coming on Bitcoin"
+    else -> when (activity.kind) {
+        Kind.SENT -> "Sent"
+        Kind.RECEIVED -> "Received"
+        Kind.MOVED -> "From Bitcoin"
+        Kind.ONCHAIN -> "On Bitcoin"
+    }
+}
+
+/** Where it stands, in words. */
+private fun status(activity: Activity, coming: Boolean, details: Details?): String = when {
+    coming -> "Waiting for a block, about 10 minutes"
+    activity.state == State.FAILED -> activity.detail
+    else -> when (details) {
+        is Details.Moved -> moving(activity, details)
+        is Details.Coin -> when {
+            details.moving != null -> "Moving into Licash"
+            else -> "On Bitcoin, moved into Licash once enough"
+        }
+        else -> when {
+            activity.state == State.PENDING -> "Under way"
+            activity.kind == Kind.SENT -> "Paid"
+            else -> "Received"
+        }
+    }
+}
+
+/** Where a move stands: the confirmations its hub waits for, first. */
+private fun moving(activity: Activity, move: Details.Moved): String {
+    if (activity.state == State.DONE) return "In your Licash"
+    val paid = move.payment ?: return if (move.pays == null) "Waiting for the hub" else "Waiting for its payment"
+    val depth = move.depth ?: 1u
+    val left = depth.toInt() - paid.confirmations.toInt()
+    return when {
+        paid.confirmations == 0u -> "Waiting for a block: $depth needed, about ${depth.toInt() * 10} minutes"
+        left > 0 -> "Confirming: ${paid.confirmations} of $depth blocks, about ${left * 10} minutes left"
+        else -> "Confirmed: the hub is sending your Licash"
+    }
+}
+
+/** What it moved, and what it cost. */
+@Composable
+private fun Summary(activity: Activity, details: Details?, tx: Onchain?) {
+    Group("Summary") {
+        when (details) {
+            is Details.Moved -> {
+                Line("Into Licash", sat(activity.amount))
+                Line("Hub fee", sat(activity.fee))
+                val (mining, pays) = details.payment?.fee to details.pays
+                mining?.let { Line("Network fee", sat(it)) }
+                if (mining != null && pays != null) Line("Paid on Bitcoin", sat(pays + mining))
+            }
+            is Details.Coin -> Line("Amount", sat(activity.amount))
+            else -> if (activity.kind == Kind.SENT) {
+                Line("Paid", sat(activity.amount))
+                Line("Hub fee", sat(activity.fee))
+                Line("Total", sat(activity.amount + activity.fee))
+            } else {
+                Line("Received", sat(activity.amount))
+            }
+        }
+        tx?.let { Line("Confirmations", confirmations(it, details)) }
+        activity.at?.let { Line("Date", at(it)) }
+    }
+}
+
+private fun confirmations(tx: Onchain, details: Details?): String {
+    val depth = (details as? Details.Moved)?.depth
+    return when {
+        depth != null && tx.confirmations < depth -> "${tx.confirmations} of $depth"
+        else -> "${tx.confirmations}"
+    }
+}
+
+@Composable
+private fun Line(label: String, value: String) {
+    Row(Modifier.fillMaxWidth().padding(vertical = 12.dp)) {
+        Text(label, Modifier.weight(1f), style = MaterialTheme.typography.bodyLarge)
+        Spacer(Modifier.width(12.dp))
+        Text(
+            value,
+            style = MaterialTheme.typography.bodyLarge,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            textAlign = TextAlign.End,
+        )
+    }
+}
+
+/** Everything known of it, for developers: a tap copies a value. */
+@Composable
+private fun Technical(activity: Activity, details: Details?, copy: (String, String) -> Unit) {
+    Group("Developer") {
+        when (details) {
+            is Details.Notes -> {
+                Fact("Payment", activity.id, copy)
+                Fact("Hub", details.hub, copy)
+            }
+            is Details.Moved -> {
+                Fact("Deposit hash", details.hash, copy)
+                Fact("Hub", details.hub, copy)
+                details.address?.let { Fact("Address", it, copy) }
+                details.pays?.let { Fact("Pays", digits(it), copy) }
+                details.payment?.let { Transaction(it, copy) }
+                details.depth?.let { Fact("Confirmations needed", "$it", copy) }
+                details.fundBy?.let { Fact("Confirmed by block", "$it", copy) }
+                details.timeout?.let { Fact("Refundable after block", "$it", copy) }
+                details.refund?.let { Fact("Refund", it, copy) }
+            }
+            is Details.Coin -> {
+                Transaction(details.tx, copy)
+                Fact("Output", "${details.vout}", copy)
+                if (details.change) Fact("Change", "of a payment of this wallet's", copy)
+                details.moving?.let { Fact("Spent by", it, copy) }
+            }
+            null -> Fact("Id", activity.id, copy)
+        }
+    }
+}
+
+@Composable
+private fun Transaction(tx: Onchain, copy: (String, String) -> Unit) {
+    Fact("Transaction", tx.txid, copy)
+    tx.height?.let { Fact("Block", "$it", copy) }
+    tx.fee?.let { Fact("Network fee", digits(it), copy) }
+}
+
+@Composable
+private fun Fact(label: String, value: String, copy: (String, String) -> Unit) {
+    Column(Modifier.fillMaxWidth().clickable { copy(label, value) }.padding(vertical = 10.dp)) {
+        Text(label, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Text(value, style = MaterialTheme.typography.bodyMedium, fontFamily = FontFamily.Monospace)
+    }
+}
