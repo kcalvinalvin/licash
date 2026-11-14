@@ -129,6 +129,14 @@ pub fn profile(network: Network) -> anyhow::Result<ChainProfile> {
     }
 }
 
+/// The network of a checkpoint `profile`.
+pub fn network(profile: ChainProfile) -> Network {
+    match profile {
+        ChainProfile::Core30Mainnet => Network::Bitcoin,
+        ChainProfile::Core30DefaultRegtest => Network::Regtest,
+    }
+}
+
 fn client() -> anyhow::Result<reqwest::Client> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     Ok(reqwest::Client::builder()

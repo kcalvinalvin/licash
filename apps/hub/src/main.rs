@@ -14,10 +14,12 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use licash_chain_client::Source;
 use licash_hub::{Fee, Hub, Ledger, Policy, Timing};
 use licash_hub_service::{
+    announce::announce,
     lightning::{lnd::Lnd, Config, Gateway},
     notify::{self, Notifier},
     watch::watch,
 };
+use licash_nostr::Announcement;
 use licash_notify::{Message, Priority, Target};
 use tracing_subscriber::EnvFilter;
 
@@ -107,6 +109,63 @@ impl Chain {
         Ok(Some((source, Duration::from_secs(self.chain_poll))))
     }
 }
+
+/// The hub's announcement on Nostr, for wallets to discover it.
+#[derive(Args)]
+struct AnnounceArgs {
+    /// Announce the hub on this Nostr relay, such as `wss://relay.example`.
+    /// Repeat it, or separate relays with commas, for more. Needs
+    /// `--announce-url` and `--chain`, whose network it announces.
+    #[arg(
+        long = "nostr-relay",
+        value_name = "URL",
+        env = "LICASH_HUB_NOSTR_RELAYS",
+        value_delimiter = ','
+    )]
+    nostr_relays: Vec<String>,
+    /// A URL wallets reach the hub at: `https://`, or an onion service's
+    /// `http://`. Repeat it, up to 4.
+    #[arg(
+        long = "announce-url",
+        value_name = "URL",
+        env = "LICASH_HUB_ANNOUNCE_URLS",
+        value_delimiter = ','
+    )]
+    announce_urls: Vec<String>,
+    /// The name the announcement shows.
+    #[arg(long = "announce-name", env = "LICASH_HUB_ANNOUNCE_NAME")]
+    announce_name: Option<String>,
+}
+
+impl AnnounceArgs {
+    /// The relays and the announcement's URLs and name, if it announces.
+    fn announcing(self) -> anyhow::Result<Option<Announcing>> {
+        let relays: Vec<String> = self
+            .nostr_relays
+            .into_iter()
+            .filter(|r| !r.is_empty())
+            .collect();
+        let urls: Vec<String> = self
+            .announce_urls
+            .into_iter()
+            .filter(|u| !u.is_empty())
+            .collect();
+        if relays.is_empty() {
+            anyhow::ensure!(urls.is_empty(), "--announce-url needs --nostr-relay");
+            return Ok(None);
+        }
+        let announcement = Announcement {
+            urls,
+            network: String::new(),
+            name: self.announce_name,
+        };
+        announcement.check().context("--announce-url")?;
+        Ok(Some((relays, announcement.urls, announcement.name)))
+    }
+}
+
+/// The relays, URLs and name of the hub's announcement.
+type Announcing = (Vec<String>, Vec<String>, Option<String>);
 
 /// What the hub charges and the locks it admits.
 #[derive(Args)]
@@ -308,6 +367,8 @@ enum Command {
         notify: Notify,
         #[command(flatten)]
         lightning: Box<LightningArgs>,
+        #[command(flatten)]
+        announce: Box<AnnounceArgs>,
         /// Notify only of these kinds of event [default: all].
         #[arg(long, value_name = "KIND", env = "LICASH_HUB_NOTIFY_KINDS", value_delimiter = ',',
               value_parser = clap::builder::PossibleValuesParser::new(notify::KINDS))]
@@ -373,6 +434,7 @@ fn command(cli: Cli) -> anyhow::Result<()> {
             chain,
             notify,
             lightning,
+            announce,
             notify_kinds,
         } => {
             let policy = policy.policy();
@@ -381,6 +443,11 @@ fn command(cli: Cli) -> anyhow::Result<()> {
             anyhow::ensure!(
                 lightning.is_none() || chain.is_some(),
                 "a Lightning gateway (--lnd) needs --chain"
+            );
+            let announcing = (*announce).announcing()?;
+            anyhow::ensure!(
+                announcing.is_none() || chain.is_some(),
+                "announcing on Nostr (--nostr-relay) needs --chain"
             );
             let targets = notify.targets()?;
             // Before the hub opens, so that new targets hear of its start.
@@ -403,7 +470,13 @@ fn command(cli: Cli) -> anyhow::Result<()> {
                 }
                 None => None,
             };
-            let serving = serve(hub, listen, policy, chain, notifier, gateway);
+            let tasks = Tasks {
+                chain,
+                notifier,
+                gateway,
+                announcing,
+            };
+            let serving = serve(hub, listen, policy, tasks);
             tokio::runtime::Runtime::new()?.block_on(serving)
         }
         Command::TestNotify { notify } => test_notify(&notify),
@@ -428,14 +501,26 @@ fn init(data: &Path, seed: &Path, db: &Path, max_pow: u32) -> anyhow::Result<()>
     Ok(())
 }
 
+/// What runs beside the API, if configured.
+struct Tasks {
+    chain: Option<(Source, Duration)>,
+    notifier: Option<Notifier>,
+    gateway: Option<Arc<Gateway>>,
+    announcing: Option<Announcing>,
+}
+
 async fn serve(
     hub: Arc<Hub>,
     listen: SocketAddr,
     policy: Policy,
-    chain: Option<(Source, Duration)>,
-    notifier: Option<Notifier>,
-    gateway: Option<Arc<Gateway>>,
+    tasks: Tasks,
 ) -> anyhow::Result<()> {
+    let Tasks {
+        chain,
+        notifier,
+        gateway,
+        announcing,
+    } = tasks;
     let listener = tokio::net::TcpListener::bind(listen)
         .await
         .with_context(|| format!("listen on {listen}"))?;
@@ -457,10 +542,14 @@ async fn serve(
         tracing::info!("running a Lightning gateway");
         tokio::spawn(gateway.run())
     });
+    let announcing = announcing.map(|(relays, urls, name)| {
+        tracing::info!(relays = %relays.join(", "), urls = %urls.join(", "), "announcing on Nostr");
+        tokio::spawn(announce(hub.clone(), relays, urls, name))
+    });
     axum::serve(listener, licash_hub_service::router(hub, gateway))
         .with_graceful_shutdown(shutdown())
         .await?;
-    for task in [watching, paying].into_iter().flatten() {
+    for task in [watching, paying, announcing].into_iter().flatten() {
         task.abort();
     }
     if let (Some(notifying), Some(notifier)) = (notifying, notifier) {

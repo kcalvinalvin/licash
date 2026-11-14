@@ -20,6 +20,8 @@ fn hub(data: &Path, args: &[&str]) -> Command {
         .env_remove("LICASH_HUB_NOTIFY")
         .env_remove("LICASH_HUB_NOTIFY_KINDS")
         .env_remove("LICASH_HUB_NAME")
+        .env_remove("LICASH_HUB_NOSTR_RELAYS")
+        .env_remove("LICASH_HUB_ANNOUNCE_URLS")
         .env("RUST_LOG", "info");
     command
 }
@@ -215,6 +217,29 @@ fn failures_exit_nonzero_and_log_as_asked() {
     let poll = ["run", "--chain", "http://node:8332", "--chain-poll", "120"];
     let out = output(&missing, &poll);
     assert!(String::from_utf8_lossy(&out.stderr).contains("--max-lag"));
+    // An announcement needs relays, URLs wallets can use, and the chain
+    // that names its network.
+    let relay = ["--nostr-relay", "ws://127.0.0.1:1"];
+    for (args, says) in [
+        (
+            &["--announce-url", "https://hub.example"][..],
+            "needs --nostr-relay",
+        ),
+        (&relay[..], "--announce-url"),
+        (
+            &[relay[0], relay[1], "--announce-url", "ftp://hub.example"][..],
+            "ftp://",
+        ),
+        (
+            &[relay[0], relay[1], "--announce-url", "https://hub.example"][..],
+            "needs --chain",
+        ),
+    ] {
+        let out = output(&missing, &[&["run"], args].concat());
+        assert!(!out.status.success());
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains(says), "{args:?}: {stderr}");
+    }
     assert!(!missing.exists());
 }
 

@@ -1,6 +1,7 @@
 //! The hub service: a [`Hub`] behind the v1 HTTP API of [`licash_api`],
 //! and its Lightning gateway if it runs one.
 
+pub mod announce;
 pub mod lightning;
 pub mod notify;
 pub mod watch;

@@ -22,6 +22,10 @@ and makes hold invoices paid with locks of its notes. `--lnd-cert` pins
 LND's certificate. The gateway keeps its invoices in
 `<data>/lightning.sqlite`: back it up with `hub.sqlite`.
 
+With `--nostr-relay URL --announce-url URL` (and `--chain`), the hub
+announces itself on Nostr relays for wallets to discover, under a key
+derived from its seed that `/v1/info` names.
+
 Notification targets are Apprise URLs (`gotify[s]://`, `tgram://`,
 `ntfy[s]://`, `json[s]://`, `apprise[s]://`); `test-notify` checks them.
 
