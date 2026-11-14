@@ -1,0 +1,48 @@
+[package]
+name = "licash-mobile"
+description = "The Licash wallet of the mobile apps, bound to Kotlin and Swift with UniFFI."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+name = "licash_mobile"
+crate-type = ["cdylib", "lib"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "uniffi-bindgen.rs"
+required-features = ["bindgen"]
+
+[dependencies]
+licash.workspace = true
+licash-api.workspace = true
+licash-wallet.workspace = true
+licash-nostr = { workspace = true, features = ["tor", "wallet"] }
+licash-tor.workspace = true
+licash-transport = { workspace = true, features = ["tor"] }
+anyhow.workspace = true
+bitcoin = { version = "=0.32.102", default-features = false, features = ["std"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror = "2"
+tokio = { workspace = true, features = ["rt-multi-thread", "time"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uniffi = "0.32.2"
+
+[dev-dependencies]
+licash-chain-client.workspace = true
+licash-hub.workspace = true
+licash-hub-service = { path = "../../hub" }
+licash-onchain.workspace = true
+axum.workspace = true
+hex = "0.4"
+nostr-sdk = { version = "0.45.6", features = ["local-relay"] }
+tempfile = "3.27"
+
+[features]
+# The binary generating the Kotlin and Swift bindings.
+bindgen = ["uniffi/cli"]
