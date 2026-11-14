@@ -2929,6 +2929,7 @@ dependencies = [
  "hex",
  "licash",
  "licash-api",
+ "licash-chain-client",
  "licash-hub",
  "licash-hub-service",
  "licash-nostr",

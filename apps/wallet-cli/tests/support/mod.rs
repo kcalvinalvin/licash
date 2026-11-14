@@ -4,16 +4,24 @@
 
 #[path = "../../../hub/tests/chain/mod.rs"]
 mod chain;
+#[path = "../../../hub/tests/esplora/mod.rs"]
+mod esplora;
 pub mod swaps;
 
 use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
-    sync::{Arc, Mutex},
+    sync::Arc,
     thread::JoinHandle,
 };
 
+use bitcoin::{
+    hashes::Hash,
+    key::TweakedPublicKey,
+    secp256k1::{Secp256k1, SecretKey},
+    OutPoint, ScriptBuf, Transaction, Txid,
+};
 use licash::{
     address::{Address, Ephemeral, OwnerKeys},
     authorization::{Authorization, SignedProposal},
@@ -24,9 +32,23 @@ use licash::{
 };
 use licash_api::{Fee, Payment};
 use licash_hub::{Hub, Policy, Timing};
-use licash_hub_service::lightning::{fake::Fake, Config, Gateway};
+use licash_hub_service::{
+    deposit,
+    lightning::{fake::Fake, Config, Gateway},
+};
 
 const MAX_POW: u32 = 6;
+
+/// Blocks a deposit is refundable after it is asked for: its window,
+/// depth, lock blocks, the lock's depth, downtime and sweep blocks.
+pub const DEPOSIT_TIMEOUT: u32 = 10 + 2 + 6 + 1 + 2 + 6;
+
+/// Where the hub's deposit claims pay.
+pub fn sweep() -> ScriptBuf {
+    let key = SecretKey::from_slice(&[9; 32]).unwrap();
+    let key = key.x_only_public_key(&Secp256k1::new()).0;
+    ScriptBuf::new_p2tr_tweaked(TweakedPublicKey::dangerous_assume_tweaked(key))
+}
 
 /// The timing of the hub's locks: short, to expire them in a test.
 const TIMING: Timing = Timing {
@@ -42,7 +64,9 @@ pub struct Server {
     pub hub: Arc<Hub>,
     /// The gateway, and the node it pays and is paid through.
     pub lightning: Option<(Arc<Gateway>, Arc<Fake>)>,
-    chain: Mutex<chain::Chain>,
+    /// The deposit gateway, and the URL of the mock Esplora it follows.
+    pub deposits: Option<(Arc<deposit::Gateway>, String)>,
+    backend: esplora::Shared,
     addr: SocketAddr,
     seed: PathBuf,
     running: Option<(tokio::sync::oneshot::Sender<()>, JoinHandle<()>)>,
@@ -53,16 +77,23 @@ impl Server {
     /// A hub charging `fee` on spends and in each branch of a lock, at
     /// height 3 of its chain.
     pub fn start(fee: Fee) -> Self {
-        Self::started(fee, false)
+        Self::started(fee, false, false)
     }
 
     /// [`Server::start`], with a gateway charging 2 to pay an invoice and
     /// 1 to take a payment, of 100 at most.
     pub fn with_lightning(fee: Fee) -> Self {
-        Self::started(fee, true)
+        Self::started(fee, true, false)
     }
 
-    fn started(fee: Fee, lightning: bool) -> Self {
+    /// [`Server::start`], taking deposits of 1000 to 4000 for a fee of
+    /// 100, paid by block 10 after they are asked for, claimed to
+    /// [`SWEEP`] and refundable [`DEPOSIT_TIMEOUT`] blocks after.
+    pub fn with_deposits(fee: Fee) -> Self {
+        Self::started(fee, false, true)
+    }
+
+    fn started(fee: Fee, lightning: bool, deposits: bool) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let (seed, db) = (dir.path().join("seed"), dir.path().join("hub.sqlite"));
         Hub::init(&seed, &db, MAX_POW).unwrap();
@@ -94,10 +125,31 @@ impl Server {
             let gateway = Gateway::open(hub.clone(), node.clone(), config, &path).unwrap();
             (Arc::new(gateway), node)
         });
+        let backend = esplora::backend(chain);
+        let deposits = deposits.then(|| {
+            let url = esplora::serve(backend.clone());
+            let config = deposit::Config {
+                fee: Fee { base: 100, ppm: 0 },
+                min: 1_000,
+                max: 4_000,
+                depth: 2,
+                window: 10,
+                lock_blocks: 6,
+                downtime: 2,
+                sweep_blocks: 6,
+                min_fee_rate: bitcoin::FeeRate::from_sat_per_vb_u32(1),
+                ..deposit::Config::new(sweep())
+            };
+            let (source, path) = (url.parse().unwrap(), dir.path().join("deposits.sqlite"));
+            let profile = licash::spend::ChainProfile::Core30DefaultRegtest;
+            let gateway = deposit::Gateway::open(hub.clone(), source, profile, config, &path);
+            (Arc::new(gateway.unwrap()), url)
+        });
         let mut server = Self {
             hub,
             lightning,
-            chain: Mutex::new(chain),
+            deposits,
+            backend,
             addr: "127.0.0.1:0".parse().unwrap(),
             seed,
             running: None,
@@ -112,11 +164,14 @@ impl Server {
     /// One round of the gateway, if any: it follows its node and the
     /// payments under way.
     pub fn round(&self) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         if let Some((gateway, _)) = &self.lightning {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
+            runtime.block_on(gateway.round());
+        }
+        if let Some((gateway, _)) = &self.deposits {
             runtime.block_on(gateway.round());
         }
     }
@@ -132,23 +187,77 @@ impl Server {
         let mut bytes = [0; 32];
         hex::decode_to_slice(hash, &mut bytes).unwrap();
         let cltv = self.node().held_cltv(bytes).unwrap() as u32;
-        let height = self.chain.lock().unwrap().height();
+        let height = self.height();
         self.node().pay_held(bytes, height + cltv);
         self.round();
     }
 
     /// Mine `blocks`, the first with an activation of `secret` if given,
     /// which the hub scans.
-    pub fn mine(&self, blocks: u32, mut secret: Option<[u8; 32]>) {
-        let mut chain = self.chain.lock().unwrap();
+    pub fn mine(&self, blocks: u32, secret: Option<[u8; 32]>) {
+        self.mine_with(blocks, secret, Vec::new());
+    }
+
+    /// [`Server::mine`], the first block with `txs`.
+    fn mine_with(&self, blocks: u32, mut secret: Option<[u8; 32]>, mut txs: Vec<Transaction>) {
+        let mut backend = self.backend.lock().unwrap();
+        let ids: Vec<Txid> = txs.iter().map(Transaction::compute_txid).collect();
+        backend.mempool.retain(|t| !ids.contains(&t.compute_txid()));
+        let chain = &mut backend.chain;
         for _ in 0..blocks {
-            let block = chain.mine(secret.take()).clone();
+            let block = chain
+                .mine_with(secret.take(), std::mem::take(&mut txs))
+                .clone();
             self.hub.observe(chain.height(), &block).unwrap();
         }
         assert!(self.hub.synced(chain.height(), &chain.tip()).unwrap());
         if let Some((_, node)) = &self.lightning {
             node.tip(chain.height(), chain.tip());
         }
+    }
+
+    pub fn height(&self) -> u32 {
+        self.backend.lock().unwrap().chain.height()
+    }
+
+    /// A payment of `sat` to `address` on Bitcoin, mined, from coins of
+    /// the `n`th payer: what it pays.
+    pub fn pay_onchain(&self, address: &str, sat: u64, n: u8) -> OutPoint {
+        let address: bitcoin::Address<_> = address.parse().unwrap();
+        let tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output: OutPoint {
+                    txid: Txid::from_byte_array([n; 32]),
+                    vout: 0,
+                },
+                ..Default::default()
+            }],
+            output: vec![bitcoin::TxOut {
+                value: bitcoin::Amount::from_sat(sat),
+                script_pubkey: address.assume_checked().script_pubkey(),
+            }],
+        };
+        let txid = tx.compute_txid();
+        self.mine_with(1, None, vec![tx]);
+        OutPoint { txid, vout: 0 }
+    }
+
+    /// The transactions sent to the chain, not mined yet.
+    pub fn sent(&self) -> Vec<Transaction> {
+        self.backend.lock().unwrap().mempool.clone()
+    }
+
+    /// Mine what was sent, in one block.
+    pub fn confirm_sent(&self) {
+        let sent = self.sent();
+        self.mine_with(1, None, sent);
+    }
+
+    /// The mock Esplora's URL, as `--chain` takes it.
+    pub fn esplora(&self) -> &str {
+        &self.deposits.as_ref().expect("deposits").1
     }
 
     pub fn url(&self) -> String {
@@ -163,6 +272,7 @@ impl Server {
         let (bound, addr) = std::sync::mpsc::channel();
         let (hub, at) = (self.hub.clone(), self.addr);
         let gateway = self.lightning.as_ref().map(|(gateway, _)| gateway.clone());
+        let deposits = self.deposits.as_ref().map(|(gateway, _)| gateway.clone());
         let thread = std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -178,6 +288,7 @@ impl Server {
                         hub,
                         licash_hub_service::Services {
                             gateway,
+                            deposits,
                             ..Default::default()
                         },
                     ),

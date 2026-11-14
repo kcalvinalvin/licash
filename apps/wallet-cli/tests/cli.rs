@@ -6,7 +6,7 @@ use licash::{address::Address, spend::lock_hash};
 use licash_api::Fee;
 use licash_hub_service::lightning::{fake::Outcome, HeldState};
 use serde_json::Value;
-use support::{swaps::Swaps, wallet, Server};
+use support::{swaps::Swaps, sweep, wallet, Server, DEPOSIT_TIMEOUT};
 
 const FEE: Fee = Fee { base: 1, ppm: 0 };
 
@@ -621,4 +621,108 @@ fn a_tor_client_of_its_own_keeps_its_state_next_to_the_wallet() {
     // Tor through the wallet's own client or through a proxy, not both.
     let args = ["--tor", "--proxy", "socks5h://127.0.0.1:9050", "balance"];
     failed(wallet(&alice, &args, None), 2, "cannot be used with");
+}
+
+/// A regtest address to take coins back to.
+const BACK_TO: &str = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
+
+#[test]
+fn owners_deposit_on_bitcoin_and_take_back_what_was_never_received() {
+    let hub = Server::with_deposits(FEE);
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, _) = party(dir.path(), "alice", Some(&hub));
+    let asked_at = hub.height();
+
+    // Asked for 2000 in notes: pay 2100 on Bitcoin, the hub's fee on top.
+    let asked = wallet(&alice, &["deposit", "2000"], None);
+    let stderr = String::from_utf8_lossy(&asked.stderr).into_owned();
+    assert!(stderr.contains("pay exactly 2100 sat"), "{stderr}");
+    let hash = stderr.trim().strip_prefix("deposit ").unwrap();
+    let hash = hash.split(':').next().unwrap().to_owned();
+    let uri = ok(asked).trim().to_owned();
+    let (address, amount) = uri
+        .strip_prefix("bitcoin:")
+        .and_then(|rest| rest.split_once("?amount="))
+        .unwrap();
+    assert!(address.starts_with("bcrt1p"), "{uri}");
+    assert_eq!(amount, "0.000021");
+    let deposits = json(&alice, &["deposits"]);
+    assert_eq!(
+        (deposits[0]["hash"].as_str(), deposits[0]["state"].as_str()),
+        (Some(&hash[..]), Some("open"))
+    );
+    assert_eq!(deposits[0]["terms"]["uri"], uri);
+    assert_eq!(deposits[0]["terms"]["timeout"], asked_at + DEPOSIT_TIMEOUT);
+
+    // Paid, then at depth: the hub locks its notes, which resume claims.
+    hub.pay_onchain(address, 2_100, 1);
+    hub.round();
+    assert_eq!(json(&alice, &["resume"])["deposits"][0]["state"], "open");
+    hub.mine(1, None);
+    hub.round();
+    assert_eq!(
+        json(&alice, &["resume"])["deposits"][0]["state"],
+        "received"
+    );
+    assert_eq!(available(&alice), (2_000, 0));
+    let text = ok(wallet(&alice, &["deposits"], None));
+    assert!(text.contains("deposit received  2000"), "{text}");
+    // The hub claims the coins, which are no longer the payer's.
+    hub.round();
+    hub.round();
+    let sent = hub.sent();
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0].output[0].script_pubkey, sweep());
+    hub.confirm_sent();
+    let refund = |hash: &str| {
+        let args = ["refund", hash, "--to", BACK_TO, "--chain", hub.esplora()];
+        wallet(&alice, &args, None)
+    };
+    failed(refund(&hash), 1, "its notes were received");
+
+    // Asked for 1500, paid a block after the last it could confirm in:
+    // canceled, the payment refunded once its timeout passed.
+    let late: Value =
+        serde_json::from_str(&ok(wallet(&alice, &["--json", "deposit", "1500"], None))).unwrap();
+    let late_hash = late["hash"].as_str().unwrap();
+    let terms = &late["terms"];
+    let fund_by = terms["fund_by"].as_u64().unwrap() as u32;
+    let timeout = terms["timeout"].as_u64().unwrap() as u32;
+    hub.mine(fund_by - hub.height(), None);
+    hub.round();
+    let paid = hub.pay_onchain(terms["address"].as_str().unwrap(), 1_600, 2);
+    hub.mine(2, None);
+    hub.round();
+    let resumed = json(&alice, &["resume"]);
+    assert_eq!(
+        resumed["deposits"][0]["state"],
+        "canceled (canceled by its hub)"
+    );
+    assert_eq!(available(&alice), (2_000, 0));
+    failed(
+        refund(late_hash),
+        1,
+        &format!("refundable after block {timeout}"),
+    );
+    hub.mine(timeout - hub.height(), None);
+    let txid = ok(refund(late_hash)).trim().to_owned();
+    let sent = hub.sent();
+    let back = sent.iter().find(|t| t.compute_txid().to_string() == txid);
+    let back = back.unwrap_or_else(|| panic!("{txid} not sent: {sent:?}"));
+    assert_eq!(back.input[0].previous_output, paid);
+    assert_eq!(back.lock_time.to_consensus_u32(), timeout);
+    let to: bitcoin::Address<_> = BACK_TO.parse().unwrap();
+    assert_eq!(
+        back.output[0].script_pubkey,
+        to.assume_checked().script_pubkey()
+    );
+    // At the chain's estimate within 6 blocks, 2 sat/vB.
+    let fee = 1_600 - back.output[0].value.to_sat();
+    let rate = bitcoin::FeeRate::from_sat_per_vb_u32(2);
+    assert_eq!(fee, rate.fee_wu(back.weight()).unwrap().to_sat());
+    let deposits = json(&alice, &["deposits"]);
+    assert_eq!(deposits[0]["state"], format!("refunded ({txid})"));
+    // Once mined, nothing is left to take back.
+    hub.confirm_sent();
+    failed(refund(late_hash), 1, "nothing unspent pays");
 }

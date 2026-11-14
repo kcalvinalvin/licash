@@ -29,6 +29,11 @@ Through a hub with a Lightning gateway, `pay-invoice <bolt11>` pays an
 invoice with a lock refunded if the payment fails, and `invoice <amount>`
 prints an invoice paying the wallet; `resume` takes the payment once made.
 
+Through a hub taking deposits, `deposit <amount>` prints a BIP21 URI to pay
+on Bitcoin, the hub's fee on top; `resume` takes the notes once the payment
+confirmed. A deposit never received is taken back after its timeout with
+`refund <hash> --to <address> --chain <url>`.
+
 `swap <amount> --to <hub> --provider <url>` swaps notes at another hub for
 `amount` at `<hub>` through a swap provider, with a lock at each hub:
 nothing is revealed until the provider's lock pays the wallet, and a swap

@@ -17,7 +17,8 @@ use licash_api::Payment;
 use licash_nostr::{Role, Route};
 use licash_transport::Http;
 use licash_wallet::{
-    Error, Invoice, InvoiceState, Lock, LockState, State, Swap, SwapState, Wallet,
+    Deposit, DepositState, Error, Invoice, InvoiceState, Lock, LockState, State, Swap, SwapState,
+    Wallet,
 };
 use rand_core::{OsRng, RngCore};
 use serde_json::json;
@@ -172,6 +173,35 @@ enum Command {
     },
     /// The Lightning invoices asked for, newest first.
     Invoices,
+    /// Get AMOUNT in notes for coins paid on Bitcoin: the address and the
+    /// exact amount to pay, the hub's fee on top, as a BIP21 URI (the
+    /// deposit's hash on stderr). `resume` takes the notes once the
+    /// payment confirmed.
+    Deposit {
+        amount: u64,
+        /// At this hub [default: the only one trusted].
+        #[arg(long)]
+        hub: Option<String>,
+    },
+    /// The deposits asked for, newest first.
+    Deposits,
+    /// Take back the coins paid to deposit HASH once its timeout passed,
+    /// its notes never received.
+    Refund {
+        hash: String,
+        /// Pay the coins to this address.
+        #[arg(long)]
+        to: String,
+        /// The chain to find the payment on and broadcast to: Esplora as
+        /// `esplora+https://esplora.example/api`, or a Bitcoin Core node
+        /// as `http://user:password@127.0.0.1:8332`.
+        #[arg(long, env = "LICASH_WALLET_CHAIN")]
+        chain: String,
+        /// In sat/vB [default: the chain's estimate within 6 blocks, at
+        /// least 1].
+        #[arg(long)]
+        fee_rate: Option<u64>,
+    },
     /// Swap notes at one hub for AMOUNT at another through a swap provider,
     /// its fee and the hub's on top. `resume` takes a pending swap on.
     Swap {
@@ -515,6 +545,53 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 lines.join("\n"),
             );
         }
+        Command::Deposit { amount, hub } => {
+            let hub = match hub {
+                Some(hub) => hub,
+                None => only_hub(&wallet)?,
+            };
+            let deposit = wallet.deposit(&hub, amount).await?;
+            let text = match (&deposit.terms, &deposit.state) {
+                (Some(terms), DepositState::Open) => {
+                    eprintln!(
+                        "deposit {}: pay exactly {} sat, confirmed by block {}; refundable after block {}",
+                        deposit.hash, terms.pays, terms.fund_by, terms.timeout
+                    );
+                    bip21(&terms.address, terms.pays)
+                }
+                _ => {
+                    show(json, deposit_json(&deposit), deposit_line(&deposit));
+                    bail!(
+                        "deposit {}: {}",
+                        deposit.hash,
+                        deposit_state(&deposit.state)
+                    )
+                }
+            };
+            show(json, deposit_json(&deposit), text);
+        }
+        Command::Deposits => {
+            let deposits = wallet.deposits()?;
+            let lines = deposits.iter().map(deposit_line).collect::<Vec<_>>();
+            show(
+                json,
+                deposits.iter().map(deposit_json).collect(),
+                lines.join("\n"),
+            );
+        }
+        Command::Refund {
+            hash,
+            to,
+            chain,
+            fee_rate,
+        } => {
+            let txid = refund(&wallet, &hash, &to, &chain, fee_rate).await?;
+            show(
+                json,
+                json!({ "hash": hash, "txid": txid.to_string() }),
+                txid.to_string(),
+            );
+        }
         Command::Swap {
             amount,
             to,
@@ -786,6 +863,7 @@ async fn resume(wallet: &Wallet<Http>, json: bool) -> anyhow::Result<()> {
     lines.extend(resumed.locks.iter().map(lock_line));
     lines.extend(resumed.invoices.iter().map(invoice_line));
     lines.extend(resumed.swaps.iter().map(swap_line));
+    lines.extend(resumed.deposits.iter().map(deposit_line));
     for (id, reason) in &resumed.abandoned {
         lines.push(format!("abandoned {id}: {reason}"));
     }
@@ -811,6 +889,7 @@ async fn resume(wallet: &Wallet<Http>, json: bool) -> anyhow::Result<()> {
             "locks": resumed.locks.iter().map(lock_json).collect::<Vec<_>>(),
             "invoices": resumed.invoices.iter().map(invoice_json).collect::<Vec<_>>(),
             "swaps": resumed.swaps.iter().map(swap_json).collect::<Vec<_>>(),
+            "deposits": resumed.deposits.iter().map(deposit_json).collect::<Vec<_>>(),
             "abandoned": abandoned.collect::<Vec<_>>(),
             "pending": pending.collect::<Vec<_>>(),
             "unlinked": unlinked,
@@ -927,6 +1006,108 @@ fn invoice_line(invoice: &Invoice) -> String {
         invoice.hub,
         invoice.hash
     )
+}
+
+fn deposit_state(state: &DepositState) -> String {
+    match state {
+        DepositState::Open => "open".into(),
+        DepositState::Received => "received".into(),
+        DepositState::Canceled(reason) => format!("canceled ({reason})"),
+        DepositState::Refunded(txid) => format!("refunded ({txid})"),
+        _ => "unknown".into(),
+    }
+}
+
+fn deposit_json(deposit: &Deposit) -> serde_json::Value {
+    let terms = deposit.terms.as_ref().map(|t| {
+        json!({
+            "address": t.address, "pays": t.pays, "fund_by": t.fund_by, "timeout": t.timeout,
+            "uri": bip21(&t.address, t.pays),
+        })
+    });
+    let funding = deposit
+        .funding
+        .map(|(outpoint, height)| json!({ "outpoint": outpoint.to_string(), "height": height }));
+    json!({
+        "hash": deposit.hash, "hub": deposit.hub, "amount": deposit.amount, "terms": terms,
+        "funding": funding, "state": deposit_state(&deposit.state),
+        "created_at": deposit.created_at,
+    })
+}
+
+fn deposit_line(deposit: &Deposit) -> String {
+    let terms = match &deposit.terms {
+        Some(t) => format!("  pay {} to {} by block {}", t.pays, t.address, t.fund_by),
+        None => String::new(),
+    };
+    format!(
+        "{}  deposit {}  {}  at {}  {}{terms}",
+        deposit.created_at,
+        deposit_state(&deposit.state),
+        deposit.amount,
+        deposit.hub,
+        deposit.hash
+    )
+}
+
+/// A BIP21 URI paying `sat` to `address`.
+fn bip21(address: &str, sat: u64) -> String {
+    let btc = bitcoin::Amount::from_sat(sat).to_string_in(bitcoin::Denomination::Bitcoin);
+    format!("bitcoin:{address}?amount={btc}")
+}
+
+/// Refund deposit `hash` to `to` from what `chain` shows paid to it, once
+/// its timeout passed: the refund's id, broadcast.
+async fn refund(
+    wallet: &Wallet<Http>,
+    hash: &str,
+    to: &str,
+    chain: &str,
+    fee_rate: Option<u64>,
+) -> anyhow::Result<bitcoin::Txid> {
+    let network = licash_chain_client::network(wallet.network());
+    let to = to
+        .parse::<bitcoin::Address<bitcoin::address::NetworkUnchecked>>()
+        .context("--to")?
+        .require_network(network)
+        .with_context(|| format!("--to: not an address on {}", wallet.network()))?;
+    let source: licash_chain_client::Source = chain.parse().context("--chain")?;
+    let deposit = wallet.deposit_of(hash)?;
+    if deposit.state == DepositState::Received {
+        bail!("its notes were received: the coins are its hub's");
+    }
+    let terms = deposit
+        .terms
+        .as_ref()
+        .context("its hub named no address: nothing was paid to it")?;
+    let address = terms
+        .address
+        .parse::<bitcoin::Address<_>>()?
+        .assume_checked();
+    let tip = source.tip().await?.height;
+    if tip < terms.timeout {
+        bail!("refundable after block {}, the tip is {tip}", terms.timeout);
+    }
+    let found = source.unspent(&address).await?;
+    let Some(paid) = found.first() else {
+        bail!("nothing unspent pays {address}: claimed or refunded already, or never paid");
+    };
+    if found.len() > 1 {
+        tracing::warn!(
+            count = found.len(),
+            "several payments to the deposit: refunding the oldest, again for the others"
+        );
+    }
+    let rate = match fee_rate {
+        Some(rate) => bitcoin::FeeRate::from_sat_per_vb(rate).context("--fee-rate")?,
+        None => source
+            .fee_rate(6)
+            .await?
+            .unwrap_or(bitcoin::FeeRate::BROADCAST_MIN)
+            .max(bitcoin::FeeRate::BROADCAST_MIN),
+    };
+    let tx = wallet.refund_deposit(hash, paid.outpoint, paid.value, to.script_pubkey(), rate)?;
+    source.broadcast(&tx).await
 }
 
 fn swap_state(state: &SwapState) -> String {
