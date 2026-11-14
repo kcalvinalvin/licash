@@ -1,0 +1,78 @@
+package org.licash.wallet.ui
+
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material3.Button
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import org.licash.core.Network
+
+/** The name, as a mark. */
+@Composable
+fun Wordmark(modifier: Modifier = Modifier, size: Int = 22) {
+    Text(
+        "licash",
+        modifier = modifier,
+        fontSize = size.sp,
+        fontWeight = FontWeight.Bold,
+        letterSpacing = (-0.5).sp,
+        color = MaterialTheme.colorScheme.primary,
+    )
+}
+
+/** The network, unless it is Bitcoin's own. */
+@Composable
+fun NetworkChip(network: Network) {
+    if (network == Network.BITCOIN) return
+    Surface(
+        shape = RoundedCornerShape(50),
+        color = MaterialTheme.colorScheme.secondary.copy(alpha = 0.18f),
+    ) {
+        Text(
+            network.name,
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 3.dp),
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.secondary,
+        )
+    }
+}
+
+@Composable
+fun TopBar(title: String, back: () -> Unit) {
+    Row(
+        Modifier.fillMaxWidth().padding(vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        IconButton(onClick = back) {
+            Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+        }
+        Text(title, style = MaterialTheme.typography.titleLarge)
+    }
+}
+
+/** The one thing to do on a screen. */
+@Composable
+fun BigButton(text: String, modifier: Modifier = Modifier, enabled: Boolean = true, onClick: () -> Unit) {
+    Button(
+        onClick = onClick,
+        enabled = enabled,
+        modifier = modifier.height(56.dp),
+        shape = RoundedCornerShape(18.dp),
+    ) {
+        Text(text, style = MaterialTheme.typography.labelLarge)
+    }
+}

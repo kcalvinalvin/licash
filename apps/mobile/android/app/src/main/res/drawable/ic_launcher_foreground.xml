@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- An "L" of two strokes, the second bent like a growing lichen. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="@color/lichen"
+        android:pathData="M38,30h10v38h24c0,5.5 -4.5,10 -10,10H38z" />
+    <path
+        android:fillColor="@color/lichen"
+        android:fillAlpha="0.55"
+        android:pathData="M54,30a16,16 0,0 1,16 16h-10a6,6 0,0 0,-6 -6z" />
+</vector>
