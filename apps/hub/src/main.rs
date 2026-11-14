@@ -35,7 +35,7 @@ struct Cli {
     /// `--seed` says otherwise.
     #[arg(long, global = true, env = "LICASH_HUB_DATA", default_value = "data")]
     data: PathBuf,
-    /// The seed file, the hub's one secret [default: <data>/seed].
+    /// The seed file, the hub's one secret: `<data>/seed` unless given.
     #[arg(long, global = true, env = "LICASH_HUB_SEED")]
     seed: Option<PathBuf>,
     /// Log lines on stderr as text or JSON, filtered by RUST_LOG.
