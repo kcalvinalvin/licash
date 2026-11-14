@@ -22,11 +22,13 @@ The app is for Bitcoin. Tapping the "licash" wordmark on the first screen,
 or the version in Settings, 7 times turns on developer mode: signet,
 Mutinynet and regtest, the light client's peers and its block-dn server.
 
-The app needs a hub serving silent payment tweaks and taking deposits, on
-the same network: `licash-hub run --network signet --chain URL --tweaks
---deposit-sweep-address ADDRESS`, with `--nostr-relay` (or
-`--mailbox-relay`) for payments between wallets through their mailboxes.
-Payments before the first block the hub indexed are not found.
+The app needs a hub taking deposits on the same network: `licash-hub run
+--network signet --chain URL --deposit-sweep-address ADDRESS`, with
+`--nostr-relay` (or `--mailbox-relay`) for payments between wallets through
+their mailboxes, and `--tweaks` for silent payments: the app's code holds a
+silent payment address only if a hub it uses serves tweaks. Silent payments
+before the first block the hub indexed are not found; payments to the
+fallback address are, from the day before the wallet was made.
 
 A counterpart on the command line:
 
@@ -37,4 +39,14 @@ licash-wallet code --sp           # for the app to scan and pay
 licash-wallet mailbox             # the payments it sent
 licash-wallet pay 'CODE' 1000     # pay the code the app shows
 licash-wallet onchain scan        # coins paid on Bitcoin
+```
+
+## Logs and tests
+
+Settings, Export logs shares the app's log and the light client's as one
+file. The end-to-end test drives the app on the emulator or phone adb
+picks, among the regtest ecosystem of `apps/e2e`:
+
+```sh
+LICASH_E2E_APP=$PWD/app/build/outputs/apk/debug/app-debug.apk ../../e2e/run.sh the_app_is
 ```
