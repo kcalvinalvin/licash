@@ -137,6 +137,19 @@ func (c *Chain) Hash(height int32) ([]byte, error) {
 	return hash[:], nil
 }
 
+// Time is the time the best chain's block at height claims, in seconds
+// since the Unix epoch.
+func (c *Chain) Time(height int32) (int64, error) {
+	if height < 0 {
+		return 0, fmt.Errorf("no block %d", height)
+	}
+	t, err := c.node.BlockTime(uint32(height))
+	if err != nil {
+		return 0, err
+	}
+	return t.Unix(), nil
+}
+
 // Filter is the basic compact filter (BIP158) of the block of hash,
 // checked against its filter header.
 func (c *Chain) Filter(hash []byte) ([]byte, error) {

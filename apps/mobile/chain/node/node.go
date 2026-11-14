@@ -213,6 +213,15 @@ func (n *Node) BlockHash(height uint32) (chainhash.Hash, error) {
 	return *hash, nil
 }
 
+// BlockTime is the time the best chain's block at height claims.
+func (n *Node) BlockTime(height uint32) (time.Time, error) {
+	header, err := n.cs.BlockHeaders.FetchHeaderByHeight(height)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return header.Timestamp, nil
+}
+
 // filterBatch is how many filters from the one asked for peers are asked
 // for at once: a wallet reads them in order.
 const filterBatch = 200

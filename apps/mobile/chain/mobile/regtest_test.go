@@ -132,3 +132,33 @@ func TestRegtestUnconfirmedPaymentsToAWatchedScript(t *testing.T) {
 		}
 	}
 }
+
+func TestRegtestBlockTimesAreTheHeaders(t *testing.T) {
+	c, err := Start("regtest", t.TempDir(), os.Getenv("LICASH_BITCOIND_P2P"), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.Stop() }()
+	for deadline := time.Now().Add(90 * time.Second); ; time.Sleep(200 * time.Millisecond) {
+		height, err := c.Height()
+		if err == nil && c.Synced() && fmt.Sprint(height) == core(t, "getblockcount") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out syncing")
+		}
+	}
+	var header struct{ Time int64 }
+	hash := core(t, "getblockhash", "100")
+	_ = json.Unmarshal([]byte(core(t, "getblockheader", hash)), &header)
+	at, err := c.Time(100)
+	if err != nil || at != header.Time || at == 0 {
+		t.Fatalf("block 100 at %d, Core's %d: %v", at, header.Time, err)
+	}
+	height, _ := c.Height()
+	for _, bad := range []int32{-1, height + 1} {
+		if _, err := c.Time(bad); err == nil {
+			t.Errorf("time of block %d", bad)
+		}
+	}
+}
