@@ -6,6 +6,8 @@
 //! | `GET /v1/swaps/info` |  | [`Info`] |
 //! | `POST /v1/swaps`     | [`Request`] | [`Swap`] |
 //! | `GET /v1/swaps/{id}` |  | [`Swap`] |
+//! | `POST /v1/swaps/chain` | [`ChainRequest`] | [`ChainSwap`] |
+//! | `GET /v1/swaps/chain/{id}` |  | [`ChainSwap`] |
 //!
 //! The client draws a preimage and locks, at hub `from`, the amount and the
 //! provider's fee to [`Info::address`] under its hash, then asks for the
@@ -16,6 +18,14 @@
 //! it. A lock unclaimed is refunded once expired: if the provider never
 //! locks, or the client never claims, each gets its own notes back.
 //!
+//! A provider with [`Info::chain`] pays notes out on Bitcoin the same way:
+//! the client locks a coin's value and the provider's fee to it at hub
+//! `from`, and the provider locks a coin on chain under the same hash
+//! (licash_onchain's `Htlc`: the client's key and the preimage claim it,
+//! the provider's key takes it back after its timeout). The client's claim
+//! pays its payee, and shows the provider the preimage it claims the
+//! client's lock with.
+//!
 //! Hubs are named by their addresses ([`crate::Info::address`]), as client
 //! and provider may reach one hub at different URLs. Anything else is a
 //! [`Problem`]; [`crate::Code::Declined`] when the provider takes no such
@@ -24,16 +34,24 @@
 use licash::{address::Address, spend::ProposalId};
 use serde::{Deserialize, Serialize};
 
-use crate::{Fee, Hex, Problem};
+use crate::{Fee, Funding, Hex, Problem};
 
 pub const SWAPS: &str = "/v1/swaps";
 pub const SWAPS_INFO: &str = "/v1/swaps/info";
 /// The path of [`swap_state`], as a route.
 pub const SWAP_STATE: &str = "/v1/swaps/{id}";
+pub const CHAIN_SWAPS: &str = "/v1/swaps/chain";
+/// The path of [`chain_swap_state`], as a route.
+pub const CHAIN_SWAP_STATE: &str = "/v1/swaps/chain/{id}";
 
 /// Where the swap of the client's lock `id` stands.
 pub fn swap_state(id: &ProposalId) -> String {
     format!("{SWAPS}/{}", hex::encode(id.as_bytes()))
+}
+
+/// Where the payout of the client's lock `id` stands.
+pub fn chain_swap_state(id: &ProposalId) -> String {
+    format!("{CHAIN_SWAPS}/{}", hex::encode(id.as_bytes()))
 }
 
 /// What a provider swaps, and on what terms.
@@ -53,6 +71,9 @@ pub struct Info {
     /// The key it announces itself under on Nostr, x-only in hex.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nostr: Option<String>,
+    /// What it pays out on Bitcoin, if it does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chain: Option<Chain>,
 }
 
 impl Info {
@@ -68,6 +89,36 @@ pub struct Hub {
     pub address: Address,
     /// The most it locks to a client there now.
     pub max: u64,
+}
+
+/// What a provider pays out on Bitcoin: coins it locks to clients on
+/// chain, for their locks at any of its hubs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Chain {
+    /// Its fee on a coin's value, which the client's lock pays on top.
+    pub fee: Fee,
+    /// What the client's lock pays on top for the miners of the coin.
+    pub miner: u64,
+    /// The fee rate it judges a claim confirms at soon, in sat per 1000
+    /// virtual bytes: a hint, which a client budgets its claim at at least,
+    /// within the fee it allows.
+    pub rate: u64,
+    /// The least and the most a coin it locks is worth.
+    pub min: u64,
+    pub max: u64,
+    /// The coin's timeout is this many blocks before the client's lock
+    /// expires, at least.
+    pub margin: u32,
+}
+
+impl Chain {
+    /// What a lock pays to have a coin worth `value` locked on chain: the
+    /// value, the provider's fee and the miners'.
+    pub fn pays(&self, value: u64) -> u64 {
+        value
+            .saturating_add(self.fee.due(value))
+            .saturating_add(self.miner)
+    }
 }
 
 /// Swap the client's `lock` at hub `from`, which pays the provider, for a
@@ -148,4 +199,65 @@ pub enum State {
     /// The provider did not lock: the client's lock is refunded once
     /// expired.
     Failed,
+}
+
+/// Pay the client's `lock` at hub `from`, which pays the provider, out on
+/// Bitcoin: lock a coin worth `value` under the lock's hash, claimed with
+/// the client's key `claim`, x-only. The same request again answers where
+/// the payout stands.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChainRequest {
+    pub from: Address,
+    pub lock: Hex,
+    pub claim: Hex,
+    pub value: u64,
+}
+
+impl ChainRequest {
+    pub fn new(from: &Address, lock: &ProposalId, claim: [u8; 32], value: u64) -> Self {
+        Self {
+            from: *from,
+            lock: Hex(lock.as_bytes().to_vec()),
+            claim: Hex(claim.to_vec()),
+            value,
+        }
+    }
+
+    pub fn lock(&self) -> Result<ProposalId, Problem> {
+        Ok(ProposalId::from_bytes(self.lock.array("lock")?))
+    }
+
+    pub fn claim(&self) -> Result<[u8; 32], Problem> {
+        self.claim.array("claim")
+    }
+}
+
+/// Where a payout stands, by the client's lock: `Accepted` while its coin
+/// is not confirmed, `Locked` once it is, `Paid` once the client claimed
+/// it, `Done` once the provider claimed the client's lock, `Refunded` once
+/// the provider took the coin back, `Failed` if it never locked one.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChainSwap {
+    /// The client's lock at `from`.
+    pub id: Hex,
+    pub state: State,
+    pub value: u64,
+    /// The provider's key, x-only, that takes the coin back after block
+    /// `timeout`.
+    pub refund: Hex,
+    /// A block height, before the client's lock expires: never a time.
+    pub timeout: u32,
+    /// The coin, once confirmed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub funding: Option<Funding>,
+    /// Why it failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl ChainSwap {
+    /// The provider's refund key, decoded.
+    pub fn refund(&self) -> Result<[u8; 32], Problem> {
+        self.refund.array("refund")
+    }
 }

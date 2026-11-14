@@ -411,6 +411,7 @@ fn swap_bodies_name_hubs_by_address_and_locks_by_id() {
             },
         ],
         nostr: None,
+        chain: None,
     };
     assert_eq!(json(&info), info);
     assert_eq!(info.hub(&hub_a.address()).unwrap().max, 20_000);
@@ -457,6 +458,95 @@ fn swap_bodies_name_hubs_by_address_and_locks_by_id() {
         (swaps::SWAPS, swaps::SWAPS_INFO),
         ("/v1/swaps", "/v1/swaps/info")
     );
+}
+
+#[test]
+fn payout_bodies_name_their_fields_on_the_wire() {
+    use licash_api::{
+        swaps::{self, Chain, ChainRequest, ChainSwap, State},
+        Funding,
+    };
+    use serde_json::json;
+
+    let terms = Chain {
+        fee: Fee { base: 1, ppm: 2000 },
+        miner: 300,
+        rate: 1500,
+        min: 10_000,
+        max: 1_000_000,
+        margin: 36,
+    };
+    assert_eq!(json(&terms), terms);
+    assert_eq!(
+        serde_json::to_value(terms).unwrap(),
+        json!({"fee": {"base": 1, "ppm": 2000}, "miner": 300, "rate": 1500,
+               "min": 10_000, "max": 1_000_000, "margin": 36})
+    );
+    assert_eq!(terms.pays(100_000), 100_000 + 201 + 300);
+
+    let hub = OwnerKeys::from_seed(&[1; 32]).unwrap();
+    let id = ProposalId::from_bytes([0xcd; 32]);
+    let request = ChainRequest::new(&hub.address(), &id, [0xab; 32], 20_000);
+    assert_eq!(json(&request), request);
+    assert_eq!(
+        (request.lock().unwrap(), request.claim().unwrap()),
+        (id, [0xab; 32])
+    );
+    let value = serde_json::to_value(&request).unwrap();
+    let mut names: Vec<&String> = value.as_object().unwrap().keys().collect();
+    names.sort();
+    assert_eq!(names, ["claim", "from", "lock", "value"]);
+    assert_eq!(value["claim"], json!("ab".repeat(32)));
+
+    let answer = ChainSwap {
+        id: Hex(id.as_bytes().to_vec()),
+        state: State::Locked,
+        value: 20_000,
+        refund: Hex(vec![0xef; 32]),
+        timeout: 400,
+        funding: Some(Funding {
+            txid: "11".repeat(32),
+            vout: 1,
+            height: 350,
+        }),
+        reason: None,
+    };
+    assert_eq!(json(&answer), answer);
+    assert_eq!(answer.refund().unwrap(), [0xef; 32]);
+    assert_eq!(
+        serde_json::to_value(&answer).unwrap(),
+        json!({"id": "cd".repeat(32), "state": "locked", "value": 20_000,
+               "refund": "ef".repeat(32), "timeout": 400,
+               "funding": {"txid": "11".repeat(32), "vout": 1, "height": 350}})
+    );
+    // Not funded yet: no funding at all, which reads back as none.
+    let waiting = ChainSwap {
+        funding: None,
+        state: State::Accepted,
+        ..answer
+    };
+    let text = serde_json::to_string(&waiting).unwrap();
+    assert!(
+        !text.contains("funding") && !text.contains("reason"),
+        "{text}"
+    );
+    assert_eq!(json(&waiting), waiting);
+    assert_eq!(
+        (swaps::CHAIN_SWAPS, swaps::chain_swap_state(&id)),
+        (
+            "/v1/swaps/chain",
+            format!("/v1/swaps/chain/{}", "cd".repeat(32))
+        )
+    );
+    // A provider paying out nothing on Bitcoin says nothing of it, and an
+    // old one's info reads as such.
+    let info: swaps::Info = serde_json::from_value(json!({
+        "address": hub.address(), "fee": {"base": 0, "ppm": 0}, "min": 1,
+        "max": 2, "margin": 12, "hubs": []
+    }))
+    .unwrap();
+    assert_eq!(info.chain, None);
+    assert!(!serde_json::to_string(&info).unwrap().contains("chain"));
 }
 
 #[test]

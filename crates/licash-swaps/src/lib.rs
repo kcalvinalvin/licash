@@ -434,6 +434,7 @@ impl<T: Transport> Provider<T> {
             margin: self.config.margin,
             hubs,
             nostr: None,
+            chain: None,
         })
     }
 
