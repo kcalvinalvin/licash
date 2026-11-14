@@ -524,7 +524,7 @@ impl Hub {
 
     /// Tell the operator `message`, through the notification outbox.
     pub fn alert(&self, message: &str) -> Result<(), Error> {
-        tracing::error!(message, "alert");
+        tracing::error!("alert: {message}");
         self.store.write(|tx| {
             notify(
                 tx,
