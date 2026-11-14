@@ -43,6 +43,23 @@ const MAX_POW: u32 = 6;
 /// depth, lock blocks, the lock's depth, downtime and sweep blocks.
 pub const DEPOSIT_TIMEOUT: u32 = 10 + 2 + 6 + 1 + 2 + 6;
 
+/// A Nostr relay in this process, and its URL. It probes for a free port
+/// before binding it, which another socket may take in between: it is
+/// tried again then.
+pub fn relay(runtime: &tokio::runtime::Runtime) -> (nostr_sdk::prelude::MockRelay, String) {
+    let mut failed = None;
+    for _ in 0..5 {
+        match runtime.block_on(nostr_sdk::prelude::MockRelay::run()) {
+            Ok(relay) => {
+                let url = runtime.block_on(relay.url()).to_string();
+                return (relay, url);
+            }
+            Err(e) => failed = Some(e),
+        }
+    }
+    panic!("no mock relay: {failed:?}");
+}
+
 /// Where the hub's deposit claims pay.
 pub fn sweep() -> ScriptBuf {
     let key = SecretKey::from_slice(&[9; 32]).unwrap();

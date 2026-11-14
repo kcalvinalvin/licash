@@ -407,12 +407,10 @@ fn owners_pay_invoices_and_get_paid_over_lightning() {
 #[test]
 fn hubs_announced_on_nostr_are_discovered_where_they_answer_as_the_announcer() {
     use licash_nostr::{Announcement, Announcer, Role, Route};
-    use nostr_sdk::prelude::MockRelay;
-
     let hub = Server::start(FEE);
     let runtime = tokio::runtime::Runtime::new().unwrap();
-    let relay = runtime.block_on(MockRelay::run()).unwrap();
-    let relays = [runtime.block_on(relay.url()).to_string()];
+    let (_relay, relay) = support::relay(&runtime);
+    let relays = [relay];
     let announce = |secret: [u8; 32], urls: &[&str], network: &str| {
         let announcement = Announcement {
             urls: urls.iter().map(|u| u.to_string()).collect(),
@@ -552,13 +550,11 @@ fn notes_swap_between_hubs_through_a_provider() {
 #[test]
 fn swap_providers_announced_on_nostr_are_discovered_where_they_answer() {
     use licash_nostr::{Announcement, Announcer, Role, Route};
-    use nostr_sdk::prelude::MockRelay;
-
     let (a, b) = (Server::start(FEE), Server::start(FEE));
     let swaps = Swaps::start(&[&a, &b], 200);
     let runtime = tokio::runtime::Runtime::new().unwrap();
-    let relay = runtime.block_on(MockRelay::run()).unwrap();
-    let relays = [runtime.block_on(relay.url()).to_string()];
+    let (_relay, relay) = support::relay(&runtime);
+    let relays = [relay];
     let announce = |secret: [u8; 32], role: Role, url: String| {
         let announcement = Announcement {
             urls: vec![url],
