@@ -18,10 +18,11 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 
 ## Test networks
 
-The app is for Bitcoin. Tapping the "licash" wordmark on the first screen,
-or the version in Settings, 7 times turns on developer mode: signet,
-Mutinynet and regtest, the light client's peers and its block-dn server,
-the block explorer transactions link to, and every detail of a payment.
+The app is for Bitcoin. Tapping the "licash" wordmark on the first screen
+7 times, or the Advanced mode switch in Settings at any time, turns on
+advanced mode: signet, Mutinynet and regtest, the light client's peers and
+its block-dn server, the block explorer transactions link to, the notes of
+each denomination, and every detail of a payment.
 
 The app needs a hub taking deposits on the same network: `licash-hub run
 --network signet --chain URL --deposit-sweep-address ADDRESS`, with
