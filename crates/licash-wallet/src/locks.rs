@@ -14,12 +14,11 @@
 use licash::{
     address::{Address, Ephemeral},
     authorization::Authorization,
-    chain::Checkpoint,
     claim::Branch,
     note::{Keyset, Note},
     spend::{lock_hash, Proposal, ProposalId, TimedLock, TimedTerms},
 };
-use licash_api::{Code, Issued, Locked, Locks, Refund, Settle, Settled};
+use licash_api::{Code, Issued, Locked, Refund, Settle, Settled};
 use rusqlite::{params, OptionalExtension, Row};
 
 use crate::{
@@ -74,16 +73,6 @@ type Chosen = (Keyset, Vec<[u8; 33]>);
 /// The branch a hub issued, its issuances and the preimage it paid on.
 type Settlement = (Branch, Issued, Option<[u8; 32]>);
 
-/// The latest expiry the hub admits at `locks.height` for a lock of
-/// `depth`: decided within its response window and the checkpoint's
-/// header budget.
-pub(crate) fn latest_expiry(locks: &Locks, checkpoint: &Checkpoint, depth: u32) -> u32 {
-    let slack = depth.saturating_add(locks.reaction);
-    let window = locks.height.saturating_add(locks.window);
-    let budget = checkpoint.height().saturating_add(locks.max_headers);
-    window.min(budget).saturating_sub(slack)
-}
-
 /// Timed locks.
 impl<T: Transport> Wallet<T> {
     /// Lock `amount` to `payee` through the hub at `url`, paid on the
@@ -125,7 +114,9 @@ impl<T: Transport> Wallet<T> {
         })?;
         let checkpoint = locks.checkpoint().map_err(|p| unavailable(&url, p))?;
         let depth = locks.min_depth.max(1);
-        let latest = latest_expiry(locks, &checkpoint, depth);
+        let latest = locks
+            .latest_expiry(depth)
+            .map_err(|p| unavailable(&url, p))?;
         let expiry = expiry.unwrap_or(latest);
         if expiry <= locks.height || expiry > latest {
             return Err(Error::Invalid(format!(

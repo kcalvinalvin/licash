@@ -254,6 +254,8 @@ fn problems_and_their_statuses_are_the_wire_contract() {
         (Code::Unexpired, "unexpired", 409),
         (Code::Activated, "activated", 409),
         (Code::Unavailable, "unavailable", 503),
+        (Code::Forward, "forward", 409),
+        (Code::Declined, "declined", 409),
     ] {
         assert_eq!(serde_json::to_string(&code).unwrap(), format!("\"{name}\""));
         assert_eq!(code.status(), status);
@@ -377,4 +379,81 @@ fn lock_bodies_carry_a_lock_and_its_settlement() {
     let mut broken = Issued::new(&issuances);
     broken.issuances[0].0.pop();
     assert_eq!(broken.decode(&f.keyset).unwrap_err().code, Code::Invalid);
+}
+
+#[test]
+fn swap_bodies_name_hubs_by_address_and_locks_by_id() {
+    use licash_api::swaps::{self, Hub, Request, State, Swap};
+
+    let (hub_a, hub_b) = (
+        OwnerKeys::from_seed(&[1; 32]).unwrap(),
+        OwnerKeys::from_seed(&[2; 32]).unwrap(),
+    );
+    let (provider, client) = (
+        OwnerKeys::from_seed(&[3; 32]).unwrap(),
+        OwnerKeys::from_seed(&[4; 32]).unwrap(),
+    );
+    let info = swaps::Info {
+        address: provider.address(),
+        fee: Fee { base: 1, ppm: 1000 },
+        min: 100,
+        max: 50_000,
+        margin: 12,
+        hubs: vec![
+            Hub {
+                address: hub_a.address(),
+                max: 20_000,
+            },
+            Hub {
+                address: hub_b.address(),
+                max: 0,
+            },
+        ],
+        nostr: None,
+    };
+    assert_eq!(json(&info), info);
+    assert_eq!(info.hub(&hub_a.address()).unwrap().max, 20_000);
+    assert!(info.hub(&client.address()).is_none());
+    let text = serde_json::to_string(&info).unwrap();
+    assert!(!text.contains("nostr"), "{text}");
+
+    let id = ProposalId::from_bytes([0xcd; 32]);
+    let request = Request::new(
+        &hub_a.address(),
+        &id,
+        &hub_b.address(),
+        &client.address(),
+        5000,
+    );
+    assert_eq!(json(&request), request);
+    assert_eq!(request.lock().unwrap(), id);
+    let short = Request {
+        lock: Hex(vec![1; 31]),
+        ..request
+    };
+    assert_eq!(short.lock().unwrap_err().code, Code::Invalid);
+
+    let swap = Swap {
+        id: Hex(id.as_bytes().to_vec()),
+        state: State::Locked,
+        amount: 5000,
+        lock: Some(Hex(vec![0xef; 32])),
+        expiry: 140,
+        reason: None,
+    };
+    assert_eq!(json(&swap), swap);
+    assert_eq!(
+        swap.lock().unwrap(),
+        Some(ProposalId::from_bytes([0xef; 32]))
+    );
+    assert!(serde_json::to_string(&swap)
+        .unwrap()
+        .contains(r#""state":"locked""#));
+    let path = swaps::swap_state(&id);
+    assert_eq!(path, format!("/v1/swaps/{}", "cd".repeat(32)));
+    assert_eq!(licash_api::lock_id(&path[10..]).unwrap(), id);
+    assert_eq!(
+        (swaps::SWAPS, swaps::SWAPS_INFO),
+        ("/v1/swaps", "/v1/swaps/info")
+    );
 }

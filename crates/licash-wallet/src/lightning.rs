@@ -21,9 +21,7 @@ use lightning_invoice::Bolt11Invoice;
 use rand_core::{OsRng, RngCore};
 use rusqlite::{params, OptionalExtension, Row};
 
-use crate::{
-    hub_url, invalid, locks::latest_expiry, now, sql, unavailable, Error, Lock, Transport, Wallet,
-};
+use crate::{hub_url, invalid, now, sql, unavailable, Error, Lock, Transport, Wallet};
 
 /// Blocks a route's timelock may take beyond an invoice's final delta, at
 /// least, as hubs require.
@@ -101,8 +99,9 @@ impl<T: Transport> Wallet<T> {
         let locks = info.locks.as_ref().ok_or_else(|| {
             Error::Invalid(format!("hub {url} follows no chain: it takes no locks"))
         })?;
-        let checkpoint = locks.checkpoint().map_err(|p| unavailable(&url, p))?;
-        let expiry = latest_expiry(locks, &checkpoint, locks.min_depth.max(1));
+        let expiry = locks
+            .latest_expiry(locks.min_depth.max(1))
+            .map_err(|p| unavailable(&url, p))?;
         let room = expiry
             .saturating_sub(locks.height)
             .saturating_sub(lightning.pay_slack);

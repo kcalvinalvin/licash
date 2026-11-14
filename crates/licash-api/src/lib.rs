@@ -23,6 +23,10 @@
 //! Anything else is a [`Problem`], with the HTTP status of its [`Code`].
 //!
 //! A payer hands its payee a [`Payment`], by whatever channel they share.
+//!
+//! Swap providers serve the API of [`swaps`].
+
+pub mod swaps;
 
 use licash::{
     address::Address,
@@ -154,6 +158,15 @@ pub struct Locks {
 impl Locks {
     pub fn checkpoint(&self) -> Result<Checkpoint, Problem> {
         Ok(Checkpoint::from_bytes(&self.checkpoint.0)?)
+    }
+
+    /// The latest expiry the hub admits now for a lock of `depth`: decided
+    /// within its response window and its checkpoint's header budget.
+    pub fn latest_expiry(&self, depth: u32) -> Result<u32, Problem> {
+        let slack = depth.saturating_add(self.reaction);
+        let window = self.height.saturating_add(self.window);
+        let budget = self.checkpoint()?.height().saturating_add(self.max_headers);
+        Ok(window.min(budget).saturating_sub(slack))
     }
 }
 
@@ -360,6 +373,9 @@ pub enum Code {
     Unavailable,
     /// The hub does not make this payment outside its ledger for the lock.
     Forward,
+    /// A swap provider takes no such swap: outside its limits, its hubs or
+    /// what it holds.
+    Declined,
 }
 
 impl Code {
