@@ -205,6 +205,10 @@ pub struct Info {
     /// [`TWEAKS`], if it serves any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tweaks: Option<u32>,
+    /// Nostr relays its wallets' mailboxes are on: where payers send the
+    /// payments of notes at this hub (NIP-17).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relays: Vec<String>,
 }
 
 impl Info {
@@ -218,6 +222,7 @@ impl Info {
             deposits: None,
             nostr: None,
             tweaks: None,
+            relays: Vec::new(),
         }
     }
 
