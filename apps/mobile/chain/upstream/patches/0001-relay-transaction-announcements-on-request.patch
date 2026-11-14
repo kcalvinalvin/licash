@@ -1,0 +1,71 @@
+Relay transaction announcements on request
+
+Upstream neutrino tells every peer not to relay transactions and
+disconnects a peer that announces one. A wallet that must see an
+unconfirmed spend of its contract cannot build on that.
+
+Config.MempoolEnabled asks peers for relay and lets their announcements
+through. Neutrino still fetches and tracks nothing: the caller watches
+ConnectedPeers and SubscribeRecvMsg and requests what it needs. With the
+option unset, behavior is upstream's.
+
+Applies to github.com/lightninglabs/neutrino v0.18.0.
+
+--- a/neutrino.go
++++ b/neutrino.go
+@@ -277,6 +277,14 @@
+ 	newInv := wire.NewMsgInvSizeHint(uint(len(msg.InvList)))
+ 	for _, invVect := range msg.InvList {
+ 		if invVect.Type == wire.InvTypeTx {
++			// With transaction relay requested, announcements
++			// are expected. Subscribers see them through
++			// SubscribeRecvMsg; nothing is fetched or tracked
++			// here.
++			if sp.server.mempoolEnabled {
++				continue
++			}
++
+ 			log.Tracef("Ignoring tx %s in inv from %v -- "+
+ 				"SPV mode", invVect.Hash, sp)
+ 			if sp.ProtocolVersion() >= wire.BIP0037Version {
+@@ -626,6 +634,13 @@
+ 	//    not, replies with a getdata message.
+ 	// 3. Neutrino sends the raw transaction.
+ 	BroadcastTimeout time.Duration
++
++	// MempoolEnabled asks peers to relay transaction announcements and
++	// stops treating those announcements as a protocol violation. The
++	// chain service itself still fetches and tracks no transaction: a
++	// caller observes the announcements through ConnectedPeers and
++	// SubscribeRecvMsg and requests what it wants.
++	MempoolEnabled bool
+ }
+ 
+ // HeadersImportConfig contains configuration options for importing headers
+@@ -723,6 +738,9 @@
+ 	dialer       func(net.Addr) (net.Conn, error)
+ 
+ 	broadcastTimeout time.Duration
++
++	// mempoolEnabled mirrors Config.MempoolEnabled.
++	mempoolEnabled bool
+ }
+ 
+ // NewChainService returns a new chain service configured to connect to the
+@@ -782,6 +800,7 @@
+ 		dialer:            dialer,
+ 		persistToDisk:     cfg.PersistToDisk,
+ 		broadcastTimeout:  cfg.BroadcastTimeout,
++		mempoolEnabled:    cfg.MempoolEnabled,
+ 		headersImport:     cfg.HeadersImport,
+ 	}
+ 	s.workManager = query.NewWorkManager(&query.Config{
+@@ -1559,7 +1578,7 @@
+ 		ChainParams:      &sp.server.chainParams,
+ 		Services:         sp.server.services,
+ 		ProtocolVersion:  wire.AddrV2Version,
+-		DisableRelayTx:   true,
++		DisableRelayTx:   !sp.server.mempoolEnabled,
+ 	}
+ }
+ 
