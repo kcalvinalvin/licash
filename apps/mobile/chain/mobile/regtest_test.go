@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/btcsuite/btcd/chainhash/v2"
+	"github.com/btcsuite/btcd/wire/v2"
 )
 
 // core runs bitcoin-cli in the container regtest.sh starts.
@@ -86,5 +87,48 @@ func TestRegtestChainAsTheAppsSeeIt(t *testing.T) {
 	}
 	if err := c.Broadcast([]byte{1, 2}); err == nil {
 		t.Error("broadcast garbage")
+	}
+}
+
+func TestRegtestUnconfirmedPaymentsToAWatchedScript(t *testing.T) {
+	c, err := Start("regtest", t.TempDir(), os.Getenv("LICASH_BITCOIND_P2P"), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.Stop() }()
+	for deadline := time.Now().Add(90 * time.Second); c.Peers() < 1; time.Sleep(200 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("timed out connecting")
+		}
+	}
+	address := core(t, "-rpcwallet=chain", "getnewaddress", "", "bech32m")
+	var info struct{ ScriptPubKey string }
+	_ = json.Unmarshal([]byte(core(t, "-rpcwallet=chain", "getaddressinfo", address)), &info)
+	script, _ := hex.DecodeString(info.ScriptPubKey)
+	if txs, err := c.Unconfirmed(script); err != nil || len(txs) != 0 {
+		t.Fatalf("before any payment: %x %v", txs, err)
+	}
+	if _, err := c.Unconfirmed(nil); err == nil {
+		t.Error("no script watched")
+	}
+	txid := core(t, "-rpcwallet=chain", "sendtoaddress", address, "0.0001")
+	for deadline := time.Now().Add(60 * time.Second); ; time.Sleep(200 * time.Millisecond) {
+		raw, err := c.Unconfirmed(script)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(raw) > 0 {
+			tx := wire.NewMsgTx(wire.TxVersion)
+			if err := tx.Deserialize(bytes.NewReader(raw)); err != nil {
+				t.Fatal(err)
+			}
+			if tx.TxHash().String() != txid {
+				t.Fatalf("%s, sent %s", tx.TxHash(), txid)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the payment was never relayed")
+		}
 	}
 }

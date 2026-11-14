@@ -8,10 +8,10 @@ import (
 	"bytes"
 	"encoding/hex"
 	"fmt"
-	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"time"
 
@@ -92,7 +92,7 @@ func Start(network, dataDir, peers, cdn string) (*Chain, error) {
 		Params:       net.params,
 		ConnectPeers: connect,
 		CDN:          cdn,
-		Log:          slog.New(slog.NewTextHandler(os.Stderr, nil)),
+		Log:          logger(),
 	})
 	if err != nil {
 		return nil, err
@@ -171,6 +171,28 @@ func (c *Chain) Broadcast(tx []byte) error {
 		return fmt.Errorf("not a transaction: %w", err)
 	}
 	return c.node.Broadcast(msg)
+}
+
+// Unconfirmed is the transactions peers relayed that pay script, oldest
+// first, consensus serialized back to back; script is watched from the
+// first call on, so what peers announced before is not held. They are
+// hints: a peer can make one up, and one can be dropped or replaced. Only
+// a block confirms a payment.
+func (c *Chain) Unconfirmed(script []byte) ([]byte, error) {
+	if len(script) == 0 {
+		return nil, fmt.Errorf("no script")
+	}
+	pool := c.node.Mempool()
+	pool.WatchScript(script)
+	seen := pool.Pays(script)
+	sort.Slice(seen, func(i, j int) bool { return seen[i].At.Before(seen[j].At) })
+	var buf bytes.Buffer
+	for _, s := range seen {
+		if err := s.Tx.Serialize(&buf); err != nil {
+			return nil, err
+		}
+	}
+	return buf.Bytes(), nil
 }
 
 // Synced is whether the client believes it caught up with its peers.
