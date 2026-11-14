@@ -290,6 +290,9 @@ async fn payers_pay_at_a_hub_the_code_names_that_they_trust_and_hold_enough_at()
             .unwrap(),
         code
     );
+    // A hub named twice is named once.
+    let twice = [HUB.into(), HUB2.into(), HUB2.into()];
+    assert_eq!(alice.payment_code(&twice, true).unwrap(), code);
     let plain = alice.payment_code(&[HUB2.into()], false).unwrap();
     assert_eq!(plain.silent, None);
     assert_eq!(plain.licash.unwrap().hubs, vec![HubId::of(&info2.address)]);

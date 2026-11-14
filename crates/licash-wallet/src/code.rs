@@ -375,9 +375,9 @@ impl CodeKeys {
 
 impl<T: Transport> Wallet<T> {
     /// The code payers pay this wallet with: at the hubs of `hubs`, which
-    /// it trusts, preferred first, and its mailbox if one of them names
-    /// relays; on Bitcoin to its silent payment address if `silent`, for
-    /// wallets that scan for it.
+    /// it trusts, preferred first, each once, and its
+    /// mailbox if one of them names relays; on Bitcoin to its silent
+    /// payment address if `silent`, for wallets that scan for it.
     pub fn payment_code(&self, hubs: &[String], silent: bool) -> Result<PaymentCode, Error> {
         let trusted = self.hubs()?;
         let mut ids = Vec::new();
@@ -388,7 +388,10 @@ impl<T: Transport> Wallet<T> {
                 .iter()
                 .find(|(u, _)| *u == url)
                 .ok_or_else(|| Error::UnknownHub(url.clone()))?;
-            ids.push(HubId::of(&info.address));
+            let id = HubId::of(&info.address);
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
             relays |= !info.relays.is_empty();
         }
         let mailbox = relays.then(|| self.keys.mailbox.x_only_public_key(&Secp256k1::new()).0);
