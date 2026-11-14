@@ -764,6 +764,10 @@ async fn silent_payment_coins_are_deposited_whole_up_to_the_most_a_hub_takes() {
     let received = alice.follow_deposit(&deposit.hash).await.unwrap();
     assert_eq!(received.state, DepositState::Received);
     assert_eq!(available(&alice), deposit.amount);
+    // Its notes received under its lock.
+    assert!(deposit.lock.is_none());
+    let receipts = alice.receipts().unwrap();
+    assert_eq!(received.lock.as_ref(), Some(&receipts[0].id));
     let scanned = scan().await;
     assert_eq!(scanned.spent.len(), 2);
     assert!(alice.silent_coins().unwrap().is_empty());

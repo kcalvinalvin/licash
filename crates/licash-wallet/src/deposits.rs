@@ -45,6 +45,9 @@ pub struct Deposit {
     pub terms: Option<DepositTerms>,
     /// The payment, once its hub saw it confirm: `txid:vout` and height.
     pub funding: Option<(OutPoint, u32)>,
+    /// The lock of the hub's notes to the wallet, once paid: the id of
+    /// their receipt (in hex).
+    pub lock: Option<String>,
     pub state: DepositState,
     pub created_at: i64,
 }
@@ -459,7 +462,7 @@ impl<T: Transport> Wallet<T> {
 
 const DEPOSITS: &str = "SELECT d.hash, r.url, d.amount, d.address, d.timeout, d.pays,
     d.fund_by, d.txid, d.vout, d.height, d.done_at IS NOT NULL, d.canceled, d.refund,
-    d.created_at
+    d.created_at, d.lock
     FROM deposits d JOIN reach r ON r.hub = d.hub";
 
 fn deposit_of(r: &Row<'_>) -> rusqlite::Result<Deposit> {
@@ -507,6 +510,7 @@ fn deposit_of(r: &Row<'_>) -> rusqlite::Result<Deposit> {
         amount: r.get::<_, i64>(2)? as u64,
         terms,
         funding,
+        lock: r.get::<_, Option<Vec<u8>>>(14)?.map(hex::encode),
         state,
         created_at: r.get(13)?,
     })
