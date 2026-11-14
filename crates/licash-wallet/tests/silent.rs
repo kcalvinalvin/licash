@@ -1,0 +1,813 @@
+//! Silent payments to a wallet, found with a hub's tweaks and a light
+//! client's compact filters on an in-process chain of real payments: found,
+//! spent with change found again, through reorganizations, and refused from
+//! a hub that names another block.
+
+#[allow(dead_code)]
+mod net;
+
+use std::{
+    collections::HashMap,
+    future::Future,
+    sync::{Arc, Mutex},
+};
+
+use bitcoin::{
+    absolute::LockTime,
+    bip158::{self, BlockFilter},
+    block::{Header, Version},
+    hashes::{sha256d, Hash},
+    key::{Secp256k1, TweakedPublicKey},
+    pow::CompactTarget,
+    secp256k1::{Message, SecretKey, XOnlyPublicKey},
+    sighash::{Prevouts, SighashCache},
+    transaction, Amount, Block, BlockHash, CompressedPublicKey, FeeRate, Network, OutPoint,
+    ScriptBuf, Sequence, TapSighashType, Transaction, TxIn, TxMerkleNode, TxOut, Txid, Witness,
+};
+use licash::spend::ChainProfile;
+use licash_api::{BlockTweaks, Fee, Hex, Info};
+use licash_onchain::silent::{self, SpAddress};
+use licash_wallet::{Blocks, Error, Response, Transport, Wallet};
+use net::{Net, HUB};
+
+const REGTEST: ChainProfile = ChainProfile::Core30DefaultRegtest;
+
+/// A best chain from genesis, the outputs of every transaction ever made
+/// (fictional coins of payers among them), and what the wallet read.
+struct Chain {
+    blocks: Vec<Block>,
+    outputs: HashMap<OutPoint, TxOut>,
+    /// Serve compact filters.
+    filters: bool,
+    /// The blocks the wallet fetched whole.
+    fetched: Vec<BlockHash>,
+    /// The filters it read.
+    filtered: u32,
+    /// Serve blocks without their last transaction.
+    tampered: bool,
+    /// Makes each coinbase and payer coin unique.
+    made: u32,
+}
+
+type Shared = Arc<Mutex<Chain>>;
+
+impl Chain {
+    fn new() -> Shared {
+        Arc::new(Mutex::new(Chain {
+            blocks: vec![bitcoin::constants::genesis_block(Network::Regtest)],
+            outputs: HashMap::new(),
+            filters: true,
+            fetched: Vec::new(),
+            filtered: 0,
+            tampered: false,
+            made: 0,
+        }))
+    }
+
+    fn height(&self) -> u32 {
+        self.blocks.len() as u32 - 1
+    }
+
+    /// Mine `txs` in a block on the tip.
+    fn mine(&mut self, txs: Vec<Transaction>) -> BlockHash {
+        self.made += 1;
+        let coinbase = Transaction {
+            version: transaction::Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::from_bytes(self.made.to_be_bytes().to_vec()),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50),
+                script_pubkey: ScriptBuf::new_op_return([1]),
+            }],
+        };
+        let mut block = Block {
+            header: Header {
+                version: Version::from_consensus(0x2000_0000),
+                prev_blockhash: self.blocks.last().unwrap().block_hash(),
+                merkle_root: TxMerkleNode::all_zeros(),
+                time: 1_700_000_000 + self.made,
+                bits: CompactTarget::from_consensus(0x207f_ffff),
+                nonce: 0,
+            },
+            txdata: [vec![coinbase], txs].concat(),
+        };
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+        for tx in &block.txdata {
+            let txid = tx.compute_txid();
+            for (vout, output) in tx.output.iter().enumerate() {
+                self.outputs
+                    .insert(OutPoint::new(txid, vout as u32), output.clone());
+            }
+        }
+        let hash = block.block_hash();
+        self.blocks.push(block);
+        hash
+    }
+
+    /// Mine `count` empty blocks.
+    fn mine_empty(&mut self, count: u32) {
+        for _ in 0..count {
+            self.mine(Vec::new());
+        }
+    }
+
+    /// Drop the blocks from height `at` on.
+    fn fork(&mut self, at: u32) {
+        self.blocks.truncate(at as usize);
+    }
+
+    /// A payer's transaction from a fresh coin of its own, of key-hash
+    /// inputs, paying `values` to `to` in order.
+    fn pay(&mut self, to: &[SpAddress], values: &[u64]) -> Transaction {
+        self.made += 1;
+        let secp = Secp256k1::new();
+        let mut secret = [0x11; 32];
+        secret[..4].copy_from_slice(&self.made.to_be_bytes());
+        let secret = SecretKey::from_slice(&secret).unwrap();
+        let key = CompressedPublicKey(secret.public_key(&secp));
+        let coin = OutPoint::new(
+            Txid::from_raw_hash(sha256d::Hash::hash(&self.made.to_be_bytes())),
+            0,
+        );
+        self.outputs.insert(
+            coin,
+            TxOut {
+                value: Amount::from_sat(values.iter().sum::<u64>() + 1_000),
+                script_pubkey: ScriptBuf::new_p2wpkh(&key.wpubkey_hash()),
+            },
+        );
+        let keys = silent::outputs(&[(secret, false)], &[coin], to).unwrap();
+        let mut witness = Witness::new();
+        witness.push([0x30; 71]);
+        witness.push(key.to_bytes());
+        Transaction {
+            version: transaction::Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: coin,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness,
+            }],
+            output: keys
+                .iter()
+                .zip(values)
+                .map(|(key, value)| TxOut {
+                    value: Amount::from_sat(*value),
+                    script_pubkey: ScriptBuf::new_p2tr_tweaked(
+                        TweakedPublicKey::dangerous_assume_tweaked(*key),
+                    ),
+                })
+                .collect(),
+        }
+    }
+
+    /// What an index server serves of the block at `height`.
+    fn tweaks(&self, height: u32) -> BlockTweaks {
+        let block = &self.blocks[height as usize];
+        let tweaks = block.txdata[1..].iter().filter_map(|tx| {
+            let prevouts: Option<Vec<&bitcoin::Script>> = tx
+                .input
+                .iter()
+                .map(|i| {
+                    self.outputs
+                        .get(&i.previous_output)
+                        .map(|o| o.script_pubkey.as_script())
+                })
+                .collect();
+            silent::tweak(tx, &prevouts?)
+        });
+        BlockTweaks {
+            height,
+            hash: block.block_hash().to_string(),
+            tweaks: tweaks.map(|t| Hex(t.serialize().to_vec())).collect(),
+        }
+    }
+}
+
+/// A light client's view of a [`Chain`].
+struct Light(Shared);
+
+impl Blocks for Light {
+    fn height(&self) -> impl Future<Output = Result<u32, String>> + Send {
+        std::future::ready(Ok(self.0.lock().unwrap().height()))
+    }
+
+    fn hash(&self, height: u32) -> impl Future<Output = Result<BlockHash, String>> + Send {
+        let chain = self.0.lock().unwrap();
+        let hash = chain.blocks.get(height as usize).map(Block::block_hash);
+        std::future::ready(hash.ok_or_else(|| format!("no block {height}")))
+    }
+
+    fn filter(
+        &self,
+        hash: &BlockHash,
+    ) -> impl Future<Output = Result<Option<Vec<u8>>, String>> + Send {
+        let mut chain = self.0.lock().unwrap();
+        chain.filtered += 1;
+        let chain = &*chain;
+        let block = chain.blocks.iter().find(|b| b.block_hash() == *hash);
+        let filter = match (chain.filters, block) {
+            (false, _) => Ok(None),
+            (true, None) => Err(format!("no block {hash}")),
+            (true, Some(block)) => BlockFilter::new_script_filter(block, |coin| {
+                let output = chain.outputs.get(coin);
+                let script = output.map(|o| o.script_pubkey.clone());
+                script.ok_or(bip158::Error::UtxoMissing(*coin))
+            })
+            .map(|f| Some(f.content))
+            .map_err(|e| e.to_string()),
+        };
+        std::future::ready(filter)
+    }
+
+    fn block(&self, hash: &BlockHash) -> impl Future<Output = Result<Block, String>> + Send {
+        let mut chain = self.0.lock().unwrap();
+        chain.fetched.push(*hash);
+        let mut block = chain
+            .blocks
+            .iter()
+            .find(|b| b.block_hash() == *hash)
+            .cloned();
+        if let Some(block) = block.as_mut().filter(|_| chain.tampered) {
+            block.txdata.pop();
+        }
+        std::future::ready(block.ok_or_else(|| format!("no block {hash}")))
+    }
+}
+
+/// A hub of the [`Net`] that indexes the tweaks of a [`Chain`].
+struct Indexer {
+    net: Arc<Net>,
+    chain: Shared,
+    /// The first block whose tweaks it serves.
+    first: Mutex<Option<u32>>,
+    /// The height at which it names another block than the chain's.
+    forged: Mutex<Option<u32>>,
+}
+
+impl Indexer {
+    fn serve(&self, url: &str, body: Option<Vec<u8>>) -> Result<Response, String> {
+        let tweaks = format!("{HUB}{}?", licash_api::TWEAKS);
+        if let Some(query) = url.strip_prefix(&tweaks) {
+            let number = |name: &str| -> u32 {
+                let pair = query.split('&').find_map(|p| p.strip_prefix(name)).unwrap();
+                pair.trim_start_matches('=').parse().unwrap()
+            };
+            let (from, count) = (number("from"), number("count"));
+            assert!(count <= licash_api::MAX_TWEAK_BLOCKS);
+            let chain = self.chain.lock().unwrap();
+            let mut blocks: Vec<BlockTweaks> = (from..from + count)
+                .take_while(|h| *h <= chain.height())
+                .map(|h| chain.tweaks(h))
+                .collect();
+            let forged = *self.forged.lock().unwrap();
+            for block in blocks.iter_mut().filter(|b| Some(b.height) == forged) {
+                block.hash = BlockHash::all_zeros().to_string();
+            }
+            return Ok(Response {
+                status: 200,
+                body: serde_json::to_vec(&blocks).unwrap(),
+            });
+        }
+        let mut response = self.net.serve(url, body)?;
+        if url.ends_with(licash_api::INFO) && response.status == 200 {
+            let mut info: Info = serde_json::from_slice(&response.body).unwrap();
+            info.tweaks = *self.first.lock().unwrap();
+            response.body = serde_json::to_vec(&info).unwrap();
+        }
+        Ok(response)
+    }
+}
+
+struct Via(Arc<Indexer>);
+
+impl Transport for Via {
+    fn request(
+        &self,
+        url: &str,
+        body: Option<Vec<u8>>,
+    ) -> impl Future<Output = Result<Response, String>> + Send {
+        std::future::ready(self.0.serve(url, body))
+    }
+}
+
+struct Setup {
+    wallet: Wallet<Via>,
+    chain: Shared,
+    hub: Arc<Indexer>,
+    dir: tempfile::TempDir,
+}
+
+/// A wallet trusting a hub that serves the tweaks of a chain of two empty
+/// blocks, from the first.
+async fn setup() -> Setup {
+    let net = Net::new();
+    net.start(HUB, Fee { base: 0, ppm: 0 });
+    let chain = Chain::new();
+    chain.lock().unwrap().mine_empty(2);
+    let hub = Arc::new(Indexer {
+        net,
+        chain: chain.clone(),
+        first: Mutex::new(Some(1)),
+        forged: Mutex::new(None),
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("wallet.sqlite");
+    let wallet = Wallet::create(&path, &[7; 32], REGTEST, Via(hub.clone())).unwrap();
+    wallet.add_hub(HUB).await.unwrap();
+    Setup {
+        wallet,
+        chain,
+        hub,
+        dir,
+    }
+}
+
+impl Setup {
+    fn address(&self) -> SpAddress {
+        self.wallet.silent_keys().address()
+    }
+
+    async fn scan(&self) -> Result<licash_wallet::Scanned, Error> {
+        self.wallet
+            .scan_silent(HUB, &Light(self.chain.clone()), u32::MAX)
+            .await
+    }
+
+    fn mine(&self, txs: Vec<Transaction>) -> BlockHash {
+        self.chain.lock().unwrap().mine(txs)
+    }
+
+    fn pay(&self, to: &[SpAddress], values: &[u64]) -> Transaction {
+        self.chain.lock().unwrap().pay(to, values)
+    }
+
+    /// The fetched blocks so far, forgotten.
+    fn fetched(&self) -> Vec<BlockHash> {
+        std::mem::take(&mut self.chain.lock().unwrap().fetched)
+    }
+}
+
+/// Someone else's silent payment address.
+fn stranger() -> SpAddress {
+    silent::Keys::from_seed(&[9; 32], bitcoin::NetworkKind::Test)
+        .unwrap()
+        .address()
+}
+
+/// A key-hash script outside the wallet.
+fn elsewhere() -> ScriptBuf {
+    let secp = Secp256k1::new();
+    let key = SecretKey::from_slice(&[5; 32]).unwrap().public_key(&secp);
+    ScriptBuf::new_p2wpkh(&CompressedPublicKey(key).wpubkey_hash())
+}
+
+/// Every input of `tx` is signed for the coin it spends, as `chain` holds.
+fn assert_signed(chain: &Chain, tx: &Transaction) {
+    let secp = Secp256k1::verification_only();
+    let prevouts: Vec<TxOut> = tx
+        .input
+        .iter()
+        .map(|i| chain.outputs[&i.previous_output].clone())
+        .collect();
+    let mut cache = SighashCache::new(tx);
+    for (i, input) in tx.input.iter().enumerate() {
+        let sighash = cache
+            .taproot_key_spend_signature_hash(i, &Prevouts::All(&prevouts), TapSighashType::Default)
+            .unwrap();
+        let signature = bitcoin::taproot::Signature::from_slice(&input.witness[0]).unwrap();
+        let key = XOnlyPublicKey::from_slice(&prevouts[i].script_pubkey.as_bytes()[2..]).unwrap();
+        let message = Message::from_digest(sighash.to_byte_array());
+        secp.verify_schnorr(&signature.signature, &message, &key)
+            .unwrap();
+        assert_eq!(input.witness.len(), 1);
+    }
+}
+
+fn rate() -> FeeRate {
+    FeeRate::from_sat_per_vb(2).unwrap()
+}
+
+#[tokio::test]
+async fn scanning_needs_a_first_block_and_a_hub_serving_tweaks() {
+    let s = setup().await;
+    assert_eq!(s.wallet.silent_next().unwrap(), None);
+    match s.scan().await {
+        Err(Error::Invalid(why)) => assert!(why.contains("watch_silent"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(s.chain.lock().unwrap().filtered, 0);
+    s.wallet.watch_silent(HUB, 2).unwrap();
+    // Never later than it stands.
+    s.wallet.watch_silent(HUB, 5).unwrap();
+    assert_eq!(s.wallet.silent_next().unwrap(), Some(2));
+    for (first, says) in [(Some(3), "from block 3 on"), (None, "serves no")] {
+        *s.hub.first.lock().unwrap() = first;
+        s.wallet.add_hub(HUB).await.unwrap();
+        match s.scan().await {
+            Err(Error::Invalid(why)) => assert!(why.contains(says), "{why}"),
+            other => panic!("{other:?}"),
+        }
+        // Nor can it look earlier than the hub serves.
+        match s.wallet.watch_silent(HUB, 1) {
+            Err(Error::Invalid(why)) => assert!(why.contains(says), "{why}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(s.wallet.silent_next().unwrap(), Some(2));
+    }
+    *s.hub.first.lock().unwrap() = Some(1);
+    s.wallet.add_hub(HUB).await.unwrap();
+    let scanned = s.scan().await.unwrap();
+    assert_eq!((scanned.next, scanned.height), (3, 2));
+    assert!(scanned.found.is_empty());
+    // At most `max` blocks at a time.
+    s.chain.lock().unwrap().mine_empty(5);
+    let light = Light(s.chain.clone());
+    let scanned = s.wallet.scan_silent(HUB, &light, 2).await.unwrap();
+    assert_eq!((scanned.next, scanned.height), (5, 7));
+    assert_eq!(s.scan().await.unwrap().next, 8);
+}
+
+#[tokio::test]
+async fn payments_are_found_and_spent_with_change_found_again() {
+    let s = setup().await;
+    s.wallet.watch_silent(HUB, 1).unwrap();
+    let me = s.address();
+    let paying = s.pay(&[me, me], &[30_000, 20_000]);
+    let other = s.pay(&[stranger()], &[10_000]);
+    s.mine(vec![other]);
+    let paid = s.mine(vec![paying.clone()]);
+    s.chain.lock().unwrap().mine_empty(1);
+    let scanned = s.scan().await.unwrap();
+    assert_eq!((scanned.next, scanned.height), (6, 5));
+    let mut values: Vec<u64> = scanned.found.iter().map(|c| c.value).collect();
+    values.sort();
+    assert_eq!(values, [20_000, 30_000]);
+    // The filters spared the block paying someone else, and the empty
+    // blocks before any coin were not even filtered.
+    assert_eq!(s.fetched(), [paid]);
+    assert_eq!(scanned.fetched, 1);
+    assert_eq!(s.chain.lock().unwrap().filtered, 3);
+    let coins = s.wallet.silent_coins().unwrap();
+    assert_eq!(coins.len(), 2);
+    assert!(coins
+        .iter()
+        .all(|c| c.height == 4 && !c.change && c.spending.is_none()));
+    assert!(coins
+        .iter()
+        .all(|c| c.outpoint.txid == paying.compute_txid()));
+    // Looked in already: nothing again.
+    assert!(s.scan().await.unwrap().found.is_empty());
+
+    let spend = s
+        .wallet
+        .spend_silent(elsewhere(), Some(35_000), rate())
+        .unwrap();
+    assert_signed(&s.chain.lock().unwrap(), &spend);
+    assert_eq!(spend.input.len(), 2);
+    assert_eq!(spend.output.len(), 2);
+    assert!(spend.input.iter().all(|i| i.sequence.is_rbf()));
+    let out: u64 = spend.output.iter().map(|o| o.value.to_sat()).sum();
+    let fee = 50_000 - out;
+    assert_eq!(fee, rate().fee_wu(spend.weight()).unwrap().to_sat());
+    let pays = |tx: &Transaction, script: &ScriptBuf| {
+        tx.output
+            .iter()
+            .filter(|o| o.script_pubkey == *script)
+            .map(|o| o.value.to_sat())
+            .sum::<u64>()
+    };
+    assert_eq!(pays(&spend, &elsewhere()), 35_000);
+    assert_eq!(
+        s.wallet.silent_spends().unwrap(),
+        std::slice::from_ref(&spend)
+    );
+    let txid = spend.compute_txid();
+    assert!(s
+        .wallet
+        .silent_coins()
+        .unwrap()
+        .iter()
+        .all(|c| c.spending == Some(txid)));
+    match s.wallet.spend_silent(elsewhere(), Some(1_000), rate()) {
+        Err(Error::Insufficient { available: 0, .. }) => {}
+        other => panic!("{other:?}"),
+    }
+
+    s.mine(vec![spend.clone()]);
+    let scanned = s.scan().await.unwrap();
+    assert_eq!(scanned.spent.len(), 2);
+    assert_eq!(scanned.found.len(), 1);
+    let change = &scanned.found[0];
+    assert!(change.change);
+    assert_eq!(change.value, 50_000 - 35_000 - fee);
+    assert_eq!(change.outpoint.txid, txid);
+    assert!(s.wallet.silent_spends().unwrap().is_empty());
+    let coins = s.wallet.silent_coins().unwrap();
+    assert_eq!(coins.len(), 1);
+    assert_eq!(coins[0].outpoint, change.outpoint);
+
+    // Everything: no change.
+    let all = s.wallet.spend_silent(elsewhere(), None, rate()).unwrap();
+    assert_signed(&s.chain.lock().unwrap(), &all);
+    assert_eq!(all.output.len(), 1);
+    let fee = rate().fee_wu(all.weight()).unwrap().to_sat();
+    assert_eq!(pays(&all, &elsewhere()), change.value - fee);
+}
+
+#[tokio::test]
+async fn amounts_too_small_or_too_large_are_refused() {
+    let s = setup().await;
+    s.wallet.watch_silent(HUB, 1).unwrap();
+    match s.wallet.spend_silent(elsewhere(), None, rate()) {
+        Err(Error::Insufficient { available: 0, .. }) => {}
+        other => panic!("{other:?}"),
+    }
+    let paying = s.pay(&[s.address()], &[10_000]);
+    s.mine(vec![paying]);
+    s.scan().await.unwrap();
+    match s.wallet.spend_silent(elsewhere(), Some(100), rate()) {
+        Err(Error::Invalid(why)) => assert!(why.contains("dust"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+    match s.wallet.spend_silent(elsewhere(), Some(10_000), rate()) {
+        Err(Error::Insufficient {
+            available: 10_000, ..
+        }) => {}
+        other => panic!("{other:?}"),
+    }
+    // Change too small to keep goes to the fee.
+    let spend = s
+        .wallet
+        .spend_silent(elsewhere(), Some(9_500), rate())
+        .unwrap();
+    assert_eq!(spend.output.len(), 1);
+    assert_eq!(spend.output[0].value.to_sat(), 9_500);
+    assert!(s.wallet.silent_spends().unwrap().len() == 1);
+}
+
+#[tokio::test]
+async fn an_abandoned_spend_frees_its_coins() {
+    let s = setup().await;
+    s.wallet.watch_silent(HUB, 1).unwrap();
+    let paying = s.pay(&[s.address()], &[10_000]);
+    s.mine(vec![paying]);
+    s.scan().await.unwrap();
+    let spend = s.wallet.spend_silent(elsewhere(), None, rate()).unwrap();
+    let txid = spend.compute_txid();
+    s.wallet.abandon_silent(&txid).unwrap();
+    assert!(s.wallet.silent_spends().unwrap().is_empty());
+    assert_eq!(s.wallet.silent_coins().unwrap()[0].spending, None);
+    assert!(matches!(
+        s.wallet.abandon_silent(&txid),
+        Err(Error::UnknownPayment(_))
+    ));
+    // Should it reach a block after all, a scan sees its coin spent.
+    let again = s
+        .wallet
+        .spend_silent(elsewhere(), Some(5_000), rate())
+        .unwrap();
+    s.mine(vec![spend]);
+    let scanned = s.scan().await.unwrap();
+    assert_eq!(scanned.spent.len(), 1);
+    assert!(s.wallet.silent_coins().unwrap().is_empty());
+    // And the spend it replaced is no longer offered for broadcast.
+    assert!(!s.wallet.silent_spends().unwrap().contains(&again));
+    // That spend, not the wallet's own any more, replaced: the coin is the
+    // wallet's again.
+    s.chain.lock().unwrap().fork(4);
+    s.chain.lock().unwrap().mine_empty(2);
+    s.scan().await.unwrap();
+    let coins = s.wallet.silent_coins().unwrap();
+    assert_eq!(coins.len(), 1);
+    assert_eq!(coins[0].spending, None);
+}
+
+#[tokio::test]
+async fn a_spend_a_block_conflicts_with_is_given_up() {
+    let s = setup().await;
+    s.wallet.watch_silent(HUB, 1).unwrap();
+    let paying = s.pay(&[s.address(), s.address()], &[20_000, 10_000]);
+    s.mine(vec![paying]);
+    s.scan().await.unwrap();
+    // The larger coin alone, given up; then both.
+    let first = s
+        .wallet
+        .spend_silent(elsewhere(), Some(5_000), rate())
+        .unwrap();
+    assert_eq!(first.input.len(), 1);
+    s.wallet.abandon_silent(&first.compute_txid()).unwrap();
+    let second = s
+        .wallet
+        .spend_silent(elsewhere(), Some(25_000), rate())
+        .unwrap();
+    assert_eq!(second.input.len(), 2);
+    // The first confirms after all: the second never can.
+    s.mine(vec![first.clone()]);
+    let scanned = s.scan().await.unwrap();
+    assert_eq!(scanned.spent, [first.input[0].previous_output]);
+    assert!(s.wallet.silent_spends().unwrap().is_empty());
+    // The smaller coin is free, beside the first's change.
+    let coins = s.wallet.silent_coins().unwrap();
+    assert_eq!(coins.len(), 2);
+    assert!(coins.iter().all(|c| c.spending.is_none()));
+    assert!(coins.iter().any(|c| c.value == 10_000 && !c.change));
+    assert!(coins.iter().any(|c| c.change));
+    // Its block replaced: both coins are free.
+    s.chain.lock().unwrap().fork(4);
+    s.chain.lock().unwrap().mine_empty(2);
+    s.scan().await.unwrap();
+    let coins = s.wallet.silent_coins().unwrap();
+    assert_eq!(coins.len(), 2);
+    assert!(coins.iter().all(|c| c.spending.is_none() && !c.change));
+}
+
+#[tokio::test]
+async fn a_block_unlike_its_header_is_refused() {
+    let s = setup().await;
+    s.wallet.watch_silent(HUB, 1).unwrap();
+    let paying = s.pay(&[s.address()], &[40_000]);
+    s.mine(vec![paying]);
+    s.chain.lock().unwrap().tampered = true;
+    match s.scan().await {
+        Err(Error::Chain(why)) => assert!(why.contains("header"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(s.wallet.silent_next().unwrap(), Some(1));
+    s.chain.lock().unwrap().tampered = false;
+    assert_eq!(s.scan().await.unwrap().found.len(), 1);
+}
+
+#[tokio::test]
+async fn without_filters_the_blocks_that_could_pay_or_spend_are_fetched() {
+    let s = setup().await;
+    s.chain.lock().unwrap().filters = false;
+    s.wallet.watch_silent(HUB, 3).unwrap();
+    let other = s.pay(&[stranger()], &[10_000]);
+    let theirs = s.mine(vec![other]);
+    s.mine(Vec::new());
+    let scanned = s.scan().await.unwrap();
+    assert!(scanned.found.is_empty());
+    assert_eq!(s.fetched(), [theirs]);
+    // Once it holds a coin, any block may spend it.
+    let paying = s.pay(&[s.address()], &[10_000]);
+    let paid = s.mine(vec![paying]);
+    let empty = s.mine(Vec::new());
+    let scanned = s.scan().await.unwrap();
+    assert_eq!(scanned.found.len(), 1);
+    assert_eq!(s.fetched(), [paid, empty]);
+    assert_eq!(scanned.fetched, 2);
+}
+
+#[tokio::test]
+async fn a_reorganization_drops_what_the_replaced_blocks_held() {
+    let s = setup().await;
+    s.wallet.watch_silent(HUB, 1).unwrap();
+    let paying = s.pay(&[s.address()], &[40_000]);
+    s.mine(vec![paying.clone()]);
+    s.mine(Vec::new());
+    assert_eq!(s.scan().await.unwrap().found[0].height, 3);
+
+    // Blocks 3 and 4 replaced, without the payment: a chain behind the
+    // blocks looked in proves nothing yet.
+    s.chain.lock().unwrap().fork(3);
+    s.chain.lock().unwrap().mine_empty(1);
+    let scanned = s.scan().await.unwrap();
+    assert_eq!((scanned.next, scanned.height), (5, 3));
+    assert_eq!(s.wallet.silent_coins().unwrap().len(), 1);
+    s.chain.lock().unwrap().mine_empty(2);
+    let scanned = s.scan().await.unwrap();
+    assert_eq!((scanned.next, scanned.height), (6, 5));
+    assert!(scanned.found.is_empty());
+    assert!(s.wallet.silent_coins().unwrap().is_empty());
+
+    // Mined again later: found again.
+    s.mine(vec![paying.clone()]);
+    let scanned = s.scan().await.unwrap();
+    assert_eq!(scanned.found.len(), 1);
+    assert_eq!(scanned.found[0].height, 6);
+
+    // The wallet's spend, in no block yet, outlives its coin's block.
+    let spend = s.wallet.spend_silent(elsewhere(), None, rate()).unwrap();
+    let txid = spend.compute_txid();
+    s.chain.lock().unwrap().fork(6);
+    s.mine(Vec::new());
+    s.mine(vec![paying.clone()]);
+    let scanned = s.scan().await.unwrap();
+    assert_eq!(scanned.next, 8);
+    let coins = s.wallet.silent_coins().unwrap();
+    assert_eq!(coins.len(), 1);
+    assert_eq!(coins[0].height, 7);
+    assert_eq!(coins[0].spending, Some(txid));
+    assert_eq!(
+        s.wallet.silent_spends().unwrap(),
+        std::slice::from_ref(&spend)
+    );
+
+    // Its spend's block replaced: the coin is the wallet's again, its
+    // spend still to broadcast.
+    s.mine(vec![spend.clone()]);
+    s.scan().await.unwrap();
+    assert!(s.wallet.silent_coins().unwrap().is_empty());
+    s.chain.lock().unwrap().fork(8);
+    s.chain.lock().unwrap().mine_empty(2);
+    s.scan().await.unwrap();
+    let coins = s.wallet.silent_coins().unwrap();
+    assert_eq!(coins.len(), 1);
+    assert_eq!(coins[0].spending, Some(txid));
+    assert_eq!(s.wallet.silent_spends().unwrap(), [spend]);
+}
+
+#[tokio::test]
+async fn a_reorganization_deeper_than_the_blocks_kept_needs_a_look_again() {
+    let s = setup().await;
+    s.wallet.watch_silent(HUB, 1).unwrap();
+    let paying = s.pay(&[s.address()], &[40_000]);
+    s.mine(vec![paying]);
+    s.chain.lock().unwrap().mine_empty(297);
+    assert_eq!(s.scan().await.unwrap().found.len(), 1);
+    s.chain.lock().unwrap().fork(3);
+    s.chain.lock().unwrap().mine_empty(299);
+    match s.scan().await {
+        Err(Error::Invalid(why)) => assert!(why.contains("deeper"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(s.wallet.silent_coins().unwrap().len(), 1);
+    s.wallet.watch_silent(HUB, 1).unwrap();
+    let scanned = s.scan().await.unwrap();
+    assert_eq!((scanned.next, scanned.height), (302, 301));
+    assert!(s.wallet.silent_coins().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn tweaks_of_another_block_than_the_chains_are_refused() {
+    let s = setup().await;
+    s.wallet.watch_silent(HUB, 1).unwrap();
+    let paying = s.pay(&[s.address()], &[40_000]);
+    s.mine(vec![paying]);
+    *s.hub.forged.lock().unwrap() = Some(2);
+    match s.scan().await {
+        Err(Error::Unavailable { hub, reason }) => {
+            assert_eq!(hub, HUB);
+            assert!(reason.contains("block 2"), "{reason}");
+        }
+        other => panic!("{other:?}"),
+    }
+    // Nothing of the batch was recorded.
+    assert_eq!(s.wallet.silent_next().unwrap(), Some(1));
+    *s.hub.forged.lock().unwrap() = None;
+    assert_eq!(s.scan().await.unwrap().found.len(), 1);
+}
+
+#[tokio::test]
+async fn a_wallet_file_of_the_first_version_gains_silent_payments() {
+    let Setup {
+        wallet,
+        chain,
+        hub,
+        dir,
+    } = setup().await;
+    drop(wallet);
+    let path = dir.path().join("v1.sqlite");
+    let version = |path: &std::path::Path| -> i64 {
+        let c = rusqlite::Connection::open(path).unwrap();
+        c.pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap()
+    };
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute_batch(include_str!("fixtures/wallet-v1.sql"))
+        .unwrap();
+    assert_eq!(version(&path), 1);
+    let wallet = Wallet::open(&path, Via(hub.clone())).unwrap();
+    let address = wallet.silent_keys().address();
+    assert_eq!(version(&path), 2);
+    assert_eq!(wallet.hubs().unwrap().len(), 1);
+    assert_eq!(wallet.silent_next().unwrap(), None);
+    wallet.watch_silent(HUB, 1).unwrap();
+    let paying = chain.lock().unwrap().pay(&[address], &[10_000]);
+    chain.lock().unwrap().mine(vec![paying]);
+    let scanned = wallet
+        .scan_silent(HUB, &Light(chain.clone()), u32::MAX)
+        .await
+        .unwrap();
+    assert_eq!(scanned.found.len(), 1);
+    drop(wallet);
+    // A newer version's file is refused, untouched.
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .pragma_update(None, "user_version", 3)
+        .unwrap();
+    match Wallet::open(&path, Via(hub)) {
+        Err(Error::Setup(why)) => assert!(why.contains("schema 3"), "{why}"),
+        Err(other) => panic!("{other:?}"),
+        Ok(_) => panic!("opened"),
+    }
+    assert_eq!(version(&path), 3);
+}

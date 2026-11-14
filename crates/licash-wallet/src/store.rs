@@ -11,9 +11,53 @@ use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior};
 
 use crate::Error;
 
-/// The schema this wallet reads and writes, as SQLite's `user_version`.
-const VERSION: i64 = 1;
+/// The schema this wallet reads and writes, as SQLite's `user_version`:
+/// [`SCHEMA`]'s, 1, with each of [`MIGRATIONS`] after it.
+const VERSION: i64 = 1 + MIGRATIONS.len() as i64;
 
+/// What each version adds to the one before: the first takes 1 to 2. A
+/// file of an older version is brought up to date when opened.
+const MIGRATIONS: &[&str] = &[SILENT];
+
+/// Version 2: payments to the silent payment address.
+const SILENT: &str = "
+-- The next block to look in for silent payments, from a first block the
+-- owner chose: none until it chose one.
+CREATE TABLE silent_scan (
+    one INTEGER PRIMARY KEY CHECK (one = 1),
+    next INTEGER NOT NULL
+) STRICT;
+-- The blocks looked in lately, by height, to notice a reorganization.
+CREATE TABLE silent_blocks (
+    height INTEGER PRIMARY KEY,
+    hash BLOB NOT NULL
+) STRICT;
+-- Outputs paying the silent payment address, in a block of the best chain,
+-- with what spends each (its key's tweak and label); spent_by names the
+-- transaction spending it, the wallet's own or seen, and spent_at the
+-- block it is in, once in one.
+CREATE TABLE silent_coins (
+    txid BLOB NOT NULL,
+    vout INTEGER NOT NULL,
+    value INTEGER NOT NULL,
+    output BLOB NOT NULL,
+    tweak BLOB NOT NULL,
+    label INTEGER,
+    height INTEGER NOT NULL,
+    spent_by BLOB,
+    spent_at INTEGER,
+    PRIMARY KEY (txid, vout)
+) STRICT;
+-- The transactions the wallet made of its coins, to broadcast.
+CREATE TABLE silent_spends (
+    txid BLOB PRIMARY KEY,
+    tx BLOB NOT NULL,
+    created_at INTEGER NOT NULL
+) STRICT;
+";
+
+/// Version 1, as wallets in the field hold it (`tests/fixtures/wallet-v1.sql`):
+/// never change it, add a migration.
 const SCHEMA: &str = "
 CREATE TABLE meta (
     one INTEGER PRIMARY KEY CHECK (one = 1),
@@ -215,7 +259,8 @@ impl Store {
         let store = Self::connect(path)?;
         store.write(|tx| {
             tx.execute_batch(SCHEMA)?;
-            tx.pragma_update(None, "user_version", VERSION)?;
+            tx.pragma_update(None, "user_version", 1)?;
+            migrate(tx)?;
             tx.execute(
                 "INSERT INTO meta (one, seed, address, network, created_at)
                  VALUES (1, ?1, ?2, ?3, ?4)",
@@ -232,13 +277,12 @@ impl Store {
             return Err(Error::Setup(format!("no wallet at {}", path.display())));
         }
         let store = Self::connect(path)?;
+        let version: i64 =
+            store.read(|c| Ok(c.pragma_query_value(None, "user_version", |r| r.get(0))?))?;
+        if version != VERSION {
+            store.write(migrate)?;
+        }
         let owner = store.read(|c| {
-            let version: i64 = c.pragma_query_value(None, "user_version", |r| r.get(0))?;
-            if version != VERSION {
-                return Err(Error::Setup(format!(
-                    "wallet schema {version}, this version reads {VERSION}"
-                )));
-            }
             Ok(
                 c.query_row("SELECT seed, address, network FROM meta", [], |r| {
                     Ok(Owner {
@@ -286,6 +330,25 @@ impl Store {
         tx.commit()?;
         Ok(value)
     }
+}
+
+/// Bring the schema up to [`VERSION`], in `tx`: from any older version,
+/// never from a newer one.
+fn migrate(tx: &Transaction<'_>) -> Result<(), Error> {
+    let version: i64 = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    if !(1..=VERSION).contains(&version) {
+        return Err(Error::Setup(format!(
+            "wallet schema {version}, this version reads 1 to {VERSION}"
+        )));
+    }
+    if version < VERSION {
+        for step in &MIGRATIONS[version as usize - 1..] {
+            tx.execute_batch(step)?;
+        }
+        tx.pragma_update(None, "user_version", VERSION)?;
+        tracing::info!(from = version, to = VERSION, "wallet schema migrated");
+    }
+    Ok(())
 }
 
 fn setup(path: &Path, e: impl std::fmt::Display) -> Error {

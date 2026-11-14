@@ -17,8 +17,8 @@ research implementation; it has not had a security review.
 - `crates/licash-api`: the HTTP API bodies and error codes of hubs and swap
   providers.
 - `crates/licash-wallet`: a wallet over its own SQLite file: hubs, notes,
-  payments made and taken, locks, Lightning, swaps, unlinking, and resuming
-  after interruptions.
+  payments made and taken, locks, Lightning, swaps, unlinking, silent
+  payments found with a light client, and resuming after interruptions.
 - `crates/licash-swaps`: a swap provider over its own wallet: swaps of notes
   at one hub for notes at another, with a timed lock at each.
 - `crates/licash-onchain`: Bitcoin outside the protocol: silent payments

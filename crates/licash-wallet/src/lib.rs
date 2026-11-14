@@ -15,7 +15,9 @@
 //! invoices with locks and is paid with locks of the hub's notes: see
 //! [`Wallet::pay_invoice`] and [`Wallet::invoice`]. Through a swap
 //! provider, it swaps notes at one hub for notes at another with a lock at
-//! each: see [`Wallet::swap`].
+//! each: see [`Wallet::swap`]. Silent payments to its address are found
+//! with a hub's tweaks and the application's light client: see
+//! [`Wallet::scan_silent`].
 //!
 //! The wallet reaches hubs through the application's [`Transport`]: HTTP
 //! over TCP or Tor, or a test. Its seed alone does not restore its notes:
@@ -26,6 +28,7 @@ mod coins;
 mod deposits;
 mod lightning;
 mod locks;
+mod silent;
 mod store;
 mod swaps;
 
@@ -53,6 +56,7 @@ pub use coins::MAX_INPUTS;
 pub use deposits::{Deposit, DepositState, DepositTerms};
 pub use lightning::{Invoice, InvoiceState};
 pub use locks::{Incoming, Lock, LockState, CLAIM_MARGIN};
+pub use silent::{Blocks, Scanned, SilentCoin};
 use store::{now, sql, Owner, Store};
 pub use swaps::{Swap, SwapState, SWAP_WINDOW};
 
@@ -118,6 +122,10 @@ pub enum Error {
     PaysNothing,
     #[error("{0}")]
     Invalid(String),
+    /// The application's view of Bitcoin failed, or served a block that
+    /// is not the one asked for: retry later.
+    #[error("chain source failed: {0}")]
+    Chain(String),
 }
 
 fn invalid(e: impl std::fmt::Display) -> Error {
