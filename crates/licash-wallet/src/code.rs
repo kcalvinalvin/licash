@@ -418,7 +418,8 @@ impl<T: Transport> Wallet<T> {
     }
 
     /// The hub to pay `amount` at to the payee of `code`: the first it
-    /// names that this wallet trusts and holds that much at, if any.
+    /// names that this wallet trusts and holds that much at, the hub's fee
+    /// on top, if any.
     pub fn hub_to_pay(&self, code: &LicashCode, amount: u64) -> Result<Option<String>, Error> {
         if code.network != self.network {
             return Err(Error::Invalid(format!(
@@ -427,19 +428,17 @@ impl<T: Transport> Wallet<T> {
             )));
         }
         let trusted = self.hubs()?;
-        let balance = self.balance()?;
-        let held = |url: &str| {
-            balance
-                .iter()
-                .filter(|b| b.hub == url)
-                .map(|b| b.available)
-                .sum::<u64>()
-        };
-        Ok(code.hubs.iter().find_map(|id| {
-            let (url, _) = trusted
-                .iter()
-                .find(|(url, info)| HubId::of(&info.address) == *id && held(url) >= amount)?;
-            Some(url.clone())
-        }))
+        for id in &code.hubs {
+            let Some((url, _)) = trusted.iter().find(|(_, i)| HubId::of(&i.address) == *id) else {
+                continue;
+            };
+            let (hub, info) = self.hub(url)?;
+            match self.select(hub, amount, &info.fees.spend) {
+                Ok(_) => return Ok(Some(url.clone())),
+                Err(Error::Insufficient { .. }) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(None)
     }
 }

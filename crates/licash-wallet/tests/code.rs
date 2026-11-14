@@ -247,7 +247,7 @@ fn wallet(net: &std::sync::Arc<Net>, dir: &tempfile::TempDir, seed: u8) -> Walle
 async fn payers_pay_at_a_hub_the_code_names_that_they_trust_and_hold_enough_at() {
     let net = Net::new();
     net.start(HUB, Fee { base: 0, ppm: 0 });
-    net.start(HUB2, Fee { base: 0, ppm: 0 });
+    net.start(HUB2, Fee { base: 1, ppm: 0 });
     *net.relays.lock().unwrap() = vec!["wss://relay.example".into()];
     let dir = tempfile::tempdir().unwrap();
     let (alice, bob, carol) = (
@@ -297,10 +297,10 @@ async fn payers_pay_at_a_hub_the_code_names_that_they_trust_and_hold_enough_at()
     let unknown = alice.payment_code(&["http://other.test".into()], true);
     assert!(matches!(unknown, Err(Error::UnknownHub(_))), "{unknown:?}");
 
-    // Bob pays at the hub he trusts and holds enough at; Carol, trusting
-    // none, pays on Bitcoin.
-    assert_eq!(bob.hub_to_pay(&licash, 50).unwrap().as_deref(), Some(HUB2));
-    assert_eq!(bob.hub_to_pay(&licash, 51).unwrap(), None);
+    // Bob pays at the hub he trusts and holds enough at, its fee on top;
+    // Carol, trusting none, pays on Bitcoin.
+    assert_eq!(bob.hub_to_pay(&licash, 49).unwrap().as_deref(), Some(HUB2));
+    assert_eq!(bob.hub_to_pay(&licash, 50).unwrap(), None);
     assert_eq!(carol.hub_to_pay(&licash, 1).unwrap(), None);
     let signet = LicashCode {
         network: ChainProfile::Core30Signet,
