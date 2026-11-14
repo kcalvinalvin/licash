@@ -33,7 +33,7 @@ use licash::statement::Journal;
 use licash::statement::Observed;
 use licash_contract::keys::{HolderKeys, HubKeys};
 pub use licash_contract::opening::journal;
-use licash_contract::opening::{self as machine, Input, Out, Quote, Start, Trust};
+use licash_contract::opening::{self as machine, Bounds, Input, Out, Quote, Start, Trust};
 use licash_contract::wire::{Kind, Wanted};
 use licash_contract::{INSTANCES, KEPT};
 use lngap_btc::bitcoin::consensus::encode::{deserialize_hex, serialize_hex};
@@ -164,6 +164,13 @@ pub fn checkpoint(rt: &Regtest) -> Result<Checkpoint> {
         None,
     )?)
 }
+
+/// What the fixture Hub lets a holder ask: its collateral locked up to
+/// 1 000 blocks, any response window Base takes.
+pub const BOUNDS: Bounds = Bounds {
+    lock: 1_000,
+    response_window: 2,
+};
 
 /// The fixture Hub's terms: a 21-bit graph of 1-sat units, its challenge
 /// and the holder's answer 12 and 6 blocks.
@@ -455,7 +462,7 @@ pub fn run(
     let mut kept = HashMap::new();
     let out = stored(&mut alice, None, out, &ctx()?, secrets, &mut kept)?;
     let mut holders = BTreeMap::from([(alice.phase(), alice.to_bytes())]);
-    let mut hub = machine::Hub::with_secret(&hub_secret(label), hub_quote);
+    let mut hub = machine::Hub::with_secret(&hub_secret(label), hub_quote, BOUNDS);
     let mut queue = VecDeque::new();
     let mut hubs = BTreeMap::new();
     let mut refused = vec![];

@@ -16,7 +16,7 @@ use licash_contract::opening::{
 use licash_contract::wire::{self, Envelope, Kind, Wanted};
 use licash_regtest::mock_statement;
 use licash_regtest::native::{
-    checkpoint, open_native_with, play, quote, Authority, Holder, Refusal, Side,
+    checkpoint, open_native_with, play, quote, run, Authority, Holder, Refusal, Side, BOUNDS,
 };
 use licash_regtest::native_fixture::{point, SEED, SPEND};
 use lichen_babe::setup::{instance, Instance};
@@ -571,6 +571,39 @@ fn misspent(bytes: &[u8], deposit: OutPoint) -> Result<Vec<Vec<u8>>> {
     ])
 }
 
+/// A hub refuses an Open that would lock its collateral longer than it
+/// lets a holder: she never gets Terms, and the opening goes no further.
+#[test]
+fn a_hub_refuses_her_open_past_its_bounds() -> Result<()> {
+    let rt = Regtest::start_standard()?;
+    let mut honest = |_: Kind, m: Vec<u8>| vec![m];
+    let deposit = Amount::from_sat(500_000);
+    let deadlines = (BOUNDS.lock, 6);
+    let mock = Authority::mock();
+    let run = run(
+        &rt,
+        "native-bounds",
+        deadlines,
+        holder()?,
+        mock,
+        deposit,
+        &mut honest,
+    )?;
+    ensure!(!run.funded, "funded past its bounds");
+    let [Refusal {
+        by: Side::Hub,
+        kind: Some(Kind::Open),
+        error,
+    }] = &run.refused[..]
+    else {
+        bail!("refused {:?}", run.refused)
+    };
+    ensure!(error.contains("collateral locked"), "{error}");
+    let phases = (run.alice.phase(), run.hub.phase());
+    ensure!(phases == (Phase::Started, None), "{phases:?}");
+    Ok(())
+}
+
 /// Each party signs only its own coins of F: the hub once she consents,
 /// all of them before its Signed, which she takes only so; she her
 /// deposit alone, by its key over all of F. The hub takes her deposit's
@@ -787,7 +820,7 @@ fn a_stored_opening_loads_only_as_hers() -> Result<()> {
     };
     let (mut alice, out) = machine::Holder::new(start, &ctx)?;
     let started = alice.to_bytes();
-    let mut hub = machine::Hub::with_secret(&[7; 32], quote);
+    let mut hub = machine::Hub::with_secret(&[7; 32], quote, BOUNDS);
     let [Out::Send(open)] = &out[..] else {
         bail!("{out:?}")
     };

@@ -486,7 +486,7 @@ impl Hub {
             .get(usize::from(phase))
             .with_context(|| format!("phase {phase}"))?;
         let secret = r.array()?;
-        let mut h = Hub::with(&secret, r.quote()?);
+        let mut h = Hub::with(&secret, r.quote()?, None);
         let id = r.array()?;
         let open = wire::Open::decode(r.blob()?)?;
         let stored = Base::from_bytes(r.blob()?)?;

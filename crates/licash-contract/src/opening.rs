@@ -1440,6 +1440,36 @@ fn programs(base: &Base) -> Programs {
     }
 }
 
+/// What a hub lets a holder ask of it beyond its quote, at the tip she
+/// opens at: how long its collateral may stay locked, Base's close height
+/// at most that many blocks ahead, and how long it has to respond to her
+/// request at least. Its policy, checked as her Open comes in only:
+/// neither Base nor its state keeps it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Bounds {
+    pub lock: u32,
+    pub response_window: u16,
+}
+
+impl Bounds {
+    /// Refused unless what she wants at `tip` is within them.
+    pub fn check(&self, wanted: &wire::Wanted, tip: u32) -> Result<()> {
+        let lock = wanted.close_height.saturating_sub(tip);
+        ensure!(
+            lock <= self.lock,
+            "collateral locked {lock} blocks, not {} at most",
+            self.lock
+        );
+        ensure!(
+            wanted.response_window >= self.response_window,
+            "a response window of {} blocks, not {} at least",
+            wanted.response_window,
+            self.response_window
+        );
+        Ok(())
+    }
+}
+
 /// Base on `quote` for the holder of `open`: her side and deadlines,
 /// the `programs` trusted and her `checkpoint`, with the hub's party and
 /// response keys. The hub builds it to offer, she again to check that it
@@ -1518,6 +1548,9 @@ pub struct Hub {
     secret: [u8; 32],
     keys: HubKeys,
     quote: Quote,
+    /// What it lets her ask, until her Open: none once loaded, which is
+    /// never before it.
+    bounds: Option<Bounds>,
     id: Option<[u8; 32]>,
     /// The holder's Open, and the Base that answers it.
     base: Option<(wire::Open, Base)>,
@@ -1535,25 +1568,26 @@ pub struct Hub {
 
 impl Hub {
     /// The hub's side of one opening, under a secret drawn for it alone.
-    pub fn new(quote: Quote) -> Self {
+    pub fn new(quote: Quote, bounds: Bounds) -> Self {
         use rand_core::RngCore;
         let mut secret = [0; 32];
         rand_core::OsRng.fill_bytes(&mut secret);
-        Self::with(&secret, quote)
+        Self::with(&secret, quote, Some(bounds))
     }
 
     /// [`Hub::new`] under `secret`. For fixtures only: a hub must never
     /// open twice under one secret.
     #[cfg(feature = "fixture")]
-    pub fn with_secret(secret: &[u8; 32], quote: Quote) -> Self {
-        Self::with(secret, quote)
+    pub fn with_secret(secret: &[u8; 32], quote: Quote, bounds: Bounds) -> Self {
+        Self::with(secret, quote, Some(bounds))
     }
 
-    fn with(secret: &[u8; 32], quote: Quote) -> Self {
+    fn with(secret: &[u8; 32], quote: Quote, bounds: Option<Bounds>) -> Self {
         Self {
             secret: *secret,
             keys: HubKeys::from_secret(secret),
             quote,
+            bounds,
             id: None,
             base: None,
             holder: None,
@@ -1602,10 +1636,13 @@ impl Hub {
         self.base.as_ref().expect("Open before").0.mock
     }
 
-    /// M1: Base, the holder's side and deadlines in it, answers.
+    /// M1: Base, the holder's side and deadlines in it, answers, if they
+    /// are within its bounds at its tip.
     fn open(&mut self, id: [u8; 32], body: &[u8], ctx: &Context) -> Result<Vec<Out>> {
         ensure!(self.base.is_none(), "Open again");
         let o = wire::Open::decode(body)?;
+        let bounds = self.bounds.expect("a hub loaded took its Open");
+        bounds.check(&o.wanted, ctx.tip)?;
         check_deposit(&o, &self.quote.graph, &self.quote.fees)?;
         let base = self.offer(id, &o, ctx.trust.programs, ctx)?;
         let out = vec![send(Kind::Terms, id, base.to_bytes())];
@@ -1985,4 +2022,32 @@ fn build(d: &Dealt, i: usize, st: &Statement) -> Instance {
         &st.public,
     )
     .0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_hub_bounds_how_long_she_locks_it_and_how_soon_it_answers() {
+        let bounds = Bounds {
+            lock: 100,
+            response_window: 6,
+        };
+        let wanted = |close_height, response_window| wire::Wanted {
+            assert_height: 1_010,
+            close_height,
+            response_window,
+        };
+        assert!(bounds.check(&wanted(1_100, 6), 1_000).is_ok());
+        // A block longer locked, at the same tip or one sooner.
+        let error = bounds.check(&wanted(1_101, 6), 1_000).unwrap_err();
+        assert!(error.to_string().contains("locked 101 blocks"), "{error}");
+        assert!(bounds.check(&wanted(1_100, 6), 999).is_err());
+        assert!(bounds.check(&wanted(1_100, 6), 1_001).is_ok());
+        // A block shorter to answer in.
+        let error = bounds.check(&wanted(1_100, 5), 1_000).unwrap_err();
+        assert!(error.to_string().contains("window of 5 blocks"), "{error}");
+        assert!(bounds.check(&wanted(1_100, 7), 1_000).is_ok());
+    }
 }
