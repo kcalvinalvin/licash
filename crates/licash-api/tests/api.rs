@@ -2,6 +2,7 @@ use licash::{
     address::{Ephemeral, OwnerKeys},
     authorization::{Authorization, PreparedGrant, SignedProposal},
     claim::Branch,
+    crypto::{schnorr_sign, tagged_hash},
     note::{Derivation, Evidence, IssuerKeys, Keyset, Note},
     source::Certificate,
     spend::{lock_hash, ChainProfile, Output, Proposal, ProposalId, TimedLock, TimedTerms},
@@ -540,4 +541,99 @@ fn deposit_bodies_are_receipts_with_a_refund_key_and_a_payment() {
     );
     info.deposits = Some(deposits);
     assert_eq!(json(&info).deposits, Some(deposits));
+}
+
+/// A hub's info as one following signet would advertise it: two keysets,
+/// a Nostr key, proved by `signer`'s spend key.
+fn proved_info(owner: &OwnerKeys, signer: &OwnerKeys) -> Info {
+    let keysets: Vec<Keyset> = (0..2)
+        .map(|i| {
+            IssuerKeys::from_seed(&[7; 32], i, 3)
+                .unwrap()
+                .keyset()
+                .unwrap()
+        })
+        .collect();
+    let mut info = Info::new(&keysets, owner.address(), Fees::default(), None);
+    info.nostr = Some(hex::encode([9; 32]));
+    let identity = info.identity(ChainProfile::Core30Signet).unwrap();
+    let signature = schnorr_sign(signer.spend_secret(), &identity).unwrap();
+    info.proof = Some(Hex(signature.0.to_vec()));
+    info
+}
+
+#[test]
+fn a_hub_proves_its_identity_and_nothing_else() {
+    let owner = OwnerKeys::from_seed(&[1; 32]).unwrap();
+    let other = OwnerKeys::from_seed(&[2; 32]).unwrap();
+    let signet = ChainProfile::Core30Signet;
+    let info = json(&proved_info(&owner, &owner));
+    assert_eq!(info.proved(signet), Ok(true));
+
+    // What it signs, field by field, in fixed widths.
+    let keysets = info.keysets().unwrap();
+    let mut parts: Vec<&[u8]> = Vec::new();
+    let address = owner.address().to_bytes();
+    let count = 2u32.to_be_bytes();
+    parts.extend([&[3u8][..], &address, &[1], &[9; 32], &count]);
+    parts.extend(keysets.iter().map(|k| k.id().as_slice()));
+    let restated = tagged_hash("licash/hub/identity/v1", &parts);
+    assert_eq!(info.identity(signet).unwrap(), restated);
+    let mut anonymous = info.clone();
+    anonymous.nostr = None;
+    let mut parts: Vec<&[u8]> = Vec::new();
+    parts.extend([&[3u8][..], &address, &[0], &[0; 32], &count]);
+    parts.extend(keysets.iter().map(|k| k.id().as_slice()));
+    let restated = tagged_hash("licash/hub/identity/v1", &parts);
+    assert_eq!(anonymous.identity(signet).unwrap(), restated);
+
+    // None: proves nothing, refuses nothing.
+    let mut unproved = info.clone();
+    unproved.proof = None;
+    assert_eq!(unproved.proved(signet), Ok(false));
+    assert!(!serde_json::to_string(&unproved).unwrap().contains("proof"));
+
+    let refused = |changed: Info, what: &str| {
+        let problem = changed.proved(signet).expect_err(what);
+        assert_eq!(problem.code, Code::Invalid, "{what}");
+    };
+    refused(proved_info(&owner, &other), "signed by another key");
+    for network in [ChainProfile::Core30DefaultRegtest, ChainProfile::Mutinynet] {
+        let problem = info.proved(network).expect_err("another network");
+        assert_eq!(problem.code, Code::Invalid);
+    }
+    let mut changed = info.clone();
+    changed.address = other.address();
+    refused(changed, "another address");
+    let mut changed = info.clone();
+    changed.nostr = Some(hex::encode([8; 32]));
+    refused(changed, "another Nostr key");
+    refused(anonymous, "no Nostr key");
+    let mut changed = info.clone();
+    changed.keysets.pop();
+    refused(changed, "a keyset removed");
+    let mut changed = info.clone();
+    changed.keysets.reverse();
+    refused(changed, "the keysets reordered");
+    let mut changed = info.clone();
+    let third = IssuerKeys::from_seed(&[7; 32], 2, 3).unwrap();
+    changed
+        .keysets
+        .push(Hex(third.keyset().unwrap().to_bytes()));
+    refused(changed, "a keyset added");
+    let mut changed = info.clone();
+    changed.proof.as_mut().unwrap().0[10] ^= 1;
+    refused(changed, "a byte of the signature");
+    let mut changed = info.clone();
+    changed.proof.as_mut().unwrap().0.pop();
+    refused(changed, "63 bytes");
+    let mut changed = info.clone();
+    changed.nostr = Some("not hex".into());
+    refused(changed, "a Nostr key not in hex");
+
+    // What it does not sign may change.
+    let mut changed = info.clone();
+    changed.relays = vec!["wss://relay.example".into()];
+    changed.fees.spend = Fee { base: 5, ppm: 0 };
+    assert_eq!(changed.proved(signet), Ok(true));
 }

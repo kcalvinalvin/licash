@@ -66,7 +66,7 @@ impl ChainProfile {
     ];
 
     /// Its byte in encodings. Tag 2 is unassigned.
-    pub(crate) fn tag(self) -> u8 {
+    pub fn tag(self) -> u8 {
         match self {
             Self::Core30Mainnet => 0,
             Self::Core30DefaultRegtest => 1,

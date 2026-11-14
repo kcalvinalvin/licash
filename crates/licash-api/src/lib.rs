@@ -32,10 +32,10 @@ use licash::{
     address::Address,
     authorization::{Authorization, Grant, SignedProposal, Unlock},
     chain::Checkpoint,
-    crypto::Point,
+    crypto::{schnorr_verify, tagged_hash, Point, Signature},
     note::{Keyset, MintResponse, Note},
     source::Certificate,
-    spend::{lock_hash, Output, Proposal, ProposalId},
+    spend::{lock_hash, ChainProfile, Output, Proposal, ProposalId},
     unlink::{Answer, Request},
 };
 use serde::{Deserialize, Serialize};
@@ -209,6 +209,11 @@ pub struct Info {
     /// payments of notes at this hub (NIP-17).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub relays: Vec<String>,
+    /// That the hub of [`Info::address`] says the rest of its
+    /// [`Info::identity`] is its own: a BIP340 signature by its spend key.
+    /// None from hubs following no chain, and from older hubs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proof: Option<Hex>,
 }
 
 impl Info {
@@ -223,7 +228,46 @@ impl Info {
             nostr: None,
             tweaks: None,
             relays: Vec::new(),
+            proof: None,
         }
+    }
+
+    /// What [`Info::proof`] signs: on `network`, the hub's address, the
+    /// key it announces itself under on Nostr and its keysets, in order. A
+    /// payer knowing a hub by its address only tells by it the hub's
+    /// keysets from those another server says under the same address.
+    pub fn identity(&self, network: ChainProfile) -> Result<[u8; 32], Problem> {
+        let (named, nostr) = match &self.nostr {
+            Some(key) => {
+                let bytes =
+                    hex::decode(key).map_err(|e| Problem::invalid(format!("nostr: {e}")))?;
+                ([1u8], Hex(bytes).array::<32>("nostr")?)
+            }
+            None => ([0], [0; 32]),
+        };
+        let keysets = self.keysets()?;
+        let count = u32::try_from(keysets.len())
+            .map_err(|_| Problem::invalid("too many keysets"))?
+            .to_be_bytes();
+        let (tag, address) = ([network.tag()], self.address.to_bytes());
+        let mut parts: Vec<&[u8]> = vec![&tag, &address, &named, &nostr, &count];
+        parts.extend(keysets.iter().map(|k| k.id().as_slice()));
+        Ok(tagged_hash("licash/hub/identity/v1", &parts))
+    }
+
+    /// Whether [`Info::proof`] proves the hub's [`Info::identity`] on
+    /// `network`: false if it has none, an error if it has one that does
+    /// not.
+    pub fn proved(&self, network: ChainProfile) -> Result<bool, Problem> {
+        let Some(proof) = &self.proof else {
+            return Ok(false);
+        };
+        let signature = Signature(proof.array::<64>("proof")?);
+        let key = self.address.spend().x_only();
+        schnorr_verify(&key, &self.identity(network)?, &signature).map_err(|_| {
+            Problem::invalid("the proof is not the hub's: it does not sign its identity")
+        })?;
+        Ok(true)
     }
 
     pub fn keysets(&self) -> Result<Vec<Keyset>, Problem> {

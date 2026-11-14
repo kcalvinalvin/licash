@@ -1126,3 +1126,27 @@ fn a_forward_is_paid_by_its_lock_settled_from_elsewhere() {
     let forwarded = kinds(&hub).iter().filter(|k| *k == "forwarded").count();
     assert_eq!(forwarded, 1);
 }
+
+#[test]
+fn a_hub_proves_its_identity_once_it_follows_a_chain() {
+    let files = files();
+    let hub = Hub::open(&files.seed, &files.db, policy()).unwrap();
+    let regtest = ChainProfile::Core30DefaultRegtest;
+    // Following no chain, it names no network to prove it on.
+    let info = hub.advertise().unwrap();
+    assert_eq!(info.proof, None);
+    assert_eq!(info.proved(regtest), Ok(false));
+
+    let chain = Chain::new();
+    hub.add_checkpoint(&chain.checkpoint(0)).unwrap();
+    let info = hub.advertise().unwrap();
+    assert_eq!(info.proved(regtest), Ok(true));
+    assert!(info.proved(ChainProfile::Core30Signet).is_err());
+    assert_eq!(info.address.spend(), hub.info().address.spend());
+    // The same proof while its identity is the same, after a restart too
+    // a valid one.
+    assert_eq!(hub.advertise().unwrap().proof, info.proof);
+    drop(hub);
+    let hub = Hub::open(&files.seed, &files.db, policy()).unwrap();
+    assert_eq!(hub.advertise().unwrap().proved(regtest), Ok(true));
+}

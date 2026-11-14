@@ -18,8 +18,8 @@ use licash::{
     unlink::Nonce,
 };
 use licash_api::{
-    Check, Checked, Code, Fee, Issued, Lock, LockState, Locked, Offer, Offered, Payment, Problem,
-    Refund, Release, Released, Settle, Unlink, Unlinked,
+    Check, Checked, Code, Fee, Hex, Issued, Lock, LockState, Locked, Offer, Offered, Payment,
+    Problem, Refund, Release, Released, Settle, Unlink, Unlinked,
 };
 use licash_hub::{Error, Hub, Policy, Settled, Timing};
 use licash_wallet::{Response, Transport};
@@ -63,6 +63,9 @@ pub struct Net {
     pub stale: Mutex<Option<Fee>>,
     /// The mailbox relays the hubs name.
     pub relays: Mutex<Vec<String>>,
+    /// The proof of identity the hubs advertise instead of their own: none
+    /// as from an older hub, or another.
+    pub proof: Mutex<Option<Option<Hex>>>,
     dirs: Mutex<Vec<tempfile::TempDir>>,
 }
 
@@ -207,6 +210,9 @@ impl Net {
             info.fees.spend = stale;
         }
         info.relays = self.relays.lock().unwrap().clone();
+        if let Some(proof) = self.proof.lock().unwrap().clone() {
+            info.proof = proof;
+        }
         Ok(serde_json::to_vec(&info).unwrap())
     }
 }

@@ -389,6 +389,40 @@ async fn only_hubs_added_are_trusted() {
 }
 
 #[tokio::test]
+async fn a_hub_proving_another_identity_is_refused_and_one_proving_none_taken() {
+    const OTHER: &str = "http://other.test";
+    let net = network();
+    net.start(OTHER, FEE);
+    let bob = party(&net, 2).await;
+    let regtest = ChainProfile::Core30DefaultRegtest;
+    assert_eq!(bob.hubs().unwrap()[0].1.proved(regtest), Ok(true));
+    let proof = |url: &str| net.hub(url).advertise().unwrap().proof;
+    let refused = |result: Result<_, Error>| {
+        assert!(
+            matches!(&result, Err(Error::Invalid(m)) if m.contains("proof")),
+            "{result:?}"
+        );
+    };
+
+    // A proof of another identity, whoever made it: not the hub's info,
+    // neither added nor refreshing what is kept.
+    let mut forged = proof(OTHER).unwrap();
+    forged.0[0] ^= 1;
+    *net.proof.lock().unwrap() = Some(Some(forged));
+    refused(bob.add_hub(OTHER).await);
+    refused(bob.add_hub(HUB).await);
+    *net.proof.lock().unwrap() = Some(proof(OTHER));
+    refused(bob.add_hub(HUB).await);
+    assert_eq!(bob.hubs().unwrap().len(), 1);
+    assert_eq!(bob.hubs().unwrap()[0].1.proof, proof(HUB));
+
+    // None, as from a hub older than proofs: taken, as ever.
+    *net.proof.lock().unwrap() = Some(None);
+    bob.add_hub(OTHER).await.unwrap();
+    assert_eq!(bob.hubs().unwrap().len(), 2);
+}
+
+#[tokio::test]
 async fn a_hub_over_plain_http_is_reached_over_https_once_it_answers_the_same_there() {
     const SECURE: &str = "https://hub.test";
     let net = network();

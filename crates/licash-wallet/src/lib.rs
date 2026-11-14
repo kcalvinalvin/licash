@@ -571,6 +571,9 @@ impl<T: Transport> Wallet<T> {
                 )));
             }
         }
+        // A proof of another identity: not the hub's info, whoever made it.
+        info.proved(self.network)
+            .map_err(|p| Error::Invalid(format!("hub {url}: {}", p.message)))?;
         Ok(info)
     }
 

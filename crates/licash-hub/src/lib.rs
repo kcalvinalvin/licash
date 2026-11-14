@@ -38,7 +38,7 @@ use licash::{
     address::{Address, OwnerKeys},
     authorization::{Grant, PreparedGrant, SignedProposal, Unlock},
     chain::Checkpoint,
-    crypto::{tagged_hash, Point},
+    crypto::{schnorr_sign, tagged_hash, Point, Signature},
     note::{IssuerKeys, Keyset, Note},
     spend::{Output, Proposal, ProposalId},
     unlink::{self, Answer, Answered, Request},
@@ -398,6 +398,8 @@ pub struct Hub {
     synced_at: Mutex<Option<Instant>>,
     /// Whether this process alerted a reorganization of a checkpoint.
     reorg_alerted: AtomicBool,
+    /// The identity it last proved, and the proof: the same while it is.
+    proved: Mutex<Option<([u8; 32], Signature)>>,
 }
 
 impl Hub {
@@ -471,6 +473,7 @@ impl Hub {
             newest: Mutex::new(newest),
             synced_at: Mutex::default(),
             reorg_alerted: AtomicBool::default(),
+            proved: Mutex::default(),
         };
         let boot = hex::encode(boot);
         tracing::info!(keysets = hub.keysets.len(), %boot, "hub started");
@@ -508,7 +511,8 @@ impl Hub {
     }
 
     /// What the hub says of itself at [`licash_api::INFO`]: with the locks
-    /// it admits once it follows a chain.
+    /// it admits once it follows a chain, and then the proof of its
+    /// identity on that chain's network.
     pub fn advertise(&self) -> Result<licash_api::Info, Error> {
         let info = self.info();
         let (policy, timing) = (info.policy, info.policy.timing);
@@ -530,6 +534,21 @@ impl Hub {
         };
         let mut advertised = licash_api::Info::new(&info.keysets, info.address, fees, locks);
         advertised.nostr = Some(self.nostr.1.clone());
+        if let Some(checkpoint) = self.checkpoint() {
+            let identity = advertised
+                .identity(checkpoint.profile())
+                .map_err(|p| Error::Setup(format!("the hub's identity: {p}")))?;
+            let mut proved = self.proved.lock().unwrap_or_else(PoisonError::into_inner);
+            let signature = match &*proved {
+                Some((digest, signature)) if *digest == identity => *signature,
+                _ => {
+                    let signature = schnorr_sign(self.owner.spend_secret(), &identity)?;
+                    *proved = Some((identity, signature));
+                    signature
+                }
+            };
+            advertised.proof = Some(licash_api::Hex(signature.0.to_vec()));
+        }
         Ok(advertised)
     }
 
