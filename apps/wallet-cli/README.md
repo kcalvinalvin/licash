@@ -24,7 +24,10 @@ drops the notes spent since.
 wallet, the hubs it is paid at and its Nostr mailbox, if they name relays.
 `pay <code> [amount]` pays it at a hub it names that the wallet trusts and
 holds enough at, and sends the payment to the mailbox, else prints it to
-hand over; `mailbox` receives what was sent there.
+hand over; `mailbox` receives what was sent there. Where the wallet holds
+too little, it swaps what it lacks there first through a provider
+announced on its hubs' relays, only if given `--max-fee` (all fees,
+swap included): without it, it says what the payment would cost.
 
 A lock pays its payee on a secret's preimage until it expires, then returns
 to the payer: the payee runs `secret` and hands over the hash, the payer

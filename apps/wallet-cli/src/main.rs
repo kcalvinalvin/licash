@@ -95,8 +95,9 @@ enum Command {
         qr: bool,
     },
     /// Pay the payee of a payment code AMOUNT, the hub's fee on top, at a
-    /// hub it names that this wallet trusts and holds enough at: sent to
-    /// the payee's mailbox, else printed to hand over (its id on stderr).
+    /// hub it names that this wallet trusts and holds enough at, else once
+    /// a swap through a provider announced on Nostr brought it there: sent
+    /// to the payee's mailbox, else printed to hand over (its id on stderr).
     Pay {
         code: String,
         /// In satoshis [default: what the code asks for].
@@ -104,6 +105,10 @@ enum Command {
         /// Write the payment here instead of to stdout, if not sent.
         #[arg(long, short)]
         out: Option<PathBuf>,
+        /// All its fees at most, in sat, a swap's included [default: any,
+        /// but a payment needing a swap is refused, saying its fees].
+        #[arg(long)]
+        max_fee: Option<u64>,
     },
     /// Receive the payments sent to the wallet's mailbox, on the relays its
     /// hubs name, and unlink their notes.
@@ -411,9 +416,15 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 text.clone(),
             );
         }
-        Command::Pay { code, amount, out } => {
-            let route = || route(tor.clone(), cli.proxy.as_deref());
-            pay(&wallet, route, &code, amount, out.as_deref(), json).await?;
+        Command::Pay {
+            code,
+            amount,
+            out,
+            max_fee,
+        } => {
+            let route = route(tor.clone(), cli.proxy.as_deref())?;
+            let out = out.as_deref();
+            pay(&wallet, &route, &code, amount, max_fee, out, json).await?;
         }
         Command::Mailbox => {
             let route = route(tor.clone(), cli.proxy.as_deref())?;
@@ -1025,19 +1036,38 @@ async fn resume(wallet: &Wallet<Http>, json: bool) -> anyhow::Result<()> {
 }
 
 /// Pay the payee of payment code `text` `amount`, or what the code asks
-/// for, at a hub it names that the wallet trusts and holds enough at: sent
-/// to its mailbox on the relays that hub names, if it has one, else written
-/// to `out` or stdout to hand over.
+/// for, at a hub it names that the wallet trusts and holds enough at, else
+/// once a swap brought it there, fees of `max_fee` at most: sent to its
+/// mailbox on the relays that hub names, if it has one, else written to
+/// `out` or stdout to hand over. A swap is only made with a `max_fee`.
 async fn pay(
     wallet: &Wallet<Http>,
-    route: impl FnOnce() -> anyhow::Result<Route>,
+    route: &Route,
     text: &str,
     amount: Option<u64>,
+    max_fee: Option<u64>,
     out: Option<&Path>,
     json: bool,
 ) -> anyhow::Result<()> {
     let code: PaymentCode = text.parse()?;
-    let paid = licash_nostr::wallet::pay(wallet, &code, amount, route).await?;
+    let plan = licash_nostr::wallet::plan(wallet, &code, amount, route).await?;
+    let fees = plan.fees();
+    if let Some(swap) = &plan.swap {
+        let (provider, quote) = (&swap.provider, &swap.provider.quote);
+        let swapping = format!(
+            "paying {} at {} swaps {} from {} through {} first",
+            plan.amount, plan.hub, quote.amount, swap.from, provider.url
+        );
+        if max_fee.is_none() {
+            bail!("{swapping}, {fees} sat in fees at most in all: pay again with --max-fee {fees}");
+        }
+        eprintln!("{swapping}");
+    }
+    if let Some(max) = max_fee.filter(|max| fees > *max) {
+        bail!("paying costs {fees} sat in fees at most, more than --max-fee {max}");
+    }
+    let paid = licash_nostr::wallet::pay_planned(wallet, &code, &plan, || Ok(route.clone()));
+    let paid = paid.await?;
     let (id, hub, amount) = (&paid.paid.id, &paid.hub, paid.amount);
     eprintln!("payment {id}");
     if let Some(reason) = &paid.undelivered {
@@ -1147,7 +1177,9 @@ async fn find_provider(
         bail!("no relay to find a provider on: name one with --relay, or a provider");
     }
     let found = swap_providers(wallet, &relays, route, (from, to), amount, limits).await?;
-    let found = found.into_iter().next().with_context(|| {
+    // Of those swapping that much exactly, not their least if more.
+    let found = found.into_iter().find(|p| p.quote.amount == amount);
+    let found = found.with_context(|| {
         format!("no provider announced swaps {amount} from {from} to {to} within the limits")
     })?;
     let (fee, known) = (found.quote.fee, found.known);

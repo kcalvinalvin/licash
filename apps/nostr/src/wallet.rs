@@ -8,7 +8,7 @@ use anyhow::bail;
 use futures_util::future::join_all;
 use licash_api::Payment;
 use licash_wallet::{
-    Error, Paid, PaymentCode, Received, SwapLimits, SwapQuote, SwapState, Transport, Wallet,
+    Error, HubId, Paid, PaymentCode, Received, SwapLimits, SwapQuote, SwapState, Transport, Wallet,
 };
 
 use crate::{mailbox, Role, Route};
@@ -40,29 +40,238 @@ pub async fn pay<T: Transport>(
     amount: Option<u64>,
     route: impl FnOnce() -> anyhow::Result<Route>,
 ) -> anyhow::Result<CodePaid> {
+    let amount = asked(wallet, code, amount)?;
+    let hub = match &code.licash {
+        Some(licash) => wallet.hub_to_pay(licash, amount)?,
+        None => None,
+    };
+    let Some(hub) = hub else {
+        return Err(unpayable(code, amount));
+    };
+    send(wallet, code, hub, amount, route).await
+}
+
+/// How [`pay_planned`] pays a payment code in notes.
+#[derive(Clone, Debug)]
+pub struct Plan {
+    /// The hub to pay at: one the code names.
+    pub hub: String,
+    pub amount: u64,
+    /// The hub's fee on the notes the payment spends: at most this once a
+    /// swap brought more.
+    pub fee: u64,
+    /// The swap bringing what the wallet lacks there first, if it does.
+    pub swap: Option<PlannedSwap>,
+}
+
+/// A swap to make before paying ([`Plan::swap`]).
+#[derive(Clone, Debug)]
+pub struct PlannedSwap {
+    /// The hub swapped from: the wallet's other one holding the most.
+    pub from: String,
+    pub provider: SwapProvider,
+    /// The fee of the hub swapped from on the swap's lock.
+    pub lock_fee: u64,
+}
+
+impl Plan {
+    /// Every fee it pays: the hub's on the payment, and on a swap the
+    /// provider's and the lock's.
+    pub fn fees(&self) -> u64 {
+        let swap = self
+            .swap
+            .as_ref()
+            .map_or(0, |s| s.provider.quote.fee.saturating_add(s.lock_fee));
+        self.fee.saturating_add(swap)
+    }
+}
+
+/// How to pay `amount`, or the amount the code asks, to the wallet of
+/// `code` in notes: at a hub it names that `wallet` trusts and holds
+/// enough at, else at one it names and `wallet` trusts once a swap brings
+/// what the wallet lacks there, from its other hub holding the most,
+/// through a provider announced on the relays its hubs name, reached
+/// through `route` ([`swap_providers`]), within [`SwapLimits::usual`].
+/// Refused as [`pay`] refuses when neither is possible, or while a swap
+/// to that hub is under way.
+pub async fn plan<T: Transport>(
+    wallet: &Wallet<T>,
+    code: &PaymentCode,
+    amount: Option<u64>,
+    route: &Route,
+) -> anyhow::Result<Plan> {
+    let amount = asked(wallet, code, amount)?;
+    let Some(licash) = &code.licash else {
+        return Err(unpayable(code, amount));
+    };
+    if let Some(hub) = wallet.hub_to_pay(licash, amount)? {
+        let fee = wallet.send_fee(&hub, amount)?;
+        return Ok(Plan {
+            hub,
+            amount,
+            fee,
+            swap: None,
+        });
+    }
+    let relays = hub_relays(wallet)?;
+    if relays.is_empty() {
+        tracing::info!("no swap: no hub trusted names relays to find a provider on");
+        return Err(unpayable(code, amount));
+    }
+    // Swaps lock at both hubs: of those following a chain.
+    let hubs: Vec<_> = wallet
+        .hubs()?
+        .into_iter()
+        .filter(|(_, i)| i.locks.is_some())
+        .collect();
+    let held = wallet.balance()?;
+    let available = |hub: &str| {
+        let held = held.iter().find(|b| b.hub == hub);
+        held.map_or(0, |b| b.available)
+    };
+    for id in &licash.hubs {
+        let named = hubs.iter().find(|(_, i)| HubId::of(&i.address) == *id);
+        let Some((to, to_info)) = named else { continue };
+        if swapping_to(wallet, to)? {
+            return Err(under_way(to, None));
+        }
+        let others = hubs.iter().map(|(url, _)| url).filter(|url| *url != to);
+        let Some(from) = others.max_by_key(|url| available(url)) else {
+            continue;
+        };
+        let lacks = wallet.lacks(to, amount)?;
+        let limits = SwapLimits::usual(lacks);
+        let found = swap_providers(wallet, &relays, route, (from, to), lacks, limits).await;
+        let found = match found {
+            Ok(found) => found,
+            Err(e) => {
+                tracing::info!(%from, %to, "no swap: {e:#}");
+                continue;
+            }
+        };
+        for provider in found {
+            let quote = &provider.quote;
+            let lock_fee = match wallet.lock_fee(from, quote.amount.saturating_add(quote.fee)) {
+                Ok(fee) => fee,
+                Err(Error::Insufficient { .. }) => continue,
+                Err(e) => return Err(e.into()),
+            };
+            // At most all it holds there then.
+            let fee = to_info
+                .fees
+                .spend
+                .due(available(to).saturating_add(quote.amount));
+            return Ok(Plan {
+                hub: to.clone(),
+                amount,
+                fee,
+                swap: Some(PlannedSwap {
+                    from: from.clone(),
+                    provider,
+                    lock_fee,
+                }),
+            });
+        }
+        tracing::info!(%from, %to, lacks, "no swap: no provider found that it can pay");
+    }
+    Err(unpayable(code, amount))
+}
+
+/// Pay as `plan` says, to the wallet of `code`: swap first if it says, on
+/// the provider's terms as quoted, then pay as [`pay`] does at the hub it
+/// names. Refused, nothing paid, if the swap fails or is still under way:
+/// paying again once it is done pays from what it brought.
+pub async fn pay_planned<T: Transport>(
+    wallet: &Wallet<T>,
+    code: &PaymentCode,
+    plan: &Plan,
+    route: impl FnOnce() -> anyhow::Result<Route>,
+) -> anyhow::Result<CodePaid> {
+    let amount = asked(wallet, code, Some(plan.amount))?;
+    if let Some(swap) = &plan.swap {
+        let (provider, hub) = (&swap.provider, &plan.hub);
+        let quote = &provider.quote;
+        if swapping_to(wallet, hub)? {
+            return Err(under_way(hub, None));
+        }
+        let limits = SwapLimits {
+            fee: quote.fee,
+            margin: quote.info.margin,
+        };
+        let swapped = wallet.swap(&provider.url, &swap.from, hub, quote.amount, limits);
+        let swapped = swapped.await.map_err(|e| match e {
+            Error::Pending { reason, .. } => under_way(hub, Some(&reason)),
+            e => e.into(),
+        })?;
+        match swapped.state {
+            SwapState::Done => {}
+            SwapState::Failed(why) => bail!(
+                "nothing paid: the swap to {hub} failed ({why}), its lock returns once expired"
+            ),
+            _ => return Err(under_way(hub, None)),
+        }
+    }
+    send(wallet, code, plan.hub.clone(), amount, route).await
+}
+
+/// Whether a swap to the hub at `hub` is under way.
+fn swapping_to<T: Transport>(wallet: &Wallet<T>, hub: &str) -> Result<bool, Error> {
+    let swaps = wallet.swaps()?.into_iter();
+    Ok(swaps
+        .filter(|s| s.state == SwapState::Open)
+        .any(|s| s.to == hub))
+}
+
+/// Nothing paid while a swap to `hub` is under way, for `reason` if known.
+fn under_way(hub: &str, reason: Option<&str>) -> anyhow::Error {
+    let why = reason.map_or(String::new(), |r| format!(" ({r})"));
+    anyhow::anyhow!(
+        "nothing paid: a swap to {hub} is under way{why}: once `resume` finishes it, pay again"
+    )
+}
+
+/// What the payer of `code` pays: `amount`, if the code asks no other.
+fn asked<T: Transport>(
+    wallet: &Wallet<T>,
+    code: &PaymentCode,
+    amount: Option<u64>,
+) -> anyhow::Result<u64> {
     code.check(wallet.network())?;
-    let amount = match (amount, code.amount) {
+    Ok(match (amount, code.amount) {
         (Some(amount), Some(asked)) if amount != asked => {
             bail!("the code asks for {asked}, not {amount}")
         }
         (Some(amount), _) | (None, Some(amount)) => amount,
         (None, None) => bail!("how much to pay: the code does not say"),
+    })
+}
+
+/// Why `code` cannot be paid `amount` in notes: where to pay it on
+/// Bitcoin, if it says.
+fn unpayable(code: &PaymentCode, amount: u64) -> anyhow::Error {
+    let none = format!("no hub it names is one trusted holding {amount} and the fee");
+    let onchain = match (&code.silent, &code.address) {
+        (Some(silent), _) => Some(silent.to_string()),
+        (None, Some(address)) => Some(address.assume_checked_ref().to_string()),
+        (None, None) => None,
     };
-    let hub = match &code.licash {
-        Some(licash) => wallet.hub_to_pay(licash, amount)?,
-        None => None,
-    };
-    let (Some(licash), Some(hub)) = (&code.licash, hub) else {
-        let none = format!("no hub it names is one trusted holding {amount} and the fee");
-        let onchain = match (&code.silent, &code.address) {
-            (Some(silent), _) => Some(silent.to_string()),
-            (None, Some(address)) => Some(address.assume_checked_ref().to_string()),
-            (None, None) => None,
-        };
-        match onchain {
-            Some(to) => bail!("{none}: pay {to} on Bitcoin"),
-            None => bail!("{none}"),
-        }
+    match onchain {
+        Some(to) => anyhow::anyhow!("{none}: pay {to} on Bitcoin"),
+        None => anyhow::anyhow!("{none}"),
+    }
+}
+
+/// Pay `amount` to the wallet of `code` at `hub`, then send the payment to
+/// the payee's mailbox on that hub's relays, reached through `route`.
+async fn send<T: Transport>(
+    wallet: &Wallet<T>,
+    code: &PaymentCode,
+    hub: String,
+    amount: u64,
+    route: impl FnOnce() -> anyhow::Result<Route>,
+) -> anyhow::Result<CodePaid> {
+    let Some(licash) = &code.licash else {
+        return Err(unpayable(code, amount));
     };
     let paid = wallet.send(&hub, &licash.address, amount).await?;
     let relays = wallet
@@ -150,8 +359,9 @@ pub struct SwapProvider {
 }
 
 /// The swap providers announced on `relays` for `wallet`'s network, asked
-/// through `route`, that swap `amount` from hub `from` to hub `to`, both
-/// added, within `limits` ([`Wallet::swap_quote`]): each at the first URL
+/// through `route`, that swap at least `amount` from hub `from` to hub
+/// `to`, both added, within `limits` ([`Wallet::swap_quote`]): `amount`,
+/// or the least one swaps if more. Each is at the first URL
 /// it was announced at that answers as the key that announced it. Those
 /// the wallet swapped through before first, then the cheapest, then the
 /// soonest to free its notes should they never lock.

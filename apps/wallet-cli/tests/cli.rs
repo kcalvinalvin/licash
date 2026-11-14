@@ -606,9 +606,30 @@ fn swap_providers_announced_on_nostr_are_discovered_where_they_answer() {
     );
 }
 
+/// Announce the swap provider at `url` on `relays` as the key of `secret`.
+fn announce_provider(
+    runtime: &tokio::runtime::Runtime,
+    relays: &[String],
+    secret: [u8; 32],
+    url: String,
+) {
+    use licash_nostr::{Announcement, Announcer, Role, Route};
+    let announcement = Announcement {
+        urls: vec![url],
+        network: "regtest".into(),
+        name: None,
+    };
+    runtime.block_on(async {
+        let announcer = Announcer::new(&secret, Role::Swaps, relays, &Route::Direct)
+            .await
+            .unwrap();
+        announcer.announce(&announcement).await.unwrap();
+    });
+}
+
 #[test]
 fn a_swap_goes_through_a_provider_announced_one_used_before_first_then_the_cheapest() {
-    use licash_nostr::{wallet::swap_providers, Announcement, Announcer, Role, Route};
+    use licash_nostr::{wallet::swap_providers, Route};
     use licash_wallet::SwapLimits;
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let (_relay, relay) = support::relay(&runtime);
@@ -626,19 +647,7 @@ fn a_swap_goes_through_a_provider_announced_one_used_before_first_then_the_cheap
     let usual = Swaps::start(&[&a, &b], 200);
     let greedy = Swaps::with(&[&a, &b], 200, 0x52, terms(500, 6));
     let slow = Swaps::with(&[&a, &b], 200, 0x53, terms(1, 30));
-    let announce = |secret: [u8; 32], url: String| {
-        let announcement = Announcement {
-            urls: vec![url],
-            network: "regtest".into(),
-            name: None,
-        };
-        runtime.block_on(async {
-            let announcer = Announcer::new(&secret, Role::Swaps, &relays, &Route::Direct)
-                .await
-                .unwrap();
-            announcer.announce(&announcement).await.unwrap();
-        });
-    };
+    let announce = |secret, url| announce_provider(&runtime, &relays, secret, url);
     for swaps in [&cheap, &usual, &greedy, &slow] {
         announce(swaps.provider.nostr_secret().unwrap(), swaps.url());
     }
@@ -703,6 +712,85 @@ fn a_swap_goes_through_a_provider_announced_one_used_before_first_then_the_cheap
         "{text}"
     );
     drop((greedy, slow));
+}
+
+#[test]
+fn a_payment_at_a_hub_holding_too_little_swaps_there_first_within_its_fees() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let (_relay, relay) = support::relay(&runtime);
+    let relays = vec![relay];
+    let a = Server::with_relays(FEE, relays.clone());
+    let b = Server::with_relays(FEE, relays.clone());
+    let swaps = Swaps::start(&[&a, &b], 200);
+    let secret = swaps.provider.nostr_secret().unwrap();
+    announce_provider(&runtime, &relays, secret, swaps.url());
+    let dir = tempfile::tempdir().unwrap();
+    // Alice holds 100 at A and trusts B; Bob's code names B alone.
+    let (alice, alice_at) = party(dir.path(), "alice", Some(&a));
+    ok(wallet(&alice, &["add-hub", &b.url()], None));
+    let funds = serde_json::to_string(&a.pay(&address(&alice_at), 100)).unwrap();
+    ok(wallet(&alice, &["receive"], Some(&funds)));
+    let (bob, _) = party(dir.path(), "bob", Some(&b));
+    let code = json(&bob, &["code"])["code"].as_str().unwrap().to_owned();
+    let pay = |amount: &str, more: &[&str]| {
+        let mut args = vec!["pay", &code, amount];
+        args.extend(more);
+        wallet(&alice, &args, None)
+    };
+    let swapped = |file: &Path| json(file, &["swaps"]).as_array().unwrap().len();
+
+    // 30 at B swaps 31 there first, B's fee of 1 on top: the provider's
+    // fee of 2, A's of 1 on the lock and B's, 4 in all. Refused unless
+    // allowed, nothing locked.
+    let (from, to, provider) = (a.url(), b.url(), swaps.url());
+    let swapping = format!("paying 30 at {to} swaps 31 from {from} through {provider} first");
+    failed(
+        pay("30", &[]),
+        1,
+        &format!("{swapping}, 4 sat in fees at most in all: pay again with --max-fee 4"),
+    );
+    failed(
+        pay("30", &["--max-fee", "3"]),
+        1,
+        "costs 4 sat in fees at most, more than --max-fee 3",
+    );
+    assert_eq!((swapped(&alice), available(&alice)), (0, (100, 0)));
+    let output = pay("30", &["--max-fee", "4", "--json"]);
+    assert!(String::from_utf8_lossy(&output.stderr).contains(&swapping));
+    let paid: Value = serde_json::from_str(&ok(output)).unwrap();
+    assert_eq!(
+        (paid["amount"].as_u64(), paid["hub"].as_str()),
+        (Some(30), Some(to.as_str()))
+    );
+    let listed = json(&alice, &["swaps"]);
+    assert_eq!(
+        (&listed[0]["state"], &listed[0]["amount"], &listed[0]["fee"]),
+        (&"done".into(), &31.into(), &2.into())
+    );
+    ok(wallet(&alice, &["resume"], None));
+    assert_eq!(available(&alice), (100 - 4 - 30, 0));
+    assert_eq!(json(&bob, &["mailbox"])["received"][0]["amount"], 30);
+
+    // The provider does not answer once Alice locked: nothing paid, and
+    // nothing more while the swap is under way.
+    let refuse = |on| swaps.refuse.store(on, std::sync::atomic::Ordering::Relaxed);
+    refuse(true);
+    let under_way = format!("nothing paid: a swap to {to} is under way");
+    failed(pay("20", &["--max-fee", "10"]), 1, &under_way);
+    assert_eq!(json(&alice, &["swaps"])[0]["state"], "open");
+    failed(pay("20", &[]), 1, &under_way);
+    failed(pay("20", &["--max-fee", "10"]), 1, &under_way);
+    assert_eq!(swapped(&alice), 2);
+    // Once it is done, at B with what it brought, swapping nothing.
+    refuse(false);
+    assert_eq!(json(&alice, &["resume"])["swaps"][0]["state"], "done");
+    ok(pay("20", &[]));
+    assert_eq!(swapped(&alice), 2);
+    assert_eq!(json(&bob, &["mailbox"])["received"][0]["amount"], 20);
+
+    // Beyond what any provider swaps: refused as before.
+    failed(pay("500", &["--max-fee", "100"]), 1, "no hub it names");
+    assert_eq!(swapped(&alice), 2);
 }
 
 #[test]
