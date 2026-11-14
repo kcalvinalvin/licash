@@ -98,7 +98,7 @@ struct Chain {
     /// The network the chain must be: bitcoin, regtest, signet or mutinynet.
     #[arg(long, env = "LICASH_HUB_NETWORK", default_value_t = ChainProfile::Core30Mainnet)]
     network: ChainProfile,
-    /// Seconds between rounds of the scan, below `--max-lag`.
+    /// Seconds between rounds of the scan and of deposits, below `--max-lag`.
     #[arg(long, env = "LICASH_HUB_CHAIN_POLL", default_value_t = 10,
           value_parser = clap::value_parser!(u64).range(1..))]
     chain_poll: u64,
@@ -602,9 +602,14 @@ fn command(cli: Cli) -> anyhow::Result<()> {
                 "a Lightning gateway (--lnd) needs --chain"
             );
             let depositing = match &chain {
-                Some((source, profile, _)) => deposits
-                    .config(*profile)?
-                    .map(|config| (source.clone(), *profile, config)),
+                // Polling the chain as often as the hub follows it.
+                Some((source, profile, every)) => deposits.config(*profile)?.map(|config| {
+                    let config = deposit::Config {
+                        poll: *every,
+                        ..config
+                    };
+                    (source.clone(), *profile, config)
+                }),
                 None => {
                     anyhow::ensure!(
                         deposits.deposit_sweep_address.is_none(),
