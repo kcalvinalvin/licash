@@ -613,3 +613,174 @@ async fn deposits_are_kept_in_a_file_of_their_own_and_timed_within_the_hubs_lock
     };
     assert_eq!(open(fits, &fresh), None);
 }
+
+/// The mock's chain as a wallet's light client sees it, filters aside.
+struct Light(esplora::Shared);
+
+impl licash_wallet::Blocks for Light {
+    fn height(&self) -> impl std::future::Future<Output = Result<u32, String>> + Send {
+        std::future::ready(Ok(self.0.lock().unwrap().chain.height()))
+    }
+
+    fn hash(
+        &self,
+        height: u32,
+    ) -> impl std::future::Future<Output = Result<bitcoin::BlockHash, String>> + Send {
+        let blocks = &self.0.lock().unwrap().chain.blocks;
+        let hash = blocks.get(height as usize).map(|b| b.block_hash());
+        std::future::ready(hash.ok_or_else(|| format!("no block {height}")))
+    }
+
+    fn filter(
+        &self,
+        _: &bitcoin::BlockHash,
+    ) -> impl std::future::Future<Output = Result<Option<Vec<u8>>, String>> + Send {
+        std::future::ready(Ok(None))
+    }
+
+    fn block(
+        &self,
+        hash: &bitcoin::BlockHash,
+    ) -> impl std::future::Future<Output = Result<bitcoin::Block, String>> + Send {
+        let blocks = &self.0.lock().unwrap().chain.blocks;
+        let block = blocks.iter().find(|b| b.block_hash() == *hash).cloned();
+        std::future::ready(block.ok_or_else(|| format!("no block {hash}")))
+    }
+}
+
+/// A silent payment of `value` to `to`, from a P2WPKH coin of the `n`th
+/// payer that the mock knows the script of.
+fn pay_silent(net: &Net, to: &licash_onchain::silent::SpAddress, value: u64, n: u8) -> Transaction {
+    let secp = Secp256k1::new();
+    let sender = SecretKey::from_slice(&[n; 32]).unwrap();
+    let key = bitcoin::CompressedPublicKey(sender.public_key(&secp));
+    let previous_output = OutPoint {
+        txid: Txid::from_byte_array([n; 32]),
+        vout: 0,
+    };
+    let spent = ScriptBuf::new_p2wpkh(&key.wpubkey_hash());
+    let backend = &mut net.backend.lock().unwrap();
+    backend.outside.insert(previous_output, spent);
+    let paid = licash_onchain::silent::outputs(&[(sender, false)], &[previous_output], &[*to]);
+    let output = TweakedPublicKey::dangerous_assume_tweaked(paid.unwrap()[0]);
+    let mut witness = Witness::new();
+    witness.push([0x30; 71]);
+    witness.push(key.to_bytes());
+    Transaction {
+        version: transaction::Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output,
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness,
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(value),
+            script_pubkey: ScriptBuf::new_p2tr_tweaked(output),
+        }],
+    }
+}
+
+/// What `tx` spends of the coins `paid`, less what it pays: its fee.
+fn fee_of(tx: &Transaction, paid: u64) -> u64 {
+    paid - tx.output.iter().map(|o| o.value.to_sat()).sum::<u64>()
+}
+
+#[tokio::test]
+async fn silent_payment_coins_are_deposited_whole_up_to_the_most_a_hub_takes() {
+    use licash_hub_service::tweaks::{step, Tweaks};
+    let net = Net::new().await;
+    let index = Arc::new(Tweaks::open(&net.dir.path().join("tweaks.sqlite")).unwrap());
+    step(&index, &net.source, None).await.unwrap();
+    let services = Services {
+        deposits: Some(net.deposits.clone()),
+        tweaks: Some(index.clone()),
+        ..Default::default()
+    };
+    let app = licash_hub_service::router(net.hub.clone(), services);
+    let path = net.dir.path().join("alice.sqlite");
+    let network = ChainProfile::Core30DefaultRegtest;
+    let alice = Wallet::create(&path, &[1; 32], network, Local(app)).unwrap();
+    alice.add_hub(HUB).await.unwrap();
+    alice
+        .watch_silent(HUB, index.first().unwrap().unwrap())
+        .unwrap();
+    let to = alice.silent_keys().address();
+    let rate = FeeRate::from_sat_per_vb_u32(1);
+    let light = Light(net.backend.clone());
+    let paid = |value: u64, n: u8| {
+        let payment = pay_silent(&net, &to, value, n);
+        net.mine(1, vec![payment]);
+    };
+    let scan = || async {
+        step(&index, &net.source, None).await.unwrap();
+        alice.scan_silent(HUB, &light, u32::MAX).await.unwrap()
+    };
+    let insufficient = |e: licash_wallet::Error| match e {
+        licash_wallet::Error::Insufficient { needed, available } => (needed, available),
+        e => panic!("{e:?}"),
+    };
+
+    // Nothing to deposit, or too little for the least the hub takes: no
+    // deposit asked.
+    let none = alice.deposit_silent(HUB, rate).await.unwrap_err();
+    let (needed, held) = insufficient(none);
+    assert_eq!(held, 0);
+    assert!(needed > 1_100, "{needed}");
+    paid(1_000, 2);
+    assert_eq!(scan().await.found.len(), 1);
+    let (needed, held) = insufficient(alice.deposit_silent(HUB, rate).await.unwrap_err());
+    assert_eq!(held, 1_000);
+    assert!(needed > 1_100, "{needed}");
+    assert!(alice.deposits().unwrap().is_empty());
+
+    // Enough with another coin: both deposited, all of them but the fee.
+    paid(2_600, 3);
+    assert_eq!(scan().await.found.len(), 1);
+    let (deposit, tx) = alice.deposit_silent(HUB, rate).await.unwrap();
+    let terms = deposit.terms.clone().unwrap();
+    assert_eq!(deposit.state, DepositState::Open);
+    assert_eq!(terms.pays, deposit.amount + 100);
+    assert_eq!((tx.input.len(), tx.output.len()), (2, 1));
+    let address: Address<_> = terms.address.parse().unwrap();
+    assert_eq!(
+        tx.output[0].script_pubkey,
+        address.assume_checked().script_pubkey()
+    );
+    assert_eq!(tx.output[0].value.to_sat(), terms.pays);
+    assert_eq!(fee_of(&tx, 3_600), tx.vsize() as u64);
+    // Its coins taken: nothing more to deposit.
+    let (_, held) = insufficient(alice.deposit_silent(HUB, rate).await.unwrap_err());
+    assert_eq!(held, 0);
+    assert_eq!(alice.deposits().unwrap().len(), 1);
+
+    // Broadcast, confirmed at depth: the notes.
+    net.backend.lock().unwrap().mempool.push(tx.clone());
+    net.confirm_sent();
+    net.deposits.round().await;
+    net.mine(1, Vec::new());
+    net.deposits.round().await;
+    let received = alice.follow_deposit(&deposit.hash).await.unwrap();
+    assert_eq!(received.state, DepositState::Received);
+    assert_eq!(available(&alice), deposit.amount);
+    let scanned = scan().await;
+    assert_eq!(scanned.spent.len(), 2);
+    assert!(alice.silent_coins().unwrap().is_empty());
+
+    // More than the hub takes: its most, the rest back as change.
+    paid(10_000, 4);
+    scan().await;
+    let (most, tx) = alice.deposit_silent(HUB, rate).await.unwrap();
+    assert_eq!((most.amount, most.terms.unwrap().pays), (4_000, 4_100));
+    assert_eq!(tx.output.len(), 2);
+    let change: u64 = tx.output.iter().map(|o| o.value.to_sat()).sum::<u64>() - 4_100;
+    net.backend.lock().unwrap().mempool.push(tx.clone());
+    net.confirm_sent();
+    scan().await;
+    let coins = alice.silent_coins().unwrap();
+    assert_eq!(coins.len(), 1);
+    assert!(coins[0].change && coins[0].spending.is_none());
+    assert_eq!(coins[0].value, change);
+    assert_eq!(fee_of(&tx, 10_000), 10_000 - 4_100 - change);
+}

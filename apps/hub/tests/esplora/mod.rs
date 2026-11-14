@@ -1,10 +1,13 @@
 //! A mock Esplora over a self-mined chain, with a mempool: it serves the
-//! blocks, takes transactions, estimates fees and finds what pays an
-//! address.
+//! blocks and what their inputs spend, takes transactions, estimates fees
+//! and finds what pays an address.
 
 #![allow(dead_code)]
 
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
 use axum::{
     extract::{Path, State},
@@ -13,7 +16,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use bitcoin::{consensus::serialize, Address, OutPoint, Transaction};
+use bitcoin::{consensus::serialize, Address, OutPoint, ScriptBuf, Transaction};
 use serde_json::json;
 
 use super::chain::Chain;
@@ -22,6 +25,8 @@ use super::chain::Chain;
 pub struct Backend {
     pub chain: Chain,
     pub mempool: Vec<Transaction>,
+    /// The scripts of outputs the chain's blocks spend but never made.
+    pub outside: HashMap<OutPoint, ScriptBuf>,
 }
 
 pub type Shared = Arc<Mutex<Backend>>;
@@ -30,6 +35,7 @@ pub fn backend(chain: Chain) -> Shared {
     Arc::new(Mutex::new(Backend {
         chain,
         mempool: Vec::new(),
+        outside: HashMap::new(),
     }))
 }
 
@@ -56,6 +62,42 @@ async fn block(
         (Some(block), "raw") => serialize(block).into_response(),
         _ => (StatusCode::NOT_FOUND, "Block not found").into_response(),
     }
+}
+
+/// The transactions of the block of `hash` from the `start`th, 25 at
+/// most, with the script each input spends, if known.
+async fn txs(
+    State(backend): State<Shared>,
+    Path((hash, start)): Path<(String, usize)>,
+) -> Response {
+    let backend = backend.lock().unwrap();
+    let blocks = &backend.chain.blocks;
+    let Some(block) = blocks.iter().find(|b| b.block_hash().to_string() == hash) else {
+        return (StatusCode::NOT_FOUND, "Block not found").into_response();
+    };
+    let spent = |outpoint: &OutPoint| {
+        let mut made = blocks.iter().flat_map(|b| &b.txdata);
+        let made = made.find(|tx| tx.compute_txid() == outpoint.txid);
+        let made = made.and_then(|tx| tx.output.get(outpoint.vout as usize));
+        let made = made.map(|output| &output.script_pubkey);
+        backend.outside.get(outpoint).or(made).cloned()
+    };
+    let page: Vec<serde_json::Value> = block.txdata[start.min(block.txdata.len())..]
+        .iter()
+        .take(25)
+        .map(|tx| {
+            let vin: Vec<serde_json::Value> = tx
+                .input
+                .iter()
+                .map(|input| {
+                    let script = spent(&input.previous_output);
+                    json!({"prevout": script.map(|s| json!({"scriptpubkey": s.to_hex_string()}))})
+                })
+                .collect();
+            json!({"txid": tx.compute_txid().to_string(), "vin": vin})
+        })
+        .collect();
+    Json(page).into_response()
 }
 
 async fn send(State(backend): State<Shared>, raw: String) -> Response {
@@ -114,6 +156,7 @@ pub fn serve(backend: Shared) -> String {
         .route("/api/blocks/tip/height", get(tip))
         .route("/api/block-height/{height}", get(hash))
         .route("/api/block/{hash}/{part}", get(block))
+        .route("/api/block/{hash}/txs/{start}", get(txs))
         .route("/api/tx", post(send))
         .route("/api/fee-estimates", get(fees))
         .route("/api/address/{address}/utxo", get(utxo))

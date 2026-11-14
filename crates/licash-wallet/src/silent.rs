@@ -13,6 +13,7 @@
 //!
 //! [`Wallet::spend_silent`] spends the coins found, change to the wallet's
 //! change address: a transaction for the application to broadcast.
+//! [`Wallet::deposit_silent`] spends them on a deposit for a hub's notes.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -34,7 +35,9 @@ use licash_onchain::silent::{self, Found, Scanner, CHANGE};
 use rand_core::{OsRng, RngCore};
 use rusqlite::{params, OptionalExtension, Transaction as Sql};
 
-use crate::{hub_url, invalid, store::now, unavailable, Error, Transport, Wallet};
+use crate::{
+    hub_url, invalid, store::now, unavailable, Deposit, DepositState, Error, Transport, Wallet,
+};
 
 /// The blocks looked in that are kept, to notice reorganizations that deep.
 const KEEP_BLOCKS: u32 = 288;
@@ -688,6 +691,74 @@ impl<T: Transport> Wallet<T> {
         tracing::info!(txid = %tx.compute_txid(), inputs = tx.input.len(), "silent payment coins spent");
         Ok(tx)
     }
+
+    /// Deposit at the hub at `url` the coins at the silent payment address
+    /// that no transaction spends: notes of as much as they pay, the fee
+    /// at `rate` and the hub's on top, up to the most the hub takes. The
+    /// deposit, and the transaction paying it, signed and recorded as
+    /// spending its coins, for the application to broadcast. Should it
+    /// never confirm, [`Wallet::abandon_silent`] frees the coins, and the
+    /// deposit lapses unpaid.
+    pub async fn deposit_silent(
+        &self,
+        url: &str,
+        rate: FeeRate,
+    ) -> Result<(Deposit, Transaction), Error> {
+        let url = hub_url(url)?;
+        let (_, info) = self.refresh(&url).await?;
+        let offer = info
+            .deposits
+            .ok_or_else(|| Error::Invalid(format!("hub {url} takes no deposits")))?;
+        // What the coins pay a taproot output, as a deposit's is.
+        let taproot = ScriptBuf::from_bytes([&[0x51, 0x20][..], &[0; 32]].concat());
+        let held = self.store.read(free_coins)?;
+        let total = held.iter().map(|h| h.value).sum::<u64>();
+        let available = plan(&held, &taproot, None, rate).map_or(0, |p| p.pay);
+        let fits = |amount: u64| offer.pays(amount).is_some_and(|pays| pays <= available);
+        let (mut amount, mut over) = (0, offer.max.saturating_add(1));
+        while over - amount > 1 {
+            let mid = amount + (over - amount) / 2;
+            match fits(mid) {
+                true => amount = mid,
+                false => over = mid,
+            }
+        }
+        if amount < offer.min {
+            let output = TxOut {
+                value: Amount::ZERO,
+                script_pubkey: taproot,
+            };
+            let fee = fee(held.len().max(1), &[output], rate);
+            return Err(Error::Insufficient {
+                needed: offer
+                    .pays(offer.min)
+                    .map_or(u64::MAX, |p| p.saturating_add(fee)),
+                available: total,
+            });
+        }
+        let deposit = self.deposit(&url, amount).await?;
+        let terms = match (&deposit.state, &deposit.terms) {
+            (DepositState::Open, Some(terms)) => terms,
+            (state, _) => {
+                return Err(Error::Invalid(format!(
+                    "deposit {} is not open to pay: {state:?}",
+                    deposit.hash
+                )))
+            }
+        };
+        let to = terms
+            .address
+            .parse::<bitcoin::Address<_>>()
+            .ok()
+            .and_then(|a| {
+                a.require_network(licash_onchain::network(self.network()))
+                    .ok()
+            })
+            .ok_or_else(|| Error::Invalid(format!("deposit address {}", terms.address)))?;
+        let tx = self.spend_silent(to.script_pubkey(), Some(terms.pays), rate)?;
+        tracing::info!(hash = %deposit.hash, amount, txid = %tx.compute_txid(), "silent payment coins deposited");
+        Ok((deposit, tx))
+    }
 }
 
 /// What a spend takes and pays: to its payee, and the change.
@@ -698,7 +769,7 @@ struct Plan {
 }
 
 /// The coins no transaction spends, largest first.
-fn free_coins(t: &Sql<'_>) -> Result<Vec<Held>, Error> {
+fn free_coins(t: &rusqlite::Connection) -> Result<Vec<Held>, Error> {
     let mut stmt = t.prepare(
         "SELECT txid, vout, value, output, tweak, label FROM silent_coins
          WHERE spent_by IS NULL AND spent_at IS NULL ORDER BY value DESC, txid, vout",
