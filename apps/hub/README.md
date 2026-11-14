@@ -32,6 +32,14 @@ With `--tweaks` (and `--chain`), the hub indexes the silent payment
 tip at the first start) in `<data>/tweaks.sqlite`, and serves them to light
 wallets at `/v1/chain/tweaks`. Deleting the file only loses the index.
 
+With `--deposit-sweep-address ADDRESS` (and `--chain`), the hub takes
+deposits on Bitcoin: a payment to a deposit's address, once confirmed,
+locks the hub's own notes to its payer, and the preimage the payer claims
+them with lets the hub claim the coins to the sweep address. Unclaimed
+deposits return to their payer after a timeout. `--deposit-*` flags set
+the fee, amounts and timing. Deposits are kept in `<data>/deposits.sqlite`:
+back it up with `hub.sqlite`. Alerts say when a claim is late or lost.
+
 With `--nostr-relay URL --announce-url URL` (and `--chain`), the hub
 announces itself on Nostr relays for wallets to discover, under a key
 derived from its seed that `/v1/info` names.

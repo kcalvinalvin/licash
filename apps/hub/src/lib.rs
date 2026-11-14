@@ -2,6 +2,7 @@
 //! and the [`Services`] it runs beside it.
 
 pub mod announce;
+pub mod deposit;
 pub mod lightning;
 pub mod notify;
 pub mod tweaks;
@@ -20,9 +21,9 @@ use axum::{
     Json, Router,
 };
 use licash_api::{
-    Check, Checked, Code, Info, Issued, Lock, LockState, Locked, Offer, Offered, Pay, Paying,
-    Problem, Receive, ReceiveStatus, Receiving, Refund, Release, Released, Settle, TweaksQuery,
-    Unlink, Unlinked,
+    Check, Checked, Code, Deposit, DepositStatus, Depositing, Info, Issued, Lock, LockState,
+    Locked, Offer, Offered, Pay, Paying, Problem, Receive, ReceiveStatus, Receiving, Refund,
+    Release, Released, Settle, TweaksQuery, Unlink, Unlinked,
 };
 use licash_hub::{Error, Hub, Settled};
 use lightning::Gateway;
@@ -44,12 +45,17 @@ pub const IMMUTABLE_DEPTH: u32 = 144;
 #[derive(Clone, Default)]
 pub struct Services {
     pub gateway: Option<Arc<Gateway>>,
+    pub deposits: Option<Arc<deposit::Gateway>>,
     pub tweaks: Option<Arc<Tweaks>>,
 }
 
 /// The API of `hub`, with the paths of its `services`.
 pub fn router(hub: Arc<Hub>, services: Services) -> Router {
-    let Services { gateway, tweaks } = services.clone();
+    let Services {
+        gateway,
+        deposits,
+        tweaks,
+    } = services.clone();
     let info_of = Router::new()
         .route(licash_api::INFO, get(info))
         .with_state((hub.clone(), services));
@@ -72,6 +78,14 @@ pub fn router(hub: Arc<Hub>, services: Services) -> Router {
                 .route(licash_api::LN_RECEIVE, post(ln_receive))
                 .route(licash_api::LN_RECEIVE_STATE, get(ln_receive_state))
                 .with_state(gateway),
+        );
+    }
+    if let Some(deposits) = deposits {
+        api = api.merge(
+            Router::new()
+                .route(licash_api::DEPOSIT, post(deposit))
+                .route(licash_api::DEPOSIT_STATE, get(deposit_state))
+                .with_state(deposits),
         );
     }
     if let Some(index) = tweaks {
@@ -164,6 +178,7 @@ async fn info(State((hub, services)): State<(Arc<Hub>, Services)>) -> Answer<Inf
     })
     .await?;
     info.lightning = services.gateway.and_then(|gateway| gateway.advertise());
+    info.deposits = services.deposits.map(|deposits| deposits.advertise());
     Ok(Json(info))
 }
 
@@ -281,6 +296,22 @@ async fn ln_receive(
 ) -> Answer<Receiving> {
     let Json(body) = body?;
     Ok(Json(gateway.receive(&body).await?))
+}
+
+async fn deposit(
+    State(deposits): State<Arc<deposit::Gateway>>,
+    body: Result<Json<Deposit>, JsonRejection>,
+) -> Answer<Depositing> {
+    let Json(body) = body?;
+    Ok(Json(deposits.deposit(&body).await?))
+}
+
+async fn deposit_state(
+    State(deposits): State<Arc<deposit::Gateway>>,
+    Path(hash): Path<String>,
+) -> Answer<DepositStatus> {
+    let hash = licash_api::hash_of(&hash)?;
+    Ok(Json(deposits.deposit_status(&hash)?))
 }
 
 /// The tweaks of the blocks asked for, answered as never changing once

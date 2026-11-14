@@ -223,6 +223,29 @@ fn failures_exit_nonzero_and_log_as_asked() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("--tweaks) needs --chain"));
     let out = output(&missing, &["run", "--tweaks-from", "1"]);
     assert_eq!(out.status.code(), Some(2));
+    // Deposits are of the chain it follows, claimed to an address on it.
+    let sweep = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
+    let out = output(&missing, &["run", "--deposit-sweep-address", sweep]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--deposit-sweep-address) needs --chain"),
+        "{stderr}"
+    );
+    let chain = ["run", "--chain", "http://node:8332", "--network", "regtest"];
+    let mainnet = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
+    let out = output(
+        &missing,
+        &[&chain[..], &["--deposit-sweep-address", mainnet]].concat(),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("not an address on"), "{stderr}");
+    let out = output(
+        &missing,
+        &[&chain[..], &["--deposit-sweep-address", "bcrt1nope"]].concat(),
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--deposit-sweep-address"));
+    let out = output(&missing, &["run", "--deposit-min-fee-rate", "0"]);
+    assert_eq!(out.status.code(), Some(2));
     // An announcement needs relays, URLs wallets can use, and the chain
     // that names its network.
     let relay = ["--nostr-relay", "ws://127.0.0.1:1"];

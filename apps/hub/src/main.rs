@@ -16,6 +16,7 @@ use licash_chain_client::Source;
 use licash_hub::{Fee, Hub, Ledger, Policy, Timing};
 use licash_hub_service::{
     announce::announce,
+    deposit,
     lightning::{lnd::Lnd, Config, Gateway},
     notify::{self, Notifier},
     tweaks::{self, Tweaks},
@@ -377,6 +378,87 @@ impl LightningArgs {
     }
 }
 
+/// The hub's deposits on Bitcoin.
+#[derive(Args)]
+struct DepositArgs {
+    /// Take deposits on Bitcoin, claiming their coins to this address:
+    /// a payment confirmed locks the hub's own notes to its payer.
+    #[arg(long, value_name = "ADDRESS", env = "LICASH_HUB_DEPOSIT_SWEEP_ADDRESS")]
+    deposit_sweep_address: Option<String>,
+    /// The fee on each deposit, in satoshis, paid on top of its notes.
+    #[arg(long, env = "LICASH_HUB_DEPOSIT_FEE_BASE", default_value_t = deposits().fee.base)]
+    deposit_fee_base: u64,
+    /// The fee on each deposit, in parts per million of its notes.
+    #[arg(long, env = "LICASH_HUB_DEPOSIT_FEE_PPM", default_value_t = deposits().fee.ppm,
+          value_parser = ppm())]
+    deposit_fee_ppm: u64,
+    /// The least notes a deposit locks, in satoshis.
+    #[arg(long, env = "LICASH_HUB_DEPOSIT_MIN", default_value_t = deposits().min)]
+    deposit_min: u64,
+    /// The most notes a deposit locks, in satoshis.
+    #[arg(long, env = "LICASH_HUB_DEPOSIT_MAX", default_value_t = deposits().max)]
+    deposit_max: u64,
+    /// Confirmations a deposit's payment needs.
+    #[arg(long, env = "LICASH_HUB_DEPOSIT_DEPTH", default_value_t = deposits().depth)]
+    deposit_depth: u32,
+    /// Blocks from a request within which its payment must confirm.
+    #[arg(long, env = "LICASH_HUB_DEPOSIT_WINDOW", default_value_t = deposits().window)]
+    deposit_window: u32,
+    /// Blocks a deposit's notes stay locked to its payer.
+    #[arg(long, env = "LICASH_HUB_DEPOSIT_LOCK_BLOCKS", default_value_t = deposits().lock_blocks)]
+    deposit_lock_blocks: u32,
+    /// Blocks the hub may be down while a deposit is locked.
+    #[arg(long, env = "LICASH_HUB_DEPOSIT_DOWNTIME", default_value_t = deposits().downtime)]
+    deposit_downtime: u32,
+    /// Blocks the hub's claim of a deposit has to confirm in before its
+    /// payer may take the coins back.
+    #[arg(long, env = "LICASH_HUB_DEPOSIT_SWEEP_BLOCKS", default_value_t = deposits().sweep_blocks)]
+    deposit_sweep_blocks: u32,
+    /// The least fee rate of claims, in sat/vB, also used while the chain
+    /// estimates none.
+    #[arg(long, env = "LICASH_HUB_DEPOSIT_MIN_FEE_RATE",
+          default_value_t = deposits().min_fee_rate.to_sat_per_vb_ceil(),
+          value_parser = clap::value_parser!(u64).range(1..=10_000))]
+    deposit_min_fee_rate: u64,
+}
+
+/// The defaults of deposits.
+fn deposits() -> deposit::Config {
+    deposit::Config::new(bitcoin::ScriptBuf::new())
+}
+
+impl DepositArgs {
+    /// The gateway's configuration, if the hub takes deposits on `profile`.
+    fn config(&self, profile: ChainProfile) -> anyhow::Result<Option<deposit::Config>> {
+        let Some(address) = &self.deposit_sweep_address else {
+            return Ok(None);
+        };
+        let network = licash_chain_client::network(profile);
+        let address = address
+            .parse::<bitcoin::Address<bitcoin::address::NetworkUnchecked>>()
+            .context("--deposit-sweep-address")?
+            .require_network(network)
+            .with_context(|| format!("--deposit-sweep-address: not an address on {profile}"))?;
+        let min_fee_rate = bitcoin::FeeRate::from_sat_per_vb(self.deposit_min_fee_rate)
+            .context("--deposit-min-fee-rate: too high")?;
+        Ok(Some(deposit::Config {
+            fee: Fee {
+                base: self.deposit_fee_base,
+                ppm: self.deposit_fee_ppm,
+            },
+            min: self.deposit_min,
+            max: self.deposit_max,
+            depth: self.deposit_depth,
+            window: self.deposit_window,
+            lock_blocks: self.deposit_lock_blocks,
+            downtime: self.deposit_downtime,
+            sweep_blocks: self.deposit_sweep_blocks,
+            min_fee_rate,
+            ..deposit::Config::new(address.script_pubkey())
+        }))
+    }
+}
+
 fn ppm() -> clap::builder::RangedU64ValueParser<u64> {
     clap::value_parser!(u64).range(0..=1_000_000)
 }
@@ -427,6 +509,8 @@ enum Command {
         notify: Notify,
         #[command(flatten)]
         lightning: Box<LightningArgs>,
+        #[command(flatten)]
+        deposits: Box<DepositArgs>,
         #[command(flatten)]
         announce: Box<AnnounceArgs>,
         /// Also serve the API as an onion service of a Tor client of the
@@ -500,6 +584,7 @@ fn command(cli: Cli) -> anyhow::Result<()> {
             chain,
             notify,
             lightning,
+            deposits,
             announce,
             onion,
             notify_kinds,
@@ -516,6 +601,18 @@ fn command(cli: Cli) -> anyhow::Result<()> {
                 lightning.is_none() || chain.is_some(),
                 "a Lightning gateway (--lnd) needs --chain"
             );
+            let depositing = match &chain {
+                Some((source, profile, _)) => deposits
+                    .config(*profile)?
+                    .map(|config| (source.clone(), *profile, config)),
+                None => {
+                    anyhow::ensure!(
+                        deposits.deposit_sweep_address.is_none(),
+                        "taking deposits (--deposit-sweep-address) needs --chain"
+                    );
+                    None
+                }
+            };
             let mut announcing = (*announce).announcing(onion)?;
             anyhow::ensure!(
                 announcing.is_none() || chain.is_some(),
@@ -542,6 +639,16 @@ fn command(cli: Cli) -> anyhow::Result<()> {
                 }
                 None => None,
             };
+            let deposits = match depositing {
+                Some((source, profile, config)) => {
+                    let path = cli.data.join("deposits.sqlite");
+                    let deposits =
+                        deposit::Gateway::open(hub.clone(), source, profile, config, &path)
+                            .context("open the deposits")?;
+                    Some(Arc::new(deposits))
+                }
+                None => None,
+            };
             let tweaks = match indexing {
                 true => {
                     let path = cli.data.join("tweaks.sqlite");
@@ -552,6 +659,7 @@ fn command(cli: Cli) -> anyhow::Result<()> {
             };
             let services = Services {
                 gateway: gateway.clone(),
+                deposits: deposits.clone(),
                 tweaks: tweaks.clone(),
             };
             let router = licash_hub_service::router(hub.clone(), services);
@@ -572,6 +680,7 @@ fn command(cli: Cli) -> anyhow::Result<()> {
                 chain,
                 notifier,
                 gateway,
+                deposits,
                 announcing,
                 tweaks: tweaks.map(|index| (index, tweaks_from)),
             };
@@ -605,6 +714,7 @@ struct Tasks {
     chain: Option<(Source, ChainProfile, Duration)>,
     notifier: Option<Notifier>,
     gateway: Option<Arc<Gateway>>,
+    deposits: Option<Arc<deposit::Gateway>>,
     announcing: Option<Announcing>,
     /// With the first block to index if the index is new.
     tweaks: Option<(Arc<Tweaks>, Option<u32>)>,
@@ -621,6 +731,7 @@ async fn serve(
         chain,
         notifier,
         gateway,
+        deposits,
         announcing,
         tweaks,
     } = tasks;
@@ -653,6 +764,10 @@ async fn serve(
         tracing::info!("running a Lightning gateway");
         tokio::spawn(gateway.run())
     });
+    let depositing = deposits.map(|deposits| {
+        tracing::info!("taking deposits on Bitcoin");
+        tokio::spawn(deposits.run())
+    });
     let announcing = announcing.map(|a| {
         let (relays, urls) = (a.relays.join(", "), a.urls.join(", "));
         tracing::info!(%relays, %urls, "announcing on Nostr");
@@ -661,7 +776,7 @@ async fn serve(
     axum::serve(listener, router)
         .with_graceful_shutdown(shutdown())
         .await?;
-    for task in [watching, indexing, paying, announcing]
+    for task in [watching, indexing, paying, depositing, announcing]
         .into_iter()
         .flatten()
     {
