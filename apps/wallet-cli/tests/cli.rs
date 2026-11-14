@@ -632,6 +632,16 @@ fn owners_deposit_on_bitcoin_and_take_back_what_was_never_received() {
     let dir = tempfile::tempdir().unwrap();
     let (alice, _) = party(dir.path(), "alice", Some(&hub));
     let asked_at = hub.height();
+    let hubs = json(&alice, &["hubs"]);
+    assert_eq!(
+        (
+            hubs[0]["deposits"]["min"].as_u64(),
+            hubs[0]["deposits"]["timeout"].as_u64()
+        ),
+        (Some(1_000), Some(DEPOSIT_TIMEOUT.into()))
+    );
+    let text = ok(wallet(&alice, &["hubs"], None));
+    assert!(text.contains("deposits 1000 to 4000"), "{text}");
 
     // Asked for 2000 in notes: pay 2100 on Bitcoin, the hub's fee on top.
     let asked = wallet(&alice, &["deposit", "2000"], None);

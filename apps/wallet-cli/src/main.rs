@@ -346,7 +346,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             let rows = hubs.iter().map(|(url, info)| {
                 json!({
                     "url": url, "fees": info.fees, "locks": info.locks.is_some(),
-                    "lightning": info.lightning,
+                    "lightning": info.lightning, "deposits": info.deposits,
                 })
             });
             let lines = hubs.iter().map(|(url, info)| {
@@ -356,7 +356,11 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 } else {
                     ""
                 };
-                format!("{url}  {} + {} ppm{lightning}", fee.base, fee.ppm)
+                let deposits = match &info.deposits {
+                    Some(d) => format!("  deposits {} to {}", d.min, d.max),
+                    None => String::new(),
+                };
+                format!("{url}  {} + {} ppm{lightning}{deposits}", fee.base, fee.ppm)
             });
             show(json, rows.collect(), lines.collect::<Vec<_>>().join("\n"));
         }
