@@ -31,6 +31,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.ClipEntry
 import androidx.compose.ui.platform.LocalClipboard
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.testTagsAsResourceId
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
@@ -130,11 +133,14 @@ fun AmountDialog(current: Long?, onDone: (Long?) -> Unit, onCancel: () -> Unit) 
     var text by remember { mutableStateOf(current?.toString() ?: "") }
     AlertDialog(
         onDismissRequest = onCancel,
+        // A window of its own: its test tags as resource ids too.
+        modifier = Modifier.semantics { testTagsAsResourceId = true },
         title = { Text("Amount in sat") },
         text = {
             OutlinedTextField(
                 value = text,
                 onValueChange = { text = it.filter(Char::isDigit).take(15) },
+                modifier = Modifier.testTag("amount"),
                 singleLine = true,
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
             )

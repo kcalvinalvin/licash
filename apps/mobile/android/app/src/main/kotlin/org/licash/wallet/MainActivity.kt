@@ -21,6 +21,8 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.testTagsAsResourceId
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import org.licash.wallet.ui.Home
 import org.licash.wallet.ui.LicashTheme
@@ -78,7 +80,8 @@ private fun App(engine: Engine, link: String?, linkShown: () -> Unit) {
         containerColor = MaterialTheme.colorScheme.background,
         snackbarHost = { SnackbarHost(snackbar) },
     ) { padding ->
-        Box(Modifier.fillMaxSize().padding(padding)) {
+        // Test tags as resource ids, for the end-to-end tests to find.
+        Box(Modifier.fillMaxSize().padding(padding).semantics { testTagsAsResourceId = true }) {
             when {
                 !ui.loaded -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                     Wordmark(size = 40)

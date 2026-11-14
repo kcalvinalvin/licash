@@ -11,14 +11,27 @@ use std::{
 };
 
 use anyhow::{bail, ensure, Context};
+use bitcoin::{
+    absolute::LockTime,
+    consensus::{deserialize, encode::serialize_hex},
+    ecdsa,
+    key::TweakedPublicKey,
+    secp256k1::{Message, Secp256k1, SecretKey},
+    sighash::SighashCache,
+    transaction, Address, Amount, CompressedPublicKey, EcdsaSighashType, OutPoint, ScriptBuf,
+    Sequence, Transaction, TxIn, TxOut, Witness,
+};
 use licash::spend::{lock_hash, ChainProfile};
 use licash_api::{swaps, Info, ReceiveStatus};
+use licash_onchain::silent::{self, SpAddress};
 use licash_wallet::InvoiceState;
 use rand_core::{OsRng, RngCore};
 use serde_json::{json, Value};
 use tokio::process::Command;
 
 pub use licash_transport::Http;
+
+pub mod phone;
 
 /// Satoshis in each channel, half pushed to its other end.
 const CHANNEL: u64 = 2_000_000;
@@ -43,6 +56,8 @@ pub struct Eco {
     swaps: String,
     /// The Gotify server's URL, as published on this host.
     gotify: String,
+    /// Bitcoin Core's peer-to-peer address, as published on this host.
+    p2p: String,
     dir: tempfile::TempDir,
 }
 
@@ -91,12 +106,14 @@ impl Eco {
             relay: String::new(),
             swaps: String::new(),
             gotify: String::new(),
+            p2p: String::new(),
             dir: tempfile::tempdir()?,
         };
         eco.core = format!("http://{}", eco.port("bitcoind", 18443).await?);
         eco.relay = format!("ws://{}", eco.port("relay", 8080).await?);
         eco.swaps = format!("http://{}", eco.port("swaps", 8340).await?);
         eco.gotify = format!("http://{}", eco.port("gotify", 80).await?);
+        eco.p2p = eco.port("bitcoind", 18444).await?;
         for hub in ["hub1", "hub2"] {
             let at = eco.port(hub, 8338).await?;
             eco.hubs.push(format!("http://{at}"));
@@ -144,6 +161,19 @@ impl Eco {
         self.compose(&all).await
     }
 
+    /// Stop `service`, until [`Eco::start`]ed again.
+    pub async fn stop(&self, service: &str) -> anyhow::Result<()> {
+        self.compose(&["stop", service]).await?;
+        Ok(())
+    }
+
+    /// Start `service` again, and wait for it to be healthy.
+    pub async fn start(&self, service: &str) -> anyhow::Result<()> {
+        self.compose(&["start", service]).await?;
+        self.compose(&["up", "--wait", service]).await?;
+        Ok(())
+    }
+
     /// Restart `service`, and wait for it to be healthy.
     pub async fn restart(&self, service: &str) -> anyhow::Result<()> {
         self.compose(&["restart", service]).await?;
@@ -159,6 +189,12 @@ impl Eco {
     /// The URL of the Nostr relay the hubs announce themselves on.
     pub fn relay(&self) -> &str {
         &self.relay
+    }
+
+    /// Bitcoin Core's peer-to-peer address, serving compact filters, for
+    /// light clients.
+    pub fn p2p(&self) -> &str {
+        &self.p2p
     }
 
     /// A new wallet, in a file of its own.
@@ -254,6 +290,62 @@ impl Eco {
         let btc = sat as f64 / 1e8;
         let txid = self.miner("sendtoaddress", json!([address, btc])).await?;
         Ok(txid.as_str().context("a txid")?.to_owned())
+    }
+
+    /// Pay `sat` to the silent payment address `to`, from a key of its own
+    /// the miner's wallet funds, unconfirmed: the transaction's id.
+    pub async fn pay_silent(&self, to: &str, sat: u64) -> anyhow::Result<String> {
+        let to: SpAddress = to.to_lowercase().parse()?;
+        let secp = Secp256k1::new();
+        let mut secret = [0; 32];
+        OsRng.fill_bytes(&mut secret);
+        let key = SecretKey::from_slice(&secret)?;
+        let public = CompressedPublicKey(key.public_key(&secp));
+        let spent = ScriptBuf::new_p2wpkh(&public.wpubkey_hash());
+        let funding = Address::from_script(&spent, bitcoin::Network::Regtest)?;
+        let value = sat + 1_000;
+        let txid = self.send_to(&funding.to_string(), value).await?;
+        let raw = self.miner("gettransaction", json!([txid])).await?;
+        let raw = hex::decode(raw["hex"].as_str().context("a raw transaction")?)?;
+        let funded: Transaction = deserialize(&raw)?;
+        let vout = funded
+            .output
+            .iter()
+            .position(|o| o.script_pubkey == spent)
+            .context("the funding output")?;
+        let outpoint = OutPoint::new(funded.compute_txid(), vout as u32);
+        let output = silent::outputs(&[(key, false)], &[outpoint], &[to])?[0];
+        let mut tx = Transaction {
+            version: transaction::Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: outpoint,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(sat),
+                script_pubkey: ScriptBuf::new_p2tr_tweaked(
+                    TweakedPublicKey::dangerous_assume_tweaked(output),
+                ),
+            }],
+        };
+        let hash = SighashCache::new(&tx).p2wpkh_signature_hash(
+            0,
+            &spent,
+            Amount::from_sat(value),
+            EcdsaSighashType::All,
+        )?;
+        let signature = ecdsa::Signature {
+            signature: secp.sign_ecdsa(&Message::from(hash), &key),
+            sighash_type: EcdsaSighashType::All,
+        };
+        tx.input[0].witness = Witness::p2wpkh(&signature, &public.0);
+        let sent = self
+            .core("sendrawtransaction", json!([serialize_hex(&tx)]))
+            .await?;
+        Ok(sent.as_str().context("a txid")?.to_owned())
     }
 
     /// A new address of the miner's wallet, of `kind`, such as `bech32m`.

@@ -1,0 +1,275 @@
+//! The Android app among the stack of `apps/e2e/run.sh`, on the emulator or
+//! phone adb picks, as its user sees it: made, paid on Bitcoin and in
+//! Licash, paying, told what went wrong, and started again. Skipped unless
+//! `LICASH_E2E_APP` names the app's APK. What it showed and logged on a
+//! failure is kept beside the stack's logs.
+
+use std::{path::PathBuf, time::Duration};
+
+use anyhow::{ensure, Context};
+use licash_e2e::{phone::Phone, until, Eco};
+use licash_nostr::{wallet, Route};
+use licash_wallet::PaymentCode;
+use serde_json::json;
+
+#[tokio::test]
+#[ignore = "needs the stack of apps/e2e/run.sh and an Android device"]
+async fn the_app_is_paid_and_pays_on_bitcoin_and_in_licash() -> anyhow::Result<()> {
+    let Some(phone) = Phone::from_env() else {
+        eprintln!("skipped: LICASH_E2E_APP names no APK of the app");
+        return Ok(());
+    };
+    let eco = Eco::up().await?;
+    phone.fresh(&eco).await?;
+    let used = used(&eco, &phone).await;
+    if used.is_err() {
+        keep(&phone).await;
+    }
+    used
+}
+
+/// What the app shows and logged, beside the stack's logs.
+async fn keep(phone: &Phone) {
+    let dir = std::env::var_os("LICASH_E2E_LOGS").map_or_else(
+        || PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/e2e"),
+        PathBuf::from,
+    );
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = phone.screenshot(&dir.join("app.png")).await;
+    for log in ["app.log", "chain.log"] {
+        if let Ok(text) = phone.file(&format!("files/logs/{log}")).await {
+            let _ = std::fs::write(dir.join(format!("app-{log}")), text);
+        }
+    }
+}
+
+/// Mine whatever waits in the mempool until Home shows `moves` payments
+/// on Bitcoin moved into Licash, and none under way.
+async fn settle(eco: &Eco, phone: &Phone, moves: usize) -> anyhow::Result<()> {
+    let what = format!("{moves} payments on Bitcoin moved into Licash");
+    until(&what, 300, || async {
+        let waiting = eco.core("getmempoolinfo", json!([])).await?["size"].as_u64();
+        if waiting.unwrap_or(0) > 0 {
+            eco.mine(1).await?;
+        }
+        let views = phone.views().await?;
+        let moved = views.iter().filter(|v| v.text == "From Bitcoin").count();
+        let busy = views.iter().any(|v| {
+            [
+                "Under way",
+                "Waiting for a block",
+                "Coming on Bitcoin",
+                "On Bitcoin",
+            ]
+            .contains(&v.text.as_str())
+        });
+        Ok((moved == moves && !busy).then_some(()))
+    })
+    .await
+}
+
+/// Wait for the balance Home shows to change from `from`: the new one.
+async fn changed(phone: &Phone, from: u64, secs: u64) -> anyhow::Result<u64> {
+    until("the balance to change", secs, || async {
+        let now = phone.balance().await?;
+        Ok((now != from).then_some(now))
+    })
+    .await
+}
+
+/// Collect Bob's mailbox, for up to `secs`, until it holds payments: their
+/// sum.
+async fn collected(bob: &licash_e2e::Wallet, secs: u64) -> anyhow::Result<u64> {
+    until("a payment in Bob's mailbox", secs, || async {
+        let collected = wallet::collect(bob, &Route::Direct).await?;
+        let sum: u64 = collected.received.iter().map(|r| r.amount).sum();
+        Ok((sum > 0).then_some(sum))
+    })
+    .await
+}
+
+async fn used(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
+    let hub = eco.hub(1);
+    let first = phone.launch().await?;
+    eprintln!("first start in {first:?}");
+    phone.onboard().await?;
+    phone.connect(hub).await?;
+
+    // Its code names the hub and its mailbox, a silent payment address,
+    // the hub serving tweaks, and an address to fall back on.
+    let code: PaymentCode = phone.code().await?.parse()?;
+    let fallback = code.address.clone().context("a fallback address")?;
+    let fallback = fallback.assume_checked().to_string();
+    let silent = code.silent.context("a silent payment address")?;
+    let licash = code.licash.clone().context("a Licash code")?;
+    ensure!(licash.mailbox.is_some(), "no mailbox in {code}");
+
+    // Paid at the fallback address: shown on its way, then found in a
+    // block and moved into Licash, the next address shown from then on.
+    eco.send_to(&fallback, 30_000).await?;
+    phone.wait("Coming on Bitcoin", 60).await?;
+    eco.mine(1).await?;
+    settle(eco, phone, 1).await?;
+    let moved = phone.balance().await?;
+    // Less the hub's 1000 and the fees of the move on Bitcoin.
+    ensure!(
+        (25_000..29_000).contains(&moved),
+        "{moved} of 30000 moved in"
+    );
+    let next: PaymentCode = phone.code().await?.parse()?;
+    ensure!(next.address != code.address, "paid at, and shown again");
+    ensure!(next.silent == code.silent, "another silent payment address");
+
+    // Paid at its silent payment address: found and moved in too.
+    eco.pay_silent(&silent.to_string(), 20_000).await?;
+    eco.mine(1).await?;
+    settle(eco, phone, 2).await?;
+    let held = phone.balance().await?;
+    ensure!(
+        (15_000..19_000).contains(&(held - moved)),
+        "{} moved in",
+        held - moved
+    );
+
+    // It pays Bob at the hub, an amount it enters, to his mailbox.
+    let info = eco.info(hub).await?;
+    let bob = eco.wallet("bob")?;
+    bob.add_hub(hub).await?;
+    let bobs = bob.payment_code(&[hub.to_owned()], false)?;
+    phone.link(&bobs.to_string()).await?;
+    phone.tap("Enter amount").await?;
+    phone.tap_id("amount").await?;
+    phone.type_text("5000").await?;
+    phone.tap("Done").await?;
+    phone.wait_any(&["Fee up to", "No fee"], 10).await?;
+    phone.tap("Pay").await?;
+    phone.wait("Sent", 60).await?;
+    phone.tap("Done").await?;
+    ensure!(
+        collected(&bob, 60).await? == 5_000,
+        "Bob got other than 5000"
+    );
+    let after = changed(phone, held, 30).await?;
+    let fee = info.fees.spend.due(held);
+    ensure!(
+        (5_000..=5_000 + fee).contains(&(held - after)),
+        "{} spent paying 5000",
+        held - after
+    );
+
+    // Bob pays its code back, to its mailbox: the app takes it by itself.
+    let code: PaymentCode = phone.code().await?.parse()?;
+    let paid = wallet::pay(&bob, &code, Some(3_000), || Ok(Route::Direct)).await?;
+    ensure!(paid.delivered == Some(1), "{:?}", paid.undelivered);
+    let now = changed(phone, after, 90).await?;
+    ensure!(now == after + 3_000, "{now} held after 3000 received");
+    phone.wait("Received", 10).await?;
+
+    refused(eco, phone, &bobs).await?;
+    hub_down(eco, phone, &bob, &bobs).await?;
+
+    // Started again: at once, holding the same.
+    let held = phone.balance().await?;
+    let again = phone.launch().await?;
+    ensure!(again < Duration::from_secs(10), "{again:?} to start again");
+    phone.wait_balance(held, 30).await?;
+    logs(phone).await
+}
+
+/// What it cannot pay: told why, nothing spent.
+async fn refused(eco: &Eco, phone: &Phone, bobs: &PaymentCode) -> anyhow::Result<()> {
+    let held = phone.balance().await?;
+    let mut asking = bobs.clone();
+    asking.amount = Some(10_000_000);
+    phone.link(&asking.to_string()).await?;
+    phone.tap("Pay").await?;
+    phone.wait("Not enough", 60).await?;
+    phone.tap("Cancel").await?;
+
+    phone.link("bitcoin:?licash=nonsense").await?;
+    phone.wait("Neither a payment code", 30).await?;
+    phone.tap("Cancel").await?;
+
+    // A code naming only a hub it does not use.
+    let carol = eco.wallet("carol")?;
+    carol.add_hub(eco.hub(2)).await?;
+    let carols = carol.payment_code(&[eco.hub(2).to_owned()], false)?;
+    phone.link(&carols.to_string()).await?;
+    phone.wait("This code names no hub you use", 30).await?;
+    phone.tap("Cancel").await?;
+    phone.wait("Receive", 10).await?;
+    ensure!(phone.balance().await? == held, "spent refusing");
+    Ok(())
+}
+
+/// Its hub down: paying is under way, and once the hub is back up the app
+/// finishes it by itself, to Bob's mailbox, paid once.
+async fn hub_down(
+    eco: &Eco,
+    phone: &Phone,
+    bob: &licash_e2e::Wallet,
+    bobs: &PaymentCode,
+) -> anyhow::Result<()> {
+    let held = phone.balance().await?;
+    let fee = eco.info(eco.hub(1)).await?.fees.spend.due(held);
+    let mut asking = bobs.clone();
+    asking.amount = Some(1_000);
+    eco.stop("hub1").await?;
+    let told = async {
+        phone.link(&asking.to_string()).await?;
+        phone.tap("Pay").await?;
+        phone
+            .wait_any(&["Under way", "Sent", "Try again"], 120)
+            .await
+    }
+    .await;
+    eco.start("hub1").await?;
+    let told = told?;
+    ensure!(
+        told.text.starts_with("Under way"),
+        "told {:?} with its hub down",
+        told.text
+    );
+    phone.tap("Done").await?;
+    phone.wait("Receive", 10).await?;
+
+    // Back up: finished and sent on within a few rounds of the app.
+    ensure!(
+        collected(bob, 180).await? == 1_000,
+        "Bob got other than 1000"
+    );
+    let spent = until("the payment done", 60, || async {
+        let spent = held - phone.balance().await?;
+        Ok((1_000..=1_000 + fee).contains(&spent).then_some(spent))
+    })
+    .await?;
+    eprintln!("{spent} spent paying 1000 while its hub was down");
+    // Once: nothing more for Bob a round later.
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    let again = wallet::collect(bob, &Route::Direct).await?;
+    ensure!(
+        again.received.is_empty(),
+        "paid twice: {:?}",
+        again.received
+    );
+    Ok(())
+}
+
+/// The app's log and the light client's, and both exported from Settings.
+async fn logs(phone: &Phone) -> anyhow::Result<()> {
+    let app = phone.file("files/logs/app.log").await?;
+    for want in ["light client of regtest started", "moving to notes"] {
+        ensure!(app.contains(want), "no {want:?} in the app's log");
+    }
+    let chain = phone.file("files/logs/chain.log").await?;
+    ensure!(
+        chain.contains("LCHN"),
+        "no neutrino in the light client's log"
+    );
+    phone.tap("Settings").await?;
+    let export = phone.scroll_to("Export logs").await?;
+    phone.tap_view(&export).await?;
+    phone.wait("licash-logs.txt", 30).await?;
+    phone.back().await?;
+    Ok(())
+}

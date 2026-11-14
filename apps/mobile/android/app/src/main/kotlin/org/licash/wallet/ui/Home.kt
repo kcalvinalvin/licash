@@ -29,6 +29,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
@@ -90,7 +91,7 @@ private fun Total(ui: Ui) {
     val b = ui.balance
     val total = b.notes + b.notesPending + b.onchain + b.moving
     Row(verticalAlignment = Alignment.Bottom) {
-        Text(digits(total), style = Figures)
+        Text(digits(total), modifier = Modifier.testTag("balance"), style = Figures)
         Text(
             " sat",
             modifier = Modifier.padding(bottom = 8.dp),

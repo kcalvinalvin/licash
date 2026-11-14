@@ -8,7 +8,8 @@
 # Every port is published on 127.0.0.1 only: the hubs', the provider's and
 # the relay's at fixed ports, which wallets keep across restarts and the hubs
 # name, LICASH_E2E_HUB1, LICASH_E2E_HUB2, LICASH_E2E_SWAPS and
-# LICASH_E2E_RELAY, the rest at ports Docker picks.
+# LICASH_E2E_RELAY, the rest at ports Docker picks. An Android emulator
+# reaches them at the same ports through `adb reverse`.
 
 x-lnd: &lnd
   image: lightninglabs/lnd:v0.21.6-beta@sha256:54b3c87ad0bc3fea3fab8af23ace6421147ea97e6b56bf3911592d7853c185b8
@@ -71,8 +72,13 @@ services:
       - -fallbackfee=0.0002
       - -zmqpubrawblock=tcp://0.0.0.0:28332
       - -zmqpubrawtx=tcp://0.0.0.0:28333
+      # Compact filters for light clients, the app's among them.
+      - -blockfilterindex=1
+      - -peerblockfilters=1
+      - -whitelist=0.0.0.0/0
     ports:
       - "127.0.0.1::18443"
+      - "127.0.0.1::18444"
     healthcheck:
       test: ["CMD", "bitcoin-cli", "-regtest", "-rpcuser=licash", "-rpcpassword=licash", "getblockchaininfo"]
       interval: 2s
