@@ -109,6 +109,32 @@ async fn a_payment_pays_its_payee_and_the_hub_its_fee() {
 }
 
 #[tokio::test]
+async fn the_notes_counted_are_those_spendable_by_denomination() {
+    let net = network();
+    let (alice, bob) = (party(&net, 1).await, party(&net, 2).await);
+    assert_eq!(alice.notes().unwrap(), []);
+    alice.receive(&net.pay(HUB, &alice.address(), 100)).unwrap();
+    alice.receive(&net.pay(HUB, &alice.address(), 4)).unwrap();
+    let notes = |wallet: &Wallet<Link>| -> Vec<(u64, u64)> {
+        let notes = wallet.notes().unwrap();
+        assert!(notes.iter().all(|n| n.hub == HUB));
+        notes.iter().map(|n| (n.denomination, n.count)).collect()
+    };
+    assert_eq!(notes(&alice), [(64, 1), (32, 1), (4, 2)]);
+
+    // Notes held by a payment under way are not spendable.
+    net.fail(RELEASE, Fault::Lost);
+    assert!(matches!(
+        alice.send(HUB, &bob.address(), 30).await,
+        Err(Error::Pending { .. })
+    ));
+    let (available, pending) = available(&alice);
+    let counted: u64 = notes(&alice).iter().map(|(d, c)| d * c).sum();
+    assert_eq!((counted, pending), (available, 104 - available));
+    assert!(pending > 0);
+}
+
+#[tokio::test]
 async fn a_payment_cut_off_at_any_step_finishes_on_resume() {
     for (path, fault) in [
         (OFFER, Fault::Lost),

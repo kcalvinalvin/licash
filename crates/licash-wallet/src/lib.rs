@@ -142,6 +142,14 @@ pub struct Balance {
     pub pending: u64,
 }
 
+/// How many notes of one denomination the wallet can spend at one hub.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Notes {
+    pub hub: String,
+    pub denomination: u64,
+    pub count: u64,
+}
+
 /// A payment made, and where it stands.
 #[derive(Clone, Debug)]
 pub struct Sent {
@@ -419,6 +427,30 @@ impl<T: Transport> Wallet<T> {
                     hub: r.get(0)?,
                     available: r.get::<_, i64>(1)? as u64,
                     pending: r.get::<_, i64>(2)? as u64,
+                })
+            })?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
+    }
+
+    /// How many notes the wallet can spend now of each denomination, at
+    /// each hub it added: by URL, then largest denomination first.
+    pub fn notes(&self) -> Result<Vec<Notes>, Error> {
+        self.store.read(|c| {
+            let mut stmt = c.prepare(
+                "SELECT r.url, n.denom, COUNT(*)
+                 FROM hubs h
+                 JOIN reach r ON r.hub = h.id
+                 JOIN keysets k ON k.hub = h.id
+                 JOIN notes n ON n.keyset = k.id
+                 WHERE n.spent_by IS NULL AND n.gone_at IS NULL
+                 GROUP BY h.id, n.denom ORDER BY r.url, n.denom DESC",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok(Notes {
+                    hub: r.get(0)?,
+                    denomination: r.get::<_, i64>(1)? as u64,
+                    count: r.get::<_, i64>(2)? as u64,
                 })
             })?;
             Ok(rows.collect::<Result<_, _>>()?)
