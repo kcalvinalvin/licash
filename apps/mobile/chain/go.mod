@@ -2,7 +2,7 @@
 // release, pinned and patched by upstream/materialize.sh.
 module github.com/licash-org/licash/apps/mobile/chain
 
-go 1.25.11
+go 1.26.0
 
 require (
 	github.com/btcsuite/btcd/chaincfg/v2 v2.0.0
@@ -42,11 +42,16 @@ require (
 	go.etcd.io/bbolt v1.3.11 // indirect
 	golang.org/x/crypto v0.41.0 // indirect
 	golang.org/x/exp v0.0.0-20250811191247-51f88131bc50 // indirect
-	golang.org/x/sync v0.16.0 // indirect
-	golang.org/x/sys v0.35.0 // indirect
+	golang.org/x/mobile v0.0.0-20261011034528-197770444867 // indirect
+	golang.org/x/mod v0.42.0 // indirect
+	golang.org/x/sync v0.24.0 // indirect
+	golang.org/x/sys v0.49.0 // indirect
+	golang.org/x/tools v0.52.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
 
 // The official v0.18.0 with the patches in upstream/patches, and nothing
 // else. Run upstream/materialize.sh before building.
 replace github.com/lightninglabs/neutrino => ./upstream/neutrino
+
+tool golang.org/x/mobile/cmd/gobind
