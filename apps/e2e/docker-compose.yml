@@ -5,9 +5,10 @@
 # hubs and the provider announce themselves on, and a Gotify server their
 # operators are notified on. `run.sh` brings it up, runs the tests and
 # removes it.
-# Every port is published on 127.0.0.1 only: the hubs' and the provider's at
-# fixed ports, which wallets keep across restarts, LICASH_E2E_HUB1,
-# LICASH_E2E_HUB2 and LICASH_E2E_SWAPS, the rest at ports Docker picks.
+# Every port is published on 127.0.0.1 only: the hubs', the provider's and
+# the relay's at fixed ports, which wallets keep across restarts and the hubs
+# name, LICASH_E2E_HUB1, LICASH_E2E_HUB2, LICASH_E2E_SWAPS and
+# LICASH_E2E_RELAY, the rest at ports Docker picks.
 
 x-lnd: &lnd
   image: lightninglabs/lnd:v0.21.6-beta@sha256:54b3c87ad0bc3fea3fab8af23ace6421147ea97e6b56bf3911592d7853c185b8
@@ -50,6 +51,8 @@ x-hub: &hub
     LICASH_HUB_LND_MACAROON: /lnd/data/chain/bitcoin/regtest/admin.macaroon
     LICASH_HUB_LND_CERT: /lnd/tls.cert
     LICASH_HUB_NOSTR_RELAYS: ws://relay:8080
+    # The relay as wallets on this host reach it.
+    LICASH_HUB_MAILBOX_RELAYS: ws://127.0.0.1:${LICASH_E2E_RELAY:-38390}
     LICASH_HUB_LOG: json
     RUST_LOG: info
 
@@ -196,7 +199,7 @@ services:
   relay:
     image: scsibug/nostr-rs-relay:0.10.0@sha256:48d54c2d2781577cf3ed2951112f0953dc2c5e7c9d2ea20c64e8c0fa37d16e4d
     ports:
-      - "127.0.0.1::8080"
+      - "127.0.0.1:${LICASH_E2E_RELAY:-38390}:8080"
 
 volumes:
   notify:
