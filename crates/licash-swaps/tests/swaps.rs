@@ -10,7 +10,7 @@ use std::sync::{
     Arc, Mutex,
 };
 
-use licash::spend::{lock_hash, ProposalId};
+use licash::spend::{lock_hash, ChainProfile, ProposalId};
 use licash_api::{
     swaps::{self, Request},
     Code, Fee, Hex, Problem,
@@ -135,7 +135,13 @@ impl Eco {
         net.start(B, FEE);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("provider.sqlite");
-        let wallet = Wallet::create(&path, &[0x50; 32], Link(net.clone())).unwrap();
+        let wallet = Wallet::create(
+            &path,
+            &[0x50; 32],
+            ChainProfile::Core30DefaultRegtest,
+            Link(net.clone()),
+        )
+        .unwrap();
         for hub in [A, B] {
             wallet.add_hub(hub).await.unwrap();
         }
@@ -146,8 +152,13 @@ impl Eco {
         let desk = Arc::new(Desk::default());
         *desk.provider.lock().unwrap() = Some(Arc::new(provider));
         let client = Client(net.clone(), desk.clone());
-        let client =
-            Wallet::create(&dir.path().join("client.sqlite"), &[0xc1; 32], client).unwrap();
+        let client = Wallet::create(
+            &dir.path().join("client.sqlite"),
+            &[0xc1; 32],
+            ChainProfile::Core30DefaultRegtest,
+            client,
+        )
+        .unwrap();
         for hub in [A, B] {
             client.add_hub(hub).await.unwrap();
         }

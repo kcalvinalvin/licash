@@ -21,6 +21,9 @@ CREATE TABLE meta (
     seed BLOB,
     -- The owner's address, which the seed opening the wallet must derive.
     address BLOB NOT NULL,
+    -- The network of the hubs it trusts, by name: bitcoin, regtest, signet
+    -- or mutinynet.
+    network TEXT NOT NULL,
     created_at INTEGER NOT NULL
 ) STRICT;
 -- Hubs the owner trusts, and what each last said of itself (an Info body).
@@ -159,6 +162,7 @@ pub(crate) struct Owner {
     /// Unless the application keeps it.
     pub(crate) seed: Option<[u8; 32]>,
     pub(crate) address: Vec<u8>,
+    pub(crate) network: String,
 }
 
 pub(crate) struct Store {
@@ -166,13 +170,14 @@ pub(crate) struct Store {
 }
 
 impl Store {
-    /// A new wallet file at `path` of the owner at `address`, holding its
-    /// `seed` if given, readable by its owner only. Never over an existing
-    /// file.
+    /// A new wallet file at `path` of the owner at `address`, on `network`,
+    /// holding its `seed` if given, readable by its owner only. Never over
+    /// an existing file.
     pub(crate) fn create(
         path: &Path,
         seed: Option<&[u8; 32]>,
         address: &[u8],
+        network: &str,
     ) -> Result<Self, Error> {
         let mut file = std::fs::OpenOptions::new();
         file.write(true).create_new(true);
@@ -184,8 +189,9 @@ impl Store {
             tx.execute_batch(SCHEMA)?;
             tx.pragma_update(None, "user_version", VERSION)?;
             tx.execute(
-                "INSERT INTO meta (one, seed, address, created_at) VALUES (1, ?1, ?2, ?3)",
-                rusqlite::params![seed, address, now()],
+                "INSERT INTO meta (one, seed, address, network, created_at)
+                 VALUES (1, ?1, ?2, ?3, ?4)",
+                rusqlite::params![seed, address, network, now()],
             )?;
             Ok(())
         })?;
@@ -205,12 +211,15 @@ impl Store {
                     "wallet schema {version}, this version reads {VERSION}"
                 )));
             }
-            Ok(c.query_row("SELECT seed, address FROM meta", [], |r| {
-                Ok(Owner {
-                    seed: r.get(0)?,
-                    address: r.get(1)?,
-                })
-            })?)
+            Ok(
+                c.query_row("SELECT seed, address, network FROM meta", [], |r| {
+                    Ok(Owner {
+                        seed: r.get(0)?,
+                        address: r.get(1)?,
+                        network: r.get(2)?,
+                    })
+                })?,
+            )
         })?;
         Ok((store, owner))
     }

@@ -35,7 +35,7 @@ use licash::{
     claim::Branch,
     crypto::Point,
     note::{Derivation, Keyset, Note},
-    spend::{Output, Proposal, ProposalId},
+    spend::{ChainProfile, Output, Proposal, ProposalId},
     unlink::Session,
 };
 use licash_api::{
@@ -49,7 +49,7 @@ use serde::{de::DeserializeOwned, Serialize};
 pub use coins::MAX_INPUTS;
 pub use lightning::{Invoice, InvoiceState};
 pub use locks::{Incoming, Lock, LockState, CLAIM_MARGIN};
-use store::{now, sql, Store};
+use store::{now, sql, Owner, Store};
 pub use swaps::{Swap, SwapState, SWAP_WINDOW};
 
 /// A hub's answer: its HTTP status and body.
@@ -232,6 +232,7 @@ impl Step {
 pub struct Wallet<T> {
     store: Store,
     owner: OwnerKeys,
+    network: ChainProfile,
     transport: T,
 }
 
@@ -245,26 +246,43 @@ struct Held {
 }
 
 impl<T: Transport> Wallet<T> {
-    /// A new wallet file at `path`, holding `seed`, its owner's.
-    pub fn create(path: &Path, seed: &[u8; 32], transport: T) -> Result<Self, Error> {
-        let owner = OwnerKeys::from_seed(seed)?;
-        let store = Store::create(path, Some(seed), &owner.address().to_bytes())?;
-        Ok(Self {
-            store,
-            owner,
-            transport,
-        })
+    /// A new wallet file at `path`, holding `seed`, its owner's, for hubs
+    /// on `network`.
+    pub fn create(
+        path: &Path,
+        seed: &[u8; 32],
+        network: ChainProfile,
+        transport: T,
+    ) -> Result<Self, Error> {
+        Self::created(path, seed, true, network, transport)
     }
 
     /// A new wallet file at `path` for the owner of `seed`, which the
     /// application keeps, as in a phone's keystore: it opens the wallet
     /// with [`Wallet::open_with_seed`].
-    pub fn create_without_seed(path: &Path, seed: &[u8; 32], transport: T) -> Result<Self, Error> {
+    pub fn create_without_seed(
+        path: &Path,
+        seed: &[u8; 32],
+        network: ChainProfile,
+        transport: T,
+    ) -> Result<Self, Error> {
+        Self::created(path, seed, false, network, transport)
+    }
+
+    fn created(
+        path: &Path,
+        seed: &[u8; 32],
+        keep: bool,
+        network: ChainProfile,
+        transport: T,
+    ) -> Result<Self, Error> {
         let owner = OwnerKeys::from_seed(seed)?;
-        let store = Store::create(path, None, &owner.address().to_bytes())?;
+        let address = owner.address().to_bytes();
+        let store = Store::create(path, keep.then_some(seed), &address, network.name())?;
         Ok(Self {
             store,
             owner,
+            network,
             transport,
         })
     }
@@ -275,25 +293,36 @@ impl<T: Transport> Wallet<T> {
         let seed = owner.seed.ok_or_else(|| {
             Error::Setup("the wallet's seed is kept elsewhere: open it with its seed".into())
         })?;
-        Self::opened(store, &seed, &owner.address, transport)
+        Self::opened(store, &seed, &owner, transport)
     }
 
     /// The wallet file at `path`, of the owner of `seed`.
     pub fn open_with_seed(path: &Path, seed: &[u8; 32], transport: T) -> Result<Self, Error> {
         let (store, owner) = Store::open(path)?;
-        Self::opened(store, seed, &owner.address, transport)
+        Self::opened(store, seed, &owner, transport)
     }
 
-    fn opened(store: Store, seed: &[u8; 32], address: &[u8], transport: T) -> Result<Self, Error> {
+    fn opened(store: Store, seed: &[u8; 32], kept: &Owner, transport: T) -> Result<Self, Error> {
         let owner = OwnerKeys::from_seed(seed)?;
-        if owner.address().to_bytes()[..] != *address {
+        if owner.address().to_bytes()[..] != *kept.address {
             return Err(Error::Setup("not this wallet's seed".into()));
         }
+        let network = kept
+            .network
+            .parse()
+            .map_err(|_| Error::Setup(format!("the wallet's network {}", kept.network)))?;
         Ok(Self {
             store,
             owner,
+            network,
             transport,
         })
+    }
+
+    /// The network of the hubs the wallet trusts: a hub following another
+    /// chain is refused.
+    pub fn network(&self) -> ChainProfile {
+        self.network
     }
 
     /// Where others pay this wallet.
@@ -302,7 +331,8 @@ impl<T: Transport> Wallet<T> {
     }
 
     /// Trust the hub at `url`, and learn its keysets and fees. Again, to
-    /// learn what changed.
+    /// learn what changed. Refused if it follows another network than the
+    /// wallet's.
     pub async fn add_hub(&self, url: &str) -> Result<Info, Error> {
         Ok(self.refresh(&hub_url(url)?).await?.1)
     }
@@ -355,6 +385,18 @@ impl<T: Transport> Wallet<T> {
     async fn refresh(&self, url: &str) -> Result<(i64, Info), Error> {
         let info: Info = self.get(url, licash_api::INFO).await?;
         let keysets = info.keysets().map_err(|p| unavailable(url, p))?;
+        if let Some(locks) = &info.locks {
+            let profile = locks
+                .checkpoint()
+                .map_err(|p| unavailable(url, p))?
+                .profile();
+            if profile != self.network {
+                return Err(Error::Invalid(format!(
+                    "hub {url} follows {profile}, not this wallet's network, {}",
+                    self.network
+                )));
+            }
+        }
         let text = serde_json::to_string(&info).map_err(invalid)?;
         let hub = self.store.write(|tx| {
             let known: Option<i64> = tx

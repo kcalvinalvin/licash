@@ -9,7 +9,10 @@ use std::{
 
 use anyhow::{bail, Context};
 use clap::{Parser, Subcommand, ValueEnum};
-use licash::{address::Address, spend::lock_hash};
+use licash::{
+    address::Address,
+    spend::{lock_hash, ChainProfile},
+};
 use licash_api::Payment;
 use licash_nostr::{Role, Route};
 use licash_transport::Http;
@@ -64,7 +67,12 @@ enum Log {
 enum Command {
     /// Create a wallet, with a new seed. Back up its file: the seed alone
     /// does not restore its notes.
-    Init,
+    Init {
+        /// The network of the hubs it trusts: bitcoin, regtest, signet or
+        /// mutinynet.
+        #[arg(long, env = "LICASH_WALLET_NETWORK", default_value_t = ChainProfile::Core30Mainnet)]
+        network: ChainProfile,
+    },
     /// Where others pay this wallet.
     Address,
     /// Trust the hub at URL, or learn again what it charges.
@@ -193,10 +201,10 @@ enum Command {
             required = true
         )]
         relays: Vec<String>,
-        /// The Bitcoin network of the hubs: bitcoin, testnet4, signet or
-        /// regtest.
-        #[arg(long, default_value = "bitcoin")]
-        network: String,
+        /// The network of the hubs: bitcoin, regtest, signet or mutinynet
+        /// [default: the wallet's, else bitcoin].
+        #[arg(long)]
+        network: Option<ChainProfile>,
         /// Swap providers instead of hubs.
         #[arg(long)]
         swaps: bool,
@@ -254,18 +262,24 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     };
     let json = cli.json;
     match cli.command {
-        Command::Init => return init(&path, transport, json),
+        Command::Init { network } => return init(&path, network, transport, json),
         Command::Discover {
             relays,
             network,
             swaps,
         } => {
+            let network = match network {
+                Some(network) => network,
+                // Opening it reaches nothing.
+                None if path.exists() => Wallet::open(&path, Http::new(None)?)?.network(),
+                None => ChainProfile::Core30Mainnet,
+            };
             let route = match (tor, cli.proxy.as_deref()) {
                 (Some(tor), _) => Route::Tor(tor),
                 (None, Some(proxy)) => Route::socks(proxy)?,
                 (None, None) => Route::Direct,
             };
-            return discover(transport, route, &relays, &network, swaps, json).await;
+            return discover(transport, route, &relays, network.name(), swaps, json).await;
         }
         _ => {}
     }
@@ -277,7 +291,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     }
     let wallet = Wallet::open(&path, transport)?;
     match cli.command {
-        Command::Init | Command::Discover { .. } => unreachable!("handled above"),
+        Command::Init { .. } | Command::Discover { .. } => unreachable!("handled above"),
         Command::Address => {
             let address = encode(&wallet.address());
             show(json, json!({ "address": address }), address.clone());
@@ -734,7 +748,7 @@ fn is_onion(url: &str) -> bool {
     host.ends_with(".onion")
 }
 
-fn init(path: &Path, transport: Http, json: bool) -> anyhow::Result<()> {
+fn init(path: &Path, network: ChainProfile, transport: Http, json: bool) -> anyhow::Result<()> {
     if let Some(dir) = path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
         let mut create = std::fs::DirBuilder::new();
         create.recursive(true);
@@ -746,13 +760,13 @@ fn init(path: &Path, transport: Http, json: bool) -> anyhow::Result<()> {
     }
     let mut seed = [0; 32];
     OsRng.fill_bytes(&mut seed);
-    let wallet = Wallet::create(path, &seed, transport)?;
+    let wallet = Wallet::create(path, &seed, network, transport)?;
     let address = encode(&wallet.address());
     show(
         json,
-        json!({ "wallet": path, "address": address }),
+        json!({ "wallet": path, "address": address, "network": network.name() }),
         format!(
-            "created {}\naddress {address}\nBack up this file: the seed alone does not restore its notes.",
+            "created {} for {network}\naddress {address}\nBack up this file: the seed alone does not restore its notes.",
             path.display()
         ),
     );

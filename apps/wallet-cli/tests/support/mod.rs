@@ -276,6 +276,8 @@ pub fn wallet(wallet: &Path, args: &[&str], input: Option<&str>) -> Output {
         .arg(wallet)
         .args(args)
         .env_remove("LICASH_WALLET_PROXY")
+        // Its hubs follow regtest.
+        .env("LICASH_WALLET_NETWORK", "regtest")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

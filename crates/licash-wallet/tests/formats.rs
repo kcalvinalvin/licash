@@ -9,7 +9,7 @@ mod net;
 
 use std::path::PathBuf;
 
-use licash::{note::Note, unlink::Session};
+use licash::{note::Note, spend::ChainProfile, unlink::Session};
 use licash_api::{Fee, Info, Offer, Release};
 use licash_wallet::{Error, Wallet};
 use net::{Fault, Link, Net, HUB};
@@ -59,7 +59,13 @@ async fn write_fixtures() {
     net.start(HUB, Fee { base: 2, ppm: 0 });
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("w.sqlite");
-    let wallet = Wallet::create(&path, &[1; 32], Link(net.clone())).unwrap();
+    let wallet = Wallet::create(
+        &path,
+        &[1; 32],
+        ChainProfile::Core30DefaultRegtest,
+        Link(net.clone()),
+    )
+    .unwrap();
     wallet.add_hub(HUB).await.unwrap();
     wallet
         .receive(&net.pay(HUB, &wallet.address(), 12))

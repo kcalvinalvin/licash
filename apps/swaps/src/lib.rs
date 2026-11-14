@@ -134,17 +134,8 @@ pub async fn step<T: Transport + 'static>(provider: Arc<Provider<T>>, every: Dur
     }
 }
 
-/// The network the hubs of `provider` follow, once one names it.
-pub fn network<T: Transport>(provider: &Provider<T>) -> Option<String> {
-    let hubs = provider.wallet().hubs().ok()?;
-    let checkpoint = hubs
-        .iter()
-        .find_map(|(_, info)| info.locks.as_ref()?.checkpoint().ok())?;
-    Some(licash_chain_client::network(checkpoint.profile()).to_string())
-}
-
 /// Announce `provider` at `urls`, named `name`, on `relays` reached through
-/// `route`, for good: once one of its hubs names the network it follows.
+/// `route`, for good, for its wallet's network.
 pub async fn announce<T: Transport + 'static>(
     provider: Arc<Provider<T>>,
     relays: Vec<String>,
@@ -152,12 +143,7 @@ pub async fn announce<T: Transport + 'static>(
     urls: Vec<String>,
     name: Option<String>,
 ) {
-    let network = loop {
-        if let Some(network) = network(&provider) {
-            break network;
-        }
-        tokio::time::sleep(Duration::from_secs(5)).await;
-    };
+    let network = provider.wallet().network().name().to_owned();
     let secret = match provider.nostr_secret() {
         Ok(secret) => secret,
         Err(e) => return tracing::error!("announcing on Nostr: {e}"),

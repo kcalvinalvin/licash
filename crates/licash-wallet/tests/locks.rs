@@ -3,7 +3,7 @@ mod net;
 
 use std::sync::Arc;
 
-use licash::spend::lock_hash;
+use licash::spend::{lock_hash, ChainProfile};
 use licash_api::{Code, Fee};
 use licash_wallet::{Error, LockState, Wallet};
 use net::{Fault, Link, Net, HUB};
@@ -25,8 +25,13 @@ impl std::ops::Deref for Party {
 
 async fn party(net: &Arc<Net>, seed: u8) -> Party {
     let dir = tempfile::tempdir().unwrap();
-    let wallet =
-        Wallet::create(&dir.path().join("w.sqlite"), &[seed; 32], Link(net.clone())).unwrap();
+    let wallet = Wallet::create(
+        &dir.path().join("w.sqlite"),
+        &[seed; 32],
+        ChainProfile::Core30DefaultRegtest,
+        Link(net.clone()),
+    )
+    .unwrap();
     wallet.add_hub(HUB).await.unwrap();
     Party { _dir: dir, wallet }
 }

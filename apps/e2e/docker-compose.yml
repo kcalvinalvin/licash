@@ -148,6 +148,7 @@ services:
         --announce-name swaps --name swaps --notify gotify://gotify/$$(cat /notify/token)
     environment:
       LICASH_SWAPS_LOG: json
+      LICASH_SWAPS_NETWORK: regtest
       RUST_LOG: info
     ports:
       - "127.0.0.1:${LICASH_E2E_SWAPS:-38340}:8340"

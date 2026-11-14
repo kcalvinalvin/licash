@@ -11,7 +11,7 @@ use std::{
 };
 
 use anyhow::{bail, ensure, Context};
-use licash::spend::lock_hash;
+use licash::spend::{lock_hash, ChainProfile};
 use licash_api::{swaps, Info, ReceiveStatus};
 use licash_wallet::InvoiceState;
 use rand_core::{OsRng, RngCore};
@@ -166,7 +166,12 @@ impl Eco {
         let mut seed = [0; 32];
         OsRng.fill_bytes(&mut seed);
         let path = self.dir.path().join(format!("{name}.sqlite"));
-        Ok(Wallet::create(&path, &seed, Http::new(None)?)?)
+        Ok(Wallet::create(
+            &path,
+            &seed,
+            ChainProfile::Core30DefaultRegtest,
+            Http::new(None)?,
+        )?)
     }
 
     pub async fn info(&self, hub: &str) -> anyhow::Result<Info> {

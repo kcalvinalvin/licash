@@ -132,6 +132,21 @@ fn owners_pay_and_get_paid_on_the_command_line() {
         "not an address",
     );
     failed(wallet(&alice, &["init"], None), 1, "");
+    // A wallet trusts hubs of its network only.
+    let signet = dir.path().join("signet").join("wallet.sqlite");
+    let created = json(&signet, &["init", "--network", "signet"]);
+    assert_eq!(created["network"], "signet");
+    failed(
+        wallet(&signet, &["add-hub", &hub.url()], None),
+        1,
+        "follows regtest",
+    );
+    assert_eq!(json(&signet, &["hubs"]), serde_json::json!([]));
+    failed(
+        wallet(&signet, &["init", "--network", "testnet3"], None),
+        2,
+        "",
+    );
     failed(
         wallet(&dir.path().join("nobody"), &["balance"], None),
         1,
@@ -450,6 +465,10 @@ fn hubs_announced_on_nostr_are_discovered_where_they_answer_as_the_announcer() {
         None,
     ));
     assert_eq!(json(&alice, &["hubs"])[0]["url"], hub.url());
+    // Without --network, of the wallet's.
+    let found = json(&alice, &["discover", "--relay", &relays[0]]);
+    assert_eq!(found.as_array().unwrap().len(), 1, "{found}");
+    assert_eq!(found[0]["key"], named);
 
     failed(
         wallet(&nowhere, &["discover", "--relay", "ws://127.0.0.1:1"], None),

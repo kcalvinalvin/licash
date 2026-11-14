@@ -2,6 +2,7 @@ mod net;
 
 use std::{path::Path, sync::Arc};
 
+use licash::spend::ChainProfile;
 use licash_api::{Code, Fee, Hex, Payment};
 use licash_wallet::{Balance, Error, State, Wallet};
 use net::{Fault, Link, Net, HUB};
@@ -26,8 +27,13 @@ impl std::ops::Deref for Party {
 /// A wallet of the owner of `[seed; 32]` that added the hub at [`HUB`].
 async fn party(net: &Arc<Net>, seed: u8) -> Party {
     let dir = tempfile::tempdir().unwrap();
-    let wallet =
-        Wallet::create(&dir.path().join("w.sqlite"), &[seed; 32], Link(net.clone())).unwrap();
+    let wallet = Wallet::create(
+        &dir.path().join("w.sqlite"),
+        &[seed; 32],
+        ChainProfile::Core30DefaultRegtest,
+        Link(net.clone()),
+    )
+    .unwrap();
     wallet.add_hub(&format!("{HUB}/")).await.unwrap();
     Party { _dir: dir, wallet }
 }
@@ -142,7 +148,13 @@ async fn a_wallet_reopened_resumes_where_it_stopped() {
     let path = dir.path().join("w.sqlite");
     let bob = party(&net, 2).await;
     {
-        let alice = Wallet::create(&path, &[1; 32], Link(net.clone())).unwrap();
+        let alice = Wallet::create(
+            &path,
+            &[1; 32],
+            ChainProfile::Core30DefaultRegtest,
+            Link(net.clone()),
+        )
+        .unwrap();
         alice.add_hub(HUB).await.unwrap();
         alice.receive(&net.pay(HUB, &alice.address(), 64)).unwrap();
         net.fail(RELEASE, Fault::Dropped);
@@ -152,7 +164,12 @@ async fn a_wallet_reopened_resumes_where_it_stopped() {
         ));
     }
     assert!(matches!(
-        Wallet::create(&path, &[1; 32], Link(net.clone())),
+        Wallet::create(
+            &path,
+            &[1; 32],
+            ChainProfile::Core30DefaultRegtest,
+            Link(net.clone())
+        ),
         Err(Error::Setup(_))
     ));
     let alice = Wallet::open(&path, Link(net.clone())).unwrap();
@@ -426,9 +443,10 @@ async fn a_wallet_whose_seed_is_kept_elsewhere_opens_with_it_only() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("w.sqlite");
     let link = || Link(net.clone());
-    let address = Wallet::create_without_seed(&path, &[5; 32], link())
-        .unwrap()
-        .address();
+    let address =
+        Wallet::create_without_seed(&path, &[5; 32], ChainProfile::Core30DefaultRegtest, link())
+            .unwrap()
+            .address();
     let seed: Option<Vec<u8>> = rusqlite::Connection::open(&path)
         .unwrap()
         .query_row("SELECT seed FROM meta", [], |r| r.get(0))
@@ -444,7 +462,7 @@ async fn a_wallet_whose_seed_is_kept_elsewhere_opens_with_it_only() {
 
     // A wallet holding its seed opens with it too.
     let path = dir.path().join("held.sqlite");
-    drop(Wallet::create(&path, &[5; 32], link()).unwrap());
+    drop(Wallet::create(&path, &[5; 32], ChainProfile::Core30DefaultRegtest, link()).unwrap());
     Wallet::open_with_seed(&path, &[5; 32], link()).unwrap();
     assert!(matches!(
         Wallet::open_with_seed(&path, &[6; 32], link()),
@@ -452,12 +470,50 @@ async fn a_wallet_whose_seed_is_kept_elsewhere_opens_with_it_only() {
     ));
 }
 
+#[tokio::test]
+async fn a_wallet_trusts_hubs_of_its_network_only() {
+    let net = network();
+    let dir = tempfile::tempdir().unwrap();
+    let link = || Link(net.clone());
+    let others = [
+        ChainProfile::Core30Mainnet,
+        ChainProfile::Core30Signet,
+        ChainProfile::Mutinynet,
+    ];
+    for profile in others {
+        let path = dir.path().join(profile.name());
+        let wallet = Wallet::create(&path, &[1; 32], profile, link()).unwrap();
+        assert_eq!(wallet.network(), profile);
+        match wallet.add_hub(HUB).await {
+            Err(Error::Invalid(reason)) => assert!(reason.contains("follows regtest"), "{reason}"),
+            other => panic!("{other:?}"),
+        }
+        assert!(wallet.hubs().unwrap().is_empty());
+        drop(wallet);
+        assert_eq!(Wallet::open(&path, link()).unwrap().network(), profile);
+    }
+    let path = dir.path().join("regtest");
+    let regtest = ChainProfile::Core30DefaultRegtest;
+    let wallet = Wallet::create_without_seed(&path, &[1; 32], regtest, link()).unwrap();
+    wallet.add_hub(HUB).await.unwrap();
+    drop(wallet);
+    let wallet = Wallet::open_with_seed(&path, &[1; 32], link()).unwrap();
+    assert_eq!(wallet.network(), regtest);
+    assert_eq!(wallet.hubs().unwrap().len(), 1);
+}
+
 #[test]
 fn its_futures_run_on_any_runtime_thread() {
     fn send<F: std::future::Future + Send>(_: F) {}
     let net = network();
     let dir = tempfile::tempdir().unwrap();
-    let wallet = Wallet::create(&dir.path().join("w"), &[1; 32], Link(net)).unwrap();
+    let wallet = Wallet::create(
+        &dir.path().join("w"),
+        &[1; 32],
+        ChainProfile::Core30DefaultRegtest,
+        Link(net),
+    )
+    .unwrap();
     let to = wallet.address();
     send(wallet.add_hub(HUB));
     send(wallet.send(HUB, &to, 1));

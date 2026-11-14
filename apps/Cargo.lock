@@ -2836,7 +2836,6 @@ dependencies = [
  "http-body-util",
  "licash",
  "licash-api",
- "licash-chain-client",
  "licash-nostr",
  "licash-notify",
  "licash-swaps",

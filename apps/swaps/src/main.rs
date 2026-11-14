@@ -11,6 +11,7 @@ use std::{
 
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use licash::spend::ChainProfile;
 use licash_api::Fee;
 use licash_nostr::Route;
 use licash_notify::{Message, Priority, Target};
@@ -224,7 +225,11 @@ enum Command {
     /// Create the provider: a wallet with a fresh seed, and no swaps. Never
     /// replaces either. Add hubs and fund it with `licash-wallet --wallet
     /// <data>/wallet.sqlite`.
-    Init,
+    Init {
+        /// The network of its hubs: bitcoin, regtest, signet or mutinynet.
+        #[arg(long, env = "LICASH_SWAPS_NETWORK", default_value_t = ChainProfile::Core30Mainnet)]
+        network: ChainProfile,
+    },
     /// Serve the provider's HTTP API, and take its swaps on, until SIGINT
     /// or SIGTERM.
     Run {
@@ -313,7 +318,7 @@ fn logging(format: Log) {
 fn command(cli: Cli) -> anyhow::Result<()> {
     let data = cli.data;
     match cli.command {
-        Command::Init => init(&data),
+        Command::Init { network } => init(&data, network),
         Command::Run {
             listen,
             terms,
@@ -394,7 +399,7 @@ fn command(cli: Cli) -> anyhow::Result<()> {
     }
 }
 
-fn init(data: &Path) -> anyhow::Result<()> {
+fn init(data: &Path, network: ChainProfile) -> anyhow::Result<()> {
     let mut dir = std::fs::DirBuilder::new();
     dir.recursive(true);
     #[cfg(unix)]
@@ -409,10 +414,11 @@ fn init(data: &Path) -> anyhow::Result<()> {
     );
     let mut seed = [0; 32];
     OsRng.fill_bytes(&mut seed);
-    let wallet = Wallet::create(&wallet, &seed, Http::new(None)?).context("create the wallet")?;
+    let wallet =
+        Wallet::create(&wallet, &seed, network, Http::new(None)?).context("create the wallet")?;
     let address = hex::encode(wallet.address().to_bytes());
     Provider::create(&swaps, wallet, Config::default()).context("create the swaps file")?;
-    tracing::info!(data = %data.display(), %address, "provider created: back up its wallet file");
+    tracing::info!(data = %data.display(), %address, %network, "provider created: back up its wallet file");
     println!("{address}");
     Ok(())
 }
@@ -531,6 +537,7 @@ fn status(data: &Path, json: bool, latest: u32) -> anyhow::Result<()> {
     let balance = provider.wallet().balance()?;
     let swaps = provider.records(latest)?;
     let address = hex::encode(provider.wallet().address().to_bytes());
+    let network = provider.wallet().network();
     if json {
         let balance: Vec<_> = balance
             .iter()
@@ -538,6 +545,7 @@ fn status(data: &Path, json: bool, latest: u32) -> anyhow::Result<()> {
             .collect();
         let status = serde_json::json!({
             "address": address,
+            "network": network.name(),
             "stats": stats,
             "balance": balance,
             "swaps": swaps,
@@ -546,6 +554,7 @@ fn status(data: &Path, json: bool, latest: u32) -> anyhow::Result<()> {
         return Ok(());
     }
     println!("address     {address}");
+    println!("network     {network}");
     for (name, value) in [
         ("open", stats.open),
         ("done", stats.done),

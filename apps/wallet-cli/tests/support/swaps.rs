@@ -18,6 +18,7 @@ use axum::{
     response::IntoResponse,
     Json,
 };
+use licash::spend::ChainProfile;
 use licash_api::{Code, Problem};
 use licash_swaps::{Config, Provider, Record};
 use licash_transport::Http;
@@ -52,7 +53,13 @@ impl Swaps {
     pub fn start(hubs: &[&Server], stock: u64) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("wallet.sqlite");
-        let wallet = Wallet::create(&path, &[0x50; 32], Http::new(None).unwrap()).unwrap();
+        let wallet = Wallet::create(
+            &path,
+            &[0x50; 32],
+            ChainProfile::Core30DefaultRegtest,
+            Http::new(None).unwrap(),
+        )
+        .unwrap();
         let stocked = hubs.last().unwrap().pay(&wallet.address(), stock);
         let urls: Vec<String> = hubs.iter().map(|hub| hub.url()).collect();
         let swaps = dir.path().join("swaps.sqlite");

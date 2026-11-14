@@ -11,6 +11,9 @@ licash-wallet send <address> 1000 > payment.json
 licash-wallet resume                      # after a payment ended pending
 ```
 
+A wallet trusts hubs of one network, `bitcoin` unless `init --network`
+names `regtest`, `signet` or `mutinynet`.
+
 A payment is JSON that only its payee can open: hand it over by any
 channel. `send` and `resume` exit with 75 when a payment is recorded but its
 hub has not answered; `resume` finishes it. Back up the wallet file: its

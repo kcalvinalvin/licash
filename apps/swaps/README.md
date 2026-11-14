@@ -17,6 +17,7 @@ licash-swaps --data ./swaps status
 licash-swaps --data ./swaps events --follow
 ```
 
+`init --network` names the network of its hubs, `bitcoin` by default.
 The provider swaps between the hubs its wallet added, up to what it holds
 at the destination hub; an alert says when that falls below `--min`, once
 a start until it recovers. Back up `<data>/wallet.sqlite` and

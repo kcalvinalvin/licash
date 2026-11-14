@@ -11,7 +11,7 @@ use axum::{
     Router,
 };
 use http_body_util::BodyExt;
-use licash::spend::{lock_hash, ProposalId};
+use licash::spend::{lock_hash, ChainProfile, ProposalId};
 use licash_api::{Fee, Info, Pay, PayState, Paying, Problem, ReceiveState};
 use licash_hub::{Hub, Policy, Timing};
 use licash_hub_service::lightning::{
@@ -115,7 +115,13 @@ impl Net {
         let path = self.dir.path().join(format!("{name}.sqlite"));
         let mut seed = [0; 32];
         seed[..name.len()].copy_from_slice(name.as_bytes());
-        Wallet::create(&path, &seed, Local(self.app.clone())).unwrap()
+        Wallet::create(
+            &path,
+            &seed,
+            ChainProfile::Core30DefaultRegtest,
+            Local(self.app.clone()),
+        )
+        .unwrap()
     }
 
     /// A wallet holding `amount`, paid to it over Lightning.

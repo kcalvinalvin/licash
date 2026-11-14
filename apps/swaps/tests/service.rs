@@ -14,6 +14,7 @@ use axum::{
     Router,
 };
 use http_body_util::BodyExt;
+use licash::spend::ChainProfile;
 use licash_api::{swaps, Code, Problem};
 use licash_swaps::{Config, Provider};
 use licash_wallet::{Response, Transport, Wallet};
@@ -32,7 +33,13 @@ impl Transport for Offline {
 }
 
 fn router(dir: &tempfile::TempDir) -> (Router, Arc<Provider<Offline>>) {
-    let wallet = Wallet::create(&dir.path().join("wallet.sqlite"), &[5; 32], Offline).unwrap();
+    let wallet = Wallet::create(
+        &dir.path().join("wallet.sqlite"),
+        &[5; 32],
+        ChainProfile::Core30DefaultRegtest,
+        Offline,
+    )
+    .unwrap();
     let provider = Provider::create(&dir.path().join("swaps.sqlite"), wallet, Config::default());
     let provider = Arc::new(provider.unwrap());
     let router = licash_swaps_service::router(provider.clone(), Some("ab".repeat(32)));
@@ -122,12 +129,22 @@ fn init_creates_the_provider_once_and_status_reads_it() {
     assert!(status.status.success(), "{status:?}");
     let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
     assert_eq!(status["address"], address.trim());
+    assert_eq!(status["network"], "bitcoin");
     assert_eq!(status["stats"]["open"], 0);
     assert_eq!(status["swaps"], serde_json::json!([]));
     let text = licash_swaps(&dir, &["status"]);
     assert!(String::from_utf8(text.stdout).unwrap().contains("earned"));
     let events = licash_swaps(&dir, &["events"]);
     assert!(events.status.success() && events.stdout.is_empty());
+
+    let signet = tempfile::tempdir().unwrap();
+    let init = licash_swaps(&signet, &["init", "--network", "signet"]);
+    assert!(init.status.success(), "{init:?}");
+    let status = licash_swaps(&signet, &["status", "--json"]);
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["network"], "signet");
+    let unknown = licash_swaps(&signet, &["init", "--network", "testnet3"]);
+    assert_eq!(unknown.status.code(), Some(2));
 
     let bad = licash_swaps(&dir, &["run", "--margin", "4"]);
     assert!(!bad.status.success());
