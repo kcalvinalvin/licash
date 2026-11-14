@@ -3,20 +3,17 @@
 //! asked, late or reorganized away lock nothing, and return to the payer.
 
 mod chain;
+mod esplora;
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use axum::{
     body::Body,
-    extract::{Path, State},
-    http::{header, Method, Request, StatusCode},
-    response::{IntoResponse, Response},
-    routing::{get, post},
-    Json, Router,
+    http::{header, Method, Request},
+    Router,
 };
 use bitcoin::{
     absolute::LockTime,
-    consensus::serialize,
     hashes::Hash,
     key::TweakedPublicKey,
     secp256k1::{Secp256k1, SecretKey},
@@ -71,77 +68,13 @@ fn config() -> deposit::Config {
 /// blocks.
 const TIMEOUT: u32 = 10 + 2 + 6 + 1 + 2 + 6;
 
-/// A chain and the transactions sent to it.
-struct Backend {
-    chain: chain::Chain,
-    mempool: Vec<Transaction>,
-}
-
-type Shared = Arc<Mutex<Backend>>;
-
-async fn tip(State(backend): State<Shared>) -> String {
-    backend.lock().unwrap().chain.height().to_string()
-}
-
-async fn hash(State(backend): State<Shared>, Path(height): Path<usize>) -> Response {
-    match backend.lock().unwrap().chain.blocks.get(height) {
-        Some(block) => block.block_hash().to_string().into_response(),
-        None => (StatusCode::NOT_FOUND, "Block not found").into_response(),
-    }
-}
-
-async fn block(
-    State(backend): State<Shared>,
-    Path((hash, part)): Path<(String, String)>,
-) -> Response {
-    let backend = backend.lock().unwrap();
-    let block = backend
-        .chain
-        .blocks
-        .iter()
-        .find(|b| b.block_hash().to_string() == hash);
-    match (block, part.as_str()) {
-        (Some(block), "header") => hex::encode(serialize(&block.header)).into_response(),
-        (Some(block), "raw") => serialize(block).into_response(),
-        _ => (StatusCode::NOT_FOUND, "Block not found").into_response(),
-    }
-}
-
-async fn send(State(backend): State<Shared>, raw: String) -> Response {
-    let tx: Transaction = bitcoin::consensus::deserialize(&hex::decode(raw).unwrap()).unwrap();
-    let txid = tx.compute_txid();
-    let mut backend = backend.lock().unwrap();
-    if !backend.mempool.iter().any(|t| t.compute_txid() == txid) {
-        backend.mempool.push(tx);
-    }
-    txid.to_string().into_response()
-}
-
-async fn fees() -> Json<serde_json::Value> {
-    Json(json!({"2": 3.0, "144": 1.0}))
-}
-
-async fn esplora(backend: Shared) -> Source {
-    let app = Router::new()
-        .route("/api/blocks/tip/height", get(tip))
-        .route("/api/block-height/{height}", get(hash))
-        .route("/api/block/{hash}/{part}", get(block))
-        .route("/api/tx", post(send))
-        .route("/api/fee-estimates", get(fees))
-        .with_state(backend);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    format!("esplora+http://{address}/api").parse().unwrap()
-}
-
 /// A hub taking deposits, it and its gateway following one chain.
 struct Net {
     hub: Arc<Hub>,
     deposits: Arc<deposit::Gateway>,
     source: Source,
     app: Router,
-    backend: Shared,
+    backend: esplora::Shared,
     dir: tempfile::TempDir,
 }
 
@@ -157,11 +90,8 @@ impl Net {
         let hub = Arc::new(Hub::open(&seed, &db, policy).unwrap());
         let chain = chain::Chain::new();
         hub.add_checkpoint(&chain.checkpoint(0)).unwrap();
-        let backend = Arc::new(Mutex::new(Backend {
-            chain,
-            mempool: Vec::new(),
-        }));
-        let source = esplora(backend.clone()).await;
+        let backend = esplora::backend(chain);
+        let source: Source = esplora::serve(backend.clone()).parse().unwrap();
         let deposits = Arc::new(gateway(&hub, &source, &dir.path().join("deposits.sqlite")));
         let services = Services {
             deposits: Some(deposits.clone()),
