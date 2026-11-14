@@ -1,27 +1,37 @@
 //! Deadline budget of a hash-locked payment across hubs.
 //!
-//! A route is one timed lock per hub under a common hash. The payer of a lock
-//! that does not learn the preimage requests its refund on Bitcoin, and the
-//! hub can void that request only by publishing the preimage in its response.
-//! So by a bounded height the payer either holds the preimage or is paid its
-//! refund, and the lock one hub upstream only has to outlive that height.
+//! A route is one timed lock per hub under a common hash, the recipient's
+//! hub first. Every hub but the sender's issues its lock itself, of a note
+//! it issued to itself, to its payee: the recipient, or the hub downstream,
+//! a client of it. Its payee settles that lock only by revealing the
+//! preimage to it or by activating the lock on Bitcoin, so the hub holds the
+//! preimage soon after its own lock expires, whatever any other party does.
+//! It then claims the lock one hub upstream, which pays it, and activates
+//! that lock if its hub does not answer. The lock upstream only has to
+//! outlive that activation.
+//!
+//! A party that pays at a hub without issuing the lock, a provider swapping
+//! between hubs, has no such guarantee: the hub learns the preimage and can
+//! keep it, and the payer obtains it only by requesting its refund on
+//! Bitcoin, which the hub can void only by publishing the preimage. Its
+//! lock elsewhere must outlive that hub's response window as well.
 //!
 //! A hub answers a refund request plainly only after it has seen the lock
 //! expire unactivated, so it admits a lock only if that fits its response
-//! window. Together the two rules bound a route: each hub's window must
-//! exceed the sum of the windows downstream of it.
+//! window.
 
 /// One hub's timing for a lock it issues, in blocks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Hop {
-    /// Response window `w` of the payer's recovery contract at this hub.
+    /// Response window `w` of the hub's recovery contracts.
     pub window: u32,
-    /// Blocks after the lock's expiry by which the payer's request and
-    /// claim body are confirmed. It may first wait for a cooperative refund.
+    /// Blocks within which a transaction the party broadcasts confirms: an
+    /// activation upstream, or a refund request and its claim body. It may
+    /// first wait for the hub to answer offchain.
     pub confirm: u32,
-    /// Blocks for the payer to read the hub's response.
+    /// Blocks to read the preimage from Bitcoin.
     pub detect: u32,
-    /// Blocks the payer needs to act on the preimage upstream.
+    /// Blocks the party needs to act on the preimage upstream.
     pub margin: u32,
     /// Activation depth of the lock.
     pub depth: u32,
@@ -39,16 +49,30 @@ impl Hop {
         expiry > now && now.checked_add(self.window).is_some_and(|by| decided <= by)
     }
 
-    /// Height by which a payer whose refund request confirms within
-    /// `confirm` blocks of `expiry` has read the preimage or is owed the
-    /// refund.
-    pub fn resolved_by(&self, expiry: u32) -> Option<u32> {
+    /// Height by which the issuer of a lock expiring at `expiry`, if the
+    /// lock was paid, holds its preimage and has activated the lock
+    /// upstream: its payee revealed the preimage to it before `expiry` or
+    /// activated the lock below it.
+    pub fn activated_by(&self, expiry: u32) -> Option<u32> {
+        sum(&[expiry, self.detect, self.confirm])
+    }
+
+    /// Least expiry of the lock one hub upstream, which pays the issuer of
+    /// the lock expiring at `expiry`.
+    pub fn upstream_expiry(&self, expiry: u32) -> Option<u32> {
+        sum(&[self.activated_by(expiry)?, self.margin, 1])
+    }
+
+    /// Height by which a payer of a lock it did not issue, expiring at
+    /// `expiry`, whose refund request confirms within `confirm` blocks of
+    /// it, has read the preimage or is owed the refund.
+    pub fn forced_by(&self, expiry: u32) -> Option<u32> {
         sum(&[expiry, self.confirm, self.window, self.detect])
     }
 
-    /// Least expiry of the lock one hub upstream.
-    pub fn upstream_expiry(&self, expiry: u32) -> Option<u32> {
-        sum(&[self.resolved_by(expiry)?, self.margin, 1])
+    /// Least expiry of a lock elsewhere that pays that payer.
+    pub fn forced_upstream_expiry(&self, expiry: u32) -> Option<u32> {
+        sum(&[self.forced_by(expiry)?, self.margin, 1])
     }
 }
 
@@ -69,8 +93,8 @@ pub fn expiries(terminal: u32, route: &[Hop]) -> Option<Vec<u32>> {
 }
 
 /// Whether locks expiring at `expiries` (recipient's hub first) are safe to
-/// set up at height `now`: every hub admits its lock, and every payer has
-/// resolved its outgoing lock, with margin, before its incoming lock expires.
+/// set up at height `now`: every hub admits its lock, and every issuer has
+/// activated the lock upstream, with margin, before it expires.
 pub fn admissible(now: u32, expiries: &[u32], route: &[Hop]) -> bool {
     expiries.len() == route.len()
         && route
@@ -100,31 +124,40 @@ mod tests {
     }
 
     #[test]
-    fn upstream_locks_outlive_forced_disclosure_and_windows_nest() {
-        // Recipient's hub first: windows 8, 24 and 60 blocks.
-        let route = [hop(8), hop(24), hop(60)];
+    fn upstream_locks_outlive_the_issuers_activation_and_windows_do_not_nest() {
+        // Recipient's hub first, every hub with the same window.
+        let route = [hop(24); 3];
         let e = expiries(105, &route).unwrap();
-        assert_eq!(e, vec![105, 119, 149]);
+        assert_eq!(e, vec![105, 111, 117]);
         assert!(admissible(100, &e, &route));
-        // The forwarder that requests its refund by e[0] reads the preimage
-        // by 116, three blocks before its own incoming lock expires.
-        assert_eq!(route[0].resolved_by(e[0]), Some(116));
-        // Expiry spacing alone is not enough: an upstream lock that expires
-        // inside the downstream response window can be refunded first.
-        assert!(!admissible(100, &[105, 116, 149], &route));
-        // Nor is a window that cannot contain its own lock: equal windows
-        // admit a single hub only.
-        let flat = [hop(24), hop(24)];
-        let e = expiries(105, &flat).unwrap();
-        assert!(admissible(100, &e[..1], &flat[..1]));
-        assert!(!admissible(100, &e, &flat));
-        // Each window exceeds the sum of the windows downstream.
-        assert!(route[1].window > route[0].window);
-        assert!(route[2].window > route[0].window + route[1].window);
-        let short = [hop(8), hop(24), hop(30)];
-        assert!(!admissible(100, &expiries(105, &short).unwrap(), &short));
+        // The recipient's hub, paid at 104, reads an activation of its own
+        // lock by 106 and its own activation upstream confirms by 108,
+        // three blocks before that lock expires.
+        assert_eq!(route[0].activated_by(e[0]), Some(108));
+        // An upstream lock that expires before that activation can be
+        // refunded first.
+        assert!(!admissible(100, &[105, 108, 117], &route));
+        // Each window only has to contain its own lock.
+        let tight = [hop(8), hop(14), hop(20)];
+        assert!(admissible(100, &e, &tight));
+        let short = [hop(8), hop(14), hop(19)];
+        assert!(!admissible(100, &e, &short));
         // A lock already expired, or overflowing heights, is never admitted.
         assert!(!hop(8).admits(105, 105));
         assert!(expiries(u32::MAX - 3, &route).is_none());
+    }
+
+    #[test]
+    fn a_payer_that_did_not_issue_the_lock_waits_for_the_window() {
+        let to = hop(24);
+        // Its refund request confirms by 107, the hub answers by 131 and
+        // the payer reads the preimage by 132.
+        assert_eq!(to.forced_by(105), Some(132));
+        assert_eq!(to.forced_upstream_expiry(105), Some(135));
+        // A lock that pays it elsewhere must outlive that window, which a
+        // hub with the same window cannot admit.
+        assert!(!hop(24).admits(100, 135));
+        assert!(hop(40).admits(100, 135));
+        assert!(to.forced_by(u32::MAX - 3).is_none());
     }
 }
