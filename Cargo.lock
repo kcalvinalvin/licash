@@ -485,6 +485,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "licash-swaps"
+version = "0.0.1"
+dependencies = [
+ "bitcoin",
+ "hex",
+ "licash",
+ "licash-api",
+ "licash-hub",
+ "licash-wallet",
+ "rand_core",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "licash-wallet"
 version = "0.0.1"
 dependencies = [

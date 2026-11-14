@@ -14,9 +14,13 @@ research implementation; it has not had a security review.
 - `crates/licash`: the protocol library (notes, spends, grants, claims, both
   statements). The crate docs map modules to paper sections.
 - `crates/licash-hub`: a hub's operations over its own SQLite ledger.
-- `crates/licash-api`: the hub's HTTP API bodies and error codes.
+- `crates/licash-api`: the HTTP API bodies and error codes of hubs and swap
+  providers.
 - `crates/licash-wallet`: a wallet over its own SQLite file: hubs, notes,
-  payments made and taken, unlinking, and resuming after interruptions.
+  payments made and taken, locks, Lightning, swaps, unlinking, and resuming
+  after interruptions.
+- `crates/licash-swaps`: a swap provider over its own wallet: swaps of notes
+  at one hub for notes at another, with a timed lock at each.
 - `crates/licash-groth16`: RISC Zero Groth16 receipt verification, used
   inside the holder's program and on the host.
 - `r0/`: the holder's and the hub's programs for the RISC Zero zkVM, and a
