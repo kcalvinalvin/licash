@@ -258,6 +258,24 @@ fn init_never_replaces_a_seed_or_ledger_and_open_needs_both_matching() {
 }
 
 #[test]
+fn a_hub_names_one_nostr_key_of_its_seed_across_restarts() {
+    use bitcoin::secp256k1::{Keypair, Secp256k1};
+    let (a, b) = (files(), files());
+    let hub = open(&a, Policy::default());
+    let secret = hub.nostr_secret();
+    let named = hub.advertise().unwrap().nostr.unwrap();
+    let pair = Keypair::from_seckey_slice(&Secp256k1::new(), &secret).unwrap();
+    assert_eq!(named, hex::encode(pair.x_only_public_key().0.serialize()));
+    let seed = std::fs::read_to_string(&a.seed).unwrap();
+    assert_ne!(hex::encode(secret), seed.trim());
+    drop(hub);
+    let again = open(&a, Policy::default());
+    assert_eq!(again.nostr_secret(), secret);
+    assert_eq!(again.advertise().unwrap().nostr.unwrap(), named);
+    assert_ne!(open(&b, Policy::default()).nostr_secret(), secret);
+}
+
+#[test]
 fn fees_round_up_and_saturate() {
     let fee = Fee { base: 3, ppm: 1 };
     assert_eq!(fee.due(0), 3);

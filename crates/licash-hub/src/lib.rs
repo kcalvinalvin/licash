@@ -2,7 +2,8 @@
 //!
 //! A hub holds one secret, a 32-byte seed in a file of its own, and derives
 //! from it its issuer keysets ([`IssuerKeys::from_seed`]), the unlock of
-//! each grant it offers and its own address, at which spends pay its fees.
+//! each grant it offers, its own address, at which spends pay its fees, and
+//! the key it announces itself under on Nostr ([`Hub::nostr_secret`]).
 //! The database holds no secret: what the hub offered, which inputs it
 //! retired, which outputs it issued and what it answered. Every operation
 //! commits one transaction before it replies.
@@ -370,6 +371,8 @@ pub struct Hub {
     keysets: BTreeMap<[u8; 32], (IssuerKeys, Keyset)>,
     owner: OwnerKeys,
     unlock_secret: [u8; 32],
+    /// The Nostr key's secret, and its public key, x-only in hex.
+    nostr: ([u8; 32], String),
     /// This process's public boot id and its key, never stored.
     boot: [u8; 16],
     boot_key: [u8; 32],
@@ -447,6 +450,7 @@ impl Hub {
             keysets,
             owner: OwnerKeys::from_seed(&tagged_hash("licash-hub/owner", &[&secret]))?,
             unlock_secret: tagged_hash("licash-hub/unlock", &[&secret]),
+            nostr: nostr_key(tagged_hash("licash-hub/nostr", &[&secret]))?,
             boot,
             boot_key: tagged_hash("licash-hub/boot", &[&secret, &drawn]),
             answered: Mutex::default(),
@@ -466,6 +470,12 @@ impl Hub {
     /// serves the database as it then is.
     pub fn halted(&self) -> bool {
         self.store.halted()
+    }
+
+    /// The secret key the hub signs its Nostr announcements with: its
+    /// public key is the `nostr` of [`Hub::advertise`].
+    pub fn nostr_secret(&self) -> [u8; 32] {
+        self.nostr.0
     }
 
     pub fn info(&self) -> Info {
@@ -497,12 +507,9 @@ impl Hub {
             }),
             _ => None,
         };
-        Ok(licash_api::Info::new(
-            &info.keysets,
-            info.address,
-            fees,
-            locks,
-        ))
+        let mut advertised = licash_api::Info::new(&info.keysets, info.address, fees, locks);
+        advertised.nostr = Some(self.nostr.1.clone());
+        Ok(advertised)
     }
 
     /// The hub's keyset `id`, to decode requests under.
@@ -559,6 +566,14 @@ fn notify(tx: &Transaction<'_>, notice: &Notice) -> Result<(), Error> {
 /// `value` as an SQLite integer. Denominations fit by [`MAX_POW`].
 fn sql(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+/// `secret`, and its x-only public key in hex, as Nostr names keys.
+fn nostr_key(secret: [u8; 32]) -> Result<([u8; 32], String), Error> {
+    use bitcoin::secp256k1::{Keypair, Secp256k1};
+    let pair = Keypair::from_seckey_slice(&Secp256k1::signing_only(), &secret)
+        .map_err(|e| Error::Setup(format!("the Nostr key: {e}")))?;
+    Ok((secret, hex::encode(pair.x_only_public_key().0.serialize())))
 }
 
 fn write_seed(path: &Path, seed: &[u8; 32]) -> Result<(), Error> {

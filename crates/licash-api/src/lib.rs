@@ -168,6 +168,10 @@ pub struct Info {
     /// None unless the hub runs a Lightning gateway.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lightning: Option<Lightning>,
+    /// The key the hub announces itself under on Nostr, x-only in hex: an
+    /// announcement of its URL by another key is not the hub's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nostr: Option<String>,
 }
 
 impl Info {
@@ -178,6 +182,7 @@ impl Info {
             fees,
             locks,
             lightning: None,
+            nostr: None,
         }
     }
 
