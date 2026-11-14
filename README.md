@@ -22,7 +22,7 @@ research implementation; it has not had a security review.
 - `crates/licash-swaps`: a swap provider over its own wallet: swaps of notes
   at one hub for notes at another, with a timed lock at each.
 - `crates/licash-onchain`: Bitcoin outside the protocol: silent payments
-  (BIP352).
+  (BIP352), and the hash-locked coins of deposits and payouts.
 - `crates/licash-contract`: the contract's BABE transaction graph, on
   Lichen and ln-gap, and its opening between a holder and a hub as two
   message-driven state machines (built in regtest's workspace).

@@ -152,3 +152,69 @@ fn a_deposit_too_small_for_its_fee_is_not_spent() {
         .unwrap();
     assert!(tx.output[0].value >= to().minimal_non_dust());
 }
+
+#[test]
+fn a_payout_claims_exactly_its_amount_the_rest_its_fee() {
+    let htlc = htlc();
+    let amount = Amount::from_sat(99_000);
+    let tx = htlc
+        .claim_exact(funding(), VALUE, to(), amount, &secret(1), &[7; 32])
+        .unwrap();
+    assert_eq!(tx.output.len(), 1);
+    assert_eq!(tx.output[0].value, amount);
+    assert_eq!(tx.output[0].script_pubkey, to());
+    assert_eq!(tx.lock_time, bitcoin::absolute::LockTime::ZERO);
+    verify(&htlc, &tx, &htlc.claim_script(), &htlc.claim);
+    // Its size does not depend on what it pays: a claim of all of it at a
+    // rate weighs the same.
+    let rate = FeeRate::from_sat_per_vb(2).unwrap();
+    let all = htlc
+        .claim_tx(funding(), VALUE, to(), rate, &secret(1), &[7; 32])
+        .unwrap();
+    assert_eq!(tx.weight(), all.weight());
+
+    let wrong = htlc.claim_exact(funding(), VALUE, to(), amount, &secret(1), &[8; 32]);
+    assert!(matches!(wrong, Err(Error::Preimage)));
+    let wrong = htlc.claim_exact(funding(), VALUE, to(), amount, &secret(2), &[7; 32]);
+    assert!(matches!(wrong, Err(Error::Key)));
+    let dust = to().minimal_non_dust();
+    for amount in [VALUE + Amount::ONE_SAT, dust - Amount::ONE_SAT] {
+        let wrong = htlc.claim_exact(funding(), VALUE, to(), amount, &secret(1), &[7; 32]);
+        assert!(
+            matches!(wrong, Err(Error::Exact { .. })),
+            "{amount}: {wrong:?}"
+        );
+    }
+    htlc.claim_exact(funding(), VALUE, to(), dust, &secret(1), &[7; 32])
+        .unwrap();
+}
+
+#[test]
+fn the_preimage_is_read_from_a_claim_and_from_nothing_else() {
+    let htlc = htlc();
+    let rate = FeeRate::from_sat_per_vb(2).unwrap();
+    let amount = Amount::from_sat(99_000);
+    let claims = [
+        htlc.claim_tx(funding(), VALUE, to(), rate, &secret(1), &[7; 32])
+            .unwrap(),
+        htlc.claim_exact(funding(), VALUE, to(), amount, &secret(1), &[7; 32])
+            .unwrap(),
+    ];
+    for claim in &claims {
+        assert_eq!(htlc.preimage_in(claim, funding()), Some([7; 32]));
+        // Not of another coin it does not spend.
+        let other = OutPoint {
+            vout: 0,
+            ..funding()
+        };
+        assert_eq!(htlc.preimage_in(claim, other), None);
+        // Not of other terms, whose hash it is not the preimage of.
+        let mut others = htlc;
+        others.hash = sha256::Hash::hash(&[8; 32]).to_byte_array();
+        assert_eq!(others.preimage_in(claim, funding()), None);
+    }
+    let refund = htlc
+        .refund_tx(funding(), VALUE, to(), rate, &secret(2))
+        .unwrap();
+    assert_eq!(htlc.preimage_in(&refund, funding()), None);
+}

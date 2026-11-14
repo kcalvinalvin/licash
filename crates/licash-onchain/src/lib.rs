@@ -1,6 +1,7 @@
 //! Licash on Bitcoin, outside the audited protocol library: silent payment
-//! addresses (BIP352) that wallets receive coins at, and the deposits that
-//! turn coins into a hub's notes.
+//! addresses (BIP352) that wallets receive coins at, and the hash-locked
+//! coins of deposits, which turn coins into a hub's notes, and of payouts,
+//! which a swap provider pays a wallet's notes out with.
 
 pub mod deposit;
 pub mod silent;

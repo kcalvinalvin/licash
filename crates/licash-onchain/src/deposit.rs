@@ -3,6 +3,11 @@
 //! signature; the payer takes it back with its own signature once a block
 //! height passes. Its key path is unspendable: its internal key is the
 //! point of BIP341 that no one knows the secret of.
+//!
+//! The same terms pay a wallet out: a swap provider locks coins the
+//! wallet claims with the preimage, paying its payee exactly what it is
+//! owed ([`Htlc::claim_exact`]), and the provider reads the preimage from
+//! the claim ([`Htlc::preimage_in`]).
 
 use bitcoin::{
     absolute::LockTime,
@@ -28,6 +33,8 @@ const NUMS: [u8; 32] = [
 pub enum Error {
     #[error("the deposit of {value} cannot pay a fee of {fee} and leave more than dust")]
     TooSmall { value: Amount, fee: Amount },
+    #[error("the deposit of {value} cannot pay exactly {amount} and no dust")]
+    Exact { value: Amount, amount: Amount },
     #[error("not the preimage of the deposit's hash")]
     Preimage,
     #[error("not the key the deposit names")]
@@ -55,6 +62,15 @@ pub struct Htlc {
 enum Path {
     Claim([u8; 32]),
     Refund,
+}
+
+/// What a spend pays its one output.
+#[derive(Clone, Copy)]
+enum Pay {
+    /// All of the deposit but the fee at a rate.
+    All(FeeRate),
+    /// Exactly an amount, the rest of the deposit its fee.
+    Exact(Amount),
 }
 
 impl Htlc {
@@ -113,10 +129,58 @@ impl Htlc {
         secret: &SecretKey,
         preimage: &[u8; 32],
     ) -> Result<Transaction, Error> {
+        self.check_preimage(preimage)?;
+        self.spend(
+            funding,
+            value,
+            to,
+            Pay::All(rate),
+            secret,
+            Path::Claim(*preimage),
+        )
+    }
+
+    /// The claim of `funding`, worth `value`, paying `to` exactly `amount`
+    /// and the rest of it as its fee: a payout's, whose payee is owed
+    /// `amount` whatever the fee comes to, which its claimer judges.
+    /// Refused unless `amount` is at most `value` and no dust.
+    pub fn claim_exact(
+        &self,
+        funding: OutPoint,
+        value: Amount,
+        to: ScriptBuf,
+        amount: Amount,
+        secret: &SecretKey,
+        preimage: &[u8; 32],
+    ) -> Result<Transaction, Error> {
+        self.check_preimage(preimage)?;
+        self.spend(
+            funding,
+            value,
+            to,
+            Pay::Exact(amount),
+            secret,
+            Path::Claim(*preimage),
+        )
+    }
+
+    /// The preimage of its hash in `tx`'s spend of `outpoint`, if it spends
+    /// it with one: how a party whose coin was claimed learns the preimage,
+    /// to settle what else it unlocks. Read from any item of the input's
+    /// witness, which only the preimage hashes to the hash.
+    pub fn preimage_in(&self, tx: &Transaction, outpoint: OutPoint) -> Option<[u8; 32]> {
+        let input = tx.input.iter().find(|i| i.previous_output == outpoint)?;
+        input.witness.iter().find_map(|item| {
+            let item: [u8; 32] = item.try_into().ok()?;
+            self.check_preimage(&item).is_ok().then_some(item)
+        })
+    }
+
+    fn check_preimage(&self, preimage: &[u8; 32]) -> Result<(), Error> {
         if bitcoin::hashes::sha256::Hash::hash(preimage).to_byte_array() != self.hash {
             return Err(Error::Preimage);
         }
-        self.spend(funding, value, to, rate, secret, Path::Claim(*preimage))
+        Ok(())
     }
 
     /// The payer's refund of `funding`, as [`Htlc::claim_tx`] but with the
@@ -129,7 +193,7 @@ impl Htlc {
         rate: FeeRate,
         secret: &SecretKey,
     ) -> Result<Transaction, Error> {
-        self.spend(funding, value, to, rate, secret, Path::Refund)
+        self.spend(funding, value, to, Pay::All(rate), secret, Path::Refund)
     }
 }
 
@@ -139,7 +203,7 @@ impl Htlc {
         funding: OutPoint,
         value: Amount,
         to: ScriptBuf,
-        rate: FeeRate,
+        pay: Pay,
         secret: &SecretKey,
         path: Path,
     ) -> Result<Transaction, Error> {
@@ -187,12 +251,18 @@ impl Htlc {
                 script_pubkey: to,
             }],
         };
-        let fee = rate.fee_wu(tx.weight()).unwrap_or(Amount::MAX);
         let dust = tx.output[0].script_pubkey.minimal_non_dust();
-        tx.output[0].value = value
-            .checked_sub(fee)
-            .filter(|left| *left >= dust)
-            .ok_or(Error::TooSmall { value, fee })?;
+        tx.output[0].value = match pay {
+            Pay::All(rate) => {
+                let fee = rate.fee_wu(tx.weight()).unwrap_or(Amount::MAX);
+                value
+                    .checked_sub(fee)
+                    .filter(|left| *left >= dust)
+                    .ok_or(Error::TooSmall { value, fee })?
+            }
+            Pay::Exact(amount) if amount <= value && amount >= dust => amount,
+            Pay::Exact(amount) => return Err(Error::Exact { value, amount }),
+        };
         let prevout = TxOut {
             value,
             script_pubkey: self.script_pubkey(),
