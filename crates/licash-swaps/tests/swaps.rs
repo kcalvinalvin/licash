@@ -367,6 +367,51 @@ async fn a_client_locks_nothing_for_a_swap_costing_more_than_it_allows() {
 }
 
 #[tokio::test]
+async fn a_client_asks_what_a_swap_costs_and_what_it_would_refuse() {
+    let eco = Eco::new(60).await;
+    let quote =
+        |from, to, amount, limits| eco.client.swap_quote(PROVIDER, from, to, amount, limits);
+    let (fee, _) = costs(20);
+    let quoted = quote(A, B, 20, SwapLimits::usual(20)).await.unwrap();
+    assert_eq!(quoted.fee, fee);
+    assert_eq!(
+        (quoted.info.min, quoted.info.margin),
+        (CONFIG.min, CONFIG.margin)
+    );
+    assert!(quoted.info.hub(&eco.address(B)).is_some());
+
+    // What a swap refuses: below its least, beyond what it holds at B,
+    // the other way, at one hub, nothing, and more than allowed.
+    let cheaper = SwapLimits {
+        fee: fee - 1,
+        margin: CONFIG.margin,
+    };
+    let sooner = SwapLimits {
+        fee,
+        margin: CONFIG.margin - 1,
+    };
+    let usual = SwapLimits::usual(10);
+    for (from, to, amount, limits) in [
+        (A, B, 4, usual),
+        (A, B, 60, usual),
+        (B, A, 10, usual),
+        (A, A, 10, usual),
+        (A, B, 0, usual),
+        (A, B, 20, cheaper),
+        (A, B, 20, sooner),
+    ] {
+        let e = quote(from, to, amount, limits).await.unwrap_err();
+        assert!(matches!(e, Error::Invalid(_)), "{e}");
+    }
+    let unknown = quote(A, "http://c.test", 10, usual).await;
+    assert!(matches!(unknown, Err(Error::UnknownHub(_))), "{unknown:?}");
+    // Asking locked and recorded nothing.
+    assert!(eco.client.swaps().unwrap().is_empty());
+    assert_eq!(held(&eco.client, A), 100);
+    assert!(eco.provider().records(10).unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn the_provider_declines_locks_that_do_not_pay_it_or_leave_it_no_room() {
     let eco = Eco::new(30).await;
     let provider = eco.provider();

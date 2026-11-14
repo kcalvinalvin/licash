@@ -12,7 +12,7 @@
 use licash::spend::{lock_hash, ProposalId};
 use licash_api::{
     swaps::{self, State as Theirs},
-    Code,
+    Code, Info,
 };
 use rand_core::{OsRng, RngCore};
 use rusqlite::{params, OptionalExtension, Row};
@@ -48,6 +48,15 @@ impl SwapLimits {
             margin: 24,
         }
     }
+}
+
+/// What a provider asks for a swap ([`Wallet::swap_quote`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SwapQuote {
+    /// What it said of itself.
+    pub info: swaps::Info,
+    /// Its fee on the amount, which the wallet's lock pays on top.
+    pub fee: u64,
 }
 
 /// A swap of notes at hub `from` for notes at hub `to`, and where it
@@ -122,25 +131,14 @@ impl<T: Transport> Wallet<T> {
         let (_, from_info) = self.refresh(&from).await?;
         let (_, to_info) = self.refresh(&to).await?;
         let offer: swaps::Info = self.get(&provider, swaps::SWAPS_INFO).await?;
-        let (Some(_), Some(at_to)) = (offer.hub(&from_info.address), offer.hub(&to_info.address))
-        else {
-            return Err(Error::Invalid(format!(
-                "provider {provider} swaps not between {from} and {to}"
-            )));
-        };
-        let most = offer.max.min(at_to.max);
-        if amount < offer.min || amount > most {
-            return Err(Error::Invalid(format!(
-                "provider {provider} swaps {} to {most} to {to} now",
-                offer.min
-            )));
-        }
-        // A lock to a hub's own address is the hub's to settle.
-        if offer.address == from_info.address || offer.address == to_info.address {
-            return Err(Error::Invalid(format!(
-                "provider {provider} names a hub's address as its own"
-            )));
-        }
+        let fee = terms(
+            &provider,
+            &offer,
+            (&from, &from_info),
+            (&to, &to_info),
+            amount,
+            limits,
+        )?;
         let locks = from_info.locks.as_ref().ok_or_else(|| {
             Error::Invalid(format!("hub {from} follows no chain: it takes no locks"))
         })?;
@@ -153,19 +151,6 @@ impl<T: Transport> Wallet<T> {
                 .saturating_add(offer.margin)
                 .saturating_add(SWAP_WINDOW),
         );
-        let fee = offer.fee.due(amount);
-        if fee > limits.fee {
-            return Err(Error::Invalid(format!(
-                "provider {provider} asks {fee} sat to swap {amount}, more than {}",
-                limits.fee
-            )));
-        }
-        if offer.margin > limits.margin {
-            return Err(Error::Invalid(format!(
-                "provider {provider} keeps a swap's notes locked {} blocks longer, more than {}",
-                offer.margin, limits.margin
-            )));
-        }
         let mut preimage = [0; 32];
         OsRng.fill_bytes(&mut preimage);
         let hash = lock_hash(&preimage);
@@ -411,6 +396,37 @@ impl<T: Transport> Wallet<T> {
         record.ok_or_else(|| Error::UnknownPayment(hex::encode(hash)))
     }
 
+    /// What the provider at `provider` asks to swap `amount` from hub
+    /// `from` to hub `to`, both added, as they last said of themselves;
+    /// refused as [`Error::Invalid`] if it swaps not between them, or not
+    /// that amount now, or asks more than `limits`. Nothing is recorded or
+    /// locked: [`Wallet::swap`] checks it again with what the hubs say then.
+    pub async fn swap_quote(
+        &self,
+        provider: &str,
+        from: &str,
+        to: &str,
+        amount: u64,
+        limits: SwapLimits,
+    ) -> Result<SwapQuote, Error> {
+        let provider = hub_url(provider)?;
+        let (from, to) = (hub_url(from)?, hub_url(to)?);
+        let ((from_hub, from_info), (to_hub, to_info)) = (self.hub(&from)?, self.hub(&to)?);
+        if from_hub == to_hub {
+            return Err(Error::Invalid("a swap is between two hubs".into()));
+        }
+        let info: swaps::Info = self.get(&provider, swaps::SWAPS_INFO).await?;
+        let fee = terms(
+            &provider,
+            &info,
+            (&from, &from_info),
+            (&to, &to_info),
+            amount,
+            limits,
+        )?;
+        Ok(SwapQuote { info, fee })
+    }
+
     /// The swaps made, newest first.
     pub fn swaps(&self) -> Result<Vec<Swap>, Error> {
         self.store.read(|c| {
@@ -440,6 +456,55 @@ impl<T: Transport> Wallet<T> {
             Ok(rows.collect::<Result<_, _>>()?)
         })
     }
+}
+
+/// The provider's fee to swap `amount` from hub `from` to hub `to` on the
+/// terms it offers, unless it swaps not between them, not that amount now,
+/// or more than `limits` allow.
+fn terms(
+    provider: &str,
+    offer: &swaps::Info,
+    (from, from_info): (&str, &Info),
+    (to, to_info): (&str, &Info),
+    amount: u64,
+    limits: SwapLimits,
+) -> Result<u64, Error> {
+    if amount == 0 {
+        return Err(Error::Invalid("nothing to swap".into()));
+    }
+    let (Some(_), Some(at_to)) = (offer.hub(&from_info.address), offer.hub(&to_info.address))
+    else {
+        return Err(Error::Invalid(format!(
+            "provider {provider} swaps not between {from} and {to}"
+        )));
+    };
+    let most = offer.max.min(at_to.max);
+    if amount < offer.min || amount > most {
+        return Err(Error::Invalid(format!(
+            "provider {provider} swaps {} to {most} to {to} now",
+            offer.min
+        )));
+    }
+    // A lock to a hub's own address is the hub's to settle.
+    if offer.address == from_info.address || offer.address == to_info.address {
+        return Err(Error::Invalid(format!(
+            "provider {provider} names a hub's address as its own"
+        )));
+    }
+    let fee = offer.fee.due(amount);
+    if fee > limits.fee {
+        return Err(Error::Invalid(format!(
+            "provider {provider} asks {fee} sat to swap {amount}, more than {}",
+            limits.fee
+        )));
+    }
+    if offer.margin > limits.margin {
+        return Err(Error::Invalid(format!(
+            "provider {provider} keeps a swap's notes locked {} blocks longer, more than {}",
+            offer.margin, limits.margin
+        )));
+    }
+    Ok(fee)
 }
 
 const SWAPS: &str = "SELECT s.hash, s.provider, f.url, t.url, s.amount, s.fee,
