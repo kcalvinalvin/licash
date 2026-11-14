@@ -29,9 +29,18 @@ private val dark = darkColorScheme(
     onSurface = Mist,
     surfaceVariant = Slate,
     onSurfaceVariant = Dim,
+    primaryContainer = Color(0xFF2C3A22),
+    onPrimaryContainer = Lichen,
+    secondaryContainer = Color(0xFF213431),
+    onSecondaryContainer = Moss,
+    tertiary = Moss,
+    surfaceContainerLowest = Ink,
+    surfaceContainerLow = Color(0xFF14181B),
     surfaceContainer = Slate,
     surfaceContainerHigh = Color(0xFF20262A),
+    surfaceContainerHighest = Color(0xFF283033),
     outline = Color(0xFF39423F),
+    outlineVariant = Color(0xFF2A3230),
     error = Color(0xFFFF8A80),
 )
 
@@ -45,9 +54,18 @@ private val light = lightColorScheme(
     onSurface = Color(0xFF151916),
     surfaceVariant = Color(0xFFEAE7DF),
     onSurfaceVariant = Color(0xFF5E665F),
+    primaryContainer = Color(0xFFD9EDC4),
+    onPrimaryContainer = Color(0xFF1E3D0E),
+    secondaryContainer = Color(0xFFD3EAE4),
+    onSecondaryContainer = Color(0xFF173F38),
+    tertiary = Color(0xFF2F7F70),
+    surfaceContainerLowest = Color(0xFFFFFFFF),
+    surfaceContainerLow = Color(0xFFF1EEE7),
     surfaceContainer = Color(0xFFEDEAE2),
     surfaceContainerHigh = Color(0xFFE4E1D8),
+    surfaceContainerHighest = Color(0xFFDDDAD0),
     outline = Color(0xFFC9C5BA),
+    outlineVariant = Color(0xFFDDD9CE),
 )
 
 /** Big figures with digits of one width, so that amounts do not jump. */

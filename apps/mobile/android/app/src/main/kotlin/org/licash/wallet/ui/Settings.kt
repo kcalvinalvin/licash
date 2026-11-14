@@ -99,11 +99,17 @@ private fun HubRow(hub: Hub) {
     Column(Modifier.padding(vertical = 8.dp)) {
         Text(hub.url, style = MaterialTheme.typography.bodyLarge)
         Text(
-            "Fee ${sat(hub.feeBase)} + ${hub.feePpm} ppm · ${can.joinToString(" · ")}",
+            (listOf(fee(hub)) + can).joinToString(" · "),
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
     }
+}
+
+private fun fee(hub: Hub): String = when {
+    hub.feeBase == 0uL && hub.feePpm == 0uL -> "No fee"
+    hub.feePpm == 0uL -> "Fee ${sat(hub.feeBase)}"
+    else -> "Fee ${sat(hub.feeBase)} + ${hub.feePpm} ppm"
 }
 
 @Composable
@@ -129,7 +135,8 @@ private fun Developer(engine: Engine, ui: Ui) {
     Toggle("Developer mode", "Test networks and the light client's settings.", true) { engine.setDeveloper(false) }
     val chain = ui.chain
     Text(
-        "${ui.network.name} · block ${chain.height} · ${chain.peers} peers · " +
+        "${ui.network.name} · block ${chain.height} · ${chain.peers} " +
+            (if (chain.peers == 1L) "peer · " else "peers · ") +
             (if (chain.synced) "synced" else "syncing") + (ui.scanned?.let { " · scanned to $it" } ?: ""),
         style = MaterialTheme.typography.bodySmall,
     )

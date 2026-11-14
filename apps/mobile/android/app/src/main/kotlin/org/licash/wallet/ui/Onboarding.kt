@@ -4,7 +4,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -37,6 +38,7 @@ fun Onboarding(engine: Engine, ui: Ui) {
     var taps by remember { mutableIntStateOf(0) }
     var busy by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
+    var peers by remember { mutableStateOf(engine.prefs.peers) }
     Column(
         Modifier.fillMaxSize().padding(horizontal = 32.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
@@ -64,7 +66,7 @@ fun Onboarding(engine: Engine, ui: Ui) {
         if (ui.developer) {
             Spacer(Modifier.height(32.dp))
             Text("Network", style = MaterialTheme.typography.labelLarge)
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally)) {
                 for (network in Network.entries) {
                     FilterChip(
                         selected = ui.network == network,
@@ -73,6 +75,13 @@ fun Onboarding(engine: Engine, ui: Ui) {
                     )
                 }
             }
+            OutlinedTextField(
+                value = peers,
+                onValueChange = { peers = it },
+                modifier = Modifier.fillMaxWidth(),
+                singleLine = true,
+                label = { Text("Peers (host:port, comma separated)") },
+            )
         }
         Spacer(Modifier.weight(1f))
         error?.let { Text(it, color = MaterialTheme.colorScheme.error, textAlign = TextAlign.Center) }
@@ -84,6 +93,7 @@ fun Onboarding(engine: Engine, ui: Ui) {
             busy = true
             error = null
             scope.launch {
+                if (peers.trim() != engine.prefs.peers) engine.setChain(peers, engine.prefs.cdn)
                 engine.create().onFailure { error = explain(it) }
                 busy = false
             }

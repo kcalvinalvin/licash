@@ -49,7 +49,8 @@ private sealed interface Step {
 fun Send(engine: Engine, ui: Ui, link: String?, back: () -> Unit) {
     val scope = rememberCoroutineScope()
     val clipboard = LocalClipboard.current
-    var step by remember { mutableStateOf<Step>(Step.Looking) }
+    // Opened with a link: no camera to start.
+    var step by remember { mutableStateOf<Step>(if (link == null) Step.Looking else Step.Busy) }
     var asking by remember { mutableStateOf(false) }
 
     suspend fun taking(payment: String, trust: Boolean): Step =
@@ -140,7 +141,7 @@ private fun Paying(ui: Ui, s: Step.Paying, asking: Boolean, ask: (Boolean) -> Un
         Text(amount?.let { sat(it.toULong()) } ?: "How much?", style = Figures)
         fee?.let {
             Text(
-                "Fee up to ${sat(it)}",
+                if (it == 0uL) "No fee" else "Fee up to ${sat(it)}",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )

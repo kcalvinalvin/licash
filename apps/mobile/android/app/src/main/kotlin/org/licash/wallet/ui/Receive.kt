@@ -50,7 +50,7 @@ fun Receive(engine: Engine, back: () -> Unit) {
     var code by remember { mutableStateOf<Code?>(null) }
     var error by remember { mutableStateOf<String?>(null) }
     var asking by remember { mutableStateOf(false) }
-    var received by remember { mutableStateOf<ULong?>(null) }
+    var received by remember { mutableStateOf<String?>(null) }
     LaunchedEffect(amount) {
         engine.code(amount?.toULong())
             .onSuccess { code = it }
@@ -62,14 +62,19 @@ fun Receive(engine: Engine, back: () -> Unit) {
         onDispose { engine.eager = false }
     }
     LaunchedEffect(Unit) {
-        engine.events.collect { event -> event.received?.let { received = it } }
+        engine.events.collect { event -> if (event.received != null) received = event.text }
     }
     Column(Modifier.fillMaxSize().padding(horizontal = 24.dp)) {
         TopBar("Receive", back)
         Column(Modifier.fillMaxWidth().weight(1f), horizontalAlignment = Alignment.CenterHorizontally) {
             Spacer(Modifier.height(16.dp))
             received?.let {
-                Text("Received ${sat(it)}", style = MaterialTheme.typography.headlineSmall, color = MaterialTheme.colorScheme.primary)
+                Text(
+                    it,
+                    style = MaterialTheme.typography.headlineSmall,
+                    color = MaterialTheme.colorScheme.primary,
+                    textAlign = TextAlign.Center,
+                )
                 Spacer(Modifier.height(16.dp))
             }
             code?.let { QrCode(it.qr) }

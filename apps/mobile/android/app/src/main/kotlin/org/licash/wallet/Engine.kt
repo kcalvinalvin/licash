@@ -174,7 +174,9 @@ class Engine(context: Context) {
                     break
                 }
                 state.update { it.copy(scanned = scan.next) }
-                if (scan.found > 0u) notices.tryEmit(Event("${sat(scan.foundValue)} arrived on Bitcoin"))
+                if (scan.found > 0u) {
+                    notices.tryEmit(Event("${sat(scan.foundValue)} arrived on Bitcoin", scan.foundValue))
+                }
                 if (scan.next > scan.height) break
             }
         }
