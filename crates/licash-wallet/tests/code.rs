@@ -317,3 +317,39 @@ async fn payers_pay_at_a_hub_the_code_names_that_they_trust_and_hold_enough_at()
     let code = carol.payment_code(&[HUB.into()], false).unwrap();
     assert_eq!(code.licash.unwrap().mailbox, None);
 }
+
+#[tokio::test]
+async fn a_payer_knows_what_a_hub_charges_and_how_much_more_it_needs_there() {
+    let net = Net::new();
+    // 1 and 10% of what a payment spends.
+    net.start(
+        HUB,
+        Fee {
+            base: 1,
+            ppm: 100_000,
+        },
+    );
+    net.start(HUB2, Fee { base: 0, ppm: 0 });
+    let dir = tempfile::tempdir().unwrap();
+    let bob = wallet(&net, &dir, 2);
+    bob.add_hub(HUB).await.unwrap();
+    bob.add_hub(HUB2).await.unwrap();
+    bob.receive(&net.pay(HUB, &bob.address(), 50)).unwrap();
+    // Paying 40 spends 48 of the notes of 32, 16 and 2, its fee 1 + 5; a
+    // lock of 40 as much.
+    assert_eq!(bob.lacks(HUB, 40).unwrap(), 0);
+    assert_eq!(bob.send_fee(HUB, 40).unwrap(), 6);
+    assert_eq!(bob.lock_fee(HUB, 40).unwrap(), 6);
+    // Paying 50 spends 57 held, its fee 1 + 6: 7 more.
+    assert_eq!(bob.lacks(HUB, 50).unwrap(), 7);
+    let short = bob.send_fee(HUB, 50);
+    assert!(
+        matches!(short, Err(Error::Insufficient { .. })),
+        "{short:?}"
+    );
+    assert_eq!(bob.lacks(&format!("{HUB}/"), 50).unwrap(), 7);
+    // Holding none, and free there.
+    assert_eq!(bob.lacks(HUB2, 30).unwrap(), 30);
+    let unknown = bob.lacks("http://other.test", 1);
+    assert!(matches!(unknown, Err(Error::UnknownHub(_))), "{unknown:?}");
+}

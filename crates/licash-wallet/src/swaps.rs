@@ -55,6 +55,8 @@ impl SwapLimits {
 pub struct SwapQuote {
     /// What it said of itself.
     pub info: swaps::Info,
+    /// What it swaps: at least what was asked.
+    pub amount: u64,
     /// Its fee on the amount, which the wallet's lock pays on top.
     pub fee: u64,
 }
@@ -396,11 +398,12 @@ impl<T: Transport> Wallet<T> {
         record.ok_or_else(|| Error::UnknownPayment(hex::encode(hash)))
     }
 
-    /// What the provider at `provider` asks to swap `amount` from hub
-    /// `from` to hub `to`, both added, as they last said of themselves;
-    /// refused as [`Error::Invalid`] if it swaps not between them, or not
-    /// that amount now, or asks more than `limits`. Nothing is recorded or
-    /// locked: [`Wallet::swap`] checks it again with what the hubs say then.
+    /// What the provider at `provider` asks to swap at least `amount`
+    /// from hub `from` to hub `to`, both added, as they last said of
+    /// themselves: `amount`, or the least it swaps if more. Refused as
+    /// [`Error::Invalid`] if it swaps not between them, or not that much
+    /// now, or asks more than `limits`. Nothing is recorded or locked:
+    /// [`Wallet::swap`] checks it again with what the hubs say then.
     pub async fn swap_quote(
         &self,
         provider: &str,
@@ -411,20 +414,18 @@ impl<T: Transport> Wallet<T> {
     ) -> Result<SwapQuote, Error> {
         let provider = hub_url(provider)?;
         let (from, to) = (hub_url(from)?, hub_url(to)?);
+        if amount == 0 {
+            return Err(Error::Invalid("nothing to swap".into()));
+        }
         let ((from_hub, from_info), (to_hub, to_info)) = (self.hub(&from)?, self.hub(&to)?);
         if from_hub == to_hub {
             return Err(Error::Invalid("a swap is between two hubs".into()));
         }
         let info: swaps::Info = self.get(&provider, swaps::SWAPS_INFO).await?;
-        let fee = terms(
-            &provider,
-            &info,
-            (&from, &from_info),
-            (&to, &to_info),
-            amount,
-            limits,
-        )?;
-        Ok(SwapQuote { info, fee })
+        let amount = amount.max(info.min);
+        let from_at = (from.as_str(), &from_info);
+        let fee = terms(&provider, &info, from_at, (&to, &to_info), amount, limits)?;
+        Ok(SwapQuote { info, amount, fee })
     }
 
     /// The swaps made, newest first.

@@ -371,17 +371,22 @@ async fn a_client_asks_what_a_swap_costs_and_what_it_would_refuse() {
     let eco = Eco::new(60).await;
     let quote =
         |from, to, amount, limits| eco.client.swap_quote(PROVIDER, from, to, amount, limits);
-    let (fee, _) = costs(20);
+    let (fee, lock_fee) = costs(20);
     let quoted = quote(A, B, 20, SwapLimits::usual(20)).await.unwrap();
-    assert_eq!(quoted.fee, fee);
+    assert_eq!((quoted.amount, quoted.fee), (20, fee));
+    // A's fee on the lock that swap makes, of what the client holds now.
+    assert_eq!(eco.client.lock_fee(A, 20 + fee).unwrap(), lock_fee);
     assert_eq!(
         (quoted.info.min, quoted.info.margin),
         (CONFIG.min, CONFIG.margin)
     );
     assert!(quoted.info.hub(&eco.address(B)).is_some());
+    // Below its least: its least.
+    let least = quote(A, B, 1, SwapLimits::usual(1)).await.unwrap();
+    assert_eq!((least.amount, least.fee), (CONFIG.min, costs(CONFIG.min).0));
 
-    // What a swap refuses: below its least, beyond what it holds at B,
-    // the other way, at one hub, nothing, and more than allowed.
+    // What a swap refuses: beyond what it holds at B, the other way, at
+    // one hub, nothing, and more than allowed.
     let cheaper = SwapLimits {
         fee: fee - 1,
         margin: CONFIG.margin,
@@ -392,7 +397,6 @@ async fn a_client_asks_what_a_swap_costs_and_what_it_would_refuse() {
     };
     let usual = SwapLimits::usual(10);
     for (from, to, amount, limits) in [
-        (A, B, 4, usual),
         (A, B, 60, usual),
         (B, A, 10, usual),
         (A, A, 10, usual),

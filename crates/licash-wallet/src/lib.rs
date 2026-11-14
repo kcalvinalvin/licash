@@ -425,6 +425,45 @@ impl<T: Transport> Wallet<T> {
         })
     }
 
+    /// The fee of the hub at `url`, added, on the notes a payment of
+    /// `amount` there spends now, as it charges on all they hold: refused
+    /// as [`Error::Insufficient`] if it holds not that much in notes it
+    /// can spend together.
+    pub fn send_fee(&self, url: &str, amount: u64) -> Result<u64, Error> {
+        let (hub, info) = self.hub(&hub_url(url)?)?;
+        Ok(self.select(hub, amount, &info.fees.spend)?.1.fee)
+    }
+
+    /// [`Wallet::send_fee`] of a lock of `amount` to another than the hub.
+    pub fn lock_fee(&self, url: &str, amount: u64) -> Result<u64, Error> {
+        let (hub, info) = self.hub(&hub_url(url)?)?;
+        Ok(self.select(hub, amount, &info.fees.lock)?.1.fee)
+    }
+
+    /// What more the wallet needs at the hub at `url`, added, to pay
+    /// `amount` there, the hub's fee on what it spends on top: none if it
+    /// holds that much in notes it can spend together.
+    pub fn lacks(&self, url: &str, amount: u64) -> Result<u64, Error> {
+        let (hub, info) = self.hub(&hub_url(url)?)?;
+        let fee = info.fees.spend;
+        let available = match self.select(hub, amount, &fee) {
+            Ok(_) => return Ok(0),
+            Err(Error::Insufficient { available, .. }) => available,
+            Err(e) => return Err(e),
+        };
+        // The fee grows with what is spent: more until it is covered.
+        let mut more = 0u64;
+        for _ in 0..64 {
+            let held = available.saturating_add(more);
+            let needed = amount.saturating_add(fee.due(held));
+            if held >= needed {
+                break;
+            }
+            more = needed - available;
+        }
+        Ok(more)
+    }
+
     /// What the hub at `url` says of itself, kept: its id and info. A hub
     /// known at `url` is asked where the wallet reaches it.
     async fn refresh(&self, url: &str) -> Result<(i64, Info), Error> {
