@@ -516,6 +516,17 @@ fn a_phone_paid_on_bitcoin_moves_it_to_notes_and_pays_in_them() {
         "{logged:?}"
     );
 
+    // More than she holds: what is needed and held.
+    let held = notes(&alice);
+    let open = bob.payment_code(None).unwrap();
+    match alice.pay(open.text, Some(held + 1)) {
+        Err(LicashError::Insufficient { needed, available }) => {
+            assert_eq!((needed, available), (held + 2, held));
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(notes(&alice), held);
+
     // Bob asks for 500 with a code naming his mailbox: she pays it there.
     let asked = bob.payment_code(Some(500)).unwrap();
     let scanned = alice.scanned(asked.qr.clone()).unwrap();

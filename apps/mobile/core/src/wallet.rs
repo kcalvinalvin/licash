@@ -235,6 +235,7 @@ impl Wallet {
     /// to the payee's mailbox, or for them to receive by hand.
     pub fn pay(&self, code: String, amount: Option<u64>) -> Result<Paid, LicashError> {
         let code: PaymentCode = code.trim().parse().map_err(LicashError::invalid)?;
+        self.enough(&code, amount)?;
         let route = self.route.clone();
         let pay = licash_nostr::wallet::pay(&self.wallet, &code, amount, || Ok(route));
         let paid = self
@@ -489,6 +490,46 @@ impl Wallet {
 }
 
 impl Wallet {
+    /// Refused as more than held if the code names hubs trusted, some
+    /// holding notes, none enough to pay `amount` or what it asks and the
+    /// fee: what is needed and held at the one holding most. Holding none,
+    /// paying it says where to pay on Bitcoin instead.
+    fn enough(&self, code: &PaymentCode, amount: Option<u64>) -> Result<(), LicashError> {
+        code.check(self.wallet.network())?;
+        let (Some(licash), Some(amount)) = (&code.licash, amount.or(code.amount)) else {
+            return Ok(());
+        };
+        if code.amount.is_some_and(|asked| asked != amount)
+            || self.wallet.hub_to_pay(licash, amount)?.is_some()
+        {
+            return Ok(());
+        }
+        let held = self.wallet.balance()?;
+        let mut most: Option<(u64, u64)> = None;
+        for (url, info) in self.wallet.hubs()? {
+            if !licash
+                .hubs
+                .contains(&licash_wallet::HubId::of(&info.address))
+            {
+                continue;
+            }
+            let available = held
+                .iter()
+                .find(|b| b.hub == url)
+                .map_or(0, |b| b.available);
+            let needed = amount.saturating_add(info.fees.spend.due(amount));
+            if most.is_none_or(|(_, a)| available > a) {
+                most = Some((needed, available));
+            }
+        }
+        match most {
+            Some((needed, available)) if available > 0 => {
+                Err(LicashError::Insufficient { needed, available })
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// Unlink what can be: what is left stays linked until the next try.
     fn unlink(&self) {
         if let Err(e) = self.runtime.block_on(self.wallet.unlink()) {
