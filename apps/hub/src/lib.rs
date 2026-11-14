@@ -47,6 +47,8 @@ pub struct Services {
     pub gateway: Option<Arc<Gateway>>,
     pub deposits: Option<Arc<deposit::Gateway>>,
     pub tweaks: Option<Arc<Tweaks>>,
+    /// The Nostr relays of its wallets' mailboxes, named in its info.
+    pub relays: Vec<String>,
 }
 
 /// The API of `hub`, with the paths of its `services`.
@@ -55,6 +57,7 @@ pub fn router(hub: Arc<Hub>, services: Services) -> Router {
         gateway,
         deposits,
         tweaks,
+        ..
     } = services.clone();
     let info_of = Router::new()
         .route(licash_api::INFO, get(info))
@@ -179,6 +182,7 @@ async fn info(State((hub, services)): State<(Arc<Hub>, Services)>) -> Answer<Inf
     .await?;
     info.lightning = services.gateway.and_then(|gateway| gateway.advertise());
     info.deposits = services.deposits.map(|deposits| deposits.advertise());
+    info.relays = services.relays;
     Ok(Json(info))
 }
 

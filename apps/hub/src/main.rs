@@ -158,9 +158,40 @@ struct AnnounceArgs {
     /// The name the announcement shows.
     #[arg(long = "announce-name", env = "LICASH_HUB_ANNOUNCE_NAME")]
     announce_name: Option<String>,
+    /// A Nostr relay of its wallets' mailboxes, named in the hub's info:
+    /// where payers send its notes to their payees. Repeat it, or separate
+    /// relays with commas, for more; the `--nostr-relay` relays by default.
+    #[arg(
+        long = "mailbox-relay",
+        value_name = "URL",
+        env = "LICASH_HUB_MAILBOX_RELAYS",
+        value_delimiter = ',',
+        value_parser = relay
+    )]
+    mailbox_relays: Vec<String>,
+}
+
+/// A relay's URL, `ws://` or `wss://`.
+fn relay(url: &str) -> Result<String, String> {
+    let host = url
+        .strip_prefix("wss://")
+        .or_else(|| url.strip_prefix("ws://"));
+    match host {
+        Some(host) if !host.is_empty() => Ok(url.to_owned()),
+        _ => Err("a relay is at a ws:// or wss:// URL".into()),
+    }
 }
 
 impl AnnounceArgs {
+    /// The relays of its wallets' mailboxes.
+    fn mailboxes(&self) -> Vec<String> {
+        let relays = match self.mailbox_relays.is_empty() {
+            true => &self.nostr_relays,
+            false => &self.mailbox_relays,
+        };
+        relays.iter().filter(|r| !r.is_empty()).cloned().collect()
+    }
+
     /// The relays and the announcement's URLs and name, if it announces:
     /// with `onion`, the onion service's URL is added once it runs.
     fn announcing(self, onion: bool) -> anyhow::Result<Option<Announcing>> {
@@ -618,6 +649,7 @@ fn command(cli: Cli) -> anyhow::Result<()> {
                     None
                 }
             };
+            let relays = announce.mailboxes();
             let mut announcing = (*announce).announcing(onion)?;
             anyhow::ensure!(
                 announcing.is_none() || chain.is_some(),
@@ -666,6 +698,7 @@ fn command(cli: Cli) -> anyhow::Result<()> {
                 gateway: gateway.clone(),
                 deposits: deposits.clone(),
                 tweaks: tweaks.clone(),
+                relays,
             };
             let router = licash_hub_service::router(hub.clone(), services);
             let runtime = tokio::runtime::Runtime::new()?;
@@ -885,5 +918,32 @@ fn events(db: &Path, mut after: u64, limit: u32, follow: bool) -> anyhow::Result
         if page.is_empty() {
             std::thread::sleep(Duration::from_secs(1));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::{Cli, Command};
+
+    fn mailboxes(args: &[&str]) -> Vec<String> {
+        let cli = Cli::try_parse_from([&["licash-hub", "run"], args].concat()).unwrap();
+        match cli.command {
+            Command::Run { announce, .. } => announce.mailboxes(),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn mailboxes_are_on_the_announcement_relays_unless_named() {
+        assert!(mailboxes(&[]).is_empty());
+        let announced = ["--nostr-relay", "wss://a.example,wss://b.example"];
+        assert_eq!(
+            mailboxes(&announced),
+            ["wss://a.example", "wss://b.example"]
+        );
+        let named = [&announced[..], &["--mailbox-relay", "ws://c.example"]].concat();
+        assert_eq!(mailboxes(&named), ["ws://c.example"]);
     }
 }

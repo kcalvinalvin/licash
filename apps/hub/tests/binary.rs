@@ -112,7 +112,15 @@ fn a_hub_is_created_run_watched_and_stopped() {
     let mut running = Running(
         hub(
             &data,
-            &["run", "--listen", &listen, "--spend-fee-base", "3"],
+            &[
+                "run",
+                "--listen",
+                &listen,
+                "--spend-fee-base",
+                "3",
+                "--mailbox-relay",
+                "wss://one.example,ws://two.example",
+            ],
         )
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -127,6 +135,7 @@ fn a_hub_is_created_run_watched_and_stopped() {
     let info: licash_api::Info = serde_json::from_str(body).unwrap();
     assert_eq!(info.fees.spend.base, 3);
     assert_eq!(info.keysets().unwrap().len(), 1);
+    assert_eq!(info.relays, ["wss://one.example", "ws://two.example"]);
 
     let second = output(
         &data,
@@ -202,6 +211,12 @@ fn failures_exit_nonzero_and_log_as_asked() {
     assert!(!out.status.success());
     let out = output(&missing, &["run", "--spend-fee-ppm", "1000001"]);
     assert!(!out.status.success());
+    let out = output(
+        &missing,
+        &["run", "--mailbox-relay", "https://relay.example"],
+    );
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("ws:// or wss://"));
     // A chain URL it cannot follow, its password unshown.
     for url in [
         "ftp://user:hunter2@node:8332",
