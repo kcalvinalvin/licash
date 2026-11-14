@@ -172,12 +172,21 @@ impl Server {
                 socket.bind(at).unwrap();
                 let listener = socket.listen(64).unwrap();
                 bound.send(listener.local_addr().unwrap()).unwrap();
-                axum::serve(listener, licash_hub_service::router(hub, gateway))
-                    .with_graceful_shutdown(async {
-                        stopped.await.ok();
-                    })
-                    .await
-                    .unwrap();
+                axum::serve(
+                    listener,
+                    licash_hub_service::router(
+                        hub,
+                        licash_hub_service::Services {
+                            gateway,
+                            ..Default::default()
+                        },
+                    ),
+                )
+                .with_graceful_shutdown(async {
+                    stopped.await.ok();
+                })
+                .await
+                .unwrap();
             });
         });
         self.addr = addr.recv().unwrap();

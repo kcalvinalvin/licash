@@ -2709,10 +2709,12 @@ name = "licash-e2e"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "bitcoin",
  "hex",
  "licash",
  "licash-api",
  "licash-nostr",
+ "licash-onchain",
  "licash-transport",
  "licash-wallet",
  "rand_core 0.6.4",
@@ -2757,6 +2759,7 @@ dependencies = [
  "licash-hub-service",
  "licash-nostr",
  "licash-notify",
+ "licash-onchain",
  "licash-tor",
  "licash-wallet",
  "lightning-invoice",
@@ -2807,6 +2810,14 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "licash-onchain"
+version = "0.0.1"
+dependencies = [
+ "bitcoin",
+ "thiserror 1.0.69",
 ]
 
 [[package]]

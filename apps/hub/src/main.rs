@@ -18,7 +18,9 @@ use licash_hub_service::{
     announce::announce,
     lightning::{lnd::Lnd, Config, Gateway},
     notify::{self, Notifier},
+    tweaks::{self, Tweaks},
     watch::watch,
+    Services,
 };
 use licash_nostr::{Announcement, Route};
 use licash_notify::{Message, Priority, Target};
@@ -99,6 +101,20 @@ struct Chain {
     #[arg(long, env = "LICASH_HUB_CHAIN_POLL", default_value_t = 10,
           value_parser = clap::value_parser!(u64).range(1..))]
     chain_poll: u64,
+    /// Index the silent payment tweaks of the chain's blocks, in
+    /// `<data>/tweaks.sqlite`, and serve them to light wallets.
+    #[arg(long, env = "LICASH_HUB_TWEAKS",
+          value_parser = clap::builder::BoolishValueParser::new())]
+    tweaks: bool,
+    /// The first block to index the tweaks of, when the index is new
+    /// [default: the tip]. Delete the index to start from another.
+    #[arg(
+        long,
+        env = "LICASH_HUB_TWEAKS_FROM",
+        value_name = "HEIGHT",
+        requires = "tweaks"
+    )]
+    tweaks_from: Option<u32>,
 }
 
 impl Chain {
@@ -406,7 +422,7 @@ enum Command {
         #[command(flatten)]
         policy: PolicyArgs,
         #[command(flatten)]
-        chain: Chain,
+        chain: Box<Chain>,
         #[command(flatten)]
         notify: Notify,
         #[command(flatten)]
@@ -489,7 +505,12 @@ fn command(cli: Cli) -> anyhow::Result<()> {
             notify_kinds,
         } => {
             let policy = policy.policy();
+            let (indexing, tweaks_from) = (chain.tweaks, chain.tweaks_from);
             let chain = chain.source(&policy)?;
+            anyhow::ensure!(
+                !indexing || chain.is_some(),
+                "indexing tweaks (--tweaks) needs --chain"
+            );
             let lightning = lightning.gateway()?;
             anyhow::ensure!(
                 lightning.is_none() || chain.is_some(),
@@ -521,7 +542,19 @@ fn command(cli: Cli) -> anyhow::Result<()> {
                 }
                 None => None,
             };
-            let router = licash_hub_service::router(hub.clone(), gateway.clone());
+            let tweaks = match indexing {
+                true => {
+                    let path = cli.data.join("tweaks.sqlite");
+                    let index = Tweaks::open(&path).context("open the tweak index")?;
+                    Some(Arc::new(index))
+                }
+                false => None,
+            };
+            let services = Services {
+                gateway: gateway.clone(),
+                tweaks: tweaks.clone(),
+            };
+            let router = licash_hub_service::router(hub.clone(), services);
             let runtime = tokio::runtime::Runtime::new()?;
             let _entered = runtime.enter();
             // Served until the hub stops.
@@ -540,6 +573,7 @@ fn command(cli: Cli) -> anyhow::Result<()> {
                 notifier,
                 gateway,
                 announcing,
+                tweaks: tweaks.map(|index| (index, tweaks_from)),
             };
             let serving = serve(hub, router, listen, policy, tasks);
             runtime.block_on(serving)
@@ -572,6 +606,8 @@ struct Tasks {
     notifier: Option<Notifier>,
     gateway: Option<Arc<Gateway>>,
     announcing: Option<Announcing>,
+    /// With the first block to index if the index is new.
+    tweaks: Option<(Arc<Tweaks>, Option<u32>)>,
 }
 
 async fn serve(
@@ -586,6 +622,7 @@ async fn serve(
         notifier,
         gateway,
         announcing,
+        tweaks,
     } = tasks;
     let listener = tokio::net::TcpListener::bind(listen)
         .await
@@ -600,6 +637,13 @@ async fn serve(
         tracing::info!(targets = %targets.join(", "), "notifying");
         tokio::spawn(notifier.run(hub.clone()))
     });
+    let indexing = match (&chain, tweaks) {
+        (Some((source, network, every)), Some((index, from))) => {
+            let indexing = tweaks::index(index, source.clone(), *network, from, *every);
+            Some(tokio::spawn(indexing))
+        }
+        _ => None,
+    };
     let watching = chain
         .map(|(source, network, every)| tokio::spawn(watch(hub.clone(), source, network, every)));
     if watching.is_none() {
@@ -617,7 +661,10 @@ async fn serve(
     axum::serve(listener, router)
         .with_graceful_shutdown(shutdown())
         .await?;
-    for task in [watching, paying, announcing].into_iter().flatten() {
+    for task in [watching, indexing, paying, announcing]
+        .into_iter()
+        .flatten()
+    {
         task.abort();
     }
     if let (Some(notifying), Some(notifier)) = (notifying, notifier) {

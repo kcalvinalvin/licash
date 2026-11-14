@@ -27,6 +27,11 @@ LND's certificate. The gateway keeps its invoices in
 `<data>/lightning.sqlite`: back it up with `hub.sqlite`. An alert says when
 LND's channels can no longer pay or receive the most it takes.
 
+With `--tweaks` (and `--chain`), the hub indexes the silent payment
+(BIP352) tweaks of the chain's blocks from `--tweaks-from` (by default, the
+tip at the first start) in `<data>/tweaks.sqlite`, and serves them to light
+wallets at `/v1/chain/tweaks`. Deleting the file only loses the index.
+
 With `--nostr-relay URL --announce-url URL` (and `--chain`), the hub
 announces itself on Nostr relays for wallets to discover, under a key
 derived from its seed that `/v1/info` names.

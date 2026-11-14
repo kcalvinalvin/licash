@@ -15,6 +15,7 @@ licash-api = { path = "../crates/licash-api" }
 licash-hub = { path = "../crates/licash-hub" }
 licash-swaps = { path = "../crates/licash-swaps" }
 licash-wallet = { path = "../crates/licash-wallet" }
+licash-onchain = { path = "../crates/licash-onchain" }
 licash-chain-client = { path = "chain-client" }
 licash-nostr = { path = "nostr" }
 licash-notify = { path = "notify" }

@@ -1,28 +1,33 @@
 //! The hub service: a [`Hub`] behind the v1 HTTP API of [`licash_api`],
-//! and its Lightning gateway if it runs one.
+//! and the [`Services`] it runs beside it.
 
 pub mod announce;
 pub mod lightning;
 pub mod notify;
+pub mod tweaks;
 pub mod watch;
 
 use std::sync::Arc;
 
 use axum::{
-    extract::{rejection::JsonRejection, DefaultBodyLimit, Path, State},
-    http::StatusCode,
+    extract::{
+        rejection::{JsonRejection, QueryRejection},
+        DefaultBodyLimit, Path, Query, State,
+    },
+    http::{header, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
 use licash_api::{
     Check, Checked, Code, Info, Issued, Lock, LockState, Locked, Offer, Offered, Pay, Paying,
-    Problem, Receive, ReceiveStatus, Receiving, Refund, Release, Released, Settle, Unlink,
-    Unlinked,
+    Problem, Receive, ReceiveStatus, Receiving, Refund, Release, Released, Settle, TweaksQuery,
+    Unlink, Unlinked,
 };
 use licash_hub::{Error, Hub, Settled};
 use lightning::Gateway;
 use tower_http::trace::TraceLayer;
+use tweaks::Tweaks;
 
 /// The largest request body: a spend of the most inputs and outputs the
 /// protocol allows fits well within it.
@@ -31,11 +36,23 @@ pub const BODY_LIMIT: usize = 1 << 20;
 /// `ok`, or 503 once the hub halted.
 pub const HEALTH: &str = "/health";
 
-/// The API of `hub`, with the Lightning paths of `gateway` if given.
-pub fn router(hub: Arc<Hub>, gateway: Option<Arc<Gateway>>) -> Router {
+/// Blocks below the newest indexed from which tweaks are answered as
+/// never changing: no reorganization reaches so deep.
+pub const IMMUTABLE_DEPTH: u32 = 144;
+
+/// What a hub serves beside its ledger, each if it runs it.
+#[derive(Clone, Default)]
+pub struct Services {
+    pub gateway: Option<Arc<Gateway>>,
+    pub tweaks: Option<Arc<Tweaks>>,
+}
+
+/// The API of `hub`, with the paths of its `services`.
+pub fn router(hub: Arc<Hub>, services: Services) -> Router {
+    let Services { gateway, tweaks } = services.clone();
     let info_of = Router::new()
         .route(licash_api::INFO, get(info))
-        .with_state((hub.clone(), gateway.clone()));
+        .with_state((hub.clone(), services));
     let mut api = Router::new()
         .route(licash_api::OFFER, post(offer))
         .route(licash_api::RELEASE, post(release))
@@ -55,6 +72,13 @@ pub fn router(hub: Arc<Hub>, gateway: Option<Arc<Gateway>>) -> Router {
                 .route(licash_api::LN_RECEIVE, post(ln_receive))
                 .route(licash_api::LN_RECEIVE_STATE, get(ln_receive_state))
                 .with_state(gateway),
+        );
+    }
+    if let Some(index) = tweaks {
+        api = api.merge(
+            Router::new()
+                .route(licash_api::TWEAKS, get(chain_tweaks))
+                .with_state(index),
         );
     }
     api.layer(DefaultBodyLimit::max(BODY_LIMIT))
@@ -124,9 +148,22 @@ async fn health(State(hub): State<Arc<Hub>>) -> Result<&'static str, Failure> {
     Ok("ok")
 }
 
-async fn info(State((hub, gateway)): State<(Arc<Hub>, Option<Arc<Gateway>>)>) -> Answer<Info> {
-    let Json(mut info) = blocking(hub, |hub| Ok(hub.advertise()?)).await?;
-    info.lightning = gateway.and_then(|gateway| gateway.advertise());
+async fn info(State((hub, services)): State<(Arc<Hub>, Services)>) -> Answer<Info> {
+    let tweaks = services.tweaks.clone();
+    let Json(mut info) = blocking(hub, move |hub| {
+        let mut info = hub.advertise()?;
+        info.tweaks = match tweaks.map(|tweaks| tweaks.first()) {
+            Some(Ok(first)) => first,
+            Some(Err(e)) => {
+                tracing::error!("reading the tweak index: {e:#}");
+                None
+            }
+            None => None,
+        };
+        Ok(info)
+    })
+    .await?;
+    info.lightning = services.gateway.and_then(|gateway| gateway.advertise());
     Ok(Json(info))
 }
 
@@ -244,6 +281,54 @@ async fn ln_receive(
 ) -> Answer<Receiving> {
     let Json(body) = body?;
     Ok(Json(gateway.receive(&body).await?))
+}
+
+/// The tweaks of the blocks asked for, answered as never changing once
+/// [`IMMUTABLE_DEPTH`] below the newest indexed, so that a cache in front
+/// of the hub serves the same ranges to every wallet.
+async fn chain_tweaks(
+    State(tweaks): State<Arc<Tweaks>>,
+    query: Result<Query<TweaksQuery>, QueryRejection>,
+) -> Result<Response, Failure> {
+    let Query(TweaksQuery { from, count }) = query.map_err(|e| Problem::invalid(e.body_text()))?;
+    if !(1..=licash_api::MAX_TWEAK_BLOCKS).contains(&count) {
+        return Err(Problem::invalid(format!(
+            "count: 1 to {} blocks",
+            licash_api::MAX_TWEAK_BLOCKS
+        ))
+        .into());
+    }
+    let unavailable = |e: anyhow::Error| {
+        tracing::error!("reading the tweak index: {e:#}");
+        Failure(Problem::new(Code::Unavailable, "the hub cannot serve now"))
+    };
+    let read = tokio::task::spawn_blocking(move || {
+        let first = tweaks.first()?;
+        let top = tweaks.top()?.map(|(height, _)| height);
+        anyhow::Ok((first, top, tweaks.blocks(from, count)?))
+    });
+    let (first, top, blocks) = read
+        .await
+        .map_err(|e| unavailable(e.into()))?
+        .map_err(unavailable)?;
+    match first {
+        None => {
+            return Err(Problem::new(Code::Unavailable, "no tweaks indexed yet").into());
+        }
+        Some(first) if from < first => {
+            return Err(
+                Problem::invalid(format!("tweaks are served from block {first} on")).into(),
+            );
+        }
+        Some(_) => {}
+    }
+    let last = from.saturating_add(count - 1);
+    let settled = top.is_some_and(|top| last.saturating_add(IMMUTABLE_DEPTH) <= top);
+    let cache = match settled && blocks.len() == count as usize {
+        true => "public, max-age=31536000, immutable",
+        false => "no-cache",
+    };
+    Ok(([(header::CACHE_CONTROL, cache)], Json(blocks)).into_response())
 }
 
 async fn ln_receive_state(

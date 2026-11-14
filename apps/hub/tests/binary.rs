@@ -218,6 +218,11 @@ fn failures_exit_nonzero_and_log_as_asked() {
     let poll = ["run", "--chain", "http://node:8332", "--chain-poll", "120"];
     let out = output(&missing, &poll);
     assert!(String::from_utf8_lossy(&out.stderr).contains("--max-lag"));
+    // Tweaks are of the chain it follows.
+    let out = output(&missing, &["run", "--tweaks"]);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--tweaks) needs --chain"));
+    let out = output(&missing, &["run", "--tweaks-from", "1"]);
+    assert_eq!(out.status.code(), Some(2));
     // An announcement needs relays, URLs wallets can use, and the chain
     // that names its network.
     let relay = ["--nostr-relay", "ws://127.0.0.1:1"];

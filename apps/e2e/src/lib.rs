@@ -243,6 +243,25 @@ impl Eco {
         self.rpc("/wallet/miner", method, params).await
     }
 
+    /// Call Bitcoin Core's node.
+    pub async fn core(&self, method: &str, params: Value) -> anyhow::Result<Value> {
+        self.rpc("", method, params).await
+    }
+
+    /// Pay `sat` to `address` from the miner's wallet, unconfirmed: the
+    /// transaction's id.
+    pub async fn send_to(&self, address: &str, sat: u64) -> anyhow::Result<String> {
+        let btc = sat as f64 / 1e8;
+        let txid = self.miner("sendtoaddress", json!([address, btc])).await?;
+        Ok(txid.as_str().context("a txid")?.to_owned())
+    }
+
+    /// A new address of the miner's wallet, of `kind`, such as `bech32m`.
+    pub async fn miner_address(&self, kind: &str) -> anyhow::Result<String> {
+        let address = self.miner("getnewaddress", json!(["", kind])).await?;
+        Ok(address.as_str().context("an address")?.to_owned())
+    }
+
     pub async fn height(&self) -> anyhow::Result<u32> {
         let count = self.rpc("", "getblockcount", json!([])).await?;
         Ok(count.as_u64().context("a block count")? as u32)

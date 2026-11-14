@@ -45,6 +45,7 @@ x-hub: &hub
     LICASH_HUB_CHAIN: http://licash:licash@bitcoind:18443
     LICASH_HUB_NETWORK: regtest
     LICASH_HUB_CHAIN_POLL: "1"
+    LICASH_HUB_TWEAKS: "true"
     LICASH_HUB_LND_MACAROON: /lnd/data/chain/bitcoin/regtest/admin.macaroon
     LICASH_HUB_LND_CERT: /lnd/tls.cert
     LICASH_HUB_NOSTR_RELAYS: ws://relay:8080

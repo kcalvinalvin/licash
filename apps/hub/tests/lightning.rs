@@ -84,7 +84,13 @@ impl Net {
         let gateway = Gateway::open(hub.clone(), node.clone(), config(), &path).unwrap();
         let gateway = Arc::new(gateway);
         let net = Self {
-            app: licash_hub_service::router(hub.clone(), Some(gateway.clone())),
+            app: licash_hub_service::router(
+                hub.clone(),
+                licash_hub_service::Services {
+                    gateway: Some(gateway.clone()),
+                    ..Default::default()
+                },
+            ),
             hub,
             node,
             gateway,

@@ -54,6 +54,11 @@ pub const LN_PAY: &str = "/v1/ln/pay";
 pub const LN_RECEIVE: &str = "/v1/ln/receive";
 /// The path of [`ln_receive_state`], as a route.
 pub const LN_RECEIVE_STATE: &str = "/v1/ln/receive/{hash}";
+/// The [`BlockTweaks`] of the blocks a [`TweaksQuery`] names, as a list,
+/// up to the newest the hub indexed.
+pub const TWEAKS: &str = "/v1/chain/tweaks";
+/// Most blocks a [`TweaksQuery`] names.
+pub const MAX_TWEAK_BLOCKS: u32 = 144;
 
 /// Where a receipt over Lightning of `hash` stands.
 pub fn ln_receive_state(hash: &[u8; 32]) -> String {
@@ -185,6 +190,10 @@ pub struct Info {
     /// announcement of its URL by another key is not the hub's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nostr: Option<String>,
+    /// The first block whose silent payment tweaks the hub serves, at
+    /// [`TWEAKS`], if it serves any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tweaks: Option<u32>,
 }
 
 impl Info {
@@ -196,6 +205,7 @@ impl Info {
             locks,
             lightning: None,
             nostr: None,
+            tweaks: None,
         }
     }
 
@@ -205,6 +215,27 @@ impl Info {
             .map(|k| Keyset::from_bytes(&k.0).map_err(Problem::from))
             .collect()
     }
+}
+
+/// The blocks of [`TWEAKS`]: `count` from height `from`, at most
+/// [`MAX_TWEAK_BLOCKS`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TweaksQuery {
+    pub from: u32,
+    pub count: u32,
+}
+
+/// A block's silent payment tweaks (BIP352): one for each of its
+/// transactions that may pay a silent payment, in the block's order. A
+/// light wallet derives from each the output that would pay it, and looks
+/// for it in the block's compact filter.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlockTweaks {
+    pub height: u32,
+    /// The block's hash, as Bitcoin shows it.
+    pub hash: String,
+    /// Each a compressed point.
+    pub tweaks: Vec<Hex>,
 }
 
 /// Ask for a grant on `proposal`, spending `notes`.
