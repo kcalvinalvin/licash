@@ -247,6 +247,25 @@ impl Source {
         Ok(block)
     }
 
+    /// The basic compact filter (BIP158) of the block of `hash`, if the
+    /// source serves them: a node indexing them (`-blockfilterindex`), as
+    /// Esplora does not. A node still building its index fails.
+    pub async fn filter(&self, hash: &BlockHash) -> anyhow::Result<Option<Vec<u8>>> {
+        #[derive(Deserialize)]
+        struct Filter {
+            filter: String,
+        }
+        if let Kind::Esplora { .. } = &self.kind {
+            return Ok(None);
+        }
+        let params = json!([hash.to_string(), "basic"]);
+        match self.call::<Filter>("getblockfilter", params).await {
+            Ok(found) => Ok(Some(hex::decode(found.filter.trim())?)),
+            Err(e) if format!("{e:#}").contains("Index is not enabled") => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     /// The scripts that the transactions of `block` paying a taproot
     /// output spend, by input, in the block's order, and None for the
     /// others, its coinbase among them: what a silent payment's tweak is

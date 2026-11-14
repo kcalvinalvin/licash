@@ -180,6 +180,17 @@ async fn rpc(
             }
             None => rpc_error(-5, "Block not found"),
         },
+        "getblockfilter" if params[1] == json!("basic") => match by_hash(0) {
+            Some(block) => {
+                let spent = |o: &OutPoint| {
+                    let found = chain.outputs.get(o).map(|t| t.script_pubkey.clone());
+                    found.ok_or(bitcoin::bip158::Error::UtxoMissing(*o))
+                };
+                let filter = bitcoin::bip158::BlockFilter::new_script_filter(block, spent).unwrap();
+                rpc_reply(json!({"filter": hex::encode(filter.content), "header": "00"}))
+            }
+            None => rpc_error(-5, "Block not found"),
+        },
         "sendrawtransaction" => match send(&chain, params[0].as_str().unwrap_or_default()) {
             Ok(txid) => rpc_reply(json!(txid)),
             Err((code, message)) => rpc_error(code, message),
@@ -210,6 +221,18 @@ async fn rpc(
             rpc_reply(json!({"success": true, "unspents": found}))
         }
         _ => rpc_error(-32601, "Method not found"),
+    }
+}
+
+/// A node without a compact filter index.
+async fn unindexed(
+    state: State<Arc<Chain>>,
+    headers: HeaderMap,
+    Json(call): Json<Value>,
+) -> Response {
+    match call["method"].as_str() {
+        Some("getblockfilter") => rpc_error(-1, "Index is not enabled for filtertype basic"),
+        _ => rpc(state, headers, Json(call)).await,
     }
 }
 
@@ -408,6 +431,7 @@ async fn serve(
     });
     let app = Router::new()
         .route("/", post(rpc))
+        .route("/unindexed", post(unindexed))
         .route("/api/blocks/tip/height", get(esplora_tip))
         .route("/api/block-height/{height}", get(esplora_hash))
         .route("/api/block/{hash}/{part}", get(esplora_block))
@@ -459,6 +483,33 @@ async fn a_node_and_esplora_read_the_same_chain() {
         commitments.push(checkpoint.commitment());
     }
     assert_eq!(commitments[0], commitments[1]);
+}
+
+#[tokio::test]
+async fn a_node_indexing_them_serves_compact_filters_esplora_none() {
+    let blocks = mine(3);
+    let address = serve(blocks.clone(), PASSWORD, None).await;
+    let [node, esplora] = sources(&address);
+    let unindexed: Source = format!("http://user:p%40ss%20w@{address}/unindexed")
+        .parse()
+        .unwrap();
+    let elsewhere = ScriptBuf::from_bytes(vec![0x51; 34]);
+    for block in &blocks {
+        let hash = block.block_hash();
+        let filter = node.filter(&hash).await.unwrap().unwrap();
+        let filter = bitcoin::bip158::BlockFilter::new(&filter);
+        let paid = block.txdata[0].output[0].script_pubkey.as_bytes();
+        assert!(filter.match_any(&hash, std::iter::once(paid)).unwrap());
+        let other = std::iter::once(elsewhere.as_bytes());
+        assert!(!filter.match_any(&hash, other).unwrap());
+        assert_eq!(esplora.filter(&hash).await.unwrap(), None);
+        assert_eq!(unindexed.filter(&hash).await.unwrap(), None);
+    }
+    let unknown = node.filter(&BlockHash::all_zeros()).await.unwrap_err();
+    assert!(
+        format!("{unknown:#}").contains("Block not found"),
+        "{unknown:#}"
+    );
 }
 
 #[tokio::test]
