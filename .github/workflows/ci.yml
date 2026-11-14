@@ -102,6 +102,11 @@ jobs:
       - name: App
         working-directory: apps/mobile/android
         run: ./gradlew --no-daemon assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app-debug
+          path: apps/mobile/android/app/build/outputs/apk/debug/app-debug.apk
+          retention-days: 3
   e2e:
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -119,6 +124,41 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: e2e-logs
+          path: apps/target/e2e/
+  app-e2e:
+    needs: android
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps
+      - uses: actions/download-artifact@v4
+        with:
+          name: app-debug
+          path: ${{ runner.temp }}/app
+      - name: KVM for the emulator
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: The app on an emulator, on the regtest ecosystem
+        uses: reactivecircus/android-emulator-runner@v2
+        env:
+          LICASH_E2E_APP: ${{ runner.temp }}/app/app-debug.apk
+        with:
+          api-level: 34
+          arch: x86_64
+          disable-animations: true
+          script: apps/e2e/run.sh the_app_is
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-e2e-logs
           path: apps/target/e2e/
   regtest:
     runs-on: ubuntu-latest
