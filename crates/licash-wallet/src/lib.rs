@@ -21,6 +21,7 @@
 //! over TCP or Tor, or a test. Its seed alone does not restore its notes:
 //! back up its file.
 
+mod code;
 mod coins;
 mod deposits;
 mod lightning;
@@ -47,6 +48,7 @@ use rand_core::{OsRng, RngCore};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{de::DeserializeOwned, Serialize};
 
+pub use code::{HubId, LicashCode, PaymentCode, MAX_HUBS};
 pub use coins::MAX_INPUTS;
 pub use deposits::{Deposit, DepositState, DepositTerms};
 pub use lightning::{Invoice, InvoiceState};
@@ -236,6 +238,7 @@ impl Step {
 pub struct Wallet<T> {
     store: Store,
     owner: OwnerKeys,
+    keys: code::CodeKeys,
     network: ChainProfile,
     transport: T,
 }
@@ -282,10 +285,12 @@ impl<T: Transport> Wallet<T> {
     ) -> Result<Self, Error> {
         let owner = OwnerKeys::from_seed(seed)?;
         let address = owner.address().to_bytes();
+        let keys = code::CodeKeys::from_seed(seed, network)?;
         let store = Store::create(path, keep.then_some(seed), &address, network.name())?;
         Ok(Self {
             store,
             owner,
+            keys,
             network,
             transport,
         })
@@ -317,6 +322,7 @@ impl<T: Transport> Wallet<T> {
             .map_err(|_| Error::Setup(format!("the wallet's network {}", kept.network)))?;
         Ok(Self {
             store,
+            keys: code::CodeKeys::from_seed(seed, network)?,
             owner,
             network,
             transport,

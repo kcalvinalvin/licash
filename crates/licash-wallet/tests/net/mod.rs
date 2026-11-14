@@ -61,6 +61,8 @@ pub struct Net {
     faults: Mutex<Vec<(&'static str, Fault)>>,
     /// Fees the hubs advertise instead of their own.
     pub stale: Mutex<Option<Fee>>,
+    /// The mailbox relays the hubs name.
+    pub relays: Mutex<Vec<String>>,
     dirs: Mutex<Vec<tempfile::TempDir>>,
 }
 
@@ -204,6 +206,7 @@ impl Net {
         if let Some(stale) = *self.stale.lock().unwrap() {
             info.fees.spend = stale;
         }
+        info.relays = self.relays.lock().unwrap().clone();
         Ok(serde_json::to_vec(&info).unwrap())
     }
 }
