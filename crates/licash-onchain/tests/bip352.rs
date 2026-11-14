@@ -409,3 +409,35 @@ fn a_payment_pays_one_of_the_candidates_of_its_tweak() {
         );
     }
 }
+
+#[test]
+fn fallback_outputs_are_spent_with_the_spend_secret_and_linked_by_the_scan_secret() {
+    let secp = Secp256k1::new();
+    let keys = Keys::new(secret(1), secret(2), NetworkKind::Test);
+    let scanner = keys.scanner([]);
+    let first = scanner.fallback(0).unwrap();
+    // A fixed derivation: a wallet must find again what it handed out.
+    assert_eq!(
+        first.output.to_string(),
+        "f26ceca6b70be4172bae5e9f0a11f6eb6e12e9c1236c13a84b265f44c4fe929b"
+    );
+    assert_eq!(scanner.fallback(0).unwrap(), first);
+    assert_eq!(first.label, None);
+    let outputs: BTreeSet<XOnlyPublicKey> = (0..20)
+        .map(|i| scanner.fallback(i).unwrap().output)
+        .collect();
+    assert_eq!(outputs.len(), 20);
+    assert!(!outputs.contains(&keys.address().spend.x_only_public_key().0));
+    // Each signs with its spend secret on the key path, whatever its parity.
+    for i in 0..20 {
+        let found = scanner.fallback(i).unwrap();
+        let keypair = Keypair::from_secret_key(&secp, &keys.spend_secret(&found).unwrap());
+        let message = Message::from_digest([i as u8; 32]);
+        let signature = secp.sign_schnorr_no_aux_rand(&message, &keypair);
+        secp.verify_schnorr(&signature, &message, &found.output)
+            .unwrap();
+    }
+    // Another scan secret over the same spend key: other outputs.
+    let other = Keys::new(secret(3), secret(2), NetworkKind::Test).scanner([]);
+    assert!(!outputs.contains(&other.fallback(0).unwrap().output));
+}

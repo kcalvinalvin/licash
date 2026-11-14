@@ -1,8 +1,10 @@
 //! Payment codes: one text, or QR code, a payer scans to pay a wallet in
 //! notes or on Bitcoin, whichever it can.
 //!
-//! A code is a BIP321 URI, `bitcoin:?sp=<silent payment address>&licash=<code>`,
-//! which any wallet that pays silent payments can pay on Bitcoin. Its
+//! A code is a BIP321 URI,
+//! `bitcoin:<address>?sp=<silent payment address>&licash=<code>`, which any
+//! wallet can pay on Bitcoin: at the silent payment address if it pays
+//! them, else at the address, the wallet's fallback address. Its
 //! `licash` parameter is bech32m (BIP350), at most 1023 characters, under
 //! `licash` on mainnet and `tlicash` on the other networks, of version 0:
 //! the network's byte, the 99 bytes of the wallet's [`Address`], then
@@ -376,8 +378,10 @@ impl CodeKeys {
 impl<T: Transport> Wallet<T> {
     /// The code payers pay this wallet with: at the hubs of `hubs`, which
     /// it trusts, preferred first, each once, and its
-    /// mailbox if one of them names relays; on Bitcoin to its silent
-    /// payment address if `silent`, for wallets that scan for it.
+    /// mailbox if one of them names relays; on Bitcoin if `silent`, for
+    /// wallets that scan for it: at its silent payment address, and at a
+    /// fallback address for payers of no silent payments, handed out and
+    /// watched from then on, the next once it is paid.
     pub fn payment_code(&self, hubs: &[String], silent: bool) -> Result<PaymentCode, Error> {
         let trusted = self.hubs()?;
         let mut ids = Vec::new();
@@ -395,8 +399,12 @@ impl<T: Transport> Wallet<T> {
             relays |= !info.relays.is_empty();
         }
         let mailbox = relays.then(|| self.keys.mailbox.x_only_public_key(&Secp256k1::new()).0);
+        let address = match silent {
+            true => Some(self.fallback_address()?.as_unchecked().clone()),
+            false => None,
+        };
         Ok(PaymentCode {
-            address: None,
+            address,
             amount: None,
             silent: silent.then(|| self.keys.silent.address()),
             licash: Some(LicashCode {

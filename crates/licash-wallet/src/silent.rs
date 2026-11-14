@@ -11,6 +11,12 @@
 //! height are refused. Each batch of blocks is recorded whole, and a
 //! reorganization drops what the blocks it replaced held.
 //!
+//! Payers of no silent payments pay a fallback address instead, a plain
+//! taproot address ([`Scanner::fallback`]) a payment code holds once
+//! [`Wallet::payment_code`] hands one out: from then on those handed out,
+//! and [`FALLBACK_GAP`] after, are watched in every block, and the next is
+//! handed out once one is paid. Their coins are the address's like any.
+//!
 //! [`Wallet::spend_silent`] spends the coins found, change to the wallet's
 //! change address: a transaction for the application to broadcast.
 //! [`Wallet::deposit_silent`] spends them on a deposit for a hub's notes.
@@ -41,6 +47,10 @@ use crate::{
 
 /// The blocks looked in that are kept, to notice reorganizations that deep.
 const KEEP_BLOCKS: u32 = 288;
+
+/// The fallback addresses watched past the highest handed out: a copy of
+/// the wallet may have handed them out.
+const FALLBACK_GAP: u32 = 20;
 
 /// What the wallet reads of Bitcoin's best chain to find its silent
 /// payments: a light client's view of it, or a full node's.
@@ -98,6 +108,52 @@ struct Batch {
     blocks: Vec<(u32, BlockHash)>,
     found: Vec<(OutPoint, u64, Found, u32)>,
     spent: Vec<(OutPoint, Txid, u32)>,
+}
+
+/// What finds the outputs paying the wallet: its silent payment address's,
+/// with each block's tweaks, and its fallback addresses'.
+struct Finder {
+    scanner: Scanner,
+    /// The fallback outputs watched, by key.
+    fallbacks: HashMap<XOnlyPublicKey, Found>,
+}
+
+impl Finder {
+    /// The fallback output `script` pays, if one.
+    fn fallback(&self, script: &ScriptBuf) -> Option<&Found> {
+        let key = script.is_p2tr().then(|| &script.as_bytes()[2..])?;
+        self.fallbacks.get(&XOnlyPublicKey::from_slice(key).ok()?)
+    }
+}
+
+/// The fallback outputs watched, by key, and the index to hand out next:
+/// past every one paid, never before the highest handed out. None watched
+/// until one is handed out.
+fn fallbacks(
+    c: &rusqlite::Connection,
+    scanner: &Scanner,
+) -> Result<(HashMap<XOnlyPublicKey, Found>, u32), Error> {
+    let shown: Option<u32> = c
+        .query_row("SELECT shown FROM silent_fallback", [], |r| r.get(0))
+        .optional()?;
+    let Some(shown) = shown else {
+        return Ok((HashMap::new(), 0));
+    };
+    let paid: HashSet<[u8; 32]> = {
+        let mut stmt = c.prepare("SELECT output FROM silent_coins")?;
+        let rows = stmt.query_map([], |r| r.get(0))?;
+        rows.collect::<Result<_, _>>()?
+    };
+    let mut watched = HashMap::new();
+    let mut next = shown;
+    for index in 0..=shown.saturating_add(FALLBACK_GAP) {
+        let found = scanner.fallback(index).map_err(invalid)?;
+        if paid.contains(&found.output.serialize()) {
+            next = next.max(index.saturating_add(1));
+        }
+        watched.insert(found.output, found);
+    }
+    Ok((watched, next))
 }
 
 /// A coin the wallet holds, as a spend reads it.
@@ -276,7 +332,11 @@ impl<T: Transport> Wallet<T> {
             )));
         }
         let end = height.min(next.saturating_add(max - 1));
+        // Read after the chain's height: an address handed out meanwhile is
+        // paid in a later block than these.
         let scanner = self.keys.silent.scanner([]);
+        let (fallbacks, _) = self.store.read(|c| fallbacks(c, &scanner))?;
+        let finder = Finder { scanner, fallbacks };
         let mut coins = self.held_outputs()?;
         while scanned.next <= end {
             let count = (end - scanned.next + 1).min(MAX_TWEAK_BLOCKS);
@@ -289,7 +349,7 @@ impl<T: Transport> Wallet<T> {
             for tweaks in blocks.into_iter().take(count as usize) {
                 let at = scanned.next + batch.blocks.len() as u32;
                 let fetched = self
-                    .look(&url, chain, &scanner, at, &tweaks, &mut coins, &mut batch)
+                    .look(&url, chain, &finder, at, &tweaks, &mut coins, &mut batch)
                     .await?;
                 scanned.fetched += u32::from(fetched);
             }
@@ -335,7 +395,7 @@ impl<T: Transport> Wallet<T> {
         &self,
         url: &str,
         chain: &impl Blocks,
-        scanner: &Scanner,
+        finder: &Finder,
         at: u32,
         tweaks: &BlockTweaks,
         coins: &mut HashMap<OutPoint, XOnlyPublicKey>,
@@ -361,12 +421,15 @@ impl<T: Transport> Wallet<T> {
             .map(|t| PublicKey::from_slice(&t.0))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| unavailable(url, format!("a tweak of block {at}: {e}")))?;
-        let candidates: Vec<Vec<XOnlyPublicKey>> =
-            points.iter().map(|p| scanner.candidates(p)).collect();
+        let candidates: Vec<Vec<XOnlyPublicKey>> = points
+            .iter()
+            .map(|p| finder.scanner.candidates(p))
+            .collect();
         let scripts: Vec<ScriptBuf> = candidates
             .iter()
             .flatten()
             .chain(coins.values())
+            .chain(finder.fallbacks.keys())
             .map(|key| p2tr(*key))
             .collect();
         if scripts.is_empty() {
@@ -411,7 +474,7 @@ impl<T: Transport> Wallet<T> {
             let mut seen = HashSet::new();
             for point in paying.get(&i).into_iter().flatten() {
                 let outputs = silent::taproot_outputs(tx);
-                for found in scanner.scan(point, &outputs) {
+                for found in finder.scanner.scan(point, &outputs) {
                     let vout = tx
                         .output
                         .iter()
@@ -423,6 +486,18 @@ impl<T: Transport> Wallet<T> {
                         coins.insert(outpoint, found.output);
                         batch.found.push((outpoint, value, found, at));
                     }
+                }
+            }
+            for (vout, output) in tx.output.iter().enumerate() {
+                let Some(found) = finder.fallback(&output.script_pubkey) else {
+                    continue;
+                };
+                let outpoint = OutPoint::new(txid, vout as u32);
+                if seen.insert(outpoint) {
+                    coins.insert(outpoint, found.output);
+                    batch
+                        .found
+                        .push((outpoint, output.value.to_sat(), *found, at));
                 }
             }
         }
@@ -569,6 +644,26 @@ impl<T: Transport> Wallet<T> {
             }
             Ok(held)
         })
+    }
+
+    /// Hand out the fallback address to show: the one handed out last
+    /// until it is paid, then the next. Watched from then on.
+    pub(crate) fn fallback_address(&self) -> Result<bitcoin::Address, Error> {
+        let scanner = self.keys.silent.scanner([]);
+        let found = self.store.write(|t| {
+            let (_, next) = fallbacks(t, &scanner)?;
+            t.execute(
+                "INSERT INTO silent_fallback (one, shown) VALUES (1, ?1)
+                 ON CONFLICT (one) DO UPDATE SET shown = max(shown, excluded.shown)",
+                [next],
+            )?;
+            scanner.fallback(next).map_err(invalid)
+        })?;
+        let key = TweakedPublicKey::dangerous_assume_tweaked(found.output);
+        Ok(bitcoin::Address::p2tr_tweaked(
+            key,
+            licash_onchain::network(self.network),
+        ))
     }
 }
 

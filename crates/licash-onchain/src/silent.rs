@@ -481,6 +481,28 @@ impl Scanner {
         }
     }
 
+    /// The receiver's fallback output `index`, the key of a plain taproot
+    /// address for payers of no silent payments: the spend key plus a hash
+    /// of the scan secret and `index`, used as is, as a silent payment's
+    /// output key is. Only the scan secret derives or links them; the
+    /// spend secret spends them ([`Keys::spend_secret`]).
+    pub fn fallback(&self, index: u32) -> Result<Found, Error> {
+        let tweak = scalar(tagged(
+            "licash/silent/fallback",
+            &[&self.scan.secret_bytes(), &index.to_be_bytes()],
+        ))
+        .map_err(|_| Error::Key)?;
+        let output = self
+            .spend
+            .add_exp_tweak(secp(), &Scalar::from(tweak))
+            .map_err(|_| Error::Key)?;
+        Ok(Found {
+            output: output.x_only_public_key().0,
+            tweak,
+            label: None,
+        })
+    }
+
     /// The output keys that a transaction of `tweak` would pay the receiver
     /// first, unlabeled then at each label: what a light client looks for
     /// in a block's compact filter (BIP158), as `OP_1 <key>` scripts, before

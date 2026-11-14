@@ -27,7 +27,7 @@ use bitcoin::{
 use licash::spend::ChainProfile;
 use licash_api::{BlockTweaks, Fee, Hex, Info};
 use licash_onchain::silent::{self, SpAddress};
-use licash_wallet::{Blocks, Error, Response, Transport, Wallet};
+use licash_wallet::{Blocks, Error, PaymentCode, Response, Transport, Wallet};
 use net::{Net, HUB};
 
 const REGTEST: ChainProfile = ChainProfile::Core30DefaultRegtest;
@@ -164,6 +164,40 @@ impl Chain {
                     ),
                 })
                 .collect(),
+        }
+    }
+
+    /// A payer's transaction from a fresh coin of its own, of a script-hash
+    /// input, which silent payments skip (no tweak), paying `value` to `to`.
+    fn pay_plain(&mut self, to: &ScriptBuf, value: u64) -> Transaction {
+        self.made += 1;
+        let script = ScriptBuf::from_bytes(vec![0x51]);
+        let coin = OutPoint::new(
+            Txid::from_raw_hash(sha256d::Hash::hash(&self.made.to_be_bytes())),
+            0,
+        );
+        self.outputs.insert(
+            coin,
+            TxOut {
+                value: Amount::from_sat(value + 1_000),
+                script_pubkey: ScriptBuf::new_p2wsh(&script.wscript_hash()),
+            },
+        );
+        let mut witness = Witness::new();
+        witness.push(script.as_bytes());
+        Transaction {
+            version: transaction::Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: coin,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness,
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(value),
+                script_pubkey: to.clone(),
+            }],
         }
     }
 
@@ -352,6 +386,22 @@ impl Setup {
     fn fetched(&self) -> Vec<BlockHash> {
         std::mem::take(&mut self.chain.lock().unwrap().fetched)
     }
+
+    fn pay_plain(&self, to: &ScriptBuf, value: u64) -> Transaction {
+        self.chain.lock().unwrap().pay_plain(to, value)
+    }
+
+    /// The fallback address a payment code hands out now, as a script.
+    fn fallback(&self) -> ScriptBuf {
+        let code = self.wallet.payment_code(&[HUB.into()], true).unwrap();
+        code.address.unwrap().assume_checked().script_pubkey()
+    }
+}
+
+/// The script of `wallet`'s fallback address `index`.
+fn fallback_of<T: Transport>(wallet: &Wallet<T>, index: u32) -> ScriptBuf {
+    let found = wallet.silent_keys().scanner([]).fallback(index).unwrap();
+    ScriptBuf::new_p2tr_tweaked(TweakedPublicKey::dangerous_assume_tweaked(found.output))
 }
 
 /// Someone else's silent payment address.
@@ -787,7 +837,7 @@ async fn a_wallet_file_of_the_first_version_gains_silent_payments() {
     assert_eq!(version(&path), 1);
     let wallet = Wallet::open(&path, Via(hub.clone())).unwrap();
     let address = wallet.silent_keys().address();
-    assert_eq!(version(&path), 2);
+    assert_eq!(version(&path), 3);
     assert_eq!(wallet.hubs().unwrap().len(), 1);
     assert_eq!(wallet.silent_next().unwrap(), None);
     wallet.watch_silent(HUB, 1).unwrap();
@@ -802,12 +852,114 @@ async fn a_wallet_file_of_the_first_version_gains_silent_payments() {
     // A newer version's file is refused, untouched.
     rusqlite::Connection::open(&path)
         .unwrap()
-        .pragma_update(None, "user_version", 3)
+        .pragma_update(None, "user_version", 4)
         .unwrap();
     match Wallet::open(&path, Via(hub)) {
-        Err(Error::Setup(why)) => assert!(why.contains("schema 3"), "{why}"),
+        Err(Error::Setup(why)) => assert!(why.contains("schema 4"), "{why}"),
         Err(other) => panic!("{other:?}"),
         Ok(_) => panic!("opened"),
     }
-    assert_eq!(version(&path), 3);
+    assert_eq!(version(&path), 4);
+}
+
+#[tokio::test]
+async fn a_fallback_address_is_watched_once_handed_out_and_the_next_once_paid() {
+    let s = setup().await;
+    s.wallet.watch_silent(HUB, 1).unwrap();
+    let first = fallback_of(&s.wallet, 0);
+    // None handed out: none watched, blocks without tweaks not even filtered.
+    let plain = s.wallet.payment_code(&[HUB.into()], false).unwrap();
+    assert_eq!(plain.address, None);
+    let early = s.pay_plain(&first, 10_000);
+    let paid = s.mine(vec![early]);
+    s.mine(Vec::new());
+    assert!(s.scan().await.unwrap().found.is_empty());
+    assert_eq!(s.chain.lock().unwrap().filtered, 0);
+
+    // Handed out in a code, its QR's too, and the same until paid.
+    let code = s.wallet.payment_code(&[HUB.into()], true).unwrap();
+    assert!(code.qr().starts_with("BITCOIN:BCRT1P"), "{}", code.qr());
+    assert!(code.qr().contains("?SP=TSP1Q"), "{}", code.qr());
+    assert_eq!(code.to_string().parse::<PaymentCode>().unwrap(), code);
+    assert_eq!(s.fallback(), first);
+    // Looked for again: found, in the one block paying it.
+    s.wallet.watch_silent(HUB, 1).unwrap();
+    let scanned = s.scan().await.unwrap();
+    assert_eq!(scanned.found.len(), 1);
+    let coin = &scanned.found[0];
+    assert_eq!((coin.value, coin.height, coin.change), (10_000, 3, false));
+    assert_eq!(s.fetched(), [paid]);
+
+    // Paid: the next is handed out, the first still watched.
+    let second = s.fallback();
+    assert_eq!(second, fallback_of(&s.wallet, 1));
+    assert_eq!(s.fallback(), second);
+    let again = s.pay_plain(&first, 20_000);
+    let to_second = s.pay_plain(&second, 30_000);
+    s.mine(vec![again, to_second]);
+    assert_eq!(s.scan().await.unwrap().found.len(), 2);
+    assert_eq!(s.fallback(), fallback_of(&s.wallet, 2));
+
+    // Spent with the spend key, like any coin of the address.
+    let all = s.wallet.spend_silent(elsewhere(), None, rate()).unwrap();
+    assert_eq!(all.input.len(), 3);
+    assert_signed(&s.chain.lock().unwrap(), &all);
+}
+
+#[tokio::test]
+async fn the_fallback_address_handed_out_never_goes_back() {
+    let s = setup().await;
+    s.wallet.watch_silent(HUB, 1).unwrap();
+    let first = s.fallback();
+    let paying = s.pay_plain(&first, 10_000);
+    s.mine(vec![paying]);
+    assert_eq!(s.scan().await.unwrap().found.len(), 1);
+    let second = s.fallback();
+    assert_eq!(second, fallback_of(&s.wallet, 1));
+    // Its payment reorganized away: the second is still the one handed out.
+    s.chain.lock().unwrap().fork(3);
+    s.chain.lock().unwrap().mine_empty(2);
+    s.scan().await.unwrap();
+    assert!(s.wallet.silent_coins().unwrap().is_empty());
+    assert_eq!(s.fallback(), second);
+    // A copy of the wallet handed out more: paid there, found here, and
+    // handed out past it.
+    let paying = s.pay_plain(&fallback_of(&s.wallet, 5), 10_000);
+    s.mine(vec![paying]);
+    assert_eq!(s.scan().await.unwrap().found.len(), 1);
+    assert_eq!(s.fallback(), fallback_of(&s.wallet, 6));
+    // Beyond the 20 watched past it: not found.
+    let paying = s.pay_plain(&fallback_of(&s.wallet, 6 + 20 + 1), 10_000);
+    s.mine(vec![paying]);
+    assert!(s.scan().await.unwrap().found.is_empty());
+}
+
+#[tokio::test]
+async fn a_wallet_file_of_version_2_watches_no_fallback_until_it_hands_one_out() {
+    let Setup {
+        wallet,
+        chain,
+        hub,
+        dir,
+    } = setup().await;
+    drop(wallet);
+    let path = dir.path().join("v2.sqlite");
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute_batch(include_str!("fixtures/wallet-v2.sql"))
+        .unwrap();
+    let wallet = Wallet::open(&path, Via(hub)).unwrap();
+    assert_eq!(wallet.silent_next().unwrap(), Some(1));
+    let light = Light(chain.clone());
+    let scanned = wallet.scan_silent(HUB, &light, u32::MAX).await.unwrap();
+    assert_eq!(scanned.next, 3);
+    assert_eq!(chain.lock().unwrap().filtered, 0);
+    // Handed out, then watched.
+    let code = wallet.payment_code(&[HUB.into()], true).unwrap();
+    let script = code.address.unwrap().assume_checked().script_pubkey();
+    assert_eq!(script, fallback_of(&wallet, 0));
+    let paying = chain.lock().unwrap().pay_plain(&script, 10_000);
+    chain.lock().unwrap().mine(vec![paying]);
+    let scanned = wallet.scan_silent(HUB, &light, u32::MAX).await.unwrap();
+    assert_eq!(scanned.found.len(), 1);
 }

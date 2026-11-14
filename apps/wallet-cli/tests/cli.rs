@@ -758,7 +758,9 @@ fn owners_pay_payment_codes_through_mailboxes_or_by_hand() {
         .trim()
         .to_owned();
     assert!(
-        qr.starts_with("BITCOIN:?SP=TSP1Q") && qr.contains("&LICASH=TLICASH1Q"),
+        qr.starts_with("BITCOIN:BCRT1P")
+            && qr.contains("?SP=TSP1Q")
+            && qr.contains("&LICASH=TLICASH1Q"),
         "{qr}"
     );
 

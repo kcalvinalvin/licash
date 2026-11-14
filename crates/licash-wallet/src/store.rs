@@ -17,7 +17,18 @@ const VERSION: i64 = 1 + MIGRATIONS.len() as i64;
 
 /// What each version adds to the one before: the first takes 1 to 2. A
 /// file of an older version is brought up to date when opened.
-const MIGRATIONS: &[&str] = &[SILENT];
+const MIGRATIONS: &[&str] = &[SILENT, FALLBACK];
+
+/// Version 3: fallback addresses on Bitcoin, for payers of no silent
+/// payments.
+const FALLBACK: &str = "
+-- The highest index of a fallback address handed out in a payment code:
+-- none until one is. Those up to it, and a few after, are watched.
+CREATE TABLE silent_fallback (
+    one INTEGER PRIMARY KEY CHECK (one = 1),
+    shown INTEGER NOT NULL
+) STRICT;
+";
 
 /// Version 2: payments to the silent payment address.
 const SILENT: &str = "
