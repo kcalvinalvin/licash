@@ -1377,6 +1377,7 @@ dependencies = [
  "hex",
  "licash",
  "licash-api",
+ "licash-nostr",
  "licash-wallet",
  "rand_core 0.6.4",
  "reqwest",

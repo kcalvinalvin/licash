@@ -1,6 +1,6 @@
 # A regtest ecosystem for the end-to-end tests: Bitcoin Core, two hubs with
-# Lightning gateways over their own LND nodes, and an outside LND node that
-# pays and is paid. `run.sh` brings it up, runs the tests and removes it.
+# Lightning gateways over their own LND nodes, an outside LND node that
+# pays and is paid, and a Nostr relay the hubs announce themselves on. `run.sh` brings it up, runs the tests and removes it.
 # Every port is published on 127.0.0.1 only: the hubs' at fixed ports, which
 # their wallets keep across restarts, LICASH_E2E_HUB1 and LICASH_E2E_HUB2,
 # the rest at ports Docker picks.
@@ -43,6 +43,7 @@ x-hub: &hub
     LICASH_HUB_CHAIN_POLL: "1"
     LICASH_HUB_LND_MACAROON: /lnd/data/chain/bitcoin/regtest/admin.macaroon
     LICASH_HUB_LND_CERT: /lnd/tls.cert
+    LICASH_HUB_NOSTR_RELAYS: ws://relay:8080
     LICASH_HUB_LOG: json
     RUST_LOG: info
 
@@ -85,7 +86,10 @@ services:
 
   hub1:
     <<: *hub
-    command: ["[ -f /data/seed ] || licash-hub init; exec licash-hub run --lnd https://hub1-ln:8080"]
+    command:
+      - >-
+        [ -f /data/seed ] || licash-hub init; exec licash-hub run --lnd https://hub1-ln:8080
+        --announce-url http://127.0.0.1:${LICASH_E2E_HUB1:-38338} --announce-name hub1
     ports:
       - "127.0.0.1:${LICASH_E2E_HUB1:-38338}:8338"
     volumes:
@@ -94,10 +98,15 @@ services:
     depends_on:
       hub1-ln:
         condition: service_healthy
+      relay:
+        condition: service_started
 
   hub2:
     <<: *hub
-    command: ["[ -f /data/seed ] || licash-hub init; exec licash-hub run --lnd https://hub2-ln:8080"]
+    command:
+      - >-
+        [ -f /data/seed ] || licash-hub init; exec licash-hub run --lnd https://hub2-ln:8080
+        --announce-url http://127.0.0.1:${LICASH_E2E_HUB2:-38339} --announce-name hub2
     ports:
       - "127.0.0.1:${LICASH_E2E_HUB2:-38339}:8338"
     volumes:
@@ -106,6 +115,13 @@ services:
     depends_on:
       hub2-ln:
         condition: service_healthy
+      relay:
+        condition: service_started
+
+  relay:
+    image: scsibug/nostr-rs-relay:0.10.0@sha256:48d54c2d2781577cf3ed2951112f0953dc2c5e7c9d2ea20c64e8c0fa37d16e4d
+    ports:
+      - "127.0.0.1::8080"
 
 volumes:
   hub1:

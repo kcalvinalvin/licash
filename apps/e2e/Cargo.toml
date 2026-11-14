@@ -1,6 +1,6 @@
 [package]
 name = "licash-e2e"
-description = "End-to-end tests of hubs, their Lightning gateways and wallets on a regtest ecosystem"
+description = "End-to-end tests of hubs, their Lightning gateways, Nostr announcements and wallets on a regtest ecosystem"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,6 +9,7 @@ publish = false
 [dependencies]
 licash.workspace = true
 licash-api.workspace = true
+licash-nostr.workspace = true
 licash-wallet.workspace = true
 anyhow.workspace = true
 hex = "0.4"

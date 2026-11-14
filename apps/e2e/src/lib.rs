@@ -38,6 +38,8 @@ pub struct Eco {
     http: reqwest::Client,
     /// Each hub's URL, as published on this host.
     hubs: Vec<String>,
+    /// The Nostr relay's URL, as published on this host.
+    relay: String,
     dir: tempfile::TempDir,
 }
 
@@ -74,9 +76,11 @@ impl Eco {
             core: String::new(),
             http: reqwest::Client::new(),
             hubs: Vec::new(),
+            relay: String::new(),
             dir: tempfile::tempdir()?,
         };
         eco.core = format!("http://{}", eco.port("bitcoind", 18443).await?);
+        eco.relay = format!("ws://{}", eco.port("relay", 8080).await?);
         for hub in ["hub1", "hub2"] {
             let at = eco.port(hub, 8338).await?;
             eco.hubs.push(format!("http://{at}"));
@@ -127,6 +131,11 @@ impl Eco {
     /// The URL of hub `n`, 1 or 2.
     pub fn hub(&self, n: usize) -> &str {
         &self.hubs[n - 1]
+    }
+
+    /// The URL of the Nostr relay the hubs announce themselves on.
+    pub fn relay(&self) -> &str {
+        &self.relay
     }
 
     /// A new wallet, in a file of its own.
