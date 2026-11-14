@@ -20,5 +20,10 @@ drops the notes spent since.
 A lock pays its payee on a secret's preimage until it expires, then returns
 to the payer: the payee runs `secret` and hands over the hash, the payer
 runs `lock <address> <amount> <hash>`, and the payee runs `claim <id>
-<preimage>`. `resume` follows the payer's locks to their end. Onion hubs need a SOCKS proxy for now:
-`--proxy socks5h://127.0.0.1:9050`.
+<preimage>`. `resume` follows the payer's locks to their end.
+
+Through a hub with a Lightning gateway, `pay-invoice <bolt11>` pays an
+invoice with a lock refunded if the payment fails, and `invoice <amount>`
+prints an invoice paying the wallet; `resume` takes the payment once made.
+
+Onion hubs need a SOCKS proxy for now: `--proxy socks5h://127.0.0.1:9050`.

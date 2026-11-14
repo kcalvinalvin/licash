@@ -2,8 +2,9 @@ mod support;
 
 use std::{path::Path, process::Output};
 
-use licash::address::Address;
+use licash::{address::Address, spend::lock_hash};
 use licash_api::Fee;
+use licash_hub_service::lightning::{fake::Outcome, HeldState};
 use serde_json::Value;
 use support::{wallet, Server};
 
@@ -286,5 +287,104 @@ fn a_lock_pays_on_its_preimage_or_returns_once_expired() {
         wallet(&alice, &["lock", &bob_at, "1", "abc"], None),
         1,
         "not 32 bytes in hex",
+    );
+}
+
+#[test]
+fn owners_pay_invoices_and_get_paid_over_lightning() {
+    let hub = Server::with_lightning(FEE);
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, _) = party(dir.path(), "alice", Some(&hub));
+    assert_eq!(json(&alice, &["hubs"])[0]["lightning"]["max_pay"], 100);
+
+    // Paid 40 over Lightning, the gateway's fee on top, once the payer
+    // pays the invoice and the wallet claims what the hub locks to it.
+    let asked = wallet(&alice, &["invoice", "40"], None);
+    let stderr = String::from_utf8_lossy(&asked.stderr).into_owned();
+    let hash = stderr.trim().strip_prefix("invoice ").unwrap().to_owned();
+    let request = ok(asked);
+    let invoices = json(&alice, &["invoices"]);
+    assert_eq!(
+        (
+            invoices[0]["state"].as_str(),
+            invoices[0]["request"].as_str()
+        ),
+        (Some("open"), Some(request.trim()))
+    );
+    assert_eq!(json(&alice, &["resume"])["invoices"][0]["state"], "open");
+    hub.pay_held(&hash);
+    let resumed = json(&alice, &["resume"]);
+    assert_eq!(resumed["invoices"][0]["state"], "received");
+    assert_eq!(available(&alice), (40, 0));
+    hub.round();
+    let mut held = [0; 32];
+    hex::decode_to_slice(&hash, &mut held).unwrap();
+    assert_eq!(hub.node().held(held).unwrap().0, HeldState::Settled);
+    let text = ok(wallet(&alice, &["invoices"], None));
+    assert!(text.contains("invoice received  40"), "{text}");
+    failed(
+        wallet(&alice, &["invoice", "101"], None),
+        1,
+        "takes 1 to 100",
+    );
+
+    // Paying an invoice of 20 locks notes of 22 to the hub, its gateway's
+    // fee on top, until the payment buys the preimage. The notes are made
+    // exact by a payment to the wallet itself, for the hub's fee of 1.
+    let preimage = [5; 32];
+    let request = hub
+        .node()
+        .invoice(20_000, lock_hash(&preimage), 6, Outcome::Pay(preimage));
+    let paid = ok(wallet(&alice, &["pay-invoice", &request], None));
+    assert_eq!(
+        paid,
+        format!("paid 22 + 0\npreimage {}\n", hex::encode(preimage))
+    );
+    assert_eq!(available(&alice), (17, 0));
+    let locks = json(&alice, &["locks"]);
+    assert_eq!(locks[0]["invoice"].as_str(), Some(request.as_str()));
+
+    // A failed payment refunds its lock at once, less the hub's refund
+    // fee.
+    let reason = "FAILURE_REASON_NO_ROUTE";
+    let request = hub
+        .node()
+        .invoice(10_000, lock_hash(&[6; 32]), 6, Outcome::Fail(reason.into()));
+    failed(wallet(&alice, &["pay-invoice", &request], None), 1, reason);
+    assert_eq!(available(&alice), (15, 0));
+    let text = ok(wallet(&alice, &["locks"], None));
+    assert!(
+        text.contains(&format!("lock refunded ({reason})  12 + 0")),
+        "{text}"
+    );
+
+    // One under way past the wait is pending, and followed by resume.
+    let preimage = [7; 32];
+    let hash = lock_hash(&preimage);
+    let request = hub.node().invoice(5_000, hash, 6, Outcome::Hang);
+    failed(
+        wallet(&alice, &["pay-invoice", &request, "--wait", "1"], None),
+        75,
+        "under way",
+    );
+    // Exact notes were at hand.
+    assert_eq!(available(&alice), (8, 7));
+    hub.node().resolve(hash, Outcome::Pay(preimage));
+    let resumed = json(&alice, &["resume"]);
+    assert_eq!(resumed["locks"][0]["state"], "paid");
+    assert_eq!(available(&alice), (8, 0));
+
+    failed(
+        wallet(&alice, &["pay-invoice", "lnbcrt1nope"], None),
+        1,
+        "not a Lightning invoice",
+    );
+    let request = hub
+        .node()
+        .invoice(101_000, lock_hash(&[8; 32]), 6, Outcome::Hang);
+    failed(
+        wallet(&alice, &["pay-invoice", &request], None),
+        1,
+        "at most 100 sat",
     );
 }

@@ -1,5 +1,6 @@
 //! A hub service on a local port that can go down and come back, following
-//! a regtest chain of its own, and a payer outside any wallet.
+//! a regtest chain of its own, with a Lightning gateway over a fake node if
+//! asked, and a payer outside any wallet.
 
 #[path = "../../../hub/tests/chain/mod.rs"]
 mod chain;
@@ -22,6 +23,7 @@ use licash::{
 };
 use licash_api::{Fee, Payment};
 use licash_hub::{Hub, Policy, Timing};
+use licash_hub_service::lightning::{fake::Fake, Config, Gateway};
 
 const MAX_POW: u32 = 6;
 
@@ -37,6 +39,8 @@ const TIMING: Timing = Timing {
 
 pub struct Server {
     pub hub: Arc<Hub>,
+    /// The gateway, and the node it pays and is paid through.
+    pub lightning: Option<(Arc<Gateway>, Arc<Fake>)>,
     chain: Mutex<chain::Chain>,
     addr: SocketAddr,
     seed: PathBuf,
@@ -48,6 +52,16 @@ impl Server {
     /// A hub charging `fee` on spends and in each branch of a lock, at
     /// height 3 of its chain.
     pub fn start(fee: Fee) -> Self {
+        Self::started(fee, false)
+    }
+
+    /// [`Server::start`], with a gateway charging 2 to pay an invoice and
+    /// 1 to take a payment, of 100 at most.
+    pub fn with_lightning(fee: Fee) -> Self {
+        Self::started(fee, true)
+    }
+
+    fn started(fee: Fee, lightning: bool) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let (seed, db) = (dir.path().join("seed"), dir.path().join("hub.sqlite"));
         Hub::init(&seed, &db, MAX_POW).unwrap();
@@ -60,8 +74,28 @@ impl Server {
         let hub = Arc::new(Hub::open(&seed, &db, policy).unwrap());
         let chain = chain::Chain::new();
         hub.add_checkpoint(&chain.checkpoint(0)).unwrap();
+        let lightning = lightning.then(|| {
+            let config = Config {
+                pay: Fee { base: 2, ppm: 0 },
+                receive: Fee { base: 1, ppm: 0 },
+                max_pay: 100,
+                min_receive: 1,
+                max_receive: 100,
+                pay_slack: 4,
+                hold_delta: 3,
+                downtime: 2,
+                receive_blocks: 6,
+                grace: 0,
+                ..Config::default()
+            };
+            let node = Arc::new(Fake::new());
+            let path = dir.path().join("lightning.sqlite");
+            let gateway = Gateway::open(hub.clone(), node.clone(), config, &path).unwrap();
+            (Arc::new(gateway), node)
+        });
         let mut server = Self {
             hub,
+            lightning,
             chain: Mutex::new(chain),
             addr: "127.0.0.1:0".parse().unwrap(),
             seed,
@@ -69,8 +103,37 @@ impl Server {
             _dir: dir,
         };
         server.mine(3, None);
+        server.round();
         server.up();
         server
+    }
+
+    /// One round of the gateway, if any: it follows its node and the
+    /// payments under way.
+    pub fn round(&self) {
+        if let Some((gateway, _)) = &self.lightning {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(gateway.round());
+        }
+    }
+
+    /// The fake node of the gateway.
+    pub fn node(&self) -> &Fake {
+        &self.lightning.as_ref().expect("a gateway").1
+    }
+
+    /// Another node pays the gateway's held invoice of `hash`, its HTLCs
+    /// lasting the invoice's final delta, and the gateway takes it.
+    pub fn pay_held(&self, hash: &str) {
+        let mut bytes = [0; 32];
+        hex::decode_to_slice(hash, &mut bytes).unwrap();
+        let cltv = self.node().held_cltv(bytes).unwrap() as u32;
+        let height = self.chain.lock().unwrap().height();
+        self.node().pay_held(bytes, height + cltv);
+        self.round();
     }
 
     /// Mine `blocks`, the first with an activation of `secret` if given,
@@ -82,6 +145,9 @@ impl Server {
             self.hub.observe(chain.height(), &block).unwrap();
         }
         assert!(self.hub.synced(chain.height(), &chain.tip()).unwrap());
+        if let Some((_, node)) = &self.lightning {
+            node.tip(chain.height(), chain.tip());
+        }
     }
 
     pub fn url(&self) -> String {
@@ -95,6 +161,7 @@ impl Server {
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
         let (bound, addr) = std::sync::mpsc::channel();
         let (hub, at) = (self.hub.clone(), self.addr);
+        let gateway = self.lightning.as_ref().map(|(gateway, _)| gateway.clone());
         let thread = std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -104,7 +171,7 @@ impl Server {
                 socket.bind(at).unwrap();
                 let listener = socket.listen(64).unwrap();
                 bound.send(listener.local_addr().unwrap()).unwrap();
-                axum::serve(listener, licash_hub_service::router(hub, None))
+                axum::serve(listener, licash_hub_service::router(hub, gateway))
                     .with_graceful_shutdown(async {
                         stopped.await.ok();
                     })

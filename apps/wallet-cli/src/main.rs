@@ -12,7 +12,7 @@ use anyhow::{bail, Context};
 use clap::{Parser, Subcommand, ValueEnum};
 use licash::{address::Address, spend::lock_hash};
 use licash_api::Payment;
-use licash_wallet::{Error, Lock, LockState, State, Wallet};
+use licash_wallet::{Error, Invoice, InvoiceState, Lock, LockState, State, Wallet};
 use rand_core::{OsRng, RngCore};
 use serde_json::json;
 use tracing_subscriber::EnvFilter;
@@ -134,6 +134,29 @@ enum Command {
     },
     /// Unlink the notes held from the payments they came in.
     Unlink,
+    /// Pay a Lightning invoice through a hub, its fee on top: the hub pays
+    /// it for a lock of notes, refunded if the payment fails.
+    PayInvoice {
+        invoice: String,
+        /// Through this hub [default: the one holding the most].
+        #[arg(long)]
+        hub: Option<String>,
+        /// Seconds to wait for the payment to end; `resume` follows it
+        /// after.
+        #[arg(long, default_value_t = 60)]
+        wait: u64,
+    },
+    /// A Lightning invoice paying this wallet AMOUNT through a hub, its fee
+    /// on top, to hand the payer (its hash on stderr). `resume` takes the
+    /// payment once made.
+    Invoice {
+        amount: u64,
+        /// Through this hub [default: the only one trusted].
+        #[arg(long)]
+        hub: Option<String>,
+    },
+    /// The Lightning invoices asked for, newest first.
+    Invoices,
 }
 
 fn main() -> ExitCode {
@@ -197,7 +220,10 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             let fee = info.fees.spend;
             show(
                 json,
-                json!({ "fees": info.fees, "keysets": info.keysets.len(), "locks": info.locks.is_some() }),
+                json!({
+                    "fees": info.fees, "keysets": info.keysets.len(), "locks": info.locks.is_some(),
+                    "lightning": info.lightning,
+                }),
                 format!(
                     "trusted; it charges {} + {} ppm a payment",
                     fee.base, fee.ppm
@@ -207,11 +233,19 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Hubs => {
             let hubs = wallet.hubs()?;
             let rows = hubs.iter().map(|(url, info)| {
-                json!({ "url": url, "fees": info.fees, "locks": info.locks.is_some() })
+                json!({
+                    "url": url, "fees": info.fees, "locks": info.locks.is_some(),
+                    "lightning": info.lightning,
+                })
             });
             let lines = hubs.iter().map(|(url, info)| {
                 let fee = info.fees.spend;
-                format!("{url}  {} + {} ppm", fee.base, fee.ppm)
+                let lightning = if info.lightning.is_some() {
+                    "  lightning"
+                } else {
+                    ""
+                };
+                format!("{url}  {} + {} ppm{lightning}", fee.base, fee.ppm)
             });
             show(json, rows.collect(), lines.collect::<Vec<_>>().join("\n"));
         }
@@ -373,8 +407,83 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 format!("unlinked {unlinked} notes"),
             );
         }
+        Command::PayInvoice { invoice, hub, wait } => {
+            let hub = match hub {
+                Some(hub) => hub,
+                None => richest(&wallet)?,
+            };
+            let lock = wallet.pay_invoice(&hub, &invoice).await?;
+            return pay_invoice(&wallet, lock, wait, json).await;
+        }
+        Command::Invoice { amount, hub } => {
+            let hub = match hub {
+                Some(hub) => hub,
+                None => only_hub(&wallet)?,
+            };
+            let invoice = wallet.invoice(&hub, amount).await?;
+            eprintln!("invoice {}", invoice.hash);
+            let request = invoice.request.clone().unwrap_or_default();
+            show(json, invoice_json(&invoice), request);
+        }
+        Command::Invoices => {
+            let invoices = wallet.invoices()?;
+            let lines = invoices.iter().map(invoice_line).collect::<Vec<_>>();
+            show(
+                json,
+                invoices.iter().map(invoice_json).collect(),
+                lines.join("\n"),
+            );
+        }
     }
     Ok(())
+}
+
+/// Follow `lock`, paying an invoice, for up to `wait` seconds: done once
+/// paid, failed once refunded, pending while under way.
+async fn pay_invoice(
+    wallet: &Wallet<Http>,
+    mut lock: Lock,
+    wait: u64,
+    json: bool,
+) -> anyhow::Result<()> {
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(wait);
+    let mut pending = None;
+    while matches!(lock.state, LockState::Requested | LockState::Locked)
+        && std::time::Instant::now() < until
+    {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        match wallet.follow_lock(&lock.id).await {
+            Ok(followed) => (lock, pending) = (followed, None),
+            Err(Error::Pending { reason, .. }) => pending = Some(reason),
+            Err(e) => return Err(e.into()),
+        }
+    }
+    let text = match &lock.state {
+        LockState::Paid(preimage) => format!(
+            "paid {} + {}\npreimage {}",
+            lock.amount,
+            lock.fee,
+            hex::encode(preimage)
+        ),
+        _ => lock_line(&lock),
+    };
+    show(json, lock_json(&lock), text);
+    match (&lock.state, lock.failure) {
+        (LockState::Paid(_), _) => Ok(()),
+        (LockState::Requested | LockState::Locked, _) => Err(Error::Pending {
+            id: lock.id,
+            reason: pending.unwrap_or_else(|| "the payment is under way".into()),
+        }
+        .into()),
+        (LockState::Refunded, Some(failure)) => {
+            bail!("the invoice was not paid ({failure}); its lock was refunded")
+        }
+        (state, failure) => bail!(
+            "the invoice was not paid: its lock {}{}",
+            lock_state(state),
+            failure.map(|f| format!(" ({f})")).unwrap_or_default()
+        ),
+    }
 }
 
 fn init(path: &Path, transport: Http, json: bool) -> anyhow::Result<()> {
@@ -413,6 +522,7 @@ async fn resume(wallet: &Wallet<Http>, json: bool) -> anyhow::Result<()> {
         ));
     }
     lines.extend(resumed.locks.iter().map(lock_line));
+    lines.extend(resumed.invoices.iter().map(invoice_line));
     for (id, reason) in &resumed.abandoned {
         lines.push(format!("abandoned {id}: {reason}"));
     }
@@ -436,6 +546,7 @@ async fn resume(wallet: &Wallet<Http>, json: bool) -> anyhow::Result<()> {
         json!({
             "paid": paid.collect::<Vec<_>>(),
             "locks": resumed.locks.iter().map(lock_json).collect::<Vec<_>>(),
+            "invoices": resumed.invoices.iter().map(invoice_json).collect::<Vec<_>>(),
             "abandoned": abandoned.collect::<Vec<_>>(),
             "pending": pending.collect::<Vec<_>>(),
             "unlinked": unlinked,
@@ -497,20 +608,47 @@ fn lock_json(lock: &Lock) -> serde_json::Value {
     json!({
         "id": lock.id, "hub": lock.hub, "payee": encode(&lock.payee), "amount": lock.amount,
         "fee": lock.fee, "hash": hex::encode(lock.hash), "expiry": lock.expiry,
-        "state": lock_state(&lock.state), "preimage": preimage, "created_at": lock.created_at,
+        "state": lock_state(&lock.state), "preimage": preimage, "invoice": lock.invoice,
+        "failure": lock.failure, "created_at": lock.created_at,
     })
 }
 
 fn lock_line(lock: &Lock) -> String {
+    let state = match &lock.failure {
+        Some(failure) => format!("{} ({failure})", lock_state(&lock.state)),
+        None => lock_state(&lock.state),
+    };
     format!(
         "{}  lock {}  {} + {}  until {}  via {}  {}",
-        lock.created_at,
-        lock_state(&lock.state),
-        lock.amount,
-        lock.fee,
-        lock.expiry,
-        lock.hub,
-        lock.id
+        lock.created_at, state, lock.amount, lock.fee, lock.expiry, lock.hub, lock.id
+    )
+}
+
+fn invoice_state(state: &InvoiceState) -> String {
+    match state {
+        InvoiceState::Open => "open".into(),
+        InvoiceState::Received => "received".into(),
+        InvoiceState::Canceled(reason) => format!("canceled ({reason})"),
+        _ => "unknown".into(),
+    }
+}
+
+fn invoice_json(invoice: &Invoice) -> serde_json::Value {
+    json!({
+        "hash": invoice.hash, "hub": invoice.hub, "amount": invoice.amount,
+        "request": invoice.request, "state": invoice_state(&invoice.state),
+        "created_at": invoice.created_at,
+    })
+}
+
+fn invoice_line(invoice: &Invoice) -> String {
+    format!(
+        "{}  invoice {}  {}  via {}  {}",
+        invoice.created_at,
+        invoice_state(&invoice.state),
+        invoice.amount,
+        invoice.hub,
+        invoice.hash
     )
 }
 
