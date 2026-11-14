@@ -3,8 +3,8 @@
 FROM rust:1-slim-trixie AS build
 WORKDIR /src
 COPY . .
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/src/apps/target \
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/src/apps/target,sharing=locked \
     cargo build --locked --release --manifest-path apps/Cargo.toml -p licash-wallet-cli \
     && cp apps/target/release/licash-wallet /usr/local/bin/licash-wallet
 
