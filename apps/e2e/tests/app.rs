@@ -313,7 +313,8 @@ async fn hub_down(
     Ok(())
 }
 
-/// The app's log and the light client's, and both exported from Settings.
+/// The app's log and the light client's, and both exported from Settings,
+/// which shows what the app keeps on the phone.
 async fn logs(phone: &Phone) -> anyhow::Result<()> {
     let app = phone.file("files/logs/app.log").await?;
     for want in ["light client of regtest started", "moving to notes"] {
@@ -325,6 +326,10 @@ async fn logs(phone: &Phone) -> anyhow::Result<()> {
         "no neutrino in the light client's log"
     );
     phone.tap("Settings").await?;
+    // What the app keeps on the phone, its light client's and its own
+    // code among it.
+    phone.scroll_to("Bitcoin light client").await?;
+    phone.scroll_to("The app itself").await?;
     let export = phone.scroll_to("Export logs").await?;
     phone.tap_view(&export).await?;
     phone.wait("licash-logs.txt", 30).await?;

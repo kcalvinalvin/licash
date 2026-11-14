@@ -1,5 +1,7 @@
 package org.licash.wallet.ui
 
+import android.content.Context
+import android.text.format.Formatter
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -27,6 +29,7 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -41,16 +44,20 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.licash.core.Hub
 import org.licash.core.Rate
 import org.licash.wallet.AppLog
 import org.licash.wallet.BuildConfig
 import org.licash.wallet.Engine
+import org.licash.wallet.Storage
 import org.licash.wallet.Ui
 import org.licash.wallet.explain
 import org.licash.wallet.exportLogs
 import org.licash.wallet.sat
+import org.licash.wallet.storage
 
 @Composable
 fun Settings(engine: Engine, ui: Ui, balance: () -> Unit, back: () -> Unit) {
@@ -77,6 +84,9 @@ fun Settings(engine: Engine, ui: Ui, balance: () -> Unit, back: () -> Unit) {
         }
         Group("Bitcoin") {
             Status(ui)
+        }
+        Group("Storage") {
+            StorageUsed(ui.developer)
         }
         Group("Support") {
             Action("Export logs", "Share what the app did, to report a problem.", Icons.Filled.Share) {
@@ -109,6 +119,41 @@ fun Settings(engine: Engine, ui: Ui, balance: () -> Unit, back: () -> Unit) {
         Spacer(Modifier.height(48.dp))
     }
 }
+
+/** What the app keeps on the phone, by what keeps it; in advanced mode, each network's light client. */
+@Composable
+private fun StorageUsed(advanced: Boolean) {
+    val context = LocalContext.current
+    var kept by remember { mutableStateOf<Storage?>(null) }
+    LaunchedEffect(Unit) { kept = withContext(Dispatchers.IO) { storage(context) } }
+    val size = { b: Long -> bytes(context, b) }
+    kept?.let { k ->
+        Size("Total", k.total, "Kept on this phone", size)
+        Size("Wallet", k.wallet, "Your notes, payments and keys", size)
+        val networks = k.chains.joinToString(", ") { (name, b) -> "$name ${size(b)}" }
+        val chain = if (advanced && networks.isNotEmpty()) networks else "Block headers and filters"
+        Size("Bitcoin light client", k.chain, chain, size)
+        if (k.tor > 0) Size("Tor", k.tor, "What it knows of the Tor network", size)
+        Size("Logs", k.logs, "What the app did, to report a problem", size)
+        Size("Cache", k.cache, "Made again when needed", size)
+        if (k.other > 0) Size("Other", k.other, "Settings and the rest", size)
+        k.app?.let { Size("The app itself", it, "Its code and libraries", size) }
+    }
+}
+
+@Composable
+private fun Size(what: String, bytes: Long, how: String, size: (Long) -> String) {
+    Row(Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
+        Column(Modifier.weight(1f)) {
+            Text(what, style = MaterialTheme.typography.bodyLarge)
+            Text(how, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        Spacer(Modifier.width(12.dp))
+        Text(size(bytes), style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    }
+}
+
+private fun bytes(context: Context, bytes: Long): String = Formatter.formatShortFileSize(context, bytes)
 
 @Composable
 private fun Note(text: String, error: Boolean = false) {

@@ -49,7 +49,9 @@ licash-wallet onchain scan        # coins paid on Bitcoin
 ## Logs and tests
 
 Settings, Export logs shares the app's log and the light client's as one
-file. The end-to-end test drives the app on the emulator or phone adb
+file; Storage shows what the app keeps on the phone: the wallet, the Bitcoin
+light client (each network's in advanced mode), Tor's state, logs, caches and
+the app itself. The end-to-end test drives the app on the emulator or phone adb
 picks, among the regtest ecosystem of `apps/e2e`:
 
 ```sh
