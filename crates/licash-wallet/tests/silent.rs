@@ -1039,3 +1039,36 @@ async fn a_spend_pays_a_silent_payment_address_its_receiver_finds() {
     let fee = rate().fee_wu(to_self.weight()).unwrap().to_sat();
     assert_eq!(found, [(10_000, false), (change - 10_000 - fee, true)]);
 }
+
+#[tokio::test]
+async fn payments_to_fallback_addresses_are_seen_on_their_way() {
+    let s = setup().await;
+    s.wallet.watch_silent(HUB, 1).unwrap();
+    // None handed out: nothing to watch.
+    assert!(s.wallet.fallback_scripts().unwrap().is_empty());
+    let first = s.fallback();
+    let watched = s.wallet.fallback_scripts().unwrap();
+    // The one handed out and 20 after.
+    assert_eq!(watched.len(), 21);
+    assert!(watched.contains(&first));
+    assert!(watched.contains(&fallback_of(&s.wallet, 20)));
+
+    // On its way: its output to the address, once however often relayed,
+    // and nothing of a payment elsewhere.
+    let paying = s.pay_plain(&first, 10_000);
+    let other = s.pay_plain(&elsewhere(), 5_000);
+    let txs = [paying.clone(), other, paying.clone()];
+    let seen = s.wallet.unconfirmed_payments(&txs).unwrap();
+    let vout = paying.output.iter().position(|o| o.script_pubkey == first);
+    let outpoint = OutPoint::new(paying.compute_txid(), vout.unwrap() as u32);
+    assert_eq!(seen, [(outpoint, 10_000)]);
+
+    // Found in a block: no longer on its way, even once spent.
+    s.mine(vec![paying.clone()]);
+    assert_eq!(s.scan().await.unwrap().found.len(), 1);
+    assert!(s.wallet.unconfirmed_payments(&txs).unwrap().is_empty());
+    let spend = s.wallet.spend_silent(elsewhere(), None, rate()).unwrap();
+    s.mine(vec![spend]);
+    s.scan().await.unwrap();
+    assert!(s.wallet.unconfirmed_payments(&txs).unwrap().is_empty());
+}

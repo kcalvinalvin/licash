@@ -721,6 +721,46 @@ impl<T: Transport> Wallet<T> {
         })
     }
 
+    /// The scripts of the fallback addresses watched: those handed out in
+    /// payment codes, and 20 after; none until one is. What a
+    /// light client watches unconfirmed transactions for.
+    pub fn fallback_scripts(&self) -> Result<Vec<ScriptBuf>, Error> {
+        let scanner = self.keys.silent.scanner([]);
+        let (watched, _) = self.store.read(|c| fallbacks(c, &scanner))?;
+        let mut scripts: Vec<ScriptBuf> = watched.into_keys().map(p2tr).collect();
+        scripts.sort();
+        Ok(scripts)
+    }
+
+    /// The outputs of `txs` paying the fallback addresses watched that no
+    /// scan found in a block yet, with their values: payments on their way,
+    /// as a light client's peers relay them. A peer can make one up, and
+    /// one can be dropped or replaced: only a scan finds coins.
+    pub fn unconfirmed_payments(&self, txs: &[Transaction]) -> Result<Vec<(OutPoint, u64)>, Error> {
+        let scripts: HashSet<ScriptBuf> = self.fallback_scripts()?.into_iter().collect();
+        let found: HashSet<OutPoint> = self.store.read(|c| {
+            let mut stmt = c.prepare("SELECT txid, vout FROM silent_coins")?;
+            let rows = stmt.query_map([], |r| {
+                Ok(OutPoint::new(Txid::from_byte_array(r.get(0)?), r.get(1)?))
+            })?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })?;
+        let mut paying = Vec::new();
+        for tx in txs {
+            let txid = tx.compute_txid();
+            for (vout, output) in (0..).zip(&tx.output) {
+                let outpoint = OutPoint::new(txid, vout);
+                if scripts.contains(&output.script_pubkey)
+                    && !found.contains(&outpoint)
+                    && !paying.iter().any(|(o, _)| *o == outpoint)
+                {
+                    paying.push((outpoint, output.value.to_sat()));
+                }
+            }
+        }
+        Ok(paying)
+    }
+
     /// The wallet's transactions spending its coins that are in no block
     /// yet, oldest first: to broadcast again until they are.
     pub fn silent_spends(&self) -> Result<Vec<Transaction>, Error> {
