@@ -8,11 +8,12 @@ use k256::Scalar;
 use licash::base::{Base, Parts, ResponseKeys};
 use licash::note::IssuerKeys;
 use licash_contract::keys::HubKeys;
-use licash_contract::wire::{self, Envelope, Kind};
-use licash_regtest::native::{open_native_with, Authority, Holder};
+use licash_contract::opening::{self as machine, Context, Quote, Start};
+use licash_contract::wire::{self, Envelope, Kind, Wanted};
+use licash_regtest::native::{checkpoint, open_native_with, quote, Authority, Holder};
 use licash_regtest::native_fixture::{point, SEED, SPEND};
 use lichen_babe::setup::Instance;
-use lngap_btc::bitcoin::{Amount, ScriptBuf};
+use lngap_btc::bitcoin::{Amount, OutPoint, ScriptBuf};
 use lngap_btc::regtest::Regtest;
 use std::collections::HashSet;
 
@@ -84,6 +85,12 @@ fn forge(kind: Kind, bytes: &[u8]) -> Result<Vec<Vec<u8>>> {
                 base(bytes, |p| p.recipe.holder_program = [12; 32])?,
                 base(bytes, |p| p.graph.assert_height += 1)?,
                 base(bytes, |p| p.spend_root = point(SPEND + 1))?,
+                // What only the quote fixes: the windows, depths, fees, cap.
+                base(bytes, |p| p.graph.holder_answer += 1)?,
+                base(bytes, |p| p.graph.to_self_delay += 1)?,
+                base(bytes, |p| p.chain.funding_depth += 1)?,
+                base(bytes, |p| p.fees.opening_fee_quote += 1)?,
+                base(bytes, |p| p.cap -= 1)?,
                 id(bytes),
                 version,
                 honest,
@@ -239,6 +246,11 @@ fn forged_messages_are_refused_and_the_opening_goes_on() -> Result<()> {
         (H, Kind::Terms, "programs she does not trust"),
         (H, Kind::Terms, "deadlines she did not ask for"),
         (H, Kind::Terms, "not her spending root"),
+        (H, Kind::Terms, "terms she was not quoted"),
+        (H, Kind::Terms, "terms she was not quoted"),
+        (H, Kind::Terms, "terms she was not quoted"),
+        (H, Kind::Terms, "terms she was not quoted"),
+        (H, Kind::Terms, "terms she was not quoted"),
         (H, Kind::Terms, "a message of another opening"),
         (H, Kind::Terms, "message of version 2"),
         (Hub, Kind::Keys, "count past the message"),
@@ -335,6 +347,68 @@ fn a_holder_given_another_hubs_keys_never_funds() -> Result<()> {
     ensure!(
         error.contains("stalled") && error.contains("by: Holder, kind: Some(Commit)"),
         "{error}"
+    );
+    Ok(())
+}
+
+/// A change to a quote.
+type Change = fn(&mut Quote);
+
+/// A holder opens on no quote under her network's floors: too little time
+/// to answer a challenge, too short a delay, too shallow a depth.
+#[test]
+fn a_quote_under_her_floors_is_refused() -> Result<()> {
+    let rt = Regtest::start_standard()?;
+    let checkpoint = checkpoint(&rt)?;
+    let ctx = Context {
+        tip: rt.height()?,
+        trust: Authority::mock().trust(),
+    };
+    let keyset = holder()?.keyset;
+    let start = |f: Change| {
+        let mut quote = quote(keyset.clone(), checkpoint.clone());
+        f(&mut quote);
+        Start {
+            seed: SEED,
+            spend: Scalar::from(SPEND),
+            quote,
+            deposit: OutPoint::null(),
+            wanted: Wanted {
+                assert_height: 200,
+                close_height: 400,
+                response_window: 6,
+            },
+            checkpoint: checkpoint.clone(),
+        }
+    };
+    let under: [(Change, &str); 5] = [
+        (
+            |q| q.graph.holder_answer = 5,
+            "5 blocks to answer, not 6 at least",
+        ),
+        (
+            |q| q.graph.to_self_delay = 5,
+            "a delay of 5 blocks, not 6 at least",
+        ),
+        (
+            |q| q.chain.funding_depth = 0,
+            "F 0 blocks deep, not 1 at least",
+        ),
+        (|q| q.chain.request_depth = 0, "a request 0 blocks deep"),
+        (
+            |q| q.chain.publication_depth = 0,
+            "a publication 0 blocks deep",
+        ),
+    ];
+    for (f, why) in under {
+        match machine::Holder::new(start(f), &ctx) {
+            Ok(_) => bail!("opened on a quote under the floors: {why}"),
+            Err(e) => ensure!(format!("{e:#}").contains(why), "{e:#}"),
+        }
+    }
+    ensure!(
+        machine::Holder::new(start(|_| ()), &ctx).is_ok(),
+        "the floors themselves"
     );
     Ok(())
 }

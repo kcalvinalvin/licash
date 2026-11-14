@@ -25,6 +25,7 @@ use licash::crypto::{self, Point};
 use licash::note::Keyset;
 use licash::opening::{FrozenPrefix, GraphOutput, RequestLeaf};
 use licash::request::Signer;
+use licash::spend::ChainProfile;
 use licash::statement::Journal;
 use lichen_babe::reveal::{check_presigs, points};
 use lichen_babe::setup::{instance, par, Hash, Instance, DIGITS};
@@ -445,8 +446,8 @@ pub struct Start {
     pub seed: [u8; 32],
     /// Her spending root's secret.
     pub spend: Scalar,
-    /// The keyset she will hold notes of.
-    pub keyset: Keyset,
+    /// The hub's terms she opens on, notes of its keyset among them.
+    pub quote: Quote,
     /// Her coin F spends, Base's `O_D`.
     pub deposit: OutPoint,
     pub wanted: wire::Wanted,
@@ -481,6 +482,17 @@ struct Graph {
     sigs: HashMap<String, Vec<u8>>,
 }
 
+/// The holder's first message, from what she brings and her keys.
+fn open(start: &Start, keys: &HolderKeys, ctx: &Context) -> wire::Open {
+    wire::Open {
+        spend_root: spend_root(&start.spend),
+        party: keys.party.public(),
+        deposit: start.deposit,
+        wanted: start.wanted,
+        mock: ctx.trust.mock,
+    }
+}
+
 /// The holder's side of an opening.
 pub struct Holder {
     start: Start,
@@ -499,8 +511,9 @@ pub struct Holder {
 }
 
 impl Holder {
-    /// Open with a fresh nonce: the first message, for the hub.
-    pub fn new(start: Start, ctx: &Context) -> (Self, Vec<Out>) {
+    /// Open with a fresh nonce: the first message, for the hub. Refused
+    /// on a quote under her network's [`Floors`].
+    pub fn new(start: Start, ctx: &Context) -> Result<(Self, Vec<Out>)> {
         Self::with(start, ctx, None)
     }
 
@@ -514,20 +527,18 @@ impl Holder {
         kept: [Vec<usize>; STAGES],
     ) -> Result<(Self, Vec<Out>)> {
         check_choice(&kept)?;
-        Ok(Self::with(start, ctx, Some(kept)))
+        Self::with(start, ctx, Some(kept))
     }
 
-    fn with(start: Start, ctx: &Context, fixed: Option<[Vec<usize>; STAGES]>) -> (Self, Vec<Out>) {
+    fn with(
+        start: Start,
+        ctx: &Context,
+        fixed: Option<[Vec<usize>; STAGES]>,
+    ) -> Result<(Self, Vec<Out>)> {
+        start.quote.check(start.checkpoint.profile())?;
         let id = Base::fresh_nonce();
         let keys = HolderKeys::derive(&start.seed, &id);
-        let open = wire::Open {
-            spend_root: spend_root(&start.spend),
-            party: keys.party.public(),
-            deposit: start.deposit,
-            wanted: start.wanted,
-            mock: ctx.trust.mock,
-        };
-        let out = vec![send(Kind::Open, id, open.encode())];
+        let out = vec![send(Kind::Open, id, open(&start, &keys, ctx).encode())];
         let holder = Self {
             start,
             id,
@@ -541,7 +552,7 @@ impl Holder {
             hub_sigs: None,
             funding: None,
         };
-        (holder, out)
+        Ok((holder, out))
     }
 
     /// The opening's id: her nonce, Base's.
@@ -587,7 +598,7 @@ impl Holder {
             p.deposit[..] == serialize(&s.deposit)[..],
             "not her deposit"
         );
-        ensure!(p.keyset == s.keyset, "notes of another keyset");
+        ensure!(p.keyset == s.quote.keyset, "notes of another keyset");
         let r = &p.recipe;
         let programs = Programs {
             holder: r.holder_program,
@@ -619,6 +630,16 @@ impl Holder {
             p.chain.checkpoint.commitment() == s.checkpoint.commitment(),
             "a checkpoint not of her chain"
         );
+        let quoted = offer(
+            &s.quote,
+            self.id,
+            &open(s, &self.keys, ctx),
+            ctx.trust.programs,
+            &s.checkpoint,
+            p.parties[1].clone(),
+            p.response_keys.clone(),
+        )?;
+        ensure!(quoted.digest() == base.digest(), "terms she was not quoted");
         let keys = self
             .keys
             .public(Signer::derive(&s.seed, &base.digest()).public());
@@ -938,8 +959,10 @@ impl Holder {
 }
 
 /// What a hub offers: all of Base but the holder's side, the deadlines
-/// she asks for and the programs, its trust's.
-pub struct Policy {
+/// she asks for and the programs, its trust's. A holder opens on the
+/// quote she was given: the Base she takes is the one it makes.
+#[derive(Clone)]
+pub struct Quote {
     pub keyset: Keyset,
     pub cap: u32,
     /// The deadlines and response window in it are the holder's.
@@ -951,10 +974,111 @@ pub struct Policy {
     pub fees: Fees,
 }
 
+/// The shortest windows and shallowest depths a holder opens on, by
+/// network: blocks she has to answer a challenge (`holder_answer`) and of
+/// the request leaf's relative delay (`to_self_delay`), and how deep F,
+/// her request and its publication must be.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Floors {
+    pub holder_answer: u16,
+    pub to_self_delay: u16,
+    pub depth: u32,
+}
+
+impl Floors {
+    pub fn of(profile: ChainProfile) -> Self {
+        let (holder_answer, to_self_delay, depth) = match profile {
+            ChainProfile::Core30DefaultRegtest => (6, 6, 1),
+            // A day of blocks.
+            ChainProfile::Core30Mainnet | ChainProfile::Core30Signet => (144, 144, 3),
+            ChainProfile::Mutinynet => (2_880, 2_880, 6),
+        };
+        Self {
+            holder_answer,
+            to_self_delay,
+            depth,
+        }
+    }
+}
+
+impl Quote {
+    /// Refused under `profile`'s floors.
+    pub fn check(&self, profile: ChainProfile) -> Result<()> {
+        let f = Floors::of(profile);
+        let g = &self.graph;
+        ensure!(
+            g.holder_answer >= f.holder_answer,
+            "{} blocks to answer, not {} at least",
+            g.holder_answer,
+            f.holder_answer
+        );
+        ensure!(
+            g.to_self_delay >= f.to_self_delay,
+            "a delay of {} blocks, not {} at least",
+            g.to_self_delay,
+            f.to_self_delay
+        );
+        let c = &self.chain;
+        for (what, depth) in [
+            ("F", c.funding_depth),
+            ("a request", c.request_depth),
+            ("a publication", c.publication_depth),
+        ] {
+            ensure!(
+                depth >= f.depth,
+                "{what} {depth} blocks deep, not {} at least",
+                f.depth
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Base on `quote` for the holder of `open`: her side and deadlines,
+/// the `programs` trusted and her `checkpoint`, with the hub's party and
+/// response keys. The hub builds it to offer, she again to check that it
+/// offers what it quoted.
+fn offer(
+    quote: &Quote,
+    id: [u8; 32],
+    open: &wire::Open,
+    programs: Programs,
+    checkpoint: &Checkpoint,
+    hub: Party,
+    response_keys: ResponseKeys,
+) -> Result<Base> {
+    let mut graph = quote.graph.clone();
+    graph.assert_height = open.wanted.assert_height;
+    graph.close_height = open.wanted.close_height;
+    graph.response_window = open.wanted.response_window;
+    let mut recipe = quote.recipe.clone();
+    recipe.holder_program = programs.holder;
+    recipe.counter_program = programs.counter;
+    let mut chain = quote.chain.clone();
+    chain.checkpoint = checkpoint.clone();
+    Ok(Base::new(Parts {
+        nonce: id,
+        spend_root: open.spend_root,
+        claim_key: open.party.delayed.serialize(),
+        keyset: quote.keyset.clone(),
+        deposit: serialize(&open.deposit)
+            .try_into()
+            .expect("an outpoint's 36 bytes"),
+        cap: quote.cap,
+        response_keys,
+        parties: [party(&open.party), hub],
+        graph,
+        recipe,
+        chain,
+        limits: quote.limits.clone(),
+        fees: quote.fees.clone(),
+    })?)
+}
+
 /// The hub's side of an opening.
 pub struct Hub {
     keys: HubKeys,
-    policy: Policy,
+    quote: Quote,
     id: Option<[u8; 32]>,
     base: Option<Base>,
     holder: Option<(wire::Keys, Babe)>,
@@ -967,24 +1091,24 @@ pub struct Hub {
 
 impl Hub {
     /// The hub's side of one opening, under a secret drawn for it alone.
-    pub fn new(policy: Policy) -> Self {
+    pub fn new(quote: Quote) -> Self {
         use rand_core::RngCore;
         let mut secret = [0; 32];
         rand_core::OsRng.fill_bytes(&mut secret);
-        Self::with(&secret, policy)
+        Self::with(&secret, quote)
     }
 
     /// [`Hub::new`] under `secret`. For fixtures only: a hub must never
     /// open twice under one secret.
     #[cfg(feature = "fixture")]
-    pub fn with_secret(secret: &[u8; 32], policy: Policy) -> Self {
-        Self::with(secret, policy)
+    pub fn with_secret(secret: &[u8; 32], quote: Quote) -> Self {
+        Self::with(secret, quote)
     }
 
-    fn with(secret: &[u8; 32], policy: Policy) -> Self {
+    fn with(secret: &[u8; 32], quote: Quote) -> Self {
         Self {
             keys: HubKeys::from_secret(secret),
-            policy,
+            quote,
             id: None,
             base: None,
             holder: None,
@@ -1034,31 +1158,16 @@ impl Hub {
             kind(o.mock),
             kind(ctx.trust.mock)
         );
-        let p = &self.policy;
-        let mut graph = p.graph.clone();
-        graph.assert_height = o.wanted.assert_height;
-        graph.close_height = o.wanted.close_height;
-        graph.response_window = o.wanted.response_window;
-        let mut recipe = p.recipe.clone();
-        recipe.holder_program = ctx.trust.programs.holder;
-        recipe.counter_program = ctx.trust.programs.counter;
-        let base = Base::new(Parts {
-            nonce: id,
-            spend_root: o.spend_root,
-            claim_key: o.party.delayed.serialize(),
-            keyset: p.keyset.clone(),
-            deposit: serialize(&o.deposit)
-                .try_into()
-                .expect("an outpoint's 36 bytes"),
-            cap: p.cap,
-            response_keys: ResponseKeys::new(self.keys.sealed.public())?,
-            parties: [party(&o.party), party(&self.keys.party.public())],
-            graph,
-            recipe,
-            chain: p.chain.clone(),
-            limits: p.limits.clone(),
-            fees: p.fees.clone(),
-        })?;
+        let q = &self.quote;
+        let base = offer(
+            q,
+            id,
+            &o,
+            ctx.trust.programs,
+            &q.chain.checkpoint,
+            party(&self.keys.party.public()),
+            ResponseKeys::new(self.keys.sealed.public())?,
+        )?;
         let out = vec![send(Kind::Terms, id, base.to_bytes())];
         self.id = Some(id);
         self.base = Some(base);

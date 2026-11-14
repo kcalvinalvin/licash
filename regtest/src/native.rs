@@ -29,7 +29,7 @@ use licash::statement::Journal;
 use licash::statement::Observed;
 use licash_contract::keys::{HolderKeys, HubKeys};
 pub use licash_contract::opening::journal;
-use licash_contract::opening::{self as machine, Input, Out, Policy, Start, Trust};
+use licash_contract::opening::{self as machine, Input, Out, Quote, Start, Trust};
 use licash_contract::wire::{Kind, Wanted};
 use licash_contract::{INSTANCES, KEPT};
 use lngap_btc::bitcoin::consensus::serialize;
@@ -106,7 +106,7 @@ impl Authority {
         })
     }
 
-    fn trust(&self) -> Trust {
+    pub fn trust(&self) -> Trust {
         Trust {
             programs: self.programs,
             statement: self.statement,
@@ -135,7 +135,8 @@ pub struct Holder {
     pub spend: Scalar,
 }
 
-fn checkpoint(rt: &Regtest) -> Result<Checkpoint> {
+/// A checkpoint at the node's tip, both parties' view of the chain.
+pub fn checkpoint(rt: &Regtest) -> Result<Checkpoint> {
     let anchor_hash = rt.rpc.get_best_block_hash()?;
     let anchor = rt.rpc.get_block_header(&anchor_hash)?;
     let mut times = vec![anchor.time];
@@ -156,8 +157,8 @@ fn checkpoint(rt: &Regtest) -> Result<Checkpoint> {
 
 /// The fixture Hub's terms: a 21-bit graph of 1-sat units, its challenge
 /// and the holder's answer 12 and 6 blocks.
-fn policy(keyset: Keyset, checkpoint: Checkpoint) -> Policy {
-    Policy {
+pub fn quote(keyset: Keyset, checkpoint: Checkpoint) -> Quote {
+    Quote {
         keyset,
         cap: 4_096,
         graph: GraphTerms {
@@ -289,18 +290,19 @@ pub fn open_native_with(
     let start = Start {
         seed: holder.seed,
         spend: holder.spend,
-        keyset: holder.keyset.clone(),
+        quote: quote(holder.keyset, checkpoint.clone()),
         deposit,
         wanted: Wanted {
             assert_height: h + t_a,
             close_height: h + t_a + 140,
             response_window: w_h,
         },
-        checkpoint: checkpoint.clone(),
+        checkpoint,
     };
+    let hub_quote = start.quote.clone();
     let (mut alice, out) = machine::Holder::with_choice(start, &ctx()?, [vec![2, 3], vec![2, 3]])?;
     let secret = sha256::Hash::hash(format!("{label}/hub").as_bytes()).to_byte_array();
-    let mut hub = machine::Hub::with_secret(&secret, policy(holder.keyset, checkpoint));
+    let mut hub = machine::Hub::with_secret(&secret, hub_quote);
     let mut queue = VecDeque::new();
     let mut refused = vec![];
     let mut funded = false;
