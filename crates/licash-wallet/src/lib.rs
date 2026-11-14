@@ -343,6 +343,13 @@ impl<T: Transport> Wallet<T> {
         self.network
     }
 
+    /// When the wallet file was made, in seconds since the Unix epoch: of
+    /// a new seed, no payment to it is older.
+    pub fn created_at(&self) -> Result<i64, Error> {
+        self.store
+            .read(|c| Ok(c.query_row("SELECT created_at FROM meta", [], |r| r.get(0))?))
+    }
+
     /// Where others pay this wallet.
     pub fn address(&self) -> Address {
         self.owner.address()

@@ -283,6 +283,8 @@ struct Indexer {
     first: Mutex<Option<u32>>,
     /// The height at which it names another block than the chain's.
     forged: Mutex<Option<u32>>,
+    /// How often it was asked for tweaks.
+    asked: Mutex<u32>,
 }
 
 impl Indexer {
@@ -294,6 +296,7 @@ impl Indexer {
                 pair.trim_start_matches('=').parse().unwrap()
             };
             let (from, count) = (number("from"), number("count"));
+            *self.asked.lock().unwrap() += 1;
             assert!(count <= licash_api::MAX_TWEAK_BLOCKS);
             let chain = self.chain.lock().unwrap();
             let mut blocks: Vec<BlockTweaks> = (from..from + count)
@@ -350,6 +353,7 @@ async fn setup() -> Setup {
         chain: chain.clone(),
         first: Mutex::new(Some(1)),
         forged: Mutex::new(None),
+        asked: Mutex::new(0),
     });
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("wallet.sqlite");
@@ -837,7 +841,7 @@ async fn a_wallet_file_of_the_first_version_gains_silent_payments() {
     assert_eq!(version(&path), 1);
     let wallet = Wallet::open(&path, Via(hub.clone())).unwrap();
     let address = wallet.silent_keys().address();
-    assert_eq!(version(&path), 3);
+    assert_eq!(version(&path), 4);
     assert_eq!(wallet.hubs().unwrap().len(), 1);
     assert_eq!(wallet.silent_next().unwrap(), None);
     wallet.watch_silent(HUB, 1).unwrap();
@@ -852,14 +856,14 @@ async fn a_wallet_file_of_the_first_version_gains_silent_payments() {
     // A newer version's file is refused, untouched.
     rusqlite::Connection::open(&path)
         .unwrap()
-        .pragma_update(None, "user_version", 4)
+        .pragma_update(None, "user_version", 5)
         .unwrap();
     match Wallet::open(&path, Via(hub)) {
-        Err(Error::Setup(why)) => assert!(why.contains("schema 4"), "{why}"),
+        Err(Error::Setup(why)) => assert!(why.contains("schema 5"), "{why}"),
         Err(other) => panic!("{other:?}"),
         Ok(_) => panic!("opened"),
     }
-    assert_eq!(version(&path), 4);
+    assert_eq!(version(&path), 5);
 }
 
 #[tokio::test]
@@ -1071,4 +1075,213 @@ async fn payments_to_fallback_addresses_are_seen_on_their_way() {
     s.mine(vec![spend]);
     s.scan().await.unwrap();
     assert!(s.wallet.unconfirmed_payments(&txs).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn without_tweaks_fallback_payments_their_spends_and_change_are_found() {
+    let s = setup().await;
+    *s.hub.first.lock().unwrap() = None;
+    s.wallet.add_hub(HUB).await.unwrap();
+    assert!(s.wallet.watch_silent(HUB, 1).is_err());
+    s.wallet.watch_silent(None, 1).unwrap();
+    let light = Light(s.chain.clone());
+    let paying = s.pay_plain(&s.fallback(), 30_000);
+    let silent = s.pay(&[s.address()], &[20_000]);
+    s.mine(vec![paying]);
+    s.mine(vec![silent]);
+    let scanned = s.wallet.scan_silent(None, &light, u32::MAX).await.unwrap();
+    assert_eq!((scanned.next, scanned.height), (5, 4));
+    // The fallback payment only: a silent payment needs its tweak.
+    let values: Vec<u64> = scanned.found.iter().map(|c| c.value).collect();
+    assert_eq!(values, [30_000]);
+
+    // Its spend, and the change of it, found with the tweak of the coins
+    // it spends.
+    let spend = s
+        .wallet
+        .spend_silent(elsewhere(), Some(10_000), rate())
+        .unwrap();
+    assert_eq!(spend.output.len(), 2);
+    s.mine(vec![spend.clone()]);
+    let scanned = s.wallet.scan_silent(None, &light, u32::MAX).await.unwrap();
+    assert_eq!(scanned.spent.len(), 1);
+    assert_eq!(scanned.found.len(), 1);
+    let change = scanned.found[0].clone();
+    assert!(change.change);
+    assert_eq!(change.outpoint.txid, spend.compute_txid());
+    // Spendable, and seen spent.
+    let all = s.wallet.spend_silent(elsewhere(), None, rate()).unwrap();
+    assert_signed(&s.chain.lock().unwrap(), &all);
+    s.mine(vec![all]);
+    let scanned = s.wallet.scan_silent(None, &light, u32::MAX).await.unwrap();
+    assert_eq!(scanned.spent, [change.outpoint]);
+    assert!(s.wallet.silent_coins().unwrap().is_empty());
+    assert_eq!(*s.hub.asked.lock().unwrap(), 0);
+}
+
+#[tokio::test]
+async fn blocks_looked_in_without_tweaks_are_looked_in_again_once_a_hub_serves_them() {
+    let s = setup().await;
+    let light = Light(s.chain.clone());
+    s.wallet.watch_silent(None, 1).unwrap();
+    let plain = s.pay_plain(&s.fallback(), 30_000);
+    let silent = s.pay(&[s.address()], &[20_000]);
+    s.mine(vec![plain]);
+    s.mine(vec![silent]);
+    let scanned = s.wallet.scan_silent(None, &light, u32::MAX).await.unwrap();
+    assert_eq!(scanned.found.len(), 1);
+    // The wallet's spend, in no block yet, outlives looking again.
+    let spend = s
+        .wallet
+        .spend_silent(elsewhere(), Some(10_000), rate())
+        .unwrap();
+    let txid = spend.compute_txid();
+
+    // From the first block looked in without tweaks: the silent payment
+    // found, the fallback payment again, once.
+    let scanned = s.scan().await.unwrap();
+    assert_eq!((scanned.next, scanned.height), (5, 4));
+    let mut values: Vec<u64> = scanned.found.iter().map(|c| c.value).collect();
+    values.sort();
+    assert_eq!(values, [20_000, 30_000]);
+    let mut coins: Vec<_> = s
+        .wallet
+        .silent_coins()
+        .unwrap()
+        .into_iter()
+        .map(|c| (c.value, c.spending))
+        .collect();
+    coins.sort();
+    assert_eq!(coins, [(20_000, None), (30_000, Some(txid))]);
+    assert_eq!(s.wallet.silent_spends().unwrap(), [spend]);
+    // Once.
+    s.chain.lock().unwrap().mine_empty(1);
+    s.fetched();
+    let scanned = s.scan().await.unwrap();
+    assert_eq!(scanned.next, 6);
+    assert!(scanned.found.is_empty());
+    assert!(s.fetched().is_empty());
+}
+
+#[tokio::test]
+async fn looking_again_with_tweaks_starts_at_the_first_block_the_hub_serves() {
+    let s = setup().await;
+    let light = Light(s.chain.clone());
+    s.wallet.watch_silent(None, 1).unwrap();
+    let early = s.pay(&[s.address()], &[10_000]);
+    s.mine(vec![early]);
+    s.chain.lock().unwrap().mine_empty(2);
+    let late = s.pay(&[s.address()], &[20_000]);
+    s.mine(vec![late]);
+    let scanned = s.wallet.scan_silent(None, &light, u32::MAX).await.unwrap();
+    assert_eq!(scanned.next, 7);
+    assert!(scanned.found.is_empty());
+
+    // A hub serving tweaks from after the next block is refused, and what
+    // was looked in without them is still to look in again.
+    s.chain.lock().unwrap().mine_empty(3);
+    *s.hub.first.lock().unwrap() = Some(8);
+    s.wallet.add_hub(HUB).await.unwrap();
+    match s.scan().await {
+        Err(Error::Invalid(why)) => assert!(why.contains("from block 8 on"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(s.wallet.silent_next().unwrap(), Some(7));
+
+    // One serving them from block 5: from it, not before.
+    *s.hub.first.lock().unwrap() = Some(5);
+    s.wallet.add_hub(HUB).await.unwrap();
+    let scanned = s.scan().await.unwrap();
+    assert_eq!(scanned.next, 10);
+    let values: Vec<u64> = scanned.found.iter().map(|c| c.value).collect();
+    assert_eq!(values, [20_000]);
+    // Once: the blocks before stay looked in without tweaks...
+    *s.hub.first.lock().unwrap() = Some(1);
+    s.wallet.add_hub(HUB).await.unwrap();
+    assert!(s.scan().await.unwrap().found.is_empty());
+    // ...unless looked in again from one.
+    s.wallet.watch_silent(HUB, 1).unwrap();
+    assert_eq!(s.scan().await.unwrap().found.len(), 2);
+}
+
+#[tokio::test]
+async fn a_reorganization_of_blocks_looked_in_without_tweaks_keeps_them_to_look_in_again() {
+    let s = setup().await;
+    let light = Light(s.chain.clone());
+    s.wallet.watch_silent(HUB, 1).unwrap();
+    s.scan().await.unwrap();
+    // Blocks 3 on looked in without tweaks.
+    let silent = s.pay(&[s.address()], &[10_000]);
+    s.mine(vec![silent.clone()]);
+    s.chain.lock().unwrap().mine_empty(2);
+    s.wallet.scan_silent(None, &light, u32::MAX).await.unwrap();
+    // Replaced from block 4, then from block 2, each looked in without
+    // tweaks again.
+    for at in [4, 2] {
+        s.chain.lock().unwrap().fork(at);
+        s.chain.lock().unwrap().mine_empty(6 - at);
+        if at == 2 {
+            s.mine(vec![silent.clone()]);
+        }
+        let scanned = s.wallet.scan_silent(None, &light, u32::MAX).await.unwrap();
+        assert!(scanned.found.is_empty());
+    }
+    let scanned = s.scan().await.unwrap();
+    let found: Vec<(u64, u32)> = scanned.found.iter().map(|c| (c.value, c.height)).collect();
+    assert_eq!(found, [(10_000, 6)]);
+    assert!(s.scan().await.unwrap().found.is_empty());
+}
+
+#[tokio::test]
+async fn a_wallet_file_of_version_3_never_watching_finds_its_fallback_payment() {
+    let Setup {
+        wallet,
+        chain,
+        hub,
+        dir,
+    } = setup().await;
+    drop(wallet);
+    let path = dir.path().join("v3.sqlite");
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute_batch(include_str!("fixtures/wallet-v3.sql"))
+        .unwrap();
+    let wallet = Wallet::open(&path, Via(hub.clone())).unwrap();
+    assert_eq!(wallet.silent_next().unwrap(), None);
+    // The address it handed out, still.
+    let code = wallet.payment_code(&[HUB.into()], true).unwrap();
+    let script = code.address.unwrap().assume_checked().script_pubkey();
+    assert_eq!(script, fallback_of(&wallet, 0));
+    let paying = chain.lock().unwrap().pay_plain(&script, 10_000);
+    chain.lock().unwrap().mine(vec![paying]);
+    wallet.watch_silent(None, 1).unwrap();
+    let light = Light(chain.clone());
+    let scanned = wallet.scan_silent(None, &light, u32::MAX).await.unwrap();
+    assert_eq!(scanned.found.len(), 1);
+    assert_eq!(*hub.asked.lock().unwrap(), 0);
+}
+
+#[tokio::test]
+async fn a_hub_serving_tweaks_from_the_next_block_looks_in_none_again() {
+    let s = setup().await;
+    let light = Light(s.chain.clone());
+    s.wallet.watch_silent(None, 1).unwrap();
+    s.chain.lock().unwrap().mine_empty(2);
+    let scanned = s.wallet.scan_silent(None, &light, u32::MAX).await.unwrap();
+    assert_eq!(scanned.next, 5);
+    // Tweaks from block 5 on: what was looked in without them stays so,
+    // and the first batch with them is looked in once.
+    *s.hub.first.lock().unwrap() = Some(5);
+    s.wallet.add_hub(HUB).await.unwrap();
+    let paying = s.pay(&[s.address()], &[10_000]);
+    s.mine(vec![paying]);
+    let scanned = s.scan().await.unwrap();
+    assert_eq!(scanned.next, 6);
+    assert_eq!(scanned.found.len(), 1);
+    s.fetched();
+    let scanned = s.scan().await.unwrap();
+    assert_eq!(scanned.next, 6);
+    assert!(scanned.found.is_empty());
+    assert!(s.fetched().is_empty());
+    assert_eq!(s.wallet.silent_coins().unwrap().len(), 1);
 }

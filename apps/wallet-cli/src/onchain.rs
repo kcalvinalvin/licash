@@ -179,8 +179,8 @@ async fn scan(
         bail!("no hub trusted serves silent payment tweaks");
     };
     match (from, wallet.silent_next()?) {
-        (Some(from), _) => wallet.watch_silent(&earliest, from)?,
-        (None, None) => wallet.watch_silent(&earliest, first)?,
+        (Some(from), _) => wallet.watch_silent(earliest.as_str(), from)?,
+        (None, None) => wallet.watch_silent(earliest.as_str(), first)?,
         (None, Some(_)) => {}
     }
     let chain = Blocks(source.clone());
@@ -238,7 +238,7 @@ async fn batch(
 ) -> anyhow::Result<licash_wallet::Scanned> {
     let mut failed = None;
     for (url, _) in hubs.iter().filter(|(_, first)| *first <= next) {
-        match wallet.scan_silent(url, chain, BATCH).await {
+        match wallet.scan_silent(url.as_str(), chain, BATCH).await {
             Ok(scanned) => return Ok(scanned),
             Err(e @ Error::Unavailable { .. }) => failed = Some(e),
             Err(e) => return Err(e.into()),

@@ -17,7 +17,16 @@ const VERSION: i64 = 1 + MIGRATIONS.len() as i64;
 
 /// What each version adds to the one before: the first takes 1 to 2. A
 /// file of an older version is brought up to date when opened.
-const MIGRATIONS: &[&str] = &[SILENT, FALLBACK];
+const MIGRATIONS: &[&str] = &[SILENT, FALLBACK, UNTWEAKED];
+
+/// Version 4: blocks looked in without tweaks, for fallback addresses and
+/// the coins held only. None in a file of an older version: it looked in
+/// every block with tweaks.
+const UNTWEAKED: &str = "
+-- The first of the blocks up to the next looked in without tweaks, to look
+-- in again for silent payments once a hub serves them: none if none was.
+ALTER TABLE silent_scan ADD COLUMN untweaked INTEGER;
+";
 
 /// Version 3: fallback addresses on Bitcoin, for payers of no silent
 /// payments.

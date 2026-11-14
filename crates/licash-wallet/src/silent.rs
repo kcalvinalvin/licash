@@ -17,6 +17,11 @@
 //! and [`FALLBACK_GAP`] after, are watched in every block, and the next is
 //! handed out once one is paid. Their coins are the address's like any.
 //!
+//! Without a hub serving tweaks, blocks are looked in for the fallback
+//! addresses and the coins held only, the change of the wallet's own spends
+//! with them: those blocks are looked in again for silent payments once a
+//! hub serving their tweaks is scanned with.
+//!
 //! [`Wallet::spend_silent`] spends the coins found, to a script or a silent
 //! payment address ([`Payee`]) and change to the wallet's change address:
 //! a transaction for the application to broadcast.
@@ -207,6 +212,10 @@ fn rewind(t: &Sql<'_>, next: u32, from: u32) -> Result<bool, Error> {
         )?;
     }
     t.execute("DELETE FROM silent_blocks WHERE height >= ?1", [from])?;
+    t.execute(
+        "UPDATE silent_scan SET untweaked = NULL WHERE untweaked >= ?1",
+        [from],
+    )?;
     Ok(true)
 }
 
@@ -246,6 +255,18 @@ fn p2tr(key: XOnlyPublicKey) -> ScriptBuf {
     ScriptBuf::new_p2tr_tweaked(TweakedPublicKey::dangerous_assume_tweaked(key))
 }
 
+/// The tweak of `tx` if it spends coins of `coins` only: the wallet's own
+/// spend, whose change it finds without a hub's tweaks.
+fn own_tweak(tx: &Transaction, coins: &HashMap<OutPoint, XOnlyPublicKey>) -> Option<PublicKey> {
+    let spent: Vec<ScriptBuf> = tx
+        .input
+        .iter()
+        .map(|i| coins.get(&i.previous_output).map(|key| p2tr(*key)))
+        .collect::<Option<_>>()?;
+    let spent: Vec<&bitcoin::Script> = spent.iter().map(ScriptBuf::as_script).collect();
+    silent::tweak(tx, &spent)
+}
+
 /// A taproot script of no key: any 32 bytes size one, to plan a spend
 /// paying a silent payment or change.
 fn any_taproot() -> ScriptBuf {
@@ -279,14 +300,21 @@ impl<T: Transport> Wallet<T> {
     /// on, with the tweaks of the hub at `hub`: the chain's height when the
     /// wallet was made, or an earlier block to look again, forgetting what
     /// was found from it on until found again. Never later than it stands,
-    /// nor earlier than the hub serves tweaks from.
-    pub fn watch_silent(&self, hub: &str, from: u32) -> Result<(), Error> {
-        let url = hub_url(hub)?;
-        let first = self.tweaks_from(&url)?;
-        if from < first {
-            return Err(Error::Invalid(format!(
-                "hub {url} serves tweaks from block {first} on, not {from}"
-            )));
+    /// nor earlier than the hub serves tweaks from. Without a hub, for any
+    /// block: to scan without tweaks.
+    pub fn watch_silent<'a>(
+        &self,
+        hub: impl Into<Option<&'a str>>,
+        from: u32,
+    ) -> Result<(), Error> {
+        if let Some(hub) = hub.into() {
+            let url = hub_url(hub)?;
+            let first = self.tweaks_from(&url)?;
+            if from < first {
+                return Err(Error::Invalid(format!(
+                    "hub {url} serves tweaks from block {first} on, not {from}"
+                )));
+            }
         }
         self.store.write(|t| {
             let next: Option<u32> = t
@@ -330,21 +358,32 @@ impl<T: Transport> Wallet<T> {
     /// at `hub` and the blocks of `chain`: up to the chain's height, or the
     /// newest block the hub indexed. Each batch of blocks is recorded whole,
     /// so an interrupted scan goes on from the last.
-    pub async fn scan_silent(
+    ///
+    /// Without a hub, for the fallback addresses and the coins held only,
+    /// the change of the wallet's own spends with them. Scanned with a hub
+    /// again, the blocks looked in so that it serves tweaks of are looked in
+    /// again first.
+    pub async fn scan_silent<'a>(
         &self,
-        hub: &str,
+        hub: impl Into<Option<&'a str>>,
         chain: &impl Blocks,
         max: u32,
     ) -> Result<Scanned, Error> {
-        let url = hub_url(hub)?;
-        let first = self.tweaks_from(&url)?;
+        let url = hub.into().map(hub_url).transpose()?;
+        let first = match &url {
+            Some(url) => Some(self.tweaks_from(url)?),
+            None => None,
+        };
         if self.silent_next()?.is_none() {
             return Err(Error::Invalid(
                 "not watching for silent payments: watch_silent first".into(),
             ));
         }
         let height = chain.height().await.map_err(chain_error)?;
-        let next = self.unwind(chain, height).await?;
+        let mut next = self.unwind(chain, height).await?;
+        if let Some(first) = first {
+            next = self.look_again(next, first)?;
+        }
         let mut scanned = Scanned {
             next,
             height,
@@ -355,10 +394,12 @@ impl<T: Transport> Wallet<T> {
         if next > height || max == 0 {
             return Ok(scanned);
         }
-        if next < first {
-            return Err(Error::Invalid(format!(
-                "hub {url} serves tweaks from block {first} on, not {next}"
-            )));
+        if let (Some(url), Some(first)) = (&url, first) {
+            if next < first {
+                return Err(Error::Invalid(format!(
+                    "hub {url} serves tweaks from block {first} on, not {next}"
+                )));
+            }
         }
         let end = height.min(next.saturating_add(max - 1));
         // Read after the chain's height: an address handed out meanwhile is
@@ -369,23 +410,30 @@ impl<T: Transport> Wallet<T> {
         let mut coins = self.held_outputs()?;
         while scanned.next <= end {
             let count = (end - scanned.next + 1).min(MAX_TWEAK_BLOCKS);
-            let path = format!("{TWEAKS}?from={}&count={count}", scanned.next);
-            let blocks: Vec<BlockTweaks> = self.get(&url, &path).await?;
-            if blocks.is_empty() {
-                break;
-            }
             let mut batch = Batch::default();
-            for tweaks in blocks.into_iter().take(count as usize) {
-                let at = scanned.next + batch.blocks.len() as u32;
-                let fetched = self
-                    .look(&url, chain, &finder, at, &tweaks, &mut coins, &mut batch)
-                    .await?;
-                scanned.fetched += u32::from(fetched);
+            if let Some(url) = &url {
+                let path = format!("{TWEAKS}?from={}&count={count}", scanned.next);
+                let blocks: Vec<BlockTweaks> = self.get(url, &path).await?;
+                for tweaks in blocks.into_iter().take(count as usize) {
+                    let at = scanned.next + batch.blocks.len() as u32;
+                    let tweaks = Some((url.as_str(), &tweaks));
+                    let fetched = self
+                        .look(chain, &finder, at, tweaks, &mut coins, &mut batch)
+                        .await?;
+                    scanned.fetched += u32::from(fetched);
+                }
+            } else {
+                for at in scanned.next..scanned.next + count {
+                    let fetched = self
+                        .look(chain, &finder, at, None, &mut coins, &mut batch)
+                        .await?;
+                    scanned.fetched += u32::from(fetched);
+                }
             }
             let Some(&(last, _)) = batch.blocks.last() else {
                 break;
             };
-            self.record_silent(scanned.next, &batch)?;
+            self.record_silent(scanned.next, &batch, url.is_none())?;
             scanned.next = last + 1;
             scanned
                 .found
@@ -416,40 +464,75 @@ impl<T: Transport> Wallet<T> {
         Ok(scanned)
     }
 
-    /// Look in block `at` with its `tweaks` from the hub at `url`, adding
-    /// to `batch` what it holds for the wallet, and to `coins` the coins
-    /// found: whether the block was fetched.
-    #[allow(clippy::too_many_arguments)]
+    /// Before looking on from `next` with a hub serving tweaks from block
+    /// `first` on: look again from the first block looked in without them
+    /// it serves tweaks of, forgetting what was found from it on until
+    /// found again. The next block to look in. Those before `first` stay
+    /// looked in without tweaks; none is looked in again if the hub serves
+    /// no block before `next`.
+    fn look_again(&self, next: u32, first: u32) -> Result<u32, Error> {
+        if next < first {
+            return Ok(next);
+        }
+        let from = self.store.write(|t| {
+            let untweaked: Option<u32> =
+                t.query_row("SELECT untweaked FROM silent_scan", [], |r| r.get(0))?;
+            let Some(from) = untweaked.map(|u| u.max(first)) else {
+                return Ok(next);
+            };
+            if from < next && !rewind(t, next, from)? {
+                return Err(raced());
+            }
+            let cleared = t.execute(
+                "UPDATE silent_scan SET untweaked = NULL WHERE next = ?1",
+                [from.min(next)],
+            )?;
+            if cleared == 0 {
+                return Err(raced());
+            }
+            Ok(from.min(next))
+        })?;
+        if from < next {
+            tracing::info!(from, next, "silent payments looked for again with tweaks");
+        }
+        Ok(from)
+    }
+
+    /// Look in block `at` with its `tweaks` from the hub at their URL, if
+    /// any, adding to `batch` what it holds for the wallet, and to `coins`
+    /// the coins found: whether the block was fetched.
     async fn look(
         &self,
-        url: &str,
         chain: &impl Blocks,
         finder: &Finder,
         at: u32,
-        tweaks: &BlockTweaks,
+        tweaks: Option<(&str, &BlockTweaks)>,
         coins: &mut HashMap<OutPoint, XOnlyPublicKey>,
         batch: &mut Batch,
     ) -> Result<bool, Error> {
-        if tweaks.height != at {
-            return Err(unavailable(
-                url,
-                format!("tweaks of block {} asked for {at}", tweaks.height),
-            ));
-        }
         let hash = chain.hash(at).await.map_err(chain_error)?;
-        if tweaks.hash != hash.to_string() {
-            return Err(unavailable(
-                url,
-                format!("its block {at} is {}, the chain's {hash}", tweaks.hash),
-            ));
-        }
+        let points = match tweaks {
+            None => Vec::new(),
+            Some((url, tweaks)) => {
+                if tweaks.height != at {
+                    return Err(unavailable(
+                        url,
+                        format!("tweaks of block {} asked for {at}", tweaks.height),
+                    ));
+                }
+                if tweaks.hash != hash.to_string() {
+                    return Err(unavailable(
+                        url,
+                        format!("its block {at} is {}, the chain's {hash}", tweaks.hash),
+                    ));
+                }
+                let points = tweaks.tweaks.iter().map(|t| PublicKey::from_slice(&t.0));
+                points
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| unavailable(url, format!("a tweak of block {at}: {e}")))?
+            }
+        };
         batch.blocks.push((at, hash));
-        let points = tweaks
-            .tweaks
-            .iter()
-            .map(|t| PublicKey::from_slice(&t.0))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| unavailable(url, format!("a tweak of block {at}: {e}")))?;
         let candidates: Vec<Vec<XOnlyPublicKey>> = points
             .iter()
             .map(|p| finder.scanner.candidates(p))
@@ -495,13 +578,15 @@ impl<T: Transport> Wallet<T> {
         // In the block's order: a coin may be paid and spent in one block.
         for (i, tx) in block.txdata.iter().enumerate() {
             let txid = tx.compute_txid();
+            let own = own_tweak(tx, coins);
             for input in &tx.input {
                 if coins.remove(&input.previous_output).is_some() {
                     batch.spent.push((input.previous_output, txid, at));
                 }
             }
             let mut seen = HashSet::new();
-            for point in paying.get(&i).into_iter().flatten() {
+            let points = paying.get(&i).into_iter().flatten().copied();
+            for point in points.chain(own.as_ref()) {
                 let outputs = silent::taproot_outputs(tx);
                 for found in finder.scanner.scan(point, &outputs) {
                     let vout = tx
@@ -585,9 +670,9 @@ impl<T: Transport> Wallet<T> {
         Ok(from)
     }
 
-    /// Record `batch`, looked in from block `from`, unless another scan
-    /// moved on meanwhile.
-    fn record_silent(&self, from: u32, batch: &Batch) -> Result<(), Error> {
+    /// Record `batch`, looked in from block `from`, without tweaks if
+    /// `untweaked`, unless another scan moved on meanwhile.
+    fn record_silent(&self, from: u32, batch: &Batch, untweaked: bool) -> Result<(), Error> {
         let Some(&(last, _)) = batch.blocks.last() else {
             return Ok(());
         };
@@ -598,6 +683,12 @@ impl<T: Transport> Wallet<T> {
             )?;
             if moved == 0 {
                 return Err(raced());
+            }
+            if untweaked {
+                t.execute(
+                    "UPDATE silent_scan SET untweaked = coalesce(untweaked, ?1)",
+                    [from],
+                )?;
             }
             let pending = if batch.found.is_empty() && batch.spent.is_empty() {
                 HashMap::new()
