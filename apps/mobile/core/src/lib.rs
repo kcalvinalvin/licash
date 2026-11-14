@@ -76,6 +76,10 @@ pub enum LicashError {
     /// A hub at an onion address, and the wallet opened without Tor.
     #[error("an onion hub is reached through Tor: turn it on")]
     NeedsTor,
+    /// A payment of notes at the hub at `url`, which the wallet does not
+    /// trust: [`Wallet::receive`] it trusting the hub to take it.
+    #[error("a payment at hub {url}, not trusted yet")]
+    UnknownHub { url: String },
     /// The wallet's own storage failed.
     #[error("{reason}")]
     Failed { reason: String },
@@ -89,6 +93,7 @@ impl From<licash_wallet::Error> for LicashError {
             E::Unavailable { .. } => Self::Unavailable { reason },
             E::Pending { .. } | E::NoteTaken => Self::Pending { reason },
             E::Insufficient { needed, available } => Self::Insufficient { needed, available },
+            E::UnknownHub(url) => Self::UnknownHub { url },
             E::Setup(_) | E::Storage(_) => Self::Failed { reason },
             _ => Self::Invalid { reason },
         }

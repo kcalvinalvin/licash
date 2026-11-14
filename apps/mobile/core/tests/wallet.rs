@@ -490,7 +490,11 @@ fn a_phone_paid_on_bitcoin_moves_it_to_notes_and_pays_in_them() {
     let handover = paid.handover.unwrap();
     assert_eq!(bob.scanned(handover.clone()).unwrap(), Scanned::Payment);
     let carol = Wallet::create(net.dir("carol"), Network::Regtest, 0, false).unwrap();
-    assert!(invalid(carol.receive(handover.clone(), false)).contains("unknown hub"));
+    let unknown = carol.receive(handover.clone(), false);
+    assert!(
+        matches!(&unknown, Err(LicashError::UnknownHub { url }) if *url == hubs[0].url),
+        "{unknown:?}"
+    );
     let refused = invalid(carol.receive(handover.clone(), true));
     assert!(refused.contains("pays this wallet nothing"), "{refused}");
     assert_eq!(carol.hubs().unwrap().len(), 1);
