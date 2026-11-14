@@ -21,6 +21,8 @@ research implementation; it has not had a security review.
   after interruptions.
 - `crates/licash-swaps`: a swap provider over its own wallet: swaps of notes
   at one hub for notes at another, with a timed lock at each.
+- `crates/licash-onchain`: Bitcoin outside the protocol: silent payments
+  (BIP352).
 - `crates/licash-groth16`: RISC Zero Groth16 receipt verification, used
   inside the holder's program and on the host.
 - `r0/`: the holder's and the hub's programs for the RISC Zero zkVM, and a

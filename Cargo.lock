@@ -510,6 +510,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "licash-onchain"
+version = "0.0.1"
+dependencies = [
+ "bitcoin",
+ "hex",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "licash-swaps"
 version = "0.0.1"
 dependencies = [

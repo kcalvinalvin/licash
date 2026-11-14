@@ -4,6 +4,7 @@ members = [
     "crates/licash",
     "crates/licash-api",
     "crates/licash-hub",
+    "crates/licash-onchain",
     "crates/licash-swaps",
     "crates/licash-wallet",
 ]

@@ -1,0 +1,14 @@
+[package]
+name = "licash-onchain"
+description = "Licash on Bitcoin: silent payments (BIP352)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bitcoin = { version = "=0.32.102", default-features = false, features = ["std"] }
+thiserror.workspace = true
+
+[dev-dependencies]
+hex.workspace = true
+serde_json.workspace = true
