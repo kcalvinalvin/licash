@@ -1,5 +1,7 @@
-//! The hub service: a [`Hub`] behind the v1 HTTP API of [`licash_api`].
+//! The hub service: a [`Hub`] behind the v1 HTTP API of [`licash_api`],
+//! and its Lightning gateway if it runs one.
 
+pub mod lightning;
 pub mod notify;
 pub mod watch;
 
@@ -13,10 +15,12 @@ use axum::{
     Json, Router,
 };
 use licash_api::{
-    Check, Checked, Code, Info, Issued, Lock, LockState, Locked, Offer, Offered, Problem, Refund,
-    Release, Released, Settle, Unlink, Unlinked,
+    Check, Checked, Code, Info, Issued, Lock, LockState, Locked, Offer, Offered, Pay, Paying,
+    Problem, Receive, ReceiveStatus, Receiving, Refund, Release, Released, Settle, Unlink,
+    Unlinked,
 };
 use licash_hub::{Error, Hub, Settled};
+use lightning::Gateway;
 use tower_http::trace::TraceLayer;
 
 /// The largest request body: a spend of the most inputs and outputs the
@@ -26,9 +30,12 @@ pub const BODY_LIMIT: usize = 1 << 20;
 /// `ok`, or 503 once the hub halted.
 pub const HEALTH: &str = "/health";
 
-pub fn router(hub: Arc<Hub>) -> Router {
-    Router::new()
+/// The API of `hub`, with the Lightning paths of `gateway` if given.
+pub fn router(hub: Arc<Hub>, gateway: Option<Arc<Gateway>>) -> Router {
+    let info_of = Router::new()
         .route(licash_api::INFO, get(info))
+        .with_state((hub.clone(), gateway.clone()));
+    let mut api = Router::new()
         .route(licash_api::OFFER, post(offer))
         .route(licash_api::RELEASE, post(release))
         .route(licash_api::UNLINK, post(unlink))
@@ -38,12 +45,23 @@ pub fn router(hub: Arc<Hub>) -> Router {
         .route(licash_api::SETTLE, post(settle))
         .route(licash_api::REFUND, post(refund))
         .route(HEALTH, get(health))
-        .layer(DefaultBodyLimit::max(BODY_LIMIT))
-        .layer(TraceLayer::new_for_http())
         .with_state(hub)
+        .merge(info_of);
+    if let Some(gateway) = gateway {
+        api = api.merge(
+            Router::new()
+                .route(licash_api::LN_PAY, post(ln_pay))
+                .route(licash_api::LN_RECEIVE, post(ln_receive))
+                .route(licash_api::LN_RECEIVE_STATE, get(ln_receive_state))
+                .with_state(gateway),
+        );
+    }
+    api.layer(DefaultBodyLimit::max(BODY_LIMIT))
+        .layer(TraceLayer::new_for_http())
 }
 
 /// A [`Problem`] answered with its status.
+#[derive(Debug)]
 pub struct Failure(pub Problem);
 
 impl IntoResponse for Failure {
@@ -105,8 +123,10 @@ async fn health(State(hub): State<Arc<Hub>>) -> Result<&'static str, Failure> {
     Ok("ok")
 }
 
-async fn info(State(hub): State<Arc<Hub>>) -> Answer<Info> {
-    blocking(hub, |hub| Ok(hub.advertise()?)).await
+async fn info(State((hub, gateway)): State<(Arc<Hub>, Option<Arc<Gateway>>)>) -> Answer<Info> {
+    let Json(mut info) = blocking(hub, |hub| Ok(hub.advertise()?)).await?;
+    info.lightning = gateway.and_then(|gateway| gateway.advertise());
+    Ok(Json(info))
 }
 
 async fn offer(
@@ -207,4 +227,28 @@ async fn refund(
         Ok(Issued::new(&hub.refund(&body.decode()?)?))
     })
     .await
+}
+
+async fn ln_pay(
+    State(gateway): State<Arc<Gateway>>,
+    body: Result<Json<Pay>, JsonRejection>,
+) -> Answer<Paying> {
+    let Json(body) = body?;
+    Ok(Json(gateway.pay(&body).await?))
+}
+
+async fn ln_receive(
+    State(gateway): State<Arc<Gateway>>,
+    body: Result<Json<Receive>, JsonRejection>,
+) -> Answer<Receiving> {
+    let Json(body) = body?;
+    Ok(Json(gateway.receive(&body).await?))
+}
+
+async fn ln_receive_state(
+    State(gateway): State<Arc<Gateway>>,
+    Path(hash): Path<String>,
+) -> Answer<ReceiveStatus> {
+    let hash = licash_api::hash_of(&hash)?;
+    Ok(Json(gateway.receive_status(&hash)?))
 }

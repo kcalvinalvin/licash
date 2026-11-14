@@ -1058,6 +1058,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "axum",
+ "base64",
  "bitcoin",
  "clap",
  "hex",
@@ -1066,8 +1067,13 @@ dependencies = [
  "licash-api",
  "licash-chain-client",
  "licash-hub",
+ "licash-hub-service",
  "licash-notify",
+ "licash-wallet",
+ "lightning-invoice",
+ "reqwest",
  "rusqlite",
+ "rustls",
  "serde",
  "serde_json",
  "tempfile",
@@ -1139,9 +1145,9 @@ dependencies = [
 
 [[package]]
 name = "lightning-invoice"
-version = "0.34.2"
+version = "0.34.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5e874476e461bcca94ae30335bc5263f126f9219fdbd7bde6e02b530dbaa6567"
+checksum = "47d83bd798e04ab9eecc8bbef1fa17d3808859bcdc0406bd16c55d51c8834444"
 dependencies = [
  "bech32",
  "bitcoin",

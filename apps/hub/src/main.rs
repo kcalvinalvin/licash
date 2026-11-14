@@ -14,6 +14,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use licash_chain_client::Source;
 use licash_hub::{Fee, Hub, Ledger, Policy, Timing};
 use licash_hub_service::{
+    lightning::{lnd::Lnd, Config, Gateway},
     notify::{self, Notifier},
     watch::watch,
 };
@@ -150,6 +151,113 @@ struct PolicyArgs {
     max_lag: u64,
 }
 
+/// The hub's Lightning gateway, over an LND node.
+#[derive(Args)]
+struct LightningArgs {
+    /// Run a Lightning gateway over the LND REST API at this URL, such as
+    /// `https://127.0.0.1:8080`.
+    #[arg(long, value_name = "URL", env = "LICASH_HUB_LND")]
+    lnd: Option<String>,
+    /// The macaroon the gateway calls LND with: it pays, and makes, settles
+    /// and cancels invoices.
+    #[arg(
+        long,
+        value_name = "FILE",
+        env = "LICASH_HUB_LND_MACAROON",
+        requires = "lnd"
+    )]
+    lnd_macaroon: Option<PathBuf>,
+    /// LND's TLS certificate, pinned. Without it, the URL's certificate
+    /// must validate against the system's roots.
+    #[arg(
+        long,
+        value_name = "FILE",
+        env = "LICASH_HUB_LND_CERT",
+        requires = "lnd"
+    )]
+    lnd_cert: Option<PathBuf>,
+    /// The fee on each invoice paid, routing fees included, in satoshis.
+    #[arg(long, env = "LICASH_HUB_LN_PAY_FEE_BASE", default_value_t = Config::default().pay.base)]
+    ln_pay_fee_base: u64,
+    /// The fee on each invoice paid, in parts per million of its amount.
+    #[arg(long, env = "LICASH_HUB_LN_PAY_FEE_PPM", default_value_t = Config::default().pay.ppm,
+          value_parser = ppm())]
+    ln_pay_fee_ppm: u64,
+    /// The fee on each payment received, in satoshis.
+    #[arg(long, env = "LICASH_HUB_LN_RECEIVE_FEE_BASE", default_value_t = 0)]
+    ln_receive_fee_base: u64,
+    /// The fee on each payment received, in parts per million.
+    #[arg(long, env = "LICASH_HUB_LN_RECEIVE_FEE_PPM", default_value_t = 0, value_parser = ppm())]
+    ln_receive_fee_ppm: u64,
+    /// The largest invoice paid, in satoshis.
+    #[arg(long, env = "LICASH_HUB_LN_MAX_PAY", default_value_t = Config::default().max_pay)]
+    ln_max_pay: u64,
+    /// The least received, in satoshis.
+    #[arg(long, env = "LICASH_HUB_LN_MIN_RECEIVE", default_value_t = Config::default().min_receive)]
+    ln_min_receive: u64,
+    /// The most received, in satoshis.
+    #[arg(long, env = "LICASH_HUB_LN_MAX_RECEIVE", default_value_t = Config::default().max_receive)]
+    ln_max_receive: u64,
+    /// Blocks between the end of a payment's route timelock and the
+    /// expiry of the lock paying for it.
+    #[arg(long, env = "LICASH_HUB_LN_PAY_SLACK", default_value_t = Config::default().pay_slack)]
+    ln_pay_slack: u32,
+    /// LND's `holdexpirydelta`: blocks before an HTLC's expiry at which
+    /// LND cancels it while held.
+    #[arg(long, env = "LICASH_HUB_LN_HOLD_DELTA", default_value_t = Config::default().hold_delta)]
+    ln_hold_delta: u32,
+    /// Blocks the gateway may be down while a payment received is locked.
+    #[arg(long, env = "LICASH_HUB_LN_DOWNTIME", default_value_t = Config::default().downtime)]
+    ln_downtime: u32,
+    /// Blocks a payment received stays locked to its payee.
+    #[arg(long, env = "LICASH_HUB_LN_RECEIVE_BLOCKS", default_value_t = Config::default().receive_blocks)]
+    ln_receive_blocks: u32,
+    /// Seconds an invoice to receive stays payable.
+    #[arg(long, env = "LICASH_HUB_LN_INVOICE_EXPIRY", default_value_t = Config::default().invoice_expiry)]
+    ln_invoice_expiry: u64,
+    /// Seconds LND tries to route a payment.
+    #[arg(long, env = "LICASH_HUB_LN_PAY_TIMEOUT", default_value_t = Config::default().pay_timeout)]
+    ln_pay_timeout: u32,
+}
+
+impl LightningArgs {
+    /// The node and the gateway's configuration, if it runs one.
+    fn gateway(&self) -> anyhow::Result<Option<(Lnd, Config)>> {
+        let Some(url) = &self.lnd else {
+            return Ok(None);
+        };
+        let macaroon = self
+            .lnd_macaroon
+            .as_ref()
+            .context("--lnd needs --lnd-macaroon")?;
+        let macaroon =
+            std::fs::read(macaroon).with_context(|| format!("read {}", macaroon.display()))?;
+        let cert = match &self.lnd_cert {
+            Some(path) => {
+                Some(std::fs::read(path).with_context(|| format!("read {}", path.display()))?)
+            }
+            None => None,
+        };
+        let lnd = Lnd::new(url, &macaroon, cert.as_deref()).context("--lnd")?;
+        let fee = |base, ppm| Fee { base, ppm };
+        let config = Config {
+            pay: fee(self.ln_pay_fee_base, self.ln_pay_fee_ppm),
+            receive: fee(self.ln_receive_fee_base, self.ln_receive_fee_ppm),
+            max_pay: self.ln_max_pay,
+            min_receive: self.ln_min_receive,
+            max_receive: self.ln_max_receive,
+            pay_slack: self.ln_pay_slack,
+            hold_delta: self.ln_hold_delta,
+            downtime: self.ln_downtime,
+            receive_blocks: self.ln_receive_blocks,
+            invoice_expiry: self.ln_invoice_expiry,
+            pay_timeout: self.ln_pay_timeout,
+            ..Config::default()
+        };
+        Ok(Some((lnd, config)))
+    }
+}
+
 fn ppm() -> clap::builder::RangedU64ValueParser<u64> {
     clap::value_parser!(u64).range(0..=1_000_000)
 }
@@ -198,6 +306,8 @@ enum Command {
         chain: Chain,
         #[command(flatten)]
         notify: Notify,
+        #[command(flatten)]
+        lightning: Box<LightningArgs>,
         /// Notify only of these kinds of event [default: all].
         #[arg(long, value_name = "KIND", env = "LICASH_HUB_NOTIFY_KINDS", value_delimiter = ',',
               value_parser = clap::builder::PossibleValuesParser::new(notify::KINDS))]
@@ -262,10 +372,16 @@ fn command(cli: Cli) -> anyhow::Result<()> {
             policy,
             chain,
             notify,
+            lightning,
             notify_kinds,
         } => {
             let policy = policy.policy();
             let chain = chain.source(&policy)?;
+            let lightning = lightning.gateway()?;
+            anyhow::ensure!(
+                lightning.is_none() || chain.is_some(),
+                "a Lightning gateway (--lnd) needs --chain"
+            );
             let targets = notify.targets()?;
             // Before the hub opens, so that new targets hear of its start.
             let notifier = if targets.is_empty() {
@@ -278,7 +394,17 @@ fn command(cli: Cli) -> anyhow::Result<()> {
             };
             let hub = Hub::open(&seed, &db, policy).context("open the hub")?;
             let hub = Arc::new(hub);
-            tokio::runtime::Runtime::new()?.block_on(serve(hub, listen, policy, chain, notifier))
+            let gateway = match lightning {
+                Some((lnd, config)) => {
+                    let path = cli.data.join("lightning.sqlite");
+                    let gateway = Gateway::open(hub.clone(), Arc::new(lnd), config, &path)
+                        .context("open the Lightning gateway")?;
+                    Some(Arc::new(gateway))
+                }
+                None => None,
+            };
+            let serving = serve(hub, listen, policy, chain, notifier, gateway);
+            tokio::runtime::Runtime::new()?.block_on(serving)
         }
         Command::TestNotify { notify } => test_notify(&notify),
         Command::Status { json } => status(&db, json),
@@ -308,6 +434,7 @@ async fn serve(
     policy: Policy,
     chain: Option<(Source, Duration)>,
     notifier: Option<Notifier>,
+    gateway: Option<Arc<Gateway>>,
 ) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(listen)
         .await
@@ -326,11 +453,15 @@ async fn serve(
     if watching.is_none() {
         tracing::warn!("following no chain (--chain): locks are refused");
     }
-    axum::serve(listener, licash_hub_service::router(hub))
+    let paying = gateway.clone().map(|gateway| {
+        tracing::info!("running a Lightning gateway");
+        tokio::spawn(gateway.run())
+    });
+    axum::serve(listener, licash_hub_service::router(hub, gateway))
         .with_graceful_shutdown(shutdown())
         .await?;
-    if let Some(watching) = watching {
-        watching.abort();
+    for task in [watching, paying].into_iter().flatten() {
+        task.abort();
     }
     if let (Some(notifying), Some(notifier)) = (notifying, notifier) {
         // Events not yet sent go out after the next start.

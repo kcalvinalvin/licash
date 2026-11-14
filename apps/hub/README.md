@@ -16,6 +16,12 @@ licash-hub --data ./hub events --follow
 `<data>/hub.sqlite` while the hub runs: the hub halts, and `/health` answers
 503, until it is restarted.
 
+With `--lnd URL --lnd-macaroon FILE` (and `--chain`), the hub also runs a
+Lightning gateway over LND: it pays invoices for locks that pay the hub,
+and makes hold invoices paid with locks of its notes. `--lnd-cert` pins
+LND's certificate. The gateway keeps its invoices in
+`<data>/lightning.sqlite`: back it up with `hub.sqlite`.
+
 Notification targets are Apprise URLs (`gotify[s]://`, `tgram://`,
 `ntfy[s]://`, `json[s]://`, `apprise[s]://`); `test-notify` checks them.
 

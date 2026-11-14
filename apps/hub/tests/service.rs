@@ -58,7 +58,7 @@ fn service_with(policy: Policy) -> Service {
     let keyset = keys.keyset().unwrap();
     Service {
         dir,
-        app: licash_hub_service::router(hub.clone()),
+        app: licash_hub_service::router(hub.clone(), None),
         hub,
         keys,
         keyset,
