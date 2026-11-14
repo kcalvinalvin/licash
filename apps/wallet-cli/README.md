@@ -20,6 +20,12 @@ hub has not answered; `resume` finishes it. Back up the wallet file: its
 seed alone does not restore its notes. After restoring an old copy, `check`
 drops the notes spent since.
 
+`code` prints a payment code (a BIP321 URI, `--qr` for QR codes) naming the
+wallet, the hubs it is paid at and its Nostr mailbox, if they name relays.
+`pay <code> [amount]` pays it at a hub it names that the wallet trusts and
+holds enough at, and sends the payment to the mailbox, else prints it to
+hand over; `mailbox` receives what was sent there.
+
 A lock pays its payee on a secret's preimage until it expires, then returns
 to the payer: the payee runs `secret` and hands over the hash, the payer
 runs `lock <address> <amount> <hash>`, and the payee runs `claim <id>

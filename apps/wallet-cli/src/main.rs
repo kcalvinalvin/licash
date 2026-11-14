@@ -17,8 +17,8 @@ use licash_api::Payment;
 use licash_nostr::{Role, Route};
 use licash_transport::Http;
 use licash_wallet::{
-    Deposit, DepositState, Error, Invoice, InvoiceState, Lock, LockState, State, Swap, SwapState,
-    Wallet,
+    Deposit, DepositState, Error, Invoice, InvoiceState, Lock, LockState, PaymentCode, State, Swap,
+    SwapState, Wallet,
 };
 use rand_core::{OsRng, RngCore};
 use serde_json::json;
@@ -76,6 +76,37 @@ enum Command {
     },
     /// Where others pay this wallet.
     Address,
+    /// A payment code to show as text or a QR code: payers pay it in notes
+    /// at a hub it names that they trust, else on Bitcoin to its silent
+    /// payment address, if it has one.
+    Code {
+        /// A hub it is paid at, preferred first; repeat it for more
+        /// [default: the two trusted holding the most].
+        #[arg(long)]
+        hub: Vec<String>,
+        /// With the wallet's silent payment address, for payers to pay on
+        /// Bitcoin: only if something scans for its payments, as this does
+        /// not.
+        #[arg(long)]
+        sp: bool,
+        /// In upper case, which a QR code holds in fewer modules.
+        #[arg(long)]
+        qr: bool,
+    },
+    /// Pay the payee of a payment code AMOUNT, the hub's fee on top, at a
+    /// hub it names that this wallet trusts and holds enough at: sent to
+    /// the payee's mailbox, else printed to hand over (its id on stderr).
+    Pay {
+        code: String,
+        /// In satoshis [default: what the code asks for].
+        amount: Option<u64>,
+        /// Write the payment here instead of to stdout, if not sent.
+        #[arg(long, short)]
+        out: Option<PathBuf>,
+    },
+    /// Receive the payments sent to the wallet's mailbox, on the relays its
+    /// hubs name, and unlink their notes.
+    Mailbox,
     /// Trust the hub at URL, or learn again what it charges.
     AddHub { url: String },
     /// The hubs trusted, and their fees.
@@ -304,11 +335,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 None if path.exists() => Wallet::open(&path, Http::new(None)?)?.network(),
                 None => ChainProfile::Core30Mainnet,
             };
-            let route = match (tor, cli.proxy.as_deref()) {
-                (Some(tor), _) => Route::Tor(tor),
-                (None, Some(proxy)) => Route::socks(proxy)?,
-                (None, None) => Route::Direct,
-            };
+            let route = route(tor, cli.proxy.as_deref())?;
             return discover(transport, route, &relays, network.name(), swaps, json).await;
         }
         _ => {}
@@ -325,6 +352,40 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Address => {
             let address = encode(&wallet.address());
             show(json, json!({ "address": address }), address.clone());
+        }
+        Command::Code { hub, sp, qr } => {
+            let hubs = match hub.is_empty() {
+                false => hub,
+                true => {
+                    let mut balance = wallet.balance()?;
+                    balance.sort_by_key(|b| std::cmp::Reverse(b.available));
+                    balance.into_iter().take(2).map(|b| b.hub).collect()
+                }
+            };
+            if hubs.is_empty() {
+                bail!("no hub: `licash-wallet add-hub URL` trusts one");
+            }
+            let code = wallet.payment_code(&hubs, sp)?;
+            let mailbox = code.licash.as_ref().is_some_and(|c| c.mailbox.is_some());
+            let text = if qr { code.qr() } else { code.to_string() };
+            if !mailbox {
+                eprintln!(
+                    "warning: none of its hubs names mailbox relays: payments are handed over"
+                );
+            }
+            show(
+                json,
+                json!({ "code": text, "hubs": hubs, "mailbox": mailbox, "sp": sp }),
+                text.clone(),
+            );
+        }
+        Command::Pay { code, amount, out } => {
+            let route = || route(tor.clone(), cli.proxy.as_deref());
+            pay(&wallet, route, &code, amount, out.as_deref(), json).await?;
+        }
+        Command::Mailbox => {
+            let route = route(tor.clone(), cli.proxy.as_deref())?;
+            mailbox(&wallet, &route, json).await?;
         }
         Command::AddHub { url } => {
             let info = wallet.add_hub(&url).await?;
@@ -904,6 +965,140 @@ async fn resume(wallet: &Wallet<Http>, json: bool) -> anyhow::Result<()> {
         Some((id, reason)) => Err(Error::Pending { id, reason }.into()),
         None => Ok(()),
     }
+}
+
+/// Pay the payee of payment code `text` `amount`, or what the code asks
+/// for, at a hub it names that the wallet trusts and holds enough at: sent
+/// to its mailbox on the relays that hub names, if it has one, else written
+/// to `out` or stdout to hand over.
+async fn pay(
+    wallet: &Wallet<Http>,
+    route: impl FnOnce() -> anyhow::Result<Route>,
+    text: &str,
+    amount: Option<u64>,
+    out: Option<&Path>,
+    json: bool,
+) -> anyhow::Result<()> {
+    let code: PaymentCode = text.parse()?;
+    code.check(wallet.network())?;
+    let amount = match (amount, code.amount) {
+        (Some(amount), Some(asked)) if amount != asked => {
+            bail!("the code asks for {asked}, not {amount}")
+        }
+        (Some(amount), _) | (None, Some(amount)) => amount,
+        (None, None) => bail!("how much to pay: the code does not say"),
+    };
+    let hub = match &code.licash {
+        Some(licash) => wallet.hub_to_pay(licash, amount)?,
+        None => None,
+    };
+    let (Some(licash), Some(hub)) = (&code.licash, hub) else {
+        let none = format!("no hub it names is one trusted holding {amount} and the fee");
+        let onchain = match (&code.silent, &code.address) {
+            (Some(silent), _) => Some(silent.to_string()),
+            (None, Some(address)) => Some(address.assume_checked_ref().to_string()),
+            (None, None) => None,
+        };
+        match onchain {
+            Some(to) => bail!("{none}: pay {to} on Bitcoin"),
+            None => bail!("{none}"),
+        }
+    };
+    let paid = wallet.send(&hub, &licash.address, amount).await?;
+    eprintln!("payment {}", paid.id);
+    let relays = wallet
+        .hubs()?
+        .into_iter()
+        .find(|(url, _)| *url == hub)
+        .map(|(_, info)| info.relays)
+        .unwrap_or_default();
+    let sent = match licash.mailbox {
+        Some(to) if !relays.is_empty() => {
+            let content = serde_json::to_string(&paid.payment)?;
+            let sent =
+                async { licash_nostr::mailbox::send(&to, &content, &relays, &route()?).await };
+            match sent.await {
+                Ok(relays) => Some(relays),
+                Err(e) => {
+                    eprintln!("warning: not sent to the payee's mailbox ({e:#}): hand it over");
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+    match sent {
+        Some(relays) => show(
+            json,
+            json!({ "id": paid.id, "hub": hub, "amount": amount, "relays": relays }),
+            format!("paid {amount} at {hub}: sent to the payee's mailbox"),
+        ),
+        None => write_payment(&paid.payment, out)?,
+    }
+    Ok(())
+}
+
+/// Receive the payments in the wallet's mailbox, on the relays its hubs
+/// name: each once, of hubs it trusts only.
+async fn mailbox(wallet: &Wallet<Http>, route: &Route, json: bool) -> anyhow::Result<()> {
+    let mut relays: Vec<String> = Vec::new();
+    for (_, info) in wallet.hubs()? {
+        for relay in info.relays {
+            if !relays.contains(&relay) {
+                relays.push(relay);
+            }
+        }
+    }
+    if relays.is_empty() {
+        bail!("no hub trusted names mailbox relays: `licash-wallet add-hub URL` learns them again");
+    }
+    let mail = licash_nostr::mailbox::fetch(&wallet.mailbox_secret(), &relays, route).await?;
+    let mut received = Vec::new();
+    for mail in mail {
+        let payment: Payment = match serde_json::from_str(&mail.content) {
+            Ok(payment) => payment,
+            Err(_) => {
+                eprintln!("warning: {} in the mailbox is not a payment", mail.id);
+                continue;
+            }
+        };
+        match wallet.receive(&payment) {
+            Ok(payment) => received.push(payment),
+            Err(Error::AlreadyReceived) => {}
+            Err(e) => eprintln!("warning: {} in the mailbox not taken: {e}", mail.id),
+        }
+    }
+    let unlinked = match received.is_empty() {
+        true => Some(0),
+        false => unlink(wallet).await,
+    };
+    let rows = received
+        .iter()
+        .map(|r| json!({ "id": r.id, "hub": r.hub, "amount": r.amount }));
+    let mut lines: Vec<String> = received
+        .iter()
+        .map(|r| format!("received {} at {}", r.amount, r.hub))
+        .collect();
+    if lines.is_empty() {
+        lines.push("nothing new".into());
+    }
+    let rows: Vec<_> = rows.collect();
+    show(
+        json,
+        json!({ "received": rows, "unlinked": unlinked }),
+        lines.join("\n"),
+    );
+    Ok(())
+}
+
+/// How to reach Nostr relays: through the wallet's own Tor client, else
+/// `proxy`, else directly.
+fn route(tor: Option<licash_tor::Tor>, proxy: Option<&str>) -> anyhow::Result<Route> {
+    Ok(match (tor, proxy) {
+        (Some(tor), _) => Route::Tor(tor),
+        (None, Some(proxy)) => Route::socks(proxy)?,
+        (None, None) => Route::Direct,
+    })
 }
 
 /// Unlink what can be: a failure leaves notes linked until the next try.

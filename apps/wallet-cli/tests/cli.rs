@@ -732,3 +732,97 @@ fn owners_deposit_on_bitcoin_and_take_back_what_was_never_received() {
     hub.confirm_sent();
     failed(refund(late_hash), 1, "nothing unspent pays");
 }
+
+#[test]
+fn owners_pay_payment_codes_through_mailboxes_or_by_hand() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let (_relay, relay) = support::relay(&runtime);
+    let hub = Server::with_relays(FEE, vec![relay]);
+    let plain = Server::start(FEE);
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, alice_address) = party(dir.path(), "alice", Some(&hub));
+    let (bob, _) = party(dir.path(), "bob", Some(&hub));
+    let funding = serde_json::to_string(&hub.pay(&address(&alice_address), 100)).unwrap();
+    ok(wallet(&alice, &["receive"], Some(&funding)));
+
+    // Bob's code names his hub and his mailbox on its relays; as a QR
+    // code, in upper case, with his silent payment address.
+    let code = json(&bob, &["code"]);
+    assert_eq!(
+        (code["mailbox"].as_bool(), code["sp"].as_bool()),
+        (Some(true), Some(false))
+    );
+    let text = code["code"].as_str().unwrap().to_owned();
+    assert!(text.starts_with("bitcoin:?licash=tlicash1q"), "{text}");
+    let qr = ok(wallet(&bob, &["code", "--qr", "--sp"], None))
+        .trim()
+        .to_owned();
+    assert!(
+        qr.starts_with("BITCOIN:?SP=TSP1Q") && qr.contains("&LICASH=TLICASH1Q"),
+        "{qr}"
+    );
+
+    // Alice pays it: sent to his mailbox, nothing to hand over.
+    let paid = json(&alice, &["pay", &qr, "30"]);
+    assert_eq!(
+        (paid["amount"].as_u64(), paid["relays"].as_u64()),
+        (Some(30), Some(1))
+    );
+    assert_eq!(available(&alice), (69, 0));
+    let got = json(&bob, &["mailbox"]);
+    assert_eq!(got["received"][0]["amount"], 30);
+    assert_eq!(available(&bob), (30, 0));
+    // Each payment is taken once.
+    assert_eq!(json(&bob, &["mailbox"])["received"], serde_json::json!([]));
+    assert_eq!(ok(wallet(&bob, &["mailbox"], None)).trim(), "nothing new");
+
+    // What the code asks for, unless told otherwise; more than she holds
+    // and its fee is for Bitcoin, at the silent payment address.
+    let asking = text.replacen("bitcoin:?", "bitcoin:?amount=0.0000002&", 1);
+    assert_eq!(json(&alice, &["pay", &asking])["amount"], 20);
+    failed(
+        wallet(&alice, &["pay", &asking, "21"], None),
+        1,
+        "asks for 20, not 21",
+    );
+    failed(
+        wallet(&alice, &["pay", &text], None),
+        1,
+        "the code does not say",
+    );
+    failed(wallet(&alice, &["pay", &qr, "49"], None), 1, "on Bitcoin");
+    let sp = qr.split(['=', '&']).nth(1).unwrap().to_lowercase();
+    failed(
+        wallet(&alice, &["pay", &qr, "49"], None),
+        1,
+        &format!("pay {sp} on Bitcoin"),
+    );
+    assert_eq!(json(&bob, &["mailbox"])["received"][0]["amount"], 20);
+
+    // Carol's hub names no relays: her code has no mailbox, and the
+    // payment is handed over. Alice trusts it, and pays there.
+    let (carol, _) = party(dir.path(), "carol", Some(&plain));
+    let code = json(&carol, &["code"]);
+    assert_eq!(code["mailbox"], false);
+    failed(
+        wallet(&alice, &["pay", code["code"].as_str().unwrap(), "5"], None),
+        1,
+        "no hub it names",
+    );
+    json(&alice, &["add-hub", &plain.url()]);
+    let funding = serde_json::to_string(&plain.pay(&address(&alice_address), 10)).unwrap();
+    ok(wallet(&alice, &["receive"], Some(&funding)));
+    let payment = ok(wallet(
+        &alice,
+        &["pay", code["code"].as_str().unwrap(), "5"],
+        None,
+    ));
+    let received = ok(wallet(&carol, &["--json", "receive"], Some(&payment)));
+    let received: Value = serde_json::from_str(&received).unwrap();
+    assert_eq!(received["amount"], 5);
+    failed(
+        wallet(&carol, &["mailbox"], None),
+        1,
+        "no hub trusted names mailbox relays",
+    );
+}

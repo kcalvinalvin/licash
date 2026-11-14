@@ -83,6 +83,8 @@ pub struct Server {
     pub lightning: Option<(Arc<Gateway>, Arc<Fake>)>,
     /// The deposit gateway, and the URL of the mock Esplora it follows.
     pub deposits: Option<(Arc<deposit::Gateway>, String)>,
+    /// The mailbox relays its info names.
+    relays: Vec<String>,
     backend: esplora::Shared,
     addr: SocketAddr,
     seed: PathBuf,
@@ -94,23 +96,28 @@ impl Server {
     /// A hub charging `fee` on spends and in each branch of a lock, at
     /// height 3 of its chain.
     pub fn start(fee: Fee) -> Self {
-        Self::started(fee, false, false)
+        Self::started(fee, false, false, Vec::new())
     }
 
     /// [`Server::start`], with a gateway charging 2 to pay an invoice and
     /// 1 to take a payment, of 100 at most.
     pub fn with_lightning(fee: Fee) -> Self {
-        Self::started(fee, true, false)
+        Self::started(fee, true, false, Vec::new())
     }
 
     /// [`Server::start`], taking deposits of 1000 to 4000 for a fee of
     /// 100, paid by block 10 after they are asked for, claimed to
     /// [`SWEEP`] and refundable [`DEPOSIT_TIMEOUT`] blocks after.
     pub fn with_deposits(fee: Fee) -> Self {
-        Self::started(fee, false, true)
+        Self::started(fee, false, true, Vec::new())
     }
 
-    fn started(fee: Fee, lightning: bool, deposits: bool) -> Self {
+    /// [`Server::start`], naming `relays` for its wallets' mailboxes.
+    pub fn with_relays(fee: Fee, relays: Vec<String>) -> Self {
+        Self::started(fee, false, false, relays)
+    }
+
+    fn started(fee: Fee, lightning: bool, deposits: bool, relays: Vec<String>) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let (seed, db) = (dir.path().join("seed"), dir.path().join("hub.sqlite"));
         Hub::init(&seed, &db, MAX_POW).unwrap();
@@ -166,6 +173,7 @@ impl Server {
             hub,
             lightning,
             deposits,
+            relays,
             backend,
             addr: "127.0.0.1:0".parse().unwrap(),
             seed,
@@ -290,6 +298,7 @@ impl Server {
         let (hub, at) = (self.hub.clone(), self.addr);
         let gateway = self.lightning.as_ref().map(|(gateway, _)| gateway.clone());
         let deposits = self.deposits.as_ref().map(|(gateway, _)| gateway.clone());
+        let relays = self.relays.clone();
         let thread = std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -306,6 +315,7 @@ impl Server {
                         licash_hub_service::Services {
                             gateway,
                             deposits,
+                            relays,
                             ..Default::default()
                         },
                     ),
