@@ -1,0 +1,130 @@
+//! The provider's API over a provider whose wallet reaches no hub, and its
+//! binary's commands that need none.
+
+use std::{process::Command, sync::Arc};
+
+use axum::{
+    body::Body,
+    http::{Request, StatusCode},
+    Router,
+};
+use http_body_util::BodyExt;
+use licash_api::{swaps, Code, Problem};
+use licash_swaps::{Config, Provider};
+use licash_wallet::{Response, Transport, Wallet};
+use tower::ServiceExt;
+
+struct Offline;
+
+impl Transport for Offline {
+    fn request(
+        &self,
+        _: &str,
+        _: Option<Vec<u8>>,
+    ) -> impl std::future::Future<Output = Result<Response, String>> + Send {
+        std::future::ready(Err("offline".into()))
+    }
+}
+
+fn router(dir: &tempfile::TempDir) -> (Router, Arc<Provider<Offline>>) {
+    let wallet = Wallet::create(&dir.path().join("wallet.sqlite"), &[5; 32], Offline).unwrap();
+    let provider = Provider::create(&dir.path().join("swaps.sqlite"), wallet, Config::default());
+    let provider = Arc::new(provider.unwrap());
+    let router = licash_swaps_service::router(provider.clone(), Some("ab".repeat(32)));
+    (router, provider)
+}
+
+async fn call(router: &Router, path: &str, body: Option<&str>) -> (StatusCode, Vec<u8>) {
+    let request = match body {
+        Some(body) => Request::post(path)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_owned())),
+        None => Request::get(path).body(Body::empty()),
+    };
+    let response = router.clone().oneshot(request.unwrap()).await.unwrap();
+    let status = response.status();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    (status, body.to_vec())
+}
+
+fn problem(body: &[u8]) -> Problem {
+    serde_json::from_slice(body).unwrap()
+}
+
+#[tokio::test]
+async fn the_api_answers_what_the_provider_swaps_and_declines_the_rest() {
+    let dir = tempfile::tempdir().unwrap();
+    let (router, provider) = router(&dir);
+
+    let (status, body) = call(&router, swaps::SWAPS_INFO, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let info: swaps::Info = serde_json::from_slice(&body).unwrap();
+    assert_eq!(info.address, provider.wallet().address());
+    assert_eq!((info.fee, info.margin), (Config::default().fee, 12));
+    assert!(info.hubs.is_empty());
+    assert_eq!(info.nostr, Some("ab".repeat(32)));
+
+    let address = provider.wallet().address();
+    let id = licash::spend::ProposalId::from_bytes([1; 32]);
+    let request = swaps::Request::new(&address, &id, &address, &address, 5000);
+    let body = serde_json::to_string(&request).unwrap();
+    let (status, answer) = call(&router, swaps::SWAPS, Some(&body)).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(problem(&answer).code, Code::Declined);
+
+    let (status, answer) = call(&router, swaps::SWAPS, Some("{\"from\": 1}")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(problem(&answer).code, Code::Invalid);
+
+    let (status, answer) = call(&router, &swaps::swap_state(&id), None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(problem(&answer).code, Code::UnknownLock);
+    let (status, _) = call(&router, "/v1/swaps/zz", None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let (status, body) = call(&router, licash_swaps_service::HEALTH, None).await;
+    assert_eq!(
+        (status, body.as_slice()),
+        (StatusCode::OK, b"ok".as_slice())
+    );
+}
+
+fn licash_swaps(dir: &tempfile::TempDir, args: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_licash-swaps"))
+        .arg("--data")
+        .arg(dir.path().join("data"))
+        .args(args)
+        .env_remove("RUST_LOG")
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn init_creates_the_provider_once_and_status_reads_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let init = licash_swaps(&dir, &["init"]);
+    assert!(init.status.success(), "{init:?}");
+    let address = String::from_utf8(init.stdout).unwrap();
+    assert_eq!(
+        address.trim().len(),
+        2 * licash::address::ADDRESS_BYTES,
+        "{address}"
+    );
+    let again = licash_swaps(&dir, &["init"]);
+    assert!(!again.status.success());
+
+    let status = licash_swaps(&dir, &["status", "--json"]);
+    assert!(status.status.success(), "{status:?}");
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["address"], address.trim());
+    assert_eq!(status["stats"]["open"], 0);
+    assert_eq!(status["swaps"], serde_json::json!([]));
+    let text = licash_swaps(&dir, &["status"]);
+    assert!(String::from_utf8(text.stdout).unwrap().contains("earned"));
+    let events = licash_swaps(&dir, &["events"]);
+    assert!(events.status.success() && events.stdout.is_empty());
+
+    let bad = licash_swaps(&dir, &["run", "--margin", "4"]);
+    assert!(!bad.status.success());
+    assert!(String::from_utf8(bad.stderr).unwrap().contains("--margin"));
+}

@@ -37,6 +37,8 @@ jobs:
         run: docker build -f apps/hub/Dockerfile .
       - name: Wallet image
         run: docker build -f apps/wallet-cli/Dockerfile .
+      - name: Swaps image
+        run: docker build -f apps/swaps/Dockerfile .
   e2e:
     runs-on: ubuntu-latest
     timeout-minutes: 45

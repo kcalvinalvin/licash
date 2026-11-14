@@ -28,9 +28,11 @@ research implementation; it has not had a security review.
 - `regtest/`: the contract's BABE transaction graph and end-to-end tests on
   Bitcoin Core and LND. See [regtest/README.md](regtest/README.md).
 - `apps/`: the applications, a workspace of their own: the hub service
-  (`apps/hub`), operator notifications (`apps/notify`), announcements on
-  Nostr (`apps/nostr`), the wallet CLI (`apps/wallet-cli`), and end-to-end
-  tests of hubs, their Lightning gateways and wallets on a regtest
+  (`apps/hub`), the swap provider service (`apps/swaps`), the wallet CLI
+  (`apps/wallet-cli`), their HTTP transport (`apps/transport`), chain
+  sources (`apps/chain-client`), operator notifications (`apps/notify`),
+  announcements on Nostr (`apps/nostr`), and end-to-end tests of hubs,
+  their Lightning gateways, swap providers and wallets on a regtest
   ecosystem in Docker (`apps/e2e`).
 - `paper/`: the paper's source; `paper/build.sh` rebuilds the PDF (Docker).
 

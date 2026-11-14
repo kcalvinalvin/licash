@@ -2,7 +2,7 @@
 # their runtime dependencies stay out of the SDK's.
 [workspace]
 resolver = "2"
-members = ["chain-client", "e2e", "hub", "nostr", "notify", "transport", "wallet-cli"]
+members = ["chain-client", "e2e", "hub", "nostr", "notify", "swaps", "transport", "wallet-cli"]
 
 [workspace.package]
 version = "0.0.1"
@@ -13,6 +13,7 @@ license = "MIT"
 licash = { path = "../crates/licash" }
 licash-api = { path = "../crates/licash-api" }
 licash-hub = { path = "../crates/licash-hub" }
+licash-swaps = { path = "../crates/licash-swaps" }
 licash-wallet = { path = "../crates/licash-wallet" }
 licash-chain-client = { path = "chain-client" }
 licash-nostr = { path = "nostr" }

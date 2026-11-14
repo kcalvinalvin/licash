@@ -1469,6 +1469,49 @@ dependencies = [
 ]
 
 [[package]]
+name = "licash-swaps"
+version = "0.0.1"
+dependencies = [
+ "hex",
+ "licash",
+ "licash-api",
+ "licash-wallet",
+ "rand_core 0.6.4",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tracing",
+]
+
+[[package]]
+name = "licash-swaps-service"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "axum",
+ "clap",
+ "hex",
+ "http-body-util",
+ "licash",
+ "licash-api",
+ "licash-chain-client",
+ "licash-nostr",
+ "licash-notify",
+ "licash-swaps",
+ "licash-transport",
+ "licash-wallet",
+ "rand_core 0.6.4",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tower",
+ "tower-http 0.7.1",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "licash-transport"
 version = "0.0.1"
 dependencies = [
