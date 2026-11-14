@@ -11,3 +11,8 @@
 !crates/licash-wallet
 !apps
 **/target
+**/tmp
+# The Android app and its light client: only the wallet core's manifest is
+# needed, a member of the applications' workspace.
+apps/mobile/android
+apps/mobile/chain
