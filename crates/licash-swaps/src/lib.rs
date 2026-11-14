@@ -366,6 +366,8 @@ pub struct Provider<T: Transport> {
     /// Held while one request is checked against what the provider holds
     /// and recorded.
     taking: Mutex<()>,
+    /// The hubs the operator was told the provider holds too little at.
+    short: Mutex<HashSet<String>>,
 }
 
 /// Setup and what the provider says of itself.
@@ -389,6 +391,7 @@ impl<T: Transport> Provider<T> {
             config,
             busy: Mutex::default(),
             taking: Mutex::default(),
+            short: Mutex::default(),
         }
     }
 
@@ -409,8 +412,31 @@ impl<T: Transport> Provider<T> {
     /// What the provider swaps now, as its hubs last said of themselves:
     /// at each hub that follows a chain, the most it can lock there.
     pub fn info(&self) -> Result<swaps::Info, Error> {
+        let hubs = self
+            .stock()?
+            .into_iter()
+            .map(|(_, address, free)| Hub {
+                address,
+                max: free.min(self.config.max),
+            })
+            .collect();
+        Ok(swaps::Info {
+            address: self.wallet.address(),
+            fee: self.config.fee,
+            min: self.config.min,
+            max: self.config.max,
+            margin: self.config.margin,
+            hubs,
+            nostr: None,
+        })
+    }
+
+    /// At each hub that follows a chain, by URL and address, the most the
+    /// provider can lock there: what it holds, less what the swaps it took
+    /// will lock and the hub's fee.
+    fn stock(&self) -> Result<Vec<(String, Address, u64)>, Error> {
         let balance = self.wallet.balance()?;
-        let mut hubs = Vec::new();
+        let mut stock = Vec::new();
         for (url, info) in self.wallet.hubs()? {
             if info.locks.is_none() {
                 continue;
@@ -422,20 +448,32 @@ impl<T: Transport> Provider<T> {
             let free = available
                 .saturating_sub(self.reserved(&url)?)
                 .saturating_sub(info.fees.lock.due(available));
-            hubs.push(Hub {
-                address: info.address,
-                max: free.min(self.config.max),
-            });
+            stock.push((url, info.address, free));
         }
-        Ok(swaps::Info {
-            address: self.wallet.address(),
-            fee: self.config.fee,
-            min: self.config.min,
-            max: self.config.max,
-            margin: self.config.margin,
-            hubs,
-            nostr: None,
-        })
+        Ok(stock)
+    }
+
+    /// Alert the operator of each hub the provider can no longer swap to,
+    /// holding less there than the least it swaps: once, until it holds
+    /// enough again. The hubs it alerted of now.
+    pub fn check_stock(&self) -> Result<Vec<String>, Error> {
+        let stock = self.stock()?;
+        let mut short = self.short.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut alerted = Vec::new();
+        for (url, _, free) in stock {
+            if free >= self.config.min {
+                short.remove(&url);
+            } else if !short.contains(&url) {
+                self.alert(&format!(
+                    "No swaps to {url}: the provider holds {free} free there, less than \
+                     the least it swaps, {}.",
+                    self.config.min
+                ))?;
+                short.insert(url.clone());
+                alerted.push(url);
+            }
+        }
+        Ok(alerted)
     }
 
     /// What the swaps accepted and not locked yet will lock at `url`.

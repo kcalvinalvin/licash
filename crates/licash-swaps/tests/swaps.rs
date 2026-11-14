@@ -573,3 +573,30 @@ async fn a_client_reveals_nothing_for_a_lock_that_does_not_pay_it_the_swap() {
         assert_eq!(held(&eco.client, A), 100 - FEE.base);
     }
 }
+
+#[tokio::test]
+async fn the_operator_is_alerted_once_of_each_hub_the_provider_cannot_swap_to() {
+    let eco = Eco::new(30).await;
+    let provider = eco.provider();
+    // Nothing at A, 30 at B: swaps to A stop.
+    assert_eq!(provider.check_stock().unwrap(), [A]);
+    assert_eq!(provider.check_stock().unwrap(), Vec::<String>::new());
+    let events = provider.events(0, 10).unwrap();
+    assert!(matches!(
+        events[0].notice(),
+        Some(Notice::Alert { message }) if message.contains(A) && message.contains("least")
+    ));
+
+    // Paid at A, it swaps to A again; it holds too little at B now.
+    let swap = eco.client.swap(PROVIDER, A, B, 25).await.unwrap();
+    assert_eq!(swap.state, SwapState::Done);
+    assert!(provider.step().await.unwrap().is_empty());
+    assert_eq!(provider.check_stock().unwrap(), [B]);
+    assert_eq!(provider.check_stock().unwrap(), Vec::<String>::new());
+    assert_eq!(eco.kinds(), ["alert", "accepted", "done", "alert"]);
+
+    // Told again once started again.
+    drop(provider);
+    eco.restart();
+    assert_eq!(eco.provider().check_stock().unwrap(), [B]);
+}

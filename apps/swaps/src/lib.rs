@@ -110,7 +110,8 @@ async fn state<T: Transport + 'static>(
     }
 }
 
-/// Take the swaps of `provider` on every `every`, for good.
+/// Take the swaps of `provider` on every `every`, and alert of the hubs it
+/// holds too little at to swap to, for good.
 pub async fn step<T: Transport + 'static>(provider: Arc<Provider<T>>, every: Duration) {
     loop {
         match provider.step().await {
@@ -120,6 +121,14 @@ pub async fn step<T: Transport + 'static>(provider: Arc<Provider<T>>, every: Dur
                 }
             }
             Err(e) => tracing::warn!("taking the swaps on: {e}"),
+        }
+        match provider.check_stock() {
+            Ok(short) => {
+                for hub in short {
+                    tracing::warn!(%hub, "too little held to swap to it");
+                }
+            }
+            Err(e) => tracing::warn!("checking what it holds: {e}"),
         }
         tokio::time::sleep(every).await;
     }

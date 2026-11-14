@@ -18,7 +18,8 @@ licash-swaps --data ./swaps events --follow
 ```
 
 The provider swaps between the hubs its wallet added, up to what it holds
-at the destination hub. Back up `<data>/wallet.sqlite` and
+at the destination hub; an alert says when that falls below `--min`, once
+a start until it recovers. Back up `<data>/wallet.sqlite` and
 `<data>/swaps.sqlite` together. A stopped provider takes its swaps on when
 started again, but a swap whose client lock expires before it claims it is
 lost (`status` counts it, and a high-priority notification says so):
