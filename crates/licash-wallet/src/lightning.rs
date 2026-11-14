@@ -16,7 +16,9 @@ use licash::{
     claim::Branch,
     spend::{lock_hash, ProposalId},
 };
-use licash_api::{Pay, PayState, Paying, Receive, ReceiveState, ReceiveStatus, Receiving};
+use licash_api::{
+    Lightning, Pay, PayState, Paying, Receive, ReceiveState, ReceiveStatus, Receiving,
+};
 use lightning_invoice::Bolt11Invoice;
 use rand_core::{OsRng, RngCore};
 use rusqlite::{params, OptionalExtension, Row};
@@ -53,12 +55,124 @@ pub enum InvoiceState {
     Canceled(String),
 }
 
+/// A Lightning invoice to pay, as [`Wallet::read_invoice`] reads it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Payable {
+    /// The BOLT11 invoice, to pay with [`Wallet::pay_invoice`].
+    pub request: String,
+    /// What it asks, in sat: rounded up from millisatoshis.
+    pub amount: u64,
+    /// What it says it pays for, if it says.
+    pub description: Option<String>,
+    /// When it expires, in seconds since the Unix epoch.
+    pub expires_at: i64,
+}
+
 /// An invoice as the wallet reads it.
 fn decode(request: &str) -> Result<Bolt11Invoice, Error> {
     request
         .trim()
         .parse()
         .map_err(|e| Error::Invalid(format!("not a Lightning invoice: {e}")))
+}
+
+/// The invoice `text` carries: bare, as a `lightning:` URI, or as the
+/// `lightning` parameter of a `bitcoin:` URI.
+fn invoice_in(text: &str) -> Option<&str> {
+    let text = text.trim();
+    let scheme = |s: &str| {
+        text.get(..s.len())
+            .is_some_and(|p| p.eq_ignore_ascii_case(s))
+    };
+    if scheme("lightning:") {
+        return Some(&text["lightning:".len()..]);
+    }
+    if scheme("bitcoin:") {
+        let (_, query) = text.split_once('?')?;
+        return query.split('&').find_map(|pair| {
+            let (key, value) = pair.split_once('=')?;
+            key.eq_ignore_ascii_case("lightning").then_some(value)
+        });
+    }
+    Some(text)
+}
+
+impl<T: Transport> Wallet<T> {
+    /// The invoice `text` asks to pay, if this wallet can: of its network,
+    /// with an amount, not expired. `text` is the invoice, bare or as a
+    /// `lightning:` URI, or a `bitcoin:` URI naming one.
+    pub fn read_invoice(&self, text: &str) -> Result<Payable, Error> {
+        let invoice = invoice_in(text)
+            .ok_or_else(|| Error::Invalid("no Lightning invoice".into()))
+            .and_then(decode)?;
+        let msat = self.payable(&invoice)?;
+        let description = match invoice.description() {
+            lightning_invoice::Bolt11InvoiceDescriptionRef::Direct(d) => Some(d.to_string()),
+            lightning_invoice::Bolt11InvoiceDescriptionRef::Hash(_) => None,
+        };
+        let expires_at = invoice.expires_at().map_or(i64::MAX, |at| {
+            i64::try_from(at.as_secs()).unwrap_or(i64::MAX)
+        });
+        Ok(Payable {
+            request: invoice.to_string(),
+            amount: msat.div_ceil(1000),
+            description: description.filter(|d| !d.is_empty()),
+            expires_at,
+        })
+    }
+
+    /// What `invoice` asks, in msat, if this wallet can pay it.
+    fn payable(&self, invoice: &Bolt11Invoice) -> Result<u64, Error> {
+        let network = licash_onchain::network(self.network());
+        if invoice.currency() != lightning_invoice::Currency::from(network) {
+            return Err(Error::Invalid(format!(
+                "an invoice of another network than {network}"
+            )));
+        }
+        let msat = invoice
+            .amount_milli_satoshis()
+            .filter(|msat| *msat > 0)
+            .ok_or_else(|| Error::Invalid("an invoice without an amount".into()))?;
+        if invoice.is_expired() {
+            return Err(Error::Invalid("the invoice expired".into()));
+        }
+        Ok(msat)
+    }
+
+    /// What paying `request` through the hub at `url` costs on top of what
+    /// it asks, with the notes held now, as the hub last said: its
+    /// gateway's fee, and its fee on a payment to this wallet making notes
+    /// worth the lock exactly, if it holds none. Refused as
+    /// [`Error::Insufficient`] if it holds not that much at the hub.
+    pub fn invoice_fee(&self, url: &str, request: &str) -> Result<u64, Error> {
+        let url = hub_url(url)?;
+        let invoice = decode(request)?;
+        let msat = self.payable(&invoice)?;
+        let (hub, info) = self.hub(&url)?;
+        let lightning = gateway(&url, &info, msat)?;
+        let lock = lightning.pay_lock(msat);
+        let exact = match self.exact(hub, lock)? {
+            Some(_) => 0,
+            None => self.send_fee(&url, lock)?,
+        };
+        Ok(lock - msat.div_ceil(1000) + exact)
+    }
+}
+
+/// The Lightning gateway of the hub at `url` saying `info`, if it pays
+/// an invoice of `msat`.
+fn gateway<'a>(url: &str, info: &'a licash_api::Info, msat: u64) -> Result<&'a Lightning, Error> {
+    let lightning = info
+        .lightning
+        .as_ref()
+        .ok_or_else(|| Error::Invalid(format!("hub {url} pays no Lightning invoices")))?;
+    if msat > lightning.max_pay.saturating_mul(1000) {
+        return Err(Error::Invalid(format!(
+            "hub {url} pays invoices of at most {} sat",
+            lightning.max_pay
+        )));
+    }
+    Ok(lightning)
 }
 
 fn hash_id(hash: &str) -> Result<[u8; 32], Error> {
@@ -79,24 +193,9 @@ impl<T: Transport> Wallet<T> {
     pub async fn pay_invoice(&self, url: &str, request: &str) -> Result<Lock, Error> {
         let url = hub_url(url)?;
         let invoice = decode(request)?;
-        let msat = invoice
-            .amount_milli_satoshis()
-            .filter(|msat| *msat > 0)
-            .ok_or_else(|| Error::Invalid("an invoice without an amount".into()))?;
-        if invoice.is_expired() {
-            return Err(Error::Invalid("the invoice expired".into()));
-        }
+        let msat = self.payable(&invoice)?;
         let (_, info) = self.refresh(&url).await?;
-        let lightning = info
-            .lightning
-            .as_ref()
-            .ok_or_else(|| Error::Invalid(format!("hub {url} pays no Lightning invoices")))?;
-        if msat > lightning.max_pay.saturating_mul(1000) {
-            return Err(Error::Invalid(format!(
-                "hub {url} pays invoices of at most {} sat",
-                lightning.max_pay
-            )));
-        }
+        let lightning = gateway(&url, &info, msat)?;
         let locks = info.locks.as_ref().ok_or_else(|| {
             Error::Invalid(format!("hub {url} follows no chain: it takes no locks"))
         })?;

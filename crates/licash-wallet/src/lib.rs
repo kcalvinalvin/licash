@@ -54,7 +54,7 @@ use serde::{de::DeserializeOwned, Serialize};
 pub use code::{HubId, LicashCode, PaymentCode, MAX_HUBS};
 pub use coins::MAX_INPUTS;
 pub use deposits::{Deposit, DepositState, DepositTerms};
-pub use lightning::{Invoice, InvoiceState};
+pub use lightning::{Invoice, InvoiceState, Payable};
 pub use locks::{Incoming, Lock, LockState, CLAIM_MARGIN};
 pub use silent::{Blocks, Payee, Scanned, SilentCoin, SilentSpend};
 use store::{now, sql, Owner, Store};

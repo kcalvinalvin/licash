@@ -219,7 +219,7 @@ impl<T: Transport> Wallet<T> {
     /// Notes of one keyset of `hub` worth `amount` exactly, the largest
     /// first: exact whenever any are, as each denomination divides the
     /// larger ones.
-    fn exact(&self, hub: i64, amount: u64) -> Result<Option<Chosen>, Error> {
+    pub(crate) fn exact(&self, hub: i64, amount: u64) -> Result<Option<Chosen>, Error> {
         for keyset in self.keysets(hub)? {
             let held = self.store.read(|c| {
                 let mut stmt = c.prepare(

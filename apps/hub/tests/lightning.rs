@@ -323,6 +323,68 @@ async fn an_invoice_paid_through_the_hub_settles_its_lock() {
 }
 
 #[tokio::test]
+async fn an_invoice_is_read_and_what_paying_it_costs_said_before_paying() {
+    let net = Net::with(Policy {
+        spend: Fee { base: 1, ppm: 0 },
+        timing: TIMING,
+        ..Policy::default()
+    });
+    net.gateway.round().await;
+    let wallet = net.funded("alice", 40).await;
+    let preimage = [5; 32];
+    let request = net
+        .node
+        .invoice(20_500, lock_hash(&preimage), 18, Outcome::Pay(preimage));
+    // Bare, as a URI, or in a Bitcoin URI, any case.
+    for text in [
+        request.clone(),
+        format!("lightning:{request}"),
+        format!("LIGHTNING:{}", request.to_uppercase()),
+        format!("bitcoin:bcrt1qexample?amount=0.00000021&lightning={request}"),
+    ] {
+        let payable = wallet.read_invoice(&text).unwrap();
+        assert_eq!(payable.request, request, "{text}");
+        assert_eq!((payable.amount, payable.description), (21, None));
+        assert!(payable.expires_at > 0);
+    }
+    for text in ["bitcoin:bcrt1qexample?amount=1", "lnbcrt1nonsense", ""] {
+        assert!(wallet.read_invoice(text).is_err(), "{text}");
+    }
+    // Not for a wallet of another network.
+    let path = net.dir.path().join("signet.sqlite");
+    let signet = Wallet::create(
+        &path,
+        &[7; 32],
+        ChainProfile::Core30Signet,
+        Local(net.app.clone()),
+    )
+    .unwrap();
+    let refused = signet.read_invoice(&request).unwrap_err().to_string();
+    assert!(refused.contains("another network"), "{refused}");
+
+    // The gateway's 2 on the 21 asked, and 1 to the hub: the lock of 23
+    // needs exact notes, made by a payment to itself.
+    assert_eq!(wallet.invoice_fee(HUB, &request).unwrap(), 3);
+    let lock = wallet.pay_invoice(HUB, &request).await.unwrap();
+    assert_eq!(lock.amount, 23);
+    net.gateway.round().await;
+    let lock = wallet.follow_lock(&lock.id).await.unwrap();
+    assert_eq!(lock.state, LockState::Paid(preimage));
+    assert_eq!(available(&wallet), 40 - 23 - 1);
+    // Exact notes held, 8: the gateway's fee alone.
+    let exact = net.node.invoice(6_000, [4; 32], 18, Outcome::Hang);
+    assert_eq!(wallet.invoice_fee(HUB, &exact).unwrap(), 2);
+    // Too much for the wallet, then for the gateway.
+    let more = net.node.invoice(30_000, [6; 32], 18, Outcome::Hang);
+    assert!(matches!(
+        wallet.invoice_fee(HUB, &more),
+        Err(licash_wallet::Error::Insufficient { .. })
+    ));
+    let most = net.node.invoice(101_000, [8; 32], 18, Outcome::Hang);
+    assert!(wallet.invoice_fee(HUB, &most).is_err());
+}
+
+#[tokio::test]
 async fn a_failed_payment_refunds_its_lock_at_once() {
     let net = Net::new().await;
     let wallet = net.funded("alice", 40).await;
