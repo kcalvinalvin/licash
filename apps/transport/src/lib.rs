@@ -44,6 +44,8 @@ impl Http {
 }
 
 impl Transport for Http {
+    // A single route without the `tor` feature.
+    #[cfg_attr(not(feature = "tor"), allow(clippy::infallible_destructuring_match))]
     fn request(
         &self,
         url: &str,
