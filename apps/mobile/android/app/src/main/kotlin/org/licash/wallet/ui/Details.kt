@@ -43,6 +43,7 @@ import org.licash.wallet.Ui
 import org.licash.wallet.at
 import org.licash.wallet.digits
 import org.licash.wallet.explain
+import org.licash.wallet.host
 import org.licash.wallet.sat
 
 /** A line of the history on its own: what it cost and where it stands. */
@@ -72,7 +73,7 @@ fun ActivityDetails(engine: Engine, ui: Ui, shown: Activity, back: () -> Unit) {
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 20.dp)) {
         TopBar(title(activity, coming != null), back)
         Spacer(Modifier.height(12.dp))
-        val sign = if (activity.kind == Kind.SENT) "−" else "+"
+        val sign = if (paid(activity)) "−" else "+"
         Text(
             "$sign${digits(activity.amount)} sat",
             modifier = Modifier.padding(horizontal = 4.dp),
@@ -112,8 +113,12 @@ private fun title(activity: Activity, coming: Boolean): String = when {
         Kind.RECEIVED -> "Received"
         Kind.MOVED -> "From Bitcoin"
         Kind.ONCHAIN -> "On Bitcoin"
+        Kind.LIGHTNING -> "Paid over Lightning"
     }
 }
+
+/** Whether it paid out, rather than in. */
+private fun paid(activity: Activity): Boolean = activity.kind == Kind.SENT || activity.kind == Kind.LIGHTNING
 
 /** Where it stands, in words. */
 private fun status(activity: Activity, coming: Boolean, details: Details?): String = when {
@@ -127,7 +132,7 @@ private fun status(activity: Activity, coming: Boolean, details: Details?): Stri
         }
         else -> when {
             activity.state == State.PENDING -> "Under way"
-            activity.kind == Kind.SENT -> "Paid"
+            paid(activity) -> "Paid"
             else -> "Received"
         }
     }
@@ -153,18 +158,30 @@ private fun Summary(activity: Activity, details: Details?, tx: Onchain?) {
         when (details) {
             is Details.Moved -> {
                 Line("Into Licash", sat(activity.amount))
+                Line("Arrived", "On Bitcoin, into Licash at ${host(details.hub)}")
                 Line("Hub fee", sat(activity.fee))
                 val (mining, pays) = details.payment?.fee to details.pays
                 mining?.let { Line("Network fee", sat(it)) }
                 if (mining != null && pays != null) Line("Paid on Bitcoin", sat(pays + mining))
             }
-            is Details.Coin -> Line("Amount", sat(activity.amount))
+            is Details.Coin -> {
+                Line("Amount", sat(activity.amount))
+                Line("Arrived", if (details.change) "As change on Bitcoin" else "On Bitcoin")
+            }
+            is Details.Lightning -> {
+                Line("Invoice", sat(activity.amount))
+                Line(if (activity.state == State.FAILED) "Refund fee" else "Fees", sat(activity.fee))
+                if (activity.state != State.FAILED) Line("Total", sat(activity.amount + activity.fee))
+                Line("Paid", "Over Lightning, through ${host(details.hub)}")
+            }
             else -> if (activity.kind == Kind.SENT) {
                 Line("Paid", sat(activity.amount))
                 Line("Hub fee", sat(activity.fee))
                 Line("Total", sat(activity.amount + activity.fee))
+                (details as? Details.Notes)?.let { Line("From", "Licash at ${host(it.hub)}") }
             } else {
                 Line("Received", sat(activity.amount))
+                (details as? Details.Notes)?.let { Line("Arrived", "In Licash at ${host(it.hub)}") }
             }
         }
         tx?.let { Line("Confirmations", confirmations(it, details)) }
@@ -219,6 +236,13 @@ private fun Technical(activity: Activity, details: Details?, copy: (String, Stri
                 Fact("Output", "${details.vout}", copy)
                 if (details.change) Fact("Change", "of a payment of this wallet's", copy)
                 details.moving?.let { Fact("Spent by", it, copy) }
+            }
+            is Details.Lightning -> {
+                Fact("Lock", activity.id, copy)
+                Fact("Hub", details.hub, copy)
+                Fact("Invoice", details.invoice, copy)
+                details.preimage?.let { Fact("Preimage", it, copy) }
+                details.failure?.let { Fact("Failure", it, copy) }
             }
             null -> Fact("Id", activity.id, copy)
         }

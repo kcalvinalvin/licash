@@ -136,6 +136,9 @@ pub struct Hub {
     pub silent: bool,
     /// Whether it names relays for mailboxes.
     pub mailbox: bool,
+    /// The most a Lightning invoice it pays may ask, in sat, if it pays
+    /// them.
+    pub lightning_pay: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Record)]
@@ -155,6 +158,34 @@ pub struct Balance {
     pub onchain: u64,
     /// Paid on Bitcoin and being moved to notes.
     pub moving: u64,
+}
+
+/// What the wallet holds at one hub it trusts, in sat.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct Holding {
+    pub hub: String,
+    /// To pay with.
+    pub available: u64,
+    /// Held by payments under way.
+    pub pending: u64,
+}
+
+/// How many notes of one denomination the wallet can pay with at a hub.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct Notes {
+    pub hub: String,
+    pub denomination: u64,
+    pub count: u64,
+}
+
+/// A Lightning invoice to pay through `hub`: `amount` it asks, and `fee`,
+/// all paying it costs on top, with the notes held now.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct InvoiceQuote {
+    pub hub: String,
+    pub amount: u64,
+    pub fee: u64,
+    pub description: Option<String>,
 }
 
 /// A payment code to show: `text` to share, `qr` to draw, and `address`,
@@ -177,6 +208,11 @@ pub enum Scanned {
     },
     /// A payment handed over, to [`Wallet::receive`].
     Payment,
+    /// A Lightning invoice, to pay through a hub: what it asks.
+    Invoice {
+        amount: u64,
+        description: Option<String>,
+    },
 }
 
 /// A payment made.
@@ -216,6 +252,8 @@ pub enum Kind {
     Moved,
     /// A coin paid on Bitcoin, not moved yet.
     Onchain,
+    /// A Lightning invoice paid through a hub.
+    Lightning,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
@@ -248,6 +286,14 @@ pub enum Details {
         timeout: Option<u32>,
         /// The transaction taking it back, if one did.
         refund: Option<String>,
+    },
+    /// A Lightning invoice paid through `hub`: the `preimage` its payment
+    /// bought once paid, or why it was not.
+    Lightning {
+        hub: String,
+        invoice: String,
+        preimage: Option<String>,
+        failure: Option<String>,
     },
     /// A coin on Bitcoin, output `vout` of `tx`: `change` of the wallet's
     /// own, and `moving`, the transaction spending it, if one is.

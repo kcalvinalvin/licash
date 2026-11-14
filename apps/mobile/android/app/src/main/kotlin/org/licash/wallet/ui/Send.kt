@@ -27,18 +27,23 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
+import org.licash.core.InvoiceQuote
 import org.licash.core.LicashException
 import org.licash.core.Scanned
+import org.licash.core.State
 import org.licash.wallet.Engine
 import org.licash.wallet.Ui
 import org.licash.wallet.explain
+import org.licash.wallet.host
 import org.licash.wallet.sat
 
 private sealed interface Step {
     data object Looking : Step
     data class Paying(val code: String, val asked: ULong?) : Step
+    data class Invoice(val text: String, val quote: InvoiceQuote) : Step
     data object Busy : Step
     data class Sent(val amount: ULong, val handover: String?) : Step
+    data class Paid(val amount: ULong, val fee: ULong) : Step
     data object Later : Step
     data class Received(val amount: ULong) : Step
     data class Trust(val payment: String, val hub: String) : Step
@@ -83,6 +88,10 @@ fun Send(engine: Engine, ui: Ui, link: String?, back: () -> Unit) {
                             )
                         }
                         is Scanned.Payment -> taking(text, false)
+                        is Scanned.Invoice -> engine.invoiceQuote(text).fold(
+                            { Step.Invoice(text, it) },
+                            { Step.Failed(explain(it)) },
+                        )
                     }
                 },
                 { Step.Failed(explain(it)) },
@@ -96,6 +105,16 @@ fun Send(engine: Engine, ui: Ui, link: String?, back: () -> Unit) {
             step = engine.pay(code, amount).fold(
                 { Step.Sent(it.amount, it.handover) },
                 { e -> if (e is LicashException.Pending) Step.Later else Step.Failed(explain(e)) },
+            )
+        }
+    }
+
+    fun payInvoice(text: String, hub: String) {
+        step = Step.Busy
+        scope.launch {
+            step = engine.payInvoice(text, hub).fold(
+                { if (it.state == State.DONE) Step.Paid(it.amount, it.fee) else Step.Later },
+                { Step.Failed(explain(it)) },
             )
         }
     }
@@ -119,6 +138,8 @@ fun Send(engine: Engine, ui: Ui, link: String?, back: () -> Unit) {
             }
             is Step.Paying -> Paying(ui, s, asking, { asking = it }) { amount -> pay(s.code, amount) }
             Step.Busy -> Middle("One moment…")
+            is Step.Invoice -> Invoice(s.quote) { payInvoice(s.text, s.quote.hub) }
+            is Step.Paid -> Done("Paid ${sat(s.amount)}, ${sat(s.fee)} in fees", back)
             is Step.Sent -> Sent(s, back)
             // Not to pay again: it finishes by itself.
             Step.Later -> Told("Under way: it finishes by itself, and reaches them then.", back)
@@ -161,6 +182,32 @@ private fun Paying(ui: Ui, s: Step.Paying, asking: Boolean, ask: (Boolean) -> Un
         }
     }
     if (asking) AmountDialog(amount, onDone = { amount = it; ask(false) }, onCancel = { ask(false) })
+}
+
+/** A Lightning invoice to pay: what it asks, and all it costs on top. */
+@Composable
+private fun Invoice(quote: InvoiceQuote, pay: () -> Unit) {
+    Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
+        Spacer(Modifier.height(48.dp))
+        Text(sat(quote.amount), style = Figures)
+        Text(
+            if (quote.fee == 0uL) "No fee" else "Fee ${sat(quote.fee)}, ${sat(quote.amount + quote.fee)} in all",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        quote.description?.let {
+            Spacer(Modifier.height(12.dp))
+            Text(it, style = MaterialTheme.typography.bodyLarge, textAlign = TextAlign.Center)
+        }
+        Spacer(Modifier.height(8.dp))
+        Text(
+            "Over Lightning, through ${host(quote.hub)}",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Spacer(Modifier.height(32.dp))
+        BigButton("Pay", Modifier.fillMaxWidth(), onClick = pay)
+    }
 }
 
 /** Paid; if not to the payee's mailbox, what to hand them. */

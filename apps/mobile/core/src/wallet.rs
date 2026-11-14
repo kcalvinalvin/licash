@@ -15,8 +15,8 @@ use serde::{Deserialize, Serialize};
 use crate::{
     chain::Chain,
     deliveries::{self, Delivery},
-    Activity, Balance, ChainError, ChainSource, Code, Details, Hub, Kind, LicashError, Network,
-    Onchain, Paid, Range, Scan, Scanned, State,
+    Activity, Balance, ChainError, ChainSource, Code, Details, Holding, Hub, InvoiceQuote, Kind,
+    LicashError, Network, Notes, Onchain, Paid, Range, Scan, Scanned, State,
 };
 
 /// The rate deposits are paid at, in sat/vB: above what nodes relay.
@@ -221,10 +221,12 @@ impl Wallet {
         })
     }
 
-    /// What `text`, scanned or pasted, is.
+    /// What `text`, scanned or pasted, is: a code to pay in notes if it
+    /// can be, else a Lightning invoice if it is or names one.
     pub fn scanned(&self, text: String) -> Result<Scanned, LicashError> {
         let text = text.trim();
-        if let Ok(code) = text.parse::<PaymentCode>() {
+        let code = text.parse::<PaymentCode>();
+        if let Ok(code) = &code {
             code.check(self.wallet.network())?;
             let hubs = self.wallet.hubs()?;
             let mut trusted = hubs
@@ -234,15 +236,107 @@ impl Wallet {
                 .licash
                 .as_ref()
                 .is_some_and(|licash| trusted.any(|id| licash.hubs.contains(&id)));
+            if notes {
+                return Ok(Scanned::Code {
+                    amount: code.amount,
+                    notes,
+                });
+            }
+        }
+        match self.wallet.read_invoice(text) {
+            Ok(invoice) => {
+                return Ok(Scanned::Invoice {
+                    amount: invoice.amount,
+                    description: invoice.description,
+                })
+            }
+            // An invoice this wallet cannot pay: say why.
+            Err(e) if code.is_err() && licash_wallet::Payable::read(text).is_ok() => {
+                return Err(e.into())
+            }
+            Err(_) => {}
+        }
+        if let Ok(code) = code {
             return Ok(Scanned::Code {
                 amount: code.amount,
-                notes,
+                notes: false,
             });
         }
         if serde_json::from_str::<licash_api::Payment>(text).is_ok() {
             return Ok(Scanned::Payment);
         }
-        Err(LicashError::invalid("neither a payment code nor a payment"))
+        Err(LicashError::invalid(
+            "neither a payment code, a Lightning invoice nor a payment",
+        ))
+    }
+
+    /// What paying the Lightning invoice `text` costs through the hub
+    /// trusted paying it for least, with the notes held now.
+    pub fn invoice_quote(&self, text: String) -> Result<InvoiceQuote, LicashError> {
+        let invoice = self.wallet.read_invoice(&text)?;
+        let (mut best, mut refused): (Option<InvoiceQuote>, Option<licash_wallet::Error>) =
+            (None, None);
+        for (url, info) in self.wallet.hubs()? {
+            if info.lightning.is_none() {
+                continue;
+            }
+            match self.wallet.invoice_fee(&url, &invoice.request) {
+                Ok(fee) if best.as_ref().is_none_or(|b| fee < b.fee) => {
+                    best = Some(InvoiceQuote {
+                        hub: url,
+                        amount: invoice.amount,
+                        fee,
+                        description: invoice.description.clone(),
+                    })
+                }
+                Ok(_) => {}
+                // Lacking notes says the most: what is needed.
+                Err(e)
+                    if refused.is_none()
+                        || matches!(e, licash_wallet::Error::Insufficient { .. }) =>
+                {
+                    refused = Some(e)
+                }
+                Err(_) => {}
+            }
+        }
+        best.ok_or_else(|| match refused {
+            Some(e) => e.into(),
+            None => LicashError::invalid("no hub you trust pays Lightning invoices"),
+        })
+    }
+
+    /// Pay the Lightning invoice `text` through `hub`: done, or under way
+    /// until [`Wallet::resume`] finds it paid or refunded.
+    pub fn pay_invoice(&self, text: String, hub: String) -> Result<Activity, LicashError> {
+        let invoice = self.wallet.read_invoice(&text)?;
+        let pay = self.wallet.pay_invoice(&hub, &invoice.request);
+        let lock = self.runtime.block_on(pay)?;
+        Ok(lightning_activity(&lock, &invoice.request))
+    }
+
+    /// What the wallet holds at each hub it trusts.
+    pub fn holdings(&self) -> Result<Vec<Holding>, LicashError> {
+        let balance = self.wallet.balance()?.into_iter();
+        Ok(balance
+            .map(|b| Holding {
+                hub: b.hub,
+                available: b.available,
+                pending: b.pending,
+            })
+            .collect())
+    }
+
+    /// How many notes of each denomination it can pay with, at each hub.
+    pub fn notes(&self) -> Result<Vec<Notes>, LicashError> {
+        let notes = self.wallet.notes()?.into_iter();
+        Ok(notes
+            .map(|n| Notes {
+                hub: n.hub,
+                denomination: n.denomination,
+                count: n.count,
+            })
+            .collect())
     }
 
     /// Pay `amount`, or what it asks, to the payment code `code`, in notes:
@@ -360,7 +454,10 @@ impl Wallet {
     /// first, then the newest first.
     pub fn history(&self) -> Result<Vec<Activity>, LicashError> {
         let mut history = Vec::new();
-        for sent in self.wallet.sends()? {
+        let me = self.wallet.address();
+        // A payment to itself only makes notes of other denominations.
+        let sends = self.wallet.sends()?.into_iter().filter(|s| s.payee != me);
+        for sent in sends {
             let (state, detail) = match sent.state {
                 licash_wallet::State::Done => (State::Done, sent.hub),
                 licash_wallet::State::Abandoned(why) => (State::Failed, why),
@@ -387,6 +484,11 @@ impl Wallet {
             .iter()
             .filter(|d| d.terms.is_some() || d.state == DepositState::Open);
         history.extend(answered.map(moved_activity));
+        for lock in self.wallet.locks()? {
+            if let Some(invoice) = &lock.invoice {
+                history.push(lightning_activity(&lock, invoice));
+            }
+        }
         for coin in self.wallet.silent_coins()? {
             let state = match coin.spending {
                 Some(_) => State::Pending,
@@ -421,6 +523,21 @@ impl Wallet {
                 let got = self.wallet.receipts()?.into_iter().find(|r| r.id == id);
                 let hub = got.ok_or_else(unknown)?.hub;
                 Ok(Details::Notes { hub })
+            }
+            Kind::Lightning => {
+                let lock = self.wallet.locks()?.into_iter().find(|l| l.id == id);
+                let lock = lock.filter(|l| l.invoice.is_some()).ok_or_else(unknown)?;
+                let (preimage, failure) = match &lock.state {
+                    licash_wallet::LockState::Paid(p) => (Some(hex::encode(p)), None),
+                    licash_wallet::LockState::Abandoned(why) => (None, Some(why.clone())),
+                    _ => (None, lock.failure.clone()),
+                };
+                Ok(Details::Lightning {
+                    hub: lock.hub,
+                    invoice: lock.invoice.unwrap_or_default(),
+                    preimage,
+                    failure,
+                })
             }
             Kind::Moved => {
                 let deposit = self.wallet.deposits()?.into_iter().find(|d| d.hash == id);
@@ -838,6 +955,7 @@ fn hub(url: &str, info: &licash_api::Info) -> Hub {
         }),
         silent: info.tweaks.is_some(),
         mailbox: !info.relays.is_empty(),
+        lightning_pay: info.lightning.as_ref().map(|l| l.max_pay),
     }
 }
 
@@ -850,6 +968,39 @@ fn received_activity(received: &licash_wallet::Received) -> Activity {
         fee: 0,
         detail: received.hub.clone(),
         at: Some(received.received_at),
+    }
+}
+
+/// The line of the history of `lock`, paying `invoice`: what the invoice
+/// asks, and the fee: the gateway's on top once paid, or while under way;
+/// the hub's refund fee once refunded; none if given up.
+fn lightning_activity(lock: &licash_wallet::Lock, invoice: &str) -> Activity {
+    use licash_wallet::LockState;
+    let asked = licash_wallet::Payable::read(invoice).map_or(lock.amount, |p| p.amount);
+    let asked = asked.min(lock.amount);
+    let expected = lock.amount - asked + lock.fee;
+    let (state, detail, fee) = match &lock.state {
+        LockState::Paid(_) => (
+            State::Done,
+            lock.hub.clone(),
+            lock.cost.map_or(expected, |c| c.saturating_sub(asked)),
+        ),
+        LockState::Refunded => (
+            State::Failed,
+            lock.failure.clone().unwrap_or_else(|| "refunded".into()),
+            lock.cost.unwrap_or(0),
+        ),
+        LockState::Abandoned(why) => (State::Failed, why.clone(), 0),
+        _ => (State::Pending, lock.hub.clone(), expected),
+    };
+    Activity {
+        id: lock.id.clone(),
+        kind: Kind::Lightning,
+        state,
+        amount: asked,
+        fee,
+        detail,
+        at: Some(lock.created_at),
     }
 }
 

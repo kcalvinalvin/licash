@@ -29,6 +29,10 @@ use licash_chain_client::Source;
 use licash_hub::{Hub, Policy, Timing};
 use licash_hub_service::{
     deposit,
+    lightning::{
+        self,
+        fake::{Fake, Outcome},
+    },
     tweaks::{step, Tweaks},
     Services,
 };
@@ -58,6 +62,9 @@ struct Net {
     runtime: tokio::runtime::Runtime,
     hub: Arc<Hub>,
     deposits: Arc<deposit::Gateway>,
+    /// A Lightning gateway over a fake node, following the chain.
+    node: Arc<Fake>,
+    lightning: Arc<lightning::Gateway>,
     tweaks: Arc<Tweaks>,
     source: Source,
     backend: esplora::Shared,
@@ -114,10 +121,21 @@ impl Net {
         let gateway = deposit::Gateway::open(hub.clone(), source.clone(), profile, config, &path);
         let deposits = Arc::new(gateway.unwrap());
         let tweaks = Arc::new(Tweaks::open(&dir.path().join("tweaks.sqlite")).unwrap());
+        let node = Arc::new(Fake::new());
+        let config = lightning::Config {
+            pay: Fee { base: 2, ppm: 0 },
+            max_pay: 5_000,
+            pay_slack: 4,
+            ..lightning::Config::default()
+        };
+        let path = dir.path().join("lightning.sqlite");
+        let gateway = lightning::Gateway::open(hub.clone(), node.clone(), config, &path);
         let mut net = Self {
             runtime,
             hub,
             deposits,
+            node,
+            lightning: Arc::new(gateway.unwrap()),
             tweaks,
             source,
             backend,
@@ -128,15 +146,16 @@ impl Net {
         };
         net.mine(3, Vec::new());
         net.round();
+        net.runtime.block_on(net.lightning.round());
         let relays = match &net.relay {
             Some(relay) => vec![net.runtime.block_on(relay.url()).to_string()],
             None => Vec::new(),
         };
         let services = Services {
             deposits: Some(net.deposits.clone()),
+            gateway: Some(net.lightning.clone()),
             tweaks: serves_tweaks.then(|| net.tweaks.clone()),
             relays,
-            ..Default::default()
         };
         let down = net.down.clone();
         let app = licash_hub_service::router(net.hub.clone(), services).layer(
@@ -173,6 +192,7 @@ impl Net {
                 self.hub.observe(chain.height(), &block).unwrap();
             }
             assert!(self.hub.synced(chain.height(), &chain.tip()).unwrap());
+            self.node.tip(chain.height(), chain.tip());
         }
         let indexed = step(&self.tweaks, &self.source, None);
         self.runtime.block_on(indexed).unwrap();
@@ -827,6 +847,97 @@ fn a_phone_born_before_its_hubs_tweaks_looks_in_each_block_once() {
 
 /// A wallet `name` holding the notes moved in from a payment of 3000 to
 /// its silent payment address.
+#[test]
+fn a_phone_pays_a_lightning_invoice_through_its_hub_and_shows_what_it_cost() {
+    let net = Net::new(false);
+    let light = Light::new(&net);
+    let alice = funded(&net, &light, "alice");
+    let hub = alice.holdings().unwrap()[0].hub.clone();
+    assert_eq!(alice.hubs().unwrap()[0].lightning_pay, Some(5_000));
+    let held = notes(&alice);
+    let holdings = alice.holdings().unwrap();
+    assert_eq!((holdings.len(), holdings[0].available), (1, held));
+    let counted: u64 = alice
+        .notes()
+        .unwrap()
+        .iter()
+        .map(|n| n.denomination * n.count)
+        .sum();
+    assert_eq!(counted, held);
+    let preimage = [5; 32];
+    let hash = licash::spend::lock_hash(&preimage);
+    let request = net.node.invoice(200_000, hash, 6, Outcome::Pay(preimage));
+    let invoice = Scanned::Invoice {
+        amount: 200,
+        description: None,
+    };
+    for text in [request.clone(), format!("lightning:{request}")] {
+        assert_eq!(alice.scanned(text).unwrap(), invoice);
+    }
+    let quote = alice.invoice_quote(request.clone()).unwrap();
+    assert_eq!((quote.hub.as_str(), quote.amount), (hub.as_str(), 200));
+
+    let paying = alice.pay_invoice(request.clone(), hub.clone()).unwrap();
+    assert_eq!(
+        (paying.kind, paying.state, paying.amount),
+        (Kind::Lightning, State::Pending, 200)
+    );
+    net.runtime.block_on(net.lightning.round());
+    alice.resume().unwrap();
+    let history = alice.history().unwrap();
+    let paid = history.iter().find(|a| a.kind == Kind::Lightning).unwrap();
+    // The gateway's 2, and the hub's 1 on a payment to itself making notes
+    // of 202 exactly, which the history does not show.
+    assert_eq!(quote.fee, 3);
+    assert_eq!((paid.state, paid.amount, paid.fee), (State::Done, 200, 2));
+    assert_eq!(notes(&alice), held - 200 - quote.fee);
+    // The payment to itself making notes for the lock is not shown.
+    assert!(history.iter().all(|a| a.kind != Kind::Sent), "{history:?}");
+    let details = alice.details(Kind::Lightning, paid.id.clone()).unwrap();
+    let wanted = Details::Lightning {
+        hub: hub.clone(),
+        invoice: request.clone(),
+        preimage: Some(hex::encode(preimage)),
+        failure: None,
+    };
+    assert_eq!(details, wanted);
+
+    // One its gateway fails to pay: refunded, and shown failed with why.
+    let failing = net
+        .node
+        .invoice(100_000, [9; 32], 6, Outcome::Fail("no route".into()));
+    // Notes of 102 exactly are held: the gateway's fee alone.
+    assert_eq!(alice.invoice_quote(failing.clone()).unwrap().fee, 2);
+    let before = notes(&alice);
+    alice.pay_invoice(failing.clone(), hub.clone()).unwrap();
+    net.runtime.block_on(net.lightning.round());
+    alice.resume().unwrap();
+    let history = alice.history().unwrap();
+    let failed = history
+        .iter()
+        .find(|a| a.kind == Kind::Lightning && a.state == State::Failed)
+        .unwrap();
+    assert!(failed.detail.contains("no route"), "{failed:?}");
+    // Refunded but for the hub's refund fee.
+    assert_eq!((failed.amount, failed.fee), (100, 1));
+    assert_eq!(notes(&alice), before - 1);
+    match alice.details(Kind::Lightning, failed.id.clone()).unwrap() {
+        Details::Lightning {
+            preimage, failure, ..
+        } => assert!(preimage.is_none() && failure.unwrap().contains("no route")),
+        other => panic!("{other:?}"),
+    }
+
+    // More than its gateway pays, or than it holds: said before paying.
+    let most = net.node.invoice(5_001_000, [8; 32], 6, Outcome::Hang);
+    assert!(invalid(alice.invoice_quote(most)).contains("at most"));
+    let more = net.node.invoice(4_000_000, [7; 32], 6, Outcome::Hang);
+    assert!(matches!(
+        alice.invoice_quote(more),
+        Err(LicashError::Insufficient { .. })
+    ));
+}
+
 fn funded(net: &Net, light: &Arc<Light>, name: &str) -> Arc<Wallet> {
     let wallet = net.wallet(name, net.height());
     let code = wallet.payment_code(None).unwrap();

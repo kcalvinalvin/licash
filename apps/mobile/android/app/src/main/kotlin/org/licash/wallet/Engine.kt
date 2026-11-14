@@ -26,10 +26,13 @@ import org.licash.core.Activity
 import org.licash.core.Balance
 import org.licash.core.Code
 import org.licash.core.Details
+import org.licash.core.Holding
 import org.licash.core.Hub
+import org.licash.core.InvoiceQuote
 import org.licash.core.Kind
 import org.licash.core.LicashException
 import org.licash.core.Network
+import org.licash.core.Notes
 import org.licash.core.Paid
 import org.licash.core.Scanned
 import org.licash.core.Wallet
@@ -386,6 +389,23 @@ class Engine(context: Context) {
         refresh()
         paid
     }
+
+    /** What paying the Lightning invoice `text` costs, through the hub paying it for least. */
+    suspend fun invoiceQuote(text: String): Result<InvoiceQuote> = io { local { it.invoiceQuote(text) } }
+
+    /** Pay the Lightning invoice `text` through `hub`: done, or under way. */
+    suspend fun payInvoice(text: String, hub: String): Result<Activity> = io {
+        val paid = locked { it.payInvoice(text, hub) }
+        refresh()
+        poke()
+        paid
+    }
+
+    /** What the wallet holds at each hub it trusts. */
+    suspend fun holdings(): Result<List<Holding>> = io { local { it.holdings() } }
+
+    /** How many notes of each denomination it holds, at each hub. */
+    suspend fun notes(): Result<List<Notes>> = io { local { it.notes() } }
 
     /** Take a payment handed over, trusting its hub if `trust`. */
     suspend fun receive(payment: String, trust: Boolean): Result<Activity> = io {

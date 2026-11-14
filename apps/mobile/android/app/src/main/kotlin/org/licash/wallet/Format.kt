@@ -28,6 +28,9 @@ fun explain(e: Throwable): String = when (e) {
 
 private fun sentence(text: String): String = text.replaceFirstChar { it.uppercase() }
 
+/** The host of a hub's `url`, to name it short. */
+fun host(url: String): String = runCatching { java.net.URI(url).host }.getOrNull() ?: url
+
 /** When, from seconds since 1970. */
 fun at(seconds: Long): String =
     DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT).format(Date(seconds * 1000))
