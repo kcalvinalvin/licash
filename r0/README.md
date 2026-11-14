@@ -12,9 +12,9 @@ Each is a workspace of its own.
 
 ## Prerequisites
 
-[rzup](https://dev.risczero.com) with the `risc0` Rust toolchain,
-`cargo-risczero` and `r0vm` 3.0.x, and its RISC-V C toolchain (the guests
-link libsecp256k1). `RISC0_TOOLCHAIN` and `RISC0_CC` override the default
+[rzup](https://dev.risczero.com) with the `risc0` Rust toolchain (Rust
+1.97), `cargo-risczero` and `r0vm` 3.1.x, and its RISC-V C toolchain (the
+guests link libsecp256k1). `RISC0_TOOLCHAIN` and `RISC0_CC` override the default
 paths, `~/.rustup/toolchains/risc0` and
 `~/.risc0/cpp/bin/riscv32-unknown-elf-gcc`.
 

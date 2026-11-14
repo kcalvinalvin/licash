@@ -68,13 +68,13 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: AdamISZ/lichen
-          ref: f025f81c646fe62d138f4476c52bdaf3f03faec2
+          ref: 82c69a055a8ac9f2010d1f91ff15eef7ac1ca8ab
           path: lichen
           persist-credentials: false
       - uses: actions/checkout@v4
         with:
           repository: AdamISZ/ln-gap
-          ref: 1f0db8ca9f78c36c75c1a69b42946ae1639bb4b8
+          ref: d7972035c12247a07b1dcc1b32e1682cd790d276
           path: ln-gap
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable

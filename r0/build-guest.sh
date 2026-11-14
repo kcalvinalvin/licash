@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Build a guest ELF with the local RISC Zero toolchain (rzup's `risc0`
-# rustup toolchain, cargo-risczero 3.0.x), then pack it with the zkOS kernel
+# rustup toolchain, cargo-risczero 3.1.x), then pack it with the zkOS kernel
 # into r0/guests/<name>.bin and write its image id to r0/guests/<name>.id.
 #
 #   r0/build-guest.sh native-counter|native-claim

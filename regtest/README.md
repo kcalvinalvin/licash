@@ -12,9 +12,11 @@ Rust, Docker, and these checkouts beside this repository:
 
 ```sh
 git clone https://github.com/AdamISZ/lichen ../lichen
-git -C ../lichen checkout f025f81c646fe62d138f4476c52bdaf3f03faec2
+git -C ../lichen fetch origin 82c69a055a8ac9f2010d1f91ff15eef7ac1ca8ab
+git -C ../lichen checkout 82c69a055a8ac9f2010d1f91ff15eef7ac1ca8ab
 git clone https://github.com/AdamISZ/ln-gap ../ln-gap
-git -C ../ln-gap checkout 1f0db8ca9f78c36c75c1a69b42946ae1639bb4b8
+git -C ../ln-gap fetch origin d7972035c12247a07b1dcc1b32e1682cd790d276
+git -C ../ln-gap checkout d7972035c12247a07b1dcc1b32e1682cd790d276
 ```
 
 Each node runs in its own throwaway `bitcoin/bitcoin:30.0` container with a

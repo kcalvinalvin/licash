@@ -5,14 +5,14 @@ name = "licash-native-counter"
 version = "0.0.1"
 edition = "2021"
 license = "MIT"
-rust-version = "1.88"
+rust-version = "1.97"
 
 [workspace]
 resolver = "3"
 
 [dependencies]
 licash = { path = "../../crates/licash" }
-risc0-zkvm = { version = "=3.0.6", default-features = false, features = ["std"] }
+risc0-zkvm = { version = "=3.1.0", default-features = false, features = ["std"] }
 
 [patch.crates-io]
 sha2 = { git = "https://github.com/risc0/RustCrypto-hashes", tag = "sha2-v0.10.9-risczero.0" }
