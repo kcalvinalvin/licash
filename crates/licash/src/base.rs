@@ -670,7 +670,6 @@ impl Base {
         tip_height: u32,
     ) -> Result<FinalDigest, Error> {
         let d = self.final_digest(prefix)?;
-        let g = &self.0.graph;
         // A counter program that accepts anything would let the Hub void any
         // claim; a holder program that does would let the holder take the cap.
         if self.0.recipe.holder_program != trusted.holder
@@ -683,7 +682,21 @@ impl Base {
         if prefix.funding_graph().output.script != expected_graph {
             return Err(bad("funded graph differs from the locally compiled graph"));
         }
-        let latest_request = [
+        if !self.fundable_at(tip_height) {
+            return Err(bad(
+                "opening cannot complete a recovery before its deadline",
+            ));
+        }
+        Ok(d)
+    }
+
+    /// Whether F funded at `tip_height` still lets the holder complete a
+    /// recovery before the assertion deadline, as both funding gates
+    /// require: F buried, the exit's delay, her request buried and the
+    /// hub's response window, with the deadline margin to spare.
+    pub fn fundable_at(&self, tip_height: u32) -> bool {
+        let g = &self.0.graph;
+        [
             self.0.chain.funding_depth,
             u32::from(g.to_self_delay),
             self.0.chain.request_depth,
@@ -691,13 +704,8 @@ impl Base {
             g.deadline_margin,
         ]
         .into_iter()
-        .try_fold(tip_height, |sum, step| sum.checked_add(step));
-        if latest_request.is_none_or(|height| height > g.assert_height) {
-            return Err(bad(
-                "opening cannot complete a recovery before its deadline",
-            ));
-        }
-        Ok(d)
+        .try_fold(tip_height, |sum, step| sum.checked_add(step))
+        .is_some_and(|height| height <= g.assert_height)
     }
 
     /// Holder funding gate: trusted proof programs, own request keys, own spending root, compiled

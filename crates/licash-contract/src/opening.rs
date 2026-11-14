@@ -20,7 +20,10 @@
 //! to send it ([`Out::Serve`], [`Hub::instance`]). Each says whether its
 //! driver may give the opening up ([`Holder::abandonable`],
 //! [`Hub::abandonable`]), and once F is signed whole each keeps its side
-//! of the contract ([`Opening`], [`HubOpening`]).
+//! of the contract ([`Opening`], [`HubOpening`]). From its signature on,
+//! each watches F on the chain until it stands or never can ([`Fate`]),
+//! giving it up past its gate's deadline ([`Holder::lapsed`],
+//! [`Hub::lapsed`]) by spending a coin of its own of F ([`Funding`]).
 
 use std::collections::HashMap;
 
@@ -58,7 +61,9 @@ use crate::keys::{Dealt, HolderKeys, HubKeys};
 use crate::wire::{self, Envelope, Kind, Shown, STAGES};
 use crate::{INSTANCES, KEPT};
 
+mod fate;
 mod state;
+pub use fate::{Fate, Funding, Spent};
 pub use state::{HubPhase, Phase};
 
 /// The statement BABE encrypts under: its Groth16 verifying key and the

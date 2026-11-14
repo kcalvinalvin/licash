@@ -36,6 +36,7 @@ regtest/run.sh -- --test-threads=1                                 # the whole s
 regtest/run.sh --test native_lifecycle -- --test-threads=1         # recovery outcomes
 regtest/run.sh --test native_interop -- --test-threads=1           # swaps and routes
 regtest/run.sh --test native_opening -- --test-threads=1           # forged messages, stored openings
+regtest/run.sh --test native_fate -- --test-threads=1              # openings given up on the chain
 cargo test --release --locked --manifest-path regtest/Cargo.toml -p licash-contract  # codecs, key derivation
 regtest/lightning.sh                                               # Lightning, two pinned LND nodes
 ```

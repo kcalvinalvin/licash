@@ -2,7 +2,11 @@
 //! through `licash_contract::opening` over a byte pipe:
 //! Base -> native request keys/leaf -> frozen F/R -> final D -> instances
 //! under the native statement journals -> holder and Hub gates -> funding.
-//! Bitcoin Core funds and signs F for both: its wallet holds the deposit.
+//! Bitcoin Core funds F and signs the hub's coins of it; the holder signs
+//! her deposit by its own key. On the chain, what spends F's inputs says
+//! whether an opening stands or never can ([`spent`]); each party gives up
+//! by spending a coin of its own of F ([`reclaim`], [`cancel`]), the hub
+//! reserving its coins of F while it may stand ([`reserve`]).
 //!
 //! The request leaf signs the native `b` and `E`; the later links (respond,
 //! assert, challenge, payout bits) read those signatures through the request
@@ -45,7 +49,7 @@ use lngap_btc::bitcoin::{
 use lngap_btc::regtest::Regtest;
 use lngap_lamport::winternitz::{WotsParams, WotsSig};
 use lngap_sessions::skeleton::Presign;
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -345,6 +349,26 @@ fn sign_key(funding: &mut Transaction, i: usize, prevouts: &[TxOut], key: &Keypa
     Ok(())
 }
 
+/// An opening as far as its messages took it: both machines as they
+/// stood, her deposit, its key and her change script, the height her
+/// deposit confirmed at (F's inputs are spent from it on), her kept
+/// instances by commitment as her driver kept them, each party's state as
+/// it stored it at each phase, the messages refused on the way, and
+/// whether F went to the chain.
+pub struct Run {
+    pub alice: machine::Holder,
+    pub hub: machine::Hub,
+    pub deposit: (OutPoint, TxOut),
+    pub key: Keypair,
+    pub change: ScriptBuf,
+    pub from: u32,
+    pub kept: HashMap<[u8; 32], Vec<u8>>,
+    pub holders: BTreeMap<machine::Phase, Vec<u8>>,
+    pub hubs: BTreeMap<machine::HubPhase, Vec<u8>>,
+    pub refused: Vec<Refusal>,
+    pub funded: bool,
+}
+
 /// An opening as its machines played it: the holder's contract, her kept
 /// instances by commitment as her driver kept them, each party's state as
 /// it stored it at each phase, and the messages refused on the way.
@@ -362,11 +386,37 @@ pub struct Played {
 pub fn play(
     rt: &Regtest,
     label: &str,
-    (t_a, w_h): (u32, u16),
+    deadlines: (u32, u16),
     holder: Holder,
     authority: Authority,
     tamper: Tamper<'_>,
 ) -> Result<Played> {
+    let deposit = Amount::from_sat(500_000);
+    let run = run(rt, label, deadlines, holder, authority, deposit, tamper)?;
+    let refused = run.refused;
+    ensure!(run.funded, "the opening stalled, refusing {refused:?}");
+    let opening = run.alice.opening()?;
+    agree(&opening, &run.hub.opening()?)?;
+    Ok(Played {
+        opening,
+        kept: run.kept,
+        holders: run.holders,
+        hubs: run.hubs,
+        refused,
+    })
+}
+
+/// Play an opening as [`play`] does, her deposit worth `value`, until F is
+/// on the chain or no message is left to take.
+pub fn run(
+    rt: &Regtest,
+    label: &str,
+    (t_a, w_h): (u32, u16),
+    holder: Holder,
+    authority: Authority,
+    value: Amount,
+    tamper: Tamper<'_>,
+) -> Result<Run> {
     let address = |kind| -> Result<ScriptBuf> {
         let addr = rt.rpc.get_new_address(None, Some(kind))?;
         Ok(addr.assume_checked().script_pubkey())
@@ -375,7 +425,7 @@ pub fn play(
     // signs only the hub's coins, she only hers.
     let key = deposit_key(label)?;
     let script = ScriptBuf::new_p2tr(&Secp256k1::new(), key.x_only_public_key().0, None);
-    let (deposit, coin) = rt.fund(&script, Amount::from_sat(500_000))?;
+    let (deposit, coin) = rt.fund(&script, value)?;
     let h = rt.height()?;
     let checkpoint = checkpoint(rt)?;
     let trust = authority.trust();
@@ -390,7 +440,7 @@ pub fn play(
         spend: holder.spend,
         quote: quote(holder.keyset, checkpoint.clone()),
         deposit,
-        coin,
+        coin: coin.clone(),
         change: address(AddressType::Bech32)?,
         wanted: Wanted {
             assert_height: h + t_a,
@@ -399,7 +449,7 @@ pub fn play(
         },
         checkpoint,
     };
-    let hub_quote = start.quote.clone();
+    let (hub_quote, change) = (start.quote.clone(), start.change.clone());
     let (mut alice, out) = machine::Holder::with_choice(start, &ctx()?, [vec![2, 3], vec![2, 3]])?;
     let secrets = (holder.seed, holder.spend);
     let mut kept = HashMap::new();
@@ -460,21 +510,24 @@ pub fn play(
             }),
         }
     }
-    ensure!(funded, "the opening stalled, refusing {refused:?}");
-    let opening = alice.opening()?;
-    agree(&opening, &hub.opening()?)?;
-    Ok(Played {
-        opening,
+    Ok(Run {
+        alice,
+        hub,
+        deposit: (deposit, coin),
+        key,
+        change,
+        from: h,
         kept,
         holders,
         hubs,
         refused,
+        funded,
     })
 }
 
 /// The hub's contract agrees with the holder's: one Base, D, F, set and
 /// choice, her pre-signatures and both parties' signatures.
-fn agree(o: &machine::Opening, h: &machine::HubOpening) -> Result<()> {
+pub fn agree(o: &machine::Opening, h: &machine::HubOpening) -> Result<()> {
     let txids = |set: &[Presign]| -> Vec<_> {
         set.iter()
             .map(|p| (p.name.clone(), p.tx.compute_txid()))
@@ -670,6 +723,13 @@ fn fund(
     let funded: serde_json::Value = rt.rpc.call("fundrawtransaction", &args)?;
     let hex = funded["hex"].as_str().context("F funded")?;
     let funding: Transaction = deserialize_hex(hex)?;
+    // Core reserves every coin F spends; the hub reserves only its own.
+    if reserved(rt)?.contains(&deposit) {
+        let _: bool = rt.rpc.call(
+            "lockunspent",
+            &[true.into(), vec![json_coin(deposit)].into()],
+        )?;
+    }
     let prevouts = funding
         .input
         .iter()
@@ -696,6 +756,115 @@ fn locate(rt: &Regtest, txid: &Txid, from: u32) -> Result<(u32, Vec<u8>, usize)>
         }
     }
     anyhow::bail!("transaction {txid} is not confirmed")
+}
+
+/// What spends `coin`, looked for in the node's mempool and in its blocks
+/// from `from` on: the spending transaction and how deep it is buried, 0
+/// in the mempool; none while unspent.
+pub fn spent(rt: &Regtest, coin: OutPoint, from: u32) -> Result<machine::Spent> {
+    if rt
+        .rpc
+        .get_tx_out(&coin.txid, coin.vout, Some(true))?
+        .is_some()
+    {
+        return Ok(None);
+    }
+    let prevout = serde_json::json!([{ "txid": coin.txid.to_string(), "vout": coin.vout }]);
+    let pending: serde_json::Value = rt.rpc.call("gettxspendingprevout", &[prevout])?;
+    if let Some(txid) = pending[0]["spendingtxid"].as_str() {
+        return Ok(Some((txid.parse()?, 0)));
+    }
+    let tip = rt.height()?;
+    for height in from..=tip {
+        for tx in rt.block_txs(height)? {
+            if tx.input.iter().any(|i| i.previous_output == coin) {
+                return Ok(Some((tx.compute_txid(), tip - height + 1)));
+            }
+        }
+    }
+    bail!("{coin} spent by nothing in the blocks from {from} on")
+}
+
+/// A transaction spending `coin`, worth `value`, to a new address of
+/// Core's, 1 000 sat of fee: unsigned.
+fn sweep(rt: &Regtest, coin: OutPoint, value: Amount) -> Result<Transaction> {
+    let to = rt.rpc.get_new_address(None, Some(AddressType::Bech32))?;
+    Ok(Transaction {
+        version: transaction::Version::TWO,
+        lock_time: absolute::LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: coin,
+            ..Default::default()
+        }],
+        output: vec![TxOut {
+            value: value - Amount::from_sat(1_000),
+            script_pubkey: to.assume_checked().script_pubkey(),
+        }],
+    })
+}
+
+/// Her deposit spent otherwise, by its key: the holder giving the opening
+/// up, unless F is first. Unsent.
+pub fn reclaim(rt: &Regtest, run: &Run) -> Result<Transaction> {
+    let (deposit, coin) = &run.deposit;
+    let mut tx = sweep(rt, *deposit, coin.value)?;
+    sign_key(&mut tx, 0, std::slice::from_ref(coin), &run.key)?;
+    Ok(tx)
+}
+
+/// The hub's first coin of `f` spent otherwise, signed by Core: the hub
+/// canceling the opening, unless F is first. Unsent.
+pub fn cancel(rt: &Regtest, f: &machine::Funding) -> Result<Transaction> {
+    let coins = f.hub_coins();
+    let (coin, prevout) = coins.first().context("F spends no coin of the hub's")?;
+    let tx = sweep(rt, *coin, prevout.value)?;
+    let signed = rt.rpc.sign_raw_transaction_with_wallet(&tx, None, None)?;
+    ensure!(signed.complete, "Core signs its coin of F");
+    Ok(signed.transaction()?)
+}
+
+/// Core's coins reserved: those its coin selection leaves alone.
+pub fn reserved(rt: &Regtest) -> Result<HashSet<OutPoint>> {
+    let locked: Vec<serde_json::Value> = rt.rpc.call("listlockunspent", &[])?;
+    let coin = |c: &serde_json::Value| -> Result<OutPoint> {
+        let txid = c["txid"].as_str().context("a txid")?.parse()?;
+        Ok(OutPoint::new(
+            txid,
+            c["vout"].as_u64().context("a vout")? as u32,
+        ))
+    };
+    locked.iter().map(coin).collect()
+}
+
+/// As a hub restarted reserves its coins: none of Core's but those of the
+/// F of each of `hubs`, as it stored them.
+pub fn reserve(rt: &Regtest, hubs: &[&machine::Hub]) -> Result<()> {
+    let _: bool = rt.rpc.call("lockunspent", &[true.into()])?;
+    let f = hubs.iter().filter_map(|h| h.funding());
+    let coins: Vec<_> = f
+        .flat_map(|f| f.hub_coins())
+        .map(|(o, _)| json_coin(o))
+        .collect();
+    let _: bool = rt.rpc.call("lockunspent", &[false.into(), coins.into()])?;
+    Ok(())
+}
+
+/// The hub's coins of `f` it still reserves, released: its opening over.
+pub fn release(rt: &Regtest, f: &machine::Funding) -> Result<()> {
+    let locked = reserved(rt)?;
+    let coins = f.hub_coins().into_iter().map(|(o, _)| o);
+    let coins: Vec<_> = coins
+        .filter(|o| locked.contains(o))
+        .map(json_coin)
+        .collect();
+    if !coins.is_empty() {
+        let _: bool = rt.rpc.call("lockunspent", &[true.into(), coins.into()])?;
+    }
+    Ok(())
+}
+
+fn json_coin(o: OutPoint) -> serde_json::Value {
+    serde_json::json!({ "txid": o.txid.to_string(), "vout": o.vout })
 }
 
 impl Native {
