@@ -963,3 +963,79 @@ async fn a_wallet_file_of_version_2_watches_no_fallback_until_it_hands_one_out()
     let scanned = wallet.scan_silent(HUB, &light, u32::MAX).await.unwrap();
     assert_eq!(scanned.found.len(), 1);
 }
+
+/// The outputs of `tx` that `keys` finds paying it, by the tweak of the
+/// coins `chain` holds that it spends.
+fn found_by(chain: &Chain, keys: &silent::Keys, tx: &Transaction) -> Vec<u64> {
+    let spent: Vec<&bitcoin::Script> = tx
+        .input
+        .iter()
+        .map(|i| chain.outputs[&i.previous_output].script_pubkey.as_script())
+        .collect();
+    let tweak = silent::tweak(tx, &spent).unwrap();
+    let found = keys
+        .scanner([silent::CHANGE])
+        .scan(&tweak, &silent::taproot_outputs(tx));
+    let value = |key: XOnlyPublicKey| {
+        let script = ScriptBuf::new_p2tr_tweaked(TweakedPublicKey::dangerous_assume_tweaked(key));
+        tx.output
+            .iter()
+            .find(|o| o.script_pubkey == script)
+            .unwrap()
+            .value
+            .to_sat()
+    };
+    let mut values: Vec<u64> = found.iter().map(|f| value(f.output)).collect();
+    values.sort();
+    values
+}
+
+#[tokio::test]
+async fn a_spend_pays_a_silent_payment_address_its_receiver_finds() {
+    let s = setup().await;
+    s.wallet.watch_silent(HUB, 1).unwrap();
+    let paying = s.pay(&[s.address()], &[50_000]);
+    s.mine(vec![paying]);
+    s.scan().await.unwrap();
+
+    // Another network's address is refused, its coins left free.
+    let main = silent::Keys::from_seed(&[9; 32], bitcoin::NetworkKind::Main).unwrap();
+    match s.wallet.spend_silent(main.address(), Some(20_000), rate()) {
+        Err(Error::Invalid(why)) => assert!(why.contains("not of regtest"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+    assert!(s.wallet.silent_spends().unwrap().is_empty());
+
+    // Someone else's: they find what it pays them, the wallet its change.
+    let them = silent::Keys::from_seed(&[9; 32], bitcoin::NetworkKind::Test).unwrap();
+    assert_eq!(them.address(), stranger());
+    let spend = s
+        .wallet
+        .spend_silent(stranger(), Some(20_000), rate())
+        .unwrap();
+    assert_signed(&s.chain.lock().unwrap(), &spend);
+    assert_eq!(spend.output.len(), 2);
+    assert!(spend.output.iter().all(|o| o.script_pubkey.is_p2tr()));
+    assert_eq!(found_by(&s.chain.lock().unwrap(), &them, &spend), [20_000]);
+    s.mine(vec![spend.clone()]);
+    let scanned = s.scan().await.unwrap();
+    assert_eq!(scanned.found.len(), 1);
+    assert!(scanned.found[0].change);
+    let fee = rate().fee_wu(spend.weight()).unwrap().to_sat();
+    let change = 50_000 - 20_000 - fee;
+    assert_eq!(scanned.found[0].value, change);
+
+    // Its own address: the payment and the change, derived together, both
+    // found again.
+    let to_self = s
+        .wallet
+        .spend_silent(s.address(), Some(10_000), rate())
+        .unwrap();
+    assert_eq!(to_self.output.len(), 2);
+    s.mine(vec![to_self.clone()]);
+    let scanned = s.scan().await.unwrap();
+    let mut found: Vec<(u64, bool)> = scanned.found.iter().map(|c| (c.value, c.change)).collect();
+    found.sort();
+    let fee = rate().fee_wu(to_self.weight()).unwrap().to_sat();
+    assert_eq!(found, [(10_000, false), (change - 10_000 - fee, true)]);
+}

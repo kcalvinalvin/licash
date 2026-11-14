@@ -17,8 +17,9 @@
 //! and [`FALLBACK_GAP`] after, are watched in every block, and the next is
 //! handed out once one is paid. Their coins are the address's like any.
 //!
-//! [`Wallet::spend_silent`] spends the coins found, change to the wallet's
-//! change address: a transaction for the application to broadcast.
+//! [`Wallet::spend_silent`] spends the coins found, to a script or a silent
+//! payment address ([`Payee`]) and change to the wallet's change address:
+//! a transaction for the application to broadcast.
 //! [`Wallet::deposit_silent`] spends them on a deposit for a hub's notes.
 
 use std::{
@@ -37,7 +38,7 @@ use bitcoin::{
     Transaction, TxIn, TxOut, Txid, Witness,
 };
 use licash_api::{BlockTweaks, MAX_TWEAK_BLOCKS, TWEAKS};
-use licash_onchain::silent::{self, Found, Scanner, CHANGE};
+use licash_onchain::silent::{self, Found, Scanner, SpAddress, CHANGE};
 use rand_core::{OsRng, RngCore};
 use rusqlite::{params, OptionalExtension, Transaction as Sql};
 
@@ -243,6 +244,34 @@ fn pending_inputs(t: &Sql<'_>) -> Result<HashMap<OutPoint, Txid>, Error> {
 /// The taproot script of output key `key`, as is.
 fn p2tr(key: XOnlyPublicKey) -> ScriptBuf {
     ScriptBuf::new_p2tr_tweaked(TweakedPublicKey::dangerous_assume_tweaked(key))
+}
+
+/// A taproot script of no key: any 32 bytes size one, to plan a spend
+/// paying a silent payment or change.
+fn any_taproot() -> ScriptBuf {
+    ScriptBuf::from_bytes([&[0x51, 0x20][..], &[0; 32]].concat())
+}
+
+/// Whom [`Wallet::spend_silent`] pays.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Payee {
+    /// This output script.
+    Script(ScriptBuf),
+    /// A silent payment address: the output paying it is derived from the
+    /// coins spent.
+    Silent(SpAddress),
+}
+
+impl From<ScriptBuf> for Payee {
+    fn from(script: ScriptBuf) -> Self {
+        Self::Script(script)
+    }
+}
+
+impl From<SpAddress> for Payee {
+    fn from(address: SpAddress) -> Self {
+        Self::Silent(address)
+    }
 }
 
 impl<T: Transport> Wallet<T> {
@@ -727,31 +756,64 @@ impl<T: Transport> Wallet<T> {
     /// for the application to broadcast.
     pub fn spend_silent(
         &self,
-        to: ScriptBuf,
+        to: impl Into<Payee>,
         amount: Option<u64>,
         rate: FeeRate,
     ) -> Result<Transaction, Error> {
+        let to = to.into();
+        if let Payee::Silent(address) = &to {
+            let network = licash_onchain::network(self.network);
+            if address.network != network.into() {
+                return Err(Error::Invalid(format!(
+                    "silent payment address {address}: not of {network}"
+                )));
+            }
+        }
         let keys = &self.keys.silent;
         let tx = self.store.write(|t| {
-            let plan = plan(&free_coins(t)?, &to, amount, rate)?;
+            let script = match &to {
+                Payee::Script(script) => script.clone(),
+                Payee::Silent(_) => any_taproot(),
+            };
+            let plan = plan(&free_coins(t)?, &script, amount, rate)?;
             let secrets = plan
                 .inputs
                 .iter()
                 .map(|h| keys.spend_secret(&h.found))
                 .collect::<Result<Vec<SecretKey>, _>>()
                 .map_err(invalid)?;
+            // The silent payment outputs, the payee's first: derived
+            // together, as those to one receiver must be.
+            let mut silent = Vec::new();
+            if let Payee::Silent(address) = &to {
+                silent.push(*address);
+            }
+            if plan.change.is_some() {
+                silent.push(keys.scanner([]).labeled(CHANGE));
+            }
+            let mut paid = match silent.is_empty() {
+                true => Vec::new(),
+                false => {
+                    let keyed: Vec<(SecretKey, bool)> =
+                        secrets.iter().map(|s| (*s, true)).collect();
+                    let outpoints: Vec<OutPoint> = plan.inputs.iter().map(|h| h.outpoint).collect();
+                    silent::outputs(&keyed, &outpoints, &silent).map_err(invalid)?
+                }
+            }
+            .into_iter()
+            .map(p2tr);
+            let script_pubkey = match &to {
+                Payee::Script(script) => script.clone(),
+                Payee::Silent(_) => paid.next().expect("the payee's output"),
+            };
             let mut outputs = vec![TxOut {
                 value: Amount::from_sat(plan.pay),
-                script_pubkey: to.clone(),
+                script_pubkey,
             }];
             if let Some(change) = plan.change {
-                let keyed: Vec<(SecretKey, bool)> = secrets.iter().map(|s| (*s, true)).collect();
-                let outpoints: Vec<OutPoint> = plan.inputs.iter().map(|h| h.outpoint).collect();
-                let address = keys.scanner([]).labeled(CHANGE);
-                let paid = silent::outputs(&keyed, &outpoints, &[address]).map_err(invalid)?;
                 outputs.push(TxOut {
                     value: Amount::from_sat(change),
-                    script_pubkey: p2tr(paid[0]),
+                    script_pubkey: paid.next().expect("the change's output"),
                 });
                 if OsRng.next_u32() & 1 == 1 {
                     outputs.swap(0, 1);
@@ -805,7 +867,7 @@ impl<T: Transport> Wallet<T> {
             .deposits
             .ok_or_else(|| Error::Invalid(format!("hub {url} takes no deposits")))?;
         // What the coins pay a taproot output, as a deposit's is.
-        let taproot = ScriptBuf::from_bytes([&[0x51, 0x20][..], &[0; 32]].concat());
+        let taproot = any_taproot();
         let held = self.store.read(free_coins)?;
         let total = held.iter().map(|h| h.value).sum::<u64>();
         let available = plan(&held, &taproot, None, rate).map_or(0, |p| p.pay);
@@ -920,8 +982,7 @@ fn plan(held: &[Held], to: &ScriptBuf, amount: Option<u64>, rate: FeeRate) -> Re
         value: Amount::from_sat(value),
         script_pubkey: script.clone(),
     };
-    // Change is a taproot output: any 32 bytes size it.
-    let change_script = ScriptBuf::from_bytes([&[0x51, 0x20][..], &[0; 32]].concat());
+    let change_script = any_taproot();
     let (dust, change_dust) = (
         to.minimal_non_dust().to_sat(),
         change_script.minimal_non_dust().to_sat(),
