@@ -2899,6 +2899,7 @@ dependencies = [
  "licash-wallet",
  "reqwest",
  "rustls",
+ "webpki-roots 1.0.12",
 ]
 
 [[package]]

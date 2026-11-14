@@ -32,6 +32,18 @@ impl Http {
             Some(proxy) => client.proxy(reqwest::Proxy::all(proxy).context("the proxy URL")?),
             None => client.no_proxy(),
         };
+        // Android's verifier needs the application's Java side: Mozilla's
+        // roots instead, as for Tor.
+        #[cfg(target_os = "android")]
+        {
+            let roots = rustls::RootCertStore {
+                roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+            };
+            let tls = rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+            client = client.tls_backend_preconfigured(tls);
+        }
         Ok(Self(Route::Direct(client.build()?)))
     }
 
