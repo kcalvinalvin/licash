@@ -9,12 +9,14 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/btcsuite/btcd/chainhash/v2"
 	"github.com/btcsuite/btcd/wire/v2"
+	"github.com/lightninglabs/neutrino"
 )
 
 // core runs bitcoin-cli in the container regtest.sh starts.
@@ -159,6 +161,35 @@ func TestRegtestBlockTimesAreTheHeaders(t *testing.T) {
 	for _, bad := range []int32{-1, height + 1} {
 		if _, err := c.Time(bad); err == nil {
 			t.Errorf("time of block %d", bad)
+		}
+	}
+}
+
+func TestRegtestTheLogFileHoldsTheLightClients(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "chain.log")
+	if err := SetLog(path); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		logMu.Lock()
+		logOut = os.Stderr
+		logMu.Unlock()
+		neutrino.DisableLog()
+	})
+	c, err := Start("regtest", t.TempDir(), os.Getenv("LICASH_BITCOIND_P2P"), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.Stop() }()
+	for deadline := time.Now().Add(90 * time.Second); !c.Synced(); time.Sleep(200 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("timed out syncing")
+		}
+	}
+	logged, _ := os.ReadFile(path)
+	for _, want := range []string{"light client started", "[INF] LCHN"} {
+		if !bytes.Contains(logged, []byte(want)) {
+			t.Errorf("no %q in the log:\n%s", want, logged)
 		}
 	}
 }

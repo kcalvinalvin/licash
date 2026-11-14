@@ -5,9 +5,11 @@ module github.com/licash-org/licash/apps/mobile/chain
 go 1.26.0
 
 require (
+	github.com/btcsuite/btcd/btcutil/v2 v2.0.0
 	github.com/btcsuite/btcd/chaincfg/v2 v2.0.0
 	github.com/btcsuite/btcd/chainhash/v2 v2.0.0
 	github.com/btcsuite/btcd/wire/v2 v2.0.0
+	github.com/btcsuite/btclog v1.0.0
 	github.com/btcsuite/btcwallet/walletdb v1.6.0
 	github.com/lightninglabs/neutrino v0.18.0
 )
@@ -17,10 +19,8 @@ require (
 	github.com/btcsuite/btcd v0.26.0 // indirect
 	github.com/btcsuite/btcd/address/v2 v2.0.0 // indirect
 	github.com/btcsuite/btcd/btcec/v2 v2.5.0 // indirect
-	github.com/btcsuite/btcd/btcutil/v2 v2.0.0 // indirect
 	github.com/btcsuite/btcd/txscript/v2 v2.0.0 // indirect
 	github.com/btcsuite/btcd/v2transport v1.0.1 // indirect
-	github.com/btcsuite/btclog v1.0.0 // indirect
 	github.com/btcsuite/btcwallet v0.16.18 // indirect
 	github.com/btcsuite/btcwallet/wtxmgr v1.6.0 // indirect
 	github.com/btcsuite/go-socks v0.0.0-20170105172521-4720035b7bfd // indirect

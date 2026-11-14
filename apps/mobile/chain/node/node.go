@@ -98,6 +98,8 @@ func Start(cfg Config) (*Node, error) {
 		return nil, err
 	}
 	n.cdn = server
+	log.Info("light client started", "network", cfg.Params.Name,
+		"connect", cfg.ConnectPeers, "add", cfg.AddPeers, "cdn", server != nil)
 	return n, nil
 }
 

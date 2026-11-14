@@ -5,6 +5,9 @@ import (
 	"log/slog"
 	"os"
 	"sync"
+
+	"github.com/btcsuite/btclog"
+	"github.com/lightninglabs/neutrino"
 )
 
 // logMax is the size a log file grows to before it is moved aside, to
@@ -17,7 +20,8 @@ var (
 )
 
 // SetLog has the light clients started from now on log to the file at
-// path as well, besides standard error (on Android, logcat).
+// path as well, besides standard error (on Android, logcat), neutrino's
+// peers and sync among it.
 func SetLog(path string) error {
 	f, err := openLog(path)
 	if err != nil {
@@ -26,6 +30,9 @@ func SetLog(path string) error {
 	logMu.Lock()
 	defer logMu.Unlock()
 	logOut = io.MultiWriter(os.Stderr, f)
+	upstream := btclog.NewBackend(logOut).Logger("LCHN")
+	upstream.SetLevel(btclog.LevelInfo)
+	neutrino.UseLogger(upstream)
 	return nil
 }
 
