@@ -1,11 +1,12 @@
 [package]
 name = "licash-onchain"
-description = "Licash on Bitcoin: silent payments (BIP352)"
+description = "Licash on Bitcoin: silent payments (BIP352) and deposits"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
+licash = { path = "../licash" }
 bitcoin = { version = "=0.32.102", default-features = false, features = ["std"] }
 thiserror.workspace = true
 

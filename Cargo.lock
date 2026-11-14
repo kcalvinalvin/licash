@@ -515,6 +515,7 @@ version = "0.0.1"
 dependencies = [
  "bitcoin",
  "hex",
+ "licash",
  "serde_json",
  "thiserror 1.0.69",
 ]
