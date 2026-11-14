@@ -243,7 +243,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     };
     let transport = if cli.tor {
         let dir = path.parent().unwrap_or(Path::new(".")).join("tor");
-        Http::tor(&dir)?
+        Http::tor(licash_tor::Tor::new(&dir).context("a Tor client")?)
     } else {
         Http::new(cli.proxy.as_deref())?
     };

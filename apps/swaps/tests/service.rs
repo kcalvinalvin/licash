@@ -128,3 +128,28 @@ fn init_creates_the_provider_once_and_status_reads_it() {
     assert!(!bad.status.success());
     assert!(String::from_utf8(bad.stderr).unwrap().contains("--margin"));
 }
+
+#[test]
+fn announcements_are_checked_before_anything_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let relay = ["--nostr-relay", "ws://127.0.0.1:1"];
+    for (args, says) in [
+        (
+            &["--announce-url", "https://swaps.example"][..],
+            "needs --nostr-relay",
+        ),
+        (&relay[..], "--announce-url"),
+        (
+            &[relay[0], relay[1], "--onion", "--announce-url", "ftp://x"][..],
+            "ftp://",
+        ),
+        // An onion service may be the only URL announced.
+        (&[relay[0], relay[1], "--onion"][..], "no provider"),
+    ] {
+        let out = licash_swaps(&dir, &[&["run"], args].concat());
+        assert!(!out.status.success());
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains(says), "{args:?}: {stderr}");
+    }
+    assert!(!dir.path().join("data").exists());
+}

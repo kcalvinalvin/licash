@@ -1,5 +1,11 @@
-//! HTTP(S) over an embedded Tor client (Arti): every request through its
-//! own Tor stream, to onion services and to hosts on the clear web alike.
+//! Tor for the applications, through a Tor client of their own (Arti):
+//! HTTP(S) requests over it, to onion services and to the clear web alike,
+//! and an axum router served as an onion service of their own.
+//!
+//! Arti may end the process if the Tor network's consensus declares its
+//! version obsolete.
+
+mod serve;
 
 use std::{path::Path, sync::Arc, time::Duration};
 
@@ -11,24 +17,28 @@ use hyper::{
     Method, Request, Uri,
 };
 use hyper_util::rt::TokioIo;
-use licash_wallet::Response;
 use tokio_rustls::{rustls, TlsConnector};
 use tor_rtcompat::PreferredRuntime;
 
-use crate::MAX_ANSWER;
+pub use serve::Onion;
 
 /// How long a request may take, its circuit included.
 const TIMEOUT: Duration = Duration::from_secs(120);
 
-pub(crate) struct Tor {
+/// A Tor client, shared by its clones.
+#[derive(Clone)]
+pub struct Tor {
     client: Arc<TorClient<PreferredRuntime>>,
     tls: TlsConnector,
 }
 
 impl Tor {
-    /// A Tor client keeping its state and its directory cache under `dir`,
-    /// to bootstrap on its first request. Within a Tokio runtime.
-    pub(crate) fn new(dir: &Path) -> anyhow::Result<Self> {
+    /// A Tor client keeping its state, onion service keys included, in
+    /// `dir/state` and its directory cache in `dir/cache`. It connects to
+    /// the Tor network once first used. Within a Tokio runtime.
+    pub fn new(dir: &Path) -> anyhow::Result<Self> {
+        // Arti's TLS needs a process-wide provider.
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let config = TorClientConfigBuilder::from_directories(dir.join("state"), dir.join("cache"))
             .build()?;
         let client = TorClient::builder()
@@ -46,17 +56,25 @@ impl Tor {
         })
     }
 
-    pub(crate) async fn request(
+    /// GET `url`, or POST `body` to it as JSON, over Tor: its status and
+    /// body, of at most `max` bytes.
+    pub async fn request(
         &self,
         url: &str,
         body: Option<Vec<u8>>,
-    ) -> Result<Response, String> {
-        tokio::time::timeout(TIMEOUT, self.exchange(url, body))
+        max: usize,
+    ) -> Result<(u16, Vec<u8>), String> {
+        tokio::time::timeout(TIMEOUT, self.exchange(url, body, max))
             .await
             .unwrap_or_else(|_| Err(format!("no answer over Tor in {} s", TIMEOUT.as_secs())))
     }
 
-    async fn exchange(&self, url: &str, body: Option<Vec<u8>>) -> Result<Response, String> {
+    async fn exchange(
+        &self,
+        url: &str,
+        body: Option<Vec<u8>>,
+        max: usize,
+    ) -> Result<(u16, Vec<u8>), String> {
         let (target, request) = prepare(url, body)?;
         let stream = self
             .client
@@ -64,7 +82,7 @@ impl Tor {
             .await
             .map_err(|e| format!("over Tor: {e}"))?;
         if !target.https {
-            return send(TokioIo::new(stream), request).await;
+            return send(TokioIo::new(stream), request, max).await;
         }
         let name = rustls::pki_types::ServerName::try_from(target.host)
             .map_err(|e| format!("not a TLS name: {e}"))?;
@@ -73,7 +91,7 @@ impl Tor {
             .connect(name, stream)
             .await
             .map_err(|e| format!("TLS: {e}"))?;
-        send(TokioIo::new(stream), request).await
+        send(TokioIo::new(stream), request, max).await
     }
 }
 
@@ -113,8 +131,9 @@ fn prepare(url: &str, body: Option<Vec<u8>>) -> Result<(Target, Request<Full<Byt
     Ok((Target { host, port, https }, request))
 }
 
-/// `request` over `io`, one HTTP/1.1 exchange.
-async fn send<I>(io: I, request: Request<Full<Bytes>>) -> Result<Response, String>
+/// `request` over `io`, one HTTP/1.1 exchange: the answer's status and
+/// body, of at most `max` bytes.
+async fn send<I>(io: I, request: Request<Full<Bytes>>, max: usize) -> Result<(u16, Vec<u8>), String>
 where
     I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
 {
@@ -128,14 +147,11 @@ where
             .await
             .map_err(|e| e.to_string())?;
         let status = response.status().as_u16();
-        let body = Limited::new(response.into_body(), MAX_ANSWER)
+        let body = Limited::new(response.into_body(), max)
             .collect()
             .await
             .map_err(|e| format!("the answer: {e}"))?;
-        Ok(Response {
-            status,
-            body: body.to_bytes().to_vec(),
-        })
+        Ok((status, body.to_bytes().to_vec()))
     }
     .await;
     connection.abort();
@@ -192,15 +208,12 @@ mod tests {
     #[tokio::test]
     #[ignore = "reaches the Tor network"]
     async fn requests_reach_the_clear_web_over_tor() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
         let dir = tempfile::tempdir().unwrap();
         let tor = Tor::new(dir.path()).unwrap();
-        let answer = tor
-            .request("https://check.torproject.org/api/ip", None)
-            .await
-            .unwrap();
-        assert_eq!(answer.status, 200);
-        let body = String::from_utf8(answer.body).unwrap();
+        let url = "https://check.torproject.org/api/ip";
+        let (status, body) = tor.request(url, None, 1 << 16).await.unwrap();
+        assert_eq!(status, 200);
+        let body = String::from_utf8(body).unwrap();
         assert!(body.contains("\"IsTor\":true"), "{body}");
     }
 }

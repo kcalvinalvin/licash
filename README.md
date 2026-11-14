@@ -29,11 +29,11 @@ research implementation; it has not had a security review.
   Bitcoin Core and LND. See [regtest/README.md](regtest/README.md).
 - `apps/`: the applications, a workspace of their own: the hub service
   (`apps/hub`), the swap provider service (`apps/swaps`), the wallet CLI
-  (`apps/wallet-cli`), their HTTP transport (`apps/transport`), chain
-  sources (`apps/chain-client`), operator notifications (`apps/notify`),
-  announcements on Nostr (`apps/nostr`), and end-to-end tests of hubs,
-  their Lightning gateways, swap providers and wallets on a regtest
-  ecosystem in Docker (`apps/e2e`).
+  (`apps/wallet-cli`), their HTTP transport (`apps/transport`), Tor
+  through Arti (`apps/tor`), chain sources (`apps/chain-client`), operator
+  notifications (`apps/notify`), announcements on Nostr (`apps/nostr`), and
+  end-to-end tests of hubs, their Lightning gateways, swap providers and
+  wallets on a regtest ecosystem in Docker (`apps/e2e`).
 - `paper/`: the paper's source; `paper/build.sh` rebuilds the PDF (Docker).
 
 ## Quick start

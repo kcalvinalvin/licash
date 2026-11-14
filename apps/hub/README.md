@@ -26,6 +26,10 @@ With `--nostr-relay URL --announce-url URL` (and `--chain`), the hub
 announces itself on Nostr relays for wallets to discover, under a key
 derived from its seed that `/v1/info` names.
 
+With `--onion`, the hub also serves its API as an onion service of a Tor
+client of its own (Arti), and announces its URL. The service's key is in
+`<data>/tor/state`: back it up to keep the address.
+
 Notification targets are Apprise URLs (`gotify[s]://`, `tgram://`,
 `ntfy[s]://`, `json[s]://`, `apprise[s]://`); `test-notify` checks them.
 

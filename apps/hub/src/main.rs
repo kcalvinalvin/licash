@@ -21,6 +21,7 @@ use licash_hub_service::{
 };
 use licash_nostr::Announcement;
 use licash_notify::{Message, Priority, Target};
+use licash_tor::{Onion, Tor};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -124,7 +125,7 @@ struct AnnounceArgs {
     )]
     nostr_relays: Vec<String>,
     /// A URL wallets reach the hub at: `https://`, or an onion service's
-    /// `http://`. Repeat it, up to 4.
+    /// `http://`. Repeat it, up to 4 with `--onion`'s.
     #[arg(
         long = "announce-url",
         value_name = "URL",
@@ -138,8 +139,9 @@ struct AnnounceArgs {
 }
 
 impl AnnounceArgs {
-    /// The relays and the announcement's URLs and name, if it announces.
-    fn announcing(self) -> anyhow::Result<Option<Announcing>> {
+    /// The relays and the announcement's URLs and name, if it announces:
+    /// with `onion`, the onion service's URL is added once it runs.
+    fn announcing(self, onion: bool) -> anyhow::Result<Option<Announcing>> {
         let relays: Vec<String> = self
             .nostr_relays
             .into_iter()
@@ -154,14 +156,34 @@ impl AnnounceArgs {
             anyhow::ensure!(urls.is_empty(), "--announce-url needs --nostr-relay");
             return Ok(None);
         }
-        let announcement = Announcement {
-            urls,
-            network: String::new(),
-            name: self.announce_name,
-        };
-        announcement.check().context("--announce-url")?;
-        Ok(Some((relays, announcement.urls, announcement.name)))
+        // `--onion`'s URL joins them once its service runs.
+        if !(onion && urls.is_empty()) {
+            check(&urls).context("--announce-url")?;
+        }
+        Ok(Some((relays, urls, self.announce_name)))
     }
+}
+
+/// Whether wallets can use the announced `urls`.
+fn check(urls: &[String]) -> anyhow::Result<()> {
+    let announcement = Announcement {
+        urls: urls.to_vec(),
+        network: String::new(),
+        name: None,
+    };
+    announcement.check()
+}
+
+/// Announce `onion`'s URL too, if the service announces.
+fn announce_onion(
+    announcing: &mut Option<Announcing>,
+    onion: Option<&Onion>,
+) -> anyhow::Result<()> {
+    if let (Some((_, urls, _)), Some(onion)) = (announcing, onion) {
+        urls.push(onion.url().to_owned());
+        check(urls).context("--onion")?;
+    }
+    Ok(())
 }
 
 /// The relays, URLs and name of the hub's announcement.
@@ -369,6 +391,12 @@ enum Command {
         lightning: Box<LightningArgs>,
         #[command(flatten)]
         announce: Box<AnnounceArgs>,
+        /// Also serve the API as an onion service of a Tor client of the
+        /// hub's own, at the same address on every start (its key in
+        /// `<data>/tor`), and announce it.
+        #[arg(long, env = "LICASH_HUB_ONION",
+              value_parser = clap::builder::BoolishValueParser::new())]
+        onion: bool,
         /// Notify only of these kinds of event [default: all].
         #[arg(long, value_name = "KIND", env = "LICASH_HUB_NOTIFY_KINDS", value_delimiter = ',',
               value_parser = clap::builder::PossibleValuesParser::new(notify::KINDS))]
@@ -435,6 +463,7 @@ fn command(cli: Cli) -> anyhow::Result<()> {
             notify,
             lightning,
             announce,
+            onion,
             notify_kinds,
         } => {
             let policy = policy.policy();
@@ -444,7 +473,7 @@ fn command(cli: Cli) -> anyhow::Result<()> {
                 lightning.is_none() || chain.is_some(),
                 "a Lightning gateway (--lnd) needs --chain"
             );
-            let announcing = (*announce).announcing()?;
+            let mut announcing = (*announce).announcing(onion)?;
             anyhow::ensure!(
                 announcing.is_none() || chain.is_some(),
                 "announcing on Nostr (--nostr-relay) needs --chain"
@@ -470,14 +499,27 @@ fn command(cli: Cli) -> anyhow::Result<()> {
                 }
                 None => None,
             };
+            let router = licash_hub_service::router(hub.clone(), gateway.clone());
+            let runtime = tokio::runtime::Runtime::new()?;
+            let _entered = runtime.enter();
+            let onion = match onion {
+                true => {
+                    let tor = Tor::new(&cli.data.join("tor")).context("a Tor client")?;
+                    let onion = tor.serve("licash-hub", router.clone())?;
+                    tracing::info!(url = onion.url(), "serving as an onion service");
+                    Some(onion)
+                }
+                false => None,
+            };
+            announce_onion(&mut announcing, onion.as_ref())?;
             let tasks = Tasks {
                 chain,
                 notifier,
                 gateway,
                 announcing,
             };
-            let serving = serve(hub, listen, policy, tasks);
-            tokio::runtime::Runtime::new()?.block_on(serving)
+            let serving = serve(hub, router, listen, policy, tasks);
+            runtime.block_on(serving)
         }
         Command::TestNotify { notify } => test_notify(&notify),
         Command::Status { json } => status(&db, json),
@@ -511,6 +553,7 @@ struct Tasks {
 
 async fn serve(
     hub: Arc<Hub>,
+    router: axum::Router,
     listen: SocketAddr,
     policy: Policy,
     tasks: Tasks,
@@ -546,7 +589,7 @@ async fn serve(
         tracing::info!(relays = %relays.join(", "), urls = %urls.join(", "), "announcing on Nostr");
         tokio::spawn(announce(hub.clone(), relays, urls, name))
     });
-    axum::serve(listener, licash_hub_service::router(hub, gateway))
+    axum::serve(listener, router)
         .with_graceful_shutdown(shutdown())
         .await?;
     for task in [watching, paying, announcing].into_iter().flatten() {

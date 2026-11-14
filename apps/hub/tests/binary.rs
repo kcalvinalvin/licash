@@ -22,6 +22,7 @@ fn hub(data: &Path, args: &[&str]) -> Command {
         .env_remove("LICASH_HUB_NAME")
         .env_remove("LICASH_HUB_NOSTR_RELAYS")
         .env_remove("LICASH_HUB_ANNOUNCE_URLS")
+        .env_remove("LICASH_HUB_ONION")
         .env("RUST_LOG", "info");
     command
 }
@@ -234,6 +235,29 @@ fn failures_exit_nonzero_and_log_as_asked() {
             &[relay[0], relay[1], "--announce-url", "https://hub.example"][..],
             "needs --chain",
         ),
+    ] {
+        let out = output(&missing, &[&["run"], args].concat());
+        assert!(!out.status.success());
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains(says), "{args:?}: {stderr}");
+    }
+    assert!(!missing.exists());
+}
+
+#[test]
+fn an_onion_service_may_be_the_only_url_announced() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("none");
+    let onion = ["--nostr-relay", "ws://127.0.0.1:1", "--onion"];
+    let chain = ["--chain", "http://node:8332"];
+    for (args, says) in [
+        (&onion[..], "needs --chain"),
+        (
+            &[&onion[..], &["--announce-url", "ftp://hub.example"]].concat(),
+            "ftp://",
+        ),
+        // Checked before the hub opens, where this one stops.
+        (&[&onion[..], &chain[..]].concat(), "open the hub"),
     ] {
         let out = output(&missing, &[&["run"], args].concat());
         assert!(!out.status.success());

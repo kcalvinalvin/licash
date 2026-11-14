@@ -2,9 +2,6 @@
 //! through a proxy such as Tor's SOCKS port, or, with the `tor` feature,
 //! through a Tor client of their own.
 
-#[cfg(feature = "tor")]
-mod tor;
-
 use std::time::Duration;
 
 use anyhow::Context;
@@ -19,7 +16,7 @@ pub struct Http(Route);
 enum Route {
     Direct(reqwest::Client),
     #[cfg(feature = "tor")]
-    Tor(tor::Tor),
+    Tor(licash_tor::Tor),
 }
 
 impl Http {
@@ -38,14 +35,11 @@ impl Http {
         Ok(Self(Route::Direct(client.build()?)))
     }
 
-    /// Through a Tor client of its own, to onion services and to the clear
-    /// web alike, keeping its state under `dir`. It connects to the Tor
-    /// network on the first request. Within a Tokio runtime.
+    /// Through `tor`, a Tor client of the application's own, to onion
+    /// services and to the clear web alike.
     #[cfg(feature = "tor")]
-    pub fn tor(dir: &std::path::Path) -> anyhow::Result<Self> {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let tor = tor::Tor::new(dir).context("a Tor client")?;
-        Ok(Self(Route::Tor(tor)))
+    pub fn tor(tor: licash_tor::Tor) -> Self {
+        Self(Route::Tor(tor))
     }
 }
 
@@ -62,8 +56,10 @@ impl Transport for Http {
                 let url = url.to_owned();
                 // Boxed: Arti's futures are too deep a type to nest in the
                 // callers'.
-                let tor: futures_util::future::BoxFuture<'_, _> =
-                    Box::pin(async move { tor.request(&url, body).await });
+                let tor: futures_util::future::BoxFuture<'_, _> = Box::pin(async move {
+                    let (status, body) = tor.request(&url, body, MAX_ANSWER).await?;
+                    Ok(Response { status, body })
+                });
                 return futures_util::future::Either::Left(tor);
             }
         };

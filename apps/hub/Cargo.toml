@@ -16,6 +16,7 @@ licash-chain-client.workspace = true
 licash-hub.workspace = true
 licash-nostr.workspace = true
 licash-notify.workspace = true
+licash-tor.workspace = true
 anyhow.workspace = true
 axum.workspace = true
 base64 = "0.23"
