@@ -322,7 +322,9 @@ struct Hold<'a> {
 impl<'a> Hold<'a> {
     fn take(busy: &'a Mutex<HashSet<[u8; 32]>>, id: [u8; 32]) -> Option<Self> {
         let mut held = busy.lock().unwrap_or_else(PoisonError::into_inner);
-        held.insert(id).then_some(Self { busy, id })
+        // Not `then_some`: a hold made only to be dropped would lock again,
+        // and release the other task's.
+        held.insert(id).then(|| Self { busy, id })
     }
 }
 
@@ -968,5 +970,23 @@ impl<T: Transport> Provider<T> {
             message: message.to_owned(),
         };
         self.store.write(|tx| emit(tx, &notice))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_swap_in_hand_is_held_until_dropped() {
+        let busy = Mutex::new(HashSet::new());
+        let first = Hold::take(&busy, [1; 32]).unwrap();
+        assert!(Hold::take(&busy, [1; 32]).is_none());
+        assert!(Hold::take(&busy, [1; 32]).is_none());
+        let other = Hold::take(&busy, [2; 32]).unwrap();
+        drop(first);
+        assert!(Hold::take(&busy, [1; 32]).is_some());
+        drop(other);
+        assert!(busy.lock().unwrap().is_empty());
     }
 }
