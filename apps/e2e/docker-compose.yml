@@ -1,0 +1,114 @@
+# A regtest ecosystem for the end-to-end tests: Bitcoin Core, two hubs with
+# Lightning gateways over their own LND nodes, and an outside LND node that
+# pays and is paid. `run.sh` brings it up, runs the tests and removes it.
+# Every port is published on 127.0.0.1 only: the hubs' at fixed ports, which
+# their wallets keep across restarts, LICASH_E2E_HUB1 and LICASH_E2E_HUB2,
+# the rest at ports Docker picks.
+
+x-lnd: &lnd
+  image: lightninglabs/lnd:v0.21.6-beta@sha256:54b3c87ad0bc3fea3fab8af23ace6421147ea97e6b56bf3911592d7853c185b8
+  depends_on:
+    bitcoind:
+      condition: service_healthy
+  healthcheck:
+    test: ["CMD", "lncli", "--network=regtest", "getinfo"]
+    interval: 2s
+    timeout: 5s
+    retries: 60
+  entrypoint: ["lnd"]
+  command:
+  - --bitcoin.regtest
+  - --bitcoin.node=bitcoind
+  - --bitcoind.rpchost=bitcoind:18443
+  - --bitcoind.rpcuser=licash
+  - --bitcoind.rpcpass=licash
+  - --bitcoind.zmqpubrawblock=tcp://bitcoind:28332
+  - --bitcoind.zmqpubrawtx=tcp://bitcoind:28333
+  - --noseedbackup
+  - --nobootstrap
+  - --listen=0.0.0.0:9735
+  - --rpclisten=0.0.0.0:10009
+  - --restlisten=0.0.0.0:8080
+
+x-hub: &hub
+  image: licash-hub:e2e
+  build:
+    context: ../..
+    dockerfile: apps/hub/Dockerfile
+  # Root, to read its LND node's macaroon.
+  user: "0:0"
+  entrypoint: ["sh", "-c"]
+  environment:
+    LICASH_HUB_CHAIN: http://licash:licash@bitcoind:18443
+    LICASH_HUB_CHAIN_POLL: "1"
+    LICASH_HUB_LND_MACAROON: /lnd/data/chain/bitcoin/regtest/admin.macaroon
+    LICASH_HUB_LND_CERT: /lnd/tls.cert
+    LICASH_HUB_LOG: json
+    RUST_LOG: info
+
+services:
+  bitcoind:
+    image: bitcoin/bitcoin:30.0
+    entrypoint: ["bitcoind"]
+    command:
+      - -regtest
+      - -server
+      - -printtoconsole
+      # licash:licash, for this throwaway regtest only.
+      - -rpcauth=licash:6c69636173682d6532652d73616c7421$$290f05ac8a7eb59151185233acb148039c315f534f56afe953ce22da6df910dd
+      - -rpcbind=0.0.0.0
+      - -rpcallowip=0.0.0.0/0
+      - -fallbackfee=0.0002
+      - -zmqpubrawblock=tcp://0.0.0.0:28332
+      - -zmqpubrawtx=tcp://0.0.0.0:28333
+    ports:
+      - "127.0.0.1::18443"
+    healthcheck:
+      test: ["CMD", "bitcoin-cli", "-regtest", "-rpcuser=licash", "-rpcpassword=licash", "getblockchaininfo"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  # The outside world's Lightning node.
+  outside-ln:
+    <<: *lnd
+
+  hub1-ln:
+    <<: *lnd
+    volumes:
+      - hub1-ln:/root/.lnd
+
+  hub2-ln:
+    <<: *lnd
+    volumes:
+      - hub2-ln:/root/.lnd
+
+  hub1:
+    <<: *hub
+    command: ["[ -f /data/seed ] || licash-hub init; exec licash-hub run --lnd https://hub1-ln:8080"]
+    ports:
+      - "127.0.0.1:${LICASH_E2E_HUB1:-38338}:8338"
+    volumes:
+      - hub1:/data
+      - hub1-ln:/lnd:ro
+    depends_on:
+      hub1-ln:
+        condition: service_healthy
+
+  hub2:
+    <<: *hub
+    command: ["[ -f /data/seed ] || licash-hub init; exec licash-hub run --lnd https://hub2-ln:8080"]
+    ports:
+      - "127.0.0.1:${LICASH_E2E_HUB2:-38339}:8338"
+    volumes:
+      - hub2:/data
+      - hub2-ln:/lnd:ro
+    depends_on:
+      hub2-ln:
+        condition: service_healthy
+
+volumes:
+  hub1:
+  hub2:
+  hub1-ln:
+  hub2-ln:

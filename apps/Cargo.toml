@@ -2,7 +2,7 @@
 # their runtime dependencies stay out of the SDK's.
 [workspace]
 resolver = "2"
-members = ["chain-client", "hub", "notify", "wallet-cli"]
+members = ["chain-client", "e2e", "hub", "notify", "wallet-cli"]
 
 [workspace.package]
 version = "0.0.1"

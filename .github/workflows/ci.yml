@@ -37,6 +37,24 @@ jobs:
         run: docker build -f apps/hub/Dockerfile .
       - name: Wallet image
         run: docker build -f apps/wallet-cli/Dockerfile .
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps
+      - name: Hubs, gateways and wallets on a regtest ecosystem
+        run: apps/e2e/run.sh
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-logs
+          path: apps/target/e2e/
   regtest:
     runs-on: ubuntu-latest
     timeout-minutes: 45

@@ -1037,6 +1037,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "licash-e2e"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "hex",
+ "licash",
+ "licash-api",
+ "licash-wallet",
+ "rand_core",
+ "reqwest",
+ "rustls",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "licash-hub"
 version = "0.0.1"
 dependencies = [
