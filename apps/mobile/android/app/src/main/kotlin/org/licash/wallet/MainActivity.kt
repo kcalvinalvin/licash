@@ -26,6 +26,7 @@ import androidx.compose.ui.semantics.testTagsAsResourceId
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import org.licash.core.Activity
 import org.licash.wallet.ui.ActivityDetails
+import org.licash.wallet.ui.BalanceDetails
 import org.licash.wallet.ui.Home
 import org.licash.wallet.ui.LicashTheme
 import org.licash.wallet.ui.Onboarding
@@ -39,6 +40,7 @@ private sealed interface Screen {
     data object Receive : Screen
     data class Send(val link: String?) : Screen
     data object Settings : Screen
+    data object Balance : Screen
     data class Details(val activity: Activity) : Screen
 }
 
@@ -97,11 +99,15 @@ private fun App(engine: Engine, link: String?, linkShown: () -> Unit) {
                         receive = { screen = Screen.Receive },
                         send = { screen = Screen.Send(null) },
                         settings = { screen = Screen.Settings },
+                        balance = { screen = Screen.Balance },
                         open = { screen = Screen.Details(it) },
                     )
                     Screen.Receive -> Receive(engine) { screen = Screen.Home }
                     is Screen.Send -> Send(engine, ui, s.link) { screen = Screen.Home }
-                    Screen.Settings -> Settings(engine, ui) { screen = Screen.Home }
+                    Screen.Settings -> Settings(engine, ui, balance = { screen = Screen.Balance }) {
+                        screen = Screen.Home
+                    }
+                    Screen.Balance -> BalanceDetails(engine, ui) { screen = Screen.Home }
                     is Screen.Details -> ActivityDetails(engine, ui, s.activity) { screen = Screen.Home }
                 }
             }

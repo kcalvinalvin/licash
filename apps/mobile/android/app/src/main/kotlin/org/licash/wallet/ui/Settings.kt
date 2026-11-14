@@ -16,6 +16,7 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
+import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.FilledTonalButton
@@ -27,7 +28,6 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -52,10 +52,9 @@ import org.licash.wallet.exportLogs
 import org.licash.wallet.sat
 
 @Composable
-fun Settings(engine: Engine, ui: Ui, back: () -> Unit) {
+fun Settings(engine: Engine, ui: Ui, balance: () -> Unit, back: () -> Unit) {
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
-    var taps by remember { mutableIntStateOf(0) }
     var error by remember { mutableStateOf<String?>(null) }
     Column(
         Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 20.dp),
@@ -84,13 +83,20 @@ fun Settings(engine: Engine, ui: Ui, back: () -> Unit) {
                     .onFailure { AppLog.warn("exporting the logs", it) }
             }
         }
+        Group("Advanced") {
+            Toggle(
+                "Advanced mode",
+                "Notes by denomination, payment details, the light client's settings and the log.",
+                ui.developer,
+            ) { engine.setDeveloper(it) }
+            if (ui.developer) {
+                Divider()
+                Action("Balance and notes held", "Where it is, and the notes of each denomination.", Icons.Filled.Info, balance)
+                Advanced(engine, ui)
+            }
+        }
         Group("About") {
-            Row(
-                Modifier.fillMaxWidth().clickable {
-                    taps += 1
-                    if (taps >= 7 && !ui.developer) engine.setDeveloper(true)
-                }.padding(vertical = 14.dp),
-            ) {
+            Row(Modifier.fillMaxWidth().padding(vertical = 14.dp)) {
                 Text("Version", Modifier.weight(1f), style = MaterialTheme.typography.bodyLarge)
                 Text(
                     BuildConfig.VERSION_NAME,
@@ -99,7 +105,6 @@ fun Settings(engine: Engine, ui: Ui, back: () -> Unit) {
                 )
             }
         }
-        if (ui.developer) Developer(engine, ui)
         Spacer(Modifier.height(48.dp))
     }
 }
@@ -228,17 +233,14 @@ private fun Status(ui: Ui) {
 
 /** The light client's settings and the log, for those testing them. */
 @Composable
-private fun Developer(engine: Engine, ui: Ui) {
+private fun Advanced(engine: Engine, ui: Ui) {
     val scope = rememberCoroutineScope()
     var peers by remember { mutableStateOf(engine.prefs.peers) }
     var cdn by remember { mutableStateOf(engine.prefs.cdn) }
     var explorer by remember { mutableStateOf(engine.prefs.explorer) }
     var logs by remember { mutableStateOf(false) }
     var deleting by remember { mutableStateOf(false) }
-    Group("Developer") {
-        Toggle("Developer mode", "Test networks and the light client's settings.", true) {
-            engine.setDeveloper(false)
-        }
+    run {
         Divider()
         Column(Modifier.padding(vertical = 12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Text("${ui.network.name} light client", style = MaterialTheme.typography.bodyLarge)

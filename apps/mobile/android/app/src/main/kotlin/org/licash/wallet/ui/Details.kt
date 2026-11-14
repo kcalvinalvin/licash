@@ -211,10 +211,10 @@ private fun Line(label: String, value: String) {
     }
 }
 
-/** Everything known of it, for developers: a tap copies a value. */
+/** Everything known of it, in advanced mode: a tap copies a value. */
 @Composable
 private fun Technical(activity: Activity, details: Details?, copy: (String, String) -> Unit) {
-    Group("Developer") {
+    Group("Advanced") {
         when (details) {
             is Details.Notes -> {
                 Fact("Payment", activity.id, copy)

@@ -51,6 +51,7 @@ fun Home(
     receive: () -> Unit,
     send: () -> Unit,
     settings: () -> Unit,
+    balance: () -> Unit,
     open: (Activity) -> Unit,
 ) {
     Column(Modifier.fillMaxSize().padding(horizontal = 24.dp)) {
@@ -62,7 +63,7 @@ fun Home(
             IconButton(onClick = settings) { Icon(Icons.Default.Settings, contentDescription = "Settings") }
         }
         Spacer(Modifier.height(40.dp))
-        Total(ui)
+        Total(ui, balance)
         Spacer(Modifier.height(32.dp))
         if (ui.hubs.isEmpty()) {
             ConnectHub(engine)
@@ -95,10 +96,10 @@ fun Home(
 }
 
 @Composable
-private fun Total(ui: Ui) {
+private fun Total(ui: Ui, open: () -> Unit) {
     val b = ui.balance
     val total = b.notes + b.notesPending + b.onchain + b.moving
-    Row(verticalAlignment = Alignment.Bottom) {
+    Row(Modifier.clickable(onClick = open), verticalAlignment = Alignment.Bottom) {
         Text(digits(total), modifier = Modifier.testTag("balance"), style = Figures)
         Text(
             " sat",
@@ -125,6 +126,12 @@ private fun Total(ui: Ui) {
             overflow = TextOverflow.Ellipsis,
         )
     }
+    Text(
+        "Where it is",
+        modifier = Modifier.clickable(onClick = open).padding(vertical = 6.dp),
+        style = MaterialTheme.typography.labelLarge,
+        color = MaterialTheme.colorScheme.primary,
+    )
 }
 
 /** No hub yet: nothing works without one. */
