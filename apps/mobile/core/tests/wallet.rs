@@ -359,6 +359,15 @@ impl ChainSource for Light {
         }
         Ok(())
     }
+
+    fn unconfirmed(&self, script: Vec<u8>) -> Result<Vec<u8>, ChainError> {
+        let backend = self.backend.lock().unwrap();
+        let paying = backend.mempool.iter().filter(|tx| {
+            let mut outputs = tx.output.iter();
+            outputs.any(|o| o.script_pubkey.as_bytes() == script.as_slice())
+        });
+        Ok(paying.flat_map(serialize).collect())
+    }
 }
 
 /// The lines logged, by level.
@@ -674,4 +683,31 @@ fn a_phone_paid_at_its_fallback_address_finds_it_and_shows_the_next() {
     assert_eq!(alice.balance().unwrap().onchain, 3_000);
     let next = alice.payment_code(None).unwrap().address.unwrap();
     assert_ne!(next, address);
+}
+
+#[test]
+fn a_phone_sees_payments_to_its_fallback_address_on_their_way() {
+    let net = Net::new(true);
+    let light = Light::new(&net);
+    let alice = net.wallet("alice", net.height());
+    // No code shown yet: nothing to watch.
+    assert_eq!(alice.incoming(light.clone()).unwrap(), []);
+    let address = alice.payment_code(None).unwrap().address.unwrap();
+    let payment = net.pay_plain(&address, 3_000, 1);
+    net.backend.lock().unwrap().mempool.push(payment.clone());
+    let incoming = alice.incoming(light.clone()).unwrap();
+    assert_eq!(incoming.len(), 1);
+    let on_its_way = &incoming[0];
+    assert_eq!(
+        (on_its_way.kind, on_its_way.state, on_its_way.amount),
+        (Kind::Onchain, State::Pending, 3_000)
+    );
+    assert!(on_its_way
+        .id
+        .starts_with(&payment.compute_txid().to_string()));
+    // Not a coin until found in a block.
+    assert_eq!(alice.balance().unwrap().onchain, 0);
+    net.mine(1, vec![payment]);
+    assert_eq!(scan(&alice, &light), (1, 3_000));
+    assert_eq!(alice.incoming(light.clone()).unwrap(), []);
 }

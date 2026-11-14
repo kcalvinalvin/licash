@@ -18,6 +18,9 @@ class GoChain(private val light: LightClient) : ChainSource {
 
     override fun broadcast(tx: ByteArray) = call { light.broadcast(tx) }
 
+    override fun unconfirmed(script: ByteArray): ByteArray =
+        call { light.unconfirmed(script) ?: ByteArray(0) }
+
     private inline fun <T> call(f: () -> T): T =
         try {
             f()

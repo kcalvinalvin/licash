@@ -21,6 +21,10 @@ pub trait ChainSource: Send + Sync {
     fn block(&self, hash: Vec<u8>) -> Result<Vec<u8>, ChainError>;
     /// Hand the transaction `tx` to the network.
     fn broadcast(&self, tx: Vec<u8>) -> Result<(), ChainError>;
+    /// The transactions in no block yet that peers relayed paying the
+    /// output script `script`, consensus serialized back to back: hints,
+    /// which a peer can make up. Watched from the first call on.
+    fn unconfirmed(&self, script: Vec<u8>) -> Result<Vec<u8>, ChainError>;
 }
 
 /// The light client failed.

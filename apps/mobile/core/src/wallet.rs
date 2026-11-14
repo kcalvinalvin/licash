@@ -398,6 +398,38 @@ impl Wallet {
         })
     }
 
+    /// Payments on Bitcoin on their way to the fallback addresses handed
+    /// out, as `chain`'s peers relay them: in no block the wallet looked
+    /// in yet. Shown, never spent: only a scan finds coins.
+    pub fn incoming(&self, chain: Arc<dyn ChainSource>) -> Result<Vec<Activity>, LicashError> {
+        let mut txs = Vec::new();
+        for script in self.wallet.fallback_scripts()? {
+            let raw = chain
+                .unconfirmed(script.into_bytes())
+                .map_err(|e| LicashError::failed(format!("the light client: {e}")))?;
+            let mut rest = raw.as_slice();
+            while !rest.is_empty() {
+                let tx: bitcoin::Transaction =
+                    bitcoin::consensus::Decodable::consensus_decode(&mut rest)
+                        .map_err(|e| LicashError::failed(format!("a relayed transaction: {e}")))?;
+                txs.push(tx);
+            }
+        }
+        let paying = self.wallet.unconfirmed_payments(&txs)?;
+        Ok(paying
+            .into_iter()
+            .map(|(outpoint, value)| Activity {
+                id: outpoint.to_string(),
+                kind: Kind::Onchain,
+                state: State::Pending,
+                amount: value,
+                fee: 0,
+                detail: "waiting for a block".into(),
+                at: None,
+            })
+            .collect())
+    }
+
     /// Move the coins paid on Bitcoin to notes, at a hub trusted that
     /// takes them, broadcasting through `chain`: the move, under way.
     pub fn move_to_licash(&self, chain: Arc<dyn ChainSource>) -> Result<Activity, LicashError> {
