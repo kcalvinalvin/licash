@@ -1,8 +1,9 @@
 # A regtest ecosystem for the end-to-end tests: Bitcoin Core, two hubs with
 # Lightning gateways over their own LND nodes, an outside LND node that
-# pays and is paid, a swap provider between the hubs, and a Nostr relay
-# the hubs and the provider announce themselves on. `run.sh` brings it up,
-# runs the tests and removes it.
+# pays and is paid, a swap provider between the hubs, a Nostr relay the
+# hubs and the provider announce themselves on, and a Gotify server their
+# operators are notified on. `run.sh` brings it up, runs the tests and
+# removes it.
 # Every port is published on 127.0.0.1 only: the hubs' and the provider's at
 # fixed ports, which wallets keep across restarts, LICASH_E2E_HUB1,
 # LICASH_E2E_HUB2 and LICASH_E2E_SWAPS, the rest at ports Docker picks.
@@ -92,14 +93,18 @@ services:
       - >-
         [ -f /data/seed ] || licash-hub init; exec licash-hub run --lnd https://hub1-ln:8080
         --announce-url http://127.0.0.1:${LICASH_E2E_HUB1:-38338} --announce-name hub1
+        --name hub1 --notify gotify://gotify/$$(cat /notify/token)
     ports:
       - "127.0.0.1:${LICASH_E2E_HUB1:-38338}:8338"
     volumes:
       - hub1:/data
       - hub1-ln:/lnd:ro
+      - notify:/notify:ro
     depends_on:
       hub1-ln:
         condition: service_healthy
+      gotify-app:
+        condition: service_completed_successfully
       relay:
         condition: service_started
 
@@ -109,14 +114,18 @@ services:
       - >-
         [ -f /data/seed ] || licash-hub init; exec licash-hub run --lnd https://hub2-ln:8080
         --announce-url http://127.0.0.1:${LICASH_E2E_HUB2:-38339} --announce-name hub2
+        --name hub2 --notify gotify://gotify/$$(cat /notify/token)
     ports:
       - "127.0.0.1:${LICASH_E2E_HUB2:-38339}:8338"
     volumes:
       - hub2:/data
       - hub2-ln:/lnd:ro
+      - notify:/notify:ro
     depends_on:
       hub2-ln:
         condition: service_healthy
+      gotify-app:
+        condition: service_completed_successfully
       relay:
         condition: service_started
 
@@ -135,7 +144,7 @@ services:
         until licash-wallet add-hub $$hub >/dev/null; do sleep 1; done; done;
         exec licash-swaps run --step 1 --fee-base 1 --fee-ppm 5000 --max 200000
         --nostr-relay ws://relay:8080 --announce-url http://127.0.0.1:${LICASH_E2E_SWAPS:-38340}
-        --announce-name swaps
+        --announce-name swaps --name swaps --notify gotify://gotify/$$(cat /notify/token)
     environment:
       LICASH_SWAPS_LOG: json
       RUST_LOG: info
@@ -143,10 +152,39 @@ services:
       - "127.0.0.1:${LICASH_E2E_SWAPS:-38340}:8340"
     volumes:
       - swaps:/data
+      - notify:/notify:ro
     depends_on:
       hub1:
         condition: service_healthy
       hub2:
+        condition: service_healthy
+
+  gotify:
+    image: &gotify gotify/server:2.9.1@sha256:a3af47067ce6aad76aadf5ba32d6ddfecd1ae576a961359f039fd1831e8b7652
+    environment:
+      GOTIFY_DEFAULTUSER_PASS: licash
+    ports:
+      - "127.0.0.1::80"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost/health"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  # The operators' Gotify application: its token in /notify/token.
+  gotify-app:
+    image: *gotify
+    entrypoint: ["sh", "-c"]
+    command:
+      - >-
+        [ -s /notify/token ] || curl -sf -u admin:licash -H 'Content-Type: application/json'
+        -d '{"name":"licash"}' http://gotify/application
+        | sed -n 's/.*"token":"\([^"]*\)".*/\1/p' > /notify/token;
+        test -s /notify/token
+    volumes:
+      - notify:/notify
+    depends_on:
+      gotify:
         condition: service_healthy
 
   relay:
@@ -155,6 +193,7 @@ services:
       - "127.0.0.1::8080"
 
 volumes:
+  notify:
   hub1:
   hub2:
   swaps:

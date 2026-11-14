@@ -41,7 +41,18 @@ pub struct Eco {
     relay: String,
     /// The swap provider's URL, as published on this host.
     swaps: String,
+    /// The Gotify server's URL, as published on this host.
+    gotify: String,
     dir: tempfile::TempDir,
+}
+
+/// A notification the stack's Gotify server took.
+#[derive(Clone, Debug)]
+pub struct Notification {
+    pub id: u64,
+    pub title: String,
+    pub message: String,
+    pub priority: u64,
 }
 
 /// Wait up to `secs` for `check` to give something, every half second.
@@ -79,11 +90,13 @@ impl Eco {
             hubs: Vec::new(),
             relay: String::new(),
             swaps: String::new(),
+            gotify: String::new(),
             dir: tempfile::tempdir()?,
         };
         eco.core = format!("http://{}", eco.port("bitcoind", 18443).await?);
         eco.relay = format!("ws://{}", eco.port("relay", 8080).await?);
         eco.swaps = format!("http://{}", eco.port("swaps", 8340).await?);
+        eco.gotify = format!("http://{}", eco.port("gotify", 80).await?);
         for hub in ["hub1", "hub2"] {
             let at = eco.port(hub, 8338).await?;
             eco.hubs.push(format!("http://{at}"));
@@ -180,6 +193,26 @@ impl Eco {
         let url = format!("{hub}{}", licash_api::ln_receive_state(&bytes));
         let response = self.http.get(url).send().await?.error_for_status()?;
         Ok(response.json().await?)
+    }
+
+    /// What the hubs and the swap provider notified their operators of on
+    /// the stack's Gotify server, newest first.
+    pub async fn notifications(&self) -> anyhow::Result<Vec<Notification>> {
+        let url = format!("{}/message?limit=200", self.gotify);
+        let response = self.http.get(url).basic_auth("admin", Some("licash"));
+        let page: Value = response.send().await?.error_for_status()?.json().await?;
+        let messages = page["messages"].as_array().context("Gotify's messages")?;
+        messages
+            .iter()
+            .map(|m| {
+                Ok(Notification {
+                    id: m["id"].as_u64().context("an id")?,
+                    title: m["title"].as_str().context("a title")?.to_owned(),
+                    message: m["message"].as_str().context("a message")?.to_owned(),
+                    priority: m["priority"].as_u64().context("a priority")?,
+                })
+            })
+            .collect()
     }
 
     /// Call Bitcoin Core, at `path`.
