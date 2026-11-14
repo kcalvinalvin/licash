@@ -10,6 +10,7 @@ publish = false
 licash.workspace = true
 licash-api.workspace = true
 licash-nostr.workspace = true
+licash-transport.workspace = true
 licash-wallet.workspace = true
 anyhow.workspace = true
 hex = "0.4"

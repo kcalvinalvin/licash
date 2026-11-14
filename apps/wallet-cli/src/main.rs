@@ -1,7 +1,5 @@
 //! `licash-wallet`: pay and get paid through Licash hubs.
 
-mod http;
-
 use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -14,12 +12,11 @@ use clap::{Parser, Subcommand, ValueEnum};
 use licash::{address::Address, spend::lock_hash};
 use licash_api::Payment;
 use licash_nostr::Role;
+use licash_transport::Http;
 use licash_wallet::{Error, Invoice, InvoiceState, Lock, LockState, State, Wallet};
 use rand_core::{OsRng, RngCore};
 use serde_json::json;
 use tracing_subscriber::EnvFilter;
-
-use http::Http;
 
 /// The exit status of a payment recorded but not finished: retry later.
 const PENDING: u8 = 75;

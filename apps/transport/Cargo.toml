@@ -1,0 +1,12 @@
+[package]
+name = "licash-transport"
+description = "How Licash applications reach hubs and swap providers: HTTP(S), directly or through a proxy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+licash-wallet.workspace = true
+anyhow.workspace = true
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "socks"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }

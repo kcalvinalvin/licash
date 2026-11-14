@@ -3,9 +3,6 @@
 //! outside LND node, and wallets in temporary files. `run.sh` brings the
 //! stack up; [`Eco::up`] funds its nodes and opens their channels once.
 
-#[path = "../../wallet-cli/src/http.rs"]
-mod http;
-
 use std::{
     future::Future,
     path::PathBuf,
@@ -19,7 +16,7 @@ use rand_core::{OsRng, RngCore};
 use serde_json::{json, Value};
 use tokio::process::Command;
 
-pub use http::Http;
+pub use licash_transport::Http;
 
 /// Satoshis in each channel, half pushed to its other end.
 const CHANNEL: u64 = 2_000_000;

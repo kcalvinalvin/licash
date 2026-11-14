@@ -1378,6 +1378,7 @@ dependencies = [
  "licash",
  "licash-api",
  "licash-nostr",
+ "licash-transport",
  "licash-wallet",
  "rand_core 0.6.4",
  "reqwest",
@@ -1468,6 +1469,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "licash-transport"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "licash-wallet",
+ "reqwest",
+ "rustls",
+]
+
+[[package]]
 name = "licash-wallet"
 version = "0.0.1"
 dependencies = [
@@ -1497,11 +1508,10 @@ dependencies = [
  "licash-hub",
  "licash-hub-service",
  "licash-nostr",
+ "licash-transport",
  "licash-wallet",
  "nostr-sdk",
  "rand_core 0.6.4",
- "reqwest",
- "rustls",
  "serde",
  "serde_json",
  "tempfile",

@@ -1,14 +1,15 @@
-//! The wallet's transport: HTTP(S), directly or through a proxy such as
-//! Tor's SOCKS port.
+//! How the applications reach hubs and swap providers: HTTP(S), directly
+//! or through a proxy such as Tor's SOCKS port.
 
 use std::time::Duration;
 
 use anyhow::Context;
 use licash_wallet::{Response, Transport};
 
-/// The most a hub's answer may hold: far above any grant.
+/// The most an answer may hold: far above any grant.
 const MAX_ANSWER: usize = 4 << 20;
 
+/// A wallet's [`Transport`] over HTTP(S).
 pub struct Http(reqwest::Client);
 
 impl Http {
@@ -19,7 +20,7 @@ impl Http {
         let mut client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(30))
             .timeout(Duration::from_secs(90))
-            .user_agent(concat!("licash-wallet/", env!("CARGO_PKG_VERSION")));
+            .user_agent(concat!("licash/", env!("CARGO_PKG_VERSION")));
         client = match proxy {
             Some(proxy) => client.proxy(reqwest::Proxy::all(proxy).context("the proxy URL")?),
             None => client.no_proxy(),
