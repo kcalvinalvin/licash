@@ -15,10 +15,17 @@
 //!   payers send it payments (NIP-17), on the relays its hubs name.
 //! - 2, any number up to [`MAX_HUBS`]: a hub the wallet is paid at
 //!   ([`HubId`]), in its order of preference.
+//! - 3, once at most for each hub of type 2: where to reach it, its
+//!   position among them (one byte), its URL's scheme (0 `https://`, 1
+//!   `http://`, of an onion service but on regtest) and the rest of its
+//!   URL, of 1 to 64 printable ASCII characters. Written only while the
+//!   whole stays within 260 bytes.
 //!
-//! Records of other types are skipped; a code of a later version is
-//! ignored, leaving its payer the rest of the URI. A hub named in a code is
-//! no reason to trust it: a payer pays at a hub it trusts already.
+//! Records of other types are skipped, and locations that are not; a code
+//! of a later version is ignored, leaving its payer the rest of the URI. A
+//! hub named in a code is no reason to trust it: a payer pays at a hub it
+//! trusts already, or at one whose info proves it the hub named
+//! ([`licash_api::Info::proved`]) wherever it was reached.
 
 use std::{fmt, str::FromStr};
 
@@ -44,6 +51,12 @@ pub const MAX_HUBS: usize = 8;
 
 const MAILBOX: u8 = 1;
 const HUB: u8 = 2;
+const LOCATION: u8 = 3;
+
+/// The longest URL of a location, past its scheme.
+const MAX_LOCATION: usize = 64;
+/// The most bytes of a code its locations are written within.
+const MAX_LOCATED: usize = 260;
 
 /// A hub, as payment codes name it: the first 16 bytes of the tagged hash
 /// of the address in its info. Its URLs may change, and differ between
@@ -83,16 +96,27 @@ pub struct LicashCode {
     /// The hubs it is paid at, preferred first; at most [`MAX_HUBS`] are
     /// written.
     pub hubs: Vec<HubId>,
+    /// Where to reach hubs of `hubs`, by URL: what a payer reaching one
+    /// checks there is that hub. Written for those of `hubs` only, once
+    /// each, while they fit.
+    pub locations: Vec<(HubId, String)>,
 }
 
-/// A network's byte in codes, as in the protocol's encodings.
-fn network_byte(network: ChainProfile) -> u8 {
-    match network {
-        ChainProfile::Core30Mainnet => 0,
-        ChainProfile::Core30DefaultRegtest => 1,
-        ChainProfile::Core30Signet => 3,
-        ChainProfile::Mutinynet => 4,
-    }
+/// The scheme byte and the rest of `url`, as a location on `network`
+/// writes it: none if it can't. Plain HTTP only to an onion service, which
+/// Tor authenticates, but on regtest.
+fn location(network: ChainProfile, url: &str) -> Option<(u8, &str)> {
+    let (scheme, rest) = match (url.strip_prefix("https://"), url.strip_prefix("http://")) {
+        (Some(rest), _) => (0, rest),
+        (_, Some(rest)) => (1, rest),
+        _ => return None,
+    };
+    let host = rest.split(['/', ':']).next().unwrap_or(rest);
+    let plain = scheme == 1 && !host.ends_with(".onion");
+    let printable = rest.bytes().all(|b| (0x21..=0x7e).contains(&b));
+    let fits = (1..=MAX_LOCATION).contains(&rest.len());
+    (printable && fits && !(plain && network != ChainProfile::Core30DefaultRegtest))
+        .then_some((scheme, rest))
 }
 
 fn network_kind(network: ChainProfile) -> NetworkKind {
@@ -116,15 +140,31 @@ impl LicashCode {
     }
 
     fn to_bytes(&self) -> Vec<u8> {
-        let mut bytes = vec![network_byte(self.network)];
+        let mut bytes = vec![self.network.tag()];
         bytes.extend(self.address.to_bytes());
         if let Some(mailbox) = &self.mailbox {
             bytes.extend([MAILBOX, 32]);
             bytes.extend(mailbox);
         }
-        for hub in self.hubs.iter().take(MAX_HUBS) {
+        let hubs = &self.hubs[..self.hubs.len().min(MAX_HUBS)];
+        for hub in hubs {
             bytes.extend([HUB, 16]);
             bytes.extend(hub.0);
+        }
+        for (index, hub) in hubs.iter().enumerate() {
+            if hubs[..index].contains(hub) {
+                continue;
+            }
+            let found = self.locations.iter().find(|(id, _)| id == hub);
+            let Some((scheme, rest)) = found.and_then(|(_, url)| location(self.network, url))
+            else {
+                continue;
+            };
+            if bytes.len() + 4 + rest.len() > MAX_LOCATED {
+                continue;
+            }
+            bytes.extend([LOCATION, 2 + rest.len() as u8, index as u8, scheme]);
+            bytes.extend(rest.as_bytes());
         }
         bytes
     }
@@ -147,7 +187,7 @@ impl LicashCode {
         let (&network, rest) = bytes.split_first().ok_or_else(|| invalid("empty"))?;
         let network = ChainProfile::ALL
             .into_iter()
-            .find(|n| network_byte(*n) == network)
+            .find(|n| n.tag() == network)
             .ok_or_else(|| invalid(format!("network {network}")))?;
         if test != (network_kind(network) == NetworkKind::Test) {
             return Err(invalid(format!(
@@ -164,7 +204,9 @@ impl LicashCode {
             address: Address::from_bytes(address).map_err(invalid)?,
             mailbox: None,
             hubs: Vec::new(),
+            locations: Vec::new(),
         };
+        let mut located = Vec::new();
         let mut last = 0;
         while let [kind, len, rest @ ..] = records {
             let (kind, len) = (*kind, usize::from(*len));
@@ -177,6 +219,15 @@ impl LicashCode {
                 MAILBOX => code.mailbox = Some(value.try_into().expect("32 bytes")),
                 HUB if len != 16 || code.hubs.len() == MAX_HUBS => return Err(invalid("hubs")),
                 HUB => code.hubs.push(HubId(value.try_into().expect("16 bytes"))),
+                // One not understood is no reason to refuse the rest.
+                LOCATION => {
+                    if let Some((index, url)) = code.location(value) {
+                        if !located.contains(&index) {
+                            located.push(index);
+                            code.locations.push((code.hubs[index], url));
+                        }
+                    }
+                }
                 _ => {}
             }
             (last, records) = (kind, rest);
@@ -185,6 +236,22 @@ impl LicashCode {
             return Err(invalid("a record cut short"));
         }
         Ok(Some(code))
+    }
+
+    /// The hub's position and URL a location's `value` writes, if valid.
+    fn location(&self, value: &[u8]) -> Option<(usize, String)> {
+        let [index, scheme, rest @ ..] = value else {
+            return None;
+        };
+        let index = usize::from(*index);
+        let scheme = match scheme {
+            0 => "https://",
+            1 => "http://",
+            _ => return None,
+        };
+        let url = format!("{scheme}{}", std::str::from_utf8(rest).ok()?);
+        location(self.network, &url)?;
+        (index < self.hubs.len()).then_some((index, url))
     }
 }
 
@@ -377,14 +444,14 @@ impl CodeKeys {
 
 impl<T: Transport> Wallet<T> {
     /// The code payers pay this wallet with: at the hubs of `hubs`, which
-    /// it trusts, preferred first, each once, and its
+    /// it trusts, preferred first, each once, reached at those URLs, and its
     /// mailbox if one of them names relays; on Bitcoin if `silent`, for
     /// wallets that scan for it: at its silent payment address, and at a
     /// fallback address for payers of no silent payments, handed out and
     /// watched from then on, the next once it is paid.
     pub fn payment_code(&self, hubs: &[String], silent: bool) -> Result<PaymentCode, Error> {
         let trusted = self.hubs()?;
-        let mut ids = Vec::new();
+        let (mut ids, mut locations) = (Vec::new(), Vec::new());
         let mut relays = false;
         for url in hubs {
             let url = crate::hub_url(url)?;
@@ -395,6 +462,7 @@ impl<T: Transport> Wallet<T> {
             let id = HubId::of(&info.address);
             if !ids.contains(&id) {
                 ids.push(id);
+                locations.push((id, url));
             }
             relays |= !info.relays.is_empty();
         }
@@ -412,6 +480,7 @@ impl<T: Transport> Wallet<T> {
                 address: self.address(),
                 mailbox: mailbox.map(|key| key.serialize()),
                 hubs: ids,
+                locations,
             }),
         })
     }

@@ -27,6 +27,7 @@ fn licash(network: ChainProfile, hubs: usize) -> LicashCode {
         address: owner.address(),
         mailbox: Some([7; 32]),
         hubs: (0..hubs as u8).map(|n| HubId([n; 16])).collect(),
+        locations: Vec::new(),
     }
 }
 
@@ -204,6 +205,99 @@ fn later_versions_and_records_are_skipped_and_malformed_codes_refused() {
 }
 
 #[test]
+fn a_code_says_where_to_reach_its_hubs_while_it_fits() {
+    let at = |code: &LicashCode, n: u8, url: &str| (code.hubs[n as usize], url.to_owned());
+    let mut code = licash(REGTEST, 3);
+    let onion = format!("http://{}.onion", "a".repeat(56));
+    code.locations = vec![
+        at(&code, 2, "http://hub.test:3000/licash"),
+        at(&code, 0, "https://hub.example"),
+        // Another hub's, or this one's again: not written.
+        (HubId([9; 16]), "https://other.example".into()),
+        at(&code, 0, "https://again.example"),
+    ];
+    let read: LicashCode = code.to_string().parse().unwrap();
+    let written = vec![
+        at(&code, 0, "https://hub.example"),
+        at(&code, 2, "http://hub.test:3000/licash"),
+    ];
+    assert_eq!(read.locations, written);
+    assert_eq!(read.hubs, code.hubs);
+
+    // Off regtest, plain HTTP only to an onion service.
+    let signet = ChainProfile::Core30Signet;
+    let mut code = LicashCode {
+        mailbox: None,
+        ..licash(signet, 3)
+    };
+    code.locations = vec![
+        at(&code, 0, "http://hub.example"),
+        at(&code, 1, &onion),
+        at(&code, 2, "https://hub.example"),
+    ];
+    let read: LicashCode = code.to_string().parse().unwrap();
+    assert_eq!(read.locations, code.locations[1..]);
+    // Too long, not ASCII, nor HTTP: not written.
+    code.locations = vec![
+        at(&code, 0, &format!("https://{}", "h".repeat(65))),
+        at(&code, 1, "https://hüb.example"),
+        at(&code, 2, "ftp://hub.example"),
+    ];
+    let read: LicashCode = code.to_string().parse().unwrap();
+    assert_eq!(read.locations, []);
+
+    // Within 260 bytes: the first hubs' while they fit, none past 278.
+    let mut code = licash(REGTEST, 2);
+    let long = |n: u8| format!("https://{}", char::from(b'a' + n).to_string().repeat(64));
+    code.locations = vec![at(&code, 0, &long(0)), at(&code, 1, &long(1))];
+    let read: LicashCode = code.to_string().parse().unwrap();
+    assert_eq!(read.locations, code.locations[..1]);
+    let mut code = licash(REGTEST, MAX_HUBS);
+    code.locations = vec![at(&code, 0, "https://h.example")];
+    let read: LicashCode = code.to_string().parse().unwrap();
+    assert_eq!((read.locations.len(), read.hubs.len()), (0, MAX_HUBS));
+}
+
+#[test]
+fn locations_not_understood_are_skipped_and_the_rest_read() {
+    let hub = |n: u8| (2, vec![n; 16]);
+    let location = |index: u8, scheme: u8, rest: &[u8]| (3, [&[index, scheme], rest].concat());
+    let records = [
+        hub(0),
+        hub(1),
+        location(0, 0, b"hub.example"),
+        // Out of range, of an unknown scheme, empty, not printable.
+        location(2, 0, b"two.example"),
+        location(1, 2, b"hub.example"),
+        location(1, 0, b""),
+        location(1, 0, b"hub example"),
+        location(1, 0, &[0xc3, 0xbc]),
+        // The first hub's again: skipped.
+        location(0, 0, b"again.example"),
+        (3, vec![1]),
+        location(1, 0, &[b'h'; 65]),
+        location(1, 1, b"hub.example"),
+    ];
+    for (network, plain) in [(1, true), (3, false)] {
+        let hrp = "tlicash";
+        let text = encoded(hrp, Fe32::Q, &bytes(network, &records));
+        let read: LicashCode = text.parse().unwrap();
+        let mut wanted = vec![(HubId([0; 16]), "https://hub.example".to_owned())];
+        if plain {
+            wanted.push((HubId([1; 16]), "http://hub.example".to_owned()));
+        }
+        assert_eq!(read.locations, wanted, "network {network}");
+        assert_eq!(read.hubs, [HubId([0; 16]), HubId([1; 16])]);
+    }
+    // Before the hubs, as any record out of order: refused.
+    let early = bytes(1, &[location(0, 0, b"hub.example"), hub(0)]);
+    refused(
+        &format!("bitcoin:?licash={}", encoded("tlicash", Fe32::Q, &early)),
+        "out of order",
+    );
+}
+
+#[test]
 fn codes_of_another_network_are_refused_whole() {
     let test = silent(NetworkKind::Test);
     let signet = PaymentCode {
@@ -352,4 +446,23 @@ async fn a_payer_knows_what_a_hub_charges_and_how_much_more_it_needs_there() {
     assert_eq!(bob.lacks(HUB2, 30).unwrap(), 30);
     let unknown = bob.lacks("http://other.test", 1);
     assert!(matches!(unknown, Err(Error::UnknownHub(_))), "{unknown:?}");
+}
+
+#[tokio::test]
+async fn a_wallet_code_says_where_it_reaches_its_hubs() {
+    let net = Net::new();
+    net.start(HUB, Fee { base: 0, ppm: 0 });
+    net.start(HUB2, Fee { base: 0, ppm: 0 });
+    let dir = tempfile::tempdir().unwrap();
+    let alice = wallet(&net, &dir, 1);
+    let info = alice.add_hub(HUB).await.unwrap();
+    let info2 = alice.add_hub(HUB2).await.unwrap();
+    let hubs = [format!("{HUB2}/"), HUB.into(), HUB2.into()];
+    let code = alice.payment_code(&hubs, false).unwrap().licash.unwrap();
+    let read: LicashCode = code.to_string().parse().unwrap();
+    let wanted = vec![
+        (HubId::of(&info2.address), HUB2.to_owned()),
+        (HubId::of(&info.address), HUB.to_owned()),
+    ];
+    assert_eq!((read.locations, code.locations), (wanted.clone(), wanted));
 }
