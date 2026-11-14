@@ -22,6 +22,7 @@
 //! back up its file.
 
 mod coins;
+mod deposits;
 mod lightning;
 mod locks;
 mod store;
@@ -47,6 +48,7 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{de::DeserializeOwned, Serialize};
 
 pub use coins::MAX_INPUTS;
+pub use deposits::{Deposit, DepositState, DepositTerms};
 pub use lightning::{Invoice, InvoiceState};
 pub use locks::{Incoming, Lock, LockState, CLAIM_MARGIN};
 use store::{now, sql, Owner, Store};
@@ -182,6 +184,8 @@ pub struct Resumed {
     pub invoices: Vec<Invoice>,
     /// Swaps taken on, where each stands now.
     pub swaps: Vec<Swap>,
+    /// Deposits taken on, where each stands now.
+    pub deposits: Vec<Deposit>,
     /// Given up, their notes freed, by id and why.
     pub abandoned: Vec<(String, String)>,
     /// Still under way, by id and why.
@@ -957,6 +961,15 @@ impl<T: Transport> Wallet<T> {
         for hash in self.open_invoices()? {
             match self.advance_invoice(&hash).await {
                 Ok(invoice) => resumed.invoices.push(invoice),
+                Err(Error::Pending { reason, .. }) => {
+                    resumed.pending.push((hex::encode(hash), reason));
+                }
+                Err(e) => resumed.pending.push((hex::encode(hash), e.to_string())),
+            }
+        }
+        for hash in self.open_deposits()? {
+            match self.advance_deposit(&hash).await {
+                Ok(deposit) => resumed.deposits.push(deposit),
                 Err(Error::Pending { reason, .. }) => {
                     resumed.pending.push((hex::encode(hash), reason));
                 }

@@ -130,6 +130,34 @@ CREATE TABLE invoices (
     done_at INTEGER,
     canceled TEXT
 ) STRICT;
+-- Deposits on Bitcoin asked for, by their hash: the preimage and the
+-- refund key only the wallet knows and the deposit asked for (a Deposit
+-- body), recorded before the hub hears of them; then the hub's terms (its
+-- claim key, the timeout, what to pay and by which block), the payment
+-- once the hub saw it confirm, and the lock of the hub's notes the wallet
+-- claims. Done once claimed; canceled once the hub refused or canceled it;
+-- a refund, once the wallet made one, takes the coins back.
+CREATE TABLE deposits (
+    hash BLOB PRIMARY KEY,
+    hub INTEGER NOT NULL REFERENCES hubs (id),
+    preimage BLOB NOT NULL,
+    refund_key BLOB NOT NULL,
+    amount INTEGER NOT NULL,
+    body TEXT NOT NULL,
+    claim BLOB,
+    timeout INTEGER,
+    pays INTEGER,
+    address TEXT,
+    fund_by INTEGER,
+    txid BLOB,
+    vout INTEGER,
+    height INTEGER,
+    lock BLOB,
+    refund BLOB,
+    created_at INTEGER NOT NULL,
+    done_at INTEGER,
+    canceled TEXT
+) STRICT;
 -- Swaps of notes at one hub for notes at another through a provider, by
 -- the hash of a preimage only the wallet knows, recorded before the lock to
 -- the provider (in locks, under that hash) is made; then the provider's

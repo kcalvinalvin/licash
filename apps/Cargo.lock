@@ -2904,9 +2904,11 @@ dependencies = [
 name = "licash-wallet"
 version = "0.0.1"
 dependencies = [
+ "bitcoin",
  "hex",
  "licash",
  "licash-api",
+ "licash-onchain",
  "lightning-invoice",
  "rand_core 0.6.4",
  "rusqlite",
