@@ -1,0 +1,109 @@
+//! Payments sent to mailboxes through a relay in this process.
+
+use std::time::Duration;
+
+use licash_nostr::{
+    mailbox::{self, KEEP},
+    Route,
+};
+use nostr::nips::nip59::GiftWrapBuilder;
+use nostr_sdk::prelude::{
+    Client, EventBuilder, FinalizeEvent, FinalizeUnsignedEvent, Keys, Kind, MockRelay, SecretKey,
+};
+
+fn mailbox(secret: [u8; 32]) -> [u8; 32] {
+    let keys = Keys::new(SecretKey::from_slice(&secret).unwrap());
+    keys.public_key().to_bytes()
+}
+
+#[tokio::test]
+async fn payments_sent_to_a_mailbox_are_opened_by_its_owner_alone() {
+    let relay = MockRelay::run().await.unwrap();
+    let relays = [relay.url().await.to_string()];
+    let (alice, bob) = ([1; 32], [2; 32]);
+    let to = mailbox(alice);
+    let sent = mailbox::send(&to, r#"{"first":1}"#, &relays, &Route::Direct);
+    assert_eq!(sent.await.unwrap(), 1);
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let sent = mailbox::send(&to, r#"{"second":2}"#, &relays, &Route::Direct);
+    assert_eq!(sent.await.unwrap(), 1);
+
+    let mail = mailbox::fetch(&alice, &relays, &Route::Direct)
+        .await
+        .unwrap();
+    let contents: Vec<&str> = mail.iter().map(|m| m.content.as_str()).collect();
+    assert_eq!(contents, [r#"{"first":1}"#, r#"{"second":2}"#]);
+    assert!(mail[0].at < mail[1].at && mail[0].id != mail[1].id);
+    assert!(mailbox::fetch(&bob, &relays, &Route::Direct)
+        .await
+        .unwrap()
+        .is_empty());
+
+    // On the relay, only a gift wrap to Alice, of an unknown key, at a
+    // time up to two days early, expiring KEEP after it.
+    let client = Client::default();
+    client.add_relay(&relays[0]).await.unwrap();
+    client.connect().and_wait(Duration::from_secs(5)).await;
+    let filter = nostr_sdk::prelude::Filter::new().kind(Kind::GiftWrap);
+    let wraps = client
+        .fetch_events(filter)
+        .timeout(Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert_eq!(wraps.len(), 2);
+    for wrap in wraps {
+        assert!(wrap
+            .tags
+            .public_keys()
+            .all(|k| k.to_bytes() == mailbox(alice)));
+        assert_ne!(wrap.pubkey.to_bytes(), mailbox(alice));
+        let at = wrap.created_at.as_secs();
+        let expiry = wrap.tags.expiration().unwrap().as_secs();
+        assert_eq!(expiry, at + KEEP.as_secs());
+        let now = nostr_sdk::prelude::Timestamp::now().as_secs();
+        assert!(at <= now && at + 2 * 24 * 60 * 60 >= now - 5, "{at} {now}");
+    }
+}
+
+#[tokio::test]
+async fn what_is_not_a_payment_gift_wrapped_to_the_mailbox_is_skipped() {
+    let relay = MockRelay::run().await.unwrap();
+    let relays = [relay.url().await.to_string()];
+    let alice = [1; 32];
+    let to = Keys::new(SecretKey::from_slice(&alice).unwrap()).public_key();
+    let client = Client::default();
+    client.add_relay(&relays[0]).await.unwrap();
+    client.connect().and_wait(Duration::from_secs(5)).await;
+    // A private message (NIP-17), and a gift wrap that opens to nothing.
+    let sender = Keys::generate();
+    let message =
+        EventBuilder::new(Kind::PrivateDirectMessage, "hi").finalize_unsigned(sender.public_key());
+    let wrap = GiftWrapBuilder::new(to, message).finalize(&sender).unwrap();
+    client.send_event(&wrap).await.unwrap();
+    let junk = EventBuilder::new(Kind::GiftWrap, "not encrypted")
+        .tag(nostr_sdk::prelude::Tag::public_key(to))
+        .finalize(&Keys::generate())
+        .unwrap();
+    client.send_event(&junk).await.unwrap();
+    mailbox::send(&mailbox(alice), "{}", &relays, &Route::Direct)
+        .await
+        .unwrap();
+    let mail = mailbox::fetch(&alice, &relays, &Route::Direct)
+        .await
+        .unwrap();
+    assert_eq!(mail.len(), 1);
+    assert_eq!(mail[0].content, "{}");
+}
+
+#[tokio::test]
+async fn a_mailbox_no_relay_answers_for_fails() {
+    let relays = ["ws://127.0.0.1:1".to_owned()];
+    let fetched = mailbox::fetch(&[1; 32], &relays, &Route::Direct).await;
+    assert!(fetched
+        .unwrap_err()
+        .to_string()
+        .contains("no Nostr relay answered"));
+    let sent = mailbox::send(&mailbox([1; 32]), "{}", &relays, &Route::Direct).await;
+    assert!(sent.is_err());
+    assert!(mailbox::fetch(&[1; 32], &[], &Route::Direct).await.is_err());
+}

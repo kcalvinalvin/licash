@@ -174,4 +174,30 @@ mod tests {
             .await
             .unwrap();
     }
+
+    /// A payment to a mailbox on the relay `LICASH_TEST_RELAY` names,
+    /// sent and fetched directly and over Tor: whether it takes and serves
+    /// gift wraps.
+    #[tokio::test]
+    #[ignore = "reaches the Tor network and the relay LICASH_TEST_RELAY names"]
+    async fn mailboxes_work_on_the_test_relay() {
+        let relay = std::env::var("LICASH_TEST_RELAY").expect("LICASH_TEST_RELAY: a relay URL");
+        let dir = tempfile::tempdir().unwrap();
+        let routes = [
+            Route::Direct,
+            Route::Tor(licash_tor::Tor::new(dir.path()).unwrap()),
+        ];
+        for route in routes {
+            let secret = Keys::generate().secret_key().to_secret_bytes();
+            let to = crate::keys(&secret).unwrap().public_key().to_bytes();
+            let relays = [relay.clone()];
+            crate::mailbox::send(&to, "{}", &relays, &route)
+                .await
+                .unwrap();
+            let mail = crate::mailbox::fetch(&secret, &relays, &route)
+                .await
+                .unwrap();
+            assert_eq!(mail.len(), 1);
+        }
+    }
 }

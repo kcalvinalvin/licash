@@ -12,9 +12,12 @@
 //! there names the key that announced it ([`Found::named_by`]), as a hub
 //! does in its `/v1/info`.
 //!
+//! Wallets are paid at their [`mailbox`] on Nostr too.
+//!
 //! Relays are reached directly, through a SOCKS5 proxy, or, with the `tor`
 //! feature, through a Tor client of the application's own ([`Route`]).
 
+pub mod mailbox;
 #[cfg(feature = "tor")]
 mod tor;
 
@@ -23,7 +26,7 @@ use std::{collections::HashMap, net::SocketAddr, time::Duration};
 use anyhow::{ensure, Context};
 use nostr_sdk::prelude::{
     Client, Event, EventBuilder, Filter, FinalizeEvent, Keys, Kind, Proxy, RelayUrl, SecretKey,
-    Tag, Timestamp,
+    SignerAuthenticator, Tag, Timestamp,
 };
 use serde::{Deserialize, Serialize};
 
@@ -176,15 +179,19 @@ impl Route {
     }
 }
 
-/// A client of `relays`, through `route`, not connected yet.
-async fn client(relays: &[String], route: &Route) -> anyhow::Result<Client> {
+/// A client of `relays`, through `route`, authenticating as `auth` to
+/// relays that ask (NIP-42), not connected yet.
+async fn client(relays: &[String], route: &Route, auth: Option<Keys>) -> anyhow::Result<Client> {
     ensure!(!relays.is_empty(), "no Nostr relay");
-    let builder = match route {
+    let mut builder = match route {
         Route::Direct => Client::builder(),
         Route::Socks(proxy) => Client::builder().proxy(Proxy::all(*proxy)),
         #[cfg(feature = "tor")]
         Route::Tor(tor) => Client::builder().websocket_transport(tor::OverTor(tor.clone())),
     };
+    if let Some(keys) = auth {
+        builder = builder.authenticator(SignerAuthenticator::new(keys));
+    }
     let client = builder.build();
     for relay in relays {
         client
@@ -212,7 +219,7 @@ impl Announcer {
         route: &Route,
     ) -> anyhow::Result<Self> {
         let keys = keys(secret)?;
-        let client = client(relays, route).await?;
+        let client = client(relays, route, None).await?;
         client.connect().and_wait(route.timeout()).await;
         Ok(Self { client, keys, role })
     }
@@ -286,25 +293,21 @@ pub async fn discover(
     role: Role,
     network: &str,
 ) -> anyhow::Result<Vec<Found>> {
-    let client = client(relays, route).await?;
-    let connected = client.try_connect().timeout(route.timeout()).await;
-    if connected.success.is_empty() {
-        let failed: Vec<String> = connected
-            .failed
-            .iter()
-            .map(|(relay, e)| format!("{relay}: {e}"))
-            .collect();
-        anyhow::bail!("no Nostr relay answered: {}", failed.join("; "));
-    }
+    let client = client(relays, route, None).await?;
+    let connected = match connected(&client, route).await {
+        Ok(relays) => relays,
+        Err(e) => {
+            client.shutdown().await;
+            return Err(e);
+        }
+    };
     let filter = Filter::new()
         .kind(Kind::Custom(KIND))
         .identifier(role.id())
         .hashtag(role.topic())
         .limit(MAX_EVENTS);
-    // Only of the relays connected: the others would hold the answer up.
     let targets: Vec<(RelayUrl, Vec<Filter>)> = connected
-        .success
-        .into_keys()
+        .into_iter()
         .map(|relay| (relay, vec![filter.clone()]))
         .collect();
     let events = client.fetch_events(targets).timeout(route.timeout()).await;
@@ -322,6 +325,21 @@ pub async fn discover(
     let mut found: Vec<Found> = newest.into_values().collect();
     found.sort_by(|a, b| b.at.cmp(&a.at).then_with(|| a.key.cmp(&b.key)));
     Ok(found)
+}
+
+/// The relays of `client` that connected in time, to ask only them: the
+/// others would hold the answer up. Fails if none did.
+async fn connected(client: &Client, route: &Route) -> anyhow::Result<Vec<RelayUrl>> {
+    let connected = client.try_connect().timeout(route.timeout()).await;
+    if connected.success.is_empty() {
+        let failed: Vec<String> = connected
+            .failed
+            .iter()
+            .map(|(relay, e)| format!("{relay}: {e}"))
+            .collect();
+        anyhow::bail!("no Nostr relay answered: {}", failed.join("; "));
+    }
+    Ok(connected.success.into_keys().collect())
 }
 
 /// `event`, if a valid, unexpired announcement of `role` for `network`.
