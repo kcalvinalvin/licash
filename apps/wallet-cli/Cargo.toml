@@ -14,7 +14,7 @@ licash.workspace = true
 licash-api.workspace = true
 licash-wallet.workspace = true
 licash-nostr.workspace = true
-licash-transport.workspace = true
+licash-transport = { workspace = true, features = ["tor"] }
 anyhow.workspace = true
 clap.workspace = true
 hex = "0.4"

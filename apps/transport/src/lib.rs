@@ -1,5 +1,9 @@
-//! How the applications reach hubs and swap providers: HTTP(S), directly
-//! or through a proxy such as Tor's SOCKS port.
+//! How the applications reach hubs and swap providers: HTTP(S), directly,
+//! through a proxy such as Tor's SOCKS port, or, with the `tor` feature,
+//! through a Tor client of their own.
+
+#[cfg(feature = "tor")]
+mod tor;
 
 use std::time::Duration;
 
@@ -10,7 +14,13 @@ use licash_wallet::{Response, Transport};
 const MAX_ANSWER: usize = 4 << 20;
 
 /// A wallet's [`Transport`] over HTTP(S).
-pub struct Http(reqwest::Client);
+pub struct Http(Route);
+
+enum Route {
+    Direct(reqwest::Client),
+    #[cfg(feature = "tor")]
+    Tor(tor::Tor),
+}
 
 impl Http {
     /// Through `proxy` if given, e.g. `socks5h://127.0.0.1:9050`, else
@@ -25,7 +35,17 @@ impl Http {
             Some(proxy) => client.proxy(reqwest::Proxy::all(proxy).context("the proxy URL")?),
             None => client.no_proxy(),
         };
-        Ok(Self(client.build()?))
+        Ok(Self(Route::Direct(client.build()?)))
+    }
+
+    /// Through a Tor client of its own, to onion services and to the clear
+    /// web alike, keeping its state under `dir`. It connects to the Tor
+    /// network on the first request. Within a Tokio runtime.
+    #[cfg(feature = "tor")]
+    pub fn tor(dir: &std::path::Path) -> anyhow::Result<Self> {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let tor = tor::Tor::new(dir).context("a Tor client")?;
+        Ok(Self(Route::Tor(tor)))
     }
 }
 
@@ -35,15 +55,26 @@ impl Transport for Http {
         url: &str,
         body: Option<Vec<u8>>,
     ) -> impl std::future::Future<Output = Result<Response, String>> + Send {
+        let client = match &self.0 {
+            Route::Direct(client) => client,
+            #[cfg(feature = "tor")]
+            Route::Tor(tor) => {
+                let url = url.to_owned();
+                // Boxed: Arti's futures are too deep a type to nest in the
+                // callers'.
+                let tor: futures_util::future::BoxFuture<'_, _> =
+                    Box::pin(async move { tor.request(&url, body).await });
+                return futures_util::future::Either::Left(tor);
+            }
+        };
         let request = match body {
-            Some(body) => self
-                .0
+            Some(body) => client
                 .post(url)
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
                 .body(body),
-            None => self.0.get(url),
+            None => client.get(url),
         };
-        async move {
+        let direct = async move {
             let mut response = request
                 .send()
                 .await
@@ -61,6 +92,9 @@ impl Transport for Http {
                 body.extend_from_slice(&chunk);
             }
             Ok(Response { status, body })
-        }
+        };
+        #[cfg(feature = "tor")]
+        let direct = futures_util::future::Either::Right(direct);
+        direct
     }
 }

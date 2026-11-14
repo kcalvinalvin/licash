@@ -174,6 +174,8 @@ impl AnnounceArgs {
     }
 }
 
+// Parsed once: its size does not matter.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Command {
     /// Create the provider: a wallet with a fresh seed, and no swaps. Never
@@ -195,6 +197,11 @@ enum Command {
         /// for Tor's.
         #[arg(long, env = "LICASH_SWAPS_PROXY")]
         proxy: Option<String>,
+        /// Reach hubs through a Tor client of the provider's own, instead of
+        /// --proxy, keeping its state in `<data>/tor`.
+        #[arg(long, env = "LICASH_SWAPS_TOR", conflicts_with = "proxy",
+              value_parser = clap::builder::BoolishValueParser::new())]
+        tor: bool,
         #[command(flatten)]
         notify: Notify,
         /// Notify only of these kinds of event [default: all].
@@ -262,6 +269,7 @@ fn command(cli: Cli) -> anyhow::Result<()> {
             terms,
             step,
             proxy,
+            tor,
             notify,
             notify_kinds,
             announce,
@@ -269,7 +277,14 @@ fn command(cli: Cli) -> anyhow::Result<()> {
             let config = terms.config()?;
             let announcing = announce.announcing()?;
             let targets = notify.targets()?;
-            let provider = open(&data, Http::new(proxy.as_deref())?, config)?;
+            let runtime = tokio::runtime::Runtime::new()?;
+            let transport = if tor {
+                let _entered = runtime.enter();
+                Http::tor(&data.join("tor"))?
+            } else {
+                Http::new(proxy.as_deref())?
+            };
+            let provider = open(&data, transport, config)?;
             let provider = Arc::new(provider);
             let notifier = if targets.is_empty() {
                 None
@@ -287,7 +302,7 @@ fn command(cli: Cli) -> anyhow::Result<()> {
             };
             let every = Duration::from_secs(step);
             let serving = serve(provider, listen, every, notifier, announcing);
-            tokio::runtime::Runtime::new()?.block_on(serving)
+            runtime.block_on(serving)
         }
         Command::TestNotify { notify } => test_notify(&notify),
         Command::Status { json, swaps } => status(&data, json, swaps),

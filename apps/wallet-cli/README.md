@@ -36,4 +36,8 @@ a pending swap on.
 at the URLs that answer as the hub that announced them; with `--swaps`, the
 swap providers.
 
-Onion hubs need a SOCKS proxy for now: `--proxy socks5h://127.0.0.1:9050`.
+With `--tor`, the wallet reaches hubs and swap providers, onion services
+included, through a Tor client of its own (Arti), which keeps its state in
+`tor/` next to the wallet file. `--proxy socks5h://127.0.0.1:9050` goes
+through a Tor daemon instead, and is how `discover` reaches Nostr relays
+over Tor.

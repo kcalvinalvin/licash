@@ -33,10 +33,16 @@ struct Cli {
     /// The wallet file [default: $XDG_DATA_HOME/licash/wallet.sqlite].
     #[arg(long, global = true, env = "LICASH_WALLET")]
     wallet: Option<PathBuf>,
-    /// Reach hubs through this proxy, such as socks5h://127.0.0.1:9050 for
-    /// Tor's.
+    /// Reach hubs, swap providers and Nostr relays through this proxy, such
+    /// as socks5h://127.0.0.1:9050 for Tor's.
     #[arg(long, global = true, env = "LICASH_WALLET_PROXY")]
     proxy: Option<String>,
+    /// Reach hubs and swap providers through a Tor client of the wallet's
+    /// own, instead of --proxy, keeping its state in `tor` next to the
+    /// wallet file. Nostr relays still need --proxy.
+    #[arg(long, global = true, env = "LICASH_WALLET_TOR",
+          value_parser = clap::builder::BoolishValueParser::new())]
+    tor: bool,
     /// Print results as JSON.
     #[arg(long, global = true)]
     json: bool,
@@ -235,7 +241,12 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Some(path) => path,
         None => default_path()?,
     };
-    let transport = Http::new(cli.proxy.as_deref())?;
+    let transport = if cli.tor {
+        let dir = path.parent().unwrap_or(Path::new(".")).join("tor");
+        Http::tor(&dir)?
+    } else {
+        Http::new(cli.proxy.as_deref())?
+    };
     let json = cli.json;
     match cli.command {
         Command::Init => return init(&path, transport, json),
@@ -245,7 +256,11 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             swaps,
         } => {
             let proxy = cli.proxy.as_deref();
-            return discover(transport, proxy, &relays, &network, swaps, json).await;
+            if cli.tor && proxy.is_none() {
+                bail!("Nostr relays are reached over Tor through --proxy only");
+            }
+            let onions = cli.tor || proxy.is_some();
+            return discover(transport, proxy, onions, &relays, &network, swaps, json).await;
         }
         _ => {}
     }
@@ -576,6 +591,7 @@ async fn pay_invoice(
 async fn discover(
     http: Http,
     proxy: Option<&str>,
+    onions: bool,
     relays: &[String],
     network: &str,
     swaps: bool,
@@ -588,8 +604,8 @@ async fn discover(
     let mut checks = tokio::task::JoinSet::new();
     for (i, service) in found.iter().enumerate() {
         for url in &service.announcement.urls {
-            if is_onion(url) && proxy.is_none() {
-                tracing::warn!(%url, "skipped: an onion service needs --proxy");
+            if is_onion(url) && !onions {
+                tracing::warn!(%url, "skipped: an onion service needs --proxy or --tor");
                 continue;
             }
             let (http, url) = (http.clone(), url.clone());

@@ -586,3 +586,16 @@ fn swap_providers_announced_on_nostr_are_discovered_where_they_answer() {
         format!("{}  1 + 10000 ppm  5 to 150  2 hubs  swaps", swaps.url())
     );
 }
+
+#[test]
+fn a_tor_client_of_its_own_keeps_its_state_next_to_the_wallet() {
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, _) = party(dir.path(), "alice", None);
+    // Commands that reach no hub do not reach Tor either.
+    let balance = json(&alice, &["--tor", "balance"]);
+    assert_eq!(balance, serde_json::json!([]));
+    assert!(alice.parent().unwrap().join("tor").is_dir());
+    // Nostr relays are reached through a proxy only.
+    let args = ["--tor", "discover", "--relay", "ws://127.0.0.1:1"];
+    failed(wallet(&alice, &args, None), 1, "through --proxy only");
+}

@@ -26,6 +26,8 @@ lost (`status` counts it, and a high-priority notification says so):
 
 With `--nostr-relay URL --announce-url URL`, the provider announces itself on
 Nostr relays for wallets to discover, under the key `/v1/swaps/info` names.
+With `--tor`, it reaches hubs, onion services included, through a Tor client
+of its own, which keeps its state in `<data>/tor`.
 Notification targets are Apprise URLs, as for the hub; `test-notify` checks
 them.
 
