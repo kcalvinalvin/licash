@@ -5,7 +5,10 @@
 mod chain;
 mod esplora;
 
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 use axum::{
     body::Body,
@@ -787,4 +790,105 @@ async fn silent_payment_coins_are_deposited_whole_up_to_the_most_a_hub_takes() {
     assert!(coins[0].change && coins[0].spending.is_none());
     assert_eq!(coins[0].value, change);
     assert_eq!(fee_of(&tx, 10_000), 10_000 - 4_100 - change);
+}
+
+/// The hub behind a front refusing what is posted while `.1` is set, with
+/// a plain 400, as a server only redirecting to HTTPS may.
+struct Front(Local, Arc<AtomicBool>);
+
+impl Transport for Front {
+    fn request(
+        &self,
+        url: &str,
+        body: Option<Vec<u8>>,
+    ) -> impl std::future::Future<Output = Result<licash_wallet::Response, String>> + Send {
+        let refused = body.is_some() && self.1.load(Ordering::SeqCst);
+        let answer = self.0.request(url, body);
+        async move {
+            if refused {
+                let body = b"Bad Request\n".to_vec();
+                return Ok(licash_wallet::Response { status: 400, body });
+            }
+            answer.await
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_deposit_its_hub_never_answered_is_abandoned_and_a_silent_one_never_kept() {
+    use licash_hub_service::tweaks::{step, Tweaks};
+    use licash_wallet::Error;
+    let net = Net::new().await;
+    let index = Arc::new(Tweaks::open(&net.dir.path().join("tweaks.sqlite")).unwrap());
+    step(&index, &net.source, None).await.unwrap();
+    let services = Services {
+        deposits: Some(net.deposits.clone()),
+        tweaks: Some(index.clone()),
+        ..Default::default()
+    };
+    let app = licash_hub_service::router(net.hub.clone(), services);
+    let path = net.dir.path().join("alice.sqlite");
+    let network = ChainProfile::Core30DefaultRegtest;
+    let refusing = Arc::new(AtomicBool::new(true));
+    let front = Front(Local(app), refusing.clone());
+    let alice = Wallet::create(&path, &[1; 32], network, front).unwrap();
+    alice.add_hub(HUB).await.unwrap();
+    alice
+        .watch_silent(HUB, index.first().unwrap().unwrap())
+        .unwrap();
+    let to = alice.silent_keys().address();
+    net.mine(1, vec![pay_silent(&net, &to, 3_000, 2)]);
+    step(&index, &net.source, None).await.unwrap();
+    let light = Light(net.backend.clone());
+    let found = alice.scan_silent(HUB, &light, u32::MAX).await.unwrap();
+    assert_eq!(found.found.len(), 1);
+    let rate = FeeRate::from_sat_per_vb_u32(1);
+
+    // Its coins never asked a deposit the hub answered: none kept, however
+    // often asked, and the coins free.
+    for _ in 0..3 {
+        let unanswered = alice.deposit_silent(HUB, rate).await.unwrap_err();
+        assert!(
+            matches!(unanswered, Error::Unavailable { .. }),
+            "{unanswered:?}"
+        );
+    }
+    assert!(alice.deposits().unwrap().is_empty());
+    assert!(alice.silent_coins().unwrap()[0].spending.is_none());
+
+    // One asked for by hand, kept before its hub hears of it, unanswered:
+    // given up, as no address was named to pay.
+    let pending = alice.deposit(HUB, 1_000).await.unwrap_err();
+    let Error::Pending { id, .. } = pending else {
+        panic!("{pending:?}");
+    };
+    let asked = alice.deposits().unwrap();
+    assert_eq!(
+        (asked[0].state.clone(), asked[0].terms.clone()),
+        (DepositState::Open, None)
+    );
+    alice.abandon_deposit(&id).unwrap();
+    let asked = alice.deposits().unwrap();
+    assert!(
+        matches!(&asked[0].state, DepositState::Canceled(_)),
+        "{asked:?}"
+    );
+    assert!(matches!(alice.abandon_deposit(&id), Err(Error::Invalid(_))));
+    refusing.store(false, Ordering::SeqCst);
+    assert!(alice.resume().await.unwrap().deposits.is_empty());
+
+    // Answered: kept with its terms, its coins spent on it, and not to be
+    // given up.
+    let (deposit, tx) = alice.deposit_silent(HUB, rate).await.unwrap();
+    assert_eq!(deposit.state, DepositState::Open);
+    assert_eq!(deposit.terms.as_ref().unwrap().pays, deposit.amount + 100);
+    assert_eq!(fee_of(&tx, 3_000), tx.vsize() as u64);
+    assert_eq!(alice.deposits().unwrap().len(), 2);
+    let answered = alice.abandon_deposit(&deposit.hash);
+    assert!(matches!(answered, Err(Error::Invalid(_))), "{answered:?}");
+    let unknown = alice.abandon_deposit(&"00".repeat(32));
+    assert!(
+        matches!(unknown, Err(Error::UnknownPayment(_))),
+        "{unknown:?}"
+    );
 }

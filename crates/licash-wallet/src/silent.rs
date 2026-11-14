@@ -986,14 +986,15 @@ impl<T: Transport> Wallet<T> {
     /// deposit, and the transaction paying it, signed and recorded as
     /// spending its coins, for the application to broadcast. Should it
     /// never confirm, [`Wallet::abandon_silent`] frees the coins, and the
-    /// deposit lapses unpaid.
+    /// deposit lapses unpaid. Nothing is kept of a deposit its hub did not
+    /// answer: the coins stay free, to deposit again.
     pub async fn deposit_silent(
         &self,
         url: &str,
         rate: FeeRate,
     ) -> Result<(Deposit, Transaction), Error> {
         let url = hub_url(url)?;
-        let (_, info) = self.refresh(&url).await?;
+        let (hub, info) = self.refresh(&url).await?;
         let offer = info
             .deposits
             .ok_or_else(|| Error::Invalid(format!("hub {url} takes no deposits")))?;
@@ -1024,7 +1025,7 @@ impl<T: Transport> Wallet<T> {
                 available: total,
             });
         }
-        let deposit = self.deposit(&url, amount).await?;
+        let deposit = self.deposit_answered(hub, &info, amount).await?;
         let terms = match (&deposit.state, &deposit.terms) {
             (DepositState::Open, Some(terms)) => terms,
             (state, _) => {

@@ -21,7 +21,7 @@ use licash::{
     claim::Branch,
     spend::{lock_hash, ProposalId},
 };
-use licash_api::{DepositStatus, Depositing, Hex, Receive, ReceiveState};
+use licash_api::{DepositStatus, Depositing, Hex, Info, Receive, ReceiveState};
 use licash_onchain::deposit::Htlc;
 use rand_core::{OsRng, RngCore};
 use rusqlite::{params, OptionalExtension, Row};
@@ -117,7 +117,63 @@ impl<T: Transport> Wallet<T> {
                 deposits.min, deposits.max
             )));
         }
-        let keysets = info.keysets().map_err(|p| unavailable(&url, p))?;
+        let asked = self.draw_deposit(&url, &info, amount)?;
+        self.store.write(|tx| asked.keep(tx, hub))?;
+        tracing::info!(hash = %hex::encode(asked.hash), %url, amount, "asking for a deposit");
+        self.advance_deposit(&asked.hash).await
+    }
+
+    /// Ask the hub `hub`, which says `info` of itself, for a deposit of
+    /// notes worth `amount`, to pay at once: recorded only with the terms
+    /// it answered, checked, as none pays a deposit its hub never answered.
+    pub(crate) async fn deposit_answered(
+        &self,
+        hub: i64,
+        info: &Info,
+        amount: u64,
+    ) -> Result<Deposit, Error> {
+        let url = self.reached(hub)?;
+        let asked = self.draw_deposit(&url, info, amount)?;
+        let hash = asked.hash;
+        tracing::info!(hash = %hex::encode(hash), %url, amount, "asking for a deposit");
+        let terms: Depositing = self.post(&url, licash_api::DEPOSIT, &asked.body).await?;
+        let htlc = self
+            .check_terms(&url, &hash, &asked.refund_key, amount, &terms)
+            .await?;
+        let network = licash_onchain::network(self.network());
+        self.store.write(|tx| {
+            asked.keep(tx, hub)?;
+            keep_terms(tx, &hash, &htlc, &terms, network)
+        })?;
+        tracing::info!(hash = %hex::encode(hash), %url, address = %terms.address, pays = terms.amount, "deposit terms");
+        self.deposit_record(&hash)
+    }
+
+    /// Give up the deposit of `hash` its hub never answered: no address
+    /// was named to pay, so nothing paid it. Refused once answered.
+    pub fn abandon_deposit(&self, hash: &str) -> Result<(), Error> {
+        let key = hash_id(hash)?;
+        let given_up = self.store.write(|tx| {
+            Ok(tx.execute(
+                "UPDATE deposits SET canceled = 'abandoned before its hub answered'
+                 WHERE hash = ?1 AND claim IS NULL AND done_at IS NULL AND canceled IS NULL",
+                [key],
+            )?)
+        })?;
+        if given_up == 0 {
+            self.deposit_record(&key)?;
+            return Err(Error::Invalid(format!(
+                "deposit {hash} is answered or over: an address to pay was named"
+            )));
+        }
+        tracing::info!(%hash, "deposit abandoned before its hub answered");
+        Ok(())
+    }
+
+    /// A deposit of notes worth `amount` to ask the hub at `url`, which
+    /// says `info` of itself, for.
+    fn draw_deposit(&self, url: &str, info: &Info, amount: u64) -> Result<Asked, Error> {
+        let keysets = info.keysets().map_err(|p| unavailable(url, p))?;
         let (ephemeral, me) = (Ephemeral::random(), self.address());
         let (keyset, outputs) = keysets
             .iter()
@@ -128,33 +184,77 @@ impl<T: Transport> Wallet<T> {
             .ok_or_else(|| Error::Invalid(format!("hub {url} has no keyset making {amount}")))?;
         let mut preimage = [0; 32];
         OsRng.fill_bytes(&mut preimage);
-        let hash = lock_hash(&preimage);
         let refund_key = random_key();
+        let hash = lock_hash(&preimage);
         let body = licash_api::Deposit {
             receive: Receive::new(keyset.id(), &ephemeral.public(), &outputs, &hash),
             refund: Hex(x_only(&refund_key).serialize().to_vec()),
         };
-        let body = serde_json::to_string(&body).map_err(invalid)?;
-        self.store.write(|tx| {
-            tx.execute(
-                "INSERT INTO deposits (hash, hub, preimage, refund_key, amount, body, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![
-                    hash,
-                    hub,
-                    preimage,
-                    refund_key.secret_bytes(),
-                    sql(amount),
-                    body,
-                    now()
-                ],
-            )?;
-            Ok(())
-        })?;
-        tracing::info!(hash = %hex::encode(hash), %url, amount, "asking for a deposit");
-        self.advance_deposit(&hash).await
+        Ok(Asked {
+            hash,
+            preimage,
+            refund_key,
+            amount,
+            body,
+        })
     }
+}
 
+/// A deposit drawn: what only the wallet knows of it, and what it asks.
+struct Asked {
+    hash: [u8; 32],
+    preimage: [u8; 32],
+    refund_key: SecretKey,
+    amount: u64,
+    body: licash_api::Deposit,
+}
+
+impl Asked {
+    /// Record it, as asked of the hub `hub`.
+    fn keep(&self, tx: &rusqlite::Transaction, hub: i64) -> Result<(), Error> {
+        let body = serde_json::to_string(&self.body).map_err(invalid)?;
+        tx.execute(
+            "INSERT INTO deposits (hash, hub, preimage, refund_key, amount, body, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                self.hash,
+                hub,
+                self.preimage,
+                self.refund_key.secret_bytes(),
+                sql(self.amount),
+                body,
+                now()
+            ],
+        )?;
+        Ok(())
+    }
+}
+
+/// Record `terms`, checked to be those of `htlc`, as the hub's answer to
+/// the deposit of `hash`.
+fn keep_terms(
+    tx: &rusqlite::Transaction,
+    hash: &[u8; 32],
+    htlc: &Htlc,
+    terms: &Depositing,
+    network: bitcoin::Network,
+) -> Result<(), Error> {
+    tx.execute(
+        "UPDATE deposits SET claim = ?2, timeout = ?3, pays = ?4, fund_by = ?5, address = ?6
+         WHERE hash = ?1 AND canceled IS NULL",
+        params![
+            hash,
+            htlc.claim.serialize(),
+            htlc.timeout,
+            sql(terms.amount),
+            terms.fund_by,
+            htlc.address(network).to_string(),
+        ],
+    )?;
+    Ok(())
+}
+
+impl<T: Transport> Wallet<T> {
     /// Take the deposit of `hash` on: learn its hub's terms, then claim the
     /// notes its hub locks to the wallet once it is paid. Where it stands.
     pub async fn follow_deposit(&self, hash: &str) -> Result<Deposit, Error> {
@@ -224,23 +324,9 @@ impl<T: Transport> Wallet<T> {
                 Err(Error::Invalid(reason)) => return self.cancel_deposit(hash, &reason),
                 Err(e) => return Err(e),
             };
-            self.store.write(|tx| {
-                tx.execute(
-                    "UPDATE deposits SET claim = ?2, timeout = ?3, pays = ?4, fund_by = ?5,
-                         address = ?6
-                     WHERE hash = ?1",
-                    params![
-                        hash,
-                        htlc.claim.serialize(),
-                        htlc.timeout,
-                        sql(terms.amount),
-                        terms.fund_by,
-                        htlc.address(licash_onchain::network(self.network()))
-                            .to_string(),
-                    ],
-                )?;
-                Ok(())
-            })?;
+            let network = licash_onchain::network(self.network());
+            self.store
+                .write(|tx| keep_terms(tx, hash, &htlc, &terms, network))?;
             let (address, pays) = (&terms.address, terms.amount);
             tracing::info!(hash = %hex::encode(hash), %url, %address, pays, "deposit terms");
         }
