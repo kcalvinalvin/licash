@@ -158,7 +158,17 @@ pub async fn resume<T: Transport, C: Chain>(
         let (state, _) = store.state(&id)?;
         let secrets = wallet.contract_secrets();
         let ctx = licash_contract::opening::Context { tip, trust };
-        let holder = Holder::load(&state, secrets.seed, secrets.spend, &ctx)?;
+        let holder = match Holder::load(&state, secrets.seed, secrets.spend, &ctx) {
+            Ok(holder) => holder,
+            Err(e) => {
+                // One that cannot be read (opened under programs this build
+                // does not name, say) holds up none of the others: given up
+                // if she never signed its F, else kept as it is.
+                tracing::warn!(id = %crate::hex_id(&id), "loading an opening: {e:#}");
+                store.abandon(&id, &format!("cannot be carried on: {e}"))?;
+                continue;
+            }
+        };
         let mut driver = Driver {
             wallet,
             chain,
@@ -310,4 +320,87 @@ fn found(store: &Store, id: &[u8; 32]) -> Result<Contract> {
         .into_iter()
         .find(|c| c.id == *id)
         .context("the contract just stored")
+}
+
+#[cfg(test)]
+mod tests {
+    use bitcoin::{hashes::Hash as _, Block, BlockHash, Transaction, Txid};
+    use licash::{chain::Checkpoint, spend::ChainProfile};
+    use licash_wallet::{Blocks, Response};
+
+    use super::*;
+
+    /// No hub to reach.
+    struct Nowhere;
+
+    impl Transport for Nowhere {
+        async fn request(&self, _: &str, _: Option<Vec<u8>>) -> Result<Response, String> {
+            Err("no hub here".into())
+        }
+    }
+
+    /// A chain at height 250, asked nothing else.
+    struct Tip;
+
+    impl Blocks for Tip {
+        async fn height(&self) -> Result<u32, String> {
+            Ok(250)
+        }
+        async fn hash(&self, _: u32) -> Result<BlockHash, String> {
+            Err("not asked".into())
+        }
+        async fn filter(&self, _: &BlockHash) -> Result<Option<Vec<u8>>, String> {
+            Err("not asked".into())
+        }
+        async fn block(&self, _: &BlockHash) -> Result<Block, String> {
+            Err("not asked".into())
+        }
+    }
+
+    impl Chain for Tip {
+        async fn checkpoint(&self, _: u32) -> Result<Checkpoint, String> {
+            Err("not asked".into())
+        }
+        async fn broadcast(&self, _: &Transaction) -> Result<(), String> {
+            Err("not asked".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn an_opening_that_cannot_be_loaded_holds_up_no_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let regtest = ChainProfile::Core30DefaultRegtest;
+        let path = dir.path().join("wallet.sqlite");
+        let wallet = Wallet::create(&path, &[7; 32], regtest, Nowhere).unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let new = |id: u8, vout: u32| New {
+            id: [id; 32],
+            hub: "http://hub.example",
+            mock: true,
+            deposit: OutPoint {
+                txid: Txid::from_byte_array([9; 32]),
+                vout,
+            },
+            value: 60_000,
+            price: 23_000,
+            cap: 4_096,
+            assert_height: 360,
+            close_height: 500,
+            since: 200,
+            state: b"not a state",
+        };
+        // One she never signed F for, then one she did: neither loads.
+        store.insert(&new(1, 0)).unwrap();
+        store.insert(&new(2, 1)).unwrap();
+        let f = Some(Txid::from_byte_array([8; 32]));
+        store.save(&[2; 32], Phase::Funded, f, b"nor this").unwrap();
+
+        let contracts = resume(&wallet, &Tip, dir.path()).await.unwrap();
+        let of = |id: u8| contracts.iter().find(|c| c.id == [id; 32]).unwrap();
+        // The first given up, its coin free again; the other kept as it is.
+        let reason = of(1).abandoned.as_deref().unwrap();
+        assert!(reason.starts_with("cannot be carried on"), "{reason}");
+        assert_eq!(of(2).abandoned, None);
+        assert_eq!(of(2).phase, Phase::Funded);
+    }
 }
