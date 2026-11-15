@@ -230,7 +230,7 @@ fn contracted(
         let hub = at.hub.trim_end_matches('/');
         let live = contracts
             .iter()
-            .filter(|c| c.hub == hub && tip > 0 && c.live(tip));
+            .filter(|c| c.hub == hub && tip > 0 && c.live(tip) && counted(c));
         let cap: u64 = live.map(|c| u64::from(c.cap)).sum();
         balance.covered += cap.min(at.available + at.pending);
     }
@@ -242,6 +242,12 @@ fn contracted(
             balance.opening += value.saturating_sub(c.price);
         }
     }
+}
+
+/// Whether `c` counts as protecting notes: a mock one, on regtest, as it
+/// stands in for one; a genuine one not until this app recovers with it.
+fn counted(c: &holder::Contract) -> bool {
+    c.mock
 }
 
 fn hex(id: &[u8; 32]) -> String {
@@ -410,6 +416,22 @@ mod tests {
         // Past their deadline, or with the chain unknown: none.
         assert_eq!(covered(360, &[held(HUB, 9_000, 0)]), 0);
         assert_eq!(covered(0, &[held(HUB, 9_000, 0)]), 0);
+    }
+
+    #[test]
+    fn genuine_contracts_cover_nothing_until_this_app_recovers_with_them() {
+        let genuine = holder::Contract {
+            mock: false,
+            ..contract(1, Phase::Funded, Some(Fate::Live))
+        };
+        let mock = contract(2, Phase::Funded, Some(Fate::Live));
+        let covered = |contracts: &[holder::Contract]| {
+            let mut balance = Balance::default();
+            contracted(&mut balance, contracts, 300, &[held(HUB, 9_000, 0)], &[]);
+            balance.covered
+        };
+        assert_eq!(covered(std::slice::from_ref(&genuine)), 0);
+        assert_eq!(covered(&[genuine, mock]), 4_096);
     }
 
     #[test]

@@ -273,6 +273,9 @@ private fun btc(amount: ULong): String = "%d.%08d".format(
 /** Whether two URLs name one hub: contracts keep it without a last slash. */
 private fun sameHub(a: String, b: String): Boolean = a.trimEnd('/') == b.trimEnd('/')
 
+/** What a genuine contract can do for now, said wherever it shows. */
+private const val UNRECOVERED = "Genuine programs. Recovery is not in this app yet: treat as unprotected"
+
 /** Protecting, or about to: what a contract is for. */
 private fun live(c: Contract): Boolean =
     c.state == ContractState.Opening || c.state == ContractState.Confirming || c.state == ContractState.Protecting
@@ -291,7 +294,8 @@ private fun ContractCard(c: Contract, height: Int, developer: Boolean, close: ()
     val (label, tint) = when (c.state) {
         ContractState.Opening -> "Opening" to colors.onSurfaceVariant
         ContractState.Confirming -> "Confirming" to colors.onSurfaceVariant
-        ContractState.Protecting -> "Protecting" to colors.primary
+        // A genuine one protects nothing this app can claim yet: live only.
+        ContractState.Protecting -> (if (c.mock) "Protecting" else "Live") to colors.primary
         ContractState.Ending -> "Ending" to colors.onSurfaceVariant
         ContractState.Closed -> "Closed" to colors.onSurfaceVariant
         is ContractState.Failed -> "Failed" to colors.error
@@ -305,20 +309,19 @@ private fun ContractCard(c: Contract, height: Int, developer: Boolean, close: ()
             Text("Contract", Modifier.weight(1f), style = MaterialTheme.typography.titleSmall)
             Text(label, Modifier.testTag("contract-state"), style = MaterialTheme.typography.labelLarge, color = tint)
         }
-        if (c.mock) {
-            Text(
-                "Mock, for testing: it protects nothing",
-                style = MaterialTheme.typography.bodySmall,
-                color = colors.error,
-            )
-        }
+        Text(
+            if (c.mock) "Mock, for testing: it protects nothing" else UNRECOVERED,
+            style = MaterialTheme.typography.bodySmall,
+            color = colors.error,
+        )
         Spacer(Modifier.height(4.dp))
         val left = c.protectsUntil.toLong() - height
         when (val s = c.state) {
             is ContractState.Failed -> Fact("Why", s.reason)
-            ContractState.Ending, ContractState.Closed -> Fact("Protected until", "block ${c.protectsUntil}")
+            ContractState.Ending, ContractState.Closed ->
+                Fact(if (c.mock) "Protected until" else "Covered until", "block ${c.protectsUntil}")
             else -> {
-                Fact("Protects up to", sat(c.cap))
+                Fact(if (c.mock) "Protects up to" else "Covers up to", sat(c.cap))
                 Fact("Until", if (height > 0) "block ${c.protectsUntil}, ${duration(left)}" else "block ${c.protectsUntil}")
             }
         }
@@ -370,10 +373,15 @@ private fun OpenContract(q: ContractQuote, open: () -> Unit, cashOutFirst: () ->
         title = { Text("Open a contract at ${host(q.hub)}?") },
         text = {
             Column {
+                val lasts = "${q.protectsFor} blocks, ${duration(q.protectsFor.toLong())}, and closes by itself after."
                 Text(
-                    "The hub locks collateral on Bitcoin behind your notes there, up to ${sat(q.cap)}: " +
-                        "if it fails them, you recover them from it. It protects for ${q.protectsFor} blocks, " +
-                        "${duration(q.protectsFor.toLong())}, and closes by itself after.",
+                    if (q.mock) {
+                        "The hub locks collateral on Bitcoin behind your notes there, up to ${sat(q.cap)}: " +
+                            "if it fails them, you recover them from it. It protects for $lasts"
+                    } else {
+                        "The hub locks collateral on Bitcoin behind your notes there, up to ${sat(q.cap)}, " +
+                            "for $lasts"
+                    },
                 )
                 Spacer(Modifier.height(8.dp))
                 if (coin != null) {
@@ -394,14 +402,12 @@ private fun OpenContract(q: ContractQuote, open: () -> Unit, cashOutFirst: () ->
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
-                if (q.mock) {
-                    Spacer(Modifier.height(8.dp))
-                    Text(
-                        "A mock contract, for testing: it protects nothing.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.error,
-                    )
-                }
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    if (q.mock) "A mock contract, for testing: it protects nothing." else "$UNRECOVERED.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                )
             }
         },
         confirmButton = {
