@@ -1,14 +1,18 @@
 package org.licash.wallet.ui
 
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.MaterialTheme
@@ -22,6 +26,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
@@ -30,10 +35,13 @@ import org.licash.core.Holding
 import org.licash.core.Notes
 import org.licash.wallet.Engine
 import org.licash.wallet.Ui
+import org.licash.wallet.credit
+import org.licash.wallet.creditPercent
 import org.licash.wallet.digits
 import org.licash.wallet.explain
 import org.licash.wallet.host
 import org.licash.wallet.sat
+import org.licash.wallet.total
 
 /**
  * Where the balance is: in Licash at each hub, and on Bitcoin; in advanced
@@ -64,10 +72,11 @@ fun BalanceDetails(engine: Engine, ui: Ui, cashOut: (String) -> Unit, back: () -
         TopBar("Balance", back)
         Spacer(Modifier.height(12.dp))
         Text(
-            sat(b.notes + b.notesPending + b.onchain + b.moving),
+            sat(b.total),
             modifier = Modifier.padding(horizontal = 4.dp),
             style = MaterialTheme.typography.displaySmall,
         )
+        if (b.total > 0uL) Protection(b)
         error?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
         Group("In Licash") {
             val held = holdings
@@ -150,6 +159,45 @@ fun BalanceDetails(engine: Engine, ui: Ui, cashOut: (String) -> Unit, back: () -
             dismissButton = { TextButton(onClick = { adding = null }) { Text("Cancel") } },
         )
     }
+}
+
+/** How much is the wallet's own, on Bitcoin, and how much hubs owe on credit. */
+@Composable
+private fun Protection(b: org.licash.core.Balance) {
+    val credit = b.creditPercent
+    val owned = 100 - credit
+    val safe = MaterialTheme.colorScheme.primary
+    val owed = MaterialTheme.colorScheme.error
+    Spacer(Modifier.height(12.dp))
+    Row(
+        Modifier.fillMaxWidth().height(10.dp).clip(RoundedCornerShape(5.dp))
+            .background(MaterialTheme.colorScheme.surfaceContainerHighest),
+    ) {
+        if (owned > 0) Box(Modifier.weight(owned.toFloat()).fillMaxHeight().background(safe))
+        if (credit > 0) Box(Modifier.weight(credit.toFloat()).fillMaxHeight().background(owed))
+    }
+    Spacer(Modifier.height(8.dp))
+    Row(Modifier.fillMaxWidth()) {
+        Text(
+            "$owned% protected",
+            modifier = Modifier.weight(1f).testTag("protected"),
+            style = MaterialTheme.typography.labelLarge,
+            color = safe,
+        )
+        Text(
+            "$credit% on credit, ${sat(b.credit)}",
+            modifier = Modifier.testTag("credit"),
+            style = MaterialTheme.typography.labelLarge,
+            color = owed,
+        )
+    }
+    Text(
+        "Protected: on Bitcoin, yours alone. On credit: notes your hubs owe you, " +
+            "worth what the hub that issued them is.",
+        modifier = Modifier.padding(top = 4.dp),
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
 }
 
 @Composable

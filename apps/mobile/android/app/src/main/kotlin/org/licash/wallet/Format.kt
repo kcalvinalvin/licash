@@ -3,6 +3,7 @@ package org.licash.wallet
 import java.text.DateFormat
 import java.util.Date
 import java.util.Locale
+import org.licash.core.Balance
 import org.licash.core.ChainException
 import org.licash.core.LicashException
 
@@ -11,6 +12,19 @@ fun sat(amount: ULong): String = "${digits(amount)} sat"
 
 fun digits(amount: ULong): String =
     String.format(Locale.US, "%,d", amount.toLong()).replace(',', '\u2009')
+
+/** All the wallet holds: in notes, and on Bitcoin. */
+val Balance.total: ULong get() = notes + notesPending + onchain + moving
+
+/**
+ * Of [total], what hubs owe on trust alone: the notes, which no contract
+ * covers yet. The rest, on Bitcoin, is the wallet's own.
+ */
+val Balance.credit: ULong get() = notes + notesPending
+
+/** [credit] as a share of [total], in whole percent: 0 if nothing is held. */
+val Balance.creditPercent: Int
+    get() = if (total == 0uL) 0 else ((credit.toDouble() * 100 / total.toDouble()) + 0.5).toInt()
 
 /** What went wrong, for the user. */
 fun explain(e: Throwable): String = when (e) {

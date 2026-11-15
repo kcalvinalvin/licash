@@ -40,9 +40,11 @@ import org.licash.core.State
 import org.licash.wallet.Engine
 import org.licash.wallet.Ui
 import org.licash.wallet.at
+import org.licash.wallet.credit
 import org.licash.wallet.digits
 import org.licash.wallet.explain
 import org.licash.wallet.sat
+import org.licash.wallet.total
 
 @Composable
 fun Home(
@@ -103,14 +105,22 @@ fun Home(
 @Composable
 private fun Total(ui: Ui, open: () -> Unit) {
     val b = ui.balance
-    val total = b.notes + b.notesPending + b.onchain + b.moving
     Row(Modifier.clickable(onClick = open), verticalAlignment = Alignment.Bottom) {
-        Text(digits(total), modifier = Modifier.testTag("balance"), style = Figures)
+        Text(digits(b.total), modifier = Modifier.testTag("balance"), style = Figures)
         Text(
             " sat",
             modifier = Modifier.padding(bottom = 8.dp),
             style = MaterialTheme.typography.titleMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+    // Owed by hubs on trust alone: as plain as it gets.
+    if (b.credit > 0uL) {
+        Text(
+            "${sat(b.credit)} on credit",
+            modifier = Modifier.clickable(onClick = open).padding(vertical = 4.dp).testTag("credit"),
+            style = MaterialTheme.typography.headlineSmall,
+            color = MaterialTheme.colorScheme.error,
         )
     }
     val notes = buildList {
