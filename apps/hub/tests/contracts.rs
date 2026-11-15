@@ -16,13 +16,13 @@ use anyhow::{ensure, Context, Result};
 use bitcoin::Amount;
 use licash::spend::ChainProfile;
 use licash_chain_client::Source;
-use licash_contracts::holder::{self, Ask, Contract, Fate, Node, Phase};
+use licash_contracts::holder::{self, Ask, Change, Contract, Fate, Node, Phase};
 use licash_contracts::hub::terms::Range;
 use licash_contracts::hub::Openings;
 use licash_hub::{Hub, Policy};
-use licash_hub_service::Services;
+use licash_hub_service::{deposit, watch, Services};
 use licash_transport::Http;
-use licash_wallet::{Transport as _, Wallet};
+use licash_wallet::{DepositState, Transport as _, Wallet};
 use lngap_btc::regtest::Regtest;
 
 /// A hub service opening contracts, funded by `rt`'s wallet: its URL.
@@ -538,5 +538,158 @@ async fn a_holder_forces_her_contract_closed_on_a_silent_hub_and_takes_her_notes
     // Nothing more to do.
     let over = recovery::advance(&wallet, &chain, &mine, rate).await?;
     ensure!(over[0] == *done, "{over:?}");
+    Ok(())
+}
+
+/// A hub service opening contracts as [`hub_serving`], of notes up to
+/// 2^30 sat, taking deposits of up to 2 M sat for 1000 sat each, scanning
+/// `rt` once [`followed`]: its URL, chain, it and its deposits.
+async fn hub_taking_deposits(
+    rt: &Regtest,
+    dir: &Path,
+) -> Result<(String, Source, Arc<Hub>, Arc<deposit::Gateway>)> {
+    std::fs::create_dir_all(dir)?;
+    let (seed, db) = (dir.join("seed"), dir.join("hub.sqlite"));
+    Hub::init(&seed, &db, 30)?;
+    let hub = Arc::new(Hub::open(&seed, &db, Policy::default())?);
+    let url = format!(
+        "{}/wallet/harness?cookie={}",
+        rt.rpc_url(),
+        rt.cookie().display()
+    );
+    let source: Source = url.parse()?;
+    let keyset = hub.info().keysets[0].clone();
+    let openings = Openings::with_wallet(dir, source.clone(), source.clone(), keyset, None);
+    let config = deposit::Config {
+        max: 2_000_000,
+        ..deposit::Config::new(bitcoin::ScriptBuf::new_op_return([]))
+    };
+    let regtest = ChainProfile::Core30DefaultRegtest;
+    let path = dir.join("deposits.sqlite");
+    let deposits = deposit::Gateway::open(hub.clone(), source.clone(), regtest, config, &path)?;
+    let deposits = Arc::new(deposits);
+    let services = Services {
+        contracts: Some(openings.await?),
+        deposits: Some(deposits.clone()),
+        ..Default::default()
+    };
+    let app = licash_hub_service::router(hub.clone(), services);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let url = format!("http://{}", listener.local_addr()?);
+    tokio::spawn(async move { axum::serve(listener, app).await });
+    Ok((url, source, hub, deposits))
+}
+
+/// `hub` scanned to the tip of `source`, then its `deposits`.
+async fn followed(hub: &Arc<Hub>, source: &Source, deposits: &deposit::Gateway) -> Result<()> {
+    for _ in 0..1_000 {
+        if watch::step(hub, source).await? {
+            deposits.round().await;
+            return Ok(());
+        }
+    }
+    anyhow::bail!("the hub never reached the tip")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs bitcoind and a release build"]
+async fn a_wallet_sweeps_its_coin_into_a_contract_and_notes_its_change_on_bitcoin_if_too_much(
+) -> Result<()> {
+    let rt = Regtest::start_standard()?;
+    let dir = tempfile::tempdir()?;
+    let (url, source, hub, deposits) = hub_taking_deposits(&rt, &dir.path().join("hub")).await?;
+    let chain = Node(source.clone());
+    followed(&hub, &source, &deposits).await?;
+    let mine = dir.path().join("wallet");
+    std::fs::create_dir(&mine)?;
+    let regtest = ChainProfile::Core30DefaultRegtest;
+    let wallet = Wallet::create(
+        &mine.join("wallet.sqlite"),
+        &[9; 32],
+        regtest,
+        Http::new(None)?,
+    )?;
+    let info = wallet.add_hub(&url).await?;
+    let taken = info.deposits.context("no deposits in the hub's info")?;
+    ensure!(taken.max == 2_000_000 && taken.fee.base == 1_000 && taken.fee.ppm == 0);
+
+    // Her 1 M sat coin and a 3 M sat one.
+    wallet.watch_silent(None, rt.height()?)?;
+    for sats in [1_000_000, 3_000_000] {
+        let to = wallet.fallback_address()?.script_pubkey();
+        rt.fund(&to, Amount::from_sat(sats))?;
+    }
+    rt.mine(1)?;
+    followed(&hub, &source, &deposits).await?;
+    ensure!(scan(&wallet, &chain).await? == 4_000_000);
+    let coins = wallet.silent_coins()?;
+    let small = coins.iter().find(|c| c.value == 1_000_000);
+    let small = small.context("no coin")?.outpoint;
+
+    // Opened on the small one, her change into notes: F pays a deposit
+    // of hers exactly, 977 000 sat, the hub's 1000 in it.
+    let swept = Ask {
+        deposit: Some(small),
+        ..ask()
+    };
+    let first = holder::open_with(&wallet, &chain, &mine, &url, swept, Change::Notes).await?;
+    ensure!(
+        first.phase == Phase::Funded && first.price == 23_000,
+        "{first:?}"
+    );
+    let asked = wallet.deposits()?;
+    ensure!(asked.len() == 1, "{asked:?}");
+    let terms = asked[0].terms.clone().context("no terms")?;
+    ensure!(asked[0].amount == 976_000 && terms.pays == 977_000);
+    ensure!(asked[0].state == DepositState::Open, "{asked:?}");
+    let f = first.funding.context("no F")?;
+    let found: serde_json::Value = chain
+        .0
+        .rpc(
+            "getrawtransaction",
+            serde_json::json!([f.to_string(), true]),
+        )
+        .await?;
+    let outputs = found["vout"].as_array().context("no outputs")?;
+    let paid = outputs.iter().any(|o| {
+        o["scriptPubKey"]["address"] == terms.address.as_str()
+            && (o["value"].as_f64().unwrap_or(0.0) * 1e8).round() as u64 == 977_000
+    });
+    ensure!(paid, "{found}");
+
+    // F confirmed at depth: her notes locked, then claimed; no coin of
+    // hers left on Bitcoin but the other.
+    let mut state = DepositState::Open;
+    for _ in 0..12 {
+        rt.mine(1)?;
+        followed(&hub, &source, &deposits).await?;
+        state = wallet.follow_deposit(&asked[0].hash).await?.state;
+        if state == DepositState::Received {
+            break;
+        }
+    }
+    ensure!(state == DepositState::Received, "{state:?}");
+    let held: u64 = wallet.balance()?.iter().map(|b| b.available).sum();
+    ensure!(held == 976_000, "{held}");
+    let contracts = holder::resume(&wallet, &chain, &mine).await?;
+    ensure!(contracts[0].fate == Some(Fate::Live), "{contracts:?}");
+    ensure!(scan(&wallet, &chain).await? == 3_000_000);
+    // Its payment found in F, for a refund had its notes never come.
+    let address: bitcoin::Address<_> = terms.address.parse()?;
+    let script = address.assume_checked().script_pubkey();
+    let tip = rt.height()?;
+    let into = holder::paid_into(&wallet, &mine, &script, 977_000, tip)?;
+    ensure!(into.map(|o| o.txid) == Some(f), "{into:?}");
+    ensure!(holder::paid_into(&wallet, &mine, &script, 977_001, tip)?.is_none());
+
+    // On the large one, its change more than the hub takes: on Bitcoin,
+    // as asked otherwise, no deposit asked for.
+    let second = holder::open_with(&wallet, &chain, &mine, &url, ask(), Change::Notes).await?;
+    ensure!(second.phase == Phase::Funded && second.value == 3_000_000);
+    ensure!(wallet.deposits()?.len() == 1);
+    rt.mine(1)?;
+    let contracts = holder::resume(&wallet, &chain, &mine).await?;
+    ensure!(contracts.iter().all(|c| c.fate == Some(Fate::Live)));
+    ensure!(scan(&wallet, &chain).await? == 2_977_000);
     Ok(())
 }

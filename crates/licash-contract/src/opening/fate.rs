@@ -7,7 +7,7 @@
 //! unconfirmed, by spending a coin of its own of F (the holder her deposit,
 //! the hub one of its inputs), unless F confirms first.
 
-use lngap_btc::bitcoin::{OutPoint, Transaction, TxOut, Txid};
+use lngap_btc::bitcoin::{OutPoint, ScriptBuf, Transaction, TxOut, Txid};
 
 use super::{at, Holder, Hub};
 
@@ -77,6 +77,11 @@ impl Holder {
             prevouts: &c.prevouts,
             deposit: at(&frozen.funding, self.start.deposit),
         })
+    }
+
+    /// The script F pays her change to, as she started: known before F.
+    pub fn change(&self) -> &ScriptBuf {
+        &self.start.change
     }
 
     /// Whether her gate has lapsed at `tip`: F funded from it on would not

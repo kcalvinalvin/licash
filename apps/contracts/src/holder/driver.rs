@@ -6,12 +6,14 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context as _, Result};
+use bitcoin::{Script, Transaction};
 use licash_contract::opening::{Context, Holder, Input, Out, Phase, Quote, Trust};
 use licash_contract::wire::Kind;
-use licash_wallet::{Transport, Wallet};
+use licash_wallet::{DepositState, Transport, Wallet};
 
 use super::chain::Chain;
 use super::store::Store;
+use super::DEPOSIT_MARGIN;
 use crate::{Frame, Opening, INSTANCE, MAX_BODY, OPEN, STEP};
 
 /// How long to wait before asking a working hub again.
@@ -79,6 +81,7 @@ impl<T: Transport, C: Chain> Driver<'_, T, C> {
                     prevouts,
                     inputs,
                 } => {
+                    self.paying_deposits(&funding).await?;
                     let mut signed = funding;
                     for index in inputs {
                         signed = self.wallet.sign_input(&signed, &prevouts, index)?;
@@ -124,6 +127,12 @@ impl<T: Transport, C: Chain> Driver<'_, T, C> {
         let holder = self.holder();
         if e.downcast_ref::<Refusal>().is_some() && holder.abandonable() {
             self.store.abandon(&self.id, &format!("{e:#}"))?;
+            // A deposit her change was to pay, never to be paid now.
+            for hash in self.deposits_paid_by(holder.change()) {
+                if let Err(e) = self.wallet.give_up_deposit(&hash, "its opening given up") {
+                    tracing::warn!(%hash, "giving the deposit of F's change up: {e}");
+                }
+            }
             if holder.phase() == Phase::Signing {
                 if let Some(f) = holder.funding() {
                     // Not reserved unless she signed before stopping.
@@ -133,6 +142,49 @@ impl<T: Transport, C: Chain> Driver<'_, T, C> {
             tracing::warn!(id = %crate::hex_id(&self.id), "an opening given up: {e:#}");
         }
         Err(e)
+    }
+
+    /// The deposits of the wallet's `script` pays: their hashes.
+    fn deposits_paid_by(&self, script: &Script) -> Vec<String> {
+        let deposits = self.wallet.deposits().unwrap_or_default();
+        let paid = deposits.into_iter().filter(|d| {
+            let to = d.terms.as_ref().and_then(|t| super::script_of(&t.address));
+            to.as_deref() == Some(script)
+        });
+        paid.map(|d| d.hash).collect()
+    }
+
+    /// Refused, short of her signing `funding`, if an output of it pays a
+    /// deposit of the wallet's other than exactly, open and unpaid, with
+    /// [`DEPOSIT_MARGIN`] blocks left to confirm in: an opening resumed
+    /// late, say. Its notes would never come, its coins back only after
+    /// the deposit's timeout.
+    async fn paying_deposits(&self, funding: &Transaction) -> Result<()> {
+        let tip = self.chain.height().await.map_err(|e| anyhow!(e))?;
+        let deposits = self.wallet.deposits()?;
+        for out in &funding.output {
+            for d in &deposits {
+                let Some(terms) = &d.terms else {
+                    continue;
+                };
+                if super::script_of(&terms.address).as_ref() != Some(&out.script_pubkey) {
+                    continue;
+                }
+                let open = d.state == DepositState::Open && d.funding.is_none();
+                let exact = out.value.to_sat() == terms.pays;
+                let time = terms.fund_by >= tip.saturating_add(DEPOSIT_MARGIN);
+                if !(open && exact && time) {
+                    let (hash, value) = (&d.hash, out.value.to_sat());
+                    return Err(Refusal(format!(
+                        "F pays deposit {hash} {value} sat, of {} by block {} at {tip}, {:?}: \
+                         not signed",
+                        terms.pays, terms.fund_by, d.state
+                    ))
+                    .into());
+                }
+            }
+        }
+        Ok(())
     }
 
     async fn context(&self) -> Result<Context> {
