@@ -97,6 +97,13 @@ data class ChainStatus(val height: Int = 0, val peers: Long = 0, val synced: Boo
 data class Event(val text: String, val received: ULong? = null)
 
 /**
+ * A contract's terms its owner chose, within its hub's range: up to `cap`
+ * sat over `blocks`, paid from `coin` (`txid:vout`), its change moved into
+ * Licash once its funding confirms if `moveChange`.
+ */
+data class Chosen(val cap: ULong, val blocks: UInt, val coin: String, val moveChange: Boolean)
+
+/**
  * The wallet and the light client, and the loop keeping them in step while
  * the app is in sight, or out of sight while a payment is under way (see
  * [Watch]): looking for payments on Bitcoin, moving them into Licash once
@@ -438,6 +445,15 @@ class Engine(context: Context) {
      * enough: but what was cashed out to this wallet, which stays.
      */
     private suspend fun move(chain: GoChain) {
+        // The change of contracts opened to move it, once their funding confirms.
+        try {
+            for (moving in locked { it.moveChanges(chain) }) {
+                AppLog.info("moving ${moving.amount} sat of a contract's change into Licash")
+                notices.tryEmit(Event("Moving ${sat(moving.amount)}, a contract's change, into Licash"))
+            }
+        } catch (e: LicashException) {
+            AppLog.warn("moving a contract's change into Licash", e)
+        }
         val balance = local { it.balance() }
         if (balance.onchain <= balance.kept || balance.moving > 0uL) return
         try {
@@ -749,11 +765,12 @@ class Engine(context: Context) {
     suspend fun contractQuote(hub: String): Result<ContractQuote> = io { local { it.contractQuote(hub) } }
 
     /**
-     * Open a recovery contract at `hub` for at most `maxPrice`, in the
-     * background: it takes minutes, its downloads large. Told once signed,
-     * or why not. One at a time.
+     * Open a recovery contract at `hub` for at most `maxPrice`, of the
+     * terms `chosen` within the hub's range if any, else of its fixed
+     * ones, in the background: it takes minutes, its downloads large.
+     * Told once signed, or why not. One at a time.
      */
-    fun openContract(hub: String, maxPrice: ULong) {
+    fun openContract(hub: String, maxPrice: ULong, chosen: Chosen? = null) {
         val light = light
         if (light == null) {
             notices.tryEmit(Event("Not connected to Bitcoin yet: try again in a moment."))
@@ -765,10 +782,19 @@ class Engine(context: Context) {
             if (started) it.copy(opening = hub) else it
         }
         if (!started) return
-        AppLog.info("opening a contract at $hub")
+        AppLog.info("opening a contract at $hub${chosen?.let { " of ${it.cap} sat over ${it.blocks} blocks" } ?: ""}")
         scope.launch {
             try {
-                val opened = local { it.openContract(GoChain(light), hub, null, maxPrice) }
+                val chain = GoChain(light)
+                val opened = local {
+                    if (chosen == null) {
+                        it.openContract(chain, hub, null, maxPrice)
+                    } else {
+                        it.openChosenContract(
+                            chain, hub, chosen.cap, chosen.blocks, maxPrice, chosen.coin, chosen.moveChange,
+                        )
+                    }
+                }
                 AppLog.info("contract ${opened.id} signed at $hub, funded by ${opened.funding}")
                 notices.tryEmit(Event("Contract signed at ${host(hub)}: protecting once its funding confirms"))
             } catch (e: Exception) {

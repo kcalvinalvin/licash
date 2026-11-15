@@ -8,6 +8,7 @@ import java.util.Locale
 import org.licash.core.Balance
 import org.licash.core.Contract
 import org.licash.core.ContractState
+import org.licash.core.OpeningStep
 import org.licash.core.Rate
 import org.licash.wallet.credit
 import org.licash.wallet.host
@@ -186,6 +187,27 @@ fun cover(contract: Contract, height: Int): Cover {
         left = if (runs && known) "${span(contract.protectsUntil.toLong() - height)} left" else null,
         ends = if ((runs || held) && known) span(contract.closesAt.toLong() - height) else null,
     )
+}
+
+/** The steps of setting a protection up, the last its payment confirming. */
+const val SETUP_STEPS = 7f
+
+/**
+ * How far setting a protection up is, in steps done of [SETUP_STEPS], and
+ * what it waits on, in a word or two.
+ */
+fun setup(step: OpeningStep): Pair<Float, String> = when (step) {
+    OpeningStep.Terms -> 0f to "Asking the hub"
+    OpeningStep.Instances -> 1f to "The hub is preparing"
+    OpeningStep.Checking -> 2f to "Checking"
+    is OpeningStep.Downloading -> {
+        // Of its downloads, how far; then what they are for, built.
+        val part = step.kept.toFloat() / step.keeping.coerceAtLeast(1u).toFloat()
+        3f + part * 0.9f to if (step.kept < step.keeping) "Downloading ${step.kept} of ${step.keeping}" else "Building"
+    }
+    OpeningStep.Signatures -> 4f to "Waiting for the hub"
+    OpeningStep.Signing -> 5f to "Signing"
+    is OpeningStep.Confirming -> 6f to if (step.confirmations == 0u) "Waiting for Bitcoin" else "Confirming"
 }
 
 /**

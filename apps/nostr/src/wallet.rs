@@ -34,7 +34,7 @@ const KEPT_FOR: Duration = Duration::from_secs(30 * 60);
 /// each is still asked, and must answer as the key that announced it.
 /// None kept, or none of those answering, a quote looks for them as it
 /// did: one never refreshed keeps none, each quote looking. Each provider
-/// is asked first at the URL it last answered at, for [`KEPT_FOR`] after,
+/// is asked first at the URL it last answered at, for half an hour after,
 /// while it still announces it: one of its URLs down (say, an onion
 /// service not opening) is not waited on again for each quote.
 #[derive(Default)]

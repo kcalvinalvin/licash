@@ -358,6 +358,15 @@ enum Command {
         /// hub's info said].
         #[arg(long)]
         max_price: Option<u64>,
+        /// The most notes it protects, in sat, if the hub lets holders
+        /// choose (its info's range), over --blocks [default: the hub's
+        /// fixed terms].
+        #[arg(long, requires = "blocks")]
+        cap: Option<u32>,
+        /// The coin on Bitcoin to pay it from, as TXID:VOUT [default: the
+        /// smallest free that pays it].
+        #[arg(long)]
+        coin: Option<bitcoin::OutPoint>,
         /// The chain to check the hub's quote on and broadcast to.
         #[arg(long, env = "LICASH_WALLET_CHAIN")]
         chain: Option<String>,
@@ -876,9 +885,16 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             hub,
             blocks,
             max_price,
+            cap,
+            coin,
             chain,
         } => {
-            let ask = (blocks, max_price);
+            let ask = contract::Asked {
+                blocks,
+                max_price,
+                cap,
+                coin,
+            };
             return contract::open(&wallet, &path, chain.as_deref(), &hub, ask, json).await;
         }
         Command::Contracts { chain } => {

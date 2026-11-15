@@ -15,6 +15,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material3.Icon
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -43,6 +44,8 @@ internal fun CoverRow(c: Contract, height: Int, developer: Boolean, end: () -> U
     val colors = MaterialTheme.colorScheme
     val cover = cover(c, height)
     var open by rememberSaveable(c.id) { mutableStateOf(false) }
+    // While it is set up: the step it is at.
+    val step = c.step?.let { setup(it) }
     val tint = when {
         cover.failed -> colors.error
         cover.on -> colors.primary
@@ -62,8 +65,13 @@ internal fun CoverRow(c: Contract, height: Int, developer: Boolean, end: () -> U
             Spacer(Modifier.width(12.dp))
             Column(Modifier.weight(1f)) {
                 Text("Up to ${sat(c.cap)}", style = MaterialTheme.typography.bodyLarge, maxLines = 1)
-                cover.left?.let {
-                    Text(it, style = MaterialTheme.typography.bodySmall, color = colors.onSurfaceVariant)
+                (step?.second ?: cover.left)?.let {
+                    Text(
+                        it,
+                        modifier = if (step != null) Modifier.testTag("contract-step") else Modifier,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = colors.onSurfaceVariant,
+                    )
                 }
             }
             Text(cover.stands, Modifier.testTag("contract-state"), style = MaterialTheme.typography.labelLarge, color = tint)
@@ -74,11 +82,19 @@ internal fun CoverRow(c: Contract, height: Int, developer: Boolean, end: () -> U
             )
         }
         // What it is worth, in sight while it runs: nobody is to count on what protects nothing.
+        step?.let { (done, _) ->
+            LinearProgressIndicator(
+                progress = { done / SETUP_STEPS },
+                modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
+            )
+        }
         if (cover.runs) Worth(c.mock)
         AnimatedVisibility(open) {
             Column {
                 val state = c.state
                 if (state is ContractState.Failed) Line("Why", state.reason)
+                // Of what its hub holds, those ending first covering first.
+                if (cover.on) Line("Covers now", sat(c.covers), tag = "covers")
                 if (cover.ends != null) Line("Ends by itself in", cover.ends)
                 if (!cover.failed) Line("Cost", sat(c.price))
                 if (developer) {
@@ -101,7 +117,7 @@ internal fun CoverRow(c: Contract, height: Int, developer: Boolean, end: () -> U
 
 /** What a protection is worth for now, said where one shows and before one is paid for. */
 @Composable
-private fun Worth(mock: Boolean) {
+internal fun Worth(mock: Boolean) {
     Text(
         if (mock) MOCK else UNRECOVERED,
         modifier = Modifier.padding(bottom = 8.dp).testTag("worth"),
@@ -121,7 +137,7 @@ internal fun ProtectSheet(q: ContractQuote, open: () -> Unit, cashOutFirst: () -
         Line("Covers up to", sat(q.cap), tag = "quote-cap")
         Line("For", span(q.protectsFor.toLong()), tag = "quote-for")
         Line("Cost", sat(q.price), tag = "quote-price")
-        Line("Takes", "A few minutes, $download")
+        Line("Takes", "Up to an hour, $download")
         Worth(q.mock)
         Spacer(Modifier.height(8.dp))
         if (q.coin != null) {

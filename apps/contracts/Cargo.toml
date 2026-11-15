@@ -8,7 +8,7 @@ publish = false
 
 [dependencies]
 licash.workspace = true
-licash-api = { workspace = true, optional = true }
+licash-api.workspace = true
 licash-chain-client = { workspace = true, optional = true }
 licash-contract = { path = "../../crates/licash-contract" }
 licash-wallet.workspace = true
@@ -26,7 +26,7 @@ tracing.workspace = true
 [features]
 # The hub's side, and a node or an Esplora API as the holder's chain.
 default = ["node"]
-node = ["dep:axum", "dep:licash-api", "dep:licash-chain-client", "dep:serde_json", "dep:sha2"]
+node = ["dep:axum", "dep:licash-chain-client", "dep:serde_json", "dep:sha2"]
 
 [dev-dependencies]
 tempfile = "3.27"

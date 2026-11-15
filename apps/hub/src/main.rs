@@ -143,9 +143,63 @@ struct Chain {
         requires = "contracts"
     )]
     contracts_wallet: Option<String>,
+    /// Let holders choose a contract's cap up to this many sat, and how
+    /// long it lasts up to `--contracts-max-blocks`, besides the fixed
+    /// terms (4 096 sat over 1 000 blocks) apps without that choice open
+    /// on. By default, the fixed terms only.
+    #[arg(
+        long = "contracts-max-cap",
+        value_name = "SAT",
+        env = "LICASH_HUB_CONTRACTS_MAX_CAP",
+        requires = "contracts"
+    )]
+    contracts_max_cap: Option<u32>,
+    /// The most blocks a contract a holder chooses lasts, with
+    /// `--contracts-max-cap`.
+    #[arg(
+        long = "contracts-max-blocks",
+        value_name = "BLOCKS",
+        env = "LICASH_HUB_CONTRACTS_MAX_BLOCKS",
+        default_value_t = 1_000,
+        requires = "contracts_max_cap"
+    )]
+    contracts_max_blocks: u32,
+    /// A contract's cap at most this many times the coin its holder
+    /// deposits, with `--contracts-max-cap`: no small coin locks much of
+    /// the hub's.
+    #[arg(
+        long = "contracts-per-coin",
+        value_name = "TIMES",
+        env = "LICASH_HUB_CONTRACTS_PER_COIN",
+        default_value_t = 2,
+        requires = "contracts_max_cap"
+    )]
+    contracts_per_coin: u32,
+    /// What a contract a holder chooses costs over the fixed price, in
+    /// millionths of its cap for each year (52 560 blocks) it lasts, with
+    /// `--contracts-max-cap`: 10 000 is 1% a year.
+    #[arg(
+        long = "contracts-rate",
+        value_name = "PPM",
+        env = "LICASH_HUB_CONTRACTS_RATE",
+        default_value_t = 10_000,
+        requires = "contracts_max_cap"
+    )]
+    contracts_rate: u32,
 }
 
 impl Chain {
+    /// The contract terms holders may choose, if the operator lets them.
+    fn range(&self) -> Option<licash_contracts::hub::terms::Range> {
+        self.contracts_max_cap
+            .map(|max_cap| licash_contracts::hub::terms::Range {
+                max_cap,
+                max_blocks: self.contracts_max_blocks,
+                per_coin: self.contracts_per_coin,
+                ppm_year: self.contracts_rate,
+            })
+    }
+
     fn source(&self, policy: &Policy) -> anyhow::Result<Option<(Source, ChainProfile, Duration)>> {
         let Some(url) = &self.url else {
             return Ok(None);
@@ -775,6 +829,7 @@ fn command(cli: Cli) -> anyhow::Result<()> {
             let policy = policy.policy();
             let (indexing, tweaks_from) = (chain.tweaks, chain.tweaks_from);
             let contracting = chain.contracts;
+            let range = chain.range();
             let wallet = match (&chain.contracts_wallet, &chain.url) {
                 (Some(url), _) => Some(url.parse::<Source>().context("--contracts-wallet")?),
                 (None, Some(url)) if contracting && url.starts_with("esplora+") => anyhow::bail!(
@@ -878,11 +933,20 @@ fn command(cli: Cli) -> anyhow::Result<()> {
                     let keysets = hub.info().keysets;
                     let keyset = keysets.first().context("the hub has no keyset")?;
                     let wallet = wallet.unwrap_or_else(|| source.clone());
-                    let opening =
-                        Openings::with_wallet(&cli.data, source.clone(), wallet, keyset.clone());
+                    let opening = Openings::with_wallet(
+                        &cli.data,
+                        source.clone(),
+                        wallet,
+                        keyset.clone(),
+                        range,
+                    );
                     let openings = runtime.block_on(opening).context("open the contracts")?;
                     openings.spawn_sweeper();
-                    tracing::info!(mock = openings.advertise().mock, "opening contracts");
+                    tracing::info!(
+                        mock = openings.advertise().mock,
+                        ?range,
+                        "opening contracts"
+                    );
                     Some(openings)
                 }
                 _ => {

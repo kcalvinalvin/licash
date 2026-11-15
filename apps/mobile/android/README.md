@@ -84,19 +84,27 @@ at that hub, shown apart behind the balance, as not in it, where adding the
 hub counts it.
 
 A hub's page sets up protection, a recovery contract, at the hubs that open
-them (`licash-hub run
---contracts`, on regtest only for now, under the mock authority: such a
-contract protects nothing). A contract locks the hub's collateral on Bitcoin
-behind the notes there, up to its cap, until its last block to recover in,
-then closes by itself, its collateral back to the hub. Its price is paid from
-a coin of the wallet's on Bitcoin, its change kept there; with none, the quote
-offers to cash notes out to the wallet first. Opening downloads about 100 MB
-and takes minutes, in the background, one at a time; several contracts at a
-hub, and at several hubs, add up. The notes contracts cover count as
-protected rather than not, on Home and behind the balance; what a contract
-is worth for now (nothing, under the mock authority) is said wherever one
-shows. A contract ends no sooner: End says to cash out the hub's notes
-instead. Force closing,
+them (`licash-hub run --contracts`: under the mock authority on regtest,
+where such a contract protects nothing, and of genuine programs on signet).
+A contract locks the hub's collateral on Bitcoin behind the notes there, up
+to its cap, until its last block to recover in, then closes by itself, its
+collateral back to the hub. Its price is paid from a coin of the wallet's on
+Bitcoin, its change kept there; with none, the quote offers to cash notes
+out to the wallet first. At a hub that lets the wallet choose
+(`--contracts-max-cap`), sliders choose its cap (at first half again the
+largest coin, at most the hub's `--contracts-per-coin` times the coin
+paying) and how long it lasts (at first half a year), priced live as the hub
+prices them, and the coin paying, if there are several; its change then
+moves into the balance at that hub once its funding confirms, unless
+switched off. Opening downloads about 100 MB and takes minutes to an hour,
+in the background, one at a time, the step it is at shown; several
+contracts at a hub, and at several hubs, add up. Each says what it covers
+now of the hub's notes once unfolded, those ending first covering first,
+and the hub's page how much of what it holds they protect; the notes they
+cover count as protected rather than not, on Home and behind the balance;
+what a contract is worth for now (nothing, under the mock authority) is said
+wherever one shows. A contract ends no sooner: End says to cash out the
+hub's notes instead. Force closing,
 recovering the notes on Bitcoin, is not available yet. The contracts are kept
 beside the wallet's file, made only once one is asked for.
 

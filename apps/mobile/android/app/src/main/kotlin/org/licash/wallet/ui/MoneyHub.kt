@@ -20,8 +20,10 @@ import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
 import org.licash.core.Contract
 import org.licash.core.ContractQuote
+import org.licash.core.ContractState
 import org.licash.core.Holding
 import org.licash.core.Notes
+import org.licash.core.contractMaxCap
 import org.licash.wallet.Engine
 import org.licash.wallet.Ui
 import org.licash.wallet.digits
@@ -51,6 +53,9 @@ internal fun HubPage(
     val now = System.currentTimeMillis() / 1000
     val covers = ui.contracts.filter { sameHub(it.hub, holding.hub) && (ui.developer || shown(it, now)) }
     val opening = ui.opening?.let { sameHub(it, holding.hub) } == true
+    // One being set up shows the step it is at in its own row, once it has one.
+    val stepping = covers.any { it.state == ContractState.Opening && it.step != null }
+    val held = holding.available + holding.pending
     // Protecting: the hub asked what it costs, then what it quotes.
     var quoting by remember { mutableStateOf(false) }
     var quote by remember { mutableStateOf<ContractQuote?>(null) }
@@ -80,13 +85,18 @@ internal fun HubPage(
     }
     if (covers.isNotEmpty() || opening) {
         Group("Protection") {
+            // Of what is held here, how much those running protect.
+            if (covers.any { it.state == ContractState.Protecting }) {
+                Line("Protected now", "${digits(covers.sumOf { it.covers })} of ${sat(held)}", tag = "hub-covered")
+                Divider()
+            }
             covers.forEachIndexed { i, c ->
                 if (i > 0) Divider()
                 CoverRow(c, ui.chain.height, ui.developer) { ending = c }
             }
-            if (opening) {
+            if (opening && !stepping) {
                 if (covers.isNotEmpty()) Divider()
-                Entry("Setting up", sub = "A few minutes", tag = "opening")
+                Entry("Setting up", sub = "Up to an hour", tag = "opening")
                 LinearProgressIndicator(Modifier.fillMaxWidth().padding(bottom = 12.dp))
             }
         }
@@ -110,23 +120,39 @@ internal fun HubPage(
 
     if (fees && hub != null) HubFees(hub) { fees = false }
     quote?.let { q ->
-        ProtectSheet(
-            q,
-            open = {
-                quote = null
-                engine.openContract(q.hub, q.price)
-            },
-            cashOutFirst = {
-                quote = null
-                scope.launch {
-                    engine.bitcoinAddress().fold(
-                        { payOwn("bitcoin:$it?amount=${btc(firstCoin(q.price))}", it) },
-                        { fail(explain(it)) },
-                    )
-                }
-            },
-            dismiss = { quote = null },
-        )
+        // Of terms chosen, if the hub lets them be and a coin held pays within them.
+        val range = q.range
+        val paying = q.coins.filter { range != null && contractMaxCap(range, it.value) != null }
+        if (range != null && paying.isNotEmpty()) {
+            ChooseSheet(
+                q,
+                range,
+                paying,
+                open = { chosen, price ->
+                    quote = null
+                    engine.openContract(q.hub, price, chosen)
+                },
+                dismiss = { quote = null },
+            )
+        } else {
+            ProtectSheet(
+                q,
+                open = {
+                    quote = null
+                    engine.openContract(q.hub, q.price)
+                },
+                cashOutFirst = {
+                    quote = null
+                    scope.launch {
+                        engine.bitcoinAddress().fold(
+                            { payOwn("bitcoin:$it?amount=${btc(firstCoin(q.price))}", it) },
+                            { fail(explain(it)) },
+                        )
+                    }
+                },
+                dismiss = { quote = null },
+            )
+        }
     }
     ending?.let { c ->
         EndSheet(

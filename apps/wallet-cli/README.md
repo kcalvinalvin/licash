@@ -102,7 +102,9 @@ back to the wallet, and downloads about 100 MB of instances, kept in
 `contracts/` next to the wallet file with `contracts.sqlite`: back them
 up with it. `--blocks` sets the blocks to its close (by default the most
 the hub allows), `--max-price` the most to pay (by default the price the
-hub's info says). Several contracts, at one hub or several, each take their
+hub's info says). At a hub that lets wallets choose (its info names a
+range), `--cap` with `--blocks` sets the most the contract protects, at the
+price the range gives; `--coin TXID:VOUT` names the coin to pay from. Several contracts, at one hub or several, each take their
 own coin. `contracts` lists them; with `--chain`, it carries on those under
 way and sees where each one's funding stands. On regtest, contracts are
 under a mock proof authority: such a contract protects nothing. On signet

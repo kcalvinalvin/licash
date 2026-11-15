@@ -25,15 +25,25 @@ fn dir(path: &Path) -> &Path {
     path.parent().unwrap_or(Path::new("."))
 }
 
+/// What `open-contract` asks of a hub, as given.
+pub struct Asked {
+    pub blocks: Option<u32>,
+    pub max_price: Option<u64>,
+    pub cap: Option<u32>,
+    pub coin: Option<bitcoin::OutPoint>,
+}
+
 /// Open a contract at `hub` closing `blocks` from now [default: as late
 /// as the hub allows], paying at most `max_price` [default: what its info
-/// said].
+/// said, or its range prices the terms chosen at], protecting `cap` sat
+/// if chosen [default: the hub's fixed terms], paid from `coin` [default:
+/// the smallest free that pays it].
 pub async fn open(
     wallet: &Wallet<Http>,
     path: &Path,
     chain: Option<&str>,
     hub: &str,
-    (blocks, max_price): (Option<u32>, Option<u64>),
+    asked: Asked,
     json: bool,
 ) -> anyhow::Result<()> {
     let chain = node(chain)?;
@@ -46,9 +56,17 @@ pub async fn open(
     let offered = info
         .contracts
         .with_context(|| format!("{hub} opens no contracts"))?;
+    let blocks = asked.blocks.unwrap_or(offered.blocks);
+    let price = match (asked.cap, offered.range) {
+        (Some(cap), Some(range)) => range.price(cap, blocks),
+        (Some(_), None) => anyhow::bail!("{hub} offers no contracts of other caps"),
+        (None, _) => offered.price,
+    };
     let ask = Ask {
-        blocks: blocks.unwrap_or(offered.blocks),
-        max_price: max_price.unwrap_or(offered.price),
+        blocks,
+        max_price: asked.max_price.unwrap_or(price),
+        cap: asked.cap,
+        deposit: asked.coin,
     };
     let contract = holder::open(wallet, &chain, dir(path), hub, ask).await?;
     show(json, contract_json(&contract), contract_line(&contract));

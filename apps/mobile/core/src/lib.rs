@@ -165,6 +165,73 @@ pub struct ContractTerms {
     /// Under the mock authority, for regtest only: such a contract
     /// protects nothing.
     pub mock: bool,
+    /// The caps and durations the wallet may choose instead, if the hub
+    /// lets it.
+    pub range: Option<ContractRange>,
+}
+
+/// The caps and durations a hub lets a wallet choose for a contract, and
+/// what each costs ([`contract_price`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct ContractRange {
+    /// The most of the notes at the hub one protects, in sat: at least,
+    /// at most.
+    pub min_cap: u64,
+    pub max_cap: u64,
+    /// Blocks from opening one to its close: at least, at most.
+    pub min_blocks: u32,
+    pub max_blocks: u32,
+    /// Its cap at most this many times the coin paying for it.
+    pub per_coin: u32,
+    /// What opening one costs, in sat: this, and `ppm_year` millionths of
+    /// its cap for each year it lasts.
+    pub base: u64,
+    pub ppm_year: u32,
+}
+
+impl From<licash_api::ContractRange> for ContractRange {
+    fn from(r: licash_api::ContractRange) -> Self {
+        Self {
+            min_cap: u64::from(r.min_cap),
+            max_cap: u64::from(r.max_cap),
+            min_blocks: r.min_blocks,
+            max_blocks: r.max_blocks,
+            per_coin: r.per_coin,
+            base: r.base,
+            ppm_year: r.ppm_year,
+        }
+    }
+}
+
+impl ContractRange {
+    /// As the hub's info says it: a cap past a `u32` none a hub offers.
+    pub(crate) fn api(&self) -> licash_api::ContractRange {
+        let sat = |v: u64| u32::try_from(v).unwrap_or(u32::MAX);
+        licash_api::ContractRange {
+            min_cap: sat(self.min_cap),
+            max_cap: sat(self.max_cap),
+            min_blocks: self.min_blocks,
+            max_blocks: self.max_blocks,
+            per_coin: self.per_coin,
+            base: self.base,
+            ppm_year: self.ppm_year,
+        }
+    }
+}
+
+/// What opening a contract within `range` protecting up to `cap` sat over
+/// `blocks` costs, in sat: as its hub prices it.
+#[uniffi::export]
+pub fn contract_price(range: ContractRange, cap: u64, blocks: u32) -> u64 {
+    let cap = u32::try_from(cap).unwrap_or(u32::MAX);
+    range.api().price(cap, blocks)
+}
+
+/// The most a contract within `range` protects, paid from a coin of
+/// `coin` sat: none if less than the least.
+#[uniffi::export]
+pub fn contract_max_cap(range: ContractRange, coin: u64) -> Option<u64> {
+    range.api().max_cap_for(coin).map(u64::from)
 }
 
 /// A fee, in sat: `base` plus `ppm` millionths of what it is on.
@@ -254,6 +321,11 @@ pub struct Contract {
     pub mock: bool,
     /// The most of the notes at its hub it protects, in sat.
     pub cap: u64,
+    /// Of the notes at its hub now, what it protects, in sat: up to its
+    /// cap, of those the live contracts there whose deadlines come first
+    /// leave; none unless it protects any (a genuine one, not until this
+    /// app recovers with it). Together, [`Balance::covered`] at its hub.
+    pub covers: u64,
     /// What opening it cost, in sat, from the coin it was paid from.
     pub price: u64,
     /// That coin's value, in sat: the rest came back as change.
@@ -267,6 +339,31 @@ pub struct Contract {
     pub funding: Option<String>,
     /// When it was asked for, in seconds since the Unix epoch.
     pub created_at: i64,
+    /// While [`ContractState::Opening`] or [`ContractState::Confirming`]:
+    /// what it waits on now.
+    pub step: Option<OpeningStep>,
+}
+
+/// What a contract being opened waits on now, in order: each step done
+/// as the wallet last saw it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum OpeningStep {
+    /// The hub's terms, for the wallet's open.
+    Terms,
+    /// The hub's commitment to the instances of its programs it builds.
+    Instances,
+    /// The instances the hub opened, checked by the wallet.
+    Checking,
+    /// The instances the wallet keeps, downloaded from the hub: `kept`
+    /// of `keeping` so far, then the contract's transactions built.
+    Downloading { kept: u32, keeping: u32 },
+    /// The hub's signatures of those transactions.
+    Signatures,
+    /// The wallet's signature of the funding.
+    Signing,
+    /// The funding, broadcast, buried deep enough: `confirmations` so
+    /// far, 0 while in no block the wallet has seen.
+    Confirming { confirmations: u32 },
 }
 
 /// How far a payout has come, step by step, as the wallet last saw it.
@@ -348,6 +445,27 @@ pub struct ContractQuote {
     pub coin: Option<u64>,
     /// What opening it downloads and keeps, in bytes, about.
     pub download: u64,
+    /// The caps and durations the wallet may choose instead, if the hub
+    /// lets it ([`Wallet::open_chosen_contract`]).
+    pub range: Option<ContractRange>,
+    /// Blocks before its close that a contract stops protecting: it
+    /// protects for its blocks less these.
+    pub after_assert: u32,
+    /// The coins on Bitcoin free to pay for one, the largest first.
+    pub coins: Vec<DepositCoin>,
+    /// What a contract chosen is at first, within the range: half again
+    /// the largest coin, for its change moved into Licash and as much
+    /// again to receive, over half a year. The fixed terms without one.
+    pub suggested_cap: u64,
+    pub suggested_blocks: u32,
+}
+
+/// A coin of the wallet's on Bitcoin.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct DepositCoin {
+    /// As `txid:vout`.
+    pub outpoint: String,
+    pub value: u64,
 }
 
 /// What the wallet holds at one hub it trusts, in sat.

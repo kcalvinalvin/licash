@@ -137,11 +137,13 @@ func (c *cdn) importFiles(dir string, held uint32) (imp *neutrino.HeadersImportC
 		_ = os.Remove(blocks)
 		_ = os.Remove(filters)
 	}
-	for path, url := range map[string]string{
-		blocks:  urls.BlockHeadersSource,
-		filters: urls.FilterHeadersSource,
+	// The block headers first, then their filters' headers: in that order
+	// always, as a map would not keep it.
+	for _, file := range [...]struct{ path, url string }{
+		{blocks, urls.BlockHeadersSource},
+		{filters, urls.FilterHeadersSource},
 	} {
-		if err := c.download(url, path); err != nil {
+		if err := c.download(file.url, file.path); err != nil {
 			remove()
 			return nil, func() {}, err
 		}

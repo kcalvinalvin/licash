@@ -15,6 +15,7 @@ class CoverTest {
     private fun contract(state: ContractState, mock: Boolean = true) = Contract(
         id = "c0", hub = "https://hub.example", state = state, mock = mock, cap = 4_096uL, price = 23_000uL,
         paidFrom = 33_000uL, protectsUntil = 1_861u, closesAt = 2_005u, funding = null, createdAt = created,
+        covers = 0uL, step = null,
     )
 
     @Test

@@ -17,7 +17,7 @@ class HubsTest {
         url = "https://hub.example", feeBase = base, feePpm = ppm, deposits = null, silent = false, mailbox = true,
         lightningPay = null, lockFee = Rate(0uL, 0uL), refundFee = Rate(0uL, 0uL), depositFee = null,
         lightning = if (lightning) LightningTerms(Rate(2uL, 5_000uL), Rate(0uL, 0uL), Range(1uL, 1_000_000uL)) else null,
-        contracts = if (contracts) ContractTerms(4_096uL, 23_000uL, 1_005u, true) else null,
+        contracts = if (contracts) ContractTerms(4_096uL, 23_000uL, 1_005u, true, null) else null,
     )
 
     @Test

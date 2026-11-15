@@ -41,7 +41,7 @@ const SPARE: u32 = 12;
 
 /// Blocks from a recovery's assertion deadline to the close on `quote`:
 /// the hub's challenge, her answer to it and the delays on what she is
-/// paid after, with [`SPARE`] blocks to confirm in; [`AFTER_ASSERT`] at
+/// paid after, with `SPARE` blocks to confirm in; [`AFTER_ASSERT`] at
 /// least.
 pub fn after_assert(quote: &Quote) -> u32 {
     let g = &quote.graph;
@@ -63,12 +63,20 @@ pub struct Ask {
     pub blocks: u32,
     /// The most she pays to open, in sat.
     pub max_price: u64,
+    /// The most notes it protects, in sat, of terms she chooses within
+    /// the hub's range (its info's), over `blocks` from the hub's quote:
+    /// none for its fixed terms.
+    pub cap: Option<u32>,
+    /// The coin she deposits: none for the smallest free that pays the
+    /// price and is large enough for the cap.
+    pub deposit: Option<OutPoint>,
 }
 
 /// Open a contract at `hub`, a hub `wallet` trusts, on its offer now:
-/// its keyset one the hub shows the wallet, its price within `ask`, her
-/// deposit the smallest coin free that pays it. Kept in `dir`, the
-/// wallet's directory, from her first message on.
+/// its keyset one the hub shows the wallet, its terms as `ask`ed, its
+/// price within it, her deposit the coin she names or else the smallest
+/// free that pays it ([`coin`]). Kept in `dir`, the wallet's directory,
+/// from her first message on.
 pub async fn open<T: Transport, C: Chain>(
     wallet: &Wallet<T>,
     chain: &C,
@@ -83,7 +91,8 @@ pub async fn open<T: Transport, C: Chain>(
         .iter()
         .find(|(url, _)| *url == hub)
         .with_context(|| format!("{hub} is no hub this wallet trusts"))?;
-    let offer = offer(wallet, &hub).await?;
+    let chosen = ask.cap.map(|cap| (cap, ask.blocks));
+    let offer = offer(wallet, &hub, chosen).await?;
     let keysets = info
         .keysets()
         .map_err(|e| anyhow!("{hub}'s keysets: {e:?}"))?;
@@ -107,8 +116,23 @@ pub async fn open<T: Transport, C: Chain>(
     let checkpoint = chain.checkpoint(at).await.map_err(|e| anyhow!(e))?;
     let wanted = wanted(&offer, tip, ask.blocks)?;
     let store = Store::open(dir)?;
-    let coin = deposit(wallet, &store, price)?
-        .with_context(|| format!("no coin on Bitcoin of {price} sat at least, free, to deposit"))?;
+    let least = least(info.contracts.and_then(|c| c.range), offer.quote.cap, price);
+    let free = free(wallet, &store)?;
+    let coin = match ask.deposit {
+        Some(named) => {
+            let coin = free.into_iter().find(|c| c.outpoint == named);
+            let coin = coin.with_context(|| format!("{named}: no coin free to deposit"))?;
+            ensure!(
+                coin.value >= least,
+                "{named}: {} sat, not {least} at least",
+                coin.value
+            );
+            coin
+        }
+        None => smallest(free, least).with_context(|| {
+            format!("no coin on Bitcoin of {least} sat at least, free, to deposit")
+        })?,
+    };
     let deposit = coin.outpoint;
     let coin = wallet
         .silent_coin_output(&deposit)?
@@ -221,31 +245,72 @@ pub fn list(dir: &Path) -> Result<Vec<Contract>> {
     }
 }
 
-/// The coin of `wallet`'s that [`open`] would deposit to pay `price`,
-/// with the contracts in `dir`: the smallest free that pays it, no other
-/// contract's deposit. None if no coin does.
+/// The coin of `wallet`'s that [`open`] would deposit of `least` sat at
+/// least ([`least`]), with the contracts in `dir`: the smallest free.
+/// None if no coin does.
 pub fn coin<T: Transport>(
     wallet: &Wallet<T>,
     dir: &Path,
-    price: u64,
+    least: u64,
 ) -> Result<Option<SilentCoin>> {
-    match Store::existing(dir)? {
-        Some(store) => deposit(wallet, &store, price),
-        None => deposit_from(wallet, &[], price),
+    Ok(smallest(coins(wallet, dir)?, least))
+}
+
+/// The coins of `wallet`'s free to deposit, with the contracts in `dir`:
+/// confirmed on Bitcoin, unspent and no other contract's deposit, the
+/// largest first.
+pub fn coins<T: Transport>(wallet: &Wallet<T>, dir: &Path) -> Result<Vec<SilentCoin>> {
+    let mut coins = match Store::existing(dir)? {
+        Some(store) => free(wallet, &store)?,
+        None => free_of(wallet, &[])?,
+    };
+    coins.sort_by_key(|c| std::cmp::Reverse(c.value));
+    Ok(coins)
+}
+
+/// The least a coin she deposits holds: the price, and for a cap she
+/// chose within a hub's `range`, the cap over the times her coin it may
+/// be ([`licash_api::ContractRange::per_coin`]).
+pub fn least(range: Option<licash_api::ContractRange>, cap: u32, price: u64) -> u64 {
+    let per_coin = range.map_or(0, |r| u64::from(r.per_coin));
+    match per_coin {
+        0 => price,
+        k => price.max(u64::from(cap).div_ceil(k)),
     }
 }
 
-/// The offer of `hub` now.
-pub async fn offer<T: Transport>(wallet: &Wallet<T>, hub: &str) -> Result<Offer> {
-    let url = format!("{}{QUOTE}", hub.trim_end_matches('/'));
+/// The offer of `hub` now: of `chosen` terms, a cap in sat over blocks,
+/// if any, else its fixed ones. Refused unless of those terms exactly,
+/// as a hub offering no others answers.
+pub async fn offer<T: Transport>(
+    wallet: &Wallet<T>,
+    hub: &str,
+    chosen: Option<(u32, u32)>,
+) -> Result<Offer> {
+    let mut url = format!("{}{QUOTE}", hub.trim_end_matches('/'));
+    if let Some((cap, blocks)) = chosen {
+        url.push_str(&format!("?cap={cap}&blocks={blocks}"));
+    }
     let response = wallet.transport().request(&url, None).await;
     let response = response.map_err(|e| anyhow!("{hub}: {e}"))?;
     ensure!(
         response.status == 200,
-        "{hub} offers no contracts: status {}",
+        "{hub} offers no contracts{}: status {}",
+        match chosen {
+            Some((cap, blocks)) => format!(" of {cap} sat over {blocks} blocks"),
+            None => String::new(),
+        },
         response.status
     );
-    Offer::decode(&response.body).with_context(|| format!("{hub}'s offer"))
+    let offer = Offer::decode(&response.body).with_context(|| format!("{hub}'s offer"))?;
+    if let Some((cap, blocks)) = chosen {
+        let (quoted, lock) = (offer.quote.cap, offer.bounds.lock);
+        ensure!(
+            (quoted, lock) == (cap, blocks),
+            "{hub} offers contracts of {quoted} sat over {lock} blocks, not {cap} over {blocks}"
+        );
+    }
+    Ok(offer)
 }
 
 /// Her deadlines on `offer` at `tip`: the close `blocks` ahead, no later
@@ -271,31 +336,30 @@ fn wanted(offer: &Offer, tip: u32, blocks: u32) -> Result<Wanted> {
     })
 }
 
-/// The smallest coin of `wallet` that pays `price`, free and no other
+/// The coins of `wallet` free to deposit: unspent and no other
 /// contract's deposit.
-fn deposit<T: Transport>(
-    wallet: &Wallet<T>,
-    store: &Store,
-    price: u64,
-) -> Result<Option<SilentCoin>> {
+fn free<T: Transport>(wallet: &Wallet<T>, store: &Store) -> Result<Vec<SilentCoin>> {
     let taken: Vec<OutPoint> = store
         .list()?
         .into_iter()
         .filter(|c| c.abandoned.is_none() && c.fate != Some(Fate::Dead))
         .map(|c| c.deposit)
         .collect();
-    deposit_from(wallet, &taken, price)
+    free_of(wallet, &taken)
 }
 
-fn deposit_from<T: Transport>(
-    wallet: &Wallet<T>,
-    taken: &[OutPoint],
-    price: u64,
-) -> Result<Option<SilentCoin>> {
+fn free_of<T: Transport>(wallet: &Wallet<T>, taken: &[OutPoint]) -> Result<Vec<SilentCoin>> {
     let mut coins = wallet.silent_coins()?;
-    coins.retain(|c| c.spending.is_none() && c.value >= price && !taken.contains(&c.outpoint));
-    coins.sort_by_key(|c| c.value);
-    Ok(coins.into_iter().next())
+    coins.retain(|c| c.spending.is_none() && !taken.contains(&c.outpoint));
+    Ok(coins)
+}
+
+/// The smallest of `coins` of `least` sat at least.
+fn smallest(coins: Vec<SilentCoin>, least: u64) -> Option<SilentCoin> {
+    coins
+        .into_iter()
+        .filter(|c| c.value >= least)
+        .min_by_key(|c| c.value)
 }
 
 /// Watch the F of the opening `driver` drives, once she signed it: its
@@ -396,12 +460,13 @@ mod tests {
         let regtest = ChainProfile::Core30DefaultRegtest;
         let signet = ChainProfile::Core30Signet;
         for profile in [regtest, signet] {
-            let timing = Timing::of(profile).unwrap();
+            let timing = Timing::of(profile, None).unwrap();
             let checkpoint = Checkpoint::genesis(profile).unwrap();
             let tip = checkpoint.height();
+            let quote = timing.quote(keyset.clone(), checkpoint);
             let offer = Offer {
-                quote: timing.quote(keyset.clone(), checkpoint),
-                bounds: timing.bounds,
+                bounds: timing.bounds(&quote),
+                quote,
             };
             offer.quote.check(profile).unwrap();
             let wanted = wanted(&offer, tip, LOCK).unwrap();
@@ -428,14 +493,67 @@ mod tests {
         // Regtest's as before; signet's 180 blocks after asserting, of
         // its 1 000, and 12 to respond.
         let gap = |profile| {
-            let timing = Timing::of(profile).unwrap();
+            let timing = Timing::of(profile, None).unwrap();
             let quote = timing.quote(keyset.clone(), Checkpoint::genesis(profile).unwrap());
-            (after_assert(&quote), timing.bounds.response_window)
+            (after_assert(&quote), timing.bounds(&quote).response_window)
         };
         assert_eq!(gap(regtest), (AFTER_ASSERT, 2));
         assert_eq!(gap(signet), (180, 12));
         for profile in [ChainProfile::Core30Mainnet, ChainProfile::Mutinynet] {
-            assert!(Timing::of(profile).is_err());
+            assert!(Timing::of(profile, None).is_err());
+        }
+    }
+
+    /// Of terms she chose within the hub's range, the fewest blocks it
+    /// lets her ask for and the most leave each window whole too, on a
+    /// quote as old as the hub takes one (6 blocks).
+    #[cfg(feature = "node")]
+    #[test]
+    fn her_deadlines_leave_each_window_whole_on_terms_she_chose() {
+        use crate::hub::terms::{Range, Timing, CAP};
+        let keyset = licash::note::IssuerKeys::from_seed(&[1; 32], 0, 4).unwrap();
+        let keyset = keyset.keyset().unwrap();
+        let range = Range {
+            max_cap: 100_000_000,
+            max_blocks: 26_280,
+            per_coin: 2,
+            ppm_year: 10_000,
+        };
+        for profile in [
+            ChainProfile::Core30DefaultRegtest,
+            ChainProfile::Core30Signet,
+        ] {
+            let timing = Timing::of(profile, Some(range)).unwrap();
+            let r = timing.range().unwrap();
+            let checkpoint = Checkpoint::genesis(profile).unwrap();
+            for (cap, blocks) in [
+                (CAP, r.min_blocks),
+                (15_000_000, 26_280),
+                (r.max_cap, r.max_blocks),
+            ] {
+                let quote = timing.quote_for(keyset.clone(), checkpoint.clone(), cap, blocks);
+                quote.check(profile).unwrap();
+                let offer = Offer {
+                    bounds: timing.bounds(&quote),
+                    quote,
+                };
+                let (g, c) = (&offer.quote.graph, &offer.quote.chain);
+                for age in [0, 6] {
+                    let tip = checkpoint.height() + age;
+                    let wanted = wanted(&offer, tip, blocks).unwrap();
+                    offer.bounds.check(&wanted, tip).unwrap();
+                    // Her headers reach the assertion deadline.
+                    assert!(checkpoint.height() + c.max_headers >= wanted.assert_height);
+                    let window = u32::from(wanted.response_window);
+                    let delay = u32::from(g.to_self_delay);
+                    let gate =
+                        c.funding_depth + delay + c.request_depth + window + g.deadline_margin;
+                    let before = wanted.assert_height - tip;
+                    assert!(before >= gate, "{profile} {blocks}: {before} blocks");
+                }
+            }
+            // One block fewer than the least leaves less than that.
+            assert!(timing.allows(CAP, r.min_blocks - 1).is_err());
         }
     }
 
