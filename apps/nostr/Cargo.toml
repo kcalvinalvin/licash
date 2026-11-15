@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 async-wsocket = { version = "0.17", default-features = false, optional = true }
+bitcoin = { version = "=0.32.102", default-features = false, features = ["std"], optional = true }
 futures-util = { version = "0.3", default-features = false, features = ["alloc", "sink"], optional = true }
 licash-api = { workspace = true, optional = true }
 licash-tor = { workspace = true, optional = true }
@@ -28,4 +29,4 @@ tempfile = "3.27"
 # Reach relays through a Tor client of the application's own.
 tor = ["dep:async-wsocket", "dep:futures-util", "dep:licash-tor", "dep:tokio-tungstenite"]
 # Pay payment codes and take the mailbox's payments with a Licash wallet.
-wallet = ["dep:futures-util", "dep:licash-api", "dep:licash-wallet"]
+wallet = ["dep:bitcoin", "dep:futures-util", "dep:licash-api", "dep:licash-wallet"]

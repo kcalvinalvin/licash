@@ -3820,6 +3820,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "async-wsocket",
+ "bitcoin",
  "futures-util",
  "licash-api",
  "licash-tor",

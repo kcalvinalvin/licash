@@ -7,6 +7,7 @@ use anyhow::Context;
 use bitcoin::FeeRate;
 use licash_api::swaps::State;
 use licash_e2e::{until, Eco};
+use licash_nostr::{wallet::payout_providers, Route};
 use licash_wallet::{LockState, PayoutState};
 use serde_json::json;
 
@@ -49,9 +50,26 @@ async fn notes_are_paid_out_to_a_bitcoin_address_through_the_provider() -> anyho
     eco.pay_in(&alice, hub1, 30_000).await?;
     let payee = eco.miner_address("bech32m").await?;
     let rate = FeeRate::from_sat_per_vb_u32(1);
+    // Found on the relay it announces itself on, as the app finds it.
+    let relays = [eco.relay().to_owned()];
+    let found = payout_providers(
+        &alice,
+        &relays,
+        &Route::Direct,
+        (hub1, &payee),
+        10_000,
+        (3_000, rate),
+    )
+    .await?;
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(
+        (found[0].url.as_str(), found[0].known),
+        (eco.swaps(), false)
+    );
     let quote = alice
         .payout_quote(eco.swaps(), hub1, &payee, 10_000, 3_000, rate)
         .await?;
+    assert_eq!(found[0].quote, quote);
     let payout = alice
         .payout(eco.swaps(), hub1, &payee, 10_000, 3_000, rate)
         .await?;
@@ -126,5 +144,16 @@ async fn notes_are_paid_out_to_a_bitcoin_address_through_the_provider() -> anyho
         .unwrap_err();
     assert!(matches!(e, licash_wallet::Error::Invalid(_)), "{e}");
     assert_eq!(alice.payouts()?.len(), 1);
+    // Paid out through before: found first from now on.
+    let found = payout_providers(
+        &alice,
+        &relays,
+        &Route::Direct,
+        (hub1, &payee),
+        10_000,
+        (3_000, rate),
+    )
+    .await?;
+    assert!(found[0].known, "{found:?}");
     Ok(())
 }

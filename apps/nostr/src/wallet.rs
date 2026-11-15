@@ -1,17 +1,19 @@
 //! A [`Wallet`]'s payments through mailboxes: paying a payment code, and
 //! taking what its own mailbox holds; and the swap providers announced
-//! that swap between two of its hubs.
+//! that swap between two of its hubs, or pay notes out on Bitcoin.
 
-use std::{collections::HashSet, time::Duration};
+use std::{collections::HashSet, future::Future, time::Duration};
 
 use anyhow::bail;
+use bitcoin::FeeRate;
 use futures_util::future::join_all;
 use licash_api::Payment;
 use licash_wallet::{
-    Error, HubId, Paid, PaymentCode, Received, SwapLimits, SwapQuote, SwapState, Transport, Wallet,
+    Error, HubId, Paid, PaymentCode, PayoutQuote, PayoutState, Received, SwapLimits, SwapQuote,
+    SwapState, Transport, Wallet,
 };
 
-use crate::{mailbox, Role, Route};
+use crate::{mailbox, Found, Role, Route};
 
 /// How long a swap provider announced has to answer at a URL.
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(30);
@@ -381,38 +383,118 @@ pub async fn swap_providers<T: Transport>(
         .filter(|s| s.state == SwapState::Done)
         .map(|s| s.provider)
         .collect();
-    let used = &used;
+    let ask = |url: String| async move { wallet.swap_quote(&url, from, to, amount, limits).await };
+    let answering = answering(found, ask, |q: &SwapQuote| q.info.nostr.as_deref()).await?;
+    let mut providers: Vec<SwapProvider> = answering
+        .into_iter()
+        .map(|(service, url, quote)| SwapProvider {
+            known: known(&service, &used),
+            url,
+            key: service.key,
+            name: service.announcement.name,
+            quote,
+        })
+        .collect();
+    // Stable: the newest announced first among equals.
+    providers.sort_by_key(|p| (!p.known, p.quote.fee, p.quote.info.margin));
+    Ok(providers)
+}
+
+/// A swap provider announced on Nostr that pays notes out on Bitcoin, and
+/// what it asks for a payout.
+#[derive(Clone, Debug)]
+pub struct PayoutProvider {
+    /// The first URL announced that answered as the provider.
+    pub url: String,
+    /// The key that announced it, x-only in hex.
+    pub key: String,
+    pub name: Option<String>,
+    pub quote: PayoutQuote,
+    /// Whether the wallet paid out through it before.
+    pub known: bool,
+}
+
+/// The swap providers announced on `relays` for `wallet`'s network, asked
+/// through `route`, that pay `amount` out to `to`, an address on Bitcoin,
+/// from notes at hub `from`, added, within `max_fee`, a claim confirming
+/// soon at `rate` ([`Wallet::payout_quote`]). Each is at the first URL it
+/// was announced at that answers as the key that announced it. Those the
+/// wallet paid out through before first, then the cheapest.
+pub async fn payout_providers<T: Transport>(
+    wallet: &Wallet<T>,
+    relays: &[String],
+    route: &Route,
+    (from, to): (&str, &str),
+    amount: u64,
+    (max_fee, rate): (u64, FeeRate),
+) -> anyhow::Result<Vec<PayoutProvider>> {
+    let network = wallet.network().name();
+    let found = crate::discover(relays, route, Role::Swaps, network).await?;
+    let used: HashSet<String> = wallet
+        .payouts()?
+        .into_iter()
+        .filter(|p| p.state == PayoutState::Done)
+        .map(|p| p.provider)
+        .collect();
+    let ask = |url: String| async move {
+        let quote = wallet.payout_quote(&url, from, to, amount, max_fee, rate);
+        quote.await
+    };
+    let answering = answering(found, ask, |q: &PayoutQuote| q.info.nostr.as_deref()).await?;
+    let mut providers: Vec<PayoutProvider> = answering
+        .into_iter()
+        .map(|(service, url, quote)| PayoutProvider {
+            known: known(&service, &used),
+            url,
+            key: service.key,
+            name: service.announcement.name,
+            quote,
+        })
+        .collect();
+    // Stable: the newest announced first among equals.
+    providers.sort_by_key(|p| (!p.known, p.quote.costs()));
+    Ok(providers)
+}
+
+/// Whether `service` announced a URL of those in `used`.
+fn known(service: &Found, used: &HashSet<String>) -> bool {
+    let mut urls = service.announcement.urls.iter();
+    urls.any(|u| used.contains(u.trim().trim_end_matches('/')))
+}
+
+/// Each service of `found` at the first URL it announced whose answer to
+/// `ask` names the key that announced it (as `nostr` reads it), with that
+/// answer: only then may its URL be used. The others are skipped, as are
+/// those not answering in time, but [`Error::UnknownHub`] fails them all:
+/// no service is one to ask.
+async fn answering<Q, Fut>(
+    found: Vec<Found>,
+    ask: impl Fn(String) -> Fut,
+    nostr: fn(&Q) -> Option<&str>,
+) -> Result<Vec<(Found, String, Q)>, Error>
+where
+    Fut: Future<Output = Result<Q, Error>>,
+{
+    let ask = &ask;
     let asked = found.into_iter().map(|service| async move {
+        let mut answered = None;
         for url in &service.announcement.urls {
-            let quote = wallet.swap_quote(url, from, to, amount, limits);
-            match tokio::time::timeout(ANSWER_TIMEOUT, quote).await {
-                Ok(Ok(quote)) if service.named_by(quote.info.nostr.as_deref()) => {
-                    let urls = service.announcement.urls.iter();
-                    let known = urls
-                        .map(|u| u.trim().trim_end_matches('/'))
-                        .any(|u| used.contains(u));
-                    return Ok(Some(SwapProvider {
-                        url: url.clone(),
-                        key: service.key,
-                        name: service.announcement.name,
-                        quote,
-                        known,
-                    }));
+            match tokio::time::timeout(ANSWER_TIMEOUT, ask(url.clone())).await {
+                Ok(Ok(answer)) if service.named_by(nostr(&answer)) => {
+                    answered = Some((url.clone(), answer));
+                    break;
                 }
                 Ok(Ok(_)) => tracing::warn!(%url, "skipped: not the provider that announced it"),
-                // Not a provider of the wallet's to ask: none is.
                 Ok(Err(e @ Error::UnknownHub(_))) => return Err(e),
                 Ok(Err(e)) => tracing::debug!(%url, "skipped: {e}"),
                 Err(_) => tracing::debug!(%url, "skipped: no answer in time"),
             }
         }
-        Ok(None)
+        Ok(answered.map(|(url, answer)| (service, url, answer)))
     });
-    let mut providers = Vec::new();
+    let mut answering = Vec::new();
     for asked in join_all(asked).await {
-        providers.extend(asked?);
+        answering.extend(asked?);
     }
-    // Stable: the newest announced first among equals.
-    providers.sort_by_key(|p| (!p.known, p.quote.fee, p.quote.info.margin));
-    Ok(providers)
+    Ok(answering)
 }
