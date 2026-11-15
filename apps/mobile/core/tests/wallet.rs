@@ -1327,6 +1327,73 @@ fn a_phone_paying_now_answers_once_paid_and_mails_it_and_unlinks_after() {
 }
 
 #[test]
+fn a_phone_keeps_contacts_by_name_one_to_each_wallet() {
+    let net = Net::new(true);
+    let alice = net.wallet("alice", net.height());
+    let bob = net.wallet("bob", net.height());
+    let carol = net.wallet("carol", net.height());
+    assert!(alice.contacts().unwrap().is_empty());
+
+    // Bob's code asking 500: kept asking nothing, paid at his silent
+    // payment address on Bitcoin rather than at a fallback address reused.
+    let asking = bob.payment_code(Some(500)).unwrap();
+    let kept = alice.save_contact(" Bob ".into(), asking.text).unwrap();
+    assert_eq!(kept.name, "Bob");
+    let code: PaymentCode = kept.code.parse().unwrap();
+    assert_eq!((code.amount, &code.address), (None, &None));
+    assert!(code.silent.is_some() && code.licash.is_some(), "{code:?}");
+    assert!(matches!(
+        alice.scanned(kept.code.clone()).unwrap(),
+        Scanned::Code {
+            amount: None,
+            notes: true
+        }
+    ));
+    // Whom another of his codes pays: Bob.
+    let open = bob.payment_code(None).unwrap();
+    assert_eq!(
+        alice.contact_of(open.text.clone()).unwrap(),
+        Some(kept.clone())
+    );
+    let carols = carol.payment_code(None).unwrap();
+    assert_eq!(alice.contact_of(carols.text.clone()).unwrap(), None);
+    assert_eq!(alice.contact_of("garbage".into()).unwrap(), None);
+
+    // Another wallet under his name: refused. His again: renamed.
+    let taken = invalid(alice.save_contact("bob".into(), carols.text.clone()));
+    assert!(taken.contains("another contact's name"), "{taken}");
+    alice.save_contact("Carol".into(), carols.text).unwrap();
+    alice.save_contact("Bobby".into(), open.text).unwrap();
+    let names: Vec<String> = alice
+        .contacts()
+        .unwrap()
+        .into_iter()
+        .map(|c| c.name)
+        .collect();
+    assert_eq!(names, ["Bobby", "Carol"]);
+
+    // Codes paying on Bitcoin only, or on another chain: no contacts.
+    let address = bob.bitcoin_address().unwrap();
+    assert!(invalid(alice.save_contact("Dan".into(), address)).contains("paid in notes"));
+    let elsewhere = Wallet::create(net.dir("mainnet"), Network::Bitcoin, 0, false).unwrap();
+    let mainnet = elsewhere.payment_code(None).unwrap();
+    assert!(invalid(alice.save_contact("Eve".into(), mainnet.text)).contains("not on"));
+    assert!(
+        invalid(alice.save_contact(" ".into(), carol.payment_code(None).unwrap().text))
+            .contains("a name")
+    );
+
+    // Forgotten, and kept so: opened again, the same.
+    alice.remove_contact("Carol".into()).unwrap();
+    alice.remove_contact("nobody".into()).unwrap();
+    let left = alice.contacts().unwrap();
+    assert_eq!(left.len(), 1);
+    drop(alice);
+    let alice = Wallet::open(net.dir("alice"), false).unwrap();
+    assert_eq!(alice.contacts().unwrap(), left);
+}
+
+#[test]
 fn a_phone_shows_the_notes_each_line_of_its_history_spent_and_made() {
     let net = Net::new(true);
     let light = Light::new(&net);

@@ -38,10 +38,13 @@ const SCAN_BATCH: u32 = 144;
 /// A day, in seconds.
 const DAY: i64 = 86_400;
 
+mod contacts;
 mod contracts;
 mod moves;
 mod payouts;
 mod recoveries;
+
+pub use contacts::Contact;
 
 /// A wallet, kept in a directory of its own.
 #[derive(uniffi::Object)]

@@ -13,7 +13,7 @@ mod wallet;
 
 pub use chain::{ChainError, ChainSource};
 pub use log::{set_logger, Logger};
-pub use wallet::{wallet_exists, Wallet};
+pub use wallet::{wallet_exists, Contact, Wallet};
 
 uniffi::setup_scaffolding!();
 
