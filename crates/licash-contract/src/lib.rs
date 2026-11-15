@@ -3,6 +3,7 @@
 //! a hub, each with its own `keys`, over `wire`'s messages. The regtest
 //! suite (`regtest/`) plays it on Bitcoin Core.
 
+pub mod close;
 pub mod graph;
 pub mod keys;
 pub mod opening;
