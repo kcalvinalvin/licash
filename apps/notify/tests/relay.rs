@@ -314,6 +314,23 @@ async fn only_the_kinds_asked_for_are_sent() {
 }
 
 #[tokio::test]
+async fn kinds_passed_over_are_not_sent_and_the_rest_are() {
+    let dir = tempfile::tempdir().unwrap();
+    let cursors = dir.path().join("notify.json");
+    let outbox = Arc::new(Fake::default());
+    let hook = Hook::start().await;
+    let relay = relay(&outbox, vec![hook.target()], &cursors).except(["locked".to_owned()]);
+    let _running = run(relay);
+    until("started", || cursor(&cursors, &hook.target()) == Some(0)).await;
+    // A kind no version knows yet is sent too.
+    for kind in ["locked", "settled", "minted", "locked"] {
+        outbox.push(kind);
+    }
+    until("recorded", || cursor(&cursors, &hook.target()) == Some(4)).await;
+    assert_eq!(hook.titles(), titles([2, 3]));
+}
+
+#[tokio::test]
 async fn alerts_go_to_every_target_and_give_up() {
     let dir = tempfile::tempdir().unwrap();
     let outbox = Arc::new(Fake::default());

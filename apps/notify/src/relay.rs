@@ -61,11 +61,28 @@ const ALERT_TRIES: u32 = 3;
 pub struct Relay {
     outbox: Arc<dyn Outbox>,
     targets: Arc<[Target]>,
-    kinds: Option<Arc<BTreeSet<String>>>,
+    kinds: Arc<Kinds>,
     new_after: Option<u64>,
     cursors: Arc<Cursors>,
     client: reqwest::Client,
     timing: Timing,
+}
+
+/// The kinds of event a relay notifies of.
+enum Kinds {
+    All,
+    Only(BTreeSet<String>),
+    Except(BTreeSet<String>),
+}
+
+impl Kinds {
+    fn wants(&self, kind: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::Only(kinds) => kinds.contains(kind),
+            Self::Except(kinds) => !kinds.contains(kind),
+        }
+    }
 }
 
 impl Relay {
@@ -79,7 +96,7 @@ impl Relay {
         Ok(Self {
             outbox,
             targets: targets.into(),
-            kinds: None,
+            kinds: Arc::new(Kinds::All),
             new_after: None,
             cursors: Arc::new(Cursors::load(cursors)?),
             client: crate::client()?,
@@ -89,7 +106,14 @@ impl Relay {
 
     /// Notify only of events of `kinds`; the others are passed over.
     pub fn only(mut self, kinds: impl IntoIterator<Item = String>) -> Self {
-        self.kinds = Some(Arc::new(kinds.into_iter().collect()));
+        self.kinds = Arc::new(Kinds::Only(kinds.into_iter().collect()));
+        self
+    }
+
+    /// Notify of events of any kind but `kinds`, those of a later version
+    /// of the service included; the others are passed over.
+    pub fn except(mut self, kinds: impl IntoIterator<Item = String>) -> Self {
+        self.kinds = Arc::new(Kinds::Except(kinds.into_iter().collect()));
         self
     }
 
@@ -197,7 +221,7 @@ impl Relay {
             let mut sent = false;
             for item in page {
                 after = item.seq;
-                if self.kinds.as_ref().is_none_or(|k| k.contains(&item.kind)) {
+                if self.kinds.wants(&item.kind) {
                     self.send(target, &item.message).await;
                     self.record(target, id, after).await;
                     sent = true;

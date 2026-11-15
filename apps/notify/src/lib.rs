@@ -34,15 +34,39 @@ impl Message {
 
 /// `amount` sat as an operator reads it: `12,345 sat`.
 pub fn sat(amount: u64) -> String {
-    let digits = amount.to_string();
-    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3 + 4);
+    grouped(amount) + " sat"
+}
+
+/// `amount` sat, signed: `-1,234 sat`.
+pub fn sat_signed(amount: i64) -> String {
+    let sign = if amount < 0 { "-" } else { "" };
+    format!("{sign}{}", sat(amount.unsigned_abs()))
+}
+
+/// `amount` sat and its rate of `of` in parts per million, rounded:
+/// `106 sat (2,120 ppm)`. No rate of nothing.
+pub fn sat_ppm(amount: i64, of: u64) -> String {
+    if of == 0 {
+        return sat_signed(amount);
+    }
+    let of = u128::from(of);
+    let rate = (u128::from(amount.unsigned_abs()) * 1_000_000 + of / 2) / of;
+    let rate = u64::try_from(rate).unwrap_or(u64::MAX);
+    let sign = if amount < 0 && rate > 0 { "-" } else { "" };
+    format!("{} ({sign}{} ppm)", sat_signed(amount), grouped(rate))
+}
+
+/// `n` with commas between thousands.
+fn grouped(n: u64) -> String {
+    let digits = n.to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
     for (i, digit) in digits.chars().enumerate() {
         if i > 0 && (digits.len() - i).is_multiple_of(3) {
             grouped.push(',');
         }
         grouped.push(digit);
     }
-    grouped + " sat"
+    grouped
 }
 
 /// `id` cut to its first 12 characters, as the dashboards show it.
@@ -84,6 +108,23 @@ mod tests {
         assert_eq!(sat(123_456), "123,456 sat");
         assert_eq!(sat(1_234_567), "1,234,567 sat");
         assert_eq!(sat(u64::MAX), "18,446,744,073,709,551,615 sat");
+    }
+
+    #[test]
+    fn signed_amounts_and_rates_in_ppm() {
+        assert_eq!(sat_signed(-1_234), "-1,234 sat");
+        assert_eq!(sat_signed(5), "5 sat");
+        assert_eq!(sat_ppm(106, 50_000), "106 sat (2,120 ppm)");
+        assert_eq!(sat_ppm(-55, 50_000), "-55 sat (-1,100 ppm)");
+        // Rounded to the nearest part.
+        assert_eq!(sat_ppm(1, 3), "1 sat (333,333 ppm)");
+        assert_eq!(sat_ppm(2, 3), "2 sat (666,667 ppm)");
+        assert_eq!(sat_ppm(0, 7), "0 sat (0 ppm)");
+        assert_eq!(sat_ppm(5, 0), "5 sat");
+        assert_eq!(
+            sat_ppm(i64::MIN, 1),
+            "-9,223,372,036,854,775,808 sat (-18,446,744,073,709,551,615 ppm)"
+        );
     }
 
     #[test]
