@@ -212,6 +212,7 @@ async fn used(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     lightning(eco, phone).await?;
     refused(eco, phone, &bobs).await?;
     hub_down(eco, phone, &bob, &bobs).await?;
+    visited(eco, phone).await?;
 
     // Started again: at once, holding the same.
     let held = phone.balance().await?;
@@ -244,6 +245,49 @@ async fn refused(eco: &Eco, phone: &Phone, bobs: &PaymentCode) -> anyhow::Result
     phone.tap("Cancel").await?;
     phone.wait("Receive", 10).await?;
     ensure!(phone.balance().await? == held, "spent refusing");
+    Ok(())
+}
+
+/// A code naming only a hub it does not use, saying where to reach it:
+/// paid there once asked and reviewed, a swap bringing notes there from
+/// its hub. What the swap brought past the payment shows apart until the
+/// hub is added.
+async fn visited(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
+    eco.stock(5_000).await?;
+    let held = phone.balance().await?;
+    let dave = eco.wallet("dave")?;
+    dave.add_hub(eco.hub(2)).await?;
+    let mut daves = dave.payment_code(&[eco.hub(2).to_owned()], false)?;
+    // Less than the provider swaps at least: some is left there.
+    daves.amount = Some(800);
+    phone.link(&daves.to_string()).await?;
+    phone.tap("Pay there").await?;
+    phone.wait_any(&["Fee up to", "No fee"], 30).await?;
+    phone.tap("Pay").await?;
+    phone.wait("Paid at", 120).await?;
+    phone.wait("Moves", 10).await?;
+    phone.tap("Pay").await?;
+    phone.wait("Sent", 180).await?;
+    phone.tap("Done").await?;
+    ensure!(
+        collected(&dave, 60).await? == 800,
+        "Dave got other than 800"
+    );
+    let after = changed(phone, held, 30).await?;
+    ensure!(
+        held - after > 800,
+        "{} spent swapping for 800",
+        held - after
+    );
+
+    phone.tap("Where it is").await?;
+    phone.wait("At hubs you have not added", 30).await?;
+    phone.tap("Add this hub").await?;
+    phone.wait("Add this hub?", 10).await?;
+    phone.tap("Add").await?;
+    phone.tap("Back").await?;
+    let now = changed(phone, after, 60).await?;
+    ensure!(now > after, "{now} held once the hub was added");
     Ok(())
 }
 
