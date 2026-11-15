@@ -477,6 +477,36 @@ pub struct Provider<T: Transport> {
     issuer: Option<Arc<Issuer>>,
 }
 
+/// The swaps into the provider's own hub under way, whose clients' locks
+/// back the hub's: those the provider follows until it claimed them.
+const OWN_UNDER_WAY: &str = "kind = 'own' AND state IN ('accepted', 'locked', 'paid')";
+
+/// Which of `hashes` the swaps file at `path`, if there is one, holds swaps
+/// into the provider's own hub under way of: the hub's locks under them are
+/// backed by the clients' locks the provider claims. Read only, beside the
+/// provider running on the file or without it.
+pub fn backing_own(path: &Path, hashes: &[[u8; 32]]) -> Result<HashSet<[u8; 32]>, Error> {
+    let mut found = HashSet::new();
+    if !path.is_file() {
+        return Ok(found);
+    }
+    let conn = rusqlite::Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    conn.busy_timeout(std::time::Duration::from_secs(10))?;
+    conn.pragma_update(None, "query_only", true)?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT 1 FROM swaps WHERE hash = ?1 AND {OWN_UNDER_WAY}"
+    ))?;
+    for hash in hashes {
+        if stmt.exists([hash])? {
+            found.insert(*hash);
+        }
+    }
+    Ok(found)
+}
+
 /// Setup and what the provider says of itself.
 impl<T: Transport> Provider<T> {
     /// A new swaps file at `path`, for the provider of `wallet`.
@@ -552,8 +582,7 @@ impl<T: Transport> Provider<T> {
     fn open_own(&self) -> Result<u64, Error> {
         self.store.read(|c| {
             Ok(c.query_row(
-                "SELECT count(*) FROM swaps WHERE kind = 'own'
-                 AND state IN ('accepted', 'locked', 'paid')",
+                &format!("SELECT count(*) FROM swaps WHERE {OWN_UNDER_WAY}"),
                 [],
                 |r| r.get::<_, i64>(0),
             )? as u64)

@@ -669,6 +669,13 @@ enum Command {
         #[arg(long, env = "LICASH_HUB_ONION",
               value_parser = clap::builder::BoolishValueParser::new())]
         onion: bool,
+        /// Run even though own locks of the hub, which it may yet pay, are
+        /// backed by no deposit, Lightning receipt or swap it keeps, as
+        /// once such a file was restored older than `hub.sqlite`: alerting
+        /// the operator, rather than refusing to start.
+        #[arg(long, env = "LICASH_HUB_ALLOW_UNBACKED_LOCKS",
+              value_parser = clap::builder::BoolishValueParser::new())]
+        allow_unbacked_locks: bool,
         /// Notify only of these kinds of event [default: all].
         #[arg(long, value_name = "KIND", env = "LICASH_HUB_NOTIFY_KINDS", value_delimiter = ',',
               value_parser = clap::builder::PossibleValuesParser::new(notify::KINDS))]
@@ -749,6 +756,7 @@ fn command(cli: Cli) -> anyhow::Result<()> {
             announce,
             swaps,
             onion,
+            allow_unbacked_locks,
             notify_kinds,
         } => {
             let policy = policy.policy();
@@ -903,6 +911,8 @@ fn command(cli: Cli) -> anyhow::Result<()> {
                 }
                 _ => None,
             };
+            // Once the files of what backs them are open, and up to date.
+            check_backed(&hub, &cli.data, allow_unbacked_locks)?;
             let swaps = match &swapping {
                 Some(Swapping { provider, .. }) => {
                     let nostr = match &announcing {
@@ -1018,6 +1028,78 @@ fn check_idle(dir: &Path) -> anyhow::Result<()> {
     let wallet = Wallet::open(&wallet, Http::new(None)?).context(off)?;
     Provider::open(&swaps, wallet, SwapsConfig::default()).context(off)?;
     tracing::warn!(dir = %dir.display(), "{off}: the swap provider takes no swaps");
+    Ok(())
+}
+
+/// Refuse to run, unless `allow`ed, while own locks of `hub` it may yet pay
+/// are backed by no deposit, Lightning receipt or swap under way in `data`:
+/// each was recorded before its lock, so such a file was restored older
+/// than `hub.sqlite`, or lost, and the hub would pay the notes it locked
+/// without collecting what was paid for them. Allowed, the operator is
+/// alerted. Opens no file while no own lock is live.
+fn check_backed(hub: &Hub, data: &Path, allow: bool) -> anyhow::Result<()> {
+    let live = hub.live_own_locks().context("read the hub's own locks")?;
+    if live.is_empty() {
+        return Ok(());
+    }
+    let hashes: Vec<[u8; 32]> = live
+        .iter()
+        .filter_map(|lock| Some(*lock.proposal.lock()?.terms().hash()))
+        .collect();
+    let (deposits, receipts) = (data.join("deposits.sqlite"), data.join("lightning.sqlite"));
+    let swaps = data.join("swaps").join("swaps.sqlite");
+    let mut backed = std::collections::HashSet::new();
+    let mut unreadable = Vec::new();
+    let mut read = |path: &Path, found: Result<_, String>| match found {
+        Ok(found) => backed.extend(found),
+        Err(e) => unreadable.push(format!("{} ({e})", path.display())),
+    };
+    let held = deposit::Gateway::holding(&deposits, &hashes).map_err(|e| e.to_string());
+    read(&deposits, held);
+    let held = Gateway::holding(&receipts, &hashes).map_err(|e| e.to_string());
+    read(&receipts, held);
+    let held = licash_swaps::backing_own(&swaps, &hashes).map_err(|e| e.to_string());
+    read(&swaps, held);
+    let unbacked: Vec<String> = live
+        .iter()
+        .filter_map(|lock| {
+            let terms = lock.proposal.lock()?.terms();
+            if backed.contains(terms.hash()) {
+                return None;
+            }
+            let amount: u64 = lock
+                .proposal
+                .outputs()
+                .iter()
+                .map(|o| o.denomination())
+                .sum();
+            Some(format!(
+                "lock {} under hash {}, {amount} sat, expiring at {}",
+                hex::encode(lock.proposal.id().as_bytes()),
+                hex::encode(terms.hash()),
+                terms.expiry()
+            ))
+        })
+        .collect();
+    if unbacked.is_empty() {
+        return Ok(());
+    }
+    let mut message = format!(
+        "{} own locks of the hub, which it may yet pay, are backed by no deposit, Lightning \
+         receipt or swap under way in {}: {}. Restore deposits.sqlite, lightning.sqlite and \
+         swaps/swaps.sqlite as recent as hub.sqlite.",
+        unbacked.len(),
+        data.display(),
+        unbacked.join("; ")
+    );
+    if !unreadable.is_empty() {
+        message.push_str(&format!(" Unreadable: {}.", unreadable.join(", ")));
+    }
+    anyhow::ensure!(
+        allow,
+        "{message} Or run with --allow-unbacked-locks, to pay them unbacked."
+    );
+    hub.alert(&message).context("alert the operator")?;
     Ok(())
 }
 

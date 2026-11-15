@@ -2,6 +2,7 @@
 //! paid, settled with the preimage that claims them.
 
 use std::{
+    collections::HashSet,
     path::Path,
     sync::{Mutex, MutexGuard},
     time::Duration,
@@ -13,7 +14,10 @@ use licash_hub::{Error, Refusal, Settled};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 
 use super::{node_down, now, refused, Gateway, HeldState};
-use crate::{peer::Recorded, Failure};
+use crate::{
+    peer::{self, Recorded},
+    Failure,
+};
 
 const VERSION: i64 = 1;
 
@@ -180,6 +184,11 @@ impl Gateway {
     /// own notes may take.
     pub fn holds(&self, hash: &[u8; 32]) -> Result<bool, String> {
         Ok(self.recorded(hash)?.is_some())
+    }
+
+    /// Which of `hashes` the receipts file at `path` holds, if there is one.
+    pub fn holding(path: &Path, hashes: &[[u8; 32]]) -> rusqlite::Result<HashSet<[u8; 32]>> {
+        peer::recorded_in(path, "SELECT 1 FROM receipts WHERE hash = ?1", hashes)
     }
 
     /// The receipt under `hash`, if any, and the lock it backs once

@@ -633,24 +633,36 @@ impl Hub {
         if forwards::pending(tx, id)? {
             return Err(Refusal::Forwarding.into());
         }
-        let decided = terms.expiry().checked_add(terms.depth());
-        let (top, _) = tip(tx)?.ok_or(Error::Halted)?;
-        if decided.is_none_or(|at| top < at) {
-            return Err(Refusal::Unexpired.into());
-        }
-        // Every block from the checkpoint to the tip was scanned.
-        let scanned: u32 = tx.query_row(
-            "SELECT count(*) FROM blocks WHERE height > ?1 AND height <= ?2",
-            params![anchor, top],
-            |r| r.get(0),
-        )?;
-        if scanned != top - anchor {
-            return Err(Error::Halted);
-        }
-        if activated(tx, terms, anchor)? {
-            return Err(Refusal::Activated.into());
-        }
-        Ok(())
+        expired_at_depth(tx, terms, anchor)
+    }
+
+    /// The hub's own locks it may yet pay ([`Hub::lock_own`]), whose
+    /// backing must be kept until they are settled: unsettled, and not
+    /// refundable, expired at depth unactivated on every block scanned.
+    pub fn live_own_locks(&self) -> Result<Vec<Lock>, Error> {
+        self.store.read(|c| {
+            let mut stmt = c.prepare(
+                "SELECT id FROM locks WHERE own = 1 AND settled IS NULL ORDER BY expiry, id",
+            )?;
+            let ids = stmt.query_map([], |r| r.get::<_, [u8; 32]>(0))?;
+            let ids: Vec<[u8; 32]> = ids.collect::<Result<_, _>>()?;
+            let mut live = Vec::new();
+            for id in ids {
+                let Some(Row { lock, anchor, .. }) = self.row(c, &ProposalId::from_bytes(id))?
+                else {
+                    continue;
+                };
+                match expired_at_depth(c, lock.terms(), anchor) {
+                    Ok(()) => {}
+                    // Not known refundable, as with a gap in the scan: live.
+                    Err(
+                        Error::Refused(Refusal::Unexpired | Refusal::Activated) | Error::Halted,
+                    ) => live.push(lock),
+                    Err(e) => return Err(e),
+                }
+            }
+            Ok(live)
+        })
     }
 
     /// Lock `id` as the hub holds it.
@@ -1010,6 +1022,29 @@ pub(crate) fn settled_of(c: &Connection, id: &ProposalId) -> Result<Option<Settl
 
 /// Whether an activation of the lock's hash was ever scanned between its
 /// checkpoint and its expiry, on any branch.
+/// Check that a lock of `terms` from the checkpoint at `anchor` expired at
+/// depth unactivated on every block scanned.
+fn expired_at_depth(c: &Connection, terms: &TimedTerms, anchor: u32) -> Result<(), Error> {
+    let decided = terms.expiry().checked_add(terms.depth());
+    let (top, _) = tip(c)?.ok_or(Error::Halted)?;
+    if decided.is_none_or(|at| top < at) {
+        return Err(Refusal::Unexpired.into());
+    }
+    // Every block from the checkpoint to the tip was scanned.
+    let scanned: u32 = c.query_row(
+        "SELECT count(*) FROM blocks WHERE height > ?1 AND height <= ?2",
+        params![anchor, top],
+        |r| r.get(0),
+    )?;
+    if scanned != top - anchor {
+        return Err(Error::Halted);
+    }
+    if activated(c, terms, anchor)? {
+        return Err(Refusal::Activated.into());
+    }
+    Ok(())
+}
+
 fn activated(c: &Connection, terms: &TimedTerms, anchor: u32) -> Result<bool, Error> {
     Ok(c.query_row(
         "SELECT 1 FROM activations WHERE hash = ?1 AND height > ?2 AND height < ?3 LIMIT 1",

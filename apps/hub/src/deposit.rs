@@ -38,7 +38,7 @@ use licash_onchain::deposit::{self, Htlc};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 
 use crate::{
-    peer::{Peer, Recorded},
+    peer::{self, Peer, Recorded},
     Failure,
 };
 
@@ -703,6 +703,11 @@ impl Gateway {
     /// own notes may take.
     pub fn holds(&self, hash: &[u8; 32]) -> Result<bool, String> {
         Ok(self.recorded(hash)?.is_some())
+    }
+
+    /// Which of `hashes` the deposits file at `path` holds, if there is one.
+    pub fn holding(path: &Path, hashes: &[[u8; 32]]) -> rusqlite::Result<HashSet<[u8; 32]>> {
+        peer::recorded_in(path, "SELECT 1 FROM deposits WHERE hash = ?1", hashes)
     }
 
     /// The deposit under `hash`, if any, and the lock it backs once

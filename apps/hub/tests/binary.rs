@@ -1,5 +1,7 @@
 //! The `licash-hub` binary end to end: create, run, watch and stop a hub.
 
+mod chain;
+
 use std::{
     io::{BufRead, BufReader, Read, Write},
     net::{TcpListener, TcpStream},
@@ -8,6 +10,13 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
+
+use licash::{
+    address::{Ephemeral, OwnerKeys},
+    claim::Branch,
+    spend::{self, ChainProfile, TimedTerms},
+};
+use licash_hub::{Hub, Policy};
 
 fn hub(data: &Path, args: &[&str]) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_licash-hub"));
@@ -25,6 +34,7 @@ fn hub(data: &Path, args: &[&str]) -> Command {
         .env_remove("LICASH_HUB_ONION")
         .env_remove("LICASH_HUB_SWAPS")
         .env_remove("LICASH_HUB_SWAPS_FROM")
+        .env_remove("LICASH_HUB_ALLOW_UNBACKED_LOCKS")
         .env("RUST_LOG", "info");
     command
 }
@@ -318,6 +328,98 @@ fn failures_exit_nonzero_and_log_as_asked() {
         assert!(stderr.contains(says), "{args:?}: {stderr}");
     }
     assert!(!missing.exists());
+}
+
+/// Give the hub at `data` an own lock under `hash`, which it may yet pay,
+/// as for a deposit, a Lightning receipt or a swap: the lock's id.
+fn own_lock(data: &Path, hash: [u8; 32]) -> String {
+    let (seed, db) = (data.join("seed"), data.join("hub.sqlite"));
+    let hub = Hub::open(&seed, &db, Policy::default()).unwrap();
+    let mut chain = chain::Chain::new();
+    hub.add_checkpoint(&chain.checkpoint(0)).unwrap();
+    for _ in 0..3 {
+        let block = chain.mine(None).clone();
+        hub.observe(chain.height(), &block).unwrap();
+    }
+    assert!(hub.synced(chain.height(), &chain.tip()).unwrap());
+    let checkpoint = hub.checkpoint().unwrap().commitment();
+    let profile = ChainProfile::Core30DefaultRegtest;
+    let terms = TimedTerms::new(profile, checkpoint, chain.height() + 20, 3, hash).unwrap();
+    let e = Ephemeral::random();
+    let payee = OwnerKeys::from_seed(&[3; 32]).unwrap().address();
+    let pay =
+        spend::Output::from_derivation(&e.derive(&payee, 4, Branch::Pay, 0).unwrap()).unwrap();
+    let keyset = *hub.info().keysets[0].id();
+    let lock = hub.lock_own(&keyset, e.public(), vec![pay], terms).unwrap();
+    hex::encode(lock.proposal.id().as_bytes())
+}
+
+/// What the hub run with `args` logs, once it exited unsuccessfully.
+fn refused(data: &Path, args: &[&str]) -> String {
+    let mut running = Running(
+        hub(data, args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let status = until("the hub exits", || running.0.try_wait().unwrap());
+    assert!(!status.success());
+    let mut stderr = String::new();
+    let mut pipe = running.0.stderr.take().unwrap();
+    pipe.read_to_string(&mut stderr).unwrap();
+    stderr
+}
+
+/// The hub at `data` run with `args`, once it serves at `port`.
+fn serving(data: &Path, port: u16, args: &[&str]) -> Running {
+    let listen = format!("127.0.0.1:{port}");
+    let running = Running(
+        hub(data, &[&["run", "--listen", &listen], args].concat())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let health = until("health", || get(port, "/health"));
+    assert!(health.starts_with("HTTP/1.1 200"), "{health}");
+    running
+}
+
+#[test]
+fn a_hub_refuses_to_run_with_own_locks_nothing_backs() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("hub");
+    stdout(&data, &["init", "--max-pow", "6"]);
+    let hash = [5; 32];
+    let lock = own_lock(&data, hash);
+    // Its deposit, receipt or swap is in no file, as once one was restored
+    // older than hub.sqlite: the hub would pay notes nothing backs.
+    let listen = format!("127.0.0.1:{}", free_port());
+    let stderr = refused(&data, &["run", "--listen", &listen]);
+    assert!(
+        stderr.contains(&lock) && stderr.contains("--allow-unbacked-locks"),
+        "{stderr}"
+    );
+    for file in ["deposits.sqlite", "lightning.sqlite", "swaps"] {
+        assert!(!data.join(file).exists(), "{file}");
+    }
+
+    // Allowed, it runs, and alerts the operator.
+    let running = serving(&data, free_port(), &["--allow-unbacked-locks"]);
+    let events = stdout(&data, &["events"]);
+    let alert = events.lines().find(|l| l.contains("\"alert\"")).unwrap();
+    assert!(alert.contains(&lock), "{alert}");
+    drop(running);
+
+    // A deposit under its hash backs it: the hub runs.
+    let deposits = rusqlite::Connection::open(data.join("deposits.sqlite")).unwrap();
+    let table = "CREATE TABLE deposits (hash BLOB PRIMARY KEY)";
+    deposits.execute(table, []).unwrap();
+    let row = "INSERT INTO deposits (hash) VALUES (?1)";
+    deposits.execute(row, [hash]).unwrap();
+    drop(deposits);
+    drop(serving(&data, free_port(), &[]));
 }
 
 #[test]

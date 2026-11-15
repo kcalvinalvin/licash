@@ -5,10 +5,16 @@
 //! under one, and pay both: each gateway refuses a hash its peer holds,
 //! and leaves a lock under it to the payment its peer recorded it for.
 
-use std::sync::{Arc, OnceLock};
+use std::{
+    collections::HashSet,
+    path::Path,
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 
 use licash::spend::ProposalId;
 use licash_api::{Code, Problem};
+use rusqlite::{Connection, OpenFlags};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use crate::{deposit, lightning, Failure};
@@ -49,6 +55,33 @@ impl Peer {
             Failure(Problem::new(Code::Unavailable, "the hub cannot serve now"))
         })
     }
+}
+
+/// Which of `hashes` `query`, of a hash, finds in the file at `path`, if
+/// there is one: opened to read only, beside the gateway running on it or
+/// without it.
+pub(crate) fn recorded_in(
+    path: &Path,
+    query: &str,
+    hashes: &[[u8; 32]],
+) -> rusqlite::Result<HashSet<[u8; 32]>> {
+    let mut found = HashSet::new();
+    if !path.is_file() {
+        return Ok(found);
+    }
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    conn.busy_timeout(Duration::from_secs(10))?;
+    conn.pragma_update(None, "query_only", true)?;
+    let mut stmt = conn.prepare(query)?;
+    for hash in hashes {
+        if stmt.exists([hash])? {
+            found.insert(*hash);
+        }
+    }
+    Ok(found)
 }
 
 /// Make the hub's Lightning gateway and its deposits peers, once both

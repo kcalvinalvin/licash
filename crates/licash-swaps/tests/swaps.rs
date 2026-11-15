@@ -1233,6 +1233,23 @@ async fn a_hub_restarted_adopts_the_lock_it_made_and_never_locks_again() {
         eco.kinds(),
         ["accepted", "accepted", "accepted", "failed", "alert", "failed"]
     );
+    // Read beside the provider: only the second swap backs a lock of B's.
+    let swaps = eco.dir.path().join("swaps.sqlite");
+    let hashes: Vec<[u8; 32]> = {
+        let c = rusqlite::Connection::open(&swaps).unwrap();
+        let hash = |id: &String| {
+            let id = hex::decode(id).unwrap();
+            c.query_row("SELECT hash FROM swaps WHERE id = ?1", [id], |r| r.get(0))
+        };
+        ids.iter().map(hash).collect::<Result<_, _>>().unwrap()
+    };
+    let backing = licash_swaps::backing_own(&swaps, &hashes).unwrap();
+    assert_eq!(backing.into_iter().collect::<Vec<_>>(), [hashes[1]]);
+    let none = eco.dir.path().join("none.sqlite");
+    assert!(licash_swaps::backing_own(&none, &hashes)
+        .unwrap()
+        .is_empty());
+    assert!(!none.exists());
 
     // The second swap's client claims B's lock, and the provider the
     // client's.

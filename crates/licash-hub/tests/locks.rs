@@ -607,6 +607,53 @@ fn admission_checks_the_terms_against_the_chain_and_the_timing() {
 }
 
 #[test]
+fn own_locks_are_live_until_settled_or_refundable() {
+    let (files, hub, mut chain) = setup(policy());
+    let (_, keyset) = issuer(&files);
+    let alice = owner(3).address();
+    let expiry = chain.height() + 5;
+    let lock = |hash: [u8; 32]| {
+        let e = Ephemeral::random();
+        let d = e.derive(&alice, 2, Branch::Pay, 0).unwrap();
+        let checkpoint = hub.checkpoint().unwrap().commitment();
+        let terms = TimedTerms::new(
+            ChainProfile::Core30DefaultRegtest,
+            checkpoint,
+            expiry,
+            1,
+            hash,
+        )
+        .unwrap();
+        let outputs = vec![Output::from_derivation(&d).unwrap()];
+        hub.lock_own(keyset.id(), e.public(), outputs, terms)
+            .unwrap()
+            .proposal
+            .id()
+    };
+    let live = || -> Vec<ProposalId> {
+        let locks = hub.live_own_locks().unwrap();
+        let mut ids: Vec<_> = locks.iter().map(|l| l.proposal.id()).collect();
+        ids.sort();
+        ids
+    };
+    assert!(live().is_empty());
+    let (paid, expiring) = (lock(lock_hash(&SECRET)), lock(lock_hash(&[9; 32])));
+    let mut both = vec![paid, expiring];
+    both.sort();
+    assert_eq!(live(), both);
+    hub.settle(&paid, &SECRET).unwrap();
+    assert_eq!(live(), [expiring]);
+    // Expired, unactivated, but not yet at depth: still payable on an
+    // activation in time.
+    chain.mine(&hub, expiry - chain.height());
+    assert_eq!(live(), [expiring]);
+    // At depth: refundable, though not refunded yet.
+    chain.mine(&hub, 1);
+    assert!(live().is_empty());
+    assert_eq!(hub.locked(&expiring).unwrap().settled, None);
+}
+
+#[test]
 fn own_locks_pay_the_payee_and_refund_nothing() {
     let (files, hub, mut chain) = setup(policy());
     let (_, keyset) = issuer(&files);

@@ -35,6 +35,14 @@ testing only: header checks cannot tell their blocks from forged ones.
 `<data>/hub.sqlite` while the hub runs: the hub halts, and `/health` answers
 503, until it is restarted.
 
+Notes the hub locks for a deposit, a Lightning receipt or a swap into it
+are backed by that payment, recorded in `deposits.sqlite`,
+`lightning.sqlite` or `swaps/swaps.sqlite`. The hub refuses to start while
+it may yet pay such a lock that none of these files records, as when one
+was restored older than `hub.sqlite`, and names the locks: restore the
+files as recent as `hub.sqlite`. `--allow-unbacked-locks` runs it anyway,
+alerting the operator: it would pay those notes unbacked.
+
 With `--lnd URL --lnd-macaroon FILE` (and `--chain`), the hub also runs a
 Lightning gateway over LND: it pays invoices for locks that pay the hub,
 and makes hold invoices paid with locks of its notes. `--lnd-cert` pins
