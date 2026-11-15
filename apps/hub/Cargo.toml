@@ -22,7 +22,7 @@ licash-onchain.workspace = true
 licash-swaps.workspace = true
 licash-swaps-service = { path = "../swaps" }
 licash-tor.workspace = true
-licash-transport.workspace = true
+licash-transport = { workspace = true, features = ["tor"] }
 licash-wallet.workspace = true
 anyhow.workspace = true
 axum.workspace = true

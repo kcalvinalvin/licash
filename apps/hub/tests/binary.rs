@@ -307,6 +307,7 @@ fn failures_exit_nonzero_and_log_as_asked() {
     let from = ["--swaps-from", "http://a.example=100"];
     for (args, says) in [
         (&from[..], "--swaps-from needs --swaps"),
+        (&["--swaps-tor"][..], "--swaps-tor needs --swaps"),
         (&["--swaps"][..], "--swaps) needs --chain"),
         (
             &["--swaps", "--swaps-from", "http://a.example"][..],

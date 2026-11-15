@@ -597,6 +597,12 @@ struct SwapsArgs {
         value_delimiter = ','
     )]
     swaps_from: Vec<String>,
+    /// Reach the hubs of `--swaps-from`, onion services among them, through
+    /// a Tor client of the hub's own (that of `--onion`, its state in
+    /// `<data>/tor`) rather than directly.
+    #[arg(long, env = "LICASH_HUB_SWAPS_TOR",
+          value_parser = clap::builder::BoolishValueParser::new())]
+    swaps_tor: bool,
     /// The fee on each swap, in the smallest unit.
     #[arg(long, env = "LICASH_HUB_SWAPS_FEE_BASE",
           default_value_t = SwapsConfig::default().fee.base)]
@@ -637,6 +643,7 @@ impl SwapsArgs {
             .collect::<anyhow::Result<_>>()?;
         if !self.swaps {
             anyhow::ensure!(from.is_empty(), "--swaps-from needs --swaps");
+            anyhow::ensure!(!self.swaps_tor, "--swaps-tor needs --swaps");
             return Ok(None);
         }
         anyhow::ensure!(
@@ -893,6 +900,7 @@ fn command(cli: Cli) -> anyhow::Result<()> {
                 "announcing on Nostr (--nostr-relay) needs --chain"
             );
             let swapping = swaps.terms()?;
+            let swaps_tor = swaps.swaps_tor;
             anyhow::ensure!(
                 swapping.is_none() || chain.is_some(),
                 "providing swaps (--swaps) needs --chain"
@@ -979,6 +987,12 @@ fn command(cli: Cli) -> anyhow::Result<()> {
                     None
                 }
             };
+            // One Tor client for the onion service and the swaps' wallet
+            // alike, since its state directory takes only one.
+            let tor = match onion || swaps_tor {
+                true => Some(Tor::new(&cli.data.join("tor")).context("a Tor client")?),
+                false => None,
+            };
             let swapping = match (swapping, &chain) {
                 (Some((config, from)), Some((_, profile, every))) => {
                     if from.is_empty() {
@@ -989,7 +1003,14 @@ fn command(cli: Cli) -> anyhow::Result<()> {
                     let url = url.unwrap_or_else(|| format!("http://{listen}"));
                     let (receipts, deposits) = (gateway.clone(), deposits.clone());
                     let issuer = issuer(&hub, url, &from, receipts, deposits);
-                    let provider = swap_provider(&swaps_dir, *profile, config, issuer)?;
+                    let transport = match &tor {
+                        Some(tor) if swaps_tor => {
+                            tracing::info!("the swaps' wallet reaches hubs through Tor");
+                            Http::tor(tor.clone())
+                        }
+                        _ => Http::new(None)?,
+                    };
+                    let provider = swap_provider(&swaps_dir, *profile, config, issuer, transport)?;
                     let provider = Arc::new(provider);
                     let notifier = match swaps_targets.is_empty() {
                         true => None,
@@ -1040,12 +1061,11 @@ fn command(cli: Cli) -> anyhow::Result<()> {
             };
             let router = licash_hub_service::router(hub.clone(), services);
             // Served until the hub stops.
-            let _onion = match onion {
-                true => {
-                    let tor = Tor::new(&cli.data.join("tor")).context("a Tor client")?;
+            let _onion = match &tor {
+                Some(tor) if onion => {
                     let onion = tor.serve("licash-hub", router.clone())?;
                     tracing::info!(url = onion.url(), "serving as an onion service");
-                    announce_over(&mut announcing, &tor, Some(&onion))?;
+                    announce_over(&mut announcing, tor, Some(&onion))?;
                     let mut urls = urls
                         .write()
                         .map_err(|_| anyhow::anyhow!("the URLs' lock"))?;
@@ -1054,7 +1074,7 @@ fn command(cli: Cli) -> anyhow::Result<()> {
                     }
                     Some(onion)
                 }
-                false => None,
+                _ => None,
             };
             let tasks = Tasks {
                 chain,
@@ -1231,18 +1251,19 @@ fn check_backed(hub: &Hub, data: &Path, allow: bool) -> anyhow::Result<()> {
 }
 
 /// The provider of the swaps into the hub, on its files in `dir`: made on
-/// the first start, its wallet's on `network`, and never replaced.
+/// the first start, its wallet's on `network`, and never replaced. Its
+/// wallet reaches hubs through `transport`.
 fn swap_provider(
     dir: &Path,
     network: ChainProfile,
     config: SwapsConfig,
     issuer: Issuer,
+    transport: Http,
 ) -> anyhow::Result<Provider<Http>> {
     let (wallet, swaps) = (dir.join("wallet.sqlite"), dir.join("swaps.sqlite"));
     match (wallet.exists(), swaps.exists()) {
         (true, true) => {
-            let wallet =
-                Wallet::open(&wallet, Http::new(None)?).context("open the swaps' wallet")?;
+            let wallet = Wallet::open(&wallet, transport).context("open the swaps' wallet")?;
             anyhow::ensure!(
                 wallet.network() == network,
                 "the swaps' wallet is of {}, the hub of {network}",
@@ -1260,7 +1281,7 @@ fn swap_provider(
                 .with_context(|| format!("create {}", dir.display()))?;
             let mut seed = [0; 32];
             OsRng.fill_bytes(&mut seed);
-            let wallet = Wallet::create(&wallet, &seed, network, Http::new(None)?)
+            let wallet = Wallet::create(&wallet, &seed, network, transport)
                 .context("create the swaps' wallet")?;
             let address = hex::encode(wallet.address().to_bytes());
             let provider = Provider::create_issuing(&swaps, wallet, config, issuer)

@@ -143,7 +143,11 @@ wallet and swaps are kept in `<data>/swaps` (`wallet.sqlite` and
 since an older `swaps.sqlite` loses the claims backing notes the hub
 locked. The hub refuses to start without `--swaps` while swaps are under
 way. To move the provider's notes out, stop the hub and run `licash-wallet
---wallet <data>/swaps/wallet.sqlite`.
+--wallet <data>/swaps/wallet.sqlite`. The provider's wallet reaches hubs
+directly, so it cannot swap from a hub at an onion service only, unless
+with `--swaps-tor`: then through a Tor client of the hub's own, that of
+`--onion` (its state in `<data>/tor`), to onion services and to the clear
+web alike.
 
 With `--onion`, the hub also serves its API as an onion service of a Tor
 client of its own (Arti), and announces its URL, reaching the relays
