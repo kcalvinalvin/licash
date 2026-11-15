@@ -27,6 +27,7 @@
 //! over TCP or Tor, or a test. Its seed alone does not restore its notes:
 //! back up its file.
 
+mod claims;
 mod code;
 mod coins;
 mod deposits;
@@ -66,6 +67,7 @@ use rand_core::{OsRng, RngCore};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{de::DeserializeOwned, Serialize};
 
+pub use claims::ClaimNote;
 pub use code::{ContractSecrets, HubId, LicashCode, PaymentCode, MAX_HUBS};
 pub use coins::MAX_INPUTS;
 pub use deposits::{Deposit, DepositState, DepositTerms};
