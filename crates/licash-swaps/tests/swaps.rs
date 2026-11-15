@@ -31,7 +31,18 @@ const CONFIG: Config = Config {
     min: 5,
     max: 150,
     margin: 6,
+    confirm: 4,
 };
+/// Hub A's response window, longer than B's ([`net::TIMING`]): a provider
+/// paying at B needs the client's lock at A to outlive its own by B's
+/// window and more.
+const WINDOW_A: u32 = 46;
+/// Blocks the client's lock outlives the provider's at B at least: the
+/// refund request's confirmation, B's window, reading the preimage, the
+/// provider's margin and one.
+const LEAD_B: u32 = 4 + 20 + 1 + 6 + 1;
+/// And at A.
+const LEAD_A: u32 = 4 + WINDOW_A + 1 + 6 + 1;
 
 /// The provider, as its clients reach it.
 #[derive(Default)]
@@ -124,14 +135,25 @@ struct Eco {
     desk: Arc<Desk>,
     dir: tempfile::TempDir,
     client: Wallet<Client>,
+    config: Config,
 }
 
 impl Eco {
-    /// Hubs A and B at height 3, a provider holding `stock` at B, and a
-    /// client holding 100 at A.
+    /// Hubs A and B at height 3, A's window the longer, a provider holding
+    /// `stock` at B, and a client holding 100 at A.
     async fn new(stock: u64) -> Self {
+        Self::with(stock, WINDOW_A, CONFIG).await
+    }
+
+    /// As [`Eco::new`], A's window `window_a`, the provider's terms
+    /// `config`.
+    async fn with(stock: u64, window_a: u32, config: Config) -> Self {
         let net = Net::new();
-        net.start(A, FEE);
+        let timing = licash_hub::Timing {
+            window: window_a,
+            ..net::TIMING
+        };
+        net.start_timed(A, FEE, timing);
         net.start(B, FEE);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("provider.sqlite");
@@ -148,7 +170,7 @@ impl Eco {
         wallet
             .receive(&net.pay(B, &wallet.address(), stock))
             .unwrap();
-        let provider = Provider::create(&dir.path().join("swaps.sqlite"), wallet, CONFIG).unwrap();
+        let provider = Provider::create(&dir.path().join("swaps.sqlite"), wallet, config).unwrap();
         let desk = Arc::new(Desk::default());
         *desk.provider.lock().unwrap() = Some(Arc::new(provider));
         let client = Client(net.clone(), desk.clone());
@@ -168,6 +190,7 @@ impl Eco {
             desk,
             dir,
             client,
+            config,
         }
     }
 
@@ -183,7 +206,7 @@ impl Eco {
         let path = self.dir.path().join("provider.sqlite");
         let wallet = Wallet::open(&path, Link(self.net.clone())).unwrap();
         let provider =
-            Provider::open(&self.dir.path().join("swaps.sqlite"), wallet, CONFIG).unwrap();
+            Provider::open(&self.dir.path().join("swaps.sqlite"), wallet, self.config).unwrap();
         *self.desk.provider.lock().unwrap() = Some(Arc::new(provider));
     }
 
@@ -271,6 +294,11 @@ async fn a_swap_moves_notes_from_one_hub_to_another_for_the_providers_fee() {
     assert_eq!(info.hub(&eco.address(B)).unwrap().max, 150);
     assert_eq!(info.hub(&eco.address(A)).unwrap().max, 0);
     assert_eq!(info.address, provider.wallet().address());
+    // By how much the client's lock outlives the provider's at each hub,
+    // and at every hub, for a client that reads only that.
+    let margin = |url| info.hub(&eco.address(url)).unwrap().margin;
+    assert_eq!((margin(B), margin(A)), (Some(LEAD_B), Some(LEAD_A)));
+    assert_eq!(info.margin, LEAD_A);
 
     let swap = eco
         .client
@@ -340,11 +368,11 @@ async fn a_client_locks_nothing_for_a_swap_costing_more_than_it_allows() {
     let (fee, _) = costs(20);
     let cheaper = SwapLimits {
         fee: fee - 1,
-        margin: CONFIG.margin,
+        margin: LEAD_B,
     };
     let sooner = SwapLimits {
         fee,
-        margin: CONFIG.margin - 1,
+        margin: LEAD_B - 1,
     };
     for (limits, says) in [(cheaper, "more than"), (sooner, "locked")] {
         let e = eco.client.swap(PROVIDER, A, B, 20, limits).await;
@@ -360,7 +388,7 @@ async fn a_client_locks_nothing_for_a_swap_costing_more_than_it_allows() {
     // At its limits exactly: swapped.
     let exact = SwapLimits {
         fee,
-        margin: CONFIG.margin,
+        margin: LEAD_B,
     };
     let swap = eco.client.swap(PROVIDER, A, B, 20, exact).await.unwrap();
     assert_eq!((swap.state, swap.fee), (SwapState::Done, fee));
@@ -376,9 +404,10 @@ async fn a_client_asks_what_a_swap_costs_and_what_it_would_refuse() {
     assert_eq!((quoted.amount, quoted.fee), (20, fee));
     // A's fee on the lock that swap makes, of what the client holds now.
     assert_eq!(eco.client.lock_fee(A, 20 + fee).unwrap(), lock_fee);
+    // Its margin at B, the hub swapped to.
     assert_eq!(
-        (quoted.info.min, quoted.info.margin),
-        (CONFIG.min, CONFIG.margin)
+        (quoted.info.min, quoted.margin, quoted.info.margin),
+        (CONFIG.min, LEAD_B, LEAD_A)
     );
     assert!(quoted.info.hub(&eco.address(B)).is_some());
     // Below its least: its least.
@@ -389,11 +418,11 @@ async fn a_client_asks_what_a_swap_costs_and_what_it_would_refuse() {
     // one hub, nothing, and more than allowed.
     let cheaper = SwapLimits {
         fee: fee - 1,
-        margin: CONFIG.margin,
+        margin: LEAD_B,
     };
     let sooner = SwapLimits {
         fee,
-        margin: CONFIG.margin - 1,
+        margin: LEAD_B - 1,
     };
     let usual = SwapLimits::usual(10);
     for (from, to, amount, limits) in [
@@ -445,16 +474,16 @@ async fn the_provider_declines_locks_that_do_not_pay_it_or_leave_it_no_room() {
         assert_eq!(provider.take(&request).await.unwrap_err().code, code);
     }
 
-    // Expiring at 12: the provider's lock would expire at 6, within 6 blocks.
+    // Expiring at 38: the provider's lock would expire at 6, within 6 blocks.
     let soon = eco
         .client
-        .lock(A, &to, 20 + fee, lock_hash(&[2; 32]), Some(12));
+        .lock(A, &to, 20 + fee, lock_hash(&[2; 32]), Some(LEAD_B + 6));
     let soon = lock_id(&soon.await.unwrap().id);
     let request = Request::new(&a, &soon, &b, &me, 20);
     let declined = provider.take(&request).await.unwrap_err();
     assert!(declined.message.contains("too soon"), "{declined:?}");
     // Refunded once expired at depth.
-    eco.mine(10);
+    eco.mine(LEAD_B + 4);
     eco.client.resume().await.unwrap();
     let declined = provider.take(&request).await.unwrap_err();
     assert!(declined.message.contains("settled"), "{declined:?}");
@@ -519,8 +548,8 @@ async fn a_client_whose_provider_never_locks_is_refunded_once_its_lock_expired()
     eco.desk.gone.store(true, Ordering::Relaxed);
     let resumed = eco.client.resume().await.unwrap();
     assert_eq!(resumed.pending.len(), 1, "{resumed:?}");
-    // Its lock expires at 20, the latest hub A admitted at 3.
-    eco.mine(18);
+    // Its lock expires at 46, the latest hub A admitted at 3.
+    eco.mine(44);
     let resumed = eco.client.resume().await.unwrap();
     assert!(
         matches!(&resumed.swaps[0].state, SwapState::Failed(why) if why.contains("never locked")),
@@ -546,7 +575,7 @@ async fn a_swap_its_provider_could_not_lock_fails_and_the_client_is_refunded() {
     assert_eq!(eco.kinds(), ["accepted", "failed"]);
     assert_eq!(held(provider.wallet(), B), 200);
     assert!(provider.step().await.unwrap().is_empty());
-    eco.mine(18);
+    eco.mine(44);
     eco.client.resume().await.unwrap();
     assert_eq!(held(&eco.client, A), 100 - FEE.base);
     assert_eq!(provider.stats().unwrap().failed, 1);
@@ -566,8 +595,8 @@ async fn a_lock_its_client_never_claims_returns_to_the_provider() {
     let swap = eco.client.swaps().unwrap().remove(0);
     assert!(swap.theirs.is_some());
     let provider = eco.provider();
-    // Its lock expires at 14, 6 before the client's.
-    assert_eq!(provider.records(1).unwrap()[0].expiry, 14);
+    // Its lock expires at 14, 32 before the client's.
+    assert_eq!(provider.records(1).unwrap()[0].expiry, 46 - LEAD_B);
     eco.mine(11);
     assert!(provider.step().await.unwrap().is_empty());
     assert_eq!(provider.records(1).unwrap()[0].stage, Stage::Locked);
@@ -579,7 +608,7 @@ async fn a_lock_its_client_never_claims_returns_to_the_provider() {
 
     // Back, the client cannot claim the provider's lock any more, and is
     // refunded its own once expired.
-    eco.mine(6);
+    eco.mine(32);
     let resumed = eco.client.resume().await.unwrap();
     assert!(
         matches!(&resumed.swaps[0].state, SwapState::Failed(why) if why.contains("refunded")),
@@ -627,8 +656,8 @@ async fn a_provider_that_claims_too_late_loses_the_swap() {
         .await
         .unwrap();
     assert_eq!(swap.state, SwapState::Done);
-    // Asleep until the client's lock, expiring at 20, is within 3 blocks.
-    eco.mine(14);
+    // Asleep until the client's lock, expiring at 46, is within 3 blocks.
+    eco.mine(40);
     let provider = eco.provider();
     assert!(provider.step().await.unwrap().is_empty());
     let record = &provider.records(1).unwrap()[0];
@@ -682,7 +711,7 @@ async fn a_client_reveals_nothing_for_a_lock_that_does_not_pay_it_the_swap() {
             .unwrap()
             .iter()
             .all(|l| l.state == licash_wallet::LockState::Locked));
-        eco.mine(18);
+        eco.mine(44);
         eco.client.resume().await.unwrap();
         assert_eq!(held(&eco.client, A), 100 - FEE.base);
     }
@@ -717,4 +746,138 @@ async fn the_operator_is_alerted_once_of_each_hub_the_provider_cannot_swap_to() 
     drop(provider);
     eco.restart();
     assert_eq!(eco.provider().check_stock().unwrap(), [B]);
+}
+
+#[tokio::test]
+async fn no_swap_is_made_to_a_hub_whose_window_the_lock_paying_the_provider_cannot_outlast() {
+    // A's window no longer than B's: no lock at A outlives the provider's
+    // at B by B's window and more.
+    let eco = Eco::with(200, net::TIMING.window, CONFIG).await;
+    let provider = eco.provider();
+    let info = provider.info().unwrap();
+    let at_b = info.hub(&eco.address(B)).unwrap();
+    assert_eq!((at_b.max, at_b.margin), (150, Some(LEAD_B)));
+    let quoted = eco
+        .client
+        .swap_quote(PROVIDER, A, B, 20, SwapLimits::usual(20))
+        .await;
+    let swapped = eco
+        .client
+        .swap(PROVIDER, A, B, 20, SwapLimits::usual(20))
+        .await;
+    for e in [quoted.unwrap_err(), swapped.unwrap_err()] {
+        assert!(
+            matches!(&e, Error::Invalid(why) if why.contains("admits none expiring after 20")),
+            "{e}"
+        );
+    }
+    assert!(eco.client.swaps().unwrap().is_empty());
+    assert_eq!(held(&eco.client, A), 100);
+
+    // A client that locks anyway, as late as A admits, is declined.
+    let (a, b, me) = (eco.address(A), eco.address(B), eco.client.address());
+    let to = provider.wallet().address();
+    let lock = eco
+        .client
+        .lock(A, &to, 20 + costs(20).0, lock_hash(&[4; 32]), None);
+    let lock = lock_id(&lock.await.unwrap().id);
+    let declined = provider
+        .take(&Request::new(&a, &lock, &b, &me, 20))
+        .await
+        .unwrap_err();
+    assert_eq!(declined.code, Code::Declined);
+    assert!(declined.message.contains("too soon"), "{declined:?}");
+    assert!(provider.records(10).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_provider_locks_nowhere_its_operator_would_hear_of_a_kept_preimage_too_late() {
+    // A refund request that confirms within 3 blocks of the lock's expiry
+    // is due before the hub, at depth 1 and reaction 2, has to refund.
+    let config = Config {
+        confirm: 3,
+        ..CONFIG
+    };
+    let eco = Eco::with(200, WINDOW_A, config).await;
+    let provider = eco.provider();
+    let info = provider.info().unwrap();
+    for url in [A, B] {
+        let hub = info.hub(&eco.address(url)).unwrap();
+        assert_eq!((hub.max, hub.margin), (0, None));
+    }
+    assert_eq!(info.margin, CONFIG.margin);
+    let e = eco
+        .client
+        .swap(PROVIDER, A, B, 20, SwapLimits::usual(20))
+        .await;
+    assert!(
+        matches!(&e, Err(Error::Invalid(why)) if why.contains("to 0")),
+        "{e:?}"
+    );
+
+    let (a, b, me) = (eco.address(A), eco.address(B), eco.client.address());
+    let to = provider.wallet().address();
+    let lock = eco
+        .client
+        .lock(A, &to, 20 + costs(20).0, lock_hash(&[5; 32]), None);
+    let lock = lock_id(&lock.await.unwrap().id);
+    let declined = provider
+        .take(&Request::new(&a, &lock, &b, &me, 20))
+        .await
+        .unwrap_err();
+    assert_eq!(declined.code, Code::Declined);
+    assert!(declined.message.contains("refund request"), "{declined:?}");
+    assert!(provider.records(10).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn the_operator_is_alerted_once_of_a_hub_that_neither_pays_nor_refunds_its_lock() {
+    let eco = Eco::new(200).await;
+    // The client's claim is lost, and the client gone.
+    eco.net.fail(licash_api::SETTLE, Fault::Lost);
+    let e = eco
+        .client
+        .swap(PROVIDER, A, B, 20, SwapLimits::usual(20))
+        .await
+        .unwrap_err();
+    assert!(matches!(e, Error::Pending { .. }), "{e}");
+    let provider = eco.provider();
+    // The refund of the provider's lock, which its wallet and the swap ask
+    // for at each step, is not given.
+    let withhold = |fault| {
+        for _ in 0..2 {
+            eco.net.fail(licash_api::REFUND, fault);
+        }
+    };
+    // Its lock expires at 14, owed back at 15, refunded by 17 at the
+    // latest if B answers.
+    eco.mine(12);
+    withhold(Fault::Refused(Code::Unexpired));
+    assert!(provider.step().await.unwrap().is_empty());
+    assert_eq!(eco.kinds(), ["accepted"]);
+    eco.mine(2);
+    withhold(Fault::Lost);
+    assert_eq!(provider.step().await.unwrap().len(), 1);
+    assert_eq!(eco.kinds(), ["accepted", "alert"]);
+    withhold(Fault::Refused(Code::Unexpired));
+    assert!(provider.step().await.unwrap().is_empty());
+    assert_eq!(eco.kinds(), ["accepted", "alert"]);
+    let events = provider.events(0, 10).unwrap();
+    let Some(Notice::Alert { message }) = events[1].notice() else {
+        panic!("{events:?}");
+    };
+    // The refund request is due by 14 + 4; the client's lock expires at 46.
+    for says in [B, "expired at 14", "by height 18", A, "expires at 46"] {
+        assert!(message.contains(says), "{message}");
+    }
+    assert_eq!(provider.records(1).unwrap()[0].stage, Stage::Locked);
+
+    // Told again once started again, until B refunds.
+    drop(provider);
+    eco.restart();
+    withhold(Fault::Refused(Code::Unexpired));
+    assert!(eco.provider().step().await.unwrap().is_empty());
+    assert!(eco.provider().step().await.unwrap().is_empty());
+    assert_eq!(eco.provider().records(1).unwrap()[0].stage, Stage::Refunded);
+    assert_eq!(eco.kinds(), ["accepted", "alert", "alert", "refunded"]);
 }

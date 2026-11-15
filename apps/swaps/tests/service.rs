@@ -173,6 +173,9 @@ fn init_creates_the_provider_once_and_status_reads_it() {
     let bad = licash_swaps(&dir, &["run", "--margin", "4"]);
     assert!(!bad.status.success());
     assert!(String::from_utf8(bad.stderr).unwrap().contains("--margin"));
+    let bad = licash_swaps(&dir, &["run", "--confirm", "0"]);
+    assert_eq!(bad.status.code(), Some(2));
+    assert!(String::from_utf8(bad.stderr).unwrap().contains("--confirm"));
 }
 
 #[test]

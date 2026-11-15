@@ -57,6 +57,19 @@ the chain's estimate at start), `--payout-min` and `--payout-max` set the
 terms; `status` shows the coins. A provider with payouts under way refuses
 to start without `--chain`.
 
+The client reveals its preimage to the destination hub, which issues the
+provider's lock there and could keep the preimage from it. The provider
+would then learn it only from a refund request of its lock on Bitcoin,
+which the hub voids only by publishing the preimage within its response
+window. So its lock expires earlier than the client's by that window,
+`--confirm` (the blocks to get the request confirmed, 36 by default) and
+`--margin`, and `/v1/swaps/info` gives that margin for each hub. A swap is
+declined unless the source hub admits a lock that late, which takes a
+source hub with a longer window than the destination's: between hubs of
+equal windows, the provider swaps nothing. It makes no refund request
+itself: a high-priority alert names the provider's lock left neither paid
+nor refunded after it expired, and the height the request must confirm by.
+
 With `--nostr-relay URL --announce-url URL`, the provider announces itself on
 Nostr relays for wallets to discover, under the key `/v1/swaps/info` names.
 With `--tor`, it reaches hubs and relays, onion services included, through a

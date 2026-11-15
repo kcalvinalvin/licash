@@ -99,10 +99,17 @@ struct Terms {
     /// The most swapped at once.
     #[arg(long, env = "LICASH_SWAPS_MAX", default_value_t = Config::default().max)]
     max: u64,
-    /// Blocks the provider's lock expires before the client's, at least:
-    /// its time to claim once the client claimed.
+    /// Blocks the provider needs to claim the client's lock once it holds
+    /// the preimage.
     #[arg(long, env = "LICASH_SWAPS_MARGIN", default_value_t = Config::default().margin)]
     margin: u32,
+    /// Blocks within which the operator gets a refund request of the
+    /// provider's lock confirmed, once alerted that the hub keeps the
+    /// preimage. The provider's lock expires that, the hub's response
+    /// window and the margin before the client's, at least.
+    #[arg(long, env = "LICASH_SWAPS_CONFIRM", default_value_t = Config::default().confirm,
+          value_parser = clap::value_parser!(u32).range(1..))]
+    confirm: u32,
 }
 
 impl Terms {
@@ -121,6 +128,7 @@ impl Terms {
             min: self.min,
             max: self.max,
             margin: self.margin,
+            confirm: self.confirm,
         })
     }
 }

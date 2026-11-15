@@ -5,11 +5,21 @@
 //! A client locks the amount and the provider's fee to the provider at hub
 //! `from`, then asks for the swap. The provider checks that lock as its hub
 //! holds it, records the swap and locks the amount to the client at hub
-//! `to`, expiring [`Config::margin`] blocks earlier at least. Once the
-//! client claimed that lock, revealing the preimage, the provider claims
-//! the client's lock with it. Unclaimed, its own lock is refunded once
-//! expired: either way the provider holds what it held, or more, unless it
-//! claims too late ([`Stage::Lost`]).
+//! `to`, expiring earlier. Once the client claimed that lock, revealing the
+//! preimage, the provider claims the client's lock with it. Unclaimed, its
+//! own lock is refunded once expired: either way the provider holds what it
+//! held, or more, unless it claims too late ([`Stage::Lost`]).
+//!
+//! The client reveals the preimage to hub `to`, which issues the
+//! provider's lock, and that hub can keep it from the provider. The
+//! provider then obtains it only by requesting the lock's refund on
+//! Bitcoin, which the hub voids only by publishing the preimage, within its
+//! response window. So the provider's lock expires that window, the
+//! request's confirmation ([`Config::confirm`]) and [`Config::margin`]
+//! blocks before the client's at least ([`licash::route::Hop::forced_lead`]),
+//! and the provider swaps only between hubs where that fits: hub `from`'s
+//! window must be the longer. The provider makes no such request itself:
+//! it alerts its operator with the deadline.
 //!
 //! The provider swaps between the hubs its wallet added. Each step is
 //! recorded before the next is asked for, so a provider stopped at any
@@ -30,10 +40,10 @@ use std::{
     sync::{Mutex, PoisonError},
 };
 
-use licash::{address::Address, spend::ProposalId};
+use licash::{address::Address, route::Hop, spend::ProposalId};
 use licash_api::{
     swaps::{self, Hub, Request, State},
-    Code, Fee, Problem,
+    Code, Fee, Locks, Problem,
 };
 use licash_wallet::{LockState, Transport, Wallet};
 use rand_core::{OsRng, RngCore};
@@ -45,7 +55,10 @@ use store::{now, Store};
 
 /// Blocks a provider's lock leaves at least before it expires: for the
 /// client to claim it, and for the provider to follow it.
-pub const MIN_ROOM: u32 = 6;
+pub const MIN_ROOM: u32 = licash_wallet::SWAP_ROOM;
+
+/// Blocks to read a preimage the hub published on Bitcoin.
+pub const DETECT: u32 = 1;
 
 /// Why a provider call failed.
 #[derive(Debug, thiserror::Error)]
@@ -68,9 +81,14 @@ pub struct Config {
     /// The least and the most it swaps at once.
     pub min: u64,
     pub max: u64,
-    /// Its lock expires this many blocks before the client's, at least:
-    /// its time to claim the client's lock once the client claimed its own.
+    /// Blocks to claim the client's lock once the provider holds the
+    /// preimage.
     pub margin: u32,
+    /// Blocks within which a refund request of the provider's lock
+    /// confirms once it expired: the operator's time to make it, after the
+    /// provider alerted it the hub keeps the preimage.
+    #[serde(default = "Config::default_confirm")]
+    pub confirm: u32,
 }
 
 impl Default for Config {
@@ -80,6 +98,36 @@ impl Default for Config {
             min: 1_000,
             max: 1_000_000,
             margin: 12,
+            confirm: Self::default_confirm(),
+        }
+    }
+}
+
+impl Config {
+    fn default_confirm() -> u32 {
+        36
+    }
+
+    /// Blocks by which the client's lock outlives the provider's at a hub
+    /// of `locks` at least, if the provider may lock there: once its lock
+    /// expires, the provider learns the hub keeps the preimage before the
+    /// refund request is due.
+    pub fn lead(&self, locks: &Locks) -> Option<u32> {
+        let seen = locks.min_depth.max(1).saturating_add(locks.reaction);
+        if self.confirm <= seen {
+            return None;
+        }
+        self.hop(locks).forced_lead()
+    }
+
+    fn hop(&self, locks: &Locks) -> Hop {
+        Hop {
+            window: locks.window,
+            confirm: self.confirm,
+            detect: DETECT,
+            margin: self.margin,
+            depth: locks.min_depth,
+            reaction: locks.reaction,
         }
     }
 }
@@ -257,6 +305,8 @@ struct Row {
     amount: u64,
     fee: u64,
     paid: u64,
+    /// The client's lock's expiry at `from`.
+    expiry_from: u32,
     expiry: u32,
     lock: Option<[u8; 32]>,
     preimage: Option<[u8; 32]>,
@@ -302,7 +352,8 @@ impl Row {
 const LAST_EVENT: &str = "SELECT coalesce(max(seq), 0) FROM events";
 
 const ROWS: &str = "SELECT id, hash, from_url, to_url, address, amount, fee, paid, expiry,
-    lock, preimage, state, reason, created_at, updated_at, kind = 'chain' FROM swaps";
+    lock, preimage, state, reason, created_at, updated_at, kind = 'chain', expiry_from
+    FROM swaps";
 
 fn row_of(r: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
     Ok(Row {
@@ -322,7 +373,17 @@ fn row_of(r: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
         created_at: r.get(13)?,
         updated_at: r.get(14)?,
         chain: r.get(15)?,
+        expiry_from: r.get(16)?,
     })
+}
+
+/// What the provider can lock at a hub, by URL and address.
+struct Stock {
+    url: String,
+    address: Address,
+    free: u64,
+    /// [`Config::lead`] there.
+    lead: Option<u32>,
 }
 
 /// A swap in hand, so that no other task takes it on meanwhile.
@@ -384,6 +445,8 @@ pub struct Provider<T: Transport> {
     short: Mutex<HashSet<String>>,
     /// What it pays out on Bitcoin, if it does.
     payouts: Option<swaps::Chain>,
+    /// The swaps whose hub the operator was told keeps the preimage.
+    withheld: Mutex<HashSet<[u8; 32]>>,
 }
 
 /// Setup and what the provider says of itself.
@@ -409,6 +472,7 @@ impl<T: Transport> Provider<T> {
             taking: Mutex::default(),
             short: Mutex::default(),
             payouts: None,
+            withheld: Mutex::default(),
         }
     }
 
@@ -429,14 +493,27 @@ impl<T: Transport> Provider<T> {
     }
 
     /// What the provider swaps now, as its hubs last said of themselves:
-    /// at each hub that follows a chain, the most it can lock there.
+    /// at each hub that follows a chain, the most it can lock there and by
+    /// how much the client's lock must outlive its own ([`Config::lead`]),
+    /// nothing where it may not lock. The margin it gives for every hub, to
+    /// clients that read no other, is the most of them.
     pub fn info(&self) -> Result<swaps::Info, Error> {
-        let hubs = self
-            .stock()?
+        let stock = self.stock()?;
+        let margin = stock
+            .iter()
+            .filter_map(|s| s.lead)
+            .max()
+            .unwrap_or(self.config.margin);
+        let hubs = stock
             .into_iter()
-            .map(|(_, address, free)| Hub {
-                address,
-                max: free.min(self.config.max),
+            .map(|s| Hub {
+                address: s.address,
+                max: if s.lead.is_some() {
+                    s.free.min(self.config.max)
+                } else {
+                    0
+                },
+                margin: s.lead,
             })
             .collect();
         Ok(swaps::Info {
@@ -444,23 +521,23 @@ impl<T: Transport> Provider<T> {
             fee: self.config.fee,
             min: self.config.min,
             max: self.config.max,
-            margin: self.config.margin,
+            margin,
             hubs,
             nostr: None,
             chain: self.chain_info()?,
         })
     }
 
-    /// At each hub that follows a chain, by URL and address, the most the
-    /// provider can lock there: what it holds, less what the swaps it took
-    /// will lock and the hub's fee.
-    fn stock(&self) -> Result<Vec<(String, Address, u64)>, Error> {
+    /// At each hub that follows a chain, the most the provider can lock
+    /// there: what it holds, less what the swaps it took will lock and the
+    /// hub's fee.
+    fn stock(&self) -> Result<Vec<Stock>, Error> {
         let balance = self.wallet.balance()?;
         let mut stock = Vec::new();
         for (url, info) in self.wallet.hubs()? {
-            if info.locks.is_none() {
+            let Some(locks) = &info.locks else {
                 continue;
-            }
+            };
             let available = balance
                 .iter()
                 .find(|b| b.hub == url)
@@ -468,7 +545,13 @@ impl<T: Transport> Provider<T> {
             let free = available
                 .saturating_sub(self.reserved(&url)?)
                 .saturating_sub(info.fees.lock.due(available));
-            stock.push((url, info.address, free));
+            let lead = self.config.lead(locks);
+            stock.push(Stock {
+                url,
+                address: info.address,
+                free,
+                lead,
+            });
         }
         Ok(stock)
     }
@@ -480,7 +563,7 @@ impl<T: Transport> Provider<T> {
         let stock = self.stock()?;
         let mut short = self.short.lock().unwrap_or_else(PoisonError::into_inner);
         let mut alerted = Vec::new();
-        for (url, _, free) in stock {
+        for Stock { url, free, .. } in stock {
             if free >= self.config.min {
                 short.remove(&url);
             } else if !short.contains(&url) {
@@ -563,15 +646,22 @@ impl<T: Transport> Provider<T> {
         let Some(locks) = to_info.locks.as_ref() else {
             return Err(declined(format!("hub {to} follows no chain")));
         };
+        let Some(lead) = config.lead(locks) else {
+            return Err(declined(format!(
+                "no swaps to hub {to}: a refund request there confirms within {} blocks, \
+                 before the provider sees the hub keep the preimage",
+                config.confirm
+            )));
+        };
         let latest = locks
             .latest_expiry(locks.min_depth.max(1))
             .map_err(unavailable)?;
-        let expiry = incoming.expiry.saturating_sub(config.margin).min(latest);
+        let expiry = incoming.expiry.saturating_sub(lead).min(latest);
         let room = locks.height.max(incoming.height).saturating_add(MIN_ROOM);
         if expiry < room {
             return Err(declined(format!(
-                "the lock expires at {}: too soon to lock {} blocks earlier",
-                incoming.expiry, config.margin
+                "the lock expires at {}: too soon to lock at hub {to} {lead} blocks earlier",
+                incoming.expiry
             )));
         }
         let terms = Terms {
@@ -871,12 +961,20 @@ impl<T: Transport> Provider<T> {
             Err(licash_wallet::Error::Refused { problem, .. }) => {
                 LockState::Abandoned(problem.to_string())
             }
-            Err(e) => return Err(e.into()),
+            Err(e) => {
+                if row.stage == Stage::Locked {
+                    self.check_withheld(id, row, &lock)?;
+                }
+                return Err(e.into());
+            }
         };
         match state {
-            LockState::Locked if row.stage == Stage::Accepted => {
-                self.advance(id, Stage::Accepted, Stage::Locked, None, None)?;
-                tracing::info!(id = %hex::encode(id), lock = %hex::encode(lock), "locked");
+            LockState::Locked => {
+                if row.stage == Stage::Accepted {
+                    self.advance(id, Stage::Accepted, Stage::Locked, None, None)?;
+                    tracing::info!(id = %hex::encode(id), lock = %hex::encode(lock), "locked");
+                }
+                self.check_withheld(id, row, &lock)?;
             }
             LockState::Paid(preimage) => {
                 self.advance(id, row.stage, Stage::Paid, Some(&preimage), None)?;
@@ -896,6 +994,61 @@ impl<T: Transport> Provider<T> {
             }
             _ => {}
         }
+        Ok(())
+    }
+
+    /// Alert the operator, once, if hub `to` of the swap `row` has neither
+    /// paid nor refunded the provider's certified `lock` though it expired
+    /// long enough ago for the hub to refund it plainly: the hub may keep
+    /// the preimage the client revealed to it. Its refund requested on
+    /// Bitcoin in time, the hub must publish the preimage or refund, and
+    /// the provider claims the client's lock with it.
+    fn check_withheld(&self, id: &[u8; 32], row: &Row, lock: &[u8; 32]) -> Result<(), Error> {
+        let hubs = self.wallet.hubs()?;
+        let locks = |url: &str| {
+            hubs.iter()
+                .find(|(u, _)| u == url)
+                .and_then(|(_, info)| info.locks.as_ref())
+        };
+        // A hub that follows no chain now says nothing of when it refunds:
+        // the operator is told early rather than late.
+        let to = locks(&row.to);
+        let (depth, reaction, height) =
+            to.map_or((1, 0, 0), |l| (l.min_depth.max(1), l.reaction, l.height));
+        let height = locks(&row.from).map_or(height, |l| l.height.max(height));
+        if height < row.expiry.saturating_add(depth).saturating_add(reaction) {
+            return Ok(());
+        }
+        let mut withheld = self.withheld.lock().unwrap_or_else(PoisonError::into_inner);
+        if withheld.contains(id) {
+            return Ok(());
+        }
+        // As the provider times its locks now, and as the hub's window
+        // leaves time to read the preimage before the client's lock expires.
+        let mut deadline = row.expiry.saturating_add(self.config.confirm);
+        if let Some(to) = to {
+            let after = Hop {
+                confirm: 0,
+                ..self.config.hop(to)
+            }
+            .forced_lead();
+            deadline = deadline.min(row.expiry_from.saturating_sub(after.unwrap_or(u32::MAX)));
+        }
+        let message = format!(
+            "Hub {} has neither paid nor refunded the provider's lock {} of swap {}, expired \
+             at {}: it may keep the preimage. Request the lock's refund on Bitcoin, confirmed \
+             by height {deadline}, for the hub to publish the preimage, and claim the client's \
+             lock at {} with it before it expires at {}.",
+            row.to,
+            hex::encode(lock),
+            hex::encode(id),
+            row.expiry,
+            row.from,
+            row.expiry_from
+        );
+        tracing::error!(id = %hex::encode(id), "{message}");
+        self.alert(&message)?;
+        withheld.insert(*id);
         Ok(())
     }
 

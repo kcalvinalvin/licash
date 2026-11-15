@@ -36,6 +36,7 @@ pub const CONFIG: Config = Config {
     min: 5,
     max: 150,
     margin: 6,
+    confirm: 4,
 };
 
 pub struct Swaps {

@@ -34,6 +34,7 @@ const CONFIG: Config = Config {
     min: 5,
     max: 150,
     margin: 6,
+    confirm: 4,
 };
 const TERMS: swaps::Chain = swaps::Chain {
     fee: Fee {
