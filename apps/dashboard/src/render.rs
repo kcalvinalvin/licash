@@ -262,25 +262,52 @@ fn draw_card(f: &mut Frame, area: Rect, card: &CardView, view: &View) {
     }
 }
 
-fn number(n: &Number, color: usize) -> Line<'static> {
+/// `n` in a column `width` wide: the first of its forms that fits, or the
+/// shortest.
+fn number(n: &Number, color: usize, width: usize) -> Line<'static> {
+    let fit = |forms: Vec<String>| {
+        let last = forms.len() - 1;
+        let fits = forms.iter().position(|f| f.chars().count() <= width);
+        forms[fits.unwrap_or(last)].clone()
+    };
     match *n {
-        Number::Value(v, unit) => Line::raw(format::amount(v, unit)).right_aligned(),
+        Number::Value(v, unit) => Line::raw(fit(vec![
+            format::amount(v, unit),
+            format::compact(v as f64, unit),
+            format::shortest(v as f64, unit),
+        ]))
+        .right_aligned(),
         Number::PerDay(v, unit) => {
-            Line::raw(format!("{}/d", format::compact(v, unit))).right_aligned()
+            // Whole units from 10 a day on.
+            let v = if v.abs() >= 10.0 { v.round() } else { v };
+            Line::raw(fit(vec![
+                format!("{}/d", format::compact(v, unit)),
+                format!("{}/d", format::shortest(v, unit)),
+            ]))
+            .right_aligned()
         }
         Number::Share(None) => Line::styled("–", DIM).right_aligned(),
         Number::Share(Some(s)) => {
-            let eighths = (s.clamp(0.0, 1.0) * 64.0).round() as usize;
+            // A bar of what is left beside the percentage, up to 8 wide.
+            let cells = width.saturating_sub(7).min(8);
+            let eighths = (s.clamp(0.0, 1.0) * (8 * cells) as f64).round() as usize;
             let bar =
                 "█".repeat(eighths / 8) + ["", "▏", "▎", "▍", "▌", "▋", "▊", "▉"][eighths % 8];
+            let bar = match cells {
+                0 => String::new(),
+                _ => format!("{bar:<cells$} "),
+            };
             Line::from(vec![
-                Span::styled(format!("{bar:<8} "), Style::new().fg(style::color(color))),
+                Span::styled(bar, Style::new().fg(style::color(color))),
                 Span::raw(format!("{:>6}", format::percent(s))),
             ])
             .right_aligned()
         }
         Number::Change(c, v) => Line::styled(format::change(c, v), DIM).right_aligned(),
-        Number::Days(None) => Line::styled("not falling", DIM).right_aligned(),
+        Number::Days(None) => {
+            let forms = vec!["not falling".to_owned(), "–".to_owned()];
+            Line::styled(fit(forms), DIM).right_aligned()
+        }
         Number::Days(Some(d)) => {
             let tone = if d < 7.0 {
                 Tone::Bad
@@ -306,6 +333,19 @@ fn breakdown(f: &mut Frame, area: Rect, b: &BreakdownView, focused: bool, offset
             .collect::<Vec<_>>(),
     )
     .style(DIM);
+    // The labels take twice what each column does, or what the longest
+    // needs, up to near half; the columns share the rest, two apart.
+    let n = b.columns.len() as u16;
+    let inner = area.width.saturating_sub(2 + 2 * n);
+    let longest = b
+        .rows
+        .iter()
+        .map(|r| r.label.chars().count())
+        .max()
+        .unwrap_or(0);
+    let share = 2 * inner / (n + 2);
+    let labels = (longest as u16 + 2).clamp(share.min(inner * 9 / 20), share.max(inner * 9 / 20));
+    let width = (inner.saturating_sub(labels) / n.max(1)) as usize;
     let rows = b.rows.iter().skip(offset).map(|row| {
         let label = Line::from(vec![
             Span::styled("■ ", Style::new().fg(style::color(row.color))),
@@ -313,12 +353,16 @@ fn breakdown(f: &mut Frame, area: Rect, b: &BreakdownView, focused: bool, offset
         ]);
         Row::new(
             std::iter::once(Cell::from(label))
-                .chain(row.cells.iter().map(|n| Cell::from(number(n, row.color))))
+                .chain(
+                    row.cells
+                        .iter()
+                        .map(|n| Cell::from(number(n, row.color, width))),
+                )
                 .collect::<Vec<_>>(),
         )
     });
-    let widths =
-        std::iter::once(Constraint::Fill(2)).chain(b.columns.iter().map(|_| Constraint::Fill(1)));
+    let widths = std::iter::once(Constraint::Length(labels))
+        .chain(b.columns.iter().map(|_| Constraint::Fill(1)));
     let mut block = block(&title, focused);
     if b.rows.is_empty() {
         let inner = block.inner(area);
@@ -479,4 +523,35 @@ fn help(f: &mut Frame, area: Rect) {
     ];
     f.render_widget(Clear, popup);
     f.render_widget(Paragraph::new(lines).block(block("Keys", true)), popup);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Unit;
+
+    fn text(n: Number, width: usize) -> String {
+        let line = number(&n, 0, width);
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn numbers_too_wide_for_their_column_read_shorter() {
+        let big = || Number::Value(1_234_567, Unit::Sat);
+        assert_eq!(text(big(), 13), "1,234,567 sat");
+        assert_eq!(text(big(), 12), "1.2M sat");
+        assert_eq!(text(Number::Value(5_720, Unit::Sat), 8), "5.7k sat");
+        assert_eq!(text(Number::Value(5_720, Unit::Sat), 3), "5.7k sat");
+        assert_eq!(text(Number::PerDay(5_720.9, Unit::Sat), 11), "5,721 sat/d");
+        assert_eq!(text(Number::PerDay(5_720.9, Unit::Sat), 10), "5.7k sat/d");
+        assert_eq!(text(Number::PerDay(2.25, Unit::Sat), 10), "2.2 sat/d");
+        assert_eq!(text(Number::Days(None), 11), "not falling");
+        assert_eq!(text(Number::Days(None), 8), "–");
+        let share = text(Number::Share(Some(0.5)), 15);
+        assert_eq!(
+            (share.chars().count(), share.ends_with(" 50.0%")),
+            (15, true)
+        );
+        assert_eq!(text(Number::Share(Some(0.5)), 7), " 50.0%");
+    }
 }

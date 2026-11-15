@@ -29,12 +29,23 @@ pub fn amount(value: i64, unit: Unit) -> String {
 
 /// `value` in `unit`, short enough for an axis or a narrow card: `12.3M sat`.
 pub fn compact(value: f64, unit: Unit) -> String {
+    scaled(value, unit, 1e4)
+}
+
+/// `value` in `unit` shorter still, for a narrow column: `5.7k sat`.
+pub fn shortest(value: f64, unit: Unit) -> String {
+    scaled(value, unit, 1e3)
+}
+
+/// `value` in `unit`, in thousands from `thousands` on, and in millions
+/// and billions.
+fn scaled(value: f64, unit: Unit, thousands: f64) -> String {
     let abs = value.abs();
     let (scaled, suffix) = if abs >= 1e9 {
         (value / 1e9, "G")
     } else if abs >= 1e6 {
         (value / 1e6, "M")
-    } else if abs >= 1e4 {
+    } else if abs >= thousands {
         (value / 1e3, "k")
     } else {
         (value, "")
@@ -196,6 +207,8 @@ mod tests {
         assert_eq!(compact(12_345_678.0, Unit::Sat), "12.3M sat");
         assert_eq!(compact(2_500.0, Unit::Count), "2,500");
         assert_eq!(compact(45_000.0, Unit::Count), "45.0k");
+        assert_eq!(shortest(5_720.9, Unit::Sat), "5.7k sat");
+        assert_eq!(shortest(999.0, Unit::Count), "999");
     }
 
     #[test]

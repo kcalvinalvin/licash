@@ -32,7 +32,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 
-pub use format::grouped;
+pub use format::{grouped, span};
 pub use page::{
     Better, Card, Cell, Check, Column, Measure, Page, Panel, Ref, Row, Table, Tone, Value,
 };
