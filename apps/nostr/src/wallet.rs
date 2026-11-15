@@ -7,7 +7,7 @@ use std::{collections::HashSet, future::Future, time::Duration};
 use anyhow::bail;
 use bitcoin::FeeRate;
 use futures_util::future::join_all;
-use licash_api::Payment;
+use licash_api::{Info, Payment};
 use licash_wallet::{
     Error, HubId, Paid, PaymentCode, PayoutQuote, PayoutState, Received, SwapLimits, SwapQuote,
     SwapState, Transport, Wallet,
@@ -64,6 +64,10 @@ pub struct Plan {
     pub fee: u64,
     /// The swap bringing what the wallet lacks there first, if it does.
     pub swap: Option<PlannedSwap>,
+    /// Whether the wallet trusts the hub, else only visited it
+    /// ([`Wallet::visit`]): what the swap brings past the payment stays
+    /// there, counted apart, until the owner adds it.
+    pub trusted: bool,
 }
 
 /// A swap to make before paying ([`Plan::swap`]).
@@ -93,7 +97,10 @@ impl Plan {
 /// enough at, else at one it names and `wallet` trusts once a swap brings
 /// what the wallet lacks there, from its other hub holding the most,
 /// through a provider announced on the relays its hubs name, reached
-/// through `route` ([`swap_providers`]), within [`SwapLimits::usual`].
+/// through `route` ([`swap_providers`]), within [`SwapLimits::usual`];
+/// else so at a hub the code says where to reach, visited
+/// ([`Wallet::visit`]) as the hub it names, by a swap bringing at most
+/// twice what the wallet lacks there.
 /// Refused as [`pay`] refuses when neither is possible, or while a swap
 /// to that hub is under way.
 pub async fn plan<T: Transport>(
@@ -113,6 +120,7 @@ pub async fn plan<T: Transport>(
             amount,
             fee,
             swap: None,
+            trusted: true,
         });
     }
     let relays = hub_relays(wallet)?;
@@ -126,22 +134,45 @@ pub async fn plan<T: Transport>(
         .into_iter()
         .filter(|(_, i)| i.locks.is_some())
         .collect();
-    let held = wallet.balance()?;
+    let mut held = wallet.balance()?;
+    held.extend(wallet.visited_balance()?);
     let available = |hub: &str| {
         let held = held.iter().find(|b| b.hub == hub);
         held.map_or(0, |b| b.available)
     };
-    for id in &licash.hubs {
-        let named = hubs.iter().find(|(_, i)| HubId::of(&i.address) == *id);
-        let Some((to, to_info)) = named else { continue };
+    // Pass 1, the hubs it names that the wallet trusts; pass 2, those it
+    // says where to reach, visited, proving they are the ones it names.
+    let named = licash.hubs.iter().map(|id| (*id, None));
+    let located = licash.locations.iter().map(|(id, url)| (*id, Some(url)));
+    for (id, at) in named.chain(located) {
+        let trusted = hubs.iter().find(|(_, i)| HubId::of(&i.address) == id);
+        let (to, to_info, trusted) = match (trusted, at) {
+            (Some((to, info)), None) => (to.clone(), info.clone(), true),
+            (None, Some(url)) => match visit(wallet, url, id).await {
+                Some((to, info)) => (to, info, false),
+                None => continue,
+            },
+            _ => continue,
+        };
+        let to = &to;
         if swapping_to(wallet, to)? {
             return Err(under_way(to, None));
+        }
+        let lacks = wallet.lacks(to, amount)?;
+        // Held enough at a hub visited, a swap there brought before.
+        if lacks == 0 {
+            return Ok(Plan {
+                hub: to.clone(),
+                amount,
+                fee: wallet.send_fee(to, amount)?,
+                swap: None,
+                trusted,
+            });
         }
         let others = hubs.iter().map(|(url, _)| url).filter(|url| *url != to);
         let Some(from) = others.max_by_key(|url| available(url)) else {
             continue;
         };
-        let lacks = wallet.lacks(to, amount)?;
         let limits = SwapLimits::usual(lacks);
         let found = swap_providers(wallet, &relays, route, (from, to), lacks, limits).await;
         let found = match found {
@@ -153,6 +184,11 @@ pub async fn plan<T: Transport>(
         };
         for provider in found {
             let quote = &provider.quote;
+            // Left at a hub not trusted: not much more than needed.
+            if !trusted && quote.amount > lacks.saturating_mul(2) {
+                tracing::info!(url = %provider.url, swaps = quote.amount, lacks, "skipped: brings too much to a hub not trusted");
+                continue;
+            }
             let lock_fee = match wallet.lock_fee(from, quote.amount.saturating_add(quote.fee)) {
                 Ok(fee) => fee,
                 Err(Error::Insufficient { .. }) => continue,
@@ -172,11 +208,61 @@ pub async fn plan<T: Transport>(
                     provider,
                     lock_fee,
                 }),
+                trusted,
             });
         }
         tracing::info!(%from, %to, lacks, "no swap: no provider found that it can pay");
     }
     Err(unpayable(code, amount))
+}
+
+/// The hub of `id`, one the wallet does not trust, visited where it was
+/// before, else at `url`, where the code says to reach it: as the wallet
+/// reaches it, and what it said of itself, once it proves it is that hub.
+async fn visit<T: Transport>(wallet: &Wallet<T>, url: &str, id: HubId) -> Option<(String, Info)> {
+    let found = || {
+        let visited = wallet.visited().ok()?;
+        visited
+            .into_iter()
+            .find(|(_, i)| HubId::of(&i.address) == id)
+    };
+    let kept = found().map(|(url, _)| url);
+    let same =
+        |a: &str| kept.as_deref().map(|k| k.trim_end_matches('/')) == Some(a.trim_end_matches('/'));
+    let code = Some(url).filter(|url| !same(url));
+    for at in kept.as_deref().into_iter().chain(code) {
+        match wallet.visit(at, id).await {
+            Ok(_) => return found(),
+            Err(e) => tracing::info!(url = %at, "not visited: {e}"),
+        }
+    }
+    None
+}
+
+/// Refused unless the hub of `plan`, if visited, visited again, proves it
+/// is the one visited and charges no more than planned.
+async fn charges_as_planned<T: Transport>(wallet: &Wallet<T>, plan: &Plan) -> anyhow::Result<()> {
+    let visited = wallet.visited()?;
+    let Some((_, kept)) = visited.into_iter().find(|(url, _)| *url == plan.hub) else {
+        // Added since: trusted.
+        return Ok(());
+    };
+    let info = wallet.visit(&plan.hub, HubId::of(&kept.address)).await?;
+    let held = wallet.visited_balance()?;
+    let held = held
+        .into_iter()
+        .find(|b| b.hub == plan.hub)
+        .map_or(0, |b| b.available);
+    let swapped = plan.swap.as_ref().map_or(0, |s| s.provider.quote.amount);
+    let fee = info.fees.spend.due(held.saturating_add(swapped));
+    if fee > plan.fee {
+        bail!(
+            "nothing paid: hub {} charges {fee} now, more than the {} planned",
+            plan.hub,
+            plan.fee
+        );
+    }
+    Ok(())
 }
 
 /// Pay as `plan` says, to the wallet of `code`: swap first if it says, on
@@ -190,6 +276,9 @@ pub async fn pay_planned<T: Transport>(
     route: impl FnOnce() -> anyhow::Result<Route>,
 ) -> anyhow::Result<CodePaid> {
     let amount = asked(wallet, code, Some(plan.amount))?;
+    if !plan.trusted {
+        charges_as_planned(wallet, plan).await?;
+    }
     if let Some(swap) = &plan.swap {
         let (provider, hub) = (&swap.provider, &plan.hub);
         let quote = &provider.quote;
@@ -276,9 +365,11 @@ async fn send<T: Transport>(
         return Err(unpayable(code, amount));
     };
     let paid = wallet.send(&hub, &licash.address, amount).await?;
+    // At a hub visited too: the payee's.
     let relays = wallet
         .hubs()?
         .into_iter()
+        .chain(wallet.visited()?)
         .find(|(url, _)| *url == hub)
         .map(|(_, info)| info.relays)
         .unwrap_or_default();
