@@ -451,7 +451,12 @@ impl Eco {
     }
 
     pub async fn swaps_info(&self) -> anyhow::Result<swaps::Info> {
-        let url = format!("{}{}", self.swaps, swaps::SWAPS_INFO);
+        self.swaps_info_at(&self.swaps).await
+    }
+
+    /// What the swap provider at `provider` says of itself.
+    pub async fn swaps_info_at(&self, provider: &str) -> anyhow::Result<swaps::Info> {
+        let url = format!("{provider}{}", swaps::SWAPS_INFO);
         let response = self.http.get(url).send().await?.error_for_status()?;
         Ok(response.json().await?)
     }
@@ -468,8 +473,14 @@ impl Eco {
 
     /// Where the swap of the client's lock `id`, in hex, stands.
     pub async fn swap_state(&self, id: &str) -> anyhow::Result<swaps::Swap> {
+        self.swap_state_at(&self.swaps, id).await
+    }
+
+    /// Where the swap of the client's lock `id`, in hex, stands at the
+    /// provider at `provider`.
+    pub async fn swap_state_at(&self, provider: &str, id: &str) -> anyhow::Result<swaps::Swap> {
         let id = licash_api::lock_id(id).map_err(|p| anyhow::anyhow!(p.message))?;
-        let url = format!("{}{}", self.swaps, swaps::swap_state(&id));
+        let url = format!("{provider}{}", swaps::swap_state(&id));
         let response = self.http.get(url).send().await?.error_for_status()?;
         Ok(response.json().await?)
     }

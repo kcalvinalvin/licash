@@ -130,6 +130,9 @@ services:
       relay:
         condition: service_started
 
+  # It provides the swaps into it from hub1, for 1 + 5000 ppm, holding or
+  # owed at most 30 000 of hub1's notes: its own lock there is of notes it
+  # issues, which need not outlast its window.
   hub2:
     <<: *hub
     command:
@@ -137,6 +140,7 @@ services:
         [ -f /data/seed ] || licash-hub init; exec licash-hub run --lnd https://hub2-ln:8080
         --announce-url http://127.0.0.1:${LICASH_E2E_HUB2:-38339} --announce-name hub2
         --name hub2 --notify gotify://gotify/$$(cat /notify/token)
+        --swaps --swaps-from http://hub1:8338=30000 --swaps-fee-base 1 --swaps-fee-ppm 5000
     ports:
       - "127.0.0.1:${LICASH_E2E_HUB2:-38339}:8338"
     volumes:

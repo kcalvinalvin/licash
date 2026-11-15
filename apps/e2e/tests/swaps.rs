@@ -1,6 +1,6 @@
-//! Wallets swap notes between the stack's hubs through its swap provider,
-//! which they discover on Nostr, on the stack of `apps/e2e/run.sh`, which
-//! runs these.
+//! Wallets swap notes between the stack's hubs through the swap providers
+//! they discover on Nostr: hub 2, providing the swaps into it, and the
+//! stack's own, on the stack of `apps/e2e/run.sh`, which runs these.
 
 use licash::spend::lock_hash;
 use licash_api::{
@@ -20,6 +20,14 @@ const STOCK: u64 = 60_000;
 /// 144, 1 to read the preimage, its margin of 12 to claim with it, and 1.
 const LEAD: u32 = 36 + 144 + 1 + 12 + 1;
 
+/// Blocks hub 2's own lock, of notes it issues, expires before its
+/// client's at hub 1, at least: 1 to read the preimage of an activation on
+/// Bitcoin, 36 for it to confirm, its margin of 12, and 1.
+const OWN_LEAD: u32 = 1 + 36 + 12 + 1;
+
+/// The most of hub 1's notes hub 2 holds or is owed, providing swaps.
+const CAP: u64 = 30_000;
+
 fn held(wallet: &Wallet, hub: &str) -> u64 {
     let balance = wallet.balance().unwrap();
     balance
@@ -28,10 +36,11 @@ fn held(wallet: &Wallet, hub: &str) -> u64 {
         .map_or(0, |b| b.available)
 }
 
-/// Wait for the provider's swap of the client's lock `id` to reach `state`.
-async fn reaches(eco: &Eco, id: &str, state: State) -> anyhow::Result<Swap> {
+/// Wait for the swap of the client's lock `id` at the provider at
+/// `provider` to reach `state`.
+async fn reaches(eco: &Eco, provider: &str, id: &str, state: State) -> anyhow::Result<Swap> {
     until(&format!("swap {id} {state:?}"), 120, || async {
-        let swap = eco.swap_state(id).await?;
+        let swap = eco.swap_state_at(provider, id).await?;
         Ok((swap.state == state).then_some(swap))
     })
     .await
@@ -39,46 +48,59 @@ async fn reaches(eco: &Eco, id: &str, state: State) -> anyhow::Result<Swap> {
 
 #[tokio::test]
 #[ignore = "needs the stack of apps/e2e/run.sh"]
-async fn wallets_swap_between_hubs_through_a_provider_they_discover() -> anyhow::Result<()> {
+async fn wallets_swap_into_a_hub_through_the_hub_itself_found_on_nostr() -> anyhow::Result<()> {
     let eco = Eco::up().await?;
     let (hub1, hub2) = (eco.hub(1), eco.hub(2));
     let relays = [eco.relay().to_owned()];
-    let found = until("the provider announced", 120, || async {
+    let found = until("both providers announced", 120, || async {
         let found = discover(&relays, &Route::Direct, Role::Swaps, "regtest").await?;
-        Ok((!found.is_empty()).then_some(found))
+        Ok((found.len() == 2).then_some(found))
     })
     .await?;
-    assert_eq!(found.len(), 1, "{found:?}");
-    assert_eq!(found[0].announcement.urls, [eco.swaps()]);
-    let info = eco.swaps_info().await?;
-    assert!(found[0].named_by(info.nostr.as_deref()), "{found:?}");
+    let at = |url: &str| found.iter().find(|f| f.announcement.urls == [url]);
+    let theirs = eco.swaps_info().await?;
+    assert!(at(eco.swaps()).unwrap().named_by(theirs.nostr.as_deref()));
+    // Hub 2, at its own URL, of a wallet of its own.
+    let info = eco.swaps_info_at(hub2).await?;
+    assert!(
+        at(hub2).unwrap().named_by(info.nostr.as_deref()),
+        "{found:?}"
+    );
     assert_eq!((info.fee.base, info.fee.ppm), (1, 5000));
-    let at_hub2 = info.hub(&eco.info(hub2).await?.address).unwrap();
-    assert_eq!(info.margin_at(at_hub2), LEAD);
+    let address = eco.info(hub2).await?.address;
+    assert_ne!(info.address, address);
+    // Its lock outlives no window of its own: far less than the stack's
+    // provider's.
+    let at_hub2 = info.hub(&address).unwrap();
+    assert_eq!(info.margin_at(at_hub2), OWN_LEAD);
+    let other = theirs.hub(&address).unwrap();
+    assert_eq!(theirs.margin_at(other), LEAD);
 
-    eco.stock(STOCK).await?;
     let alice = eco.wallet("swapper")?;
-    eco.pay_in(&alice, hub1, 30_000).await?;
+    eco.pay_in(&alice, hub1, 60_000).await?;
     alice.add_hub(hub2).await?;
     let swap = alice
-        .swap(eco.swaps(), hub1, hub2, 10_000, SwapLimits::usual(10_000))
+        .swap(hub2, hub1, hub2, 10_000, SwapLimits::usual(10_000))
         .await?;
     assert_eq!(swap.state, SwapState::Done, "{swap:?}");
     // 1 + 5000 ppm of 10 000.
     assert_eq!(swap.fee, 51);
     assert_eq!(held(&alice, hub2), 10_000);
 
-    // The provider claims Alice's lock with the preimage she revealed.
+    // Hub 2 claims Alice's lock with the preimage she revealed to it.
     let id = swap.lock.clone().unwrap();
-    reaches(&eco, &id, State::Done).await?;
+    reaches(&eco, hub2, &id, State::Done).await?;
     alice.resume().await?;
     let ours = alice.locks()?.into_iter().find(|l| l.id == id).unwrap();
     assert!(matches!(ours.state, LockState::Paid(_)), "{ours:?}");
     assert_eq!(ours.amount, 10_051);
 
-    // Beyond what it holds at hub 2: Alice locks nothing.
+    // Holding 10 051 of hub 1's notes, it takes no more than its cap's
+    // rest: Alice locks nothing.
+    let room = eco.swaps_info_at(hub2).await?.hub(&address).unwrap().max;
+    assert!(room <= CAP - 10_051, "{room}");
     let e = alice
-        .swap(eco.swaps(), hub1, hub2, 190_000, SwapLimits::usual(190_000))
+        .swap(hub2, hub1, hub2, 25_000, SwapLimits::usual(25_000))
         .await
         .unwrap_err();
     assert!(matches!(e, licash_wallet::Error::Invalid(_)), "{e}");
@@ -151,13 +173,13 @@ async fn a_provider_restarted_takes_its_swaps_on_and_unclaimed_locks_return() ->
     let lock = hex::encode(&theirs.lock.unwrap().0);
     let received = bob.claim(hub2, &lock, &preimages[0]).await?;
     assert_eq!(received.amount, 5_000);
-    reaches(&eco, &claimed.id, State::Done).await?;
+    reaches(&eco, eco.swaps(), &claimed.id, State::Done).await?;
 
     // Unclaimed, the provider's second lock returns to it once expired at
     // the hub's depth of 3.
     let height = eco.height().await?;
     eco.mine(other.expiry + 3 + 1 - height).await?;
-    reaches(&eco, &unclaimed.id, State::Refunded).await?;
+    reaches(&eco, eco.swaps(), &unclaimed.id, State::Refunded).await?;
     // Bob's returns to him once his expired.
     let height = eco.height().await?;
     eco.mine(expiry + 3 + 1 - height).await?;
