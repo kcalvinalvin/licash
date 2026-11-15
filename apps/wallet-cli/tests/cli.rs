@@ -794,6 +794,56 @@ fn a_payment_at_a_hub_holding_too_little_swaps_there_first_within_its_fees() {
 }
 
 #[test]
+fn what_paying_at_a_hub_not_added_leaves_there_is_shown_apart_until_added() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let (_relay, relay) = support::relay(&runtime);
+    let relays = vec![relay];
+    let a = Server::with_relays(FEE, relays.clone());
+    let b = Server::with_relays(FEE, relays.clone());
+    let swaps = Swaps::start(&[&a, &b], 200);
+    let secret = swaps.provider.nostr_secret().unwrap();
+    announce_provider(&runtime, &relays, secret, swaps.url());
+    let dir = tempfile::tempdir().unwrap();
+    // Alice holds 100 at A alone; Bob's code names B, saying where it is.
+    let (alice, alice_at) = party(dir.path(), "alice", Some(&a));
+    let funds = serde_json::to_string(&a.pay(&address(&alice_at), 100)).unwrap();
+    ok(wallet(&alice, &["receive"], Some(&funds)));
+    let (bob, _) = party(dir.path(), "bob", Some(&b));
+    let code = json(&bob, &["code"])["code"].as_str().unwrap().to_owned();
+
+    // 3 at B: the provider swaps no less than its 5 there, 1 left past the
+    // payment and B's fee.
+    let output = wallet(&alice, &["pay", &code, "3", "--max-fee", "20"], None);
+    let said = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        said.contains(&format!("{} is not a hub you added", b.url())),
+        "{said}"
+    );
+    ok(output);
+    // Its lock at A done once the provider takes it.
+    swaps.until(|r| r.stage == licash_swaps::Stage::Done);
+    ok(wallet(&alice, &["resume"], None));
+    assert_eq!(json(&bob, &["mailbox"])["received"][0]["amount"], 3);
+    let (held, _) = available(&alice);
+    assert!(held < 100 - 3, "{held}");
+    let text = ok(wallet(&alice, &["balance"], None));
+    let apart = format!("{}  1 (not added: add-hub to count it)", b.url());
+    assert!(
+        text.contains(&apart) && text.contains(&format!("total  {held}")),
+        "{text}"
+    );
+
+    // Added, it counts.
+    ok(wallet(&alice, &["add-hub", &b.url()], None));
+    assert_eq!(available(&alice), (held + 1, 0));
+    let text = ok(wallet(&alice, &["balance"], None));
+    assert!(
+        !text.contains("not added") && text.contains(&format!("total  {}", held + 1)),
+        "{text}"
+    );
+}
+
+#[test]
 fn a_tor_client_of_its_own_keeps_its_state_next_to_the_wallet() {
     let dir = tempfile::tempdir().unwrap();
     let (alice, _) = party(dir.path(), "alice", None);

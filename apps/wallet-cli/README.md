@@ -27,7 +27,11 @@ holds enough at, and sends the payment to the mailbox, else prints it to
 hand over; `mailbox` receives what was sent there. Where the wallet holds
 too little, it swaps what it lacks there first through a provider
 announced on its hubs' relays, only if given `--max-fee` (all fees,
-swap included): without it, it says what the payment would cost.
+swap included): without it, it says what the payment would cost. A code
+naming no hub the wallet trusts is paid so at a hub it says where to reach,
+visited only if it proves it is the hub the code names: what the swap brings
+past the payment stays there, apart from the hubs added, until `add-hub`:
+`balance` shows it after the total, outside it and its `--json` rows.
 
 A lock pays its payee on a secret's preimage until it expires, then returns
 to the payer: the payee runs `secret` and hands over the hash, the payer

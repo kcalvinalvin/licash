@@ -530,6 +530,17 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 })
                 .collect();
             lines.push(format!("total  {total}"));
+            // Left at hubs visited to pay there, apart from the total (and
+            // from the JSON rows, which sum to it) until added.
+            for b in wallet.visited_balance()? {
+                if b.available + b.pending > 0 {
+                    let held = b.available + b.pending;
+                    lines.push(format!(
+                        "{}  {held} (not added: add-hub to count it)",
+                        b.hub
+                    ));
+                }
+            }
             show(json, rows.collect(), lines.join("\n"));
         }
         Command::Send {
