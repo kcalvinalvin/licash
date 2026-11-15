@@ -18,7 +18,7 @@
 //! are the application's to broadcast, again after each follow, until they
 //! confirm.
 
-use std::str::FromStr;
+use std::{str::FromStr, sync::PoisonError};
 
 use bitcoin::{
     absolute::LOCK_TIME_THRESHOLD,
@@ -121,6 +121,35 @@ pub struct Payout {
     pub claim: Option<Txid>,
     pub state: PayoutState,
     pub created_at: i64,
+}
+
+/// How far a payout has come, step by step, as the wallet last saw it:
+/// for an application to show where it stands.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PayoutProgress {
+    /// The wallet's lock to the provider once made, where it stands, and
+    /// the block from which its hub refunds it unpaid.
+    pub lock: Option<(LockState, u32)>,
+    /// The block from which the provider may take its coin back, once the
+    /// provider took the payout.
+    pub timeout: Option<u32>,
+    /// The last block the wallet claims the coin at: [`CLAIM_ROOM`] before
+    /// the timeout, for the claim to confirm in time. Past it, the payout
+    /// fails and the lock is refunded.
+    pub claim_by: Option<u32>,
+    /// The provider's coin: as found on chain, or else as the provider told
+    /// of it since the wallet was opened, maybe not confirmed yet.
+    pub coin: Option<Txid>,
+    /// The block the coin is in: as found, or else as the provider told.
+    pub coin_height: Option<u32>,
+    /// The wallet's claim of the coin, once made.
+    pub claim: Option<Txid>,
+    /// The block the claim is in, once found.
+    pub claim_height: Option<u32>,
+    /// The confirmations awaited: of the coin before it is claimed, of the
+    /// claim before the payout is done.
+    pub depth: u32,
 }
 
 /// Where a payout stands.
@@ -311,6 +340,58 @@ impl<T: Transport> Wallet<T> {
         self.payout_after(&bytes, advanced)
     }
 
+    /// How far the payout of `hash` has come, step by step. Reads only what
+    /// the wallet holds and was told since opened: following it learns more.
+    pub fn payout_progress(&self, hash: &str) -> Result<PayoutProgress, Error> {
+        let mut bytes = [0; 32];
+        hex::decode_to_slice(hash, &mut bytes)
+            .map_err(|_| Error::Invalid(format!("not a payout's hash: {hash}")))?;
+        let payout = self.payout_record(&bytes)?;
+        type Heights = (Option<u32>, Option<u32>, Option<u32>);
+        let (timeout, found_height, spent_height): Heights = self.store.read(|c| {
+            Ok(c.query_row(
+                "SELECT timeout, funding_height, spent_height FROM payouts WHERE hash = ?1",
+                [bytes],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?)
+        })?;
+        let lock = match &payout.lock {
+            Some(id) => {
+                let mut lock = [0; 32];
+                hex::decode_to_slice(id, &mut lock).map_err(invalid)?;
+                let lock = self.lock_record(&ProposalId::from_bytes(lock))?;
+                Some((lock.state, lock.expiry))
+            }
+            None => None,
+        };
+        let told = self
+            .told_coins
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&bytes)
+            .copied();
+        let (coin, coin_height) = match payout.funding {
+            Some(funding) => (Some(funding.txid), found_height),
+            None => told.map_or((None, None), |(txid, height)| (Some(txid), height)),
+        };
+        // The coin's spend is the claim's unless the payout failed after.
+        let claim_height = match payout.state {
+            PayoutState::Failed(_) => None,
+            _ if payout.claim.is_some() => spent_height,
+            _ => None,
+        };
+        Ok(PayoutProgress {
+            lock,
+            timeout,
+            claim_by: timeout.and_then(|t| t.checked_sub(CLAIM_ROOM)),
+            coin,
+            coin_height,
+            claim: payout.claim,
+            claim_height,
+            depth: payout_depth(self.network()),
+        })
+    }
+
     /// Take every payout under way on, as [`Wallet::follow_payout`]: where
     /// each stands, and why those still under way wait.
     pub async fn follow_payouts(
@@ -475,6 +556,20 @@ impl<T: Transport> Wallet<T> {
         };
         if answer.id.0 != id.as_bytes() {
             return Err(unavailable(provider, "it answered with another payout"));
+        }
+        // Where the provider says its coin is, to show before it is checked.
+        let told = match (&answer.funding, &answer.txid) {
+            (Some(funding), _) => Txid::from_str(&funding.txid)
+                .ok()
+                .map(|t| (t, Some(funding.height))),
+            (None, Some(txid)) => Txid::from_str(txid).ok().map(|t| (t, None)),
+            (None, None) => None,
+        };
+        if let Some(told) = told {
+            self.told_coins
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(*hash, told);
         }
         if let Theirs::Failed | Theirs::Refunded = answer.state {
             let reason = answer.reason.as_deref().unwrap_or("no reason given");

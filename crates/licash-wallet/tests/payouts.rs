@@ -121,6 +121,7 @@ impl Desk {
             refund: Hex(self.refund_key().serialize().to_vec()),
             timeout: htlc.timeout,
             funding: None,
+            txid: None,
             reason: None,
         };
         let taken = Taken {
@@ -380,6 +381,47 @@ fn failed(payout: &Payout, why: &str) {
         PayoutState::Failed(reason) => assert!(reason.contains(why), "{reason}"),
         other => panic!("{other:?}"),
     }
+}
+
+#[tokio::test]
+async fn a_payouts_progress_shows_each_step_as_it_comes() {
+    let eco = Eco::new().await;
+    let payout = eco.pay_out(1000).await;
+    let progress = |eco: &Eco| eco.client.payout_progress(&payout.hash).unwrap();
+    let first = progress(&eco);
+    assert!(first.lock.is_some(), "{first:?}");
+    assert_eq!((first.coin, first.claim, first.depth), (None, None, 1));
+    pending(eco.follow(&payout).await, "not confirmed yet");
+    // Certified, and the provider's terms taken: the block to claim by.
+    let taken = progress(&eco);
+    let (state, expiry) = taken.lock.clone().unwrap();
+    assert_eq!(state, LockState::Locked);
+    let timeout = eco.desk.with(|t| t.htlc.timeout);
+    assert!(timeout < expiry, "{timeout} {expiry}");
+    assert_eq!(taken.timeout, Some(timeout));
+    assert_eq!(taken.claim_by, Some(timeout - CLAIM_ROOM));
+    assert_eq!(taken.coin, None);
+    // Broadcast, not confirmed: shown as the provider tells of it.
+    let told = Txid::from_byte_array([0xab; 32]);
+    eco.desk.with(|t| t.answer.txid = Some(told.to_string()));
+    pending(eco.follow(&payout).await, "not confirmed yet");
+    let broadcast = progress(&eco);
+    assert_eq!((broadcast.coin, broadcast.coin_height), (Some(told), None));
+    // Confirmed and claimed: the coin as found, then the claim's block.
+    let coin = eco.desk.fund(None, None);
+    let funded = eco.net.view(A).height();
+    let claimed = eco.follow(&payout).await.unwrap();
+    let claiming = progress(&eco);
+    assert_eq!(claiming.coin, Some(coin.txid));
+    assert_eq!(claiming.coin_height, Some(funded));
+    assert_eq!(
+        (claiming.claim, claiming.claim_height),
+        (claimed.claim, None)
+    );
+    eco.net.confirm(A, eco.client.payout_claims().unwrap());
+    assert_eq!(eco.follow(&payout).await.unwrap().state, PayoutState::Done);
+    let done = progress(&eco);
+    assert_eq!(done.claim_height, Some(eco.net.view(A).height()));
 }
 
 #[tokio::test]

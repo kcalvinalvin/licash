@@ -509,6 +509,7 @@ fn payout_bodies_name_their_fields_on_the_wire() {
             vout: 1,
             height: 350,
         }),
+        txid: None,
         reason: None,
     };
     assert_eq!(json(&answer), answer);
@@ -531,6 +532,19 @@ fn payout_bodies_name_their_fields_on_the_wire() {
         "{text}"
     );
     assert_eq!(json(&waiting), waiting);
+    // Broadcast, not confirmed: its transaction alone, which a provider
+    // before it never says.
+    let broadcast = ChainSwap {
+        txid: Some("22".repeat(32)),
+        ..waiting.clone()
+    };
+    let value = serde_json::to_value(&broadcast).unwrap();
+    assert_eq!(value["txid"], json!("22".repeat(32)));
+    assert_eq!(json(&broadcast), broadcast);
+    let mut old = value;
+    old.as_object_mut().unwrap().remove("txid");
+    let old: ChainSwap = serde_json::from_value(old).unwrap();
+    assert_eq!(old, waiting);
     assert_eq!(
         (swaps::CHAIN_SWAPS, swaps::chain_swap_state(&id)),
         (

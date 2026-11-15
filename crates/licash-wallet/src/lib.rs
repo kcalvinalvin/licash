@@ -33,7 +33,13 @@ mod silent;
 mod store;
 mod swaps;
 
-use std::{cmp::Reverse, collections::HashSet, future::Future, path::Path, sync::Mutex};
+use std::{
+    cmp::Reverse,
+    collections::{HashMap, HashSet},
+    future::Future,
+    path::Path,
+    sync::Mutex,
+};
 
 use licash::{
     address::{Address, Ephemeral, OwnerKeys},
@@ -57,7 +63,9 @@ pub use coins::MAX_INPUTS;
 pub use deposits::{Deposit, DepositState, DepositTerms};
 pub use lightning::{Invoice, InvoiceState, Payable};
 pub use locks::{Incoming, Lock, LockState, CLAIM_MARGIN};
-pub use payouts::{first_spend, payout_depth, Payout, PayoutQuote, PayoutState, CLAIM_ROOM};
+pub use payouts::{
+    first_spend, payout_depth, Payout, PayoutProgress, PayoutQuote, PayoutState, CLAIM_ROOM,
+};
 pub use silent::{Blocks, Payee, Scanned, SilentCoin, SilentSpend};
 use store::{now, sql, Owner, Store};
 pub use swaps::{Swap, SwapLimits, SwapQuote, SwapState, SWAP_WINDOW};
@@ -295,7 +303,14 @@ pub struct Wallet<T> {
     transport: T,
     /// The hubs reached over plain HTTP asked over HTTPS since opened.
     asked_secure: Mutex<HashSet<i64>>,
+    /// The coins of payouts as their providers told of them since opened,
+    /// confirmed or not, and their blocks if confirmed: by payout hash.
+    told_coins: Mutex<HashMap<[u8; 32], Told>>,
 }
+
+/// A payout's coin as its provider told of it: its transaction, and its
+/// block once confirmed.
+type Told = (bitcoin::Txid, Option<u32>);
 
 /// A note the wallet holds, with where it was made: the scan key derives
 /// it again from there.
@@ -348,6 +363,7 @@ impl<T: Transport> Wallet<T> {
             network,
             transport,
             asked_secure: Mutex::default(),
+            told_coins: Mutex::default(),
         })
     }
 
@@ -382,6 +398,7 @@ impl<T: Transport> Wallet<T> {
             network,
             transport,
             asked_secure: Mutex::default(),
+            told_coins: Mutex::default(),
         })
     }
 

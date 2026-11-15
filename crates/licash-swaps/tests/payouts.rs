@@ -395,6 +395,35 @@ async fn a_payout_claimed_pays_the_provider_its_lock() {
 }
 
 #[tokio::test]
+async fn a_payouts_coin_is_told_of_before_it_confirms() {
+    let eco = Eco::new(STOCK, TERMS).await;
+    let payout = eco.pay_out(1_000).await;
+    let coin = eco.pool.waiting();
+    assert_eq!(coin.len(), 1);
+    let txid = coin[0].compute_txid();
+    let lock = licash::spend::ProposalId::from_bytes(
+        hex::decode(payout.lock.as_ref().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap(),
+    );
+    let answer = eco.provider().payout(&lock).unwrap().unwrap();
+    assert_eq!(answer.funding, None);
+    assert_eq!(answer.txid, Some(txid.to_string()));
+    // The client shows it at once, in no block yet.
+    assert_eq!(eco.client_follows(&payout).await.state, PayoutState::Open);
+    let progress = eco.client.payout_progress(&payout.hash).unwrap();
+    assert_eq!((progress.coin, progress.coin_height), (Some(txid), None));
+    eco.pool.mine();
+    eco.follow().await;
+    let claimed = eco.client_follows(&payout).await;
+    assert_eq!(claimed.state, PayoutState::Claimed);
+    let progress = eco.client.payout_progress(&payout.hash).unwrap();
+    assert_eq!(progress.coin, Some(txid));
+    assert_eq!(progress.coin_height, Some(eco.pool.view.height()));
+}
+
+#[tokio::test]
 async fn a_coin_never_claimed_is_taken_back_once_timed_out() {
     let eco = Eco::new(STOCK, TERMS).await;
     let payout = eco.pay_out(1_000).await;

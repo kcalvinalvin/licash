@@ -394,6 +394,10 @@ impl<T: Transport> Provider<T> {
             refund: Hex(coin.htlc.refund.serialize().to_vec()),
             timeout: coin.htlc.timeout,
             funding,
+            txid: coin
+                .funding
+                .as_ref()
+                .map(|(tx, _)| tx.compute_txid().to_string()),
             reason: row.reason.clone(),
         }))
     }

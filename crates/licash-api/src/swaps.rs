@@ -250,6 +250,11 @@ pub struct ChainSwap {
     /// The coin, once confirmed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub funding: Option<Funding>,
+    /// The coin's transaction once broadcast, confirmed or not: for the
+    /// client to show it before `funding` says where it is. Providers
+    /// before it say nothing of it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub txid: Option<String>,
     /// Why it failed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
