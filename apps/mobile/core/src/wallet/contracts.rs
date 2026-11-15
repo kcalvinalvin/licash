@@ -215,9 +215,12 @@ impl Wallet {
                         .collect();
                     match self.move_keeping(chain.clone(), &keep, Some(hub)) {
                         Ok(activity) => moved.push(activity),
-                        Err(e) => {
+                        Err(e) if retried(&e) => {
                             tracing::warn!(%deposit, "moving a contract's change: {e}");
                             left.push(deposit);
+                        }
+                        Err(e) => {
+                            tracing::info!(%deposit, "a contract's change stays on Bitcoin: {e}");
                         }
                     }
                 }
@@ -460,6 +463,16 @@ enum Change<'a> {
     None,
     /// Move this coin into Licash at this hub.
     Move(OutPoint, &'a str),
+}
+
+/// Whether moving a contract's change that failed with `e` is tried
+/// again next round: not if it never can be, as when the change is less
+/// than the hub takes, so it stays on Bitcoin.
+fn retried(e: &LicashError) -> bool {
+    !matches!(
+        e,
+        LicashError::Insufficient { .. } | LicashError::Invalid { .. }
+    )
 }
 
 /// What becomes of the change of the contract of `all` paid from
@@ -931,6 +944,26 @@ mod tests {
         // Buried with no change of the wallet's: none ever comes.
         let live = paid(Phase::Funded, Some(Fate::Live));
         assert_eq!(change(&[live], &[], &deposit), Change::None);
+    }
+
+    #[test]
+    fn a_change_too_small_to_move_is_not_tried_again_one_unreachable_is() {
+        let small = LicashError::Insufficient {
+            needed: 10_000,
+            available: 9_900,
+        };
+        assert!(!retried(&small));
+        assert!(!retried(&LicashError::invalid(
+            "no hub trusted takes coins"
+        )));
+        let down = LicashError::Unavailable {
+            reason: "broadcasting".into(),
+        };
+        assert!(retried(&down));
+        assert!(retried(&LicashError::NeedsTor));
+        assert!(retried(&LicashError::Failed {
+            reason: "disk".into()
+        }));
     }
 
     #[test]
