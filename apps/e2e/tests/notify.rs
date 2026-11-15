@@ -17,7 +17,10 @@ async fn operators_are_notified_on_gotify() -> anyhow::Result<()> {
     };
     // Each hub's start, at low priority.
     for hub in ["hub1", "hub2"] {
-        assert_eq!(find(&format!("{hub}: Hub started"), "(boot ")?.priority, 3);
+        assert_eq!(
+            find(&format!("{hub}: Hub started"), "• Boot: ")?.priority,
+            3
+        );
     }
     // Started with no channels, and the provider with nothing to swap with:
     // alerts, at high priority.
@@ -38,8 +41,7 @@ async fn operators_are_notified_on_gotify() -> anyhow::Result<()> {
     })
     .await?;
     assert!(
-        paid.message
-            .starts_with("A lock of 4,321 sat paid its payee"),
+        paid.message.starts_with("• Amount: 4,321 sat\n"),
         "{paid:?}"
     );
     assert_eq!(paid.priority, 3);

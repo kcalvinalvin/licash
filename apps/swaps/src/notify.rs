@@ -3,7 +3,7 @@
 
 use std::{path::Path, sync::Arc, time::Duration};
 
-use licash_notify::{sat, Item, Message, Outbox, Priority, Relay, Target};
+use licash_notify::{list, sat, short, Item, Message, Outbox, Priority, Relay, Target};
 use licash_swaps::{Event, Notice, Provider};
 use licash_wallet::Transport;
 
@@ -63,8 +63,7 @@ impl Notifier {
             Message::new(
                 Priority::Normal,
                 "Swaps stopped",
-                "The swap provider stopped: the swaps and payouts under way resume when it \
-                 starts again.",
+                "Swaps and payouts under way resume on restart.",
             ),
         );
         if tokio::time::timeout(STOP_WITHIN, self.relay.alert(&message))
@@ -119,55 +118,57 @@ pub fn message(event: &Event) -> Message {
             Some(network) => Message::new(
                 Priority::Low,
                 "Payout accepted",
-                format!(
-                    "{} from {from} to pay out on Bitcoin ({network}), for a fee of {}. \
-                     Payout {id}.",
-                    sat(amount),
-                    sat(fee)
-                ),
+                list(&[
+                    ("Amount", sat(amount)),
+                    ("Fee", sat(fee)),
+                    ("From", from),
+                    ("To", format!("Bitcoin ({network})")),
+                    ("Payout", short(&id)),
+                ]),
             ),
             None => Message::new(
                 Priority::Low,
                 "Swap accepted",
-                format!(
-                    "{} from {from} to {to}, for a fee of {}. Swap {id}.",
-                    sat(amount),
-                    sat(fee)
-                ),
+                list(&[
+                    ("Amount", sat(amount)),
+                    ("Fee", sat(fee)),
+                    ("From", from),
+                    ("To", to),
+                    ("Swap", short(&id)),
+                ]),
             ),
         },
         Some(Notice::Done { id, amount, fee }) => Message::new(
             Priority::Low,
             "Swap done",
-            format!(
-                "{} delivered and the client's side claimed: the provider earned {}. \
-                 Swap {id}.",
-                sat(amount),
-                sat(fee)
-            ),
+            list(&[
+                ("Amount", sat(amount)),
+                ("Earned", sat(fee)),
+                ("Swap", short(&id)),
+            ]),
         ),
         Some(Notice::Refunded { id, amount }) => Message::new(
             Priority::Normal,
             "Swap refunded",
-            format!(
-                "The client never claimed the {} the provider locked for it, so the provider \
-                 took it back. Swap {id}.",
-                sat(amount)
-            ),
+            list(&[
+                ("Amount", sat(amount)),
+                ("Reason", "the client never claimed".to_owned()),
+                ("Swap", short(&id)),
+            ]),
         ),
         Some(Notice::Failed { id, reason }) => Message::new(
             Priority::Normal,
             "Swap failed",
-            format!("The provider locked nothing ({reason}). Swap {id}."),
+            list(&[("Reason", reason), ("Swap", short(&id))]),
         ),
         Some(Notice::Lost { id, amount, reason }) => Message::new(
             Priority::High,
             "Swap lost",
-            format!(
-                "The client got {}, but the provider failed to claim the client's lock in \
-                 return ({reason}): that amount is lost. Swap {id}.",
-                sat(amount)
-            ),
+            list(&[
+                ("Lost", sat(amount)),
+                ("Reason", reason),
+                ("Swap", short(&id)),
+            ]),
         ),
         Some(Notice::Alert { message }) => Message::new(Priority::High, "Swaps alert", message),
         _ => Message::new(
@@ -228,11 +229,21 @@ mod tests {
         assert_eq!(kinds, KINDS);
         let messages: Vec<Message> = notices.iter().map(|n| message(&event(n))).collect();
         assert_eq!(messages[0].title, "Swap accepted");
-        assert!(messages[0]
-            .body
-            .contains("5,000 sat from https://a.example"));
+        assert_eq!(
+            messages[0].body,
+            "• Amount: 5,000 sat\n• Fee: 6 sat\n• From: https://a.example\n\
+             • To: https://b.example\n• Swap: ab"
+        );
+        assert_eq!(
+            messages[1].body,
+            "• Amount: 5,000 sat\n• Earned: 6 sat\n• Swap: ab"
+        );
+        assert_eq!(messages[3].body, "• Reason: hub refused\n• Swap: ab");
         assert_eq!(messages[4].priority, Priority::High);
-        assert!(messages[4].body.contains("too late"));
+        assert_eq!(
+            messages[4].body,
+            "• Lost: 5,000 sat\n• Reason: too late\n• Swap: ab"
+        );
         assert_eq!(messages[5].body, "look");
         let unknown = Event {
             kind: "future".into(),
@@ -243,9 +254,9 @@ mod tests {
     }
 
     #[test]
-    fn a_payout_reads_as_one_its_amounts_in_sat() {
+    fn a_payout_reads_as_one_its_amounts_in_sat_its_id_cut_short() {
         let payout = Notice::Accepted {
-            id: "cd".into(),
+            id: "cd".repeat(32),
             amount: 125_000,
             fee: 1_250,
             from: "https://a.example".into(),
@@ -255,8 +266,8 @@ mod tests {
         assert_eq!(message.title, "Payout accepted");
         assert_eq!(
             message.body,
-            "125,000 sat from https://a.example to pay out on Bitcoin (signet), for a fee of \
-             1,250 sat. Payout cd."
+            "• Amount: 125,000 sat\n• Fee: 1,250 sat\n• From: https://a.example\n\
+             • To: Bitcoin (signet)\n• Payout: cdcdcdcdcdcd…"
         );
     }
 }

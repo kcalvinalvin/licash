@@ -45,6 +45,24 @@ pub fn sat(amount: u64) -> String {
     grouped + " sat"
 }
 
+/// `id` cut to its first 12 characters, as the dashboards show it.
+pub fn short(id: &str) -> String {
+    const SHOWN: usize = 12;
+    match id.char_indices().nth(SHOWN) {
+        Some((cut, _)) => format!("{}…", &id[..cut]),
+        None => id.to_owned(),
+    }
+}
+
+/// A body of one `Label: value` bullet per line.
+pub fn list<V: AsRef<str>>(fields: &[(&str, V)]) -> String {
+    fields
+        .iter()
+        .map(|(label, value)| format!("• {label}: {}", value.as_ref()))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// The HTTP client targets are sent with. Installs the TLS provider once.
 pub fn client() -> anyhow::Result<reqwest::Client> {
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -66,5 +84,21 @@ mod tests {
         assert_eq!(sat(123_456), "123,456 sat");
         assert_eq!(sat(1_234_567), "1,234,567 sat");
         assert_eq!(sat(u64::MAX), "18,446,744,073,709,551,615 sat");
+    }
+
+    #[test]
+    fn ids_are_cut_to_twelve_characters() {
+        assert_eq!(short(&"ab".repeat(32)), "abababababab…");
+        assert_eq!(short("abcdef012345"), "abcdef012345");
+        assert_eq!(short("p1"), "p1");
+        assert_eq!(short("ééééééééééééé"), "éééééééééééé…");
+    }
+
+    #[test]
+    fn fields_list_one_bullet_per_line() {
+        assert_eq!(
+            list(&[("Amount", sat(5_000)), ("Swap", short("ab"))]),
+            "• Amount: 5,000 sat\n• Swap: ab"
+        );
     }
 }

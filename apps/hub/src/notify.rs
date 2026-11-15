@@ -8,7 +8,7 @@ use std::{
 };
 
 use licash_hub::{Event, Hub, Ledger, Notice, Settled};
-use licash_notify::{sat, Item, Message, Outbox, Priority, Relay, Target, Timing};
+use licash_notify::{list, sat, short, Item, Message, Outbox, Priority, Relay, Target, Timing};
 
 /// The kinds of the hub's events.
 pub const KINDS: [&str; 9] = [
@@ -144,7 +144,7 @@ pub fn message(event: &Event) -> Message {
         Some(Notice::Started { boot }) => Message::new(
             Priority::Low,
             "Hub started",
-            format!("The hub is serving (boot {boot})."),
+            list(&[("Boot", short(&boot))]),
         ),
         Some(Notice::Released {
             proposal,
@@ -153,19 +153,19 @@ pub fn message(event: &Event) -> Message {
         }) => Message::new(
             Priority::Low,
             "Spend released",
-            format!(
-                "Notes worth {} spent, {} of it the hub's fee. Proposal {proposal}.",
-                sat(amount),
-                sat(fee)
-            ),
+            list(&[
+                ("Amount", sat(amount)),
+                ("Fee", sat(fee)),
+                ("Proposal", short(&proposal)),
+            ]),
         ),
         Some(Notice::DoubleSpend { proposal, spent_by }) => Message::new(
             Priority::High,
             "Double spend refused",
-            format!(
-                "Proposal {proposal} tried to spend notes that proposal {spent_by} already \
-                 spent: refused."
-            ),
+            list(&[
+                ("Proposal", short(&proposal)),
+                ("Spent by", short(&spent_by)),
+            ]),
         ),
         Some(Notice::Locked {
             proposal,
@@ -176,12 +176,12 @@ pub fn message(event: &Event) -> Message {
         }) => Message::new(
             Priority::Low,
             "Lock admitted",
-            format!(
-                "{} locked until block {expiry}: paid if its condition is met by then, else \
-                 refunded. {} of it is the hub's fee if it pays. Proposal {proposal}.",
-                sat(amount),
-                sat(fee)
-            ),
+            list(&[
+                ("Amount", sat(amount)),
+                ("Fee if paid", sat(fee)),
+                ("Expiry", format!("block {expiry}")),
+                ("Proposal", short(&proposal)),
+            ]),
         ),
         Some(Notice::Locked {
             proposal,
@@ -192,41 +192,32 @@ pub fn message(event: &Event) -> Message {
         }) => Message::new(
             Priority::Low,
             "Own lock admitted",
-            format!(
-                "{} of the hub's own notes locked until block {expiry}, backing what it holds \
-                 under the same hash. Proposal {proposal}.",
-                sat(amount)
-            ),
+            list(&[
+                ("Amount", sat(amount)),
+                ("Expiry", format!("block {expiry}")),
+                ("Proposal", short(&proposal)),
+            ]),
         ),
         Some(Notice::Settled {
             proposal,
             amount,
             fee,
-            branch: Settled::Pay,
-        }) => Message::new(
-            Priority::Low,
-            "Lock paid",
-            format!(
-                "A lock of {} paid its payee, {} of it the hub's fee. Proposal {proposal}.",
-                sat(amount),
-                sat(fee)
-            ),
-        ),
-        Some(Notice::Settled {
-            proposal,
-            amount,
-            fee,
-            branch: Settled::Refund,
-        }) => Message::new(
-            Priority::Normal,
-            "Lock refunded",
-            format!(
-                "A lock of {} went back to its payer, {} of it the hub's fee. \
-                 Proposal {proposal}.",
-                sat(amount),
-                sat(fee)
-            ),
-        ),
+            branch,
+        }) => {
+            let (priority, title) = match branch {
+                Settled::Pay => (Priority::Low, "Lock paid"),
+                Settled::Refund => (Priority::Normal, "Lock refunded"),
+            };
+            Message::new(
+                priority,
+                title,
+                list(&[
+                    ("Amount", sat(amount)),
+                    ("Fee", sat(fee)),
+                    ("Proposal", short(&proposal)),
+                ]),
+            )
+        }
         Some(Notice::Activated {
             proposal,
             height,
@@ -234,10 +225,10 @@ pub fn message(event: &Event) -> Message {
         }) => Message::new(
             Priority::High,
             "Lock activated on Bitcoin",
-            format!(
-                "The secret unlocking proposal {proposal} was published on Bitcoin at block \
-                 {height}, in time: the lock pays its payee."
-            ),
+            list(&[
+                ("Block", height.to_string()),
+                ("Proposal", short(&proposal)),
+            ]),
         ),
         Some(Notice::Activated {
             proposal,
@@ -246,19 +237,22 @@ pub fn message(event: &Event) -> Message {
         }) => Message::new(
             Priority::High,
             "Refunded lock activated",
-            format!(
-                "After a reorganization, the secret unlocking proposal {proposal} was \
-                 published on Bitcoin at block {height}, though the hub had refunded the lock: \
-                 it owes the payee too. Check the hub's reserves."
-            ),
+            list(&[
+                ("Block", height.to_string()),
+                ("Proposal", short(&proposal)),
+                ("Action", "check the hub's reserves".to_owned()),
+            ]),
         ),
         Some(Notice::Reorg { height }) => Message::new(
             Priority::High,
             "Checkpoint reorganized",
-            format!(
-                "Bitcoin reorganized at block {height}, at or below a checkpoint. The hub \
-                 stopped following Bitcoin: it takes and refunds no locks until you act."
-            ),
+            list(&[
+                ("Block", height.to_string()),
+                (
+                    "Action",
+                    "the hub follows Bitcoin no more until you act".to_owned(),
+                ),
+            ]),
         ),
         Some(Notice::Forwarded {
             proposal,
@@ -267,11 +261,7 @@ pub fn message(event: &Event) -> Message {
         }) => Message::new(
             Priority::Low,
             "Payment forwarded",
-            format!(
-                "A lock of {} paid outside the hub, such as a Lightning invoice. \
-                 Proposal {proposal}.",
-                sat(amount)
-            ),
+            list(&[("Amount", sat(amount)), ("Proposal", short(&proposal))]),
         ),
         Some(Notice::Forwarded {
             proposal,
@@ -280,11 +270,11 @@ pub fn message(event: &Event) -> Message {
         }) => Message::new(
             Priority::Normal,
             "Forward failed",
-            format!(
-                "Paying outside the hub for a lock of {} failed ({reason}): the lock goes back \
-                 to its payer. Proposal {proposal}.",
-                sat(amount)
-            ),
+            list(&[
+                ("Amount", sat(amount)),
+                ("Reason", reason),
+                ("Proposal", short(&proposal)),
+            ]),
         ),
         Some(Notice::Alert { message }) => Message::new(Priority::High, "Hub alert", message),
         _ => Message::new(
@@ -299,8 +289,10 @@ pub fn halted() -> Message {
     Message::new(
         Priority::High,
         "Hub halted",
-        "The database changed under the running hub, which serves nothing more. \
-         Restart it once the database is the one it should be.",
+        list(&[
+            ("Cause", "its database changed while it ran"),
+            ("Action", "restart it on the right database"),
+        ]),
     )
 }
 
@@ -367,25 +359,25 @@ mod tests {
         let messages: Vec<_> = notices.iter().map(|n| message(&event(n))).collect();
         assert_eq!(messages[0].title, "Hub started");
         // Wallets handle what a restart means for unlinking: no news to an operator.
-        assert_eq!(messages[0].body, "The hub is serving (boot b0).");
+        assert_eq!(messages[0].body, "• Boot: b0");
         assert_eq!(messages[1].title, "Spend released");
         assert_eq!(
             messages[1].body,
-            "Notes worth 10 sat spent, 1 sat of it the hub's fee. Proposal p1."
+            "• Amount: 10 sat\n• Fee: 1 sat\n• Proposal: p1"
         );
         assert_eq!(messages[2].priority, Priority::High);
-        assert!(messages[2].body.contains("p2") && messages[2].body.contains("p1"));
+        assert_eq!(messages[2].body, "• Proposal: p2\n• Spent by: p1");
         assert_eq!(
             messages[3].body,
-            "8 sat locked until block 900: paid if its condition is met by then, else \
-             refunded. 1 sat of it is the hub's fee if it pays. Proposal p3."
+            "• Amount: 8 sat\n• Fee if paid: 1 sat\n• Expiry: block 900\n• Proposal: p3"
         );
         assert_eq!(messages[4].title, "Lock refunded");
         assert_eq!(messages[5].priority, Priority::High);
-        assert!(messages[5].body.contains("block 899"));
+        assert_eq!(messages[5].body, "• Block: 899\n• Proposal: p3");
         assert_eq!(messages[6].priority, Priority::High);
+        assert!(messages[6].body.starts_with("• Block: 800\n"));
         assert_eq!(messages[7].title, "Forward failed");
-        assert!(messages[7].body.contains("no route"));
+        assert!(messages[7].body.contains("• Reason: no route"));
         assert_eq!(
             (messages[8].priority, messages[8].body.as_str()),
             (Priority::High, "look")
@@ -448,8 +440,24 @@ mod tests {
         };
         let body = message(&event(&failed)).body;
         assert!(
-            body.contains("50,000 sat") && body.contains("(no route)"),
+            body.contains("50,000 sat") && body.contains("no route"),
             "{body}"
+        );
+    }
+
+    #[test]
+    fn ids_read_cut_short() {
+        let started = Notice::Started {
+            boot: "0123456789abcdef0123456789abcdef".into(),
+        };
+        assert_eq!(message(&event(&started)).body, "• Boot: 0123456789ab…");
+        let twice = Notice::DoubleSpend {
+            proposal: "a".repeat(64),
+            spent_by: "b".repeat(64),
+        };
+        assert_eq!(
+            message(&event(&twice)).body,
+            "• Proposal: aaaaaaaaaaaa…\n• Spent by: bbbbbbbbbbbb…"
         );
     }
 }
