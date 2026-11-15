@@ -13,13 +13,14 @@ use std::{
     collections::HashMap,
     path::Path,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use arti_client::{config::TorClientConfigBuilder, IsolationToken, StreamPrefs, TorClient};
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::{
     body::Bytes,
+    client::conn::http1,
     header::{CONTENT_TYPE, HOST, USER_AGENT},
     Method, Request, Uri,
 };
@@ -38,12 +39,24 @@ pub const TIMEOUT: Duration = Duration::from_secs(120);
 /// those before, as from a fresh client.
 const MAX_ISOLATED: usize = 1024;
 
+/// How long a connection to a host stays open, idle, for the next request
+/// to it: a payment's few requests, one after the other, share one.
+const KEPT_FOR: Duration = Duration::from_secs(20);
+
+/// The most idle connections kept open at once.
+const MOST_KEPT: usize = 16;
+
+/// How long a connection kept may take to be ready for the next request:
+/// its own task taking in the last answer's end, not the network.
+const READY: Duration = Duration::from_secs(1);
+
 /// A Tor client, shared by its clones.
 #[derive(Clone)]
 pub struct Tor {
     client: Arc<TorClient<PreferredRuntime>>,
     tls: TlsConnector,
     isolation: Arc<Isolation>,
+    kept: Arc<Kept>,
 }
 
 /// Which circuits streams may share: those to the same host only, so that
@@ -94,6 +107,7 @@ impl Tor {
             client,
             tls: TlsConnector::from(Arc::new(tls)),
             isolation: Arc::default(),
+            kept: Arc::new(Kept::new(KEPT_FOR)),
         })
     }
 
@@ -135,18 +149,32 @@ impl Tor {
     ) -> Result<(u16, Vec<u8>), Failed> {
         let deadline = tokio::time::Instant::now() + timeout;
         let (target, request) = prepare(url, body).map_err(Failed::Unsent)?;
+        let get = request.method() == Method::GET;
+        let reused = tokio::time::timeout_at(deadline, self.kept.reuse(&target, request, max));
+        let request = match reused.await {
+            Err(_) => {
+                let why = format!("no answer over Tor in {} s", timeout.as_secs());
+                return Err(Failed::Sent(why));
+            }
+            Ok(Ok(Ok(answer))) => return Ok(answer),
+            // The connection kept may have closed as it was asked: a GET is
+            // asked again.
+            Ok(Ok(Err(_))) if get => prepare(url, None).map_err(Failed::Unsent)?.1,
+            Ok(Ok(Err(why))) => return Err(Failed::Sent(why)),
+            Ok(Err(request)) => *request,
+        };
         // A cold start is not the host's slowness: `open` counts after it.
         tokio::time::timeout_at(deadline, self.client.bootstrap())
             .await
             .map_err(|_| Failed::Unsent(format!("no Tor in {} s", timeout.as_secs())))?
             .map_err(|e| Failed::Unsent(format!("bootstrapping Tor: {e}")))?;
         let open_by = deadline.min(tokio::time::Instant::now() + open);
-        let opening = tokio::time::timeout_at(open_by, self.stream(target));
+        let opening = tokio::time::timeout_at(open_by, self.stream(target.clone()));
         let stream = opening
             .await
             .map_err(|_| Failed::Unsent(format!("no stream over Tor in {} s", open.as_secs())))?
             .map_err(Failed::Unsent)?;
-        tokio::time::timeout_at(deadline, send(TokioIo::new(stream), request, max))
+        tokio::time::timeout_at(deadline, self.kept.first(target, stream, request, max))
             .await
             .map_err(|_| Failed::Sent(format!("no answer over Tor in {} s", timeout.as_secs())))?
             .map_err(Failed::Sent)
@@ -159,8 +187,17 @@ impl Tor {
         max: usize,
     ) -> Result<(u16, Vec<u8>), String> {
         let (target, request) = prepare(url, body)?;
-        let stream = self.stream(target).await?;
-        send(TokioIo::new(stream), request, max).await
+        let get = request.method() == Method::GET;
+        let request = match self.kept.reuse(&target, request, max).await {
+            Ok(Ok(answer)) => return Ok(answer),
+            // The connection kept may have closed as it was asked: a GET is
+            // asked again.
+            Ok(Err(_)) if get => prepare(url, None)?.1,
+            Ok(Err(why)) => return Err(why),
+            Err(request) => *request,
+        };
+        let stream = self.stream(target.clone()).await?;
+        self.kept.first(target, stream, request, max).await
     }
 
     /// A SOCKS5 proxy at a loopback address through this client, served on
@@ -237,7 +274,7 @@ pub trait Stream: AsyncRead + AsyncWrite + Send + Unpin {}
 impl<T: AsyncRead + AsyncWrite + Send + Unpin> Stream for T {}
 
 /// Where a stream goes.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Target {
     host: String,
     port: u16,
@@ -287,31 +324,160 @@ fn prepare(url: &str, body: Option<Vec<u8>>) -> Result<(Target, Request<Full<Byt
     Ok((target, request))
 }
 
-/// `request` over `io`, one HTTP/1.1 exchange: the answer's status and
-/// body, of at most `max` bytes.
-async fn send<I>(io: I, request: Request<Full<Bytes>>, max: usize) -> Result<(u16, Vec<u8>), String>
-where
-    I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
-{
-    let (mut sender, connection) = hyper::client::conn::http1::handshake(io)
-        .await
-        .map_err(|e| e.to_string())?;
-    let connection = tokio::spawn(connection);
-    let answer = async {
-        let response = sender
-            .send_request(request)
+/// An HTTP/1.1 request as sent over Tor.
+type Asked = Request<Full<Bytes>>;
+
+/// An answer: its status and body.
+type Answer = (u16, Vec<u8>);
+
+/// HTTP/1.1 connections kept open once answered, idle, each for the next
+/// request to the same host and port: no stream to open nor TLS handshake
+/// to make for it, a second or two over Tor. Streams to a host share their
+/// circuits already, and a host can tell they are one client's (TLS
+/// resumes its sessions; an onion service sees one circuit), so keeping a
+/// connection open links no more requests than before.
+struct Kept {
+    open: Mutex<Vec<(Target, Instant, Open)>>,
+    /// How long a connection is kept, idle.
+    keep: Duration,
+}
+
+/// An HTTP/1.1 connection, its task ended as it is dropped.
+struct Open {
+    sender: http1::SendRequest<Full<Bytes>>,
+    task: tokio::task::AbortHandle,
+}
+
+impl Drop for Open {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// How a request on a connection failed.
+enum Lost {
+    /// Not sent: the connection had closed. The request back.
+    Unsent(Box<Asked>),
+    /// Sent, in part or whole: its host may have had it.
+    Sent(String),
+}
+
+impl Open {
+    /// An HTTP/1.1 connection over `stream`, served by a task of its own.
+    async fn over(stream: Box<dyn Stream>) -> Result<Self, String> {
+        let (sender, connection) = http1::handshake(TokioIo::new(stream))
             .await
             .map_err(|e| e.to_string())?;
+        let task = tokio::spawn(connection).abort_handle();
+        Ok(Self { sender, task })
+    }
+
+    /// `request` on this connection: its answer, with a body of at most
+    /// `max` bytes.
+    async fn ask(&mut self, request: Asked, max: usize) -> Result<Answer, Lost> {
+        let response = match self.sender.try_send_request(request).await {
+            Ok(response) => response,
+            Err(mut e) => {
+                return Err(match e.take_message() {
+                    Some(request) => Lost::Unsent(Box::new(request)),
+                    None => Lost::Sent(e.into_error().to_string()),
+                })
+            }
+        };
         let status = response.status().as_u16();
         let body = Limited::new(response.into_body(), max)
             .collect()
             .await
-            .map_err(|e| format!("the answer: {e}"))?;
+            .map_err(|e| Lost::Sent(format!("the answer: {e}")))?;
         Ok((status, body.to_bytes().to_vec()))
     }
-    .await;
-    connection.abort();
-    answer
+}
+
+impl Kept {
+    fn new(keep: Duration) -> Self {
+        Self {
+            open: Mutex::default(),
+            keep,
+        }
+    }
+
+    /// The connections kept, those expired or closed let go.
+    fn kept(&self) -> std::sync::MutexGuard<'_, Vec<(Target, Instant, Open)>> {
+        let mut kept = self.open.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        kept.retain(|(_, at, open)| {
+            now.duration_since(*at) < self.keep && !open.sender.is_closed()
+        });
+        kept
+    }
+
+    /// A connection to `target` kept and ready for a request, the latest
+    /// kept first, if any.
+    async fn take(&self, target: &Target) -> Option<Open> {
+        loop {
+            let mut open = {
+                let mut kept = self.kept();
+                let at = kept.iter().rposition(|(to, ..)| to == target)?;
+                kept.remove(at).2
+            };
+            if let Ok(Ok(())) = tokio::time::timeout(READY, open.sender.ready()).await {
+                return Some(open);
+            }
+        }
+    }
+
+    /// `open`, its last answer read whole, kept for the next request to
+    /// `target`: the oldest kept let go past [`MOST_KEPT`].
+    fn put(&self, target: Target, open: Open) {
+        if open.sender.is_closed() {
+            return;
+        }
+        let mut kept = self.kept();
+        if kept.len() >= MOST_KEPT {
+            kept.remove(0);
+        }
+        kept.push((target, Instant::now(), open));
+    }
+
+    /// `request` on a connection kept to `target`: its answer, or how it
+    /// failed once sent; or, none kept taking it, the request back.
+    async fn reuse(
+        &self,
+        target: &Target,
+        mut request: Asked,
+        max: usize,
+    ) -> Result<Result<Answer, String>, Box<Asked>> {
+        while let Some(mut open) = self.take(target).await {
+            match open.ask(request, max).await {
+                Ok(answer) => {
+                    self.put(target.clone(), open);
+                    return Ok(Ok(answer));
+                }
+                // Closed: the next kept, or a new one.
+                Err(Lost::Unsent(back)) => request = *back,
+                Err(Lost::Sent(why)) => return Ok(Err(why)),
+            }
+        }
+        Err(Box::new(request))
+    }
+
+    /// `request` on a new connection over `stream` to `target`: its
+    /// answer, the connection kept once it is read whole.
+    async fn first(
+        &self,
+        target: Target,
+        stream: Box<dyn Stream>,
+        request: Asked,
+        max: usize,
+    ) -> Result<Answer, String> {
+        let mut open = Open::over(stream).await?;
+        let answer = open.ask(request, max).await.map_err(|lost| match lost {
+            Lost::Unsent(_) => "the connection closed".to_owned(),
+            Lost::Sent(why) => why,
+        })?;
+        self.put(target, open);
+        Ok(answer)
+    }
 }
 
 #[cfg(test)]
@@ -399,6 +565,112 @@ mod tests {
         assert_eq!(isolation.0.lock().unwrap().len(), 1);
         assert_eq!(isolation.of("one-more.example"), next);
         assert_ne!(isolation.of("host0.example"), first);
+    }
+
+    /// An HTTP/1.1 server on a loopback port answering `ok`, closing the
+    /// connection if the path asks it (`/close`): its address, and how many
+    /// connections it took.
+    async fn server() -> (std::net::SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let at = listener.local_addr().unwrap();
+        let taken = Arc::new(AtomicUsize::new(0));
+        let counted = taken.clone();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                counted.fetch_add(1, Ordering::SeqCst);
+                let service = hyper::service::service_fn(
+                    |request: Request<hyper::body::Incoming>| async move {
+                        let mut answer = hyper::Response::builder();
+                        if request.uri().path() == "/close" {
+                            answer = answer.header(hyper::header::CONNECTION, "close");
+                        }
+                        answer.body(Full::new(Bytes::from_static(b"ok")))
+                    },
+                );
+                tokio::spawn(
+                    hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service),
+                );
+            }
+        });
+        (at, taken)
+    }
+
+    /// GET `path` from the server at `at` as host `to`: on a connection
+    /// kept, or a new one.
+    async fn get(kept: &Kept, at: std::net::SocketAddr, to: &Target, path: &str) -> Answer {
+        let url = format!("http://{}:{}{path}", to.host, to.port);
+        let (_, request) = prepare(&url, None).unwrap();
+        match kept.reuse(to, request, 1 << 10).await {
+            Ok(answer) => answer.unwrap(),
+            Err(request) => {
+                let stream = tokio::net::TcpStream::connect(at).await.unwrap();
+                kept.first(to.clone(), Box::new(stream), *request, 1 << 10)
+                    .await
+                    .unwrap()
+            }
+        }
+    }
+
+    fn taken(count: &std::sync::atomic::AtomicUsize) -> usize {
+        count.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[tokio::test]
+    async fn a_hosts_requests_share_a_connection_kept_open() {
+        let (at, count) = server().await;
+        let kept = Kept::new(KEPT_FOR);
+        let hub = target("hub.example", at.port(), false);
+        for _ in 0..3 {
+            assert_eq!(
+                get(&kept, at, &hub, "/v1/info").await,
+                (200, b"ok".to_vec())
+            );
+        }
+        assert_eq!(taken(&count), 1);
+        // Another host: a connection of its own, as on its own circuits.
+        let relay = target("relay.example", at.port(), false);
+        assert_eq!(get(&kept, at, &relay, "/").await.0, 200);
+        assert_eq!(taken(&count), 2);
+        assert_eq!(get(&kept, at, &hub, "/v1/info").await.0, 200);
+        assert_eq!(taken(&count), 2);
+    }
+
+    #[tokio::test]
+    async fn a_connection_idle_too_long_or_closed_is_not_used_again() {
+        let (at, count) = server().await;
+        let hub = target("hub.example", at.port(), false);
+        let expired = Kept::new(Duration::ZERO);
+        get(&expired, at, &hub, "/").await;
+        get(&expired, at, &hub, "/").await;
+        assert_eq!(taken(&count), 2);
+
+        let kept = Kept::new(KEPT_FOR);
+        get(&kept, at, &hub, "/close").await;
+        get(&kept, at, &hub, "/").await;
+        assert_eq!(taken(&count), 4);
+        get(&kept, at, &hub, "/").await;
+        assert_eq!(taken(&count), 4);
+    }
+
+    #[tokio::test]
+    async fn at_most_so_many_connections_are_kept() {
+        let (at, count) = server().await;
+        let kept = Kept::new(KEPT_FOR);
+        for i in 0..=MOST_KEPT {
+            get(
+                &kept,
+                at,
+                &target(&format!("host{i}.example"), at.port(), false),
+                "/",
+            )
+            .await;
+        }
+        assert_eq!(kept.kept().len(), MOST_KEPT);
+        // The oldest let go: asked again, it connects anew.
+        get(&kept, at, &target("host0.example", at.port(), false), "/").await;
+        assert_eq!(taken(&count), MOST_KEPT + 2);
     }
 
     /// The Tor Project's check that a request came over Tor.
