@@ -34,7 +34,8 @@ research implementation; it has not had a security review.
   [regtest/README.md](regtest/README.md).
 - `apps/`: the applications, a workspace of their own: the hub service
   (`apps/hub`), the swap provider service (`apps/swaps`), the wallet CLI
-  (`apps/wallet-cli`), their HTTP transport (`apps/transport`), Tor
+  (`apps/wallet-cli`), recovery contracts opened between them over HTTP
+  (`apps/contracts`), their HTTP transport (`apps/transport`), Tor
   through Arti (`apps/tor`), chain sources (`apps/chain-client`), operator
   notifications (`apps/notify`), announcements on Nostr (`apps/nostr`),
   end-to-end tests of hubs, their Lightning gateways, swap providers and
@@ -50,6 +51,14 @@ The library needs only Rust:
 
 ```sh
 cargo test --locked
+```
+
+The applications build the contract on Lichen and ln-gap, which
+`vendor/fetch.sh` copies into `vendor/` at the revisions it pins (see
+[regtest/README.md](regtest/README.md)); so do their Docker images:
+
+```sh
+vendor/fetch.sh
 cargo test --locked --manifest-path apps/Cargo.toml   # the applications
 apps/e2e/run.sh                                       # the ecosystem (Docker)
 ```
