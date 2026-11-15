@@ -40,7 +40,13 @@ private sealed interface Screen {
     data object Receive : Screen
 
     /** Sending, or with `cashOut`, a hub, paying all the notes there out. */
-    data class Send(val link: String?, val cashOut: String? = null, val from: Screen = Home) : Screen
+    data class Send(
+        val link: String?,
+        val cashOut: String? = null,
+        val from: Screen = Home,
+        /** The address of this wallet's that `link` pays, if it does. */
+        val own: String? = null,
+    ) : Screen
     data object Settings : Screen
     data class Balance(val from: Screen = Home) : Screen
     data class Details(val activity: Activity) : Screen
@@ -112,7 +118,7 @@ private fun App(engine: Engine, link: String?, linkShown: () -> Unit) {
                         open = { screen = Screen.Details(it) },
                     )
                     Screen.Receive -> Receive(engine) { screen = Screen.Home }
-                    is Screen.Send -> Send(engine, ui, s.link, s.cashOut) { screen = s.from }
+                    is Screen.Send -> Send(engine, ui, s.link, s.cashOut, s.own) { screen = s.from }
                     Screen.Settings -> Settings(engine, ui, balance = { screen = Screen.Balance(Screen.Settings) }) {
                         screen = Screen.Home
                     }
@@ -120,6 +126,7 @@ private fun App(engine: Engine, link: String?, linkShown: () -> Unit) {
                         engine,
                         ui,
                         cashOut = { screen = Screen.Send(null, it, s) },
+                        payOwn = { link, own -> screen = Screen.Send(link, from = s, own = own) },
                     ) { screen = s.from }
                     is Screen.Details -> ActivityDetails(engine, ui, s.activity) { screen = Screen.Home }
                 }

@@ -74,6 +74,7 @@ fun ActivityDetails(engine: Engine, ui: Ui, shown: Activity, back: () -> Unit) {
     }
     // A payout's claim pays the address: else the provider's coin.
     val txid = tx?.txid ?: (details as? Details.Payout)?.let { it.claim ?: it.coin }
+        ?: (details as? Details.Contract)?.funding
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 20.dp)) {
         TopBar(title(activity, coming != null), back)
         Spacer(Modifier.height(12.dp))
@@ -131,12 +132,14 @@ private fun title(activity: Activity, coming: Boolean): String = when {
         Kind.LIGHTNING -> "Paid over Lightning"
         Kind.INVOICE -> "Received over Lightning"
         Kind.PAYOUT -> "Sent on Bitcoin"
+        Kind.CONTRACT -> "Contract opened"
     }
 }
 
 /** Whether it paid out, rather than in. */
 private fun paid(activity: Activity): Boolean =
-    activity.kind == Kind.SENT || activity.kind == Kind.LIGHTNING || activity.kind == Kind.PAYOUT
+    activity.kind == Kind.SENT || activity.kind == Kind.LIGHTNING || activity.kind == Kind.PAYOUT ||
+        activity.kind == Kind.CONTRACT
 
 /** Where it stands, in words. */
 private fun status(activity: Activity, coming: Boolean, details: Details?): String = when {
@@ -159,6 +162,10 @@ private fun status(activity: Activity, coming: Boolean, details: Details?): Stri
         is Details.Invoice -> when (activity.state) {
             State.DONE -> "In your Licash"
             else -> "Paid: taking its notes from the hub"
+        }
+        is Details.Contract -> when (activity.state) {
+            State.DONE -> "Opened at ${host(details.hub)}: Balance shows where it stands"
+            else -> "Confirming its funding: protecting once in a block, about 10 minutes"
         }
         else -> when {
             activity.state == State.PENDING -> "Under way"
@@ -221,6 +228,11 @@ private fun Summary(activity: Activity, details: Details?, tx: Onchain?) {
                     Line("Paid by the payer", sat(it))
                 }
                 Line("Arrived", "Over Lightning, into Licash at ${host(details.hub)}")
+            }
+            is Details.Contract -> {
+                Line("Cost", sat(activity.amount))
+                Line("Paid", "On Bitcoin, from a coin of yours")
+                Line("At", host(details.hub))
             }
             else -> if (activity.kind == Kind.SENT) {
                 Line("Paid", sat(activity.amount))
@@ -310,6 +322,11 @@ private fun Technical(activity: Activity, details: Details?, copy: (String, Stri
                 Fact("Hub", details.hub, copy)
                 details.invoice?.let { Fact("Invoice", it, copy) }
                 details.failure?.let { Fact("Failure", it, copy) }
+            }
+            is Details.Contract -> {
+                Fact("Contract", activity.id, copy)
+                Fact("Hub", details.hub, copy)
+                Fact("Funding", details.funding, copy)
             }
             null -> Fact("Id", activity.id, copy)
         }

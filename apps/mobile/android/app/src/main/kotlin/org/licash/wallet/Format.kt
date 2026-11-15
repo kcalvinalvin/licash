@@ -14,13 +14,17 @@ fun digits(amount: ULong): String =
     String.format(Locale.US, "%,d", amount.toLong()).replace(',', '\u2009')
 
 /** All the wallet holds: in notes, and on Bitcoin. */
-val Balance.total: ULong get() = notes + notesPending + onchain + moving
+val Balance.total: ULong get() = notes + notesPending + onchain + moving + opening
 
 /**
- * Of [total], what hubs owe on trust alone: the notes, which no contract
- * covers yet. The rest, on Bitcoin, is the wallet's own.
+ * Of [total], what hubs owe on trust alone: the notes no contract covers.
+ * The rest, on Bitcoin or covered by a contract, is the wallet's own.
  */
-val Balance.credit: ULong get() = notes + notesPending
+val Balance.credit: ULong
+    get() {
+        val held = notes + notesPending
+        return if (held > covered) held - covered else 0uL
+    }
 
 /**
  * [credit] as a share of [total], in whole percent: 0 if nothing is held.
@@ -67,6 +71,17 @@ fun host(url: String): String = runCatching {
     val host = uri.host ?: return@runCatching null
     if (uri.port == -1) host else "$host:${uri.port}"
 }.getOrNull() ?: url
+
+/** About how long `blocks` take, ten minutes each: `about 6 days`. */
+fun duration(blocks: Long): String {
+    val minutes = blocks * 10
+    return when {
+        blocks <= 0 -> "now"
+        minutes < 90 -> "about $minutes minutes"
+        minutes < 48 * 60 -> "about ${(minutes + 30) / 60} hours"
+        else -> "about ${(minutes + 720) / 1440} days"
+    }
+}
 
 /** When, from seconds since 1970. */
 fun at(seconds: Long): String =

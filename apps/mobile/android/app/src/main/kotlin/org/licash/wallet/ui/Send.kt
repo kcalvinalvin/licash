@@ -83,9 +83,17 @@ private sealed interface Step {
 /**
  * Scan or paste: a code to pay, or a payment handed over to take; with
  * `cashOut`, a hub, a Bitcoin address to pay all the notes there out to.
+ * `ownAddress`, if `link` pays this wallet's own address, is shown so.
  */
 @Composable
-fun Send(engine: Engine, ui: Ui, link: String?, cashOut: String? = null, back: () -> Unit) {
+fun Send(
+    engine: Engine,
+    ui: Ui,
+    link: String?,
+    cashOut: String? = null,
+    ownAddress: String? = null,
+    back: () -> Unit,
+) {
     val scope = rememberCoroutineScope()
     val clipboard = LocalClipboard.current
     // Opened with a link: no camera to start.
@@ -93,7 +101,7 @@ fun Send(engine: Engine, ui: Ui, link: String?, cashOut: String? = null, back: (
     var asking by remember { mutableStateOf(false) }
     var empty by remember { mutableStateOf(false) }
     // This wallet's own address, once cashing out to it.
-    var own by remember { mutableStateOf<String?>(null) }
+    var own by remember { mutableStateOf(ownAddress) }
 
     suspend fun taking(payment: String, trust: Boolean): Step =
         engine.receive(payment, trust).fold(
@@ -215,7 +223,7 @@ fun Send(engine: Engine, ui: Ui, link: String?, cashOut: String? = null, back: (
 
     LaunchedEffect(link) { link?.let { read(it) } }
     Column(Modifier.fillMaxSize().padding(horizontal = 24.dp)) {
-        TopBar(if (cashOut == null) "Send" else "Cash out", back)
+        TopBar(if (cashOut == null && ownAddress == null) "Send" else "Cash out", back)
         Column(Modifier.fillMaxWidth().weight(1f).verticalScroll(rememberScrollState())) {
             when (val s = step) {
                 Step.Looking -> {

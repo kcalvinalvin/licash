@@ -5,6 +5,7 @@ import androidx.lifecycle.DefaultLifecycleObserver
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.ProcessLifecycleOwner
 import java.io.File
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -25,6 +26,9 @@ import org.licash.chain.mobile.Mobile
 import org.licash.core.Activity
 import org.licash.core.Balance
 import org.licash.core.Code
+import org.licash.core.Contract
+import org.licash.core.ContractQuote
+import org.licash.core.ContractState
 import org.licash.core.Details
 import org.licash.core.Holding
 import org.licash.core.Hub
@@ -53,7 +57,7 @@ data class Ui(
     val wallet: Boolean = false,
     val network: Network = Network.BITCOIN,
     val developer: Boolean = false,
-    val balance: Balance = Balance(0u, 0u, 0u, 0u, 0u),
+    val balance: Balance = Balance(0u, 0u, 0u, 0u, 0u, 0u, 0u),
     val history: List<Activity> = emptyList(),
     val hubs: List<Hub> = emptyList(),
     val tor: Boolean = false,
@@ -64,6 +68,10 @@ data class Ui(
     val incoming: List<Activity> = emptyList(),
     /** Why the last round of syncing fell short, if it did. */
     val problem: String? = null,
+    /** The recovery contracts with hubs, the newest first. */
+    val contracts: List<Contract> = emptyList(),
+    /** The hub a contract is being opened at, while one is. */
+    val opening: String? = null,
 )
 
 data class ChainStatus(val height: Int = 0, val peers: Long = 0, val synced: Boolean = false)
@@ -115,6 +123,9 @@ class Engine(context: Context) {
     /** Whether what the hubs trusted serve was learned since the app started. */
     @Volatile
     private var hubsLearned = false
+
+    /** Carrying on with contracts, apart from the rounds: it may take minutes. */
+    private val contracting = AtomicBoolean(false)
 
     init {
         AppLog.start(File(files, "logs"))
@@ -267,6 +278,7 @@ class Engine(context: Context) {
             } catch (e: LicashException) {
                 failed("paying out on Bitcoin", e)
             }
+            resumeContracts(chain)
         }
         if (hubs.any { it.mailbox }) {
             try {
@@ -320,6 +332,29 @@ class Engine(context: Context) {
     }
 
     /**
+     * Carry on with the contracts being opened and watch the funding of
+     * those signed, in the background: an opening carried on downloads
+     * for minutes. Nothing to do once each is confirmed or given up.
+     */
+    private fun resumeContracts(chain: GoChain) {
+        val waiting = state.value.contracts.any {
+            it.state == ContractState.Opening || it.state == ContractState.Confirming
+        }
+        if (!waiting || !contracting.compareAndSet(false, true)) return
+        scope.launch {
+            try {
+                local { it.resumeContracts(chain) }
+            } catch (e: Exception) {
+                // Not to bring the app down from a coroutine of its own.
+                AppLog.warn("carrying on with contracts", e)
+            } finally {
+                contracting.set(false)
+            }
+            refresh()
+        }
+    }
+
+    /**
      * Tell of coins found on Bitcoin and payments on their way not told of
      * yet: none of those there when the app started, nor coins found again
      * after looking in blocks again.
@@ -336,7 +371,12 @@ class Engine(context: Context) {
 
     private fun refresh() {
         val shown = runCatching {
-            wallet?.let { Shown(it.network(), it.balance(), it.history(), it.hubs(), it.tor()) }
+            wallet?.let {
+                val contracts = runCatching { it.contracts() }
+                    .onFailure { e -> AppLog.warn("reading the contracts", e) }
+                    .getOrDefault(state.value.contracts)
+                Shown(it.network(), it.balance(), it.history(), it.hubs(), it.tor(), contracts)
+            }
         }.onFailure { AppLog.warn("reading the wallet", it) }.getOrNull()
         state.update {
             when {
@@ -350,6 +390,7 @@ class Engine(context: Context) {
                     history = shown.history,
                     hubs = shown.hubs,
                     tor = shown.tor,
+                    contracts = shown.contracts,
                 )
             }
         }
@@ -361,6 +402,7 @@ class Engine(context: Context) {
         val history: List<Activity>,
         val hubs: List<Hub>,
         val tor: Boolean,
+        val contracts: List<Contract>,
     )
 
     /** A new wallet of the network chosen, born at the chain's height if known. */
@@ -478,6 +520,43 @@ class Engine(context: Context) {
         refresh()
         poke()
         paying
+    }
+
+    /** What opening a recovery contract at `hub` costs now, and the coin that would pay it. */
+    suspend fun contractQuote(hub: String): Result<ContractQuote> = io { local { it.contractQuote(hub) } }
+
+    /**
+     * Open a recovery contract at `hub` for at most `maxPrice`, in the
+     * background: it takes minutes, its downloads large. Told once signed,
+     * or why not. One at a time.
+     */
+    fun openContract(hub: String, maxPrice: ULong) {
+        val light = light
+        if (light == null) {
+            notices.tryEmit(Event("Not connected to Bitcoin yet: try again in a moment."))
+            return
+        }
+        var started = false
+        state.update {
+            started = it.opening == null
+            if (started) it.copy(opening = hub) else it
+        }
+        if (!started) return
+        AppLog.info("opening a contract at $hub")
+        scope.launch {
+            try {
+                val opened = local { it.openContract(GoChain(light), hub, null, maxPrice) }
+                AppLog.info("contract ${opened.id} signed at $hub, funded by ${opened.funding}")
+                notices.tryEmit(Event("Contract signed at ${host(hub)}: protecting once its funding confirms"))
+            } catch (e: Exception) {
+                AppLog.warn("opening a contract at $hub", e)
+                notices.tryEmit(Event("No contract opened. ${explain(e)}"))
+            } finally {
+                state.update { it.copy(opening = null) }
+                refresh()
+                poke()
+            }
+        }
     }
 
     /** The hubs announced on the relays its hubs name, not used yet. */

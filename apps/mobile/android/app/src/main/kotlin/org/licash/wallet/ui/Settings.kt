@@ -243,6 +243,7 @@ private fun HubRow(hub: Hub) {
         hub.deposits?.let { add("takes Bitcoin from ${sat(it.min)}") }
         if (hub.silent) add("finds Bitcoin payments")
         if (hub.mailbox) add("mailbox")
+        if (hub.contracts != null) add("opens contracts")
     }
     Row(Modifier.fillMaxWidth().clickable { open = !open }.padding(vertical = 12.dp)) {
         Column(Modifier.weight(1f)) {
@@ -287,6 +288,14 @@ private fun Fees(hub: Hub) {
         hub.depositFee?.let { FeeLine("Moving Bitcoin into Licash", it, "of what is moved") }
         FeeLine("Holding a payment for a condition", hub.lockFee, "as paying an invoice does")
         FeeLine("Refunding a payment held", hub.refundFee, "if it is not paid")
+        hub.contracts?.let {
+            FeeLine(
+                "Opening a contract",
+                Rate(it.price, 0uL),
+                "from a coin on Bitcoin; protects up to ${sat(it.cap)} for up to ${it.blocks} blocks" +
+                    if (it.mock) ", a mock for testing" else "",
+            )
+        }
     }
 }
 

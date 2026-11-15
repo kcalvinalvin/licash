@@ -43,6 +43,7 @@ import org.licash.wallet.at
 import org.licash.wallet.credit
 import org.licash.wallet.digits
 import org.licash.wallet.explain
+import org.licash.wallet.host
 import org.licash.wallet.sat
 import org.licash.wallet.total
 
@@ -127,6 +128,9 @@ private fun Total(ui: Ui, open: () -> Unit) {
         if (b.moving > 0uL) add("${sat(b.moving)} on its way from Bitcoin")
         if (b.onchain > b.kept) add("${sat(b.onchain - b.kept)} on Bitcoin, moved in once enough")
         if (b.kept > 0uL) add("${sat(b.kept)} cashed out, kept on Bitcoin")
+        if (b.covered > 0uL) add("${sat(b.covered)} in notes protected by contracts")
+        if (b.opening > 0uL) add("${sat(b.opening)} coming back from opening a contract")
+        ui.opening?.let { add("Opening a contract at ${host(it)}…") }
         val coming = ui.incoming.sumOf { it.amount }
         if (coming > 0uL) add("${sat(coming)} coming on Bitcoin, waiting for a block")
         if (b.notesPending > 0uL) add("${sat(b.notesPending)} still settling")
@@ -197,6 +201,7 @@ private fun ActivityRow(activity: Activity, coming: Boolean = false, open: () ->
         Kind.LIGHTNING -> "Paid over Lightning" to "−"
         Kind.INVOICE -> "Received over Lightning" to "+"
         Kind.PAYOUT -> "Sent on Bitcoin" to "−"
+        Kind.CONTRACT -> "Contract opened" to "−"
     }
     val detail = when {
         coming -> "Waiting for a block"
