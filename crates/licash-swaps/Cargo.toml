@@ -9,6 +9,7 @@ license.workspace = true
 bitcoin = { version = "=0.32.102", default-features = false, features = ["std"] }
 licash = { path = "../licash" }
 licash-api = { path = "../licash-api" }
+licash-hub = { path = "../licash-hub" }
 licash-onchain = { path = "../licash-onchain" }
 licash-wallet = { path = "../licash-wallet" }
 rusqlite = { version = "0.40", features = ["bundled"] }
@@ -20,6 +21,5 @@ tracing = "0.1"
 rand_core.workspace = true
 
 [dev-dependencies]
-licash-hub = { path = "../licash-hub" }
 tempfile = "3.27"
 tokio = { version = "1.54", features = ["macros", "rt"] }

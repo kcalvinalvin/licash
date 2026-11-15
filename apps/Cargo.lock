@@ -4353,6 +4353,7 @@ dependencies = [
  "hex",
  "licash",
  "licash-api",
+ "licash-hub",
  "licash-onchain",
  "licash-wallet",
  "rand_core 0.6.4",

@@ -12,7 +12,20 @@ use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior};
 use crate::Error;
 
 /// The schema this provider reads and writes, as SQLite's `user_version`.
-const VERSION: i64 = 2;
+const VERSION: i64 = 3;
+
+/// Version 3: swaps into the provider's own hub. A swap of kind `own` has
+/// hub `to_url`, which the provider is, lock notes it issues itself
+/// (`licash_hub::Hub::lock_own`) rather than notes its wallet holds there.
+const ISSUES: &str = "
+-- The own swaps' locks, by their swaps' ids: their notes pay the client's
+-- address as derived from the ephemeral secret, recorded with the swap,
+-- before the hub locks.
+CREATE TABLE issues (
+    id BLOB PRIMARY KEY REFERENCES swaps (id),
+    ephemeral BLOB NOT NULL
+) STRICT;
+";
 
 /// Version 2: payouts on Bitcoin. A swap's kind is `notes`, a swap of notes
 /// at one hub for notes at another, or `chain`, a payout: its `to_url` is
@@ -97,6 +110,7 @@ impl Store {
         store.write(|tx| {
             tx.execute_batch(SCHEMA)?;
             tx.execute_batch(PAYOUTS)?;
+            tx.execute_batch(ISSUES)?;
             tx.pragma_update(None, "user_version", VERSION)?;
             tx.execute(
                 "INSERT INTO meta (one, nostr, created_at) VALUES (1, ?1, ?2)",
@@ -118,8 +132,11 @@ impl Store {
             let version: i64 = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
             match version {
                 VERSION => {}
-                1 => {
-                    tx.execute_batch(PAYOUTS)?;
+                1 | 2 => {
+                    if version == 1 {
+                        tx.execute_batch(PAYOUTS)?;
+                    }
+                    tx.execute_batch(ISSUES)?;
                     tx.pragma_update(None, "user_version", VERSION)?;
                     tracing::info!("swaps file migrated to schema {VERSION}");
                 }

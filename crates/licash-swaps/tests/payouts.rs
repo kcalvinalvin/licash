@@ -622,7 +622,7 @@ async fn a_swaps_file_of_version_1_gains_payouts() {
     )
     .unwrap();
     let provider = Provider::open(&path, wallet, CONFIG).unwrap();
-    assert_eq!(version(&path), 2);
+    assert_eq!(version(&path), 3);
     let records = provider.records(10).unwrap();
     assert_eq!(records.len(), 1);
     assert_eq!(
@@ -640,13 +640,52 @@ async fn a_swaps_file_of_version_1_gains_payouts() {
     // A newer file is refused untouched.
     rusqlite::Connection::open(&path)
         .unwrap()
-        .pragma_update(None, "user_version", 3)
+        .pragma_update(None, "user_version", 4)
         .unwrap();
     let wallet = Wallet::open(&dir.path().join("wallet.sqlite"), Link(net)).unwrap();
     match Provider::open(&path, wallet, CONFIG) {
-        Err(licash_swaps::Error::Setup(why)) => assert!(why.contains("schema 3"), "{why}"),
+        Err(licash_swaps::Error::Setup(why)) => assert!(why.contains("schema 4"), "{why}"),
         Err(e) => panic!("{e}"),
         Ok(_) => panic!("opened"),
     }
-    assert_eq!(version(&path), 3);
+    assert_eq!(version(&path), 4);
+}
+
+#[tokio::test]
+async fn a_swaps_file_of_version_2_gains_the_locks_a_hub_issues() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("swaps.sqlite");
+    let db = || rusqlite::Connection::open(&path).unwrap();
+    db().execute_batch(include_str!("fixtures/swaps-v1.sql"))
+        .unwrap();
+    let net = Net::new();
+    net.start_timed(A, FEE, TIMED);
+    let wallet = Wallet::create(
+        &dir.path().join("wallet.sqlite"),
+        &[0x50; 32],
+        ChainProfile::Core30DefaultRegtest,
+        Link(net.clone()),
+    )
+    .unwrap();
+    drop(Provider::open(&path, wallet, CONFIG).unwrap());
+    // As a provider of version 2 left it: its swaps and payouts, no
+    // issues.
+    db().execute_batch("DROP TABLE issues; PRAGMA user_version = 2;")
+        .unwrap();
+    let wallet = Wallet::open(&dir.path().join("wallet.sqlite"), Link(net)).unwrap();
+    let provider = Provider::open(&path, wallet, CONFIG).unwrap();
+    let version: i64 = db()
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, 3);
+    let issues: i64 = db()
+        .query_row("SELECT count(*) FROM issues", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(issues, 0);
+    let records = provider.records(10).unwrap();
+    assert_eq!(
+        (records.len(), records[0].stage, records[0].amount),
+        (1, Stage::Accepted, 1000)
+    );
+    assert_eq!(provider.last_event().unwrap(), 1);
 }

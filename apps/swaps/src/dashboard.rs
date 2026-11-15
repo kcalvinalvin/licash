@@ -18,7 +18,7 @@ use licash_dashboard::{Probe, Report, Series, Unit};
 use rusqlite::{Connection, OpenFlags};
 
 /// The newest schemas read, as each file's `user_version`.
-const SWAPS_VERSION: i64 = 2;
+const SWAPS_VERSION: i64 = 3;
 const WALLET_VERSION: i64 = 7;
 
 /// Why a swap ended without paying, beside a reason recorded.

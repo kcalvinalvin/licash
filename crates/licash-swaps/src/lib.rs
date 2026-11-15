@@ -30,7 +30,14 @@
 //! takes payouts with [`Provider::take_payout`], locking a coin on chain
 //! under the client's hash, and follows them with
 //! [`Provider::follow_payouts`], given a view of the chain ([`Chain`]).
+//!
+//! A hub may be the provider of the swaps into it ([`Issuer`],
+//! [`Provider::open_issuing`]): its lock there is of notes it issues
+//! itself, and it keeps no preimage from itself, so its lock expires only
+//! [`Config::own_lead`] blocks before the client's, between hubs of any
+//! windows.
 
+mod issue;
 mod payouts;
 mod store;
 
@@ -50,6 +57,8 @@ use rand_core::{OsRng, RngCore};
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
+pub use issue::Issuer;
+use issue::{Issue, Issued};
 pub use payouts::{Chain, PAYOUT_ROOM};
 use store::{now, Store};
 
@@ -71,6 +80,9 @@ pub enum Error {
     Storage(#[from] rusqlite::Error),
     #[error(transparent)]
     Wallet(#[from] licash_wallet::Error),
+    /// The provider's own hub, issuing its locks ([`Issuer`]).
+    #[error("its hub: {0}")]
+    Hub(Problem),
 }
 
 /// What a provider swaps, and on what terms.
@@ -118,6 +130,14 @@ impl Config {
             return None;
         }
         self.hop(locks).forced_lead()
+    }
+
+    /// Blocks by which the client's lock outlives the provider's at its
+    /// own hub, of `locks`, at least: the hub shows the provider the
+    /// preimage once the client claims, or once it is published on Bitcoin
+    /// in time ([`Hop::lead`]).
+    pub fn own_lead(&self, locks: &Locks) -> Option<u32> {
+        self.hop(locks).lead()
     }
 
     fn hop(&self, locks: &Locks) -> Hop {
@@ -316,6 +336,8 @@ struct Row {
     updated_at: i64,
     /// A payout on Bitcoin, not a swap of notes.
     chain: bool,
+    /// A swap into the provider's own hub, of notes it issues ([`Issuer`]).
+    own: bool,
 }
 
 impl Row {
@@ -352,7 +374,8 @@ impl Row {
 const LAST_EVENT: &str = "SELECT coalesce(max(seq), 0) FROM events";
 
 const ROWS: &str = "SELECT id, hash, from_url, to_url, address, amount, fee, paid, expiry,
-    lock, preimage, state, reason, created_at, updated_at, kind = 'chain', expiry_from
+    lock, preimage, state, reason, created_at, updated_at, kind = 'chain', expiry_from,
+    kind = 'own'
     FROM swaps";
 
 fn row_of(r: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
@@ -374,6 +397,7 @@ fn row_of(r: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
         updated_at: r.get(14)?,
         chain: r.get(15)?,
         expiry_from: r.get(16)?,
+        own: r.get(17)?,
     })
 }
 
@@ -447,23 +471,69 @@ pub struct Provider<T: Transport> {
     payouts: Option<swaps::Chain>,
     /// The swaps whose hub the operator was told keeps the preimage.
     withheld: Mutex<HashSet<[u8; 32]>>,
+    /// The swaps the operator was told the provider claims late.
+    late: Mutex<HashSet<[u8; 32]>>,
+    /// The provider's own hub, if it is one, which issues its locks there.
+    issuer: Option<Issuer>,
 }
 
 /// Setup and what the provider says of itself.
 impl<T: Transport> Provider<T> {
     /// A new swaps file at `path`, for the provider of `wallet`.
     pub fn create(path: &Path, wallet: Wallet<T>, config: Config) -> Result<Self, Error> {
+        Ok(Self::with(Self::created(path)?, wallet, config, None))
+    }
+
+    /// The swaps file at `path`. Refused while swaps into a hub's own
+    /// notes are under way: only that hub takes them on
+    /// ([`Provider::open_issuing`]).
+    pub fn open(path: &Path, wallet: Wallet<T>, config: Config) -> Result<Self, Error> {
+        let provider = Self::with(Store::open(path)?, wallet, config, None);
+        let open = provider.open_own()?;
+        if open > 0 {
+            return Err(Error::Setup(format!(
+                "{open} swaps into a hub's own notes are under way in {}: only that hub takes \
+                 them on",
+                path.display()
+            )));
+        }
+        Ok(provider)
+    }
+
+    /// A new swaps file at `path`, for the provider of `wallet` that is the
+    /// hub of `issuer`.
+    pub fn create_issuing(
+        path: &Path,
+        wallet: Wallet<T>,
+        config: Config,
+        issuer: Issuer,
+    ) -> Result<Self, Error> {
+        Ok(Self::with(
+            Self::created(path)?,
+            wallet,
+            config,
+            Some(issuer),
+        ))
+    }
+
+    /// The swaps file at `path`, of the provider of `wallet` that is the
+    /// hub of `issuer`.
+    pub fn open_issuing(
+        path: &Path,
+        wallet: Wallet<T>,
+        config: Config,
+        issuer: Issuer,
+    ) -> Result<Self, Error> {
+        Ok(Self::with(Store::open(path)?, wallet, config, Some(issuer)))
+    }
+
+    fn created(path: &Path) -> Result<Store, Error> {
         let mut nostr = [0; 32];
         OsRng.fill_bytes(&mut nostr);
-        Ok(Self::with(Store::create(path, &nostr)?, wallet, config))
+        Store::create(path, &nostr)
     }
 
-    /// The swaps file at `path`.
-    pub fn open(path: &Path, wallet: Wallet<T>, config: Config) -> Result<Self, Error> {
-        Ok(Self::with(Store::open(path)?, wallet, config))
-    }
-
-    fn with(store: Store, wallet: Wallet<T>, config: Config) -> Self {
+    fn with(store: Store, wallet: Wallet<T>, config: Config, issuer: Option<Issuer>) -> Self {
         Self {
             wallet,
             store,
@@ -473,7 +543,26 @@ impl<T: Transport> Provider<T> {
             short: Mutex::default(),
             payouts: None,
             withheld: Mutex::default(),
+            late: Mutex::default(),
+            issuer,
         }
+    }
+
+    /// Swaps into the provider's own hub under way.
+    fn open_own(&self) -> Result<u64, Error> {
+        self.store.read(|c| {
+            Ok(c.query_row(
+                "SELECT count(*) FROM swaps WHERE kind = 'own'
+                 AND state IN ('accepted', 'locked', 'paid')",
+                [],
+                |r| r.get::<_, i64>(0),
+            )? as u64)
+        })
+    }
+
+    /// The hub the provider is, if it is one.
+    pub fn issuer(&self) -> Option<&Issuer> {
+        self.issuer.as_ref()
     }
 
     /// Its wallet, which holds its notes at each hub.
@@ -497,25 +586,32 @@ impl<T: Transport> Provider<T> {
     /// how much the client's lock must outlive its own ([`Config::lead`]),
     /// nothing where it may not lock. The margin it gives for every hub, to
     /// clients that read no other, is the most of them.
+    ///
+    /// The hub of an [`Issuer`] locks at itself alone: as much as it may
+    /// still take of the notes of a hub it swaps from, by
+    /// [`Config::own_lead`].
     pub fn info(&self) -> Result<swaps::Info, Error> {
-        let stock = self.stock()?;
-        let margin = stock
+        let hubs: Vec<Hub> = match &self.issuer {
+            Some(issuer) => self.issuing(issuer)?,
+            None => self
+                .stock()?
+                .into_iter()
+                .map(|s| Hub {
+                    address: s.address,
+                    max: if s.lead.is_some() {
+                        s.free.min(self.config.max)
+                    } else {
+                        0
+                    },
+                    margin: s.lead,
+                })
+                .collect(),
+        };
+        let margin = hubs
             .iter()
-            .filter_map(|s| s.lead)
+            .filter_map(|h| h.margin)
             .max()
             .unwrap_or(self.config.margin);
-        let hubs = stock
-            .into_iter()
-            .map(|s| Hub {
-                address: s.address,
-                max: if s.lead.is_some() {
-                    s.free.min(self.config.max)
-                } else {
-                    0
-                },
-                margin: s.lead,
-            })
-            .collect();
         Ok(swaps::Info {
             address: self.wallet.address(),
             fee: self.config.fee,
@@ -556,10 +652,69 @@ impl<T: Transport> Provider<T> {
         Ok(stock)
     }
 
+    /// The hubs of an issuing provider, its own first.
+    fn issuing(&self, issuer: &Issuer) -> Result<Vec<Hub>, Error> {
+        let own = issuer.info().map_err(Error::Hub)?;
+        let (mut room, mut hubs) = (0, Vec::new());
+        for (url, info) in self.wallet.hubs()? {
+            if info.address == own.address {
+                continue;
+            }
+            if let Some(cap) = issuer.cap_of(&url) {
+                room = room.max(cap.saturating_sub(self.held(&url)?));
+            }
+            hubs.push(Hub {
+                address: info.address,
+                max: 0,
+                margin: None,
+            });
+        }
+        let lead = own.locks.as_ref().and_then(|l| self.config.own_lead(l));
+        let max = match lead {
+            Some(_) => room.min(self.config.max),
+            None => 0,
+        };
+        hubs.insert(
+            0,
+            Hub {
+                address: own.address,
+                max,
+                margin: lead,
+            },
+        );
+        Ok(hubs)
+    }
+
+    /// What the provider holds of hub `url`'s notes, and is owed there by
+    /// the clients of the swaps into its own hub.
+    fn held(&self, url: &str) -> Result<u64, Error> {
+        // Owed first: a swap claimed between the reads is counted twice,
+        // never not at all.
+        let owed = self.store.read(|c| {
+            Ok(c.query_row(
+                "SELECT coalesce(sum(paid), 0) FROM swaps
+                 WHERE kind = 'own' AND from_url = ?1 AND state IN ('accepted', 'locked', 'paid')",
+                [url],
+                |r| r.get::<_, i64>(0),
+            )? as u64)
+        })?;
+        let holds = self
+            .wallet
+            .balance()?
+            .iter()
+            .find(|b| b.hub == url)
+            .map_or(0, |b| b.available.saturating_add(b.pending));
+        Ok(holds.saturating_add(owed))
+    }
+
     /// Alert the operator of each hub the provider can no longer swap to,
     /// holding less there than the least it swaps: once, until it holds
-    /// enough again. The hubs it alerted of now.
+    /// enough again. The hubs it alerted of now: none of an issuing
+    /// provider, which locks notes its hub issues.
     pub fn check_stock(&self) -> Result<Vec<String>, Error> {
+        if self.issuer.is_some() {
+            return Ok(Vec::new());
+        }
         let stock = self.stock()?;
         let mut short = self.short.lock().unwrap_or_else(PoisonError::into_inner);
         let mut alerted = Vec::new();
@@ -613,15 +768,38 @@ impl<T: Transport> Provider<T> {
             )));
         }
         let hubs = self.wallet.hubs().map_err(unavailable)?;
-        let at = |address: &Address| hubs.iter().find(|(_, info)| info.address == *address);
-        let (Some((from, _)), Some((to, _))) = (at(&request.from), at(&request.to)) else {
+        let at = |address: &Address| {
+            hubs.iter()
+                .find(|(_, info)| info.address == *address)
+                .map(|(url, _)| url.as_str())
+        };
+        // The hub of an issuer swaps into itself alone, from the hubs it
+        // takes notes of.
+        let own = match &self.issuer {
+            Some(issuer) => Some((issuer, issuer.info()?)),
+            None => None,
+        };
+        let (from, to) = match &own {
+            Some((issuer, info)) if request.to == info.address && request.from != info.address => {
+                (at(&request.from), Some(issuer.url()))
+            }
+            Some(_) => (None, None),
+            None => (at(&request.from), at(&request.to)),
+        };
+        let (Some(from), Some(to)) = (from, to) else {
             return Err(declined("no swaps between these hubs"));
         };
         if from == to {
             return Err(declined("a swap is between two hubs"));
         }
-        if at(&request.address).is_some() {
+        let own_address = own.as_ref().map(|(_, info)| info.address);
+        if at(&request.address).is_some() || own_address == Some(request.address) {
             return Err(Problem::invalid("a hub's address is not a client's"));
+        }
+        if let Some((issuer, _)) = &own {
+            if issuer.cap_of(from).is_none() {
+                return Err(declined(format!("no swaps from hub {from}")));
+            }
         }
         let Some(_hold) = Hold::take(&self.busy, key) else {
             return Err(unavailable("the swap is under way"));
@@ -642,11 +820,18 @@ impl<T: Transport> Provider<T> {
         if incoming.settled.is_some() || incoming.preimage.is_some() {
             return Err(declined("the lock is settled"));
         }
-        let to_info = self.wallet.add_hub(to).await.map_err(refused)?;
+        let to_info = match own {
+            Some((_, info)) => info,
+            None => self.wallet.add_hub(to).await.map_err(refused)?,
+        };
         let Some(locks) = to_info.locks.as_ref() else {
             return Err(declined(format!("hub {to} follows no chain")));
         };
-        let Some(lead) = config.lead(locks) else {
+        let lead = match own_address {
+            Some(_) => config.own_lead(locks),
+            None => config.lead(locks),
+        };
+        let Some(lead) = lead else {
             return Err(declined(format!(
                 "no swaps to hub {to}: a refund request there confirms within {} blocks, \
                  before the provider sees the hub keep the preimage",
@@ -673,7 +858,7 @@ impl<T: Transport> Provider<T> {
             expiry_from: incoming.expiry,
             expiry,
         };
-        self.record(request, &key, &terms, &to_info)?;
+        self.record(request, &key, &terms, &to_info, own_address.is_some())?;
         tracing::info!(id = %hex::encode(key), %from, %to, amount = request.amount, fee, expiry, "swap accepted");
         self.lock(&key).await.map_err(unavailable)?;
         Ok(self
@@ -687,8 +872,12 @@ impl<T: Transport> Provider<T> {
     fn again(&self, row: &Row, request: &Request) -> Result<swaps::Swap, Problem> {
         let hubs = self.wallet.hubs().map_err(unavailable)?;
         let address = |url: &str| hubs.iter().find(|(u, _)| u == url).map(|(_, i)| i.address);
+        let to = match &self.issuer {
+            Some(issuer) if row.own => Some(issuer.address()),
+            _ => address(&row.to),
+        };
         let same = address(&row.from) == Some(request.from)
-            && address(&row.to) == Some(request.to)
+            && to == Some(request.to)
             && row.address == request.address.to_bytes()
             && row.amount == request.amount;
         if !same {
@@ -712,29 +901,46 @@ struct Terms<'a> {
 /// Recording and locking.
 impl<T: Transport> Provider<T> {
     /// Record the swap `request` asks for on `terms`, if the provider holds
-    /// enough at hub `to` beside the swaps it has yet to lock there.
+    /// enough at hub `to` beside the swaps it has yet to lock there. Into
+    /// its `own` hub, if it may yet take as many of hub `from`'s notes, its
+    /// lock's ephemeral secret with it.
     fn record(
         &self,
         request: &Request,
         id: &[u8; 32],
         terms: &Terms<'_>,
         to_info: &licash_api::Info,
+        own: bool,
     ) -> Result<(), Problem> {
         let _taking = self.taking.lock().unwrap_or_else(PoisonError::into_inner);
-        let balance = self.wallet.balance().map_err(unavailable)?;
-        let available = balance
-            .iter()
-            .find(|b| b.hub == terms.to)
-            .map_or(0, |b| b.available);
-        let reserved = self.reserved(terms.to).map_err(unavailable)?;
-        let needed = reserved
-            .saturating_add(request.amount)
-            .saturating_add(to_info.fees.lock.due(available));
-        if available < needed {
-            return Err(declined(format!(
-                "the provider holds too little at hub {} now",
-                terms.to
-            )));
+        match self.issuer.as_ref().filter(|_| own) {
+            Some(issuer) => {
+                let cap = issuer.cap_of(terms.from).unwrap_or(0);
+                let held = self.held(terms.from).map_err(unavailable)?;
+                if held.saturating_add(terms.paid) > cap {
+                    return Err(declined(format!(
+                        "the hub takes no more of hub {}'s notes now",
+                        terms.from
+                    )));
+                }
+            }
+            None => {
+                let balance = self.wallet.balance().map_err(unavailable)?;
+                let available = balance
+                    .iter()
+                    .find(|b| b.hub == terms.to)
+                    .map_or(0, |b| b.available);
+                let reserved = self.reserved(terms.to).map_err(unavailable)?;
+                let needed = reserved
+                    .saturating_add(request.amount)
+                    .saturating_add(to_info.fees.lock.due(available));
+                if available < needed {
+                    return Err(declined(format!(
+                        "the provider holds too little at hub {} now",
+                        terms.to
+                    )));
+                }
+            }
         }
         let notice = Notice::Accepted {
             id: hex::encode(id),
@@ -747,8 +953,8 @@ impl<T: Transport> Provider<T> {
             let at = now();
             let inserted = tx.execute(
                 "INSERT INTO swaps (id, hash, from_url, to_url, address, amount, fee, paid,
-                    expiry_from, expiry, state, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'accepted', ?11, ?11)
+                    expiry_from, expiry, state, created_at, updated_at, kind)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'accepted', ?11, ?11, ?12)
                  ON CONFLICT DO NOTHING",
                 params![
                     id,
@@ -761,10 +967,17 @@ impl<T: Transport> Provider<T> {
                     terms.paid as i64,
                     terms.expiry_from,
                     terms.expiry,
-                    at
+                    at,
+                    if own { "own" } else { "notes" }
                 ],
             )?;
             if inserted == 1 {
+                if own {
+                    tx.execute(
+                        "INSERT INTO issues (id, ephemeral) VALUES (?1, ?2)",
+                        params![id, Issue::new_ephemeral()],
+                    )?;
+                }
                 emit(tx, &notice)?;
             }
             Ok(inserted == 1)
@@ -780,6 +993,9 @@ impl<T: Transport> Provider<T> {
     /// it up if nothing was locked.
     async fn lock(&self, id: &[u8; 32]) -> Result<(), Error> {
         let row = self.row(id)?.expect("recorded");
+        if row.own {
+            return self.lock_own(id, &row);
+        }
         let address = Address::from_bytes(&row.address).map_err(licash_wallet::Error::from)?;
         let mut tries = 0;
         let locked = loop {
@@ -812,6 +1028,56 @@ impl<T: Transport> Provider<T> {
             }
         }
         Ok(())
+    }
+
+    /// Have the provider's hub lock the notes of the swap `row` it issues:
+    /// give it up if declined. Its outcome unknown, `step` adopts the lock
+    /// the hub made, or gives the swap up.
+    fn lock_own(&self, id: &[u8; 32], row: &Row) -> Result<(), Error> {
+        let issuer = self.issuer_of(row)?;
+        match issuer.lock(&self.issue_of(id, row)?) {
+            Ok(lock) => {
+                self.set_lock(id, &lock)?;
+                self.advance(id, Stage::Accepted, Stage::Locked, None, None)?;
+            }
+            Err(problem) if problem.code == Code::Declined => {
+                self.fail(id, row, &format!("not locked: {}", problem.message))?;
+            }
+            Err(problem) => {
+                tracing::warn!(id = %hex::encode(id), %problem, "own lock pending");
+            }
+        }
+        Ok(())
+    }
+
+    /// The issuer of the swap `row`, into its own hub: the provider's, at
+    /// whatever URL it is reached now, as only that hub opens a file
+    /// holding such swaps ([`Provider::open`]).
+    fn issuer_of(&self, row: &Row) -> Result<&Issuer, Error> {
+        self.issuer.as_ref().ok_or_else(|| {
+            Error::Setup(format!(
+                "a swap into hub {}'s own notes: only that hub takes it on",
+                row.to
+            ))
+        })
+    }
+
+    /// The own lock of the swap `row`, as recorded.
+    fn issue_of(&self, id: &[u8; 32], row: &Row) -> Result<Issue, Error> {
+        let ephemeral = self.store.read(|c| {
+            Ok(
+                c.query_row("SELECT ephemeral FROM issues WHERE id = ?1", [id], |r| {
+                    r.get(0)
+                })?,
+            )
+        })?;
+        Ok(Issue {
+            address: Address::from_bytes(&row.address).map_err(licash_wallet::Error::from)?,
+            amount: row.amount,
+            hash: row.hash,
+            expiry: row.expiry,
+            ephemeral,
+        })
     }
 
     fn set_lock(&self, id: &[u8; 32], lock: &[u8; 32]) -> Result<(), Error> {
@@ -889,10 +1155,22 @@ fn emit(tx: &rusqlite::Transaction<'_>, notice: &Notice) -> Result<(), Error> {
 impl<T: Transport> Provider<T> {
     /// Take every swap under way on: follow the provider's locks, and
     /// claim the clients' once they revealed their preimages. Its hubs are
-    /// asked again what they say of themselves, and its wallet's other
-    /// payments taken on. The swaps that could not move now, by id and why.
+    /// asked again what they say of themselves, with the hubs an issuing
+    /// provider swaps from, and its wallet's other payments taken on. The
+    /// swaps that could not move now, by id and why.
     pub async fn step(&self) -> Result<Vec<(String, String)>, Error> {
-        for (url, _) in self.wallet.hubs()? {
+        let mut urls: Vec<String> = self
+            .wallet
+            .hubs()?
+            .into_iter()
+            .map(|(url, _)| url)
+            .collect();
+        for url in self.issuer.iter().flat_map(Issuer::sources) {
+            if !urls.iter().any(|u| u == url) {
+                urls.push(url.to_owned());
+            }
+        }
+        for url in urls {
             if let Err(e) = self.wallet.add_hub(&url).await {
                 tracing::warn!(%url, "hub unavailable: {e}");
             }
@@ -909,7 +1187,7 @@ impl<T: Transport> Provider<T> {
         let open: Vec<[u8; 32]> = self.store.read(|c| {
             let mut stmt = c.prepare(
                 "SELECT id FROM swaps WHERE state IN ('accepted', 'locked', 'paid')
-                    AND (kind = 'notes' OR state = 'paid')
+                    AND (kind IN ('notes', 'own') OR state = 'paid')
                  ORDER BY created_at, rowid",
             )?;
             let rows = stmt.query_map([], |r| r.get(0))?;
@@ -941,6 +1219,9 @@ impl<T: Transport> Provider<T> {
 
     /// Follow the provider's lock of the swap `row` to its settlement.
     async fn follow(&self, id: &[u8; 32], row: &Row) -> Result<(), Error> {
+        if row.own {
+            return self.follow_own(id, row).await;
+        }
         let lock = match row.lock {
             Some(lock) => lock,
             // Stopped after the wallet recorded the lock, or before.
@@ -993,6 +1274,56 @@ impl<T: Transport> Provider<T> {
                 return self.fail(id, row, &format!("its hub refused the lock: {reason}"));
             }
             _ => {}
+        }
+        Ok(())
+    }
+
+    /// Follow the own lock of the swap `row`, which its hub issued, to its
+    /// settlement. Stopped before its lock was recorded, the provider
+    /// adopts the lock the hub holds under its hash if the swap made it,
+    /// and never locks again.
+    async fn follow_own(&self, id: &[u8; 32], row: &Row) -> Result<(), Error> {
+        let issuer = self.issuer_of(row)?;
+        let lock = match row.lock {
+            Some(lock) => lock,
+            None => match issuer.find(&self.issue_of(id, row)?) {
+                Ok(Some(lock)) => {
+                    self.set_lock(id, &lock)?;
+                    lock
+                }
+                Ok(None) => return self.fail(id, row, "stopped before locking"),
+                Err(problem) if problem.code == Code::Declined => {
+                    let reason = format!("not locked: {}", problem.message);
+                    self.alert(&format!(
+                        "Swap {} was not locked: hub {} holds another lock under its hash.",
+                        hex::encode(id),
+                        row.to
+                    ))?;
+                    return self.fail(id, row, &reason);
+                }
+                Err(problem) => return Err(Error::Hub(problem)),
+            },
+        };
+        match issuer.follow(&lock).map_err(Error::Hub)? {
+            Issued::Locked => {
+                if row.stage == Stage::Accepted {
+                    self.advance(id, Stage::Accepted, Stage::Locked, None, None)?;
+                    tracing::info!(id = %hex::encode(id), lock = %hex::encode(lock), "locked");
+                }
+            }
+            Issued::Paid(preimage) => {
+                self.advance(id, row.stage, Stage::Paid, Some(&preimage), None)?;
+                let row = self.row(id)?.expect("recorded");
+                return self.claim(id, &row).await;
+            }
+            Issued::Refunded => {
+                tracing::info!(id = %hex::encode(id), "refunded: the client never claimed");
+                let notice = Notice::Refunded {
+                    id: hex::encode(id),
+                    amount: row.amount,
+                };
+                self.advance(id, row.stage, Stage::Refunded, None, Some((&notice, "")))?;
+            }
         }
         Ok(())
     }
@@ -1057,7 +1388,10 @@ impl<T: Transport> Provider<T> {
     async fn claim(&self, id: &[u8; 32], row: &Row) -> Result<(), Error> {
         let preimage = row.preimage.expect("paid on it");
         let key = hex::encode(id);
-        let claimed = match row.chain {
+        // Its own hub paid the client already: the preimage is out, and the
+        // hub claims until hub `from` refuses, its notes backed by none
+        // other.
+        let claimed = match row.chain || row.own {
             true => self.wallet.claim_revealed(&row.from, &key, &preimage).await,
             false => self.wallet.claim(&row.from, &key, &preimage).await,
         };
@@ -1081,9 +1415,52 @@ impl<T: Transport> Provider<T> {
                 };
                 self.advance(id, Stage::Paid, Stage::Lost, None, Some((&notice, &reason)))?;
             }
-            Err(e) => return Err(e.into()),
+            Err(e) => {
+                self.check_late(id, row)?;
+                return Err(e.into());
+            }
         }
         Ok(())
+    }
+
+    /// Alert the operator, once, if the provider paid the swap `row` but
+    /// has yet to claim the client's lock within its margin, and the time
+    /// to confirm on Bitcoin, of that lock's expiry: lost once it expires.
+    fn check_late(&self, id: &[u8; 32], row: &Row) -> Result<(), Error> {
+        // Not hub `from`'s height alone, which may stop answering, or lag:
+        // the highest of either hub, or of the provider's own.
+        let hubs = self.wallet.hubs()?;
+        let at = |url: &str| {
+            hubs.iter()
+                .find(|(u, _)| u == url)
+                .and_then(|(_, info)| info.locks.as_ref())
+                .map(|l| l.height)
+        };
+        let own = self.issuer.as_ref().filter(|_| row.own);
+        let height = [at(&row.from), at(&row.to), own.and_then(Issuer::height)]
+            .into_iter()
+            .flatten()
+            .max();
+        let late = self.config.margin.saturating_add(self.config.confirm);
+        // A hub that follows no chain now says nothing of its height: the
+        // operator is told early rather than late.
+        if height.is_some_and(|h| h < row.expiry_from.saturating_sub(late)) {
+            return Ok(());
+        }
+        let mut alerted = self.late.lock().unwrap_or_else(PoisonError::into_inner);
+        if !alerted.insert(*id) {
+            return Ok(());
+        }
+        let message = format!(
+            "The provider paid swap {} at {} but has not claimed the client's lock at {} yet, \
+             which expires at {}: unclaimed by then, the swap is lost. Check that hub.",
+            hex::encode(id),
+            row.to,
+            row.from,
+            row.expiry_from
+        );
+        tracing::error!(id = %hex::encode(id), "{message}");
+        self.alert(&message)
     }
 }
 

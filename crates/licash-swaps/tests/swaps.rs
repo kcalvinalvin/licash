@@ -15,7 +15,7 @@ use licash_api::{
     swaps::{self, Request},
     Code, Fee, Hex, Problem,
 };
-use licash_swaps::{Config, Notice, Provider, Stage};
+use licash_swaps::{Config, Issuer, Notice, Provider, Stage};
 use licash_wallet::{Error, Response, SwapLimits, SwapState, Transport, Wallet};
 use net::{Fault, Link, Net};
 
@@ -43,6 +43,17 @@ const WINDOW_A: u32 = 46;
 const LEAD_B: u32 = 4 + 20 + 1 + 6 + 1;
 /// And at A.
 const LEAD_A: u32 = 4 + WINDOW_A + 1 + 6 + 1;
+/// Blocks the client's lock outlives B's own lock, B the provider: the
+/// confirmation of an activation on Bitcoin, reading it, the provider's
+/// margin and one.
+const OWN_LEAD: u32 = 4 + 1 + 6 + 1;
+
+/// Both hubs' window when B is the provider: too short at A for a third
+/// party to outlast B's window, long enough for B itself.
+const WINDOW: u32 = 30;
+
+/// Whether hub B holds a hash for another of its services.
+type Guard = Box<dyn Fn(&[u8; 32]) -> Result<bool, String> + Send + Sync>;
 
 /// The provider, as its clients reach it.
 #[derive(Default)]
@@ -136,6 +147,8 @@ struct Eco {
     dir: tempfile::TempDir,
     client: Wallet<Client>,
     config: Config,
+    /// Hub B is the provider, taking at most this of A's notes.
+    cap: Option<u64>,
 }
 
 impl Eco {
@@ -148,13 +161,32 @@ impl Eco {
     /// As [`Eco::new`], A's window `window_a`, the provider's terms
     /// `config`.
     async fn with(stock: u64, window_a: u32, config: Config) -> Self {
+        Self::build(stock, window_a, config, None).await
+    }
+
+    /// Hubs A and B of window [`WINDOW`] at height 3, B the provider of the
+    /// swaps into it, taking at most `cap` of A's notes and no hash
+    /// `guard` says it holds, and a client holding 100 at A.
+    async fn issuing(cap: u64, guard: Guard) -> Self {
+        Self::build(0, WINDOW, CONFIG, Some((cap, guard))).await
+    }
+
+    async fn build(
+        stock: u64,
+        window_a: u32,
+        config: Config,
+        issuing: Option<(u64, Guard)>,
+    ) -> Self {
         let net = Net::new();
         let timing = licash_hub::Timing {
             window: window_a,
             ..net::TIMING
         };
         net.start_timed(A, FEE, timing);
-        net.start(B, FEE);
+        match issuing {
+            Some(_) => net.start_timed(B, FEE, timing),
+            None => net.start(B, FEE),
+        }
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("provider.sqlite");
         let wallet = Wallet::create(
@@ -167,10 +199,20 @@ impl Eco {
         for hub in [A, B] {
             wallet.add_hub(hub).await.unwrap();
         }
-        wallet
-            .receive(&net.pay(B, &wallet.address(), stock))
-            .unwrap();
-        let provider = Provider::create(&dir.path().join("swaps.sqlite"), wallet, config).unwrap();
+        let swaps = dir.path().join("swaps.sqlite");
+        let cap = issuing.as_ref().map(|&(cap, _)| cap);
+        let provider = match issuing {
+            Some((cap, guard)) => {
+                let issuer = Issuer::new(net.hub(B), B).cap(A, cap).guard(guard);
+                Provider::create_issuing(&swaps, wallet, config, issuer).unwrap()
+            }
+            None => {
+                wallet
+                    .receive(&net.pay(B, &wallet.address(), stock))
+                    .unwrap();
+                Provider::create(&swaps, wallet, config).unwrap()
+            }
+        };
         let desk = Arc::new(Desk::default());
         *desk.provider.lock().unwrap() = Some(Arc::new(provider));
         let client = Client(net.clone(), desk.clone());
@@ -191,6 +233,7 @@ impl Eco {
             dir,
             client,
             config,
+            cap,
         }
     }
 
@@ -200,14 +243,30 @@ impl Eco {
 
     /// Stop the provider and start it again on its files.
     fn restart(&self) {
+        self.stop();
+        let provider = self.reopen(self.cap).unwrap();
+        *self.desk.provider.lock().unwrap() = Some(Arc::new(provider));
+    }
+
+    fn stop(&self) {
         let old = self.desk.provider.lock().unwrap().take().unwrap();
         assert_eq!(Arc::strong_count(&old), 1, "the provider is in use");
         drop(old);
+    }
+
+    /// The provider on its files, as hub B taking at most `cap` of A's
+    /// notes if given.
+    fn reopen(&self, cap: Option<u64>) -> Result<Provider<Link>, licash_swaps::Error> {
         let path = self.dir.path().join("provider.sqlite");
         let wallet = Wallet::open(&path, Link(self.net.clone())).unwrap();
-        let provider =
-            Provider::open(&self.dir.path().join("swaps.sqlite"), wallet, self.config).unwrap();
-        *self.desk.provider.lock().unwrap() = Some(Arc::new(provider));
+        let swaps = self.dir.path().join("swaps.sqlite");
+        match cap {
+            Some(cap) => {
+                let issuer = Issuer::new(self.net.hub(B), B).cap(A, cap);
+                Provider::open_issuing(&swaps, wallet, self.config, issuer)
+            }
+            None => Provider::open(&swaps, wallet, self.config),
+        }
     }
 
     /// Mine `blocks` on both hubs' chains, as if they followed one.
@@ -880,4 +939,419 @@ async fn the_operator_is_alerted_once_of_a_hub_that_neither_pays_nor_refunds_its
     assert!(eco.provider().step().await.unwrap().is_empty());
     assert_eq!(eco.provider().records(1).unwrap()[0].stage, Stage::Refunded);
     assert_eq!(eco.kinds(), ["accepted", "alert", "alert", "refunded"]);
+}
+
+impl Eco {
+    /// Hub B's own lock under the hash of the swap `id`, made as the
+    /// provider makes it from the ephemeral secret it recorded, or from
+    /// another: as if B stopped once it locked, before the provider
+    /// recorded the lock.
+    fn lock_own(&self, id: &str, recorded: bool) {
+        use licash::{address::Ephemeral, crypto::ScalarBytes, spend::TimedTerms};
+        let c = rusqlite::Connection::open(self.dir.path().join("swaps.sqlite")).unwrap();
+        let (address, amount, hash, expiry, secret) = c
+            .query_row(
+                "SELECT s.address, s.amount, s.hash, s.expiry, i.ephemeral
+                 FROM swaps s JOIN issues i ON i.id = s.id WHERE s.id = ?1",
+                [hex::decode(id).unwrap()],
+                |r| {
+                    Ok((
+                        r.get::<_, Vec<u8>>(0)?,
+                        r.get::<_, i64>(1)? as u64,
+                        r.get::<_, [u8; 32]>(2)?,
+                        r.get::<_, u32>(3)?,
+                        r.get::<_, [u8; 32]>(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        let secret = if recorded { secret } else { [7; 32] };
+        let ephemeral = Ephemeral::from_scalar(ScalarBytes(secret).to_scalar().unwrap()).unwrap();
+        let address = licash::address::Address::from_bytes(&address).unwrap();
+        let hub = self.net.hub(B);
+        let keyset = hub.info().keysets.remove(0);
+        let pay = licash_wallet::pay_outputs(&keyset, &ephemeral, &address, amount).unwrap();
+        let checkpoint = hub.checkpoint().unwrap();
+        let terms = TimedTerms::new(
+            checkpoint.profile(),
+            checkpoint.commitment(),
+            expiry,
+            1,
+            hash,
+        )
+        .unwrap();
+        hub.lock_own(keyset.id(), ephemeral.public(), pay, terms)
+            .unwrap();
+    }
+
+    /// The expiry of the lock `id` at the hub at `url`.
+    fn expiry(&self, url: &str, id: &str) -> u32 {
+        let lock = self.net.hub(url).locked(&lock_id(id)).unwrap();
+        lock.proposal.lock().unwrap().terms().expiry()
+    }
+}
+
+fn no_guard() -> Guard {
+    Box::new(|_| Ok(false))
+}
+
+#[tokio::test]
+async fn a_hub_swaps_into_itself_notes_it_issues_from_a_hub_of_the_same_window() {
+    let eco = Eco::issuing(100, no_guard()).await;
+    let (fee, lock_fee) = costs(20);
+    let provider = eco.provider();
+    // At B as much as it may still take of A's notes, up to its most, the
+    // client's lock outliving its own by little: B keeps no preimage from
+    // itself. Nothing at A.
+    let info = provider.info().unwrap();
+    let at = |url| {
+        let hub = info.hub(&eco.address(url)).unwrap();
+        (hub.max, hub.margin)
+    };
+    assert_eq!((at(B), at(A)), ((100, Some(OWN_LEAD)), (0, None)));
+    assert_eq!(info.margin, OWN_LEAD);
+    assert_ne!(info.address, eco.address(B));
+
+    let swap = eco
+        .client
+        .swap(PROVIDER, A, B, 20, SwapLimits::usual(20))
+        .await
+        .unwrap();
+    assert_eq!(swap.state, SwapState::Done);
+    assert_eq!(held(&eco.client, B), 20);
+    let record = provider.records(1).unwrap().remove(0);
+    assert_eq!(record.stage, Stage::Locked);
+    let lock = record.lock.unwrap();
+    assert_eq!(
+        record.expiry,
+        eco.expiry(A, swap.lock.as_ref().unwrap()) - OWN_LEAD
+    );
+    // Of notes B issued: the provider's wallet locked nothing there.
+    assert!(eco.net.hub(B).locked(&lock_id(&lock)).unwrap().own);
+    assert!(provider.wallet().locks().unwrap().is_empty());
+    // What the client's lock pays at A counts against the cap, owed or
+    // held.
+    let left = || provider.info().unwrap().hub(&eco.address(B)).unwrap().max;
+    assert_eq!(left(), 100 - 20 - fee);
+
+    assert!(provider.step().await.unwrap().is_empty());
+    let record = &provider.records(1).unwrap()[0];
+    assert_eq!((record.stage, record.paid), (Stage::Done, 20 + fee));
+    assert_eq!(held(provider.wallet(), A), 20 + fee);
+    assert_eq!(left(), 100 - 20 - fee);
+    assert_eq!(eco.kinds(), ["accepted", "done"]);
+    eco.client.resume().await.unwrap();
+    assert_eq!(held(&eco.client, A), 100 - 20 - fee - lock_fee);
+    assert_eq!(
+        eco.client.follow_swap(&swap.hash).await.unwrap().state,
+        SwapState::Done
+    );
+}
+
+#[tokio::test]
+async fn a_hub_takes_swaps_into_itself_only_from_the_hubs_it_caps() {
+    let eco = Eco::issuing(30, no_guard()).await;
+    let provider = eco.provider();
+    let fee = costs(20).0;
+    let swap = eco
+        .client
+        .swap(PROVIDER, A, B, 20, SwapLimits::usual(20))
+        .await
+        .unwrap();
+    assert_eq!(swap.state, SwapState::Done);
+    // Owed 21 of A's notes, 9 under its cap: a client locks nothing for
+    // more.
+    let left = provider.info().unwrap().hub(&eco.address(B)).unwrap().max;
+    assert_eq!(left, 30 - 20 - fee);
+    let e = eco
+        .client
+        .swap(PROVIDER, A, B, 20, SwapLimits::usual(20))
+        .await
+        .unwrap_err();
+    assert!(matches!(e, Error::Invalid(_)), "{e}");
+    assert_eq!(eco.client.swaps().unwrap().len(), 1);
+
+    // One that locks anyway is declined.
+    let (a, b, me) = (eco.address(A), eco.address(B), eco.client.address());
+    let to = provider.wallet().address();
+    let lock = eco.client.lock(A, &to, 20 + fee, lock_hash(&[6; 32]), None);
+    let lock = lock_id(&lock.await.unwrap().id);
+    let take = |request: Request| {
+        let provider = provider.clone();
+        async move { provider.take(&request).await.unwrap_err() }
+    };
+    let declined = take(Request::new(&a, &lock, &b, &me, 20)).await;
+    assert_eq!(declined.code, Code::Declined);
+    assert!(declined.message.contains("no more"), "{declined:?}");
+    // Nor does B swap out of itself, or into another hub.
+    let declined = take(Request::new(&b, &lock, &a, &me, 20)).await;
+    assert!(
+        declined.message.contains("between these hubs"),
+        "{declined:?}"
+    );
+    let invalid = take(Request::new(&a, &lock, &b, &b, 20)).await;
+    assert_eq!(invalid.code, Code::Invalid);
+
+    // Nor from a hub it holds no cap for.
+    const C: &str = "http://c.test";
+    eco.net.start(C, FEE);
+    provider.wallet().add_hub(C).await.unwrap();
+    eco.client.add_hub(C).await.unwrap();
+    eco.client
+        .receive(&eco.net.pay(C, &eco.client.address(), 100))
+        .unwrap();
+    let lock = eco.client.lock(C, &to, 20 + fee, lock_hash(&[7; 32]), None);
+    let lock = lock_id(&lock.await.unwrap().id);
+    let declined = take(Request::new(&eco.address(C), &lock, &b, &me, 20)).await;
+    assert!(
+        declined.message.contains("no swaps from hub"),
+        "{declined:?}"
+    );
+    assert_eq!(provider.records(10).unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_hub_restarted_adopts_the_lock_it_made_and_never_locks_again() {
+    // B's other services' hashes cannot be read: the provider records the
+    // swaps, but does not lock.
+    let eco = Eco::issuing(100, Box::new(|_| Err("receipts unreadable".into()))).await;
+    let mut ids = Vec::new();
+    for _ in 0..3 {
+        // A note for each lock: the change of the last is not back yet.
+        let note = eco.net.pay(A, &eco.client.address(), 16);
+        eco.client.receive(&note).unwrap();
+        let e = eco
+            .client
+            .swap(PROVIDER, A, B, 10, SwapLimits::usual(10))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&e, Error::Pending { reason, .. } if reason.contains("locking")),
+            "{e}"
+        );
+        let record = eco.provider().records(1).unwrap().remove(0);
+        assert_eq!((record.stage, record.lock), (Stage::Accepted, None));
+        ids.push(record.id);
+    }
+    // B locked the second swap's notes before it stopped, and other notes
+    // under the third's hash.
+    eco.lock_own(&ids[1], true);
+    eco.lock_own(&ids[2], false);
+
+    // Only B takes its swaps on.
+    eco.stop();
+    match eco.reopen(None) {
+        Err(licash_swaps::Error::Setup(why)) => assert!(why.contains("3 swaps"), "{why}"),
+        Err(e) => panic!("{e}"),
+        Ok(_) => panic!("opened"),
+    }
+    *eco.desk.provider.lock().unwrap() = Some(Arc::new(eco.reopen(eco.cap).unwrap()));
+    let provider = eco.provider();
+    assert!(provider.step().await.unwrap().is_empty());
+    let record = |id: &str| {
+        let records = provider.records(10).unwrap();
+        records.into_iter().find(|r| r.id == id).unwrap()
+    };
+    let (first, second, third) = (record(&ids[0]), record(&ids[1]), record(&ids[2]));
+    assert_eq!(first.stage, Stage::Failed);
+    assert!(first.reason.unwrap().contains("stopped before locking"));
+    assert_eq!(second.stage, Stage::Locked);
+    assert!(second.lock.is_some());
+    assert_eq!(third.stage, Stage::Failed);
+    assert!(third.reason.unwrap().contains("other notes"));
+    assert_eq!(
+        eco.kinds(),
+        ["accepted", "accepted", "accepted", "failed", "alert", "failed"]
+    );
+
+    // The second swap's client claims B's lock, and the provider the
+    // client's.
+    let resumed = eco.client.resume().await.unwrap();
+    let done = resumed.swaps.iter().filter(|s| s.state == SwapState::Done);
+    assert_eq!(done.count(), 1, "{resumed:?}");
+    assert_eq!(held(&eco.client, B), 10);
+    // Reached at another URL once started again, B still takes it on.
+    drop(provider);
+    eco.stop();
+    let wallet = Wallet::open(
+        &eco.dir.path().join("provider.sqlite"),
+        Link(eco.net.clone()),
+    );
+    let issuer = Issuer::new(eco.net.hub(B), "http://b.renamed.test").cap(A, 100);
+    let swaps = eco.dir.path().join("swaps.sqlite");
+    let provider = Provider::open_issuing(&swaps, wallet.unwrap(), CONFIG, issuer).unwrap();
+    assert!(provider.step().await.unwrap().is_empty());
+    let records = provider.records(10).unwrap();
+    let second = records.iter().find(|r| r.id == ids[1]).unwrap();
+    assert_eq!(second.stage, Stage::Done);
+    assert_eq!(held(provider.wallet(), A), 10 + costs(10).0);
+}
+
+#[tokio::test]
+async fn a_hub_locks_no_hash_another_of_its_services_holds() {
+    let eco = Eco::issuing(100, Box::new(|_| Ok(true))).await;
+    let swap = eco
+        .client
+        .swap(PROVIDER, A, B, 20, SwapLimits::usual(20))
+        .await;
+    let failed = match swap {
+        Ok(swap) => swap.state,
+        Err(e) => panic!("{e}"),
+    };
+    assert!(
+        matches!(&failed, SwapState::Failed(why) if why.contains("another payment")),
+        "{failed:?}"
+    );
+    let record = &eco.provider().records(1).unwrap()[0];
+    assert_eq!((record.stage, &record.lock), (Stage::Failed, &None));
+    assert_eq!(eco.kinds(), ["accepted", "failed"]);
+}
+
+#[tokio::test]
+async fn a_hubs_own_lock_its_client_never_claims_is_refunded() {
+    let eco = Eco::issuing(100, no_guard()).await;
+    // The client's claim is lost, and the client gone.
+    eco.net.fail(licash_api::SETTLE, Fault::Lost);
+    let e = eco
+        .client
+        .swap(PROVIDER, A, B, 20, SwapLimits::usual(20))
+        .await
+        .unwrap_err();
+    assert!(matches!(e, Error::Pending { .. }), "{e}");
+    let provider = eco.provider();
+    let expiry = provider.records(1).unwrap()[0].expiry;
+    let left = || provider.info().unwrap().hub(&eco.address(B)).unwrap().max;
+    assert_eq!(left(), 100 - 20 - costs(20).0);
+    // Refunded once expired at depth 1.
+    eco.mine(expiry - 3);
+    assert!(provider.step().await.unwrap().is_empty());
+    assert_eq!(provider.records(1).unwrap()[0].stage, Stage::Locked);
+    eco.mine(1);
+    assert!(provider.step().await.unwrap().is_empty());
+    assert_eq!(provider.records(1).unwrap()[0].stage, Stage::Refunded);
+    assert_eq!(eco.kinds(), ["accepted", "refunded"]);
+    // Owed nothing at A any more.
+    assert_eq!(left(), 100);
+}
+
+#[tokio::test]
+async fn the_operator_is_alerted_once_of_a_claim_late_at_the_hub_swapped_from() {
+    let eco = Eco::issuing(100, no_guard()).await;
+    let swap = eco
+        .client
+        .swap(PROVIDER, A, B, 20, SwapLimits::usual(20))
+        .await
+        .unwrap();
+    assert_eq!(swap.state, SwapState::Done);
+    let provider = eco.provider();
+    // The provider claims the client's lock within its margin, 6, and the
+    // time a claim on Bitcoin takes, 4, of its expiry.
+    let expiry = eco.expiry(A, swap.lock.as_ref().unwrap());
+    let due = expiry - 6 - 4;
+    eco.mine(due - 1 - 3);
+    eco.net.fail(licash_api::SETTLE, Fault::Lost);
+    assert_eq!(provider.step().await.unwrap().len(), 1);
+    assert_eq!(provider.records(1).unwrap()[0].stage, Stage::Paid);
+    assert_eq!(eco.kinds(), ["accepted"]);
+    eco.mine(1);
+    for _ in 0..2 {
+        eco.net.fail(licash_api::SETTLE, Fault::Lost);
+        assert_eq!(provider.step().await.unwrap().len(), 1);
+    }
+    assert_eq!(eco.kinds(), ["accepted", "alert"]);
+    let events = provider.events(0, 10).unwrap();
+    let Some(Notice::Alert { message }) = events[1].notice() else {
+        panic!("{events:?}");
+    };
+    for says in [A, &format!("expires at {expiry}")] {
+        assert!(message.contains(says), "{message}");
+    }
+    assert!(provider.step().await.unwrap().is_empty());
+    assert_eq!(provider.records(1).unwrap()[0].stage, Stage::Done);
+    assert_eq!(eco.kinds(), ["accepted", "alert", "done"]);
+}
+
+#[tokio::test]
+async fn the_operator_is_alerted_of_a_late_claim_though_the_hub_swapped_from_lags() {
+    let eco = Eco::issuing(100, no_guard()).await;
+    let swap = eco
+        .client
+        .swap(PROVIDER, A, B, 20, SwapLimits::usual(20))
+        .await
+        .unwrap();
+    let provider = eco.provider();
+    let expiry = eco.expiry(A, swap.lock.as_ref().unwrap());
+    // Hub A says it is still at 3, and loses the claim: the provider's own
+    // hub, at the height it is due by, alerts the operator.
+    eco.net.mine(B, expiry - 6 - 4 - 3, None);
+    eco.net.fail(licash_api::SETTLE, Fault::Lost);
+    assert_eq!(provider.step().await.unwrap().len(), 1);
+    assert_eq!(eco.kinds(), ["accepted", "alert"]);
+}
+
+#[tokio::test]
+async fn a_hubs_own_lock_activated_too_late_is_refunded_and_the_clients_lock_left_unclaimed() {
+    let eco = Eco::issuing(100, no_guard()).await;
+    let provider = eco.provider();
+    let fee = costs(20).0;
+    let (a, b, me) = (eco.address(A), eco.address(B), eco.client.address());
+    let to = provider.wallet().address();
+    for preimage in [[5; 32], [6; 32]] {
+        let note = eco.net.pay(A, &me, 30);
+        eco.client.receive(&note).unwrap();
+        let lock = eco
+            .client
+            .lock(A, &to, 20 + fee, lock_hash(&preimage), None);
+        let lock = lock_id(&lock.await.unwrap().id);
+        let request = Request::new(&a, &lock, &b, &me, 20);
+        let taken = provider.take(&request).await.unwrap();
+        assert_eq!(taken.state, swaps::State::Locked);
+    }
+    let record = |preimage: [u8; 32]| {
+        let hash = hex::encode(lock_hash(&preimage));
+        let records = provider.records(10).unwrap();
+        records.into_iter().find(|r| r.hash == hash).unwrap()
+    };
+    // The first activated on Bitcoin in time, its client gone: the hub
+    // pays it, and the provider claims the client's lock.
+    eco.net.mine(B, 1, Some([5; 32]));
+    assert!(provider.step().await.unwrap().is_empty());
+    let first = record([5; 32]);
+    assert_eq!(first.stage, Stage::Done);
+    assert_eq!(held(provider.wallet(), A), 20 + fee);
+    let lock = first.lock.unwrap();
+    eco.client.claim(B, &lock, &[5; 32]).await.unwrap();
+    assert_eq!(held(&eco.client, B), 20);
+
+    // The second activated once expired: the hub pays nothing, refunds,
+    // and claims nothing at A.
+    let second = record([6; 32]);
+    let height = eco.net.view(B).height();
+    eco.net.mine(B, second.expiry - height, None);
+    eco.net.mine(B, 1, Some([6; 32]));
+    assert!(provider.step().await.unwrap().is_empty());
+    assert_eq!(record([6; 32]).stage, Stage::Refunded);
+    assert_eq!(held(provider.wallet(), A), 20 + fee);
+    let late = eco.client.claim(B, &second.lock.unwrap(), &[6; 32]).await;
+    assert!(late.is_err(), "{late:?}");
+    assert_eq!(held(&eco.client, B), 20);
+}
+
+#[tokio::test]
+async fn a_hub_claims_the_lock_backing_its_own_until_the_hub_swapped_from_refuses() {
+    let eco = Eco::issuing(100, no_guard()).await;
+    let swap = eco
+        .client
+        .swap(PROVIDER, A, B, 20, SwapLimits::usual(20))
+        .await
+        .unwrap();
+    assert_eq!(swap.state, SwapState::Done);
+    let provider = eco.provider();
+    // Asleep until the client's lock is within 3 blocks of its expiry: the
+    // preimage out at B already, the provider claims it still.
+    let expiry = eco.expiry(A, swap.lock.as_ref().unwrap());
+    eco.mine(expiry - 2 - 3);
+    assert!(provider.step().await.unwrap().is_empty());
+    assert_eq!(provider.records(1).unwrap()[0].stage, Stage::Done);
+    assert_eq!(held(provider.wallet(), A), 20 + costs(20).0);
 }
