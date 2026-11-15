@@ -210,5 +210,9 @@ async fn a_provider_restarted_takes_its_swaps_on_and_unclaimed_locks_return() ->
     assert!(dashboard.card("Never claimed") >= Some(1.0));
     assert!(dashboard.card("Fees") > Some(0.0));
     assert!(dashboard.card("Notes held") > Some(0.0));
+    let events = dashboard.texts("Recent events");
+    for event in ["taken", "done", "refunded"] {
+        assert!(events.iter().any(|e| e[0] == event), "{event}: {events:?}");
+    }
     Ok(())
 }

@@ -747,6 +747,24 @@ impl Dashboard {
         cards.into_iter().find(|c| c["title"] == title)?["value"].as_f64()
     }
 
+    /// The text cells of each row of the list `title`, on any page.
+    pub fn texts(&self, title: &str) -> Vec<Vec<String>> {
+        let table = self
+            .panels()
+            .find(|p| p["type"] == "table" && p["title"] == title);
+        let rows = table
+            .and_then(|t| t["rows"].as_array())
+            .into_iter()
+            .flatten();
+        rows.map(|r| {
+            let cells = r["cells"].as_array().into_iter().flatten();
+            cells
+                .filter_map(|c| Some(c["text"].as_str()?.to_owned()))
+                .collect()
+        })
+        .collect()
+    }
+
     /// The tone and detail of the health check `name`.
     pub fn check(&self, name: &str) -> Option<(String, String)> {
         let checks = self

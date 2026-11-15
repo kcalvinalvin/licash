@@ -94,6 +94,10 @@ async fn wallets_pay_and_get_paid_over_lightning_across_hubs() -> anyhow::Result
     assert!(dashboard.card("Lightning out") >= Some(2.0));
     assert!(dashboard.card("Failed") >= Some(1.0));
     assert!(dashboard.card("Fees") > Some(0.0));
+    // Among its recent events, the newest payment out: the one refused.
+    let events = dashboard.texts("Recent events");
+    let out = events.iter().find(|e| e[0] == "lightning out");
+    assert_eq!(out.map(|e| &e[1]), Some(&"failed".to_owned()), "{events:?}");
     Ok(())
 }
 
