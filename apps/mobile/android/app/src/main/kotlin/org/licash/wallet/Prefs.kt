@@ -33,10 +33,17 @@ class Prefs(context: Context) {
         get() = prefs.getString("explorer", "default")!!
         set(url) = prefs.edit().putString("explorer", url.trim()).apply()
 
-    /** Hubs and relays reached through Tor. */
+    /**
+     * Hubs and relays reached through Tor: by default but on regtest, whose
+     * services are local. [network] is that of the wallet, chosen once.
+     */
     var tor: Boolean
-        get() = prefs.getBoolean("tor", false)
+        get() = prefs.getBoolean("tor", network != Network.REGTEST)
         set(on) = prefs.edit().putBoolean("tor", on).apply()
+
+    /** Whether [tor] was set rather than the default. */
+    val torChosen: Boolean
+        get() = prefs.contains("tor")
 
     /**
      * The most paid to renew notes a hub that restarted no longer unlinks,

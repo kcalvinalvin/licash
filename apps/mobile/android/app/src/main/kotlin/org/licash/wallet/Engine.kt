@@ -166,6 +166,10 @@ class Engine(context: Context) {
     private suspend fun load() {
         mutex.withLock {
             if (walletExists(walletDir)) {
+                AppLog.info(
+                    (if (prefs.tor) "through Tor" else "Tor off") +
+                        if (prefs.torChosen) ", as chosen" else ", by default",
+                )
                 runCatching { configured(Wallet.open(walletDir, prefs.tor)) }
                     .onSuccess { wallet = it }
                     .onFailure { e ->
@@ -396,7 +400,12 @@ class Engine(context: Context) {
         }.onFailure { AppLog.warn("reading the wallet", it) }.getOrNull()
         state.update {
             when {
-                wallet == null -> it.copy(wallet = false, network = prefs.network, developer = prefs.developer)
+                wallet == null -> it.copy(
+                    wallet = false,
+                    network = prefs.network,
+                    developer = prefs.developer,
+                    tor = prefs.tor,
+                )
                 shown == null -> it
                 else -> it.copy(
                     wallet = true,
@@ -665,7 +674,9 @@ class Engine(context: Context) {
     /** The network of the wallet to make, its light client started now. */
     suspend fun setNetwork(network: Network): Result<Unit> = io {
         mutex.withLock {
-            check(wallet == null) { "the wallet's network is chosen once" }
+            // A wallet there but failing to open keeps its network, and so
+            // the Tor default that follows it.
+            check(!walletExists(walletDir)) { "the wallet's network is chosen once" }
             prefs.network = network
         }
         lightLock.withLock { startLight() }
