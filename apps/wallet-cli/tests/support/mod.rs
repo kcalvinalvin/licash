@@ -418,6 +418,7 @@ impl Server {
                             tweaks,
                             relays,
                             contracts: None,
+                            swaps: None,
                         },
                     ),
                 )

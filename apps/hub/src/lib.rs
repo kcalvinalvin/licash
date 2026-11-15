@@ -52,6 +52,8 @@ pub struct Services {
     pub relays: Vec<String>,
     /// The recovery contracts it opens, funded by its node's wallet.
     pub contracts: Option<Arc<licash_contracts::hub::Openings>>,
+    /// The API of the provider of the swaps into it, if it is one.
+    pub swaps: Option<Router>,
 }
 
 /// The API of `hub`, with the paths of its `services`.
@@ -61,6 +63,7 @@ pub fn router(hub: Arc<Hub>, services: Services) -> Router {
         deposits,
         tweaks,
         contracts,
+        swaps,
         ..
     } = services.clone();
     let info_of = Router::new()
@@ -105,6 +108,10 @@ pub fn router(hub: Arc<Hub>, services: Services) -> Router {
     if let Some(openings) = contracts {
         // Its own body limit: an opening's messages are large.
         api = api.merge(licash_contracts::hub::router(openings));
+    }
+    if let Some(swaps) = swaps {
+        // Its own body limit too, of a provider's requests.
+        api = api.merge(swaps);
     }
     api.layer(DefaultBodyLimit::max(BODY_LIMIT))
         .layer(TraceLayer::new_for_http())

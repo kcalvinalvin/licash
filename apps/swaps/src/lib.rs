@@ -75,6 +75,12 @@ pub fn router<T: Transport + 'static>(provider: Arc<Provider<T>>, nostr: Option<
     routes::<T, ChainView>(provider, nostr, None)
 }
 
+/// [`router`] without [`HEALTH`] and traces: for a hub serving the swaps
+/// into it beside its own API, which has both.
+pub fn api<T: Transport + 'static>(provider: Arc<Provider<T>>, nostr: Option<String>) -> Router {
+    paths::<T, ChainView>(provider, nostr, None)
+}
+
 /// [`router`], for a provider paying out on Bitcoin
 /// ([`Provider::pay_out`]) on `chain`.
 pub fn router_paying_out<T: Transport + 'static, C: Chain + Send + 'static>(
@@ -90,6 +96,16 @@ fn routes<T: Transport + 'static, C: Chain + Send + 'static>(
     nostr: Option<String>,
     chain: Option<Arc<C>>,
 ) -> Router {
+    paths(provider, nostr, chain)
+        .route(HEALTH, get(|| async { "ok" }))
+        .layer(TraceLayer::new_for_http())
+}
+
+fn paths<T: Transport + 'static, C: Chain + Send + 'static>(
+    provider: Arc<Provider<T>>,
+    nostr: Option<String>,
+    chain: Option<Arc<C>>,
+) -> Router {
     let served = Served {
         provider,
         nostr,
@@ -101,10 +117,8 @@ fn routes<T: Transport + 'static, C: Chain + Send + 'static>(
         .route(swaps::SWAP_STATE, get(state::<T, C>))
         .route(swaps::CHAIN_SWAPS, post(take_payout::<T, C>))
         .route(swaps::CHAIN_SWAP_STATE, get(payout_state::<T, C>))
-        .route(HEALTH, get(|| async { "ok" }))
         .with_state(Arc::new(served))
         .layer(DefaultBodyLimit::max(BODY_LIMIT))
-        .layer(TraceLayer::new_for_http())
 }
 
 /// A [`Problem`] answered with its status.

@@ -26,7 +26,12 @@ use licash_hub_service::{
 };
 use licash_nostr::{Announcement, Route};
 use licash_notify::{Message, Priority, Target};
+use licash_swaps::{Config as SwapsConfig, Issuer, Provider};
+use licash_swaps_service::notify::Notifier as SwapsNotifier;
 use licash_tor::{Onion, Tor};
+use licash_transport::Http;
+use licash_wallet::Wallet;
+use rand_core::{OsRng, RngCore};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -260,6 +265,7 @@ fn announce_over(
 
 /// The hub's announcement: the relays, how it reaches them, and the URLs
 /// and name it announces.
+#[derive(Clone)]
 struct Announcing {
     relays: Vec<String>,
     route: Route,
@@ -502,6 +508,108 @@ fn ppm() -> clap::builder::RangedU64ValueParser<u64> {
     clap::value_parser!(u64).range(0..=1_000_000)
 }
 
+/// The swaps into the hub, which it provides, locking notes it issues.
+#[derive(Args)]
+struct SwapsArgs {
+    /// Provide the swaps into the hub from the hubs of `--swaps-from`: the
+    /// hub locks notes it issues to the client, against the client's lock
+    /// there. The provider's wallet, which claims those locks, and its
+    /// swaps are kept in `<data>/swaps`, made on the first start. Needs
+    /// `--chain`.
+    #[arg(long, env = "LICASH_HUB_SWAPS",
+          value_parser = clap::builder::BoolishValueParser::new())]
+    swaps: bool,
+    /// Take swaps from the hub at URL while the provider holds, or is owed
+    /// by the swaps under way, at most CAP of its notes: `URL=CAP`. Repeat
+    /// it, or separate them with commas, for more hubs.
+    #[arg(
+        long = "swaps-from",
+        value_name = "URL=CAP",
+        env = "LICASH_HUB_SWAPS_FROM",
+        value_delimiter = ','
+    )]
+    swaps_from: Vec<String>,
+    /// The fee on each swap, in the smallest unit.
+    #[arg(long, env = "LICASH_HUB_SWAPS_FEE_BASE",
+          default_value_t = SwapsConfig::default().fee.base)]
+    swaps_fee_base: u64,
+    /// The fee on each swap, in parts per million of its amount.
+    #[arg(long, env = "LICASH_HUB_SWAPS_FEE_PPM",
+          default_value_t = SwapsConfig::default().fee.ppm, value_parser = ppm())]
+    swaps_fee_ppm: u64,
+    /// The least swapped at once.
+    #[arg(long, env = "LICASH_HUB_SWAPS_MIN", default_value_t = SwapsConfig::default().min)]
+    swaps_min: u64,
+    /// The most swapped at once.
+    #[arg(long, env = "LICASH_HUB_SWAPS_MAX", default_value_t = SwapsConfig::default().max)]
+    swaps_max: u64,
+    /// Blocks the provider needs to claim the client's lock once it holds
+    /// the preimage.
+    #[arg(long, env = "LICASH_HUB_SWAPS_MARGIN",
+          default_value_t = SwapsConfig::default().margin)]
+    swaps_margin: u32,
+    /// Blocks within which a client's activation of the hub's lock on
+    /// Bitcoin confirms: the hub's lock expires that, the margin and two
+    /// blocks before the client's.
+    #[arg(long, env = "LICASH_HUB_SWAPS_CONFIRM",
+          default_value_t = SwapsConfig::default().confirm,
+          value_parser = clap::value_parser!(u32).range(1..))]
+    swaps_confirm: u32,
+}
+
+impl SwapsArgs {
+    /// The provider's terms, and the hubs it takes swaps from with their
+    /// caps, if the hub provides swaps.
+    fn terms(&self) -> anyhow::Result<Option<(SwapsConfig, Vec<Capped>)>> {
+        let from: Vec<Capped> = self
+            .swaps_from
+            .iter()
+            .filter(|f| !f.trim().is_empty())
+            .map(|f| capped(f).with_context(|| format!("--swaps-from {f}")))
+            .collect::<anyhow::Result<_>>()?;
+        if !self.swaps {
+            anyhow::ensure!(from.is_empty(), "--swaps-from needs --swaps");
+            return Ok(None);
+        }
+        anyhow::ensure!(
+            self.swaps_min <= self.swaps_max,
+            "--swaps-min must not exceed --swaps-max"
+        );
+        anyhow::ensure!(
+            self.swaps_margin > licash_wallet::CLAIM_MARGIN + 2,
+            "--swaps-margin must exceed {}",
+            licash_wallet::CLAIM_MARGIN + 2
+        );
+        let config = SwapsConfig {
+            fee: Fee {
+                base: self.swaps_fee_base,
+                ppm: self.swaps_fee_ppm,
+            },
+            min: self.swaps_min,
+            max: self.swaps_max,
+            margin: self.swaps_margin,
+            confirm: self.swaps_confirm,
+        };
+        Ok(Some((config, from)))
+    }
+}
+
+/// A hub swapped from, by URL, and the most of its notes the provider
+/// holds.
+type Capped = (String, u64);
+
+/// A hub's URL and the cap on its notes, of `URL=CAP`.
+fn capped(arg: &str) -> anyhow::Result<Capped> {
+    let (url, cap) = arg.rsplit_once('=').context("not URL=CAP")?;
+    let url = url.trim().trim_end_matches('/');
+    anyhow::ensure!(
+        url.starts_with("http://") || url.starts_with("https://"),
+        "not a hub URL: {url}"
+    );
+    let cap = cap.trim().parse().with_context(|| format!("cap {cap}"))?;
+    Ok((url.to_owned(), cap))
+}
+
 impl PolicyArgs {
     fn policy(&self) -> Policy {
         let fee = |base, ppm| Fee { base, ppm };
@@ -552,6 +660,8 @@ enum Command {
         deposits: Box<DepositArgs>,
         #[command(flatten)]
         announce: Box<AnnounceArgs>,
+        #[command(flatten)]
+        swaps: Box<SwapsArgs>,
         /// Also serve the API as an onion service of a Tor client of the
         /// hub's own, at the same address on every start (its key in
         /// `<data>/tor`), and announce it, reaching relays through Tor too.
@@ -636,6 +746,7 @@ fn command(cli: Cli) -> anyhow::Result<()> {
             lightning,
             deposits,
             announce,
+            swaps,
             onion,
             notify_kinds,
         } => {
@@ -679,7 +790,17 @@ fn command(cli: Cli) -> anyhow::Result<()> {
                 announcing.is_none() || chain.is_some(),
                 "announcing on Nostr (--nostr-relay) needs --chain"
             );
+            let swapping = swaps.terms()?;
+            anyhow::ensure!(
+                swapping.is_none() || chain.is_some(),
+                "providing swaps (--swaps) needs --chain"
+            );
+            let swaps_dir = cli.data.join("swaps");
+            if swapping.is_none() {
+                check_idle(&swaps_dir)?;
+            }
             let targets = notify.targets()?;
+            let swaps_targets = targets.clone();
             // Before the hub opens, so that new targets hear of its start.
             let notifier = if targets.is_empty() {
                 None
@@ -742,12 +863,59 @@ fn command(cli: Cli) -> anyhow::Result<()> {
                     None
                 }
             };
+            let swapping = match (swapping, &chain) {
+                (Some((config, from)), Some((_, profile, every))) => {
+                    if from.is_empty() {
+                        tracing::warn!("providing swaps from no hub (--swaps-from)");
+                    }
+                    // As clients reach the hub, or at least as it listens.
+                    let url = announcing.as_ref().and_then(|a| a.urls.first().cloned());
+                    let url = url.unwrap_or_else(|| format!("http://{listen}"));
+                    let (receipts, deposits) = (gateway.clone(), deposits.clone());
+                    let issuer = issuer(&hub, url, &from, receipts, deposits);
+                    let provider = swap_provider(&swaps_dir, *profile, config, issuer)?;
+                    let provider = Arc::new(provider);
+                    let notifier = match swaps_targets.is_empty() {
+                        true => None,
+                        false => {
+                            let cursors = swaps_dir.join("notify.json");
+                            let name = format!("{} swaps", notify.name);
+                            let notifier = SwapsNotifier::new(
+                                provider.clone(),
+                                &name,
+                                swaps_targets,
+                                &cursors,
+                                Vec::new(),
+                            )
+                            .context("set up the swaps' notifications")?;
+                            Some(notifier)
+                        }
+                    };
+                    Some(Swapping {
+                        provider,
+                        every: *every,
+                        notifier,
+                    })
+                }
+                _ => None,
+            };
+            let swaps = match &swapping {
+                Some(Swapping { provider, .. }) => {
+                    let nostr = match &announcing {
+                        Some(_) => Some(licash_nostr::public_key(&provider.nostr_secret()?)?),
+                        None => None,
+                    };
+                    Some(licash_swaps_service::api(provider.clone(), nostr))
+                }
+                None => None,
+            };
             let services = Services {
                 gateway: gateway.clone(),
                 deposits: deposits.clone(),
                 tweaks: tweaks.clone(),
                 relays,
                 contracts,
+                swaps,
             };
             let router = licash_hub_service::router(hub.clone(), services);
             // Served until the hub stops.
@@ -768,6 +936,7 @@ fn command(cli: Cli) -> anyhow::Result<()> {
                 deposits,
                 announcing,
                 tweaks: tweaks.map(|index| (index, tweaks_from)),
+                swapping,
             };
             let serving = serve(hub, router, listen, policy, tasks);
             runtime.block_on(serving)
@@ -795,6 +964,95 @@ fn init(data: &Path, seed: &Path, db: &Path, max_pow: u32) -> anyhow::Result<()>
     Ok(())
 }
 
+/// `hub`, reached at `url`, issuing the locks of the swaps into it from
+/// the hubs of `from` under their caps: under no hash its Lightning
+/// receipts or its deposits hold.
+fn issuer(
+    hub: &Arc<Hub>,
+    url: String,
+    from: &[Capped],
+    receipts: Option<Arc<Gateway>>,
+    deposits: Option<Arc<deposit::Gateway>>,
+) -> Issuer {
+    let issuer = from
+        .iter()
+        .fold(Issuer::new(hub.clone(), url), |issuer, (from, cap)| {
+            issuer.cap(from, *cap)
+        });
+    issuer.guard(move |hash| {
+        if let Some(gateway) = &receipts {
+            if gateway.holds(hash)? {
+                return Ok(true);
+            }
+        }
+        match &deposits {
+            Some(deposits) => deposits.holds(hash),
+            None => Ok(false),
+        }
+    })
+}
+
+/// Refuse to run without `--swaps` while the provider in `dir`, if any,
+/// has swaps into the hub under way: the notes the hub locked for them
+/// are backed once the provider claims the clients' locks, which it then
+/// would not.
+fn check_idle(dir: &Path) -> anyhow::Result<()> {
+    let (wallet, swaps) = (dir.join("wallet.sqlite"), dir.join("swaps.sqlite"));
+    if !swaps.exists() {
+        return Ok(());
+    }
+    let off = "--swaps is off";
+    let wallet = Wallet::open(&wallet, Http::new(None)?).context(off)?;
+    Provider::open(&swaps, wallet, SwapsConfig::default()).context(off)?;
+    tracing::warn!(dir = %dir.display(), "{off}: the swap provider takes no swaps");
+    Ok(())
+}
+
+/// The provider of the swaps into the hub, on its files in `dir`: made on
+/// the first start, its wallet's on `network`, and never replaced.
+fn swap_provider(
+    dir: &Path,
+    network: ChainProfile,
+    config: SwapsConfig,
+    issuer: Issuer,
+) -> anyhow::Result<Provider<Http>> {
+    let (wallet, swaps) = (dir.join("wallet.sqlite"), dir.join("swaps.sqlite"));
+    match (wallet.exists(), swaps.exists()) {
+        (true, true) => {
+            let wallet =
+                Wallet::open(&wallet, Http::new(None)?).context("open the swaps' wallet")?;
+            anyhow::ensure!(
+                wallet.network() == network,
+                "the swaps' wallet is of {}, the hub of {network}",
+                wallet.network()
+            );
+            Provider::open_issuing(&swaps, wallet, config, issuer).context("open the swaps file")
+        }
+        (false, false) => {
+            let mut builder = std::fs::DirBuilder::new();
+            builder.recursive(true);
+            #[cfg(unix)]
+            std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+            builder
+                .create(dir)
+                .with_context(|| format!("create {}", dir.display()))?;
+            let mut seed = [0; 32];
+            OsRng.fill_bytes(&mut seed);
+            let wallet = Wallet::create(&wallet, &seed, network, Http::new(None)?)
+                .context("create the swaps' wallet")?;
+            let address = hex::encode(wallet.address().to_bytes());
+            let provider = Provider::create_issuing(&swaps, wallet, config, issuer)
+                .context("create the swaps file")?;
+            tracing::info!(dir = %dir.display(), %address, "swap provider created: back up its wallet file");
+            Ok(provider)
+        }
+        _ => anyhow::bail!(
+            "{}: wallet.sqlite and swaps.sqlite go together, and one is missing: restore it",
+            dir.display()
+        ),
+    }
+}
+
 /// What runs beside the API, if configured.
 struct Tasks {
     chain: Option<(Source, ChainProfile, Duration)>,
@@ -804,6 +1062,15 @@ struct Tasks {
     announcing: Option<Announcing>,
     /// With the first block to index if the index is new.
     tweaks: Option<(Arc<Tweaks>, Option<u32>)>,
+    swapping: Option<Swapping>,
+}
+
+/// The provider of the swaps into the hub, which takes them on every
+/// `every`, and tells the operator of them through `notifier`.
+struct Swapping {
+    provider: Arc<Provider<Http>>,
+    every: Duration,
+    notifier: Option<SwapsNotifier>,
 }
 
 async fn serve(
@@ -820,6 +1087,7 @@ async fn serve(
         deposits,
         announcing,
         tweaks,
+        swapping,
     } = tasks;
     let listener = tokio::net::TcpListener::bind(listen)
         .await
@@ -854,6 +1122,28 @@ async fn serve(
         tracing::info!("taking deposits on Bitcoin");
         tokio::spawn(deposits.run())
     });
+    let mut swaps = Vec::new();
+    if let Some(Swapping {
+        provider,
+        every,
+        notifier,
+    }) = swapping
+    {
+        let address = hex::encode(provider.wallet().address().to_bytes());
+        tracing::info!(%address, config = %serde_json::to_string(provider.config())?, "providing swaps");
+        swaps.push(tokio::spawn(licash_swaps_service::step(
+            provider.clone(),
+            every,
+        )));
+        // Its events not yet sent go out after the next start.
+        swaps.extend(notifier.map(|notifier| tokio::spawn(notifier.run())));
+        if let Some(a) = &announcing {
+            let (relays, route) = (a.relays.clone(), a.route.clone());
+            let (urls, name) = (a.urls.clone(), a.name.clone());
+            let announcing = licash_swaps_service::announce(provider, relays, route, urls, name);
+            swaps.push(tokio::spawn(announcing));
+        }
+    }
     let announcing = announcing.map(|a| {
         let (relays, urls) = (a.relays.join(", "), a.urls.join(", "));
         tracing::info!(%relays, %urls, "announcing on Nostr");
@@ -865,6 +1155,7 @@ async fn serve(
     for task in [watching, indexing, paying, depositing, announcing]
         .into_iter()
         .flatten()
+        .chain(swaps)
     {
         task.abort();
     }

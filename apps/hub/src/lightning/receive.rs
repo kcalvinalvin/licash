@@ -176,6 +176,15 @@ fn store_down(e: rusqlite::Error) -> Failure {
 }
 
 impl Gateway {
+    /// Whether a receipt is under `hash`, which no other lock of the hub's
+    /// own notes may take.
+    pub fn holds(&self, hash: &[u8; 32]) -> Result<bool, String> {
+        match self.receipts.get(hash) {
+            Ok(receipt) => Ok(receipt.is_some()),
+            Err(Failure(problem)) => Err(problem.message),
+        }
+    }
+
     /// The invoice whose payment locks the hub's notes to the outputs of
     /// `body`: the same again for the same receipt.
     pub async fn receive(&self, body: &Receive) -> Result<Receiving, Failure> {

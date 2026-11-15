@@ -162,6 +162,7 @@ impl Net {
             tweaks: serves_tweaks.then(|| net.tweaks.clone()),
             relays,
             contracts: None,
+            swaps: None,
         };
         let down = net.down.clone();
         let app = licash_hub_service::router(net.hub.clone(), services).layer(

@@ -688,6 +688,13 @@ impl Gateway {
 }
 
 impl Gateway {
+    /// Whether a deposit is under `hash`, which no other lock of the hub's
+    /// own notes may take.
+    pub fn holds(&self, hash: &[u8; 32]) -> Result<bool, String> {
+        let record = self.store.get(hash).map_err(|e| e.to_string())?;
+        Ok(record.is_some())
+    }
+
     /// Follow the chain and the deposits until the task is dropped, once
     /// the chain is of the hub's network.
     pub async fn run(self: Arc<Self>) {

@@ -23,6 +23,8 @@ fn hub(data: &Path, args: &[&str]) -> Command {
         .env_remove("LICASH_HUB_NOSTR_RELAYS")
         .env_remove("LICASH_HUB_ANNOUNCE_URLS")
         .env_remove("LICASH_HUB_ONION")
+        .env_remove("LICASH_HUB_SWAPS")
+        .env_remove("LICASH_HUB_SWAPS_FROM")
         .env("RUST_LOG", "info");
     command
 }
@@ -284,7 +286,152 @@ fn failures_exit_nonzero_and_log_as_asked() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(stderr.contains(says), "{args:?}: {stderr}");
     }
+    // Swaps into the hub are of the chain it follows, from hubs it caps.
+    let from = ["--swaps-from", "http://a.example=100"];
+    for (args, says) in [
+        (&from[..], "--swaps-from needs --swaps"),
+        (&["--swaps"][..], "--swaps) needs --chain"),
+        (
+            &["--swaps", "--swaps-from", "http://a.example"][..],
+            "URL=CAP",
+        ),
+        (
+            &["--swaps", "--swaps-from", "a.example=1"][..],
+            "not a hub URL",
+        ),
+        (
+            &["--swaps", "--swaps-from", "http://a.example=-1"][..],
+            "cap",
+        ),
+        (
+            &["--swaps", "--swaps-margin", "2"][..],
+            "--swaps-margin must exceed",
+        ),
+        (
+            &["--swaps", "--swaps-min", "2", "--swaps-max", "1"][..],
+            "--swaps-min must not exceed",
+        ),
+    ] {
+        let out = output(&missing, &[&["run"], args].concat());
+        assert!(!out.status.success());
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains(says), "{args:?}: {stderr}");
+    }
     assert!(!missing.exists());
+}
+
+#[test]
+fn a_hub_provides_the_swaps_into_it_from_a_wallet_of_its_own() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("hub");
+    stdout(&data, &["init", "--max-pow", "6"]);
+    let chain = ["--chain", "http://127.0.0.1:1", "--network", "regtest"];
+    let swaps = ["--swaps", "--swaps-from", "http://a.example/=500"];
+    let run = |port: u16, args: &[&str]| {
+        let listen = format!("127.0.0.1:{port}");
+        let args = [&["run", "--listen", &listen][..], &chain[..], args].concat();
+        hub(&data, &args)
+    };
+    let port = free_port();
+    let mut running = Running(
+        run(port, &[&swaps[..], &["--swaps-fee-base", "7"]].concat())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    until("health", || get(port, "/health"));
+    let body = |response: String| response.split("\r\n\r\n").nth(1).unwrap().to_owned();
+    let info: licash_api::swaps::Info =
+        serde_json::from_str(&body(get(port, licash_api::swaps::SWAPS_INFO).unwrap())).unwrap();
+    let hub_info: licash_api::Info =
+        serde_json::from_str(&body(get(port, licash_api::INFO).unwrap())).unwrap();
+    // A wallet of its own, beside the hub's notes.
+    assert_ne!(info.address, hub_info.address);
+    assert_eq!(info.fee.base, 7);
+    // Following no chain yet, the hub swaps nothing into itself.
+    let own = info.hub(&hub_info.address).unwrap();
+    assert_eq!(own.max, 0);
+    let swaps_dir = data.join("swaps");
+    for file in ["wallet.sqlite", "swaps.sqlite"] {
+        assert!(swaps_dir.join(file).exists(), "{file}");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&swaps_dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+    }
+    let pid = running.0.id().to_string();
+    let killed = Command::new("kill").args(["-TERM", &pid]).status();
+    assert!(killed.unwrap().success());
+    assert!(until("stop", || running.0.try_wait().unwrap()).success());
+    let mut logs = String::new();
+    let mut stderr = running.0.stderr.take().unwrap();
+    stderr.read_to_string(&mut logs).unwrap();
+    assert!(logs.contains("swap provider created"), "{logs}");
+
+    // Started again on the same wallet; without --swaps, no swaps served,
+    // the operator warned of them.
+    let port = free_port();
+    let again = Running(
+        run(port, &swaps)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    until("restart", || get(port, "/health"));
+    let response = get(port, licash_api::swaps::SWAPS_INFO).unwrap();
+    let same: licash_api::swaps::Info = serde_json::from_str(&body(response)).unwrap();
+    assert_eq!(same.address, info.address);
+    drop(again);
+    let port = free_port();
+    let mut off = Running(
+        run(port, &[])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    until("run without swaps", || get(port, "/health"));
+    let response = get(port, licash_api::swaps::SWAPS_INFO).unwrap();
+    assert!(response.starts_with("HTTP/1.1 404"), "{response}");
+    off.0.kill().unwrap();
+    let mut logs = String::new();
+    off.0
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut logs)
+        .unwrap();
+    assert!(logs.contains("--swaps is off"), "{logs}");
+    // Nor at all while a swap into it is under way: its notes are backed
+    // once the provider claims the client's lock.
+    let db = rusqlite::Connection::open(swaps_dir.join("swaps.sqlite")).unwrap();
+    db.execute(
+        "INSERT INTO swaps (id, hash, from_url, to_url, address, amount, fee, paid,
+            expiry_from, expiry, state, created_at, updated_at, kind)
+         VALUES (x'01', x'02', 'http://a.example', 'http://hub', x'03', 10, 1, 11,
+            50, 40, 'locked', 0, 0, 'own')",
+        [],
+    )
+    .unwrap();
+    drop(db);
+    let out = run(free_port(), &[]).output().unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--swaps is off") && stderr.contains("1 swaps"),
+        "{stderr}"
+    );
+
+    // Its wallet and its swaps go together.
+    std::fs::remove_file(swaps_dir.join("swaps.sqlite")).unwrap();
+    let out = run(free_port(), &swaps).output().unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("one is missing"), "{stderr}");
 }
 
 #[test]
