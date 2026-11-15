@@ -197,7 +197,8 @@ jobs:
           path: apps/target/e2e/
   regtest:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # Core's tests alone take about 45 minutes, one at a time, LND's after.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
         with:
