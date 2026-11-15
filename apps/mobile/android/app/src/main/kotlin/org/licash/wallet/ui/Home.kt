@@ -115,7 +115,8 @@ private fun Total(ui: Ui, open: () -> Unit) {
     }
     val notes = buildList {
         if (b.moving > 0uL) add("${sat(b.moving)} on its way from Bitcoin")
-        if (b.onchain > 0uL) add("${sat(b.onchain)} on Bitcoin, moved in once enough")
+        if (b.onchain > b.kept) add("${sat(b.onchain - b.kept)} on Bitcoin, moved in once enough")
+        if (b.kept > 0uL) add("${sat(b.kept)} cashed out, kept on Bitcoin")
         val coming = ui.incoming.sumOf { it.amount }
         if (coming > 0uL) add("${sat(coming)} coming on Bitcoin, waiting for a block")
         if (b.notesPending > 0uL) add("${sat(b.notesPending)} still settling")

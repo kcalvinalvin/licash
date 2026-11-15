@@ -82,6 +82,8 @@ fun Send(engine: Engine, ui: Ui, link: String?, cashOut: String? = null, back: (
     var step by remember { mutableStateOf<Step>(if (link == null) Step.Looking else Step.Busy) }
     var asking by remember { mutableStateOf(false) }
     var empty by remember { mutableStateOf(false) }
+    // This wallet's own address, once cashing out to it.
+    var own by remember { mutableStateOf<String?>(null) }
 
     suspend fun taking(payment: String, trust: Boolean): Step =
         engine.receive(payment, trust).fold(
@@ -209,7 +211,7 @@ fun Send(engine: Engine, ui: Ui, link: String?, cashOut: String? = null, back: (
                 Step.Looking -> {
                     if (cashOut != null) {
                         Text(
-                            "All you hold at ${host(cashOut)}, paid out on Bitcoin. Scan or paste the address to pay.",
+                            "All you hold at ${host(cashOut)}, paid out on Bitcoin: to this wallet, or to the address you scan or paste.",
                             style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
@@ -228,6 +230,20 @@ fun Send(engine: Engine, ui: Ui, link: String?, cashOut: String? = null, back: (
                         },
                         modifier = Modifier.fillMaxWidth().height(56.dp),
                     ) { Text("Paste") }
+                    if (cashOut != null) {
+                        Spacer(Modifier.height(8.dp))
+                        OutlinedButton(
+                            onClick = {
+                                scope.launch {
+                                    engine.bitcoinAddress().fold(
+                                        { own = it; quote(it, null) },
+                                        { step = Step.Failed(explain(it)) },
+                                    )
+                                }
+                            },
+                            modifier = Modifier.fillMaxWidth().height(56.dp),
+                        ) { Text("To this wallet") }
+                    }
                     if (empty) {
                         Spacer(Modifier.height(8.dp))
                         Text(
@@ -265,7 +281,7 @@ fun Send(engine: Engine, ui: Ui, link: String?, cashOut: String? = null, back: (
                 Step.Quoting -> Middle("Finding a provider to pay it on Bitcoin…")
                 is Step.Invoice -> Invoice(s.quote) { payInvoice(s.text, s.quote.hub) }
                 is Step.Address -> ToAddress(s.address, asking, { asking = it }) { amount -> quote(s.address, amount) }
-                is Step.Payout -> Payout(s.quote) { payOut(s.quote) }
+                is Step.Payout -> Payout(s.quote, s.quote.address == own) { payOut(s.quote) }
                 is Step.PayingOut -> Told(
                     "Sending ${sat(s.amount)} on Bitcoin. It reaches the address in about " +
                         "${(s.depth.toInt() + 1) * 10} minutes; your history shows how far it got.",
@@ -413,7 +429,7 @@ private fun ToAddress(address: String, asking: Boolean, ask: (Boolean) -> Unit, 
 
 /** A payout on Bitcoin to confirm: what the address gets, and all it costs on top. */
 @Composable
-private fun Payout(quote: PayoutQuote, pay: () -> Unit) {
+private fun Payout(quote: PayoutQuote, own: Boolean, pay: () -> Unit) {
     Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
         Spacer(Modifier.height(48.dp))
         Text(sat(quote.amount), style = Figures)
@@ -424,7 +440,7 @@ private fun Payout(quote: PayoutQuote, pay: () -> Unit) {
         )
         Spacer(Modifier.height(12.dp))
         Text(
-            "To ${shortAddress(quote.address)}, on Bitcoin",
+            if (own) "To this wallet, on Bitcoin" else "To ${shortAddress(quote.address)}, on Bitcoin",
             style = MaterialTheme.typography.bodyLarge,
             textAlign = TextAlign.Center,
         )

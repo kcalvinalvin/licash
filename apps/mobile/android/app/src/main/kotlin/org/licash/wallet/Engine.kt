@@ -51,7 +51,7 @@ data class Ui(
     val wallet: Boolean = false,
     val network: Network = Network.BITCOIN,
     val developer: Boolean = false,
-    val balance: Balance = Balance(0u, 0u, 0u, 0u),
+    val balance: Balance = Balance(0u, 0u, 0u, 0u, 0u),
     val history: List<Activity> = emptyList(),
     val hubs: List<Hub> = emptyList(),
     val tor: Boolean = false,
@@ -301,10 +301,13 @@ class Engine(context: Context) {
         hubsLearned = true
     }
 
-    /** Move what was paid on Bitcoin into Licash, all at once, once it is enough. */
+    /**
+     * Move what was paid on Bitcoin into Licash, all at once, once it is
+     * enough: but what was cashed out to this wallet, which stays.
+     */
     private suspend fun move(chain: GoChain) {
         val balance = local { it.balance() }
-        if (balance.onchain == 0uL || balance.moving > 0uL) return
+        if (balance.onchain <= balance.kept || balance.moving > 0uL) return
         try {
             val moving = locked { it.moveToLicash(chain) }
             AppLog.info("moving ${moving.amount} sat into Licash")
@@ -442,6 +445,18 @@ class Engine(context: Context) {
      */
     suspend fun payoutQuote(address: String, amount: ULong?, hub: String? = null): Result<PayoutQuote> =
         io { local { it.payoutQuote(address, amount, hub) } }
+
+    /** An address on Bitcoin of this wallet's, to cash out to. */
+    suspend fun bitcoinAddress(): Result<String> = io { local { it.bitcoinAddress() } }
+
+    /** Move all on Bitcoin into Licash now, what was cashed out here too. */
+    suspend fun moveAll(): Result<Activity> = io {
+        val light = light ?: throw LicashException.Unavailable("not connected to Bitcoin yet")
+        val moving = locked { it.moveAllToLicash(GoChain(light)) }
+        refresh()
+        poke()
+        moving
+    }
 
     /** Pay out as `quote` says: under way until its claim confirms. */
     suspend fun payOut(quote: PayoutQuote): Result<Activity> = io {
