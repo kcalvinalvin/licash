@@ -8,7 +8,7 @@ use licash::{
     spend::{ChainProfile, Output, Proposal, TimedLock, TimedTerms},
     unlink::{Nonce, Request, Session},
 };
-use licash_hub::{Error, Fee, Hub, Ledger, Notice, Policy, Refusal, Stats};
+use licash_hub::{Error, Fee, Hub, Ledger, Notes, Notice, Policy, Refusal, Stats, Unlinks};
 
 const MAX_POW: u32 = 6;
 
@@ -902,4 +902,81 @@ fn one_hub_runs_on_a_database_by_any_path() {
     let _hub = open(&files, Policy::default());
     let why = setup_error(Hub::open(&files.seed, &alias, Policy::default()));
     assert!(why.contains("another hub"), "{why}");
+}
+
+#[test]
+fn the_ledger_reads_back_the_notes_it_moved_and_the_unlinks_it_answered() {
+    let files = files();
+    let hub = open(&files, fee(1, 0));
+    let (_, keyset) = issuer(&files);
+    let (alice, bob) = (owner(1), owner(2));
+    let spend = Spend::new(
+        &keyset,
+        &[mint(&files, &alice, 8)],
+        &[
+            (bob.address(), 4),
+            (alice.address(), 2),
+            (hub.info().address, 1),
+            (alice.address(), 1),
+        ],
+    );
+    let notes = spend.complete(&hub, &keyset);
+    // Bob unlinks his 4 and spends it, paying the hub again.
+    let paid = spend.coin(&notes, 0, &bob);
+    let session = Session::start(&keyset, &paid.note, &paid.derivation).unwrap();
+    let answer = hub.unlink(session.request()).unwrap();
+    let unlinked = Coin {
+        note: session.finish(&keyset, &answer).unwrap(),
+        ..paid
+    };
+    let swap = Spend::new(
+        &keyset,
+        &[unlinked],
+        &[
+            (bob.address(), 2),
+            (bob.address(), 1),
+            (hub.info().address, 1),
+        ],
+    );
+    swap.complete(&hub, &keyset);
+
+    let ledger = Ledger::open(&files.db).unwrap();
+    assert!(ledger.created_at().unwrap() > 0);
+    assert_eq!(ledger.tip().unwrap(), None);
+    let Notes { movements, unlinks } = ledger.notes().unwrap();
+    assert!(movements.iter().all(|m| m.keyset == 0));
+    assert!(movements.windows(2).all(|w| w[0].at <= w[1].at));
+    let moved = |issued: bool| {
+        let mut moved: Vec<(u64, bool, bool)> = movements
+            .iter()
+            .filter(|m| m.issued == issued)
+            .map(|m| (m.denom, m.hub, m.unlinked))
+            .collect();
+        moved.sort();
+        moved
+    };
+    // Each spend's outputs, the hub's fee among them.
+    assert_eq!(
+        moved(true),
+        [
+            (1, false, false),
+            (1, false, false),
+            (1, true, false),
+            (1, true, false),
+            (2, false, false),
+            (2, false, false),
+            (4, false, false),
+        ]
+    );
+    // The note issued before the ledger began, and Bob's unlinked 4.
+    assert_eq!(moved(false), [(4, false, true), (8, false, false)]);
+    assert_eq!(
+        unlinks,
+        [Unlinks {
+            keyset: 0,
+            denom: 4,
+            answered: 1,
+            retired: 1
+        }]
+    );
 }

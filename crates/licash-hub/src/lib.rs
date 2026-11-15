@@ -24,6 +24,7 @@
 
 mod forwards;
 mod locks;
+mod records;
 mod store;
 
 use std::{
@@ -51,6 +52,7 @@ use store::{now, setup_io, Store};
 
 pub use forwards::{Forward, Forwarded};
 pub use locks::{Lock, Settled, Timing};
+pub use records::{ForwardRecord, LockRecord, Movement, Notes, Unlinks};
 
 /// The largest denomination exponent a hub issues: its ledger keeps
 /// denominations as SQLite integers.

@@ -1150,3 +1150,92 @@ fn a_hub_proves_its_identity_once_it_follows_a_chain() {
     let hub = Hub::open(&files.seed, &files.db, policy()).unwrap();
     assert_eq!(hub.advertise().unwrap().proved(regtest), Ok(true));
 }
+
+#[test]
+fn the_ledger_reads_back_locks_forwards_and_the_notes_they_moved() {
+    let (files, hub, chain) = setup(policy());
+    let (_, keyset) = issuer(&files);
+    let expiry = chain.height() + 5;
+    // Paid: Bob's 2 and 1 and the hub's 1.
+    let paid = standard(&files, &hub, terms(&hub, expiry, 1));
+    hub.lock(&paid.signed, &paid.notes).unwrap();
+    hub.settle(&paid.id(), &SECRET).unwrap();
+    // Forwarded, failed and so refunded: the payer's 4.
+    let failed = to_hub(&files, &hub, terms(&hub, expiry, 1));
+    hub.lock(&failed.signed, &failed.notes).unwrap();
+    hub.forward(&failed.id(), &lock_hash(&SECRET), "lnbcrt1", "node", 4)
+        .unwrap();
+    hub.forward_failed(&failed.id(), "no route").unwrap();
+    let open = standard(&files, &hub, terms(&hub, expiry, 1));
+    hub.lock(&open.signed, &open.notes).unwrap();
+    // The hub's own lock, paid: Alice's 2, of inputs that were never notes.
+    let e = Ephemeral::random();
+    let d = e.derive(&owner(3).address(), 2, Branch::Pay, 0).unwrap();
+    let own = hub
+        .lock_own(
+            keyset.id(),
+            e.public(),
+            vec![Output::from_derivation(&d).unwrap()],
+            terms(&hub, expiry, 1),
+        )
+        .unwrap()
+        .proposal
+        .id();
+    hub.settle(&own, &SECRET).unwrap();
+
+    let ledger = Ledger::open(&files.db).unwrap();
+    assert_eq!(ledger.tip().unwrap(), Some(chain.height()));
+    let locks: Vec<_> = ledger
+        .locks()
+        .unwrap()
+        .into_iter()
+        .map(|l| (l.id, l.amount, l.own, l.paid, l.settled_at.is_some()))
+        .collect();
+    assert_eq!(
+        locks,
+        [
+            (*paid.id().as_bytes(), 4, false, Some(true), true),
+            (*failed.id().as_bytes(), 4, false, Some(false), true),
+            (*open.id().as_bytes(), 4, false, None, false),
+            (*own.as_bytes(), 2, true, Some(true), true),
+        ]
+    );
+    let forwards = ledger.forwards().unwrap();
+    let [forward] = &forwards[..] else {
+        panic!("one forward, not {forwards:?}");
+    };
+    assert_eq!(
+        (
+            forward.lock,
+            forward.request.as_str(),
+            forward.amount,
+            forward.expiry,
+            forward.state.as_str(),
+            forward.reason.as_deref()
+        ),
+        (
+            *failed.id().as_bytes(),
+            "lnbcrt1",
+            4,
+            expiry,
+            "failed",
+            Some("no route")
+        )
+    );
+    assert!(forward.resolved_at >= Some(forward.created_at));
+
+    let notes = ledger.notes().unwrap();
+    let value = |issued: bool, hub: bool| -> u64 {
+        notes
+            .movements
+            .iter()
+            .filter(|m| m.issued == issued && (m.hub || !hub))
+            .map(|m| m.denom)
+            .sum()
+    };
+    // Bob's 3, the hub's 1, the refund of 4 and Alice's 2.
+    assert_eq!((value(true, false), value(true, true)), (10, 1));
+    // Each payer's 4, but none of the own lock's inputs.
+    assert_eq!((value(false, false), value(false, true)), (12, 0));
+    assert!(notes.unlinks.is_empty());
+}
