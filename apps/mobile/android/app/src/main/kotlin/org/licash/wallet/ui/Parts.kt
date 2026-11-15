@@ -305,9 +305,13 @@ fun Entry(
     }
 }
 
-/** A fact: its name, and what it is at the end. `tag` names the value, for the tests. */
+/**
+ * A fact: its name, and what it is at the end, then, quieter, its `share`
+ * of what it is on (a fee's `0.24%`). `tag` names the value, for the
+ * tests, and `tag-share` its share.
+ */
 @Composable
-fun Line(label: String, value: String, modifier: Modifier = Modifier, tag: String? = null) {
+fun Line(label: String, value: String, modifier: Modifier = Modifier, tag: String? = null, share: String? = null) {
     Row(modifier.fillMaxWidth().padding(vertical = 12.dp)) {
         Text(label, style = MaterialTheme.typography.bodyLarge)
         Spacer(Modifier.width(16.dp))
@@ -318,6 +322,14 @@ fun Line(label: String, value: String, modifier: Modifier = Modifier, tag: Strin
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             textAlign = TextAlign.End,
         )
+        if (share != null) {
+            Text(
+                " · $share",
+                modifier = if (tag != null) Modifier.testTag("$tag-share") else Modifier,
+                style = Amounts,
+                color = MaterialTheme.colorScheme.outline,
+            )
+        }
     }
 }
 

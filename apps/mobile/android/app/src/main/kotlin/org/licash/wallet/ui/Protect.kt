@@ -35,6 +35,7 @@ import org.licash.core.ContractState
 import org.licash.core.Recovery
 import org.licash.core.RecoveryStage
 import org.licash.wallet.sat
+import org.licash.wallet.share
 
 /**
  * A protection at a hub, in a row: how much it covers, how long it has
@@ -127,7 +128,7 @@ private fun Unfolded(c: Contract, cover: Cover, developer: Boolean, end: () -> U
     // Of what its hub holds, those ending first covering first.
     if (cover.on) Line("Covers now", sat(c.covers), tag = "covers")
     if (cover.ends != null) Line("Ends by itself in", cover.ends)
-    if (!cover.failed) Line("Cost", sat(c.price))
+    if (!cover.failed) Line("Cost", sat(c.price), share = share(c.price, c.cap))
     if (developer) {
         Line("Paid from", "A coin of ${sat(c.paidFrom)}")
         Line("Protects until", "block ${c.protectsUntil}")
@@ -204,7 +205,7 @@ internal fun ProtectSheet(q: ContractQuote, open: () -> Unit, cashOutFirst: () -
     Sheet("Protect at ${name(q.hub)}", dismiss) {
         Line("Covers up to", sat(q.cap), tag = "quote-cap")
         Line("For", span(q.protectsFor.toLong()), tag = "quote-for")
-        Line("Cost", sat(q.price), tag = "quote-price")
+        Line("Cost", sat(q.price), tag = "quote-price", share = share(q.price, q.cap))
         Line("Takes", "Up to an hour, $download")
         Worth(q.mock)
         Spacer(Modifier.height(8.dp))

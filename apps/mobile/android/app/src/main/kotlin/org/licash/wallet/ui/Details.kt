@@ -52,6 +52,7 @@ import org.licash.wallet.digits
 import org.licash.wallet.explain
 import org.licash.wallet.host
 import org.licash.wallet.sat
+import org.licash.wallet.share
 
 /** A line of the history on its own: what it cost and where it stands. */
 @Composable
@@ -357,19 +358,30 @@ private fun Summary(activity: Activity, details: Details?, tx: Onchain?, develop
         // What it cost on top, and what it came to: nothing of one that failed.
         val costs = @Composable {
             if (!failed) {
-                Line("Fee", if (activity.fee == 0uL) "None" else sat(activity.fee), tag = "fee")
+                Line(
+                    "Fee",
+                    if (activity.fee == 0uL) "None" else sat(activity.fee),
+                    tag = "fee",
+                    share = share(activity.fee, activity.amount),
+                )
                 if (activity.fee > 0uL) Line("Total", sat(activity.amount + activity.fee), tag = "total")
             }
         }
         when (details) {
             is Details.Moved -> {
-                Line("Hub fee", sat(activity.fee), tag = "fee-hub")
-                details.payment?.fee?.let { Line("Network fee", sat(it), tag = "fee-network") }
+                Line("Hub fee", sat(activity.fee), tag = "fee-hub", share = share(activity.fee, activity.amount))
+                details.payment?.fee?.let {
+                    Line("Network fee", sat(it), tag = "fee-network", share = share(it, activity.amount))
+                }
                 Line("At", name(details.hub))
             }
             is Details.Coin -> Line("From", if (details.change) "Your own change" else "Bitcoin")
             is Details.Lightning -> {
-                if (failed) Line("Refund fee", sat(activity.fee), tag = "fee") else costs()
+                if (failed) {
+                    Line("Refund fee", sat(activity.fee), tag = "fee", share = share(activity.fee, activity.amount))
+                } else {
+                    costs()
+                }
                 Line("From", name(details.hub))
             }
             is Details.Payout -> {
@@ -380,7 +392,7 @@ private fun Summary(activity: Activity, details: Details?, tx: Onchain?, develop
             }
             is Details.Invoice -> {
                 details.asks?.takeIf { it > activity.amount }?.let {
-                    Line("Payer's fee", sat(it - activity.amount), tag = "fee")
+                    Line("Payer's fee", sat(it - activity.amount), tag = "fee", share = share(it - activity.amount, activity.amount))
                 }
                 Line("At", name(details.hub))
             }

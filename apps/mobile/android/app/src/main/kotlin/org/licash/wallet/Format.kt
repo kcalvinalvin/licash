@@ -41,6 +41,27 @@ val Balance.creditPercent: Int
         }
     }
 
+/**
+ * What [fee] is of [of], to two significant digits: `0.24%`, `1.2%`, `5%`,
+ * `12%`, `<0.01%` below. Null for no fee, or a fee of nothing.
+ */
+fun share(fee: ULong, of: ULong): String? {
+    if (fee == 0uL || of == 0uL) return null
+    val at = { scale: Long -> Math.round(fee.toDouble() * scale / of.toDouble()) }
+    val hundredths = at(10_000)
+    if (hundredths == 0L) return "<0.01%"
+    if (hundredths < 100) return String.format(Locale.US, "0.%02d%%", hundredths)
+    val tenths = at(1_000)
+    return when {
+        tenths < 100 && tenths % 10 != 0L -> "${tenths / 10}.${tenths % 10}%"
+        tenths < 100 -> "${tenths / 10}%"
+        else -> "${digits(at(100).toULong())}%"
+    }
+}
+
+/** A fee and what it is of [of]: `12 sat · 0.24%`. */
+fun feeOf(fee: ULong, of: ULong): String = sat(fee) + (share(fee, of)?.let { " · $it" } ?: "")
+
 /** `ppm` millionths as a percentage: `0.5%`. */
 fun percent(ppm: ULong): String =
     java.text.DecimalFormat("0.####", java.text.DecimalFormatSymbols(Locale.US))

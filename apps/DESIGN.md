@@ -70,6 +70,9 @@ type in `ui/Theme.kt`. Use them; do not restyle a screen on its own.
   opens), `Line` for a fact, `Toggle` for on or off. A glyph on a tile
   only on a list's first page (Settings), and then on every row of it.
   A row that destroys is red text, no glyph.
+- **Fees** are a `Line` with `share = share(fee, of)` (`Format.kt`), the
+  share quieter after the amount, its own `tag-share`; in a sentence or
+  an offer, `feeOf(fee, of)` (`12 sat · 0.24%`).
 - **Group** cards of 20 dp corners; a title only when the page's title
   does not say it already.
 - **Buttons.** `BigButton`: one primary (green), a quiet one in the same

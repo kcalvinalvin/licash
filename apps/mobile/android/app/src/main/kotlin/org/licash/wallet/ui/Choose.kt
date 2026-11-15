@@ -32,6 +32,7 @@ import org.licash.core.contractMaxCap
 import org.licash.core.contractPrice
 import org.licash.wallet.Chosen
 import org.licash.wallet.sat
+import org.licash.wallet.share
 import kotlin.math.exp
 import kotlin.math.floor
 import kotlin.math.ln
@@ -85,7 +86,7 @@ internal fun ChooseSheet(
                 modifier = Modifier.testTag("contract-blocks"),
             )
         }
-        Line("Cost", sat(price), tag = "quote-price")
+        Line("Cost", sat(price), tag = "quote-price", share = share(price, capped))
         if (coins.size > 1) {
             Text("Paid from", modifier = Modifier.padding(top = 12.dp), style = MaterialTheme.typography.bodyLarge)
             Row(Modifier.horizontalScroll(rememberScrollState())) {

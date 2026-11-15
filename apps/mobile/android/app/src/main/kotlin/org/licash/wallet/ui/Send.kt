@@ -53,8 +53,10 @@ import org.licash.core.State
 import org.licash.wallet.Engine
 import org.licash.wallet.Ui
 import org.licash.wallet.explain
+import org.licash.wallet.feeOf
 import org.licash.wallet.host
 import org.licash.wallet.sat
+import org.licash.wallet.share
 
 private sealed interface Step {
     data object Looking : Step
@@ -290,7 +292,7 @@ fun Send(
                                     val name = o.providerName ?: host(provider)
                                     Offer(
                                         name,
-                                        "Fees ${sat(o.quote.fee)}" + if (o.known) ", used before" else "",
+                                        "Fees ${feeOf(o.quote.fee, o.quote.amount)}" + if (o.known) ", used before" else "",
                                         provider == current,
                                     ) {
                                         step = Step.Planning
@@ -338,7 +340,7 @@ fun Send(
                                 offers.map { o ->
                                     Offer(
                                         o.providerName ?: host(o.provider),
-                                        "Fees ${sat(o.fee)}, pays ${sat(o.amount)}",
+                                        "Fees ${feeOf(o.fee, o.amount)}, pays ${sat(o.amount)}",
                                         o.provider == s.quote.provider,
                                     ) { step = Step.Payout(o, s.asked) }
                                 }
@@ -347,7 +349,7 @@ fun Send(
                     }
                 }
                 is Step.PayingOut -> Told("Sending ${sat(s.amount)}", "Arrives in ${arrives(s.depth)}", back)
-                is Step.Paid -> Done("Paid ${sat(s.amount)}", back, if (s.fee > 0uL) "Fee ${sat(s.fee)}" else null)
+                is Step.Paid -> Done("Paid ${sat(s.amount)}", back, if (s.fee > 0uL) "Fee ${feeOf(s.fee, s.amount)}" else null)
                 is Step.Sent -> Sent(s, back)
                 // Not to pay again: it finishes by itself.
                 Step.Later -> Told("Under way", "It finishes by itself", back)
@@ -365,12 +367,12 @@ fun Send(
     }
 }
 
-/** One fact of a payment to confirm: `tag` names its value, for the tests. */
-private class Fact(val label: String, val value: String, val tag: String)
+/** One fact of a payment to confirm: `tag` names its value, for the tests; a fee's `share` of the amount. */
+private class Fact(val label: String, val value: String, val tag: String, val share: String? = null)
 
 /** What a payment costs and when it arrives, to confirm it by: with what it comes to, if it costs. */
 private fun costs(amount: ULong, fee: ULong, arrives: String): List<Fact> = listOfNotNull(
-    Fact("Fee", if (fee == 0uL) "None" else sat(fee), "fee"),
+    Fact("Fee", if (fee == 0uL) "None" else sat(fee), "fee", share(fee, amount)),
     if (fee > 0uL) Fact("Total", sat(amount + fee), "total") else null,
     Fact("Arrives", arrives, "arrives"),
 )
@@ -408,7 +410,7 @@ private fun Facts(facts: List<Fact>) {
     Group("") {
         facts.forEachIndexed { i, fact ->
             if (i > 0) Divider()
-            Line(fact.label, fact.value, tag = fact.tag)
+            Line(fact.label, fact.value, tag = fact.tag, share = fact.share)
         }
     }
 }
@@ -434,7 +436,12 @@ private fun Paying(ui: Ui, s: Step.Paying, pay: (ULong?) -> Unit) {
         if (!s.visit) {
             Facts(
                 listOf(
-                    Fact("Fee", fee?.let { if (it == 0uL) "None" else "Up to ${sat(it)}" } ?: "", "fee"),
+                    Fact(
+                        "Fee",
+                        fee?.let { if (it == 0uL) "None" else "Up to ${sat(it)}" } ?: "",
+                        "fee",
+                        fee?.let { f -> amount?.let { share(f, it.toULong()) } },
+                    ),
                     Fact("Arrives", "Instantly", "arrives"),
                 ),
             )

@@ -32,6 +32,7 @@ import org.licash.core.Holding
 import org.licash.core.MoveQuote
 import org.licash.wallet.Engine
 import org.licash.wallet.explain
+import org.licash.wallet.feeOf
 import org.licash.wallet.host
 import org.licash.wallet.sat
 
@@ -80,7 +81,7 @@ fun MoveSheet(engine: Engine, from: Holding, hubs: List<Holding>, moved: () -> U
                     Choice(
                         chosen == i,
                         "${sat(o.amount)} arrive",
-                        "Fee ${sat(o.fee)}",
+                        "Fee ${feeOf(o.fee, o.amount)}",
                         "Through ${o.providerName ?: host(o.provider)}",
                     ) { chosen = i }
                 }

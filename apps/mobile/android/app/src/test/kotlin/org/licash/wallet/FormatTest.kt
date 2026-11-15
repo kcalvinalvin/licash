@@ -15,6 +15,22 @@ class FormatTest {
     }
 
     @Test
+    fun a_fee_says_what_it_is_of_the_amount() {
+        assertEquals(null, share(0uL, 100uL))
+        assertEquals(null, share(5uL, 0uL))
+        assertEquals("<0.01%", share(1uL, 1_000_000uL))
+        assertEquals("0.24%", share(24uL, 10_000uL))
+        assertEquals("1%", share(1uL, 100uL))
+        assertEquals("1.2%", share(12uL, 1_000uL))
+        assertEquals("5%", share(1uL, 20uL))
+        assertEquals("10%", share(999uL, 10_000uL))
+        assertEquals("13%", share(1uL, 8uL))
+        assertEquals("3,000%", share(30uL, 1uL))
+        assertEquals("12 sat · 0.24%", feeOf(12uL, 5_000uL))
+        assertEquals("0 sat", feeOf(0uL, 5_000uL))
+    }
+
+    @Test
     fun no_provider_is_said_without_naming_providers() {
         assertEquals(
             "No one can send 20,000 sat on Bitcoin right now. Try less, or later.",
