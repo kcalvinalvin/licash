@@ -2,6 +2,7 @@ package org.licash.wallet.ui
 
 import android.content.Context
 import android.text.format.Formatter
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -19,9 +20,14 @@ import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
+import androidx.compose.material.icons.filled.Build
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
+import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.Phone
+import androidx.compose.material.icons.filled.Place
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.FilledTonalButton
@@ -37,6 +43,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.text.style.TextOverflow
@@ -59,75 +66,123 @@ import org.licash.wallet.Engine
 import org.licash.wallet.Storage
 import org.licash.wallet.Ui
 import org.licash.wallet.explain
+import org.licash.wallet.host
 import org.licash.wallet.exportLogs
 import org.licash.wallet.sat
 import org.licash.wallet.storage
 
+/** A page of Settings, of one kind of thing. */
+private enum class Page(val title: String) {
+    Hubs("Hubs"),
+    Bitcoin("Bitcoin"),
+    Privacy("Privacy"),
+    Storage("Storage"),
+    Advanced("Advanced"),
+}
+
+/**
+ * Settings: a short list of what there is to see and change, each kind on
+ * a page of its own.
+ */
 @Composable
 fun Settings(engine: Engine, ui: Ui, balance: () -> Unit, back: () -> Unit) {
-    val scope = rememberCoroutineScope()
-    val context = LocalContext.current
-    var error by remember { mutableStateOf<String?>(null) }
-    var exporting by remember { mutableStateOf<String?>(null) }
+    var page by rememberSaveable { mutableStateOf<Page?>(null) }
+    BackHandler(enabled = page != null) { page = null }
     Column(
         Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 20.dp),
     ) {
-        TopBar("Settings", back)
-        Group("Hubs") {
-            ui.hubs.forEachIndexed { i, hub ->
-                if (i > 0) Divider()
-                HubRow(hub)
+        when (val p = page) {
+            null -> {
+                TopBar("Settings", back)
+                Overview(engine, ui) { page = it }
             }
-            if (ui.hubs.isNotEmpty()) Divider()
-            AddHub(engine)
-        }
-        Group("Privacy") {
-            Toggle("Reach hubs through Tor", "Slower, and hides where you are from hubs.", ui.tor) { on ->
-                scope.launch { engine.setTor(on).onFailure { error = explain(it) } }
-            }
-            error?.let { Note(it, error = true) }
-        }
-        Group("Bitcoin") {
-            Status(ui)
-        }
-        Group("Storage") {
-            StorageUsed(ui.developer)
-        }
-        Group("Support") {
-            Action("Export logs", "Share what the app did, to report a problem.", Icons.Filled.Share) {
-                exporting = null
-                runCatching { context.startActivity(exportLogs(context, ui)) }
-                    .onFailure {
-                        AppLog.warn("exporting the logs", it)
-                        exporting = "Could not export the logs: ${it.message ?: it.javaClass.simpleName}"
+            else -> {
+                TopBar(p.title) { page = null }
+                when (p) {
+                    Page.Hubs -> {
+                        Group("Hubs you use") {
+                            ui.hubs.forEachIndexed { i, hub ->
+                                if (i > 0) Divider()
+                                HubRow(hub)
+                            }
+                            if (ui.hubs.isNotEmpty()) Divider()
+                            AddHub(engine)
+                        }
                     }
-            }
-            exporting?.let { Note(it, error = true) }
-        }
-        Group("Advanced") {
-            Toggle(
-                "Advanced mode",
-                "Notes by denomination, payment details, the light client's settings and the log.",
-                ui.developer,
-            ) { engine.setDeveloper(it) }
-            if (ui.developer) {
-                Divider()
-                Action("Balance and notes held", "Where it is, and the notes of each denomination.", Icons.Filled.Info, balance)
-                Advanced(engine, ui)
-            }
-        }
-        Group("About") {
-            Row(Modifier.fillMaxWidth().padding(vertical = 14.dp)) {
-                Text("Version", Modifier.weight(1f), style = MaterialTheme.typography.bodyLarge)
-                Text(
-                    BuildConfig.VERSION_NAME,
-                    style = MaterialTheme.typography.bodyLarge,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
+                    Page.Bitcoin -> {
+                        Group("Following Bitcoin") { Status(ui) }
+                        if (ui.developer) Group("Light client") { LightClient(engine, ui) }
+                    }
+                    Page.Privacy -> Group("Privacy") { Privacy(engine, ui) }
+                    Page.Storage -> Group("Kept on this phone") { StorageUsed(ui.developer) }
+                    Page.Advanced -> Group("Advanced") { Advanced(engine, balance) }
+                }
             }
         }
         Spacer(Modifier.height(48.dp))
     }
+}
+
+/** The pages there are, each with what it holds in a few words. */
+@Composable
+private fun Overview(engine: Engine, ui: Ui, open: (Page) -> Unit) {
+    val context = LocalContext.current
+    var exporting by remember { mutableStateOf<String?>(null) }
+    Group("Wallet") {
+        val hubs = when (ui.hubs.size) {
+            0 -> "None yet: add one"
+            1 -> host(ui.hubs[0].url) + ", its fees"
+            else -> "${ui.hubs.size} hubs, their fees"
+        }
+        Action("Hubs", hubs, Icons.Filled.Place) { open(Page.Hubs) }
+        Divider()
+        Action("Bitcoin", status(ui).first, Icons.Filled.Refresh) { open(Page.Bitcoin) }
+        Divider()
+        Action("Privacy", if (ui.tor) "Through Tor" else "Tor off", Icons.Filled.Lock) { open(Page.Privacy) }
+    }
+    Group("App") {
+        Action("Storage", "What the app keeps on this phone", Icons.Filled.Phone) { open(Page.Storage) }
+        Divider()
+        Action("Export logs", "Share what the app did, to report a problem.", Icons.Filled.Share) {
+            exporting = null
+            runCatching { context.startActivity(exportLogs(context, ui)) }
+                .onFailure {
+                    AppLog.warn("exporting the logs", it)
+                    exporting = "Could not export the logs: ${it.message ?: it.javaClass.simpleName}"
+                }
+        }
+        exporting?.let { Note(it, error = true) }
+        Divider()
+        Toggle(
+            "Advanced mode",
+            "Notes by denomination, payment details, providers to choose, the light client's settings and the log.",
+            ui.developer,
+        ) { engine.setDeveloper(it) }
+        if (ui.developer) {
+            Divider()
+            Action("Advanced", "Notes held, the log, deleting the wallet", Icons.Filled.Build) { open(Page.Advanced) }
+        }
+    }
+    Group("About") {
+        Row(Modifier.fillMaxWidth().padding(vertical = 14.dp)) {
+            Text("Version", Modifier.weight(1f), style = MaterialTheme.typography.bodyLarge)
+            Text(
+                BuildConfig.VERSION_NAME,
+                style = MaterialTheme.typography.bodyLarge,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
+@Composable
+private fun Privacy(engine: Engine, ui: Ui) {
+    val scope = rememberCoroutineScope()
+    var error by remember { mutableStateOf<String?>(null) }
+    Toggle("Reach hubs through Tor", "Slower, and hides where you are from hubs.", ui.tor) { on ->
+        scope.launch { engine.setTor(on).onFailure { error = explain(it) } }
+    }
+    error?.let { Note(it, error = true) }
 }
 
 /** What the app keeps on the phone, by what keeps it; in advanced mode, each network's light client. */
@@ -325,17 +380,22 @@ private fun Action(title: String, detail: String, icon: ImageVector, onClick: ()
     }
 }
 
-/** How far the app follows Bitcoin, in words. */
-@Composable
-private fun Status(ui: Ui) {
+/** How far the app follows Bitcoin, in a word and in a sentence. */
+private fun status(ui: Ui): Pair<String, String> {
     val chain = ui.chain
-    val (title, detail) = when {
+    return when {
         chain.peers == 0L -> "Connecting" to "Looking for Bitcoin nodes."
         !chain.synced -> "Catching up" to "At block ${chain.height}."
         ui.scanned != null && ui.scanned.toInt() <= chain.height ->
             "Looking for payments" to "At block ${ui.scanned} of ${chain.height}."
         else -> "Up to date" to "Block ${chain.height}, ${chain.peers} " + (if (chain.peers == 1L) "node." else "nodes.")
     }
+}
+
+/** How far the app follows Bitcoin, in words. */
+@Composable
+private fun Status(ui: Ui) {
+    val (title, detail) = status(ui)
     Column(Modifier.fillMaxWidth().padding(vertical = 12.dp)) {
         Text(title, style = MaterialTheme.typography.bodyLarge)
         Text(detail, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -343,17 +403,14 @@ private fun Status(ui: Ui) {
     ui.problem?.let { Note(it, error = true) }
 }
 
-/** The light client's settings and the log, for those testing them. */
+/** The light client's settings and the block explorer, for those testing them. */
 @Composable
-private fun Advanced(engine: Engine, ui: Ui) {
+private fun LightClient(engine: Engine, ui: Ui) {
     val scope = rememberCoroutineScope()
     var peers by remember { mutableStateOf(engine.prefs.peers) }
     var cdn by remember { mutableStateOf(engine.prefs.cdn) }
     var explorer by remember { mutableStateOf(engine.prefs.explorer) }
-    var logs by remember { mutableStateOf(false) }
-    var deleting by remember { mutableStateOf(false) }
     run {
-        Divider()
         Column(Modifier.padding(vertical = 12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Text("${ui.network.name} light client", style = MaterialTheme.typography.bodyLarge)
             OutlinedTextField(
@@ -390,6 +447,17 @@ private fun Advanced(engine: Engine, ui: Ui) {
             )
             FilledTonalButton(onClick = { engine.prefs.explorer = explorer }) { Text("Save") }
         }
+    }
+}
+
+/** The notes held, the log, and deleting the wallet, for those testing them. */
+@Composable
+private fun Advanced(engine: Engine, balance: () -> Unit) {
+    val scope = rememberCoroutineScope()
+    var logs by remember { mutableStateOf(false) }
+    var deleting by remember { mutableStateOf(false) }
+    run {
+        Action("Balance and notes held", "Where it is, and the notes of each denomination.", Icons.Filled.Info, balance)
         Divider()
         Toggle("Show the log", "Its newest lines, here.", logs) { logs = it }
         if (logs) {
