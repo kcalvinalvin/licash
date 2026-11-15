@@ -436,6 +436,24 @@ impl Note {
     /// Decode `to_bytes` and verify the note under `keyset`, the issuer
     /// keyset the caller expects (never one the bytes merely name).
     pub fn from_bytes(keyset: &Keyset, bytes: &[u8]) -> Result<Self, Error> {
+        let note = Self::decode(bytes)?;
+        note.verify(keyset)?;
+        Ok(note)
+    }
+
+    /// What `to_bytes` say of a note, decoded but not verified: for a
+    /// ledger reading back the notes it verified before keeping them. It
+    /// proves nothing about the note.
+    pub fn peek(bytes: &[u8]) -> Result<Peek, Error> {
+        let note = Self::decode(bytes)?;
+        Ok(Peek {
+            keyset: note.keyset,
+            unlinked: matches!(note.evidence, Evidence::Unlinked(_)),
+            message: note.message,
+        })
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, Error> {
         let mut r = Reader::new(bytes, "note", NOTE_TAG)?;
         let claimed = r.array()?;
         let message = Message::from_public_fields(r.take(PUBLIC_FIELDS_BYTES)?)?;
@@ -473,8 +491,23 @@ impl Note {
             _ => return Err(bad("unknown note evidence")),
         };
         r.finish()?;
-        Self::from_parts(keyset, claimed, message, signature, evidence)
+        Ok(Self {
+            keyset: claimed,
+            message,
+            signature,
+            evidence,
+        })
     }
+}
+
+/// A note's keyset, message and kind of evidence as its bytes claim them,
+/// unverified ([`Note::peek`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Peek {
+    pub keyset: [u8; 32],
+    pub message: Message,
+    /// Whether its evidence is of an unlinked issuance.
+    pub unlinked: bool,
 }
 
 /// A linked issuance of one output: the issuer's blind signature with its

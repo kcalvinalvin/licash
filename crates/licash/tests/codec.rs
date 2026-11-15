@@ -166,6 +166,29 @@ fn note_decoding_verifies_the_signature_and_evidence() {
 }
 
 #[test]
+fn a_peek_reads_what_a_note_claims_without_verifying_it() {
+    let f = fixture();
+    let note = &f.inputs[0].1;
+    let bytes = note.to_bytes();
+    let peek = Note::peek(&bytes).unwrap();
+    assert_eq!(&peek.keyset, f.keyset.id());
+    assert_eq!(&peek.message, note.message());
+    assert_eq!(peek.message.denomination(), 4);
+    assert!(!peek.unlinked);
+    refuses_framing_errors(&bytes, |b| Note::peek(b).is_ok());
+    // An unlinked form that does not verify still frames, and says so.
+    let evidence = 10 + 32 + 104 + 33;
+    let unlinked = [
+        &bytes[..evidence],
+        &[0],
+        &bytes[evidence + 1..evidence + 65],
+    ]
+    .concat();
+    assert!(Note::from_bytes(&f.keyset, &unlinked).is_err());
+    assert!(Note::peek(&unlinked).unwrap().unlinked);
+}
+
+#[test]
 fn grants_roundtrip_structurally_and_verify_after_decoding() {
     let f = fixture();
     let grant = f.grant();
