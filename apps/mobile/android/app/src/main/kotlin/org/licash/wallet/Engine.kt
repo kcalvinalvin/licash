@@ -165,7 +165,7 @@ class Engine(context: Context) {
     private suspend fun load() {
         mutex.withLock {
             if (walletExists(walletDir)) {
-                runCatching { Wallet.open(walletDir, prefs.tor) }
+                runCatching { configured(Wallet.open(walletDir, prefs.tor)) }
                     .onSuccess { wallet = it }
                     .onFailure { e ->
                         AppLog.warn("opening the wallet", e)
@@ -427,7 +427,7 @@ class Engine(context: Context) {
         mutex.withLock {
             val light = light
             val birthday = if (light != null && light.synced()) light.height().toUInt() else 0u
-            wallet = Wallet.create(walletDir, prefs.network, birthday, prefs.tor)
+            wallet = configured(Wallet.create(walletDir, prefs.network, birthday, prefs.tor))
             AppLog.info("wallet made at block $birthday")
         }
         lightLock.withLock { startLight() }
@@ -627,10 +627,28 @@ class Engine(context: Context) {
             prefs.tor = on
             wallet?.let {
                 it.destroy()
-                wallet = Wallet.open(walletDir, on)
+                wallet = configured(Wallet.open(walletDir, on))
             }
         }
         refresh()
+    }
+
+    /** Renew notes a restarted hub no longer unlinks for at most `ppm` parts per million of them. */
+    suspend fun setRenewLimit(ppm: UInt): Result<Unit> = io {
+        mutex.withLock {
+            prefs.renewPpm = ppm
+            wallet?.setRenewLimit(ppm)
+        }
+        Unit
+    }
+
+    /** The most the wallet pays to renew notes, in parts per million, if there is a wallet. */
+    fun renewLimit(): UInt? = wallet?.renewLimit()
+
+    /** The wallet `w` opened, as its owner set it: what its renewals may cost. */
+    private fun configured(w: Wallet): Wallet {
+        prefs.renewPpm?.let { w.setRenewLimit(it) }
+        return w
     }
 
     fun setDeveloper(on: Boolean) {

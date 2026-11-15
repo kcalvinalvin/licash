@@ -187,6 +187,58 @@ private fun Privacy(engine: Engine, ui: Ui) {
         scope.launch { engine.setTor(on).onFailure { error = explain(it) } }
     }
     error?.let { Note(it, error = true) }
+    if (ui.developer && ui.wallet) {
+        Divider()
+        RenewLimit(engine)
+    }
+}
+
+/**
+ * The most the wallet pays, on its own, to renew notes a hub that
+ * restarted can no longer unlink: in parts per million of them.
+ */
+@Composable
+private fun RenewLimit(engine: Engine) {
+    val scope = rememberCoroutineScope()
+    var ppm by remember { mutableStateOf(engine.renewLimit()?.toString() ?: "") }
+    var error by remember { mutableStateOf<String?>(null) }
+    val asked = ppm.trim().toUIntOrNull()
+    Column(Modifier.padding(vertical = 12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text("Renewing notes", style = MaterialTheme.typography.bodyLarge)
+        Text(
+            "A hub that restarted can no longer unlink the notes it issued before. " +
+                "The wallet swaps them for new ones there if the hub charges at most this.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            OutlinedTextField(
+                value = ppm,
+                onValueChange = { ppm = it; error = null },
+                modifier = Modifier.weight(1f),
+                singleLine = true,
+                label = { Text("Most to pay, parts per million") },
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number, imeAction = ImeAction.Done),
+                shape = RoundedCornerShape(14.dp),
+            )
+            FilledTonalButton(
+                enabled = asked != null,
+                onClick = {
+                    if (asked != null) {
+                        scope.launch { engine.setRenewLimit(asked).onFailure { error = explain(it) } }
+                    }
+                },
+            ) { Text("Save") }
+        }
+        Note(
+            error ?: asked?.let { "${percent(it.toULong())} of the notes renewed, 0 for free renewals only." }
+                ?: "A whole number, such as 100 (0.01%).",
+            error = error != null || asked == null,
+        )
+    }
 }
 
 /** What the app keeps on the phone, by what keeps it; in advanced mode, each network's light client. */

@@ -133,6 +133,19 @@ impl Wallet {
     pub fn tor(&self) -> bool {
         self.tor
     }
+
+    /// Renew notes a hub no longer unlinks since it restarted, paying them
+    /// to the wallet itself, only if its fee on them is at most `ppm` parts
+    /// per million of their value, its base fee included: 0 renews them
+    /// only for free. 100 until set, for as long as the wallet is open.
+    pub fn set_renew_limit(&self, ppm: u32) {
+        self.wallet.set_renew_limit(ppm);
+    }
+
+    /// The most it pays to renew notes ([`Wallet::set_renew_limit`]).
+    pub fn renew_limit(&self) -> u32 {
+        self.wallet.renew_limit()
+    }
 }
 
 impl Wallet {
@@ -588,6 +601,8 @@ impl Wallet {
         }
         let paid =
             paid.map_err(|e| LicashError::from_any(e, |reason| LicashError::Invalid { reason }))?;
+        // Its change, linked to it until then.
+        self.unlink();
         let handover = match paid.delivered {
             Some(_) => None,
             None => Some(serde_json::to_string(&paid.paid.payment).map_err(LicashError::failed)?),

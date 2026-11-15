@@ -42,7 +42,9 @@ has the file can sign updates.
 The app is for Bitcoin. Tapping the "licash" wordmark on the first screen
 7 times, or the Advanced mode switch in Settings at any time, turns on
 advanced mode: signet, Mutinynet and regtest, the light client's peers and
-its block-dn server, the block explorer transactions link to, the notes of
+its block-dn server, the block explorer transactions link to, the most the
+app pays, on its own, to renew notes a hub that restarted no longer unlinks
+(100 parts per million of them unless set, under Privacy), the notes of
 each denomination, and every detail of a payment.
 
 The app needs a hub taking deposits on the same network: `licash-hub run

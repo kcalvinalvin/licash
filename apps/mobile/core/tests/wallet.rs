@@ -1196,6 +1196,11 @@ fn a_phone_shows_the_notes_each_line_of_its_history_spent_and_made() {
     let net = Net::new(true);
     let light = Light::new(&net);
     let alice = funded(&net, &light, "alice");
+    // Renewals of notes a restarted hub no longer unlinks: 100 parts per
+    // million at most unless set.
+    assert_eq!(alice.renew_limit(), 100);
+    alice.set_renew_limit(0);
+    assert_eq!(alice.renew_limit(), 0);
     let held = notes(&alice);
     let history = alice.history().unwrap();
     let moved = history.iter().find(|a| a.kind == Kind::Moved).unwrap();
@@ -1224,6 +1229,11 @@ fn a_phone_shows_the_notes_each_line_of_its_history_spent_and_made() {
         .iter()
         .all(|n| n.spent_by.as_ref() == Some(&paid.id)));
     assert!(sent.made.iter().all(|n| n.made_by == paid.id));
+    // Its change, unlinked as it is made.
+    assert!(
+        sent.made.iter().all(|n| n.linking == Linking::Unlinked),
+        "{sent:?}"
+    );
     let after = alice.notes_of(Kind::Moved, moved.id.clone()).unwrap().made;
     let by = after
         .iter()

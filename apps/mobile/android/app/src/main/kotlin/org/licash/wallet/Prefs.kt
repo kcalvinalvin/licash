@@ -37,4 +37,12 @@ class Prefs(context: Context) {
     var tor: Boolean
         get() = prefs.getBoolean("tor", false)
         set(on) = prefs.edit().putBoolean("tor", on).apply()
+
+    /**
+     * The most paid to renew notes a hub that restarted no longer unlinks,
+     * in parts per million of them: none if never set, the wallet's own.
+     */
+    var renewPpm: UInt?
+        get() = prefs.getLong("renew_ppm", -1L).takeIf { it >= 0 }?.toUInt()
+        set(ppm) = prefs.edit().putLong("renew_ppm", ppm?.toLong() ?: -1L).apply()
 }
