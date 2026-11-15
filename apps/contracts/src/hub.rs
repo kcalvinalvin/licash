@@ -18,7 +18,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{ensure, Result};
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path as UrlPath, State};
 use axum::http::StatusCode;
@@ -48,7 +48,11 @@ const WAIT: Duration = Duration::from_secs(20);
 /// A hub's openings, with its node, whose wallet funds and signs F.
 pub struct Openings {
     store: Mutex<Store>,
+    /// The chain followed: its tip, checkpoints and fee rates, and
+    /// broadcasting.
     source: Source,
+    /// The node whose wallet funds and signs F, and locks its coins.
+    wallet: Source,
     keyset: Keyset,
     trust: Trust,
     timing: Timing,
@@ -167,23 +171,45 @@ fn peek(state: &[u8]) -> Option<Terms> {
 
 impl Openings {
     /// The openings in `data`, opened under `keyset` and funded by the
-    /// wallet of the node `source` names (its JSON-RPC). Refused on a
-    /// network the hub has no terms or programs for: [`Timing::of`],
-    /// [`crate::trust`].
+    /// wallet of the node `source` names (its JSON-RPC), as
+    /// [`Openings::with_wallet`].
     pub async fn new(data: &Path, source: Source, keyset: Keyset) -> Result<Arc<Self>> {
+        Self::with_wallet(data, source.clone(), source, keyset).await
+    }
+
+    /// The openings in `data` on the chain `source` follows, opened under
+    /// `keyset` and funded by the node's wallet `wallet` names (its
+    /// JSON-RPC, as `http://host:port/wallet/NAME`), which may be another
+    /// node's on the same network. Refused on a network the hub has no
+    /// terms or programs for: [`Timing::of`], [`crate::trust`].
+    pub async fn with_wallet(
+        data: &Path,
+        source: Source,
+        wallet: Source,
+        keyset: Keyset,
+    ) -> Result<Arc<Self>> {
         let profile: ChainProfile = source.profile().await?;
         let trust = crate::trust(profile)?;
         let timing = Timing::of(profile)?;
         // Not fatal: a node may load its wallet after the hub starts. F
-        // goes unfunded, and its openings given up, until it does.
-        let wallet = source.rpc::<serde_json::Value>("getwalletinfo", serde_json::json!([]));
-        if let Err(e) = wallet.await {
+        // goes unfunded, and its openings given up, until it does. Fatal
+        // on another network: no F it funds could be the chain's.
+        let info = wallet.rpc::<serde_json::Value>("getwalletinfo", serde_json::json!([]));
+        if let Err(e) = info.await {
             tracing::warn!("contracts need the node's wallet, to fund F: {e:#}");
+        }
+        match wallet.profile().await {
+            Ok(theirs) => ensure!(
+                theirs == profile,
+                "the contracts' wallet, {wallet}, is on {theirs}, the chain on {profile}"
+            ),
+            Err(e) => tracing::warn!("the contracts' wallet, {wallet}: {e:#}"),
         }
         let store = Store::open(data)?;
         let openings = Arc::new(Self {
             store: Mutex::new(store),
             source,
+            wallet,
             keyset,
             trust,
             timing,

@@ -55,7 +55,7 @@ impl Openings {
             }],
         });
         let funded: Value = self
-            .source
+            .wallet
             .rpc(
                 "fundrawtransaction",
                 json!([serialize_hex(&unsigned), options]),
@@ -72,7 +72,7 @@ impl Openings {
                 continue;
             }
             let found: Value = self
-                .source
+                .wallet
                 .rpc("gettransaction", json!([o.txid.to_string()]))
                 .await?;
             let hex = found["hex"].as_str().context("a coin of F, no hex")?;
@@ -112,7 +112,7 @@ impl Openings {
             })
             .collect();
         let signed: Value = self
-            .source
+            .wallet
             .rpc(
                 "signrawtransactionwithwallet",
                 json!([serialize_hex(funding), theirs]),
@@ -126,7 +126,7 @@ impl Openings {
     /// Whether `deposit` is a confirmed coin of the chain as `value` says.
     pub(super) async fn confirmed(&self, deposit: OutPoint, value: &TxOut) -> Result<bool> {
         let found: Value = self
-            .source
+            .wallet
             .rpc(
                 "gettxout",
                 json!([deposit.txid.to_string(), deposit.vout, false]),
@@ -157,11 +157,11 @@ impl Openings {
     async fn lock(&self, coins: &[OutPoint], unlock: bool) {
         for o in coins {
             let args = json!([unlock, [coin(o)], true]);
-            let mut done: Result<bool> = self.source.rpc("lockunspent", args).await;
+            let mut done: Result<bool> = self.wallet.rpc("lockunspent", args).await;
             if done.is_err() {
                 // Nodes before 0.25 persist no lock.
                 let args = json!([unlock, [coin(o)]]);
-                done = self.source.rpc("lockunspent", args).await;
+                done = self.wallet.rpc("lockunspent", args).await;
             }
             if let Err(e) = done {
                 tracing::warn!(coin = %o, unlock, "locking a coin of F: {e:#}");

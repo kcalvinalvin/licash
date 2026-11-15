@@ -125,11 +125,24 @@ struct Chain {
     tweaks_from: Option<u32>,
     /// Open recovery contracts with wallets, kept in
     /// `<data>/openings.sqlite`, F funded and signed by the wallet of the
-    /// node `--chain` names. Regtest only for now, under the mock
-    /// authority: a contract there protects nothing.
+    /// node `--contracts-wallet` names, else `--chain`. On regtest under
+    /// the mock authority, a contract there protecting nothing; on signet
+    /// under the genuine programs; none elsewhere yet.
     #[arg(long, env = "LICASH_HUB_CONTRACTS",
           value_parser = clap::builder::BoolishValueParser::new())]
     contracts: bool,
+    /// Fund and sign contracts with the wallet of the node at this URL, its
+    /// JSON-RPC as `--chain` takes it, such as
+    /// `http://host:port/wallet/NAME?cookie=PATH`: one apart from the chain
+    /// followed, which may be an Esplora API. By default, `--chain`'s.
+    #[arg(
+        long = "contracts-wallet",
+        value_name = "URL",
+        env = "LICASH_HUB_CONTRACTS_WALLET",
+        hide_env_values = true,
+        requires = "contracts"
+    )]
+    contracts_wallet: Option<String>,
 }
 
 impl Chain {
@@ -762,6 +775,13 @@ fn command(cli: Cli) -> anyhow::Result<()> {
             let policy = policy.policy();
             let (indexing, tweaks_from) = (chain.tweaks, chain.tweaks_from);
             let contracting = chain.contracts;
+            let wallet = match (&chain.contracts_wallet, &chain.url) {
+                (Some(url), _) => Some(url.parse::<Source>().context("--contracts-wallet")?),
+                (None, Some(url)) if contracting && url.starts_with("esplora+") => anyhow::bail!(
+                    "opening contracts (--contracts) on an Esplora API needs --contracts-wallet, a node's JSON-RPC"
+                ),
+                (None, _) => None,
+            };
             let chain = chain.source(&policy)?;
             anyhow::ensure!(
                 !indexing || chain.is_some(),
@@ -769,7 +789,7 @@ fn command(cli: Cli) -> anyhow::Result<()> {
             );
             anyhow::ensure!(
                 !contracting || chain.is_some(),
-                "opening contracts (--contracts) needs --chain, a node's JSON-RPC"
+                "opening contracts (--contracts) needs --chain"
             );
             let lightning = lightning.gateway()?;
             anyhow::ensure!(
@@ -857,7 +877,9 @@ fn command(cli: Cli) -> anyhow::Result<()> {
                 (true, Some((source, _, _))) => {
                     let keysets = hub.info().keysets;
                     let keyset = keysets.first().context("the hub has no keyset")?;
-                    let opening = Openings::new(&cli.data, source.clone(), keyset.clone());
+                    let wallet = wallet.unwrap_or_else(|| source.clone());
+                    let opening =
+                        Openings::with_wallet(&cli.data, source.clone(), wallet, keyset.clone());
                     let openings = runtime.block_on(opening).context("open the contracts")?;
                     openings.spawn_sweeper();
                     tracing::info!(mock = openings.advertise().mock, "opening contracts");

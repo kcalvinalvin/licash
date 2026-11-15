@@ -75,14 +75,28 @@ of `--nostr-relay` unless `--mailbox-relay` names others.
 With `--contracts` (and `--chain` naming a Bitcoin Core node's JSON-RPC,
 with a wallet), the hub opens recovery contracts with its wallets: each
 locks collateral of the node's wallet behind the wallet's notes at the hub,
-up to a cap, until the contract's close. `/v1/info` names the cap, the
-price a wallet pays to open one and the most blocks to its close; the
-openings take `/v1/contracts`. F, a contract's funding, spends the node's
-coins, which stay locked while the opening lives. Openings are kept in
-`<data>/openings.sqlite`, as sensitive as the seed: back it up with
-`hub.sqlite`. Regtest only for now, under a mock proof authority: such a
-contract protects nothing. Each opening downloads about 100 MB of garbled
-instances to the wallet.
+up to a cap, until the contract's close. `--contracts-wallet URL` names
+another node's wallet instead, by its JSON-RPC as `--chain` takes it
+(`http://host:port/wallet/NAME?cookie=PATH`), on the same network: the hub
+may then follow the chain through an Esplora API. A wallet of its own,
+funded with what the hub may lock, bounds the collateral at stake.
+`/v1/info` names the cap, the price a wallet pays to open one and the most
+blocks to its close; the openings take `/v1/contracts`. F, a contract's
+funding, spends the wallet's coins, which stay locked while the opening
+lives. Openings are kept in `<data>/openings.sqlite`, as sensitive as the
+seed: back it up with `hub.sqlite`. Each opening downloads about 100 MB of
+garbled instances to the wallet.
+
+On regtest, contracts are under a mock proof authority: such a contract
+protects nothing. On signet they are under the genuine programs kept in
+`r0/programs/`, a trial: RISC Zero's shared Groth16 setup, signet's headers
+checked by their work alone and not the network's signature of each block,
+and a hub that does not yet answer a recovery's request (which then pays
+the wallet at its timeout) nor yet take its collateral back after the
+close. The hub's terms there are signet's least: a day
+for the wallet to answer a challenge and for each party's outputs to wait,
+3 blocks deep, and 12 blocks at least to respond to a request. No other
+network yet.
 
 With `--swaps` (and `--chain`), the hub provides the swaps into it from the
 hubs of `--swaps-from URL=CAP`: a wallet locks its notes at such a hub to
