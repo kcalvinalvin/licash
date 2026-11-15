@@ -57,7 +57,7 @@ pub use coins::MAX_INPUTS;
 pub use deposits::{Deposit, DepositState, DepositTerms};
 pub use lightning::{Invoice, InvoiceState, Payable};
 pub use locks::{Incoming, Lock, LockState, CLAIM_MARGIN};
-pub use payouts::{Payout, PayoutQuote, PayoutState, CLAIM_ROOM};
+pub use payouts::{first_spend, payout_depth, Payout, PayoutQuote, PayoutState, CLAIM_ROOM};
 pub use silent::{Blocks, Payee, Scanned, SilentCoin, SilentSpend};
 use store::{now, sql, Owner, Store};
 pub use swaps::{Swap, SwapLimits, SwapQuote, SwapState, SWAP_WINDOW};

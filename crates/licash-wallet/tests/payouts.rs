@@ -664,3 +664,28 @@ async fn a_coin_timed_out_by_a_time_or_after_the_lock_is_never_claimed() {
         assert!(eco.client.payout_claims().unwrap().is_empty());
     }
 }
+
+#[tokio::test]
+async fn a_public_preimage_is_claimed_with_inside_the_claim_margin() {
+    let eco = Eco::new().await;
+    let payout = eco.pay_out(1000).await;
+    let coin = eco.desk.fund(None, None);
+    eco.follow(&payout).await.unwrap();
+    let claims = eco.client.payout_claims().unwrap();
+    eco.net.confirm(A, claims.clone());
+    let lock = eco.client.locks().unwrap().remove(0);
+    eco.mine_to(lock.expiry - licash_wallet::CLAIM_MARGIN);
+    let (htlc, id) = eco.desk.with(|t| (t.htlc, t.lock.clone()));
+    let preimage = htlc.preimage_in(&claims[0], coin).unwrap();
+    match eco.desk.wallet.claim(A, &id, &preimage).await {
+        Err(Error::Invalid(why)) => assert!(why.contains("too late to claim"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+    eco.desk
+        .wallet
+        .claim_revealed(A, &id, &preimage)
+        .await
+        .unwrap();
+    let lock = eco.client.follow_lock(&lock.id).await.unwrap();
+    assert!(matches!(lock.state, LockState::Paid(_)), "{lock:?}");
+}

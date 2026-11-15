@@ -60,7 +60,7 @@ const REORG: u32 = 6;
 /// Confirmations a coin needs before the wallet claims it, and its claim
 /// before the payout is done: a reorganization deeper than that could take
 /// the coin away once the preimage is out.
-fn payout_depth(network: ChainProfile) -> u32 {
+pub fn payout_depth(network: ChainProfile) -> u32 {
     match network {
         ChainProfile::Core30Mainnet => 2,
         _ => 1,

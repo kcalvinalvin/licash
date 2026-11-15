@@ -779,8 +779,10 @@ impl<T: Transport> Wallet<T> {
     }
 
     /// Hand out the fallback address to show: the one handed out last
-    /// until it is paid, then the next. Watched from then on.
-    pub(crate) fn fallback_address(&self) -> Result<bitcoin::Address, Error> {
+    /// until it is paid, then the next. Watched from then on, also by scans
+    /// without a hub's tweaks: a plain taproot address to fund the wallet
+    /// at, or to pay back to.
+    pub fn fallback_address(&self) -> Result<bitcoin::Address, Error> {
         let scanner = self.keys.silent.scanner([]);
         let found = self.store.write(|t| {
             let (_, next) = fallbacks(t, &scanner)?;

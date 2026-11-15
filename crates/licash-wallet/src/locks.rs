@@ -502,6 +502,29 @@ impl<T: Transport> Wallet<T> {
     /// revealing it within [`CLAIM_MARGIN`] blocks of the lock's expiry, as
     /// the hub could then refund the lock and keep what the preimage buys.
     pub async fn claim(&self, url: &str, id: &str, preimage: &[u8; 32]) -> Result<Received, Error> {
+        self.claim_with(url, id, preimage, false).await
+    }
+
+    /// [`Wallet::claim`], within [`CLAIM_MARGIN`] blocks of the lock's
+    /// expiry too, until its hub refuses: for a preimage public already,
+    /// such as one read from a claim on chain, which claiming late reveals
+    /// to no one new.
+    pub async fn claim_revealed(
+        &self,
+        url: &str,
+        id: &str,
+        preimage: &[u8; 32],
+    ) -> Result<Received, Error> {
+        self.claim_with(url, id, preimage, true).await
+    }
+
+    async fn claim_with(
+        &self,
+        url: &str,
+        id: &str,
+        preimage: &[u8; 32],
+        revealed: bool,
+    ) -> Result<Received, Error> {
         let url = hub_url(url)?;
         let id = payment_id(id)?;
         let (info, keyset, view) = self.lock_view(&url, &id).await?;
@@ -521,6 +544,7 @@ impl<T: Transport> Wallet<T> {
             }
             // Revealed already.
             Some(Settled::Pay) => {}
+            None if revealed => {}
             None => {
                 let height = info.locks.map_or(u32::MAX, |l| l.height);
                 if height.saturating_add(CLAIM_MARGIN) >= terms.expiry() {
