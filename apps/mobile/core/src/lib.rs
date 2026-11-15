@@ -173,6 +173,15 @@ pub struct Range {
     pub max: u64,
 }
 
+/// A hub announced on Nostr, not used yet.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct FoundHub {
+    /// The name it announced itself under, if any.
+    pub name: Option<String>,
+    /// What it says of itself, at the URL it answered at.
+    pub hub: Hub,
+}
+
 /// What the wallet holds, in sat.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, uniffi::Record)]
 pub struct Balance {
@@ -250,6 +259,19 @@ pub struct PayQuote {
     /// hub proving it is the one their code names: what the swap brings
     /// past the payment stays there, apart ([`Wallet::visited`]).
     pub trusted: bool,
+}
+
+/// A way of paying a payment code ([`Wallet::pay_offers`]): through the
+/// swap provider at `provider`, if a swap brings what the wallet lacks at
+/// the payee's hub first.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct PayOffer {
+    pub provider: Option<String>,
+    /// The name it announced itself under, if any.
+    pub provider_name: Option<String>,
+    /// Whether the wallet swapped through it before.
+    pub known: bool,
+    pub quote: PayQuote,
 }
 
 /// A payment code to show: `text` to share, `qr` to draw, `address`, the

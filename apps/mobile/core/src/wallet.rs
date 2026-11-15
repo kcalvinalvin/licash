@@ -6,7 +6,10 @@ use std::{
 };
 
 use bitcoin::{FeeRate, OutPoint};
-use licash_nostr::Route;
+use licash_nostr::{
+    wallet::{hub_relays, hubs_announced},
+    Route,
+};
 use licash_transport::Http;
 use licash_wallet::{DepositState, PaymentCode, MAX_HUBS};
 use rand_core::{OsRng, RngCore};
@@ -15,9 +18,9 @@ use serde::{Deserialize, Serialize};
 use crate::{
     chain::Chain,
     deliveries::{self, Delivery},
-    Activity, Balance, ChainError, ChainSource, Code, Details, Holding, Hub, InvoiceQuote, Kind,
-    LicashError, LightningInvoice, LightningTerms, Network, Notes, Onchain, Paid, PayQuote, Range,
-    Rate, Scan, Scanned, State,
+    Activity, Balance, ChainError, ChainSource, Code, Details, FoundHub, Holding, Hub,
+    InvoiceQuote, Kind, LicashError, LightningInvoice, LightningTerms, Network, Notes, Onchain,
+    Paid, PayOffer, PayQuote, Range, Rate, Scan, Scanned, State,
 };
 
 /// The rate deposits are paid at, in sat/vB: above what nodes relay.
@@ -193,6 +196,31 @@ impl Wallet {
     pub fn hubs(&self) -> Result<Vec<Hub>, LicashError> {
         let hubs = self.wallet.hubs()?;
         Ok(hubs.iter().map(|(url, info)| hub(url, info)).collect())
+    }
+
+    /// The hubs announced on Nostr, on the relays the hubs trusted name,
+    /// that the wallet does not use, with what each says of itself: to add
+    /// one without typing its URL. Each is at a URL that answered as the
+    /// key announcing it.
+    pub fn discover_hubs(&self) -> Result<Vec<FoundHub>, LicashError> {
+        let relays = hub_relays(&self.wallet)?;
+        if relays.is_empty() {
+            return Err(LicashError::invalid(
+                "no hub you use names relays to find other hubs on",
+            ));
+        }
+        let found = hubs_announced(&self.wallet, &relays, &self.route);
+        let found = self
+            .runtime
+            .block_on(found)
+            .map_err(|e| LicashError::from_any(e, |reason| LicashError::Unavailable { reason }))?;
+        Ok(found
+            .iter()
+            .map(|h| FoundHub {
+                name: h.name.clone(),
+                hub: hub(&h.url, &h.info),
+            })
+            .collect())
     }
 
     pub fn balance(&self) -> Result<Balance, LicashError> {
@@ -430,28 +458,56 @@ impl Wallet {
     /// else so at a hub the code says where to reach, visited, proving it
     /// is the one the code names. [`Wallet::pay`] pays it so.
     pub fn pay_quote(&self, code: String, amount: Option<u64>) -> Result<PayQuote, LicashError> {
-        let text = code.trim().to_owned();
-        let code: PaymentCode = text.parse().map_err(LicashError::invalid)?;
-        code.check(self.wallet.network())?;
-        let plan = licash_nostr::wallet::plan(&self.wallet, &code, amount, &self.route);
-        let plan = match self.runtime.block_on(plan) {
-            Ok(plan) => plan,
-            Err(e) => {
-                // Lacking notes says the most: what is needed.
-                self.enough(&code, amount)?;
-                return Err(LicashError::from_any(e, |reason| LicashError::Invalid {
-                    reason,
-                }));
-            }
+        let (text, mut plans) = self.plans(&code, amount)?;
+        let plan = plans.remove(0);
+        let quote = quoted(&plan);
+        *self.planned.lock().unwrap_or_else(PoisonError::into_inner) = Some((text, plan));
+        Ok(quote)
+    }
+
+    /// The ways [`Wallet::pay_quote`] chooses from of paying `code`: the
+    /// one it picks first, then those through each other swap provider it
+    /// could swap with instead. One, through no provider, when the wallet
+    /// holds enough at a hub the code names.
+    pub fn pay_offers(
+        &self,
+        code: String,
+        amount: Option<u64>,
+    ) -> Result<Vec<PayOffer>, LicashError> {
+        let (_, plans) = self.plans(&code, amount)?;
+        Ok(plans
+            .iter()
+            .map(|plan| {
+                let swap = plan.swap.as_ref();
+                PayOffer {
+                    provider: swap.map(|s| s.provider.url.clone()),
+                    provider_name: swap.and_then(|s| s.provider.name.clone()),
+                    known: swap.is_some_and(|s| s.provider.known),
+                    quote: quoted(plan),
+                }
+            })
+            .collect())
+    }
+
+    /// [`Wallet::pay_quote`], swapping through the provider at `provider`,
+    /// one of [`Wallet::pay_offers`]: what [`Wallet::pay`] pays next.
+    pub fn choose_pay_offer(
+        &self,
+        code: String,
+        amount: Option<u64>,
+        provider: String,
+    ) -> Result<PayQuote, LicashError> {
+        let (text, plans) = self.plans(&code, amount)?;
+        let through = |plan: &licash_nostr::wallet::Plan| {
+            let swap = plan.swap.as_ref();
+            swap.is_some_and(|s| s.provider.url == provider)
         };
-        let quote = PayQuote {
-            hub: plan.hub.clone(),
-            amount: plan.amount,
-            fee: plan.fees(),
-            swap_from: plan.swap.as_ref().map(|s| s.from.clone()),
-            swapped: plan.swap.as_ref().map_or(0, |s| s.provider.quote.amount),
-            trusted: plan.trusted,
+        let Some(plan) = plans.into_iter().find(through) else {
+            return Err(LicashError::invalid(format!(
+                "{provider} offers no swap for this payment now"
+            )));
         };
+        let quote = quoted(&plan);
         *self.planned.lock().unwrap_or_else(PoisonError::into_inner) = Some((text, plan));
         Ok(quote)
     }
@@ -842,6 +898,29 @@ impl Wallet {
 }
 
 impl Wallet {
+    /// The ways of paying `code`, trimmed as it was given, as
+    /// [`licash_nostr::wallet::plans`] finds them: never none.
+    fn plans(
+        &self,
+        code: &str,
+        amount: Option<u64>,
+    ) -> Result<(String, Vec<licash_nostr::wallet::Plan>), LicashError> {
+        let text = code.trim().to_owned();
+        let code: PaymentCode = text.parse().map_err(LicashError::invalid)?;
+        code.check(self.wallet.network())?;
+        let plans = licash_nostr::wallet::plans(&self.wallet, &code, amount, &self.route);
+        match self.runtime.block_on(plans) {
+            Ok(plans) => Ok((text, plans)),
+            Err(e) => {
+                // Lacking notes says the most: what is needed.
+                self.enough(&code, amount)?;
+                Err(LicashError::from_any(e, |reason| LicashError::Invalid {
+                    reason,
+                }))
+            }
+        }
+    }
+
     /// The coins not spent that the claims of the wallet's payouts paid,
     /// with their values: cashed out to the wallet itself.
     fn kept_coins(&self) -> Result<Vec<(OutPoint, u64)>, LicashError> {
@@ -1306,5 +1385,17 @@ fn moved_activity(deposit: &licash_wallet::Deposit) -> Activity {
         fee: pays.saturating_sub(deposit.amount),
         detail,
         at: Some(deposit.created_at),
+    }
+}
+
+/// What paying as `plan` says costs, as quoted.
+fn quoted(plan: &licash_nostr::wallet::Plan) -> PayQuote {
+    PayQuote {
+        hub: plan.hub.clone(),
+        amount: plan.amount,
+        fee: plan.fees(),
+        swap_from: plan.swap.as_ref().map(|s| s.from.clone()),
+        swapped: plan.swap.as_ref().map_or(0, |s| s.provider.quote.amount),
+        trusted: plan.trusted,
     }
 }

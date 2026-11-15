@@ -38,8 +38,9 @@ use licash_hub_service::{
 };
 use licash_mobile::{
     set_logger, wallet_exists, Activity, Balance, ChainError, ChainSource, Details, Kind,
-    LicashError, Logger, Network, Onchain, PayQuote, Range, Rate, Scanned, State, Wallet,
+    LicashError, Logger, Network, Onchain, PayOffer, PayQuote, Range, Rate, Scanned, State, Wallet,
 };
+use licash_nostr::{Announcement, Announcer, Role, Route};
 use licash_wallet::PaymentCode;
 use nostr_sdk::prelude::MockRelay;
 
@@ -996,6 +997,50 @@ fn a_phone_pays_out_to_bitcoin_addresses_and_codes_of_hubs_it_does_not_trust() {
 }
 
 #[test]
+fn a_phone_finds_the_hubs_announced_on_its_hubs_relays_but_those_it_uses() {
+    let net = Net::new(true);
+    let alice = net.wallet("alice", net.height());
+    let relay = net.relay.as_ref().unwrap();
+    let relays = vec![net.runtime.block_on(relay.url()).to_string()];
+    let other = Net::new(false);
+    let announce = |secret: [u8; 32], url: &str, name: &str| {
+        let announcement = Announcement {
+            urls: vec![url.into()],
+            network: "regtest".into(),
+            name: Some(name.into()),
+        };
+        net.runtime.block_on(async {
+            let announcer = Announcer::new(&secret, Role::Hub, &relays, &Route::Direct);
+            let sent = announcer.await.unwrap().announce(&announcement).await;
+            assert_eq!(sent.unwrap(), 1);
+        })
+    };
+    // Nothing announced: nothing found.
+    assert_eq!(alice.discover_hubs().unwrap(), []);
+
+    // Her own hub, another, and the other's URL announced by another key:
+    // only the other found, at the URL that answered as its key.
+    announce(net.hub.nostr_secret(), &net.url, "hers");
+    announce(other.hub.nostr_secret(), &other.url, "another");
+    announce([5; 32], &other.url, "not it");
+    let found = alice.discover_hubs().unwrap();
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].name.as_deref(), Some("another"));
+    assert_eq!(found[0].hub.url, other.url);
+    assert_eq!((found[0].hub.fee_base, found[0].hub.fee_ppm), (1, 0));
+    // Not added by finding it.
+    assert_eq!(alice.hubs().unwrap().len(), 1);
+
+    // Added: found no more.
+    alice.add_hub(found[0].hub.url.clone()).unwrap();
+    assert_eq!(alice.discover_hubs().unwrap(), []);
+
+    // A hub naming no relays: nowhere to look.
+    let bob = other.wallet("bob", other.height());
+    assert!(invalid(bob.discover_hubs()).contains("no hub you use names relays"));
+}
+
+#[test]
 fn a_phone_paid_over_lightning_takes_the_notes_and_shows_the_invoice() {
     let net = Net::new(false);
     let alice = net.wallet("alice", net.height());
@@ -1122,6 +1167,47 @@ fn a_phone_pays_a_code_as_quoted() {
     let paid = alice.pay(open.qr, Some(200)).unwrap();
     assert_eq!(paid.amount, 200);
     assert_eq!(notes(&alice), held - 501 - 201);
+}
+
+#[test]
+fn a_phone_offers_the_ways_it_could_pay_to_choose_from() {
+    let net = Net::new(true);
+    let light = Light::new(&net);
+    let alice = funded(&net, &light, "alice");
+    let held = notes(&alice);
+    let bob = net.wallet("bob", net.height());
+    let hub = bob.hubs().unwrap()[0].url.clone();
+    let asked = bob.payment_code(Some(500)).unwrap();
+
+    // Holding enough at the payee's hub: one way, through no provider,
+    // the one quoted.
+    let offers = alice.pay_offers(asked.qr.clone(), None).unwrap();
+    let quote = PayQuote {
+        hub: hub.clone(),
+        amount: 500,
+        fee: 1,
+        swap_from: None,
+        swapped: 0,
+        trusted: true,
+    };
+    let direct = PayOffer {
+        provider: None,
+        provider_name: None,
+        known: false,
+        quote: quote.clone(),
+    };
+    assert_eq!(offers, [direct]);
+    assert_eq!(alice.pay_quote(asked.qr.clone(), None).unwrap(), quote);
+    // No provider to choose: refused, nothing paid.
+    let chosen = alice.choose_pay_offer(asked.qr.clone(), None, "http://swaps.example".into());
+    assert!(invalid(chosen).contains("offers no swap"));
+    assert_eq!(notes(&alice), held);
+
+    // No provider announced on her hub's relays: no payout offered.
+    let address = "bcrt1p8sjsah3xnncxd4jar9pc0xn3lhu7tlg2wwk03vxnvn0zhd24j25sl5zmq9";
+    let offers = alice.payout_offers(address.into(), Some(1_000), None);
+    assert!(invalid(offers).contains("no swap provider"));
+    assert_eq!(notes(&alice), held);
 }
 
 #[test]

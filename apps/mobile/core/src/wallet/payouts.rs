@@ -54,59 +54,35 @@ impl Wallet {
         amount: Option<u64>,
         hub: Option<String>,
     ) -> Result<PayoutQuote, LicashError> {
-        let address = address.trim();
-        let hub = match hub {
-            Some(hub) => hub,
-            None => self.richest()?,
-        };
-        let held = self.held(&hub)?;
-        let first = amount.unwrap_or_else(|| all_but_fees(held));
-        if first == 0 {
-            return Err(LicashError::Insufficient {
-                needed: held + 1,
-                available: held,
-            });
-        }
-        let relays = hub_relays(&self.wallet)?;
-        if relays.is_empty() {
-            return Err(LicashError::invalid(
-                "no hub you trust names relays to find swap providers on",
-            ));
-        }
-        let limits = (max_fee(first), claim_rate());
-        let found = payout_providers(
-            &self.wallet,
-            &relays,
-            &self.route,
-            (&hub, address),
-            first,
-            limits,
-        );
-        let found = self
-            .runtime
-            .block_on(found)
-            .map_err(|e| LicashError::from_any(e, |reason| LicashError::Unavailable { reason }))?;
+        let (asked, found) = self.payout_found(&address, amount, hub)?;
         let Some(best) = found.into_iter().next() else {
-            return Err(LicashError::invalid(format!(
-                "no swap provider found pays {first} sat out on Bitcoin now"
-            )));
+            return Err(no_provider(asked.first));
         };
-        let quote = match amount {
-            Some(_) => {
-                self.wallet.lock_fee(&hub, locked(&best.quote))?;
-                best.quote
+        self.payout_offer(&asked, best)
+    }
+
+    /// The quotes of [`Wallet::payout_quote`] through each swap provider
+    /// that pays it out, in the order it prefers them: to choose from.
+    /// Those that cannot are left out; refused if none can.
+    pub fn payout_offers(
+        &self,
+        address: String,
+        amount: Option<u64>,
+        hub: Option<String>,
+    ) -> Result<Vec<PayoutQuote>, LicashError> {
+        let (asked, found) = self.payout_found(&address, amount, hub)?;
+        let mut offers = Vec::new();
+        for provider in found {
+            let url = provider.url.clone();
+            match self.payout_offer(&asked, provider) {
+                Ok(quote) => offers.push(quote),
+                Err(e) => tracing::info!(%url, "no payout offer: {e}"),
             }
-            None => self.fit(&best.url, (&hub, held), address, best.quote)?,
-        };
-        Ok(PayoutQuote {
-            address: address.to_owned(),
-            amount: quote.amount,
-            fee: quote.costs(),
-            hub,
-            provider: best.url,
-            provider_name: best.name,
-            depth: payout_depth(self.wallet.network()),
-        })
+        }
+        match offers.is_empty() {
+            true => Err(no_provider(asked.first)),
+            false => Ok(offers),
+        }
     }
 
     /// Pay out as `quote` says, costing at most its fee: the payout, under
@@ -151,7 +127,104 @@ impl Wallet {
     }
 }
 
+/// A payout asked for ([`Wallet::payout_quote`]).
+struct Asked {
+    address: String,
+    amount: Option<u64>,
+    hub: String,
+    held: u64,
+    /// What the providers were asked to pay out first.
+    first: u64,
+}
+
+fn no_provider(amount: u64) -> LicashError {
+    LicashError::invalid(format!(
+        "no swap provider found pays {amount} sat out on Bitcoin now"
+    ))
+}
+
 impl Wallet {
+    /// The payout asked for, and the providers announced that quote it,
+    /// the one to prefer first.
+    fn payout_found(
+        &self,
+        address: &str,
+        amount: Option<u64>,
+        hub: Option<String>,
+    ) -> Result<(Asked, Vec<licash_nostr::wallet::PayoutProvider>), LicashError> {
+        let address = address.trim();
+        let hub = match hub {
+            Some(hub) => hub,
+            None => self.richest()?,
+        };
+        let held = self.held(&hub)?;
+        let first = amount.unwrap_or_else(|| all_but_fees(held));
+        if first == 0 {
+            return Err(LicashError::Insufficient {
+                needed: held + 1,
+                available: held,
+            });
+        }
+        let relays = hub_relays(&self.wallet)?;
+        if relays.is_empty() {
+            return Err(LicashError::invalid(
+                "no hub you trust names relays to find swap providers on",
+            ));
+        }
+        let limits = (max_fee(first), claim_rate());
+        let found = payout_providers(
+            &self.wallet,
+            &relays,
+            &self.route,
+            (&hub, address),
+            first,
+            limits,
+        );
+        let found = self
+            .runtime
+            .block_on(found)
+            .map_err(|e| LicashError::from_any(e, |reason| LicashError::Unavailable { reason }))?;
+        let asked = Asked {
+            address: address.to_owned(),
+            amount,
+            hub,
+            held,
+            first,
+        };
+        Ok((asked, found))
+    }
+
+    /// The quote of paying out as `asked` through `provider`: all the notes
+    /// at the hub pay, fitted to them, if no amount was asked.
+    fn payout_offer(
+        &self,
+        asked: &Asked,
+        provider: licash_nostr::wallet::PayoutProvider,
+    ) -> Result<PayoutQuote, LicashError> {
+        let hub = &asked.hub;
+        let quote = match asked.amount {
+            Some(_) => {
+                self.wallet.lock_fee(hub, locked(&provider.quote))?;
+                provider.quote
+            }
+            None => self.fit(
+                &provider.url,
+                (hub, asked.held),
+                &asked.address,
+                provider.quote,
+            )?,
+        };
+        Ok(PayoutQuote {
+            address: asked.address.clone(),
+            amount: quote.amount,
+            fee: quote.costs(),
+            hub: hub.clone(),
+            provider: provider.url,
+            provider_name: provider.name,
+            depth: payout_depth(self.wallet.network()),
+        })
+    }
+
     /// The hub trusted holding the most.
     fn richest(&self) -> Result<String, LicashError> {
         let balance = self.wallet.balance()?.into_iter();
