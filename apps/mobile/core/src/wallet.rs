@@ -12,7 +12,7 @@ use licash_nostr::{
     Route,
 };
 use licash_transport::Http;
-use licash_wallet::{DepositState, PaymentCode, MAX_HUBS};
+use licash_wallet::{DepositState, PaymentCode, Unlinking, MAX_HUBS};
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 
@@ -20,8 +20,8 @@ use crate::{
     chain::Chain,
     deliveries::{self, Delivery},
     Activity, Balance, ChainError, ChainSource, Code, ContractTerms, Details, FoundHub, Holding,
-    Hub, InvoiceQuote, Kind, LicashError, LightningInvoice, LightningTerms, Network, Notes,
-    Onchain, Paid, PayOffer, PayQuote, Range, Rate, Scan, Scanned, State,
+    Hub, InvoiceQuote, Kind, LicashError, LightningInvoice, LightningTerms, Linking, Network,
+    NoteLine, Notes, NotesOf, Onchain, Paid, PayOffer, PayQuote, Range, Rate, Scan, Scanned, State,
 };
 
 /// The rate deposits are paid at, in sat/vB: above what nodes relay.
@@ -739,6 +739,60 @@ impl Wallet {
         }
         history.sort_by_key(|a| (a.at.is_some(), std::cmp::Reverse(a.at)));
         Ok(history)
+    }
+
+    /// The notes the line of the history of `kind` and `id` spent, and
+    /// those it made the wallet's: none for a line on Bitcoin alone, nor
+    /// before its notes are locked or taken.
+    pub fn notes_of(&self, kind: Kind, id: String) -> Result<NotesOf, LicashError> {
+        let unknown = || LicashError::invalid(format!("nothing in the history is {id}"));
+        let operation = match kind {
+            Kind::Sent | Kind::Received | Kind::Lightning => Some(id.clone()),
+            Kind::Moved => {
+                let deposit = self.wallet.deposits()?.into_iter().find(|d| d.hash == id);
+                deposit.ok_or_else(unknown)?.lock
+            }
+            Kind::Invoice => {
+                let invoice = self.wallet.invoices()?.into_iter().find(|i| i.hash == id);
+                invoice.ok_or_else(unknown)?.lock
+            }
+            Kind::Payout => {
+                let payout = self.wallet.payouts()?.into_iter().find(|p| p.hash == id);
+                payout.ok_or_else(unknown)?.lock
+            }
+            Kind::Onchain | Kind::Contract => None,
+        };
+        let Some(operation) = operation else {
+            return Ok(NotesOf::default());
+        };
+        let notes = self.wallet.operation_notes(&operation)?;
+        let me = self.wallet.address();
+        let itself: Vec<String> = self
+            .wallet
+            .sends()?
+            .into_iter()
+            .filter(|s| s.payee == me)
+            .map(|s| s.id)
+            .collect();
+        let line = |n: licash_wallet::NoteRecord| NoteLine {
+            made_by_itself: itself.contains(&n.made_by),
+            linking: match n.unlinked {
+                Unlinking::Unlinked => Linking::Unlinked,
+                Unlinking::StaysLinked => Linking::StaysLinked,
+                _ => Linking::Linked,
+            },
+            id: n.id,
+            hub: n.hub,
+            amount: n.amount,
+            made_by: n.made_by,
+            spent_by: n.spent_by,
+            gone: n.gone,
+            added_at: n.added_at,
+        };
+        Ok(NotesOf {
+            spent: notes.spent.into_iter().map(line).collect(),
+            made: notes.made.into_iter().map(line).collect(),
+        })
     }
 
     /// More of the line of the history of `kind` and `id`: what it cost

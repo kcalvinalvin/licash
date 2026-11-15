@@ -38,7 +38,8 @@ use licash_hub_service::{
 };
 use licash_mobile::{
     set_logger, wallet_exists, Activity, Balance, ChainError, ChainSource, Details, Kind,
-    LicashError, Logger, Network, Onchain, PayOffer, PayQuote, Range, Rate, Scanned, State, Wallet,
+    LicashError, Linking, Logger, Network, Onchain, PayOffer, PayQuote, Range, Rate, Scanned,
+    State, Wallet,
 };
 use licash_nostr::{Announcement, Announcer, Role, Route};
 use licash_wallet::PaymentCode;
@@ -1188,6 +1189,56 @@ fn a_phone_pays_a_code_as_quoted() {
     let paid = alice.pay(open.qr, Some(200)).unwrap();
     assert_eq!(paid.amount, 200);
     assert_eq!(notes(&alice), held - 501 - 201);
+}
+
+#[test]
+fn a_phone_shows_the_notes_each_line_of_its_history_spent_and_made() {
+    let net = Net::new(true);
+    let light = Light::new(&net);
+    let alice = funded(&net, &light, "alice");
+    let held = notes(&alice);
+    let history = alice.history().unwrap();
+    let moved = history.iter().find(|a| a.kind == Kind::Moved).unwrap();
+    let got = alice.notes_of(Kind::Moved, moved.id.clone()).unwrap();
+    assert!(got.spent.is_empty(), "{got:?}");
+    assert_eq!(got.made.iter().map(|n| n.amount).sum::<u64>(), held);
+    // Taken, then unlinked from the move.
+    assert!(
+        got.made.iter().all(|n| n.linking == Linking::Unlinked),
+        "{got:?}"
+    );
+    assert!(got
+        .made
+        .iter()
+        .all(|n| !n.made_by_itself && n.spent_by.is_none()));
+
+    let bob = net.wallet("bob", net.height());
+    let asked = bob.payment_code(Some(500)).unwrap();
+    let paid = alice.pay(asked.qr, None).unwrap();
+    let sent = alice.notes_of(Kind::Sent, paid.id.clone()).unwrap();
+    let spent: u64 = sent.spent.iter().map(|n| n.amount).sum();
+    let change: u64 = sent.made.iter().map(|n| n.amount).sum();
+    assert_eq!(spent, 501 + change, "{sent:?}");
+    assert!(sent
+        .spent
+        .iter()
+        .all(|n| n.spent_by.as_ref() == Some(&paid.id)));
+    assert!(sent.made.iter().all(|n| n.made_by == paid.id));
+    let after = alice.notes_of(Kind::Moved, moved.id.clone()).unwrap().made;
+    let by = after
+        .iter()
+        .filter(|n| n.spent_by.as_ref() == Some(&paid.id));
+    assert_eq!(by.count(), sent.spent.len());
+
+    // A coin on Bitcoin alone: no notes; a line of none: refused.
+    let coin = history.iter().find(|a| a.kind == Kind::Onchain);
+    if let Some(coin) = coin {
+        assert_eq!(
+            alice.notes_of(Kind::Onchain, coin.id.clone()).unwrap(),
+            Default::default()
+        );
+    }
+    assert!(alice.notes_of(Kind::Moved, "00".repeat(32)).is_err());
 }
 
 #[test]

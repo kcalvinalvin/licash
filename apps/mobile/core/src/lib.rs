@@ -470,6 +470,47 @@ pub struct LightningInvoice {
     pub reason: Option<String>,
 }
 
+/// The notes one line of the history spent, and those it made the
+/// wallet's ([`Wallet::notes_of`]), the largest first.
+#[derive(Clone, Debug, Default, PartialEq, Eq, uniffi::Record)]
+pub struct NotesOf {
+    pub spent: Vec<NoteLine>,
+    pub made: Vec<NoteLine>,
+}
+
+/// A note the wallet holds or held.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct NoteLine {
+    /// Its identifier at its hub, in hex: the same once unlinked.
+    pub id: String,
+    pub hub: String,
+    pub amount: u64,
+    /// The payment, lock or receipt that made it, in hex.
+    pub made_by: String,
+    /// Made by a payment of the wallet to itself, for notes of the
+    /// amounts it needed: not a line of the history.
+    pub made_by_itself: bool,
+    /// The payment or lock that spends it, in hex, if any.
+    pub spent_by: Option<String>,
+    pub linking: Linking,
+    /// Spent by a copy of the wallet, as its hub showed: never here.
+    pub gone: bool,
+    /// When the wallet got it, in seconds since the Unix epoch.
+    pub added_at: i64,
+}
+
+/// Whether a note's hub can tell which payment it came from when it is
+/// spent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum Linking {
+    /// As issued: its hub can tell. The wallet unlinks it next time.
+    Linked,
+    /// Signed again blindly by its hub: it cannot tell.
+    Unlinked,
+    /// Its hub refused to unlink it: it stays linked.
+    StaysLinked,
+}
+
 /// A payment made.
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct Paid {
