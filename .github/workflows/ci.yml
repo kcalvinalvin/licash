@@ -185,6 +185,9 @@ jobs:
         with:
           api-level: 34
           arch: x86_64
+          # The phone the test is written on: with no profile, a 320x640 dp
+          # screen, too small for the buttons it taps without scrolling.
+          profile: pixel_6
           disable-animations: true
           # As the test is run locally: typed through a hardware keyboard,
           # with no on-screen keyboard covering the buttons it taps.
