@@ -786,6 +786,23 @@ impl Deposits {
     pub fn pays(&self, amount: u64) -> Option<u64> {
         amount.checked_add(self.fee.due(amount))
     }
+
+    /// The notes a deposit paying exactly `pays` on Bitcoin locks, its fee
+    /// in it: none if none does, rounding the fee up leaving a gap there,
+    /// whatever the limits.
+    pub fn paid_by(&self, pays: u64) -> Option<u64> {
+        // It and its fee only grow with it: the last at most `pays`, found
+        // halving, then the one if it comes to `pays` exactly.
+        let (mut low, mut high) = (0, pays);
+        while low < high {
+            let mid = low + (high - low).div_ceil(2);
+            match self.pays(mid) {
+                Some(paid) if paid <= pays => low = mid,
+                _ => high = mid - 1,
+            }
+        }
+        (self.pays(low) == Some(pays)).then_some(low)
+    }
 }
 
 /// Ask for a deposit: an address on Bitcoin whose payment locks the hub's

@@ -559,6 +559,85 @@ async fn deposits_paid_wrong_late_or_never_lock_nothing_and_are_refunded() {
 }
 
 #[tokio::test]
+async fn a_deposit_paid_an_amount_exactly_is_given_up_unpaid_or_refunded_once_due() {
+    let net = Net::new().await;
+    let alice = net.wallet("alice");
+    // Paid 3,100 exactly: 3,000 in notes, the hub's 100 in it.
+    let paid = alice.deposit_paying(HUB, 3_100).await.unwrap();
+    let terms = paid.terms.clone().unwrap();
+    assert_eq!((paid.amount, terms.pays), (3_000, 3_100));
+    // No notes within its limits come to it, the fee in it.
+    for pays in [50, 1_099, 4_101] {
+        let refused = alice.deposit_paying(HUB, pays).await;
+        assert!(
+            matches!(refused, Err(licash_wallet::Error::Invalid(_))),
+            "{refused:?}"
+        );
+    }
+    // Given up unpaid, once.
+    let unpaid = alice.deposit_paying(HUB, 2_100).await.unwrap();
+    alice
+        .give_up_deposit(&unpaid.hash, "its F given up")
+        .unwrap();
+    let state = alice.deposit_of(&unpaid.hash).unwrap().state;
+    assert_eq!(state, DepositState::Canceled("its F given up".into()));
+    assert!(alice.give_up_deposit(&unpaid.hash, "again").is_err());
+
+    // Paid, seen by its hub: not given up.
+    let tx = payment(&terms.address, 3_100, 1);
+    net.mine(1, vec![tx.clone()]);
+    net.deposits.round().await;
+    let seen = alice.follow_deposit(&paid.hash).await.unwrap();
+    let funding = OutPoint {
+        txid: tx.compute_txid(),
+        vout: 0,
+    };
+    assert_eq!(seen.funding.map(|(f, _)| f), Some(funding));
+    assert!(alice.give_up_deposit(&paid.hash, "too late").is_err());
+    // At depth its notes are locked, and left unclaimed until the hub
+    // takes them back: canceled.
+    net.mine(1, Vec::new());
+    net.deposits.round().await;
+    for _ in 0..8 {
+        net.mine(1, Vec::new());
+        net.deposits.round().await;
+    }
+    let over = alice.follow_deposit(&paid.hash).await.unwrap();
+    assert!(
+        matches!(over.state, DepositState::Canceled(_)),
+        "{:?}",
+        over.state
+    );
+    assert_eq!(over.funding.map(|(f, _)| f), Some(funding));
+    assert_eq!(available(&alice), 0);
+
+    // Due once past its timeout, with the payment its hub saw; the one
+    // given up too, unpaid as far as the wallet knows.
+    let due = |tip| -> Vec<String> {
+        let due = alice.deposits_to_refund(tip).unwrap();
+        due.into_iter().map(|d| d.hash).collect()
+    };
+    assert!(due(terms.timeout - 1).is_empty());
+    let both = due(terms.timeout + 1);
+    assert!(
+        both.contains(&paid.hash) && both.contains(&unpaid.hash),
+        "{both:?}"
+    );
+    assert_eq!(alice.deposit_refund(&paid.hash).unwrap(), None);
+    let to = payment(&terms.address, 0, 0).output[0]
+        .script_pubkey
+        .clone();
+    let rate = FeeRate::from_sat_per_vb_u32(1);
+    let value = Amount::from_sat(3_100);
+    let refund = alice
+        .refund_deposit(&paid.hash, funding, value, to, rate)
+        .unwrap();
+    assert_eq!(alice.deposit_refund(&paid.hash).unwrap(), Some(refund));
+    assert_eq!(due(terms.timeout + 1), std::slice::from_ref(&unpaid.hash));
+    assert!(alice.deposit_refund("00").is_err());
+}
+
+#[tokio::test]
 async fn a_payment_reorganized_away_locks_nothing_and_one_locked_alerts() {
     let net = Net::new().await;
     let alice = net.wallet("alice");

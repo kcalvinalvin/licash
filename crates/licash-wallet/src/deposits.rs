@@ -124,6 +124,55 @@ impl<T: Transport> Wallet<T> {
         self.advance_deposit(&asked.hash).await
     }
 
+    /// Ask the hub at `url` for a deposit paid exactly `pays` on Bitcoin,
+    /// its fee in it: the notes it locks are what the fee leaves. To pay at
+    /// once, in a transaction made with its address (a contract's funding
+    /// paying its change in, say): recorded only with the terms its hub
+    /// answered, checked. Refused if no notes within the hub's limits come,
+    /// with its fee, to `pays` exactly.
+    pub async fn deposit_paying(&self, url: &str, pays: u64) -> Result<Deposit, Error> {
+        let url = hub_url(url)?;
+        self.not_visited(&url)?;
+        let (hub, info) = self.refresh(&url).await?;
+        let deposits = info
+            .deposits
+            .as_ref()
+            .ok_or_else(|| Error::Invalid(format!("hub {url} takes no deposits")))?;
+        let amount = deposits
+            .paid_by(pays)
+            .filter(|a| (deposits.min..=deposits.max).contains(a))
+            .ok_or_else(|| {
+                Error::Invalid(format!(
+                    "hub {url} takes no deposit paid {pays} sat exactly, its fee in it"
+                ))
+            })?;
+        self.deposit_answered(hub, &info, amount).await
+    }
+
+    /// Give up the deposit of `hash`, answered but never to be paid: the
+    /// transaction to pay it given up unmade, `why`. Refused once its hub
+    /// saw a payment to it, or the deposit is over. One made all the same
+    /// returns after its timeout ([`Wallet::deposits_to_refund`]).
+    pub fn give_up_deposit(&self, hash: &str, why: &str) -> Result<(), Error> {
+        let key = hash_id(hash)?;
+        let given_up = self.store.write(|tx| {
+            Ok(tx.execute(
+                "UPDATE deposits SET canceled = ?2
+                 WHERE hash = ?1 AND txid IS NULL AND lock IS NULL
+                    AND done_at IS NULL AND canceled IS NULL AND refund IS NULL",
+                params![key, why],
+            )?)
+        })?;
+        if given_up == 0 {
+            self.deposit_record(&key)?;
+            return Err(Error::Invalid(format!(
+                "deposit {hash} is paid or over: not given up"
+            )));
+        }
+        tracing::info!(%hash, why, "deposit given up unpaid");
+        Ok(())
+    }
+
     /// Ask the hub `hub`, which says `info` of itself, for a deposit of
     /// notes worth `amount`, to pay at once: recorded only with the terms
     /// it answered, checked, as none pays a deposit its hub never answered.
@@ -509,6 +558,37 @@ impl<T: Transport> Wallet<T> {
 }
 
 impl<T: Transport> Wallet<T> {
+    /// The deposits whose coins, if paid, may be taken back at `tip`
+    /// ([`Wallet::refund_deposit`]): canceled, their notes never claimed,
+    /// an address named, past their timeout, not taken back yet. Paid or
+    /// not: [`Deposit::funding`] is the payment its hub saw, none for one
+    /// it did not (made too late, say), which only its payer knows of.
+    pub fn deposits_to_refund(&self, tip: u32) -> Result<Vec<Deposit>, Error> {
+        let mut due = self.deposits()?;
+        due.retain(|d| {
+            let past = d.terms.as_ref().is_some_and(|t| tip >= t.timeout);
+            past && matches!(d.state, DepositState::Canceled(_))
+        });
+        Ok(due)
+    }
+
+    /// The refund made of the deposit of `hash`, if one was: to hand the
+    /// network again until it confirms.
+    pub fn deposit_refund(&self, hash: &str) -> Result<Option<Transaction>, Error> {
+        let key = hash_id(hash)?;
+        let raw: Option<Option<Vec<u8>>> = self.store.read(|c| {
+            Ok(
+                c.query_row("SELECT refund FROM deposits WHERE hash = ?1", [key], |r| {
+                    r.get(0)
+                })
+                .optional()?,
+            )
+        })?;
+        let raw = raw.ok_or_else(|| Error::UnknownPayment(hash.to_owned()))?;
+        raw.map(|tx| bitcoin::consensus::deserialize(&tx).map_err(invalid))
+            .transpose()
+    }
+
     /// The deposits asked for, newest first.
     pub fn deposits(&self) -> Result<Vec<Deposit>, Error> {
         self.store.read(|c| {

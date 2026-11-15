@@ -812,3 +812,34 @@ fn a_hubs_contract_range_is_left_out_when_none_and_prices_the_cap_by_the_year() 
     assert_eq!(range.max_cap_for(2_047), None);
     assert_eq!(range.max_cap_for(u64::MAX), Some(100_000_000));
 }
+
+#[test]
+fn a_deposit_paying_an_amount_exactly_locks_what_its_fee_leaves() {
+    use licash_api::Deposits;
+    let deposits = |base, ppm| Deposits {
+        fee: Fee { base, ppm },
+        min: 10_000,
+        max: 1_000_000,
+        depth: 3,
+        window: 144,
+        timeout: 288,
+    };
+    let flat = deposits(1_000, 0);
+    assert_eq!(flat.paid_by(9_981_000), Some(9_980_000));
+    assert_eq!(flat.paid_by(1_000), Some(0));
+    assert_eq!(flat.paid_by(999), None);
+    let both = deposits(500, 1_000);
+    assert_eq!(both.paid_by(100_600), Some(100_000));
+    // Its fee rounded up: no amount comes to some, each gap a sat wide.
+    let rate = deposits(0, 10);
+    assert_eq!(rate.paid_by(100_001), Some(100_000));
+    assert_eq!(rate.paid_by(100_002), None);
+    assert_eq!(rate.paid_by(100_003), Some(100_001));
+    for pays in [0, 1, 499, 500, 501, 10_510, 1_000_000, 21_000_000_000_000] {
+        match both.paid_by(pays) {
+            Some(amount) => assert_eq!(both.pays(amount), Some(pays)),
+            None => assert!(pays > 2_000_000 || (0..=pays).all(|a| both.pays(a) != Some(pays))),
+        }
+    }
+    assert_eq!(deposits(0, 0).paid_by(u64::MAX), Some(u64::MAX));
+}
