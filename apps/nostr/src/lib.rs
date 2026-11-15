@@ -369,19 +369,44 @@ pub async fn discover(
     Ok(found)
 }
 
+/// How long the other relays have to connect once one did: those slower
+/// are left out, rather than hold up whoever waits (a payment being sent,
+/// providers being looked for, or the wallet, as it looks in its mailbox).
+/// One that never answers would take the route's whole timeout, and over
+/// Tor some often do not (an onion service gone, a relay blocking Tor).
+const GRACE: Duration = Duration::from_secs(4);
+
 /// The relays of `client` that connected in time, to ask only them: the
-/// others would hold the answer up. Fails if none did.
+/// first within the route's timeout, the others within [`GRACE`] of it.
+/// Fails if none did.
 async fn connected(client: &Client, route: &Route) -> anyhow::Result<Vec<RelayUrl>> {
-    let connected = client.try_connect().timeout(route.timeout()).await;
-    if connected.success.is_empty() {
-        let failed: Vec<String> = connected
-            .failed
-            .iter()
-            .map(|(relay, e)| format!("{relay}: {e}"))
-            .collect();
+    let timeout = route.timeout();
+    let mut trying = tokio::task::JoinSet::new();
+    for (url, relay) in client.relays().await {
+        trying.spawn(async move { (url, relay.try_connect().timeout(timeout).await) });
+    }
+    let mut until = tokio::time::Instant::now() + timeout;
+    let (mut connected, mut failed) = (Vec::new(), Vec::new());
+    while let Ok(Some(tried)) = tokio::time::timeout_at(until, trying.join_next()).await {
+        match tried {
+            Ok((url, Ok(()))) => {
+                if connected.is_empty() {
+                    until = until.min(tokio::time::Instant::now() + GRACE);
+                }
+                connected.push(url);
+            }
+            Ok((url, Err(e))) => failed.push(format!("{url}: {e}")),
+            Err(e) => failed.push(format!("a relay: {e}")),
+        }
+    }
+    // Those still trying end with the set, dropped.
+    if connected.is_empty() {
+        if failed.is_empty() {
+            failed.push(format!("none in {} s", timeout.as_secs()));
+        }
         anyhow::bail!("no Nostr relay answered: {}", failed.join("; "));
     }
-    Ok(connected.success.into_keys().collect())
+    Ok(connected)
 }
 
 /// `event`, if a valid, unexpired announcement of `role` for `network`.

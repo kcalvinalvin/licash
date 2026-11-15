@@ -59,8 +59,14 @@ pub async fn send(
         .finalize(&sealer)
         .context("gift wrap the payment")?;
     let client = client(relays, route, Some(sealer)).await?;
-    client.connect().and_wait(route.timeout()).await;
-    let sent = client.send_event(&wrap).await;
+    // To those that connected in time only: one down would hold it up.
+    let sent = match connected(&client, route).await {
+        Ok(relays) => client.send_event(&wrap).to(relays).await,
+        Err(e) => {
+            client.shutdown().await;
+            return Err(e);
+        }
+    };
     client.shutdown().await;
     let sent = sent.context("send to the mailbox")?;
     if sent.success.is_empty() {

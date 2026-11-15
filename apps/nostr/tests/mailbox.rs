@@ -107,3 +107,47 @@ async fn a_mailbox_no_relay_answers_for_fails() {
     assert!(sent.is_err());
     assert!(mailbox::fetch(&[1; 32], &[], &Route::Direct).await.is_err());
 }
+
+/// A relay that takes connections and never answers: the WebSocket
+/// handshake waits on it until the route's timeout.
+async fn silent_relay() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            held.push(stream);
+        }
+    });
+    url
+}
+
+#[tokio::test]
+async fn a_relay_that_never_answers_holds_nothing_up() {
+    let relay = MockRelay::run().await.unwrap();
+    let relays = [relay.url().await.to_string(), silent_relay().await];
+    let alice = [1; 32];
+    // Direct, a relay has 10 s to connect: the one answering is enough,
+    // the other given a few seconds once it did.
+    let to = mailbox(alice);
+    let started = std::time::Instant::now();
+    let sent = mailbox::send(&to, r#"{"paid":1}"#, &relays, &Route::Direct);
+    assert_eq!(sent.await.unwrap(), 1);
+    let mail = mailbox::fetch(&alice, &relays, &Route::Direct)
+        .await
+        .unwrap();
+    assert_eq!(mail.len(), 1);
+    let took = started.elapsed();
+    assert!(took < Duration::from_secs(12), "{took:?}");
+}
+
+#[tokio::test]
+async fn no_relay_answering_fails_in_the_routes_time() {
+    let relays = [silent_relay().await];
+    let to = mailbox([1; 32]);
+    let started = std::time::Instant::now();
+    let sent = mailbox::send(&to, "{}", &relays, &Route::Direct).await;
+    let why = format!("{:#}", sent.unwrap_err());
+    assert!(why.contains("no Nostr relay answered"), "{why}");
+    assert!(started.elapsed() < Duration::from_secs(15));
+}
