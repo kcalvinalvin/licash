@@ -41,7 +41,9 @@ import org.licash.core.Linking
 import org.licash.core.LockStep
 import org.licash.core.NoteLine
 import org.licash.core.NotesOf
+import org.licash.core.NotesPaid
 import org.licash.core.Onchain
+import org.licash.core.PaidTo
 import org.licash.core.PayoutSteps
 import org.licash.core.State
 import org.licash.wallet.AppLog
@@ -144,7 +146,7 @@ fun ActivityDetails(engine: Engine, ui: Ui, shown: Activity, back: () -> Unit) {
         }
         if (ui.developer) {
             Technical(activity, details, copy)
-            notes?.takeIf { it.spent.isNotEmpty() || it.made.isNotEmpty() }?.let { NotesGroup(it, copy) }
+            notes?.takeIf { it.spent.isNotEmpty() || it.made.isNotEmpty() }?.let { NotesGroup(activity, it, copy) }
         }
         Spacer(Modifier.height(48.dp))
     }
@@ -545,12 +547,13 @@ private fun Technical(activity: Activity, details: Details?, copy: (String, Stri
 }
 
 /**
- * The notes it spent and those it made the wallet's, in advanced mode:
- * each one's hub, and whether its hub can still tell which payment it came
- * from. A tap copies a note's identifier.
+ * The notes in and out, in advanced mode: those it spent, whom they paid
+ * and what it kept, and those it made the wallet's, each with its hub and
+ * whether its hub can still tell which payment it came from. A tap copies
+ * a note's identifier.
  */
 @Composable
-private fun NotesGroup(notes: NotesOf, copy: (String, String) -> Unit) {
+private fun NotesGroup(activity: Activity, notes: NotesOf, copy: (String, String) -> Unit) {
     Group("Notes") {
         val made = notes.made
         val unlinked = made.count { it.linking == Linking.UNLINKED }
@@ -567,13 +570,59 @@ private fun NotesGroup(notes: NotesOf, copy: (String, String) -> Unit) {
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
         if (notes.spent.isNotEmpty()) {
-            Text("Spent", Modifier.padding(top = 8.dp), style = MaterialTheme.typography.titleSmall)
+            Text("In: spent", Modifier.padding(top = 8.dp), style = MaterialTheme.typography.titleSmall)
             notes.spent.forEach { NoteRow(it, spentHere = true, copy = copy) }
         }
+        if (notes.paid.isNotEmpty()) {
+            Text("Out: paid and kept", Modifier.padding(top = 8.dp), style = MaterialTheme.typography.titleSmall)
+            if (activity.state == State.PENDING) {
+                Text(
+                    if (activity.kind == Kind.SENT) "Once its hub releases it."
+                    else "Once paid. Refunded instead, the notes come back less the hub's refund fee.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            notes.paid.forEach { PaidRow(activity.kind, it) }
+        }
         if (made.isNotEmpty()) {
-            Text("Made", Modifier.padding(top = 8.dp), style = MaterialTheme.typography.titleSmall)
+            Text(
+                if (notes.paid.isEmpty()) "In: made the wallet's" else "Made the wallet's",
+                Modifier.padding(top = 8.dp),
+                style = MaterialTheme.typography.titleSmall,
+            )
             made.forEach { NoteRow(it, spentHere = false, copy = copy) }
         }
+    }
+}
+
+/** Part of what the notes spent paid: to whom, how much, in which notes. */
+@Composable
+private fun PaidRow(kind: Kind, part: NotesPaid) {
+    val to = when (part.to) {
+        PaidTo.PAYEE -> when (kind) {
+            Kind.LIGHTNING -> "To the invoice, through the hub"
+            Kind.PAYOUT, Kind.SWAP -> "To the provider"
+            else -> "To the payee"
+        }
+        PaidTo.ITSELF -> "To this wallet"
+        PaidTo.HUB -> "The hub's fee"
+        PaidTo.KEPT -> "Kept"
+    }
+    Row(Modifier.fillMaxWidth().padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+        Column(Modifier.weight(1f)) {
+            Text(to, style = MaterialTheme.typography.bodyLarge)
+            val each = part.notes.joinToString(" + ") { digits(it) }
+            val what = if (part.notes.size == 1) "1 note" else "${part.notes.size} notes"
+            Text(
+                listOfNotNull(host(part.hub), each.takeIf { it.isNotEmpty() }?.let { "$what: $it" })
+                    .joinToString(" · "),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        Spacer(Modifier.width(12.dp))
+        Text(sat(part.amount), style = MaterialTheme.typography.bodyLarge)
     }
 }
 
