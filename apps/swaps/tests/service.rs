@@ -145,8 +145,18 @@ fn init_creates_the_provider_once_and_status_reads_it() {
     assert_eq!(status["network"], "bitcoin");
     assert_eq!(status["stats"]["open"], 0);
     assert_eq!(status["swaps"], serde_json::json!([]));
+    // Read by a person: what it earned first, in sat; what it did, in words.
     let text = licash_swaps(&dir, &["status"]);
-    assert!(String::from_utf8(text.stdout).unwrap().contains("earned"));
+    let text = String::from_utf8(text.stdout).unwrap();
+    assert!(text.starts_with("earned "), "{text}");
+    let said = |label: &str| {
+        let line = text.lines().find(|l| l.starts_with(label));
+        line.map(|l| l[label.len()..].trim().to_owned())
+    };
+    assert_eq!(said("earned").as_deref(), Some("0 sat"), "{text}");
+    assert_eq!(said("swaps").as_deref(), Some("none"), "{text}");
+    assert_eq!(said("lost").as_deref(), Some("none"), "{text}");
+    assert_eq!(said("address").as_deref(), Some(address.trim()), "{text}");
     let events = licash_swaps(&dir, &["events"]);
     assert!(events.status.success() && events.stdout.is_empty());
     // An address on Bitcoin to fund payouts at, watched from a first block,

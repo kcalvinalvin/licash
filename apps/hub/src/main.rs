@@ -1411,18 +1411,30 @@ fn status(db: &Path, json: bool) -> anyhow::Result<()> {
         println!("{}", serde_json::to_string(&stats)?);
         return Ok(());
     }
+    // What it earned first, then what it did.
+    let n = |v: u64| licash_dashboard::grouped(v as i64);
     for (name, value) in [
-        ("offers", stats.offers),
-        ("released", stats.released),
-        ("locks", stats.locks),
-        ("open_locks", stats.open_locks),
-        ("spent", stats.spent),
-        ("issued", stats.issued),
-        ("unlinked", stats.unlinked),
-        ("income", stats.income),
-        ("events", stats.events),
+        ("income", format!("{} sat", n(stats.income))),
+        (
+            "offers",
+            format!("{}, {} released", n(stats.offers), n(stats.released)),
+        ),
+        (
+            "locks",
+            format!("{}, {} open", n(stats.locks), n(stats.open_locks)),
+        ),
+        (
+            "notes",
+            format!(
+                "{} issued, {} spent, {} unlinked",
+                n(stats.issued),
+                n(stats.spent),
+                n(stats.unlinked)
+            ),
+        ),
+        ("events", n(stats.events)),
     ] {
-        println!("{name:<10} {value}");
+        println!("{name:<6}  {value}");
     }
     Ok(())
 }

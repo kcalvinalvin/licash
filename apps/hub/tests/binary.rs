@@ -118,6 +118,13 @@ fn a_hub_is_created_run_watched_and_stopped() {
     assert!(String::from_utf8_lossy(&again.stderr).contains("exists"));
     assert_eq!(stats(&data)["offers"], 0);
     assert_eq!(stats(&data)["events"], 0);
+    // Read by a person: what it earned first, in sat, then what it did.
+    let text = stdout(&data, &["status"]);
+    assert!(text.starts_with("income  0 sat\n"), "{text}");
+    assert!(
+        text.contains("\nnotes   0 issued, 0 spent, 0 unlinked\n"),
+        "{text}"
+    );
 
     let port = free_port();
     let listen = format!("127.0.0.1:{port}");

@@ -17,6 +17,7 @@ use licash_nostr::Route;
 use licash_notify::{Message, Priority, Target};
 use licash_swaps::{Config, Provider};
 use licash_swaps_service::{
+    dashboard,
     notify::{self, Notifier},
     ChainView,
 };
@@ -777,30 +778,78 @@ fn status(data: &Path, json: bool, latest: u32) -> anyhow::Result<()> {
         println!("{status}");
         return Ok(());
     }
-    println!("address     {address}");
-    println!("network     {network}");
-    for (name, value) in [
-        ("open", stats.open),
-        ("done", stats.done),
-        ("refunded", stats.refunded),
-        ("failed", stats.failed),
-        ("lost", stats.lost),
-        ("earned", stats.earned),
-        ("lost_amount", stats.lost_amount),
-        ("events", stats.events),
-    ] {
-        println!("{name:<11} {value}");
-    }
+    // What it earned first, then what it did and holds; who it is last.
+    let n = |v: u64| licash_dashboard::grouped(v as i64);
+    let sat = |v: u64| format!("{} sat", n(v));
+    let done: Vec<String> = [
+        (stats.done, "done"),
+        (stats.open, "open"),
+        (stats.refunded, "refunded"),
+        (stats.failed, "failed"),
+    ]
+    .into_iter()
+    .filter(|(count, _)| *count > 0)
+    .map(|(count, what)| format!("{} {what}", n(count)))
+    .collect();
+    let mut rows = vec![
+        ("earned".to_owned(), sat(stats.earned)),
+        (
+            "swaps".to_owned(),
+            match done.is_empty() {
+                true => "none".to_owned(),
+                false => done.join(", "),
+            },
+        ),
+        (
+            "lost".to_owned(),
+            match stats.lost {
+                0 => "none".to_owned(),
+                1 => format!("1 swap, {}", sat(stats.lost_amount)),
+                count => format!("{} swaps, {}", n(count), sat(stats.lost_amount)),
+            },
+        ),
+    ];
     for b in &balance {
-        println!(
-            "hub         {} available {} pending {}",
-            b.hub, b.available, b.pending
-        );
+        let pending = match b.pending {
+            0 => String::new(),
+            p => format!(", {} pending", sat(p)),
+        };
+        rows.push((
+            dashboard::short(&b.hub),
+            format!("{}{pending}", sat(b.available)),
+        ));
     }
     if onchain > 0 || payouts > 0 {
-        println!("onchain     {onchain} free {free} payouts {payouts}");
+        rows.push((
+            "on Bitcoin".to_owned(),
+            format!(
+                "{}, {} free, {payouts} payouts open",
+                sat(onchain),
+                sat(free)
+            ),
+        ));
     }
-    for s in &swaps {
+    rows.push(("events".to_owned(), n(stats.events)));
+    rows.push(("network".to_owned(), network.to_string()));
+    rows.push(("address".to_owned(), address));
+    let width = rows
+        .iter()
+        .map(|(l, _)| l.chars().count())
+        .max()
+        .unwrap_or(0);
+    for (label, value) in &rows {
+        println!("{label:<width$}  {value}");
+    }
+    // The latest swaps, a line each.
+    let amounts: Vec<String> = swaps
+        .iter()
+        .map(|s| format!("{}, fee {}", sat(s.amount), sat(s.fee)))
+        .collect();
+    let wide = amounts.iter().map(|a| a.chars().count()).max().unwrap_or(0);
+    if !swaps.is_empty() {
+        println!();
+    }
+    for (s, amount) in swaps.iter().zip(&amounts) {
         let stage = serde_json::to_value(s.stage)?;
         let stage = stage.as_str().unwrap_or_default();
         let reason = s
@@ -809,12 +858,10 @@ fn status(data: &Path, json: bool, latest: u32) -> anyhow::Result<()> {
             .map(|r| format!(" ({r})"))
             .unwrap_or_default();
         println!(
-            "swap        {} {stage:<8} {} fee {} {} -> {}{reason}",
-            &s.id[..16],
-            s.amount,
-            s.fee,
-            s.from,
-            s.to
+            "{}…  {stage:<8}  {amount:<wide$}  {} → {}{reason}",
+            &s.id[..8],
+            dashboard::short(&s.from),
+            dashboard::short(&s.to),
         );
     }
     Ok(())

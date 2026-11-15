@@ -287,7 +287,7 @@ fn read_coins(c: &Connection, version: i64) -> Result<Option<Vec<i64>>> {
 }
 
 /// A hub's URL as a label: its host, an onion's shortened.
-pub(crate) fn short(url: &str) -> String {
+pub fn short(url: &str) -> String {
     if url.starts_with("bitcoin:") {
         return "on-chain".to_owned();
     }
