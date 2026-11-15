@@ -9,6 +9,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
@@ -29,6 +30,7 @@ import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
 import org.licash.core.InvoiceQuote
 import org.licash.core.LicashException
+import org.licash.core.PayoutQuote
 import org.licash.core.Scanned
 import org.licash.core.State
 import org.licash.wallet.Engine
@@ -41,7 +43,11 @@ private sealed interface Step {
     data object Looking : Step
     data class Paying(val code: String, val asked: ULong?) : Step
     data class Invoice(val text: String, val quote: InvoiceQuote) : Step
+    data class Address(val address: String) : Step
+    data class Payout(val quote: PayoutQuote) : Step
     data object Busy : Step
+    data object Quoting : Step
+    data class PayingOut(val amount: ULong, val depth: UInt) : Step
     data class Sent(val amount: ULong, val handover: String?) : Step
     data class Paid(val amount: ULong, val fee: ULong) : Step
     data object Later : Step
@@ -50,9 +56,12 @@ private sealed interface Step {
     data class Failed(val why: String) : Step
 }
 
-/** Scan or paste: a code to pay, or a payment handed over to take. */
+/**
+ * Scan or paste: a code to pay, or a payment handed over to take; with
+ * `cashOut`, a hub, a Bitcoin address to pay all the notes there out to.
+ */
 @Composable
-fun Send(engine: Engine, ui: Ui, link: String?, back: () -> Unit) {
+fun Send(engine: Engine, ui: Ui, link: String?, cashOut: String? = null, back: () -> Unit) {
     val scope = rememberCoroutineScope()
     val clipboard = LocalClipboard.current
     // Opened with a link: no camera to start.
@@ -75,23 +84,43 @@ fun Send(engine: Engine, ui: Ui, link: String?, back: () -> Unit) {
         scope.launch { step = taking(payment, trust) }
     }
 
+    suspend fun quoting(address: String, amount: ULong?): Step {
+        step = Step.Quoting
+        return engine.payoutQuote(address, amount, cashOut).fold(
+            { Step.Payout(it) },
+            { Step.Failed(explain(it)) },
+        )
+    }
+
+    fun quote(address: String, amount: ULong?) {
+        scope.launch { step = quoting(address, amount) }
+    }
+
     fun read(text: String) {
         step = Step.Busy
         scope.launch {
             step = engine.scanned(text).fold(
                 { scanned ->
-                    when (scanned) {
-                        is Scanned.Code -> when {
-                            scanned.notes -> Step.Paying(text, scanned.amount)
-                            else -> Step.Failed(
-                                "This code names no hub you use: paying it on Bitcoin is not in the app yet.",
-                            )
+                    when {
+                        // Cashing out: all to an address, nothing else.
+                        cashOut != null -> when (scanned) {
+                            is Scanned.Bitcoin -> quoting(scanned.address, null)
+                            else -> Step.Failed("To cash out, scan or paste a Bitcoin address.")
                         }
-                        is Scanned.Payment -> taking(text, false)
-                        is Scanned.Invoice -> engine.invoiceQuote(text).fold(
+                        scanned is Scanned.Code -> when {
+                            scanned.notes -> Step.Paying(text, scanned.amount)
+                            else -> Step.Failed("This code names no hub you use, and no Bitcoin address to pay.")
+                        }
+                        scanned is Scanned.Bitcoin -> when (val asked = scanned.amount) {
+                            null -> Step.Address(scanned.address)
+                            else -> quoting(scanned.address, asked)
+                        }
+                        scanned is Scanned.Payment -> taking(text, false)
+                        scanned is Scanned.Invoice -> engine.invoiceQuote(text).fold(
                             { Step.Invoice(text, it) },
                             { Step.Failed(explain(it)) },
                         )
+                        else -> Step.Failed("Nothing to pay there.")
                     }
                 },
                 { Step.Failed(explain(it)) },
@@ -119,11 +148,29 @@ fun Send(engine: Engine, ui: Ui, link: String?, back: () -> Unit) {
         }
     }
 
+    fun payOut(quote: PayoutQuote) {
+        step = Step.Busy
+        scope.launch {
+            step = engine.payOut(quote).fold(
+                { Step.PayingOut(it.amount, quote.depth) },
+                { Step.Failed(explain(it)) },
+            )
+        }
+    }
+
     LaunchedEffect(link) { link?.let { read(it) } }
     Column(Modifier.fillMaxSize().padding(horizontal = 24.dp)) {
-        TopBar("Send", back)
+        TopBar(if (cashOut == null) "Send" else "Cash out", back)
         when (val s = step) {
             Step.Looking -> {
+                if (cashOut != null) {
+                    Text(
+                        "All you hold at ${host(cashOut)}, paid out on Bitcoin. Scan or paste the address to pay.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Spacer(Modifier.height(12.dp))
+                }
                 Scanner(Modifier.fillMaxWidth().aspectRatio(1f).clip(RoundedCornerShape(24.dp))) { read(it) }
                 Spacer(Modifier.height(16.dp))
                 OutlinedButton(
@@ -138,7 +185,15 @@ fun Send(engine: Engine, ui: Ui, link: String?, back: () -> Unit) {
             }
             is Step.Paying -> Paying(ui, s, asking, { asking = it }) { amount -> pay(s.code, amount) }
             Step.Busy -> Middle("One moment…")
+            Step.Quoting -> Middle("Finding a provider to pay it on Bitcoin…")
             is Step.Invoice -> Invoice(s.quote) { payInvoice(s.text, s.quote.hub) }
+            is Step.Address -> ToAddress(s.address, asking, { asking = it }) { amount -> quote(s.address, amount) }
+            is Step.Payout -> Payout(s.quote) { payOut(s.quote) }
+            is Step.PayingOut -> Told(
+                "Sending ${sat(s.amount)} on Bitcoin. It reaches the address in about " +
+                    "${(s.depth.toInt() + 1) * 10} minutes; your history shows how far it got.",
+                back,
+            )
             is Step.Paid -> Done("Paid ${sat(s.amount)}, ${sat(s.fee)} in fees", back)
             is Step.Sent -> Sent(s, back)
             // Not to pay again: it finishes by itself.
@@ -210,6 +265,68 @@ private fun Invoice(quote: InvoiceQuote, pay: () -> Unit) {
     }
 }
 
+/** A Bitcoin address to pay: how much, or all. */
+@Composable
+private fun ToAddress(address: String, asking: Boolean, ask: (Boolean) -> Unit, quote: (ULong?) -> Unit) {
+    var amount by remember { mutableStateOf<Long?>(null) }
+    Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
+        Spacer(Modifier.height(48.dp))
+        Text(amount?.let { sat(it.toULong()) } ?: "How much?", style = Figures)
+        Text(
+            "To ${shortAddress(address)}, on Bitcoin",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Spacer(Modifier.height(32.dp))
+        OutlinedButton(onClick = { ask(true) }, modifier = Modifier.fillMaxWidth().height(56.dp)) {
+            Text(if (amount == null) "Enter amount" else "Change amount")
+        }
+        Spacer(Modifier.height(12.dp))
+        OutlinedButton(onClick = { quote(null) }, modifier = Modifier.fillMaxWidth().height(56.dp)) {
+            Text("Send all")
+        }
+        Spacer(Modifier.height(12.dp))
+        BigButton("Continue", Modifier.fillMaxWidth(), enabled = amount != null) {
+            amount?.let { quote(it.toULong()) }
+        }
+    }
+    if (asking) AmountDialog(amount, onDone = { amount = it; ask(false) }, onCancel = { ask(false) })
+}
+
+/** A payout on Bitcoin to confirm: what the address gets, and all it costs on top. */
+@Composable
+private fun Payout(quote: PayoutQuote, pay: () -> Unit) {
+    Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
+        Spacer(Modifier.height(48.dp))
+        Text(sat(quote.amount), style = Figures)
+        Text(
+            "Fees ${sat(quote.fee)}, ${sat(quote.amount + quote.fee)} in all",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Spacer(Modifier.height(12.dp))
+        Text(
+            "To ${shortAddress(quote.address)}, on Bitcoin",
+            style = MaterialTheme.typography.bodyLarge,
+            textAlign = TextAlign.Center,
+        )
+        Spacer(Modifier.height(8.dp))
+        Text(
+            "From Licash at ${host(quote.hub)}, through ${quote.providerName ?: host(quote.provider)}. " +
+                "Arrives in about ${(quote.depth.toInt() + 1) * 10} minutes.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            textAlign = TextAlign.Center,
+        )
+        Spacer(Modifier.height(32.dp))
+        BigButton("Send", Modifier.fillMaxWidth(), onClick = pay)
+    }
+}
+
+/** A long address, its ends shown. */
+private fun shortAddress(address: String): String =
+    if (address.length <= 20) address else address.take(10) + "…" + address.takeLast(8)
+
 /** Paid; if not to the payee's mailbox, what to hand them. */
 @Composable
 private fun Sent(s: Step.Sent, back: () -> Unit) {
@@ -242,7 +359,9 @@ private fun Sent(s: Step.Sent, back: () -> Unit) {
 private fun Middle(text: String) {
     Column(Modifier.fillMaxSize(), horizontalAlignment = Alignment.CenterHorizontally) {
         Spacer(Modifier.height(120.dp))
-        Text(text, style = MaterialTheme.typography.titleMedium)
+        CircularProgressIndicator()
+        Spacer(Modifier.height(24.dp))
+        Text(text, style = MaterialTheme.typography.titleMedium, textAlign = TextAlign.Center)
     }
 }
 

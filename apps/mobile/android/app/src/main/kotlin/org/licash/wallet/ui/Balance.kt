@@ -12,6 +12,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -33,10 +34,11 @@ import org.licash.wallet.sat
 
 /**
  * Where the balance is: in Licash at each hub, and on Bitcoin; in advanced
- * mode, the notes held of each denomination too.
+ * mode, the notes held of each denomination too. `cashOut` pays all the
+ * notes at a hub out on Bitcoin.
  */
 @Composable
-fun BalanceDetails(engine: Engine, ui: Ui, back: () -> Unit) {
+fun BalanceDetails(engine: Engine, ui: Ui, cashOut: (String) -> Unit, back: () -> Unit) {
     var holdings by remember { mutableStateOf<List<Holding>>(emptyList()) }
     var notes by remember { mutableStateOf<List<Notes>>(emptyList()) }
     var error by remember { mutableStateOf<String?>(null) }
@@ -64,6 +66,12 @@ fun BalanceDetails(engine: Engine, ui: Ui, back: () -> Unit) {
                 if (holding.pending > 0uL) Amount("Settling", holding.pending)
                 hub?.lightningPay?.let { Hint("Pays Lightning invoices of up to ${sat(it)}") }
                 hub?.deposits?.let { Hint("Takes Bitcoin in from ${sat(it.min)} to ${sat(it.max)}") }
+                if (holding.available > 0uL) {
+                    TextButton(
+                        onClick = { cashOut(holding.hub) },
+                        modifier = Modifier.testTag("cash-out"),
+                    ) { Text("Cash out to Bitcoin") }
+                }
             }
         }
         Group("On Bitcoin") {

@@ -70,6 +70,8 @@ fun ActivityDetails(engine: Engine, ui: Ui, shown: Activity, back: () -> Unit) {
         is Details.Coin -> d.tx
         else -> null
     }
+    // A payout's claim pays the address: else the provider's coin.
+    val txid = tx?.txid ?: (details as? Details.Payout)?.let { it.claim ?: it.coin }
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 20.dp)) {
         TopBar(title(activity, coming != null), back)
         Spacer(Modifier.height(12.dp))
@@ -91,7 +93,7 @@ fun ActivityDetails(engine: Engine, ui: Ui, shown: Activity, back: () -> Unit) {
         )
         error?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
         Summary(activity, details, tx)
-        tx?.let { engine.explorerLink(it.txid) }?.let { link ->
+        txid?.let { engine.explorerLink(it) }?.let { link ->
             Spacer(Modifier.height(16.dp))
             OutlinedButton(
                 onClick = {
@@ -115,17 +117,27 @@ private fun title(activity: Activity, coming: Boolean): String = when {
         Kind.ONCHAIN -> "On Bitcoin"
         Kind.LIGHTNING -> "Paid over Lightning"
         Kind.INVOICE -> "Received over Lightning"
+        Kind.PAYOUT -> "Sent on Bitcoin"
     }
 }
 
 /** Whether it paid out, rather than in. */
-private fun paid(activity: Activity): Boolean = activity.kind == Kind.SENT || activity.kind == Kind.LIGHTNING
+private fun paid(activity: Activity): Boolean =
+    activity.kind == Kind.SENT || activity.kind == Kind.LIGHTNING || activity.kind == Kind.PAYOUT
 
 /** Where it stands, in words. */
 private fun status(activity: Activity, coming: Boolean, details: Details?): String = when {
     coming -> "Waiting for a block, about 10 minutes"
+    activity.state == State.FAILED && details is Details.Payout ->
+        "${activity.detail}. What it locked comes back once the lock expires."
     activity.state == State.FAILED -> activity.detail
     else -> when (details) {
+        is Details.Payout -> when {
+            activity.state == State.DONE -> "Paid on Bitcoin"
+            details.claim != null -> "Sent on Bitcoin: confirming, about 10 minutes"
+            details.coin != null -> "The provider paid it on Bitcoin: confirming, about 10 minutes"
+            else -> "Waiting for the provider to pay it on Bitcoin"
+        }
         is Details.Moved -> moving(activity, details)
         is Details.Coin -> when {
             details.moving != null -> "Moving into Licash"
@@ -179,6 +191,16 @@ private fun Summary(activity: Activity, details: Details?, tx: Onchain?) {
                 if (activity.state != State.FAILED) Line("Total", sat(activity.amount + activity.fee))
                 Line("Paid", "Over Lightning, through ${host(details.hub)}")
             }
+            is Details.Payout -> {
+                Line("Paid", sat(activity.amount))
+                if (activity.state != State.FAILED) {
+                    Line("Fees", sat(activity.fee))
+                    Line("Total", sat(activity.amount + activity.fee))
+                }
+                Line("To", short(details.address))
+                Line("From", "Licash at ${host(details.hub)}")
+                Line("Through", host(details.provider))
+            }
             is Details.Invoice -> {
                 Line("Into Licash", sat(activity.amount))
                 details.asks?.let {
@@ -201,6 +223,10 @@ private fun Summary(activity: Activity, details: Details?, tx: Onchain?) {
         activity.at?.let { Line("Date", at(it)) }
     }
 }
+
+/** A long address, its ends shown. */
+private fun short(address: String): String =
+    if (address.length <= 20) address else address.take(10) + "…" + address.takeLast(8)
 
 private fun confirmations(tx: Onchain, details: Details?): String {
     val depth = (details as? Details.Moved)?.depth
@@ -255,6 +281,15 @@ private fun Technical(activity: Activity, details: Details?, copy: (String, Stri
                 Fact("Hub", details.hub, copy)
                 Fact("Invoice", details.invoice, copy)
                 details.preimage?.let { Fact("Preimage", it, copy) }
+                details.failure?.let { Fact("Failure", it, copy) }
+            }
+            is Details.Payout -> {
+                Fact("Payout hash", activity.id, copy)
+                Fact("Address", details.address, copy)
+                Fact("Hub", details.hub, copy)
+                Fact("Provider", details.provider, copy)
+                details.coin?.let { Fact("Provider's coin", it, copy) }
+                details.claim?.let { Fact("Claim", it, copy) }
                 details.failure?.let { Fact("Failure", it, copy) }
             }
             is Details.Invoice -> {

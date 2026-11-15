@@ -35,6 +35,12 @@ app takes once paid. Tapping a hub in Settings lists its fees. Silent payments
 before the first block the hub indexed are not found; payments to the
 fallback address are, from the day before the wallet was made.
 
+Send pays Bitcoin addresses from notes too, and codes naming no hub the app
+trusts at their address, through a swap provider paying out on Bitcoin
+(`licash-swaps run --chain URL`) announced on a relay a hub of the app names
+(`--nostr-relay URL --announce-url URL`); Balance cashes out all the notes at
+a hub to an address that way.
+
 A counterpart on the command line:
 
 ```sh

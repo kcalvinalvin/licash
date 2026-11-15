@@ -38,10 +38,19 @@ import org.licash.wallet.ui.Wordmark
 private sealed interface Screen {
     data object Home : Screen
     data object Receive : Screen
-    data class Send(val link: String?) : Screen
+
+    /** Sending, or with `cashOut`, a hub, paying all the notes there out. */
+    data class Send(val link: String?, val cashOut: String? = null, val from: Screen = Home) : Screen
     data object Settings : Screen
-    data object Balance : Screen
+    data class Balance(val from: Screen = Home) : Screen
     data class Details(val activity: Activity) : Screen
+}
+
+/** The screen back goes to from `screen`. */
+private fun parent(screen: Screen): Screen = when (screen) {
+    is Screen.Send -> screen.from
+    is Screen.Balance -> screen.from
+    else -> Screen.Home
 }
 
 class MainActivity : ComponentActivity() {
@@ -80,7 +89,7 @@ private fun App(engine: Engine, link: String?, linkShown: () -> Unit) {
             linkShown()
         }
     }
-    BackHandler(enabled = screen != Screen.Home) { screen = Screen.Home }
+    BackHandler(enabled = screen != Screen.Home) { screen = parent(screen) }
     Scaffold(
         containerColor = MaterialTheme.colorScheme.background,
         snackbarHost = { SnackbarHost(snackbar) },
@@ -99,15 +108,19 @@ private fun App(engine: Engine, link: String?, linkShown: () -> Unit) {
                         receive = { screen = Screen.Receive },
                         send = { screen = Screen.Send(null) },
                         settings = { screen = Screen.Settings },
-                        balance = { screen = Screen.Balance },
+                        balance = { screen = Screen.Balance() },
                         open = { screen = Screen.Details(it) },
                     )
                     Screen.Receive -> Receive(engine) { screen = Screen.Home }
-                    is Screen.Send -> Send(engine, ui, s.link) { screen = Screen.Home }
-                    Screen.Settings -> Settings(engine, ui, balance = { screen = Screen.Balance }) {
+                    is Screen.Send -> Send(engine, ui, s.link, s.cashOut) { screen = s.from }
+                    Screen.Settings -> Settings(engine, ui, balance = { screen = Screen.Balance(Screen.Settings) }) {
                         screen = Screen.Home
                     }
-                    Screen.Balance -> BalanceDetails(engine, ui) { screen = Screen.Home }
+                    is Screen.Balance -> BalanceDetails(
+                        engine,
+                        ui,
+                        cashOut = { screen = Screen.Send(null, it, s) },
+                    ) { screen = s.from }
                     is Screen.Details -> ActivityDetails(engine, ui, s.activity) { screen = Screen.Home }
                 }
             }

@@ -35,6 +35,7 @@ import org.licash.core.LightningInvoice
 import org.licash.core.Network
 import org.licash.core.Notes
 import org.licash.core.Paid
+import org.licash.core.PayoutQuote
 import org.licash.core.Scanned
 import org.licash.core.State
 import org.licash.core.Wallet
@@ -256,6 +257,14 @@ class Engine(context: Context) {
         } catch (e: LicashException) {
             failed("finishing what is under way", e)
         }
+        // With the chain as it is: a claim waits for the provider's coin.
+        if (status.synced) {
+            try {
+                locked { it.followPayouts(chain) }
+            } catch (e: LicashException) {
+                failed("paying out on Bitcoin", e)
+            }
+        }
         if (hubs.any { it.mailbox }) {
             try {
                 for (got in locked { it.collect() }) {
@@ -415,6 +424,22 @@ class Engine(context: Context) {
         val followed = locked { it.followInvoice(hash) }
         if (followed.state != State.PENDING) refresh()
         followed
+    }
+
+    /**
+     * What paying `amount` to the Bitcoin address `address` costs through a
+     * swap provider, from notes at `hub` or the hub holding the most: all
+     * the notes there pay out if `amount` is null.
+     */
+    suspend fun payoutQuote(address: String, amount: ULong?, hub: String? = null): Result<PayoutQuote> =
+        io { local { it.payoutQuote(address, amount, hub) } }
+
+    /** Pay out as `quote` says: under way until its claim confirms. */
+    suspend fun payOut(quote: PayoutQuote): Result<Activity> = io {
+        val paying = locked { it.payOut(quote) }
+        refresh()
+        poke()
+        paying
     }
 
     /** What the wallet holds at each hub it trusts. */
