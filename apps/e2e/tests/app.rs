@@ -64,7 +64,8 @@ async fn mine(eco: &Eco) -> anyhow::Result<()> {
 /// The history, opened from Home: what it shows.
 async fn history(phone: &Phone) -> anyhow::Result<Vec<View>> {
     phone.tap_id("activity").await?;
-    phone.wait("Activity", 30).await?;
+    // Home says "Activity" too: the history's own list, then.
+    phone.by_id("history", 30).await?;
     phone.views().await
 }
 

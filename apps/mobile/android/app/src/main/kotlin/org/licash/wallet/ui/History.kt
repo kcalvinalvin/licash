@@ -41,7 +41,7 @@ import org.licash.wallet.sat
 @Composable
 fun History(ui: Ui, open: (Activity) -> Unit, back: () -> Unit) {
     val now = System.currentTimeMillis() / 1000
-    LazyColumn(Modifier.fillMaxSize().padding(horizontal = 20.dp)) {
+    LazyColumn(Modifier.fillMaxSize().padding(horizontal = 20.dp).testTag("history")) {
         item(key = "top") { TopBar("Activity", back) }
         if (ui.history.isEmpty() && ui.incoming.isEmpty()) {
             item(key = "none") {
