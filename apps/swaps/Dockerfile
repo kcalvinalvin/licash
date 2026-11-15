@@ -1,14 +1,14 @@
 # The swap provider service, with the wallet CLI to fund it. Build from the
 # repository root:
 #   docker build -f apps/swaps/Dockerfile -t licash-swaps .
-FROM rust:1-slim-trixie AS build
+# --platform linux/arm64 or linux/arm/v7 cross-compiles (apps/image-build.sh).
+FROM --platform=$BUILDPLATFORM rust:1-slim-trixie AS build
+ARG TARGETPLATFORM
 WORKDIR /src
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/src/apps/target,sharing=locked \
-    cargo build --locked --release --manifest-path apps/Cargo.toml \
-        -p licash-swaps-service -p licash-wallet-cli \
-    && cp apps/target/release/licash-swaps apps/target/release/licash-wallet /usr/local/bin/
+    apps/image-build.sh licash-swaps-service:licash-swaps licash-wallet-cli:licash-wallet
 
 FROM debian:trixie-slim
 # Root certificates, for hubs and notifications over HTTPS.

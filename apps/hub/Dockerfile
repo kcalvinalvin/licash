@@ -1,12 +1,13 @@
 # The hub service. Build from the repository root:
 #   docker build -f apps/hub/Dockerfile -t licash-hub .
-FROM rust:1-slim-trixie AS build
+# --platform linux/arm64 or linux/arm/v7 cross-compiles (apps/image-build.sh).
+FROM --platform=$BUILDPLATFORM rust:1-slim-trixie AS build
+ARG TARGETPLATFORM
 WORKDIR /src
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/src/apps/target,sharing=locked \
-    cargo build --locked --release --manifest-path apps/Cargo.toml -p licash-hub-service \
-    && cp apps/target/release/licash-hub /usr/local/bin/licash-hub
+    apps/image-build.sh licash-hub-service:licash-hub
 
 FROM debian:trixie-slim
 # Root certificates, for notifications and Esplora over HTTPS.

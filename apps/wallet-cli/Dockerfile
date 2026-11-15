@@ -1,12 +1,13 @@
 # The wallet CLI. Build from the repository root:
 #   docker build -f apps/wallet-cli/Dockerfile -t licash-wallet .
-FROM rust:1-slim-trixie AS build
+# --platform linux/arm64 or linux/arm/v7 cross-compiles (apps/image-build.sh).
+FROM --platform=$BUILDPLATFORM rust:1-slim-trixie AS build
+ARG TARGETPLATFORM
 WORKDIR /src
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/src/apps/target,sharing=locked \
-    cargo build --locked --release --manifest-path apps/Cargo.toml -p licash-wallet-cli \
-    && cp apps/target/release/licash-wallet /usr/local/bin/licash-wallet
+    apps/image-build.sh licash-wallet-cli:licash-wallet
 
 FROM debian:trixie-slim
 # Root certificates, for hubs over HTTPS.
