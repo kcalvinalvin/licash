@@ -904,9 +904,9 @@ impl Gateway {
         let name = hex::encode(record.hash);
         if let Some(by) = record.spent_by {
             let message = format!(
-                "The payment of deposit {name} was spent by {by}, not the hub's claim, once its \
-                 notes were claimed: the hub lost {} sat.",
-                record.pays
+                "The payment of deposit {name} was spent by {by}, not by the hub's claim, after \
+                 its notes were issued: the hub lost {}.",
+                licash_notify::sat(record.pays)
             );
             self.alert(format!("lost {name}"), message).await;
             return self.store.done(&record.hash).map_err(store_down);

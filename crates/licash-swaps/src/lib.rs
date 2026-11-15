@@ -485,9 +485,10 @@ impl<T: Transport> Provider<T> {
                 short.remove(&url);
             } else if !short.contains(&url) {
                 self.alert(&format!(
-                    "No swaps to {url}: the provider holds {free} free there, less than \
-                     the least it swaps, {}.",
-                    self.config.min
+                    "No swaps to {url} for now: the provider holds {} free there, less than \
+                     the {} it swaps at least. Fund its account there.",
+                    sat(free),
+                    sat(self.config.min)
                 ))?;
                 short.insert(url.clone());
                 alerted.push(url);
@@ -1041,9 +1042,30 @@ impl<T: Transport> Provider<T> {
     }
 }
 
+/// `amount` sat as an operator reads it: `12,345 sat`.
+fn sat(amount: u64) -> String {
+    let digits = amount.to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3 + 4);
+    for (i, digit) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    grouped + " sat"
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn amounts_read_with_commas_between_thousands() {
+        assert_eq!(sat(0), "0 sat");
+        assert_eq!(sat(999), "999 sat");
+        assert_eq!(sat(1_000), "1,000 sat");
+        assert_eq!(sat(1_234_567), "1,234,567 sat");
+    }
 
     #[test]
     fn a_swap_in_hand_is_held_until_dropped() {

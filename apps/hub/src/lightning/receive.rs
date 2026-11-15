@@ -411,9 +411,9 @@ impl Gateway {
             HeldState::Canceled => {
                 let name = hex::encode(receipt.hash);
                 let message = format!(
-                    "The invoice of receipt {name} was canceled once its lock paid: the hub \
+                    "The invoice of receipt {name} was canceled after its lock paid: the hub \
                      lost {}.",
-                    receipt.amount
+                    licash_notify::sat(receipt.amount)
                 );
                 self.alert(format!("lost {name}"), message).await;
                 self.finish(receipt, "canceled")

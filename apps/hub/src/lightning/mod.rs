@@ -345,8 +345,10 @@ impl Gateway {
                 continue;
             }
             let message = format!(
-                "The Lightning node can {way} {can} sat over its channels, less than the \
-                 {most} sat the gateway takes ({flag}): larger payments fail."
+                "The Lightning node can {way} {} over its channels, less than the {} the \
+                 gateway allows ({flag}): larger payments fail. Open or rebalance channels.",
+                licash_notify::sat(can),
+                licash_notify::sat(most)
             );
             self.alert(key, message).await;
         }

@@ -8,7 +8,7 @@ use std::{
 };
 
 use licash_hub::{Event, Hub, Ledger, Notice, Settled};
-use licash_notify::{Item, Message, Outbox, Priority, Relay, Target, Timing};
+use licash_notify::{sat, Item, Message, Outbox, Priority, Relay, Target, Timing};
 
 /// The kinds of the hub's events.
 pub const KINDS: [&str; 9] = [
@@ -145,8 +145,8 @@ pub fn message(event: &Event) -> Message {
             Priority::Low,
             "Hub started",
             format!(
-                "Boot {boot}. Notes issued before this start can no longer be unlinked: \
-                 their holders swap them."
+                "The hub is serving (boot {boot}). Notes it issued before this start can no \
+                 longer be unlinked: wallets holding them swap them for fresh ones."
             ),
         ),
         Some(Notice::Released {
@@ -156,12 +156,19 @@ pub fn message(event: &Event) -> Message {
         }) => Message::new(
             Priority::Low,
             "Spend released",
-            format!("{amount} moved, {fee} of it to the hub. Proposal {proposal}."),
+            format!(
+                "Notes worth {} spent, {} of it the hub's fee. Proposal {proposal}.",
+                sat(amount),
+                sat(fee)
+            ),
         ),
         Some(Notice::DoubleSpend { proposal, spent_by }) => Message::new(
             Priority::High,
             "Double spend refused",
-            format!("Proposal {proposal} spends inputs that {spent_by} spent."),
+            format!(
+                "Proposal {proposal} tried to spend notes that proposal {spent_by} already \
+                 spent: refused."
+            ),
         ),
         Some(Notice::Locked {
             proposal,
@@ -173,8 +180,10 @@ pub fn message(event: &Event) -> Message {
             Priority::Low,
             "Lock admitted",
             format!(
-                "{amount} locked until block {expiry}, {fee} of it to the hub if it pays. \
-                 Proposal {proposal}."
+                "{} locked until block {expiry}: paid if its condition is met by then, else \
+                 refunded. {} of it is the hub's fee if it pays. Proposal {proposal}.",
+                sat(amount),
+                sat(fee)
             ),
         ),
         Some(Notice::Locked {
@@ -187,8 +196,9 @@ pub fn message(event: &Event) -> Message {
             Priority::Low,
             "Own lock admitted",
             format!(
-                "{amount} of the hub's own notes locked until block {expiry}, against what \
-                 it holds for the hash. Proposal {proposal}."
+                "{} of the hub's own notes locked until block {expiry}, backing what it holds \
+                 under the same hash. Proposal {proposal}.",
+                sat(amount)
             ),
         ),
         Some(Notice::Settled {
@@ -199,7 +209,11 @@ pub fn message(event: &Event) -> Message {
         }) => Message::new(
             Priority::Low,
             "Lock paid",
-            format!("{amount} paid, {fee} of it to the hub. Proposal {proposal}."),
+            format!(
+                "A lock of {} paid its payee, {} of it the hub's fee. Proposal {proposal}.",
+                sat(amount),
+                sat(fee)
+            ),
         ),
         Some(Notice::Settled {
             proposal,
@@ -209,7 +223,12 @@ pub fn message(event: &Event) -> Message {
         }) => Message::new(
             Priority::Normal,
             "Lock refunded",
-            format!("{amount} refunded, {fee} of it to the hub. Proposal {proposal}."),
+            format!(
+                "A lock of {} went back to its payer, {} of it the hub's fee. \
+                 Proposal {proposal}.",
+                sat(amount),
+                sat(fee)
+            ),
         ),
         Some(Notice::Activated {
             proposal,
@@ -219,8 +238,8 @@ pub fn message(event: &Event) -> Message {
             Priority::High,
             "Lock activated on Bitcoin",
             format!(
-                "The preimage of proposal {proposal} was published at block {height}: \
-                 the lock pays."
+                "The secret unlocking proposal {proposal} was published on Bitcoin at block \
+                 {height}, in time: the lock pays its payee."
             ),
         ),
         Some(Notice::Activated {
@@ -231,8 +250,9 @@ pub fn message(event: &Event) -> Message {
             Priority::High,
             "Refunded lock activated",
             format!(
-                "The preimage of proposal {proposal}, which the hub refunded, was published \
-                 at block {height} after a reorganization: the hub owes both branches."
+                "After a reorganization, the secret unlocking proposal {proposal} was \
+                 published on Bitcoin at block {height}, though the hub had refunded the lock: \
+                 it owes the payee too. Check the hub's reserves."
             ),
         ),
         Some(Notice::Reorg { height }) => Message::new(
@@ -240,7 +260,7 @@ pub fn message(event: &Event) -> Message {
             "Checkpoint reorganized",
             format!(
                 "Bitcoin reorganized at block {height}, at or below a checkpoint. The hub \
-                 scans no further, so admits and refunds no lock, until its operator acts."
+                 stopped following Bitcoin: it takes and refunds no locks until you act."
             ),
         ),
         Some(Notice::Forwarded {
@@ -250,7 +270,11 @@ pub fn message(event: &Event) -> Message {
         }) => Message::new(
             Priority::Low,
             "Payment forwarded",
-            format!("Paid outside the ledger for a lock of {amount}. Proposal {proposal}."),
+            format!(
+                "A lock of {} paid outside the hub, such as a Lightning invoice. \
+                 Proposal {proposal}.",
+                sat(amount)
+            ),
         ),
         Some(Notice::Forwarded {
             proposal,
@@ -260,8 +284,9 @@ pub fn message(event: &Event) -> Message {
             Priority::Normal,
             "Forward failed",
             format!(
-                "The payment for a lock of {amount} failed ({reason}); the lock is refunded. \
-                 Proposal {proposal}."
+                "Paying outside the hub for a lock of {} failed ({reason}): the lock goes back \
+                 to its payer. Proposal {proposal}.",
+                sat(amount)
             ),
         ),
         Some(Notice::Alert { message }) => Message::new(Priority::High, "Hub alert", message),
@@ -348,13 +373,14 @@ mod tests {
         assert_eq!(messages[1].title, "Spend released");
         assert_eq!(
             messages[1].body,
-            "10 moved, 1 of it to the hub. Proposal p1."
+            "Notes worth 10 sat spent, 1 sat of it the hub's fee. Proposal p1."
         );
         assert_eq!(messages[2].priority, Priority::High);
         assert!(messages[2].body.contains("p2") && messages[2].body.contains("p1"));
         assert_eq!(
             messages[3].body,
-            "8 locked until block 900, 1 of it to the hub if it pays. Proposal p3."
+            "8 sat locked until block 900: paid if its condition is met by then, else \
+             refunded. 1 sat of it is the hub's fee if it pays. Proposal p3."
         );
         assert_eq!(messages[4].title, "Lock refunded");
         assert_eq!(messages[5].priority, Priority::High);
@@ -403,5 +429,29 @@ mod tests {
         assert_eq!(message.priority, Priority::Normal);
         assert!(message.body.contains("\"amount\":5"));
         assert_eq!(titled("north", message).title, "north: Hub event minted");
+    }
+
+    #[test]
+    fn amounts_read_in_sat_with_commas() {
+        let released = Notice::Released {
+            proposal: "p".into(),
+            amount: 1_234_567,
+            fee: 1_235,
+        };
+        let body = message(&event(&released)).body;
+        assert!(
+            body.contains("1,234,567 sat") && body.contains("1,235 sat"),
+            "{body}"
+        );
+        let failed = Notice::Forwarded {
+            proposal: "p".into(),
+            amount: 50_000,
+            failed: Some("no route".into()),
+        };
+        let body = message(&event(&failed)).body;
+        assert!(
+            body.contains("50,000 sat") && body.contains("(no route)"),
+            "{body}"
+        );
     }
 }

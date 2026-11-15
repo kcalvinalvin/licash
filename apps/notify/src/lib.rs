@@ -32,6 +32,19 @@ impl Message {
     }
 }
 
+/// `amount` sat as an operator reads it: `12,345 sat`.
+pub fn sat(amount: u64) -> String {
+    let digits = amount.to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3 + 4);
+    for (i, digit) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    grouped + " sat"
+}
+
 /// The HTTP client targets are sent with. Installs the TLS provider once.
 pub fn client() -> anyhow::Result<reqwest::Client> {
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -39,4 +52,19 @@ pub fn client() -> anyhow::Result<reqwest::Client> {
         .timeout(std::time::Duration::from_secs(15))
         .user_agent(concat!("licash-notify/", env!("CARGO_PKG_VERSION")))
         .build()?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn amounts_read_with_commas_between_thousands() {
+        assert_eq!(sat(0), "0 sat");
+        assert_eq!(sat(999), "999 sat");
+        assert_eq!(sat(1_000), "1,000 sat");
+        assert_eq!(sat(123_456), "123,456 sat");
+        assert_eq!(sat(1_234_567), "1,234,567 sat");
+        assert_eq!(sat(u64::MAX), "18,446,744,073,709,551,615 sat");
+    }
 }
