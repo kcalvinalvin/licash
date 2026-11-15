@@ -627,6 +627,37 @@ impl Wallet {
         self.invoice_now(asked)
     }
 
+    /// [`Wallet::ask_invoice`], for an invoice asking the payer `invoiced`,
+    /// the hub's fee in it, as a shop asks a price: the wallet gets that
+    /// less the fee, at the hub trusted leaving the most. A sat short,
+    /// rarely, where no amount and its fee rounded up come to it exactly.
+    pub fn ask_invoice_for(&self, invoiced: u64) -> Result<LightningInvoice, LicashError> {
+        let (mut best, mut any): (Option<(u64, String)>, bool) = (None, false);
+        for (url, info) in self.wallet.hubs()? {
+            let Some(lightning) = &info.lightning else {
+                continue;
+            };
+            any = true;
+            let amount = before_fee(&lightning.receive, invoiced);
+            if amount == 0 || !(lightning.min_receive..=lightning.max_receive).contains(&amount) {
+                continue;
+            }
+            if best.as_ref().is_none_or(|(most, _)| amount > *most) {
+                best = Some((amount, url));
+            }
+        }
+        let (amount, url) = best.ok_or_else(|| {
+            LicashError::invalid(match any {
+                true => {
+                    format!("no hub you trust takes an invoice of {invoiced} sat over Lightning")
+                }
+                false => "no hub you trust takes payments over Lightning".into(),
+            })
+        })?;
+        let asked = self.runtime.block_on(self.wallet.invoice(&url, amount));
+        self.invoice_now(asked)
+    }
+
     /// Take on the invoice of `hash`, as [`Wallet::ask_invoice`] asked for
     /// it: have its hub make it, and take its notes once it is paid. Where
     /// it stands.
@@ -1852,5 +1883,62 @@ fn quoted(plan: &licash_nostr::wallet::Plan) -> PayQuote {
         swap_from: plan.swap.as_ref().map(|s| s.from.clone()),
         swapped: plan.swap.as_ref().map_or(0, |s| s.provider.quote.amount),
         trusted: plan.trusted,
+    }
+}
+
+/// The most an amount may be for it and `fee` on it to come to `total` at
+/// most: none if the fee alone is more.
+fn before_fee(fee: &licash_api::Fee, total: u64) -> u64 {
+    let fits = |n: u64| n.checked_add(fee.due(n)).is_some_and(|t| t <= total);
+    if !fits(0) {
+        return 0;
+    }
+    // It and its fee only grow with it: the last that fits, found halving.
+    let (mut low, mut high) = (0, total);
+    while low < high {
+        let mid = low + (high - low).div_ceil(2);
+        if fits(mid) {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    low
+}
+
+#[cfg(test)]
+mod tests {
+    use licash_api::Fee;
+
+    use super::before_fee;
+
+    #[test]
+    fn an_amount_and_its_fee_come_to_the_total_or_a_sat_short() {
+        let base = Fee { base: 3, ppm: 0 };
+        assert_eq!(before_fee(&base, 503), 500);
+        assert_eq!(before_fee(&base, 3), 0);
+        assert_eq!(before_fee(&base, 2), 0);
+        let rate = Fee { base: 0, ppm: 10 };
+        assert_eq!(before_fee(&rate, 100_001), 100_000);
+        // No amount and its fee, rounded up, come to 100,002: a sat short.
+        assert_eq!(before_fee(&rate, 100_002), 100_000);
+        assert_eq!(before_fee(&rate, 100_003), 100_001);
+        let half = Fee {
+            base: 1,
+            ppm: 1_000_000,
+        };
+        assert_eq!(before_fee(&half, 11), 5);
+        assert_eq!(before_fee(&Fee::default(), u64::MAX), u64::MAX);
+        let both = Fee {
+            base: 1_000,
+            ppm: 2_500,
+        };
+        for total in [0, 999, 1_000, 1_001, 50_000, 1_000_000, 21_000_000_000] {
+            let n = before_fee(&both, total);
+            let came = n + both.due(n);
+            assert!(came <= total || n == 0, "{total}: {n}");
+            assert!(n == 0 || total - came <= 1, "{total}: {n} came to {came}");
+            assert!((n + 1) + both.due(n + 1) > total, "{total}: {n}");
+        }
     }
 }

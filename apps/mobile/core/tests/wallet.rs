@@ -1196,6 +1196,32 @@ fn a_phone_paid_over_lightning_takes_the_notes_and_shows_the_invoice() {
     assert_eq!(notes(&alice), 500);
 }
 
+#[test]
+fn a_phone_asks_for_an_invoice_of_the_amount_entered_its_fee_in_it() {
+    let net = Net::new(false);
+    let alice = net.wallet("alice", net.height());
+    let hub = alice.hubs().unwrap().remove(0);
+    // Its hub takes 3 sat on each: the payer pays 500, Alice gets 497.
+    let asked = alice.ask_invoice_for(500).unwrap();
+    let shown = (asked.hub.as_str(), asked.amount, asked.asks, asked.state);
+    assert_eq!(shown, (hub.url.as_str(), 497, Some(500), State::Pending));
+    let hash = held(&asked.hash);
+    let cltv = net.node.held_cltv(hash).unwrap() as u32;
+    net.node.pay_held(hash, net.height() + cltv);
+    net.runtime.block_on(net.lightning.round());
+    let paid = alice.follow_invoice(asked.hash.clone()).unwrap();
+    assert_eq!((paid.state, paid.asks), (State::Done, Some(500)));
+    assert_eq!(notes(&alice), 497);
+    // Its notes at least 1 sat, at most 10,000: the fee alone is too much,
+    // or more than it takes.
+    for invoiced in [3, 10_004] {
+        let refused = invalid(alice.ask_invoice_for(invoiced));
+        let said = format!("takes an invoice of {invoiced} sat over Lightning");
+        assert!(refused.contains(&said), "{refused}");
+    }
+    assert_eq!(alice.ask_invoice_for(10_003).unwrap().amount, 10_000);
+}
+
 /// The payment hash `hash` of an invoice, in hex, as the node holds it.
 fn held(hash: &str) -> [u8; 32] {
     let mut bytes = [0; 32];
