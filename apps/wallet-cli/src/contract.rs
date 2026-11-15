@@ -1,10 +1,12 @@
 //! `licash-wallet open-contract` and `contracts`: recovery contracts at
 //! the wallet's hubs, kept beside its file, each paid from a coin of the
-//! wallet's on Bitcoin.
+//! wallet's on Bitcoin. `force-close`, `recoveries` and
+//! `give-up-recovery`: one its hub left silent, closed by the wallet.
 
 use std::path::Path;
 
 use anyhow::Context;
+use licash_contracts::holder::recovery::{self, Recovery};
 use licash_contracts::holder::{self, Ask, Contract, Node};
 use licash_transport::Http;
 use licash_wallet::Wallet;
@@ -137,5 +139,106 @@ fn contract_json(c: &Contract) -> serde_json::Value {
         "funding": c.funding.map(|t| t.to_string()),
         "abandoned": c.abandoned,
         "created_at": c.created_at,
+    })
+}
+
+/// The contract of the wallet's whose id is or starts with `id`, in hex.
+fn contract_id(path: &Path, id: &str) -> anyhow::Result<[u8; 32]> {
+    let id = id.to_lowercase();
+    let mut found = holder::list(dir(path))?
+        .into_iter()
+        .map(|c| c.id)
+        .filter(|c| licash_contracts::hex_id(c).starts_with(&id));
+    let one = found.next().with_context(|| format!("no contract {id}"))?;
+    anyhow::ensure!(found.next().is_none(), "more than one contract starts {id}");
+    Ok(one)
+}
+
+/// Force contract `id` closed, its hub silent: the wallet's notes at the
+/// hub claimed on Bitcoin, paid back on Bitcoin once the hub's window
+/// passed, its fees at `fee_rate` sat/vB [default: the chain's estimate].
+pub async fn force_close(
+    wallet: &Wallet<Http>,
+    path: &Path,
+    chain: Option<&str>,
+    id: &str,
+    fee_rate: Option<u64>,
+    json: bool,
+) -> anyhow::Result<()> {
+    let chain = node(chain)?;
+    let id = contract_id(path, id)?;
+    let rate = crate::onchain::rate(&chain.0, fee_rate).await?;
+    let forced = recovery::force_close(wallet, &chain, dir(path), &id, rate).await?;
+    show(json, recovery_json(&forced), recovery_line(&forced));
+    Ok(())
+}
+
+/// The contracts the wallet forced closed: with --chain, each carried on
+/// as far as the chain lets it.
+pub async fn recoveries(
+    wallet: &Wallet<Http>,
+    path: &Path,
+    chain: Option<&str>,
+    fee_rate: Option<u64>,
+    json: bool,
+) -> anyhow::Result<()> {
+    let all = match chain {
+        Some(_) => {
+            let chain = node(chain)?;
+            let rate = crate::onchain::rate(&chain.0, fee_rate).await?;
+            recovery::advance(wallet, &chain, dir(path), rate).await?
+        }
+        None => recovery::recoveries(dir(path))?,
+    };
+    let lines: Vec<String> = all.iter().map(recovery_line).collect();
+    show(
+        json,
+        all.iter().map(recovery_json).collect(),
+        lines.join("\n"),
+    );
+    Ok(())
+}
+
+/// Give up forcing contract `id` closed, the wallet's notes back to it:
+/// only before its request is signed.
+pub fn give_up(wallet: &Wallet<Http>, path: &Path, id: &str) -> anyhow::Result<()> {
+    let id = contract_id(path, id)?;
+    recovery::give_up(wallet, dir(path), &id)
+}
+
+fn recovery_line(r: &Recovery) -> String {
+    let mut line = format!(
+        "{}  {}  claims {} sat in {} notes",
+        &licash_contracts::hex_id(&r.id)[..16],
+        r.stage.as_str(),
+        r.claimed,
+        r.notes,
+    );
+    if let Some(at) = r.next_at {
+        line.push_str(&format!("  next step at block {at}"));
+    }
+    if let Some(error) = &r.error {
+        line.push_str(&format!("  ({error})"));
+    }
+    line
+}
+
+fn recovery_json(r: &Recovery) -> serde_json::Value {
+    let txid = |t: Option<bitcoin::Txid>| t.map(|t| t.to_string());
+    json!({
+        "id": licash_contracts::hex_id(&r.id),
+        "stage": r.stage.as_str(),
+        "irrevocable": r.irrevocable,
+        "claimed": r.claimed,
+        "notes": r.notes,
+        "request": txid(r.request),
+        "publication": txid(r.publication),
+        "requested_at": r.requested_at,
+        "timeout": txid(r.timeout),
+        "timed_out_at": r.timed_out_at,
+        "sweep": txid(r.sweep),
+        "swept_at": r.swept_at,
+        "next_at": r.next_at,
+        "error": r.error,
     })
 }

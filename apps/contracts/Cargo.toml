@@ -18,7 +18,8 @@ bitcoin = { version = "=0.32.102", default-features = false, features = ["std"] 
 hex = "0.4"
 hex-literal = "0.4"
 rusqlite = { version = "0.40", features = ["bundled"] }
-serde_json = { workspace = true, optional = true }
+serde.workspace = true
+serde_json.workspace = true
 sha2 = { version = "0.10", optional = true }
 tokio = { workspace = true, features = ["time"] }
 tracing.workspace = true
@@ -26,7 +27,7 @@ tracing.workspace = true
 [features]
 # The hub's side, and a node or an Esplora API as the holder's chain.
 default = ["node"]
-node = ["dep:axum", "dep:licash-chain-client", "dep:serde_json", "dep:sha2"]
+node = ["dep:axum", "dep:licash-chain-client", "dep:sha2"]
 
 [dev-dependencies]
 tempfile = "3.27"
