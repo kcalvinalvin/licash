@@ -9,7 +9,7 @@ use std::{
 
 use bitcoin::{FeeRate, OutPoint};
 use licash_nostr::{
-    wallet::{hub_relays, hubs_announced, hubs_found},
+    wallet::{hub_relays, hubs_announced, hubs_found, plans_with, Announcements},
     Route,
 };
 use licash_transport::Http;
@@ -67,6 +67,9 @@ pub struct Wallet {
     /// The SOCKS5 proxy through its Tor client, once asked for
     /// ([`Wallet::tor_proxy`]).
     socks: Mutex<Option<licash_tor::Socks>>,
+    /// The swap providers announced, as last looked for
+    /// ([`Wallet::refresh_providers`]): quotes ask them without looking.
+    announced: Announcements,
 }
 
 /// How long the hubs asked what URLs they name may take, all at once
@@ -216,6 +219,7 @@ impl Wallet {
             times: Mutex::new(HashMap::new()),
             onions_asked: Mutex::new(None),
             socks: Mutex::new(None),
+            announced: Announcements::default(),
         };
         wallet.onions();
         Ok(Arc::new(wallet))
@@ -354,6 +358,27 @@ impl Wallet {
                 hub: hub(&h.url, &h.info),
             })
             .collect())
+    }
+
+    /// Look for the swap providers announced on the relays the hubs
+    /// trusted name, and keep them for a while, in memory: a quote then
+    /// asks them without waiting on the relays (the providers themselves
+    /// are still asked). How many were found: none if no hub names relays.
+    /// The app calls it out of sight, every so often.
+    pub fn refresh_providers(&self) -> Result<u32, LicashError> {
+        let relays = hub_relays(&self.wallet)?;
+        if relays.is_empty() {
+            return Ok(0);
+        }
+        let started = Instant::now();
+        let network = self.wallet.network().name();
+        let found = self.announced.refresh(&relays, &self.route, network);
+        let found = self
+            .runtime
+            .block_on(found)
+            .map_err(|e| LicashError::from_any(e, |reason| LicashError::Unavailable { reason }))?;
+        tracing::info!(found, took = ?started.elapsed(), "swap providers looked for");
+        Ok(u32::try_from(found).unwrap_or(u32::MAX))
     }
 
     /// [`Wallet::discover_hubs`], on `relays` as well as on those the hubs
@@ -1217,7 +1242,7 @@ impl Wallet {
         let text = code.trim().to_owned();
         let code: PaymentCode = text.parse().map_err(LicashError::invalid)?;
         code.check(self.wallet.network())?;
-        let plans = licash_nostr::wallet::plans(&self.wallet, &code, amount, &self.route);
+        let plans = plans_with(&self.wallet, &code, amount, &self.route, &self.announced);
         match self.runtime.block_on(plans) {
             Ok(plans) => Ok((text, plans)),
             Err(e) => {

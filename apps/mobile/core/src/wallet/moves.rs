@@ -2,7 +2,7 @@
 //! provider takes the wallet's lock at one hub and locks as much to it at
 //! the other, less its fee.
 
-use licash_nostr::wallet::{hub_relays, swap_providers, SwapProvider};
+use licash_nostr::wallet::{hub_relays, swap_providers_with, SwapProvider};
 use licash_transport::Http;
 use licash_wallet::{Swap, SwapLimits, SwapQuote, SwapState};
 
@@ -46,8 +46,9 @@ impl Wallet {
                 "no hub you trust names relays to find swap providers on",
             ));
         }
-        let found = swap_providers(
+        let found = swap_providers_with(
             &self.wallet,
+            &self.announced,
             &relays,
             &self.route,
             (&from, &to),

@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use bitcoin::FeeRate;
-use licash_nostr::wallet::{hub_relays, payout_providers};
+use licash_nostr::wallet::{hub_relays, payout_providers_with};
 use licash_transport::Http;
 use licash_wallet::{payout_depth, LockState, Payout, PayoutProgress, PayoutState};
 
@@ -213,8 +213,9 @@ impl Wallet {
             ));
         }
         let limits = (max_fee(first), claim_rate());
-        let found = payout_providers(
+        let found = payout_providers_with(
             &self.wallet,
+            &self.announced,
             &relays,
             &self.route,
             (&hub, address),

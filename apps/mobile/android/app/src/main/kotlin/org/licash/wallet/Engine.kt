@@ -165,6 +165,13 @@ class Engine(context: Context) {
     /** Carrying on with contracts, apart from the rounds: it may take minutes. */
     private val contracting = AtomicBoolean(false)
 
+    /** Looking for the swap providers announced, apart from the rounds. */
+    private val findingProviders = AtomicBoolean(false)
+
+    /** The wallet that last looked for swap providers, and when it looks again ([System.nanoTime]). */
+    @Volatile
+    private var providersDue: Pair<Wallet, Long>? = null
+
     init {
         AppLog.start(File(files, "logs"))
         setLogger(AppLog, "info,nostr_sdk=warn,nostr_relay_pool=warn")
@@ -302,6 +309,7 @@ class Engine(context: Context) {
     private suspend fun loop() {
         while (true) {
             if (foreground || keepers.get() > 0) {
+                findProviders()
                 runCatching { sync() }.onFailure { e ->
                     AppLog.warn("sync", e)
                     state.update { it.copy(problem = explain(e)) }
@@ -438,6 +446,26 @@ class Engine(context: Context) {
             notices.tryEmit(Event("Moving ${sat(moving.amount)} into Licash"))
         } catch (_: LicashException.Insufficient) {
             // Too little for the hub yet: more payments may come.
+        }
+    }
+
+    /**
+     * Look for the swap providers announced, apart from the rounds, for a
+     * quote to ask them without waiting on relays: every [PROVIDERS_MS]
+     * once looked for, [PROVIDERS_RETRY_MS] after failing to; at once for
+     * a wallet opened since.
+     */
+    private fun findProviders() {
+        val wallet = wallet ?: return
+        val due = providersDue
+        if (due != null && due.first === wallet && System.nanoTime() < due.second) return
+        if (!findingProviders.compareAndSet(false, true)) return
+        scope.launch {
+            val wait = runCatching { wallet.refreshProviders() }
+                .onFailure { AppLog.warn("looking for swap providers", it) }
+                .fold({ PROVIDERS_MS }, { PROVIDERS_RETRY_MS })
+            providersDue = wallet to System.nanoTime() + wait * 1_000_000
+            findingProviders.set(false)
         }
     }
 
@@ -882,5 +910,7 @@ class Engine(context: Context) {
         private const val ROUND_MS = 20_000L
         private const val EAGER_MS = 4_000L
         private const val AWAY_MS = 60_000L
+        private const val PROVIDERS_MS = 15 * 60_000L
+        private const val PROVIDERS_RETRY_MS = 2 * 60_000L
     }
 }

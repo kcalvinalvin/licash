@@ -2,7 +2,12 @@
 //! taking what its own mailbox holds; and the swap providers announced
 //! that swap between two of its hubs, or pay notes out on Bitcoin.
 
-use std::{collections::HashSet, future::Future, time::Duration};
+use std::{
+    collections::HashSet,
+    future::Future,
+    sync::Mutex,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::bail;
 use bitcoin::FeeRate;
@@ -13,10 +18,110 @@ use licash_wallet::{
     SwapState, Transport, Wallet,
 };
 
-use crate::{mailbox, Found, Role, Route};
+use crate::{mailbox, Found, Role, Route, LIFETIME};
 
 /// How long a swap provider announced has to answer at a URL.
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long the swap providers announced, as last found, are used without
+/// looking for them again: well within an announcement's [`LIFETIME`].
+const KEPT_FOR: Duration = Duration::from_secs(30 * 60);
+
+/// The swap providers announced, as last found on some relays for a
+/// network: quotes ask them without looking for them first, as the
+/// wallet's owner waits, once looked for out of sight
+/// ([`Announcements::refresh`]). What they say is only where to ask them:
+/// each is still asked, and must answer as the key that announced it.
+/// None kept, or none of those answering, a quote looks for them as it
+/// did: one never refreshed keeps none, each quote looking.
+#[derive(Default)]
+pub struct Announcements(Mutex<Option<Kept>>);
+
+/// Announcements found, and where and when.
+struct Kept {
+    found: Vec<Found>,
+    relays: Vec<String>,
+    network: String,
+    at: Instant,
+}
+
+/// `relays` in order, once each: the same set however listed.
+fn set_of(relays: &[String]) -> Vec<String> {
+    let mut set = relays.to_vec();
+    set.sort();
+    set.dedup();
+    set
+}
+
+impl Announcements {
+    /// Look for the swap providers announced on `relays` for `network`,
+    /// through `route`, and keep them: how many. Those kept before stay,
+    /// should none answer.
+    pub async fn refresh(
+        &self,
+        relays: &[String],
+        route: &Route,
+        network: &str,
+    ) -> anyhow::Result<usize> {
+        let found = crate::discover(relays, route, Role::Swaps, network).await?;
+        let count = found.len();
+        let kept = Kept {
+            found,
+            relays: set_of(relays),
+            network: network.to_owned(),
+            at: Instant::now(),
+        };
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(kept);
+        Ok(count)
+    }
+
+    /// Those kept from `relays` for `network`, found within [`KEPT_FOR`],
+    /// those expired since left out: none if none is left.
+    fn kept(&self, relays: &[String], network: &str) -> Option<Vec<Found>> {
+        let kept = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let kept = kept.as_ref()?;
+        if kept.network != network || kept.relays != set_of(relays) || kept.at.elapsed() >= KEPT_FOR
+        {
+            return None;
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let found: Vec<Found> = (kept.found.iter())
+            .filter(|f| f.at.saturating_add(LIFETIME.as_secs()) > now)
+            .cloned()
+            .collect();
+        (!found.is_empty()).then_some(found)
+    }
+
+    /// The swap providers announced on `relays` for `network` that answer
+    /// `ask` as the key that announced them, as `nostr` reads it
+    /// ([`answering`]): those kept, else those looked for now through
+    /// `route`, should none be kept or none of those answer. Only
+    /// [`Announcements::refresh`] keeps them: looking for them here keeps
+    /// nothing, so that one never refreshing sees each provider announced
+    /// since.
+    async fn answering<Q, Fut>(
+        &self,
+        (relays, route, network): (&[String], &Route, &str),
+        ask: impl Fn(String) -> Fut,
+        nostr: fn(&Q) -> Option<&str>,
+    ) -> anyhow::Result<Vec<(Found, String, Q)>>
+    where
+        Fut: Future<Output = Result<Q, Error>>,
+    {
+        if let Some(found) = self.kept(relays, network) {
+            let answered = answering(found, &ask, nostr).await?;
+            if !answered.is_empty() {
+                return Ok(answered);
+            }
+            tracing::info!("no swap provider kept answered: looking for them again");
+        }
+        let found = crate::discover(relays, route, Role::Swaps, network).await?;
+        Ok(answering(found, &ask, nostr).await?)
+    }
+}
 
 /// A payment made to a payment code.
 #[derive(Debug)]
@@ -122,6 +227,17 @@ pub async fn plans<T: Transport>(
     amount: Option<u64>,
     route: &Route,
 ) -> anyhow::Result<Vec<Plan>> {
+    plans_with(wallet, code, amount, route, &Announcements::default()).await
+}
+
+/// [`plans`], the swap providers announced as `announced` keeps them.
+pub async fn plans_with<T: Transport>(
+    wallet: &Wallet<T>,
+    code: &PaymentCode,
+    amount: Option<u64>,
+    route: &Route,
+    announced: &Announcements,
+) -> anyhow::Result<Vec<Plan>> {
     let amount = asked(wallet, code, amount)?;
     let Some(licash) = &code.licash else {
         return Err(unpayable(code, amount));
@@ -187,7 +303,9 @@ pub async fn plans<T: Transport>(
             continue;
         };
         let limits = SwapLimits::usual(lacks);
-        let found = swap_providers(wallet, &relays, route, (from, to), lacks, limits).await;
+        let pair = (from.as_str(), to.as_str());
+        let found =
+            swap_providers_with(wallet, announced, &relays, route, pair, lacks, limits).await;
         let found = match found {
             Ok(found) => found,
             Err(e) => {
@@ -493,12 +611,25 @@ pub async fn swap_providers<T: Transport>(
     wallet: &Wallet<T>,
     relays: &[String],
     route: &Route,
+    pair: (&str, &str),
+    amount: u64,
+    limits: SwapLimits,
+) -> anyhow::Result<Vec<SwapProvider>> {
+    let announced = Announcements::default();
+    swap_providers_with(wallet, &announced, relays, route, pair, amount, limits).await
+}
+
+/// [`swap_providers`], those announced as `announced` keeps them.
+pub async fn swap_providers_with<T: Transport>(
+    wallet: &Wallet<T>,
+    announced: &Announcements,
+    relays: &[String],
+    route: &Route,
     (from, to): (&str, &str),
     amount: u64,
     limits: SwapLimits,
 ) -> anyhow::Result<Vec<SwapProvider>> {
     let network = wallet.network().name();
-    let found = crate::discover(relays, route, Role::Swaps, network).await?;
     let used: HashSet<String> = wallet
         .swaps()?
         .into_iter()
@@ -506,7 +637,9 @@ pub async fn swap_providers<T: Transport>(
         .map(|s| s.provider)
         .collect();
     let ask = |url: String| async move { wallet.swap_quote(&url, from, to, amount, limits).await };
-    let answering = answering(found, ask, |q: &SwapQuote| q.info.nostr.as_deref()).await?;
+    let on = (relays, route, network);
+    let answering = announced.answering(on, ask, |q: &SwapQuote| q.info.nostr.as_deref());
+    let answering = answering.await?;
     let mut providers: Vec<SwapProvider> = answering
         .into_iter()
         .map(|(service, url, quote)| SwapProvider {
@@ -621,12 +754,25 @@ pub async fn payout_providers<T: Transport>(
     wallet: &Wallet<T>,
     relays: &[String],
     route: &Route,
+    pair: (&str, &str),
+    amount: u64,
+    limits: (u64, FeeRate),
+) -> anyhow::Result<Vec<PayoutProvider>> {
+    let announced = Announcements::default();
+    payout_providers_with(wallet, &announced, relays, route, pair, amount, limits).await
+}
+
+/// [`payout_providers`], those announced as `announced` keeps them.
+pub async fn payout_providers_with<T: Transport>(
+    wallet: &Wallet<T>,
+    announced: &Announcements,
+    relays: &[String],
+    route: &Route,
     (from, to): (&str, &str),
     amount: u64,
     (max_fee, rate): (u64, FeeRate),
 ) -> anyhow::Result<Vec<PayoutProvider>> {
     let network = wallet.network().name();
-    let found = crate::discover(relays, route, Role::Swaps, network).await?;
     let used: HashSet<String> = wallet
         .payouts()?
         .into_iter()
@@ -637,7 +783,9 @@ pub async fn payout_providers<T: Transport>(
         let quote = wallet.payout_quote(&url, from, to, amount, max_fee, rate);
         quote.await
     };
-    let answering = answering(found, ask, |q: &PayoutQuote| q.info.nostr.as_deref()).await?;
+    let on = (relays, route, network);
+    let answering = announced.answering(on, ask, |q: &PayoutQuote| q.info.nostr.as_deref());
+    let answering = answering.await?;
     let mut providers: Vec<PayoutProvider> = answering
         .into_iter()
         .map(|(service, url, quote)| PayoutProvider {
@@ -694,4 +842,133 @@ where
         answering.extend(asked?);
     }
     Ok(answering)
+}
+
+#[cfg(test)]
+mod tests {
+    use nostr_sdk::prelude::MockRelay;
+
+    use super::*;
+    use crate::{Announcement, Announcer};
+
+    fn provider(at: u64) -> Found {
+        Found {
+            key: "a".repeat(64),
+            announcement: Announcement {
+                urls: vec!["https://swaps.example".into()],
+                network: "regtest".into(),
+                name: None,
+            },
+            at,
+        }
+    }
+
+    fn now() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    /// A provider's answer: the key it names.
+    struct Answer(String);
+
+    fn named(answer: &Answer) -> Option<&str> {
+        Some(&answer.0)
+    }
+
+    #[tokio::test]
+    async fn providers_found_are_kept_for_quotes_without_the_relays() {
+        let relay = MockRelay::run().await.unwrap();
+        let relays = [relay.url().await.to_string()];
+        let announcer = Announcer::new(&[9; 32], Role::Swaps, &relays, &Route::Direct);
+        let announcement = provider(0).announcement;
+        announcer
+            .await
+            .unwrap()
+            .announce(&announcement)
+            .await
+            .unwrap();
+        let key = crate::public_key(&[9; 32]).unwrap();
+        let answers = |_: String| {
+            let key = key.clone();
+            async move { Ok(Answer(key)) }
+        };
+        let down = |_: String| async { Err::<Answer, _>(Error::Invalid("down".into())) };
+        let route = Route::Direct;
+        let announced = Announcements::default();
+
+        // Looked for as asked, but not kept: a provider announced since
+        // would be found the next time.
+        let found = announced
+            .answering((&relays[..], &route, "regtest"), answers, named)
+            .await;
+        assert_eq!(found.unwrap()[0].1, "https://swaps.example");
+        assert!(announced.kept(&relays, "regtest").is_none());
+        let found = announced.refresh(&relays, &Route::Direct, "regtest");
+        assert_eq!(found.await.unwrap(), 1);
+
+        // The relay gone, those kept answer, however its URL is listed.
+        relay.shutdown();
+        let twice = [relays[0].clone(), relays[0].clone()];
+        let found = announced
+            .answering((&twice[..], &route, "regtest"), answers, named)
+            .await;
+        assert_eq!(found.unwrap().len(), 1);
+        // None of those kept answering, they are looked for again.
+        assert!(announced
+            .answering((&relays[..], &route, "regtest"), down, named)
+            .await
+            .is_err());
+        // Not for another network, nor other relays: those are asked.
+        assert!(announced.kept(&relays, "signet").is_none());
+        let others = ["ws://127.0.0.1:1".to_owned()];
+        assert!(announced.kept(&others, "regtest").is_none());
+        assert!(announced
+            .answering((&others[..], &route, "regtest"), answers, named)
+            .await
+            .is_err());
+        // Failing to find them again, those kept stay.
+        assert!(announced
+            .refresh(&relays, &Route::Direct, "regtest")
+            .await
+            .is_err());
+        assert_eq!(announced.kept(&relays, "regtest").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn providers_kept_too_long_or_expired_since_are_not_used() {
+        let relays = ["ws://relay.example".to_owned()];
+        let keep = |found: Vec<Found>, at: Instant| {
+            let announced = Announcements::default();
+            let relays = set_of(&relays);
+            let network = "regtest".to_owned();
+            *announced.0.lock().unwrap() = Some(Kept {
+                found,
+                relays,
+                network,
+                at,
+            });
+            announced
+        };
+        let fresh = keep(vec![provider(now())], Instant::now());
+        assert_eq!(fresh.kept(&relays, "regtest").unwrap().len(), 1);
+        // Found a while ago: looked for again.
+        if let Some(then) = Instant::now().checked_sub(KEPT_FOR) {
+            assert!(keep(vec![provider(now())], then)
+                .kept(&relays, "regtest")
+                .is_none());
+        }
+        // Announced so long ago that it expired since: left out.
+        let old = now() - LIFETIME.as_secs();
+        let kept = keep(vec![provider(old), provider(now())], Instant::now());
+        assert_eq!(kept.kept(&relays, "regtest").unwrap().len(), 1);
+        assert!(keep(vec![provider(old)], Instant::now())
+            .kept(&relays, "regtest")
+            .is_none());
+        // None found: looked for again, a provider may have announced since.
+        assert!(keep(Vec::new(), Instant::now())
+            .kept(&relays, "regtest")
+            .is_none());
+    }
 }
