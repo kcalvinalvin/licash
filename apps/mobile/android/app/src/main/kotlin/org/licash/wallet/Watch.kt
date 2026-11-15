@@ -52,7 +52,7 @@ internal fun watchOf(ui: Ui, now: Long): Watch {
  * A deposit whose own payment on Bitcoin was never sent: it ends only once
  * its hub cancels it. Where it stands unread, perhaps sent.
  */
-private fun unpaid(activity: Activity, details: Details?): Boolean =
+internal fun unpaid(activity: Activity, details: Details?): Boolean =
     activity.kind == Kind.MOVED && details is Details.Moved && details.payment == null
 
 /** The lines finished since last looked, and those under way now, by [key]. */

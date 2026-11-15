@@ -165,7 +165,8 @@ fun BigButton(
 
 /**
  * A state in a glyph and a word or two, never by color alone: `busy` turns
- * the glyph into a spinner, and a tap, if it takes one, opens more.
+ * the glyph into a spinner, and a tap, if it takes one, opens more. `tag`
+ * names its words, for the tests to read.
  */
 @Composable
 fun Pill(
@@ -174,6 +175,7 @@ fun Pill(
     modifier: Modifier = Modifier,
     tint: Color = MaterialTheme.colorScheme.onSurfaceVariant,
     busy: Boolean = false,
+    tag: String? = null,
     onClick: (() -> Unit)? = null,
 ) {
     val shape = RoundedCornerShape(50)
@@ -191,7 +193,7 @@ fun Pill(
             Spacer(Modifier.width(8.dp))
             Text(
                 text,
-                Modifier.weight(1f, fill = false),
+                Modifier.weight(1f, fill = false).then(if (tag != null) Modifier.testTag(tag) else Modifier),
                 style = MaterialTheme.typography.labelLarge,
                 color = tint,
                 maxLines = 1,

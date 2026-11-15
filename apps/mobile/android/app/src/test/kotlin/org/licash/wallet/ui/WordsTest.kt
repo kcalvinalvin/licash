@@ -67,4 +67,17 @@ class WordsTest {
         assertEquals("6 days", span(861))
         assertEquals("7 days", span(1_001))
     }
+
+    @Test
+    fun a_day_is_said_as_short_as_today_lets_it() {
+        val zone = java.time.ZoneId.of("UTC")
+        val us = java.util.Locale.US
+        // 2026-11-15 12:00 UTC.
+        val now = 1_794_744_000L
+        // Narrow or plain, the space before PM is the JDK's to choose.
+        assertEquals("11:00 AM", day(now - 3_600, now, zone, us).replace('\u202f', ' '))
+        assertEquals("Yesterday", day(now - 86_400, now, zone, us))
+        assertEquals("Nov 13", day(now - 2 * 86_400, now, zone, us))
+        assertEquals("Dec 31, 2025", day(1_767_182_400L, now, zone, us))
+    }
 }

@@ -36,6 +36,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import org.licash.core.Activity
 import org.licash.wallet.ui.ActivityDetails
 import org.licash.wallet.ui.BalanceDetails
+import org.licash.wallet.ui.History
 import org.licash.wallet.ui.Home
 import org.licash.wallet.ui.LicashTheme
 import org.licash.wallet.ui.Onboarding
@@ -58,13 +59,19 @@ private sealed interface Screen {
     ) : Screen
     data object Settings : Screen
     data class Balance(val from: Screen = Home) : Screen
-    data class Details(val activity: Activity) : Screen
+
+    /** The history: what came in and went out. */
+    data object History : Screen
+
+    /** One line of the history, opened from `from`. */
+    data class Details(val activity: Activity, val from: Screen = History) : Screen
 }
 
 /** The screen back goes to from `screen`. */
 private fun parent(screen: Screen): Screen = when (screen) {
     is Screen.Send -> screen.from
     is Screen.Balance -> screen.from
+    is Screen.Details -> screen.from
     else -> Screen.Home
 }
 
@@ -140,9 +147,11 @@ private fun App(engine: Engine, link: String?, linkShown: () -> Unit) {
                         receive = { screen = Screen.Receive },
                         send = { screen = Screen.Send(null) },
                         settings = { screen = Screen.Settings },
-                        balance = { screen = Screen.Balance() },
-                        open = { screen = Screen.Details(it) },
+                        money = { screen = Screen.Balance() },
+                        history = { screen = Screen.History },
+                        open = { screen = Screen.Details(it, Screen.Home) },
                     )
+                    Screen.History -> History(ui, open = { screen = Screen.Details(it) }) { screen = Screen.Home }
                     Screen.Receive -> Receive(engine) { screen = Screen.Home }
                     is Screen.Send -> Send(engine, ui, s.link, s.cashOut, s.own) { screen = s.from }
                     Screen.Settings -> Settings(engine, ui, balance = { screen = Screen.Balance(Screen.Settings) }) {
@@ -154,7 +163,7 @@ private fun App(engine: Engine, link: String?, linkShown: () -> Unit) {
                         cashOut = { screen = Screen.Send(null, it, s) },
                         payOwn = { link, own -> screen = Screen.Send(link, from = s, own = own) },
                     ) { screen = s.from }
-                    is Screen.Details -> ActivityDetails(engine, ui, s.activity) { screen = Screen.Home }
+                    is Screen.Details -> ActivityDetails(engine, ui, s.activity) { screen = s.from }
                 }
             }
         }

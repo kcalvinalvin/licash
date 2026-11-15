@@ -1,8 +1,8 @@
 package org.licash.wallet.ui
 
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -12,15 +12,13 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Warning
-import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -30,31 +28,38 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
+import androidx.compose.ui.input.nestedscroll.NestedScrollSource
+import androidx.compose.ui.input.nestedscroll.nestedScroll
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
-import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Velocity
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.launch
 import org.licash.core.Activity
-import org.licash.core.Details
-import org.licash.core.Kind
-import org.licash.core.State
 import org.licash.wallet.Engine
 import org.licash.wallet.Ui
-import org.licash.wallet.at
-import org.licash.wallet.credit
 import org.licash.wallet.digits
 import org.licash.wallet.explain
-import org.licash.wallet.host
-import org.licash.wallet.key
-import org.licash.wallet.sat
 import org.licash.wallet.total
 
+/**
+ * Home, at a glance: what the wallet holds, how much of it is protected,
+ * and what is going on, if anything; to receive and to send. The rest is a
+ * tap away: where the money is behind the balance, the history behind
+ * Activity, or a swipe up.
+ */
 @Composable
 fun Home(
     engine: Engine,
@@ -62,104 +67,148 @@ fun Home(
     receive: () -> Unit,
     send: () -> Unit,
     settings: () -> Unit,
-    balance: () -> Unit,
+    money: () -> Unit,
+    history: () -> Unit,
     open: (Activity) -> Unit,
 ) {
-    // One list, the balance and buttons atop the history: all of it
-    // scrolls on short screens and with large fonts.
-    LazyColumn(Modifier.fillMaxSize().padding(horizontal = 24.dp)) {
-        item(key = "top") {
-            Column {
-                Row(Modifier.fillMaxWidth().padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Wordmark()
-                    Spacer(Modifier.width(10.dp))
-                    NetworkChip(ui.network)
-                    Spacer(Modifier.weight(1f))
-                    IconButton(onClick = settings) { Icon(Icons.Default.Settings, contentDescription = "Settings") }
-                }
-                Spacer(Modifier.height(40.dp))
-                Total(ui, balance)
-                Spacer(Modifier.height(32.dp))
-                if (ui.hubs.isEmpty()) {
-                    ConnectHub(engine)
-                } else {
-                    Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                        BigButton("Receive", Modifier.weight(1f), onClick = receive)
-                        BigButton("Send", Modifier.weight(1f), onClick = send)
-                    }
-                }
-                Spacer(Modifier.height(28.dp))
+    // A swipe up opens the history, wherever it starts: what the middle,
+    // which scrolls, leaves of one, and one over the rest.
+    val up by rememberUpdatedState(history)
+    val far = with(LocalDensity.current) { 64.dp.toPx() }
+    val pull = remember(far) {
+        object : NestedScrollConnection {
+            var dragged = 0f
+
+            override fun onPostScroll(consumed: Offset, available: Offset, source: NestedScrollSource): Offset {
+                if (source == NestedScrollSource.UserInput) dragged += available.y
+                return Offset.Zero
+            }
+
+            override suspend fun onPreFling(available: Velocity): Velocity {
+                if (dragged < -far) up()
+                dragged = 0f
+                return Velocity.Zero
             }
         }
-        if (ui.history.isEmpty() && ui.incoming.isEmpty()) {
-            item(key = "none") {
+    }
+    Column(
+        Modifier.fillMaxSize().padding(horizontal = 24.dp).nestedScroll(pull).pointerInput(far) {
+            var dragged = 0f
+            detectVerticalDragGestures(
+                onDragStart = { dragged = 0f },
+                onDragEnd = { if (dragged < -far) up() },
+            ) { _, by -> dragged += by }
+        },
+    ) {
+        Row(Modifier.fillMaxWidth().padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+            Wordmark()
+            Spacer(Modifier.width(10.dp))
+            NetworkChip(ui.network)
+            Spacer(Modifier.weight(1f))
+            IconButton(onClick = settings) { Icon(Icons.Default.Settings, contentDescription = "Settings") }
+        }
+        // In the middle of what is left, scrolling on short screens and with large fonts.
+        Column(
+            Modifier.fillMaxWidth().weight(1f).verticalScroll(rememberScrollState()),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center,
+        ) {
+            Total(ui, money)
+            Going(ui, money, history, open)
+            if (ui.hubs.isEmpty()) {
+                Spacer(Modifier.height(32.dp))
+                ConnectHub(engine)
+            }
+        }
+        if (ui.hubs.isNotEmpty()) {
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                BigButton("Receive", Modifier.weight(1f), onClick = receive)
+                BigButton("Send", Modifier.weight(1f), onClick = send)
+            }
+            Column(
+                Modifier.fillMaxWidth().padding(top = 8.dp, bottom = 8.dp).clip(RoundedCornerShape(16.dp))
+                    .clickable(onClick = history).padding(vertical = 8.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                Icon(
+                    Icons.Default.KeyboardArrowUp,
+                    contentDescription = null,
+                    Modifier.size(20.dp),
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
                 Text(
-                    "Nothing yet. What you receive and send shows here.",
-                    style = MaterialTheme.typography.bodyMedium,
+                    "Activity",
+                    modifier = Modifier.testTag("activity"),
+                    style = MaterialTheme.typography.labelLarge,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
         }
-        items(ui.incoming, key = { "coming " + it.id }) { activity ->
-            ActivityRow(activity, coming = true) { open(activity) }
-            HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.4f))
-        }
-        items(ui.history, key = { it.key }) { activity ->
-            ActivityRow(activity, details = ui.under[activity.key]) { open(activity) }
-            HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.4f))
-        }
     }
 }
 
+/** What the wallet holds, and how much of it is protected: both open where it is. */
 @Composable
 private fun Total(ui: Ui, open: () -> Unit) {
-    val b = ui.balance
-    Row(Modifier.clickable(onClick = open), verticalAlignment = Alignment.Bottom) {
-        Text(digits(b.total), modifier = Modifier.testTag("balance"), style = Figures)
+    val colors = MaterialTheme.colorScheme
+    val figure = digits(ui.balance.total)
+    Row(
+        Modifier.clip(RoundedCornerShape(16.dp)).clickable(onClick = open).padding(horizontal = 8.dp),
+        verticalAlignment = Alignment.Bottom,
+    ) {
+        // Smaller once long, to stay on one line.
+        val size = when {
+            figure.length <= 9 -> 56
+            figure.length <= 11 -> 46
+            else -> 36
+        }
+        Text(
+            figure,
+            modifier = Modifier.testTag("balance"),
+            style = Figures.copy(fontSize = size.sp),
+            maxLines = 1,
+        )
         Text(
             " sat",
             modifier = Modifier.padding(bottom = 8.dp),
             style = MaterialTheme.typography.titleMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            color = colors.onSurfaceVariant,
         )
     }
-    // Owed by hubs on trust alone: as plain as it gets.
-    if (b.credit > 0uL) {
-        Text(
-            "${sat(b.credit)} on credit",
-            modifier = Modifier.clickable(onClick = open).padding(vertical = 4.dp).testTag("credit"),
-            style = MaterialTheme.typography.headlineSmall,
-            color = MaterialTheme.colorScheme.error,
+    val held = protection(ui.balance)
+    held.label?.let { label ->
+        Spacer(Modifier.height(12.dp))
+        Pill(
+            icon = if (held.shield == Shield.NONE) Glyphs.shieldOff else Glyphs.shield,
+            text = label,
+            // Calm, whichever: what is not protected is said, not shouted.
+            tint = if (held.shield == Shield.ALL) colors.primary else colors.onSurfaceVariant,
+            tag = "protection",
+            onClick = open,
         )
     }
-    val notes = buildList {
-        if (b.moving > 0uL) add("${sat(b.moving)} on its way from Bitcoin")
-        if (b.onchain > b.kept) add("${sat(b.onchain - b.kept)} on Bitcoin, moved in once enough")
-        if (b.kept > 0uL) add("${sat(b.kept)} cashed out, kept on Bitcoin")
-        if (b.covered > 0uL) add("${sat(b.covered)} in notes protected by contracts")
-        if (b.opening > 0uL) add("${sat(b.opening)} coming back from opening a contract")
-        ui.opening?.let { add("Opening a contract at ${host(it)}…") }
-        val coming = ui.incoming.sumOf { it.amount }
-        if (coming > 0uL) add("${sat(coming)} coming on Bitcoin, waiting for a block")
-        if (b.notesPending > 0uL) add("${sat(b.notesPending)} still settling")
-        if (!ui.chain.synced && ui.hubs.isNotEmpty()) add("Catching up with Bitcoin…")
-        ui.problem?.let { add(it) }
-    }
-    for (note in notes) {
-        Text(
-            note,
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            maxLines = 2,
-            overflow = TextOverflow.Ellipsis,
-        )
-    }
-    Text(
-        "Where it is",
-        modifier = Modifier.clickable(onClick = open).padding(vertical = 6.dp),
-        style = MaterialTheme.typography.labelLarge,
-        color = MaterialTheme.colorScheme.primary,
+}
+
+/** What is going on, in a line: see [glance]. */
+@Composable
+private fun Going(ui: Ui, money: () -> Unit, history: () -> Unit, open: (Activity) -> Unit) {
+    val going = glance(ui, System.currentTimeMillis() / 1000) ?: return
+    var why by remember { mutableStateOf<String?>(null) }
+    Spacer(Modifier.height(8.dp))
+    Pill(
+        icon = Icons.Default.Warning,
+        text = going.text,
+        busy = going !is Glance.Behind,
+        tag = "status",
+        onClick = when (going) {
+            is Glance.One -> ({ open(going.activity) })
+            is Glance.Many -> history
+            is Glance.Protecting -> money
+            is Glance.Behind -> ({ why = going.reason })
+            Glance.Syncing -> null
+        },
     )
+    why?.let { Sheet("Not up to date", dismiss = { why = null }) { Say(it) } }
 }
 
 /** No hub yet: nothing works without one. */
@@ -196,102 +245,5 @@ private fun ConnectHub(engine: Engine) {
                 }
             }
         }
-    }
-}
-
-/**
- * A line of the history: what it was, an icon of its kind and direction,
- * and when it was; one under way tells which step it is at, from
- * [details], as its page does.
- */
-@Composable
-private fun ActivityRow(activity: Activity, coming: Boolean = false, details: Details? = null, open: () -> Unit) {
-    val colors = MaterialTheme.colorScheme
-    val failed = !coming && activity.state == State.FAILED
-    val under = !coming && activity.state == State.PENDING
-    val sign = when {
-        activity.kind == Kind.SWAP -> ""
-        !coming && paid(activity) -> "−"
-        else -> "+"
-    }
-    val detail = when {
-        coming -> "Waiting for a block"
-        failed -> activity.detail
-        // "Under way" itself shows beside the title.
-        under -> status(activity, false, details).takeIf { details != null && it != "Under way" }
-        else -> activity.at?.let { at(it) } ?: activity.detail
-    }
-    val tint = when {
-        failed -> colors.error
-        coming -> colors.onSurfaceVariant
-        sign == "+" -> colors.primary
-        activity.kind == Kind.SWAP -> colors.secondary
-        else -> colors.onSurfaceVariant
-    }
-    Row(
-        Modifier.fillMaxWidth().clickable(onClick = open).padding(vertical = 12.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Surface(Modifier.size(40.dp), shape = CircleShape, color = tint.copy(alpha = 0.14f)) {
-            Box(contentAlignment = Alignment.Center) {
-                Icon(glyph(activity, coming, failed), contentDescription = null, Modifier.size(20.dp), tint = tint)
-            }
-        }
-        Spacer(Modifier.width(14.dp))
-        Column(Modifier.weight(1f)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(
-                    title(activity, coming),
-                    Modifier.weight(1f, fill = false),
-                    style = MaterialTheme.typography.bodyLarge,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-                if (under) {
-                    Spacer(Modifier.width(8.dp))
-                    Surface(shape = RoundedCornerShape(50), color = colors.tertiary.copy(alpha = 0.16f)) {
-                        Text(
-                            "Under way",
-                            Modifier.padding(horizontal = 8.dp, vertical = 2.dp),
-                            style = MaterialTheme.typography.labelSmall,
-                            color = colors.tertiary,
-                        )
-                    }
-                }
-            }
-            detail?.let {
-                Text(
-                    it,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = if (failed) colors.error else colors.onSurfaceVariant,
-                    maxLines = 2,
-                    overflow = TextOverflow.Ellipsis,
-                )
-            }
-        }
-        Spacer(Modifier.width(12.dp))
-        Text(
-            "$sign${sat(activity.amount)}",
-            style = MaterialTheme.typography.bodyLarge,
-            color = when {
-                failed -> colors.error
-                coming -> colors.onSurfaceVariant
-                sign == "+" -> colors.primary
-                else -> colors.onSurface
-            },
-        )
-    }
-}
-
-/** The icon of a line of the history: failed, or its kind and direction. */
-private fun glyph(activity: Activity, coming: Boolean, failed: Boolean): ImageVector = when {
-    failed -> Icons.Default.Warning
-    coming -> Glyphs.down
-    else -> when (activity.kind) {
-        Kind.LIGHTNING, Kind.INVOICE -> Glyphs.bolt
-        Kind.SWAP -> Glyphs.swap
-        Kind.CONTRACT -> Icons.Default.Lock
-        Kind.SENT, Kind.PAYOUT -> Glyphs.up
-        Kind.RECEIVED, Kind.MOVED, Kind.ONCHAIN -> Glyphs.down
     }
 }

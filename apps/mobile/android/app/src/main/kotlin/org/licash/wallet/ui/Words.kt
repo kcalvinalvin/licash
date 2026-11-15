@@ -80,3 +80,27 @@ fun span(blocks: Long): String {
         else -> "$days days"
     }
 }
+
+/**
+ * When `seconds` since 1970 was, as short as `now` lets it be said: the
+ * time today, `Yesterday`, `Nov 13`, and with its year once it is another.
+ */
+fun day(
+    seconds: Long,
+    now: Long,
+    zone: java.time.ZoneId = java.time.ZoneId.systemDefault(),
+    locale: java.util.Locale = java.util.Locale.getDefault(),
+): String {
+    val at = java.time.Instant.ofEpochSecond(seconds).atZone(zone)
+    val date = at.toLocalDate()
+    val today = java.time.Instant.ofEpochSecond(now).atZone(zone).toLocalDate()
+    val format = { pattern: String -> at.format(java.time.format.DateTimeFormatter.ofPattern(pattern, locale)) }
+    return when {
+        date == today -> at.format(
+            java.time.format.DateTimeFormatter.ofLocalizedTime(java.time.format.FormatStyle.SHORT).withLocale(locale),
+        )
+        date == today.minusDays(1) -> "Yesterday"
+        date.year == today.year -> format("MMM d")
+        else -> format("MMM d, yyyy")
+    }
+}
