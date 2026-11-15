@@ -94,6 +94,19 @@ async fn the_api_answers_what_the_provider_swaps_and_declines_the_rest() {
     let (status, _) = call(&router, "/v1/swaps/zz", None).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 
+    // Paying nothing out on Bitcoin: no payout taken, none known.
+    assert_eq!(info.chain, None);
+    let payout = swaps::ChainRequest::new(&address, &id, [2; 32], 20_000);
+    let body = serde_json::to_string(&payout).unwrap();
+    let (status, answer) = call(&router, swaps::CHAIN_SWAPS, Some(&body)).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let declined = problem(&answer);
+    assert_eq!(declined.code, Code::Declined);
+    assert!(declined.message.contains("no payouts"), "{declined:?}");
+    let (status, answer) = call(&router, &swaps::chain_swap_state(&id), None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(problem(&answer).code, Code::UnknownLock);
+
     let (status, body) = call(&router, licash_swaps_service::HEALTH, None).await;
     assert_eq!(
         (status, body.as_slice()),
@@ -136,6 +149,17 @@ fn init_creates_the_provider_once_and_status_reads_it() {
     assert!(String::from_utf8(text.stdout).unwrap().contains("earned"));
     let events = licash_swaps(&dir, &["events"]);
     assert!(events.status.success() && events.stdout.is_empty());
+    // An address on Bitcoin to fund payouts at, watched from a first block,
+    // given once: the same until paid.
+    let unwatched = licash_swaps(&dir, &["address"]);
+    assert!(!unwatched.status.success());
+    assert!(String::from_utf8_lossy(&unwatched.stderr).contains("--chain-from"));
+    let funding = licash_swaps(&dir, &["address", "--chain-from", "900000"]);
+    assert!(funding.status.success(), "{funding:?}");
+    let funding = String::from_utf8(funding.stdout).unwrap();
+    assert!(funding.starts_with("bc1p"), "{funding}");
+    let again = licash_swaps(&dir, &["address"]);
+    assert_eq!(String::from_utf8(again.stdout).unwrap(), funding);
 
     let signet = tempfile::tempdir().unwrap();
     let init = licash_swaps(&signet, &["init", "--network", "signet"]);

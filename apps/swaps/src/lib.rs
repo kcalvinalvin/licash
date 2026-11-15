@@ -1,6 +1,6 @@
 //! The swap provider service: a [`Provider`] behind the HTTP API of
-//! [`licash_api::swaps`], the steps that take its swaps on, and its
-//! announcement on Nostr.
+//! [`licash_api::swaps`], the steps that take its swaps on, the chain its
+//! payouts on Bitcoin follow, and its announcement on Nostr.
 
 pub mod notify;
 
@@ -13,12 +13,14 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use bitcoin::{BlockHash, Transaction};
 use licash_api::{
-    swaps::{self, Request, Swap},
+    swaps::{self, ChainRequest, ChainSwap, Request, Swap},
     Code, Problem,
 };
+use licash_chain_client::Source;
 use licash_nostr::{Announcement, Announcer, Role, Route};
-use licash_swaps::Provider;
+use licash_swaps::{Chain, Provider};
 use licash_wallet::Transport;
 use tower_http::trace::TraceLayer;
 
@@ -28,20 +30,78 @@ pub const BODY_LIMIT: usize = 64 * 1024;
 /// `ok` while the service serves.
 pub const HEALTH: &str = "/health";
 
-struct Served<T: Transport> {
+/// A chain source, as the provider reads Bitcoin and broadcasts through it.
+pub struct ChainView(pub Source);
+
+fn text(e: anyhow::Error) -> String {
+    format!("{e:#}")
+}
+
+impl licash_wallet::Blocks for ChainView {
+    async fn height(&self) -> Result<u32, String> {
+        Ok(self.0.tip().await.map_err(text)?.height)
+    }
+
+    async fn hash(&self, height: u32) -> Result<BlockHash, String> {
+        self.0.hash(height).await.map_err(text)
+    }
+
+    async fn filter(&self, hash: &BlockHash) -> Result<Option<Vec<u8>>, String> {
+        self.0.filter(hash).await.map_err(text)
+    }
+
+    async fn block(&self, hash: &BlockHash) -> Result<bitcoin::Block, String> {
+        self.0.block(hash).await.map_err(text)
+    }
+}
+
+impl Chain for ChainView {
+    async fn broadcast(&self, tx: &Transaction) -> Result<(), String> {
+        self.0.broadcast(tx).await.map(|_| ()).map_err(text)
+    }
+}
+
+struct Served<T: Transport, C> {
     provider: Arc<Provider<T>>,
     nostr: Option<String>,
+    /// The chain payouts are paid on, if the provider pays out.
+    chain: Option<Arc<C>>,
 }
 
 /// The API of `provider`, whose info names `nostr`, the key it announces
-/// itself under, if given.
+/// itself under, if given. It pays nothing out on Bitcoin.
 pub fn router<T: Transport + 'static>(provider: Arc<Provider<T>>, nostr: Option<String>) -> Router {
+    routes::<T, ChainView>(provider, nostr, None)
+}
+
+/// [`router`], for a provider paying out on Bitcoin
+/// ([`Provider::pay_out`]) on `chain`.
+pub fn router_paying_out<T: Transport + 'static, C: Chain + Send + 'static>(
+    provider: Arc<Provider<T>>,
+    nostr: Option<String>,
+    chain: Arc<C>,
+) -> Router {
+    routes(provider, nostr, Some(chain))
+}
+
+fn routes<T: Transport + 'static, C: Chain + Send + 'static>(
+    provider: Arc<Provider<T>>,
+    nostr: Option<String>,
+    chain: Option<Arc<C>>,
+) -> Router {
+    let served = Served {
+        provider,
+        nostr,
+        chain,
+    };
     Router::new()
-        .route(swaps::SWAPS_INFO, get(info::<T>))
-        .route(swaps::SWAPS, post(take::<T>))
-        .route(swaps::SWAP_STATE, get(state::<T>))
+        .route(swaps::SWAPS_INFO, get(info::<T, C>))
+        .route(swaps::SWAPS, post(take::<T, C>))
+        .route(swaps::SWAP_STATE, get(state::<T, C>))
+        .route(swaps::CHAIN_SWAPS, post(take_payout::<T, C>))
+        .route(swaps::CHAIN_SWAP_STATE, get(payout_state::<T, C>))
         .route(HEALTH, get(|| async { "ok" }))
-        .with_state(Arc::new(Served { provider, nostr }))
+        .with_state(Arc::new(served))
         .layer(DefaultBodyLimit::max(BODY_LIMIT))
         .layer(TraceLayer::new_for_http())
 }
@@ -82,14 +142,19 @@ impl From<licash_swaps::Error> for Failure {
 
 type Answer<T> = Result<Json<T>, Failure>;
 
-async fn info<T: Transport + 'static>(State(served): State<Arc<Served<T>>>) -> Answer<swaps::Info> {
+type Shared<T, C> = State<Arc<Served<T, C>>>;
+
+async fn info<T: Transport + 'static, C>(State(served): Shared<T, C>) -> Answer<swaps::Info> {
     let mut info = served.provider.info()?;
+    if served.chain.is_none() {
+        info.chain = None;
+    }
     info.nostr = served.nostr.clone();
     Ok(Json(info))
 }
 
-async fn take<T: Transport + 'static>(
-    State(served): State<Arc<Served<T>>>,
+async fn take<T: Transport + 'static, C>(
+    State(served): Shared<T, C>,
     body: Result<Json<Request>, JsonRejection>,
 ) -> Answer<Swap> {
     let Json(request) = body?;
@@ -99,14 +164,43 @@ async fn take<T: Transport + 'static>(
     Ok(Json(swap))
 }
 
-async fn state<T: Transport + 'static>(
-    State(served): State<Arc<Served<T>>>,
+async fn state<T: Transport + 'static, C>(
+    State(served): Shared<T, C>,
     Path(id): Path<String>,
 ) -> Answer<Swap> {
     let id = licash_api::lock_id(&id)?;
     match served.provider.swap(&id)? {
         Some(swap) => Ok(Json(swap)),
         None => Err(Problem::new(Code::UnknownLock, "no such swap").into()),
+    }
+}
+
+async fn take_payout<T: Transport + 'static, C: Chain>(
+    State(served): Shared<T, C>,
+    body: Result<Json<ChainRequest>, JsonRejection>,
+) -> Answer<ChainSwap> {
+    let Json(request) = body?;
+    let Some(chain) = &served.chain else {
+        return Err(Problem::new(Code::Declined, "no payouts on Bitcoin").into());
+    };
+    let payout = served
+        .provider
+        .take_payout(&request, chain.as_ref())
+        .await
+        .inspect_err(|p| {
+            tracing::debug!(code = ?p.code, message = %p.message, "payout declined");
+        })?;
+    Ok(Json(payout))
+}
+
+async fn payout_state<T: Transport + 'static, C>(
+    State(served): Shared<T, C>,
+    Path(id): Path<String>,
+) -> Answer<ChainSwap> {
+    let id = licash_api::lock_id(&id)?;
+    match served.provider.payout(&id)? {
+        Some(payout) => Ok(Json(payout)),
+        None => Err(Problem::new(Code::UnknownLock, "no such payout").into()),
     }
 }
 
@@ -129,6 +223,25 @@ pub async fn step<T: Transport + 'static>(provider: Arc<Provider<T>>, every: Dur
                 }
             }
             Err(e) => tracing::warn!("checking what it holds: {e}"),
+        }
+        tokio::time::sleep(every).await;
+    }
+}
+
+/// Follow the payouts of `provider` on `chain` every `every`, for good.
+pub async fn follow<T: Transport + 'static, C: Chain>(
+    provider: Arc<Provider<T>>,
+    chain: Arc<C>,
+    every: Duration,
+) {
+    loop {
+        match provider.follow_payouts(chain.as_ref()).await {
+            Ok(pending) => {
+                for (id, reason) in pending {
+                    tracing::debug!(%id, reason, "payout pending");
+                }
+            }
+            Err(e) => tracing::warn!("following the payouts: {e}"),
         }
         tokio::time::sleep(every).await;
     }

@@ -12,11 +12,14 @@ use std::{
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use licash::spend::ChainProfile;
-use licash_api::Fee;
+use licash_api::{swaps, Fee};
 use licash_nostr::Route;
 use licash_notify::{Message, Priority, Target};
 use licash_swaps::{Config, Provider};
-use licash_swaps_service::notify::{self, Notifier};
+use licash_swaps_service::{
+    notify::{self, Notifier},
+    ChainView,
+};
 use licash_tor::{Onion, Tor};
 use licash_transport::Http;
 use licash_wallet::Wallet;
@@ -118,6 +121,118 @@ impl Terms {
             min: self.min,
             max: self.max,
             margin: self.margin,
+        })
+    }
+}
+
+/// The chain the provider's wallet follows, for its coins on Bitcoin.
+#[derive(Args)]
+struct ChainArgs {
+    /// Follow Bitcoin at this source: Bitcoin Core's JSON-RPC as
+    /// http://user:password@127.0.0.1:8332 (or ?cookie=PATH), or Esplora as
+    /// esplora+https://esplora.example/api.
+    #[arg(long, env = "LICASH_SWAPS_CHAIN", hide_env_values = true)]
+    chain: Option<String>,
+    /// The first block to look in for the provider's coins, once: an
+    /// earlier one looks again [default: the chain's tip when first
+    /// followed].
+    #[arg(long, env = "LICASH_SWAPS_CHAIN_FROM")]
+    chain_from: Option<u32>,
+}
+
+impl ChainArgs {
+    fn source(&self) -> anyhow::Result<Option<Arc<ChainView>>> {
+        match &self.chain {
+            Some(url) => Ok(Some(Arc::new(ChainView(url.parse().context("--chain")?)))),
+            None => Ok(None),
+        }
+    }
+
+    /// Have `wallet` watch `chain` for its coins: from `--chain-from`, or
+    /// the tip unless it watches already.
+    async fn watch<T: licash_wallet::Transport>(
+        &self,
+        wallet: &Wallet<T>,
+        chain: Option<&ChainView>,
+    ) -> anyhow::Result<()> {
+        let from = match (self.chain_from, wallet.silent_next()?, chain) {
+            (Some(from), ..) => from,
+            (None, Some(_), _) => return Ok(()),
+            (None, None, Some(chain)) => chain.0.tip().await.context("the chain's tip")?.height,
+            (None, None, None) => {
+                anyhow::bail!("--chain or --chain-from: the first block to look in for coins")
+            }
+        };
+        wallet.watch_silent(None, from)?;
+        Ok(())
+    }
+}
+
+/// What the provider pays out on Bitcoin, with `--chain`.
+#[derive(Args)]
+struct PayoutTerms {
+    /// The fee on each payout, in satoshis.
+    #[arg(long, env = "LICASH_SWAPS_PAYOUT_FEE_BASE", default_value_t = 0)]
+    payout_fee_base: u64,
+    /// The fee on each payout, in parts per million of its coin's value.
+    #[arg(long, env = "LICASH_SWAPS_PAYOUT_FEE_PPM", default_value_t = 2000,
+          value_parser = clap::value_parser!(u64).range(0..=1_000_000))]
+    payout_fee_ppm: u64,
+    /// What each payout pays on top for the miners of its coin, in
+    /// satoshis.
+    #[arg(long, env = "LICASH_SWAPS_PAYOUT_MINER", default_value_t = 500)]
+    payout_miner: u64,
+    /// The fee rate its coins are paid at, and its clients' claims
+    /// budgeted at least, in sat/vB [default: the chain's estimate within
+    /// 6 blocks at start, at least 1].
+    #[arg(long, env = "LICASH_SWAPS_PAYOUT_RATE",
+          value_parser = clap::value_parser!(u64).range(1..))]
+    payout_rate: Option<u64>,
+    /// The least a payout's coin is worth.
+    #[arg(long, env = "LICASH_SWAPS_PAYOUT_MIN", default_value_t = 10_000)]
+    payout_min: u64,
+    /// The most a payout's coin is worth.
+    #[arg(long, env = "LICASH_SWAPS_PAYOUT_MAX", default_value_t = 1_000_000)]
+    payout_max: u64,
+    /// Blocks a payout's coin times out before the client's lock expires,
+    /// at least: the provider's time to claim it once the coin is claimed.
+    #[arg(long, env = "LICASH_SWAPS_PAYOUT_MARGIN", default_value_t = 36)]
+    payout_margin: u32,
+}
+
+impl PayoutTerms {
+    /// The terms, at the rate given or `chain` estimates.
+    async fn terms(&self, chain: &ChainView) -> anyhow::Result<swaps::Chain> {
+        anyhow::ensure!(
+            self.payout_min <= self.payout_max,
+            "--payout-min must not exceed --payout-max"
+        );
+        anyhow::ensure!(
+            self.payout_margin > licash_wallet::CLAIM_MARGIN + 2,
+            "--payout-margin must exceed {}",
+            licash_wallet::CLAIM_MARGIN + 2
+        );
+        // In sat per 1000 virtual bytes.
+        let rate = match self.payout_rate {
+            Some(rate) => rate * 1000,
+            None => {
+                let estimate = chain.0.fee_rate(6).await.unwrap_or_else(|e| {
+                    tracing::warn!("no fee estimate: {e:#}");
+                    None
+                });
+                estimate.map_or(1000, |r| r.to_sat_per_kwu() * 4).max(1000)
+            }
+        };
+        Ok(swaps::Chain {
+            fee: Fee {
+                base: self.payout_fee_base,
+                ppm: self.payout_fee_ppm,
+            },
+            miner: self.payout_miner,
+            rate,
+            min: self.payout_min,
+            max: self.payout_max,
+            margin: self.payout_margin,
         })
     }
 }
@@ -265,6 +380,18 @@ enum Command {
         notify_kinds: Vec<String>,
         #[command(flatten)]
         announce: AnnounceArgs,
+        /// With --chain, the provider pays notes out on Bitcoin too, from
+        /// its coins there: fund it at `address`.
+        #[command(flatten)]
+        chain: ChainArgs,
+        #[command(flatten)]
+        payouts: PayoutTerms,
+    },
+    /// Hand out an address on Bitcoin to fund the provider's payouts at:
+    /// a plain taproot address of its wallet, watched from then on.
+    Address {
+        #[command(flatten)]
+        chain: ChainArgs,
     },
     /// Send a test notification to each `--notify` target.
     TestNotify {
@@ -329,8 +456,11 @@ fn command(cli: Cli) -> anyhow::Result<()> {
             notify,
             notify_kinds,
             announce,
+            chain,
+            payouts,
         } => {
             let config = terms.config()?;
+            let source = chain.source()?;
             let mut announcing = announce.announcing(onion)?;
             if let (Some(announcing), Some(proxy)) = (&mut announcing, &proxy) {
                 announcing.route = Route::socks(proxy).context("--proxy")?;
@@ -354,12 +484,32 @@ fn command(cli: Cli) -> anyhow::Result<()> {
                 _ => Http::new(proxy.as_deref())?,
             };
             let provider = open(&data, transport, config)?;
+            let provider = match &source {
+                Some(source) => {
+                    runtime.block_on(chain.watch(provider.wallet(), Some(source)))?;
+                    let terms = runtime.block_on(payouts.terms(source))?;
+                    provider.pay_out(terms)
+                }
+                None => {
+                    let open = provider.open_payouts()?;
+                    anyhow::ensure!(
+                        open == 0,
+                        "{open} payouts on Bitcoin under way: they need --chain"
+                    );
+                    provider
+                }
+            };
             let provider = Arc::new(provider);
             let nostr = match announcing {
                 Some(_) => Some(licash_nostr::public_key(&provider.nostr_secret()?)?),
                 None => None,
             };
-            let router = licash_swaps_service::router(provider.clone(), nostr);
+            let router = match &source {
+                Some(source) => {
+                    licash_swaps_service::router_paying_out(provider.clone(), nostr, source.clone())
+                }
+                None => licash_swaps_service::router(provider.clone(), nostr),
+            };
             let onion = match &client {
                 Some(client) if onion => {
                     let onion = client.serve("licash-swaps", router.clone())?;
@@ -386,9 +536,12 @@ fn command(cli: Cli) -> anyhow::Result<()> {
                 Some(notifier)
             };
             let every = Duration::from_secs(step);
-            let serving = serve(provider, router, listen, every, notifier, announcing);
+            let serving = serve(
+                provider, router, listen, every, notifier, announcing, source,
+            );
             runtime.block_on(serving)
         }
+        Command::Address { chain } => address(&data, &chain),
         Command::TestNotify { notify } => test_notify(&notify),
         Command::Status { json, swaps } => status(&data, json, swaps),
         Command::Events {
@@ -423,6 +576,16 @@ fn init(data: &Path, network: ChainProfile) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Print an address on Bitcoin of the provider's wallet, to fund it at.
+fn address(data: &Path, chain: &ChainArgs) -> anyhow::Result<()> {
+    let provider = open(data, Http::new(None)?, Config::default())?;
+    let source = chain.source()?;
+    let runtime = tokio::runtime::Runtime::new()?;
+    runtime.block_on(chain.watch(provider.wallet(), source.as_deref()))?;
+    println!("{}", provider.wallet().fallback_address()?);
+    Ok(())
+}
+
 fn open(data: &Path, transport: Http, config: Config) -> anyhow::Result<Provider<Http>> {
     let wallet = Wallet::open(&data.join("wallet.sqlite"), transport).context("open the wallet")?;
     Provider::open(&data.join("swaps.sqlite"), wallet, config).context("open the swaps file")
@@ -435,6 +598,7 @@ async fn serve(
     every: Duration,
     notifier: Option<Notifier>,
     announcing: Option<Announcing>,
+    chain: Option<Arc<ChainView>>,
 ) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(listen)
         .await
@@ -459,6 +623,15 @@ async fn serve(
         tokio::spawn(notifier.run())
     });
     let stepping = tokio::spawn(licash_swaps_service::step(provider.clone(), every));
+    let following = chain.map(|chain| {
+        let terms = provider.payout_terms().copied();
+        tracing::info!(
+            chain = %chain.0,
+            terms = %serde_json::to_string(&terms).unwrap_or_default(),
+            "paying out on Bitcoin"
+        );
+        tokio::spawn(licash_swaps_service::follow(provider.clone(), chain, every))
+    });
     let announcing = announcing.map(|a| {
         let (relays, urls) = (a.relays.join(", "), a.urls.join(", "));
         tracing::info!(%relays, %urls, "announcing on Nostr");
@@ -473,7 +646,10 @@ async fn serve(
     axum::serve(listener, router)
         .with_graceful_shutdown(shutdown())
         .await?;
-    for task in [Some(stepping), announcing].into_iter().flatten() {
+    for task in [Some(stepping), following, announcing]
+        .into_iter()
+        .flatten()
+    {
         task.abort();
     }
     if let (Some(notifying), Some(notifier)) = (notifying, notifier) {
@@ -538,6 +714,15 @@ fn status(data: &Path, json: bool, latest: u32) -> anyhow::Result<()> {
     let swaps = provider.records(latest)?;
     let address = hex::encode(provider.wallet().address().to_bytes());
     let network = provider.wallet().network();
+    // Its coins on Bitcoin, for payouts, and those no transaction spends.
+    let coins = provider.wallet().silent_coins()?;
+    let onchain: u64 = coins.iter().map(|c| c.value).sum();
+    let free: u64 = coins
+        .iter()
+        .filter(|c| c.spending.is_none())
+        .map(|c| c.value)
+        .sum();
+    let payouts = provider.open_payouts()?;
     if json {
         let balance: Vec<_> = balance
             .iter()
@@ -548,6 +733,7 @@ fn status(data: &Path, json: bool, latest: u32) -> anyhow::Result<()> {
             "network": network.name(),
             "stats": stats,
             "balance": balance,
+            "onchain": {"total": onchain, "free": free, "open_payouts": payouts},
             "swaps": swaps,
         });
         println!("{status}");
@@ -572,6 +758,9 @@ fn status(data: &Path, json: bool, latest: u32) -> anyhow::Result<()> {
             "hub         {} available {} pending {}",
             b.hub, b.available, b.pending
         );
+    }
+    if onchain > 0 || payouts > 0 {
+        println!("onchain     {onchain} free {free} payouts {payouts}");
     }
     for s in &swaps {
         let stage = serde_json::to_value(s.stage)?;

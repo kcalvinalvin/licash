@@ -26,6 +26,21 @@ started again, but a swap whose client lock expires before it claims it is
 lost (`status` counts it, and a high-priority notification says so):
 `--margin` sets the blocks it keeps for that.
 
+With `--chain URL` (Bitcoin Core's RPC, `http://user:password@host:8332`, or
+Esplora, `esplora+https://esplora.example/api`), the provider also pays notes
+out on Bitcoin: a client locks the coin's value and the fees to it at a hub,
+the provider pays a coin of its own to an HTLC under the lock's hash, timed
+out `--payout-margin` blocks before the lock expires, and claims the lock
+with the preimage the client's claim of the coin reveals on chain. A coin
+never claimed comes back to the provider once timed out. Fund it on chain at
+the address `licash-swaps --data ./swaps address --chain URL` prints: its
+wallet watches the chain from its tip when first started with `--chain`, or
+from `--chain-from`. `--payout-fee-base`, `--payout-fee-ppm`,
+`--payout-miner` (the coin's miners, on top), `--payout-rate` (sat/vB, else
+the chain's estimate at start), `--payout-min` and `--payout-max` set the
+terms; `status` shows the coins. A provider with payouts under way refuses
+to start without `--chain`.
+
 With `--nostr-relay URL --announce-url URL`, the provider announces itself on
 Nostr relays for wallets to discover, under the key `/v1/swaps/info` names.
 With `--tor`, it reaches hubs and relays, onion services included, through a
