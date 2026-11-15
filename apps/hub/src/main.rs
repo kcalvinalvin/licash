@@ -909,6 +909,8 @@ fn command(cli: Cli) -> anyhow::Result<()> {
                 }
                 None => None,
             };
+            let announced = announcing.as_ref().map(|a| a.urls.clone());
+            let urls = Arc::new(std::sync::RwLock::new(announced.unwrap_or_default()));
             let services = Services {
                 gateway: gateway.clone(),
                 deposits: deposits.clone(),
@@ -916,6 +918,7 @@ fn command(cli: Cli) -> anyhow::Result<()> {
                 relays,
                 contracts,
                 swaps,
+                urls: urls.clone(),
             };
             let router = licash_hub_service::router(hub.clone(), services);
             // Served until the hub stops.
@@ -925,6 +928,12 @@ fn command(cli: Cli) -> anyhow::Result<()> {
                     let onion = tor.serve("licash-hub", router.clone())?;
                     tracing::info!(url = onion.url(), "serving as an onion service");
                     announce_over(&mut announcing, &tor, Some(&onion))?;
+                    let mut urls = urls
+                        .write()
+                        .map_err(|_| anyhow::anyhow!("the URLs' lock"))?;
+                    if !urls.iter().any(|url| url == onion.url()) {
+                        urls.push(onion.url().to_owned());
+                    }
                     Some(onion)
                 }
                 false => None,

@@ -118,6 +118,7 @@ impl Hubs {
                 relays: relays.clone(),
                 contracts: None,
                 swaps: None,
+                urls: Default::default(),
             };
             let app = licash_hub_service::router(hub.clone(), services);
             let listener = runtime

@@ -419,6 +419,7 @@ impl Server {
                             relays,
                             contracts: None,
                             swaps: None,
+                            urls: Default::default(),
                         },
                     ),
                 )

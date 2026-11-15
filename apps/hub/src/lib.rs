@@ -54,6 +54,9 @@ pub struct Services {
     pub contracts: Option<Arc<licash_contracts::hub::Openings>>,
     /// The API of the provider of the swaps into it, if it is one.
     pub swaps: Option<Router>,
+    /// The URLs wallets reach it at, named in its info: those it
+    /// announces, and its onion service's once that runs.
+    pub urls: Arc<std::sync::RwLock<Vec<String>>>,
 }
 
 /// The API of `hub`, with the paths of its `services`.
@@ -199,6 +202,7 @@ async fn info(State((hub, services)): State<(Arc<Hub>, Services)>) -> Answer<Inf
     info.deposits = services.deposits.map(|deposits| deposits.advertise());
     info.contracts = services.contracts.map(|openings| openings.advertise());
     info.relays = services.relays;
+    info.urls = (services.urls.read()).map_or_else(|e| e.into_inner().clone(), |urls| urls.clone());
     Ok(Json(info))
 }
 

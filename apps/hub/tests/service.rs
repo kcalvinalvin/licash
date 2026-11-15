@@ -705,3 +705,28 @@ async fn locks_out_of_the_hubs_terms_or_view_are_problems() {
         .await;
     assert_eq!(code(problem), Code::Unavailable);
 }
+
+#[tokio::test]
+async fn its_info_names_the_urls_it_is_reached_at_once_known() {
+    let mut service = service(0);
+    assert!(service.info().await.urls.is_empty());
+    let urls = Arc::new(std::sync::RwLock::new(vec![
+        "https://hub.example".to_owned()
+    ]));
+    let services = licash_hub_service::Services {
+        urls: urls.clone(),
+        ..Default::default()
+    };
+    service.app = licash_hub_service::router(service.hub.clone(), services);
+    assert_eq!(service.info().await.urls, ["https://hub.example"]);
+    // Its onion service's, once it runs.
+    let onion = format!("http://{}.onion", "a".repeat(56));
+    urls.write().unwrap().push(onion.clone());
+    let info = service.info().await;
+    assert_eq!(info.urls, ["https://hub.example".to_owned(), onion]);
+    // Not part of what it proves.
+    let mut without = info.clone();
+    without.urls.clear();
+    let signet = ChainProfile::Core30Signet;
+    assert_eq!(info.identity(signet), without.identity(signet));
+}
