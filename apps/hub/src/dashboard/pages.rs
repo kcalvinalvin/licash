@@ -80,10 +80,8 @@ pub(super) fn report(r: &Records, now: i64, service: Check, data: &Path) -> Repo
     series.extend(levels(r));
     let failures = failures(&series[2]);
     let checks = checks(r, &state, now, service);
-    let subtitle = match state.tip {
-        Some(tip) => format!("{} · height {tip}", data.display()),
-        None => format!("{} · no chain", data.display()),
-    };
+    // Where its records are; how far it follows the chain is its health's.
+    let subtitle = data.display().to_string();
     let pages = vec![
         overview(&state, checks.clone(), recent(r)),
         payments(r, &state, failures),
@@ -164,13 +162,10 @@ fn overview(state: &Now, checks: Vec<Check>, recent: Table) -> Page {
                 total("Notes outstanding", Ref::level("ecash"), Better::Neither),
                 collateral(state),
             ])],
+            // Fees and notes outstanding are charted on their own pages.
             vec![
-                Panel::chart("Volume", "volume", Measure::Sum),
-                Panel::chart("Fees", "fees", Measure::Sum),
-            ],
-            vec![
-                Panel::chart("Notes outstanding", "ecash", Measure::Level),
                 Panel::Health(checks),
+                Panel::chart("Volume", "volume", Measure::Sum),
             ],
             vec![Panel::Table(recent)],
         ],
@@ -845,7 +840,7 @@ fn checks(r: &Records, state: &Now, now: i64, service: Check) -> Vec<Check> {
             "reorganized below a checkpoint: the scan stopped",
         ),
         (None, _) => Check::new("Chain", Tone::Warn, "following no chain: locks are refused"),
-        (Some(tip), _) => Check::new("Chain", Tone::Good, format!("scanned to {tip}")),
+        (Some(tip), _) => Check::new("Chain", Tone::Good, format!("scanned to block {tip}")),
     });
     let open: Vec<_> = r.locks.iter().filter(|l| l.settled_at.is_none()).collect();
     let soon = open

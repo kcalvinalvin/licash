@@ -180,13 +180,10 @@ fn overview(checks: Vec<Check>, recent: Table) -> Page {
                 Card::new("Success", success(), Better::Up),
                 total("Notes held", Ref::level("stock"), Better::Neither),
             ])],
+            // Fees and the notes held are charted on their own pages.
             vec![
-                Panel::chart("Swapped", "volume", Measure::Sum),
-                Panel::chart("Fees", "fees", Measure::Sum),
-            ],
-            vec![
-                Panel::chart("Notes held", "stock", Measure::Level),
                 Panel::Health(checks),
+                Panel::chart("Swapped", "volume", Measure::Sum),
             ],
             vec![Panel::Table(recent)],
         ],
