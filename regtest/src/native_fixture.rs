@@ -6,7 +6,7 @@ use crate::{
     contract::{Opened, Stage},
     graph::Babe,
     mock_proof, mock_verify,
-    native::{journal, open_native, Authority, Holder, Native},
+    native::{journal, open_native, Asking, Authority, Holder, Native, Width},
     native_mock_counter, native_mock_counter_verify, sig,
 };
 use anyhow::{ensure, Context, Result};
@@ -148,6 +148,27 @@ pub fn fixture_under<'a>(
     terms: Terms,
     authority: Authority,
 ) -> Result<Fixture<'a>> {
+    fixture_asking(rt, label, terms, authority, None)
+}
+
+/// [`fixture_with`] of the cap and bits of `width` the holder asks, not
+/// the fixture hub's 4,096 sat in 21 bits.
+pub fn fixture_wide<'a>(
+    rt: &'a Regtest,
+    label: &str,
+    terms: Terms,
+    width: Width,
+) -> Result<Fixture<'a>> {
+    fixture_asking(rt, label, terms, Authority::mock(), Some(width))
+}
+
+fn fixture_asking<'a>(
+    rt: &'a Regtest,
+    label: &str,
+    terms: Terms,
+    authority: Authority,
+    width: Option<Width>,
+) -> Result<Fixture<'a>> {
     let root = terms.root;
     let issuer = match terms.issuer {
         Some(issuer) => issuer,
@@ -159,6 +180,7 @@ pub fn fixture_under<'a>(
         seed: SEED,
         spend: Scalar::from(root),
     };
+    let holder = Asking { holder, width };
     let (c, n) = open_native(rt, label, (terms.t_a, terms.w_h), holder, authority)?;
     let ds: Vec<_> = terms
         .denominations

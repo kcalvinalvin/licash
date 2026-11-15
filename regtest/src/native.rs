@@ -145,6 +145,43 @@ pub struct Holder {
     pub spend: Scalar,
 }
 
+/// A contract wider than the fixture's: the cap a holder asks and the
+/// bits its graph takes, as a hub quotes the terms its holders choose
+/// (apps/contracts' hub terms, up to 31 bits).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Width {
+    pub cap: u32,
+    pub bits: u8,
+}
+
+impl Width {
+    /// A cap of `cap` sat in the fewest bits, 21 at least, as a hub
+    /// quotes it.
+    pub fn of(cap: u32) -> Self {
+        let bits = (u32::BITS - cap.leading_zeros()) as u8;
+        Self {
+            cap,
+            bits: bits.max(21),
+        }
+    }
+}
+
+/// A holder at an opening, of the fixture hub's terms or of a width she
+/// asks: what [`run`] and those over it take, a [`Holder`] as she is.
+pub struct Asking {
+    pub holder: Holder,
+    pub width: Option<Width>,
+}
+
+impl From<Holder> for Asking {
+    fn from(holder: Holder) -> Self {
+        Self {
+            holder,
+            width: None,
+        }
+    }
+}
+
 /// A checkpoint at the node's tip, both parties' view of the chain.
 pub fn checkpoint(rt: &Regtest) -> Result<Checkpoint> {
     let anchor_hash = rt.rpc.get_best_block_hash()?;
@@ -232,6 +269,15 @@ pub fn quote(keyset: Keyset, checkpoint: Checkpoint) -> Quote {
     }
 }
 
+/// `quote` of the cap and bits of `width`, if a holder asked one.
+fn asked(mut quote: Quote, width: Option<Width>) -> Quote {
+    if let Some(Width { cap, bits }) = width {
+        quote.cap = cap;
+        quote.graph.bits = bits;
+    }
+    quote
+}
+
 /// Which party a message or effect is for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Side {
@@ -267,7 +313,7 @@ pub fn open_native(
     rt: &Regtest,
     label: &str,
     (t_a, w_h): (u32, u16),
-    holder: Holder,
+    holder: impl Into<Asking>,
     authority: Authority,
 ) -> Result<(Opened, Native)> {
     let (c, n, refused) =
@@ -284,11 +330,12 @@ pub fn open_native_with(
     rt: &Regtest,
     label: &str,
     deadlines: (u32, u16),
-    holder: Holder,
+    holder: impl Into<Asking>,
     authority: Authority,
     tamper: Tamper<'_>,
 ) -> Result<(Opened, Native, Vec<Refusal>)> {
-    let seed = holder.seed;
+    let holder = holder.into();
+    let seed = holder.holder.seed;
     let played = play(rt, label, deadlines, holder, authority, tamper)?;
     let o = played.opening;
     rt.mine(u64::from(o.base.parts().graph.to_self_delay))?;
@@ -394,7 +441,7 @@ pub fn play(
     rt: &Regtest,
     label: &str,
     deadlines: (u32, u16),
-    holder: Holder,
+    holder: impl Into<Asking>,
     authority: Authority,
     tamper: Tamper<'_>,
 ) -> Result<Played> {
@@ -419,11 +466,12 @@ pub fn run(
     rt: &Regtest,
     label: &str,
     (t_a, w_h): (u32, u16),
-    holder: Holder,
+    holder: impl Into<Asking>,
     authority: Authority,
     value: Amount,
     tamper: Tamper<'_>,
 ) -> Result<Run> {
+    let Asking { holder, width } = holder.into();
     let address = |kind| -> Result<ScriptBuf> {
         let addr = rt.rpc.get_new_address(None, Some(kind))?;
         Ok(addr.assume_checked().script_pubkey())
@@ -445,7 +493,7 @@ pub fn run(
     let start = Start {
         seed: holder.seed,
         spend: holder.spend,
-        quote: quote(holder.keyset, checkpoint.clone()),
+        quote: asked(quote(holder.keyset, checkpoint.clone()), width),
         deposit,
         coin: coin.clone(),
         change: address(AddressType::Bech32)?,
