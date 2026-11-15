@@ -6,11 +6,12 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
@@ -53,8 +54,8 @@ import org.licash.wallet.sat
 /** How often an invoice shown is followed, in ms. */
 private const val FOLLOW_MS = 3_000L
 
-/** How long Copy says it copied, in ms. */
-private const val COPIED_MS = 2_000L
+/** How long copying says it copied, in ms. */
+internal const val COPIED_MS = 2_000L
 
 /**
  * What to be paid at, as a QR code and one Copy: the wallet's code, paid in
@@ -83,6 +84,8 @@ fun Receive(engine: Engine, back: () -> Unit) {
     }
     // Made again once paid: a fallback address paid gives way to the next.
     LaunchedEffect(amount, received) {
+        code = null
+        error = null
         engine.code(amount?.toULong())
             .onSuccess { code = it }
             .onFailure { error = explain(it) }
@@ -150,7 +153,10 @@ fun Receive(engine: Engine, back: () -> Unit) {
             when {
                 lightning && request != null -> QrCode(request.uppercase())
                 lightning && amount != null && error == null -> Waiting()
-                !lightning -> code?.let { QrCode(it.qr) } ?: Waiting()
+                !lightning -> when (val made = code) {
+                    null -> if (error == null) Waiting()
+                    else -> QrCode(made.qr)
+                }
             }
             error?.let {
                 Spacer(Modifier.height(8.dp))
@@ -206,7 +212,10 @@ fun Receive(engine: Engine, back: () -> Unit) {
 /** Where a QR code shows once made. */
 @Composable
 private fun Waiting() {
-    Box(Modifier.size(316.dp), contentAlignment = Alignment.Center) { CircularProgressIndicator() }
+    Box(
+        Modifier.widthIn(max = 316.dp).fillMaxWidth().aspectRatio(1f),
+        contentAlignment = Alignment.Center,
+    ) { CircularProgressIndicator() }
 }
 
 @Composable

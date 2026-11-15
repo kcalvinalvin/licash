@@ -4,8 +4,9 @@ import android.graphics.Bitmap
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
@@ -46,7 +47,7 @@ fun QrCode(text: String, size: Dp = 280.dp) {
         Image(
             bitmap,
             contentDescription = "QR code",
-            modifier = Modifier.size(size),
+            modifier = Modifier.widthIn(max = size).aspectRatio(1f),
             filterQuality = FilterQuality.None,
         )
     }

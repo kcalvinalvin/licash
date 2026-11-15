@@ -31,6 +31,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import org.licash.core.Activity
 import org.licash.core.Details
@@ -57,6 +58,7 @@ fun ActivityDetails(engine: Engine, ui: Ui, shown: Activity, back: () -> Unit) {
     val activity = coming ?: ui.history.find { it.id == shown.id && it.kind == shown.kind } ?: shown
     var details by remember { mutableStateOf<Details?>(null) }
     var error by remember { mutableStateOf<String?>(null) }
+    var unopened by remember { mutableStateOf(false) }
     LaunchedEffect(activity, ui.scanned) {
         engine.details(activity)
             .onSuccess { details = it; error = null }
@@ -97,11 +99,22 @@ fun ActivityDetails(engine: Engine, ui: Ui, shown: Activity, back: () -> Unit) {
             Spacer(Modifier.height(16.dp))
             OutlinedButton(
                 onClick = {
+                    unopened = false
                     runCatching { context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(link))) }
-                        .onFailure { AppLog.warn("opening $link", it) }
+                        .onFailure {
+                            AppLog.warn("opening $link", it)
+                            unopened = true
+                        }
                 },
                 modifier = Modifier.fillMaxWidth().height(52.dp),
             ) { Text("View on a block explorer") }
+            if (unopened) {
+                Text(
+                    "No app here opens web links.",
+                    color = MaterialTheme.colorScheme.error,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
         }
         if (ui.developer) Technical(activity, details, copy)
         Spacer(Modifier.height(48.dp))
@@ -263,7 +276,7 @@ private fun Technical(activity: Activity, details: Details?, copy: (String, Stri
                 Fact("Deposit hash", details.hash, copy)
                 Fact("Hub", details.hub, copy)
                 details.address?.let { Fact("Address", it, copy) }
-                details.pays?.let { Fact("Pays", digits(it), copy) }
+                details.pays?.let { Fact("Pays", sat(it), copy, "$it") }
                 details.payment?.let { Transaction(it, copy) }
                 details.depth?.let { Fact("Confirmations needed", "$it", copy) }
                 details.fundBy?.let { Fact("Confirmed by block", "$it", copy) }
@@ -307,13 +320,29 @@ private fun Technical(activity: Activity, details: Details?, copy: (String, Stri
 private fun Transaction(tx: Onchain, copy: (String, String) -> Unit) {
     Fact("Transaction", tx.txid, copy)
     tx.height?.let { Fact("Block", "$it", copy) }
-    tx.fee?.let { Fact("Network fee", digits(it), copy) }
+    tx.fee?.let { Fact("Network fee", sat(it), copy, "$it") }
 }
 
 @Composable
-private fun Fact(label: String, value: String, copy: (String, String) -> Unit) {
-    Column(Modifier.fillMaxWidth().clickable { copy(label, value) }.padding(vertical = 10.dp)) {
-        Text(label, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+private fun Fact(label: String, value: String, copy: (String, String) -> Unit, copied: String = value) {
+    var done by remember { mutableStateOf(false) }
+    LaunchedEffect(done) {
+        if (done) {
+            delay(COPIED_MS)
+            done = false
+        }
+    }
+    Column(
+        Modifier.fillMaxWidth().clickable {
+            copy(label, copied)
+            done = true
+        }.padding(vertical = 10.dp),
+    ) {
+        Text(
+            if (done) "$label · Copied" else label,
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
         Text(value, style = MaterialTheme.typography.bodyMedium, fontFamily = FontFamily.Monospace)
     }
 }

@@ -10,6 +10,8 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
@@ -43,47 +45,52 @@ fun Onboarding(engine: Engine, ui: Ui) {
         Modifier.fillMaxSize().padding(horizontal = 32.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
-        Spacer(Modifier.weight(1f))
-        Wordmark(
-            Modifier.clickable(remember { MutableInteractionSource() }, indication = null) {
-                taps += 1
-                if (taps >= 7 && !ui.developer) engine.setDeveloper(true)
-            },
-            size = 56,
-        )
-        Spacer(Modifier.height(12.dp))
-        Text(
-            "Bitcoin you can pay with in a tap.",
-            style = MaterialTheme.typography.titleMedium,
-            textAlign = TextAlign.Center,
-        )
-        Text(
-            "One code to be paid at, on Bitcoin or in Licash alike.",
-            style = MaterialTheme.typography.bodyMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            textAlign = TextAlign.Center,
-        )
-        if (ui.developer) {
-            Spacer(Modifier.height(32.dp))
-            Text("Network", style = MaterialTheme.typography.labelLarge)
-            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally)) {
-                for (network in Network.entries) {
-                    FilterChip(
-                        selected = ui.network == network,
-                        onClick = { scope.launch { engine.setNetwork(network) } },
-                        label = { Text(network.name.lowercase()) },
-                    )
-                }
-            }
-            OutlinedTextField(
-                value = peers,
-                onValueChange = { peers = it },
-                modifier = Modifier.fillMaxWidth(),
-                singleLine = true,
-                label = { Text("Peers (host:port, comma separated)") },
+        Column(
+            Modifier.fillMaxWidth().weight(1f).verticalScroll(rememberScrollState()),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center,
+        ) {
+            Wordmark(
+                Modifier.clickable(remember { MutableInteractionSource() }, indication = null) {
+                    taps += 1
+                    if (taps >= 7 && !ui.developer) engine.setDeveloper(true)
+                },
+                size = 56,
             )
+            Spacer(Modifier.height(12.dp))
+            Text(
+                "Bitcoin you can pay with in a tap.",
+                style = MaterialTheme.typography.titleMedium,
+                textAlign = TextAlign.Center,
+            )
+            Text(
+                "One code to be paid at, on Bitcoin or in Licash alike.",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                textAlign = TextAlign.Center,
+            )
+            if (ui.developer) {
+                Spacer(Modifier.height(32.dp))
+                Text("Network", style = MaterialTheme.typography.labelLarge)
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally)) {
+                    for (network in Network.entries) {
+                        FilterChip(
+                            selected = ui.network == network,
+                            onClick = { scope.launch { engine.setNetwork(network) } },
+                            label = { Text(network.name.lowercase()) },
+                        )
+                    }
+                }
+                OutlinedTextField(
+                    value = peers,
+                    onValueChange = { peers = it },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true,
+                    label = { Text("Peers (host:port, comma separated)") },
+                )
+            }
         }
-        Spacer(Modifier.weight(1f))
+        Spacer(Modifier.height(16.dp))
         error?.let { Text(it, color = MaterialTheme.colorScheme.error, textAlign = TextAlign.Center) }
         BigButton(
             if (busy) "Creating…" else "Create wallet",

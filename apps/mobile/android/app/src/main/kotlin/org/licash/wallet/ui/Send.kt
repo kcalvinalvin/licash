@@ -8,7 +8,9 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -197,81 +199,83 @@ fun Send(engine: Engine, ui: Ui, link: String?, cashOut: String? = null, back: (
     LaunchedEffect(link) { link?.let { read(it) } }
     Column(Modifier.fillMaxSize().padding(horizontal = 24.dp)) {
         TopBar(if (cashOut == null) "Send" else "Cash out", back)
-        when (val s = step) {
-            Step.Looking -> {
-                if (cashOut != null) {
-                    Text(
-                        "All you hold at ${host(cashOut)}, paid out on Bitcoin. Scan or paste the address to pay.",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                    Spacer(Modifier.height(12.dp))
+        Column(Modifier.fillMaxWidth().weight(1f).verticalScroll(rememberScrollState())) {
+            when (val s = step) {
+                Step.Looking -> {
+                    if (cashOut != null) {
+                        Text(
+                            "All you hold at ${host(cashOut)}, paid out on Bitcoin. Scan or paste the address to pay.",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        Spacer(Modifier.height(12.dp))
+                    }
+                    Scanner(Modifier.fillMaxWidth().aspectRatio(1f).clip(RoundedCornerShape(24.dp))) { read(it) }
+                    Spacer(Modifier.height(16.dp))
+                    OutlinedButton(
+                        onClick = {
+                            scope.launch {
+                                val clip = clipboard.getClipEntry()?.clipData
+                                val text = clip?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.text?.toString()?.trim()
+                                empty = text.isNullOrEmpty()
+                                if (!text.isNullOrEmpty()) read(text)
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth().height(56.dp),
+                    ) { Text("Paste") }
+                    if (empty) {
+                        Spacer(Modifier.height(8.dp))
+                        Text(
+                            "Nothing to paste: copy a code, an address or an invoice first.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
                 }
-                Scanner(Modifier.fillMaxWidth().aspectRatio(1f).clip(RoundedCornerShape(24.dp))) { read(it) }
-                Spacer(Modifier.height(16.dp))
-                OutlinedButton(
-                    onClick = {
-                        scope.launch {
-                            val clip = clipboard.getClipEntry()?.clipData
-                            val text = clip?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.text?.toString()?.trim()
-                            empty = text.isNullOrEmpty()
-                            if (!text.isNullOrEmpty()) read(text)
+                is Step.Paying -> Paying(ui, s, asking, { asking = it }) { amount -> plan(s, amount) }
+                Step.Busy -> Middle("One moment…")
+                Step.Planning -> Middle("Finding the way to pay…")
+                is Step.Review -> Review(s.quote) { pay(s.code, s.amount) }
+                is Step.Visit -> Ask(
+                    "This code names no hub you use. It says where to reach the payee's, " +
+                        "which proves it is the one named.\n\nPay there, moving notes from a hub you use?",
+                    "Pay there",
+                    { step = Step.Paying(s.code, s.asked, s.address) },
+                    back,
+                )
+                is Step.Unpayable -> Ask(
+                    "${s.why}\n\nTheir code names a Bitcoin address too: pay there instead?",
+                    "Pay on Bitcoin",
+                    {
+                        when (val amount = s.amount) {
+                            null -> step = Step.Address(s.address)
+                            else -> quote(s.address, amount)
                         }
                     },
-                    modifier = Modifier.fillMaxWidth().height(56.dp),
-                ) { Text("Paste") }
-                if (empty) {
-                    Spacer(Modifier.height(8.dp))
-                    Text(
-                        "Nothing to paste: copy a code, an address or an invoice first.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                }
+                    back,
+                )
+                Step.Quoting -> Middle("Finding a provider to pay it on Bitcoin…")
+                is Step.Invoice -> Invoice(s.quote) { payInvoice(s.text, s.quote.hub) }
+                is Step.Address -> ToAddress(s.address, asking, { asking = it }) { amount -> quote(s.address, amount) }
+                is Step.Payout -> Payout(s.quote) { payOut(s.quote) }
+                is Step.PayingOut -> Told(
+                    "Sending ${sat(s.amount)} on Bitcoin. It reaches the address in about " +
+                        "${(s.depth.toInt() + 1) * 10} minutes; your history shows how far it got.",
+                    back,
+                )
+                is Step.Paid -> Done("Paid ${sat(s.amount)}, ${sat(s.fee)} in fees", back)
+                is Step.Sent -> Sent(s, back)
+                // Not to pay again: it finishes by itself.
+                Step.Later -> Told("Under way: it finishes by itself, and reaches them then.", back)
+                is Step.Received -> Done("Received ${sat(s.amount)}", back)
+                is Step.Trust -> Ask(
+                    "This payment is at a hub you don't use yet:\n${s.hub}\n\nTake it, and use that hub from now on?",
+                    "Take it",
+                    { take(s.payment, true) },
+                    back,
+                )
+                is Step.Failed -> Ask(s.why, "Try again", { step = Step.Looking }, back)
             }
-            is Step.Paying -> Paying(ui, s, asking, { asking = it }) { amount -> plan(s, amount) }
-            Step.Busy -> Middle("One moment…")
-            Step.Planning -> Middle("Finding the way to pay…")
-            is Step.Review -> Review(s.quote) { pay(s.code, s.amount) }
-            is Step.Visit -> Ask(
-                "This code names no hub you use. It says where to reach the payee's, " +
-                    "which proves it is the one named.\n\nPay there, moving notes from a hub you use?",
-                "Pay there",
-                { step = Step.Paying(s.code, s.asked, s.address) },
-                back,
-            )
-            is Step.Unpayable -> Ask(
-                "${s.why}\n\nTheir code names a Bitcoin address too: pay there instead?",
-                "Pay on Bitcoin",
-                {
-                    when (val amount = s.amount) {
-                        null -> step = Step.Address(s.address)
-                        else -> quote(s.address, amount)
-                    }
-                },
-                back,
-            )
-            Step.Quoting -> Middle("Finding a provider to pay it on Bitcoin…")
-            is Step.Invoice -> Invoice(s.quote) { payInvoice(s.text, s.quote.hub) }
-            is Step.Address -> ToAddress(s.address, asking, { asking = it }) { amount -> quote(s.address, amount) }
-            is Step.Payout -> Payout(s.quote) { payOut(s.quote) }
-            is Step.PayingOut -> Told(
-                "Sending ${sat(s.amount)} on Bitcoin. It reaches the address in about " +
-                    "${(s.depth.toInt() + 1) * 10} minutes; your history shows how far it got.",
-                back,
-            )
-            is Step.Paid -> Done("Paid ${sat(s.amount)}, ${sat(s.fee)} in fees", back)
-            is Step.Sent -> Sent(s, back)
-            // Not to pay again: it finishes by itself.
-            Step.Later -> Told("Under way: it finishes by itself, and reaches them then.", back)
-            is Step.Received -> Done("Received ${sat(s.amount)}", back)
-            is Step.Trust -> Ask(
-                "This payment is at a hub you don't use yet:\n${s.hub}\n\nTake it, and use that hub from now on?",
-                "Take it",
-                { take(s.payment, true) },
-                back,
-            )
-            is Step.Failed -> Ask(s.why, "Try again", { step = Step.Looking }, back)
         }
     }
 }
@@ -462,7 +466,7 @@ private fun Sent(s: Step.Sent, back: () -> Unit) {
 
 @Composable
 private fun Middle(text: String) {
-    Column(Modifier.fillMaxSize(), horizontalAlignment = Alignment.CenterHorizontally) {
+    Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
         Spacer(Modifier.height(120.dp))
         CircularProgressIndicator()
         Spacer(Modifier.height(24.dp))

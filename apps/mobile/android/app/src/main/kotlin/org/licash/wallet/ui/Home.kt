@@ -12,7 +12,9 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.HorizontalDivider
@@ -54,7 +56,13 @@ fun Home(
     balance: () -> Unit,
     open: (Activity) -> Unit,
 ) {
-    Column(Modifier.fillMaxSize().padding(horizontal = 24.dp)) {
+    // Scrolled as a whole only while no list of its own scrolls inside.
+    val listed = ui.history.isNotEmpty() || ui.incoming.isNotEmpty()
+    val scroll = rememberScrollState()
+    Column(
+        Modifier.fillMaxSize().then(if (listed) Modifier else Modifier.verticalScroll(scroll))
+            .padding(horizontal = 24.dp),
+    ) {
         Row(Modifier.fillMaxWidth().padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
             Wordmark()
             Spacer(Modifier.width(10.dp))
@@ -74,7 +82,7 @@ fun Home(
             }
         }
         Spacer(Modifier.height(28.dp))
-        if (ui.history.isEmpty() && ui.incoming.isEmpty()) {
+        if (!listed) {
             Text(
                 "Nothing yet. What you receive and send shows here.",
                 style = MaterialTheme.typography.bodyMedium,
@@ -209,6 +217,6 @@ private fun ActivityRow(activity: Activity, coming: Boolean = false, open: () ->
                 overflow = TextOverflow.Ellipsis,
             )
         }
-        Text("$sign${digits(activity.amount)}", style = MaterialTheme.typography.bodyLarge, color = color)
+        Text("$sign${sat(activity.amount)}", style = MaterialTheme.typography.bodyLarge, color = color)
     }
 }

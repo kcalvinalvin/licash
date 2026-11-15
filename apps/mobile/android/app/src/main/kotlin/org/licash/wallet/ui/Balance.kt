@@ -43,6 +43,7 @@ import org.licash.wallet.sat
 @Composable
 fun BalanceDetails(engine: Engine, ui: Ui, cashOut: (String) -> Unit, back: () -> Unit) {
     var holdings by remember { mutableStateOf<List<Holding>?>(null) }
+    var unknown by remember { mutableStateOf(false) }
     var notes by remember { mutableStateOf<List<Notes>>(emptyList()) }
     var visited by remember { mutableStateOf<List<Holding>>(emptyList()) }
     var error by remember { mutableStateOf<String?>(null) }
@@ -51,7 +52,9 @@ fun BalanceDetails(engine: Engine, ui: Ui, cashOut: (String) -> Unit, back: () -
     var added by remember { mutableStateOf(0) }
     val scope = rememberCoroutineScope()
     LaunchedEffect(ui.balance, ui.history, added) {
-        engine.holdings().onSuccess { holdings = it }.onFailure { holdings = emptyList(); error = explain(it) }
+        engine.holdings()
+            .onSuccess { holdings = it; unknown = false }
+            .onFailure { holdings = emptyList(); unknown = true; error = explain(it) }
         engine.notes().onSuccess { notes = it }.onFailure { error = explain(it) }
         engine.visited().onSuccess { visited = it }.onFailure { error = explain(it) }
     }
@@ -70,7 +73,7 @@ fun BalanceDetails(engine: Engine, ui: Ui, cashOut: (String) -> Unit, back: () -
             val held = holdings
             when {
                 held == null -> Amount("Looking…", null)
-                held.isEmpty() -> Amount("Nothing yet", null)
+                held.isEmpty() -> Amount(if (unknown) "Unknown for now" else "Nothing yet", null)
             }
             held.orEmpty().forEachIndexed { i, holding ->
                 if (i > 0) Divider()
