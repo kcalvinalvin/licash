@@ -1771,3 +1771,56 @@ fn a_phone_whose_hub_opens_no_contracts_has_none_and_keeps_no_file_for_them() {
     assert!(dir.join("wallet.sqlite").exists());
     assert!(!dir.join("contracts.sqlite").exists() && !dir.join("contracts").exists());
 }
+
+/// Over Tor, the light client goes through the wallet's own Tor client: a
+/// SOCKS5 proxy only it can use. Nothing here reaches the Tor network.
+#[test]
+fn a_wallet_over_tor_lends_the_light_client_a_proxy_of_its_own() {
+    use std::io::{Read, Write};
+
+    let dir = tempfile::tempdir().unwrap();
+    let direct = Wallet::create(
+        dir.path().join("direct").display().to_string(),
+        Network::Signet,
+        0,
+        false,
+    );
+    assert_eq!(direct.unwrap().tor_proxy().unwrap(), None);
+
+    let tor = dir.path().join("tor").display().to_string();
+    let wallet = Wallet::create(tor, Network::Signet, 0, true).unwrap();
+    let url = wallet.tor_proxy().unwrap().unwrap();
+    assert_eq!(
+        wallet.tor_proxy().unwrap().as_deref(),
+        Some(url.as_str()),
+        "the same each time"
+    );
+    let (credentials, address) = url
+        .strip_prefix("socks5://")
+        .unwrap()
+        .split_once('@')
+        .unwrap();
+    let (user, password) = credentials.split_once(':').unwrap();
+    assert!(address.starts_with("127.0.0.1:"), "{address}");
+
+    let greet = |user: &str, password: &str| {
+        let mut client = std::net::TcpStream::connect(address).unwrap();
+        client.write_all(&[5, 1, 2]).unwrap();
+        let mut reply = [0; 2];
+        client.read_exact(&mut reply).unwrap();
+        assert_eq!(reply, [5, 2]);
+        let mut auth = vec![1, user.len() as u8];
+        auth.extend(user.as_bytes());
+        auth.push(password.len() as u8);
+        auth.extend(password.as_bytes());
+        client.write_all(&auth).unwrap();
+        client.read_exact(&mut reply).unwrap();
+        reply[1]
+    };
+    assert_eq!(greet(user, password), 0);
+    assert_ne!(greet(user, "guessed"), 0);
+
+    // Closed with the wallet.
+    drop(wallet);
+    assert!(std::net::TcpStream::connect(address).is_err());
+}

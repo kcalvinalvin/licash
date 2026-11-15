@@ -64,6 +64,9 @@ pub struct Wallet {
     /// When the hubs were last asked what URLs they name
     /// ([`Wallet::ask_onions`]): never since it opened if none.
     onions_asked: Mutex<Option<Instant>>,
+    /// The SOCKS5 proxy through its Tor client, once asked for
+    /// ([`Wallet::tor_proxy`]).
+    socks: Mutex<Option<licash_tor::Socks>>,
 }
 
 /// How long the hubs asked what URLs they name may take, all at once
@@ -147,6 +150,25 @@ impl Wallet {
         self.tor
     }
 
+    /// A SOCKS5 proxy through its Tor client, for the light client to
+    /// reach everything through, as `socks5://username:password@host:port`:
+    /// on the loopback interface, only with these credentials, while the
+    /// wallet is open. The same each time; none unless over Tor.
+    pub fn tor_proxy(&self) -> Result<Option<String>, LicashError> {
+        let Route::Tor(tor) = &self.route else {
+            return Ok(None);
+        };
+        let mut socks = self.socks.lock().unwrap_or_else(PoisonError::into_inner);
+        if socks.is_none() {
+            let served = self.runtime.block_on(tor.socks());
+            *socks = Some(served.map_err(LicashError::failed)?);
+        }
+        Ok(socks.as_ref().map(|socks| {
+            let (user, password) = (socks.username(), socks.password());
+            format!("socks5://{user}:{password}@{}", socks.address())
+        }))
+    }
+
     /// Renew notes a hub no longer unlinks since it restarted, paying them
     /// to the wallet itself, only if its fee on them is at most `ppm` parts
     /// per million of their value, its base fee included: 0 renews them
@@ -193,6 +215,7 @@ impl Wallet {
             contracting: Mutex::new(()),
             times: Mutex::new(HashMap::new()),
             onions_asked: Mutex::new(None),
+            socks: Mutex::new(None),
         };
         wallet.onions();
         Ok(Arc::new(wallet))
