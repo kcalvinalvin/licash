@@ -60,6 +60,7 @@ internal fun HubPage(
     var quoting by remember { mutableStateOf(false) }
     var quote by remember { mutableStateOf<ContractQuote?>(null) }
     var ending by remember { mutableStateOf<Contract?>(null) }
+    var forcing by remember { mutableStateOf<Contract?>(null) }
     var fees by remember { mutableStateOf(false) }
     var moving by remember { mutableStateOf(false) }
 
@@ -92,7 +93,17 @@ internal fun HubPage(
             }
             covers.forEachIndexed { i, c ->
                 if (i > 0) Divider()
-                CoverRow(c, ui.chain.height, ui.developer) { ending = c }
+                CoverRow(
+                    c,
+                    ui.chain.height,
+                    ui.developer,
+                    recovery = ui.recoveries.find { it.id == c.id },
+                    end = { ending = c },
+                    forceClose = { forcing = c },
+                    giveUp = {
+                        scope.launch { engine.giveUpRecovery(c.id).onFailure { fail(explain(it)) } }
+                    },
+                )
             }
             if (opening && !stepping) {
                 if (covers.isNotEmpty()) Divider()
@@ -164,6 +175,17 @@ internal fun HubPage(
                 cashOut(c.hub)
             },
             dismiss = { ending = null },
+        )
+    }
+    forcing?.let { c ->
+        ForceSheet(
+            c,
+            held,
+            force = {
+                forcing = null
+                engine.forceClose(c.id)
+            },
+            dismiss = { forcing = null },
         )
     }
     if (moving) {

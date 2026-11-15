@@ -8,6 +8,8 @@ import org.junit.Test
 import org.licash.core.Contract
 import org.licash.core.ContractState
 import org.licash.core.Rate
+import org.licash.core.Recovery
+import org.licash.core.RecoveryStage
 
 class CoverTest {
     private val created = 1_800_000_000L
@@ -94,6 +96,30 @@ class CoverTest {
         assertEquals("10 sat", charge(Rate(10uL, 0uL)))
         assertEquals("0.5%", charge(Rate(0uL, 5_000uL)))
         assertEquals("10 sat + 0.5%", charge(Rate(10uL, 5_000uL)))
+    }
+
+    private fun recovery(stage: RecoveryStage, irrevocable: Boolean = false, nextAt: UInt? = 1_144u) = Recovery(
+        id = "c0", stage = stage, irrevocable = irrevocable, claimed = 3_000uL, notes = 7u, request = null,
+        publication = null, timeout = null, sweep = null, nextAt = nextAt, error = null,
+    )
+
+    @Test
+    fun a_forced_close_says_where_it_stands_and_may_be_given_up_only_while_claimed() {
+        val claimed = forcing(recovery(RecoveryStage.CLAIMED), height = 1_000)
+        assertEquals("Forcing closed", claimed.stands)
+        assertEquals("Final in 24 hours: it can be given up until then", claimed.says)
+        assertTrue(claimed.revocable && !claimed.failed)
+        // Final already: claimed, not to be given up.
+        assertFalse(forcing(recovery(RecoveryStage.CLAIMED, irrevocable = true), 1_000).revocable)
+        val requested = forcing(recovery(RecoveryStage.REQUESTED, irrevocable = true), 1_000)
+        assertEquals("The hub has 24 hours to answer", requested.says)
+        assertFalse(requested.revocable)
+        // The chain's height unknown: no wait said.
+        assertNull(forcing(recovery(RecoveryStage.CLAIMED), height = 0).says)
+        assertEquals("3,000 sat back on Bitcoin", forcing(recovery(RecoveryStage.DONE, true, null), 1_000).says)
+        for (stage in listOf(RecoveryStage.ANSWERED, RecoveryStage.LOST)) {
+            assertTrue(forcing(recovery(stage, true), 1_000).failed)
+        }
     }
 
     @Test

@@ -32,21 +32,34 @@ import androidx.compose.ui.unit.dp
 import org.licash.core.Contract
 import org.licash.core.ContractQuote
 import org.licash.core.ContractState
+import org.licash.core.Recovery
+import org.licash.core.RecoveryStage
 import org.licash.wallet.sat
 
 /**
  * A protection at a hub, in a row: how much it covers, how long it has
  * left and where it stands, and what it is worth, never folded away. A
- * tap unfolds the rest.
+ * tap unfolds the rest. Once forced closed (`recovery`), where that
+ * stands instead; in advanced mode, forcing it closed.
  */
 @Composable
-internal fun CoverRow(c: Contract, height: Int, developer: Boolean, end: () -> Unit) {
+internal fun CoverRow(
+    c: Contract,
+    height: Int,
+    developer: Boolean,
+    recovery: Recovery?,
+    end: () -> Unit,
+    forceClose: () -> Unit,
+    giveUp: () -> Unit,
+) {
     val colors = MaterialTheme.colorScheme
     val cover = cover(c, height)
+    val forcing = recovery?.let { forcing(it, height) }
     var open by rememberSaveable(c.id) { mutableStateOf(false) }
     // While it is set up: the step it is at.
     val step = c.step?.let { setup(it) }
     val tint = when {
+        forcing != null -> if (forcing.failed) colors.error else colors.tertiary
         cover.failed -> colors.error
         cover.on -> colors.primary
         else -> colors.onSurfaceVariant
@@ -65,7 +78,7 @@ internal fun CoverRow(c: Contract, height: Int, developer: Boolean, end: () -> U
             Spacer(Modifier.width(12.dp))
             Column(Modifier.weight(1f)) {
                 Text("Up to ${sat(c.cap)}", style = MaterialTheme.typography.bodyLarge, maxLines = 1)
-                (step?.second ?: cover.left)?.let {
+                (forcing?.says ?: step?.second ?: cover.left)?.let {
                     Text(
                         it,
                         modifier = if (step != null) Modifier.testTag("contract-step") else Modifier,
@@ -74,7 +87,12 @@ internal fun CoverRow(c: Contract, height: Int, developer: Boolean, end: () -> U
                     )
                 }
             }
-            Text(cover.stands, Modifier.testTag("contract-state"), style = MaterialTheme.typography.labelLarge, color = tint)
+            Text(
+                forcing?.stands ?: cover.stands,
+                Modifier.testTag("contract-state"),
+                style = MaterialTheme.typography.labelLarge,
+                color = tint,
+            )
             Icon(
                 if (open) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
                 contentDescription = if (open) "Hide" else "Show",
@@ -88,30 +106,80 @@ internal fun CoverRow(c: Contract, height: Int, developer: Boolean, end: () -> U
                 modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
             )
         }
-        if (cover.runs) Worth(c.mock)
+        if (cover.runs && recovery == null) Worth(c.mock)
         AnimatedVisibility(open) {
             Column {
-                val state = c.state
-                if (state is ContractState.Failed) Line("Why", state.reason)
-                // Of what its hub holds, those ending first covering first.
-                if (cover.on) Line("Covers now", sat(c.covers), tag = "covers")
-                if (cover.ends != null) Line("Ends by itself in", cover.ends)
-                if (!cover.failed) Line("Cost", sat(c.price))
-                if (developer) {
-                    Line("Paid from", "A coin of ${sat(c.paidFrom)}")
-                    Line("Protects until", "block ${c.protectsUntil}")
-                    Line("Closes at", "block ${c.closesAt}")
-                    c.funding?.let { Line("Funding", it.take(16) + "…") }
-                    Line("Id", c.id.take(16) + "…")
-                }
-                if (cover.held) {
-                    Row {
-                        TextButton(onClick = end, modifier = Modifier.testTag("close-contract")) { Text("End") }
-                        if (developer) TextButton(onClick = {}, enabled = false) { Text("Force close") }
-                    }
+                if (recovery != null) {
+                    Forced(recovery, developer, giveUp)
+                } else {
+                    Unfolded(c, cover, developer, end, forceClose)
                 }
             }
         }
+    }
+}
+
+/** A protection's row unfolded: what it covers and costs; ending it, forcing it closed in advanced mode. */
+@Composable
+private fun Unfolded(c: Contract, cover: Cover, developer: Boolean, end: () -> Unit, forceClose: () -> Unit) {
+    val state = c.state
+    if (state is ContractState.Failed) Line("Why", state.reason)
+    // Of what its hub holds, those ending first covering first.
+    if (cover.on) Line("Covers now", sat(c.covers), tag = "covers")
+    if (cover.ends != null) Line("Ends by itself in", cover.ends)
+    if (!cover.failed) Line("Cost", sat(c.price))
+    if (developer) {
+        Line("Paid from", "A coin of ${sat(c.paidFrom)}")
+        Line("Protects until", "block ${c.protectsUntil}")
+        Line("Closes at", "block ${c.closesAt}")
+        c.funding?.let { Line("Funding", it.take(16) + "…") }
+        Line("Id", c.id.take(16) + "…")
+    }
+    if (cover.held) {
+        Row {
+            TextButton(onClick = end, modifier = Modifier.testTag("close-contract")) { Text("End") }
+            // Its hub silent: what it holds claimed on Bitcoin, unilaterally.
+            if (developer && cover.on) {
+                TextButton(onClick = forceClose, modifier = Modifier.testTag("force-close")) {
+                    Text("Force close", color = MaterialTheme.colorScheme.error)
+                }
+            }
+        }
+    }
+}
+
+/** A protection forced closed, unfolded: what it claimed, what stopped it, and giving it up while it may be. */
+@Composable
+private fun Forced(r: Recovery, developer: Boolean, giveUp: () -> Unit) {
+    Line("Claimed", sat(r.claimed), tag = "recovery-claimed")
+    r.error?.let { Line("Stopped by", it) }
+    if (developer) {
+        r.nextAt?.let { Line("Next step at", "block $it") }
+        r.request?.let { Line("Request", it.take(16) + "…") }
+        r.publication?.let { Line("Claim", it.take(16) + "…") }
+        r.timeout?.let { Line("Payback", it.take(16) + "…") }
+        r.sweep?.let { Line("Sweep", it.take(16) + "…") }
+    }
+    if (r.stage == RecoveryStage.CLAIMED && !r.irrevocable) {
+        TextButton(onClick = giveUp, modifier = Modifier.testTag("give-up-recovery")) { Text("Give up") }
+    }
+}
+
+/**
+ * What forcing a protection closed does, before it is done: for a hub that
+ * stopped answering only, and final once its request is on Bitcoin.
+ */
+@Composable
+internal fun ForceSheet(c: Contract, held: ULong, force: () -> Unit, dismiss: () -> Unit) {
+    val claimed = if (held < c.cap) held else c.cap
+    Sheet("Force close", dismiss) {
+        Say(
+            "Only if ${name(c.hub)} stopped answering: while it answers, cash out instead. " +
+                "Your ${sat(claimed)} there leave your balance and are claimed on Bitcoin, " +
+                "back on Bitcoin in a few days if the hub stays silent. Its fees are paid from your Bitcoin.",
+        )
+        Say("Once its request is on Bitcoin, it cannot be undone.")
+        BigButton("Force close", Modifier.fillMaxWidth().testTag("force-close-confirm"), danger = true) { force() }
     }
 }
 

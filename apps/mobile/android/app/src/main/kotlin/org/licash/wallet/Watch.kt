@@ -4,6 +4,8 @@ import org.licash.core.Activity
 import org.licash.core.ContractState
 import org.licash.core.Details
 import org.licash.core.Kind
+import org.licash.core.Recovery
+import org.licash.core.RecoveryStage
 import org.licash.core.State
 
 /*
@@ -41,12 +43,18 @@ internal fun watchOf(ui: Ui, now: Long): Watch {
     // Of unknown age: perhaps not stuck.
     val under = ui.history.filter { it.state == State.PENDING && (it.at ?: now) > now - STALE_SECS }
     val asked = ui.asked?.let { it > now - ASKED_SECS } ?: false
+    // A forced close moves on with blocks, an hour or a day apart: a look now and then.
+    val forcing = ui.recoveries.any { carriedOn(it) }
     return when {
         contracting || under.any { !unpaid(it, ui.under[it.key]) } -> Watch.NOW
-        under.isNotEmpty() || asked -> Watch.LATER
+        under.isNotEmpty() || asked || forcing -> Watch.LATER
         else -> Watch.NONE
     }
 }
+
+/** Whether a forced close is carried on as blocks come: not once over, nor answered (a proof this app does not make). */
+internal fun carriedOn(recovery: Recovery): Boolean =
+    recovery.stage !in setOf(RecoveryStage.DONE, RecoveryStage.ANSWERED, RecoveryStage.LOST)
 
 /**
  * A deposit whose own payment on Bitcoin was never sent: it ends only once

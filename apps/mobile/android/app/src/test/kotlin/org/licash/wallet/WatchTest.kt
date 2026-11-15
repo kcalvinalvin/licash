@@ -10,6 +10,8 @@ import org.licash.core.Kind
 import org.licash.core.LockStep
 import org.licash.core.Onchain
 import org.licash.core.PayoutSteps
+import org.licash.core.Recovery
+import org.licash.core.RecoveryStage
 import org.licash.core.State
 
 class WatchTest {
@@ -68,6 +70,20 @@ class WatchTest {
         assertEquals(Watch.NONE, watchOf(Ui(history = listOf(stuck)), now))
         val recent = line(Kind.PAYOUT, State.PENDING, at = now - STALE_SECS + 60)
         assertEquals(Watch.NOW, watchOf(Ui(history = listOf(recent)), now))
+    }
+
+    @Test
+    fun a_contract_forced_closed_is_looked_at_later_until_over() {
+        fun forced(stage: RecoveryStage) = Recovery(
+            id = "c0", stage = stage, irrevocable = true, claimed = 3_000uL, notes = 7u, request = null,
+            publication = null, timeout = null, sweep = null, nextAt = null, error = null,
+        )
+        for (stage in listOf(RecoveryStage.CLAIMED, RecoveryStage.REQUESTED, RecoveryStage.SWEEPING)) {
+            assertEquals(stage.name, Watch.LATER, watchOf(Ui(recoveries = listOf(forced(stage))), now))
+        }
+        for (stage in listOf(RecoveryStage.DONE, RecoveryStage.ANSWERED, RecoveryStage.LOST)) {
+            assertEquals(stage.name, Watch.NONE, watchOf(Ui(recoveries = listOf(forced(stage))), now))
+        }
     }
 
     @Test

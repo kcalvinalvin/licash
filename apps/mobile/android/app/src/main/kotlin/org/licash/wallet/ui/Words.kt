@@ -10,6 +10,8 @@ import org.licash.core.Contract
 import org.licash.core.ContractState
 import org.licash.core.OpeningStep
 import org.licash.core.Rate
+import org.licash.core.Recovery
+import org.licash.core.RecoveryStage
 import org.licash.wallet.credit
 import org.licash.wallet.host
 import org.licash.wallet.percent
@@ -187,6 +189,31 @@ fun cover(contract: Contract, height: Int): Cover {
         left = if (runs && known) "${span(contract.protectsUntil.toLong() - height)} left" else null,
         ends = if ((runs || held) && known) span(contract.closesAt.toLong() - height) else null,
     )
+}
+
+/**
+ * A protection forced closed, as its row says it: where it `stands`, in a
+ * word, and what it waits for (`says`), at the chain's `height`, 0 while
+ * unknown; whether it may still be given up, and whether it failed.
+ */
+data class Forcing(val stands: String, val says: String?, val revocable: Boolean, val failed: Boolean)
+
+/** `recovery`, in words, at the chain's `height`. */
+fun forcing(recovery: Recovery, height: Int): Forcing {
+    val wait = recovery.nextAt?.takeIf { height > 0 }?.let { span(it.toLong() - height) }
+    val revocable = recovery.stage == RecoveryStage.CLAIMED && !recovery.irrevocable
+    val (stands, says) = when (recovery.stage) {
+        RecoveryStage.CLAIMED -> "Forcing closed" to wait?.let { "Final in $it: it can be given up until then" }
+        RecoveryStage.REQUESTING -> "Requesting" to "Asking on Bitcoin for what the hub holds"
+        RecoveryStage.REQUESTED -> "Requested" to (wait?.let { "The hub has $it to answer" } ?: "The hub may answer")
+        RecoveryStage.TIMING_OUT -> "Paying back" to (wait?.let { "Back on Bitcoin in $it" } ?: "The hub did not answer")
+        RecoveryStage.SWEEPING -> "Sweeping" to "To your Bitcoin, once in a block"
+        RecoveryStage.DONE -> "Recovered" to "${sat(recovery.claimed)} back on Bitcoin"
+        RecoveryStage.ANSWERED -> "Answered" to "The hub answered: a proof is needed, which this app does not make yet"
+        RecoveryStage.LOST -> "Lost" to "Its bitcoin went elsewhere"
+    }
+    val failed = recovery.stage == RecoveryStage.ANSWERED || recovery.stage == RecoveryStage.LOST
+    return Forcing(stands, says, revocable, failed)
 }
 
 /** The steps of setting a protection up, the last its payment confirming. */

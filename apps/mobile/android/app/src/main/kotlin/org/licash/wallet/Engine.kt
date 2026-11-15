@@ -43,6 +43,7 @@ import org.licash.core.Network
 import org.licash.core.Notes
 import org.licash.core.NotesOf
 import org.licash.core.Paid
+import org.licash.core.Recovery
 import org.licash.core.PayQuote
 import org.licash.core.PayoutQuote
 import org.licash.core.HubsFound
@@ -75,6 +76,8 @@ data class Ui(
     val problem: String? = null,
     /** The recovery contracts with hubs, the newest first. */
     val contracts: List<Contract> = emptyList(),
+    /** The contracts forced closed, the oldest first. */
+    val recoveries: List<Recovery> = emptyList(),
     /** The hub a contract is being opened at, while one is. */
     val opening: String? = null,
     /** Where each line of the history under way stands, by [key]. */
@@ -486,14 +489,16 @@ class Engine(context: Context) {
     }
 
     /**
-     * Carry on with the contracts being opened and watch the funding of
-     * those signed, in the background: an opening carried on downloads
-     * for minutes. Nothing to do once each is confirmed or given up.
+     * Carry on with the contracts being opened, watch the funding of those
+     * signed and carry on those forced closed, in the background: an
+     * opening carried on downloads for minutes. Nothing to do once each is
+     * confirmed or given up, and each forced closed over.
      */
     private fun resumeContracts(chain: GoChain) {
-        val waiting = state.value.contracts.any {
+        val ui = state.value
+        val waiting = ui.contracts.any {
             it.state == ContractState.Opening || it.state == ContractState.Confirming
-        }
+        } || ui.recoveries.any { carriedOn(it) }
         if (!waiting || !contracting.compareAndSet(false, true)) return
         scope.launch {
             try {
@@ -529,12 +534,15 @@ class Engine(context: Context) {
                 val contracts = runCatching { it.contracts() }
                     .onFailure { e -> AppLog.warn("reading the contracts", e) }
                     .getOrDefault(state.value.contracts)
+                val recoveries = runCatching { it.recoveries() }
+                    .onFailure { e -> AppLog.warn("reading the forced closes", e) }
+                    .getOrDefault(state.value.recoveries)
                 val history = it.history()
                 // From the wallet alone, no network: Home tells each step.
                 val under = history.filter { a -> a.state == State.PENDING }.take(UNDER_READ)
                     .mapNotNull { a -> runCatching { it.details(a.kind, a.id) }.getOrNull()?.let { d -> a.key to d } }
                     .toMap()
-                Shown(it.network(), it.balance(), history, it.hubs(), it.tor(), contracts, under)
+                Shown(it.network(), it.balance(), history, it.hubs(), it.tor(), contracts, recoveries, under)
             }
         }.onFailure { AppLog.warn("reading the wallet", it) }.getOrNull()
         state.update {
@@ -555,6 +563,7 @@ class Engine(context: Context) {
                     hubs = shown.hubs,
                     tor = shown.tor,
                     contracts = shown.contracts,
+                    recoveries = shown.recoveries,
                     under = shown.under,
                     asked = prefs.askedAt,
                 )
@@ -606,6 +615,7 @@ class Engine(context: Context) {
         val hubs: List<Hub>,
         val tor: Boolean,
         val contracts: List<Contract>,
+        val recoveries: List<Recovery>,
         val under: Map<String, Details>,
     )
 
@@ -806,6 +816,40 @@ class Engine(context: Context) {
                 poke()
             }
         }
+    }
+
+    /**
+     * Force contract `id` closed, its hub silent, in the background: the
+     * notes at its hub, up to its cap, leave the balance, claimed on
+     * Bitcoin. Told once claimed, or why not.
+     */
+    fun forceClose(id: String) {
+        val light = light
+        if (light == null) {
+            notices.tryEmit(Event("Not connected to Bitcoin yet: try again in a moment."))
+            return
+        }
+        AppLog.info("forcing contract $id closed")
+        scope.launch {
+            try {
+                val forced = local { it.forceCloseContract(GoChain(light), id) }
+                AppLog.info("contract $id forced closed: ${forced.stage}, ${forced.claimed} sat claimed")
+                notices.tryEmit(Event("Forcing closed: ${sat(forced.claimed)} claimed on Bitcoin"))
+            } catch (e: Exception) {
+                AppLog.warn("forcing contract $id closed", e)
+                notices.tryEmit(Event("Not forced closed. ${explain(e)}"))
+            } finally {
+                refresh()
+                poke()
+            }
+        }
+    }
+
+    /** Give up forcing contract `id` closed, its notes back: only until its request is final. */
+    suspend fun giveUpRecovery(id: String): Result<Unit> = io {
+        local { it.giveUpRecovery(id) }
+        AppLog.info("forcing contract $id closed given up")
+        refresh()
     }
 
     /**
