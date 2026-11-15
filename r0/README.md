@@ -38,8 +38,11 @@ cargo build --release --manifest-path r0/host/Cargo.toml
 ```
 
 Builds are local and untracked in `r0/guests/`; image ids change with the
-source. The checkout's directory and cargo's are left out of the paths a
-guest holds, so the same commit builds the same image id on any machine.
+source. A guest is built from a copy of its sources at `/tmp/licash-r0`,
+whichever the checkout's directory (cargo hashes a path dependency outside
+the guest's workspace by where it is), and cargo's directory is left out
+of the paths it holds, so the same commit builds the same image id on any
+machine. One build at a time uses that directory.
 
 ## Execute and prove
 
