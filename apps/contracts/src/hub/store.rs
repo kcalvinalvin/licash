@@ -12,7 +12,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 /// The format of the rows: a machine's stored bytes, of
 /// `licash_contract`'s format 1.
-const FORMAT: i64 = 1;
+pub(super) const FORMAT: i64 = 1;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS openings (
@@ -40,6 +40,19 @@ pub(super) struct Row {
     pub abandoned: bool,
 }
 
+/// An opening as stored, for the hub's operator ([`Store::listed`]).
+pub(super) struct Listed {
+    pub id: [u8; 32],
+    pub format: i64,
+    pub phase: u8,
+    pub mock: bool,
+    pub irrevocable: bool,
+    pub abandoned: bool,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub state: Vec<u8>,
+}
+
 pub(super) struct Store(Connection);
 
 impl Store {
@@ -57,6 +70,40 @@ impl Store {
             |r| r.get(0),
         )?;
         Ok(n as u64)
+    }
+
+    /// Every opening in `dir`, oldest first, read only: none if no
+    /// opening was ever stored there.
+    pub fn listed(dir: &Path) -> Result<Vec<Listed>> {
+        let path = dir.join("openings.sqlite");
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let c = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let version: i64 = c.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        match version {
+            0 => return Ok(Vec::new()),
+            1 => {}
+            v => bail!("openings.sqlite is of version {v}, newer than this hub knows"),
+        }
+        let mut stmt = c.prepare(
+            "SELECT id, format, phase, mock, irrevocable, abandoned, created_at, updated_at, state
+             FROM openings ORDER BY created_at, rowid",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(Listed {
+                id: r.get(0)?,
+                format: r.get(1)?,
+                phase: r.get(2)?,
+                mock: r.get(3)?,
+                irrevocable: r.get(4)?,
+                abandoned: r.get(5)?,
+                created_at: r.get(6)?,
+                updated_at: r.get(7)?,
+                state: r.get(8)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
     }
 
     pub fn open(dir: &Path) -> Result<Self> {

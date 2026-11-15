@@ -28,7 +28,8 @@ use axum::Router;
 use licash::note::Keyset;
 use licash::spend::ChainProfile;
 use licash_chain_client::Source;
-use licash_contract::opening::{Context, Trust};
+pub use licash_contract::opening::HubPhase;
+use licash_contract::opening::{Context, Hub, Trust};
 
 use crate::{Frame, Offer, INSTANCE, MAX_BODY, OPEN, QUOTE, STEP};
 use store::Store;
@@ -90,6 +91,76 @@ pub enum Answer {
 /// contracts warns of them. Nothing is made in `data`.
 pub fn signed(data: &Path) -> Result<u64> {
     Store::signed(data)
+}
+
+/// An opening as the hub's operator sees it ([`openings`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Summary {
+    pub id: [u8; 32],
+    /// How far it went.
+    pub phase: Option<HubPhase>,
+    /// Opened under mock proofs: it protects nothing.
+    pub mock: bool,
+    /// The hub signed F: the contract may stand, and is never given up.
+    pub signed: bool,
+    /// Given up short of the hub's signatures, its coins freed.
+    pub abandoned: bool,
+    /// Seconds since 1970.
+    pub created_at: u64,
+    pub updated_at: u64,
+    /// Its terms, unchecked: none if its stored state does not read.
+    pub terms: Option<Terms>,
+}
+
+/// What an opening's stored state says of it ([`Hub::peek`]), unchecked.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Terms {
+    /// The most of the holder's notes it protects, in sat.
+    pub cap: u64,
+    /// The height its graph closes at, which ends the contract.
+    pub close: u32,
+    /// The hub's fee for it, in sat.
+    pub fee: u64,
+    /// Her reserve, from her deposit, in sat.
+    pub reserve: u64,
+    /// The value its graph holds, in sat: its collateral, and her reserve.
+    pub graph: u64,
+    /// F's id, from the hub's commitment to F on.
+    pub funding: Option<bitcoin::Txid>,
+}
+
+/// The openings in `data`, oldest first, read only: none if no opening
+/// was ever stored there. Their secrets stay in their states.
+pub fn openings(data: &Path) -> Result<Vec<Summary>> {
+    let rows = Store::listed(data)?;
+    Ok(rows
+        .into_iter()
+        .map(|row| Summary {
+            id: row.id,
+            phase: HubPhase::ALL.get(usize::from(row.phase)).copied(),
+            mock: row.mock,
+            signed: row.irrevocable,
+            abandoned: row.abandoned,
+            created_at: row.created_at.max(0) as u64,
+            updated_at: row.updated_at.max(0) as u64,
+            terms: (row.format == store::FORMAT)
+                .then(|| peek(&row.state))
+                .flatten(),
+        })
+        .collect())
+}
+
+fn peek(state: &[u8]) -> Option<Terms> {
+    let peek = Hub::peek(state).ok()?;
+    let p = peek.base.parts();
+    Some(Terms {
+        cap: u64::from(p.cap),
+        close: p.graph.close_height,
+        fee: p.fees.opening_fee_quote,
+        reserve: p.graph.reserve_alice,
+        graph: p.graph.graph_value().ok()?,
+        funding: peek.funding,
+    })
 }
 
 impl Openings {
@@ -237,4 +308,78 @@ async fn instance(
 ) -> Result<Vec<u8>, Refused> {
     let id = crate::parse_id(&id).map_err(Refused::bad)?;
     openings.instance(id, stage, index).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A hub's opening at Funded, as `licash_contract`'s golden test keeps
+    /// it: of a mock opening on regtest.
+    const FUNDED: &[u8] =
+        include_bytes!("../../../crates/licash-contract/tests/golden/hub-funded.bin");
+
+    fn deposit(vout: u32) -> bitcoin::OutPoint {
+        use bitcoin::hashes::Hash as _;
+        bitcoin::OutPoint {
+            txid: bitcoin::Txid::from_byte_array([9; 32]),
+            vout,
+        }
+    }
+
+    #[test]
+    fn openings_read_as_stored_with_their_terms_and_none_are_made() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(openings(dir.path()).unwrap().is_empty());
+        assert!(!dir.path().join("openings.sqlite").exists());
+        let store = Store::open(dir.path()).unwrap();
+        assert!(openings(dir.path()).unwrap().is_empty());
+        store
+            .insert(&[1; 32], 0, true, &deposit(0), &[0; 32], FUNDED)
+            .unwrap();
+        store
+            .save(&[1; 32], HubPhase::Funded as u8, true, &[0; 32], FUNDED)
+            .unwrap();
+        // A state that does not read, given up.
+        store
+            .insert(&[2; 32], 0, true, &deposit(1), &[0; 32], b"state")
+            .unwrap();
+        store.abandon(&[2; 32]).unwrap();
+        let all = openings(dir.path()).unwrap();
+        let [funded, abandoned] = &all[..] else {
+            panic!("two openings, not {all:?}");
+        };
+        assert_eq!(funded.id, [1; 32]);
+        assert_eq!(funded.phase, Some(HubPhase::Funded));
+        assert!(funded.mock && funded.signed && !funded.abandoned);
+        assert!(funded.updated_at >= funded.created_at && funded.created_at > 0);
+        let terms = funded.terms.as_ref().unwrap();
+        let peek = Hub::peek(FUNDED).unwrap();
+        let parts = peek.base.parts();
+        assert_eq!(
+            (terms.cap, terms.close, terms.fee, terms.reserve),
+            (
+                u64::from(parts.cap),
+                parts.graph.close_height,
+                parts.fees.opening_fee_quote,
+                parts.graph.reserve_alice
+            )
+        );
+        // A 21-bit graph, her reserve 20 000 sat and the hub's 100 000.
+        assert_eq!(
+            (
+                terms.cap,
+                terms.close,
+                terms.fee,
+                terms.reserve,
+                terms.graph
+            ),
+            (4_096, 504, 3_000, 20_000, (1 << 21) - 1 + 120_000)
+        );
+        assert_eq!(terms.funding, peek.funding);
+        assert!(terms.funding.is_some());
+        assert_eq!(abandoned.phase, Some(HubPhase::Termed));
+        assert!(abandoned.abandoned && !abandoned.signed);
+        assert_eq!(abandoned.terms, None);
+    }
 }
