@@ -1,0 +1,25 @@
+name: vendor
+description: >-
+  Lichen and ln-gap at the revisions vendor/fetch.sh pins, copied into
+  vendor/ as it does: the applications' workspace builds the recovery
+  contract on them.
+runs:
+  using: composite
+  steps:
+    - uses: actions/checkout@v4
+      with:
+        repository: AdamISZ/lichen
+        ref: 82c69a055a8ac9f2010d1f91ff15eef7ac1ca8ab
+        path: .vendor-src/lichen
+        persist-credentials: false
+    - uses: actions/checkout@v4
+      with:
+        repository: AdamISZ/ln-gap
+        ref: d7972035c12247a07b1dcc1b32e1682cd790d276
+        path: .vendor-src/ln-gap
+        persist-credentials: false
+    - shell: sh
+      run: |
+        LICHEN_GIT="$GITHUB_WORKSPACE/.vendor-src/lichen" \
+        LNGAP_GIT="$GITHUB_WORKSPACE/.vendor-src/ln-gap" \
+          vendor/fetch.sh

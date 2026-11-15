@@ -20,7 +20,7 @@ repos:
         pass_filenames: false
       - id: apps-fmt-clippy
         name: apps fmt and clippy
-        entry: sh -c 'cargo fmt --manifest-path apps/Cargo.toml --all -- --check && cargo clippy --locked --manifest-path apps/Cargo.toml --workspace --all-targets -- -D warnings'
+        entry: sh -c 'cargo fmt --manifest-path apps/Cargo.toml $(cargo metadata --no-deps --format-version 1 --manifest-path apps/Cargo.toml | jq -r ".packages[] | \"-p \" + .name") -- --check && cargo clippy --locked --manifest-path apps/Cargo.toml --workspace --all-targets -- -D warnings'
         language: system
         files: ^(apps/|crates/licash(-api|-hub)?/)
         exclude: ^apps/mobile/

@@ -9,6 +9,12 @@
 !crates/licash-onchain
 !crates/licash-swaps
 !crates/licash-wallet
+# The recovery contract, on Lichen and ln-gap as vendor/fetch.sh copies
+# them: run it before building an image.
+!crates/licash-contract
+!regtest/Cargo.toml
+!vendor/lichen
+!vendor/ln-gap
 !apps
 **/target
 **/tmp
