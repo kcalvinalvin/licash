@@ -730,8 +730,8 @@ async fn hub_down(
     Ok(())
 }
 
-/// The app's log and the light client's, and both exported from Settings,
-/// which shows what the app keeps on the phone.
+/// The app's log and the light client's, and both exported from About in
+/// Settings, which shows what the app keeps on the phone.
 async fn logs(phone: &Phone) -> anyhow::Result<()> {
     let app = phone.file("files/logs/app.log").await?;
     for want in ["light client of regtest started", "moving to notes"] {
@@ -743,8 +743,9 @@ async fn logs(phone: &Phone) -> anyhow::Result<()> {
         "no neutrino in the light client's log"
     );
     phone.tap("Settings").await?;
+    phone.tap_id("about").await?;
     // What the app keeps on the phone, its light client's and its own
-    // code among it.
+    // code among it, in a sheet.
     phone.tap_id("storage").await?;
     phone.by_id("storage-total", 30).await?;
     phone.scroll_to_id("storage-chain").await?;

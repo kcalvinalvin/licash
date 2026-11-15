@@ -34,6 +34,7 @@ import org.licash.core.Rate
 import org.licash.wallet.Engine
 import org.licash.wallet.Ui
 import org.licash.wallet.explain
+import org.licash.wallet.digits
 import org.licash.wallet.sat
 
 /*
@@ -74,31 +75,55 @@ internal fun HubFees(hub: Hub, full: Boolean = false, dismiss: () -> Unit) {
                 )
             }
         }
-        Line("Paying", charge(Rate(hub.feeBase, hub.feePpm)), tag = "fee-pay")
-        val most = hub.lightningPay
-        if (hub.lightning != null || most != null) {
-            Line("Paying over Lightning", hub.lightning?.let { charge(it.pay) } ?: "Yes")
-            most?.let { Line("At most", sat(it)) }
+        // What a payment costs, a section a direction: limits under each.
+        Group("Paying") {
+            Entry("In Licash", value = charge(Rate(hub.feeBase, hub.feePpm)), tag = "fee-pay")
+            val most = hub.lightningPay
+            if (hub.lightning != null || most != null) {
+                Divider()
+                Entry(
+                    "Over Lightning",
+                    value = hub.lightning?.let { charge(it.pay) } ?: "Yes",
+                    sub = most?.let { "Up to ${sat(it)}" },
+                )
+            }
         }
-        hub.lightning?.let {
-            Line("Receiving over Lightning", charge(it.receive))
-            Line("Between", "${sat(it.receiveRange.min)} and ${sat(it.receiveRange.max)}")
-        }
-        hub.deposits?.let { range ->
-            Line("Receiving on Bitcoin", hub.depositFee?.let { charge(it) } ?: "Yes")
-            Line("Between", "${sat(range.min)} and ${sat(range.max)}")
+        if (hub.lightning != null || hub.deposits != null) {
+            Group("Receiving") {
+                hub.lightning?.let {
+                    Entry("Over Lightning", value = charge(it.receive), sub = between(it.receiveRange.min, it.receiveRange.max))
+                }
+                hub.deposits?.let { range ->
+                    if (hub.lightning != null) Divider()
+                    Entry(
+                        "On Bitcoin",
+                        value = hub.depositFee?.let { charge(it) } ?: "Yes",
+                        sub = between(range.min, range.max),
+                    )
+                }
+            }
         }
         hub.contracts?.let {
-            Line("Protection", sat(it.price))
-            Line("Protects up to", sat(it.cap))
-            Line("For", span(it.blocks.toLong()))
+            Group("Protection") {
+                Entry("Price", value = sat(it.price))
+                Divider()
+                Entry("Covers up to", value = sat(it.cap))
+                Divider()
+                Entry("For", value = span(it.blocks.toLong()))
+            }
         }
         if (full) {
-            Line("Holding a payment", charge(hub.lockFee))
-            Line("Refunding one held", charge(hub.refundFee))
+            Group("Held payments") {
+                Entry("Holding one", value = charge(hub.lockFee))
+                Divider()
+                Entry("Refunding one", value = charge(hub.refundFee))
+            }
         }
     }
 }
+
+/** From `min` to `max`, in sat: a range a hub takes. */
+private fun between(min: ULong, max: ULong): String = "${digits(min)} to ${sat(max)}"
 
 /** A hub added by its address, typed or pasted: `action` names the button. */
 @Composable
@@ -117,7 +142,7 @@ internal fun AddHub(engine: Engine, action: String = "Add") {
             onValueChange = { url = it },
             modifier = Modifier.weight(1f).testTag("hub-address"),
             singleLine = true,
-            placeholder = { Text("hub.example") },
+            label = { Text("Hub address") },
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri, imeAction = ImeAction.Done),
             shape = RoundedCornerShape(14.dp),
         )

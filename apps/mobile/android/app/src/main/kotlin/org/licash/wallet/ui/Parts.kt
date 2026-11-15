@@ -33,6 +33,7 @@ import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledTonalButton
@@ -42,12 +43,15 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.rememberModalBottomSheetState
+import androidx.compose.material3.SheetValue
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -151,16 +155,25 @@ fun BigButton(
     modifier: Modifier = Modifier,
     enabled: Boolean = true,
     quiet: Boolean = false,
+    danger: Boolean = false,
     onClick: () -> Unit,
 ) {
     val shape = RoundedCornerShape(18.dp)
     val label: @Composable RowScope.() -> Unit = {
         Text(text, style = MaterialTheme.typography.labelLarge, maxLines = 1, overflow = TextOverflow.Ellipsis)
     }
-    if (quiet) {
-        FilledTonalButton(onClick, modifier.height(56.dp), enabled, shape, content = label)
-    } else {
-        Button(onClick, modifier.height(56.dp), enabled, shape, content = label)
+    val colors = MaterialTheme.colorScheme
+    when {
+        quiet -> FilledTonalButton(onClick, modifier.height(56.dp), enabled, shape, content = label)
+        danger -> Button(
+            onClick,
+            modifier.height(56.dp),
+            enabled,
+            shape,
+            ButtonDefaults.buttonColors(containerColor = colors.error, contentColor = colors.onError),
+            content = label,
+        )
+        else -> Button(onClick, modifier.height(56.dp), enabled, shape, content = label)
     }
 }
 
@@ -217,10 +230,25 @@ fun Chevron(tint: Color = MaterialTheme.colorScheme.outline) {
 }
 
 /**
- * A row of a list: what it is and, at its end, its value; a glyph before
- * it and a line under it, if any. With something to open, a chevron.
- * `tag` names the value, for the tests to read, or the title of one
- * without a value.
+ * What a row is about, in a glyph on a tile of its color: on a list's
+ * first page only, every row of it with one.
+ */
+@Composable
+private fun Tile(icon: ImageVector, tint: Color) {
+    Box(
+        Modifier.size(32.dp).clip(RoundedCornerShape(9.dp)).background(tint.copy(alpha = 0.16f)),
+        contentAlignment = Alignment.Center,
+    ) {
+        Icon(icon, contentDescription = null, Modifier.size(18.dp), tint = tint)
+    }
+    Spacer(Modifier.width(16.dp))
+}
+
+/**
+ * A row of a list: what it is and, at its end, its value; a glyph on a
+ * tile before it and a line under it, if any. With something to open, a
+ * chevron. `tag` names the value, for the tests to read, or the title of
+ * one without a value; `color`, the title's, for a row that destroys.
  */
 @Composable
 fun Entry(
@@ -229,8 +257,9 @@ fun Entry(
     value: String? = null,
     sub: String? = null,
     icon: ImageVector? = null,
-    tint: Color = MaterialTheme.colorScheme.onSurfaceVariant,
+    tint: Color = MaterialTheme.colorScheme.primary,
     tag: String? = null,
+    color: Color = Color.Unspecified,
     onClick: (() -> Unit)? = null,
 ) {
     Row(
@@ -238,15 +267,13 @@ fun Entry(
             .heightIn(min = 56.dp).padding(vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        icon?.let {
-            Icon(it, contentDescription = null, Modifier.size(20.dp), tint = tint)
-            Spacer(Modifier.width(12.dp))
-        }
+        icon?.let { Tile(it, tint) }
         Column(Modifier.weight(1f)) {
             Text(
                 title,
                 modifier = if (tag != null && value == null) Modifier.testTag(tag) else Modifier,
                 style = MaterialTheme.typography.bodyLarge,
+                color = color,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
             )
@@ -295,17 +322,60 @@ fun Line(label: String, value: String, modifier: Modifier = Modifier, tag: Strin
 }
 
 /**
+ * Something on or off, as a row: a glyph on a tile and a line under it,
+ * if any, and what it does behind an (i). Its switch is tagged `toggle`,
+ * then its title.
+ */
+@Composable
+fun Toggle(
+    title: String,
+    on: Boolean,
+    sub: String? = null,
+    icon: ImageVector? = null,
+    means: String? = null,
+    set: (Boolean) -> Unit,
+) {
+    Row(
+        Modifier.fillMaxWidth().clickable { set(!on) }.heightIn(min = 56.dp).padding(vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        icon?.let { Tile(it, MaterialTheme.colorScheme.primary) }
+        Column(Modifier.weight(1f)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(title, style = MaterialTheme.typography.bodyLarge)
+                means?.let { Info(title, it) }
+            }
+            sub?.let {
+                Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        }
+        Spacer(Modifier.width(12.dp))
+        Switch(checked = on, onCheckedChange = set, modifier = Modifier.testTag("toggle $title"))
+    }
+}
+
+/**
  * What a tap asked for, from the bottom of the screen: a title and a
- * little under it. For what is read and left; what is worked in gets a
- * screen.
+ * little under it. For what is read and left, or one choice made; what
+ * is worked in gets a screen. Not `dismissable` while what it started is
+ * under way.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun Sheet(title: String, dismiss: () -> Unit, content: @Composable ColumnScope.() -> Unit) {
+fun Sheet(
+    title: String,
+    dismiss: () -> Unit,
+    dismissable: Boolean = true,
+    content: @Composable ColumnScope.() -> Unit,
+) {
+    val leave by rememberUpdatedState(dismissable)
     ModalBottomSheet(
-        onDismissRequest = dismiss,
+        onDismissRequest = { if (leave) dismiss() },
         // All of it at once: no half-open sheet hiding its button.
-        sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
+        sheetState = rememberModalBottomSheetState(
+            skipPartiallyExpanded = true,
+            confirmValueChange = { it != SheetValue.Hidden || leave },
+        ),
         // Its own window: its test tags as resource ids too.
         modifier = Modifier.semantics { testTagsAsResourceId = true },
         containerColor = MaterialTheme.colorScheme.surfaceContainerLow,
@@ -490,6 +560,24 @@ internal object Glyphs {
             "M12,1L3,5v6c0,5.55 3.84,10.74 9,12 5.16,-1.26 9,-6.45 9,-12V5l-9,-4z" +
                 "M19,11c0,4.52 -2.98,8.69 -7,9.93 -4.02,-1.24 -7,-5.41 -7,-9.93V6.3l7,-3.11 7,3.11V11z",
         )
+    }
+
+    /** Where money is held: a hub. */
+    val bank by lazy { icon("bank", "M4,10h3v7H4zM10.5,10h3v7h-3zM2,19h20v3H2zM17,10h3v7h-3zM12,1L2,6v2h20V6z") }
+
+    /** Bitcoin's sign. */
+    val bitcoin by lazy {
+        icon(
+            "bitcoin",
+            "M17.06,11.57C17.65,10.88 18,9.98 18,9c0,-1.86 -1.27,-3.43 -3,-3.87L15,3h-2v2h-2V3H9v2H6v2h2v10H6v2h3v2" +
+                "h2v-2h2v2h2v-2c2.21,0 4,-1.79 4,-4C19,13.55 18.22,12.27 17.06,11.57zM10,7h4c1.1,0 2,0.9 2,2" +
+                "s-0.9,2 -2,2h-4V7zM15,17h-5v-4h5c1.1,0 2,0.9 2,2S16.1,17 15,17z",
+        )
+    }
+
+    /** What is under the hood: advanced mode. */
+    val code by lazy {
+        icon("code", "M9.4,16.6L4.8,12l4.6,-4.6L8,6l-6,6 6,6 1.4,-1.4zM14.6,16.6l4.6,-4.6 -4.6,-4.6L16,6l6,6 -6,6 -1.4,-1.4z")
     }
 
     private fun icon(name: String, path: String): ImageVector =
