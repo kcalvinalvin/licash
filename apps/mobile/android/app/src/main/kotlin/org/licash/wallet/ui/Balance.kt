@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -18,11 +19,13 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.launch
 import org.licash.core.Holding
 import org.licash.core.Notes
 import org.licash.wallet.Engine
@@ -41,10 +44,16 @@ import org.licash.wallet.sat
 fun BalanceDetails(engine: Engine, ui: Ui, cashOut: (String) -> Unit, back: () -> Unit) {
     var holdings by remember { mutableStateOf<List<Holding>>(emptyList()) }
     var notes by remember { mutableStateOf<List<Notes>>(emptyList()) }
+    var visited by remember { mutableStateOf<List<Holding>>(emptyList()) }
     var error by remember { mutableStateOf<String?>(null) }
-    LaunchedEffect(ui.balance, ui.history) {
+    // A hub visited the owner asks to add, by its URL.
+    var adding by remember { mutableStateOf<String?>(null) }
+    var added by remember { mutableStateOf(0) }
+    val scope = rememberCoroutineScope()
+    LaunchedEffect(ui.balance, ui.history, added) {
         engine.holdings().onSuccess { holdings = it }.onFailure { error = explain(it) }
         engine.notes().onSuccess { notes = it }.onFailure { error = explain(it) }
+        engine.visited().onSuccess { visited = it }.onFailure { error = explain(it) }
     }
     val b = ui.balance
     val coming = ui.incoming.sumOf { it.amount }
@@ -74,6 +83,16 @@ fun BalanceDetails(engine: Engine, ui: Ui, cashOut: (String) -> Unit, back: () -
                 }
             }
         }
+        if (visited.isNotEmpty()) {
+            Group("At hubs you have not added") {
+                Hint("Left over from paying someone at their hub. Not in your balance until you add the hub.")
+                visited.forEachIndexed { i, holding ->
+                    if (i > 0) Divider()
+                    Amount(host(holding.hub), holding.available + holding.pending, Modifier.testTag("visited"))
+                    TextButton(onClick = { adding = holding.hub }) { Text("Add this hub") }
+                }
+            }
+        }
         Group("On Bitcoin") {
             Amount("Confirmed, moved in once enough", b.onchain)
             if (b.moving > 0uL) Amount("Moving into Licash", b.moving)
@@ -92,6 +111,28 @@ fun BalanceDetails(engine: Engine, ui: Ui, cashOut: (String) -> Unit, back: () -
             }
         }
         Spacer(Modifier.height(48.dp))
+    }
+    adding?.let { url ->
+        AlertDialog(
+            onDismissRequest = { adding = null },
+            title = { Text("Add this hub?") },
+            text = {
+                Text(
+                    "$url\n\nYou will hold notes there and be paid there, as at your other hubs. " +
+                        "Add it only if you trust who runs it.",
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    adding = null
+                    scope.launch {
+                        engine.addHub(url).onFailure { error = explain(it) }
+                        added++
+                    }
+                }) { Text("Add") }
+            },
+            dismissButton = { TextButton(onClick = { adding = null }) { Text("Cancel") } },
+        )
     }
 }
 

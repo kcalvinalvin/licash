@@ -41,6 +41,13 @@ trusts at their address, through a swap provider paying out on Bitcoin
 (`--nostr-relay URL --announce-url URL`); Balance cashes out all the notes at
 a hub to an address that way.
 
+A code naming no hub the app trusts, but saying where to reach the payee's,
+is paid there in notes once the owner agrees: the hub proves it is the one the
+code names, a swap brings notes there from a hub of the app's, and the payment
+shows its fees for review first. What the swap brought past the payment stays
+at that hub, shown apart in Balance, where adding the hub (its URL shown to
+confirm) counts it.
+
 A counterpart on the command line:
 
 ```sh

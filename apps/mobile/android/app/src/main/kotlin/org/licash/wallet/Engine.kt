@@ -35,6 +35,7 @@ import org.licash.core.LightningInvoice
 import org.licash.core.Network
 import org.licash.core.Notes
 import org.licash.core.Paid
+import org.licash.core.PayQuote
 import org.licash.core.PayoutQuote
 import org.licash.core.Scanned
 import org.licash.core.State
@@ -395,6 +396,14 @@ class Engine(context: Context) {
 
     suspend fun scanned(text: String): Result<Scanned> = io { local { it.scanned(text) } }
 
+    /**
+     * How paying `amount`, or what the code `code` asks, in notes goes, and
+     * all it costs: [pay] pays it so. At a hub not trusted, the payee's,
+     * visited and proving it is the one named, if no hub trusted is.
+     */
+    suspend fun payQuote(code: String, amount: ULong?): Result<PayQuote> =
+        io { local { it.payQuote(code, amount) } }
+
     suspend fun pay(code: String, amount: ULong?): Result<Paid> = io {
         val paid = locked { it.pay(code, amount) }
         refresh()
@@ -444,6 +453,9 @@ class Engine(context: Context) {
 
     /** What the wallet holds at each hub it trusts. */
     suspend fun holdings(): Result<List<Holding>> = io { local { it.holdings() } }
+
+    /** What it holds at hubs it only visited, to pay a payee there. */
+    suspend fun visited(): Result<List<Holding>> = io { local { it.visited() } }
 
     /** How many notes of each denomination it holds, at each hub. */
     suspend fun notes(): Result<List<Notes>> = io { local { it.notes() } }

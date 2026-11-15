@@ -25,11 +25,13 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalClipboard
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
 import org.licash.core.InvoiceQuote
 import org.licash.core.LicashException
+import org.licash.core.PayQuote
 import org.licash.core.PayoutQuote
 import org.licash.core.Scanned
 import org.licash.core.State
@@ -41,7 +43,12 @@ import org.licash.wallet.sat
 
 private sealed interface Step {
     data object Looking : Step
-    data class Paying(val code: String, val asked: ULong?) : Step
+    /** A code to pay in notes; on Bitcoin at `address` if it cannot be. */
+    data class Paying(val code: String, val asked: ULong?, val address: String? = null) : Step
+    data object Planning : Step
+    data class Review(val code: String, val amount: ULong?, val quote: PayQuote) : Step
+    data class Visit(val code: String, val asked: ULong?, val address: String?) : Step
+    data class Unpayable(val why: String, val address: String, val amount: ULong?) : Step
     data class Invoice(val text: String, val quote: InvoiceQuote) : Step
     data class Address(val address: String) : Step
     data class Payout(val quote: PayoutQuote) : Step
@@ -111,6 +118,7 @@ fun Send(engine: Engine, ui: Ui, link: String?, cashOut: String? = null, back: (
                             scanned.notes -> Step.Paying(text, scanned.amount)
                             else -> Step.Failed("This code names no hub you use, and no Bitcoin address to pay.")
                         }
+                        scanned is Scanned.Visit -> Step.Visit(text, scanned.amount, scanned.address)
                         scanned is Scanned.Bitcoin -> when (val asked = scanned.amount) {
                             null -> Step.Address(scanned.address)
                             else -> quoting(scanned.address, asked)
@@ -128,12 +136,39 @@ fun Send(engine: Engine, ui: Ui, link: String?, cashOut: String? = null, back: (
         }
     }
 
+    suspend fun paying(code: String, amount: ULong?): Step =
+        engine.pay(code, amount).fold(
+            { Step.Sent(it.amount, it.handover) },
+            { e -> if (e is LicashException.Pending) Step.Later else Step.Failed(explain(e)) },
+        )
+
     fun pay(code: String, amount: ULong?) {
         step = Step.Busy
+        scope.launch { step = paying(code, amount) }
+    }
+
+    // Quoted first: paid at once at a hub trusted holding enough, else
+    // reviewed, a swap or a hub not added in the way.
+    fun plan(s: Step.Paying, amount: ULong?) {
+        step = Step.Planning
         scope.launch {
-            step = engine.pay(code, amount).fold(
-                { Step.Sent(it.amount, it.handover) },
-                { e -> if (e is LicashException.Pending) Step.Later else Step.Failed(explain(e)) },
+            step = engine.payQuote(s.code, amount).fold(
+                { quote ->
+                    if (quote.trusted && quote.swapFrom == null) {
+                        step = Step.Busy
+                        paying(s.code, amount)
+                    } else {
+                        Step.Review(s.code, amount, quote)
+                    }
+                },
+                { e ->
+                    val address = s.address
+                    if (address == null || e is LicashException.Insufficient) {
+                        Step.Failed(explain(e))
+                    } else {
+                        Step.Unpayable(explain(e), address, amount ?: s.asked)
+                    }
+                },
             )
         }
     }
@@ -183,8 +218,28 @@ fun Send(engine: Engine, ui: Ui, link: String?, cashOut: String? = null, back: (
                     modifier = Modifier.fillMaxWidth().height(56.dp),
                 ) { Text("Paste") }
             }
-            is Step.Paying -> Paying(ui, s, asking, { asking = it }) { amount -> pay(s.code, amount) }
+            is Step.Paying -> Paying(ui, s, asking, { asking = it }) { amount -> plan(s, amount) }
             Step.Busy -> Middle("One moment…")
+            Step.Planning -> Middle("Finding the way to pay…")
+            is Step.Review -> Review(s.quote) { pay(s.code, s.amount) }
+            is Step.Visit -> Ask(
+                "This code names no hub you use. It says where to reach the payee's, " +
+                    "which proves it is the one named.\n\nPay there, moving notes from a hub you use?",
+                "Pay there",
+                { step = Step.Paying(s.code, s.asked, s.address) },
+                back,
+            )
+            is Step.Unpayable -> Ask(
+                "${s.why}\n\nTheir code names a Bitcoin address too: pay there instead?",
+                "Pay on Bitcoin",
+                {
+                    when (val amount = s.amount) {
+                        null -> step = Step.Address(s.address)
+                        else -> quote(s.address, amount)
+                    }
+                },
+                back,
+            )
             Step.Quoting -> Middle("Finding a provider to pay it on Bitcoin…")
             is Step.Invoice -> Invoice(s.quote) { payInvoice(s.text, s.quote.hub) }
             is Step.Address -> ToAddress(s.address, asking, { asking = it }) { amount -> quote(s.address, amount) }
@@ -237,6 +292,45 @@ private fun Paying(ui: Ui, s: Step.Paying, asking: Boolean, ask: (Boolean) -> Un
         }
     }
     if (asking) AmountDialog(amount, onDone = { amount = it; ask(false) }, onCancel = { ask(false) })
+}
+
+/**
+ * A payment in notes to review: what it pays and costs, the swap bringing
+ * notes to its hub first, and whether that hub is one not added.
+ */
+@Composable
+private fun Review(quote: PayQuote, pay: () -> Unit) {
+    val note = MaterialTheme.colorScheme.onSurfaceVariant
+    Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
+        Spacer(Modifier.height(48.dp))
+        Text(sat(quote.amount), style = Figures)
+        Text(
+            if (quote.fee == 0uL) "No fee" else "Fees ${sat(quote.fee)}, ${sat(quote.amount + quote.fee)} in all",
+            style = MaterialTheme.typography.bodySmall,
+            color = note,
+        )
+        Spacer(Modifier.height(16.dp))
+        quote.swapFrom?.let { from ->
+            Text(
+                "Moves ${sat(quote.swapped)} from ${host(from)} to ${host(quote.hub)} first, through a swap provider.",
+                style = MaterialTheme.typography.bodyMedium,
+                textAlign = TextAlign.Center,
+            )
+            Spacer(Modifier.height(8.dp))
+        }
+        if (!quote.trusted) {
+            Text(
+                "Paid at ${host(quote.hub)}, the payee's hub, which you have not added. " +
+                    "What is left there shows apart in your balance.",
+                modifier = Modifier.testTag("not-added"),
+                style = MaterialTheme.typography.bodyMedium,
+                color = note,
+                textAlign = TextAlign.Center,
+            )
+        }
+        Spacer(Modifier.height(32.dp))
+        BigButton("Pay", Modifier.fillMaxWidth(), onClick = pay)
+    }
 }
 
 /** A Lightning invoice to pay: what it asks, and all it costs on top. */
