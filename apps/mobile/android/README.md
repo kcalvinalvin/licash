@@ -48,6 +48,20 @@ shows its fees for review first. What the swap brought past the payment stays
 at that hub, shown apart in Balance, where adding the hub (its URL shown to
 confirm) counts it.
 
+Balance opens recovery contracts at the hubs that open them (`licash-hub run
+--contracts`, on regtest only for now, under the mock authority: such a
+contract protects nothing). A contract locks the hub's collateral on Bitcoin
+behind the notes there, up to its cap, until its last block to recover in,
+then closes by itself, its collateral back to the hub. Its price is paid from
+a coin of the wallet's on Bitcoin, its change kept there; with none, the quote
+offers to cash notes out to the wallet first. Opening downloads about 100 MB
+and takes minutes, in the background, one at a time; several contracts at a
+hub, and at several hubs, add up. The notes contracts cover count as
+protected rather than on credit, in Balance and on Home. A contract closes no
+sooner: Close says to cash out the hub's notes instead. Force closing,
+recovering the notes on Bitcoin, is not available yet. The contracts are kept
+beside the wallet's file, made only once one is asked for.
+
 A counterpart on the command line:
 
 ```sh
