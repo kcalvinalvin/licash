@@ -1142,6 +1142,16 @@ fn lock_id(text: &str) -> Result<[u8; 32], Error> {
     Ok(id)
 }
 
+/// Whether claiming a client's lock failed for good with `e`: refunded,
+/// paying the provider nothing, or expired unactivated at its hub.
+fn refused_for_good(e: &licash_wallet::Error) -> bool {
+    match e {
+        licash_wallet::Error::Invalid(_) | licash_wallet::Error::PaysNothing => true,
+        licash_wallet::Error::Refused { problem, .. } => problem.code == Code::LockExpired,
+        _ => false,
+    }
+}
+
 fn emit(tx: &rusqlite::Transaction<'_>, notice: &Notice) -> Result<(), Error> {
     let json = serde_json::to_string(notice).expect("a notice serializes");
     tx.execute(
@@ -1384,18 +1394,13 @@ impl<T: Transport> Provider<T> {
     }
 
     /// Claim the client's lock of the swap `row` with the preimage it
-    /// revealed: of a payout, on chain, late as its hub takes it.
+    /// revealed, late as hub `from` takes it: the provider paid the client
+    /// already, so the preimage is out and buys nothing more. Lost once
+    /// the hub refuses for good, the lock expired or refunded.
     async fn claim(&self, id: &[u8; 32], row: &Row) -> Result<(), Error> {
         let preimage = row.preimage.expect("paid on it");
         let key = hex::encode(id);
-        // Its own hub paid the client already: the preimage is out, and the
-        // hub claims until hub `from` refuses, its notes backed by none
-        // other.
-        let claimed = match row.chain || row.own {
-            true => self.wallet.claim_revealed(&row.from, &key, &preimage).await,
-            false => self.wallet.claim(&row.from, &key, &preimage).await,
-        };
-        match claimed {
+        match self.wallet.claim_revealed(&row.from, &key, &preimage).await {
             Ok(_) | Err(licash_wallet::Error::AlreadyReceived) => {
                 tracing::info!(id = %key, amount = row.amount, fee = row.fee, "swap done");
                 let notice = Notice::Done {
@@ -1405,7 +1410,7 @@ impl<T: Transport> Provider<T> {
                 };
                 self.advance(id, Stage::Paid, Stage::Done, None, Some((&notice, "")))?;
             }
-            Err(e @ (licash_wallet::Error::Invalid(_) | licash_wallet::Error::PaysNothing)) => {
+            Err(e) if refused_for_good(&e) => {
                 let reason = format!("the client's lock was not claimed: {e}");
                 tracing::error!(id = %key, amount = row.amount, reason, "swap lost");
                 let notice = Notice::Lost {

@@ -715,21 +715,43 @@ async fn a_provider_that_claims_too_late_loses_the_swap() {
         .await
         .unwrap();
     assert_eq!(swap.state, SwapState::Done);
-    // Asleep until the client's lock, expiring at 46, is within 3 blocks.
-    eco.mine(40);
+    // Asleep until the client's lock, expiring at 46, expired.
+    eco.mine(44);
     let provider = eco.provider();
     assert!(provider.step().await.unwrap().is_empty());
     let record = &provider.records(1).unwrap()[0];
     assert_eq!(record.stage, Stage::Lost);
-    assert!(record.reason.as_ref().unwrap().contains("too late"));
+    assert!(
+        record.reason.as_ref().unwrap().contains("expired"),
+        "{record:?}"
+    );
     assert_eq!(eco.kinds(), ["accepted", "lost"]);
     let stats = provider.stats().unwrap();
     assert_eq!((stats.lost, stats.lost_amount, stats.earned), (1, 20, 0));
     // The client keeps both.
-    eco.mine(4);
     eco.client.resume().await.unwrap();
     assert_eq!(held(&eco.client, A), 100 - FEE.base);
     assert_eq!(held(&eco.client, B), 20);
+}
+
+#[tokio::test]
+async fn a_provider_claims_the_clients_lock_in_its_last_blocks_the_preimage_out_already() {
+    let eco = Eco::new(200).await;
+    let swap = eco
+        .client
+        .swap(PROVIDER, A, B, 20, SwapLimits::usual(20))
+        .await
+        .unwrap();
+    assert_eq!(swap.state, SwapState::Done);
+    // Asleep until the client's lock, expiring at 46, is within 3 blocks:
+    // B published the preimage paying the provider's lock, so claiming
+    // reveals it to no one new.
+    eco.mine(40);
+    let provider = eco.provider();
+    assert!(provider.step().await.unwrap().is_empty());
+    assert_eq!(provider.records(1).unwrap()[0].stage, Stage::Done);
+    assert_eq!(held(provider.wallet(), A), 20 + costs(20).0);
+    assert_eq!(eco.kinds(), ["accepted", "done"]);
 }
 
 #[tokio::test]
