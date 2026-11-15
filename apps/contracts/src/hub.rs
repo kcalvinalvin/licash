@@ -38,6 +38,12 @@ use terms::Timing;
 /// The most openings short of the hub's signatures at once.
 pub const MAX_UNDER_WAY: usize = 16;
 
+/// The most steps of openings and instances built at once. Each takes
+/// hundreds of MB, and anyone may start an opening (a confirmed coin is all
+/// it asks): one at a time bounds the hub's memory, the others waiting
+/// their turn (answered 202 meanwhile).
+pub const HEAVY: usize = 1;
+
 /// How long an opening short of the hub's signatures may wait for the
 /// holder's next message before it is given up, its coins freed.
 pub const IDLE: Duration = Duration::from_secs(3_600);
@@ -58,6 +64,8 @@ pub struct Openings {
     timing: Timing,
     /// The openings a task is stepping.
     busy: Mutex<HashSet<[u8; 32]>>,
+    /// A permit for each step or instance built at once: [`HEAVY`].
+    heavy: Arc<tokio::sync::Semaphore>,
     /// Held from funding an F to locking its coins: no two take the same.
     funding: tokio::sync::Mutex<()>,
 }
@@ -214,6 +222,7 @@ impl Openings {
             trust,
             timing,
             busy: Mutex::new(HashSet::new()),
+            heavy: Arc::new(tokio::sync::Semaphore::new(HEAVY)),
             funding: tokio::sync::Mutex::new(()),
         });
         // A node restarted forgets the coins it locked without persisting.

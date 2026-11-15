@@ -8,6 +8,7 @@ use bitcoin::{OutPoint, TxOut};
 use licash_contract::opening::{Context, Hub, Input, Out, Quote};
 use licash_contract::wire::{self, Envelope, Kind, Writer};
 use sha2::{Digest, Sha256};
+use tokio::sync::Semaphore;
 
 use super::{Answer, Openings, Refused, MAX_UNDER_WAY, WAIT};
 use crate::{Frame, Opening};
@@ -84,13 +85,10 @@ impl Openings {
         let ctx = self.context().await?;
         let row = self.store().row(&id).map_err(Refused::unavailable)?;
         let row = row.ok_or_else(not_found)?;
-        let built = tokio::task::spawn_blocking(move || {
+        let built = heavy(&self.heavy, move || {
             Hub::load(&row.state, &ctx)?.instance(stage, index, &ctx)
         });
-        built
-            .await
-            .map_err(Refused::unavailable)?
-            .map_err(Refused::bad)
+        built.await?.map_err(Refused::bad)
     }
 
     /// Refused unless `quote` is the hub's: its terms, checkpointed at a
@@ -162,7 +160,8 @@ impl Openings {
                     let out = hub.pending().map_err(Refused::unavailable)?;
                     (hub, out)
                 } else {
-                    let (hub, out) = stepped(hub, Input::Message(message), ctx).await?;
+                    let (hub, out) =
+                        stepped(&self.heavy, hub, Input::Message(message), ctx).await?;
                     self.save(&id, &hub, &last)?;
                     (hub, out)
                 }
@@ -173,7 +172,7 @@ impl Openings {
                     return Err(Refused::unavailable("too many openings under way: later"));
                 }
                 let hub = Hub::new(*quote, self.timing.bounds);
-                let (hub, out) = stepped(hub, Input::Message(message), ctx).await?;
+                let (hub, out) = stepped(&self.heavy, hub, Input::Message(message), ctx).await?;
                 let state = hub.to_bytes().map_err(Refused::unavailable)?;
                 let inserted = self
                     .store()
@@ -221,7 +220,7 @@ impl Openings {
                         .filter(|o| *o != deposit)
                         .collect();
                     let (next, more) =
-                        stepped(hub, Input::Funded { funding, prevouts }, ctx).await?;
+                        stepped(&self.heavy, hub, Input::Funded { funding, prevouts }, ctx).await?;
                     hub = next;
                     self.save(&id, &hub, &last)?;
                     self.store()
@@ -246,7 +245,8 @@ impl Openings {
                         .collect();
                     let signed = self.sign(&funding, &theirs).await;
                     let signed = signed.map_err(Refused::unavailable)?;
-                    let (next, more) = stepped(hub, Input::Signed(signed), ctx).await?;
+                    let (next, more) =
+                        stepped(&self.heavy, hub, Input::Signed(signed), ctx).await?;
                     hub = next;
                     self.save(&id, &hub, &last)?;
                     tracing::info!(id = %crate::hex_id(&id), "F signed");
@@ -281,13 +281,74 @@ fn phase(hub: &Hub) -> u8 {
     hub.phase().map_or(0, |p| p as u8)
 }
 
-/// `hub` stepped with `input` off the async threads: refused as the
-/// machine refuses it, unchanged.
-async fn stepped(mut hub: Hub, input: Input, ctx: Context) -> Result<(Hub, Vec<Out>), Refused> {
-    let stepped = tokio::task::spawn_blocking(move || {
+/// `hub` stepped with `input` off the async threads, in its turn
+/// ([`heavy`]): refused as the machine refuses it, unchanged.
+async fn stepped(
+    limit: &Arc<Semaphore>,
+    mut hub: Hub,
+    input: Input,
+    ctx: Context,
+) -> Result<(Hub, Vec<Out>), Refused> {
+    let stepped = heavy(limit, move || {
         let out = hub.step(input, &ctx);
         (hub, out)
     });
-    let (hub, out) = stepped.await.map_err(Refused::unavailable)?;
+    let (hub, out) = stepped.await?;
     Ok((hub, out.map_err(Refused::bad)?))
+}
+
+/// `work` off the async threads once `limit` has a permit free, held until
+/// the work is done, even if no one waits for it any more: the most at once
+/// ([`super::HEAVY`]).
+async fn heavy<T: Send + 'static>(
+    limit: &Arc<Semaphore>,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, Refused> {
+    let permit = limit.clone().acquire_owned().await;
+    let permit = permit.map_err(Refused::unavailable)?;
+    let done = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        work()
+    });
+    done.await.map_err(Refused::unavailable)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn heavy_work_runs_one_at_a_time_even_once_no_one_waits_for_it() {
+        let limit = Arc::new(Semaphore::new(super::super::HEAVY));
+        let running = Arc::new(AtomicUsize::new(0));
+        let most = Arc::new(AtomicUsize::new(0));
+        let work = || {
+            let (running, most) = (running.clone(), most.clone());
+            move || {
+                let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                most.fetch_max(now, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(100));
+                running.fetch_sub(1, Ordering::SeqCst);
+            }
+        };
+        // One whose request was answered 202: no one waits for it, and it
+        // keeps its turn.
+        let unwaited = heavy(&limit, work());
+        let waited = tokio::time::timeout(Duration::from_millis(20), unwaited).await;
+        assert!(waited.is_err());
+        let others: Vec<_> = (0..4)
+            .map(|_| {
+                let (limit, work) = (limit.clone(), work());
+                tokio::spawn(async move { heavy(&limit, work).await })
+            })
+            .collect();
+        for other in others {
+            other.await.unwrap().unwrap();
+        }
+        assert_eq!(most.load(Ordering::SeqCst), 1);
+        assert_eq!(running.load(Ordering::SeqCst), 0);
+    }
 }

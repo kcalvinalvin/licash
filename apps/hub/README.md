@@ -85,7 +85,10 @@ blocks to its close; the openings take `/v1/contracts`. F, a contract's
 funding, spends the wallet's coins, which stay locked while the opening
 lives. Openings are kept in `<data>/openings.sqlite`, as sensitive as the
 seed: back it up with `hub.sqlite`. Each opening downloads about 100 MB of
-garbled instances to the wallet.
+garbled instances to the wallet. The hub takes one opening's step, or
+builds one instance, at a time, the others waiting their turn: each opening
+takes about 30 CPU seconds over a few threads, and the hub holds about
+700 MB once it has opened a few: allow it 2 GB of memory.
 
 On regtest, contracts are under a mock proof authority: such a contract
 protects nothing. On signet they are under the genuine programs kept in
