@@ -947,6 +947,49 @@ fn a_phone_pays_a_lightning_invoice_through_its_hub_and_shows_what_it_cost() {
 }
 
 #[test]
+fn a_phone_pays_out_to_bitcoin_addresses_and_codes_of_hubs_it_does_not_trust() {
+    let net = Net::new(true);
+    let light = Light::new(&net);
+    let alice = funded(&net, &light, "alice");
+    let address = "bcrt1p8sjsah3xnncxd4jar9pc0xn3lhu7tlg2wwk03vxnvn0zhd24j25sl5zmq9";
+    let plain = Scanned::Bitcoin {
+        address: address.into(),
+        amount: None,
+    };
+    assert_eq!(alice.scanned(format!(" {address} ")).unwrap(), plain);
+    let asked = alice.scanned(format!("bitcoin:{address}?amount=0.0001"));
+    let asked_for = Scanned::Bitcoin {
+        address: address.into(),
+        amount: Some(10_000),
+    };
+    assert_eq!(asked.unwrap(), asked_for);
+    // A code of a wallet at a hub she does not trust: its fallback address.
+    let other = Net::new(true);
+    let bob = other.wallet("bob", other.height());
+    let code = bob.payment_code(None).unwrap();
+    let fallback = code.address.clone().unwrap();
+    match alice.scanned(code.qr).unwrap() {
+        Scanned::Bitcoin { address, amount } => {
+            assert_eq!((address.to_lowercase(), amount), (fallback, None));
+        }
+        other => panic!("{other:?}"),
+    }
+
+    // No provider announced on her hub's relays: nothing quoted, nothing
+    // paid out.
+    let quote = alice.payout_quote(address.into(), Some(1_000), None);
+    assert!(invalid(quote).contains("no swap provider"));
+    let all = alice.payout_quote(address.into(), None, None);
+    assert!(invalid(all).contains("no swap provider"));
+    assert!(!alice.follow_payouts(light.clone()).unwrap());
+    let history = alice.history().unwrap();
+    assert!(
+        history.iter().all(|a| a.kind != Kind::Payout),
+        "{history:?}"
+    );
+}
+
+#[test]
 fn a_phone_paid_over_lightning_takes_the_notes_and_shows_the_invoice() {
     let net = Net::new(false);
     let alice = net.wallet("alice", net.height());

@@ -29,6 +29,8 @@ const SCAN_BATCH: u32 = 144;
 /// A day, in seconds.
 const DAY: i64 = 86_400;
 
+mod payouts;
+
 /// A wallet, kept in a directory of its own.
 #[derive(uniffi::Object)]
 pub struct Wallet {
@@ -224,7 +226,8 @@ impl Wallet {
     }
 
     /// What `text`, scanned or pasted, is: a code to pay in notes if it
-    /// can be, else a Lightning invoice if it is or names one.
+    /// can be, else a Lightning invoice if it is or names one, else an
+    /// address on Bitcoin to pay out to if it is or names one.
     pub fn scanned(&self, text: String) -> Result<Scanned, LicashError> {
         let text = text.trim();
         let code = text.parse::<PaymentCode>();
@@ -259,6 +262,12 @@ impl Wallet {
             Err(_) => {}
         }
         if let Ok(code) = code {
+            if let Some(address) = &code.address {
+                return Ok(Scanned::Bitcoin {
+                    address: address.assume_checked_ref().to_string(),
+                    amount: code.amount,
+                });
+            }
             return Ok(Scanned::Code {
                 amount: code.amount,
                 notes: false,
@@ -535,6 +544,7 @@ impl Wallet {
                 history.push(lightning_activity(&lock, invoice));
             }
         }
+        history.extend(payouts::activities(&self.wallet)?);
         for coin in self.wallet.silent_coins()? {
             let state = match coin.spending {
                 Some(_) => State::Pending,
@@ -599,6 +609,7 @@ impl Wallet {
                     failure: invoice.reason,
                 })
             }
+            Kind::Payout => payouts::details(&self.wallet, &id),
             Kind::Onchain => {
                 let outpoint: OutPoint = id.parse().map_err(|_| unknown())?;
                 let mut coins = self.wallet.silent_coins()?.into_iter();

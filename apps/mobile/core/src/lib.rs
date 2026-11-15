@@ -214,6 +214,24 @@ pub struct InvoiceQuote {
     pub description: Option<String>,
 }
 
+/// Notes paid out to `address`, on Bitcoin, through a swap provider: what
+/// the address gets, `amount`, from notes at `hub`, and `fee`, all it costs
+/// on top: the miners of the claim of the provider's coin, the provider's
+/// fee, its coin's miners in it, and the hub's ([`Wallet::payout_quote`]).
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct PayoutQuote {
+    pub address: String,
+    pub amount: u64,
+    pub fee: u64,
+    pub hub: String,
+    /// The provider, by its URL, and the name it announced, if any.
+    pub provider: String,
+    pub provider_name: Option<String>,
+    /// The blocks confirming the provider's coin before the wallet claims
+    /// it: the claim reaches the address after.
+    pub depth: u32,
+}
+
 /// A payment code to show: `text` to share, `qr` to draw, `address`, the
 /// plain address on Bitcoin in it, for payers that take no codes, and
 /// `silent`, its silent payment address, if a hub trusted finds payments
@@ -234,6 +252,13 @@ pub enum Scanned {
         amount: Option<u64>,
         /// Whether it names a hub the wallet trusts, to pay in notes.
         notes: bool,
+    },
+    /// An address on Bitcoin, or a code naming one and no hub the wallet
+    /// trusts: to pay out to from notes, through a swap provider
+    /// ([`Wallet::payout_quote`]), `amount` if it says.
+    Bitcoin {
+        address: String,
+        amount: Option<u64>,
     },
     /// A payment handed over, to [`Wallet::receive`].
     Payment,
@@ -304,6 +329,8 @@ pub enum Kind {
     Lightning,
     /// Paid over Lightning: an invoice the wallet asked a hub for.
     Invoice,
+    /// Notes paid out to an address on Bitcoin, through a swap provider.
+    Payout,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
@@ -352,6 +379,18 @@ pub enum Details {
         hub: String,
         invoice: Option<String>,
         asks: Option<u64>,
+        failure: Option<String>,
+    },
+    /// Notes at `hub` paid out to `address`, on Bitcoin, through
+    /// `provider`: the transaction of its coin, once the wallet found it,
+    /// and of the wallet's claim paying the address, once made; why it
+    /// failed, if it did, its notes back once the lock expires.
+    Payout {
+        hub: String,
+        provider: String,
+        address: String,
+        coin: Option<String>,
+        claim: Option<String>,
         failure: Option<String>,
     },
     /// A coin on Bitcoin, output `vout` of `tx`: `change` of the wallet's
