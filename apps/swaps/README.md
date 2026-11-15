@@ -80,7 +80,12 @@ socks5h://...` goes through a Tor daemon instead. With `--onion`, it also
 serves its API as an onion service, announced like `--announce-url`'s; back
 up `<data>/tor/state` to keep the address.
 Notification targets are Apprise URLs, as for the hub; `test-notify` checks
-them.
+them. Each notification lists the event's figures, ids cut to 12
+characters; `--notify-kinds` picks the kinds of event. A refunded swap is
+one whose client never claimed the provider's lock; a lost one, at high
+priority, one the client was paid for but whose lock the provider did not
+claim in return. Swaps and payouts under way resume when a stopped
+provider starts again.
 
 ```sh
 docker build -f apps/swaps/Dockerfile -t licash-swaps .

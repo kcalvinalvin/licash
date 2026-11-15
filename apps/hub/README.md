@@ -97,6 +97,14 @@ keep the address.
 
 Notification targets are Apprise URLs (`gotify[s]://`, `tgram://`,
 `ntfy[s]://`, `json[s]://`, `apprise[s]://`); `test-notify` checks them.
+Each notification lists the event's figures, ids cut to 12 characters as
+on the dashboard; `--notify-kinds` picks the kinds of event. An admitted
+lock's fee is the hub's only if the lock pays. The high-priority ones need
+a look: a double spend refused; a lock activated on Bitcoin (its preimage
+published in time, so it pays), or one the hub had refunded already, after
+a reorganization (it owes the payee too: check the reserves); a
+reorganization at or below a checkpoint (the hub follows Bitcoin no more,
+taking and refunding no locks, until you act); a halt; and alerts.
 
 ```sh
 docker build -f apps/hub/Dockerfile -t licash-hub .
