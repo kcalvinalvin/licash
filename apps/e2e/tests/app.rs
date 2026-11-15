@@ -212,6 +212,8 @@ async fn used(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     lightning(eco, phone).await?;
     refused(eco, phone, &bobs).await?;
     hub_down(eco, phone, &bob, &bobs).await?;
+    found_hubs(phone).await?;
+    cashed_out(eco, phone).await?;
     visited(eco, phone).await?;
 
     // Started again: at once, holding the same.
@@ -290,6 +292,114 @@ async fn visited(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Cashed out to itself: all its notes paid out on Bitcoin to its own
+/// address, and kept there rather than moved back into Licash, until it is
+/// asked to.
+async fn cashed_out(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
+    let pays = || async {
+        let chain = eco.swaps_info().await?.chain;
+        anyhow::Ok(
+            chain
+                .context("the provider pays nothing out on Bitcoin")?
+                .max,
+        )
+    };
+    if pays().await? < 100_000 {
+        let address = eco.exec("swaps", &["licash-swaps", "address"]).await?;
+        eco.send_to(String::from_utf8(address)?.trim(), 300_000)
+            .await?;
+        eco.mine(1).await?;
+        until("the provider's coins found", 120, || async {
+            Ok((pays().await? >= 100_000).then_some(()))
+        })
+        .await?;
+    }
+    let held = phone.balance().await?;
+    phone.tap("Where it is").await?;
+    phone.tap("Cash out to Bitcoin").await?;
+    phone.tap("To this wallet").await?;
+    phone.wait("To this wallet, on Bitcoin", 120).await?;
+    // In advanced mode (since onboarding), every provider's offer: the
+    // stack's only one, the one picked.
+    phone.tap_id("providers").await?;
+    phone.wait("The only provider", 120).await?;
+    phone.wait("Chosen", 10).await?;
+    phone.tap("Send").await?;
+    phone.wait("Sending", 60).await?;
+    phone.tap("Done").await?;
+    // Claimed once the provider's coin confirms, then found on Bitcoin:
+    // kept there.
+    let mine = || async {
+        let waiting = eco.core("getmempoolinfo", json!([])).await?["size"].as_u64();
+        if waiting.unwrap_or(0) > 0 {
+            eco.mine(1).await?;
+        }
+        anyhow::Ok(())
+    };
+    let kept = until("the payout kept on Bitcoin", 300, || async {
+        mine().await?;
+        phone.find("Cashed out, kept on Bitcoin").await
+    })
+    .await?;
+    eprintln!("cashed out, kept: {:?}", kept.text);
+    // Rounds later, not moved back in by itself.
+    tokio::time::sleep(Duration::from_secs(20)).await;
+    mine().await?;
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    ensure!(
+        phone.find("Moving into Licash").await?.is_none(),
+        "what was cashed out moved back in by itself"
+    );
+    phone.wait("Cashed out, kept on Bitcoin", 10).await?;
+    // Asked to: moved in, none left on Bitcoin.
+    phone.tap("Move into Licash").await?;
+    until("all moved back into Licash", 300, || async {
+        mine().await?;
+        let views = phone.views().await?;
+        let busy = views.iter().any(|v| {
+            [
+                "Cashed out, kept on Bitcoin",
+                "Moving into Licash",
+                "Coming, waiting for a block",
+            ]
+            .contains(&v.text.as_str())
+        });
+        Ok((!busy).then_some(()))
+    })
+    .await?;
+    phone.back().await?;
+    let back = phone.balance().await?;
+    ensure!(
+        back < held && back > held * 8 / 10,
+        "{back} held once {held} cashed out and moved back in"
+    );
+    Ok(())
+}
+
+/// The other hub, announced on the relay its hub names: found in Settings,
+/// offered to add with a tap and a word of warning.
+async fn found_hubs(phone: &Phone) -> anyhow::Result<()> {
+    phone.tap("Settings").await?;
+    phone.tap("Hubs").await?;
+    let find = phone.scroll_to("Find hubs").await?;
+    phone.tap_view(&find).await?;
+    phone.wait("hub2", 60).await?;
+    phone.tap_id("add-found").await?;
+    phone.wait("Add this hub?", 10).await?;
+    // Not now: paid there first, below.
+    phone.tap("Cancel").await?;
+    phone.wait_gone("Add this hub?", 10).await?;
+    phone.tap("Back").await?;
+    // In advanced mode, since onboarding: its page listed.
+    phone.scroll_to("Advanced mode").await?;
+    phone
+        .scroll_to("Notes held, the log, deleting the wallet")
+        .await?;
+    phone.back().await?;
+    phone.wait("Receive", 10).await?;
+    Ok(())
+}
+
 /// Its hub down: paying is under way, and once the hub is back up the app
 /// finishes it by itself, to Bob's mailbox, paid once.
 async fn hub_down(
@@ -358,8 +468,10 @@ async fn logs(phone: &Phone) -> anyhow::Result<()> {
     phone.tap("Settings").await?;
     // What the app keeps on the phone, its light client's and its own
     // code among it.
+    phone.tap("Storage").await?;
     phone.scroll_to("Bitcoin light client").await?;
     phone.scroll_to("The app itself").await?;
+    phone.back().await?;
     let export = phone.scroll_to("Export logs").await?;
     phone.tap_view(&export).await?;
     phone.wait("licash-logs.txt", 30).await?;
