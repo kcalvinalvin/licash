@@ -56,7 +56,7 @@ pub enum Onchain {
 }
 
 /// A chain source as the wallet reads Bitcoin through it.
-struct Blocks(Source);
+pub(crate) struct Blocks(pub(crate) Source);
 
 fn text(e: anyhow::Error) -> String {
     format!("{e:#}")

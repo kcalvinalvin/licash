@@ -60,6 +60,17 @@ Nostr (on `--relay`, else the relays its hubs name) that swaps the amount
 within `--max-fee` and `--max-margin`: one it swapped through before, else
 the cheapest.
 
+`payout <amount> --to <address> --provider <url> --chain <url>` pays
+`amount` to an address on Bitcoin from notes at a hub, through a provider
+paying out on chain: the wallet locks the amount and the fees to the
+provider, which locks a coin under the lock's hash, and the wallet claims
+that coin, paying the address exactly `amount`, once it finds it confirmed
+on its own chain source. Nothing is revealed before; a payout that fails
+leaves the lock to return once expired. `--max-fee` bounds everything on
+top of the amount (the claim's fee, the provider's and the hub's).
+`payouts --chain <url>` takes the payouts under way on and broadcasts their
+claims: run it until the payout is done.
+
 `discover --relay wss://relay.example` lists the hubs announced on Nostr,
 at the URLs that answer as the hub that announced them; with `--swaps`, the
 swap providers.

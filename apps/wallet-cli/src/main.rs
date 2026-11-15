@@ -25,6 +25,7 @@ use serde_json::json;
 use tracing_subscriber::EnvFilter;
 
 mod onchain;
+mod payout;
 
 /// The exit status of a payment recorded but not finished: retry later.
 const PENDING: u8 = 75;
@@ -274,6 +275,41 @@ enum Command {
     },
     /// The swaps made, newest first.
     Swaps,
+    /// Pay AMOUNT to TO, an address on Bitcoin, from notes at a hub
+    /// through a swap provider: the wallet locks the amount and the fees to
+    /// the provider, which locks a coin on chain the wallet claims, paying
+    /// TO exactly AMOUNT. `payouts` takes it on until done.
+    Payout {
+        amount: u64,
+        #[arg(long)]
+        to: String,
+        /// The swap provider, by its URL.
+        #[arg(long, env = "LICASH_WALLET_PROVIDER")]
+        provider: String,
+        /// The hub to pay at [default: the one holding the most].
+        #[arg(long)]
+        from: Option<String>,
+        /// What the payout costs at most on top of AMOUNT, in sat: the
+        /// claim's fee, the provider's and the hub's [default: 1% and
+        /// 2000].
+        #[arg(long)]
+        max_fee: Option<u64>,
+        /// The fee rate the claim is budgeted at least, in sat/vB
+        /// [default: the chain's estimate within 6 blocks, at least 1].
+        #[arg(long)]
+        fee_rate: Option<u64>,
+        /// The chain to find the provider's coin on and broadcast the claim
+        /// to: a Bitcoin Core node as `http://user:password@127.0.0.1:8332`,
+        /// or Esplora as `esplora+https://esplora.example/api`.
+        #[arg(long, env = "LICASH_WALLET_CHAIN")]
+        chain: String,
+    },
+    /// The payouts made, newest first: with --chain, those under way taken
+    /// on first and their claims broadcast.
+    Payouts {
+        #[arg(long, env = "LICASH_WALLET_CHAIN")]
+        chain: Option<String>,
+    },
     /// The coins paid on Bitcoin to the wallet's silent payment and
     /// fallback addresses: found, spent, or moved to notes.
     Onchain {
@@ -754,6 +790,23 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Onchain { chain, command } => {
             return onchain::run(&wallet, chain, command, json).await;
         }
+        Command::Payout {
+            amount,
+            to,
+            provider,
+            from,
+            max_fee,
+            fee_rate,
+            chain,
+        } => {
+            let from = match from {
+                Some(from) => from,
+                None => richest_but(&wallet, "")?,
+            };
+            let route = (provider.as_str(), from.as_str(), to.as_str());
+            return payout::pay(&wallet, &chain, route, amount, (max_fee, fee_rate), json).await;
+        }
+        Command::Payouts { chain } => return payout::list(&wallet, chain.as_deref(), json).await,
         Command::Swaps => {
             let swaps = wallet.swaps()?;
             let lines = swaps.iter().map(swap_line).collect::<Vec<_>>();
