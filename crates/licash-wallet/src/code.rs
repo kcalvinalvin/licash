@@ -425,10 +425,27 @@ impl FromStr for PaymentCode {
 }
 
 /// The keys a wallet's seed derives besides its owner's: its silent
-/// payment keys and its mailbox's.
+/// payment keys, its mailbox's, and the seed of its contracts' keys.
 pub(crate) struct CodeKeys {
     pub(crate) silent: licash_onchain::silent::Keys,
     pub(crate) mailbox: SecretKey,
+    pub(crate) contract: [u8; 32],
+}
+
+/// What a wallet brings to opening a recovery contract with a hub, as its
+/// holder: the seed its contracts' keys derive from, of its own domain,
+/// and the spending root's secret, whose notes a recovery claims. The
+/// spending root's secret spends the wallet's notes: kept in memory only
+/// as long as an opening or a recovery needs it, never logged or stored.
+pub struct ContractSecrets {
+    pub seed: [u8; 32],
+    pub spend: k256::Scalar,
+}
+
+impl fmt::Debug for ContractSecrets {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ContractSecrets(..)")
+    }
 }
 
 impl CodeKeys {
@@ -438,7 +455,12 @@ impl CodeKeys {
         let mailbox = tagged_hash("licash/mailbox", &[seed]);
         let mailbox = SecretKey::from_slice(&mailbox)
             .map_err(|_| Error::Setup("no mailbox key from this seed".into()))?;
-        Ok(Self { silent, mailbox })
+        let contract = tagged_hash("licash/contract/seed", &[seed]);
+        Ok(Self {
+            silent,
+            mailbox,
+            contract,
+        })
     }
 }
 
@@ -495,6 +517,14 @@ impl<T: Transport> Wallet<T> {
     /// them.
     pub fn silent_keys(&self) -> &licash_onchain::silent::Keys {
         &self.keys.silent
+    }
+
+    /// What the wallet brings to its recovery contracts as their holder.
+    pub fn contract_secrets(&self) -> ContractSecrets {
+        ContractSecrets {
+            seed: self.keys.contract,
+            spend: *self.owner.spend_secret(),
+        }
     }
 
     /// The hub to pay `amount` at to the payee of `code`: the first it

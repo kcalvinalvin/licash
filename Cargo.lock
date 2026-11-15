@@ -547,6 +547,7 @@ version = "0.0.1"
 dependencies = [
  "bitcoin",
  "hex",
+ "k256",
  "licash",
  "licash-api",
  "licash-hub",

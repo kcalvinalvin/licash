@@ -925,6 +925,71 @@ impl<T: Transport> Wallet<T> {
         })
     }
 
+    /// Sign input `index` of `tx`, another party's transaction spending one
+    /// of the wallet's coins among coins of its own, as a contract's
+    /// funding does: on the key path, committing to `prevouts`, the coin
+    /// each input spends. The wallet's coin is reserved for `tx`, so that
+    /// no spend or deposit takes it, until [`Wallet::abandon_silent`]
+    /// frees it or a scan sees it spent. Nothing is recorded to broadcast:
+    /// completing `tx` is the other party's. Signing `tx` again signs it
+    /// again; a coin reserved for another transaction, spent, not the
+    /// wallet's, or other than `prevouts` says, is refused.
+    pub fn sign_input(
+        &self,
+        tx: &Transaction,
+        prevouts: &[TxOut],
+        index: usize,
+    ) -> Result<Transaction, Error> {
+        if prevouts.len() != tx.input.len() {
+            return Err(Error::Invalid(format!(
+                "{} coins for {} inputs",
+                prevouts.len(),
+                tx.input.len()
+            )));
+        }
+        let Some(input) = tx.input.get(index) else {
+            return Err(Error::Invalid(format!("no input {index}")));
+        };
+        let outpoint = input.previous_output;
+        let txid = tx.compute_txid();
+        let keys = &self.keys.silent;
+        let signed = self.store.write(|t| {
+            let Some((held, spent_by)) = coin(t, &outpoint)? else {
+                return Err(Error::Invalid(format!(
+                    "coin {outpoint}: not the wallet's, or spent"
+                )));
+            };
+            if spent_by.is_some_and(|by| by != txid) {
+                return Err(Error::NoteTaken);
+            }
+            let want = TxOut {
+                value: Amount::from_sat(held.value),
+                script_pubkey: p2tr(held.found.output),
+            };
+            if prevouts[index] != want {
+                return Err(Error::Invalid(format!(
+                    "coin {outpoint}: not the coin the wallet holds"
+                )));
+            }
+            let secret = keys.spend_secret(&held.found).map_err(invalid)?;
+            let signature = key_spend(tx, prevouts, index, &held, &secret)?;
+            t.execute(
+                "UPDATE silent_coins SET spent_by = ?3
+                 WHERE txid = ?1 AND vout = ?2 AND spent_at IS NULL",
+                params![
+                    outpoint.txid.to_byte_array(),
+                    outpoint.vout,
+                    txid.to_byte_array()
+                ],
+            )?;
+            let mut signed = tx.clone();
+            signed.input[index].witness = Witness::p2tr_key_spend(&signature);
+            Ok(signed)
+        })?;
+        tracing::info!(%txid, %outpoint, "silent payment coin signed for another's transaction");
+        Ok(signed)
+    }
+
     /// Give up the wallet's spend `txid`, never broadcast or dropped by the
     /// network, freeing its coins: should it reach a block after all, a
     /// scan sees them spent.
@@ -1145,6 +1210,43 @@ fn kept(coins: Vec<Held>, keep: &[OutPoint]) -> Vec<Held> {
         .collect()
 }
 
+/// The wallet's coin at `outpoint` that no block spends, and the
+/// transaction it is reserved for, if any.
+fn coin(
+    t: &rusqlite::Connection,
+    outpoint: &OutPoint,
+) -> Result<Option<(Held, Option<Txid>)>, Error> {
+    let row = t
+        .query_row(
+            "SELECT value, output, tweak, label, spent_by FROM silent_coins
+             WHERE txid = ?1 AND vout = ?2 AND spent_at IS NULL",
+            params![outpoint.txid.to_byte_array(), outpoint.vout],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, [u8; 32]>(1)?,
+                    r.get::<_, [u8; 32]>(2)?,
+                    r.get::<_, Option<u32>>(3)?,
+                    r.get::<_, Option<[u8; 32]>>(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((value, output, tweak, label, spent_by)) = row else {
+        return Ok(None);
+    };
+    let held = Held {
+        outpoint: *outpoint,
+        value: value as u64,
+        found: Found {
+            output: XOnlyPublicKey::from_slice(&output).map_err(invalid)?,
+            tweak: SecretKey::from_slice(&tweak).map_err(invalid)?,
+            label,
+        },
+    };
+    Ok(Some((held, spent_by.map(Txid::from_byte_array))))
+}
+
 /// The coins no transaction spends, largest first.
 fn free_coins(t: &rusqlite::Connection) -> Result<Vec<Held>, Error> {
     let mut stmt = t.prepare(
@@ -1252,10 +1354,35 @@ fn plan(held: &[Held], to: &ScriptBuf, amount: Option<u64>, rate: FeeRate) -> Re
     })
 }
 
+/// The key-path signature of input `index` of `tx`, spending `held` with
+/// `secret`, committing to `prevouts`.
+fn key_spend(
+    tx: &Transaction,
+    prevouts: &[TxOut],
+    index: usize,
+    held: &Held,
+    secret: &SecretKey,
+) -> Result<bitcoin::taproot::Signature, Error> {
+    let secp = Secp256k1::new();
+    let keypair = Keypair::from_secret_key(&secp, secret);
+    if keypair.x_only_public_key().0 != held.found.output {
+        return Err(Error::Invalid(format!("no key for coin {}", held.outpoint)));
+    }
+    let sighash = SighashCache::new(tx)
+        .taproot_key_spend_signature_hash(index, &Prevouts::All(prevouts), TapSighashType::Default)
+        .map_err(invalid)?;
+    let message = Message::from_digest(sighash.to_byte_array());
+    let mut aux = [0; 32];
+    OsRng.fill_bytes(&mut aux);
+    Ok(bitcoin::taproot::Signature {
+        signature: secp.sign_schnorr_with_aux_rand(&message, &keypair, &aux),
+        sighash_type: TapSighashType::Default,
+    })
+}
+
 /// A transaction spending `inputs` on the key path with `secrets`, paying
 /// `outputs`: replaceable.
 fn sign(inputs: &[Held], secrets: &[SecretKey], output: Vec<TxOut>) -> Result<Transaction, Error> {
-    let secp = Secp256k1::new();
     let mut tx = Transaction {
         version: transaction::Version::TWO,
         lock_time: LockTime::ZERO,
@@ -1277,24 +1404,12 @@ fn sign(inputs: &[Held], secrets: &[SecretKey], output: Vec<TxOut>) -> Result<Tr
             script_pubkey: p2tr(h.found.output),
         })
         .collect();
-    let mut cache = SighashCache::new(&tx);
-    let mut signatures = Vec::with_capacity(inputs.len());
-    for (i, (held, secret)) in inputs.iter().zip(secrets).enumerate() {
-        let keypair = Keypair::from_secret_key(&secp, secret);
-        if keypair.x_only_public_key().0 != held.found.output {
-            return Err(Error::Invalid(format!("no key for coin {}", held.outpoint)));
-        }
-        let sighash = cache
-            .taproot_key_spend_signature_hash(i, &Prevouts::All(&prevouts), TapSighashType::Default)
-            .map_err(invalid)?;
-        let message = Message::from_digest(sighash.to_byte_array());
-        let mut aux = [0; 32];
-        OsRng.fill_bytes(&mut aux);
-        signatures.push(bitcoin::taproot::Signature {
-            signature: secp.sign_schnorr_with_aux_rand(&message, &keypair, &aux),
-            sighash_type: TapSighashType::Default,
-        });
-    }
+    let signatures = inputs
+        .iter()
+        .zip(secrets)
+        .enumerate()
+        .map(|(i, (held, secret))| key_spend(&tx, &prevouts, i, held, secret))
+        .collect::<Result<Vec<_>, Error>>()?;
     for (input, signature) in tx.input.iter_mut().zip(&signatures) {
         input.witness = Witness::p2tr_key_spend(signature);
     }

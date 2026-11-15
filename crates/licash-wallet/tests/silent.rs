@@ -28,7 +28,7 @@ use licash::spend::ChainProfile;
 use licash_api::{BlockTweaks, Fee, Hex, Info};
 use licash_onchain::silent::{self, SpAddress};
 use licash_wallet::{Blocks, Error, PaymentCode, Response, SilentSpend, Transport, Wallet};
-use net::{Net, HUB};
+use net::{Link, Net, HUB};
 
 const REGTEST: ChainProfile = ChainProfile::Core30DefaultRegtest;
 
@@ -688,6 +688,112 @@ async fn an_abandoned_spend_frees_its_coins() {
     let coins = s.wallet.silent_coins().unwrap();
     assert_eq!(coins.len(), 1);
     assert_eq!(coins[0].spending, None);
+}
+
+/// A transaction spending another party's coin, then the wallet's coin
+/// `coin`, paying `value` elsewhere, and the coins it spends: a contract's
+/// funding, as far as the wallet sees it.
+fn shared(chain: &Chain, coin: OutPoint, value: u64) -> (Transaction, Vec<TxOut>) {
+    let theirs = OutPoint::new(Txid::from_byte_array([3; 32]), 0);
+    let tx = Transaction {
+        version: transaction::Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: [theirs, coin]
+            .map(|previous_output| TxIn {
+                previous_output,
+                ..Default::default()
+            })
+            .to_vec(),
+        output: vec![TxOut {
+            value: Amount::from_sat(value),
+            script_pubkey: elsewhere(),
+        }],
+    };
+    let prevouts = vec![
+        TxOut {
+            value: Amount::from_sat(50_000),
+            script_pubkey: elsewhere(),
+        },
+        chain.outputs[&coin].clone(),
+    ];
+    (tx, prevouts)
+}
+
+#[tokio::test]
+async fn a_coin_signed_into_anothers_transaction_is_reserved_for_it() {
+    let s = setup().await;
+    s.wallet.watch_silent(HUB, 1).unwrap();
+    let paying = s.pay(&[s.address()], &[10_000]);
+    s.mine(vec![paying]);
+    s.scan().await.unwrap();
+    let coin = s.wallet.silent_coins().unwrap()[0].outpoint;
+    let (tx, prevouts) = shared(&s.chain.lock().unwrap(), coin, 55_000);
+    let txid = tx.compute_txid();
+
+    // Its input signed as the coin it spends, committing to every coin:
+    // the other party's left as it was.
+    let signed = s.wallet.sign_input(&tx, &prevouts, 1).unwrap();
+    assert_eq!(signed.compute_txid(), txid);
+    assert!(signed.input[0].witness.is_empty());
+    let mut cache = SighashCache::new(&signed);
+    let sighash = cache
+        .taproot_key_spend_signature_hash(1, &Prevouts::All(&prevouts), TapSighashType::Default)
+        .unwrap();
+    let signature = bitcoin::taproot::Signature::from_slice(&signed.input[1].witness[0]).unwrap();
+    let key = XOnlyPublicKey::from_slice(&prevouts[1].script_pubkey.as_bytes()[2..]).unwrap();
+    let message = Message::from_digest(sighash.to_byte_array());
+    Secp256k1::verification_only()
+        .verify_schnorr(&signature.signature, &message, &key)
+        .unwrap();
+
+    // Reserved for it, nothing to broadcast: no spend takes the coin.
+    assert_eq!(s.wallet.silent_coins().unwrap()[0].spending, Some(txid));
+    assert!(s.wallet.silent_spends().unwrap().is_empty());
+    let spend = s.wallet.spend_silent(elsewhere(), None, rate());
+    assert!(
+        matches!(spend, Err(Error::Insufficient { .. })),
+        "{spend:?}"
+    );
+    // Signed again for it alone.
+    s.wallet.sign_input(&tx, &prevouts, 1).unwrap();
+    let (other, other_prevouts) = shared(&s.chain.lock().unwrap(), coin, 54_000);
+    let again = s.wallet.sign_input(&other, &other_prevouts, 1);
+    assert!(matches!(again, Err(Error::NoteTaken)), "{again:?}");
+
+    // Never the other party's coin, nor the wallet's for another value.
+    let theirs = s.wallet.sign_input(&tx, &prevouts, 0);
+    assert!(matches!(theirs, Err(Error::Invalid(_))), "{theirs:?}");
+    let mut lied = prevouts.clone();
+    lied[1].value = Amount::from_sat(20_000);
+    let lied = s.wallet.sign_input(&tx, &lied, 1);
+    assert!(matches!(lied, Err(Error::Invalid(_))), "{lied:?}");
+    let short = s.wallet.sign_input(&tx, &prevouts[1..], 1);
+    assert!(matches!(short, Err(Error::Invalid(_))), "{short:?}");
+
+    // Given up, the coin is free again.
+    s.wallet.abandon_silent(&txid).unwrap();
+    assert_eq!(s.wallet.silent_coins().unwrap()[0].spending, None);
+    s.wallet.spend_silent(elsewhere(), None, rate()).unwrap();
+}
+
+#[test]
+fn a_wallets_contract_secrets_are_its_own_and_its_spending_roots() {
+    let dir = tempfile::tempdir().unwrap();
+    let open = |name: &str, seed: [u8; 32]| {
+        let path = dir.path().join(name);
+        Wallet::create(&path, &seed, REGTEST, Link(Net::new())).unwrap()
+    };
+    let a = open("a.sqlite", [7; 32]).contract_secrets();
+    let again = open("again.sqlite", [7; 32]).contract_secrets();
+    let b = open("b.sqlite", [8; 32]).contract_secrets();
+    assert_eq!((a.seed, a.spend), (again.seed, again.spend));
+    assert_ne!(a.seed, b.seed);
+    assert_ne!(a.spend, b.spend);
+    // Of a domain of its own: neither the seed nor the spending root's.
+    assert_ne!(a.seed, [7; 32]);
+    let owner = licash::address::OwnerKeys::from_seed(&[7; 32]).unwrap();
+    assert_eq!(a.spend, *owner.spend_secret());
+    assert_eq!(format!("{a:?}"), "ContractSecrets(..)");
 }
 
 #[tokio::test]
