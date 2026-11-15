@@ -38,6 +38,26 @@ if [ "$target" != "$host" ]; then
 	out=apps/target/$target/release
 fi
 
+# Cargo takes a file for unchanged when it is no newer than what was built
+# from it, but the target cache is shared by every build on the host, from
+# any checkout, whose files keep the times they had there. Date each file
+# by its content instead: the time recorded with that content, or now when
+# it is new or changed. Recorded before building, so that what a failed
+# build compiled is dated too; the cache is locked to one build at a time.
+sources=apps/target/.sources
+now=$(date +%s.%N)
+mkdir -p apps/target
+[ -f "$sources" ] || : >"$sources"
+find . -path ./apps/target -prune -o -type f -exec sha256sum -- {} + |
+	awk -v now="$now" '
+		FILENAME == ARGV[1] { known[substr($0, length($1) + 2)] = $1; next }
+		{ print (($0 in known) ? known[$0] : now), $0 }
+	' "$sources" - >"$sources.new"
+mv "$sources.new" "$sources"
+while read -r time _ path; do
+	touch -d "@$time" -- "$path"
+done <"$sources"
+
 # shellcheck disable=SC2086 # a word per flag
 cargo build --locked --release --manifest-path apps/Cargo.toml $packages
 for binary in $binaries; do
