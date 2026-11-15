@@ -42,6 +42,20 @@ CREATE UNIQUE INDEX IF NOT EXISTS contracts_deposit ON contracts (deposit)
     WHERE abandoned IS NULL AND (fate IS NULL OR fate != 'dead');
 ";
 
+/// Where beside `contracts.sqlite` the instances each opening keeps are,
+/// in a directory of its id each.
+const KEPT_DIR: &str = "contracts";
+
+/// Of the instances opening `id` in `dir` keeps, how many are on disk:
+/// those [`Store::keep`] finished writing. None if it keeps none there.
+pub fn kept(dir: &Path, id: &[u8; 32]) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir.join(KEPT_DIR).join(crate::hex_id(id))) else {
+        return 0;
+    };
+    let written = |e: &std::fs::DirEntry| !e.file_name().to_string_lossy().ends_with(".new");
+    entries.filter_map(Result::ok).filter(written).count()
+}
+
 /// A contract as a list shows it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Contract {
@@ -131,7 +145,7 @@ impl Store {
         }
         Ok(Self {
             c,
-            kept: dir.join("contracts"),
+            kept: dir.join(KEPT_DIR),
         })
     }
 
@@ -457,5 +471,22 @@ mod tests {
         assert!(!kept.exists());
         // Again, or with nothing kept: no error.
         store.forget(&[1; 32]).unwrap();
+    }
+
+    #[test]
+    fn the_instances_an_opening_kept_are_counted_once_written_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store.insert(&new(1, coin(0))).unwrap();
+        assert_eq!(kept(dir.path(), &[1; 32]), 0);
+        store.keep(&[1; 32], 0, 1, b"instance").unwrap();
+        store.keep(&[1; 32], 1, 3, b"instance").unwrap();
+        // One being written, as a stop leaves it: not yet.
+        let aside = dir.path().join("contracts").join(crate::hex_id(&[1; 32]));
+        std::fs::write(aside.join("1-0.new"), b"inst").unwrap();
+        assert_eq!(kept(dir.path(), &[1; 32]), 2);
+        assert_eq!(kept(dir.path(), &[2; 32]), 0);
+        store.forget(&[1; 32]).unwrap();
+        assert_eq!(kept(dir.path(), &[1; 32]), 0);
     }
 }

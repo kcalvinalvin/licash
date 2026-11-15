@@ -22,8 +22,12 @@ use driver::Driver;
 pub use licash_contract::opening::{Fate, Phase};
 #[cfg(feature = "node")]
 pub use node::Node;
-pub use store::Contract;
+pub use store::{kept, Contract};
 use store::{New, Store};
+
+/// How many of the hub's instances an opening keeps: of each stage,
+/// those she chose, downloaded whole before she consents.
+pub const KEEPS: usize = licash_contract::wire::STAGES * licash_contract::KEPT;
 
 use crate::{Offer, QUOTE};
 

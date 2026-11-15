@@ -3,7 +3,7 @@
 //! it asks is done.
 
 use std::collections::VecDeque;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context as _, Result};
 use licash_contract::opening::{Context, Holder, Input, Out, Phase, Quote, Trust};
@@ -147,6 +147,7 @@ impl<T: Transport, C: Chain> Driver<'_, T, C> {
     /// then her state stored, then the rest of what it asks returned.
     async fn step(&mut self, input: Input) -> Result<Vec<Out>> {
         let ctx = self.context().await?;
+        let started = Instant::now();
         let mut holder = self.holder.take().expect("a holder between steps");
         let stepped = tokio::task::spawn_blocking(move || {
             let out = holder.step(input, &ctx);
@@ -171,6 +172,9 @@ impl<T: Transport, C: Chain> Driver<'_, T, C> {
         let funding = holder.funding().map(|f| f.tx.compute_txid());
         let state = holder.to_bytes();
         self.store.save(&self.id, holder.phase(), funding, &state)?;
+        // Where an opening's time goes, step by step.
+        let (id, phase) = (crate::hex_id(&self.id), holder.phase());
+        tracing::info!(%id, ?phase, took = ?started.elapsed(), "an opening's step taken");
         Ok(rest)
     }
 
@@ -202,12 +206,17 @@ impl<T: Transport, C: Chain> Driver<'_, T, C> {
                 (format!("{}{path}", self.hub), message)
             }
         };
+        let started = Instant::now();
         for _ in 0..PATIENCE {
             let body = Some(body.clone());
             let response = self.wallet.transport().request(&url, body).await;
             let response = response.map_err(|e| anyhow!("{}: {e}", self.hub))?;
             match response.status {
-                200 => return Frame::decode_all(&response.body).context("the hub's answer"),
+                200 => {
+                    let (id, took) = (crate::hex_id(&self.id), started.elapsed());
+                    tracing::info!(%id, ?took, "the hub answered an opening's step");
+                    return Frame::decode_all(&response.body).context("the hub's answer");
+                }
                 202 => tokio::time::sleep(RETRY).await,
                 status => return Err(failed(&self.hub, status, &response.body)),
             }
@@ -223,10 +232,19 @@ impl<T: Transport, C: Chain> Driver<'_, T, C> {
             .replace("{stage}", &stage.to_string())
             .replace("{index}", &index.to_string());
         let url = format!("{}{path}", self.hub);
+        let started = Instant::now();
         let response = self.wallet.transport().download(&url, MAX_BODY).await;
         let response = response.map_err(|e| anyhow!("{}: {e}", self.hub))?;
         match response.status {
-            200 => Ok(response.body),
+            200 => {
+                let (id, bytes, took) = (
+                    crate::hex_id(&self.id),
+                    response.body.len(),
+                    started.elapsed(),
+                );
+                tracing::info!(%id, stage, index, bytes, ?took, "an instance kept downloaded");
+                Ok(response.body)
+            }
             status => Err(failed(&self.hub, status, &response.body)),
         }
     }
