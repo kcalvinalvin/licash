@@ -27,6 +27,7 @@ use tracing_subscriber::EnvFilter;
 mod contract;
 mod onchain;
 mod payout;
+mod say;
 
 /// The exit status of a payment recorded but not finished: retry later.
 const PENDING: u8 = 75;
@@ -559,8 +560,8 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                     "lightning": info.lightning,
                 }),
                 format!(
-                    "trusted; it charges {} + {} ppm a payment",
-                    fee.base, fee.ppm
+                    "trusted: it charges {} a payment",
+                    say::fee(fee.base, fee.ppm)
                 ),
             );
         }
@@ -580,10 +581,13 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                     ""
                 };
                 let deposits = match &info.deposits {
-                    Some(d) => format!("  deposits {} to {}", d.min, d.max),
+                    Some(d) => format!("  deposits {}", say::between(d.min, d.max)),
                     None => String::new(),
                 };
-                format!("{url}  {} + {} ppm{lightning}{deposits}", fee.base, fee.ppm)
+                format!(
+                    "{url}  {}{lightning}{deposits}",
+                    say::fee(fee.base, fee.ppm)
+                )
             });
             show(json, rows.collect(), lines.collect::<Vec<_>>().join("\n"));
         }
@@ -593,22 +597,26 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 .iter()
                 .map(|b| json!({ "hub": b.hub, "available": b.available, "pending": b.pending }));
             let total: u64 = balance.iter().map(|b| b.available).sum();
-            let mut lines: Vec<_> = balance
-                .iter()
-                .map(|b| match b.pending {
-                    0 => format!("{}  {}", b.hub, b.available),
-                    p => format!("{}  {} ({p} pending)", b.hub, b.available),
-                })
-                .collect();
-            lines.push(format!("total  {total}"));
+            // The total first, then where it is.
+            let mut lines = vec![format!("total  {}", say::sat(total))];
+            lines.extend(balance.iter().map(|b| match b.pending {
+                0 => format!("{}  {}", b.hub, say::sat(b.available)),
+                p => format!(
+                    "{}  {} ({} pending)",
+                    b.hub,
+                    say::sat(b.available),
+                    say::sat(p)
+                ),
+            }));
             // Left at hubs visited to pay there, apart from the total (and
             // from the JSON rows, which sum to it) until added.
             for b in wallet.visited_balance()? {
                 if b.available + b.pending > 0 {
                     let held = b.available + b.pending;
                     lines.push(format!(
-                        "{}  {held} (not added: add-hub to count it)",
-                        b.hub
+                        "{}  {} (not added: add-hub to count it)",
+                        b.hub,
+                        say::sat(held)
                     ));
                 }
             }
@@ -647,7 +655,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             show(
                 json,
                 json!({ "id": received.id, "hub": received.hub, "amount": amount, "unlinked": unlinked }),
-                format!("received {amount}"),
+                format!("received {}", say::sat(amount)),
             );
         }
         Command::Resume => resume(&wallet, json).await?,
@@ -661,11 +669,10 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             });
             let lines = sends.iter().map(|s| {
                 format!(
-                    "{}  {}  {} + {}  via {}  {}",
-                    s.created_at,
+                    "{}  {}  {}  via {}  {}",
+                    say::when(s.created_at),
                     state(&s.state),
-                    s.amount,
-                    s.fee,
+                    say::plus(s.amount, s.fee),
                     s.hub,
                     s.id
                 )
@@ -677,9 +684,10 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             let rows = receipts.iter().map(|r| {
                 json!({ "id": r.id, "hub": r.hub, "amount": r.amount, "received_at": r.received_at })
             });
-            let lines = receipts
-                .iter()
-                .map(|r| format!("{}  {}  via {}  {}", r.received_at, r.amount, r.hub, r.id));
+            let lines = receipts.iter().map(|r| {
+                let (at, amount) = (say::when(r.received_at), say::sat(r.amount));
+                format!("{at}  {amount}  via {}  {}", r.hub, r.id)
+            });
             show(json, rows.collect(), lines.collect::<Vec<_>>().join("\n"));
         }
         Command::Check => {
@@ -747,7 +755,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             show(
                 json,
                 json!({ "id": received.id, "hub": received.hub, "amount": amount, "unlinked": unlinked }),
-                format!("received {amount}"),
+                format!("received {}", say::sat(amount)),
             );
         }
         Command::Unlink => {
@@ -876,8 +884,11 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                         json,
                         shown,
                         format!(
-                            "swapped {} + {} at {} for {} at {}{through}",
-                            swap.amount, swap.fee, swap.from, swap.amount, swap.to
+                            "swapped {} at {} for {} at {}{through}",
+                            say::plus(swap.amount, swap.fee),
+                            swap.from,
+                            say::sat(swap.amount),
+                            swap.to
                         ),
                     )
                 }
@@ -974,9 +985,8 @@ async fn pay_invoice(
     }
     let text = match &lock.state {
         LockState::Paid(preimage) => format!(
-            "paid {} + {}\npreimage {}",
-            lock.amount,
-            lock.fee,
+            "paid {}\npreimage {}",
+            say::plus(lock.amount, lock.fee),
             hex::encode(preimage)
         ),
         _ => lock_line(&lock),
@@ -1061,10 +1071,9 @@ async fn discover(
                     ""
                 };
                 lines.push(format!(
-                    "{}  {} + {} ppm{lightning}  {name}",
+                    "{}  {}{lightning}  {name}",
                     urls.join(" "),
-                    fee.base,
-                    fee.ppm
+                    say::fee(fee.base, fee.ppm)
                 ));
                 rows.push(json!({
                     "key": key, "name": shown, "urls": urls, "fees": info.fees,
@@ -1074,12 +1083,10 @@ async fn discover(
             Answer::Swaps(info) => {
                 let fee = info.fee;
                 lines.push(format!(
-                    "{}  {} + {} ppm  {} to {}  {} hubs  {name}",
+                    "{}  {}  {}  {} hubs  {name}",
                     urls.join(" "),
-                    fee.base,
-                    fee.ppm,
-                    info.min,
-                    info.max,
+                    say::fee(fee.base, fee.ppm),
+                    say::between(info.min, info.max),
                     info.hubs.len()
                 ));
                 let hubs = info.hubs.iter().map(|hub| {
@@ -1271,7 +1278,10 @@ async fn pay(
         Some(relays) => show(
             json,
             json!({ "id": id, "hub": hub, "amount": amount, "relays": relays }),
-            format!("paid {amount} at {hub}: sent to the payee's mailbox"),
+            format!(
+                "paid {} at {hub}: sent to the payee's mailbox",
+                say::sat(amount)
+            ),
         ),
         None => write_payment(&paid.paid.payment, out)?,
     }
@@ -1298,7 +1308,7 @@ async fn mailbox(wallet: &Wallet<Http>, route: &Route, json: bool) -> anyhow::Re
         .collect();
     let mut lines: Vec<String> = received
         .iter()
-        .map(|r| format!("received {} at {}", r.amount, r.hub))
+        .map(|r| format!("received {} at {}", say::sat(r.amount), r.hub))
         .collect();
     if lines.is_empty() {
         lines.push("nothing new".into());
@@ -1423,8 +1433,13 @@ fn lock_line(lock: &Lock) -> String {
         None => lock_state(&lock.state),
     };
     format!(
-        "{}  lock {}  {} + {}  until {}  via {}  {}",
-        lock.created_at, state, lock.amount, lock.fee, lock.expiry, lock.hub, lock.id
+        "{}  lock {}  {}  until block {}  via {}  {}",
+        say::when(lock.created_at),
+        state,
+        say::plus(lock.amount, lock.fee),
+        lock.expiry,
+        lock.hub,
+        lock.id
     )
 }
 
@@ -1448,9 +1463,9 @@ fn invoice_json(invoice: &Invoice) -> serde_json::Value {
 fn invoice_line(invoice: &Invoice) -> String {
     format!(
         "{}  invoice {}  {}  via {}  {}",
-        invoice.created_at,
+        say::when(invoice.created_at),
         invoice_state(&invoice.state),
-        invoice.amount,
+        say::sat(invoice.amount),
         invoice.hub,
         invoice.hash
     )
@@ -1485,14 +1500,19 @@ fn deposit_json(deposit: &Deposit) -> serde_json::Value {
 
 fn deposit_line(deposit: &Deposit) -> String {
     let terms = match &deposit.terms {
-        Some(t) => format!("  pay {} to {} by block {}", t.pays, t.address, t.fund_by),
+        Some(t) => format!(
+            "  pay {} to {} by block {}",
+            say::sat(t.pays),
+            t.address,
+            t.fund_by
+        ),
         None => String::new(),
     };
     format!(
         "{}  deposit {}  {}  at {}  {}{terms}",
-        deposit.created_at,
+        say::when(deposit.created_at),
         deposit_state(&deposit.state),
-        deposit.amount,
+        say::sat(deposit.amount),
         deposit.hub,
         deposit.hash
     )
@@ -1570,11 +1590,10 @@ fn swap_json(swap: &Swap) -> serde_json::Value {
 
 fn swap_line(swap: &Swap) -> String {
     format!(
-        "{}  swap {}  {} + {}  {} -> {}  {}",
-        swap.created_at,
+        "{}  swap {}  {}  {} → {}  {}",
+        say::when(swap.created_at),
         swap_state(&swap.state),
-        swap.amount,
-        swap.fee,
+        say::plus(swap.amount, swap.fee),
         swap.from,
         swap.to,
         swap.hash

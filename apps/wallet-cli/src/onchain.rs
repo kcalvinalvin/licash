@@ -103,7 +103,7 @@ pub async fn run(
             let coins = wallet.silent_coins()?;
             let total: u64 = coins.iter().map(|c| c.value).sum();
             let mut lines: Vec<String> = coins.iter().map(coin_line).collect();
-            lines.push(format!("total  {total}"));
+            lines.push(format!("total  {}", crate::say::sat(total)));
             show(
                 json,
                 coins.iter().map(coin_json).collect(),
@@ -235,9 +235,10 @@ async fn scan(
             "tweaks": !without,
         }),
         format!(
-            "found {} {} of {value} sat, {} spent; looked up to block {}{behind}{without_text}",
+            "found {} {} of {}, {} spent; looked up to block {}{behind}{without_text}",
             found.len(),
             if found.len() == 1 { "coin" } else { "coins" },
+            crate::say::sat(value),
             spent.len(),
             scanned.next.saturating_sub(1)
         ),
@@ -326,7 +327,8 @@ fn coin_json(coin: &SilentCoin) -> serde_json::Value {
 }
 
 fn coin_line(coin: &SilentCoin) -> String {
-    let mut line = format!("{}  {}  block {}", coin.outpoint, coin.value, coin.height);
+    let value = crate::say::sat(coin.value);
+    let mut line = format!("{}  {value}  block {}", coin.outpoint, coin.height);
     if coin.change {
         line.push_str("  change");
     }

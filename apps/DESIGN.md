@@ -97,9 +97,12 @@ The wallet CLI (`licash-wallet`), the hub and swap services
 - **Lead with the answer.** A command prints its result first, in a line
   or a short aligned table: `12,345 sat` before how it was reached.
 - **Aligned key-value lines** (`label  value`), labels in plain words,
-  values right where they line up; amounts grouped with their unit; times
-  as spans or local dates; ids shortened (`a1b2c3d4…`) and only where
-  they are needed to act on something.
+  values right where they line up; amounts grouped with their unit
+  (`10,000 + 12 sat` for an amount and its fee); fees as sat and a
+  percentage (`1 sat + 0.1%`), never ppm; times as spans or UTC dates
+  (`2026-11-15 13:05`), heights only where they are the deadline, labeled
+  `block`; ids shortened (`a1b2c3d4…`) and only where they are needed to
+  act on something.
 - **Errors** are `error: what failed: why` on stderr, one line, with what
   to do when known. Progress and logs go to stderr too, never mixed into
   the result.

@@ -157,11 +157,10 @@ fn payout_json(payout: &Payout) -> serde_json::Value {
 
 fn payout_line(payout: &Payout) -> String {
     format!(
-        "{}  payout {}  {} + {}  {} -> {}  {}",
-        payout.created_at,
+        "{}  payout {}  {}  {} → {}  {}",
+        crate::say::when(payout.created_at),
         state(&payout.state),
-        payout.amount,
-        payout.budget + payout.fee,
+        crate::say::plus(payout.amount, payout.budget + payout.fee),
         payout.from,
         payout.address,
         payout.hash

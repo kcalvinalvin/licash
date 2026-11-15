@@ -83,7 +83,7 @@ fn owners_pay_and_get_paid_on_the_command_line() {
     let id = String::from_utf8_lossy(&sent.stderr).trim().to_owned();
     let paid = ok(sent);
     let received = ok(wallet(&bob, &["receive"], Some(&paid)));
-    assert_eq!(received.trim(), "received 30");
+    assert_eq!(received.trim(), "received 30 sat");
     let receipts = json(&bob, &["received"]);
     assert_eq!(
         format!("payment {}", receipts[0]["id"].as_str().unwrap()),
@@ -94,7 +94,7 @@ fn owners_pay_and_get_paid_on_the_command_line() {
     assert_eq!(available(&bob), (30, 0));
     let text = ok(wallet(&alice, &["balance"], None));
     assert!(
-        text.contains(&format!("{}  69", hub.url())) && text.contains("total  69"),
+        text.starts_with("total  69 sat\n") && text.contains(&format!("{}  69 sat", hub.url())),
         "{text}"
     );
 
@@ -194,7 +194,7 @@ fn a_payment_while_its_hub_is_down_finishes_once_it_is_back() {
     let payment = serde_json::to_string(&resumed["paid"][0]["payment"]).unwrap();
     assert_eq!(
         ok(wallet(&bob, &["receive"], Some(&payment))).trim(),
-        "received 10"
+        "received 10 sat"
     );
     assert_eq!(available(&alice), (53, 0));
     assert_eq!(json(&alice, &["history"])[0]["state"], "done");
@@ -254,7 +254,7 @@ fn notes_a_restarted_hub_no_longer_unlinks_are_renewed_within_the_fee_limit() {
     let payment = ok(wallet(&alice, &["send", &bob_at, "10"], None));
     assert_eq!(
         ok(wallet(&bob, &["receive"], Some(&payment))).trim(),
-        "received 10"
+        "received 10 sat"
     );
     assert_eq!(json(&alice, &["unlink"])["unlinked"], 0);
     assert_eq!(available(&alice), (52, 0));
@@ -338,7 +338,7 @@ fn a_lock_pays_on_its_preimage_or_returns_once_expired() {
     assert_eq!(available(&alice), (52, 0));
     let text = ok(wallet(&alice, &["locks"], None));
     assert!(
-        text.contains("lock refunded  10 + 1  until 8") && text.contains("lock paid"),
+        text.contains("lock refunded  10 + 1 sat  until block 8") && text.contains("lock paid"),
         "{text}"
     );
     failed(
@@ -379,7 +379,7 @@ fn owners_pay_invoices_and_get_paid_over_lightning() {
     hex::decode_to_slice(&hash, &mut held).unwrap();
     assert_eq!(hub.node().held(held).unwrap().0, HeldState::Settled);
     let text = ok(wallet(&alice, &["invoices"], None));
-    assert!(text.contains("invoice received  40"), "{text}");
+    assert!(text.contains("invoice received  40 sat"), "{text}");
     failed(
         wallet(&alice, &["invoice", "101"], None),
         1,
@@ -396,7 +396,7 @@ fn owners_pay_invoices_and_get_paid_over_lightning() {
     let paid = ok(wallet(&alice, &["pay-invoice", &request], None));
     assert_eq!(
         paid,
-        format!("paid 22 + 0\npreimage {}\n", hex::encode(preimage))
+        format!("paid 22 + 0 sat\npreimage {}\n", hex::encode(preimage))
     );
     assert_eq!(available(&alice), (17, 0));
     let locks = json(&alice, &["locks"]);
@@ -412,7 +412,7 @@ fn owners_pay_invoices_and_get_paid_over_lightning() {
     assert_eq!(available(&alice), (15, 0));
     let text = ok(wallet(&alice, &["locks"], None));
     assert!(
-        text.contains(&format!("lock refunded ({reason})  12 + 0")),
+        text.contains(&format!("lock refunded ({reason})  12 + 0 sat")),
         "{text}"
     );
 
@@ -494,7 +494,7 @@ fn hubs_announced_on_nostr_are_discovered_where_they_answer_as_the_announcer() {
     assert!(!nowhere.exists());
     let text = ok(wallet(&nowhere, &args, None));
     assert!(
-        text.starts_with(&format!("{}  1 + 0 ppm  hub ", hub.url())),
+        text.starts_with(&format!("{}  1 sat  hub ", hub.url())),
         "{text}"
     );
 
@@ -555,7 +555,11 @@ fn notes_swap_between_hubs_through_a_provider() {
     let text = ok(swap("20"));
     assert_eq!(
         text.trim(),
-        format!("swapped 20 + 2 at {} for 20 at {}", a.url(), b.url())
+        format!(
+            "swapped 20 + 2 sat at {} for 20 sat at {}",
+            a.url(),
+            b.url()
+        )
     );
     let listed = json(&alice, &["swaps"]);
     assert_eq!(
@@ -586,7 +590,7 @@ fn notes_swap_between_hubs_through_a_provider() {
     assert_eq!(resumed["swaps"][0]["state"], "done", "{resumed}");
     assert_eq!(resumed["swaps"][0]["amount"], 10);
     let text = ok(wallet(&alice, &["swaps"], None));
-    assert!(text.contains("swap done  10 + 2"), "{text}");
+    assert!(text.contains("swap done  10 + 2 sat"), "{text}");
     swaps.until(|r| r.amount == 10 && r.stage == licash_swaps::Stage::Done);
 }
 
@@ -653,7 +657,7 @@ fn swap_providers_announced_on_nostr_are_discovered_where_they_answer() {
     let text = ok(wallet(&nowhere, &args, None));
     assert_eq!(
         text.trim(),
-        format!("{}  1 + 10000 ppm  5 to 150  2 hubs  swaps", swaps.url())
+        format!("{}  1 sat + 1%  5 to 150 sat  2 hubs  swaps", swaps.url())
     );
 }
 
@@ -744,7 +748,7 @@ fn a_swap_goes_through_a_provider_announced_one_used_before_first_then_the_cheap
     let through = format!("through {}", cheap.url());
     assert_eq!(
         text.trim(),
-        format!("swapped 20 + 1 at {from} for 20 at {to} {through}")
+        format!("swapped 20 + 1 sat at {from} for 20 sat at {to} {through}")
     );
     failed(
         swap(&alice, "151", &[]),
@@ -880,9 +884,9 @@ fn what_paying_at_a_hub_not_added_leaves_there_is_shown_apart_until_added() {
     let (held, _) = available(&alice);
     assert!(held < 100 - 3, "{held}");
     let text = ok(wallet(&alice, &["balance"], None));
-    let apart = format!("{}  1 (not added: add-hub to count it)", b.url());
+    let apart = format!("{}  1 sat (not added: add-hub to count it)", b.url());
     assert!(
-        text.contains(&apart) && text.contains(&format!("total  {held}")),
+        text.contains(&apart) && text.starts_with(&format!("total  {held} sat\n")),
         "{text}"
     );
 
@@ -891,7 +895,7 @@ fn what_paying_at_a_hub_not_added_leaves_there_is_shown_apart_until_added() {
     assert_eq!(available(&alice), (held + 1, 0));
     let text = ok(wallet(&alice, &["balance"], None));
     assert!(
-        !text.contains("not added") && text.contains(&format!("total  {}", held + 1)),
+        !text.contains("not added") && text.starts_with(&format!("total  {} sat\n", held + 1)),
         "{text}"
     );
 }
@@ -927,7 +931,7 @@ fn owners_deposit_on_bitcoin_and_take_back_what_was_never_received() {
         (Some(1_000), Some(DEPOSIT_TIMEOUT.into()))
     );
     let text = ok(wallet(&alice, &["hubs"], None));
-    assert!(text.contains("deposits 1000 to 4000"), "{text}");
+    assert!(text.contains("deposits 1,000 to 4,000 sat"), "{text}");
 
     // Asked for 2000 in notes: pay 2100 on Bitcoin, the hub's fee on top.
     let asked = wallet(&alice, &["deposit", "2000"], None);
@@ -962,7 +966,7 @@ fn owners_deposit_on_bitcoin_and_take_back_what_was_never_received() {
     );
     assert_eq!(available(&alice), (2_000, 0));
     let text = ok(wallet(&alice, &["deposits"], None));
-    assert!(text.contains("deposit received  2000"), "{text}");
+    assert!(text.contains("deposit received  2,000 sat"), "{text}");
     // The hub claims the coins, which are no longer the payer's.
     hub.round();
     hub.round();
@@ -1171,7 +1175,7 @@ fn coins_paid_on_bitcoin_are_found_spent_and_moved_to_notes() {
     assert_eq!(scanned["next"], hub.height() + 1);
     assert_eq!(scan(&alice)["found"], serde_json::json!([]));
     let coins = ok(wallet(&alice, &["onchain", "coins"], None));
-    assert!(coins.ends_with("total  5500\n"), "{coins}");
+    assert!(coins.ends_with("total  5,500 sat\n"), "{coins}");
     // The address paid gives way to the next.
     assert_ne!(on_bitcoin(&alice).0, fallback);
 
@@ -1266,5 +1270,5 @@ fn coins_paid_at_a_fallback_address_are_found_with_no_hub_serving_tweaks() {
     let again: Value = serde_json::from_str(&ok(scan(&[]))).unwrap();
     assert_eq!(again["found"], serde_json::json!([]));
     let coins = ok(wallet(&alice, &["onchain", "coins"], None));
-    assert!(coins.ends_with("total  3000\n"), "{coins}");
+    assert!(coins.ends_with("total  3,000 sat\n"), "{coins}");
 }

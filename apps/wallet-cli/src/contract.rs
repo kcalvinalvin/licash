@@ -110,15 +110,15 @@ fn contract_line(c: &Contract) -> String {
         ""
     };
     format!(
-        "{}  {}  {}  cap {}  until block {}  closes at {}  deposit {} price {}{mock}",
+        "{}  {}  {}  covers {}  until block {}  closes at block {}  deposit {}  price {}{mock}",
         &licash_contracts::hex_id(&c.id)[..16],
         c.hub,
         state(c),
-        c.cap,
+        crate::say::sat(c.cap.into()),
         c.assert_height,
         c.close_height,
-        c.value,
-        c.price,
+        crate::say::sat(c.value),
+        crate::say::sat(c.price),
     )
 }
 
