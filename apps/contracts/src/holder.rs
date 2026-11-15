@@ -5,6 +5,8 @@
 
 mod chain;
 mod driver;
+#[cfg(feature = "node")]
+mod node;
 mod store;
 
 use std::path::Path;
@@ -15,9 +17,11 @@ use licash_contract::opening::{Holder, Start};
 use licash_contract::wire::Wanted;
 use licash_wallet::{Transport, Wallet};
 
-pub use chain::{Chain, Node};
+pub use chain::Chain;
 use driver::Driver;
 pub use licash_contract::opening::{Fate, Phase};
+#[cfg(feature = "node")]
+pub use node::Node;
 pub use store::Contract;
 use store::{New, Store};
 

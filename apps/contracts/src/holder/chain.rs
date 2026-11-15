@@ -4,9 +4,8 @@ use std::collections::HashMap;
 use std::future::Future;
 
 use anyhow::{anyhow, Result};
-use bitcoin::{BlockHash, OutPoint, Transaction, Txid};
+use bitcoin::{OutPoint, Transaction, Txid};
 use licash::chain::Checkpoint;
-use licash_chain_client::Source;
 use licash_contract::opening::{Fate, Holder};
 use licash_wallet::Blocks;
 
@@ -18,41 +17,6 @@ pub trait Chain: Blocks {
 
     /// Hand `tx` to the network; one it has already is no error.
     fn broadcast(&self, tx: &Transaction) -> impl Future<Output = Result<(), String>> + Send;
-}
-
-/// A node or an Esplora API, as a holder's chain.
-pub struct Node(pub Source);
-
-fn text(e: anyhow::Error) -> String {
-    format!("{e:#}")
-}
-
-impl Blocks for Node {
-    async fn height(&self) -> Result<u32, String> {
-        Ok(self.0.tip().await.map_err(text)?.height)
-    }
-
-    async fn hash(&self, height: u32) -> Result<BlockHash, String> {
-        self.0.hash(height).await.map_err(text)
-    }
-
-    async fn filter(&self, hash: &BlockHash) -> Result<Option<Vec<u8>>, String> {
-        self.0.filter(hash).await.map_err(text)
-    }
-
-    async fn block(&self, hash: &BlockHash) -> Result<bitcoin::Block, String> {
-        self.0.block(hash).await.map_err(text)
-    }
-}
-
-impl Chain for Node {
-    async fn checkpoint(&self, height: u32) -> Result<Checkpoint, String> {
-        self.0.checkpoint(height).await.map_err(text)
-    }
-
-    async fn broadcast(&self, tx: &Transaction) -> Result<(), String> {
-        self.0.broadcast(tx).await.map(|_| ()).map_err(text)
-    }
 }
 
 /// Where `holder`'s F stands on `chain`, its inputs looked up in the

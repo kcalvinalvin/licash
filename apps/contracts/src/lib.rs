@@ -12,6 +12,10 @@
 //!
 //! Openings under the mock authority (anyone "proves" anything) are for
 //! regtest only, and say so: [`trust`].
+//!
+//! The `node` feature, on by default, adds the hub's side and a node or an
+//! Esplora API as the holder's chain: a wallet bringing its own chain, as
+//! a phone's light client, goes without.
 
 use anyhow::{bail, ensure, Result};
 use licash::spend::ChainProfile;
@@ -19,6 +23,7 @@ use licash_contract::opening::{Bounds, Quote, Trust};
 use licash_contract::wire::{Reader, Writer};
 
 pub mod holder;
+#[cfg(feature = "node")]
 pub mod hub;
 
 /// GET: the hub's [`Offer`].
