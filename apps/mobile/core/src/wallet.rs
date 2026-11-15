@@ -36,6 +36,7 @@ const SCAN_BATCH: u32 = 144;
 const DAY: i64 = 86_400;
 
 mod contracts;
+mod recoveries;
 mod moves;
 mod payouts;
 

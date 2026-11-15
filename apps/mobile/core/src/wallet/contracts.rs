@@ -236,9 +236,10 @@ impl Wallet {
         self.listed(&all)
     }
 
-    /// Carry on with the contracts being opened, and see where the funding
-    /// of each signed stands on `chain`: every contract, the newest first.
-    /// While one is being opened, as last seen.
+    /// Carry on with the contracts being opened, see where the funding of
+    /// each signed stands on `chain`, and carry on those forced closed:
+    /// every contract, the newest first. While one is being opened, as
+    /// last seen.
     pub fn resume_contracts(
         &self,
         chain: Arc<dyn ChainSource>,
@@ -251,8 +252,11 @@ impl Wallet {
             self.saw(tip);
         }
         let all = holder::resume(&self.wallet, &chain, &self.dir);
-        let all = self.runtime.block_on(all).map_err(unavailable)?;
-        self.listed(&all)
+        let all = self.runtime.block_on(all);
+        // Carried on even if the others could not be: a forced close
+        // has deadlines of its own.
+        self.advance_recoveries(&chain);
+        self.listed(&all.map_err(unavailable)?)
     }
 }
 

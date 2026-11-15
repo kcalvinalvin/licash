@@ -1772,6 +1772,33 @@ fn a_phone_whose_hub_opens_no_contracts_has_none_and_keeps_no_file_for_them() {
     assert!(!dir.join("contracts.sqlite").exists() && !dir.join("contracts").exists());
 }
 
+#[test]
+fn a_phone_with_no_contract_forces_none_closed_and_keeps_no_file_for_it() {
+    let net = Net::new(true);
+    let light = Light::new(&net);
+    let alice = funded(&net, &light, "alice");
+    assert!(alice.recoveries().unwrap().is_empty());
+    let bad = invalid(alice.force_close_contract(light.clone(), "zz".into()));
+    assert!(bad.contains("no contract id"), "{bad}");
+    let failed = |result: Result<_, LicashError>| match result {
+        Err(LicashError::Failed { reason }) => reason,
+        other => panic!("not failed: {other:?}"),
+    };
+    let none = failed(
+        alice
+            .force_close_contract(light.clone(), "00".repeat(32))
+            .map(|_| ()),
+    );
+    assert!(none.contains("no contracts"), "{none}");
+    let none = failed(alice.give_up_recovery("00".repeat(32)));
+    assert!(none.contains("no contracts"), "{none}");
+    // Carried on with the others: nothing.
+    assert!(alice.resume_contracts(light.clone()).unwrap().is_empty());
+    assert!(alice.recoveries().unwrap().is_empty());
+    let dir = std::path::Path::new(&net.dir("alice")).to_owned();
+    assert!(!dir.join("contracts.sqlite").exists());
+}
+
 /// Over Tor, the light client goes through the wallet's own Tor client: a
 /// SOCKS5 proxy only it can use. Nothing here reaches the Tor network.
 #[test]
