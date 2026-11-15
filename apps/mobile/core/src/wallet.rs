@@ -284,7 +284,9 @@ impl Wallet {
                     tracing::info!(%url, "asking the hub what URLs it names: {e}");
                 }
             });
-        let asked = tokio::time::timeout(ASK_URLS, futures_util::future::join_all(asks));
+        // Its timer made within the runtime: not on the caller's thread.
+        let asked =
+            async { tokio::time::timeout(ASK_URLS, futures_util::future::join_all(asks)).await };
         if self.runtime.block_on(asked).is_err() {
             tracing::info!("asking the hubs what URLs they name: not all answered in time");
         }

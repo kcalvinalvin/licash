@@ -1824,3 +1824,15 @@ fn a_wallet_over_tor_lends_the_light_client_a_proxy_of_its_own() {
     drop(wallet);
     assert!(std::net::TcpStream::connect(address).is_err());
 }
+
+/// Taken on from the app's thread, outside any runtime, over Tor: the hubs
+/// asked what URLs they name, here none, without failing for want of one.
+/// Nothing here reaches the Tor network.
+#[test]
+fn a_wallet_over_tor_takes_things_on_from_a_thread_of_the_apps() {
+    let dir = tempfile::tempdir().unwrap();
+    let tor = dir.path().join("tor").display().to_string();
+    let wallet = Wallet::create(tor, Network::Signet, 0, true).unwrap();
+    wallet.resume().unwrap();
+    wallet.resume().unwrap();
+}
