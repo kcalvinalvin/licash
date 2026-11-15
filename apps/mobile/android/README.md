@@ -84,3 +84,7 @@ picks, among the regtest ecosystem of `apps/e2e`:
 ```sh
 LICASH_E2E_APP=$PWD/app/build/outputs/apk/debug/app-debug.apk ../../e2e/run.sh the_app_is
 ```
+
+It types as on a hardware keyboard: give the emulator one (`hw.keyboard =
+yes` in its AVD's `config.ini`), as CI does, so that no on-screen keyboard
+covers the buttons it taps.

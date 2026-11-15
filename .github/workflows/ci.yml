@@ -170,6 +170,9 @@ jobs:
           api-level: 34
           arch: x86_64
           disable-animations: true
+          # As the test is run locally: typed through a hardware keyboard,
+          # with no on-screen keyboard covering the buttons it taps.
+          enable-hw-keyboard: true
           script: apps/e2e/run.sh the_app_is
       - if: failure()
         uses: actions/upload-artifact@v4
