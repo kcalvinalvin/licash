@@ -1128,6 +1128,13 @@ async fn pay(
             "paying {} at {} swaps {} from {} through {} first",
             plan.amount, plan.hub, quote.amount, swap.from, provider.url
         );
+        let swapping = match plan.trusted {
+            true => swapping,
+            false => format!(
+                "{swapping}; {} is not a hub you added: what the swap brings past the payment stays there",
+                plan.hub
+            ),
+        };
         if max_fee.is_none() {
             bail!("{swapping}, {fees} sat in fees at most in all: pay again with --max-fee {fees}");
         }
