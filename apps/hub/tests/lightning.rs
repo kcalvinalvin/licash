@@ -643,3 +643,85 @@ async fn the_operator_is_alerted_once_of_each_way_the_node_moves_too_little() {
     net.gateway.round().await;
     assert_eq!(said().len(), 3);
 }
+
+/// The value of the facts of `series` under `label`, in `report`.
+fn summed(report: &licash_dashboard::Report, series: &str, label: &str) -> (usize, i64) {
+    let series = report.series.iter().find(|s| s.id == series).unwrap();
+    let Some(label) = series.labels.iter().position(|l| l == label) else {
+        return (0, 0);
+    };
+    let facts = series.facts.iter().filter(|f| f.label as usize == label);
+    facts.fold((0, 0), |(n, sum), f| (n + 1, sum + f.value))
+}
+
+#[tokio::test]
+async fn the_dashboard_reads_payments_fees_failures_and_notes_from_the_records() {
+    let net = Net::with(Policy {
+        spend: Fee { base: 1, ppm: 0 },
+        timing: TIMING,
+        ..Policy::default()
+    });
+    net.gateway.round().await;
+    // In: 40 sat, of an invoice of 41.
+    let wallet = net.funded("alice", 40).await;
+    // Out: 20 sat, in a lock of 22 with the gateway's fee, of notes made
+    // exact by a transfer to itself, paying the hub 1.
+    let preimage = [5; 32];
+    let paid = net
+        .node
+        .invoice(20_000, lock_hash(&preimage), 18, Outcome::Pay(preimage));
+    let lock = wallet.pay_invoice(HUB, &paid).await.unwrap();
+    net.gateway.round().await;
+    let lock = wallet.follow_lock(&lock.id).await.unwrap();
+    assert_eq!(lock.state, LockState::Paid(preimage));
+    // Failed: refunded.
+    let reason = "FAILURE_REASON_NO_ROUTE".to_owned();
+    let failed = net
+        .node
+        .invoice(10_000, lock_hash(&[6; 32]), 18, Outcome::Fail(reason));
+    let lock = wallet.pay_invoice(HUB, &failed).await.unwrap();
+    net.gateway.round().await;
+    let failed = wallet.follow_lock(&lock.id).await.unwrap();
+    assert_eq!(failed.state, LockState::Refunded);
+
+    let report = licash_hub_service::dashboard::report(net.dir.path(), None).unwrap();
+    assert_eq!(summed(&report, "volume", "lightning in"), (1, 41));
+    assert_eq!(summed(&report, "fees", "lightning in"), (1, 1));
+    assert_eq!(summed(&report, "volume", "lightning out"), (1, 22));
+    assert_eq!(summed(&report, "fees", "lightning out"), (1, 2));
+    let (transfers, fees) = summed(&report, "fees", "transfers");
+    assert!(
+        transfers >= 1 && fees == transfers as i64,
+        "{transfers} {fees}"
+    );
+    assert_eq!(
+        summed(&report, "failures", "no route"),
+        (1, failed.amount as i64)
+    );
+    // A lock paying out is no plain lock, settled or refunded.
+    assert_eq!(summed(&report, "volume", "locks"), (0, 0));
+    assert_eq!(summed(&report, "failures", "lock refunded"), (0, 0));
+    // Every note the hub issued since its ledger began: the 40 paid in,
+    // the wallet's and the hub's fees and payments out, none behind a lock.
+    let (_, holders) = summed(&report, "ecash", "holders");
+    let (_, own) = summed(&report, "ecash", "hub's own");
+    assert_eq!(summed(&report, "ecash", "behind locks").1, 0);
+    assert_eq!(holders, available(&wallet) as i64);
+    assert_eq!(holders + own, 40);
+    let notes = report.series.iter().find(|s| s.id == "notes").unwrap();
+    assert!(notes.facts.iter().map(|f| f.value).sum::<i64>() > 0);
+    let pages: Vec<_> = report.pages.iter().map(|p| p.title.as_str()).collect();
+    assert_eq!(
+        pages,
+        [
+            "Overview",
+            "Payments",
+            "Fees",
+            "Reserves",
+            "Contracts",
+            "Privacy",
+            "Health"
+        ]
+    );
+    assert!(report.since <= report.now && report.now - report.since < 600);
+}

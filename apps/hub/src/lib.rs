@@ -2,6 +2,7 @@
 //! and the [`Services`] it runs beside it.
 
 pub mod announce;
+pub mod dashboard;
 pub mod deposit;
 pub mod lightning;
 pub mod notify;

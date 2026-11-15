@@ -17,7 +17,7 @@ use licash_contracts::hub::Openings;
 use licash_hub::{Fee, Hub, Ledger, Policy, Timing};
 use licash_hub_service::{
     announce::announce,
-    deposit,
+    dashboard, deposit,
     lightning::{lnd::Lnd, Config, Gateway},
     notify::{self, Notifier},
     tweaks::{self, Tweaks},
@@ -574,6 +574,17 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// An interactive dashboard of the hub's records, beside the running
+    /// hub or without it: payments, fees, reserves, contracts, privacy and
+    /// health, over a range (30 days at first) against the one before.
+    Dashboard {
+        #[command(flatten)]
+        dashboard: licash_dashboard::Args,
+        /// The running hub's URL, asked for its health [default: http://
+        /// and `LICASH_HUB_LISTEN`, or 127.0.0.1:8338].
+        #[arg(long)]
+        url: Option<String>,
+    },
     /// The hub's events as JSON lines, oldest first.
     Events {
         /// Only events after this sequence number.
@@ -763,6 +774,7 @@ fn command(cli: Cli) -> anyhow::Result<()> {
         }
         Command::TestNotify { notify } => test_notify(&notify),
         Command::Status { json } => status(&db, json),
+        Command::Dashboard { dashboard, url } => show(&cli.data, dashboard, url),
         Command::Events {
             after,
             limit,
@@ -909,6 +921,16 @@ async fn shutdown() {
     #[cfg(not(unix))]
     let _ = interrupt.await;
     tracing::info!("stopping: finishing the requests in flight");
+}
+
+fn show(data: &Path, args: licash_dashboard::Args, url: Option<String>) -> anyhow::Result<()> {
+    let url = url.unwrap_or_else(|| {
+        let listen = std::env::var("LICASH_HUB_LISTEN");
+        format!("http://{}", listen.as_deref().unwrap_or("127.0.0.1:8338"))
+    });
+    let probe = dashboard::Probe::new(&url)?;
+    let data = data.to_owned();
+    args.run(move || dashboard::report(&data, Some(&probe)))
 }
 
 fn status(db: &Path, json: bool) -> anyhow::Result<()> {
