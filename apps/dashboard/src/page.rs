@@ -192,3 +192,126 @@ pub struct Page {
     pub title: String,
     pub rows: Vec<Vec<Panel>>,
 }
+
+impl Card {
+    pub fn new(title: &str, value: Value, better: Better) -> Self {
+        Self {
+            title: title.into(),
+            value,
+            better,
+        }
+    }
+}
+
+impl Value {
+    /// The value of `of` over the range.
+    pub fn of(of: Ref) -> Self {
+        Self::Total {
+            plus: vec![of],
+            minus: vec![],
+        }
+    }
+
+    pub fn now(value: Option<i64>, unit: Unit, detail: impl Into<String>, tone: Tone) -> Self {
+        Self::Now {
+            value,
+            unit,
+            detail: detail.into(),
+            tone,
+        }
+    }
+}
+
+impl Column {
+    pub fn value(title: &str, of: Ref) -> Self {
+        Self::Value {
+            title: title.into(),
+            of,
+        }
+    }
+
+    pub fn share(title: &str, of: Ref) -> Self {
+        Self::Share {
+            title: title.into(),
+            of,
+        }
+    }
+
+    pub fn change(title: &str, of: Ref) -> Self {
+        Self::Change {
+            title: title.into(),
+            of,
+        }
+    }
+
+    pub fn per_day(title: &str, of: Ref) -> Self {
+        Self::PerDay {
+            title: title.into(),
+            of,
+        }
+    }
+}
+
+impl Check {
+    pub fn new(name: &str, tone: Tone, detail: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            tone,
+            detail: detail.into(),
+        }
+    }
+}
+
+impl Row {
+    pub fn new(at: Option<i64>, tone: Tone, cells: Vec<Cell>) -> Self {
+        Self { at, tone, cells }
+    }
+}
+
+impl Table {
+    /// A table of what is true now: every row shows, whatever the range.
+    pub fn now(title: &str, columns: &[&str], rows: Vec<Row>, empty: &str) -> Self {
+        Self {
+            title: title.into(),
+            columns: columns.iter().map(|c| c.to_string()).collect(),
+            rows,
+            in_range: false,
+            empty: empty.into(),
+        }
+    }
+
+    /// A table of what happened: only the rows within the range show.
+    pub fn in_range(title: &str, columns: &[&str], rows: Vec<Row>, empty: &str) -> Self {
+        Self {
+            in_range: true,
+            ..Self::now(title, columns, rows, empty)
+        }
+    }
+}
+
+impl Panel {
+    pub fn chart(title: &str, series: &str, measure: Measure) -> Self {
+        Self::Chart {
+            title: title.into(),
+            series: series.into(),
+            measure,
+        }
+    }
+
+    pub fn breakdown(title: &str, series: &str, columns: Vec<Column>) -> Self {
+        Self::Breakdown {
+            title: title.into(),
+            series: series.into(),
+            columns,
+        }
+    }
+}
+
+impl Page {
+    pub fn new(title: &str, rows: Vec<Vec<Panel>>) -> Self {
+        Self {
+            title: title.into(),
+            rows,
+        }
+    }
+}
