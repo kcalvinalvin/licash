@@ -311,6 +311,7 @@ impl<T: Transport> Wallet<T> {
     /// payment once made.
     pub async fn invoice(&self, url: &str, amount: u64) -> Result<Invoice, Error> {
         let url = hub_url(url)?;
+        self.not_visited(&url)?;
         let (hub, info) = self.refresh(&url).await?;
         let lightning = info
             .lightning

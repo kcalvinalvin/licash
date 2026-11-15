@@ -4,7 +4,7 @@ use std::{path::Path, sync::Arc};
 
 use licash::spend::ChainProfile;
 use licash_api::{Code, Fee, Hex, Payment};
-use licash_wallet::{Balance, Error, State, Wallet};
+use licash_wallet::{Balance, Error, HubId, State, Wallet};
 use net::{Fault, Link, Net, HUB};
 
 const FEE: Fee = Fee { base: 2, ppm: 0 };
@@ -420,6 +420,116 @@ async fn a_hub_proving_another_identity_is_refused_and_one_proving_none_taken() 
     *net.proof.lock().unwrap() = Some(None);
     bob.add_hub(OTHER).await.unwrap();
     assert_eq!(bob.hubs().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn a_hub_visited_proves_it_is_the_one_a_code_names_and_is_not_trusted() {
+    const OTHER: &str = "http://other.test";
+    let net = network();
+    net.start(OTHER, FEE);
+    let bob = party(&net, 2).await;
+    let other = HubId::of(&net.hub(OTHER).advertise().unwrap().address);
+    let added = HubId::of(&bob.hubs().unwrap()[0].1.address);
+    fn refused<T: std::fmt::Debug>(result: Result<T, Error>, why: &str) {
+        assert!(
+            matches!(&result, Err(Error::Invalid(m)) if m.contains(why)),
+            "{result:?}"
+        );
+    }
+
+    // Not the hub the code names, or proving none: refused, nothing kept.
+    refused(bob.visit(OTHER, added).await, "not the hub the code names");
+    *net.proof.lock().unwrap() = Some(None);
+    refused(bob.visit(OTHER, other).await, "proves no identity");
+    *net.proof.lock().unwrap() = None;
+    assert!(bob.visited().unwrap().is_empty());
+
+    // Visited: known apart, its payments not taken, and in no code.
+    let info = bob.visit(&format!("{OTHER}/"), other).await.unwrap();
+    assert_eq!(HubId::of(&info.address), other);
+    assert_eq!(bob.hubs().unwrap().len(), 1);
+    assert_eq!(bob.visited().unwrap()[0].0, OTHER);
+    let payment = net.pay(OTHER, &bob.address(), 8);
+    assert!(matches!(bob.receive(&payment), Err(Error::UnknownHub(hub)) if hub == OTHER));
+    assert_eq!(bob.balance().unwrap().len(), 1);
+    let apart = Balance {
+        hub: OTHER.into(),
+        available: 0,
+        pending: 0,
+    };
+    assert_eq!(bob.visited_balance().unwrap(), [apart]);
+    let code = bob.payment_code(&[OTHER.into()], false);
+    assert!(matches!(code, Err(Error::UnknownHub(_))), "{code:?}");
+    // Nor asked for what its proof does not cover.
+    refused(bob.deposit(OTHER, 1_000).await, "only visited");
+    refused(bob.invoice(OTHER, 1_000).await, "only visited");
+
+    // Learned again only as the hub it proved it is: else unavailable,
+    // what is under way there waiting for it to prove it again.
+    *net.proof.lock().unwrap() = Some(None);
+    let lock = bob.lock(OTHER, &bob.address(), 1, [0; 32], None).await;
+    assert!(
+        matches!(&lock, Err(Error::Unavailable { reason, .. }) if reason.contains("no longer proves")),
+        "{lock:?}"
+    );
+    *net.proof.lock().unwrap() = None;
+    assert_eq!(bob.visited().unwrap()[0].1.proof, info.proof);
+
+    // A hub added stays trusted when visited; one visited, once added, is.
+    bob.visit(HUB, added).await.unwrap();
+    assert_eq!(bob.hubs().unwrap().len(), 1);
+    bob.add_hub(OTHER).await.unwrap();
+    assert!(bob.visited().unwrap().is_empty());
+    assert_eq!(bob.receive(&payment).unwrap().amount, 8);
+    assert_eq!(bob.balance().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn a_hub_visited_is_added_at_the_url_the_owner_gives() {
+    const OTHER: &str = "http://other.test";
+    const MIRROR: &str = "http://mirror.test";
+    let net = network();
+    net.start(OTHER, FEE);
+    net.alias(MIRROR, OTHER);
+    let bob = party(&net, 2).await;
+    let other = HubId::of(&net.hub(OTHER).advertise().unwrap().address);
+    bob.visit(OTHER, other).await.unwrap();
+
+    // The same hub, proving it is, at another URL: reached there, trusted.
+    bob.add_hub(MIRROR).await.unwrap();
+    assert!(bob.visited().unwrap().is_empty());
+    let hubs = bob.hubs().unwrap();
+    assert_eq!(hubs.len(), 2);
+    assert!(hubs
+        .iter()
+        .any(|(url, i)| url == MIRROR && HubId::of(&i.address) == other));
+    let payment = net.pay(OTHER, &bob.address(), 8);
+    assert_eq!(bob.receive(&payment).unwrap().amount, 8);
+    let held = bob.balance().unwrap();
+    assert!(
+        held.iter().any(|b| b.hub == MIRROR && b.available == 8),
+        "{held:?}"
+    );
+}
+
+#[test]
+fn a_wallet_file_of_version_5_trusts_every_hub_it_had() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v5.sqlite");
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute_batch(include_str!("fixtures/wallet-v5.sql"))
+        .unwrap();
+    let wallet = Wallet::open(&path, Link(Net::new())).unwrap();
+    let db = rusqlite::Connection::open(&path).unwrap();
+    let version: i64 = db
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, 6);
+    assert_eq!(wallet.hubs().unwrap().len(), 1);
+    assert_eq!(wallet.balance().unwrap().len(), 1);
+    assert!(wallet.visited().unwrap().is_empty());
+    assert!(wallet.visited_balance().unwrap().is_empty());
 }
 
 #[tokio::test]

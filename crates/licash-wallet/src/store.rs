@@ -17,7 +17,15 @@ const VERSION: i64 = 1 + MIGRATIONS.len() as i64;
 
 /// What each version adds to the one before: the first takes 1 to 2. A
 /// file of an older version is brought up to date when opened.
-const MIGRATIONS: &[&str] = &[SILENT, FALLBACK, UNTWEAKED, PAYOUTS];
+const MIGRATIONS: &[&str] = &[SILENT, FALLBACK, UNTWEAKED, PAYOUTS, VISITED];
+
+/// Version 6: hubs visited to pay a payee there, not trusted.
+const VISITED: &str = "
+-- Whether the owner trusts the hub, having added it (1), or the wallet
+-- only visited it to pay a payee there (0), the hub proving it is the one
+-- the payee's code names. Every hub of an older file was added.
+ALTER TABLE hubs ADD COLUMN trusted INTEGER NOT NULL DEFAULT 1;
+";
 
 /// Version 5: notes paid out on Bitcoin through a swap provider.
 const PAYOUTS: &str = "

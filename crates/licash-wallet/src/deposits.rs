@@ -106,6 +106,7 @@ impl<T: Transport> Wallet<T> {
     /// confirmed.
     pub async fn deposit(&self, url: &str, amount: u64) -> Result<Deposit, Error> {
         let url = hub_url(url)?;
+        self.not_visited(&url)?;
         let (hub, info) = self.refresh(&url).await?;
         let deposits = info
             .deposits

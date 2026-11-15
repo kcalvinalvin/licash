@@ -134,6 +134,27 @@ fn invalid(e: impl std::fmt::Display) -> Error {
     Error::Invalid(e.to_string())
 }
 
+/// Whether the hub `hub` is trusted, and what it last said of itself.
+fn kept_hub(tx: &rusqlite::Transaction, hub: i64) -> Result<(bool, Info), Error> {
+    let (trusted, info): (bool, String) =
+        tx.query_row("SELECT trusted, info FROM hubs WHERE id = ?1", [hub], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?;
+    Ok((trusted, serde_json::from_str(&info).map_err(invalid)?))
+}
+
+/// How [`Wallet::keep_info`] keeps what a hub says of itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Keep {
+    /// Trusted from now on: the owner added it.
+    Add,
+    /// Visited, unless added: it proved it is the hub of this id.
+    Visit(HubId),
+    /// As it was kept; a hub new to the wallet trusted, as one the owner
+    /// named.
+    Refresh,
+}
+
 /// What the wallet holds at one hub.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Balance {
@@ -377,7 +398,7 @@ impl<T: Transport> Wallet<T> {
     /// the other URL.
     pub async fn add_hub(&self, url: &str) -> Result<Info, Error> {
         let url = hub_url(url)?;
-        let refreshed = self.refresh(&url).await;
+        let refreshed = self.learn(&url, Keep::Add).await;
         let hub = match &refreshed {
             Ok((hub, _)) => Some(*hub),
             Err(Error::Unavailable { .. }) => self.hub(&url).ok().map(|(hub, _)| hub),
@@ -394,11 +415,22 @@ impl<T: Transport> Wallet<T> {
 
     /// The hubs added, by URL, and what each last said of itself.
     pub fn hubs(&self) -> Result<Vec<(String, Info)>, Error> {
+        self.hubs_trusted(true)
+    }
+
+    /// The hubs visited to pay a payee there ([`Wallet::visit`]), not
+    /// added: by URL, and what each last said of itself.
+    pub fn visited(&self) -> Result<Vec<(String, Info)>, Error> {
+        self.hubs_trusted(false)
+    }
+
+    fn hubs_trusted(&self, trusted: bool) -> Result<Vec<(String, Info)>, Error> {
         self.store.read(|c| {
             let mut stmt = c.prepare(
-                "SELECT r.url, h.info FROM hubs h JOIN reach r ON r.hub = h.id ORDER BY r.url",
+                "SELECT r.url, h.info FROM hubs h JOIN reach r ON r.hub = h.id
+                 WHERE h.trusted = ?1 ORDER BY r.url",
             )?;
-            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get::<_, String>(1)?)))?;
+            let rows = stmt.query_map([trusted], |r| Ok((r.get(0)?, r.get::<_, String>(1)?)))?;
             rows.map(|row| {
                 let (url, info) = row?;
                 Ok((url, serde_json::from_str(&info).map_err(invalid)?))
@@ -409,6 +441,17 @@ impl<T: Transport> Wallet<T> {
 
     /// What the wallet holds at each hub it added, by URL.
     pub fn balance(&self) -> Result<Vec<Balance>, Error> {
+        self.balance_trusted(true)
+    }
+
+    /// What the wallet holds at each hub it visited ([`Wallet::visit`]),
+    /// by URL: what a swap there brought past a payment, say, for the
+    /// owner to add the hub to count, or to pay out.
+    pub fn visited_balance(&self) -> Result<Vec<Balance>, Error> {
+        self.balance_trusted(false)
+    }
+
+    fn balance_trusted(&self, trusted: bool) -> Result<Vec<Balance>, Error> {
         self.store.read(|c| {
             let mut stmt = c.prepare(
                 "SELECT r.url,
@@ -422,9 +465,10 @@ impl<T: Transport> Wallet<T> {
                  LEFT JOIN notes n ON n.keyset = k.id
                  LEFT JOIN sends s ON s.id = n.spent_by
                  LEFT JOIN locks l ON l.id = n.spent_by
+                 WHERE h.trusted = ?1
                  GROUP BY h.id ORDER BY r.url",
             )?;
-            let rows = stmt.query_map([], |r| {
+            let rows = stmt.query_map([trusted], |r| {
                 Ok(Balance {
                     hub: r.get(0)?,
                     available: r.get::<_, i64>(1)? as u64,
@@ -445,7 +489,7 @@ impl<T: Transport> Wallet<T> {
                  JOIN reach r ON r.hub = h.id
                  JOIN keysets k ON k.hub = h.id
                  JOIN notes n ON n.keyset = k.id
-                 WHERE n.spent_by IS NULL AND n.gone_at IS NULL
+                 WHERE n.spent_by IS NULL AND n.gone_at IS NULL AND h.trusted = 1
                  GROUP BY h.id, n.denom ORDER BY r.url, n.denom DESC",
             )?;
             let rows = stmt.query_map([], |r| {
@@ -498,9 +542,26 @@ impl<T: Transport> Wallet<T> {
         Ok(more)
     }
 
-    /// What the hub at `url` says of itself, kept: its id and info. A hub
-    /// known at `url` is asked where the wallet reaches it.
+    /// Learn the hub at `url` to pay a payee there, without trusting it:
+    /// what it says of itself, kept as a hub visited with its keysets and
+    /// fees. Refused unless it proves it is the hub of `id`, the one the
+    /// payee's code names, and takes locks, for a swap to bring notes
+    /// there. Its notes count apart ([`Wallet::visited_balance`]) and no
+    /// payment is taken there until the owner adds it; a hub added stays
+    /// so.
+    pub async fn visit(&self, url: &str, id: HubId) -> Result<Info, Error> {
+        let url = hub_url(url)?;
+        Ok(self.learn(&url, Keep::Visit(id)).await?.1)
+    }
+
+    /// What the hub at `url` says of itself, kept: its id and info.
     async fn refresh(&self, url: &str) -> Result<(i64, Info), Error> {
+        self.learn(url, Keep::Refresh).await
+    }
+
+    /// What the hub at `url` says of itself, kept as `keep` says: its id
+    /// and info. A hub known at `url` is asked where the wallet reaches it.
+    async fn learn(&self, url: &str, keep: Keep) -> Result<(i64, Info), Error> {
         let reached: Option<String> = self.store.read(|c| {
             Ok(c.query_row(
                 "SELECT r.url FROM hub_urls u JOIN reach r ON r.hub = u.hub WHERE u.url = ?1",
@@ -511,7 +572,32 @@ impl<T: Transport> Wallet<T> {
         })?;
         let url = reached.as_deref().unwrap_or(url);
         let info = self.info(url).await?;
-        Ok((self.keep_info(url, &info)?, info))
+        if let Keep::Visit(id) = keep {
+            self.visitable(url, &info, id)?;
+        }
+        Ok((self.keep_info(url, &info, keep)?, info))
+    }
+
+    /// Refused unless the hub at `url`, saying `info` of itself, proves it
+    /// is the hub of `id` and takes locks.
+    fn visitable(&self, url: &str, info: &Info, id: HubId) -> Result<(), Error> {
+        let proved = info.proved(self.network);
+        if !proved.map_err(|p| Error::Invalid(format!("hub {url}: {}", p.message)))? {
+            return Err(Error::Invalid(format!(
+                "hub {url} proves no identity: only a hub added is paid at without"
+            )));
+        }
+        if HubId::of(&info.address) != id {
+            return Err(Error::Invalid(format!(
+                "hub {url} is not the hub the code names"
+            )));
+        }
+        if info.locks.is_none() {
+            return Err(Error::Invalid(format!(
+                "hub {url} follows no chain: no swap brings notes there"
+            )));
+        }
+        Ok(())
     }
 
     /// The hub `hub` asked over HTTPS, at most once since the wallet was
@@ -541,7 +627,8 @@ impl<T: Transport> Wallet<T> {
             tracing::warn!(%url, http = %reached, "another hub over HTTPS than over HTTP");
             return None;
         }
-        match self.keep_info(&url, &info) {
+        // Only adding a hub asks: the owner's.
+        match self.keep_info(&url, &info, Keep::Add) {
             Ok(kept) if kept == hub => Some(info),
             Ok(_) => None,
             Err(e) => {
@@ -583,10 +670,12 @@ impl<T: Transport> Wallet<T> {
     /// belongs to the hub that first advertised it: another URL advertising
     /// it is not that hub, unless it is the URL the hub is reached at, over
     /// HTTPS rather than plain HTTP. The hub is reached there from then on,
-    /// and still known at the other URL.
-    fn keep_info(&self, url: &str, info: &Info) -> Result<i64, Error> {
+    /// and still known at the other URL. A hub visited stays the one it
+    /// proved it is, unless added.
+    fn keep_info(&self, url: &str, info: &Info, keep: Keep) -> Result<i64, Error> {
         let keysets = info.keysets().map_err(|p| unavailable(url, p))?;
         let text = serde_json::to_string(info).map_err(invalid)?;
+        let proved = info.proved(self.network).unwrap_or(false);
         let hub = self.store.write(|tx| {
             let mut known: Option<i64> = tx
                 .query_row("SELECT hub FROM hub_urls WHERE url = ?1", [url], |r| {
@@ -607,9 +696,20 @@ impl<T: Transport> Wallet<T> {
                     others.push(other);
                 }
             }
+            // A hub visited, the same, at a URL the owner adds or another
+            // code names: reached there from now on, its identity proven.
+            let adopted = match (known, others.as_slice()) {
+                (None, [(hub, _)]) if keep != Keep::Refresh => {
+                    let (trusted, kept) = kept_hub(tx, *hub)?;
+                    !trusted && HubId::of(&kept.address) == HubId::of(&info.address)
+                }
+                _ => false,
+            };
             match (known, others.as_slice()) {
                 (_, []) => {}
-                (None, [(hub, other)]) if secure_url(other).as_deref() == Some(url) => {
+                (None, [(hub, other)])
+                    if adopted || secure_url(other).as_deref() == Some(url) =>
+                {
                     // The row's id keeps the URL first, the one reached.
                     tx.execute(
                         "UPDATE hub_urls SET url = ?1 WHERE url = ?2",
@@ -619,7 +719,10 @@ impl<T: Transport> Wallet<T> {
                         "INSERT INTO hub_urls (url, hub) VALUES (?1, ?2)",
                         params![other, hub],
                     )?;
-                    tracing::info!(%url, http = %other, "hub reached over HTTPS from now on");
+                    match adopted {
+                        true => tracing::info!(%url, %other, "hub visited reached here from now on"),
+                        false => tracing::info!(%url, http = %other, "hub reached over HTTPS from now on"),
+                    }
                     known = Some(*hub);
                 }
                 (_, [(_, other), ..]) => {
@@ -630,16 +733,26 @@ impl<T: Transport> Wallet<T> {
             }
             let hub = match known {
                 Some(hub) => {
+                    let (trusted, kept) = kept_hub(tx, hub)?;
+                    // Unavailable, not invalid: what is under way there
+                    // waits for it to prove it again.
+                    if !trusted
+                        && keep != Keep::Add
+                        && (!proved || HubId::of(&kept.address) != HubId::of(&info.address))
+                    {
+                        return Err(unavailable(url, "no longer proves it is the hub visited"));
+                    }
                     tx.execute(
-                        "UPDATE hubs SET info = ?2, updated_at = ?3 WHERE id = ?1",
-                        params![hub, text, now()],
+                        "UPDATE hubs SET info = ?2, updated_at = ?3, trusted = ?4 WHERE id = ?1",
+                        params![hub, text, now(), trusted || keep == Keep::Add],
                     )?;
                     hub
                 }
                 None => {
+                    let trusted = !matches!(keep, Keep::Visit(_));
                     tx.execute(
-                        "INSERT INTO hubs (info, updated_at) VALUES (?1, ?2)",
-                        params![text, now()],
+                        "INSERT INTO hubs (info, updated_at, trusted) VALUES (?1, ?2, ?3)",
+                        params![text, now(), trusted],
                     )?;
                     let hub = tx.last_insert_rowid();
                     tx.execute(
@@ -660,6 +773,25 @@ impl<T: Transport> Wallet<T> {
         })?;
         tracing::info!(%url, keysets = keysets.len(), "hub info");
         Ok(hub)
+    }
+
+    /// Refused if the hub at `url` is one only visited: what only the
+    /// owner's hubs are asked for, whose terms its proof does not cover.
+    fn not_visited(&self, url: &str) -> Result<(), Error> {
+        let trusted: Option<bool> = self.store.read(|c| {
+            Ok(c.query_row(
+                "SELECT h.trusted FROM hub_urls u JOIN hubs h ON h.id = u.hub WHERE u.url = ?1",
+                [url],
+                |r| r.get(0),
+            )
+            .optional()?)
+        })?;
+        match trusted {
+            Some(false) => Err(Error::Invalid(format!(
+                "hub {url} is only visited, to pay at: add it first"
+            ))),
+            _ => Ok(()),
+        }
     }
 
     /// The hub at `url`: its id and what it last said of itself.
@@ -1291,7 +1423,7 @@ impl<T: Transport> Wallet<T> {
 impl<T: Transport> Wallet<T> {
     /// Take `payment`: keep the notes it pays this wallet, its unlock
     /// checked to open them. It must be under a keyset of a hub added
-    /// here, as the wallet takes no hub's notes unasked.
+    /// here, not only visited, as the wallet takes no hub's notes unasked.
     pub fn receive(&self, payment: &Payment) -> Result<Received, Error> {
         let id: [u8; 32] = payment
             .release
@@ -1302,7 +1434,9 @@ impl<T: Transport> Wallet<T> {
             .map_err(invalid)?;
         let known: Option<(Vec<u8>, String)> = self.store.read(|c| {
             Ok(c.query_row(
-                "SELECT k.bytes, r.url FROM keysets k JOIN reach r ON r.hub = k.hub
+                "SELECT k.bytes, r.url FROM keysets k
+                 JOIN hubs h ON h.id = k.hub AND h.trusted = 1
+                 JOIN reach r ON r.hub = k.hub
                  WHERE k.id = ?1",
                 [id],
                 |r| Ok((r.get(0)?, r.get(1)?)),

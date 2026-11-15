@@ -1051,6 +1051,7 @@ impl<T: Transport> Wallet<T> {
         rate: FeeRate,
     ) -> Result<(Deposit, Transaction), Error> {
         let url = hub_url(url)?;
+        self.not_visited(&url)?;
         let (hub, info) = self.refresh(&url).await?;
         let offer = info
             .deposits
