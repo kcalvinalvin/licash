@@ -130,7 +130,9 @@ fn footer(f: &mut Frame, area: Rect, status: &Status) {
     }
 }
 
-fn block(title: &str, focused: bool) -> Block<'static> {
+/// A panel's frame `width` wide, its title shortened to fit.
+fn block(title: &str, focused: bool, width: u16) -> Block<'static> {
+    let title = format::fit(title, width.saturating_sub(4) as usize);
     Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(if focused { FOCUS } else { BORDER }))
@@ -161,7 +163,7 @@ fn draw_panel(
             }
         }
         PanelView::Chart(c) => {
-            let b = block(&c.title, false);
+            let b = block(&c.title, false, area.width);
             let inner = b.inner(area);
             f.render_widget(b, area);
             chart::draw(c, inner, f.buffer_mut());
@@ -183,7 +185,7 @@ fn draw_panel(
 /// The checks, what needs attention first: each a glyph, a name and what
 /// it found, wrapped under itself rather than cut.
 fn health(f: &mut Frame, area: Rect, checks: &[Check]) {
-    let block = block("Health", false);
+    let block = block("Health", false, area.width);
     let width = block.inner(area).width as usize;
     let name = checks
         .iter()
@@ -239,7 +241,13 @@ fn draw_card(f: &mut Frame, area: Rect, card: &CardView, view: &View) {
     let b = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(BORDER))
-        .title(Span::styled(format!(" {} ", card.title), DIM))
+        .title(Span::styled(
+            format!(
+                " {} ",
+                format::fit(&card.title, area.width.saturating_sub(4) as usize)
+            ),
+            DIM,
+        ))
         .padding(Padding::horizontal(1));
     let inner = b.inner(area);
     f.render_widget(b, area);
@@ -277,11 +285,29 @@ fn draw_card(f: &mut Frame, area: Rect, card: &CardView, view: &View) {
                 style::trend(v - p, card.better),
             ),
         },
-        _ => Line::styled(card.detail.clone(), DIM),
+        // A detail goes on in the trend's line when there is none.
+        _ if card.trend.is_empty() => {
+            let mut lines = format::wrap(&card.detail, width);
+            if lines.len() > 2 {
+                lines[1] = format::fit(&lines[1..].join(" "), width);
+                lines.truncate(2);
+            }
+            let lines: Vec<Line> = lines.into_iter().map(|l| Line::styled(l, DIM)).collect();
+            let below = Rect {
+                height: inner.height.saturating_sub(1).min(2),
+                y: inner.y + 1,
+                ..inner
+            };
+            f.render_widget(Paragraph::new(lines), below);
+            Line::default()
+        }
+        _ => Line::styled(format::fit(&card.detail, width), DIM),
     };
     let [first, middle, last] = Layout::vertical([Constraint::Length(1); 3]).areas(inner);
     f.render_widget(Paragraph::new(Span::styled(value, value_style)), first);
-    f.render_widget(Paragraph::new(second), middle);
+    if !second.spans.is_empty() {
+        f.render_widget(Paragraph::new(second), middle);
+    }
     if !card.trend.is_empty() {
         let lo = card.trend.iter().copied().min().unwrap_or(0).min(0);
         let data: Vec<u64> = card.trend.iter().map(|v| (v - lo) as u64).collect();
@@ -394,7 +420,7 @@ fn breakdown(f: &mut Frame, area: Rect, b: &BreakdownView, focused: bool, offset
     });
     let widths = std::iter::once(Constraint::Length(labels))
         .chain(b.columns.iter().map(|_| Constraint::Fill(1)));
-    let mut block = block(&title, focused);
+    let mut block = block(&title, focused, area.width);
     if b.rows.is_empty() {
         let inner = block.inner(area);
         f.render_widget(block, area);
@@ -424,7 +450,7 @@ fn breakdown(f: &mut Frame, area: Rect, b: &BreakdownView, focused: bool, offset
 
 fn table(f: &mut Frame, area: Rect, t: &TableView, view: &View, focused: bool, offset: usize) {
     let title = format!("{} · {}", t.title, t.rows.len());
-    let mut block = block(&title, focused);
+    let mut block = block(&title, focused, area.width);
     if t.hidden > 0 {
         block = block.title_bottom(Line::styled(
             format!(" {} more before {} ", t.hidden, view.range),
@@ -563,7 +589,10 @@ fn help(f: &mut Frame, area: Rect) {
         Line::styled("Times are UTC.", DIM),
     ];
     f.render_widget(Clear, popup);
-    f.render_widget(Paragraph::new(lines).block(block("Keys", true)), popup);
+    f.render_widget(
+        Paragraph::new(lines).block(block("Keys", true, popup.width)),
+        popup,
+    );
 }
 
 #[cfg(test)]

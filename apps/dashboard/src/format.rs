@@ -231,9 +231,47 @@ pub fn wrap(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
+/// `text` in at most `width` characters: whole if it fits, else the words
+/// that fit and `…`; a word is cut only if the first is too long alone.
+pub fn fit(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        return text.to_owned();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let mut out = String::new();
+    for word in text.split_whitespace() {
+        let used = out.chars().count();
+        let gap = usize::from(used > 0);
+        if used + gap + word.chars().count() + 1 > width {
+            break;
+        }
+        if gap > 0 {
+            out.push(' ');
+        }
+        out.push_str(word);
+    }
+    let mut out = out.trim_end_matches([' ', '·', ',', ':', ';']).to_owned();
+    if out.is_empty() {
+        out = text.chars().take(width - 1).collect();
+    }
+    out.push('…');
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_says_less_between_words() {
+        assert_eq!(fit("Notes outstanding", 20), "Notes outstanding");
+        assert_eq!(fit("Notes outstanding", 11), "Notes…");
+        assert_eq!(fit("Recent events · 29", 16), "Recent events…");
+        assert_eq!(fit("Collateral", 6), "Colla…");
+        assert_eq!(fit("anything", 0), "");
+    }
 
     #[test]
     fn text_wraps_between_words() {

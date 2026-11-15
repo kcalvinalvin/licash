@@ -372,6 +372,32 @@ fn what_needs_attention_comes_first_and_nothing_long_is_cut() {
 }
 
 #[test]
+fn a_narrow_card_shortens_its_title_and_wraps_its_detail() {
+    let card = Card::new(
+        "Notes outstanding",
+        Value::now(
+            Some(2_217_151),
+            Unit::Sat,
+            "45x the 49,500 sat",
+            Tone::Normal,
+        ),
+        Better::Neither,
+    );
+    let report = Report {
+        title: "licash hub".into(),
+        subtitle: String::new(),
+        now: NOW,
+        since: NOW - DAY,
+        series: vec![],
+        pages: vec![Page::new("Overview", vec![vec![Panel::Cards(vec![card])]])],
+    };
+    let out = screen_of(&report, &Ui::new(Range::Day), 15, 12);
+    assert!(out.contains(" Notes… "), "{out}");
+    assert!(out.contains("45x the"), "{out}");
+    assert!(out.contains("49,500 sat"), "{out}");
+}
+
+#[test]
 fn a_card_drops_what_it_compares_with_rather_than_cut_it() {
     for width in [80, 100, 160] {
         let out = screen(&Ui::new(Range::Month), width, 44);

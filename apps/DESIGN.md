@@ -113,7 +113,8 @@ The wallet CLI (`licash-wallet`), the hub and swap services
   `✗` failing, `–` idle. What needs attention is listed first.
 - **Nothing cut.** Text too long for its place wraps under itself, or
   says less as a whole (a comparison dropped, a legend without its
-  totals, `+2 more`): never a word cut in half.
+  totals, `+2 more`, a title ending at a word in `…`): never a word cut
+  in half.
 - **Dashboards**: the overview page first (the few numbers that matter,
   then health beside one chart, then what happened), detail on the
   following pages, each chart on one page only; one accent color, one
