@@ -101,9 +101,12 @@ services:
 
   hub1:
     <<: *hub
+    # It opens recovery contracts too, F funded by the miner's wallet,
+    # which the harness makes once the stack is up.
     command:
       - >-
         [ -f /data/seed ] || licash-hub init; exec licash-hub run --lnd https://hub1-ln:8080
+        --chain http://licash:licash@bitcoind:18443/wallet/miner --contracts
         --announce-url http://127.0.0.1:${LICASH_E2E_HUB1:-38338} --announce-name hub1
         --name hub1 --notify gotify://gotify/$$(cat /notify/token)
         --deposit-sweep-address bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080
