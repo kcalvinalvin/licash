@@ -747,3 +747,25 @@ fn a_hub_proves_its_identity_and_nothing_else() {
     changed.fees.spend = Fee { base: 5, ppm: 0 };
     assert_eq!(changed.proved(signet), Ok(true));
 }
+
+#[test]
+fn a_hubs_urls_are_left_out_when_none_and_are_not_its_identity() {
+    let owner = OwnerKeys::from_seed(&[1; 32]).unwrap();
+    let signet = ChainProfile::Core30Signet;
+    let info = proved_info(&owner, &owner);
+    assert!(info.urls.is_empty());
+    // None: not sent, and an older hub's info, without them, reads.
+    let sent = serde_json::to_value(&info).unwrap();
+    assert!(sent.get("urls").is_none(), "{sent}");
+    assert!(json(&info).urls.is_empty());
+
+    let mut named = info.clone();
+    named.urls = vec![
+        "https://hub.example".into(),
+        format!("http://{}.onion", "a".repeat(56)),
+    ];
+    assert_eq!(json(&named).urls, named.urls);
+    // Changing them leaves its proof standing: they prove nothing.
+    assert_eq!(named.identity(signet), info.identity(signet));
+    assert_eq!(named.proved(signet), Ok(true));
+}

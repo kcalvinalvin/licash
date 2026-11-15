@@ -212,6 +212,12 @@ pub struct Info {
     /// None unless the hub opens recovery contracts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contracts: Option<Contracts>,
+    /// The URLs the hub says it is reached at, such as its onion
+    /// service's beside its clearnet one. Not part of its
+    /// [`Info::identity`]: a wallet takes them only from a hub it trusts,
+    /// as other ways to it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub urls: Vec<String>,
     /// That the hub of [`Info::address`] says the rest of its
     /// [`Info::identity`] is its own: a BIP340 signature by its spend key.
     /// None from hubs following no chain, and from older hubs.
@@ -232,6 +238,7 @@ impl Info {
             tweaks: None,
             relays: Vec::new(),
             contracts: None,
+            urls: Vec::new(),
             proof: None,
         }
     }
