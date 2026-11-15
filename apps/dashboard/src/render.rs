@@ -449,12 +449,8 @@ fn table(f: &mut Frame, area: Rect, t: &TableView, view: &View, focused: bool, o
             }
         })
         .collect();
-    let right = |i: usize| {
-        t.rows
-            .first()
-            .and_then(|r| r.cells.get(i))
-            .is_some_and(numeric)
-    };
+    // A column of numbers, though some rows have none, as a log's.
+    let right = |i: usize| t.rows.iter().any(|r| r.cells.get(i).is_some_and(numeric));
     let header = Row::new(
         t.columns
             .iter()

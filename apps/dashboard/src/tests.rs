@@ -239,7 +239,11 @@ fn the_view_prints_as_json() {
 }
 
 fn screen(ui: &Ui, width: u16, height: u16) -> String {
-    let view = View::new(&report(), ui.range);
+    screen_of(&report(), ui, width, height)
+}
+
+fn screen_of(report: &Report, ui: &Ui, width: u16, height: u16) -> String {
+    let view = View::new(report, ui.range);
     let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
     let status = Status {
         read: std::time::Duration::from_secs(3),
@@ -288,6 +292,38 @@ fn the_overview_draws_its_cards_charts_and_lists() {
         assert!(out.contains(text), "{text:?} missing from\n{out}");
     }
     assert!(out.contains('█'), "bars\n{out}");
+}
+
+#[test]
+fn a_column_of_numbers_aligns_right_though_its_newest_row_has_none() {
+    let row = |at: i64, amount: Cell, what: &str| Row {
+        at: Some(at),
+        tone: Tone::Normal,
+        cells: vec![Cell::Time(at), amount, Cell::Text(what.into())],
+    };
+    let log = Table::in_range(
+        "Recent events",
+        &["when", "amount", "event"],
+        vec![
+            row(NOW - 60, Cell::Empty, "alert"),
+            row(NOW - 120, Cell::Sat(20_000), "paid"),
+        ],
+        "nothing happened",
+    );
+    let report = Report {
+        title: "licash hub".into(),
+        subtitle: String::new(),
+        now: NOW,
+        since: NOW - DAY,
+        series: vec![],
+        pages: vec![Page::new("Overview", vec![vec![Panel::Table(log)]])],
+    };
+    let out = screen_of(&report, &Ui::new(Range::Day), 60, 10);
+    let end = |text: &str| {
+        let line = out.lines().find(|l| l.contains(text)).unwrap();
+        line.chars().count() - line.split(text).nth(1).unwrap().chars().count()
+    };
+    assert_eq!(end("amount"), end("20,000 sat"), "\n{out}");
 }
 
 #[test]
