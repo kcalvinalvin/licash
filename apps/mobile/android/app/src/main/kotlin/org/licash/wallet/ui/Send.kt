@@ -14,7 +14,6 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -228,14 +227,8 @@ fun Send(
             when (val s = step) {
                 Step.Looking -> {
                     if (cashOut != null) {
-                        Text(
-                            "All you hold at ${host(cashOut)}, paid out on Bitcoin: to this wallet, " +
-                                "kept there as your own, or to an address you scan or paste.",
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                        Spacer(Modifier.height(16.dp))
-                        BigButton("To this wallet", Modifier.fillMaxWidth()) {
+                        Spacer(Modifier.height(8.dp))
+                        BigButton("To this wallet", Modifier.fillMaxWidth().testTag("to-own")) {
                             scope.launch {
                                 engine.bitcoinAddress().fold(
                                     { own = it; quote(it, null) },
@@ -244,47 +237,38 @@ fun Send(
                             }
                         }
                         Text(
-                            "Or to another address",
+                            "Or scan an address",
                             modifier = Modifier.fillMaxWidth().padding(top = 20.dp, bottom = 8.dp),
-                            style = MaterialTheme.typography.titleSmall,
+                            style = MaterialTheme.typography.labelLarge,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            textAlign = TextAlign.Center,
                         )
                     }
                     Scanner(Modifier.fillMaxWidth().aspectRatio(1f).clip(RoundedCornerShape(24.dp))) { read(it) }
                     Spacer(Modifier.height(16.dp))
-                    OutlinedButton(
-                        onClick = {
-                            scope.launch {
-                                val clip = clipboard.getClipEntry()?.clipData
-                                val text = clip?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.text?.toString()?.trim()
-                                empty = text.isNullOrEmpty()
-                                if (!text.isNullOrEmpty()) read(text)
-                            }
-                        },
-                        modifier = Modifier.fillMaxWidth().height(56.dp),
-                    ) { Text("Paste") }
-                    if (cashOut == null && !empty) {
+                    BigButton("Paste", Modifier.fillMaxWidth().testTag("paste"), quiet = true) {
+                        scope.launch {
+                            val clip = clipboard.getClipEntry()?.clipData
+                            val text = clip?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.text?.toString()?.trim()
+                            empty = text.isNullOrEmpty()
+                            if (!text.isNullOrEmpty()) read(text)
+                        }
+                    }
+                    if (empty) {
                         Spacer(Modifier.height(8.dp))
                         Text(
-                            "Scan or paste a payment code, a Bitcoin address or a Lightning invoice.",
+                            "Nothing copied yet",
                             modifier = Modifier.fillMaxWidth(),
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             textAlign = TextAlign.Center,
                         )
                     }
-                    if (empty) {
-                        Spacer(Modifier.height(8.dp))
-                        Text(
-                            "Nothing to paste: copy a code, an address or an invoice first.",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
                 }
                 is Step.Paying -> Paying(ui, s) { amount -> plan(s, amount) }
                 Step.Busy -> Middle("One moment…")
-                Step.Planning -> Middle("Finding the way to pay…")
-                is Step.Review -> Review(s.quote, s.through, { pay(s.code, s.amount) }) {
+                Step.Planning -> Middle("One moment…")
+                is Step.Review -> Review(s.quote, s.through.takeIf { ui.developer }, { pay(s.code, s.amount) }) {
                     // A swap first: any provider that could, to choose.
                     if (ui.developer && s.quote.swapFrom != null) {
                         Providers {
@@ -313,8 +297,7 @@ fun Send(
                     }
                 }
                 is Step.Visit -> Ask(
-                    "This code names no hub you use. It says where to reach the payee's, " +
-                        "which proves it is the one named.\n\nPay there, moving notes from a hub you use?",
+                    "Their hub is not one of yours. Pay there anyway?",
                     "Pay there",
                     {
                         val paying = Step.Paying(s.code, s.asked, s.address, visit = true)
@@ -323,7 +306,7 @@ fun Send(
                     back,
                 )
                 is Step.Unpayable -> Ask(
-                    "${s.why}\n\nTheir code names a Bitcoin address too: pay there instead?",
+                    "${s.why}\n\nPay on Bitcoin instead?",
                     "Pay on Bitcoin",
                     {
                         when (val amount = s.amount) {
@@ -333,10 +316,10 @@ fun Send(
                     },
                     back,
                 )
-                Step.Quoting -> Middle("Finding a provider to pay it on Bitcoin…")
-                is Step.Invoice -> Invoice(s.quote) { payInvoice(s.text, s.quote.hub) }
+                Step.Quoting -> Middle("Getting a price…")
+                is Step.Invoice -> Invoice(s.quote, ui.hubs.size > 1) { payInvoice(s.text, s.quote.hub) }
                 is Step.Address -> ToAddress(s.address) { amount -> quote(s.address, amount) }
-                is Step.Payout -> Payout(s.quote, s.quote.address == own, { payOut(s.quote, s.asked) }) {
+                is Step.Payout -> Payout(s.quote, s.quote.address == own, ui.hubs.size > 1, { payOut(s.quote, s.asked) }) {
                     if (ui.developer) {
                         Providers {
                             engine.payoutOffers(s.quote.address, s.asked, s.quote.hub).map { offers ->
@@ -351,18 +334,14 @@ fun Send(
                         }
                     }
                 }
-                is Step.PayingOut -> Told(
-                    "Sending ${sat(s.amount)} on Bitcoin. It reaches the address in about " +
-                        "${(s.depth.toInt() + 1) * 10} minutes; your history shows how far it got.",
-                    back,
-                )
-                is Step.Paid -> Done("Paid ${sat(s.amount)}, ${sat(s.fee)} in fees", back)
+                is Step.PayingOut -> Told("Sending ${sat(s.amount)}", "Arrives in ${arrives(s.depth)}", back)
+                is Step.Paid -> Done("Paid ${sat(s.amount)}", back, if (s.fee > 0uL) "Fee ${sat(s.fee)}" else null)
                 is Step.Sent -> Sent(s, back)
                 // Not to pay again: it finishes by itself.
-                Step.Later -> Told("Under way: it finishes by itself, and reaches them then.", back)
+                Step.Later -> Told("Under way", "It finishes by itself", back)
                 is Step.Received -> Done("Received ${sat(s.amount)}", back)
                 is Step.Trust -> Ask(
-                    "This payment is at a hub you don't use yet:\n${s.hub}\n\nTake it, and use that hub from now on?",
+                    "From a hub you don't use yet:\n${s.hub}\n\nTake it, and use that hub?",
                     "Take it",
                     { take(s.payment, true) },
                     back,
@@ -373,9 +352,58 @@ fun Send(
     }
 }
 
+/** One fact of a payment to confirm: `tag` names its value, for the tests. */
+private class Fact(val label: String, val value: String, val tag: String)
+
+/** What a payment costs and when it arrives, to confirm it by: with what it comes to, if it costs. */
+private fun costs(amount: ULong, fee: ULong, arrives: String): List<Fact> = listOfNotNull(
+    Fact("Fee", if (fee == 0uL) "None" else sat(fee), "fee"),
+    if (fee > 0uL) Fact("Total", sat(amount + fee), "total") else null,
+    Fact("Arrives", arrives, "arrives"),
+)
+
+/** How long a payment on Bitcoin takes to count, `depth` blocks deep. */
+internal fun arrives(depth: UInt): String = "about ${(depth.toInt() + 1) * 10} min"
+
+/**
+ * A payment to confirm: how much, then what there is to know before
+ * agreeing, a fact a line, and one button. `head` goes under the amount,
+ * `more` under the button.
+ */
+@Composable
+private fun Confirm(
+    amount: ULong,
+    facts: List<Fact>,
+    action: String,
+    act: () -> Unit,
+    head: @Composable () -> Unit = {},
+    more: @Composable () -> Unit = {},
+) {
+    Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
+        Spacer(Modifier.height(32.dp))
+        Text(sat(amount), modifier = Modifier.testTag("paying"), style = Heading)
+        head()
+        Facts(facts)
+        Spacer(Modifier.height(24.dp))
+        BigButton(action, Modifier.fillMaxWidth().testTag("confirm"), onClick = act)
+        more()
+    }
+}
+
+@Composable
+private fun Facts(facts: List<Fact>) {
+    Group("") {
+        facts.forEachIndexed { i, fact ->
+            if (i > 0) Divider()
+            Line(fact.label, fact.value, tag = fact.tag)
+        }
+    }
+}
+
 /**
  * A code to pay in notes: the amount it asks, or one typed straight in.
- * The keyboard's action only hides it: the button pays.
+ * The keyboard's action only hides it: the button pays. At a hub not
+ * added, what it costs is told next, once known.
  */
 @Composable
 private fun Paying(ui: Ui, s: Step.Paying, pay: (ULong?) -> Unit) {
@@ -384,19 +412,22 @@ private fun Paying(ui: Ui, s: Step.Paying, pay: (ULong?) -> Unit) {
     val fee = amount?.takeIf { !s.visit }
         ?.let { a -> ui.hubs.maxOfOrNull { it.feeBase + it.feePpm * a.toULong() / 1_000_000uL } }
     Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
-        Spacer(Modifier.height(48.dp))
+        Spacer(Modifier.height(32.dp))
         if (s.asked == null) {
             AmountField(amount, { amount = it })
         } else {
-            Text(sat(s.asked), style = Figures)
+            Text(sat(s.asked), modifier = Modifier.testTag("paying"), style = Heading)
         }
-        Text(
-            fee?.let { if (it == 0uL) "No fee" else "Fee up to ${sat(it)}" } ?: "",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-        Spacer(Modifier.height(32.dp))
-        BigButton("Pay", Modifier.fillMaxWidth(), enabled = amount != null) {
+        if (!s.visit) {
+            Facts(
+                listOf(
+                    Fact("Fee", fee?.let { if (it == 0uL) "None" else "Up to ${sat(it)}" } ?: "", "fee"),
+                    Fact("Arrives", "Instantly", "arrives"),
+                ),
+            )
+        }
+        Spacer(Modifier.height(24.dp))
+        BigButton(if (s.visit) "Continue" else "Pay", Modifier.fillMaxWidth().testTag("confirm"), enabled = amount != null) {
             pay(if (s.asked == null) amount?.toULong() else null)
         }
     }
@@ -408,39 +439,28 @@ private fun Paying(ui: Ui, s: Step.Paying, pay: (ULong?) -> Unit) {
  */
 @Composable
 private fun Review(quote: PayQuote, through: String?, pay: () -> Unit, more: @Composable () -> Unit) {
-    val note = MaterialTheme.colorScheme.onSurfaceVariant
-    Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
-        Spacer(Modifier.height(48.dp))
-        Text(sat(quote.amount), style = Figures)
-        Text(
-            if (quote.fee == 0uL) "No fee" else "Fees ${sat(quote.fee)}, ${sat(quote.amount + quote.fee)} in all",
-            style = MaterialTheme.typography.bodySmall,
-            color = note,
-        )
-        Spacer(Modifier.height(16.dp))
-        quote.swapFrom?.let { from ->
-            Text(
-                "Moves ${sat(quote.swapped)} from ${host(from)} to ${host(quote.hub)} first, " +
-                    "through ${through ?: "a swap provider"}.",
-                style = MaterialTheme.typography.bodyMedium,
-                textAlign = TextAlign.Center,
-            )
-            Spacer(Modifier.height(8.dp))
-        }
-        if (!quote.trusted) {
-            Text(
-                "Paid at ${host(quote.hub)}, the payee's hub, which you have not added. " +
-                    "What is left there shows apart in your balance.",
-                modifier = Modifier.testTag("not-added"),
-                style = MaterialTheme.typography.bodyMedium,
-                color = note,
-                textAlign = TextAlign.Center,
-            )
-        }
-        Spacer(Modifier.height(32.dp))
-        BigButton("Pay", Modifier.fillMaxWidth(), onClick = pay)
-        more()
-    }
+    val swap = quote.swapFrom
+    Confirm(
+        quote.amount,
+        costs(quote.amount, quote.fee, if (swap == null) "Instantly" else "Shortly") + listOfNotNull(
+            swap?.let { Fact("Moved first", "${sat(quote.swapped)} from ${name(it)}", "moves") },
+            through?.let { Fact("Through", it, "through") },
+        ),
+        "Pay",
+        pay,
+        head = {
+            if (!quote.trusted) {
+                Text(
+                    "At ${name(quote.hub)}, a hub you have not added",
+                    modifier = Modifier.padding(top = 8.dp).testTag("not-added"),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    textAlign = TextAlign.Center,
+                )
+            }
+        },
+        more = more,
+    )
 }
 
 /** A provider's offer, in a list to choose from: `choose` takes it. */
@@ -500,30 +520,29 @@ private fun Providers(load: suspend () -> Result<List<Offer>>) {
     }
 }
 
-/** A Lightning invoice to pay: what it asks, and all it costs on top. */
+/** A Lightning invoice to pay: what it asks, and all it costs on top; from which hub, with `several`. */
 @Composable
-private fun Invoice(quote: InvoiceQuote, pay: () -> Unit) {
-    Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
-        Spacer(Modifier.height(48.dp))
-        Text(sat(quote.amount), style = Figures)
-        Text(
-            if (quote.fee == 0uL) "No fee" else "Fee ${sat(quote.fee)}, ${sat(quote.amount + quote.fee)} in all",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-        quote.description?.let {
-            Spacer(Modifier.height(12.dp))
-            Text(it, style = MaterialTheme.typography.bodyLarge, textAlign = TextAlign.Center)
-        }
-        Spacer(Modifier.height(8.dp))
-        Text(
-            "Over Lightning, through ${host(quote.hub)}",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-        Spacer(Modifier.height(32.dp))
-        BigButton("Pay", Modifier.fillMaxWidth(), onClick = pay)
-    }
+private fun Invoice(quote: InvoiceQuote, several: Boolean, pay: () -> Unit) {
+    Confirm(
+        quote.amount,
+        costs(quote.amount, quote.fee, "In seconds") + listOfNotNull(
+            if (several) Fact("From", name(quote.hub), "from") else null,
+        ),
+        "Pay",
+        pay,
+        head = {
+            quote.description?.let {
+                Text(
+                    it,
+                    modifier = Modifier.padding(top = 8.dp),
+                    style = MaterialTheme.typography.bodyLarge,
+                    textAlign = TextAlign.Center,
+                    maxLines = 3,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        },
+    )
 }
 
 /**
@@ -534,10 +553,11 @@ private fun Invoice(quote: InvoiceQuote, pay: () -> Unit) {
 private fun ToAddress(address: String, quote: (ULong?) -> Unit) {
     var amount by remember { mutableStateOf<Long?>(null) }
     Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
-        Spacer(Modifier.height(48.dp))
+        Spacer(Modifier.height(32.dp))
         AmountField(amount, { amount = it }, action = ImeAction.Go) { amount?.let { quote(it.toULong()) } }
         Text(
-            "To ${shortAddress(address)}, on Bitcoin",
+            "To ${shortAddress(address)}",
+            modifier = Modifier.testTag("to"),
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
@@ -546,41 +566,25 @@ private fun ToAddress(address: String, quote: (ULong?) -> Unit) {
             amount?.let { quote(it.toULong()) }
         }
         Spacer(Modifier.height(12.dp))
-        OutlinedButton(onClick = { quote(null) }, modifier = Modifier.fillMaxWidth().height(56.dp)) {
-            Text("Send all")
-        }
+        BigButton("Send all", Modifier.fillMaxWidth(), quiet = true) { quote(null) }
     }
 }
 
-/** A payout on Bitcoin to confirm: what the address gets, and all it costs on top. */
+/**
+ * A payout on Bitcoin to confirm: what the address gets, all it costs on
+ * top and when it arrives; from which hub, with `several`.
+ */
 @Composable
-private fun Payout(quote: PayoutQuote, own: Boolean, pay: () -> Unit, more: @Composable () -> Unit) {
-    Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
-        Spacer(Modifier.height(48.dp))
-        Text(sat(quote.amount), style = Figures)
-        Text(
-            "Fees ${sat(quote.fee)}, ${sat(quote.amount + quote.fee)} in all",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-        Spacer(Modifier.height(12.dp))
-        Text(
-            if (own) "To this wallet, on Bitcoin" else "To ${shortAddress(quote.address)}, on Bitcoin",
-            style = MaterialTheme.typography.bodyLarge,
-            textAlign = TextAlign.Center,
-        )
-        Spacer(Modifier.height(8.dp))
-        Text(
-            "From Licash at ${host(quote.hub)}, through ${quote.providerName ?: host(quote.provider)}. " +
-                "Arrives in about ${(quote.depth.toInt() + 1) * 10} minutes.",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            textAlign = TextAlign.Center,
-        )
-        Spacer(Modifier.height(32.dp))
-        BigButton("Send", Modifier.fillMaxWidth(), onClick = pay)
-        more()
-    }
+private fun Payout(quote: PayoutQuote, own: Boolean, several: Boolean, pay: () -> Unit, more: @Composable () -> Unit) {
+    Confirm(
+        quote.amount,
+        listOf(Fact("To", if (own) "This wallet" else shortAddress(quote.address), "to")) +
+            costs(quote.amount, quote.fee, arrives(quote.depth).replaceFirstChar { it.uppercase() }) +
+            listOfNotNull(if (several) Fact("From", name(quote.hub), "from") else null),
+        "Send",
+        pay,
+        more = more,
+    )
 }
 
 /** A long address, its ends shown. */
@@ -599,19 +603,20 @@ private fun Sent(s: Step.Sent, back: () -> Unit) {
         Spacer(Modifier.height(32.dp))
         Text("Sent ${sat(s.amount)}", style = MaterialTheme.typography.headlineSmall)
         Text(
-            "Their mailbox could not be reached: hand them the payment.",
+            "Hand them this to finish",
             style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
             textAlign = TextAlign.Center,
         )
         Spacer(Modifier.height(16.dp))
         if (s.handover.length <= 1500) QrCode(s.handover)
         Spacer(Modifier.height(16.dp))
-        BigButton("Share payment", Modifier.fillMaxWidth()) {
+        BigButton("Share", Modifier.fillMaxWidth()) {
             val send = Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, s.handover)
             context.startActivity(Intent.createChooser(send, null))
         }
         Spacer(Modifier.height(12.dp))
-        OutlinedButton(onClick = back, modifier = Modifier.fillMaxWidth().height(56.dp)) { Text("Done") }
+        BigButton("Done", Modifier.fillMaxWidth().testTag("done"), quiet = true, onClick = back)
     }
 }
 
@@ -625,24 +630,32 @@ private fun Middle(text: String) {
     }
 }
 
+/** It went through: said in a few words, `sub` under them if any. */
 @Composable
-private fun Done(text: String, back: () -> Unit) {
+private fun Done(text: String, back: () -> Unit, sub: String? = null) {
     Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
         Spacer(Modifier.height(120.dp))
         Text("✓", style = Figures, color = MaterialTheme.colorScheme.primary)
-        Text(text, style = MaterialTheme.typography.headlineSmall)
+        Text(text, modifier = Modifier.testTag("result"), style = MaterialTheme.typography.headlineSmall)
+        sub?.let {
+            Text(it, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
         Spacer(Modifier.height(48.dp))
-        BigButton("Done", Modifier.fillMaxWidth(), onClick = back)
+        BigButton("Done", Modifier.fillMaxWidth().testTag("done"), onClick = back)
     }
 }
 
+/** It is under way: what, and what to expect of it. */
 @Composable
-private fun Told(text: String, back: () -> Unit) {
+private fun Told(text: String, sub: String, back: () -> Unit) {
     Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
-        Spacer(Modifier.height(80.dp))
-        Text(text, style = MaterialTheme.typography.bodyLarge, textAlign = TextAlign.Center)
-        Spacer(Modifier.height(40.dp))
-        BigButton("Done", Modifier.fillMaxWidth(), onClick = back)
+        Spacer(Modifier.height(120.dp))
+        CircularProgressIndicator()
+        Spacer(Modifier.height(24.dp))
+        Text(text, modifier = Modifier.testTag("result"), style = MaterialTheme.typography.headlineSmall)
+        Text(sub, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Spacer(Modifier.height(48.dp))
+        BigButton("Done", Modifier.fillMaxWidth().testTag("done"), onClick = back)
     }
 }
 
@@ -650,10 +663,10 @@ private fun Told(text: String, back: () -> Unit) {
 private fun Ask(text: String, action: String, act: () -> Unit, back: () -> Unit) {
     Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
         Spacer(Modifier.height(80.dp))
-        Text(text, style = MaterialTheme.typography.bodyLarge, textAlign = TextAlign.Center)
+        Text(text, modifier = Modifier.testTag("ask"), style = MaterialTheme.typography.bodyLarge, textAlign = TextAlign.Center)
         Spacer(Modifier.height(40.dp))
-        BigButton(action, Modifier.fillMaxWidth(), onClick = act)
+        BigButton(action, Modifier.fillMaxWidth().testTag("confirm"), onClick = act)
         Spacer(Modifier.height(12.dp))
-        OutlinedButton(onClick = back, modifier = Modifier.fillMaxWidth().height(56.dp)) { Text("Cancel") }
+        BigButton("Cancel", Modifier.fillMaxWidth().testTag("cancel"), quiet = true, onClick = back)
     }
 }
