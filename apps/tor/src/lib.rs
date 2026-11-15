@@ -7,6 +7,7 @@
 //! version obsolete.
 
 mod serve;
+mod socks;
 
 use std::{
     collections::HashMap,
@@ -28,6 +29,7 @@ use tokio_rustls::{rustls, TlsConnector};
 use tor_rtcompat::PreferredRuntime;
 
 pub use serve::Onion;
+pub use socks::Socks;
 
 /// How long a request may take, its circuit included.
 pub const TIMEOUT: Duration = Duration::from_secs(120);
@@ -161,6 +163,16 @@ impl Tor {
         send(TokioIo::new(stream), request, max).await
     }
 
+    /// A SOCKS5 proxy at a loopback address through this client, served on
+    /// the current Tokio runtime until dropped: for code bringing its own
+    /// sockets, such as a light client. It takes CONNECT, and Tor's
+    /// RESOLVE, only with its random username and password, each
+    /// destination host on circuits apart from the others' as this
+    /// client's own streams.
+    pub async fn socks(&self) -> std::io::Result<Socks> {
+        socks::serve(self.clone()).await
+    }
+
     /// A stream over Tor to the host and port of `url`, an `http[s]://` or
     /// `ws[s]://` URL, within TLS for `https://` and `wss://`.
     pub async fn connect(&self, url: &str) -> Result<Box<dyn Stream>, String> {
@@ -204,6 +216,18 @@ impl std::fmt::Display for Failed {
         match self {
             Self::Unsent(why) | Self::Sent(why) => f.write_str(why),
         }
+    }
+}
+
+impl socks::Exit for Tor {
+    async fn connect(&self, host: String, port: u16) -> Result<Box<dyn Stream>, String> {
+        let tls = false;
+        self.stream(Target { host, port, tls }).await
+    }
+
+    async fn resolve(&self, host: String) -> Result<Vec<std::net::IpAddr>, String> {
+        let prefs = self.isolation.prefs(&host);
+        (self.client.resolve_with_prefs(&host, &prefs).await).map_err(|e| format!("over Tor: {e}"))
     }
 }
 

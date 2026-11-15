@@ -13,8 +13,9 @@ futures-util = { version = "0.3", default-features = false, features = ["alloc"]
 http-body-util = "0.1"
 hyper = { version = "1.12", features = ["client", "http1", "server"] }
 hyper-util = { version = "0.1.21", features = ["service", "tokio"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
 safelog = "0.10"
-tokio = { workspace = true, features = ["rt", "time"] }
+tokio = { workspace = true, features = ["io-util", "net", "rt", "time"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 tor-cell = "0.48"
 tor-hsservice = "0.48"
