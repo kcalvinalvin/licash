@@ -78,6 +78,19 @@ pub trait Transport: Send + Sync {
         url: &str,
         body: Option<Vec<u8>>,
     ) -> impl Future<Output = Result<Response, String>> + Send;
+
+    /// GET `url`, an answer far larger than any of the wallet's own: of up
+    /// to `max` bytes, given the time a download of it takes. As
+    /// [`Transport::request`] unless the transport bounds such answers
+    /// apart.
+    fn download(
+        &self,
+        url: &str,
+        max: usize,
+    ) -> impl Future<Output = Result<Response, String>> + Send {
+        let _ = max;
+        self.request(url, None)
+    }
 }
 
 /// Why a wallet call failed.
@@ -376,6 +389,11 @@ impl<T: Transport> Wallet<T> {
     /// chain is refused.
     pub fn network(&self) -> ChainProfile {
         self.network
+    }
+
+    /// How the wallet reaches its hubs, for what it does not ask itself.
+    pub fn transport(&self) -> &T {
+        &self.transport
     }
 
     /// When the wallet file was made, in seconds since the Unix epoch: of

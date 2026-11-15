@@ -925,6 +925,18 @@ impl<T: Transport> Wallet<T> {
         })
     }
 
+    /// What the wallet's coin at `outpoint` pays, as a transaction
+    /// spending it names it: none unless it is the wallet's and no block
+    /// spends it.
+    pub fn silent_coin_output(&self, outpoint: &OutPoint) -> Result<Option<TxOut>, Error> {
+        self.store.read(|c| {
+            Ok(coin(c, outpoint)?.map(|(held, _)| TxOut {
+                value: Amount::from_sat(held.value),
+                script_pubkey: p2tr(held.found.output),
+            }))
+        })
+    }
+
     /// Sign input `index` of `tx`, another party's transaction spending one
     /// of the wallet's coins among coins of its own, as a contract's
     /// funding does: on the key path, committing to `prevouts`, the coin
