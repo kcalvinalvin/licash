@@ -207,7 +207,15 @@ impl Wallet {
                 None => balance.onchain += coin.value,
             }
         }
+        balance.kept = self.kept_coins()?.iter().map(|(_, value)| value).sum();
         Ok(balance)
+    }
+
+    /// An address on Bitcoin of this wallet's, to cash notes out to: what
+    /// the wallet's own payouts pay there stays on Bitcoin, unless moved
+    /// into Licash with [`Wallet::move_all_to_licash`].
+    pub fn bitcoin_address(&self) -> Result<String, LicashError> {
+        Ok(self.wallet.fallback_address()?.to_string())
     }
 
     /// The code to be paid at, `amount` if given: in notes at the hubs
@@ -819,7 +827,45 @@ impl Wallet {
 
     /// Move the coins paid on Bitcoin to notes, at a hub trusted that
     /// takes them, broadcasting through `chain`: the move, under way.
+    /// The coins the wallet's own payouts paid, cashed out to it
+    /// ([`Balance::kept`]), stay on Bitcoin.
     pub fn move_to_licash(&self, chain: Arc<dyn ChainSource>) -> Result<Activity, LicashError> {
+        let keep: Vec<OutPoint> = self.kept_coins()?.into_iter().map(|(c, _)| c).collect();
+        self.move_keeping(chain, &keep)
+    }
+
+    /// [`Wallet::move_to_licash`] of all the coins, those cashed out to the
+    /// wallet too.
+    pub fn move_all_to_licash(&self, chain: Arc<dyn ChainSource>) -> Result<Activity, LicashError> {
+        self.move_keeping(chain, &[])
+    }
+}
+
+impl Wallet {
+    /// The coins not spent that the claims of the wallet's payouts paid,
+    /// with their values: cashed out to the wallet itself.
+    fn kept_coins(&self) -> Result<Vec<(OutPoint, u64)>, LicashError> {
+        let claims: Vec<bitcoin::Txid> = self
+            .wallet
+            .payouts()?
+            .into_iter()
+            .filter_map(|p| p.claim)
+            .collect();
+        if claims.is_empty() {
+            return Ok(Vec::new());
+        }
+        let coins = self.wallet.silent_coins()?.into_iter();
+        Ok(coins
+            .filter(|c| c.spending.is_none() && claims.contains(&c.outpoint.txid))
+            .map(|c| (c.outpoint, c.value))
+            .collect())
+    }
+
+    fn move_keeping(
+        &self,
+        chain: Arc<dyn ChainSource>,
+        keep: &[OutPoint],
+    ) -> Result<Activity, LicashError> {
         let hubs = self.wallet.hubs()?.into_iter();
         let Some(hub) = hubs
             .filter(|(_, i)| i.deposits.is_some())
@@ -833,7 +879,7 @@ impl Wallet {
         let rate = FeeRate::from_sat_per_vb(DEPOSIT_RATE).expect("a rate");
         let (deposit, tx) = self
             .runtime
-            .block_on(self.wallet.deposit_silent(&hub, rate))?;
+            .block_on(self.wallet.deposit_silent_keeping(&hub, rate, keep))?;
         if let Err(e) = chain.broadcast(bitcoin::consensus::serialize(&tx)) {
             // Its coins free again: the deposit lapses unpaid.
             self.wallet.abandon_silent(&tx.compute_txid())?;

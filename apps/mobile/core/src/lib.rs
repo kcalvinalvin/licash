@@ -180,10 +180,13 @@ pub struct Balance {
     pub notes: u64,
     /// In notes under way: change of a payment not finished.
     pub notes_pending: u64,
-    /// Paid on Bitcoin, confirmed, to move to notes.
+    /// Paid on Bitcoin, confirmed, to move to notes but `kept`.
     pub onchain: u64,
     /// Paid on Bitcoin and being moved to notes.
     pub moving: u64,
+    /// Of `onchain`, what the wallet's own payouts paid it: cashed out to
+    /// the wallet, and not moved back to notes unless asked.
+    pub kept: u64,
 }
 
 /// What the wallet holds at one hub it trusts, in sat.
