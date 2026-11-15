@@ -260,11 +260,21 @@ async fn refresh<T: Transport, C: Chain>(driver: &Driver<'_, T, C>, chain: &C) -
     }
     let tip = chain.height().await.map_err(|e| anyhow!(e))?;
     let free = fate == Fate::Dead || (fate == Fate::Open && holder.lapsed(tip));
-    if let (true, Some(f)) = (free, holder.funding()) {
-        let txid = f.tx.compute_txid();
+    let Some(f) = holder.funding() else {
+        return Ok(());
+    };
+    let txid = f.tx.compute_txid();
+    if free {
         // Freed already, or spent: nothing to free.
         let _ = driver.wallet.abandon_silent(&txid);
         tracing::warn!(id = %crate::hex_id(&driver.id), %txid, ?fate, "F will not confirm: her coin freed");
+    } else if fate == Fate::Open {
+        // Her coin kept for F: a wallet rewinding past it, as a reorg
+        // makes it, forgets what reserved it. Refused once a block
+        // spends it, which is no matter.
+        if let Err(e) = driver.wallet.sign_input(f.tx, f.prevouts, f.deposit) {
+            tracing::debug!(id = %crate::hex_id(&driver.id), %txid, "her coin not kept again: {e}");
+        }
     }
     Ok(())
 }

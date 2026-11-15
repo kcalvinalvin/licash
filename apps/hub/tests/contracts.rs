@@ -124,6 +124,18 @@ async fn a_wallet_opens_contracts_at_a_hub_and_sees_them_confirm() -> Result<()>
     ensure!(second.phase == Phase::Funded && second.value == 100_000);
     ensure!(second.id != first.id && second.deposit != first.deposit);
 
+    // Her coin's reservation lost, as a wallet rewound past it loses it:
+    // kept for F again once the contracts resume.
+    wallet.abandon_silent(&f)?;
+    let kept = |coins: Vec<licash_wallet::SilentCoin>| {
+        coins
+            .iter()
+            .any(|c| c.outpoint == first.deposit && c.spending == Some(f))
+    };
+    ensure!(!kept(wallet.silent_coins()?));
+    holder::resume(&wallet, &chain, &mine).await?;
+    ensure!(kept(wallet.silent_coins()?), "not kept again");
+
     // Both F in a block: live, her change back at her fallback address.
     rt.mine(1)?;
     let contracts = holder::resume(&wallet, &chain, &mine).await?;
