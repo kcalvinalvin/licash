@@ -16,8 +16,8 @@ use crate::{
     chain::Chain,
     deliveries::{self, Delivery},
     Activity, Balance, ChainError, ChainSource, Code, Details, Holding, Hub, InvoiceQuote, Kind,
-    LicashError, LightningInvoice, LightningTerms, Network, Notes, Onchain, Paid, Range, Rate,
-    Scan, Scanned, State,
+    LicashError, LightningInvoice, LightningTerms, Network, Notes, Onchain, Paid, PayQuote, Range,
+    Rate, Scan, Scanned, State,
 };
 
 /// The rate deposits are paid at, in sat/vB: above what nodes relay.
@@ -42,6 +42,9 @@ pub struct Wallet {
     /// Held while paying and finishing what is under way: the payments to
     /// send to mailboxes change only under it.
     delivering: Mutex<()>,
+    /// The plan of the last [`Wallet::pay_quote`], for [`Wallet::pay`]:
+    /// for the code, by its text, and the amount it pays.
+    planned: Mutex<Option<(String, licash_nostr::wallet::Plan)>>,
 }
 
 /// What the app keeps of a wallet besides the SDK's file.
@@ -52,6 +55,14 @@ struct Kept {
     /// before its file was made.
     #[serde(default)]
     birthday: u32,
+}
+
+fn holding(b: licash_wallet::Balance) -> Holding {
+    Holding {
+        hub: b.hub,
+        available: b.available,
+        pending: b.pending,
+    }
 }
 
 fn wallet_file(dir: &Path) -> PathBuf {
@@ -137,6 +148,7 @@ impl Wallet {
             tor,
             dir,
             delivering: Mutex::new(()),
+            planned: Mutex::new(None),
         }))
     }
 
@@ -262,6 +274,21 @@ impl Wallet {
             Err(_) => {}
         }
         if let Ok(code) = code {
+            // Its hubs not trusted, reached where it says, proving who
+            // they are.
+            if code
+                .licash
+                .as_ref()
+                .is_some_and(|l| !l.locations.is_empty())
+            {
+                return Ok(Scanned::Visit {
+                    amount: code.amount,
+                    address: code
+                        .address
+                        .as_ref()
+                        .map(|a| a.assume_checked_ref().to_string()),
+                });
+            }
             if let Some(address) = &code.address {
                 return Ok(Scanned::Bitcoin {
                     address: address.assume_checked_ref().to_string(),
@@ -365,14 +392,16 @@ impl Wallet {
 
     /// What the wallet holds at each hub it trusts.
     pub fn holdings(&self) -> Result<Vec<Holding>, LicashError> {
-        let balance = self.wallet.balance()?.into_iter();
-        Ok(balance
-            .map(|b| Holding {
-                hub: b.hub,
-                available: b.available,
-                pending: b.pending,
-            })
-            .collect())
+        Ok(self.wallet.balance()?.into_iter().map(holding).collect())
+    }
+
+    /// What the wallet holds at hubs it only visited to pay a payee there,
+    /// left over from a swap: none of its balance until the owner adds the
+    /// hub ([`Wallet::add_hub`]). Hubs holding nothing are left out.
+    pub fn visited(&self) -> Result<Vec<Holding>, LicashError> {
+        let held = self.wallet.visited_balance()?.into_iter();
+        let held = held.filter(|b| b.available > 0 || b.pending > 0);
+        Ok(held.map(holding).collect())
     }
 
     /// How many notes of each denomination it can pay with, at each hub.
@@ -387,11 +416,56 @@ impl Wallet {
             .collect())
     }
 
+    /// How paying `amount`, or what it asks, to the payment code `code` in
+    /// notes goes, and all it costs: at a hub it names that the wallet
+    /// trusts, else once a swap from another brings what it lacks there,
+    /// else so at a hub the code says where to reach, visited, proving it
+    /// is the one the code names. [`Wallet::pay`] pays it so.
+    pub fn pay_quote(&self, code: String, amount: Option<u64>) -> Result<PayQuote, LicashError> {
+        let text = code.trim().to_owned();
+        let code: PaymentCode = text.parse().map_err(LicashError::invalid)?;
+        code.check(self.wallet.network())?;
+        let plan = licash_nostr::wallet::plan(&self.wallet, &code, amount, &self.route);
+        let plan = match self.runtime.block_on(plan) {
+            Ok(plan) => plan,
+            Err(e) => {
+                // Lacking notes says the most: what is needed.
+                self.enough(&code, amount)?;
+                return Err(LicashError::from_any(e, |reason| LicashError::Invalid {
+                    reason,
+                }));
+            }
+        };
+        let quote = PayQuote {
+            hub: plan.hub.clone(),
+            amount: plan.amount,
+            fee: plan.fees(),
+            swap_from: plan.swap.as_ref().map(|s| s.from.clone()),
+            swapped: plan.swap.as_ref().map_or(0, |s| s.provider.quote.amount),
+            trusted: plan.trusted,
+        };
+        *self.planned.lock().unwrap_or_else(PoisonError::into_inner) = Some((text, plan));
+        Ok(quote)
+    }
+
     /// Pay `amount`, or what it asks, to the payment code `code`, in notes:
-    /// to the payee's mailbox, or for them to receive by hand.
+    /// as [`Wallet::pay_quote`] quoted it last, else at a hub it names that
+    /// the wallet trusts and holds enough at. To the payee's mailbox, or
+    /// for them to receive by hand.
     pub fn pay(&self, code: String, amount: Option<u64>) -> Result<Paid, LicashError> {
-        let code: PaymentCode = code.trim().parse().map_err(LicashError::invalid)?;
-        self.enough(&code, amount)?;
+        let text = code.trim().to_owned();
+        let code: PaymentCode = text.parse().map_err(LicashError::invalid)?;
+        let planned = self
+            .planned
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        let planned = planned
+            .filter(|(quoted, plan)| *quoted == text && Some(plan.amount) == amount.or(code.amount))
+            .map(|(_, plan)| plan);
+        if planned.is_none() {
+            self.enough(&code, amount)?;
+        }
         let _delivering = self.delivering();
         // Kept before paying: a payment its hub does not answer is made
         // later, and sent to the mailbox then.
@@ -410,8 +484,20 @@ impl Wallet {
             deliveries::save(&self.dir, &all).map_err(LicashError::failed)?;
         }
         let route = self.route.clone();
-        let pay = licash_nostr::wallet::pay(&self.wallet, &code, amount, || Ok(route));
-        let paid = self.runtime.block_on(pay);
+        let paid = match &planned {
+            Some(plan) => self.runtime.block_on(licash_nostr::wallet::pay_planned(
+                &self.wallet,
+                &code,
+                plan,
+                || Ok(route),
+            )),
+            None => self.runtime.block_on(licash_nostr::wallet::pay(
+                &self.wallet,
+                &code,
+                amount,
+                || Ok(route),
+            )),
+        };
         if let Some(delivery) = &delivery {
             self.settle(delivery, &paid);
         }

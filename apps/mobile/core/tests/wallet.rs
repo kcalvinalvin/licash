@@ -38,7 +38,7 @@ use licash_hub_service::{
 };
 use licash_mobile::{
     set_logger, wallet_exists, Activity, Balance, ChainError, ChainSource, Details, Kind,
-    LicashError, Logger, Network, Onchain, Range, Rate, Scanned, State, Wallet,
+    LicashError, Logger, Network, Onchain, PayQuote, Range, Rate, Scanned, State, Wallet,
 };
 use licash_wallet::PaymentCode;
 use nostr_sdk::prelude::MockRelay;
@@ -963,17 +963,23 @@ fn a_phone_pays_out_to_bitcoin_addresses_and_codes_of_hubs_it_does_not_trust() {
         amount: Some(10_000),
     };
     assert_eq!(asked.unwrap(), asked_for);
-    // A code of a wallet at a hub she does not trust: its fallback address.
+    // A code of a wallet at a hub she does not trust, saying where to
+    // reach it: paid in notes there if a swap brings them, else on Bitcoin
+    // at its fallback address.
     let other = Net::new(true);
     let bob = other.wallet("bob", other.height());
     let code = bob.payment_code(None).unwrap();
     let fallback = code.address.clone().unwrap();
-    match alice.scanned(code.qr).unwrap() {
-        Scanned::Bitcoin { address, amount } => {
-            assert_eq!((address.to_lowercase(), amount), (fallback, None));
-        }
+    match alice.scanned(code.qr.clone()).unwrap() {
+        Scanned::Visit {
+            amount: None,
+            address: Some(address),
+        } => assert_eq!(address.to_lowercase(), fallback),
         other => panic!("{other:?}"),
     }
+    // No provider to swap there with: not in notes, nothing held there.
+    assert!(alice.pay_quote(code.qr, Some(1_000)).is_err());
+    assert!(alice.visited().unwrap().is_empty());
 
     // No provider announced on her hub's relays: nothing quoted, nothing
     // paid out.
@@ -1083,6 +1089,39 @@ fn funded(net: &Net, light: &Arc<Light>, name: &str) -> Arc<Wallet> {
     wallet.resume().unwrap();
     assert!(notes(&wallet) > 0);
     wallet
+}
+
+#[test]
+fn a_phone_pays_a_code_as_quoted() {
+    let net = Net::new(true);
+    let light = Light::new(&net);
+    let alice = funded(&net, &light, "alice");
+    let held = notes(&alice);
+    let bob = net.wallet("bob", net.height());
+    let hub = bob.hubs().unwrap()[0].url.clone();
+    let asked = bob.payment_code(Some(500)).unwrap();
+
+    // At the hub she trusts, holding enough there: no swap.
+    let quote = alice.pay_quote(asked.qr.clone(), None).unwrap();
+    let wanted = PayQuote {
+        hub: hub.clone(),
+        amount: 500,
+        fee: 1,
+        swap_from: None,
+        swapped: 0,
+        trusted: true,
+    };
+    assert_eq!(quote, wanted);
+    let paid = alice.pay(asked.qr.clone(), None).unwrap();
+    assert_eq!((paid.amount, &paid.hub), (500, &hub));
+    assert_eq!(notes(&alice), held - 501);
+
+    // Quoted for another amount than paid: paid as without a quote.
+    let open = bob.payment_code(None).unwrap();
+    alice.pay_quote(open.qr.clone(), Some(100)).unwrap();
+    let paid = alice.pay(open.qr, Some(200)).unwrap();
+    assert_eq!(paid.amount, 200);
+    assert_eq!(notes(&alice), held - 501 - 201);
 }
 
 #[test]

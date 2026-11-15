@@ -232,6 +232,23 @@ pub struct PayoutQuote {
     pub depth: u32,
 }
 
+/// How a payment code is paid in notes ([`Wallet::pay_quote`]): `amount`
+/// at `hub`, with `fee`, all it costs on top: the hub's, and on a swap
+/// bringing notes there first, `swapped` from `swap_from`, the provider's
+/// and the lock's.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct PayQuote {
+    pub hub: String,
+    pub amount: u64,
+    pub fee: u64,
+    pub swap_from: Option<String>,
+    pub swapped: u64,
+    /// Whether the wallet trusts `hub`, else only visited it, the payee's
+    /// hub proving it is the one their code names: what the swap brings
+    /// past the payment stays there, apart ([`Wallet::visited`]).
+    pub trusted: bool,
+}
+
 /// A payment code to show: `text` to share, `qr` to draw, `address`, the
 /// plain address on Bitcoin in it, for payers that take no codes, and
 /// `silent`, its silent payment address, if a hub trusted finds payments
@@ -252,6 +269,14 @@ pub enum Scanned {
         amount: Option<u64>,
         /// Whether it names a hub the wallet trusts, to pay in notes.
         notes: bool,
+    },
+    /// A payment code naming no hub the wallet trusts that says where to
+    /// reach its hubs: to pay in notes at one, visited, proving it is the
+    /// one named, if the owner agrees ([`Wallet::pay_quote`]), else on
+    /// Bitcoin at `address`, if it names one; `amount` if it says.
+    Visit {
+        amount: Option<u64>,
+        address: Option<String>,
     },
     /// An address on Bitcoin, or a code naming one and no hub the wallet
     /// trusts: to pay out to from notes, through a swap provider
