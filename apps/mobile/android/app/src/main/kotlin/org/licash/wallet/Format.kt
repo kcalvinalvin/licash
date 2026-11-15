@@ -48,19 +48,32 @@ fun percent(ppm: ULong): String =
 
 /** What went wrong, for the user. */
 fun explain(e: Throwable): String = when (e) {
-    is LicashException.Invalid -> sentence(e.reason)
-    is LicashException.Unavailable -> sentence(e.reason)
+    is LicashException.Invalid -> plain(e.reason)
+    is LicashException.Unavailable -> plain(e.reason)
     is LicashException.Pending -> "Still under way: it finishes by itself."
     is LicashException.Insufficient ->
         "Not enough: ${sat(e.needed)} needed, ${sat(e.available)} available."
     is LicashException.NeedsTor -> "This hub is on Tor: turn Tor on in Settings."
     is LicashException.UnknownHub -> "This payment is at a hub you don't use yet: ${e.url}"
-    is LicashException.Failed -> sentence(e.reason)
-    is ChainException.Failed -> sentence(e.reason)
-    else -> sentence(e.message ?: e.toString())
+    is LicashException.Failed -> plain(e.reason)
+    is ChainException.Failed -> plain(e.reason)
+    else -> plain(e.message ?: e.toString())
 }
 
-private fun sentence(text: String): String = text.replaceFirstChar { it.uppercase() }
+/**
+ * A reason the core gives, in the app's words: a sentence, its amounts
+ * grouped, and no one to pay out or move said without naming providers.
+ */
+internal fun plain(reason: String): String {
+    fun amount(m: MatchResult) = m.groupValues[1].toULongOrNull()?.let(::sat) ?: "${m.groupValues[1]} sat"
+    NO_PAYOUT.matchEntire(reason)?.let { return "No one can send ${amount(it)} on Bitcoin right now. Try less, or later." }
+    NO_MOVE.matchEntire(reason)?.let { return "No one can move ${amount(it)} between your hubs right now. Try less, or later." }
+    return AMOUNT.replace(reason, ::amount).replaceFirstChar { it.uppercase() }
+}
+
+private val NO_PAYOUT = Regex("no swap provider found pays (\\d+) sat out on Bitcoin now")
+private val NO_MOVE = Regex("no swap provider found moves (\\d+) sat from \\S+ to \\S+ now")
+private val AMOUNT = Regex("\\b(\\d{4,}) sat\\b")
 
 /**
  * The host of a hub's `url`, to name it short: with its port if it names

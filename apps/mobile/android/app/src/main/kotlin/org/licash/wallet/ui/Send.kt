@@ -25,6 +25,16 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.ColumnScope
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.Warning
+import androidx.compose.material.icons.outlined.Info
+import androidx.compose.material3.Icon
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalClipboard
 import androidx.compose.ui.platform.LocalContext
@@ -77,7 +87,7 @@ private sealed interface Step {
     data object Later : Step
     data class Received(val amount: ULong) : Step
     data class Trust(val payment: String, val hub: String) : Step
-    data class Failed(val why: String) : Step
+    data class Failed(val why: String, val title: String = "Couldn't pay") : Step
 }
 
 /**
@@ -108,7 +118,7 @@ fun Send(
             { e ->
                 when (e) {
                     is LicashException.UnknownHub -> Step.Trust(payment, e.url)
-                    else -> Step.Failed(explain(e))
+                    else -> Step.Failed(explain(e), "Couldn't receive")
                 }
             },
         )
@@ -122,7 +132,7 @@ fun Send(
         step = Step.Quoting
         return engine.payoutQuote(address, amount, cashOut).fold(
             { Step.Payout(it, amount) },
-            { Step.Failed(explain(it)) },
+            { Step.Failed(explain(it), "Can't send on Bitcoin") },
         )
     }
 
@@ -139,11 +149,11 @@ fun Send(
                         // Cashing out: all to an address, nothing else.
                         cashOut != null -> when (scanned) {
                             is Scanned.Bitcoin -> quoting(scanned.address, null)
-                            else -> Step.Failed("To cash out, scan or paste a Bitcoin address.")
+                            else -> Step.Failed("To cash out, scan or paste a Bitcoin address.", "Not a Bitcoin address")
                         }
                         scanned is Scanned.Code -> when {
                             scanned.notes -> Step.Paying(text, scanned.amount)
-                            else -> Step.Failed("This code names no hub you use, and no Bitcoin address to pay.")
+                            else -> Step.Failed("This code names no hub you use, and no Bitcoin address to pay.", "Can't pay this")
                         }
                         scanned is Scanned.Visit -> Step.Visit(text, scanned.amount, scanned.address)
                         scanned is Scanned.Bitcoin -> when (val asked = scanned.amount) {
@@ -155,10 +165,10 @@ fun Send(
                             { Step.Invoice(text, it) },
                             { Step.Failed(explain(it)) },
                         )
-                        else -> Step.Failed("Nothing to pay there.")
+                        else -> Step.Failed("Nothing to pay there.", "Nothing to pay")
                     }
                 },
-                { Step.Failed(explain(it)) },
+                { Step.Failed(explain(it), "Can't read this") },
             )
         }
     }
@@ -297,7 +307,8 @@ fun Send(
                     }
                 }
                 is Step.Visit -> Ask(
-                    "Their hub is not one of yours. Pay there anyway?",
+                    "Pay at their hub?",
+                    "Their hub is not one of yours.",
                     "Pay there",
                     {
                         val paying = Step.Paying(s.code, s.asked, s.address, visit = true)
@@ -306,7 +317,8 @@ fun Send(
                     back,
                 )
                 is Step.Unpayable -> Ask(
-                    "${s.why}\n\nPay on Bitcoin instead?",
+                    "Pay on Bitcoin instead?",
+                    s.why,
                     "Pay on Bitcoin",
                     {
                         when (val amount = s.amount) {
@@ -341,12 +353,13 @@ fun Send(
                 Step.Later -> Told("Under way", "It finishes by itself", back)
                 is Step.Received -> Done("Received ${sat(s.amount)}", back)
                 is Step.Trust -> Ask(
-                    "From a hub you don't use yet:\n${s.hub}\n\nTake it, and use that hub?",
+                    "Take it?",
+                    "It is at ${name(s.hub)}, a hub you don't use yet. Taking it adds that hub.",
                     "Take it",
                     { take(s.payment, true) },
                     back,
                 )
-                is Step.Failed -> Ask(s.why, "Try again", { step = Step.Looking }, back)
+                is Step.Failed -> Ask(s.title, s.why, "Try again", { step = Step.Looking }, back, failed = true)
             }
         }
     }
@@ -620,53 +633,94 @@ private fun Sent(s: Step.Sent, back: () -> Unit) {
     }
 }
 
+/** What [Outcome] says in its glyph: done, under way, a question, or failed. */
+private enum class Tone { DONE, BUSY, ASK, FAILED }
+
+/**
+ * Where paying ends, or stops to ask, all alike: a glyph in a disc, a
+ * title, a line under it, and its buttons. `titleTag` and `detailTag`
+ * name them, for the tests.
+ */
 @Composable
-private fun Middle(text: String) {
+private fun Outcome(
+    tone: Tone,
+    title: String,
+    detail: String? = null,
+    titleTag: String? = null,
+    detailTag: String? = null,
+    buttons: @Composable ColumnScope.() -> Unit = {},
+) {
+    val colors = MaterialTheme.colorScheme
+    val tint = when (tone) {
+        Tone.FAILED -> colors.error
+        Tone.ASK -> colors.onSurfaceVariant
+        else -> colors.primary
+    }
     Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
-        Spacer(Modifier.height(120.dp))
-        CircularProgressIndicator()
+        Spacer(Modifier.height(72.dp))
+        Box(
+            Modifier.size(88.dp).clip(CircleShape).background(tint.copy(alpha = 0.14f)),
+            contentAlignment = Alignment.Center,
+        ) {
+            when (tone) {
+                Tone.BUSY -> CircularProgressIndicator(Modifier.size(40.dp), color = tint, strokeWidth = 3.dp)
+                Tone.DONE -> Icon(Icons.Filled.Check, contentDescription = null, Modifier.size(44.dp), tint = tint)
+                Tone.ASK -> Icon(Icons.Outlined.Info, contentDescription = null, Modifier.size(44.dp), tint = tint)
+                Tone.FAILED -> Icon(Icons.Filled.Warning, contentDescription = null, Modifier.size(40.dp), tint = tint)
+            }
+        }
         Spacer(Modifier.height(24.dp))
-        Text(text, style = MaterialTheme.typography.titleMedium, textAlign = TextAlign.Center)
+        Text(
+            title,
+            modifier = titleTag?.let { Modifier.testTag(it) } ?: Modifier,
+            style = MaterialTheme.typography.headlineSmall,
+            textAlign = TextAlign.Center,
+        )
+        detail?.let {
+            Spacer(Modifier.height(8.dp))
+            Text(
+                it,
+                modifier = detailTag?.let { tag -> Modifier.testTag(tag) } ?: Modifier,
+                style = MaterialTheme.typography.bodyLarge,
+                color = colors.onSurfaceVariant,
+                textAlign = TextAlign.Center,
+            )
+        }
+        Spacer(Modifier.height(40.dp))
+        buttons()
     }
 }
 
+/** Waiting on something quick: what, under a spinner. */
+@Composable
+private fun Middle(text: String) = Outcome(Tone.BUSY, text)
+
 /** It went through: said in a few words, `sub` under them if any. */
 @Composable
-private fun Done(text: String, back: () -> Unit, sub: String? = null) {
-    Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
-        Spacer(Modifier.height(120.dp))
-        Text("✓", style = Figures, color = MaterialTheme.colorScheme.primary)
-        Text(text, modifier = Modifier.testTag("result"), style = MaterialTheme.typography.headlineSmall)
-        sub?.let {
-            Text(it, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        }
-        Spacer(Modifier.height(48.dp))
-        BigButton("Done", Modifier.fillMaxWidth().testTag("done"), onClick = back)
-    }
+private fun Done(text: String, back: () -> Unit, sub: String? = null) = Outcome(Tone.DONE, text, sub, titleTag = "result") {
+    BigButton("Done", Modifier.fillMaxWidth().testTag("done"), onClick = back)
 }
 
 /** It is under way: what, and what to expect of it. */
 @Composable
-private fun Told(text: String, sub: String, back: () -> Unit) {
-    Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
-        Spacer(Modifier.height(120.dp))
-        CircularProgressIndicator()
-        Spacer(Modifier.height(24.dp))
-        Text(text, modifier = Modifier.testTag("result"), style = MaterialTheme.typography.headlineSmall)
-        Text(sub, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        Spacer(Modifier.height(48.dp))
-        BigButton("Done", Modifier.fillMaxWidth().testTag("done"), onClick = back)
-    }
+private fun Told(text: String, sub: String, back: () -> Unit) = Outcome(Tone.BUSY, text, sub, titleTag = "result") {
+    BigButton("Done", Modifier.fillMaxWidth().testTag("done"), onClick = back)
 }
 
+/**
+ * A question, or what went wrong `failed`: its `title`, why under it
+ * (tagged `ask`), and what to do about it or leave.
+ */
 @Composable
-private fun Ask(text: String, action: String, act: () -> Unit, back: () -> Unit) {
-    Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
-        Spacer(Modifier.height(80.dp))
-        Text(text, modifier = Modifier.testTag("ask"), style = MaterialTheme.typography.bodyLarge, textAlign = TextAlign.Center)
-        Spacer(Modifier.height(40.dp))
-        BigButton(action, Modifier.fillMaxWidth().testTag("confirm"), onClick = act)
-        Spacer(Modifier.height(12.dp))
-        BigButton("Cancel", Modifier.fillMaxWidth().testTag("cancel"), quiet = true, onClick = back)
-    }
+private fun Ask(
+    title: String,
+    why: String,
+    action: String,
+    act: () -> Unit,
+    back: () -> Unit,
+    failed: Boolean = false,
+) = Outcome(if (failed) Tone.FAILED else Tone.ASK, title, why, detailTag = "ask") {
+    BigButton(action, Modifier.fillMaxWidth().testTag("confirm"), onClick = act)
+    Spacer(Modifier.height(12.dp))
+    BigButton("Cancel", Modifier.fillMaxWidth().testTag("cancel"), quiet = true, onClick = back)
 }
