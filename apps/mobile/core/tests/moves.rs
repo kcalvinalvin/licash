@@ -137,6 +137,19 @@ impl Hubs {
         for served in &hubs {
             assert!(served.hub.synced(chain.height(), &chain.tip()).unwrap());
         }
+        // Kept synced as a hub's service following Bitcoin keeps it: a
+        // loaded runner setting providers up can take longer than the
+        // hubs' `max_lag`, past which they would admit no lock.
+        let (height, tip) = (chain.height(), chain.tip());
+        for served in &hubs {
+            let hub = served.hub.clone();
+            runtime.spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    hub.synced(height, &tip).unwrap();
+                }
+            });
+        }
         Self {
             runtime,
             relay,
