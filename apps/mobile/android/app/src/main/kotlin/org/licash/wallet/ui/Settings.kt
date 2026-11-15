@@ -136,9 +136,9 @@ private fun Overview(engine: Engine, ui: Ui, open: (Page) -> Unit) {
         }
     }
     Group("") {
-        Entry("Storage", icon = Icons.AutoMirrored.Filled.List, tint = tint) { open(Page.Storage) }
+        Entry("Storage", icon = Icons.AutoMirrored.Filled.List, tint = tint, tag = "storage") { open(Page.Storage) }
         Divider()
-        Entry("Export logs", icon = Icons.Filled.Share, tint = tint) {
+        Entry("Export logs", icon = Icons.Filled.Share, tint = tint, tag = "export-logs") {
             exporting = null
             runCatching { context.startActivity(exportLogs(context, ui)) }
                 .onFailure {
@@ -156,7 +156,7 @@ private fun Overview(engine: Engine, ui: Ui, open: (Page) -> Unit) {
         ) { engine.setDeveloper(it) }
         if (ui.developer) {
             Divider()
-            Entry("Advanced", icon = Icons.Filled.Build, tint = tint) { open(Page.Advanced) }
+            Entry("Advanced", icon = Icons.Filled.Build, tint = tint, tag = "advanced") { open(Page.Advanced) }
         }
     }
     Group("") { Line("Version", BuildConfig.VERSION_NAME, tag = "version") }
@@ -239,13 +239,13 @@ private fun StorageUsed(advanced: Boolean) {
         Line("Total", size(k.total), tag = "storage-total")
         Divider()
         Line("Wallet", size(k.wallet))
-        Line("Bitcoin light client", size(k.chain))
+        Line("Bitcoin light client", size(k.chain), tag = "storage-chain")
         if (advanced) k.chains.forEach { (name, b) -> Line("  $name", size(b)) }
         if (k.tor > 0) Line("Tor", size(k.tor))
         Line("Logs", size(k.logs))
         Line("Cache", size(k.cache))
         if (k.other > 0) Line("Other", size(k.other))
-        k.app?.let { Line("The app itself", size(it)) }
+        k.app?.let { Line("The app itself", size(it), tag = "storage-app") }
     }
 }
 

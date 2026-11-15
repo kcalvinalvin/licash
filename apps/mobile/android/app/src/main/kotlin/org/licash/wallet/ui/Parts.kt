@@ -368,7 +368,7 @@ fun More(label: String = "More", modifier: Modifier = Modifier, content: @Compos
     AnimatedVisibility(open) { Column(content = content) }
 }
 
-/** One of a few, side by side: the one chosen stands out. */
+/** One of a few, side by side: the one chosen stands out. Each is tagged `segment`, then its name. */
 @Composable
 fun Segmented(options: List<String>, chosen: Int, modifier: Modifier = Modifier, choose: (Int) -> Unit) {
     val colors = MaterialTheme.colorScheme
@@ -385,6 +385,7 @@ fun Segmented(options: List<String>, chosen: Int, modifier: Modifier = Modifier,
             ) {
                 Text(
                     option,
+                    modifier = Modifier.testTag("segment $option"),
                     style = MaterialTheme.typography.labelLarge,
                     color = if (on) colors.onSurface else colors.onSurfaceVariant,
                     maxLines = 1,

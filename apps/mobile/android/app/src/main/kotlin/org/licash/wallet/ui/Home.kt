@@ -117,8 +117,8 @@ fun Home(
         }
         if (ui.hubs.isNotEmpty()) {
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                BigButton("Receive", Modifier.weight(1f), onClick = receive)
-                BigButton("Send", Modifier.weight(1f), onClick = send)
+                BigButton("Receive", Modifier.weight(1f).testTag("receive"), onClick = receive)
+                BigButton("Send", Modifier.weight(1f).testTag("send"), onClick = send)
             }
             Column(
                 Modifier.fillMaxWidth().padding(top = 8.dp, bottom = 8.dp).clip(RoundedCornerShape(16.dp))
