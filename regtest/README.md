@@ -12,15 +12,15 @@ except in `tests/native_real_proof.rs`.
 
 ## Prerequisites
 
-Rust, Docker, and these checkouts beside this repository:
+Rust, Docker, and Lichen and ln-gap at the revisions `vendor/fetch.sh`
+pins, which it copies into `vendor/` from checkouts beside this repository:
 
 ```sh
 git clone https://github.com/AdamISZ/lichen ../lichen
 git -C ../lichen fetch origin 82c69a055a8ac9f2010d1f91ff15eef7ac1ca8ab
-git -C ../lichen checkout 82c69a055a8ac9f2010d1f91ff15eef7ac1ca8ab
 git clone https://github.com/AdamISZ/ln-gap ../ln-gap
 git -C ../ln-gap fetch origin d7972035c12247a07b1dcc1b32e1682cd790d276
-git -C ../ln-gap checkout d7972035c12247a07b1dcc1b32e1682cd790d276
+vendor/fetch.sh
 ```
 
 Each node runs in its own throwaway `bitcoin/bitcoin:30.0` container with a

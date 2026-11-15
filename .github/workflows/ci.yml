@@ -181,6 +181,7 @@ jobs:
           ref: d7972035c12247a07b1dcc1b32e1682cd790d276
           path: ln-gap
           persist-credentials: false
+      - run: licash/vendor/fetch.sh
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy

@@ -13,13 +13,13 @@ members = ["../crates/licash-contract"]
 [dependencies]
 licash = { path = "../crates/licash" }
 licash-contract = { path = "../crates/licash-contract", features = ["fixture"] }
-lichen-babe = { path = "../../lichen/crates/babe" }
+lichen-babe = { path = "../vendor/lichen/crates/babe" }
 licash-groth16 = { path = "../crates/licash-groth16" }
-lngap-btc = { path = "../../ln-gap/crates/btc" }
-lngap-channel = { path = "../../ln-gap/crates/channel" }
-lngap-lamport = { path = "../../ln-gap/crates/lamport" }
-lngap-sessions = { path = "../../ln-gap/crates/apps/sessions" }
-lngap-zk = { path = "../../ln-gap/crates/apps/zk" }
+lngap-btc = { path = "../vendor/ln-gap/crates/btc" }
+lngap-channel = { path = "../vendor/ln-gap/crates/channel" }
+lngap-lamport = { path = "../vendor/ln-gap/crates/lamport" }
+lngap-sessions = { path = "../vendor/ln-gap/crates/apps/sessions" }
+lngap-zk = { path = "../vendor/ln-gap/crates/apps/zk" }
 anyhow = "1"
 bincode = "1.3"
 bitcoincore-rpc = "0.19"
@@ -41,7 +41,7 @@ bitcoin-scriptexec = { git = "https://github.com/FairgateLabs/rust-bitcoin-scrip
 [profile.release]
 debug = 1
 
-# ln-gap's BitVMX-CPU fork, as ../lichen/Cargo.toml and ../ln-gap/Cargo.toml
+# ln-gap's BitVMX-CPU fork, as Lichen's and ln-gap's workspaces
 # patch it (pulled in through lngap-sessions).
 [patch."https://github.com/FairgateLabs/BitVMX-CPU"]
 emulator = { git = "https://github.com/AdamISZ/BitVMX-CPU", rev = "0b7d285fc5c7795d16fd58d380ff6ef25f2f0423" }
