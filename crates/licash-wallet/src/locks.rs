@@ -18,7 +18,7 @@ use licash::{
     note::{Keyset, Note},
     spend::{lock_hash, Proposal, ProposalId, TimedLock, TimedTerms},
 };
-use licash_api::{Code, Issued, Locked, Refund, Settle, Settled};
+use licash_api::{Code, Info, Issued, Locked, Refund, Settle, Settled};
 use rusqlite::{params, OptionalExtension, Row};
 
 use crate::{
@@ -113,33 +113,37 @@ impl<T: Transport> Wallet<T> {
         hash: [u8; 32],
         expiry: Option<u32>,
     ) -> Result<Lock, Error> {
-        self.lock_paying(url, payee, amount, hash, expiry, None)
+        let url = hub_url(url)?;
+        if amount == 0 {
+            return Err(Error::Invalid("nothing to lock".into()));
+        }
+        let (hub, info) = self.refresh(&url).await?;
+        self.lock_paying((&url, hub, &info), payee, amount, hash, expiry, None)
             .await
     }
 
-    /// [`Wallet::lock`], paying `invoice` through the hub once certified.
+    /// [`Wallet::lock`] at the hub `hub` reached at `url`, `info` what it
+    /// just said of itself, paying `invoice` through it once certified.
     pub(crate) async fn lock_paying(
         &self,
-        url: &str,
+        (url, hub, info): (&str, i64, &Info),
         payee: &Address,
         amount: u64,
         hash: [u8; 32],
         expiry: Option<u32>,
         invoice: Option<&str>,
     ) -> Result<Lock, Error> {
-        let url = hub_url(url)?;
         if amount == 0 {
             return Err(Error::Invalid("nothing to lock".into()));
         }
-        let (hub, info) = self.refresh(&url).await?;
         let locks = info.locks.as_ref().ok_or_else(|| {
             Error::Invalid(format!("hub {url} follows no chain: it takes no locks"))
         })?;
-        let checkpoint = locks.checkpoint().map_err(|p| unavailable(&url, p))?;
+        let checkpoint = locks.checkpoint().map_err(|p| unavailable(url, p))?;
         let depth = locks.min_depth.max(1);
         let latest = locks
             .latest_expiry(depth)
-            .map_err(|p| unavailable(&url, p))?;
+            .map_err(|p| unavailable(url, p))?;
         let expiry = expiry.unwrap_or(latest);
         if expiry <= locks.height || expiry > latest {
             return Err(Error::Invalid(format!(
@@ -153,7 +157,7 @@ impl<T: Transport> Wallet<T> {
                 Some(exact) => exact,
                 None => {
                     tracing::info!(%url, amount, "making exact notes to lock");
-                    self.send(&url, &self.address(), amount).await?;
+                    self.send(url, &self.address(), amount).await?;
                     self.exact(hub, amount)?.ok_or(Error::Insufficient {
                         needed: amount,
                         available: 0,
@@ -217,7 +221,7 @@ impl<T: Transport> Wallet<T> {
             crate::take(tx, &id, &inputs)
         })?;
         tracing::info!(id = %hex::encode(id.as_bytes()), %url, amount, fee, expiry, "locking");
-        self.advance_lock(&id).await
+        self.advance_lock(&id, Some(locks.height)).await
     }
 
     /// Notes of one keyset of `hub` worth `amount` exactly, the largest
@@ -247,10 +251,18 @@ impl<T: Transport> Wallet<T> {
     /// lock expired at depth. Where it stands: a lock waiting on its payee
     /// or its expiry is [`LockState::Locked`].
     pub async fn follow_lock(&self, id: &str) -> Result<Lock, Error> {
-        self.advance_lock(&payment_id(id)?).await
+        self.advance_lock(&payment_id(id)?, None).await
     }
 
-    pub(crate) async fn advance_lock(&self, id: &ProposalId) -> Result<Lock, Error> {
+    /// [`Wallet::follow_lock`]: `height`, the height its hub said it was at
+    /// in this same step, if known, spares asking it again whether the lock
+    /// expired at depth; a height behind only puts the refund off to the
+    /// next step.
+    pub(crate) async fn advance_lock(
+        &self,
+        id: &ProposalId,
+        height: Option<u32>,
+    ) -> Result<Lock, Error> {
         let pending = |e: Error| match e {
             Error::Refused { .. } | Error::Pending { .. } | Error::Abandoned { .. } => e,
             e => Error::Pending {
@@ -258,11 +270,11 @@ impl<T: Transport> Wallet<T> {
                 reason: e.to_string(),
             },
         };
-        self.advance_lock_from(id).await.map_err(pending)?;
+        self.advance_lock_from(id, height).await.map_err(pending)?;
         self.lock_record(id)
     }
 
-    async fn advance_lock_from(&self, id: &ProposalId) -> Result<(), Error> {
+    async fn advance_lock_from(&self, id: &ProposalId, height: Option<u32>) -> Result<(), Error> {
         type Row = (
             i64,
             String,
@@ -346,7 +358,7 @@ impl<T: Transport> Wallet<T> {
                     Err(Error::Refused { problem, .. })
                         if settled.is_none() && problem.code == Code::LockExpired =>
                     {
-                        self.refund_deep(&url, id, &terms).await?
+                        self.refund_deep(&url, id, &terms, height).await?
                     }
                     Err(Error::Refused { problem, .. }) => return Err(unavailable(&url, problem)),
                     Err(e) => return Err(e),
@@ -355,7 +367,7 @@ impl<T: Transport> Wallet<T> {
             (Some(Settled::Pay), None) => {
                 return Err(unavailable(&url, "a lock paid without its preimage"));
             }
-            (None, None) => self.refund_deep(&url, id, &terms).await?,
+            (None, None) => self.refund_deep(&url, id, &terms, height).await?,
         };
         let Some((branch, issued, preimage)) = settled else {
             return Ok(());
@@ -384,15 +396,18 @@ impl<T: Transport> Wallet<T> {
     }
 
     /// The refund of lock `id`, of `terms`, once its hub scanned past its
-    /// expiry at depth.
+    /// expiry at depth: at `height`, if just learned, else as it says now.
     async fn refund_deep(
         &self,
         url: &str,
         id: &ProposalId,
         terms: &TimedTerms,
+        height: Option<u32>,
     ) -> Result<Option<Settlement>, Error> {
-        let (_, info) = self.refresh(url).await?;
-        let height = info.locks.map_or(0, |l| l.height);
+        let height = match height {
+            Some(height) => height,
+            None => self.refresh(url).await?.1.locks.map_or(0, |l| l.height),
+        };
         if height >= terms.expiry().saturating_add(terms.depth()) {
             self.refund_lock(url, id).await
         } else {

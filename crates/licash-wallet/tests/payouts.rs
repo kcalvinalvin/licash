@@ -8,7 +8,7 @@ use std::{
     collections::HashMap,
     str::FromStr,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
     },
 };
@@ -20,7 +20,7 @@ use bitcoin::{
 use licash::spend::ChainProfile;
 use licash_api::{
     swaps::{self, ChainRequest, ChainSwap},
-    Code, Fee, Funding, Hex, Problem,
+    Code, Fee, Funding, Hex, Problem, INFO,
 };
 use licash_hub::Timing;
 use licash_onchain::deposit::Htlc;
@@ -228,9 +228,10 @@ fn unchecked(coin: OutPoint, output: TxOut) -> Transaction {
     }
 }
 
-/// A client's way to the hub and the provider.
+/// A client's way to the hub and the provider, counting how often it asks
+/// the hub what it says of itself.
 #[derive(Clone)]
-struct Client(Arc<Net>, Arc<Desk>);
+struct Client(Arc<Net>, Arc<Desk>, Arc<AtomicUsize>);
 
 impl Transport for Client {
     fn request(
@@ -239,6 +240,9 @@ impl Transport for Client {
         body: Option<Vec<u8>>,
     ) -> impl std::future::Future<Output = Result<Response, String>> + Send {
         let (net, desk, url) = (self.0.clone(), self.1.clone(), url.to_owned());
+        if url.ends_with(INFO) && !url.starts_with(PROVIDER) {
+            self.2.fetch_add(1, Ordering::Relaxed);
+        }
         async move {
             match url.strip_prefix(PROVIDER) {
                 Some(path) => desk.serve(path, body).await,
@@ -303,7 +307,7 @@ impl Eco {
     ) -> Wallet<Client> {
         let (path, link) = (
             dir.path().join("client.sqlite"),
-            Client(net.clone(), desk.clone()),
+            Client(net.clone(), desk.clone(), Arc::default()),
         );
         if !new {
             return Wallet::open(&path, link).unwrap();
@@ -479,6 +483,28 @@ async fn a_payout_pays_the_address_exactly_and_the_provider_its_lock() {
     let total = value + quote.fee;
     assert_eq!(eco.held(), 3000 - total - FEE.base);
     assert_eq!(eco.client.payouts().unwrap(), vec![done]);
+}
+
+#[tokio::test]
+async fn a_payout_asks_its_hub_what_it_says_of_itself_once_to_lock() {
+    let eco = Eco::new().await;
+    let asked = || eco.client.transport().2.load(Ordering::Relaxed);
+    let before = asked();
+    let payout = eco.pay_out(1000).await;
+    // Once for its terms, its lock and whether that expired: each round
+    // trip a wait over Tor.
+    assert_eq!(asked() - before, 1);
+    assert_eq!(payout.state, PayoutState::Open);
+    // Followed, whether the lock expired is asked again, as is the height
+    // once the provider names its coin, for the room left to claim it.
+    let before = asked();
+    pending(eco.follow(&payout).await, "not confirmed yet");
+    assert_eq!(asked() - before, 1);
+    eco.desk.fund(None, None);
+    let before = asked();
+    let claimed = eco.follow(&payout).await.unwrap();
+    assert_eq!(claimed.state, PayoutState::Claimed);
+    assert_eq!(asked() - before, 2);
 }
 
 #[tokio::test]

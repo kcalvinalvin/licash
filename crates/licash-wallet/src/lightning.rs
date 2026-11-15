@@ -250,7 +250,7 @@ impl<T: Transport> Wallet<T> {
         let url = hub_url(url)?;
         let invoice = decode(request)?;
         let msat = self.payable(&invoice)?;
-        let (_, info) = self.refresh(&url).await?;
+        let (hub, info) = self.refresh(&url).await?;
         let lightning = gateway(&url, &info, msat)?;
         let expiry = lock_expiry(&url, &info, lightning, &invoice)?;
         let hash: [u8; 32] = *invoice.payment_hash().as_ref();
@@ -258,7 +258,7 @@ impl<T: Transport> Wallet<T> {
         let request = invoice.to_string();
         tracing::info!(%url, msat, amount, "paying an invoice");
         self.lock_paying(
-            &url,
+            (&url, hub, &info),
             &info.address,
             amount,
             hash,

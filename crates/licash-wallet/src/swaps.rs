@@ -176,8 +176,9 @@ impl<T: Transport> Wallet<T> {
         })?;
         tracing::info!(hash = %hex::encode(hash), %provider, %from, %to, amount, fee, "swapping");
         let total = amount.saturating_add(fee);
+        let at = (from.as_str(), from_hub, &from_info);
         match self
-            .lock(&from, &offer.address, total, hash, Some(expiry))
+            .lock_paying(at, &offer.address, total, hash, Some(expiry), None)
             .await
         {
             Ok(_) | Err(Error::Pending { .. }) => {}
@@ -229,7 +230,7 @@ impl<T: Transport> Wallet<T> {
             return self.fail_swap(hash, "its lock was not made");
         };
         let id = ProposalId::from_bytes(lock);
-        let ours = match self.advance_lock(&id).await {
+        let ours = match self.advance_lock(&id, None).await {
             Ok(ours) => ours,
             Err(Error::Refused { problem, .. }) => {
                 return self.fail_swap(hash, &format!("its hub refused its lock: {problem}"));

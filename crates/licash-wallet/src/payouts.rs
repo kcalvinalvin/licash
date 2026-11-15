@@ -311,8 +311,9 @@ impl<T: Transport> Wallet<T> {
             budget = quote.budget, fee = quote.fee, "paying out"
         );
         let total = quote.value().saturating_add(quote.fee);
+        let at = (from.as_str(), from_hub, &from_info);
         match self
-            .lock(&from, &quote.info.address, total, hash, Some(expiry))
+            .lock_paying(at, &quote.info.address, total, hash, Some(expiry), None)
             .await
         {
             Ok(_) | Err(Error::Pending { .. }) => {}
@@ -322,7 +323,11 @@ impl<T: Transport> Wallet<T> {
             }
         }
         // Asked again by each follow, if this fails.
-        if let Err(e) = self.ask_payout(&hash, &self.payout_row(&hash)?).await {
+        let height = locks.height;
+        if let Err(e) = self
+            .ask_payout(&hash, &self.payout_row(&hash)?, Some(height))
+            .await
+        {
             tracing::debug!(hash = %hex::encode(hash), reason = %e, "payout waits");
         }
         self.payout_record(&hash)
@@ -482,7 +487,7 @@ impl<T: Transport> Wallet<T> {
         if record.claim.is_some() {
             return self.watch_claim(hash, &record, chain).await;
         }
-        let Some((funding, hub_height)) = self.ask_payout(hash, &record).await? else {
+        let Some((funding, hub_height)) = self.ask_payout(hash, &record, None).await? else {
             return Ok(());
         };
         // Its terms, as recorded first.
@@ -492,12 +497,14 @@ impl<T: Transport> Wallet<T> {
     }
 
     /// Ask the provider for the payout of the wallet's lock, and record its
-    /// terms: its coin, as it says, once confirmed; `None` once the payout
-    /// failed.
+    /// terms: its coin, as it says, once confirmed, with its hub's height
+    /// as it says then; `None` once the payout failed. `height`, the hub's
+    /// as it said in this same step, follows the lock ([`Wallet::advance_lock`]).
     async fn ask_payout(
         &self,
         hash: &[u8; 32],
         record: &Record,
+        height: Option<u32>,
     ) -> Result<Option<(licash_api::Funding, u32)>, Error> {
         let from_hub = record.from.0;
         let lock: Option<[u8; 32]> = self.store.read(|c| {
@@ -515,7 +522,7 @@ impl<T: Transport> Wallet<T> {
             return Ok(None);
         };
         let id = ProposalId::from_bytes(lock);
-        let ours = match self.advance_lock(&id).await {
+        let ours = match self.advance_lock(&id, height).await {
             Ok(ours) => ours,
             Err(Error::Refused { problem, .. }) => {
                 self.fail_payout(hash, &format!("its hub refused its lock: {problem}"))?;
@@ -541,7 +548,8 @@ impl<T: Transport> Wallet<T> {
             _ => {}
         }
         let provider = &record.provider;
-        let (_, from_info) = self.refresh(&record.from.1).await?;
+        // Its identity, as kept: its height is asked once a coin is named.
+        let (_, from_info) = self.hub(&record.from.1)?;
         let claim = x_only(&record.claim_key()?).serialize();
         let request = swaps::ChainRequest::new(&from_info.address, &id, claim, record.value());
         let answer: swaps::ChainSwap = match self.post(provider, swaps::CHAIN_SWAPS, &request).await
@@ -607,9 +615,11 @@ impl<T: Transport> Wallet<T> {
             )?;
             Ok(())
         })?;
-        let hub_height = from_info.locks.map_or(0, |l| l.height);
         match answer.funding {
-            Some(funding) => Ok(Some((funding, hub_height))),
+            Some(funding) => {
+                let (_, from_info) = self.refresh(&record.from.1).await?;
+                Ok(Some((funding, from_info.locks.map_or(0, |l| l.height))))
+            }
             None => Err(Error::Pending {
                 id: hex::encode(hash),
                 reason: "the provider's coin is not confirmed yet".into(),

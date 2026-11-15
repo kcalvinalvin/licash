@@ -1447,7 +1447,7 @@ impl<T: Transport> Wallet<T> {
         })?;
         for id in ids {
             let key = hex::encode(id);
-            match self.advance_lock(&ProposalId::from_bytes(id)).await {
+            match self.advance_lock(&ProposalId::from_bytes(id), None).await {
                 Ok(lock) => resumed.locks.push(lock),
                 Err(Error::Refused { problem, .. }) => {
                     resumed.abandoned.push((key, problem.to_string()));
