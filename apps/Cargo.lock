@@ -4165,8 +4165,11 @@ dependencies = [
  "anyhow",
  "clap",
  "ratatui",
+ "reqwest",
+ "rustls",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]

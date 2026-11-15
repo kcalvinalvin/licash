@@ -15,6 +15,7 @@ mod app;
 mod chart;
 mod format;
 mod page;
+mod probe;
 mod render;
 mod series;
 mod style;
@@ -35,6 +36,7 @@ pub use format::grouped;
 pub use page::{
     Better, Card, Cell, Check, Column, Measure, Page, Panel, Ref, Row, Table, Tone, Value,
 };
+pub use probe::{unasked, Probe};
 pub use series::{Fact, Kind, Series, Unit};
 
 /// Everything a service shows its operator, as read at `now`.

@@ -928,7 +928,7 @@ fn show(data: &Path, args: licash_dashboard::Args, url: Option<String>) -> anyho
         let listen = std::env::var("LICASH_HUB_LISTEN");
         format!("http://{}", listen.as_deref().unwrap_or("127.0.0.1:8338"))
     });
-    let probe = dashboard::Probe::new(&url)?;
+    let probe = licash_dashboard::Probe::new(&url, licash_hub_service::HEALTH)?;
     let data = data.to_owned();
     args.run(move || dashboard::report(&data, Some(&probe)))
 }

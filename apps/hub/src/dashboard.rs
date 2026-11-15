@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Context as _, Result};
 use licash_contracts::hub::Summary;
-use licash_dashboard::{grouped, Check, Report, Series, Tone, Unit};
+use licash_dashboard::{grouped, Probe, Report, Series, Unit};
 use licash_hub::{Event, ForwardRecord, Ledger, LockRecord, Notes, Notice, Settled};
 use rusqlite::{Connection, OpenFlags};
 
@@ -23,60 +23,6 @@ const PAY: &str = "lightning out";
 const RECEIVE: &str = "lightning in";
 const DEPOSIT: &str = "deposits";
 const CONTRACT: &str = "contracts";
-
-/// The hub's service at `url`, asked whether it is up.
-pub struct Probe {
-    url: String,
-    client: reqwest::Client,
-    runtime: tokio::runtime::Runtime,
-}
-
-impl Probe {
-    pub fn new(url: &str) -> Result<Self> {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        Ok(Self {
-            url: url.trim_end_matches('/').to_owned(),
-            client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(3))
-                .build()?,
-            runtime: tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()?,
-        })
-    }
-
-    /// Whether the service answers `/health`, and how.
-    fn check(&self) -> Check {
-        let url = format!("{}{}", self.url, crate::HEALTH);
-        let answer = self.runtime.block_on(async {
-            let response = self.client.get(&url).send().await?;
-            Ok::<_, reqwest::Error>((response.status(), response.text().await?))
-        });
-        match answer {
-            Ok((status, _)) if status.is_success() => {
-                Check::new("Service", Tone::Good, format!("answers at {}", self.url))
-            }
-            Ok((status, body)) => Check::new(
-                "Service",
-                Tone::Bad,
-                format!("{status} at {}: {}", self.url, body.trim()),
-            ),
-            Err(e) => Check::new(
-                "Service",
-                Tone::Warn,
-                format!("no answer at {}: {}", self.url, root(&e)),
-            ),
-        }
-    }
-}
-
-fn root(e: &dyn std::error::Error) -> String {
-    let mut e = e;
-    while let Some(source) = e.source() {
-        e = source;
-    }
-    e.to_string()
-}
 
 /// A receipt of the Lightning gateway: notes asked for over Lightning.
 struct Receipt {
@@ -119,10 +65,7 @@ struct Records {
 /// asked by `probe`.
 pub fn report(data: &Path, probe: Option<&Probe>) -> Result<Report> {
     let records = read(data)?;
-    let service = match probe {
-        Some(probe) => probe.check(),
-        None => Check::new("Service", Tone::Muted, "not asked"),
-    };
+    let service = probe.map_or_else(licash_dashboard::unasked, Probe::check);
     Ok(pages::report(&records, now(), service, data))
 }
 
