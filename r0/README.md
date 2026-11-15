@@ -18,6 +18,17 @@ guests link libsecp256k1). `RISC0_TOOLCHAIN` and `RISC0_CC` override the default
 paths, `~/.rustup/toolchains/risc0` and
 `~/.risc0/cpp/bin/riscv32-unknown-elf-gcc`.
 
+`r0/build-guest.sh` builds with the toolchains the kept programs were built
+with alone, rzup's `rust` 1.97.0 (rustc `e638c6cfe`) and `cpp` 2024.1.5
+(gcc 13.2.0), and the lockfiles as committed:
+
+```sh
+rzup install rust 1.97.0
+rzup install cpp 2024.1.5
+```
+
+`LICASH_GUEST_ANY_TOOLCHAIN=1` builds with others, for a guest not to keep.
+
 ## Build
 
 ```sh
@@ -26,7 +37,9 @@ r0/build-guest.sh native-claim     # r0/guests/native-claim.{bin,id}
 cargo build --release --manifest-path r0/host/Cargo.toml
 ```
 
-Builds are local and untracked; image ids change with the source.
+Builds are local and untracked in `r0/guests/`; image ids change with the
+source. The checkout's directory and cargo's are left out of the paths a
+guest holds, so the same commit builds the same image id on any machine.
 
 ## Execute and prove
 

@@ -185,11 +185,17 @@ fn main() -> Result<()> {
             println!("{}", compute_image_id(&bin)?);
             Ok(())
         }
+        // A packed program's image id: those kept in r0/programs are
+        // named by theirs.
+        ["id", bin] => {
+            println!("{}", compute_image_id(&read(bin)?)?);
+            Ok(())
+        }
         ["native-exec", path] => native::exec(native::Program::Holder, path),
         ["native-counter-exec", path] => native::exec(native::Program::Counter, path),
         ["native-prove", path, out] => native::prove(native::Program::Holder, path, out),
         ["native-counter-prove", path, out] => native::prove(native::Program::Counter, path, out),
-        _ => bail!("usage: licash-r0 pack <elf> <out.bin> | native-exec|native-counter-exec <input.bin> | native-prove|native-counter-prove <input.bin> <out.json>"),
+        _ => bail!("usage: licash-r0 pack <elf> <out.bin> | id <program.bin> | native-exec|native-counter-exec <input.bin> | native-prove|native-counter-prove <input.bin> <out.json>"),
     }
 }
 
