@@ -3,6 +3,7 @@ package org.licash.wallet.ui
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
@@ -123,26 +124,27 @@ fun BalanceDetails(
                     Hint("Opening a contract: a few minutes, downloading what it needs.")
                     LinearProgressIndicator(Modifier.fillMaxWidth().padding(bottom = 8.dp))
                 }
-                Row {
+                // A button that does not fit goes below whole, its words on one line.
+                FlowRow {
                     if (holding.available > 0uL) {
                         TextButton(
                             onClick = { cashOut(holding.hub) },
                             modifier = Modifier.testTag("cash-out"),
-                        ) { Text("Cash out to Bitcoin") }
+                        ) { Text("Cash out to Bitcoin", maxLines = 1) }
                     }
                     if (hub?.contracts != null && ui.opening == null) {
                         TextButton(
                             onClick = { askQuote(holding.hub) },
                             enabled = quoting == null,
                             modifier = Modifier.testTag("open-contract"),
-                        ) { Text(if (here.any { live(it) }) "Open another contract" else "Open a contract") }
+                        ) { Text(if (here.any { live(it) }) "Open another contract" else "Open a contract", maxLines = 1) }
                     }
-                }
-                if (ui.developer && held.orEmpty().size >= 2 && holding.available > 0uL) {
-                    TextButton(
-                        onClick = { moving = holding },
-                        modifier = Modifier.testTag("move"),
-                    ) { Text("Move to another hub") }
+                    if (ui.developer && held.orEmpty().size >= 2 && holding.available > 0uL) {
+                        TextButton(
+                            onClick = { moving = holding },
+                            modifier = Modifier.testTag("move"),
+                        ) { Text("Move to another hub", maxLines = 1) }
+                    }
                 }
             }
         }
@@ -324,7 +326,10 @@ private fun ContractCard(c: Contract, height: Int, developer: Boolean, close: ()
             val closes = c.closesAt.toLong() - height
             Fact("Closes", if (height > 0) "at block ${c.closesAt}, ${duration(closes)}" else "at block ${c.closesAt}")
         }
-        if (c.state !is ContractState.Failed) Fact("Cost", "${sat(c.price)}, from a coin of ${sat(c.paidFrom)}")
+        if (c.state !is ContractState.Failed) {
+            Fact("Cost", sat(c.price))
+            Fact("Paid from", "A coin of ${sat(c.paidFrom)}")
+        }
         if (developer) {
             c.funding?.let { Fact("Funding", it.take(16) + "…") }
             Fact("Id", c.id.take(16) + "…")
