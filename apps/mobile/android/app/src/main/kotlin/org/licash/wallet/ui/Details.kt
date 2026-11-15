@@ -36,7 +36,9 @@ import kotlinx.coroutines.launch
 import org.licash.core.Activity
 import org.licash.core.Details
 import org.licash.core.Kind
+import org.licash.core.LockStep
 import org.licash.core.Onchain
+import org.licash.core.PayoutSteps
 import org.licash.core.State
 import org.licash.wallet.AppLog
 import org.licash.wallet.Engine
@@ -72,8 +74,9 @@ fun ActivityDetails(engine: Engine, ui: Ui, shown: Activity, back: () -> Unit) {
         is Details.Coin -> d.tx
         else -> null
     }
-    // A payout's claim pays the address: else the provider's coin.
-    val txid = tx?.txid ?: (details as? Details.Payout)?.let { it.claim ?: it.coin }
+    // A payout's claim pays the address: else the provider's coin, as soon
+    // as the provider tells of it.
+    val txid = tx?.txid ?: (details as? Details.Payout)?.progress?.let { it.claim ?: it.coin }
         ?: (details as? Details.Contract)?.funding
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 20.dp)) {
         TopBar(title(activity, coming != null), back)
@@ -95,6 +98,16 @@ fun ActivityDetails(engine: Engine, ui: Ui, shown: Activity, back: () -> Unit) {
             },
         )
         error?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
+        (details as? Details.Payout)?.let { payout ->
+            PayoutTimeline(activity, payout, engine::explorerLink) { link ->
+                unopened = false
+                runCatching { context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(link))) }
+                    .onFailure {
+                        AppLog.warn("opening $link", it)
+                        unopened = true
+                    }
+            }
+        }
         Summary(activity, details, tx)
         txid?.let { engine.explorerLink(it) }?.let { link ->
             Spacer(Modifier.height(16.dp))
@@ -144,16 +157,16 @@ private fun paid(activity: Activity): Boolean =
 /** Where it stands, in words. */
 private fun status(activity: Activity, coming: Boolean, details: Details?): String = when {
     coming -> "Waiting for a block, about 10 minutes"
-    activity.state == State.FAILED && details is Details.Payout ->
-        "${activity.detail}. What it locked comes back once the lock expires."
+    activity.state == State.FAILED && details is Details.Payout -> {
+        val back = details.progress.lockExpiry
+        when (details.progress.lock) {
+            LockStep.LOCKED -> "${activity.detail}. Your notes come back after block $back."
+            else -> "${activity.detail}. Your notes stay yours."
+        }
+    }
     activity.state == State.FAILED -> activity.detail
     else -> when (details) {
-        is Details.Payout -> when {
-            activity.state == State.DONE -> "Paid on Bitcoin"
-            details.claim != null -> "Sent on Bitcoin: confirming, about 10 minutes"
-            details.coin != null -> "The provider paid it on Bitcoin: confirming, about 10 minutes"
-            else -> "Waiting for the provider to pay it on Bitcoin"
-        }
+        is Details.Payout -> payoutStatus(activity, details.progress)
         is Details.Moved -> moving(activity, details)
         is Details.Coin -> when {
             details.moving != null -> "Moving into Licash"
@@ -173,6 +186,149 @@ private fun status(activity: Activity, coming: Boolean, details: Details?): Stri
             else -> "Received"
         }
     }
+}
+
+/** Where a payout under way stands, in words. */
+private fun payoutStatus(activity: Activity, p: PayoutSteps): String {
+    val coinHeight = p.coinHeight
+    return when {
+        activity.state == State.DONE -> "Paid on Bitcoin"
+        p.claim != null -> "Sent to the address: confirming, about 10 minutes"
+        coinHeight != null && depthOf(coinHeight, p.tip) >= p.depth.toInt() ->
+            "The provider's coin confirmed: claiming it"
+        coinHeight != null -> "The provider's coin is confirming"
+        p.coin != null -> "The provider sent its coin: waiting for a block, about 10 minutes"
+        p.lock == LockStep.LOCKED -> "Waiting for the provider to send its coin"
+        else -> "Locking your notes at the hub"
+    }
+}
+
+/** The confirmations of a transaction in block `height`, at `tip`. */
+private fun depthOf(height: UInt?, tip: UInt): Int =
+    height?.let { if (tip >= it) (tip - it + 1u).toInt() else 0 } ?: 0
+
+/**
+ * Each step of a payout: its notes locked for the provider, the provider's
+ * coin sent and confirmed, the coin claimed paying the address, and that
+ * confirmed; the block to claim by while it is not. A transaction known
+ * links to the block explorer.
+ */
+@Composable
+private fun PayoutTimeline(
+    activity: Activity,
+    payout: Details.Payout,
+    link: (String) -> String?,
+    open: (String) -> Unit,
+) {
+    val p = payout.progress
+    // Read once: a record's fields are mutable, so not smart cast.
+    val coin = p.coin
+    val coinHeight = p.coinHeight
+    val claim = p.claim
+    val claimHeight = p.claimHeight
+    val failed = activity.state == State.FAILED
+    val done = activity.state == State.DONE
+    val view = { txid: String? ->
+        txid?.let(link)?.let { url -> "View on a block explorer" to { open(url) } }
+    }
+    val coinDepth = depthOf(coinHeight, p.tip)
+    val coinConfirmed = claim != null || (coinHeight != null && coinDepth >= p.depth.toInt())
+    val hub = host(payout.hub)
+    Group("Progress") {
+        val (lockMark, lockDetail) = when (p.lock) {
+            null -> (if (failed) Mark.FAILED else Mark.NOW) to "Locking them at $hub"
+            LockStep.REQUESTED -> (if (failed) Mark.FAILED else Mark.NOW) to "Waiting for $hub to certify the lock"
+            LockStep.LOCKED -> Mark.DONE to "At $hub. The provider gets them only once you claim its coin; " +
+                "else they come back to you after block ${p.lockExpiry}."
+            LockStep.PAID -> Mark.DONE to "Paid to the provider at $hub"
+            LockStep.REFUNDED -> Mark.FAILED to "Given back to you at $hub"
+            LockStep.ABANDONED -> Mark.FAILED to "Never made: your notes stayed yours"
+        }
+        Step(lockMark, "Notes locked for the provider", lockDetail)
+        Step(
+            mark = when {
+                coin != null -> Mark.DONE
+                !failed && p.lock == LockStep.LOCKED -> Mark.NOW
+                else -> Mark.NEXT
+            },
+            title = "The provider locked bitcoin for you",
+            detail = coin?.let { id ->
+                "Transaction ${short(id)}" + (p.timeout?.let { ", yours to claim before block $it" } ?: "")
+            },
+            action = view(coin),
+        )
+        Step(
+            mark = when {
+                coinConfirmed -> Mark.DONE
+                failed || coin == null -> Mark.NEXT
+                else -> Mark.NOW
+            },
+            title = "Its coin confirmed",
+            detail = when {
+                coinConfirmed -> coinHeight?.let { "In block $it" }
+                coinHeight != null -> "$coinDepth of ${p.depth} confirmations"
+                coin != null && !failed -> "Waiting for a block, about 10 minutes"
+                else -> null
+            },
+        )
+        Step(
+            mark = when {
+                claim != null -> Mark.DONE
+                failed || !coinConfirmed -> Mark.NEXT
+                else -> Mark.NOW
+            },
+            title = "Claimed, paying the address",
+            detail = when {
+                claim != null -> "Transaction ${short(claim)}, broadcast by this phone"
+                coinConfirmed && !failed -> "Claiming it"
+                else -> null
+            },
+            action = view(claim),
+        )
+        Step(
+            mark = when {
+                done -> Mark.DONE
+                failed || claim == null -> Mark.NEXT
+                else -> Mark.NOW
+            },
+            title = "Payment confirmed",
+            detail = when {
+                done -> claimHeight?.let { "In block $it" } ?: "Confirmed"
+                claimHeight != null -> "${depthOf(claimHeight, p.tip)} of ${p.depth} confirmations"
+                claim != null && !failed -> "Waiting for a block, about 10 minutes"
+                else -> null
+            },
+            last = true,
+        )
+    }
+    val by = p.claimBy
+    if (!done && !failed && claim == null && by != null) {
+        Text(
+            deadline(by, p.tip),
+            modifier = Modifier.padding(horizontal = 4.dp, vertical = 8.dp),
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+}
+
+/** The block to claim a payout's coin by, and the time left, roughly. */
+private fun deadline(by: UInt, tip: UInt): String {
+    val open = "This phone claims it while the app is open."
+    return when {
+        tip == 0u -> "To be claimed by block $by. $open"
+        tip > by -> "Block $by, the last to claim it at, has passed: the payout fails, " +
+            "and your notes come back once the lock expires."
+        else -> "To be claimed by block $by, in about ${duration((by - tip).toInt() * 10)}. $open"
+    }
+}
+
+/** `minutes`, roughly, in the largest unit that fits. */
+private fun duration(minutes: Int): String = when {
+    minutes < 60 -> "$minutes minutes"
+    minutes < 120 -> "1 hour"
+    minutes < 48 * 60 -> "${minutes / 60} hours"
+    else -> "${minutes / (24 * 60)} days"
 }
 
 /** Where a move stands: the confirmations its hub waits for, first. */
@@ -313,8 +469,16 @@ private fun Technical(activity: Activity, details: Details?, copy: (String, Stri
                 Fact("Address", details.address, copy)
                 Fact("Hub", details.hub, copy)
                 Fact("Provider", details.provider, copy)
-                details.coin?.let { Fact("Provider's coin", it, copy) }
-                details.claim?.let { Fact("Claim", it, copy) }
+                val p = details.progress
+                p.coin?.let { Fact("Provider's coin", it, copy) }
+                p.coinHeight?.let { Fact("Its block", "$it", copy) }
+                p.claim?.let { Fact("Claim", it, copy) }
+                p.claimHeight?.let { Fact("The claim's block", "$it", copy) }
+                p.lock?.let { Fact("Lock", it.name.lowercase(), copy) }
+                p.lockExpiry?.let { Fact("Lock refunded from block", "$it", copy) }
+                p.timeout?.let { Fact("Provider takes its coin back from block", "$it", copy) }
+                p.claimBy?.let { Fact("Claimed by block", "$it", copy) }
+                Fact("Confirmations needed", "${p.depth}", copy)
                 details.failure?.let { Fact("Failure", it, copy) }
             }
             is Details.Invoice -> {

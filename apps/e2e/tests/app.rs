@@ -374,6 +374,20 @@ async fn cashed_out(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
         back < held && back > held * 8 / 10,
         "{back} held once {held} cashed out and moved back in"
     );
+    // In the history, each of its steps done.
+    phone.tap("Sent on Bitcoin").await?;
+    phone.wait("Paid on Bitcoin", 60).await?;
+    for step in [
+        "Notes locked for the provider",
+        "The provider locked bitcoin for you",
+        "Its coin confirmed",
+        "Claimed, paying the address",
+    ] {
+        phone.wait(step, 10).await?;
+    }
+    phone.scroll_to("Payment confirmed").await?;
+    phone.back().await?;
+    phone.wait("Receive", 10).await?;
     Ok(())
 }
 
