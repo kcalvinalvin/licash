@@ -77,6 +77,16 @@ impl Isolation {
             .or_insert_with(IsolationToken::new)
     }
 
+    /// Streams to `host` on new circuits from now on: those it had failed
+    /// one, an exit timing out or failing to look its name up, say. Arti
+    /// would use them again, and a host's streams fail one after the other.
+    fn renew(&self, host: &str) {
+        let mut hosts = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(token) = hosts.get_mut(&host.to_ascii_lowercase()) {
+            *token = IsolationToken::new();
+        }
+    }
+
     /// Stream preferences keeping streams to `host` to their own circuits.
     fn prefs(&self, host: &str) -> StreamPrefs {
         let mut prefs = StreamPrefs::new();
@@ -131,9 +141,18 @@ impl Tor {
         max: usize,
         timeout: Duration,
     ) -> Result<(u16, Vec<u8>), String> {
-        tokio::time::timeout(timeout, self.exchange(url, body, max))
-            .await
-            .unwrap_or_else(|_| Err(format!("no answer over Tor in {} s", timeout.as_secs())))
+        let answer = tokio::time::timeout(timeout, self.exchange(url, body, max)).await;
+        answer.unwrap_or_else(|_| {
+            self.renew(url);
+            Err(format!("no answer over Tor in {} s", timeout.as_secs()))
+        })
+    }
+
+    /// Requests to the host of `url` on new circuits: one timed out.
+    fn renew(&self, url: &str) {
+        if let Ok((target, _)) = prepare(url, None) {
+            self.isolation.renew(&target.host);
+        }
     }
 
     /// [`Tor::request_for`], its stream to open within `open` once the
@@ -172,11 +191,18 @@ impl Tor {
         let opening = tokio::time::timeout_at(open_by, self.stream(target.clone()));
         let stream = opening
             .await
-            .map_err(|_| Failed::Unsent(format!("no stream over Tor in {} s", open.as_secs())))?
+            .map_err(|_| {
+                self.isolation.renew(&target.host);
+                Failed::Unsent(format!("no stream over Tor in {} s", open.as_secs()))
+            })?
             .map_err(Failed::Unsent)?;
+        let host = target.host.clone();
         tokio::time::timeout_at(deadline, self.kept.first(target, stream, request, max))
             .await
-            .map_err(|_| Failed::Sent(format!("no answer over Tor in {} s", timeout.as_secs())))?
+            .map_err(|_| {
+                self.isolation.renew(&host);
+                Failed::Sent(format!("no answer over Tor in {} s", timeout.as_secs()))
+            })?
             .map_err(Failed::Sent)
     }
 
@@ -217,7 +243,17 @@ impl Tor {
         self.stream(Target::of(&uri)?).await
     }
 
+    /// A stream to `target`, within TLS if it asks: on new circuits next
+    /// time, should this one fail.
     async fn stream(&self, target: Target) -> Result<Box<dyn Stream>, String> {
+        let opened = self.open(&target).await;
+        if opened.is_err() {
+            self.isolation.renew(&target.host);
+        }
+        opened
+    }
+
+    async fn open(&self, target: &Target) -> Result<Box<dyn Stream>, String> {
         let prefs = self.isolation.prefs(&target.host);
         let stream = self
             .client
@@ -227,7 +263,7 @@ impl Tor {
         if !target.tls {
             return Ok(Box::new(stream));
         }
-        let name = rustls::pki_types::ServerName::try_from(target.host)
+        let name = rustls::pki_types::ServerName::try_from(target.host.clone())
             .map_err(|e| format!("not a TLS name: {e}"))?;
         let stream = self
             .tls
@@ -264,7 +300,11 @@ impl socks::Exit for Tor {
 
     async fn resolve(&self, host: String) -> Result<Vec<std::net::IpAddr>, String> {
         let prefs = self.isolation.prefs(&host);
-        (self.client.resolve_with_prefs(&host, &prefs).await).map_err(|e| format!("over Tor: {e}"))
+        let resolved = self.client.resolve_with_prefs(&host, &prefs).await;
+        resolved.map_err(|e| {
+            self.isolation.renew(&host);
+            format!("over Tor: {e}")
+        })
     }
 }
 
@@ -551,6 +591,22 @@ mod tests {
         assert_ne!(isolation.of("relay.example"), hub);
         assert_ne!(isolation.of("relay.example"), isolation.of("other.example"));
         assert_eq!(isolation.of("hub.example"), hub);
+    }
+
+    #[test]
+    fn a_host_whose_stream_failed_goes_on_new_circuits() {
+        let isolation = Isolation::default();
+        let hub = isolation.of("hub.example");
+        let relay = isolation.of("relay.example");
+        isolation.renew("HUB.example");
+        let renewed = isolation.of("hub.example");
+        assert_ne!(renewed, hub);
+        assert_ne!(renewed, relay);
+        assert_eq!(isolation.of("hub.example"), renewed);
+        assert_eq!(isolation.of("relay.example"), relay);
+        // A host never reached keeps none: its first stream takes one.
+        isolation.renew("other.example");
+        assert_eq!(isolation.0.lock().unwrap().len(), 2);
     }
 
     #[test]
