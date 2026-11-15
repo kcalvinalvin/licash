@@ -43,6 +43,7 @@ mod contracts;
 mod moves;
 mod payouts;
 mod recoveries;
+mod refunds;
 
 pub use contacts::Contact;
 
@@ -77,6 +78,9 @@ pub struct Wallet {
     /// The swap providers announced, as last looked for
     /// ([`Wallet::refresh_providers`]): quotes ask them without looking.
     announced: Announcements,
+    /// The height each deposit to refund whose payment its hub never saw
+    /// was last looked for at, by its hash: in memory only.
+    refunds_looked: Mutex<HashMap<String, u32>>,
 }
 
 /// How long the hubs asked what URLs they name may take, all at once
@@ -227,6 +231,7 @@ impl Wallet {
             onions_asked: Mutex::new(None),
             socks: Mutex::new(None),
             announced: Announcements::default(),
+            refunds_looked: Mutex::new(HashMap::new()),
         };
         wallet.onions();
         Ok(Arc::new(wallet))
@@ -1246,6 +1251,7 @@ impl Wallet {
         self.learn_times(chain.as_ref())?;
         if scanned.next > scanned.height {
             self.broadcast_again(chain.as_ref());
+            self.refund_deposits(chain.as_ref(), scanned.height);
         }
         Ok(Scan {
             next: scanned.next,

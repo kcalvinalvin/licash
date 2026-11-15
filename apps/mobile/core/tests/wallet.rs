@@ -2004,3 +2004,72 @@ fn a_wallet_over_tor_takes_things_on_from_a_thread_of_the_apps() {
     wallet.resume().unwrap();
     wallet.resume().unwrap();
 }
+
+#[test]
+fn a_phone_takes_back_the_coins_of_a_move_whose_notes_it_never_claimed() {
+    let net = Net::new(false);
+    let light = Light::new(&net);
+    let alice = net.wallet("alice", net.height());
+    let code = alice.payment_code(None).unwrap();
+    net.mine(2, Vec::new());
+    let payment = net.pay_silent(&code.qr, 3_000, 1);
+    net.mine(1, vec![payment]);
+    net.mine(2, Vec::new());
+    assert_eq!(scan(&alice, &light), (1, 3_000));
+
+    // Moved, paid and confirmed at depth: the hub locks its notes, which
+    // the phone, asleep, never claims; the hub takes them back.
+    let moving = alice.move_to_licash(light.clone()).unwrap();
+    let sent = net.sent();
+    let funding = OutPoint::new(sent[0].compute_txid(), 0);
+    let pays = moving.amount + 100;
+    assert_eq!(sent[0].output[0].value.to_sat(), pays);
+    let timeout = match alice.details(Kind::Moved, moving.id.clone()).unwrap() {
+        Details::Moved { timeout, .. } => timeout.unwrap(),
+        other => panic!("{other:?}"),
+    };
+    net.confirm_sent();
+    net.round();
+    net.mine(1, Vec::new());
+    net.round();
+    for _ in 0..8 {
+        net.mine(1, Vec::new());
+        net.round();
+    }
+    alice.resume().unwrap();
+    assert_eq!(alice.balance().unwrap().notes, 0);
+    let refunds = |net: &Net| -> Vec<Transaction> {
+        let sent = net.sent().into_iter();
+        let spending = sent.filter(|t| t.input.iter().any(|i| i.previous_output == funding));
+        spending.collect()
+    };
+
+    // Not before its timeout.
+    while net.height() + 1 < timeout {
+        net.mine(1, Vec::new());
+    }
+    scan(&alice, &light);
+    assert!(refunds(&net).is_empty());
+
+    // From it on, taken back by itself, to an address of its own: found
+    // once confirmed, and shown with the move.
+    net.mine(1, Vec::new());
+    assert!(net.height() >= timeout);
+    scan(&alice, &light);
+    let refunded = refunds(&net);
+    assert_eq!(refunded.len(), 1, "{refunded:?}");
+    let refund = &refunded[0];
+    assert_eq!(refund.output.len(), 1);
+    let fee = pays - refund.output[0].value.to_sat();
+    assert!(fee > 0 && fee <= 2 * refund.vsize() as u64 + 2, "{fee}");
+    let txid = refund.compute_txid().to_string();
+    match alice.details(Kind::Moved, moving.id.clone()).unwrap() {
+        Details::Moved { refund, .. } => assert_eq!(refund, Some(txid.clone())),
+        other => panic!("{other:?}"),
+    }
+    // Handed the network again until found in a block.
+    net.confirm_sent();
+    assert_eq!(scan(&alice, &light), (1, refund.output[0].value.to_sat()));
+    scan(&alice, &light);
+    assert!(refunds(&net).is_empty());
+}

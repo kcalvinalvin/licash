@@ -109,7 +109,7 @@ impl Wallet {
             .contracting
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        self.opened(chain, &hub, ask)
+        self.opened(chain, &hub, ask, holder::Change::Bitcoin)
     }
 
     /// Open a contract at `hub`, a hub trusted that lets the wallet
@@ -117,8 +117,9 @@ impl Wallet {
     /// `blocks` from now, for at most `max_price`, paid from `coin`
     /// (`txid:vout`; by default the smallest large enough), as
     /// [`Wallet::open_contract`]. With `move_change`, its change moves
-    /// into Licash at the hub once its funding confirms
-    /// ([`Wallet::move_changes`]).
+    /// into Licash at the hub: its funding paying it in, when the hub
+    /// takes it so ([`holder::Change::Notes`]), else once its funding
+    /// confirms ([`Wallet::move_changes`]).
     #[allow(clippy::too_many_arguments)]
     pub fn open_chosen_contract(
         &self,
@@ -172,7 +173,11 @@ impl Wallet {
                 self.set_changes(&changes)?;
             }
         }
-        let opened = self.opened(chain, &hub, ask);
+        let change = match move_change {
+            true => holder::Change::Notes,
+            false => holder::Change::Bitcoin,
+        };
+        let opened = self.opened(chain, &hub, ask, change);
         if opened.is_err() && move_change {
             // None started: no change to move.
             let all = holder::list(&self.dir).map_err(failed)?;
@@ -268,11 +273,12 @@ impl Wallet {
         chain: Arc<dyn ChainSource>,
         hub: &str,
         ask: Ask,
+        change: holder::Change,
     ) -> Result<Contract, LicashError> {
         let chain = Chain(chain, self.wallet.network());
         let tip = self.runtime.block_on(licash_wallet::Blocks::height(&chain));
         self.saw(tip.map_err(|reason| LicashError::Unavailable { reason })?);
-        let opened = holder::open(&self.wallet, &chain, &self.dir, hub, ask);
+        let opened = holder::open_with(&self.wallet, &chain, &self.dir, hub, ask, change);
         let opened = self.runtime.block_on(opened).map_err(unavailable)?;
         // Protecting nothing before its funding is buried.
         Ok(self.contract(&opened, 0))
