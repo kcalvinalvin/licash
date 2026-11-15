@@ -4145,6 +4145,7 @@ dependencies = [
  "axum",
  "bitcoin",
  "hex",
+ "hex-literal",
  "licash",
  "licash-api",
  "licash-chain-client",

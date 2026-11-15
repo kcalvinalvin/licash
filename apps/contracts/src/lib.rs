@@ -11,15 +11,19 @@
 //! 202 until done: she sends the same message again, and gets the answer.
 //!
 //! Openings under the mock authority (anyone "proves" anything) are for
-//! regtest only, and say so: [`trust`].
+//! regtest only, and say so; on signet they are under the genuine programs
+//! kept in `r0/programs/`: [`trust`].
 //!
 //! The `node` feature, on by default, adds the hub's side and a node or an
 //! Esplora API as the holder's chain: a wallet bringing its own chain, as
 //! a phone's light client, goes without.
 
-use anyhow::{bail, ensure, Result};
+use anyhow::{bail, Result};
+use hex_literal::hex;
+use licash::base::Programs;
 use licash::spend::ChainProfile;
-use licash_contract::opening::{Bounds, Quote, Trust};
+use licash::statement::Journal;
+use licash_contract::opening::{Bounds, Quote, Statement, Trust};
 use licash_contract::wire::{Reader, Writer};
 
 pub mod holder;
@@ -148,14 +152,37 @@ impl Frame {
 }
 
 /// Who a party of an opening on `profile` trusts for proofs: the mock
-/// authority on regtest, labeled as such. Elsewhere the genuine programs
-/// are needed, which this build does not name yet.
+/// authority on regtest, labeled as such; on signet the genuine programs
+/// [`SIGNET`], under RISC Zero's shared Groth16 setup. None elsewhere yet.
+///
+/// Signet's are a trial: its headers are checked by their work alone, not
+/// by the network's signature of each block, so headers that fool the
+/// programs cost little to make.
 pub fn trust(profile: ChainProfile) -> Result<Trust> {
-    ensure!(
-        profile == ChainProfile::Core30DefaultRegtest,
-        "contracts on {profile} need the genuine proof programs, which this build does not name yet: mock proofs are for regtest only"
-    );
-    Ok(Trust::mock())
+    match profile {
+        ChainProfile::Core30DefaultRegtest => Ok(Trust::mock()),
+        ChainProfile::Core30Signet => Ok(Trust {
+            programs: SIGNET,
+            statement: signet_statement,
+            mock: false,
+        }),
+        _ => bail!("contracts are not opened on {profile} yet"),
+    }
+}
+
+/// The genuine programs contracts open under on signet, as built by
+/// `r0/build-guest.sh` with the toolchains it pins, from the commit
+/// `r0/README.md` names. Each is kept as `r0/programs/<image id>.bin`:
+/// the contracts opened under one are proven with it alone, so none named
+/// here is ever to go.
+pub const SIGNET: Programs = Programs {
+    holder: hex!("8be30cb2a683e896d251c7c363dddf794dc8ddb9d502922199cfa4d2f73b1390"),
+    counter: hex!("25051741d3d6438bc7f78ebf074a4b93f30363729564345bb800efd43ce21129"),
+};
+
+/// What a proof by [`SIGNET`]'s holder program answers.
+fn signet_statement(journal: &Journal) -> Statement {
+    Statement::genuine(&SIGNET.holder, journal)
 }
 
 /// The SQLite file at `path`, readable by its owner only, made so before
@@ -219,8 +246,36 @@ mod tests {
     #[test]
     fn mock_proofs_are_for_regtest_only() {
         assert!(trust(ChainProfile::Core30DefaultRegtest).unwrap().mock);
-        for profile in [ChainProfile::Core30Mainnet, ChainProfile::Core30Signet] {
+        // Signet's are genuine; none elsewhere yet.
+        let signet = trust(ChainProfile::Core30Signet).unwrap();
+        assert!(!signet.mock);
+        assert_eq!(signet.programs, SIGNET);
+        for profile in [ChainProfile::Core30Mainnet, ChainProfile::Mutinynet] {
             assert!(trust(profile).is_err());
         }
+    }
+
+    #[test]
+    fn the_programs_contracts_open_under_are_kept_by_image_id() {
+        let kept = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../r0/programs");
+        for id in [SIGNET.holder, SIGNET.counter] {
+            let program = kept.join(format!("{}.bin", hex::encode(id)));
+            let size = std::fs::metadata(&program).map_or(0, |m| m.len());
+            assert!(size > 0, "{} is not kept", program.display());
+        }
+    }
+
+    #[test]
+    fn signet_proofs_answer_risc_zeros_key_for_its_holder_program() {
+        let journal = Journal::from_bytes(&[5; 68]).unwrap();
+        let statement = (trust(ChainProfile::Core30Signet).unwrap().statement)(&journal);
+        let holders = Statement::genuine(&SIGNET.holder, &journal);
+        assert_eq!(statement.public, holders.public);
+        assert_eq!(statement.vk, holders.vk);
+        // Not the mock key, nor the counter program's inputs.
+        let mock = (Trust::mock().statement)(&journal);
+        assert_ne!(statement.vk, mock.vk);
+        let counters = Statement::genuine(&SIGNET.counter, &journal);
+        assert_ne!(statement.public, counters.public);
     }
 }

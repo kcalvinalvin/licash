@@ -44,6 +44,37 @@ the guest's workspace by where it is), and cargo's directory is left out
 of the paths it holds, so the same commit builds the same image id on any
 machine. One build at a time uses that directory.
 
+## Programs kept
+
+Contracts open under the programs `apps/contracts` names (`SIGNET` in
+`apps/contracts/src/lib.rs`), each kept in `r0/programs/` as
+`<image id>.bin`: a contract opened under one is proven with it alone, so
+none named there is ever removed. Each file's image id is its name:
+
+```sh
+for p in r0/programs/*.bin; do
+  cargo run -q --locked --release --manifest-path r0/host/Cargo.toml -- id "$p"
+done
+```
+
+| Network | Program | Image id | Built from |
+|---|---|---|---|
+| signet | `native-claim` (holder) | `8be30cb2a683e896d251c7c363dddf794dc8ddb9d502922199cfa4d2f73b1390` | c325330 |
+| signet | `native-counter` (counter) | `25051741d3d6438bc7f78ebf074a4b93f30363729564345bb800efd43ce21129` | c325330 |
+
+Signet's are a trial under RISC Zero's shared Groth16 setup, and the
+programs check signet's headers by their work alone, not by the network's
+signature of each block: headers that fool them cost little to make.
+
+Rebuilt, a program's file may differ from the one kept in its symbols'
+names, which its image id does not cover (they vary from build to build):
+compare image ids, not files.
+
+To name new ones, build them from a commit, rebuild them in another
+checkout to see the same image ids, copy each `r0/guests/<name>.bin` to
+`r0/programs/<image id>.bin`, and name them in `apps/contracts`, keeping
+the programs named before for the contracts opened under them.
+
 ## Execute and prove
 
 Export guest inputs from the regtest suite (see

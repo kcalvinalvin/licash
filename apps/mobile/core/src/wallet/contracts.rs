@@ -36,8 +36,7 @@ impl Wallet {
     pub fn contract_quote(&self, hub: String) -> Result<ContractQuote, LicashError> {
         let (hub, _) = self.contracting_hub(&hub)?;
         let trust = licash_contracts::trust(self.wallet.network());
-        let trust =
-            trust.map_err(|_| LicashError::invalid("contracts open on regtest only, for now"))?;
+        let trust = trust.map_err(|e| LicashError::invalid(format!("{e:#}")))?;
         let offer = holder::offer(&self.wallet, &hub);
         let offer = self.runtime.block_on(offer).map_err(unavailable)?;
         let price = offer.price();

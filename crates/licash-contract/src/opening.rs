@@ -73,6 +73,18 @@ pub struct Statement {
     pub public: Vec<Fr>,
 }
 
+impl Statement {
+    /// The statement of a genuine proof by the holder's program `holder`
+    /// (its image id): RISC Zero's Groth16 key, and the public inputs of
+    /// `journal` as that program commits it.
+    pub fn genuine(holder: &[u8; 32], journal: &Journal) -> Self {
+        Self {
+            vk: lichen_babe::risc0::verifying_key(),
+            public: lichen_babe::risc0::public_inputs(holder, &journal.to_bytes()).to_vec(),
+        }
+    }
+}
+
 /// One assertion's setup as the holder keeps it: her adaptor
 /// pre-signatures of its challenge, her kept instances by index (1-based,
 /// as the shares), and the opened instances' shares, checked.
