@@ -33,6 +33,7 @@ use licash_contract::opening::{Context, Hub, Trust};
 
 use crate::{Frame, Offer, INSTANCE, MAX_BODY, OPEN, QUOTE, STEP};
 use store::Store;
+use terms::Timing;
 
 /// The most openings short of the hub's signatures at once.
 pub const MAX_UNDER_WAY: usize = 16;
@@ -50,6 +51,7 @@ pub struct Openings {
     source: Source,
     keyset: Keyset,
     trust: Trust,
+    timing: Timing,
     /// The openings a task is stepping.
     busy: Mutex<HashSet<[u8; 32]>>,
     /// Held from funding an F to locking its coins: no two take the same.
@@ -165,11 +167,13 @@ fn peek(state: &[u8]) -> Option<Terms> {
 
 impl Openings {
     /// The openings in `data`, opened under `keyset` and funded by the
-    /// wallet of the node `source` names (its JSON-RPC). Refused off
-    /// regtest until the genuine proof programs are named: [`crate::trust`].
+    /// wallet of the node `source` names (its JSON-RPC). Refused on a
+    /// network the hub has no terms or programs for: [`Timing::of`],
+    /// [`crate::trust`].
     pub async fn new(data: &Path, source: Source, keyset: Keyset) -> Result<Arc<Self>> {
         let profile: ChainProfile = source.profile().await?;
         let trust = crate::trust(profile)?;
+        let timing = Timing::of(profile)?;
         // Not fatal: a node may load its wallet after the hub starts. F
         // goes unfunded, and its openings given up, until it does.
         let wallet = source.rpc::<serde_json::Value>("getwalletinfo", serde_json::json!([]));
@@ -182,6 +186,7 @@ impl Openings {
             source,
             keyset,
             trust,
+            timing,
             busy: Mutex::new(HashSet::new()),
             funding: tokio::sync::Mutex::new(()),
         });
@@ -196,8 +201,8 @@ impl Openings {
         let tip = self.source.tip().await?.height;
         let checkpoint = self.source.checkpoint(tip).await?;
         Ok(Offer {
-            quote: terms::quote(self.keyset.clone(), checkpoint),
-            bounds: terms::BOUNDS,
+            quote: self.timing.quote(self.keyset.clone(), checkpoint),
+            bounds: self.timing.bounds,
         })
     }
 
@@ -206,7 +211,7 @@ impl Openings {
         licash_api::Contracts {
             cap: terms::CAP,
             price: terms::RESERVE_ALICE + terms::OPENING_FEE,
-            blocks: terms::BOUNDS.lock,
+            blocks: self.timing.bounds.lock,
             mock: self.trust.mock,
         }
     }

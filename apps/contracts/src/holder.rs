@@ -13,7 +13,7 @@ use std::path::Path;
 
 use anyhow::{anyhow, ensure, Context as _, Result};
 use bitcoin::OutPoint;
-use licash_contract::opening::{Holder, Start};
+use licash_contract::opening::{Holder, Quote, Start};
 use licash_contract::wire::Wanted;
 use licash_wallet::{SilentCoin, Transport, Wallet};
 
@@ -27,9 +27,26 @@ use store::{New, Store};
 
 use crate::{Offer, QUOTE};
 
-/// Blocks from a recovery's assertion deadline to the close: for the
-/// hub's challenge and her answer to it, as the regtest fixture has.
+/// Blocks from a recovery's assertion deadline to the close, at least:
+/// as the regtest fixture has.
 pub const AFTER_ASSERT: u32 = 140;
+
+/// Blocks to spare beyond the windows after an assertion, for what is
+/// published in them to confirm.
+const SPARE: u32 = 12;
+
+/// Blocks from a recovery's assertion deadline to the close on `quote`:
+/// the hub's challenge, her answer to it and the delays on what she is
+/// paid after, with [`SPARE`] blocks to confirm in; [`AFTER_ASSERT`] at
+/// least.
+pub fn after_assert(quote: &Quote) -> u32 {
+    let g = &quote.graph;
+    let windows: u32 = [g.hub_challenge, g.holder_answer, g.delta, g.delta_prime]
+        .map(u32::from)
+        .iter()
+        .sum();
+    (windows + SPARE).max(AFTER_ASSERT)
+}
 
 /// The blocks she has to respond to the hub's request, at least.
 pub const RESPONSE_WINDOW: u16 = 6;
@@ -240,7 +257,7 @@ fn wanted(offer: &Offer, tip: u32, blocks: u32) -> Result<Wanted> {
     let latest = offer.quote.chain.checkpoint.height() + bounds.lock;
     let close_height = (tip + blocks).min(latest);
     let assert_height = close_height
-        .checked_sub(AFTER_ASSERT)
+        .checked_sub(after_assert(&offer.quote))
         .filter(|a| *a > tip)
         .with_context(|| format!("{blocks} blocks leave no time to recover in"))?;
     Ok(Wanted {
@@ -363,6 +380,58 @@ mod tests {
         }
         async fn broadcast(&self, _: &Transaction) -> Result<(), String> {
             Err("not asked".into())
+        }
+    }
+
+    #[cfg(feature = "node")]
+    #[test]
+    fn her_deadlines_leave_each_window_whole_on_the_hubs_terms() {
+        use crate::hub::terms::{Timing, LOCK};
+        let keyset = licash::note::IssuerKeys::from_seed(&[1; 32], 0, 4).unwrap();
+        let keyset = keyset.keyset().unwrap();
+        let regtest = ChainProfile::Core30DefaultRegtest;
+        let signet = ChainProfile::Core30Signet;
+        for profile in [regtest, signet] {
+            let timing = Timing::of(profile).unwrap();
+            let checkpoint = Checkpoint::genesis(profile).unwrap();
+            let tip = checkpoint.height();
+            let offer = Offer {
+                quote: timing.quote(keyset.clone(), checkpoint),
+                bounds: timing.bounds,
+            };
+            offer.quote.check(profile).unwrap();
+            let wanted = wanted(&offer, tip, LOCK).unwrap();
+            offer.bounds.check(&wanted, tip).unwrap();
+            let (g, c) = (&offer.quote.graph, &offer.quote.chain);
+            let window = u32::from(wanted.response_window);
+            // After the assertion deadline: the hub's challenge, her answer
+            // and the delays on what she is paid, whole.
+            let after = [g.hub_challenge, g.holder_answer, g.delta, g.delta_prime];
+            let after: u32 = after.map(u32::from).iter().sum();
+            let gap = wanted.close_height - wanted.assert_height;
+            assert!(gap > after, "{profile}: {gap} blocks after asserting");
+            // Before it, Base's funding gate: F and a request deep enough,
+            // her outputs' delay and the window to respond.
+            let delay = u32::from(g.to_self_delay);
+            let gate = c.funding_depth + delay + c.request_depth + window + g.deadline_margin;
+            assert!(wanted.assert_height - tip >= gate, "{profile}");
+            // A publication confirmed deep enough within the window.
+            assert!(
+                window > c.publication_depth + c.observation_margin,
+                "{profile}"
+            );
+        }
+        // Regtest's as before; signet's 180 blocks after asserting, of
+        // its 1 000, and 12 to respond.
+        let gap = |profile| {
+            let timing = Timing::of(profile).unwrap();
+            let quote = timing.quote(keyset.clone(), Checkpoint::genesis(profile).unwrap());
+            (after_assert(&quote), timing.bounds.response_window)
+        };
+        assert_eq!(gap(regtest), (AFTER_ASSERT, 2));
+        assert_eq!(gap(signet), (180, 12));
+        for profile in [ChainProfile::Core30Mainnet, ChainProfile::Mutinynet] {
+            assert!(Timing::of(profile).is_err());
         }
     }
 

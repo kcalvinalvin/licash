@@ -9,7 +9,7 @@ use licash_contract::opening::{Context, Hub, Input, Out, Quote};
 use licash_contract::wire::{self, Envelope, Kind, Writer};
 use sha2::{Digest, Sha256};
 
-use super::{terms, Answer, Openings, Refused, MAX_UNDER_WAY, WAIT};
+use super::{Answer, Openings, Refused, MAX_UNDER_WAY, WAIT};
 use crate::{Frame, Opening};
 
 /// How deep the block a quote is checkpointed at may be.
@@ -109,7 +109,7 @@ impl Openings {
             )));
         }
         let checkpoint = self.source.checkpoint(height).await;
-        let ours = terms::quote(
+        let ours = self.timing.quote(
             self.keyset.clone(),
             checkpoint.map_err(Refused::unavailable)?,
         );
@@ -172,7 +172,7 @@ impl Openings {
                 if self.store().under_way().map_err(Refused::unavailable)? >= MAX_UNDER_WAY {
                     return Err(Refused::unavailable("too many openings under way: later"));
                 }
-                let hub = Hub::new(*quote, terms::BOUNDS);
+                let hub = Hub::new(*quote, self.timing.bounds);
                 let (hub, out) = stepped(hub, Input::Message(message), ctx).await?;
                 let state = hub.to_bytes().map_err(Refused::unavailable)?;
                 let inserted = self

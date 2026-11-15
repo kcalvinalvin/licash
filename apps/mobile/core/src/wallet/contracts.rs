@@ -48,7 +48,7 @@ impl Wallet {
             price,
             cap: u64::from(offer.quote.cap),
             blocks,
-            protects_for: blocks.saturating_sub(holder::AFTER_ASSERT),
+            protects_for: blocks.saturating_sub(holder::after_assert(&offer.quote)),
             mock: trust.mock,
             coin: coin.map(|c| c.value),
             download: DOWNLOAD,
