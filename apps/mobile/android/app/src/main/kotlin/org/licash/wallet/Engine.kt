@@ -449,7 +449,7 @@ class Engine(context: Context) {
         try {
             for (moving in locked { it.moveChanges(chain) }) {
                 AppLog.info("moving ${moving.amount} sat of a contract's change into Licash")
-                notices.tryEmit(Event("Moving ${sat(moving.amount)}, a contract's change, into Licash"))
+                notices.tryEmit(Event("Adding ${sat(moving.amount)} of change to your balance"))
             }
         } catch (e: LicashException) {
             AppLog.warn("moving a contract's change into Licash", e)
@@ -459,7 +459,7 @@ class Engine(context: Context) {
         try {
             val moving = locked { it.moveToLicash(chain) }
             AppLog.info("moving ${moving.amount} sat into Licash")
-            notices.tryEmit(Event("Moving ${sat(moving.amount)} into Licash"))
+            notices.tryEmit(Event("Adding ${sat(moving.amount)} to your balance"))
         } catch (_: LicashException.Insufficient) {
             // Too little for the hub yet: more payments may come.
         }
@@ -796,10 +796,10 @@ class Engine(context: Context) {
                     }
                 }
                 AppLog.info("contract ${opened.id} signed at $hub, funded by ${opened.funding}")
-                notices.tryEmit(Event("Contract signed at ${host(hub)}: protecting once its funding confirms"))
+                notices.tryEmit(Event("Protection set up at ${host(hub)}: on once confirmed"))
             } catch (e: Exception) {
                 AppLog.warn("opening a contract at $hub", e)
-                notices.tryEmit(Event("No contract opened. ${explain(e)}"))
+                notices.tryEmit(Event("Protection not set up. ${explain(e)}"))
             } finally {
                 state.update { it.copy(opening = null) }
                 refresh()

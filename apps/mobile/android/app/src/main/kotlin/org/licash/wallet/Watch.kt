@@ -90,9 +90,9 @@ internal fun news(activity: Activity): String? {
             Kind.LIGHTNING -> "Paid $amount over Lightning"
             Kind.PAYOUT -> "Sent $amount on Bitcoin"
             Kind.SWAP -> "Moved $amount between hubs"
-            Kind.MOVED -> "$amount moved into Licash"
+            Kind.MOVED -> "$amount added to your balance"
             Kind.INVOICE -> "Received $amount over Lightning"
-            Kind.CONTRACT -> "Contract opened: protecting"
+            Kind.CONTRACT -> "Protection on"
             Kind.RECEIVED, Kind.ONCHAIN -> null
         }
         State.FAILED -> when (activity.kind) {
@@ -100,9 +100,9 @@ internal fun news(activity: Activity): String? {
             Kind.LIGHTNING -> "Paying $amount over Lightning"
             Kind.PAYOUT -> "Sending $amount on Bitcoin"
             Kind.SWAP -> "Moving $amount between hubs"
-            Kind.MOVED -> "Moving $amount into Licash"
+            Kind.MOVED -> "Adding $amount to your balance"
             Kind.INVOICE -> "Receiving $amount over Lightning"
-            Kind.CONTRACT -> "Opening a contract"
+            Kind.CONTRACT -> "Setting up protection"
             Kind.RECEIVED, Kind.ONCHAIN -> null
         }?.let { "$it failed: open Licash for why" }
     }
