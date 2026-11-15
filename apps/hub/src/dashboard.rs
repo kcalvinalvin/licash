@@ -548,7 +548,7 @@ mod tests {
                 (
                     now - 200,
                     Tone::Normal,
-                    "lock | locked | 50 | awaiting its preimage, expires at 950"
+                    "lock | locked | 50 | awaiting its preimage, expires at block 950"
                 ),
                 (
                     now - 250,
@@ -560,7 +560,7 @@ mod tests {
                 (
                     now - 400,
                     Tone::Normal,
-                    "lightning out | locked | 22 | to pay out, expires at 900"
+                    "lightning out | locked | 22 | to pay out, expires at block 900"
                 ),
                 (
                     now - 450,

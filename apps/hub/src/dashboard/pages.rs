@@ -617,7 +617,7 @@ fn recent(r: &Records) -> Table {
                     DEPOSIT => "confirmed",
                     _ => "awaiting its preimage",
                 };
-                let detail = format!("{what}, expires at {expiry}");
+                let detail = format!("{what}, expires at block {expiry}");
                 push(at, Tone::Normal, kind, "locked", Some(amount), detail);
             }
             Some(Notice::Settled {
@@ -652,16 +652,19 @@ fn recent(r: &Records) -> Table {
                 refunded,
             }) => {
                 let (tone, detail) = match refunded {
-                    false => (Tone::Normal, format!("preimage on Bitcoin at {height}")),
+                    false => (
+                        Tone::Normal,
+                        format!("preimage on Bitcoin at block {height}"),
+                    ),
                     true => (
                         Tone::Bad,
-                        format!("after its refund, at {height}: both branches owed"),
+                        format!("after its refund, at block {height}: both branches owed"),
                     ),
                 };
                 push(at, tone, kind(&proposal), "activated", None, detail);
             }
             Some(Notice::Reorg { height }) => {
-                let detail = format!("at {height}: the scan stopped");
+                let detail = format!("at block {height}: the scan stopped");
                 push(at, Tone::Bad, "hub", "reorganized", None, detail);
             }
             Some(Notice::DoubleSpend { proposal, .. }) => {
@@ -801,7 +804,7 @@ fn alerts(r: &Records) -> Table {
             ),
             Some(Notice::Reorg { height }) => (
                 Tone::Bad,
-                format!("reorganized at {height}: the scan stopped"),
+                format!("reorganized at block {height}: the scan stopped"),
             ),
             Some(Notice::Activated {
                 height,
@@ -809,7 +812,7 @@ fn alerts(r: &Records) -> Table {
                 ..
             }) => (
                 Tone::Bad,
-                format!("a refunded lock activated at {height}: both branches owed"),
+                format!("a refunded lock activated at block {height}: both branches owed"),
             ),
             Some(Notice::Started { .. }) => (Tone::Muted, "started".to_owned()),
             _ => continue,
