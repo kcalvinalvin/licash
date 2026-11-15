@@ -10,7 +10,20 @@ licash-hub --data ./hub run --listen 0.0.0.0:8338 --chain esplora+https://esplor
   --notify tgram://BOT_TOKEN/CHAT_ID
 licash-hub --data ./hub status
 licash-hub --data ./hub events --follow
+licash-hub --data ./hub dashboard
 ```
+
+`dashboard` draws the hub's dashboard in the terminal: payments by kind
+(transfers, locks, Lightning out and in, deposits), their failures by
+reason and those under way, the fees earned, the notes outstanding and the
+collateral of the contracts that protect them, the notes' anonymity sets,
+and health checks, among them whether the hub at `--url` answers
+`/health`. It reads the files in `<data>` only, beside the running hub or
+without it, and never writes or migrates them. History comes from the
+records themselves, over a range of 24 hours to all of it (30 days at
+first, or `--range`) against the range before; what no record dates, such
+as the collateral, is as it stands now. Arrows or digits turn the pages,
+`[` and `]` the range; `--json` prints the range's view once instead.
 
 `--network` (`bitcoin` by default, or `regtest`, `signet`, `mutinynet`) is
 the chain `--chain` must follow: the hub scans no other. The signets are for

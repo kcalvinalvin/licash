@@ -37,8 +37,9 @@ research implementation; it has not had a security review.
   (`apps/wallet-cli`), recovery contracts opened between them over HTTP
   (`apps/contracts`), their HTTP transport (`apps/transport`), Tor
   through Arti (`apps/tor`), chain sources (`apps/chain-client`), operator
-  notifications (`apps/notify`), announcements on Nostr (`apps/nostr`),
-  end-to-end tests of hubs, their Lightning gateways, swap providers and
+  notifications (`apps/notify`), operators' dashboards in the terminal
+  (`apps/dashboard`), announcements on Nostr (`apps/nostr`), end-to-end
+  tests of hubs, their Lightning gateways, swap providers and
   wallets on a regtest ecosystem in Docker (`apps/e2e`), and the mobile
   apps' wallet core (`apps/mobile/core`), resumable zkVM prover
   (`apps/mobile/prover`), light client in Go (`apps/mobile/chain`) and
