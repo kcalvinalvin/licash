@@ -30,6 +30,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalClipboard
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -98,7 +99,6 @@ fun Send(
     val clipboard = LocalClipboard.current
     // Opened with a link: no camera to start.
     var step by remember { mutableStateOf<Step>(if (link == null) Step.Looking else Step.Busy) }
-    var asking by remember { mutableStateOf(false) }
     var empty by remember { mutableStateOf(false) }
     // This wallet's own address, once cashing out to it.
     var own by remember { mutableStateOf(ownAddress) }
@@ -281,7 +281,7 @@ fun Send(
                         )
                     }
                 }
-                is Step.Paying -> Paying(ui, s, asking, { asking = it }) { amount -> plan(s, amount) }
+                is Step.Paying -> Paying(ui, s) { amount -> plan(s, amount) }
                 Step.Busy -> Middle("One moment…")
                 Step.Planning -> Middle("Finding the way to pay…")
                 is Step.Review -> Review(s.quote, s.through, { pay(s.code, s.amount) }) {
@@ -335,7 +335,7 @@ fun Send(
                 )
                 Step.Quoting -> Middle("Finding a provider to pay it on Bitcoin…")
                 is Step.Invoice -> Invoice(s.quote) { payInvoice(s.text, s.quote.hub) }
-                is Step.Address -> ToAddress(s.address, asking, { asking = it }) { amount -> quote(s.address, amount) }
+                is Step.Address -> ToAddress(s.address) { amount -> quote(s.address, amount) }
                 is Step.Payout -> Payout(s.quote, s.quote.address == own, { payOut(s.quote, s.asked) }) {
                     if (ui.developer) {
                         Providers {
@@ -373,34 +373,33 @@ fun Send(
     }
 }
 
+/**
+ * A code to pay in notes: the amount it asks, or one typed straight in.
+ * The keyboard's action only hides it: the button pays.
+ */
 @Composable
-private fun Paying(ui: Ui, s: Step.Paying, asking: Boolean, ask: (Boolean) -> Unit, pay: (ULong?) -> Unit) {
+private fun Paying(ui: Ui, s: Step.Paying, pay: (ULong?) -> Unit) {
     var amount by remember { mutableStateOf(s.asked?.toLong()) }
     // The most a hub would charge: the code may name several.
     val fee = amount?.takeIf { !s.visit }
         ?.let { a -> ui.hubs.maxOfOrNull { it.feeBase + it.feePpm * a.toULong() / 1_000_000uL } }
     Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
         Spacer(Modifier.height(48.dp))
-        Text(amount?.let { sat(it.toULong()) } ?: "How much?", style = Figures)
-        fee?.let {
-            Text(
-                if (it == 0uL) "No fee" else "Fee up to ${sat(it)}",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-        }
-        Spacer(Modifier.height(32.dp))
         if (s.asked == null) {
-            OutlinedButton(onClick = { ask(true) }, modifier = Modifier.fillMaxWidth().height(56.dp)) {
-                Text(if (amount == null) "Enter amount" else "Change amount")
-            }
-            Spacer(Modifier.height(12.dp))
+            AmountField(amount, { amount = it })
+        } else {
+            Text(sat(s.asked), style = Figures)
         }
+        Text(
+            fee?.let { if (it == 0uL) "No fee" else "Fee up to ${sat(it)}" } ?: "",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Spacer(Modifier.height(32.dp))
         BigButton("Pay", Modifier.fillMaxWidth(), enabled = amount != null) {
             pay(if (s.asked == null) amount?.toULong() else null)
         }
     }
-    if (asking) AmountDialog(amount, onDone = { amount = it; ask(false) }, onCancel = { ask(false) })
 }
 
 /**
@@ -527,32 +526,30 @@ private fun Invoice(quote: InvoiceQuote, pay: () -> Unit) {
     }
 }
 
-/** A Bitcoin address to pay: how much, or all. */
+/**
+ * A Bitcoin address to pay: how much, typed straight in, or all. The
+ * keyboard's action continues to what it costs, to confirm.
+ */
 @Composable
-private fun ToAddress(address: String, asking: Boolean, ask: (Boolean) -> Unit, quote: (ULong?) -> Unit) {
+private fun ToAddress(address: String, quote: (ULong?) -> Unit) {
     var amount by remember { mutableStateOf<Long?>(null) }
     Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
         Spacer(Modifier.height(48.dp))
-        Text(amount?.let { sat(it.toULong()) } ?: "How much?", style = Figures)
+        AmountField(amount, { amount = it }, action = ImeAction.Go) { amount?.let { quote(it.toULong()) } }
         Text(
             "To ${shortAddress(address)}, on Bitcoin",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
         Spacer(Modifier.height(32.dp))
-        OutlinedButton(onClick = { ask(true) }, modifier = Modifier.fillMaxWidth().height(56.dp)) {
-            Text(if (amount == null) "Enter amount" else "Change amount")
+        BigButton("Continue", Modifier.fillMaxWidth(), enabled = amount != null) {
+            amount?.let { quote(it.toULong()) }
         }
         Spacer(Modifier.height(12.dp))
         OutlinedButton(onClick = { quote(null) }, modifier = Modifier.fillMaxWidth().height(56.dp)) {
             Text("Send all")
         }
-        Spacer(Modifier.height(12.dp))
-        BigButton("Continue", Modifier.fillMaxWidth(), enabled = amount != null) {
-            amount?.let { quote(it.toULong()) }
-        }
     }
-    if (asking) AmountDialog(amount, onDone = { amount = it; ask(false) }, onCancel = { ask(false) })
 }
 
 /** A payout on Bitcoin to confirm: what the address gets, and all it costs on top. */

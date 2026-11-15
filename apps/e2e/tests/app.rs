@@ -181,10 +181,16 @@ async fn used(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     bob.add_hub(hub).await?;
     let bobs = bob.payment_code(&[hub.to_owned()], false)?;
     phone.link(&bobs.to_string()).await?;
-    phone.tap("Enter amount").await?;
-    phone.tap_id("amount").await?;
+    // Typed straight in: the field has the focus, untouched.
+    until("the amount to type in", 10, || async {
+        let views = phone.views().await?;
+        Ok(views
+            .iter()
+            .any(|v| v.id == "amount" && v.focused)
+            .then_some(()))
+    })
+    .await?;
     phone.type_text("5000").await?;
-    phone.tap("Done").await?;
     phone.wait_any(&["Fee up to", "No fee"], 10).await?;
     phone.tap("Pay").await?;
     phone.wait("Sent", 60).await?;

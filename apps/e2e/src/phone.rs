@@ -18,11 +18,13 @@ pub struct Phone {
     apk: PathBuf,
 }
 
-/// A view on screen: its text or description, its test tag, and where.
+/// A view on screen: its text or description, its test tag, whether it
+/// has the focus (a field typed in), and where.
 #[derive(Clone, Debug)]
 pub struct View {
     pub text: String,
     pub id: String,
+    pub focused: bool,
     bounds: [i32; 4],
 }
 
@@ -116,7 +118,13 @@ fn views_in(xml: &str) -> Vec<View> {
         let Ok(bounds) = <[i32; 4]>::try_from(numbers) else {
             continue;
         };
-        views.push(View { text, id, bounds });
+        let focused = attribute(node, "focused") == "true";
+        views.push(View {
+            text,
+            id,
+            focused,
+            bounds,
+        });
     }
     views
 }
@@ -450,7 +458,7 @@ mod tests {
 
     #[test]
     fn views_are_read_from_the_layout_dumped() {
-        let xml = r#"<?xml version='1.0' encoding='UTF-8' standalone='yes' ?><hierarchy rotation="0"><node index="0" text="" resource-id="" bounds="[0,0][1080,2400]"><node index="1" text="48&#8201;778" resource-id="balance" content-desc="" bounds="[63,380][501,552]" /><node text="" content-desc="QR code" resource-id="" bounds="[173,385][908,1120]" /><node text="A &amp; B &quot;x&quot;" resource-id="" bounds="[1,2][3,4]" /></node></hierarchy>"#;
+        let xml = r#"<?xml version='1.0' encoding='UTF-8' standalone='yes' ?><hierarchy rotation="0"><node index="0" text="" resource-id="" bounds="[0,0][1080,2400]"><node index="1" text="48&#8201;778" resource-id="balance" content-desc="" focused="false" bounds="[63,380][501,552]" /><node text="" content-desc="QR code" resource-id="" bounds="[173,385][908,1120]" /><node text="A &amp; B &quot;x&quot;" resource-id="" focused="true" bounds="[1,2][3,4]" /></node></hierarchy>"#;
         let views = views_in(xml);
         assert_eq!(views.len(), 3);
         assert_eq!(
@@ -460,6 +468,10 @@ mod tests {
         assert_eq!(views[0].center(), (282, 466));
         assert_eq!(views[1].text, "QR code");
         assert_eq!(views[2].text, "A & B \"x\"");
+        assert_eq!(
+            views.iter().map(|v| v.focused).collect::<Vec<_>>(),
+            [false, false, true]
+        );
     }
 
     #[test]
