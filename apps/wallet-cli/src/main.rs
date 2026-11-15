@@ -24,6 +24,7 @@ use rand_core::{OsRng, RngCore};
 use serde_json::json;
 use tracing_subscriber::EnvFilter;
 
+mod contract;
 mod onchain;
 mod payout;
 
@@ -333,6 +334,31 @@ enum Command {
         chain: Option<String>,
         #[command(subcommand)]
         command: onchain::Onchain,
+    },
+    /// Open a recovery contract at HUB, a hub the wallet trusts: its
+    /// collateral protects the wallet's notes there, up to its cap, until
+    /// the contract's deadline. Paid from a coin of the wallet's on
+    /// Bitcoin, its change back to it. Regtest only for now, under the mock
+    /// authority: such a contract protects nothing.
+    OpenContract {
+        hub: String,
+        /// Blocks from now to its close [default: as many as the hub
+        /// allows].
+        #[arg(long)]
+        blocks: Option<u32>,
+        /// The most to pay to open it, in sat [default: the price the
+        /// hub's info said].
+        #[arg(long)]
+        max_price: Option<u64>,
+        /// The chain to check the hub's quote on and broadcast to.
+        #[arg(long, env = "LICASH_WALLET_CHAIN")]
+        chain: Option<String>,
+    },
+    /// The wallet's contracts, the newest first. With --chain, those
+    /// under way carried on, and where each one's funding stands.
+    Contracts {
+        #[arg(long, env = "LICASH_WALLET_CHAIN")]
+        chain: Option<String>,
     },
     /// Hubs announced on Nostr relays, at the URLs that answer as the hub
     /// that announced them. Needs no wallet.
@@ -835,6 +861,18 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             return payout::pay(&wallet, &chain, route, amount, (max_fee, fee_rate), json).await;
         }
         Command::Payouts { chain } => return payout::list(&wallet, chain.as_deref(), json).await,
+        Command::OpenContract {
+            hub,
+            blocks,
+            max_price,
+            chain,
+        } => {
+            let ask = (blocks, max_price);
+            return contract::open(&wallet, &path, chain.as_deref(), &hub, ask, json).await;
+        }
+        Command::Contracts { chain } => {
+            return contract::list(&wallet, &path, chain.as_deref(), json).await;
+        }
         Command::Swaps => {
             let swaps = wallet.swaps()?;
             let lines = swaps.iter().map(swap_line).collect::<Vec<_>>();

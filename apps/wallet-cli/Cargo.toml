@@ -14,6 +14,7 @@ licash.workspace = true
 licash-api.workspace = true
 licash-wallet.workspace = true
 licash-chain-client.workspace = true
+licash-contracts = { path = "../contracts" }
 bitcoin = { version = "=0.32.102", default-features = false, features = ["std"] }
 licash-nostr = { workspace = true, features = ["tor", "wallet"] }
 licash-tor.workspace = true
