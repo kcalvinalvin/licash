@@ -12,9 +12,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.HorizontalDivider
@@ -56,49 +54,48 @@ fun Home(
     balance: () -> Unit,
     open: (Activity) -> Unit,
 ) {
-    // Scrolled as a whole only while no list of its own scrolls inside.
-    val listed = ui.history.isNotEmpty() || ui.incoming.isNotEmpty()
-    val scroll = rememberScrollState()
-    Column(
-        Modifier.fillMaxSize().then(if (listed) Modifier else Modifier.verticalScroll(scroll))
-            .padding(horizontal = 24.dp),
-    ) {
-        Row(Modifier.fillMaxWidth().padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-            Wordmark()
-            Spacer(Modifier.width(10.dp))
-            NetworkChip(ui.network)
-            Spacer(Modifier.weight(1f))
-            IconButton(onClick = settings) { Icon(Icons.Default.Settings, contentDescription = "Settings") }
-        }
-        Spacer(Modifier.height(40.dp))
-        Total(ui, balance)
-        Spacer(Modifier.height(32.dp))
-        if (ui.hubs.isEmpty()) {
-            ConnectHub(engine)
-        } else {
-            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                BigButton("Receive", Modifier.weight(1f), onClick = receive)
-                BigButton("Send", Modifier.weight(1f), onClick = send)
+    // One list, the balance and buttons atop the history: all of it
+    // scrolls on short screens and with large fonts.
+    LazyColumn(Modifier.fillMaxSize().padding(horizontal = 24.dp)) {
+        item(key = "top") {
+            Column {
+                Row(Modifier.fillMaxWidth().padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Wordmark()
+                    Spacer(Modifier.width(10.dp))
+                    NetworkChip(ui.network)
+                    Spacer(Modifier.weight(1f))
+                    IconButton(onClick = settings) { Icon(Icons.Default.Settings, contentDescription = "Settings") }
+                }
+                Spacer(Modifier.height(40.dp))
+                Total(ui, balance)
+                Spacer(Modifier.height(32.dp))
+                if (ui.hubs.isEmpty()) {
+                    ConnectHub(engine)
+                } else {
+                    Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                        BigButton("Receive", Modifier.weight(1f), onClick = receive)
+                        BigButton("Send", Modifier.weight(1f), onClick = send)
+                    }
+                }
+                Spacer(Modifier.height(28.dp))
             }
         }
-        Spacer(Modifier.height(28.dp))
-        if (!listed) {
-            Text(
-                "Nothing yet. What you receive and send shows here.",
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-        } else {
-            LazyColumn(Modifier.fillMaxSize()) {
-                items(ui.incoming, key = { "coming " + it.id }) { activity ->
-                    ActivityRow(activity, coming = true) { open(activity) }
-                    HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.4f))
-                }
-                items(ui.history, key = { it.id + it.kind }) { activity ->
-                    ActivityRow(activity) { open(activity) }
-                    HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.4f))
-                }
+        if (ui.history.isEmpty() && ui.incoming.isEmpty()) {
+            item(key = "none") {
+                Text(
+                    "Nothing yet. What you receive and send shows here.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
+        }
+        items(ui.incoming, key = { "coming " + it.id }) { activity ->
+            ActivityRow(activity, coming = true) { open(activity) }
+            HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.4f))
+        }
+        items(ui.history, key = { it.id + it.kind }) { activity ->
+            ActivityRow(activity) { open(activity) }
+            HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.4f))
         }
     }
 }
