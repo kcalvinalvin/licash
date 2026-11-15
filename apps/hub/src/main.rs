@@ -676,7 +676,7 @@ enum Command {
         #[arg(long, env = "LICASH_HUB_ALLOW_UNBACKED_LOCKS",
               value_parser = clap::builder::BoolishValueParser::new())]
         allow_unbacked_locks: bool,
-        /// Notify only of these kinds of event [default: all].
+        /// Notify only of these kinds of event [default: all but locked].
         #[arg(long, value_name = "KIND", env = "LICASH_HUB_NOTIFY_KINDS", value_delimiter = ',',
               value_parser = clap::builder::PossibleValuesParser::new(notify::KINDS))]
         notify_kinds: Vec<String>,

@@ -388,7 +388,7 @@ enum Command {
         onion: bool,
         #[command(flatten)]
         notify: Notify,
-        /// Notify only of these kinds of event [default: all].
+        /// Notify only of these kinds of event [default: all but accepted].
         #[arg(long, value_name = "KIND", env = "LICASH_SWAPS_NOTIFY_KINDS", value_delimiter = ',',
               value_parser = clap::builder::PossibleValuesParser::new(notify::KINDS))]
         notify_kinds: Vec<String>,

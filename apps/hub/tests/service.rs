@@ -559,6 +559,22 @@ async fn a_lock_is_paid_or_refunded_through_the_api() {
         ..Policy::default()
     });
     let keyset = &service.keyset;
+    // Its operator hears of the locks once they paid or refunded.
+    let (target, titles) = hook().await;
+    let dir = service.dir.path();
+    let notifier = Notifier::new(
+        &dir.join("hub.sqlite"),
+        "north",
+        vec![target],
+        &dir.join("notify.json"),
+        vec![],
+    )
+    .unwrap()
+    .timing(Timing {
+        poll: Duration::from_millis(10),
+        ..Timing::default()
+    });
+    let _notifying = tokio::spawn(notifier.run(service.hub.clone()));
     let info = service.info().await;
     assert_eq!(info.fees.lock, licash_api::Fee { base: 1, ppm: 0 });
     assert!(info.locks.is_none());
@@ -652,6 +668,11 @@ async fn a_lock_is_paid_or_refunded_through_the_api() {
     assert_eq!(
         (state.settled, state.preimage),
         (Some(Settled::Refund), None)
+    );
+    until("refunded", || titles.lock().unwrap().len() == 2).await;
+    assert_eq!(
+        *titles.lock().unwrap(),
+        ["north: Lock paid", "north: Lock refunded"]
     );
 }
 

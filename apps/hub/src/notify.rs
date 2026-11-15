@@ -8,7 +8,9 @@ use std::{
 };
 
 use licash_hub::{Event, Hub, Ledger, Notice, Settled};
-use licash_notify::{list, sat, short, Item, Message, Outbox, Priority, Relay, Target, Timing};
+use licash_notify::{
+    list, sat, sat_ppm, short, Item, Message, Outbox, Priority, Relay, Target, Timing,
+};
 
 /// The kinds of the hub's events.
 pub const KINDS: [&str; 9] = [
@@ -23,6 +25,9 @@ pub const KINDS: [&str; 9] = [
     "alert",
 ];
 
+/// The kinds of the events of locks under way, notified of only if asked.
+const UNDER_WAY: [&str; 1] = ["locked"];
+
 /// How long a stopping hub tries to say so.
 const STOP_WITHIN: Duration = Duration::from_secs(5);
 
@@ -35,8 +40,8 @@ pub struct Notifier {
 
 impl Notifier {
     /// Notifications of the hub at `db` to `targets`, keeping their places
-    /// in the file `cursors`, of the `kinds` of event (all if empty), under
-    /// titles headed by `name`. Open it before [`Hub::open`]: targets new to
+    /// in the file `cursors`, of the `kinds` of event (if empty, all but
+    /// those of locks under way), under titles headed by `name`. Open it before [`Hub::open`]: targets new to
     /// `cursors` then hear of the hub's start.
     pub fn new(
         db: &Path,
@@ -49,11 +54,11 @@ impl Notifier {
             ledger: Mutex::new(Ledger::open(db)?),
             name: name.to_owned(),
         });
-        let mut relay =
-            Relay::new(events.clone(), targets, cursors)?.new_targets_after(events.last()?);
-        if !kinds.is_empty() {
-            relay = relay.only(kinds);
-        }
+        let relay = Relay::new(events.clone(), targets, cursors)?.new_targets_after(events.last()?);
+        let relay = match kinds.is_empty() {
+            true => relay.except(UNDER_WAY.map(str::to_owned)),
+            false => relay.only(kinds),
+        };
         Ok(Self {
             events,
             relay,
@@ -155,7 +160,7 @@ pub fn message(event: &Event) -> Message {
             "Spend released",
             list(&[
                 ("Amount", sat(amount)),
-                ("Fee", sat(fee)),
+                ("Income", income(fee, amount)),
                 ("Proposal", short(&proposal)),
             ]),
         ),
@@ -213,7 +218,7 @@ pub fn message(event: &Event) -> Message {
                 title,
                 list(&[
                     ("Amount", sat(amount)),
-                    ("Fee", sat(fee)),
+                    ("Income", income(fee, amount)),
                     ("Proposal", short(&proposal)),
                 ]),
             )
@@ -283,6 +288,11 @@ pub fn message(event: &Event) -> Message {
             event.data.to_string(),
         ),
     }
+}
+
+/// The hub's `fee` of `amount`, and its rate.
+fn income(fee: u64, amount: u64) -> String {
+    sat_ppm(i64::try_from(fee).unwrap_or(i64::MAX), amount)
 }
 
 pub fn halted() -> Message {
@@ -363,7 +373,7 @@ mod tests {
         assert_eq!(messages[1].title, "Spend released");
         assert_eq!(
             messages[1].body,
-            "• Amount: 10 sat\n• Fee: 1 sat\n• Proposal: p1"
+            "• Amount: 10 sat\n• Income: 1 sat (100,000 ppm)\n• Proposal: p1"
         );
         assert_eq!(messages[2].priority, Priority::High);
         assert_eq!(messages[2].body, "• Proposal: p2\n• Spent by: p1");
@@ -372,6 +382,10 @@ mod tests {
             "• Amount: 8 sat\n• Fee if paid: 1 sat\n• Expiry: block 900\n• Proposal: p3"
         );
         assert_eq!(messages[4].title, "Lock refunded");
+        assert_eq!(
+            messages[4].body,
+            "• Amount: 8 sat\n• Income: 1 sat (125,000 ppm)\n• Proposal: p3"
+        );
         assert_eq!(messages[5].priority, Priority::High);
         assert_eq!(messages[5].body, "• Block: 899\n• Proposal: p3");
         assert_eq!(messages[6].priority, Priority::High);
@@ -404,6 +418,11 @@ mod tests {
             refunded: true,
         };
         assert_eq!(message(&event(&twice)).title, "Refunded lock activated");
+    }
+
+    #[test]
+    fn the_kinds_passed_over_by_default_are_of_locks_under_way() {
+        assert!(UNDER_WAY.iter().all(|k| KINDS.contains(k)));
     }
 
     #[test]

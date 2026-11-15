@@ -81,9 +81,15 @@ socks5h://...` goes through a Tor daemon instead. With `--onion`, it also
 serves its API as an onion service, announced like `--announce-url`'s; back
 up `<data>/tor/state` to keep the address.
 Notification targets are Apprise URLs, as for the hub; `test-notify` checks
-them. Each notification lists the event's figures, ids cut to 12
-characters; `--notify-kinds` picks the kinds of event. A refunded swap is
-one whose client never claimed the provider's lock; a lost one, at high
+them. `--notify-kinds` picks the kinds of event: by default all but swaps
+accepted (`accepted`), still under way. Each notification lists the swap's
+route and figures, ids cut to 12 characters. A swap done shows its income
+(what the client's lock paid beyond the amount), its costs (the fee its
+lock at the destination hub paid) and its profit, with their rates in ppm
+of the amount; the wallet's unlinking is not counted against any one swap.
+A payout shows what it charged instead, the miner fee it pays included,
+since miner fees go unrecorded. A refunded swap is one whose client never
+claimed the provider's lock, which cost its refund fee; a lost one, at high
 priority, one the client was paid for but whose lock the provider did not
 claim in return. Swaps and payouts under way resume when a stopped
 provider starts again.
