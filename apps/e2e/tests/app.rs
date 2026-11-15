@@ -424,8 +424,12 @@ async fn cashed_out(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
 /// the notes there, on credit no longer. Its price paid, its change kept
 /// on Bitcoin. Closing it, it is told to cash out instead.
 async fn contracted(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
-    const PRICE: u64 = 23_000;
-    const CAP: u64 = 4_096;
+    // hub1's fixed price, and over it 1% of the cap a year for terms its
+    // holders choose (licash-hub's --contracts-rate by default).
+    const FIXED: u64 = 23_000;
+    let price = |cap: u64, blocks: u32| {
+        FIXED + licash_api::rate(10_000, u32::try_from(cap).unwrap_or(u32::MAX), blocks)
+    };
     let mine = || async {
         let waiting = eco.core("getmempoolinfo", json!([])).await?["size"].as_u64();
         if waiting.unwrap_or(0) > 0 {
@@ -491,13 +495,36 @@ async fn contracted(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     let credit = licash_e2e::phone::amount(&phone.by_id("credit", 10).await?.text);
     eprintln!("a coin of {coin} kept, {before} held, {credit} on credit");
 
-    // Paid from it now, its change back.
+    // Paid from it now, its change back, of terms chosen within hub1's
+    // range: at first a cap of half again the coin, over the longest hub1
+    // allows, priced as hub1 prices them as they change.
     phone.tap("Where it is").await?;
     phone.tap_id("open-contract").await?;
-    phone
-        .wait("It costs 23,000 sat, paid from a coin of yours", 60)
-        .await?;
-    phone.tap("Open for 23,000 sat").await?;
+    let offered = phone.wait("Protects up to", 60).await?;
+    let cap = licash_e2e::phone::amount(&offered.text);
+    ensure!(cap == coin + coin / 2, "a cap of {cap} offered on {coin}");
+    let chosen = |blocks: u32| async move {
+        until(&format!("{blocks} blocks chosen"), 10, || async {
+            let views = phone.views().await?;
+            let shown = |start: &str| views.iter().find(|v| v.text.starts_with(start));
+            // "Lasts 6 days, 22 hours (1,000 blocks)".
+            let lasts = shown("Lasts").and_then(|v| v.text.rsplit_once('('));
+            let lasts = lasts.map(|(_, b)| licash_e2e::phone::amount(b));
+            let costs = shown("Open for").map(|v| licash_e2e::phone::amount(&v.text));
+            let right = lasts == Some(u64::from(blocks)) && costs == Some(price(cap, blocks));
+            Ok(right.then_some(()))
+        })
+        .await
+    };
+    chosen(1_000).await?;
+    // Its shortest costs less, at once; the longest again, to open.
+    phone.slide_id("contract-blocks", 0.0).await?;
+    chosen(200).await?;
+    phone.slide_id("contract-blocks", 1.0).await?;
+    chosen(1_000).await?;
+    let paid = price(cap, 1_000);
+    ensure!(paid > price(cap, 200) && paid > FIXED, "{paid} for {cap}");
+    phone.tap_id("contract-open").await?;
     phone.wait("Opening a contract", 30).await?;
     let protecting = until("the contract protecting", 900, || async {
         mine().await?;
@@ -519,16 +546,22 @@ async fn contracted(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     phone.wait_gone("Close this contract?", 10).await?;
     phone.back().await?;
 
-    phone
-        .wait("4,096 sat in notes protected by contracts", 30)
-        .await?;
+    until("its cap protected", 30, || async {
+        let views = phone.views().await?;
+        let protected = views
+            .into_iter()
+            .find(|v| v.text.ends_with("in notes protected by contracts"));
+        Ok(protected.filter(|v| licash_e2e::phone::amount(&v.text) == cap))
+    })
+    .await?;
     let now = licash_e2e::phone::amount(&phone.by_id("credit", 10).await?.text);
-    ensure!(now + CAP == credit, "{now} on credit, {credit} before");
+    ensure!(now + cap == credit, "{now} on credit, {credit} before");
     let after = phone.balance().await?;
-    ensure!(after + PRICE == before, "{after} held, {before} before");
+    ensure!(after + paid == before, "{after} held, {before} before");
+    // Less than hub1 takes, its change stays on Bitcoin, moved in or not.
     let change = note("cashed out, kept on Bitcoin").await?;
     let change = licash_e2e::phone::amount(&change.text);
-    ensure!(change + PRICE == coin, "{change} back of {coin}");
+    ensure!(change + paid == coin, "{change} back of {coin}");
     // Its price in the history, as paid once its funding confirmed.
     phone.tap("Contract opened").await?;
     phone.wait("Opened at", 30).await?;

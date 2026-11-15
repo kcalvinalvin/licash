@@ -35,6 +35,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.testTagsAsResourceId
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import kotlin.math.exp
@@ -557,6 +559,8 @@ private fun ChooseContract(
     val quiet = MaterialTheme.colorScheme.onSurfaceVariant
     AlertDialog(
         onDismissRequest = dismiss,
+        // A dialog is a window of its own: its views' tags as their ids too.
+        modifier = Modifier.semantics { testTagsAsResourceId = true },
         title = { Text("Open a contract at ${host(q.hub)}?") },
         text = {
             Column(Modifier.verticalScroll(rememberScrollState())) {
