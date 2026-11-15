@@ -3,7 +3,7 @@
 //! that swap between two of its hubs, or pay notes out on Bitcoin.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     future::Future,
     sync::Mutex,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -33,9 +33,17 @@ const KEPT_FOR: Duration = Duration::from_secs(30 * 60);
 /// ([`Announcements::refresh`]). What they say is only where to ask them:
 /// each is still asked, and must answer as the key that announced it.
 /// None kept, or none of those answering, a quote looks for them as it
-/// did: one never refreshed keeps none, each quote looking.
+/// did: one never refreshed keeps none, each quote looking. Each provider
+/// is asked first at the URL it last answered at, for [`KEPT_FOR`] after,
+/// while it still announces it: one of its URLs down (say, an onion
+/// service not opening) is not waited on again for each quote.
 #[derive(Default)]
-pub struct Announcements(Mutex<Option<Kept>>);
+pub struct Announcements {
+    kept: Mutex<Option<Kept>>,
+    /// By the key that announced it, the URL each provider last answered
+    /// at as that key, and since when.
+    answered: Mutex<HashMap<String, (String, Instant)>>,
+}
 
 /// Announcements found, and where and when.
 struct Kept {
@@ -71,14 +79,14 @@ impl Announcements {
             network: network.to_owned(),
             at: Instant::now(),
         };
-        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(kept);
+        *self.kept.lock().unwrap_or_else(|e| e.into_inner()) = Some(kept);
         Ok(count)
     }
 
     /// Those kept from `relays` for `network`, found within [`KEPT_FOR`],
     /// those expired since left out: none if none is left.
     fn kept(&self, relays: &[String], network: &str) -> Option<Vec<Found>> {
-        let kept = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
         let kept = kept.as_ref()?;
         if kept.network != network || kept.relays != set_of(relays) || kept.at.elapsed() >= KEPT_FOR
         {
@@ -101,7 +109,8 @@ impl Announcements {
     /// `route`, should none be kept or none of those answer. Only
     /// [`Announcements::refresh`] keeps them: looking for them here keeps
     /// nothing, so that one never refreshing sees each provider announced
-    /// since.
+    /// since. Each is asked first where it last answered
+    /// ([`Announcements::asked`]).
     async fn answering<Q, Fut>(
         &self,
         (relays, route, network): (&[String], &Route, &str),
@@ -112,14 +121,59 @@ impl Announcements {
         Fut: Future<Output = Result<Q, Error>>,
     {
         if let Some(found) = self.kept(relays, network) {
-            let answered = answering(found, &ask, nostr).await?;
+            let answered = self.asked(found, &ask, nostr).await?;
             if !answered.is_empty() {
                 return Ok(answered);
             }
             tracing::info!("no swap provider kept answered: looking for them again");
         }
         let found = crate::discover(relays, route, Role::Swaps, network).await?;
-        Ok(answering(found, &ask, nostr).await?)
+        Ok(self.asked(found, &ask, nostr).await?)
+    }
+
+    /// Those of `found` answering `ask` ([`answering`]), each asked first
+    /// at the URL it last answered at, within [`KEPT_FOR`] and while it
+    /// still announces it, then at the others in the order announced:
+    /// where each answers kept for the next, forgotten for one that does
+    /// not.
+    async fn asked<Q, Fut>(
+        &self,
+        mut found: Vec<Found>,
+        ask: impl Fn(String) -> Fut,
+        nostr: fn(&Q) -> Option<&str>,
+    ) -> Result<Vec<(Found, String, Q)>, Error>
+    where
+        Fut: Future<Output = Result<Q, Error>>,
+    {
+        let lock = || self.answered.lock().unwrap_or_else(|e| e.into_inner());
+        {
+            let answered = lock();
+            for service in &mut found {
+                let Some((url, at)) = answered.get(&service.key) else {
+                    continue;
+                };
+                let urls = &mut service.announcement.urls;
+                match urls.iter().position(|u| u == url) {
+                    Some(i) if at.elapsed() < KEPT_FOR => urls[..=i].rotate_right(1),
+                    _ => {}
+                }
+            }
+        }
+        let keys: Vec<String> = found.iter().map(|f| f.key.clone()).collect();
+        let answering = answering(found, ask, nostr).await?;
+        let mut answered = lock();
+        for key in keys {
+            let at = answering.iter().find(|(f, ..)| f.key == key);
+            let Some((_, url, _)) = at else {
+                answered.remove(&key);
+                continue;
+            };
+            let same = |(kept, at): &(String, Instant)| kept == url && at.elapsed() < KEPT_FOR;
+            if !answered.get(&key).is_some_and(same) {
+                answered.insert(key, (url.clone(), Instant::now()));
+            }
+        }
+        Ok(answering)
     }
 }
 
@@ -590,7 +644,8 @@ pub fn hub_relays<T: Transport>(wallet: &Wallet<T>) -> Result<Vec<String>, Error
 /// A swap provider announced on Nostr, and what it asks for a swap.
 #[derive(Clone, Debug)]
 pub struct SwapProvider {
-    /// The first URL announced that answered as the provider.
+    /// The URL that answered as the provider: the first announced that
+    /// does, or where it last answered ([`Announcements`]).
     pub url: String,
     /// The key that announced it, x-only in hex.
     pub key: String,
@@ -619,7 +674,8 @@ pub async fn swap_providers<T: Transport>(
     swap_providers_with(wallet, &announced, relays, route, pair, amount, limits).await
 }
 
-/// [`swap_providers`], those announced as `announced` keeps them.
+/// [`swap_providers`], those announced as `announced` keeps them, each
+/// asked first where it last answered.
 pub async fn swap_providers_with<T: Transport>(
     wallet: &Wallet<T>,
     announced: &Announcements,
@@ -734,7 +790,8 @@ pub async fn hubs_found<T: Transport>(
 /// what it asks for a payout.
 #[derive(Clone, Debug)]
 pub struct PayoutProvider {
-    /// The first URL announced that answered as the provider.
+    /// The URL that answered as the provider: the first announced that
+    /// does, or where it last answered ([`Announcements`]).
     pub url: String,
     /// The key that announced it, x-only in hex.
     pub key: String,
@@ -762,7 +819,8 @@ pub async fn payout_providers<T: Transport>(
     payout_providers_with(wallet, &announced, relays, route, pair, amount, limits).await
 }
 
-/// [`payout_providers`], those announced as `announced` keeps them.
+/// [`payout_providers`], those announced as `announced` keeps them, each
+/// asked first where it last answered.
 pub async fn payout_providers_with<T: Transport>(
     wallet: &Wallet<T>,
     announced: &Announcements,
@@ -943,7 +1001,7 @@ mod tests {
             let announced = Announcements::default();
             let relays = set_of(&relays);
             let network = "regtest".to_owned();
-            *announced.0.lock().unwrap() = Some(Kept {
+            *announced.kept.lock().unwrap() = Some(Kept {
                 found,
                 relays,
                 network,
@@ -970,5 +1028,82 @@ mod tests {
         assert!(keep(Vec::new(), Instant::now())
             .kept(&relays, "regtest")
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn providers_are_asked_first_where_they_last_answered_as_themselves() {
+        const ONION: &str = "http://swaps.onion";
+        const CLEAR: &str = "https://swaps.example";
+        let announced = Announcements::default();
+        let mut two = provider(now());
+        two.announcement.urls = vec![ONION.into(), CLEAR.into()];
+        let key = two.key.clone();
+        // Those down, those answering as another key, and each URL asked.
+        let down: Mutex<HashSet<&str>> = Mutex::new(HashSet::new());
+        let other: Mutex<HashSet<&str>> = Mutex::new(HashSet::new());
+        let asked: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        let ask = |url: String| {
+            asked.lock().unwrap().push(url.clone());
+            let up = !down.lock().unwrap().contains(url.as_str());
+            let named = match other.lock().unwrap().contains(url.as_str()) {
+                true => "b".repeat(64),
+                false => key.clone(),
+            };
+            async move {
+                match up {
+                    true => Ok(Answer(named)),
+                    false => Err(Error::Invalid("down".into())),
+                }
+            }
+        };
+        let quote = async |set: (&[&'static str], &[&'static str])| {
+            *down.lock().unwrap() = set.0.iter().copied().collect();
+            *other.lock().unwrap() = set.1.iter().copied().collect();
+            let answered = announced.asked(vec![two.clone()], &ask, named).await;
+            let at = answered.unwrap().first().map(|(_, url, _)| url.clone());
+            (at, std::mem::take(&mut *asked.lock().unwrap()))
+        };
+        let both = || vec![ONION.to_owned(), CLEAR.to_owned()];
+
+        // Its onion service down: asked there, then at its other URL, where
+        // it is asked first from then on.
+        assert_eq!(quote((&[ONION], &[])).await, (Some(CLEAR.into()), both()));
+        assert_eq!(
+            quote((&[], &[])).await,
+            (Some(CLEAR.into()), vec![CLEAR.into()])
+        );
+        // Answering there as another key: not where it answered, forgotten.
+        let back = || vec![CLEAR.to_owned(), ONION.to_owned()];
+        assert_eq!(quote((&[ONION], &[CLEAR])).await, (None, back()));
+        assert_eq!(
+            quote((&[], &[])).await,
+            (Some(ONION.into()), vec![ONION.into()])
+        );
+        // Down where it last answered: the others, in the order announced.
+        assert_eq!(quote((&[ONION], &[])).await, (Some(CLEAR.into()), both()));
+        assert_eq!(quote((&[CLEAR], &[])).await, (Some(ONION.into()), back()));
+        assert_eq!(
+            quote((&[], &[])).await,
+            (Some(ONION.into()), vec![ONION.into()])
+        );
+
+        // Kept for so long: asked in the order announced again.
+        let since = |url: &str, at| {
+            let kept = (url.to_owned(), at);
+            announced.answered.lock().unwrap().insert(key.clone(), kept);
+        };
+        if let Some(then) = Instant::now().checked_sub(KEPT_FOR) {
+            since(CLEAR, then);
+            assert_eq!(
+                quote((&[], &[])).await,
+                (Some(ONION.into()), vec![ONION.into()])
+            );
+        }
+        // No longer announced there: neither.
+        since("https://moved.example", Instant::now());
+        assert_eq!(
+            quote((&[], &[])).await,
+            (Some(ONION.into()), vec![ONION.into()])
+        );
     }
 }
