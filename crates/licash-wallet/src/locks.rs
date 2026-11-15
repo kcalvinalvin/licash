@@ -573,7 +573,8 @@ impl<T: Transport> Wallet<T> {
         })
     }
 
-    pub(crate) fn lock_record(&self, id: &ProposalId) -> Result<Lock, Error> {
+    /// The lock `id`, as [`Wallet::locks`] lists it.
+    pub fn lock_record(&self, id: &ProposalId) -> Result<Lock, Error> {
         self.store.read(|c| {
             c.query_row(
                 &format!("{LOCKS} WHERE l.id = ?1"),

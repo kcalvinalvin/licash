@@ -236,6 +236,18 @@ pub struct Record {
     pub updated_at: i64,
 }
 
+/// A swap as its operator reads it once it ended: its record and what the
+/// provider's lock at `to` paid that hub ([`Provider::outcome`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Outcome {
+    pub record: Record,
+    /// The hub's fee on the provider's lock at `to` once it paid, or its
+    /// refund fee once refunded; none into the provider's own hub. Unknown
+    /// while the lock is unsettled, and for a payout, whose miner fees go
+    /// unrecorded. The wallet's unlinking is not counted against a swap.
+    pub hub_fee: Option<u64>,
+}
+
 /// What the operator is told of.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -1537,6 +1549,37 @@ impl<T: Transport> Provider<T> {
     pub fn swap(&self, id: &ProposalId) -> Result<Option<swaps::Swap>, Error> {
         let row = self.row(id.as_bytes())?;
         Ok(row.filter(|row| !row.chain).map(|row| row.swap()))
+    }
+
+    /// The swap or payout of the client's lock `id`, in hex, and what it
+    /// paid hubs, if the provider recorded it.
+    pub fn outcome(&self, id: &str) -> Result<Option<Outcome>, Error> {
+        let mut key = [0; 32];
+        if hex::decode_to_slice(id, &mut key).is_err() {
+            return Ok(None);
+        }
+        let Some(row) = self.row(&key)? else {
+            return Ok(None);
+        };
+        let hub_fee = match (row.chain, row.own, row.lock) {
+            (true, ..) | (false, false, None) => None,
+            (false, true, _) => Some(0),
+            (false, false, Some(lock)) => {
+                match self.wallet.lock_record(&ProposalId::from_bytes(lock)) {
+                    Ok(lock) => match lock.state {
+                        LockState::Paid(_) => Some(lock.fee),
+                        LockState::Refunded => lock.cost,
+                        _ => None,
+                    },
+                    Err(licash_wallet::Error::UnknownPayment(_)) => None,
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        };
+        Ok(Some(Outcome {
+            record: row.record(),
+            hub_fee,
+        }))
     }
 
     /// The swaps, newest first, at most `limit`.

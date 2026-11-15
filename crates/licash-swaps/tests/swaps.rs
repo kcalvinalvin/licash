@@ -382,6 +382,11 @@ async fn a_swap_moves_notes_from_one_hub_to_another_for_the_providers_fee() {
     );
     assert_eq!(held(provider.wallet(), A), 20 + fee);
     assert_eq!(held(provider.wallet(), B), 200 - 20 - lock_fee);
+    // Its record, and what its lock paid hub B.
+    let outcome = provider.outcome(&record.id).unwrap().unwrap();
+    assert_eq!((&outcome.record, outcome.hub_fee), (record, Some(lock_fee)));
+    assert_eq!(provider.outcome(&"00".repeat(32)).unwrap(), None);
+    assert_eq!(provider.outcome("not hex").unwrap(), None);
     eco.client.resume().await.unwrap();
     assert_eq!(held(&eco.client, A), 100 - 20 - fee - lock_fee);
 
@@ -667,6 +672,10 @@ async fn a_lock_its_client_never_claims_returns_to_the_provider() {
     assert_eq!(provider.records(1).unwrap()[0].stage, Stage::Refunded);
     assert_eq!(held(provider.wallet(), B), 200 - FEE.base);
     assert_eq!(eco.kinds(), ["accepted", "refunded"]);
+    // Its lock's refund fee at B, all it cost.
+    let id = &provider.records(1).unwrap()[0].id;
+    let outcome = provider.outcome(id).unwrap().unwrap();
+    assert_eq!(outcome.hub_fee, Some(FEE.base));
 
     // Back, the client cannot claim the provider's lock any more, and is
     // refunded its own once expired.
@@ -731,6 +740,9 @@ async fn a_provider_that_claims_too_late_loses_the_swap() {
     assert_eq!(eco.kinds(), ["accepted", "lost"]);
     let stats = provider.stats().unwrap();
     assert_eq!((stats.lost, stats.lost_amount, stats.earned), (1, 20, 0));
+    // Its lock at B paid, and its fee with it.
+    let outcome = provider.outcome(&record.id).unwrap().unwrap();
+    assert_eq!(outcome.hub_fee, Some(costs(20).1));
     // The client keeps both.
     eco.client.resume().await.unwrap();
     assert_eq!(held(&eco.client, A), 100 - FEE.base);
