@@ -237,7 +237,7 @@ impl Wallet {
     }
 
     /// What the wallet holds at `hub` to pay with.
-    fn held(&self, hub: &str) -> Result<u64, LicashError> {
+    pub(super) fn held(&self, hub: &str) -> Result<u64, LicashError> {
         let balance = self.wallet.balance()?.into_iter();
         let held = balance.filter(|b| b.hub == hub).map(|b| b.available);
         held.max()

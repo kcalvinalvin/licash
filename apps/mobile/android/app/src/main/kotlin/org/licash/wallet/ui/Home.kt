@@ -202,6 +202,7 @@ private fun ActivityRow(activity: Activity, coming: Boolean = false, open: () ->
         Kind.INVOICE -> "Received over Lightning" to "+"
         Kind.PAYOUT -> "Sent on Bitcoin" to "−"
         Kind.CONTRACT -> "Contract opened" to "−"
+        Kind.SWAP -> "Moved between hubs" to ""
     }
     val detail = when {
         coming -> "Waiting for a block"

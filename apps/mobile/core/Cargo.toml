@@ -41,6 +41,8 @@ licash-chain-client.workspace = true
 licash-hub.workspace = true
 licash-hub-service = { path = "../../hub", features = ["fake"] }
 licash-onchain.workspace = true
+licash-swaps.workspace = true
+licash-swaps-service = { path = "../../swaps" }
 axum.workspace = true
 nostr-sdk = { version = "0.45.6", features = ["local-relay"] }
 tempfile = "3.27"

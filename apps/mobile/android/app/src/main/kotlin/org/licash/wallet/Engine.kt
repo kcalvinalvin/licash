@@ -36,6 +36,7 @@ import org.licash.core.InvoiceQuote
 import org.licash.core.Kind
 import org.licash.core.LicashException
 import org.licash.core.LightningInvoice
+import org.licash.core.MoveQuote
 import org.licash.core.Network
 import org.licash.core.Notes
 import org.licash.core.NotesOf
@@ -525,6 +526,24 @@ class Engine(context: Context) {
         refresh()
         poke()
         paying
+    }
+
+    /**
+     * What moving `amount` of the notes at hub `from` to hub `to` costs
+     * through each swap provider found, as preferred: all of them if null.
+     */
+    suspend fun moveOffers(from: String, to: String, amount: ULong?): Result<List<MoveQuote>> =
+        io { local { it.moveOffers(from, to, amount) } }
+
+    /**
+     * Move as the first of `offers` says; through the next costing no more
+     * if its provider fails before the notes are locked to it.
+     */
+    suspend fun moveNotes(offers: List<MoveQuote>): Result<Activity> = io {
+        val moving = locked { it.moveNotes(offers) }
+        refresh()
+        poke()
+        moving
     }
 
     /** What opening a recovery contract at `hub` costs now, and the coin that would pay it. */

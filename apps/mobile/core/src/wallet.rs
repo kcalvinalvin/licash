@@ -34,6 +34,7 @@ const SCAN_BATCH: u32 = 144;
 const DAY: i64 = 86_400;
 
 mod contracts;
+mod moves;
 mod payouts;
 
 /// A wallet, kept in a directory of its own.
@@ -715,6 +716,7 @@ impl Wallet {
             }
         }
         history.extend(payouts::activities(&self.wallet)?);
+        history.extend(moves::activities(&self.wallet)?);
         history.extend(self.contract_activities()?);
         let times = self
             .times
@@ -746,26 +748,35 @@ impl Wallet {
     /// before its notes are locked or taken.
     pub fn notes_of(&self, kind: Kind, id: String) -> Result<NotesOf, LicashError> {
         let unknown = || LicashError::invalid(format!("nothing in the history is {id}"));
-        let operation = match kind {
-            Kind::Sent | Kind::Received | Kind::Lightning => Some(id.clone()),
+        let operations: Vec<String> = match kind {
+            Kind::Sent | Kind::Received | Kind::Lightning => vec![id.clone()],
             Kind::Moved => {
                 let deposit = self.wallet.deposits()?.into_iter().find(|d| d.hash == id);
-                deposit.ok_or_else(unknown)?.lock
+                deposit.ok_or_else(unknown)?.lock.into_iter().collect()
             }
             Kind::Invoice => {
                 let invoice = self.wallet.invoices()?.into_iter().find(|i| i.hash == id);
-                invoice.ok_or_else(unknown)?.lock
+                invoice.ok_or_else(unknown)?.lock.into_iter().collect()
             }
             Kind::Payout => {
                 let payout = self.wallet.payouts()?.into_iter().find(|p| p.hash == id);
-                payout.ok_or_else(unknown)?.lock
+                payout.ok_or_else(unknown)?.lock.into_iter().collect()
             }
-            Kind::Onchain | Kind::Contract => None,
+            // Its lock spends at one hub, the provider's lock it claims
+            // makes notes at the other.
+            Kind::Swap => {
+                let swap = self.wallet.swaps()?.into_iter().find(|s| s.hash == id);
+                let swap = swap.ok_or_else(unknown)?;
+                swap.lock.into_iter().chain(swap.theirs).collect()
+            }
+            Kind::Onchain | Kind::Contract => Vec::new(),
         };
-        let Some(operation) = operation else {
-            return Ok(NotesOf::default());
-        };
-        let notes = self.wallet.operation_notes(&operation)?;
+        let mut notes = licash_wallet::OperationNotes::default();
+        for operation in &operations {
+            let of = self.wallet.operation_notes(operation)?;
+            notes.spent.extend(of.spent);
+            notes.made.extend(of.made);
+        }
         let me = self.wallet.address();
         let itself: Vec<String> = self
             .wallet
@@ -841,6 +852,7 @@ impl Wallet {
                 })
             }
             Kind::Payout => payouts::details(&self.wallet, &id, self.tip()),
+            Kind::Swap => moves::details(&self.wallet, &id),
             Kind::Contract => self.contract_details(&id)?.ok_or_else(unknown),
             Kind::Onchain => {
                 let outpoint: OutPoint = id.parse().map_err(|_| unknown())?;

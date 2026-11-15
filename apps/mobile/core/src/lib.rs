@@ -376,6 +376,24 @@ pub struct PayoutQuote {
     pub depth: u32,
 }
 
+/// What moving notes from one of the wallet's hubs to another costs
+/// through `provider` ([`Wallet::move_offers`]): `amount` reaching `to`,
+/// and `fee` on top, the provider's and `lock_fee`, the hub's at `from`.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct MoveQuote {
+    pub from: String,
+    pub to: String,
+    pub amount: u64,
+    pub fee: u64,
+    pub lock_fee: u64,
+    /// Blocks past the usual the notes stay locked at `from` should the
+    /// provider never lock to the wallet at `to`.
+    pub margin: u32,
+    /// The provider, by its URL, and the name it announced, if any.
+    pub provider: String,
+    pub provider_name: Option<String>,
+}
+
 /// How a payment code is paid in notes ([`Wallet::pay_quote`]): `amount`
 /// at `hub`, with `fee`, all it costs on top: the hub's, and on a swap
 /// bringing notes there first, `swapped` from `swap_from`, the provider's
@@ -557,6 +575,9 @@ pub enum Kind {
     /// A recovery contract opened at a hub: its price, paid on Bitcoin
     /// from a coin of the wallet's, the rest back to it.
     Contract,
+    /// Notes moved from one of the wallet's hubs to another, through a
+    /// swap provider: `amount` reaching the other hub, `fee` on top.
+    Swap,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
@@ -605,6 +626,18 @@ pub enum Details {
         hub: String,
         invoice: Option<String>,
         asks: Option<u64>,
+        failure: Option<String>,
+    },
+    /// Notes moved from hub `from` to hub `to` through `provider`: the
+    /// wallet's lock at `from` once made, the provider's at `to` once made;
+    /// why it failed, if it did, the notes locked back once the lock
+    /// expires.
+    Swap {
+        from: String,
+        to: String,
+        provider: String,
+        lock: Option<String>,
+        theirs: Option<String>,
         failure: Option<String>,
     },
     /// Notes at `hub` paid out to `address`, on Bitcoin, through

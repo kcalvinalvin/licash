@@ -89,7 +89,11 @@ fun ActivityDetails(engine: Engine, ui: Ui, shown: Activity, back: () -> Unit) {
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 20.dp)) {
         TopBar(title(activity, coming != null), back)
         Spacer(Modifier.height(12.dp))
-        val sign = if (paid(activity)) "−" else "+"
+        val sign = when {
+            activity.kind == Kind.SWAP -> ""
+            paid(activity) -> "−"
+            else -> "+"
+        }
         Text(
             "$sign${digits(activity.amount)} sat",
             modifier = Modifier.padding(horizontal = 4.dp),
@@ -157,6 +161,7 @@ private fun title(activity: Activity, coming: Boolean): String = when {
         Kind.INVOICE -> "Received over Lightning"
         Kind.PAYOUT -> "Sent on Bitcoin"
         Kind.CONTRACT -> "Contract opened"
+        Kind.SWAP -> "Moved between hubs"
     }
 }
 
@@ -175,9 +180,21 @@ private fun status(activity: Activity, coming: Boolean, details: Details?): Stri
             else -> "${activity.detail}. Your notes stay yours."
         }
     }
+    activity.state == State.FAILED && details is Details.Swap -> when (details.lock) {
+        null -> "${activity.detail}. Your notes stay yours."
+        else -> "${activity.detail}. The notes it locked come back once the lock expires."
+    }
     activity.state == State.FAILED -> activity.detail
     else -> when (details) {
         is Details.Payout -> payoutStatus(activity, details.progress)
+        is Details.Swap -> when {
+            activity.state == State.DONE -> "At ${host(details.to)}"
+            details.theirs != null -> "The provider locked notes to you at ${host(details.to)}: claiming them"
+            details.lock != null ->
+                "Your notes are locked for the provider at ${host(details.from)}: " +
+                    "waiting for it to lock as much to you at ${host(details.to)}"
+            else -> "Locking your notes at ${host(details.from)}"
+        }
         is Details.Moved -> moving(activity, details)
         is Details.Coin -> when {
             details.moving != null -> "Moving into Licash"
@@ -401,6 +418,16 @@ private fun Summary(activity: Activity, details: Details?, tx: Onchain?) {
                 Line("Paid", "On Bitcoin, from a coin of yours")
                 Line("At", host(details.hub))
             }
+            is Details.Swap -> {
+                Line("Moved", sat(activity.amount))
+                if (activity.state != State.FAILED) {
+                    Line("Fees", sat(activity.fee))
+                    Line("Total", sat(activity.amount + activity.fee))
+                }
+                Line("From", host(details.from))
+                Line("To", host(details.to))
+                Line("Through", host(details.provider))
+            }
             else -> if (activity.kind == Kind.SENT) {
                 Line("Paid", sat(activity.amount))
                 Line("Hub fee", sat(activity.fee))
@@ -503,16 +530,18 @@ private fun Technical(activity: Activity, details: Details?, copy: (String, Stri
                 Fact("Hub", details.hub, copy)
                 Fact("Funding", details.funding, copy)
             }
+            is Details.Swap -> {
+                Fact("Swap hash", activity.id, copy)
+                Fact("From", details.from, copy)
+                Fact("To", details.to, copy)
+                Fact("Provider", details.provider, copy)
+                details.lock?.let { Fact("Your lock", it, copy) }
+                details.theirs?.let { Fact("The provider's lock", it, copy) }
+                details.failure?.let { Fact("Failure", it, copy) }
+            }
             null -> Fact("Id", activity.id, copy)
         }
     }
-}
-
-@Composable
-private fun Transaction(tx: Onchain, copy: (String, String) -> Unit) {
-    Fact("Transaction", tx.txid, copy)
-    tx.height?.let { Fact("Block", "$it", copy) }
-    tx.fee?.let { Fact("Network fee", sat(it), copy, "$it") }
 }
 
 /**
@@ -603,6 +632,13 @@ private fun NoteRow(note: NoteLine, spentHere: Boolean, copy: (String, String) -
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
     }
+}
+
+@Composable
+private fun Transaction(tx: Onchain, copy: (String, String) -> Unit) {
+    Fact("Transaction", tx.txid, copy)
+    tx.height?.let { Fact("Block", "$it", copy) }
+    tx.fee?.let { Fact("Network fee", sat(it), copy, "$it") }
 }
 
 @Composable

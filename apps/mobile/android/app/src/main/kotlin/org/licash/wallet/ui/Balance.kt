@@ -75,6 +75,8 @@ fun BalanceDetails(
     var quoting by remember { mutableStateOf<String?>(null) }
     var quote by remember { mutableStateOf<ContractQuote?>(null) }
     var closing by remember { mutableStateOf<Contract?>(null) }
+    // Moving notes from a hub to another of the wallet's, in advanced mode.
+    var moving by remember { mutableStateOf<Holding?>(null) }
     val scope = rememberCoroutineScope()
     fun askQuote(hub: String) {
         quoting = hub
@@ -135,6 +137,12 @@ fun BalanceDetails(
                             modifier = Modifier.testTag("open-contract"),
                         ) { Text(if (here.any { live(it) }) "Open another contract" else "Open a contract") }
                     }
+                }
+                if (ui.developer && held.orEmpty().size >= 2 && holding.available > 0uL) {
+                    TextButton(
+                        onClick = { moving = holding },
+                        modifier = Modifier.testTag("move"),
+                    ) { Text("Move to another hub") }
                 }
             }
         }
@@ -221,6 +229,18 @@ fun BalanceDetails(
                 }
             },
             dismiss = { quote = null },
+        )
+    }
+    moving?.let { from ->
+        MoveDialog(
+            engine,
+            from,
+            holdings.orEmpty(),
+            moved = {
+                moving = null
+                added++
+            },
+            dismiss = { moving = null },
         )
     }
     closing?.let { c ->
