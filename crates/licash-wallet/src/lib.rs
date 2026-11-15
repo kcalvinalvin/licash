@@ -2049,6 +2049,19 @@ fn take(tx: &Transaction<'_>, id: &ProposalId, ys: &[[u8; 33]]) -> Result<(), Er
     Ok(())
 }
 
+/// The outputs of a lock's pay branch paying `amount` to `to`, under
+/// `keyset`, derived from `ephemeral`, as a wallet paying `to` makes them:
+/// the same for the same `ephemeral`, so that whoever kept it can tell them
+/// again.
+pub fn pay_outputs(
+    keyset: &Keyset,
+    ephemeral: &Ephemeral,
+    to: &Address,
+    amount: u64,
+) -> Result<Vec<Output>, Error> {
+    outputs(keyset, ephemeral, Branch::Pay, &[(to, amount)])
+}
+
 /// The outputs of `branch` paying each of `parts` its value, under
 /// `keyset`, derived from `ephemeral`: largest first, and equal ones in
 /// random order, so that their order tells no one whose they are.
