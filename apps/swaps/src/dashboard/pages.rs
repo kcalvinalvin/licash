@@ -1,11 +1,13 @@
 //! The provider's records as the pages its operator reads.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use licash_dashboard::{
     grouped, span, Better, Card, Cell, Check, Column, Measure, Page, Panel, Ref, Report, Row,
     Table, Tone, Unit, Value,
 };
+use licash_swaps::Notice;
 
 use super::{flows, levels, short, Hub, Records, Swap, NEVER_CLAIMED};
 
@@ -119,7 +121,7 @@ pub(super) fn report(r: &Records, now: i64, service: Check, data: &Path) -> Repo
     series.extend(levels(r));
     let checks = checks(r, &state, now, service);
     let pages = vec![
-        overview(checks.clone()),
+        overview(checks.clone(), recent(r)),
         swaps(r, &state),
         liquidity(&state),
         fees(),
@@ -166,7 +168,7 @@ fn success() -> Value {
     }
 }
 
-fn overview(checks: Vec<Check>) -> Page {
+fn overview(checks: Vec<Check>, recent: Table) -> Page {
     Page::new(
         "Overview",
         vec![
@@ -186,7 +188,96 @@ fn overview(checks: Vec<Check>) -> Page {
                 Panel::chart("Notes held", "stock", Measure::Level),
                 Panel::Health(checks),
             ],
+            vec![Panel::Table(recent)],
         ],
+    )
+}
+
+/// What the provider did, newest first: the notices it recorded, a swap's
+/// with its route.
+fn recent(r: &Records) -> Table {
+    let swaps: HashMap<&str, &Swap> = r.swaps.iter().map(|s| (s.id.as_str(), s)).collect();
+    let route = |id: &str| swaps.get(id).map_or(String::new(), |s| s.route());
+    let rows = r
+        .events
+        .iter()
+        .map(|e| {
+            let (tone, event, route, amount, detail) = match &e.notice {
+                Some(Notice::Accepted {
+                    amount,
+                    fee,
+                    from,
+                    to,
+                    ..
+                }) => (
+                    Tone::Normal,
+                    "taken".into(),
+                    format!("{} → {}", short(from), short(to)),
+                    Some(*amount as i64),
+                    format!("fee {} sat", grouped(*fee as i64)),
+                ),
+                Some(Notice::Done { id, amount, fee }) => (
+                    Tone::Good,
+                    "done".into(),
+                    route(id),
+                    Some(*amount as i64),
+                    format!("earned {} sat", grouped(*fee as i64)),
+                ),
+                Some(Notice::Refunded { id, amount }) => (
+                    Tone::Warn,
+                    "refunded".into(),
+                    route(id),
+                    Some(*amount as i64),
+                    NEVER_CLAIMED.to_owned(),
+                ),
+                Some(Notice::Failed { id, reason }) => (
+                    Tone::Warn,
+                    "failed".into(),
+                    route(id),
+                    swaps.get(id.as_str()).map(|s| s.amount),
+                    reason.clone(),
+                ),
+                Some(Notice::Lost { id, amount, reason }) => (
+                    Tone::Bad,
+                    "lost".into(),
+                    route(id),
+                    Some(*amount as i64),
+                    reason.clone(),
+                ),
+                Some(Notice::Alert { message }) => (
+                    Tone::Warn,
+                    "alert".into(),
+                    String::new(),
+                    None,
+                    message.clone(),
+                ),
+                // Of a newer provider.
+                _ => (
+                    Tone::Muted,
+                    e.kind.replace('_', " "),
+                    String::new(),
+                    None,
+                    String::new(),
+                ),
+            };
+            Row::new(
+                Some(e.at),
+                tone,
+                vec![
+                    Cell::Time(e.at),
+                    Cell::Text(event),
+                    Cell::Text(route),
+                    amount.map_or(Cell::Empty, Cell::Sat),
+                    Cell::Text(detail),
+                ],
+            )
+        })
+        .collect();
+    Table::in_range(
+        "Recent events",
+        &["when", "event", "route", "amount", "detail"],
+        rows,
+        "nothing happened",
     )
 }
 

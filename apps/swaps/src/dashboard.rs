@@ -25,8 +25,13 @@ const WALLET_VERSION: i64 = 7;
 const NEVER_CLAIMED: &str = "never claimed";
 const NOT_LOCKED: &str = "not locked";
 
+/// The most events the overview lists.
+const RECENT: usize = 100;
+
 /// A swap as the provider recorded it.
 struct Swap {
+    /// Its id, in hex, as its notices name it.
+    id: String,
     /// A payout on Bitcoin, not a swap of notes.
     chain: bool,
     from: String,
@@ -93,11 +98,21 @@ struct Note {
     unlinked: bool,
 }
 
+/// A notice the provider recorded for its operator.
+struct Logged {
+    at: i64,
+    kind: String,
+    /// None if of a newer provider.
+    notice: Option<licash_swaps::Notice>,
+}
+
 struct Records {
     created_at: i64,
     network: String,
     swaps: Vec<Swap>,
     alerts: Vec<(i64, String)>,
+    /// The latest [`RECENT`], newest first.
+    events: Vec<Logged>,
     hubs: Vec<Hub>,
     notes: Vec<Note>,
     /// What the wallet's unspent coins on Bitcoin pay: none before its
@@ -157,6 +172,7 @@ fn read(data: &Path) -> Result<Records> {
         network: wallet.query_row("SELECT network FROM meta", [], |r| r.get(0))?,
         swaps: read_swaps(&swaps, version)?,
         alerts: read_alerts(&swaps)?,
+        events: read_events(&swaps, RECENT)?,
         hubs: read_hubs(&wallet, wallet_version)?,
         notes: read_notes(&wallet)?,
         coins: read_coins(&wallet, wallet_version)?,
@@ -168,7 +184,7 @@ fn read_swaps(c: &Connection, version: i64) -> Result<Vec<Swap>> {
     let kind = if version >= 2 { "kind" } else { "'notes'" };
     let mut stmt = c.prepare(&format!(
         "SELECT {kind}, from_url, to_url, amount, fee, expiry_from, expiry, state, reason,
-            created_at, updated_at
+            created_at, updated_at, lower(hex(id))
          FROM swaps ORDER BY created_at, rowid"
     ))?;
     let rows = stmt.query_map([], |r| {
@@ -184,6 +200,20 @@ fn read_swaps(c: &Connection, version: i64) -> Result<Vec<Swap>> {
             reason: r.get(8)?,
             created_at: r.get(9)?,
             updated_at: r.get(10)?,
+            id: r.get(11)?,
+        })
+    })?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
+/// The latest `limit` notices the provider recorded, newest first.
+fn read_events(c: &Connection, limit: usize) -> Result<Vec<Logged>> {
+    let mut stmt = c.prepare("SELECT at, kind, json FROM events ORDER BY seq DESC LIMIT ?1")?;
+    let rows = stmt.query_map([limit as i64], |r| {
+        Ok(Logged {
+            at: r.get(0)?,
+            kind: r.get(1)?,
+            notice: serde_json::from_str(&r.get::<_, String>(2)?).ok(),
         })
     })?;
     Ok(rows.collect::<Result<_, _>>()?)

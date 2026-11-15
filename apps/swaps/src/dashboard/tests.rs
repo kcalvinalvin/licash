@@ -429,6 +429,10 @@ fn files_of_older_versions_are_read_as_they_are() {
         // The one swap of version 1, of notes, taken and not locked yet.
         assert_eq!(summed(&report, "taken", "a.test → b.test"), (1, 1000));
         assert_eq!(table(&report, "Under way").rows.len(), 1);
+        assert_eq!(
+            texts(&table(&report, "Recent events").rows[0]),
+            ["taken", "a.test → b.test", "1000", "fee 11 sat"]
+        );
         let stock = report.series.iter().find(|s| s.id == "stock").unwrap();
         assert_eq!(stock.labels, ["hub.test"], "wallet v{}", i + 1);
         let on_chain = now_card(&report, "On chain").0;
@@ -437,6 +441,158 @@ fn files_of_older_versions_are_read_as_they_are() {
         assert_eq!(version(&dir.path().join("swaps.sqlite")), 1);
         assert_eq!(version(&dir.path().join("wallet.sqlite")), i as i64 + 1);
     }
+}
+
+/// A row's cells but its time, as text: amounts in sat.
+fn texts(row: &licash_dashboard::Row) -> Vec<String> {
+    use licash_dashboard::Cell;
+    let text = |c: &Cell| match c {
+        Cell::Text(s) => s.clone(),
+        Cell::Sat(v) | Cell::Int(v) | Cell::Time(v) | Cell::Blocks(v) => v.to_string(),
+        Cell::Empty => String::new(),
+    };
+    row.cells.iter().skip(1).map(text).collect()
+}
+
+fn event(swaps: &Connection, at: i64, json: &str) {
+    let kind: serde_json::Value = serde_json::from_str(json).unwrap();
+    swaps
+        .execute(
+            "INSERT INTO events (at, kind, json) VALUES (?1, ?2, ?3)",
+            params![at, kind["kind"].as_str().unwrap(), json],
+        )
+        .unwrap();
+}
+
+#[test]
+fn recent_events_read_the_notices_newest_first_with_their_swaps() {
+    let dir = tempfile::tempdir().unwrap();
+    let (swaps, wallet) = provider(dir.path());
+    let (a, b) = ("http://a.test", "http://b.test/");
+    swap(
+        &swaps,
+        1,
+        "notes",
+        b,
+        1000,
+        10,
+        1050,
+        "done",
+        None,
+        NOW - DAY,
+        NOW - DAY + 60,
+    );
+    let refused = Some("its hub refused the lock: too big");
+    swap(
+        &swaps,
+        4,
+        "notes",
+        a,
+        200,
+        2,
+        1050,
+        "failed",
+        refused,
+        NOW - HOUR,
+        NOW - HOUR,
+    );
+    let (one, four) = (hex::encode([1; 32]), hex::encode([4; 32]));
+    event(
+        &swaps,
+        NOW - DAY,
+        &format!(
+            r#"{{"kind":"accepted","id":"{one}","amount":1000,"fee":10,"from":"{a}","to":"{b}"}}"#
+        ),
+    );
+    event(
+        &swaps,
+        NOW - DAY + 60,
+        &format!(r#"{{"kind":"done","id":"{one}","amount":1000,"fee":10}}"#),
+    );
+    event(
+        &swaps,
+        NOW - HOUR,
+        &format!(
+            r#"{{"kind":"failed","id":"{four}","reason":"its hub refused the lock: too big"}}"#
+        ),
+    );
+    // Of a swap not recorded, and of a newer provider.
+    event(
+        &swaps,
+        NOW - 60,
+        r#"{"kind":"lost","id":"00","amount":5,"reason":"expired"}"#,
+    );
+    event(&swaps, NOW - 30, r#"{"kind":"swap_paused","id":"00"}"#);
+    event(
+        &swaps,
+        NOW,
+        r#"{"kind":"alert","message":"No swaps to b.test for now"}"#,
+    );
+    drop((swaps, wallet));
+
+    let report = dashboard(dir.path());
+    let recent = table(&report, "Recent events");
+    assert!(recent.in_range);
+    let rows: Vec<_> = recent
+        .rows
+        .iter()
+        .map(|r| (r.at, r.tone, texts(r)))
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            (
+                Some(NOW),
+                Tone::Warn,
+                vec!["alert", "", "", "No swaps to b.test for now"]
+            ),
+            (Some(NOW - 30), Tone::Muted, vec!["swap paused", "", "", ""]),
+            (Some(NOW - 60), Tone::Bad, vec!["lost", "", "5", "expired"]),
+            (
+                Some(NOW - HOUR),
+                Tone::Warn,
+                vec![
+                    "failed",
+                    "b.test → a.test",
+                    "200",
+                    "its hub refused the lock: too big"
+                ]
+            ),
+            (
+                Some(NOW - DAY + 60),
+                Tone::Good,
+                vec!["done", "a.test → b.test", "1000", "earned 10 sat"]
+            ),
+            (
+                Some(NOW - DAY),
+                Tone::Normal,
+                vec!["taken", "a.test → b.test", "1000", "fee 10 sat"]
+            ),
+        ]
+        .map(|(at, tone, cells)| (at, tone, cells.into_iter().map(String::from).collect()))
+    );
+    // On the overview, below the rest.
+    let overview = &report.pages[0];
+    assert!(matches!(
+        overview.rows.last().unwrap()[..],
+        [Panel::Table(ref t)] if t.title == "Recent events"
+    ));
+}
+
+#[test]
+fn recent_events_are_the_latest_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let (swaps, wallet) = provider(dir.path());
+    for i in 0..RECENT as i64 + 5 {
+        event(&swaps, NOW - 1000 + i, r#"{"kind":"alert","message":"x"}"#);
+    }
+    drop((swaps, wallet));
+
+    let report = dashboard(dir.path());
+    let recent = &table(&report, "Recent events").rows;
+    assert_eq!(recent.len(), RECENT);
+    assert_eq!(recent[0].at, Some(NOW - 1000 + RECENT as i64 + 4));
+    assert_eq!(recent[RECENT - 1].at, Some(NOW - 1000 + 5));
 }
 
 #[test]

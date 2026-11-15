@@ -21,14 +21,15 @@ licash-swaps --data ./swaps dashboard
 `dashboard` draws the provider's dashboard in the terminal: swaps by route,
 failures by reason and those under way, fees less what lost swaps cost, the
 notes held at each hub with the days they last at the rate they fell, what
-is free to lock and reserved, the coins on Bitcoin, and health checks,
-among them whether the provider at `--url` answers `/health` and whether
-its hubs answer it. It reads `<data>` only, beside the running provider or
-without it, and never writes or migrates its files. History comes from the
-records themselves, over a range of 24 hours to all of it (30 days at
-first, or `--range`) against the range before. Arrows or digits turn the
-pages, `[` and `]` the range; `--json` prints the range's view once
-instead.
+is free to lock and reserved, the coins on Bitcoin, health checks, among
+them whether the provider at `--url` answers `/health` and whether its
+hubs answer it, and below the overview its recent events, newest first:
+each swap taken, done, failed or lost, with its route, and its alerts. It
+reads `<data>` only, beside the running provider or without it, and never
+writes or migrates its files. History comes from the records themselves,
+over a range of 24 hours to all of it (30 days at first, or `--range`)
+against the range before. Arrows or digits turn the pages, `[` and `]` the
+range; `--json` prints the range's view once instead.
 
 `init --network` names the network of its hubs, `bitcoin` by default.
 The provider swaps between the hubs its wallet added, up to what it holds
