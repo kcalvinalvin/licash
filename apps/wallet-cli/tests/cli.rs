@@ -539,7 +539,8 @@ fn notes_swap_between_hubs_through_a_provider() {
     let swaps = Swaps::start(&[&a, &b], 200);
     let dir = tempfile::tempdir().unwrap();
     let (alice, alice_at) = party(dir.path(), "alice", Some(&a));
-    ok(wallet(&alice, &["add-hub", &b.url()], None));
+    let added = ok(wallet(&alice, &["add-hub", &b.url()], None));
+    assert_eq!(added.trim(), "trusted: it charges 1 sat a payment");
     let funds = serde_json::to_string(&a.pay(&address(&alice_at), 100)).unwrap();
     ok(wallet(&alice, &["receive"], Some(&funds)));
     let provider = swaps.url();

@@ -559,10 +559,13 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                     "fees": info.fees, "keysets": info.keysets.len(), "locks": info.locks.is_some(),
                     "lightning": info.lightning,
                 }),
-                format!(
-                    "trusted: it charges {} a payment",
-                    say::fee(fee.base, fee.ppm)
-                ),
+                match (fee.base, fee.ppm) {
+                    (0, 0) => "trusted: it charges no fee".to_owned(),
+                    _ => format!(
+                        "trusted: it charges {} a payment",
+                        say::fee(fee.base, fee.ppm)
+                    ),
+                },
             );
         }
         Command::Hubs => {
