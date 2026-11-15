@@ -4,6 +4,7 @@
 
 use anyhow::{bail, Context};
 use licash_chain_client::Source;
+use licash_nostr::{wallet::payout_providers, Route};
 use licash_transport::Http;
 use licash_wallet::{Payout, PayoutState, Wallet};
 use serde_json::json;
@@ -18,13 +19,20 @@ fn source(chain: &str) -> anyhow::Result<Source> {
     chain.parse().context("--chain")
 }
 
+/// The provider to pay out through: at its URL, or the one announced on
+/// relays, reached through a route, asking least.
+pub enum Provider {
+    At(String),
+    Announced(Vec<String>, Route),
+}
+
 /// Pay `amount` to `to` from notes at `from` through `provider`, the
 /// claim budgeted at `fee_rate` or the chain's estimate, and take the
 /// payout on once.
 pub async fn pay(
     wallet: &Wallet<Http>,
     chain: &str,
-    (provider, from, to): (&str, &str, &str),
+    (provider, from, to): (Provider, &str, &str),
     amount: u64,
     (max_fee, fee_rate): (Option<u64>, Option<u64>),
     json: bool,
@@ -32,8 +40,28 @@ pub async fn pay(
     let source = source(chain)?;
     let rate = onchain::rate(&source, fee_rate).await?;
     let max_fee = max_fee.unwrap_or(amount / 100 + USUAL_MAX_FEE);
+    let provider = match provider {
+        Provider::At(url) => url,
+        Provider::Announced(relays, route) => {
+            let relays = match relays {
+                relays if !relays.is_empty() => relays,
+                _ => licash_nostr::wallet::hub_relays(wallet)?,
+            };
+            if relays.is_empty() {
+                bail!("no relay to find a provider on: name one with --relay, or a provider");
+            }
+            let limits = (max_fee, rate);
+            let found = payout_providers(wallet, &relays, &route, (from, to), amount, limits);
+            let found = found.await?.into_iter().next().with_context(|| {
+                format!("no provider announced pays {amount} out from {from} within --max-fee")
+            })?;
+            let (costs, known) = (found.quote.costs(), found.known);
+            tracing::info!(provider = %found.url, costs, known, "provider found");
+            found.url
+        }
+    };
     let payout = wallet
-        .payout(provider, from, to, amount, max_fee, rate)
+        .payout(&provider, from, to, amount, max_fee, rate)
         .await?;
     if let PayoutState::Failed(reason) = &payout.state {
         show(json, payout_json(&payout), payout_line(&payout));

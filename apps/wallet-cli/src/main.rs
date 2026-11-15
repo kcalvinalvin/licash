@@ -283,9 +283,21 @@ enum Command {
         amount: u64,
         #[arg(long)]
         to: String,
-        /// The swap provider, by its URL.
+        /// The swap provider, by its URL [default: of those announced on
+        /// the relays that pay AMOUNT out within --max-fee, one paid out
+        /// through before, else the cheapest].
         #[arg(long, env = "LICASH_WALLET_PROVIDER")]
-        provider: String,
+        provider: Option<String>,
+        /// A relay to find a provider on [default: those the wallet's hubs
+        /// name]. Repeat it, or separate relays with commas, for more.
+        #[arg(
+            long = "relay",
+            value_name = "URL",
+            env = "LICASH_WALLET_RELAYS",
+            value_delimiter = ',',
+            conflicts_with = "provider"
+        )]
+        relays: Vec<String>,
         /// The hub to pay at [default: the one holding the most].
         #[arg(long)]
         from: Option<String>,
@@ -794,6 +806,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             amount,
             to,
             provider,
+            relays,
             from,
             max_fee,
             fee_rate,
@@ -803,7 +816,11 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 Some(from) => from,
                 None => richest_but(&wallet, "")?,
             };
-            let route = (provider.as_str(), from.as_str(), to.as_str());
+            let provider = match provider {
+                Some(url) => payout::Provider::At(url),
+                None => payout::Provider::Announced(relays, route(tor, cli.proxy.as_deref())?),
+            };
+            let route = (provider, from.as_str(), to.as_str());
             return payout::pay(&wallet, &chain, route, amount, (max_fee, fee_rate), json).await;
         }
         Command::Payouts { chain } => return payout::list(&wallet, chain.as_deref(), json).await,
