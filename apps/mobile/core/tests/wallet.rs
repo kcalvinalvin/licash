@@ -470,6 +470,26 @@ fn notes(wallet: &Wallet) -> u64 {
 }
 
 #[test]
+fn coins_found_on_bitcoin_take_their_blocks_time_in_the_history() {
+    let net = Net::new(true);
+    let light = Light::new(&net);
+    let alice = net.wallet("alice", net.height());
+    let code = alice.payment_code(None).unwrap();
+    net.mine(2, Vec::new());
+    let payment = net.pay_silent(&code.qr, 3_000, 1);
+    net.mine(1, vec![payment]);
+    let block = net.height();
+    net.mine(2, Vec::new());
+    assert_eq!(scan(&alice, &light), (1, 3_000));
+    let history = alice.history().unwrap();
+    assert_eq!(history[0].detail, format!("block {block}"));
+    // The fake chain's times move with the clock: seconds apart at most.
+    let claimed = light.time(block).unwrap();
+    let at = history[0].at.expect("the time of its block");
+    assert!((at - claimed).abs() <= 5, "{at} for a block of {claimed}");
+}
+
+#[test]
 fn a_phone_paid_on_bitcoin_moves_it_to_notes_and_pays_in_them() {
     let lines = Arc::new(Lines::default());
     set_logger(lines.clone(), "info".into());

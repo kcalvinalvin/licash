@@ -1,6 +1,7 @@
 //! [`Wallet`]: the SDK's wallet as the apps use it.
 
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
     sync::{atomic::AtomicU32, Arc, Mutex, MutexGuard, PoisonError},
 };
@@ -54,6 +55,9 @@ pub struct Wallet {
     /// Held while opening contracts or carrying them on: one driver to
     /// each.
     contracting: Mutex<()>,
+    /// The times the blocks of the coins found claim, by height, as the
+    /// light client told them: learned on each scan, kept in memory only.
+    times: Mutex<HashMap<u32, i64>>,
 }
 
 /// What the app keeps of a wallet besides the SDK's file.
@@ -160,6 +164,7 @@ impl Wallet {
             planned: Mutex::new(None),
             tip: AtomicU32::new(0),
             contracting: Mutex::new(()),
+            times: Mutex::new(HashMap::new()),
         }))
     }
 
@@ -711,6 +716,11 @@ impl Wallet {
         }
         history.extend(payouts::activities(&self.wallet)?);
         history.extend(self.contract_activities()?);
+        let times = self
+            .times
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
         for coin in self.wallet.silent_coins()? {
             let state = match coin.spending {
                 Some(_) => State::Pending,
@@ -723,7 +733,8 @@ impl Wallet {
                 amount: coin.value,
                 fee: 0,
                 detail: format!("block {}", coin.height),
-                at: None,
+                // Its block's: until learned, with those under way first.
+                at: times.get(&coin.height).copied(),
             });
         }
         history.sort_by_key(|a| (a.at.is_some(), std::cmp::Reverse(a.at)));
@@ -856,6 +867,7 @@ impl Wallet {
             }
         };
         self.saw(scanned.height);
+        self.learn_times(chain.as_ref())?;
         if scanned.next > scanned.height {
             self.broadcast_again(chain.as_ref());
         }
@@ -865,6 +877,33 @@ impl Wallet {
             found: scanned.found.len() as u32,
             found_value: scanned.found.iter().map(|c| c.value).sum(),
         })
+    }
+
+    /// Learn from `chain` the times of the blocks of the coins found whose
+    /// time is not known yet, for the history to place them among the rest.
+    /// One the light client cannot tell is asked again on the next scan.
+    fn learn_times(&self, chain: &dyn ChainSource) -> Result<(), LicashError> {
+        let mut heights: Vec<u32> = self
+            .wallet
+            .silent_coins()?
+            .iter()
+            .map(|c| c.height)
+            .collect();
+        heights.sort_unstable();
+        heights.dedup();
+        let mut times = self.times.lock().unwrap_or_else(PoisonError::into_inner);
+        for height in heights {
+            if times.contains_key(&height) {
+                continue;
+            }
+            match chain.time(height) {
+                Ok(time) => {
+                    times.insert(height, time);
+                }
+                Err(e) => tracing::debug!(height, "no time of the block: {e}"),
+            }
+        }
+        Ok(())
     }
 
     /// Payments on Bitcoin on their way to the fallback addresses handed
