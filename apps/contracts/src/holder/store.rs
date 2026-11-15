@@ -6,11 +6,11 @@
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context as _, Result};
+use anyhow::{bail, ensure, Context as _, Result};
 use bitcoin::consensus::{deserialize, serialize};
 use bitcoin::{OutPoint, Txid};
 use licash_contract::opening::{Fate, Phase};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
 /// The format of the rows: a machine's stored bytes, of
 /// `licash_contract`'s format 1.
@@ -41,6 +41,37 @@ CREATE TABLE IF NOT EXISTS contracts (
 CREATE UNIQUE INDEX IF NOT EXISTS contracts_deposit ON contracts (deposit)
     WHERE abandoned IS NULL AND (fate IS NULL OR fate != 'dead');
 ";
+
+/// Contracts she forced closed, each a recovery's stage and state in a
+/// format of `recovery`'s: made at her first, the file of version 2 from
+/// then on. A wallet that never forced a contract closed keeps version 1,
+/// which builds before readily open.
+const RECOVERIES: &str = "
+CREATE TABLE recoveries (
+    id BLOB PRIMARY KEY REFERENCES contracts (id),
+    format INTEGER NOT NULL,
+    stage TEXT NOT NULL,
+    irrevocable INTEGER NOT NULL,
+    state BLOB NOT NULL,
+    error TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+) STRICT;
+";
+
+/// A recovery as stored.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct RecoveryRow {
+    pub id: [u8; 32],
+    pub format: i64,
+    pub stage: String,
+    /// Past giving it up: her request signed, or about to be.
+    pub irrevocable: bool,
+    pub state: Vec<u8>,
+    /// What stopped its last step, if anything did.
+    pub error: Option<String>,
+    pub created_at: i64,
+}
 
 /// Where beside `contracts.sqlite` the instances each opening keeps are,
 /// in a directory of its id each.
@@ -140,7 +171,7 @@ impl Store {
                 c.execute_batch(SCHEMA)?;
                 c.pragma_update(None, "user_version", 1)?;
             }
-            1 => {}
+            1 | 2 => {}
             v => bail!("contracts.sqlite is of version {v}, newer than this wallet knows"),
         }
         Ok(Self {
@@ -336,6 +367,133 @@ impl Store {
         std::fs::File::open(&dir)?.sync_all()?;
         Ok(())
     }
+
+    fn version(&self) -> Result<i64> {
+        Ok(self
+            .c
+            .pragma_query_value(None, "user_version", |r| r.get(0))?)
+    }
+
+    /// Start recovering contract `id`, at `stage` with `state`, made
+    /// revocable: false if it is recovering already. The file of version 2
+    /// from the first on, in the same write.
+    pub fn start_recovery(
+        &self,
+        id: &[u8; 32],
+        format: i64,
+        stage: &str,
+        state: &[u8],
+    ) -> Result<bool> {
+        let t = rusqlite::Transaction::new_unchecked(&self.c, TransactionBehavior::Immediate)?;
+        let version: i64 = t.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        match version {
+            1 => {
+                t.execute_batch(RECOVERIES)?;
+                t.pragma_update(None, "user_version", 2)?;
+            }
+            2 => {}
+            v => bail!("contracts.sqlite of version {v} keeps no recoveries"),
+        }
+        let known: Option<i64> = t
+            .query_row("SELECT 1 FROM contracts WHERE id = ?1", [id], |r| r.get(0))
+            .optional()?;
+        ensure!(known.is_some(), "no contract {}", crate::hex_id(id));
+        let now = crate::now();
+        let started = t.execute(
+            "INSERT OR IGNORE INTO recoveries (id, format, stage, irrevocable, state, created_at,
+                                               updated_at)
+             VALUES (?1, ?2, ?3, 0, ?4, ?5, ?5)",
+            params![id, format, stage, state, now],
+        )?;
+        t.commit()?;
+        Ok(started == 1)
+    }
+
+    /// Recovery `id` at stage `to` with `state`, from stage `from` and
+    /// state `was` only; irrevocable from then on if `irrevocable`, in the
+    /// same write. False if another step moved it on meanwhile, or it was
+    /// given up (and started again) since `was` was read.
+    pub fn save_recovery(
+        &self,
+        id: &[u8; 32],
+        (from, was): (&str, &[u8]),
+        to: &str,
+        irrevocable: bool,
+        state: &[u8],
+    ) -> Result<bool> {
+        let saved = self.c.execute(
+            "UPDATE recoveries SET stage = ?4, state = ?5, irrevocable = max(irrevocable, ?6),
+                                   error = NULL, updated_at = ?7
+             WHERE id = ?1 AND stage = ?2 AND state = ?3",
+            params![id, from, was, to, state, irrevocable, crate::now()],
+        )?;
+        Ok(saved == 1)
+    }
+
+    /// Recovery `id` at stage `to` whatever its stage, `error` why, only
+    /// while revocable: giving it up, before its notes are given back.
+    /// False if it is irrevocable, or none is.
+    pub fn revoke_recovery(&self, id: &[u8; 32], to: &str, error: Option<&str>) -> Result<bool> {
+        if self.version()? < 2 {
+            return Ok(false);
+        }
+        let revoked = self.c.execute(
+            "UPDATE recoveries SET stage = ?2, error = ?3, updated_at = ?4
+             WHERE id = ?1 AND irrevocable = 0",
+            params![id, to, error, crate::now()],
+        )?;
+        Ok(revoked == 1)
+    }
+
+    /// What stopped recovery `id`'s last step, or none.
+    pub fn recovery_error(&self, id: &[u8; 32], error: Option<&str>) -> Result<()> {
+        self.c.execute(
+            "UPDATE recoveries SET error = ?2, updated_at = ?3 WHERE id = ?1",
+            params![id, error, crate::now()],
+        )?;
+        Ok(())
+    }
+
+    /// Forget recovery `id`, given up: never one irrevocable. False if it
+    /// is, or none was.
+    pub fn drop_recovery(&self, id: &[u8; 32]) -> Result<bool> {
+        if self.version()? < 2 {
+            return Ok(false);
+        }
+        let dropped = self.c.execute(
+            "DELETE FROM recoveries WHERE id = ?1 AND irrevocable = 0",
+            [id],
+        )?;
+        Ok(dropped == 1)
+    }
+
+    /// Recovery `id`, if she forced it closed.
+    pub fn recovery(&self, id: &[u8; 32]) -> Result<Option<RecoveryRow>> {
+        Ok(self.recoveries()?.into_iter().find(|r| &r.id == id))
+    }
+
+    /// Every recovery, the oldest first: none in a file of version 1.
+    pub fn recoveries(&self) -> Result<Vec<RecoveryRow>> {
+        if self.version()? < 2 {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.c.prepare(
+            "SELECT id, format, stage, irrevocable, state, error, created_at
+             FROM recoveries ORDER BY created_at, id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(RecoveryRow {
+                id: r.get(0)?,
+                format: r.get(1)?,
+                stage: r.get(2)?,
+                irrevocable: r.get(3)?,
+                state: r.get(4)?,
+                error: r.get(5)?,
+                created_at: r.get(6)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
 }
 
 fn fate_text(fate: Fate) -> &'static str {
@@ -471,6 +629,108 @@ mod tests {
         assert!(!kept.exists());
         // Again, or with nothing kept: no error.
         store.forget(&[1; 32]).unwrap();
+    }
+
+    fn user_version(dir: &Path) -> i64 {
+        let c = Connection::open(dir.join("contracts.sqlite")).unwrap();
+        c.pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn a_file_stays_of_version_1_until_she_forces_a_contract_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store.insert(&new(1, coin(0))).unwrap();
+        store
+            .save(&[1; 32], Phase::Funded, None, b"funded")
+            .unwrap();
+        store.set_fate(&[1; 32], Fate::Live).unwrap();
+        let before = store.list().unwrap();
+        drop(store);
+        // Opened, listed, read: as it was.
+        let store = Store::open(dir.path()).unwrap();
+        assert!(store.recoveries().unwrap().is_empty());
+        assert!(store.recovery(&[1; 32]).unwrap().is_none());
+        assert!(!store.drop_recovery(&[1; 32]).unwrap());
+        assert_eq!(user_version(dir.path()), 1);
+
+        // Her first: version 2, the contracts as they were.
+        assert!(store.start_recovery(&[1; 32], 1, "claiming", b"s").unwrap());
+        assert_eq!(user_version(dir.path()), 2);
+        assert_eq!(store.list().unwrap(), before);
+        assert_eq!(store.state(&[1; 32]).unwrap(), (b"funded".to_vec(), 200));
+        let row = store.recovery(&[1; 32]).unwrap().unwrap();
+        assert_eq!((row.format, row.stage.as_str()), (1, "claiming"));
+        assert!(!row.irrevocable && row.state == b"s" && row.error.is_none());
+        // Again: refused, as it was.
+        assert!(!store.start_recovery(&[1; 32], 1, "claiming", b"t").unwrap());
+        assert_eq!(store.recovery(&[1; 32]).unwrap().unwrap().state, b"s");
+        drop(store);
+
+        // Reopened, of version 2.
+        let store = Store::open(dir.path()).unwrap();
+        assert_eq!(store.recoveries().unwrap().len(), 1);
+        // Of a contract it does not know: refused.
+        assert!(store.start_recovery(&[2; 32], 1, "claiming", b"s").is_err());
+    }
+
+    #[test]
+    fn a_file_of_a_version_newer_than_it_knows_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        drop(Store::open(dir.path()).unwrap());
+        let c = Connection::open(dir.path().join("contracts.sqlite")).unwrap();
+        c.pragma_update(None, "user_version", 3).unwrap();
+        drop(c);
+        let refused = Store::open(dir.path()).err().unwrap();
+        assert!(format!("{refused:#}").contains("version 3"), "{refused:#}");
+    }
+
+    #[test]
+    fn a_recovery_moves_on_one_stage_at_a_time_and_is_dropped_only_while_revocable() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store.insert(&new(1, coin(0))).unwrap();
+        store.start_recovery(&[1; 32], 1, "a", b"0").unwrap();
+        store.recovery_error(&[1; 32], Some("offline")).unwrap();
+        let save = |from: (&str, &[u8]), to: &str, irrevocable: bool, state: &[u8]| {
+            store
+                .save_recovery(&[1; 32], from, to, irrevocable, state)
+                .unwrap()
+        };
+        assert!(save(("a", b"0"), "b", false, b"1"));
+        // From a stage it left, or a state it no longer has: not saved.
+        assert!(!save(("a", b"0"), "c", false, b"2"));
+        assert!(!save(("b", b"0"), "c", false, b"2"));
+        let row = store.recovery(&[1; 32]).unwrap().unwrap();
+        assert_eq!((row.stage.as_str(), row.state.as_slice()), ("b", &b"1"[..]));
+        assert_eq!(row.error, None);
+
+        assert!(save(("b", b"1"), "c", true, b"2"));
+        // Never revocable again.
+        assert!(save(("c", b"2"), "d", false, b"3"));
+        assert!(store.recovery(&[1; 32]).unwrap().unwrap().irrevocable);
+        assert!(!store.revoke_recovery(&[1; 32], "x", None).unwrap());
+        assert!(!store.drop_recovery(&[1; 32]).unwrap());
+        assert_eq!(store.recovery(&[1; 32]).unwrap().unwrap().stage, "d");
+
+        store.insert(&new(2, coin(1))).unwrap();
+        store.start_recovery(&[2; 32], 1, "a", b"0").unwrap();
+        let why = Some("why");
+        assert!(store.revoke_recovery(&[2; 32], "giving-up", why).unwrap());
+        let row = store.recovery(&[2; 32]).unwrap().unwrap();
+        assert_eq!(
+            (row.stage.as_str(), row.error.as_deref()),
+            ("giving-up", why)
+        );
+        // A step that read it before: not saved.
+        assert!(!store
+            .save_recovery(&[2; 32], ("a", b"0"), "b", false, b"1")
+            .unwrap());
+        assert!(store.drop_recovery(&[2; 32]).unwrap());
+        assert!(store.recovery(&[2; 32]).unwrap().is_none());
+        // And started again.
+        assert!(store.start_recovery(&[2; 32], 1, "a", b"0").unwrap());
     }
 
     #[test]

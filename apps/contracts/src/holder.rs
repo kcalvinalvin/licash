@@ -1,12 +1,14 @@
 //! The holder's side of openings, in her wallet: [`open`] a contract at
 //! a hub she trusts, [`resume`] those under way and watch their F, and
 //! [`list`] them. Her deposit is a coin of the wallet's, signed into F by
-//! it; her change returns to its fallback address.
+//! it; her change returns to its fallback address. One her hub left
+//! silent she forces closed, in [`recovery`].
 
 mod chain;
 mod driver;
 #[cfg(feature = "node")]
 mod node;
+pub mod recovery;
 mod store;
 
 use std::path::Path;

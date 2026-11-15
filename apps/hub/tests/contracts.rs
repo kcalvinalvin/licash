@@ -32,6 +32,16 @@ async fn hub(rt: &Regtest, dir: &Path) -> Result<(String, Source)> {
 
 /// As [`hub`], holders choosing their terms within `range`, if any.
 async fn hub_with(rt: &Regtest, dir: &Path, range: Option<Range>) -> Result<(String, Source)> {
+    let (url, source, _) = hub_serving(rt, dir, range).await?;
+    Ok((url, source))
+}
+
+/// As [`hub_with`], and the hub it serves, for a test to pay with.
+async fn hub_serving(
+    rt: &Regtest,
+    dir: &Path,
+    range: Option<Range>,
+) -> Result<(String, Source, Arc<Hub>)> {
     std::fs::create_dir_all(dir)?;
     let (seed, db) = (dir.join("seed"), dir.join("hub.sqlite"));
     Hub::init(&seed, &db, 12)?;
@@ -49,11 +59,11 @@ async fn hub_with(rt: &Regtest, dir: &Path, range: Option<Range>) -> Result<(Str
         contracts: Some(openings),
         ..Default::default()
     };
-    let app = licash_hub_service::router(hub, services);
+    let app = licash_hub_service::router(hub.clone(), services);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let url = format!("http://{}", listener.local_addr()?);
     tokio::spawn(async move { axum::serve(listener, app).await });
-    Ok((url, source))
+    Ok((url, source, hub))
 }
 
 /// What the wallet finds on the chain to the tip: its coins' total.
@@ -286,5 +296,247 @@ async fn a_wallet_opens_a_contract_of_terms_it_chose_on_its_large_coin() -> Resu
     let sats = |o: &serde_json::Value| (o["value"].as_f64().unwrap_or(0.0) * 1e8).round() as u64;
     let most = outputs.iter().map(sats).max().unwrap_or(0);
     ensure!(most >= (1 << 24) - 1, "{found}");
+    Ok(())
+}
+
+/// A payment of `amount` to `to` at `hub`, of seed file `seed`, its fee
+/// paid, from notes its keys made for someone outside any wallet.
+fn pay(
+    hub: &Hub,
+    seed: &Path,
+    url: &str,
+    to: &licash::address::Address,
+    amount: u64,
+) -> Result<licash_api::Payment> {
+    use licash::address::{Ephemeral, OwnerKeys};
+    use licash::authorization::{Authorization, SignedProposal};
+    use licash::claim::Branch;
+    use licash::note::{Evidence, IssuerKeys, Note};
+    use licash::spend::{Output, Proposal};
+    use licash::unlink::Nonce;
+
+    let split = |mut amount: u64| {
+        let mut denoms = Vec::new();
+        while amount > 0 {
+            let d = 1u64 << (63 - amount.leading_zeros());
+            denoms.push(d);
+            amount -= d;
+        }
+        denoms
+    };
+    let text = std::fs::read_to_string(seed)?;
+    let mut bytes = [0; 32];
+    hex::decode_to_slice(text.trim(), &mut bytes)?;
+    let keys = IssuerKeys::from_seed(&bytes, 0, 12)?;
+    let keyset = keys.keyset()?;
+    let info = hub.info();
+    let mut total = amount;
+    while amount + info.policy.spend.due(total) != total {
+        total = amount + info.policy.spend.due(total);
+    }
+    let payer = OwnerKeys::from_seed(&[0xfa; 32])?;
+    let mut inputs = Vec::new();
+    for denom in split(total) {
+        let d = Ephemeral::random().derive(&payer.address(), denom, Branch::Pay, 0)?;
+        let output = Output::from_derivation(&d)?;
+        let proof = keys.prove_blinded(denom, output.blinded())?;
+        let note = Note::from_parts(
+            &keyset,
+            *keyset.id(),
+            d.message().clone(),
+            proof.open_point(&keyset, &d)?,
+            Evidence::Linked {
+                dleq: proof.dleq(),
+                blinding: *d.blinding(),
+                commit: Nonce::new(&keyset, &output)?.commit()?,
+            },
+        )?;
+        inputs.push((note, d));
+    }
+    let notes: Vec<Note> = inputs.iter().map(|(note, _)| note.clone()).collect();
+    let ephemeral = Ephemeral::random();
+    let to_hub = split(total - amount)
+        .into_iter()
+        .map(|d| (d, &info.address));
+    let outputs = split(amount)
+        .into_iter()
+        .map(|d| (d, to))
+        .chain(to_hub)
+        .enumerate()
+        .map(|(i, (d, to))| Output::from_derivation(&ephemeral.derive(to, d, Branch::Pay, i)?))
+        .collect::<Result<Vec<_>, _>>()?;
+    let proposal = Proposal::new(&keyset, &notes, ephemeral.public(), outputs, None)?;
+    let grant = hub.offer(&proposal, &notes)?;
+    let owners = inputs
+        .iter()
+        .map(|(_, d)| d.ownership().owner_secret(payer.spend_secret()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let signed = SignedProposal::sign(
+        &keyset,
+        proposal,
+        &notes,
+        Authorization::Granted(Box::new(grant)),
+        &owners,
+    )?;
+    let unlock = hub.release(&signed, &notes)?;
+    Ok(licash_api::Payment::new(url, &signed, &notes, &unlock))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs bitcoind and a release build"]
+async fn a_holder_forces_her_contract_closed_on_a_silent_hub_and_takes_her_notes_value(
+) -> Result<()> {
+    use bitcoin::FeeRate;
+    use licash_contracts::holder::recovery::{self, Stage};
+
+    let rt = Regtest::start_standard()?;
+    let dir = tempfile::tempdir()?;
+    let at = dir.path().join("hub");
+    // A hub service that answers no request: silent.
+    let (url, source, hub) = hub_serving(&rt, &at, None).await?;
+    let chain = Node(source);
+    let mine = dir.path().join("wallet");
+    std::fs::create_dir(&mine)?;
+    let regtest = ChainProfile::Core30DefaultRegtest;
+    let wallet = Wallet::create(
+        &mine.join("wallet.sqlite"),
+        &[9; 32],
+        regtest,
+        Http::new(None)?,
+    )?;
+    wallet.add_hub(&url).await?;
+    wallet.watch_silent(None, rt.height()?)?;
+    for sats in [60_000, 50_000] {
+        let to = wallet.fallback_address()?.script_pubkey();
+        rt.fund(&to, Amount::from_sat(sats))?;
+    }
+    rt.mine(1)?;
+    ensure!(scan(&wallet, &chain).await? == 110_000);
+    let opened = holder::open(&wallet, &chain, &mine, &url, ask()).await?;
+    let rate = FeeRate::from_sat_per_vb(2).context("a rate")?;
+
+    // 3 000 sat of notes at the hub: 7 of them.
+    let payment = pay(&hub, &at.join("seed"), &url, &wallet.address(), 3_000)?;
+    wallet.receive(&payment)?;
+    let available =
+        |w: &Wallet<Http>| -> Result<u64> { Ok(w.balance()?.iter().map(|b| b.available).sum()) };
+    ensure!(available(&wallet)? == 3_000);
+
+    // Not before F is buried: nothing taken.
+    let early = recovery::force_close(&wallet, &chain, &mine, &opened.id, rate).await;
+    let early = format!("{:#}", early.unwrap_err());
+    ensure!(early.contains("not buried"), "{early}");
+    ensure!(available(&wallet)? == 3_000 && recovery::recoveries(&mine)?.is_empty());
+    rt.mine(1)?;
+    holder::resume(&wallet, &chain, &mine).await?;
+
+    // Forced closed: her notes claimed, out of her balance; revocable
+    // until R may be in the next block, after its lock from F.
+    let forced = recovery::force_close(&wallet, &chain, &mine, &opened.id, rate).await?;
+    ensure!(
+        forced.stage == Stage::Claimed && !forced.irrevocable,
+        "{forced:?}"
+    );
+    ensure!((forced.claimed, forced.notes) == (3_000, 7), "{forced:?}");
+    ensure!(forced.error.is_none(), "{forced:?}");
+    ensure!(available(&wallet)? == 0);
+    let lock_end = forced.next_at.context("no lock")?;
+    ensure!(lock_end > rt.height()? + 1, "{forced:?}");
+    // Given up: her notes back. Then forced closed again.
+    recovery::give_up(&wallet, &mine, &opened.id)?;
+    ensure!(available(&wallet)? == 3_000 && recovery::recoveries(&mine)?.is_empty());
+    let forced = recovery::force_close(&wallet, &chain, &mine, &opened.id, rate).await?;
+    ensure!(
+        forced.stage == Stage::Claimed && forced.claimed == 3_000,
+        "{forced:?}"
+    );
+    ensure!(available(&wallet)? == 0);
+    // Again: the same one, carried on.
+    let again = recovery::force_close(&wallet, &chain, &mine, &opened.id, rate).await?;
+    ensure!(again == forced, "{again:?}");
+
+    rt.mine_to_height(lock_end - 2)?;
+    let held = recovery::advance(&wallet, &chain, &mine, rate).await?;
+    ensure!(
+        held[0].stage == Stage::Claimed && held[0].error.is_none(),
+        "{held:?}"
+    );
+    // R may be in the next block: irrevocable, R and P broadcast.
+    rt.mine(1)?;
+    let sent = recovery::advance(&wallet, &chain, &mine, rate).await?;
+    ensure!(
+        sent[0].stage == Stage::Published && sent[0].irrevocable,
+        "{sent:?}"
+    );
+    ensure!(sent[0].error.is_none(), "{sent:?}");
+    let given_up = recovery::give_up(&wallet, &mine, &opened.id);
+    ensure!(format!("{:#}", given_up.unwrap_err()).contains("past giving up"));
+
+    // R and P in a block: the hub's window runs.
+    rt.mine(1)?;
+    let tip = rt.height()?;
+    let all = recovery::advance(&wallet, &chain, &mine, rate).await?;
+    let requested = &all[0];
+    ensure!(
+        all.len() == 1 && requested.stage == Stage::Requested,
+        "{all:?}"
+    );
+    ensure!(requested.requested_at == Some(tip), "{requested:?}");
+    let window_end = requested.next_at.context("no window")?;
+    ensure!(window_end > tip + 1, "{requested:?}");
+
+    // Nothing to do until it passes; then request_timeout, paid of P's
+    // fee coin.
+    rt.mine_to_height(window_end - 2)?;
+    let waiting = recovery::advance(&wallet, &chain, &mine, rate).await?;
+    ensure!(waiting[0].stage == Stage::Requested, "{waiting:?}");
+    rt.mine(1)?;
+    let timing_out = recovery::advance(&wallet, &chain, &mine, rate).await?;
+    ensure!(timing_out[0].stage == Stage::TimingOut, "{timing_out:?}");
+    ensure!(timing_out[0].error.is_none(), "{timing_out:?}");
+    rt.mine(1)?;
+    let timed_out = &recovery::advance(&wallet, &chain, &mine, rate).await?[0];
+    ensure!(timed_out.stage == Stage::TimedOut, "{timed_out:?}");
+    ensure!(
+        timed_out.timed_out_at == Some(rt.height()?),
+        "{timed_out:?}"
+    );
+
+    // Her bits and reserve, swept to her wallet once their delay passed.
+    let delay_end = timed_out.next_at.context("no delay")?;
+    rt.mine_to_height(delay_end - 2)?;
+    let held = recovery::advance(&wallet, &chain, &mine, rate).await?;
+    ensure!(held[0].stage == Stage::TimedOut, "{held:?}");
+    let before = scan(&wallet, &chain).await?;
+    rt.mine(1)?;
+    let sweeping = &recovery::advance(&wallet, &chain, &mine, rate).await?[0];
+    ensure!(sweeping.stage == Stage::Sweeping, "{sweeping:?}");
+    let sweep = sweeping.sweep.context("no sweep")?;
+    rt.mine(1)?;
+    let done = &recovery::advance(&wallet, &chain, &mine, rate).await?[0];
+    ensure!(
+        done.stage == Stage::Done && done.swept_at == Some(rt.height()?),
+        "{done:?}"
+    );
+    let found: serde_json::Value = chain
+        .0
+        .rpc(
+            "getrawtransaction",
+            serde_json::json!([sweep.to_string(), true]),
+        )
+        .await?;
+    let paid = found["vout"][0]["value"].as_f64().context("no output")?;
+    let paid = (paid * 1e8).round() as u64;
+    let after = scan(&wallet, &chain).await?;
+    ensure!(
+        after == before + paid,
+        "{before} then {after}, {paid} swept"
+    );
+    // Her claim's bits and her reserve, less the sweep's fee.
+    ensure!(paid > 3_000, "{paid} swept");
+    eprintln!("swept {paid} sat to her wallet");
+    // Nothing more to do.
+    let over = recovery::advance(&wallet, &chain, &mine, rate).await?;
+    ensure!(over[0] == *done, "{over:?}");
     Ok(())
 }
