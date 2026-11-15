@@ -535,7 +535,7 @@ fn hubs_announced_on_nostr_are_discovered_where_they_answer_as_the_announcer() {
 
 #[test]
 fn notes_swap_between_hubs_through_a_provider() {
-    let (a, b) = (Server::start(FEE), Server::start(FEE));
+    let (a, b) = (Server::swapping_from(FEE, Vec::new()), Server::start(FEE));
     let swaps = Swaps::start(&[&a, &b], 200);
     let dir = tempfile::tempdir().unwrap();
     let (alice, alice_at) = party(dir.path(), "alice", Some(&a));
@@ -642,6 +642,14 @@ fn swap_providers_announced_on_nostr_are_discovered_where_they_answer() {
     let mut max: Vec<u64> = hubs.iter().map(|h| h["max"].as_u64().unwrap()).collect();
     max.sort();
     assert_eq!(max, [0, 150]);
+    // Its lock at either hub, of a window of 20, expires 32 blocks before
+    // the client's: 4 to confirm a refund request, 20, 1 to read the
+    // preimage, its margin of 6 and 1.
+    let margins: Vec<u64> = hubs.iter().map(|h| h["margin"].as_u64().unwrap()).collect();
+    assert_eq!(
+        (margins, found[0]["margin"].as_u64()),
+        (vec![32, 32], Some(32))
+    );
     let text = ok(wallet(&nowhere, &args, None));
     assert_eq!(
         text.trim(),
@@ -678,18 +686,20 @@ fn a_swap_goes_through_a_provider_announced_one_used_before_first_then_the_cheap
     let (_relay, relay) = support::relay(&runtime);
     let relays = vec![relay];
     // Hubs naming the relay, where their wallets look for providers.
-    let a = Server::with_relays(FEE, relays.clone());
+    let a = Server::swapping_from(FEE, relays.clone());
     let b = Server::with_relays(FEE, relays.clone());
     let terms = |base, margin| licash_swaps::Config {
         fee: Fee { base, ppm: 0 },
         margin,
         ..support::swaps::CONFIG
     };
-    // For 20: 1, 2 (1 + 1%, rounded up), too much, too long locked.
+    // For 20: 1, 2 (1 + 1%, rounded up), too much, too long locked: its
+    // margin alone is the most the wallet allows.
     let cheap = Swaps::with(&[&a, &b], 200, 0x51, terms(1, 6));
     let usual = Swaps::start(&[&a, &b], 200);
     let greedy = Swaps::with(&[&a, &b], 200, 0x52, terms(500, 6));
-    let slow = Swaps::with(&[&a, &b], 200, 0x53, terms(1, 30));
+    let slow_margin = SwapLimits::usual(20).margin;
+    let slow = Swaps::with(&[&a, &b], 200, 0x53, terms(1, slow_margin));
     let announce = |secret, url| announce_provider(&runtime, &relays, secret, url);
     for swaps in [&cheap, &usual, &greedy, &slow] {
         announce(swaps.provider.nostr_secret().unwrap(), swaps.url());
@@ -762,7 +772,7 @@ fn a_payment_at_a_hub_holding_too_little_swaps_there_first_within_its_fees() {
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let (_relay, relay) = support::relay(&runtime);
     let relays = vec![relay];
-    let a = Server::with_relays(FEE, relays.clone());
+    let a = Server::swapping_from(FEE, relays.clone());
     let b = Server::with_relays(FEE, relays.clone());
     let swaps = Swaps::start(&[&a, &b], 200);
     let secret = swaps.provider.nostr_secret().unwrap();
@@ -841,7 +851,7 @@ fn what_paying_at_a_hub_not_added_leaves_there_is_shown_apart_until_added() {
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let (_relay, relay) = support::relay(&runtime);
     let relays = vec![relay];
-    let a = Server::with_relays(FEE, relays.clone());
+    let a = Server::swapping_from(FEE, relays.clone());
     let b = Server::with_relays(FEE, relays.clone());
     let swaps = Swaps::start(&[&a, &b], 200);
     let secret = swaps.provider.nostr_secret().unwrap();

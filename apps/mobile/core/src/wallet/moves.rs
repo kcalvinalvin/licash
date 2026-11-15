@@ -149,7 +149,7 @@ impl Wallet {
             amount: quote.amount,
             fee: quote.fee.saturating_add(lock_fee),
             lock_fee,
-            margin: quote.info.margin,
+            margin: quote.margin,
             provider: url,
             provider_name: provider.name,
         })

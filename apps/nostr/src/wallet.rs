@@ -309,7 +309,7 @@ pub async fn pay_planned<T: Transport>(
         }
         let limits = SwapLimits {
             fee: quote.fee,
-            margin: quote.info.margin,
+            margin: quote.margin,
         };
         let swapped = wallet.swap(&provider.url, &swap.from, hub, quote.amount, limits);
         let swapped = swapped.await.map_err(|e| match e {
@@ -509,7 +509,7 @@ pub async fn swap_providers<T: Transport>(
         })
         .collect();
     // Stable: the newest announced first among equals.
-    providers.sort_by_key(|p| (!p.known, p.quote.fee, p.quote.info.margin));
+    providers.sort_by_key(|p| (!p.known, p.quote.fee, p.quote.margin));
     Ok(providers)
 }
 

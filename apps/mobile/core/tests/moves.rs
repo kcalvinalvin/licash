@@ -53,8 +53,13 @@ const TIMING: Timing = Timing {
     max_lag: 120,
 };
 
-/// A provider's terms: a fee of 1 and 1%, swapping 5 to 5000, its locks
-/// expiring 6 blocks before its clients'.
+/// The response window of the first hub, moved from: a provider's lock at
+/// the second, of [`TIMING`]'s window of 20, expires 32 blocks before the
+/// phone's with [`TERMS`], and leaves room to claim it.
+const SOURCE_WINDOW: u32 = 46;
+
+/// A provider's terms: a fee of 1 and 1%, swapping 5 to 5000, 6 blocks to
+/// claim its client's lock and 4 to get a refund request confirmed.
 const TERMS: Config = Config {
     fee: Fee {
         base: 1,
@@ -63,6 +68,7 @@ const TERMS: Config = Config {
     min: 5,
     max: 5_000,
     margin: 6,
+    confirm: 4,
 };
 
 /// Two hubs charging 1 on a payment, a lock and a refund, following the
@@ -92,7 +98,7 @@ impl Hubs {
         let dir = tempfile::tempdir().unwrap();
         let mut chain = chain::Chain::new();
         let mut hubs = Vec::new();
-        for name in ["a", "b"] {
+        for (name, window) in [("a", SOURCE_WINDOW), ("b", TIMING.window)] {
             let seed = dir.path().join(format!("{name}.seed"));
             let db = dir.path().join(format!("{name}.sqlite"));
             Hub::init(&seed, &db, MAX_POW).unwrap();
@@ -101,7 +107,7 @@ impl Hubs {
                 spend: fee,
                 lock: fee,
                 refund: fee,
-                timing: TIMING,
+                timing: Timing { window, ..TIMING },
             };
             let hub = Arc::new(Hub::open(&seed, &db, policy).unwrap());
             hub.add_checkpoint(&chain.checkpoint(0)).unwrap();
@@ -427,6 +433,9 @@ fn a_phone_moves_its_notes_to_another_of_its_hubs_through_a_provider() {
         "{offer:?}"
     );
     assert_eq!((&offer.from, &offer.to), (&hubs.url(0), &hubs.url(1)));
+    // Its lock at the second hub expires 32 blocks before the phone's: 4 to
+    // confirm a refund request, 20, 1 to read the preimage, 6 and 1.
+    assert_eq!(offer.margin, 32, "{offer:?}");
     assert_eq!(offer.provider, swaps.url());
     assert_eq!(offer.provider_name.as_deref(), Some("provider 81"));
 

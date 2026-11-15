@@ -79,6 +79,11 @@ const TIMING: Timing = Timing {
     max_lag: 120,
 };
 
+/// The response window of a hub swapped from: a provider's lock at a hub of
+/// [`TIMING`]'s window of 20 expires 32 blocks before the client's with
+/// [`swaps::CONFIG`], and leaves room to claim it.
+pub const SOURCE_WINDOW: u32 = 46;
+
 pub struct Server {
     pub hub: Arc<Hub>,
     /// The gateway, and the node it pays and is paid through.
@@ -127,12 +132,32 @@ impl Server {
         Self::started(fee, false, false, false, relays)
     }
 
+    /// [`Server::with_relays`], of a response window of [`SOURCE_WINDOW`]:
+    /// a hub to swap from, to one of the usual window, through a provider
+    /// that is not the hub swapped to.
+    pub fn swapping_from(fee: Fee, relays: Vec<String>) -> Self {
+        let timing = Timing {
+            window: SOURCE_WINDOW,
+            ..TIMING
+        };
+        Self::timed(fee, (false, false, false), relays, timing)
+    }
+
     fn started(
         fee: Fee,
         lightning: bool,
         deposits: bool,
         tweaks: bool,
         relays: Vec<String>,
+    ) -> Self {
+        Self::timed(fee, (lightning, deposits, tweaks), relays, TIMING)
+    }
+
+    fn timed(
+        fee: Fee,
+        (lightning, deposits, tweaks): (bool, bool, bool),
+        relays: Vec<String>,
+        timing: Timing,
     ) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let (seed, db) = (dir.path().join("seed"), dir.path().join("hub.sqlite"));
@@ -141,7 +166,7 @@ impl Server {
             spend: fee,
             lock: fee,
             refund: fee,
-            timing: TIMING,
+            timing,
         };
         let hub = Arc::new(Hub::open(&seed, &db, policy).unwrap());
         let chain = chain::Chain::new();

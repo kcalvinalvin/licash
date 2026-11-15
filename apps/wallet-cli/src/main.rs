@@ -278,7 +278,7 @@ enum Command {
         max_fee: Option<u64>,
         /// The provider's margin at most, in blocks: how much longer the
         /// notes stay locked should it never pay.
-        #[arg(long, default_value_t = 24)]
+        #[arg(long, default_value_t = SwapLimits::usual(0).margin)]
         max_margin: u32,
     },
     /// The swaps made, newest first.
@@ -1026,10 +1026,12 @@ async fn discover(
                     info.max,
                     info.hubs.len()
                 ));
-                let hubs = info
-                    .hubs
-                    .iter()
-                    .map(|hub| json!({ "address": encode(&hub.address), "max": hub.max }));
+                let hubs = info.hubs.iter().map(|hub| {
+                    json!({
+                        "address": encode(&hub.address), "max": hub.max,
+                        "margin": info.margin_at(hub),
+                    })
+                });
                 rows.push(json!({
                     "key": key, "name": shown, "urls": urls, "fee": fee, "min": info.min,
                     "max": info.max, "margin": info.margin, "hubs": hubs.collect::<Vec<_>>(),

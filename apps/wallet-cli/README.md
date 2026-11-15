@@ -70,8 +70,11 @@ nothing is revealed until the provider's lock pays the wallet, and a swap
 that fails leaves the wallet's lock to return once expired. `resume` takes
 a pending swap on. Without `--provider`, the wallet takes one announced on
 Nostr (on `--relay`, else the relays its hubs name) that swaps the amount
-within `--max-fee` and `--max-margin`: one it swapped through before, else
-the cheapest.
+within `--max-fee` and `--max-margin` (200 blocks by default: what a
+provider other than the hub swapped to needs at a hub of the usual
+144-block window): one it swapped through before, else the cheapest. A
+swap is refused before anything is locked unless the source hub admits a
+lock that outlasts the provider's by that margin.
 
 `payout <amount> --to <address> --chain <url>` pays
 `amount` to an address on Bitcoin from notes at a hub, through a provider
