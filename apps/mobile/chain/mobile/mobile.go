@@ -7,7 +7,9 @@ package mobile
 import (
 	"bytes"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -73,6 +75,18 @@ type Chain struct {
 // base URL of a block-dn server to sync faster from, "default" for the
 // network's, or empty for none.
 func Start(network, dataDir, peers, cdn string) (*Chain, error) {
+	return StartThrough(network, dataDir, peers, cdn, "")
+}
+
+// StartThrough is Start reaching everything through proxy, a SOCKS5 proxy
+// such as Tor's as socks5://username:password@host:port: the peers, the
+// names of DNS seeds and peers, and the block-dn server, nothing directly.
+// None if empty.
+func StartThrough(network, dataDir, peers, cdn, proxy string) (*Chain, error) {
+	through, err := proxyOf(proxy)
+	if err != nil {
+		return nil, err
+	}
 	net, err := networkOf(network)
 	if err != nil {
 		return nil, err
@@ -92,12 +106,33 @@ func Start(network, dataDir, peers, cdn string) (*Chain, error) {
 		Params:       net.params,
 		ConnectPeers: connect,
 		CDN:          cdn,
+		Proxy:        through,
 		Log:          logger(),
 	})
 	if err != nil {
 		return nil, err
 	}
 	return &Chain{node: n}, nil
+}
+
+// proxyOf is the SOCKS5 proxy of proxy, a URL with a username and
+// password: none if empty. Its errors never quote it, as it holds a
+// password.
+func proxyOf(proxy string) (*node.Proxy, error) {
+	if proxy == "" {
+		return nil, nil
+	}
+	refused := errors.New("not a proxy: socks5://username:password@host:port")
+	u, err := url.Parse(proxy)
+	if err != nil || u.Scheme != "socks5" || u.User == nil || u.Port() == "" ||
+		u.Hostname() == "" || (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" {
+		return nil, refused
+	}
+	password, set := u.User.Password()
+	if !set || u.User.Username() == "" {
+		return nil, refused
+	}
+	return &node.Proxy{Addr: u.Host, Username: u.User.Username(), Password: password}, nil
 }
 
 // tempIn makes temporary files go to dataDir/tmp, emptied first, on

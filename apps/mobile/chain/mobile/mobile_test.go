@@ -1,6 +1,7 @@
 package mobile
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -45,5 +46,42 @@ func TestNetworks(t *testing.T) {
 	}
 	if _, err := Start("testnet", t.TempDir(), "", ""); err == nil {
 		t.Error("started an unknown network")
+	}
+}
+
+func TestTheProxyIsAURLWithAUsernameAndPassword(t *testing.T) {
+	if proxy, err := proxyOf(""); proxy != nil || err != nil {
+		t.Fatalf("none: %v, %v", proxy, err)
+	}
+	proxy, err := proxyOf("socks5://user:s3cret@127.0.0.1:9150")
+	if err != nil || proxy.Addr != "127.0.0.1:9150" || proxy.Username != "user" || proxy.Password != "s3cret" {
+		t.Fatalf("%+v, %v", proxy, err)
+	}
+	for _, refused := range []string{
+		"socks4://user:s3cret@127.0.0.1:9150",
+		"http://user:s3cret@127.0.0.1:9150",
+		"socks5://127.0.0.1:9150",
+		"socks5://user@127.0.0.1:9150",
+		"socks5://:s3cret@127.0.0.1:9150",
+		"socks5://user:s3cret@127.0.0.1",
+		"socks5://user:s3cret@:9150",
+		"socks5://user:s3cret@127.0.0.1:9150/path",
+		"socks5://user:s3cret@127.0.0.1:9150?x=1",
+		"socks5://user:s3cret@[::1",
+		"user:s3cret@127.0.0.1:9150",
+	} {
+		proxy, err := proxyOf(refused)
+		if proxy != nil || err == nil {
+			t.Errorf("%s: %+v", refused, proxy)
+			continue
+		}
+		if strings.Contains(err.Error(), "s3cret") {
+			t.Errorf("%s: the password in %q", refused, err)
+		}
+	}
+	// Refused before anything starts.
+	if _, err := StartThrough("regtest", t.TempDir(), "", "", "socks5://u:s3cret@127.0.0.1"); err == nil ||
+		strings.Contains(err.Error(), "s3cret") {
+		t.Errorf("started through a proxy without a port: %v", err)
 	}
 }
