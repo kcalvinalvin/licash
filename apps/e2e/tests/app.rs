@@ -88,7 +88,7 @@ async fn lightning(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     phone.type_text("4000").await?;
     phone.tap("Done").await?;
     phone
-        .wait("Asking for 4\u{2009}000 sat over Lightning", 10)
+        .wait("Asking for 4,000 sat over Lightning", 10)
         .await?;
     // In upper case, as a QR code holds it best.
     let shown = phone.qr(60).await?;
@@ -98,7 +98,7 @@ async fn lightning(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
         "{shown} shown for an invoice"
     );
     let paying = eco.pay(OUTSIDE, &request);
-    phone.wait("Received 4\u{2009}000 sat", 120).await?;
+    phone.wait("Received 4,000 sat", 120).await?;
     ensure!(paying.await??, "the node outside did not pay {request}");
     phone.tap("Back").await?;
     phone.wait("Send", 30).await?;
@@ -156,7 +156,7 @@ async fn used(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     phone.tap("From Bitcoin").await?;
     phone.wait("In your Licash", 10).await?;
     phone.wait("Hub fee", 10).await?;
-    phone.wait("1\u{2009}000 sat", 10).await?;
+    phone.wait("1,000 sat", 10).await?;
     phone.wait("Network fee", 10).await?;
     phone.back().await?;
     phone.wait("Receive", 10).await?;
@@ -434,7 +434,7 @@ async fn contracted(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     // A dialog's views carry no ids: by their text.
     phone.tap("Cash out to this wallet").await?;
     phone.wait("To this wallet, on Bitcoin", 120).await?;
-    phone.wait("33\u{2009}000 sat", 10).await?;
+    phone.wait("33,000 sat", 10).await?;
     phone.tap("Send").await?;
     phone.wait("Sending", 60).await?;
     phone.tap("Done").await?;
@@ -454,9 +454,9 @@ async fn contracted(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     phone.tap("Where it is").await?;
     phone.tap_id("open-contract").await?;
     phone
-        .wait("It costs 23\u{2009}000 sat, paid from a coin of yours", 60)
+        .wait("It costs 23,000 sat, paid from a coin of yours", 60)
         .await?;
-    phone.tap("Open for 23\u{2009}000 sat").await?;
+    phone.tap("Open for 23,000 sat").await?;
     phone.wait("Opening a contract", 30).await?;
     let protecting = until("the contract protecting", 900, || async {
         mine().await?;
@@ -479,7 +479,7 @@ async fn contracted(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     phone.back().await?;
 
     phone
-        .wait("4\u{2009}096 sat in notes protected by contracts", 30)
+        .wait("4,096 sat in notes protected by contracts", 30)
         .await?;
     let now = licash_e2e::phone::amount(&phone.by_id("credit", 10).await?.text);
     ensure!(now + CAP == credit, "{now} on credit, {credit} before");

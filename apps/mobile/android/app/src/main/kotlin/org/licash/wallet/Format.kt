@@ -7,11 +7,11 @@ import org.licash.core.Balance
 import org.licash.core.ChainException
 import org.licash.core.LicashException
 
-/** `12 345 sat`, thin spaces between thousands. */
+/** `12,345 sat`, commas between thousands. */
 fun sat(amount: ULong): String = "${digits(amount)} sat"
 
-fun digits(amount: ULong): String =
-    String.format(Locale.US, "%,d", amount.toLong()).replace(',', '\u2009')
+/** `12,345`. */
+fun digits(amount: ULong): String = String.format(Locale.US, "%,d", amount.toLong())
 
 /** All the wallet holds: in notes, and on Bitcoin. */
 val Balance.total: ULong get() = notes + notesPending + onchain + moving + opening
