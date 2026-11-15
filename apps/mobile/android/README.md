@@ -15,6 +15,13 @@ behind its (i). Times are said as times, never as blocks; ids, notes and
 providers show in advanced mode only. With no hub yet, Home lists the hubs
 announced on Nostr to pick from, or takes one by its address.
 
+Settings is one page: the hubs (each tapped for its fees, more added by
+address or found on Nostr), Bitcoin's state, Tor, About (the version, the
+storage used and the logs to export) and advanced mode, whose own page
+holds the notes, the log, the limit for renewing notes, the light client's
+settings and deleting the wallet. How the app looks and speaks, and the
+shared parts to build a screen of, are in [../../DESIGN.md](../../DESIGN.md).
+
 ## Build
 
 Needs a JDK 17 or later, the Android SDK (platform 37) with the NDK at
@@ -121,8 +128,8 @@ licash-wallet onchain scan        # coins paid on Bitcoin
 
 ## Logs and tests
 
-Settings, Export logs shares the app's log and the light client's as one
-file; Storage shows what the app keeps on the phone: the wallet, the Bitcoin
+Settings, About, Export logs shares the app's log and the light client's as
+one file; Storage shows what the app keeps on the phone: the wallet, the Bitcoin
 light client (each network's in advanced mode), Tor's state, logs, caches and
 the app itself. The end-to-end test drives the app on the emulator or phone adb
 picks, among the regtest ecosystem of `apps/e2e`:
