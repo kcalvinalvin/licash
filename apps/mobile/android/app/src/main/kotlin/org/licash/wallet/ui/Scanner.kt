@@ -51,6 +51,7 @@ import com.google.zxing.common.HybridBinarizer
 import com.google.zxing.qrcode.QRCodeReader
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
+import org.licash.wallet.AppLog
 
 /**
  * The back camera, until it sees a QR code: its text, once. Pinching or the
@@ -79,11 +80,25 @@ fun Scanner(modifier: Modifier = Modifier, onText: (String) -> Unit) {
     // 0 is the widest the camera sees, 1 its closest.
     var zoom by remember { mutableFloatStateOf(0f) }
     var light by remember { mutableStateOf(false) }
+    // Why the camera cannot be used, if it cannot: none, or it failed.
+    var broken by remember { mutableStateOf<String?>(null) }
+    // Left before the camera was ready: not to bind it then.
+    val gone = remember { AtomicBoolean(false) }
     DisposableEffect(Unit) {
         onDispose {
-            ProcessCameraProvider.getInstance(context).get().unbindAll()
+            gone.set(true)
+            // Never waiting on the main thread, nor failing there: a camera
+            // that never started has nothing to unbind.
+            val future = ProcessCameraProvider.getInstance(context)
+            if (future.isDone) runCatching { future.get().unbindAll() }
             worker.shutdown()
         }
+    }
+    broken?.let {
+        Box(modifier, contentAlignment = Alignment.Center) {
+            Text(it, style = MaterialTheme.typography.bodyMedium)
+        }
+        return
     }
     Box(modifier) {
         AndroidView(
@@ -123,9 +138,15 @@ fun Scanner(modifier: Modifier = Modifier, onText: (String) -> Unit) {
                         val text = image.use { decode(it, reader) }
                         if (text != null && seen.compareAndSet(false, true)) view.post { onText(text) }
                     }
-                    val provider = future.get()
-                    provider.unbindAll()
-                    camera = provider.bindToLifecycle(owner, CameraSelector.DEFAULT_BACK_CAMERA, preview, analysis)
+                    if (gone.get()) return@addListener
+                    runCatching {
+                        val provider = future.get()
+                        provider.unbindAll()
+                        camera = provider.bindToLifecycle(owner, CameraSelector.DEFAULT_BACK_CAMERA, preview, analysis)
+                    }.onFailure {
+                        AppLog.warn("starting the camera", it)
+                        broken = "The camera is not available: paste a code instead."
+                    }
                 }, ContextCompat.getMainExecutor(ctx))
                 view
             },
