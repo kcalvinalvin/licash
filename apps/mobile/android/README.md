@@ -4,6 +4,17 @@ The Licash wallet for Android: the wallet core (`apps/mobile/core`, Rust
 over UniFFI) and the light client (`apps/mobile/chain`, Go over gomobile)
 under a Jetpack Compose UI.
 
+## What it shows
+
+Home is the balance, how much of it is protected, one line while something
+is going on, Receive and Send. The rest waits behind a tap: where the money
+is behind the balance (a page for each hub, to cash out and protect, and
+one for what is on Bitcoin), the history behind Activity (or a swipe up),
+what a payment cost and how it was made behind its line, what a word means
+behind its (i). Times are said as times, never as blocks; ids, notes and
+providers show in advanced mode only. With no hub yet, Home lists the hubs
+announced on Nostr to pick from, or takes one by its address.
+
 ## Build
 
 Needs a JDK 17 or later, the Android SDK (platform 37) with the NDK at
@@ -45,7 +56,8 @@ advanced mode: signet, Mutinynet and regtest, the light client's peers and
 its block-dn server, the block explorer transactions link to, the most the
 app pays, on its own, to renew notes a hub that restarted no longer unlinks
 (100 parts per million of them unless set, under Privacy), the notes of
-each denomination, and every detail of a payment.
+each denomination, and how each payment was made: its transactions, block
+heights and providers.
 
 The app needs a hub taking deposits on the same network: `licash-hub run
 --network signet --chain URL --deposit-sweep-address ADDRESS`, with
@@ -53,25 +65,26 @@ The app needs a hub taking deposits on the same network: `licash-hub run
 their mailboxes, `--tweaks` for silent payments: the app's code holds a
 silent payment address only if a hub it uses serves tweaks, and `--lnd URL
 --lnd-macaroon FILE` for Lightning: the app pays invoices through the hub,
-and Receive over Lightning shows an invoice the hub makes, whose notes the
-app takes once paid. Tapping a hub in Settings lists its fees. Silent payments
+and Receive, switched to Lightning, shows an invoice the hub makes, whose
+notes the app takes once paid. Tapping a hub in Settings lists its fees. Silent payments
 before the first block the hub indexed are not found; payments to the
 fallback address are, from the day before the wallet was made.
 
 Send pays Bitcoin addresses from notes too, and codes naming no hub the app
 trusts at their address, through a swap provider paying out on Bitcoin
 (`licash-swaps run --chain URL`) announced on a relay a hub of the app names
-(`--nostr-relay URL --announce-url URL`); Balance cashes out all the notes at
-a hub to an address that way.
+(`--nostr-relay URL --announce-url URL`); a hub's page, behind the balance,
+cashes out all the notes there to an address that way.
 
 A code naming no hub the app trusts, but saying where to reach the payee's,
 is paid there in notes once the owner agrees: the hub proves it is the one the
 code names, a swap brings notes there from a hub of the app's, and the payment
 shows its fees for review first. What the swap brought past the payment stays
-at that hub, shown apart in Balance, where adding the hub (its URL shown to
-confirm) counts it.
+at that hub, shown apart behind the balance, as not in it, where adding the
+hub counts it.
 
-Balance opens recovery contracts at the hubs that open them (`licash-hub run
+A hub's page sets up protection, a recovery contract, at the hubs that open
+them (`licash-hub run
 --contracts`, on regtest only for now, under the mock authority: such a
 contract protects nothing). A contract locks the hub's collateral on Bitcoin
 behind the notes there, up to its cap, until its last block to recover in,
@@ -80,8 +93,10 @@ a coin of the wallet's on Bitcoin, its change kept there; with none, the quote
 offers to cash notes out to the wallet first. Opening downloads about 100 MB
 and takes minutes, in the background, one at a time; several contracts at a
 hub, and at several hubs, add up. The notes contracts cover count as
-protected rather than on credit, in Balance and on Home. A contract closes no
-sooner: Close says to cash out the hub's notes instead. Force closing,
+protected rather than not, on Home and behind the balance; what a contract
+is worth for now (nothing, under the mock authority) is said wherever one
+shows. A contract ends no sooner: End says to cash out the hub's notes
+instead. Force closing,
 recovering the notes on Bitcoin, is not available yet. The contracts are kept
 beside the wallet's file, made only once one is asked for.
 
