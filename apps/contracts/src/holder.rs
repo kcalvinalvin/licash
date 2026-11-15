@@ -12,10 +12,10 @@ mod store;
 use std::path::Path;
 
 use anyhow::{anyhow, ensure, Context as _, Result};
-use bitcoin::{OutPoint, TxOut};
+use bitcoin::OutPoint;
 use licash_contract::opening::{Holder, Start};
 use licash_contract::wire::Wanted;
-use licash_wallet::{Transport, Wallet};
+use licash_wallet::{SilentCoin, Transport, Wallet};
 
 pub use chain::Chain;
 use driver::Driver;
@@ -86,7 +86,12 @@ pub async fn open<T: Transport, C: Chain>(
     let checkpoint = chain.checkpoint(at).await.map_err(|e| anyhow!(e))?;
     let wanted = wanted(&offer, tip, ask.blocks)?;
     let store = Store::open(dir)?;
-    let (deposit, coin) = deposit(wallet, &store, price)?;
+    let coin = deposit(wallet, &store, price)?
+        .with_context(|| format!("no coin on Bitcoin of {price} sat at least, free, to deposit"))?;
+    let deposit = coin.outpoint;
+    let coin = wallet
+        .silent_coin_output(&deposit)?
+        .context("a coin gone")?;
     let secrets = wallet.contract_secrets();
     let start = Start {
         seed: secrets.seed,
@@ -185,6 +190,20 @@ pub fn list(dir: &Path) -> Result<Vec<Contract>> {
     }
 }
 
+/// The coin of `wallet`'s that [`open`] would deposit to pay `price`,
+/// with the contracts in `dir`: the smallest free that pays it, no other
+/// contract's deposit. None if no coin does.
+pub fn coin<T: Transport>(
+    wallet: &Wallet<T>,
+    dir: &Path,
+    price: u64,
+) -> Result<Option<SilentCoin>> {
+    match Store::existing(dir)? {
+        Some(store) => deposit(wallet, &store, price),
+        None => deposit_from(wallet, &[], price),
+    }
+}
+
 /// The offer of `hub` now.
 pub async fn offer<T: Transport>(wallet: &Wallet<T>, hub: &str) -> Result<Offer> {
     let url = format!("{}{QUOTE}", hub.trim_end_matches('/'));
@@ -227,23 +246,25 @@ fn deposit<T: Transport>(
     wallet: &Wallet<T>,
     store: &Store,
     price: u64,
-) -> Result<(OutPoint, TxOut)> {
+) -> Result<Option<SilentCoin>> {
     let taken: Vec<OutPoint> = store
         .list()?
         .into_iter()
         .filter(|c| c.abandoned.is_none() && c.fate != Some(Fate::Dead))
         .map(|c| c.deposit)
         .collect();
+    deposit_from(wallet, &taken, price)
+}
+
+fn deposit_from<T: Transport>(
+    wallet: &Wallet<T>,
+    taken: &[OutPoint],
+    price: u64,
+) -> Result<Option<SilentCoin>> {
     let mut coins = wallet.silent_coins()?;
     coins.retain(|c| c.spending.is_none() && c.value >= price && !taken.contains(&c.outpoint));
     coins.sort_by_key(|c| c.value);
-    let coin = coins
-        .first()
-        .with_context(|| format!("no coin on Bitcoin of {price} sat at least, free, to deposit"))?;
-    let output = wallet
-        .silent_coin_output(&coin.outpoint)?
-        .context("a coin gone")?;
-    Ok((coin.outpoint, output))
+    Ok(coins.into_iter().next())
 }
 
 /// Watch the F of the opening `driver` drives, once she signed it: its
