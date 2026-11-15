@@ -1428,6 +1428,38 @@ fn a_phone_keeps_no_move_its_hub_never_answered_and_gives_up_those_kept_before()
 }
 
 #[test]
+fn a_move_whose_payment_is_in_a_block_is_moving_until_its_notes_arrive() {
+    let net = Net::new(false);
+    let light = Light::new(&net);
+    let alice = net.wallet("alice", 0);
+    let code = alice.payment_code(None).unwrap();
+    net.mine(1, vec![net.pay_silent(&code.text, 3_000, 1)]);
+    assert_eq!(scan(&alice, &light), (1, 3_000));
+    let moving = alice.move_to_licash(light.clone()).unwrap();
+
+    // Its payment in a block, seen spent before its hub made the notes:
+    // neither the wallet's coins nor its notes, moving still.
+    net.confirm_sent();
+    assert_eq!(scan(&alice, &light).1, 0);
+    let confirmed = Balance {
+        moving: moving.amount,
+        ..Balance::default()
+    };
+    assert_eq!(alice.balance().unwrap(), confirmed);
+
+    // Its notes received: counted once, as notes.
+    net.round();
+    net.mine(1, Vec::new());
+    net.round();
+    alice.resume().unwrap();
+    let held = Balance {
+        notes: moving.amount,
+        ..Balance::default()
+    };
+    assert_eq!(alice.balance().unwrap(), held);
+}
+
+#[test]
 fn a_phone_reaches_a_hub_named_by_its_host_alone_over_https() {
     let net = Net::new(false);
     let alice = Wallet::create(net.dir("alice"), Network::Regtest, 0, false).unwrap();

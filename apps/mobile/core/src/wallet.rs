@@ -235,6 +235,7 @@ impl Wallet {
                 None => balance.onchain += coin.value,
             }
         }
+        balance.moving += self.confirmed_moves()?;
         balance.kept = self.kept_coins()?.iter().map(|(_, value)| value).sum();
         Ok(balance)
     }
@@ -938,6 +939,43 @@ impl Wallet {
             .filter(|c| c.spending.is_none() && claims.contains(&c.outpoint.txid))
             .map(|c| (c.outpoint, c.value))
             .collect())
+    }
+
+    /// What moves to notes hold once their payment is in a block and
+    /// before their notes are received: no longer the wallet's coins, not
+    /// yet its notes.
+    fn confirmed_moves(&self) -> Result<u64, LicashError> {
+        let mut receipts = None;
+        let mut moving = 0;
+        for deposit in self.wallet.deposits()? {
+            let Some(terms) = deposit.terms.as_ref() else {
+                continue;
+            };
+            if deposit.state != DepositState::Open {
+                continue;
+            }
+            if let Some(lock) = &deposit.lock {
+                let receipts = match &receipts {
+                    Some(receipts) => receipts,
+                    None => receipts.insert(self.wallet.receipts()?),
+                };
+                if receipts.iter().any(|r| &r.id == lock) {
+                    continue;
+                }
+            }
+            let Ok(address) = terms
+                .address
+                .parse::<bitcoin::Address<bitcoin::address::NetworkUnchecked>>()
+            else {
+                continue;
+            };
+            let script = address.assume_checked().script_pubkey();
+            let spends = self.wallet.silent_spends_paying(&script)?;
+            if spends.iter().any(|s| s.height.is_some()) {
+                moving += deposit.amount;
+            }
+        }
+        Ok(moving)
     }
 
     fn move_keeping(
