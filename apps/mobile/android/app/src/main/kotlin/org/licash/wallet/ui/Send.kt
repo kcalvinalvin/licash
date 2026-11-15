@@ -74,6 +74,7 @@ fun Send(engine: Engine, ui: Ui, link: String?, cashOut: String? = null, back: (
     // Opened with a link: no camera to start.
     var step by remember { mutableStateOf<Step>(if (link == null) Step.Looking else Step.Busy) }
     var asking by remember { mutableStateOf(false) }
+    var empty by remember { mutableStateOf(false) }
 
     suspend fun taking(payment: String, trust: Boolean): Step =
         engine.receive(payment, trust).fold(
@@ -212,11 +213,21 @@ fun Send(engine: Engine, ui: Ui, link: String?, cashOut: String? = null, back: (
                     onClick = {
                         scope.launch {
                             val clip = clipboard.getClipEntry()?.clipData
-                            clip?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.text?.let { read(it.toString()) }
+                            val text = clip?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.text?.toString()?.trim()
+                            empty = text.isNullOrEmpty()
+                            if (!text.isNullOrEmpty()) read(text)
                         }
                     },
                     modifier = Modifier.fillMaxWidth().height(56.dp),
                 ) { Text("Paste") }
+                if (empty) {
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        "Nothing to paste: copy a code, an address or an invoice first.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
             }
             is Step.Paying -> Paying(ui, s, asking, { asking = it }) { amount -> plan(s, amount) }
             Step.Busy -> Middle("One moment…")
