@@ -25,12 +25,12 @@ impl Program {
         }
     }
 
+    /// The packed guest, from `LICASH_R0_GUESTS` if set (a host moved
+    /// to another machine, a phone say), else from this checkout's.
     fn guest(self) -> Result<Vec<u8>> {
-        let path = format!(
-            "{}/../guests/{}.bin",
-            env!("CARGO_MANIFEST_DIR"),
-            self.name()
-        );
+        let dir = std::env::var("LICASH_R0_GUESTS")
+            .unwrap_or_else(|_| format!("{}/../guests", env!("CARGO_MANIFEST_DIR")));
+        let path = format!("{dir}/{}.bin", self.name());
         read(&path).with_context(|| {
             format!(
                 "no packed guest at {path}: run r0/build-guest.sh {}",
@@ -90,4 +90,33 @@ pub fn prove(program: Program, path: &str, out: &str) -> Result<()> {
     let expected = program.expected(&bytes)?;
     let receipt = super::prove_bytes(&bin, program.name(), &bytes, &expected, true)?;
     super::export_receipt(&bin, &receipt, out, expected.len())
+}
+
+/// The succinct (STARK) receipt only, written for [`wrap`] elsewhere: the
+/// part of a proof a phone can make, Groth16 needing an x86 machine.
+pub fn prove_succinct(program: Program, path: &str) -> Result<()> {
+    let bytes = read(path)?;
+    let bin = program.guest()?;
+    let expected = program.expected(&bytes)?;
+    super::prove_bytes(&bin, program.name(), &bytes, &expected, false)?;
+    Ok(())
+}
+
+/// A succinct receipt of the guest at `receipt`, wrapped in Groth16,
+/// verified and exported to `out`.
+pub fn wrap(program: Program, receipt: &str, out: &str) -> Result<()> {
+    let bin = program.guest()?;
+    let succinct: risc0_zkvm::Receipt = bincode::deserialize(&read(receipt)?)?;
+    let id = risc0_zkvm::compute_image_id(&bin)?;
+    succinct.verify(id).context("not a receipt of this guest")?;
+    let journal = succinct.journal.bytes.len();
+    let t = Instant::now();
+    let opts = risc0_zkvm::ProverOpts::groth16();
+    let wrapped = risc0_zkvm::default_prover().compress(&opts, &succinct)?;
+    println!(
+        "{}: groth16 wrap in {:.1} s",
+        program.name(),
+        t.elapsed().as_secs_f64()
+    );
+    super::export_receipt(&bin, &wrapped, out, journal)
 }

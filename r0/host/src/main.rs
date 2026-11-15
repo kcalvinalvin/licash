@@ -6,6 +6,12 @@
 //!                                           execute an input; prints journal and cycles
 //!   licash-r0 native-prove|native-counter-prove <input.bin> <out.json>
 //!                                           prove, wrap in Groth16, verify and export
+//!   licash-r0 native-prove-succinct <input.bin>
+//!                                           prove the holder's (STARK) only, as a phone
+//!                                           can: writes the receipt
+//!   licash-r0 native-wrap <receipt> <out.json>
+//!                                           wrap such a receipt in Groth16 (x86, Docker),
+//!                                           verify and export
 //!
 //! Packed guests are read from `r0/guests/` (built by r0/build-guest.sh).
 
@@ -195,7 +201,9 @@ fn main() -> Result<()> {
         ["native-counter-exec", path] => native::exec(native::Program::Counter, path),
         ["native-prove", path, out] => native::prove(native::Program::Holder, path, out),
         ["native-counter-prove", path, out] => native::prove(native::Program::Counter, path, out),
-        _ => bail!("usage: licash-r0 pack <elf> <out.bin> | id <program.bin> | native-exec|native-counter-exec <input.bin> | native-prove|native-counter-prove <input.bin> <out.json>"),
+        ["native-prove-succinct", path] => native::prove_succinct(native::Program::Holder, path),
+        ["native-wrap", receipt, out] => native::wrap(native::Program::Holder, receipt, out),
+        _ => bail!("usage: licash-r0 pack <elf> <out.bin> | id <program.bin> | native-exec|native-counter-exec <input.bin> | native-prove|native-counter-prove <input.bin> <out.json> | native-prove-succinct <input.bin> | native-wrap <receipt> <out.json>"),
     }
 }
 
