@@ -39,6 +39,7 @@ import org.licash.core.ContractQuote
 import org.licash.core.ContractState
 import org.licash.core.Holding
 import org.licash.core.Notes
+import org.licash.core.OpeningStep
 import org.licash.wallet.Engine
 import org.licash.wallet.Ui
 import org.licash.wallet.credit
@@ -122,8 +123,16 @@ fun BalanceDetails(
                 if (here.isNotEmpty()) HubSplit(holding.available + holding.pending, here.sumOf { it.covers })
                 for (c in here) ContractCard(c, ui.chain.height, ui.developer) { closing = c }
                 if (ui.opening != null && sameHub(ui.opening, holding.hub)) {
-                    Hint("Opening a contract: a few minutes, downloading what it needs.")
-                    LinearProgressIndicator(Modifier.fillMaxWidth().padding(bottom = 8.dp))
+                    // Its card shows its steps once it has one.
+                    val stepping = here.any { it.state == ContractState.Opening && it.step != null }
+                    Hint(
+                        if (stepping) {
+                            "Opening a contract takes up to an hour: its steps show above."
+                        } else {
+                            "Opening a contract…"
+                        },
+                    )
+                    if (!stepping) LinearProgressIndicator(Modifier.fillMaxWidth().padding(bottom = 8.dp))
                 }
                 // A button that does not fit goes below whole, its words on one line.
                 FlowRow {
@@ -315,6 +324,18 @@ private fun ContractCard(c: Contract, height: Int, developer: Boolean, close: ()
             style = MaterialTheme.typography.bodySmall,
             color = colors.error,
         )
+        c.step?.let { step ->
+            val (done, words) = stepOf(step)
+            Text(
+                "Step ${done + 1} of $STEPS: $words",
+                Modifier.padding(top = 6.dp).testTag("contract-step"),
+                style = MaterialTheme.typography.bodySmall,
+            )
+            LinearProgressIndicator(
+                progress = { done / STEPS },
+                modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+            )
+        }
         Spacer(Modifier.height(4.dp))
         val left = c.protectsUntil.toLong() - height
         when (val s = c.state) {
@@ -350,6 +371,33 @@ private fun ContractCard(c: Contract, height: Int, developer: Boolean, close: ()
             }
             if (developer) Hint("Force closing, recovering your notes on Bitcoin, is not available yet.")
         }
+    }
+}
+
+/** An opening's steps, the last its funding confirming. */
+private const val STEPS = 7f
+
+/** Of an opening's steps, how far it is, in steps done, and what it waits on, in words. */
+private fun stepOf(s: OpeningStep): Pair<Float, String> = when (s) {
+    OpeningStep.Terms -> 0f to "asking the hub for its terms"
+    OpeningStep.Instances -> 1f to "the hub building its side, a few minutes"
+    OpeningStep.Checking -> 2f to "checking what the hub built"
+    is OpeningStep.Downloading -> {
+        // Of the four downloads, how far, then the transactions built.
+        val part = s.kept.toFloat() / s.keeping.coerceAtLeast(1u).toFloat()
+        val words = if (s.kept < s.keeping) {
+            "downloading what the hub built, ${s.kept} of ${s.keeping}"
+        } else {
+            "building the contract's transactions"
+        }
+        3f + part * 0.9f to words
+    }
+    OpeningStep.Signatures -> 4f to "waiting for the hub's signatures"
+    OpeningStep.Signing -> 5f to "signing its funding"
+    is OpeningStep.Confirming -> 6f to when (s.confirmations) {
+        0u -> "its funding sent, waiting for a block"
+        1u -> "its funding in a block, waiting for a few more"
+        else -> "its funding ${s.confirmations} blocks deep, waiting for a few more"
     }
 }
 

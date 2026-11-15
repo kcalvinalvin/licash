@@ -272,6 +272,31 @@ pub struct Contract {
     pub funding: Option<String>,
     /// When it was asked for, in seconds since the Unix epoch.
     pub created_at: i64,
+    /// While [`ContractState::Opening`] or [`ContractState::Confirming`]:
+    /// what it waits on now.
+    pub step: Option<OpeningStep>,
+}
+
+/// What a contract being opened waits on now, in order: each step done
+/// as the wallet last saw it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum OpeningStep {
+    /// The hub's terms, for the wallet's open.
+    Terms,
+    /// The hub's commitment to the instances of its programs it builds.
+    Instances,
+    /// The instances the hub opened, checked by the wallet.
+    Checking,
+    /// The instances the wallet keeps, downloaded from the hub: `kept`
+    /// of `keeping` so far, then the contract's transactions built.
+    Downloading { kept: u32, keeping: u32 },
+    /// The hub's signatures of those transactions.
+    Signatures,
+    /// The wallet's signature of the funding.
+    Signing,
+    /// The funding, broadcast, buried deep enough: `confirmations` so
+    /// far, 0 while in no block the wallet has seen.
+    Confirming { confirmations: u32 },
 }
 
 /// How far a payout has come, step by step, as the wallet last saw it.

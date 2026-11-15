@@ -19,7 +19,7 @@ use licash_contracts::holder::{self, Ask, Fate, Phase};
 use super::Wallet;
 use crate::{
     chain::Chain, Activity, Balance, ChainSource, Contract, ContractQuote, ContractState, Details,
-    Kind, LicashError, State,
+    Kind, LicashError, OpeningStep, State,
 };
 
 /// What opening a contract downloads and keeps, in bytes, about: the
@@ -154,10 +154,23 @@ impl Wallet {
     }
 
     fn contract(&self, c: &holder::Contract, covers: u64) -> Contract {
+        let (tip, state) = (self.tip(), state(c, self.tip()));
+        let step = match state {
+            ContractState::Opening => Some(opening_step(c.phase, holder::kept(&self.dir, &c.id))),
+            ContractState::Confirming => {
+                // As deep as the wallet saw her coin's spend: F, which
+                // spends it.
+                let spent_at = self.wallet.silent_spent_at(&c.deposit).ok().flatten();
+                let confirmations = confirmations(spent_at, tip);
+                Some(OpeningStep::Confirming { confirmations })
+            }
+            _ => None,
+        };
         Contract {
             id: hex(&c.id),
             hub: c.hub.clone(),
-            state: state(c, self.tip()),
+            state,
+            step,
             mock: c.mock,
             cap: u64::from(c.cap),
             covers,
@@ -323,6 +336,30 @@ fn activity(c: &holder::Contract) -> Option<Activity> {
     })
 }
 
+/// What an opening at `phase` waits on, `kept` of the instances it keeps
+/// on disk: what follows the last step done.
+fn opening_step(phase: Phase, kept: usize) -> OpeningStep {
+    let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+    match phase {
+        Phase::Started => OpeningStep::Terms,
+        Phase::Termed => OpeningStep::Instances,
+        Phase::Committed => OpeningStep::Checking,
+        Phase::Opened => OpeningStep::Downloading {
+            kept: count(kept.min(holder::KEEPS)),
+            keeping: count(holder::KEEPS),
+        },
+        Phase::Consented => OpeningStep::Signatures,
+        Phase::Signing => OpeningStep::Signing,
+        Phase::Funded => OpeningStep::Confirming { confirmations: 0 },
+    }
+}
+
+/// How deep a transaction in block `at`, if any, is at `tip`: 1 in the
+/// tip, and at least 1 in a block the wallet saw, its tip behind.
+fn confirmations(at: Option<u32>, tip: u32) -> u32 {
+    at.map_or(0, |at| tip.saturating_sub(at) + 1)
+}
+
 /// Where `c` stands at `tip`.
 fn state(c: &holder::Contract, tip: u32) -> ContractState {
     if let Some(reason) = &c.abandoned {
@@ -404,6 +441,41 @@ mod tests {
         refused.abandoned = Some("refused".into());
         let reason = "refused".to_owned();
         assert_eq!(state(&refused, 300), ContractState::Failed { reason });
+    }
+
+    #[test]
+    fn an_opening_waits_on_what_follows_its_last_step() {
+        use OpeningStep::*;
+        let steps = Phase::ALL.map(|phase| opening_step(phase, 1));
+        let downloading = Downloading {
+            kept: 1,
+            keeping: 4,
+        };
+        let confirming = Confirming { confirmations: 0 };
+        assert_eq!(
+            steps,
+            [
+                Terms,
+                Instances,
+                Checking,
+                downloading,
+                Signatures,
+                Signing,
+                confirming
+            ]
+        );
+        // Never more than it keeps, whatever else is on disk.
+        let all = opening_step(Phase::Opened, 9);
+        let all_kept = Downloading {
+            kept: 4,
+            keeping: 4,
+        };
+        assert_eq!(all, all_kept);
+        // Its funding in no block yet, in the tip, deeper.
+        assert_eq!(confirmations(None, 300), 0);
+        assert_eq!(confirmations(Some(300), 300), 1);
+        assert_eq!(confirmations(Some(298), 300), 3);
+        assert_eq!(confirmations(Some(301), 300), 1);
     }
 
     #[test]
