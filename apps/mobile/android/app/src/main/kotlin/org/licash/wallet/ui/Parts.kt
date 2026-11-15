@@ -41,6 +41,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -303,6 +304,8 @@ fun Line(label: String, value: String, modifier: Modifier = Modifier, tag: Strin
 fun Sheet(title: String, dismiss: () -> Unit, content: @Composable ColumnScope.() -> Unit) {
     ModalBottomSheet(
         onDismissRequest = dismiss,
+        // All of it at once: no half-open sheet hiding its button.
+        sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
         // Its own window: its test tags as resource ids too.
         modifier = Modifier.semantics { testTagsAsResourceId = true },
         containerColor = MaterialTheme.colorScheme.surfaceContainerLow,
