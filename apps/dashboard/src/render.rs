@@ -52,11 +52,10 @@ pub fn draw(f: &mut Frame, view: &View, ui: &Ui, status: &Status) {
 }
 
 fn header(f: &mut Frame, area: Rect, view: &View, ui: &Ui, status: &Status) {
-    let left = Line::from(vec![
+    let mut left = vec![
         Span::styled(" ◆ ", Style::new().fg(ACCENT)),
         Span::styled(view.title.clone(), BOLD),
-        Span::styled(format!("  {}", view.subtitle), DIM),
-    ]);
+    ];
     let mut right = Vec::new();
     for range in Range::ALL {
         let text = format!(" {range} ");
@@ -89,8 +88,19 @@ fn header(f: &mut Frame, area: Rect, view: &View, ui: &Ui, status: &Status) {
             format::span(status.read.as_secs() as i64)
         )
     };
-    right.push(Span::styled(read, DIM));
-    f.render_widget(Paragraph::new(left), area);
+    // What does not fit goes, whole: the subtitle first, then when it read.
+    let width = |spans: &[Span]| spans.iter().map(Span::width).sum::<usize>();
+    let fits = |more: usize| area.width as usize > width(&left) + width(&right) + more;
+    let subtitle = Span::styled(format!("  {}", view.subtitle), DIM);
+    if fits(subtitle.width()) {
+        left.push(subtitle);
+    }
+    let read = Span::styled(read, DIM);
+    let fits = |more: usize| area.width as usize > width(&left) + width(&right) + more;
+    if fits(read.width()) {
+        right.push(read);
+    }
+    f.render_widget(Paragraph::new(Line::from(left)), area);
     f.render_widget(Paragraph::new(Line::from(right).right_aligned()), area);
 }
 

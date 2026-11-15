@@ -415,6 +415,30 @@ fn a_card_drops_what_it_compares_with_rather_than_cut_it() {
 }
 
 #[test]
+fn the_header_drops_its_subtitle_whole_when_narrow() {
+    let header = |width| {
+        screen(&Ui::new(Range::Day), width, 30)
+            .lines()
+            .next()
+            .unwrap()
+            .to_owned()
+    };
+    assert!(
+        header(160).contains("licash hub  regtest · /data"),
+        "{}",
+        header(160)
+    );
+    for width in [60, 70, 80, 90] {
+        let line = header(width);
+        assert!(line.contains("! attention"), "{line}");
+        assert!(
+            !line.contains("regtest") || line.contains("regtest · /data"),
+            "{line}"
+        );
+    }
+}
+
+#[test]
 fn small_terminals_still_draw() {
     for (w, h) in [(40, 12), (80, 24), (20, 6)] {
         screen(&Ui::new(Range::Day), w, h);
