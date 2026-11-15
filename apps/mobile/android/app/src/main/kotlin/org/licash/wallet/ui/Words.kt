@@ -1,7 +1,18 @@
 package org.licash.wallet.ui
 
+import java.time.Instant
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
+import java.time.format.FormatStyle
+import java.util.Locale
 import org.licash.core.Balance
+import org.licash.core.Contract
+import org.licash.core.ContractState
+import org.licash.core.Rate
 import org.licash.wallet.credit
+import org.licash.wallet.host
+import org.licash.wallet.percent
+import org.licash.wallet.sat
 import org.licash.wallet.total
 
 /*
@@ -88,19 +99,111 @@ fun span(blocks: Long): String {
 fun day(
     seconds: Long,
     now: Long,
-    zone: java.time.ZoneId = java.time.ZoneId.systemDefault(),
-    locale: java.util.Locale = java.util.Locale.getDefault(),
+    zone: ZoneId = ZoneId.systemDefault(),
+    locale: Locale = Locale.getDefault(),
 ): String {
-    val at = java.time.Instant.ofEpochSecond(seconds).atZone(zone)
+    val at = Instant.ofEpochSecond(seconds).atZone(zone)
     val date = at.toLocalDate()
-    val today = java.time.Instant.ofEpochSecond(now).atZone(zone).toLocalDate()
-    val format = { pattern: String -> at.format(java.time.format.DateTimeFormatter.ofPattern(pattern, locale)) }
+    val today = Instant.ofEpochSecond(now).atZone(zone).toLocalDate()
+    val format = { pattern: String -> at.format(DateTimeFormatter.ofPattern(pattern, locale)) }
     return when {
         date == today -> at.format(
-            java.time.format.DateTimeFormatter.ofLocalizedTime(java.time.format.FormatStyle.SHORT).withLocale(locale),
+            DateTimeFormatter.ofLocalizedTime(FormatStyle.SHORT).withLocale(locale),
         )
         date == today.minusDays(1) -> "Yesterday"
         date.year == today.year -> format("MMM d")
         else -> format("MMM d, yyyy")
     }
 }
+
+/**
+ * A hub's name, short, from its `url`: its host, with its port if it names
+ * one; an onion service's by its first letters, the rest telling nobody
+ * anything.
+ */
+fun name(url: String): String {
+    val host = host(url)
+    val onion = host.substringBefore(':').removeSuffix(".onion")
+    return if (onion.length > 12 && host.substringBefore(':').endsWith(".onion")) {
+        onion.take(8) + "….onion" + host.substring(host.substringBefore(':').length)
+    } else {
+        host
+    }
+}
+
+/** A fee, as short as it can be said: `None`, `10 sat`, `0.5%`, `10 sat + 0.5%`. */
+fun charge(rate: Rate): String = when {
+    rate.base == 0uL && rate.ppm == 0uL -> "None"
+    rate.ppm == 0uL -> sat(rate.base)
+    rate.base == 0uL -> percent(rate.ppm)
+    else -> "${sat(rate.base)} + ${percent(rate.ppm)}"
+}
+
+/** What protection under the mock authority is worth, said wherever one shows. */
+const val MOCK = "Test only: protects nothing"
+
+/** What genuine protection can do for now, said wherever one shows. */
+const val UNRECOVERED = "Recovery is not in this app yet: treat as not protected"
+
+/**
+ * A protection as a row says it: where it `stands`, in a word; whether it
+ * is `on`, protecting now, `runs`, protecting or about to, or `failed`;
+ * whether the hub's bitcoin is `held` behind it; how long it has `left` to
+ * protect, and in how long it `ends`, the hub's bitcoin back to it, while
+ * the chain's height is known.
+ */
+data class Cover(
+    val stands: String,
+    val on: Boolean,
+    val runs: Boolean,
+    val failed: Boolean,
+    val held: Boolean,
+    val left: String?,
+    val ends: String?,
+)
+
+/** `contract`, in words, at the chain's `height`: 0 while unknown. */
+fun cover(contract: Contract, height: Int): Cover {
+    val state = contract.state
+    val on = state == ContractState.Protecting
+    val runs = on || state == ContractState.Opening || state == ContractState.Confirming
+    val held = on || state == ContractState.Confirming || state == ContractState.Ending
+    val known = height > 0
+    return Cover(
+        stands = when (state) {
+            ContractState.Opening -> "Setting up"
+            ContractState.Confirming -> "Confirming"
+            // A genuine one protects nothing this app can claim yet: live only.
+            ContractState.Protecting -> if (contract.mock) "Protecting" else "Live"
+            ContractState.Ending -> "Ending"
+            ContractState.Closed -> "Ended"
+            is ContractState.Failed -> "Failed"
+        },
+        on = on,
+        runs = runs,
+        failed = state is ContractState.Failed,
+        held = held,
+        left = if (runs && known) "${span(contract.protectsUntil.toLong() - height)} left" else null,
+        ends = if ((runs || held) && known) span(contract.closesAt.toLong() - height) else null,
+    )
+}
+
+/**
+ * Whether `contract` shows outside advanced mode at `now`, in seconds
+ * since 1970: not once ended, nor failed over a day ago.
+ */
+fun shown(contract: Contract, now: Long): Boolean = when (contract.state) {
+    ContractState.Closed -> false
+    is ContractState.Failed -> now - contract.createdAt < 86_400
+    else -> true
+}
+
+/** What a payout to this wallet leaves as change, protecting from it. */
+private const val FIRST_CHANGE: ULong = 10_000uL
+
+/** The coin to cash out to this wallet to pay a protection of `price`: it, and some change. */
+fun firstCoin(price: ULong): ULong = price + FIRST_CHANGE
+
+/** `amount` sat in bitcoin, as a payment link says it: `0.00033000`. */
+fun btc(amount: ULong): String =
+    "%d.%08d".format(Locale.US, (amount / 100_000_000uL).toLong(), (amount % 100_000_000uL).toLong())

@@ -67,7 +67,7 @@ fun Home(
     receive: () -> Unit,
     send: () -> Unit,
     settings: () -> Unit,
-    money: () -> Unit,
+    money: (at: String?) -> Unit,
     history: () -> Unit,
     open: (Activity) -> Unit,
 ) {
@@ -113,7 +113,7 @@ fun Home(
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.Center,
         ) {
-            Total(ui, money)
+            Total(ui) { money(null) }
             Going(ui, money, history, open)
             if (ui.hubs.isEmpty()) {
                 Spacer(Modifier.height(32.dp))
@@ -191,7 +191,7 @@ private fun Total(ui: Ui, open: () -> Unit) {
 
 /** What is going on, in a line: see [glance]. */
 @Composable
-private fun Going(ui: Ui, money: () -> Unit, history: () -> Unit, open: (Activity) -> Unit) {
+private fun Going(ui: Ui, money: (String?) -> Unit, history: () -> Unit, open: (Activity) -> Unit) {
     val going = glance(ui, System.currentTimeMillis() / 1000) ?: return
     var why by remember { mutableStateOf<String?>(null) }
     Spacer(Modifier.height(8.dp))
@@ -203,7 +203,7 @@ private fun Going(ui: Ui, money: () -> Unit, history: () -> Unit, open: (Activit
         onClick = when (going) {
             is Glance.One -> ({ open(going.activity) })
             is Glance.Many -> history
-            is Glance.Protecting -> money
+            is Glance.Protecting -> ({ money(going.hub) })
             is Glance.Behind -> ({ why = going.reason })
             Glance.Syncing -> null
         },

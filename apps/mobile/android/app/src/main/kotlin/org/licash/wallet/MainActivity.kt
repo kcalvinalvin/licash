@@ -35,10 +35,10 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import org.licash.core.Activity
 import org.licash.wallet.ui.ActivityDetails
-import org.licash.wallet.ui.BalanceDetails
 import org.licash.wallet.ui.History
 import org.licash.wallet.ui.Home
 import org.licash.wallet.ui.LicashTheme
+import org.licash.wallet.ui.Money
 import org.licash.wallet.ui.Onboarding
 import org.licash.wallet.ui.Receive
 import org.licash.wallet.ui.Send
@@ -58,7 +58,12 @@ private sealed interface Screen {
         val own: String? = null,
     ) : Screen
     data object Settings : Screen
-    data class Balance(val from: Screen = Home) : Screen
+
+    /**
+     * Where the money is, opened from `from`: all of it, or `at` one
+     * place, a hub's URL or what is on Bitcoin.
+     */
+    data class Money(val from: Screen = Home, val at: String? = null) : Screen
 
     /** The history: what came in and went out. */
     data object History : Screen
@@ -70,7 +75,7 @@ private sealed interface Screen {
 /** The screen back goes to from `screen`. */
 private fun parent(screen: Screen): Screen = when (screen) {
     is Screen.Send -> screen.from
-    is Screen.Balance -> screen.from
+    is Screen.Money -> if (screen.at != null) screen.copy(at = null) else screen.from
     is Screen.Details -> screen.from
     else -> Screen.Home
 }
@@ -147,19 +152,21 @@ private fun App(engine: Engine, link: String?, linkShown: () -> Unit) {
                         receive = { screen = Screen.Receive },
                         send = { screen = Screen.Send(null) },
                         settings = { screen = Screen.Settings },
-                        money = { screen = Screen.Balance() },
+                        money = { screen = Screen.Money(at = it) },
                         history = { screen = Screen.History },
                         open = { screen = Screen.Details(it, Screen.Home) },
                     )
                     Screen.History -> History(ui, open = { screen = Screen.Details(it) }) { screen = Screen.Home }
                     Screen.Receive -> Receive(engine) { screen = Screen.Home }
                     is Screen.Send -> Send(engine, ui, s.link, s.cashOut, s.own) { screen = s.from }
-                    Screen.Settings -> Settings(engine, ui, balance = { screen = Screen.Balance(Screen.Settings) }) {
+                    Screen.Settings -> Settings(engine, ui, balance = { screen = Screen.Money(Screen.Settings) }) {
                         screen = Screen.Home
                     }
-                    is Screen.Balance -> BalanceDetails(
+                    is Screen.Money -> Money(
                         engine,
                         ui,
+                        at = s.at,
+                        go = { screen = s.copy(at = it) },
                         cashOut = { screen = Screen.Send(null, it, s) },
                         payOwn = { link, own -> screen = Screen.Send(link, from = s, own = own) },
                     ) { screen = s.from }
