@@ -72,15 +72,23 @@ at that hub, shown apart in Balance, where adding the hub (its URL shown to
 confirm) counts it.
 
 Balance opens recovery contracts at the hubs that open them (`licash-hub run
---contracts`, on regtest only for now, under the mock authority: such a
-contract protects nothing). A contract locks the hub's collateral on Bitcoin
-behind the notes there, up to its cap, until its last block to recover in,
-then closes by itself, its collateral back to the hub. Its price is paid from
-a coin of the wallet's on Bitcoin, its change kept there; with none, the quote
-offers to cash notes out to the wallet first. Opening downloads about 100 MB
-and takes minutes, in the background, one at a time; several contracts at a
-hub, and at several hubs, add up. The notes contracts cover count as
-protected rather than on credit, in Balance and on Home. A contract closes no
+--contracts`: under the mock authority on regtest, where such a contract
+protects nothing, and of genuine programs on signet). A contract locks the
+hub's collateral on Bitcoin behind the notes there, up to its cap, until its
+last block to recover in, then closes by itself, its collateral back to the
+hub. Its price is paid from a coin of the wallet's on Bitcoin, its change
+kept there; with none, the quote offers to cash notes out to the wallet
+first. At a hub that lets the wallet choose (`--contracts-max-cap`), sliders
+choose its cap (at first half again the largest coin, at most the hub's
+`--contracts-per-coin` times the coin paying) and how long it lasts (at first
+half a year), priced live as the hub prices them, and the coin paying; its
+change then moves into Licash at that hub once its funding confirms, unless
+unticked. Opening downloads about 100 MB and takes minutes to an hour, in the
+background, one at a time, its steps shown; several contracts at a hub, and
+at several hubs, add up. Each says what it covers of the hub's notes, those
+ending first covering first, and the rest shows on credit, in red; the notes
+they cover count as protected rather than on credit, in Balance and on Home.
+A contract closes no
 sooner: Close says to cash out the hub's notes instead. Force closing,
 recovering the notes on Bitcoin, is not available yet. The contracts are kept
 beside the wallet's file, made only once one is asked for.

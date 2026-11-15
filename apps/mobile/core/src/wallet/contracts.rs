@@ -10,6 +10,7 @@
 
 use std::{
     collections::HashMap,
+    path::Path,
     sync::{atomic::Ordering, Arc, PoisonError},
 };
 
@@ -18,8 +19,8 @@ use licash_contracts::holder::{self, Ask, Fate, Phase};
 
 use super::Wallet;
 use crate::{
-    chain::Chain, Activity, Balance, ChainSource, Contract, ContractQuote, ContractState, Details,
-    Kind, LicashError, OpeningStep, State,
+    chain::Chain, Activity, Balance, ChainSource, Contract, ContractQuote, ContractState,
+    DepositCoin, Details, Kind, LicashError, OpeningStep, State,
 };
 
 /// What opening a contract downloads and keeps, in bytes, about: the
@@ -31,29 +32,55 @@ const DOWNLOAD: u64 = 100_100_000;
 /// kept longer would never move.
 const OPENING: i64 = 86_400;
 
+/// Blocks a contract chosen lasts at first: half a year.
+const HALF_YEAR: u32 = 26_280;
+
+/// The file in the wallet's directory naming the coins paying for
+/// contracts whose change moves into Licash once their funding confirms,
+/// one `txid:vout` a line: none without it.
+const CHANGES: &str = "contracts-change";
+
 /// Recovery contracts.
 #[uniffi::export]
 impl Wallet {
     /// What opening a contract at `hub`, a hub trusted, costs now, as it
     /// offers, and the coin on Bitcoin that would pay it.
     pub fn contract_quote(&self, hub: String) -> Result<ContractQuote, LicashError> {
-        let (hub, _) = self.contracting_hub(&hub)?;
+        let (hub, terms) = self.contracting_hub(&hub)?;
         let trust = licash_contracts::trust(self.wallet.network());
         let trust = trust.map_err(|e| LicashError::invalid(format!("{e:#}")))?;
         let offer = holder::offer(&self.wallet, &hub, None);
         let offer = self.runtime.block_on(offer).map_err(unavailable)?;
         let price = offer.price();
         let coin = holder::coin(&self.wallet, &self.dir, price).map_err(failed)?;
+        let coins = holder::coins(&self.wallet, &self.dir).map_err(failed)?;
         let blocks = offer.bounds.lock;
+        let after_assert = holder::after_assert(&offer.quote);
+        let largest = coins.first().map(|c| c.value);
+        let (suggested_cap, suggested_blocks) = match &terms.range {
+            Some(range) => suggested(range, largest),
+            None => (offer.quote.cap, blocks),
+        };
         Ok(ContractQuote {
             hub,
             price,
             cap: u64::from(offer.quote.cap),
             blocks,
-            protects_for: blocks.saturating_sub(holder::after_assert(&offer.quote)),
+            protects_for: blocks.saturating_sub(after_assert),
             mock: trust.mock,
             coin: coin.map(|c| c.value),
             download: DOWNLOAD,
+            range: terms.range.map(Into::into),
+            after_assert,
+            coins: coins
+                .iter()
+                .map(|c| DepositCoin {
+                    outpoint: c.outpoint.to_string(),
+                    value: c.value,
+                })
+                .collect(),
+            suggested_cap: u64::from(suggested_cap),
+            suggested_blocks,
         })
     }
 
@@ -82,13 +109,122 @@ impl Wallet {
             .contracting
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let chain = Chain(chain, self.wallet.network());
-        let tip = self.runtime.block_on(licash_wallet::Blocks::height(&chain));
-        self.saw(tip.map_err(|reason| LicashError::Unavailable { reason })?);
-        let opened = holder::open(&self.wallet, &chain, &self.dir, &hub, ask);
-        let opened = self.runtime.block_on(opened).map_err(unavailable)?;
-        // Protecting nothing before its funding is buried.
-        Ok(self.contract(&opened, 0))
+        self.opened(chain, &hub, ask)
+    }
+
+    /// Open a contract at `hub`, a hub trusted that lets the wallet
+    /// choose (its terms' range), protecting up to `cap` sat and closing
+    /// `blocks` from now, for at most `max_price`, paid from `coin`
+    /// (`txid:vout`; by default the smallest large enough), as
+    /// [`Wallet::open_contract`]. With `move_change`, its change moves
+    /// into Licash at the hub once its funding confirms
+    /// ([`Wallet::move_changes`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_chosen_contract(
+        &self,
+        chain: Arc<dyn ChainSource>,
+        hub: String,
+        cap: u64,
+        blocks: u32,
+        max_price: u64,
+        coin: Option<String>,
+        move_change: bool,
+    ) -> Result<Contract, LicashError> {
+        let (hub, terms) = self.contracting_hub(&hub)?;
+        let Some(range) = terms.range else {
+            return Err(LicashError::invalid(format!(
+                "{hub} offers contracts of {} sat over {} blocks only",
+                terms.cap, terms.blocks
+            )));
+        };
+        let cap = u32::try_from(cap)
+            .map_err(|_| LicashError::invalid(format!("a cap of {cap} sat: too large")))?;
+        let _contracting = self
+            .contracting
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let deposit = match coin {
+            Some(coin) => coin
+                .parse::<OutPoint>()
+                .map_err(|e| LicashError::invalid(format!("a coin {coin}: {e}")))?,
+            None => {
+                let least = holder::least(Some(range), cap, max_price);
+                let coin = holder::coin(&self.wallet, &self.dir, least).map_err(failed)?;
+                let coin = coin.ok_or_else(|| {
+                    LicashError::invalid(format!(
+                        "no coin on Bitcoin of {least} sat at least to pay for it"
+                    ))
+                })?;
+                coin.outpoint
+            }
+        };
+        let ask = Ask {
+            blocks,
+            max_price,
+            cap: Some(cap),
+            deposit: Some(deposit),
+        };
+        if move_change {
+            // Before the opening starts: one cut short carries on.
+            let mut changes = self.changes()?;
+            if !changes.contains(&deposit) {
+                changes.push(deposit);
+                self.set_changes(&changes)?;
+            }
+        }
+        let opened = self.opened(chain, &hub, ask);
+        if opened.is_err() && move_change {
+            // None started: no change to move.
+            let all = holder::list(&self.dir).map_err(failed)?;
+            if !all.iter().any(|c| c.deposit == deposit) {
+                let changes = self.changes()?.into_iter().filter(|c| *c != deposit);
+                self.set_changes(&changes.collect::<Vec<_>>())?;
+            }
+        }
+        opened
+    }
+
+    /// Move the change of the contracts opened to move it, once their
+    /// funding confirms, into Licash at their hubs (or another hub
+    /// trusted taking coins, if theirs does not), broadcasting through
+    /// `chain`: the moves under way. None while a contract is being
+    /// opened.
+    pub fn move_changes(&self, chain: Arc<dyn ChainSource>) -> Result<Vec<Activity>, LicashError> {
+        let changes = self.changes()?;
+        if changes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let Ok(_contracting) = self.contracting.try_lock() else {
+            return Ok(Vec::new());
+        };
+        let all = holder::list(&self.dir).map_err(failed)?;
+        let coins = self.wallet.silent_coins()?;
+        let mut left = Vec::new();
+        let mut moved = Vec::new();
+        for deposit in changes {
+            match change(&all, &coins, &deposit) {
+                Change::Wait => left.push(deposit),
+                Change::None => {
+                    tracing::info!(%deposit, "no change of a contract's to move");
+                }
+                Change::Move(coin, hub) => {
+                    let keep: Vec<OutPoint> = coins
+                        .iter()
+                        .map(|c| c.outpoint)
+                        .filter(|c| *c != coin)
+                        .collect();
+                    match self.move_keeping(chain.clone(), &keep, Some(hub)) {
+                        Ok(activity) => moved.push(activity),
+                        Err(e) => {
+                            tracing::warn!(%deposit, "moving a contract's change: {e}");
+                            left.push(deposit);
+                        }
+                    }
+                }
+            }
+        }
+        self.set_changes(&left)?;
+        Ok(moved)
     }
 
     /// The contracts, the newest first, as last seen.
@@ -118,6 +254,33 @@ impl Wallet {
 }
 
 impl Wallet {
+    /// Open a contract at `hub` as `ask`ed, through `chain`, the wallet
+    /// contracting.
+    fn opened(
+        &self,
+        chain: Arc<dyn ChainSource>,
+        hub: &str,
+        ask: Ask,
+    ) -> Result<Contract, LicashError> {
+        let chain = Chain(chain, self.wallet.network());
+        let tip = self.runtime.block_on(licash_wallet::Blocks::height(&chain));
+        self.saw(tip.map_err(|reason| LicashError::Unavailable { reason })?);
+        let opened = holder::open(&self.wallet, &chain, &self.dir, hub, ask);
+        let opened = self.runtime.block_on(opened).map_err(unavailable)?;
+        // Protecting nothing before its funding is buried.
+        Ok(self.contract(&opened, 0))
+    }
+
+    /// The coins paying for contracts whose change is to move into
+    /// Licash ([`changes`]).
+    fn changes(&self) -> Result<Vec<OutPoint>, LicashError> {
+        changes(&self.dir)
+    }
+
+    fn set_changes(&self, changes: &[OutPoint]) -> Result<(), LicashError> {
+        set_changes(&self.dir, changes)
+    }
+
     /// `hub`, a hub trusted that opens contracts, by its URL as contracts
     /// keep it, and its terms as its info says.
     fn contracting_hub(&self, hub: &str) -> Result<(String, licash_api::Contracts), LicashError> {
@@ -238,6 +401,91 @@ impl Wallet {
             c.abandoned.is_none() && c.phase < Phase::Funded && now - c.created_at < OPENING
         });
         Ok(opening.map(|c| c.deposit).collect())
+    }
+}
+
+/// The coins paying for contracts whose change is to move into Licash, as
+/// kept in `dir` ([`CHANGES`]): none if it was never asked.
+fn changes(dir: &Path) -> Result<Vec<OutPoint>, LicashError> {
+    let text = match std::fs::read_to_string(dir.join(CHANGES)) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(LicashError::failed(format!("{CHANGES}: {e}"))),
+    };
+    // A line that does not read names no coin: nothing moves for it.
+    Ok(text.lines().filter_map(|l| l.trim().parse().ok()).collect())
+}
+
+/// Keep `changes` in `dir`, as [`changes`] reads them: whole or not at all.
+fn set_changes(dir: &Path, changes: &[OutPoint]) -> Result<(), LicashError> {
+    let path = dir.join(CHANGES);
+    let failed = |e: std::io::Error| LicashError::failed(format!("{CHANGES}: {e}"));
+    if changes.is_empty() {
+        return match std::fs::remove_file(&path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(failed(e)),
+            _ => Ok(()),
+        };
+    }
+    let text: String = changes.iter().map(|c| format!("{c}\n")).collect();
+    let next = path.with_extension("next");
+    std::fs::write(&next, text).map_err(failed)?;
+    std::fs::rename(&next, &path).map_err(failed)
+}
+
+/// What a contract chosen within `range` is at first, paid from a coin of
+/// `coin` sat, if any: half again the coin, its change moved into Licash
+/// and as much again to receive, over half a year; within the range and
+/// the times the coin it may be.
+fn suggested(range: &licash_api::ContractRange, coin: Option<u64>) -> (u32, u32) {
+    let blocks = HALF_YEAR.clamp(range.min_blocks, range.max_blocks);
+    let most = coin.and_then(|c| range.max_cap_for(c).map(|most| (c, most)));
+    let cap = match most {
+        Some((coin, most)) => {
+            let half_again = coin.saturating_add(coin / 2);
+            u32::try_from(half_again)
+                .unwrap_or(u32::MAX)
+                .clamp(range.min_cap, most)
+        }
+        None => range.min_cap,
+    };
+    (cap, blocks)
+}
+
+/// What becomes of the change of the contract paid from `deposit`.
+#[derive(Debug, PartialEq, Eq)]
+enum Change<'a> {
+    /// Its funding not confirmed yet, or its opening not started.
+    Wait,
+    /// Nothing to move: its opening given up, or its change spent or none.
+    None,
+    /// Move this coin into Licash at this hub.
+    Move(OutPoint, &'a str),
+}
+
+/// What becomes of the change of the contract of `all` paid from
+/// `deposit`, the wallet's `coins` as they are.
+fn change<'a>(
+    all: &'a [holder::Contract],
+    coins: &[licash_wallet::SilentCoin],
+    deposit: &OutPoint,
+) -> Change<'a> {
+    // The newest paid from it: one given up may have been before.
+    let Some(c) = all.iter().find(|c| c.deposit == *deposit) else {
+        // Its opening never started: none is under way as this is asked.
+        return Change::None;
+    };
+    if c.abandoned.is_some() || c.fate == Some(Fate::Dead) {
+        return Change::None;
+    }
+    let Some(funding) = c.funding else {
+        return Change::Wait;
+    };
+    match coins.iter().find(|k| k.outpoint.txid == funding) {
+        Some(coin) if coin.spending.is_none() => Change::Move(coin.outpoint, &c.hub),
+        Some(_) => Change::None,
+        // Seen once its funding is buried and scanned: none then, or spent.
+        None if c.fate == Some(Fate::Live) => Change::None,
+        None => Change::Wait,
     }
 }
 
@@ -592,5 +840,132 @@ mod tests {
         let reserved = [(f, 60_000), (other, 10_000)];
         contracted(&mut balance, &[signed], 300, &[], &reserved);
         assert_eq!((balance.moving, balance.opening), (10_000, 37_000));
+    }
+
+    fn range() -> licash_api::ContractRange {
+        licash_api::ContractRange {
+            min_cap: 4_096,
+            max_cap: 100_000_000,
+            min_blocks: 432,
+            max_blocks: 26_280,
+            per_coin: 2,
+            base: 23_000,
+            ppm_year: 10_000,
+        }
+    }
+
+    #[test]
+    fn a_contract_chosen_is_at_first_half_again_the_largest_coin_for_half_a_year() {
+        // The 10 M sat coin: 15 M sat, 10 M once moved and 5 M to receive.
+        assert_eq!(suggested(&range(), Some(10_000_000)), (15_000_000, 26_280));
+        // Within the hub's range and twice the coin.
+        assert_eq!(suggested(&range(), Some(90_000_000)), (100_000_000, 26_280));
+        assert_eq!(suggested(&range(), Some(2_500)), (4_096, 26_280));
+        // No coin, or none large enough: the least.
+        assert_eq!(suggested(&range(), None), (4_096, 26_280));
+        assert_eq!(suggested(&range(), Some(2_000)), (4_096, 26_280));
+        // Half a year, or as long as the hub lets.
+        let short = licash_api::ContractRange {
+            max_blocks: 4_000,
+            ..range()
+        };
+        assert_eq!(suggested(&short, Some(10_000_000)).1, 4_000);
+    }
+
+    fn coin(txid: Txid, vout: u32, spending: Option<Txid>) -> licash_wallet::SilentCoin {
+        licash_wallet::SilentCoin {
+            outpoint: OutPoint { txid, vout },
+            value: 9_900_000,
+            height: 300,
+            change: false,
+            spending,
+        }
+    }
+
+    #[test]
+    fn a_contracts_change_moves_once_its_funding_confirms_and_never_twice() {
+        let deposit = OutPoint {
+            txid: Txid::from_byte_array([7; 32]),
+            vout: 0,
+        };
+        let paid = |phase, fate| holder::Contract {
+            deposit,
+            ..contract(1, phase, fate)
+        };
+        let f = Txid::from_byte_array([1; 32]);
+        let change_coin = coin(f, 1, None);
+        // Its opening not started, or given up: nothing.
+        assert_eq!(change(&[], &[], &deposit), Change::None);
+        let given_up = holder::Contract {
+            abandoned: Some("idle".into()),
+            ..paid(Phase::Funded, None)
+        };
+        assert_eq!(change(&[given_up], &[], &deposit), Change::None);
+        let dead = paid(Phase::Funded, Some(Fate::Dead));
+        assert_eq!(change(&[dead], &[], &deposit), Change::None);
+        // Being opened, or signed and not seen confirmed: later.
+        assert_eq!(
+            change(&[paid(Phase::Opened, None)], &[], &deposit),
+            Change::Wait
+        );
+        let signed = paid(Phase::Funded, Some(Fate::Open));
+        assert_eq!(
+            change(std::slice::from_ref(&signed), &[], &deposit),
+            Change::Wait
+        );
+        // Its change seen: moved, to its hub.
+        let coins = [
+            coin(Txid::from_byte_array([2; 32]), 0, None),
+            change_coin.clone(),
+        ];
+        assert_eq!(
+            change(std::slice::from_ref(&signed), &coins, &deposit),
+            Change::Move(change_coin.outpoint, HUB)
+        );
+        // Being spent already, by the move as it may be: not again.
+        let spent = [coin(f, 1, Some(Txid::from_byte_array([3; 32])))];
+        assert_eq!(
+            change(std::slice::from_ref(&signed), &spent, &deposit),
+            Change::None
+        );
+        // Buried with no change of the wallet's: none ever comes.
+        let live = paid(Phase::Funded, Some(Fate::Live));
+        assert_eq!(change(&[live], &[], &deposit), Change::None);
+    }
+
+    #[test]
+    fn the_changes_to_move_are_kept_whole_and_none_without_them() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(changes(dir.path()).unwrap().is_empty());
+        let a = OutPoint {
+            txid: Txid::from_byte_array([1; 32]),
+            vout: 0,
+        };
+        let b = OutPoint { vout: 3, ..a };
+        set_changes(dir.path(), &[a, b]).unwrap();
+        assert_eq!(changes(dir.path()).unwrap(), [a, b]);
+        // A line that does not read moves nothing; the rest stand.
+        let path = dir.path().join(CHANGES);
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, format!("{text}not a coin\n")).unwrap();
+        assert_eq!(changes(dir.path()).unwrap(), [a, b]);
+        set_changes(dir.path(), &[]).unwrap();
+        assert!(!path.exists());
+        assert!(changes(dir.path()).unwrap().is_empty());
+        set_changes(dir.path(), &[]).unwrap();
+    }
+
+    #[test]
+    fn the_app_prices_a_contract_chosen_as_its_hub_does() {
+        let range = crate::ContractRange::from(range());
+        assert_eq!(range.api(), super::tests::range());
+        // 15 M sat for half a year at 1% a year, over the base.
+        assert_eq!(crate::contract_price(range, 15_000_000, 26_280), 98_000);
+        assert_eq!(crate::contract_price(range, 4_096, 1_000), 23_000);
+        // A cap past what a hub could offer: priced as the most.
+        let most = crate::contract_price(range, u64::from(u32::MAX), 26_280);
+        assert_eq!(crate::contract_price(range, u64::MAX, 26_280), most);
+        assert_eq!(crate::contract_max_cap(range, 10_000_000), Some(20_000_000));
+        assert_eq!(crate::contract_max_cap(range, 2_047), None);
     }
 }

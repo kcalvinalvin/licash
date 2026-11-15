@@ -1223,13 +1223,13 @@ impl Wallet {
     pub fn move_to_licash(&self, chain: Arc<dyn ChainSource>) -> Result<Activity, LicashError> {
         let mut keep: Vec<OutPoint> = self.kept_coins()?.into_iter().map(|(c, _)| c).collect();
         keep.extend(self.opening_coins()?);
-        self.move_keeping(chain, &keep)
+        self.move_keeping(chain, &keep, None)
     }
 
     /// [`Wallet::move_to_licash`] of all the coins, those cashed out to the
     /// wallet too: but those paying for contracts being opened.
     pub fn move_all_to_licash(&self, chain: Arc<dyn ChainSource>) -> Result<Activity, LicashError> {
-        self.move_keeping(chain, &self.opening_coins()?)
+        self.move_keeping(chain, &self.opening_coins()?, None)
     }
 }
 
@@ -1315,17 +1315,21 @@ impl Wallet {
         Ok(moving)
     }
 
-    fn move_keeping(
+    pub(super) fn move_keeping(
         &self,
         chain: Arc<dyn ChainSource>,
         keep: &[OutPoint],
+        to: Option<&str>,
     ) -> Result<Activity, LicashError> {
         let hubs = self.wallet.hubs()?.into_iter();
-        let Some(hub) = hubs
+        let mut taking: Vec<String> = hubs
             .filter(|(_, i)| i.deposits.is_some())
             .map(|(u, _)| u)
-            .next()
-        else {
+            .collect();
+        // `to` first, if it takes them.
+        taking
+            .sort_by_key(|u| Some(u.trim_end_matches('/')) != to.map(|t| t.trim_end_matches('/')));
+        let Some(hub) = taking.into_iter().next() else {
             return Err(LicashError::invalid(
                 "no hub trusted takes coins on Bitcoin",
             ));
@@ -1644,6 +1648,7 @@ fn hub(url: &str, info: &licash_api::Info) -> Hub {
             price: c.price,
             blocks: c.blocks,
             mock: c.mock,
+            range: c.range.map(Into::into),
         }),
     }
 }

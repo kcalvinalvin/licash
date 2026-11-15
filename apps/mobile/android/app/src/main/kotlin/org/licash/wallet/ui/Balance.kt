@@ -16,8 +16,11 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Checkbox
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Slider
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -27,19 +30,32 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import kotlin.math.exp
+import kotlin.math.floor
+import kotlin.math.ln
+import kotlin.math.log10
+import kotlin.math.max
+import kotlin.math.pow
+import kotlin.math.roundToLong
 import kotlinx.coroutines.launch
 import org.licash.core.Contract
 import org.licash.core.ContractQuote
+import org.licash.core.ContractRange
 import org.licash.core.ContractState
+import org.licash.core.DepositCoin
 import org.licash.core.Holding
 import org.licash.core.Notes
 import org.licash.core.OpeningStep
+import org.licash.core.contractMaxCap
+import org.licash.core.contractPrice
+import org.licash.wallet.Chosen
 import org.licash.wallet.Engine
 import org.licash.wallet.Ui
 import org.licash.wallet.credit
@@ -222,7 +238,22 @@ fun BalanceDetails(
             dismissButton = { TextButton(onClick = { adding = null }) { Text("Cancel") } },
         )
     }
-    quote?.let { q ->
+    val q = quote
+    // Of terms chosen, if the hub has a range and a coin of the wallet's pays within it.
+    val range = q?.range
+    val paying = q?.coins.orEmpty().filter { range != null && contractMaxCap(range, it.value) != null }
+    if (q != null && range != null && paying.isNotEmpty()) {
+        ChooseContract(
+            q,
+            range,
+            paying,
+            open = { chosen, price ->
+                quote = null
+                engine.openContract(q.hub, price, chosen)
+            },
+            dismiss = { quote = null },
+        )
+    } else if (q != null) {
         OpenContract(
             q,
             open = {
@@ -495,6 +526,158 @@ private fun OpenContract(q: ContractQuote, open: () -> Unit, cashOutFirst: () ->
         dismissButton = { TextButton(onClick = dismiss) { Text("Cancel") } },
     )
 }
+
+/**
+ * A contract of terms chosen within `range`: which of `coins` pays for
+ * it, the most it protects and how long it lasts, at first as `q`
+ * suggests, priced as the hub prices them; its change moved into Licash
+ * once its funding confirms, or kept on Bitcoin.
+ */
+@Composable
+private fun ChooseContract(
+    q: ContractQuote,
+    range: ContractRange,
+    coins: List<DepositCoin>,
+    open: (Chosen, price: ULong) -> Unit,
+    dismiss: () -> Unit,
+) {
+    val context = LocalContext.current
+    val download = android.text.format.Formatter.formatShortFileSize(context, q.download.toLong())
+    var coin by remember(q) { mutableStateOf(coins.first()) }
+    var cap by remember(q) { mutableStateOf(q.suggestedCap) }
+    var blocks by remember(q) { mutableStateOf(q.suggestedBlocks.coerceIn(range.minBlocks, range.maxBlocks)) }
+    var moveChange by remember(q) { mutableStateOf(true) }
+    val most = contractMaxCap(range, coin.value) ?: range.minCap
+    val capped = cap.coerceIn(range.minCap, most)
+    val price = contractPrice(range, capped, blocks)
+    val pays = coin.value > price
+    val change = if (pays) coin.value - price else 0uL
+    val protectsFor = if (blocks > q.afterAssert) blocks - q.afterAssert else 0u
+    val note = MaterialTheme.typography.bodySmall
+    val quiet = MaterialTheme.colorScheme.onSurfaceVariant
+    AlertDialog(
+        onDismissRequest = dismiss,
+        title = { Text("Open a contract at ${host(q.hub)}?") },
+        text = {
+            Column(Modifier.verticalScroll(rememberScrollState())) {
+                Text("The hub locks collateral on Bitcoin behind your notes there.")
+                Spacer(Modifier.height(12.dp))
+                Text("Paid from your coin on Bitcoin of", style = MaterialTheme.typography.labelLarge)
+                FlowRow {
+                    for (c in coins) {
+                        FilterChip(
+                            selected = c == coin,
+                            onClick = { coin = c },
+                            label = { Text(sat(c.value)) },
+                            modifier = Modifier.padding(end = 8.dp).testTag("contract-coin"),
+                        )
+                    }
+                }
+                Spacer(Modifier.height(8.dp))
+                Text("Protects up to ${sat(capped)}", style = MaterialTheme.typography.labelLarge)
+                if (most > range.minCap) {
+                    Slider(
+                        value = capPosition(capped, range.minCap, most),
+                        onValueChange = { cap = capAt(it, range.minCap, most) },
+                        modifier = Modifier.testTag("contract-cap"),
+                    )
+                }
+                Text(
+                    "Lasts ${duration(blocks.toLong())} (${digits(blocks.toULong())} blocks)",
+                    style = MaterialTheme.typography.labelLarge,
+                )
+                if (range.maxBlocks > range.minBlocks) {
+                    Slider(
+                        value = blocks.toFloat(),
+                        onValueChange = { blocks = blocksAt(it, range.minBlocks, range.maxBlocks) },
+                        valueRange = range.minBlocks.toFloat()..range.maxBlocks.toFloat(),
+                        modifier = Modifier.testTag("contract-blocks"),
+                    )
+                }
+                Text(
+                    "It protects for $protectsFor blocks, ${duration(protectsFor.toLong())}, " +
+                        "and closes by itself after.",
+                    style = note,
+                    color = quiet,
+                )
+                Spacer(Modifier.height(8.dp))
+                if (pays) {
+                    Text("It costs ${sat(price)}. The rest of the coin, ${sat(change)} less the network fee, comes back to this wallet.")
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Checkbox(
+                            checked = moveChange,
+                            onCheckedChange = { moveChange = it },
+                            modifier = Modifier.testTag("contract-move-change"),
+                        )
+                        Text("Move it into Licash at ${host(q.hub)} once it confirms")
+                    }
+                    if (moveChange) {
+                        Text(
+                            if (capped >= change) {
+                                "Protected whole, with room for about ${sat(capped - change)} more to receive."
+                            } else {
+                                "Over what it protects: about ${sat(change - capped)} of it on credit."
+                            },
+                            style = note,
+                            color = if (capped >= change) quiet else MaterialTheme.colorScheme.error,
+                        )
+                    }
+                } else {
+                    Text(
+                        "It costs ${sat(price)}, more than this coin holds.",
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
+                Spacer(Modifier.height(8.dp))
+                Text("Opening takes a few minutes and downloads about $download.", style = note, color = quiet)
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    if (q.mock) "A mock contract, for testing: it protects nothing." else "$UNRECOVERED.",
+                    style = note,
+                    color = MaterialTheme.colorScheme.error,
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = { open(Chosen(capped, blocks, coin.outpoint, pays && moveChange), price) },
+                enabled = pays,
+                modifier = Modifier.testTag("contract-open"),
+            ) { Text("Open for ${sat(price)}") }
+        },
+        dismissButton = { TextButton(onClick = dismiss) { Text("Cancel") } },
+    )
+}
+
+/**
+ * The cap at `position`, from 0 to 1, of a slider from `least` to `most`
+ * sat, evenly by ratio (so a small cap is as easy to pick as a large one),
+ * to two significant digits but at its ends.
+ */
+internal fun capAt(position: Float, least: ULong, most: ULong): ULong {
+    if (most <= least || position <= 0f) return least
+    if (position >= 1f) return most
+    val lo = ln(least.coerceAtLeast(1uL).toDouble())
+    val exact = exp(lo + position * (ln(most.toDouble()) - lo))
+    val unit = 10.0.pow(max(0.0, floor(log10(exact)) - 1))
+    return ((exact / unit).roundToLong() * unit).roundToLong().toULong().coerceIn(least, most)
+}
+
+/** Where `cap` is on [capAt]'s slider. */
+internal fun capPosition(cap: ULong, least: ULong, most: ULong): Float {
+    if (most <= least) return 0f
+    val lo = ln(least.coerceAtLeast(1uL).toDouble())
+    return ((ln(cap.coerceAtLeast(1uL).toDouble()) - lo) / (ln(most.toDouble()) - lo)).toFloat().coerceIn(0f, 1f)
+}
+
+/** The blocks at `value` of a slider from `least` to `most`, in whole days but at its ends. */
+internal fun blocksAt(value: Float, least: UInt, most: UInt): UInt {
+    val days = (value / DAY_BLOCKS).roundToLong().coerceAtLeast(0L) * DAY_BLOCKS
+    return days.toUInt().coerceIn(least, most)
+}
+
+/** Blocks in a day, about. */
+private const val DAY_BLOCKS = 144L
 
 /** Why a contract does not close at once, and what to do instead: cash out its hub's notes. */
 @Composable
