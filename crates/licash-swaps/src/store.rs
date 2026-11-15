@@ -12,8 +12,33 @@ use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior};
 use crate::Error;
 
 /// The schema this provider reads and writes, as SQLite's `user_version`.
-const VERSION: i64 = 1;
+const VERSION: i64 = 2;
 
+/// Version 2: payouts on Bitcoin. A swap's kind is `notes`, a swap of notes
+/// at one hub for notes at another, or `chain`, a payout: its `to_url` is
+/// `bitcoin:<network>`, `address` the output script of the provider's coin,
+/// `amount` its value and `expiry` its timeout, a block height.
+const PAYOUTS: &str = "
+ALTER TABLE swaps ADD COLUMN kind TEXT NOT NULL DEFAULT 'notes';
+-- The payouts' coins, by their swaps' ids: claimed with the client's key
+-- claim_key and the preimage, taken back after the timeout with the
+-- provider's refund_key, a secret key, recorded before the coin is made.
+-- funding_tx is the wallet's transaction paying it, at output
+-- funding_vout, once made; refund_tx the provider's taking it back once
+-- timed out unclaimed. scanned is the last block looked in for its spend.
+CREATE TABLE payouts (
+    id BLOB PRIMARY KEY REFERENCES swaps (id),
+    claim_key BLOB NOT NULL,
+    refund_key BLOB NOT NULL,
+    funding_tx BLOB,
+    funding_vout INTEGER,
+    refund_tx BLOB,
+    scanned INTEGER
+) STRICT;
+";
+
+/// Version 1, as providers in the field hold it
+/// (`tests/fixtures/swaps-v1.sql`): never change it, add a migration.
 const SCHEMA: &str = "
 CREATE TABLE meta (
     one INTEGER PRIMARY KEY CHECK (one = 1),
@@ -71,6 +96,7 @@ impl Store {
         let store = Self::connect(path)?;
         store.write(|tx| {
             tx.execute_batch(SCHEMA)?;
+            tx.execute_batch(PAYOUTS)?;
             tx.pragma_update(None, "user_version", VERSION)?;
             tx.execute(
                 "INSERT INTO meta (one, nostr, created_at) VALUES (1, ?1, ?2)",
@@ -86,12 +112,22 @@ impl Store {
             return Err(Error::Setup(format!("no swaps file at {}", path.display())));
         }
         let store = Self::connect(path)?;
-        store.read(|c| {
-            let version: i64 = c.pragma_query_value(None, "user_version", |r| r.get(0))?;
-            if version != VERSION {
-                return Err(Error::Setup(format!(
-                    "swaps schema {version}, this version reads {VERSION}"
-                )));
+        // Checked and migrated in one transaction: a provider of another
+        // version opening it meanwhile sees it whole, either way.
+        store.write(|tx| {
+            let version: i64 = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
+            match version {
+                VERSION => {}
+                1 => {
+                    tx.execute_batch(PAYOUTS)?;
+                    tx.pragma_update(None, "user_version", VERSION)?;
+                    tracing::info!("swaps file migrated to schema {VERSION}");
+                }
+                _ => {
+                    return Err(Error::Setup(format!(
+                        "swaps schema {version}, this version reads 1 to {VERSION}"
+                    )))
+                }
             }
             Ok(())
         })?;

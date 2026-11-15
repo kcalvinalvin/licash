@@ -529,6 +529,7 @@ dependencies = [
  "licash",
  "licash-api",
  "licash-hub",
+ "licash-onchain",
  "licash-wallet",
  "rand_core",
  "rusqlite",

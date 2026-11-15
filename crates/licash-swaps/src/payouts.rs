@@ -1,0 +1,664 @@
+//! Payouts on Bitcoin ([`swaps::ChainRequest`]): the provider pays a
+//! client's lock at one of its hubs out as a coin on chain, a reverse
+//! submarine swap.
+//!
+//! A client locks a coin's value and the provider's fees to the provider at
+//! hub `from`, then asks for the payout. The provider checks that lock as
+//! its hub holds it, draws a refund key and records the payout, then pays
+//! the coin of its wallet's coins ([`Wallet::spend_silent`]) to an [`Htlc`]
+//! under the lock's hash: claimed with the client's key and the preimage,
+//! taken back with the provider's key after its timeout, [`swaps::Chain`]'s
+//! margin blocks before the client's lock expires. Once the client claimed
+//! the coin, revealing the preimage on chain, the provider claims the
+//! client's lock with it. Unclaimed, the provider takes the coin back once
+//! timed out.
+//!
+//! The provider's wallet watches the chain for its coins from a block its
+//! operator chose ([`Wallet::watch_silent`], without a hub): coins paid to
+//! its fallback addresses ([`Wallet::fallback_address`]), the change of its
+//! spends and the coins it takes back. [`Provider::follow_payouts`] scans
+//! for them and broadcasts the provider's transactions until a block holds
+//! them.
+//!
+//! [`Wallet::spend_silent`]: licash_wallet::Wallet::spend_silent
+//! [`Wallet::watch_silent`]: licash_wallet::Wallet::watch_silent
+//! [`Wallet::fallback_address`]: licash_wallet::Wallet::fallback_address
+
+use std::{future::Future, sync::PoisonError};
+
+use bitcoin::{
+    absolute::LOCK_TIME_THRESHOLD,
+    consensus::{deserialize, serialize},
+    secp256k1::{Secp256k1, SecretKey, XOnlyPublicKey},
+    Amount, FeeRate, OutPoint, ScriptBuf, Transaction,
+};
+use licash::spend::ProposalId;
+use licash_api::{
+    swaps::{self, ChainRequest, ChainSwap},
+    Funding, Hex, Problem,
+};
+use licash_onchain::deposit::Htlc;
+use licash_wallet::{first_spend, payout_depth, Blocks, Payee, Transport};
+use rand_core::{OsRng, RngCore};
+use rusqlite::{params, OptionalExtension};
+
+use crate::{declined, emit, now, refused, unavailable, Error, Hold, Notice, Provider, Row, Stage};
+
+/// Blocks a payout's coin leaves at least, past the confirmations its
+/// client waits for, before it times out: for the client to claim it.
+pub const PAYOUT_ROOM: u32 = 18;
+
+/// Blocks scanned for the wallet's coins at once.
+const SCAN_BATCH: u32 = 100;
+
+/// Bitcoin, as a provider paying out on it sees it: the blocks a wallet
+/// reads ([`Blocks`]), and a way to broadcast.
+pub trait Chain: Blocks + Sync {
+    /// Hand `tx` to the network.
+    fn broadcast(&self, tx: &Transaction) -> impl Future<Output = Result<(), String>> + Send;
+}
+
+/// A payout's coin as recorded.
+struct Coin {
+    htlc: Htlc,
+    refund_key: SecretKey,
+    funding: Option<(Transaction, u32)>,
+    refund: Option<Transaction>,
+    scanned: Option<u32>,
+}
+
+impl Coin {
+    fn outpoint(&self) -> Option<OutPoint> {
+        self.funding
+            .as_ref()
+            .map(|(tx, vout)| OutPoint::new(tx.compute_txid(), *vout))
+    }
+}
+
+fn x_only(key: &SecretKey) -> XOnlyPublicKey {
+    key.x_only_public_key(&Secp256k1::new()).0
+}
+
+fn random_key() -> SecretKey {
+    loop {
+        let mut bytes = [0; 32];
+        OsRng.fill_bytes(&mut bytes);
+        if let Ok(key) = SecretKey::from_slice(&bytes) {
+            return key;
+        }
+    }
+}
+
+/// A fee rate in sat per 1000 virtual bytes, as [`swaps::Chain::rate`].
+fn rate(per_kvb: u64) -> FeeRate {
+    FeeRate::from_sat_per_kwu(per_kvb.div_ceil(4))
+}
+
+/// Payouts taken.
+impl<T: Transport> Provider<T> {
+    /// Pay out on Bitcoin what pays this provider at hub `from`, on
+    /// `terms`: the provider pays nothing out on chain otherwise.
+    pub fn pay_out(mut self, terms: swaps::Chain) -> Self {
+        self.payouts = Some(terms);
+        self
+    }
+
+    /// What it pays out on Bitcoin, as its operator set it.
+    pub fn payout_terms(&self) -> Option<&swaps::Chain> {
+        self.payouts.as_ref()
+    }
+
+    /// What it pays out on Bitcoin now: nothing until its wallet watches
+    /// the chain, and coins up to what its coins free now pay.
+    pub(crate) fn chain_info(&self) -> Result<Option<swaps::Chain>, Error> {
+        let Some(terms) = self.payouts else {
+            return Ok(None);
+        };
+        if self.wallet.silent_next()?.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(swaps::Chain {
+            max: terms.max.min(self.free_on_chain(&terms)?),
+            ..terms
+        }))
+    }
+
+    /// What the wallet's coins no transaction spends pay, less the fee of
+    /// spending them all at the terms' rate: the most a coin is worth now.
+    fn free_on_chain(&self, terms: &swaps::Chain) -> Result<u64, Error> {
+        let free: Vec<u64> = self
+            .wallet
+            .silent_coins()?
+            .into_iter()
+            .filter(|c| c.spending.is_none())
+            .map(|c| c.value)
+            .collect();
+        // A key spend of each coin, and a coin and change, taproot both.
+        let vsize = 11 + 58 * free.len() as u64 + 2 * 43;
+        let fee = vsize.saturating_mul(terms.rate).div_ceil(1000);
+        Ok(free.iter().sum::<u64>().saturating_sub(fee))
+    }
+
+    /// Take the payout `request` asks for, or answer where it stands if
+    /// taken already. Declined unless the client's lock, as its hub holds
+    /// it, pays the provider the coin's value and its fees, unsettled, and
+    /// leaves the coin [`PAYOUT_ROOM`] blocks past its client's
+    /// confirmations at least before it times out, [`swaps::Chain`]'s
+    /// margin before the lock expires; or if the provider's coins pay too
+    /// little now. `chain` is the provider's view of Bitcoin, which the
+    /// coin is broadcast to.
+    pub async fn take_payout(
+        &self,
+        request: &ChainRequest,
+        chain: &impl Chain,
+    ) -> Result<ChainSwap, Problem> {
+        let id = request.lock()?;
+        let key = *id.as_bytes();
+        if let Some(row) = self.row(&key).map_err(unavailable)? {
+            return self.payout_again(&row, request);
+        }
+        let Some(terms) = self.chain_info().map_err(unavailable)? else {
+            return Err(declined("no payouts on Bitcoin"));
+        };
+        if request.value < terms.min || request.value > terms.max {
+            return Err(declined(format!(
+                "coins of {} to {} now",
+                terms.min, terms.max
+            )));
+        }
+        let claim = XOnlyPublicKey::from_slice(&request.claim()?)
+            .map_err(|_| Problem::invalid("the claim key is no key"))?;
+        let hubs = self.wallet.hubs().map_err(unavailable)?;
+        let Some((from, _)) = hubs.iter().find(|(_, info)| info.address == request.from) else {
+            return Err(declined("no payouts from this hub"));
+        };
+        let Some(_hold) = Hold::take(&self.busy, key) else {
+            return Err(unavailable("the payout is under way"));
+        };
+        let incoming = self
+            .wallet
+            .incoming(from, &hex::encode(key))
+            .await
+            .map_err(refused)?;
+        let due = terms.pays(request.value);
+        if incoming.amount < due {
+            return Err(declined(format!(
+                "the lock pays {}, the payout {due}",
+                incoming.amount
+            )));
+        }
+        if incoming.settled.is_some() || incoming.preimage.is_some() {
+            return Err(declined("the lock is settled"));
+        }
+        let tip = chain.height().await.map_err(unavailable)?;
+        let tip = tip.max(incoming.height);
+        let timeout = incoming.expiry.saturating_sub(terms.margin);
+        let room = tip
+            .saturating_add(payout_depth(self.wallet.network()))
+            .saturating_add(PAYOUT_ROOM);
+        if timeout < room || timeout >= LOCK_TIME_THRESHOLD {
+            return Err(declined(format!(
+                "the lock expires at {}: too soon to time a coin out {} blocks earlier",
+                incoming.expiry, terms.margin
+            )));
+        }
+        let refund_key = random_key();
+        let htlc = Htlc {
+            hash: incoming.hash,
+            claim,
+            refund: x_only(&refund_key),
+            timeout,
+        };
+        let taken = Taken {
+            from,
+            value: request.value,
+            fee: due - request.value,
+            paid: incoming.amount,
+            expiry_from: incoming.expiry,
+        };
+        let funding = self.fund(&key, &taken, &htlc, &refund_key, &terms)?;
+        if let Some(tx) = funding {
+            if let Err(e) = chain.broadcast(&tx).await {
+                tracing::warn!(id = %hex::encode(key), "payout's coin not broadcast yet: {e}");
+            }
+        }
+        self.payout_answer(&key)
+            .map_err(unavailable)?
+            .ok_or_else(|| unavailable("the payout is not recorded"))
+    }
+
+    /// The payout `row` asked for again: where it stands, if it is the
+    /// same.
+    fn payout_again(&self, row: &Row, request: &ChainRequest) -> Result<ChainSwap, Problem> {
+        let hubs = self.wallet.hubs().map_err(unavailable)?;
+        let from = hubs
+            .iter()
+            .find(|(u, _)| *u == row.from)
+            .map(|(_, i)| i.address);
+        let coin = self.coin(&row.id).map_err(unavailable)?;
+        let same = row.chain
+            && from == Some(request.from)
+            && row.amount == request.value
+            && coin.is_some_and(|c| Some(c.htlc.claim.serialize()) == request.claim().ok());
+        if !same {
+            return Err(declined("another swap of this lock"));
+        }
+        self.payout_answer(&row.id)
+            .map_err(unavailable)?
+            .ok_or_else(|| unavailable("the payout is not recorded"))
+    }
+
+    /// Record the payout `id` on `taken`, its coin `htlc`, and pay the coin
+    /// of the wallet's coins, if they pay enough: the coin, for the caller
+    /// to broadcast, unless the payout failed. Recorded before the coin is
+    /// made, which is recorded once made.
+    fn fund(
+        &self,
+        id: &[u8; 32],
+        taken: &Taken<'_>,
+        htlc: &Htlc,
+        refund_key: &SecretKey,
+        terms: &swaps::Chain,
+    ) -> Result<Option<Transaction>, Problem> {
+        let _taking = self.taking.lock().unwrap_or_else(PoisonError::into_inner);
+        if self.free_on_chain(terms).map_err(unavailable)? < taken.value {
+            return Err(declined("the provider holds too little on chain now"));
+        }
+        let script = htlc.script_pubkey();
+        let to = format!("bitcoin:{}", licash_onchain::network(self.wallet.network()));
+        let notice = Notice::Accepted {
+            id: hex::encode(id),
+            amount: taken.value,
+            fee: taken.fee,
+            from: taken.from.to_owned(),
+            to: to.clone(),
+        };
+        let recorded = self.store.write(|tx| {
+            let at = now();
+            let inserted = tx.execute(
+                "INSERT INTO swaps (id, hash, from_url, to_url, address, amount, fee, paid,
+                    expiry_from, expiry, state, kind, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'accepted', 'chain', ?11, ?11)
+                 ON CONFLICT DO NOTHING",
+                params![
+                    id,
+                    htlc.hash,
+                    taken.from,
+                    to,
+                    script.as_bytes(),
+                    taken.value as i64,
+                    taken.fee as i64,
+                    taken.paid as i64,
+                    taken.expiry_from,
+                    htlc.timeout,
+                    at
+                ],
+            )?;
+            if inserted == 1 {
+                tx.execute(
+                    "INSERT INTO payouts (id, claim_key, refund_key) VALUES (?1, ?2, ?3)",
+                    params![id, htlc.claim.serialize(), refund_key.secret_bytes()],
+                )?;
+                emit(tx, &notice)?;
+            }
+            Ok(inserted == 1)
+        });
+        match recorded {
+            Ok(true) => {}
+            Ok(false) => return Err(declined("a swap under this hash was taken before")),
+            Err(e) => return Err(unavailable(e)),
+        }
+        tracing::info!(
+            id = %hex::encode(id), from = taken.from, value = taken.value, fee = taken.fee,
+            timeout = htlc.timeout, "payout accepted"
+        );
+        let paid = self.wallet.spend_silent(
+            Payee::Script(script.clone()),
+            Some(taken.value),
+            rate(terms.rate),
+        );
+        let row = self.row(id).map_err(unavailable)?.expect("recorded");
+        let tx = match paid {
+            Ok(tx) => tx,
+            Err(e) => {
+                self.fail(id, &row, &format!("no coin paid: {e}"))
+                    .map_err(unavailable)?;
+                return Ok(None);
+            }
+        };
+        self.set_funding(id, &tx, &script, taken.value)
+            .map_err(unavailable)?;
+        Ok(Some(tx))
+    }
+
+    /// Record `tx`, the wallet's, as the coin of the payout `id`: its
+    /// output paying `value` to `script`.
+    fn set_funding(
+        &self,
+        id: &[u8; 32],
+        tx: &Transaction,
+        script: &ScriptBuf,
+        value: u64,
+    ) -> Result<(), Error> {
+        let vout = tx
+            .output
+            .iter()
+            .position(|o| o.script_pubkey == *script && o.value == Amount::from_sat(value))
+            .ok_or_else(|| licash_wallet::Error::Invalid("a coin paying no payout".into()))?;
+        self.store.write(|t| {
+            t.execute(
+                "UPDATE payouts SET funding_tx = ?2, funding_vout = ?3
+                 WHERE id = ?1 AND funding_tx IS NULL",
+                params![id, serialize(tx), vout as u32],
+            )?;
+            Ok(())
+        })
+    }
+}
+
+/// What the provider checked of a client's lock for a payout.
+struct Taken<'a> {
+    from: &'a str,
+    value: u64,
+    fee: u64,
+    paid: u64,
+    expiry_from: u32,
+}
+
+/// What the provider recorded of payouts.
+impl<T: Transport> Provider<T> {
+    /// The payout of the client's lock `id`, as its client is told.
+    pub fn payout(&self, id: &ProposalId) -> Result<Option<ChainSwap>, Error> {
+        self.payout_answer(id.as_bytes())
+    }
+
+    fn payout_answer(&self, id: &[u8; 32]) -> Result<Option<ChainSwap>, Error> {
+        let (Some(row), Some(coin)) = (self.row(id)?, self.coin(id)?) else {
+            return Ok(None);
+        };
+        if !row.chain {
+            return Ok(None);
+        }
+        let funding = match (&coin.funding, self.funding_height(&coin)?) {
+            (Some((tx, vout)), Some(height)) => Some(Funding {
+                txid: tx.compute_txid().to_string(),
+                vout: *vout,
+                height,
+            }),
+            _ => None,
+        };
+        Ok(Some(ChainSwap {
+            id: Hex(id.to_vec()),
+            state: row.stage.state(),
+            value: row.amount,
+            refund: Hex(coin.htlc.refund.serialize().to_vec()),
+            timeout: coin.htlc.timeout,
+            funding,
+            reason: row.reason.clone(),
+        }))
+    }
+
+    /// The block the coin is in, as the wallet's last scan saw it.
+    fn funding_height(&self, coin: &Coin) -> Result<Option<u32>, Error> {
+        let Some((tx, _)) = &coin.funding else {
+            return Ok(None);
+        };
+        let txid = tx.compute_txid();
+        let spends = self
+            .wallet
+            .silent_spends_paying(&coin.htlc.script_pubkey())?;
+        Ok(spends
+            .iter()
+            .find(|s| s.tx.compute_txid() == txid)
+            .and_then(|s| s.height))
+    }
+
+    fn coin(&self, id: &[u8; 32]) -> Result<Option<Coin>, Error> {
+        type Raw = (
+            [u8; 32],
+            u32,
+            [u8; 32],
+            [u8; 32],
+            Option<Vec<u8>>,
+            Option<u32>,
+            Option<Vec<u8>>,
+            Option<u32>,
+        );
+        let raw: Option<Raw> = self.store.read(|c| {
+            Ok(c.query_row(
+                "SELECT s.hash, s.expiry, p.claim_key, p.refund_key, p.funding_tx,
+                    p.funding_vout, p.refund_tx, p.scanned
+                 FROM payouts p JOIN swaps s ON s.id = p.id WHERE p.id = ?1",
+                [id],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                    ))
+                },
+            )
+            .optional()?)
+        })?;
+        let Some((hash, timeout, claim, refund_key, funding, vout, refund, scanned)) = raw else {
+            return Ok(None);
+        };
+        let bad = |what: &str| licash_wallet::Error::Invalid(format!("a payout's {what}"));
+        let refund_key = SecretKey::from_slice(&refund_key).map_err(|_| bad("refund key"))?;
+        let htlc = Htlc {
+            hash,
+            claim: XOnlyPublicKey::from_slice(&claim).map_err(|_| bad("claim key"))?,
+            refund: x_only(&refund_key),
+            timeout,
+        };
+        let tx = |raw: Option<Vec<u8>>| -> Result<Option<Transaction>, Error> {
+            raw.map(|raw| deserialize(&raw).map_err(|_| bad("transaction").into()))
+                .transpose()
+        };
+        let funding = match (tx(funding)?, vout) {
+            (Some(tx), Some(vout)) => Some((tx, vout)),
+            _ => None,
+        };
+        Ok(Some(Coin {
+            htlc,
+            refund_key,
+            funding,
+            refund: tx(refund)?,
+            scanned,
+        }))
+    }
+}
+
+/// Payouts taken on.
+impl<T: Transport> Provider<T> {
+    /// Take every payout under way on, `chain` the provider's view of
+    /// Bitcoin: scan for the wallet's coins, broadcast its transactions in
+    /// no block yet, and follow each coin until its client's claim reveals
+    /// the preimage, which claims the client's lock, or the provider takes
+    /// it back once timed out. The payouts that could not move now, by id
+    /// and why; `chain` if the scan failed.
+    pub async fn follow_payouts(&self, chain: &impl Chain) -> Result<Vec<(String, String)>, Error> {
+        let mut pending = Vec::new();
+        if let Err(e) = self.scan(chain).await {
+            tracing::warn!("no scan for the provider's coins: {e}");
+            pending.push(("chain".to_owned(), e.to_string()));
+        }
+        for tx in self.wallet.silent_spends()? {
+            if let Err(e) = chain.broadcast(&tx).await {
+                tracing::debug!(txid = %tx.compute_txid(), "not broadcast: {e}");
+            }
+        }
+        let open: Vec<[u8; 32]> = self.store.read(|c| {
+            let mut stmt = c.prepare(
+                "SELECT id FROM swaps WHERE kind = 'chain' AND state IN ('accepted', 'locked')
+                 ORDER BY created_at, rowid",
+            )?;
+            let rows = stmt.query_map([], |r| r.get(0))?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })?;
+        for id in open {
+            let Some(_hold) = Hold::take(&self.busy, id) else {
+                continue;
+            };
+            if let Err(e) = self.follow_payout(&id, chain).await {
+                tracing::warn!(id = %hex::encode(id), "payout pending: {e}");
+                pending.push((hex::encode(id), e.to_string()));
+            }
+        }
+        Ok(pending)
+    }
+
+    /// Payouts under way, which only [`Provider::follow_payouts`] takes on.
+    pub fn open_payouts(&self) -> Result<u64, Error> {
+        self.store.read(|c| {
+            Ok(c.query_row(
+                "SELECT count(*) FROM swaps WHERE kind = 'chain'
+                 AND state IN ('accepted', 'locked')",
+                [],
+                |r| r.get::<_, i64>(0),
+            )? as u64)
+        })
+    }
+
+    async fn scan(&self, chain: &impl Chain) -> Result<(), Error> {
+        if self.wallet.silent_next()?.is_none() {
+            return Ok(());
+        }
+        loop {
+            let scanned = self.wallet.scan_silent(None, chain, SCAN_BATCH).await?;
+            if scanned.next > scanned.height {
+                return Ok(());
+            }
+        }
+    }
+
+    async fn follow_payout(&self, id: &[u8; 32], chain: &impl Chain) -> Result<(), Error> {
+        let (Some(row), Some(coin)) = (self.row(id)?, self.coin(id)?) else {
+            return Ok(());
+        };
+        match row.stage {
+            Stage::Accepted if coin.funding.is_none() => {
+                // Stopped after the wallet paid the coin, or before.
+                let script = coin.htlc.script_pubkey();
+                let spends = self.wallet.silent_spends_paying(&script)?;
+                match spends.first() {
+                    Some(spend) => self.set_funding(id, &spend.tx, &script, row.amount),
+                    None => self.fail(id, &row, "stopped before paying the coin"),
+                }
+            }
+            Stage::Accepted => {
+                if self.funding_height(&coin)?.is_none() {
+                    return Ok(());
+                }
+                self.advance(id, Stage::Accepted, Stage::Locked, None, None)?;
+                tracing::info!(id = %hex::encode(id), "payout's coin confirmed");
+                self.watch_coin(id, &row, &coin, chain).await
+            }
+            Stage::Locked => self.watch_coin(id, &row, &coin, chain).await,
+            _ => Ok(()),
+        }
+    }
+
+    /// Follow the coin of the payout `row`, confirmed, until spent: by its
+    /// client's claim, whose preimage claims the client's lock, or by the
+    /// provider's taking it back, made once it timed out and broadcast
+    /// until buried.
+    async fn watch_coin(
+        &self,
+        id: &[u8; 32],
+        row: &Row,
+        coin: &Coin,
+        chain: &impl Chain,
+    ) -> Result<(), Error> {
+        let (Some(outpoint), Some(height)) = (coin.outpoint(), self.funding_height(coin)?) else {
+            // Out of the chain in a reorganization: waited for again.
+            return Ok(());
+        };
+        let script = coin.htlc.script_pubkey();
+        let tip = chain.height().await.map_err(licash_wallet::Error::Chain)?;
+        let first = coin.scanned.unwrap_or(height).max(height) + 1;
+        let Some((at, spend)) = first_spend(chain, outpoint, &script, first..=tip).await? else {
+            self.set_scanned(id, tip)?;
+            if tip >= coin.htlc.timeout {
+                self.refund(id, coin, chain).await?;
+            }
+            return Ok(());
+        };
+        if let Some(preimage) = coin.htlc.preimage_in(&spend, outpoint) {
+            tracing::info!(id = %hex::encode(id), height = at, "payout's coin claimed");
+            self.set_scanned(id, at)?;
+            self.advance(id, Stage::Locked, Stage::Paid, Some(&preimage), None)?;
+            let row = self.row(id)?.expect("recorded");
+            return self.claim(id, &row).await;
+        }
+        // Its only other spend: the provider's.
+        let need = payout_depth(self.wallet.network());
+        if tip + 1 - at < need {
+            // Looked for again next time, to count its confirmations.
+            self.set_scanned(id, at - 1)?;
+            return self.refund(id, coin, chain).await;
+        }
+        self.set_scanned(id, tip)?;
+        tracing::info!(id = %hex::encode(id), "refunded: the client never claimed the coin");
+        let notice = Notice::Refunded {
+            id: hex::encode(id),
+            amount: row.amount,
+        };
+        self.advance(
+            id,
+            Stage::Locked,
+            Stage::Refunded,
+            None,
+            Some((&notice, "")),
+        )?;
+        Ok(())
+    }
+
+    /// Take the coin of the payout `id` back, timed out: to the wallet's
+    /// fallback address, at the terms' rate. Recorded once made, broadcast
+    /// each time.
+    async fn refund(&self, id: &[u8; 32], coin: &Coin, chain: &impl Chain) -> Result<(), Error> {
+        let tx = match (&coin.refund, &coin.funding) {
+            (Some(tx), _) => tx.clone(),
+            (None, Some((funding, vout))) => {
+                let outpoint = OutPoint::new(funding.compute_txid(), *vout);
+                let value = funding.output[*vout as usize].value;
+                let to = self.wallet.fallback_address()?.script_pubkey();
+                let per_kvb = self.payouts.map_or(1_000, |t| t.rate);
+                let tx = coin
+                    .htlc
+                    .refund_tx(outpoint, value, to, rate(per_kvb), &coin.refund_key)
+                    .map_err(|e| licash_wallet::Error::Invalid(e.to_string()))?;
+                self.store.write(|t| {
+                    t.execute(
+                        "UPDATE payouts SET refund_tx = ?2 WHERE id = ?1 AND refund_tx IS NULL",
+                        params![id, serialize(&tx)],
+                    )?;
+                    Ok(())
+                })?;
+                tracing::info!(id = %hex::encode(id), txid = %tx.compute_txid(), "taking a payout's coin back");
+                tx
+            }
+            (None, None) => return Ok(()),
+        };
+        if let Err(e) = chain.broadcast(&tx).await {
+            tracing::debug!(id = %hex::encode(id), "refund not broadcast: {e}");
+        }
+        Ok(())
+    }
+
+    fn set_scanned(&self, id: &[u8; 32], height: u32) -> Result<(), Error> {
+        self.store.write(|t| {
+            t.execute(
+                "UPDATE payouts SET scanned = ?2 WHERE id = ?1",
+                params![id, height],
+            )?;
+            Ok(())
+        })
+    }
+}

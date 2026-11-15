@@ -15,7 +15,13 @@
 //! recorded before the next is asked for, so a provider stopped at any
 //! point takes its swaps on with [`Provider::step`]. What its operator is
 //! told of is kept in order: [`Provider::events`].
+//!
+//! A provider may pay notes out on Bitcoin too ([`Provider::pay_out`]): it
+//! takes payouts with [`Provider::take_payout`], locking a coin on chain
+//! under the client's hash, and follows them with
+//! [`Provider::follow_payouts`], given a view of the chain ([`Chain`]).
 
+mod payouts;
 mod store;
 
 use std::{
@@ -34,6 +40,7 @@ use rand_core::{OsRng, RngCore};
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
+pub use payouts::{Chain, PAYOUT_ROOM};
 use store::{now, Store};
 
 /// Blocks a provider's lock leaves at least before it expires: for the
@@ -257,6 +264,8 @@ struct Row {
     reason: Option<String>,
     created_at: i64,
     updated_at: i64,
+    /// A payout on Bitcoin, not a swap of notes.
+    chain: bool,
 }
 
 impl Row {
@@ -293,7 +302,7 @@ impl Row {
 const LAST_EVENT: &str = "SELECT coalesce(max(seq), 0) FROM events";
 
 const ROWS: &str = "SELECT id, hash, from_url, to_url, address, amount, fee, paid, expiry,
-    lock, preimage, state, reason, created_at, updated_at FROM swaps";
+    lock, preimage, state, reason, created_at, updated_at, kind = 'chain' FROM swaps";
 
 fn row_of(r: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
     Ok(Row {
@@ -312,6 +321,7 @@ fn row_of(r: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
         reason: r.get(12)?,
         created_at: r.get(13)?,
         updated_at: r.get(14)?,
+        chain: r.get(15)?,
     })
 }
 
@@ -372,6 +382,8 @@ pub struct Provider<T: Transport> {
     taking: Mutex<()>,
     /// The hubs the operator was told the provider holds too little at.
     short: Mutex<HashSet<String>>,
+    /// What it pays out on Bitcoin, if it does.
+    payouts: Option<swaps::Chain>,
 }
 
 /// Setup and what the provider says of itself.
@@ -396,6 +408,7 @@ impl<T: Transport> Provider<T> {
             busy: Mutex::default(),
             taking: Mutex::default(),
             short: Mutex::default(),
+            payouts: None,
         }
     }
 
@@ -434,7 +447,7 @@ impl<T: Transport> Provider<T> {
             margin: self.config.margin,
             hubs,
             nostr: None,
-            chain: None,
+            chain: self.chain_info()?,
         })
     }
 
@@ -800,9 +813,12 @@ impl<T: Transport> Provider<T> {
         if let Err(e) = self.wallet.unlink().await {
             tracing::warn!("notes stay linked for now: {e}");
         }
+        // Of payouts, those whose clients claimed their coins only: the rest
+        // follow the chain (Provider::follow_payouts).
         let open: Vec<[u8; 32]> = self.store.read(|c| {
             let mut stmt = c.prepare(
                 "SELECT id FROM swaps WHERE state IN ('accepted', 'locked', 'paid')
+                    AND (kind = 'notes' OR state = 'paid')
                  ORDER BY created_at, rowid",
             )?;
             let rows = stmt.query_map([], |r| r.get(0))?;
@@ -826,8 +842,8 @@ impl<T: Transport> Provider<T> {
             return Ok(());
         };
         match row.stage {
-            Stage::Accepted | Stage::Locked => self.follow(id, &row).await,
             Stage::Paid => self.claim(id, &row).await,
+            Stage::Accepted | Stage::Locked if !row.chain => self.follow(id, &row).await,
             _ => Ok(()),
         }
     }
@@ -883,11 +899,15 @@ impl<T: Transport> Provider<T> {
     }
 
     /// Claim the client's lock of the swap `row` with the preimage it
-    /// revealed.
+    /// revealed: of a payout, on chain, late as its hub takes it.
     async fn claim(&self, id: &[u8; 32], row: &Row) -> Result<(), Error> {
         let preimage = row.preimage.expect("paid on it");
         let key = hex::encode(id);
-        match self.wallet.claim(&row.from, &key, &preimage).await {
+        let claimed = match row.chain {
+            true => self.wallet.claim_revealed(&row.from, &key, &preimage).await,
+            false => self.wallet.claim(&row.from, &key, &preimage).await,
+        };
+        match claimed {
             Ok(_) | Err(licash_wallet::Error::AlreadyReceived) => {
                 tracing::info!(id = %key, amount = row.amount, fee = row.fee, "swap done");
                 let notice = Notice::Done {
@@ -922,9 +942,11 @@ impl<T: Transport> Provider<T> {
         })
     }
 
-    /// The swap of the client's lock `id`, as its client is told.
+    /// The swap of the client's lock `id`, as its client is told: none of
+    /// a payout ([`Provider::payout`]).
     pub fn swap(&self, id: &ProposalId) -> Result<Option<swaps::Swap>, Error> {
-        Ok(self.row(id.as_bytes())?.map(|row| row.swap()))
+        let row = self.row(id.as_bytes())?;
+        Ok(row.filter(|row| !row.chain).map(|row| row.swap()))
     }
 
     /// The swaps, newest first, at most `limit`.
