@@ -406,6 +406,17 @@ enum Command {
         #[arg(long, default_value_t = 10)]
         swaps: u32,
     },
+    /// An interactive dashboard of the provider's swaps, fees, notes and
+    /// health over time, read from its files only (never migrated), beside
+    /// the running provider or without it.
+    Dashboard {
+        #[command(flatten)]
+        dashboard: licash_dashboard::Args,
+        /// The running provider's URL, asked for its health [default:
+        /// http:// and `LICASH_SWAPS_LISTEN`, or 127.0.0.1:8340].
+        #[arg(long)]
+        url: Option<String>,
+    },
     /// The provider's events as JSON lines, oldest first.
     Events {
         #[arg(long, default_value_t = 0)]
@@ -544,6 +555,7 @@ fn command(cli: Cli) -> anyhow::Result<()> {
         Command::Address { chain } => address(&data, &chain),
         Command::TestNotify { notify } => test_notify(&notify),
         Command::Status { json, swaps } => status(&data, json, swaps),
+        Command::Dashboard { dashboard, url } => show(&data, dashboard, url),
         Command::Events {
             after,
             limit,
@@ -705,6 +717,16 @@ async fn shutdown() {
     #[cfg(not(unix))]
     let _ = interrupt.await;
     tracing::info!("stopping: finishing the requests in flight");
+}
+
+fn show(data: &Path, args: licash_dashboard::Args, url: Option<String>) -> anyhow::Result<()> {
+    let url = url.unwrap_or_else(|| {
+        let listen = std::env::var("LICASH_SWAPS_LISTEN");
+        format!("http://{}", listen.as_deref().unwrap_or("127.0.0.1:8340"))
+    });
+    let probe = licash_dashboard::Probe::new(&url, licash_swaps_service::HEALTH)?;
+    let data = data.to_owned();
+    args.run(move || licash_swaps_service::dashboard::report(&data, Some(&probe)))
 }
 
 fn status(data: &Path, json: bool, latest: u32) -> anyhow::Result<()> {

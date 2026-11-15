@@ -176,6 +176,37 @@ fn init_creates_the_provider_once_and_status_reads_it() {
 }
 
 #[test]
+fn the_dashboard_reads_the_provider_as_json_and_draws_on_a_terminal_only() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(licash_swaps(&dir, &["init", "--network", "regtest"])
+        .status
+        .success());
+    let no_service = ["--url", "http://127.0.0.1:1"];
+    let json = licash_swaps(
+        &dir,
+        &[&["dashboard", "--json", "--range", "7d"][..], &no_service].concat(),
+    );
+    assert!(json.status.success(), "{json:?}");
+    let view: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(
+        (&view["title"], &view["range"]),
+        (&"licash swaps".into(), &"7d".into())
+    );
+    let pages: Vec<_> = view["pages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| &p["title"])
+        .collect();
+    assert_eq!(pages, ["Overview", "Swaps", "Liquidity", "Fees", "Health"]);
+    // A provider of no hub swaps nothing.
+    assert_eq!(view["health"], "bad");
+    let drawn = licash_swaps(&dir, &[&["dashboard"][..], &no_service].concat());
+    assert!(!drawn.status.success());
+    assert!(String::from_utf8(drawn.stderr).unwrap().contains("--json"));
+}
+
+#[test]
 fn announcements_are_checked_before_anything_runs() {
     let dir = tempfile::tempdir().unwrap();
     let relay = ["--nostr-relay", "ws://127.0.0.1:1"];

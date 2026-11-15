@@ -4384,6 +4384,7 @@ dependencies = [
  "licash-transport",
  "licash-wallet",
  "rand_core 0.6.4",
+ "rusqlite",
  "serde_json",
  "tempfile",
  "tokio",

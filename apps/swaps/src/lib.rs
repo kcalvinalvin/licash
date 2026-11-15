@@ -2,6 +2,7 @@
 //! [`licash_api::swaps`], the steps that take its swaps on, the chain its
 //! payouts on Bitcoin follow, and its announcement on Nostr.
 
+pub mod dashboard;
 pub mod notify;
 
 use std::{sync::Arc, time::Duration};
