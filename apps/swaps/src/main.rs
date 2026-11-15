@@ -356,6 +356,12 @@ enum Command {
         #[arg(long, env = "LICASH_SWAPS_STEP", default_value_t = 10,
               value_parser = clap::value_parser!(u64).range(1..))]
         step: u64,
+        /// Renew notes a hub no longer unlinks since it restarted, paying
+        /// them to the provider itself, only if its fee on them is at most
+        /// this many parts per million of their value, its base fee
+        /// included: 0 renews them only for free.
+        #[arg(long, env = "LICASH_SWAPS_RENEW_PPM", default_value_t = licash_wallet::RENEW_PPM)]
+        renew_ppm: u32,
         /// Reach hubs, and Nostr relays, through this proxy, such as
         /// socks5h://127.0.0.1:9050 for Tor's (relays through SOCKS only).
         #[arg(long, env = "LICASH_SWAPS_PROXY")]
@@ -461,6 +467,7 @@ fn command(cli: Cli) -> anyhow::Result<()> {
             listen,
             terms,
             step,
+            renew_ppm,
             proxy,
             tor,
             onion,
@@ -495,6 +502,7 @@ fn command(cli: Cli) -> anyhow::Result<()> {
                 _ => Http::new(proxy.as_deref())?,
             };
             let provider = open(&data, transport, config)?;
+            provider.wallet().set_renew_limit(renew_ppm);
             let provider = match &source {
                 Some(source) => {
                     runtime.block_on(chain.watch(provider.wallet(), Some(source)))?;
@@ -854,5 +862,18 @@ mod tests {
         let mut none = None;
         announce_over(&mut none, &tor, None).unwrap();
         assert!(none.is_none());
+    }
+
+    #[test]
+    fn renewals_cost_at_most_100_parts_per_million_unless_set() {
+        let renew = |args: &[&str]| {
+            let cli = Cli::try_parse_from([&["licash-swaps", "run"], args].concat()).unwrap();
+            match cli.command {
+                Command::Run { renew_ppm, .. } => renew_ppm,
+                _ => unreachable!("run"),
+            }
+        };
+        assert_eq!(renew(&[]), 100);
+        assert_eq!(renew(&["--renew-ppm", "0"]), 0);
     }
 }

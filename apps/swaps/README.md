@@ -37,7 +37,10 @@ a start until it recovers. Back up `<data>/wallet.sqlite` and
 `<data>/swaps.sqlite` together. A stopped provider takes its swaps on when
 started again, but a swap whose client lock expires before it claims it is
 lost (`status` counts it, and a high-priority notification says so):
-`--margin` sets the blocks it keeps for that.
+`--margin` sets the blocks it keeps for that. Its wallet unlinks the notes
+it is paid each round, and renews those a hub no longer unlinks since it
+restarted, once, if the hub's fee on them is at most `--renew-ppm` parts
+per million of their value (100 by default, 0 for free renewals only).
 
 With `--chain URL` (Bitcoin Core's RPC, `http://user:password@host:8332`, or
 Esplora, `esplora+https://esplora.example/api`), the provider also pays notes
