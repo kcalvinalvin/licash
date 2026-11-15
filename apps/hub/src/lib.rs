@@ -6,6 +6,7 @@ pub mod dashboard;
 pub mod deposit;
 pub mod lightning;
 pub mod notify;
+pub mod peer;
 pub mod tweaks;
 pub mod watch;
 

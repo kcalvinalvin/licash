@@ -13,7 +13,7 @@ use licash_hub::{Error, Refusal, Settled};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 
 use super::{node_down, now, refused, Gateway, HeldState};
-use crate::Failure;
+use crate::{peer::Recorded, Failure};
 
 const VERSION: i64 = 1;
 
@@ -179,8 +179,14 @@ impl Gateway {
     /// Whether a receipt is under `hash`, which no other lock of the hub's
     /// own notes may take.
     pub fn holds(&self, hash: &[u8; 32]) -> Result<bool, String> {
+        Ok(self.recorded(hash)?.is_some())
+    }
+
+    /// The receipt under `hash`, if any, and the lock it backs once
+    /// locked.
+    pub fn recorded(&self, hash: &[u8; 32]) -> Result<Recorded, String> {
         match self.receipts.get(hash) {
-            Ok(receipt) => Ok(receipt.is_some()),
+            Ok(receipt) => Ok(receipt.map(|receipt| receipt.lock)),
             Err(Failure(problem)) => Err(problem.message),
         }
     }
@@ -207,7 +213,11 @@ impl Gateway {
             .ok_or_else(|| Failure(Problem::invalid("the amount overflows")))?;
         let canonical = Receive::new(&keyset, &ephemeral, &outputs, &hash);
         let canonical = serde_json::to_string(&canonical).expect("a receipt serializes");
+        let turn = self.peer.turn().await;
         if self.receipts.get(&hash)?.is_none() {
+            if self.peer.recorded(&hash)?.is_some() {
+                return Err(refused("the hub holds this hash for another payment"));
+            }
             if self
                 .on_hub(move |hub| hub.own_lock_of(&hash))
                 .await?
@@ -217,6 +227,7 @@ impl Gateway {
             }
             self.receipts.insert(&hash, &canonical, amount, msat)?;
         }
+        drop(turn);
         let receipt = self.receipts.get(&hash)?.ok_or_else(store_gone)?;
         if receipt.body != canonical {
             return Err(refused("another receipt under this hash"));
@@ -299,10 +310,44 @@ impl Gateway {
         }
         let body: Receive = serde_json::from_str(&receipt.body).map_err(|_| store_gone())?;
         let ((keyset, ephemeral, _), outputs) = (body.terms()?, body.outputs()?);
-        // A lock made before the gateway stopped.
+        let Some(least_expiry) = held.min_expiry else {
+            return Ok(());
+        };
+        let info = self.node.info().await.map_err(node_down)?;
+        let c = &self.config;
+        let depth = self.hub.info().policy.timing.min_depth;
+        // The latest a lock may expire, its HTLCs outlasting it, its refund
+        // and the gateway's downtime by the node's hold delta.
+        let latest = [c.hold_delta, depth, c.downtime, 1]
+            .iter()
+            .try_fold(least_expiry, |at, b| at.checked_sub(*b));
+        // Until the lock under the hash is recorded.
+        let turn = self.peer.turn().await;
+        // A lock made before the gateway stopped, or for a deposit under the
+        // same hash, which backs it once the deposits recorded it: one
+        // payment per lock.
         if let Some(lock) = self.on_hub(move |hub| hub.own_lock_of(&hash)).await? {
-            if lock.proposal.outputs() != outputs.as_slice() {
-                let message = format!("The hash of receipt {name} is locked to other notes.");
+            if self.peer.recorded(&hash)? == Some(Some(lock.proposal.id())) {
+                drop(turn);
+                let message = format!(
+                    "The hash of receipt {name} is locked for a deposit: its invoice is canceled."
+                );
+                self.alert(format!("taken {name}"), message).await;
+                return self.cancel(receipt).await;
+            }
+            let expiry = lock
+                .proposal
+                .lock()
+                .ok_or_else(store_gone)?
+                .terms()
+                .expiry();
+            if lock.proposal.outputs() != outputs.as_slice()
+                || latest.is_none_or(|latest| expiry > latest)
+            {
+                let message = format!(
+                    "The hash of receipt {name} is locked to other notes, or for longer than its \
+                     HTLCs last."
+                );
                 self.alert(format!("taken {name}"), message).await;
                 return Ok(());
             }
@@ -310,23 +355,15 @@ impl Gateway {
                 .update(&hash, "lock", &lock.proposal.id().as_bytes())?;
             return self.finish(receipt, "locked");
         }
-        let Some(least_expiry) = held.min_expiry else {
-            return Ok(());
-        };
-        let info = self.node.info().await.map_err(node_down)?;
         let (scanned, checkpoint) = self
             .on_hub(|hub| Ok((hub.scanned()?, hub.checkpoint())))
             .await?;
         let (Some((tip, _)), Some(checkpoint)) = (scanned, checkpoint) else {
             return Ok(());
         };
-        let c = &self.config;
-        let depth = self.hub.info().policy.timing.min_depth;
         let expiry = tip.max(info.height).saturating_add(c.receive_blocks);
-        let latest = [c.hold_delta, depth, c.downtime, 1]
-            .iter()
-            .try_fold(least_expiry, |at, b| at.checked_sub(*b));
         if latest.is_none_or(|latest| expiry > latest) {
+            drop(turn);
             tracing::warn!(hash = %name, least_expiry, expiry, "HTLCs expire too soon");
             return self.cancel(receipt).await;
         }
@@ -352,6 +389,7 @@ impl Gateway {
             // Retried: the hub catches up, or adopts its lock above.
             Err(Error::Refused(Refusal::Unsynced | Refusal::NoChain | Refusal::Exists)) => Ok(()),
             Err(Error::Refused(refusal)) => {
+                drop(turn);
                 tracing::warn!(hash = %name, %refusal, "the hub refuses to lock a receipt");
                 self.cancel(receipt).await
             }

@@ -37,7 +37,10 @@ use licash_hub::{Error, Hub, Refusal, Settled, Timing};
 use licash_onchain::deposit::{self, Htlc};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 
-use crate::Failure;
+use crate::{
+    peer::{Peer, Recorded},
+    Failure,
+};
 
 /// What deposits cost, the amounts taken and their timing, in satoshis
 /// and blocks.
@@ -534,6 +537,8 @@ pub struct Gateway {
     store: Store,
     /// What the operator was alerted of, once each.
     alerted: Mutex<HashSet<String>>,
+    /// The Lightning gateway, if the hub runs one.
+    pub(crate) peer: Peer,
 }
 
 impl Gateway {
@@ -556,6 +561,7 @@ impl Gateway {
             profile,
             config,
             alerted: Mutex::default(),
+            peer: Peer::default(),
         })
     }
 
@@ -603,7 +609,11 @@ impl Gateway {
             refund: Hex(refund.serialize().to_vec()),
         };
         let canonical = serde_json::to_string(&canonical).expect("a deposit serializes");
+        let turn = self.peer.turn().await;
         if self.store.get(&hash).map_err(store_down)?.is_none() {
+            if self.peer.recorded(&hash)?.is_some() {
+                return Err(refused("the hub holds this hash for another payment"));
+            }
             if self
                 .on_hub(move |hub| hub.own_lock_of(&hash))
                 .await?
@@ -637,6 +647,7 @@ impl Gateway {
                 .map_err(store_down)?;
             tracing::info!(hash = %hex::encode(hash), amount, pays, fund_by, timeout, "deposit asked");
         }
+        drop(turn);
         let record = self
             .store
             .get(&hash)
@@ -691,8 +702,14 @@ impl Gateway {
     /// Whether a deposit is under `hash`, which no other lock of the hub's
     /// own notes may take.
     pub fn holds(&self, hash: &[u8; 32]) -> Result<bool, String> {
+        Ok(self.recorded(hash)?.is_some())
+    }
+
+    /// The deposit under `hash`, if any, and the lock it backs once
+    /// locked.
+    pub fn recorded(&self, hash: &[u8; 32]) -> Result<Recorded, String> {
         let record = self.store.get(hash).map_err(|e| e.to_string())?;
-        Ok(record.is_some())
+        Ok(record.map(|record| record.lock))
     }
 
     /// Follow the chain and the deposits until the task is dropped, once
@@ -792,8 +809,20 @@ impl Gateway {
         let body: Deposit = serde_json::from_str(&record.body).map_err(|_| store_gone())?;
         let ((keyset, ephemeral, _), outputs) = (body.receive.terms()?, body.receive.outputs()?);
         let (lock_depth, timeout) = (self.lock_depth(), record.htlc.timeout);
-        // A lock made before the gateway stopped.
+        // Until the lock under the hash is recorded.
+        let _turn = self.peer.turn().await;
+        // A lock made before the gateway stopped, or for a receipt under
+        // the same hash, which backs it once the Lightning gateway recorded
+        // it: one payment per lock.
         if let Some(lock) = self.on_hub(move |hub| hub.own_lock_of(&hash)).await? {
+            if self.peer.recorded(&hash)? == Some(Some(lock.proposal.id())) {
+                let message = format!(
+                    "The hash of deposit {name} is locked for a Lightning receipt: its payer \
+                     takes its coins back."
+                );
+                self.alert(format!("taken {name}"), message).await;
+                return self.finish(record, "canceled");
+            }
             let expiry = lock
                 .proposal
                 .lock()

@@ -33,7 +33,7 @@ use licash_api::{Code, Fee, Lightning, Problem};
 use licash_hub::{Error, Hub, Timing};
 pub use lightning_invoice::Currency;
 
-use crate::Failure;
+use crate::{peer::Peer, Failure};
 
 /// What a node answers, or why it did not.
 pub type Call<'a, T> = Pin<Box<dyn Future<Output = Result<T, String>> + Send + 'a>>;
@@ -222,6 +222,8 @@ pub struct Gateway {
     identity: Mutex<Option<String>>,
     /// What the operator was alerted of, once each.
     alerted: Mutex<HashSet<String>>,
+    /// The deposits, if the hub takes them.
+    pub(crate) peer: Peer,
 }
 
 /// The node and the hub on the same chain: the node's view, and the
@@ -250,6 +252,7 @@ impl Gateway {
             paying: tokio::sync::Mutex::default(),
             identity: Mutex::default(),
             alerted: Mutex::default(),
+            peer: Peer::default(),
         })
     }
 

@@ -53,7 +53,10 @@ locks the hub's own notes to its payer, and the preimage the payer claims
 them with lets the hub claim the coins to the sweep address. Unclaimed
 deposits return to their payer after a timeout. `--deposit-*` flags set
 the fee, amounts and timing. Deposits are kept in `<data>/deposits.sqlite`:
-back it up with `hub.sqlite`. Alerts say when a claim is late or lost.
+back it up with `hub.sqlite`. Alerts say when a claim is late or lost. With
+both gateways, a deposit and a Lightning receipt never share a hash: one
+payment backs each lock of the hub's notes, and a payment made under a hash
+the other already locked for returns to its payer (an alert says so).
 
 With `--nostr-relay URL --announce-url URL` (and `--chain`), the hub
 announces itself on Nostr relays for wallets to discover, under a key

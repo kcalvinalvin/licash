@@ -20,6 +20,7 @@ use licash_hub_service::{
     dashboard, deposit,
     lightning::{lnd::Lnd, Config, Gateway},
     notify::{self, Notifier},
+    peer,
     tweaks::{self, Tweaks},
     watch::watch,
     Services,
@@ -831,6 +832,9 @@ fn command(cli: Cli) -> anyhow::Result<()> {
                 }
                 None => None,
             };
+            if let (Some(receipts), Some(deposits)) = (&gateway, &deposits) {
+                peer::pair(receipts, deposits);
+            }
             let tweaks = match indexing {
                 true => {
                     let path = cli.data.join("tweaks.sqlite");

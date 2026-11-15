@@ -28,7 +28,11 @@ use licash::spend::ChainProfile;
 use licash_api::{Code, Fee, Info, Problem, ReceiveState};
 use licash_chain_client::Source;
 use licash_hub::{Hub, Policy, Timing};
-use licash_hub_service::{deposit, Services};
+use licash_hub_service::{
+    deposit,
+    lightning::{self, fake::Fake, HeldState},
+    peer, Services,
+};
 use licash_wallet::{DepositState, Transport, Wallet};
 use serde_json::json;
 use tower::ServiceExt;
@@ -256,6 +260,107 @@ impl Transport for Local {
             })
         }
     }
+}
+
+fn lightning(net: &Net) -> (Arc<Fake>, Arc<lightning::Gateway>) {
+    let node = Arc::new(Fake::new());
+    let backend = net.backend.lock().unwrap();
+    node.tip(backend.chain.height(), backend.chain.tip());
+    drop(backend);
+    let config = lightning::Config {
+        hold_delta: 3,
+        downtime: 2,
+        receive_blocks: 6,
+        ..lightning::Config::default()
+    };
+    let gateway = lightning::Gateway::open(
+        net.hub.clone(),
+        node.clone(),
+        config,
+        &net.dir.path().join("lightning.sqlite"),
+    )
+    .unwrap();
+    (node, Arc::new(gateway))
+}
+
+#[tokio::test]
+async fn deposits_and_receipts_refuse_hashes_held_by_the_other_gateway() {
+    let net = Net::new().await;
+    let alice = net.wallet("alice");
+    let deposit = alice.deposit(HUB, 3_000).await.unwrap();
+    let (_, body) = net.asked("alice", &deposit.hash);
+    let (_, lightning) = lightning(&net);
+    peer::pair(&lightning, &net.deposits);
+    let refused = lightning.receive(&body.receive).await.unwrap_err().0;
+    assert_eq!(refused.code, Code::Forward);
+    assert!(refused.message.contains("another payment"));
+    let mut other = body.clone();
+    other.receive.hash = licash_api::Hex(vec![42; 32]);
+    lightning.receive(&other.receive).await.unwrap();
+    let refused = net.deposits.deposit(&other).await.unwrap_err().0;
+    assert_eq!(refused.code, Code::Forward);
+    assert!(refused.message.contains("another payment"));
+}
+
+#[tokio::test]
+async fn a_duplicate_deposit_is_canceled_when_its_receipt_locked_first() {
+    let net = Net::new().await;
+    let alice = net.wallet("alice");
+    let deposit = alice.deposit(HUB, 3_000).await.unwrap();
+    let (_, body) = net.asked("alice", &deposit.hash);
+    let hash = bytes(&deposit.hash);
+    let (node, lightning) = lightning(&net);
+    lightning.receive(&body.receive).await.unwrap();
+    peer::pair(&lightning, &net.deposits);
+    let cltv = node.held_cltv(hash).unwrap() as u32;
+    node.pay_held(hash, net.height() + cltv);
+    lightning.round().await;
+    let receipt = lightning.receive_status(&hash).unwrap();
+    assert_eq!(receipt.state, ReceiveState::Locked);
+    let lock = receipt.lock().unwrap().unwrap();
+    net.mine(2, vec![payment(&deposit.terms.unwrap().address, 3_100, 1)]);
+    net.deposits.round().await;
+    let status = net.deposits.deposit_status(&hash).unwrap().status;
+    assert_eq!(status.state, ReceiveState::Canceled);
+    assert_eq!(status.lock, None);
+    assert_eq!(
+        net.hub.own_lock_of(&hash).unwrap().unwrap().proposal.id(),
+        lock
+    );
+    assert!(alerts(&net.hub)
+        .iter()
+        .any(|a| a.contains("locked for a Lightning receipt")));
+}
+
+#[tokio::test]
+async fn a_duplicate_receipt_is_canceled_when_its_deposit_locked_first() {
+    let net = Net::new().await;
+    let alice = net.wallet("alice");
+    let deposit = alice.deposit(HUB, 3_000).await.unwrap();
+    let (_, body) = net.asked("alice", &deposit.hash);
+    let hash = bytes(&deposit.hash);
+    let (node, lightning) = lightning(&net);
+    lightning.receive(&body.receive).await.unwrap();
+    peer::pair(&lightning, &net.deposits);
+    net.mine(2, vec![payment(&deposit.terms.unwrap().address, 3_100, 1)]);
+    net.deposits.round().await;
+    let status = net.deposits.deposit_status(&hash).unwrap().status;
+    assert_eq!(status.state, ReceiveState::Locked);
+    let lock = status.lock().unwrap().unwrap();
+    let cltv = node.held_cltv(hash).unwrap() as u32;
+    node.pay_held(hash, net.height() + cltv);
+    lightning.round().await;
+    let receipt = lightning.receive_status(&hash).unwrap();
+    assert_eq!(receipt.state, ReceiveState::Canceled);
+    assert_eq!(receipt.lock, None);
+    assert_eq!(node.held(hash).unwrap().0, HeldState::Canceled);
+    assert_eq!(
+        net.hub.own_lock_of(&hash).unwrap().unwrap().proposal.id(),
+        lock
+    );
+    assert!(alerts(&net.hub)
+        .iter()
+        .any(|a| a.contains("locked for a deposit")));
 }
 
 #[tokio::test]
