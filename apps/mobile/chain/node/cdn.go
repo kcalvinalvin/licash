@@ -36,6 +36,8 @@ const (
 	statusEvery = time.Minute
 	// maxFilterFile bounds a file of filters held in memory.
 	maxFilterFile = 128 << 20
+	// maxImportFile bounds a file of headers downloaded to import.
+	maxImportFile = 1 << 30
 )
 
 // cdnStatus is what a block-dn server's /status says of itself.
@@ -59,11 +61,12 @@ type cdn struct {
 	done map[uint32]bool
 }
 
-// newCDN is the server at base, if it follows the chain of params.
-func newCDN(base string, params *chaincfg.Params, log *slog.Logger) (*cdn, error) {
+// newCDN is the server at base, if it follows the chain of params, reached
+// through proxy if set.
+func newCDN(base string, params *chaincfg.Params, proxy *Proxy, log *slog.Logger) (*cdn, error) {
 	c := &cdn{
 		base:   strings.TrimRight(base, "/"),
-		client: &http.Client{Timeout: fileTimeout},
+		client: httpClient(proxy, fileTimeout),
 		log:    log,
 		done:   make(map[uint32]bool),
 	}
@@ -117,6 +120,64 @@ func (c *cdn) headersImport(held uint32) *neutrino.HeadersImportConfig {
 		BlockHeadersSource:  fmt.Sprintf("%s/headers/import/%d", c.base, end),
 		FilterHeadersSource: fmt.Sprintf("%s/filter-headers/import/%d", c.base, end),
 	}
+}
+
+// importFiles is headersImport's, downloaded into dir as files for
+// neutrino to import: through the server's client, so through its proxy if
+// any, where neutrino would fetch them directly. Nothing if nothing is to
+// be imported. The files are removed by remove, once imported.
+func (c *cdn) importFiles(dir string, held uint32) (imp *neutrino.HeadersImportConfig, remove func(), err error) {
+	urls := c.headersImport(held)
+	if urls == nil {
+		return nil, func() {}, nil
+	}
+	blocks := filepath.Join(dir, "import-block-headers.bin")
+	filters := filepath.Join(dir, "import-filter-headers.bin")
+	remove = func() {
+		_ = os.Remove(blocks)
+		_ = os.Remove(filters)
+	}
+	for path, url := range map[string]string{
+		blocks:  urls.BlockHeadersSource,
+		filters: urls.FilterHeadersSource,
+	} {
+		if err := c.download(url, path); err != nil {
+			remove()
+			return nil, func() {}, err
+		}
+	}
+	imp = &neutrino.HeadersImportConfig{BlockHeadersSource: blocks, FilterHeadersSource: filters}
+	return imp, remove, nil
+}
+
+// download writes what url holds to path.
+func (c *cdn) download(url, path string) error {
+	resp, err := c.client.Get(url)
+	if err != nil {
+		return fmt.Errorf("downloading %s: %w", url, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("downloading %s: HTTP %d", url, resp.StatusCode)
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	n, err := io.Copy(file, io.LimitReader(resp.Body, maxImportFile+1))
+	if err == nil && n > maxImportFile {
+		err = fmt.Errorf("%s holds over %d bytes", url, maxImportFile)
+	}
+	if err == nil {
+		err = file.Sync()
+	}
+	if closed := file.Close(); err == nil {
+		err = closed
+	}
+	if err != nil {
+		return fmt.Errorf("downloading %s: %w", url, err)
+	}
+	return nil
 }
 
 // heldHeaders is how many block headers the node in dir holds, from the

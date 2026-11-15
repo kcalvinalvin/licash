@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
 	"sync"
@@ -39,6 +40,9 @@ type Config struct {
 	// filters fetched from it by the file, each checked against its header.
 	// The peers serve whatever it cannot.
 	CDN string
+	// Proxy, if set, is the SOCKS5 proxy everything is reached through:
+	// the peers, the names resolved and the CDN.
+	Proxy *Proxy
 	// Log receives the node's own events; nothing if nil.
 	Log *slog.Logger
 }
@@ -83,10 +87,15 @@ func Start(cfg Config) (*Node, error) {
 	var imp *neutrino.HeadersImportConfig
 	if cfg.CDN != "" {
 		var err error
-		if server, err = newCDN(cfg.CDN, &cfg.Params, log); err != nil {
+		if server, err = newCDN(cfg.CDN, &cfg.Params, cfg.Proxy, log); err != nil {
 			log.Warn("block-dn unusable, syncing from peers", "err", err)
 		} else {
-			imp = server.headersImport(heldHeaders(cfg.DataDir))
+			var remove func()
+			imp, remove, err = server.importFiles(cfg.DataDir, heldHeaders(cfg.DataDir))
+			if err != nil {
+				log.Warn("downloading headers failed, syncing from peers", "err", err)
+			}
+			defer remove()
 		}
 	}
 	n, err := start(cfg, imp)
@@ -121,6 +130,8 @@ func start(cfg Config, imp *neutrino.HeadersImportConfig) (*Node, error) {
 		PersistToDisk:  true,
 		MempoolEnabled: true,
 		HeadersImport:  imp,
+		Dialer:         dialer(cfg.Proxy),
+		NameResolver:   resolver(cfg.Proxy),
 	})
 	if err != nil {
 		_ = db.Close()
@@ -253,4 +264,22 @@ func (n *Node) Block(hash chainhash.Hash) (*wire.MsgBlock, error) {
 		return nil, err
 	}
 	return block.MsgBlock(), nil
+}
+
+// dialer is how neutrino reaches its peers: through proxy if set, else
+// its own way.
+func dialer(proxy *Proxy) func(net.Addr) (net.Conn, error) {
+	if proxy == nil {
+		return nil
+	}
+	return func(addr net.Addr) (net.Conn, error) { return proxy.Dial(addr.String()) }
+}
+
+// resolver is how neutrino resolves names, the DNS seeds' and the peers':
+// through proxy if set, else its own way.
+func resolver(proxy *Proxy) func(string) ([]net.IP, error) {
+	if proxy == nil {
+		return nil
+	}
+	return proxy.Lookup
 }
