@@ -28,7 +28,7 @@ pub const PUBLICATION_SATS: u64 = 20_000;
 /// The most F's and the graph's transactions pay, in sat per 1 000 vB.
 const MAX_RATE_SAT_PER_KVB: u64 = 10_000;
 
-/// [`MAX_RATE_SAT_PER_KVB`] in sat/vB.
+/// The most F's and the graph's transactions pay, in sat/vB.
 pub fn quote_ceiling() -> f64 {
     MAX_RATE_SAT_PER_KVB as f64 / 1_000.0
 }

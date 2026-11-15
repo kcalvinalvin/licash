@@ -137,8 +137,8 @@ impl Terms {
 #[derive(Args)]
 struct ChainArgs {
     /// Follow Bitcoin at this source: Bitcoin Core's JSON-RPC as
-    /// http://user:password@127.0.0.1:8332 (or ?cookie=PATH), or Esplora as
-    /// esplora+https://esplora.example/api.
+    /// `http://user:password@127.0.0.1:8332` (or `?cookie=PATH`), or
+    /// Esplora as `esplora+https://esplora.example/api`.
     #[arg(long, env = "LICASH_SWAPS_CHAIN", hide_env_values = true)]
     chain: Option<String>,
     /// The first block to look in for the provider's coins, once: an
