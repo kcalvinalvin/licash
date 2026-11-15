@@ -404,20 +404,26 @@ fn swap_bodies_name_hubs_by_address_and_locks_by_id() {
             Hub {
                 address: hub_a.address(),
                 max: 20_000,
+                margin: Some(40),
             },
             Hub {
                 address: hub_b.address(),
                 max: 0,
+                margin: None,
             },
         ],
         nostr: None,
         chain: None,
     };
     assert_eq!(json(&info), info);
-    assert_eq!(info.hub(&hub_a.address()).unwrap().max, 20_000);
+    let at_a = info.hub(&hub_a.address()).unwrap();
+    assert_eq!((at_a.max, info.margin_at(at_a)), (20_000, 40));
+    // A hub with no margin of its own, as an older provider lists it.
+    assert_eq!(info.margin_at(info.hub(&hub_b.address()).unwrap()), 12);
     assert!(info.hub(&client.address()).is_none());
     let text = serde_json::to_string(&info).unwrap();
     assert!(!text.contains("nostr"), "{text}");
+    assert_eq!(text.matches("margin").count(), 2, "{text}");
 
     let id = ProposalId::from_bytes([0xcd; 32]);
     let request = Request::new(

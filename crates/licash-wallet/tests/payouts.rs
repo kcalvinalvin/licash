@@ -84,6 +84,7 @@ impl Desk {
             hubs: vec![swaps::Hub {
                 address: self.net.hub(A).info().address,
                 max: 0,
+                margin: None,
             }],
             nostr: None,
             chain: *self.terms.lock().unwrap(),

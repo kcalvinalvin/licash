@@ -64,7 +64,8 @@ pub struct Info {
     /// The least and the most it swaps.
     pub min: u64,
     pub max: u64,
-    /// Its lock expires this many blocks before the client's, at least.
+    /// Its lock expires this many blocks before the client's, at least, at
+    /// every hub: the most of [`Hub::margin`].
     pub margin: u32,
     /// The hubs it swaps between.
     pub hubs: Vec<Hub>,
@@ -81,6 +82,11 @@ impl Info {
     pub fn hub(&self, address: &Address) -> Option<&Hub> {
         self.hubs.iter().find(|h| h.address == *address)
     }
+
+    /// Blocks its lock at `hub` expires before the client's, at least.
+    pub fn margin_at(&self, hub: &Hub) -> u32 {
+        hub.margin.unwrap_or(self.margin)
+    }
 }
 
 /// A hub a provider swaps at.
@@ -89,6 +95,12 @@ pub struct Hub {
     pub address: Address,
     /// The most it locks to a client there now.
     pub max: u64,
+    /// Its lock there expires this many blocks before the client's, at
+    /// least; [`Info::margin`] if not given. A provider that is not the
+    /// hub learns the preimage from it only by forcing it out on Bitcoin,
+    /// so this covers the hub's response window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub margin: Option<u32>,
 }
 
 /// What a provider pays out on Bitcoin: coins it locks to clients on
