@@ -4,6 +4,7 @@ use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     sync::{atomic::AtomicU32, Arc, Mutex, MutexGuard, PoisonError},
+    time::{Duration, Instant},
 };
 
 use bitcoin::{FeeRate, OutPoint};
@@ -60,7 +61,18 @@ pub struct Wallet {
     /// The times the blocks of the coins found claim, by height, as the
     /// light client told them: learned on each scan, kept in memory only.
     times: Mutex<HashMap<u32, i64>>,
+    /// When the hubs were last asked what URLs they name
+    /// ([`Wallet::ask_onions`]): never since it opened if none.
+    onions_asked: Mutex<Option<Instant>>,
 }
+
+/// How long the hubs asked what URLs they name may take, all at once
+/// ([`Wallet::ask_onions`]).
+const ASK_URLS: Duration = Duration::from_secs(30);
+
+/// How often the hubs are asked what URLs they name, at most
+/// ([`Wallet::ask_onions`]).
+const ASK_URLS_EVERY: Duration = Duration::from_secs(6 * 3600);
 
 /// What the app keeps of a wallet besides the SDK's file.
 #[derive(Default, Serialize, Deserialize)]
@@ -169,7 +181,7 @@ impl Wallet {
             false => (Http::new(None).map_err(LicashError::failed)?, Route::Direct),
         };
         let wallet = wallet(&wallet_file(&dir), http)?;
-        Ok(Arc::new(Self {
+        let wallet = Self {
             runtime,
             wallet,
             route,
@@ -180,7 +192,76 @@ impl Wallet {
             tip: AtomicU32::new(0),
             contracting: Mutex::new(()),
             times: Mutex::new(HashMap::new()),
-        }))
+            onions_asked: Mutex::new(None),
+        };
+        wallet.onions();
+        Ok(Arc::new(wallet))
+    }
+
+    /// Reach each hub trusted at the onion service it names as its own, if
+    /// any, while over Tor: its own URL is asked if that one does not open.
+    /// Of hubs only visited, or announced by others, none.
+    fn onions(&self) {
+        if !self.tor {
+            return;
+        }
+        let hubs = match self.wallet.hubs() {
+            Ok(hubs) => hubs,
+            Err(e) => return tracing::warn!("reading the hubs for their onion services: {e}"),
+        };
+        let http = self.wallet.transport();
+        for (url, info) in hubs {
+            // The first it names that is taken. Naming none, it may not have
+            // been asked since it named them: as it was.
+            let onion = info
+                .urls
+                .iter()
+                .find(|onion| http.set_onion(&url, Some(onion)));
+            match onion {
+                Some(onion) => tracing::debug!(%url, %onion, "reached at its onion service"),
+                None if !info.urls.is_empty() => {
+                    http.set_onion(&url, None);
+                }
+                None => {}
+            }
+        }
+    }
+
+    /// Over Tor, once open and every [`ASK_URLS_EVERY`] after at most:
+    /// learn again what each hub trusted at an `https://` URL says of
+    /// itself, for [`Wallet::onions`]. Its info kept may name no URLs, kept
+    /// by earlier versions or before it named any, or others than it names
+    /// now. All at once, in [`ASK_URLS`] at most: those not answering are
+    /// asked again only next time.
+    fn ask_onions(&self) {
+        if !self.tor {
+            return;
+        }
+        {
+            let mut asked = self
+                .onions_asked
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let now = Instant::now();
+            if asked.is_some_and(|at| now.saturating_duration_since(at) < ASK_URLS_EVERY) {
+                return;
+            }
+            *asked = Some(now);
+        }
+        let hubs = self.wallet.hubs().unwrap_or_default();
+        let asks = hubs
+            .iter()
+            .filter(|(url, _)| url.starts_with("https://") && !licash_nostr::onion(url))
+            .map(|(url, _)| async move {
+                if let Err(e) = self.wallet.add_hub(url).await {
+                    tracing::info!(%url, "asking the hub what URLs it names: {e}");
+                }
+            });
+        let asked = tokio::time::timeout(ASK_URLS, futures_util::future::join_all(asks));
+        if self.runtime.block_on(asked).is_err() {
+            tracing::info!("asking the hubs what URLs they name: not all answered in time");
+        }
+        self.onions();
     }
 
     fn kept(&self) -> Kept {
@@ -212,6 +293,7 @@ impl Wallet {
         };
         let url = url.as_str();
         let info = self.runtime.block_on(self.wallet.add_hub(url))?;
+        self.onions();
         // Its URL as the wallet keeps it.
         let mut kept = self.wallet.hubs()?.into_iter();
         let kept = kept
@@ -699,7 +781,7 @@ impl Wallet {
 
     /// Finish what was under way: payments, and moves to notes.
     pub fn resume(&self) -> Result<(), LicashError> {
-        let _delivering = self.delivering();
+        let delivering = self.delivering();
         // Moves kept before their hub answered, by earlier versions: none
         // paid them, as no address was named, and a move asks anew.
         for deposit in self.wallet.deposits()? {
@@ -708,6 +790,8 @@ impl Wallet {
             }
         }
         let resumed = self.runtime.block_on(self.wallet.resume())?;
+        // What the hubs said of themselves since.
+        self.onions();
         for (id, reason) in &resumed.abandoned {
             tracing::warn!(%id, %reason, "given up");
         }
@@ -716,6 +800,9 @@ impl Wallet {
         }
         self.unlink();
         self.deliver();
+        // Not under it: payments need not wait for the hubs asked.
+        drop(delivering);
+        self.ask_onions();
         Ok(())
     }
 }
