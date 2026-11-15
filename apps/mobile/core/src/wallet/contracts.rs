@@ -37,7 +37,7 @@ impl Wallet {
         let (hub, _) = self.contracting_hub(&hub)?;
         let trust = licash_contracts::trust(self.wallet.network());
         let trust = trust.map_err(|e| LicashError::invalid(format!("{e:#}")))?;
-        let offer = holder::offer(&self.wallet, &hub);
+        let offer = holder::offer(&self.wallet, &hub, None);
         let offer = self.runtime.block_on(offer).map_err(unavailable)?;
         let price = offer.price();
         let coin = holder::coin(&self.wallet, &self.dir, price).map_err(failed)?;
@@ -72,6 +72,8 @@ impl Wallet {
         let ask = Ask {
             blocks: blocks.unwrap_or(terms.blocks),
             max_price: max_price.unwrap_or(terms.price),
+            cap: None,
+            deposit: None,
         };
         let _contracting = self
             .contracting

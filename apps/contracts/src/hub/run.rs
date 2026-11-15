@@ -58,6 +58,11 @@ impl Openings {
                 "her deposit is no confirmed coin of the chain as she says",
             ));
         }
+        // No small coin locks much of the hub's.
+        let coin = open.coin.value.to_sat();
+        self.timing
+            .covers(opening.quote.cap, coin)
+            .map_err(Refused::bad)?;
         let start = Start::New {
             quote: Box::new(opening.quote),
             deposit: open.deposit,
@@ -106,11 +111,14 @@ impl Openings {
                 "a quote of block {height}, the tip at {tip}: ask again"
             )));
         }
+        // The terms she chose, if within the hub's: those of the quote.
+        let (cap, blocks) = (quote.cap, quote.chain.max_headers);
+        self.timing.allows(cap, blocks).map_err(Refused::bad)?;
         let checkpoint = self.source.checkpoint(height).await;
-        let ours = self.timing.quote(
-            self.keyset.clone(),
-            checkpoint.map_err(Refused::unavailable)?,
-        );
+        let checkpoint = checkpoint.map_err(Refused::unavailable)?;
+        let ours = self
+            .timing
+            .quote_for(self.keyset.clone(), checkpoint, cap, blocks);
         let bytes = |q: &Quote| {
             let mut w = Writer(Vec::new());
             w.quote(q);
@@ -171,7 +179,8 @@ impl Openings {
                 if self.store().under_way().map_err(Refused::unavailable)? >= MAX_UNDER_WAY {
                     return Err(Refused::unavailable("too many openings under way: later"));
                 }
-                let hub = Hub::new(*quote, self.timing.bounds);
+                let bounds = self.timing.bounds(&quote);
+                let hub = Hub::new(*quote, bounds);
                 let (hub, out) = stepped(&self.heavy, hub, Input::Message(message), ctx).await?;
                 let state = hub.to_bytes().map_err(Refused::unavailable)?;
                 let inserted = self

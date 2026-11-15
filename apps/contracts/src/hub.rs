@@ -13,14 +13,14 @@ mod run;
 mod store;
 pub mod terms;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use anyhow::{ensure, Result};
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, Path as UrlPath, State};
+use axum::extract::{DefaultBodyLimit, Path as UrlPath, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -33,7 +33,7 @@ use licash_contract::opening::{Context, Hub, Trust};
 
 use crate::{Frame, Offer, INSTANCE, MAX_BODY, OPEN, QUOTE, STEP};
 use store::Store;
-use terms::Timing;
+use terms::{Range, Timing};
 
 /// The most openings short of the hub's signatures at once.
 pub const MAX_UNDER_WAY: usize = 16;
@@ -182,23 +182,26 @@ impl Openings {
     /// wallet of the node `source` names (its JSON-RPC), as
     /// [`Openings::with_wallet`].
     pub async fn new(data: &Path, source: Source, keyset: Keyset) -> Result<Arc<Self>> {
-        Self::with_wallet(data, source.clone(), source, keyset).await
+        Self::with_wallet(data, source.clone(), source, keyset, None).await
     }
 
     /// The openings in `data` on the chain `source` follows, opened under
     /// `keyset` and funded by the node's wallet `wallet` names (its
     /// JSON-RPC, as `http://host:port/wallet/NAME`), which may be another
-    /// node's on the same network. Refused on a network the hub has no
-    /// terms or programs for: [`Timing::of`], [`crate::trust`].
+    /// node's on the same network. Holders choose their terms within
+    /// `range`, if any, else open on its fixed ones. Refused on a network
+    /// the hub has no terms or programs for: [`Timing::of`],
+    /// [`crate::trust`].
     pub async fn with_wallet(
         data: &Path,
         source: Source,
         wallet: Source,
         keyset: Keyset,
+        range: Option<Range>,
     ) -> Result<Arc<Self>> {
         let profile: ChainProfile = source.profile().await?;
         let trust = crate::trust(profile)?;
-        let timing = Timing::of(profile)?;
+        let timing = Timing::of(profile, range)?;
         // Not fatal: a node may load its wallet after the hub starts. F
         // goes unfunded, and its openings given up, until it does. Fatal
         // on another network: no F it funds could be the chain's.
@@ -231,23 +234,32 @@ impl Openings {
         Ok(openings)
     }
 
-    /// The hub's offer now: its quote, checkpointed at its tip.
-    pub async fn offer(&self) -> Result<Offer> {
-        let tip = self.source.tip().await?.height;
-        let checkpoint = self.source.checkpoint(tip).await?;
-        Ok(Offer {
-            quote: self.timing.quote(self.keyset.clone(), checkpoint),
-            bounds: self.timing.bounds,
-        })
+    /// The hub's offer now, checkpointed at its tip: its quote of `cap`
+    /// sat over `blocks` she chose, if within its terms, else its fixed
+    /// one.
+    pub async fn offer(&self, chosen: Option<(u32, u32)>) -> Result<Offer, Refused> {
+        let (cap, blocks) = chosen.unwrap_or((terms::CAP, terms::LOCK));
+        self.timing.allows(cap, blocks).map_err(Refused::bad)?;
+        let tip = self.source.tip().await.map_err(Refused::unavailable)?;
+        let checkpoint = self.source.checkpoint(tip.height).await;
+        let checkpoint = checkpoint.map_err(Refused::unavailable)?;
+        let quote = self
+            .timing
+            .quote_for(self.keyset.clone(), checkpoint, cap, blocks);
+        let bounds = self.timing.bounds(&quote);
+        Ok(Offer { quote, bounds })
     }
 
-    /// What the hub's info says of its contracts.
+    /// What the hub's info says of its contracts: its fixed terms, as
+    /// apps installed open on, and those holders may choose, if any.
     pub fn advertise(&self) -> licash_api::Contracts {
+        let range = self.timing.range();
         licash_api::Contracts {
             cap: terms::CAP,
-            price: terms::RESERVE_ALICE + terms::OPENING_FEE,
-            blocks: self.timing.bounds.lock,
+            price: self.timing.price(terms::CAP, terms::LOCK),
+            blocks: terms::LOCK,
             mock: self.trust.mock,
+            range,
         }
     }
 
@@ -324,9 +336,24 @@ impl IntoResponse for Answer {
     }
 }
 
-async fn quote(State(openings): State<Arc<Openings>>) -> Result<Vec<u8>, Refused> {
-    let offer = openings.offer().await.map_err(Refused::unavailable)?;
-    Ok(offer.encode())
+/// The hub's quote, of the terms she chose (`?cap=SAT&blocks=N`, both or
+/// neither), else its fixed one.
+async fn quote(
+    State(openings): State<Arc<Openings>>,
+    Query(asked): Query<HashMap<String, String>>,
+) -> Result<Vec<u8>, Refused> {
+    let number = |name: &str| {
+        let value = asked.get(name).map(|v| v.parse::<u32>());
+        value
+            .transpose()
+            .map_err(|e| Refused::bad(format!("{name}: {e}")))
+    };
+    let chosen = match (number("cap")?, number("blocks")?) {
+        (Some(cap), Some(blocks)) => Some((cap, blocks)),
+        (None, None) => None,
+        _ => return Err(Refused::bad("a cap and blocks, both or neither")),
+    };
+    Ok(openings.offer(chosen).await?.encode())
 }
 
 async fn open(State(openings): State<Arc<Openings>>, body: Bytes) -> Result<Answer, Refused> {

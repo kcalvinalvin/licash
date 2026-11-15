@@ -711,6 +711,56 @@ pub struct Contracts {
     /// Under the mock authority, for regtest only: anyone "proves"
     /// anything, and a contract protects nothing.
     pub mock: bool,
+    /// The terms a holder may ask for instead of `cap` over `blocks`, if
+    /// the hub lets her choose: none from a hub offering only those, as
+    /// older hubs do.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range: Option<ContractRange>,
+}
+
+/// Blocks in a year, as a contract's price counts them: 144 a day.
+pub const YEAR_BLOCKS: u64 = 144 * 365;
+
+/// The caps and durations a hub lets holders choose, and what each costs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContractRange {
+    /// The notes a contract protects, in sat: at least, at most.
+    pub min_cap: u32,
+    pub max_cap: u32,
+    /// Blocks from its opening to its close: at least, at most.
+    pub min_blocks: u32,
+    pub max_blocks: u32,
+    /// Its cap at most this many times the value of the coin its holder
+    /// deposits.
+    pub per_coin: u32,
+    /// What opening one costs its holder, in sat, from her deposit: this,
+    /// and [`ContractRange::ppm_year`] of its cap.
+    pub base: u64,
+    /// Millionths of its cap for each year of blocks ([`YEAR_BLOCKS`])
+    /// it lasts, rounded down.
+    pub ppm_year: u32,
+}
+
+impl ContractRange {
+    /// What opening a contract of `cap` sat over `blocks` costs.
+    pub fn price(&self, cap: u32, blocks: u32) -> u64 {
+        self.base.saturating_add(rate(self.ppm_year, cap, blocks))
+    }
+
+    /// The most a contract may protect, its holder depositing a coin of
+    /// `coin` sat: none less than the least.
+    pub fn max_cap_for(&self, coin: u64) -> Option<u32> {
+        let most = coin.saturating_mul(u64::from(self.per_coin));
+        let most = u32::try_from(most).unwrap_or(u32::MAX).min(self.max_cap);
+        (most >= self.min_cap).then_some(most)
+    }
+}
+
+/// `ppm` millionths of `cap` for each year of `blocks`, rounded down.
+pub fn rate(ppm: u32, cap: u32, blocks: u32) -> u64 {
+    let n = u128::from(ppm) * u128::from(cap) * u128::from(blocks);
+    let year = 1_000_000 * u128::from(YEAR_BLOCKS);
+    u64::try_from(n / year).unwrap_or(u64::MAX)
 }
 
 /// What a hub takes on Bitcoin, in its info: deposits whose payment, once

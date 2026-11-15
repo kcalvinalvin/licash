@@ -9,8 +9,9 @@ use licash::{
     unlink::{Nonce, Session},
 };
 use licash_api::{
-    Check, Code, Fee, Fees, Hex, Info, Issued, Lock, LockState, Locked, Offer, Offered, Payment,
-    Problem, Refund, Release, Released, Settle, Settled, Unlink, Unlinked,
+    rate, Check, Code, ContractRange, Contracts, Fee, Fees, Hex, Info, Issued, Lock, LockState,
+    Locked, Offer, Offered, Payment, Problem, Refund, Release, Released, Settle, Settled, Unlink,
+    Unlinked,
 };
 use serde::{de::DeserializeOwned, Serialize};
 
@@ -768,4 +769,46 @@ fn a_hubs_urls_are_left_out_when_none_and_are_not_its_identity() {
     // Changing them leaves its proof standing: they prove nothing.
     assert_eq!(named.identity(signet), info.identity(signet));
     assert_eq!(named.proved(signet), Ok(true));
+}
+
+#[test]
+fn a_hubs_contract_range_is_left_out_when_none_and_prices_the_cap_by_the_year() {
+    // As an older hub says it, without one: read, none.
+    let older = r#"{"cap":4096,"price":23000,"blocks":1000,"mock":false}"#;
+    let read: Contracts = serde_json::from_str(older).unwrap();
+    assert_eq!(read.range, None);
+    let sent = serde_json::to_value(read).unwrap();
+    assert!(sent.get("range").is_none(), "{sent}");
+
+    let range = ContractRange {
+        min_cap: 4_096,
+        max_cap: 100_000_000,
+        min_blocks: 432,
+        max_blocks: 26_280,
+        per_coin: 2,
+        base: 23_000,
+        ppm_year: 10_000,
+    };
+    let offered = Contracts {
+        range: Some(range),
+        ..read
+    };
+    assert_eq!(json(&offered), offered);
+    // Read by an app knowing of no range, as installed ones: the rest.
+    let text = serde_json::to_string(&offered).unwrap();
+    let mut seen: serde_json::Value = serde_json::from_str(&text).unwrap();
+    seen.as_object_mut().unwrap().remove("range");
+    assert_eq!(serde_json::from_value::<Contracts>(seen).unwrap(), read);
+
+    // 1% a year: 15 M sat for half a year, 75 000 sat over the base; the
+    // fixed terms nothing over it, rounded down.
+    assert_eq!(range.price(15_000_000, 26_280), 98_000);
+    assert_eq!(range.price(4_096, 1_000), 23_000);
+    assert_eq!(rate(10_000, u32::MAX, u32::MAX), 3_509_654_502_496);
+    // Twice her coin at most, within the hub's bounds.
+    assert_eq!(range.max_cap_for(10_000_000), Some(20_000_000));
+    assert_eq!(range.max_cap_for(90_000_000), Some(100_000_000));
+    assert_eq!(range.max_cap_for(2_048), Some(4_096));
+    assert_eq!(range.max_cap_for(2_047), None);
+    assert_eq!(range.max_cap_for(u64::MAX), Some(100_000_000));
 }

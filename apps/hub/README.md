@@ -80,8 +80,16 @@ another node's wallet instead, by its JSON-RPC as `--chain` takes it
 (`http://host:port/wallet/NAME?cookie=PATH`), on the same network: the hub
 may then follow the chain through an Esplora API. A wallet of its own,
 funded with what the hub may lock, bounds the collateral at stake.
-`/v1/info` names the cap, the price a wallet pays to open one and the most
-blocks to its close; the openings take `/v1/contracts`. F, a contract's
+`/v1/info` names its fixed terms: the cap (4,096 sat), the price a wallet
+pays to open one and the blocks to its close (1,000); the openings take
+`/v1/contracts`. With `--contracts-max-cap SAT`, wallets may also choose a
+contract's cap up to that and how long it lasts up to
+`--contracts-max-blocks` (`/v1/contracts/quote?cap=SAT&blocks=N`), its cap
+at most `--contracts-per-coin` times (2 by default) the coin the wallet
+deposits, at the fixed price plus `--contracts-rate` millionths of the cap
+a year (10,000, 1% a year, by default); `/v1/info` then names that range.
+The collateral of a contract is the next power of two minus one sat at or
+above its cap (2,097,151 sat at least, 2,147,483,647 at most). F, a contract's
 funding, spends the wallet's coins, which stay locked while the opening
 lives. Openings are kept in `<data>/openings.sqlite`, as sensitive as the
 seed: back it up with `hub.sqlite`. Each opening downloads about 100 MB of
