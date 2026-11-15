@@ -12,7 +12,7 @@ use licash_nostr::{
     Route,
 };
 use licash_transport::Http;
-use licash_wallet::{DepositState, PaymentCode, Unlinking, MAX_HUBS};
+use licash_wallet::{DepositState, PartTo, PaymentCode, Unlinking, MAX_HUBS};
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 
@@ -21,8 +21,8 @@ use crate::{
     deliveries::{self, Delivery},
     Activity, Balance, ChainError, ChainSource, Code, ContractTerms, Details, FoundHub, Holding,
     Hub, HubsFound, InvoiceQuote, Kind, LicashError, LightningInvoice, LightningTerms, Linking,
-    Network, NoteLine, Notes, NotesOf, Onchain, Paid, PayOffer, PayQuote, Range, Rate, Scan,
-    Scanned, State,
+    Network, NoteLine, Notes, NotesOf, NotesPaid, Onchain, Paid, PaidTo, PayOffer, PayQuote, Range,
+    Rate, Scan, Scanned, State,
 };
 
 /// The rate deposits are paid at, in sat/vB: above what nodes relay.
@@ -825,13 +825,31 @@ impl Wallet {
             }
             Kind::Onchain | Kind::Contract => Vec::new(),
         };
+        let me = self.wallet.address();
         let mut notes = licash_wallet::OperationNotes::default();
+        let mut paid = Vec::new();
         for operation in &operations {
             let of = self.wallet.operation_notes(operation)?;
+            // Its notes spent are at its hub.
+            if let Some(hub) = of.spent.first().map(|n| n.hub.clone()) {
+                for part in self.wallet.operation_parts(operation)? {
+                    let to = match &part.to {
+                        PartTo::Payee(payee) if *payee == me => PaidTo::Itself,
+                        PartTo::Payee(_) => PaidTo::Payee,
+                        PartTo::Hub => PaidTo::Hub,
+                        _ => PaidTo::Kept,
+                    };
+                    paid.push(NotesPaid {
+                        to,
+                        hub: hub.clone(),
+                        amount: part.amount,
+                        notes: part.notes,
+                    });
+                }
+            }
             notes.spent.extend(of.spent);
             notes.made.extend(of.made);
         }
-        let me = self.wallet.address();
         let itself: Vec<String> = self
             .wallet
             .sends()?
@@ -857,6 +875,7 @@ impl Wallet {
         Ok(NotesOf {
             spent: notes.spent.into_iter().map(line).collect(),
             made: notes.made.into_iter().map(line).collect(),
+            paid,
         })
     }
 

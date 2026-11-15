@@ -509,11 +509,38 @@ pub struct LightningInvoice {
 }
 
 /// The notes one line of the history spent, and those it made the
-/// wallet's ([`Wallet::notes_of`]), the largest first.
+/// wallet's ([`Wallet::notes_of`]), the largest first, and whom those spent
+/// paid.
 #[derive(Clone, Debug, Default, PartialEq, Eq, uniffi::Record)]
 pub struct NotesOf {
     pub spent: Vec<NoteLine>,
     pub made: Vec<NoteLine>,
+    /// What those spent pay, part by part: its payee, its hub's fee, and
+    /// what the wallet keeps, the notes kept among `made` once made.
+    pub paid: Vec<NotesPaid>,
+}
+
+/// Part of what the notes a line of the history spent pay.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct NotesPaid {
+    pub to: PaidTo,
+    pub hub: String,
+    pub amount: u64,
+    /// The amounts of the notes made for it, the largest first.
+    pub notes: Vec<u64>,
+}
+
+/// Whom a part of a payment pays.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum PaidTo {
+    /// Its payee: a person, a provider, or the hub paying an invoice.
+    Payee,
+    /// The wallet itself, as payee: notes of the amounts it needs.
+    Itself,
+    /// Its hub, as its fee.
+    Hub,
+    /// The wallet, as its change or what a refund returned.
+    Kept,
 }
 
 /// A note the wallet holds or held.

@@ -38,8 +38,8 @@ use licash_hub_service::{
 };
 use licash_mobile::{
     default_relays, set_logger, wallet_exists, Activity, Balance, ChainError, ChainSource, Details,
-    Kind, LicashError, Linking, Logger, Network, Onchain, PayOffer, PayQuote, Range, Rate, Scanned,
-    State, Wallet,
+    Kind, LicashError, Linking, Logger, Network, Onchain, PaidTo, PayOffer, PayQuote, Range, Rate,
+    Scanned, State, Wallet,
 };
 use licash_nostr::{Announcement, Announcer, Role, Route};
 use licash_wallet::PaymentCode;
@@ -1308,6 +1308,41 @@ fn a_phone_shows_the_notes_each_line_of_its_history_spent_and_made() {
         );
     }
     assert!(alice.notes_of(Kind::Moved, "00".repeat(32)).is_err());
+}
+
+#[test]
+fn a_phone_shows_whom_the_notes_a_payment_spent_paid_and_what_it_kept() {
+    let net = Net::new(true);
+    let light = Light::new(&net);
+    let alice = funded(&net, &light, "alice");
+    let history = alice.history().unwrap();
+    let moved = history.iter().find(|a| a.kind == Kind::Moved).unwrap();
+    // Notes taken pay nothing.
+    let got = alice.notes_of(Kind::Moved, moved.id.clone()).unwrap();
+    assert!(got.paid.is_empty(), "{got:?}");
+
+    let bob = net.wallet("bob", net.height());
+    let asked = bob.payment_code(Some(500)).unwrap();
+    let paid = alice.pay(asked.qr, None).unwrap();
+    let sent = alice.notes_of(Kind::Sent, paid.id.clone()).unwrap();
+    let spent: u64 = sent.spent.iter().map(|n| n.amount).sum();
+    let parts: Vec<_> = sent.paid.iter().map(|p| (p.to, p.amount)).collect();
+    assert_eq!(
+        parts,
+        [
+            (PaidTo::Payee, 500),
+            (PaidTo::Hub, 1),
+            (PaidTo::Kept, spent - 501)
+        ],
+        "{sent:?}"
+    );
+    assert!(sent.paid.iter().all(|p| p.hub == paid.hub));
+    for part in &sent.paid {
+        assert_eq!(part.notes.iter().sum::<u64>(), part.amount, "{part:?}");
+    }
+    // What it kept is its change, note for note.
+    let made: Vec<u64> = sent.made.iter().map(|n| n.amount).collect();
+    assert_eq!(sent.paid[2].notes, made);
 }
 
 #[test]
