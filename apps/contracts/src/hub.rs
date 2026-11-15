@@ -18,7 +18,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use anyhow::{Context as _, Result};
+use anyhow::Result;
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path as UrlPath, State};
 use axum::http::StatusCode;
@@ -99,10 +99,12 @@ impl Openings {
     pub async fn new(data: &Path, source: Source, keyset: Keyset) -> Result<Arc<Self>> {
         let profile: ChainProfile = source.profile().await?;
         let trust = crate::trust(profile)?;
-        let _: serde_json::Value = source
-            .rpc("getwalletinfo", serde_json::json!([]))
-            .await
-            .context("contracts need the node's wallet, to fund F")?;
+        // Not fatal: a node may load its wallet after the hub starts. F
+        // goes unfunded, and its openings given up, until it does.
+        let wallet = source.rpc::<serde_json::Value>("getwalletinfo", serde_json::json!([]));
+        if let Err(e) = wallet.await {
+            tracing::warn!("contracts need the node's wallet, to fund F: {e:#}");
+        }
         let store = Store::open(data)?;
         let openings = Arc::new(Self {
             store: Mutex::new(store),
