@@ -62,6 +62,45 @@ const MAX_URL: usize = 256;
 /// The most announcements asked of each relay.
 const MAX_EVENTS: usize = 500;
 
+/// Relays to look for hubs and providers on besides those a wallet's hubs
+/// name: the signet hubs and provider announce there. They were chosen for
+/// serving readers over Tor without NIP-42 and keeping addressable events,
+/// unlike many relays, which refuse Tor's exits or ask for AUTH; one may
+/// still be slow at times (on 2026-11-15 the oxtr.dev pair timed out over
+/// Tor while the others answered). The last two are onion services,
+/// reached only through Tor.
+pub const DEFAULT_RELAYS: &[&str] = &[
+    "wss://relay.primal.net",
+    "wss://relay.snort.social",
+    "wss://relay.ditto.pub",
+    "wss://nostr.azzamo.net",
+    "wss://relay.angor.io",
+    "wss://nostr.oxtr.dev",
+    "ws://gnostr2jnapk72mnagq3cuykfon73temzp77hcbncn4silgt77boruid.onion",
+    "ws://oxtrdevav64z64yb7x6rjg4ntzqjhedm5b5zjqulugknhzr46ny2qbad.onion",
+];
+
+/// The relays of [`DEFAULT_RELAYS`] to look on for services of `network`,
+/// the onion services among them only if reached `over_tor`. None on
+/// regtest, whose services are local.
+pub fn default_relays(network: &str, over_tor: bool) -> Vec<String> {
+    if network == "regtest" {
+        return Vec::new();
+    }
+    DEFAULT_RELAYS
+        .iter()
+        .filter(|relay| over_tor || !onion(relay))
+        .map(|relay| (*relay).to_owned())
+        .collect()
+}
+
+/// Whether `url` is that of an onion service.
+pub fn onion(url: &str) -> bool {
+    let host = url.split("://").nth(1).unwrap_or(url);
+    let host = host.split(['/', ':', '?']).next().unwrap_or(host);
+    host.to_ascii_lowercase().ends_with(".onion")
+}
+
 /// What announces itself.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
@@ -376,4 +415,33 @@ fn usable(url: &str) -> bool {
     url.len() <= MAX_URL
         && (url.starts_with("https://") || url.starts_with("http://"))
         && !url.chars().any(char::is_whitespace)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_relays_are_onion_services_only_over_tor_and_none_on_regtest() {
+        let clear = default_relays("signet", false);
+        assert!(!clear.is_empty());
+        assert!(clear.iter().all(|r| r.starts_with("wss://") && !onion(r)));
+        let all = default_relays("bitcoin", true);
+        assert_eq!(all.len(), DEFAULT_RELAYS.len());
+        assert_eq!(all.iter().filter(|r| onion(r)).count(), 2);
+        assert!(clear.iter().all(|r| all.contains(r)));
+        assert!(default_relays("regtest", true).is_empty());
+        assert!(default_relays("regtest", false).is_empty());
+    }
+
+    #[test]
+    fn onion_urls_are_told_by_their_host() {
+        let v3 = "gnostr2jnapk72mnagq3cuykfon73temzp77hcbncn4silgt77boruid.onion";
+        assert!(onion(&format!("ws://{v3}")));
+        assert!(onion(&format!("http://{}:8080/v1", v3.to_uppercase())));
+        assert!(onion(v3));
+        assert!(!onion("wss://relay.example"));
+        assert!(!onion("wss://onion.example/x.onion"));
+        assert!(!onion("https://relay.example?h=a.onion"));
+    }
 }

@@ -533,15 +533,33 @@ pub async fn hubs_announced<T: Transport>(
     relays: &[String],
     route: &Route,
 ) -> anyhow::Result<Vec<AnnouncedHub>> {
+    Ok(hubs_found(wallet, relays, route).await?.hubs)
+}
+
+/// What looking for hubs found ([`hubs_found`]).
+#[derive(Clone, Debug)]
+pub struct HubsFound {
+    /// Those answering, as [`hubs_announced`] finds them.
+    pub hubs: Vec<AnnouncedHub>,
+    /// The announcements of the others, but those naming a URL of a hub the
+    /// wallet trusts or found: answering as the key that announced them at
+    /// none of their URLs, they are only told of, never to be added.
+    pub silent: Vec<Found>,
+}
+
+/// [`hubs_announced`], and the announcements of hubs that did not answer:
+/// down, refusing the route, or reached only through Tor.
+pub async fn hubs_found<T: Transport>(
+    wallet: &Wallet<T>,
+    relays: &[String],
+    route: &Route,
+) -> anyhow::Result<HubsFound> {
     let network = wallet.network().name();
     let found = crate::discover(relays, route, Role::Hub, network).await?;
-    let trusted: HashSet<_> = wallet
-        .hubs()?
-        .into_iter()
-        .map(|(_, info)| info.address)
-        .collect();
+    let hubs_used = wallet.hubs()?;
+    let trusted: HashSet<_> = hubs_used.iter().map(|(_, info)| info.address).collect();
     let ask = |url: String| async move { wallet.hub_info(&url).await };
-    let answering = answering(found, ask, |i: &Info| i.nostr.as_deref()).await?;
+    let answering = answering(found.clone(), ask, |i: &Info| i.nostr.as_deref()).await?;
     let mut hubs: Vec<AnnouncedHub> = answering
         .into_iter()
         .filter(|(_, _, info)| !trusted.contains(&info.address))
@@ -555,7 +573,19 @@ pub async fn hubs_announced<T: Transport>(
     // One hub announced by two keys: once.
     let mut seen = HashSet::new();
     hubs.retain(|h| seen.insert(h.info.address));
-    Ok(hubs)
+    let answered: HashSet<String> = (hubs.iter().map(|h| h.url.clone()))
+        .chain(hubs_used.into_iter().map(|(url, _)| url))
+        .map(|url| url.trim().trim_end_matches('/').to_owned())
+        .collect();
+    let silent = found
+        .into_iter()
+        .filter(|service| {
+            let mut urls = service.announcement.urls.iter();
+            !hubs.iter().any(|h| h.key == service.key)
+                && !urls.any(|u| answered.contains(u.trim().trim_end_matches('/')))
+        })
+        .collect();
+    Ok(HubsFound { hubs, silent })
 }
 
 /// A swap provider announced on Nostr that pays notes out on Bitcoin, and
