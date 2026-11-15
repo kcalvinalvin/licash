@@ -792,6 +792,67 @@ async fn silent_payment_coins_are_deposited_whole_up_to_the_most_a_hub_takes() {
     assert_eq!(fee_of(&tx, 10_000), 10_000 - 4_100 - change);
 }
 
+#[tokio::test]
+async fn coins_a_wallet_keeps_stay_out_of_its_deposits() {
+    use licash_hub_service::tweaks::{step, Tweaks};
+    let net = Net::new().await;
+    let index = Arc::new(Tweaks::open(&net.dir.path().join("tweaks.sqlite")).unwrap());
+    step(&index, &net.source, None).await.unwrap();
+    let services = Services {
+        deposits: Some(net.deposits.clone()),
+        tweaks: Some(index.clone()),
+        ..Default::default()
+    };
+    let app = licash_hub_service::router(net.hub.clone(), services);
+    let path = net.dir.path().join("alice.sqlite");
+    let network = ChainProfile::Core30DefaultRegtest;
+    let alice = Wallet::create(&path, &[1; 32], network, Local(app)).unwrap();
+    alice.add_hub(HUB).await.unwrap();
+    alice
+        .watch_silent(HUB, index.first().unwrap().unwrap())
+        .unwrap();
+    let to = alice.silent_keys().address();
+    let rate = FeeRate::from_sat_per_vb_u32(1);
+    let light = Light(net.backend.clone());
+    for (value, n) in [(2_000, 2), (3_000, 3)] {
+        let payment = pay_silent(&net, &to, value, n);
+        net.mine(1, vec![payment]);
+    }
+    step(&index, &net.source, None).await.unwrap();
+    alice.scan_silent(HUB, &light, u32::MAX).await.unwrap();
+    let coins = alice.silent_coins().unwrap();
+    assert_eq!(coins.len(), 2);
+    let kept = coins.iter().find(|c| c.value == 3_000).unwrap().outpoint;
+
+    // All kept: nothing to deposit.
+    let both = [
+        kept,
+        coins.iter().find(|c| c.value == 2_000).unwrap().outpoint,
+    ];
+    let none = alice.deposit_silent_keeping(HUB, rate, &both).await;
+    match none.unwrap_err() {
+        licash_wallet::Error::Insufficient { available, .. } => assert_eq!(available, 0),
+        e => panic!("{e:?}"),
+    }
+    assert!(alice.deposits().unwrap().is_empty());
+
+    // One kept: the other alone deposited, the kept one left free.
+    let (deposit, tx) = alice
+        .deposit_silent_keeping(HUB, rate, &[kept])
+        .await
+        .unwrap();
+    assert_eq!(tx.input.len(), 1);
+    assert_ne!(tx.input[0].previous_output, kept);
+    assert_eq!(fee_of(&tx, 2_000), tx.vsize() as u64);
+    assert_eq!(deposit.terms.unwrap().pays, tx.output[0].value.to_sat());
+    let coins = alice.silent_coins().unwrap();
+    let left = coins.iter().find(|c| c.outpoint == kept).unwrap();
+    assert!(left.spending.is_none());
+    // Not kept any more: deposited too.
+    let (_, tx) = alice.deposit_silent(HUB, rate).await.unwrap();
+    assert_eq!(tx.input[0].previous_output, kept);
+}
+
 /// The hub behind a front refusing what is posted while `.1` is set, with
 /// a plain 400, as a server only redirecting to HTTPS may.
 struct Front(Local, Arc<AtomicBool>);

@@ -948,7 +948,17 @@ impl<T: Transport> Wallet<T> {
         amount: Option<u64>,
         rate: FeeRate,
     ) -> Result<Transaction, Error> {
-        let to = to.into();
+        self.spend_silent_keeping(to.into(), amount, rate, &[])
+    }
+
+    /// [`Wallet::spend_silent`], the coins of `keep` left unspent.
+    fn spend_silent_keeping(
+        &self,
+        to: Payee,
+        amount: Option<u64>,
+        rate: FeeRate,
+        keep: &[OutPoint],
+    ) -> Result<Transaction, Error> {
         if let Payee::Silent(address) = &to {
             let network = licash_onchain::network(self.network);
             if address.network != network.into() {
@@ -963,7 +973,7 @@ impl<T: Transport> Wallet<T> {
                 Payee::Script(script) => script.clone(),
                 Payee::Silent(_) => any_taproot(),
             };
-            let plan = plan(&free_coins(t)?, &script, amount, rate)?;
+            let plan = plan(&kept(free_coins(t)?, keep), &script, amount, rate)?;
             let secrets = plan
                 .inputs
                 .iter()
@@ -1050,6 +1060,17 @@ impl<T: Transport> Wallet<T> {
         url: &str,
         rate: FeeRate,
     ) -> Result<(Deposit, Transaction), Error> {
+        self.deposit_silent_keeping(url, rate, &[]).await
+    }
+
+    /// [`Wallet::deposit_silent`] of the coins but those of `keep`, which
+    /// stay on Bitcoin.
+    pub async fn deposit_silent_keeping(
+        &self,
+        url: &str,
+        rate: FeeRate,
+        keep: &[OutPoint],
+    ) -> Result<(Deposit, Transaction), Error> {
         let url = hub_url(url)?;
         self.not_visited(&url)?;
         let (hub, info) = self.refresh(&url).await?;
@@ -1058,7 +1079,7 @@ impl<T: Transport> Wallet<T> {
             .ok_or_else(|| Error::Invalid(format!("hub {url} takes no deposits")))?;
         // What the coins pay a taproot output, as a deposit's is.
         let taproot = any_taproot();
-        let held = self.store.read(free_coins)?;
+        let held = kept(self.store.read(free_coins)?, keep);
         let total = held.iter().map(|h| h.value).sum::<u64>();
         let available = plan(&held, &taproot, None, rate).map_or(0, |p| p.pay);
         let fits = |amount: u64| offer.pays(amount).is_some_and(|pays| pays <= available);
@@ -1102,7 +1123,8 @@ impl<T: Transport> Wallet<T> {
                     .ok()
             })
             .ok_or_else(|| Error::Invalid(format!("deposit address {}", terms.address)))?;
-        let tx = self.spend_silent(to.script_pubkey(), Some(terms.pays), rate)?;
+        let tx =
+            self.spend_silent_keeping(to.script_pubkey().into(), Some(terms.pays), rate, keep)?;
         tracing::info!(hash = %deposit.hash, amount, txid = %tx.compute_txid(), "silent payment coins deposited");
         Ok((deposit, tx))
     }
@@ -1113,6 +1135,14 @@ struct Plan {
     inputs: Vec<Held>,
     pay: u64,
     change: Option<u64>,
+}
+
+/// `coins` but those of `keep`.
+fn kept(coins: Vec<Held>, keep: &[OutPoint]) -> Vec<Held> {
+    coins
+        .into_iter()
+        .filter(|h| !keep.contains(&h.outpoint))
+        .collect()
 }
 
 /// The coins no transaction spends, largest first.
