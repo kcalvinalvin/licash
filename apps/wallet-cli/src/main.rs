@@ -377,6 +377,33 @@ enum Command {
         #[arg(long, env = "LICASH_WALLET_CHAIN")]
         chain: Option<String>,
     },
+    /// Force contract ID (its id, or the start of it) closed when its hub
+    /// stopped answering: the wallet's notes at the hub, up to its cap,
+    /// claimed on Bitcoin, and once the hub's window to answer passed
+    /// unanswered, paid to the wallet on Bitcoin with both reserves. Past
+    /// its first step, irrevocable: those notes leave the wallet's balance
+    /// for good. Run `recoveries --chain` until it is done.
+    ForceClose {
+        id: String,
+        /// Its fees' rate, in sat/vB [default: the chain's estimate].
+        #[arg(long)]
+        fee_rate: Option<u64>,
+        /// The chain to read and broadcast to.
+        #[arg(long, env = "LICASH_WALLET_CHAIN")]
+        chain: Option<String>,
+    },
+    /// The contracts the wallet forced closed. With --chain, each carried
+    /// on as far as the chain lets it.
+    Recoveries {
+        /// Its fees' rate, in sat/vB [default: the chain's estimate].
+        #[arg(long)]
+        fee_rate: Option<u64>,
+        #[arg(long, env = "LICASH_WALLET_CHAIN")]
+        chain: Option<String>,
+    },
+    /// Give up forcing contract ID closed, its notes back to the wallet:
+    /// only before its request is signed.
+    GiveUpRecovery { id: String },
     /// Hubs announced on Nostr relays, at the URLs that answer as the hub
     /// that announced them. Needs no wallet.
     Discover {
@@ -900,6 +927,18 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Contracts { chain } => {
             return contract::list(&wallet, &path, chain.as_deref(), json).await;
         }
+        Command::ForceClose {
+            id,
+            fee_rate,
+            chain,
+        } => {
+            return contract::force_close(&wallet, &path, chain.as_deref(), &id, fee_rate, json)
+                .await;
+        }
+        Command::Recoveries { fee_rate, chain } => {
+            return contract::recoveries(&wallet, &path, chain.as_deref(), fee_rate, json).await;
+        }
+        Command::GiveUpRecovery { id } => contract::give_up(&wallet, &path, &id)?,
         Command::Swaps => {
             let swaps = wallet.swaps()?;
             let lines = swaps.iter().map(swap_line).collect::<Vec<_>>();

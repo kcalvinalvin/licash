@@ -112,6 +112,19 @@ they are under the genuine programs, a trial this wallet cannot recover
 with yet (the hub's README says what else it lacks). No other network for
 now.
 
+`force-close <id> --chain <url>` forces a live contract closed when its hub
+stopped answering (`<id>` is the contract's id, or its start): the wallet's
+notes at that hub, up to the contract's cap, leave its balance and are
+claimed on Bitcoin. Until its request may be in the next block (a day
+after the contract's funding on signet), `give-up-recovery <id>` gives
+them back; from then on it is irrevocable. The wallet pays its fees from
+its coins on Bitcoin at `--fee-rate` sat/vB (by default the chain's
+estimate). `recoveries --chain <url>` carries every forced close on as
+far as the chain lets it and shows the block its next step waits for: run
+it until it is `done`, when the claimed notes' value and both reserves
+are back in the wallet on Bitcoin. A hub that answers the request instead
+(`answered`) needs a proof this wallet does not make yet.
+
 `discover --relay wss://relay.example` lists the hubs announced on Nostr,
 at the URLs that answer as the hub that announced them; with `--swaps`, the
 swap providers.
