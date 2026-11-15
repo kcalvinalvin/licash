@@ -403,6 +403,39 @@ pub async fn received(wallet: &Wallet, hash: &str) -> anyhow::Result<InvoiceStat
     .await
 }
 
+/// Bitcoin Core's chain, as a wallet reads it.
+impl licash_wallet::Blocks for Eco {
+    async fn height(&self) -> Result<u32, String> {
+        Eco::height(self).await.map_err(|e| format!("{e:#}"))
+    }
+
+    async fn hash(&self, height: u32) -> Result<bitcoin::BlockHash, String> {
+        let hash = self.core("getblockhash", json!([height])).await;
+        let hash = hash.map_err(|e| format!("{e:#}"))?;
+        hash.as_str()
+            .and_then(|h| h.parse().ok())
+            .ok_or_else(|| format!("no block hash: {hash}"))
+    }
+
+    async fn filter(&self, hash: &bitcoin::BlockHash) -> Result<Option<Vec<u8>>, String> {
+        let filter = self
+            .core("getblockfilter", json!([hash.to_string(), "basic"]))
+            .await
+            .map_err(|e| format!("{e:#}"))?;
+        let filter = filter["filter"].as_str().ok_or("no filter")?;
+        hex::decode(filter).map(Some).map_err(|e| e.to_string())
+    }
+
+    async fn block(&self, hash: &bitcoin::BlockHash) -> Result<bitcoin::Block, String> {
+        let block = self
+            .core("getblock", json!([hash.to_string(), 0]))
+            .await
+            .map_err(|e| format!("{e:#}"))?;
+        let raw = hex::decode(block.as_str().ok_or("no block")?).map_err(|e| e.to_string())?;
+        deserialize(&raw).map_err(|e| e.to_string())
+    }
+}
+
 /// The swap provider.
 impl Eco {
     /// The provider's URL, as published on this host.
@@ -432,6 +465,23 @@ impl Eco {
         let url = format!("{}{}", self.swaps, swaps::swap_state(&id));
         let response = self.http.get(url).send().await?.error_for_status()?;
         Ok(response.json().await?)
+    }
+
+    /// Where the payout on Bitcoin of the client's lock `id`, in hex,
+    /// stands.
+    pub async fn payout_state(&self, id: &str) -> anyhow::Result<swaps::ChainSwap> {
+        let id = licash_api::lock_id(id).map_err(|p| anyhow::anyhow!(p.message))?;
+        let url = format!("{}{}", self.swaps, swaps::chain_swap_state(&id));
+        let response = self.http.get(url).send().await?.error_for_status()?;
+        Ok(response.json().await?)
+    }
+
+    /// Hand `tx` to Bitcoin Core: its id.
+    pub async fn broadcast(&self, tx: &Transaction) -> anyhow::Result<String> {
+        let txid = self
+            .core("sendrawtransaction", json!([serialize_hex(tx)]))
+            .await?;
+        Ok(txid.as_str().context("a txid")?.to_owned())
     }
 
     /// The most the provider locks at hub 2 now.
