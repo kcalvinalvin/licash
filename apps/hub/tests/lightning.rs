@@ -724,4 +724,41 @@ async fn the_dashboard_reads_payments_fees_failures_and_notes_from_the_records()
         ]
     );
     assert!(report.since <= report.now && report.now - report.since < 600);
+
+    // Below the overview, what happened, newest first: each payment out
+    // as its forward ended, never again as its lock settling.
+    use licash_dashboard::{Cell, Panel};
+    let Some([Panel::Table(recent)]) = report.pages[0].rows.last().map(|r| &r[..]) else {
+        panic!("no recent events below the overview");
+    };
+    assert_eq!(recent.title, "Recent events");
+    let text = |c: &Cell| match c {
+        Cell::Text(s) => s.clone(),
+        Cell::Sat(v) => v.to_string(),
+        _ => String::new(),
+    };
+    let said: Vec<[String; 4]> = recent
+        .rows
+        .iter()
+        .map(|r| [&r.cells[1], &r.cells[2], &r.cells[3], &r.cells[4]].map(text))
+        .collect();
+    let has = |kind: &str, event: &str| said.iter().any(|s| s[0] == kind && s[1] == event);
+    let out = |event: &'static str| {
+        let said = said.iter();
+        said.filter(move |s| s[0] == "lightning out" && s[1] == event)
+    };
+    assert_eq!(out("locked").count(), 2, "{said:?}");
+    assert_eq!(out("paid").map(|s| &s[2]).collect::<Vec<_>>(), ["22"]);
+    let failures: Vec<_> = out("failed").collect();
+    assert_eq!(failures.len(), 1, "{said:?}");
+    assert_eq!(failures[0][2], failed.amount.to_string());
+    assert_eq!(failures[0][3], "no route");
+    assert!(!has("lightning out", "settled") && !has("lightning out", "refunded"));
+    assert!(has("lightning in", "asked") && has("lightning in", "settled"));
+    assert!(
+        has("transfer", "released") && has("hub", "started"),
+        "{said:?}"
+    );
+    let at: Vec<_> = recent.rows.iter().map(|r| r.at.unwrap()).collect();
+    assert!(at.is_sorted_by(|a, b| a >= b), "{at:?}");
 }

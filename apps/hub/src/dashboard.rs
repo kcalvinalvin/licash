@@ -24,6 +24,9 @@ const RECEIVE: &str = "lightning in";
 const DEPOSIT: &str = "deposits";
 const CONTRACT: &str = "contracts";
 
+/// The most events the overview lists.
+const RECENT: usize = 100;
+
 /// A receipt of the Lightning gateway: notes asked for over Lightning.
 struct Receipt {
     amount: u64,
@@ -351,6 +354,8 @@ const LOCKED: &str = "behind locks";
 
 #[cfg(test)]
 mod tests {
+    use licash_dashboard::Tone;
+
     use super::*;
 
     #[test]
@@ -364,5 +369,242 @@ mod tests {
         assert_eq!(set_name(false, 0, 1_048_576), "1,048,576 sat");
         assert_eq!(set_name(true, 2, 64), "k2 64 sat");
         assert_eq!(invoice_sat("not an invoice"), None);
+    }
+
+    fn event(seq: u64, at: u64, notice: Notice) -> Event {
+        Event {
+            seq,
+            at,
+            kind: notice.kind().into(),
+            data: serde_json::to_value(&notice).unwrap(),
+        }
+    }
+
+    /// A row's cells but its time, as text: amounts in sat.
+    fn texts(row: &licash_dashboard::Row) -> Vec<String> {
+        use licash_dashboard::Cell;
+        let text = |c: &Cell| match c {
+            Cell::Text(s) => s.clone(),
+            Cell::Sat(v) | Cell::Int(v) | Cell::Time(v) | Cell::Blocks(v) => v.to_string(),
+            Cell::Empty => String::new(),
+        };
+        row.cells.iter().skip(1).map(text).collect()
+    }
+
+    fn recent(r: &Records, now: i64) -> licash_dashboard::Table {
+        let report = pages::report(r, now, licash_dashboard::unasked(), Path::new("hub"));
+        let overview = &report.pages[0];
+        match &overview.rows.last().unwrap()[..] {
+            [licash_dashboard::Panel::Table(t)] if t.title == "Recent events" => t.clone(),
+            _ => panic!("no recent events below the overview"),
+        }
+    }
+
+    #[test]
+    fn recent_events_read_what_each_lock_paid_for_newest_first() {
+        const NOW: u64 = 1_800_000_000;
+        let (pay, plain) = ([1; 32], [2; 32]);
+        let proposal = |id: [u8; 32]| hex::encode(id);
+        let events = vec![
+            event(1, NOW - 600, Notice::Started { boot: "b".into() }),
+            event(
+                2,
+                NOW - 500,
+                Notice::Released {
+                    proposal: proposal([9; 32]),
+                    amount: 1_000,
+                    fee: 1,
+                },
+            ),
+            event(
+                3,
+                NOW - 400,
+                Notice::Locked {
+                    proposal: proposal(pay),
+                    amount: 22,
+                    fee: 0,
+                    expiry: 900,
+                    own: false,
+                },
+            ),
+            // Paid out: its forward says so, its lock settling no more.
+            event(
+                4,
+                NOW - 300,
+                Notice::Forwarded {
+                    proposal: proposal(pay),
+                    amount: 22,
+                    failed: None,
+                },
+            ),
+            event(
+                5,
+                NOW - 300,
+                Notice::Settled {
+                    proposal: proposal(pay),
+                    amount: 22,
+                    fee: 2,
+                    branch: Settled::Pay,
+                },
+            ),
+            event(
+                6,
+                NOW - 200,
+                Notice::Locked {
+                    proposal: proposal(plain),
+                    amount: 50,
+                    fee: 1,
+                    expiry: 950,
+                    own: false,
+                },
+            ),
+            // Of one second, the last recorded first.
+            event(
+                7,
+                NOW - 200,
+                Notice::Settled {
+                    proposal: proposal(plain),
+                    amount: 50,
+                    fee: 1,
+                    branch: Settled::Refund,
+                },
+            ),
+            event(
+                8,
+                NOW - 100,
+                Notice::Alert {
+                    message: "low on collateral".into(),
+                },
+            ),
+            // Of a newer hub.
+            Event {
+                seq: 9,
+                at: NOW - 50,
+                kind: "key_rotated".into(),
+                data: serde_json::json!({"kind": "key_rotated"}),
+            },
+        ];
+        let records = Records {
+            created_at: (NOW - 1_000) as i64,
+            tip: Some(800),
+            notes: Notes::default(),
+            locks: vec![],
+            forwards: vec![ForwardRecord {
+                lock: pay,
+                request: "lnbc".into(),
+                amount: 22,
+                expiry: 900,
+                state: "paid".into(),
+                reason: None,
+                created_at: NOW - 400,
+                resolved_at: Some(NOW - 300),
+            }],
+            events,
+            receipts: Some(vec![Receipt {
+                amount: 40,
+                msat: 41_000,
+                lock: None,
+                state: "canceled".into(),
+                created_at: (NOW - 450) as i64,
+                done_at: Some((NOW - 250) as i64),
+            }]),
+            deposits: Some(vec![Deposit {
+                amount: 1_000,
+                pays: 1_010,
+                confirmed: false,
+                lock: None,
+                state: "open".into(),
+                created_at: (NOW - 350) as i64,
+                done_at: None,
+            }]),
+            // Given up short of the hub's signatures.
+            openings: vec![Summary {
+                id: [7; 32],
+                phase: None,
+                mock: false,
+                signed: false,
+                abandoned: true,
+                created_at: NOW - 700,
+                updated_at: NOW - 150,
+                terms: None,
+            }],
+        };
+
+        let table = recent(&records, NOW as i64);
+        assert!(table.in_range);
+        let rows: Vec<_> = table
+            .rows
+            .iter()
+            .map(|r| (r.at.unwrap(), r.tone, texts(r).join(" | ")))
+            .collect();
+        let now = NOW as i64;
+        assert_eq!(
+            rows,
+            [
+                (now - 50, Tone::Muted, "hub | key rotated |  | "),
+                (now - 100, Tone::Warn, "hub | alert |  | low on collateral"),
+                (now - 150, Tone::Muted, "contract | given up |  | 07070707"),
+                (now - 200, Tone::Warn, "lock | refunded | 50 | fee 1 sat"),
+                (
+                    now - 200,
+                    Tone::Normal,
+                    "lock | locked | 50 | awaiting its preimage, expires at 950"
+                ),
+                (
+                    now - 250,
+                    Tone::Muted,
+                    "lightning in | unpaid | 41 | invoice canceled"
+                ),
+                (now - 300, Tone::Good, "lightning out | paid | 22 | "),
+                (now - 350, Tone::Normal, "deposit | asked | 1010 | address"),
+                (
+                    now - 400,
+                    Tone::Normal,
+                    "lightning out | locked | 22 | to pay out, expires at 900"
+                ),
+                (
+                    now - 450,
+                    Tone::Normal,
+                    "lightning in | asked | 41 | invoice"
+                ),
+                (
+                    now - 500,
+                    Tone::Good,
+                    "transfer | released | 1000 | fee 1 sat"
+                ),
+                (now - 600, Tone::Muted, "hub | started |  | "),
+                (
+                    now - 700,
+                    Tone::Normal,
+                    "contract | opened |  | 07070707 given up"
+                ),
+            ]
+            .map(|(at, tone, text)| (at, tone, text.to_owned()))
+        );
+    }
+
+    #[test]
+    fn recent_events_are_the_latest_only() {
+        let events = (1..=RECENT as u64 + 5)
+            .map(|seq| {
+                let message = format!("alert {seq}");
+                event(seq, 1_000 + seq, Notice::Alert { message })
+            })
+            .collect();
+        let records = Records {
+            created_at: 0,
+            tip: None,
+            notes: Notes::default(),
+            locks: vec![],
+            forwards: vec![],
+            events,
+            receipts: None,
+            deposits: None,
+            openings: vec![],
+        };
+        let table = recent(&records, 2_000);
+        assert_eq!(table.rows.len(), RECENT);
+        assert_eq!(table.rows[0].at, Some(1_000 + RECENT as i64 + 5));
+        assert_eq!(table.rows[RECENT - 1].at, Some(1_006));
     }
 }

@@ -8,11 +8,11 @@ use licash_dashboard::{
     grouped, Better, Card, Cell, Check, Column, Measure, Page, Panel, Ref, Report, Row, Table,
     Tone, Unit, Value,
 };
-use licash_hub::Notice;
+use licash_hub::{Notice, Settled};
 
 use super::{
-    flows, levels, lock_kinds, set_name, Records, CONTRACT, DEPOSIT, HOLDERS, HUB, LOCK, LOCKED,
-    PAY, RECEIVE, TRANSFER,
+    flows, levels, lock_kinds, reason, set_name, Records, CONTRACT, DEPOSIT, HOLDERS, HUB, LOCK,
+    LOCKED, PAY, RECEIVE, RECENT, TRANSFER,
 };
 
 const DAY: i64 = 86_400;
@@ -85,7 +85,7 @@ pub(super) fn report(r: &Records, now: i64, service: Check, data: &Path) -> Repo
         None => format!("{} · no chain", data.display()),
     };
     let pages = vec![
-        overview(&state, checks.clone()),
+        overview(&state, checks.clone(), recent(r)),
         payments(r, &state, failures),
         fees(),
         reserves(&state),
@@ -152,7 +152,7 @@ fn protected(state: &Now) -> Card {
     now_sat("Protected", protected, detail)
 }
 
-fn overview(state: &Now, checks: Vec<Check>) -> Page {
+fn overview(state: &Now, checks: Vec<Check>, recent: Table) -> Page {
     Page::new(
         "Overview",
         vec![
@@ -172,6 +172,7 @@ fn overview(state: &Now, checks: Vec<Check>) -> Page {
                 Panel::chart("Notes outstanding", "ecash", Measure::Level),
                 Panel::Health(checks),
             ],
+            vec![Panel::Table(recent)],
         ],
     )
 }
@@ -558,6 +559,235 @@ fn privacy(r: &Records) -> Page {
             ],
         ],
     )
+}
+
+/// What the hub did, newest first, the latest [`RECENT`]: its ledger's
+/// events, a lock's by what it paid for, beside the invoices, deposit
+/// addresses and contracts asked for, which the ledger does not see.
+fn recent(r: &Records) -> Table {
+    let kinds = lock_kinds(r);
+    // A payment out ends as its forward did: the lock settling with it
+    // says no more.
+    let forwarded: HashSet<[u8; 32]> = r
+        .forwards
+        .iter()
+        .filter(|f| f.resolved_at.is_some())
+        .map(|f| f.lock)
+        .collect();
+    let lock = |proposal: &str| -> Option<[u8; 32]> { hex::decode(proposal).ok()?.try_into().ok() };
+    let kind = |proposal: &str| {
+        let kind = lock(proposal).and_then(|id| kinds.get(&id).copied());
+        kind.unwrap_or(LOCK)
+    };
+    let mut rows: Vec<Row> = Vec::new();
+    let mut push = |at: i64, tone, kind, event: &str, amount: Option<u64>, detail: String| {
+        rows.push(Row::new(
+            Some(at),
+            tone,
+            vec![
+                Cell::Time(at),
+                Cell::Text(noun(kind).into()),
+                Cell::Text(event.into()),
+                amount.map_or(Cell::Empty, |a| Cell::Sat(a as i64)),
+                Cell::Text(detail),
+            ],
+        ));
+    };
+    for e in &r.events {
+        let at = e.at as i64;
+        match e.notice() {
+            Some(Notice::Started { .. }) => {
+                push(at, Tone::Muted, "hub", "started", None, "".into())
+            }
+            Some(Notice::Released { amount, fee, .. }) => {
+                push(
+                    at,
+                    Tone::Good,
+                    TRANSFER,
+                    "released",
+                    Some(amount),
+                    fees_of(fee),
+                );
+            }
+            Some(Notice::Locked {
+                proposal,
+                amount,
+                expiry,
+                ..
+            }) => {
+                let kind = kind(&proposal);
+                let what = match kind {
+                    PAY => "to pay out",
+                    RECEIVE => "paid in",
+                    DEPOSIT => "confirmed",
+                    _ => "awaiting its preimage",
+                };
+                let detail = format!("{what}, expires at {expiry}");
+                push(at, Tone::Normal, kind, "locked", Some(amount), detail);
+            }
+            Some(Notice::Settled {
+                proposal,
+                amount,
+                fee,
+                branch,
+            }) => {
+                if lock(&proposal).is_some_and(|id| forwarded.contains(&id)) {
+                    continue;
+                }
+                let (tone, event) = match branch {
+                    Settled::Pay => (Tone::Good, "settled"),
+                    Settled::Refund => (Tone::Warn, "refunded"),
+                };
+                push(at, tone, kind(&proposal), event, Some(amount), fees_of(fee));
+            }
+            Some(Notice::Forwarded {
+                proposal,
+                amount,
+                failed,
+            }) => {
+                let (tone, event, why) = match failed {
+                    None => (Tone::Good, "paid", String::new()),
+                    Some(why) => (Tone::Bad, "failed", reason(&why)),
+                };
+                push(at, tone, kind(&proposal), event, Some(amount), why);
+            }
+            Some(Notice::Activated {
+                proposal,
+                height,
+                refunded,
+            }) => {
+                let (tone, detail) = match refunded {
+                    false => (Tone::Normal, format!("preimage on Bitcoin at {height}")),
+                    true => (
+                        Tone::Bad,
+                        format!("after its refund, at {height}: both branches owed"),
+                    ),
+                };
+                push(at, tone, kind(&proposal), "activated", None, detail);
+            }
+            Some(Notice::Reorg { height }) => {
+                let detail = format!("at {height}: the scan stopped");
+                push(at, Tone::Bad, "hub", "reorganized", None, detail);
+            }
+            Some(Notice::DoubleSpend { proposal, .. }) => {
+                let detail = format!("proposal {}…", &proposal[..12.min(proposal.len())]);
+                push(at, Tone::Bad, "hub", "double spend", None, detail);
+            }
+            Some(Notice::Alert { message }) => push(at, Tone::Warn, "hub", "alert", None, message),
+            // Of a newer hub.
+            _ => {
+                let event = e.kind.replace('_', " ");
+                push(at, Tone::Muted, "hub", &event, None, String::new());
+            }
+        }
+    }
+    for x in r.receipts.iter().flatten() {
+        let amount = Some(x.msat / 1000);
+        push(
+            x.created_at,
+            Tone::Normal,
+            RECEIVE,
+            "asked",
+            amount,
+            "invoice".into(),
+        );
+        if x.state == "canceled" && x.lock.is_none() {
+            let at = x.done_at.unwrap_or(x.created_at);
+            push(
+                at,
+                Tone::Muted,
+                RECEIVE,
+                "unpaid",
+                amount,
+                "invoice canceled".into(),
+            );
+        }
+    }
+    for x in r.deposits.iter().flatten() {
+        let kind = DEPOSIT;
+        push(
+            x.created_at,
+            Tone::Normal,
+            kind,
+            "asked",
+            Some(x.pays),
+            "address".into(),
+        );
+        if x.state == "canceled" && x.lock.is_none() {
+            let at = x.done_at.unwrap_or(x.created_at);
+            match x.confirmed {
+                false => push(
+                    at,
+                    Tone::Muted,
+                    kind,
+                    "unpaid",
+                    Some(x.pays),
+                    "address expired".into(),
+                ),
+                true => push(
+                    at,
+                    Tone::Bad,
+                    kind,
+                    "canceled",
+                    Some(x.pays),
+                    "paid, never locked".into(),
+                ),
+            }
+        }
+    }
+    for o in &r.openings {
+        let id = hex::encode(&o.id[..4]);
+        let t = o.terms.as_ref();
+        let state = match (o.signed, o.abandoned, t.map_or(0, |t| t.fee)) {
+            (true, _, 0) => "signed".to_owned(),
+            (true, _, fee) => format!("signed, {}", fees_of(fee)),
+            (false, true, _) => "given up".to_owned(),
+            (false, false, _) => "under way".to_owned(),
+        };
+        let mock = if o.mock { ", mock" } else { "" };
+        let (at, cap) = (o.created_at as i64, t.map(|t| t.cap));
+        push(
+            at,
+            Tone::Normal,
+            CONTRACT,
+            "opened",
+            cap,
+            format!("{id} {state}{mock}"),
+        );
+        if o.abandoned {
+            let at = o.updated_at as i64;
+            push(at, Tone::Muted, CONTRACT, "given up", cap, id);
+        }
+    }
+    // Newest first: of one second, the last recorded.
+    rows.reverse();
+    rows.sort_by_key(|row| std::cmp::Reverse(row.at));
+    rows.truncate(RECENT);
+    Table::in_range(
+        "Recent events",
+        &["when", "kind", "event", "amount", "detail"],
+        rows,
+        "nothing happened",
+    )
+}
+
+/// A kind of payment, as one event of it reads.
+fn noun(kind: &str) -> &str {
+    match kind {
+        TRANSFER => "transfer",
+        LOCK => "lock",
+        DEPOSIT => "deposit",
+        CONTRACT => "contract",
+        kind => kind,
+    }
+}
+
+/// The hub's fee, if any.
+fn fees_of(fee: u64) -> String {
+    match fee {
+        0 => String::new(),
+        fee => format!("fee {} sat", grouped(fee as i64)),
+    }
 }
 
 /// What the hub alerted of, newest first.

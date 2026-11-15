@@ -17,8 +17,10 @@ licash-hub --data ./hub dashboard
 (transfers, locks, Lightning out and in, deposits), their failures by
 reason and those under way, the fees earned, the notes outstanding and the
 collateral of the contracts that protect them, the notes' anonymity sets,
-and health checks, among them whether the hub at `--url` answers
-`/health`. It reads the files in `<data>` only, beside the running hub or
+health checks, among them whether the hub at `--url` answers `/health`,
+and below the overview its recent events, newest first: each transfer,
+lock, payment, invoice, deposit and contract as it moved, and the hub's
+alerts. It reads the files in `<data>` only, beside the running hub or
 without it, and never writes or migrates them. History comes from the
 records themselves, over a range of 24 hours to all of it (30 days at
 first, or `--range`) against the range before; what no record dates, such
