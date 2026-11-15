@@ -237,8 +237,8 @@ jobs:
   # images to ghcr.io, the app to the main-build prerelease. Versioned
   # releases are left for later.
 
-  # Each platform's images on a runner of its architecture, pushed by digest
-  # only: images-tag names them.
+  # Each platform's images on a runner of its architecture where there is
+  # one, pushed by digest only: images-tag names them.
   images:
     needs: [rust, apps, chain, android, e2e, app-e2e, regtest]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -248,20 +248,16 @@ jobs:
           - platform: linux/amd64
             slug: amd64
             runner: ubuntu-latest
-            timeout: 120
           # GitHub's ARM runners have no -latest label: the newest Ubuntu.
           - platform: linux/arm64
             slug: arm64
             runner: ubuntu-26.04-arm
-            timeout: 120
-          # No runner is 32-bit ARM: an ARM one runs it natively if its CPU
-          # and kernel do, under QEMU otherwise (hours).
+          # No runner is 32-bit ARM: cross-compiled (apps/image-build.sh).
           - platform: linux/arm/v7
             slug: armv7
-            runner: ubuntu-26.04-arm
-            timeout: 350
+            runner: ubuntu-latest
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: ${{ matrix.timeout }}
+    timeout-minutes: 120
     permissions:
       contents: read
       packages: write
@@ -272,16 +268,9 @@ jobs:
         with:
           persist-credentials: false
       - uses: ./.github/actions/vendor
-      - name: 32-bit ARM natively?
-        id: arm
-        if: matrix.platform == 'linux/arm/v7'
-        run: |
-          if docker run --rm --platform linux/arm/v7 debian:trixie-slim true; then
-            echo native=true >> "$GITHUB_OUTPUT"
-          else
-            echo "::notice::This runner does not run 32-bit ARM: building under QEMU."
-          fi
-      - if: matrix.platform == 'linux/arm/v7' && steps.arm.outputs.native != 'true'
+      # For the runtime stage's few commands only: the binaries are
+      # cross-compiled.
+      - if: matrix.platform == 'linux/arm/v7'
         uses: docker/setup-qemu-action@v4
         with:
           platforms: arm
