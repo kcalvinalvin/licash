@@ -13,13 +13,10 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
-import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -36,10 +33,6 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.ClipEntry
 import androidx.compose.ui.platform.LocalClipboard
-import androidx.compose.ui.platform.testTag
-import androidx.compose.ui.semantics.semantics
-import androidx.compose.ui.semantics.testTagsAsResourceId
-import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.delay
@@ -70,7 +63,17 @@ fun Receive(engine: Engine, back: () -> Unit) {
     var amount by rememberSaveable { mutableStateOf<Long?>(null) }
     var code by remember { mutableStateOf<Code?>(null) }
     var error by remember { mutableStateOf<String?>(null) }
-    var asking by remember { mutableStateOf(false) }
+    // The amount typed in, in place of the QR code: asked for once done.
+    var editing by remember { mutableStateOf(false) }
+    var typed by remember { mutableStateOf<Long?>(null) }
+    val edit = {
+        typed = amount
+        editing = true
+    }
+    val done = {
+        amount = typed
+        editing = false
+    }
     var received by remember { mutableStateOf<String?>(null) }
     var copied by remember { mutableStateOf(false) }
     val ui by engine.ui.collectAsState()
@@ -151,6 +154,11 @@ fun Receive(engine: Engine, back: () -> Unit) {
             }
             // In upper case, which a QR code holds in fewer modules.
             when {
+                editing -> {
+                    Spacer(Modifier.height(32.dp))
+                    AmountField(typed, { typed = it }) { done() }
+                    Spacer(Modifier.height(16.dp))
+                }
                 lightning && request != null -> QrCode(request.uppercase())
                 lightning && amount != null && error == null -> Waiting()
                 !lightning -> when (val made = code) {
@@ -164,12 +172,17 @@ fun Receive(engine: Engine, back: () -> Unit) {
             }
             Spacer(Modifier.height(16.dp))
             Text(
-                amount?.let { "Asking for ${sat(it.toULong())}" + if (lightning) " over Lightning" else "" }
-                    ?: if (lightning) "Choose an amount" else "Any amount",
+                when {
+                    editing -> "The amount to ask for"
+                    else -> amount?.let { "Asking for ${sat(it.toULong())}" + if (lightning) " over Lightning" else "" }
+                        ?: if (lightning) "Choose an amount" else "Any amount"
+                },
                 style = MaterialTheme.typography.titleMedium,
             )
             Text(
                 when {
+                    editing && lightning -> "A Lightning invoice asks for an amount."
+                    editing -> "None, and the payer chooses."
                     !lightning -> "Anyone can pay this, with Licash or on Bitcoin."
                     amount == null -> "A Lightning invoice asks for an amount."
                     request != null -> "Any Lightning wallet can pay this, once." +
@@ -187,25 +200,29 @@ fun Receive(engine: Engine, back: () -> Unit) {
                     lightning = !lightning
                     error = null
                     // An invoice asks for an amount.
-                    if (lightning && amount == null) asking = true
+                    if (lightning && amount == null) edit()
                 }) { Text(if (lightning) "Receive with Licash or Bitcoin" else "Receive over Lightning") }
             }
         }
         Row(Modifier.padding(vertical = 24.dp), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            OutlinedButton(onClick = { asking = true }, modifier = Modifier.weight(1f).height(56.dp)) {
-                Text(if (amount == null) "Amount" else "Change amount")
-            }
-            BigButton(if (copied) "Copied" else "Copy", Modifier.weight(1f), enabled = shown != null) {
-                shown?.let { (label, text) ->
-                    val clip = ClipData.newPlainText(label, text)
-                    scope.launch { clipboard.setClipEntry(ClipEntry(clip)) }
-                    copied = true
+            if (editing) {
+                OutlinedButton(onClick = { editing = false }, modifier = Modifier.weight(1f).height(56.dp)) {
+                    Text("Cancel")
+                }
+                BigButton("Done", Modifier.weight(1f)) { done() }
+            } else {
+                OutlinedButton(onClick = edit, modifier = Modifier.weight(1f).height(56.dp)) {
+                    Text(if (amount == null) "Amount" else "Change amount")
+                }
+                BigButton(if (copied) "Copied" else "Copy", Modifier.weight(1f), enabled = shown != null) {
+                    shown?.let { (label, text) ->
+                        val clip = ClipData.newPlainText(label, text)
+                        scope.launch { clipboard.setClipEntry(ClipEntry(clip)) }
+                        copied = true
+                    }
                 }
             }
         }
-    }
-    if (asking) {
-        AmountDialog(amount, onDone = { amount = it; asking = false }, onCancel = { asking = false })
     }
 }
 
@@ -216,26 +233,4 @@ private fun Waiting() {
         Modifier.widthIn(max = 316.dp).fillMaxWidth().aspectRatio(1f),
         contentAlignment = Alignment.Center,
     ) { CircularProgressIndicator() }
-}
-
-@Composable
-fun AmountDialog(current: Long?, onDone: (Long?) -> Unit, onCancel: () -> Unit) {
-    var text by remember { mutableStateOf(current?.toString() ?: "") }
-    AlertDialog(
-        onDismissRequest = onCancel,
-        // A window of its own: its test tags as resource ids too.
-        modifier = Modifier.semantics { testTagsAsResourceId = true },
-        title = { Text("Amount in sat") },
-        text = {
-            OutlinedTextField(
-                value = text,
-                onValueChange = { text = it.filter(Char::isDigit).take(15) },
-                modifier = Modifier.testTag("amount"),
-                singleLine = true,
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-            )
-        },
-        confirmButton = { TextButton(onClick = { onDone(text.toLongOrNull()?.takeIf { it > 0 }) }) { Text("Done") } },
-        dismissButton = { TextButton(onClick = onCancel) { Text("Cancel") } },
-    )
 }
