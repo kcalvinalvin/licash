@@ -9,6 +9,10 @@
 //! hub shows it can never be released. Notes its hub shows spent by a copy
 //! of the wallet are dropped.
 //!
+//! Notes are unlinked from the payments that made them ([`Wallet::unlink`]):
+//! those a hub no longer unlinks since it restarted are renewed, paid to
+//! the wallet itself within a fee limit ([`Wallet::set_renew_limit`]).
+//!
 //! A timed lock pays a payee on the preimage of a hash, or returns to the
 //! wallet once it expired unpaid: see [`Wallet::lock`] and
 //! [`Wallet::claim`]. Through a hub's Lightning gateway, the wallet pays
@@ -29,6 +33,7 @@ mod deposits;
 mod lightning;
 mod locks;
 mod payouts;
+mod renewals;
 mod silent;
 mod store;
 mod swaps;
@@ -38,7 +43,10 @@ use std::{
     collections::{HashMap, HashSet},
     future::Future,
     path::Path,
-    sync::Mutex,
+    sync::{
+        atomic::{AtomicU32, Ordering},
+        Mutex,
+    },
 };
 
 use licash::{
@@ -69,6 +77,14 @@ pub use payouts::{
 pub use silent::{Blocks, Payee, Scanned, SilentCoin, SilentSpend};
 use store::{now, sql, Owner, Store};
 pub use swaps::{Swap, SwapLimits, SwapQuote, SwapState, SWAP_WINDOW};
+
+/// The most a wallet pays to renew notes its hub no longer unlinks unless
+/// told otherwise ([`Wallet::set_renew_limit`]): in parts per million of
+/// their value.
+pub const RENEW_PPM: u32 = 100;
+
+/// Why a note stays linked: its hub refused to renew it.
+const RENEWAL_REFUSED: &str = "renewal_refused";
 
 /// A hub's answer: its HTTP status and body.
 #[derive(Clone, Debug)]
@@ -153,6 +169,14 @@ pub enum Error {
 
 fn invalid(e: impl std::fmt::Display) -> Error {
     Error::Invalid(e.to_string())
+}
+
+/// `code` as the API names it, as the wallet records it.
+fn code_name(code: Code) -> String {
+    match serde_json::to_value(code) {
+        Ok(serde_json::Value::String(name)) => name,
+        _ => format!("{code:?}"),
+    }
 }
 
 /// Whether the hub `hub` is trusted, and what it last said of itself.
@@ -346,6 +370,8 @@ pub struct Wallet<T> {
     /// The coins of payouts as their providers told of them since opened,
     /// confirmed or not, and their blocks if confirmed: by payout hash.
     told_coins: Mutex<HashMap<[u8; 32], Told>>,
+    /// The most it pays to renew notes, in parts per million of their value.
+    renew_ppm: AtomicU32,
 }
 
 /// A payout's coin as its provider told of it: its transaction, and its
@@ -404,6 +430,7 @@ impl<T: Transport> Wallet<T> {
             transport,
             asked_secure: Mutex::default(),
             told_coins: Mutex::default(),
+            renew_ppm: AtomicU32::new(RENEW_PPM),
         })
     }
 
@@ -439,6 +466,7 @@ impl<T: Transport> Wallet<T> {
             transport,
             asked_secure: Mutex::default(),
             told_coins: Mutex::default(),
+            renew_ppm: AtomicU32::new(RENEW_PPM),
         })
     }
 
@@ -446,6 +474,19 @@ impl<T: Transport> Wallet<T> {
     /// chain is refused.
     pub fn network(&self) -> ChainProfile {
         self.network
+    }
+
+    /// Renew notes their hub no longer unlinks ([`Wallet::unlink`]) only
+    /// if its fee on them is at most `ppm` parts per million of their
+    /// value, its base fee and rounding included: with 0, only where it
+    /// charges nothing. [`RENEW_PPM`] until set.
+    pub fn set_renew_limit(&self, ppm: u32) {
+        self.renew_ppm.store(ppm, Ordering::Relaxed);
+    }
+
+    /// The most the wallet pays to renew notes ([`Wallet::set_renew_limit`]).
+    pub fn renew_limit(&self) -> u32 {
+        self.renew_ppm.load(Ordering::Relaxed)
     }
 
     /// How the wallet reaches its hubs, for what it does not ask itself.
@@ -1334,11 +1375,12 @@ impl<T: Transport> Wallet<T> {
     }
 
     /// Finish every payment under way, or give up those their hubs refuse,
-    /// and take every lock, invoice and swap under way on.
+    /// and take every lock, invoice and swap under way on. Renewals of
+    /// notes are no payment: [`Wallet::unlink`] finishes them.
     pub async fn resume(&self) -> Result<Resumed, Error> {
         let ids: Vec<[u8; 32]> = self.store.read(|c| {
             let mut stmt = c.prepare(
-                "SELECT id FROM sends WHERE done_at IS NULL AND abandoned IS NULL
+                "SELECT id FROM sends WHERE done_at IS NULL AND abandoned IS NULL AND renewal = 0
                  ORDER BY created_at",
             )?;
             let rows = stmt.query_map([], |r| r.get(0))?;
@@ -1408,11 +1450,23 @@ impl<T: Transport> Wallet<T> {
     }
 
     /// Give up the payment `id`, not signed yet, and free its notes: for a
-    /// hub gone for good. A signed payment its hub may have released.
+    /// hub gone for good. A signed payment its hub may have released. The
+    /// notes of a renewal given up are not renewed again.
     pub fn abandon(&self, id: &str) -> Result<(), Error> {
         let id = payment_id(id)?;
+        let renewal: bool = self.store.read(|c| {
+            Ok(c.query_row(
+                "SELECT EXISTS (SELECT 1 FROM sends WHERE id = ?1 AND renewal = 1)",
+                [id.as_bytes()],
+                |r| r.get(0),
+            )?)
+        })?;
+        let ys = match renewal {
+            true => self.inputs_of(&id)?,
+            false => Vec::new(),
+        };
         if self.give_up(Step::Offer, &id, "abandoned by its owner", &[])? {
-            return Ok(());
+            return self.renewal_refused(&ys);
         }
         Err(Error::Invalid(
             "not a payment under way and unsigned: its hub may have released it".into(),
@@ -1692,24 +1746,73 @@ impl<T: Transport> Wallet<T> {
     }
 
     /// Unlink the notes held linked to their issuance, so that their hub
-    /// cannot tell which payment one came from when it is spent. A note
-    /// its hub refuses to unlink stays linked. The number unlinked; on an
-    /// error, those before it are kept and the rest are asked again next
-    /// time.
+    /// cannot tell which payment one came from when it is spent. A note its
+    /// hub refuses to unlink stays linked, but one it no longer unlinks
+    /// since it restarted is renewed: paid to the wallet itself, for notes
+    /// unlinked then, if the hub's fee on it is within the wallet's limit
+    /// ([`Wallet::set_renew_limit`]). Once only: a renewal's notes stay
+    /// linked if their hub restarted meanwhile. The notes of one payment
+    /// are renewed together, apart from others', so that a renewal tells
+    /// their hub nothing it did not know.
+    ///
+    /// The number of notes unlinked. On an error at a hub, its other notes
+    /// are asked again next time, the other hubs' still now: the first
+    /// error then.
     pub async fn unlink(&self) -> Result<usize, Error> {
-        let todo: Vec<([u8; 33], String)> = self.store.read(|c| {
+        let hubs: Vec<(i64, String)> = self.store.read(|c| {
             let mut stmt = c.prepare(
-                "SELECT n.y, r.url FROM notes n
+                "SELECT k.hub, r.url FROM notes n
                  JOIN keysets k ON k.id = n.keyset JOIN reach r ON r.hub = k.hub
-                 WHERE n.unlinked = 0 AND n.spent_by IS NULL AND n.gone_at IS NULL
-                 ORDER BY n.session IS NULL, n.added_at",
+                 WHERE n.spent_by IS NULL AND n.gone_at IS NULL
+                    AND (n.unlinked = 0 OR n.stays_linked = ?1)
+                 UNION
+                 SELECT s.hub, r.url FROM sends s JOIN reach r ON r.hub = s.hub
+                 WHERE s.renewal = 1 AND s.done_at IS NULL AND s.abandoned IS NULL
+                 ORDER BY 2",
             )?;
-            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            let rows =
+                stmt.query_map([code_name(Code::Expired)], |r| Ok((r.get(0)?, r.get(1)?)))?;
             Ok(rows.collect::<Result<_, _>>()?)
         })?;
         let mut unlinked = 0;
-        for (y, url) in todo {
-            if self.unlink_one(&url, &y).await? {
+        let mut failed = None;
+        for (hub, url) in hubs {
+            match self.unlink_at(hub, &url).await {
+                Ok(n) => unlinked += n,
+                Err(e) => {
+                    tracing::info!(%url, %e, "notes stay linked for now");
+                    failed.get_or_insert(e);
+                }
+            }
+        }
+        failed.map_or(Ok(unlinked), Err)
+    }
+
+    /// [`Wallet::unlink`] at the hub `hub`, reached at `url`.
+    async fn unlink_at(&self, hub: i64, url: &str) -> Result<usize, Error> {
+        let mut unlinked = self.unlink_linked(hub, url).await?;
+        if self.renew(hub, url).await? {
+            unlinked += self.unlink_linked(hub, url).await?;
+        }
+        Ok(unlinked)
+    }
+
+    /// Unlink the linked notes held at the hub `hub`, reached at `url`:
+    /// those asked before first, to ask the same again.
+    async fn unlink_linked(&self, hub: i64, url: &str) -> Result<usize, Error> {
+        let todo: Vec<[u8; 33]> = self.store.read(|c| {
+            let mut stmt = c.prepare(
+                "SELECT n.y FROM notes n JOIN keysets k ON k.id = n.keyset
+                 WHERE k.hub = ?1 AND n.unlinked = 0 AND n.spent_by IS NULL
+                    AND n.gone_at IS NULL
+                 ORDER BY n.session IS NULL, n.added_at",
+            )?;
+            let rows = stmt.query_map([hub], |r| r.get(0))?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })?;
+        let mut unlinked = 0;
+        for y in todo {
+            if self.unlink_one(url, &y).await? {
                 unlinked += 1;
             }
         }
@@ -1757,7 +1860,7 @@ impl<T: Transport> Wallet<T> {
             // It answers the same request the same: it will never unlink it.
             Err(Error::Refused { problem, .. }) => {
                 tracing::info!(%url, %problem, "a note stays linked");
-                self.stay_linked(y)?;
+                self.stay_linked(y, Some(problem.code))?;
                 return Ok(false);
             }
             Err(e) => return Err(e),
@@ -1766,7 +1869,7 @@ impl<T: Transport> Wallet<T> {
             Ok(note) if note.message().identifier()?.0 == *y => note,
             _ => {
                 tracing::warn!(%url, "its unlink answer does not open: a note stays linked");
-                self.stay_linked(y)?;
+                self.stay_linked(y, None)?;
                 return Ok(false);
             }
         };
@@ -1780,11 +1883,15 @@ impl<T: Transport> Wallet<T> {
         Ok(true)
     }
 
-    fn stay_linked(&self, y: &[u8; 33]) -> Result<(), Error> {
+    /// Keep the note `y` linked for good: for the refusal `code`, if its
+    /// hub refused to unlink it.
+    fn stay_linked(&self, y: &[u8; 33], code: Option<Code>) -> Result<(), Error> {
+        let why = code.map(code_name);
         self.store.write(|tx| {
             tx.execute(
-                "UPDATE notes SET unlinked = -1, session = NULL WHERE y = ?1",
-                [y],
+                "UPDATE notes SET unlinked = -1, session = NULL, stays_linked = ?2
+                 WHERE y = ?1 AND unlinked = 0",
+                params![y, why],
             )?;
             Ok(())
         })

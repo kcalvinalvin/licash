@@ -19,7 +19,7 @@ use rusqlite::{Connection, OpenFlags};
 
 /// The newest schemas read, as each file's `user_version`.
 const SWAPS_VERSION: i64 = 2;
-const WALLET_VERSION: i64 = 6;
+const WALLET_VERSION: i64 = 7;
 
 /// Why a swap ended without paying, beside a reason recorded.
 const NEVER_CLAIMED: &str = "never claimed";

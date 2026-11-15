@@ -410,6 +410,7 @@ fn files_of_older_versions_are_read_as_they_are() {
         include_str!("../../../../crates/licash-wallet/tests/fixtures/wallet-v3.sql"),
         include_str!("../../../../crates/licash-wallet/tests/fixtures/wallet-v4.sql"),
         include_str!("../../../../crates/licash-wallet/tests/fixtures/wallet-v5.sql"),
+        include_str!("../../../../crates/licash-wallet/tests/fixtures/wallet-v6.sql"),
     ];
     for (i, fixture) in wallets.iter().enumerate() {
         let dir = tempfile::tempdir().unwrap();

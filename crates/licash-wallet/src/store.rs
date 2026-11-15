@@ -17,7 +17,19 @@ const VERSION: i64 = 1 + MIGRATIONS.len() as i64;
 
 /// What each version adds to the one before: the first takes 1 to 2. A
 /// file of an older version is brought up to date when opened.
-const MIGRATIONS: &[&str] = &[SILENT, FALLBACK, UNTWEAKED, PAYOUTS, VISITED];
+const MIGRATIONS: &[&str] = &[SILENT, FALLBACK, UNTWEAKED, PAYOUTS, VISITED, RENEWALS];
+
+/// Version 7: renewals of notes a hub no longer unlinks since it restarted.
+const RENEWALS: &str = "
+-- Why a note stays linked (unlinked = -1): the code its hub refused to
+-- unlink it with ('expired' while the wallet may renew it), or
+-- 'renewal_refused' once its hub refused to renew it. None in a file of an
+-- older version: its notes that stay linked are never renewed.
+ALTER TABLE notes ADD COLUMN stays_linked TEXT;
+-- 1 for a payment of the wallet's notes to itself renewing them, which
+-- Wallet::unlink finishes: every send of an older file is a payment.
+ALTER TABLE sends ADD COLUMN renewal INTEGER NOT NULL DEFAULT 0;
+";
 
 /// Version 6: hubs visited to pay a payee there, not trusted.
 const VISITED: &str = "

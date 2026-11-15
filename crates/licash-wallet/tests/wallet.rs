@@ -525,11 +525,31 @@ fn a_wallet_file_of_version_5_trusts_every_hub_it_had() {
     let version: i64 = db
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 6);
+    assert_eq!(version, 7);
     assert_eq!(wallet.hubs().unwrap().len(), 1);
     assert_eq!(wallet.balance().unwrap().len(), 1);
     assert!(wallet.visited().unwrap().is_empty());
     assert!(wallet.visited_balance().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_wallet_file_of_version_6_renews_nothing_unasked() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v6.sqlite");
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute_batch(include_str!("fixtures/wallet-v6.sql"))
+        .unwrap();
+    // No hub answers: the wallet asks none.
+    let wallet = Wallet::open(&path, Link(Net::new())).unwrap();
+    let db = rusqlite::Connection::open(&path).unwrap();
+    let version: i64 = db
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, 7);
+    assert_eq!(wallet.unlink().await.unwrap(), 0);
+    assert!(wallet.sends().unwrap().is_empty());
+    assert_eq!(wallet.hubs().unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -667,6 +687,200 @@ async fn notes_a_restarted_hub_no_longer_unlinks_stay_linked_and_spendable() {
     assert_eq!(alice.unlink().await.unwrap(), 0);
     let payment = alice.send(HUB, &bob.address(), 4).await.unwrap().payment;
     assert_eq!(bob.receive(&payment).unwrap().amount, 4);
+}
+
+/// The wallet's payments to itself: its renewals.
+fn renewals(wallet: &Wallet<Link>) -> Vec<licash_wallet::Sent> {
+    let me = wallet.address();
+    let sends = wallet.sends().unwrap().into_iter();
+    sends.filter(|s| s.payee == me).collect()
+}
+
+/// How the notes the operation `id` made stand.
+fn made(wallet: &Wallet<Link>, id: &str) -> Vec<Unlinking> {
+    let notes = wallet.operation_notes(id).unwrap().made;
+    notes.iter().map(|n| n.unlinked).collect()
+}
+
+/// A network of one hub at [`HUB`] charging `fee`.
+fn charging(fee: Fee) -> Arc<Net> {
+    let net = Net::new();
+    net.start(HUB, fee);
+    net
+}
+
+#[tokio::test]
+async fn notes_a_restarted_hub_no_longer_unlinks_are_renewed_once_and_unlinked() {
+    let net = charging(Fee::default());
+    let (alice, bob) = (party(&net, 1).await, party(&net, 2).await);
+    let got = alice.receive(&net.pay(HUB, &alice.address(), 100)).unwrap();
+    net.restart(HUB);
+    let unlinked = alice.unlink().await.unwrap();
+    let renewals = renewals(&alice);
+    assert_eq!(renewals.len(), 1, "{renewals:?}");
+    let renewal = &renewals[0];
+    assert_eq!((renewal.amount, renewal.fee), (100, 0));
+    assert_eq!(renewal.state, State::Done);
+    let fresh = made(&alice, &renewal.id);
+    assert_eq!(unlinked, fresh.len());
+    assert!(fresh.iter().all(|u| *u == Unlinking::Unlinked), "{fresh:?}");
+    let spent = alice.operation_notes(&got.id).unwrap().made;
+    assert!(spent
+        .iter()
+        .all(|n| n.spent_by.as_ref() == Some(&renewal.id)));
+    assert_eq!(available(&alice), (100, 0));
+    // No payment to hand anyone, and nothing more to renew.
+    assert!(alice.resume().await.unwrap().paid.is_empty());
+    assert_eq!(alice.unlink().await.unwrap(), 0);
+    assert_eq!(alice.sends().unwrap().len(), 1);
+    let payment = alice.send(HUB, &bob.address(), 100).await.unwrap().payment;
+    assert_eq!(bob.receive(&payment).unwrap().amount, 100);
+}
+
+#[tokio::test]
+async fn a_renewal_pays_its_hub_within_the_limit_only() {
+    // 5% of 100: 5, 50,000 parts per million.
+    let net = charging(Fee {
+        base: 0,
+        ppm: 50_000,
+    });
+    let alice = party(&net, 1).await;
+    alice.receive(&net.pay(HUB, &alice.address(), 100)).unwrap();
+    net.restart(HUB);
+    assert_eq!(alice.renew_limit(), licash_wallet::RENEW_PPM);
+    assert_eq!(alice.unlink().await.unwrap(), 0);
+    alice.set_renew_limit(49_999);
+    assert_eq!(alice.unlink().await.unwrap(), 0);
+    assert!(renewals(&alice).is_empty());
+    assert_eq!(available(&alice), (100, 0));
+    alice.set_renew_limit(50_000);
+    assert!(alice.unlink().await.unwrap() > 0);
+    let renewals = renewals(&alice);
+    assert_eq!(renewals.len(), 1, "{renewals:?}");
+    assert_eq!((renewals[0].amount, renewals[0].fee), (95, 5));
+    assert_eq!(available(&alice), (95, 0));
+}
+
+#[tokio::test]
+async fn a_renewal_refused_for_fees_changed_asks_them_again_once() {
+    let net = charging(Fee {
+        base: 0,
+        ppm: 50_000,
+    });
+    *net.stale.lock().unwrap() = Some(Fee::default());
+    let alice = party(&net, 1).await;
+    alice.receive(&net.pay(HUB, &alice.address(), 100)).unwrap();
+    net.restart(HUB);
+    *net.stale.lock().unwrap() = None;
+    alice.set_renew_limit(50_000);
+    assert!(alice.unlink().await.unwrap() > 0);
+    let renewals = renewals(&alice);
+    let states: Vec<_> = renewals.iter().map(|s| (&s.state, s.fee)).collect();
+    assert!(
+        matches!(states[..], [(State::Done, 5), (State::Abandoned(_), 0)]),
+        "{states:?}"
+    );
+    assert_eq!(available(&alice), (95, 0));
+}
+
+#[tokio::test]
+async fn a_renewal_whose_hub_restarted_meanwhile_stays_linked_and_is_not_renewed_again() {
+    let net = charging(Fee::default());
+    let (alice, bob) = (party(&net, 1).await, party(&net, 2).await);
+    alice.receive(&net.pay(HUB, &alice.address(), 100)).unwrap();
+    net.restart(HUB);
+    // Released, but its answer lost: under way, its notes taken.
+    net.fail(RELEASE, Fault::Dropped);
+    assert!(matches!(alice.unlink().await, Err(Error::Pending { .. })));
+    assert_eq!(available(&alice), (0, 100));
+    net.restart(HUB);
+    assert_eq!(alice.unlink().await.unwrap(), 0);
+    assert_eq!(alice.unlink().await.unwrap(), 0);
+    let renewals = renewals(&alice);
+    assert_eq!(renewals.len(), 1, "{renewals:?}");
+    let fresh = made(&alice, &renewals[0].id);
+    assert!(
+        fresh.iter().all(|u| *u == Unlinking::StaysLinked),
+        "{fresh:?}"
+    );
+    let payment = alice.send(HUB, &bob.address(), 100).await.unwrap().payment;
+    assert_eq!(bob.receive(&payment).unwrap().amount, 100);
+}
+
+#[tokio::test]
+async fn a_renewal_its_hub_never_heard_of_is_finished_by_unlink_not_resume() {
+    let net = charging(Fee::default());
+    let alice = party(&net, 1).await;
+    alice.receive(&net.pay(HUB, &alice.address(), 100)).unwrap();
+    net.restart(HUB);
+    net.fail(OFFER, Fault::Lost);
+    assert!(matches!(alice.unlink().await, Err(Error::Pending { .. })));
+    let resumed = alice.resume().await.unwrap();
+    assert!(resumed.paid.is_empty() && resumed.pending.is_empty());
+    assert_eq!(renewals(&alice)[0].state, State::Offered);
+    assert!(alice.unlink().await.unwrap() > 0);
+    let renewals = renewals(&alice);
+    assert_eq!(renewals.len(), 1, "{renewals:?}");
+    assert_eq!(renewals[0].state, State::Done);
+    assert_eq!(available(&alice), (100, 0));
+}
+
+#[tokio::test]
+async fn a_renewal_given_up_by_its_owner_is_not_made_again() {
+    let net = charging(Fee::default());
+    let alice = party(&net, 1).await;
+    let got = alice.receive(&net.pay(HUB, &alice.address(), 100)).unwrap();
+    net.restart(HUB);
+    net.fail(OFFER, Fault::Lost);
+    assert!(alice.unlink().await.is_err());
+    alice.abandon(&renewals(&alice)[0].id).unwrap();
+    assert_eq!(alice.unlink().await.unwrap(), 0);
+    assert_eq!(alice.sends().unwrap().len(), 1);
+    let held = made(&alice, &got.id);
+    assert!(
+        held.iter().all(|u| *u == Unlinking::StaysLinked),
+        "{held:?}"
+    );
+    assert_eq!(available(&alice), (100, 0));
+}
+
+#[tokio::test]
+async fn notes_that_stay_linked_for_no_reason_recorded_are_never_renewed() {
+    let net = charging(Fee::default());
+    let alice = party(&net, 1).await;
+    alice.receive(&net.pay(HUB, &alice.address(), 100)).unwrap();
+    net.restart(HUB);
+    // Linked for good as a file of an older version holds them, which
+    // recorded no reason.
+    net.fail(UNLINK, Fault::Refused(Code::Invalid));
+    net.fail(UNLINK, Fault::Refused(Code::Invalid));
+    net.fail(UNLINK, Fault::Refused(Code::Invalid));
+    assert_eq!(alice.unlink().await.unwrap(), 0);
+    let db = rusqlite::Connection::open(alice._dir.path().join("w.sqlite")).unwrap();
+    db.execute("UPDATE notes SET stays_linked = NULL", [])
+        .unwrap();
+    assert_eq!(alice.unlink().await.unwrap(), 0);
+    assert!(renewals(&alice).is_empty());
+}
+
+#[tokio::test]
+async fn an_unavailable_hub_leaves_the_other_hubs_notes_unlinked() {
+    const OTHER: &str = "http://other.test";
+    let net = network();
+    net.start(OTHER, FEE);
+    let alice = party(&net, 1).await;
+    alice.add_hub(OTHER).await.unwrap();
+    let here = alice.receive(&net.pay(HUB, &alice.address(), 8)).unwrap();
+    let there = alice.receive(&net.pay(OTHER, &alice.address(), 8)).unwrap();
+    // The first hub asked, HUB, does not answer.
+    net.fail(UNLINK, Fault::Lost);
+    assert!(matches!(
+        alice.unlink().await,
+        Err(Error::Unavailable { .. })
+    ));
+    assert_eq!(made(&alice, &here.id), [Unlinking::Linked]);
+    assert_eq!(made(&alice, &there.id), [Unlinking::Unlinked]);
+    assert_eq!(alice.unlink().await.unwrap(), 1);
 }
 
 #[tokio::test]
