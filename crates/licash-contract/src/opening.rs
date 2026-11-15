@@ -64,7 +64,7 @@ use crate::{INSTANCES, KEPT};
 mod fate;
 mod state;
 pub use fate::{Fate, Funding, Spent};
-pub use state::{HubPhase, Phase};
+pub use state::{HubPhase, Peek, Phase};
 
 /// The statement BABE encrypts under: its Groth16 verifying key and the
 /// public inputs of the journal fixed at opening.

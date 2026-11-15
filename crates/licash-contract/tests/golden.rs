@@ -65,3 +65,14 @@ fn a_hub_funded_in_format_1_loads_as_stored() {
     let opening = hub.opening().unwrap();
     assert_eq!(hex(opening.d.as_bytes()), D);
 }
+
+#[test]
+fn a_hub_state_peeks_at_the_terms_it_loads_with_and_no_holders() {
+    let peek = Hub::peek(HUB).unwrap();
+    let hub = Hub::load(HUB, &ctx()).unwrap();
+    assert_eq!(peek.phase, HubPhase::Funded);
+    assert_eq!(peek.funding.unwrap().to_string(), F);
+    assert_eq!(peek.base.digest(), hub.opening().unwrap().base.digest());
+    assert!(Hub::peek(HOLDER).is_err());
+    assert!(Hub::peek(&HUB[..HUB.len() / 2]).is_err());
+}

@@ -26,6 +26,7 @@ use anyhow::{bail, ensure, Context as _, Result};
 use k256::Scalar;
 use licash::base::Base;
 use licash::chain::Checkpoint;
+use lngap_btc::bitcoin::Txid;
 
 use super::{
     check_choice, check_sigs, compile, draft_hmsg, programs, same_kind, send, Context, Holder, Hub,
@@ -566,6 +567,51 @@ impl Hub {
         ensure!(r.0.is_empty(), "bytes past an opening's state");
         Ok(h)
     }
+
+    /// What a state [`Hub::to_bytes`] stored says of its opening, read
+    /// without [`Hub::load`]'s checks, its trust or its secret: for its
+    /// operator to see, never to act on.
+    pub fn peek(bytes: &[u8]) -> Result<Peek> {
+        let mut r = Reader(bytes);
+        ensure!(r.array::<4>()? == MAGIC, "not an opening's state");
+        let format = r.u16()?;
+        ensure!(format == FORMAT, "an opening's state of format {format}");
+        r.u8()?;
+        ensure!(r.u8()? == HUB, "not a hub's opening");
+        let phase = r.u8()?;
+        let phase = *HubPhase::ALL
+            .get(usize::from(phase))
+            .with_context(|| format!("phase {phase}"))?;
+        r.array::<32>()?;
+        r.quote()?;
+        let id = r.array()?;
+        r.blob()?;
+        let base = Base::from_bytes(r.blob()?)?;
+        if phase >= HubPhase::Keyed {
+            r.blob()?;
+        }
+        let funding = match phase >= HubPhase::Committed {
+            true => Some(wire::Commit::decode(r.blob()?)?.funding.compute_txid()),
+            false => None,
+        };
+        Ok(Peek {
+            phase,
+            id,
+            base,
+            funding,
+        })
+    }
+}
+
+/// A hub's stored opening as [`Hub::peek`] reads it: unchecked.
+#[derive(Clone, Debug)]
+pub struct Peek {
+    pub phase: HubPhase,
+    pub id: [u8; 32],
+    /// The terms it answered her Open with.
+    pub base: Base,
+    /// F's id, from its commitment to F on.
+    pub funding: Option<Txid>,
 }
 
 #[cfg(test)]
