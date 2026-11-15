@@ -38,6 +38,7 @@ import org.licash.core.Paid
 import org.licash.core.PayQuote
 import org.licash.core.PayoutQuote
 import org.licash.core.FoundHub
+import org.licash.core.PayOffer
 import org.licash.core.Scanned
 import org.licash.core.State
 import org.licash.core.Wallet
@@ -408,6 +409,14 @@ class Engine(context: Context) {
     suspend fun payQuote(code: String, amount: ULong?): Result<PayQuote> =
         io { local { it.payQuote(code, amount) } }
 
+    /** Every way of paying `code`: through each swap provider that could. */
+    suspend fun payOffers(code: String, amount: ULong?): Result<List<PayOffer>> =
+        io { local { it.payOffers(code, amount) } }
+
+    /** Quote paying `code` through the provider at `provider`: paid so next. */
+    suspend fun choosePayOffer(code: String, amount: ULong?, provider: String): Result<PayQuote> =
+        io { local { it.choosePayOffer(code, amount, provider) } }
+
     suspend fun pay(code: String, amount: ULong?): Result<Paid> = io {
         val paid = locked { it.pay(code, amount) }
         refresh()
@@ -446,6 +455,10 @@ class Engine(context: Context) {
      */
     suspend fun payoutQuote(address: String, amount: ULong?, hub: String? = null): Result<PayoutQuote> =
         io { local { it.payoutQuote(address, amount, hub) } }
+
+    /** The quotes of [payoutQuote] through every provider that pays it out. */
+    suspend fun payoutOffers(address: String, amount: ULong?, hub: String?): Result<List<PayoutQuote>> =
+        io { local { it.payoutOffers(address, amount, hub) } }
 
     /** An address on Bitcoin of this wallet's, to cash out to. */
     suspend fun bitcoinAddress(): Result<String> = io { local { it.bitcoinAddress() } }

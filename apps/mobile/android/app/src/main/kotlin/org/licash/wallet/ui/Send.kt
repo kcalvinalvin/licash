@@ -2,6 +2,7 @@ package org.licash.wallet.ui
 
 import android.content.Intent
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
@@ -15,6 +16,7 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -29,6 +31,7 @@ import androidx.compose.ui.platform.LocalClipboard
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
 import org.licash.core.InvoiceQuote
@@ -53,12 +56,19 @@ private sealed interface Step {
         val visit: Boolean = false,
     ) : Step
     data object Planning : Step
-    data class Review(val code: String, val amount: ULong?, val quote: PayQuote) : Step
+    /** Swapping through `provider`, named `through`, if chosen. */
+    data class Review(
+        val code: String,
+        val amount: ULong?,
+        val quote: PayQuote,
+        val provider: String? = null,
+        val through: String? = null,
+    ) : Step
     data class Visit(val code: String, val asked: ULong?, val address: String?) : Step
     data class Unpayable(val why: String, val address: String, val amount: ULong?) : Step
     data class Invoice(val text: String, val quote: InvoiceQuote) : Step
     data class Address(val address: String) : Step
-    data class Payout(val quote: PayoutQuote) : Step
+    data class Payout(val quote: PayoutQuote, val asked: ULong? = null) : Step
     data object Busy : Step
     data object Quoting : Step
     data class PayingOut(val amount: ULong, val depth: UInt) : Step
@@ -104,7 +114,7 @@ fun Send(engine: Engine, ui: Ui, link: String?, cashOut: String? = null, back: (
     suspend fun quoting(address: String, amount: ULong?): Step {
         step = Step.Quoting
         return engine.payoutQuote(address, amount, cashOut).fold(
-            { Step.Payout(it) },
+            { Step.Payout(it, amount) },
             { Step.Failed(explain(it)) },
         )
     }
@@ -256,7 +266,34 @@ fun Send(engine: Engine, ui: Ui, link: String?, cashOut: String? = null, back: (
                 is Step.Paying -> Paying(ui, s, asking, { asking = it }) { amount -> plan(s, amount) }
                 Step.Busy -> Middle("One moment…")
                 Step.Planning -> Middle("Finding the way to pay…")
-                is Step.Review -> Review(s.quote) { pay(s.code, s.amount) }
+                is Step.Review -> Review(s.quote, s.through, { pay(s.code, s.amount) }) {
+                    // A swap first: any provider that could, to choose.
+                    if (ui.developer && s.quote.swapFrom != null) {
+                        Providers {
+                            engine.payOffers(s.code, s.amount).map { offers ->
+                                val swaps = offers.filter { it.provider != null }
+                                val current = s.provider ?: swaps.firstOrNull()?.provider
+                                swaps.map { o ->
+                                    val provider = o.provider!!
+                                    val name = o.providerName ?: host(provider)
+                                    Offer(
+                                        name,
+                                        "Fees ${sat(o.quote.fee)}" + if (o.known) ", used before" else "",
+                                        provider == current,
+                                    ) {
+                                        step = Step.Planning
+                                        scope.launch {
+                                            step = engine.choosePayOffer(s.code, s.amount, provider).fold(
+                                                { Step.Review(s.code, s.amount, it, provider, name) },
+                                                { Step.Failed(explain(it)) },
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 is Step.Visit -> Ask(
                     "This code names no hub you use. It says where to reach the payee's, " +
                         "which proves it is the one named.\n\nPay there, moving notes from a hub you use?",
@@ -281,7 +318,21 @@ fun Send(engine: Engine, ui: Ui, link: String?, cashOut: String? = null, back: (
                 Step.Quoting -> Middle("Finding a provider to pay it on Bitcoin…")
                 is Step.Invoice -> Invoice(s.quote) { payInvoice(s.text, s.quote.hub) }
                 is Step.Address -> ToAddress(s.address, asking, { asking = it }) { amount -> quote(s.address, amount) }
-                is Step.Payout -> Payout(s.quote, s.quote.address == own) { payOut(s.quote) }
+                is Step.Payout -> Payout(s.quote, s.quote.address == own, { payOut(s.quote) }) {
+                    if (ui.developer) {
+                        Providers {
+                            engine.payoutOffers(s.quote.address, s.asked, s.quote.hub).map { offers ->
+                                offers.map { o ->
+                                    Offer(
+                                        o.providerName ?: host(o.provider),
+                                        "Fees ${sat(o.fee)}, pays ${sat(o.amount)}",
+                                        o.provider == s.quote.provider,
+                                    ) { step = Step.Payout(o, s.asked) }
+                                }
+                            }
+                        }
+                    }
+                }
                 is Step.PayingOut -> Told(
                     "Sending ${sat(s.amount)} on Bitcoin. It reaches the address in about " +
                         "${(s.depth.toInt() + 1) * 10} minutes; your history shows how far it got.",
@@ -339,7 +390,7 @@ private fun Paying(ui: Ui, s: Step.Paying, asking: Boolean, ask: (Boolean) -> Un
  * notes to its hub first, and whether that hub is one not added.
  */
 @Composable
-private fun Review(quote: PayQuote, pay: () -> Unit) {
+private fun Review(quote: PayQuote, through: String?, pay: () -> Unit, more: @Composable () -> Unit) {
     val note = MaterialTheme.colorScheme.onSurfaceVariant
     Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
         Spacer(Modifier.height(48.dp))
@@ -352,7 +403,8 @@ private fun Review(quote: PayQuote, pay: () -> Unit) {
         Spacer(Modifier.height(16.dp))
         quote.swapFrom?.let { from ->
             Text(
-                "Moves ${sat(quote.swapped)} from ${host(from)} to ${host(quote.hub)} first, through a swap provider.",
+                "Moves ${sat(quote.swapped)} from ${host(from)} to ${host(quote.hub)} first, " +
+                    "through ${through ?: "a swap provider"}.",
                 style = MaterialTheme.typography.bodyMedium,
                 textAlign = TextAlign.Center,
             )
@@ -370,6 +422,64 @@ private fun Review(quote: PayQuote, pay: () -> Unit) {
         }
         Spacer(Modifier.height(32.dp))
         BigButton("Pay", Modifier.fillMaxWidth(), onClick = pay)
+        more()
+    }
+}
+
+/** A provider's offer, in a list to choose from: `choose` takes it. */
+private class Offer(val name: String, val detail: String, val current: Boolean, val choose: () -> Unit)
+
+/**
+ * Every provider's offer, once asked, `load`ing them: to choose another
+ * than the one picked, in advanced mode.
+ */
+@Composable
+private fun Providers(load: suspend () -> Result<List<Offer>>) {
+    val scope = rememberCoroutineScope()
+    var offers by remember { mutableStateOf<List<Offer>?>(null) }
+    var asking by remember { mutableStateOf(false) }
+    var error by remember { mutableStateOf<String?>(null) }
+    Spacer(Modifier.height(16.dp))
+    val list = offers
+    if (list == null) {
+        TextButton(
+            enabled = !asking,
+            onClick = {
+                asking = true
+                error = null
+                scope.launch {
+                    load().fold({ offers = it }, { error = explain(it) })
+                    asking = false
+                }
+            },
+            modifier = Modifier.testTag("providers"),
+        ) { Text(if (asking) "Asking the providers…" else "All providers") }
+    } else {
+        Text(
+            if (list.size == 1) "The only provider" else "${list.size} providers",
+            modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+            style = MaterialTheme.typography.titleSmall,
+        )
+        list.forEach { o ->
+            Row(Modifier.fillMaxWidth().padding(vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text(o.name, style = MaterialTheme.typography.bodyLarge, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    Text(
+                        o.detail,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                if (o.current) {
+                    Text("Chosen", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
+                } else {
+                    TextButton(onClick = o.choose) { Text("Use") }
+                }
+            }
+        }
+    }
+    error?.let {
+        Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
     }
 }
 
@@ -429,7 +539,7 @@ private fun ToAddress(address: String, asking: Boolean, ask: (Boolean) -> Unit, 
 
 /** A payout on Bitcoin to confirm: what the address gets, and all it costs on top. */
 @Composable
-private fun Payout(quote: PayoutQuote, own: Boolean, pay: () -> Unit) {
+private fun Payout(quote: PayoutQuote, own: Boolean, pay: () -> Unit, more: @Composable () -> Unit) {
     Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
         Spacer(Modifier.height(48.dp))
         Text(sat(quote.amount), style = Figures)
@@ -454,6 +564,7 @@ private fun Payout(quote: PayoutQuote, own: Boolean, pay: () -> Unit) {
         )
         Spacer(Modifier.height(32.dp))
         BigButton("Send", Modifier.fillMaxWidth(), onClick = pay)
+        more()
     }
 }
 
