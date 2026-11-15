@@ -10,6 +10,9 @@ use licash_wallet::{Response, Transport};
 /// The most an answer may hold: far above any grant.
 const MAX_ANSWER: usize = 4 << 20;
 
+/// How long a [`Transport::download`] may take: its answer is large.
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(900);
+
 /// A wallet's [`Transport`] over HTTP(S).
 pub struct Http(Route);
 
@@ -56,13 +59,34 @@ impl Http {
 }
 
 impl Transport for Http {
-    // A single route without the `tor` feature.
-    #[cfg_attr(not(feature = "tor"), allow(clippy::infallible_destructuring_match))]
     fn request(
         &self,
         url: &str,
         body: Option<Vec<u8>>,
     ) -> impl std::future::Future<Output = Result<Response, String>> + Send {
+        self.exchange(url, body, MAX_ANSWER, None)
+    }
+
+    fn download(
+        &self,
+        url: &str,
+        max: usize,
+    ) -> impl std::future::Future<Output = Result<Response, String>> + Send {
+        self.exchange(url, None, max, Some(DOWNLOAD_TIMEOUT))
+    }
+}
+
+impl Http {
+    /// `body` POSTed to `url`, or a GET: an answer of at most `max` bytes,
+    /// in `timeout` if given rather than the client's own.
+    #[cfg_attr(not(feature = "tor"), allow(clippy::infallible_destructuring_match))]
+    fn exchange(
+        &self,
+        url: &str,
+        body: Option<Vec<u8>>,
+        max: usize,
+        timeout: Option<Duration>,
+    ) -> impl std::future::Future<Output = Result<Response, String>> + Send + '_ {
         let client = match &self.0 {
             Route::Direct(client) => client,
             #[cfg(feature = "tor")]
@@ -71,19 +95,25 @@ impl Transport for Http {
                 // Boxed: Arti's futures are too deep a type to nest in the
                 // callers'.
                 let tor: futures_util::future::BoxFuture<'_, _> = Box::pin(async move {
-                    let (status, body) = tor.request(&url, body, MAX_ANSWER).await?;
+                    let (status, body) = match timeout {
+                        Some(timeout) => tor.request_for(&url, body, max, timeout).await?,
+                        None => tor.request(&url, body, max).await?,
+                    };
                     Ok(Response { status, body })
                 });
                 return futures_util::future::Either::Left(tor);
             }
         };
-        let request = match body {
+        let mut request = match body {
             Some(body) => client
                 .post(url)
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
                 .body(body),
             None => client.get(url),
         };
+        if let Some(timeout) = timeout {
+            request = request.timeout(timeout);
+        }
         let direct = async move {
             let mut response = request
                 .send()
@@ -96,8 +126,8 @@ impl Transport for Http {
                 .await
                 .map_err(|e| e.without_url().to_string())?
             {
-                if body.len() + chunk.len() > MAX_ANSWER {
-                    return Err(format!("an answer over {MAX_ANSWER} bytes"));
+                if body.len() + chunk.len() > max {
+                    return Err(format!("an answer over {max} bytes"));
                 }
                 body.extend_from_slice(&chunk);
             }

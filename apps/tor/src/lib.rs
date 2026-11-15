@@ -66,9 +66,21 @@ impl Tor {
         body: Option<Vec<u8>>,
         max: usize,
     ) -> Result<(u16, Vec<u8>), String> {
-        tokio::time::timeout(TIMEOUT, self.exchange(url, body, max))
+        self.request_for(url, body, max, TIMEOUT).await
+    }
+
+    /// [`Tor::request`], given `timeout` rather than its own: for a large
+    /// answer.
+    pub async fn request_for(
+        &self,
+        url: &str,
+        body: Option<Vec<u8>>,
+        max: usize,
+        timeout: Duration,
+    ) -> Result<(u16, Vec<u8>), String> {
+        tokio::time::timeout(timeout, self.exchange(url, body, max))
             .await
-            .unwrap_or_else(|_| Err(format!("no answer over Tor in {} s", TIMEOUT.as_secs())))
+            .unwrap_or_else(|_| Err(format!("no answer over Tor in {} s", timeout.as_secs())))
     }
 
     async fn exchange(
