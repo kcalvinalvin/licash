@@ -2,6 +2,7 @@ package org.licash.wallet.ui
 
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -9,12 +10,16 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -30,11 +35,16 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.graphics.vector.addPathNodes
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
 import org.licash.core.Activity
+import org.licash.core.Details
 import org.licash.core.Kind
 import org.licash.core.State
 import org.licash.wallet.Engine
@@ -44,6 +54,7 @@ import org.licash.wallet.credit
 import org.licash.wallet.digits
 import org.licash.wallet.explain
 import org.licash.wallet.host
+import org.licash.wallet.key
 import org.licash.wallet.sat
 import org.licash.wallet.total
 
@@ -96,8 +107,8 @@ fun Home(
             ActivityRow(activity, coming = true) { open(activity) }
             HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.4f))
         }
-        items(ui.history, key = { it.id + it.kind }) { activity ->
-            ActivityRow(activity) { open(activity) }
+        items(ui.history, key = { it.key }) { activity ->
+            ActivityRow(activity, details = ui.under[activity.key]) { open(activity) }
             HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.4f))
         }
     }
@@ -191,46 +202,122 @@ private fun ConnectHub(engine: Engine) {
     }
 }
 
+/**
+ * A line of the history: what it was, an icon of its kind and direction,
+ * and when it was; one under way tells which step it is at, from
+ * [details], as its page does.
+ */
 @Composable
-private fun ActivityRow(activity: Activity, coming: Boolean = false, open: () -> Unit) {
-    val (title, sign) = if (coming) "Coming on Bitcoin" to "+" else when (activity.kind) {
-        Kind.SENT -> "Sent" to "−"
-        Kind.RECEIVED -> "Received" to "+"
-        Kind.MOVED -> "From Bitcoin" to "+"
-        Kind.ONCHAIN -> "On Bitcoin" to "+"
-        Kind.LIGHTNING -> "Paid over Lightning" to "−"
-        Kind.INVOICE -> "Received over Lightning" to "+"
-        Kind.PAYOUT -> "Sent on Bitcoin" to "−"
-        Kind.CONTRACT -> "Contract opened" to "−"
-        Kind.SWAP -> "Moved between hubs" to ""
+private fun ActivityRow(activity: Activity, coming: Boolean = false, details: Details? = null, open: () -> Unit) {
+    val colors = MaterialTheme.colorScheme
+    val failed = !coming && activity.state == State.FAILED
+    val under = !coming && activity.state == State.PENDING
+    val sign = when {
+        activity.kind == Kind.SWAP -> ""
+        !coming && paid(activity) -> "−"
+        else -> "+"
     }
     val detail = when {
         coming -> "Waiting for a block"
-        else -> when (activity.state) {
-            State.PENDING -> "Under way"
-            State.FAILED -> activity.detail
-            State.DONE -> activity.at?.let { at(it) } ?: activity.detail
-        }
+        failed -> activity.detail
+        // "Under way" itself shows beside the title.
+        under -> status(activity, false, details).takeIf { details != null && it != "Under way" }
+        else -> activity.at?.let { at(it) } ?: activity.detail
     }
-    val color = when {
-        coming -> MaterialTheme.colorScheme.onSurfaceVariant
-        activity.state == State.FAILED -> MaterialTheme.colorScheme.error
-        else -> MaterialTheme.colorScheme.onSurface
+    val tint = when {
+        failed -> colors.error
+        coming -> colors.onSurfaceVariant
+        sign == "+" -> colors.primary
+        activity.kind == Kind.SWAP -> colors.secondary
+        else -> colors.onSurfaceVariant
     }
     Row(
-        Modifier.fillMaxWidth().clickable(onClick = open).padding(vertical = 14.dp),
+        Modifier.fillMaxWidth().clickable(onClick = open).padding(vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Column(Modifier.weight(1f)) {
-            Text(title, style = MaterialTheme.typography.bodyLarge)
-            Text(
-                detail,
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
+        Surface(Modifier.size(40.dp), shape = CircleShape, color = tint.copy(alpha = 0.14f)) {
+            Box(contentAlignment = Alignment.Center) {
+                Icon(glyph(activity, coming, failed), contentDescription = null, Modifier.size(20.dp), tint = tint)
+            }
         }
-        Text("$sign${sat(activity.amount)}", style = MaterialTheme.typography.bodyLarge, color = color)
+        Spacer(Modifier.width(14.dp))
+        Column(Modifier.weight(1f)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    title(activity, coming),
+                    Modifier.weight(1f, fill = false),
+                    style = MaterialTheme.typography.bodyLarge,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                if (under) {
+                    Spacer(Modifier.width(8.dp))
+                    Surface(shape = RoundedCornerShape(50), color = colors.tertiary.copy(alpha = 0.16f)) {
+                        Text(
+                            "Under way",
+                            Modifier.padding(horizontal = 8.dp, vertical = 2.dp),
+                            style = MaterialTheme.typography.labelSmall,
+                            color = colors.tertiary,
+                        )
+                    }
+                }
+            }
+            detail?.let {
+                Text(
+                    it,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = if (failed) colors.error else colors.onSurfaceVariant,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        }
+        Spacer(Modifier.width(12.dp))
+        Text(
+            "$sign${sat(activity.amount)}",
+            style = MaterialTheme.typography.bodyLarge,
+            color = when {
+                failed -> colors.error
+                coming -> colors.onSurfaceVariant
+                sign == "+" -> colors.primary
+                else -> colors.onSurface
+            },
+        )
     }
+}
+
+/** The icon of a line of the history: failed, or its kind and direction. */
+private fun glyph(activity: Activity, coming: Boolean, failed: Boolean): ImageVector = when {
+    failed -> Icons.Default.Warning
+    coming -> Glyphs.down
+    else -> when (activity.kind) {
+        Kind.LIGHTNING, Kind.INVOICE -> Glyphs.bolt
+        Kind.SWAP -> Glyphs.swap
+        Kind.CONTRACT -> Icons.Default.Lock
+        Kind.SENT, Kind.PAYOUT -> Glyphs.up
+        Kind.RECEIVED, Kind.MOVED, Kind.ONCHAIN -> Glyphs.down
+    }
+}
+
+/**
+ * The few Material icons (Apache 2.0) the core set lacks, from their path
+ * data: an extended set of thousands for four is not worth its size.
+ */
+private object Glyphs {
+    val up by lazy { icon("up", "M4,12l1.41,1.41L11,7.83V20h2V7.83l5.58,5.59L20,12l-8,-8 -8,8z") }
+    val down by lazy { icon("down", "M20,12l-1.41,-1.41L13,16.17V4h-2v12.17l-5.58,-5.59L4,12l8,8 8,-8z") }
+    val swap by lazy { icon("swap", "M6.99,11L3,15l3.99,4v-3H14v-2H6.99v-3zM21,9l-3.99,-4v3H10v2h7.01v3L21,9z") }
+    val bolt by lazy {
+        icon(
+            "bolt",
+            "M11,21h-1l1,-7H7.5c-0.58,0 -0.57,-0.32 -0.38,-0.66 0.19,-0.34 0.05,-0.08 0.07,-0.12" +
+                "C8.48,10.94 10.42,7.54 13,3h1l-1,7h3.5c0.49,0 0.56,0.33 0.47,0.51l-0.07,0.15" +
+                "C12.96,17.55 11,21 11,21z",
+        )
+    }
+
+    private fun icon(name: String, path: String): ImageVector =
+        ImageVector.Builder(name, 24.dp, 24.dp, 24f, 24f)
+            .addPath(addPathNodes(path), fill = SolidColor(Color.Black))
+            .build()
 }

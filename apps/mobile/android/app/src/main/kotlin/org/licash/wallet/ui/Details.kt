@@ -150,7 +150,7 @@ fun ActivityDetails(engine: Engine, ui: Ui, shown: Activity, back: () -> Unit) {
     }
 }
 
-private fun title(activity: Activity, coming: Boolean): String = when {
+internal fun title(activity: Activity, coming: Boolean): String = when {
     coming -> "Coming on Bitcoin"
     else -> when (activity.kind) {
         Kind.SENT -> "Sent"
@@ -166,12 +166,12 @@ private fun title(activity: Activity, coming: Boolean): String = when {
 }
 
 /** Whether it paid out, rather than in. */
-private fun paid(activity: Activity): Boolean =
+internal fun paid(activity: Activity): Boolean =
     activity.kind == Kind.SENT || activity.kind == Kind.LIGHTNING || activity.kind == Kind.PAYOUT ||
         activity.kind == Kind.CONTRACT
 
 /** Where it stands, in words. */
-private fun status(activity: Activity, coming: Boolean, details: Details?): String = when {
+internal fun status(activity: Activity, coming: Boolean, details: Details?): String = when {
     coming -> "Waiting for a block, about 10 minutes"
     activity.state == State.FAILED && details is Details.Payout -> {
         val back = details.progress.lockExpiry

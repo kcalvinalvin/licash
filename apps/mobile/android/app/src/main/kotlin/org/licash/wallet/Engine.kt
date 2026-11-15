@@ -74,7 +74,15 @@ data class Ui(
     val contracts: List<Contract> = emptyList(),
     /** The hub a contract is being opened at, while one is. */
     val opening: String? = null,
+    /** Where each line of the history under way stands, by [key]. */
+    val under: Map<String, Details> = emptyMap(),
 )
+
+/** A line of the history's own key: lines of different kinds can share an id. */
+val Activity.key: String get() = "$kind $id"
+
+/** At most so many lines under way have where they stand read, each refresh. */
+private const val UNDER_READ = 20
 
 data class ChainStatus(val height: Int = 0, val peers: Long = 0, val synced: Boolean = false)
 
@@ -377,7 +385,12 @@ class Engine(context: Context) {
                 val contracts = runCatching { it.contracts() }
                     .onFailure { e -> AppLog.warn("reading the contracts", e) }
                     .getOrDefault(state.value.contracts)
-                Shown(it.network(), it.balance(), it.history(), it.hubs(), it.tor(), contracts)
+                val history = it.history()
+                // From the wallet alone, no network: Home tells each step.
+                val under = history.filter { a -> a.state == State.PENDING }.take(UNDER_READ)
+                    .mapNotNull { a -> runCatching { it.details(a.kind, a.id) }.getOrNull()?.let { d -> a.key to d } }
+                    .toMap()
+                Shown(it.network(), it.balance(), history, it.hubs(), it.tor(), contracts, under)
             }
         }.onFailure { AppLog.warn("reading the wallet", it) }.getOrNull()
         state.update {
@@ -393,6 +406,7 @@ class Engine(context: Context) {
                     hubs = shown.hubs,
                     tor = shown.tor,
                     contracts = shown.contracts,
+                    under = shown.under,
                 )
             }
         }
@@ -405,6 +419,7 @@ class Engine(context: Context) {
         val hubs: List<Hub>,
         val tor: Boolean,
         val contracts: List<Contract>,
+        val under: Map<String, Details>,
     )
 
     /** A new wallet of the network chosen, born at the chain's height if known. */

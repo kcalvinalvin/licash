@@ -328,6 +328,22 @@ async fn cashed_out(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     phone.tap("Send").await?;
     phone.wait("Sending", 60).await?;
     phone.tap("Done").await?;
+    // Home tells where it stands, no block mined yet: under way, at one of
+    // its first steps.
+    phone.back().await?;
+    phone.wait("Under way", 30).await?;
+    let step = phone
+        .wait_any(
+            &[
+                "Locking your notes at the hub",
+                "Waiting for the provider to send its coin",
+                "The provider sent its coin",
+            ],
+            30,
+        )
+        .await?;
+    eprintln!("cashing out, on Home: {:?}", step.text);
+    phone.tap("Where it is").await?;
     // Claimed once the provider's coin confirms, then found on Bitcoin:
     // kept there.
     let mine = || async {
