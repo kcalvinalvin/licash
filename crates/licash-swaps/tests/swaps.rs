@@ -1136,6 +1136,51 @@ async fn a_hub_takes_swaps_into_itself_only_from_the_hubs_it_caps() {
 }
 
 #[tokio::test]
+async fn a_hub_caps_a_hub_it_swaps_from_at_every_url_its_wallet_knows_it_by() {
+    const SECURE_A: &str = "https://a.test";
+    let eco = Eco::issuing(30, no_guard()).await;
+    let fee = costs(20).0;
+    let swap = eco
+        .client
+        .swap(PROVIDER, A, B, 20, SwapLimits::usual(20))
+        .await
+        .unwrap();
+    assert_eq!(swap.state, SwapState::Done);
+    // A answers over HTTPS too: the provider reaches it there from now on,
+    // owed 21 of its notes by a swap recorded at the old URL.
+    eco.net.alias(SECURE_A, A);
+    eco.restart();
+    eco.provider().wallet().add_hub(A).await.unwrap();
+    assert_eq!(eco.provider().wallet().hub_urls(A).unwrap(), [SECURE_A, A]);
+    let left = |eco: &Eco| {
+        let info = eco.provider().info().unwrap();
+        info.hub(&eco.address(B)).unwrap().max
+    };
+    // Its cap, naming the old URL or the new, counts what is owed.
+    assert_eq!(left(&eco), 30 - 20 - fee);
+    eco.stop();
+    let path = eco.dir.path().join("provider.sqlite");
+    let wallet = Wallet::open(&path, Link(eco.net.clone())).unwrap();
+    let issuer = Issuer::new(eco.net.hub(B), B).cap(SECURE_A, 30);
+    let swaps = eco.dir.path().join("swaps.sqlite");
+    let provider = Provider::open_issuing(&swaps, wallet, CONFIG, issuer).unwrap();
+    let provider = Arc::new(provider);
+    *eco.desk.provider.lock().unwrap() = Some(provider.clone());
+    assert_eq!(left(&eco), 30 - 20 - fee);
+    // One that locks for more anyway is declined.
+    let (a, b, me) = (eco.address(A), eco.address(B), eco.client.address());
+    let to = provider.wallet().address();
+    let lock = eco.client.lock(A, &to, 20 + fee, lock_hash(&[6; 32]), None);
+    let lock = lock_id(&lock.await.unwrap().id);
+    let declined = provider
+        .take(&Request::new(&a, &lock, &b, &me, 20))
+        .await
+        .unwrap_err();
+    assert!(declined.message.contains("no more"), "{declined:?}");
+    assert_eq!(provider.records(10).unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn a_hub_restarted_adopts_the_lock_it_made_and_never_locks_again() {
     // B's other services' hashes cannot be read: the provider records the
     // swaps, but does not lock.

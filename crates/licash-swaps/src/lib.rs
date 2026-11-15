@@ -663,8 +663,8 @@ impl<T: Transport> Provider<T> {
             if info.address == own.address {
                 continue;
             }
-            if let Some(cap) = issuer.cap_of(&url) {
-                room = room.max(cap.saturating_sub(self.held(&url)?));
+            if let Some((cap, urls)) = self.source(issuer, &url)? {
+                room = room.max(cap.saturating_sub(self.held(&urls)?));
             }
             hubs.push(Hub {
                 address: info.address,
@@ -688,16 +688,27 @@ impl<T: Transport> Provider<T> {
         Ok(hubs)
     }
 
-    /// What the provider holds of hub `url`'s notes, and is owed there by
-    /// the clients of the swaps into its own hub.
-    fn held(&self, url: &str) -> Result<u64, Error> {
+    /// The most of hub `url`'s notes the issuing provider may hold, if it
+    /// takes swaps from there, and every URL its wallet knows that hub by:
+    /// a cap may name any of them, as may the swaps recorded from there.
+    fn source(&self, issuer: &Issuer, url: &str) -> Result<Option<(u64, Vec<String>)>, Error> {
+        let urls = self.wallet.hub_urls(url)?;
+        let cap = urls.iter().find_map(|url| issuer.cap_of(url));
+        Ok(cap.map(|cap| (cap, urls)))
+    }
+
+    /// What the provider holds of the notes of the hub at `urls`, and is
+    /// owed there by the clients of the swaps into its own hub.
+    fn held(&self, urls: &[String]) -> Result<u64, Error> {
+        let listed = serde_json::to_string(urls).map_err(|e| Error::Setup(e.to_string()))?;
         // Owed first: a swap claimed between the reads is counted twice,
         // never not at all.
         let owed = self.store.read(|c| {
             Ok(c.query_row(
                 "SELECT coalesce(sum(paid), 0) FROM swaps
-                 WHERE kind = 'own' AND from_url = ?1 AND state IN ('accepted', 'locked', 'paid')",
-                [url],
+                 WHERE kind = 'own' AND state IN ('accepted', 'locked', 'paid')
+                    AND from_url IN (SELECT value FROM json_each(?1))",
+                [listed],
                 |r| r.get::<_, i64>(0),
             )? as u64)
         })?;
@@ -705,8 +716,10 @@ impl<T: Transport> Provider<T> {
             .wallet
             .balance()?
             .iter()
-            .find(|b| b.hub == url)
-            .map_or(0, |b| b.available.saturating_add(b.pending));
+            .filter(|b| urls.contains(&b.hub))
+            .fold(0u64, |sum, b| {
+                sum.saturating_add(b.available.saturating_add(b.pending))
+            });
         Ok(holds.saturating_add(owed))
     }
 
@@ -800,7 +813,7 @@ impl<T: Transport> Provider<T> {
             return Err(Problem::invalid("a hub's address is not a client's"));
         }
         if let Some((issuer, _)) = &own {
-            if issuer.cap_of(from).is_none() {
+            if self.source(issuer, from).map_err(unavailable)?.is_none() {
                 return Err(declined(format!("no swaps from hub {from}")));
             }
         }
@@ -918,8 +931,9 @@ impl<T: Transport> Provider<T> {
         let _taking = self.taking.lock().unwrap_or_else(PoisonError::into_inner);
         match self.issuer.as_ref().filter(|_| own) {
             Some(issuer) => {
-                let cap = issuer.cap_of(terms.from).unwrap_or(0);
-                let held = self.held(terms.from).map_err(unavailable)?;
+                let source = self.source(issuer, terms.from).map_err(unavailable)?;
+                let (cap, urls) = source.unwrap_or_default();
+                let held = self.held(&urls).map_err(unavailable)?;
                 if held.saturating_add(terms.paid) > cap {
                     return Err(declined(format!(
                         "the hub takes no more of hub {}'s notes now",

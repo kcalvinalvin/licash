@@ -42,10 +42,10 @@ impl Issuer {
         }
     }
 
-    /// Take swaps from hub `from`, by its URL in the provider's wallet,
-    /// while the provider holds, or is owed through such swaps, at most
-    /// `most` of its notes. The wallet reaching that hub at another URL,
-    /// none are taken from it.
+    /// Take swaps from hub `from`, by any URL the provider's wallet knows
+    /// it at, while the provider holds, or is owed through such swaps, at
+    /// most `most` of its notes, whatever URL they were recorded at. None
+    /// are taken from a hub the wallet knows at no such URL.
     pub fn cap(mut self, from: &str, most: u64) -> Self {
         let from = from.trim().trim_end_matches('/').to_owned();
         self.caps.retain(|(url, _)| *url != from);

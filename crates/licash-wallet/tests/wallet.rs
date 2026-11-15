@@ -603,6 +603,21 @@ async fn a_hub_over_plain_http_is_reached_over_https_once_it_answers_the_same_th
 }
 
 #[tokio::test]
+async fn a_hub_is_known_at_each_of_its_urls_the_one_reached_first() {
+    const SECURE: &str = "https://hub.test";
+    let net = network();
+    let bob = party(&net, 2).await;
+    assert_eq!(bob.hub_urls(HUB).unwrap(), [HUB]);
+    net.alias(SECURE, HUB);
+    bob.add_hub(SECURE).await.unwrap();
+    for url in [HUB, SECURE, "https://hub.test/"] {
+        assert_eq!(bob.hub_urls(url).unwrap(), [SECURE, HUB]);
+    }
+    assert!(bob.hub_urls("https://other.test").unwrap().is_empty());
+    assert!(matches!(bob.hub_urls("hub.test"), Err(Error::Invalid(_))));
+}
+
+#[tokio::test]
 async fn a_hub_over_plain_http_is_asked_over_https_again_once_its_wallet_is_opened_again() {
     let net = network();
     let bob = party(&net, 2).await;

@@ -82,8 +82,9 @@ lock expires `--swaps-confirm` (36 by default), `--swaps-margin` and two
 blocks before the wallet's. `--swaps-fee-base`, `--swaps-fee-ppm`,
 `--swaps-min` and `--swaps-max` set the terms. CAP bounds the notes the
 provider holds at that hub, or is owed by the swaps under way: past it,
-swaps from that hub are declined. Caps go by the URL as given, so a wallet
-using another URL of the same hub (an alias, `https`) swaps nothing. The
+swaps from that hub are declined. A cap holds for every URL the provider's
+wallet knows the hub by, such as the URL given and the `https` one it
+moves to, and counts the swaps recorded at each of them. The
 hub locks no hash its Lightning receipts or deposits hold. The provider's
 wallet and swaps are kept in `<data>/swaps` (`wallet.sqlite` and
 `swaps.sqlite`, made on the first start): back them up with `hub.sqlite`,

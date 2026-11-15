@@ -557,6 +557,21 @@ impl<T: Transport> Wallet<T> {
         self.hubs_trusted(true)
     }
 
+    /// Every URL the wallet knows the hub at `url` by, such as over plain
+    /// HTTP and over HTTPS, the one it reaches it at first: none if it
+    /// knows no hub at `url`.
+    pub fn hub_urls(&self, url: &str) -> Result<Vec<String>, Error> {
+        let url = hub_url(url)?;
+        self.store.read(|c| {
+            let mut stmt = c.prepare(
+                "SELECT u.url FROM hub_urls k JOIN hub_urls u ON u.hub = k.hub
+                 WHERE k.url = ?1 ORDER BY u.rowid",
+            )?;
+            let rows = stmt.query_map([url], |r| r.get(0))?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
+    }
+
     /// The hubs visited to pay a payee there ([`Wallet::visit`]), not
     /// added: by URL, and what each last said of itself.
     pub fn visited(&self) -> Result<Vec<(String, Info)>, Error> {
