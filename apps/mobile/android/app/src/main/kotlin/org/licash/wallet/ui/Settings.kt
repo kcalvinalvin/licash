@@ -19,6 +19,8 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.FilledTonalButton
@@ -36,6 +38,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
@@ -64,6 +67,7 @@ fun Settings(engine: Engine, ui: Ui, balance: () -> Unit, back: () -> Unit) {
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
     var error by remember { mutableStateOf<String?>(null) }
+    var exporting by remember { mutableStateOf<String?>(null) }
     Column(
         Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 20.dp),
     ) {
@@ -90,9 +94,14 @@ fun Settings(engine: Engine, ui: Ui, balance: () -> Unit, back: () -> Unit) {
         }
         Group("Support") {
             Action("Export logs", "Share what the app did, to report a problem.", Icons.Filled.Share) {
+                exporting = null
                 runCatching { context.startActivity(exportLogs(context, ui)) }
-                    .onFailure { AppLog.warn("exporting the logs", it) }
+                    .onFailure {
+                        AppLog.warn("exporting the logs", it)
+                        exporting = "Could not export the logs: ${it.message ?: it.javaClass.simpleName}"
+                    }
             }
+            exporting?.let { Note(it, error = true) }
         }
         Group("Advanced") {
             Toggle(
@@ -175,15 +184,22 @@ private fun HubRow(hub: Hub) {
         if (hub.silent) add("finds Bitcoin payments")
         if (hub.mailbox) add("mailbox")
     }
-    Column(Modifier.fillMaxWidth().clickable { open = !open }.padding(vertical = 12.dp)) {
-        Text(hub.url, style = MaterialTheme.typography.bodyLarge, maxLines = 1)
-        Spacer(Modifier.height(2.dp))
-        Text(
-            can.joinToString(" · "),
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
+    Row(Modifier.fillMaxWidth().clickable { open = !open }.padding(vertical = 12.dp)) {
+        Column(Modifier.weight(1f)) {
+            Text(hub.url, style = MaterialTheme.typography.bodyLarge, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Spacer(Modifier.height(2.dp))
+            Text(
+                can.joinToString(" · "),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            if (open) Fees(hub)
+        }
+        Icon(
+            if (open) Icons.Filled.KeyboardArrowUp else Icons.Filled.KeyboardArrowDown,
+            contentDescription = if (open) "Hide fees" else "Show fees",
+            tint = MaterialTheme.colorScheme.onSurfaceVariant,
         )
-        if (open) Fees(hub)
     }
 }
 
