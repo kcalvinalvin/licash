@@ -184,7 +184,11 @@ private fun Overview(engine: Engine, ui: Ui, open: (Page) -> Unit) {
 private fun Privacy(engine: Engine, ui: Ui) {
     val scope = rememberCoroutineScope()
     var error by remember { mutableStateOf<String?>(null) }
-    Toggle("Reach hubs through Tor", "Slower, and hides where you are from hubs.", ui.tor) { on ->
+    Toggle(
+        "Everything through Tor",
+        "Hubs, relays and Bitcoin, each apart: slower, and hides where you are from them.",
+        ui.tor,
+    ) { on ->
         scope.launch { engine.setTor(on).onFailure { error = explain(it) } }
     }
     error?.let { Note(it, error = true) }

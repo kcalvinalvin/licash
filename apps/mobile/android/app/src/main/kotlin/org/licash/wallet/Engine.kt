@@ -183,17 +183,39 @@ class Engine(context: Context) {
         lightLock.withLock { startLight() }
     }
 
-    /** Run the light client of the wallet's network, or the one chosen. */
+    /**
+     * Run the light client of the wallet's network, or the one chosen. Over
+     * Tor, everything it reaches goes through the wallet's own Tor client, so
+     * it waits for a wallet: never directly instead.
+     */
     private suspend fun startLight() {
         val network = wallet?.network() ?: prefs.network
-        val key = listOf(chainName(network), prefs.peers, prefs.cdn).joinToString("|")
+        val tor = wallet?.tor() ?: prefs.tor
+        // The wallet's own, while it is open: it holds a password, never logged.
+        val proxy = if (!tor) {
+            ""
+        } else {
+            mutex.withLock {
+                runCatching { wallet?.torProxy() }
+                    .onFailure { e ->
+                        AppLog.warn("the light client's way through Tor", e)
+                        state.update { it.copy(problem = explain(e)) }
+                    }
+                    .getOrNull()
+            }
+        }
+        val key = listOf(chainName(network), prefs.peers, prefs.cdn, proxy ?: "none").joinToString("|")
         if (key == lightOf && light != null) return
         // Between wallet calls: one may be reading through it.
         mutex.withLock { stopLight() }
+        if (proxy == null) {
+            AppLog.info("the light client waits for a wallet to reach Bitcoin through Tor")
+            return
+        }
         val name = chainName(network)
         val dir = File(files, "chain-$name").path
-        AppLog.info("starting the light client of $name")
-        runCatching { Mobile.start(name, dir, prefs.peers, prefs.cdn) }
+        AppLog.info("starting the light client of $name" + if (tor) ", through Tor" else "")
+        runCatching { Mobile.startThrough(name, dir, prefs.peers, prefs.cdn, proxy) }
             .onSuccess {
                 light = it
                 lightOf = key
@@ -636,14 +658,23 @@ class Engine(context: Context) {
         got
     }
 
-    /** Reach hubs and relays through Tor, or not: the wallet opens again. */
+    /**
+     * Reach hubs, relays and Bitcoin through Tor, or not: the wallet opens
+     * again, and the light client starts again its new way.
+     */
     suspend fun setTor(on: Boolean): Result<Unit> = io {
-        mutex.withLock {
-            prefs.tor = on
-            wallet?.let {
-                it.destroy()
-                wallet = configured(Wallet.open(walletDir, on))
+        try {
+            mutex.withLock {
+                prefs.tor = on
+                wallet?.let {
+                    it.destroy()
+                    wallet = null
+                    wallet = configured(Wallet.open(walletDir, on))
+                }
             }
+        } finally {
+            // Its old way through Tor closed with the wallet.
+            lightLock.withLock { startLight() }
         }
         refresh()
     }
@@ -702,6 +733,8 @@ class Engine(context: Context) {
             File(walletDir).deleteRecursively()
             AppLog.info("wallet deleted")
         }
+        // Through Tor, its way closed with the wallet.
+        lightLock.withLock { startLight() }
         state.update { Ui(loaded = true, developer = prefs.developer, network = prefs.network) }
         refresh()
     }
