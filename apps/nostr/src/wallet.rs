@@ -386,7 +386,9 @@ async fn send<T: Transport>(
     let Some(licash) = &code.licash else {
         return Err(unpayable(code, amount));
     };
+    let started = std::time::Instant::now();
     let paid = wallet.send(&hub, &licash.address, amount).await?;
+    let sent = started.elapsed();
     // At a hub visited too: the payee's.
     let relays = wallet
         .hubs()?
@@ -407,6 +409,13 @@ async fn send<T: Transport>(
         Some(_) => (None, Some(format!("hub {hub} names no mailbox relays"))),
         None => (None, None),
     };
+    tracing::info!(
+        hub = %hub,
+        sent = ?sent,
+        mailbox = ?started.elapsed() - sent,
+        relays = delivered.unwrap_or(0),
+        "paid a payment code"
+    );
     Ok(CodePaid {
         paid,
         hub,

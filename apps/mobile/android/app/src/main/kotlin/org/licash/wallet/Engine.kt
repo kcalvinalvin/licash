@@ -624,7 +624,14 @@ class Engine(context: Context) {
         io { local { it.choosePayOffer(code, amount, provider) } }
 
     suspend fun pay(code: String, amount: ULong?): Result<Paid> = io {
-        val paid = locked { it.pay(code, amount) }
+        val asked = System.nanoTime()
+        val paid = mutex.withLock {
+            val waited = (System.nanoTime() - asked) / 1_000_000
+            // What a payment waits for before it starts: a round under way.
+            if (waited >= 500) AppLog.info("paying waited $waited ms for the wallet")
+            local { it.pay(code, amount) }
+        }
+        AppLog.info("paid in ${(System.nanoTime() - asked) / 1_000_000} ms")
         refresh()
         paid
     }

@@ -746,7 +746,9 @@ impl Wallet {
         let paid =
             paid.map_err(|e| LicashError::from_any(e, |reason| LicashError::Invalid { reason }))?;
         // Its change, linked to it until then.
+        let unlinking = std::time::Instant::now();
         self.unlink();
+        tracing::info!(took = ?unlinking.elapsed(), "unlinked after paying");
         let handover = match paid.delivered {
             Some(_) => None,
             None => Some(serde_json::to_string(&paid.paid.payment).map_err(LicashError::failed)?),
