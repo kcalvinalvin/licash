@@ -937,6 +937,23 @@ impl<T: Transport> Wallet<T> {
         })
     }
 
+    /// The block a scan saw the wallet's coin at `outpoint` spent in: none
+    /// while no block spends it, or once that block was replaced, or if
+    /// the coin is not the wallet's. How deep another party's transaction
+    /// spending it is, as a contract's funding.
+    pub fn silent_spent_at(&self, outpoint: &OutPoint) -> Result<Option<u32>, Error> {
+        self.store.read(|c| {
+            let at = c
+                .query_row(
+                    "SELECT spent_at FROM silent_coins WHERE txid = ?1 AND vout = ?2",
+                    params![outpoint.txid.to_byte_array(), outpoint.vout],
+                    |r| r.get::<_, Option<u32>>(0),
+                )
+                .optional()?;
+            Ok(at.flatten())
+        })
+    }
+
     /// Sign input `index` of `tx`, another party's transaction spending one
     /// of the wallet's coins among coins of its own, as a contract's
     /// funding does: on the key path, committing to `prevouts`, the coin

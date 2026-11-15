@@ -776,6 +776,40 @@ async fn a_coin_signed_into_anothers_transaction_is_reserved_for_it() {
     s.wallet.spend_silent(elsewhere(), None, rate()).unwrap();
 }
 
+#[tokio::test]
+async fn the_block_a_coin_signed_into_anothers_transaction_is_spent_in_is_known() {
+    let s = setup().await;
+    s.wallet.watch_silent(HUB, 1).unwrap();
+    let paying = s.pay(&[s.address()], &[10_000]);
+    s.mine(vec![paying]);
+    s.scan().await.unwrap();
+    let coin = s.wallet.silent_coins().unwrap()[0].outpoint;
+    let (tx, mut prevouts) = shared(&s.chain.lock().unwrap(), coin, 55_000);
+    // The other party's coin, on the chain: of a script-hash, no tweak.
+    let theirs = tx.input[0].previous_output;
+    let script = ScriptBuf::from_bytes(vec![0x51]);
+    prevouts[0].script_pubkey = ScriptBuf::new_p2wsh(&script.wscript_hash());
+    let output = prevouts[0].clone();
+    s.chain.lock().unwrap().outputs.insert(theirs, output);
+    let signed = s.wallet.sign_input(&tx, &prevouts, 1).unwrap();
+
+    // Signed, in no block yet; nor is a coin not the wallet's.
+    assert_eq!(s.wallet.silent_spent_at(&coin).unwrap(), None);
+    assert_eq!(s.wallet.silent_spent_at(&theirs).unwrap(), None);
+
+    // In block 4, however deep.
+    s.mine(vec![signed]);
+    s.mine(Vec::new());
+    s.scan().await.unwrap();
+    assert_eq!(s.wallet.silent_spent_at(&coin).unwrap(), Some(4));
+
+    // That block replaced, without it: in none again.
+    s.chain.lock().unwrap().fork(4);
+    s.chain.lock().unwrap().mine_empty(3);
+    s.scan().await.unwrap();
+    assert_eq!(s.wallet.silent_spent_at(&coin).unwrap(), None);
+}
+
 #[test]
 fn a_wallets_contract_secrets_are_its_own_and_its_spending_roots() {
     let dir = tempfile::tempdir().unwrap();
