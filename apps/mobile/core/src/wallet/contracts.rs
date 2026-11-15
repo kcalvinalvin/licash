@@ -135,7 +135,7 @@ impl Wallet {
 
     /// The chain's height as the wallet last saw it, or the last block it
     /// looked in: 0 if neither is known.
-    fn tip(&self) -> u32 {
+    pub(super) fn tip(&self) -> u32 {
         let looked = self.wallet.silent_next().ok().flatten();
         let looked = looked.map_or(0, |next| next.saturating_sub(1));
         self.tip.load(Ordering::Relaxed).max(looked)

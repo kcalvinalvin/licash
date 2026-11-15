@@ -249,6 +249,48 @@ pub struct Contract {
     pub created_at: i64,
 }
 
+/// How far a payout has come, step by step, as the wallet last saw it.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct PayoutSteps {
+    /// The wallet's notes locked for the provider at the hub: none before.
+    pub lock: Option<LockStep>,
+    /// The block from which the hub gives the locked notes back unpaid.
+    pub lock_expiry: Option<u32>,
+    /// The block from which the provider may take its coin back.
+    pub timeout: Option<u32>,
+    /// The last block the wallet claims the provider's coin at: past it,
+    /// the payout fails and the notes come back once the lock expires.
+    pub claim_by: Option<u32>,
+    /// The provider's coin on Bitcoin, as found or as the provider told
+    /// of it, maybe not confirmed yet; its block once in one.
+    pub coin: Option<String>,
+    pub coin_height: Option<u32>,
+    /// The wallet's claim of the coin, paying the address, once made; its
+    /// block once in one.
+    pub claim: Option<String>,
+    pub claim_height: Option<u32>,
+    /// The confirmations awaited: of the coin before it is claimed, of the
+    /// claim before the payout is done.
+    pub depth: u32,
+    /// The chain's height as the wallet last saw it: 0 if never.
+    pub tip: u32,
+}
+
+/// Where the notes a payout locked stand.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum LockStep {
+    /// Asked of the hub, not certified yet.
+    Requested,
+    /// Certified: the provider is paid once the wallet claims its coin.
+    Locked,
+    /// Paid to the provider.
+    Paid,
+    /// Given back to the wallet, unpaid.
+    Refunded,
+    /// Never made: the notes stayed the wallet's.
+    Abandoned,
+}
+
 /// Where a contract stands.
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum ContractState {
@@ -527,7 +569,8 @@ pub enum Details {
     /// Notes at `hub` paid out to `address`, on Bitcoin, through
     /// `provider`: the transaction of its coin, once the wallet found it,
     /// and of the wallet's claim paying the address, once made; why it
-    /// failed, if it did, its notes back once the lock expires.
+    /// failed, if it did, its notes back once the lock expires. `progress`
+    /// tells each step.
     Payout {
         hub: String,
         provider: String,
@@ -535,6 +578,7 @@ pub enum Details {
         coin: Option<String>,
         claim: Option<String>,
         failure: Option<String>,
+        progress: PayoutSteps,
     },
     /// A recovery contract opened at `hub`, by its `funding`'s id.
     Contract { hub: String, funding: String },

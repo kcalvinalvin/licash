@@ -6,10 +6,13 @@ use std::sync::Arc;
 use bitcoin::FeeRate;
 use licash_nostr::wallet::{hub_relays, payout_providers};
 use licash_transport::Http;
-use licash_wallet::{payout_depth, Payout, PayoutState};
+use licash_wallet::{payout_depth, LockState, Payout, PayoutProgress, PayoutState};
 
 use super::Wallet;
-use crate::{chain::Chain, Activity, ChainSource, Details, Kind, LicashError, PayoutQuote, State};
+use crate::{
+    chain::Chain, Activity, ChainSource, Details, Kind, LicashError, LockStep, PayoutQuote,
+    PayoutSteps, State,
+};
 
 /// The fee rate a claim confirms at soon, in sat/vB, as the app judges it
 /// knowing no estimates: a claim is budgeted at a few times this or the
@@ -332,10 +335,11 @@ pub(super) fn activities(
         .collect())
 }
 
-/// More of the payout of `hash`.
+/// More of the payout of `hash`, `tip` the chain's height as last seen.
 pub(super) fn details(
     wallet: &licash_wallet::Wallet<Http>,
     hash: &str,
+    tip: u32,
 ) -> Result<Details, LicashError> {
     let payout = wallet.payouts()?.into_iter().find(|p| p.hash == hash);
     let payout =
@@ -351,7 +355,39 @@ pub(super) fn details(
         coin: payout.funding.map(|o| o.txid.to_string()),
         claim: payout.claim.map(|t| t.to_string()),
         failure,
+        progress: steps(wallet.payout_progress(hash)?, tip),
     })
+}
+
+/// The steps of `progress`, `tip` the chain's height as last seen.
+fn steps(progress: PayoutProgress, tip: u32) -> PayoutSteps {
+    let (lock, lock_expiry) = match progress.lock {
+        Some((state, expiry)) => {
+            let step = match state {
+                LockState::Requested => LockStep::Requested,
+                LockState::Locked => LockStep::Locked,
+                LockState::Paid(_) => LockStep::Paid,
+                LockState::Refunded => LockStep::Refunded,
+                LockState::Abandoned(_) => LockStep::Abandoned,
+                // A state of a later library: under way still.
+                _ => LockStep::Requested,
+            };
+            (Some(step), Some(expiry))
+        }
+        None => (None, None),
+    };
+    PayoutSteps {
+        lock,
+        lock_expiry,
+        timeout: progress.timeout,
+        claim_by: progress.claim_by,
+        coin: progress.coin.map(|t| t.to_string()),
+        coin_height: progress.coin_height,
+        claim: progress.claim.map(|t| t.to_string()),
+        claim_height: progress.claim_height,
+        depth: progress.depth,
+        tip,
+    }
 }
 
 /// The line of the history of `payout`: what the address gets, and what

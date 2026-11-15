@@ -786,7 +786,7 @@ impl Wallet {
                     failure: invoice.reason,
                 })
             }
-            Kind::Payout => payouts::details(&self.wallet, &id),
+            Kind::Payout => payouts::details(&self.wallet, &id, self.tip()),
             Kind::Contract => self.contract_details(&id)?.ok_or_else(unknown),
             Kind::Onchain => {
                 let outpoint: OutPoint = id.parse().map_err(|_| unknown())?;
