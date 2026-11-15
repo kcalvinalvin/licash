@@ -63,6 +63,12 @@ impl Hop {
         sum(&[self.activated_by(expiry)?, self.margin, 1])
     }
 
+    /// Blocks by which the lock upstream outlives the issuer's at least:
+    /// `upstream_expiry(e) - e`.
+    pub fn lead(&self) -> Option<u32> {
+        sum(&[self.detect, self.confirm, self.margin, 1])
+    }
+
     /// Height by which a payer of a lock it did not issue, expiring at
     /// `expiry`, whose refund request confirms within `confirm` blocks of
     /// it, has read the preimage or is owed the refund.
@@ -73,6 +79,12 @@ impl Hop {
     /// Least expiry of a lock elsewhere that pays that payer.
     pub fn forced_upstream_expiry(&self, expiry: u32) -> Option<u32> {
         sum(&[self.forced_by(expiry)?, self.margin, 1])
+    }
+
+    /// Blocks by which a lock elsewhere that pays that payer outlives the
+    /// lock at least: `forced_upstream_expiry(e) - e`.
+    pub fn forced_lead(&self) -> Option<u32> {
+        sum(&[self.confirm, self.window, self.detect, self.margin, 1])
     }
 }
 
@@ -154,6 +166,9 @@ mod tests {
         // the payer reads the preimage by 132.
         assert_eq!(to.forced_by(105), Some(132));
         assert_eq!(to.forced_upstream_expiry(105), Some(135));
+        assert_eq!(to.forced_lead(), Some(30));
+        assert_eq!(to.lead(), Some(6));
+        assert_eq!(to.upstream_expiry(105), Some(111));
         // A lock that pays it elsewhere must outlive that window, which a
         // hub with the same window cannot admit.
         assert!(!hop(24).admits(100, 135));
