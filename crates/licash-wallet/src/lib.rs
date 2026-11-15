@@ -554,6 +554,13 @@ impl<T: Transport> Wallet<T> {
         Ok(self.learn(&url, Keep::Visit(id)).await?.1)
     }
 
+    /// What the hub at `url` says of itself, nothing kept: to show before
+    /// adding it. Refused as [`Wallet::add_hub`] refuses it, if it follows
+    /// another network or proves another identity.
+    pub async fn hub_info(&self, url: &str) -> Result<Info, Error> {
+        self.info(&hub_url(url)?).await
+    }
+
     /// What the hub at `url` says of itself, kept: its id and info.
     async fn refresh(&self, url: &str) -> Result<(i64, Info), Error> {
         self.learn(url, Keep::Refresh).await
