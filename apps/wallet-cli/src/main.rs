@@ -1505,7 +1505,7 @@ fn deposit_line(deposit: &Deposit) -> String {
     let terms = match &deposit.terms {
         Some(t) => format!(
             "  pay {} to {} by block {}",
-            say::sat(t.pays),
+            say::plus(deposit.amount, t.pays.saturating_sub(deposit.amount)),
             t.address,
             t.fund_by
         ),

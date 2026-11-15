@@ -20,6 +20,13 @@ a person sees. The apps differ in medium, not in manners.
    providers unless asked for (advanced mode, `--json`, a detail view).
    Times are spans (`about 2 hours`, `in 3 days`), not heights. Amounts
    are `12,345 sat`, digits grouped, the unit always said.
+9. **A fee says what it is of.** Wherever a cost is shown, its share of
+   the amount it is charged on is shown beside it: `12 sat · 0.24%` in
+   the app, `10,000 + 12 sat (0.12%)` in a terminal. Two significant
+   digits (`0.24%`, `1.2%`, `5%`, `12%`), `<0.01%` below that, nothing
+   for no fee (the word `None` says it). A protection's price is a share
+   of what it covers. A fee known only as terms (`1 sat + 0.5%`) stays
+   terms; a limit stays a limit (`Up to 21 sat · 0.21%`).
 5. **Risk is never hidden.** What is not protected, what is on credit,
    what failed, what a test network's contract is worth (`Test only:
    protects nothing`), and what cannot be undone are always said, in

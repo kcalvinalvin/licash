@@ -20,9 +20,32 @@ pub fn sat(amount: u64) -> String {
     format!("{} sat", grouped(amount))
 }
 
-/// An amount and its fee: `10,000 + 12 sat`.
+/// An amount and its fee, with what the fee is of it: `10,000 + 12 sat
+/// (0.12%)`.
 pub fn plus(amount: u64, fee: u64) -> String {
-    format!("{} + {}", grouped(amount), sat(fee))
+    match share(fee, amount) {
+        Some(share) => format!("{} + {} ({share})", grouped(amount), sat(fee)),
+        None => format!("{} + {}", grouped(amount), sat(fee)),
+    }
+}
+
+/// What `fee` is of `of`, to two significant digits: `0.24%`, `1.2%`,
+/// `12%`, `<0.01%` below. Nothing for no fee, or a fee of nothing.
+pub fn share(fee: u64, of: u64) -> Option<String> {
+    if fee == 0 || of == 0 {
+        return None;
+    }
+    let (fee, of) = (u128::from(fee), u128::from(of));
+    let at = |scale: u128| u64::try_from((fee * scale + of / 2) / of).unwrap_or(u64::MAX);
+    Some(match at(10_000) {
+        0 => "<0.01%".into(),
+        h if h < 100 => format!("0.{h:02}%"),
+        _ => match at(1_000) {
+            t if t < 100 && t % 10 > 0 => format!("{}.{}%", t / 10, t % 10),
+            t if t < 100 => format!("{}%", t / 10),
+            _ => format!("{}%", grouped(at(100))),
+        },
+    })
 }
 
 /// What a hub or provider takes: `1,000 to 4,000 sat`.
@@ -89,8 +112,23 @@ mod tests {
         assert_eq!(sat(999), "999 sat");
         assert_eq!(sat(1_000), "1,000 sat");
         assert_eq!(sat(1_234_567), "1,234,567 sat");
-        assert_eq!(plus(10_000, 12), "10,000 + 12 sat");
+        assert_eq!(plus(10_000, 12), "10,000 + 12 sat (0.12%)");
+        assert_eq!(plus(22, 0), "22 + 0 sat");
         assert_eq!(between(1_000, 4_000), "1,000 to 4,000 sat");
+    }
+
+    #[test]
+    fn a_fee_reads_as_a_share_of_what_it_is_on() {
+        assert_eq!(share(0, 100), None);
+        assert_eq!(share(5, 0), None);
+        assert_eq!(share(1, 1_000_000), Some("<0.01%".into()));
+        assert_eq!(share(24, 10_000), Some("0.24%".into()));
+        assert_eq!(share(1, 100), Some("1%".into()));
+        assert_eq!(share(1, 20), Some("5%".into()));
+        assert_eq!(share(12, 1_000), Some("1.2%".into()));
+        assert_eq!(share(999, 10_000), Some("10%".into()));
+        assert_eq!(share(1, 8), Some("13%".into()));
+        assert_eq!(share(30, 1), Some("3,000%".into()));
     }
 
     #[test]

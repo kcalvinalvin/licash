@@ -338,7 +338,8 @@ fn a_lock_pays_on_its_preimage_or_returns_once_expired() {
     assert_eq!(available(&alice), (52, 0));
     let text = ok(wallet(&alice, &["locks"], None));
     assert!(
-        text.contains("lock refunded  10 + 1 sat  until block 8") && text.contains("lock paid"),
+        text.contains("lock refunded  10 + 1 sat (10%)  until block 8")
+            && text.contains("lock paid"),
         "{text}"
     );
     failed(
@@ -557,7 +558,7 @@ fn notes_swap_between_hubs_through_a_provider() {
     assert_eq!(
         text.trim(),
         format!(
-            "swapped 20 + 2 sat at {} for 20 sat at {}",
+            "swapped 20 + 2 sat (10%) at {} for 20 sat at {}",
             a.url(),
             b.url()
         )
@@ -591,7 +592,7 @@ fn notes_swap_between_hubs_through_a_provider() {
     assert_eq!(resumed["swaps"][0]["state"], "done", "{resumed}");
     assert_eq!(resumed["swaps"][0]["amount"], 10);
     let text = ok(wallet(&alice, &["swaps"], None));
-    assert!(text.contains("swap done  10 + 2 sat"), "{text}");
+    assert!(text.contains("swap done  10 + 2 sat (20%)"), "{text}");
     swaps.until(|r| r.amount == 10 && r.stage == licash_swaps::Stage::Done);
 }
 
@@ -749,7 +750,7 @@ fn a_swap_goes_through_a_provider_announced_one_used_before_first_then_the_cheap
     let through = format!("through {}", cheap.url());
     assert_eq!(
         text.trim(),
-        format!("swapped 20 + 1 sat at {from} for 20 sat at {to} {through}")
+        format!("swapped 20 + 1 sat (5%) at {from} for 20 sat at {to} {through}")
     );
     failed(
         swap(&alice, "151", &[]),
@@ -947,6 +948,10 @@ fn owners_deposit_on_bitcoin_and_take_back_what_was_never_received() {
         .unwrap();
     assert!(address.starts_with("bcrt1p"), "{uri}");
     assert_eq!(amount, "0.000021");
+    // Listed, the hub's fee in it says what it is of the deposit.
+    let text = ok(wallet(&alice, &["deposits"], None));
+    let terms = format!("pay 2,000 + 100 sat (5%) to {address} by block ");
+    assert!(text.contains(&terms), "{text}");
     let deposits = json(&alice, &["deposits"]);
     assert_eq!(
         (deposits[0]["hash"].as_str(), deposits[0]["state"].as_str()),
