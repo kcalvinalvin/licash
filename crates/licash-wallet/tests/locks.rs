@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use licash::spend::{lock_hash, ChainProfile};
 use licash_api::{Code, Fee};
-use licash_wallet::{Error, LockState, Wallet};
+use licash_wallet::{Error, LockState, PartTo, Wallet};
 use net::{Fault, Link, Net, HUB};
 
 const FEE: Fee = Fee { base: 2, ppm: 0 };
@@ -123,6 +123,39 @@ async fn a_lock_unpaid_is_refunded_once_expired_at_depth() {
         bob.claim(HUB, &lock.id, &PREIMAGE).await,
         Err(Error::Invalid(why)) if why.contains("refunded")
     ));
+}
+
+#[tokio::test]
+async fn a_locks_parts_are_what_it_pays_until_refunded_then_the_refund() {
+    let (net, alice, bob) = parties().await;
+    let lock = alice
+        .lock(HUB, &bob.address(), 10, hash(), Some(8))
+        .await
+        .unwrap();
+    let parts = |alice: &Party| {
+        let parts = alice.operation_parts(&lock.id).unwrap();
+        for part in &parts {
+            assert_eq!(part.notes.iter().sum::<u64>(), part.amount, "{part:?}");
+        }
+        parts
+            .into_iter()
+            .map(|p| (p.to, p.amount))
+            .collect::<Vec<_>>()
+    };
+    // Its one note of 64: 10 to Bob if paid, its fee of 2, 52 back.
+    let pays = vec![
+        (PartTo::Payee(bob.address()), 10),
+        (PartTo::Hub, 2),
+        (PartTo::Kept, 52),
+    ];
+    assert_eq!(parts(&alice), pays);
+    net.mine(HUB, 6, None);
+    assert_eq!(
+        alice.resume().await.unwrap().locks[0].state,
+        LockState::Refunded
+    );
+    // Refunded: the hub's refund fee, and the rest back.
+    assert_eq!(parts(&alice), [(PartTo::Hub, 2), (PartTo::Kept, 62)]);
 }
 
 #[tokio::test]

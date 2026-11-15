@@ -4,7 +4,7 @@ use std::{path::Path, sync::Arc};
 
 use licash::spend::ChainProfile;
 use licash_api::{Code, Fee, Hex, Payment};
-use licash_wallet::{Balance, Error, HubId, NoteRecord, State, Unlinking, Wallet};
+use licash_wallet::{Balance, Error, HubId, NoteRecord, PartTo, State, Unlinking, Wallet};
 use net::{Fault, Link, Net, HUB};
 
 const FEE: Fee = Fee { base: 2, ppm: 0 };
@@ -893,6 +893,54 @@ async fn a_note_its_hub_refuses_to_unlink_stays_linked_and_spendable() {
     assert_eq!(alice.unlink().await.unwrap(), 0);
     let payment = alice.send(HUB, &bob.address(), 98).await.unwrap().payment;
     assert_eq!(bob.receive(&payment).unwrap().amount, 98);
+}
+
+#[tokio::test]
+async fn an_operations_parts_show_whom_its_notes_paid_and_what_it_kept() {
+    let net = network();
+    let (alice, bob) = (party(&net, 1).await, party(&net, 2).await);
+    let got = alice.receive(&net.pay(HUB, &alice.address(), 100)).unwrap();
+    // A receipt spends none of the wallet's notes: it pays nothing.
+    assert!(alice.operation_parts(&got.id).unwrap().is_empty());
+
+    let sent = alice.send(HUB, &bob.address(), 50).await.unwrap();
+    let parts = alice.operation_parts(&sent.id).unwrap();
+    let to: Vec<_> = parts.iter().map(|p| (&p.to, p.amount)).collect();
+    let notes = alice.operation_notes(&sent.id).unwrap();
+    let spent: u64 = notes.spent.iter().map(|n| n.amount).sum();
+    assert_eq!(
+        to,
+        [
+            (&PartTo::Payee(bob.address()), 50),
+            (&PartTo::Hub, 2),
+            (&PartTo::Kept, spent - 52)
+        ],
+        "{parts:?}"
+    );
+    for part in &parts {
+        assert_eq!(part.notes.iter().sum::<u64>(), part.amount, "{part:?}");
+        assert!(part.notes.windows(2).all(|w| w[0] >= w[1]), "{part:?}");
+    }
+    // What it kept is the change made the wallet's, note for note.
+    let made: Vec<u64> = notes.made.iter().map(|n| n.amount).collect();
+    assert_eq!(parts[2].notes, made);
+    // Bob was paid in the notes made for him.
+    let received = bob.receive(&sent.payment).unwrap();
+    let his: Vec<u64> = bob
+        .operation_notes(&received.id)
+        .unwrap()
+        .made
+        .iter()
+        .map(|n| n.amount)
+        .collect();
+    assert_eq!(parts[0].notes, his);
+
+    // None of the wallet's: nothing.
+    assert!(alice.operation_parts(&"00".repeat(32)).unwrap().is_empty());
+    assert!(matches!(
+        alice.operation_parts("zz"),
+        Err(Error::Invalid(_))
+    ));
 }
 
 #[tokio::test]

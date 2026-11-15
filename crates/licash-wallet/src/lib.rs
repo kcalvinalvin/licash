@@ -269,6 +269,29 @@ pub struct OperationNotes {
     pub made: Vec<NoteRecord>,
 }
 
+/// Part of what the notes a payment or lock of the wallet spent paid
+/// ([`Wallet::operation_parts`]): to whom, and in which notes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Part {
+    pub to: PartTo,
+    pub amount: u64,
+    /// The amounts of the notes made for it, the largest first.
+    pub notes: Vec<u64>,
+}
+
+/// Whom a [`Part`] pays.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PartTo {
+    /// The payment's payee, which may be the wallet itself.
+    Payee(Address),
+    /// Its hub, as its fee.
+    Hub,
+    /// The wallet, as its change or its refund.
+    Kept,
+}
+
 /// A note the wallet holds or held, as an application shows it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -1680,6 +1703,79 @@ impl<T: Transport> Wallet<T> {
                 spent: of("spent_by")?,
                 made: of("proposal")?,
             })
+        })
+    }
+
+    /// What the notes the payment or lock `id` (in hex) spent pay: its
+    /// payee, its hub's fee and what the wallet keeps, each in the notes
+    /// made for it. A lock refunded pays its hub's refund fee and the rest
+    /// back; one not settled yet, what it pays if paid. None for a receipt,
+    /// for anything spending none of the wallet's notes, or once given up.
+    pub fn operation_parts(&self, id: &str) -> Result<Vec<Part>, Error> {
+        let id = payment_id(id)?;
+        self.store.read(|c| {
+            let id = id.as_bytes();
+            // A proposal spends notes of one keyset, which makes its outputs.
+            let keyset: Option<Vec<u8>> = c
+                .query_row(
+                    "SELECT k.bytes FROM notes n JOIN keysets k ON k.id = n.keyset
+                     WHERE n.spent_by = ?1 LIMIT 1",
+                    [id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let Some(keyset) = keyset else {
+                return Ok(Vec::new());
+            };
+            let keyset = Keyset::from_bytes(&keyset)?;
+            let sum = |column: &str| -> rusqlite::Result<u64> {
+                let sql = format!("SELECT COALESCE(SUM(denom), 0) FROM notes WHERE {column} = ?1");
+                Ok(c.query_row(&sql, [id], |r| r.get::<_, i64>(0))? as u64)
+            };
+            let spent = sum("spent_by")?;
+            let row = |r: &rusqlite::Row| -> rusqlite::Result<_> {
+                Ok((
+                    r.get::<_, Vec<u8>>(0)?,
+                    r.get::<_, i64>(1)? as u64,
+                    r.get::<_, i64>(2)? as u64,
+                    r.get::<_, Option<String>>(3)?,
+                ))
+            };
+            let of = |table: &str| {
+                let sql = format!(
+                    "SELECT payee, amount, fee, {} FROM {table} WHERE id = ?1 AND abandoned IS NULL",
+                    if table == "locks" { "settled" } else { "NULL" }
+                );
+                c.query_row(&sql, [id], row).optional()
+            };
+            let operation = match of("sends")? {
+                Some(send) => Some(send),
+                None => of("locks")?,
+            };
+            let Some((payee, amount, fee, settled)) = operation else {
+                return Ok(Vec::new());
+            };
+            let shares = match settled.as_deref() {
+                // The refund branch: what came back is known, the rest the fee.
+                Some("refund") => {
+                    let kept = sum("proposal")?;
+                    vec![(PartTo::Hub, spent.saturating_sub(kept)), (PartTo::Kept, kept)]
+                }
+                _ => vec![
+                    (PartTo::Payee(Address::from_bytes(&payee)?), amount),
+                    (PartTo::Hub, fee),
+                    (PartTo::Kept, spent.saturating_sub(amount + fee)),
+                ],
+            };
+            Ok(shares
+                .into_iter()
+                .filter(|(_, amount)| *amount > 0)
+                .map(|(to, amount)| Part {
+                    to,
+                    amount,
+                    notes: coins::split(amount, keyset.denominations()).unwrap_or_default(),
+                })
+                .collect())
         })
     }
 
