@@ -395,9 +395,11 @@ fn settled(hubs: &Hubs, phone: &Wallet, i: usize) -> u64 {
 }
 
 /// The phone's move of `id` once done, its history followed meanwhile,
-/// within 10 seconds.
+/// within a minute: a loaded runner, running several of these at once,
+/// took more than 10 seconds.
 fn until_moved(phone: &Wallet, id: &str) {
-    for _ in 0..50 {
+    let by = std::time::Instant::now() + Duration::from_secs(60);
+    while std::time::Instant::now() < by {
         let history = phone.history().unwrap();
         let line = history.iter().find(|a| a.id == id && a.kind == Kind::Swap);
         match line.map(|a| a.state) {
