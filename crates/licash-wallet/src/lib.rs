@@ -76,7 +76,7 @@ pub use payouts::{
 };
 pub use silent::{Blocks, Payee, Scanned, SilentCoin, SilentSpend};
 use store::{now, sql, Owner, Store};
-pub use swaps::{Swap, SwapLimits, SwapQuote, SwapState, SWAP_WINDOW};
+pub use swaps::{Swap, SwapLimits, SwapQuote, SwapState, SWAP_ROOM, SWAP_WINDOW};
 
 /// The most a wallet pays to renew notes its hub no longer unlinks unless
 /// told otherwise ([`Wallet::set_renew_limit`]): in parts per million of

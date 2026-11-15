@@ -24,20 +24,29 @@ use crate::{hub_url, now, sql, unavailable, Error, LockState, Transport, Wallet}
 /// return soon if the provider never locks.
 pub const SWAP_WINDOW: u32 = 24;
 
+/// Blocks a provider's lock leaves at least before it expires, for the
+/// wallet to claim it and the provider to follow it: a swap that leaves
+/// fewer is refused before the wallet locks anything.
+pub const SWAP_ROOM: u32 = 6;
+
 /// The most a swap may cost: refused before the wallet locks anything if
 /// its provider asks more.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SwapLimits {
     /// The provider's fee at most, in sat.
     pub fee: u64,
-    /// The provider's margin at most, in blocks: how much longer than
-    /// [`SWAP_WINDOW`] the wallet's notes stay locked if it never locks.
+    /// The provider's margin at most at the hub swapped to, in blocks: how
+    /// much longer than [`SWAP_WINDOW`] the wallet's notes stay locked if it
+    /// never locks.
     pub margin: u32,
 }
 
 impl SwapLimits {
-    /// For a swap of `amount`: a fee of 1% and 100 sat, a margin of 24
-    /// blocks.
+    /// For a swap of `amount`: a fee of 1% and 100 sat, a margin of 200
+    /// blocks. That is what a provider other than the hub swapped to needs
+    /// there, at a hub of the usual response window of 144 blocks: its lock
+    /// outlasts that window, and the refund request that forces the
+    /// preimage out of the hub.
     pub fn usual(amount: u64) -> Self {
         let fee = licash_api::Fee {
             base: 100,
@@ -45,7 +54,7 @@ impl SwapLimits {
         };
         Self {
             fee: fee.due(amount),
-            margin: 24,
+            margin: 200,
         }
     }
 }
@@ -59,6 +68,9 @@ pub struct SwapQuote {
     pub amount: u64,
     /// Its fee on the amount, which the wallet's lock pays on top.
     pub fee: u64,
+    /// Blocks its lock at the hub swapped to expires before the wallet's,
+    /// at least.
+    pub margin: u32,
 }
 
 /// A swap of notes at hub `from` for notes at hub `to`, and where it
@@ -133,7 +145,7 @@ impl<T: Transport> Wallet<T> {
         let (_, from_info) = self.refresh(&from).await?;
         let (_, to_info) = self.refresh(&to).await?;
         let offer: swaps::Info = self.get(&provider, swaps::SWAPS_INFO).await?;
-        let fee = terms(
+        let Terms { fee, expiry, .. } = terms(
             &provider,
             &offer,
             (&from, &from_info),
@@ -141,18 +153,6 @@ impl<T: Transport> Wallet<T> {
             amount,
             limits,
         )?;
-        let locks = from_info.locks.as_ref().ok_or_else(|| {
-            Error::Invalid(format!("hub {from} follows no chain: it takes no locks"))
-        })?;
-        let latest = locks
-            .latest_expiry(locks.min_depth.max(1))
-            .map_err(|p| unavailable(&from, p))?;
-        let expiry = latest.min(
-            locks
-                .height
-                .saturating_add(offer.margin)
-                .saturating_add(SWAP_WINDOW),
-        );
         let mut preimage = [0; 32];
         OsRng.fill_bytes(&mut preimage);
         let hash = lock_hash(&preimage);
@@ -424,8 +424,14 @@ impl<T: Transport> Wallet<T> {
         let info: swaps::Info = self.get(&provider, swaps::SWAPS_INFO).await?;
         let amount = amount.max(info.min);
         let from_at = (from.as_str(), &from_info);
-        let fee = terms(&provider, &info, from_at, (&to, &to_info), amount, limits)?;
-        Ok(SwapQuote { info, amount, fee })
+        let Terms { fee, margin, .. } =
+            terms(&provider, &info, from_at, (&to, &to_info), amount, limits)?;
+        Ok(SwapQuote {
+            info,
+            amount,
+            fee,
+            margin,
+        })
     }
 
     /// The swaps made, newest first.
@@ -459,9 +465,20 @@ impl<T: Transport> Wallet<T> {
     }
 }
 
-/// The provider's fee to swap `amount` from hub `from` to hub `to` on the
-/// terms it offers, unless it swaps not between them, not that amount now,
-/// or more than `limits` allow.
+/// What a swap costs on the terms its provider offers.
+struct Terms {
+    /// The provider's fee.
+    fee: u64,
+    /// Blocks its lock at `to` expires before the wallet's, at least.
+    margin: u32,
+    /// The expiry of the wallet's lock at `from`.
+    expiry: u32,
+}
+
+/// The terms of a swap of `amount` from hub `from` to hub `to` on what the
+/// provider offers, unless it swaps not between them, not that amount now,
+/// or more than `limits` allow, or hub `from` admits no lock that expires
+/// late enough for the provider to lock its margin earlier.
 fn terms(
     provider: &str,
     offer: &swaps::Info,
@@ -469,7 +486,7 @@ fn terms(
     (to, to_info): (&str, &Info),
     amount: u64,
     limits: SwapLimits,
-) -> Result<u64, Error> {
+) -> Result<Terms, Error> {
     if amount == 0 {
         return Err(Error::Invalid("nothing to swap".into()));
     }
@@ -499,13 +516,41 @@ fn terms(
             limits.fee
         )));
     }
-    if offer.margin > limits.margin {
+    let margin = offer.margin_at(at_to);
+    if margin > limits.margin {
         return Err(Error::Invalid(format!(
-            "provider {provider} keeps a swap's notes locked {} blocks longer, more than {}",
-            offer.margin, limits.margin
+            "provider {provider} keeps a swap's notes locked {margin} blocks longer, more than {}",
+            limits.margin
         )));
     }
-    Ok(fee)
+    let no_chain =
+        |hub: &str| Error::Invalid(format!("hub {hub} follows no chain: it takes no locks"));
+    let at_from = from_info.locks.as_ref().ok_or_else(|| no_chain(from))?;
+    let height = to_info.locks.as_ref().ok_or_else(|| no_chain(to))?.height;
+    let latest = at_from
+        .latest_expiry(at_from.min_depth.max(1))
+        .map_err(|p| unavailable(from, p))?;
+    let expiry = latest.min(
+        at_from
+            .height
+            .saturating_add(margin)
+            .saturating_add(SWAP_WINDOW),
+    );
+    // The provider's lock would expire too soon to claim, or before it is
+    // made: it declines once the wallet's lock is made, which then stays
+    // locked until it expires.
+    let room = height.max(at_from.height).saturating_add(SWAP_ROOM);
+    if expiry.saturating_sub(margin) < room {
+        return Err(Error::Invalid(format!(
+            "provider {provider} locks at {to} {margin} blocks before the wallet's lock \
+             expires, and {from} admits none expiring after {latest}"
+        )));
+    }
+    Ok(Terms {
+        fee,
+        margin,
+        expiry,
+    })
 }
 
 const SWAPS: &str = "SELECT s.hash, s.provider, f.url, t.url, s.amount, s.fee,
