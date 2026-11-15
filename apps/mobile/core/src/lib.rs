@@ -471,6 +471,9 @@ pub enum Kind {
     Invoice,
     /// Notes paid out to an address on Bitcoin, through a swap provider.
     Payout,
+    /// A recovery contract opened at a hub: its price, paid on Bitcoin
+    /// from a coin of the wallet's, the rest back to it.
+    Contract,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
@@ -533,6 +536,8 @@ pub enum Details {
         claim: Option<String>,
         failure: Option<String>,
     },
+    /// A recovery contract opened at `hub`, by its `funding`'s id.
+    Contract { hub: String, funding: String },
     /// A coin on Bitcoin, output `vout` of `tx`: `change` of the wallet's
     /// own, and `moving`, the transaction spending it, if one is.
     Coin {

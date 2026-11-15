@@ -15,7 +15,8 @@ use licash_contracts::holder::{self, Ask, Fate, Phase};
 
 use super::Wallet;
 use crate::{
-    chain::Chain, Balance, ChainSource, Contract, ContractQuote, ContractState, LicashError,
+    chain::Chain, Activity, Balance, ChainSource, Contract, ContractQuote, ContractState, Details,
+    Kind, LicashError, State,
 };
 
 /// What opening a contract downloads and keeps, in bytes, about: the
@@ -142,7 +143,7 @@ impl Wallet {
 
     fn contract(&self, c: &holder::Contract) -> Contract {
         Contract {
-            id: c.id.iter().map(|b| format!("{b:02x}")).collect(),
+            id: hex(&c.id),
             hub: c.hub.clone(),
             state: state(c, self.tip()),
             mock: c.mock,
@@ -171,6 +172,25 @@ impl Wallet {
             contracted(balance, &all, self.tip(), held, reserved);
         }
         Ok(())
+    }
+
+    /// The contracts signed, as lines of the history: what each cost,
+    /// under way until its funding is in a block.
+    pub(super) fn contract_activities(&self) -> Result<Vec<Activity>, LicashError> {
+        let all = holder::list(&self.dir).map_err(failed)?;
+        Ok(all.iter().filter_map(activity).collect())
+    }
+
+    /// More of the line of the history of the contract `id`, if any.
+    pub(super) fn contract_details(&self, id: &str) -> Result<Option<Details>, LicashError> {
+        let all = holder::list(&self.dir).map_err(failed)?;
+        let found = all.into_iter().find(|c| hex(&c.id) == id);
+        Ok(found.and_then(|c| {
+            Some(Details::Contract {
+                hub: c.hub,
+                funding: c.funding?.to_string(),
+            })
+        }))
     }
 
     /// The transactions funding contracts, those signed: their change is
@@ -224,6 +244,39 @@ fn contracted(
     }
 }
 
+fn hex(id: &[u8; 32]) -> String {
+    id.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Why a contract whose funding can never confirm failed.
+const DEAD: &str = "its funding can never confirm: its coin was spent otherwise";
+
+/// `c` as a line of the history, once its funding is broadcast: it pays
+/// its price then, done once in a block.
+fn activity(c: &holder::Contract) -> Option<Activity> {
+    if c.abandoned.is_some() || c.phase < Phase::Funded {
+        return None;
+    }
+    let state = match c.fate {
+        Some(Fate::Live) => State::Done,
+        Some(Fate::Dead) => State::Failed,
+        _ => State::Pending,
+    };
+    let detail = match state {
+        State::Failed => DEAD.into(),
+        _ => c.hub.clone(),
+    };
+    Some(Activity {
+        id: hex(&c.id),
+        kind: Kind::Contract,
+        state,
+        amount: c.price,
+        fee: 0,
+        detail,
+        at: Some(c.created_at),
+    })
+}
+
 /// Where `c` stands at `tip`.
 fn state(c: &holder::Contract, tip: u32) -> ContractState {
     if let Some(reason) = &c.abandoned {
@@ -233,7 +286,7 @@ fn state(c: &holder::Contract, tip: u32) -> ContractState {
     }
     match c.fate {
         Some(Fate::Dead) => ContractState::Failed {
-            reason: "its funding can never confirm: its coin was spent otherwise".into(),
+            reason: DEAD.into(),
         },
         Some(Fate::Live) if tip >= c.close_height => ContractState::Closed,
         Some(Fate::Live) if tip >= c.assert_height => ContractState::Ending,
@@ -305,6 +358,29 @@ mod tests {
         refused.abandoned = Some("refused".into());
         let reason = "refused".to_owned();
         assert_eq!(state(&refused, 300), ContractState::Failed { reason });
+    }
+
+    #[test]
+    fn contracts_are_in_the_history_once_funded_done_once_confirmed() {
+        let opening = contract(1, Phase::Consented, None);
+        assert_eq!(activity(&opening), None);
+        let mut refused = contract(2, Phase::Funded, None);
+        refused.abandoned = Some("refused".into());
+        assert_eq!(activity(&refused), None);
+        let line = |fate| activity(&contract(3, Phase::Funded, fate)).unwrap();
+        let confirming = line(None);
+        assert_eq!(
+            (confirming.kind, confirming.state, confirming.amount),
+            (Kind::Contract, State::Pending, 23_000)
+        );
+        assert_eq!(
+            (confirming.id, confirming.detail),
+            (hex(&[3; 32]), HUB.into())
+        );
+        assert_eq!(line(Some(Fate::Open)).state, State::Pending);
+        assert_eq!(line(Some(Fate::Live)).state, State::Done);
+        let dead = line(Some(Fate::Dead));
+        assert_eq!((dead.state, dead.detail.as_str()), (State::Failed, DEAD));
     }
 
     #[test]

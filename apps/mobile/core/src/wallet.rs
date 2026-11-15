@@ -710,6 +710,7 @@ impl Wallet {
             }
         }
         history.extend(payouts::activities(&self.wallet)?);
+        history.extend(self.contract_activities()?);
         for coin in self.wallet.silent_coins()? {
             let state = match coin.spending {
                 Some(_) => State::Pending,
@@ -775,6 +776,7 @@ impl Wallet {
                 })
             }
             Kind::Payout => payouts::details(&self.wallet, &id),
+            Kind::Contract => self.contract_details(&id)?.ok_or_else(unknown),
             Kind::Onchain => {
                 let outpoint: OutPoint = id.parse().map_err(|_| unknown())?;
                 let mut coins = self.wallet.silent_coins()?.into_iter();
