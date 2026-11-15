@@ -4,7 +4,7 @@ use std::{path::Path, sync::Arc};
 
 use licash::spend::ChainProfile;
 use licash_api::{Code, Fee, Hex, Payment};
-use licash_wallet::{Balance, Error, HubId, State, Wallet};
+use licash_wallet::{Balance, Error, HubId, NoteRecord, State, Unlinking, Wallet};
 use net::{Fault, Link, Net, HUB};
 
 const FEE: Fee = Fee { base: 2, ppm: 0 };
@@ -679,6 +679,70 @@ async fn a_note_its_hub_refuses_to_unlink_stays_linked_and_spendable() {
     assert_eq!(alice.unlink().await.unwrap(), 0);
     let payment = alice.send(HUB, &bob.address(), 98).await.unwrap().payment;
     assert_eq!(bob.receive(&payment).unwrap().amount, 98);
+}
+
+#[tokio::test]
+async fn an_operations_notes_show_what_it_spent_and_made_and_which_are_unlinked() {
+    let net = network();
+    let (alice, bob) = (party(&net, 1).await, party(&net, 2).await);
+    let got = alice.receive(&net.pay(HUB, &alice.address(), 100)).unwrap();
+    let paid = alice.operation_notes(&got.id).unwrap();
+    assert!(paid.spent.is_empty(), "{paid:?}");
+    assert_eq!(paid.made.iter().map(|n| n.amount).sum::<u64>(), 100);
+    assert!(paid.made.windows(2).all(|w| w[0].amount >= w[1].amount));
+    for note in &paid.made {
+        assert_eq!((note.unlinked, note.hub.as_str()), (Unlinking::Linked, HUB));
+        assert_eq!(
+            (&note.made_by, &note.spent_by, note.gone),
+            (&got.id, &None, false)
+        );
+    }
+    assert_eq!(alice.unlink().await.unwrap(), paid.made.len());
+    let unlinked = alice.operation_notes(&got.id).unwrap().made;
+    assert!(unlinked.iter().all(|n| n.unlinked == Unlinking::Unlinked));
+    // Unlinking keeps each note's identifier.
+    let ids = |notes: &[NoteRecord]| notes.iter().map(|n| n.id.clone()).collect::<Vec<_>>();
+    assert_eq!(ids(&unlinked), ids(&paid.made));
+
+    // A payment spends them, its change made the wallet's.
+    let sent = alice.send(HUB, &bob.address(), 50).await.unwrap();
+    let fee = alice.sends().unwrap()[0].fee;
+    let notes = alice.operation_notes(&sent.id).unwrap();
+    let spent: u64 = notes.spent.iter().map(|n| n.amount).sum();
+    let change: u64 = notes.made.iter().map(|n| n.amount).sum();
+    assert_eq!(spent, 50 + fee + change, "{notes:?}");
+    assert!(notes
+        .spent
+        .iter()
+        .all(|n| n.spent_by.as_ref() == Some(&sent.id)));
+    assert!(notes
+        .made
+        .iter()
+        .all(|n| n.made_by == sent.id && n.spent_by.is_none()));
+    let spent_now = alice.operation_notes(&got.id).unwrap().made;
+    let by_payment = spent_now
+        .iter()
+        .filter(|n| n.spent_by.as_ref() == Some(&sent.id));
+    assert_eq!(by_payment.count(), notes.spent.len());
+
+    // A note its hub refuses to unlink stays linked.
+    let received = bob.receive(&sent.payment).unwrap();
+    net.fail(UNLINK, Fault::Refused(Code::Invalid));
+    let made = bob.operation_notes(&received.id).unwrap().made;
+    assert_eq!(bob.unlink().await.unwrap(), made.len() - 1);
+    let made = bob.operation_notes(&received.id).unwrap().made;
+    let refused = made.iter().filter(|n| n.unlinked == Unlinking::StaysLinked);
+    assert_eq!(refused.count(), 1, "{made:?}");
+
+    // None of the wallet's: nothing.
+    assert_eq!(
+        alice.operation_notes(&"00".repeat(32)).unwrap(),
+        Default::default()
+    );
+    assert!(matches!(
+        alice.operation_notes("zz"),
+        Err(Error::Invalid(_))
+    ));
 }
 
 #[tokio::test]

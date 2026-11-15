@@ -236,6 +236,46 @@ pub struct Received {
     pub received_at: i64,
 }
 
+/// The notes one payment, lock or receipt of the wallet spent, and those
+/// it made the wallet's: its change, its settled branch, or what it was
+/// paid ([`Wallet::operation_notes`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OperationNotes {
+    pub spent: Vec<NoteRecord>,
+    pub made: Vec<NoteRecord>,
+}
+
+/// A note the wallet holds or held, as an application shows it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct NoteRecord {
+    /// Its identifier, the same at its hub once unlinked: in hex.
+    pub id: String,
+    pub hub: String,
+    pub amount: u64,
+    /// The payment, lock or receipt that made it, in hex.
+    pub made_by: String,
+    /// The payment or lock that spends it, from when it chose it, in hex.
+    pub spent_by: Option<String>,
+    pub unlinked: Unlinking,
+    /// Spent by a copy of the wallet, as its hub showed: never here.
+    pub gone: bool,
+    pub added_at: i64,
+}
+
+/// Whether a note's hub can tell which payment it came from when it is
+/// spent ([`Wallet::unlink`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Unlinking {
+    /// As issued: its hub can tell. The wallet unlinks it next time.
+    Linked,
+    /// Signed again blindly by its hub: it cannot tell.
+    Unlinked,
+    /// Its hub refused to unlink it: it stays linked.
+    StaysLinked,
+}
+
 /// What [`Wallet::resume`] did with the payments and locks under way.
 #[derive(Debug, Default)]
 pub struct Resumed {
@@ -1548,6 +1588,44 @@ impl<T: Transport> Wallet<T> {
             hub: url,
             amount,
             received_at,
+        })
+    }
+
+    /// The notes the payment, lock or receipt `id` (in hex) spent, and
+    /// those it made the wallet's, the largest first: none of either if it
+    /// is none of the wallet's.
+    pub fn operation_notes(&self, id: &str) -> Result<OperationNotes, Error> {
+        let id = payment_id(id)?;
+        self.store.read(|c| {
+            let of = |column: &str| -> Result<Vec<NoteRecord>, Error> {
+                let mut stmt = c.prepare(&format!(
+                    "SELECT n.y, r.url, n.denom, n.proposal, n.spent_by, n.unlinked,
+                        n.gone_at IS NOT NULL, n.added_at
+                     FROM notes n JOIN keysets k ON k.id = n.keyset JOIN reach r ON r.hub = k.hub
+                     WHERE n.{column} = ?1 ORDER BY n.denom DESC, n.added_at, n.y"
+                ))?;
+                let rows = stmt.query_map([id.as_bytes()], |r| {
+                    Ok(NoteRecord {
+                        id: hex::encode(r.get::<_, Vec<u8>>(0)?),
+                        hub: r.get(1)?,
+                        amount: r.get::<_, i64>(2)? as u64,
+                        made_by: hex::encode(r.get::<_, Vec<u8>>(3)?),
+                        spent_by: r.get::<_, Option<Vec<u8>>>(4)?.map(hex::encode),
+                        unlinked: match r.get::<_, i64>(5)? {
+                            1 => Unlinking::Unlinked,
+                            -1 => Unlinking::StaysLinked,
+                            _ => Unlinking::Linked,
+                        },
+                        gone: r.get(6)?,
+                        added_at: r.get(7)?,
+                    })
+                })?;
+                Ok(rows.collect::<Result<_, _>>()?)
+            };
+            Ok(OperationNotes {
+                spent: of("spent_by")?,
+                made: of("proposal")?,
+            })
         })
     }
 
