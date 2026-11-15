@@ -22,16 +22,12 @@ import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
-import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -46,12 +42,10 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.Velocity
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import kotlinx.coroutines.launch
 import org.licash.core.Activity
 import org.licash.wallet.Engine
 import org.licash.wallet.Ui
 import org.licash.wallet.digits
-import org.licash.wallet.explain
 import org.licash.wallet.total
 
 /**
@@ -113,11 +107,12 @@ fun Home(
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.Center,
         ) {
-            Total(ui) { money(null) }
-            Going(ui, money, history, open)
+            // Nothing works without a hub: choosing one comes first.
             if (ui.hubs.isEmpty()) {
-                Spacer(Modifier.height(32.dp))
-                ConnectHub(engine)
+                ChooseHub(engine, ui)
+            } else {
+                Total(ui) { money(null) }
+                Going(ui, money, history, open)
             }
         }
         if (ui.hubs.isNotEmpty()) {
@@ -211,39 +206,18 @@ private fun Going(ui: Ui, money: (String?) -> Unit, history: () -> Unit, open: (
     why?.let { Sheet("Not up to date", dismiss = { why = null }) { Say(it) } }
 }
 
-/** No hub yet: nothing works without one. */
+/**
+ * No hub yet: those announced to pick from, looked for at once, or one by
+ * the address its operator gave. What a hub is, once asked.
+ */
 @Composable
-private fun ConnectHub(engine: Engine) {
-    val scope = rememberCoroutineScope()
-    var url by rememberSaveable { mutableStateOf("") }
-    var busy by rememberSaveable { mutableStateOf(false) }
-    var error by rememberSaveable { mutableStateOf<String?>(null) }
-    Surface(shape = RoundedCornerShape(20.dp), color = MaterialTheme.colorScheme.surfaceContainer) {
-        Column(Modifier.padding(20.dp)) {
-            Text("Connect to a hub", style = MaterialTheme.typography.titleMedium)
-            Text(
-                "A hub holds your Licash and moves it for you. Paste the address its operator gave you.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            Spacer(Modifier.height(12.dp))
-            OutlinedTextField(
-                value = url,
-                onValueChange = { url = it },
-                modifier = Modifier.fillMaxWidth(),
-                singleLine = true,
-                placeholder = { Text("hub.example") },
-            )
-            error?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
-            Spacer(Modifier.height(12.dp))
-            BigButton(if (busy) "Connecting…" else "Connect", Modifier.fillMaxWidth(), enabled = !busy && url.isNotBlank()) {
-                busy = true
-                error = null
-                scope.launch {
-                    engine.addHub(url.trim()).onFailure { error = explain(it) }
-                    busy = false
-                }
-            }
+private fun ChooseHub(engine: Engine, ui: Ui) {
+    Column(Modifier.fillMaxWidth()) {
+        Row(Modifier.align(Alignment.CenterHorizontally), verticalAlignment = Alignment.CenterVertically) {
+            Text("Choose a hub", modifier = Modifier.testTag("choose-hub"), style = MaterialTheme.typography.headlineSmall)
+            Info("Hubs", HUB_MEANS)
         }
+        Group("") { FoundHubs(engine, ui, auto = true) }
+        Group("Or its address") { AddHub(engine, "Connect") }
     }
 }

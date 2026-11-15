@@ -21,9 +21,7 @@ import kotlinx.coroutines.launch
 import org.licash.core.Contract
 import org.licash.core.ContractQuote
 import org.licash.core.Holding
-import org.licash.core.Hub
 import org.licash.core.Notes
-import org.licash.core.Rate
 import org.licash.wallet.Engine
 import org.licash.wallet.Ui
 import org.licash.wallet.digits
@@ -110,7 +108,7 @@ internal fun HubPage(
         }
     }
 
-    if (fees && hub != null) Fees(hub) { fees = false }
+    if (fees && hub != null) HubFees(hub) { fees = false }
     quote?.let { q ->
         ProtectSheet(
             q,
@@ -153,31 +151,5 @@ internal fun HubPage(
             },
             dismiss = { moving = false },
         )
-    }
-}
-
-/** What a hub charges and takes, in a sheet: only what it does. */
-@Composable
-private fun Fees(hub: Hub, dismiss: () -> Unit) {
-    Sheet("Fees and limits", dismiss) {
-        Line("Paying", charge(Rate(hub.feeBase, hub.feePpm)), tag = "fee-pay")
-        val most = hub.lightningPay
-        if (hub.lightning != null || most != null) {
-            Line("Paying over Lightning", hub.lightning?.let { charge(it.pay) } ?: "Yes")
-            most?.let { Line("At most", sat(it)) }
-        }
-        hub.lightning?.let {
-            Line("Receiving over Lightning", charge(it.receive))
-            Line("Between", "${sat(it.receiveRange.min)} and ${sat(it.receiveRange.max)}")
-        }
-        hub.deposits?.let { range ->
-            Line("Receiving on Bitcoin", hub.depositFee?.let { charge(it) } ?: "Yes")
-            Line("Between", "${sat(range.min)} and ${sat(range.max)}")
-        }
-        hub.contracts?.let {
-            Line("Protection", sat(it.price))
-            Line("Protects up to", sat(it.cap))
-            Line("For", span(it.blocks.toLong()))
-        }
     }
 }

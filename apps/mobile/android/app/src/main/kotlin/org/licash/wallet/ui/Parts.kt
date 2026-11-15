@@ -218,7 +218,8 @@ fun Chevron(tint: Color = MaterialTheme.colorScheme.outline) {
 /**
  * A row of a list: what it is and, at its end, its value; a glyph before
  * it and a line under it, if any. With something to open, a chevron.
- * `tag` names the value, for the tests to read.
+ * `tag` names the value, for the tests to read, or the title of one
+ * without a value.
  */
 @Composable
 fun Entry(
@@ -241,7 +242,13 @@ fun Entry(
             Spacer(Modifier.width(12.dp))
         }
         Column(Modifier.weight(1f)) {
-            Text(title, style = MaterialTheme.typography.bodyLarge, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Text(
+                title,
+                modifier = if (tag != null && value == null) Modifier.testTag(tag) else Modifier,
+                style = MaterialTheme.typography.bodyLarge,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
             sub?.let {
                 Text(
                     it,

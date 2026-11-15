@@ -25,6 +25,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
@@ -59,13 +60,8 @@ fun Onboarding(engine: Engine, ui: Ui) {
             )
             Spacer(Modifier.height(12.dp))
             Text(
-                "Bitcoin you can pay with in a tap.",
+                "Bitcoin, paid in a tap",
                 style = MaterialTheme.typography.titleMedium,
-                textAlign = TextAlign.Center,
-            )
-            Text(
-                "One code to be paid at, on Bitcoin or in Licash alike.",
-                style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 textAlign = TextAlign.Center,
             )
@@ -78,13 +74,14 @@ fun Onboarding(engine: Engine, ui: Ui) {
                             selected = ui.network == network,
                             onClick = { scope.launch { engine.setNetwork(network) } },
                             label = { Text(network.name.lowercase()) },
+                            modifier = Modifier.testTag("network ${network.name.lowercase()}"),
                         )
                     }
                 }
                 OutlinedTextField(
                     value = peers,
                     onValueChange = { peers = it },
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = Modifier.fillMaxWidth().testTag("peers"),
                     singleLine = true,
                     label = { Text("Peers (host:port, comma separated)") },
                 )
@@ -94,7 +91,7 @@ fun Onboarding(engine: Engine, ui: Ui) {
         error?.let { Text(it, color = MaterialTheme.colorScheme.error, textAlign = TextAlign.Center) }
         BigButton(
             if (busy) "Creating…" else "Create wallet",
-            Modifier.fillMaxWidth().padding(bottom = 32.dp),
+            Modifier.fillMaxWidth().padding(bottom = 32.dp).testTag("create"),
             enabled = !busy,
         ) {
             busy = true
