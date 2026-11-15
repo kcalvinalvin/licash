@@ -28,6 +28,7 @@ import org.licash.chain.mobile.Mobile
 import org.licash.core.Activity
 import org.licash.core.Balance
 import org.licash.core.Code
+import org.licash.core.Contact
 import org.licash.core.Contract
 import org.licash.core.ContractQuote
 import org.licash.core.ContractState
@@ -716,6 +717,18 @@ class Engine(context: Context) {
         refresh()
         asked
     }
+
+    /** The contacts, by name. */
+    suspend fun contacts(): Result<List<Contact>> = io { local { it.contacts() } }
+
+    /** Keep the payment code `code` as `name`'s: refused for a name another contact has. */
+    suspend fun saveContact(name: String, code: String): Result<Contact> = io { local { it.saveContact(name, code) } }
+
+    /** Forget the contact named `name`. */
+    suspend fun removeContact(name: String): Result<Unit> = io { local { it.removeContact(name) } }
+
+    /** The contact the payment code `code` pays, if one does. */
+    suspend fun contactOf(code: String): Result<Contact?> = io { local { it.contactOf(code) } }
 
     /** Where the invoice of `hash` stands: its notes taken once it is paid. */
     suspend fun followInvoice(hash: String): Result<LightningInvoice> = io {

@@ -84,7 +84,8 @@ private sealed interface Step {
     data object Busy : Step
     data object Quoting : Step
     data class PayingOut(val amount: ULong, val depth: UInt) : Step
-    data class Sent(val amount: ULong, val handover: String?) : Step
+    /** To the code `code`, if one. */
+    data class Sent(val amount: ULong, val handover: String?, val code: String? = null) : Step
     data class Paid(val amount: ULong, val fee: ULong) : Step
     data object Later : Step
     data class Received(val amount: ULong) : Step
@@ -177,7 +178,7 @@ fun Send(
 
     suspend fun paying(code: String, amount: ULong?): Step =
         engine.pay(code, amount).fold(
-            { Step.Sent(it.amount, it.handover) },
+            { Step.Sent(it.amount, it.handover, code) },
             { e -> if (e is LicashException.Pending) Step.Later else Step.Failed(explain(e)) },
         )
 
@@ -276,6 +277,8 @@ fun Send(
                             textAlign = TextAlign.Center,
                         )
                     }
+                    // Or someone paid before, by name.
+                    if (cashOut == null) Contacts(engine) { read(it.code) }
                 }
                 is Step.Paying -> Paying(ui, s) { amount -> plan(s, amount) }
                 Step.Busy -> Middle("One moment…")
@@ -350,7 +353,10 @@ fun Send(
                 }
                 is Step.PayingOut -> Told("Sending ${sat(s.amount)}", "Arrives in ${arrives(s.depth)}", back)
                 is Step.Paid -> Done("Paid ${sat(s.amount)}", back, if (s.fee > 0uL) "Fee ${feeOf(s.fee, s.amount)}" else null)
-                is Step.Sent -> Sent(s, back)
+                is Step.Sent -> {
+                    Sent(s, back)
+                    s.code?.let { SaveContact(engine, it) }
+                }
                 // Not to pay again: it finishes by itself.
                 Step.Later -> Told("Under way", "It finishes by itself", back)
                 is Step.Received -> Done("Received ${sat(s.amount)}", back)
