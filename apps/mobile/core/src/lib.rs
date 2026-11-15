@@ -200,6 +200,26 @@ pub struct FoundHub {
     pub hub: Hub,
 }
 
+/// What looking for hubs on Nostr found ([`Wallet::find_hubs`]).
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct HubsFound {
+    /// Those answering, not used yet.
+    pub hubs: Vec<FoundHub>,
+    /// How many others were announced that answered at none of their URLs:
+    /// down, refusing the route, or reached only through Tor.
+    pub silent: u32,
+    /// How many of those are onion services only, reached through Tor only.
+    pub silent_onion: u32,
+}
+
+/// The relays to look for hubs and swap providers on besides those the
+/// hubs used name: relays that serve readers over Tor, the onion services
+/// among them only if `tor`. None on regtest, whose services are local.
+#[uniffi::export]
+pub fn default_relays(network: Network, tor: bool) -> Vec<String> {
+    licash_nostr::default_relays(network.profile().name(), tor)
+}
+
 /// What the wallet holds, in sat.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, uniffi::Record)]
 pub struct Balance {

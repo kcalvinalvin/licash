@@ -8,7 +8,7 @@ use std::{
 
 use bitcoin::{FeeRate, OutPoint};
 use licash_nostr::{
-    wallet::{hub_relays, hubs_announced},
+    wallet::{hub_relays, hubs_announced, hubs_found},
     Route,
 };
 use licash_transport::Http;
@@ -20,8 +20,9 @@ use crate::{
     chain::Chain,
     deliveries::{self, Delivery},
     Activity, Balance, ChainError, ChainSource, Code, ContractTerms, Details, FoundHub, Holding,
-    Hub, InvoiceQuote, Kind, LicashError, LightningInvoice, LightningTerms, Linking, Network,
-    NoteLine, Notes, NotesOf, Onchain, Paid, PayOffer, PayQuote, Range, Rate, Scan, Scanned, State,
+    Hub, HubsFound, InvoiceQuote, Kind, LicashError, LightningInvoice, LightningTerms, Linking,
+    Network, NoteLine, Notes, NotesOf, Onchain, Paid, PayOffer, PayQuote, Range, Rate, Scan,
+    Scanned, State,
 };
 
 /// The rate deposits are paid at, in sat/vB: above what nodes relay.
@@ -248,6 +249,44 @@ impl Wallet {
                 hub: hub(&h.url, &h.info),
             })
             .collect())
+    }
+
+    /// [`Wallet::discover_hubs`], on `relays` as well as on those the hubs
+    /// trusted name, such as [`crate::default_relays`]: a wallet using no
+    /// hub yet finds some. Told also how many more were announced that did
+    /// not answer.
+    pub fn find_hubs(&self, relays: Vec<String>) -> Result<HubsFound, LicashError> {
+        let mut asked = hub_relays(&self.wallet)?;
+        for relay in relays {
+            let relay = relay.trim().to_owned();
+            if !relay.is_empty() && !asked.contains(&relay) {
+                asked.push(relay);
+            }
+        }
+        if asked.is_empty() {
+            return Err(LicashError::invalid("no relays to find hubs on"));
+        }
+        let found = hubs_found(&self.wallet, &asked, &self.route);
+        let found = self
+            .runtime
+            .block_on(found)
+            .map_err(|e| LicashError::from_any(e, |reason| LicashError::Unavailable { reason }))?;
+        let onion_only = |f: &&licash_nostr::Found| {
+            let urls = &f.announcement.urls;
+            !urls.is_empty() && urls.iter().all(|u| licash_nostr::onion(u))
+        };
+        Ok(HubsFound {
+            hubs: found
+                .hubs
+                .iter()
+                .map(|h| FoundHub {
+                    name: h.name.clone(),
+                    hub: hub(&h.url, &h.info),
+                })
+                .collect(),
+            silent: found.silent.len() as u32,
+            silent_onion: found.silent.iter().filter(onion_only).count() as u32,
+        })
     }
 
     pub fn balance(&self) -> Result<Balance, LicashError> {

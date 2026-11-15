@@ -37,8 +37,8 @@ use licash_hub_service::{
     Services,
 };
 use licash_mobile::{
-    set_logger, wallet_exists, Activity, Balance, ChainError, ChainSource, Details, Kind,
-    LicashError, Linking, Logger, Network, Onchain, PayOffer, PayQuote, Range, Rate, Scanned,
+    default_relays, set_logger, wallet_exists, Activity, Balance, ChainError, ChainSource, Details,
+    Kind, LicashError, Linking, Logger, Network, Onchain, PayOffer, PayQuote, Range, Rate, Scanned,
     State, Wallet,
 };
 use licash_nostr::{Announcement, Announcer, Role, Route};
@@ -1060,6 +1060,65 @@ fn a_phone_finds_the_hubs_announced_on_its_hubs_relays_but_those_it_uses() {
     // A hub naming no relays: nowhere to look.
     let bob = other.wallet("bob", other.height());
     assert!(invalid(bob.discover_hubs()).contains("no hub you use names relays"));
+}
+
+#[test]
+fn a_phone_finds_hubs_on_relays_it_is_given_and_is_told_of_those_not_answering() {
+    let net = Net::new(true);
+    let relay = net.relay.as_ref().unwrap();
+    let relays = vec![net.runtime.block_on(relay.url()).to_string()];
+    let other = Net::new(false);
+    let announce = |secret: [u8; 32], url: String, name: &str| {
+        let announcement = Announcement {
+            urls: vec![url],
+            network: "regtest".into(),
+            name: Some(name.into()),
+        };
+        net.runtime.block_on(async {
+            let announcer = Announcer::new(&secret, Role::Hub, &relays, &Route::Direct);
+            let sent = announcer.await.unwrap().announce(&announcement).await;
+            assert_eq!(sent.unwrap(), 1);
+        })
+    };
+    announce(net.hub.nostr_secret(), net.url.clone(), "a hub");
+    // One down, and one an onion service only, out of reach without Tor.
+    announce([6; 32], "http://127.0.0.1:9".into(), "down");
+    let onion = format!("http://{}.onion", "a".repeat(56));
+    announce([7; 32], onion, "onion");
+
+    // Bob's hub names no relays: only those given to look on.
+    let bob = other.wallet("bob", other.height());
+    assert!(invalid(bob.find_hubs(vec![])).contains("no relays"));
+    let found = bob.find_hubs(relays.clone()).unwrap();
+    assert_eq!(found.hubs.len(), 1, "{found:?}");
+    assert_eq!(found.hubs[0].name.as_deref(), Some("a hub"));
+    assert_eq!(found.hubs[0].hub.url, net.url);
+    assert_eq!((found.silent, found.silent_onion), (2, 1));
+    // Not added by finding it.
+    assert_eq!(bob.hubs().unwrap().len(), 1);
+
+    // His own hub announced: neither found nor told of.
+    announce(other.hub.nostr_secret(), other.url.clone(), "his");
+    let found = bob.find_hubs(relays.clone()).unwrap();
+    assert_eq!(found.hubs.len(), 1, "{found:?}");
+    assert_eq!((found.silent, found.silent_onion), (2, 1));
+
+    // Added: found no more, nor told of.
+    bob.add_hub(net.url.clone()).unwrap();
+    let found = bob.find_hubs(relays).unwrap();
+    assert!(found.hubs.is_empty(), "{found:?}");
+    assert_eq!((found.silent, found.silent_onion), (2, 1));
+}
+
+#[test]
+fn default_relays_are_none_on_regtest_and_onion_services_only_over_tor() {
+    assert!(default_relays(Network::Regtest, true).is_empty());
+    let clear = default_relays(Network::Signet, false);
+    let all = default_relays(Network::Signet, true);
+    assert!(!clear.is_empty() && clear.len() < all.len());
+    assert!(clear.iter().all(|r| !r.contains(".onion")));
+    assert!(all.iter().any(|r| r.contains(".onion")));
+    assert_eq!(default_relays(Network::Bitcoin, true), all);
 }
 
 #[test]
