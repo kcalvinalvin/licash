@@ -259,26 +259,6 @@ impl Phone {
         until(&what, secs, || self.find(text)).await
     }
 
-    /// Wait up to `secs` for any of `texts` to show: the one that did.
-    pub async fn wait_any(&self, texts: &[&str], secs: u64) -> anyhow::Result<View> {
-        let what = format!("any of {texts:?} on screen");
-        until(&what, secs, || async {
-            let views = self.views().await?;
-            let mut found = views.into_iter().filter(|v| !v.text.is_empty());
-            Ok(found.find(|v| texts.iter().any(|t| v.text.starts_with(t))))
-        })
-        .await
-    }
-
-    /// Wait up to `secs` for no view's text to start with `text`.
-    pub async fn wait_gone(&self, text: &str, secs: u64) -> anyhow::Result<()> {
-        let what = format!("{text:?} gone");
-        until(&what, secs, || async {
-            Ok(self.find(text).await?.is_none().then_some(()))
-        })
-        .await
-    }
-
     /// Tap `view`.
     pub async fn tap_view(&self, view: &View) -> anyhow::Result<()> {
         let (x, y) = view.center();
@@ -307,6 +287,32 @@ impl Phone {
         self.tap_view(&view).await
     }
 
+    /// Whether a view tagged `id` is on screen now.
+    pub async fn has(&self, id: &str) -> anyhow::Result<bool> {
+        Ok(self.views().await?.iter().any(|v| v.id == id))
+    }
+
+    /// Wait up to `secs` for no view to be tagged `id`.
+    pub async fn gone(&self, id: &str, secs: u64) -> anyhow::Result<()> {
+        until(&format!("view {id:?} gone"), secs, || async {
+            Ok((!self.has(id).await?).then_some(()))
+        })
+        .await
+    }
+
+    /// Wait up to `secs` for the view tagged `id` to say `text`, or to
+    /// start with it: the view.
+    pub async fn tagged(&self, id: &str, text: &str, secs: u64) -> anyhow::Result<View> {
+        let shown = std::cell::RefCell::new(None);
+        until(&format!("view {id:?} saying {text:?}"), secs, || async {
+            let view = self.views().await?.into_iter().find(|v| v.id == id);
+            *shown.borrow_mut() = view.as_ref().map(|v| v.text.clone());
+            Ok(view.filter(|v| v.text.starts_with(text)))
+        })
+        .await
+        .with_context(|| format!("{:?} shown", shown.borrow()))
+    }
+
     /// Type `text` into the field in focus.
     pub async fn type_text(&self, text: &str) -> anyhow::Result<()> {
         ensure!(!text.contains('\''), "no quotes to type: {text}");
@@ -315,10 +321,10 @@ impl Phone {
         Ok(())
     }
 
-    /// Tap the field whose hint starts with `hint` and type `text` in it,
-    /// the keyboard hidden after.
-    pub async fn fill(&self, hint: &str, text: &str) -> anyhow::Result<()> {
-        self.tap(hint).await?;
+    /// Tap the field tagged `id` and type `text` in it, the keyboard
+    /// hidden after.
+    pub async fn fill_id(&self, id: &str, text: &str) -> anyhow::Result<()> {
+        self.tap_id(id).await?;
         tokio::time::sleep(Duration::from_millis(500)).await;
         self.type_text(text).await?;
         self.hide_keyboard().await
@@ -331,14 +337,14 @@ impl Phone {
         Ok(())
     }
 
-    /// Scroll down until a view whose text starts with `text` shows: it.
-    pub async fn scroll_to(&self, text: &str) -> anyhow::Result<View> {
+    /// Scroll down until a view tagged `id` shows: it.
+    pub async fn scroll_to_id(&self, id: &str) -> anyhow::Result<View> {
         let size = self.shell("wm size").await?;
         let size = size.rsplit(' ').next().context("no screen size")?.trim();
         let (width, height) = size.split_once('x').context("no screen size")?;
         let (x, height): (i32, i32) = (width.parse::<i32>()? / 2, height.parse()?);
         for _ in 0..8 {
-            if let Some(view) = self.find(text).await? {
+            if let Some(view) = self.views().await?.into_iter().find(|v| v.id == id) {
                 return Ok(view);
             }
             let (from, to) = (height * 7 / 10, height * 3 / 10);
@@ -346,7 +352,7 @@ impl Phone {
                 .await?;
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
-        anyhow::bail!("no {text:?} however far scrolled")
+        anyhow::bail!("no view {id:?} however far scrolled")
     }
 
     pub async fn back(&self) -> anyhow::Result<()> {
@@ -411,36 +417,49 @@ impl Phone {
 
     /// Make a wallet on regtest, its light client reaching Bitcoin Core
     /// only, through the developer mode the title turns on when tapped
-    /// seven times.
+    /// seven times. Home then asks for a hub.
     pub async fn onboard(&self) -> anyhow::Result<()> {
-        self.wait("Create wallet", 60).await?;
+        self.by_id("create", 60).await?;
         let title = self.wait("licash", 10).await?;
         for _ in 0..7 {
             self.tap_view(&title).await?;
         }
-        self.tap("regtest").await?;
-        self.fill("Peers (host:port", "127.0.0.1:18444").await?;
-        self.tap("Create wallet").await?;
+        self.tap_id("network regtest").await?;
+        self.fill_id("peers", "127.0.0.1:18444").await?;
+        self.tap_id("create").await?;
         // The light client of the network first chosen stops first.
-        self.wait("Connect to a hub", 180).await?;
+        self.by_id("choose-hub", 180).await?;
         Ok(())
     }
 
-    /// Connect to the hub at `url`, from Home with no hub yet.
+    /// Connect to the hub at `url`, by its address, from Home with no hub
+    /// yet: Home then shows what it holds.
     pub async fn connect(&self, url: &str) -> anyhow::Result<()> {
-        self.fill("hub.example", url).await?;
-        self.tap("Connect").await?;
-        self.wait("Receive", 60).await?;
+        self.fill_id("hub-address", url).await?;
+        self.tap_id("add-address").await?;
+        self.home(60).await
+    }
+
+    /// Wait up to `secs` for Home, with a hub: to receive and to send.
+    pub async fn home(&self, secs: u64) -> anyhow::Result<()> {
+        self.by_id("receive", secs).await?;
+        Ok(())
+    }
+
+    /// Go back a screen, to the one showing a view tagged `id`.
+    pub async fn back_to(&self, id: &str) -> anyhow::Result<()> {
+        self.back().await?;
+        self.by_id(id, 30).await?;
         Ok(())
     }
 
     /// The payment code Receive shows, for any amount, back on Home after.
     pub async fn code(&self) -> anyhow::Result<String> {
-        self.tap("Receive").await?;
+        self.tap_id("receive").await?;
         self.wait("QR code", 30).await?;
         let code = self.qr(30).await?;
         self.tap("Back").await?;
-        self.wait("Send", 30).await?;
+        self.home(30).await?;
         Ok(code)
     }
 
