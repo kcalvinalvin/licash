@@ -313,6 +313,28 @@ impl Phone {
         .with_context(|| format!("{:?} shown", shown.borrow()))
     }
 
+    /// Drag the slider tagged `id` from its middle to `at`, from 0 (its
+    /// start) to 1 (its end), waiting up to 30 s for it. Its track is
+    /// narrower than the view, and a drag's first pixels only start it:
+    /// to its very start or end, past the view, halfway to the screen's
+    /// edge (a dialog's slider is as far from either).
+    pub async fn slide_id(&self, id: &str, at: f32) -> anyhow::Result<()> {
+        let view = self.by_id(id, 30).await?;
+        let [left, _, right, _] = view.bounds;
+        let (from, y) = view.center();
+        let to = if at <= 0.0 {
+            left / 2
+        } else if at >= 1.0 {
+            right + left / 2
+        } else {
+            left + ((right - left) as f32 * at) as i32
+        };
+        self.shell(&format!("input swipe {from} {y} {to} {y} 500"))
+            .await?;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        Ok(())
+    }
+
     /// Type `text` into the field in focus.
     pub async fn type_text(&self, text: &str) -> anyhow::Result<()> {
         ensure!(!text.contains('\''), "no quotes to type: {text}");
