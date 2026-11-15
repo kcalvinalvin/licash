@@ -413,6 +413,29 @@ impl Server {
         thread.join().unwrap();
     }
 
+    /// Served again as a new run of the hub, opened from its files: it no
+    /// longer unlinks the notes it issued before. Of a hub without
+    /// gateways, which would hold the run before.
+    pub fn restarted(mut self) -> Self {
+        assert!(self.lightning.is_none() && self.deposits.is_none());
+        if self.running.is_some() {
+            self.down();
+        }
+        let policy = self.hub.info().policy;
+        // The run before stops first: one runs on its files at a time.
+        let before = Arc::into_inner(self.hub).expect("the only hold of the run before");
+        drop(before);
+        let db = self._dir.path().join("hub.sqlite");
+        let hub = Hub::open(&self.seed, &db, policy).unwrap();
+        {
+            let chain = &self.backend.lock().unwrap().chain;
+            assert!(hub.synced(chain.height(), &chain.tip()).unwrap());
+        }
+        self.hub = Arc::new(hub);
+        self.up();
+        self
+    }
+
     /// A payment of `amount` to `to`, its fee paid, from notes the hub's
     /// keys made for someone outside any wallet.
     pub fn pay(&self, to: &Address, amount: u64) -> Payment {
@@ -500,6 +523,7 @@ pub fn wallet(wallet: &Path, args: &[&str], input: Option<&str>) -> Output {
         .args(args)
         .env_remove("LICASH_WALLET_PROXY")
         .env_remove("LICASH_WALLET_CHAIN")
+        .env_remove("LICASH_WALLET_RENEW_PPM")
         // Its hubs follow regtest.
         .env("LICASH_WALLET_NETWORK", "regtest")
         .stdin(Stdio::piped())

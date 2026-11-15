@@ -54,6 +54,13 @@ struct Cli {
     /// Print results as JSON.
     #[arg(long, global = true)]
     json: bool,
+    /// Renew notes a hub no longer unlinks since it restarted, paying them
+    /// to the wallet itself, only if its fee on them is at most this many
+    /// parts per million of their value, its base fee included: 0 renews
+    /// them only for free.
+    #[arg(long, global = true, env = "LICASH_WALLET_RENEW_PPM",
+          default_value_t = licash_wallet::RENEW_PPM)]
+    renew_ppm: u32,
     /// Log lines on stderr as text or JSON, filtered by RUST_LOG (default
     /// warn).
     #[arg(long, global = true, env = "LICASH_WALLET_LOG", value_enum, default_value_t = Log::Text)]
@@ -458,6 +465,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         );
     }
     let wallet = Wallet::open(&path, transport)?;
+    wallet.set_renew_limit(cli.renew_ppm);
     match cli.command {
         Command::Init { .. } | Command::Discover { .. } => unreachable!("handled above"),
         Command::Address => {
@@ -583,6 +591,8 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             let paid = wallet.send(&hub, &payee, amount).await?;
             eprintln!("payment {}", paid.id);
             write_payment(&paid.payment, out.as_deref())?;
+            // Its change, linked to it until then.
+            unlink(&wallet).await;
         }
         Command::Receive { payment, trust } => {
             let text = read(&payment)?;
@@ -1207,6 +1217,8 @@ async fn pay(
         ),
         None => write_payment(&paid.paid.payment, out)?,
     }
+    // Its change, linked to it until then.
+    unlink(wallet).await;
     Ok(())
 }
 

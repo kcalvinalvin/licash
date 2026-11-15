@@ -20,6 +20,15 @@ hub has not answered; `resume` finishes it. Back up the wallet file: its
 seed alone does not restore its notes. After restoring an old copy, `check`
 drops the notes spent since.
 
+Notes are unlinked from the payment that made them as they are received,
+and a payment's change as it is sent, so that their hub cannot tell where
+one came from when it is spent; `unlink` asks again for those left linked.
+A hub that restarted no longer unlinks the notes it issued before: the
+wallet renews them, paying them to itself for notes it unlinks, once, if
+the hub's fee on them is at most `--renew-ppm` parts per million of their
+value (`LICASH_WALLET_RENEW_PPM`, 100 by default, 0 for free renewals
+only). `history` lists a renewal as a payment to the wallet's own address.
+
 `code` prints a payment code (a BIP321 URI, `--qr` for QR codes) naming the
 wallet, the hubs it is paid at and its Nostr mailbox, if they name relays.
 `pay <code> [amount]` pays it at a hub it names that the wallet trusts and

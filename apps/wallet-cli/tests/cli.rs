@@ -218,6 +218,49 @@ fn a_payment_while_its_hub_is_down_finishes_once_it_is_back() {
 }
 
 #[test]
+fn notes_a_restarted_hub_no_longer_unlinks_are_renewed_within_the_fee_limit() {
+    let mut hub = Server::start(FEE);
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, alice_at) = party(dir.path(), "alice", Some(&hub));
+    let (bob, bob_at) = party(dir.path(), "bob", Some(&hub));
+    // Received while its hub is down: linked until it is back, restarted.
+    let funds = serde_json::to_string(&hub.pay(&address(&alice_at), 64)).unwrap();
+    hub.down();
+    let received = ok(wallet(&alice, &["--json", "receive"], Some(&funds)));
+    let received: Value = serde_json::from_str(&received).unwrap();
+    assert_eq!(received["unlinked"], Value::Null);
+    let _hub = hub.restarted();
+
+    // Its fee of 1 on 64 is 15,625 parts per million: over the limit.
+    let unlink = |ppm: &str| json(&alice, &["--renew-ppm", ppm, "unlink"])["unlinked"].clone();
+    assert_eq!(json(&alice, &["unlink"])["unlinked"], 0);
+    assert_eq!(unlink("15624"), 0);
+    assert_eq!(json(&alice, &["history"]), Value::Array(vec![]));
+    let unlinked = unlink("15625");
+    assert!(unlinked.as_u64().unwrap() > 0, "{unlinked}");
+    let history = json(&alice, &["history"]);
+    assert_eq!(history.as_array().unwrap().len(), 1, "{history}");
+    let renewal = &history[0];
+    assert_eq!(renewal["payee"], alice_at.as_str());
+    assert_eq!(
+        (renewal["amount"].as_u64(), renewal["fee"].as_u64()),
+        (Some(63), Some(1))
+    );
+    assert_eq!(renewal["state"], "done");
+    assert_eq!(available(&alice), (63, 0));
+    assert_eq!(json(&alice, &["unlink"])["unlinked"], 0);
+
+    // A payment's change is unlinked as it is made.
+    let payment = ok(wallet(&alice, &["send", &bob_at, "10"], None));
+    assert_eq!(
+        ok(wallet(&bob, &["receive"], Some(&payment))).trim(),
+        "received 10"
+    );
+    assert_eq!(json(&alice, &["unlink"])["unlinked"], 0);
+    assert_eq!(available(&alice), (52, 0));
+}
+
+#[test]
 fn a_restored_backup_drops_the_notes_spent_since() {
     let hub = Server::start(FEE);
     let dir = tempfile::tempdir().unwrap();
