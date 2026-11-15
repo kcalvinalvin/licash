@@ -144,10 +144,7 @@ pub fn message(event: &Event) -> Message {
         Some(Notice::Started { boot }) => Message::new(
             Priority::Low,
             "Hub started",
-            format!(
-                "The hub is serving (boot {boot}). Notes it issued before this start can no \
-                 longer be unlinked: wallets holding them swap them for fresh ones."
-            ),
+            format!("The hub is serving (boot {boot})."),
         ),
         Some(Notice::Released {
             proposal,
@@ -369,7 +366,8 @@ mod tests {
         assert_eq!(kinds, KINDS);
         let messages: Vec<_> = notices.iter().map(|n| message(&event(n))).collect();
         assert_eq!(messages[0].title, "Hub started");
-        assert!(messages[0].body.contains("b0"));
+        // Wallets handle what a restart means for unlinking: no news to an operator.
+        assert_eq!(messages[0].body, "The hub is serving (boot b0).");
         assert_eq!(messages[1].title, "Spend released");
         assert_eq!(
             messages[1].body,
