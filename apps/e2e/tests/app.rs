@@ -328,6 +328,11 @@ async fn cashed_out(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     phone.tap("Send").await?;
     phone.wait("Sending", 60).await?;
     phone.tap("Done").await?;
+    // Under way, watched in a foreground service: finished out of sight too.
+    until("the watching notification", 30, || async {
+        Ok(phone.notifying("watching").await?.then_some(()))
+    })
+    .await?;
     // Home tells where it stands, no block mined yet: under way, at one of
     // its first steps.
     phone.back().await?;

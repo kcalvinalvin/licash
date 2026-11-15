@@ -10,6 +10,7 @@ icons = "1.7.8"
 coroutines = "1.11.0"
 zxing = "3.5.4"
 jna = "5.19.1"
+junit = "4.13.2"
 
 [libraries]
 compose-bom = { module = "androidx.compose:compose-bom", version.ref = "compose-bom" }
@@ -29,6 +30,7 @@ camera-view = { module = "androidx.camera:camera-view", version.ref = "camera" }
 coroutines = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-android", version.ref = "coroutines" }
 zxing = { module = "com.google.zxing:core", version.ref = "zxing" }
 jna = { module = "net.java.dev.jna:jna", version.ref = "jna" }
+junit = { module = "junit:junit", version.ref = "junit" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }

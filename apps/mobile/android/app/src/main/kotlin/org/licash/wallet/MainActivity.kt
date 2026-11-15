@@ -1,11 +1,16 @@
 package org.licash.wallet
 
+import android.Manifest
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
@@ -21,8 +26,10 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.testTagsAsResourceId
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import org.licash.core.Activity
 import org.licash.wallet.ui.ActivityDetails
@@ -88,6 +95,19 @@ private fun App(engine: Engine, link: String?, linkShown: () -> Unit) {
     var screen by remember { mutableStateOf<Screen>(Screen.Home) }
     val snackbar = remember { SnackbarHostState() }
     LaunchedEffect(Unit) { engine.events.collect { snackbar.showSnackbar(it.text) } }
+    // Asked as a payment goes under way, to tell of it out of sight: Android
+    // asks at most twice, then no more once refused.
+    val context = LocalContext.current
+    val ask = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        AppLog.info(if (granted) "notifications allowed" else "notifications not allowed")
+    }
+    val watching = ui.watch != Watch.NONE
+    LaunchedEffect(watching) {
+        val missing = Build.VERSION.SDK_INT >= 33 &&
+            ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) !=
+            PackageManager.PERMISSION_GRANTED
+        if (watching && missing) ask.launch(Manifest.permission.POST_NOTIFICATIONS)
+    }
     LaunchedEffect(ui.wallet) { if (!ui.wallet) screen = Screen.Home }
     LaunchedEffect(link, ui.wallet) {
         if (link != null && ui.wallet) {

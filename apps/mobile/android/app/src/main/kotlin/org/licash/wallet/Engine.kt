@@ -6,6 +6,7 @@ import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.ProcessLifecycleOwner
 import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -15,6 +16,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -77,6 +79,10 @@ data class Ui(
     val opening: String? = null,
     /** Where each line of the history under way stands, by [key]. */
     val under: Map<String, Details> = emptyMap(),
+    /** How closely what is under way is watched, out of sight too. */
+    val watch: Watch = Watch.NONE,
+    /** When a Lightning invoice was last asked, in seconds since the epoch. */
+    val asked: Long? = null,
 )
 
 /** A line of the history's own key: lines of different kinds can share an id. */
@@ -92,14 +98,17 @@ data class Event(val text: String, val received: ULong? = null)
 
 /**
  * The wallet and the light client, and the loop keeping them in step while
- * the app is in sight: looking for payments on Bitcoin, moving them into
- * Licash once there is enough, finishing what is under way and taking
- * what arrives in the mailbox. Every wallet call is on an IO thread; those
+ * the app is in sight, or out of sight while a payment is under way (see
+ * [Watch]): looking for payments on Bitcoin, moving them into Licash once
+ * there is enough, finishing what is under way and taking what arrives in
+ * the mailbox. Every wallet call is on an IO thread; those
  * reaching the network or changing what the wallet holds one at a time,
  * those reading it alongside.
  */
 class Engine(context: Context) {
+    private val app = context.applicationContext
     val prefs = Prefs(context)
+    val notifier = Notifier(app)
     private val files = context.filesDir
     private val walletDir = File(files, "wallet").path
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -117,6 +126,24 @@ class Engine(context: Context) {
 
     @Volatile
     private var foreground = false
+
+    /** Those keeping the engine at work out of sight: the service, the periodic job. */
+    private val keepers = AtomicInteger()
+
+    /** The rounds done in step with Bitcoin, its light client synced. */
+    private val rounds = MutableStateFlow(0L)
+
+    /** Whether the periodic look is scheduled, as last asked; unknown at start. */
+    private var looking: Boolean? = null
+
+    /** The events told of out of sight, each in a notification of its own. */
+    private val noticed = AtomicInteger()
+
+    /** Every line of the history when last looked, since the app started. */
+    private var seen: Set<String>? = null
+
+    /** Whether the wallet was opened and its light client first started, or not. */
+    private val started = MutableStateFlow(false)
 
     @Volatile
     private var wallet: Wallet? = null
@@ -144,6 +171,8 @@ class Engine(context: Context) {
         ProcessLifecycleOwner.get().lifecycle.addObserver(object : DefaultLifecycleObserver {
             override fun onStart(owner: LifecycleOwner) {
                 foreground = true
+                // In sight: the only time the service may start.
+                if (state.value.watch == Watch.NOW) WatchService.start(app)
                 poke()
             }
 
@@ -152,8 +181,44 @@ class Engine(context: Context) {
             }
         })
         scope.launch {
+            // In sight, told on screen; out of sight, money in in a
+            // notification: the rest is told as its line finishes.
+            events.collect {
+                if (!foreground && it.received != null) notifier.payment("event ${noticed.incrementAndGet()}", it.text)
+            }
+        }
+        scope.launch {
             load()
             loop()
+        }
+    }
+
+    /** Keep at work out of sight, or no longer: for the service watching. */
+    fun keep(on: Boolean) {
+        if (on) keepers.incrementAndGet() else keepers.decrementAndGet()
+        poke()
+    }
+
+    /**
+     * Keep at work out of sight for two rounds in step with Bitcoin, at most
+     * `ms`: a look for the periodic job, the app perhaps just started. None
+     * with no wallet, or no light client (Tor or the wallet failing).
+     */
+    suspend fun round(ms: Long) {
+        keepers.incrementAndGet()
+        try {
+            withTimeoutOrNull(ms) {
+                started.first { it }
+                if (wallet == null || light == null) {
+                    AppLog.info("no look out of sight: no wallet or no light client")
+                    return@withTimeoutOrNull
+                }
+                val start = rounds.value
+                poke()
+                rounds.first { it >= start + 2 }
+            }
+        } finally {
+            keepers.decrementAndGet()
         }
     }
 
@@ -181,6 +246,7 @@ class Engine(context: Context) {
         refresh()
         state.update { it.copy(loaded = true) }
         lightLock.withLock { startLight() }
+        started.value = true
     }
 
     /**
@@ -235,13 +301,20 @@ class Engine(context: Context) {
 
     private suspend fun loop() {
         while (true) {
-            if (foreground) {
+            if (foreground || keepers.get() > 0) {
                 runCatching { sync() }.onFailure { e ->
                     AppLog.warn("sync", e)
                     state.update { it.copy(problem = explain(e)) }
                 }
+                if (state.value.chain.synced) rounds.update { it + 1 }
             }
-            withTimeoutOrNull(if (eager) EAGER_MS else ROUND_MS) { wake.receive() }
+            // Out of sight, what is watched waits for blocks: no hurry.
+            val ms = when {
+                !foreground -> AWAY_MS
+                eager -> EAGER_MS
+                else -> ROUND_MS
+            }
+            withTimeoutOrNull(ms) { wake.receive() }
         }
     }
 
@@ -439,8 +512,46 @@ class Engine(context: Context) {
                     tor = shown.tor,
                     contracts = shown.contracts,
                     under = shown.under,
+                    asked = prefs.askedAt,
                 )
             }
+        }
+        if (shown != null) watch()
+    }
+
+    /**
+     * After each look at the wallet: out of sight, tell of the payments
+     * finished and of payouts nearing their deadline; and keep watching,
+     * the service started while in sight, as long as anything is under way.
+     */
+    @Synchronized
+    private fun watch() {
+        val ui = state.value
+        val level = watchOf(ui, System.currentTimeMillis() / 1000)
+        state.update { it.copy(watch = level) }
+        val look = look(ui.history, prefs.watched, seen)
+        prefs.watched = look.under
+        seen = ui.history.map { it.key }.toSet()
+        val near = nearing(ui)
+        var warned = prefs.warned intersect look.under
+        if (!foreground) {
+            for (activity in look.finished) news(activity)?.let { notifier.payment(activity.key, it) }
+            for ((key, by) in near) {
+                if (key in warned) continue
+                notifier.deadline(
+                    key,
+                    "A payment on Bitcoin must be claimed by block ${digits(by.toULong())}, or it fails. " +
+                        "Licash claims it once open with a connection.",
+                )
+                warned = warned + key
+            }
+        }
+        prefs.warned = warned
+        if (level == Watch.NOW && foreground) WatchService.start(app)
+        val periodic = level != Watch.NONE
+        if (periodic != looking) {
+            looking = periodic
+            if (periodic) WatchJob.schedule(app) else WatchJob.cancel(app)
         }
     }
 
@@ -532,6 +643,8 @@ class Engine(context: Context) {
     /** Ask the hub taking it for least for a Lightning invoice paying `amount` in notes. */
     suspend fun askInvoice(amount: ULong): Result<LightningInvoice> = io {
         val asked = locked { it.askInvoice(amount) }
+        // Perhaps paid out of sight: looked for now and then for a while.
+        prefs.askedAt = System.currentTimeMillis() / 1000
         refresh()
         asked
     }
@@ -733,6 +846,15 @@ class Engine(context: Context) {
             File(walletDir).deleteRecursively()
             AppLog.info("wallet deleted")
         }
+        // Nothing of it under way any more: a new wallet starts afresh.
+        synchronized(this) {
+            prefs.watched = null
+            prefs.warned = emptySet()
+            prefs.askedAt = null
+            seen = null
+            looking = false
+            WatchJob.cancel(app)
+        }
         // Through Tor, its way closed with the wallet.
         lightLock.withLock { startLight() }
         state.update { Ui(loaded = true, developer = prefs.developer, network = prefs.network) }
@@ -752,5 +874,6 @@ class Engine(context: Context) {
     companion object {
         private const val ROUND_MS = 20_000L
         private const val EAGER_MS = 4_000L
+        private const val AWAY_MS = 60_000L
     }
 }

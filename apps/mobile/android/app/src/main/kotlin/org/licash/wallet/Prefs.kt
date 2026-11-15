@@ -52,4 +52,22 @@ class Prefs(context: Context) {
     var renewPpm: UInt?
         get() = prefs.getLong("renew_ppm", -1L).takeIf { it >= 0 }?.toUInt()
         set(ppm) = prefs.edit().putLong("renew_ppm", ppm?.toLong() ?: -1L).apply()
+
+    /**
+     * The lines of the history under way when last looked, by key: none
+     * kept yet (`null`, as before the app kept them) tells of none finished.
+     */
+    var watched: Set<String>?
+        get() = prefs.getStringSet("watched", null)?.toSet()
+        set(keys) = prefs.edit().apply { if (keys == null) remove("watched") else putStringSet("watched", keys) }.apply()
+
+    /** The payouts already warned of as their deadline neared, by key. */
+    var warned: Set<String>
+        get() = prefs.getStringSet("warned", null)?.toSet().orEmpty()
+        set(keys) = prefs.edit().putStringSet("warned", keys).apply()
+
+    /** When a Lightning invoice was last asked, in seconds since the epoch, if ever since kept. */
+    var askedAt: Long?
+        get() = prefs.getLong("asked_at", -1L).takeIf { it >= 0 }
+        set(at) = prefs.edit().putLong("asked_at", at ?: -1L).apply()
 }

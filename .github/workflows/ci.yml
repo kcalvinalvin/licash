@@ -123,9 +123,9 @@ jobs:
         working-directory: apps/mobile/android
         run: ANDROID_NDK_HOME=$ANDROID_NDK_LATEST_HOME ./native.sh
       # Release unsigned: only publish-app holds the signing key.
-      - name: App
+      - name: App, and its unit tests
         working-directory: apps/mobile/android
-        run: ./gradlew --no-daemon assembleDebug assembleRelease
+        run: ./gradlew --no-daemon testDebugUnitTest assembleDebug assembleRelease
       - uses: actions/upload-artifact@v7
         with:
           name: app-debug

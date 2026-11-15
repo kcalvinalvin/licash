@@ -162,8 +162,14 @@ impl Phone {
         let apk = self.apk.to_str().context("the APK's path")?;
         self.adb(&["install", "-r", "-g", apk]).await?;
         self.shell(&format!("pm clear {PACKAGE}")).await?;
-        self.shell(&format!("pm grant {PACKAGE} android.permission.CAMERA"))
+        // Cleared with its data: granted again, so that no dialog covers
+        // the app (notifications from Android 13, as the emulators run).
+        for permission in ["CAMERA", "POST_NOTIFICATIONS"] {
+            self.shell(&format!(
+                "pm grant {PACKAGE} android.permission.{permission}"
+            ))
             .await?;
+        }
         for url in [eco.hub(1), eco.hub(2), eco.relay(), eco.swaps()] {
             let at = format!("tcp:{}", port(url)?);
             self.adb(&["reverse", &at, &at]).await?;
@@ -194,6 +200,18 @@ impl Phone {
     pub async fn shell(&self, command: &str) -> anyhow::Result<String> {
         let out = self.adb(&["shell", command]).await?;
         Ok(String::from_utf8_lossy(&out).into_owned())
+    }
+
+    /// Whether the app shows a notification in its channel `channel`.
+    pub async fn notifying(&self, channel: &str) -> anyhow::Result<bool> {
+        let shown = self.shell("dumpsys notification --noredact").await?;
+        let (app, channel) = (
+            format!("pkg={PACKAGE} "),
+            format!("Notification(channel={channel} "),
+        );
+        Ok(shown
+            .lines()
+            .any(|l| l.contains("NotificationRecord(") && l.contains(&app) && l.contains(&channel)))
     }
 
     /// The views on screen.

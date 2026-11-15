@@ -74,4 +74,5 @@ dependencies {
     implementation(libs.coroutines)
     implementation(libs.zxing)
     debugImplementation(libs.compose.tooling)
+    testImplementation(libs.junit)
 }
