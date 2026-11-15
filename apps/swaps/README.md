@@ -69,6 +69,8 @@ source hub with a longer window than the destination's: between hubs of
 equal windows, the provider swaps nothing. It makes no refund request
 itself: a high-priority alert names the provider's lock left neither paid
 nor refunded after it expired, and the height the request must confirm by.
+A hub can provide the swaps into it instead, issuing the provider's lock
+itself, with no such risk: see `licash-hub run --swaps`.
 
 With `--nostr-relay URL --announce-url URL`, the provider announces itself on
 Nostr relays for wallets to discover, under the key `/v1/swaps/info` names.

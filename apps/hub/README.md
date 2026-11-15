@@ -71,6 +71,25 @@ coins, which stay locked while the opening lives. Openings are kept in
 contract protects nothing. Each opening downloads about 100 MB of garbled
 instances to the wallet.
 
+With `--swaps` (and `--chain`), the hub provides the swaps into it from the
+hubs of `--swaps-from URL=CAP`: a wallet locks its notes at such a hub to
+the hub's provider, and the hub locks notes it issues to the wallet under
+the same hash. The wallet reveals the preimage to the hub itself, so the
+provider always learns it in time to claim the wallet's lock. The hub's
+lock expires `--swaps-confirm` (36 by default), `--swaps-margin` and two
+blocks before the wallet's. `--swaps-fee-base`, `--swaps-fee-ppm`,
+`--swaps-min` and `--swaps-max` set the terms. CAP bounds the notes the
+provider holds at that hub, or is owed by the swaps under way: past it,
+swaps from that hub are declined. Caps go by the URL as given, so a wallet
+using another URL of the same hub (an alias, `https`) swaps nothing. The
+hub locks no hash its Lightning receipts or deposits hold. The provider's
+wallet and swaps are kept in `<data>/swaps` (`wallet.sqlite` and
+`swaps.sqlite`, made on the first start): back them up with `hub.sqlite`,
+since an older `swaps.sqlite` loses the claims backing notes the hub
+locked. The hub refuses to start without `--swaps` while swaps are under
+way. To move the provider's notes out, stop the hub and run `licash-wallet
+--wallet <data>/swaps/wallet.sqlite`.
+
 With `--onion`, the hub also serves its API as an onion service of a Tor
 client of its own (Arti), and announces its URL, reaching the relays
 through Tor too. The service's key is in `<data>/tor/state`: back it up to

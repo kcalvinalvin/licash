@@ -20,7 +20,9 @@ research implementation; it has not had a security review.
   payments made and taken, locks, Lightning, swaps, unlinking, silent
   payments found with a light client, and resuming after interruptions.
 - `crates/licash-swaps`: a swap provider over its own wallet: swaps of notes
-  at one hub for notes at another, with a timed lock at each.
+  at one hub for notes at another, with a timed lock at each, either
+  locking its notes at the destination or, run by the destination hub
+  itself, notes the hub issues.
 - `crates/licash-onchain`: Bitcoin outside the protocol: silent payments
   (BIP352), and the hash-locked coins of deposits and payouts.
 - `crates/licash-contract`: the contract's BABE transaction graph, on
