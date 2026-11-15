@@ -3,7 +3,10 @@
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    sync::{atomic::AtomicU32, Arc, Mutex, MutexGuard, PoisonError},
+    sync::{
+        atomic::{AtomicBool, AtomicU32, Ordering},
+        Arc, Mutex, MutexGuard, PoisonError,
+    },
     time::{Duration, Instant},
 };
 
@@ -36,9 +39,9 @@ const SCAN_BATCH: u32 = 144;
 const DAY: i64 = 86_400;
 
 mod contracts;
-mod recoveries;
 mod moves;
 mod payouts;
+mod recoveries;
 
 /// A wallet, kept in a directory of its own.
 #[derive(uniffi::Object)]
@@ -723,6 +726,49 @@ impl Wallet {
     /// the wallet trusts and holds enough at. To the payee's mailbox, or
     /// for them to receive by hand.
     pub fn pay(&self, code: String, amount: Option<u64>) -> Result<Paid, LicashError> {
+        Ok(self.paying(code, amount, true)?.0)
+    }
+
+    /// [`Wallet::pay`], answered once the hub made the payment: sent to the
+    /// payee's mailbox, and its change unlinked, right after, in the
+    /// background. Neither delivered nor to hand over then, on its way to
+    /// the mailbox: kept to send there again on [`Wallet::resume`] if no
+    /// relay took it. Payments wait for it, as for a payment under way.
+    pub fn pay_now(
+        self: Arc<Self>,
+        code: String,
+        amount: Option<u64>,
+    ) -> Result<Paid, LicashError> {
+        let (paid, later) = self.paying(code, amount, false)?;
+        let after = std::thread::Builder::new()
+            .name("licash-paid".into())
+            .spawn(move || {
+                let _delivering = self.delivering();
+                let started = Instant::now();
+                if later {
+                    self.deliver();
+                }
+                self.unlink();
+                tracing::info!(took = ?started.elapsed(), later, "after paying, mailed and unlinked");
+            });
+        if let Err(e) = after {
+            // Sent and unlinked on the next resume.
+            tracing::warn!(%e, "after paying");
+        }
+        Ok(paid)
+    }
+}
+
+impl Wallet {
+    /// [`Wallet::pay`], to the payee's mailbox and its change unlinked
+    /// `now`, else neither, and told whether it is to be sent to the
+    /// mailbox ([`Wallet::deliver`]).
+    fn paying(
+        &self,
+        code: String,
+        amount: Option<u64>,
+        now: bool,
+    ) -> Result<(Paid, bool), LicashError> {
         let text = code.trim().to_owned();
         let code: PaymentCode = text.parse().map_err(LicashError::invalid)?;
         let planned = self
@@ -753,19 +799,27 @@ impl Wallet {
             all.push(delivery.clone());
             deliveries::save(&self.dir, &all).map_err(LicashError::failed)?;
         }
-        let route = self.route.clone();
+        // Not now: the mailbox not reached, the payment kept for it.
+        let later = AtomicBool::new(false);
+        let route = || {
+            if now {
+                return Ok(self.route.clone());
+            }
+            later.store(true, Ordering::Relaxed);
+            Err(anyhow::anyhow!("sent to the mailbox next"))
+        };
         let paid = match &planned {
             Some(plan) => self.runtime.block_on(licash_nostr::wallet::pay_planned(
                 &self.wallet,
                 &code,
                 plan,
-                || Ok(route),
+                route,
             )),
             None => self.runtime.block_on(licash_nostr::wallet::pay(
                 &self.wallet,
                 &code,
                 amount,
-                || Ok(route),
+                route,
             )),
         };
         if let Some(delivery) = &delivery {
@@ -773,24 +827,33 @@ impl Wallet {
         }
         let paid =
             paid.map_err(|e| LicashError::from_any(e, |reason| LicashError::Invalid { reason }))?;
-        // Its change, linked to it until then.
-        let unlinking = std::time::Instant::now();
-        self.unlink();
-        tracing::info!(took = ?unlinking.elapsed(), "unlinked after paying");
+        let later = later.into_inner();
+        if now {
+            // Its change, linked to it until then.
+            let unlinking = Instant::now();
+            self.unlink();
+            tracing::info!(took = ?unlinking.elapsed(), "unlinked after paying");
+        }
         let handover = match paid.delivered {
-            Some(_) => None,
-            None => Some(serde_json::to_string(&paid.paid.payment).map_err(LicashError::failed)?),
+            None if !later => {
+                Some(serde_json::to_string(&paid.paid.payment).map_err(LicashError::failed)?)
+            }
+            _ => None,
         };
-        Ok(Paid {
+        let paid = Paid {
             id: paid.paid.id,
             amount: paid.amount,
             hub: paid.hub,
             delivered: paid.delivered.is_some(),
             handover,
-            undelivered: paid.undelivered,
-        })
+            undelivered: paid.undelivered.filter(|_| !later),
+        };
+        Ok((paid, later))
     }
+}
 
+#[uniffi::export]
+impl Wallet {
     /// Take the payment `payment` handed over: under a hub trusted, or any
     /// if `trust`, which it then is.
     pub fn receive(&self, payment: String, trust: bool) -> Result<Activity, LicashError> {
@@ -1469,7 +1532,12 @@ impl Wallet {
         if all.is_empty() {
             return;
         }
-        let (sends, hubs) = match (self.wallet.sends(), self.wallet.hubs()) {
+        // A payment at a hub visited too: the payee's.
+        let hubs = self.wallet.hubs().and_then(|mut hubs| {
+            hubs.extend(self.wallet.visited()?);
+            Ok(hubs)
+        });
+        let (sends, hubs) = match (self.wallet.sends(), hubs) {
             (Ok(sends), Ok(hubs)) => (sends, hubs),
             (Err(e), _) | (_, Err(e)) => return tracing::warn!(%e, "the payments made"),
         };

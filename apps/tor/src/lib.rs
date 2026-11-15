@@ -243,14 +243,11 @@ impl Tor {
         self.stream(Target::of(&uri)?).await
     }
 
-    /// A stream to `target`, within TLS if it asks: on new circuits next
-    /// time, should this one fail.
+    /// A stream to `target`, within TLS if it asks: on new circuits once
+    /// more should one fail, and next time should that one fail too.
     async fn stream(&self, target: Target) -> Result<Box<dyn Stream>, String> {
-        let opened = self.open(&target).await;
-        if opened.is_err() {
-            self.isolation.renew(&target.host);
-        }
-        opened
+        let renew = || self.isolation.renew(&target.host);
+        twice(|| self.open(&target), renew).await
     }
 
     async fn open(&self, target: &Target) -> Result<Box<dyn Stream>, String> {
@@ -272,6 +269,29 @@ impl Tor {
             .map_err(|e| format!("TLS: {e}"))?;
         Ok(Box::new(stream))
     }
+}
+
+/// What `open` opened, tried once more on new circuits (`renew`) should
+/// it fail: an exit refusing, a name not looked up, a TLS handshake cut
+/// short, a circuit's to blame more often than its host. Nothing was sent
+/// yet: safe to try again. On new circuits again next time, should the
+/// second fail too.
+async fn twice<T, F, O>(mut open: O, renew: impl Fn()) -> Result<T, String>
+where
+    O: FnMut() -> F,
+    F: std::future::Future<Output = Result<T, String>>,
+{
+    let first = match open().await {
+        Ok(opened) => return Ok(opened),
+        Err(first) => first,
+    };
+    renew();
+    tracing::info!(%first, "no stream over Tor: once more, on new circuits");
+    let again = open().await;
+    if again.is_err() {
+        renew();
+    }
+    again
 }
 
 /// How a request over Tor failed ([`Tor::request_opened`]).
@@ -607,6 +627,42 @@ mod tests {
         // A host never reached keeps none: its first stream takes one.
         isolation.renew("other.example");
         assert_eq!(isolation.0.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_stream_failing_is_opened_once_more_on_new_circuits() {
+        use std::cell::Cell;
+        let (opened, renewed) = (Cell::new(0), Cell::new(0));
+        let renew = || renewed.set(renewed.get() + 1);
+        // Failing once: opened the second time, on new circuits.
+        let open = || {
+            opened.set(opened.get() + 1);
+            let n = opened.get();
+            async move {
+                if n == 1 {
+                    Err(format!("failed {n}"))
+                } else {
+                    Ok(n)
+                }
+            }
+        };
+        assert_eq!(twice(open, renew).await, Ok(2));
+        assert_eq!((opened.get(), renewed.get()), (2, 1));
+        // Failing twice: the second failure said, on new circuits next time.
+        let (opened, renewed) = (Cell::new(0), Cell::new(0));
+        let renew = || renewed.set(renewed.get() + 1);
+        let open = || {
+            opened.set(opened.get() + 1);
+            let n = opened.get();
+            async move { Err::<usize, _>(format!("failed {n}")) }
+        };
+        assert_eq!(twice(open, renew).await, Err("failed 2".into()));
+        assert_eq!((opened.get(), renewed.get()), (2, 2));
+        // Opened at once: as it was.
+        let renewed = Cell::new(0);
+        let open = || async { Ok::<_, String>(1) };
+        assert_eq!(twice(open, || renewed.set(1)).await, Ok(1));
+        assert_eq!(renewed.get(), 0);
     }
 
     #[test]

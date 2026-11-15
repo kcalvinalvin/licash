@@ -1253,6 +1253,54 @@ fn a_phone_pays_a_code_as_quoted() {
 }
 
 #[test]
+fn a_phone_paying_now_answers_once_paid_and_mails_it_and_unlinks_after() {
+    let net = Net::new(true);
+    let light = Light::new(&net);
+    let alice = funded(&net, &light, "alice");
+    let held = notes(&alice);
+    let bob = net.wallet("bob", net.height());
+    let hub = bob.hubs().unwrap()[0].url.clone();
+    let asked = bob.payment_code(Some(500)).unwrap();
+
+    // Answered once paid: neither delivered yet nor to hand over.
+    let paid = alice.clone().pay_now(asked.qr, None).unwrap();
+    assert_eq!((paid.amount, &paid.hub), (500, &hub));
+    assert!(!paid.delivered, "{paid:?}");
+    assert_eq!((&paid.handover, &paid.undelivered), (&None, &None));
+    assert_eq!(notes(&alice), held - 501);
+
+    // In Bob's mailbox right after, and Alice's change unlinked.
+    let waited = std::time::Instant::now();
+    let got = loop {
+        let got = bob.collect().unwrap();
+        if !got.is_empty() || waited.elapsed().as_secs() > 30 {
+            break got;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!((got[0].kind, got[0].amount), (Kind::Received, 500));
+    assert_eq!(notes(&bob), 500);
+    let unlinked = |alice: &Wallet| {
+        let sent = alice.notes_of(Kind::Sent, paid.id.clone()).unwrap();
+        !sent.made.is_empty() && sent.made.iter().all(|n| n.linking == Linking::Unlinked)
+    };
+    while !unlinked(&alice) && waited.elapsed().as_secs() <= 30 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(unlinked(&alice));
+    // Mailed once: forgotten, not mailed again.
+    alice.resume().unwrap();
+    let kept = std::fs::read_to_string(format!("{}/deliveries.json", net.dir("alice"))).unwrap();
+    assert_eq!(kept, "[]");
+    let history = alice.history().unwrap();
+    assert_eq!(
+        (history[0].kind, history[0].state),
+        (Kind::Sent, State::Done)
+    );
+}
+
+#[test]
 fn a_phone_shows_the_notes_each_line_of_its_history_spent_and_made() {
     let net = Net::new(true);
     let light = Light::new(&net);
