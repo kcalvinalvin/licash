@@ -106,6 +106,43 @@ impl Wallet {
         Ok(activity(&payout, self.lock_fee(&payout)?))
     }
 
+    /// Pay out as `quote` says, as [`Wallet::pay_out`]; if its provider
+    /// fails before the wallet's notes are locked to it, through the next
+    /// found paying `asked` (all the notes, if none) from the same hub to
+    /// the same address for no more in fees, and so on: never once a lock
+    /// was made, whose notes come back only once it expires.
+    pub fn pay_out_or_another(
+        &self,
+        quote: PayoutQuote,
+        asked: Option<u64>,
+    ) -> Result<Activity, LicashError> {
+        let most = quote.fee;
+        let mut tried = vec![quote.provider.clone()];
+        let mut last = match self.try_pay_out(&quote)? {
+            Ok(paying) => return Ok(paying),
+            Err(e) => e,
+        };
+        let others = self.payout_offers(quote.address.clone(), asked, Some(quote.hub.clone()));
+        let others = match others {
+            Ok(others) => others,
+            Err(e) => {
+                tracing::info!("no other payout offer: {e}");
+                return Err(last);
+            }
+        };
+        for offer in others {
+            if offer.fee > most || tried.contains(&offer.provider) {
+                continue;
+            }
+            tried.push(offer.provider.clone());
+            match self.try_pay_out(&offer)? {
+                Ok(paying) => return Ok(paying),
+                Err(e) => last = e,
+            }
+        }
+        Err(last)
+    }
+
     /// Take the payouts under way on, on `chain`: claim each provider's
     /// coin once confirmed, then broadcast through `chain` the claims of
     /// those not done, again each time, as a claim dropped loses its coin
@@ -303,6 +340,34 @@ impl Wallet {
                 needed: held + 1,
                 available: held,
             }),
+        }
+    }
+
+    /// Paying out as `quote` says: the payout, under way, else why it
+    /// failed with nothing locked, to try another provider. Refused if
+    /// it failed once a lock was made.
+    fn try_pay_out(
+        &self,
+        quote: &PayoutQuote,
+    ) -> Result<Result<Activity, LicashError>, LicashError> {
+        let before: Vec<String> = self.wallet.payouts()?.into_iter().map(|p| p.hash).collect();
+        let e = match self.pay_out(quote.clone()) {
+            Ok(paying) => return Ok(Ok(paying)),
+            Err(e) => e,
+        };
+        // Newest first: the one this attempt recorded, if any.
+        let payouts = self.wallet.payouts()?;
+        match payouts.into_iter().find(|p| !before.contains(&p.hash)) {
+            // Under way: it is followed, never replaced.
+            Some(payout) if matches!(payout.state, PayoutState::Open | PayoutState::Claimed) => {
+                tracing::info!(hash = %payout.hash, "paying out, pending: {e}");
+                Ok(Ok(activity(&payout, self.lock_fee(&payout)?)))
+            }
+            Some(payout) if payout.lock.is_some() => Err(e),
+            _ => {
+                tracing::info!(provider = %quote.provider, "paying out failed, nothing locked: {e}");
+                Ok(Err(e))
+            }
         }
     }
 

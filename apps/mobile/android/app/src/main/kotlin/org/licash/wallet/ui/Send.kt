@@ -211,10 +211,10 @@ fun Send(
         }
     }
 
-    fun payOut(quote: PayoutQuote) {
+    fun payOut(quote: PayoutQuote, asked: ULong?) {
         step = Step.Busy
         scope.launch {
-            step = engine.payOut(quote).fold(
+            step = engine.payOut(quote, asked).fold(
                 { Step.PayingOut(it.amount, quote.depth) },
                 { Step.Failed(explain(it)) },
             )
@@ -336,7 +336,7 @@ fun Send(
                 Step.Quoting -> Middle("Finding a provider to pay it on Bitcoin…")
                 is Step.Invoice -> Invoice(s.quote) { payInvoice(s.text, s.quote.hub) }
                 is Step.Address -> ToAddress(s.address, asking, { asking = it }) { amount -> quote(s.address, amount) }
-                is Step.Payout -> Payout(s.quote, s.quote.address == own, { payOut(s.quote) }) {
+                is Step.Payout -> Payout(s.quote, s.quote.address == own, { payOut(s.quote, s.asked) }) {
                     if (ui.developer) {
                         Providers {
                             engine.payoutOffers(s.quote.address, s.asked, s.quote.hub).map { offers ->

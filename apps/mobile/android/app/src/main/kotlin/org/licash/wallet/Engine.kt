@@ -520,9 +520,13 @@ class Engine(context: Context) {
         moving
     }
 
-    /** Pay out as `quote` says: under way until its claim confirms. */
-    suspend fun payOut(quote: PayoutQuote): Result<Activity> = io {
-        val paying = locked { it.payOut(quote) }
+    /**
+     * Pay out as `quote` says: under way until its claim confirms. If its
+     * provider fails before the notes are locked to it, through another
+     * paying `asked` (all if null) for no more in fees.
+     */
+    suspend fun payOut(quote: PayoutQuote, asked: ULong?): Result<Activity> = io {
+        val paying = locked { it.payOutOrAnother(quote, asked) }
         refresh()
         poke()
         paying
