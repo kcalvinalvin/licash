@@ -30,7 +30,7 @@ use tor_rtcompat::PreferredRuntime;
 pub use serve::Onion;
 
 /// How long a request may take, its circuit included.
-const TIMEOUT: Duration = Duration::from_secs(120);
+pub const TIMEOUT: Duration = Duration::from_secs(120);
 
 /// The most hosts kept apart at once: past it, they start over apart from
 /// those before, as from a fresh client.
@@ -120,6 +120,36 @@ impl Tor {
             .unwrap_or_else(|_| Err(format!("no answer over Tor in {} s", timeout.as_secs())))
     }
 
+    /// [`Tor::request_for`], its stream to open within `open` once the
+    /// client is bootstrapped: told whether it failed before any of it was
+    /// sent, to try another way safely.
+    pub async fn request_opened(
+        &self,
+        url: &str,
+        body: Option<Vec<u8>>,
+        max: usize,
+        open: Duration,
+        timeout: Duration,
+    ) -> Result<(u16, Vec<u8>), Failed> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let (target, request) = prepare(url, body).map_err(Failed::Unsent)?;
+        // A cold start is not the host's slowness: `open` counts after it.
+        tokio::time::timeout_at(deadline, self.client.bootstrap())
+            .await
+            .map_err(|_| Failed::Unsent(format!("no Tor in {} s", timeout.as_secs())))?
+            .map_err(|e| Failed::Unsent(format!("bootstrapping Tor: {e}")))?;
+        let open_by = deadline.min(tokio::time::Instant::now() + open);
+        let opening = tokio::time::timeout_at(open_by, self.stream(target));
+        let stream = opening
+            .await
+            .map_err(|_| Failed::Unsent(format!("no stream over Tor in {} s", open.as_secs())))?
+            .map_err(Failed::Unsent)?;
+        tokio::time::timeout_at(deadline, send(TokioIo::new(stream), request, max))
+            .await
+            .map_err(|_| Failed::Sent(format!("no answer over Tor in {} s", timeout.as_secs())))?
+            .map_err(Failed::Sent)
+    }
+
     async fn exchange(
         &self,
         url: &str,
@@ -156,6 +186,24 @@ impl Tor {
             .await
             .map_err(|e| format!("TLS: {e}"))?;
         Ok(Box::new(stream))
+    }
+}
+
+/// How a request over Tor failed ([`Tor::request_opened`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Failed {
+    /// Before any of it was sent: no stream to its host opened in time, or
+    /// at all, or it was not a URL to ask.
+    Unsent(String),
+    /// Once its stream opened: its host may have had it.
+    Sent(String),
+}
+
+impl std::fmt::Display for Failed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unsent(why) | Self::Sent(why) => f.write_str(why),
+        }
     }
 }
 
