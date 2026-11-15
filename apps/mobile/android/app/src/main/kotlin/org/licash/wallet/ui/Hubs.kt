@@ -35,6 +35,7 @@ import org.licash.wallet.Engine
 import org.licash.wallet.Ui
 import org.licash.wallet.explain
 import org.licash.wallet.digits
+import org.licash.wallet.feeOf
 import org.licash.wallet.sat
 
 /*
@@ -105,7 +106,7 @@ internal fun HubFees(hub: Hub, full: Boolean = false, dismiss: () -> Unit) {
         }
         hub.contracts?.let {
             Group("Protection") {
-                Entry("Price", value = sat(it.price))
+                Entry("Price", value = feeOf(it.price, it.cap))
                 Divider()
                 Entry("Covers up to", value = sat(it.cap))
                 Divider()
