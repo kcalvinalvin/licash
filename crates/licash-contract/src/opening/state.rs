@@ -42,27 +42,30 @@ pub const FORMAT: u16 = 1;
 const HOLDER: u8 = 0;
 const HUB: u8 = 1;
 
-/// How far an opening went, by the last message its holder took.
+/// How far an opening went, by the last message its holder took. Its
+/// value is the byte its state stores ([`FORMAT`] 1): frozen.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(u8)]
 pub enum Phase {
     /// Her Open sent.
-    Started,
+    Started = 0,
     /// Base taken, her keys sent.
-    Termed,
+    Termed = 1,
     /// The hub's commitment taken, her choice sent.
-    Committed,
+    Committed = 2,
     /// The opened instances taken, her kept ones coming in.
-    Opened,
+    Opened = 3,
     /// Her kept instances in, her consent sent.
-    Consented,
+    Consented = 4,
     /// The hub's signatures taken: F hers to sign.
-    Signing,
+    Signing = 5,
     /// F signed whole and sent.
-    Funded,
+    Funded = 6,
 }
 
 impl Phase {
-    const ALL: [Phase; 7] = [
+    /// Every phase, in order: `ALL[p as usize] == p`.
+    pub const ALL: [Phase; 7] = [
         Phase::Started,
         Phase::Termed,
         Phase::Committed,
@@ -329,27 +332,30 @@ impl Holder {
     }
 }
 
-/// How far an opening went, by the last input its hub took.
+/// How far an opening went, by the last input its hub took. Its value is
+/// the byte its state stores ([`FORMAT`] 1): frozen.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(u8)]
 pub enum HubPhase {
     /// Her Open taken, Base sent.
-    Termed,
+    Termed = 0,
     /// Her keys taken: F its to fund.
-    Keyed,
+    Keyed = 1,
     /// F funded and frozen, its commitment sent.
-    Committed,
+    Committed = 2,
     /// Her choice taken, the opened instances and hers sent.
-    Chosen,
+    Chosen = 3,
     /// Her consent taken through its gate: its own inputs of F to sign.
-    Consented,
+    Consented = 4,
     /// F with its own inputs signed taken, its signatures sent.
-    Signed,
+    Signed = 5,
     /// F signed whole taken: its to broadcast.
-    Funded,
+    Funded = 6,
 }
 
 impl HubPhase {
-    const ALL: [HubPhase; 7] = [
+    /// Every phase, in order: `ALL[p as usize] == p`.
+    pub const ALL: [HubPhase; 7] = [
         HubPhase::Termed,
         HubPhase::Keyed,
         HubPhase::Committed,
@@ -559,5 +565,25 @@ impl Hub {
         }
         ensure!(r.0.is_empty(), "bytes past an opening's state");
         Ok(h)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The byte each phase is stored as, frozen with format 1: a state one
+    /// release wrote loads in the next as the same phase.
+    #[test]
+    fn phases_are_stored_as_frozen_bytes() {
+        assert_eq!(FORMAT, 1);
+        let holder = Phase::ALL.map(|p| p as u8);
+        assert_eq!(holder, [0, 1, 2, 3, 4, 5, 6]);
+        assert_eq!(Phase::ALL[5], Phase::Signing);
+        assert_eq!(Phase::ALL[6], Phase::Funded);
+        let hub = HubPhase::ALL.map(|p| p as u8);
+        assert_eq!(hub, [0, 1, 2, 3, 4, 5, 6]);
+        assert_eq!(HubPhase::ALL[5], HubPhase::Signed);
+        assert_eq!(HubPhase::ALL[6], HubPhase::Funded);
     }
 }

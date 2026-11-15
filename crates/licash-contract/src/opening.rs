@@ -96,6 +96,32 @@ pub struct Trust {
     pub mock: bool,
 }
 
+impl Trust {
+    /// The insecure mock authority, for regtest only: anyone "proves"
+    /// anything under it, and the programs it names are placeholders.
+    /// Both parties of an opening under it say so.
+    pub fn mock() -> Self {
+        Self {
+            programs: Programs {
+                holder: [11; 32],
+                counter: [13; 32],
+            },
+            statement: mock_statement,
+            mock: true,
+        }
+    }
+}
+
+/// The statement instances are garbled under with the mock proof system:
+/// Lichen's mock key and the journal's public inputs.
+fn mock_statement(journal: &Journal) -> Statement {
+    let mock = lichen_babe::statement::Kind::Mock;
+    Statement {
+        vk: mock.verifying_key(),
+        public: mock.public_inputs(&journal.to_bytes()),
+    }
+}
+
 /// What a step is judged against: the party's own chain tip and trust.
 #[derive(Clone, Copy)]
 pub struct Context {
