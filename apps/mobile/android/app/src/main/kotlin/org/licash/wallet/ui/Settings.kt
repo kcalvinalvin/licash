@@ -20,12 +20,12 @@ import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
+import androidx.compose.material.icons.automirrored.filled.List
 import androidx.compose.material.icons.filled.Build
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.Lock
-import androidx.compose.material.icons.filled.Phone
 import androidx.compose.material.icons.filled.Place
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Share
@@ -68,8 +68,9 @@ import org.licash.wallet.Engine
 import org.licash.wallet.Storage
 import org.licash.wallet.Ui
 import org.licash.wallet.explain
-import org.licash.wallet.host
 import org.licash.wallet.exportLogs
+import org.licash.wallet.host
+import org.licash.wallet.percent
 import org.licash.wallet.sat
 import org.licash.wallet.storage
 
@@ -116,9 +117,9 @@ fun Settings(engine: Engine, ui: Ui, balance: () -> Unit, back: () -> Unit) {
                         Group("Following Bitcoin") { Status(ui) }
                         if (ui.developer) Group("Light client") { LightClient(engine, ui) }
                     }
-                    Page.Privacy -> Group("Privacy") { Privacy(engine, ui) }
+                    Page.Privacy -> Group("") { Privacy(engine, ui) }
                     Page.Storage -> Group("Kept on this phone") { StorageUsed(ui.developer) }
-                    Page.Advanced -> Group("Advanced") { Advanced(engine, balance) }
+                    Page.Advanced -> Group("") { Advanced(engine, balance) }
                 }
             }
         }
@@ -144,7 +145,7 @@ private fun Overview(engine: Engine, ui: Ui, open: (Page) -> Unit) {
         Action("Privacy", if (ui.tor) "Through Tor" else "Tor off", Icons.Filled.Lock) { open(Page.Privacy) }
     }
     Group("App") {
-        Action("Storage", "What the app keeps on this phone", Icons.Filled.Phone) { open(Page.Storage) }
+        Action("Storage", "What the app keeps on this phone", Icons.AutoMirrored.Filled.List) { open(Page.Storage) }
         Divider()
         Action("Export logs", "Share what the app did, to report a problem.", Icons.Filled.Share) {
             exporting = null
@@ -245,7 +246,7 @@ private fun HubRow(hub: Hub) {
     }
     Row(Modifier.fillMaxWidth().clickable { open = !open }.padding(vertical = 12.dp)) {
         Column(Modifier.weight(1f)) {
-            Text(hub.url, style = MaterialTheme.typography.bodyLarge, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Text(host(hub.url), style = MaterialTheme.typography.bodyLarge, maxLines = 1, overflow = TextOverflow.Ellipsis)
             Spacer(Modifier.height(2.dp))
             Text(
                 can.joinToString(" · "),
@@ -304,14 +305,15 @@ private fun FeeLine(what: String, rate: Rate, how: String) {
 private fun rate(rate: Rate): String = when {
     rate.base == 0uL && rate.ppm == 0uL -> "None"
     rate.ppm == 0uL -> sat(rate.base)
-    rate.base == 0uL -> "${rate.ppm} ppm"
-    else -> "${sat(rate.base)} + ${rate.ppm} ppm"
+    rate.base == 0uL -> percent(rate.ppm)
+    else -> "${sat(rate.base)} + ${percent(rate.ppm)}"
 }
 
 private fun fee(hub: Hub): String = when {
     hub.feeBase == 0uL && hub.feePpm == 0uL -> "No fee"
     hub.feePpm == 0uL -> "Fee ${sat(hub.feeBase)}"
-    else -> "Fee ${sat(hub.feeBase)} + ${hub.feePpm} ppm"
+    hub.feeBase == 0uL -> "Fee ${percent(hub.feePpm)}"
+    else -> "Fee ${sat(hub.feeBase)} + ${percent(hub.feePpm)}"
 }
 
 @Composable

@@ -221,11 +221,25 @@ fun Send(engine: Engine, ui: Ui, link: String?, cashOut: String? = null, back: (
                 Step.Looking -> {
                     if (cashOut != null) {
                         Text(
-                            "All you hold at ${host(cashOut)}, paid out on Bitcoin: to this wallet, or to the address you scan or paste.",
+                            "All you hold at ${host(cashOut)}, paid out on Bitcoin: to this wallet, " +
+                                "kept there as your own, or to an address you scan or paste.",
                             style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
-                        Spacer(Modifier.height(12.dp))
+                        Spacer(Modifier.height(16.dp))
+                        BigButton("To this wallet", Modifier.fillMaxWidth()) {
+                            scope.launch {
+                                engine.bitcoinAddress().fold(
+                                    { own = it; quote(it, null) },
+                                    { step = Step.Failed(explain(it)) },
+                                )
+                            }
+                        }
+                        Text(
+                            "Or to another address",
+                            modifier = Modifier.fillMaxWidth().padding(top = 20.dp, bottom = 8.dp),
+                            style = MaterialTheme.typography.titleSmall,
+                        )
                     }
                     Scanner(Modifier.fillMaxWidth().aspectRatio(1f).clip(RoundedCornerShape(24.dp))) { read(it) }
                     Spacer(Modifier.height(16.dp))
@@ -240,19 +254,15 @@ fun Send(engine: Engine, ui: Ui, link: String?, cashOut: String? = null, back: (
                         },
                         modifier = Modifier.fillMaxWidth().height(56.dp),
                     ) { Text("Paste") }
-                    if (cashOut != null) {
+                    if (cashOut == null && !empty) {
                         Spacer(Modifier.height(8.dp))
-                        OutlinedButton(
-                            onClick = {
-                                scope.launch {
-                                    engine.bitcoinAddress().fold(
-                                        { own = it; quote(it, null) },
-                                        { step = Step.Failed(explain(it)) },
-                                    )
-                                }
-                            },
-                            modifier = Modifier.fillMaxWidth().height(56.dp),
-                        ) { Text("To this wallet") }
+                        Text(
+                            "Scan or paste a payment code, a Bitcoin address or a Lightning invoice.",
+                            modifier = Modifier.fillMaxWidth(),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            textAlign = TextAlign.Center,
+                        )
                     }
                     if (empty) {
                         Spacer(Modifier.height(8.dp))

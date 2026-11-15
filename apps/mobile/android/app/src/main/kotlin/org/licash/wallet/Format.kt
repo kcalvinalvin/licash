@@ -22,9 +22,25 @@ val Balance.total: ULong get() = notes + notesPending + onchain + moving
  */
 val Balance.credit: ULong get() = notes + notesPending
 
-/** [credit] as a share of [total], in whole percent: 0 if nothing is held. */
+/**
+ * [credit] as a share of [total], in whole percent: 0 if nothing is held.
+ * Never 0 with some on credit, nor 100 with some protected.
+ */
 val Balance.creditPercent: Int
-    get() = if (total == 0uL) 0 else ((credit.toDouble() * 100 / total.toDouble()) + 0.5).toInt()
+    get() {
+        if (total == 0uL) return 0
+        val rounded = ((credit.toDouble() * 100 / total.toDouble()) + 0.5).toInt()
+        return when {
+            credit > 0uL && rounded == 0 -> 1
+            credit < total && rounded == 100 -> 99
+            else -> rounded
+        }
+    }
+
+/** `ppm` millionths as a percentage: `0.5%`. */
+fun percent(ppm: ULong): String =
+    java.text.DecimalFormat("0.####", java.text.DecimalFormatSymbols(Locale.US))
+        .format(ppm.toDouble() / 10_000) + "%"
 
 /** What went wrong, for the user. */
 fun explain(e: Throwable): String = when (e) {
@@ -42,8 +58,15 @@ fun explain(e: Throwable): String = when (e) {
 
 private fun sentence(text: String): String = text.replaceFirstChar { it.uppercase() }
 
-/** The host of a hub's `url`, to name it short. */
-fun host(url: String): String = runCatching { java.net.URI(url).host }.getOrNull() ?: url
+/**
+ * The host of a hub's `url`, to name it short: with its port if it names
+ * one, as hubs sharing a host do.
+ */
+fun host(url: String): String = runCatching {
+    val uri = java.net.URI(url)
+    val host = uri.host ?: return@runCatching null
+    if (uri.port == -1) host else "$host:${uri.port}"
+}.getOrNull() ?: url
 
 /** When, from seconds since 1970. */
 fun at(seconds: Long): String =

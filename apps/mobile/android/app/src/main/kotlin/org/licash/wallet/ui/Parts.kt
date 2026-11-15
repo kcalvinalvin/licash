@@ -72,12 +72,15 @@ fun TopBar(title: String, back: () -> Unit) {
 @Composable
 fun Group(title: String, content: @Composable ColumnScope.() -> Unit) {
     Spacer(Modifier.height(20.dp))
-    Text(
-        title,
-        modifier = Modifier.padding(start = 4.dp, bottom = 8.dp),
-        style = MaterialTheme.typography.labelLarge,
-        color = MaterialTheme.colorScheme.primary,
-    )
+    // Untitled on a page of its own, the page's title saying it.
+    if (title.isNotEmpty()) {
+        Text(
+            title,
+            modifier = Modifier.padding(start = 4.dp, bottom = 8.dp),
+            style = MaterialTheme.typography.labelLarge,
+            color = MaterialTheme.colorScheme.primary,
+        )
+    }
     Surface(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(20.dp),

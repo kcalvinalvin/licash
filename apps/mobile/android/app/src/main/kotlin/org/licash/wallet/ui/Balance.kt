@@ -112,9 +112,10 @@ fun BalanceDetails(engine: Engine, ui: Ui, cashOut: (String) -> Unit, back: () -
         Group("On Bitcoin") {
             val toMove = b.onchain - b.kept
             if (b.kept > 0uL) Amount("Cashed out, kept on Bitcoin", b.kept)
-            if (toMove > 0uL || b.kept == 0uL) Amount("Confirmed, moved in once enough", toMove)
+            if (toMove > 0uL) Amount("Confirmed, moved in once enough", toMove)
             if (b.moving > 0uL) Amount("Moving into Licash", b.moving)
             if (coming > 0uL) Amount("Coming, waiting for a block", coming)
+            if (b.onchain == 0uL && b.moving == 0uL && coming == 0uL) Amount("Nothing now", null)
             if (b.kept > 0uL && b.moving == 0uL) {
                 TextButton(
                     onClick = {
