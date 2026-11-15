@@ -50,6 +50,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
@@ -58,6 +59,7 @@ import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import org.licash.core.FoundHub
 import org.licash.core.Hub
 import org.licash.core.Rate
 import org.licash.wallet.AppLog
@@ -108,6 +110,7 @@ fun Settings(engine: Engine, ui: Ui, balance: () -> Unit, back: () -> Unit) {
                             if (ui.hubs.isNotEmpty()) Divider()
                             AddHub(engine)
                         }
+                        if (ui.hubs.isNotEmpty()) Group("Other hubs") { FindHubs(engine, ui) }
                     }
                     Page.Bitcoin -> {
                         Group("Following Bitcoin") { Status(ui) }
@@ -343,6 +346,79 @@ private fun AddHub(engine: Engine) {
         FilledTonalButton(enabled = url.isNotBlank() && !adding, onClick = ::add) { Text("Add") }
     }
     error?.let { Note(it, error = true) }
+}
+
+/**
+ * The hubs announced on Nostr, on the relays the hubs used name: each
+ * added with a tap, once the owner says she trusts it.
+ */
+@Composable
+private fun FindHubs(engine: Engine, ui: Ui) {
+    val scope = rememberCoroutineScope()
+    var found by remember { mutableStateOf<List<FoundHub>?>(null) }
+    var looking by remember { mutableStateOf(false) }
+    var error by remember { mutableStateOf<String?>(null) }
+    var adding by remember { mutableStateOf<FoundHub?>(null) }
+    fun look() {
+        looking = true
+        error = null
+        scope.launch {
+            engine.discoverHubs()
+                .onSuccess { found = it }
+                .onFailure { error = explain(it) }
+            looking = false
+        }
+    }
+    // Those added since looking drop out.
+    val shown = found?.filter { f -> ui.hubs.none { it.url == f.hub.url } }
+    Note("Hubs announce themselves on the relays your hubs name. Find them there, and add one without typing its address.")
+    shown?.let { list ->
+        if (list.isEmpty()) Note("No other hub announced there for now.")
+        list.forEachIndexed { i, f ->
+            if (i > 0) Divider()
+            Row(Modifier.fillMaxWidth().padding(vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text(f.name ?: host(f.hub.url), style = MaterialTheme.typography.bodyLarge, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    Text(
+                        listOfNotNull(
+                            host(f.hub.url),
+                            fee(f.hub),
+                            f.hub.lightning?.let { "Lightning" },
+                            f.hub.deposits?.let { "takes Bitcoin" },
+                        ).joinToString(" · "),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                TextButton(onClick = { adding = f }, modifier = Modifier.testTag("add-found")) { Text("Add") }
+            }
+        }
+    }
+    error?.let { Note(it, error = true) }
+    FilledTonalButton(
+        enabled = !looking,
+        onClick = ::look,
+        modifier = Modifier.padding(vertical = 8.dp),
+    ) { Text(if (looking) "Looking…" else if (found == null) "Find hubs" else "Look again") }
+    adding?.let { f ->
+        AlertDialog(
+            onDismissRequest = { adding = null },
+            title = { Text("Add this hub?") },
+            text = {
+                Text(
+                    "${f.name?.let { "$it\n" } ?: ""}${f.hub.url}\n\nYou will hold notes there and be paid there, " +
+                        "as at your other hubs. Add it only if you trust who runs it.",
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    adding = null
+                    scope.launch { engine.addHub(f.hub.url).onFailure { error = explain(it) } }
+                }) { Text("Add") }
+            },
+            dismissButton = { TextButton(onClick = { adding = null }) { Text("Cancel") } },
+        )
+    }
 }
 
 @Composable

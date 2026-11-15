@@ -37,6 +37,7 @@ import org.licash.core.Notes
 import org.licash.core.Paid
 import org.licash.core.PayQuote
 import org.licash.core.PayoutQuote
+import org.licash.core.FoundHub
 import org.licash.core.Scanned
 import org.licash.core.State
 import org.licash.core.Wallet
@@ -465,6 +466,9 @@ class Engine(context: Context) {
         poke()
         paying
     }
+
+    /** The hubs announced on the relays its hubs name, not used yet. */
+    suspend fun discoverHubs(): Result<List<FoundHub>> = io { local { it.discoverHubs() } }
 
     /** What the wallet holds at each hub it trusts. */
     suspend fun holdings(): Result<List<Holding>> = io { local { it.holdings() } }
