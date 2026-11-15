@@ -2,7 +2,7 @@
 
 use std::{
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, MutexGuard, PoisonError},
+    sync::{atomic::AtomicU32, Arc, Mutex, MutexGuard, PoisonError},
 };
 
 use bitcoin::{FeeRate, OutPoint};
@@ -18,9 +18,9 @@ use serde::{Deserialize, Serialize};
 use crate::{
     chain::Chain,
     deliveries::{self, Delivery},
-    Activity, Balance, ChainError, ChainSource, Code, Details, FoundHub, Holding, Hub,
-    InvoiceQuote, Kind, LicashError, LightningInvoice, LightningTerms, Network, Notes, Onchain,
-    Paid, PayOffer, PayQuote, Range, Rate, Scan, Scanned, State,
+    Activity, Balance, ChainError, ChainSource, Code, ContractTerms, Details, FoundHub, Holding,
+    Hub, InvoiceQuote, Kind, LicashError, LightningInvoice, LightningTerms, Network, Notes,
+    Onchain, Paid, PayOffer, PayQuote, Range, Rate, Scan, Scanned, State,
 };
 
 /// The rate deposits are paid at, in sat/vB: above what nodes relay.
@@ -32,6 +32,7 @@ const SCAN_BATCH: u32 = 144;
 /// A day, in seconds.
 const DAY: i64 = 86_400;
 
+mod contracts;
 mod payouts;
 
 /// A wallet, kept in a directory of its own.
@@ -48,6 +49,11 @@ pub struct Wallet {
     /// The plan of the last [`Wallet::pay_quote`], for [`Wallet::pay`]:
     /// for the code, by its text, and the amount it pays.
     planned: Mutex<Option<(String, licash_nostr::wallet::Plan)>>,
+    /// The chain's height as last seen: 0 until seen.
+    tip: AtomicU32,
+    /// Held while opening contracts or carrying them on: one driver to
+    /// each.
+    contracting: Mutex<()>,
 }
 
 /// What the app keeps of a wallet besides the SDK's file.
@@ -152,6 +158,8 @@ impl Wallet {
             dir,
             delivering: Mutex::new(()),
             planned: Mutex::new(None),
+            tip: AtomicU32::new(0),
+            contracting: Mutex::new(()),
         }))
     }
 
@@ -225,18 +233,24 @@ impl Wallet {
 
     pub fn balance(&self) -> Result<Balance, LicashError> {
         let mut balance = Balance::default();
-        for held in self.wallet.balance()? {
-            balance.notes += held.available;
-            balance.notes_pending += held.pending;
+        let held = self.wallet.balance()?;
+        for at in &held {
+            balance.notes += at.available;
+            balance.notes_pending += at.pending;
         }
+        let mut reserved = Vec::new();
         for coin in self.wallet.silent_coins()? {
             match coin.spending {
-                Some(_) => balance.moving += coin.value,
+                Some(by) => {
+                    balance.moving += coin.value;
+                    reserved.push((by, coin.value));
+                }
                 None => balance.onchain += coin.value,
             }
         }
         balance.moving += self.confirmed_moves()?;
         balance.kept = self.kept_coins()?.iter().map(|(_, value)| value).sum();
+        self.contracted(&mut balance, &held, &reserved)?;
         Ok(balance)
     }
 
@@ -810,7 +824,7 @@ impl Wallet {
                 from
             }
         };
-        let source = Chain(chain.clone());
+        let source = Chain(chain.clone(), self.wallet.network());
         let mut failed = None;
         let mut scanned = None;
         // Any hub serving the blocks: their tweaks are the chain's.
@@ -839,6 +853,7 @@ impl Wallet {
                 self.runtime.block_on(scan)?
             }
         };
+        self.saw(scanned.height);
         if scanned.next > scanned.height {
             self.broadcast_again(chain.as_ref());
         }
@@ -887,14 +902,15 @@ impl Wallet {
     /// The coins the wallet's own payouts paid, cashed out to it
     /// ([`Balance::kept`]), stay on Bitcoin.
     pub fn move_to_licash(&self, chain: Arc<dyn ChainSource>) -> Result<Activity, LicashError> {
-        let keep: Vec<OutPoint> = self.kept_coins()?.into_iter().map(|(c, _)| c).collect();
+        let mut keep: Vec<OutPoint> = self.kept_coins()?.into_iter().map(|(c, _)| c).collect();
+        keep.extend(self.opening_coins()?);
         self.move_keeping(chain, &keep)
     }
 
     /// [`Wallet::move_to_licash`] of all the coins, those cashed out to the
-    /// wallet too.
+    /// wallet too: but those paying for contracts being opened.
     pub fn move_all_to_licash(&self, chain: Arc<dyn ChainSource>) -> Result<Activity, LicashError> {
-        self.move_keeping(chain, &[])
+        self.move_keeping(chain, &self.opening_coins()?)
     }
 }
 
@@ -925,18 +941,20 @@ impl Wallet {
     /// The coins not spent that the claims of the wallet's payouts paid,
     /// with their values: cashed out to the wallet itself.
     fn kept_coins(&self) -> Result<Vec<(OutPoint, u64)>, LicashError> {
-        let claims: Vec<bitcoin::Txid> = self
+        let mut paid: Vec<bitcoin::Txid> = self
             .wallet
             .payouts()?
             .into_iter()
             .filter_map(|p| p.claim)
             .collect();
-        if claims.is_empty() {
+        // A contract's change too: it was paid from a coin kept, as a rule.
+        paid.extend(self.fundings()?);
+        if paid.is_empty() {
             return Ok(Vec::new());
         }
         let coins = self.wallet.silent_coins()?.into_iter();
         Ok(coins
-            .filter(|c| c.spending.is_none() && claims.contains(&c.outpoint.txid))
+            .filter(|c| c.spending.is_none() && paid.contains(&c.outpoint.txid))
             .map(|c| (c.outpoint, c.value))
             .collect())
     }
@@ -1301,6 +1319,12 @@ fn hub(url: &str, info: &licash_api::Info) -> Hub {
                 min: l.min_receive,
                 max: l.max_receive,
             },
+        }),
+        contracts: info.contracts.map(|c| ContractTerms {
+            cap: u64::from(c.cap),
+            price: c.price,
+            blocks: c.blocks,
+            mock: c.mock,
         }),
     }
 }

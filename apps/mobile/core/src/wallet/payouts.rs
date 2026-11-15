@@ -108,9 +108,10 @@ impl Wallet {
     /// those not done, again each time, as a claim dropped loses its coin
     /// once it times out. Whether any is under way still.
     pub fn follow_payouts(&self, chain: Arc<dyn ChainSource>) -> Result<bool, LicashError> {
-        let followed = self
-            .runtime
-            .block_on(self.wallet.follow_payouts(&Chain(chain.clone())));
+        let followed = self.runtime.block_on(
+            self.wallet
+                .follow_payouts(&Chain(chain.clone(), self.wallet.network())),
+        );
         // Whatever the follow made, even if it failed after.
         for claim in self.wallet.payout_claims()? {
             if let Err(e) = chain.broadcast(bitcoin::consensus::serialize(&claim)) {

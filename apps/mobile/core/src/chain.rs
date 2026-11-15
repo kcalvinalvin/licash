@@ -2,7 +2,9 @@
 
 use std::{future::Future, sync::Arc};
 
-use bitcoin::{hashes::Hash, Block, BlockHash};
+use bitcoin::{consensus::serialize, hashes::Hash, Block, BlockHash, Transaction};
+use licash::{chain::Checkpoint, spend::ChainProfile};
+use licash_wallet::Blocks as _;
 
 /// Bitcoin as the app's light client sees it: on Android, the Go module
 /// `org.licash.chain`. Hashes are 32 bytes in Bitcoin's internal order,
@@ -43,9 +45,17 @@ impl From<uniffi::UnexpectedUniFFICallbackError> for ChainError {
     }
 }
 
-/// A [`ChainSource`] as the wallet's [`licash_wallet::Blocks`], each call
+/// A [`ChainSource`] of the chain of a profile as the wallet's
+/// [`licash_wallet::Blocks`], and as a contract holder's chain, each call
 /// on a thread that may block.
-pub(crate) struct Chain(pub Arc<dyn ChainSource>);
+pub(crate) struct Chain(pub Arc<dyn ChainSource>, pub ChainProfile);
+
+impl Chain {
+    async fn time(&self, height: u32) -> Result<u32, String> {
+        let time = blocking(&self.0, move |c| c.time(height)).await?;
+        u32::try_from(time).map_err(|_| format!("block {height} at time {time}"))
+    }
+}
 
 async fn blocking<R: Send + 'static>(
     source: &Arc<dyn ChainSource>,
@@ -95,5 +105,34 @@ impl licash_wallet::Blocks for Chain {
             }
             Ok(block)
         }
+    }
+}
+
+impl licash_contracts::holder::Chain for Chain {
+    /// From the light client's headers: the block at `height`, fetched
+    /// whole for its header, and the times of the eleven to it and of the
+    /// first of its retarget period.
+    async fn checkpoint(&self, height: u32) -> Result<Checkpoint, String> {
+        let hash = self.hash(height).await?;
+        let header = self.block(&hash).await?.header;
+        let mut times = Vec::new();
+        for at in height.saturating_sub(10)..=height {
+            times.push(self.time(at).await?);
+        }
+        let period_start = match self.1.retarget_interval() {
+            Some(interval) => Some(self.time(height - height % interval).await?),
+            None => None,
+        };
+        if self.hash(height).await? != hash {
+            return Err("the chain changed while its checkpoint was read: try again".into());
+        }
+        let bytes = serialize(&header).try_into().expect("a header is 80 bytes");
+        Checkpoint::new(self.1, height, bytes, times, period_start)
+            .map_err(|e| format!("the checkpoint at block {height}: {e}"))
+    }
+
+    async fn broadcast(&self, tx: &Transaction) -> Result<(), String> {
+        let tx = serialize(tx);
+        blocking(&self.0, move |c| c.broadcast(tx)).await
     }
 }

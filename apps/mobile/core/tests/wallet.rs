@@ -1571,3 +1571,26 @@ fn a_phone_shows_what_a_move_cost_and_how_deep_its_payment_is() {
     assert!(invalid(alice.details(Kind::Onchain, "no".into())).contains("nothing"));
     assert!(invalid(alice.details(Kind::Sent, "no".into())).contains("nothing"));
 }
+
+#[test]
+fn a_phone_whose_hub_opens_no_contracts_has_none_and_keeps_no_file_for_them() {
+    let net = Net::new(true);
+    let light = Light::new(&net);
+    let alice = funded(&net, &light, "alice");
+    let hub = alice.hubs().unwrap().remove(0);
+    assert_eq!(hub.contracts, None);
+    assert!(alice.contracts().unwrap().is_empty());
+    assert!(alice.resume_contracts(light.clone()).unwrap().is_empty());
+    let balance = alice.balance().unwrap();
+    assert_eq!((balance.covered, balance.opening), (0, 0));
+    // Asked anyway: refused, and nothing kept.
+    let quoted = invalid(alice.contract_quote(hub.url.clone()));
+    assert!(quoted.contains("opens no contracts"), "{quoted}");
+    let opened = invalid(alice.open_contract(light.clone(), hub.url, None, None));
+    assert!(opened.contains("opens no contracts"), "{opened}");
+    let other = invalid(alice.contract_quote("https://other.example".into()));
+    assert!(other.contains("no hub you use"), "{other}");
+    let dir = std::path::Path::new(&net.dir("alice")).to_owned();
+    assert!(dir.join("wallet.sqlite").exists());
+    assert!(!dir.join("contracts.sqlite").exists() && !dir.join("contracts").exists());
+}

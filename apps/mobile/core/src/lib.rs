@@ -147,6 +147,24 @@ pub struct Hub {
     pub deposit_fee: Option<Rate>,
     /// Paying and being paid over Lightning, if it does.
     pub lightning: Option<LightningTerms>,
+    /// The recovery contracts it opens now, if it does.
+    pub contracts: Option<ContractTerms>,
+}
+
+/// The recovery contracts a hub opens, as its info says. A contract locks
+/// the hub's collateral on Bitcoin behind the wallet's notes there, up to
+/// `cap`: if the hub fails them, the wallet recovers them from it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct ContractTerms {
+    /// The most of the notes at the hub one protects, in sat.
+    pub cap: u64,
+    /// What opening one costs, in sat, paid from a coin on Bitcoin.
+    pub price: u64,
+    /// Blocks from opening one to its close, at most.
+    pub blocks: u32,
+    /// Under the mock authority, for regtest only: such a contract
+    /// protects nothing.
+    pub mock: bool,
 }
 
 /// A fee, in sat: `base` plus `ppm` millionths of what it is on.
@@ -193,9 +211,81 @@ pub struct Balance {
     pub onchain: u64,
     /// Paid on Bitcoin and being moved to notes.
     pub moving: u64,
-    /// Of `onchain`, what the wallet's own payouts paid it: cashed out to
-    /// the wallet, and not moved back to notes unless asked.
+    /// Of `onchain`, what the wallet's own payouts paid it, and the change
+    /// of its contracts' funding: cashed out to the wallet, and not moved
+    /// back to notes unless asked.
     pub kept: u64,
+    /// On Bitcoin, in the funding of contracts being opened: what comes
+    /// back to the wallet once it confirms, their price paid.
+    pub opening: u64,
+    /// Of `notes` and `notes_pending`, what contracts protect: at each
+    /// hub, up to the caps of those live there. The rest is on credit.
+    pub covered: u64,
+}
+
+/// A recovery contract with a hub, as the wallet keeps it.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct Contract {
+    /// Its id, in hex.
+    pub id: String,
+    pub hub: String,
+    pub state: ContractState,
+    /// Under the mock authority, for regtest only: it protects nothing.
+    pub mock: bool,
+    /// The most of the notes at its hub it protects, in sat.
+    pub cap: u64,
+    /// What opening it cost, in sat, from the coin it was paid from.
+    pub price: u64,
+    /// That coin's value, in sat: the rest came back as change.
+    pub paid_from: u64,
+    /// The block from which it protects nothing: the last a recovery
+    /// can start by.
+    pub protects_until: u32,
+    /// The block from which its collateral returns to the hub: closed.
+    pub closes_at: u32,
+    /// The transaction funding it, once known, its id in hex.
+    pub funding: Option<String>,
+    /// When it was asked for, in seconds since the Unix epoch.
+    pub created_at: i64,
+}
+
+/// Where a contract stands.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum ContractState {
+    /// Being opened with its hub.
+    Opening,
+    /// Signed and broadcast, its funding not confirmed yet.
+    Confirming,
+    /// Protecting the notes at its hub, up to its cap.
+    Protecting,
+    /// Past [`Contract::protects_until`]: protecting nothing, its
+    /// collateral back to its hub at its close.
+    Ending,
+    /// Closed: its collateral back to its hub.
+    Closed,
+    /// Never opened, so nothing paid: `reason`.
+    Failed { reason: String },
+}
+
+/// What opening a contract at a hub costs now, and what pays it.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct ContractQuote {
+    pub hub: String,
+    /// In sat, from one coin of the wallet's on Bitcoin.
+    pub price: u64,
+    /// The most of the notes at the hub it protects, in sat.
+    pub cap: u64,
+    /// Blocks from now to its close.
+    pub blocks: u32,
+    /// Blocks from now it protects for: until its last block to recover in.
+    pub protects_for: u32,
+    /// Under the mock authority, for regtest only: it protects nothing.
+    pub mock: bool,
+    /// The value of the coin that would pay it, if one does: the rest
+    /// comes back as change.
+    pub coin: Option<u64>,
+    /// What opening it downloads and keeps, in bytes, about.
+    pub download: u64,
 }
 
 /// What the wallet holds at one hub it trusts, in sat.
