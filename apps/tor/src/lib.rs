@@ -8,9 +8,14 @@
 
 mod serve;
 
-use std::{path::Path, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    path::Path,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
-use arti_client::{config::TorClientConfigBuilder, TorClient};
+use arti_client::{config::TorClientConfigBuilder, IsolationToken, StreamPrefs, TorClient};
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::{
     body::Bytes,
@@ -27,11 +32,42 @@ pub use serve::Onion;
 /// How long a request may take, its circuit included.
 const TIMEOUT: Duration = Duration::from_secs(120);
 
+/// The most hosts kept apart at once: past it, they start over apart from
+/// those before, as from a fresh client.
+const MAX_ISOLATED: usize = 1024;
+
 /// A Tor client, shared by its clones.
 #[derive(Clone)]
 pub struct Tor {
     client: Arc<TorClient<PreferredRuntime>>,
     tls: TlsConnector,
+    isolation: Arc<Isolation>,
+}
+
+/// Which circuits streams may share: those to the same host only, so that
+/// no exit or onion service sees two of them on one circuit, and no host
+/// learns which others the application reaches.
+#[derive(Default)]
+struct Isolation(Mutex<HashMap<String, IsolationToken>>);
+
+impl Isolation {
+    /// What streams to `host` share their circuits with.
+    fn of(&self, host: &str) -> IsolationToken {
+        let mut hosts = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if hosts.len() >= MAX_ISOLATED && !hosts.contains_key(&host.to_ascii_lowercase()) {
+            hosts.clear();
+        }
+        *hosts
+            .entry(host.to_ascii_lowercase())
+            .or_insert_with(IsolationToken::new)
+    }
+
+    /// Stream preferences keeping streams to `host` to their own circuits.
+    fn prefs(&self, host: &str) -> StreamPrefs {
+        let mut prefs = StreamPrefs::new();
+        prefs.set_isolation(self.of(host));
+        prefs
+    }
 }
 
 impl Tor {
@@ -55,6 +91,7 @@ impl Tor {
         Ok(Self {
             client,
             tls: TlsConnector::from(Arc::new(tls)),
+            isolation: Arc::default(),
         })
     }
 
@@ -102,9 +139,10 @@ impl Tor {
     }
 
     async fn stream(&self, target: Target) -> Result<Box<dyn Stream>, String> {
+        let prefs = self.isolation.prefs(&target.host);
         let stream = self
             .client
-            .connect((target.host.as_str(), target.port))
+            .connect_with_prefs((target.host.as_str(), target.port), &prefs)
             .await
             .map_err(|e| format!("over Tor: {e}"))?;
         if !target.tls {
@@ -265,6 +303,30 @@ mod tests {
         assert_eq!(at("https://relay.example"), Ok(target(relay, 443, true)));
         assert!(at("ftp://relay.example").is_err());
         assert!(at("/v1/info").is_err());
+    }
+
+    #[test]
+    fn streams_share_circuits_only_with_those_to_the_same_host() {
+        let isolation = Isolation::default();
+        let hub = isolation.of("hub.example");
+        assert_eq!(isolation.of("HUB.example"), hub);
+        assert_ne!(isolation.of("relay.example"), hub);
+        assert_ne!(isolation.of("relay.example"), isolation.of("other.example"));
+        assert_eq!(isolation.of("hub.example"), hub);
+    }
+
+    #[test]
+    fn hosts_past_the_most_kept_start_over_apart() {
+        let isolation = Isolation::default();
+        let first = isolation.of("host0.example");
+        for i in 1..MAX_ISOLATED {
+            isolation.of(&format!("host{i}.example"));
+        }
+        assert_eq!(isolation.of("host0.example"), first);
+        let next = isolation.of("one-more.example");
+        assert_eq!(isolation.0.lock().unwrap().len(), 1);
+        assert_eq!(isolation.of("one-more.example"), next);
+        assert_ne!(isolation.of("host0.example"), first);
     }
 
     /// The Tor Project's check that a request came over Tor.
