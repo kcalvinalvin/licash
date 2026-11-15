@@ -64,6 +64,15 @@ cargo test --locked --manifest-path apps/Cargo.toml   # the applications
 apps/e2e/run.sh                                       # the ecosystem (Docker)
 ```
 
+## Releases
+
+Once CI passes on main, it publishes the hub's, the wallet's and the swap
+provider's images for amd64, arm64 and arm/v7 to
+`ghcr.io/licash-org/licash-hub`, `licash-wallet` and `licash-swaps` (tagged
+`main` and `sha-<commit>`), and the signed Android app to the `main-build`
+prerelease (see
+[apps/mobile/android/README.md](apps/mobile/android/README.md#releases)).
+
 ## License
 
 MIT, see [LICENSE](LICENSE).

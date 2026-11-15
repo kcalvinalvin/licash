@@ -16,6 +16,27 @@ Needs a JDK 17 or later, the Android SDK (platform 37) with the NDK at
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
+## Releases
+
+Once every CI job passes on main, CI publishes the app signed, as
+`licash-main.apk` with its `SHA256SUMS`, on the `main-build` prerelease,
+replaced on each push. The `android` job builds the release APK unsigned;
+only `publish-app` signs it, with the key in two repository secrets: the
+debug key the app has been signed with so far, from the machine that built
+it, so that the published app installs as an update over those builds (its
+certificate's SHA-256 is `0bfd0c83...d474c1e2`, as `apksigner verify
+--print-certs` shows):
+
+```sh
+base64 -w0 ~/.android/debug.keystore | gh secret set ANDROID_KEYSTORE
+gh secret set ANDROID_KEYSTORE_PASSWORD --body android
+```
+
+Android updates an app only with an APK signed by the same key: keep that
+keystore backed up, since without it every user must uninstall (and restore
+the wallet from its backup). Its password is the debug default, so whoever
+has the file can sign updates.
+
 ## Test networks
 
 The app is for Bitcoin. Tapping the "licash" wordmark on the first screen
