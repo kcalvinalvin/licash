@@ -261,9 +261,8 @@ async fn visited(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     // Less than the provider swaps at least: some is left there.
     daves.amount = Some(800);
     phone.link(&daves.to_string()).await?;
+    // Its amount asked: straight to what it costs.
     phone.tap("Pay there").await?;
-    phone.wait_any(&["Fee up to", "No fee"], 30).await?;
-    phone.tap("Pay").await?;
     phone.wait("Paid at", 120).await?;
     phone.wait("Moves", 10).await?;
     phone.tap("Pay").await?;

@@ -46,7 +46,12 @@ import org.licash.wallet.sat
 private sealed interface Step {
     data object Looking : Step
     /** A code to pay in notes; on Bitcoin at `address` if it cannot be. */
-    data class Paying(val code: String, val asked: ULong?, val address: String? = null) : Step
+    data class Paying(
+        val code: String,
+        val asked: ULong?,
+        val address: String? = null,
+        val visit: Boolean = false,
+    ) : Step
     data object Planning : Step
     data class Review(val code: String, val amount: ULong?, val quote: PayQuote) : Step
     data class Visit(val code: String, val asked: ULong?, val address: String?) : Step
@@ -240,7 +245,10 @@ fun Send(engine: Engine, ui: Ui, link: String?, cashOut: String? = null, back: (
                     "This code names no hub you use. It says where to reach the payee's, " +
                         "which proves it is the one named.\n\nPay there, moving notes from a hub you use?",
                     "Pay there",
-                    { step = Step.Paying(s.code, s.asked, s.address) },
+                    {
+                        val paying = Step.Paying(s.code, s.asked, s.address, visit = true)
+                        if (s.asked != null) plan(paying, null) else step = paying
+                    },
                     back,
                 )
                 is Step.Unpayable -> Ask(
@@ -284,7 +292,8 @@ fun Send(engine: Engine, ui: Ui, link: String?, cashOut: String? = null, back: (
 private fun Paying(ui: Ui, s: Step.Paying, asking: Boolean, ask: (Boolean) -> Unit, pay: (ULong?) -> Unit) {
     var amount by remember { mutableStateOf(s.asked?.toLong()) }
     // The most a hub would charge: the code may name several.
-    val fee = amount?.let { a -> ui.hubs.maxOfOrNull { it.feeBase + it.feePpm * a.toULong() / 1_000_000uL } }
+    val fee = amount?.takeIf { !s.visit }
+        ?.let { a -> ui.hubs.maxOfOrNull { it.feeBase + it.feePpm * a.toULong() / 1_000_000uL } }
     Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
         Spacer(Modifier.height(48.dp))
         Text(amount?.let { sat(it.toULong()) } ?: "How much?", style = Figures)
