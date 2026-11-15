@@ -167,7 +167,7 @@ internal fun HubPage(
         )
     }
     if (moving) {
-        MoveDialog(
+        MoveSheet(
             engine,
             holding,
             others,
