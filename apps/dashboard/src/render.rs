@@ -3,7 +3,7 @@
 
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
-use ratatui::text::{Line, Span};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
     Block, BorderType, Cell, Clear, Padding, Paragraph, Row, Sparkline, Table, Widget,
 };
@@ -11,7 +11,7 @@ use ratatui::Frame;
 
 use crate::app::{Status, Ui};
 use crate::format;
-use crate::page::{Cell as Value, Tone};
+use crate::page::{Cell as Value, Check, Tone};
 use crate::style::{self, ACCENT, BOLD, BORDER, DIM, FOCUS};
 use crate::view::{self, BreakdownView, CardView, Number, PanelView, Reads, TableView, View};
 use crate::{chart, Range};
@@ -77,7 +77,10 @@ fn header(f: &mut Frame, area: Rect, view: &View, ui: &Ui, status: &Status) {
         Tone::Warn => ("attention", Tone::Warn),
         _ => ("healthy", Tone::Good),
     };
-    right.push(Span::styled(format!("   ● {word}"), style::tone(tone)));
+    right.push(Span::styled(
+        format!("   {} {word}", style::glyph(tone)),
+        style::tone(tone),
+    ));
     let read = if status.reading {
         "   reading…".to_string()
     } else {
@@ -112,7 +115,7 @@ fn tab_line(view: &View, ui: &Ui) -> Paragraph<'static> {
 }
 
 fn footer(f: &mut Frame, area: Rect, status: &Status) {
-    let keys = " ←→ page  [ ] range  tab list  ↑↓ scroll  r read now  ? help  q quit ";
+    let keys = " ←→ page  [ ] range  ↑↓ scroll  ? help  q quit ";
     if let Some(error) = status.error {
         let line = Line::from(vec![
             Span::styled(" ✗ ", style::tone(Tone::Bad)),
@@ -173,31 +176,46 @@ fn draw_panel(
             table(f, area, t, view, focused, ui.offset(*list));
             *list += 1;
         }
-        PanelView::Health { checks } => {
-            let name = checks
-                .iter()
-                .map(|c| c.name.chars().count())
-                .max()
-                .unwrap_or(0);
-            let lines: Vec<Line> = checks
-                .iter()
-                .map(|c| {
-                    Line::from(vec![
-                        Span::styled("● ", style::tone(c.tone)),
-                        Span::styled(format!("{:<name$}", c.name), BOLD),
-                        Span::styled(
-                            format!("  {}", c.detail),
-                            match c.tone {
-                                Tone::Warn | Tone::Bad => style::tone(c.tone),
-                                _ => DIM,
-                            },
-                        ),
-                    ])
-                })
-                .collect();
-            f.render_widget(Paragraph::new(lines).block(block("Health", false)), area);
+        PanelView::Health { checks } => health(f, area, checks),
+    }
+}
+
+/// The checks, what needs attention first: each a glyph, a name and what
+/// it found, wrapped under itself rather than cut.
+fn health(f: &mut Frame, area: Rect, checks: &[Check]) {
+    let block = block("Health", false);
+    let width = block.inner(area).width as usize;
+    let name = checks
+        .iter()
+        .map(|c| c.name.chars().count())
+        .max()
+        .unwrap_or(0);
+    let indent = name + 4;
+    let mut sorted: Vec<&Check> = checks.iter().collect();
+    sorted.sort_by_key(|c| match c.tone {
+        Tone::Bad => 0,
+        Tone::Warn => 1,
+        _ => 2,
+    });
+    let mut lines = Vec::new();
+    for c in sorted {
+        let detail = match c.tone {
+            Tone::Warn | Tone::Bad => style::tone(c.tone),
+            _ => DIM,
+        };
+        let parts = format::wrap(&c.detail, width.saturating_sub(indent).max(12));
+        for (i, part) in parts.into_iter().enumerate() {
+            lines.push(match i {
+                0 => Line::from(vec![
+                    Span::styled(format!("{} ", style::glyph(c.tone)), style::tone(c.tone)),
+                    Span::styled(format!("{:<name$}", c.name), BOLD),
+                    Span::styled(format!("  {part}"), detail),
+                ]),
+                _ => Line::styled(format!("{:indent$}{part}", ""), detail),
+            });
         }
     }
+    f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 fn value_text(value: Option<f64>, reads: Reads, width: u16) -> String {
@@ -234,18 +252,31 @@ fn draw_card(f: &mut Frame, area: Rect, card: &CardView, view: &View) {
         (_, Tone::Normal) => BOLD,
         (_, tone) => style::tone(tone).add_modifier(Modifier::BOLD),
     };
-    let second = match (card.value, card.previous, card.reads) {
-        (Some(v), Some(p), Reads::Percent) => Line::from(vec![
-            Span::styled(format::points(v - p), style::trend(v - p, card.better)),
-            Span::styled(" vs before", DIM),
-        ]),
-        (Some(v), Some(p), Reads::Unit(_)) => {
-            let change = view::change(v, p);
-            Line::from(vec![
-                Span::styled(format::change(change, v), style::trend(v - p, card.better)),
-                Span::styled(format!(" vs prior {}", view.range), DIM),
-            ])
+    // The change, and what it is on if that fits too.
+    let width = inner.width as usize;
+    let compared = |change: String, on: String, trend: Style| {
+        let fits = change.chars().count() + on.chars().count() <= width;
+        let mut spans = vec![Span::styled(change, trend)];
+        if fits {
+            spans.push(Span::styled(on, DIM));
         }
+        Line::from(spans)
+    };
+    let second = match (card.value, card.previous, card.reads) {
+        (Some(v), Some(p), Reads::Percent) => compared(
+            format::points(v - p),
+            " vs before".into(),
+            style::trend(v - p, card.better),
+        ),
+        (Some(v), Some(p), Reads::Unit(_)) => match format::change(view::change(v, p), v) {
+            // Nothing then and nothing now: nothing to say.
+            change if change == "–" => Line::default(),
+            change => compared(
+                change,
+                format!(" vs prior {}", view.range),
+                style::trend(v - p, card.better),
+            ),
+        },
         _ => Line::styled(card.detail.clone(), DIM),
     };
     let [first, middle, last] = Layout::vertical([Constraint::Length(1); 3]).areas(inner);
@@ -462,22 +493,36 @@ fn table(f: &mut Frame, area: Rect, t: &TableView, view: &View, focused: bool, o
             .collect::<Vec<_>>(),
     )
     .style(DIM);
+    // The last column takes what the others leave: its text wrapped
+    // there rather than cut, up to three lines a row.
+    let columns = widths.len().saturating_sub(1);
+    let others = widths[..columns].iter().sum::<usize>() + 2 * columns;
+    let last = (area.width as usize).saturating_sub(4 + others);
     let rows = t.rows.iter().zip(&texts).skip(offset).map(|(row, texts)| {
-        Row::new(
-            texts
-                .iter()
-                .zip(&row.cells)
-                .map(|(text, cell)| {
-                    let line = Line::raw(text.clone());
-                    Cell::from(if numeric(cell) {
-                        line.right_aligned()
-                    } else {
-                        line
-                    })
-                })
-                .collect::<Vec<_>>(),
-        )
-        .style(style::tone(row.tone))
+        let mut height = 1;
+        let cells: Vec<Cell> = texts
+            .iter()
+            .zip(&row.cells)
+            .enumerate()
+            .map(|(i, (text, cell))| {
+                if numeric(cell) {
+                    return Cell::from(Line::raw(text.clone()).right_aligned());
+                }
+                if i == columns && last >= 12 && text.chars().count() > last {
+                    let mut lines = format::wrap(text, last);
+                    if lines.len() > 3 {
+                        lines.truncate(3);
+                        lines[2].push('…');
+                    }
+                    height = lines.len() as u16;
+                    return Cell::from(Text::from(
+                        lines.into_iter().map(Line::raw).collect::<Vec<_>>(),
+                    ));
+                }
+                Cell::from(Line::raw(text.clone()))
+            })
+            .collect();
+        Row::new(cells).height(height).style(style::tone(row.tone))
     });
     f.render_widget(
         Table::new(rows, constraints)

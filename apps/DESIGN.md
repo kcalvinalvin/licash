@@ -106,7 +106,14 @@ The wallet CLI (`licash-wallet`), the hub and swap services
 - **Color** only on a terminal, never carrying meaning alone: green for
   done or healthy, yellow for attention, red for failure, dim for
   secondary detail.
-- **Dashboards**: the overview page first (health, then the few numbers
-  that matter), detail on the following pages; one accent color, one
-  style of card, chart and table; empty and stale states said in words;
-  the key bar always at the bottom, `?` for the rest.
+- **States** in a glyph and a word: `✓` healthy or done, `!` attention,
+  `✗` failing, `–` idle. What needs attention is listed first.
+- **Nothing cut.** Text too long for its place wraps under itself, or
+  says less as a whole (a comparison dropped, a legend without its
+  totals, `+2 more`): never a word cut in half.
+- **Dashboards**: the overview page first (the few numbers that matter,
+  then health beside one chart, then what happened), detail on the
+  following pages, each chart on one page only; one accent color, one
+  style of card, chart and table; empty and stale states said in words
+  or left blank; no heights in the header; the key bar always at the
+  bottom, `?` for the rest.

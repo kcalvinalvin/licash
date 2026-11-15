@@ -25,7 +25,7 @@ pub fn draw(chart: &ChartView, area: Rect, buf: &mut Buffer) {
         height: area.height - 1,
         ..area
     };
-    legend_line(chart).render(legend, buf);
+    legend_line(chart, area.width as usize).render(legend, buf);
     let empty = chart.lines.iter().all(|l| l.values.iter().all(|v| *v == 0));
     if empty {
         let y = plot.y + plot.height / 2;
@@ -45,9 +45,11 @@ pub fn draw(chart: &ChartView, area: Rect, buf: &mut Buffer) {
     }
 }
 
-/// Each label with its total over the range (its last value for a level).
-fn legend_line(chart: &ChartView) -> Line<'static> {
-    let mut spans = Vec::new();
+/// Each label with its total over the range (its last value for a level),
+/// in `width`: closer together, then without the totals, then as many
+/// labels as fit and how many more, rather than one cut.
+fn legend_line(chart: &ChartView, width: usize) -> Line<'static> {
+    let mut entries = Vec::new();
     for line in &chart.lines {
         let total = match chart.kind {
             Kind::Flow => line.values.iter().sum::<i64>(),
@@ -56,13 +58,40 @@ fn legend_line(chart: &ChartView) -> Line<'static> {
         if chart.kind == Kind::Flow && total == 0 {
             continue;
         }
-        spans.push(Span::styled("■ ", Style::new().fg(color(line.color))));
-        spans.push(Span::raw(line.label.clone()));
-        spans.push(Span::styled(
-            format!(" {}   ", format::compact(total as f64, chart.unit)),
-            DIM,
-        ));
+        let total = format!(" {}", format::compact(total as f64, chart.unit));
+        entries.push((color(line.color), line.label.clone(), total));
     }
+    let length = |shown: usize, totals: bool, gap: usize| -> usize {
+        let each = entries[..shown].iter().map(|(_, label, total)| {
+            2 + label.chars().count() + if totals { total.chars().count() } else { 0 }
+        });
+        each.sum::<usize>() + gap * shown.saturating_sub(1)
+    };
+    let all = entries.len();
+    let form = [(true, 3), (true, 2), (false, 3)]
+        .into_iter()
+        .find(|&(totals, gap)| length(all, totals, gap) <= width);
+    let (totals, gap) = form.unwrap_or((false, 2));
+    let more = |shown: usize| match all - shown {
+        0 => String::new(),
+        n => format!("{:gap$}+{n} more", ""),
+    };
+    let mut shown = all;
+    while shown > 0 && length(shown, totals, gap) + more(shown).chars().count() > width {
+        shown -= 1;
+    }
+    let mut spans = Vec::new();
+    for (i, (color, label, total)) in entries.into_iter().take(shown).enumerate() {
+        if i > 0 {
+            spans.push(Span::raw(" ".repeat(gap)));
+        }
+        spans.push(Span::styled("■ ", Style::new().fg(color)));
+        spans.push(Span::raw(label));
+        if totals {
+            spans.push(Span::styled(total, DIM));
+        }
+    }
+    spans.push(Span::styled(more(shown), DIM));
     Line::from(spans)
 }
 
@@ -239,4 +268,42 @@ fn lines(chart: &ChartView, area: Rect, buf: &mut Buffer) {
                 .style(Style::new().fg(Color::DarkGray).add_modifier(Modifier::DIM)),
         )
         .render(area, buf);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::view::Line as Series;
+    use crate::Unit;
+
+    fn legend(width: usize) -> String {
+        let line = |label: &str, color: usize, value: i64| Series {
+            label: label.into(),
+            color,
+            values: vec![value],
+        };
+        let chart = ChartView {
+            title: "Notes outstanding".into(),
+            unit: Unit::Sat,
+            kind: Kind::Level,
+            starts: vec![0],
+            lines: vec![
+                line("holders", 0, 28_778),
+                line("hub's own", 1, 0),
+                line("behind locks", 2, 0),
+            ],
+        };
+        let line = legend_line(&chart, width);
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn a_legend_says_less_rather_than_cut() {
+        let full = "■ holders 28.8k sat   ■ hub's own 0 sat   ■ behind locks 0 sat";
+        assert_eq!(legend(80), full);
+        assert_eq!(legend(61), full.replace("   ", "  "));
+        assert_eq!(legend(40), "■ holders   ■ hub's own   ■ behind locks");
+        assert_eq!(legend(31), "■ holders  ■ hub's own  +1 more");
+        assert_eq!(legend(30), "■ holders  +2 more");
+    }
 }

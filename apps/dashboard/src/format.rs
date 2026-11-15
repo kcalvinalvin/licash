@@ -195,9 +195,53 @@ fn civil(days: i64) -> (i64, u32, u32) {
     (y, m, d)
 }
 
+/// `text` in lines at most `width` wide, broken between words; a word
+/// longer than a line is split.
+pub fn wrap(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        let mut word: Vec<char> = word.chars().collect();
+        loop {
+            let used = line.chars().count();
+            let room = if used == 0 {
+                width
+            } else {
+                width.saturating_sub(used + 1)
+            };
+            if word.len() <= room {
+                if used > 0 {
+                    line.push(' ');
+                }
+                line.extend(word.iter());
+                break;
+            }
+            if used > 0 {
+                lines.push(std::mem::take(&mut line));
+                continue;
+            }
+            lines.push(word[..width].iter().collect());
+            word.drain(..width);
+        }
+    }
+    if !line.is_empty() || lines.is_empty() {
+        lines.push(line);
+    }
+    lines
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_wraps_between_words() {
+        assert_eq!(wrap("one two three four", 9), ["one two", "three", "four"]);
+        assert_eq!(wrap("abcdefghij  k", 4), ["abcd", "efgh", "ij k"]);
+        assert_eq!(wrap("", 5), [""]);
+        assert_eq!(wrap("fits", 10), ["fits"]);
+    }
 
     #[test]
     fn amounts_group_thousands() {

@@ -327,6 +327,68 @@ fn a_column_of_numbers_aligns_right_though_its_newest_row_has_none() {
 }
 
 #[test]
+fn what_needs_attention_comes_first_and_nothing_long_is_cut() {
+    let long =
+        "The Lightning node can pay 0 sat over its channels, less than the 1,000,000 sat it keeps";
+    let log = Table::in_range(
+        "Recent events",
+        &["when", "event", "detail"],
+        vec![Row::new(
+            Some(NOW - 60),
+            Tone::Warn,
+            vec![
+                Cell::Time(NOW - 60),
+                Cell::Text("alert".into()),
+                Cell::Text(long.into()),
+            ],
+        )],
+        "nothing happened",
+    );
+    let checks = vec![
+        Check::new("Service", Tone::Good, "answers"),
+        Check::new("Lightning", Tone::Muted, "no gateway ran"),
+        Check::new("Alerts", Tone::Warn, long),
+    ];
+    let report = Report {
+        title: "licash hub".into(),
+        subtitle: String::new(),
+        now: NOW,
+        since: NOW - DAY,
+        series: vec![],
+        pages: vec![Page::new(
+            "Overview",
+            vec![vec![Panel::Health(checks)], vec![Panel::Table(log)]],
+        )],
+    };
+    let out = screen_of(&report, &Ui::new(Range::Day), 70, 24);
+    let at = |text: &str| out.lines().position(|l| l.contains(text));
+    // Each state in a glyph, not by its color alone; attention first.
+    assert!(out.contains("! attention"), "{out}");
+    assert!(at("! Alerts") < at("✓ Service"), "{out}");
+    assert!(at("✓ Service") < at("– Lightning"), "{out}");
+    // The long detail, whole in the health panel and in the list.
+    assert_eq!(out.matches("1,000,000").count(), 2, "{out}");
+    assert_eq!(out.matches("it keeps").count(), 2, "{out}");
+}
+
+#[test]
+fn a_card_drops_what_it_compares_with_rather_than_cut_it() {
+    for width in [80, 100, 160] {
+        let out = screen(&Ui::new(Range::Month), width, 44);
+        assert!(out.contains("▼ 17.7%"), "{out}");
+        for line in out.lines() {
+            for (i, _) in line.match_indices(" vs") {
+                let rest = &line[i..];
+                assert!(
+                    rest.starts_with(" vs prior 30d") || rest.starts_with(" vs before"),
+                    "{line}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn small_terminals_still_draw() {
     for (w, h) in [(40, 12), (80, 24), (20, 6)] {
         screen(&Ui::new(Range::Day), w, h);

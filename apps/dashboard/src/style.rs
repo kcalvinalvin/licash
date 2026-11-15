@@ -42,6 +42,17 @@ pub fn tone(tone: Tone) -> Style {
     }
 }
 
+/// A tone's glyph, so that a state never reads by its color alone.
+pub fn glyph(tone: Tone) -> &'static str {
+    match tone {
+        Tone::Good => "✓",
+        Tone::Warn => "!",
+        Tone::Bad => "✗",
+        Tone::Muted => "–",
+        Tone::Normal => "·",
+    }
+}
+
 /// How a change of `delta` reads for a value better moving `better`.
 pub fn trend(delta: f64, better: Better) -> Style {
     match (better, delta.partial_cmp(&0.0)) {
