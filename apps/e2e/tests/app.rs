@@ -124,6 +124,44 @@ async fn changed(phone: &Phone, from: u64, secs: u64) -> anyhow::Result<u64> {
     .await
 }
 
+/// Its silent payment address `silent` alone, one switch away on Receive,
+/// for any amount.
+async fn silently(phone: &Phone, silent: &str) -> anyhow::Result<()> {
+    phone.tap_id("receive").await?;
+    phone.tap_id("segment Silent").await?;
+    phone.tagged("silent", silent, 30).await?;
+    phone.tagged("asking", "Any amount, on Bitcoin", 10).await?;
+    phone.tap("Back").await?;
+    phone.home(30).await
+}
+
+/// Bob paid again, picked by name among the contacts rather than scanned.
+async fn contact(phone: &Phone, bob: &licash_e2e::Wallet) -> anyhow::Result<()> {
+    let before = phone.balance().await?;
+    phone.tap_id("send").await?;
+    phone.tap_id("contact Bob").await?;
+    until("the amount to type in", 10, || async {
+        let views = phone.views().await?;
+        Ok(views
+            .iter()
+            .any(|v| v.id == "amount" && v.focused)
+            .then_some(()))
+    })
+    .await?;
+    phone.type_text("1000").await?;
+    phone.tagged("arrives", "Instantly", 10).await?;
+    phone.tap_id("confirm").await?;
+    phone.tagged("result", "Sent", 60).await?;
+    phone.tagged("contact", "To Bob", 10).await?;
+    phone.tap_id("done").await?;
+    ensure!(
+        collected(bob, 60).await? == 1_000,
+        "Bob got other than 1000"
+    );
+    changed(phone, before, 30).await?;
+    Ok(())
+}
+
 /// Paid over Lightning: an invoice its hub makes for an amount it enters,
 /// shown as a QR code, which a node outside pays. Its notes are taken while
 /// shown, and the payment is in the history.
@@ -220,6 +258,7 @@ async fn used(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
         "{} moved in",
         held - moved
     );
+    silently(phone, &silent.to_string()).await?;
 
     // It pays Bob at the hub, an amount it enters, to his mailbox.
     let info = eco.info(hub).await?;
@@ -248,6 +287,11 @@ async fn used(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     phone.tagged("arrives", "Instantly", 10).await?;
     phone.tap_id("confirm").await?;
     phone.tagged("result", "Sent", 60).await?;
+    // Bob, kept as a contact once paid.
+    phone.tap_id("save-contact").await?;
+    phone.fill_id("contact-name", "Bob").await?;
+    phone.tap_id("save-contact-name").await?;
+    phone.tagged("contact", "To Bob", 10).await?;
     phone.tap_id("done").await?;
     ensure!(
         collected(&bob, 60).await? == 5_000,
@@ -273,6 +317,7 @@ async fn used(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
         "no payment received in the history"
     );
     phone.back_to("receive").await?;
+    contact(phone, &bob).await?;
 
     lightning(eco, phone).await?;
     refused(eco, phone, &bobs).await?;
