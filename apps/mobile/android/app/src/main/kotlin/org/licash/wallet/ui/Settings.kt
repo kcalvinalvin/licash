@@ -60,6 +60,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.licash.core.FoundHub
+import org.licash.core.HubsFound
 import org.licash.core.Hub
 import org.licash.core.Rate
 import org.licash.wallet.AppLog
@@ -111,7 +112,7 @@ fun Settings(engine: Engine, ui: Ui, balance: () -> Unit, back: () -> Unit) {
                             if (ui.hubs.isNotEmpty()) Divider()
                             AddHub(engine)
                         }
-                        if (ui.hubs.isNotEmpty()) Group("Other hubs") { FindHubs(engine, ui) }
+                        Group(if (ui.hubs.isEmpty()) "Find a hub" else "Other hubs") { FindHubs(engine, ui) }
                     }
                     Page.Bitcoin -> {
                         Group("Following Bitcoin") { Status(ui) }
@@ -412,13 +413,15 @@ private fun AddHub(engine: Engine) {
 }
 
 /**
- * The hubs announced on Nostr, on the relays the hubs used name: each
- * added with a tap, once the owner says she trusts it.
+ * The hubs announced on Nostr, on the relays the hubs used name and on the
+ * default ones: each added with a tap, once the owner says she trusts it.
+ * Those announced but not answering are only counted, with a hint if Tor
+ * would reach them.
  */
 @Composable
 private fun FindHubs(engine: Engine, ui: Ui) {
     val scope = rememberCoroutineScope()
-    var found by remember { mutableStateOf<List<FoundHub>?>(null) }
+    var found by remember { mutableStateOf<HubsFound?>(null) }
     var looking by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
     var adding by remember { mutableStateOf<FoundHub?>(null) }
@@ -426,17 +429,20 @@ private fun FindHubs(engine: Engine, ui: Ui) {
         looking = true
         error = null
         scope.launch {
-            engine.discoverHubs()
+            engine.findHubs()
                 .onSuccess { found = it }
                 .onFailure { error = explain(it) }
             looking = false
         }
     }
     // Those added since looking drop out.
-    val shown = found?.filter { f -> ui.hubs.none { it.url == f.hub.url } }
-    Note("Hubs announce themselves on the relays your hubs name. Find them there, and add one without typing its address.")
+    val shown = found?.hubs?.filter { f -> ui.hubs.none { it.url == f.hub.url } }
+    Note(
+        if (ui.tor) "Hubs announce themselves on Nostr relays, reached through Tor. Find them there, and add one without typing its address."
+        else "Hubs announce themselves on Nostr relays. Find them there, and add one without typing its address.",
+    )
     shown?.let { list ->
-        if (list.isEmpty()) Note("No other hub announced there for now.")
+        if (list.isEmpty()) Note("No other hub answered for now.")
         list.forEachIndexed { i, f ->
             if (i > 0) Divider()
             Row(Modifier.fillMaxWidth().padding(vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -455,6 +461,18 @@ private fun FindHubs(engine: Engine, ui: Ui) {
                 }
                 TextButton(onClick = { adding = f }, modifier = Modifier.testTag("add-found")) { Text("Add") }
             }
+        }
+    }
+    found?.let { f ->
+        if (f.silent > 0u) {
+            val more = if (f.silent == 1u) "1 more hub is announced but did not answer"
+            else "${f.silent} more hubs are announced but did not answer"
+            val tor = when {
+                ui.tor || f.silentOnion == 0u -> "."
+                f.silentOnion == f.silent -> ": ${if (f.silent == 1u) "it is" else "they are"} reached only through Tor, under Privacy."
+                else -> ": ${f.silentOnion} of them only through Tor, under Privacy."
+            }
+            Note(more + tor)
         }
     }
     error?.let { Note(it, error = true) }

@@ -43,12 +43,13 @@ import org.licash.core.NotesOf
 import org.licash.core.Paid
 import org.licash.core.PayQuote
 import org.licash.core.PayoutQuote
-import org.licash.core.FoundHub
+import org.licash.core.HubsFound
 import org.licash.core.PayOffer
 import org.licash.core.Scanned
 import org.licash.core.State
 import org.licash.core.Wallet
 import org.licash.core.chainName
+import org.licash.core.defaultRelays
 import org.licash.core.explorer
 import org.licash.core.setLogger
 import org.licash.core.walletExists
@@ -602,8 +603,13 @@ class Engine(context: Context) {
         }
     }
 
-    /** The hubs announced on the relays its hubs name, not used yet. */
-    suspend fun discoverHubs(): Result<List<FoundHub>> = io { local { it.discoverHubs() } }
+    /**
+     * The hubs announced on the relays its hubs name and on the default
+     * ones, not used yet, and how many more did not answer.
+     */
+    suspend fun findHubs(): Result<HubsFound> = io {
+        local { it.findHubs(defaultRelays(it.network(), it.tor())) }
+    }
 
     /** What the wallet holds at each hub it trusts. */
     suspend fun holdings(): Result<List<Holding>> = io { local { it.holdings() } }
