@@ -35,10 +35,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.vector.ImageVector
-import androidx.compose.ui.graphics.vector.addPathNodes
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -297,27 +294,4 @@ private fun glyph(activity: Activity, coming: Boolean, failed: Boolean): ImageVe
         Kind.SENT, Kind.PAYOUT -> Glyphs.up
         Kind.RECEIVED, Kind.MOVED, Kind.ONCHAIN -> Glyphs.down
     }
-}
-
-/**
- * The few Material icons (Apache 2.0) the core set lacks, from their path
- * data: an extended set of thousands for four is not worth its size.
- */
-private object Glyphs {
-    val up by lazy { icon("up", "M4,12l1.41,1.41L11,7.83V20h2V7.83l5.58,5.59L20,12l-8,-8 -8,8z") }
-    val down by lazy { icon("down", "M20,12l-1.41,-1.41L13,16.17V4h-2v12.17l-5.58,-5.59L4,12l8,8 8,-8z") }
-    val swap by lazy { icon("swap", "M6.99,11L3,15l3.99,4v-3H14v-2H6.99v-3zM21,9l-3.99,-4v3H10v2h7.01v3L21,9z") }
-    val bolt by lazy {
-        icon(
-            "bolt",
-            "M11,21h-1l1,-7H7.5c-0.58,0 -0.57,-0.32 -0.38,-0.66 0.19,-0.34 0.05,-0.08 0.07,-0.12" +
-                "C8.48,10.94 10.42,7.54 13,3h1l-1,7h3.5c0.49,0 0.56,0.33 0.47,0.51l-0.07,0.15" +
-                "C12.96,17.55 11,21 11,21z",
-        )
-    }
-
-    private fun icon(name: String, path: String): ImageVector =
-        ImageVector.Builder(name, 24.dp, 24.dp, 24f, 24f)
-            .addPath(addPathNodes(path), fill = SolidColor(Color.Black))
-            .build()
 }

@@ -77,6 +77,23 @@ val Figures = TextStyle(
     fontFeatureSettings = "tnum",
 )
 
+/** The amount a screen is about, under its title: smaller than Home's. */
+val Heading = TextStyle(
+    fontSize = 36.sp,
+    lineHeight = 44.sp,
+    fontWeight = FontWeight.SemiBold,
+    letterSpacing = (-0.5).sp,
+    fontFeatureSettings = "tnum",
+)
+
+/** An amount or a value in a row: digits of one width, to line up down a list. */
+val Amounts = TextStyle(
+    fontSize = 16.sp,
+    lineHeight = 24.sp,
+    letterSpacing = 0.5.sp,
+    fontFeatureSettings = "tnum",
+)
+
 @Composable
 fun LicashTheme(content: @Composable () -> Unit) {
     val base = Typography()

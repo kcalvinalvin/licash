@@ -30,7 +30,6 @@ import androidx.compose.ui.platform.ClipEntry
 import androidx.compose.ui.platform.LocalClipboard
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
-import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -453,20 +452,6 @@ private fun confirmations(tx: Onchain, details: Details?): String {
     return when {
         depth != null && tx.confirmations < depth -> "${tx.confirmations} of $depth"
         else -> "${tx.confirmations}"
-    }
-}
-
-@Composable
-private fun Line(label: String, value: String) {
-    Row(Modifier.fillMaxWidth().padding(vertical = 12.dp)) {
-        Text(label, Modifier.weight(1f), style = MaterialTheme.typography.bodyLarge)
-        Spacer(Modifier.width(12.dp))
-        Text(
-            value,
-            style = MaterialTheme.typography.bodyLarge,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            textAlign = TextAlign.End,
-        )
     }
 }
 

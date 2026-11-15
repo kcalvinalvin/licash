@@ -101,7 +101,7 @@ fun Settings(engine: Engine, ui: Ui, balance: () -> Unit, back: () -> Unit) {
                 Overview(engine, ui) { page = it }
             }
             else -> {
-                TopBar(p.title) { page = null }
+                TopBar(p.title, back = { page = null })
                 when (p) {
                     Page.Hubs -> {
                         Group("Hubs you use") {
