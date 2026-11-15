@@ -85,8 +85,8 @@ them. `--notify-kinds` picks the kinds of event: by default all but swaps
 accepted (`accepted`), still under way. Each notification lists the swap's
 route and figures, ids cut to 12 characters. A swap done shows its income
 (what the client's lock paid beyond the amount), its costs (the fee its
-lock at the destination hub paid) and its profit, with their rates in ppm
-of the amount; the wallet's unlinking is not counted against any one swap.
+lock at the destination hub paid) and its profit, with their rates as a
+percentage of the amount; the wallet's unlinking is not counted against any one swap.
 A payout shows what it charged instead, the miner fee it pays included,
 since miner fees go unrecorded. A refunded swap is one whose client never
 claimed the provider's lock, which cost its refund fee; a lost one, at high

@@ -9,7 +9,7 @@ use std::{
 
 use licash_hub::{Event, Hub, Ledger, Notice, Settled};
 use licash_notify::{
-    list, sat, sat_ppm, short, Item, Message, Outbox, Priority, Relay, Target, Timing,
+    list, sat, sat_rate, short, Item, Message, Outbox, Priority, Relay, Target, Timing,
 };
 
 /// The kinds of the hub's events.
@@ -292,7 +292,7 @@ pub fn message(event: &Event) -> Message {
 
 /// The hub's `fee` of `amount`, and its rate.
 fn income(fee: u64, amount: u64) -> String {
-    sat_ppm(i64::try_from(fee).unwrap_or(i64::MAX), amount)
+    sat_rate(i64::try_from(fee).unwrap_or(i64::MAX), amount)
 }
 
 pub fn halted() -> Message {
@@ -373,7 +373,7 @@ mod tests {
         assert_eq!(messages[1].title, "Spend released");
         assert_eq!(
             messages[1].body,
-            "• Amount: 10 sat\n• Income: 1 sat (100,000 ppm)\n• Proposal: p1"
+            "• Amount: 10 sat\n• Income: 1 sat (10.0%)\n• Proposal: p1"
         );
         assert_eq!(messages[2].priority, Priority::High);
         assert_eq!(messages[2].body, "• Proposal: p2\n• Spent by: p1");
@@ -384,7 +384,7 @@ mod tests {
         assert_eq!(messages[4].title, "Lock refunded");
         assert_eq!(
             messages[4].body,
-            "• Amount: 8 sat\n• Income: 1 sat (125,000 ppm)\n• Proposal: p3"
+            "• Amount: 8 sat\n• Income: 1 sat (12.5%)\n• Proposal: p3"
         );
         assert_eq!(messages[5].priority, Priority::High);
         assert_eq!(messages[5].body, "• Block: 899\n• Proposal: p3");

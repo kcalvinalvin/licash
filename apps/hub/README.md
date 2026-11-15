@@ -138,8 +138,8 @@ Notification targets are Apprise URLs (`gotify[s]://`, `tgram://`,
 `ntfy[s]://`, `json[s]://`, `apprise[s]://`); `test-notify` checks them.
 Each notification lists the event's figures, ids cut to 12 characters as
 on the dashboard: a spend released or a lock paid or refunded shows the
-hub's income, its fee, and its rate in ppm of the amount. Costs, such as
-Lightning routing fees, go unrecorded, so no profit is shown.
+hub's income, its fee, and its rate as a percentage of the amount. Costs,
+such as Lightning routing fees, go unrecorded, so no profit is shown.
 `--notify-kinds` picks the kinds of event: by default all but locks
 admitted (`locked`), still under way, whose fee is the hub's only if they
 pay. The high-priority ones need

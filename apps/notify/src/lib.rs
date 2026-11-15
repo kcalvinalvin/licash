@@ -43,17 +43,26 @@ pub fn sat_signed(amount: i64) -> String {
     format!("{sign}{}", sat(amount.unsigned_abs()))
 }
 
-/// `amount` sat and its rate of `of` in parts per million, rounded:
-/// `106 sat (2,120 ppm)`. No rate of nothing.
-pub fn sat_ppm(amount: i64, of: u64) -> String {
+/// `amount` sat and its rate of `of` as a percentage, rounded as the
+/// dashboards show it: `106 sat (0.21%)`, `1 sat (12.5%)`. No rate of
+/// nothing.
+pub fn sat_rate(amount: i64, of: u64) -> String {
     if of == 0 {
         return sat_signed(amount);
     }
-    let of = u128::from(of);
-    let rate = (u128::from(amount.unsigned_abs()) * 1_000_000 + of / 2) / of;
-    let rate = u64::try_from(rate).unwrap_or(u64::MAX);
-    let sign = if amount < 0 && rate > 0 { "-" } else { "" };
-    format!("{} ({sign}{} ppm)", sat_signed(amount), grouped(rate))
+    let (abs, of) = (u128::from(amount.unsigned_abs()), u128::from(of));
+    let rounded = |scale: u128| u64::try_from((abs * scale + of / 2) / of).unwrap_or(u64::MAX);
+    // Below 1% in hundredths of a percent, from 1% in tenths.
+    let (rate, units) = match rounded(10_000) {
+        0 if abs == 0 => ("0".to_owned(), 0),
+        h if h < 100 => (format!("0.{h:02}"), h),
+        _ => {
+            let t = rounded(1_000);
+            (format!("{}.{}", grouped(t / 10), t % 10), t)
+        }
+    };
+    let sign = if amount < 0 && units > 0 { "-" } else { "" };
+    format!("{} ({sign}{rate}%)", sat_signed(amount))
 }
 
 /// `n` with commas between thousands.
@@ -111,20 +120,20 @@ mod tests {
     }
 
     #[test]
-    fn signed_amounts_and_rates_in_ppm() {
+    fn signed_amounts_and_rates_in_percent() {
         assert_eq!(sat_signed(-1_234), "-1,234 sat");
         assert_eq!(sat_signed(5), "5 sat");
-        assert_eq!(sat_ppm(106, 50_000), "106 sat (2,120 ppm)");
-        assert_eq!(sat_ppm(-55, 50_000), "-55 sat (-1,100 ppm)");
-        // Rounded to the nearest part.
-        assert_eq!(sat_ppm(1, 3), "1 sat (333,333 ppm)");
-        assert_eq!(sat_ppm(2, 3), "2 sat (666,667 ppm)");
-        assert_eq!(sat_ppm(0, 7), "0 sat (0 ppm)");
-        assert_eq!(sat_ppm(5, 0), "5 sat");
-        assert_eq!(
-            sat_ppm(i64::MIN, 1),
-            "-9,223,372,036,854,775,808 sat (-18,446,744,073,709,551,615 ppm)"
-        );
+        assert_eq!(sat_rate(106, 50_000), "106 sat (0.21%)");
+        assert_eq!(sat_rate(-55, 50_000), "-55 sat (-0.11%)");
+        // Rounded: below 1% to a hundredth, from 1% to a tenth.
+        assert_eq!(sat_rate(1, 3), "1 sat (33.3%)");
+        assert_eq!(sat_rate(2, 3), "2 sat (66.7%)");
+        assert_eq!(sat_rate(1, 8), "1 sat (12.5%)");
+        assert_eq!(sat_rate(1, 1_000_000), "1 sat (0.00%)");
+        assert_eq!(sat_rate(30, 1), "30 sat (3,000.0%)");
+        assert_eq!(sat_rate(0, 7), "0 sat (0%)");
+        assert_eq!(sat_rate(5, 0), "5 sat");
+        assert!(sat_rate(i64::MIN, 1).starts_with("-9,223,372,036,854,775,808 sat (-"));
     }
 
     #[test]

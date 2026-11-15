@@ -4,7 +4,7 @@
 use std::{path::Path, sync::Arc, time::Duration};
 
 use licash_notify::{
-    list, sat, sat_ppm, sat_signed, short, Item, Message, Outbox, Priority, Relay, Target,
+    list, sat, sat_rate, sat_signed, short, Item, Message, Outbox, Priority, Relay, Target,
 };
 use licash_swaps::{Event, Notice, Outcome, Provider};
 use licash_wallet::Transport;
@@ -172,13 +172,13 @@ pub fn message(event: &Event, outcome: Option<&Outcome>) -> Message {
             let income = record.map_or(fee, |r| r.paid.saturating_sub(r.amount));
             if payout {
                 // The miner fee it pays is in it.
-                fields.push(("Charged", sat_ppm(signed(income), amount)));
+                fields.push(("Charged", sat_rate(signed(income), amount)));
             } else {
-                fields.push(("Income", sat_ppm(signed(income), amount)));
+                fields.push(("Income", sat_rate(signed(income), amount)));
                 if let Some(cost) = hub_fee {
                     let profit = signed(income).saturating_sub(signed(cost));
                     fields.push(("Costs", sat(cost)));
-                    fields.push(("Profit", sat_ppm(profit, amount)));
+                    fields.push(("Profit", sat_rate(profit, amount)));
                 }
             }
             let title = if payout { "Payout done" } else { "Swap done" };
@@ -327,7 +327,7 @@ mod tests {
         );
         assert_eq!(
             messages[1].body,
-            "• Amount: 5,000 sat\n• Income: 6 sat (1,200 ppm)\n• Swap: ab"
+            "• Amount: 5,000 sat\n• Income: 6 sat (0.12%)\n• Swap: ab"
         );
         assert_eq!(
             messages[2].body,
@@ -363,20 +363,20 @@ mod tests {
         assert_eq!(
             message.body,
             "• Route: a.example → abcdefgh….onion\n• Amount: 50,000 sat\n\
-             • Income: 106 sat (2,120 ppm)\n• Costs: 51 sat\n• Profit: 55 sat (1,100 ppm)\n\
+             • Income: 106 sat (0.21%)\n• Costs: 51 sat\n• Profit: 55 sat (0.11%)\n\
              • Swap: ab"
         );
         // A hub fee above the income: a loss.
         let dear = outcome(ONION, 50_000, 50_106, Some(200));
         assert!(super::message(&done, Some(&dear))
             .body
-            .contains("• Profit: -94 sat (-1,880 ppm)"));
+            .contains("• Profit: -94 sat (-0.19%)"));
         // Its lock's fee unknown: no costs, no profit.
         let unsettled = outcome(ONION, 50_000, 50_106, None);
         assert_eq!(
             super::message(&done, Some(&unsettled)).body,
             "• Route: a.example → abcdefgh….onion\n• Amount: 50,000 sat\n\
-             • Income: 106 sat (2,120 ppm)\n• Swap: ab"
+             • Income: 106 sat (0.21%)\n• Swap: ab"
         );
 
         let refunded = event(&Notice::Refunded {
@@ -438,7 +438,7 @@ mod tests {
         assert_eq!(
             done.body,
             "• Route: a.example → Bitcoin (signet)\n• Amount: 125,000 sat\n\
-             • Charged: 1,250 sat (10,000 ppm)\n• Payout: cdcdcdcdcdcd…"
+             • Charged: 1,250 sat (1.0%)\n• Payout: cdcdcdcdcdcd…"
         );
     }
 
