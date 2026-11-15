@@ -63,6 +63,19 @@ impl Issuer {
         self
     }
 
+    /// Run `op` off the async runtime: the methods that read or write the
+    /// hub's ledger wait for its one connection, which a block scan holds
+    /// for as long as the scan takes.
+    pub(crate) async fn blocking<R: Send + 'static>(
+        self: &Arc<Self>,
+        op: impl FnOnce(&Self) -> Result<R, Problem> + Send + 'static,
+    ) -> Result<R, Problem> {
+        let issuer = Arc::clone(self);
+        tokio::task::spawn_blocking(move || op(&issuer))
+            .await
+            .map_err(unavailable)?
+    }
+
     /// The hub's URL, as its clients reach it.
     pub fn url(&self) -> &str {
         &self.url

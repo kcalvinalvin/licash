@@ -17,6 +17,7 @@ serde.workspace = true
 serde_json.workspace = true
 hex.workspace = true
 thiserror.workspace = true
+tokio = { version = "1.54", features = ["rt"] }
 tracing = "0.1"
 rand_core.workspace = true
 

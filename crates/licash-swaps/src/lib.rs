@@ -44,7 +44,7 @@ mod store;
 use std::{
     collections::HashSet,
     path::Path,
-    sync::{Mutex, PoisonError},
+    sync::{Arc, Mutex, PoisonError},
 };
 
 use licash::{address::Address, route::Hop, spend::ProposalId};
@@ -474,7 +474,7 @@ pub struct Provider<T: Transport> {
     /// The swaps the operator was told the provider claims late.
     late: Mutex<HashSet<[u8; 32]>>,
     /// The provider's own hub, if it is one, which issues its locks there.
-    issuer: Option<Issuer>,
+    issuer: Option<Arc<Issuer>>,
 }
 
 /// Setup and what the provider says of itself.
@@ -544,7 +544,7 @@ impl<T: Transport> Provider<T> {
             payouts: None,
             withheld: Mutex::default(),
             late: Mutex::default(),
-            issuer,
+            issuer: issuer.map(Arc::new),
         }
     }
 
@@ -562,7 +562,7 @@ impl<T: Transport> Provider<T> {
 
     /// The hub the provider is, if it is one.
     pub fn issuer(&self) -> Option<&Issuer> {
-        self.issuer.as_ref()
+        self.issuer.as_deref()
     }
 
     /// Its wallet, which holds its notes at each hub.
@@ -590,6 +590,9 @@ impl<T: Transport> Provider<T> {
     /// The hub of an [`Issuer`] locks at itself alone: as much as it may
     /// still take of the notes of a hub it swaps from, by
     /// [`Config::own_lead`].
+    ///
+    /// It reads the provider's files, and its hub's ledger: call it off
+    /// the async runtime.
     pub fn info(&self) -> Result<swaps::Info, Error> {
         let hubs: Vec<Hub> = match &self.issuer {
             Some(issuer) => self.issuing(issuer)?,
@@ -776,7 +779,7 @@ impl<T: Transport> Provider<T> {
         // The hub of an issuer swaps into itself alone, from the hubs it
         // takes notes of.
         let own = match &self.issuer {
-            Some(issuer) => Some((issuer, issuer.info()?)),
+            Some(issuer) => Some((issuer, issuer.blocking(Issuer::info).await?)),
             None => None,
         };
         let (from, to) = match &own {
@@ -994,7 +997,7 @@ impl<T: Transport> Provider<T> {
     async fn lock(&self, id: &[u8; 32]) -> Result<(), Error> {
         let row = self.row(id)?.expect("recorded");
         if row.own {
-            return self.lock_own(id, &row);
+            return self.lock_own(id, &row).await;
         }
         let address = Address::from_bytes(&row.address).map_err(licash_wallet::Error::from)?;
         let mut tries = 0;
@@ -1033,9 +1036,10 @@ impl<T: Transport> Provider<T> {
     /// Have the provider's hub lock the notes of the swap `row` it issues:
     /// give it up if declined. Its outcome unknown, `step` adopts the lock
     /// the hub made, or gives the swap up.
-    fn lock_own(&self, id: &[u8; 32], row: &Row) -> Result<(), Error> {
-        let issuer = self.issuer_of(row)?;
-        match issuer.lock(&self.issue_of(id, row)?) {
+    async fn lock_own(&self, id: &[u8; 32], row: &Row) -> Result<(), Error> {
+        let issue = self.issue_of(id, row)?;
+        let locked = self.issuer_of(row)?;
+        match locked.blocking(move |issuer| issuer.lock(&issue)).await {
             Ok(lock) => {
                 self.set_lock(id, &lock)?;
                 self.advance(id, Stage::Accepted, Stage::Locked, None, None)?;
@@ -1053,7 +1057,7 @@ impl<T: Transport> Provider<T> {
     /// The issuer of the swap `row`, into its own hub: the provider's, at
     /// whatever URL it is reached now, as only that hub opens a file
     /// holding such swaps ([`Provider::open`]).
-    fn issuer_of(&self, row: &Row) -> Result<&Issuer, Error> {
+    fn issuer_of(&self, row: &Row) -> Result<&Arc<Issuer>, Error> {
         self.issuer.as_ref().ok_or_else(|| {
             Error::Setup(format!(
                 "a swap into hub {}'s own notes: only that hub takes it on",
@@ -1175,7 +1179,7 @@ impl<T: Transport> Provider<T> {
             .into_iter()
             .map(|(url, _)| url)
             .collect();
-        for url in self.issuer.iter().flat_map(Issuer::sources) {
+        for url in self.issuer.iter().flat_map(|issuer| issuer.sources()) {
             if !urls.iter().any(|u| u == url) {
                 urls.push(url.to_owned());
             }
@@ -1296,25 +1300,29 @@ impl<T: Transport> Provider<T> {
         let issuer = self.issuer_of(row)?;
         let lock = match row.lock {
             Some(lock) => lock,
-            None => match issuer.find(&self.issue_of(id, row)?) {
-                Ok(Some(lock)) => {
-                    self.set_lock(id, &lock)?;
-                    lock
+            None => {
+                let issue = self.issue_of(id, row)?;
+                match issuer.blocking(move |issuer| issuer.find(&issue)).await {
+                    Ok(Some(lock)) => {
+                        self.set_lock(id, &lock)?;
+                        lock
+                    }
+                    Ok(None) => return self.fail(id, row, "stopped before locking"),
+                    Err(problem) if problem.code == Code::Declined => {
+                        let reason = format!("not locked: {}", problem.message);
+                        self.alert(&format!(
+                            "Swap {} was not locked: hub {} holds another lock under its hash.",
+                            hex::encode(id),
+                            row.to
+                        ))?;
+                        return self.fail(id, row, &reason);
+                    }
+                    Err(problem) => return Err(Error::Hub(problem)),
                 }
-                Ok(None) => return self.fail(id, row, "stopped before locking"),
-                Err(problem) if problem.code == Code::Declined => {
-                    let reason = format!("not locked: {}", problem.message);
-                    self.alert(&format!(
-                        "Swap {} was not locked: hub {} holds another lock under its hash.",
-                        hex::encode(id),
-                        row.to
-                    ))?;
-                    return self.fail(id, row, &reason);
-                }
-                Err(problem) => return Err(Error::Hub(problem)),
-            },
+            }
         };
-        match issuer.follow(&lock).map_err(Error::Hub)? {
+        let issued = issuer.blocking(move |issuer| issuer.follow(&lock)).await;
+        match issued.map_err(Error::Hub)? {
             Issued::Locked => {
                 if row.stage == Stage::Accepted {
                     self.advance(id, Stage::Accepted, Stage::Locked, None, None)?;
@@ -1421,7 +1429,7 @@ impl<T: Transport> Provider<T> {
                 self.advance(id, Stage::Paid, Stage::Lost, None, Some((&notice, &reason)))?;
             }
             Err(e) => {
-                self.check_late(id, row)?;
+                self.check_late(id, row).await?;
                 return Err(e.into());
             }
         }
@@ -1431,7 +1439,7 @@ impl<T: Transport> Provider<T> {
     /// Alert the operator, once, if the provider paid the swap `row` but
     /// has yet to claim the client's lock within its margin, and the time
     /// to confirm on Bitcoin, of that lock's expiry: lost once it expires.
-    fn check_late(&self, id: &[u8; 32], row: &Row) -> Result<(), Error> {
+    async fn check_late(&self, id: &[u8; 32], row: &Row) -> Result<(), Error> {
         // Not hub `from`'s height alone, which may stop answering, or lag:
         // the highest of either hub, or of the provider's own.
         let hubs = self.wallet.hubs()?;
@@ -1441,8 +1449,11 @@ impl<T: Transport> Provider<T> {
                 .and_then(|(_, info)| info.locks.as_ref())
                 .map(|l| l.height)
         };
-        let own = self.issuer.as_ref().filter(|_| row.own);
-        let height = [at(&row.from), at(&row.to), own.and_then(Issuer::height)]
+        let own = match self.issuer.as_ref().filter(|_| row.own) {
+            Some(issuer) => issuer.blocking(|issuer| Ok(issuer.height())).await,
+            None => Ok(None),
+        };
+        let height = [at(&row.from), at(&row.to), own.ok().flatten()]
             .into_iter()
             .flatten()
             .max();

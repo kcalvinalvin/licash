@@ -160,7 +160,10 @@ type Answer<T> = Result<Json<T>, Failure>;
 type Shared<T, C> = State<Arc<Served<T, C>>>;
 
 async fn info<T: Transport + 'static, C>(State(served): Shared<T, C>) -> Answer<swaps::Info> {
-    let mut info = served.provider.info()?;
+    let provider = Arc::clone(&served.provider);
+    let mut info = tokio::task::spawn_blocking(move || provider.info())
+        .await
+        .map_err(|e| Failure(Problem::new(Code::Unavailable, e.to_string())))??;
     if served.chain.is_none() {
         info.chain = None;
     }

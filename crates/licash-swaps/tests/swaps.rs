@@ -5,9 +5,12 @@
 #[path = "../../licash-wallet/tests/net/mod.rs"]
 mod net;
 
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc, Mutex,
+use std::{
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
+    time::Duration,
 };
 
 use licash::spend::{lock_hash, ChainProfile, ProposalId};
@@ -1227,6 +1230,39 @@ async fn a_hub_locks_no_hash_another_of_its_services_holds() {
     let record = &eco.provider().records(1).unwrap()[0];
     assert_eq!((record.stage, &record.lock), (Stage::Failed, &None));
     assert_eq!(eco.kinds(), ["accepted", "failed"]);
+}
+
+/// What the hub's ledger waits on, such as a block scan, waits off the
+/// async runtime: the runtime's one thread runs other tasks meanwhile.
+#[tokio::test]
+async fn a_hub_locks_its_own_off_the_async_runtime() {
+    let (entered, entering) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let released = Mutex::new(released);
+    let guard: Guard = Box::new(move |_| {
+        entered.send(()).map_err(|e| e.to_string())?;
+        let waited = released
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(5));
+        waited
+            .map(|()| false)
+            .map_err(|_| "the runtime stood still".into())
+    });
+    let eco = Eco::issuing(100, guard).await;
+    let releasing = tokio::spawn(async move {
+        while entering.try_recv().is_err() {
+            tokio::task::yield_now().await;
+        }
+        release.send(()).unwrap();
+    });
+    let swap = eco
+        .client
+        .swap(PROVIDER, A, B, 20, SwapLimits::usual(20))
+        .await
+        .unwrap();
+    assert_eq!(swap.state, SwapState::Done);
+    releasing.await.unwrap();
 }
 
 #[tokio::test]
