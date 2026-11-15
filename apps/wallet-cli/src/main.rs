@@ -345,8 +345,9 @@ enum Command {
     /// Open a recovery contract at HUB, a hub the wallet trusts: its
     /// collateral protects the wallet's notes there, up to its cap, until
     /// the contract's deadline. Paid from a coin of the wallet's on
-    /// Bitcoin, its change back to it. Regtest only for now, under the mock
-    /// authority: such a contract protects nothing.
+    /// Bitcoin, its change back to it. On regtest under the mock authority,
+    /// protecting nothing; on signet under the genuine programs, a trial
+    /// this wallet cannot recover with yet. No other network for now.
     OpenContract {
         hub: String,
         /// Blocks from now to its close [default: as many as the hub

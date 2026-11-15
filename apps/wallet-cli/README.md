@@ -100,8 +100,11 @@ up with it. `--blocks` sets the blocks to its close (by default the most
 the hub allows), `--max-price` the most to pay (by default the price the
 hub's info says). Several contracts, at one hub or several, each take their
 own coin. `contracts` lists them; with `--chain`, it carries on those under
-way and sees where each one's funding stands. Regtest only for now, under a
-mock proof authority: such a contract protects nothing.
+way and sees where each one's funding stands. On regtest, contracts are
+under a mock proof authority: such a contract protects nothing. On signet
+they are under the genuine programs, a trial this wallet cannot recover
+with yet (the hub's README says what else it lacks). No other network for
+now.
 
 `discover --relay wss://relay.example` lists the hubs announced on Nostr,
 at the URLs that answer as the hub that announced them; with `--swaps`, the
