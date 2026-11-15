@@ -215,6 +215,7 @@ async fn used(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     found_hubs(phone).await?;
     cashed_out(eco, phone).await?;
     visited(eco, phone).await?;
+    contracted(eco, phone).await?;
 
     // Started again: at once, holding the same.
     let held = phone.balance().await?;
@@ -373,6 +374,126 @@ async fn cashed_out(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
         back < held && back > held * 8 / 10,
         "{back} held once {held} cashed out and moved back in"
     );
+    Ok(())
+}
+
+/// A recovery contract at its hub, opened as its user would: with no coin
+/// on Bitcoin to pay its price, notes cashed out to itself for it first,
+/// as the quote offers; then signed, confirmed and protecting its cap of
+/// the notes there, on credit no longer. Its price paid, its change kept
+/// on Bitcoin. Closing it, it is told to cash out instead.
+async fn contracted(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
+    const PRICE: u64 = 23_000;
+    const CAP: u64 = 4_096;
+    let mine = || async {
+        let waiting = eco.core("getmempoolinfo", json!([])).await?["size"].as_u64();
+        if waiting.unwrap_or(0) > 0 {
+            eco.mine(1).await?;
+        }
+        anyhow::Ok(())
+    };
+    // A note on screen holding `text`, as Home's start with an amount.
+    let note = |text: &'static str| async move {
+        until(text, 30, || async {
+            let views = phone.views().await?;
+            Ok(views.into_iter().find(|v| v.text.contains(text)))
+        })
+        .await
+    };
+    let on_home = |texts: &'static [&'static str]| async move {
+        let views = phone.views().await?;
+        anyhow::Ok(
+            views
+                .iter()
+                .any(|v| texts.iter().any(|t| v.text.contains(t))),
+        )
+    };
+    // Enough in notes to pay for it, and to pay with after.
+    let code: PaymentCode = phone.code().await?.parse()?;
+    let fallback = code.address.context("a fallback address")?;
+    let held = phone.balance().await?;
+    eco.send_to(&fallback.assume_checked().to_string(), 100_000)
+        .await?;
+    until("100000 moved into Licash", 300, || async {
+        mine().await?;
+        let busy = on_home(&[
+            "on its way from Bitcoin",
+            "moved in once enough",
+            "coming on Bitcoin",
+        ])
+        .await?;
+        Ok((!busy && phone.balance().await? > held + 90_000).then_some(()))
+    })
+    .await?;
+
+    // No coin on Bitcoin pays its price: cashed out to itself first.
+    phone.tap("Where it is").await?;
+    phone.tap_id("open-contract").await?;
+    phone.wait("Open a contract at", 60).await?;
+    phone.wait("A mock contract, for testing", 10).await?;
+    // A dialog's views carry no ids: by their text.
+    phone.tap("Cash out to this wallet").await?;
+    phone.wait("To this wallet, on Bitcoin", 120).await?;
+    phone.wait("33\u{2009}000 sat", 10).await?;
+    phone.tap("Send").await?;
+    phone.wait("Sending", 60).await?;
+    phone.tap("Done").await?;
+    until("the payout kept on Bitcoin", 300, || async {
+        mine().await?;
+        phone.find("Cashed out, kept on Bitcoin").await
+    })
+    .await?;
+    phone.back().await?;
+    let coin = note("cashed out, kept on Bitcoin").await?;
+    let coin = licash_e2e::phone::amount(&coin.text);
+    let before = phone.balance().await?;
+    let credit = licash_e2e::phone::amount(&phone.by_id("credit", 10).await?.text);
+    eprintln!("a coin of {coin} kept, {before} held, {credit} on credit");
+
+    // Paid from it now, its change back.
+    phone.tap("Where it is").await?;
+    phone.tap_id("open-contract").await?;
+    phone
+        .wait("It costs 23\u{2009}000 sat, paid from a coin of yours", 60)
+        .await?;
+    phone.tap("Open for 23\u{2009}000 sat").await?;
+    phone.wait("Opening a contract", 30).await?;
+    let protecting = until("the contract protecting", 900, || async {
+        mine().await?;
+        let views = phone.views().await?;
+        let state = views.into_iter().find(|v| v.id == "contract-state");
+        Ok(state.filter(|v| v.text == "Protecting"))
+    })
+    .await?;
+    eprintln!("contract {:?}", protecting.text);
+    phone.wait("Mock, for testing", 10).await?;
+    // In advanced mode, since onboarding: forcing it, not yet.
+    phone.wait("Force close", 10).await?;
+    phone.tap_id("close-contract").await?;
+    phone.wait("Close this contract?", 10).await?;
+    phone
+        .wait("A contract closes by itself at block", 10)
+        .await?;
+    phone.tap("Cancel").await?;
+    phone.wait_gone("Close this contract?", 10).await?;
+    phone.back().await?;
+
+    phone
+        .wait("4\u{2009}096 sat in notes protected by contracts", 30)
+        .await?;
+    let now = licash_e2e::phone::amount(&phone.by_id("credit", 10).await?.text);
+    ensure!(now + CAP == credit, "{now} on credit, {credit} before");
+    let after = phone.balance().await?;
+    ensure!(after + PRICE == before, "{after} held, {before} before");
+    let change = note("cashed out, kept on Bitcoin").await?;
+    let change = licash_e2e::phone::amount(&change.text);
+    ensure!(change + PRICE == coin, "{change} back of {coin}");
+    // Its price in the history, as paid once its funding confirmed.
+    phone.tap("Contract opened").await?;
+    phone.wait("Opened at", 30).await?;
+    phone.wait("On Bitcoin, from a coin of yours", 10).await?;
+    phone.back().await?;
+    phone.wait("Receive", 10).await?;
     Ok(())
 }
 
