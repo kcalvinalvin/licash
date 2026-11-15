@@ -86,6 +86,14 @@ async fn wallets_pay_and_get_paid_over_lightning_across_hubs() -> anyhow::Result
     assert_eq!(lock.state, LockState::Refunded);
     assert!(lock.failure.is_some());
     assert_eq!(available(&alice), before);
+
+    // hub1's operator sees them in its dashboard, read beside it running.
+    let dashboard = eco.dashboard("hub1", "licash-hub").await?;
+    assert_eq!(dashboard.check("Service").map(|c| c.0), Some("good".into()));
+    assert!(dashboard.card("Lightning in") >= Some(1.0));
+    assert!(dashboard.card("Lightning out") >= Some(2.0));
+    assert!(dashboard.card("Failed") >= Some(1.0));
+    assert!(dashboard.card("Fees") > Some(0.0));
     Ok(())
 }
 

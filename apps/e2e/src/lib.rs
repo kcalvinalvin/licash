@@ -161,6 +161,13 @@ impl Eco {
         self.compose(&all).await
     }
 
+    /// The dashboard of `service`, run there by its `cli` beside it, as
+    /// JSON: the range of 30 days.
+    pub async fn dashboard(&self, service: &str, cli: &str) -> anyhow::Result<Dashboard> {
+        let view = self.exec(service, &[cli, "dashboard", "--json"]).await?;
+        Ok(Dashboard(serde_json::from_slice(&view)?))
+    }
+
     /// Stop `service`, until [`Eco::start`]ed again.
     pub async fn stop(&self, service: &str) -> anyhow::Result<()> {
         self.compose(&["stop", service]).await?;
@@ -708,5 +715,36 @@ impl Eco {
             .await?;
         }
         Ok(())
+    }
+}
+
+/// A service's dashboard as it prints in JSON ([`Eco::dashboard`]).
+pub struct Dashboard(pub Value);
+
+impl Dashboard {
+    fn panels(&self) -> impl Iterator<Item = &Value> {
+        let pages = self.0["pages"].as_array().into_iter().flatten();
+        let rows = pages.flat_map(|p| p["rows"].as_array().into_iter().flatten());
+        rows.flat_map(|r| r.as_array().into_iter().flatten())
+    }
+
+    /// The value of the card `title`, on any page: none if it has none.
+    pub fn card(&self, title: &str) -> Option<f64> {
+        let cards = self
+            .panels()
+            .flat_map(|p| p["cards"].as_array().into_iter().flatten());
+        cards.into_iter().find(|c| c["title"] == title)?["value"].as_f64()
+    }
+
+    /// The tone and detail of the health check `name`.
+    pub fn check(&self, name: &str) -> Option<(String, String)> {
+        let checks = self
+            .panels()
+            .flat_map(|p| p["checks"].as_array().into_iter().flatten());
+        let check = checks.into_iter().find(|c| c["name"] == name)?;
+        Some((
+            check["tone"].as_str()?.to_owned(),
+            check["detail"].as_str()?.to_owned(),
+        ))
     }
 }

@@ -173,5 +173,12 @@ async fn a_provider_restarted_takes_its_swaps_on_and_unclaimed_locks_return() ->
     for kind in ["accepted", "done", "refunded"] {
         assert!(events.contains(&format!("\"kind\":\"{kind}\"")), "{events}");
     }
+    // And in its dashboard, read beside it running.
+    let dashboard = eco.dashboard("swaps", "licash-swaps").await?;
+    assert_eq!(dashboard.check("Service").map(|c| c.0), Some("good".into()));
+    assert!(dashboard.card("Done") >= Some(1.0));
+    assert!(dashboard.card("Never claimed") >= Some(1.0));
+    assert!(dashboard.card("Fees") > Some(0.0));
+    assert!(dashboard.card("Notes held") > Some(0.0));
     Ok(())
 }
