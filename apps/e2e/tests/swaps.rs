@@ -15,6 +15,11 @@ use rand_core::{OsRng, RngCore};
 /// What the provider holds at hub 2 for the tests.
 const STOCK: u64 = 60_000;
 
+/// Blocks the provider's lock at hub 2 expires before its client's at hub
+/// 1, at least: 36 to get a refund request confirmed, hub 2's window of
+/// 144, 1 to read the preimage, its margin of 12 to claim with it, and 1.
+const LEAD: u32 = 36 + 144 + 1 + 12 + 1;
+
 fn held(wallet: &Wallet, hub: &str) -> u64 {
     let balance = wallet.balance().unwrap();
     balance
@@ -47,7 +52,9 @@ async fn wallets_swap_between_hubs_through_a_provider_they_discover() -> anyhow:
     assert_eq!(found[0].announcement.urls, [eco.swaps()]);
     let info = eco.swaps_info().await?;
     assert!(found[0].named_by(info.nostr.as_deref()), "{found:?}");
-    assert_eq!((info.fee.base, info.fee.ppm, info.margin), (1, 5000, 12));
+    assert_eq!((info.fee.base, info.fee.ppm), (1, 5000));
+    let at_hub2 = info.hub(&eco.info(hub2).await?.address).unwrap();
+    assert_eq!(info.margin_at(at_hub2), LEAD);
 
     eco.stock(STOCK).await?;
     let alice = eco.wallet("swapper")?;
@@ -111,8 +118,8 @@ async fn ask(
     );
     let swap = eco.ask_swap(&request).await?;
     assert_eq!(swap.state, State::Locked, "{swap:?}");
-    // The provider's lock expires its margin earlier.
-    assert_eq!(swap.expiry, expiry - 12);
+    // The provider's lock expires its lead earlier.
+    assert_eq!(swap.expiry, expiry - LEAD);
     Ok((lock, swap))
 }
 
@@ -129,7 +136,8 @@ async fn a_provider_restarted_takes_its_swaps_on_and_unclaimed_locks_return() ->
     eco.pay_in(&bob, hub1, 8_000).await?;
     bob.add_hub(hub2).await?;
     let hubs = (eco.info(hub1).await?, eco.info(hub2).await?);
-    let expiry = eco.height().await? + 40;
+    // Within hub 1's 240 blocks, leaving the provider's lock 26.
+    let expiry = eco.height().await? + LEAD + 26;
     let mut preimages = [[0; 32]; 2];
     for preimage in &mut preimages {
         OsRng.fill_bytes(preimage);
