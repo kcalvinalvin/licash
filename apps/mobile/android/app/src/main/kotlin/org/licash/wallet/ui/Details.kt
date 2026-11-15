@@ -43,7 +43,6 @@ import org.licash.core.NoteLine
 import org.licash.core.NotesOf
 import org.licash.core.NotesPaid
 import org.licash.core.Onchain
-import org.licash.core.PaidTo
 import org.licash.core.PayoutSteps
 import org.licash.core.State
 import org.licash.wallet.AppLog
@@ -72,9 +71,7 @@ fun ActivityDetails(engine: Engine, ui: Ui, shown: Activity, back: () -> Unit) {
         engine.details(activity)
             .onSuccess { details = it; error = null }
             .onFailure { error = explain(it) }
-        if (ui.developer) {
-            engine.notesOf(activity).onSuccess { notes = it }.onFailure { AppLog.warn("its notes", it) }
-        }
+        engine.notesOf(activity).onSuccess { notes = it }.onFailure { AppLog.warn("its notes", it) }
     }
     val copy: (String, String) -> Unit = { label, text ->
         scope.launch { clipboard.setClipEntry(ClipEntry(ClipData.newPlainText(label, text))) }
@@ -144,6 +141,8 @@ fun ActivityDetails(engine: Engine, ui: Ui, shown: Activity, back: () -> Unit) {
                 )
             }
         }
+        // Drawn for all: each note's identifier, only in advanced mode.
+        notes?.let(::flowOf)?.let { flow -> Group("Notes") { NotesFlow(activity, flow) } }
         if (ui.developer) {
             Technical(activity, details, copy)
             notes?.takeIf { it.spent.isNotEmpty() || it.made.isNotEmpty() }?.let { NotesGroup(activity, it, copy) }
@@ -554,7 +553,7 @@ private fun Technical(activity: Activity, details: Details?, copy: (String, Stri
  */
 @Composable
 private fun NotesGroup(activity: Activity, notes: NotesOf, copy: (String, String) -> Unit) {
-    Group("Notes") {
+    Group("Each note") {
         val made = notes.made
         val unlinked = made.count { it.linking == Linking.UNLINKED }
         Text(
@@ -599,16 +598,7 @@ private fun NotesGroup(activity: Activity, notes: NotesOf, copy: (String, String
 /** Part of what the notes spent paid: to whom, how much, in which notes. */
 @Composable
 private fun PaidRow(kind: Kind, part: NotesPaid) {
-    val to = when (part.to) {
-        PaidTo.PAYEE -> when (kind) {
-            Kind.LIGHTNING -> "To the invoice, through the hub"
-            Kind.PAYOUT, Kind.SWAP -> "To the provider"
-            else -> "To the payee"
-        }
-        PaidTo.ITSELF -> "To this wallet"
-        PaidTo.HUB -> "The hub's fee"
-        PaidTo.KEPT -> "Kept"
-    }
+    val to = paidTo(kind, part.to)
     Row(Modifier.fillMaxWidth().padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
         Column(Modifier.weight(1f)) {
             Text(to, style = MaterialTheme.typography.bodyLarge)
