@@ -209,6 +209,9 @@ pub struct Info {
     /// payments of notes at this hub (NIP-17).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub relays: Vec<String>,
+    /// None unless the hub opens recovery contracts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contracts: Option<Contracts>,
     /// That the hub of [`Info::address`] says the rest of its
     /// [`Info::identity`] is its own: a BIP340 signature by its spend key.
     /// None from hubs following no chain, and from older hubs.
@@ -228,6 +231,7 @@ impl Info {
             nostr: None,
             tweaks: None,
             relays: Vec::new(),
+            contracts: None,
             proof: None,
         }
     }
@@ -685,6 +689,21 @@ impl ReceiveStatus {
             .map(|l| Ok(ProposalId::from_bytes(l.array("lock")?)))
             .transpose()
     }
+}
+
+/// The recovery contracts a hub opens, in its info, as it offers them
+/// now: the terms an opening binds are those of its quote then.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Contracts {
+    /// The most notes a contract protects, in sat.
+    pub cap: u32,
+    /// What opening one costs its holder, in sat, from her deposit.
+    pub price: u64,
+    /// Blocks from its opening to its close, at most.
+    pub blocks: u32,
+    /// Under the mock authority, for regtest only: anyone "proves"
+    /// anything, and a contract protects nothing.
+    pub mock: bool,
 }
 
 /// What a hub takes on Bitcoin, in its info: deposits whose payment, once
