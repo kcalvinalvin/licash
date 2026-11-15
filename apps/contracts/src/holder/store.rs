@@ -47,7 +47,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS contracts_deposit ON contracts (deposit)
 const KEPT_DIR: &str = "contracts";
 
 /// Of the instances opening `id` in `dir` keeps, how many are on disk:
-/// those [`Store::keep`] finished writing. None if it keeps none there.
+/// those `Store::keep` finished writing. None if it keeps none there.
 pub fn kept(dir: &Path, id: &[u8; 32]) -> usize {
     let Ok(entries) = std::fs::read_dir(dir.join(KEPT_DIR).join(crate::hex_id(id))) else {
         return 0;

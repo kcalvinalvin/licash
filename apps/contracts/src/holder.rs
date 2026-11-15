@@ -41,7 +41,7 @@ const SPARE: u32 = 12;
 
 /// Blocks from a recovery's assertion deadline to the close on `quote`:
 /// the hub's challenge, her answer to it and the delays on what she is
-/// paid after, with [`SPARE`] blocks to confirm in; [`AFTER_ASSERT`] at
+/// paid after, with `SPARE` blocks to confirm in; [`AFTER_ASSERT`] at
 /// least.
 pub fn after_assert(quote: &Quote) -> u32 {
     let g = &quote.graph;
