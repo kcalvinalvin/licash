@@ -8,7 +8,10 @@
 //! Kept in the wallet's directory, `contracts.sqlite` and `contracts/`,
 //! made only once a first contract is asked for.
 
-use std::sync::{atomic::Ordering, Arc, PoisonError};
+use std::{
+    collections::HashMap,
+    sync::{atomic::Ordering, Arc, PoisonError},
+};
 
 use bitcoin::{OutPoint, Txid};
 use licash_contracts::holder::{self, Ask, Fate, Phase};
@@ -84,13 +87,14 @@ impl Wallet {
         self.saw(tip.map_err(|reason| LicashError::Unavailable { reason })?);
         let opened = holder::open(&self.wallet, &chain, &self.dir, &hub, ask);
         let opened = self.runtime.block_on(opened).map_err(unavailable)?;
-        Ok(self.contract(&opened))
+        // Protecting nothing before its funding is buried.
+        Ok(self.contract(&opened, 0))
     }
 
     /// The contracts, the newest first, as last seen.
     pub fn contracts(&self) -> Result<Vec<Contract>, LicashError> {
         let all = holder::list(&self.dir).map_err(failed)?;
-        Ok(all.iter().map(|c| self.contract(c)).collect())
+        self.listed(&all)
     }
 
     /// Carry on with the contracts being opened, and see where the funding
@@ -109,7 +113,7 @@ impl Wallet {
         }
         let all = holder::resume(&self.wallet, &chain, &self.dir);
         let all = self.runtime.block_on(all).map_err(unavailable)?;
-        Ok(all.iter().map(|c| self.contract(c)).collect())
+        self.listed(&all)
     }
 }
 
@@ -142,13 +146,21 @@ impl Wallet {
         self.tip.load(Ordering::Relaxed).max(looked)
     }
 
-    fn contract(&self, c: &holder::Contract) -> Contract {
+    /// `all`, each with what it protects of the notes held now.
+    fn listed(&self, all: &[holder::Contract]) -> Result<Vec<Contract>, LicashError> {
+        let covers = covers(all, self.tip(), &self.wallet.balance()?);
+        let covered = |c: &holder::Contract| covers.get(&c.id).copied().unwrap_or(0);
+        Ok(all.iter().map(|c| self.contract(c, covered(c))).collect())
+    }
+
+    fn contract(&self, c: &holder::Contract, covers: u64) -> Contract {
         Contract {
             id: hex(&c.id),
             hub: c.hub.clone(),
             state: state(c, self.tip()),
             mock: c.mock,
             cap: u64::from(c.cap),
+            covers,
             price: c.price,
             paid_from: c.value,
             protects_until: c.assert_height,
@@ -217,9 +229,9 @@ impl Wallet {
 }
 
 /// Of `balance`, `held` at each hub, what `contracts` protect at `tip`
-/// (none if it is unknown, 0), and what those being opened hold of the
-/// coins `reserved` for transactions, by their ids: its `covered`, and
-/// its `opening` rather than `moving`.
+/// ([`covers`]), and what those being opened hold of the coins `reserved`
+/// for transactions, by their ids: its `covered`, and its `opening` rather
+/// than `moving`.
 fn contracted(
     balance: &mut Balance,
     contracts: &[holder::Contract],
@@ -227,14 +239,7 @@ fn contracted(
     held: &[licash_wallet::Balance],
     reserved: &[(Txid, u64)],
 ) {
-    for at in held {
-        let hub = at.hub.trim_end_matches('/');
-        let live = contracts
-            .iter()
-            .filter(|c| c.hub == hub && tip > 0 && c.live(tip) && counted(c));
-        let cap: u64 = live.map(|c| u64::from(c.cap)).sum();
-        balance.covered += cap.min(at.available + at.pending);
-    }
+    balance.covered += covers(contracts, tip, held).values().sum::<u64>();
     for c in contracts.iter().filter(|c| c.abandoned.is_none()) {
         let Some(funding) = c.funding else { continue };
         for (_, value) in reserved.iter().filter(|(by, _)| *by == funding) {
@@ -243,6 +248,40 @@ fn contracted(
             balance.opening += value.saturating_sub(c.price);
         }
     }
+}
+
+/// What each of `contracts` protects, by id, of the notes `held` at its
+/// hub (those to come too) at `tip`, none if it is unknown (0): at each
+/// hub, of those live that count, the one whose deadline comes first
+/// takes up to its cap, then the next of what is left, by id among
+/// equals. Those protecting nothing are left out. A way to tell apart
+/// what each protects, not notes of its own: together they protect the
+/// least of the hub's notes and their caps.
+fn covers(
+    contracts: &[holder::Contract],
+    tip: u32,
+    held: &[licash_wallet::Balance],
+) -> HashMap<[u8; 32], u64> {
+    let mut covers = HashMap::new();
+    if tip == 0 {
+        return covers;
+    }
+    for at in held {
+        let hub = at.hub.trim_end_matches('/');
+        let mut live: Vec<&holder::Contract> = (contracts.iter())
+            .filter(|c| c.hub == hub && c.live(tip) && counted(c))
+            .collect();
+        live.sort_by_key(|c| (c.assert_height, c.id));
+        let mut left = at.available + at.pending;
+        for c in live {
+            let share = left.min(u64::from(c.cap));
+            if share > 0 {
+                covers.insert(c.id, share);
+            }
+            left -= share;
+        }
+    }
+    covers
 }
 
 /// Whether `c` counts as protecting notes: a mock one, on regtest, as it
@@ -417,6 +456,40 @@ mod tests {
         // Past their deadline, or with the chain unknown: none.
         assert_eq!(covered(360, &[held(HUB, 9_000, 0)]), 0);
         assert_eq!(covered(0, &[held(HUB, 9_000, 0)]), 0);
+    }
+
+    #[test]
+    fn each_contract_covers_what_those_ending_first_leave_up_to_its_cap() {
+        let ending = |id, assert_height| holder::Contract {
+            assert_height,
+            ..contract(id, Phase::Funded, Some(Fate::Live))
+        };
+        // The latest first by id, the earliest first by deadline.
+        let contracts = [ending(1, 400), ending(2, 380), ending(3, 400)];
+        let other = holder::Contract {
+            hub: "https://other.example".into(),
+            ..ending(4, 370)
+        };
+        let all = [&contracts[..], &[other]].concat();
+        let covers = |held: &[licash_wallet::Balance]| {
+            let covers = covers(&all, 300, held);
+            let of = |id: u8| covers.get(&[id; 32]).copied();
+            [of(1), of(2), of(3), of(4)]
+        };
+        let there = held("https://other.example", 1_000, 0);
+        assert_eq!(
+            covers(&[held(HUB, 9_000, 1_000), there.clone()]),
+            [Some(4_096), Some(4_096), Some(1_808), Some(1_000)]
+        );
+        assert_eq!(
+            covers(&[held(HUB, 5_000, 0), there]),
+            [Some(904), Some(4_096), None, Some(1_000)]
+        );
+        assert_eq!(covers(&[held(HUB, 0, 0)]), [None; 4]);
+        // Together, what the hub's notes are covered by.
+        let mut balance = Balance::default();
+        contracted(&mut balance, &all, 300, &[held(HUB, 5_000, 0)], &[]);
+        assert_eq!(balance.covered, 5_000);
     }
 
     #[test]

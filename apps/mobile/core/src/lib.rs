@@ -254,6 +254,11 @@ pub struct Contract {
     pub mock: bool,
     /// The most of the notes at its hub it protects, in sat.
     pub cap: u64,
+    /// Of the notes at its hub now, what it protects, in sat: up to its
+    /// cap, of those the live contracts there whose deadlines come first
+    /// leave; none unless it protects any (a genuine one, not until this
+    /// app recovers with it). Together, [`Balance::covered`] at its hub.
+    pub covers: u64,
     /// What opening it cost, in sat, from the coin it was paid from.
     pub price: u64,
     /// That coin's value, in sat: the rest came back as change.

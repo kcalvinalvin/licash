@@ -119,6 +119,7 @@ fun BalanceDetails(
                 hub?.lightningPay?.let { Hint("Pays Lightning invoices of up to ${sat(it)}") }
                 hub?.deposits?.let { Hint("Takes Bitcoin in from ${sat(it.min)} to ${sat(it.max)}") }
                 val here = ui.contracts.filter { sameHub(it.hub, holding.hub) && (ui.developer || shown(it)) }
+                if (here.isNotEmpty()) HubSplit(holding.available + holding.pending, here.sumOf { it.covers })
                 for (c in here) ContractCard(c, ui.chain.height, ui.developer) { closing = c }
                 if (ui.opening != null && sameHub(ui.opening, holding.hub)) {
                     Hint("Opening a contract: a few minutes, downloading what it needs.")
@@ -322,6 +323,9 @@ private fun ContractCard(c: Contract, height: Int, developer: Boolean, close: ()
                 Fact(if (c.mock) "Protected until" else "Covered until", "block ${c.protectsUntil}")
             else -> {
                 Fact(if (c.mock) "Protects up to" else "Covers up to", sat(c.cap))
+                if (c.state == ContractState.Protecting) {
+                    Fact(if (c.mock) "Protects now" else "Covers now", sat(c.covers))
+                }
                 Fact("Until", if (height > 0) "block ${c.protectsUntil}, ${duration(left)}" else "block ${c.protectsUntil}")
             }
         }
@@ -359,6 +363,29 @@ private fun Fact(label: String, value: String) {
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
         Text(value, Modifier.weight(1f), style = MaterialTheme.typography.bodySmall)
+    }
+}
+
+/** Of the notes `held` at a hub with contracts, what they cover, and the rest, on credit, in red. */
+@Composable
+private fun HubSplit(held: ULong, covered: ULong) {
+    val credit = if (held > covered) held - covered else 0uL
+    val colors = MaterialTheme.colorScheme
+    Row(Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 2.dp)) {
+        Text(
+            "Covered by contracts ${sat(covered)}",
+            Modifier.weight(1f).testTag("hub-covered"),
+            style = MaterialTheme.typography.bodySmall,
+            color = if (covered > 0uL) colors.primary else colors.onSurfaceVariant,
+        )
+        if (credit > 0uL) {
+            Text(
+                "On credit ${sat(credit)}",
+                Modifier.testTag("hub-credit"),
+                style = MaterialTheme.typography.bodySmall,
+                color = colors.error,
+            )
+        }
     }
 }
 
