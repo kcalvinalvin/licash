@@ -19,9 +19,13 @@ const BATCH: u32 = 144;
 pub enum Onchain {
     /// Look in the blocks since the last scan for payments and spends of
     /// the coins, then broadcast again the wallet's spends in no block yet.
+    /// In blocks no hub trusted serves silent payment tweaks of, for the
+    /// fallback addresses and the coins held only: those are looked in
+    /// again for silent payments once a hub serves their tweaks.
     Scan {
         /// The block to look from: at the first scan, or an earlier one to
-        /// look again [default: the first a hub trusted serves tweaks of].
+        /// look again [default: the first a hub trusted serves tweaks of;
+        /// at the first scan with none serving them, required].
         #[arg(long)]
         from: Option<u32>,
     },
@@ -164,8 +168,9 @@ pub async fn run(
 }
 
 /// Scan from the next block to the chain's height, with the tweaks of the
-/// hubs trusted serving them, the next after one that is unavailable; then
-/// broadcast again the spends in no block yet.
+/// hubs trusted serving them, the next after one that is unavailable, and
+/// without in blocks none serves tweaks of; then broadcast again the spends
+/// in no block yet.
 async fn scan(
     wallet: &Wallet<Http>,
     source: &Source,
@@ -175,20 +180,27 @@ async fn scan(
     let trusted = wallet.hubs()?.into_iter();
     let mut hubs: Vec<(String, u32)> = trusted.filter_map(|(u, i)| Some((u, i.tweaks?))).collect();
     hubs.sort_by_key(|(_, first)| *first);
-    let Some((earliest, first)) = hubs.first().cloned() else {
-        bail!("no hub trusted serves silent payment tweaks");
-    };
-    match (from, wallet.silent_next()?) {
-        (Some(from), _) => wallet.watch_silent(earliest.as_str(), from)?,
-        (None, None) => wallet.watch_silent(earliest.as_str(), first)?,
-        (None, Some(_)) => {}
+    match (from, wallet.silent_next()?, hubs.first()) {
+        (Some(from), ..) => wallet.watch_silent(None, from)?,
+        (None, None, Some((_, first))) => wallet.watch_silent(None, *first)?,
+        (None, None, None) => bail!(
+            "no hub trusted serves silent payment tweaks: name the block to look from, --from HEIGHT"
+        ),
+        (None, Some(_), _) => {}
     }
     let chain = Blocks(source.clone());
     let (mut found, mut spent, mut fetched) = (Vec::new(), Vec::new(), 0);
+    let mut without = false;
     let scanned = loop {
         let next = wallet.silent_next()?.expect("watching");
-        let scanned = batch(wallet, &hubs, &chain, next).await?;
-        tracing::info!(next = scanned.next, height = scanned.height, "scanned");
+        let (scanned, tweaks) = batch(wallet, &hubs, &chain, next).await?;
+        without |= !tweaks;
+        tracing::info!(
+            next = scanned.next,
+            height = scanned.height,
+            tweaks,
+            "scanned"
+        );
         found.extend(scanned.found.iter().cloned());
         spent.extend(scanned.spent.iter().copied());
         fetched += scanned.fetched;
@@ -210,15 +222,20 @@ async fn scan(
             scanned.height
         ),
     };
+    let without_text = match without {
+        true => " (some without tweaks: the fallback addresses only)",
+        false => "",
+    };
     show(
         json,
         json!({
             "next": scanned.next, "height": scanned.height, "fetched": fetched,
             "found": found.iter().map(coin_json).collect::<Vec<_>>(),
             "spent": spent.iter().map(|o| o.to_string()).collect::<Vec<_>>(),
+            "tweaks": !without,
         }),
         format!(
-            "found {} {} of {value} sat, {} spent; looked up to block {}{behind}",
+            "found {} {} of {value} sat, {} spent; looked up to block {}{behind}{without_text}",
             found.len(),
             if found.len() == 1 { "coin" } else { "coins" },
             spent.len(),
@@ -229,25 +246,30 @@ async fn scan(
 }
 
 /// A batch of blocks from `next`, with the tweaks of the first of `hubs`
-/// serving them that is available.
+/// serving them that is available; if none serves `next`'s, without, up to
+/// the first block one does: for the fallback addresses and the coins held
+/// only, looked in again once scanned with tweaks. Whether with tweaks.
 async fn batch(
     wallet: &Wallet<Http>,
     hubs: &[(String, u32)],
     chain: &Blocks,
     next: u32,
-) -> anyhow::Result<licash_wallet::Scanned> {
+) -> anyhow::Result<(licash_wallet::Scanned, bool)> {
     let mut failed = None;
     for (url, _) in hubs.iter().filter(|(_, first)| *first <= next) {
         match wallet.scan_silent(url.as_str(), chain, BATCH).await {
-            Ok(scanned) => return Ok(scanned),
+            Ok(scanned) => return Ok((scanned, true)),
             Err(e @ Error::Unavailable { .. }) => failed = Some(e),
             Err(e) => return Err(e.into()),
         }
     }
-    match failed {
-        Some(e) => Err(e.into()),
-        None => bail!("no hub trusted serves the tweaks of block {next} on"),
+    // Those serving them are unreachable: wait for one.
+    if let Some(e) = failed {
+        return Err(e.into());
     }
+    let later = hubs.iter().map(|(_, first)| *first).find(|f| *f > next);
+    let max = later.map_or(BATCH, |first| BATCH.min(first - next));
+    Ok((wallet.scan_silent(None, chain, max).await?, false))
 }
 
 /// Whom `code` names to pay on Bitcoin: its silent payment address, else

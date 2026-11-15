@@ -59,7 +59,11 @@ confirmed. A deposit never received is taken back after its timeout with
 With `--sp`, the code also names the wallet's silent payment address and a
 fallback address any wallet pays. `onchain --chain <url> scan` finds what
 they pay with the tweaks of a hub serving them (fetching only the blocks
-whose filters match from a node with `-blockfilterindex`); `onchain coins`
+whose filters match from a node with `-blockfilterindex`). In blocks no
+hub trusted serves tweaks of, it finds what the fallback addresses are
+paid only, looking in them again for silent payments once a hub serves
+their tweaks; with no such hub, the first scan needs `--from <height>`.
+`onchain coins`
 lists the coins, `onchain send <to> <amount>` pays an address, a silent
 payment address or a code on Bitcoin, and `onchain move` deposits the coins
 for notes at a hub taking deposits.

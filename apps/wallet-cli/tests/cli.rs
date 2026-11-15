@@ -1237,3 +1237,34 @@ fn coins_paid_on_bitcoin_are_found_spent_and_moved_to_notes() {
     assert_eq!(scan(&alice)["spent"].as_array().unwrap().len(), 2);
     assert_eq!(json(&alice, &["onchain", "coins"]), serde_json::json!([]));
 }
+
+#[test]
+fn coins_paid_at_a_fallback_address_are_found_with_no_hub_serving_tweaks() {
+    let hub = Server::with_deposits(FEE);
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, _) = party(dir.path(), "alice", Some(&hub));
+    let chain = hub.esplora().to_owned();
+    let scan = |args: &[&str]| {
+        let mut all = vec!["--json", "onchain", "--chain", &chain, "scan"];
+        all.extend(args);
+        wallet(&alice, &all, None)
+    };
+    // No hub's tweaks to start from: she names the block.
+    failed(scan(&[]), 1, "--from");
+    let from = (hub.height() + 1).to_string();
+
+    // Paid at her fallback address and at her silent payment address: the
+    // first found only.
+    let (fallback, sp, _) = on_bitcoin(&alice);
+    hub.pay_onchain(&fallback, 3_000, 1);
+    hub.pay_silent(&sp, 2_500, 2);
+    hub.round();
+    let scanned: Value = serde_json::from_str(&ok(scan(&["--from", &from]))).unwrap();
+    assert_eq!(values(&scanned["found"]), [3_000]);
+    assert_eq!(scanned["tweaks"], false);
+    assert_eq!(scanned["next"], hub.height() + 1);
+    let again: Value = serde_json::from_str(&ok(scan(&[]))).unwrap();
+    assert_eq!(again["found"], serde_json::json!([]));
+    let coins = ok(wallet(&alice, &["onchain", "coins"], None));
+    assert!(coins.ends_with("total  3000\n"), "{coins}");
+}
