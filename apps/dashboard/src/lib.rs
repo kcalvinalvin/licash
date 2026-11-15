@@ -11,10 +11,21 @@
 //! A service calls [`Args::run`] from its `dashboard` command with a loader
 //! the dashboard calls again on every refresh, off the terminal's thread.
 
+mod app;
+mod chart;
+mod format;
 mod page;
+mod render;
 mod series;
+mod style;
+mod view;
+mod window;
+
+#[cfg(test)]
+mod tests;
 
 use std::fmt;
+use std::io::IsTerminal;
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -121,12 +132,15 @@ impl Args {
     where
         F: FnMut() -> anyhow::Result<Report> + Send + 'static,
     {
-        let _refresh = Duration::from_secs(self.refresh);
         let report = load()?;
         if self.json {
-            println!("{}", serde_json::to_string_pretty(&report)?);
+            let view = view::View::new(&report, self.range);
+            println!("{}", serde_json::to_string_pretty(&view)?);
             return Ok(());
         }
-        anyhow::bail!("the terminal dashboard is not drawn yet: use --json")
+        if !std::io::stdout().is_terminal() {
+            anyhow::bail!("the dashboard draws on a terminal: run it in one, or with --json");
+        }
+        app::run(report, load, self.range, Duration::from_secs(self.refresh))
     }
 }
