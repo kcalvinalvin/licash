@@ -133,7 +133,8 @@ fun ActivityDetails(engine: Engine, ui: Ui, shown: Activity, back: () -> Unit) {
             )
         }
         val payout = details as? Details.Payout
-        val flow = notes?.let(::flowOf)
+        // How its notes moved: for those who asked to see notes.
+        val flow = notes?.takeIf { ui.developer }?.let(::flowOf)
         if (payout != null || flow != null || ui.developer) {
             Spacer(Modifier.height(8.dp))
             More(modifier = Modifier.testTag("more")) {
