@@ -13,6 +13,7 @@ path = "src/main.rs"
 licash.workspace = true
 licash-api.workspace = true
 licash-chain-client.workspace = true
+licash-contracts = { path = "../contracts" }
 licash-hub.workspace = true
 licash-nostr = { workspace = true, features = ["tor"] }
 licash-notify.workspace = true
@@ -41,7 +42,9 @@ fake = []
 
 [dev-dependencies]
 licash-hub-service = { path = ".", features = ["fake"] }
+licash-transport.workspace = true
 licash-wallet.workspace = true
+lngap-btc = { path = "../../vendor/ln-gap/crates/btc" }
 nostr-sdk = { version = "0.45.6", features = ["local-relay"] }
 tempfile = "3.27"
 tower = { version = "0.5", features = ["util"] }

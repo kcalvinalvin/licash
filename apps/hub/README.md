@@ -46,6 +46,18 @@ derived from its seed that `/v1/info` names. `/v1/info` also names the
 relays of its wallets' mailboxes, where payers send them payments: those
 of `--nostr-relay` unless `--mailbox-relay` names others.
 
+With `--contracts` (and `--chain` naming a Bitcoin Core node's JSON-RPC,
+with a wallet), the hub opens recovery contracts with its wallets: each
+locks collateral of the node's wallet behind the wallet's notes at the hub,
+up to a cap, until the contract's close. `/v1/info` names the cap, the
+price a wallet pays to open one and the most blocks to its close; the
+openings take `/v1/contracts`. F, a contract's funding, spends the node's
+coins, which stay locked while the opening lives. Openings are kept in
+`<data>/openings.sqlite`, as sensitive as the seed: back it up with
+`hub.sqlite`. Regtest only for now, under a mock proof authority: such a
+contract protects nothing. Each opening downloads about 100 MB of garbled
+instances to the wallet.
+
 With `--onion`, the hub also serves its API as an onion service of a Tor
 client of its own (Arti), and announces its URL, reaching the relays
 through Tor too. The service's key is in `<data>/tor/state`: back it up to

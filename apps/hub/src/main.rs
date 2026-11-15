@@ -13,6 +13,7 @@ use anyhow::Context;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use licash::spend::ChainProfile;
 use licash_chain_client::Source;
+use licash_contracts::hub::Openings;
 use licash_hub::{Fee, Hub, Ledger, Policy, Timing};
 use licash_hub_service::{
     announce::announce,
@@ -116,6 +117,13 @@ struct Chain {
         requires = "tweaks"
     )]
     tweaks_from: Option<u32>,
+    /// Open recovery contracts with wallets, kept in
+    /// `<data>/openings.sqlite`, F funded and signed by the wallet of the
+    /// node `--chain` names. Regtest only for now, under the mock
+    /// authority: a contract there protects nothing.
+    #[arg(long, env = "LICASH_HUB_CONTRACTS",
+          value_parser = clap::builder::BoolishValueParser::new())]
+    contracts: bool,
 }
 
 impl Chain {
@@ -622,10 +630,15 @@ fn command(cli: Cli) -> anyhow::Result<()> {
         } => {
             let policy = policy.policy();
             let (indexing, tweaks_from) = (chain.tweaks, chain.tweaks_from);
+            let contracting = chain.contracts;
             let chain = chain.source(&policy)?;
             anyhow::ensure!(
                 !indexing || chain.is_some(),
                 "indexing tweaks (--tweaks) needs --chain"
+            );
+            anyhow::ensure!(
+                !contracting || chain.is_some(),
+                "opening contracts (--contracts) needs --chain, a node's JSON-RPC"
             );
             let lightning = lightning.gateway()?;
             anyhow::ensure!(
@@ -694,15 +707,38 @@ fn command(cli: Cli) -> anyhow::Result<()> {
                 }
                 false => None,
             };
+            let runtime = tokio::runtime::Runtime::new()?;
+            let _entered = runtime.enter();
+            let contracts = match (contracting, &chain) {
+                (true, Some((source, _, _))) => {
+                    let keysets = hub.info().keysets;
+                    let keyset = keysets.first().context("the hub has no keyset")?;
+                    let opening = Openings::new(&cli.data, source.clone(), keyset.clone());
+                    let openings = runtime.block_on(opening).context("open the contracts")?;
+                    openings.spawn_sweeper();
+                    tracing::info!(mock = openings.advertise().mock, "opening contracts");
+                    Some(openings)
+                }
+                _ => {
+                    match licash_contracts::hub::signed(&cli.data) {
+                        Ok(0) => {}
+                        Ok(signed) => tracing::warn!(
+                            signed,
+                            "contracts signed in openings.sqlite, and --contracts is off"
+                        ),
+                        Err(e) => tracing::warn!("the contracts in openings.sqlite: {e:#}"),
+                    }
+                    None
+                }
+            };
             let services = Services {
                 gateway: gateway.clone(),
                 deposits: deposits.clone(),
                 tweaks: tweaks.clone(),
                 relays,
+                contracts,
             };
             let router = licash_hub_service::router(hub.clone(), services);
-            let runtime = tokio::runtime::Runtime::new()?;
-            let _entered = runtime.enter();
             // Served until the hub stops.
             let _onion = match onion {
                 true => {

@@ -392,6 +392,7 @@ impl Server {
                             deposits,
                             tweaks,
                             relays,
+                            contracts: None,
                         },
                     ),
                 )
