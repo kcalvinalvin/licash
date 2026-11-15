@@ -109,19 +109,32 @@ pub async fn plan<T: Transport>(
     amount: Option<u64>,
     route: &Route,
 ) -> anyhow::Result<Plan> {
+    let mut plans = plans(wallet, code, amount, route).await?;
+    Ok(plans.remove(0))
+}
+
+/// The ways [`plan`] finds of paying `code`: the one it picks first, then
+/// those through each other swap provider it could pick instead, in the
+/// order it prefers them. Never none: refused as [`plan`] is.
+pub async fn plans<T: Transport>(
+    wallet: &Wallet<T>,
+    code: &PaymentCode,
+    amount: Option<u64>,
+    route: &Route,
+) -> anyhow::Result<Vec<Plan>> {
     let amount = asked(wallet, code, amount)?;
     let Some(licash) = &code.licash else {
         return Err(unpayable(code, amount));
     };
     if let Some(hub) = wallet.hub_to_pay(licash, amount)? {
         let fee = wallet.send_fee(&hub, amount)?;
-        return Ok(Plan {
+        return Ok(vec![Plan {
             hub,
             amount,
             fee,
             swap: None,
             trusted: true,
-        });
+        }]);
     }
     let relays = hub_relays(wallet)?;
     if relays.is_empty() {
@@ -161,13 +174,13 @@ pub async fn plan<T: Transport>(
         let lacks = wallet.lacks(to, amount)?;
         // Held enough at a hub visited, a swap there brought before.
         if lacks == 0 {
-            return Ok(Plan {
+            return Ok(vec![Plan {
                 hub: to.clone(),
                 amount,
                 fee: wallet.send_fee(to, amount)?,
                 swap: None,
                 trusted,
-            });
+            }]);
         }
         let others = hubs.iter().map(|(url, _)| url).filter(|url| *url != to);
         let Some(from) = others.max_by_key(|url| available(url)) else {
@@ -182,6 +195,7 @@ pub async fn plan<T: Transport>(
                 continue;
             }
         };
+        let mut plans = Vec::new();
         for provider in found {
             let quote = &provider.quote;
             // Left at a hub not trusted: not much more than needed.
@@ -192,14 +206,19 @@ pub async fn plan<T: Transport>(
             let lock_fee = match wallet.lock_fee(from, quote.amount.saturating_add(quote.fee)) {
                 Ok(fee) => fee,
                 Err(Error::Insufficient { .. }) => continue,
-                Err(e) => return Err(e.into()),
+                // None found yet: refused, as when it was the first.
+                Err(e) if plans.is_empty() => return Err(e.into()),
+                Err(e) => {
+                    tracing::info!(url = %provider.url, "skipped: {e}");
+                    continue;
+                }
             };
             // At most all it holds there then.
             let fee = to_info
                 .fees
                 .spend
                 .due(available(to).saturating_add(quote.amount));
-            return Ok(Plan {
+            plans.push(Plan {
                 hub: to.clone(),
                 amount,
                 fee,
@@ -210,6 +229,9 @@ pub async fn plan<T: Transport>(
                 }),
                 trusted,
             });
+        }
+        if !plans.is_empty() {
+            return Ok(plans);
         }
         tracing::info!(%from, %to, lacks, "no swap: no provider found that it can pay");
     }
@@ -489,6 +511,51 @@ pub async fn swap_providers<T: Transport>(
     // Stable: the newest announced first among equals.
     providers.sort_by_key(|p| (!p.known, p.quote.fee, p.quote.info.margin));
     Ok(providers)
+}
+
+/// A hub announced on Nostr, and what it says of itself.
+#[derive(Clone, Debug)]
+pub struct AnnouncedHub {
+    /// The first URL announced that answered as the hub.
+    pub url: String,
+    /// The key that announced it, x-only in hex.
+    pub key: String,
+    pub name: Option<String>,
+    pub info: Info,
+}
+
+/// The hubs announced on `relays` for `wallet`'s network, asked through
+/// `route`, but those the wallet trusts: each at the first URL it was
+/// announced at that answers as the key that announced it. What a hub says
+/// of itself there is only shown: adding it is the owner's call.
+pub async fn hubs_announced<T: Transport>(
+    wallet: &Wallet<T>,
+    relays: &[String],
+    route: &Route,
+) -> anyhow::Result<Vec<AnnouncedHub>> {
+    let network = wallet.network().name();
+    let found = crate::discover(relays, route, Role::Hub, network).await?;
+    let trusted: HashSet<_> = wallet
+        .hubs()?
+        .into_iter()
+        .map(|(_, info)| info.address)
+        .collect();
+    let ask = |url: String| async move { wallet.hub_info(&url).await };
+    let answering = answering(found, ask, |i: &Info| i.nostr.as_deref()).await?;
+    let mut hubs: Vec<AnnouncedHub> = answering
+        .into_iter()
+        .filter(|(_, _, info)| !trusted.contains(&info.address))
+        .map(|(service, url, info)| AnnouncedHub {
+            url,
+            key: service.key,
+            name: service.announcement.name,
+            info,
+        })
+        .collect();
+    // One hub announced by two keys: once.
+    let mut seen = HashSet::new();
+    hubs.retain(|h| seen.insert(h.info.address));
+    Ok(hubs)
 }
 
 /// A swap provider announced on Nostr that pays notes out on Bitcoin, and
