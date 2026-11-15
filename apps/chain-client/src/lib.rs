@@ -650,6 +650,17 @@ impl Source {
             .map_err(|e| anyhow::anyhow!("checkpoint at {height}: {e}"))
     }
 
+    /// Call `method` of the node's JSON-RPC with `params`, for what this
+    /// client does not wrap, as its wallet's calls. Refused on an Esplora
+    /// API.
+    pub async fn rpc<T: DeserializeOwned>(&self, method: &str, params: Value) -> anyhow::Result<T> {
+        ensure!(
+            matches!(self.kind, Kind::Rpc { .. }),
+            "{self}: {method} needs a node's JSON-RPC"
+        );
+        self.call(method, params).await
+    }
+
     async fn call<T: DeserializeOwned>(&self, method: &str, params: Value) -> anyhow::Result<T> {
         let Kind::Rpc { url, auth } = &self.kind else {
             unreachable!("JSON-RPC on a node");
