@@ -24,6 +24,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.ClipEntry
 import androidx.compose.ui.platform.LocalClipboard
@@ -36,7 +37,10 @@ import kotlinx.coroutines.launch
 import org.licash.core.Activity
 import org.licash.core.Details
 import org.licash.core.Kind
+import org.licash.core.Linking
 import org.licash.core.LockStep
+import org.licash.core.NoteLine
+import org.licash.core.NotesOf
 import org.licash.core.Onchain
 import org.licash.core.PayoutSteps
 import org.licash.core.State
@@ -61,10 +65,14 @@ fun ActivityDetails(engine: Engine, ui: Ui, shown: Activity, back: () -> Unit) {
     var details by remember { mutableStateOf<Details?>(null) }
     var error by remember { mutableStateOf<String?>(null) }
     var unopened by remember { mutableStateOf(false) }
+    var notes by remember { mutableStateOf<NotesOf?>(null) }
     LaunchedEffect(activity, ui.scanned) {
         engine.details(activity)
             .onSuccess { details = it; error = null }
             .onFailure { error = explain(it) }
+        if (ui.developer) {
+            engine.notesOf(activity).onSuccess { notes = it }.onFailure { AppLog.warn("its notes", it) }
+        }
     }
     val copy: (String, String) -> Unit = { label, text ->
         scope.launch { clipboard.setClipEntry(ClipEntry(ClipData.newPlainText(label, text))) }
@@ -130,7 +138,10 @@ fun ActivityDetails(engine: Engine, ui: Ui, shown: Activity, back: () -> Unit) {
                 )
             }
         }
-        if (ui.developer) Technical(activity, details, copy)
+        if (ui.developer) {
+            Technical(activity, details, copy)
+            notes?.takeIf { it.spent.isNotEmpty() || it.made.isNotEmpty() }?.let { NotesGroup(it, copy) }
+        }
         Spacer(Modifier.height(48.dp))
     }
 }
@@ -502,6 +513,96 @@ private fun Transaction(tx: Onchain, copy: (String, String) -> Unit) {
     Fact("Transaction", tx.txid, copy)
     tx.height?.let { Fact("Block", "$it", copy) }
     tx.fee?.let { Fact("Network fee", sat(it), copy, "$it") }
+}
+
+/**
+ * The notes it spent and those it made the wallet's, in advanced mode:
+ * each one's hub, and whether its hub can still tell which payment it came
+ * from. A tap copies a note's identifier.
+ */
+@Composable
+private fun NotesGroup(notes: NotesOf, copy: (String, String) -> Unit) {
+    Group("Notes") {
+        val made = notes.made
+        val unlinked = made.count { it.linking == Linking.UNLINKED }
+        Text(
+            listOfNotNull(
+                notes.spent.takeIf { it.isNotEmpty() }?.let { "Spent ${count(it)}." },
+                made.takeIf { it.isNotEmpty() }?.let {
+                    "Made ${count(it)}" + if (unlinked > 0) ", $unlinked unlinked since." else "."
+                },
+            ).joinToString(" ") + " An unlinked note was signed again blindly by its hub: " +
+                "the hub can't tell which payment it came from when it is spent.",
+            modifier = Modifier.padding(vertical = 8.dp),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        if (notes.spent.isNotEmpty()) {
+            Text("Spent", Modifier.padding(top = 8.dp), style = MaterialTheme.typography.titleSmall)
+            notes.spent.forEach { NoteRow(it, spentHere = true, copy = copy) }
+        }
+        if (made.isNotEmpty()) {
+            Text("Made", Modifier.padding(top = 8.dp), style = MaterialTheme.typography.titleSmall)
+            made.forEach { NoteRow(it, spentHere = false, copy = copy) }
+        }
+    }
+}
+
+/** `3 notes, 4,096 sat`. */
+private fun count(notes: List<NoteLine>): String {
+    val total = notes.fold(0uL) { sum, n -> sum + n.amount }
+    val what = if (notes.size == 1) "1 note" else "${notes.size} notes"
+    return "$what, ${sat(total)}"
+}
+
+/** A note: its amount, hub and linking, and where it went or came from. */
+@Composable
+private fun NoteRow(note: NoteLine, spentHere: Boolean, copy: (String, String) -> Unit) {
+    var done by remember { mutableStateOf(false) }
+    LaunchedEffect(done) {
+        if (done) {
+            delay(COPIED_MS)
+            done = false
+        }
+    }
+    val linking = when (note.linking) {
+        Linking.UNLINKED -> "unlinked"
+        Linking.STAYS_LINKED -> "stays linked: its hub refused to unlink it"
+        Linking.LINKED -> "linked, to be unlinked"
+    }
+    val where = when {
+        note.gone -> "spent by a copy of this wallet"
+        spentHere && note.madeByItself -> "made for this payment's amounts"
+        !spentHere && note.spentBy != null -> "spent since"
+        else -> null
+    }
+    Row(
+        Modifier.fillMaxWidth().clickable {
+            copy("Note", note.id)
+            done = true
+        }.padding(vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(sat(note.amount), style = MaterialTheme.typography.bodyLarge)
+            Text(
+                listOfNotNull(host(note.hub), linking, where).joinToString(" · "),
+                style = MaterialTheme.typography.bodySmall,
+                color = if (note.linking == Linking.UNLINKED) {
+                    MaterialTheme.colorScheme.onSurfaceVariant
+                } else {
+                    MaterialTheme.colorScheme.tertiary
+                },
+            )
+        }
+        Spacer(Modifier.width(12.dp))
+        Text(
+            if (done) "Copied" else short(note.id),
+            style = MaterialTheme.typography.bodySmall,
+            fontFamily = FontFamily.Monospace,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
 }
 
 @Composable

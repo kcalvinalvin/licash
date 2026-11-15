@@ -38,6 +38,7 @@ import org.licash.core.LicashException
 import org.licash.core.LightningInvoice
 import org.licash.core.Network
 import org.licash.core.Notes
+import org.licash.core.NotesOf
 import org.licash.core.Paid
 import org.licash.core.PayQuote
 import org.licash.core.PayoutQuote
@@ -430,6 +431,10 @@ class Engine(context: Context) {
     /** More of a line of the history, as far as the wallet looked. */
     suspend fun details(activity: Activity): Result<Details> =
         io { local { it.details(activity.kind, activity.id) } }
+
+    /** The notes a line of the history spent, and those it made the wallet's. */
+    suspend fun notesOf(activity: Activity): Result<NotesOf> =
+        io { local { it.notesOf(activity.kind, activity.id) } }
 
     /** Where to see the transaction `txid`, if anywhere. */
     fun explorerLink(txid: String): String? {
