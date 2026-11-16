@@ -107,6 +107,7 @@ impl Hubs {
                 spend: fee,
                 lock: fee,
                 refund: fee,
+                output_msat: 0,
                 timing: Timing { window, ..TIMING },
             };
             let hub = Arc::new(Hub::open(&seed, &db, policy).unwrap());

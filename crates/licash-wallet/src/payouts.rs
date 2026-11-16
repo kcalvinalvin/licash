@@ -79,7 +79,8 @@ pub struct PayoutQuote {
     pub budget: u64,
     /// The provider's fee, its coin's miners included.
     pub fee: u64,
-    /// The hub's fee on the wallet's lock, as it charges now.
+    /// The hub's fee on the wallet's lock, as it charges now: on what is
+    /// locked, in as many notes as it may take.
     pub lock_fee: u64,
 }
 
@@ -944,7 +945,7 @@ impl Terms<'_> {
             ));
         }
         let fee = chain.pays(value) - value;
-        let lock_fee = from_info.fees.lock.due(value.saturating_add(fee));
+        let lock_fee = from_info.fees.locking().at_most(value.saturating_add(fee));
         let quote = PayoutQuote {
             info,
             amount: self.amount,

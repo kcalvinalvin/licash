@@ -189,7 +189,23 @@ pub struct Policy {
     pub lock: Fee,
     /// In a lock's refund branch.
     pub refund: Fee,
+    /// Charged besides, in thousandths of a sat, for each note a spend or
+    /// a branch of a lock makes for others than the hub.
+    pub output_msat: u64,
     pub timing: Timing,
+}
+
+impl Policy {
+    /// The fees of this policy, as the hub advertises them: what it
+    /// charges is computed from them, as payers do.
+    pub fn fees(&self) -> licash_api::Fees {
+        licash_api::Fees {
+            spend: self.spend,
+            lock: self.lock,
+            refund: self.refund,
+            output_msat: self.output_msat,
+        }
+    }
 }
 
 /// What the hub publishes of itself.
@@ -518,11 +534,7 @@ impl Hub {
     pub fn advertise(&self) -> Result<licash_api::Info, Error> {
         let info = self.info();
         let (policy, timing) = (info.policy, info.policy.timing);
-        let fees = licash_api::Fees {
-            spend: policy.spend,
-            lock: policy.lock,
-            refund: policy.refund,
-        };
+        let fees = policy.fees();
         let locks = match (self.checkpoint(), self.scanned()?) {
             (Some(checkpoint), Some((height, _))) => Some(licash_api::Locks {
                 checkpoint: licash_api::Hex(checkpoint.to_bytes()),
@@ -659,8 +671,8 @@ impl Hub {
             return Err(Refusal::Timed.into());
         }
         let ys = proposal.verify(keyset, notes)?;
-        let (amount, fee) = self.charge(proposal)?;
-        let due = self.policy.spend.due(amount);
+        let (amount, fee, made) = self.charge(proposal)?;
+        let due = self.policy.fees().spending().due(amount, made);
         if fee < due {
             return Err(Refusal::Fee { due, paid: fee }.into());
         }
@@ -733,7 +745,7 @@ impl Hub {
             .iter()
             .map(|message| message.identifier())
             .collect::<Result<Vec<Point>, _>>()?;
-        let (amount, fee) = self.charge(proposal)?;
+        let (amount, fee, _) = self.charge(proposal)?;
         let income = self
             .owner
             .scan_key()
@@ -893,21 +905,19 @@ impl Hub {
         })
     }
 
-    /// The amount `proposal` moves and the part of it paid to the hub.
-    fn charge(&self, proposal: &Proposal) -> Result<(u64, u64), Error> {
+    /// The amount `proposal`, no lock, moves, the part of it paid to the
+    /// hub, and how many notes it makes for others.
+    fn charge(&self, proposal: &Proposal) -> Result<(u64, u64, usize), Error> {
         let amount = proposal
             .inputs()
             .iter()
             .fold(0u64, |sum, m| sum.saturating_add(m.denomination()));
-        let fee = self
-            .owner
-            .scan_key()
-            .receive(proposal)?
-            .iter()
-            .fold(0u64, |sum, r| {
-                sum.saturating_add(r.derivation.message().denomination())
-            });
-        Ok((amount, fee))
+        let received = self.owner.scan_key().receive(proposal)?;
+        let fee = received.iter().fold(0u64, |sum, r| {
+            sum.saturating_add(r.derivation.message().denomination())
+        });
+        let made = proposal.outputs().len().saturating_sub(received.len());
+        Ok((amount, fee, made))
     }
 }
 

@@ -706,7 +706,7 @@ impl<T: Transport> Provider<T> {
 
     /// At each hub that follows a chain, the most the provider can lock
     /// there: what it holds, less what the swaps it took will lock and the
-    /// hub's fee.
+    /// most the hub's fee comes to.
     fn stock(&self) -> Result<Vec<Stock>, Error> {
         let balance = self.wallet.balance()?;
         let mut stock = Vec::new();
@@ -720,7 +720,7 @@ impl<T: Transport> Provider<T> {
                 .map_or(0, |b| b.available);
             let free = available
                 .saturating_sub(self.reserved(&url)?)
-                .saturating_sub(info.fees.lock.due(available));
+                .saturating_sub(info.fees.locking().at_most(available));
             let lead = self.config.lead(locks);
             stock.push(Stock {
                 url,
@@ -1027,7 +1027,7 @@ impl<T: Transport> Provider<T> {
                 let reserved = self.reserved(terms.to).map_err(unavailable)?;
                 let needed = reserved
                     .saturating_add(request.amount)
-                    .saturating_add(to_info.fees.lock.due(available));
+                    .saturating_add(to_info.fees.locking().at_most(available));
                 if available < needed {
                     return Err(declined(format!(
                         "the provider holds too little at hub {} now",

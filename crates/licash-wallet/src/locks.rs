@@ -22,8 +22,8 @@ use licash_api::{Code, Info, Issued, Locked, Refund, Settle, Settled};
 use rusqlite::{params, OptionalExtension, Row};
 
 use crate::{
-    coins, hub_url, insert_note, invalid, now, payment_id, sql, unavailable, Error, Received, Step,
-    Transport, Wallet,
+    coins, hub_url, insert_note, invalid, made, now, payment_id, sql, unavailable, Error, Received,
+    Step, Transport, Wallet,
 };
 
 /// Blocks before its expiry after which the wallet no longer claims a
@@ -228,16 +228,16 @@ impl<T: Transport> Wallet<T> {
             };
             (keyset, inputs, amount, 0)
         } else {
-            let (keyset, selection) = self.select(hub, amount, &info.fees.lock)?;
+            let (keyset, selection) = self.select(hub, amount, &info.fees.locking())?;
             (keyset, selection.inputs, selection.total, selection.fee)
         };
-        let refund_fee = info.fees.refund.due(total);
-        if refund_fee > total {
-            return Err(Error::Insufficient {
-                needed: refund_fee,
+        // The refund branch returns all but its fee, which counts its notes.
+        let refunding = info.fees.refunding();
+        let refund_fee = coins::settle(total, 0, 0, &refunding, |value| made(&keyset, value))
+            .map_err(|needed| Error::Insufficient {
+                needed,
                 available: total,
-            });
-        }
+            })?;
         let notes = self.notes_of(&keyset, &inputs)?;
         let me = self.address();
         let ephemeral = Ephemeral::random();

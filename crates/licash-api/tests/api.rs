@@ -276,6 +276,65 @@ fn problems_and_their_statuses_are_the_wire_contract() {
 }
 
 #[test]
+fn a_fee_on_the_notes_made_rounds_to_the_nearest_sat_beside_the_fee_on_value() {
+    let fees = Fees {
+        spend: Fee { base: 1, ppm: 100 },
+        lock: Fee { base: 2, ppm: 0 },
+        refund: Fee { base: 3, ppm: 0 },
+        output_msat: 100,
+    };
+    let spend = fees.spending();
+    // 1, and 100 ppm of 10,000 rounded up, 1: the notes made add a tenth
+    // of a sat each, to the nearest sat.
+    assert_eq!(spend.due(10_000, 0), 2);
+    assert_eq!(spend.due(10_001, 4), 3);
+    assert_eq!(spend.due(10_000, 4), 2);
+    assert_eq!(spend.due(10_000, 5), 3);
+    assert_eq!(spend.due(10_000, 14), 3);
+    assert_eq!(spend.due(10_000, 15), 4);
+    // Each branch of a lock its own fee on value, the same on notes.
+    assert_eq!(fees.locking().due(0, 5), 3);
+    assert_eq!(fees.refunding().due(0, 5), 4);
+    // No part on the notes made is the fee on value alone.
+    let plain = Fees {
+        output_msat: 0,
+        ..fees
+    };
+    assert_eq!(plain.spending().due(10_001, 64), fees.spend.due(10_001));
+    assert_eq!(
+        Fees {
+            output_msat: u64::MAX,
+            ..fees
+        }
+        .spending()
+        .due(8, usize::MAX),
+        u64::MAX
+    );
+
+    // Before the notes are known: as many as two parts of the value can
+    // take, each of every power of two it holds.
+    assert_eq!(spend.at_most(0), 1);
+    assert_eq!(spend.at_most(7), 1 + 1 + 1);
+    assert_eq!(spend.at_most(10_000), 1 + 1 + 3);
+    for value in 0..2_000u64 {
+        for payee in 0..=value {
+            let notes = (payee.count_ones() + (value - payee).count_ones()) as usize;
+            assert!(spend.due(value, notes) <= spend.at_most(value));
+        }
+    }
+    assert_eq!(plain.spending().at_most(10_001), fees.spend.due(10_001));
+
+    // A hub that predates the fee on notes says none, and one that charges
+    // none says nothing an older wallet does not read.
+    let old: Fees = serde_json::from_str(r#"{"spend":{"base":1,"ppm":0}}"#).unwrap();
+    assert_eq!(old.output_msat, 0);
+    assert!(!serde_json::to_string(&plain).unwrap().contains("output"));
+    let said = serde_json::to_string(&fees).unwrap();
+    assert!(said.contains(r#""output_msat":100"#), "{said}");
+    assert_eq!(serde_json::from_str::<Fees>(&said).unwrap(), fees);
+}
+
+#[test]
 fn lock_bodies_carry_a_lock_and_its_settlement() {
     let f = fixture();
     let lookup = |id: &[u8; 32]| (id == f.keyset.id()).then_some(&f.keyset);

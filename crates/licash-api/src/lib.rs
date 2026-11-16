@@ -149,6 +149,68 @@ pub struct Fees {
     pub lock: Fee,
     /// In a lock's refund branch.
     pub refund: Fee,
+    /// Charged besides, in thousandths of a sat, for each note a spend or
+    /// a branch of a lock makes for others than the hub ([`NoteFee`]).
+    /// None from a hub that predates it.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub output_msat: u64,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
+impl Fees {
+    /// What a spend owes.
+    pub fn spending(&self) -> NoteFee {
+        self.with_outputs(self.spend)
+    }
+
+    /// What a lock's pay branch owes.
+    pub fn locking(&self) -> NoteFee {
+        self.with_outputs(self.lock)
+    }
+
+    /// What a lock's refund branch owes.
+    pub fn refunding(&self) -> NoteFee {
+        self.with_outputs(self.refund)
+    }
+
+    fn with_outputs(&self, fee: Fee) -> NoteFee {
+        NoteFee {
+            fee,
+            output_msat: self.output_msat,
+        }
+    }
+}
+
+/// What a spend, or one branch of a lock, owes its hub: `fee` on the value
+/// of the notes it spends, and `output_msat` thousandths of a sat for each
+/// note it makes for others than the hub. The hub's own notes, which pay
+/// it, are not charged for.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NoteFee {
+    pub fee: Fee,
+    pub output_msat: u64,
+}
+
+impl NoteFee {
+    /// The fee on spending notes worth `value` for `outputs` notes made
+    /// for others than the hub: the part on the notes made rounded to the
+    /// nearest sat, saturating.
+    pub fn due(&self, value: u64, outputs: usize) -> u64 {
+        let made = (u128::from(self.output_msat) * outputs as u128 + 500) / 1000;
+        u64::try_from(made).map_or(u64::MAX, |made| self.fee.due(value).saturating_add(made))
+    }
+
+    /// The most a spend of notes worth `value` owes, however it parts them
+    /// between a payee and change, each in the fewest notes of any power
+    /// of two: what an estimate made before the notes are known counts,
+    /// not to fall short. A keyset with no note that large makes more.
+    pub fn at_most(&self, value: u64) -> u64 {
+        let bits = (u64::BITS - value.leading_zeros()) as usize;
+        self.due(value, 2 * bits)
+    }
 }
 
 /// The locks a hub admits, as of its scan of Bitcoin, in blocks.

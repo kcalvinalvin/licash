@@ -390,6 +390,42 @@ fn spends_pay_the_policy_fee_in_outputs_to_the_hub() {
 }
 
 #[test]
+fn a_spend_pays_for_the_notes_it_makes_for_others_than_the_hub() {
+    let files = files();
+    let (_, keyset) = issuer(&files);
+    let (alice, bob) = (owner(1), owner(2));
+    let free = open(&files, Policy::default());
+    let address = free.info().address;
+    drop(free);
+    let coin = mint(&files, &alice, 8);
+    let spend =
+        |outputs: &[(Address, u64)]| Spend::new(&keyset, std::slice::from_ref(&coin), outputs);
+    let three = spend(&[
+        (bob.address(), 4),
+        (bob.address(), 2),
+        (bob.address(), 1),
+        (address, 1),
+    ]);
+    let two = spend(&[(bob.address(), 4), (bob.address(), 2), (address, 2)]);
+    let one = spend(&[(bob.address(), 4), (address, 2), (address, 1), (address, 1)]);
+    let per_note = |output_msat| Policy {
+        output_msat,
+        ..fee(1, 0)
+    };
+    // 0.6 sat a note, to the nearest sat: 2 for three notes, 1 for two,
+    // beside the base of 1. The hub's own notes cost nothing.
+    let hub = open(&files, per_note(600));
+    assert_eq!(hub.advertise().unwrap().fees.output_msat, 600);
+    assert_eq!(refused(three.offer(&hub)), Refusal::Fee { due: 3, paid: 1 });
+    two.offer(&hub).unwrap();
+    one.offer(&hub).unwrap();
+    drop(hub);
+    // A tenth of a sat a note is nothing on three notes.
+    let hub = open(&files, per_note(100));
+    three.offer(&hub).unwrap();
+}
+
+#[test]
 fn an_input_is_spent_once_and_a_second_signed_spend_is_alerted() {
     let files = files();
     let hub = open(&files, Policy::default());

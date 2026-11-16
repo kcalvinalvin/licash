@@ -126,6 +126,41 @@ async fn a_lock_unpaid_is_refunded_once_expired_at_depth() {
 }
 
 #[tokio::test]
+async fn each_branch_of_a_lock_pays_for_the_notes_it_makes() {
+    // 2 in each branch, and a sat for each note made for others than the
+    // hub.
+    let net = Net::new();
+    net.start_per_note(HUB, FEE, 1_000);
+    let (alice, bob) = (party(&net, 1).await, party(&net, 2).await);
+    alice.receive(&net.pay(HUB, &alice.address(), 64)).unwrap();
+
+    // Paid: 10 in two notes and a change of 48 in two, 6 to the hub.
+    assert_eq!(alice.lock_fee(HUB, 10).unwrap(), 6);
+    let lock = alice
+        .lock(HUB, &bob.address(), 10, hash(), Some(8))
+        .await
+        .unwrap();
+    assert_eq!(lock.fee, 6);
+    let received = bob.claim(HUB, &lock.id, &PREIMAGE).await.unwrap();
+    assert_eq!(received.amount, 10);
+    let paid = alice.follow_lock(&lock.id).await.unwrap();
+    assert_eq!(paid.state, LockState::Paid(PREIMAGE));
+    assert_eq!(available(&alice), (48, 0));
+
+    // Refunded: 48 back as 42 in three notes, 6 to the hub with its 2 and
+    // one sat that would take a note more.
+    let lock = alice
+        .lock(HUB, &bob.address(), 10, hash(), Some(8))
+        .await
+        .unwrap();
+    net.mine(HUB, 6, None);
+    let refunded = alice.resume().await.unwrap();
+    assert_eq!(refunded.locks[0].state, LockState::Refunded);
+    assert_eq!(available(&alice), (42, 0));
+    assert_eq!(lock.amount, 10);
+}
+
+#[tokio::test]
 async fn a_locks_parts_are_what_it_pays_until_refunded_then_the_refund() {
     let (net, alice, bob) = parties().await;
     let lock = alice

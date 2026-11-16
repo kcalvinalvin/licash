@@ -21,8 +21,9 @@ use licash_api::{Code, Info, Offer};
 use rusqlite::params;
 
 use crate::{
-    code_name, coins::MAX_INPUTS, invalid, now, outputs, sql, take, Error, Transport, Wallet,
-    RENEWAL_REFUSED,
+    code_name,
+    coins::{self, MAX_INPUTS},
+    invalid, made, now, outputs, sql, take, Error, Transport, Wallet, RENEWAL_REFUSED,
 };
 
 /// Notes renewed together, of one keyset: `(y, denomination)` each.
@@ -112,7 +113,10 @@ impl<T: Transport> Wallet<T> {
         let total = batch.iter().fold(0u64, |sum, n| sum.saturating_add(n.1));
         for asked in [false, true] {
             let info = self.hub(url)?.1;
-            let fee = info.fees.spend.due(total);
+            // What it does not pay is above any limit.
+            let spending = info.fees.spending();
+            let fee = coins::settle(total, 0, 0, &spending, |value| made(keyset, value))
+                .unwrap_or_else(|due| due);
             let limit = self.renew_limit();
             if !within(fee, total, limit) {
                 tracing::info!(

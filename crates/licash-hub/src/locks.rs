@@ -329,9 +329,16 @@ impl Hub {
         }
         let ys = signed.verify(keyset, notes)?;
         let charge = self.lock_charge(proposal)?;
+        let fees = self.policy.fees();
+        let made =
+            |branch: Branch, outputs: &[Output]| outputs.len().saturating_sub(charge.count(branch));
+        let (pay, refund) = (
+            made(Branch::Pay, proposal.outputs()),
+            made(Branch::Refund, timed.refund()),
+        );
         for (paid, due) in [
-            (charge.pay, self.policy.lock.due(charge.amount)),
-            (charge.refund, self.policy.refund.due(charge.amount)),
+            (charge.pay, fees.locking().due(charge.amount, pay)),
+            (charge.refund, fees.refunding().due(charge.amount, refund)),
         ] {
             if paid < due {
                 return Err(Refusal::Fee { due, paid }.into());

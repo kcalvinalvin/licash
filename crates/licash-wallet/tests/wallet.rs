@@ -797,6 +797,54 @@ async fn a_renewal_pays_its_hub_within_the_limit_only() {
 }
 
 #[tokio::test]
+async fn a_payment_pays_for_the_notes_it_makes_for_its_payee_and_as_change() {
+    // 1, and a sat for each note made for others than the hub.
+    let net = Net::new();
+    net.start_per_note(HUB, Fee { base: 1, ppm: 0 }, 1_000);
+    let (alice, bob) = (party(&net, 1).await, party(&net, 2).await);
+    assert_eq!(alice.hubs().unwrap()[0].1.fees.output_msat, 1_000);
+    alice.receive(&net.pay(HUB, &alice.address(), 64)).unwrap();
+
+    // 10 in two notes. A fee of 5 would leave 49, in three notes where it
+    // pays for two: 6 leaves 48, in two.
+    assert_eq!(alice.send_fee(HUB, 10).unwrap(), 6);
+    let payment = alice.send(HUB, &bob.address(), 10).await.unwrap().payment;
+    assert_eq!(bob.receive(&payment).unwrap().amount, 10);
+    assert_eq!(available(&alice), (48, 0));
+    assert_eq!(alice.sends().unwrap()[0].fee, 6);
+
+    // All of it, in three notes, and no change to pay for.
+    assert!(matches!(
+        alice.send(HUB, &bob.address(), 45).await,
+        Err(Error::Insufficient { needed: 50, .. })
+    ));
+    assert_eq!(alice.lacks(HUB, 45).unwrap(), 2);
+    let payment = alice.send(HUB, &bob.address(), 44).await.unwrap().payment;
+    assert_eq!(bob.receive(&payment).unwrap().amount, 44);
+    assert_eq!(available(&alice), (0, 0));
+    assert_eq!(alice.sends().unwrap()[0].fee, 4);
+}
+
+#[tokio::test]
+async fn a_renewal_counts_the_notes_it_makes_in_its_fee_and_its_limit() {
+    // A sat for each note: 100 renewed is 97 in three notes, and 3.
+    let net = Net::new();
+    net.start_per_note(HUB, Fee::default(), 1_000);
+    let alice = party(&net, 1).await;
+    alice.receive(&net.pay(HUB, &alice.address(), 100)).unwrap();
+    net.restart(HUB);
+    alice.set_renew_limit(29_999);
+    assert_eq!(alice.unlink().await.unwrap(), 0);
+    assert!(renewals(&alice).is_empty());
+    alice.set_renew_limit(30_000);
+    assert!(alice.unlink().await.unwrap() > 0);
+    let renewals = renewals(&alice);
+    assert_eq!(renewals.len(), 1, "{renewals:?}");
+    assert_eq!((renewals[0].amount, renewals[0].fee), (97, 3));
+    assert_eq!(available(&alice), (97, 0));
+}
+
+#[tokio::test]
 async fn a_renewal_refused_for_fees_changed_asks_them_again_once() {
     let net = charging(Fee {
         base: 0,

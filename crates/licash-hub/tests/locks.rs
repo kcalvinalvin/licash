@@ -401,6 +401,44 @@ fn each_branch_pays_its_own_fee() {
 }
 
 #[test]
+fn each_branch_pays_for_the_notes_it_makes_for_others_than_the_hub() {
+    // 1 in the pay branch, and a sat a note in either.
+    let (files, hub, chain) = setup(Policy {
+        output_msat: 1_000,
+        ..policy()
+    });
+    let expiry = chain.height() + 5;
+    let (bob, payer, me) = (owner(2).address(), owner(1).address(), hub.info().address);
+    // Two notes for Bob: 3 with the pay branch's fee.
+    let l = standard(&files, &hub, terms(&hub, expiry, 1));
+    assert_eq!(
+        refused(hub.lock(&l.signed, &l.notes)),
+        Refusal::Fee { due: 3, paid: 1 }
+    );
+    // One note for Bob paid for, but three for the payer in the refund
+    // branch, which pays 1.
+    let pay = [(bob, 4), (me, 2), (me, 2)];
+    let l = locking(
+        &files,
+        &pay,
+        &[(payer, 4), (payer, 2), (payer, 1), (me, 1)],
+        terms(&hub, expiry, 1),
+    );
+    assert_eq!(
+        refused(hub.lock(&l.signed, &l.notes)),
+        Refusal::Fee { due: 3, paid: 1 }
+    );
+    // Each branch pays for its own notes.
+    let l = locking(
+        &files,
+        &pay,
+        &[(payer, 4), (payer, 2), (me, 2)],
+        terms(&hub, expiry, 1),
+    );
+    hub.lock(&l.signed, &l.notes).unwrap();
+}
+
+#[test]
 fn a_refund_waits_for_the_expiry_at_depth_and_excludes_payment() {
     let (files, hub, mut chain) = setup(policy());
     let (_, keyset) = issuer(&files);

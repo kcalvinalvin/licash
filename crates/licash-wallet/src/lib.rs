@@ -715,13 +715,13 @@ impl<T: Transport> Wallet<T> {
     /// can spend together.
     pub fn send_fee(&self, url: &str, amount: u64) -> Result<u64, Error> {
         let (hub, info) = self.hub(&hub_url(url)?)?;
-        Ok(self.select(hub, amount, &info.fees.spend)?.1.fee)
+        Ok(self.select(hub, amount, &info.fees.spending())?.1.fee)
     }
 
     /// [`Wallet::send_fee`] of a lock of `amount` to another than the hub.
     pub fn lock_fee(&self, url: &str, amount: u64) -> Result<u64, Error> {
         let (hub, info) = self.hub(&hub_url(url)?)?;
-        Ok(self.select(hub, amount, &info.fees.lock)?.1.fee)
+        Ok(self.select(hub, amount, &info.fees.locking())?.1.fee)
     }
 
     /// What more the wallet needs at the hub at `url`, added, to pay
@@ -729,21 +729,22 @@ impl<T: Transport> Wallet<T> {
     /// holds that much in notes it can spend together.
     pub fn lacks(&self, url: &str, amount: u64) -> Result<u64, Error> {
         let (hub, info) = self.hub(&hub_url(url)?)?;
-        let fee = info.fees.spend;
+        let fee = info.fees.spending();
         let available = match self.select(hub, amount, &fee) {
             Ok(_) => return Ok(0),
             Err(Error::Insufficient { available, .. }) => available,
             Err(e) => return Err(e),
         };
-        // The fee grows with what is spent: more until it is covered.
+        // The fee grows with what is spent: more until it is covered. The
+        // notes made are counted as every power of two makes them.
+        let made = |value: u64| value.count_ones() as usize;
         let mut more = 0u64;
         for _ in 0..64 {
             let held = available.saturating_add(more);
-            let needed = amount.saturating_add(fee.due(held));
-            if held >= needed {
-                break;
+            match coins::settle(held, amount, made(amount), &fee, made) {
+                Ok(_) => break,
+                Err(due) => more = amount.saturating_add(due).saturating_sub(available),
             }
-            more = needed - available;
         }
         Ok(more)
     }
@@ -1095,7 +1096,7 @@ impl<T: Transport> Wallet<T> {
 
     async fn send_once(&self, url: &str, payee: &Address, amount: u64) -> Result<Paid, Error> {
         let (hub, info) = self.hub(url)?;
-        let (keyset, selection) = self.select(hub, amount, &info.fees.spend)?;
+        let (keyset, selection) = self.select(hub, amount, &info.fees.spending())?;
         let inputs = self.notes_of(&keyset, &selection.inputs)?;
         let me = self.address();
         let ephemeral = Ephemeral::random();
@@ -1136,15 +1137,16 @@ impl<T: Transport> Wallet<T> {
             .read(|c| ys.iter().map(|y| Ok(held(c, keyset, y)?.note)).collect())
     }
 
-    /// The notes of one keyset of `hub` that pay `amount` and `fee`.
+    /// The notes of one keyset of `hub` that pay `amount` and `fee`, on
+    /// them and on the notes `amount` and the change are made in.
     fn select(
         &self,
         hub: i64,
         amount: u64,
-        fee: &licash_api::Fee,
+        fee: &licash_api::NoteFee,
     ) -> Result<(Keyset, coins::Selection<[u8; 33]>), Error> {
         let mut short = Error::Insufficient {
-            needed: amount.saturating_add(fee.due(amount)),
+            needed: amount.saturating_add(fee.due(amount, 0)),
             available: 0,
         };
         let mut keysets = self.keysets(hub)?;
@@ -1172,7 +1174,7 @@ impl<T: Transport> Wallet<T> {
         keysets.sort_by_cached_key(|k| Reverse(of(k).iter().map(|n| n.0).sum::<u64>()));
         for keyset in keysets {
             let held = of(&keyset);
-            match coins::select(&held, amount, fee) {
+            match coins::select(&held, amount, fee, |value| made(&keyset, value)) {
                 Ok(selection) => return Ok((keyset, selection)),
                 Err(needed) => {
                     if let Error::Insufficient { available: 0, .. } = short {
@@ -2131,6 +2133,12 @@ pub fn pay_outputs(
     amount: u64,
 ) -> Result<Vec<Output>, Error> {
     outputs(keyset, ephemeral, Branch::Pay, &[(to, amount)])
+}
+
+/// How many notes [`outputs`] makes of `value` under `keyset`: what a fee
+/// on the notes made counts.
+fn made(keyset: &Keyset, value: u64) -> usize {
+    coins::split(value, keyset.denominations()).map_or(0, |notes| notes.len())
 }
 
 /// The outputs of `branch` paying each of `parts` its value, under

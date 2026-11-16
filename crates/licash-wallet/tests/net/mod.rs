@@ -82,6 +82,16 @@ impl Net {
 
     /// [`Net::start`], its locks timed by `timing`.
     pub fn start_timed(&self, url: &str, fee: Fee, timing: Timing) {
+        self.start_with(url, fee, 0, timing);
+    }
+
+    /// [`Net::start`], charging besides `output_msat` thousandths of a sat
+    /// for each note made for others than the hub.
+    pub fn start_per_note(&self, url: &str, fee: Fee, output_msat: u64) {
+        self.start_with(url, fee, output_msat, TIMING);
+    }
+
+    fn start_with(&self, url: &str, fee: Fee, output_msat: u64, timing: Timing) {
         let dir = tempfile::tempdir().unwrap();
         let (seed, db) = (dir.path().join("seed"), dir.path().join("hub.sqlite"));
         Hub::init(&seed, &db, MAX_POW).unwrap();
@@ -89,6 +99,7 @@ impl Net {
             spend: fee,
             lock: fee,
             refund: fee,
+            output_msat,
             timing,
         };
         let hub = Arc::new(Hub::open(&seed, &db, policy).unwrap());
@@ -343,9 +354,11 @@ impl Net {
         let hub = self.hub(url);
         let (keys, keyset) = self.issuer(url);
         let info = hub.info();
+        // The payee's notes are all it makes for others than the hub.
+        let (fee, made) = (info.policy.fees().spending(), split(amount).len());
         let mut total = amount;
-        while amount + info.policy.spend.due(total) != total {
-            total = amount + info.policy.spend.due(total);
+        while amount + fee.due(total, made) != total {
+            total = amount + fee.due(total, made);
         }
         let payer = OwnerKeys::from_seed(&[0xfa; 32]).unwrap();
         let inputs: Vec<(Note, Derivation)> = split(total)

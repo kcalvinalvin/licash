@@ -543,7 +543,7 @@ impl<T: Transport> Wallet<T> {
                 continue;
             };
             let (hub, info) = self.hub(url)?;
-            match self.select(hub, amount, &info.fees.spend) {
+            match self.select(hub, amount, &info.fees.spending()) {
                 Ok(_) => return Ok(Some(url.clone())),
                 Err(Error::Insufficient { .. }) => {}
                 Err(e) => return Err(e),
