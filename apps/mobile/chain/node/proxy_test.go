@@ -1,16 +1,17 @@
 package node
 
 import (
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/btcsuite/btcd/chaincfg/v2"
 )
 
 // fakeSocks is a SOCKS5 proxy taking one username and password, CONNECT
@@ -130,36 +131,26 @@ func TestNamesResolveAtTheProxysEnd(t *testing.T) {
 
 func TestTheCDNsFilesComeThroughTheProxy(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		io.WriteString(w, "headers of "+r.URL.Path)
+		if r.URL.Path == "/status" {
+			_ = json.NewEncoder(w).Encode(cdnStatus{Genesis: chaincfg.RegressionNetParams.GenesisHash.String(), PerFilterFile: 20})
+			return
+		}
+		io.WriteString(w, "filters of "+r.URL.Path)
 	}))
 	defer server.Close()
 	f := newFakeSocks(t, map[string]string{"cdn.example": server.Listener.Addr().String()})
-	c := &cdn{
-		base:   "http://cdn.example",
-		client: httpClient(f.proxy("secret"), fileTimeout),
-		log:    slog.New(slog.DiscardHandler),
-	}
-	c.status = cdnStatus{BestBlock: 4999, BestFilter: 4999, PerHeaderFile: 1000}
-
-	dir := t.TempDir()
-	imp, remove, err := c.importFiles(dir, 1000)
+	c, err := newCDN("http://cdn.example", &chaincfg.RegressionNetParams, f.proxy("secret"), slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatal(err)
 	}
-	for path, want := range map[string]string{
-		imp.BlockHeadersSource:  "headers of /headers/import/5000",
-		imp.FilterHeadersSource: "headers of /filter-headers/import/5000",
-	} {
-		if filepath.Dir(path) != dir {
-			t.Errorf("%s outside %s", path, dir)
-		}
-		if got, err := os.ReadFile(path); err != nil || string(got) != want {
-			t.Errorf("%s: %q, %v", path, got, err)
-		}
+	response, err := c.client.Get(c.base + "/filters/0")
+	if err != nil {
+		t.Fatal(err)
 	}
-	remove()
-	if left, _ := os.ReadDir(dir); len(left) != 0 {
-		t.Errorf("left %v", left)
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	if err != nil || string(body) != "filters of /filters/0" {
+		t.Fatalf("filter file: %q, %v", body, err)
 	}
 	for _, asked := range f.askedOf() {
 		if asked != "connect cdn.example" {
@@ -168,12 +159,6 @@ func TestTheCDNsFilesComeThroughTheProxy(t *testing.T) {
 	}
 	if len(f.askedOf()) == 0 {
 		t.Error("nothing went through the proxy")
-	}
-
-	// Holding as many as it has: nothing.
-	imp, _, err = c.importFiles(dir, 4500)
-	if imp != nil || err != nil {
-		t.Errorf("held all: %v, %v", imp, err)
 	}
 }
 

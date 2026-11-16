@@ -1,10 +1,8 @@
 package node
 
-// A block-dn server (github.com/guggero/block-dn): headers to import into a
-// new or far-behind node in whole files, and compact filters by the file,
-// each checked against the filter header the node holds before it is kept.
-// The node's peers still check the imported filter headers against their
-// checkpoints, and anything the server lacks or gets wrong comes from them.
+// A block-dn server supplies only compact filter bodies. Block and filter
+// headers always come from peers; every CDN filter must match those headers
+// before any of its file is cached. CDN metadata is never a chain authority.
 
 import (
 	"context"
@@ -14,8 +12,6 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -36,23 +32,22 @@ const (
 	statusEvery = time.Minute
 	// maxFilterFile bounds a file of filters held in memory.
 	maxFilterFile = 128 << 20
-	// maxImportFile bounds a file of headers downloaded to import.
-	maxImportFile = 1 << 30
+	// Bound metadata allocations independently of the HTTP byte budget.
+	maxFiltersPerFile = 65_536
 )
 
 // cdnStatus is what a block-dn server's /status says of itself.
 type cdnStatus struct {
 	Genesis       string `json:"chain_genesis_hash"`
-	BestBlock     uint32 `json:"best_block_height"`
 	BestFilter    uint32 `json:"best_filter_height"`
-	PerHeaderFile uint32 `json:"entries_per_header_file"`
 	PerFilterFile uint32 `json:"entries_per_filter_file"`
 }
 
 type cdn struct {
-	base   string
-	client *http.Client
-	log    *slog.Logger
+	base    string
+	genesis string
+	client  *http.Client
+	log     *slog.Logger
 
 	mu     sync.Mutex
 	status cdnStatus
@@ -65,20 +60,14 @@ type cdn struct {
 // through proxy if set.
 func newCDN(base string, params *chaincfg.Params, proxy *Proxy, log *slog.Logger) (*cdn, error) {
 	c := &cdn{
-		base:   strings.TrimRight(base, "/"),
-		client: httpClient(proxy, fileTimeout),
-		log:    log,
-		done:   make(map[uint32]bool),
+		base:    strings.TrimRight(base, "/"),
+		genesis: params.GenesisHash.String(),
+		client:  httpClient(proxy, fileTimeout),
+		log:     log,
+		done:    make(map[uint32]bool),
 	}
 	if err := c.refresh(); err != nil {
 		return nil, err
-	}
-	if c.status.Genesis != params.GenesisHash.String() {
-		return nil, fmt.Errorf("%s follows the chain of genesis %s, not %s",
-			c.base, c.status.Genesis, params.GenesisHash)
-	}
-	if c.status.PerHeaderFile == 0 || c.status.PerFilterFile == 0 {
-		return nil, fmt.Errorf("%s names no file sizes", c.base)
 	}
 	return c, nil
 }
@@ -103,93 +92,17 @@ func (c *cdn) refresh() error {
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<16)).Decode(&status); err != nil {
 		return fmt.Errorf("the status of %s: %w", c.base, err)
 	}
+	if status.Genesis != c.genesis {
+		return fmt.Errorf("%s follows another genesis", c.base)
+	}
+	if status.PerFilterFile == 0 || status.PerFilterFile > maxFiltersPerFile {
+		return fmt.Errorf("%s names an invalid filter file size", c.base)
+	}
+	if c.status.PerFilterFile != 0 && status.PerFilterFile != c.status.PerFilterFile {
+		return fmt.Errorf("%s changed its filter file size", c.base)
+	}
 	c.status, c.read = status, time.Now()
 	return nil
-}
-
-// headersImport is what to import into a node holding held block headers:
-// the server's sealed files of headers, if they hold at least a file more.
-func (c *cdn) headersImport(held uint32) *neutrino.HeadersImportConfig {
-	per := c.status.PerHeaderFile
-	end := (min(c.status.BestBlock, c.status.BestFilter) + 1) / per * per
-	if end < held+per {
-		return nil
-	}
-	c.log.Info("importing headers", "server", c.base, "held", held, "to", end)
-	return &neutrino.HeadersImportConfig{
-		BlockHeadersSource:  fmt.Sprintf("%s/headers/import/%d", c.base, end),
-		FilterHeadersSource: fmt.Sprintf("%s/filter-headers/import/%d", c.base, end),
-	}
-}
-
-// importFiles is headersImport's, downloaded into dir as files for
-// neutrino to import: through the server's client, so through its proxy if
-// any, where neutrino would fetch them directly. Nothing if nothing is to
-// be imported. The files are removed by remove, once imported.
-func (c *cdn) importFiles(dir string, held uint32) (imp *neutrino.HeadersImportConfig, remove func(), err error) {
-	urls := c.headersImport(held)
-	if urls == nil {
-		return nil, func() {}, nil
-	}
-	blocks := filepath.Join(dir, "import-block-headers.bin")
-	filters := filepath.Join(dir, "import-filter-headers.bin")
-	remove = func() {
-		_ = os.Remove(blocks)
-		_ = os.Remove(filters)
-	}
-	// The block headers first, then their filters' headers: in that order
-	// always, as a map would not keep it.
-	for _, file := range [...]struct{ path, url string }{
-		{blocks, urls.BlockHeadersSource},
-		{filters, urls.FilterHeadersSource},
-	} {
-		if err := c.download(file.url, file.path); err != nil {
-			remove()
-			return nil, func() {}, err
-		}
-	}
-	imp = &neutrino.HeadersImportConfig{BlockHeadersSource: blocks, FilterHeadersSource: filters}
-	return imp, remove, nil
-}
-
-// download writes what url holds to path.
-func (c *cdn) download(url, path string) error {
-	resp, err := c.client.Get(url)
-	if err != nil {
-		return fmt.Errorf("downloading %s: %w", url, err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("downloading %s: HTTP %d", url, resp.StatusCode)
-	}
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
-	if err != nil {
-		return err
-	}
-	n, err := io.Copy(file, io.LimitReader(resp.Body, maxImportFile+1))
-	if err == nil && n > maxImportFile {
-		err = fmt.Errorf("%s holds over %d bytes", url, maxImportFile)
-	}
-	if err == nil {
-		err = file.Sync()
-	}
-	if closed := file.Close(); err == nil {
-		err = closed
-	}
-	if err != nil {
-		return fmt.Errorf("downloading %s: %w", url, err)
-	}
-	return nil
-}
-
-// heldHeaders is how many block headers the node in dir holds, from the
-// size of neutrino's flat file of them: none if it has none yet.
-func heldHeaders(dir string) uint32 {
-	info, err := os.Stat(filepath.Join(dir, "block_headers.bin"))
-	if err != nil {
-		return 0
-	}
-	return uint32(info.Size() / 80)
 }
 
 // prefetch stores in cs the filters of the file holding the block at
@@ -201,6 +114,9 @@ func (c *cdn) prefetch(cs *neutrino.ChainService, height uint32) {
 	per := c.status.PerFilterFile
 	first := height / per * per
 	last := first + per - 1
+	if uint64(first)+uint64(per)-1 > uint64(^uint32(0)) {
+		return
+	}
 	if c.done[first] {
 		return
 	}
@@ -290,8 +206,14 @@ func (c *cdn) filters(cs *neutrino.ChainService, first, count uint32) error {
 // splitFilters reads count filters, each after its length as a Bitcoin
 // CompactSize, and nothing after them.
 func splitFilters(data []byte, count uint32) ([][]byte, error) {
+	if count > maxFiltersPerFile || uint64(count) > uint64(len(data)) {
+		return nil, errors.New("invalid filter count")
+	}
 	filters := make([][]byte, 0, count)
 	for len(data) > 0 {
+		if uint32(len(filters)) == count {
+			return nil, errors.New("too many filters")
+		}
 		size, n := compactSize(data)
 		if n == 0 || uint64(len(data)-n) < size {
 			return nil, fmt.Errorf("filter %d is cut short", len(filters))

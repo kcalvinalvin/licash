@@ -10,9 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
-	"os"
-	"path/filepath"
-	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -98,9 +95,6 @@ func StartThrough(network, dataDir, peers, cdn, proxy string) (*Chain, error) {
 	if peers != "" {
 		connect = strings.Split(peers, ",")
 	}
-	if err := tempIn(dataDir); err != nil {
-		return nil, err
-	}
 	n, err := node.Start(node.Config{
 		DataDir:      dataDir,
 		Params:       net.params,
@@ -133,25 +127,6 @@ func proxyOf(proxy string) (*node.Proxy, error) {
 		return nil, refused
 	}
 	return &node.Proxy{Addr: u.Host, Username: u.User.Username(), Password: password}, nil
-}
-
-// tempIn makes temporary files go to dataDir/tmp, emptied first, on
-// Android: neutrino imports headers through one where Go puts them, by
-// default /data/local/tmp, which apps cannot write. Elsewhere TMPDIR or
-// the system's default serves.
-func tempIn(dataDir string) error {
-	if runtime.GOOS != "android" {
-		return nil
-	}
-	tmp := filepath.Join(dataDir, "tmp")
-	// What an import cut short left behind.
-	if err := os.RemoveAll(tmp); err != nil {
-		return err
-	}
-	if err := os.MkdirAll(tmp, 0o700); err != nil {
-		return err
-	}
-	return os.Setenv("TMPDIR", tmp)
 }
 
 // Height is the best chain's height.

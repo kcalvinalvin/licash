@@ -36,8 +36,8 @@ type Config struct {
 	// Mempool bounds what peers can make the node hold.
 	Mempool mempool.Limits
 	// CDN, if set, is the base URL of a block-dn server following the same
-	// chain: headers are imported from it while the node is far behind, and
-	// filters fetched from it by the file, each checked against its header.
+	// chain: filters are fetched by the file and checked against filter
+	// headers obtained independently from peers. No headers are imported.
 	// The peers serve whatever it cannot.
 	CDN string
 	// Proxy, if set, is the SOCKS5 proxy everything is reached through:
@@ -83,26 +83,19 @@ func Start(cfg Config) (*Node, error) {
 	if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
 		return nil, fmt.Errorf("creating the data directory: %w", err)
 	}
+	dir, err := peerDirectory(cfg.DataDir)
+	if err != nil {
+		return nil, err
+	}
+	cfg.DataDir = dir
 	var server *cdn
-	var imp *neutrino.HeadersImportConfig
 	if cfg.CDN != "" {
 		var err error
 		if server, err = newCDN(cfg.CDN, &cfg.Params, cfg.Proxy, log); err != nil {
 			log.Warn("block-dn unusable, syncing from peers", "err", err)
-		} else {
-			var remove func()
-			imp, remove, err = server.importFiles(cfg.DataDir, heldHeaders(cfg.DataDir))
-			if err != nil {
-				log.Warn("downloading headers failed, syncing from peers", "err", err)
-			}
-			defer remove()
 		}
 	}
-	n, err := start(cfg, imp)
-	if err != nil && imp != nil {
-		log.Warn("importing headers failed, syncing from peers", "err", err)
-		n, err = start(cfg, nil)
-	}
+	n, err := start(cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -112,8 +105,27 @@ func Start(cfg Config) (*Node, error) {
 	return n, nil
 }
 
-// start runs the node, first importing the headers of imp if set.
-func start(cfg Config, imp *neutrino.HeadersImportConfig) (*Node, error) {
+// A separate layout cannot be contaminated by an older binary's imports.
+// Existing caches are never deleted or rebuilt implicitly, including after
+// a downgrade. Testing installations must explicitly reset their chain and
+// wallet scan state, or choose a fresh data directory.
+func peerDirectory(base string) (string, error) {
+	for _, name := range []string{"block_headers.bin", "reg_filter_headers.bin", "neutrino.db"} {
+		if _, err := os.Stat(filepath.Join(base, name)); err == nil {
+			return "", fmt.Errorf("legacy chain data in %s is not verified: explicitly reset the test wallet and chain data", base)
+		} else if !os.IsNotExist(err) {
+			return "", err
+		}
+	}
+	dir := filepath.Join(base, "peer-headers-v1")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", err
+	}
+	return dir, nil
+}
+
+// start runs the node using only the peers for block and filter headers.
+func start(cfg Config) (*Node, error) {
 	db, err := walletdb.Create(
 		"bdb", filepath.Join(cfg.DataDir, "neutrino.db"), true,
 		time.Minute, false,
@@ -129,7 +141,6 @@ func start(cfg Config, imp *neutrino.HeadersImportConfig) (*Node, error) {
 		AddPeers:       cfg.AddPeers,
 		PersistToDisk:  true,
 		MempoolEnabled: true,
-		HeadersImport:  imp,
 		Dialer:         dialer(cfg.Proxy),
 		NameResolver:   resolver(cfg.Proxy),
 	})

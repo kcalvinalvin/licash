@@ -149,7 +149,7 @@ func (f *fakeCDN) importFile(w *bytes.Buffer, headerType byte, end uint32,
 	}
 }
 
-func TestRegtestHeadersAndFiltersFromBlockDN(t *testing.T) {
+func TestRegtestPeerHeadersAndCDNFilters(t *testing.T) {
 	// A chain of several files of either.
 	if count, _ := strconv.Atoi(cli(t, "getblockcount")); count < 230 {
 		cli(t, "generatetoaddress", strconv.Itoa(230-count), cli(t, "getnewaddress"))
@@ -185,19 +185,14 @@ func TestRegtestHeadersAndFiltersFromBlockDN(t *testing.T) {
 			t.Errorf("stop: %v", err)
 		}
 	}
-	end := (tip + 1) / 50 * 50
-	imported := []string{"/status",
-		fmt.Sprintf("/headers/import/%d", end), fmt.Sprintf("/filter-headers/import/%d", end)}
-
-	// A new node, with no peer to reach, holds the sealed files' headers.
+	// CDN status cannot advance the chain: no peer means only genesis.
 	dir := t.TempDir()
 	n := run(dir, "127.0.0.1:1")
-	if height, hash, err := n.Tip(); err != nil || uint32(height) != end-1 ||
-		hash != blocks[end-1].hash {
-		t.Fatalf("tip %d %s %v after importing to %d", height, hash, err, end)
+	if height, hash, err := n.Tip(); err != nil || height != 0 || hash != blocks[0].hash {
+		t.Fatalf("CDN advanced tip without peers: %d %s %v", height, hash, err)
 	}
-	if asked := fake.taken(); !slices.Equal(asked, imported) {
-		t.Fatalf("asked %v, want %v", asked, imported)
+	if asked := fake.taken(); !slices.Equal(asked, []string{"/status"}) {
+		t.Fatalf("asked CDN for headers: %v", asked)
 	}
 	stop(n)
 
@@ -286,12 +281,9 @@ func TestRegtestHeadersAndFiltersFromBlockDN(t *testing.T) {
 	}
 }
 
-func TestRegtestBrokenHeadersImportFallsBackToPeers(t *testing.T) {
+func TestRegtestCDNHeaderFilesAreNeverRequested(t *testing.T) {
 	blocks := coreChain(t)
 	tip := uint32(len(blocks) - 1)
-	if tip < 100 {
-		t.Fatalf("tip %d: too short a chain to import", tip)
-	}
 	fake := &fakeCDN{
 		params:     &chaincfg.RegressionNetParams,
 		blocks:     blocks,
@@ -318,11 +310,8 @@ func TestRegtestBrokenHeadersImportFallsBackToPeers(t *testing.T) {
 		}
 	}()
 	asked := fake.taken()
-	if !slices.Contains(asked, fmt.Sprintf("/headers/import/%d", (tip+1)/50*50)) {
-		t.Fatalf("asked %v", asked)
-	}
-	if !strings.Contains(logged.String(), "importing headers failed") {
-		t.Fatalf("logged %q", logged.String())
+	if !slices.Equal(asked, []string{"/status"}) {
+		t.Fatalf("asked CDN for headers: %v", asked)
 	}
 	eventually(t, "the node to catch up with Core from its peer", func() bool {
 		height, hash, err := n.Tip()
