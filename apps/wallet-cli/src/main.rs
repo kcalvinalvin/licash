@@ -496,7 +496,12 @@ fn logging(format: Option<Log>) {
         .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
         .with_writer(std::io::stderr);
     match format.unwrap_or(Log::Text) {
-        Log::Text => logs.without_time().with_target(false).init(),
+        Log::Text => logs
+            .with_ansi(false)
+            .with_writer(|| say::TerminalWriter(std::io::stderr()))
+            .without_time()
+            .with_target(false)
+            .init(),
         Log::Json => logs.json().init(),
     }
 }

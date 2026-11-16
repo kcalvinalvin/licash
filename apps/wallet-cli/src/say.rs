@@ -16,6 +16,23 @@ pub fn terminal(text: &str) -> String {
     out
 }
 
+/// The text tracing formatter writes UTF-8 chunks. Keep warnings visible
+/// without allowing peer-supplied fields to execute terminal controls.
+pub struct TerminalWriter<W>(pub W);
+
+impl<W: std::io::Write> std::io::Write for TerminalWriter<W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let text = std::str::from_utf8(bytes)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        self.0.write_all(terminal(text).as_bytes())?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
+    }
+}
+
 #[cfg(test)]
 mod terminal_tests {
     #[test]
@@ -24,6 +41,48 @@ mod terminal_tests {
         assert_eq!(
             super::terminal("\u{1b}[2J\r\u{7}\u{9b}"),
             "\\u{1b}[2J\\r\\u{7}\\u{9b}"
+        );
+    }
+
+    #[test]
+    fn diagnostic_text_is_escaped_without_suppressing_warnings() {
+        use std::io::Write;
+        let mut writer = super::TerminalWriter(Vec::new());
+        writer
+            .write_all("WARN José: \u{1b}[2J\u{9b}clear\n".as_bytes())
+            .unwrap();
+        writer.flush().unwrap();
+        assert_eq!(
+            String::from_utf8(writer.0).unwrap(),
+            "WARN José: \\u{1b}[2J\\u{9b}clear\n"
+        );
+    }
+
+    #[test]
+    fn tracing_display_fields_pass_through_the_terminal_writer() {
+        use std::io::{Read, Seek, SeekFrom};
+
+        let mut file = tempfile::tempfile().unwrap();
+        let output = file.try_clone().unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_target(false)
+            .with_writer(move || super::TerminalWriter(output.try_clone().unwrap()))
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let reason = "José: \u{1b}[2J\u{9b}clear";
+            tracing::warn!(%reason, "payment needs attention");
+        });
+        file.seek(SeekFrom::Start(0)).unwrap();
+        let mut text = String::new();
+        file.read_to_string(&mut text).unwrap();
+        assert!(text.contains("WARN"), "{text:?}");
+        assert!(text.contains("payment needs attention"), "{text:?}");
+        assert!(text.contains("José: \\u{1b}[2J\\u{9b}clear"), "{text:?}");
+        assert!(
+            !text.contains('\u{1b}') && !text.contains('\u{9b}'),
+            "{text:?}"
         );
     }
 }
