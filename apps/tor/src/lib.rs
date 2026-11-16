@@ -50,6 +50,11 @@ const MOST_KEPT: usize = 16;
 /// its own task taking in the last answer's end, not the network.
 const READY: Duration = Duration::from_secs(1);
 
+/// How long an answer may come with nothing more of it: then its circuit
+/// is taken for gone, rather than waited on for the whole of a long
+/// download's time (on signet one hung 15 min).
+const STALLED: Duration = Duration::from_secs(60);
+
 /// A Tor client, shared by its clones.
 #[derive(Clone)]
 pub struct Tor {
@@ -458,11 +463,21 @@ impl Open {
             }
         };
         let status = response.status().as_u16();
-        let body = Limited::new(response.into_body(), max)
-            .collect()
-            .await
-            .map_err(|e| Lost::Sent(format!("the answer: {e}")))?;
-        Ok((status, body.to_bytes().to_vec()))
+        let mut body = Limited::new(response.into_body(), max);
+        let mut bytes = Vec::new();
+        loop {
+            let frame = tokio::time::timeout(STALLED, body.frame()).await;
+            let stalled = || format!("the answer stalled for {} s", STALLED.as_secs());
+            match frame.map_err(|_| Lost::Sent(stalled()))? {
+                None => return Ok((status, bytes)),
+                Some(Err(e)) => return Err(Lost::Sent(format!("the answer: {e}"))),
+                Some(Ok(frame)) => {
+                    if let Ok(data) = frame.into_data() {
+                        bytes.extend_from_slice(&data);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -640,6 +655,43 @@ mod tests {
         // A host never reached keeps none: its first stream takes one.
         isolation.renew("other.example");
         assert_eq!(isolation.0.lock().unwrap().len(), 2);
+    }
+
+    /// A connection to a host that answers `head`, then `body` and then
+    /// nothing more, never closing.
+    async fn answering(head: &'static str, body: &'static [u8]) -> Open {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (ours, mut theirs) = tokio::io::duplex(1 << 16);
+        tokio::spawn(async move {
+            let mut asked = [0; 1024];
+            let _ = theirs.read(&mut asked).await;
+            theirs.write_all(head.as_bytes()).await.unwrap();
+            theirs.write_all(body).await.unwrap();
+            std::future::pending::<()>().await;
+            drop(theirs);
+        });
+        Open::over(Box::new(ours)).await.unwrap()
+    }
+
+    fn info() -> Asked {
+        let request = hyper::Request::get("/v1/info").header("host", "hub.example");
+        request.body(Full::new(Bytes::new())).unwrap()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_answer_stalled_fails_its_request() {
+        let head = "HTTP/1.1 200 OK\r\ncontent-length: 10\r\n\r\n";
+        let mut open = answering(head, b"abc").await;
+        let started = tokio::time::Instant::now();
+        let Err(Lost::Sent(why)) = open.ask(info(), 100).await else {
+            panic!("an answer");
+        };
+        assert!(why.contains("stalled"), "{why}");
+        assert_eq!(started.elapsed(), STALLED);
+        // Whole: taken.
+        let mut open = answering(head, b"0123456789").await;
+        let answer = open.ask(info(), 100).await.ok().unwrap();
+        assert_eq!(answer, (200, b"0123456789".to_vec()));
     }
 
     #[tokio::test]
