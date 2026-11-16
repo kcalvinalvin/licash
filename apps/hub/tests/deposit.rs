@@ -283,6 +283,94 @@ fn lightning(net: &Net) -> (Arc<Fake>, Arc<lightning::Gateway>) {
     (node, Arc::new(gateway))
 }
 
+/// A dishonest status is not proof that the preimage is already public.
+#[derive(Clone)]
+struct PaidView(Local);
+
+impl Transport for PaidView {
+    async fn request(
+        &self,
+        url: &str,
+        body: Option<Vec<u8>>,
+    ) -> Result<licash_wallet::Response, String> {
+        let mut response = self.0.request(url, body).await?;
+        if url.contains("/v1/lock/") && response.status == 200 {
+            let mut state: licash_api::LockState = serde_json::from_slice(&response.body).unwrap();
+            state.settled = Some(licash_api::Settled::Pay);
+            response.body = serde_json::to_vec(&state).unwrap();
+        }
+        Ok(response)
+    }
+}
+
+async fn short_deposit_lock(claimed_paid: bool) {
+    let net = Net::new().await;
+    let alice = net.wallet("alice");
+    let deposit = alice.deposit(HUB, 3_000).await.unwrap();
+    let (_, body) = net.asked("alice", &deposit.hash);
+    let ((keyset, ephemeral, hash), outputs) = (
+        body.receive.terms().unwrap(),
+        body.receive.outputs().unwrap(),
+    );
+    assert!(outputs.len() > 1);
+    let amount = outputs[0].denomination();
+    let terms = licash::spend::TimedTerms::new(
+        ChainProfile::Core30DefaultRegtest,
+        net.hub.checkpoint().unwrap().commitment(),
+        net.height() + 6,
+        1,
+        hash,
+    )
+    .unwrap();
+    let lock = net
+        .hub
+        .lock_own(&keyset, ephemeral, vec![outputs[0].clone()], terms)
+        .unwrap();
+    let id = lock.proposal.id();
+    let db = rusqlite::Connection::open(net.dir.path().join("deposits.sqlite")).unwrap();
+    db.execute(
+        "UPDATE deposits SET lock = ?1, state = 'locked' WHERE hash = ?2",
+        rusqlite::params![id.as_bytes(), hash],
+    )
+    .unwrap();
+    let expected = DepositState::Canceled(format!("its lock pays {amount} of 3000"));
+    if claimed_paid {
+        drop(alice);
+        let alice = Wallet::open(
+            &net.dir.path().join("alice.sqlite"),
+            PaidView(Local(net.app.clone())),
+        )
+        .unwrap();
+        assert_eq!(
+            alice.follow_deposit(&deposit.hash).await.unwrap().state,
+            expected
+        );
+    } else {
+        assert_eq!(
+            alice.follow_deposit(&deposit.hash).await.unwrap().state,
+            expected
+        );
+        let timeout = deposit.terms.unwrap().timeout;
+        assert!(alice
+            .deposits_to_refund(timeout)
+            .unwrap()
+            .iter()
+            .any(|d| d.hash == deposit.hash));
+    }
+    let lock = net.hub.locked(&id).unwrap();
+    assert_eq!((lock.preimage, lock.settled), (None, None));
+}
+
+#[tokio::test]
+async fn a_short_deposit_lock_does_not_receive_the_full_deposits_preimage() {
+    short_deposit_lock(false).await;
+}
+
+#[tokio::test]
+async fn a_hubs_paid_status_does_not_bypass_the_deposit_value_check() {
+    short_deposit_lock(true).await;
+}
+
 #[tokio::test]
 async fn deposits_and_receipts_refuse_hashes_held_by_the_other_gateway() {
     let net = Net::new().await;

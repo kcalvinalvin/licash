@@ -408,7 +408,12 @@ impl<T: Transport> Wallet<T> {
             Ok(())
         })?;
         match self
-            .claim(&url, &hex::encode(lock.as_bytes()), &preimage)
+            .claim_paying(
+                &url,
+                &hex::encode(lock.as_bytes()),
+                &preimage,
+                amount as u64,
+            )
             .await
         {
             Ok(_) | Err(Error::AlreadyReceived) => {}

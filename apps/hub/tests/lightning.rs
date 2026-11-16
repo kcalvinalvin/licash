@@ -249,6 +249,49 @@ fn preimage_of(net: &Net, name: &str, hash: &str) -> [u8; 32] {
 }
 
 #[tokio::test]
+async fn a_short_receipt_lock_does_not_receive_the_invoices_preimage() {
+    let net = Net::new().await;
+    let alice = net.wallet("alice");
+    let invoice = alice.invoice(HUB, 10).await.unwrap();
+    let db = rusqlite::Connection::open(net.dir.path().join("lightning.sqlite")).unwrap();
+    let body: String = db
+        .query_row(
+            "SELECT body FROM receipts WHERE hash = ?1",
+            [bytes(&invoice.hash)],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let body: licash_api::Receive = serde_json::from_str(&body).unwrap();
+    let ((keyset, ephemeral, hash), outputs) = (body.terms().unwrap(), body.outputs().unwrap());
+    assert!(outputs.len() > 1);
+    let amount = outputs[0].denomination();
+    let terms = licash::spend::TimedTerms::new(
+        ChainProfile::Core30DefaultRegtest,
+        net.hub.checkpoint().unwrap().commitment(),
+        net.height() + 6,
+        1,
+        hash,
+    )
+    .unwrap();
+    let lock = net
+        .hub
+        .lock_own(&keyset, ephemeral, vec![outputs[0].clone()], terms)
+        .unwrap();
+    let id = lock.proposal.id();
+    db.execute(
+        "UPDATE receipts SET lock = ?1, state = 'locked' WHERE hash = ?2",
+        rusqlite::params![id.as_bytes(), hash],
+    )
+    .unwrap();
+    assert_eq!(
+        alice.follow_invoice(&invoice.hash).await.unwrap().state,
+        InvoiceState::Canceled(format!("its lock pays {amount} of 10"))
+    );
+    let lock = net.hub.locked(&id).unwrap();
+    assert_eq!((lock.preimage, lock.settled), (None, None));
+}
+
+#[tokio::test]
 async fn a_payment_received_is_claimed_and_settles_its_invoice() {
     let net = Net::new().await;
     let lightning = net.info().await.lightning.unwrap();

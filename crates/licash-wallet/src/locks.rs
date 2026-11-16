@@ -517,7 +517,20 @@ impl<T: Transport> Wallet<T> {
     /// revealing it within [`CLAIM_MARGIN`] blocks of the lock's expiry, as
     /// the hub could then refund the lock and keep what the preimage buys.
     pub async fn claim(&self, url: &str, id: &str, preimage: &[u8; 32]) -> Result<Received, Error> {
-        self.claim_with(url, id, preimage, false).await
+        self.claim_with(url, id, preimage, false, None).await
+    }
+
+    /// Claim only if this verified proposal pays at least the promised
+    /// amount: deposits and invoices must not disclose their preimage for
+    /// a smaller, otherwise valid lock. Check on retries and paid views too.
+    pub(crate) async fn claim_paying(
+        &self,
+        url: &str,
+        id: &str,
+        preimage: &[u8; 32],
+        least: u64,
+    ) -> Result<Received, Error> {
+        self.claim_with(url, id, preimage, false, Some(least)).await
     }
 
     /// [`Wallet::claim`], within [`CLAIM_MARGIN`] blocks of the lock's
@@ -530,7 +543,7 @@ impl<T: Transport> Wallet<T> {
         id: &str,
         preimage: &[u8; 32],
     ) -> Result<Received, Error> {
-        self.claim_with(url, id, preimage, true).await
+        self.claim_with(url, id, preimage, true, None).await
     }
 
     async fn claim_with(
@@ -539,6 +552,7 @@ impl<T: Transport> Wallet<T> {
         id: &str,
         preimage: &[u8; 32],
         revealed: bool,
+        least: Option<u64>,
     ) -> Result<Received, Error> {
         let url = hub_url(url)?;
         let id = payment_id(id)?;
@@ -552,6 +566,18 @@ impl<T: Transport> Wallet<T> {
         let ours = self.owner.scan_key().receive(proposal)?;
         if !ours.iter().any(|r| r.branch == Branch::Pay) {
             return Err(Error::PaysNothing);
+        }
+        if let Some(least) = least {
+            let amount = ours
+                .iter()
+                .filter(|r| r.branch == Branch::Pay)
+                .try_fold(0u64, |sum, r| {
+                    sum.checked_add(proposal.outputs()[r.position as usize].denomination())
+                })
+                .ok_or_else(|| Error::Invalid("its lock's amount overflows".into()))?;
+            if amount < least {
+                return Err(Error::Invalid(format!("its lock pays {amount} of {least}")));
+            }
         }
         match view.settled {
             Some(Settled::Refund) => {
