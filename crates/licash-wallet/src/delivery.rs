@@ -1,0 +1,523 @@
+//! How payments to payment codes reach their payees. The payer asks the
+//! hub releasing a payment to keep it for its payee ([`licash_api::inbox`]),
+//! who collects it there ([`Wallet::collect_inbox`]) and tells the payer,
+//! through the hub, that it has it. Only a payment no payee said it has
+//! within [`ACK_WITHIN`], or one its hub does not keep, is mailed to the
+//! payee's mailbox on Nostr, which the application does: [`Wallet::due`]
+//! names what to mail, [`Wallet::mailed`] records how it went.
+//!
+//! The hub cannot tell the payer a payee has a payment unless it does: the
+//! ack derives from the receipt secret, which the hub does not know. A hub
+//! that keeps nothing, or keeps it from the payee, only delays it by
+//! [`ACK_WITHIN`].
+
+use std::collections::BTreeMap;
+
+use licash::{crypto::Point, spend::ProposalId};
+use licash_api::{
+    inbox::{
+        self, Acknowledge, Acknowledged, Acknowledgment, Acks, AskAcks, Feed, Keep, Kept, Take,
+        Taken,
+    },
+    Hex, Info, Payment,
+};
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
+
+use crate::{
+    answer, each_at_most, invalid, now, payment_id, unavailable, Error, LicashCode, Paid, Received,
+    Transport, Wallet,
+};
+
+/// How long a payment kept at its hub waits for its payee to say it has
+/// it before it is mailed, in seconds.
+pub const ACK_WITHIN: i64 = 60 * 60;
+
+/// The longest wait before mailing again a payment whose mailing failed,
+/// in seconds: from a minute, doubling with each failure.
+const MAIL_AGAIN_WITHIN: i64 = 60 * 60;
+
+/// Hubs looked at, at once.
+const HUBS_AT_ONCE: usize = 4;
+
+/// Where a payment to a payment code stands in reaching its payee.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Delivery {
+    /// Kept at its hub for its payee, which has not said it has it yet:
+    /// mailed from `mail_at` on if the code names a mailbox.
+    Kept { mail_at: i64 },
+    /// Its payee said it has it.
+    Collected,
+    /// To mail to the payee's mailbox: failed `tries` times so far, the
+    /// last for `error`.
+    Mailing { tries: u32, error: Option<String> },
+    /// Mailed to the payee's mailbox.
+    Mailed,
+    /// Neither collected nor mailed, the code naming no mailbox: the
+    /// payment is to hand over ([`Wallet::payment`]).
+    HandOver,
+    /// Neither collected nor mailed in the days a hub keeps a payment: no
+    /// longer tried. The payment may still be handed over.
+    GivenUp,
+}
+
+/// A payment to mail to its payee's mailbox ([`Wallet::due`]).
+#[derive(Clone, Debug)]
+pub struct Due {
+    /// The payment's id, to tell [`Wallet::mailed`].
+    pub id: String,
+    /// The payee's mailbox: an x-only Nostr key.
+    pub mailbox: [u8; 32],
+    /// The mailbox relays the payment's hub names.
+    pub relays: Vec<String>,
+    pub payment: Payment,
+}
+
+/// What [`Wallet::collect_inbox`] collected.
+#[derive(Debug, Default)]
+pub struct Inboxed {
+    /// The payments taken.
+    pub received: Vec<Received>,
+    /// The hubs not looked through, or not to the end, and why: looked
+    /// through again from there next time.
+    pub failed: Vec<(String, String)>,
+}
+
+/// Record that send `id`, to the payee sharing receipt secret `shared`,
+/// is to reach it as [`Wallet::pay_code`] says, mailed to `mailbox` if any.
+pub(crate) fn record(
+    tx: &Transaction,
+    id: &ProposalId,
+    mailbox: Option<[u8; 32]>,
+    shared: &[u8; 32],
+) -> Result<(), Error> {
+    tx.execute(
+        "INSERT INTO deliveries (send, mailbox, tag, key, ack) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            id.as_bytes(),
+            mailbox,
+            inbox::tag(shared),
+            inbox::key(shared),
+            inbox::ack(shared, id)
+        ],
+    )?;
+    Ok(())
+}
+
+/// What to ask the hub of send `id` to keep it with, if it is to.
+pub(crate) fn keep(c: &Connection, id: &ProposalId) -> Result<Option<Keep>, Error> {
+    let row: Option<([u8; inbox::TAG], [u8; 32], [u8; 32])> = c
+        .query_row(
+            "SELECT tag, key, ack FROM deliveries WHERE send = ?1",
+            [id.as_bytes()],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    Ok(row.map(|(tag, key, ack)| Keep {
+        tag: Hex(tag.to_vec()),
+        key: Hex(key.to_vec()),
+        commitment: Hex(inbox::commitment(&ack).to_vec()),
+    }))
+}
+
+/// Record that send `id` is released, its hub keeping it for its payee if
+/// `kept` says, unknown if none: when to mail it, set once. Whether its
+/// hub keeps it.
+pub(crate) fn released(
+    tx: &Transaction,
+    id: &ProposalId,
+    kept: Option<bool>,
+) -> Result<bool, Error> {
+    let now = now();
+    let (kept_at, mail_at) = match kept {
+        Some(true) => (Some(now), now + ACK_WITHIN),
+        Some(false) | None => (None, now),
+    };
+    tx.execute(
+        "UPDATE deliveries SET kept_at = COALESCE(kept_at, ?2), mail_at = COALESCE(mail_at, ?3)
+         WHERE send = ?1",
+        params![id.as_bytes(), kept_at, mail_at],
+    )?;
+    let kept: Option<bool> = tx
+        .query_row(
+            "SELECT kept_at IS NOT NULL FROM deliveries WHERE send = ?1",
+            [id.as_bytes()],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(kept.unwrap_or(false))
+}
+
+/// Sends whose delivery is under way: released, neither abandoned, nor
+/// collected, mailed or given up.
+const UNDER_WAY: &str = "s.done_at IS NOT NULL AND s.abandoned IS NULL
+    AND d.acked_at IS NULL AND d.mailed_at IS NULL AND d.given_up_at IS NULL";
+
+/// Payments to payment codes, reaching their payees.
+impl<T: Transport> Wallet<T> {
+    /// Pay `amount` to the wallet of `code` at the hub at `url`, as
+    /// [`Wallet::send`] does, asking the hub to keep the payment for its
+    /// payee to collect there. Returned once released: [`Paid::kept`] says
+    /// whether the hub keeps it. [`Wallet::due`] then names it to mail to
+    /// the mailbox the code names, if any, unless the payee says it has it
+    /// within [`ACK_WITHIN`], or at once if the hub does not keep it.
+    pub async fn pay_code(&self, url: &str, code: &LicashCode, amount: u64) -> Result<Paid, Error> {
+        self.send_with(url, &code.address, amount, Some(code.mailbox))
+            .await
+    }
+
+    /// The payments to mail to their payees' mailboxes now: those whose
+    /// payees did not say they have them in time, as their hubs tell,
+    /// asked here. Those neither collected nor mailed in the days a hub
+    /// keeps them are given up first. A hub that does not answer is asked
+    /// again next time: its payments are not mailed early for it.
+    pub async fn due(&self) -> Result<Vec<Due>, Error> {
+        let now = now();
+        self.store.write(|tx| {
+            tx.execute(
+                "UPDATE deliveries SET given_up_at = ?1
+                 WHERE given_up_at IS NULL AND acked_at IS NULL AND mailed_at IS NULL
+                   AND send IN (SELECT id FROM sends WHERE done_at < ?2)",
+                params![now, now - inbox::KEPT_FOR],
+            )?;
+            Ok(())
+        })?;
+        self.ask_acks().await?;
+        type Row = ([u8; 32], [u8; 32], String);
+        let rows: Vec<Row> = self.store.read(|c| {
+            let mut stmt = c.prepare(&format!(
+                "SELECT d.send, d.mailbox, h.info
+                 FROM deliveries d JOIN sends s ON s.id = d.send JOIN hubs h ON h.id = s.hub
+                 WHERE {UNDER_WAY} AND d.mailbox IS NOT NULL AND COALESCE(d.mail_at, 0) <= ?1
+                 ORDER BY s.done_at"
+            ))?;
+            let rows = stmt.query_map([now], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })?;
+        let mut due = Vec::new();
+        for (id, mailbox, info) in rows {
+            let id = hex::encode(id);
+            let info: Info = serde_json::from_str(&info).map_err(invalid)?;
+            if info.relays.is_empty() {
+                self.mailed(&id, Err("its hub names no mailbox relays".into()))?;
+                continue;
+            }
+            let payment = self.payment(&id)?;
+            due.push(Due {
+                id,
+                mailbox,
+                relays: info.relays,
+                payment,
+            });
+        }
+        Ok(due)
+    }
+
+    /// Record how mailing payment `id` ([`Wallet::due`]) went: to so many
+    /// relays, or failed for a reason, to mail it again later.
+    pub fn mailed(&self, id: &str, outcome: Result<usize, String>) -> Result<(), Error> {
+        let id = payment_id(id)?;
+        let now = now();
+        self.store.write(|tx| {
+            match &outcome {
+                Ok(_) => tx.execute(
+                    "UPDATE deliveries SET mailed_at = COALESCE(mailed_at, ?2), error = NULL
+                     WHERE send = ?1",
+                    params![id.as_bytes(), now],
+                )?,
+                Err(error) => tx.execute(
+                    "UPDATE deliveries SET tries = tries + 1, error = ?2,
+                        mail_at = ?3 + MIN(60 << MIN(tries, 6), ?4)
+                     WHERE send = ?1 AND mailed_at IS NULL",
+                    params![id.as_bytes(), error, now, MAIL_AGAIN_WITHIN],
+                )?,
+            };
+            Ok(())
+        })?;
+        match outcome {
+            Ok(relays) => tracing::info!(id = %hex::encode(id.as_bytes()), relays, "mailed"),
+            Err(e) => tracing::info!(id = %hex::encode(id.as_bytes()), "not mailed: {e}"),
+        }
+        Ok(())
+    }
+
+    /// Ask the hubs of the payments they keep whether their payees said
+    /// they have them, and record those they did.
+    async fn ask_acks(&self) -> Result<(), Error> {
+        type Row = (String, [u8; 32], [u8; 32], [u8; 32]);
+        let rows: Vec<Row> = self.store.read(|c| {
+            let mut stmt = c.prepare(&format!(
+                "SELECT r.url, d.send, d.key, d.ack
+                 FROM deliveries d JOIN sends s ON s.id = d.send JOIN reach r ON r.hub = s.hub
+                 WHERE {UNDER_WAY} AND d.kept_at IS NOT NULL"
+            ))?;
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })?;
+        // Each payment kept, by its send, key and ack.
+        type Asked = ([u8; 32], [u8; 32], [u8; 32]);
+        let mut by_hub: BTreeMap<String, Vec<Asked>> = BTreeMap::new();
+        for (url, send, key, ack) in rows {
+            by_hub.entry(url).or_default().push((send, key, ack));
+        }
+        let acked = each_at_most(HUBS_AT_ONCE, by_hub, |(url, kept)| async move {
+            let mut acked = Vec::new();
+            for kept in kept.chunks(inbox::MAX_ASKED) {
+                let keys = kept.iter().map(|(_, key, _)| Hex(key.to_vec())).collect();
+                let asked: Result<Acks, Error> =
+                    self.post(&url, inbox::ACKS, &AskAcks { keys }).await;
+                match asked {
+                    Ok(told) if told.acks.len() == kept.len() => {
+                        for ((send, _, ack), told) in kept.iter().zip(told.acks) {
+                            match told {
+                                Some(told) if told.0 == ack => acked.push(*send),
+                                Some(_) => {
+                                    tracing::warn!(%url, "a hub told an ack not the payee's")
+                                }
+                                None => {}
+                            }
+                        }
+                    }
+                    Ok(_) => {
+                        tracing::warn!(%url, "a hub told other acks than asked");
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::info!(%url, "acks not asked: {e}");
+                        break;
+                    }
+                }
+            }
+            Ok::<_, Error>(acked)
+        });
+        let acked: Vec<[u8; 32]> = acked.await?.into_iter().flatten().collect();
+        if acked.is_empty() {
+            return Ok(());
+        }
+        let now = now();
+        self.store.write(|tx| {
+            for send in &acked {
+                tx.execute(
+                    "UPDATE deliveries SET acked_at = COALESCE(acked_at, ?2) WHERE send = ?1",
+                    params![send, now],
+                )?;
+            }
+            Ok(())
+        })?;
+        tracing::info!(payments = acked.len(), "collected by their payees");
+        Ok(())
+    }
+
+    /// Where payment `id` stands in reaching its payee: none unless made
+    /// by [`Wallet::pay_code`] and released.
+    pub fn delivery(&self, id: &str) -> Result<Option<Delivery>, Error> {
+        let id = payment_id(id)?;
+        type Row = (
+            bool,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            i64,
+            Option<String>,
+        );
+        let row: Option<Row> = self.store.read(|c| {
+            Ok(c.query_row(
+                "SELECT d.mailbox IS NOT NULL, d.kept_at, d.mail_at, d.acked_at, d.mailed_at,
+                    d.given_up_at, d.tries, d.error
+                 FROM deliveries d JOIN sends s ON s.id = d.send
+                 WHERE d.send = ?1 AND s.done_at IS NOT NULL AND s.abandoned IS NULL",
+                [id.as_bytes()],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                    ))
+                },
+            )
+            .optional()?)
+        })?;
+        let Some((mailbox, kept, mail_at, acked, mailed, given_up, tries, error)) = row else {
+            return Ok(None);
+        };
+        let mail_at = mail_at.unwrap_or(0);
+        Ok(Some(match () {
+            _ if acked.is_some() => Delivery::Collected,
+            _ if mailed.is_some() => Delivery::Mailed,
+            _ if given_up.is_some() => Delivery::GivenUp,
+            _ if kept.is_some() && tries == 0 && mail_at > now() => Delivery::Kept { mail_at },
+            _ if !mailbox => Delivery::HandOver,
+            _ => Delivery::Mailing {
+                tries: u32::try_from(tries).unwrap_or(u32::MAX),
+                error,
+            },
+        }))
+    }
+
+    /// How many payments are still to reach their payees through
+    /// [`Wallet::due`]: kept at their hubs awaiting their payees, or to
+    /// mail. While any are, the application calls it now and then.
+    pub fn delivering(&self) -> Result<usize, Error> {
+        self.store.read(|c| {
+            let count: i64 = c.query_row(
+                &format!(
+                    "SELECT count(*) FROM deliveries d JOIN sends s ON s.id = d.send
+                     WHERE {UNDER_WAY}
+                       AND (d.mailbox IS NOT NULL OR (d.kept_at IS NOT NULL AND d.mail_at > ?1))"
+                ),
+                [now()],
+                |r| r.get(0),
+            )?;
+            Ok(count as usize)
+        })
+    }
+
+    /// Take the payments the hubs the wallet trusts keep for it, each
+    /// once, and tell their payers, through the hubs, that it has them.
+    /// Each hub's inbox is looked through from where it was last, to the
+    /// end; a hub that keeps no payments is skipped, and one that fails is
+    /// looked through again from there next time.
+    pub async fn collect_inbox(&self) -> Result<Inboxed, Error> {
+        let hubs: Vec<(i64, String, i64)> = self.store.read(|c| {
+            let mut stmt = c.prepare(
+                "SELECT h.id, r.url, COALESCE(h.inbox_after, 0)
+                 FROM hubs h JOIN reach r ON r.hub = h.id WHERE h.trusted = 1",
+            )?;
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })?;
+        let looked = each_at_most(HUBS_AT_ONCE, hubs, |(hub, url, after)| async move {
+            let mut received = Vec::new();
+            let failed = self.collect_at(hub, &url, after, &mut received).await;
+            let failed = failed.err().map(|e| (url, e.to_string()));
+            Ok::<_, Error>((received, failed))
+        });
+        let mut inboxed = Inboxed::default();
+        for (received, failed) in looked.await? {
+            inboxed.received.extend(received);
+            inboxed.failed.extend(failed);
+        }
+        Ok(inboxed)
+    }
+
+    /// [`Wallet::collect_inbox`] at hub `hub`, at `url`, after entry
+    /// `after`, adding the payments taken to `received`. Only a failure to
+    /// reach the hub or keep a payment holds the inbox where it was: an
+    /// entry whose payment is not the wallet's, or does not open, is
+    /// passed, so that no payer stalls the wallet's inbox with one.
+    async fn collect_at(
+        &self,
+        hub: i64,
+        url: &str,
+        mut after: i64,
+        received: &mut Vec<Received>,
+    ) -> Result<(), Error> {
+        let scan = self.owner.scan_key().clone();
+        let mut refreshed = false;
+        loop {
+            let Some(feed) = self.feed(url, after).await? else {
+                return Ok(());
+            };
+            let mine: Vec<(u64, [u8; 32])> = feed
+                .entries
+                .iter()
+                .filter_map(|entry| {
+                    let (ephemeral, tag) = entry.decode().ok()?;
+                    let shared = scan.shared(&Point(ephemeral)).ok()?;
+                    (inbox::tag(&shared) == tag).then_some((entry.seq, shared))
+                })
+                .collect();
+            for asked in mine.chunks(inbox::MAX_ASKED) {
+                let payments = asked.iter().map(|(seq, shared)| Kept {
+                    seq: *seq,
+                    key: Hex(inbox::key(shared).to_vec()),
+                });
+                let take = Take {
+                    payments: payments.collect(),
+                };
+                let taken: Taken = self.post(url, inbox::TAKE, &take).await?;
+                if taken.payments.len() != asked.len() {
+                    return Err(unavailable(url, "it answered other payments than asked"));
+                }
+                let mut acks = Vec::new();
+                for ((_, shared), kept) in asked.iter().zip(taken.payments) {
+                    let Some(kept) = kept else { continue };
+                    let payment = kept.at(url);
+                    let opened = match self.open_payment(&payment) {
+                        // A keyset the hub added since the wallet last asked.
+                        Err(Error::UnknownHub(_)) if !refreshed => {
+                            refreshed = true;
+                            self.refresh(url).await?;
+                            self.open_payment(&payment)
+                        }
+                        opened => opened,
+                    };
+                    let opened = match opened {
+                        Ok(opened) => opened,
+                        Err(e @ Error::Storage(_)) => return Err(e),
+                        Err(e) => {
+                            tracing::info!(%url, "a payment kept, not taken: {e}");
+                            continue;
+                        }
+                    };
+                    let proposal = opened.signed.proposal();
+                    match self.keep(&opened.keyset, opened.url.clone(), proposal, &opened.ours) {
+                        Ok(taken) => received.push(taken),
+                        Err(Error::AlreadyReceived) => {}
+                        Err(e @ Error::Storage(_)) => return Err(e),
+                        Err(e) => {
+                            tracing::info!(%url, "a payment kept, not taken: {e}");
+                            continue;
+                        }
+                    }
+                    // Of the payment as it is, whatever entry it came by.
+                    let secret = scan.shared(&proposal.ephemeral())?;
+                    acks.push(Acknowledgment {
+                        key: Hex(inbox::key(shared).to_vec()),
+                        ack: Hex(inbox::ack(&secret, &proposal.id()).to_vec()),
+                    });
+                }
+                if !acks.is_empty() {
+                    let told = Acknowledge { acks };
+                    let _: Acknowledged = self.post(url, inbox::ACK, &told).await?;
+                }
+            }
+            let Some(last) = feed.entries.last() else {
+                return Ok(());
+            };
+            after = i64::try_from(last.seq).map_err(invalid)?;
+            self.store.write(|tx| {
+                tx.execute(
+                    "UPDATE hubs SET inbox_after = MAX(COALESCE(inbox_after, 0), ?2) WHERE id = ?1",
+                    params![hub, after],
+                )?;
+                Ok(())
+            })?;
+            if !feed.more {
+                return Ok(());
+            }
+        }
+    }
+
+    /// The entries of the inbox of the hub at `url` after `after`: none if
+    /// the hub keeps no payments, answering that it serves no inbox.
+    async fn feed(&self, url: &str, after: i64) -> Result<Option<Feed>, Error> {
+        let path = inbox::feed(u64::try_from(after).unwrap_or(0));
+        let response = self
+            .transport
+            .request(&format!("{url}{path}"), None)
+            .await
+            .map_err(|reason| unavailable(url, reason))?;
+        let problem = serde_json::from_slice::<licash_api::Problem>(&response.body);
+        if response.status == 404 && problem.is_err() {
+            return Ok(None);
+        }
+        answer(url, &path, &response).map(Some)
+    }
+}

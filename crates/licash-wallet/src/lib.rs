@@ -30,6 +30,7 @@
 mod claims;
 mod code;
 mod coins;
+mod delivery;
 mod deposits;
 mod lightning;
 mod locks;
@@ -62,8 +63,8 @@ use licash::{
     unlink::Session,
 };
 use licash_api::{
-    Check, Checked, Code, Info, Offer, Offered, Payment, Problem, Release, Released, Unlink,
-    Unlinked, MAX_CHECK,
+    Check, Checked, Code, Info, Offer, Offered, Payment, Problem, Release, Unlink, Unlinked,
+    MAX_CHECK,
 };
 use rand_core::{OsRng, RngCore};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
@@ -72,6 +73,7 @@ use serde::{de::DeserializeOwned, Serialize};
 pub use claims::ClaimNote;
 pub use code::{ContractSecrets, HubId, LicashCode, PaymentCode, MAX_HUBS};
 pub use coins::MAX_INPUTS;
+pub use delivery::{Delivery, Due, Inboxed, ACK_WITHIN};
 pub use deposits::{Deposit, DepositState, DepositTerms};
 pub use lightning::{Invoice, InvoiceState, Payable};
 pub use locks::{Incoming, Lock, LockState, CLAIM_MARGIN};
@@ -301,6 +303,18 @@ pub enum State {
 pub struct Paid {
     pub id: String,
     pub payment: Payment,
+    /// Whether its hub keeps it for its payee to collect there
+    /// ([`Wallet::pay_code`]): not yet collected.
+    pub kept: bool,
+}
+
+/// A payment's notes paying the wallet, opened ([`Wallet::receive`]): of
+/// a keyset of the hub at `url`.
+struct Opened {
+    keyset: Keyset,
+    url: String,
+    signed: SignedProposal,
+    ours: Vec<(licash::address::Received, Note)>,
 }
 
 /// A payment taken.
@@ -1055,21 +1069,26 @@ impl<T: Transport> Wallet<T> {
             .request(&format!("{hub}{path}"), body)
             .await
             .map_err(|reason| unavailable(hub, reason))?;
-        if (200..300).contains(&response.status) {
-            return serde_json::from_slice(&response.body)
-                .map_err(|e| unavailable(hub, format!("{path}: {e}")));
-        }
-        match serde_json::from_slice::<Problem>(&response.body) {
-            Ok(problem) if problem.code != Code::Unavailable => Err(Error::Refused {
-                hub: hub.to_owned(),
-                problem,
-            }),
-            Ok(problem) => Err(unavailable(hub, problem.message)),
-            Err(_) => Err(unavailable(
-                hub,
-                format!("{path}: status {}", response.status),
-            )),
-        }
+        answer(hub, path, &response)
+    }
+}
+
+/// What the hub at `hub` answered at `path`: its body, or its problem.
+fn answer<A: DeserializeOwned>(hub: &str, path: &str, response: &Response) -> Result<A, Error> {
+    if (200..300).contains(&response.status) {
+        return serde_json::from_slice(&response.body)
+            .map_err(|e| unavailable(hub, format!("{path}: {e}")));
+    }
+    match serde_json::from_slice::<Problem>(&response.body) {
+        Ok(problem) if problem.code != Code::Unavailable => Err(Error::Refused {
+            hub: hub.to_owned(),
+            problem,
+        }),
+        Ok(problem) => Err(unavailable(hub, problem.message)),
+        Err(_) => Err(unavailable(
+            hub,
+            format!("{path}: status {}", response.status),
+        )),
     }
 }
 
@@ -1079,21 +1098,40 @@ impl<T: Transport> Wallet<T> {
     /// top. A hub that refuses the fee it advertised is asked again for its
     /// fees, and paid them, once.
     pub async fn send(&self, url: &str, payee: &Address, amount: u64) -> Result<Paid, Error> {
+        self.send_with(url, payee, amount, None).await
+    }
+
+    /// [`Wallet::send`], its hub asked to keep the payment for its payee if
+    /// `delivered`, then mailed to the payee's mailbox it holds, if any,
+    /// unless the payee collects it ([`delivery`]).
+    pub(crate) async fn send_with(
+        &self,
+        url: &str,
+        payee: &Address,
+        amount: u64,
+        delivered: Option<Option<[u8; 32]>>,
+    ) -> Result<Paid, Error> {
         let url = hub_url(url)?;
         if amount == 0 {
             return Err(Error::Invalid("nothing to pay".into()));
         }
-        match self.send_once(&url, payee, amount).await {
+        match self.send_once(&url, payee, amount, delivered).await {
             Err(Error::Refused { problem, .. }) if problem.code == Code::Fee => {
                 tracing::info!(%url, %problem, "fees changed, paying the new ones");
                 self.refresh(&url).await?;
-                self.send_once(&url, payee, amount).await
+                self.send_once(&url, payee, amount, delivered).await
             }
             sent => sent,
         }
     }
 
-    async fn send_once(&self, url: &str, payee: &Address, amount: u64) -> Result<Paid, Error> {
+    async fn send_once(
+        &self,
+        url: &str,
+        payee: &Address,
+        amount: u64,
+        delivered: Option<Option<[u8; 32]>>,
+    ) -> Result<Paid, Error> {
         let (hub, info) = self.hub(url)?;
         let (keyset, selection) = self.select(hub, amount, &info.fees.spend)?;
         let inputs = self.notes_of(&keyset, &selection.inputs)?;
@@ -1108,6 +1146,10 @@ impl<T: Transport> Wallet<T> {
         let proposal = Proposal::new(&keyset, &inputs, ephemeral.public(), outputs, None)?;
         let id = proposal.id();
         let offer = serde_json::to_string(&Offer::new(&proposal, &inputs)).map_err(invalid)?;
+        let shared = match delivered {
+            Some(_) => Some(ephemeral.shared(payee)?),
+            None => None,
+        };
         self.store.write(|tx| {
             tx.execute(
                 "INSERT INTO sends (id, hub, payee, amount, fee, offer, created_at)
@@ -1122,12 +1164,14 @@ impl<T: Transport> Wallet<T> {
                     now()
                 ],
             )?;
+            if let (Some(mailbox), Some(shared)) = (delivered, shared) {
+                delivery::record(tx, &id, mailbox, &shared)?;
+            }
             take(tx, &id, &selection.inputs)
         })?;
         let key = hex::encode(id.as_bytes());
         tracing::info!(id = %key, %url, amount, fee = selection.fee, "sending");
-        let payment = self.advance(&id).await?;
-        Ok(Paid { id: key, payment })
+        self.advance(&id).await
     }
 
     /// The wallet's notes `ys` of `keyset`.
@@ -1188,7 +1232,7 @@ impl<T: Transport> Wallet<T> {
     /// Take send `id` on from where it stands: ask for its offer, sign it,
     /// ask for its release, then keep its change. Refused only if given up
     /// here; any other failure leaves it pending.
-    async fn advance(&self, id: &ProposalId) -> Result<Payment, Error> {
+    async fn advance(&self, id: &ProposalId) -> Result<Paid, Error> {
         let pending = |e: Error| match e {
             Error::Refused { .. } | Error::Pending { .. } | Error::Abandoned { .. } => e,
             e => Error::Pending {
@@ -1199,7 +1243,7 @@ impl<T: Transport> Wallet<T> {
         self.advance_from(id).await.map_err(pending)
     }
 
-    async fn advance_from(&self, id: &ProposalId) -> Result<Payment, Error> {
+    async fn advance_from(&self, id: &ProposalId) -> Result<Paid, Error> {
         type Row = (
             i64,
             String,
@@ -1226,6 +1270,7 @@ impl<T: Transport> Wallet<T> {
             )?)
         })?;
         let (hub, url, offer, release, unlock, abandoned) = row;
+        let keep = self.store.read(|c| delivery::keep(c, id))?;
         if let Some(reason) = abandoned {
             return Err(Error::Abandoned {
                 id: hex::encode(id.as_bytes()),
@@ -1247,9 +1292,15 @@ impl<T: Transport> Wallet<T> {
         let Authorization::Granted(grant) = signed.authorization() else {
             return Err(Error::Invalid("a send without a grant".into()));
         };
-        let unlock = match unlock {
-            Some(unlock) => unlock,
-            None => self.release(&url, id, &release, keyset, grant).await?,
+        // Whether its hub keeps it for its payee, if asked here.
+        let (unlock, kept) = match unlock {
+            Some(unlock) => (unlock, None),
+            None => {
+                let (unlock, kept) = self
+                    .release(&url, id, &release, keep, keyset, grant)
+                    .await?;
+                (unlock, Some(kept))
+            }
         };
         let change = self
             .owner
@@ -1268,7 +1319,7 @@ impl<T: Transport> Wallet<T> {
             })
             .collect::<Result<Vec<_>, Error>>()?;
         let ephemeral = signed.proposal().ephemeral();
-        self.store.write(|tx| {
+        let kept = self.store.write(|tx| {
             tx.execute(
                 "UPDATE sends SET unlock = ?2, done_at = COALESCE(done_at, ?3) WHERE id = ?1",
                 params![id.as_bytes(), unlock, now()],
@@ -1276,9 +1327,13 @@ impl<T: Transport> Wallet<T> {
             for (r, note) in &change {
                 insert_note(tx, keyset, note, id, &ephemeral, r.branch, r.position)?;
             }
-            Ok(())
+            delivery::released(tx, id, kept)
         })?;
-        Ok(Payment::new(&url, &signed, &notes, &unlock))
+        Ok(Paid {
+            id: hex::encode(id.as_bytes()),
+            payment: Payment::new(&url, &signed, &notes, &unlock),
+            kept,
+        })
     }
 
     /// The hub's offer for `offer`, signed and recorded: from then on the
@@ -1334,18 +1389,25 @@ impl<T: Transport> Wallet<T> {
     }
 
     /// The hub's unlock for the signed `release`, checked to open its
-    /// grant. A hub that spent an input otherwise will never release it:
+    /// grant, and whether it keeps the payment for its payee, asked to if
+    /// `keep`. A hub that spent an input otherwise will never release it:
     /// the send is given up. Any other refusal leaves it pending.
     async fn release(
         &self,
         url: &str,
         id: &ProposalId,
         release: &Release,
+        keep: Option<licash_api::inbox::Keep>,
         keyset: &Keyset,
         grant: &Grant,
-    ) -> Result<Unlock, Error> {
+    ) -> Result<(Unlock, bool), Error> {
+        let asked = keep.is_some();
+        let release = licash_api::inbox::Release {
+            release: release.clone(),
+            keep,
+        };
         let released = match self
-            .post::<Released>(url, licash_api::RELEASE, release)
+            .post::<licash_api::inbox::Released>(url, licash_api::RELEASE, &release)
             .await
         {
             Ok(released) => released,
@@ -1360,11 +1422,14 @@ impl<T: Transport> Wallet<T> {
             }
             Err(e) => return Err(e),
         };
-        let unlock = released.decode().map_err(|p| unavailable(url, p))?;
+        let unlock = released
+            .released
+            .decode()
+            .map_err(|p| unavailable(url, p))?;
         grant
             .verify_unlock(keyset, &unlock)
             .map_err(|e| unavailable(url, format!("its unlock: {e}")))?;
-        Ok(unlock)
+        Ok((unlock, asked && released.kept))
     }
 
     /// Give payment `id` up on its hub's refusal `problem` of `step`, unless
@@ -1480,7 +1545,7 @@ impl<T: Transport> Wallet<T> {
         for id in ids {
             let key = hex::encode(id);
             match self.advance(&ProposalId::from_bytes(id)).await {
-                Ok(payment) => resumed.paid.push(Paid { id: key, payment }),
+                Ok(paid) => resumed.paid.push(paid),
                 Err(Error::Refused { problem, .. }) => {
                     resumed.abandoned.push((key, problem.to_string()));
                 }
@@ -1651,6 +1716,18 @@ impl<T: Transport> Wallet<T> {
     /// checked to open them. It must be under a keyset of a hub added
     /// here, not only visited, as the wallet takes no hub's notes unasked.
     pub fn receive(&self, payment: &Payment) -> Result<Received, Error> {
+        let opened = self.open_payment(payment)?;
+        self.keep(
+            &opened.keyset,
+            opened.url,
+            opened.signed.proposal(),
+            &opened.ours,
+        )
+    }
+
+    /// The notes `payment` pays this wallet, opened, under a keyset of a
+    /// hub added here.
+    fn open_payment(&self, payment: &Payment) -> Result<Opened, Error> {
         let id: [u8; 32] = payment
             .release
             .keyset
@@ -1691,7 +1768,12 @@ impl<T: Transport> Wallet<T> {
                 Ok((r, note))
             })
             .collect::<Result<Vec<_>, Error>>()?;
-        self.keep(&keyset, url, proposal, &ours)
+        Ok(Opened {
+            keyset,
+            url,
+            signed,
+            ours,
+        })
     }
 
     /// Keep the notes `ours` of `proposal` paid this wallet, with a
