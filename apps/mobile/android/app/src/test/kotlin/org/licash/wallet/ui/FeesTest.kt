@@ -28,6 +28,27 @@ class FeesTest {
     }
 
     @Test
+    fun a_payout_splits_its_fee_by_who_gets_it_leaving_out_parts_of_zero() {
+        val quoted = payoutFee(10_000uL, 160uL, hub = 10uL, provider = 100uL, network = 50uL, quoted = true)
+        assertEquals(listOf("Hub" to 10uL, "Payout provider" to 100uL, "Bitcoin network" to 50uL), quoted.components)
+        assertTrue(quoted.explanation.contains("its own coin"))
+        // Before its lock is made, the hub has charged nothing yet.
+        val recorded = payoutFee(10_000uL, 150uL, hub = 0uL, provider = 100uL, network = 50uL, quoted = false)
+        assertEquals(listOf("Payout provider" to 100uL, "Bitcoin network" to 50uL), recorded.components)
+        assertTrue(recorded.explanation.contains("not saved"))
+        assertNull(recorded.rate)
+    }
+
+    @Test
+    fun parts_that_do_not_add_up_to_the_fee_are_not_shown() {
+        assertTrue(payoutFee(10_000uL, 99uL, 10uL, 100uL, 50uL, quoted = false).components.isEmpty())
+        assertTrue(payoutFee(10_000uL, 0uL, 0uL, 0uL, 0uL, quoted = true).components.isEmpty())
+        assertTrue(feeParts(ULong.MAX_VALUE - 1uL, listOf("a" to ULong.MAX_VALUE, "b" to 1uL)).isEmpty())
+        assertEquals(listOf("Hub" to 1uL, "Swap provider" to 4uL), swapFee(300uL, 5uL, hub = 1uL, provider = 4uL).components)
+        assertEquals(recordedFee(300uL, 5uL), swapFee(300uL, 5uL, hub = 1uL, provider = 3uL))
+    }
+
+    @Test
     fun setup_cost_is_not_labeled_a_transaction_fee() {
         val cost = setupCost(4_096uL, 23_000uL)
         assertEquals("Total cost", cost.totalLabel)

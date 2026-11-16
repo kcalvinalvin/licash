@@ -260,6 +260,9 @@ impl Wallet {
             address: asked.address.clone(),
             amount: quote.amount,
             fee: quote.costs(),
+            provider_fee: quote.fee,
+            claim_fee: quote.budget,
+            lock_fee: quote.lock_fee,
             hub: hub.clone(),
             provider: provider.url,
             provider_name: provider.name,
@@ -414,6 +417,11 @@ pub(super) fn details(
         PayoutState::Failed(why) => Some(why.clone()),
         _ => None,
     };
+    let locks = wallet.locks()?;
+    let lock = payout.lock.as_ref();
+    let lock_fee = lock
+        .and_then(|id| locks.iter().find(|l| &l.id == id))
+        .map_or(0, |l| l.fee);
     Ok(Details::Payout {
         hub: payout.from,
         provider: payout.provider,
@@ -422,6 +430,9 @@ pub(super) fn details(
         claim: payout.claim.map(|t| t.to_string()),
         failure,
         progress: steps(wallet.payout_progress(hash)?, tip),
+        provider_fee: payout.fee,
+        claim_fee: payout.budget,
+        lock_fee,
     })
 }
 

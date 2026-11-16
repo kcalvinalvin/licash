@@ -356,9 +356,9 @@ private fun Summary(activity: Activity, details: Details?, tx: Onchain?, develop
     val failed = activity.state == State.FAILED
     Group("") {
         // What it cost on top, and what it came to: nothing of one that failed.
-        val costs = @Composable {
+        val costs = @Composable { breakdown: FeeBreakdown ->
             if (!failed) {
-                FeeLine("Fee", activity.fee, activity.amount, breakdown = recordedFee(activity.amount, activity.fee))
+                FeeLine("Fee", activity.fee, activity.amount, breakdown = breakdown)
                 if (activity.fee > 0uL) Line("Total", sat(activity.amount + activity.fee), tag = "total")
             }
         }
@@ -375,12 +375,12 @@ private fun Summary(activity: Activity, details: Details?, tx: Onchain?, develop
                 if (failed) {
                     FeeLine("Refund fee", activity.fee, activity.amount, value = sat(activity.fee), breakdown = recordedFee(activity.amount, activity.fee))
                 } else {
-                    costs()
+                    costs(recordedFee(activity.amount, activity.fee))
                 }
                 Line("From", name(details.hub))
             }
             is Details.Payout -> {
-                costs()
+                costs(payoutFee(activity.amount, activity.fee, details.lockFee, details.providerFee, details.claimFee, quoted = false))
                 Line("To", short(details.address), tag = "to")
                 Line("From", name(details.hub))
                 if (developer) Line("Through", host(details.provider))
@@ -396,13 +396,13 @@ private fun Summary(activity: Activity, details: Details?, tx: Onchain?, develop
                 Line("At", name(details.hub), tag = "at")
             }
             is Details.Swap -> {
-                costs()
+                costs(swapFee(activity.amount, activity.fee, details.lockFee, details.providerFee))
                 Line("From", name(details.from))
                 Line("To", name(details.to))
                 if (developer) Line("Through", host(details.provider))
             }
             else -> if (activity.kind == Kind.SENT) {
-                costs()
+                costs(recordedFee(activity.amount, activity.fee))
                 (details as? Details.Notes)?.let { Line("From", name(it.hub)) }
             } else {
                 (details as? Details.Notes)?.let { Line("At", name(it.hub)) }

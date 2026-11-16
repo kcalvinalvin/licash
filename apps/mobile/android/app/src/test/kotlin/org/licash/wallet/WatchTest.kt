@@ -28,7 +28,7 @@ class WatchTest {
 
     private fun payout(steps: PayoutSteps) = Details.Payout(
         hub = "https://hub.example", provider = "https://swaps.example", address = "bc1q", coin = steps.coin,
-        claim = steps.claim, failure = null, progress = steps,
+        claim = steps.claim, failure = null, progress = steps, providerFee = 0u, claimFee = 0u, lockFee = 0u,
     )
 
     private fun deposit(paid: Boolean) = Details.Moved(

@@ -377,8 +377,13 @@ fun Send(
 private class Fact(val label: String, val value: String, val tag: String, val share: String? = null, val fee: FeeBreakdown? = null)
 
 /** What a payment costs and when it arrives, to confirm it by: with what it comes to, if it costs. */
-private fun costs(amount: ULong, fee: ULong, arrives: String): List<Fact> = listOfNotNull(
-    Fact("Fee", if (fee == 0uL) "None" else sat(fee), "fee", share(fee, amount), FeeBreakdown(amount, fee)),
+private fun costs(
+    amount: ULong,
+    fee: ULong,
+    arrives: String,
+    breakdown: FeeBreakdown = FeeBreakdown(amount, fee),
+): List<Fact> = listOfNotNull(
+    Fact("Fee", if (fee == 0uL) "None" else sat(fee), "fee", share(fee, amount), breakdown),
     if (fee > 0uL) Fact("Total", sat(amount + fee), "total") else null,
     Fact("Arrives", arrives, "arrives"),
 )
@@ -614,7 +619,12 @@ private fun Payout(quote: PayoutQuote, own: Boolean, several: Boolean, pay: () -
     Confirm(
         quote.amount,
         listOf(Fact("To", if (own) "This wallet" else shortAddress(quote.address), "to")) +
-            costs(quote.amount, quote.fee, arrives(quote.depth).replaceFirstChar { it.uppercase() }) +
+            costs(
+                quote.amount,
+                quote.fee,
+                arrives(quote.depth).replaceFirstChar { it.uppercase() },
+                payoutFee(quote.amount, quote.fee, quote.lockFee, quote.providerFee, quote.claimFee, quoted = true),
+            ) +
             listOfNotNull(if (several) Fact("From", name(quote.hub), "from") else null),
         "Send",
         pay,

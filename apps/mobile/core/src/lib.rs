@@ -521,6 +521,11 @@ pub struct PayoutQuote {
     pub address: String,
     pub amount: u64,
     pub fee: u64,
+    /// The parts of `fee`, as quoted: the provider's (its coin's miners
+    /// in it), the claim's miners and the hub's on the wallet's lock.
+    pub provider_fee: u64,
+    pub claim_fee: u64,
+    pub lock_fee: u64,
     pub hub: String,
     /// The provider, by its URL, and the name it announced, if any.
     pub provider: String,
@@ -815,6 +820,8 @@ pub enum Details {
     /// wallet's lock at `from` once made, the provider's at `to` once made;
     /// why it failed, if it did, the notes locked back once the lock
     /// expires.
+    /// Its fee's parts as recorded: the provider's, and the hub's on the
+    /// lock, 0 until the lock is made.
     Swap {
         from: String,
         to: String,
@@ -822,12 +829,16 @@ pub enum Details {
         lock: Option<String>,
         theirs: Option<String>,
         failure: Option<String>,
+        provider_fee: u64,
+        lock_fee: u64,
     },
     /// Notes at `hub` paid out to `address`, on Bitcoin, through
     /// `provider`: the transaction of its coin, once the wallet found it,
     /// and of the wallet's claim paying the address, once made; why it
     /// failed, if it did, its notes back once the lock expires. `progress`
-    /// tells each step.
+    /// tells each step. Its fee's parts as recorded: the provider's (its
+    /// coin's miners in it), the claim's miners, and the hub's on the lock,
+    /// 0 until the lock is made.
     Payout {
         hub: String,
         provider: String,
@@ -836,6 +847,9 @@ pub enum Details {
         claim: Option<String>,
         failure: Option<String>,
         progress: PayoutSteps,
+        provider_fee: u64,
+        claim_fee: u64,
+        lock_fee: u64,
     },
     /// A recovery contract opened at `hub`, by its `funding`'s id.
     Contract { hub: String, funding: String },

@@ -17,9 +17,11 @@ announced on Nostr to pick from, or takes one by its address.
 
 Tap a fee in a payment review or its history for the amount, percentage,
 and supplied recipient split. Current direct-payment estimates show base
-plus percentage times amount, rounded up like the hub. Historical rates
-or provider/miner splits that were not saved are identified as unavailable,
-never reconstructed from today's terms.
+plus percentage times amount, rounded up like the hub. Payouts and moves
+split their fee by who gets it, as quoted or recorded: the hub, the payout
+or swap provider, and the Bitcoin network for a payout's claim. Historical
+rates or splits that were not saved are identified as unavailable, never
+reconstructed from today's terms.
 
 Settings is one page: the hubs (each tapped for its fees, more added by
 address or found on Nostr), Backup, Bitcoin's state, Tor, About (the
