@@ -467,7 +467,7 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             let pending = matches!(e.downcast_ref(), Some(Error::Pending { .. }));
-            eprintln!("error: {e:#}");
+            eprintln!("error: {}", say::terminal(&format!("{e:#}")));
             if pending {
                 ExitCode::from(PENDING)
             } else {
@@ -1333,7 +1333,7 @@ async fn pay(
             );
         }
         if json || details || !plan.trusted {
-            eprintln!("{swapping}");
+            eprintln!("{}", say::terminal(&swapping));
         }
     }
     if let Some(max) = max_fee.filter(|max| fees > *max) {
@@ -1355,7 +1355,10 @@ async fn pay(
         eprintln!("payment {id}");
     }
     if let Some(reason) = &paid.undelivered {
-        eprintln!("warning: not sent to the payee's mailbox ({reason}): hand it over");
+        eprintln!(
+            "warning: not sent to the payee's mailbox ({}): hand it over",
+            say::terminal(reason)
+        );
     }
     match paid.delivered {
         Some(relays) => show(
@@ -1398,7 +1401,7 @@ async fn pay(
 async fn mailbox(wallet: &Wallet<Http>, route: &Route, json: bool) -> anyhow::Result<()> {
     let collected = licash_nostr::wallet::collect(wallet, route).await?;
     for (id, reason) in &collected.skipped {
-        eprintln!("warning: {id} in the mailbox {reason}");
+        eprintln!("warning: {id} in the mailbox {}", say::terminal(reason));
     }
     let received = collected.received;
     let unlinked = match received.is_empty() {
@@ -1439,7 +1442,10 @@ async fn unlink(wallet: &Wallet<Http>) -> Option<usize> {
     match wallet.unlink().await {
         Ok(unlinked) => Some(unlinked),
         Err(e) => {
-            eprintln!("warning: some notes stay linked for now ({e}); resume unlinks them");
+            eprintln!(
+                "warning: some notes stay linked for now ({}); resume unlinks them",
+                say::terminal(&e.to_string())
+            );
             None
         }
     }
@@ -1724,7 +1730,7 @@ fn show(json: bool, value: serde_json::Value, text: String) {
     if json {
         println!("{value}");
     } else if !text.is_empty() {
-        println!("{text}");
+        println!("{}", say::terminal(&text));
     }
 }
 

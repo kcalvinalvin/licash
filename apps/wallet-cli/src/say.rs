@@ -2,6 +2,32 @@
 //! grouped and in sat, fees as a percentage, times as UTC dates. JSON
 //! keeps the raw numbers.
 
+/// Human output must not execute control sequences supplied by a peer.
+/// Preserve the layout's newlines and tabs, and ordinary Unicode text.
+pub fn terminal(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if c.is_control() && c != '\n' && c != '\t' {
+            out.extend(c.escape_default());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod terminal_tests {
+    #[test]
+    fn peer_controls_are_literal_but_unicode_and_layout_survive() {
+        assert_eq!(super::terminal("José\n\tpaid"), "José\n\tpaid");
+        assert_eq!(
+            super::terminal("\u{1b}[2J\r\u{7}\u{9b}"),
+            "\\u{1b}[2J\\r\\u{7}\\u{9b}"
+        );
+    }
+}
+
 /// `12,345`.
 pub fn grouped(n: u64) -> String {
     let digits = n.to_string();
