@@ -102,8 +102,7 @@ pub enum Stage {
     /// Her payout after the hub's answer (`success`, or her answer to its
     /// challenge) in a block: waiting out its delay.
     Paid,
-    /// A proven counter, whose corrected payout is not supported yet, or
-    /// an older build's counter still to classify. Its output is watched.
+    /// An older build's counter still to classify.
     Countered,
 }
 
@@ -237,6 +236,10 @@ struct State {
     /// hex, and their total.
     notes: Vec<String>,
     amount: u32,
+    /// The selected c=1 payout, fixed with the statement before proving.
+    /// Absent on every older full-claim row; zero still means c=1.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    corrected: Option<u32>,
     /// The signed claim P publishes, in hex.
     publication: Option<String>,
     #[serde(with = "consensus")]
@@ -337,7 +340,76 @@ impl State {
             "a recovery stored in format {}, unknown",
             row.format
         );
-        serde_json::from_slice(&row.state).context("a recovery's state")
+        let state: Self = serde_json::from_slice(&row.state).context("a recovery's state")?;
+        if state.corrected.is_some() {
+            ensure!(
+                matches!(
+                    Stage::parse(&row.stage)?,
+                    Stage::Proving
+                        | Stage::Asserting
+                        | Stage::Asserted
+                        | Stage::Succeeding
+                        | Stage::Answering
+                        | Stage::Paid
+                        | Stage::Sweeping
+                        | Stage::Done
+                        | Stage::Lost
+                ),
+                "corrected amount before statement selection"
+            );
+        }
+        Ok(state)
+    }
+
+    fn prepare_statement(
+        &mut self,
+        input: &StatementInput,
+        paid: u32,
+        deadline: u32,
+    ) -> Result<Vec<u8>> {
+        ensure!(
+            self.corrected.is_none(),
+            "the recovery's statement is selected already"
+        );
+        let corrected = match input.c {
+            0 => {
+                ensure!(
+                    paid == self.amount,
+                    "her statement pays {paid}, not her claim"
+                );
+                None
+            }
+            1 => {
+                ensure!(paid <= self.amount, "corrected payout exceeds her claim");
+                ensure!(
+                    matches!(&input.response, HubResponse::Counter { b_corr, .. } if *b_corr == paid),
+                    "corrected statement pays another amount"
+                );
+                Some(paid)
+            }
+            _ => bail!("unknown assertion mode"),
+        };
+        let bytes = input
+            .to_bytes()
+            .map_err(|e| anyhow!("her statement: {e}"))?;
+        self.corrected = corrected;
+        self.deadline = Some(deadline);
+        self.next_at = None;
+        Ok(bytes)
+    }
+
+    fn check_statement(&self, input: &StatementInput) -> Result<()> {
+        ensure!(
+            input.c == u32::from(self.corrected.is_some()),
+            "statement disagrees with the recovery's assertion mode"
+        );
+        if let Some(amount) = self.corrected {
+            ensure!(
+                matches!(&input.response, HubResponse::Counter { b_corr, .. } if *b_corr == amount),
+                "statement disagrees with the recovery's corrected amount"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -404,6 +476,7 @@ pub async fn import_proof<T: Transport, C: Chain>(
     let row = store.recovery(id)?.context("no recovery of it")?;
     let stage = Stage::parse(&row.stage)?;
     let mut state = State::decode(&row)?;
+    full_only(&state)?;
     match stage {
         Stage::Proving => {
             state.proof = Some(proof);
@@ -480,12 +553,15 @@ pub fn statement(dir: &std::path::Path, id: &[u8; 32]) -> Result<Vec<u8>> {
     let row = store.recovery(id)?.context("no recovery of it")?;
     let stage = Stage::parse(&row.stage)?;
     ensure!(
-        stage.disputed() && stage != Stage::Answered,
+        stage.disputed() && !matches!(stage, Stage::Answered | Stage::Countered),
         "no statement to prove at stage {}",
         stage.as_str()
     );
     let path = store.statement_path(id);
-    std::fs::read(&path).with_context(|| format!("{}", path.display()))
+    let bytes = std::fs::read(&path).with_context(|| format!("{}", path.display()))?;
+    let input = StatementInput::from_bytes(&bytes).map_err(|e| anyhow!("her statement: {e}"))?;
+    State::decode(&row)?.check_statement(&input)?;
+    Ok(bytes)
 }
 
 /// Give up recovering contract `id`, her notes given back to her: only
@@ -1118,6 +1194,7 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
 
     /// Her bits and reserve swept to her wallet once their delay passed.
     fn sweep(&self, state: &mut State, tip: u32) -> Result<Next> {
+        full_only(state)?;
         let (payout, height) = payout(state)?;
         let height = height.context("no payout in a block")?;
         if tip + 1 < height + close::sweep_delay(&self.o) {
@@ -1167,9 +1244,13 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
     /// Her statement's input, from her notes claimed and the chain's
     /// evidence of R and P once both are deep enough, run as her proof
     /// will be and kept beside her instances: then her proof is needed.
-    /// An unproven counter also permits the full claim. A proven counter
-    /// is watched until corrected-payout recovery is supported.
+    /// An unproven counter permits the full claim. A proven counter fixes
+    /// its corrected amount with the statement before proving starts.
     async fn answered(&self, state: &mut State, tip: u32) -> Result<Next> {
+        ensure!(
+            state.corrected.is_none(),
+            "an unclassified recovery has a corrected amount"
+        );
         // Its output taken meanwhile (her assert by another copy of her
         // wallet, or the hub's timeout): nothing to build.
         state.from = state.from.max(state.spent_height);
@@ -1192,46 +1273,22 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
         let mut input = self.statement(state, response, deep).await?;
         let (journal, paid) = match classify_statement(&mut input)? {
             StatementResult::Full(journal, paid) => (journal, paid),
-            StatementResult::Counter(paid) => {
-                // An affirmative classification marker, in a field older
-                // builds already read. Do not fetch the chain again on
-                // every refresh of a proven counter.
-                state.deadline = Some(dispute::deadline(&self.o));
-                state.next_at = None;
-                self.trouble(format!(
-                    "the hub proved a counter paying {paid}, before block {}; corrected-payout recovery is not supported yet",
-                    dispute::deadline(&self.o)
-                ));
-                return Ok(Next::To(Stage::Countered));
-            }
+            StatementResult::Counter(journal, paid) => (journal, paid),
         };
         ensure!(
-            journal.to_bytes() == dispute::expected(&self.o).to_bytes(),
+            journal.to_bytes()
+                == licash_contract::opening::journal(&self.o.base, &self.o.d, input.c).to_bytes(),
             "her statement commits another journal than her contract fixed"
         );
-        ensure!(
-            paid == state.amount,
-            "her statement pays {paid}, not her claim"
-        );
-        let bytes = input
-            .to_bytes()
-            .map_err(|e| anyhow!("her statement: {e}"))?;
+        let bytes = state.prepare_statement(&input, paid, dispute::deadline(&self.o))?;
         self.store.keep_statement(&self.id, &bytes)?;
-        state.deadline = Some(dispute::deadline(&self.o));
-        state.next_at = None;
         Ok(Next::To(Stage::Proving))
     }
 
-    /// Retry an older build's unclassified counter once. A proven counter
-    /// keeps its classification and only watches the answer's output.
+    /// Both older counter states, including the former deadline marker,
+    /// select a statement once. New recoveries never write this stage.
     async fn countered(&self, state: &mut State, tip: u32) -> Result<Next> {
-        if state.deadline.is_none() {
-            return self.answered(state, tip).await;
-        }
-        self.trouble(
-            "the hub proved a counter; corrected-payout recovery is not supported yet".into(),
-        );
-        Ok(self.answer_spent(state, tip).await?.unwrap_or(Next::Save))
+        self.answered(state, tip).await
     }
 
     /// Her statement's input proving her whole claim against `response`:
@@ -1311,7 +1368,7 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
         if let Some(next) = self.answer_spent(state, tip).await? {
             return Ok(next);
         }
-        if !self.trust.mock {
+        if state.corrected.is_some() || !self.trust.mock {
             return Ok(Next::Save);
         }
         let proof = dispute::mock_proof(&self.o, &self.trust)?;
@@ -1322,6 +1379,7 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
     /// Her `assert` of her proof kept, broadcast until in a block, past
     /// her deadline too, until the hub's timeout is.
     async fn asserting(&self, state: &mut State, tip: u32) -> Result<Next> {
+        full_only(state)?;
         if let Some(next) = self.answer_spent(state, tip).await? {
             return Ok(next);
         }
@@ -1347,12 +1405,22 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
         let script = answer.output[0].script_pubkey.clone();
         let from = state.from.or(state.spent_height).unwrap_or(self.since);
         match first_spend(self.chain, output, &script, from..=tip).await? {
-            Some((height, tx)) if dispute::is_assert(&self.o, &tx) => {
-                let proof = hex::encode(dispute::proof_bytes(&dispute::asserted(&self.o, &tx)?));
+            Some((height, tx))
+                if dispute::is_assert(&self.o, &tx)
+                    || dispute::Corrected::is_assert(&self.o, &tx) =>
+            {
+                let (corrected, proof) = if dispute::Corrected::is_assert(&self.o, &tx) {
+                    let (claim, proof, _) = dispute::Corrected::asserted(&self.o, &tx)?;
+                    (Some(claim.amount()), proof)
+                } else {
+                    (None, dispute::asserted(&self.o, &tx)?)
+                };
+                let proof = hex::encode(dispute::proof_bytes(&proof));
                 if state.proof.as_ref().is_some_and(|p| *p != proof) {
                     self.trouble("another copy of this wallet asserted another proof".into());
                 }
                 state.proof = Some(proof);
+                state.corrected = corrected;
                 state.assertion = Some(tx);
                 state.assertion_height = Some(height);
                 state.from = Some(height);
@@ -1377,6 +1445,7 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
     /// chance passed, then `success`, of P's fee coin, broadcast until in
     /// a block. A challenge, even once `success` is out, is answered.
     async fn asserted(&self, stage: Stage, state: &mut State, tip: u32) -> Result<Next> {
+        full_only(state)?;
         let assertion = state.assertion.clone().context("no assert")?;
         let height = state.assertion_height.context("her assert in no block")?;
         let output = OutPoint {
@@ -1426,6 +1495,7 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
     /// of P's fee coin, broadcast until in a block: the hub's `failure`
     /// pays it once her chance passed.
     async fn answering(&self, state: &mut State, tip: u32) -> Result<Next> {
+        full_only(state)?;
         let challenge = state.challenge.clone().context("no challenge")?;
         let height = state.challenge_height.context("a challenge in no block")?;
         let output = OutPoint {
@@ -1516,7 +1586,7 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
 #[derive(Debug)]
 enum StatementResult {
     Full(licash::statement::Journal, u32),
-    Counter(u32),
+    Counter(licash::statement::Journal, u32),
 }
 
 /// Use the same counter verifier as the holder guest. Trying both journals
@@ -1529,13 +1599,23 @@ fn classify_statement(input: &mut StatementInput) -> Result<StatementResult> {
         Ok((journal, paid)) => Ok(StatementResult::Full(journal, paid)),
         Err(full_error) => {
             input.c = 1;
-            if let Ok((_, paid)) = input.run(&mut verify) {
-                return Ok(StatementResult::Counter(paid));
+            if let Ok((journal, paid)) = input.run(&mut verify) {
+                return Ok(StatementResult::Counter(journal, paid));
             }
             input.c = 0;
             Err(anyhow!("her statement: {full_error}"))
         }
     }
+}
+
+/// Until collection is wired, corrected states may export their statement
+/// and watch the chain, but must never fall through to full-claim signing.
+fn full_only(state: &State) -> Result<()> {
+    ensure!(
+        state.corrected.is_none(),
+        "corrected proof import and collection are not supported yet"
+    );
+    Ok(())
 }
 
 #[cfg(test)]

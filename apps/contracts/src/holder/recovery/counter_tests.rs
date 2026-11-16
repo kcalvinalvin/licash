@@ -387,7 +387,7 @@ fn a_bad_signature_is_not_a_full_claim_fallback() {
 }
 
 #[tokio::test]
-async fn a_classified_counter_watches_without_rebuilding_chain_evidence() {
+async fn a_corrected_statement_waits_for_proof_without_rebuilding_or_signing() {
     use k256::elliptic_curve::PrimeField as _;
     use licash_wallet::{Blocks, Response};
     use std::sync::atomic::AtomicUsize;
@@ -454,7 +454,7 @@ async fn a_classified_counter_watches_without_rebuilding_chain_evidence() {
     .unwrap();
     let store = Store::open(dir.path()).unwrap();
     let chain = Watch(AtomicUsize::new(0));
-    let run = Run {
+    let mut run = Run {
         wallet: &wallet,
         chain: &chain,
         store: &store,
@@ -463,12 +463,15 @@ async fn a_classified_counter_watches_without_rebuilding_chain_evidence() {
         rate: FeeRate::from_sat_per_vb(2).unwrap(),
         o,
         keys,
-        trust: Trust::mock(),
+        // A genuine authority waits for an explicit proof action. The
+        // frozen opening is used only to identify the watched output.
+        trust: crate::trust(ChainProfile::Core30Signet).unwrap(),
         since: 100,
         refused: Default::default(),
         took: AtomicBool::new(false),
         rebuilt: AtomicBool::new(false),
     };
+    assert!(!run.trust.mock);
     let spend = Transaction {
         version: transaction::Version::TWO,
         lock_time: absolute::LockTime::ZERO,
@@ -481,19 +484,279 @@ async fn a_classified_counter_watches_without_rebuilding_chain_evidence() {
     let mut state = State {
         notes: vec!["ab".into()],
         amount: 4,
+        corrected: Some(2),
         spend: Some(spend),
         from: Some(199),
         deadline: Some(500),
         ..State::default()
     };
-    for _ in 0..2 {
-        assert!(matches!(
-            run.countered(&mut state, 200).await.unwrap(),
-            Next::Save
-        ));
-        assert_eq!(state.notes, vec!["ab"]);
-        assert_eq!(state.amount, 4);
+    for trust in [
+        crate::trust(ChainProfile::Core30Signet).unwrap(),
+        Trust::mock(),
+    ] {
+        run.trust = trust;
+        for _ in 0..2 {
+            assert!(matches!(
+                run.proving(&mut state, 200).await.unwrap(),
+                Next::Save
+            ));
+            assert_eq!(state.notes, vec!["ab"]);
+            assert_eq!(state.amount, 4);
+            assert_eq!(state.corrected, Some(2));
+            // In particular, the full-claim mock prover must not run for
+            // a corrected row under the regtest authority.
+            assert!(state.proof.is_none());
+        }
     }
-    assert_eq!(chain.0.load(Ordering::SeqCst), 4);
+    assert_eq!(chain.0.load(Ordering::SeqCst), 8);
     assert!(!store.statement_path(&run.id).exists());
+}
+
+#[test]
+fn selecting_a_corrected_statement_keeps_the_original_claim_and_records_zero_explicitly() {
+    let mut k = vec![0; K_LEN];
+    k[4..8].copy_from_slice(&2u32.to_be_bytes());
+    let mut input = fixture(k);
+    input.c = 1;
+    let mut state = State {
+        amount: 4,
+        ..State::default()
+    };
+    // This tests metadata after a c=1 decision, not counter validity.
+    // Production reaches this transition only after the real verifier.
+    let bytes = state.prepare_statement(&input, 2, 500).unwrap();
+    assert_eq!(state.amount, 4);
+    assert_eq!(state.corrected, Some(2));
+    assert_eq!(state.deadline, Some(500));
+    let exported = StatementInput::from_bytes(&bytes).unwrap();
+    state.check_statement(&exported).unwrap();
+    assert!(full_only(&state).is_err());
+    let before = state.encode();
+    assert!(state.prepare_statement(&input, 2, 501).is_err());
+    assert_eq!(state.encode(), before);
+
+    let HubResponse::Counter { b_corr, .. } = &mut input.response else {
+        unreachable!()
+    };
+    *b_corr = 0;
+    let mut zero = State {
+        amount: 4,
+        ..State::default()
+    };
+    zero.prepare_statement(&input, 0, 500).unwrap();
+    assert_eq!(zero.corrected, Some(0));
+    assert!(String::from_utf8(zero.encode())
+        .unwrap()
+        .contains("\"corrected\":0"));
+    zero.check_statement(&input).unwrap();
+    input.c = 0;
+    assert!(zero.check_statement(&input).is_err());
+}
+
+#[test]
+fn an_orphan_or_mismatched_statement_cannot_select_the_recovery_mode() {
+    let mut input = fixture(vec![0; K_LEN]);
+    let full = State {
+        amount: 4,
+        ..State::default()
+    };
+    full.check_statement(&input).unwrap();
+    input.c = 1;
+    assert!(full.check_statement(&input).is_err());
+    let corrected = State {
+        amount: 4,
+        corrected: Some(2),
+        ..State::default()
+    };
+    corrected.check_statement(&input).unwrap();
+    let other = State {
+        amount: 4,
+        corrected: Some(3),
+        ..State::default()
+    };
+    assert!(other.check_statement(&input).is_err());
+    assert_eq!(full.corrected, None);
+    assert_eq!(full.amount, 4);
+}
+
+#[test]
+fn rejected_statement_amounts_leave_all_recovery_metadata_unchanged() {
+    let mut input = fixture(vec![0; K_LEN]);
+    let mut state = State {
+        amount: 4,
+        ..State::default()
+    };
+    let before = state.encode();
+    assert!(state.prepare_statement(&input, 2, 500).is_err());
+    assert_eq!(state.encode(), before);
+    input.c = 1;
+    assert!(state.prepare_statement(&input, 5, 500).is_err());
+    assert_eq!(state.encode(), before);
+    assert!(state.prepare_statement(&input, 3, 500).is_err());
+    assert_eq!(state.encode(), before);
+}
+
+#[test]
+fn corrected_metadata_cannot_resume_an_earlier_full_claim_signing_stage() {
+    let state = State {
+        amount: 4,
+        corrected: Some(0),
+        ..State::default()
+    };
+    for stage in Stage::ALL {
+        let row = RecoveryRow {
+            id: [1; 32],
+            format: FORMAT,
+            stage: stage.as_str().into(),
+            irrevocable: true,
+            error: None,
+            state: state.encode(),
+            created_at: 0,
+        };
+        let allowed = matches!(
+            stage,
+            Stage::Proving
+                | Stage::Asserting
+                | Stage::Asserted
+                | Stage::Succeeding
+                | Stage::Answering
+                | Stage::Paid
+                | Stage::Sweeping
+                | Stage::Done
+                | Stage::Lost
+        );
+        assert_eq!(State::decode(&row).is_ok(), allowed, "{stage:?}");
+    }
+}
+
+#[test]
+fn older_answered_and_countered_rows_commit_mode_with_the_statement_and_reject_orphans() {
+    use super::super::store::New;
+
+    let mut input = fixture(vec![0; K_LEN]);
+    input.c = 1;
+    for (stage, deadline) in [
+        (Stage::Answered, None),
+        (Stage::Countered, None),
+        (Stage::Countered, Some(400)),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let id = [1; 32];
+        store
+            .insert(&New {
+                id,
+                hub: "http://hub.example",
+                mock: true,
+                deposit: OutPoint::null(),
+                value: 60_000,
+                price: 23_000,
+                cap: 128,
+                assert_height: 800,
+                close_height: 1_000,
+                since: 0,
+                state: b"unused opening",
+            })
+            .unwrap();
+        let tx = Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![TxIn::default()],
+            output: vec![],
+        };
+        let original = State {
+            notes: vec!["ab".into()],
+            amount: 4,
+            r: Some(tx.clone()),
+            p: Some(tx.clone()),
+            spend: Some(tx),
+            r_height: Some(1),
+            p_height: Some(2),
+            spent_height: Some(3),
+            from: Some(3),
+            deadline,
+            ..State::default()
+        };
+        let raw = original.encode();
+        store
+            .start_recovery(&id, FORMAT, stage.as_str(), &raw)
+            .unwrap();
+        assert!(store
+            .save_recovery(&id, (stage.as_str(), &raw), stage.as_str(), true, &raw)
+            .unwrap());
+        let mut selected = State::decode(&store.recovery(&id).unwrap().unwrap()).unwrap();
+        assert!(selected.corrected.is_none());
+        let bytes = selected.prepare_statement(&input, 2, 500).unwrap();
+
+        // A crash before the row CAS leaves an orphan file, not a mode
+        // decision. Export cannot use that file to switch the old row.
+        store.keep_statement(&id, &bytes).unwrap();
+        assert!(statement(dir.path(), &id).is_err());
+        let mut full_orphan = input.clone();
+        full_orphan.c = 0;
+        store
+            .keep_statement(&id, &full_orphan.to_bytes().unwrap())
+            .unwrap();
+        assert!(statement(dir.path(), &id).is_err());
+        store.keep_statement(&id, &bytes).unwrap();
+        assert!(State::decode(&store.recovery(&id).unwrap().unwrap())
+            .unwrap()
+            .corrected
+            .is_none());
+
+        assert!(store
+            .save_recovery(
+                &id,
+                (stage.as_str(), &raw),
+                Stage::Proving.as_str(),
+                true,
+                &selected.encode()
+            )
+            .unwrap());
+        let row = store.recovery(&id).unwrap().unwrap();
+        let resumed = State::decode(&row).unwrap();
+        assert_eq!(row.format, FORMAT);
+        assert!(row.irrevocable);
+        assert_eq!(row.stage, Stage::Proving.as_str());
+        assert_eq!(resumed.corrected, Some(2));
+        assert_eq!(resumed.amount, original.amount);
+        assert_eq!(resumed.notes, original.notes);
+        assert_eq!(resumed.r, original.r);
+        assert_eq!(resumed.p, original.p);
+        assert_eq!(resumed.spend, original.spend);
+        assert_eq!(statement(dir.path(), &id).unwrap(), bytes);
+        assert!(resumed.proof.is_none());
+
+        // A stale runner cannot overwrite the mode in the database. Its
+        // file can win a rename race, but export must refuse the mismatch.
+        assert!(!store
+            .save_recovery(
+                &id,
+                (stage.as_str(), &raw),
+                Stage::Proving.as_str(),
+                true,
+                &original.encode()
+            )
+            .unwrap());
+        let mut wrong = input.clone();
+        wrong.c = 0;
+        store
+            .keep_statement(&id, &wrong.to_bytes().unwrap())
+            .unwrap();
+        assert!(statement(dir.path(), &id).is_err());
+        assert_eq!(
+            State::decode(&store.recovery(&id).unwrap().unwrap())
+                .unwrap()
+                .corrected,
+            Some(2)
+        );
+        std::fs::remove_file(store.statement_path(&id)).unwrap();
+        assert!(statement(dir.path(), &id).is_err());
+        assert_eq!(
+            State::decode(&store.recovery(&id).unwrap().unwrap())
+                .unwrap()
+                .corrected,
+            Some(2)
+        );
+    }
 }

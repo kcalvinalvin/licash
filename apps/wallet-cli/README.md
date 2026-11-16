@@ -150,9 +150,12 @@ Bitcoin at once. `recoveries --chain <url>` then carries it on to `done`
 (`asserted`, `succeeding`, `paid`, `sweeping`), answering the hub if it
 challenges the proof. An unproven counter or a response with any plain
 publication input follows the same full-claim proof path. A proven counter
-stays `countered`: its corrected payout is not supported yet, so no
-statement is exported for it. Older `countered` recoveries are classified
+keeps its corrected statement at `proving`; corrected proof import and
+collection are not enabled yet. Older `countered` recoveries are classified
 on their next advance without changing their request or reserved notes.
+Full-claim recovery state stays unchanged. Older wallet builds refuse new
+corrected recovery rows, leaving their notes reserved; do not downgrade
+while a corrected recovery is in progress, as its deadline keeps running.
 
 `discover --relay wss://relay.example` lists the hubs announced on Nostr,
 at the URLs that answer as the hub that announced them; with `--swaps`, the
