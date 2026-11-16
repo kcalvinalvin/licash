@@ -204,10 +204,16 @@ private fun Unfolded(c: Contract, cover: Cover, developer: Boolean, end: () -> U
     if (cover.ends != null) Line("Ends by itself in", cover.ends)
     if (!cover.failed) FeeLine("Cost", c.price, c.cap, value = sat(c.price), breakdown = setupCost(c.cap, c.price))
     if (cover.held) {
+        // Its status at a glance; the margin and what it means, when tapped.
         safety?.let {
-            Line("Recovery planning", safetyStatus(it, height))
-            Line("Your proof margin", "${it.proofMargin} blocks")
-            Say("Planning only. Start earlier for confirmation time. Stay online: a late hub answer can reduce your proving time until your timeout confirms.")
+            var planning by remember { mutableStateOf(false) }
+            Line("Recovery planning", safetyStatus(it, height), tag = "planning", onClick = { planning = true })
+            if (planning) {
+                Sheet("Recovery planning", dismiss = { planning = false }) {
+                    Line("Your proof margin", "${it.proofMargin} blocks")
+                    Say("Planning only. Start earlier for confirmation time. Stay online: a late hub answer can reduce your proving time until your timeout confirms.")
+                }
+            }
         }
     }
     if (developer) {
