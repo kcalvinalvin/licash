@@ -18,6 +18,7 @@ use licash_hub::{Fee, Hub, Ledger, Policy, Timing};
 use licash_hub_service::{
     announce::announce,
     dashboard, deposit,
+    inbox::Inbox,
     lightning::{lnd::Lnd, Config, Gateway},
     notify::{self, Notifier},
     peer,
@@ -982,6 +983,8 @@ fn command(cli: Cli) -> anyhow::Result<()> {
                 }
                 false => None,
             };
+            let inbox = Inbox::open(&cli.data.join("inbox.sqlite")).context("open the inbox")?;
+            let inbox = Some(Arc::new(inbox));
             let runtime = tokio::runtime::Runtime::new()?;
             let _entered = runtime.enter();
             let contracts = match (contracting, &chain) {
@@ -1097,6 +1100,7 @@ fn command(cli: Cli) -> anyhow::Result<()> {
                 gateway: gateway.clone(),
                 deposits: deposits.clone(),
                 tweaks: tweaks.clone(),
+                inbox,
                 relays,
                 contracts,
                 swaps,

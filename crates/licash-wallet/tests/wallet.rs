@@ -525,7 +525,7 @@ fn a_wallet_file_of_version_5_trusts_every_hub_it_had() {
     let version: i64 = db
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 7);
+    assert_eq!(version, 8);
     assert_eq!(wallet.hubs().unwrap().len(), 1);
     assert_eq!(wallet.balance().unwrap().len(), 1);
     assert!(wallet.visited().unwrap().is_empty());
@@ -546,9 +546,30 @@ async fn a_wallet_file_of_version_6_renews_nothing_unasked() {
     let version: i64 = db
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 7);
+    assert_eq!(version, 8);
     assert_eq!(wallet.unlink().await.unwrap(), 0);
     assert!(wallet.sends().unwrap().is_empty());
+    assert_eq!(wallet.hubs().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_wallet_file_of_version_7_mails_nothing_unasked() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v7.sqlite");
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute_batch(include_str!("fixtures/wallet-v7.sql"))
+        .unwrap();
+    // No hub answers: the wallet asks none.
+    let wallet = Wallet::open(&path, Link(Net::new())).unwrap();
+    let db = rusqlite::Connection::open(&path).unwrap();
+    let version: i64 = db
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, 8);
+    // Its payments were mailed, or handed over, as they were made.
+    assert_eq!(wallet.delivering().unwrap(), 0);
+    assert!(wallet.due().await.unwrap().is_empty());
     assert_eq!(wallet.hubs().unwrap().len(), 1);
 }
 

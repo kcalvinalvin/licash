@@ -89,6 +89,8 @@ data class Ui(
     val watch: Watch = Watch.NONE,
     /** When a Lightning invoice was last asked, in seconds since the epoch. */
     val asked: Long? = null,
+    /** Payments made still on their way to their payees: kept at their hubs, or to mail. */
+    val onTheirWay: UInt = 0u,
 )
 
 /** A line of the history's own key: lines of different kinds can share an id. */
@@ -604,7 +606,10 @@ class Engine(context: Context) {
                 val under = detailsToRead(history)
                     .mapNotNull { a -> runCatching { it.details(a.kind, a.id) }.getOrNull()?.let { d -> a.key to d } }
                     .toMap()
-                Shown(it.network(), it.balance(), history, it.hubs(), it.tor(), contracts, recoveries, under)
+                val onTheirWay = runCatching { it.onTheirWay() }
+                    .onFailure { e -> AppLog.warn("reading the payments on their way", e) }
+                    .getOrDefault(state.value.onTheirWay)
+                Shown(it.network(), it.balance(), history, it.hubs(), it.tor(), contracts, recoveries, under, onTheirWay)
             }
         }.onFailure { AppLog.warn("reading the wallet", it) }.getOrNull()
         state.update {
@@ -628,6 +633,7 @@ class Engine(context: Context) {
                     recoveries = shown.recoveries,
                     under = shown.under,
                     asked = prefs.askedAt,
+                    onTheirWay = shown.onTheirWay,
                 )
             }
         }
@@ -679,6 +685,7 @@ class Engine(context: Context) {
         val contracts: List<Contract>,
         val recoveries: List<Recovery>,
         val under: Map<String, Details>,
+        val onTheirWay: UInt,
     )
 
     /** A new wallet of the network chosen, born at the chain's height if known. */

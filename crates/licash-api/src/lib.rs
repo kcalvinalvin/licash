@@ -22,10 +22,12 @@
 //!
 //! Anything else is a [`Problem`], with the HTTP status of its [`Code`].
 //!
-//! A payer hands its payee a [`Payment`], by whatever channel they share.
+//! A payer hands its payee a [`Payment`], by whatever channel they share:
+//! the hub's [`inbox`] if it keeps payments for their payees.
 //!
 //! Swap providers serve the API of [`swaps`].
 
+pub mod inbox;
 pub mod swaps;
 
 use licash::{

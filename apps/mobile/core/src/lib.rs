@@ -7,7 +7,6 @@
 //! into notes. One payment code ([`Wallet::payment_code`]) takes both.
 
 mod chain;
-mod deliveries;
 mod log;
 mod wallet;
 
@@ -700,6 +699,8 @@ pub struct Paid {
     pub id: String,
     pub amount: u64,
     pub hub: String,
+    /// Kept at its hub for the payee to collect there: not yet collected.
+    pub kept: bool,
     /// Sent to the payee's mailbox.
     pub delivered: bool,
     /// Else the payment, for the payee to receive by hand.

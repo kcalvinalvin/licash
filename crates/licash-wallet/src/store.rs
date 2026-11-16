@@ -17,7 +17,40 @@ const VERSION: i64 = 1 + MIGRATIONS.len() as i64;
 
 /// What each version adds to the one before: the first takes 1 to 2. A
 /// file of an older version is brought up to date when opened.
-const MIGRATIONS: &[&str] = &[SILENT, FALLBACK, UNTWEAKED, PAYOUTS, VISITED, RENEWALS];
+const MIGRATIONS: &[&str] = &[
+    SILENT, FALLBACK, UNTWEAKED, PAYOUTS, VISITED, RENEWALS, DELIVERIES,
+];
+
+/// Version 8: payments to payment codes kept at their hub for the payee,
+/// and mailed only once it does not say it has them.
+const DELIVERIES: &str = "
+-- How each payment to a payment code reaches its payee: its hub asked to
+-- keep it under the inbox tag and key of the receipt secret, the payee
+-- telling ack through the hub once it has it; mailed to the payee's
+-- mailbox (an x-only Nostr key), if the code names one, from mail_at on
+-- unless acked by then. kept_at is when its hub answered that it keeps
+-- it, and mail_at set once released: an hour on if kept, else then. tries
+-- counts the mailings failed, the last for error. A payment neither acked
+-- nor mailed in the days a hub keeps it is given up. No send of an older
+-- file has one: each was mailed, or handed over, as it was made.
+CREATE TABLE deliveries (
+    send BLOB PRIMARY KEY REFERENCES sends (id),
+    mailbox BLOB,
+    tag BLOB NOT NULL,
+    key BLOB NOT NULL,
+    ack BLOB NOT NULL,
+    kept_at INTEGER,
+    mail_at INTEGER,
+    acked_at INTEGER,
+    mailed_at INTEGER,
+    tries INTEGER NOT NULL DEFAULT 0,
+    error TEXT,
+    given_up_at INTEGER
+) STRICT;
+-- The last entry of the hub's inbox the wallet looked through for
+-- payments kept for it: none before it first did, so it looks through all.
+ALTER TABLE hubs ADD COLUMN inbox_after INTEGER;
+";
 
 /// Version 7: renewals of notes a hub no longer unlinks since it restarted.
 const RENEWALS: &str = "

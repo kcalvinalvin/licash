@@ -85,6 +85,16 @@ impl Net {
 
     /// The hub serving tweaks only if `tweaks`.
     fn with(relays: bool, tweaks: bool) -> Self {
+        Self::built(relays, tweaks, false)
+    }
+
+    /// [`Net::new`], with relays, the hub keeping the payments its wallets
+    /// ask it to for their payees, as hubs do.
+    fn keeping() -> Self {
+        Self::built(true, true, true)
+    }
+
+    fn built(relays: bool, tweaks: bool, keeps: bool) -> Self {
         let serves_tweaks = tweaks;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -160,6 +170,10 @@ impl Net {
             deposits: Some(net.deposits.clone()),
             gateway: Some(net.lightning.clone()),
             tweaks: serves_tweaks.then(|| net.tweaks.clone()),
+            inbox: keeps.then(|| {
+                let path = net.dir.path().join("inbox.sqlite");
+                Arc::new(licash_hub_service::inbox::Inbox::open(&path).unwrap())
+            }),
             relays,
             contracts: None,
             swaps: None,
@@ -1365,10 +1379,10 @@ fn a_phone_paying_now_answers_once_paid_and_mails_it_and_unlinks_after() {
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
     assert!(unlinked(&alice));
-    // Mailed once: forgotten, not mailed again.
+    // Mailed once: not mailed again.
     alice.resume().unwrap();
-    let kept = std::fs::read_to_string(format!("{}/deliveries.json", net.dir("alice"))).unwrap();
-    assert_eq!(kept, "[]");
+    assert_eq!(alice.on_their_way().unwrap(), 0);
+    assert!(bob.collect().unwrap().is_empty());
     let history = alice.history().unwrap();
     assert_eq!(
         (history[0].kind, history[0].state),
@@ -1634,8 +1648,7 @@ fn a_phone_paying_while_its_hub_is_down_sends_the_payment_to_the_mailbox_once_ma
     alice.resume().unwrap();
     assert!(bob.collect().unwrap().is_empty());
     assert_eq!(notes(&bob), 500);
-    let kept = std::path::Path::new(&net.dir("alice")).join("deliveries.json");
-    assert_eq!(std::fs::read_to_string(kept).unwrap(), "[]");
+    assert_eq!(alice.on_their_way().unwrap(), 0);
 
     // Paid with its hub up: sent at once, nothing kept to send later.
     let paid = alice.pay(asked.qr, None).unwrap();
@@ -1646,104 +1659,57 @@ fn a_phone_paying_while_its_hub_is_down_sends_the_payment_to_the_mailbox_once_ma
 }
 
 #[test]
-fn a_phone_stopped_while_paying_sends_the_payment_to_the_mailbox_when_back() {
-    let net = Net::new(true);
+fn a_phone_paying_a_code_at_a_hub_keeping_it_is_done_once_released_and_collected_there() {
+    let net = Net::keeping();
     let light = Light::new(&net);
     let alice = funded(&net, &light, "alice");
     let held = notes(&alice);
     let bob = net.wallet("bob", net.height());
+    let hub = bob.hubs().unwrap()[0].url.clone();
     let asked = bob.payment_code(Some(500)).unwrap();
-    net.down.store(true, Ordering::SeqCst);
-    let paid = alice.pay(asked.qr, None);
-    assert!(matches!(paid, Err(LicashError::Pending { .. })), "{paid:?}");
 
-    // As if the app stopped before keeping which payment it was, and the
-    // payment was made after, before the app sent it on.
-    let dir = std::path::PathBuf::from(net.dir("alice"));
-    let kept = dir.join("deliveries.json");
-    let mut entries: Vec<serde_json::Value> =
-        serde_json::from_str(&std::fs::read_to_string(&kept).unwrap()).unwrap();
-    assert_eq!(entries.len(), 1);
-    assert!(entries[0].as_object_mut().unwrap().remove("send").is_some());
-    std::fs::write(&kept, serde_json::to_vec(&entries).unwrap()).unwrap();
-    net.down.store(false, Ordering::SeqCst);
-    let http = licash_transport::Http::new(None).unwrap();
-    let sdk = licash_wallet::Wallet::open(&dir.join("wallet.sqlite"), http).unwrap();
-    let resumed = net.runtime.block_on(sdk.resume()).unwrap();
-    assert_eq!(resumed.paid.len(), 1);
-    drop(sdk);
-
-    // Back: the payment made found, and sent to Bob's mailbox.
-    alice.resume().unwrap();
+    // Kept at the hub for Bob: nothing mailed, nothing to hand over.
+    let paid = alice.pay(asked.qr.clone(), None).unwrap();
+    assert_eq!((paid.amount, &paid.hub), (500, &hub));
+    assert!(paid.kept && !paid.delivered, "{paid:?}");
+    assert_eq!((&paid.handover, &paid.undelivered), (&None, &None));
     assert_eq!(notes(&alice), held - 501);
+    assert_eq!(alice.on_their_way().unwrap(), 1);
+
+    // Bob collects it there, once, and tells Alice so through the hub.
     let got = bob.collect().unwrap();
     assert_eq!(got.len(), 1, "{got:?}");
     assert_eq!((got[0].kind, got[0].amount), (Kind::Received, 500));
-    assert_eq!(std::fs::read_to_string(kept).unwrap(), "[]");
-}
-
-/// Alice's payments kept for mailboxes, each changed by `change`.
-fn change_deliveries(net: &Net, change: impl Fn(&mut serde_json::Map<String, serde_json::Value>)) {
-    let kept = std::path::Path::new(&net.dir("alice")).join("deliveries.json");
-    let mut entries: Vec<serde_json::Value> =
-        serde_json::from_str(&std::fs::read_to_string(&kept).unwrap()).unwrap();
-    for entry in &mut entries {
-        change(entry.as_object_mut().unwrap());
-    }
-    std::fs::write(&kept, serde_json::to_vec(&entries).unwrap()).unwrap();
-}
-
-#[test]
-fn a_phone_sends_a_payment_made_weeks_later_to_the_mailbox_still() {
-    let net = Net::new(true);
-    let light = Light::new(&net);
-    let alice = funded(&net, &light, "alice");
-    let bob = net.wallet("bob", net.height());
-    let asked = bob.payment_code(Some(500)).unwrap();
-    net.down.store(true, Ordering::SeqCst);
-    let paid = alice.pay(asked.qr, None);
-    assert!(matches!(paid, Err(LicashError::Pending { .. })), "{paid:?}");
-    // Paid 15 days ago, its hub down since.
-    let ago = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
-        - 15 * 86_400;
-    change_deliveries(&net, |entry| {
-        entry.insert("at".into(), ago.into());
-    });
-    net.down.store(false, Ordering::SeqCst);
+    assert!(bob.collect().unwrap().is_empty());
+    assert_eq!(notes(&bob), 500);
     alice.resume().unwrap();
-    let got = bob.collect().unwrap();
+    assert_eq!(alice.on_their_way().unwrap(), 0);
+
+    // Paying now: answered once released, collected as soon.
+    let paid = alice.clone().pay_now(asked.qr, None).unwrap();
+    assert!(paid.kept && paid.handover.is_none(), "{paid:?}");
+    let got = bob.clone().collect_now().unwrap();
     assert_eq!(got.len(), 1, "{got:?}");
-    assert_eq!(got[0].amount, 500);
+    assert_eq!(notes(&bob), 1_000);
 }
 
 #[test]
-fn a_phone_stopped_twice_while_paying_the_same_sends_both_to_the_mailbox() {
-    let net = Net::new(true);
+fn a_phone_paying_a_code_naming_no_mailbox_hands_it_over_though_its_hub_keeps_it() {
+    let net = Net::keeping();
     let light = Light::new(&net);
     let alice = funded(&net, &light, "alice");
-    let held = notes(&alice);
     let bob = net.wallet("bob", net.height());
     let asked = bob.payment_code(Some(500)).unwrap();
-    net.down.store(true, Ordering::SeqCst);
-    for _ in 0..2 {
-        let paid = alice.pay(asked.qr.clone(), None);
-        assert!(matches!(paid, Err(LicashError::Pending { .. })), "{paid:?}");
-        // A second apart: the second kept after the first was made.
-        std::thread::sleep(std::time::Duration::from_millis(1_100));
-    }
-    // As if the app stopped each time before keeping which payment it was.
-    change_deliveries(&net, |entry| {
-        assert!(entry.remove("send").is_some());
-    });
-    net.down.store(false, Ordering::SeqCst);
-    alice.resume().unwrap();
-    assert_eq!(notes(&alice), held - 2 * 501);
-    let got = bob.collect().unwrap();
-    assert_eq!(got.len(), 2, "{got:?}");
-    assert_eq!(notes(&bob), 1_000);
+    // Bob's code, its mailbox left out.
+    let mut code: PaymentCode = asked.text.parse().unwrap();
+    code.licash.as_mut().unwrap().mailbox = None;
+    let paid = alice.pay(code.to_string(), None).unwrap();
+    assert!(paid.kept && !paid.delivered, "{paid:?}");
+    let handover = paid.handover.unwrap();
+    // Collected at the hub, or handed over: taken once.
+    assert_eq!(bob.collect().unwrap().len(), 1);
+    assert!(invalid(bob.receive(handover, false)).contains("received already"));
+    assert_eq!(notes(&bob), 500);
 }
 
 /// HTTP to a hub, losing every request that posts.

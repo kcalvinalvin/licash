@@ -305,10 +305,11 @@ async fn used(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
         held - after
     );
 
-    // Bob pays its code back, to its mailbox: the app takes it by itself.
+    // Bob pays its code back, kept at the hub for the app, which takes it
+    // there by itself: nothing mailed.
     let code: PaymentCode = phone.code().await?.parse()?;
-    let paid = wallet::pay(&bob, &code, Some(3_000), || Ok(Route::Direct)).await?;
-    ensure!(paid.delivered == Some(1), "{:?}", paid.undelivered);
+    let paid = wallet::pay(&bob, &code, Some(3_000)).await?;
+    ensure!(paid.paid.kept, "not kept at the hub: {paid:?}");
     let now = changed(phone, after, 90).await?;
     ensure!(now == after + 3_000, "{now} held after 3000 received");
     let lines = history(phone).await?;

@@ -112,7 +112,8 @@ The wallet CLI (`licash-wallet`), the hub and swap services
   `status` does not list transactions or internal note counts. `--details`
   reveals them (swaps also accepts `--swaps N`). Pending funds, losses,
   uncounted funds and delivery failures stay visible in the summary.
-  Payment delivery to a mailbox is not receipt by the recipient. Fee
+  Payment delivery to a mailbox, or kept at the hub, is not receipt by
+  the recipient: only their acknowledgment through the hub is. Fee
   bounds are labeled `up to`, not presented as the exact price paid.
 - **Aligned key-value lines** (`label  value`), labels in plain words,
   values right where they line up; amounts grouped with their unit

@@ -3,10 +3,7 @@
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    sync::{
-        atomic::{AtomicBool, AtomicU32, Ordering},
-        Arc, Mutex, MutexGuard, PoisonError,
-    },
+    sync::{atomic::AtomicU32, Arc, Mutex, MutexGuard, PoisonError},
     time::{Duration, Instant},
 };
 
@@ -21,12 +18,10 @@ use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    chain::Chain,
-    deliveries::{self, Delivery},
-    Activity, Balance, ChainError, ChainSource, Code, ContractTerms, Details, FoundHub, Holding,
-    Hub, HubsFound, InvoiceQuote, Kind, LicashError, LightningInvoice, LightningTerms, Linking,
-    Network, NoteLine, Notes, NotesOf, NotesPaid, Onchain, Paid, PaidTo, PayOffer, PayQuote, Range,
-    Rate, Scan, Scanned, State,
+    chain::Chain, Activity, Balance, ChainError, ChainSource, Code, ContractTerms, Details,
+    FoundHub, Holding, Hub, HubsFound, InvoiceQuote, Kind, LicashError, LightningInvoice,
+    LightningTerms, Linking, Network, NoteLine, Notes, NotesOf, NotesPaid, Onchain, Paid, PaidTo,
+    PayOffer, PayQuote, Range, Rate, Scan, Scanned, State,
 };
 
 /// The rate deposits are paid at, in sat/vB: above what nodes relay.
@@ -770,30 +765,29 @@ impl Wallet {
     /// the wallet trusts and holds enough at. To the payee's mailbox, or
     /// for them to receive by hand.
     pub fn pay(&self, code: String, amount: Option<u64>) -> Result<Paid, LicashError> {
-        Ok(self.paying(code, amount, true)?.0)
+        self.paying(code, amount, true)
     }
 
-    /// [`Wallet::pay`], answered once the hub made the payment: sent to the
-    /// payee's mailbox, and its change unlinked, right after, in the
-    /// background. Neither delivered nor to hand over then, on its way to
-    /// the mailbox: kept to send there again on [`Wallet::resume`] if no
+    /// [`Wallet::pay`], answered once its hub released the payment, kept
+    /// there for the payee if [`Paid::kept`]: one it does not keep is sent
+    /// to the payee's mailbox, and its change unlinked, right after, in
+    /// the background. Neither delivered nor to hand over then, on its way
+    /// to the mailbox: sent there again later ([`Wallet::resume`]) if no
     /// relay took it. Payments wait for it, as for a payment under way.
     pub fn pay_now(
         self: Arc<Self>,
         code: String,
         amount: Option<u64>,
     ) -> Result<Paid, LicashError> {
-        let (paid, later) = self.paying(code, amount, false)?;
+        let paid = self.paying(code, amount, false)?;
         let after = std::thread::Builder::new()
             .name("licash-paid".into())
             .spawn(move || {
                 let _delivering = self.delivering();
                 let started = Instant::now();
-                if later {
-                    self.deliver();
-                }
+                self.deliver();
                 self.unlink();
-                tracing::info!(took = ?started.elapsed(), later, "after paying, mailed and unlinked");
+                tracing::info!(took = ?started.elapsed(), "after paying, mailed what was due and unlinked");
             });
         if let Err(e) = after {
             // Sent and unlinked on the next resume.
@@ -827,39 +821,42 @@ impl Wallet {
 }
 
 impl Wallet {
-    /// The payments in the wallet's mailbox taken, each once, their notes
-    /// still linked.
+    /// The payments the wallet's hubs keep for it, and those in its
+    /// mailbox, taken, each once, their notes still linked. Its hubs
+    /// naming no relays, only those they keep.
     fn collecting(&self) -> Result<Vec<Activity>, LicashError> {
+        let unavailable =
+            |e| LicashError::from_any(e, |reason| LicashError::Unavailable { reason });
         if self
             .wallet
             .hubs()?
             .iter()
             .all(|(_, info)| info.relays.is_empty())
         {
-            return Ok(Vec::new());
+            let inboxed = self.runtime.block_on(self.wallet.collect_inbox())?;
+            for (hub, reason) in &inboxed.failed {
+                tracing::warn!(%hub, %reason, "the payments kept at a hub not looked through");
+            }
+            return Ok(inboxed.received.iter().map(received_activity).collect());
         }
         let mut kept = self.mailbox.lock().unwrap_or_else(PoisonError::into_inner);
         let collect = licash_nostr::wallet::collect_kept(&self.wallet, &self.route, &mut kept);
-        let collected = self
-            .runtime
-            .block_on(collect)
-            .map_err(|e| LicashError::from_any(e, |reason| LicashError::Unavailable { reason }))?;
+        let collected = self.runtime.block_on(collect).map_err(unavailable)?;
         drop(kept);
         for (id, reason) in &collected.skipped {
             tracing::warn!(%id, %reason, "mail not taken");
         }
+        for (at, reason) in &collected.failed {
+            tracing::warn!(%at, %reason, "payments not looked for");
+        }
         Ok(collected.received.iter().map(received_activity).collect())
     }
 
-    /// [`Wallet::pay`], to the payee's mailbox and its change unlinked
-    /// `now`, else neither, and told whether it is to be sent to the
-    /// mailbox ([`Wallet::deliver`]).
-    fn paying(
-        &self,
-        code: String,
-        amount: Option<u64>,
-        now: bool,
-    ) -> Result<(Paid, bool), LicashError> {
+    /// [`Wallet::pay`], answered once its hub released the payment, kept
+    /// there for the payee if it does: one it does not keep mailed to the
+    /// payee's mailbox and its change unlinked `now`, else neither, left
+    /// to [`Wallet::deliver`] after.
+    fn paying(&self, code: String, amount: Option<u64>, now: bool) -> Result<Paid, LicashError> {
         let text = code.trim().to_owned();
         let code: PaymentCode = text.parse().map_err(LicashError::invalid)?;
         let planned = self
@@ -874,72 +871,62 @@ impl Wallet {
             self.enough(&code, amount)?;
         }
         let _delivering = self.delivering();
-        // Kept before paying: a payment its hub does not answer is made
-        // later, and sent to the mailbox then.
-        let delivery = code.licash.as_ref().and_then(|licash| {
-            Some(Delivery {
-                payee: licash.address,
-                amount: amount.or(code.amount)?,
-                mailbox: licash.mailbox?,
-                at: deliveries::now(),
-                send: None,
-            })
-        });
-        if let Some(delivery) = &delivery {
-            let mut all = deliveries::load(&self.dir).map_err(LicashError::failed)?;
-            all.push(delivery.clone());
-            deliveries::save(&self.dir, &all).map_err(LicashError::failed)?;
-        }
-        // Not now: the mailbox not reached, the payment kept for it.
-        let later = AtomicBool::new(false);
-        let route = || {
-            if now {
-                return Ok(self.route.clone());
-            }
-            later.store(true, Ordering::Relaxed);
-            Err(anyhow::anyhow!("sent to the mailbox next"))
-        };
         let paid = match &planned {
-            Some(plan) => self.runtime.block_on(licash_nostr::wallet::pay_planned(
-                &self.wallet,
-                &code,
-                plan,
-                route,
-            )),
-            None => self.runtime.block_on(licash_nostr::wallet::pay(
-                &self.wallet,
-                &code,
-                amount,
-                route,
-            )),
+            Some(plan) => {
+                self.runtime
+                    .block_on(licash_nostr::wallet::pay_planned(&self.wallet, &code, plan))
+            }
+            None => self
+                .runtime
+                .block_on(licash_nostr::wallet::pay(&self.wallet, &code, amount)),
         };
-        if let Some(delivery) = &delivery {
-            self.settle(delivery, &paid);
-        }
         let paid =
             paid.map_err(|e| LicashError::from_any(e, |reason| LicashError::Invalid { reason }))?;
-        let later = later.into_inner();
+        let kept = paid.paid.kept;
+        let mailbox = code.licash.as_ref().is_some_and(|c| c.mailbox.is_some());
+        // Not kept at its hub: to the payee's mailbox at once if `now`.
+        let mailed = (now && mailbox && !kept).then(|| self.deliver_now(&paid.paid.id));
         if now {
             // Its change, linked to it until then.
             let unlinking = Instant::now();
             self.unlink();
             tracing::info!(took = ?unlinking.elapsed(), "unlinked after paying");
         }
-        let handover = match paid.delivered {
-            None if !later => {
+        // No mailbox to reach, or not reached: to hand over, whether its
+        // hub keeps it or not.
+        let handover = match (mailbox, &mailed) {
+            (false, _) | (true, Some(Err(_))) => {
                 Some(serde_json::to_string(&paid.paid.payment).map_err(LicashError::failed)?)
             }
             _ => None,
         };
-        let paid = Paid {
+        Ok(Paid {
             id: paid.paid.id,
             amount: paid.amount,
             hub: paid.hub,
-            delivered: paid.delivered.is_some(),
+            kept,
+            delivered: matches!(mailed, Some(Ok(_))),
             handover,
-            undelivered: paid.undelivered.filter(|_| !later),
-        };
-        Ok((paid, later))
+            undelivered: mailed.and_then(Result::err),
+        })
+    }
+
+    /// Mail the payments due to their payees' mailboxes, payment `id`
+    /// among them: whether it went, or why not.
+    fn deliver_now(&self, id: &str) -> Result<(), String> {
+        let delivered = licash_nostr::wallet::deliver(&self.wallet, || Ok(self.route.clone()));
+        let delivered = self
+            .runtime
+            .block_on(delivered)
+            .map_err(|e| format!("{e:#}"))?;
+        for (paid, why) in &delivered.failed {
+            tracing::warn!(id = %paid, %why, "a payment to mail to its payee, again later");
+        }
+        match delivered.failed.into_iter().find(|(paid, _)| paid == id) {
+            Some((_, why)) => Err(why),
+            None if delivered.mailed.iter().any(|(paid, _)| paid == id) => Ok(()),
+            None => Err("it was not due".into()),
+        }
     }
 }
 
@@ -973,7 +960,16 @@ impl Wallet {
         Ok(received)
     }
 
-    /// Finish what was under way: payments, and moves to notes.
+    /// How many payments made are still on their way to their payees:
+    /// kept at their hubs, not yet collected, or to send to their
+    /// mailboxes. While any are, [`Wallet::resume`] is called now and
+    /// then, which mails those their payees did not collect in time.
+    pub fn on_their_way(&self) -> Result<u32, LicashError> {
+        Ok(u32::try_from(self.wallet.delivering()?).unwrap_or(u32::MAX))
+    }
+
+    /// Finish what was under way: payments, and moves to notes; and mail
+    /// the payments due to their payees.
     pub fn resume(&self) -> Result<(), LicashError> {
         let delivering = self.delivering();
         // Moves kept before their hub answered, by earlier versions: none
@@ -1588,117 +1584,21 @@ impl Wallet {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// After paying to the mailbox of `delivery`: forgotten once sent
-    /// there, else kept naming its payment if known, for [`Wallet::deliver`]
-    /// to send once made, or again.
-    fn settle(&self, delivery: &Delivery, paid: &anyhow::Result<licash_nostr::wallet::CodePaid>) {
-        let send = match paid {
-            Ok(paid) if paid.delivered.is_some() => None,
-            Ok(paid) => Some(Some(paid.paid.id.clone())),
-            Err(e) => match e.downcast_ref() {
-                Some(licash_wallet::Error::Pending { id, .. }) => Some(Some(id.clone())),
-                // Never made, refused or given up, unless it failed after:
-                // what became of it is looked up.
-                _ => Some(None),
-            },
-        };
-        let mut all = match deliveries::load(&self.dir) {
-            Ok(all) => all,
-            Err(e) => return tracing::warn!(%e, "the payments to send to mailboxes unreadable"),
-        };
-        deliveries::forget(&mut all, delivery);
-        if let Some(send) = send {
-            all.push(Delivery {
-                send,
-                ..delivery.clone()
-            });
-        }
-        if let Err(e) = deliveries::save(&self.dir, &all) {
-            tracing::warn!(%e, "the payments to send to mailboxes");
-        }
-    }
-
-    /// Send the payments kept for mailboxes that are made now to them, from
-    /// what the wallet records: kept while under way or not sent, forgotten
-    /// once sent, given up or never made, or not sent two weeks on.
+    /// Mail the payments due to their payees' mailboxes, again later
+    /// those no relay took ([`licash_nostr::wallet::deliver`]).
     fn deliver(&self) {
-        let all = match deliveries::load(&self.dir) {
-            Ok(all) => all,
-            Err(e) => return tracing::warn!(%e, "the payments to send to mailboxes unreadable"),
-        };
-        if all.is_empty() {
-            return;
-        }
-        // A payment at a hub visited too: the payee's.
-        let hubs = self.wallet.hubs().and_then(|mut hubs| {
-            hubs.extend(self.wallet.visited()?);
-            Ok(hubs)
-        });
-        let (sends, hubs) = match (self.wallet.sends(), hubs) {
-            (Ok(sends), Ok(hubs)) => (sends, hubs),
-            (Err(e), _) | (_, Err(e)) => return tracing::warn!(%e, "the payments made"),
-        };
-        let mut named: Vec<String> = all.iter().filter_map(|d| d.send.clone()).collect();
-        let old = deliveries::now() - licash_nostr::mailbox::KEEP.as_secs() as i64;
-        let mut kept = Vec::new();
-        for mut delivery in all {
-            if delivery.send.is_none() {
-                // The app stopped while paying, or it failed: the oldest
-                // payment to the payee since not given up, if any, no other
-                // one's. Newest first, the sends are looked at from the end.
-                let made = sends.iter().rev().find(|s| {
-                    s.payee == delivery.payee
-                        && s.amount == delivery.amount
-                        && s.created_at >= delivery.at
-                        && !matches!(s.state, licash_wallet::State::Abandoned(_))
-                        && !named.contains(&s.id)
-                });
-                let Some(made) = made else { continue };
-                named.push(made.id.clone());
-                delivery.send = Some(made.id.clone());
-            }
-            let Some(send) = sends.iter().find(|s| delivery.send.as_ref() == Some(&s.id)) else {
-                continue;
-            };
-            match send.state {
-                licash_wallet::State::Offered | licash_wallet::State::Signed => {
-                    kept.push(delivery);
-                    continue;
+        let delivered = licash_nostr::wallet::deliver(&self.wallet, || Ok(self.route.clone()));
+        match self.runtime.block_on(delivered) {
+            Ok(delivered) => {
+                for (id, relays) in &delivered.mailed {
+                    tracing::info!(%id, relays, "a payment sent to its payee's mailbox");
                 }
-                licash_wallet::State::Done => {}
-                _ => continue,
-            }
-            let relays = hubs.iter().find(|(url, _)| *url == send.hub);
-            let relays = relays.map_or(&[][..], |(_, info)| info.relays.as_slice());
-            match self.mail(&delivery.mailbox, &send.id, relays) {
-                Ok(()) => {
-                    let amount = delivery.amount;
-                    tracing::info!(id = %send.id, amount, "a payment sent to its payee's mailbox");
-                }
-                Err(e) if delivery.at < old => {
-                    let why = format!("{e:#}");
-                    tracing::warn!(id = %send.id, %why, "a payment never sent to its payee's mailbox");
-                }
-                Err(e) => {
-                    let why = format!("{e:#}");
-                    tracing::warn!(id = %send.id, %why, "a payment to send to its payee's mailbox, again later");
-                    kept.push(delivery);
+                for (id, why) in &delivered.failed {
+                    tracing::warn!(%id, %why, "a payment to send to its payee's mailbox, again later");
                 }
             }
+            Err(e) => tracing::warn!(e = %format!("{e:#}"), "the payments due to mailboxes"),
         }
-        if let Err(e) = deliveries::save(&self.dir, &kept) {
-            tracing::warn!(%e, "the payments to send to mailboxes");
-        }
-    }
-
-    /// Send the payment `id` made to `mailbox`, on `relays`.
-    fn mail(&self, mailbox: &[u8; 32], id: &str, relays: &[String]) -> anyhow::Result<()> {
-        anyhow::ensure!(!relays.is_empty(), "its hub names no mailbox relays");
-        let payment = serde_json::to_string(&self.wallet.payment(id)?)?;
-        let mail = licash_nostr::mailbox::send(mailbox, &payment, relays, &self.route);
-        let taken = self.runtime.block_on(mail)?;
-        anyhow::ensure!(taken > 0, "no relay took it");
-        Ok(())
     }
 
     /// Refused as more than held if the code names hubs trusted, some

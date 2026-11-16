@@ -4,6 +4,7 @@
 pub mod announce;
 pub mod dashboard;
 pub mod deposit;
+pub mod inbox;
 pub mod lightning;
 pub mod notify;
 pub mod peer;
@@ -22,10 +23,11 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use inbox::Inbox;
 use licash_api::{
     Check, Checked, Code, Deposit, DepositStatus, Depositing, Info, Issued, Lock, LockState,
     Locked, Offer, Offered, Pay, Paying, Problem, Receive, ReceiveStatus, Receiving, Refund,
-    Release, Released, Settle, TweaksQuery, Unlink, Unlinked,
+    Released, Settle, TweaksQuery, Unlink, Unlinked,
 };
 use licash_hub::{Error, Hub, Settled};
 use lightning::Gateway;
@@ -49,6 +51,8 @@ pub struct Services {
     pub gateway: Option<Arc<Gateway>>,
     pub deposits: Option<Arc<deposit::Gateway>>,
     pub tweaks: Option<Arc<Tweaks>>,
+    /// The payments it keeps for their payees, as their payers ask.
+    pub inbox: Option<Arc<Inbox>>,
     /// The Nostr relays of its wallets' mailboxes, named in its info.
     pub relays: Vec<String>,
     /// The recovery contracts it opens, funded by its node's wallet.
@@ -66,6 +70,7 @@ pub fn router(hub: Arc<Hub>, services: Services) -> Router {
         gateway,
         deposits,
         tweaks,
+        inbox,
         contracts,
         swaps,
         ..
@@ -73,9 +78,11 @@ pub fn router(hub: Arc<Hub>, services: Services) -> Router {
     let info_of = Router::new()
         .route(licash_api::INFO, get(info))
         .with_state((hub.clone(), services));
+    let release_of = Router::new()
+        .route(licash_api::RELEASE, post(release))
+        .with_state((hub.clone(), inbox.clone()));
     let mut api = Router::new()
         .route(licash_api::OFFER, post(offer))
-        .route(licash_api::RELEASE, post(release))
         .route(licash_api::UNLINK, post(unlink))
         .route(licash_api::CHECK, post(check))
         .route(licash_api::LOCK, post(lock))
@@ -84,7 +91,8 @@ pub fn router(hub: Arc<Hub>, services: Services) -> Router {
         .route(licash_api::REFUND, post(refund))
         .route(HEALTH, get(health))
         .with_state(hub)
-        .merge(info_of);
+        .merge(info_of)
+        .merge(release_of);
     if let Some(gateway) = gateway {
         api = api.merge(
             Router::new()
@@ -100,6 +108,16 @@ pub fn router(hub: Arc<Hub>, services: Services) -> Router {
                 .route(licash_api::DEPOSIT, post(deposit))
                 .route(licash_api::DEPOSIT_STATE, get(deposit_state))
                 .with_state(deposits),
+        );
+    }
+    if let Some(inbox) = inbox {
+        api = api.merge(
+            Router::new()
+                .route(licash_api::inbox::INBOX, get(inbox_feed))
+                .route(licash_api::inbox::TAKE, post(inbox_take))
+                .route(licash_api::inbox::ACK, post(inbox_ack))
+                .route(licash_api::inbox::ACKS, post(inbox_acks))
+                .with_state(inbox),
         );
     }
     if let Some(index) = tweaks {
@@ -220,14 +238,37 @@ async fn offer(
     .await
 }
 
+/// Released, then kept for its payee if asked and the hub keeps payments:
+/// the unlock answered even if the inbox fails, the payment then not kept.
 async fn release(
-    State(hub): State<Arc<Hub>>,
-    body: Result<Json<Release>, JsonRejection>,
-) -> Answer<Released> {
+    State((hub, inbox)): State<(Arc<Hub>, Option<Arc<Inbox>>)>,
+    body: Result<Json<licash_api::inbox::Release>, JsonRejection>,
+) -> Answer<licash_api::inbox::Released> {
     let Json(body) = body?;
     blocking(hub, move |hub| {
-        let (signed, notes) = body.decode(|id| hub.keyset(id))?;
-        Ok(Released::new(&hub.release(&signed, &notes)?))
+        let (signed, notes) = body.release.decode(|id| hub.keyset(id))?;
+        let keep = match (&inbox, &body.keep) {
+            (Some(inbox), Some(keep)) => {
+                keep.decode()?;
+                Some((inbox, keep))
+            }
+            _ => None,
+        };
+        let unlock = hub.release(&signed, &notes)?;
+        let kept = keep.is_some_and(|(inbox, keep)| {
+            let proposal = signed.proposal();
+            let receipt = licash_api::inbox::Receipt {
+                release: body.release.clone(),
+                unlock: licash_api::Hex(unlock.to_vec()),
+            };
+            let kept = inbox.keep(&proposal.id(), &proposal.ephemeral().0, keep, &receipt);
+            kept.inspect_err(|e| tracing::error!("keeping a payment: {e:#}"))
+                .is_ok()
+        });
+        Ok(licash_api::inbox::Released {
+            released: Released::new(&unlock),
+            kept,
+        })
     })
     .await
 }
@@ -393,4 +434,82 @@ async fn ln_receive_state(
 ) -> Answer<ReceiveStatus> {
     let hash = licash_api::hash_of(&hash)?;
     Ok(Json(gateway.receive_status(&hash)?))
+}
+
+/// Run `op` on the inbox, off the async workers: it waits on its fsync.
+async fn inboxed<T: Send + 'static>(
+    inbox: Arc<Inbox>,
+    op: impl FnOnce(&Inbox) -> Result<T, Failure> + Send + 'static,
+) -> Answer<T> {
+    let unavailable = || Failure(Problem::new(Code::Unavailable, "the hub cannot serve now"));
+    tokio::task::spawn_blocking(move || op(&inbox))
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "inbox task failed");
+            unavailable()
+        })?
+        .map(Json)
+}
+
+fn inbox_failed(e: anyhow::Error) -> Failure {
+    tracing::error!("the inbox: {e:#}");
+    Failure(Problem::new(Code::Unavailable, "the hub cannot serve now"))
+}
+
+async fn inbox_feed(
+    State(inbox): State<Arc<Inbox>>,
+    query: Result<Query<licash_api::inbox::Query>, QueryRejection>,
+) -> Answer<licash_api::inbox::Feed> {
+    let Query(query) = query.map_err(|e| Problem::invalid(e.body_text()))?;
+    inboxed(inbox, move |inbox| {
+        inbox.feed(query.after).map_err(inbox_failed)
+    })
+    .await
+}
+
+async fn inbox_take(
+    State(inbox): State<Arc<Inbox>>,
+    body: Result<Json<licash_api::inbox::Take>, JsonRejection>,
+) -> Answer<licash_api::inbox::Taken> {
+    let Json(body) = body?;
+    let keys = body.payments.iter().map(|p| &p.key);
+    let keys = licash_api::inbox::arrays::<32>(keys, "key")?;
+    let asked: Vec<(u64, [u8; 32])> = body.payments.iter().map(|p| p.seq).zip(keys).collect();
+    inboxed(inbox, move |inbox| {
+        let payments = inbox.take(&asked).map_err(inbox_failed)?;
+        Ok(licash_api::inbox::Taken { payments })
+    })
+    .await
+}
+
+async fn inbox_ack(
+    State(inbox): State<Arc<Inbox>>,
+    body: Result<Json<licash_api::inbox::Acknowledge>, JsonRejection>,
+) -> Answer<licash_api::inbox::Acknowledged> {
+    let Json(body) = body?;
+    let keys = licash_api::inbox::arrays::<32>(body.acks.iter().map(|a| &a.key), "key")?;
+    let acks = licash_api::inbox::arrays::<32>(body.acks.iter().map(|a| &a.ack), "ack")?;
+    let told: Vec<_> = keys.into_iter().zip(acks).collect();
+    inboxed(inbox, move |inbox| {
+        let acked = inbox.acknowledge(&told).map_err(inbox_failed)?;
+        Ok(licash_api::inbox::Acknowledged { acked })
+    })
+    .await
+}
+
+async fn inbox_acks(
+    State(inbox): State<Arc<Inbox>>,
+    body: Result<Json<licash_api::inbox::AskAcks>, JsonRejection>,
+) -> Answer<licash_api::inbox::Acks> {
+    let Json(body) = body?;
+    let keys = licash_api::inbox::arrays::<32>(body.keys.iter(), "key")?;
+    inboxed(inbox, move |inbox| {
+        let acks = inbox.acks(&keys).map_err(inbox_failed)?;
+        let acks = acks
+            .into_iter()
+            .map(|ack| ack.map(|ack| licash_api::Hex(ack.to_vec())))
+            .collect();
+        Ok(licash_api::inbox::Acks { acks })
+    })
+    .await
 }

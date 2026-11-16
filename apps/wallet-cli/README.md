@@ -32,8 +32,20 @@ only). `history` lists a renewal as a payment to the wallet's own address.
 `code` prints a payment code (a BIP321 URI, `--qr` for QR codes) naming the
 wallet, the hubs it is paid at and its Nostr mailbox, if they name relays.
 `pay <code> [amount]` pays it at a hub it names that the wallet trusts and
-holds enough at, and sends the payment to the mailbox, else prints it to
-hand over; `mailbox` receives what was sent there. Where the wallet holds
+holds enough at, and is done once the hub releases the payment: the hub
+keeps it for the payee, who collects it there and tells the payer so
+through the hub, signed with a secret only the two share. A payment not
+collected within an hour is sent to the payee's mailbox on Nostr by
+`deliver`, by `watch`, or after `mailbox` and `resume`; one the hub
+does not keep is sent there at once. A code naming no mailbox has its
+payment printed to hand over as well. `mailbox` (or `collect`) receives
+what the hubs keep for the wallet and what was sent to its mailbox; `watch`
+keeps receiving and delivering, every `--every` seconds (60), until
+stopped. Keep `watch` running, or schedule `deliver`, to send fallback mail
+while the wallet is otherwise idle. `pay` does not mail older receipts:
+a slow relay must not delay a new payment kept at its hub. Its change is
+still unlinked before exit. Payments kept at the hub appear on Nostr only
+if they missed the hour. Where the wallet holds
 too little, it swaps what it lacks there first through a provider
 announced on its hubs' relays, only if given `--max-fee` (all fees,
 swap included): without it, it says what the payment would cost. A code
@@ -44,8 +56,10 @@ past the payment stays there, apart from the hubs added, until `add-hub`:
 
 Normal output stays short: `balance` shows the available amount and any
 pending or uncounted funds; `balance --details` adds the full per-hub
-breakdown. `pay` reports mailbox delivery and the fee bound (sat and a
-percentage of the payment), not whether the recipient has collected it.
+breakdown. `pay` reports where the payment went (kept at the hub, or sent
+to the mailbox) and the fee bound (sat and a percentage of the payment),
+not whether the recipient has collected it yet; `deliver` says how many
+payments are still on their way.
 `pay --details` adds the payment ID and hub URL. Payments that must be
 handed over still go unchanged to stdout or `--out`, with instructions on
 stderr. Progress appears on an interactive terminal only. Diagnostic logs
