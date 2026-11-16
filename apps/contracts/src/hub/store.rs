@@ -210,32 +210,30 @@ impl Store {
         )? as usize)
     }
 
-    /// The openings under way untouched since `before` (seconds since
-    /// 1970), with their coins.
-    pub fn stale(&self, before: i64) -> Result<Vec<([u8; 32], Vec<OutPoint>)>> {
+    /// Candidate openings untouched since `before`. Recheck when abandoning.
+    pub fn stale(&self, before: i64) -> Result<Vec<[u8; 32]>> {
         let mut stmt = self.0.prepare(
-            "SELECT id, coins FROM openings
+            "SELECT id FROM openings
              WHERE abandoned = 0 AND irrevocable = 0 AND updated_at < ?1",
         )?;
-        let rows = stmt.query_map([before], |r| {
-            Ok((r.get::<_, [u8; 32]>(0)?, r.get::<_, Vec<u8>>(1)?))
-        })?;
-        rows.map(|row| {
-            let (id, coins) = row?;
-            Ok((id, outpoints(&coins)?))
-        })
-        .collect()
+        let rows = stmt.query_map([before], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// Give up opening `id`, short of the hub's signatures: its deposit
-    /// free for another.
-    pub fn abandon(&self, id: &[u8; 32]) -> Result<()> {
-        self.0.execute(
-            "UPDATE openings SET abandoned = 1, updated_at = ?2
-             WHERE id = ?1 AND irrevocable = 0",
-            params![id, crate::now()],
-        )?;
-        Ok(())
+    /// Give up a still-idle, unsigned opening and return only its current
+    /// coins. A stale selection never authorizes unlocking a signed row.
+    pub fn abandon(&self, id: &[u8; 32], before: i64) -> Result<Option<Vec<OutPoint>>> {
+        let coins: Option<Vec<u8>> = self
+            .0
+            .query_row(
+                "UPDATE openings SET abandoned = 1, updated_at = ?2
+             WHERE id = ?1 AND abandoned = 0 AND irrevocable = 0 AND updated_at < ?3
+             RETURNING coins",
+                params![id, crate::now(), before],
+                |r| r.get(0),
+            )
+            .optional()?;
+        coins.map(|coins| outpoints(&coins)).transpose()
     }
 
     /// The coins of the openings not given up: locked in the hub's node.

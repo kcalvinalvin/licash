@@ -268,15 +268,25 @@ impl Openings {
     pub async fn sweep(&self) -> Result<usize> {
         let before = crate::now() - IDLE.as_secs() as i64;
         let stale = self.store().stale(before)?;
-        for (id, coins) in &stale {
-            if self.busy().contains(id) {
-                continue;
-            }
-            self.store().abandon(id)?;
-            self.unlock_coins(coins).await;
+        let mut abandoned = 0;
+        for id in &stale {
+            let coins = self.abandon_idle(id, before)?;
+            let Some(coins) = coins else { continue };
+            self.unlock_coins(&coins).await;
+            abandoned += 1;
             tracing::info!(id = %crate::hex_id(id), "an opening given up, idle");
         }
-        Ok(stale.len())
+        Ok(abandoned)
+    }
+
+    fn abandon_idle(&self, id: &[u8; 32], before: i64) -> Result<Option<Vec<bitcoin::OutPoint>>> {
+        // A step takes this same mark before loading its row. Hold the
+        // mutex through the conditional write, never through node I/O.
+        let busy = self.busy();
+        if busy.contains(id) {
+            return Ok(None);
+        }
+        self.store().abandon(id, before)
     }
 
     /// Sweep every minute, for as long as the hub runs.
@@ -438,6 +448,107 @@ mod tests {
         }
     }
 
+    fn test_openings(dir: &Path) -> Openings {
+        let profile = ChainProfile::Core30DefaultRegtest;
+        let keyset = Hub::peek(FUNDED).unwrap().base.parts().keyset.clone();
+        let source: Source = "http://127.0.0.1:1".parse().unwrap();
+        Openings {
+            store: Mutex::new(Store::open(dir).unwrap()),
+            source: source.clone(),
+            wallet: source,
+            keyset,
+            trust: crate::trust(profile).unwrap(),
+            timing: Timing::of(profile, None).unwrap(),
+            busy: Mutex::new(HashSet::new()),
+            heavy: Arc::new(tokio::sync::Semaphore::new(HEAVY)),
+            funding: tokio::sync::Mutex::new(()),
+        }
+    }
+
+    #[test]
+    fn sweeping_holds_the_busy_mutex_until_the_abandonment_write_completes() {
+        let dir = tempfile::tempdir().unwrap();
+        let openings = test_openings(dir.path());
+        let id = [5; 32];
+        let store = openings.store();
+        store
+            .insert(&id, 0, true, &deposit(0), &[0; 32], FUNDED)
+            .unwrap();
+        store.set_coins(&id, &[deposit(1)]).unwrap();
+        std::thread::scope(|scope| {
+            let sweeping = scope.spawn(|| openings.abandon_idle(&id, i64::MAX));
+            let started = std::time::Instant::now();
+            loop {
+                match openings.busy.try_lock() {
+                    Err(std::sync::TryLockError::WouldBlock) => break,
+                    Ok(_) => {}
+                    Err(e) => panic!("busy mutex: {e}"),
+                }
+                assert!(
+                    started.elapsed() < Duration::from_secs(2),
+                    "sweep released busy before its write"
+                );
+                std::thread::yield_now();
+            }
+            drop(store);
+            assert_eq!(sweeping.join().unwrap().unwrap(), Some(vec![deposit(1)]));
+        });
+    }
+
+    #[test]
+    fn sweeping_cannot_abandon_a_busy_opening_or_unlock_one_signed_since_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        let openings = test_openings(dir.path());
+        let id = [3; 32];
+        openings
+            .store()
+            .insert(&id, 0, true, &deposit(0), &[0; 32], FUNDED)
+            .unwrap();
+        openings.store().set_coins(&id, &[deposit(1)]).unwrap();
+        assert_eq!(openings.store().stale(i64::MAX).unwrap(), vec![id]);
+        openings.busy().insert(id);
+        assert!(openings.abandon_idle(&id, i64::MAX).unwrap().is_none());
+        openings
+            .store()
+            .save(&id, HubPhase::Funded as u8, true, &[0; 32], FUNDED)
+            .unwrap();
+        openings.busy().remove(&id);
+        assert!(openings.abandon_idle(&id, i64::MAX).unwrap().is_none());
+        assert_eq!(openings.store().locked().unwrap(), vec![deposit(1)]);
+        drop(openings);
+        assert_eq!(
+            Store::open(dir.path()).unwrap().locked().unwrap(),
+            vec![deposit(1)]
+        );
+    }
+
+    #[test]
+    fn abandonment_rechecks_activity_and_returns_only_the_coins_actually_abandoned() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let id = [4; 32];
+        store
+            .insert(&id, 0, true, &deposit(0), &[0; 32], FUNDED)
+            .unwrap();
+        store.set_coins(&id, &[deposit(1)]).unwrap();
+        let db = rusqlite::Connection::open(dir.path().join("openings.sqlite")).unwrap();
+        db.execute("UPDATE openings SET updated_at = 0", [])
+            .unwrap();
+        let before = crate::now() - 1;
+        assert_eq!(store.stale(before).unwrap(), vec![id]);
+        store.save(&id, 0, false, &[1; 32], FUNDED).unwrap();
+        assert!(store.abandon(&id, before).unwrap().is_none());
+        assert!(!store.row(&id).unwrap().unwrap().abandoned);
+        // A candidate's coin snapshot is not an authorization to unlock it.
+        store.set_coins(&id, &[deposit(2)]).unwrap();
+        assert_eq!(
+            store.abandon(&id, i64::MAX).unwrap(),
+            Some(vec![deposit(2)])
+        );
+        assert!(store.abandon(&id, i64::MAX).unwrap().is_none());
+        assert!(store.locked().unwrap().is_empty());
+    }
+
     #[test]
     fn openings_read_as_stored_with_their_terms_and_none_are_made() {
         let dir = tempfile::tempdir().unwrap();
@@ -455,7 +566,7 @@ mod tests {
         store
             .insert(&[2; 32], 0, true, &deposit(1), &[0; 32], b"state")
             .unwrap();
-        store.abandon(&[2; 32]).unwrap();
+        store.abandon(&[2; 32], i64::MAX).unwrap();
         let all = openings(dir.path()).unwrap();
         let [funded, abandoned] = &all[..] else {
             panic!("two openings, not {all:?}");
