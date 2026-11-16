@@ -59,7 +59,7 @@ impl Responses {
             "request witness differs from the one-time signing pin; refusing to sign again"
         );
         if let Some(response) = response {
-            return Ok(deserialize(&response).context("pinned response")?);
+            return deserialize(&response).context("pinned response");
         }
         let response = sign()?;
         self.0.execute(
