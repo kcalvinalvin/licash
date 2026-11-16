@@ -275,6 +275,25 @@ fn input(base: &Base, exit: Exit, evidence: Vec<Evidence>) -> HubInput {
     }
 }
 
+/// The inputs r0/host measures the guest on (`licash-r0 hp-exec`),
+/// written to `LICASH_HP_INPUTS` if set: the 32-item claim the Hub
+/// answers with a 16-note spend, and the same claim unanswered.
+#[test]
+fn export_inputs() {
+    let Ok(dir) = std::env::var("LICASH_HP_INPUTS") else {
+        return;
+    };
+    let (f, spent) = stale();
+    println!("filing: {} bytes", f.bytes.len());
+    let answered = input(&f.base, exit(&f.base, f.b, &f.e, &f.bytes, 64), vec![spent]);
+    let unanswered = input(&f.base, exit(&f.base, f.b, &f.e, &f.bytes, 127), vec![]);
+    for (name, i) in [("answered", answered), ("unanswered", unanswered)] {
+        let bytes = i.to_bytes();
+        println!("{name}: {} input bytes, {:?}", bytes.len(), check(&i).err());
+        std::fs::write(format!("{dir}/{name}.bin"), bytes).unwrap();
+    }
+}
+
 #[test]
 fn the_contract_is_bases() {
     let issuer = IssuerKeys::random(3).unwrap();

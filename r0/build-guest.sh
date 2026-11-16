@@ -3,7 +3,7 @@
 # rustup toolchain, cargo-risczero 3.1.x), then pack it with the zkOS kernel
 # into r0/guests/<name>.bin and write its image id to r0/guests/<name>.id.
 #
-#   r0/build-guest.sh native-counter|native-claim
+#   r0/build-guest.sh hp
 #
 # The flags are those of risczero/risc0-guest-builder (Lichen's
 # r0/build-guest.sh); `getrandom_backend="custom"` makes rand_core's OsRng
@@ -34,9 +34,8 @@ flags="$(printf '%s\x1f--remap-path-prefix=%s=licash\x1f--remap-path-prefix=%s=c
 tc="${RISC0_TOOLCHAIN:-$HOME/.rustup/toolchains/risc0}"
 name="${1:-}"
 case "$name" in
-    native-claim) dir=native-guest ;;
-    native-counter) dir=native-counter-guest ;;
-    *) echo 'usage: r0/build-guest.sh native-counter|native-claim' >&2; exit 2 ;;
+    hp) dir=hp-guest ;;
+    *) echo 'usage: r0/build-guest.sh hp' >&2; exit 2 ;;
 esac
 # The guests link libsecp256k1 (taproot control blocks): compile its C with
 # rzup's RISC-V gcc.
@@ -50,8 +49,11 @@ if [ "$rustc_commit" != "$pinned_rustc" ] || [ "$gcc_version" != "$pinned_gcc" ]
 fi
 # The guest's sources as the checkout has them, uncommitted changes and
 # all: the root manifest (crates/licash inherits from it), the crates the
-# guests depend on, and the guest.
-sources=(Cargo.toml crates/licash crates/licash-groth16 "r0/$dir")
+# guest depends on, and the guest; and Lichen's statement crate, fetched
+# into vendor/ at vendor/fetch.sh's pinned revision.
+sources=(Cargo.toml crates/licash crates/licash-hp "r0/$dir")
+lichen=vendor/lichen/crates/statement
+[ -f "$lichen/Cargo.toml" ] || { echo "no $lichen: run vendor/fetch.sh" >&2; exit 1; }
 if [ -n "$(git status --porcelain -- "${sources[@]}")" ]; then
     echo "uncommitted changes in the guest's sources: not a guest to keep" >&2
 fi
@@ -62,11 +64,13 @@ rm -rf "$src"
 mkdir "$src"
 git ls-files -z --cached --others --exclude-standard -- "${sources[@]}" |
     tar --null -T - -cf - | tar -xf - -C "$src"
+mkdir -p "$src/$(dirname "$lichen")"
+cp -R "$lichen" "$src/$lichen"
 export CC_riscv32im_risc0_zkvm_elf="$cc" AR_riscv32im_risc0_zkvm_elf="${cc%gcc}ar"
 export CFLAGS_riscv32im_risc0_zkvm_elf="-march=rv32im -nostdlib -ffile-prefix-map=$src=licash -ffile-prefix-map=$cargo_home=cargo"
 CARGO_ENCODED_RUSTFLAGS="$flags" RISC0_FEATURE_bigint2= RUSTC="$tc/bin/rustc" CARGO_TARGET_DIR="$build/target" \
     "$tc/bin/cargo" build --locked --release --target riscv32im-risc0-zkvm-elf --manifest-path "$src/r0/$dir/Cargo.toml"
-elf="$build/target/riscv32im-risc0-zkvm-elf/release/licash-$name"
+elf="$build/target/riscv32im-risc0-zkvm-elf/release/licash-$dir"
 sha256sum "$elf"
 cargo run --locked --release --manifest-path r0/host/Cargo.toml -- pack "$elf" "r0/guests/$name.bin" > "r0/guests/$name.id"
 cat "r0/guests/$name.id"

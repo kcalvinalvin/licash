@@ -11,8 +11,7 @@ license = "MIT"
 resolver = "3"
 
 [dependencies]
-licash = { path = "../../crates/licash" }
-licash-groth16 = { path = "../../crates/licash-groth16" }
+licash-hp = { path = "../../crates/licash-hp" }
 risc0-zkvm = { version = "=3.1.0", default-features = false, features = ["prove", "std"] }
 risc0-binfmt = "=3.0.6"
 risc0-zkos-v1compat = "=2.2.3"

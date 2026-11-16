@@ -1,14 +1,15 @@
 # RISC Zero programs
 
-- `native-guest/`: the holder's statement (`licash::statement::StatementInput`).
-  It commits the 68-byte journal `c ‖ D ‖ H(pk_H ‖ O_D)` and verifies the
-  Hub's counter proof against the counter program that Base names.
-- `native-counter-guest/`: the Hub's counter (`licash::guest::CounterInput`).
-  It commits the 104-byte journal `D ‖ E ‖ mask ‖ owed ‖ H(disclosure slots)`.
-- `host/`: packs, executes and proves both. Every command also runs the
-  library natively and fails when the guest disagrees with it.
+- `hp-guest/`: the Hub's statement (`licash_hp::check`): the claim the
+  holder's publication carries is owed at most the Hub's response `b′`. It
+  commits Lichen's 68-byte journal `c ‖ H("licash/hp/word" ‖ Base digest)
+  ‖ H(O_D ‖ checkpoint ‖ W)`, fixed when the contract opens, so the holder
+  garbles for it before anyone proves.
+- `host/`: packs, executes and proves it. Every command also runs
+  `licash_hp::check` natively and fails when the guest disagrees with it.
 
-Each is a workspace of its own.
+Each is a workspace of its own. The guest needs Lichen's statement crate in
+`vendor/` (`vendor/fetch.sh`).
 
 ## Prerequisites
 
@@ -32,8 +33,7 @@ rzup install cpp 2024.1.5
 ## Build
 
 ```sh
-r0/build-guest.sh native-counter   # r0/guests/native-counter.{bin,id}
-r0/build-guest.sh native-claim     # r0/guests/native-claim.{bin,id}
+r0/build-guest.sh hp   # r0/guests/hp.{bin,id}
 cargo build --release --manifest-path r0/host/Cargo.toml
 ```
 
@@ -80,30 +80,35 @@ land before changing the holder image or receipt-verifier parameters.
 
 ## Execute and prove
 
-Export guest inputs from the regtest suite (see
-[../regtest/README.md](../regtest/README.md)):
+Export statement inputs (`licash_hp::HubInput::to_bytes`) from the
+statement's tests: a 32-item claim the Hub answers with a 16-note spend,
+and the same claim with a response it can't prove:
 
 ```sh
-LICASH_NATIVE_INPUTS=$PWD/tmp/inputs regtest/run.sh --test native_lifecycle -- --test-threads=1
+LICASH_HP_INPUTS=$PWD/tmp/hp-inputs cargo test --release \
+  --manifest-path regtest/Cargo.toml -p licash-hp export_inputs
 ```
 
 Then execute (journal and cycle count) or prove (succinct receipt, Groth16
-wrap, verified and exported as JSON):
+wrap, verified and exported as JSON with the 256-byte seal that
+`lichen_babe::risc0::proof_from_seal` reads):
 
 ```sh
 licash=r0/host/target/release/licash-r0
-$licash native-exec tmp/inputs/native-honest-holder-c0.bin
-$licash native-counter-exec tmp/inputs/native-stale-counter.bin
-$licash native-prove tmp/inputs/native-honest-holder-c0.bin tmp/honest.json
-$licash native-counter-prove tmp/inputs/native-stale-counter.bin tmp/counter.json
+$licash hp-exec tmp/hp-inputs/answered.bin
+$licash hp-prove tmp/hp-inputs/answered.bin tmp/answered.json
 ```
 
-`LICASH_SEGMENT_PO2` (13 to 20) sets the zkVM segment size. Inputs exported
-by the mock-proof suite carry mock counter seals, so the holder's program
-refuses those that depend on a counter proof, as the library does.
+`LICASH_SEGMENT_PO2` (13 to 20) sets the zkVM segment size.
 
-The end-to-end test with real proofs plays both receipts on Bitcoin. It takes
-hours and about 10 GB of memory, so it is run explicitly:
+The answered input (a 20 kB filing, 32 settled notes, a 16-note spend as
+evidence) executes in about 68 M cycles (71 segments of 2^20). Cycles grow
+with the signatures and DLEQ proofs a filing carries, so a filing at the
+64 kB limit is roughly three times that. The Hub proves only when the
+holder challenges its assertion, within the graph's assert window.
+
+The end-to-end test with a real proof plays the receipt on Bitcoin. It
+takes hours and about 10 GB of memory, so it is run explicitly:
 
 ```sh
 LICASH_NATIVE_GUESTS=$PWD/r0/guests LICASH_R0=$PWD/r0/host/target/release/licash-r0 \

@@ -1,25 +1,24 @@
-//! licash-r0: packs, executes and proves the RISC Zero guests (`r0/native-guest`
-//! is the holder statement, `r0/native-counter-guest` the Hub's counter).
+//! licash-r0: packs, executes and proves the Hub's statement guest
+//! (`r0/hp-guest`, `licash_hp::check`).
 //!
 //!   licash-r0 pack <elf> <out.bin>          pack an ELF with the zkOS kernel; prints the image id
-//!   licash-r0 native-exec|native-counter-exec <input.bin>
-//!                                           execute an input; prints journal and cycles
-//!   licash-r0 native-prove|native-counter-prove <input.bin> <out.json>
+//!   licash-r0 id <program.bin>              a packed program's image id
+//!   licash-r0 hp-exec <input.bin>           execute an input; prints journal and cycles
+//!   licash-r0 hp-prove <input.bin> <out.json>
 //!                                           prove, wrap in Groth16, verify and export
-//!   licash-r0 native-prove-succinct|native-counter-prove-succinct <input.bin> [work-dir]
-//!                                           prove the STARK only, as a phone
-//!                                           can, a segment at a time, carried on across
-//!                                           runs in work-dir (<input.bin>.proof): writes
-//!                                           work-dir/receipt
-//!   licash-r0 native-wrap <receipt> <out.json>
-//!                                           wrap such a receipt in Groth16 (x86, Docker),
+//!   licash-r0 hp-prove-succinct <input.bin> [work-dir]
+//!                                           prove the STARK only, a segment at a time,
+//!                                           carried on across runs in work-dir
+//!                                           (<input.bin>.proof): writes work-dir/receipt
+//!   licash-r0 hp-wrap <receipt> <out.json>  wrap such a receipt in Groth16 (x86, Docker),
 //!                                           verify and export
 //!
+//! The export is JSON: the image id, the journal and the 256-byte Groth16
+//! seal (`lichen_babe::risc0::proof_from_seal`'s input), all hex.
 //! Packed guests are read from `r0/guests/` (built by r0/build-guest.sh).
 
-mod native;
+mod hp;
 mod resumable;
-mod seal;
 
 use std::fs::{read, write, File, OpenOptions};
 use std::path::{Path, PathBuf};
@@ -171,11 +170,11 @@ fn export_receipt(bin: &[u8], receipt: &Receipt, out: &str, journal_len: usize) 
         .inner
         .groth16()
         .context("a Groth16 receipt is required")?;
-    let proof = seal::compress(&groth16.seal)?;
+    ensure!(groth16.seal.len() == 256, "a Groth16 seal is 256 bytes");
     let data = serde_json::json!({
         "image_id": id.to_string(),
         "journal": hex::encode(&receipt.journal.bytes),
-        "proof": hex::encode(proof),
+        "seal": hex::encode(&groth16.seal),
     });
     write(out, serde_json::to_vec_pretty(&data)?)?;
     println!("verified and exported {out}");
@@ -200,18 +199,13 @@ fn main() -> Result<()> {
             println!("{}", compute_image_id(&read(bin)?)?);
             Ok(())
         }
-        ["native-exec", path] => native::exec(native::Program::Holder, path),
-        ["native-counter-exec", path] => native::exec(native::Program::Counter, path),
-        ["native-prove", path, out] => native::prove(native::Program::Holder, path, out),
-        ["native-counter-prove", path, out] => native::prove(native::Program::Counter, path, out),
-        ["native-prove-succinct", path, dir @ ..] if dir.len() <= 1 => {
-            native::prove_succinct(native::Program::Holder, path, dir.first().copied())
+        ["hp-exec", path] => hp::exec(path),
+        ["hp-prove", path, out] => hp::prove(path, out),
+        ["hp-prove-succinct", path, dir @ ..] if dir.len() <= 1 => {
+            hp::prove_succinct(path, dir.first().copied())
         }
-        ["native-counter-prove-succinct", path, dir @ ..] if dir.len() <= 1 => {
-            native::prove_succinct(native::Program::Counter, path, dir.first().copied())
-        }
-        ["native-wrap", receipt, out] => native::wrap(native::Program::Holder, receipt, out),
-        _ => bail!("usage: licash-r0 pack <elf> <out.bin> | id <program.bin> | native-exec|native-counter-exec <input.bin> | native-prove|native-counter-prove <input.bin> <out.json> | native-prove-succinct|native-counter-prove-succinct <input.bin> [work-dir] | native-wrap <receipt> <out.json>"),
+        ["hp-wrap", receipt, out] => hp::wrap(receipt, out),
+        _ => bail!("usage: licash-r0 pack <elf> <out.bin> | id <program.bin> | hp-exec <input.bin> | hp-prove <input.bin> <out.json> | hp-prove-succinct <input.bin> [work-dir] | hp-wrap <receipt> <out.json>"),
     }
 }
 

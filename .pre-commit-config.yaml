@@ -14,7 +14,7 @@ repos:
     hooks:
       - id: cargo-fmt
         name: cargo fmt
-        entry: sh -c 'cargo fmt --all -- --check && cargo fmt --manifest-path r0/native-guest/Cargo.toml -- --check && cargo fmt --manifest-path r0/native-counter-guest/Cargo.toml -- --check && cargo fmt --manifest-path r0/host/Cargo.toml -- --check && cargo fmt --manifest-path regtest/Cargo.toml -p licash-regtest -p licash-contract -- --check'
+        entry: sh -c 'cargo fmt --all -- --check && cargo fmt --manifest-path r0/hp-guest/Cargo.toml -- --check && cargo fmt --manifest-path r0/host/Cargo.toml -- --check && cargo fmt --manifest-path regtest/Cargo.toml -p licash-regtest -p licash-contract -p licash-hp -- --check'
         language: system
         types: [rust]
         pass_filenames: false
