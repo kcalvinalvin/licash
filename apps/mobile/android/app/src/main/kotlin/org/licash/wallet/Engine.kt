@@ -94,8 +94,12 @@ data class Ui(
 /** A line of the history's own key: lines of different kinds can share an id. */
 val Activity.key: String get() = "$kind $id"
 
-/** At most so many lines under way have where they stand read, each refresh. */
+/** Ordinary progress details are bounded; payout deadlines are always read. */
 private const val UNDER_READ = 20
+
+internal fun detailsToRead(history: List<Activity>): List<Activity> = history
+    .filter { it.state == State.PENDING }
+    .filterIndexed { index, activity -> index < UNDER_READ || activity.kind == Kind.PAYOUT }
 
 data class ChainStatus(val height: Int = 0, val peers: Long = 0, val synced: Boolean = false)
 
@@ -597,7 +601,7 @@ class Engine(context: Context) {
                     .getOrDefault(state.value.recoveries)
                 val history = it.history()
                 // From the wallet alone, no network: Home tells each step.
-                val under = history.filter { a -> a.state == State.PENDING }.take(UNDER_READ)
+                val under = detailsToRead(history)
                     .mapNotNull { a -> runCatching { it.details(a.kind, a.id) }.getOrNull()?.let { d -> a.key to d } }
                     .toMap()
                 Shown(it.network(), it.balance(), history, it.hubs(), it.tor(), contracts, recoveries, under)

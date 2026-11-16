@@ -43,14 +43,13 @@ pub(crate) fn now() -> i64 {
 }
 
 /// The deliveries kept in `dir`.
-pub(crate) fn load(dir: &Path) -> Vec<Delivery> {
-    let Ok(kept) = std::fs::read(file(dir)) else {
-        return Vec::new();
+pub(crate) fn load(dir: &Path) -> io::Result<Vec<Delivery>> {
+    let kept = match std::fs::read(file(dir)) {
+        Ok(kept) => kept,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
     };
-    serde_json::from_slice(&kept).unwrap_or_else(|e| {
-        tracing::warn!(%e, "the payments to send to mailboxes unreadable");
-        Vec::new()
-    })
+    serde_json::from_slice(&kept).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
 /// Keep `deliveries` in `dir` in place of those kept: written aside, then
@@ -78,7 +77,7 @@ mod tests {
     #[test]
     fn deliveries_are_kept_whole_and_none_without_a_file() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(load(dir.path()).is_empty());
+        assert!(load(dir.path()).unwrap().is_empty());
         let payee = licash::address::OwnerKeys::from_seed(&[1; 32])
             .unwrap()
             .address();
@@ -91,11 +90,22 @@ mod tests {
         };
         let mut all = vec![one.clone(), one.clone()];
         save(dir.path(), &all).unwrap();
-        assert_eq!(load(dir.path()), all);
+        assert_eq!(load(dir.path()).unwrap(), all);
         forget(&mut all, &one);
         save(dir.path(), &all).unwrap();
-        assert_eq!(load(dir.path()), [one]);
+        assert_eq!(load(dir.path()).unwrap(), [one]);
         std::fs::write(file(dir.path()), "{").unwrap();
-        assert!(load(dir.path()).is_empty());
+        assert_eq!(
+            load(dir.path()).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(std::fs::read(file(dir.path())).unwrap(), b"{");
+    }
+
+    #[test]
+    fn unreadable_delivery_state_is_not_an_empty_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(file(dir.path())).unwrap();
+        assert!(load(dir.path()).is_err());
     }
 }

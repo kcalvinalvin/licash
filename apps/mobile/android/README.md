@@ -142,6 +142,12 @@ licash-wallet onchain scan        # coins paid on Bitcoin
 
 ## Logs and tests
 
+Payout deadlines are checked for every pending payout, independently of
+the ordinary progress display limit. An unreadable `deliveries.json`
+stops mailbox-delivery updates without replacing the file; restore it from
+a backup or inspect it before retrying. A missing file still means no
+pending deliveries, and valid existing files need no conversion.
+
 Settings, About, Export logs shares the app's log and the light client's as
 one file; Storage shows what the app keeps on the phone: the wallet, the Bitcoin
 light client (each network's in advanced mode), Tor's state, logs, caches and

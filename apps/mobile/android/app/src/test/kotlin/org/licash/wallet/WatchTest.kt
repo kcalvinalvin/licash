@@ -158,6 +158,17 @@ class WatchTest {
     }
 
     @Test
+    fun payout_deadlines_are_read_beyond_the_ordinary_progress_limit() {
+        val ordinary = (1..25).map { line(Kind.SWAP, State.PENDING, "s$it") }
+        val p = line(Kind.PAYOUT, State.PENDING, "p")
+        val done = line(Kind.PAYOUT, State.DONE, "done")
+        val read = detailsToRead(ordinary + p + done)
+        assertEquals(ordinary.take(20) + p, read)
+        val under = read.filter { it.kind == Kind.PAYOUT }.associate { it.key to payout(steps(tip = 999u)) }
+        assertEquals(mapOf(p.key to 1_000u), nearing(Ui(history = ordinary + p + done, under = under)))
+    }
+
+    @Test
     fun a_payout_is_warned_of_only_with_the_providers_coin_unclaimed_near_its_deadline() {
         val p = line(Kind.PAYOUT, State.PENDING, "p")
         fun near(steps: PayoutSteps, height: Int = 0) =

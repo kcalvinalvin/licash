@@ -885,7 +885,7 @@ impl Wallet {
             })
         });
         if let Some(delivery) = &delivery {
-            let mut all = deliveries::load(&self.dir);
+            let mut all = deliveries::load(&self.dir).map_err(LicashError::failed)?;
             all.push(delivery.clone());
             deliveries::save(&self.dir, &all).map_err(LicashError::failed)?;
         }
@@ -1598,7 +1598,10 @@ impl Wallet {
                 _ => Some(None),
             },
         };
-        let mut all = deliveries::load(&self.dir);
+        let mut all = match deliveries::load(&self.dir) {
+            Ok(all) => all,
+            Err(e) => return tracing::warn!(%e, "the payments to send to mailboxes unreadable"),
+        };
         deliveries::forget(&mut all, delivery);
         if let Some(send) = send {
             all.push(Delivery {
@@ -1615,7 +1618,10 @@ impl Wallet {
     /// what the wallet records: kept while under way or not sent, forgotten
     /// once sent, given up or never made, or not sent two weeks on.
     fn deliver(&self) {
-        let all = deliveries::load(&self.dir);
+        let all = match deliveries::load(&self.dir) {
+            Ok(all) => all,
+            Err(e) => return tracing::warn!(%e, "the payments to send to mailboxes unreadable"),
+        };
         if all.is_empty() {
             return;
         }

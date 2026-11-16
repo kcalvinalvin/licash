@@ -304,7 +304,12 @@ impl Wallet {
             return Err(LicashError::invalid(format!("{hub} is no hub you use")));
         };
         match info.contracts {
-            Some(terms) => Ok((hub.to_owned(), terms)),
+            Some(terms) => {
+                if let Some(range) = &terms.range {
+                    check_range(range)?;
+                }
+                Ok((hub.to_owned(), terms))
+            }
             None => Err(LicashError::invalid(format!("{hub} opens no contracts"))),
         }
     }
@@ -445,10 +450,18 @@ fn set_changes(dir: &Path, changes: &[OutPoint]) -> Result<(), LicashError> {
     std::fs::rename(&next, &path).map_err(failed)
 }
 
-/// What a contract chosen within `range` is at first, paid from a coin of
-/// `coin` sat, if any: half again the coin, its change moved into Licash
-/// and as much again to receive, over half a year; within the range and
-/// the times the coin it may be.
+/// Refuse malformed advertised ranges before choosing or pricing terms.
+fn check_range(range: &licash_api::ContractRange) -> Result<(), LicashError> {
+    if range.min_blocks > range.max_blocks || range.min_cap > range.max_cap {
+        return Err(LicashError::invalid(
+            "the hub offers an inverted contract range",
+        ));
+    }
+    Ok(())
+}
+
+/// What a contract chosen within the checked `range` is at first: half
+/// again `coin`, over half a year, within the advertised bounds.
 fn suggested(range: &licash_api::ContractRange, coin: Option<u64>) -> (u32, u32) {
     let blocks = HALF_YEAR.clamp(range.min_blocks, range.max_blocks);
     let most = coin.and_then(|c| range.max_cap_for(c).map(|most| (c, most)));
@@ -893,6 +906,25 @@ mod tests {
             ..range()
         };
         assert_eq!(suggested(&short, Some(10_000_000)).1, 4_000);
+    }
+
+    #[test]
+    fn inverted_contract_ranges_are_refused_before_suggesting_terms() {
+        assert!(check_range(&range()).is_ok());
+        let mut inverted = range();
+        inverted.min_blocks = inverted.max_blocks + 1;
+        assert!(check_range(&inverted).is_err());
+        let mut inverted = range();
+        inverted.min_cap = inverted.max_cap + 1;
+        assert!(check_range(&inverted).is_err());
+        let mut single = range();
+        single.min_blocks = single.max_blocks;
+        single.min_cap = single.max_cap;
+        assert!(check_range(&single).is_ok());
+        assert_eq!(
+            suggested(&single, None),
+            (single.min_cap, single.min_blocks)
+        );
     }
 
     fn coin(txid: Txid, vout: u32, spending: Option<Txid>) -> licash_wallet::SilentCoin {
