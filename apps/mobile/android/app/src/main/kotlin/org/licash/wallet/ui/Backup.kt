@@ -90,7 +90,7 @@ private fun WordList(words: List<String>) {
                             style = MaterialTheme.typography.bodyLarge,
                             color = MaterialTheme.colorScheme.outline,
                         )
-                        Text(words[i], style = MaterialTheme.typography.bodyLarge)
+                        Text(words[i], Modifier.testTag("word ${i + 1}"), style = MaterialTheme.typography.bodyLarge)
                     }
                 }
             }
