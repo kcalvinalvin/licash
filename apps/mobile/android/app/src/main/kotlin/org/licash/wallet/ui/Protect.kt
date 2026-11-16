@@ -21,8 +21,10 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -32,12 +34,14 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
 import org.licash.core.Contract
 import org.licash.core.ContractQuote
+import org.licash.core.ContractSafety
 import org.licash.core.ContractState
 import org.licash.core.Recovery
 import org.licash.core.RecoveryStage
 import org.licash.wallet.Proving
 import org.licash.wallet.sat
 import org.licash.wallet.share
+import org.licash.wallet.safetyStatus
 
 /**
  * A protection at a hub, in a row: how much it covers, how long it has
@@ -60,11 +64,14 @@ internal fun CoverRow(
     proveHere: (() -> Unit)? = null,
     stopProving: () -> Unit = {},
     saveReceipt: (Uri) -> Unit = {},
+    safety: suspend () -> ContractSafety? = { null },
 ) {
     val colors = MaterialTheme.colorScheme
     val cover = cover(c, height)
     val forcing = recovery?.let { forcing(it, height) }
     var open by rememberSaveable(c.id) { mutableStateOf(false) }
+    var plan by remember(c.id) { mutableStateOf<ContractSafety?>(null) }
+    LaunchedEffect(open, c.id) { if (open && recovery == null) plan = safety() }
     // While it is set up: the step it is at.
     val step = c.step?.let { setup(it) }
     val tint = when {
@@ -119,7 +126,7 @@ internal fun CoverRow(
         AnimatedVisibility(open) {
             Column {
                 if (recovery != null) {
-                    Forced(recovery, developer, giveUp)
+                    Forced(recovery, developer, giveUp, height)
                     if (needsProof(recovery)) {
                         ProveElsewhere(recovery, saveStatement, bringProof)
                         proveHere?.let {
@@ -127,7 +134,7 @@ internal fun CoverRow(
                         }
                     }
                 } else {
-                    Unfolded(c, cover, developer, end, forceClose)
+                    Unfolded(c, cover, developer, end, forceClose, plan, height)
                 }
             }
         }
@@ -136,13 +143,20 @@ internal fun CoverRow(
 
 /** A protection's row unfolded: what it covers and costs; ending it, forcing it closed in advanced mode. */
 @Composable
-private fun Unfolded(c: Contract, cover: Cover, developer: Boolean, end: () -> Unit, forceClose: () -> Unit) {
+private fun Unfolded(c: Contract, cover: Cover, developer: Boolean, end: () -> Unit, forceClose: () -> Unit, safety: ContractSafety?, height: Int) {
     val state = c.state
     if (state is ContractState.Failed) Line("Why", state.reason)
     // Of what its hub holds, those ending first covering first.
     if (cover.on) Line("Covers now", sat(c.covers), tag = "covers")
     if (cover.ends != null) Line("Ends by itself in", cover.ends)
     if (!cover.failed) Line("Cost", sat(c.price), share = share(c.price, c.cap))
+    if (cover.held) {
+        safety?.let {
+            Line("Recovery planning", safetyStatus(it, height))
+            Line("Your proof margin", "${it.proofMargin} blocks")
+            Say("Planning only. Start earlier for confirmation time. Stay online: a late hub answer can reduce your proving time until your timeout confirms.")
+        }
+    }
     if (developer) {
         Line("Paid from", "A coin of ${sat(c.paidFrom)}")
         Line("Protects until", "block ${c.protectsUntil}")
@@ -165,8 +179,11 @@ private fun Unfolded(c: Contract, cover: Cover, developer: Boolean, end: () -> U
 
 /** A protection forced closed, unfolded: what it claimed, what stopped it, and giving it up while it may be. */
 @Composable
-private fun Forced(r: Recovery, developer: Boolean, giveUp: () -> Unit) {
+private fun Forced(r: Recovery, developer: Boolean, giveUp: () -> Unit, height: Int) {
     Line("Claimed", sat(r.claimed), tag = "recovery-claimed")
+    if (needsProof(r) && height > 0) r.deadline?.let {
+        Line("Time left to prove", "${it.toLong().minus(height).coerceAtLeast(0)} blocks")
+    }
     r.error?.let { Line("Stopped by", it) }
     if (developer) {
         r.nextAt?.let { Line("Next step at", "block $it") }

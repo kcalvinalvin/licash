@@ -44,6 +44,7 @@ mod moves;
 mod payouts;
 mod recoveries;
 mod refunds;
+mod safety;
 
 pub use contacts::Contact;
 

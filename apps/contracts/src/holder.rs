@@ -10,6 +10,7 @@ mod driver;
 #[cfg(feature = "node")]
 mod node;
 pub mod recovery;
+pub mod safety;
 mod store;
 
 use std::path::Path;

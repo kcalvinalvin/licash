@@ -129,6 +129,12 @@ phone itself, for hours, carried on after any stop; that proof's last step
 saved from the row. The contracts are kept beside the wallet's file, made
 only once one is asked for.
 
+Advanced settings has a holder-owned recovery planning margin (14 estimated
+days by default). An unfolded contract reads the signed terms to show when
+its request should confirm. This does not authorize automatic closing.
+A late hub answer remains possible until the holder's timeout wins on
+chain, so the margin requires online monitoring and prompt confirmation.
+
 A counterpart on the command line:
 
 ```sh

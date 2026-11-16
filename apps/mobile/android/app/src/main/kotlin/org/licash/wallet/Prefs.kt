@@ -53,6 +53,14 @@ class Prefs(context: Context) {
         get() = prefs.getLong("renew_ppm", -1L).takeIf { it >= 0 }?.toUInt()
         set(ppm) = prefs.edit().putLong("renew_ppm", ppm?.toLong() ?: -1L).apply()
 
+    /** Local planning only. A missing preference never authorizes a close. */
+    var proofMarginDays: Int
+        get() = prefs.getInt("proof_margin_days", 14).takeIf { it in 1..30 } ?: 14
+        set(days) {
+            require(days in 1..30)
+            prefs.edit().putInt("proof_margin_days", days).apply()
+        }
+
     /**
      * The lines of the history under way when last looked, by key: none
      * kept yet (`null`, as before the app kept them) tells of none finished.

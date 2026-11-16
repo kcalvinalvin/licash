@@ -100,6 +100,7 @@ internal fun HubPage(
                     ui.chain.height,
                     ui.developer,
                     recovery = ui.recoveries.find { it.id == c.id },
+                    safety = { engine.contractSafety(c.id).getOrNull() },
                     end = { ending = c },
                     forceClose = { forcing = c },
                     giveUp = {
