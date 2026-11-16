@@ -282,6 +282,41 @@ pub struct Settings {
     pub open_hint: String,
 }
 
+impl Settings {
+    /// On `network`, every hub the provider's wallet knows kept, with
+    /// `proof_days` to prove a claim in and a successor opened
+    /// `successor_days` before its predecessor's safe deadline, each a
+    /// day of its blocks; told to open a first contract at a hub with
+    /// `open_hint`. Its successors cost a quarter more than their
+    /// predecessors at most, it drains nothing, and looks for no coins.
+    pub fn new(
+        network: ChainProfile,
+        proof_days: u32,
+        successor_days: u32,
+        open_hint: String,
+    ) -> Self {
+        let day = blocks_a_day(network);
+        Self {
+            hubs: None,
+            proof_margin: proof_days.saturating_mul(day),
+            timeout_slack: TIMEOUT_SLACK,
+            day,
+            successor_lead: successor_days.saturating_mul(day),
+            max_price: None,
+            drain_via: None,
+            scan: false,
+            open_hint,
+        }
+    }
+}
+
+/// Blocks kept for a recovery's timeout to confirm in, as the wallet apps
+/// keep them.
+pub const TIMEOUT_SLACK: u32 = 6;
+
+/// How often the keeper keeps the contracts ([`Keeper::run`]).
+pub const EVERY: Duration = Duration::from_secs(60);
+
 /// How long a hub may answer nothing before the operator hears of it.
 const SILENCE: Duration = Duration::from_secs(60 * 60);
 
@@ -292,6 +327,9 @@ const MAX_RETRY: Duration = Duration::from_secs(6 * 60 * 60);
 
 /// Blocks a scan looks in at once.
 const SCAN_BATCH: u32 = 1_000;
+
+/// A keeper running on its own thread ([`Keeper::spawn`]), until dropped.
+pub struct Running(#[allow(dead_code)] tokio::sync::oneshot::Sender<()>);
 
 /// A replacement that failed.
 struct Failure {
@@ -335,6 +373,30 @@ impl<T: Transport + 'static> Keeper<T> {
             told_late: HashSet::new(),
             answered: HashMap::new(),
         }
+    }
+
+    /// Keep the contracts every `every` on a thread of its own, as their
+    /// files are not shared between threads, until the handle returned is
+    /// dropped: stopped at the next step it awaits, as a task aborted.
+    pub fn spawn(self, every: Duration) -> std::io::Result<Running>
+    where
+        Self: Send,
+    {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        std::thread::Builder::new()
+            .name("contracts".into())
+            .spawn(move || {
+                runtime.block_on(async move {
+                    tokio::select! {
+                        () = self.run(every) => {}
+                        _ = stopped => {}
+                    }
+                });
+            })?;
+        Ok(Running(stop))
     }
 
     /// Keep the contracts every `every`, for good.
