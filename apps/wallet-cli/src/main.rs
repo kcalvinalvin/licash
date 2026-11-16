@@ -480,7 +480,13 @@ fn main() -> ExitCode {
 fn log_filter(format: Option<Log>, rust_log: Option<&str>) -> EnvFilter {
     rust_log
         .and_then(|value| EnvFilter::try_new(value).ok())
-        .unwrap_or_else(|| EnvFilter::new(if format.is_some() { "warn" } else { "off" }))
+        .unwrap_or_else(|| {
+            EnvFilter::new(if format.is_some() {
+                "warn"
+            } else {
+                "off,licash_wallet=warn"
+            })
+        })
 }
 
 fn logging(format: Option<Log>) {
@@ -490,7 +496,7 @@ fn logging(format: Option<Log>) {
         .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
         .with_writer(std::io::stderr);
     match format.unwrap_or(Log::Text) {
-        Log::Text => logs.init(),
+        Log::Text => logs.without_time().with_target(false).init(),
         Log::Json => logs.json().init(),
     }
 }
@@ -1773,12 +1779,51 @@ mod presentation_tests {
 
     #[test]
     fn diagnostics_are_opt_in_and_keep_explicit_filters() {
-        assert_eq!(log_filter(None, None).to_string(), "off");
+        let quiet = log_filter(None, None).to_string();
+        assert!(
+            quiet.contains("off") && quiet.contains("licash_wallet=warn"),
+            "{quiet}"
+        );
         assert_eq!(log_filter(Some(Log::Text), None).to_string(), "warn");
         assert_eq!(log_filter(Some(Log::Json), None).to_string(), "warn");
         assert_eq!(
             log_filter(None, Some("nostr_sdk=debug")).to_string(),
             "nostr_sdk=debug"
         );
+    }
+
+    #[test]
+    fn relay_noise_is_hidden_but_wallet_warnings_are_not() {
+        use std::sync::{Arc, Mutex};
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+        impl Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let capture = buffer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(log_filter(None, None))
+            .with_ansi(false)
+            .without_time()
+            .with_target(false)
+            .with_writer(move || Capture(capture.clone()))
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::error!(target: "nostr_sdk::relay::inner", "Connection reset");
+            tracing::warn!(target: "licash_wallet::payout", "claim not broadcast: retry required");
+        });
+        let bytes = buffer.lock().unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            text.contains("claim not broadcast: retry required"),
+            "{text}"
+        );
+        assert!(!text.contains("Connection reset"), "{text}");
     }
 }
