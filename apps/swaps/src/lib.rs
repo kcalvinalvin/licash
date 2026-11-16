@@ -234,6 +234,11 @@ pub async fn step<T: Transport + 'static>(provider: Arc<Provider<T>>, every: Dur
             }
             Err(e) => tracing::warn!("taking the swaps on: {e}"),
         }
+        // Shared by standalone and hub-embedded providers. Maintenance
+        // never prevents pending swaps from being advanced next round.
+        if let Err(e) = provider.wallet().maintain_notes().await {
+            tracing::info!("note maintenance deferred: {e}");
+        }
         match provider.check_stock() {
             Ok(short) => {
                 for hub in short {

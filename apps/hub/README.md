@@ -207,7 +207,10 @@ wallet and swaps are kept in `<data>/swaps` (`wallet.sqlite` and
 `swaps.sqlite`, made on the first start): back them up with `hub.sqlite`,
 since an older `swaps.sqlite` loses the claims backing notes the hub
 locked. The hub refuses to start without `--swaps` while swaps are under
-way. To move the provider's notes out, stop the hub and run `licash-wallet
+way. Each round, the provider's wallet also reshapes the notes it was paid,
+as a standalone provider's does (see `apps/swaps/README.md`); its first
+start under this version upgrades `wallet.sqlite` to version 8, which older
+versions refuse. To move the provider's notes out, stop the hub and run `licash-wallet
 --wallet <data>/swaps/wallet.sqlite`. The provider's wallet reaches hubs
 directly, so it cannot swap from a hub at an onion service only, unless
 with `--swaps-tor`: then through a Tor client of the hub's own, that of

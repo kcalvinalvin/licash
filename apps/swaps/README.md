@@ -55,6 +55,13 @@ it is paid each round, and renews those a hub no longer unlinks since it
 restarted, once, if the hub's fee on them is at most `--renew-ppm` parts
 per million of their value, or a spending schedule of at most 1 sat base,
 that rate and 0.1 sat per output (1000 by default, 0 for free renewals only).
+Each round after the swaps it also reshapes the notes it was paid, as the
+wallet's README says: at most one remint per hub, after a privacy rest,
+within that fee authority and 1% of what it holds there a day. A failed
+remint is only logged and never holds a swap up. The same applies to the
+provider a hub embeds (`licash-hub run --swaps`). The first start under
+this version upgrades `wallet.sqlite` to version 8, which older versions
+refuse; the upgrade itself remints nothing and asks no hub.
 
 With `--chain URL` (Bitcoin Core's RPC, `http://user:password@host:8332`, or
 Esplora, `esplora+https://esplora.example/api`), the provider also pays notes
