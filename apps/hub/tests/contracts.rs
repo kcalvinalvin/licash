@@ -1367,3 +1367,170 @@ async fn an_operator_answers_a_holders_request_beside_the_running_hub() -> Resul
     );
     Ok(())
 }
+
+/// A provider's keeper, a round at a time: what the provider takes in at
+/// the hub held to its contracts there, the one ending replaced in time,
+/// and forced closed at its safe deadline only once its successor cannot
+/// recover every note held there.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs bitcoind and a release build"]
+async fn a_providers_keeper_holds_its_intake_to_its_contracts_and_replaces_them() -> Result<()> {
+    use std::collections::HashMap;
+
+    use licash_contracts::holder::{recovery, safety};
+    use licash_swaps::{Config as SwapsConfig, Provider};
+    use licash_swaps_service::keeper::{Alert, Deadlines, Keeper, Settings};
+
+    let rt = Regtest::start_standard()?;
+    let dir = tempfile::tempdir()?;
+    let at = dir.path().join("hub");
+    let (url, source, hub) = hub_serving(&rt, &at, None).await?;
+    let mine = dir.path().join("provider");
+    std::fs::create_dir(&mine)?;
+    let regtest = ChainProfile::Core30DefaultRegtest;
+    let wallet = Wallet::create(
+        &mine.join("wallet.sqlite"),
+        &[11; 32],
+        regtest,
+        Http::new(None)?,
+    )?;
+    wallet.add_hub(&url).await?;
+    wallet.watch_silent(None, rt.height()?)?;
+    for sats in [60_000, 60_000] {
+        let to = wallet.fallback_address()?.script_pubkey();
+        rt.fund(&to, Amount::from_sat(sats))?;
+    }
+    rt.mine(1)?;
+    let swaps = mine.join("swaps.sqlite");
+    let provider = Arc::new(Provider::create(&swaps, wallet, SwapsConfig::default())?);
+    let (day, lead, margin, slack) = (2, 20, 10, 6);
+    let settings = Settings {
+        proof_margin: margin,
+        timeout_slack: slack,
+        day,
+        successor_lead: lead,
+        max_price: Some(30_000),
+        scan: true,
+        ..Settings::new(regtest, 0, 0, "open-contract {hub}".into())
+    };
+    let chain = Node(source.clone());
+    let mut keeper = Keeper::new(provider.clone(), Node(source), mine.clone(), settings);
+    let limited = |most: u64| Some(HashMap::from([(url.clone(), most)]));
+    let alerted = |says: &str| -> Result<bool> {
+        let events = provider.events(0, 1_000)?;
+        Ok((events.iter()).any(|e| e.kind == "alert" && e.data.to_string().contains(says)))
+    };
+    // Nothing taken in until it knows what protects the notes.
+    ensure!(provider.intake() == Some(HashMap::new()));
+
+    // No contract at the hub: nothing taken in there, the operator told
+    // how to open one.
+    let plan = keeper.round().await?;
+    ensure!(
+        plan.alerts == [Alert::NoContract { hub: url.clone() }],
+        "{plan:?}"
+    );
+    ensure!(provider.intake() == limited(0));
+    ensure!(alerted(&format!("open-contract {url}"))?);
+
+    // Opened by the operator: nothing yet while it opens, then its cap.
+    let first = holder::open(provider.wallet(), &chain, &mine, &url, ask()).await?;
+    let plan = keeper.round().await?;
+    ensure!(
+        plan.alerts.is_empty() && plan.successors.is_empty(),
+        "{plan:?}"
+    );
+    ensure!(provider.intake() == limited(0));
+    rt.mine(1)?;
+    keeper.round().await?;
+    keeper.round().await?;
+    ensure!(
+        provider.intake() == limited(4_096),
+        "{:?}",
+        provider.intake()
+    );
+
+    let tip = rt.height()?;
+    let safety = safety::of(provider.wallet(), &mine, &first.id, tip, margin, slack)?;
+    let Deadlines { renew_at, claim_at } = Deadlines::new(safety.request_by, day, lead);
+    ensure!(renew_at > tip + 1, "{safety:?}");
+    rt.mine_to_height(renew_at - 1)?;
+    let plan = keeper.round().await?;
+    ensure!(plan.successors.is_empty(), "{plan:?}");
+    ensure!(provider.intake() == limited(4_096));
+
+    // Due to be replaced: a successor of its cap opened, counted in its
+    // stead while it opens.
+    rt.mine(1)?;
+    let plan = keeper.round().await?;
+    ensure!(
+        plan.successors.len() == 1 && plan.successors[0].replaces == first.id,
+        "{plan:?}"
+    );
+    let all = holder::list(&mine)?;
+    let second = all
+        .iter()
+        .find(|c| c.id != first.id)
+        .context("no successor")?;
+    ensure!(
+        second.since >= renew_at && second.cap == 4_096 && second.price <= 30_000,
+        "{second:?}"
+    );
+    let plan = keeper.round().await?;
+    ensure!(plan.successors.is_empty(), "{plan:?}");
+    ensure!(provider.intake() == limited(4_096));
+    // Live: it counts, and nothing more is opened.
+    rt.mine(1)?;
+    keeper.round().await?;
+    let plan = keeper.round().await?;
+    ensure!(
+        plan.successors.is_empty() && plan.force_close.is_empty(),
+        "{plan:?}"
+    );
+    ensure!(provider.intake() == limited(4_096));
+    ensure!(holder::list(&mine)?.len() == 2);
+
+    // At its safe deadline, its successor recovers every note there: not
+    // claimed.
+    let payment = pay(
+        &hub,
+        &at.join("seed"),
+        &url,
+        &provider.wallet().address(),
+        3_000,
+    )?;
+    provider.wallet().receive(&payment)?;
+    rt.mine_to_height(claim_at)?;
+    let plan = keeper.round().await?;
+    ensure!(
+        plan.force_close.is_empty() && plan.drains.is_empty(),
+        "{plan:?}"
+    );
+    ensure!(recovery::recoveries(&mine)?.is_empty());
+    // More than it recovers: claimed, whatever the hub says, and what the
+    // successor cannot protect to be drained.
+    let payment = pay(
+        &hub,
+        &at.join("seed"),
+        &url,
+        &provider.wallet().address(),
+        2_000,
+    )?;
+    provider.wallet().receive(&payment)?;
+    let plan = keeper.round().await?;
+    ensure!(plan.force_close == [first.id], "{plan:?}");
+    ensure!(plan.drains == [(url.clone(), 5_000 - 4_096)], "{plan:?}");
+    let recoveries = recovery::recoveries(&mine)?;
+    ensure!(
+        recoveries.len() == 1 && recoveries[0].id == first.id,
+        "{recoveries:?}"
+    );
+    ensure!(alerted("forced contract")?);
+    // Never forced again, nor replaced.
+    let plan = keeper.round().await?;
+    ensure!(
+        plan.force_close.is_empty() && plan.successors.is_empty(),
+        "{plan:?}"
+    );
+    Ok(())
+}
