@@ -155,6 +155,8 @@ pub struct Contract {
     pub assert_height: u32,
     /// The block its collateral returns to the hub from.
     pub close_height: u32,
+    /// The chain's height as she started opening it.
+    pub since: u32,
     /// F's id, once she knows F.
     pub funding: Option<Txid>,
     /// Where F stands, as last seen once she signed it.
@@ -460,7 +462,7 @@ impl Store {
     pub fn list(&self) -> Result<Vec<Contract>> {
         let mut stmt = self.c.prepare(
             "SELECT id, hub, phase, mock, deposit, value, price, cap, assert_height,
-                    close_height, funding, fate, abandoned, created_at
+                    close_height, funding, fate, abandoned, created_at, since
              FROM contracts ORDER BY created_at DESC, id",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -480,6 +482,7 @@ impl Store {
                 r.get::<_, Option<String>>(11)?,
                 r.get::<_, Option<String>>(12)?,
                 r.get::<_, i64>(13)?,
+                r.get::<_, u32>(14)?,
             ))
         })?;
         let mut all = Vec::new();
@@ -496,6 +499,7 @@ impl Store {
                 fate,
                 abandoned,
                 created_at,
+                since,
             ) = row?;
             let phase = *Phase::ALL
                 .get(usize::from(phase))
@@ -511,6 +515,7 @@ impl Store {
                 cap,
                 assert_height: heights.0,
                 close_height: heights.1,
+                since,
                 funding: funding.map(|t| deserialize(&t)).transpose()?,
                 fate: fate.as_deref().map(text_fate).transpose()?,
                 abandoned,
@@ -809,7 +814,10 @@ mod tests {
             (first.deposit, first.value, first.price),
             (coin(0), 60_000, 23_000)
         );
-        assert_eq!((first.assert_height, first.close_height), (360, 500));
+        assert_eq!(
+            (first.assert_height, first.close_height, first.since),
+            (360, 500, 200)
+        );
         assert!(first.live(359) && !first.live(360) && !first.over(499) && first.over(500));
         assert_eq!(store.state(&[1; 32]).unwrap(), (b"funded".to_vec(), 200));
         let second = all.iter().find(|c| c.id == [2; 32]).unwrap();

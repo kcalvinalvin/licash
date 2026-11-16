@@ -868,6 +868,7 @@ mod tests {
             cap: 4_096,
             assert_height: deadline,
             close_height: 500,
+            since: 200,
             funding: None,
             fate: Some(fate),
             abandoned: None,

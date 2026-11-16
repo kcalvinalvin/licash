@@ -154,6 +154,7 @@ mod tests {
             cap,
             assert_height,
             close_height: 500,
+            since: 200,
             funding: None,
             fate: Some(Fate::Live),
             abandoned: None,

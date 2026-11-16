@@ -223,6 +223,7 @@ mod tests {
             cap: 4_096,
             assert_height: 360,
             close_height: 500,
+            since: 200,
             funding: None,
             fate,
             abandoned: None,
