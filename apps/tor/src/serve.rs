@@ -104,7 +104,11 @@ async fn answer(request: StreamRequest, router: axum::Router) {
         _ => None,
     };
     if port != Some(PORT) {
-        let _ = request.reject(End::new_with_reason(EndReason::DONE)).await;
+        let _ = tokio::time::timeout(
+            Duration::from_secs(5),
+            request.reject(End::new_with_reason(EndReason::DONE)),
+        )
+        .await;
         return;
     }
     let stream = match tokio::time::timeout(HEADERS, request.accept(Connected::new_empty())).await {
