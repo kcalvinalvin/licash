@@ -96,6 +96,46 @@ type Chosen = (Keyset, Vec<[u8; 33]>);
 /// The branch a hub issued, its issuances and the preimage it paid on.
 type Settlement = (Branch, Issued, Option<[u8; 32]>);
 
+/// A signed lock not yet recorded or sent. The selected notes are taken
+/// in the same transaction as its record, optionally alongside the
+/// operation that owns it.
+pub(crate) struct PreparedLock {
+    pub(crate) id: ProposalId,
+    hub: i64,
+    payee: Vec<u8>,
+    hash: [u8; 32],
+    expiry: u32,
+    amount: u64,
+    pub(crate) fee: u64,
+    request: String,
+    invoice: Option<String>,
+    inputs: Vec<[u8; 33]>,
+    height: u32,
+}
+
+impl PreparedLock {
+    pub(crate) fn record(&self, tx: &rusqlite::Transaction<'_>) -> Result<(), Error> {
+        tx.execute(
+            "INSERT INTO locks
+                (id, hub, payee, hash, expiry, amount, fee, request, invoice, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                self.id.as_bytes(),
+                self.hub,
+                self.payee,
+                self.hash,
+                self.expiry,
+                sql(self.amount),
+                sql(self.fee),
+                self.request,
+                self.invoice,
+                now()
+            ],
+        )?;
+        crate::take(tx, &self.id, &self.inputs)
+    }
+}
+
 /// Timed locks.
 impl<T: Transport> Wallet<T> {
     /// Lock `amount` to `payee` through the hub at `url`, paid on the
@@ -133,6 +173,28 @@ impl<T: Transport> Wallet<T> {
         expiry: Option<u32>,
         invoice: Option<&str>,
     ) -> Result<Lock, Error> {
+        let prepared = self
+            .prepare_lock((url, hub, info), payee, amount, hash, expiry, invoice)
+            .await?;
+        self.store.write(|tx| prepared.record(tx))?;
+        let id = prepared.id;
+        let fee = prepared.fee;
+        let expiry = prepared.expiry;
+        tracing::info!(id = %hex::encode(id.as_bytes()), %url, amount, fee, expiry, "locking");
+        self.advance_lock(&id, Some(prepared.height)).await
+    }
+
+    /// Prepare locally, without recording or admitting the lock. A lock
+    /// to the hub itself may first remint exact notes, as before.
+    pub(crate) async fn prepare_lock(
+        &self,
+        (url, hub, info): (&str, i64, &Info),
+        payee: &Address,
+        amount: u64,
+        hash: [u8; 32],
+        expiry: Option<u32>,
+        invoice: Option<&str>,
+    ) -> Result<PreparedLock, Error> {
         if amount == 0 {
             return Err(Error::Invalid("nothing to lock".into()));
         }
@@ -200,28 +262,19 @@ impl<T: Transport> Wallet<T> {
         let signed = self.sign_as_owner(&keyset, proposal, &notes, Authorization::Plain)?;
         let request =
             serde_json::to_string(&licash_api::Lock::new(&signed, &notes)).map_err(invalid)?;
-        self.store.write(|tx| {
-            tx.execute(
-                "INSERT INTO locks
-                    (id, hub, payee, hash, expiry, amount, fee, request, invoice, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                params![
-                    id.as_bytes(),
-                    hub,
-                    payee.to_bytes(),
-                    hash,
-                    expiry,
-                    sql(amount),
-                    sql(fee),
-                    request,
-                    invoice,
-                    now()
-                ],
-            )?;
-            crate::take(tx, &id, &inputs)
-        })?;
-        tracing::info!(id = %hex::encode(id.as_bytes()), %url, amount, fee, expiry, "locking");
-        self.advance_lock(&id, Some(locks.height)).await
+        Ok(PreparedLock {
+            id,
+            hub,
+            payee: payee.to_bytes().to_vec(),
+            hash,
+            expiry,
+            amount,
+            fee,
+            request,
+            invoice: invoice.map(str::to_owned),
+            inputs,
+            height: locks.height,
+        })
     }
 
     /// Notes of one keyset of `hub` worth `amount` exactly, the largest
