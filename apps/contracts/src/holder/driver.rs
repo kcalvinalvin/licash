@@ -3,12 +3,16 @@
 //! it asks is done.
 
 use std::collections::VecDeque;
+use std::future::Future;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context as _, Result};
 use bitcoin::{Script, Transaction};
+use futures_util::future::Either;
+use futures_util::{Stream, StreamExt};
 use licash_contract::opening::{Context, Holder, Input, Out, Phase, Quote, Trust};
-use licash_contract::wire::Kind;
+use licash_contract::wire::{Kind, STAGES};
+use licash_contract::KEPT;
 use licash_wallet::{DepositState, Transport, Wallet};
 
 use super::chain::Chain;
@@ -21,6 +25,13 @@ const RETRY: Duration = Duration::from_secs(2);
 
 /// How many times to ask a working hub again before trying later.
 const PATIENCE: u32 = 900;
+
+/// How many frames of a hub's answer are under way at once: all the
+/// instances an opening keeps, downloaded together, and the message the
+/// hub sends before them. Tens of MB each, over Tor each on circuits of
+/// its own, as one carries only so much: on signet 25 MB took 4-6 min
+/// over Tor, 10 s without.
+const DOWNLOADING_AT_ONCE: usize = STAGES * KEPT + 1;
 
 /// The hub refused what she sent, or she what it sent: the opening goes
 /// no further.
@@ -68,12 +79,13 @@ impl<T: Transport, C: Chain> Driver<'_, T, C> {
                     }
                 }
                 Out::Send(message) => {
-                    for frame in self.post(message).await? {
-                        let bytes = match frame {
-                            Frame::Message(bytes) => bytes,
-                            Frame::Instance { stage, index } => self.fetch(stage, index).await?,
-                        };
-                        queue.extend(self.step(Input::Message(bytes)).await?);
+                    let frames = self.post(message).await?;
+                    let (wallet, hub, id) = (self.wallet, self.hub.clone(), self.id);
+                    let hub = hub.as_str();
+                    let fetch = move |stage, index| fetch(wallet, hub, id, stage, index);
+                    let mut each = each_frame(frames, fetch);
+                    while let Some(bytes) = each.next().await {
+                        queue.extend(self.step(Input::Message(bytes?)).await?);
                     }
                 }
                 Out::Sign {
@@ -111,9 +123,14 @@ impl<T: Transport, C: Chain> Driver<'_, T, C> {
             .into_iter()
             .filter(|o| !matches!(o, Out::Keep { .. }))
             .collect();
-        for (stage, index) in self.holder().missing() {
-            let bytes = self.fetch(stage, index).await?;
-            outs.extend(self.step(Input::Message(bytes)).await?);
+        let missing = self.holder().missing().into_iter();
+        let frames = missing.map(|(stage, index)| Frame::Instance { stage, index });
+        let (wallet, hub, id) = (self.wallet, self.hub.clone(), self.id);
+        let hub = hub.as_str();
+        let fetch = move |stage, index| fetch(wallet, hub, id, stage, index);
+        let mut each = each_frame(frames.collect(), fetch);
+        while let Some(bytes) = each.next().await {
+            outs.extend(self.step(Input::Message(bytes?)).await?);
         }
         self.drive(outs).await
     }
@@ -275,30 +292,51 @@ impl<T: Transport, C: Chain> Driver<'_, T, C> {
         }
         bail!("{}: still working on the opening: later", self.hub)
     }
+}
 
-    /// Instance `index` of assertion `stage`, as the hub serves it: tens
-    /// of MB each, as large as any message an opening has.
-    async fn fetch(&self, stage: usize, index: usize) -> Result<Vec<u8>> {
-        let path = INSTANCE
-            .replace("{id}", &crate::hex_id(&self.id))
-            .replace("{stage}", &stage.to_string())
-            .replace("{index}", &index.to_string());
-        let url = format!("{}{path}", self.hub);
-        let started = Instant::now();
-        let response = self.wallet.transport().download(&url, MAX_BODY).await;
-        let response = response.map_err(|e| anyhow!("{}: {e}", self.hub))?;
-        match response.status {
-            200 => {
-                let (id, bytes, took) = (
-                    crate::hex_id(&self.id),
-                    response.body.len(),
-                    started.elapsed(),
-                );
-                tracing::info!(%id, stage, index, bytes, ?took, "an instance kept downloaded");
-                Ok(response.body)
-            }
-            status => Err(failed(&self.hub, status, &response.body)),
+/// The bytes of each of `frames`, in order: the instances among them
+/// downloaded with `fetch`, [`DOWNLOADING_AT_ONCE`] frames under way at
+/// once (a message taking no time), each taken once those before it are.
+fn each_frame<'f, F>(
+    frames: Vec<Frame>,
+    fetch: impl Fn(usize, usize) -> F + 'f,
+) -> impl Stream<Item = Result<Vec<u8>>> + 'f
+where
+    F: Future<Output = Result<Vec<u8>>> + 'f,
+{
+    futures_util::stream::iter(frames)
+        .map(move |frame| match frame {
+            Frame::Message(bytes) => Either::Left(std::future::ready(Ok(bytes))),
+            Frame::Instance { stage, index } => Either::Right(fetch(stage, index)),
+        })
+        .buffered(DOWNLOADING_AT_ONCE)
+}
+
+/// Instance `index` of assertion `stage` of the opening `id`, as `hub`
+/// serves it: tens of MB each, as large as any message an opening has.
+async fn fetch<T: Transport>(
+    wallet: &Wallet<T>,
+    hub: &str,
+    id: [u8; 32],
+    stage: usize,
+    index: usize,
+) -> Result<Vec<u8>> {
+    let id = crate::hex_id(&id);
+    let path = INSTANCE
+        .replace("{id}", &id)
+        .replace("{stage}", &stage.to_string())
+        .replace("{index}", &index.to_string());
+    let url = format!("{hub}{path}");
+    let started = Instant::now();
+    let response = wallet.transport().download(&url, MAX_BODY).await;
+    let response = response.map_err(|e| anyhow!("{hub}: {e}"))?;
+    match response.status {
+        200 => {
+            let (bytes, took) = (response.body.len(), started.elapsed());
+            tracing::info!(%id, stage, index, bytes, ?took, "an instance kept downloaded");
+            Ok(response.body)
         }
+        status => Err(failed(hub, status, &response.body)),
     }
 }
 
@@ -309,5 +347,63 @@ fn failed(hub: &str, status: u16, body: &[u8]) -> anyhow::Error {
         Refusal(format!("{hub} refused it: {reason}")).into()
     } else {
         anyhow!("{hub}: status {status}: {reason}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn instances_download_together_each_frame_taken_in_order() {
+        let (under_way, most) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        let fetch = |stage: usize, index: usize| {
+            let (under_way, most) = (&under_way, &most);
+            async move {
+                let now = under_way.fetch_add(1, Ordering::SeqCst) + 1;
+                most.fetch_max(now, Ordering::SeqCst);
+                // Those asked first the slowest to come.
+                tokio::time::sleep(Duration::from_millis(40 - 10 * index as u64)).await;
+                under_way.fetch_sub(1, Ordering::SeqCst);
+                if stage == 9 {
+                    bail!("not served");
+                }
+                Ok(vec![stage as u8, index as u8])
+            }
+        };
+        let instance = |stage, index| Frame::Instance { stage, index };
+        // As a hub answers: its message, then the instances kept.
+        let frames = vec![
+            Frame::Message(vec![7]),
+            instance(0, 0),
+            instance(0, 2),
+            instance(1, 1),
+            instance(1, 3),
+            Frame::Message(vec![8]),
+        ];
+        let each: Vec<Vec<u8>> = each_frame(frames, fetch)
+            .map(Result::unwrap)
+            .collect()
+            .await;
+        let wanted = [[7].as_slice(), &[0, 0], &[0, 2], &[1, 1], &[1, 3], &[8]];
+        assert_eq!(each, wanted);
+        assert_eq!(most.load(Ordering::SeqCst), STAGES * KEPT);
+        // Never more at once.
+        most.store(0, Ordering::SeqCst);
+        let frames: Vec<Frame> = (0..9).map(|i| instance(i % 2, i % 4)).collect();
+        let each: Vec<Vec<u8>> = each_frame(frames, fetch)
+            .map(Result::unwrap)
+            .collect()
+            .await;
+        assert_eq!(each[8], [0, 0]);
+        assert_eq!(most.load(Ordering::SeqCst), DOWNLOADING_AT_ONCE);
+
+        // One not served: those before it taken, then its error.
+        let frames = vec![instance(0, 0), instance(9, 1), instance(0, 2)];
+        let mut each = each_frame(frames, fetch);
+        assert_eq!(each.next().await.unwrap().unwrap(), [0, 0]);
+        assert!(each.next().await.unwrap().is_err());
     }
 }

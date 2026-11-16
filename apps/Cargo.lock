@@ -4144,6 +4144,7 @@ dependencies = [
  "anyhow",
  "axum",
  "bitcoin",
+ "futures-util",
  "hex",
  "hex-literal",
  "licash",

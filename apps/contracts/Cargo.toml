@@ -15,6 +15,7 @@ licash-wallet.workspace = true
 anyhow.workspace = true
 axum = { workspace = true, optional = true }
 bitcoin = { version = "=0.32.102", default-features = false, features = ["std"] }
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 hex = "0.4"
 hex-literal = "0.4"
 rusqlite = { version = "0.40", features = ["bundled"] }
