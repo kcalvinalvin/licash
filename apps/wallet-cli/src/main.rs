@@ -1453,11 +1453,9 @@ async fn pay(
             }
         }
     }
-    // Its change, linked to it until then; and payments due before it.
-    match mailed {
-        Some(_) => drop(unlink(wallet).await),
-        None => drop(tokio::join!(unlink(wallet), deliver_due(wallet, route))),
-    }
+    // Preserve change unlinking, but leave older receipts to delivery runs:
+    // a relay timeout must not hold up a new payment kept at its hub.
+    let _ = unlink(wallet).await;
     Ok(())
 }
 

@@ -36,12 +36,16 @@ holds enough at, and is done once the hub releases the payment: the hub
 keeps it for the payee, who collects it there and tells the payer so
 through the hub, signed with a secret only the two share. A payment not
 collected within an hour is sent to the payee's mailbox on Nostr by
-`deliver`, by `watch`, or after `pay`, `mailbox` and `resume`; one the hub
+`deliver`, by `watch`, or after `mailbox` and `resume`; one the hub
 does not keep is sent there at once. A code naming no mailbox has its
 payment printed to hand over as well. `mailbox` (or `collect`) receives
 what the hubs keep for the wallet and what was sent to its mailbox; `watch`
 keeps receiving and delivering, every `--every` seconds (60), until
-stopped. Only payments that missed the hour appear on Nostr. Where the wallet holds
+stopped. Keep `watch` running, or schedule `deliver`, to send fallback mail
+while the wallet is otherwise idle. `pay` does not mail older receipts:
+a slow relay must not delay a new payment kept at its hub. Its change is
+still unlinked before exit. Payments kept at the hub appear on Nostr only
+if they missed the hour. Where the wallet holds
 too little, it swaps what it lacks there first through a provider
 announced on its hubs' relays, only if given `--max-fee` (all fees,
 swap included): without it, it says what the payment would cost. A code

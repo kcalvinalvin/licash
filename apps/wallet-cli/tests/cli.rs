@@ -1244,6 +1244,38 @@ fn payments_to_codes_are_kept_at_the_hub_and_mailed_only_if_not_collected_within
 }
 
 #[test]
+fn paying_a_code_does_not_wait_for_older_payments_to_be_mailed() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let (_relay, relay) = support::relay(&runtime);
+    let hub = Server::keeping(FEE, vec![relay]);
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, alice_address) = party(dir.path(), "alice", Some(&hub));
+    let (bob, _) = party(dir.path(), "bob", Some(&hub));
+    let funding = serde_json::to_string(&hub.pay(&address(&alice_address), 100)).unwrap();
+    ok(wallet(&alice, &["receive"], Some(&funding)));
+    let code = json(&bob, &["code"])["code"].as_str().unwrap().to_owned();
+    let older = json(&alice, &["pay", &code, "30"]);
+    later(&alice, 3_601);
+
+    // The next payment stays on the hub path even with overdue mail.
+    assert_eq!(json(&alice, &["pay", &code, "20"])["kept"], true);
+    let db = rusqlite::Connection::open(&alice).unwrap();
+    let mailed: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM deliveries WHERE mailed_at IS NOT NULL OR tries > 0",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(mailed, 0, "pay must not contact relays for older receipts");
+
+    // A delivery run still mails the overdue receipt, not the new one.
+    let delivered = json(&alice, &["deliver"]);
+    assert_eq!(delivered["mailed"][0]["id"], older["id"]);
+    assert_eq!(delivered["delivering"], 1);
+}
+
+#[test]
 fn a_wallet_watching_collects_what_it_is_paid_and_mails_what_is_due() {
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let (_relay, relay) = support::relay(&runtime);
