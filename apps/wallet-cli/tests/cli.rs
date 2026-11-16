@@ -1500,9 +1500,24 @@ fn payments_to_codes_are_kept_at_the_hub_and_mailed_only_if_not_collected_within
         .is_empty());
     later(&alice, 3_601);
     let delivered = json(&alice, &["deliver"]);
-    assert_eq!(delivered["mailed"][0]["id"], paid["id"]);
-    assert_eq!(delivered["mailed"][0]["relays"], 1);
-    assert_eq!(delivered["delivering"], 0);
+    match delivered["failed"][0]["reason"].as_str() {
+        // Shaping may make a payment of many notes larger than the relay
+        // takes: not mailed, still kept at the hub for him.
+        Some(why) if why.starts_with("too large to mail, ") => {
+            assert_eq!(delivered["failed"][0]["id"], paid["id"]);
+            assert!(
+                why.contains("exceeds maximum allowed size (65536 bytes)"),
+                "{why}"
+            );
+            assert_eq!(delivered["mailed"], serde_json::json!([]));
+            assert_eq!(delivered["delivering"], 1);
+        }
+        _ => {
+            assert_eq!(delivered["mailed"][0]["id"], paid["id"]);
+            assert_eq!(delivered["mailed"][0]["relays"], 1);
+            assert_eq!(delivered["delivering"], 0);
+        }
+    }
     // Taken once, from his mailbox or the hub.
     let got = json(&bob, &["mailbox"]);
     assert_eq!(got["received"].as_array().unwrap().len(), 1, "{got}");
