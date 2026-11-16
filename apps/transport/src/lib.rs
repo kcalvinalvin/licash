@@ -183,7 +183,7 @@ impl Transport for Http {
         url: &str,
         body: Option<Vec<u8>>,
     ) -> impl std::future::Future<Output = Result<Response, String>> + Send {
-        self.exchange(url, body, MAX_ANSWER, None)
+        self.exchange(url, body, MAX_ANSWER, None, false)
     }
 
     fn download(
@@ -191,25 +191,31 @@ impl Transport for Http {
         url: &str,
         max: usize,
     ) -> impl std::future::Future<Output = Result<Response, String>> + Send {
-        self.exchange(url, None, max, Some(DOWNLOAD_TIMEOUT))
+        // Over Tor on circuits of its own: one carries only so much, and
+        // downloads run beside each other.
+        self.exchange(url, None, max, Some(DOWNLOAD_TIMEOUT), true)
     }
 }
 
 impl Http {
     /// `body` POSTed to `url`, or a GET: an answer of at most `max` bytes,
-    /// in `timeout` if given rather than the client's own.
+    /// in `timeout` if given rather than the client's own. Over Tor on
+    /// circuits of its own if `apart` ([`licash_tor::Tor::apart`]).
     #[cfg_attr(not(feature = "tor"), allow(clippy::infallible_destructuring_match))]
+    #[cfg_attr(not(feature = "tor"), allow(unused_variables))]
     fn exchange(
         &self,
         url: &str,
         body: Option<Vec<u8>>,
         max: usize,
         timeout: Option<Duration>,
+        apart: bool,
     ) -> impl std::future::Future<Output = Result<Response, String>> + Send + '_ {
         let client = match &self.route {
             Route::Direct(client) => client,
             #[cfg(feature = "tor")]
             Route::Tor(tor) => {
+                let tor = if apart { tor.apart() } else { tor.clone() };
                 let url = url.to_owned();
                 let timeout = timeout.unwrap_or(licash_tor::TIMEOUT);
                 let onion = self.onions.route(&url, Instant::now());

@@ -121,6 +121,19 @@ impl Tor {
         })
     }
 
+    /// This client, its streams on circuits of their own, shared with no
+    /// stream of another clone: for a large download, one circuit carrying
+    /// only so much (on the order of 100 KB/s), to run beside others to
+    /// the same host. It keeps no connection of another.
+    pub fn apart(&self) -> Self {
+        Self {
+            client: self.client.clone(),
+            tls: self.tls.clone(),
+            isolation: Arc::default(),
+            kept: Arc::new(Kept::new(KEPT_FOR)),
+        }
+    }
+
     /// GET `url`, or POST `body` to it as JSON, over Tor: its status and
     /// body, of at most `max` bytes.
     pub async fn request(
@@ -627,6 +640,22 @@ mod tests {
         // A host never reached keeps none: its first stream takes one.
         isolation.renew("other.example");
         assert_eq!(isolation.0.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_client_apart_shares_no_circuit_with_the_one_it_is_of() {
+        let dir = tempfile::tempdir().unwrap();
+        let tor = Tor::new(dir.path()).unwrap();
+        let hub = tor.isolation.of("hub.example");
+        let (one, other) = (tor.apart(), tor.apart());
+        let apart = one.isolation.of("hub.example");
+        assert_ne!(apart, hub);
+        assert_ne!(other.isolation.of("hub.example"), apart);
+        // Each its own from then on, the one it is of unchanged.
+        assert_eq!(one.isolation.of("hub.example"), apart);
+        assert_eq!(tor.isolation.of("hub.example"), hub);
+        assert!(!Arc::ptr_eq(&one.kept, &tor.kept));
+        assert!(Arc::ptr_eq(&one.client, &tor.client));
     }
 
     #[tokio::test]
