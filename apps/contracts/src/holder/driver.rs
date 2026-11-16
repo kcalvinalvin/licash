@@ -33,6 +33,10 @@ const PATIENCE: u32 = 900;
 /// over Tor, 10 s without.
 const DOWNLOADING_AT_ONCE: usize = STAGES * KEPT + 1;
 
+/// How many times an instance is asked for before the opening waits for
+/// later: an instance asked again is answered the same.
+const DOWNLOAD_TRIES: u32 = 3;
+
 /// The hub refused what she sent, or she what it sent: the opening goes
 /// no further.
 #[derive(Debug)]
@@ -328,8 +332,18 @@ async fn fetch<T: Transport>(
         .replace("{index}", &index.to_string());
     let url = format!("{hub}{path}");
     let started = Instant::now();
-    let response = wallet.transport().download(&url, MAX_BODY).await;
-    let response = response.map_err(|e| anyhow!("{hub}: {e}"))?;
+    let mut tries = 1;
+    let response = loop {
+        // Each over Tor on new circuits: one may stall, or crawl.
+        match wallet.transport().download(&url, MAX_BODY).await {
+            Ok(response) => break response,
+            Err(e) if tries < DOWNLOAD_TRIES => {
+                tracing::info!(%id, stage, index, tries, "an instance's download failed, again: {e}");
+                tries += 1;
+            }
+            Err(e) => bail!("{hub}: {e}"),
+        }
+    };
     match response.status {
         200 => {
             let (bytes, took) = (response.body.len(), started.elapsed());
@@ -354,7 +368,53 @@ fn failed(hub: &str, status: u16, body: &[u8]) -> anyhow::Error {
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use licash::spend::ChainProfile;
+    use licash_wallet::Response;
+
     use super::*;
+
+    /// A hub whose downloads fail so many times, then are served.
+    struct Failing(AtomicUsize);
+
+    impl Transport for Failing {
+        async fn request(&self, _: &str, _: Option<Vec<u8>>) -> Result<Response, String> {
+            Err("not asked".into())
+        }
+
+        async fn download(&self, url: &str, _: usize) -> Result<Response, String> {
+            let left = self.0.load(Ordering::SeqCst);
+            if left > 0 {
+                self.0.store(left - 1, Ordering::SeqCst);
+                return Err("the answer stalled for 60 s".into());
+            }
+            let body = url.as_bytes().to_vec();
+            Ok(Response { status: 200, body })
+        }
+    }
+
+    #[tokio::test]
+    async fn an_instance_whose_download_failed_is_asked_for_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wallet.sqlite");
+        let regtest = ChainProfile::Core30DefaultRegtest;
+        let failing = Failing(AtomicUsize::new(DOWNLOAD_TRIES as usize - 1));
+        let wallet = Wallet::create(&path, &[7; 32], regtest, failing).unwrap();
+        let (hub, id) = ("http://hub.example", [1; 32]);
+        let got = fetch(&wallet, hub, id, 1, 3).await.unwrap();
+        let path = INSTANCE
+            .replace("{id}", &crate::hex_id(&id))
+            .replace("{stage}", "1")
+            .replace("{index}", "3");
+        assert_eq!(got, format!("{hub}{path}").into_bytes());
+        // Failing every time asked: the opening waits.
+        wallet
+            .transport()
+            .0
+            .store(DOWNLOAD_TRIES as usize, Ordering::SeqCst);
+        let failed = fetch(&wallet, hub, id, 1, 3).await.unwrap_err();
+        assert!(failed.to_string().contains("stalled"), "{failed:#}");
+        assert!(failed.downcast_ref::<Refusal>().is_none());
+    }
 
     #[tokio::test]
     async fn instances_download_together_each_frame_taken_in_order() {
