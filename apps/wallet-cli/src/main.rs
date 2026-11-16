@@ -418,7 +418,9 @@ enum Command {
         yes: bool,
     },
     /// The wallet's contracts, the newest first. With --chain, those
-    /// under way carried on, and where each one's funding stands.
+    /// under way carried on, where each one's funding stands, and what
+    /// each protecting notes would claim of them now, sharing them with
+    /// the others at its hub.
     Contracts {
         #[arg(long, env = "LICASH_WALLET_CHAIN")]
         chain: Option<String>,
