@@ -51,6 +51,24 @@ impl Openings {
             return Err(Refused::bad("an opening starts with an Open"));
         }
         let open = wire::Open::decode(&envelope.body).map_err(Refused::bad)?;
+        {
+            let store = self.store();
+            if store
+                .row(&envelope.id)
+                .map_err(Refused::unavailable)?
+                .is_none()
+                && store.under_way().map_err(Refused::unavailable)? >= MAX_UNDER_WAY
+            {
+                return Err(Refused::unavailable("too many openings under way: later"));
+            }
+        }
+        // Reject cheap size/collateral and policy failures before node RPC.
+        self.timing
+            .covers(opening.quote.cap, open.coin.value.to_sat())
+            .map_err(Refused::bad)?;
+        self.timing
+            .allows(opening.quote.cap, opening.quote.chain.max_headers)
+            .map_err(Refused::bad)?;
         self.terms_of(&opening.quote).await?;
         let confirmed = self.confirmed(open.deposit, &open.coin).await;
         if !confirmed.map_err(Refused::unavailable)? {
@@ -58,11 +76,6 @@ impl Openings {
                 "her deposit is no confirmed coin of the chain as she says",
             ));
         }
-        // No small coin locks much of the hub's.
-        let coin = open.coin.value.to_sat();
-        self.timing
-            .covers(opening.quote.cap, coin)
-            .map_err(Refused::bad)?;
         let start = Start::New {
             quote: Box::new(opening.quote),
             deposit: open.deposit,

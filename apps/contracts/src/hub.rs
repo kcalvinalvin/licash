@@ -19,12 +19,14 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use anyhow::{ensure, Context as _, Result};
-use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, Path as UrlPath, Query, State};
+use axum::body::{Body, Bytes};
+use axum::extract::{DefaultBodyLimit, Path as UrlPath, Query, Request, State};
 use axum::http::StatusCode;
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
+use futures_util::StreamExt;
 use licash::note::Keyset;
 use licash::spend::ChainProfile;
 use licash_chain_client::Source;
@@ -366,13 +368,43 @@ fn answer(
 /// The routes of `openings`, at [`QUOTE`], [`OPEN`], [`STEP`] and
 /// [`INSTANCE`].
 pub fn router(openings: Arc<Openings>) -> Router {
+    // Separate budgets let existing openings progress while new opens or
+    // instance downloads are saturated. Four downloads preserve the
+    // holder's normal parallel fetch. Body permits precede extraction and
+    // last until the response body is dropped, not merely constructed.
+    let budget =
+        |count| middleware::from_fn_with_state(Arc::new(tokio::sync::Semaphore::new(count)), admit);
     Router::new()
-        .route(QUOTE, get(quote))
-        .route(OPEN, post(open))
-        .route(STEP, post(step))
-        .route(INSTANCE, get(instance))
+        .route(QUOTE, get(quote).layer(budget(2)))
+        .route(OPEN, post(open).layer(budget(2)))
+        .route(STEP, post(step).layer(budget(2)))
+        .route(INSTANCE, get(instance).layer(budget(4)))
         .layer(DefaultBodyLimit::max(MAX_BODY))
         .with_state(openings)
+}
+
+async fn admit(
+    State(limit): State<Arc<tokio::sync::Semaphore>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let Ok(permit) = limit.try_acquire_owned() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "too many contract requests: retry later",
+        )
+            .into_response();
+    };
+    let response = match tokio::time::timeout(Duration::from_secs(300), next.run(request)).await {
+        Ok(response) => response,
+        Err(_) => return StatusCode::REQUEST_TIMEOUT.into_response(),
+    };
+    response.map(|body| {
+        Body::from_stream(body.into_data_stream().map(move |chunk| {
+            let _held = &permit;
+            chunk
+        }))
+    })
 }
 
 impl IntoResponse for Refused {
@@ -434,6 +466,45 @@ async fn instance(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn admission_precedes_body_buffering_and_lasts_through_response_delivery() {
+        use axum::http::Request as HttpRequest;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let limit = Arc::new(tokio::sync::Semaphore::new(1));
+        let app = Router::new()
+            .route("/", post(|_: Bytes| async { "ok" }))
+            .layer(middleware::from_fn_with_state(limit.clone(), admit));
+        let response = app
+            .clone()
+            .oneshot(HttpRequest::post("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(limit.available_permits(), 0);
+        let polled = Arc::new(AtomicUsize::new(0));
+        let seen = polled.clone();
+        let body = Body::from_stream(futures_util::stream::poll_fn(move |_| {
+            seen.fetch_add(1, Ordering::SeqCst);
+            std::task::Poll::<Option<Result<Bytes, std::io::Error>>>::Pending
+        }));
+        let refused = app
+            .clone()
+            .oneshot(HttpRequest::post("/").body(body).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(polled.load(Ordering::SeqCst), 0);
+        drop(response);
+        assert_eq!(limit.available_permits(), 1);
+        let response = app
+            .oneshot(HttpRequest::post("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
 
     /// A hub's opening at Funded, as `licash_contract`'s golden test keeps
     /// it: of a mock opening on regtest.
