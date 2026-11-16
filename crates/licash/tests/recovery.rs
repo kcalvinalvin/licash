@@ -28,8 +28,8 @@ use licash::{
     note::{Derivation, HoldRoot, IssuerKeys, Keyset, Note},
     opening::{FrozenPrefix, GraphOutput, RequestLeaf},
     recovery::{
-        counter_disclosures, prove_counter, prove_holder, settle, Evidence, HolderWitness,
-        ItemWitness, Publication, Response, SourceWitness,
+        self, counter_disclosures, prove_counter, prove_holder, settle, Evidence, Filing,
+        HolderWitness, ItemWitness, Publication, Response, SourceWitness,
     },
     request::{Request, Signer},
     source::Certificate,
@@ -1506,5 +1506,590 @@ fn input_claim_conflicts_preserve_certified_outputs_but_retire_all_own_outputs()
         };
         let c = prove_counter(&o.base, &o.d, r, here, &[evidence], None).unwrap();
         assert_eq!((c.mask, c.owed), (0b10, 4));
+    }
+}
+
+// The hub-proves model: the holder files P with its public witness and
+// proves nothing; the Hub's statement (`recovery::owed`) decides what the
+// claim is owed.
+
+/// The filing's body as posted: one OP_RETURN of a transaction, read back.
+fn filed(filing: &Filing) -> Vec<u8> {
+    let tx = Transaction {
+        version: transaction::Version::TWO,
+        lock_time: absolute::LockTime::ZERO,
+        input: vec![TxIn::default()],
+        output: vec![TxOut {
+            value: Amount::ZERO,
+            script_pubkey: ScriptBuf::from_bytes(filing.script().unwrap()),
+        }],
+    };
+    let parsed = chain::Transaction::parse(&serialize(&tx), 100_000).unwrap();
+    Filing::body(&parsed).unwrap().to_vec()
+}
+
+/// `bytes` with the unique occurrence of `inside` replaced by `with`.
+fn swap(bytes: &[u8], inside: &[u8], with: &[u8]) -> Vec<u8> {
+    let at: Vec<_> = bytes
+        .windows(inside.len())
+        .enumerate()
+        .filter(|(_, w)| *w == inside)
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(at.len(), 1);
+    [&bytes[..at[0]], with, &bytes[at[0] + inside.len()..]].concat()
+}
+
+/// `bytes` with the last byte of the unique occurrence of `inside` flipped.
+fn flip(bytes: &[u8], inside: &[u8]) -> Vec<u8> {
+    let mut with = inside.to_vec();
+    *with.last_mut().unwrap() ^= 1;
+    swap(bytes, inside, &with)
+}
+
+#[test]
+fn the_hub_decides_what_a_filed_claim_is_owed() {
+    let o = open();
+    let keyset = o.base.parts().keyset.clone();
+    let hold = hold();
+    let (chain, _) = activated_chain();
+    let ds: Vec<_> = (0..32).map(|i| derive(SPEND, &hold, 4, 23, i)).collect();
+    let notes: Vec<_> = ds.iter().map(|d| mint(&o.issuer, &keyset, d)).collect();
+    // After her backup, the holder paid Bob 64 sats from 16 of the notes.
+    let owners: Vec<_> = (0..16).map(|i| owner(SPEND, 23, i)).collect();
+    let payment = spend(
+        &o,
+        &notes[..16],
+        &owners,
+        (0..8).map(|i| bob(8, i)).collect(),
+    );
+    let items = ds
+        .iter()
+        .map(|d| Item::Settled(d.message().clone()))
+        .collect();
+    let p = Publication::sign(
+        claim(&o, items, vec![], vec![], &ds, 128),
+        &hold_keys(&ds),
+        LIMIT,
+    )
+    .unwrap();
+    let request = Request {
+        amount: 128,
+        claim_digest: *p.claim().digest(),
+    };
+    let filing = Filing::new(
+        p,
+        recovery::Witness {
+            notes: notes.clone(),
+            sources: vec![],
+            activations: vec![],
+        },
+    )
+    .unwrap();
+    let bytes = filed(&filing);
+    assert_eq!(bytes, filing.to_bytes());
+    assert!(bytes.len() < 25_000, "{} bytes", bytes.len());
+    let owed = |request: &Request, bytes: &[u8], evidence: &[Evidence]| {
+        recovery::owed(&o.base, &o.d, request, bytes, evidence, &chain)
+    };
+
+    // Unanswered by evidence, the claim is owed in full: nothing to prove.
+    let whole = owed(&request, &bytes, &[]).unwrap();
+    assert_eq!((whole.owed, whole.mask, whole.ineligible), (128, 0, None));
+    // The stale backup: the Hub's evidence of the spend voids 16 items, as
+    // in a counter.
+    let spent = Evidence::Spend {
+        signed: payment,
+        notes: notes[..16].to_vec(),
+        unlock: None,
+    };
+    let stale = owed(&request, &bytes, std::slice::from_ref(&spent)).unwrap();
+    assert_eq!((stale.owed, stale.mask), (64, 0xffff));
+    let counter = prove_counter(
+        &o.base,
+        &o.d,
+        &request,
+        filing.publication(),
+        std::slice::from_ref(&spent),
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        (counter.owed, counter.mask, counter.disclosure),
+        (stale.owed, stale.mask, stale.disclosure)
+    );
+    // A Q signature over any other claim, in any contract, voids its item.
+    let other = hold::Context {
+        final_digest: [1; 32],
+        deposit: [2; 36],
+        amount: 4,
+        claim_digest: [3; 32],
+    };
+    let record = hold::Envelope::sign(other, &hold_keys(&ds[20..21]), LIMIT)
+        .unwrap()
+        .records()[0]
+        .clone();
+    let second = Evidence::SecondClaim {
+        context: other,
+        record: record.clone(),
+    };
+    let both = owed(&request, &bytes, &[spent.clone(), second]).unwrap();
+    assert_eq!((both.owed, both.mask), (60, 0xffff | 1 << 20));
+
+    // The Hub's errors: it can't prove with evidence that voids nothing,
+    // with this claim cited as its own second claim, or on another chain.
+    let unrelated = derive(SPEND, &hold, 4, 23, 40);
+    let unrelated_note = mint(&o.issuer, &keyset, &unrelated);
+    let unrelated = Evidence::Spend {
+        signed: spend(
+            &o,
+            std::slice::from_ref(&unrelated_note),
+            &[owner(SPEND, 23, 40)],
+            vec![bob(4, 9)],
+        ),
+        notes: vec![unrelated_note],
+        unlock: None,
+    };
+    assert!(owed(&request, &bytes, &[unrelated]).is_err());
+    let same = Evidence::SecondClaim {
+        context: filing.publication().claim().hold_context(),
+        record,
+    };
+    assert!(owed(&request, &bytes, &[same]).is_err());
+    let signet = Checkpoint::genesis(ChainProfile::Core30Signet).unwrap();
+    let elsewhere = Chain::verify(signet.clone(), &signet.commitment(), vec![], 100).unwrap();
+    assert!(recovery::owed(&o.base, &o.d, &request, &bytes, &[], &elsewhere).is_err());
+
+    // A filing for another request is the holder's error: owed nothing, which
+    // the Hub shows with no evidence (and may attach none).
+    let wrong = Request {
+        amount: 127,
+        ..request
+    };
+    let nothing = owed(&wrong, &bytes, &[]).unwrap();
+    assert_eq!((nothing.owed, nothing.mask), (0, 0));
+    assert!(nothing.ineligible.is_some());
+    assert_eq!(
+        nothing.disclosure,
+        counter_disclosures(&[]).unwrap().digest()
+    );
+    assert!(owed(&wrong, &bytes, &[spent]).is_err());
+}
+
+#[test]
+fn a_note_is_claimed_in_any_contract_its_hold_key_designates() {
+    let o = open();
+    let keyset = o.base.parts().keyset.clone();
+    let (chain, _) = activated_chain();
+    // Notes of a wallet whose spend root (41) isn't this contract's.
+    let ds: Vec<_> = (0..2).map(|i| derive(41, &hold(), 4, 23, i)).collect();
+    let notes: Vec<_> = ds.iter().map(|d| mint(&o.issuer, &keyset, d)).collect();
+    let items: Vec<_> = ds
+        .iter()
+        .map(|d| Item::Settled(d.message().clone()))
+        .collect();
+    let unsigned = claim(&o, items, vec![], vec![], &ds, 8);
+    let p = Publication::sign(unsigned.clone(), &hold_keys(&ds), LIMIT).unwrap();
+    let request = Request {
+        amount: 8,
+        claim_digest: *p.claim().digest(),
+    };
+    // The holder-proves model refuses them: their owner keys don't derive
+    // from Base's spend root.
+    let witness = HolderWitness {
+        items: ds
+            .iter()
+            .zip(&notes)
+            .map(|(d, note)| ItemWitness::Settled {
+                note: Box::new(note.clone()),
+                ownership: d.ownership(),
+            })
+            .collect(),
+        sources: vec![],
+        chain: None,
+        activations: vec![],
+    };
+    assert!(prove_holder(&o.base, &o.d, &request, &p, &witness).is_err());
+    // Filed, their Q signatures designate this contract, and they are owed.
+    let signatures: Vec<_> = p.envelope().records().iter().map(|r| r.sig.0).collect();
+    let filing = Filing::new(
+        p,
+        recovery::Witness {
+            notes,
+            sources: vec![],
+            activations: vec![],
+        },
+    )
+    .unwrap();
+    let bytes = filed(&filing);
+    let owed = |bytes: &[u8]| recovery::owed(&o.base, &o.d, &request, bytes, &[], &chain).unwrap();
+    assert_eq!((owed(&bytes).owed, owed(&bytes).ineligible), (8, None));
+
+    // Only the notes' Q keys designate. Another hold root (a payer's, say,
+    // who knows the outputs it made) doesn't derive their Q secrets, a key
+    // that isn't Q's secret can't sign P, and a forged Q signature leaves the
+    // claim owed nothing.
+    let payer = HoldRoot::from_seed(&[9; 32]).unwrap();
+    assert!(ds.iter().all(|d| d.hold_key(&payer).is_err()));
+    let theirs: Vec<_> = ds
+        .iter()
+        .map(|d| (d.message().clone(), crypto::ScalarBytes([7; 32])))
+        .collect();
+    assert!(Publication::sign(unsigned, &theirs, LIMIT).is_err());
+    for sig in signatures {
+        let forged = owed(&flip(&bytes, &sig));
+        assert_eq!(forged.owed, 0);
+        assert!(forged.ineligible.is_some());
+    }
+}
+
+#[test]
+fn fabricated_or_malformed_filings_are_owed_nothing() {
+    let o = open();
+    let keyset = o.base.parts().keyset.clone();
+    let (chain, _) = activated_chain();
+    let ds: Vec<_> = (0..3).map(|i| derive(SPEND, &hold(), 4, 23, i)).collect();
+    let notes: Vec<_> = ds.iter().map(|d| mint(&o.issuer, &keyset, d)).collect();
+    let items: Vec<_> = ds
+        .iter()
+        .map(|d| Item::Settled(d.message().clone()))
+        .collect();
+    let p = Publication::sign(
+        claim(&o, items, vec![], vec![], &ds, 12),
+        &hold_keys(&ds),
+        LIMIT,
+    )
+    .unwrap();
+    let request = Request {
+        amount: 12,
+        claim_digest: *p.claim().digest(),
+    };
+    let file = |notes: Vec<Note>| {
+        Filing::new(
+            p.clone(),
+            recovery::Witness {
+                notes,
+                sources: vec![],
+                activations: vec![],
+            },
+        )
+    };
+    let bytes = filed(&file(notes.clone()).unwrap());
+    let owed = |bytes: &[u8], evidence: &[Evidence]| {
+        recovery::owed(&o.base, &o.d, &request, bytes, evidence, &chain)
+    };
+    assert_eq!(owed(&bytes, &[]).unwrap().owed, 12);
+    let nothing = |bytes: &[u8]| {
+        let o = owed(bytes, &[]).unwrap();
+        assert_eq!((o.owed, o.mask), (0, 0));
+        assert!(o.ineligible.is_some());
+    };
+
+    // A note another issuer signed, or the issuer's signature forged.
+    let other = IssuerKeys::random(3).unwrap();
+    let mut fake = notes.clone();
+    fake[1] = mint(&other, &other.keyset().unwrap(), &ds[1]);
+    nothing(&file(fake).unwrap().to_bytes());
+    nothing(&flip(&bytes, &notes[1].signature().0));
+    let borrowed = swap(&bytes, &notes[1].signature().0, &notes[0].signature().0);
+    let reason = owed(&borrowed, &[]).unwrap().ineligible.unwrap();
+    assert!(!reason.contains("point"), "{reason}");
+    nothing(&borrowed);
+    // A filing that doesn't decode: cut short, extended, not a filing (P
+    // alone), or nothing at all.
+    for n in [0, 9, bytes.len() / 2, bytes.len() - 1] {
+        nothing(&bytes[..n]);
+    }
+    let mut trailing = bytes.clone();
+    trailing.push(0);
+    nothing(&trailing);
+    nothing(&p.to_bytes());
+    // A witness that doesn't line up with P can't be filed.
+    assert!(file(notes[..2].to_vec()).is_err());
+    assert!(file(vec![notes[1].clone(), notes[0].clone(), notes[2].clone()]).is_err());
+
+    // Evidence against an ineligible claim is the Hub's error.
+    let spent = Evidence::Spend {
+        signed: spend(&o, &notes[..1], &[owner(SPEND, 23, 0)], vec![bob(4, 0)]),
+        notes: notes[..1].to_vec(),
+        unlock: None,
+    };
+    assert_eq!(owed(&bytes, std::slice::from_ref(&spent)).unwrap().owed, 8);
+    assert!(owed(&trailing, &[spent]).is_err());
+}
+
+#[test]
+fn pending_items_are_eligible_by_their_sources_public_bodies() {
+    let o = open();
+    let keyset = o.base.parts().keyset.clone();
+    let hold = hold();
+    let (chain, activation) = activated_chain();
+    // Bob pays the holder 4 sats under an issuer-certified timed lock.
+    let bob_hold = HoldRoot::from_seed(&[9; 32]).unwrap();
+    let bob_note = mint(&o.issuer, &keyset, &derive(41, &bob_hold, 4, 29, 0));
+    let pay = derive(SPEND, &hold, 4, 61, 0);
+    let lock = TimedLock::new(terms(), vec![bob(4, 1)]).unwrap();
+    let body = Proposal::new(
+        &keyset,
+        std::slice::from_ref(&bob_note),
+        point(43),
+        vec![Output::from_derivation(&pay).unwrap()],
+        Some(lock),
+    )
+    .unwrap();
+    let bob_signed = SignedProposal::sign(
+        &keyset,
+        body,
+        std::slice::from_ref(&bob_note),
+        Authorization::Plain,
+        &[owner(41, 29, 0)],
+    )
+    .unwrap();
+    let cert =
+        Certificate::attest(&o.issuer, &bob_signed, std::slice::from_ref(&bob_note)).unwrap();
+    let bob_id = bob_signed.proposal().id();
+    // The holder locked one of her own notes to Carol and claims its refund.
+    let own = derive(SPEND, &hold, 4, 23, 40);
+    let own_note = mint(&o.issuer, &keyset, &own);
+    let refund = derive(SPEND, &hold, 4, 67, 0);
+    let carol = derive(53, &HoldRoot::from_seed(&[11; 32]).unwrap(), 4, 31, 0);
+    let lock = TimedLock::new(terms(), vec![Output::from_derivation(&refund).unwrap()]).unwrap();
+    let body = Proposal::new(
+        &keyset,
+        std::slice::from_ref(&own_note),
+        point(47),
+        vec![Output::from_derivation(&carol).unwrap()],
+        Some(lock),
+    )
+    .unwrap();
+    let own_signed = SignedProposal::sign(
+        &keyset,
+        body,
+        std::slice::from_ref(&own_note),
+        Authorization::Plain,
+        &[owner(SPEND, 23, 40)],
+    )
+    .unwrap();
+    let own_id = own_signed.proposal().id();
+    let settled = derive(SPEND, &hold, 4, 23, 0);
+    let settled_note = mint(&o.issuer, &keyset, &settled);
+
+    let items = |refund_blinding| {
+        vec![
+            Item::Settled(settled.message().clone()),
+            Item::Pending {
+                message: pay.message().clone(),
+                source: bob_id,
+                branch: Branch::Pay,
+                index: 0,
+                blinding: *pay.blinding(),
+                preimage: Some(Z),
+            },
+            Item::Pending {
+                message: refund.message().clone(),
+                source: own_id,
+                branch: Branch::Refund,
+                index: 0,
+                blinding: refund_blinding,
+                preimage: None,
+            },
+        ]
+    };
+    let sources = |own_terms| {
+        vec![
+            Source::Admitted(cert.clone()),
+            Source::OwnInputs {
+                id: own_id,
+                inputs: vec![own_note.message().identifier().unwrap()],
+                terms: own_terms,
+            },
+        ]
+    };
+    // The sources' bodies, in P's (source-id) order.
+    let mut bodies = vec![
+        (
+            bob_id,
+            SourceWitness::Certified {
+                proposal: bob_signed.proposal().clone(),
+                signatures: bob_signed.signatures().to_vec(),
+            },
+        ),
+        (
+            own_id,
+            SourceWitness::Signed {
+                signed: own_signed,
+                notes: vec![own_note.clone()],
+            },
+        ),
+    ];
+    bodies.sort_by_key(|(id, _)| *id);
+    let bodies: Vec<_> = bodies.into_iter().map(|(_, w)| w).collect();
+    let signers = [settled.clone(), pay.clone(), refund.clone(), own];
+    let file = |items, sources, activations, inclusions| {
+        let p = Publication::sign(
+            claim(&o, items, sources, activations, &signers, 12),
+            &hold_keys(&signers),
+            LIMIT,
+        )
+        .unwrap();
+        let request = Request {
+            amount: 12,
+            claim_digest: *p.claim().digest(),
+        };
+        let filing = Filing::new(
+            p,
+            recovery::Witness {
+                notes: vec![settled_note.clone()],
+                sources: bodies.clone(),
+                activations: inclusions,
+            },
+        )
+        .unwrap();
+        (filed(&filing), request)
+    };
+    let owed = |(bytes, request): &(Vec<u8>, Request), evidence: &[Evidence], chain: &Chain| {
+        recovery::owed(&o.base, &o.d, request, bytes, evidence, chain)
+    };
+    let nothing = |filed: &(Vec<u8>, Request), chain: &Chain| {
+        let o = owed(filed, &[], chain).unwrap();
+        assert_eq!(o.owed, 0);
+        assert!(o.ineligible.is_some());
+    };
+    let record = ActivationRecord {
+        source: bob_id,
+        reference: activation.reference,
+    };
+    let preimage = Evidence::PayPreimage {
+        source: own_id,
+        preimage: Z,
+    };
+
+    // Activated certified Pay: eligible, and expiry can't void it; the Pay
+    // preimage voids the holder's own refund, and is disclosed.
+    let activated = file(
+        items(*refund.blinding()),
+        sources(terms()),
+        vec![record],
+        vec![activation.inclusion.clone()],
+    );
+    assert_eq!(owed(&activated, &[], &chain).unwrap().owed, 12);
+    assert!(owed(&activated, &[Evidence::Expired { source: bob_id }], &chain).is_err());
+    let c = owed(&activated, std::slice::from_ref(&preimage), &chain).unwrap();
+    assert_eq!((c.mask, c.owed), (0b100, 8));
+    assert_eq!(
+        c.disclosure,
+        counter_disclosures(&[preimage]).unwrap().digest()
+    );
+    // Without an advertised activation, expiry voids the Pay.
+    let plain = file(items(*refund.blinding()), sources(terms()), vec![], vec![]);
+    let c = owed(&plain, &[Evidence::Expired { source: bob_id }], &chain).unwrap();
+    assert_eq!((c.mask, c.owed), (0b010, 8));
+
+    // What the holder can get wrong of a pending item leaves the claim owed
+    // nothing: an activation the statement's chain doesn't bury at its
+    // terms' depth, or that isn't what it says; an output the source doesn't
+    // make; source metadata its body doesn't match.
+    let short = Chain::verify(
+        chain.checkpoint().clone(),
+        &chain.checkpoint().commitment(),
+        (1..=2).map(|h| *chain.header(h).unwrap()).collect(),
+        100,
+    )
+    .unwrap();
+    nothing(&activated, &short);
+    let elsewhere = ActivationRecord {
+        source: bob_id,
+        reference: ActivationRef {
+            output: 1,
+            ..activation.reference
+        },
+    };
+    nothing(
+        &file(
+            items(*refund.blinding()),
+            sources(terms()),
+            vec![elsewhere],
+            vec![activation.inclusion.clone()],
+        ),
+        &chain,
+    );
+    nothing(
+        &file(items(*pay.blinding()), sources(terms()), vec![], vec![]),
+        &chain,
+    );
+    let cp = Checkpoint::genesis(ChainProfile::Core30DefaultRegtest).unwrap();
+    let later = TimedTerms::new(
+        cp.profile(),
+        cp.commitment(),
+        5,
+        3,
+        sha256::Hash::hash(&Z).to_byte_array(),
+    )
+    .unwrap();
+    nothing(
+        &file(items(*refund.blinding()), sources(later), vec![], vec![]),
+        &chain,
+    );
+}
+
+#[test]
+fn a_filed_pay_of_a_lock_timed_on_another_checkpoint_is_owed_nothing() {
+    let o = open();
+    let keyset = o.base.parts().keyset.clone();
+    let (chain, _) = activated_chain();
+    let owed = |terms: TimedTerms| {
+        let payer = HoldRoot::from_seed(&[9; 32]).unwrap();
+        let note = mint(&o.issuer, &keyset, &derive(41, &payer, 4, 29, 0));
+        let notes = std::slice::from_ref(&note);
+        let pay = derive(SPEND, &hold(), 4, 61, 0);
+        let lock = TimedLock::new(terms, vec![bob(4, 1)]).unwrap();
+        let outputs = vec![Output::from_derivation(&pay).unwrap()];
+        let body = Proposal::new(&keyset, notes, point(43), outputs, Some(lock)).unwrap();
+        let owners = [owner(41, 29, 0)];
+        let signed =
+            SignedProposal::sign(&keyset, body, notes, Authorization::Plain, &owners).unwrap();
+        let cert = Certificate::attest(&o.issuer, &signed, notes).unwrap();
+        let items = vec![Item::Pending {
+            message: pay.message().clone(),
+            source: signed.proposal().id(),
+            branch: Branch::Pay,
+            index: 0,
+            blinding: *pay.blinding(),
+            preimage: Some(Z),
+        }];
+        let signers = [pay.clone()];
+        let unsigned = claim(&o, items, vec![Source::Admitted(cert)], vec![], &signers, 4);
+        let p = Publication::sign(unsigned, &hold_keys(&signers), LIMIT).unwrap();
+        let request = Request {
+            amount: 4,
+            claim_digest: *p.claim().digest(),
+        };
+        let filing = Filing::new(
+            p,
+            recovery::Witness {
+                notes: vec![],
+                sources: vec![SourceWitness::Certified {
+                    proposal: signed.proposal().clone(),
+                    signatures: signed.signatures().to_vec(),
+                }],
+                activations: vec![],
+            },
+        )
+        .unwrap();
+        recovery::owed(&o.base, &o.d, &request, &filed(&filing), &[], &chain).unwrap()
+    };
+    let here = terms();
+    assert_eq!(
+        (owed(here.clone()).owed, owed(here.clone()).ineligible),
+        (4, None)
+    );
+    let hash = *here.hash();
+    let elsewhere = TimedTerms::new(here.profile(), [7; 32], 4, 3, hash).unwrap();
+    let mainnet = TimedTerms::new(ChainProfile::Core30Mainnet, *here.checkpoint(), 4, 3, hash);
+    for terms in [elsewhere, mainnet.unwrap()] {
+        let refused = owed(terms);
+        assert_eq!(refused.owed, 0);
+        let reason = refused.ineligible.unwrap();
+        assert!(reason.contains("another checkpoint"), "{reason}");
     }
 }
