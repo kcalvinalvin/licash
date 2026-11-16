@@ -94,6 +94,8 @@ pub struct Server {
     tweaks: Option<Arc<Tweaks>>,
     /// The mailbox relays its info names.
     relays: Vec<String>,
+    /// Where it keeps payments for their payees, if it does.
+    inbox: Option<Arc<licash_hub_service::inbox::Inbox>>,
     backend: esplora::Shared,
     addr: SocketAddr,
     seed: PathBuf,
@@ -130,6 +132,19 @@ impl Server {
     /// [`Server::start`], naming `relays` for its wallets' mailboxes.
     pub fn with_relays(fee: Fee, relays: Vec<String>) -> Self {
         Self::started(fee, false, false, false, relays)
+    }
+
+    /// [`Server::with_relays`], keeping the payments its wallets ask it to
+    /// for their payees, as hubs do.
+    pub fn keeping(fee: Fee, relays: Vec<String>) -> Self {
+        let mut server = Self::with_relays(fee, relays);
+        let path = server._dir.path().join("inbox.sqlite");
+        server.inbox = Some(Arc::new(
+            licash_hub_service::inbox::Inbox::open(&path).unwrap(),
+        ));
+        server.down();
+        server.up();
+        server
     }
 
     /// [`Server::with_relays`], of a response window of [`SOURCE_WINDOW`]:
@@ -220,6 +235,7 @@ impl Server {
             deposits,
             tweaks,
             relays,
+            inbox: None,
             backend,
             addr: "127.0.0.1:0".parse().unwrap(),
             seed,
@@ -399,6 +415,7 @@ impl Server {
         let deposits = self.deposits.as_ref().map(|(gateway, _)| gateway.clone());
         let tweaks = self.tweaks.clone();
         let relays = self.relays.clone();
+        let inbox = self.inbox.clone();
         let thread = std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -416,7 +433,7 @@ impl Server {
                             gateway,
                             deposits,
                             tweaks,
-                            inbox: None,
+                            inbox,
                             relays,
                             contracts: None,
                             swaps: None,

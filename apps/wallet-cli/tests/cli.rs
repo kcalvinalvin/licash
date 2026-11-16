@@ -1167,6 +1167,145 @@ fn owners_pay_payment_codes_through_mailboxes_or_by_hand() {
     );
 }
 
+/// Time passes for the payments `file` delivers: `by` seconds.
+fn later(file: &Path, by: i64) {
+    let db = rusqlite::Connection::open(file).unwrap();
+    db.execute_batch(&format!(
+        "UPDATE deliveries SET kept_at = kept_at - {by}, mail_at = mail_at - {by};
+         UPDATE sends SET created_at = created_at - {by}, done_at = done_at - {by};"
+    ))
+    .unwrap();
+}
+
+#[test]
+fn payments_to_codes_are_kept_at_the_hub_and_mailed_only_if_not_collected_within_the_hour() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let (_relay, relay) = support::relay(&runtime);
+    let hub = Server::keeping(FEE, vec![relay]);
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, alice_address) = party(dir.path(), "alice", Some(&hub));
+    let (bob, _) = party(dir.path(), "bob", Some(&hub));
+    let funding = serde_json::to_string(&hub.pay(&address(&alice_address), 100)).unwrap();
+    ok(wallet(&alice, &["receive"], Some(&funding)));
+    let code = json(&bob, &["code"])["code"].as_str().unwrap().to_owned();
+
+    // Alice pays: kept at the hub, not yet collected, nothing mailed.
+    let output = wallet(&alice, &["pay", &code, "30"], None);
+    let said = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        said.contains("Kept at the hub, not yet collected"),
+        "{said}"
+    );
+    assert_eq!(
+        ok(output),
+        "kept at hub      30 sat\nfee              up to 1 sat (3.3%)\n"
+    );
+    assert_eq!(available(&alice), (69, 0));
+    let delivered = json(&alice, &["deliver"]);
+    assert_eq!(delivered["mailed"], serde_json::json!([]));
+    assert_eq!(delivered["delivering"], 1);
+
+    // Bob collects it there: Alice hears so through the hub, and mails
+    // nothing, even once the hour is over.
+    let got = json(&bob, &["collect"]);
+    assert_eq!(got["received"][0]["amount"], 30);
+    assert_eq!(available(&bob), (30, 0));
+    assert_eq!(json(&bob, &["mailbox"])["received"], serde_json::json!([]));
+    later(&alice, 3_601);
+    let delivered = json(&alice, &["deliver"]);
+    assert_eq!(delivered["mailed"], serde_json::json!([]));
+    assert_eq!(delivered["delivering"], 0);
+    assert_eq!(
+        ok(wallet(&alice, &["deliver"], None)).trim(),
+        "nothing to deliver"
+    );
+
+    // One he does not collect within the hour is mailed to his mailbox.
+    let paid = json(&alice, &["pay", &code, "20"]);
+    assert_eq!(
+        (paid["amount"].as_u64(), paid["kept"].as_bool()),
+        (Some(20), Some(true))
+    );
+    assert!(json(&alice, &["deliver"])["mailed"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    later(&alice, 3_601);
+    let delivered = json(&alice, &["deliver"]);
+    assert_eq!(delivered["mailed"][0]["id"], paid["id"]);
+    assert_eq!(delivered["mailed"][0]["relays"], 1);
+    assert_eq!(delivered["delivering"], 0);
+    // Taken once, from his mailbox or the hub.
+    let got = json(&bob, &["mailbox"]);
+    assert_eq!(got["received"].as_array().unwrap().len(), 1, "{got}");
+    assert_eq!(got["received"][0]["amount"], 20);
+    assert_eq!(json(&bob, &["mailbox"])["received"], serde_json::json!([]));
+    assert_eq!(available(&bob), (50, 0));
+}
+
+#[test]
+fn a_wallet_watching_collects_what_it_is_paid_and_mails_what_is_due() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let (_relay, relay) = support::relay(&runtime);
+    let hub = Server::keeping(FEE, vec![relay]);
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, alice_address) = party(dir.path(), "alice", Some(&hub));
+    let (bob, _) = party(dir.path(), "bob", Some(&hub));
+    let funding = serde_json::to_string(&hub.pay(&address(&alice_address), 100)).unwrap();
+    ok(wallet(&alice, &["receive"], Some(&funding)));
+    let code = json(&bob, &["code"])["code"].as_str().unwrap().to_owned();
+    let paid = json(&alice, &["pay", &code, "30"]);
+    later(&alice, 3_601);
+
+    let watching = |file: &Path| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_licash-wallet"))
+            .args([
+                "--wallet",
+                file.to_str().unwrap(),
+                "--json",
+                "watch",
+                "--every",
+                "1",
+            ])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap()
+    };
+    // Stopped if it says too little: its output ends.
+    let watchdog = |child: &std::process::Child| {
+        let pid = child.id().to_string();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(60));
+            let _ = std::process::Command::new("kill")
+                .args(["-9", &pid])
+                .status();
+        });
+    };
+    // Each says what it did, a line each: Alice mails it, Bob takes it.
+    let lines = |child: &mut std::process::Child, n: usize| {
+        use std::io::BufRead;
+        let out = std::io::BufReader::new(child.stdout.take().unwrap());
+        let lines: Vec<Value> = out
+            .lines()
+            .take(n)
+            .map(|l| serde_json::from_str(&l.unwrap()).unwrap())
+            .collect();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        lines
+    };
+    let mut alice_watching = watching(&alice);
+    watchdog(&alice_watching);
+    let said = lines(&mut alice_watching, 1);
+    assert_eq!(said[0]["mailed"]["id"], paid["id"]);
+    let mut bob_watching = watching(&bob);
+    watchdog(&bob_watching);
+    let said = lines(&mut bob_watching, 1);
+    assert_eq!(said[0]["received"]["amount"], 30);
+    assert_eq!(available(&bob), (30, 0));
+}
+
 /// The fallback and silent payment addresses of `file`'s code.
 fn on_bitcoin(file: &Path) -> (String, String, String) {
     let text = json(file, &["code", "--sp"])["code"]
