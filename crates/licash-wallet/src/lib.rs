@@ -27,6 +27,7 @@
 //! over TCP or Tor, or a test. Its seed alone does not restore its notes:
 //! back up its file.
 
+mod backup;
 mod claims;
 mod code;
 mod coins;

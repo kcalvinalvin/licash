@@ -161,6 +161,22 @@ pub(super) struct Store {
 }
 
 impl Store {
+    /// Snapshot committed rows, including the WAL. The caller freezes the
+    /// holder driver while also copying its kept instance files.
+    pub fn snapshot(&self, to: &Path) -> Result<()> {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let file = options.open(to)?;
+        self.c.backup(rusqlite::MAIN_DB, to, None)?;
+        file.sync_all()?;
+        Ok(())
+    }
+
     /// The contracts in `dir`, if any were ever opened there.
     pub fn existing(dir: &Path) -> Result<Option<Self>> {
         if !dir.join("contracts.sqlite").exists() {
@@ -373,6 +389,13 @@ impl Store {
         std::fs::rename(&aside, &path)?;
         std::fs::File::open(&dir)?.sync_all()?;
         Ok(())
+    }
+
+    /// Whether instance `index` of `stage` that opening `id` keeps is on
+    /// disk, written whole: without reading it.
+    pub fn has_instance(&self, id: &[u8; 32], stage: usize, index: usize) -> bool {
+        let path = self.kept.join(crate::hex_id(id));
+        path.join(format!("{stage}-{index}")).is_file()
     }
 
     /// Instance `index` of assertion `stage` of opening `id`, as kept.
@@ -769,6 +792,41 @@ mod tests {
         assert!(store.recovery(&[2; 32]).unwrap().is_none());
         // And started again.
         assert!(store.start_recovery(&[2; 32], 1, "a", b"0").unwrap());
+    }
+
+    #[test]
+    fn a_snapshot_preserves_the_selected_mode_pinned_proof_and_irrevocable_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let copy = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store.insert(&new(1, coin(0))).unwrap();
+        let state = br#"{"amount":4096,"corrected":0,"proof":"pinned"}"#;
+        store.start_recovery(&[1; 32], 1, "proving", state).unwrap();
+        assert!(store
+            .save_recovery(&[1; 32], ("proving", state), "proving", true, state)
+            .unwrap());
+        super::super::recovery::validate_backup(&store).unwrap();
+        store
+            .snapshot(&copy.path().join("contracts.sqlite"))
+            .unwrap();
+        let copied = Store::existing(copy.path()).unwrap().unwrap();
+        let row = copied.recovery(&[1; 32]).unwrap().unwrap();
+        assert_eq!(row.state, state);
+        assert!(row.irrevocable);
+        assert_eq!(row.stage, "proving");
+        assert!(!copied.drop_recovery(&[1; 32]).unwrap());
+        assert!(store
+            .snapshot(&copy.path().join("contracts.sqlite"))
+            .is_err());
+        store
+            .c
+            .execute(
+                "UPDATE recoveries SET state = ?1",
+                [br#"{"future_field":1}"#.as_slice()],
+            )
+            .unwrap();
+        assert!(super::super::recovery::validate_backup(&store).is_err());
+        super::super::recovery::validate_backup(&copied).unwrap();
     }
 
     #[test]

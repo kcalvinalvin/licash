@@ -230,6 +230,16 @@ pub struct Recovery {
     pub paid_at: Option<u32>,
 }
 
+/// Refuse a bundle containing recovery formats this build cannot safely
+/// carry on. No signing, reservation, migration, or chain work is done.
+pub(super) fn validate_backup(store: &Store) -> Result<()> {
+    for row in store.recoveries()? {
+        Stage::parse(&row.stage)?;
+        State::decode(&row)?;
+    }
+    Ok(())
+}
+
 /// What a recovery keeps between its steps, its transactions and outputs
 /// in consensus hex, the encoding Bitcoin fixes. A field of a later build
 /// is refused, not dropped on this one's next save.
