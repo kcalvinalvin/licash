@@ -17,12 +17,12 @@ use licash::recovery::HolderWitness;
 use licash::statement::{HubKeys as ResponseKeys, HubResponse, Observed, StatementInput, K_LEN};
 use licash::wots::{self, Hashes};
 use lichen_babe::garble::evaluate;
-use lichen_babe::reveal::extract;
+use lichen_babe::reveal::{extract, LamportPub};
 use lichen_babe::vsss::interpolate;
 use lichen_babe::we::decrypt;
 use lngap_btc::bitcoin::{OutPoint, Transaction, TxOut};
 use lngap_btc::witness::witness_args_consumption_order;
-use lngap_lamport::winternitz::{WotsParams, WotsSig};
+use lngap_lamport::winternitz::{Wots256Sig, WotsParams, WotsSig};
 use lngap_sessions::skeleton::sig_name;
 
 use crate::close::{finished, presign, terminal, B_ITEMS, E_ITEMS};
@@ -37,6 +37,7 @@ pub const RESPOND_COUNTER: &str = "respond_counter";
 pub const RESPOND_TIMEOUT: &str = "respond_timeout";
 /// Her assertion of the full claim's proof, and its terminal paying her.
 pub const ASSERT: &str = "assert";
+pub const ASSERT_CORRECTED: &str = "assert_corrected";
 pub const SUCCESS: &str = "success";
 /// The hub's challenge of her assertion, and its terminal paying it.
 pub const CHALLENGE: &str = "challenge_assert";
@@ -445,6 +446,114 @@ pub fn assert(o: &Opening, keys: &HolderKeys, proof: &Proof<Bn254>) -> Result<Tr
     finished(o, ASSERT, wire)
 }
 
+/// The corrected assertion bound to one opening and the hub's signed amount.
+/// Its Lamport and amount keys are separate from the full claim's keys.
+pub struct Corrected<'a> {
+    opening: &'a Opening,
+    amount: u32,
+    hub_b: Wots256Sig,
+}
+
+impl<'a> Corrected<'a> {
+    /// Bind the corrected amount before any holder key is used. The driver
+    /// must also validate the counter proof and durably keep its decision.
+    pub fn new(opening: &'a Opening, amount: u32, signature: &Hashes) -> Result<Self> {
+        ensure!(
+            amount <= opening.base.parts().cap,
+            "corrected amount exceeds the cap"
+        );
+        ensure!(
+            wots::verify_b(
+                &opening.base.parts().response_keys.keys().b_corr,
+                signature,
+                amount
+            ),
+            "corrected amount signature"
+        );
+        let hub_b = Wots256Sig::from_hashes(
+            WotsParams::for_bytes(4),
+            &amount.to_be_bytes(),
+            signature.0.clone(),
+        )?;
+        Ok(Self {
+            opening,
+            amount,
+            hub_b,
+        })
+    }
+
+    pub fn amount(&self) -> u32 {
+        self.amount
+    }
+
+    pub fn expected(&self) -> licash::statement::Journal {
+        journal(&self.opening.base, &self.opening.d, 1)
+    }
+
+    pub fn proves(&self, trust: &Trust, proof: &ClaimProof) -> bool {
+        let statement = (trust.statement)(&self.expected());
+        <Groth16<Bn254> as ark_snark::SNARK<_>>::verify(&statement.vk, &statement.public, proof)
+            .unwrap_or(false)
+    }
+
+    pub fn mock_proof(&self, trust: &Trust) -> Result<ClaimProof> {
+        ensure!(trust.mock, "a mock proof under a genuine authority");
+        Ok(lichen_babe::statement::mock_prove(
+            &self.expected().to_bytes(),
+        ))
+    }
+
+    /// Sign only a proof and amount already kept by the driver. Both
+    /// corrected one-time keys must never sign different data on retry.
+    pub fn assert(&self, keys: &HolderKeys, proof: &ClaimProof) -> Result<Transaction> {
+        let (_, digits, pi2, pi3) = pi(proof);
+        let wire = Babe::assert_corrected_wire(
+            &keys.corrected.lamport.sign(&digits),
+            &pi2,
+            &pi3,
+            &self.hub_b,
+            &keys.corrected.b_key.sign(&self.amount.to_be_bytes())?,
+        );
+        finished(self.opening, ASSERT_CORRECTED, wire)
+    }
+
+    pub fn is_assert(opening: &Opening, tx: &Transaction) -> bool {
+        is(opening, tx, ASSERT_CORRECTED)
+    }
+
+    /// Adopt a posted assertion, including its existing holder amount
+    /// signature for collection. Reading never emits another signature.
+    pub fn asserted(opening: &'a Opening, tx: &Transaction) -> Result<(Self, ClaimProof, WotsSig)> {
+        ensure!(Self::is_assert(opening, tx), "not her corrected assert");
+        let arguments = args(tx);
+        let read = Babe::read_corrected_assertion_hashes(&arguments)?;
+        let signature = Hashes(read.hub_b);
+        let amount = signed_message(
+            &opening.base.parts().response_keys.keys().b_corr,
+            &signature,
+            4,
+        )?;
+        let amount = u32::from_be_bytes(amount.try_into().expect("a four-byte corrected amount"));
+        let corrected = Self::new(opening, amount, &signature)?;
+        let holder_b = WotsSig::from_hashes(
+            WotsParams::for_bytes(4),
+            &amount.to_be_bytes(),
+            read.holder_b,
+        )?;
+        let spec = opening
+            .babe
+            .spec
+            .corrected
+            .as_ref()
+            .context("no corrected assertion")?;
+        spec.b_key
+            .verify(&holder_b)
+            .context("holder's corrected amount signature")?;
+        let proof = proof_from_reveals(&spec.lamport, read.proof)?;
+        Ok((corrected, proof, holder_b))
+    }
+}
+
 /// Whether `tx` is her `assert`, any proof's.
 pub fn is_assert(o: &Opening, tx: &Transaction) -> bool {
     is(o, tx, ASSERT)
@@ -457,6 +566,13 @@ pub fn asserted(o: &Opening, tx: &Transaction) -> Result<Proof<Bn254>> {
     let args = args(tx);
     let (signed, pi2, pi3) = Babe::read_assert(&args).context("assert's arguments")?;
     let lamport = &o.babe.spec.lamport;
+    proof_from_reveals(lamport, (signed, pi2, pi3))
+}
+
+fn proof_from_reveals(
+    lamport: &LamportPub,
+    (signed, pi2, pi3): crate::graph::Asserted<'_>,
+) -> Result<ClaimProof> {
     let digits = signed
         .iter()
         .enumerate()
@@ -681,8 +797,8 @@ mod tests {
         let witness: Vec<_> = tx.input[i].witness.iter().map(<[u8]>::to_vec).collect();
         arguments.reverse();
         arguments.extend([
-            vec![],
-            vec![],
+            witness[witness.len() - 4].clone(),
+            witness[witness.len() - 3].clone(),
             witness[witness.len() - 2].clone(),
             witness[witness.len() - 1].clone(),
         ]);
@@ -882,6 +998,105 @@ mod tests {
         for length in [0, 1, args.len() - 1] {
             assert!(Babe::read_plain_publication_hashes(&args[..length]).is_err());
         }
+    }
+
+    fn funded_opening() -> (Opening, HolderKeys, HubKeys) {
+        use crate::opening::{Context, Holder};
+        use k256::{elliptic_curve::PrimeField as _, Scalar};
+
+        let seed: [u8; 32] =
+            hex("2c45ef335c38f0e7417c97395c863c450c35fa34a629267e999994292aaa9ee7")
+                .try_into()
+                .unwrap();
+        let spend: [u8; 32] =
+            hex("548fedbbc7e1fb67570cac75bf01a723c31987d60bfcd44eafd8c1da39b7c54f")
+                .try_into()
+                .unwrap();
+        let spend = Option::<Scalar>::from(Scalar::from_repr(spend.into())).unwrap();
+        let holder = Holder::load(
+            include_bytes!("../tests/golden/holder-funded.bin"),
+            seed,
+            spend,
+            &Context {
+                tip: 0,
+                trust: Trust::mock(),
+            },
+        )
+        .unwrap();
+        let opening = holder.opening().unwrap();
+        let keys = HolderKeys::derive(&seed, &opening.base.parts().nonce);
+        // The frozen format-1 fixture header is MAGIC, u16 format, u8
+        // derivation, u8 party, u8 phase, then its documented test secret.
+        let hub = include_bytes!("../tests/golden/hub-funded.bin");
+        let hub = HubKeys::from_secret(hub[9..41].try_into().unwrap());
+        assert_eq!(
+            hub.sealed.public(),
+            *opening.base.parts().response_keys.keys()
+        );
+        (opening, keys, hub)
+    }
+
+    #[test]
+    fn corrected_assertions_use_separate_proof_amount_and_lamport_keys() {
+        let (opening, keys, hub) = funded_opening();
+        let signature = Hashes(hub.b_corr.sign(&15u32.to_be_bytes()).unwrap().hashes);
+        let corrected = Corrected::new(&opening, 15, &signature).unwrap();
+        let trust = Trust::mock();
+        let proof = corrected.mock_proof(&trust).unwrap();
+        let full_proof = mock_proof(&opening, &trust).unwrap();
+        assert!(corrected.proves(&trust, &proof));
+        assert!(!corrected.proves(&trust, &full_proof));
+        assert!(!proves(&opening, &trust, &proof));
+        let tx = corrected.assert(&keys, &proof).unwrap();
+        assert!(Corrected::is_assert(&opening, &tx));
+        assert!(!is_assert(&opening, &tx));
+        assert!(asserted(&opening, &tx).is_err());
+        let (adopted, posted, b) = Corrected::asserted(&opening, &tx).unwrap();
+        assert_eq!(adopted.amount(), 15);
+        assert_eq!(posted, proof);
+        assert_eq!(b.message(), 15u32.to_be_bytes());
+        assert!(opening.babe.spec.b_key.verify(&b).is_err());
+        let full_tx = assert(&opening, &keys, &full_proof).unwrap();
+        assert_eq!(asserted(&opening, &full_tx).unwrap(), full_proof);
+        assert!(Corrected::asserted(&opening, &full_tx).is_err());
+    }
+
+    #[test]
+    fn a_corrected_assertion_reuses_its_posted_amount_signature_despite_digit_aliases() {
+        let (opening, keys, hub) = funded_opening();
+        let signature = Hashes(hub.b_corr.sign(&15u32.to_be_bytes()).unwrap().hashes);
+        let corrected = Corrected::new(&opening, 15, &signature).unwrap();
+        let proof = corrected.mock_proof(&Trust::mock()).unwrap();
+        let original = corrected.assert(&keys, &proof).unwrap();
+        for alias in [vec![16], vec![16, 1]] {
+            let mut tx = original.clone();
+            let mut arguments = args(&tx);
+            let end = arguments.len();
+            alias_digit(&mut arguments, lichen_babe::setup::DIGITS + 2..end, &alias);
+            replace_arguments(&mut tx, 0, arguments);
+            let (adopted, posted, b) = Corrected::asserted(&opening, &tx).unwrap();
+            assert_eq!(adopted.amount(), 15);
+            assert_eq!(posted, proof);
+            assert_eq!(b.message(), 15u32.to_be_bytes());
+        }
+        let mut changed = original;
+        let mut arguments = args(&changed);
+        let at =
+            lichen_babe::setup::DIGITS + 2 + 2 * WotsParams::for_bytes(4).total_digits() as usize;
+        arguments[at + 1][0] ^= 1;
+        replace_arguments(&mut changed, 0, arguments);
+        assert!(Corrected::asserted(&opening, &changed).is_err());
+    }
+
+    #[test]
+    fn corrected_amounts_must_be_signed_within_the_cap_including_zero() {
+        let (opening, _, hub) = funded_opening();
+        let signature = Hashes(hub.b_corr.sign(&0u32.to_be_bytes()).unwrap().hashes);
+        assert_eq!(Corrected::new(&opening, 0, &signature).unwrap().amount(), 0);
+        assert!(Corrected::new(&opening, 1, &signature).is_err());
+        let amount = opening.base.parts().cap + 1;
+        let signature = Hashes(hub.b_corr.sign(&amount.to_be_bytes()).unwrap().hashes);
+        assert!(Corrected::new(&opening, amount, &signature).is_err());
     }
 
     /// A genuine proof as `licash-r0 native-wrap` exports it (a holder's

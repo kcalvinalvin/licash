@@ -191,6 +191,13 @@ pub struct CounterResponseHashes {
 /// `assert`'s arguments: the preimages, π2, π3.
 pub type Asserted<'a> = (&'a [Vec<u8>], &'a [u8], &'a [u8]);
 
+/// A corrected assertion's proof and both parties' amount reveals.
+pub struct CorrectedAsserted<'a> {
+    pub proof: Asserted<'a>,
+    pub hub_b: Vec<[u8; 32]>,
+    pub holder_b: Vec<[u8; 20]>,
+}
+
 /// A terminal's outputs, from the value it spends.
 type Terminal<'a> = &'a dyn Fn(&Babe, Amount) -> Result<Vec<TxOut>>;
 
@@ -994,13 +1001,24 @@ impl Babe {
     /// are deliberately ignored: even multi-byte aliases can be valid in
     /// a block. Authenticate the reveals against the opening's public key.
     pub fn read_wots256_hashes(params: WotsParams, args: &[Vec<u8>]) -> Result<Vec<[u8; 32]>> {
+        Self::read_wots_hashes(params, args)
+    }
+
+    fn read_wots_hashes<const N: usize>(
+        params: WotsParams,
+        args: &[Vec<u8>],
+    ) -> Result<Vec<[u8; N]>> {
         args.get(..2 * params.total_digits() as usize)
             .context("signature's arguments are too few")?
             .as_chunks::<2>()
             .0
             .iter()
             .rev()
-            .map(|pair| pair[1][..].try_into().context("a reveal of 32 bytes"))
+            .map(|pair| {
+                pair[1][..]
+                    .try_into()
+                    .with_context(|| format!("a reveal of {N} bytes"))
+            })
             .collect()
     }
 
@@ -1282,6 +1300,24 @@ impl Babe {
             asserted,
             WotsSig::from_consumption_order(word, &args[DIGITS + 2 + b..])?,
         ))
+    }
+
+    /// Read a confirmed corrected assertion without interpreting declared
+    /// WOTS digits. Its signed amount is recovered against the opening keys.
+    pub fn read_corrected_assertion_hashes(args: &[Vec<u8>]) -> Result<CorrectedAsserted<'_>> {
+        let word = WotsParams::for_bytes(4);
+        let b = 2 * word.total_digits() as usize;
+        ensure!(
+            args.len() == DIGITS + 2 + 2 * b,
+            "assert_corrected of {} arguments",
+            args.len()
+        );
+        Ok(CorrectedAsserted {
+            proof: Self::read_assert(&args[..DIGITS + 2])
+                .context("assert_corrected's assertion")?,
+            hub_b: Self::read_wots256_hashes(word, &args[DIGITS + 2..])?,
+            holder_b: Self::read_wots_hashes(word, &args[DIGITS + 2 + b..])?,
+        })
     }
     /// `challenge_assert`'s: the reveal ([`lichen_babe::reveal::reveal_args`]).
     pub fn challenge_wire(args: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
