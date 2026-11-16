@@ -180,6 +180,17 @@ pub fn payment_fee(fees: &licash_api::Fees) -> String {
     }
 }
 
+/// All a hub charges: [`payment_fee`], and its [`fee`] in each branch of
+/// a lock.
+pub fn fees(fees: &licash_api::Fees) -> String {
+    format!(
+        "{} a payment, {} a lock, {} a refund",
+        payment_fee(fees),
+        fee(fees.lock.base, fees.lock.ppm),
+        fee(fees.refund.base, fees.refund.ppm)
+    )
+}
+
 /// Parts per million as a percentage: `0.01%`, `1%`, `2.5%`.
 pub fn percent(ppm: u64) -> String {
     let (whole, rest) = (ppm / 10_000, ppm % 10_000);
@@ -269,6 +280,14 @@ mod tests {
         );
         assert_eq!(payment_fee(&fees(0, 0, 2_000)), "2 sat a note");
         assert_eq!(payment_fee(&fees(0, 0, 1_250)), "1.25 sat a note");
+        let all = licash_api::Fees {
+            lock: licash_api::Fee { base: 2, ppm: 0 },
+            ..fees(1, 100, 100)
+        };
+        assert_eq!(
+            super::fees(&all),
+            "1 sat + 0.01% + 0.1 sat a note a payment, 2 sat a lock, free a refund"
+        );
         assert_eq!(percent(25_000), "2.5%");
         assert_eq!(percent(1), "0.0001%");
     }

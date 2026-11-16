@@ -44,6 +44,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
+import org.licash.core.FeesRaised
 import org.licash.core.InvoiceQuote
 import org.licash.core.LicashException
 import org.licash.core.PayQuote
@@ -90,6 +91,8 @@ private sealed interface Step {
     data object Later : Step
     data class Received(val amount: ULong) : Step
     data class Trust(val payment: String, val hub: String) : Step
+    /** A hub charging more than agreed, in the way of a payment: made `again` once approved. */
+    class Approve(val raised: FeesRaised, val again: () -> Unit) : Step
     data class Failed(val why: String, val title: String = "Couldn't pay") : Step
 }
 
@@ -176,10 +179,26 @@ fun Send(
         }
     }
 
+    // Why a payment failed: its hub's fees to approve first, if it charges
+    // more than agreed, and the payment made `again` then.
+    suspend fun unpaid(e: Throwable, again: () -> Unit): Step {
+        val hub = (e as? LicashException.FeesRaised)?.hub
+        val raised = hub?.let { engine.feesRaised(it).getOrNull() }
+        return if (raised == null) Step.Failed(explain(e)) else Step.Approve(raised, again)
+    }
+
     suspend fun paying(code: String, amount: ULong?): Step =
         engine.pay(code, amount).fold(
             { Step.Sent(it.amount, it.handover, code) },
-            { e -> if (e is LicashException.Pending) Step.Later else Step.Failed(explain(e)) },
+            { e ->
+                when (e) {
+                    is LicashException.Pending -> Step.Later
+                    else -> unpaid(e) {
+                        step = Step.Busy
+                        scope.launch { step = paying(code, amount) }
+                    }
+                }
+            },
         )
 
     fun pay(code: String, amount: ULong?) {
@@ -218,7 +237,7 @@ fun Send(
         scope.launch {
             step = engine.payInvoice(text, hub).fold(
                 { if (it.state == State.DONE) Step.Paid(it.amount, it.fee) else Step.Later },
-                { Step.Failed(explain(it)) },
+                { e -> unpaid(e) { payInvoice(text, hub) } },
             )
         }
     }
@@ -228,7 +247,7 @@ fun Send(
         scope.launch {
             step = engine.payOut(quote, asked).fold(
                 { Step.PayingOut(it.amount, quote.depth) },
-                { Step.Failed(explain(it)) },
+                { e -> unpaid(e) { payOut(quote, asked) } },
             )
         }
     }
@@ -365,6 +384,19 @@ fun Send(
                     "It is at ${name(s.hub)}, a hub you don't use yet. Taking it adds that hub.",
                     "Take it",
                     { take(s.payment, true) },
+                    back,
+                )
+                is Step.Approve -> Ask(
+                    "Approve higher fees?",
+                    "${name(s.raised.hub)} raised its fees since your protection there started.\n\n" +
+                        raises(s.raised).joinToString("\n") { "${it.what}: ${it.now}, was ${it.agreed}" },
+                    "Approve and pay",
+                    {
+                        step = Step.Busy
+                        scope.launch {
+                            engine.approveFees(s.raised).fold({ s.again() }, { step = Step.Failed(explain(it)) })
+                        }
+                    },
                     back,
                 )
                 is Step.Failed -> Ask(s.title, s.why, "Try again", { step = Step.Looking }, back, failed = true)

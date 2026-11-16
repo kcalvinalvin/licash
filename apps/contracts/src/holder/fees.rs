@@ -1,0 +1,464 @@
+//! What she agreed to pay her contracts' hubs. The fees a hub charged as
+//! a contract opened there are the most it may charge her from then on
+//! ([`agree`], which tells her wallet): a hub may raise its fees whenever
+//! it likes, and is then paid nothing until she [`approve`]s them. A hub
+//! charging more than is sane ([`abusive`]) opens no contract unasked.
+
+use std::collections::HashMap;
+use std::path::Path;
+
+use anyhow::{ensure, Result};
+use licash_api::{ContractRange, Fee, Fees};
+use licash_contract::opening::Fate;
+use licash_wallet::{Transport, Wallet};
+
+use super::store::{Contract, Store};
+
+const SANE_FEE: Fee = Fee {
+    base: 10,
+    ppm: 10_000,
+};
+
+/// The most a hub may charge for a contract to open there unasked: on a
+/// payment and in each branch of a lock, 10 sat and 1% of what moves, and
+/// a sat for each note made.
+pub const SANE: Fees = Fees {
+    spend: SANE_FEE,
+    lock: SANE_FEE,
+    refund: SANE_FEE,
+    output_msat: 1_000,
+};
+
+/// And for a contract of terms she chose, a year: 20% of its cap.
+pub const SANE_PPM_YEAR: u32 = 200_000;
+
+/// Why no contract opens unasked at a hub charging `fees`, of terms
+/// chosen within `range` if any: the first of its fees that is more than
+/// is sane ([`SANE`], [`SANE_PPM_YEAR`]). None if none is.
+pub fn abusive(fees: &Fees, range: Option<&ContractRange>) -> Option<String> {
+    let year = range.map_or(0, |r| u64::from(r.ppm_year));
+    let parts = [
+        (
+            "a payment's base fee, in sat",
+            fees.spend.base,
+            SANE.spend.base,
+        ),
+        (
+            "a payment's fee, in parts per million",
+            fees.spend.ppm,
+            SANE.spend.ppm,
+        ),
+        ("a lock's base fee, in sat", fees.lock.base, SANE.lock.base),
+        (
+            "a lock's fee, in parts per million",
+            fees.lock.ppm,
+            SANE.lock.ppm,
+        ),
+        (
+            "a refund's base fee, in sat",
+            fees.refund.base,
+            SANE.refund.base,
+        ),
+        (
+            "a refund's fee, in parts per million",
+            fees.refund.ppm,
+            SANE.refund.ppm,
+        ),
+        (
+            "its fee for each note made, in thousandths of a sat",
+            fees.output_msat,
+            SANE.output_msat,
+        ),
+        (
+            "a contract's price a year, in parts per million of its cap",
+            year,
+            u64::from(SANE_PPM_YEAR),
+        ),
+    ];
+    let (what, is, most) = parts.iter().find(|(_, is, most)| is > most)?;
+    Some(format!("{what}: {is}, where {most} at most is sane"))
+}
+
+/// Tell `wallet` the most each hub it trusts may charge
+/// ([`Wallet::set_fee_ceilings`]), by the contracts in `dir`: of those at
+/// a hub that protect notes at `tip` (all whose F is buried, if the tip is
+/// not known), the least of each fee they opened under or she approved
+/// since. No ceilings at a hub with no such contract, or whose contracts
+/// were opened before any were kept: nothing is refused there. To call as
+/// the wallet opens, and whenever its contracts changed ([`super::resume`]
+/// and [`approve`] do).
+pub fn agree<T: Transport>(wallet: &Wallet<T>, dir: &Path, tip: Option<u32>) -> Result<()> {
+    let (contracts, ceilings) = match Store::existing(dir)? {
+        Some(store) => (store.list()?, store.ceilings()?),
+        None => return Ok(()),
+    };
+    for (url, _) in wallet.hubs()? {
+        let urls = wallet.hub_urls(&url)?;
+        wallet.set_fee_ceilings(&url, strictest(&contracts, &ceilings, &urls, tip))?;
+    }
+    Ok(())
+}
+
+/// Agree to `fees` at `hub`, a hub `wallet` trusts: what it charges now,
+/// as she was shown. The ceilings of each of her contracts there in
+/// `dir`, but those given up or whose F never confirms, are raised to
+/// them, fee by fee, none lowered: those still opening too, not to refuse
+/// the same fees again once they protect. Then as [`agree`].
+pub fn approve<T: Transport>(
+    wallet: &Wallet<T>,
+    dir: &Path,
+    hub: &str,
+    fees: &Fees,
+    tip: Option<u32>,
+) -> Result<()> {
+    let urls = wallet.hub_urls(hub)?;
+    ensure!(!urls.is_empty(), "{hub} is no hub this wallet trusts");
+    let Some(store) = Store::existing(dir)? else {
+        return Ok(());
+    };
+    let ids: Vec<[u8; 32]> = store
+        .list()?
+        .iter()
+        .filter(|c| at(&urls, c) && c.abandoned.is_none() && c.fate != Some(Fate::Dead))
+        .map(|c| c.id)
+        .collect();
+    let raised = store.raise_ceilings(&ids, fees)?;
+    tracing::info!(%hub, contracts = ids.len(), raised, "fees approved");
+    drop(store);
+    agree(wallet, dir, tip)
+}
+
+/// Whether `contract` is at the hub reached at any of `urls`.
+fn at(urls: &[String], contract: &Contract) -> bool {
+    let hub = contract.hub.trim_end_matches('/');
+    urls.iter().any(|url| url.trim_end_matches('/') == hub)
+}
+
+/// The least of each fee in the `ceilings` of the `contracts` at the hub
+/// of `urls` that protect notes at `tip`: none if none of them keeps any.
+fn strictest(
+    contracts: &[Contract],
+    ceilings: &HashMap<[u8; 32], Fees>,
+    urls: &[String],
+    tip: Option<u32>,
+) -> Option<Fees> {
+    contracts
+        .iter()
+        .filter(|c| at(urls, c) && c.live(tip.unwrap_or(0)))
+        .filter_map(|c| ceilings.get(&c.id))
+        .copied()
+        .reduce(|a, b| a.least(&b))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use bitcoin::hashes::Hash as _;
+    use bitcoin::{OutPoint, Txid};
+    use licash::note::IssuerKeys;
+    use licash::spend::ChainProfile;
+    use licash_api::Info;
+    use licash_contract::opening::Phase;
+    use licash_wallet::Response;
+
+    use super::super::store::New;
+    use super::*;
+
+    /// Hubs by URL, each answering what it says of itself and no more.
+    #[derive(Default)]
+    struct Hubs(Mutex<HashMap<String, Info>>);
+
+    impl Hubs {
+        /// The hub at `url`, of keys of its own, charging `fees` from now.
+        fn charge(&self, url: &str, seed: u8, fees: Fees) {
+            let keys = IssuerKeys::from_seed(&[seed; 32], 0, 6).unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("hub.sqlite");
+            let regtest = ChainProfile::Core30DefaultRegtest;
+            let address = Wallet::create(&path, &[seed; 32], regtest, Hubs::default())
+                .unwrap()
+                .address();
+            let info = Info::new(&[keys.keyset().unwrap()], address, fees, None);
+            self.0.lock().unwrap().insert(url.to_owned(), info);
+        }
+    }
+
+    impl Transport for &Hubs {
+        async fn request(&self, url: &str, _: Option<Vec<u8>>) -> Result<Response, String> {
+            let hubs = self.0.lock().unwrap();
+            let info = url
+                .strip_suffix(licash_api::INFO)
+                .and_then(|hub| hubs.get(hub))
+                .ok_or("no hub here")?;
+            Ok(Response {
+                status: 200,
+                body: serde_json::to_vec(info).unwrap(),
+            })
+        }
+    }
+
+    impl Transport for Hubs {
+        async fn request(&self, _: &str, _: Option<Vec<u8>>) -> Result<Response, String> {
+            Err("no hub here".into())
+        }
+    }
+
+    fn fees(base: u64, ppm: u64, output_msat: u64) -> Fees {
+        let fee = Fee { base, ppm };
+        Fees {
+            spend: fee,
+            lock: fee,
+            refund: fee,
+            output_msat,
+        }
+    }
+
+    fn contract(id: u8, hub: &str, fate: Option<Fate>) -> Contract {
+        Contract {
+            id: [id; 32],
+            hub: hub.to_owned(),
+            phase: Phase::Funded,
+            mock: true,
+            deposit: OutPoint {
+                txid: Txid::from_byte_array([9; 32]),
+                vout: u32::from(id),
+            },
+            value: 60_000,
+            price: 23_000,
+            cap: 4_096,
+            assert_height: 360,
+            close_height: 500,
+            funding: None,
+            fate,
+            abandoned: None,
+            created_at: 0,
+        }
+    }
+
+    #[test]
+    fn a_hub_charging_what_hubs_do_is_sane_and_one_charging_more_is_told_why() {
+        let range = |ppm_year| ContractRange {
+            min_cap: 1,
+            max_cap: 1_000_000,
+            min_blocks: 1,
+            max_blocks: 1_000,
+            per_coin: 1,
+            base: 1_000_000,
+            ppm_year,
+        };
+        assert_eq!(abusive(&Fees::default(), None), None);
+        assert_eq!(abusive(&fees(1, 100, 100), Some(&range(10_000))), None);
+        assert_eq!(abusive(&SANE, Some(&range(SANE_PPM_YEAR))), None);
+        // Each fee, of each kind, and the price of the terms she chooses.
+        let over = |fees: Fees, year| abusive(&fees, Some(&range(year))).unwrap();
+        for (raised, what) in [
+            (
+                Fees {
+                    spend: Fee { base: 11, ppm: 0 },
+                    ..SANE
+                },
+                "payment's base",
+            ),
+            (
+                Fees {
+                    spend: Fee {
+                        base: 0,
+                        ppm: 10_001,
+                    },
+                    ..SANE
+                },
+                "payment's fee",
+            ),
+            (
+                Fees {
+                    lock: Fee { base: 11, ppm: 0 },
+                    ..SANE
+                },
+                "lock's base",
+            ),
+            (
+                Fees {
+                    lock: Fee {
+                        base: 0,
+                        ppm: 10_001,
+                    },
+                    ..SANE
+                },
+                "lock's fee",
+            ),
+            (
+                Fees {
+                    refund: Fee { base: 11, ppm: 0 },
+                    ..SANE
+                },
+                "refund's base",
+            ),
+            (
+                Fees {
+                    refund: Fee {
+                        base: 0,
+                        ppm: 10_001,
+                    },
+                    ..SANE
+                },
+                "refund's fee",
+            ),
+            (
+                Fees {
+                    output_msat: 1_001,
+                    ..SANE
+                },
+                "each note",
+            ),
+        ] {
+            let why = over(raised, 0);
+            assert!(why.contains(what), "{why}");
+            assert!(raised.above(&SANE));
+        }
+        let why = over(SANE, 200_001);
+        assert!(why.contains("a year") && why.contains("200001"), "{why}");
+        // Of fixed terms, their price is hers to bound.
+        assert_eq!(abusive(&SANE, None), None);
+    }
+
+    #[tokio::test]
+    async fn a_hub_is_held_to_what_it_charged_as_her_contracts_opened_until_she_approves_more() {
+        let (a, b) = ("http://a.example", "http://b.example");
+        let hubs = Hubs::default();
+        hubs.charge(a, 1, fees(1, 100, 100));
+        hubs.charge(b, 2, fees(1, 100, 100));
+        let dir = tempfile::tempdir().unwrap();
+        let regtest = ChainProfile::Core30DefaultRegtest;
+        let path = dir.path().join("wallet.sqlite");
+        let wallet = Wallet::create(&path, &[7; 32], regtest, &hubs).unwrap();
+        wallet.add_hub(a).await.unwrap();
+        wallet.add_hub(b).await.unwrap();
+        let agreed = |hub: &str| wallet.fee_ceilings(hub).unwrap();
+
+        // No contract ever opened: nothing agreed, nothing made.
+        agree(&wallet, dir.path(), None).unwrap();
+        approve(&wallet, dir.path(), a, &fees(9, 9, 9), None).unwrap();
+        assert_eq!((agreed(a), agreed(b)), (None, None));
+        assert!(!dir.path().join("contracts.sqlite").exists());
+        assert!(approve(
+            &wallet,
+            dir.path(),
+            "http://c.example",
+            &fees(9, 9, 9),
+            None
+        )
+        .is_err());
+
+        let new = |id: u8, hub: &'static str| New {
+            id: [id; 32],
+            hub,
+            mock: true,
+            deposit: OutPoint {
+                txid: Txid::from_byte_array([9; 32]),
+                vout: u32::from(id),
+            },
+            value: 60_000,
+            price: 23_000,
+            cap: 4_096,
+            assert_height: 360,
+            close_height: 500,
+            since: 200,
+            state: b"state",
+        };
+        let store = Store::open(dir.path()).unwrap();
+        // One opened before any were kept, one buried, one still opening
+        // and one given up, at the first hub; one never to be, at the other.
+        store.insert(&new(1, a)).unwrap();
+        store.set_fate(&[1; 32], Fate::Live).unwrap();
+        store.insert_under(&new(2, a), &fees(1, 100, 100)).unwrap();
+        store.set_fate(&[2; 32], Fate::Live).unwrap();
+        store.insert_under(&new(3, a), &fees(1, 100, 100)).unwrap();
+        store.insert_under(&new(4, a), &fees(1, 100, 100)).unwrap();
+        store.abandon(&[4; 32], "refused").unwrap();
+        store.insert_under(&new(5, b), &fees(1, 100, 100)).unwrap();
+        store.set_fate(&[5; 32], Fate::Dead).unwrap();
+        drop(store);
+
+        agree(&wallet, dir.path(), Some(250)).unwrap();
+        assert_eq!((agreed(a), agreed(b)), (Some(fees(1, 100, 100)), None));
+        // Past the time of the one that protected: nothing agreed.
+        agree(&wallet, dir.path(), Some(360)).unwrap();
+        assert_eq!(agreed(a), None);
+        agree(&wallet, dir.path(), None).unwrap();
+        assert_eq!(agreed(a), Some(fees(1, 100, 100)));
+
+        // It charges more, in one fee and less in another: hers to approve,
+        // as she was shown.
+        hubs.charge(a, 1, fees(0, 150, 100));
+        let charged = wallet.add_hub(a).await.unwrap().fees;
+        assert!(charged.above(&agreed(a).unwrap()));
+        approve(&wallet, dir.path(), a, &charged, Some(250)).unwrap();
+        assert_eq!(agreed(a), Some(fees(1, 150, 100)));
+        assert!(!charged.above(&agreed(a).unwrap()));
+        // Of each of her contracts there that may yet protect, and no
+        // other: kept, as a wallet opened again finds them.
+        let kept = Store::open(dir.path()).unwrap().ceilings().unwrap();
+        assert_eq!(kept.len(), 4);
+        assert_eq!(kept[&[2; 32]], fees(1, 150, 100));
+        assert_eq!(kept[&[3; 32]], fees(1, 150, 100));
+        assert_eq!(kept[&[4; 32]], fees(1, 100, 100));
+        assert_eq!(kept[&[5; 32]], fees(1, 100, 100));
+        wallet.set_fee_ceilings(a, None).unwrap();
+        agree(&wallet, dir.path(), Some(250)).unwrap();
+        assert_eq!(agreed(a), Some(fees(1, 150, 100)));
+
+        // The hub changes fees after they were shown: approving the
+        // snapshot never approves a higher schedule learned meanwhile.
+        hubs.charge(a, 1, fees(0, 300, 100));
+        let later = wallet.add_hub(a).await.unwrap().fees;
+        approve(&wallet, dir.path(), a, &charged, Some(250)).unwrap();
+        assert_eq!(agreed(a), Some(fees(1, 150, 100)));
+        assert!(later.above(&agreed(a).unwrap()));
+    }
+
+    #[test]
+    fn the_strictest_ceilings_of_the_contracts_protecting_at_a_hub_are_hers() {
+        let (a, b) = ("http://a.example", "http://b.example");
+        let live = Some(Fate::Live);
+        let mut expired = contract(4, a, live);
+        expired.assert_height = 300;
+        let mut given_up = contract(5, a, None);
+        given_up.abandoned = Some("refused".into());
+        let contracts = [
+            contract(1, a, live),
+            contract(2, a, live),
+            // Opened before any were kept.
+            contract(3, a, live),
+            expired,
+            given_up,
+            // Not buried yet, or never to be.
+            contract(6, a, Some(Fate::Open)),
+            contract(7, a, Some(Fate::Dead)),
+            contract(8, b, live),
+        ];
+        let ceilings = HashMap::from([
+            ([1; 32], fees(2, 100, 100)),
+            ([2; 32], fees(1, 500, 0)),
+            ([4; 32], fees(0, 0, 0)),
+            ([5; 32], fees(0, 0, 0)),
+            ([6; 32], fees(0, 0, 0)),
+            ([7; 32], fees(0, 0, 0)),
+            ([8; 32], fees(7, 7, 7)),
+        ]);
+        let urls = |all: &[&str]| all.iter().map(|u| (*u).to_owned()).collect::<Vec<_>>();
+        let of = |hubs: &[&str], tip| strictest(&contracts, &ceilings, &urls(hubs), tip);
+        assert_eq!(of(&[a], Some(310)), Some(fees(1, 100, 0)));
+        // The tip unknown: one whose F is buried counts, past its time too.
+        assert_eq!(of(&[a], None), Some(fees(0, 0, 0)));
+        // None protects any longer: nothing agreed.
+        assert_eq!(of(&[a], Some(360)), None);
+        // By any of the hub's addresses, however written.
+        assert_eq!(of(&["http://b.example/"], Some(310)), Some(fees(7, 7, 7)));
+        assert_eq!(of(&["http://c.example", b], Some(310)), Some(fees(7, 7, 7)));
+        assert_eq!(of(&["http://c.example"], Some(310)), None);
+        // At a hub whose contracts kept none: nothing agreed.
+        let only = [contract(3, a, live)];
+        assert_eq!(strictest(&only, &ceilings, &urls(&[a]), Some(310)), None);
+    }
+}

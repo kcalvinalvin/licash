@@ -28,6 +28,14 @@ Wallets that predate the fee on notes do not pay it, so a payment of theirs
 that makes five notes or more is refused until they upgrade:
 `--output-fee-msat 0` spares them.
 
+Fees may change at any restart, but a wallet holding a recovery contract
+agreed to those charged as it opened, and no more: it stops paying a hub
+that charges more, in any fee, until its owner approves the new fees by
+hand. With `--contracts`, the hub keeps what it charged with each opening
+(in `<data>/openings.sqlite`) and `run` warns, as it starts, of how many
+contracts it signed opened for less than it charges now. Nothing else is
+done with it, and openings from before it was kept are not counted.
+
 `status` shows income, released payments and open locks. `status --details`
 adds the internal note and event counts; `status --json` keeps the full
 machine-readable statistics. Normal text logs omit timestamps and Rust

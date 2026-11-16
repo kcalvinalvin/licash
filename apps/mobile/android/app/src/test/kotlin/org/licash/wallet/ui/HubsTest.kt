@@ -4,6 +4,8 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Test
 import org.licash.core.ContractTerms
+import org.licash.core.Fees
+import org.licash.core.FeesRaised
 import org.licash.core.Hub
 import org.licash.core.HubsFound
 import org.licash.core.LightningTerms
@@ -43,6 +45,26 @@ class HubsTest {
         assertEquals("2 sat a note", paying(hub(note = 2_000uL)))
         assertEquals("1.25 sat a note", paying(hub(note = 1_250uL)))
         assertEquals("Fee 0.1 sat a note", about(hub(note = 100uL)))
+    }
+
+    @Test
+    fun a_hub_charging_more_than_agreed_is_told_by_the_fees_it_changed() {
+        val agreed = Fees(spend = Rate(1uL, 100uL), lock = Rate(1uL, 0uL), refund = Rate(0uL, 0uL), outputMsat = 100uL)
+        fun raised(charged: Fees) = raises(FeesRaised("https://hub.example", charged, agreed))
+        assertEquals(
+            listOf(Raise("Paying", "1 sat + 0.02% + 0.1 sat a note", "1 sat + 0.01% + 0.1 sat a note")),
+            raised(agreed.copy(spend = Rate(1uL, 200uL))),
+        )
+        // The fee on each note made is a payment's too.
+        assertEquals(
+            listOf(Raise("Paying", "1 sat + 0.01% + 1 sat a note", "1 sat + 0.01% + 0.1 sat a note")),
+            raised(agreed.copy(outputMsat = 1_000uL)),
+        )
+        assertEquals(
+            listOf(Raise("Holding a payment", "2 sat", "1 sat"), Raise("Refunding one", "0.5%", "None")),
+            raised(agreed.copy(lock = Rate(2uL, 0uL), refund = Rate(0uL, 5_000uL))),
+        )
+        assertEquals(emptyList<Raise>(), raised(agreed))
     }
 
     @Test

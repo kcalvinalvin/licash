@@ -3,10 +3,12 @@
 //! [`list`] them. Her deposit is a coin of the wallet's, signed into F by
 //! it; her change returns to its fallback address, or into notes at the
 //! hub ([`Change::Notes`]). One her hub left silent she forces closed, in
-//! [`recovery`].
+//! [`recovery`]. What a hub charged as a contract opened there is the most
+//! it may charge her since, until she agrees to more: [`fees`].
 
 mod chain;
 mod driver;
+pub mod fees;
 #[cfg(feature = "node")]
 mod node;
 pub mod recovery;
@@ -15,7 +17,7 @@ mod store;
 
 use std::path::Path;
 
-use anyhow::{anyhow, ensure, Context as _, Result};
+use anyhow::{anyhow, bail, ensure, Context as _, Result};
 use bitcoin::{OutPoint, ScriptBuf};
 use licash_contract::opening::{Holder, Quote, Start};
 use licash_contract::wire::Wanted;
@@ -100,7 +102,9 @@ pub struct Ask {
 /// its keyset one the hub shows the wallet, its terms as `ask`ed, its
 /// price within it, her deposit the coin she names or else the smallest
 /// free that pays it ([`coin`]). Kept in `dir`, the wallet's directory,
-/// from her first message on.
+/// from her first message on, with the fees the hub charges now: the most
+/// it may charge her since ([`fees`]). Refused at a hub charging more
+/// than is sane ([`fees::abusive`]).
 pub async fn open<T: Transport, C: Chain>(
     wallet: &Wallet<T>,
     chain: &C,
@@ -121,6 +125,31 @@ pub async fn open_with<T: Transport, C: Chain>(
     ask: Ask,
     change: Change,
 ) -> Result<Contract> {
+    open_at(wallet, chain, dir, hub, ask, change, true).await
+}
+
+/// [`open_with`], at a hub charging more than is sane too
+/// ([`fees::abusive`]): for her who was told, and asks all the same.
+pub async fn open_anyway<T: Transport, C: Chain>(
+    wallet: &Wallet<T>,
+    chain: &C,
+    dir: &Path,
+    hub: &str,
+    ask: Ask,
+    change: Change,
+) -> Result<Contract> {
+    open_at(wallet, chain, dir, hub, ask, change, false).await
+}
+
+async fn open_at<T: Transport, C: Chain>(
+    wallet: &Wallet<T>,
+    chain: &C,
+    dir: &Path,
+    hub: &str,
+    ask: Ask,
+    change: Change,
+    sane: bool,
+) -> Result<Contract> {
     let hub = hub.trim_end_matches('/').to_owned();
     let trust = crate::trust(wallet.network())?;
     let trusted = wallet.hubs()?;
@@ -129,6 +158,16 @@ pub async fn open_with<T: Transport, C: Chain>(
         .find(|(url, _)| *url == hub)
         .with_context(|| format!("{hub} is no hub this wallet trusts"))?;
     let chosen = ask.cap.map(|cap| (cap, ask.blocks));
+    // What it charges now, not as the wallet last heard: her ceilings.
+    let now = wallet.hub_info(&hub).await;
+    let now = now.map_err(|e| anyhow!("{hub}'s fees: {e}"))?;
+    let range = now
+        .contracts
+        .and_then(|c| c.range)
+        .filter(|_| chosen.is_some());
+    if let Some(why) = fees::abusive(&now.fees, range.as_ref()).filter(|_| sane) {
+        bail!("{hub} charges more than is sane, {why}: no contract opens there unless asked all the same");
+    }
     let offer = offer(wallet, &hub, chosen).await?;
     let keysets = info
         .keysets()
@@ -215,7 +254,7 @@ pub async fn open_with<T: Transport, C: Chain>(
         }
     };
     let id = holder.id();
-    let inserted = store.insert(&New {
+    let new = New {
         id,
         hub: &hub,
         mock: trust.mock,
@@ -227,7 +266,8 @@ pub async fn open_with<T: Transport, C: Chain>(
         close_height: wanted.close_height,
         since: tip,
         state: &holder.to_bytes(),
-    });
+    };
+    let inserted = store.insert_under(&new, &now.fees);
     if let Err(e) = inserted {
         give_up("its opening never started");
         return Err(e);
@@ -302,7 +342,13 @@ pub async fn resume<T: Transport, C: Chain>(
             tracing::warn!(id = %crate::hex_id(&id), "watching F: {e:#}");
         }
     }
-    store.list()
+    let all = store.list()?;
+    drop(store);
+    // As they stand now: one newly buried, or past its time.
+    if let Err(e) = fees::agree(wallet, dir, Some(tip)) {
+        tracing::warn!("what her contracts' hubs may charge: {e:#}");
+    }
+    Ok(all)
 }
 
 /// The contracts in `dir`, the newest first: none if none was ever

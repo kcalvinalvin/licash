@@ -46,6 +46,7 @@ licash-swaps.workspace = true
 licash-swaps-service = { path = "../../swaps" }
 axum.workspace = true
 nostr-sdk = { version = "0.45.6", features = ["local-relay"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 tempfile = "3.27"
 
 [features]

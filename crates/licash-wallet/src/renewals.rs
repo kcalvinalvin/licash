@@ -17,7 +17,7 @@ use licash::{
     note::Keyset,
     spend::{Proposal, ProposalId},
 };
-use licash_api::{Code, Info, Offer};
+use licash_api::{Code, Fees, Info, Offer};
 use rusqlite::params;
 
 use crate::{
@@ -126,7 +126,7 @@ impl<T: Transport> Wallet<T> {
                 }
                 Some(_) if fee >= total => Some("renewing them would leave nothing"),
                 Some(_) => None,
-                None if !within(fee, total, limit) => {
+                None if !allowed(fee, total, limit, &info.fees) => {
                     Some("renewing them costs more than the limit")
                 }
                 None => None,
@@ -264,9 +264,58 @@ fn within(fee: u64, total: u64, ppm: u32) -> bool {
     fee < total && u128::from(fee) * 1_000_000 <= u128::from(total) * u128::from(ppm)
 }
 
+/// Without contract ceilings, a renewal may pay within the amount-based
+/// limit or a modest advertised spending schedule. A zero limit still
+/// permits only a free renewal, and some value must always remain.
+pub(crate) fn allowed(fee: u64, total: u64, ppm: u32, fees: &Fees) -> bool {
+    within(fee, total, ppm)
+        || (fee < total
+            && ppm > 0
+            && fees.spend.base <= 1
+            && fees.spend.ppm <= u64::from(ppm)
+            && fees.output_msat <= 100)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::within;
+    use licash_api::Fee;
+
+    use super::*;
+
+    #[test]
+    fn a_modest_schedule_allows_small_renewals_but_zero_means_free_only() {
+        let fees = Fees {
+            spend: Fee { base: 1, ppm: 100 },
+            output_msat: 100,
+            ..Fees::default()
+        };
+        assert!(allowed(2, 64, 1_000, &fees));
+        assert!(!allowed(2, 64, 0, &fees));
+        assert!(!allowed(2, 2, 1_000, &fees));
+        assert!(!allowed(0, 0, 1_000, &fees));
+        for expensive in [
+            Fees {
+                spend: Fee { base: 2, ppm: 100 },
+                ..fees
+            },
+            Fees {
+                spend: Fee {
+                    base: 1,
+                    ppm: 1_001,
+                },
+                ..fees
+            },
+            Fees {
+                output_msat: 101,
+                ..fees
+            },
+        ] {
+            assert!(!allowed(2, 64, 1_000, &expensive));
+            // Expensive schedules may still pass the amount-based limit.
+            assert!(allowed(2, 10_000, 1_000, &expensive));
+        }
+        assert!(allowed(0, 64, 0, &fees));
+    }
 
     #[test]
     fn a_renewal_costs_at_most_its_limit_and_leaves_some() {

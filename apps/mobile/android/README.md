@@ -68,7 +68,9 @@ The app is for Bitcoin. Tapping the "licash" wordmark on the first screen
 advanced mode: signet, Mutinynet and regtest, the light client's peers and
 its block-dn server, the block explorer transactions link to, the most the
 app pays, on its own, to renew notes a hub that restarted no longer unlinks
-(100 parts per million of them unless set, under Privacy), the notes of
+(1000 parts per million of them unless set, or a spending schedule of at
+most 1 sat base, that rate and 0.1 sat per output; live contract ceilings
+take precedence, under Privacy), the notes of
 each denomination, and how each payment was made: its transactions, block
 heights and providers.
 
@@ -116,7 +118,11 @@ now of the hub's notes once unfolded, those ending first covering first,
 and the hub's page how much of what it holds they protect; the notes they
 cover count as protected rather than not, on Home and behind the balance;
 what a contract is worth for now (nothing, under the mock authority) is said
-wherever one shows. A contract ends no sooner: End says to cash out the
+wherever one shows. The fees a hub charges as a contract opens there are
+the most the app pays it from then on: a hub that raised them since is not
+paid, and its notes not renewed, until the owner approves the new fees,
+asked when a payment there is refused for it (old beside new, then paid)
+and on the hub's page in Settings. A contract ends no sooner: End says to cash out the
 hub's notes instead. In advanced mode, a contract whose hub stopped
 answering can be forced closed: the notes it covers are claimed on Bitcoin
 and paid back there once the hub's window to answer passed. A hub that

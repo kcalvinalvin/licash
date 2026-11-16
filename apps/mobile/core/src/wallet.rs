@@ -40,6 +40,7 @@ const DAY: i64 = 86_400;
 
 mod contacts;
 mod contracts;
+mod fees;
 mod moves;
 mod payouts;
 mod recoveries;
@@ -189,8 +190,10 @@ impl Wallet {
 
     /// Renew notes a hub no longer unlinks since it restarted, paying them
     /// to the wallet itself, only if its fee on them is at most `ppm` parts
-    /// per million of their value, its base fee included: 0 renews them
-    /// only for free. 100 until set, for as long as the wallet is open.
+    /// per million of their value, or the hub charges at most 1 sat base,
+    /// `ppm` millionths and 0.1 sat per output. Contract ceilings take
+    /// precedence. 0 renews them only for free. 1000 until set, for as long
+    /// as the wallet is open.
     pub fn set_renew_limit(&self, ppm: u32) {
         self.wallet.set_renew_limit(ppm);
     }
@@ -239,6 +242,7 @@ impl Wallet {
             mailbox: Mutex::new(None),
         };
         wallet.onions();
+        wallet.agree_fees();
         Ok(Arc::new(wallet))
     }
 

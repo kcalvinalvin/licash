@@ -81,6 +81,12 @@ pub enum LicashError {
     /// trust: [`Wallet::receive`] it trusting the hub to take it.
     #[error("a payment at hub {url}, not trusted yet")]
     UnknownHub { url: String },
+    /// The hub at `hub` charges more than the wallet agreed to pay it, as
+    /// its contracts there opened: nothing is paid there until the user
+    /// approves its fees ([`Wallet::fees_raised`],
+    /// [`Wallet::approve_fees`]).
+    #[error("hub {hub} charges more than agreed: approve its fees to pay there")]
+    FeesRaised { hub: String },
     /// The wallet's own storage failed.
     #[error("{reason}")]
     Failed { reason: String },
@@ -95,6 +101,7 @@ impl From<licash_wallet::Error> for LicashError {
             E::Pending { .. } | E::NoteTaken => Self::Pending { reason },
             E::Insufficient { needed, available } => Self::Insufficient { needed, available },
             E::UnknownHub(url) => Self::UnknownHub { url },
+            E::FeesRaised { hub } => Self::FeesRaised { hub },
             E::Setup(_) | E::Storage(_) => Self::Failed { reason },
             _ => Self::Invalid { reason },
         }
@@ -242,6 +249,29 @@ pub fn contract_max_cap(range: ContractRange, coin: u64) -> Option<u64> {
 pub struct Rate {
     pub base: u64,
     pub ppm: u64,
+}
+
+/// All a hub charges on notes: on a payment and in each branch of a lock,
+/// and for each note it makes for others than the hub, in thousandths of
+/// a sat.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct Fees {
+    pub spend: Rate,
+    pub lock: Rate,
+    pub refund: Rate,
+    pub output_msat: u64,
+}
+
+/// A hub charging more than the wallet agreed to pay it
+/// ([`Wallet::fees_raised`]).
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct FeesRaised {
+    pub hub: String,
+    /// What it charges now, as the wallet last heard.
+    pub charged: Fees,
+    /// The most the wallet agreed to: its fees as the wallet's contracts
+    /// there opened, or approved since.
+    pub agreed: Fees,
 }
 
 /// What a hub charges over Lightning, and what it takes.

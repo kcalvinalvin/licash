@@ -35,6 +35,7 @@ import org.licash.core.Contract
 import org.licash.core.ContractQuote
 import org.licash.core.ContractState
 import org.licash.core.Details
+import org.licash.core.FeesRaised
 import org.licash.core.Holding
 import org.licash.core.Hub
 import org.licash.core.InvoiceQuote
@@ -69,6 +70,8 @@ data class Ui(
     val balance: Balance = Balance(0u, 0u, 0u, 0u, 0u, 0u, 0u),
     val history: List<Activity> = emptyList(),
     val hubs: List<Hub> = emptyList(),
+    /** The hubs charging more than agreed as a contract opened there: not paid until approved. */
+    val raised: List<FeesRaised> = emptyList(),
     val tor: Boolean = false,
     val chain: ChainStatus = ChainStatus(),
     /** The next block to look in for payments on Bitcoin, once looking. */
@@ -604,7 +607,10 @@ class Engine(context: Context) {
                 val under = detailsToRead(history)
                     .mapNotNull { a -> runCatching { it.details(a.kind, a.id) }.getOrNull()?.let { d -> a.key to d } }
                     .toMap()
-                Shown(it.network(), it.balance(), history, it.hubs(), it.tor(), contracts, recoveries, under)
+                val raised = runCatching { it.feesRaised() }
+                    .onFailure { e -> AppLog.warn("reading the fees agreed", e) }
+                    .getOrDefault(state.value.raised)
+                Shown(it.network(), it.balance(), history, it.hubs(), raised, it.tor(), contracts, recoveries, under)
             }
         }.onFailure { AppLog.warn("reading the wallet", it) }.getOrNull()
         state.update {
@@ -623,6 +629,7 @@ class Engine(context: Context) {
                     balance = shown.balance,
                     history = shown.history,
                     hubs = shown.hubs,
+                    raised = shown.raised,
                     tor = shown.tor,
                     contracts = shown.contracts,
                     recoveries = shown.recoveries,
@@ -675,6 +682,7 @@ class Engine(context: Context) {
         val balance: Balance,
         val history: List<Activity>,
         val hubs: List<Hub>,
+        val raised: List<FeesRaised>,
         val tor: Boolean,
         val contracts: List<Contract>,
         val recoveries: List<Recovery>,
@@ -699,6 +707,19 @@ class Engine(context: Context) {
         refresh()
         poke()
         hub
+    }
+
+    /**
+     * What the hub at [hub] charges beyond what was agreed, as the wallet
+     * last heard: none if no more. A payment refused for it asked anew.
+     */
+    suspend fun feesRaised(hub: String): Result<FeesRaised?> =
+        io { local { w -> w.feesRaised().find { it.hub == hub } } }
+
+    /** Agree to pay a hub what [raised] shows it charges, and no more. */
+    suspend fun approveFees(raised: FeesRaised): Result<Unit> = io {
+        locked { it.approveFees(raised.hub, raised.charged) }
+        refresh()
     }
 
     suspend fun code(amount: ULong?): Result<Code> = io { local { it.paymentCode(amount) } }

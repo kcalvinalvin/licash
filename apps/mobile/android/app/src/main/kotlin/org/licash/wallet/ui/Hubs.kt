@@ -27,6 +27,7 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
+import org.licash.core.FeesRaised
 import org.licash.core.FoundHub
 import org.licash.core.Hub
 import org.licash.core.HubsFound
@@ -60,9 +61,19 @@ internal fun unanswered(found: HubsFound, tor: Boolean): String? {
     return if (!tor && found.silentOnion > 0u) "$more: try with Tor on" else more
 }
 
-/** What a hub charges and takes, in a sheet: only what it does. Its address, to copy, `full`. */
+/**
+ * What a hub charges and takes, in a sheet: only what it does. Its address,
+ * to copy, `full`. What it `raised` since agreed, if anything, first, to
+ * `approve`.
+ */
 @Composable
-internal fun HubFees(hub: Hub, full: Boolean = false, dismiss: () -> Unit) {
+internal fun HubFees(
+    hub: Hub,
+    full: Boolean = false,
+    raised: FeesRaised? = null,
+    approve: (FeesRaised) -> Unit = {},
+    dismiss: () -> Unit,
+) {
     Sheet(if (full) name(hub.url) else "Fees and limits", dismiss) {
         if (full) {
             SelectionContainer {
@@ -74,6 +85,16 @@ internal fun HubFees(hub: Hub, full: Boolean = false, dismiss: () -> Unit) {
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
+        }
+        raised?.let { r ->
+            Group("Raised fees") {
+                raises(r).forEachIndexed { i, raise ->
+                    if (i > 0) Divider()
+                    Entry(raise.what, value = raise.now, sub = "Was ${raise.agreed}", tag = "raised")
+                }
+            }
+            Problem(RAISED_MEANS, error = false)
+            BigButton("Approve fees", Modifier.fillMaxWidth().testTag("approve-fees")) { approve(r) }
         }
         // What a payment costs, a section a direction: limits under each.
         Group("Paying") {

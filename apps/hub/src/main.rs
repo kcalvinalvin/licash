@@ -1011,6 +1011,8 @@ fn command(cli: Cli) -> anyhow::Result<()> {
                         range,
                     );
                     let openings = runtime.block_on(opening).context("open the contracts")?;
+                    // What each holder agrees to pay at most from now on.
+                    openings.charging(hub.info().policy.fees());
                     openings.spawn_sweeper();
                     if responding {
                         openings.spawn_responder(response_poll);
@@ -1035,6 +1037,15 @@ fn command(cli: Cli) -> anyhow::Result<()> {
                     None
                 }
             };
+            // Their holders agreed to what it charged then, and no more.
+            match licash_contracts::hub::opened_for_less(&cli.data, &hub.info().policy.fees()) {
+                Ok(0) => {}
+                Ok(contracts) => tracing::warn!(
+                    contracts,
+                    "contracts were opened while the hub charged less: their holders pay it nothing more until they agree to its fees now"
+                ),
+                Err(e) => tracing::warn!("the fees kept in openings.sqlite: {e:#}"),
+            }
             // One Tor client for the onion service and the swaps' wallet
             // alike, since its state directory takes only one.
             let tor = match onion || swaps_tor {

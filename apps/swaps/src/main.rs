@@ -367,8 +367,9 @@ enum Command {
         step: u64,
         /// Renew notes a hub no longer unlinks since it restarted, paying
         /// them to the provider itself, only if its fee on them is at most
-        /// this many parts per million of their value, its base fee
-        /// included: 0 renews them only for free.
+        /// this many parts per million of their value, or its spending
+        /// schedule is at most 1 sat base, this rate and 0.1 sat per
+        /// output. Contract ceilings take precedence. 0 means free only.
         #[arg(long, env = "LICASH_SWAPS_RENEW_PPM", default_value_t = licash_wallet::RENEW_PPM)]
         renew_ppm: u32,
         /// Reach hubs, and Nostr relays, through this proxy, such as
@@ -970,7 +971,7 @@ mod tests {
     }
 
     #[test]
-    fn renewals_cost_at_most_100_parts_per_million_unless_set() {
+    fn renewals_default_to_1000_parts_per_million_unless_set() {
         let renew = |args: &[&str]| {
             let cli = Cli::try_parse_from([&["licash-swaps", "run"], args].concat()).unwrap();
             match cli.command {
@@ -978,7 +979,7 @@ mod tests {
                 _ => unreachable!("run"),
             }
         };
-        assert_eq!(renew(&[]), 100);
+        assert_eq!(renew(&[]), 1_000);
         assert_eq!(renew(&["--renew-ppm", "0"]), 0);
     }
 }

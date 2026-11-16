@@ -1,6 +1,7 @@
 //! `licash-wallet open-contract` and `contracts`: recovery contracts at
 //! the wallet's hubs, kept beside its file, each paid from a coin of the
-//! wallet's on Bitcoin. `force-close`, `recoveries` and
+//! wallet's on Bitcoin. `approve-fees`: more than a hub charged as they
+//! opened, agreed to. `force-close`, `recoveries` and
 //! `give-up-recovery`: one its hub left silent, closed by the wallet.
 //! `recovery-statement` and `import-proof`: one its hub answered, proved
 //! on another machine.
@@ -29,12 +30,83 @@ fn dir(path: &Path) -> &Path {
     path.parent().unwrap_or(Path::new("."))
 }
 
+/// Hold each hub to the fees the wallet's contracts there opened under,
+/// or its owner approved since. A wallet whose contracts cannot be read
+/// holds no hub to any, as one with none.
+pub fn agree(wallet: &Wallet<Http>, path: &Path) {
+    if let Err(e) = holder::fees::agree(wallet, dir(path), None) {
+        tracing::warn!("what the contracts' hubs may charge: {e:#}");
+    }
+}
+
+/// What `hub` charges now beside what the wallet agreed to there, asked
+/// again; with `yes`, agreed to as the wallet last heard it, without
+/// asking: what was shown.
+pub async fn approve_fees(
+    wallet: &Wallet<Http>,
+    path: &Path,
+    hub: &str,
+    yes: bool,
+    json: bool,
+) -> anyhow::Result<()> {
+    let hub = hub.trim_end_matches('/');
+    let agreed = wallet.fee_ceilings(hub)?;
+    let charged = match yes {
+        true => {
+            let hubs = wallet.hubs()?;
+            let known = hubs.iter().find(|(url, _)| url == hub);
+            let (_, info) = known.with_context(|| format!("{hub} is no hub this wallet trusts"))?;
+            info.fees
+        }
+        false => wallet.add_hub(hub).await?.fees,
+    };
+    let raised = agreed.is_some_and(|agreed| charged.above(&agreed));
+    if yes && raised {
+        holder::fees::approve(wallet, dir(path), hub, &charged, None)?;
+    }
+    let now = wallet.fee_ceilings(hub)?;
+    let said = |fees: &licash_api::Fees| crate::say::fees(fees);
+    let line = match (agreed, raised, yes) {
+        (None, ..) => format!(
+            "nothing to approve: no contract holds {hub} to its fees\ncharges  {}",
+            said(&charged)
+        ),
+        (Some(agreed), false, _) => format!(
+            "nothing to approve: {hub} charges no more than agreed\ncharges  {}\nagreed   {}",
+            said(&charged),
+            said(&agreed)
+        ),
+        (Some(agreed), true, false) => format!(
+            "{hub} charges more than agreed: `approve-fees {hub} --yes` agrees to it\ncharges  {}\nagreed   {}",
+            said(&charged),
+            said(&agreed)
+        ),
+        (Some(agreed), true, true) => format!(
+            "approved\ncharges  {}\nagreed   {}\nbefore   {}",
+            said(&charged),
+            now.as_ref().map_or_else(|| "nothing".into(), said),
+            said(&agreed)
+        ),
+    };
+    show(
+        json,
+        json!({
+            "hub": hub, "charged": charged, "agreed_before": agreed, "agreed": now,
+            "raised": raised, "approved": yes && raised,
+        }),
+        line,
+    );
+    Ok(())
+}
+
 /// What `open-contract` asks of a hub, as given.
 pub struct Asked {
     pub blocks: Option<u32>,
     pub max_price: Option<u64>,
     pub cap: Option<u32>,
     pub coin: Option<bitcoin::OutPoint>,
+    /// At a hub charging more than is sane too.
+    pub any_fees: bool,
 }
 
 /// Open a contract at `hub` closing `blocks` from now [default: as late
@@ -72,7 +144,11 @@ pub async fn open(
         cap: asked.cap,
         deposit: asked.coin,
     };
-    let contract = holder::open(wallet, &chain, dir(path), hub, ask).await?;
+    let (dir, change) = (dir(path), holder::Change::Bitcoin);
+    let contract = match asked.any_fees {
+        true => holder::open_anyway(wallet, &chain, dir, hub, ask, change).await,
+        false => holder::open_with(wallet, &chain, dir, hub, ask, change).await,
+    }?;
     show(json, contract_json(&contract), contract_line(&contract));
     Ok(())
 }

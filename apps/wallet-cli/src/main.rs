@@ -57,8 +57,9 @@ struct Cli {
     json: bool,
     /// Renew notes a hub no longer unlinks since it restarted, paying them
     /// to the wallet itself, only if its fee on them is at most this many
-    /// parts per million of their value, its base fee included: 0 renews
-    /// them only for free.
+    /// parts per million of their value, or its spending schedule is at
+    /// most 1 sat base, this rate and 0.1 sat per output. Contract ceilings
+    /// take precedence. 0 renews them only for free.
     #[arg(long, global = true, env = "LICASH_WALLET_RENEW_PPM",
           default_value_t = licash_wallet::RENEW_PPM)]
     renew_ppm: u32,
@@ -375,9 +376,24 @@ enum Command {
         /// smallest free that pays it].
         #[arg(long)]
         coin: Option<bitcoin::OutPoint>,
+        /// Open it at a hub charging more than is sane too: over 10 sat
+        /// or 1% a payment, lock or refund, a sat for each note made, or
+        /// 20% of the cap chosen a year.
+        #[arg(long)]
+        any_fees: bool,
         /// The chain to check the hub's quote on and broadcast to.
         #[arg(long, env = "LICASH_WALLET_CHAIN")]
         chain: Option<String>,
+    },
+    /// What the hub at URL charges now, asked again, beside what the
+    /// wallet agreed to pay it at most: its fees as the wallet's contracts
+    /// there opened. A hub charging more is paid nothing, and its notes
+    /// are not renewed, until --yes agrees to what was shown.
+    ApproveFees {
+        url: String,
+        /// Agree to its fees, as last shown.
+        #[arg(long)]
+        yes: bool,
     },
     /// The wallet's contracts, the newest first. With --chain, those
     /// under way carried on, and where each one's funding stands.
@@ -549,6 +565,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     }
     let wallet = Wallet::open(&path, transport)?;
     wallet.set_renew_limit(cli.renew_ppm);
+    contract::agree(&wallet, &path);
     match cli.command {
         Command::Init { .. } | Command::Discover { .. } => unreachable!("handled above"),
         Command::Address => {
@@ -629,8 +646,13 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                     Some(d) => format!("  deposits {}", say::between(d.min, d.max)),
                     None => String::new(),
                 };
+                let agreed = wallet.fee_ceilings(url).ok().flatten();
+                let raised = match agreed.is_some_and(|agreed| info.fees.above(&agreed)) {
+                    true => "  more than agreed: approve-fees",
+                    false => "",
+                };
                 format!(
-                    "{url}  {}{lightning}{deposits}",
+                    "{url}  {}{lightning}{deposits}{raised}",
                     say::payment_fee(&info.fees)
                 )
             });
@@ -975,6 +997,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             max_price,
             cap,
             coin,
+            any_fees,
             chain,
         } => {
             let ask = contract::Asked {
@@ -982,11 +1005,15 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 max_price,
                 cap,
                 coin,
+                any_fees,
             };
             return contract::open(&wallet, &path, chain.as_deref(), &hub, ask, json).await;
         }
         Command::Contracts { chain } => {
             return contract::list(&wallet, &path, chain.as_deref(), json).await;
+        }
+        Command::ApproveFees { url, yes } => {
+            return contract::approve_fees(&wallet, &path, &url, yes, json).await;
         }
         Command::ForceClose {
             id,

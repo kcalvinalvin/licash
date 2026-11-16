@@ -26,8 +26,10 @@ one came from when it is spent; `unlink` asks again for those left linked.
 A hub that restarted no longer unlinks the notes it issued before: the
 wallet renews them, paying them to itself for notes it unlinks, once, if
 the hub's fee on them is at most `--renew-ppm` parts per million of their
-value (`LICASH_WALLET_RENEW_PPM`, 100 by default, 0 for free renewals
-only). `history` lists a renewal as a payment to the wallet's own address.
+value, or its spending schedule is at most 1 sat base, that relative rate,
+and 0.1 sat per output (`LICASH_WALLET_RENEW_PPM`, 1000 by default, 0 for
+free renewals only). Live contract ceilings take precedence. `history`
+lists a renewal as a payment to the wallet's own address.
 
 `code` prints a payment code (a BIP321 URI, `--qr` for QR codes) naming the
 wallet, the hubs it is paid at and its Nostr mailbox, if they name relays.
@@ -121,7 +123,19 @@ the hub allows), `--max-price` the most to pay (by default the price the
 hub's info says). At a hub that lets wallets choose (its info names a
 range), `--cap` with `--blocks` sets the most the contract protects, at the
 price the range gives; `--coin TXID:VOUT` names the coin to pay from. Several contracts, at one hub or several, each take their
-own coin. `contracts` lists them; with `--chain`, it carries on those under
+own coin. No contract opens at a hub charging more than is sane (over 10 sat
+or 1% on a payment, lock or refund, over 1 sat for each note made, or over
+20% of a chosen cap a year) unless `--any-fees` asks all the same.
+
+The fees a hub charges as a contract opens there are the most the wallet
+agreed to pay it, kept with the contract in `contracts.sqlite`. A hub may
+raise its fees whenever it likes: while it charges more than agreed (at
+several live contracts, the least of each fee), payments and locks there
+are refused, its notes are not renewed, and `hubs` says so. `approve-fees
+<hub>` asks the hub again and shows what it charges beside what was agreed;
+`approve-fees <hub> --yes` agrees to what was last shown, each fee raised to
+it and none lowered. Contracts opened before fees were kept with them hold
+their hub to nothing, as does a hub with no live contract. `contracts` lists them; with `--chain`, it carries on those under
 way and sees where each one's funding stands. On regtest, contracts are
 under a mock proof authority: such a contract protects nothing. On signet
 they are under the genuine programs, a trial: `force-close` below recovers

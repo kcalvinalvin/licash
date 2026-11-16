@@ -76,6 +76,8 @@ fun explain(e: Throwable): String = when (e) {
         "Not enough: ${sat(e.needed)} needed, ${sat(e.available)} available."
     is LicashException.NeedsTor -> "This hub is on Tor: turn Tor on in Settings."
     is LicashException.UnknownHub -> "This payment is at a hub you don't use yet: ${e.url}"
+    is LicashException.FeesRaised ->
+        "${host(e.hub)} raised its fees since your protection there started. Approve them in Settings, under Hubs, to pay there."
     is LicashException.Failed -> plain(e.reason)
     is ChainException.Failed -> plain(e.reason)
     else -> plain(e.message ?: e.toString())

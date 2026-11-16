@@ -134,18 +134,33 @@ private fun Overview(engine: Engine, ui: Ui, open: (Page) -> Unit) {
 /** The hubs used, each opening what it charges; one added by its address, or found. */
 @Composable
 private fun HubsPage(engine: Engine, ui: Ui) {
+    val scope = rememberCoroutineScope()
     var shown by remember { mutableStateOf<Hub?>(null) }
+    var failed by remember { mutableStateOf<String?>(null) }
+    fun raised(hub: Hub) = ui.raised.find { it.hub == hub.url }
     if (ui.hubs.isNotEmpty()) {
         Group("") {
             ui.hubs.forEachIndexed { i, hub ->
                 if (i > 0) Divider()
-                Entry(name(hub.url), Modifier.testTag("hub"), sub = about(hub), onClick = { shown = hub })
+                val sub = if (raised(hub) == null) about(hub) else "Raised its fees: approve to pay there"
+                Entry(name(hub.url), Modifier.testTag("hub"), sub = sub, onClick = { shown = hub })
             }
         }
     }
+    failed?.let { Problem(it) }
     Group("Add a hub") { AddHub(engine) }
     Group("More hubs") { FoundHubs(engine, ui, auto = false) }
-    shown?.let { HubFees(it, full = true) { shown = null } }
+    shown?.let { hub ->
+        HubFees(
+            hub,
+            full = true,
+            raised = raised(hub),
+            approve = { r ->
+                shown = null
+                scope.launch { failed = engine.approveFees(r).exceptionOrNull()?.let(::explain) }
+            },
+        ) { shown = null }
+    }
 }
 
 /** The app's version, what it keeps on the phone, and its logs to share. */
@@ -287,7 +302,8 @@ private fun RenewLimit(engine: Engine) {
         Info(
             "Renewing notes",
             "A hub that restarted can no longer unlink the notes it issued before. " +
-                "The wallet swaps them for new ones there if the hub charges at most this.",
+                "The wallet swaps them for new ones there within this share, or if its fees are at most " +
+                "1 sat base, this rate and 0.1 sat per output. Protection's agreed fees take precedence. 0 means free only.",
         )
     }
     Row(

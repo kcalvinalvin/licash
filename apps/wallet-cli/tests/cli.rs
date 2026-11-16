@@ -59,6 +59,141 @@ fn available(file: &Path) -> (u64, u64) {
     })
 }
 
+/// A contract at `hub` beside the wallet `file`, its F buried, as
+/// `open-contract` leaves one in a file of version `version`: its hub
+/// held to `fees`, if any were kept with it.
+fn contract_at(file: &Path, hub: &str, fees: Option<&Value>, version: i64) {
+    let db = rusqlite::Connection::open(file.parent().unwrap().join("contracts.sqlite")).unwrap();
+    db.execute_batch(
+        "CREATE TABLE contracts (
+             id BLOB PRIMARY KEY, hub TEXT NOT NULL, format INTEGER NOT NULL,
+             phase INTEGER NOT NULL, mock INTEGER NOT NULL, irrevocable INTEGER NOT NULL,
+             deposit BLOB NOT NULL, value INTEGER NOT NULL, price INTEGER NOT NULL,
+             cap INTEGER NOT NULL, assert_height INTEGER NOT NULL,
+             close_height INTEGER NOT NULL, funding BLOB, since INTEGER NOT NULL, fate TEXT,
+             abandoned TEXT, state BLOB NOT NULL, created_at INTEGER NOT NULL,
+             updated_at INTEGER NOT NULL
+         ) STRICT;",
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO contracts VALUES (?2, ?1, 1, 0, 1, 1, zeroblob(36), 60000, 23000, 4096,
+                                       360, 500, NULL, 200, 'live', NULL, x'', 0, 0)",
+        rusqlite::params![hub, [1u8; 32]],
+    )
+    .unwrap();
+    if let Some(fees) = fees {
+        db.execute_batch(
+            "CREATE TABLE ceilings (
+                 id BLOB PRIMARY KEY REFERENCES contracts (id), fees TEXT NOT NULL,
+                 updated_at INTEGER NOT NULL
+             ) STRICT;",
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO ceilings VALUES (?2, ?1, 0)",
+            rusqlite::params![fees.to_string(), [1u8; 32]],
+        )
+        .unwrap();
+    }
+    db.pragma_update(None, "user_version", version).unwrap();
+}
+
+#[test]
+fn a_hub_charging_more_than_its_contracts_opened_under_is_paid_once_its_fees_are_approved() {
+    let hub = Server::start(FEE);
+    let url = hub.url();
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, _) = party(dir.path(), "alice", Some(&hub));
+    let (bob, bob_at) = party(dir.path(), "bob", Some(&hub));
+    let funds = serde_json::to_string(&hub.pay(&address(&alice_at(&alice)), 100)).unwrap();
+    ok(wallet(&alice, &["receive"], Some(&funds)));
+    let charged = json(&alice, &["hubs"])[0]["fees"].clone();
+
+    // No contract: no hub is held to anything, and nothing is made.
+    let asked = json(&alice, &["approve-fees", &url, "--yes"]);
+    assert_eq!(asked["agreed"], Value::Null);
+    assert_eq!(
+        (&asked["raised"], &asked["approved"]),
+        (&false.into(), &false.into())
+    );
+    assert_eq!(asked["charged"], charged);
+    assert!(!alice.with_file_name("contracts.sqlite").exists());
+    failed(
+        wallet(&alice, &["approve-fees", "http://127.0.0.1:1"], None),
+        1,
+        "unknown hub",
+    );
+
+    // Her contract there opened while a payment was free.
+    let mut agreed = charged.clone();
+    agreed["spend"]["base"] = 0.into();
+    contract_at(&alice, &url, Some(&agreed), 1);
+    let refused = "charges more than agreed";
+    failed(wallet(&alice, &["send", &bob_at, "10"], None), 1, refused);
+    assert_eq!(available(&alice), (100, 0));
+    let text = ok(wallet(&alice, &["hubs"], None));
+    assert!(text.contains("more than agreed: approve-fees"), "{text}");
+    // Shown, asked again: nothing agreed to yet.
+    let shown = json(&alice, &["approve-fees", &url]);
+    assert_eq!(
+        (&shown["raised"], &shown["approved"]),
+        (&true.into(), &false.into())
+    );
+    assert_eq!((&shown["charged"], &shown["agreed"]), (&charged, &agreed));
+    let text = ok(wallet(&alice, &["approve-fees", &url], None));
+    assert!(
+        text.contains("--yes") && text.contains("charges  1 sat a payment"),
+        "{text}"
+    );
+    failed(wallet(&alice, &["send", &bob_at, "10"], None), 1, refused);
+
+    // Agreed to: paid, and kept beside the wallet.
+    let approved = json(&alice, &["approve-fees", &url, "--yes"]);
+    assert_eq!(approved["approved"], true);
+    assert_eq!(
+        (&approved["agreed_before"], &approved["agreed"]),
+        (&agreed, &charged)
+    );
+    let payment = ok(wallet(&alice, &["send", &bob_at, "10"], None));
+    assert_eq!(
+        ok(wallet(&bob, &["receive"], Some(&payment))).trim(),
+        "received 10 sat"
+    );
+    let again = json(&alice, &["approve-fees", &url, "--yes"]);
+    assert_eq!(
+        (&again["raised"], &again["approved"]),
+        (&false.into(), &false.into())
+    );
+    let text = ok(wallet(&alice, &["hubs"], None));
+    assert!(!text.contains("more than agreed"), "{text}");
+
+    // Contracts opened before any fees were kept, or kept by a build this
+    // one cannot read: no hub is held to anything.
+    for (name, version) in [("carol", 1), ("dave", 9)] {
+        let (wallet_file, _) = party(dir.path(), name, Some(&hub));
+        let at = alice_at(&wallet_file);
+        let funds = serde_json::to_string(&hub.pay(&address(&at), 100)).unwrap();
+        ok(wallet(&wallet_file, &["receive"], Some(&funds)));
+        contract_at(
+            &wallet_file,
+            &url,
+            (version == 9).then_some(&agreed),
+            version,
+        );
+        assert_eq!(
+            json(&wallet_file, &["approve-fees", &url])["agreed"],
+            Value::Null
+        );
+        ok(wallet(&wallet_file, &["send", &bob_at, "10"], None));
+    }
+}
+
+/// The address of the wallet `file`.
+fn alice_at(file: &Path) -> String {
+    ok(wallet(file, &["address"], None)).trim().to_owned()
+}
+
 #[test]
 fn owners_pay_and_get_paid_on_the_command_line() {
     let hub = Server::start(FEE);
@@ -233,12 +368,12 @@ fn notes_a_restarted_hub_no_longer_unlinks_are_renewed_within_the_fee_limit() {
     assert_eq!(received["unlinked"], Value::Null);
     let _hub = hub.restarted();
 
-    // Its fee of 1 on 64 is 15,625 parts per million: over the limit.
+    // A zero limit permits only free renewal. The default also accepts
+    // the hub's modest schedule, despite 1 on 64 exceeding 1,000 ppm.
     let unlink = |ppm: &str| json(&alice, &["--renew-ppm", ppm, "unlink"])["unlinked"].clone();
-    assert_eq!(json(&alice, &["unlink"])["unlinked"], 0);
-    assert_eq!(unlink("15624"), 0);
+    assert_eq!(unlink("0"), 0);
     assert_eq!(json(&alice, &["history"]), Value::Array(vec![]));
-    let unlinked = unlink("15625");
+    let unlinked = json(&alice, &["unlink"])["unlinked"].clone();
     assert!(unlinked.as_u64().unwrap() > 0, "{unlinked}");
     let history = json(&alice, &["history"]);
     assert_eq!(history.as_array().unwrap().len(), 1, "{history}");

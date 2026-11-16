@@ -38,8 +38,8 @@ use licash_hub_service::{
 };
 use licash_mobile::{
     default_relays, set_logger, wallet_exists, Activity, Balance, ChainError, ChainSource, Details,
-    Kind, LicashError, Linking, Logger, Network, Onchain, PaidTo, PayOffer, PayQuote, Range, Rate,
-    Scanned, State, Wallet,
+    Fees, FeesRaised, Kind, LicashError, Linking, Logger, Network, Onchain, PaidTo, PayOffer,
+    PayQuote, Range, Rate, Scanned, State, Wallet,
 };
 use licash_nostr::{Announcement, Announcer, Role, Route};
 use licash_wallet::PaymentCode;
@@ -1478,9 +1478,9 @@ fn a_phone_shows_the_notes_each_line_of_its_history_spent_and_made() {
     let net = Net::new(true);
     let light = Light::new(&net);
     let alice = funded(&net, &light, "alice");
-    // Renewals of notes a restarted hub no longer unlinks: 100 parts per
+    // Renewals of notes a restarted hub no longer unlinks: 1000 parts per
     // million at most unless set.
-    assert_eq!(alice.renew_limit(), 100);
+    assert_eq!(alice.renew_limit(), 1_000);
     alice.set_renew_limit(0);
     assert_eq!(alice.renew_limit(), 0);
     let held = notes(&alice);
@@ -1991,6 +1991,101 @@ fn a_phone_whose_hub_opens_no_contracts_has_none_and_keeps_no_file_for_them() {
     let dir = std::path::Path::new(&net.dir("alice")).to_owned();
     assert!(dir.join("wallet.sqlite").exists());
     assert!(!dir.join("contracts.sqlite").exists() && !dir.join("contracts").exists());
+}
+
+/// A contract at `hub` in the wallet's directory `dir`, its F buried, as
+/// one opened there leaves it: its hub held to `fees`, as JSON.
+fn contract_under(dir: &str, hub: &str, fees: &str) {
+    let db = rusqlite::Connection::open(std::path::Path::new(dir).join("contracts.sqlite"));
+    let db = db.unwrap();
+    db.execute_batch(
+        "CREATE TABLE contracts (
+             id BLOB PRIMARY KEY, hub TEXT NOT NULL, format INTEGER NOT NULL,
+             phase INTEGER NOT NULL, mock INTEGER NOT NULL, irrevocable INTEGER NOT NULL,
+             deposit BLOB NOT NULL, value INTEGER NOT NULL, price INTEGER NOT NULL,
+             cap INTEGER NOT NULL, assert_height INTEGER NOT NULL,
+             close_height INTEGER NOT NULL, funding BLOB, since INTEGER NOT NULL, fate TEXT,
+             abandoned TEXT, state BLOB NOT NULL, created_at INTEGER NOT NULL,
+             updated_at INTEGER NOT NULL
+         ) STRICT;
+         CREATE TABLE ceilings (
+             id BLOB PRIMARY KEY REFERENCES contracts (id), fees TEXT NOT NULL,
+             updated_at INTEGER NOT NULL
+         ) STRICT;
+         PRAGMA user_version = 1;",
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO contracts VALUES (?2, ?1, 1, 0, 1, 1, zeroblob(36), 60000, 23000, 4096,
+                                       360, 500, NULL, 200, 'live', NULL, x'', 0, 0)",
+        rusqlite::params![hub, [1u8; 32]],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO ceilings VALUES (?1, ?2, 0)",
+        rusqlite::params![[1u8; 32], fees],
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_phone_pays_a_hub_charging_more_than_its_contract_opened_under_once_approved() {
+    let net = Net::new(true);
+    let light = Light::new(&net);
+    let alice = funded(&net, &light, "alice");
+    let held = notes(&alice);
+    let bob = net.wallet("bob", net.height());
+    let hub = alice.hubs().unwrap().remove(0);
+    // No contract: no hub is held to anything, and nothing is made.
+    assert!(alice.fees_raised().unwrap().is_empty());
+    let one = Rate { base: 1, ppm: 0 };
+    let charged = Fees {
+        spend: one,
+        lock: one,
+        refund: one,
+        output_msat: 0,
+    };
+    alice.approve_fees(hub.url.clone(), charged).unwrap();
+    let dir = net.dir("alice");
+    assert!(!std::path::Path::new(&dir).join("contracts.sqlite").exists());
+    let other = invalid(alice.approve_fees("https://other.example".into(), charged));
+    assert!(other.contains("no hub you use"), "{other}");
+    drop(alice);
+
+    // Her contract there opened while a payment was free.
+    let free = r#"{"spend":{"base":0,"ppm":0},"lock":{"base":1,"ppm":0},"refund":{"base":1,"ppm":0},"output_msat":0}"#;
+    contract_under(&dir, &hub.url, free);
+    let alice = Wallet::open(dir.clone(), false).unwrap();
+    let agreed = Fees {
+        spend: Rate { base: 0, ppm: 0 },
+        ..charged
+    };
+    let raised = vec![FeesRaised {
+        hub: hub.url.clone(),
+        charged,
+        agreed,
+    }];
+    assert_eq!(alice.fees_raised().unwrap(), raised);
+    let asked = bob.payment_code(Some(500)).unwrap();
+    let refused = alice.pay(asked.qr.clone(), None).unwrap_err();
+    assert!(
+        matches!(&refused, LicashError::FeesRaised { hub: at } if *at == hub.url),
+        "{refused:?}"
+    );
+    assert_eq!(notes(&alice), held);
+    assert_eq!(alice.fees_raised().unwrap(), raised);
+
+    // Approved as shown: paid, and kept for the wallet opened again.
+    alice.approve_fees(hub.url.clone(), charged).unwrap();
+    assert!(alice.fees_raised().unwrap().is_empty());
+    let paid = alice.pay(asked.qr, None).unwrap();
+    assert_eq!(paid.amount, 500);
+    assert_eq!(notes(&alice), held - 501);
+    drop(alice);
+    let alice = Wallet::open(dir, false).unwrap();
+    assert!(alice.fees_raised().unwrap().is_empty());
+    let asked = bob.payment_code(Some(100)).unwrap();
+    assert_eq!(alice.pay(asked.qr, None).unwrap().amount, 100);
 }
 
 #[test]

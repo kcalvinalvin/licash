@@ -82,10 +82,10 @@ pub use silent::{Blocks, Payee, Scanned, SilentCoin, SilentSpend};
 use store::{now, sql, Owner, Store};
 pub use swaps::{Swap, SwapLimits, SwapQuote, SwapState, SWAP_ROOM, SWAP_WINDOW};
 
-/// The most a wallet pays to renew notes its hub no longer unlinks unless
-/// told otherwise ([`Wallet::set_renew_limit`]): in parts per million of
-/// their value.
-pub const RENEW_PPM: u32 = 100;
+/// The default relative limit for automatic renewal without contract
+/// ceilings ([`Wallet::set_renew_limit`]), in parts per million. A modest
+/// spending schedule is allowed too, as that setter describes.
+pub const RENEW_PPM: u32 = 1_000;
 
 /// Why a note stays linked: its hub refused to renew it.
 const RENEWAL_REFUSED: &str = "renewal_refused";
@@ -561,8 +561,10 @@ impl<T: Transport> Wallet<T> {
 
     /// Renew notes their hub no longer unlinks ([`Wallet::unlink`]) only
     /// if its fee on them is at most `ppm` parts per million of their
-    /// value, its base fee and rounding included: with 0, only where it
-    /// charges nothing. [`RENEW_PPM`] until set.
+    /// value, or its advertised spending fees are at most 1 sat base,
+    /// `ppm` millionths and 0.1 sat per output. With 0, only where the
+    /// renewal costs nothing. Contract ceilings take precedence.
+    /// [`RENEW_PPM`] until set.
     pub fn set_renew_limit(&self, ppm: u32) {
         self.renew_ppm.store(ppm, Ordering::Relaxed);
     }

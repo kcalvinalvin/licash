@@ -8,6 +8,8 @@ import java.util.Locale
 import org.licash.core.Balance
 import org.licash.core.Contract
 import org.licash.core.ContractState
+import org.licash.core.Fees
+import org.licash.core.FeesRaised
 import org.licash.core.Hub
 import org.licash.core.OpeningStep
 import org.licash.core.Rate
@@ -147,13 +149,36 @@ fun charge(rate: Rate): String = when {
  * What a hub charges a payment in Licash: its rate and, if it charges for
  * the notes a payment makes, that for each: `1 sat + 0.01% + 0.1 sat a note`.
  */
-fun paying(hub: Hub): String {
-    val rate = Rate(hub.feeBase, hub.feePpm)
-    if (hub.feeOutputMsat == 0uL) return charge(rate)
-    val (whole, rest) = hub.feeOutputMsat / 1_000uL to hub.feeOutputMsat % 1_000uL
+fun paying(hub: Hub): String = paying(Rate(hub.feeBase, hub.feePpm), hub.feeOutputMsat)
+
+/** [paying], of a `rate` and a fee of `outputMsat` thousandths of a sat for each note made. */
+fun paying(rate: Rate, outputMsat: ULong): String {
+    if (outputMsat == 0uL) return charge(rate)
+    val (whole, rest) = outputMsat / 1_000uL to outputMsat % 1_000uL
     val each = if (rest == 0uL) sat(whole) else "$whole.${rest.toString().padStart(3, '0').trimEnd('0')} sat"
     return if (rate.base == 0uL && rate.ppm == 0uL) "$each a note" else "${charge(rate)} + $each a note"
 }
+
+/** A fee a hub changed since it was agreed to: what it is on, what it is `now`, and what was `agreed`. */
+data class Raise(val what: String, val now: String, val agreed: String)
+
+/**
+ * What a hub charging more than agreed changed, to approve: each of its
+ * fees that differs, the others left unsaid. Approving takes none lower
+ * than agreed.
+ */
+fun raises(raised: FeesRaised): List<Raise> {
+    val (now, agreed) = raised.charged to raised.agreed
+    fun said(fees: Fees) = paying(fees.spend, fees.outputMsat)
+    return listOfNotNull(
+        Raise("Paying", said(now), said(agreed)).takeIf { it.now != it.agreed },
+        Raise("Holding a payment", charge(now.lock), charge(agreed.lock)).takeIf { now.lock != agreed.lock },
+        Raise("Refunding one", charge(now.refund), charge(agreed.refund)).takeIf { now.refund != agreed.refund },
+    )
+}
+
+/** Why a hub's fees are the owner's to approve, said wherever they are. */
+const val RAISED_MEANS = "This hub raised its fees since your protection there started. Nothing is paid there until you approve them."
 
 /**
  * The most a hub charges on paying `amount`, said before the notes it

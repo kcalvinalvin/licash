@@ -15,6 +15,16 @@ class FormatTest {
     }
 
     @Test
+    fun a_hub_charging_more_than_agreed_is_named_and_where_to_approve_it() {
+        val said = explain(org.licash.core.LicashException.FeesRaised("https://hub.example:8443"))
+        assertEquals(
+            "hub.example:8443 raised its fees since your protection there started. " +
+                "Approve them in Settings, under Hubs, to pay there.",
+            said,
+        )
+    }
+
+    @Test
     fun a_fee_says_what_it_is_of_the_amount() {
         assertEquals(null, share(0uL, 100uL))
         assertEquals(null, share(5uL, 0uL))

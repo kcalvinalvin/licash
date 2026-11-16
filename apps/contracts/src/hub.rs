@@ -119,6 +119,16 @@ pub fn signed(data: &Path) -> Result<u64> {
     Store::signed(data)
 }
 
+/// How many openings in `data` the hub signed started while it charged
+/// less, in some fee, than `fees`, what it charges now: their holders
+/// agreed to no more, and pay it nothing until they agree to these
+/// ([`Openings::charging`]). Those started before what it charged was
+/// kept are not counted. Nothing is made in `data`.
+pub fn opened_for_less(data: &Path, fees: &licash_api::Fees) -> Result<u64> {
+    let charged = Store::charged(data)?;
+    Ok(charged.iter().filter(|was| fees.above(was)).count() as u64)
+}
+
 /// An opening as the hub's operator sees it ([`openings`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Summary {
@@ -245,6 +255,13 @@ impl Openings {
         let locked = openings.store().locked()?;
         openings.lock_coins(&locked).await;
         Ok(openings)
+    }
+
+    /// Keep `fees`, what the hub charges, with each opening that starts
+    /// from now on: what its holder agrees to pay at most
+    /// ([`opened_for_less`]). Nothing is kept until told.
+    pub fn charging(&self, fees: licash_api::Fees) {
+        self.store().charging(fees);
     }
 
     /// The hub's offer now, checkpointed at its tip: its quote of `cap`
@@ -732,6 +749,78 @@ mod tests {
         );
         assert!(store.abandon(&id, i64::MAX).unwrap().is_none());
         assert!(store.locked().unwrap().is_empty());
+    }
+
+    #[test]
+    fn what_the_hub_charged_is_kept_with_the_openings_started_once_told() {
+        let fee = |base, ppm| licash_api::Fee { base, ppm };
+        let fees = |base, ppm, output_msat| licash_api::Fees {
+            spend: fee(base, ppm),
+            lock: fee(base, ppm),
+            refund: fee(base, ppm),
+            output_msat,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let now = fees(1, 100, 100);
+        assert_eq!(opened_for_less(dir.path(), &now).unwrap(), 0);
+        assert!(!dir.path().join("openings.sqlite").exists());
+        let openings = test_openings(dir.path());
+        let sign = |id: u8| {
+            let store = openings.store();
+            assert!(store
+                .insert(
+                    &[id; 32],
+                    0,
+                    true,
+                    &deposit(u32::from(id)),
+                    &[0; 32],
+                    FUNDED
+                )
+                .unwrap());
+            store
+                .save(&[id; 32], HubPhase::Funded as u8, true, &[0; 32], FUNDED)
+                .unwrap();
+        };
+        // Not told what it charges: nothing kept, and the file as it was.
+        sign(1);
+        assert_eq!(opened_for_less(dir.path(), &now).unwrap(), 0);
+        let tables = || -> i64 {
+            let db = rusqlite::Connection::open(dir.path().join("openings.sqlite")).unwrap();
+            db.query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'table'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(tables(), 1);
+
+        openings.charging(fees(1, 50, 100));
+        sign(2);
+        assert_eq!(tables(), 2);
+        // One never signed, one whose deposit is another's, one given up.
+        assert!(openings
+            .store()
+            .insert(&[3; 32], 0, true, &deposit(3), &[0; 32], FUNDED)
+            .unwrap());
+        assert!(!openings
+            .store()
+            .insert(&[4; 32], 0, true, &deposit(3), &[0; 32], FUNDED)
+            .unwrap());
+        openings.store().abandon(&[3; 32], i64::MAX).unwrap();
+        openings.charging(now);
+        sign(5);
+
+        // Only the one signed for less, in one fee, than it charges now.
+        assert_eq!(opened_for_less(dir.path(), &now).unwrap(), 1);
+        assert_eq!(opened_for_less(dir.path(), &fees(1, 50, 100)).unwrap(), 0);
+        assert_eq!(opened_for_less(dir.path(), &fees(1, 100, 101)).unwrap(), 2);
+        assert_eq!(opened_for_less(dir.path(), &fees(0, 0, 0)).unwrap(), 0);
+        // Read by a hub that reopens them, and still of its version.
+        drop(openings);
+        let reopened = test_openings(dir.path());
+        assert_eq!(reopened.store().signed_ids().unwrap().len(), 3);
+        assert_eq!(signed(dir.path()).unwrap(), 3);
     }
 
     #[test]

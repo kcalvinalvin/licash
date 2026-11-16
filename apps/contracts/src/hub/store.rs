@@ -2,13 +2,20 @@
 //! as its machine stored itself at its last step, the digest of the
 //! holder's message that step took, and the hub's own coins F spends,
 //! which its node keeps locked while the opening lives.
+//!
+//! The file's version tells which of its tables a build must know to
+//! read it right. The `fees` are none of them: made with the first kept,
+//! whatever the version, and ignored by a build before them, which opens
+//! the file all the same. A migration to come must make them
+//! `IF NOT EXISTS` too.
 
 use std::path::Path;
 
 use anyhow::{bail, Result};
 use bitcoin::consensus::{deserialize, serialize};
 use bitcoin::OutPoint;
-use rusqlite::{params, Connection, OptionalExtension};
+use licash_api::Fees;
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
 /// The format of the rows: a machine's stored bytes, of
 /// `licash_contract`'s format 1.
@@ -32,6 +39,19 @@ CREATE TABLE IF NOT EXISTS openings (
 CREATE UNIQUE INDEX IF NOT EXISTS openings_deposit ON openings (deposit) WHERE abandoned = 0;
 ";
 
+/// What the hub charged as each opening started, as JSON: what its
+/// holder agreed to pay at most, for the operator to know whom fees
+/// raised since leave to agree again. Nothing is done by it. No row, of an
+/// opening started before these were kept, tells nothing: nor does no
+/// table.
+const FEES: &str = "
+CREATE TABLE IF NOT EXISTS fees (
+    id BLOB PRIMARY KEY REFERENCES openings (id),
+    fees TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+) STRICT;
+";
+
 /// An opening as stored.
 pub(super) struct Row {
     pub state: Vec<u8>,
@@ -53,7 +73,9 @@ pub(super) struct Listed {
     pub state: Vec<u8>,
 }
 
-pub(super) struct Store(Connection);
+/// The openings, and what the hub charges, if told
+/// ([`Store::charging`]): kept with each that starts.
+pub(super) struct Store(Connection, Option<Fees>);
 
 impl Store {
     /// How many openings in `dir` the hub signed and did not give up,
@@ -117,7 +139,46 @@ impl Store {
             1 => {}
             v => bail!("openings.sqlite is of version {v}, newer than this hub knows"),
         }
-        Ok(Self(c))
+        Ok(Self(c, None))
+    }
+
+    /// Keep `fees`, what the hub charges, with each opening that starts
+    /// from now on.
+    pub fn charging(&mut self, fees: Fees) {
+        self.1 = Some(fees);
+    }
+
+    /// What the hub charged as each opening in `dir` it signed and did
+    /// not give up started, read only: none of those started before these
+    /// were kept, nor of one whose own cannot be read.
+    pub fn charged(dir: &Path) -> Result<Vec<Fees>> {
+        let path = dir.join("openings.sqlite");
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let c = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let made: Option<i64> = c
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'fees'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if made.is_none() {
+            return Ok(Vec::new());
+        }
+        let mut stmt = c.prepare(
+            "SELECT f.fees FROM fees f JOIN openings o ON o.id = f.id
+             WHERE o.irrevocable = 1 AND o.abandoned = 0",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut all = Vec::new();
+        for text in rows {
+            if let Ok(fees) = serde_json::from_str(&text?) {
+                all.push(fees);
+            }
+        }
+        Ok(all)
     }
 
     /// Opening `id` in `dir`, read only, beside the running hub: none if
@@ -147,7 +208,8 @@ impl Store {
     }
 
     /// A new opening, of the holder's deposit `deposit`: false if another
-    /// opening not given up spends it.
+    /// opening not given up spends it. What the hub charges, if told, is
+    /// kept with it in the same write.
     pub fn insert(
         &self,
         id: &[u8; 32],
@@ -158,7 +220,8 @@ impl Store {
         state: &[u8],
     ) -> Result<bool> {
         let now = crate::now();
-        let inserted = self.0.execute(
+        let t = rusqlite::Transaction::new_unchecked(&self.0, TransactionBehavior::Immediate)?;
+        let inserted = t.execute(
             "INSERT INTO openings (id, format, phase, mock, irrevocable, deposit, coins, last,
                                    state, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, 0, ?5, x'', ?6, ?7, ?8, ?8)
@@ -174,6 +237,14 @@ impl Store {
                 now
             ],
         )?;
+        if let Some(fees) = self.1.as_ref().filter(|_| inserted == 1) {
+            t.execute_batch(FEES)?;
+            t.execute(
+                "INSERT INTO fees (id, fees, created_at) VALUES (?1, ?2, ?3)",
+                params![id, serde_json::to_string(fees)?, now],
+            )?;
+        }
+        t.commit()?;
         Ok(inserted == 1)
     }
 
