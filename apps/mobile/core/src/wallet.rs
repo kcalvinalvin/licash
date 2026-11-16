@@ -450,7 +450,7 @@ impl Wallet {
                 None => balance.onchain += coin.value,
             }
         }
-        balance.moving += self.confirmed_moves()?;
+        balance.moving += self.confirmed_moves(&reserved)?;
         balance.kept = self.kept_coins()?.iter().map(|(_, value)| value).sum();
         self.contracted(&mut balance, &held, &reserved)?;
         Ok(balance)
@@ -1005,7 +1005,16 @@ impl Wallet {
         let answered = deposits
             .iter()
             .filter(|d| d.terms.is_some() || d.state == DepositState::Open);
-        history.extend(answered.map(moved_activity));
+        history.extend(answered.map(|d| {
+            let mut activity = moved_activity(d);
+            // Its refund made, not yet found in a block.
+            if let DepositState::Refunded(txid) = &d.state {
+                if !self.refund_found(*txid) {
+                    activity.detail = format!("refund {txid} on its way");
+                }
+            }
+            activity
+        }));
         for lock in self.wallet.locks()? {
             if let Some(invoice) = &lock.invoice {
                 history.push(lightning_activity(&lock, invoice));
@@ -1385,7 +1394,7 @@ impl Wallet {
     /// What moves to notes hold once their payment is in a block and
     /// before their notes are received: no longer the wallet's coins, not
     /// yet its notes.
-    fn confirmed_moves(&self) -> Result<u64, LicashError> {
+    fn confirmed_moves(&self, reserved: &[(bitcoin::Txid, u64)]) -> Result<u64, LicashError> {
         let mut receipts = None;
         let mut moving = 0;
         for deposit in self.wallet.deposits()? {
@@ -1412,7 +1421,7 @@ impl Wallet {
             };
             let script = address.assume_checked().script_pubkey();
             let spends = self.wallet.silent_spends_paying(&script)?;
-            if spends.iter().any(|s| s.height.is_some()) {
+            if seen_paid(&deposit, reserved) || spends.iter().any(|s| s.height.is_some()) {
                 moving += deposit.amount;
             }
         }
@@ -1864,6 +1873,15 @@ fn confirmations(height: Option<u32>, next: Option<u32>) -> u32 {
     }
 }
 
+/// Whether `deposit` was paid in a block, as its hub saw, by a
+/// transaction spending no coin of the wallet's still shown (`reserved`,
+/// as moving or being opened): another's, such as a contract's F paying
+/// its change in, or the wallet's own once a scan saw it.
+fn seen_paid(deposit: &licash_wallet::Deposit, reserved: &[(bitcoin::Txid, u64)]) -> bool {
+    let shown = |paid: &OutPoint| reserved.iter().any(|(by, _)| *by == paid.txid);
+    deposit.funding.is_some_and(|(paid, _)| !shown(&paid))
+}
+
 fn moved_activity(deposit: &licash_wallet::Deposit) -> Activity {
     let (state, detail) = match &deposit.state {
         DepositState::Received => (State::Done, deposit.hub.clone()),
@@ -1917,9 +1935,36 @@ fn before_fee(fee: &licash_api::Fee, total: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use bitcoin::hashes::Hash as _;
+    use bitcoin::{OutPoint, Txid};
     use licash_api::Fee;
+    use licash_wallet::{Deposit, DepositState};
 
-    use super::before_fee;
+    use super::{before_fee, seen_paid};
+
+    #[test]
+    fn a_deposit_another_paid_moves_once_no_coin_shows_its_payment() {
+        let f = Txid::from_byte_array([7; 32]);
+        let mut deposit = Deposit {
+            hash: "00".into(),
+            hub: "http://hub.test".into(),
+            amount: 976_000,
+            terms: None,
+            funding: None,
+            lock: None,
+            state: DepositState::Open,
+            created_at: 0,
+        };
+        // Its payment unseen: nothing moves yet.
+        assert!(!seen_paid(&deposit, &[]));
+        deposit.funding = Some((OutPoint::new(f, 1), 100));
+        // Paid by F, the coin F spends gone: moving.
+        assert!(seen_paid(&deposit, &[]));
+        let other = Txid::from_byte_array([8; 32]);
+        assert!(seen_paid(&deposit, &[(other, 5_000)]));
+        // Its coin still shown as being opened: counted there, not twice.
+        assert!(!seen_paid(&deposit, &[(f, 1_000_000)]));
+    }
 
     #[test]
     fn an_amount_and_its_fee_come_to_the_total_or_a_sat_short() {

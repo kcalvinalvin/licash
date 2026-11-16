@@ -1,10 +1,8 @@
 //! The coins paid for deposits whose notes never came, taken back once
 //! their timeout passed: canceled by their hub (its lock to the wallet
-//! left unclaimed, say, the phone asleep) or paid too late for it to see.
-//! Each round at the chain's tip, by itself: the refund key is the
-//! wallet's alone.
-
-use std::collections::HashSet;
+//! left unclaimed, say, the phone asleep), paid too late for it to see, or
+//! never locked by then, its hub gone. Each round at the chain's tip, by
+//! itself: the refund key is the wallet's alone.
 
 use bitcoin::{Amount, FeeRate, OutPoint, Txid};
 use licash_contracts::holder;
@@ -16,31 +14,39 @@ use crate::ChainSource;
 /// The fee rate of a refund, in sat/vB: no estimates known.
 const REFUND_RATE: u64 = 2;
 
-/// Blocks past a deposit's timeout its payment is looked for when its hub
-/// never saw one, and its refund handed the network again until found in
-/// a block: two weeks.
-pub(super) const REFUND_BLOCKS: u32 = 2_016;
+/// Blocks past a deposit's timeout within which its payment is looked
+/// for, and its refund handed the network again, every [`LOOK_EVERY`]
+/// blocks: two weeks. Every [`LOOK_LATE`] after, and once each time the
+/// app starts: a phone asleep for longer gets its coins back all the same.
+const REFUND_BLOCKS: u32 = 2_016;
 
-/// Blocks between looks for the payment of one deposit its hub never saw:
-/// a contract's F is read whole to find it.
+/// Blocks between looks for the payment of one deposit, or hands of its
+/// refund to the network: a contract's F may be read whole to find it.
 const LOOK_EVERY: u32 = 6;
+
+/// [`LOOK_EVERY`] once [`REFUND_BLOCKS`] past a deposit's timeout: a day.
+const LOOK_LATE: u32 = 144;
 
 impl Wallet {
     /// Take back, through `chain` at `tip`, the coins of each deposit
-    /// canceled and past its timeout, paid as far as the wallet knows, to
-    /// its fallback address; and hand the network again the refunds made,
-    /// until found in a block. Never a deposit whose notes were received,
-    /// nor one still open: its notes may yet be claimed.
+    /// past its timeout whose notes never came
+    /// ([`licash_wallet::Wallet::deposits_to_refund`]), paid as far as
+    /// the wallet knows, to its fallback address; and hand the network
+    /// again the refunds made, until found in a block. Never a deposit
+    /// whose notes were received, nor one whose lock it may have claimed.
     pub(super) fn refund_deposits(&self, chain: &dyn ChainSource, tip: u32) {
         let due = match self.wallet.deposits_to_refund(tip) {
             Ok(due) => due,
             Err(e) => return tracing::warn!(%e, "the deposits to refund"),
         };
         for deposit in due {
-            let Some(funding) = self.deposit_paid(&deposit, tip) else {
+            let Some(terms) = &deposit.terms else {
                 continue;
             };
-            let Some(terms) = &deposit.terms else {
+            if !self.refund_turn(&deposit.hash, terms.timeout, tip) {
+                continue;
+            }
+            let Some(funding) = self.deposit_paid(&deposit, tip) else {
                 continue;
             };
             let to = match self.wallet.fallback_address() {
@@ -64,29 +70,31 @@ impl Wallet {
         self.refund_again(chain, tip);
     }
 
-    /// Where the payment of `deposit` is, at `tip`: as its hub saw it,
-    /// else a transaction of the wallet's in a block paying it, else the
-    /// F of a contract paying its change in. Its hub not having seen it,
-    /// looked for a while past its timeout, every few blocks.
+    /// Whether to act at `tip` on the deposit of `hash` timing out at
+    /// `timeout`: look for its payment, or hand its refund to the network
+    /// again. The first time since the app started, then every
+    /// [`LOOK_EVERY`] blocks, every [`LOOK_LATE`] once [`REFUND_BLOCKS`]
+    /// past its timeout.
+    fn refund_turn(&self, hash: &str, timeout: u32, tip: u32) -> bool {
+        let late = tip > timeout.saturating_add(REFUND_BLOCKS);
+        let every = if late { LOOK_LATE } else { LOOK_EVERY };
+        let mut looked = self
+            .refunds_looked
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let last = looked.get(hash).copied();
+        if last.is_some_and(|at| tip < at.saturating_add(every)) {
+            return false;
+        }
+        looked.insert(hash.to_owned(), tip);
+        true
+    }
+
+    /// Where the payment of `deposit` is, as far as the wallet knows: a
+    /// transaction of the wallet's in a block paying it, else the F of a
+    /// contract paying its change in, else the payment its hub saw.
     fn deposit_paid(&self, deposit: &Deposit, tip: u32) -> Option<OutPoint> {
-        if let Some((funding, _)) = deposit.funding {
-            return Some(funding);
-        }
         let terms = deposit.terms.as_ref()?;
-        if tip > terms.timeout.saturating_add(REFUND_BLOCKS) {
-            return None;
-        }
-        {
-            let mut looked = self
-                .refunds_looked
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            let last = looked.get(&deposit.hash).copied();
-            if last.is_some_and(|at| tip < at.saturating_add(LOOK_EVERY)) {
-                return None;
-            }
-            looked.insert(deposit.hash.clone(), tip);
-        }
         let address: bitcoin::Address<bitcoin::address::NetworkUnchecked> =
             terms.address.parse().ok()?;
         let script = address.assume_checked().script_pubkey();
@@ -104,31 +112,34 @@ impl Wallet {
             }
         }
         let paid = holder::paid_into(&self.wallet, &self.dir, &script, terms.pays, tip);
-        paid.unwrap_or_else(|e| {
+        let paid = paid.unwrap_or_else(|e| {
             tracing::warn!(hash = %deposit.hash, "a contract paying a deposit: {e:#}");
             None
-        })
+        });
+        paid.or(deposit.funding.map(|(funding, _)| funding))
+    }
+
+    /// Whether the refund `txid` made of a deposit was found in a block:
+    /// its coin the wallet's, spent since or not.
+    pub(super) fn refund_found(&self, txid: Txid) -> bool {
+        let coin = OutPoint::new(txid, 0);
+        let unspent = self.wallet.silent_coin_output(&coin);
+        let spent = self.wallet.silent_spent_at(&coin);
+        matches!(unspent, Ok(Some(_))) || matches!(spent, Ok(Some(_)))
     }
 
     /// The refunds made of deposits, handed the network again at `tip`
-    /// until found in a block (their coin the wallet's), for a while past
-    /// their timeout.
+    /// until found in a block, each in its turn ([`Wallet::refund_turn`]).
     fn refund_again(&self, chain: &dyn ChainSource, tip: u32) {
         let Ok(deposits) = self.wallet.deposits() else {
             return;
         };
-        let found: HashSet<Txid> = match self.wallet.silent_coins() {
-            Ok(coins) => coins.iter().map(|c| c.outpoint.txid).collect(),
-            Err(_) => return,
-        };
-        for deposit in deposits {
-            let DepositState::Refunded(txid) = deposit.state else {
-                continue;
-            };
-            let Some(terms) = &deposit.terms else {
-                continue;
-            };
-            if found.contains(&txid) || tip > terms.timeout.saturating_add(REFUND_BLOCKS) {
+        let refunded = deposits.iter().filter_map(|d| match (&d.state, &d.terms) {
+            (DepositState::Refunded(txid), Some(terms)) => Some((d, *txid, terms.timeout)),
+            _ => None,
+        });
+        for (deposit, txid, timeout) in refunded {
+            if self.refund_found(txid) || !self.refund_turn(&deposit.hash, timeout, tip) {
                 continue;
             }
             if let Ok(Some(tx)) = self.wallet.deposit_refund(&deposit.hash) {

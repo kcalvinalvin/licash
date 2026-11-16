@@ -2073,3 +2073,109 @@ fn a_phone_takes_back_the_coins_of_a_move_whose_notes_it_never_claimed() {
     scan(&alice, &light);
     assert!(refunds(&net).is_empty());
 }
+
+/// Alice's move of a 3,000 sat coin, paid and confirmed at depth, its
+/// notes locked by the hub and, never claimed, taken back by it: what
+/// her payment spends, pays and times out at, and the move's id. She
+/// never asked her hub since, and knows none of it.
+fn moved_unclaimed(net: &Net, light: &Arc<Light>, alice: &Wallet) -> (OutPoint, u64, u32, String) {
+    let code = alice.payment_code(None).unwrap();
+    net.mine(2, Vec::new());
+    let payment = net.pay_silent(&code.qr, 3_000, 1);
+    net.mine(1, vec![payment]);
+    net.mine(2, Vec::new());
+    assert_eq!(scan(alice, light), (1, 3_000));
+    let moving = alice.move_to_licash(light.clone()).unwrap();
+    let sent = net.sent();
+    let funding = OutPoint::new(sent[0].compute_txid(), 0);
+    let pays = moving.amount + 100;
+    assert_eq!(sent[0].output[0].value.to_sat(), pays);
+    let timeout = match alice.details(Kind::Moved, moving.id.clone()).unwrap() {
+        Details::Moved { timeout, .. } => timeout.unwrap(),
+        other => panic!("{other:?}"),
+    };
+    net.confirm_sent();
+    for _ in 0..10 {
+        net.round();
+        net.mine(1, Vec::new());
+    }
+    net.round();
+    (funding, pays, timeout, moving.id)
+}
+
+/// The transactions sent spending `coin`.
+fn spending(net: &Net, coin: OutPoint) -> Vec<Transaction> {
+    let sent = net.sent().into_iter();
+    sent.filter(|t| t.input.iter().any(|i| i.previous_output == coin))
+        .collect()
+}
+
+#[test]
+fn a_phone_takes_back_the_coins_of_a_move_its_hub_never_locked_to_it_as_far_as_it_knows() {
+    let net = Net::new(false);
+    let light = Light::new(&net);
+    let alice = net.wallet("alice", net.height());
+    let (funding, pays, timeout, id) = moved_unclaimed(&net, &light, &alice);
+    // Moving, paid in a block: no longer her coin, not yet her notes.
+    scan(&alice, &light);
+    let balance = alice.balance().unwrap();
+    assert_eq!((balance.onchain, balance.notes), (0, 0));
+    assert_eq!(balance.moving, pays - 100);
+
+    // Still open as far as she knows, no lock to her ever seen: not
+    // before its timeout, then taken back all the same.
+    while net.height() + 1 < timeout {
+        net.mine(1, Vec::new());
+    }
+    scan(&alice, &light);
+    assert!(spending(&net, funding).is_empty());
+    net.mine(1, Vec::new());
+    scan(&alice, &light);
+    let refunded = spending(&net, funding);
+    assert_eq!(refunded.len(), 1, "{refunded:?}");
+    let txid = refunded[0].compute_txid().to_string();
+    let detail = |alice: &Wallet| {
+        let history = alice.history().unwrap();
+        let moved = history.into_iter().find(|a| a.id == id).unwrap();
+        (moved.state, moved.detail)
+    };
+    // On its way until found in a block.
+    let on_its_way = format!("refund {txid} on its way");
+    assert_eq!(detail(&alice), (State::Failed, on_its_way));
+    net.confirm_sent();
+    let value = refunded[0].output[0].value.to_sat();
+    assert_eq!(scan(&alice, &light), (1, value));
+    let refunded_in = format!("refunded in {txid}");
+    assert_eq!(detail(&alice), (State::Failed, refunded_in));
+    assert_eq!(alice.balance().unwrap().onchain, value);
+}
+
+#[test]
+fn a_phone_hands_its_refund_on_long_after_its_timeout() {
+    let net = Net::new(false);
+    let light = Light::new(&net);
+    let alice = net.wallet("alice", net.height());
+    let (funding, _, timeout, _) = moved_unclaimed(&net, &light, &alice);
+    while net.height() < timeout {
+        net.mine(1, Vec::new());
+    }
+    // Made, but its broadcasts fail for over two weeks.
+    light.failing.store(true, Ordering::SeqCst);
+    scan(&alice, &light);
+    assert!(spending(&net, funding).is_empty());
+    net.mine(2_016 + 144, Vec::new());
+    scan(&alice, &light);
+    // Working again: handed on a day after the last try.
+    light.failing.store(false, Ordering::SeqCst);
+    net.mine(143, Vec::new());
+    scan(&alice, &light);
+    assert!(spending(&net, funding).is_empty());
+    net.mine(1, Vec::new());
+    scan(&alice, &light);
+    let refunded = spending(&net, funding);
+    assert_eq!(refunded.len(), 1, "{refunded:?}");
+    net.confirm_sent();
+    scan(&alice, &light);
+    let value = refunded[0].output[0].value.to_sat();
+    assert_eq!(alice.balance().unwrap().onchain, value);
+}
