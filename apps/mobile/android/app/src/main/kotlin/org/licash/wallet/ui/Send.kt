@@ -374,11 +374,11 @@ fun Send(
 }
 
 /** One fact of a payment to confirm: `tag` names its value, for the tests; a fee's `share` of the amount. */
-private class Fact(val label: String, val value: String, val tag: String, val share: String? = null)
+private class Fact(val label: String, val value: String, val tag: String, val share: String? = null, val fee: FeeBreakdown? = null)
 
 /** What a payment costs and when it arrives, to confirm it by: with what it comes to, if it costs. */
 private fun costs(amount: ULong, fee: ULong, arrives: String): List<Fact> = listOfNotNull(
-    Fact("Fee", if (fee == 0uL) "None" else sat(fee), "fee", share(fee, amount)),
+    Fact("Fee", if (fee == 0uL) "None" else sat(fee), "fee", share(fee, amount), FeeBreakdown(amount, fee)),
     if (fee > 0uL) Fact("Total", sat(amount + fee), "total") else null,
     Fact("Arrives", arrives, "arrives"),
 )
@@ -416,7 +416,9 @@ private fun Facts(facts: List<Fact>) {
     Group("") {
         facts.forEachIndexed { i, fact ->
             if (i > 0) Divider()
-            Line(fact.label, fact.value, tag = fact.tag, share = fact.share)
+            val fee = fact.fee
+            if (fee != null) FeeLine(fact.label, fee.fee, fee.amount, fact.tag, fact.value, fee)
+            else Line(fact.label, fact.value, tag = fact.tag, share = fact.share)
         }
     }
 }
@@ -430,8 +432,9 @@ private fun Facts(facts: List<Fact>) {
 private fun Paying(ui: Ui, s: Step.Paying, pay: (ULong?) -> Unit) {
     var amount by remember { mutableStateOf(s.asked?.toLong()) }
     // The most a hub would charge: the code may name several.
-    val fee = amount?.takeIf { !s.visit }
-        ?.let { a -> ui.hubs.maxOfOrNull { it.feeBase + it.feePpm * a.toULong() / 1_000_000uL } }
+    val estimatedHub = amount?.takeIf { !s.visit }
+        ?.let { a -> ui.hubs.maxByOrNull { feeDue(a.toULong(), org.licash.core.Rate(it.feeBase, it.feePpm)) } }
+    val fee = amount?.let { a -> estimatedHub?.let { feeDue(a.toULong(), org.licash.core.Rate(it.feeBase, it.feePpm)) } }
     Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
         Spacer(Modifier.height(32.dp))
         if (s.asked == null) {
@@ -447,6 +450,12 @@ private fun Paying(ui: Ui, s: Step.Paying, pay: (ULong?) -> Unit) {
                         fee?.let { if (it == 0uL) "None" else "Up to ${sat(it)}" } ?: "",
                         "fee",
                         fee?.let { f -> amount?.let { share(f, it.toULong()) } },
+                        fee?.let { f -> amount?.let { a -> estimatedHub?.let { hub -> FeeBreakdown(
+                            a.toULong(), f,
+                            components = listOf("Hub (estimate)" to f),
+                            rate = org.licash.core.Rate(hub.feeBase, hub.feePpm),
+                            explanation = "Upper estimate using current terms at ${name(hub.url)}. The hub used to pay may charge less.",
+                        ) } } },
                     ),
                     Fact("Arrives", "Instantly", "arrives"),
                 ),

@@ -311,8 +311,8 @@ fun Entry(
  * tests, and `tag-share` its share.
  */
 @Composable
-fun Line(label: String, value: String, modifier: Modifier = Modifier, tag: String? = null, share: String? = null) {
-    Row(modifier.fillMaxWidth().padding(vertical = 12.dp)) {
+fun Line(label: String, value: String, modifier: Modifier = Modifier, tag: String? = null, share: String? = null, onClick: (() -> Unit)? = null) {
+    Row(modifier.fillMaxWidth().then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier).padding(vertical = 12.dp)) {
         Text(label, style = MaterialTheme.typography.bodyLarge)
         Spacer(Modifier.width(16.dp))
         Text(
@@ -330,6 +330,7 @@ fun Line(label: String, value: String, modifier: Modifier = Modifier, tag: Strin
                 color = MaterialTheme.colorScheme.outline,
             )
         }
+        if (onClick != null) Chevron()
     }
 }
 

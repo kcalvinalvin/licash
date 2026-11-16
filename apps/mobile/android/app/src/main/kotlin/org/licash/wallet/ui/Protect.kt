@@ -150,7 +150,7 @@ private fun Unfolded(c: Contract, cover: Cover, developer: Boolean, end: () -> U
     // Of what its hub holds, those ending first covering first.
     if (cover.on) Line("Covers now", sat(c.covers), tag = "covers")
     if (cover.ends != null) Line("Ends by itself in", cover.ends)
-    if (!cover.failed) Line("Cost", sat(c.price), share = share(c.price, c.cap))
+    if (!cover.failed) FeeLine("Cost", c.price, c.cap, value = sat(c.price), breakdown = setupCost(c.cap, c.price))
     if (cover.held) {
         safety?.let {
             Line("Recovery planning", safetyStatus(it, height))
@@ -266,7 +266,7 @@ internal fun ProtectSheet(q: ContractQuote, open: () -> Unit, cashOutFirst: () -
     Sheet("Protect at ${name(q.hub)}", dismiss) {
         Line("Covers up to", sat(q.cap), tag = "quote-cap")
         Line("For", span(q.protectsFor.toLong()), tag = "quote-for")
-        Line("Cost", sat(q.price), tag = "quote-price", share = share(q.price, q.cap))
+        FeeLine("Cost", q.price, q.cap, tag = "quote-price", value = sat(q.price), breakdown = setupCost(q.cap, q.price))
         Line("Takes", "Up to an hour, $download")
         Worth(q.mock)
         Spacer(Modifier.height(8.dp))

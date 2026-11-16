@@ -15,6 +15,12 @@ behind its (i). Times are said as times, never as blocks; ids, notes and
 providers show in advanced mode only. With no hub yet, Home lists the hubs
 announced on Nostr to pick from, or takes one by its address.
 
+Tap a fee in a payment review or its history for the amount, percentage,
+and supplied recipient split. Current direct-payment estimates show base
+plus percentage times amount, rounded up like the hub. Historical rates
+or provider/miner splits that were not saved are identified as unavailable,
+never reconstructed from today's terms.
+
 Settings is one page: the hubs (each tapped for its fees, more added by
 address or found on Nostr), Bitcoin's state, Tor, About (the version, the
 storage used and the logs to export) and advanced mode, whose own page
