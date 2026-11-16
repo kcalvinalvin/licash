@@ -98,6 +98,15 @@ pub(crate) struct Store {
 }
 
 impl Store {
+    pub(crate) fn set_lock(&self, id: &[u8; 32], lock: &[u8; 32]) -> Result<(), Error> {
+        self.write(|tx| {
+            tx.execute(
+                "UPDATE swaps SET lock = ?2, updated_at = ?3 WHERE id = ?1 AND lock IS NULL",
+                rusqlite::params![id, lock, now()],
+            )?;
+            Ok(())
+        })
+    }
     /// A new file at `path`, readable by its owner only. Never over an
     /// existing file.
     pub(crate) fn create(path: &Path, nostr: &[u8; 32]) -> Result<Self, Error> {

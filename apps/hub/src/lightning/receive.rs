@@ -108,15 +108,39 @@ impl Store {
     }
 
     /// Record a receipt unless one under its hash is.
-    fn insert(&self, hash: &[u8; 32], body: &str, amount: u64, msat: u64) -> Result<(), Failure> {
-        self.conn()
+    fn insert(
+        &self,
+        hash: &[u8; 32],
+        body: &str,
+        amount: u64,
+        msat: u64,
+        most: u32,
+    ) -> Result<(), Failure> {
+        let conn = self.conn();
+        let inserted = conn
             .execute(
                 "INSERT INTO receipts (hash, body, amount, msat, state, created_at)
-                 VALUES (?1, ?2, ?3, ?4, 'open', ?5) ON CONFLICT DO NOTHING",
-                params![hash, body, sql(amount), sql(msat), sql(now())],
+                 SELECT ?1, ?2, ?3, ?4, 'open', ?5
+                 WHERE (SELECT count(*) FROM receipts WHERE state IN ('open', 'locked')) < ?6
+                 ON CONFLICT DO NOTHING",
+                params![hash, body, sql(amount), sql(msat), sql(now()), most],
             )
-            .map(drop)
-            .map_err(store_down)
+            .map_err(store_down)?;
+        if inserted == 0
+            && !conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM receipts WHERE hash = ?1)",
+                    [hash],
+                    |r| r.get::<_, bool>(0),
+                )
+                .map_err(store_down)?
+        {
+            return Err(Failure(Problem::new(
+                Code::Unavailable,
+                "too many receipts under way: retry later",
+            )));
+        }
+        Ok(())
     }
 
     fn update(
@@ -224,7 +248,7 @@ impl Gateway {
         let canonical = serde_json::to_string(&canonical).expect("a receipt serializes");
         let turn = self.peer.turn().await;
         if self.receipts.get(&hash)?.is_none() {
-            if self.peer.recorded(&hash)?.is_some() {
+            if self.peer.recorded(&hash)?.is_some() || self.peer.holds_swap(&hash)? {
                 return Err(refused("the hub holds this hash for another payment"));
             }
             if self
@@ -234,7 +258,8 @@ impl Gateway {
             {
                 return Err(refused("the hub locked notes under this hash before"));
             }
-            self.receipts.insert(&hash, &canonical, amount, msat)?;
+            self.receipts
+                .insert(&hash, &canonical, amount, msat, c.max_receipts)?;
         }
         drop(turn);
         let receipt = self.receipts.get(&hash)?.ok_or_else(store_gone)?;
@@ -336,10 +361,12 @@ impl Gateway {
         // same hash, which backs it once the deposits recorded it: one
         // payment per lock.
         if let Some(lock) = self.on_hub(move |hub| hub.own_lock_of(&hash)).await? {
-            if self.peer.recorded(&hash)? == Some(Some(lock.proposal.id())) {
+            let deposit = self.peer.recorded(&hash)? == Some(Some(lock.proposal.id()));
+            if deposit || self.peer.swap_owns(&hash, &lock.proposal.id())? {
                 drop(turn);
+                let owner = if deposit { "a deposit" } else { "a swap" };
                 let message = format!(
-                    "The hash of receipt {name} is locked for a deposit: its invoice is canceled."
+                    "The hash of receipt {name} is locked for {owner}: its invoice is canceled."
                 );
                 self.alert(format!("taken {name}"), message).await;
                 return self.cancel(receipt).await;
@@ -511,12 +538,47 @@ mod tests {
     use super::*;
 
     #[test]
+    fn receipt_admission_is_atomic_and_never_blocks_existing_obligations() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lightning.sqlite");
+        let store = std::sync::Arc::new(Store::open(&path).unwrap());
+        let admitted = std::thread::scope(|scope| {
+            let requests: Vec<_> = (0u8..32)
+                .map(|n| {
+                    let store = store.clone();
+                    scope.spawn(move || (n, store.insert(&[n; 32], "{}", 5, 5000, 2).is_ok()))
+                })
+                .collect();
+            requests
+                .into_iter()
+                .map(|t| t.join().unwrap())
+                .filter(|(_, accepted)| *accepted)
+                .map(|(n, _)| n)
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(admitted.len(), 2);
+        // Lowering the limit does not discard old receipts or prevent retries.
+        store.insert(&[admitted[0]; 32], "{}", 5, 5000, 1).unwrap();
+        store
+            .update(&[admitted[0]; 32], "state", &"locked")
+            .unwrap();
+        assert_eq!(store.live().unwrap().len(), 2);
+        assert!(store.insert(&[99; 32], "{}", 5, 5000, 2).is_err());
+        store.finish(&[admitted[0]; 32], "settled").unwrap();
+        store.insert(&[99; 32], "{}", 5, 5000, 2).unwrap();
+        drop(store);
+        assert_eq!(Store::open(&path).unwrap().live().unwrap().len(), 2);
+    }
+
+    #[test]
     fn the_receipts_file_is_new_or_the_gateways() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("lightning.sqlite");
         let store = Store::open(&path).unwrap();
-        store.insert(&[1; 32], "{}", 5, 6000).unwrap();
-        store.insert(&[1; 32], "{\"other\":1}", 7, 8000).unwrap();
+        store.insert(&[1; 32], "{}", 5, 6000, 1024).unwrap();
+        store
+            .insert(&[1; 32], "{\"other\":1}", 7, 8000, 1024)
+            .unwrap();
         drop(store);
         let store = Store::open(&path).unwrap();
         let receipt = store.get(&[1; 32]).unwrap().unwrap();

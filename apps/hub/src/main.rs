@@ -431,6 +431,9 @@ struct LightningArgs {
     /// The most received, in satoshis.
     #[arg(long, env = "LICASH_HUB_LN_MAX_RECEIVE", default_value_t = Config::default().max_receive)]
     ln_max_receive: u64,
+    /// The most Lightning receipts open or locked at once.
+    #[arg(long, env = "LICASH_HUB_LN_MAX_RECEIPTS", default_value_t = Config::default().max_receipts)]
+    ln_max_receipts: u32,
     /// Blocks between the end of a payment's route timelock and the
     /// expiry of the lock paying for it.
     #[arg(long, env = "LICASH_HUB_LN_PAY_SLACK", default_value_t = Config::default().pay_slack)]
@@ -479,6 +482,7 @@ impl LightningArgs {
             max_pay: self.ln_max_pay,
             min_receive: self.ln_min_receive,
             max_receive: self.ln_max_receive,
+            max_receipts: self.ln_max_receipts,
             pay_slack: self.ln_pay_slack,
             hold_delta: self.ln_hold_delta,
             downtime: self.ln_downtime,
@@ -922,6 +926,12 @@ fn command(cli: Cli) -> anyhow::Result<()> {
             };
             let hub = Hub::open(&seed, &db, policy).context("open the hub")?;
             let hub = Arc::new(hub);
+            if lightning.is_none() {
+                check_gateway_idle(&hub, &cli.data.join("lightning.sqlite"), false)?;
+            }
+            if depositing.is_none() {
+                check_gateway_idle(&hub, &cli.data.join("deposits.sqlite"), true)?;
+            }
             let gateway = match lightning {
                 Some((lnd, config)) => {
                     let path = cli.data.join("lightning.sqlite");
@@ -941,9 +951,8 @@ fn command(cli: Cli) -> anyhow::Result<()> {
                 }
                 None => None,
             };
-            if let (Some(receipts), Some(deposits)) = (&gateway, &deposits) {
-                peer::pair(receipts, deposits);
-            }
+            let turn = Arc::new(tokio::sync::Mutex::new(()));
+            peer::coordinate(gateway.as_ref(), deposits.as_ref(), &cli.data, turn.clone());
             let tweaks = match indexing {
                 true => {
                     let path = cli.data.join("tweaks.sqlite");
@@ -1002,7 +1011,15 @@ fn command(cli: Cli) -> anyhow::Result<()> {
                     let url = announcing.as_ref().and_then(|a| a.urls.first().cloned());
                     let url = url.unwrap_or_else(|| format!("http://{listen}"));
                     let (receipts, deposits) = (gateway.clone(), deposits.clone());
-                    let issuer = issuer(&hub, url, &from, receipts, deposits);
+                    let issuer = issuer(
+                        &hub,
+                        url,
+                        &from,
+                        receipts,
+                        deposits,
+                        &cli.data,
+                        turn.clone(),
+                    );
                     let transport = match &tor {
                         Some(tor) if swaps_tor => {
                             tracing::info!("the swaps' wallet reaches hubs through Tor");
@@ -1143,21 +1160,32 @@ fn issuer(
     from: &[Capped],
     receipts: Option<Arc<Gateway>>,
     deposits: Option<Arc<deposit::Gateway>>,
+    data: &Path,
+    turn: Arc<tokio::sync::Mutex<()>>,
 ) -> Issuer {
     let issuer = from
         .iter()
         .fold(Issuer::new(hub.clone(), url), |issuer, (from, cap)| {
             issuer.cap(from, *cap)
         });
-    issuer.guard(move |hash| {
+    let receipts_file = data.join("lightning.sqlite");
+    let deposits_file = data.join("deposits.sqlite");
+    issuer.guard(turn, move |hash| {
         if let Some(gateway) = &receipts {
             if gateway.holds(hash)? {
                 return Ok(true);
             }
+        } else if Gateway::holding(&receipts_file, &[*hash])
+            .map_err(|e| e.to_string())?
+            .contains(hash)
+        {
+            return Ok(true);
         }
         match &deposits {
             Some(deposits) => deposits.holds(hash),
-            None => Ok(false),
+            None => deposit::Gateway::holding(&deposits_file, &[*hash])
+                .map(|found| found.contains(hash))
+                .map_err(|e| e.to_string()),
         }
     })
 }
@@ -1175,6 +1203,71 @@ fn check_idle(dir: &Path) -> anyhow::Result<()> {
     let wallet = Wallet::open(&wallet, Http::new(None)?).context(off)?;
     Provider::open(&swaps, wallet, SwapsConfig::default()).context(off)?;
     tracing::warn!(dir = %dir.display(), "{off}: the swap provider takes no swaps");
+    Ok(())
+}
+
+/// Backing on disk is not enough: a disabled gateway cannot collect it.
+/// Read without creating or upgrading files. Open records alone cost no
+/// notes, except when a crash left their own lock recorded only in the hub.
+fn check_gateway_idle(hub: &Hub, path: &Path, deposits: bool) -> anyhow::Result<()> {
+    if !path
+        .try_exists()
+        .with_context(|| format!("read {}", path.display()))?
+    {
+        return Ok(());
+    }
+    let (table, flag) = if deposits {
+        ("deposits", "--deposit-sweep-address")
+    } else {
+        ("receipts", "--lnd")
+    };
+    let check = || -> anyhow::Result<(usize, usize)> {
+        let conn = rusqlite::Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        conn.busy_timeout(Duration::from_secs(10))?;
+        let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        anyhow::ensure!(version == 1, "unsupported {table} schema {version}");
+        let mut stmt = conn.prepare(&format!("SELECT hash, lock, state, done_at FROM {table}"))?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, [u8; 32]>(0)?,
+                r.get::<_, Option<Vec<u8>>>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<i64>>(3)?,
+            ))
+        })?;
+        let (mut required, mut open) = (0, 0);
+        for row in rows {
+            let (hash, lock, state, done) = row?;
+            let owes = match state.as_str() {
+                "locked" => true,
+                "settled" => deposits && done.is_none(),
+                "canceled" => false,
+                "open" => {
+                    open += 1;
+                    lock.is_some()
+                        || hub
+                            .own_lock_of(&hash)?
+                            .is_some_and(|l| l.settled != Some(licash_hub::Settled::Refund))
+                }
+                other => anyhow::bail!("unknown {table} state {other}"),
+            };
+            required += usize::from(owes);
+        }
+        Ok((required, open))
+    };
+    let (required, open) = check().with_context(|| {
+        format!(
+            "{flag} is off: cannot establish that {} is idle",
+            path.display()
+        )
+    })?;
+    anyhow::ensure!(required == 0, "{flag} is off but {required} obligations in {} still need its gateway; enable {flag} to follow them", path.display());
+    if open > 0 {
+        tracing::warn!(file = %path.display(), open, "{flag} is off: open payments wait for its gateway");
+    }
     Ok(())
 }
 

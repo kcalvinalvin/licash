@@ -58,6 +58,29 @@ const WINDOW: u32 = 30;
 /// Whether hub B holds a hash for another of its services.
 type Guard = Box<dyn Fn(&[u8; 32]) -> Result<bool, String> + Send + Sync>;
 
+#[test]
+fn a_hash_reservation_is_not_proof_of_lock_ownership() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("swaps.sqlite");
+    let hash = [1; 32];
+    let id = ProposalId::from_bytes([2; 32]);
+    assert!(!licash_swaps::holds_hash(&path, &hash).unwrap());
+    assert!(!licash_swaps::owns_hash_lock(&path, &hash, &id).unwrap());
+    assert!(!path.exists());
+    let db = rusqlite::Connection::open(&path).unwrap();
+    db.execute_batch("CREATE TABLE swaps (hash BLOB PRIMARY KEY, lock BLOB)")
+        .unwrap();
+    db.execute("INSERT INTO swaps (hash) VALUES (?1)", [hash])
+        .unwrap();
+    assert!(licash_swaps::holds_hash(&path, &hash).unwrap());
+    assert!(!licash_swaps::owns_hash_lock(&path, &hash, &id).unwrap());
+    db.execute("UPDATE swaps SET lock = ?1", [[3; 32]]).unwrap();
+    assert!(!licash_swaps::owns_hash_lock(&path, &hash, &id).unwrap());
+    db.execute("UPDATE swaps SET lock = ?1", [id.as_bytes()])
+        .unwrap();
+    assert!(licash_swaps::owns_hash_lock(&path, &hash, &id).unwrap());
+}
+
 /// The provider, as its clients reach it.
 #[derive(Default)]
 struct Desk {
@@ -152,6 +175,7 @@ struct Eco {
     config: Config,
     /// Hub B is the provider, taking at most this of A's notes.
     cap: Option<u64>,
+    turn: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Eco {
@@ -204,9 +228,12 @@ impl Eco {
         }
         let swaps = dir.path().join("swaps.sqlite");
         let cap = issuing.as_ref().map(|&(cap, _)| cap);
+        let turn = Arc::new(tokio::sync::Mutex::new(()));
         let provider = match issuing {
             Some((cap, guard)) => {
-                let issuer = Issuer::new(net.hub(B), B).cap(A, cap).guard(guard);
+                let issuer = Issuer::new(net.hub(B), B)
+                    .cap(A, cap)
+                    .guard(turn.clone(), guard);
                 Provider::create_issuing(&swaps, wallet, config, issuer).unwrap()
             }
             None => {
@@ -237,6 +264,7 @@ impl Eco {
             client,
             config,
             cap,
+            turn,
         }
     }
 
@@ -1304,6 +1332,87 @@ async fn a_hub_locks_no_hash_another_of_its_services_holds() {
     let record = &eco.provider().records(1).unwrap()[0];
     assert_eq!((record.stage, &record.lock), (Stage::Failed, &None));
     assert_eq!(eco.kinds(), ["accepted", "failed"]);
+}
+
+#[tokio::test]
+async fn a_canceled_take_keeps_its_turn_until_the_blocking_lock_is_recorded() {
+    let (entered, entering) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let released = Mutex::new(released);
+    let guard: Guard = Box::new(move |_| {
+        entered.send(()).unwrap();
+        released
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(5))
+            .map_err(|e| e.to_string())?;
+        Ok(false)
+    });
+    let eco = Arc::new(Eco::issuing(100, guard).await);
+    let taking = {
+        let eco = eco.clone();
+        tokio::spawn(async move {
+            eco.client
+                .swap(PROVIDER, A, B, 20, SwapLimits::usual(20))
+                .await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while entering.try_recv().is_err() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    taking.abort();
+    assert!(taking.await.unwrap_err().is_cancelled());
+    assert!(eco.turn.try_lock().is_err());
+    let provider = eco.provider();
+    let mut following = tokio::spawn(async move { provider.step().await });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), &mut following)
+            .await
+            .is_err()
+    );
+    release.send(()).unwrap();
+    assert!(following.await.unwrap().unwrap().is_empty());
+    let row = eco.provider().records(1).unwrap().remove(0);
+    assert_eq!(row.stage, Stage::Locked);
+    let id = lock_id(&row.lock.unwrap());
+    assert!(eco.net.hub(B).locked(&id).unwrap().own);
+    assert!(eco.turn.try_lock().is_ok());
+    assert_eq!(eco.kinds(), ["accepted"]);
+}
+
+#[tokio::test]
+async fn canceling_while_waiting_for_the_turn_creates_no_own_lock() {
+    let eco = Arc::new(Eco::issuing(100, no_guard()).await);
+    let held = eco.turn.clone().lock_owned().await;
+    let taking = {
+        let eco = eco.clone();
+        tokio::spawn(async move {
+            eco.client
+                .swap(PROVIDER, A, B, 20, SwapLimits::usual(20))
+                .await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while eco.provider().records(1).unwrap().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    taking.abort();
+    assert!(taking.await.unwrap_err().is_cancelled());
+    drop(held);
+    assert!(eco.provider().step().await.unwrap().is_empty());
+    let row = eco.provider().records(1).unwrap().remove(0);
+    assert_eq!(row.stage, Stage::Failed);
+    assert!(row.lock.is_none());
+    let hash: [u8; 32] = hex::decode(&row.hash).unwrap().try_into().unwrap();
+    assert!(eco.net.hub(B).own_lock_of(&hash).unwrap().is_none());
+    assert!(eco.turn.try_lock().is_ok());
 }
 
 /// What the hub's ledger waits on, such as a block scan, waits off the

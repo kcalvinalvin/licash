@@ -394,6 +394,145 @@ fn serving(data: &Path, port: u16, args: &[&str]) -> Running {
     running
 }
 
+fn gateway_file(data: &Path, deposits: bool, hash: [u8; 32]) -> rusqlite::Connection {
+    let (file, table) = if deposits {
+        ("deposits.sqlite", "deposits")
+    } else {
+        ("lightning.sqlite", "receipts")
+    };
+    let conn = rusqlite::Connection::open(data.join(file)).unwrap();
+    conn.execute_batch(&format!("PRAGMA user_version = 1; CREATE TABLE {table} (hash BLOB PRIMARY KEY, lock BLOB, state TEXT, done_at INTEGER);")).unwrap();
+    conn.execute(
+        &format!("INSERT INTO {table} (hash, state) VALUES (?1, 'locked')"),
+        [hash],
+    )
+    .unwrap();
+    conn
+}
+
+#[test]
+fn disabled_gateways_refuse_outstanding_obligations_but_allow_idle_files() {
+    for deposits in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("hub");
+        stdout(&data, &["init", "--max-pow", "6"]);
+        let (file, table, flag) = if deposits {
+            ("deposits.sqlite", "deposits", "--deposit-sweep-address")
+        } else {
+            ("lightning.sqlite", "receipts", "--lnd")
+        };
+        let conn = gateway_file(&data, deposits, [6; 32]);
+        let stderr = refused(
+            &data,
+            &["run", "--listen", &format!("127.0.0.1:{}", free_port())],
+        );
+        assert!(
+            stderr.contains(file) && stderr.contains(flag) && stderr.contains("1 obligations"),
+            "{stderr}"
+        );
+        conn.execute(&format!("UPDATE {table} SET state = 'open'"), [])
+            .unwrap();
+        drop(serving(&data, free_port(), &[]));
+        conn.execute(&format!("UPDATE {table} SET state = 'settled'"), [])
+            .unwrap();
+        if deposits {
+            let stderr = refused(
+                &data,
+                &["run", "--listen", &format!("127.0.0.1:{}", free_port())],
+            );
+            assert!(
+                stderr.contains(file) && stderr.contains("1 obligations"),
+                "{stderr}"
+            );
+        } else {
+            drop(serving(&data, free_port(), &[]));
+        }
+        conn.execute(&format!("UPDATE {table} SET done_at = 1"), [])
+            .unwrap();
+        drop(serving(&data, free_port(), &[]));
+        conn.execute(&format!("UPDATE {table} SET state = 'canceled'"), [])
+            .unwrap();
+        drop(serving(&data, free_port(), &[]));
+    }
+}
+
+#[test]
+fn disabled_gateways_detect_a_lock_made_before_the_gateway_recorded_it() {
+    for deposits in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("hub");
+        stdout(&data, &["init", "--max-pow", "6"]);
+        let hash = [7; 32];
+        own_lock(&data, hash);
+        let conn = gateway_file(&data, deposits, hash);
+        let table = if deposits { "deposits" } else { "receipts" };
+        conn.execute(&format!("UPDATE {table} SET state = 'open'"), [])
+            .unwrap();
+        let stderr = refused(
+            &data,
+            &["run", "--listen", &format!("127.0.0.1:{}", free_port())],
+        );
+        assert!(stderr.contains("1 obligations"), "{stderr}");
+    }
+}
+
+#[test]
+fn unreadable_gateway_state_is_not_assumed_idle() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("hub");
+    stdout(&data, &["init", "--max-pow", "6"]);
+    let file = data.join("deposits.sqlite");
+    std::fs::write(&file, b"partial or invalid state").unwrap();
+    let stderr = refused(
+        &data,
+        &["run", "--listen", &format!("127.0.0.1:{}", free_port())],
+    );
+    assert!(
+        stderr.contains("cannot establish") && stderr.contains("deposits.sqlite"),
+        "{stderr}"
+    );
+    assert_eq!(std::fs::read(file).unwrap(), b"partial or invalid state");
+    assert!(!data.join("lightning.sqlite").exists());
+}
+
+#[test]
+fn a_disabled_gateway_reads_real_receipts_in_wal_without_mutating_them() {
+    use licash_hub_service::lightning::{fake::Fake, Config, Gateway};
+
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("hub");
+    stdout(&data, &["init", "--max-pow", "6"]);
+    let live_hub = Arc::new(
+        Hub::open(
+            &data.join("seed"),
+            &data.join("hub.sqlite"),
+            Policy::default(),
+        )
+        .unwrap(),
+    );
+    let path = data.join("lightning.sqlite");
+    let _gateway =
+        Gateway::open(live_hub, Arc::new(Fake::new()), Config::default(), &path).unwrap();
+    let writer = rusqlite::Connection::open(&path).unwrap();
+    // Keep the WAL connection, not a second running hub's ledger lock.
+    drop(_gateway);
+    writer.execute("INSERT INTO receipts (hash, body, amount, msat, state, created_at) VALUES (?1, '{}', 5, 5000, 'locked', 0)", [[8u8; 32]]).unwrap();
+    let stderr = refused(
+        &data,
+        &["run", "--listen", &format!("127.0.0.1:{}", free_port())],
+    );
+    assert!(
+        stderr.contains("lightning.sqlite") && stderr.contains("1 obligations"),
+        "{stderr}"
+    );
+    assert_eq!(
+        writer
+            .query_row("SELECT state FROM receipts", [], |r| r.get::<_, String>(0))
+            .unwrap(),
+        "locked"
+    );
+}
+
 #[test]
 fn a_hub_refuses_to_run_with_own_locks_nothing_backs() {
     let dir = tempfile::tempdir().unwrap();
@@ -420,11 +559,11 @@ fn a_hub_refuses_to_run_with_own_locks_nothing_backs() {
     assert!(alert.contains(&lock), "{alert}");
     drop(running);
 
-    // A deposit under its hash backs it: the hub runs.
+    // Presence of a backing record and whether its gateway still has
+    // work are separate checks. An idle record needs no running gateway.
     let deposits = rusqlite::Connection::open(data.join("deposits.sqlite")).unwrap();
-    let table = "CREATE TABLE deposits (hash BLOB PRIMARY KEY)";
-    deposits.execute(table, []).unwrap();
-    let row = "INSERT INTO deposits (hash) VALUES (?1)";
+    deposits.execute_batch("PRAGMA user_version = 1; CREATE TABLE deposits (hash BLOB PRIMARY KEY, lock BLOB, state TEXT, done_at INTEGER)").unwrap();
+    let row = "INSERT INTO deposits (hash, state, done_at) VALUES (?1, 'settled', 1)";
     deposits.execute(row, [hash]).unwrap();
     drop(deposits);
     drop(serving(&data, free_port(), &[]));

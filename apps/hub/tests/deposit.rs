@@ -283,6 +283,170 @@ fn lightning(net: &Net) -> (Arc<Fake>, Arc<lightning::Gateway>) {
     (node, Arc::new(gateway))
 }
 
+fn swap_record(net: &Net, hash: [u8; 32], state: &str, lock: Option<licash::spend::ProposalId>) {
+    let dir = net.dir.path().join("swaps");
+    std::fs::create_dir(&dir).unwrap();
+    let db = rusqlite::Connection::open(dir.join("swaps.sqlite")).unwrap();
+    db.execute_batch("CREATE TABLE swaps (hash BLOB PRIMARY KEY, state TEXT, lock BLOB)")
+        .unwrap();
+    db.execute(
+        "INSERT INTO swaps (hash, state, lock) VALUES (?1, ?2, ?3)",
+        rusqlite::params![hash, state, lock.map(|id| *id.as_bytes())],
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn gateways_refuse_every_hash_reserved_by_a_swap_even_when_swaps_are_off() {
+    for state in ["accepted", "locked", "failed", "done"] {
+        let net = Net::new().await;
+        let alice = net.wallet("alice");
+        let deposit = alice.deposit(HUB, 3_000).await.unwrap();
+        let (_, body) = net.asked("alice", &deposit.hash);
+        let hash = bytes(&deposit.hash);
+        // Reuse the request, but no gateway has reserved it yet.
+        let db = rusqlite::Connection::open(net.dir.path().join("deposits.sqlite")).unwrap();
+        db.execute("DELETE FROM deposits WHERE hash = ?1", [hash])
+            .unwrap();
+        swap_record(&net, hash, state, None);
+        let (_, lightning) = lightning(&net);
+        peer::coordinate(
+            Some(&lightning),
+            Some(&net.deposits),
+            net.dir.path(),
+            Arc::new(tokio::sync::Mutex::new(())),
+        );
+        assert!(net
+            .deposits
+            .deposit(&body)
+            .await
+            .unwrap_err()
+            .0
+            .message
+            .contains("another payment"));
+        assert!(lightning
+            .receive(&body.receive)
+            .await
+            .unwrap_err()
+            .0
+            .message
+            .contains("another payment"));
+    }
+}
+
+#[tokio::test]
+async fn a_disabled_receipt_gateway_still_reserves_its_hashes() {
+    let net = Net::new().await;
+    let alice = net.wallet("alice");
+    let deposit = alice.deposit(HUB, 3_000).await.unwrap();
+    let (_, body) = net.asked("alice", &deposit.hash);
+    let hash = bytes(&deposit.hash);
+    let db = rusqlite::Connection::open(net.dir.path().join("deposits.sqlite")).unwrap();
+    db.execute("DELETE FROM deposits WHERE hash = ?1", [hash])
+        .unwrap();
+    let (_, lightning) = lightning(&net);
+    lightning.receive(&body.receive).await.unwrap();
+    drop(lightning);
+    peer::coordinate(
+        None,
+        Some(&net.deposits),
+        net.dir.path(),
+        Arc::new(tokio::sync::Mutex::new(())),
+    );
+    assert!(net
+        .deposits
+        .deposit(&body)
+        .await
+        .unwrap_err()
+        .0
+        .message
+        .contains("another payment"));
+    assert!(!net.dir.path().join("swaps").exists());
+}
+
+#[tokio::test]
+async fn a_gateway_waits_for_the_issuers_turn_and_then_sees_its_reservation() {
+    let net = Net::new().await;
+    let alice = net.wallet("alice");
+    let deposit = alice.deposit(HUB, 3_000).await.unwrap();
+    let (_, body) = net.asked("alice", &deposit.hash);
+    let hash = bytes(&deposit.hash);
+    let db = rusqlite::Connection::open(net.dir.path().join("deposits.sqlite")).unwrap();
+    db.execute("DELETE FROM deposits WHERE hash = ?1", [hash])
+        .unwrap();
+    let turn = Arc::new(tokio::sync::Mutex::new(()));
+    peer::coordinate(None, Some(&net.deposits), net.dir.path(), turn.clone());
+    let held = turn.lock_owned().await;
+    let gateway = net.deposits.clone();
+    let receiving = tokio::spawn(async move { gateway.deposit(&body).await });
+    tokio::task::yield_now().await;
+    assert!(!receiving.is_finished());
+    swap_record(&net, hash, "accepted", None);
+    drop(held);
+    assert!(receiving
+        .await
+        .unwrap()
+        .unwrap_err()
+        .0
+        .message
+        .contains("another payment"));
+}
+
+async fn adoption_with_a_swap_row(state: &str, recorded: bool) {
+    let net = Net::new().await;
+    let alice = net.wallet("alice");
+    let deposit = alice.deposit(HUB, 3_000).await.unwrap();
+    let (_, body) = net.asked("alice", &deposit.hash);
+    let ((keyset, ephemeral, hash), outputs) = (
+        body.receive.terms().unwrap(),
+        body.receive.outputs().unwrap(),
+    );
+    let terms = licash::spend::TimedTerms::new(
+        ChainProfile::Core30DefaultRegtest,
+        net.hub.checkpoint().unwrap().commitment(),
+        net.height() + 6,
+        1,
+        hash,
+    )
+    .unwrap();
+    let lock = net
+        .hub
+        .lock_own(&keyset, ephemeral, outputs, terms)
+        .unwrap();
+    let id = lock.proposal.id();
+    swap_record(&net, hash, state, recorded.then_some(id));
+    peer::coordinate(
+        None,
+        Some(&net.deposits),
+        net.dir.path(),
+        Arc::new(tokio::sync::Mutex::new(())),
+    );
+    net.mine(2, vec![payment(&deposit.terms.unwrap().address, 3_100, 1)]);
+    net.deposits.round().await;
+    let status = net.deposits.deposit_status(&hash).unwrap().status;
+    if recorded {
+        assert_eq!(status.state, ReceiveState::Canceled);
+        assert!(status.lock.is_none());
+        assert!(alerts(&net.hub)
+            .iter()
+            .any(|a| a.contains("locked for a swap")));
+    } else {
+        assert_eq!(status.state, ReceiveState::Locked);
+        assert_eq!(status.lock().unwrap(), Some(id));
+    }
+}
+
+#[tokio::test]
+async fn a_gateway_never_adopts_a_lock_the_swap_store_recorded() {
+    adoption_with_a_swap_row("locked", true).await;
+}
+
+#[tokio::test]
+async fn a_gateway_recovers_its_own_unrecorded_lock_beside_an_accepted_or_failed_swap() {
+    adoption_with_a_swap_row("accepted", false).await;
+    adoption_with_a_swap_row("failed", false).await;
+}
+
 /// A dishonest status is not proof that the preimage is already public.
 #[derive(Clone)]
 struct PaidView(Local);
@@ -324,7 +488,7 @@ async fn short_deposit_lock(claimed_paid: bool) {
     .unwrap();
     let lock = net
         .hub
-        .lock_own(&keyset, ephemeral, vec![outputs[0].clone()], terms)
+        .lock_own(&keyset, ephemeral, vec![outputs[0]], terms)
         .unwrap();
     let id = lock.proposal.id();
     let db = rusqlite::Connection::open(net.dir.path().join("deposits.sqlite")).unwrap();

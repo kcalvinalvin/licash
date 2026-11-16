@@ -43,12 +43,22 @@ was restored older than `hub.sqlite`, and names the locks: restore the
 files as recent as `hub.sqlite`. `--allow-unbacked-locks` runs it anyway,
 alerting the operator: it would pay those notes unbacked.
 
+It also refuses to run with `--lnd` or `--deposit-sweep-address` disabled
+while that gateway still has obligations to collect, including deposits
+settled but not swept and locks left between writes by an interruption.
+The refusal names the file and count. Idle files are inspected read-only,
+never created or upgraded; open unpaid requests only warn. Enable the
+gateway to finish its work. This also applies when upgrading an existing
+installation; no records are discarded or migrated.
+
 With `--lnd URL --lnd-macaroon FILE` (and `--chain`), the hub also runs a
 Lightning gateway over LND: it pays invoices for locks that pay the hub,
 and makes hold invoices paid with locks of its notes. `--lnd-cert` pins
 LND's certificate. The gateway keeps its invoices in
 `<data>/lightning.sqlite`: back it up with `hub.sqlite`. An alert says when
 LND's channels can no longer pay or receive the most it takes.
+`--ln-max-receipts` bounds open and locked receipts (1024 by default).
+Lowering it blocks new receipts, not retries or following existing ones.
 
 With `--tweaks` (and `--chain`), the hub indexes the silent payment
 (BIP352) tweaks of the chain's blocks from `--tweaks-from` (by default, the
@@ -62,9 +72,20 @@ them with lets the hub claim the coins to the sweep address. Unclaimed
 deposits return to their payer after a timeout. `--deposit-*` flags set
 the fee, amounts and timing. Deposits are kept in `<data>/deposits.sqlite`:
 back it up with `hub.sqlite`. Alerts say when a claim is late or lost. With
-both gateways, a deposit and a Lightning receipt never share a hash: one
-payment backs each lock of the hub's notes, and a payment made under a hash
+the gateways and swap issuer sharing one turn, one payment backs each
+lock of the hub's notes. New gateway requests refuse hashes already
+reserved by another service, and a payment made under a hash
 the other already locked for returns to its payer (an alert says so).
+Reservations remain visible while a service is disabled. A swap's hash
+reservation is not by itself proof that it owns a gateway's existing lock:
+the recorded lock id decides ownership during recovery.
+
+Contract HTTP requests have separate admission budgets for new openings,
+progress and instance downloads; excess requests receive 503 before body
+buffering or node RPC. Four concurrent instance downloads remain supported.
+Admission lasts through response delivery, with a five-minute deadline for
+request handling. Onion services accept at most 128 streams and allow two minutes
+to receive HTTP headers, without limiting a valid response's duration.
 
 With `--nostr-relay URL --announce-url URL` (and `--chain`), the hub
 announces itself on Nostr relays for wallets to discover, under a key

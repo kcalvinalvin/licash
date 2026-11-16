@@ -611,7 +611,7 @@ impl Gateway {
         let canonical = serde_json::to_string(&canonical).expect("a deposit serializes");
         let turn = self.peer.turn().await;
         if self.store.get(&hash).map_err(store_down)?.is_none() {
-            if self.peer.recorded(&hash)?.is_some() {
+            if self.peer.recorded(&hash)?.is_some() || self.peer.holds_swap(&hash)? {
                 return Err(refused("the hub holds this hash for another payment"));
             }
             if self
@@ -820,9 +820,15 @@ impl Gateway {
         // the same hash, which backs it once the Lightning gateway recorded
         // it: one payment per lock.
         if let Some(lock) = self.on_hub(move |hub| hub.own_lock_of(&hash)).await? {
-            if self.peer.recorded(&hash)? == Some(Some(lock.proposal.id())) {
+            let receipt = self.peer.recorded(&hash)? == Some(Some(lock.proposal.id()));
+            if receipt || self.peer.swap_owns(&hash, &lock.proposal.id())? {
+                let owner = if receipt {
+                    "a Lightning receipt"
+                } else {
+                    "a swap"
+                };
                 let message = format!(
-                    "The hash of deposit {name} is locked for a Lightning receipt: its payer \
+                    "The hash of deposit {name} is locked for {owner}: its payer \
                      takes its coins back."
                 );
                 self.alert(format!("taken {name}"), message).await;

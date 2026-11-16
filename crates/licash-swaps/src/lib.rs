@@ -470,7 +470,7 @@ fn refused(e: licash_wallet::Error) -> Problem {
 /// swaps file and its [`Config`].
 pub struct Provider<T: Transport> {
     wallet: Wallet<T>,
-    store: Store,
+    store: Arc<Store>,
     config: Config,
     /// Swaps in hand, by the client's lock.
     busy: Mutex<HashSet<[u8; 32]>>,
@@ -499,15 +499,9 @@ const OWN_UNDER_WAY: &str = "kind = 'own' AND state IN ('accepted', 'locked', 'p
 /// provider running on the file or without it.
 pub fn backing_own(path: &Path, hashes: &[[u8; 32]]) -> Result<HashSet<[u8; 32]>, Error> {
     let mut found = HashSet::new();
-    if !path.is_file() {
+    let Some(conn) = read_swaps(path)? else {
         return Ok(found);
-    }
-    let conn = rusqlite::Connection::open_with_flags(
-        path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )?;
-    conn.busy_timeout(std::time::Duration::from_secs(10))?;
-    conn.pragma_update(None, "query_only", true)?;
+    };
     let mut stmt = conn.prepare(&format!(
         "SELECT 1 FROM swaps WHERE hash = ?1 AND {OWN_UNDER_WAY}"
     ))?;
@@ -517,6 +511,48 @@ pub fn backing_own(path: &Path, hashes: &[[u8; 32]]) -> Result<HashSet<[u8; 32]>
         }
     }
     Ok(found)
+}
+
+fn read_swaps(path: &Path) -> Result<Option<rusqlite::Connection>, Error> {
+    if !path
+        .try_exists()
+        .map_err(|e| Error::Setup(format!("{}: {e}", path.display())))?
+    {
+        return Ok(None);
+    }
+    let conn = rusqlite::Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    conn.busy_timeout(std::time::Duration::from_secs(10))?;
+    Ok(Some(conn))
+}
+
+/// Any recorded swap reserves its hash, even terminal or not yet locked.
+pub fn holds_hash(path: &Path, hash: &[u8; 32]) -> Result<bool, Error> {
+    let Some(conn) = read_swaps(path)? else {
+        return Ok(false);
+    };
+    let held = conn
+        .prepare("SELECT 1 FROM swaps WHERE hash = ?1")?
+        .exists([hash])?;
+    Ok(held)
+}
+
+/// A recorded lock id proves swap ownership. A reserved hash alone does
+/// not: a gateway may need to recover its own lock after a crash.
+pub fn owns_hash_lock(
+    path: &Path,
+    hash: &[u8; 32],
+    lock: &licash::spend::ProposalId,
+) -> Result<bool, Error> {
+    let Some(conn) = read_swaps(path)? else {
+        return Ok(false);
+    };
+    let owns = conn
+        .prepare("SELECT 1 FROM swaps WHERE hash = ?1 AND lock = ?2")?
+        .exists(params![hash, lock.as_bytes()])?;
+    Ok(owns)
 }
 
 /// Setup and what the provider says of itself.
@@ -578,7 +614,7 @@ impl<T: Transport> Provider<T> {
     fn with(store: Store, wallet: Wallet<T>, config: Config, issuer: Option<Issuer>) -> Self {
         Self {
             wallet,
-            store,
+            store: Arc::new(store),
             config,
             busy: Mutex::default(),
             taking: Mutex::default(),
@@ -1071,7 +1107,7 @@ impl<T: Transport> Provider<T> {
         match locked {
             Ok(lock) => {
                 let lock_id = lock_id(&lock.id)?;
-                self.set_lock(id, &lock_id)?;
+                self.store.set_lock(id, &lock_id)?;
                 if lock.state == LockState::Locked {
                     self.advance(id, Stage::Accepted, Stage::Locked, None, None)?;
                 }
@@ -1079,7 +1115,7 @@ impl<T: Transport> Provider<T> {
             // Recorded, its outcome unknown: taken on by `step`.
             Err(licash_wallet::Error::Pending { id: lock, reason }) => {
                 tracing::warn!(id = %hex::encode(id), %lock, reason, "lock pending");
-                self.set_lock(id, &lock_id(&lock)?)?;
+                self.store.set_lock(id, &lock_id(&lock)?)?;
             }
             Err(e) => {
                 self.fail(id, &row, &format!("not locked: {e}"))?;
@@ -1094,9 +1130,20 @@ impl<T: Transport> Provider<T> {
     async fn lock_own(&self, id: &[u8; 32], row: &Row) -> Result<(), Error> {
         let issue = self.issue_of(id, row)?;
         let locked = self.issuer_of(row)?;
-        match locked.blocking(move |issuer| issuer.lock(&issue)).await {
-            Ok(lock) => {
-                self.set_lock(id, &lock)?;
+        let turn = locked.turn().await;
+        let store = self.store.clone();
+        let key = *id;
+        match locked
+            .blocking(move |issuer| {
+                // This guard belongs to the blocking operation, not its
+                // cancelable caller. Recording is part of the same turn.
+                let _turn = turn;
+                let lock = issuer.lock(&issue)?;
+                store.set_lock(&key, &lock).map_err(unavailable)
+            })
+            .await
+        {
+            Ok(()) => {
                 self.advance(id, Stage::Accepted, Stage::Locked, None, None)?;
             }
             Err(problem) if problem.code == Code::Declined => {
@@ -1136,16 +1183,6 @@ impl<T: Transport> Provider<T> {
             hash: row.hash,
             expiry: row.expiry,
             ephemeral,
-        })
-    }
-
-    fn set_lock(&self, id: &[u8; 32], lock: &[u8; 32]) -> Result<(), Error> {
-        self.store.write(|tx| {
-            tx.execute(
-                "UPDATE swaps SET lock = ?2, updated_at = ?3 WHERE id = ?1 AND lock IS NULL",
-                params![id, lock, now()],
-            )?;
-            Ok(())
         })
     }
 
@@ -1301,7 +1338,7 @@ impl<T: Transport> Provider<T> {
                     return self.fail(id, row, "stopped before locking");
                 };
                 let lock = lock_id(&found.id)?;
-                self.set_lock(id, &lock)?;
+                self.store.set_lock(id, &lock)?;
                 lock
             }
         };
@@ -1357,9 +1394,17 @@ impl<T: Transport> Provider<T> {
             Some(lock) => lock,
             None => {
                 let issue = self.issue_of(id, row)?;
-                match issuer.blocking(move |issuer| issuer.find(&issue)).await {
+                let turn = issuer.turn().await;
+                // A canceled take may still be locking on the blocking
+                // pool. Wait for its turn, then keep it through adoption
+                // or failure so that a late lock cannot land on a failed row.
+                let (found, _turn) = issuer
+                    .blocking(move |issuer| Ok((issuer.find(&issue), turn)))
+                    .await
+                    .map_err(Error::Hub)?;
+                match found {
                     Ok(Some(lock)) => {
-                        self.set_lock(id, &lock)?;
+                        self.store.set_lock(id, &lock)?;
                         lock
                     }
                     Ok(None) => return self.fail(id, row, "stopped before locking"),

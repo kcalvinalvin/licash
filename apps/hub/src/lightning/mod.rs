@@ -123,6 +123,9 @@ pub struct Config {
     /// The notes a receipt locks: at least and at most.
     pub min_receive: u64,
     pub max_receive: u64,
+    /// New receipts are refused while this many remain open or locked.
+    /// Existing receipts are always followed, even above a lowered limit.
+    pub max_receipts: u32,
     /// Blocks between the end of a payment's route timelock and the
     /// expiry of its lock: the time to settle the lock once paid.
     pub pay_slack: u32,
@@ -151,6 +154,7 @@ impl Default for Config {
             max_pay: 1_000_000,
             min_receive: 1,
             max_receive: 1_000_000,
+            max_receipts: 1024,
             pay_slack: 12,
             hold_delta: 12,
             downtime: 6,
@@ -181,6 +185,9 @@ impl Config {
         }
         if self.min_receive == 0 || self.min_receive > self.max_receive {
             return Err("the least receipt must be positive and at most the largest".into());
+        }
+        if self.max_receipts == 0 {
+            return Err("the receipt limit must be positive".into());
         }
         Ok(())
     }

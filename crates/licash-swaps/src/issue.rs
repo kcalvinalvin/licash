@@ -29,6 +29,7 @@ pub struct Issuer {
     url: String,
     caps: Vec<(String, u64)>,
     taken: Box<Taken>,
+    turn: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Issuer {
@@ -39,6 +40,7 @@ impl Issuer {
             url: url.into(),
             caps: Vec::new(),
             taken: Box::new(|_| Ok(false)),
+            turn: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -55,12 +57,20 @@ impl Issuer {
 
     /// Lock no hash `taken` says another of the hub's services holds, such
     /// as its Lightning receipts and deposits: one own lock per hash.
+    /// Share `turn` with those services; it covers checking, locking and
+    /// recording, including blocking work whose caller was canceled.
     pub fn guard(
         mut self,
+        turn: Arc<tokio::sync::Mutex<()>>,
         taken: impl Fn(&[u8; 32]) -> Result<bool, String> + Send + Sync + 'static,
     ) -> Self {
         self.taken = Box::new(taken);
+        self.turn = turn;
         self
+    }
+
+    pub(crate) async fn turn(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.turn.clone().lock_owned().await
     }
 
     /// Run `op` off the async runtime: the methods that read or write the
