@@ -17,7 +17,24 @@ const VERSION: i64 = 1 + MIGRATIONS.len() as i64;
 
 /// What each version adds to the one before: the first takes 1 to 2. A
 /// file of an older version is brought up to date when opened.
-const MIGRATIONS: &[&str] = &[SILENT, FALLBACK, UNTWEAKED, PAYOUTS, VISITED, RENEWALS];
+const MIGRATIONS: &[&str] = &[
+    SILENT,
+    FALLBACK,
+    UNTWEAKED,
+    PAYOUTS,
+    VISITED,
+    RENEWALS,
+    UNLINKED_AT,
+];
+
+/// Version 8: a privacy rest starts when a note finishes unlinking, not
+/// when it was received. Existing unlinked notes have an unknown unlink
+/// time: conservatively begin their rest now. No remint or network work
+/// is started by this migration.
+const UNLINKED_AT: &str = "
+ALTER TABLE notes ADD COLUMN unlinked_at INTEGER;
+UPDATE notes SET unlinked_at = unixepoch() WHERE unlinked = 1;
+";
 
 /// Version 7: renewals of notes a hub no longer unlinks since it restarted.
 const RENEWALS: &str = "

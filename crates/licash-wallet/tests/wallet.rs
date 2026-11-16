@@ -525,7 +525,7 @@ fn a_wallet_file_of_version_5_trusts_every_hub_it_had() {
     let version: i64 = db
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 7);
+    assert_eq!(version, 8);
     assert_eq!(wallet.hubs().unwrap().len(), 1);
     assert_eq!(wallet.balance().unwrap().len(), 1);
     assert!(wallet.visited().unwrap().is_empty());
@@ -546,10 +546,111 @@ async fn a_wallet_file_of_version_6_renews_nothing_unasked() {
     let version: i64 = db
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 7);
+    assert_eq!(version, 8);
     assert_eq!(wallet.unlink().await.unwrap(), 0);
     assert!(wallet.sends().unwrap().is_empty());
     assert_eq!(wallet.hubs().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_wallet_file_of_version_7_starts_a_privacy_rest_without_reminting() {
+    let net = charging(Fee { base: 0, ppm: 0 });
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v7.sqlite");
+    let wallet = Wallet::create(
+        &path,
+        &[1; 32],
+        ChainProfile::Core30DefaultRegtest,
+        Link(net.clone()),
+    )
+    .unwrap();
+    wallet.add_hub(HUB).await.unwrap();
+    wallet
+        .receive(&net.pay(HUB, &wallet.address(), 64))
+        .unwrap();
+    assert_eq!(wallet.unlink().await.unwrap(), 1);
+    wallet
+        .receive(&net.pay(HUB, &wallet.address(), 32))
+        .unwrap();
+    drop(wallet);
+    let db = rusqlite::Connection::open(&path).unwrap();
+    // Reconstruct exactly the previous schema, retaining real notes,
+    // their unlink flags, and an old receipt timestamp.
+    db.execute_batch(
+        "ALTER TABLE notes DROP COLUMN unlinked_at;
+         UPDATE notes SET added_at = 1;
+         PRAGMA user_version = 7;",
+    )
+    .unwrap();
+    let bytes = || -> Vec<Vec<u8>> {
+        let mut stmt = db
+            .prepare("SELECT note FROM notes ORDER BY denom DESC")
+            .unwrap();
+        stmt.query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    };
+    let before_notes = bytes();
+    let now = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+    };
+    let before = now();
+    // No hub answers. Opening only migrates local metadata, without
+    // starting a renewal, remint, or network request.
+    let wallet = Wallet::open(&path, Link(Net::new())).unwrap();
+    let at: i64 = db
+        .query_row("SELECT unlinked_at FROM notes WHERE denom = 64", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert!((before..=now()).contains(&at));
+    let linked: Option<i64> = db
+        .query_row("SELECT unlinked_at FROM notes WHERE denom = 32", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(linked, None);
+    assert_eq!(bytes(), before_notes);
+    assert!(wallet.sends().unwrap().is_empty());
+    assert_eq!(available(&wallet), (96, 0));
+    let oldest: i64 = db
+        .query_row("SELECT MIN(added_at) FROM notes", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(oldest, 1);
+    drop(wallet);
+    let wallet = Wallet::open(&path, Link(Net::new())).unwrap();
+    let again: i64 = db
+        .query_row("SELECT unlinked_at FROM notes WHERE denom = 64", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(again, at, "opening again must not restart the rest");
+    assert!(wallet.sends().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_delayed_unlink_records_its_completion_time_not_its_receipt_time() {
+    let net = charging(Fee { base: 0, ppm: 0 });
+    let alice = party(&net, 1).await;
+    alice.receive(&net.pay(HUB, &alice.address(), 64)).unwrap();
+    let db = rusqlite::Connection::open(alice._dir.path().join("w.sqlite")).unwrap();
+    db.execute("UPDATE notes SET added_at = 1", []).unwrap();
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    assert_eq!(alice.unlink().await.unwrap(), 1);
+    let (received, unlinked): (i64, i64) = db
+        .query_row("SELECT added_at, unlinked_at FROM notes", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    assert_eq!(received, 1);
+    assert!(unlinked >= before);
 }
 
 #[tokio::test]
@@ -871,6 +972,263 @@ async fn a_shaped_payment_quotes_its_actual_output_fee_and_preserves_value() {
     assert_eq!(available(&alice).0 + 10 + quote, 64);
     let fee = alice.hubs().unwrap()[0].1.fees.spending();
     assert!(quote >= fee.due(64, 10u64.count_ones() as usize + operation.made.len()));
+}
+
+/// Simulate a completed privacy rest without sleeping or changing receipt
+/// timestamps. The wallet's migration and unlink-clock tests cover how
+/// these durable timestamps are written.
+fn rested_notes(party: &Party) {
+    rusqlite::Connection::open(party._dir.path().join("w.sqlite"))
+        .unwrap()
+        .execute("UPDATE notes SET unlinked_at = 1 WHERE unlinked = 1", [])
+        .unwrap();
+}
+
+#[tokio::test]
+async fn automatic_note_maintenance_waits_after_unlinking_and_records_its_fee() {
+    let net = charging(Fee { base: 1, ppm: 0 });
+    let alice = party(&net, 1).await;
+    alice.receive(&net.pay(HUB, &alice.address(), 128)).unwrap();
+    assert_eq!(alice.unlink().await.unwrap(), 2);
+    assert_eq!(alice.maintain_notes().await.unwrap(), 0);
+    assert!(alice.sends().unwrap().is_empty());
+    rested_notes(&alice);
+    assert_eq!(alice.maintain_notes().await.unwrap(), 1);
+    let sends = alice.sends().unwrap();
+    assert_eq!(sends.len(), 1);
+    assert_eq!((sends[0].amount, sends[0].fee), (0, 1));
+    assert_eq!(sends[0].payee, alice.address());
+    assert_eq!(sends[0].state, State::Done);
+    assert_eq!(available(&alice), (127, 0));
+    assert_eq!(alice.maintain_notes().await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn note_work_is_reported_while_resting_and_not_once_healthy_or_unaffordable() {
+    let net = charging(Fee { base: 1, ppm: 0 });
+    let alice = party(&net, 1).await;
+    assert!(!alice.note_maintenance_needed().unwrap());
+    alice.receive(&net.pay(HUB, &alice.address(), 128)).unwrap();
+    // Linked notes: the next round unlinks them.
+    assert!(alice.note_maintenance_needed().unwrap());
+    alice.unlink().await.unwrap();
+    // Resting: nothing now, but a later round reshapes them.
+    assert_eq!(alice.maintain_notes().await.unwrap(), 0);
+    assert!(alice.note_maintenance_needed().unwrap());
+    rested_notes(&alice);
+    assert_eq!(alice.maintain_notes().await.unwrap(), 1);
+    assert!(!alice.note_maintenance_needed().unwrap());
+    assert!(alice.sends().unwrap().len() == 1);
+
+    // Free-only authority: a paid remint is never a reason to keep a
+    // background job alive.
+    let bob = party(&net, 2).await;
+    bob.set_renew_limit(0);
+    bob.receive(&net.pay(HUB, &bob.address(), 128)).unwrap();
+    bob.unlink().await.unwrap();
+    assert!(!bob.note_maintenance_needed().unwrap());
+    assert!(bob.sends().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn expired_notes_are_note_work_only_while_their_renewal_is_affordable() {
+    let net = charging(Fee { base: 1, ppm: 0 });
+    let alice = party(&net, 1).await;
+    alice.set_renew_limit(0);
+    alice.receive(&net.pay(HUB, &alice.address(), 100)).unwrap();
+    net.restart(HUB);
+    let _ = alice.unlink().await;
+    assert!(alice.sends().unwrap().is_empty());
+    assert!(!alice.note_maintenance_needed().unwrap());
+    alice.set_renew_limit(1_000);
+    assert!(alice.note_maintenance_needed().unwrap());
+    // Reading it started nothing.
+    assert!(alice.sends().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn unknown_or_future_unlink_times_never_start_automatic_optimization() {
+    let net = charging(Fee { base: 1, ppm: 0 });
+    let alice = party(&net, 1).await;
+    alice.receive(&net.pay(HUB, &alice.address(), 128)).unwrap();
+    alice.unlink().await.unwrap();
+    let db = rusqlite::Connection::open(alice._dir.path().join("w.sqlite")).unwrap();
+    db.execute("UPDATE notes SET unlinked_at = NULL", [])
+        .unwrap();
+    assert_eq!(alice.maintain_notes().await.unwrap(), 0);
+    let observed: i64 = db
+        .query_row("SELECT unlinked_at FROM notes", [], |r| r.get(0))
+        .unwrap();
+    assert!(observed > 1);
+    assert!(alice.sends().unwrap().is_empty());
+    db.execute("UPDATE notes SET unlinked_at = ?1", [observed + 86_400])
+        .unwrap();
+    assert_eq!(alice.maintain_notes().await.unwrap(), 0);
+    assert!(alice.sends().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn automatic_optimization_obeys_the_rolling_budget_but_explicit_optimization_can_bypass_it() {
+    let net = charging(Fee { base: 1, ppm: 0 });
+    let alice = party(&net, 1).await;
+    alice.receive(&net.pay(HUB, &alice.address(), 128)).unwrap();
+    alice.unlink().await.unwrap();
+    let first = alice.optimize_notes(HUB, 1).await.unwrap().unwrap();
+    for _ in 0..9 {
+        alice.receive(&net.pay(HUB, &alice.address(), 1)).unwrap();
+    }
+    alice.unlink().await.unwrap();
+    rested_notes(&alice);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let db = rusqlite::Connection::open(alice._dir.path().join("w.sqlite")).unwrap();
+    // A real paid optimization from seven hours ago: its cooldown is
+    // over, but its fee remains in the rolling daily budget.
+    db.execute(
+        "UPDATE sends SET created_at = ?1, done_at = ?1 WHERE id = ?2",
+        rusqlite::params![now - 7 * 3_600, hex::decode(&first.id).unwrap()],
+    )
+    .unwrap();
+    let quote = alice.optimization_quote(HUB).unwrap().unwrap();
+    assert_eq!(quote.fee, 1);
+    assert_eq!(available(&alice), (136, 0));
+    assert_eq!(alice.maintain_notes().await.unwrap(), 0);
+    assert_eq!(alice.sends().unwrap().len(), 1);
+    assert!(alice.optimize_notes(HUB, 1).await.unwrap().is_some());
+    assert_eq!(alice.sends().unwrap().len(), 2);
+    assert_eq!(available(&alice), (135, 0));
+    // Long-pending work is charged to its completion day, not merely
+    // the day it was first recorded.
+    db.execute(
+        "UPDATE sends SET created_at = ?1, done_at = ?2 WHERE amount = 0",
+        rusqlite::params![now - 2 * 86_400, now - 7 * 3_600],
+    )
+    .unwrap();
+    for _ in 0..9 {
+        alice.receive(&net.pay(HUB, &alice.address(), 1)).unwrap();
+    }
+    alice.unlink().await.unwrap();
+    rested_notes(&alice);
+    assert_eq!(alice.maintain_notes().await.unwrap(), 0);
+    assert_eq!(alice.sends().unwrap().len(), 2);
+    db.execute(
+        "UPDATE sends SET done_at = ?1 WHERE amount = 0",
+        [now - 2 * 86_400],
+    )
+    .unwrap();
+    assert_eq!(alice.maintain_notes().await.unwrap(), 1);
+    assert_eq!(alice.sends().unwrap().len(), 3);
+    assert_eq!(available(&alice), (143, 0));
+}
+
+#[tokio::test]
+async fn explicit_optimization_honors_its_quote_cap_and_contract_ceilings() {
+    let net = charging(Fee { base: 1, ppm: 0 });
+    let alice = party(&net, 1).await;
+    alice.receive(&net.pay(HUB, &alice.address(), 128)).unwrap();
+    alice.unlink().await.unwrap();
+    // Explicit optimization may bypass the privacy rest, but never the
+    // quoted fee cap or a contract's fee agreement.
+    let quote = alice.optimization_quote(HUB).unwrap().unwrap();
+    assert_eq!(quote.fee, 1);
+    assert!(matches!(
+        alice.optimize_notes(HUB, 0).await,
+        Err(Error::Invalid(_))
+    ));
+    assert!(alice.sends().unwrap().is_empty());
+    alice
+        .set_fee_ceilings(HUB, Some(licash_api::Fees::default()))
+        .unwrap();
+    assert!(matches!(
+        alice.optimize_notes(HUB, 1).await,
+        Err(Error::FeesRaised { .. })
+    ));
+    assert!(alice.sends().unwrap().is_empty());
+    alice.set_fee_ceilings(HUB, None).unwrap();
+    let optimized = alice.optimize_notes(HUB, quote.fee).await.unwrap().unwrap();
+    assert_eq!(optimized.quote, quote);
+    let operation = alice.operation_notes(&optimized.id).unwrap();
+    assert_eq!(operation.made.len(), quote.notes_after);
+    assert_eq!(available(&alice), (127, 0));
+    assert!(alice.resume().await.unwrap().paid.is_empty());
+}
+
+#[tokio::test]
+async fn a_pending_optimization_blocks_another_connection_and_resumes_without_handover() {
+    let net = charging(Fee { base: 0, ppm: 0 });
+    let alice = party(&net, 1).await;
+    for _ in 0..100 {
+        alice.receive(&net.pay(HUB, &alice.address(), 1)).unwrap();
+    }
+    alice.unlink().await.unwrap();
+    rested_notes(&alice);
+    net.fail(OFFER, Fault::Lost);
+    let pending = alice.maintain_notes().await;
+    assert!(
+        matches!(&pending, Err(Error::Pending { .. })),
+        "{pending:?}"
+    );
+    let id = alice.sends().unwrap()[0].id.clone();
+    // The first attempt takes at most 64 inputs: enough disjoint notes
+    // remain for a second process to remint unless the hub-wide guard
+    // prevents it.
+    let other = Wallet::open(&alice._dir.path().join("w.sqlite"), Link(net.clone())).unwrap();
+    assert!(available(&other).0 > 0);
+    assert_eq!(other.maintain_notes().await.unwrap(), 0);
+    assert_eq!(other.sends().unwrap().len(), 1);
+    let resumed = other.resume().await.unwrap();
+    assert!(resumed.paid.is_empty());
+    assert!(resumed.pending.is_empty());
+    assert_eq!(other.sends().unwrap()[0].id, id);
+    assert_eq!(other.sends().unwrap()[0].state, State::Done);
+    assert_eq!(other.maintain_notes().await.unwrap(), 0);
+    assert_eq!(other.sends().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn automatic_optimization_never_retries_a_fee_increase_or_bypasses_free_only() {
+    let net = charging(Fee { base: 1, ppm: 0 });
+    *net.stale.lock().unwrap() = Some(Fee { base: 0, ppm: 0 });
+    let alice = party(&net, 1).await;
+    *net.stale.lock().unwrap() = None;
+    alice.receive(&net.pay(HUB, &alice.address(), 128)).unwrap();
+    alice.unlink().await.unwrap();
+    rested_notes(&alice);
+    let refused = alice.maintain_notes().await;
+    assert!(
+        matches!(&refused, Err(Error::Refused { problem, .. }) if problem.code == Code::Fee),
+        "{refused:?}"
+    );
+    assert_eq!(alice.sends().unwrap().len(), 1);
+    assert!(matches!(
+        alice.sends().unwrap()[0].state,
+        State::Abandoned(_)
+    ));
+    assert_eq!(available(&alice), (128, 0));
+    let db = rusqlite::Connection::open(alice._dir.path().join("w.sqlite")).unwrap();
+    db.execute(
+        "UPDATE sends SET created_at = 1, done_at = NULL WHERE amount = 0",
+        [],
+    )
+    .unwrap();
+    assert_eq!(alice.maintain_notes().await.unwrap(), 0);
+    assert_eq!(alice.sends().unwrap().len(), 1);
+    let observed: i64 = db
+        .query_row("SELECT done_at FROM sends WHERE amount = 0", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert!(observed > 1, "an unknown refusal clock starts a new rest");
+
+    let bob = party(&net, 2).await;
+    bob.receive(&net.pay(HUB, &bob.address(), 128)).unwrap();
+    bob.unlink().await.unwrap();
+    rested_notes(&bob);
+    bob.set_renew_limit(0);
+    assert_eq!(bob.maintain_notes().await.unwrap(), 0);
+    assert!(bob.sends().unwrap().is_empty());
 }
 
 #[tokio::test]

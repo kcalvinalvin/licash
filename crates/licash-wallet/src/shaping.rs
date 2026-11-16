@@ -2,11 +2,485 @@
 //! budget, use the smallest possible largest denomination. No contract's
 //! cap or wallet identity is encoded in the distribution.
 
-use licash::{crypto::tagged_hash, note::Keyset};
-use licash_api::NoteFee;
+use licash::{
+    address::{Address, Ephemeral},
+    claim::Branch,
+    crypto::tagged_hash,
+    note::Keyset,
+    spend::Proposal,
+};
+use licash_api::{Info, NoteFee, Offer};
+use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::coins::{self, Selection, MAX_INPUTS};
-use crate::{Error, Transport, Wallet};
+use crate::{
+    denominated_outputs, denominations, hub_url, invalid, now, sql, take, Error, Transport, Wallet,
+};
+
+const DAY: i64 = 24 * 60 * 60;
+const STALE: i64 = 7 * DAY;
+
+impl crate::Sent {
+    /// Whether this operation rearranges `owner`'s notes, rather than
+    /// paying an amount away. Ordinary sends reject zero amounts and
+    /// renewals always leave a positive amount.
+    pub fn is_optimization(&self, owner: &Address) -> bool {
+        self.amount == 0 && self.payee == *owner
+    }
+}
+
+/// A snapshot of a possible note optimization. `value` is the input value
+/// reminted, not an amount paid away. Note counts cover the hub's currently
+/// held notes, not notes pending in other operations.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OptimizationQuote {
+    pub hub: String,
+    pub value: u64,
+    pub fee: u64,
+    pub notes_before: usize,
+    pub notes_after: usize,
+}
+
+/// A completed optimization, recorded as a zero-amount self-payment.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Optimization {
+    pub id: String,
+    pub quote: OptimizationQuote,
+}
+
+#[derive(Clone, Copy)]
+enum Mode {
+    Automatic,
+    /// Read-only scheduling: automatic authority, ignoring temporary waits.
+    Future,
+    Manual {
+        max_fee: u64,
+    },
+}
+
+struct Remint {
+    keyset: Keyset,
+    plan: Plan<[u8; 33]>,
+    quote: OptimizationQuote,
+    short_rest: bool,
+}
+
+impl<T: Transport> Wallet<T> {
+    /// Whether a later sync round can finish note work, including privacy
+    /// rest, cooldown and rolling-budget waits. Reads cached hub fees only,
+    /// and never reserves notes or starts network work. A remint that cannot
+    /// fit its fee authority or even a fresh daily budget is not a reason
+    /// to keep a periodic job alive.
+    pub fn note_maintenance_needed(&self) -> Result<bool, Error> {
+        // Like a payment line, work stuck for a week (its hub gone) is
+        // retried when the app is opened, not kept alive in the background.
+        let since = now().saturating_sub(STALE);
+        let pending: bool = self.store.read(|c| {
+            Ok(c.query_row(
+                "SELECT EXISTS (SELECT 1 FROM sends s JOIN reach r ON r.hub = s.hub
+                 WHERE s.payee = ?1 AND s.done_at IS NULL AND s.abandoned IS NULL
+                 AND s.created_at > ?2)
+                 OR EXISTS (SELECT 1 FROM notes n JOIN keysets k ON k.id = n.keyset
+                 JOIN reach r ON r.hub = k.hub WHERE n.unlinked = 0
+                 AND n.spent_by IS NULL AND n.gone_at IS NULL AND n.added_at > ?2)",
+                params![self.address().to_bytes(), since],
+                |r| r.get(0),
+            )?)
+        })?;
+        if pending {
+            return Ok(true);
+        }
+        let reachable: Vec<(i64, String)> = self.store.read(|c| {
+            let mut stmt = c.prepare("SELECT hub, MIN(url) FROM reach GROUP BY hub")?;
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })?;
+        for (hub, url) in reachable {
+            let info = self.hub(&url)?.1;
+            if self.renewal_needed(hub, &info)? {
+                return Ok(true);
+            }
+        }
+        for (url, info) in self.hubs()? {
+            let hub = self.hub(&url)?.0;
+            if let Some(remint) = self.remint_plan(hub, &url, &info, Mode::Future, now())? {
+                let value: i64 = self.store.read(|c| {
+                    Ok(c.query_row(
+                        "SELECT COALESCE(SUM(n.denom), 0) FROM notes n
+                         JOIN keysets k ON k.id = n.keyset WHERE k.hub = ?1
+                         AND n.spent_by IS NULL AND n.gone_at IS NULL",
+                        [hub],
+                        |r| r.get(0),
+                    )?)
+                })?;
+                if within_daily_budget(value.try_into().map_err(invalid)?, 0, remint.quote.fee) {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// Preview explicit optimization at `url`, as its hub last advertised
+    /// its fees. Only unlinked notes are used. Unlike automatic maintenance,
+    /// explicit optimization may bypass rest periods and the daily budget.
+    pub fn optimization_quote(&self, url: &str) -> Result<Option<OptimizationQuote>, Error> {
+        let url = hub_url(url)?;
+        let (hub, info) = self.hub(&url)?;
+        self.agreed_fees(hub, &url, &info)?;
+        Ok(self
+            .remint_plan(hub, &url, &info, Mode::Manual { max_fee: u64::MAX }, now())?
+            .map(|remint| remint.quote))
+    }
+
+    /// Explicitly optimize notes at `url`, paying at most `max_fee` sat.
+    /// This bypasses automatic rest and daily-budget guards, but never
+    /// contract ceilings or the unlinked-input rule. A fee refusal is not
+    /// retried at a higher price. None if no improvement is available or
+    /// another optimization is still pending.
+    pub async fn optimize_notes(
+        &self,
+        url: &str,
+        max_fee: u64,
+    ) -> Result<Option<Optimization>, Error> {
+        self.optimize_at(url, Mode::Manual { max_fee }).await
+    }
+
+    /// Opportunistically maintain notes at each trusted hub, at most one
+    /// remint per hub. Inputs rest after unlinking, attempts rest after
+    /// being recorded, and fees fit both their authority and a rolling
+    /// 1%-of-current-note-value daily budget (at least 1 sat). Unknown
+    /// unlink times begin a rest, never request a remint. Call after
+    /// resuming pending work and unlinking, from the application's loop.
+    pub async fn maintain_notes(&self) -> Result<usize, Error> {
+        let mut completed = 0;
+        let mut failed = None;
+        for (url, _) in self.hubs()? {
+            match self.optimize_at(&url, Mode::Automatic).await {
+                Ok(Some(_)) => completed += 1,
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::info!(%url, %e, "note maintenance deferred");
+                    failed.get_or_insert(e);
+                }
+            }
+        }
+        failed.map_or(Ok(completed), Err)
+    }
+
+    async fn optimize_at(&self, url: &str, mode: Mode) -> Result<Option<Optimization>, Error> {
+        let url = hub_url(url)?;
+        let (hub, info) = self.hub(&url)?;
+        self.agreed_fees(hub, &url, &info)?;
+        let at = now();
+        if matches!(mode, Mode::Automatic) {
+            // A partial/imported row may lack this metadata even after
+            // migration. Unknown age starts here, not at its receipt.
+            self.store.write(|tx| {
+                tx.execute(
+                    "UPDATE notes SET unlinked_at = ?2 WHERE unlinked = 1
+                     AND unlinked_at IS NULL AND spent_by IS NULL AND gone_at IS NULL
+                     AND keyset IN (SELECT id FROM keysets WHERE hub = ?1)",
+                    params![hub, at],
+                )?;
+                // A crash may leave a refused attempt without an end
+                // clock. Its first observation starts a conservative
+                // rest rather than treating its old creation as enough.
+                tx.execute(
+                    "UPDATE sends SET done_at = ?3 WHERE hub = ?1 AND payee = ?2
+                     AND amount = 0 AND renewal = 0 AND abandoned IS NOT NULL AND done_at IS NULL",
+                    params![hub, self.address().to_bytes(), at],
+                )?;
+                Ok(())
+            })?;
+        }
+        let Some(remint) = self.remint_plan(hub, &url, &info, mode, at)? else {
+            return Ok(None);
+        };
+        if let Mode::Manual { max_fee } = mode {
+            if remint.quote.fee > max_fee {
+                return Err(Error::Invalid(format!(
+                    "optimizing costs {} sat, more than the limit of {max_fee}",
+                    remint.quote.fee
+                )));
+            }
+        }
+        if !self
+            .store
+            .read(|c| self.remint_allowed(c, hub, mode, at, &remint))?
+        {
+            return Ok(None);
+        }
+        let inputs = self.notes_of(&remint.keyset, &remint.plan.selection.inputs)?;
+        let ephemeral = Ephemeral::random();
+        let me = self.address();
+        let parts = [
+            (
+                &info.address,
+                denominations(&remint.keyset, remint.quote.fee)?,
+            ),
+            (&me, remint.plan.change.clone()),
+        ];
+        let outputs = denominated_outputs(&ephemeral, Branch::Pay, &parts)?;
+        let proposal = Proposal::new(&remint.keyset, &inputs, ephemeral.public(), outputs, None)?;
+        let id = proposal.id();
+        let offer = serde_json::to_string(&Offer::new(&proposal, &inputs)).map_err(invalid)?;
+        let started = self.store.write(|tx| {
+            let recorded = now();
+            if matches!(mode, Mode::Automatic) && recorded < at {
+                return Ok(false);
+            }
+            // Disjoint inputs do not prevent concurrent paid remints.
+            // Recheck the hub-wide guards under this IMMEDIATE lock.
+            if !self.remint_allowed(tx, hub, mode, recorded, &remint)? {
+                return Ok(false);
+            }
+            tx.execute(
+                "INSERT INTO sends (id, hub, payee, amount, fee, offer, created_at)
+                 VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6)",
+                params![
+                    id.as_bytes(),
+                    hub,
+                    me.to_bytes(),
+                    sql(remint.quote.fee),
+                    offer,
+                    recorded
+                ],
+            )?;
+            take(tx, &id, &remint.plan.selection.inputs)?;
+            Ok(true)
+        });
+        match started {
+            Ok(true) => {}
+            Ok(false) | Err(Error::NoteTaken) => return Ok(None),
+            Err(e) => return Err(e),
+        }
+        tracing::info!(%url, fee = remint.quote.fee, before = remint.quote.notes_before,
+            after = remint.quote.notes_after, "optimizing notes");
+        if let Err(e) = self.advance(&id).await {
+            if matches!(&e, Error::Refused { problem, .. } if problem.code == licash_api::Code::Fee)
+            {
+                // Learn for the next preview/attempt, never silently pay
+                // more now. The recorded attempt still anchors the rest.
+                if let Ok((_, info)) = self.refresh(&url).await {
+                    self.agreed_fees(hub, &url, &info)?;
+                }
+            }
+            return Err(e);
+        }
+        // Blind the replacement notes promptly, but do not recursively
+        // pay for a renewal if the hub restarted in the meantime.
+        if let Err(e) = self.unlink_linked(hub, &url).await {
+            tracing::info!(%url, %e, "optimized notes stay linked for now");
+        }
+        Ok(Some(Optimization {
+            id: hex::encode(id.as_bytes()),
+            quote: remint.quote,
+        }))
+    }
+
+    fn remint_plan(
+        &self,
+        hub: i64,
+        url: &str,
+        info: &Info,
+        mode: Mode,
+        at: i64,
+    ) -> Result<Option<Remint>, Error> {
+        type Row = (u64, [u8; 33], [u8; 32], bool, Option<i64>);
+        let rows: Vec<Row> = self.store.read(|c| {
+            let mut stmt = c.prepare(
+                "SELECT n.denom, n.y, n.keyset, n.unlinked = 1 AND n.session IS NULL, n.unlinked_at
+                 FROM notes n JOIN keysets k ON k.id = n.keyset
+                 WHERE k.hub = ?1 AND n.spent_by IS NULL AND n.gone_at IS NULL
+                 ORDER BY n.denom DESC, n.y",
+            )?;
+            let rows = stmt.query_map([hub], |r| {
+                Ok((
+                    r.get::<_, i64>(0)? as u64,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                ))
+            })?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })?;
+        let Some(first) = rows.first() else {
+            return Ok(None);
+        };
+        let noise = self.shape_noise("licash/shaping/target", &first.1);
+        let target = 18 + (noise % 7) as usize;
+        let pressure = rows.len() >= 28 + (noise % 5) as usize;
+        let rest = match mode {
+            Mode::Automatic => self.shape_rest(&first.1, pressure),
+            Mode::Manual { .. } | Mode::Future => 0,
+        };
+        let agreed = self.ceilings_of(hub);
+        let willing = |total, fee| match mode {
+            Mode::Manual { .. } => fee < total,
+            Mode::Automatic | Mode::Future => match agreed {
+                Some(agreed) => !info.fees.above(&agreed) && fee < total,
+                None => crate::renewals::allowed(fee, total, self.renew_limit(), &info.fees),
+            },
+        };
+        let mut best: Option<Remint> = None;
+        // The healthy band is fixed. A newly drawn target must not turn
+        // yesterday's healthy 24-note layout into recurring paid work.
+        let before_score = (rows.len().saturating_sub(24), first.0);
+        let mut best_score = before_score;
+        for keyset in self.keysets(hub)? {
+            let denoms: Vec<_> = keyset.denominations().collect();
+            let notes: Vec<_> = rows
+                .iter()
+                .filter(|r| &r.2 == keyset.id())
+                .map(|&(d, y, _, unlinked, clock)| {
+                    (
+                        d,
+                        y,
+                        unlinked
+                            && match mode {
+                                Mode::Manual { .. } | Mode::Future => true,
+                                Mode::Automatic => {
+                                    clock.is_some_and(|clock| rested(at, clock, rest))
+                                }
+                            },
+                    )
+                })
+                .collect();
+            let eligible: Vec<_> = notes
+                .iter()
+                .filter(|n| n.2)
+                .map(|&(d, y, _)| (d, y))
+                .collect();
+            let spending = info.fees.spending();
+            let Ok(ordinary) = coins::select(&eligible, 0, &spending, |v| {
+                coins::split(v, denoms.iter().copied()).map_or(0, |n| n.len())
+            }) else {
+                continue;
+            };
+            let Some(plan) = payment(
+                &notes,
+                ordinary,
+                &spending,
+                &denoms,
+                target.saturating_sub(rows.len() - notes.len()),
+                willing,
+            ) else {
+                continue;
+            };
+            if !willing(plan.selection.total, plan.selection.fee) {
+                continue;
+            }
+            let after = rows.len() - plan.selection.inputs.len() + plan.change.len();
+            let largest = rows
+                .iter()
+                .filter(|r| !plan.selection.inputs.contains(&r.1))
+                .map(|r| r.0)
+                .chain(plan.change.iter().copied())
+                .max()
+                .unwrap_or(0);
+            let score = (after.saturating_sub(24), largest);
+            if score >= best_score {
+                continue;
+            }
+            best_score = score;
+            let quote = OptimizationQuote {
+                hub: url.to_owned(),
+                value: plan.selection.total,
+                fee: plan.selection.fee,
+                notes_before: rows.len(),
+                notes_after: after,
+            };
+            best = Some(Remint {
+                keyset,
+                plan,
+                quote,
+                short_rest: pressure && after < 28,
+            });
+        }
+        Ok(best)
+    }
+
+    fn remint_allowed(
+        &self,
+        c: &Connection,
+        hub: i64,
+        mode: Mode,
+        at: i64,
+        remint: &Remint,
+    ) -> Result<bool, Error> {
+        let me = self.address().to_bytes();
+        let pending: bool = c.query_row(
+            "SELECT EXISTS (SELECT 1 FROM sends WHERE hub = ?1 AND payee = ?2 AND amount = 0
+             AND renewal = 0 AND done_at IS NULL AND abandoned IS NULL)",
+            params![hub, me],
+            |r| r.get(0),
+        )?;
+        if pending {
+            return Ok(false);
+        }
+        if matches!(mode, Mode::Manual { .. }) {
+            return Ok(true);
+        }
+        let last: Option<([u8; 32], i64)> = c
+            .query_row(
+                "SELECT id, MAX(created_at, COALESCE(done_at, created_at)) AS rested_from
+             FROM sends WHERE hub = ?1 AND payee = ?2 AND amount = 0
+             AND renewal = 0 ORDER BY rested_from DESC, rowid DESC LIMIT 1",
+                params![hub, me],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        if let Some((id, clock)) = last {
+            if !rested(at, clock, self.shape_rest(&id, remint.short_rest)) {
+                return Ok(false);
+            }
+        }
+        let used: i64 = c.query_row(
+            "SELECT COALESCE(SUM(fee), 0) FROM sends WHERE hub = ?1 AND payee = ?2 AND amount = 0
+             AND renewal = 0 AND abandoned IS NULL
+             AND MAX(created_at, COALESCE(done_at, created_at)) >= ?3",
+            params![hub, me, at.saturating_sub(DAY)],
+            |r| r.get(0),
+        )?;
+        let value: i64 = c.query_row(
+            "SELECT COALESCE(SUM(n.denom), 0) FROM notes n JOIN keysets k ON k.id = n.keyset
+             WHERE k.hub = ?1 AND n.spent_by IS NULL AND n.gone_at IS NULL",
+            [hub],
+            |r| r.get(0),
+        )?;
+        let (Ok(used), Ok(value)) = (u64::try_from(used), u64::try_from(value)) else {
+            return Err(Error::Invalid(
+                "negative note-maintenance accounting".into(),
+            ));
+        };
+        Ok(within_daily_budget(value, used, remint.quote.fee))
+    }
+
+    fn shape_noise(&self, domain: &str, generation: &[u8]) -> u64 {
+        let hash = tagged_hash(domain, &[&self.keys.shaping, generation]);
+        u64::from_le_bytes(hash[..8].try_into().expect("eight hash bytes"))
+    }
+
+    fn shape_rest(&self, generation: &[u8], short: bool) -> i64 {
+        let noise = self.shape_noise("licash/shaping/rest", generation);
+        if short {
+            120 + (noise % 481) as i64
+        } else {
+            3_600 + (noise % 18_001) as i64
+        }
+    }
+}
+
+fn rested(at: i64, since: i64, rest: i64) -> bool {
+    since > 0 && at >= since && at.saturating_sub(since) >= rest
+}
+
+fn within_daily_budget(value: u64, used: u64, fee: u64) -> bool {
+    used.checked_add(fee)
+        .is_some_and(|total| total <= (value / 100).max(1))
+}
 
 impl<T: Transport> Wallet<T> {
     /// Select ordinary payment inputs, then shape change and add only
@@ -37,11 +511,8 @@ impl<T: Transport> Wallet<T> {
         })?;
         // Common bounds, varied by private generation-specific noise:
         // stable between quoting and paying, not predictable by a hub.
-        let noise = tagged_hash(
-            "licash/shaping/target",
-            &[&self.keys.shaping, &ordinary.inputs[0]],
-        );
-        let target = 18 + usize::from(noise[0]) % 7;
+        let target =
+            18 + (self.shape_noise("licash/shaping/target", &ordinary.inputs[0]) % 7) as usize;
         let others = rows.iter().filter(|row| &row.3 != keyset.id()).count();
         let notes: Vec<_> = rows
             .into_iter()
@@ -229,6 +700,26 @@ mod tests {
         fee: Fee { base: 0, ppm: 0 },
         output_msat: 0,
     };
+
+    #[test]
+    fn unknown_or_future_clocks_never_prove_that_notes_rested() {
+        assert!(!rested(10_000, 0, 120));
+        assert!(!rested(10_000, -1, 120));
+        assert!(!rested(10_000, 10_001, 120));
+        assert!(!rested(10_000, 9_881, 120));
+        assert!(rested(10_000, 9_880, 120));
+        assert!(!rested(i64::MAX, i64::MAX, 1));
+    }
+
+    #[test]
+    fn the_daily_budget_is_one_percent_with_a_one_sat_floor() {
+        assert!(within_daily_budget(0, 0, 0));
+        assert!(within_daily_budget(99, 0, 1));
+        assert!(!within_daily_budget(99, 0, 2));
+        assert!(within_daily_budget(200, 1, 1));
+        assert!(!within_daily_budget(200, 2, 1));
+        assert!(!within_daily_budget(200, u64::MAX, 1));
+    }
 
     #[test]
     fn consolidation_adds_only_unlinked_extras() {

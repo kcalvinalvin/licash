@@ -83,6 +83,7 @@ pub use locks::{Incoming, Lock, LockState, CLAIM_MARGIN};
 pub use payouts::{
     first_spend, payout_depth, Payout, PayoutProgress, PayoutQuote, PayoutState, CLAIM_ROOM,
 };
+pub use shaping::{Optimization, OptimizationQuote};
 pub use silent::{Blocks, Payee, Scanned, SilentCoin, SilentSpend};
 use store::{now, sql, Owner, Store};
 pub use swaps::{Swap, SwapLimits, SwapQuote, SwapState, SWAP_ROOM, SWAP_WINDOW};
@@ -1532,19 +1533,22 @@ impl<T: Transport> Wallet<T> {
     /// and take every lock, invoice and swap under way on. Renewals of
     /// notes are no payment: [`Wallet::unlink`] finishes them.
     pub async fn resume(&self) -> Result<Resumed, Error> {
-        let ids: Vec<[u8; 32]> = self.store.read(|c| {
+        let ids: Vec<([u8; 32], bool)> = self.store.read(|c| {
             let mut stmt = c.prepare(
-                "SELECT id FROM sends WHERE done_at IS NULL AND abandoned IS NULL AND renewal = 0
+                "SELECT id, amount = 0 AND payee = ?1 FROM sends
+                 WHERE done_at IS NULL AND abandoned IS NULL AND renewal = 0
                  ORDER BY created_at",
             )?;
-            let rows = stmt.query_map([], |r| r.get(0))?;
+            let rows =
+                stmt.query_map([self.address().to_bytes()], |r| Ok((r.get(0)?, r.get(1)?)))?;
             Ok(rows.collect::<Result<_, _>>()?)
         })?;
         let mut resumed = Resumed::default();
-        for id in ids {
+        for (id, optimization) in ids {
             let key = hex::encode(id);
             match self.advance(&ProposalId::from_bytes(id)).await {
-                Ok(payment) => resumed.paid.push(Paid { id: key, payment }),
+                Ok(payment) if !optimization => resumed.paid.push(Paid { id: key, payment }),
+                Ok(_) => {}
                 Err(Error::Refused { problem, .. }) => {
                     resumed.abandoned.push((key, problem.to_string()));
                 }
@@ -2140,8 +2144,9 @@ impl<T: Transport> Wallet<T> {
         };
         self.store.write(|tx| {
             tx.execute(
-                "UPDATE notes SET note = ?2, unlinked = 1, session = NULL WHERE y = ?1",
-                params![y, note.to_bytes()],
+                "UPDATE notes SET note = ?2, unlinked = 1, session = NULL, unlinked_at = ?3
+                 WHERE y = ?1",
+                params![y, note.to_bytes(), now()],
             )?;
             Ok(())
         })?;

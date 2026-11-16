@@ -113,24 +113,8 @@ impl<T: Transport> Wallet<T> {
         let total = batch.iter().fold(0u64, |sum, n| sum.saturating_add(n.1));
         for asked in [false, true] {
             let info = self.hub(url)?.1;
-            // What it does not pay is above any limit.
-            let spending = info.fees.spending();
-            let fee = coins::settle(total, 0, 0, &spending, |value| made(keyset, value))
-                .unwrap_or_else(|due| due);
-            // Under the ceilings agreed to there, whatever it costs that
-            // leaves some; else within the limit.
+            let (fee, refused) = self.renewal_price(hub, keyset, total, &info);
             let limit = self.renew_limit();
-            let refused = match self.ceilings_of(hub) {
-                Some(agreed) if info.fees.above(&agreed) => {
-                    Some("their hub charges more than agreed")
-                }
-                Some(_) if fee >= total => Some("renewing them would leave nothing"),
-                Some(_) => None,
-                None if !allowed(fee, total, limit, &info.fees) => {
-                    Some("renewing them costs more than the limit")
-                }
-                None => None,
-            };
             if let Some(why) = refused {
                 tracing::info!(%url, total, fee, limit, "notes stay linked: {why}");
                 return Ok(false);
@@ -151,6 +135,38 @@ impl<T: Transport> Wallet<T> {
             }
         }
         Ok(false)
+    }
+
+    /// The same batches and fee decision as execution, without starting a
+    /// renewal. Refused notes alone do not justify endless periodic work.
+    pub(crate) fn renewal_needed(&self, hub: i64, info: &Info) -> Result<bool, Error> {
+        Ok(self.renewable(hub)?.iter().any(|(keyset, batch)| {
+            let total = batch.iter().fold(0u64, |sum, n| sum.saturating_add(n.1));
+            self.renewal_price(hub, keyset, total, info).1.is_none()
+        }))
+    }
+
+    fn renewal_price(
+        &self,
+        hub: i64,
+        keyset: &Keyset,
+        total: u64,
+        info: &Info,
+    ) -> (u64, Option<&'static str>) {
+        let fee = coins::settle(total, 0, 0, &info.fees.spending(), |value| {
+            made(keyset, value)
+        })
+        .unwrap_or_else(|due| due);
+        let refused = match self.ceilings_of(hub) {
+            Some(agreed) if info.fees.above(&agreed) => Some("their hub charges more than agreed"),
+            Some(_) if fee >= total => Some("renewing them would leave nothing"),
+            Some(_) => None,
+            None if !allowed(fee, total, self.renew_limit(), &info.fees) => {
+                Some("renewing them costs more than the limit")
+            }
+            None => None,
+        };
+        (fee, refused)
     }
 
     /// The renewal of the notes `ys` of `keyset`, worth `total`, paying the
