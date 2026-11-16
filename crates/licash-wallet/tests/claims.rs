@@ -91,6 +91,31 @@ async fn a_claim_takes_the_largest_notes_its_cap_holds_out_of_every_payment() {
 }
 
 #[tokio::test]
+async fn a_claimed_note_shows_its_ownership_under_the_wallet_s_spending_root() {
+    let net = network();
+    let p = party(&net, 1, &[100]).await;
+    let w = &p.wallet;
+    let claimed = w.claim_notes(&ID, &p.keyset, 1_000, 32).unwrap();
+    let ownerships = w.ownerships(&claimed).unwrap();
+    assert_eq!(ownerships.len(), claimed.len());
+    let root = w.address().spend();
+    for (n, o) in claimed.iter().zip(&ownerships) {
+        o.verify(&root, n.note.message()).unwrap();
+    }
+    // Another wallet's ownerships are not hers, nor hers of its notes.
+    let other = party(&net, 2, &[100]).await;
+    let theirs = other
+        .wallet
+        .claim_notes(&ID, &other.keyset, 1_000, 32)
+        .unwrap();
+    assert!(w.ownerships(&theirs).is_err());
+    let root = other.wallet.address().spend();
+    assert!(ownerships[0]
+        .verify(&root, claimed[0].note.message())
+        .is_err());
+}
+
+#[tokio::test]
 async fn a_claim_takes_as_many_notes_as_it_may_hold() {
     let net = network();
     let p = party(&net, 1, &[100]).await;

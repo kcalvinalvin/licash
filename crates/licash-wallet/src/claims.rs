@@ -11,7 +11,7 @@
 use licash::{
     claim::Branch,
     crypto::{Point, ScalarBytes},
-    note::{Keyset, Message, Note},
+    note::{Keyset, Message, Note, Ownership},
 };
 use rusqlite::{params, OptionalExtension};
 
@@ -179,6 +179,23 @@ impl<T: Transport> Wallet<T> {
                 }
                 let key = derivation.hold_key(self.owner.hold_root())?;
                 Ok((n.note.message().clone(), key))
+            })
+            .collect()
+    }
+
+    /// Each of `notes`' ownership, which her proof of a claim shows the
+    /// note is hers by (its spending key derived from her spending root):
+    /// of this wallet's keys, refused for a note not derived from them.
+    /// Not a spending key, but private: it links the note to her.
+    pub fn ownerships(&self, notes: &[ClaimNote]) -> Result<Vec<Ownership>, Error> {
+        notes
+            .iter()
+            .map(|n| {
+                let derivation = self.derivation(&n.held())?;
+                if derivation.message() != n.note.message() {
+                    return Err(Error::Invalid("a note not of this wallet's keys".into()));
+                }
+                Ok(derivation.ownership())
             })
             .collect()
     }
