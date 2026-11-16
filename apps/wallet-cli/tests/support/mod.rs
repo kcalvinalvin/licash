@@ -416,6 +416,7 @@ impl Server {
                             gateway,
                             deposits,
                             tweaks,
+                            inbox: None,
                             relays,
                             contracts: None,
                             swaps: None,

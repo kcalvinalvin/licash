@@ -115,6 +115,7 @@ impl Hubs {
                 gateway: None,
                 deposits: None,
                 tweaks: None,
+                inbox: None,
                 relays: relays.clone(),
                 contracts: None,
                 swaps: None,

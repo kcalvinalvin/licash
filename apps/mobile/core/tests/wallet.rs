@@ -160,6 +160,7 @@ impl Net {
             deposits: Some(net.deposits.clone()),
             gateway: Some(net.lightning.clone()),
             tweaks: serves_tweaks.then(|| net.tweaks.clone()),
+            inbox: None,
             relays,
             contracts: None,
             swaps: None,
