@@ -800,9 +800,56 @@ impl Wallet {
         }
         Ok(paid)
     }
+
+    /// [`Wallet::collect`], answered once the payments are taken: their
+    /// notes unlinked right after, in the background, as after
+    /// [`Wallet::pay_now`]. Payments wait for it, as for a payment under
+    /// way.
+    pub fn collect_now(self: Arc<Self>) -> Result<Vec<Activity>, LicashError> {
+        let received = self.collecting()?;
+        if !received.is_empty() {
+            let after = std::thread::Builder::new()
+                .name("licash-received".into())
+                .spawn(move || {
+                    let _delivering = self.delivering();
+                    let started = Instant::now();
+                    self.unlink();
+                    tracing::info!(took = ?started.elapsed(), "after receiving, unlinked");
+                });
+            if let Err(e) = after {
+                // Unlinked on the next resume.
+                tracing::warn!(%e, "after receiving");
+            }
+        }
+        Ok(received)
+    }
 }
 
 impl Wallet {
+    /// The payments in the wallet's mailbox taken, each once, their notes
+    /// still linked.
+    fn collecting(&self) -> Result<Vec<Activity>, LicashError> {
+        if self
+            .wallet
+            .hubs()?
+            .iter()
+            .all(|(_, info)| info.relays.is_empty())
+        {
+            return Ok(Vec::new());
+        }
+        let mut kept = self.mailbox.lock().unwrap_or_else(PoisonError::into_inner);
+        let collect = licash_nostr::wallet::collect_kept(&self.wallet, &self.route, &mut kept);
+        let collected = self
+            .runtime
+            .block_on(collect)
+            .map_err(|e| LicashError::from_any(e, |reason| LicashError::Unavailable { reason }))?;
+        drop(kept);
+        for (id, reason) in &collected.skipped {
+            tracing::warn!(%id, %reason, "mail not taken");
+        }
+        Ok(collected.received.iter().map(received_activity).collect())
+    }
+
     /// [`Wallet::pay`], to the payee's mailbox and its change unlinked
     /// `now`, else neither, and told whether it is to be sent to the
     /// mailbox ([`Wallet::deliver`]).
@@ -917,28 +964,11 @@ impl Wallet {
     /// name: each once. Its relays stay connected until the next look,
     /// which then asks them at once.
     pub fn collect(&self) -> Result<Vec<Activity>, LicashError> {
-        if self
-            .wallet
-            .hubs()?
-            .iter()
-            .all(|(_, info)| info.relays.is_empty())
-        {
-            return Ok(Vec::new());
-        }
-        let mut kept = self.mailbox.lock().unwrap_or_else(PoisonError::into_inner);
-        let collect = licash_nostr::wallet::collect_kept(&self.wallet, &self.route, &mut kept);
-        let collected = self
-            .runtime
-            .block_on(collect)
-            .map_err(|e| LicashError::from_any(e, |reason| LicashError::Unavailable { reason }))?;
-        drop(kept);
-        for (id, reason) in &collected.skipped {
-            tracing::warn!(%id, %reason, "mail not taken");
-        }
-        if !collected.received.is_empty() {
+        let received = self.collecting()?;
+        if !received.is_empty() {
             self.unlink();
         }
-        Ok(collected.received.iter().map(received_activity).collect())
+        Ok(received)
     }
 
     /// Finish what was under way: payments, and moves to notes.

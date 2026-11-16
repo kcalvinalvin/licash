@@ -442,9 +442,12 @@ class Engine(context: Context) {
         tell()
     }
 
-    /** Take the payments in the mailbox, each told of: whether there were any. */
+    /**
+     * Take the payments in the mailbox, each told of at once, their notes
+     * unlinked after: whether there were any.
+     */
     private suspend fun collect(): Boolean {
-        val got = locked { it.collect() }
+        val got = locked { it.collectNow() }
         for (one in got) {
             AppLog.info("received ${one.amount} sat in the mailbox")
             notices.tryEmit(Event("Received ${sat(one.amount)}", one.amount))

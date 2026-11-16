@@ -1327,6 +1327,35 @@ fn a_phone_paying_now_answers_once_paid_and_mails_it_and_unlinks_after() {
 }
 
 #[test]
+fn a_phone_collecting_now_answers_once_taken_and_unlinks_after() {
+    let net = Net::new(true);
+    let light = Light::new(&net);
+    let alice = funded(&net, &light, "alice");
+    let bob = net.wallet("bob", net.height());
+    let asked = bob.payment_code(Some(500)).unwrap();
+    let paid = alice.pay(asked.qr, None).unwrap();
+    assert!(paid.delivered, "{paid:?}");
+
+    let got = bob.clone().collect_now().unwrap();
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!((got[0].kind, got[0].amount), (Kind::Received, 500));
+    assert_eq!(notes(&bob), 500);
+    // Its notes unlinked right after.
+    let unlinked = |bob: &Wallet| {
+        let taken = bob.notes_of(Kind::Received, got[0].id.clone()).unwrap();
+        !taken.made.is_empty() && taken.made.iter().all(|n| n.linking == Linking::Unlinked)
+    };
+    let waited = std::time::Instant::now();
+    while !unlinked(&bob) && waited.elapsed().as_secs() <= 30 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(unlinked(&bob));
+    // Each payment is taken once.
+    assert!(bob.clone().collect_now().unwrap().is_empty());
+    assert_eq!(notes(&bob), 500);
+}
+
+#[test]
 fn a_phone_keeps_contacts_by_name_one_to_each_wallet() {
     let net = Net::new(true);
     let alice = net.wallet("alice", net.height());
