@@ -116,7 +116,8 @@ private fun ActivityRow(activity: Activity, now: Long, coming: Boolean = false, 
         }
         Spacer(Modifier.width(12.dp))
         Text(
-            "$sign${sat(activity.amount)}",
+            if (activity.kind == Kind.OPTIMIZED) optimizationCost(activity.fee, activity.state)
+            else "$sign${sat(activity.amount)}",
             style = Amounts,
             color = when {
                 failed -> colors.error
@@ -134,7 +135,7 @@ private fun glyph(activity: Activity, coming: Boolean, failed: Boolean): ImageVe
     coming -> Glyphs.down
     else -> when (activity.kind) {
         Kind.LIGHTNING, Kind.INVOICE -> Glyphs.bolt
-        Kind.SWAP -> Glyphs.swap
+        Kind.SWAP, Kind.OPTIMIZED -> Glyphs.swap
         Kind.CONTRACT -> Glyphs.shield
         Kind.SENT, Kind.PAYOUT -> Glyphs.up
         Kind.RECEIVED, Kind.MOVED, Kind.ONCHAIN -> Glyphs.down

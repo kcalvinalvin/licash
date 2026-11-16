@@ -48,8 +48,8 @@ internal fun watchOf(ui: Ui, now: Long): Watch {
     // A proof posted: a challenge of it is answered within hours, not when a periodic job comes.
     val disputed = ui.recoveries.any { it.stage in DISPUTED }
     return when {
-        contracting || disputed || under.any { !unpaid(it, ui.under[it.key]) } -> Watch.NOW
-        under.isNotEmpty() || asked || forcing -> Watch.LATER
+        contracting || disputed || under.any { it.kind != Kind.OPTIMIZED && !unpaid(it, ui.under[it.key]) } -> Watch.NOW
+        under.isNotEmpty() || asked || forcing || ui.noteMaintenance -> Watch.LATER
         else -> Watch.NONE
     }
 }
@@ -106,7 +106,7 @@ internal fun news(activity: Activity): String? {
             Kind.MOVED -> "$amount added to your balance"
             Kind.INVOICE -> "Received $amount over Lightning"
             Kind.CONTRACT -> "Protection on"
-            Kind.RECEIVED, Kind.ONCHAIN -> null
+            Kind.RECEIVED, Kind.ONCHAIN, Kind.OPTIMIZED -> null
         }
         State.FAILED -> when (activity.kind) {
             Kind.SENT -> "Sending $amount"
@@ -116,7 +116,7 @@ internal fun news(activity: Activity): String? {
             Kind.MOVED -> "Adding $amount to your balance"
             Kind.INVOICE -> "Receiving $amount over Lightning"
             Kind.CONTRACT -> "Setting up protection"
-            Kind.RECEIVED, Kind.ONCHAIN -> null
+            Kind.RECEIVED, Kind.ONCHAIN, Kind.OPTIMIZED -> null
         }?.let { "$it failed: open Licash for why" }
     }
 }

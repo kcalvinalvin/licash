@@ -46,6 +46,7 @@ import org.licash.core.MoveQuote
 import org.licash.core.Network
 import org.licash.core.Notes
 import org.licash.core.NotesOf
+import org.licash.core.NoteOptimization
 import org.licash.core.Paid
 import org.licash.core.Recovery
 import org.licash.core.PayQuote
@@ -72,6 +73,8 @@ data class Ui(
     val hubs: List<Hub> = emptyList(),
     /** The hubs charging more than agreed as a contract opened there: not paid until approved. */
     val raised: List<FeesRaised> = emptyList(),
+    /** Note work waiting for another sync, including privacy rest. */
+    val noteMaintenance: Boolean = false,
     val tor: Boolean = false,
     val chain: ChainStatus = ChainStatus(),
     /** The next block to look in for payments on Bitcoin, once looking. */
@@ -451,6 +454,13 @@ class Engine(context: Context) {
                 failed("moving into Licash", e)
             }
         }
+        // Common SDK guards handle privacy rest, fee ceilings and the
+        // daily budget. Failure here does not fail completed sync work.
+        try {
+            locked { it.maintainNotes() }
+        } catch (e: LicashException) {
+            AppLog.info("note maintenance deferred: ${explain(e)}")
+        }
         state.update { it.copy(problem = problems.firstOrNull()) }
         refresh()
         tell()
@@ -610,13 +620,17 @@ class Engine(context: Context) {
                 val raised = runCatching { it.feesRaised() }
                     .onFailure { e -> AppLog.warn("reading the fees agreed", e) }
                     .getOrDefault(state.value.raised)
-                Shown(it.network(), it.balance(), history, it.hubs(), raised, it.tor(), contracts, recoveries, under)
+                val noteMaintenance = runCatching { it.noteMaintenanceNeeded() }
+                    .onFailure { e -> AppLog.warn("reading future note work", e) }
+                    .getOrDefault(state.value.noteMaintenance)
+                Shown(it.network(), it.balance(), history, it.hubs(), raised, it.tor(), contracts, recoveries, under, noteMaintenance)
             }
         }.onFailure { AppLog.warn("reading the wallet", it) }.getOrNull()
         state.update {
             when {
                 wallet == null -> it.copy(
                     wallet = false,
+                    noteMaintenance = false,
                     network = prefs.network,
                     developer = prefs.developer,
                     tor = prefs.tor,
@@ -634,6 +648,7 @@ class Engine(context: Context) {
                     contracts = shown.contracts,
                     recoveries = shown.recoveries,
                     under = shown.under,
+                    noteMaintenance = shown.noteMaintenance,
                     asked = prefs.askedAt,
                 )
             }
@@ -687,6 +702,7 @@ class Engine(context: Context) {
         val contracts: List<Contract>,
         val recoveries: List<Recovery>,
         val under: Map<String, Details>,
+        val noteMaintenance: Boolean,
     )
 
     /** A new wallet of the network chosen, born at the chain's height if known. */
@@ -720,6 +736,18 @@ class Engine(context: Context) {
     suspend fun approveFees(raised: FeesRaised): Result<Unit> = io {
         locked { it.approveFees(raised.hub, raised.charged) }
         refresh()
+    }
+
+    suspend fun optimizationQuote(hub: String): Result<NoteOptimization?> =
+        io { local { it.optimizationQuote(hub) } }
+
+    /** The shown fee is a hard cap, including if inventory changed since. */
+    suspend fun optimizeNotes(quote: NoteOptimization): Result<NoteOptimization?> = io {
+        try {
+            locked { it.optimizeNotes(quote.hub, quote.fee) }
+        } finally {
+            refresh()
+        }
     }
 
     suspend fun code(amount: ULong?): Result<Code> = io { local { it.paymentCode(amount) } }

@@ -60,6 +60,23 @@ class WatchTest {
     }
 
     @Test
+    fun note_work_waiting_for_privacy_rest_is_looked_at_later_until_done() {
+        // A receive-only wallet: everything finished, notes resting.
+        val received = listOf(line(Kind.RECEIVED, State.DONE))
+        assertEquals(Watch.LATER, watchOf(Ui(history = received, noteMaintenance = true), now))
+        assertEquals(Watch.NONE, watchOf(Ui(history = received, noteMaintenance = false), now))
+    }
+
+    @Test
+    fun an_optimization_under_way_is_looked_at_later_never_kept_at_work() {
+        val optimizing = line(Kind.OPTIMIZED, State.PENDING, amount = 0uL)
+        assertEquals(Watch.LATER, watchOf(Ui(history = listOf(optimizing)), now))
+        // A real payment beside it still keeps the app at work.
+        val paying = line(Kind.SENT, State.PENDING, "b")
+        assertEquals(Watch.NOW, watchOf(Ui(history = listOf(optimizing, paying), noteMaintenance = true), now))
+    }
+
+    @Test
     fun a_contract_being_opened_is_watched_now() {
         assertEquals(Watch.NOW, watchOf(Ui(opening = "https://hub.example"), now))
     }

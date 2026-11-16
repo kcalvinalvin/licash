@@ -72,5 +72,6 @@ internal fun doing(activity: Activity, coming: Boolean): String = when {
         Kind.RECEIVED, Kind.INVOICE, Kind.MOVED, Kind.ONCHAIN -> "Receiving ${sat(activity.amount)}"
         Kind.SWAP -> "Moving ${sat(activity.amount)}"
         Kind.CONTRACT -> "Setting up protection"
+        Kind.OPTIMIZED -> "Optimizing notes"
     }
 }

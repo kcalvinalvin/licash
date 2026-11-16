@@ -101,7 +101,8 @@ fun ActivityDetails(engine: Engine, ui: Ui, shown: Activity, back: () -> Unit) {
             else -> "+"
         }
         Text(
-            "$sign${digits(activity.amount)} sat",
+            if (activity.kind == Kind.OPTIMIZED) optimizationCost(activity.fee, activity.state)
+            else "$sign${digits(activity.amount)} sat",
             modifier = Modifier.padding(horizontal = 4.dp, vertical = 8.dp).testTag("amount"),
             style = Heading,
         )
@@ -165,13 +166,14 @@ internal fun title(activity: Activity, coming: Boolean): String = when {
         Kind.PAYOUT -> "Sent on Bitcoin"
         Kind.CONTRACT -> "Protection"
         Kind.SWAP -> "Moved"
+        Kind.OPTIMIZED -> "Optimized notes"
     }
 }
 
 /** Whether it paid out, rather than in. */
 internal fun paid(activity: Activity): Boolean =
     activity.kind == Kind.SENT || activity.kind == Kind.LIGHTNING || activity.kind == Kind.PAYOUT ||
-        activity.kind == Kind.CONTRACT
+        activity.kind == Kind.CONTRACT || activity.kind == Kind.OPTIMIZED
 
 /** What a wait for a block is, said the same way wherever one shows. */
 private const val CONFIRMING = "Confirming, about 10 min"
@@ -411,6 +413,7 @@ private fun Summary(activity: Activity, details: Details?, tx: Onchain?, develop
                 (details as? Details.Notes)?.let { Line("From", name(it.hub)) }
             } else {
                 (details as? Details.Notes)?.let { Line("At", name(it.hub)) }
+                if (activity.kind == Kind.OPTIMIZED) Say("Smaller notes leave room for receiving and help recovery fit its note limit.")
             }
         }
         if (developer) tx?.let { Line("Confirmations", confirmations(it, details)) }

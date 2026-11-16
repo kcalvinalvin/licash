@@ -15,6 +15,7 @@ import org.licash.core.OpeningStep
 import org.licash.core.Rate
 import org.licash.core.Recovery
 import org.licash.core.RecoveryStage
+import org.licash.core.State
 import org.licash.wallet.credit
 import org.licash.wallet.host
 import org.licash.wallet.percent
@@ -179,6 +180,13 @@ fun raises(raised: FeesRaised): List<Raise> {
 
 /** Why a hub's fees are the owner's to approve, said wherever they are. */
 const val RAISED_MEANS = "This hub raised its fees since your protection there started. Nothing is paid there until you approve them."
+
+/** An optimization moves no amount away: show only its fee, not `0 sat`. */
+internal fun optimizationCost(fee: ULong, state: State): String = when {
+    state == State.FAILED -> "Not charged"
+    fee == 0uL -> "Free"
+    else -> "Fee ${sat(fee)}"
+}
 
 /**
  * The most a hub charges on paying `amount`, said before the notes it

@@ -274,6 +274,18 @@ pub struct FeesRaised {
     pub agreed: Fees,
 }
 
+/// A note optimization, previewed with no `id` or completed with one.
+/// `value` is reminted, not paid away; only `fee` leaves the balance.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct NoteOptimization {
+    pub id: Option<String>,
+    pub hub: String,
+    pub value: u64,
+    pub fee: u64,
+    pub notes_before: u64,
+    pub notes_after: u64,
+}
+
 /// What a hub charges over Lightning, and what it takes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct LightningTerms {
@@ -776,6 +788,8 @@ pub enum Kind {
     /// Notes moved from one of the wallet's hubs to another, through a
     /// swap provider: `amount` reaching the other hub, `fee` on top.
     Swap,
+    /// Notes rearranged at a hub: no amount paid away, only a fee.
+    Optimized,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]

@@ -74,6 +74,17 @@ take precedence, under Privacy), the notes of
 each denomination, and how each payment was made: its transactions, block
 heights and providers.
 
+Like the CLI, each sync reshapes the notes of a wallet that mostly
+receives, within the same fee authority and the rolling 1% daily budget
+(see [the wallet's README](../../wallet-cli/README.md)). While notes wait
+out their privacy rest, a periodic job (about every 15 minutes, as Android
+allows) keeps looking after the app is closed, without the foreground
+service; it stops once nothing is left to do, or when what is left is
+beyond the fee authority. History shows each remint as "Optimized notes",
+its fee alone. In advanced mode, a hub's sheet in Settings offers "Optimize
+notes": a preview, then a remint within the fee shown, bypassing the rests
+and the daily budget but never the contract ceilings.
+
 The app needs a hub taking deposits on the same network: `licash-hub run
 --network signet --chain URL --deposit-sweep-address ADDRESS`, with
 `--nostr-relay` (or `--mailbox-relay`) for payments between wallets through

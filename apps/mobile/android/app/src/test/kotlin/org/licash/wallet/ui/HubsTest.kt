@@ -11,8 +11,17 @@ import org.licash.core.HubsFound
 import org.licash.core.LightningTerms
 import org.licash.core.Range
 import org.licash.core.Rate
+import org.licash.core.State
 
 class HubsTest {
+    @Test
+    fun optimization_shows_only_its_fee_and_never_a_zero_amount_payment() {
+        assertEquals("Fee 1 sat", optimizationCost(1uL, State.DONE))
+        assertEquals("Fee 1 sat", optimizationCost(1uL, State.PENDING))
+        assertEquals("Free", optimizationCost(0uL, State.DONE))
+        assertEquals("Not charged", optimizationCost(1uL, State.FAILED))
+    }
+
     private fun found(silent: UInt, onion: UInt) = HubsFound(hubs = emptyList(), silent = silent, silentOnion = onion)
 
     private fun hub(

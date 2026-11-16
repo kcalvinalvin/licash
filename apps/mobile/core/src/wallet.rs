@@ -46,6 +46,7 @@ mod payouts;
 mod recoveries;
 mod refunds;
 mod safety;
+mod shaping;
 
 pub use contacts::Contact;
 
@@ -1013,9 +1014,19 @@ impl Wallet {
     pub fn history(&self) -> Result<Vec<Activity>, LicashError> {
         let mut history = Vec::new();
         let me = self.wallet.address();
-        // A payment to itself only makes notes of other denominations.
-        let sends = self.wallet.sends()?.into_iter().filter(|s| s.payee != me);
+        // Exact-note normalization stays hidden. Explicit/background
+        // optimizations are visible, including their fee and progress.
+        let sends = self
+            .wallet
+            .sends()?
+            .into_iter()
+            .filter(|s| s.payee != me || s.is_optimization(&me));
         for sent in sends {
+            let kind = if sent.is_optimization(&me) {
+                Kind::Optimized
+            } else {
+                Kind::Sent
+            };
             let (state, detail) = match sent.state {
                 licash_wallet::State::Done => (State::Done, sent.hub),
                 licash_wallet::State::Abandoned(why) => (State::Failed, why),
@@ -1023,7 +1034,7 @@ impl Wallet {
             };
             history.push(Activity {
                 id: sent.id,
-                kind: Kind::Sent,
+                kind,
                 state,
                 amount: sent.amount,
                 fee: sent.fee,
@@ -1097,7 +1108,7 @@ impl Wallet {
     pub fn notes_of(&self, kind: Kind, id: String) -> Result<NotesOf, LicashError> {
         let unknown = || LicashError::invalid(format!("nothing in the history is {id}"));
         let operations: Vec<String> = match kind {
-            Kind::Sent | Kind::Received | Kind::Lightning => vec![id.clone()],
+            Kind::Sent | Kind::Received | Kind::Lightning | Kind::Optimized => vec![id.clone()],
             Kind::Moved => {
                 let deposit = self.wallet.deposits()?.into_iter().find(|d| d.hash == id);
                 deposit.ok_or_else(unknown)?.lock.into_iter().collect()
@@ -1179,7 +1190,7 @@ impl Wallet {
     pub fn details(&self, kind: Kind, id: String) -> Result<Details, LicashError> {
         let unknown = || LicashError::invalid(format!("nothing in the history is {id}"));
         match kind {
-            Kind::Sent => {
+            Kind::Sent | Kind::Optimized => {
                 let sent = self.wallet.sends()?.into_iter().find(|s| s.id == id);
                 let hub = sent.ok_or_else(unknown)?.hub;
                 Ok(Details::Notes { hub })

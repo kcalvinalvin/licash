@@ -2116,6 +2116,44 @@ fn a_phone_with_no_contract_forces_none_closed_and_keeps_no_file_for_it() {
     assert!(!dir.join("contracts.sqlite").exists());
 }
 
+#[test]
+fn a_phone_previews_and_optimizes_notes_and_shows_the_fee_in_its_history() {
+    let net = Net::new(false);
+    let light = Light::new(&net);
+    let bob = funded(&net, &light, "bob");
+    let alice = net.wallet("alice", net.height());
+    let code = alice.payment_code(Some(64)).unwrap();
+    let paid = bob.pay(code.qr, None).unwrap();
+    alice.receive(paid.handover.unwrap(), false).unwrap();
+    alice.resume().unwrap();
+    assert_eq!(notes(&alice), 64);
+    assert_eq!(alice.maintain_notes().unwrap(), 0);
+    let hub = alice.hubs().unwrap()[0].url.clone();
+    let quote = alice.optimization_quote(hub.clone()).unwrap().unwrap();
+    assert_eq!((quote.id, quote.fee, quote.notes_before), (None, 1, 1));
+    assert!((18..=24).contains(&quote.notes_after));
+    assert!(invalid(alice.optimize_notes(hub.clone(), 0)).contains("more than the limit"));
+    let done = alice.optimize_notes(hub.clone(), 1).unwrap().unwrap();
+    assert_eq!(done.notes_after, quote.notes_after);
+    assert_eq!(notes(&alice), 63);
+    let id = done.id.unwrap();
+    let history = alice.history().unwrap();
+    let optimized = history.iter().find(|a| a.kind == Kind::Optimized).unwrap();
+    assert_eq!(optimized.id, id);
+    assert_eq!(
+        (optimized.state, optimized.amount, optimized.fee),
+        (State::Done, 0, 1)
+    );
+    assert_eq!(
+        alice.details(Kind::Optimized, id.clone()).unwrap(),
+        Details::Notes { hub }
+    );
+    let changed = alice.notes_of(Kind::Optimized, id).unwrap();
+    assert_eq!(changed.spent.iter().map(|n| n.amount).sum::<u64>(), 64);
+    assert_eq!(changed.made.iter().map(|n| n.amount).sum::<u64>(), 63);
+    assert_eq!(alice.maintain_notes().unwrap(), 0);
+}
+
 /// Over Tor, the light client goes through the wallet's own Tor client: a
 /// SOCKS5 proxy only it can use. Nothing here reaches the Tor network.
 #[test]

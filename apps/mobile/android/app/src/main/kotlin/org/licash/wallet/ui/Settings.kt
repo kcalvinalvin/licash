@@ -136,6 +136,7 @@ private fun Overview(engine: Engine, ui: Ui, open: (Page) -> Unit) {
 private fun HubsPage(engine: Engine, ui: Ui) {
     val scope = rememberCoroutineScope()
     var shown by remember { mutableStateOf<Hub?>(null) }
+    var optimizing by remember { mutableStateOf<Hub?>(null) }
     var failed by remember { mutableStateOf<String?>(null) }
     fun raised(hub: Hub) = ui.raised.find { it.hub == hub.url }
     if (ui.hubs.isNotEmpty()) {
@@ -159,8 +160,10 @@ private fun HubsPage(engine: Engine, ui: Ui) {
                 shown = null
                 scope.launch { failed = engine.approveFees(r).exceptionOrNull()?.let(::explain) }
             },
+            optimize = if (ui.developer) ({ shown = null; optimizing = hub }) else null,
         ) { shown = null }
     }
+    optimizing?.let { hub -> OptimizeNotes(engine, hub) { optimizing = null } }
 }
 
 /** The app's version, what it keeps on the phone, and its logs to share. */

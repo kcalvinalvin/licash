@@ -31,6 +31,7 @@ import org.licash.core.FeesRaised
 import org.licash.core.FoundHub
 import org.licash.core.Hub
 import org.licash.core.HubsFound
+import org.licash.core.NoteOptimization
 import org.licash.wallet.Engine
 import org.licash.wallet.Ui
 import org.licash.wallet.explain
@@ -72,6 +73,7 @@ internal fun HubFees(
     full: Boolean = false,
     raised: FeesRaised? = null,
     approve: (FeesRaised) -> Unit = {},
+    optimize: (() -> Unit)? = null,
     dismiss: () -> Unit,
 ) {
     Sheet(if (full) name(hub.url) else "Fees and limits", dismiss) {
@@ -140,6 +142,50 @@ internal fun HubFees(
                 Entry("Refunding one", value = charge(hub.refundFee))
             }
         }
+        optimize?.let { action ->
+            TextButton(onClick = action, modifier = Modifier.testTag("optimize-notes")) { Text("Optimize notes") }
+        }
+    }
+}
+
+/** Explicit optimization, with the shown fee as a hard execution cap. */
+@Composable
+internal fun OptimizeNotes(engine: Engine, hub: Hub, dismiss: () -> Unit) {
+    val scope = rememberCoroutineScope()
+    var quote by remember(hub.url) { mutableStateOf<NoteOptimization?>(null) }
+    var loading by remember(hub.url) { mutableStateOf(true) }
+    var busy by remember { mutableStateOf(false) }
+    var error by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(hub.url) {
+        engine.optimizationQuote(hub.url).onSuccess { quote = it }.onFailure { error = explain(it) }
+        loading = false
+    }
+    Sheet("Optimize notes", dismiss, dismissable = !busy) {
+        Say("Smaller notes leave receiving room and help recovery fit its note limit. Automatic shaping normally handles this.")
+        Say("Doing it manually bypasses privacy rest and the daily fee budget, but not the fees you agreed to.")
+        when {
+            loading -> Say("Checking the notes…")
+            quote == null && error == null -> Say("No optimization is available, or one is still pending.")
+            else -> quote?.let { q ->
+                Line("Notes", "${q.notesBefore} to ${q.notesAfter}")
+                Line("Reminting", sat(q.value))
+                Line("Fee", feeOf(q.fee, q.value))
+                if (q.id != null) {
+                    Say("Optimized. Its fee is recorded in History.")
+                } else {
+                    BigButton("Optimize for ${sat(q.fee)}", Modifier.fillMaxWidth().testTag("confirm-optimize"), enabled = !busy) {
+                        busy = true
+                        error = null
+                        scope.launch {
+                            engine.optimizeNotes(q).onSuccess { quote = it }.onFailure { error = explain(it) }
+                            busy = false
+                        }
+                    }
+                }
+            }
+        }
+        error?.let { Problem(it) }
+        TextButton(onClick = dismiss, enabled = !busy) { Text("Done") }
     }
 }
 
