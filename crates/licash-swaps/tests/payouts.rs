@@ -6,7 +6,10 @@
 #[path = "../../licash-wallet/tests/net/mod.rs"]
 mod net;
 
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
 use bitcoin::{
     hashes::Hash, transaction, Amount, BlockHash, FeeRate, OutPoint, Transaction, TxIn, TxOut, Txid,
@@ -576,6 +579,45 @@ async fn a_payout_is_declined_beyond_the_providers_terms() {
         Err(problem) => assert!(problem.message.contains("another swap"), "{problem:?}"),
         Ok(swap) => panic!("{swap:?}"),
     }
+}
+
+#[tokio::test]
+async fn a_payout_takes_notes_at_a_hub_only_within_the_providers_limit_there() {
+    let eco = Eco::new(STOCK, TERMS).await;
+    let provider = eco.provider();
+    let payout = eco.pay_out(1_000).await;
+    let paid = provider.records(1).unwrap()[0].paid;
+    assert!(paid > payout.amount + payout.budget, "{paid}");
+    // What its client's lock pays it counts as held at A, before and after
+    // it is claimed.
+    assert_eq!(provider.exposure(A).unwrap(), paid);
+    eco.pool.mine();
+    eco.follow().await;
+    eco.client_follows(&payout).await;
+    eco.pool.mine();
+    eco.follow().await;
+    assert_eq!(eco.stage(), Stage::Done);
+    assert_eq!(eco.provider_held(), paid);
+    assert_eq!(provider.exposure(A).unwrap(), paid);
+
+    // Limited to that much of A's notes: no payout taken from there.
+    provider.limit_intake(Some(HashMap::from([(A.to_owned(), paid + 1)])));
+    let more = eco.net.pay(A, &eco.client.address(), HELD);
+    eco.client.receive(&more).unwrap();
+    let declined = eco
+        .client
+        .payout(PROVIDER, A, PAYEE, 1_000, MAX_FEE, ONE_SAT)
+        .await
+        .unwrap();
+    match &declined.state {
+        PayoutState::Failed(why) => assert!(
+            why.contains("the provider takes no more of hub http://a.test's notes now"),
+            "{why}"
+        ),
+        state => panic!("{state:?}"),
+    }
+    assert_eq!(provider.records(10).unwrap().len(), 1);
+    assert!(eco.pool.waiting().is_empty());
 }
 
 #[tokio::test]
