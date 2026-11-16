@@ -44,10 +44,12 @@ use std::{
     collections::{HashMap, HashSet},
     future::Future,
     path::Path,
+    pin::Pin,
     sync::{
         atomic::{AtomicU32, Ordering},
         Mutex,
     },
+    task::Poll,
 };
 
 use licash::{
@@ -87,6 +89,11 @@ pub const RENEW_PPM: u32 = 100;
 
 /// Why a note stays linked: its hub refused to renew it.
 const RENEWAL_REFUSED: &str = "renewal_refused";
+
+/// How many notes a wallet asks a hub to unlink at once: each request
+/// waits for its answer, over Tor half a second or more, and a payment
+/// leaves a few notes to unlink.
+const UNLINKING_AT_ONCE: usize = 4;
 
 /// A hub's answer: its HTTP status and body.
 #[derive(Clone, Debug)]
@@ -167,6 +174,49 @@ pub enum Error {
     /// is not the one asked for: retry later.
     #[error("chain source failed: {0}")]
     Chain(String),
+}
+
+/// `run` on each of `items`, at most `most` under way at once: what each
+/// made, in no particular order. Once one failed, no other is started,
+/// and those under way are finished: its error then.
+async fn each_at_most<I, T, E, F>(
+    most: usize,
+    items: impl IntoIterator<Item = I>,
+    run: impl Fn(I) -> F,
+) -> Result<Vec<T>, E>
+where
+    F: Future<Output = Result<T, E>>,
+{
+    let mut items = items.into_iter();
+    let mut running: Vec<Pin<Box<F>>> = Vec::new();
+    let (mut made, mut failed) = (Vec::new(), None);
+    std::future::poll_fn(|cx| loop {
+        if failed.is_none() {
+            let room = most.max(1) - running.len();
+            running.extend(items.by_ref().take(room).map(|item| Box::pin(run(item))));
+        }
+        if running.is_empty() {
+            return Poll::Ready(());
+        }
+        let before = running.len();
+        running.retain_mut(|one| match one.as_mut().poll(cx) {
+            Poll::Ready(Ok(one)) => {
+                made.push(one);
+                false
+            }
+            Poll::Ready(Err(e)) => {
+                failed.get_or_insert(e);
+                false
+            }
+            Poll::Pending => true,
+        });
+        // Each still under way woken when it can go on.
+        if running.len() == before {
+            return Poll::Pending;
+        }
+    })
+    .await;
+    failed.map_or(Ok(made), Err)
 }
 
 fn invalid(e: impl std::fmt::Display) -> Error {
@@ -1923,13 +1973,17 @@ impl<T: Transport> Wallet<T> {
             let rows = stmt.query_map([hub], |r| r.get(0))?;
             Ok(rows.collect::<Result<_, _>>()?)
         })?;
-        let mut unlinked = 0;
-        for y in todo {
-            if self.unlink_one(url, &y).await? {
-                unlinked += 1;
-            }
-        }
-        Ok(unlinked)
+        let mut todo = todo.into_iter();
+        // The first alone: a hub not answering is asked nothing more.
+        let Some(first) = todo.next() else {
+            return Ok(0);
+        };
+        let first = self.unlink_one(url, &first).await?;
+        let rest = each_at_most(UNLINKING_AT_ONCE, todo, |y| async move {
+            self.unlink_one(url, &y).await
+        });
+        let unlinked = rest.await?.into_iter().filter(|&unlinked| unlinked).count();
+        Ok(usize::from(first) + unlinked)
     }
 
     async fn unlink_one(&self, url: &str, y: &[u8; 33]) -> Result<bool, Error> {
@@ -2189,4 +2243,50 @@ fn secure_url(url: &str) -> Option<String> {
     let rest = url.strip_prefix("http://")?;
     let host = rest.split(['/', ':']).next().unwrap_or(rest);
     (!host.ends_with(".onion")).then(|| format!("https://{rest}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::AtomicUsize;
+
+    use super::*;
+
+    /// A task that yields a few times, counting those under way at once.
+    async fn counted(under_way: &AtomicUsize, most: &AtomicUsize, fails: bool) -> Result<u8, u8> {
+        let now = under_way.fetch_add(1, Ordering::SeqCst) + 1;
+        most.fetch_max(now, Ordering::SeqCst);
+        for _ in 0..3 {
+            tokio::task::yield_now().await;
+        }
+        under_way.fetch_sub(1, Ordering::SeqCst);
+        if fails {
+            Err(1)
+        } else {
+            Ok(1)
+        }
+    }
+
+    #[tokio::test]
+    async fn each_runs_with_at_most_so_many_under_way() {
+        let (under_way, most) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        let ran = each_at_most(4, 0..11, |_| counted(&under_way, &most, false));
+        assert_eq!(ran.await, Ok(vec![1; 11]));
+        assert_eq!(most.load(Ordering::SeqCst), 4);
+        let none = each_at_most(4, 0..0, |_| counted(&under_way, &most, false));
+        assert_eq!(none.await, Ok(vec![]));
+    }
+
+    #[tokio::test]
+    async fn none_starts_once_one_failed_those_under_way_finishing() {
+        let (under_way, most) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        let started = AtomicUsize::new(0);
+        let ran = each_at_most(2, 0..10, |i| {
+            started.fetch_add(1, Ordering::SeqCst);
+            counted(&under_way, &most, i == 2)
+        });
+        assert_eq!(ran.await, Err(1));
+        // 0 and 1 done, then 2 failed with 3 under way, which finished.
+        assert_eq!(started.load(Ordering::SeqCst), 4);
+        assert_eq!(under_way.load(Ordering::SeqCst), 0);
+    }
 }

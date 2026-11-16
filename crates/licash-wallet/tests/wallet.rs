@@ -693,6 +693,26 @@ async fn notes_unlink_and_stay_spendable() {
 }
 
 #[tokio::test]
+async fn many_notes_unlink_none_asked_once_the_first_went_unanswered() {
+    let net = network();
+    let (alice, bob) = (party(&net, 1).await, party(&net, 2).await);
+    // In more notes than are asked to unlink at once.
+    alice.receive(&net.pay(HUB, &alice.address(), 255)).unwrap();
+    net.fail(UNLINK, Fault::Lost);
+    assert!(matches!(
+        alice.unlink().await,
+        Err(Error::Unavailable { .. })
+    ));
+    // Asked a few at once then, all of them.
+    assert_eq!(alice.unlink().await.unwrap(), net::split(255).len());
+    assert_eq!(alice.unlink().await.unwrap(), 0);
+    assert_eq!(available(&alice), (255, 0));
+
+    let payment = alice.send(HUB, &bob.address(), 250).await.unwrap().payment;
+    assert_eq!(bob.receive(&payment).unwrap().amount, 250);
+}
+
+#[tokio::test]
 async fn notes_a_restarted_hub_no_longer_unlinks_stay_linked_and_spendable() {
     let net = network();
     let (alice, bob) = (party(&net, 1).await, party(&net, 2).await);
