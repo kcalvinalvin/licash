@@ -70,8 +70,7 @@ pub enum Stage {
     /// Her payout in her wallet.
     Done,
     /// The hub answered her request: her statement's input to build from
-    /// her notes claimed and the chain's evidence of R and P. A counter,
-    /// which this build does not answer yet, stays here.
+    /// her notes claimed and the chain's evidence of R and P.
     Answered,
     /// The contract's output went otherwise than to her request.
     Lost,
@@ -92,10 +91,13 @@ pub enum Stage {
     /// Her payout after the hub's answer (`success`, or her answer to its
     /// challenge) in a block: waiting out its delay.
     Paid,
+    /// The hub countered her request, which this build does not answer:
+    /// only watched, for its collateral going elsewhere.
+    Countered,
 }
 
 impl Stage {
-    const ALL: [Stage; 19] = [
+    const ALL: [Stage; 20] = [
         Stage::Claiming,
         Stage::Claimed,
         Stage::Irrevocable,
@@ -115,6 +117,7 @@ impl Stage {
         Stage::Succeeding,
         Stage::Answering,
         Stage::Paid,
+        Stage::Countered,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -138,6 +141,7 @@ impl Stage {
             Stage::Succeeding => "succeeding",
             Stage::Answering => "answering",
             Stage::Paid => "paid",
+            Stage::Countered => "countered",
         }
     }
 
@@ -164,6 +168,7 @@ impl Stage {
                 | Stage::Succeeding
                 | Stage::Answering
                 | Stage::Paid
+                | Stage::Countered
         )
     }
 }
@@ -639,6 +644,7 @@ impl<'a, T: Transport, C: Chain> Run<'a, T, C> {
                     self.asserted(stage, &mut state, tip).await?
                 }
                 Stage::Answering => self.answering(&mut state, tip).await?,
+                Stage::Countered => self.countered(&mut state, tip).await?,
                 Stage::Done | Stage::Lost | Stage::GivingUp => Next::Wait,
             };
             let to = match next {
@@ -1161,9 +1167,7 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
         let spend = state.spend.clone().context("no answer")?;
         let response = match dispute::response(&self.o, &spend)? {
             Response::Plain(response) => response,
-            Response::Counter => {
-                bail!("the hub countered her request, which this build does not answer yet")
-            }
+            Response::Counter => return Ok(Next::To(Stage::Countered)),
         };
         let r_height = state.r_height.context("R in no block")?;
         let p_height = state.p_height.context("P in no block")?;
@@ -1193,6 +1197,13 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
         state.deadline = Some(dispute::deadline(&self.o));
         state.next_at = None;
         Ok(Next::To(Stage::Proving))
+    }
+
+    /// The hub's counter, which this build does not answer, said; its
+    /// answer's output watched as while she proves.
+    async fn countered(&self, state: &mut State, tip: u32) -> Result<Next> {
+        self.trouble("the hub countered her request, which this build does not answer yet".into());
+        Ok(self.answer_spent(state, tip).await?.unwrap_or(Next::Save))
     }
 
     /// Her statement's input proving her whole claim against `response`:
@@ -1619,6 +1630,6 @@ mod tests {
             assert_eq!(Stage::parse(stage.as_str()).unwrap(), stage);
             assert_eq!(stage.over(), matches!(stage, Stage::Done | Stage::Lost));
         }
-        assert!(Stage::parse("countered").is_err());
+        assert!(Stage::parse("forgotten").is_err());
     }
 }
