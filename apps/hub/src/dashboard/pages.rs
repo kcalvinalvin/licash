@@ -445,6 +445,14 @@ fn openings(r: &Records, state: &Now) -> Table {
             (false, Some(phase)) if !o.signed => format!("{what}, {phase:?}").to_lowercase(),
             _ => what.to_owned(),
         };
+        let what = match o
+            .terms
+            .as_ref()
+            .and_then(|t| licash_dashboard::fee_share(t.fee as i64, t.cap as i64))
+        {
+            Some(share) => format!("{what}, cost {share} of cap"),
+            None => what,
+        };
         let sat = |v: Option<u64>| v.map_or(Cell::Empty, |v| Cell::Sat(v as i64));
         let t = o.terms.as_ref();
         rows.push(Row::new(
@@ -601,7 +609,7 @@ fn recent(r: &Records) -> Table {
                     TRANSFER,
                     "released",
                     Some(amount),
-                    fees_of(fee),
+                    fees_of(fee, amount),
                 );
             }
             Some(Notice::Locked {
@@ -633,7 +641,14 @@ fn recent(r: &Records) -> Table {
                     Settled::Pay => (Tone::Good, "settled"),
                     Settled::Refund => (Tone::Warn, "refunded"),
                 };
-                push(at, tone, kind(&proposal), event, Some(amount), fees_of(fee));
+                push(
+                    at,
+                    tone,
+                    kind(&proposal),
+                    event,
+                    Some(amount),
+                    fees_of(fee, amount),
+                );
             }
             Some(Notice::Forwarded {
                 proposal,
@@ -738,7 +753,10 @@ fn recent(r: &Records) -> Table {
         let t = o.terms.as_ref();
         let state = match (o.signed, o.abandoned, t.map_or(0, |t| t.fee)) {
             (true, _, 0) => "signed".to_owned(),
-            (true, _, fee) => format!("signed, {}", fees_of(fee)),
+            (true, _, fee) => format!(
+                "signed, fee {} of cap",
+                licash_dashboard::fee(fee as i64, t.map_or(0, |t| t.cap) as i64)
+            ),
             (false, true, _) => "given up".to_owned(),
             (false, false, _) => "under way".to_owned(),
         };
@@ -781,10 +799,13 @@ fn noun(kind: &str) -> &str {
 }
 
 /// The hub's fee, if any.
-fn fees_of(fee: u64) -> String {
+fn fees_of(fee: u64, inputs: u64) -> String {
     match fee {
         0 => String::new(),
-        fee => format!("fee {} sat", grouped(fee as i64)),
+        fee => format!(
+            "fee {} of input",
+            licash_dashboard::fee(fee as i64, inputs as i64)
+        ),
     }
 }
 

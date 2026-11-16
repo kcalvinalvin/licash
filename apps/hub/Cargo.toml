@@ -47,6 +47,7 @@ tracing-subscriber.workspace = true
 fake = []
 
 [dev-dependencies]
+licash-dashboard = { workspace = true, features = ["test-support"] }
 licash-hub-service = { path = ".", features = ["fake"] }
 lngap-btc = { path = "../../vendor/ln-gap/crates/btc" }
 nostr-sdk = { version = "0.45.6", features = ["local-relay"] }

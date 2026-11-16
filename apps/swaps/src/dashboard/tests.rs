@@ -29,6 +29,23 @@ fn dashboard(dir: &Path) -> Report {
     pages::report(&records, NOW, licash_dashboard::unasked(), dir)
 }
 
+fn check_screens(report: &Report) {
+    for page in 0..report.pages.len() {
+        for (width, height) in [(80, 30), (140, 44)] {
+            if std::env::var_os("DASHBOARD_SCREEN").is_some() {
+                println!("SWAPS page {page} {width}x{height}");
+            }
+            let screen = licash_dashboard::testing::screen(report, page, width, height);
+            assert!(screen.contains("q quit"), "{screen}");
+            assert!(screen.contains("? help"), "{screen}");
+            assert!(
+                screen.lines().next().unwrap().contains("regtest"),
+                "{screen}"
+            );
+        }
+    }
+}
+
 fn summed(report: &Report, series: &str, label: &str) -> (usize, i64) {
     let series = report.series.iter().find(|s| s.id == series).unwrap();
     let Some(label) = series.labels.iter().position(|l| l == label) else {
@@ -339,6 +356,7 @@ fn the_dashboard_reads_swaps_fees_losses_and_notes_from_the_records() {
     let before = contents(dir.path());
 
     let report = dashboard(dir.path());
+    check_screens(&report);
     let route = "a.test → b.test";
     assert_eq!(summed(&report, "volume", route), (1, 1000));
     assert_eq!(summed(&report, "fees", route), (1, 10));
@@ -431,7 +449,7 @@ fn files_of_older_versions_are_read_as_they_are() {
         assert_eq!(table(&report, "Under way").rows.len(), 1);
         assert_eq!(
             texts(&table(&report, "Recent events").rows[0]),
-            ["taken", "a.test → b.test", "1000", "fee 11 sat"]
+            ["taken", "a.test → b.test", "1000", "fee 11 sat (1.1%)"]
         );
         let stock = report.series.iter().find(|s| s.id == "stock").unwrap();
         assert_eq!(stock.labels, ["hub.test"], "wallet v{}", i + 1);
@@ -561,12 +579,12 @@ fn recent_events_read_the_notices_newest_first_with_their_swaps() {
             (
                 Some(NOW - DAY + 60),
                 Tone::Good,
-                vec!["done", "a.test → b.test", "1000", "earned 10 sat"]
+                vec!["done", "a.test → b.test", "1000", "earned 10 sat (1.0%)"]
             ),
             (
                 Some(NOW - DAY),
                 Tone::Normal,
-                vec!["taken", "a.test → b.test", "1000", "fee 10 sat"]
+                vec!["taken", "a.test → b.test", "1000", "fee 10 sat (1.0%)"]
             ),
         ]
         .map(|(at, tone, cells)| (at, tone, cells.into_iter().map(String::from).collect()))

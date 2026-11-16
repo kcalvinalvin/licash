@@ -34,6 +34,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
+licash-dashboard = { workspace = true, features = ["test-support"] }
 tempfile = "3.27"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
