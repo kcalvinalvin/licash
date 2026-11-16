@@ -349,8 +349,9 @@ pub struct Balance {
     /// On Bitcoin, in the funding of contracts being opened: what comes
     /// back to the wallet once it confirms, their price paid.
     pub opening: u64,
-    /// Of `notes` and `notes_pending`, what contracts protect: at each
-    /// hub, up to the caps of those live there. The rest is on credit.
+    /// Of `notes`, what contracts protect: what their recoveries would
+    /// claim now, each up to its cap. The rest, and `notes_pending`, is on
+    /// credit.
     pub covered: u64,
 }
 
@@ -365,10 +366,11 @@ pub struct Contract {
     pub mock: bool,
     /// The most of the notes at its hub it protects, in sat.
     pub cap: u64,
-    /// Of the notes at its hub now, what it protects, in sat: up to its
-    /// cap, of those the live contracts there whose deadlines come first
-    /// leave; none unless it protects any (a genuine one, not until this
-    /// app recovers with it). Together, [`Balance::covered`] at its hub.
+    /// Of the notes at its hub now, what it protects, in sat: what its
+    /// recovery would claim, up to its cap, sharing them with the live
+    /// contracts there (those whose deadlines come first served first on
+    /// a tie); none of one under recovery, or of a holder program this
+    /// app does not trust. Together, [`Balance::covered`] at its hub.
     pub covers: u64,
     /// What opening it cost, in sat, from the coin it was paid from.
     pub price: u64,
