@@ -431,7 +431,7 @@ private fun Paying(ui: Ui, s: Step.Paying, pay: (ULong?) -> Unit) {
     var amount by remember { mutableStateOf(s.asked?.toLong()) }
     // The most a hub would charge: the code may name several.
     val fee = amount?.takeIf { !s.visit }
-        ?.let { a -> ui.hubs.maxOfOrNull { it.feeBase + it.feePpm * a.toULong() / 1_000_000uL } }
+        ?.let { a -> ui.hubs.maxOfOrNull { payingUpTo(it, a.toULong()) } }
     Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
         Spacer(Modifier.height(32.dp))
         if (s.asked == null) {

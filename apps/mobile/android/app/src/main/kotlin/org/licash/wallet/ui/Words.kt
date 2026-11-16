@@ -8,6 +8,7 @@ import java.util.Locale
 import org.licash.core.Balance
 import org.licash.core.Contract
 import org.licash.core.ContractState
+import org.licash.core.Hub
 import org.licash.core.OpeningStep
 import org.licash.core.Rate
 import org.licash.core.Recovery
@@ -140,6 +141,28 @@ fun charge(rate: Rate): String = when {
     rate.ppm == 0uL -> sat(rate.base)
     rate.base == 0uL -> percent(rate.ppm)
     else -> "${sat(rate.base)} + ${percent(rate.ppm)}"
+}
+
+/**
+ * What a hub charges a payment in Licash: its rate and, if it charges for
+ * the notes a payment makes, that for each: `1 sat + 0.01% + 0.1 sat a note`.
+ */
+fun paying(hub: Hub): String {
+    val rate = Rate(hub.feeBase, hub.feePpm)
+    if (hub.feeOutputMsat == 0uL) return charge(rate)
+    val (whole, rest) = hub.feeOutputMsat / 1_000uL to hub.feeOutputMsat % 1_000uL
+    val each = if (rest == 0uL) sat(whole) else "$whole.${rest.toString().padStart(3, '0').trimEnd('0')} sat"
+    return if (rate.base == 0uL && rate.ppm == 0uL) "$each a note" else "${charge(rate)} + $each a note"
+}
+
+/**
+ * The most a hub charges on paying `amount`, said before the notes it
+ * takes are known: its rate on the amount, and its fee on as many notes
+ * as the amount and what is left of it can be made in.
+ */
+fun payingUpTo(hub: Hub, amount: ULong): ULong {
+    val notes = 2uL * (ULong.SIZE_BITS - amount.countLeadingZeroBits()).toULong()
+    return hub.feeBase + hub.feePpm * amount / 1_000_000uL + (hub.feeOutputMsat * notes + 500uL) / 1_000uL
 }
 
 /** What protection under the mock authority is worth, said wherever one shows. */

@@ -385,11 +385,11 @@ pub async fn plans_with<T: Transport>(
                     continue;
                 }
             };
-            // At most all it holds there then.
+            // At most all it holds there then, in as many notes as it takes.
             let fee = to_info
                 .fees
-                .spend
-                .due(available(to).saturating_add(quote.amount));
+                .spending()
+                .at_most(available(to).saturating_add(quote.amount));
             plans.push(Plan {
                 hub: to.clone(),
                 amount,
@@ -448,7 +448,7 @@ async fn charges_as_planned<T: Transport>(wallet: &Wallet<T>, plan: &Plan) -> an
         .find(|b| b.hub == plan.hub)
         .map_or(0, |b| b.available);
     let swapped = plan.swap.as_ref().map_or(0, |s| s.provider.quote.amount);
-    let fee = info.fees.spend.due(held.saturating_add(swapped));
+    let fee = info.fees.spending().at_most(held.saturating_add(swapped));
     if fee > plan.fee {
         bail!(
             "nothing paid: hub {} charges {fee} now, more than the {} planned",

@@ -130,6 +130,9 @@ pub struct Hub {
     /// Its fee on a payment: `base` plus `ppm` millionths of it.
     pub fee_base: u64,
     pub fee_ppm: u64,
+    /// And, on a payment or a lock, for each note it makes for others
+    /// than the hub, in thousandths of a sat.
+    pub fee_output_msat: u64,
     /// The least and most it turns into notes from Bitcoin, if it does.
     pub deposits: Option<Range>,
     /// Whether it serves what finds silent payments.

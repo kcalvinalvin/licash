@@ -598,19 +598,16 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         }
         Command::AddHub { url } => {
             let info = wallet.add_hub(&url).await?;
-            let fee = info.fees.spend;
+            let fees = info.fees;
             show(
                 json,
                 json!({
                     "fees": info.fees, "keysets": info.keysets.len(), "locks": info.locks.is_some(),
                     "lightning": info.lightning,
                 }),
-                match (fee.base, fee.ppm) {
-                    (0, 0) => "trusted: it charges no fee".to_owned(),
-                    _ => format!(
-                        "trusted: it charges {} a payment",
-                        say::fee(fee.base, fee.ppm)
-                    ),
+                match (fees.spend.base, fees.spend.ppm, fees.output_msat) {
+                    (0, 0, 0) => "trusted: it charges no fee".to_owned(),
+                    _ => format!("trusted: it charges {} a payment", say::payment_fee(&fees)),
                 },
             );
         }
@@ -623,7 +620,6 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 })
             });
             let lines = hubs.iter().map(|(url, info)| {
-                let fee = info.fees.spend;
                 let lightning = if info.lightning.is_some() {
                     "  lightning"
                 } else {
@@ -635,7 +631,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 };
                 format!(
                     "{url}  {}{lightning}{deposits}",
-                    say::fee(fee.base, fee.ppm)
+                    say::payment_fee(&info.fees)
                 )
             });
             show(json, rows.collect(), lines.collect::<Vec<_>>().join("\n"));
@@ -1130,7 +1126,6 @@ async fn discover(
         let (key, shown) = (&service.key, &service.announcement.name);
         match &at[0].1 {
             Answer::Hub(info) => {
-                let fee = info.fees.spend;
                 let lightning = if info.lightning.is_some() {
                     "  lightning"
                 } else {
@@ -1139,7 +1134,7 @@ async fn discover(
                 lines.push(format!(
                     "{}  {}{lightning}  {name}",
                     urls.join(" "),
-                    say::fee(fee.base, fee.ppm)
+                    say::payment_fee(&info.fees)
                 ));
                 rows.push(json!({
                     "key": key, "name": shown, "urls": urls, "fees": info.fees,

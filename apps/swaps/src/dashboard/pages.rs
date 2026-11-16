@@ -45,7 +45,7 @@ impl Stock<'_> {
     /// is reserved and the hub's fee, as it quotes it.
     fn free(&self) -> i64 {
         let fee = self.hub.info.as_ref().map_or(0, |i| {
-            i64::try_from(i.fees.lock.due(self.held.max(0) as u64)).unwrap_or(i64::MAX)
+            i64::try_from(i.fees.locking().at_most(self.held.max(0) as u64)).unwrap_or(i64::MAX)
         });
         (self.held - self.reserved).saturating_sub(fee).max(0)
     }

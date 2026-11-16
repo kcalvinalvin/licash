@@ -160,6 +160,26 @@ pub fn fee(base: u64, ppm: u64) -> String {
     }
 }
 
+/// What a hub charges a payment: [`fee`] on what it moves and, if it
+/// charges for the notes made, that for each: `1 sat + 0.01% + 0.1 sat a
+/// note`.
+pub fn payment_fee(fees: &licash_api::Fees) -> String {
+    let on_value = fee(fees.spend.base, fees.spend.ppm);
+    let a_note = match (fees.output_msat / 1000, fees.output_msat % 1000) {
+        (0, 0) => return on_value,
+        (whole, 0) => format!("{} a note", sat(whole)),
+        (whole, rest) => format!(
+            "{}.{} sat a note",
+            grouped(whole),
+            format!("{rest:03}").trim_end_matches('0')
+        ),
+    };
+    match (fees.spend.base, fees.spend.ppm) {
+        (0, 0) => a_note,
+        _ => format!("{on_value} + {a_note}"),
+    }
+}
+
 /// Parts per million as a percentage: `0.01%`, `1%`, `2.5%`.
 pub fn percent(ppm: u64) -> String {
     let (whole, rest) = (ppm / 10_000, ppm % 10_000);
@@ -236,6 +256,19 @@ mod tests {
         assert_eq!(fee(1, 0), "1 sat");
         assert_eq!(fee(0, 100), "0.01%");
         assert_eq!(fee(1, 10_000), "1 sat + 1%");
+        let fees = |base, ppm, output_msat| licash_api::Fees {
+            spend: licash_api::Fee { base, ppm },
+            output_msat,
+            ..Default::default()
+        };
+        assert_eq!(payment_fee(&fees(0, 0, 0)), "free");
+        assert_eq!(payment_fee(&fees(1, 100, 0)), "1 sat + 0.01%");
+        assert_eq!(
+            payment_fee(&fees(1, 100, 100)),
+            "1 sat + 0.01% + 0.1 sat a note"
+        );
+        assert_eq!(payment_fee(&fees(0, 0, 2_000)), "2 sat a note");
+        assert_eq!(payment_fee(&fees(0, 0, 1_250)), "1.25 sat a note");
         assert_eq!(percent(25_000), "2.5%");
         assert_eq!(percent(1), "0.0001%");
     }

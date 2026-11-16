@@ -30,7 +30,6 @@ import kotlinx.coroutines.launch
 import org.licash.core.FoundHub
 import org.licash.core.Hub
 import org.licash.core.HubsFound
-import org.licash.core.Rate
 import org.licash.wallet.Engine
 import org.licash.wallet.Ui
 import org.licash.wallet.explain
@@ -49,7 +48,7 @@ const val HUB_MEANS = "A hub holds your balance and moves it for you. Choose one
 
 /** A hub in a line under its name: its fee on a payment, and what else it does. */
 internal fun about(hub: Hub): String = listOfNotNull(
-    if (hub.feeBase == 0uL && hub.feePpm == 0uL) "No fee" else "Fee ${charge(Rate(hub.feeBase, hub.feePpm))}",
+    paying(hub).let { if (it == "None") "No fee" else "Fee $it" },
     hub.lightning?.let { "Lightning" },
     hub.contracts?.let { "Protection" },
 ).joinToString(" · ")
@@ -78,7 +77,7 @@ internal fun HubFees(hub: Hub, full: Boolean = false, dismiss: () -> Unit) {
         }
         // What a payment costs, a section a direction: limits under each.
         Group("Paying") {
-            Entry("In Licash", value = charge(Rate(hub.feeBase, hub.feePpm)), tag = "fee-pay")
+            Entry("In Licash", value = paying(hub), tag = "fee-pay")
             val most = hub.lightningPay
             if (hub.lightning != null || most != null) {
                 Divider()
@@ -210,7 +209,7 @@ internal fun FoundHubs(engine: Engine, ui: Ui, auto: Boolean) {
                 fontFamily = FontFamily.Monospace,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
-            Line("Paying", charge(Rate(f.hub.feeBase, f.hub.feePpm)))
+            Line("Paying", paying(f.hub))
             Say("Add it only if you trust who runs it.")
             BigButton("Add hub", Modifier.fillMaxWidth().testTag("add-hub")) {
                 adding = null

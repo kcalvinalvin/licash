@@ -1728,7 +1728,7 @@ impl Wallet {
                 .iter()
                 .find(|b| b.hub == url)
                 .map_or(0, |b| b.available);
-            let needed = amount.saturating_add(info.fees.spend.due(amount));
+            let needed = amount.saturating_add(info.fees.spending().at_most(amount));
             if most.is_none_or(|(_, a)| available > a) {
                 most = Some((needed, available));
             }
@@ -1791,6 +1791,7 @@ fn hub(url: &str, info: &licash_api::Info) -> Hub {
         url: url.to_owned(),
         fee_base: info.fees.spend.base,
         fee_ppm: info.fees.spend.ppm,
+        fee_output_msat: info.fees.output_msat,
         deposits: info.deposits.as_ref().map(|d| Range {
             min: d.min,
             max: d.max,
