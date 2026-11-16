@@ -134,8 +134,9 @@ class Engine(context: Context) {
 
     /**
      * Look often: someone is waiting to be paid. In the mailbox too, apart
-     * from the rounds, every [MAIL_MS]: its relays kept connected, a look
-     * takes about a second.
+     * from the rounds, every [MAIL_MS]: its relays kept connected and
+     * pushing the new mail, a look takes what they pushed at once, asking
+     * them for all of it every 30 s (a few seconds over Tor).
      */
     @Volatile
     var eager = false
@@ -1049,7 +1050,7 @@ class Engine(context: Context) {
     companion object {
         private const val ROUND_MS = 20_000L
         private const val EAGER_MS = 4_000L
-        private const val MAIL_MS = 3_000L
+        private const val MAIL_MS = 1_000L
         private const val AWAY_MS = 60_000L
         private const val PROVIDERS_MS = 15 * 60_000L
         private const val PROVIDERS_RETRY_MS = 2 * 60_000L

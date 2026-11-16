@@ -961,8 +961,9 @@ impl Wallet {
     }
 
     /// Take the payments in the wallet's mailbox, on the relays its hubs
-    /// name: each once. Its relays stay connected until the next look,
-    /// which then asks them at once.
+    /// name: each once. Its relays stay connected, pushing the new mail:
+    /// the next looks take what they pushed at once, asking them for all
+    /// of it again every 30 s.
     pub fn collect(&self) -> Result<Vec<Activity>, LicashError> {
         let received = self.collecting()?;
         if !received.is_empty() {
