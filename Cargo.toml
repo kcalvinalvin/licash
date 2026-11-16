@@ -13,6 +13,10 @@ members = [
 # applications) are workspaces of their own.
 exclude = ["r0", "regtest", "apps", "crates/licash-groth16", "crates/licash-contract", "vendor"]
 
+[profile.dev]
+debug = 0
+incremental = false
+
 [workspace.package]
 version = "0.0.1"
 edition = "2021"

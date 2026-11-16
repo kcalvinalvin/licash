@@ -4,6 +4,10 @@
 resolver = "2"
 members = ["chain-client", "contracts", "dashboard", "e2e", "hub", "mobile/core", "mobile/prover", "nostr", "notify", "swaps", "tor", "transport", "wallet-cli"]
 
+[profile.dev]
+debug = 0
+incremental = false
+
 [workspace.package]
 version = "0.0.1"
 edition = "2021"

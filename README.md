@@ -67,6 +67,12 @@ cargo test --locked --manifest-path apps/Cargo.toml   # the applications
 apps/e2e/run.sh                                       # the ecosystem (Docker)
 ```
 
+The library and applications omit debug information and incremental build
+artifacts in dev and test builds to save disk space. These builds still enable
+development checks. To enable debug information for a build or test, set
+`CARGO_PROFILE_DEV_DEBUG=2`; set `CARGO_PROFILE_DEV_INCREMENTAL=true` to
+enable incremental builds. These settings may increase disk usage.
+
 ## Releases
 
 Once CI passes on main, it publishes the hub's, the wallet's and the swap
