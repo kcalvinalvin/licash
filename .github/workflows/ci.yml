@@ -52,6 +52,9 @@ jobs:
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - working-directory: apps
         run: cargo test --locked --workspace
+      - name: Corrected recovery driver challenge and collection
+        working-directory: apps
+        run: cargo test --release --locked -p licash-contracts --lib holder::recovery::driver_tests::a_selected_corrected_receipt_answers_a_challenge_and_collects -- --ignored --exact
       - working-directory: apps
         run: cargo doc --locked --no-deps --workspace
         env:

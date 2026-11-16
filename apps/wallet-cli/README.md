@@ -164,8 +164,10 @@ Bitcoin at once. `recoveries --chain <url>` then carries it on to `done`
 (`asserted`, `succeeding`, `paid`, `sweeping`), answering the hub if it
 challenges the proof. An unproven counter or a response with any plain
 publication input follows the same full-claim proof path. A proven counter
-keeps its corrected statement at `proving`; corrected proof import and
-collection are not enabled yet. Older `countered` recoveries are classified
+keeps its corrected statement at `proving`; the same export/import flow
+asserts its corrected payout, answers challenges, and collects the unspent
+remainder and reserves, including the reserves when the remainder is zero.
+Older `countered` recoveries are classified
 on their next advance without changing their request or reserved notes.
 Full-claim recovery state stays unchanged. Older wallet builds refuse new
 corrected recovery rows, leaving their notes reserved; do not downgrade

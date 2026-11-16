@@ -33,5 +33,8 @@ node = ["dep:axum", "dep:licash-chain-client", "dep:sha2"]
 
 [dev-dependencies]
 k256 = "0.13"
+lichen-babe = { path = "../../vendor/lichen/crates/babe" }
+lngap-lamport = { path = "../../vendor/ln-gap/crates/lamport" }
+lngap-sessions = { path = "../../vendor/ln-gap/crates/apps/sessions" }
 tempfile = "3.27"
 tower = { version = "0.5", features = ["util"] }

@@ -472,11 +472,16 @@ pub async fn import_proof<T: Transport, C: Chain>(
 ) -> Result<Recovery> {
     let store = Store::existing(dir)?.context("no contracts")?;
     let run = Run::load(wallet, chain, &store, dir, id, rate).await?;
-    let proof = hex::encode(run.verified(export)?);
     let row = store.recovery(id)?.context("no recovery of it")?;
     let stage = Stage::parse(&row.stage)?;
     let mut state = State::decode(&row)?;
-    full_only(&state)?;
+    let proof = hex::encode(run.verified(export, &state)?);
+    if let Some(kept) = &state.proof {
+        ensure!(
+            *kept == proof,
+            "another proof is kept already, and her key signs one only"
+        );
+    }
     match stage {
         Stage::Proving => {
             state.proof = Some(proof);
@@ -940,6 +945,7 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
     /// R signed, unless taken as another copy of hers posted it; P built
     /// to publish the claim, of R's anchor and coins of her wallet's.
     fn request(&self, state: &mut State) -> Result<Next> {
+        full_only(state)?;
         let request = self.requested(state)?;
         let r = match state.r.clone() {
             Some(r) => r,
@@ -1194,16 +1200,20 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
 
     /// Her bits and reserve swept to her wallet once their delay passed.
     fn sweep(&self, state: &mut State, tip: u32) -> Result<Next> {
-        full_only(state)?;
         let (payout, height) = payout(state)?;
         let height = height.context("no payout in a block")?;
         if tip + 1 < height + close::sweep_delay(&self.o) {
             return Ok(Next::Wait);
         }
-        let r = state.r.as_ref().context("no R")?;
-        let (_, b) = close::read_request(&self.o, r)?;
         let to = self.wallet.fallback_address()?.script_pubkey();
-        let sweep = close::sweep(&self.o, &self.keys, payout, state.amount, &b, to, self.rate)?;
+        let sweep = if state.corrected.is_some() {
+            let (claim, _, b) = self.posted_corrected(state)?;
+            claim.sweep(&self.keys, payout, &b, to, self.rate)?
+        } else {
+            let r = state.r.as_ref().context("no R")?;
+            let (_, b) = close::read_request(&self.o, r)?;
+            close::sweep(&self.o, &self.keys, payout, state.amount, &b, to, self.rate)?
+        };
         state.sweep = Some(sweep);
         state.next_at = None;
         Ok(Next::To(Stage::Sweeping))
@@ -1379,13 +1389,21 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
     /// Her `assert` of her proof kept, broadcast until in a block, past
     /// her deadline too, until the hub's timeout is.
     async fn asserting(&self, state: &mut State, tip: u32) -> Result<Next> {
-        full_only(state)?;
         if let Some(next) = self.answer_spent(state, tip).await? {
             return Ok(next);
         }
+        self.check_assertion(state)?;
+        let proof = self.proof(state)?;
+        ensure!(
+            self.proof_valid(state, &proof)?,
+            "not a proof of her selected claim"
+        );
         let assertion = match state.assertion.clone() {
             Some(tx) => tx,
-            None => dispute::assert(&self.o, &self.keys, &self.proof(state)?)?,
+            None => match self.corrected(state)? {
+                Some(claim) => claim.assert(&self.keys, &proof)?,
+                None => dispute::assert(&self.o, &self.keys, &proof)?,
+            },
         };
         self.broadcast(&assertion).await;
         state.assertion = Some(assertion);
@@ -1409,11 +1427,37 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
                 if dispute::is_assert(&self.o, &tx)
                     || dispute::Corrected::is_assert(&self.o, &tx) =>
             {
-                let (corrected, proof) = if dispute::Corrected::is_assert(&self.o, &tx) {
-                    let (claim, proof, _) = dispute::Corrected::asserted(&self.o, &tx)?;
+                let is_corrected = dispute::Corrected::is_assert(&self.o, &tx);
+                let pinned = if is_corrected == state.corrected.is_some() && state.proof.is_some() {
+                    let proof = self.proof(state)?;
+                    ensure!(
+                        self.proof_valid(state, &proof)?,
+                        "kept proof does not prove her selected claim"
+                    );
+                    Some(proof)
+                } else {
+                    None
+                };
+                let (corrected, proof) = if is_corrected {
+                    let (claim, proof, _) = match &pinned {
+                        Some(proof) => dispute::Corrected::asserted_keeping(&self.o, &tx, proof)?,
+                        None => dispute::Corrected::asserted(&self.o, &tx)?,
+                    };
+                    ensure!(
+                        claim.proves(&self.trust, &proof),
+                        "posted proof does not prove her corrected claim"
+                    );
                     (Some(claim.amount()), proof)
                 } else {
-                    (None, dispute::asserted(&self.o, &tx)?)
+                    let proof = match &pinned {
+                        Some(proof) => dispute::asserted_keeping(&self.o, &tx, proof)?,
+                        None => dispute::asserted(&self.o, &tx)?,
+                    };
+                    ensure!(
+                        dispute::proves(&self.o, &self.trust, &proof),
+                        "posted proof does not prove her full claim"
+                    );
+                    (None, proof)
                 };
                 let proof = hex::encode(dispute::proof_bytes(&proof));
                 if state.proof.as_ref().is_some_and(|p| *p != proof) {
@@ -1445,7 +1489,8 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
     /// chance passed, then `success`, of P's fee coin, broadcast until in
     /// a block. A challenge, even once `success` is out, is answered.
     async fn asserted(&self, stage: Stage, state: &mut State, tip: u32) -> Result<Next> {
-        full_only(state)?;
+        self.check_assertion(state)?;
+        let corrected = self.corrected(state)?;
         let assertion = state.assertion.clone().context("no assert")?;
         let height = state.assertion_height.context("her assert in no block")?;
         let output = OutPoint {
@@ -1455,7 +1500,12 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
         let script = &assertion.output[0].script_pubkey;
         let from = state.from.unwrap_or(height);
         match first_spend(self.chain, output, script, from..=tip).await? {
-            Some((at, tx)) if dispute::is_challenge(&self.o, &tx) => {
+            Some((at, tx))
+                if corrected.as_ref().map_or_else(
+                    || dispute::is_challenge(&self.o, &tx),
+                    |c| c.is_challenge(&tx),
+                ) =>
+            {
                 state.challenge = Some(tx);
                 state.challenge_height = Some(at);
                 // A `success` she built never will be.
@@ -1464,7 +1514,12 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
                 state.next_at = None;
                 return Ok(Next::To(Stage::Answering));
             }
-            Some((at, tx)) if dispute::is_success(&self.o, &tx)? => {
+            Some((at, tx))
+                if match &corrected {
+                    Some(c) => c.is_success(&tx)?,
+                    None => dispute::is_success(&self.o, &tx)?,
+                } =>
+            {
                 return Ok(self.paid(state, tx, at));
             }
             Some((_, tx)) => {
@@ -1484,7 +1539,10 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
         if tip + 1 < at {
             return Ok(Next::Save);
         }
-        let success = dispute::success(&self.o, &self.keys, fee_coin(state)?)?;
+        let success = match corrected {
+            Some(c) => c.success(&self.keys, fee_coin(state)?)?,
+            None => dispute::success(&self.o, &self.keys, fee_coin(state)?)?,
+        };
         self.broadcast(&success).await;
         state.payout = Some(success);
         state.next_at = None;
@@ -1495,7 +1553,8 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
     /// of P's fee coin, broadcast until in a block: the hub's `failure`
     /// pays it once her chance passed.
     async fn answering(&self, state: &mut State, tip: u32) -> Result<Next> {
-        full_only(state)?;
+        self.check_assertion(state)?;
+        let corrected = self.corrected(state)?;
         let challenge = state.challenge.clone().context("no challenge")?;
         let height = state.challenge_height.context("a challenge in no block")?;
         let output = OutPoint {
@@ -1505,7 +1564,11 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
         let script = &challenge.output[0].script_pubkey;
         let from = state.from.unwrap_or(height);
         match first_spend(self.chain, output, script, from..=tip).await? {
-            Some((at, tx)) if dispute::is_answer(&self.o, &tx) => {
+            Some((at, tx))
+                if corrected
+                    .as_ref()
+                    .map_or_else(|| dispute::is_answer(&self.o, &tx), |c| c.is_answer(&tx)) =>
+            {
                 return Ok(self.paid(state, tx, at));
             }
             Some((_, tx)) => {
@@ -1521,16 +1584,20 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
             let setups = self
                 .o
                 .setups(|s, i, _| self.store.kept_instance(&self.id, s, i))?;
-            let [full, ..] = &setups;
             let proof = self.proof(state)?;
-            let answer = dispute::answer(
-                &self.o,
-                &self.keys,
-                full,
-                &challenge,
-                &proof,
-                fee_coin(state)?,
-            )?;
+            let answer = match corrected {
+                Some(c) => {
+                    c.answer(&self.keys, &setups[1], &challenge, &proof, fee_coin(state)?)?
+                }
+                None => dispute::answer(
+                    &self.o,
+                    &self.keys,
+                    &setups[0],
+                    &challenge,
+                    &proof,
+                    fee_coin(state)?,
+                )?,
+            };
             let answer = answer.context("no instance she kept opens to her proof")?;
             state.payout = Some(answer);
         }
@@ -1553,11 +1620,91 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
         dispute::proof_of_bytes(&hex::decode(state.proof.as_deref().context("no proof")?)?)
     }
 
+    fn check_assertion(&self, state: &State) -> Result<()> {
+        if let Some(tx) = &state.assertion {
+            ensure!(
+                if state.corrected.is_some() {
+                    dispute::Corrected::is_assert(&self.o, tx)
+                } else {
+                    dispute::is_assert(&self.o, tx)
+                },
+                "assertion disagrees with the selected claim mode"
+            );
+        }
+        Ok(())
+    }
+
+    fn posted_corrected(
+        &self,
+        state: &State,
+    ) -> Result<(
+        dispute::Corrected<'_>,
+        dispute::ClaimProof,
+        dispute::HolderAmountSignature,
+    )> {
+        let tx = state.assertion.as_ref().context("no corrected assertion")?;
+        let read = if state.proof.is_some() {
+            dispute::Corrected::asserted_keeping(&self.o, tx, &self.proof(state)?)?
+        } else {
+            dispute::Corrected::asserted(&self.o, tx)?
+        };
+        ensure!(
+            state.corrected == Some(read.0.amount()),
+            "posted corrected amount disagrees with recovery"
+        );
+        Ok(read)
+    }
+
+    fn corrected(&self, state: &State) -> Result<Option<dispute::Corrected<'_>>> {
+        let Some(amount) = state.corrected else {
+            return Ok(None);
+        };
+        if state.assertion.is_some() {
+            return Ok(Some(self.posted_corrected(state)?.0));
+        }
+        ensure!(
+            amount <= state.amount,
+            "corrected amount exceeds original claim"
+        );
+        let response =
+            dispute::response(&self.o, state.spend.as_ref().context("no hub response")?)?;
+        let Response::Counter(HubResponse::Counter {
+            b_corr, corr_sig, ..
+        }) = response
+        else {
+            bail!("no signed corrected response")
+        };
+        ensure!(
+            b_corr == amount,
+            "hub response disagrees with selected corrected amount"
+        );
+        Ok(Some(dispute::Corrected::new(&self.o, amount, &corr_sig)?))
+    }
+
+    fn proof_valid(&self, state: &State, proof: &dispute::ClaimProof) -> Result<bool> {
+        if let Some(tx) = &state.assertion {
+            if let Some(amount) = state.corrected {
+                let (claim, _, _) = dispute::Corrected::asserted_keeping(&self.o, tx, proof)?;
+                ensure!(
+                    claim.amount() == amount,
+                    "posted corrected amount disagrees with recovery"
+                );
+                return Ok(claim.proves(&self.trust, proof));
+            }
+            dispute::asserted_keeping(&self.o, tx, proof)?;
+            return Ok(dispute::proves(&self.o, &self.trust, proof));
+        }
+        Ok(match self.corrected(state)? {
+            Some(c) => c.proves(&self.trust, proof),
+            None => dispute::proves(&self.o, &self.trust, proof),
+        })
+    }
+
     /// `export`, a proof as `licash-r0 native-wrap` writes it, checked:
     /// of the program her contract names, of the journal it fixed, and
     /// proving her claim under the statement her instances are garbled
     /// under. Its bytes as kept.
-    fn verified(&self, export: &[u8]) -> Result<Vec<u8>> {
+    fn verified(&self, export: &[u8], state: &State) -> Result<Vec<u8>> {
         let export: serde_json::Value =
             serde_json::from_slice(export).context("not a proof's export")?;
         let field = |name: &str| -> Result<Vec<u8>> {
@@ -1571,14 +1718,17 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
             "a proof of another program than her contract names"
         );
         ensure!(
-            field("journal")? == dispute::expected(&self.o).to_bytes(),
+            field("journal")?
+                == licash_contract::opening::journal(
+                    &self.o.base,
+                    &self.o.d,
+                    u32::from(state.corrected.is_some())
+                )
+                .to_bytes(),
             "a proof of another journal than her contract fixed"
         );
         let proof = dispute::proof_from_points(&field("proof")?)?;
-        ensure!(
-            dispute::proves(&self.o, &self.trust, &proof),
-            "not a proof of her claim"
-        );
+        ensure!(self.proof_valid(state, &proof)?, "not a proof of her claim");
         Ok(dispute::proof_bytes(&proof))
     }
 }
@@ -1608,18 +1758,20 @@ fn classify_statement(input: &mut StatementInput) -> Result<StatementResult> {
     }
 }
 
-/// Until collection is wired, corrected states may export their statement
-/// and watch the chain, but must never fall through to full-claim signing.
+#[cfg(test)]
+mod counter_tests;
+#[cfg(test)]
+mod driver_tests;
+
+/// R uses the original claim. A selected corrected statement proves that
+/// request construction is already behind us and must not be repeated.
 fn full_only(state: &State) -> Result<()> {
     ensure!(
         state.corrected.is_none(),
-        "corrected proof import and collection are not supported yet"
+        "a corrected statement is selected already"
     );
     Ok(())
 }
-
-#[cfg(test)]
-mod counter_tests;
 
 /// P's fee coin, which the hub's answer left hers: what pays the fee of
 /// her payout after it.

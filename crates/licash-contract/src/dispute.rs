@@ -47,6 +47,8 @@ pub const FAILURE: &str = "failure";
 
 /// A proof of her claim: Groth16's, on BN254.
 pub type ClaimProof = Proof<Bn254>;
+/// The holder's existing one-time amount signature, reused to collect.
+pub type HolderAmountSignature = WotsSig;
 
 /// What the hub answered R with, read from the chain.
 pub enum Response {
@@ -528,6 +530,24 @@ impl<'a> Corrected<'a> {
     /// Adopt a posted assertion, including its existing holder amount
     /// signature for collection. Reading never emits another signature.
     pub fn asserted(opening: &'a Opening, tx: &Transaction) -> Result<(Self, ClaimProof, WotsSig)> {
+        Self::read_assertion(opening, tx, None)
+    }
+
+    /// Pi2 and Pi3 are unsigned. Keep the verified local receipt when its
+    /// Lamport-signed Pi1 matches, even if those public witness items changed.
+    pub fn asserted_keeping(
+        opening: &'a Opening,
+        tx: &Transaction,
+        proof: &ClaimProof,
+    ) -> Result<(Self, ClaimProof, WotsSig)> {
+        Self::read_assertion(opening, tx, Some(proof))
+    }
+
+    fn read_assertion(
+        opening: &'a Opening,
+        tx: &Transaction,
+        pinned: Option<&ClaimProof>,
+    ) -> Result<(Self, ClaimProof, WotsSig)> {
         ensure!(Self::is_assert(opening, tx), "not her corrected assert");
         let arguments = args(tx);
         let read = Babe::read_corrected_assertion_hashes(&arguments)?;
@@ -553,7 +573,7 @@ impl<'a> Corrected<'a> {
         spec.b_key
             .verify(&holder_b)
             .context("holder's corrected amount signature")?;
-        let proof = proof_from_reveals(&spec.lamport, read.proof)?;
+        let proof = proof_from_reveals(&spec.lamport, read.proof, pinned)?;
         Ok((corrected, proof, holder_b))
     }
 
@@ -625,22 +645,44 @@ pub fn is_assert(o: &Opening, tx: &Transaction) -> bool {
 /// The proof `tx`, an `assert` of hers, carries: one posted by another
 /// copy of her wallet, say, to go on with.
 pub fn asserted(o: &Opening, tx: &Transaction) -> Result<Proof<Bn254>> {
+    read_assertion(o, tx, None)
+}
+
+/// Keep a caller-verified receipt when its signed Pi1 matches the posted
+/// assertion. Unsigned Pi2/Pi3 cannot replace that pinned receipt.
+pub fn asserted_keeping(o: &Opening, tx: &Transaction, proof: &ClaimProof) -> Result<ClaimProof> {
+    read_assertion(o, tx, Some(proof))
+}
+
+fn read_assertion(
+    o: &Opening,
+    tx: &Transaction,
+    pinned: Option<&ClaimProof>,
+) -> Result<ClaimProof> {
     ensure!(is_assert(o, tx), "not her assert");
     let args = args(tx);
     let (signed, pi2, pi3) = Babe::read_assert(&args).context("assert's arguments")?;
     let lamport = &o.babe.spec.lamport;
-    proof_from_reveals(lamport, (signed, pi2, pi3))
+    proof_from_reveals(lamport, (signed, pi2, pi3), pinned)
 }
 
 fn proof_from_reveals(
     lamport: &LamportPub,
     (signed, pi2, pi3): crate::graph::Asserted<'_>,
+    pinned: Option<&ClaimProof>,
 ) -> Result<ClaimProof> {
     let digits = signed
         .iter()
         .enumerate()
         .map(|(d, x)| lamport.read(d, x).context("a preimage of no digit"))
         .collect::<Result<Vec<u8>>>()?;
+    if let Some(proof) = pinned {
+        ensure!(
+            digits == pi(proof).1,
+            "another proof used the same one-time assertion key"
+        );
+        return Ok(proof.clone());
+    }
     let bits: Vec<bool> = digits
         .iter()
         .flat_map(|v| [v & 1 == 1, v & 2 == 2])
@@ -1157,6 +1199,45 @@ mod tests {
         let full_tx = assert(&opening, &keys, &full_proof).unwrap();
         assert_eq!(asserted(&opening, &full_tx).unwrap(), full_proof);
         assert!(Corrected::asserted(&opening, &full_tx).is_err());
+    }
+
+    #[test]
+    fn unsigned_assertion_fields_cannot_replace_the_pinned_receipt() {
+        let (opening, keys, hub) = funded_opening();
+        let full = mock_proof(&opening, &Trust::mock()).unwrap();
+        let signature = Hashes(hub.b_corr.sign(&15u32.to_be_bytes()).unwrap().hashes);
+        let corrected = Corrected::new(&opening, 15, &signature).unwrap();
+        let reduced = corrected.mock_proof(&Trust::mock()).unwrap();
+        for (mut tx, proof, is_corrected) in [
+            (assert(&opening, &keys, &full).unwrap(), full, false),
+            (corrected.assert(&keys, &reduced).unwrap(), reduced, true),
+        ] {
+            let mut arguments = args(&tx);
+            let n = lichen_babe::setup::DIGITS;
+            arguments[n] = vec![];
+            arguments[n + 1] = vec![];
+            replace_arguments(&mut tx, 0, arguments);
+            if is_corrected {
+                assert!(Corrected::asserted(&opening, &tx).is_err());
+                assert_eq!(
+                    Corrected::asserted_keeping(&opening, &tx, &proof)
+                        .unwrap()
+                        .1,
+                    proof
+                );
+            } else {
+                assert!(asserted(&opening, &tx).is_err());
+                assert_eq!(asserted_keeping(&opening, &tx, &proof).unwrap(), proof);
+            }
+            let mut other = proof.clone();
+            other.a = ark_bn254::G1Affine::default();
+            assert_ne!(other.a, proof.a);
+            if is_corrected {
+                assert!(Corrected::asserted_keeping(&opening, &tx, &other).is_err());
+            } else {
+                assert!(asserted_keeping(&opening, &tx, &other).is_err());
+            }
+        }
     }
 
     #[test]
