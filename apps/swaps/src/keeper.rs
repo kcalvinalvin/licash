@@ -704,13 +704,15 @@ impl<T: Transport + 'static> Keeper<T> {
             matches!(p.state, PayoutState::Open | PayoutState::Claimed)
                 && hub.urls.contains(&p.from)
         };
-        let amount = excess.min(hub.notes);
+        // Its fees are locked beside it, from the same notes: at most 1% of
+        // them, or 1 000 sat if that is more.
+        let max_fee = (hub.notes / 100).max(1_000);
+        let amount = excess.min(hub.notes.saturating_sub(max_fee));
         let paid = async {
             if wallet.payouts()?.iter().any(under_way) || amount == 0 {
                 return Ok(None);
             }
             let to = wallet.fallback_address()?.to_string();
-            let max_fee = (amount / 100).max(1_000);
             wallet
                 .payout(via, url, &to, amount, max_fee, rate)
                 .await
