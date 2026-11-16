@@ -18,6 +18,16 @@ licash-swaps --data ./swaps events --follow
 licash-swaps --data ./swaps dashboard
 ```
 
+`status` shows earnings, aggregate balances, swap outcomes and losses,
+without listing transactions or identity details. `status --details` adds
+per-hub balances, the address and ten recent swaps; `status --swaps N`
+requests a particular number. `status --json` retains the full structured
+output and its default of ten swaps. Individual fees show their share of
+the swap amount, including miner fees for Bitcoin payouts. Normal text
+logs omit timestamps and Rust targets; `RUST_LOG=debug` reveals diagnostic
+configuration, and `--log json` retains structured logging. Warnings remain
+visible.
+
 `dashboard` draws the provider's dashboard in the terminal: swaps by route,
 failures by reason and those under way, fees less what lost swaps cost, the
 notes held at each hub with the days they last at the rate they fell, what
@@ -30,6 +40,8 @@ writes or migrates its files. History comes from the records themselves,
 over a range of 24 hours to all of it (30 days at first, or `--range`)
 against the range before. Arrows or digits turn the pages, `[` and `]` the
 range; `--json` prints the range's view once instead.
+A read failure keeps the last good data and the help/quit keys; `?` shows
+the error detail.
 
 `init --network` names the network of its hubs, `bitcoin` by default.
 The provider swaps between the hubs its wallet added, up to what it holds

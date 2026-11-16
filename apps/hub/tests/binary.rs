@@ -120,11 +120,12 @@ fn a_hub_is_created_run_watched_and_stopped() {
     assert_eq!(stats(&data)["events"], 0);
     // Read by a person: what it earned first, in sat, then what it did.
     let text = stdout(&data, &["status"]);
-    assert!(text.starts_with("income  0 sat\n"), "{text}");
-    assert!(
-        text.contains("\nnotes   0 issued, 0 spent, 0 unlinked\n"),
-        "{text}"
+    assert_eq!(
+        text,
+        "income    0 sat\npayments  0 released\nlocks     0 open\n"
     );
+    let text = stdout(&data, &["status", "--details"]);
+    assert!(text.contains("0 issued, 0 spent, 0 unlinked\n"), "{text}");
 
     let port = free_port();
     let listen = format!("127.0.0.1:{port}");
@@ -225,6 +226,9 @@ fn failures_exit_nonzero_and_log_as_asked() {
     // Running needs a hub: it never creates one.
     let out = output(&missing, &["run", "--listen", "127.0.0.1:0"]);
     assert!(!out.status.success());
+    let error = String::from_utf8_lossy(&out.stderr);
+    assert!(error.starts_with("error: "), "{error}");
+    assert_eq!(error.lines().count(), 1, "{error}");
     assert!(!missing.exists());
     let out = output(&missing, &["init", "--max-pow", "63"]);
     assert!(!out.status.success());

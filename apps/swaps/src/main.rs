@@ -413,13 +413,16 @@ enum Command {
         #[command(flatten)]
         notify: Notify,
     },
-    /// What the provider holds, its counts and its latest swaps.
+    /// Earnings, balances and what needs attention; details on request.
     Status {
         #[arg(long)]
         json: bool,
-        /// The latest swaps shown.
-        #[arg(long, default_value_t = 10)]
-        swaps: u32,
+        /// Show this many recent swaps (default: none, or 10 with --details).
+        #[arg(long)]
+        swaps: Option<u32>,
+        /// Include per-hub balances, identity and recent swaps.
+        #[arg(long)]
+        details: bool,
     },
     /// An interactive dashboard of the provider's swaps, fees, notes and
     /// health over time, read from its files only (never migrated), beside
@@ -447,23 +450,29 @@ enum Command {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     logging(cli.log);
+    let structured = matches!(cli.log, Log::Json);
     match command(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            tracing::error!("{e:#}");
+            if structured {
+                tracing::error!("{e:#}");
+            } else {
+                eprintln!("error: {e:#}");
+            }
             ExitCode::FAILURE
         }
     }
 }
 
 fn logging(format: Log) {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,nostr_sdk=off"));
     let logs = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
         .with_writer(std::io::stderr);
     match format {
-        Log::Text => logs.init(),
+        Log::Text => logs.without_time().with_target(false).init(),
         Log::Json => logs.json().init(),
     }
 }
@@ -571,7 +580,15 @@ fn command(cli: Cli) -> anyhow::Result<()> {
         }
         Command::Address { chain } => address(&data, &chain),
         Command::TestNotify { notify } => test_notify(&notify),
-        Command::Status { json, swaps } => status(&data, json, swaps),
+        Command::Status {
+            json,
+            swaps,
+            details,
+        } => {
+            // JSON keeps its previous default of ten records.
+            let latest = swaps.unwrap_or(if json || details { 10 } else { 0 });
+            status(&data, json, latest, details)
+        }
         Command::Dashboard { dashboard, url } => show(&data, dashboard, url),
         Command::Events {
             after,
@@ -633,12 +650,12 @@ async fn serve(
         .await
         .with_context(|| format!("listen on {listen}"))?;
     let config = provider.config();
-    tracing::info!(
-        listen = %listener.local_addr()?,
+    tracing::debug!(
         address = %hex::encode(provider.wallet().address().to_bytes()),
         config = %serde_json::to_string(config)?,
-        "serving"
+        "swap configuration"
     );
+    tracing::info!("serving at {}", listener.local_addr()?);
     let hubs = provider.wallet().hubs()?;
     if hubs.len() < 2 {
         tracing::warn!(
@@ -647,23 +664,27 @@ async fn serve(
         );
     }
     let notifying = notifier.clone().map(|notifier| {
-        let targets: Vec<_> = notifier.targets().iter().map(Target::to_string).collect();
-        tracing::info!(targets = %targets.join(", "), "notifying");
+        tracing::info!(
+            "notifications enabled ({} targets)",
+            notifier.targets().len()
+        );
         tokio::spawn(notifier.run())
     });
     let stepping = tokio::spawn(licash_swaps_service::step(provider.clone(), every));
     let following = chain.map(|chain| {
         let terms = provider.payout_terms().copied();
-        tracing::info!(
+        tracing::debug!(
             chain = %chain.0,
             terms = %serde_json::to_string(&terms).unwrap_or_default(),
             "paying out on Bitcoin"
         );
+        tracing::info!("paying out on Bitcoin");
         tokio::spawn(licash_swaps_service::follow(provider.clone(), chain, every))
     });
     let announcing = announcing.map(|a| {
         let (relays, urls) = (a.relays.join(", "), a.urls.join(", "));
-        tracing::info!(%relays, %urls, "announcing on Nostr");
+        tracing::debug!(%relays, %urls, "announcement configuration");
+        tracing::info!("announcing on Nostr");
         tokio::spawn(licash_swaps_service::announce(
             provider.clone(),
             a.relays,
@@ -746,7 +767,7 @@ fn show(data: &Path, args: licash_dashboard::Args, url: Option<String>) -> anyho
     args.run(move || licash_swaps_service::dashboard::report(&data, Some(&probe)))
 }
 
-fn status(data: &Path, json: bool, latest: u32) -> anyhow::Result<()> {
+fn status(data: &Path, json: bool, latest: u32, details: bool) -> anyhow::Result<()> {
     let provider = open(data, Http::new(None)?, Config::default())?;
     let stats = provider.stats()?;
     let balance = provider.wallet().balance()?;
@@ -809,15 +830,25 @@ fn status(data: &Path, json: bool, latest: u32) -> anyhow::Result<()> {
             },
         ),
     ];
-    for b in &balance {
-        let pending = match b.pending {
-            0 => String::new(),
-            p => format!(", {} pending", sat(p)),
-        };
-        rows.push((
-            dashboard::short(&b.hub),
-            format!("{}{pending}", sat(b.available)),
-        ));
+    rows.push((
+        "balance".to_owned(),
+        sat(balance.iter().map(|b| b.available).sum()),
+    ));
+    let pending = balance.iter().map(|b| b.pending).sum();
+    if pending > 0 {
+        rows.push(("pending".to_owned(), sat(pending)));
+    }
+    if details {
+        for b in &balance {
+            let pending = match b.pending {
+                0 => String::new(),
+                p => format!(", {} pending", sat(p)),
+            };
+            rows.push((
+                dashboard::short(&b.hub),
+                format!("{}{pending}", sat(b.available)),
+            ));
+        }
     }
     if onchain > 0 || payouts > 0 {
         rows.push((
@@ -829,9 +860,11 @@ fn status(data: &Path, json: bool, latest: u32) -> anyhow::Result<()> {
             ),
         ));
     }
-    rows.push(("events".to_owned(), n(stats.events)));
     rows.push(("network".to_owned(), network.to_string()));
-    rows.push(("address".to_owned(), address));
+    if details {
+        rows.push(("events".to_owned(), n(stats.events)));
+        rows.push(("address".to_owned(), address));
+    }
     let width = rows
         .iter()
         .map(|(l, _)| l.chars().count())
@@ -843,7 +876,13 @@ fn status(data: &Path, json: bool, latest: u32) -> anyhow::Result<()> {
     // The latest swaps, a line each.
     let amounts: Vec<String> = swaps
         .iter()
-        .map(|s| format!("{}, fee {}", sat(s.amount), sat(s.fee)))
+        .map(|s| {
+            format!(
+                "{}, fee {}",
+                sat(s.amount),
+                licash_dashboard::fee(s.fee as i64, s.amount as i64)
+            )
+        })
         .collect();
     let wide = amounts.iter().map(|a| a.chars().count()).max().unwrap_or(0);
     if !swaps.is_empty() {

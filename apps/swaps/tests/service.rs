@@ -156,7 +156,22 @@ fn init_creates_the_provider_once_and_status_reads_it() {
     assert_eq!(said("earned").as_deref(), Some("0 sat"), "{text}");
     assert_eq!(said("swaps").as_deref(), Some("none"), "{text}");
     assert_eq!(said("lost").as_deref(), Some("none"), "{text}");
-    assert_eq!(said("address").as_deref(), Some(address.trim()), "{text}");
+    assert_eq!(said("balance").as_deref(), Some("0 sat"), "{text}");
+    assert_eq!(said("address"), None, "{text}");
+    assert_eq!(said("events"), None, "{text}");
+    let detailed = licash_swaps(&dir, &["status", "--details"]);
+    assert!(detailed.status.success(), "{detailed:?}");
+    let detailed = String::from_utf8(detailed.stdout).unwrap();
+    assert!(detailed.contains(address.trim()), "{detailed}");
+    assert!(
+        detailed.lines().any(|line| line.starts_with("events")),
+        "{detailed}"
+    );
+    let missing = licash_swaps(&tempfile::tempdir().unwrap(), &["status"]);
+    assert!(!missing.status.success());
+    let error = String::from_utf8_lossy(&missing.stderr);
+    assert!(error.starts_with("error: "), "{error}");
+    assert_eq!(error.lines().count(), 1, "{error}");
     let events = licash_swaps(&dir, &["events"]);
     assert!(events.status.success() && events.stdout.is_empty());
     // An address on Bitcoin to fund payouts at, watched from a first block,

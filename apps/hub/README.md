@@ -13,6 +13,12 @@ licash-hub --data ./hub events --follow
 licash-hub --data ./hub dashboard
 ```
 
+`status` shows income, released payments and open locks. `status --details`
+adds the internal note and event counts; `status --json` keeps the full
+machine-readable statistics. Normal text logs omit timestamps and Rust
+targets. Configuration is diagnostic detail (`RUST_LOG=debug`); warnings
+remain visible. `--log json` retains structured logging.
+
 `dashboard` draws the hub's dashboard in the terminal: payments by kind
 (transfers, locks, Lightning out and in, deposits), their failures by
 reason and those under way, the fees earned, the notes outstanding and the
@@ -26,6 +32,9 @@ records themselves, over a range of 24 hours to all of it (30 days at
 first, or `--range`) against the range before; what no record dates, such
 as the collateral, is as it stands now. Arrows or digits turn the pages,
 `[` and `]` the range; `--json` prints the range's view once instead.
+Transaction fees include their share of the processed input, while contract
+prices are relative to their cap. A read failure keeps the last good data
+and the help/quit keys; `?` shows the error detail.
 
 `--network` (`bitcoin` by default, or `regtest`, `signet`, `mutinynet`) is
 the chain `--chain` must follow: the hub scans no other. The signets are for

@@ -771,6 +771,9 @@ enum Command {
     Status {
         #[arg(long)]
         json: bool,
+        /// Include internal note and event counts.
+        #[arg(long)]
+        details: bool,
     },
     /// An interactive dashboard of the hub's records, beside the running
     /// hub or without it: payments, fees, reserves, contracts, privacy and
@@ -818,23 +821,29 @@ enum Command {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     logging(cli.log);
+    let structured = matches!(cli.log, Log::Json);
     match command(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            tracing::error!("{e:#}");
+            if structured {
+                tracing::error!("{e:#}");
+            } else {
+                eprintln!("error: {e:#}");
+            }
             ExitCode::FAILURE
         }
     }
 }
 
 fn logging(format: Log) {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,nostr_sdk=off"));
     let logs = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
         .with_writer(std::io::stderr);
     match format {
-        Log::Text => logs.init(),
+        Log::Text => logs.without_time().with_target(false).init(),
         Log::Json => logs.json().init(),
     }
 }
@@ -1101,7 +1110,7 @@ fn command(cli: Cli) -> anyhow::Result<()> {
             runtime.block_on(serving)
         }
         Command::TestNotify { notify } => test_notify(&notify),
-        Command::Status { json } => status(&db, json),
+        Command::Status { json, details } => status(&db, json, details),
         Command::Dashboard { dashboard, url } => show(&cli.data, dashboard, url),
         Command::Events {
             after,
@@ -1347,14 +1356,13 @@ async fn serve(
     let listener = tokio::net::TcpListener::bind(listen)
         .await
         .with_context(|| format!("listen on {listen}"))?;
-    tracing::info!(
-        listen = %listener.local_addr()?,
-        policy = %serde_json::to_string(&policy)?,
-        "serving"
-    );
+    tracing::debug!(policy = %serde_json::to_string(&policy)?, "hub policy");
+    tracing::info!("serving at {}", listener.local_addr()?);
     let notifying = notifier.clone().map(|notifier| {
-        let targets: Vec<_> = notifier.targets().iter().map(Target::to_string).collect();
-        tracing::info!(targets = %targets.join(", "), "notifying");
+        tracing::info!(
+            "notifications enabled ({} targets)",
+            notifier.targets().len()
+        );
         tokio::spawn(notifier.run(hub.clone()))
     });
     let indexing = match (&chain, tweaks) {
@@ -1385,7 +1393,8 @@ async fn serve(
     }) = swapping
     {
         let address = hex::encode(provider.wallet().address().to_bytes());
-        tracing::info!(%address, config = %serde_json::to_string(provider.config())?, "providing swaps");
+        tracing::debug!(%address, config = %serde_json::to_string(provider.config())?, "swap configuration");
+        tracing::info!("providing swaps");
         swaps.push(tokio::spawn(licash_swaps_service::step(
             provider.clone(),
             every,
@@ -1401,7 +1410,8 @@ async fn serve(
     }
     let announcing = announcing.map(|a| {
         let (relays, urls) = (a.relays.join(", "), a.urls.join(", "));
-        tracing::info!(%relays, %urls, "announcing on Nostr");
+        tracing::debug!(%relays, %urls, "announcement configuration");
+        tracing::info!("announcing on Nostr");
         tokio::spawn(announce(hub.clone(), a.relays, a.route, a.urls, a.name))
     });
     axum::serve(listener, router)
@@ -1479,7 +1489,7 @@ fn show(data: &Path, args: licash_dashboard::Args, url: Option<String>) -> anyho
     args.run(move || dashboard::report(&data, Some(&probe)))
 }
 
-fn status(db: &Path, json: bool) -> anyhow::Result<()> {
+fn status(db: &Path, json: bool, details: bool) -> anyhow::Result<()> {
     let stats = Ledger::open(db).context("read the hub")?.stats()?;
     if json {
         println!("{}", serde_json::to_string(&stats)?);
@@ -1487,28 +1497,30 @@ fn status(db: &Path, json: bool) -> anyhow::Result<()> {
     }
     // What it earned first, then what it did.
     let n = |v: u64| licash_dashboard::grouped(v as i64);
-    for (name, value) in [
+    let mut rows = vec![
         ("income", format!("{} sat", n(stats.income))),
-        (
-            "offers",
-            format!("{}, {} released", n(stats.offers), n(stats.released)),
-        ),
-        (
-            "locks",
-            format!("{}, {} open", n(stats.locks), n(stats.open_locks)),
-        ),
-        (
-            "notes",
-            format!(
-                "{} issued, {} spent, {} unlinked",
-                n(stats.issued),
-                n(stats.spent),
-                n(stats.unlinked)
+        ("payments", format!("{} released", n(stats.released))),
+        ("locks", format!("{} open", n(stats.open_locks))),
+    ];
+    if details {
+        rows.extend([
+            ("offers", n(stats.offers)),
+            ("all locks", n(stats.locks)),
+            (
+                "notes",
+                format!(
+                    "{} issued, {} spent, {} unlinked",
+                    n(stats.issued),
+                    n(stats.spent),
+                    n(stats.unlinked)
+                ),
             ),
-        ),
-        ("events", n(stats.events)),
-    ] {
-        println!("{name:<6}  {value}");
+            ("events", n(stats.events)),
+        ]);
+    }
+    let width = rows.iter().map(|(label, _)| label.len()).max().unwrap_or(0);
+    for (name, value) in rows {
+        println!("{name:<width$}  {value}");
     }
     Ok(())
 }
