@@ -182,7 +182,7 @@ impl Wallet {
     }
 
     /// The statement to prove of contract `id` (in hex), once the hub
-    /// answered and it is built ([`RecoveryStage::Proving`]): to prove
+    /// answered and it is built (`RecoveryStage::Proving`): to prove
     /// on a computer (`licash-r0 native-prove-succinct`, then
     /// `native-wrap`). Private: it shows the notes claimed.
     pub fn recovery_statement(&self, id: String) -> Result<Vec<u8>, LicashError> {
@@ -225,7 +225,7 @@ impl Wallet {
     }
 
     /// Give up forcing contract `id` closed, its notes back in the
-    /// balance: only while [`RecoveryStage::Claimed`].
+    /// balance: only while `RecoveryStage::Claimed`.
     pub fn give_up_recovery(&self, id: String) -> Result<(), LicashError> {
         let id = contract_id(&id)?;
         let _contracting = self

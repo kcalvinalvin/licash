@@ -211,8 +211,8 @@ pub fn give_up(wallet: &Wallet<Http>, path: &Path, id: &str) -> anyhow::Result<(
     recovery::give_up(wallet, dir(path), &id)
 }
 
-/// The statement to prove of contract `id`, written to `out` [default:
-/// `<id>.statement.input` here, its id's first 16 digits], and how to
+/// The statement to prove of contract `id`, written to `out` (default:
+/// `<id>.statement.input` here, its id's first 16 digits), and how to
 /// prove it elsewhere and bring the proof back.
 pub fn statement(path: &Path, id: &str, out: Option<&Path>, json: bool) -> anyhow::Result<()> {
     let id = contract_id(path, id)?;

@@ -177,7 +177,7 @@ impl Mailbox {
     /// the relays connected, if any (the others connecting for the next
     /// meanwhile), else each as soon as it connects, for all the mail,
     /// each asked first to push it the new mail from then on. Until
-    /// [`ASK_EVERY`] later, while one of those is connected, a look takes
+    /// `ASK_EVERY` later, while one of those is connected, a look takes
     /// what they pushed, at once, asking nothing.
     pub async fn fetch(&self) -> anyhow::Result<Vec<Mail>> {
         let relays: Vec<_> = self.client.relays().await.into_iter().collect();
