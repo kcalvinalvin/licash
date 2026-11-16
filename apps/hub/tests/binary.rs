@@ -352,6 +352,20 @@ fn failures_exit_nonzero_and_log_as_asked() {
             &["--swaps", "--swaps-min", "2", "--swaps-max", "1"][..],
             "--swaps-min must not exceed",
         ),
+        (
+            &["--swaps-no-contracts"][..],
+            "--swaps-no-contracts needs --swaps",
+        ),
+        (
+            &["--swaps-drain-via", "http://b.example"][..],
+            "--swaps-drain-via needs --swaps",
+        ),
+        // Contracts protect the notes it takes in from other hubs, and none
+        // opens on Bitcoin yet.
+        (
+            &["--swaps", from[0], from[1], "--chain", "http://127.0.0.1:1"][..],
+            "none opens on bitcoin: --swaps-no-contracts runs it unprotected",
+        ),
     ] {
         let out = output(&missing, &[&["run"], args].concat());
         assert!(!out.status.success());
@@ -642,14 +656,18 @@ fn a_hub_provides_the_swaps_into_it_from_a_wallet_of_its_own() {
     let mut stderr = running.0.stderr.take().unwrap();
     stderr.read_to_string(&mut logs).unwrap();
     assert!(logs.contains("swap provider created"), "{logs}");
+    // Contracts protect what it takes in from the hubs swapped from.
+    assert!(logs.contains("keeping the contracts"), "{logs}");
+    assert!(!logs.contains("Reckless"), "{logs}");
 
-    // Started again on the same wallet; without --swaps, no swaps served,
-    // the operator warned of them.
+    // Started again on the same wallet, unprotected as told: warned of.
+    // Without --swaps, no swaps served, the operator warned of them.
     let port = free_port();
-    let again = Running(
-        run(port, &swaps)
+    let unprotected = [&swaps[..], &["--swaps-no-contracts"]].concat();
+    let mut again = Running(
+        run(port, &unprotected)
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .unwrap(),
     );
@@ -657,6 +675,14 @@ fn a_hub_provides_the_swaps_into_it_from_a_wallet_of_its_own() {
     let response = get(port, licash_api::swaps::SWAPS_INFO).unwrap();
     let same: licash_api::swaps::Info = serde_json::from_str(&body(response)).unwrap();
     assert_eq!(same.address, info.address);
+    again.0.kill().unwrap();
+    let mut logs = String::new();
+    let mut stderr = again.0.stderr.take().unwrap();
+    stderr.read_to_string(&mut logs).unwrap();
+    assert!(
+        logs.contains("Reckless") && !logs.contains("keeping the contracts"),
+        "{logs}"
+    );
     drop(again);
     let port = free_port();
     let mut off = Running(
