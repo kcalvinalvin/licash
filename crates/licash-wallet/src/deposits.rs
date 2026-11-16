@@ -559,15 +559,19 @@ impl<T: Transport> Wallet<T> {
 
 impl<T: Transport> Wallet<T> {
     /// The deposits whose coins, if paid, may be taken back at `tip`
-    /// ([`Wallet::refund_deposit`]): canceled, their notes never claimed,
-    /// an address named, past their timeout, not taken back yet. Paid or
-    /// not: [`Deposit::funding`] is the payment its hub saw, none for one
-    /// it did not (made too late, say), which only its payer knows of.
+    /// ([`Wallet::refund_deposit`]): an address named, past their timeout,
+    /// not taken back yet, and canceled, their notes never claimed, or
+    /// still open with no lock to them ever seen, so never claimed (their
+    /// hub gone, say): the preimage the hub would take the coins with was
+    /// never sent, and no lock to them is made so late. Paid or not:
+    /// [`Deposit::funding`] is the payment its hub saw, none for one it
+    /// did not (made too late, say), which only its payer knows of.
     pub fn deposits_to_refund(&self, tip: u32) -> Result<Vec<Deposit>, Error> {
         let mut due = self.deposits()?;
         due.retain(|d| {
             let past = d.terms.as_ref().is_some_and(|t| tip >= t.timeout);
-            past && matches!(d.state, DepositState::Canceled(_))
+            let never_locked = d.state == DepositState::Open && d.lock.is_none();
+            past && (matches!(d.state, DepositState::Canceled(_)) || never_locked)
         });
         Ok(due)
     }
