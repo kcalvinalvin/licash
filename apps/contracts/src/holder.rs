@@ -4,9 +4,12 @@
 //! it; her change returns to its fallback address, or into notes at the
 //! hub ([`Change::Notes`]). One her hub left silent she forces closed, in
 //! [`recovery`]. What a hub charged as a contract opened there is the most
-//! it may charge her since, until she agrees to more: [`fees`].
+//! it may charge her since, until she agrees to more: [`fees`]. Her
+//! contracts at a hub share her notes there out, to show and to claim
+//! alike: [`claims`].
 
 mod chain;
+pub mod claims;
 mod driver;
 pub mod fees;
 #[cfg(feature = "node")]
@@ -479,7 +482,7 @@ fn inspection(
         note_limit: parts
             .limits
             .max_authorizations
-            .min(recovery::MAX_NOTES as u32),
+            .min(licash::claim::MAX_ITEMS as u32),
         denominations: parts.keyset.denominations().collect(),
         keyset: crate::hex_id(parts.keyset.id()),
         graph_version: parts.recipe.graph_version,
@@ -488,61 +491,35 @@ fn inspection(
     })
 }
 
-/// Precisely what live contracts can claim now, by id. Read signed opening
-/// terms rather than current hub offers. An unreadable or unsupported
-/// opening covers nothing; it never triggers recovery or reserves notes.
+/// Precisely what live contracts can claim now, by id: what their
+/// recoveries would claim of the notes at their hubs, shared out among
+/// them ([`claims`]), from the terms they opened with rather than current
+/// hub offers. One under recovery shows none: its recovery fixes its notes
+/// once, and it cannot also protect those left over or received after.
+/// It still takes its share, which the others then cannot claim. One whose
+/// opening cannot be read or is of an untrusted holder program covers
+/// nothing; this never triggers recovery or reserves notes.
 pub fn coverage<T: Transport>(
     wallet: &Wallet<T>,
     dir: &Path,
     contracts: &[Contract],
     tip: u32,
 ) -> Result<std::collections::HashMap<[u8; 32], u64>> {
-    let mut amounts = std::collections::HashMap::new();
-    if tip == 0 {
-        return Ok(amounts);
-    }
-    let Some(store) = Store::existing(dir)? else {
-        return Ok(amounts);
+    let Some(store) = Store::existing(dir)?.filter(|_| tip > 0) else {
+        return Ok(std::collections::HashMap::new());
     };
-    let trust = crate::trust(wallet.network())?;
     let held = wallet.balance()?;
-    // A recovery fixes its notes once. The same one-shot graph cannot
-    // also protect notes left over or received after that decision.
-    let recovering = store.recoveries()?.into_iter().map(|r| r.id).collect();
-    let secrets = wallet.contract_secrets();
-    let ctx = licash_contract::opening::Context { tip, trust };
-    let mut ids = Vec::new();
-    let mut claims = Vec::new();
-    for c in coverage_order(contracts, tip, &held, &recovering) {
-        let read = || -> Result<_> {
-            let (state, _) = store.state(&c.id)?;
-            let opening = Holder::load(&state, secrets.seed, secrets.spend, &ctx)?.opening()?;
-            let parts = opening.base.parts();
-            ensure!(
-                trust.mock || parts.recipe.holder_program == trust.programs.holder,
-                "unsupported holder program"
-            );
-            Ok((
-                *parts.keyset.id(),
-                u64::from(parts.cap),
-                recovery::MAX_NOTES.min(parts.limits.max_authorizations as usize),
-            ))
-        };
-        match read() {
-            Ok(claim) => {
-                ids.push(c.id);
-                claims.push(claim);
-            }
-            Err(e) => {
-                tracing::warn!(id = %crate::hex_id(&c.id), "cannot count recovery coverage: {e:#}")
-            }
-        }
+    let live = coverage_order(contracts, tip, &held, &HashSet::new());
+    let terms = claims::terms(wallet, &store, &live, tip)?;
+    let mut hubs = Vec::new();
+    for (url, _) in wallet.hubs()? {
+        hubs.push(wallet.hub_urls(&url)?);
     }
-    for (id, amount) in ids.into_iter().zip(wallet.claimable_amounts(&claims)?) {
-        if amount > 0 {
-            amounts.insert(id, amount);
-        }
-    }
+    let mut amounts = claims::shared_out(&live, &terms, &hubs, |slots| {
+        Ok::<_, anyhow::Error>(wallet.recoverable(slots)?)
+    })?;
+    let recovering: HashSet<_> = store.recoveries()?.into_iter().map(|r| r.id).collect();
+    amounts.retain(|id, _| !recovering.contains(id));
     Ok(amounts)
 }
 

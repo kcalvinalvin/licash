@@ -119,19 +119,13 @@ pub fn approve<T: Transport>(
     let ids: Vec<[u8; 32]> = store
         .list()?
         .iter()
-        .filter(|c| at(&urls, c) && c.abandoned.is_none() && c.fate != Some(Fate::Dead))
+        .filter(|c| c.at(&urls) && c.abandoned.is_none() && c.fate != Some(Fate::Dead))
         .map(|c| c.id)
         .collect();
     let raised = store.raise_ceilings(&ids, fees)?;
     tracing::info!(%hub, contracts = ids.len(), raised, "fees approved");
     drop(store);
     agree(wallet, dir, tip)
-}
-
-/// Whether `contract` is at the hub reached at any of `urls`.
-fn at(urls: &[String], contract: &Contract) -> bool {
-    let hub = contract.hub.trim_end_matches('/');
-    urls.iter().any(|url| url.trim_end_matches('/') == hub)
 }
 
 /// The least of each fee in the `ceilings` of the `contracts` at the hub
@@ -144,7 +138,7 @@ fn strictest(
 ) -> Option<Fees> {
     contracts
         .iter()
-        .filter(|c| at(urls, c) && c.live(tip.unwrap_or(0)))
+        .filter(|c| c.at(urls) && c.live(tip.unwrap_or(0)))
         .filter_map(|c| ceilings.get(&c.id))
         .copied()
         .reduce(|a, b| a.least(&b))

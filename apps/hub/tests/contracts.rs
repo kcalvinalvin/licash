@@ -723,6 +723,16 @@ async fn hub_answering(
     rt: &Regtest,
     dir: &Path,
 ) -> Result<(String, Source, Arc<Hub>, Arc<Openings>)> {
+    hub_answering_with(rt, dir, None).await
+}
+
+/// As [`hub_answering`], holders choosing their terms within `range`, if
+/// any.
+async fn hub_answering_with(
+    rt: &Regtest,
+    dir: &Path,
+    range: Option<Range>,
+) -> Result<(String, Source, Arc<Hub>, Arc<Openings>)> {
     std::fs::create_dir_all(dir)?;
     let (seed, db) = (dir.join("seed"), dir.join("hub.sqlite"));
     Hub::init(&seed, &db, 12)?;
@@ -734,7 +744,7 @@ async fn hub_answering(
     );
     let source: Source = url.parse()?;
     let keyset = hub.info().keysets[0].clone();
-    let openings = Openings::with_wallet(dir, source.clone(), source.clone(), keyset, None);
+    let openings = Openings::with_wallet(dir, source.clone(), source.clone(), keyset, range);
     let openings = openings.await?;
     let services = Services {
         contracts: Some(openings.clone()),
@@ -907,6 +917,196 @@ async fn a_holder_proves_her_claim_against_a_hub_that_answered_and_takes_her_not
     eprintln!("swept {swept} sat to her wallet after her proof");
     let over = recovery::advance(&wallet, &chain, &mine, rate).await?;
     ensure!(over[0] == *done, "{over:?}");
+    Ok(())
+}
+
+/// A wallet of `seed` in `dir`'s `wallet`, trusting the hub at `url`,
+/// with coins of `coins` sat on Bitcoin, in a block: its directory too.
+async fn holder_wallet(
+    rt: &Regtest,
+    chain: &Node,
+    dir: &Path,
+    url: &str,
+    seed: [u8; 32],
+    coins: &[u64],
+) -> Result<(std::path::PathBuf, Wallet<Http>)> {
+    let mine = dir.join("wallet");
+    std::fs::create_dir(&mine)?;
+    let regtest = ChainProfile::Core30DefaultRegtest;
+    let wallet = Wallet::create(
+        &mine.join("wallet.sqlite"),
+        &seed,
+        regtest,
+        Http::new(None)?,
+    )?;
+    wallet.add_hub(url).await?;
+    wallet.watch_silent(None, rt.height()?)?;
+    for sats in coins {
+        let to = wallet.fallback_address()?.script_pubkey();
+        rt.fund(&to, Amount::from_sat(*sats))?;
+    }
+    rt.mine(1)?;
+    ensure!(scan(&wallet, chain).await? == coins.iter().sum::<u64>());
+    Ok((mine, wallet))
+}
+
+fn available(wallet: &Wallet<Http>) -> Result<u64> {
+    Ok(wallet.balance()?.iter().map(|b| b.available).sum())
+}
+
+/// What each contract in `mine` protecting notes at `tip` would claim of
+/// `wallet`'s notes now, by id ([`holder::coverage`]): none of one under
+/// recovery.
+fn recoverable(
+    wallet: &Wallet<Http>,
+    mine: &Path,
+    tip: u32,
+) -> Result<std::collections::HashMap<[u8; 32], u64>> {
+    holder::coverage(wallet, mine, &holder::list(mine)?, tip)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs bitcoind and a release build"]
+async fn a_holder_recovers_her_cap_of_notes_beyond_it_from_a_hub_that_answered() -> Result<()> {
+    use bitcoin::FeeRate;
+    use licash_contracts::holder::recovery::{self, Stage};
+
+    let rt = Regtest::start_standard()?;
+    let dir = tempfile::tempdir()?;
+    let at = dir.path().join("hub");
+    let range = Range {
+        max_cap: 50_000_000,
+        max_blocks: 5_000,
+        per_coin: 2,
+        ppm_year: 10_000,
+    };
+    let (url, source, hub, openings) = hub_answering_with(&rt, &at, Some(range)).await?;
+    let chain = Node(source);
+    let (mine, wallet) =
+        holder_wallet(&rt, &chain, dir.path(), &url, [10; 32], &[60_000, 50_000]).await?;
+    let chosen = Ask {
+        cap: Some(5_000),
+        ..ask()
+    };
+    let opened = holder::open(&wallet, &chain, &mine, &url, chosen).await?;
+    ensure!(opened.cap == 5_000, "{opened:?}");
+    let rate = FeeRate::from_sat_per_vb(2).context("a rate")?;
+    // Three notes of 2 048 sat, the hub's largest: two recover 4 096 of
+    // her cap, three all of it.
+    for _ in 0..3 {
+        let payment = pay(&hub, &at.join("seed"), &url, &wallet.address(), 2_048)?;
+        wallet.receive(&payment)?;
+    }
+    ensure!(available(&wallet)? == 6_144);
+    rt.mine(1)?;
+    holder::resume(&wallet, &chain, &mine).await?;
+    // What it protects: its cap, of the three.
+    let each = recoverable(&wallet, &mine, rt.height()?)?;
+    ensure!(each.get(&opened.id) == Some(&5_000), "{each:?}");
+
+    // Forced closed: the notes claimed for her cap, their excess lost.
+    let forced = recovery::force_close(&wallet, &chain, &mine, &opened.id, rate).await?;
+    ensure!(forced.stage == Stage::Claimed, "{forced:?}");
+    ensure!((forced.claimed, forced.notes) == (5_000, 3), "{forced:?}");
+    ensure!(available(&wallet)? == 0);
+    rt.mine_to_height(forced.next_at.context("no lock")? - 1)?;
+    let sent = recovery::advance(&wallet, &chain, &mine, rate).await?;
+    ensure!(sent[0].stage == Stage::Published, "{sent:?}");
+    rt.mine(1)?;
+    let requested = recovery::advance(&wallet, &chain, &mine, rate).await?;
+    let requested = &requested[0];
+    ensure!(requested.stage == Stage::Requested, "{requested:?}");
+
+    // The hub answers a claim of less than her notes' face: her proof
+    // decides, and is taken.
+    let r = rt.get_tx(&requested.request.context("no R")?)?;
+    let answer = openings.respond(&opened.id, &r).await?;
+    rt.send_raw(&answer)?;
+    rt.mine(1)?;
+    let mut now = recovery::advance(&wallet, &chain, &mine, rate).await?[0].clone();
+    ensure!(now.response == Some(answer.compute_txid()), "{now:?}");
+    for _ in 0..20 {
+        if now.stage == Stage::Asserted {
+            break;
+        }
+        ensure!(now.error.is_none(), "{now:?}");
+        rt.mine(1)?;
+        now = recovery::advance(&wallet, &chain, &mine, rate).await?[0].clone();
+    }
+    ensure!(now.stage == Stage::Asserted && now.proved, "{now:?}");
+    ensure!(now.error.is_none(), "{now:?}");
+
+    // Paid once the hub's chance to challenge passes, then swept.
+    rt.mine_to_height(now.next_at.context("no chance")? - 1)?;
+    let succeeding = &recovery::advance(&wallet, &chain, &mine, rate).await?[0];
+    ensure!(succeeding.stage == Stage::Succeeding, "{succeeding:?}");
+    ensure!(succeeding.error.is_none(), "{succeeding:?}");
+    rt.mine(1)?;
+    let paid = &recovery::advance(&wallet, &chain, &mine, rate).await?[0];
+    ensure!(
+        paid.stage == Stage::Paid && paid.claimed == 5_000,
+        "{paid:?}"
+    );
+    rt.mine_to_height(paid.next_at.context("no delay")? - 1)?;
+    let sweeping = &recovery::advance(&wallet, &chain, &mine, rate).await?[0];
+    ensure!(sweeping.stage == Stage::Sweeping, "{sweeping:?}");
+    rt.mine(1)?;
+    let swept = rt.get_tx(&sweeping.sweep.context("no sweep")?)?.output[0].value;
+    let swept = swept.to_sat();
+    ensure!(swept > 5_000, "{swept} swept");
+    eprintln!("swept {swept} sat to her wallet of a claim of 5000");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs bitcoind and a release build"]
+async fn her_contracts_at_a_hub_each_claim_their_share_of_her_notes() -> Result<()> {
+    use bitcoin::FeeRate;
+    use licash_contracts::holder::recovery::{self, Stage};
+
+    let rt = Regtest::start_standard()?;
+    let dir = tempfile::tempdir()?;
+    let at = dir.path().join("hub");
+    let (url, source, hub) = hub_serving(&rt, &at, None).await?;
+    let chain = Node(source);
+    let coins = [100_000, 60_000];
+    let (mine, wallet) = holder_wallet(&rt, &chain, dir.path(), &url, [11; 32], &coins).await?;
+    let mut both = [
+        holder::open(&wallet, &chain, &mine, &url, ask()).await?,
+        holder::open(&wallet, &chain, &mine, &url, ask()).await?,
+    ];
+    // The one asserting first served first: by id, of the same deadline.
+    both.sort_by_key(|c| (c.assert_height, c.id));
+    let [first, later] = both;
+    ensure!(first.cap == 4_096 && later.cap == 4_096);
+    let rate = FeeRate::from_sat_per_vb(2).context("a rate")?;
+    // 4 096 + 2 048 + 1 024: within their caps together.
+    let payment = pay(&hub, &at.join("seed"), &url, &wallet.address(), 7_168)?;
+    wallet.receive(&payment)?;
+    rt.mine(1)?;
+    holder::resume(&wallet, &chain, &mine).await?;
+    let tip = rt.height()?;
+    let each = recoverable(&wallet, &mine, tip)?;
+    let shares = (each.get(&first.id), each.get(&later.id));
+    ensure!(shares == (Some(&4_096), Some(&3_072)), "{each:?}");
+
+    // The later forced closed first: its share only, not the largest
+    // note within its cap, which the first would then miss.
+    let forced = recovery::force_close(&wallet, &chain, &mine, &later.id, rate).await?;
+    ensure!(forced.stage == Stage::Claimed, "{forced:?}");
+    ensure!((forced.claimed, forced.notes) == (3_072, 2), "{forced:?}");
+    ensure!(available(&wallet)? == 4_096);
+    let each = recoverable(&wallet, &mine, tip)?;
+    let shares = (each.get(&first.id), each.get(&later.id));
+    ensure!(shares == (Some(&4_096), None), "{each:?}");
+    let forced = recovery::force_close(&wallet, &chain, &mine, &first.id, rate).await?;
+    ensure!((forced.claimed, forced.notes) == (4_096, 1), "{forced:?}");
+    ensure!(available(&wallet)? == 0);
+
+    // Both given up: her notes back.
+    recovery::give_up(&wallet, &mine, &later.id)?;
+    recovery::give_up(&wallet, &mine, &first.id)?;
+    ensure!(available(&wallet)? == 7_168);
     Ok(())
 }
 

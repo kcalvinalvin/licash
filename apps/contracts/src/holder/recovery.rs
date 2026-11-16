@@ -23,18 +23,15 @@ use licash_contract::close;
 use licash_contract::dispute::{self, Response};
 use licash_contract::keys::HolderKeys;
 use licash_contract::opening::{Context, Holder, Opening, Trust};
-use licash_wallet::{first_spend, ClaimNote, Transport, Wallet};
+use licash_wallet::{first_spend, ClaimNote, ClaimSlot, Transport, Wallet};
 use serde::{Deserialize, Serialize};
 
+use super::claims::{self, ClaimTerms};
 use super::store::{RecoveryRow, Store};
 use super::{Chain, Fate};
 
 /// The format of a recovery's stored state.
 const FORMAT: i64 = 1;
-
-/// The most notes a claim takes, as many as a claim's authorizations at
-/// most.
-pub(super) const MAX_NOTES: usize = 32;
 
 /// The timeout's fee coin pays this many times its fee at the rate she
 /// forced the contract closed at: the rate may rise over the hub's window.
@@ -191,7 +188,8 @@ pub struct Recovery {
     pub stage: Stage,
     /// Past giving it up.
     pub irrevocable: bool,
-    /// What her notes claimed come to, in sat, and how many they are.
+    /// What her claim recovers, in sat (her notes' face value, the cap at
+    /// most), and how many notes it holds.
     pub claimed: u64,
     /// The selected corrected principal, before reserves and fees.
     pub corrected: Option<u64>,
@@ -747,7 +745,7 @@ impl<'a, T: Transport, C: Chain> Run<'a, T, C> {
             let mut state = State::decode(&row)?;
             let tip = self.chain.height().await.map_err(|e| anyhow!(e))?;
             let next = match stage {
-                Stage::Claiming => self.claim(&mut state)?,
+                Stage::Claiming => self.claim(&mut state, tip)?,
                 Stage::Claimed => self.commit(&mut state, tip).await?,
                 Stage::Irrevocable => self.request(&mut state)?,
                 Stage::Signing => self.sign(&mut state)?,
@@ -835,17 +833,15 @@ impl<'a, T: Transport, C: Chain> Run<'a, T, C> {
         Ok(())
     }
 
-    /// Her notes of the hub's keyset taken, the largest first within the
-    /// cap, and claimed: the claim signed by each note's hold key.
-    fn claim(&self, state: &mut State) -> Result<Next> {
+    /// Her notes of the hub's keyset taken, its share of them with her
+    /// other contracts there ([`claims`]), and claimed: the claim signed
+    /// by each note's hold key, for their face value, its cap at most.
+    fn claim(&self, state: &mut State, tip: u32) -> Result<Next> {
         let parts = self.o.base.parts();
         let keyset = *parts.keyset.id();
         let mut notes = self.wallet.claimed_notes(&self.id, &keyset)?;
         if notes.is_empty() {
-            let max = MAX_NOTES.min(parts.limits.max_authorizations as usize);
-            notes = self
-                .wallet
-                .claim_notes(&self.id, &keyset, u64::from(parts.cap), max)?;
+            notes = self.wallet.claim_notes(&self.id, &self.slots(tip)?)?;
             self.took.store(!notes.is_empty(), Ordering::SeqCst);
         }
         if notes.is_empty() {
@@ -853,8 +849,9 @@ impl<'a, T: Transport, C: Chain> Run<'a, T, C> {
             self.give_back(why)?;
             bail!(why);
         }
-        let amount: u64 = notes.iter().map(|n| n.note.message().denomination()).sum();
-        state.amount = u32::try_from(amount).context("a claim above any cap")?;
+        // A note beyond what is left of the cap is claimed for that much.
+        let held: u64 = notes.iter().map(|n| n.note.message().denomination()).sum();
+        state.amount = parts.cap.min(u32::try_from(held).unwrap_or(u32::MAX));
         let publication = match self.publication(&notes, state.amount) {
             Ok(publication) => publication,
             Err(e) => {
@@ -866,6 +863,21 @@ impl<'a, T: Transport, C: Chain> Run<'a, T, C> {
         state.notes = notes.iter().map(|n| hex::encode(n.to_bytes())).collect();
         state.publication = Some(hex::encode(publication.to_bytes()));
         Ok(Next::To(Stage::Claimed))
+    }
+
+    /// The slots her notes at its hub are shared out to: its own, and
+    /// those of her other contracts there protecting notes at `tip`.
+    fn slots(&self, tip: u32) -> Result<Vec<ClaimSlot>> {
+        let all = self.store.list()?;
+        let this = (all.iter().find(|c| c.id == self.id)).context("a contract not stored")?;
+        let urls = self.wallet.hub_urls(&this.hub).unwrap_or_default();
+        let others: Vec<_> = (all.iter())
+            .filter(|c| c.id != self.id && c.live(tip) && c.at(&urls))
+            .collect();
+        let mut terms = claims::terms(self.wallet, self.store, &others, tip)?;
+        terms.insert(self.id, ClaimTerms::of(&self.o));
+        let mine = others.into_iter().chain([this]);
+        Ok(claims::claim_slots(mine, &terms))
     }
 
     fn publication(&self, notes: &[ClaimNote], amount: u32) -> Result<Publication> {
