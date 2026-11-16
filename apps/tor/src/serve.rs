@@ -4,7 +4,10 @@ use std::{sync::Arc, time::Duration};
 
 use anyhow::Context;
 use futures_util::StreamExt;
-use hyper_util::{rt::TokioIo, service::TowerToHyperService};
+use hyper_util::{
+    rt::{TokioIo, TokioTimer},
+    service::TowerToHyperService,
+};
 use safelog::DisplayRedacted;
 use tor_cell::relaycell::msg::{Connected, End, EndReason};
 use tor_hsservice::{
@@ -19,6 +22,10 @@ const PORT: u16 = 80;
 
 /// How soon to try connecting to the Tor network again.
 const RETRY: Duration = Duration::from_secs(60);
+
+/// Bound accepted streams, including clients that never send HTTP headers.
+const MAX_STREAMS: usize = 128;
+const HEADERS: Duration = Duration::from_secs(120);
 
 /// An onion service, served until dropped.
 pub struct Onion {
@@ -66,8 +73,20 @@ impl Tor {
                 tracing::warn!("Tor, for the onion service: {e}");
                 tokio::time::sleep(RETRY).await;
             }
+            let mut tasks = tokio::task::JoinSet::new();
             while let Some(request) = streams.next().await {
-                tokio::spawn(answer(request, router.clone()));
+                while tasks.try_join_next().is_some() {}
+                if tasks.len() >= MAX_STREAMS {
+                    // No task is spawned for an excess stream. Bound even
+                    // rejection so the accept loop cannot hang on a peer.
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(5),
+                        request.reject(End::new_with_reason(EndReason::RESOURCELIMIT)),
+                    )
+                    .await;
+                    continue;
+                }
+                tasks.spawn(answer(request, router.clone()));
             }
         });
         Ok(Onion {
@@ -88,15 +107,27 @@ async fn answer(request: StreamRequest, router: axum::Router) {
         let _ = request.reject(End::new_with_reason(EndReason::DONE)).await;
         return;
     }
-    let stream = match request.accept(Connected::new_empty()).await {
-        Ok(stream) => stream,
-        Err(e) => {
+    let stream = match tokio::time::timeout(HEADERS, request.accept(Connected::new_empty())).await {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(e)) => {
             tracing::debug!("an onion stream not accepted: {e}");
             return;
         }
+        Err(_) => return,
     };
+    http(stream, router).await;
+}
+
+/// A header deadline releases idle streams without limiting the duration
+/// of a legitimate response (contract downloads can take minutes).
+async fn http(
+    stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    router: axum::Router,
+) {
     let service = TowerToHyperService::new(router);
     let connection = hyper::server::conn::http1::Builder::new()
+        .timer(TokioTimer::new())
+        .header_read_timeout(HEADERS)
         .serve_connection(TokioIo::new(stream), service)
         .await;
     if let Err(e) = connection {
@@ -109,6 +140,30 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn an_idle_http_stream_times_out_and_a_normal_request_still_works() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let router = axum::Router::new().route("/health", axum::routing::get(|| async { "ok" }));
+        let (_client, server) = tokio::io::duplex(4096);
+        let idle = tokio::spawn(http(server, router.clone()));
+        tokio::task::yield_now().await;
+        tokio::time::advance(HEADERS + Duration::from_secs(1)).await;
+        idle.await.unwrap();
+
+        let (mut client, server) = tokio::io::duplex(4096);
+        let served = tokio::spawn(http(server, router));
+        client
+            .write_all(b"GET /health HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).await.unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.ends_with("ok"), "{response}");
+        served.await.unwrap();
+    }
 
     /// One Tor client serves a router, another reaches it once its service
     /// is published.
