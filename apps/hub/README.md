@@ -209,7 +209,22 @@ blocks before the wallet's. `--swaps-fee-base`, `--swaps-fee-ppm`,
 provider holds at that hub, or is owed by the swaps under way: past it,
 swaps from that hub are declined. A cap holds for every URL the provider's
 wallet knows the hub by, such as the URL given and the `https` one it
-moves to, and counts the swaps recorded at each of them. The
+moves to, and counts the swaps recorded at each of them. By default it
+also takes in only what recovery contracts at that hub protect, keeping
+them as a standalone provider does (see `apps/swaps/README.md`): the first
+at each hub opened by the operator with `licash-wallet --wallet
+<data>/swaps/wallet.sqlite open-contract URL --chain URL`, then replaced
+before they end and forced closed at their safe deadline if needed, the
+provider's wallet looking for its coins on the hub's chain. The
+`--swaps-contract-successor-days`, `--swaps-contract-proof-days`,
+`--swaps-contract-max-price` and `--swaps-drain-via` flags match the
+provider's. The hub's own notes, which it issues, need no contract. With
+`--swaps-from`, a hub on a network where no contract opens (only regtest
+and signet do for now) refuses to start, unless `--swaps-no-contracts`
+runs it unprotected, which is reckless; a hub upgraded to this version
+takes nothing more in from a hub until a contract there is live. Back up
+the contracts (`<data>/swaps/contracts.sqlite` and `<data>/swaps/contracts`)
+with the provider's wallet. The
 hub locks no hash its Lightning receipts or deposits hold. The provider's
 wallet and swaps are kept in `<data>/swaps` (`wallet.sqlite` and
 `swaps.sqlite`, made on the first start): back them up with `hub.sqlite`,
