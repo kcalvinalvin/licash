@@ -1490,10 +1490,13 @@ impl Wallet {
             .runtime
             .block_on(self.wallet.deposit_silent_keeping(&hub, rate, keep))?;
         if let Err(e) = chain.broadcast(bitcoin::consensus::serialize(&tx)) {
-            // Its coins free again: the deposit lapses unpaid.
-            self.wallet.abandon_silent(&tx.compute_txid())?;
+            // Relay may have succeeded before the response failed. Keep
+            // the signed transaction and inputs; scanning retries it.
             return Err(LicashError::Unavailable {
-                reason: format!("broadcasting: {e}"),
+                reason: format!(
+                    "broadcast outcome unknown; transaction {} kept for retry: {e}",
+                    tx.compute_txid()
+                ),
             });
         }
         tracing::info!(hash = %deposit.hash, txid = %tx.compute_txid(), "moving to notes");

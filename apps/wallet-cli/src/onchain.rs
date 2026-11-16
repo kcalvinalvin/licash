@@ -130,7 +130,7 @@ pub async fn run(
             };
             let rate = rate(&source, fee_rate).await?;
             let tx = wallet.spend_silent(payee, amount, rate)?;
-            let txid = broadcast(wallet, &source, &tx).await?;
+            let txid = broadcast(&source, &tx).await?;
             let paid = tx.output.iter().map(|o| o.value.to_sat()).sum::<u64>();
             show(
                 json,
@@ -154,7 +154,7 @@ pub async fn run(
             };
             let rate = rate(&source, fee_rate).await?;
             let (deposit, tx) = wallet.deposit_silent(&hub, rate).await?;
-            let txid = broadcast(wallet, &source, &tx).await?;
+            let txid = broadcast(&source, &tx).await?;
             eprintln!(
                 "deposit {}: {} sat in notes once {txid} confirms; `licash-wallet resume` takes them",
                 deposit.hash, deposit.amount
@@ -303,19 +303,15 @@ pub async fn rate(source: &Source, sat_per_vb: Option<u64>) -> anyhow::Result<Fe
     })
 }
 
-/// Broadcast the wallet's spend `tx`, given up if refused: its coins free
-/// again.
-async fn broadcast(
-    wallet: &Wallet<Http>,
-    source: &Source,
-    tx: &bitcoin::Transaction,
-) -> anyhow::Result<bitcoin::Txid> {
+/// Broadcast the wallet's spend `tx`. An error may follow relay, so keep
+/// the signed transaction and its reserved inputs for retry or inspection.
+async fn broadcast(source: &Source, tx: &bitcoin::Transaction) -> anyhow::Result<bitcoin::Txid> {
     match source.broadcast(tx).await {
         Ok(txid) => Ok(txid),
-        Err(e) => {
-            wallet.abandon_silent(&tx.compute_txid())?;
-            Err(e.context("its coins are free again"))
-        }
+        Err(e) => Err(e.context(format!(
+            "broadcast outcome unknown; transaction {} and its coins are kept for retry",
+            tx.compute_txid()
+        ))),
     }
 }
 

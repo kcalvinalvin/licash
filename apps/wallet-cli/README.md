@@ -78,6 +78,12 @@ lists the coins, `onchain send <to> <amount>` pays an address, a silent
 payment address or a code on Bitcoin, and `onchain move` deposits the coins
 for notes at a hub taking deposits.
 
+A broadcast error can follow successful relay. The signed transaction and
+its inputs stay reserved, and `onchain scan` rebroadcasts that same spend.
+Do not make a replacement payment merely because the response was lost.
+Existing pending spends need no conversion; transactions abandoned by an
+older version cannot be reconstructed automatically.
+
 `swap <amount> --to <hub> --provider <url>` swaps notes at another hub for
 `amount` at `<hub>` through a swap provider, with a lock at each hub:
 nothing is revealed until the provider's lock pays the wallet, and a swap

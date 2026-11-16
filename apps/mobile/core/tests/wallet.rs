@@ -328,6 +328,7 @@ struct Light {
     backend: esplora::Shared,
     fetched: Mutex<Vec<u32>>,
     failing: AtomicBool,
+    accepted_error: AtomicBool,
     /// Added to the times blocks claim.
     skew: AtomicI64,
 }
@@ -338,6 +339,7 @@ impl Light {
             backend: net.backend.clone(),
             fetched: Mutex::new(Vec::new()),
             failing: AtomicBool::new(false),
+            accepted_error: AtomicBool::new(false),
             skew: AtomicI64::new(0),
         })
     }
@@ -419,6 +421,11 @@ impl ChainSource for Light {
         let mut backend = self.backend.lock().unwrap();
         if !backend.mempool.contains(&tx) {
             backend.mempool.push(tx);
+        }
+        if self.accepted_error.load(Ordering::SeqCst) {
+            return Err(ChainError::Failed {
+                reason: "response lost after relay".into(),
+            });
         }
         Ok(())
     }
@@ -661,7 +668,7 @@ fn a_phone_paid_on_bitcoin_moves_it_to_notes_and_pays_in_them() {
 }
 
 #[test]
-fn a_phone_refuses_what_it_cannot_do_and_frees_coins_it_could_not_send() {
+fn a_phone_refuses_what_it_cannot_do_and_retries_an_uncertain_broadcast() {
     let net = Net::new(false);
     let light = Light::new(&net);
     let dir = net.dir("alice");
@@ -723,7 +730,8 @@ fn a_phone_refuses_what_it_cannot_do_and_frees_coins_it_could_not_send() {
     assert!(invalid(alice.receive("{}".into(), false)).contains("not a payment"));
     assert!(alice.history().unwrap().is_empty());
 
-    // A move whose broadcast fails frees its coins to move again.
+    // A generic broadcast error cannot prove the signed spend was never
+    // relayed. Its inputs stay reserved and scanning retries that spend.
     let code = alice.payment_code(None).unwrap();
     let payment = net.pay_silent(&code.text, 3_000, 1);
     net.mine(1, vec![payment]);
@@ -734,20 +742,51 @@ fn a_phone_refuses_what_it_cannot_do_and_frees_coins_it_could_not_send() {
         matches!(failed, Err(LicashError::Unavailable { .. })),
         "{failed:?}"
     );
-    let onchain = Balance {
-        onchain: 3_000,
-        ..Balance::default()
-    };
-    assert_eq!(alice.balance().unwrap(), onchain);
-    assert!(net.sent().is_empty());
-    light.failing.store(false, Ordering::SeqCst);
-    alice.move_to_licash(light.clone()).unwrap();
     let moving = Balance {
         moving: 3_000,
         ..Balance::default()
     };
     assert_eq!(alice.balance().unwrap(), moving);
+    assert!(net.sent().is_empty());
+    light.failing.store(false, Ordering::SeqCst);
+    scan(&alice, &light);
+    assert_eq!(alice.balance().unwrap(), moving);
     assert_eq!(net.sent().len(), 1);
+}
+
+#[test]
+fn a_move_accepted_before_an_error_is_kept_and_rebroadcast_after_restart() {
+    let net = Net::new(false);
+    let light = Light::new(&net);
+    let alice = net.wallet("alice", 0);
+    let code = alice.payment_code(None).unwrap();
+    let payment = net.pay_silent(&code.text, 3_000, 1);
+    net.mine(1, vec![payment]);
+    assert_eq!(scan(&alice, &light), (1, 3_000));
+    light.accepted_error.store(true, Ordering::SeqCst);
+    let failed = alice.move_to_licash(light.clone());
+    assert!(
+        matches!(failed, Err(LicashError::Unavailable { .. })),
+        "{failed:?}"
+    );
+    let accepted = net.sent();
+    assert_eq!(accepted.len(), 1);
+    assert!(!accepted[0].input[0].witness.is_empty());
+    assert_eq!(alice.balance().unwrap().moving, 3_000);
+    assert_eq!(alice.balance().unwrap().onchain, 0);
+    drop(alice);
+    let alice = Wallet::open(net.dir("alice"), false).unwrap();
+    light.accepted_error.store(false, Ordering::SeqCst);
+    scan(&alice, &light);
+    assert_eq!(net.sent(), accepted);
+    net.confirm_sent();
+    net.round();
+    net.mine(1, Vec::new());
+    net.round();
+    alice.resume().unwrap();
+    scan(&alice, &light);
+    assert_eq!(alice.balance().unwrap().moving, 0);
+    assert!(alice.balance().unwrap().notes > 0);
 }
 
 #[test]
