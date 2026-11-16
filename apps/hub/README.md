@@ -102,12 +102,28 @@ On regtest, contracts are under a mock proof authority: such a contract
 protects nothing. On signet they are under the genuine programs kept in
 `r0/programs/`, a trial: RISC Zero's shared Groth16 setup, signet's headers
 checked by their work alone and not the network's signature of each block,
-and a hub that does not yet answer a recovery's request (which then pays
-the wallet at its timeout) nor yet take its collateral back after the
-close. The hub's terms there are signet's least: a day
+and a hub that answers a recovery's request only when its operator asks
+(unanswered, the request pays the wallet at its timeout) and does not yet
+take its collateral back after the close. The hub's terms there are
+signet's least: a day
 for the wallet to answer a challenge and for each party's outputs to wait,
 3 blocks deep, and 12 blocks at least to respond to a request. No other
 network yet.
+
+When a wallet forces its contract closed, its request R comes on Bitcoin.
+The operator answers it beside the running hub, within the blocks the hub
+has to respond:
+
+```sh
+licash-hub --data ./hub respond OPENING_ID r.hex --chain URL
+```
+
+`respond` reads the opening from `<data>/openings.sqlite` (it writes
+nothing, and needs neither the seed nor the contracts' wallet), checks that
+R (in hex, `-` for stdin) is that contract's request, broadcasts the hub's
+plain answer on `--chain` (`LICASH_HUB_CHAIN`) and prints its txid. The
+wallet must then prove its claim, its assert in a block by the contract's
+assert height.
 
 With `--swaps` (and `--chain`), the hub provides the swaps into it from the
 hubs of `--swaps-from URL=CAP`: a wallet locks its notes at such a hub to

@@ -120,29 +120,24 @@ impl Store {
         Ok(Self(c))
     }
 
-    pub fn row(&self, id: &[u8; 32]) -> Result<Option<Row>> {
-        let row = self
-            .0
-            .query_row(
-                "SELECT format, state, last, abandoned FROM openings WHERE id = ?1",
-                [id],
-                |r| {
-                    Ok((
-                        r.get::<_, i64>(0)?,
-                        Row {
-                            state: r.get(1)?,
-                            last: r.get(2)?,
-                            abandoned: r.get(3)?,
-                        },
-                    ))
-                },
-            )
-            .optional()?;
-        match row {
-            Some((FORMAT, row)) => Ok(Some(row)),
-            Some((format, _)) => bail!("an opening stored in format {format}, unknown"),
-            None => Ok(None),
+    /// Opening `id` in `dir`, read only, beside the running hub: none if
+    /// it is not there, an error if no opening was ever stored there.
+    pub fn read(dir: &Path, id: &[u8; 32]) -> Result<Option<Row>> {
+        let path = dir.join("openings.sqlite");
+        if !path.exists() {
+            bail!("no openings in {}", dir.display());
         }
+        let c = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let version: i64 = c.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        match version {
+            0 => Ok(None),
+            1 => row(&c, id),
+            v => bail!("openings.sqlite is of version {v}, newer than this hub knows"),
+        }
+    }
+
+    pub fn row(&self, id: &[u8; 32]) -> Result<Option<Row>> {
+        row(&self.0, id)
     }
 
     /// A new opening, of the holder's deposit `deposit`: false if another
@@ -254,6 +249,30 @@ impl Store {
             all.extend(outpoints(&coins?)?);
         }
         Ok(all)
+    }
+}
+
+fn row(c: &Connection, id: &[u8; 32]) -> Result<Option<Row>> {
+    let row = c
+        .query_row(
+            "SELECT format, state, last, abandoned FROM openings WHERE id = ?1",
+            [id],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    Row {
+                        state: r.get(1)?,
+                        last: r.get(2)?,
+                        abandoned: r.get(3)?,
+                    },
+                ))
+            },
+        )
+        .optional()?;
+    match row {
+        Some((FORMAT, row)) => Ok(Some(row)),
+        Some((format, _)) => bail!("an opening stored in format {format}, unknown"),
+        None => Ok(None),
     }
 }
 

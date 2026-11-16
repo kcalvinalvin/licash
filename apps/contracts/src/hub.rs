@@ -307,9 +307,7 @@ impl Openings {
             .await
             .map_err(|e| anyhow::anyhow!(e.reason))?;
         let row = self.store().row(id)?;
-        let row = row.with_context(|| format!("no opening {}", crate::hex_id(id)))?;
-        ensure!(!row.abandoned, "an opening given up");
-        Hub::load(&row.state, &ctx)?.respond(r)
+        answer(row, &ctx, id, r)
     }
 
     async fn context(&self) -> Result<Context, Refused> {
@@ -327,6 +325,32 @@ impl Openings {
     fn busy(&self) -> MutexGuard<'_, HashSet<[u8; 32]>> {
         self.busy.lock().unwrap_or_else(PoisonError::into_inner)
     }
+}
+
+/// The plain answer to `r` in opening `id` of the openings in `data`, as
+/// [`Openings::respond`], on the chain `source` follows: read beside the
+/// running hub, for its operator. Needs neither the hub's seed nor its
+/// wallet, and writes nothing.
+pub async fn respond(
+    data: &Path,
+    source: &Source,
+    id: &[u8; 32],
+    r: &bitcoin::Transaction,
+) -> Result<bitcoin::Transaction> {
+    let trust = crate::trust(source.profile().await?)?;
+    let tip = source.tip().await?.height;
+    answer(Store::read(data, id)?, &Context { tip, trust }, id, r)
+}
+
+fn answer(
+    row: Option<store::Row>,
+    ctx: &Context,
+    id: &[u8; 32],
+    r: &bitcoin::Transaction,
+) -> Result<bitcoin::Transaction> {
+    let row = row.with_context(|| format!("no opening {}", crate::hex_id(id)))?;
+    ensure!(!row.abandoned, "an opening given up");
+    Hub::load(&row.state, ctx)?.respond(r)
 }
 
 /// The routes of `openings`, at [`QUOTE`], [`OPEN`], [`STEP`] and

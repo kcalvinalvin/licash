@@ -886,3 +886,108 @@ async fn a_wallet_sweeps_its_coin_into_a_contract_and_notes_its_change_on_bitcoi
     ensure!(scan(&wallet, &chain).await? == 2_977_000);
     Ok(())
 }
+
+/// `licash-hub respond`, beside the running hub: the operator answers her
+/// request from the openings alone, and she sees its answer on Bitcoin.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs bitcoind and a release build"]
+async fn an_operator_answers_a_holders_request_beside_the_running_hub() -> Result<()> {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+
+    use bitcoin::FeeRate;
+    use licash_contracts::holder::recovery::{self, Stage};
+
+    let rt = Regtest::start_standard()?;
+    let dir = tempfile::tempdir()?;
+    let at = dir.path().join("hub");
+    let (url, source, hub, _openings) = hub_answering(&rt, &at).await?;
+    let chain = Node(source);
+    let mine = dir.path().join("wallet");
+    std::fs::create_dir(&mine)?;
+    let regtest = ChainProfile::Core30DefaultRegtest;
+    let wallet = Wallet::create(
+        &mine.join("wallet.sqlite"),
+        &[9; 32],
+        regtest,
+        Http::new(None)?,
+    )?;
+    wallet.add_hub(&url).await?;
+    wallet.watch_silent(None, rt.height()?)?;
+    for sats in [60_000, 50_000] {
+        let to = wallet.fallback_address()?.script_pubkey();
+        rt.fund(&to, Amount::from_sat(sats))?;
+    }
+    rt.mine(1)?;
+    ensure!(scan(&wallet, &chain).await? == 110_000);
+    let opened = holder::open(&wallet, &chain, &mine, &url, ask()).await?;
+    let rate = FeeRate::from_sat_per_vb(2).context("a rate")?;
+    let payment = pay(&hub, &at.join("seed"), &url, &wallet.address(), 3_000)?;
+    wallet.receive(&payment)?;
+    rt.mine(1)?;
+    let live = holder::resume(&wallet, &chain, &mine).await?;
+    let funding = live[0].funding.context("no F")?;
+
+    let forced = recovery::force_close(&wallet, &chain, &mine, &opened.id, rate).await?;
+    rt.mine_to_height(forced.next_at.context("no lock")? - 1)?;
+    recovery::advance(&wallet, &chain, &mine, rate).await?;
+    rt.mine(1)?;
+    let requested = recovery::advance(&wallet, &chain, &mine, rate).await?;
+    ensure!(requested[0].stage == Stage::Requested, "{requested:?}");
+    let r = rt.get_tx(&requested[0].request.context("no R")?)?;
+    let r_hex = bitcoin::consensus::encode::serialize_hex(&r);
+
+    let rpc = format!(
+        "{}/wallet/harness?cookie={}",
+        rt.rpc_url(),
+        rt.cookie().display()
+    );
+    let respond = |id: &str, request: &str| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_licash-hub"));
+        command
+            .arg("--data")
+            .arg(&at)
+            .args(["respond", id, request, "--chain", &rpc])
+            .env_remove("LICASH_HUB_SEED")
+            .env("RUST_LOG", "info")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        command
+    };
+
+    // Refused for an opening it does not have, or what is not R.
+    let file = dir.path().join("r.hex");
+    std::fs::write(&file, &r_hex)?;
+    let unknown = respond(&"00".repeat(32), &file.to_string_lossy()).output()?;
+    ensure!(!unknown.status.success(), "{unknown:?}");
+    let id = licash_contracts::hex_id(&opened.id);
+    let other = dir.path().join("f.hex");
+    let f = rt.get_tx(&funding)?;
+    std::fs::write(&other, bitcoin::consensus::encode::serialize_hex(&f))?;
+    let wrong = respond(&id, &other.to_string_lossy()).output()?;
+    ensure!(!wrong.status.success(), "{wrong:?}");
+
+    // Its answer to R, read from stdin, broadcast and printed.
+    let mut child = respond(&id, "-").spawn()?;
+    child
+        .stdin
+        .take()
+        .context("no stdin")?
+        .write_all(r_hex.as_bytes())?;
+    let out = child.wait_with_output()?;
+    ensure!(out.status.success(), "{out:?}");
+    let txid: bitcoin::Txid = String::from_utf8(out.stdout)?.trim().parse()?;
+    rt.mine(1)?;
+    let answered = &recovery::advance(&wallet, &chain, &mine, rate).await?[0];
+    ensure!(answered.error.is_none(), "{answered:?}");
+    ensure!(
+        answered.response == Some(txid) && answered.timeout.is_none(),
+        "{answered:?}"
+    );
+    ensure!(
+        matches!(answered.stage, Stage::Answered | Stage::Asserting),
+        "{answered:?}"
+    );
+    Ok(())
+}
