@@ -33,8 +33,8 @@ pub const TIMEOUT: &str = "request_timeout";
 
 /// R's witness: her signatures of `E` (67 digits) then of `b` (10), two
 /// items a digit, below both parties' signatures.
-const E_ITEMS: usize = 134;
-const B_ITEMS: usize = 20;
+pub(crate) const E_ITEMS: usize = 134;
+pub(crate) const B_ITEMS: usize = 20;
 
 pub(crate) fn presign<'a>(o: &'a Opening, name: &str) -> Result<&'a Presign> {
     o.set

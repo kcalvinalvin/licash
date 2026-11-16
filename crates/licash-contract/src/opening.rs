@@ -2007,6 +2007,13 @@ impl Hub {
         Ok(out)
     }
 
+    /// Its plain answer to `r`, the holder's request on Bitcoin
+    /// ([`crate::dispute::respond`]), once F signed whole is in.
+    pub fn respond(self, r: &Transaction) -> Result<Transaction> {
+        let keys = HubKeys::from_secret(&self.secret);
+        crate::dispute::respond(&self.opening()?, &keys, r)
+    }
+
     /// The contract, once F signed whole is in.
     pub fn opening(self) -> Result<HubOpening> {
         let funding = self.funded.context("an opening not funded")?;

@@ -21,11 +21,13 @@ use lichen_babe::vsss::interpolate;
 use lichen_babe::we::decrypt;
 use lngap_btc::bitcoin::{OutPoint, Transaction, TxOut};
 use lngap_btc::witness::witness_args_consumption_order;
+use lngap_lamport::winternitz::{WotsParams, WotsSig};
+use lngap_sessions::skeleton::sig_name;
 
-use crate::close::{finished, presign, terminal};
+use crate::close::{finished, presign, terminal, B_ITEMS, E_ITEMS};
 use crate::graph::Babe;
-use crate::keys::HolderKeys;
-use crate::opening::{journal, Opening, Setup, Trust};
+use crate::keys::{HolderKeys, HubKeys};
+use crate::opening::{journal, HubOpening, Opening, Setup, Trust};
 
 /// The hub's answers to R: its plain one and its counter, of one txid.
 pub const RESPOND: &str = "respond";
@@ -38,6 +40,9 @@ pub const SUCCESS: &str = "success";
 /// The hub's challenge of her assertion, and its terminal paying it.
 pub const CHALLENGE: &str = "challenge_assert";
 pub const FAILURE: &str = "failure";
+
+/// A proof of her claim: Groth16's, on BN254.
+pub type ClaimProof = Proof<Bn254>;
 
 /// What the hub answered R with, read from the chain.
 pub enum Response {
@@ -76,6 +81,64 @@ pub fn response(o: &Opening, tx: &Transaction) -> Result<Response> {
     Ok(Response::Plain(HubResponse::Plain {
         e_sig: Hashes(exit.hub_e),
     }))
+}
+
+/// The hub's plain `respond` to `r`, her request in contract `o`: her
+/// signatures of `b` and `E`, read from R, signed back under its one-time
+/// keys of the plain leaf, both parties' signatures below, R's
+/// publication coins spent with it. Her proof decides then. Refused for
+/// a transaction not the contract's request, or one that misreads it.
+pub fn respond(o: &HubOpening, keys: &HubKeys, r: &Transaction) -> Result<Transaction> {
+    let link = |name: &str| {
+        o.set
+            .iter()
+            .find(|p| p.name == name)
+            .with_context(|| format!("no {name} in the contract's graph"))
+    };
+    ensure!(
+        r.compute_txid() == link("request")?.tx.compute_txid(),
+        "not this contract's request"
+    );
+    let items: Vec<Vec<u8>> = r.input[0].witness.iter().map(<[u8]>::to_vec).collect();
+    ensure!(
+        items.len() > E_ITEMS + B_ITEMS,
+        "a request of too few items"
+    );
+    let leaf = o.prefix.leaf();
+    let request = leaf
+        .keys()
+        .decode_witness(&items, leaf.script(), leaf.control())?;
+    let order = |items: &[Vec<u8>]| items.iter().rev().cloned().collect::<Vec<_>>();
+    let e = WotsSig::from_consumption_order(WotsParams::for_bytes(32), &order(&items[..E_ITEMS]))?;
+    let b = &items[E_ITEMS..E_ITEMS + B_ITEMS];
+    let b = WotsSig::from_consumption_order(WotsParams::for_bytes(4), &order(b))?;
+    ensure!(
+        b.message() == request.amount.to_be_bytes() && e.message() == request.claim_digest,
+        "her signatures read another request than R's"
+    );
+    let hub_b = keys.b.sign(&b.message())?;
+    let hub_e = keys.e_plain.sign(&e.message())?;
+    let wire = Babe::respond_exit_wire(&hub_b, &b, &e, &hub_e, None);
+    let p = link(RESPOND)?;
+    // Each publication coin's input carries the E part alone: the main
+    // input's wire but its `b` signatures, at its bottom.
+    let n = 4 * WotsParams::for_bytes(4).total_digits() as usize;
+    let e_wire = wire[..wire.len() - n].to_vec();
+    let mut wires = vec![wire];
+    wires.extend((0..p.extra.len()).map(|_| e_wire.clone()));
+    let sigs = |of: &std::collections::HashMap<String, Vec<u8>>, whose: &str| {
+        (0..p.inputs())
+            .map(|i| {
+                let name = sig_name(RESPOND, i);
+                of.get(&name)
+                    .cloned()
+                    .with_context(|| format!("no signature of {whose} of {name}"))
+            })
+            .collect::<Result<Vec<_>>>()
+    };
+    let hub = sigs(&o.sigs, "the hub")?;
+    let alice = sigs(&o.consent.sigs, "hers")?;
+    Ok(p.finish_multi(wires, &hub, &alice))
 }
 
 /// Her statement's input proving her whole claim (`c` = 0): `observed`,
@@ -137,6 +200,27 @@ pub fn proof_from_points(points: &[u8]) -> Result<Proof<Bn254>> {
     })
 }
 
+/// A proof's points as [`proof_from_points`] reads them.
+pub fn proof_to_points(proof: &Proof<Bn254>) -> Vec<u8> {
+    let le = |x: Fq| {
+        let mut b = x.into_bigint().to_bytes_le();
+        b.resize(32, 0);
+        b
+    };
+    let flagged = |mut b: Vec<u8>, odd: bool| {
+        if odd {
+            b[31] |= 0x80;
+        }
+        b
+    };
+    let g1 = |p: &G1Affine| flagged(le(p.x), odd(p.y));
+    let mut points = g1(&proof.a);
+    points.extend(le(proof.b.x.c0));
+    points.extend(flagged(le(proof.b.x.c1), odd(proof.b.y.c0)));
+    points.extend(g1(&proof.c));
+    points
+}
+
 /// A coordinate from 32 little-endian bytes, below the modulus.
 fn fq_le(b: &[u8]) -> Result<Fq> {
     let x = Fq::from_le_bytes_mod_order(b);
@@ -177,6 +261,22 @@ fn g2(b: &[u8]) -> Result<G2Affine> {
         "not a G2 point"
     );
     Ok(p)
+}
+
+/// A proof as a recovery keeps it: its points compressed, 128 bytes.
+pub fn proof_bytes(proof: &Proof<Bn254>) -> Vec<u8> {
+    lichen_babe::statement::proof_to_bytes(proof)
+}
+
+/// [`proof_bytes`] read back.
+pub fn proof_of_bytes(bytes: &[u8]) -> Result<Proof<Bn254>> {
+    lichen_babe::statement::proof_from_bytes(bytes).context("not a proof's bytes")
+}
+
+/// The program her proof must be of: the holder program her opening
+/// names, by its image id.
+pub fn holder_image(o: &Opening) -> [u8; 32] {
+    o.base.parts().recipe.holder_program
 }
 
 /// Whether `proof` proves her claim in full under `trust`: the statement
@@ -251,6 +351,18 @@ pub fn is_success(o: &Opening, tx: &Transaction) -> Result<bool> {
     Ok(tx.input.iter().any(|i| i.previous_output == at) && tx.output == p.tx.output)
 }
 
+/// Whether `tx` is her answer to the hub's challenge, from any kept
+/// instance, any fee inputs added.
+pub fn is_answer(o: &Opening, tx: &Transaction) -> bool {
+    o.set
+        .iter()
+        .filter(|p| p.name.starts_with("wrongly_challenged_") && !p.name.contains("corrected"))
+        .any(|p| {
+            let at = p.tx.input[0].previous_output;
+            tx.input.iter().any(|i| i.previous_output == at) && tx.output == p.tx.output
+        })
+}
+
 /// Whether `tx` is the hub's challenge of her `assert`.
 pub fn is_challenge(o: &Opening, tx: &Transaction) -> bool {
     is(o, tx, CHALLENGE)
@@ -319,7 +431,10 @@ mod tests {
         let verify = |p: &Proof<Bn254>| {
             <Groth16<Bn254> as ark_snark::SNARK<_>>::verify(&vk, &public, p).unwrap_or(false)
         };
-        assert!(verify(&proof_from_points(&points).unwrap()));
+        let proof = proof_from_points(&points).unwrap();
+        assert!(verify(&proof));
+        assert_eq!(proof_to_points(&proof), points);
+        assert_eq!(proof_of_bytes(&proof_bytes(&proof)).unwrap(), proof);
         let mut flipped = points.clone();
         flipped[0] ^= 1;
         assert!(proof_from_points(&flipped).map_or(true, |p| !verify(&p)));
