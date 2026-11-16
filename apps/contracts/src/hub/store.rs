@@ -140,6 +140,12 @@ impl Store {
         row(&self.0, id)
     }
 
+    pub fn signed_ids(&self) -> Result<Vec<[u8; 32]>> {
+        let mut stmt = self.0.prepare("SELECT id FROM openings WHERE irrevocable = 1 AND abandoned = 0 ORDER BY created_at, rowid")?;
+        let rows = stmt.query_map([], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     /// A new opening, of the holder's deposit `deposit`: false if another
     /// opening not given up spends it.
     pub fn insert(

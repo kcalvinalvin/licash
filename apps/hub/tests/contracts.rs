@@ -609,6 +609,114 @@ async fn a_hubs_answer_can_confirm_after_its_response_window() -> Result<()> {
     Ok(())
 }
 
+/// The daemon needs no scan cursor and an upgraded opening needs no
+/// rewrite. A late first poll and a restart still use just one answer.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs bitcoind and a release build"]
+async fn a_hub_automatically_answers_and_restarts_with_the_same_one_time_answer() -> Result<()> {
+    use bitcoin::FeeRate;
+    use licash_contracts::holder::recovery::{self, Stage};
+
+    let rt = Regtest::start_standard()?;
+    let dir = tempfile::tempdir()?;
+    let at = dir.path().join("hub");
+    let (url, source, hub, openings) = hub_answering(&rt, &at).await?;
+    let chain = Node(source.clone());
+    let mine = dir.path().join("wallet");
+    std::fs::create_dir(&mine)?;
+    let wallet = Wallet::create(
+        &mine.join("wallet.sqlite"),
+        &[29; 32],
+        ChainProfile::Core30DefaultRegtest,
+        Http::new(None)?,
+    )?;
+    wallet.add_hub(&url).await?;
+    wallet.watch_silent(None, rt.height()?)?;
+    for sats in [60_000, 50_000] {
+        rt.fund(
+            &wallet.fallback_address()?.script_pubkey(),
+            Amount::from_sat(sats),
+        )?;
+    }
+    rt.mine(1)?;
+    scan(&wallet, &chain).await?;
+    let opened = holder::open(&wallet, &chain, &mine, &url, ask()).await?;
+    wallet.receive(&pay(
+        &hub,
+        &at.join("seed"),
+        &url,
+        &wallet.address(),
+        3_000,
+    )?)?;
+    rt.mine(1)?;
+    holder::resume(&wallet, &chain, &mine).await?;
+    let rate = FeeRate::from_sat_per_vb(2).context("a rate")?;
+    let forced = recovery::force_close(&wallet, &chain, &mine, &opened.id, rate).await?;
+    rt.mine_to_height(forced.next_at.context("no lock")? - 1)?;
+    recovery::advance(&wallet, &chain, &mine, rate).await?;
+    // No signature for R while it is only in the mempool (depth 0).
+    ensure!(
+        openings.answer_requests().await?
+            == licash_contracts::hub::ResponseRound {
+                answered: 0,
+                failed: 0
+            }
+    );
+    ensure!(!at.join("responses.sqlite").exists());
+    rt.mine(1)?;
+    let requested = recovery::advance(&wallet, &chain, &mine, rate).await?;
+    let r = rt.get_tx(&requested[0].request.context("no request")?)?;
+    rt.mine_to_height(requested[0].next_at.context("no window")? + 1)?;
+
+    // A broken unrelated row must not hide the actual request.
+    let db = rusqlite::Connection::open(at.join("openings.sqlite"))?;
+    db.execute("INSERT INTO openings SELECT ?1, format, phase, mock, irrevocable, ?2, coins, last, x'00', abandoned, created_at, updated_at FROM openings WHERE id = ?3", rusqlite::params![[99_u8; 32], vec![99_u8; 36], opened.id])?;
+    ensure!(
+        openings.answer_requests().await?
+            == licash_contracts::hub::ResponseRound {
+                answered: 1,
+                failed: 1
+            }
+    );
+    let answer = openings.respond(&opened.id, &r).await?;
+    // Manual fallback shares and returns the exact same stored answer.
+    let manual = licash_contracts::hub::respond(&at, &source, &opened.id, &r).await?;
+    ensure!(manual == answer);
+    let restarted = Openings::with_wallet(
+        &at,
+        source.clone(),
+        source,
+        hub.info().keysets[0].clone(),
+        None,
+    )
+    .await?;
+    ensure!(
+        restarted.answer_requests().await?
+            == licash_contracts::hub::ResponseRound {
+                answered: 1,
+                failed: 1
+            }
+    );
+    ensure!(restarted.respond(&opened.id, &r).await? == answer);
+    rt.mine(1)?;
+    ensure!(
+        restarted.answer_requests().await?
+            == licash_contracts::hub::ResponseRound {
+                answered: 0,
+                failed: 1
+            }
+    );
+    let observed = recovery::advance(&wallet, &chain, &mine, rate).await?;
+    ensure!(observed[0].error.is_none(), "{observed:?}");
+    ensure!(observed[0].stage.disputed(), "{observed:?}");
+    ensure!(
+        observed[0].response == Some(answer.compute_txid()),
+        "{observed:?}"
+    );
+    ensure!(observed[0].stage != Stage::Lost);
+    Ok(())
+}
+
 /// As [`hub_serving`], and its openings, for a test to answer a holder's
 /// request with.
 async fn hub_answering(

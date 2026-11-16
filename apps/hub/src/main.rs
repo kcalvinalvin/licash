@@ -131,6 +131,12 @@ struct Chain {
     #[arg(long, env = "LICASH_HUB_CONTRACTS",
           value_parser = clap::builder::BoolishValueParser::new())]
     contracts: bool,
+    /// Automatically answer confirmed holder requests. Pins one request
+    /// witness per opening in responses.sqlite; never runs hub timeouts.
+    /// Before enabling on an older hub, reconcile any manual responses.
+    #[arg(long, env = "LICASH_HUB_CONTRACTS_RESPOND", requires = "contracts",
+          value_parser = clap::builder::BoolishValueParser::new())]
+    contracts_respond: bool,
     /// Fund and sign contracts with the wallet of the node at this URL, its
     /// JSON-RPC as `--chain` takes it, such as
     /// `http://host:port/wallet/NAME?cookie=PATH`: one apart from the chain
@@ -854,6 +860,8 @@ fn command(cli: Cli) -> anyhow::Result<()> {
             let policy = policy.policy();
             let (indexing, tweaks_from) = (chain.tweaks, chain.tweaks_from);
             let contracting = chain.contracts;
+            let responding = chain.contracts_respond;
+            let response_poll = Duration::from_secs(chain.chain_poll);
             let range = chain.range();
             let wallet = match (&chain.contracts_wallet, &chain.url) {
                 (Some(url), _) => Some(url.parse::<Source>().context("--contracts-wallet")?),
@@ -968,6 +976,10 @@ fn command(cli: Cli) -> anyhow::Result<()> {
                     );
                     let openings = runtime.block_on(opening).context("open the contracts")?;
                     openings.spawn_sweeper();
+                    if responding {
+                        openings.spawn_responder(response_poll);
+                        tracing::info!("automatic contract responder enabled; one-time answers pinned in responses.sqlite");
+                    }
                     tracing::info!(
                         mock = openings.advertise().mock,
                         ?range,
