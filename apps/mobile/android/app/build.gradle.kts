@@ -6,6 +6,9 @@ plugins {
 // What ../native.sh builds: the wallet core, its bindings and the chain.
 val native = layout.buildDirectory.dir("native").get().asFile
 
+// What ../prover.sh builds, if run: the phone's prover and its programs.
+val prover = layout.buildDirectory.dir("prover").get().asFile
+
 android {
     namespace = "org.licash.wallet"
     compileSdk = 37
@@ -36,6 +39,16 @@ android {
         getByName("main") {
             kotlin.directories += native.resolve("kotlin").path
             jniLibs.directories += native.resolve("jniLibs").path
+            jniLibs.directories += prover.resolve("jniLibs").path
+            assets.directories += prover.resolve("assets").path
+        }
+    }
+
+    packaging {
+        jniLibs {
+            // The prover runs as a process: installed as a file, not read
+            // from the APK in place.
+            useLegacyPackaging = prover.resolve("jniLibs").exists()
         }
     }
 }

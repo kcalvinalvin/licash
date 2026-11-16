@@ -9,6 +9,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -61,6 +62,7 @@ internal fun HubPage(
     var quote by remember { mutableStateOf<ContractQuote?>(null) }
     var ending by remember { mutableStateOf<Contract?>(null) }
     var forcing by remember { mutableStateOf<Contract?>(null) }
+    val proofs by engine.prover.proofs.collectAsState()
     var fees by remember { mutableStateOf(false) }
     var moving by remember { mutableStateOf(false) }
 
@@ -107,6 +109,16 @@ internal fun HubPage(
                         scope.launch { engine.saveStatement(c.id, to).onFailure { fail(explain(it)) } }
                     },
                     bringProof = { from -> engine.bringProof(c.id, from) },
+                    proving = proofs[c.id],
+                    proveHere = if (engine.prover.available) {
+                        { scope.launch { engine.proveHere(c.id).onFailure { fail(explain(it)) } } }
+                    } else {
+                        null
+                    },
+                    stopProving = { engine.stopProving() },
+                    saveReceipt = { to ->
+                        scope.launch { engine.saveReceipt(c.id, to).onFailure { fail(explain(it)) } }
+                    },
                 )
             }
             if (opening && !stepping) {

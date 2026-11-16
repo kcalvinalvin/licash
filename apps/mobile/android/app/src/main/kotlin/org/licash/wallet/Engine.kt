@@ -122,6 +122,9 @@ class Engine(context: Context) {
     private val app = context.applicationContext
     val prefs = Prefs(context)
     val notifier = Notifier(app)
+
+    /** The proofs made on this phone, if this build carries the prover. */
+    val prover = Prover(app)
     private val files = context.filesDir
     private val walletDir = File(files, "wallet").path
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -205,6 +208,8 @@ class Engine(context: Context) {
                 foreground = true
                 // In sight: the only time the service may start.
                 if (state.value.watch == Watch.NOW) WatchService.start(app)
+                // A proof the user started, stopped by Android since: carried on.
+                if (prover.available && prover.pending().isNotEmpty()) ProverService.start(app)
                 poke()
                 if (eager) watchMailbox()
             }
@@ -924,6 +929,34 @@ class Engine(context: Context) {
         val out = app.contentResolver.openOutputStream(to, "wt") ?: error("that file cannot be written")
         out.use { it.write(statement) }
         AppLog.info("statement of contract $id saved, ${statement.size} bytes")
+    }
+
+    /** Prove contract `id`'s claim on this phone, or carry on proving it: for hours, in the foreground. */
+    suspend fun proveHere(id: String): Result<Unit> = io {
+        val statement = local { it.recoveryStatement(id) }
+        val program = local { it.recoveryProgram(id) }
+        prover.prepare(id, statement, program)
+        ProverService.start(app)
+    }
+
+    /** Prove the sample statement this build carries, or carry on: to see how long a proof takes here. */
+    suspend fun proveSample(): Result<Unit> = io {
+        prover.prepareSample()
+        ProverService.start(app)
+    }
+
+    /** Stop every proof on this phone: each carries on where it stopped, at the user's word. */
+    fun stopProving() = ProverService.stop(app)
+
+    /** The sample proof and its work forgotten, for another. */
+    suspend fun forgetSample(): Result<Unit> = io { prover.forget(Prover.SAMPLE) }
+
+    /** The receipt of contract `id`'s claim made on this phone, saved `to` a file, to wrap on a computer. */
+    suspend fun saveReceipt(id: String, to: Uri): Result<Unit> = io {
+        val receipt = prover.receipt(id) ?: error("its receipt is not made yet")
+        val out = app.contentResolver.openOutputStream(to, "wt") ?: error("that file cannot be written")
+        out.use { o -> receipt.inputStream().use { it.copyTo(o) } }
+        AppLog.info("receipt of contract $id saved, ${receipt.length()} bytes")
     }
 
     /** The proof of contract `id`'s claim brought back `from` the file licash-r0 wrote: checked, kept, posted. */

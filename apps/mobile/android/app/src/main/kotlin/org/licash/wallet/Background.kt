@@ -49,6 +49,8 @@ class Notifier(private val context: Context) {
                     "Money received, and payments finished or failed while the app was out of sight."),
                 channel(DEADLINES, NotificationManagerCompat.IMPORTANCE_HIGH, "Deadlines",
                     "A payment under way that needs the app open soon to finish."),
+                channel(PROVING, NotificationManagerCompat.IMPORTANCE_LOW, "Proving",
+                    "Shown while the app proves a protection's claim on this phone."),
             ),
         )
     }
@@ -63,6 +65,33 @@ class Notifier(private val context: Context) {
         .setOngoing(true)
         .setSilent(true)
         .build()
+
+    /** The prover's foreground service's own: how far the proof running is, if one is. */
+    fun proving(p: Proving?): Notification {
+        val builder = builder(PROVING)
+            .setContentTitle("Proving a protection's claim")
+            .setContentText(p?.let { provingWords(it) } ?: "Starting")
+            .setOngoing(true)
+            .setSilent(true)
+            .setAutoCancel(false)
+        if (p != null && p.segments > 0) builder.setProgress(1000, (p.share * 1000).toInt(), false)
+        return builder.build()
+    }
+
+    /** [proving] shown again, as it goes. */
+    fun showProving(p: Proving?) {
+        if (Build.VERSION.SDK_INT >= 33 &&
+            ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            return
+        }
+        try {
+            manager.notify(PROVING_ID, proving(p))
+        } catch (e: SecurityException) {
+            AppLog.warn("a notification", e)
+        }
+    }
 
     /** Money in, or a payment finished: `key` names it, each told once. */
     fun payment(key: String, text: String) = post(key, PAYMENT_ID, builder(PAYMENTS).setContentTitle(text))
@@ -107,7 +136,9 @@ class Notifier(private val context: Context) {
         const val WATCHING = "watching"
         const val PAYMENTS = "payments"
         const val DEADLINES = "deadlines"
+        const val PROVING = "proving"
         const val WATCHING_ID = 1
+        const val PROVING_ID = 4
         private const val PAYMENT_ID = 2
         private const val DEADLINE_ID = 3
     }

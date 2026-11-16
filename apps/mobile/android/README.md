@@ -30,9 +30,15 @@ Needs a JDK 17 or later, the Android SDK (platform 37) with the NDK at
 
 ```sh
 ./native.sh                 # the core, its Kotlin bindings and the chain AAR
+./prover.sh                 # optional: the phone's prover and the programs it proves
 ./gradlew assembleDebug     # app/build/outputs/apk/debug/app-debug.apk
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
+
+`./prover.sh` builds `r0/host`'s `licash-r0` for each ABI (about 60 MB
+each) and copies `r0/programs`; with `SAMPLE=<statement input>`, it adds a
+sample statement that advanced mode proves on the phone, to see how long a
+proof takes there.
 
 ## Releases
 
@@ -111,9 +117,17 @@ and the hub's page how much of what it holds they protect; the notes they
 cover count as protected rather than not, on Home and behind the balance;
 what a contract is worth for now (nothing, under the mock authority) is said
 wherever one shows. A contract ends no sooner: End says to cash out the
-hub's notes instead. Force closing,
-recovering the notes on Bitcoin, is not available yet. The contracts are kept
-beside the wallet's file, made only once one is asked for.
+hub's notes instead. In advanced mode, a contract whose hub stopped
+answering can be forced closed: the notes it covers are claimed on Bitcoin
+and paid back there once the hub's window to answer passed. A hub that
+answers instead leaves it to a proof of the claim, by a deadline the row
+shows: it offers to save the statement to prove on a computer (`licash-r0`,
+as [the wallet's README](../../wallet-cli/README.md) says) and to bring the
+proof back, and, in an app built with `./prover.sh`, to prove it on the
+phone itself, for hours, carried on after any stop; that proof's last step
+(its Groth16 wrap) still needs an x86 computer with Docker, its receipt
+saved from the row. The contracts are kept beside the wallet's file, made
+only once one is asked for.
 
 A counterpart on the command line:
 

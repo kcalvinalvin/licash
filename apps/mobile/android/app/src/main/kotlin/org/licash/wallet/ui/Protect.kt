@@ -35,6 +35,7 @@ import org.licash.core.ContractQuote
 import org.licash.core.ContractState
 import org.licash.core.Recovery
 import org.licash.core.RecoveryStage
+import org.licash.wallet.Proving
 import org.licash.wallet.sat
 import org.licash.wallet.share
 
@@ -55,6 +56,10 @@ internal fun CoverRow(
     giveUp: () -> Unit,
     saveStatement: (Uri) -> Unit = {},
     bringProof: (Uri) -> Unit = {},
+    proving: Proving? = null,
+    proveHere: (() -> Unit)? = null,
+    stopProving: () -> Unit = {},
+    saveReceipt: (Uri) -> Unit = {},
 ) {
     val colors = MaterialTheme.colorScheme
     val cover = cover(c, height)
@@ -115,7 +120,12 @@ internal fun CoverRow(
             Column {
                 if (recovery != null) {
                     Forced(recovery, developer, giveUp)
-                    if (needsProof(recovery)) ProveElsewhere(recovery, saveStatement, bringProof)
+                    if (needsProof(recovery)) {
+                        ProveElsewhere(recovery, saveStatement, bringProof)
+                        proveHere?.let {
+                            ProveHere(proving, "${recovery.id.take(16)}.receipt", it, stopProving, saveReceipt)
+                        }
+                    }
                 } else {
                     Unfolded(c, cover, developer, end, forceClose)
                 }

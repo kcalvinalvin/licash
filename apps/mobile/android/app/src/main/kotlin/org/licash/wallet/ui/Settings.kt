@@ -25,6 +25,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -47,6 +48,7 @@ import org.licash.core.Hub
 import org.licash.wallet.AppLog
 import org.licash.wallet.BuildConfig
 import org.licash.wallet.Engine
+import org.licash.wallet.Prover
 import org.licash.wallet.Storage
 import org.licash.wallet.Ui
 import org.licash.wallet.explain
@@ -236,6 +238,22 @@ private fun Advanced(engine: Engine, ui: Ui, balance: () -> Unit) {
     }
     if (ui.wallet) Group("Renewing notes") { RenewLimit(engine) }
     Group("Bitcoin light client") { LightClient(engine) }
+    if (engine.prover.sample) {
+        Group("Proving on this phone") {
+            val proofs by engine.prover.proofs.collectAsState()
+            SampleProof(
+                proofs[Prover.SAMPLE],
+                prove = { scope.launch { engine.proveSample().onFailure { AppLog.warn("the sample proof", it) } } },
+                stop = { engine.stopProving() },
+                again = {
+                    scope.launch {
+                        engine.forgetSample().onFailure { AppLog.warn("forgetting the sample proof", it) }
+                        engine.proveSample().onFailure { AppLog.warn("the sample proof", it) }
+                    }
+                },
+            )
+        }
+    }
     Group("") {
         Entry("Delete wallet", tag = "delete-wallet", color = MaterialTheme.colorScheme.error) { deleting = true }
     }

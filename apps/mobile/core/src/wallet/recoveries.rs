@@ -190,6 +190,17 @@ impl Wallet {
         recovery::statement(&self.dir, &id).map_err(failed)
     }
 
+    /// The program contract `id`'s statement is proved with, its image id
+    /// in hex: the app proves it with `<image id>.bin` among those it
+    /// carries (`r0/programs`). Refused before the statement is built.
+    pub fn recovery_program(&self, id: String) -> Result<String, LicashError> {
+        let id = contract_id(&id)?;
+        let statement = recovery::statement(&self.dir, &id).map_err(failed)?;
+        let input = licash::statement::StatementInput::from_bytes(&statement)
+            .map_err(|e| failed(anyhow::anyhow!("its statement: {e}")))?;
+        Ok(hex::encode(input.base.parts().recipe.holder_program))
+    }
+
     /// Bring back the proof of contract `id`'s claim, `export` as
     /// `licash-r0 native-wrap` wrote it: checked against the contract,
     /// kept, and posted on Bitcoin through `chain` at once. The same proof
