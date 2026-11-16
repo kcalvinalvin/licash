@@ -93,8 +93,10 @@ fn owners_pay_and_get_paid_on_the_command_line() {
     assert_eq!(available(&alice), (69, 0));
     assert_eq!(available(&bob), (30, 0));
     let text = ok(wallet(&alice, &["balance"], None));
+    assert_eq!(text, "balance  69 sat\n");
+    let text = ok(wallet(&alice, &["balance", "--details"], None));
     assert!(
-        text.starts_with("total  69 sat\n") && text.contains(&format!("{}  69 sat", hub.url())),
+        text.starts_with("balance  69 sat\n") && text.contains(&format!("{}  69 sat", hub.url())),
         "{text}"
     );
 
@@ -806,12 +808,12 @@ fn a_payment_at_a_hub_holding_too_little_swaps_there_first_within_its_fees() {
     failed(
         pay("30", &[]),
         1,
-        &format!("{swapping}, 4 sat in fees at most in all: pay again with --max-fee 4"),
+        "A swap is needed to send 30 sat; fee up to 4 sat (13%): pay again with --max-fee 4",
     );
     failed(
         pay("30", &["--max-fee", "3"]),
         1,
-        "costs 4 sat in fees at most, more than --max-fee 3",
+        "fee up to 4 sat (13%) exceeds --max-fee 3",
     );
     assert_eq!((swapped(&alice), available(&alice)), (0, (100, 0)));
     let output = pay("30", &["--max-fee", "4", "--json"]);
@@ -886,9 +888,12 @@ fn what_paying_at_a_hub_not_added_leaves_there_is_shown_apart_until_added() {
     let (held, _) = available(&alice);
     assert!(held < 100 - 3, "{held}");
     let text = ok(wallet(&alice, &["balance"], None));
-    let apart = format!("{}  1 sat (not added: add-hub to count it)", b.url());
+    let apart = format!(
+        "not counted  1 sat at {} (hub not added: add-hub to count it)",
+        b.url()
+    );
     assert!(
-        text.contains(&apart) && text.starts_with(&format!("total  {held} sat\n")),
+        text.contains(&apart) && text.starts_with(&format!("balance  {held} sat\n")),
         "{text}"
     );
 
@@ -897,7 +902,7 @@ fn what_paying_at_a_hub_not_added_leaves_there_is_shown_apart_until_added() {
     assert_eq!(available(&alice), (held + 1, 0));
     let text = ok(wallet(&alice, &["balance"], None));
     assert!(
-        !text.contains("not added") && text.starts_with(&format!("total  {} sat\n", held + 1)),
+        !text.contains("not added") && text.starts_with(&format!("balance  {} sat\n", held + 1)),
         "{text}"
     );
 }
@@ -1065,7 +1070,13 @@ fn owners_pay_payment_codes_through_mailboxes_or_by_hand() {
     );
 
     // Alice pays it: sent to his mailbox, nothing to hand over.
-    let paid = json(&alice, &["pay", &qr, "30"]);
+    let output = wallet(&alice, &["--json", "pay", &qr, "30"], None);
+    let diagnostic = String::from_utf8_lossy(&output.stderr).into_owned();
+    let paid: Value = serde_json::from_str(&ok(output)).unwrap();
+    assert_eq!(
+        diagnostic,
+        format!("payment {}\n", paid["id"].as_str().unwrap())
+    );
     assert_eq!(
         (paid["amount"].as_u64(), paid["relays"].as_u64()),
         (Some(30), Some(1))
@@ -1081,7 +1092,16 @@ fn owners_pay_payment_codes_through_mailboxes_or_by_hand() {
     // What the code asks for, unless told otherwise; more than she holds
     // and its fee is for Bitcoin, at the silent payment address.
     let asking = text.replacen("bitcoin:?", "bitcoin:?amount=0.0000002&", 1);
-    assert_eq!(json(&alice, &["pay", &asking])["amount"], 20);
+    let output = wallet(&alice, &["pay", &asking], None);
+    assert!(
+        output.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        ok(output),
+        "sent to mailbox  20 sat\nfee              up to 1 sat (5%)\n"
+    );
     failed(
         wallet(&alice, &["pay", &asking, "21"], None),
         1,
@@ -1114,11 +1134,17 @@ fn owners_pay_payment_codes_through_mailboxes_or_by_hand() {
     json(&alice, &["add-hub", &plain.url()]);
     let funding = serde_json::to_string(&plain.pay(&address(&alice_address), 10)).unwrap();
     ok(wallet(&alice, &["receive"], Some(&funding)));
-    let payment = ok(wallet(
-        &alice,
-        &["pay", code["code"].as_str().unwrap(), "5"],
-        None,
-    ));
+    let output = wallet(&alice, &["pay", code["code"].as_str().unwrap(), "5"], None);
+    let said = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        said.contains("payment ready  5 sat\nfee            up to 1 sat (20%)"),
+        "{said}"
+    );
+    assert!(
+        said.contains("Hand the payment to the recipient."),
+        "{said}"
+    );
+    let payment = ok(output);
     let received = ok(wallet(&carol, &["--json", "receive"], Some(&payment)));
     let received: Value = serde_json::from_str(&received).unwrap();
     assert_eq!(received["amount"], 5);

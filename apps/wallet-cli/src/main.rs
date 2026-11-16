@@ -1,7 +1,7 @@
 //! `licash-wallet`: pay and get paid through Licash hubs.
 
 use std::{
-    io::{Read, Write},
+    io::{IsTerminal, Read, Write},
     path::{Path, PathBuf},
     process::ExitCode,
     sync::Arc,
@@ -62,10 +62,10 @@ struct Cli {
     #[arg(long, global = true, env = "LICASH_WALLET_RENEW_PPM",
           default_value_t = licash_wallet::RENEW_PPM)]
     renew_ppm: u32,
-    /// Log lines on stderr as text or JSON, filtered by RUST_LOG (default
-    /// warn).
-    #[arg(long, global = true, env = "LICASH_WALLET_LOG", value_enum, default_value_t = Log::Text)]
-    log: Log,
+    /// Diagnostic logs on stderr as text or JSON (default: off). RUST_LOG
+    /// also enables diagnostics; explicit --log defaults to warn.
+    #[arg(long, global = true, env = "LICASH_WALLET_LOG", value_enum)]
+    log: Option<Log>,
     #[command(subcommand)]
     command: Command,
 }
@@ -107,7 +107,7 @@ enum Command {
     /// Pay the payee of a payment code AMOUNT, the hub's fee on top, at a
     /// hub it names that this wallet trusts and holds enough at, else once
     /// a swap through a provider announced on Nostr brought it there: sent
-    /// to the payee's mailbox, else printed to hand over (its id on stderr).
+    /// to the payee's mailbox, else printed to hand over.
     Pay {
         code: String,
         /// In satoshis [default: what the code asks for].
@@ -119,6 +119,9 @@ enum Command {
         /// but a payment needing a swap is refused, saying its fees].
         #[arg(long)]
         max_fee: Option<u64>,
+        /// Also show the payment ID and the hub's full URL.
+        #[arg(long)]
+        details: bool,
     },
     /// Receive the payments sent to the wallet's mailbox, on the relays its
     /// hubs name, and unlink their notes.
@@ -127,8 +130,11 @@ enum Command {
     AddHub { url: String },
     /// The hubs trusted, and their fees.
     Hubs,
-    /// What the wallet holds, by hub.
-    Balance,
+    /// Available balance; --details shows where it is held.
+    Balance {
+        #[arg(long)]
+        details: bool,
+    },
     /// Pay AMOUNT to ADDRESS, the hub's fee on top, and print the payment
     /// to hand the payee (its id on stderr).
     Send {
@@ -471,13 +477,19 @@ fn main() -> ExitCode {
     }
 }
 
-fn logging(format: Log) {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
+fn log_filter(format: Option<Log>, rust_log: Option<&str>) -> EnvFilter {
+    rust_log
+        .and_then(|value| EnvFilter::try_new(value).ok())
+        .unwrap_or_else(|| EnvFilter::new(if format.is_some() { "warn" } else { "off" }))
+}
+
+fn logging(format: Option<Log>) {
+    let filter = log_filter(format, std::env::var("RUST_LOG").ok().as_deref());
     let logs = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
         .with_writer(std::io::stderr);
-    match format {
+    match format.unwrap_or(Log::Text) {
         Log::Text => logs.init(),
         Log::Json => logs.json().init(),
     }
@@ -563,10 +575,11 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             amount,
             out,
             max_fee,
+            details,
         } => {
             let route = route(tor.clone(), cli.proxy.as_deref())?;
             let out = out.as_deref();
-            pay(&wallet, &route, &code, amount, max_fee, out, json).await?;
+            pay(&wallet, &route, &code, amount, max_fee, out, json, details).await?;
         }
         Command::Mailbox => {
             let route = route(tor.clone(), cli.proxy.as_deref())?;
@@ -616,32 +629,37 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             });
             show(json, rows.collect(), lines.collect::<Vec<_>>().join("\n"));
         }
-        Command::Balance => {
+        Command::Balance { details } => {
             let balance = wallet.balance()?;
             let rows = balance
                 .iter()
                 .map(|b| json!({ "hub": b.hub, "available": b.available, "pending": b.pending }));
             let total: u64 = balance.iter().map(|b| b.available).sum();
-            // The total first, then where it is.
-            let mut lines = vec![format!("total  {}", say::sat(total))];
-            lines.extend(balance.iter().map(|b| match b.pending {
-                0 => format!("{}  {}", b.hub, say::sat(b.available)),
-                p => format!(
-                    "{}  {} ({} pending)",
-                    b.hub,
-                    say::sat(b.available),
-                    say::sat(p)
-                ),
-            }));
+            let mut lines = vec![format!("balance  {}", say::sat(total))];
+            let pending: u64 = balance.iter().map(|b| b.pending).sum();
+            if pending > 0 {
+                lines.push(format!("pending  {}", say::sat(pending)));
+            }
+            if details {
+                lines.extend(balance.iter().map(|b| match b.pending {
+                    0 => format!("{}  {}", b.hub, say::sat(b.available)),
+                    p => format!(
+                        "{}  {} ({} pending)",
+                        b.hub,
+                        say::sat(b.available),
+                        say::sat(p)
+                    ),
+                }));
+            }
             // Left at hubs visited to pay there, apart from the total (and
             // from the JSON rows, which sum to it) until added.
             for b in wallet.visited_balance()? {
                 if b.available + b.pending > 0 {
                     let held = b.available + b.pending;
                     lines.push(format!(
-                        "{}  {} (not added: add-hub to count it)",
-                        b.hub,
-                        say::sat(held)
+                        "not counted  {} at {} (hub not added: add-hub to count it)",
+                        say::sat(held),
+                        b.hub
                     ));
                 }
             }
@@ -1271,6 +1289,7 @@ async fn resume(wallet: &Wallet<Http>, json: bool) -> anyhow::Result<()> {
 /// once a swap brought it there, fees of `max_fee` at most: sent to its
 /// mailbox on the relays that hub names, if it has one, else written to
 /// `out` or stdout to hand over. A swap is only made with a `max_fee`.
+#[allow(clippy::too_many_arguments)]
 async fn pay(
     wallet: &Wallet<Http>,
     route: &Route,
@@ -1279,35 +1298,62 @@ async fn pay(
     max_fee: Option<u64>,
     out: Option<&Path>,
     json: bool,
+    details: bool,
 ) -> anyhow::Result<()> {
     let code: PaymentCode = text.parse()?;
+    let progress = !json && std::io::stderr().is_terminal();
+    if progress {
+        eprintln!("Preparing payment…");
+    }
     let plan = licash_nostr::wallet::plan(wallet, &code, amount, route).await?;
     let fees = plan.fees();
     if let Some(swap) = &plan.swap {
         let (provider, quote) = (&swap.provider, &swap.provider.quote);
-        let swapping = format!(
+        let technical = format!(
             "paying {} at {} swaps {} from {} through {} first",
             plan.amount, plan.hub, quote.amount, swap.from, provider.url
         );
-        let swapping = match plan.trusted {
-            true => swapping,
-            false => format!(
-                "{swapping}; {} is not a hub you added: what the swap brings past the payment stays there",
-                plan.hub
-            ),
+        let swapping = if json || details {
+            technical
+        } else {
+            format!("A swap is needed to send {}", say::sat(plan.amount))
+        };
+        let swapping = if plan.trusted {
+            swapping
+        } else {
+            format!("{swapping}; {} is not a hub you added: what the swap brings past the payment stays there", plan.hub)
         };
         if max_fee.is_none() {
-            bail!("{swapping}, {fees} sat in fees at most in all: pay again with --max-fee {fees}");
+            if json {
+                bail!("{swapping}, {fees} sat in fees at most in all: pay again with --max-fee {fees}");
+            }
+            bail!(
+                "{swapping}; fee up to {}: pay again with --max-fee {fees}",
+                say::fee_of(fees, plan.amount)
+            );
         }
-        eprintln!("{swapping}");
+        if json || details || !plan.trusted {
+            eprintln!("{swapping}");
+        }
     }
     if let Some(max) = max_fee.filter(|max| fees > *max) {
-        bail!("paying costs {fees} sat in fees at most, more than --max-fee {max}");
+        if json {
+            bail!("paying costs {fees} sat in fees at most, more than --max-fee {max}");
+        }
+        bail!(
+            "fee up to {} exceeds --max-fee {max}",
+            say::fee_of(fees, plan.amount)
+        );
+    }
+    if progress {
+        eprintln!("Sending {}…", say::sat(plan.amount));
     }
     let paid = licash_nostr::wallet::pay_planned(wallet, &code, &plan, || Ok(route.clone()));
     let paid = paid.await?;
     let (id, hub, amount) = (&paid.paid.id, &paid.hub, paid.amount);
-    eprintln!("payment {id}");
+    if json || details {
+        eprintln!("payment {id}");
+    }
     if let Some(reason) = &paid.undelivered {
         eprintln!("warning: not sent to the payee's mailbox ({reason}): hand it over");
     }
@@ -1316,11 +1362,31 @@ async fn pay(
             json,
             json!({ "id": id, "hub": hub, "amount": amount, "relays": relays }),
             format!(
-                "paid {} at {hub}: sent to the payee's mailbox",
-                say::sat(amount)
-            ),
+                "sent to mailbox  {}\nfee              {}{}",
+                say::sat(amount),
+                if fees == 0 {
+                    String::new()
+                } else {
+                    "up to ".into()
+                },
+                say::fee_of(fees, amount)
+            ) + &if details {
+                format!("\nhub              {hub}")
+            } else {
+                String::new()
+            },
         ),
-        None => write_payment(&paid.paid.payment, out)?,
+        None => {
+            write_payment(&paid.paid.payment, out)?;
+            if !json {
+                eprintln!(
+                    "payment ready  {}\nfee            {}{}\nHand the payment to the recipient.",
+                    say::sat(amount),
+                    if fees == 0 { "" } else { "up to " },
+                    say::fee_of(fees, amount)
+                );
+            }
+        }
     }
     // Its change, linked to it until then.
     unlink(wallet).await;
@@ -1699,4 +1765,20 @@ fn default_path() -> anyhow::Result<PathBuf> {
         .or_else(|| std::env::var_os("HOME").map(|home| Path::new(&home).join(".local/share")))
         .context("no wallet file: give --wallet")?;
     Ok(data.join("licash").join("wallet.sqlite"))
+}
+
+#[cfg(test)]
+mod presentation_tests {
+    use super::*;
+
+    #[test]
+    fn diagnostics_are_opt_in_and_keep_explicit_filters() {
+        assert_eq!(log_filter(None, None).to_string(), "off");
+        assert_eq!(log_filter(Some(Log::Text), None).to_string(), "warn");
+        assert_eq!(log_filter(Some(Log::Json), None).to_string(), "warn");
+        assert_eq!(
+            log_filter(None, Some("nostr_sdk=debug")).to_string(),
+            "nostr_sdk=debug"
+        );
+    }
 }

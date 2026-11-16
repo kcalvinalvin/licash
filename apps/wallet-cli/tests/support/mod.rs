@@ -551,6 +551,8 @@ pub fn wallet(wallet: &Path, args: &[&str], input: Option<&str>) -> Output {
         .env_remove("LICASH_WALLET_PROXY")
         .env_remove("LICASH_WALLET_CHAIN")
         .env_remove("LICASH_WALLET_RENEW_PPM")
+        .env_remove("LICASH_WALLET_LOG")
+        .env_remove("RUST_LOG")
         // Its hubs follow regtest.
         .env("LICASH_WALLET_NETWORK", "regtest")
         .stdin(Stdio::piped())

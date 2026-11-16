@@ -42,6 +42,16 @@ visited only if it proves it is the hub the code names: what the swap brings
 past the payment stays there, apart from the hubs added, until `add-hub`:
 `balance` shows it after the total, outside it and its `--json` rows.
 
+Normal output stays short: `balance` shows the available amount and any
+pending or uncounted funds; `balance --details` adds the full per-hub
+breakdown. `pay` reports mailbox delivery and the fee bound (sat and a
+percentage of the payment), not whether the recipient has collected it.
+`pay --details` adds the payment ID and hub URL. Payments that must be
+handed over still go unchanged to stdout or `--out`, with instructions on
+stderr. Progress appears on an interactive terminal only. Diagnostic logs
+are off unless requested with `--log text`, `--log json`, or `RUST_LOG`;
+delivery failures and actionable warnings remain visible without logging.
+
 A lock pays its payee on a secret's preimage until it expires, then returns
 to the payer: the payee runs `secret` and hands over the hash, the payer
 runs `lock <address> <amount> <hash>`, and the payee runs `claim <id>

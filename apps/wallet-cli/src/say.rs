@@ -29,6 +29,17 @@ pub fn plus(amount: u64, fee: u64) -> String {
     }
 }
 
+/// A cost and its share of the payment, without suggesting it was received.
+pub fn fee_of(fee: u64, amount: u64) -> String {
+    if fee == 0 {
+        return "None".into();
+    }
+    match share(fee, amount) {
+        Some(share) => format!("{} ({share})", sat(fee)),
+        None => sat(fee),
+    }
+}
+
 /// What `fee` is of `of`, to two significant digits: `0.24%`, `1.2%`,
 /// `12%`, `<0.01%` below. Nothing for no fee, or a fee of nothing.
 pub fn share(fee: u64, of: u64) -> Option<String> {
@@ -119,6 +130,9 @@ mod tests {
 
     #[test]
     fn a_fee_reads_as_a_share_of_what_it_is_on() {
+        assert_eq!(fee_of(0, 42), "None");
+        assert_eq!(fee_of(1, 42), "1 sat (2.4%)");
+        assert_eq!(fee_of(5, 0), "5 sat");
         assert_eq!(share(0, 100), None);
         assert_eq!(share(5, 0), None);
         assert_eq!(share(1, 1_000_000), Some("<0.01%".into()));
