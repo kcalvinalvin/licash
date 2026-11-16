@@ -226,6 +226,12 @@ func (n *Node) BlockHash(height uint32) (chainhash.Hash, error) {
 	return *hash, nil
 }
 
+// Header is the header of the best chain's block at height, from the
+// headers the node keeps: no block fetched.
+func (n *Node) Header(height uint32) (*wire.BlockHeader, error) {
+	return n.cs.BlockHeaders.FetchHeaderByHeight(height)
+}
+
 // BlockTime is the time the best chain's block at height claims.
 func (n *Node) BlockTime(height uint32) (time.Time, error) {
 	header, err := n.cs.BlockHeaders.FetchHeaderByHeight(height)

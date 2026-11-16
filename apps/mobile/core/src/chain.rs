@@ -2,7 +2,12 @@
 
 use std::{future::Future, sync::Arc};
 
-use bitcoin::{consensus::serialize, hashes::Hash, Block, BlockHash, Transaction};
+use bitcoin::{
+    block::Header,
+    consensus::{deserialize, serialize},
+    hashes::Hash,
+    Block, BlockHash, Transaction,
+};
 use licash::{chain::Checkpoint, spend::ChainProfile};
 use licash_wallet::Blocks as _;
 
@@ -19,6 +24,9 @@ pub trait ChainSource: Send + Sync {
     /// The time the best chain's block at `height` claims, in seconds since
     /// the Unix epoch.
     fn time(&self, height: u32) -> Result<i64, ChainError>;
+    /// The header of the best chain's block at `height`, its 80 bytes as
+    /// serialized: from the light client's headers, no block fetched.
+    fn header(&self, height: u32) -> Result<Vec<u8>, ChainError>;
     /// The basic compact filter (BIP158) of the block of `hash`, checked
     /// against the chain's filter headers.
     fn filter(&self, hash: Vec<u8>) -> Result<Vec<u8>, ChainError>;
@@ -109,12 +117,14 @@ impl licash_wallet::Blocks for Chain {
 }
 
 impl licash_contracts::holder::Chain for Chain {
-    /// From the light client's headers: the block at `height`, fetched
-    /// whole for its header, and the times of the eleven to it and of the
-    /// first of its retarget period.
+    /// From the light client's headers: the block at `height`'s, and the
+    /// times of the eleven to it and of the first of its retarget period.
     async fn checkpoint(&self, height: u32) -> Result<Checkpoint, String> {
         let hash = self.hash(height).await?;
-        let header = self.block(&hash).await?.header;
+        let header = licash_contracts::holder::Chain::header(self, height).await?;
+        if header.block_hash() != hash {
+            return Err("the chain changed while its checkpoint was read: try again".into());
+        }
         let mut times = Vec::new();
         for at in height.saturating_sub(10)..=height {
             times.push(self.time(at).await?);
@@ -134,5 +144,95 @@ impl licash_contracts::holder::Chain for Chain {
     async fn broadcast(&self, tx: &Transaction) -> Result<(), String> {
         let tx = serialize(tx);
         blocking(&self.0, move |c| c.broadcast(tx)).await
+    }
+
+    /// From the light client's headers, no block fetched: a forced
+    /// close's statement reads thousands of them.
+    async fn header(&self, height: u32) -> Result<Header, String> {
+        let bytes = blocking(&self.0, move |c| c.header(height)).await?;
+        deserialize(&bytes).map_err(|e| format!("the header of block {height}: {e}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitcoin::{
+        block::Version, blockdata::constants::genesis_block, CompactTarget, Network, TxMerkleNode,
+    };
+    use licash_contracts::holder::Chain as _;
+
+    /// Regtest headers on genesis, mined, and no block to fetch.
+    struct Headers(Vec<Header>);
+
+    impl Headers {
+        fn new(n: usize) -> Self {
+            let mut headers = vec![genesis_block(Network::Regtest).header];
+            while headers.len() < n {
+                let prev = headers.last().unwrap();
+                let mut header = Header {
+                    version: Version::from_consensus(4),
+                    prev_blockhash: prev.block_hash(),
+                    merkle_root: TxMerkleNode::all_zeros(),
+                    time: prev.time + 600,
+                    bits: CompactTarget::from_consensus(0x207f_ffff),
+                    nonce: 0,
+                };
+                while header.validate_pow(header.target()).is_err() {
+                    header.nonce += 1;
+                }
+                headers.push(header);
+            }
+            Self(headers)
+        }
+
+        fn at(&self, height: u32) -> Result<&Header, ChainError> {
+            self.0.get(height as usize).ok_or(ChainError::Failed {
+                reason: format!("no block {height}"),
+            })
+        }
+    }
+
+    impl ChainSource for Headers {
+        fn height(&self) -> Result<u32, ChainError> {
+            Ok(self.0.len() as u32 - 1)
+        }
+        fn hash(&self, height: u32) -> Result<Vec<u8>, ChainError> {
+            Ok(self.at(height)?.block_hash().to_byte_array().to_vec())
+        }
+        fn time(&self, height: u32) -> Result<i64, ChainError> {
+            Ok(self.at(height)?.time.into())
+        }
+        fn header(&self, height: u32) -> Result<Vec<u8>, ChainError> {
+            Ok(serialize(self.at(height)?))
+        }
+        fn filter(&self, _: Vec<u8>) -> Result<Vec<u8>, ChainError> {
+            unreachable!("no filter is read")
+        }
+        fn block(&self, _: Vec<u8>) -> Result<Vec<u8>, ChainError> {
+            unreachable!("no block is fetched")
+        }
+        fn broadcast(&self, _: Vec<u8>) -> Result<(), ChainError> {
+            unreachable!()
+        }
+        fn unconfirmed(&self, _: Vec<u8>) -> Result<Vec<u8>, ChainError> {
+            unreachable!()
+        }
+    }
+
+    /// A checkpoint and the headers a forced close's statement reads come
+    /// from the light client's headers, no block fetched.
+    #[test]
+    fn headers_and_checkpoints_are_read_without_their_blocks() {
+        let source = Arc::new(Headers::new(14));
+        let chain = Chain(source.clone(), ChainProfile::Core30DefaultRegtest);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            assert_eq!(chain.header(13).await.unwrap(), source.0[13]);
+            assert!(chain.header(14).await.is_err());
+            let checkpoint = chain.checkpoint(13).await.unwrap();
+            assert_eq!(checkpoint.height(), 13);
+            assert_eq!(checkpoint.header()[..], serialize(&source.0[13])[..]);
+        });
     }
 }

@@ -372,6 +372,17 @@ impl ChainSource for Light {
         }
     }
 
+    /// Its block's header, no block counted as fetched.
+    fn header(&self, height: u32) -> Result<Vec<u8>, ChainError> {
+        let backend = self.backend.lock().unwrap();
+        match backend.chain.blocks.get(height as usize) {
+            Some(block) => Ok(serialize(&block.header)),
+            None => Err(ChainError::Failed {
+                reason: format!("no block {height}"),
+            }),
+        }
+    }
+
     fn filter(&self, hash: Vec<u8>) -> Result<Vec<u8>, ChainError> {
         let block = self.block_of(&hash)?;
         let backend = self.backend.lock().unwrap();

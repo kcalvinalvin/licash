@@ -185,6 +185,23 @@ func (c *Chain) Time(height int32) (int64, error) {
 	return t.Unix(), nil
 }
 
+// Header is the header of the best chain's block at height, its 80 bytes
+// as serialized: from the headers the node keeps, no block fetched.
+func (c *Chain) Header(height int32) ([]byte, error) {
+	if height < 0 {
+		return nil, fmt.Errorf("no block %d", height)
+	}
+	header, err := c.node.Header(uint32(height))
+	if err != nil {
+		return nil, err
+	}
+	var buf bytes.Buffer
+	if err := header.Serialize(&buf); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
 // Filter is the basic compact filter (BIP158) of the block of hash,
 // checked against its filter header.
 func (c *Chain) Filter(hash []byte) ([]byte, error) {

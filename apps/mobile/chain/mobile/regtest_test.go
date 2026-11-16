@@ -165,6 +165,34 @@ func TestRegtestBlockTimesAreTheHeaders(t *testing.T) {
 	}
 }
 
+func TestRegtestHeadersAreCoresWithoutTheirBlocks(t *testing.T) {
+	c, err := Start("regtest", t.TempDir(), os.Getenv("LICASH_BITCOIND_P2P"), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.Stop() }()
+	for deadline := time.Now().Add(90 * time.Second); ; time.Sleep(200 * time.Millisecond) {
+		height, err := c.Height()
+		if err == nil && c.Synced() && fmt.Sprint(height) == core(t, "getblockcount") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out syncing")
+		}
+	}
+	hash := core(t, "getblockhash", "100")
+	header, err := c.Header(100)
+	if err != nil || hex.EncodeToString(header) != core(t, "getblockheader", hash, "false") {
+		t.Fatalf("block 100's header %x: %v", header, err)
+	}
+	height, _ := c.Height()
+	for _, bad := range []int32{-1, height + 1} {
+		if _, err := c.Header(bad); err == nil {
+			t.Errorf("header of block %d", bad)
+		}
+	}
+}
+
 func TestRegtestTheLogFileHoldsTheLightClients(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "chain.log")
 	if err := SetLog(path); err != nil {

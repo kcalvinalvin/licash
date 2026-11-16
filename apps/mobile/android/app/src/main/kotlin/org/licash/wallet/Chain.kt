@@ -10,6 +10,8 @@ class GoChain(private val light: LightClient) : ChainSource {
 
     override fun hash(height: UInt): ByteArray = call { light.hash(height.toInt()) }
 
+    override fun header(height: UInt): ByteArray = call { light.header(height.toInt()) }
+
     override fun time(height: UInt): Long = call { light.time(height.toInt()) }
 
     override fun filter(hash: ByteArray): ByteArray = call { light.filter(hash) }
