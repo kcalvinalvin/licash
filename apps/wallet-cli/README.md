@@ -108,9 +108,9 @@ price the range gives; `--coin TXID:VOUT` names the coin to pay from. Several co
 own coin. `contracts` lists them; with `--chain`, it carries on those under
 way and sees where each one's funding stands. On regtest, contracts are
 under a mock proof authority: such a contract protects nothing. On signet
-they are under the genuine programs, a trial this wallet cannot recover
-with yet (the hub's README says what else it lacks). No other network for
-now.
+they are under the genuine programs, a trial: `force-close` below recovers
+from them, not yet tried on signet itself (the hub's README says what else
+it lacks). No other network for now.
 
 `force-close <id> --chain <url>` forces a live contract closed when its hub
 stopped answering (`<id>` is the contract's id, or its start): the wallet's
