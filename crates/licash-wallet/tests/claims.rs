@@ -124,6 +124,79 @@ async fn a_claim_takes_as_many_notes_as_it_may_hold() {
 }
 
 #[tokio::test]
+async fn coverage_previews_whole_notes_once_without_reserving_them() {
+    let net = network();
+    let p = party(&net, 1, &[100, 4]).await;
+    let requests = [(p.keyset, 70, 32), (p.keyset, 70, 32)];
+    assert_eq!(p.wallet.claimable_amounts(&requests).unwrap(), [68, 36]);
+    assert_eq!(available(&p.wallet), 104);
+    assert!(p.wallet.claimed_notes(&ID, &p.keyset).unwrap().is_empty());
+    let first = p.wallet.claim_notes(&ID, &p.keyset, 70, 32).unwrap();
+    assert_eq!(denominations(&first).iter().sum::<u64>(), 68);
+    assert_eq!(p.wallet.claimable_amounts(&requests).unwrap(), [36, 0]);
+    let second = p.wallet.claim_notes(&[8; 32], &p.keyset, 70, 32).unwrap();
+    assert_eq!(denominations(&second).iter().sum::<u64>(), 36);
+}
+
+#[tokio::test]
+async fn coverage_obeys_note_limits_caps_and_exact_keysets() {
+    let net = network();
+    let p = party(&net, 1, &[64]).await;
+    assert_eq!(
+        p.wallet.claimable_amounts(&[(p.keyset, 60, 32)]).unwrap(),
+        [0]
+    );
+    assert_eq!(
+        p.wallet.claimable_amounts(&[(p.keyset, 128, 0)]).unwrap(),
+        [0]
+    );
+    assert_eq!(
+        p.wallet.claimable_amounts(&[([9; 32], 128, 32)]).unwrap(),
+        [0]
+    );
+    let p = party(&net, 2, &[100]).await;
+    assert_eq!(
+        p.wallet
+            .claimable_amounts(&[(p.keyset, 1_000, 2), (p.keyset, 1_000, 1)])
+            .unwrap(),
+        [96, 4]
+    );
+}
+
+#[tokio::test]
+async fn coverage_excludes_notes_reserved_by_payments_unlinks_or_another_copy() {
+    let net = network();
+    let p = party(&net, 1, &[100, 4]).await;
+    let db = rusqlite::Connection::open(p._dir.path().join("w.sqlite")).unwrap();
+    db.execute(
+        "UPDATE notes SET session = 'unlink-in-progress' WHERE denom = 64",
+        [],
+    )
+    .unwrap();
+    db.execute("UPDATE notes SET gone_at = 1 WHERE denom = 32", [])
+        .unwrap();
+    db.execute(
+        "UPDATE notes SET spent_by = ?1 WHERE y IN (SELECT y FROM notes WHERE denom = 4 LIMIT 1)",
+        [&ID[..]],
+    )
+    .unwrap();
+    assert_eq!(
+        p.wallet
+            .claimable_amounts(&[(p.keyset, 1_000, 32)])
+            .unwrap(),
+        [4]
+    );
+    assert_eq!(
+        denominations(
+            &p.wallet
+                .claim_notes(&[8; 32], &p.keyset, 1_000, 32)
+                .unwrap()
+        ),
+        [4]
+    );
+}
+
+#[tokio::test]
 async fn a_recovery_claims_once_and_its_notes_come_back_when_given_up() {
     let net = network();
     let p = party(&net, 1, &[100]).await;

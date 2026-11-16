@@ -314,6 +314,80 @@ pub fn list(dir: &Path) -> Result<Vec<Contract>> {
     }
 }
 
+/// Precisely what live contracts can claim now, by id. Read signed opening
+/// terms rather than current hub offers. An unreadable or unsupported
+/// opening covers nothing; it never triggers recovery or reserves notes.
+pub fn coverage<T: Transport>(
+    wallet: &Wallet<T>,
+    dir: &Path,
+    contracts: &[Contract],
+    tip: u32,
+) -> Result<std::collections::HashMap<[u8; 32], u64>> {
+    let mut amounts = std::collections::HashMap::new();
+    if tip == 0 {
+        return Ok(amounts);
+    }
+    let Some(store) = Store::existing(dir)? else {
+        return Ok(amounts);
+    };
+    let trust = crate::trust(wallet.network())?;
+    let held = wallet.balance()?;
+    let secrets = wallet.contract_secrets();
+    let ctx = licash_contract::opening::Context { tip, trust };
+    let mut ids = Vec::new();
+    let mut claims = Vec::new();
+    for c in coverage_order(contracts, tip, &held) {
+        let read = || -> Result<_> {
+            let (state, _) = store.state(&c.id)?;
+            let opening = Holder::load(&state, secrets.seed, secrets.spend, &ctx)?.opening()?;
+            let parts = opening.base.parts();
+            ensure!(
+                trust.mock || parts.recipe.holder_program == trust.programs.holder,
+                "unsupported holder program"
+            );
+            Ok((
+                *parts.keyset.id(),
+                u64::from(parts.cap),
+                recovery::MAX_NOTES.min(parts.limits.max_authorizations as usize),
+            ))
+        };
+        match read() {
+            Ok(claim) => {
+                ids.push(c.id);
+                claims.push(claim);
+            }
+            Err(e) => {
+                tracing::warn!(id = %crate::hex_id(&c.id), "cannot count recovery coverage: {e:#}")
+            }
+        }
+    }
+    for (id, amount) in ids.into_iter().zip(wallet.claimable_amounts(&claims)?) {
+        if amount > 0 {
+            amounts.insert(id, amount);
+        }
+    }
+    Ok(amounts)
+}
+
+fn coverage_order<'a>(
+    contracts: &'a [Contract],
+    tip: u32,
+    held: &[licash_wallet::Balance],
+) -> Vec<&'a Contract> {
+    let mut live: Vec<_> = contracts
+        .iter()
+        .filter(|c| {
+            tip > 0
+                && c.live(tip)
+                && held
+                    .iter()
+                    .any(|at| at.hub.trim_end_matches('/') == c.hub.trim_end_matches('/'))
+        })
+        .collect();
+    live.sort_by_key(|c| (c.assert_height, c.id));
+    live
+}
+
 /// The output of a contract's F in `dir`, confirmed, paying `pays` sat
 /// to `script`: a deposit she had F pay her change into
 /// ([`Change::Notes`]), to take back should its notes never come, its
@@ -567,6 +641,50 @@ mod tests {
     use licash_wallet::{Blocks, Response};
 
     use super::*;
+
+    #[test]
+    fn coverage_uses_live_trusted_contracts_in_deadline_and_id_order() {
+        let contract = |id, deadline, fate| Contract {
+            id: [id; 32],
+            hub: "http://hub.example".into(),
+            phase: Phase::Funded,
+            mock: false,
+            deposit: OutPoint::null(),
+            value: 60_000,
+            price: 23_000,
+            cap: 4_096,
+            assert_height: deadline,
+            close_height: 500,
+            funding: None,
+            fate: Some(fate),
+            abandoned: None,
+            created_at: 0,
+        };
+        let mut other = contract(5, 320, Fate::Live);
+        other.hub = "http://other.example".into();
+        let all = [
+            contract(3, 400, Fate::Live),
+            contract(2, 380, Fate::Live),
+            contract(1, 400, Fate::Live),
+            contract(4, 350, Fate::Open),
+            other,
+        ];
+        let held = [licash_wallet::Balance {
+            hub: "http://hub.example/".into(),
+            available: 104,
+            pending: 1_000,
+        }];
+        let ids = |tip| {
+            coverage_order(&all, tip, &held)
+                .iter()
+                .map(|c| c.id[0])
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(300), [2, 1, 3]);
+        assert_eq!(ids(380), [1, 3]);
+        assert!(ids(400).is_empty());
+        assert!(ids(0).is_empty());
+    }
 
     /// No hub to reach.
     struct Nowhere;

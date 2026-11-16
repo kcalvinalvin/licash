@@ -39,6 +39,7 @@ import org.licash.core.Notes
 import org.licash.wallet.Engine
 import org.licash.wallet.Ui
 import org.licash.wallet.explain
+import org.licash.wallet.digits
 import org.licash.wallet.sat
 
 /** Where [Money] is `at`, for what is on Bitcoin: a hub's page is at its URL. */
@@ -93,7 +94,7 @@ fun Money(
         }
         val fail = { why: String -> error = why }
         when (at) {
-            null -> Summary(engine, ui, held, visited, go, fail) { changed++ }
+            null -> Summary(engine, ui, held, notes, visited, go, fail) { changed++ }
             ON_BITCOIN -> OnBitcoin(engine, ui, fail)
             else -> HubPage(
                 engine,
@@ -120,6 +121,7 @@ private fun Summary(
     engine: Engine,
     ui: Ui,
     held: List<Holding>,
+    notes: List<Notes>,
     visited: List<Holding>,
     go: (String?) -> Unit,
     fail: (String) -> Unit,
@@ -144,6 +146,7 @@ private fun Summary(
         Share(Glyphs.shield, colors.primary, PROTECTED, share.protected, "protected", PROTECTED_MEANS)
         Share(Glyphs.shieldOff, colors.onSurfaceVariant, NOT_PROTECTED, share.open, "credit", NOT_PROTECTED_MEANS)
     }
+    Line("Notes", digits(noteCount(notes)), tag = "note-count")
     Group("") {
         held.forEach { holding ->
             Entry(
@@ -182,6 +185,8 @@ private fun Summary(
         }
     }
 }
+
+internal fun noteCount(notes: List<Notes>): ULong = notes.sumOf { it.count.toULong() }
 
 /** A share of the balance: its glyph and name, how much, and what it means on a tap. */
 @Composable

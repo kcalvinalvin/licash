@@ -34,7 +34,7 @@ const FORMAT: i64 = 1;
 
 /// The most notes a claim takes, as many as a claim's authorizations at
 /// most.
-const MAX_NOTES: usize = 32;
+pub(super) const MAX_NOTES: usize = 32;
 
 /// The timeout's fee coin pays this many times its fee at the rate she
 /// forced the contract closed at: the rate may rise over the hub's window.

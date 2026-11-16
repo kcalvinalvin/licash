@@ -8,10 +8,21 @@ import org.junit.Test
 import org.licash.core.Contract
 import org.licash.core.ContractState
 import org.licash.core.Rate
+import org.licash.core.Notes
 import org.licash.core.Recovery
 import org.licash.core.RecoveryStage
 
 class CoverTest {
+    @Test
+    fun note_count_counts_notes_not_their_denominations_across_hubs() {
+        assertEquals(0uL, noteCount(emptyList()))
+        assertEquals(7uL, noteCount(listOf(
+            Notes("https://one.example", 64uL, 2uL),
+            Notes("https://one.example", 4uL, 3uL),
+            Notes("https://two.example", 32uL, 2uL),
+        )))
+    }
+
     private val created = 1_800_000_000L
 
     private fun contract(state: ContractState, mock: Boolean = true) = Contract(

@@ -129,6 +129,13 @@ phone itself, for hours, carried on after any stop; that proof's last step
 saved from the row. The contracts are kept beside the wallet's file, made
 only once one is asked for.
 
+Coverage uses the actual whole-note recovery selection, not nominal caps:
+only settled, unreserved notes of the opening's keyset, at most 32 or its
+lower signed note limit. Notes are allocated once, earliest deadline first.
+Genuine current-image contracts count with external proving available;
+unreadable or unsupported openings count as zero. Balance details show the
+total number of held notes.
+
 Before its request is signed, Cancel closing asks for confirmation and
 releases the notes reserved by that attempt. It does not close the contract
 or recover Bitcoin; another attempt is possible while the contract permits

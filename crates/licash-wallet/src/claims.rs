@@ -13,7 +13,8 @@ use licash::{
     crypto::{Point, ScalarBytes},
     note::{Keyset, Message, Note, Ownership},
 };
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension};
+use std::collections::HashSet;
 
 use crate::{held, Error, Held, Transport, Wallet};
 
@@ -79,6 +80,24 @@ impl ClaimNote {
 }
 
 impl<T: Transport> Wallet<T> {
+    /// Preview successive recoveries `(keyset, cap, note limit)` in caller
+    /// order, from one read snapshot. Each eligible note is allocated once;
+    /// no notes are reserved and pending or in-use notes never count.
+    pub fn claimable_amounts(&self, claims: &[([u8; 32], u64, usize)]) -> Result<Vec<u64>, Error> {
+        self.store.read(|c| {
+            let mut used = HashSet::new();
+            claims
+                .iter()
+                .map(|(keyset, cap, max)| {
+                    let selected = select_notes(c, keyset, *cap, *max, &used)?;
+                    let amount = selected.iter().map(|(_, value)| value).sum();
+                    used.extend(selected.into_iter().map(|(y, _)| y));
+                    Ok(amount)
+                })
+                .collect()
+        })
+    }
+
     /// Take for the recovery of contract `id` the wallet's spendable notes
     /// of the keyset of id `keyset`: the largest first, as long as they
     /// come to `cap` at most, `max` of them at most. All or none: none if
@@ -105,28 +124,9 @@ impl<T: Transport> Wallet<T> {
                     "this recovery took its notes already".into(),
                 ));
             }
-            let mut stmt = t.prepare(
-                "SELECT y, denom FROM notes
-                 WHERE keyset = ?1 AND spent_by IS NULL AND session IS NULL AND gone_at IS NULL
-                 ORDER BY denom DESC, y",
-            )?;
-            let rows = stmt.query_map([keyset.id()], |r| {
-                Ok((r.get::<_, [u8; 33]>(0)?, r.get::<_, i64>(1)? as u64))
-            })?;
-            let (mut ys, mut sum) = (Vec::new(), 0u64);
-            for row in rows {
-                let (y, denom) = row?;
-                if ys.len() == max {
-                    break;
-                }
-                if sum + denom <= cap {
-                    sum += denom;
-                    ys.push(y);
-                }
-            }
-            drop(stmt);
+            let ys = select_notes(t, keyset.id(), cap, max, &HashSet::new())?;
             let mut notes = Vec::with_capacity(ys.len());
-            for y in &ys {
+            for (y, _) in &ys {
                 let taken = t.execute(
                     "UPDATE notes SET spent_by = ?1
                      WHERE y = ?2 AND spent_by IS NULL AND session IS NULL AND gone_at IS NULL",
@@ -218,6 +218,37 @@ impl<T: Transport> Wallet<T> {
         })?;
         Ok(Keyset::from_bytes(&bytes)?)
     }
+}
+
+/// Shared with the reserving path so display cannot invent fractional
+/// notes or a different greedy policy. `used` belongs only to a preview.
+fn select_notes(
+    c: &Connection,
+    keyset: &[u8; 32],
+    cap: u64,
+    max: usize,
+    used: &HashSet<[u8; 33]>,
+) -> Result<Vec<([u8; 33], u64)>, Error> {
+    let mut stmt = c.prepare(
+        "SELECT y, denom FROM notes
+         WHERE keyset = ?1 AND spent_by IS NULL AND session IS NULL AND gone_at IS NULL
+         ORDER BY denom DESC, y",
+    )?;
+    let rows = stmt.query_map([keyset], |r| {
+        Ok((r.get::<_, [u8; 33]>(0)?, r.get::<_, i64>(1)? as u64))
+    })?;
+    let (mut selected, mut left) = (Vec::new(), cap);
+    for row in rows {
+        if selected.len() == max {
+            break;
+        }
+        let (y, denom) = row?;
+        if !used.contains(&y) && denom <= left {
+            left -= denom;
+            selected.push((y, denom));
+        }
+    }
+    Ok(selected)
 }
 
 fn claim_note(c: &rusqlite::Connection, keyset: &Keyset, y: &[u8; 33]) -> Result<ClaimNote, Error> {

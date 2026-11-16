@@ -75,7 +75,7 @@ const val NOT_PROTECTED = "Not protected"
 
 /** What each means, where asked. */
 const val PROTECTED_MEANS =
-    "Yours whatever happens: on Bitcoin, or backed by bitcoin a hub has locked for you."
+    "On Bitcoin, or claimable from a live recovery contract. Coverage counts whole eligible notes within each contract's payout and note limits. Recovering can require fees and a computer-made proof before its deadline."
 const val NOT_PROTECTED_MEANS =
     "Held on credit: a hub owes it to you, on its word alone. Protect it, or cash it out to Bitcoin."
 
@@ -145,8 +145,8 @@ fun charge(rate: Rate): String = when {
 /** What protection under the mock authority is worth, said wherever one shows. */
 const val MOCK = "Test only: protects nothing"
 
-/** What genuine protection can do for now, said wherever one shows. */
-const val UNRECOVERED = "Recovery is not in this app yet: treat as not protected"
+/** A computer may be needed even when the contract counts as covered. */
+const val EXTERNAL_RECOVERY = "Recovery may need a computer"
 
 /**
  * A protection as a row says it: where it `stands`, in a word; whether it
@@ -176,7 +176,7 @@ fun cover(contract: Contract, height: Int): Cover {
         stands = when (state) {
             ContractState.Opening -> "Setting up"
             ContractState.Confirming -> "Confirming"
-            // A genuine one protects nothing this app can claim yet: live only.
+            // Keep the live status distinct from regtest's mock protection.
             ContractState.Protecting -> if (contract.mock) "Protecting" else "Live"
             ContractState.Ending -> "Ending"
             ContractState.Closed -> "Ended"

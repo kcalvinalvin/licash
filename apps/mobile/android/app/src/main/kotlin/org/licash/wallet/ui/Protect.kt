@@ -249,7 +249,7 @@ internal fun ForceSheet(c: Contract, held: ULong, force: () -> Unit, dismiss: ()
 @Composable
 internal fun Worth(mock: Boolean) {
     Text(
-        if (mock) MOCK else UNRECOVERED,
+        if (mock) MOCK else EXTERNAL_RECOVERY,
         modifier = Modifier.padding(bottom = 8.dp).testTag("worth"),
         style = MaterialTheme.typography.bodySmall,
         color = MaterialTheme.colorScheme.error,
