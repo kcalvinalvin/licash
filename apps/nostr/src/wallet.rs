@@ -9,9 +9,9 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{bail, Context};
+use anyhow::bail;
 use bitcoin::FeeRate;
-use futures_util::future::join_all;
+use futures_util::future::{join, join_all};
 use licash_api::{Info, Payment};
 use licash_wallet::{
     Error, HubId, Paid, PaymentCode, PayoutQuote, PayoutState, Received, SwapLimits, SwapQuote,
@@ -177,29 +177,25 @@ impl Announcements {
     }
 }
 
-/// A payment made to a payment code.
+/// A payment made to a payment code, its hub keeping it for the payee if
+/// [`Paid::kept`]: [`deliver`] mails it to the payee's mailbox once due.
 #[derive(Debug)]
 pub struct CodePaid {
     pub paid: Paid,
     pub hub: String,
     pub amount: u64,
-    /// How many of the hub's relays took it for the payee's mailbox: none
-    /// if it was not sent there, and must be handed over.
-    pub delivered: Option<usize>,
-    /// Why it was not sent to the mailbox the code names.
-    pub undelivered: Option<String>,
 }
 
 /// Pay `amount`, or the amount the code asks, to the wallet of `code` in
-/// notes, at a hub it names that `wallet` trusts and holds enough at, then
-/// send the payment to the payee's mailbox on that hub's relays, reached
-/// through `route`. Refused, saying where to pay on Bitcoin if the code
-/// says, when no such hub is named.
+/// notes, at a hub it names that `wallet` trusts and holds enough at, its
+/// hub asked to keep the payment for the payee ([`Wallet::pay_code`]).
+/// Returned once its hub released it: nothing is mailed here, but by
+/// [`deliver`]. Refused, saying where to pay on Bitcoin if the code says,
+/// when no such hub is named.
 pub async fn pay<T: Transport>(
     wallet: &Wallet<T>,
     code: &PaymentCode,
     amount: Option<u64>,
-    route: impl FnOnce() -> anyhow::Result<Route>,
 ) -> anyhow::Result<CodePaid> {
     let amount = asked(wallet, code, amount)?;
     let hub = match &code.licash {
@@ -209,7 +205,7 @@ pub async fn pay<T: Transport>(
     let Some(hub) = hub else {
         return Err(unpayable(code, amount));
     };
-    send(wallet, code, hub, amount, route).await
+    send(wallet, code, hub, amount).await
 }
 
 /// How [`pay_planned`] pays a payment code in notes.
@@ -467,7 +463,6 @@ pub async fn pay_planned<T: Transport>(
     wallet: &Wallet<T>,
     code: &PaymentCode,
     plan: &Plan,
-    route: impl FnOnce() -> anyhow::Result<Route>,
 ) -> anyhow::Result<CodePaid> {
     let amount = asked(wallet, code, Some(plan.amount))?;
     if !plan.trusted {
@@ -496,7 +491,7 @@ pub async fn pay_planned<T: Transport>(
             _ => return Err(under_way(hub, None)),
         }
     }
-    send(wallet, code, plan.hub.clone(), amount, route).await
+    send(wallet, code, plan.hub.clone(), amount).await
 }
 
 /// Whether a swap to the hub at `hub` is under way.
@@ -546,72 +541,115 @@ fn unpayable(code: &PaymentCode, amount: u64) -> anyhow::Error {
     }
 }
 
-/// Pay `amount` to the wallet of `code` at `hub`, then send the payment to
-/// the payee's mailbox on that hub's relays, reached through `route`.
+/// Pay `amount` to the wallet of `code` at `hub`, kept there for the
+/// payee if the hub does.
 async fn send<T: Transport>(
     wallet: &Wallet<T>,
     code: &PaymentCode,
     hub: String,
     amount: u64,
-    route: impl FnOnce() -> anyhow::Result<Route>,
 ) -> anyhow::Result<CodePaid> {
     let Some(licash) = &code.licash else {
         return Err(unpayable(code, amount));
     };
-    let started = std::time::Instant::now();
-    let paid = wallet.send(&hub, &licash.address, amount).await?;
-    let sent = started.elapsed();
-    // At a hub visited too: the payee's.
-    let relays = wallet
-        .hubs()?
-        .into_iter()
-        .chain(wallet.visited()?)
-        .find(|(url, _)| *url == hub)
-        .map(|(_, info)| info.relays)
-        .unwrap_or_default();
-    let (delivered, undelivered) = match licash.mailbox {
-        Some(to) if !relays.is_empty() => {
-            let content = serde_json::to_string(&paid.payment)?;
-            let sent = async { mailbox::send(&to, &content, &relays, &route()?).await };
-            match sent.await {
-                Ok(relays) => (Some(relays), None),
-                Err(e) => (None, Some(format!("{e:#}"))),
-            }
-        }
-        Some(_) => (None, Some(format!("hub {hub} names no mailbox relays"))),
-        None => (None, None),
-    };
+    let started = Instant::now();
+    let paid = wallet.pay_code(&hub, licash, amount).await?;
     tracing::info!(
         hub = %hub,
-        sent = ?sent,
-        mailbox = ?started.elapsed() - sent,
-        relays = delivered.unwrap_or(0),
+        took = ?started.elapsed(),
+        kept = paid.kept,
         "paid a payment code"
     );
-    Ok(CodePaid {
-        paid,
-        hub,
-        amount,
-        delivered,
-        undelivered,
-    })
+    Ok(CodePaid { paid, hub, amount })
 }
 
-/// What [`collect`] found in the mailbox.
+/// Payments mailed at once, at most.
+const MAILING_AT_ONCE: usize = 4;
+
+/// What [`deliver`] mailed.
+#[derive(Debug, Default)]
+pub struct Delivered {
+    /// The payments mailed, by id, with how many relays took each.
+    pub mailed: Vec<(String, usize)>,
+    /// The payments not mailed, by id, and why: mailed again later.
+    pub failed: Vec<(String, String)>,
+}
+
+/// Mail the payments due to their payees' mailboxes ([`Wallet::due`]) on
+/// the relays their hubs name, reached through `route`, asked only if any
+/// is due, and record how it went. A while: call it out of the payer's
+/// way, now and then while [`Wallet::delivering`].
+pub async fn deliver<T: Transport>(
+    wallet: &Wallet<T>,
+    route: impl FnOnce() -> anyhow::Result<Route>,
+) -> anyhow::Result<Delivered> {
+    let due = wallet.due().await?;
+    let mut delivered = Delivered::default();
+    if due.is_empty() {
+        return Ok(delivered);
+    }
+    let route = match route() {
+        Ok(route) => route,
+        Err(e) => {
+            let why = format!("{e:#}");
+            for due in due {
+                wallet.mailed(&due.id, Err(why.clone()))?;
+                delivered.failed.push((due.id, why.clone()));
+            }
+            return Ok(delivered);
+        }
+    };
+    let started = Instant::now();
+    for due in due.chunks(MAILING_AT_ONCE) {
+        let mailing = due.iter().map(|due| async {
+            let content = serde_json::to_string(&due.payment)?;
+            mailbox::send(&due.mailbox, &content, &due.relays, &route).await
+        });
+        for (due, mailed) in due.iter().zip(join_all(mailing).await) {
+            let mailed = mailed.map_err(|e| format!("{e:#}"));
+            wallet.mailed(&due.id, mailed.clone())?;
+            match mailed {
+                Ok(relays) => delivered.mailed.push((due.id.clone(), relays)),
+                Err(why) => delivered.failed.push((due.id.clone(), why)),
+            }
+        }
+    }
+    tracing::info!(
+        took = ?started.elapsed(),
+        mailed = delivered.mailed.len(),
+        failed = delivered.failed.len(),
+        "mailed payments due"
+    );
+    Ok(delivered)
+}
+
+/// What [`collect`] found at the hubs and in the mailbox.
 #[derive(Debug, Default)]
 pub struct Collected {
-    /// The payments taken, oldest first.
+    /// The payments taken: those the hubs kept first ([`Wallet::collect_inbox`]),
+    /// then those mailed, oldest first.
     pub received: Vec<Received>,
     /// Mail not taken, by its identifier, and why.
     pub skipped: Vec<(String, String)>,
+    /// Where payments were not looked for, a hub's URL or [`MAILBOX`], and
+    /// why: looked for again next time.
+    pub failed: Vec<(String, String)>,
 }
 
-/// Take the payments in `wallet`'s mailbox, on the relays its hubs name,
-/// reached through `route`: each once, whenever asked again.
+/// Where [`Collected::failed`] names the mailbox.
+pub const MAILBOX: &str = "mailbox";
+
+/// Take the payments the hubs `wallet` trusts keep for it, and those in
+/// its mailbox, on the relays its hubs name, reached through `route`, at
+/// once: each once, whenever asked again. Refused only if the mailbox
+/// was not looked through and no hub keeps payments.
 pub async fn collect<T: Transport>(wallet: &Wallet<T>, route: &Route) -> anyhow::Result<Collected> {
-    let relays = mailbox_relays(wallet)?;
-    let mail = mailbox::fetch(&wallet.mailbox_secret(), &relays, route).await?;
-    Ok(take(wallet, mail, |_| {}))
+    let fetch = async {
+        let relays = mailbox_relays(wallet)?;
+        mailbox::fetch(&wallet.mailbox_secret(), &relays, route).await
+    };
+    let (inboxed, mail) = join(wallet.collect_inbox(), fetch).await;
+    collected(wallet, inboxed?, mail, |_| {})
 }
 
 /// [`collect`], looking through `kept`, the mailbox kept connected between
@@ -624,26 +662,54 @@ pub async fn collect_kept<T: Transport>(
     route: &Route,
     kept: &mut Option<mailbox::Mailbox>,
 ) -> anyhow::Result<Collected> {
-    let relays = mailbox_relays(wallet)?;
-    let secret = wallet.mailbox_secret();
-    let fetched = match kept.as_ref().filter(|m| m.is(&secret, &relays)) {
-        Some(mailbox) => mailbox.fetch().await.map_err(|e| {
-            tracing::info!("the mailbox kept, opened anew: {e:#}");
-        }),
-        None => Err(()),
-    };
-    let mail = match fetched {
-        Ok(mail) => mail,
-        Err(()) => {
-            if let Some(old) = kept.take() {
-                old.close().await;
+    let fetch = async {
+        let relays = mailbox_relays(wallet)?;
+        let secret = wallet.mailbox_secret();
+        let fetched = match kept.as_ref().filter(|m| m.is(&secret, &relays)) {
+            Some(mailbox) => mailbox.fetch().await.map_err(|e| {
+                tracing::info!("the mailbox kept, opened anew: {e:#}");
+            }),
+            None => Err(()),
+        };
+        match fetched {
+            Ok(mail) => anyhow::Ok(mail),
+            Err(()) => {
+                if let Some(old) = kept.take() {
+                    old.close().await;
+                }
+                let mailbox = kept.insert(mailbox::Mailbox::open(&secret, &relays, route).await?);
+                mailbox.fetch().await
             }
-            let mailbox = kept.insert(mailbox::Mailbox::open(&secret, &relays, route).await?);
-            mailbox.fetch().await?
         }
     };
-    let mailbox = kept.as_ref().context("a mailbox kept")?;
-    Ok(take(wallet, mail, |id| mailbox.done(id)))
+    let (inboxed, mail) = join(wallet.collect_inbox(), fetch).await;
+    let mailbox = kept.as_ref();
+    collected(wallet, inboxed?, mail, |id| {
+        if let Some(mailbox) = mailbox {
+            mailbox.done(id);
+        }
+    })
+}
+
+/// What `inboxed` took, and the payments of `mail` taken as [`take`] does:
+/// refused for the mailbox's failure if no hub keeps payments.
+fn collected<T: Transport>(
+    wallet: &Wallet<T>,
+    inboxed: licash_wallet::Inboxed,
+    mail: anyhow::Result<Vec<mailbox::Mail>>,
+    done: impl FnMut(&str),
+) -> anyhow::Result<Collected> {
+    let mut collected = Collected {
+        received: inboxed.received,
+        skipped: Vec::new(),
+        failed: inboxed.failed,
+    };
+    match mail {
+        Ok(mail) => take(wallet, mail, done, &mut collected),
+        Err(e) if inboxed.served == 0 => return Err(e),
+        Err(e) => collected.failed.push((MAILBOX.into(), format!("{e:#}"))),
+    }
+    Ok(collected)
 }
 
 /// The relays `wallet`'s mailbox is on: those its hubs name.
@@ -655,15 +721,15 @@ fn mailbox_relays<T: Transport>(wallet: &Wallet<T>) -> anyhow::Result<Vec<String
     Ok(relays)
 }
 
-/// The payments of `mail` `wallet` takes, each once, told to `done` by
-/// their mail's identifier as are those taken before and those that are
-/// no payment: none of which to take again.
+/// The payments of `mail` `wallet` takes, each once, into `collected`,
+/// told to `done` by their mail's identifier as are those taken before and
+/// those that are no payment: none of which to take again.
 fn take<T: Transport>(
     wallet: &Wallet<T>,
     mail: Vec<mailbox::Mail>,
     mut done: impl FnMut(&str),
-) -> Collected {
-    let mut collected = Collected::default();
+    collected: &mut Collected,
+) {
     for mail in mail {
         let Ok(payment) = serde_json::from_str::<Payment>(&mail.content) else {
             done(&mail.id);
@@ -680,7 +746,6 @@ fn take<T: Transport>(
             Err(e) => collected.skipped.push((mail.id, format!("not taken: {e}"))),
         }
     }
-    collected
 }
 
 /// The relays `wallet`'s hubs name, each once, in the order of its hubs.

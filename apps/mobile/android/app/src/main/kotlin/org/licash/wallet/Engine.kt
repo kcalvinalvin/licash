@@ -95,6 +95,8 @@ data class Ui(
     val watch: Watch = Watch.NONE,
     /** When a Lightning invoice was last asked, in seconds since the epoch. */
     val asked: Long? = null,
+    /** Payments made still on their way to their payees: kept at their hubs, or to mail. */
+    val onTheirWay: UInt = 0u,
 )
 
 /** A line of the history's own key: lines of different kinds can share an id. */
@@ -623,7 +625,13 @@ class Engine(context: Context) {
                 val noteMaintenance = runCatching { it.noteMaintenanceNeeded() }
                     .onFailure { e -> AppLog.warn("reading future note work", e) }
                     .getOrDefault(state.value.noteMaintenance)
-                Shown(it.network(), it.balance(), history, it.hubs(), raised, it.tor(), contracts, recoveries, under, noteMaintenance)
+                val onTheirWay = runCatching { it.onTheirWay() }
+                    .onFailure { e -> AppLog.warn("reading the payments on their way", e) }
+                    .getOrDefault(state.value.onTheirWay)
+                Shown(
+                    it.network(), it.balance(), history, it.hubs(), raised, it.tor(), contracts, recoveries, under,
+                    noteMaintenance, onTheirWay,
+                )
             }
         }.onFailure { AppLog.warn("reading the wallet", it) }.getOrNull()
         state.update {
@@ -650,6 +658,7 @@ class Engine(context: Context) {
                     under = shown.under,
                     noteMaintenance = shown.noteMaintenance,
                     asked = prefs.askedAt,
+                    onTheirWay = shown.onTheirWay,
                 )
             }
         }
@@ -703,6 +712,7 @@ class Engine(context: Context) {
         val recoveries: List<Recovery>,
         val under: Map<String, Details>,
         val noteMaintenance: Boolean,
+        val onTheirWay: UInt,
     )
 
     /** A new wallet of the network chosen, born at the chain's height if known. */
@@ -714,6 +724,94 @@ class Engine(context: Context) {
             AppLog.info("wallet made at block $birthday")
         }
         lightLock.withLock { startLight() }
+        refresh()
+        poke()
+    }
+
+    /** The 24 words restoring this wallet's keys: secret, shown only when asked, never logged. */
+    suspend fun backupPhrase(): Result<List<String>> = io { local { it.backupPhrase() }.split(" ") }
+
+    /**
+     * Everything this wallet holds as it is now, saved `to` a file the user
+     * chose: unencrypted, private. Written whole to the cache first, so a
+     * failure leaves no half a backup behind as if it were one.
+     */
+    suspend fun exportBackup(to: Uri): Result<Unit> = io {
+        val made = File(app.cacheDir, "backup-${System.nanoTime()}.licash")
+        try {
+            locked { it.exportStateBundle(made.path) }
+            val out = app.contentResolver.openOutputStream(to, "wt") ?: error("that file cannot be written")
+            out.use { o -> made.inputStream().use { it.copyTo(o) } }
+            AppLog.info("full backup saved, ${made.length()} bytes")
+        } finally {
+            made.delete()
+        }
+    }
+
+    /** A wallet of the network chosen from its 24 words: its keys, and its coins once Bitcoin is looked through. */
+    suspend fun restorePhrase(words: List<String>): Result<Unit> = restored {
+        Wallet.fromPhrase(walletDir, words.joinToString(" "), prefs.network, prefs.tor)
+    }
+
+    /** The wallet a full backup `from` holds, of its own network. Never over a wallet there. */
+    suspend fun restoreBackup(from: Uri): Result<Unit> {
+        val copy = File(app.cacheDir, "restore-${System.nanoTime()}.licash")
+        return try {
+            io {
+                val input = app.contentResolver.openInputStream(from) ?: error("that file cannot be read")
+                input.use { i -> copy.outputStream().use { i.copyTo(it) } }
+            }.fold(
+                { restored { Wallet.fromStateBundle(walletDir, copy.path, prefs.tor) } },
+                { Result.failure(it) },
+            )
+        } finally {
+            copy.delete()
+        }
+    }
+
+    /**
+     * The wallet `open` makes, there being none: its network the app's from
+     * now on, and Tor as that network has it unless chosen.
+     */
+    private suspend fun restored(open: () -> Wallet): Result<Unit> = io {
+        mutex.withLock {
+            check(wallet == null && !walletExists(walletDir)) { "a wallet is here already" }
+            var w = open()
+            prefs.network = w.network()
+            if (w.tor() != prefs.tor) {
+                w.destroy()
+                w = Wallet.open(walletDir, prefs.tor)
+            }
+            wallet = configured(w)
+            hubsLearned = false
+            AppLog.info("wallet restored, of ${chainName(prefs.network)}")
+        }
+        lightLock.withLock { startLight() }
+        refresh()
+        poke()
+    }
+
+    /**
+     * Look through Bitcoin again, as asked: the wallet from its first block,
+     * the light client's blocks fetched afresh. Notes, contracts and what is
+     * under way are untouched. Refused, nothing changed, if the wallet's
+     * first block cannot be known yet.
+     */
+    suspend fun resetChain(): Result<Unit> = io {
+        lightLock.withLock {
+            mutex.withLock {
+                wallet?.let { w ->
+                    val from = w.rescanChain(light?.let { GoChain(it) } ?: NoChain)
+                    AppLog.info("looking through Bitcoin again" + (from?.let { " from block $it" } ?: ""))
+                }
+                stopLight()
+            }
+            val dir = File(files, "chain-${chainName(wallet?.network() ?: prefs.network)}")
+            dir.deleteRecursively()
+            AppLog.info("light client's blocks forgotten")
+            state.update { it.copy(chain = ChainStatus(), scanned = null) }
+            startLight()
+        }
         refresh()
         poke()
     }
@@ -762,12 +860,18 @@ class Engine(context: Context) {
 
     /** Where to see the transaction `txid`, if anywhere. */
     fun explorerLink(txid: String): String? {
+        return explorerBase()?.let { "$it/tx/$txid" }
+    }
+
+    fun explorerAddress(address: String): String? = explorerBase()?.let { "$it/address/$address" }
+
+    private fun explorerBase(): String? {
         val base = when (val chosen = prefs.explorer) {
             "default" -> explorer(state.value.network)
             "" -> null
             else -> chosen
         }
-        return base?.trimEnd('/')?.let { "$it/tx/$txid" }
+        return base?.trimEnd('/')
     }
 
     suspend fun scanned(text: String): Result<Scanned> = io { local { it.scanned(text) } }
@@ -903,6 +1007,8 @@ class Engine(context: Context) {
 
     /** What opening a recovery contract at `hub` costs now, and the coin that would pay it. */
     suspend fun contractQuote(hub: String): Result<ContractQuote> = io { local { it.contractQuote(hub) } }
+
+    suspend fun contractInspection(id: String): Result<org.licash.core.ContractInspection> = io { local { it.contractInspection(id) } }
 
     /** Planning from this wallet's signed terms; never starts a close. */
     suspend fun contractSafety(id: String): Result<org.licash.core.ContractSafety> = io {

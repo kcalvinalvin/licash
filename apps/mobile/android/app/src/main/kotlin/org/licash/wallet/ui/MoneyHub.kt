@@ -62,6 +62,8 @@ internal fun HubPage(
     var quote by remember { mutableStateOf<ContractQuote?>(null) }
     var ending by remember { mutableStateOf<Contract?>(null) }
     var forcing by remember { mutableStateOf<Contract?>(null) }
+    var canceling by remember { mutableStateOf<String?>(null) }
+    var cancelingBusy by remember { mutableStateOf(false) }
     val proofs by engine.prover.proofs.collectAsState()
     var fees by remember { mutableStateOf(false) }
     var moving by remember { mutableStateOf(false) }
@@ -101,11 +103,11 @@ internal fun HubPage(
                     ui.developer,
                     recovery = ui.recoveries.find { it.id == c.id },
                     safety = { engine.contractSafety(c.id).getOrNull() },
+                    inspection = { engine.contractInspection(c.id).getOrNull() },
+                    explorer = engine::explorerAddress,
                     end = { ending = c },
                     forceClose = { forcing = c },
-                    giveUp = {
-                        scope.launch { engine.giveUpRecovery(c.id).onFailure { fail(explain(it)) } }
-                    },
+                    giveUp = { canceling = c.id },
                     saveStatement = { to ->
                         scope.launch { engine.saveStatement(c.id, to).onFailure { fail(explain(it)) } }
                     },
@@ -203,6 +205,23 @@ internal fun HubPage(
                 engine.forceClose(c.id)
             },
             dismiss = { forcing = null },
+        )
+    }
+    canceling?.let { id ->
+        GiveUpSheet(
+            recovery = ui.recoveries.find { it.id == id },
+            busy = cancelingBusy,
+            confirm = {
+                cancelingBusy = true
+                scope.launch {
+                    engine.giveUpRecovery(id).fold(
+                        { canceling = null },
+                        { canceling = null; fail("Couldn't cancel closing: ${explain(it)}") },
+                    )
+                    cancelingBusy = false
+                }
+            },
+            dismiss = { if (!cancelingBusy) canceling = null },
         )
     }
     if (moving) {

@@ -8,10 +8,27 @@ import org.junit.Test
 import org.licash.core.Contract
 import org.licash.core.ContractState
 import org.licash.core.Rate
+import org.licash.core.Notes
 import org.licash.core.Recovery
 import org.licash.core.RecoveryStage
 
 class CoverTest {
+    @Test
+    fun a_corrected_recovery_shows_the_actual_sweep_not_the_original_claim() {
+        val done = recovery(RecoveryStage.DONE, true, null).copy(corrected = 0uL, received = 2_500uL)
+        assertEquals("2,500 sat back on Bitcoin", forcing(done, 1_000).says)
+    }
+
+    @Test
+    fun note_count_counts_notes_not_their_denominations_across_hubs() {
+        assertEquals(0uL, noteCount(emptyList()))
+        assertEquals(7uL, noteCount(listOf(
+            Notes("https://one.example", 64uL, 2uL),
+            Notes("https://one.example", 4uL, 3uL),
+            Notes("https://two.example", 32uL, 2uL),
+        )))
+    }
+
     private val created = 1_800_000_000L
 
     private fun contract(state: ContractState, mock: Boolean = true) = Contract(
@@ -119,6 +136,14 @@ class CoverTest {
         assertEquals("3,000 sat back on Bitcoin", forcing(recovery(RecoveryStage.DONE, true, null), 1_000).says)
         for (stage in listOf(RecoveryStage.ANSWERED, RecoveryStage.LOST)) {
             assertTrue(forcing(recovery(stage, true), 1_000).failed)
+        }
+    }
+
+    @Test
+    fun canceling_requires_an_unsigned_claim_and_never_a_later_stage() {
+        for (stage in RecoveryStage.entries) {
+            assertEquals(stage == RecoveryStage.CLAIMED, forcing(recovery(stage), 0).revocable)
+            assertFalse(forcing(recovery(stage, irrevocable = true), 0).revocable)
         }
     }
 

@@ -74,6 +74,9 @@ To name new ones, build them from a commit, rebuild them in another
 checkout to see the same image ids, copy each `r0/guests/<name>.bin` to
 `r0/programs/<image id>.bin`, and name them in `apps/contracts`, keeping
 the programs named before for the contracts opened under them.
+Archived binaries alone do not provide prior-holder-image verification in
+the wallet: that support and a genuine prior-image proof regression must
+land before changing the holder image or receipt-verifier parameters.
 
 ## Execute and prove
 

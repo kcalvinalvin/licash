@@ -16,6 +16,7 @@ import androidx.compose.material3.FilterChip
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -42,6 +43,7 @@ fun Onboarding(engine: Engine, ui: Ui) {
     var busy by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
     var peers by remember { mutableStateOf(engine.prefs.peers) }
+    var restoring by remember { mutableStateOf(false) }
     Column(
         Modifier.fillMaxSize().padding(horizontal = 32.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
@@ -91,7 +93,7 @@ fun Onboarding(engine: Engine, ui: Ui) {
         error?.let { Text(it, color = MaterialTheme.colorScheme.error, textAlign = TextAlign.Center) }
         BigButton(
             if (busy) "Creating…" else "Create wallet",
-            Modifier.fillMaxWidth().padding(bottom = 32.dp).testTag("create"),
+            Modifier.fillMaxWidth().testTag("create"),
             enabled = !busy,
         ) {
             busy = true
@@ -102,5 +104,13 @@ fun Onboarding(engine: Engine, ui: Ui) {
                 busy = false
             }
         }
+        TextButton(
+            onClick = { restoring = true },
+            modifier = Modifier.padding(top = 8.dp, bottom = 24.dp).testTag("restore-wallet"),
+            enabled = !busy,
+        ) { Text("Restore a wallet") }
+    }
+    if (restoring) {
+        Restore(engine) { restoring = false }
     }
 }

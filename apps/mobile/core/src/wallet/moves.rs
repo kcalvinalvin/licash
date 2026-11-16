@@ -252,6 +252,12 @@ pub(super) fn details(
         SwapState::Failed(why) => Some(why.clone()),
         _ => None,
     };
+    let locks = wallet.locks()?;
+    let lock_fee = swap
+        .lock
+        .as_ref()
+        .and_then(|id| locks.iter().find(|l| &l.id == id))
+        .map_or(0, |l| l.fee);
     Ok(Details::Swap {
         from: swap.from,
         to: swap.to,
@@ -259,6 +265,8 @@ pub(super) fn details(
         lock: swap.lock,
         theirs: swap.theirs,
         failure,
+        provider_fee: swap.fee,
+        lock_fee,
     })
 }
 

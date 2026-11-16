@@ -15,12 +15,46 @@ behind its (i). Times are said as times, never as blocks; ids, notes and
 providers show in advanced mode only. With no hub yet, Home lists the hubs
 announced on Nostr to pick from, or takes one by its address.
 
+Tap a fee in a payment review or its history for the amount, percentage,
+and supplied recipient split. Current direct-payment estimates show base
+plus percentage times amount, rounded up like the hub. Payouts and moves
+split their fee by who gets it, as quoted or recorded: the hub, the payout
+or swap provider, and the Bitcoin network for a payout's claim. Historical
+rates or splits that were not saved are identified as unavailable, never
+reconstructed from today's terms.
+
 Settings is one page: the hubs (each tapped for its fees, more added by
-address or found on Nostr), Bitcoin's state, Tor, About (the version, the
-storage used and the logs to export) and advanced mode, whose own page
-holds the notes, the log, the limit for renewing notes, the light client's
-settings and deleting the wallet. How the app looks and speaks, and the
-shared parts to build a screen of, are in [../../DESIGN.md](../../DESIGN.md).
+address or found on Nostr), Backup, Bitcoin's state, Tor, About (the
+version, the storage used and the logs to export) and advanced mode, whose
+own page holds the notes, the log, the limit for renewing notes, the light
+client's settings, resetting its chain state and deleting the wallet. How
+the app looks and speaks, and the shared parts to build a screen of, are in
+[../../DESIGN.md](../../DESIGN.md).
+
+## Backup and restore
+
+- **Recovery words**: 24 words, shown after a warning, kept out of
+  screenshots. They encode the wallet's existing 256-bit seed as BIP39
+  entropy (not a BIP39 PBKDF seed, so other wallets do not read them). They
+  bring back the keys and coins on Bitcoin only, scanning from block 1:
+  notes held at hubs and contracts need the backup file.
+- **Backup file**: everything the wallet holds as of when it is saved (the
+  wallet and contract databases, the instances a contract's recovery needs,
+  contacts), in a checksummed, unencrypted tar the user saves through the
+  system file picker. Tor state, proofs made on the phone and the light
+  client's blocks are left out. Payments after it are not in it. Restore a
+  backup on one phone only: two live copies can reuse one-time recovery
+  keys and lose money.
+- **Restore**, from the first screen: from a backup file (its network is
+  the wallet's) or from the recovery words (of the network chosen). It never
+  lands over existing wallet state; a backup this build cannot carry on
+  ("needs a newer version of the app") or one missing a file a recovery
+  needs is refused before anything is installed.
+- **Reset chain state**, in advanced mode, after a confirmation: the wallet
+  looks for payments again from its first block and the light client's
+  blocks are fetched afresh. Notes, contracts, recoveries and payments under
+  way are untouched. Nothing runs on its own: existing wallets see no change
+  until a backup, restore or reset is asked for.
 
 ## Build
 
@@ -146,6 +180,28 @@ phone itself, for hours, carried on after any stop; that proof's last step
 saved from the row. The contracts are kept beside the wallet's file, made
 only once one is asked for.
 
+Coverage uses the actual whole-note recovery selection, not nominal caps:
+only settled, unreserved notes of the opening's keyset, at most 32 or its
+lower signed note limit. Notes are allocated once, earliest deadline first.
+Genuine current-image contracts count with external proving available;
+unreadable or unsupported openings count as zero. Balance details show the
+total number of held notes.
+
+Unfold a signed contract for its locked value, payout-pool and reserve
+diagram, and a link to the contract address in the configured explorer.
+The claim cap is a limit inside the payout pool, not extra collateral.
+Technical details reveal the signed note limit, denominations, keyset,
+graph version and program identities. Earlier opening stages show progress
+rather than guessed signed details.
+Corrected recoveries show the unspent claim separately from the original
+claim. Once done, the returned amount is the actual sweep output, including
+the effect of reserves and fees, not the original claimed amount.
+
+Before its request is signed, Cancel closing asks for confirmation and
+releases the notes reserved by that attempt. It does not close the contract
+or recover Bitcoin; another attempt is possible while the contract permits
+it. Once signed, even an unconfirmed request cannot be canceled.
+
 Advanced settings has a holder-owned recovery planning margin (14 estimated
 days by default). An unfolded contract reads the signed terms to show when
 its request should confirm. This does not authorize automatic closing.
@@ -166,10 +222,13 @@ licash-wallet onchain scan        # coins paid on Bitcoin
 ## Logs and tests
 
 Payout deadlines are checked for every pending payout, independently of
-the ordinary progress display limit. An unreadable `deliveries.json`
-stops mailbox-delivery updates without replacing the file; restore it from
-a backup or inspect it before retrying. A missing file still means no
-pending deliveries, and valid existing files need no conversion.
+the ordinary progress display limit. A payment to a payment code is done
+once its hub releases it, kept there for the payee, who collects it at the
+hub and tells the payer so through it. One not collected within an hour,
+or that its hub does not keep, is sent to the payee's mailbox by the app
+in the background: the periodic job runs while any is on its way. The
+wallet file records where each stands; a `deliveries.json` left by an
+earlier version is no longer read.
 
 Settings, About, Export logs shares the app's log and the light client's as
 one file; Storage shows what the app keeps on the phone: the wallet, the Bitcoin

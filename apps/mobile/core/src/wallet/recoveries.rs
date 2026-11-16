@@ -61,6 +61,11 @@ pub struct Recovery {
     pub assertion: Option<String>,
     #[uniffi(default = None)]
     pub payout: Option<String>,
+    /// Corrected principal, distinct from the original claim and net sweep.
+    #[uniffi(default = None)]
+    pub corrected: Option<u64>,
+    #[uniffi(default = None)]
+    pub received: Option<u64>,
 }
 
 /// Where a forced close stands.
@@ -80,8 +85,7 @@ pub enum RecoveryStage {
     Sweeping,
     /// Its value back in the wallet on Bitcoin.
     Done,
-    /// The hub countered its request, which this app does not answer
-    /// yet.
+    /// A legacy counter awaiting reclassification on the next advance.
     Answered,
     /// The contract's collateral went elsewhere.
     Lost,
@@ -136,6 +140,8 @@ fn shown(r: &recovery::Recovery) -> Recovery {
         proved: r.proved,
         assertion: txid(r.assertion),
         payout: txid(r.payout),
+        corrected: r.corrected,
+        received: r.received,
     }
 }
 

@@ -2,6 +2,10 @@
 //! following a regtest chain of its own.
 
 mod chain;
+mod inbox;
+
+#[allow(unused_imports)]
+pub use inbox::Conduct;
 
 use std::{
     collections::HashMap,
@@ -19,7 +23,7 @@ use licash::{
 };
 use licash_api::{
     Check, Checked, Code, Fee, Hex, Issued, Lock, LockState, Locked, Offer, Offered, Payment,
-    Problem, Refund, Release, Released, Settle, Unlink, Unlinked,
+    Problem, Refund, Released, Settle, Unlink, Unlinked,
 };
 use licash_hub::{Error, Hub, Policy, Settled, Timing};
 use licash_wallet::{Response, Transport};
@@ -43,6 +47,7 @@ struct Site {
     db: PathBuf,
     policy: Policy,
     chain: Arc<Mutex<chain::Chain>>,
+    inbox: Arc<Mutex<inbox::Inbox>>,
 }
 
 /// The timing of the hubs' locks: short, to expire them in a test.
@@ -112,6 +117,7 @@ impl Net {
             db,
             policy,
             chain: Arc::new(Mutex::new(chain)),
+            inbox: Arc::default(),
         };
         self.sites.lock().unwrap().insert(url.into(), site);
         self.mine(url, 3, None);
@@ -162,6 +168,7 @@ impl Net {
             db: site.db.clone(),
             policy: site.policy,
             chain: site.chain.clone(),
+            inbox: site.inbox.clone(),
         };
         sites.insert(url.into(), alias);
     }
@@ -215,15 +222,32 @@ impl Net {
             }
             _ => {}
         }
-        let hub = self
-            .sites
-            .lock()
-            .unwrap()
-            .get(site)
-            .and_then(|s| s.hub.clone());
-        let hub = hub.ok_or("no such host")?;
+        let (hub, kept) = {
+            let sites = self.sites.lock().unwrap();
+            let site = sites.get(site).ok_or("no such host")?;
+            (site.hub.clone().ok_or("no such host")?, site.inbox.clone())
+        };
+        if path.starts_with(licash_api::inbox::INBOX) {
+            let answer = kept.lock().unwrap().serve(path, body.as_deref());
+            if let Some(Fault::Dropped) = fault {
+                return Err("connection reset".into());
+            }
+            return Ok(match answer {
+                // As the service answers a route it does not serve.
+                None => Response {
+                    status: 404,
+                    body: Vec::new(),
+                },
+                Some(Ok(body)) => Response { status: 200, body },
+                Some(Err(problem)) => Response {
+                    status: problem.code.status(),
+                    body: serde_json::to_vec(&problem).unwrap(),
+                },
+            });
+        }
         let answer = match (path, body) {
             (licash_api::INFO, None) => self.info(&hub),
+            (licash_api::RELEASE, Some(body)) => release(&hub, &kept, &body),
             (path, None) if path.starts_with("/v1/lock/") => lock_state(&hub, &path[9..]),
             (path, Some(body)) => post(&hub, path, &body),
             _ => Err(Problem::invalid("no such route")),
@@ -263,12 +287,6 @@ fn post(hub: &Hub, path: &str, body: &[u8]) -> Result<Vec<u8>, Problem> {
             let grant = hub.offer(&proposal, &notes).map_err(problem)?;
             serde_json::to_vec(&Offered::new(&grant)?)
         }
-        licash_api::RELEASE => {
-            let release: Release = serde_json::from_slice(body).map_err(json)?;
-            let (signed, notes) = release.decode(lookup)?;
-            let unlock = hub.release(&signed, &notes).map_err(problem)?;
-            serde_json::to_vec(&Released::new(&unlock))
-        }
         licash_api::UNLINK => {
             let unlink: Unlink = serde_json::from_slice(body).map_err(json)?;
             let answer = hub.unlink(&unlink.decode()?).map_err(problem)?;
@@ -299,6 +317,35 @@ fn post(hub: &Hub, path: &str, body: &[u8]) -> Result<Vec<u8>, Problem> {
         _ => return Err(Problem::invalid("no such route")),
     };
     Ok(answer.unwrap())
+}
+
+/// Released, then kept for its payee if asked, as the hub service does.
+fn release(hub: &Hub, kept: &Mutex<inbox::Inbox>, body: &[u8]) -> Result<Vec<u8>, Problem> {
+    let release: licash_api::inbox::Release =
+        serde_json::from_slice(body).map_err(|e| Problem::invalid(e.to_string()))?;
+    let (signed, notes) = release.release.decode(|id| hub.keyset(id))?;
+    if let Some(keep) = &release.keep {
+        keep.decode()?;
+    }
+    let unlock = hub.release(&signed, &notes).map_err(problem)?;
+    let kept = match &release.keep {
+        Some(keep) => {
+            let proposal = signed.proposal();
+            let receipt = licash_api::inbox::Receipt {
+                release: release.release.clone(),
+                unlock: Hex(unlock.to_vec()),
+            };
+            let ephemeral = proposal.ephemeral().0.to_vec();
+            let id = *proposal.id().as_bytes();
+            kept.lock().unwrap().keep(id, ephemeral, keep, receipt)?
+        }
+        None => false,
+    };
+    let released = licash_api::inbox::Released {
+        released: Released::new(&unlock),
+        kept,
+    };
+    Ok(serde_json::to_vec(&released).unwrap())
 }
 
 fn lock_state(hub: &Hub, id: &str) -> Result<Vec<u8>, Problem> {
@@ -351,6 +398,85 @@ impl Net {
     /// A payment of `amount` to `to` at the hub at `url`, its fee paid, from
     /// notes its keys made for someone outside any wallet.
     pub fn pay(&self, url: &str, to: &Address, amount: u64) -> Payment {
+        self.pay_with(url, to, amount).0
+    }
+
+    /// How the hub at `url` keeps payments asked kept.
+    #[allow(dead_code)]
+    pub fn conduct(&self, url: &str, conduct: Conduct) {
+        self.sites.lock().unwrap()[url]
+            .inbox
+            .lock()
+            .unwrap()
+            .conduct = conduct;
+    }
+
+    /// How many payments the hub at `url` keeps, and how many of them
+    /// their payees acknowledged.
+    #[allow(dead_code)]
+    pub fn kept(&self, url: &str) -> (usize, usize) {
+        self.sites.lock().unwrap()[url]
+            .inbox
+            .lock()
+            .unwrap()
+            .counts()
+    }
+
+    /// [`Net::pay`], kept at the hub under the tag and key `tagged` finds
+    /// it by: the payee's, or another's.
+    #[allow(dead_code)]
+    pub fn pay_kept(&self, url: &str, to: &Address, amount: u64, tagged: &Address) -> Payment {
+        let (payment, ephemeral) = self.pay_with(url, to, amount);
+        let hub = self.hub(url);
+        let (signed, _, _) = payment.decode(|id| hub.keyset(id)).unwrap();
+        let id = signed.proposal().id();
+        let keep = licash_api::inbox::Keep::new(&ephemeral.shared(tagged).unwrap(), &id).0;
+        let receipt = licash_api::inbox::Receipt {
+            release: payment.release.clone(),
+            unlock: payment.unlock.clone(),
+        };
+        let eph = ephemeral.public().0.to_vec();
+        let inbox = self.sites.lock().unwrap()[url].inbox.clone();
+        assert!(inbox
+            .lock()
+            .unwrap()
+            .keep(*id.as_bytes(), eph, &keep, receipt)
+            .unwrap());
+        payment
+    }
+
+    /// An entry `tagged` finds in the inbox of the hub at `url`, under a
+    /// key it cannot take it with.
+    #[allow(dead_code)]
+    pub fn keep_junk(&self, url: &str, tagged: &Address) {
+        let (payment, ephemeral) = self.pay_with(
+            url,
+            &OwnerKeys::from_seed(&[0xfb; 32]).unwrap().address(),
+            2,
+        );
+        let shared = ephemeral.shared(tagged).unwrap();
+        let keep = licash_api::inbox::Keep {
+            tag: Hex(licash_api::inbox::tag(&shared).to_vec()),
+            key: Hex(vec![0x55; 32]),
+            commitment: Hex(vec![0x66; 32]),
+        };
+        let receipt = licash_api::inbox::Receipt {
+            release: payment.release.clone(),
+            unlock: payment.unlock.clone(),
+        };
+        let eph = ephemeral.public().0.to_vec();
+        let inbox = self.sites.lock().unwrap()[url].inbox.clone();
+        let mut proposal = [0; 32];
+        proposal.copy_from_slice(&licash::crypto::tagged_hash("junk", &[&eph])[..32]);
+        inbox
+            .lock()
+            .unwrap()
+            .keep(proposal, eph, &keep, receipt)
+            .unwrap();
+    }
+
+    /// [`Net::pay`], and the ephemeral key it was made with.
+    fn pay_with(&self, url: &str, to: &Address, amount: u64) -> (Payment, Ephemeral) {
         let hub = self.hub(url);
         let (keys, keyset) = self.issuer(url);
         let info = hub.info();
@@ -394,7 +520,7 @@ impl Net {
         )
         .unwrap();
         let unlock = hub.release(&signed, &notes).unwrap();
-        Payment::new(url, &signed, &notes, &unlock)
+        (Payment::new(url, &signed, &notes, &unlock), ephemeral)
     }
 }
 

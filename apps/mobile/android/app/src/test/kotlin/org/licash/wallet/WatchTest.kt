@@ -28,7 +28,7 @@ class WatchTest {
 
     private fun payout(steps: PayoutSteps) = Details.Payout(
         hub = "https://hub.example", provider = "https://swaps.example", address = "bc1q", coin = steps.coin,
-        claim = steps.claim, failure = null, progress = steps,
+        claim = steps.claim, failure = null, progress = steps, providerFee = 0u, claimFee = 0u, lockFee = 0u,
     )
 
     private fun deposit(paid: Boolean) = Details.Moved(
@@ -74,6 +74,12 @@ class WatchTest {
         // A real payment beside it still keeps the app at work.
         val paying = line(Kind.SENT, State.PENDING, "b")
         assertEquals(Watch.NOW, watchOf(Ui(history = listOf(optimizing, paying), noteMaintenance = true), now))
+    }
+
+    @Test
+    fun a_payment_on_its_way_to_its_payee_is_looked_at_later() {
+        assertEquals(Watch.LATER, watchOf(Ui(onTheirWay = 1u), now))
+        assertEquals(Watch.NONE, watchOf(Ui(onTheirWay = 0u), now))
     }
 
     @Test

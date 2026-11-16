@@ -86,6 +86,16 @@ fun MoveSheet(engine: Engine, from: Holding, hubs: List<Holding>, moved: () -> U
                     ) { chosen = i }
                 }
             }
+            shown.getOrNull(chosen)?.let { quote ->
+                val split = if (quote.lockFee <= quote.fee) listOf(
+                    "Hub lock fee" to quote.lockFee,
+                    "Swap provider" to quote.fee - quote.lockFee,
+                ) else emptyList()
+                FeeLine("Fee", quote.fee, quote.amount, breakdown = FeeBreakdown(
+                    quote.amount, quote.fee, split,
+                    explanation = "The hub lock fee is separate from the provider's quoted cost. No separate miner fee or base/rate terms were supplied.",
+                ))
+            }
             Say("If it never arrives, your notes come back once the lock expires.")
         }
         if (busy) LinearProgressIndicator(Modifier.fillMaxWidth().padding(vertical = 12.dp))

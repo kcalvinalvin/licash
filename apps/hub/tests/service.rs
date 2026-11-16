@@ -21,8 +21,8 @@ use licash::{
     unlink::{Nonce, Session},
 };
 use licash_api::{
-    Check, Checked, Code, Info, Issued, Lock, LockState, Locked, Locks, Offer, Offered, Problem,
-    Refund, Release, Released, Settle, Settled, Unlink, Unlinked,
+    Check, Checked, Code, Hex, Info, Issued, Lock, LockState, Locked, Locks, Offer, Offered,
+    Problem, Refund, Release, Released, Settle, Settled, Unlink, Unlinked,
 };
 use licash_hub::{Fee, Hub, Policy};
 use licash_hub_service::notify::Notifier;
@@ -149,7 +149,16 @@ struct Coin {
 
 /// A spend of `coin` to `outputs`, with the derivations of its outputs.
 fn spend(keyset: &Keyset, coin: &Coin, outputs: &[(Address, u64)]) -> (Proposal, Vec<Derivation>) {
-    let e = Ephemeral::random();
+    spend_with(&Ephemeral::random(), keyset, coin, outputs)
+}
+
+/// [`spend`], under the ephemeral key `e`.
+fn spend_with(
+    e: &Ephemeral,
+    keyset: &Keyset,
+    coin: &Coin,
+    outputs: &[(Address, u64)],
+) -> (Proposal, Vec<Derivation>) {
     let outputs: Vec<_> = outputs
         .iter()
         .enumerate()
@@ -750,4 +759,154 @@ async fn its_info_names_the_urls_it_is_reached_at_once_known() {
     without.urls.clear();
     let signet = ChainProfile::Core30Signet;
     assert_eq!(info.identity(signet), without.identity(signet));
+}
+
+#[tokio::test]
+async fn a_payment_kept_for_its_payee_is_taken_and_acknowledged_through_the_api() {
+    use licash_api::inbox::{self, Acknowledge, Acknowledgment, AskAcks, Keep, Kept, Take};
+
+    let mut service = service(1);
+    let path = service.dir.path().join("inbox.sqlite");
+    let kept = Arc::new(licash_hub_service::inbox::Inbox::open(&path).unwrap());
+    let services = licash_hub_service::Services {
+        inbox: Some(kept),
+        ..Default::default()
+    };
+    service.app = licash_hub_service::router(service.hub.clone(), services);
+    let info = service.info().await;
+    let keyset = &service.keyset;
+    let (alice, bob) = (owner(1), owner(2));
+    let coin = service.mint(&alice, 8);
+    let e = Ephemeral::random();
+    let (proposal, outputs) = spend_with(
+        &e,
+        keyset,
+        &coin,
+        &[(bob.address(), 4), (alice.address(), 2), (info.address, 2)],
+    );
+    let notes = vec![coin.note.clone()];
+    let offered: Offered = service
+        .post(licash_api::OFFER, &Offer::new(&proposal, &notes))
+        .await;
+    let grant = offered.decode().unwrap();
+    let signed = sign(
+        keyset,
+        &coin,
+        &proposal,
+        Authorization::Granted(Box::new(grant)),
+    );
+    let shared = e.shared(&bob.address()).unwrap();
+    let (keep, ack) = Keep::new(&shared, &proposal.id());
+    let release = inbox::Release {
+        release: Release::new(&signed, &notes),
+        keep: Some(keep.clone()),
+    };
+    let released: inbox::Released = service.post(licash_api::RELEASE, &release).await;
+    assert!(released.kept);
+    // Asked again, as a payer does that missed the answer: kept once.
+    let again: inbox::Released = service.post(licash_api::RELEASE, &release).await;
+    assert!(again.kept);
+    assert_eq!(again.released.unlock, released.released.unlock);
+
+    // Bob finds it by its tag, of the secret he shares with Alice.
+    let (status, body) = service.call(Method::GET, &inbox::feed(0), None).await;
+    assert_eq!(status, StatusCode::OK);
+    let feed: inbox::Feed = serde_json::from_slice(&body).unwrap();
+    assert_eq!(feed.entries.len(), 1, "{feed:?}");
+    let entry = &feed.entries[0];
+    let (ephemeral, tag) = entry.decode().unwrap();
+    let found = bob
+        .scan_key()
+        .shared(&licash::crypto::Point(ephemeral))
+        .unwrap();
+    assert_eq!(tag, inbox::tag(&found));
+
+    // And takes it with its key, only.
+    let ask = |key: [u8; 32]| Take {
+        payments: vec![Kept {
+            seq: entry.seq,
+            key: Hex(key.to_vec()),
+        }],
+    };
+    let none: inbox::Taken = service.post(inbox::TAKE, &ask([0; 32])).await;
+    assert!(none.payments[0].is_none());
+    let taken: inbox::Taken = service.post(inbox::TAKE, &ask(inbox::key(&found))).await;
+    let payment = taken.payments[0].clone().unwrap().at("http://hub.example");
+    let lookup = |id: &[u8; 32]| (id == keyset.id()).then_some(keyset);
+    let (paid, paid_notes, unlock) = payment.decode(lookup).unwrap();
+    paid.open_granted_output(keyset, &paid_notes, 0, &outputs[0], &unlock)
+        .unwrap();
+
+    // Alice hears of it only once Bob tells his ack.
+    let key = Hex(inbox::key(&shared).to_vec());
+    let asking = AskAcks {
+        keys: vec![key.clone()],
+    };
+    let acks: inbox::Acks = service.post(inbox::ACKS, &asking).await;
+    assert_eq!(acks.acks, [None]);
+    let told = |ack: [u8; 32]| Acknowledge {
+        acks: vec![Acknowledgment {
+            key: key.clone(),
+            ack: Hex(ack.to_vec()),
+        }],
+    };
+    let wrong: inbox::Acknowledged = service.post(inbox::ACK, &told([3; 32])).await;
+    assert_eq!(wrong.acked, [false]);
+    let acks: inbox::Acks = service.post(inbox::ACKS, &asking).await;
+    assert_eq!(acks.acks, [None], "not by an ack the hub could make");
+    let right: inbox::Acknowledged = service
+        .post(inbox::ACK, &told(inbox::ack(&found, &proposal.id())))
+        .await;
+    assert_eq!(right.acked, [true]);
+    let acks: inbox::Acks = service.post(inbox::ACKS, &asking).await;
+    assert_eq!(acks.acks, [Some(Hex(ack.to_vec()))]);
+
+    let many = AskAcks {
+        keys: vec![key; inbox::MAX_ASKED + 1],
+    };
+    let problem = service.problem(inbox::ACKS, json(&many)).await;
+    assert_eq!(problem.code, Code::Invalid);
+}
+
+#[tokio::test]
+async fn a_hub_keeping_no_payments_releases_without_keeping() {
+    use licash_api::inbox::{self, Keep};
+
+    let service = service(1);
+    let info = service.info().await;
+    let keyset = &service.keyset;
+    let (alice, bob) = (owner(1), owner(2));
+    let coin = service.mint(&alice, 8);
+    let e = Ephemeral::random();
+    let (proposal, _) = spend_with(
+        &e,
+        keyset,
+        &coin,
+        &[(bob.address(), 4), (alice.address(), 2), (info.address, 2)],
+    );
+    let notes = vec![coin.note.clone()];
+    let offered: Offered = service
+        .post(licash_api::OFFER, &Offer::new(&proposal, &notes))
+        .await;
+    let signed = sign(
+        keyset,
+        &coin,
+        &proposal,
+        Authorization::Granted(Box::new(offered.decode().unwrap())),
+    );
+    let shared = e.shared(&bob.address()).unwrap();
+    let release = inbox::Release {
+        release: Release::new(&signed, &notes),
+        keep: Some(Keep::new(&shared, &proposal.id()).0),
+    };
+    let (status, body) = service
+        .call(Method::POST, licash_api::RELEASE, Some(json(&release)))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let text = String::from_utf8(body).unwrap();
+    assert!(!text.contains("kept"), "{text}");
+    let released: inbox::Released = serde_json::from_str(&text).unwrap();
+    assert!(!released.kept);
+    let (status, _) = service.call(Method::GET, &inbox::feed(0), None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }

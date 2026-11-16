@@ -52,6 +52,9 @@ jobs:
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - working-directory: apps
         run: cargo test --locked --workspace
+      - name: Corrected recovery driver challenge and collection
+        working-directory: apps
+        run: cargo test --release --locked -p licash-contracts --lib holder::recovery::driver_tests::a_selected_corrected_receipt_answers_a_challenge_and_collects -- --ignored --exact
       - working-directory: apps
         run: cargo doc --locked --no-deps --workspace
         env:
@@ -236,6 +239,9 @@ jobs:
       - name: The contract's opening messages
         working-directory: licash
         run: cargo test --release --locked --manifest-path regtest/Cargo.toml -p licash-contract
+      - name: Corrected challenge and collection
+        working-directory: licash
+        run: cargo test --release --locked --manifest-path regtest/Cargo.toml -p licash-contract --lib dispute::tests::a_corrected_challenge_opens_the_corrected_instances_and_collects -- --ignored --exact
       - name: Bitcoin Core regtest (mock proofs)
         working-directory: licash
         run: regtest/run.sh -- --test-threads=1

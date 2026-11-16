@@ -9,7 +9,6 @@
 //! made only once a first contract is asked for.
 
 use std::{
-    collections::HashMap,
     path::Path,
     sync::{atomic::Ordering, Arc, PoisonError},
 };
@@ -43,6 +42,30 @@ const CHANGES: &str = "contracts-change";
 /// Recovery contracts.
 #[uniffi::export]
 impl Wallet {
+    pub fn contract_inspection(
+        &self,
+        id: String,
+    ) -> Result<crate::ContractInspection, LicashError> {
+        let mut bytes = [0; 32];
+        hex::decode_to_slice(id, &mut bytes)
+            .map_err(|_| LicashError::invalid("not a contract id"))?;
+        let info = holder::inspect(&self.wallet, &self.dir, &bytes, self.tip()).map_err(failed)?;
+        Ok(crate::ContractInspection {
+            address: info.address,
+            locked: info.locked,
+            payout_pool: info.payout_pool,
+            holder_reserve: info.holder_reserve,
+            hub_reserve: info.hub_reserve,
+            claim_limit: info.claim_limit,
+            note_limit: info.note_limit,
+            denominations: info.denominations,
+            keyset: info.keyset,
+            graph_version: info.graph_version,
+            holder_program: info.holder_program,
+            counter_program: info.counter_program,
+        })
+    }
+
     /// What opening a contract at `hub`, a hub trusted, costs now, as it
     /// offers, and the coin on Bitcoin that would pay it.
     pub fn contract_quote(&self, hub: String) -> Result<ContractQuote, LicashError> {
@@ -329,7 +352,7 @@ impl Wallet {
 
     /// `all`, each with what it protects of the notes held now.
     fn listed(&self, all: &[holder::Contract]) -> Result<Vec<Contract>, LicashError> {
-        let covers = covers(all, self.tip(), &self.wallet.balance()?);
+        let covers = holder::coverage(&self.wallet, &self.dir, all, self.tip()).map_err(failed)?;
         let covered = |c: &holder::Contract| covers.get(&c.id).copied().unwrap_or(0);
         Ok(all.iter().map(|c| self.contract(c, covered(c))).collect())
     }
@@ -371,12 +394,14 @@ impl Wallet {
     pub(super) fn contracted(
         &self,
         balance: &mut Balance,
-        held: &[licash_wallet::Balance],
+        _held: &[licash_wallet::Balance],
         reserved: &[(Txid, u64)],
     ) -> Result<(), LicashError> {
         let all = holder::list(&self.dir).map_err(failed)?;
         if !all.is_empty() {
-            contracted(balance, &all, self.tip(), held, reserved);
+            let covered =
+                holder::coverage(&self.wallet, &self.dir, &all, self.tip()).map_err(failed)?;
+            contracted(balance, &all, covered.values().sum(), reserved);
         }
         Ok(())
     }
@@ -525,18 +550,17 @@ fn change<'a>(
     }
 }
 
-/// Of `balance`, `held` at each hub, what `contracts` protect at `tip`
-/// ([`covers`]), and what those being opened hold of the coins `reserved`
+/// Of `balance`, the precisely claimable `covered`, and what contracts
+/// being opened hold of the coins `reserved`
 /// for transactions, by their ids: its `covered`, and its `opening` rather
 /// than `moving`.
 fn contracted(
     balance: &mut Balance,
     contracts: &[holder::Contract],
-    tip: u32,
-    held: &[licash_wallet::Balance],
+    covered: u64,
     reserved: &[(Txid, u64)],
 ) {
-    balance.covered += covers(contracts, tip, held).values().sum::<u64>();
+    balance.covered += covered;
     for c in contracts.iter().filter(|c| c.abandoned.is_none()) {
         let Some(funding) = c.funding else { continue };
         for (_, value) in reserved.iter().filter(|(by, _)| *by == funding) {
@@ -545,46 +569,6 @@ fn contracted(
             balance.opening += value.saturating_sub(c.price);
         }
     }
-}
-
-/// What each of `contracts` protects, by id, of the notes `held` at its
-/// hub (those to come too) at `tip`, none if it is unknown (0): at each
-/// hub, of those live that count, the one whose deadline comes first
-/// takes up to its cap, then the next of what is left, by id among
-/// equals. Those protecting nothing are left out. A way to tell apart
-/// what each protects, not notes of its own: together they protect the
-/// least of the hub's notes and their caps.
-fn covers(
-    contracts: &[holder::Contract],
-    tip: u32,
-    held: &[licash_wallet::Balance],
-) -> HashMap<[u8; 32], u64> {
-    let mut covers = HashMap::new();
-    if tip == 0 {
-        return covers;
-    }
-    for at in held {
-        let hub = at.hub.trim_end_matches('/');
-        let mut live: Vec<&holder::Contract> = (contracts.iter())
-            .filter(|c| c.hub == hub && c.live(tip) && counted(c))
-            .collect();
-        live.sort_by_key(|c| (c.assert_height, c.id));
-        let mut left = at.available + at.pending;
-        for c in live {
-            let share = left.min(u64::from(c.cap));
-            if share > 0 {
-                covers.insert(c.id, share);
-            }
-            left -= share;
-        }
-    }
-    covers
-}
-
-/// Whether `c` counts as protecting notes: a mock one, on regtest, as it
-/// stands in for one; a genuine one not until this app recovers with it.
-fn counted(c: &holder::Contract) -> bool {
-    c.mock
 }
 
 fn hex(id: &[u8; 32]) -> String {
@@ -698,14 +682,6 @@ mod tests {
         }
     }
 
-    fn held(hub: &str, available: u64, pending: u64) -> licash_wallet::Balance {
-        licash_wallet::Balance {
-            hub: hub.into(),
-            available,
-            pending,
-        }
-    }
-
     #[test]
     fn contracts_stand_as_their_phase_fate_and_the_chain_say() {
         let live = contract(1, Phase::Funded, Some(Fate::Live));
@@ -786,7 +762,7 @@ mod tests {
     }
 
     #[test]
-    fn live_contracts_cover_their_hubs_notes_up_to_their_caps() {
+    fn balance_uses_claimable_coverage_instead_of_nominal_caps() {
         let contracts = [
             contract(1, Phase::Funded, Some(Fate::Live)),
             contract(2, Phase::Funded, Some(Fate::Live)),
@@ -794,28 +770,17 @@ mod tests {
             contract(3, Phase::Funded, Some(Fate::Open)),
             contract(4, Phase::Consented, None),
         ];
-        let covered = |tip, held: &[licash_wallet::Balance]| {
+        let covered = |claimable| {
             let mut balance = Balance::default();
-            contracted(&mut balance, &contracts, tip, held, &[]);
+            contracted(&mut balance, &contracts, claimable, &[]);
             balance.covered
         };
-        let other = held("https://other.example", 50_000, 0);
-        // Two caps at the hub, its pending notes too, the slash aside.
-        assert_eq!(
-            covered(300, &[held(HUB, 9_000, 1_000), other.clone()]),
-            8_192
-        );
-        assert_eq!(
-            covered(300, &[held("https://hub.example/", 5_000, 1_000)]),
-            6_000
-        );
-        // Past their deadline, or with the chain unknown: none.
-        assert_eq!(covered(360, &[held(HUB, 9_000, 0)]), 0);
-        assert_eq!(covered(0, &[held(HUB, 9_000, 0)]), 0);
+        assert_eq!(covered(68), 68);
+        assert_eq!(covered(0), 0);
     }
 
     #[test]
-    fn each_contract_covers_what_those_ending_first_leave_up_to_its_cap() {
+    fn aggregate_coverage_preserves_opening_coin_accounting() {
         let ending = |id, assert_height| holder::Contract {
             assert_height,
             ..contract(id, Phase::Funded, Some(Fate::Live))
@@ -827,29 +792,17 @@ mod tests {
             ..ending(4, 370)
         };
         let all = [&contracts[..], &[other]].concat();
-        let covers = |held: &[licash_wallet::Balance]| {
-            let covers = covers(&all, 300, held);
-            let of = |id: u8| covers.get(&[id; 32]).copied();
-            [of(1), of(2), of(3), of(4)]
+        let mut balance = Balance {
+            covered: 2,
+            ..Balance::default()
         };
-        let there = held("https://other.example", 1_000, 0);
-        assert_eq!(
-            covers(&[held(HUB, 9_000, 1_000), there.clone()]),
-            [Some(4_096), Some(4_096), Some(1_808), Some(1_000)]
-        );
-        assert_eq!(
-            covers(&[held(HUB, 5_000, 0), there]),
-            [Some(904), Some(4_096), None, Some(1_000)]
-        );
-        assert_eq!(covers(&[held(HUB, 0, 0)]), [None; 4]);
-        // Together, what the hub's notes are covered by.
-        let mut balance = Balance::default();
-        contracted(&mut balance, &all, 300, &[held(HUB, 5_000, 0)], &[]);
-        assert_eq!(balance.covered, 5_000);
+        contracted(&mut balance, &all, 68, &[]);
+        assert_eq!(balance.covered, 70);
+        assert_eq!(balance.opening, 0);
     }
 
     #[test]
-    fn genuine_contracts_cover_nothing_until_this_app_recovers_with_them() {
+    fn genuine_claimable_coverage_is_not_gated_on_phone_proving() {
         let genuine = holder::Contract {
             mock: false,
             ..contract(1, Phase::Funded, Some(Fate::Live))
@@ -857,11 +810,11 @@ mod tests {
         let mock = contract(2, Phase::Funded, Some(Fate::Live));
         let covered = |contracts: &[holder::Contract]| {
             let mut balance = Balance::default();
-            contracted(&mut balance, contracts, 300, &[held(HUB, 9_000, 0)], &[]);
+            contracted(&mut balance, contracts, 68, &[]);
             balance.covered
         };
-        assert_eq!(covered(std::slice::from_ref(&genuine)), 0);
-        assert_eq!(covered(&[genuine, mock]), 4_096);
+        assert_eq!(covered(std::slice::from_ref(&genuine)), 68);
+        assert_eq!(covered(&[genuine, mock]), 68);
     }
 
     #[test]
@@ -874,7 +827,7 @@ mod tests {
             ..Balance::default()
         };
         let reserved = [(f, 60_000), (other, 10_000)];
-        contracted(&mut balance, &[signed], 300, &[], &reserved);
+        contracted(&mut balance, &[signed], 0, &reserved);
         assert_eq!((balance.moving, balance.opening), (10_000, 37_000));
     }
 

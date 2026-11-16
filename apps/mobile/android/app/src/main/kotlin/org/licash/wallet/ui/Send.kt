@@ -85,8 +85,8 @@ private sealed interface Step {
     data object Busy : Step
     data object Quoting : Step
     data class PayingOut(val amount: ULong, val depth: UInt) : Step
-    /** To the code `code`, if one. */
-    data class Sent(val amount: ULong, val handover: String?, val code: String? = null) : Step
+    /** To the code `code`, if one; `kept` at its hub for the payee to collect. */
+    data class Sent(val amount: ULong, val handover: String?, val code: String? = null, val kept: Boolean = false) : Step
     data class Paid(val amount: ULong, val fee: ULong) : Step
     data object Later : Step
     data class Received(val amount: ULong) : Step
@@ -189,7 +189,7 @@ fun Send(
 
     suspend fun paying(code: String, amount: ULong?): Step =
         engine.pay(code, amount).fold(
-            { Step.Sent(it.amount, it.handover, code) },
+            { Step.Sent(it.amount, it.handover, code, it.kept) },
             { e ->
                 when (e) {
                     is LicashException.Pending -> Step.Later
@@ -406,11 +406,16 @@ fun Send(
 }
 
 /** One fact of a payment to confirm: `tag` names its value, for the tests; a fee's `share` of the amount. */
-private class Fact(val label: String, val value: String, val tag: String, val share: String? = null)
+private class Fact(val label: String, val value: String, val tag: String, val share: String? = null, val fee: FeeBreakdown? = null)
 
 /** What a payment costs and when it arrives, to confirm it by: with what it comes to, if it costs. */
-private fun costs(amount: ULong, fee: ULong, arrives: String): List<Fact> = listOfNotNull(
-    Fact("Fee", if (fee == 0uL) "None" else sat(fee), "fee", share(fee, amount)),
+private fun costs(
+    amount: ULong,
+    fee: ULong,
+    arrives: String,
+    breakdown: FeeBreakdown = FeeBreakdown(amount, fee),
+): List<Fact> = listOfNotNull(
+    Fact("Fee", if (fee == 0uL) "None" else sat(fee), "fee", share(fee, amount), breakdown),
     if (fee > 0uL) Fact("Total", sat(amount + fee), "total") else null,
     Fact("Arrives", arrives, "arrives"),
 )
@@ -448,7 +453,9 @@ private fun Facts(facts: List<Fact>) {
     Group("") {
         facts.forEachIndexed { i, fact ->
             if (i > 0) Divider()
-            Line(fact.label, fact.value, tag = fact.tag, share = fact.share)
+            val fee = fact.fee
+            if (fee != null) FeeLine(fact.label, fee.fee, fee.amount, fact.tag, fact.value, fee)
+            else Line(fact.label, fact.value, tag = fact.tag, share = fact.share)
         }
     }
 }
@@ -462,8 +469,9 @@ private fun Facts(facts: List<Fact>) {
 private fun Paying(ui: Ui, s: Step.Paying, pay: (ULong?) -> Unit) {
     var amount by remember { mutableStateOf(s.asked?.toLong()) }
     // The most a hub would charge: the code may name several.
-    val fee = amount?.takeIf { !s.visit }
-        ?.let { a -> ui.hubs.maxOfOrNull { payingUpTo(it, a.toULong()) } }
+    val estimatedHub = amount?.takeIf { !s.visit }
+        ?.let { a -> ui.hubs.maxByOrNull { payingUpTo(it, a.toULong()) } }
+    val fee = amount?.let { a -> estimatedHub?.let { payingUpTo(it, a.toULong()) } }
     Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
         Spacer(Modifier.height(32.dp))
         if (s.asked == null) {
@@ -479,6 +487,12 @@ private fun Paying(ui: Ui, s: Step.Paying, pay: (ULong?) -> Unit) {
                         fee?.let { if (it == 0uL) "None" else "Up to ${sat(it)}" } ?: "",
                         "fee",
                         fee?.let { f -> amount?.let { share(f, it.toULong()) } },
+                        fee?.let { f -> amount?.let { a -> estimatedHub?.let { hub -> FeeBreakdown(
+                            a.toULong(), f,
+                            components = listOf("Hub (estimate)" to f),
+                            rate = org.licash.core.Rate(hub.feeBase, hub.feePpm),
+                            explanation = "Upper estimate using current terms at ${name(hub.url)}, with its fee for each note made. The hub used to pay may charge less.",
+                        ) } } },
                     ),
                     Fact("Arrives", "Instantly", "arrives"),
                 ),
@@ -637,7 +651,12 @@ private fun Payout(quote: PayoutQuote, own: Boolean, several: Boolean, pay: () -
     Confirm(
         quote.amount,
         listOf(Fact("To", if (own) "This wallet" else shortAddress(quote.address), "to")) +
-            costs(quote.amount, quote.fee, arrives(quote.depth).replaceFirstChar { it.uppercase() }) +
+            costs(
+                quote.amount,
+                quote.fee,
+                arrives(quote.depth).replaceFirstChar { it.uppercase() },
+                payoutFee(quote.amount, quote.fee, quote.lockFee, quote.providerFee, quote.claimFee, quoted = true),
+            ) +
             listOfNotNull(if (several) Fact("From", name(quote.hub), "from") else null),
         "Send",
         pay,
@@ -661,7 +680,7 @@ private fun Sent(s: Step.Sent, back: () -> Unit) {
         Spacer(Modifier.height(32.dp))
         Text("Sent ${sat(s.amount)}", style = MaterialTheme.typography.headlineSmall)
         Text(
-            "Hand them this to finish",
+            if (s.kept) "They collect it from the hub. If they can't, hand them this" else "Hand them this to finish",
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             textAlign = TextAlign.Center,

@@ -12,19 +12,20 @@ use anyhow::{anyhow, ensure, Context, Result};
 use ark_bn254::{Bn254, Fq, Fq2, G1Affine, G2Affine};
 use ark_ff::{BigInteger, PrimeField};
 use ark_groth16::{Groth16, Proof};
+use licash::disclosure::{Disclosures, SignedDisclosures, CHUNK_BYTES};
 use licash::recovery::HolderWitness;
-use licash::statement::{HubResponse, Observed, StatementInput};
-use licash::wots::Hashes;
+use licash::statement::{HubKeys as ResponseKeys, HubResponse, Observed, StatementInput, K_LEN};
+use licash::wots::{self, Hashes};
 use lichen_babe::garble::evaluate;
-use lichen_babe::reveal::extract;
+use lichen_babe::reveal::{extract, LamportPub};
 use lichen_babe::vsss::interpolate;
 use lichen_babe::we::decrypt;
 use lngap_btc::bitcoin::{OutPoint, Transaction, TxOut};
 use lngap_btc::witness::witness_args_consumption_order;
-use lngap_lamport::winternitz::{WotsParams, WotsSig};
+use lngap_lamport::winternitz::{Wots256Sig, WotsParams, WotsSig};
 use lngap_sessions::skeleton::sig_name;
 
-use crate::close::{finished, presign, terminal, B_ITEMS, E_ITEMS};
+use crate::close::{self, finished, presign, terminal, B_ITEMS, E_ITEMS};
 use crate::graph::Babe;
 use crate::keys::{HolderKeys, HubKeys};
 use crate::opening::{journal, HubOpening, Opening, Setup, Trust};
@@ -36,21 +37,26 @@ pub const RESPOND_COUNTER: &str = "respond_counter";
 pub const RESPOND_TIMEOUT: &str = "respond_timeout";
 /// Her assertion of the full claim's proof, and its terminal paying her.
 pub const ASSERT: &str = "assert";
+pub const ASSERT_CORRECTED: &str = "assert_corrected";
 pub const SUCCESS: &str = "success";
+pub const SUCCESS_CORRECTED: &str = "success_corrected";
 /// The hub's challenge of her assertion, and its terminal paying it.
 pub const CHALLENGE: &str = "challenge_assert";
+pub const CHALLENGE_CORRECTED: &str = "challenge_corrected";
 pub const FAILURE: &str = "failure";
 
 /// A proof of her claim: Groth16's, on BN254.
 pub type ClaimProof = Proof<Bn254>;
+/// The holder's existing one-time amount signature, reused to collect.
+pub type HolderAmountSignature = WotsSig;
 
 /// What the hub answered R with, read from the chain.
 pub enum Response {
     /// `respond`: her proof of her whole claim decides.
     Plain(HubResponse),
-    /// `respond_counter`: the hub says some of her notes are spent. Not
-    /// read here yet.
-    Counter,
+    /// `respond_counter`, with all five signed disclosure publications.
+    /// Whether it proves anything is decided by the holder statement.
+    Counter(HubResponse),
 }
 
 /// Which presigned link of `o` `tx` is, if any of `names`: each is known
@@ -62,7 +68,11 @@ fn is(o: &Opening, tx: &Transaction, name: &str) -> bool {
 /// A link's script arguments, in consumption order, below both
 /// signatures.
 fn args(tx: &Transaction) -> Vec<Vec<u8>> {
-    let all = witness_args_consumption_order(&tx.input[0].witness);
+    input_args(&tx.input[0].witness)
+}
+
+fn input_args(witness: &lngap_btc::bitcoin::Witness) -> Vec<Vec<u8>> {
+    let all = witness_args_consumption_order(witness);
     all.get(2..).map(<[_]>::to_vec).unwrap_or_default()
 }
 
@@ -74,13 +84,140 @@ pub fn response(o: &Opening, tx: &Transaction) -> Result<Response> {
     let script = leaf.context("no script")?.script;
     let leaf = |name: &str| presign(o, name).map(|p| p.leaf.as_script() == script);
     if leaf(RESPOND_COUNTER).unwrap_or(false) {
-        return Ok(Response::Counter);
+        let plain = presign(o, RESPOND)?;
+        let counter = presign(o, RESPOND_COUNTER)?;
+        ensure!(
+            plain.extra.len() == 5 && counter.extra.len() == 5 && tx.input.len() == 6,
+            "counter publication input count"
+        );
+        return counter_response(
+            o.base.parts().response_keys.keys(),
+            tx,
+            &std::array::from_fn(|i| plain.extra[i].1.clone()),
+            &std::array::from_fn(|i| counter.extra[i].1.clone()),
+        );
     }
     ensure!(leaf(RESPOND)?, "an answer of no leaf of hers");
-    let exit = Babe::read_respond_exit(&args(tx), false)?;
     Ok(Response::Plain(HubResponse::Plain {
-        e_sig: Hashes(exit.hub_e),
+        e_sig: Hashes(Babe::read_plain_response_hashes(&args(tx))?),
     }))
+}
+
+/// Decode only after the caller identifies the presigned transaction and
+/// its main counter leaf. The sidecar scripts come from that same opening.
+fn counter_response(
+    keys: &ResponseKeys,
+    tx: &Transaction,
+    plain: &[lngap_btc::bitcoin::ScriptBuf; 5],
+    published: &[lngap_btc::bitcoin::ScriptBuf; 5],
+) -> Result<Response> {
+    ensure!(tx.input.len() == 6, "counter publication input count");
+    let mut plain_response = None;
+    for (i, input) in tx.input.iter().skip(1).enumerate() {
+        let leaf = input.witness.taproot_leaf_script();
+        let script = leaf.context("publication has no script")?.script;
+        if script == plain[i].as_script() {
+            let signature = Hashes(Babe::read_plain_publication_hashes(&input_args(
+                &input.witness,
+            ))?);
+            plain_response = Some(HubResponse::Plain { e_sig: signature });
+        } else {
+            ensure!(
+                script == published[i].as_script(),
+                "publication of no response leaf"
+            );
+        }
+    }
+    // Any plain publication authenticates E under the plain key, even
+    // when the main input uses the counter leaf. No disclosures needed.
+    if let Some(response) = plain_response {
+        return Ok(Response::Plain(response));
+    }
+    let publication = read_disclosures(keys, tx)?;
+    Ok(Response::Counter(read_counter(
+        keys,
+        &args(tx),
+        publication,
+    )?))
+}
+
+fn signed_message(key: &Hashes, signature: &Hashes, bytes: usize) -> Result<Vec<u8>> {
+    let params = WotsParams::for_bytes(bytes as u32);
+    ensure!(
+        key.len() == params.total_digits() as usize && signature.len() == key.len(),
+        "response key digit count"
+    );
+    let mut digits = Vec::with_capacity(key.len());
+    for (reveal, public) in signature.0.iter().zip(&key.0) {
+        let mut hash = *reveal;
+        let mut digit = None;
+        for distance in 0..=wots::MAX_DIGIT {
+            if hash == *public {
+                digit = Some(wots::MAX_DIGIT - distance);
+                break;
+            }
+            hash = wots::chain(hash, 1);
+        }
+        digits.push(digit.context("response reveal of no public-key digit")?);
+    }
+    let message = digits[..2 * bytes]
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|d| (d[0] << 4) | d[1])
+        .collect::<Vec<_>>();
+    ensure!(
+        wots::verify_msg(key, signature, &message),
+        "response signature checksum"
+    );
+    Ok(message)
+}
+
+fn read_disclosures(keys: &ResponseKeys, tx: &Transaction) -> Result<SignedDisclosures> {
+    ensure!(tx.input.len() == 6, "counter publication input count");
+    let mut bytes = Vec::new();
+    let mut signatures = Vec::new();
+    for (i, size) in CHUNK_BYTES.into_iter().enumerate() {
+        let params = WotsParams::for_bytes(size as u32);
+        let n = 2 * params.total_digits() as usize;
+        let witness = &tx.input[i + 1].witness;
+        ensure!(witness.len() == n + 4, "publication witness shape");
+        let mut arguments: Vec<_> = witness.iter().take(n).map(<[u8]>::to_vec).collect();
+        arguments.reverse();
+        let signature = Hashes(Babe::read_wots256_hashes(params, &arguments)?);
+        bytes.extend(signed_message(&keys.disclosure[i], &signature, size)?);
+        signatures.push(signature);
+    }
+    Ok(SignedDisclosures {
+        disclosures: Disclosures::from_bytes(&bytes)?,
+        signatures: signatures.try_into().expect("five publication signatures"),
+    })
+}
+
+fn read_counter(
+    keys: &ResponseKeys,
+    arguments: &[Vec<u8>],
+    publication: SignedDisclosures,
+) -> Result<HubResponse> {
+    let hashes =
+        Babe::read_corrected_response_hashes(arguments, WotsParams::for_bytes(K_LEN as u32))?;
+    let k = Hashes(hashes.k);
+    let corrected = Hashes(hashes.b_corr);
+    let message = signed_message(&keys.k, &k, K_LEN)?;
+    let amount = signed_message(&keys.b_corr, &corrected, 4)?;
+    let e_sig = Hashes(hashes.e);
+    ensure!(
+        publication.verify(&keys.disclosure),
+        "counter response signatures"
+    );
+    Ok(HubResponse::Counter {
+        e_sig,
+        k: message,
+        k_sig: k,
+        b_corr: u32::from_be_bytes(amount.try_into().expect("a four-byte corrected amount")),
+        corr_sig: corrected,
+        publication: Box::new(publication),
+    })
 }
 
 /// The hub's plain `respond` to `r`, her request in contract `o`: her
@@ -283,7 +420,11 @@ pub fn holder_image(o: &Opening) -> [u8; 32] {
 /// her kept instances are garbled under, of the journal fixed at
 /// opening. A proof that does not opens none of them.
 pub fn proves(o: &Opening, trust: &Trust, proof: &Proof<Bn254>) -> bool {
-    let statement = (trust.statement)(&expected(o));
+    proves_journal(trust, &expected(o), proof)
+}
+
+fn proves_journal(trust: &Trust, journal: &licash::statement::Journal, proof: &ClaimProof) -> bool {
+    let statement = (trust.statement)(journal);
     <Groth16<Bn254> as ark_snark::SNARK<_>>::verify(&statement.vk, &statement.public, proof)
         .unwrap_or(false)
 }
@@ -313,6 +454,189 @@ pub fn assert(o: &Opening, keys: &HolderKeys, proof: &Proof<Bn254>) -> Result<Tr
     finished(o, ASSERT, wire)
 }
 
+/// The corrected assertion bound to one opening and the hub's signed amount.
+/// Its Lamport and amount keys are separate from the full claim's keys.
+pub struct Corrected<'a> {
+    opening: &'a Opening,
+    amount: u32,
+    hub_b: Wots256Sig,
+}
+
+impl<'a> Corrected<'a> {
+    /// Bind the corrected amount before any holder key is used. The driver
+    /// must also validate the counter proof and durably keep its decision.
+    pub fn new(opening: &'a Opening, amount: u32, signature: &Hashes) -> Result<Self> {
+        ensure!(
+            amount <= opening.base.parts().cap,
+            "corrected amount exceeds the cap"
+        );
+        ensure!(
+            wots::verify_b(
+                &opening.base.parts().response_keys.keys().b_corr,
+                signature,
+                amount
+            ),
+            "corrected amount signature"
+        );
+        let hub_b = Wots256Sig::from_hashes(
+            WotsParams::for_bytes(4),
+            &amount.to_be_bytes(),
+            signature.0.clone(),
+        )?;
+        Ok(Self {
+            opening,
+            amount,
+            hub_b,
+        })
+    }
+
+    pub fn amount(&self) -> u32 {
+        self.amount
+    }
+
+    pub fn expected(&self) -> licash::statement::Journal {
+        journal(&self.opening.base, &self.opening.d, 1)
+    }
+
+    pub fn proves(&self, trust: &Trust, proof: &ClaimProof) -> bool {
+        proves_journal(trust, &self.expected(), proof)
+    }
+
+    pub fn mock_proof(&self, trust: &Trust) -> Result<ClaimProof> {
+        ensure!(trust.mock, "a mock proof under a genuine authority");
+        Ok(lichen_babe::statement::mock_prove(
+            &self.expected().to_bytes(),
+        ))
+    }
+
+    /// Sign only a proof and amount already kept by the driver. Both
+    /// corrected one-time keys must never sign different data on retry.
+    pub fn assert(&self, keys: &HolderKeys, proof: &ClaimProof) -> Result<Transaction> {
+        let (_, digits, pi2, pi3) = pi(proof);
+        let wire = Babe::assert_corrected_wire(
+            &keys.corrected.lamport.sign(&digits),
+            &pi2,
+            &pi3,
+            &self.hub_b,
+            &keys.corrected.b_key.sign(&self.amount.to_be_bytes())?,
+        );
+        finished(self.opening, ASSERT_CORRECTED, wire)
+    }
+
+    pub fn is_assert(opening: &Opening, tx: &Transaction) -> bool {
+        is(opening, tx, ASSERT_CORRECTED)
+    }
+
+    /// Adopt a posted assertion, including its existing holder amount
+    /// signature for collection. Reading never emits another signature.
+    pub fn asserted(opening: &'a Opening, tx: &Transaction) -> Result<(Self, ClaimProof, WotsSig)> {
+        Self::read_assertion(opening, tx, None)
+    }
+
+    /// Pi2 and Pi3 are unsigned. Keep the verified local receipt when its
+    /// Lamport-signed Pi1 matches, even if those public witness items changed.
+    pub fn asserted_keeping(
+        opening: &'a Opening,
+        tx: &Transaction,
+        proof: &ClaimProof,
+    ) -> Result<(Self, ClaimProof, WotsSig)> {
+        Self::read_assertion(opening, tx, Some(proof))
+    }
+
+    fn read_assertion(
+        opening: &'a Opening,
+        tx: &Transaction,
+        pinned: Option<&ClaimProof>,
+    ) -> Result<(Self, ClaimProof, WotsSig)> {
+        ensure!(Self::is_assert(opening, tx), "not her corrected assert");
+        let arguments = args(tx);
+        let read = Babe::read_corrected_assertion_hashes(&arguments)?;
+        let signature = Hashes(read.hub_b);
+        let amount = signed_message(
+            &opening.base.parts().response_keys.keys().b_corr,
+            &signature,
+            4,
+        )?;
+        let amount = u32::from_be_bytes(amount.try_into().expect("a four-byte corrected amount"));
+        let corrected = Self::new(opening, amount, &signature)?;
+        let holder_b = WotsSig::from_hashes(
+            WotsParams::for_bytes(4),
+            &amount.to_be_bytes(),
+            read.holder_b,
+        )?;
+        let spec = opening
+            .babe
+            .spec
+            .corrected
+            .as_ref()
+            .context("no corrected assertion")?;
+        spec.b_key
+            .verify(&holder_b)
+            .context("holder's corrected amount signature")?;
+        let proof = proof_from_reveals(&spec.lamport, read.proof, pinned)?;
+        Ok((corrected, proof, holder_b))
+    }
+
+    pub fn success(&self, keys: &HolderKeys, fee: (OutPoint, TxOut)) -> Result<Transaction> {
+        terminal(self.opening, keys, SUCCESS_CORRECTED, vec![], fee)
+    }
+
+    pub fn is_success(&self, tx: &Transaction) -> Result<bool> {
+        is_terminal(self.opening, tx, SUCCESS_CORRECTED)
+    }
+
+    pub fn is_challenge(&self, tx: &Transaction) -> bool {
+        is(self.opening, tx, CHALLENGE_CORRECTED)
+    }
+
+    pub fn is_answer(&self, tx: &Transaction) -> bool {
+        is_answer_for(self.opening, tx, true)
+    }
+
+    /// Use only the corrected setup, checked by Opening::setups, to answer
+    /// a challenge of the corrected proof already posted.
+    pub fn answer(
+        &self,
+        keys: &HolderKeys,
+        setup: &Setup,
+        challenge: &Transaction,
+        proof: &ClaimProof,
+        fee: (OutPoint, TxOut),
+    ) -> Result<Option<Transaction>> {
+        answer_for(self.opening, keys, setup, challenge, proof, fee, true)
+    }
+
+    /// Collect with the holder amount signature read from the assertion.
+    /// Only the ordinary payment key signs; neither one-time key is used.
+    pub fn sweep(
+        &self,
+        keys: &HolderKeys,
+        payout: &Transaction,
+        b: &WotsSig,
+        to: lngap_btc::bitcoin::ScriptBuf,
+        rate: lngap_btc::bitcoin::FeeRate,
+    ) -> Result<Transaction> {
+        let spec = self
+            .opening
+            .babe
+            .spec
+            .corrected
+            .as_ref()
+            .context("no corrected assertion")?;
+        spec.b_key
+            .verify(b)
+            .context("holder's corrected amount signature")?;
+        close::sweep_with_key(
+            self.opening,
+            keys,
+            payout,
+            (self.amount, b, &spec.b_key),
+            to,
+            rate,
+        )
+    }
+}
+
 /// Whether `tx` is her `assert`, any proof's.
 pub fn is_assert(o: &Opening, tx: &Transaction) -> bool {
     is(o, tx, ASSERT)
@@ -321,15 +645,44 @@ pub fn is_assert(o: &Opening, tx: &Transaction) -> bool {
 /// The proof `tx`, an `assert` of hers, carries: one posted by another
 /// copy of her wallet, say, to go on with.
 pub fn asserted(o: &Opening, tx: &Transaction) -> Result<Proof<Bn254>> {
+    read_assertion(o, tx, None)
+}
+
+/// Keep a caller-verified receipt when its signed Pi1 matches the posted
+/// assertion. Unsigned Pi2/Pi3 cannot replace that pinned receipt.
+pub fn asserted_keeping(o: &Opening, tx: &Transaction, proof: &ClaimProof) -> Result<ClaimProof> {
+    read_assertion(o, tx, Some(proof))
+}
+
+fn read_assertion(
+    o: &Opening,
+    tx: &Transaction,
+    pinned: Option<&ClaimProof>,
+) -> Result<ClaimProof> {
     ensure!(is_assert(o, tx), "not her assert");
     let args = args(tx);
     let (signed, pi2, pi3) = Babe::read_assert(&args).context("assert's arguments")?;
     let lamport = &o.babe.spec.lamport;
+    proof_from_reveals(lamport, (signed, pi2, pi3), pinned)
+}
+
+fn proof_from_reveals(
+    lamport: &LamportPub,
+    (signed, pi2, pi3): crate::graph::Asserted<'_>,
+    pinned: Option<&ClaimProof>,
+) -> Result<ClaimProof> {
     let digits = signed
         .iter()
         .enumerate()
         .map(|(d, x)| lamport.read(d, x).context("a preimage of no digit"))
         .collect::<Result<Vec<u8>>>()?;
+    if let Some(proof) = pinned {
+        ensure!(
+            digits == pi(proof).1,
+            "another proof used the same one-time assertion key"
+        );
+        return Ok(proof.clone());
+    }
     let bits: Vec<bool> = digits
         .iter()
         .flat_map(|v| [v & 1 == 1, v & 2 == 2])
@@ -346,7 +699,11 @@ pub fn success(o: &Opening, keys: &HolderKeys, fee: (OutPoint, TxOut)) -> Result
 
 /// Whether `tx` is `success`, any fee inputs added.
 pub fn is_success(o: &Opening, tx: &Transaction) -> Result<bool> {
-    let p = presign(o, SUCCESS)?;
+    is_terminal(o, tx, SUCCESS)
+}
+
+fn is_terminal(o: &Opening, tx: &Transaction, name: &str) -> Result<bool> {
+    let p = presign(o, name)?;
     let at = p.tx.input[0].previous_output;
     Ok(tx.input.iter().any(|i| i.previous_output == at) && tx.output == p.tx.output)
 }
@@ -354,9 +711,15 @@ pub fn is_success(o: &Opening, tx: &Transaction) -> Result<bool> {
 /// Whether `tx` is her answer to the hub's challenge, from any kept
 /// instance, any fee inputs added.
 pub fn is_answer(o: &Opening, tx: &Transaction) -> bool {
+    is_answer_for(o, tx, false)
+}
+
+fn is_answer_for(o: &Opening, tx: &Transaction, corrected: bool) -> bool {
     o.set
         .iter()
-        .filter(|p| p.name.starts_with("wrongly_challenged_") && !p.name.contains("corrected"))
+        .filter(|p| {
+            p.name.starts_with("wrongly_challenged_") && p.name.contains("corrected") == corrected
+        })
         .any(|p| {
             let at = p.tx.input[0].previous_output;
             tx.input.iter().any(|i| i.previous_output == at) && tx.output == p.tx.output
@@ -382,9 +745,34 @@ pub fn answer(
     proof: &Proof<Bn254>,
     fee: (OutPoint, TxOut),
 ) -> Result<Option<Transaction>> {
-    ensure!(is_challenge(o, challenge), "not the hub's challenge");
+    answer_for(o, keys, setup, challenge, proof, fee, false)
+}
+
+fn answer_for(
+    o: &Opening,
+    keys: &HolderKeys,
+    setup: &Setup,
+    challenge: &Transaction,
+    proof: &ClaimProof,
+    fee: (OutPoint, TxOut),
+    corrected: bool,
+) -> Result<Option<Transaction>> {
+    let (name, lamport, prefix) = if corrected {
+        (
+            CHALLENGE_CORRECTED,
+            &o.babe
+                .spec
+                .corrected
+                .as_ref()
+                .context("no corrected assertion")?
+                .lamport,
+            "wrongly_challenged_corrected",
+        )
+    } else {
+        (CHALLENGE, &o.babe.spec.lamport, "wrongly_challenged")
+    };
+    ensure!(is(o, challenge, name), "not the hub's challenge");
     let (bits, digits, _, _) = pi(proof);
-    let lamport = &o.babe.spec.lamport;
     let (posted, revealed) = extract(lamport, &setup.presigs, &args(challenge))
         .ok_or_else(|| anyhow!("the challenge's secrets"))?;
     ensure!(
@@ -406,7 +794,7 @@ pub fn answer(
         let r_pi1 = evaluate(&instance.gc, &bits, &instance.labels(&bits, &secrets));
         let msg = decrypt(&instance.ct, &r_pi1, proof);
         if instance.is_msg(&msg) {
-            let name = format!("wrongly_challenged_{k}");
+            let name = format!("{prefix}_{k}");
             return terminal(o, keys, &name, Babe::wrongly_wire(&msg), fee).map(Some);
         }
     }
@@ -416,6 +804,613 @@ pub fn answer(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lngap_btc::bitcoin::{absolute, transaction, Transaction, TxIn, Witness};
+    use lngap_lamport::winternitz::{Wots256Secret, WotsSecret};
+
+    fn counter_witnesses() -> (ResponseKeys, Transaction, Vec<Vec<u8>>, SignedDisclosures) {
+        let key = |bytes, entropy| {
+            Wots256Secret::from_entropy(WotsParams::for_bytes(bytes), [entropy; 32])
+        };
+        let b = key(4, 1);
+        let plain = key(32, 2);
+        let e = key(32, 3);
+        let k = key(K_LEN as u32, 4);
+        let corrected = key(4, 5);
+        let disclosure: [_; 5] = std::array::from_fn(|i| key(CHUNK_BYTES[i] as u32, i as u8 + 6));
+        let public = |key: &Wots256Secret| Hashes(key.public().digits);
+        let keys = ResponseKeys {
+            b: public(&b),
+            e_plain: public(&plain),
+            e_counter: public(&e),
+            k: public(&k),
+            b_corr: public(&corrected),
+            disclosure: std::array::from_fn(|i| public(&disclosure[i])),
+        };
+        let mut tx = Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![TxIn::default(); 6],
+            output: vec![],
+        };
+        let mut values = Disclosures::empty();
+        values.values[0] = [255; 32];
+        let bytes = values.to_bytes();
+        let mut at = 0;
+        for (i, key) in disclosure.iter().enumerate() {
+            let end = at + CHUNK_BYTES[i];
+            let sig = key.sign(&bytes[at..end]).unwrap();
+            let mut wire = sig.consumption_order();
+            wire.reverse();
+            // Both transaction signatures, script and control block.
+            wire.extend([vec![], vec![], vec![0x52], vec![0xc0; 33]]);
+            tx.input[i + 1].witness = Witness::from_slice(&wire);
+            at = end;
+        }
+        let publication = read_disclosures(&keys, &tx).unwrap();
+        assert_eq!(publication.disclosures, values);
+        let alice_b = WotsSecret::from_entropy(WotsParams::for_bytes(4), [20; 32]);
+        let alice_e = WotsSecret::from_entropy(WotsParams::for_bytes(32), [21; 32]);
+        let mut digest = [255; 32];
+        digest[31] = 240; // E's checksum has both zero and 15 digits.
+        let mut counter = [0; K_LEN];
+        counter[0] = 255;
+        let mut wire = Babe::respond_corrected_wire(
+            &b.sign(&128u32.to_be_bytes()).unwrap(),
+            &alice_b.sign(&128u32.to_be_bytes()).unwrap(),
+            &alice_e.sign(&digest).unwrap(),
+            &e.sign(&digest).unwrap(),
+            &k.sign(&counter).unwrap(),
+            &corrected.sign(&15u32.to_be_bytes()).unwrap(),
+        );
+        let mut witness = wire.clone();
+        witness.extend([vec![], vec![], vec![0x53], vec![0xc0; 33]]);
+        tx.input[0].witness = Witness::from_slice(&witness);
+        wire.reverse();
+        (keys, tx, wire, publication)
+    }
+
+    #[test]
+    fn a_counter_is_reconstructed_and_authenticated_without_any_secret_keys() {
+        let (keys, _, args, publication) = counter_witnesses();
+        let response = read_counter(&keys, &args, publication).unwrap();
+        let HubResponse::Counter {
+            k,
+            b_corr,
+            publication,
+            ..
+        } = response
+        else {
+            panic!("not a counter")
+        };
+        assert_eq!(k[0], 255);
+        assert!(k[1..].iter().all(|b| *b == 0));
+        assert_eq!(b_corr, 15);
+        assert!(publication.verify(&keys.disclosure));
+        assert_eq!(publication.disclosures.values[0], [255; 32]);
+    }
+
+    #[test]
+    fn a_complete_counter_response_uses_every_publication_input() {
+        let (keys, tx, _, _) = counter_witnesses();
+        let plain = std::array::from_fn(|_| lngap_btc::bitcoin::ScriptBuf::from_bytes(vec![0x51]));
+        let published =
+            std::array::from_fn(|_| lngap_btc::bitcoin::ScriptBuf::from_bytes(vec![0x52]));
+        assert!(matches!(
+            counter_response(&keys, &tx, &plain, &published).unwrap(),
+            Response::Counter(_)
+        ));
+        let mut unknown = tx;
+        unknown.input[3].witness =
+            Witness::from_slice(&[vec![], vec![], vec![0x54], vec![0xc0; 33]]);
+        assert!(counter_response(&keys, &unknown, &plain, &published).is_err());
+    }
+
+    fn counter_fields(
+        response: Response,
+    ) -> (Hashes, Vec<u8>, Hashes, u32, Hashes, Box<SignedDisclosures>) {
+        let Response::Counter(HubResponse::Counter {
+            e_sig,
+            k,
+            k_sig,
+            b_corr,
+            corr_sig,
+            publication,
+        }) = response
+        else {
+            panic!("not a complete counter")
+        };
+        (e_sig, k, k_sig, b_corr, corr_sig, publication)
+    }
+
+    fn alias_digit(arguments: &mut [Vec<u8>], range: std::ops::Range<usize>, alias: &[u8]) {
+        let mut changed = false;
+        for item in &mut arguments[range] {
+            if item == &[15] {
+                *item = alias.to_vec();
+                changed = true;
+            }
+        }
+        assert!(changed, "fixture has no digit 15 in this signature");
+    }
+
+    fn replace_arguments(tx: &mut Transaction, i: usize, mut arguments: Vec<Vec<u8>>) {
+        let witness: Vec<_> = tx.input[i].witness.iter().map(<[u8]>::to_vec).collect();
+        arguments.reverse();
+        arguments.extend([
+            witness[witness.len() - 4].clone(),
+            witness[witness.len() - 3].clone(),
+            witness[witness.len() - 2].clone(),
+            witness[witness.len() - 1].clone(),
+        ]);
+        tx.input[i].witness = Witness::from_slice(&arguments);
+    }
+
+    #[test]
+    fn counter_messages_are_recovered_from_hashes_not_declared_digits() {
+        let (keys, tx, _, _) = counter_witnesses();
+        let plain = std::array::from_fn(|_| lngap_btc::bitcoin::ScriptBuf::from_bytes(vec![0x51]));
+        let published =
+            std::array::from_fn(|_| lngap_btc::bitcoin::ScriptBuf::from_bytes(vec![0x52]));
+        let expected = counter_fields(counter_response(&keys, &tx, &plain, &published).unwrap());
+        let b = 2 * WotsParams::for_bytes(4).total_digits() as usize;
+        let n = WotsParams::for_bytes(32).total_digits() as usize;
+        let e_len = 3 * n + (n - WotsParams::for_bytes(32).message_digits as usize);
+        let args = input_args(&tx.input[0].witness);
+        let ranges = [
+            2 * b..3 * b,
+            3 * b..3 * b + 2 * n,
+            3 * b + 2 * n..3 * b + 2 * n + 6,
+            3 * b + e_len..args.len(),
+        ];
+        for alias in [vec![16], vec![16, 1]] {
+            for range in &ranges {
+                let mut changed = tx.clone();
+                let mut arguments = args.clone();
+                alias_digit(&mut arguments, range.clone(), &alias);
+                replace_arguments(&mut changed, 0, arguments);
+                assert_eq!(
+                    counter_fields(counter_response(&keys, &changed, &plain, &published).unwrap()),
+                    expected
+                );
+            }
+            let mut changed = tx.clone();
+            let mut arguments = input_args(&changed.input[1].witness);
+            let length = arguments.len();
+            alias_digit(&mut arguments, 0..length, &alias);
+            replace_arguments(&mut changed, 1, arguments);
+            assert_eq!(
+                counter_fields(counter_response(&keys, &changed, &plain, &published).unwrap()),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn forward_hashing_a_reveal_cannot_forge_a_message_with_the_old_checksum() {
+        let (keys, tx, args, _) = counter_witnesses();
+        let raw = Babe::read_corrected_response_hashes(&args, WotsParams::for_bytes(K_LEN as u32))
+            .unwrap();
+        let mut k = Hashes(raw.k);
+        k.0[2] = wots::chain(k.0[2], 1);
+        assert!(signed_message(&keys.k, &k, K_LEN)
+            .unwrap_err()
+            .to_string()
+            .contains("response signature checksum"));
+        let witness = input_args(&tx.input[1].witness);
+        let mut chunk = Hashes(
+            Babe::read_wots256_hashes(WotsParams::for_bytes(CHUNK_BYTES[0] as u32), &witness)
+                .unwrap(),
+        );
+        chunk.0[64] = wots::chain(chunk.0[64], 1);
+        assert!(signed_message(&keys.disclosure[0], &chunk, CHUNK_BYTES[0])
+            .unwrap_err()
+            .to_string()
+            .contains("response signature checksum"));
+    }
+
+    #[test]
+    fn any_plain_publication_makes_a_mixed_counter_a_full_claim_response() {
+        let (keys, tx, _, _) = counter_witnesses();
+        let word = WotsParams::for_bytes(4);
+        let message = WotsParams::for_bytes(32);
+        let b = Wots256Secret::from_entropy(word, [1; 32]);
+        let alice_b = WotsSecret::from_entropy(word, [20; 32]);
+        let alice_e = WotsSecret::from_entropy(message, [21; 32]);
+        let hub_e = Wots256Secret::from_entropy(message, [2; 32]);
+        let mut digest = [255; 32];
+        digest[31] = 240;
+        let wire = Babe::respond_exit_wire(
+            &b.sign(&128u32.to_be_bytes()).unwrap(),
+            &alice_b.sign(&128u32.to_be_bytes()).unwrap(),
+            &alice_e.sign(&digest).unwrap(),
+            &hub_e.sign(&digest).unwrap(),
+            None,
+        );
+        let n = 4 * word.total_digits() as usize;
+        let mut e_wire = wire[..wire.len() - n].to_vec();
+        e_wire.extend([vec![], vec![], vec![0x51], vec![0xc0; 33]]);
+        let plain = std::array::from_fn(|_| lngap_btc::bitcoin::ScriptBuf::from_bytes(vec![0x51]));
+        let published =
+            std::array::from_fn(|_| lngap_btc::bitcoin::ScriptBuf::from_bytes(vec![0x52]));
+        for i in 1..=5 {
+            let mut mixed = tx.clone();
+            mixed.input[i].witness = Witness::from_slice(&e_wire);
+            // The other inputs' disclosed bytes are unnecessary on this
+            // path, but every input must still use an authorized leaf.
+            let Response::Plain(HubResponse::Plain { e_sig }) =
+                counter_response(&keys, &mixed, &plain, &published).unwrap()
+            else {
+                panic!("a mixed response did not select the full claim")
+            };
+            assert!(wots::verify_msg(&keys.e_plain, &e_sig, &digest));
+            for alias in [vec![16], vec![16, 1]] {
+                let mut aliased = mixed.clone();
+                let mut arguments = input_args(&aliased.input[i].witness);
+                let n = 2 * message.total_digits() as usize;
+                alias_digit(&mut arguments, 0..n, &alias);
+                replace_arguments(&mut aliased, i, arguments);
+                let Response::Plain(HubResponse::Plain { e_sig }) =
+                    counter_response(&keys, &aliased, &plain, &published).unwrap()
+                else {
+                    panic!("aliased E blocked a mixed response")
+                };
+                assert!(wots::verify_msg(&keys.e_plain, &e_sig, &digest));
+            }
+            for zero in [vec![], vec![0], vec![0x80]] {
+                let mut aliased = mixed.clone();
+                let mut arguments = input_args(&aliased.input[i].witness);
+                let n = 2 * message.total_digits() as usize;
+                assert_eq!(arguments[n], vec![15]);
+                arguments[n] = vec![16];
+                arguments[n + 2] = zero.clone();
+                arguments[n + 4] = zero;
+                replace_arguments(&mut aliased, i, arguments);
+                let Response::Plain(HubResponse::Plain { e_sig }) =
+                    counter_response(&keys, &aliased, &plain, &published).unwrap()
+                else {
+                    panic!("tied-checksum encoding blocked a mixed response")
+                };
+                assert!(wots::verify_msg(&keys.e_plain, &e_sig, &digest));
+            }
+        }
+        let mut mixed = tx;
+        for i in 1..=5 {
+            mixed.input[i].witness = Witness::from_slice(&e_wire);
+            assert!(matches!(
+                counter_response(&keys, &mixed, &plain, &published).unwrap(),
+                Response::Plain(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn missing_or_unauthenticated_disclosures_are_not_an_unproven_counter() {
+        let (keys, mut tx, args, publication) = counter_witnesses();
+        tx.input.pop();
+        assert!(read_disclosures(&keys, &tx).is_err());
+        let mut wrong = keys.clone();
+        wrong.disclosure[0].0[0][0] ^= 1;
+        assert!(read_counter(&wrong, &args, publication.clone()).is_err());
+        let mut changed = publication;
+        changed.disclosures.values[0][0] ^= 1;
+        assert!(read_counter(&keys, &args, changed).is_err());
+    }
+
+    #[test]
+    fn malformed_counter_arguments_return_errors_instead_of_panicking() {
+        let (keys, mut tx, args, publication) = counter_witnesses();
+        for length in [0, 1, 39, args.len() - 1] {
+            assert!(read_counter(&keys, &args[..length], publication.clone()).is_err());
+        }
+        tx.input[1].witness = Witness::new();
+        assert!(read_disclosures(&keys, &tx).is_err());
+        let mut wrong = keys;
+        wrong.k.0.pop();
+        assert!(read_counter(&wrong, &args, publication).is_err());
+    }
+
+    #[test]
+    fn a_plain_publication_carries_a_full_claim_signature_without_amount_signatures() {
+        let word = WotsParams::for_bytes(4);
+        let message = WotsParams::for_bytes(32);
+        let b = Wots256Secret::from_entropy(word, [1; 32]);
+        let alice_b = WotsSecret::from_entropy(word, [2; 32]);
+        let alice_e = WotsSecret::from_entropy(message, [3; 32]);
+        let hub_e = Wots256Secret::from_entropy(message, [4; 32]);
+        let digest = [5; 32];
+        let wire = Babe::respond_exit_wire(
+            &b.sign(&128u32.to_be_bytes()).unwrap(),
+            &alice_b.sign(&128u32.to_be_bytes()).unwrap(),
+            &alice_e.sign(&digest).unwrap(),
+            &hub_e.sign(&digest).unwrap(),
+            None,
+        );
+        // The exact e_wire used by respond() on every publication input.
+        let n = 4 * word.total_digits() as usize;
+        let mut args = wire[..wire.len() - n].to_vec();
+        args.reverse();
+        let signature = Babe::read_plain_publication_hashes(&args).unwrap();
+        assert!(wots::verify_msg(
+            &Hashes(hub_e.public().digits),
+            &Hashes(signature),
+            &digest
+        ));
+        for length in [0, 1, args.len() - 1] {
+            assert!(Babe::read_plain_publication_hashes(&args[..length]).is_err());
+        }
+    }
+
+    fn funded_opening() -> (Opening, HolderKeys, HubKeys) {
+        use crate::opening::{Context, Holder};
+        use k256::{elliptic_curve::PrimeField as _, Scalar};
+
+        let seed: [u8; 32] =
+            hex("2c45ef335c38f0e7417c97395c863c450c35fa34a629267e999994292aaa9ee7")
+                .try_into()
+                .unwrap();
+        let spend: [u8; 32] =
+            hex("548fedbbc7e1fb67570cac75bf01a723c31987d60bfcd44eafd8c1da39b7c54f")
+                .try_into()
+                .unwrap();
+        let spend = Option::<Scalar>::from(Scalar::from_repr(spend.into())).unwrap();
+        let holder = Holder::load(
+            include_bytes!("../tests/golden/holder-funded.bin"),
+            seed,
+            spend,
+            &Context {
+                tip: 0,
+                trust: Trust::mock(),
+            },
+        )
+        .unwrap();
+        let opening = holder.opening().unwrap();
+        let keys = HolderKeys::derive(&seed, &opening.base.parts().nonce);
+        // The frozen format-1 fixture header is MAGIC, u16 format, u8
+        // derivation, u8 party, u8 phase, then its documented test secret.
+        let hub = include_bytes!("../tests/golden/hub-funded.bin");
+        let hub = HubKeys::from_secret(hub[9..41].try_into().unwrap());
+        assert_eq!(
+            hub.sealed.public(),
+            *opening.base.parts().response_keys.keys()
+        );
+        (opening, keys, hub)
+    }
+
+    #[test]
+    fn corrected_assertions_use_separate_proof_amount_and_lamport_keys() {
+        let (opening, keys, hub) = funded_opening();
+        let signature = Hashes(hub.b_corr.sign(&15u32.to_be_bytes()).unwrap().hashes);
+        let corrected = Corrected::new(&opening, 15, &signature).unwrap();
+        let trust = Trust::mock();
+        let proof = corrected.mock_proof(&trust).unwrap();
+        let full_proof = mock_proof(&opening, &trust).unwrap();
+        assert!(corrected.proves(&trust, &proof));
+        assert!(!corrected.proves(&trust, &full_proof));
+        assert!(!proves(&opening, &trust, &proof));
+        let tx = corrected.assert(&keys, &proof).unwrap();
+        assert!(Corrected::is_assert(&opening, &tx));
+        assert!(!is_assert(&opening, &tx));
+        assert!(asserted(&opening, &tx).is_err());
+        let (adopted, posted, b) = Corrected::asserted(&opening, &tx).unwrap();
+        assert_eq!(adopted.amount(), 15);
+        assert_eq!(posted, proof);
+        assert_eq!(b.message(), 15u32.to_be_bytes());
+        assert!(opening.babe.spec.b_key.verify(&b).is_err());
+        let full_tx = assert(&opening, &keys, &full_proof).unwrap();
+        assert_eq!(asserted(&opening, &full_tx).unwrap(), full_proof);
+        assert!(Corrected::asserted(&opening, &full_tx).is_err());
+    }
+
+    #[test]
+    fn unsigned_assertion_fields_cannot_replace_the_pinned_receipt() {
+        let (opening, keys, hub) = funded_opening();
+        let full = mock_proof(&opening, &Trust::mock()).unwrap();
+        let signature = Hashes(hub.b_corr.sign(&15u32.to_be_bytes()).unwrap().hashes);
+        let corrected = Corrected::new(&opening, 15, &signature).unwrap();
+        let reduced = corrected.mock_proof(&Trust::mock()).unwrap();
+        for (mut tx, proof, is_corrected) in [
+            (assert(&opening, &keys, &full).unwrap(), full, false),
+            (corrected.assert(&keys, &reduced).unwrap(), reduced, true),
+        ] {
+            let mut arguments = args(&tx);
+            let n = lichen_babe::setup::DIGITS;
+            arguments[n] = vec![];
+            arguments[n + 1] = vec![];
+            replace_arguments(&mut tx, 0, arguments);
+            if is_corrected {
+                assert!(Corrected::asserted(&opening, &tx).is_err());
+                assert_eq!(
+                    Corrected::asserted_keeping(&opening, &tx, &proof)
+                        .unwrap()
+                        .1,
+                    proof
+                );
+            } else {
+                assert!(asserted(&opening, &tx).is_err());
+                assert_eq!(asserted_keeping(&opening, &tx, &proof).unwrap(), proof);
+            }
+            let mut other = proof.clone();
+            other.a = ark_bn254::G1Affine::default();
+            assert_ne!(other.a, proof.a);
+            if is_corrected {
+                assert!(Corrected::asserted_keeping(&opening, &tx, &other).is_err());
+            } else {
+                assert!(asserted_keeping(&opening, &tx, &other).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn a_corrected_assertion_reuses_its_posted_amount_signature_despite_digit_aliases() {
+        let (opening, keys, hub) = funded_opening();
+        let signature = Hashes(hub.b_corr.sign(&15u32.to_be_bytes()).unwrap().hashes);
+        let corrected = Corrected::new(&opening, 15, &signature).unwrap();
+        let proof = corrected.mock_proof(&Trust::mock()).unwrap();
+        let original = corrected.assert(&keys, &proof).unwrap();
+        for alias in [vec![16], vec![16, 1]] {
+            let mut tx = original.clone();
+            let mut arguments = args(&tx);
+            let end = arguments.len();
+            alias_digit(&mut arguments, lichen_babe::setup::DIGITS + 2..end, &alias);
+            replace_arguments(&mut tx, 0, arguments);
+            let (adopted, posted, b) = Corrected::asserted(&opening, &tx).unwrap();
+            assert_eq!(adopted.amount(), 15);
+            assert_eq!(posted, proof);
+            assert_eq!(b.message(), 15u32.to_be_bytes());
+        }
+        let mut changed = original;
+        let mut arguments = args(&changed);
+        let at =
+            lichen_babe::setup::DIGITS + 2 + 2 * WotsParams::for_bytes(4).total_digits() as usize;
+        arguments[at + 1][0] ^= 1;
+        replace_arguments(&mut changed, 0, arguments);
+        assert!(Corrected::asserted(&opening, &changed).is_err());
+    }
+
+    #[test]
+    fn corrected_amounts_must_be_signed_within_the_cap_including_zero() {
+        let (opening, _, hub) = funded_opening();
+        let signature = Hashes(hub.b_corr.sign(&0u32.to_be_bytes()).unwrap().hashes);
+        assert_eq!(Corrected::new(&opening, 0, &signature).unwrap().amount(), 0);
+        assert!(Corrected::new(&opening, 1, &signature).is_err());
+        let amount = opening.base.parts().cap + 1;
+        let signature = Hashes(hub.b_corr.sign(&amount.to_be_bytes()).unwrap().hashes);
+        assert!(Corrected::new(&opening, amount, &signature).is_err());
+    }
+
+    fn fee_coin(keys: &HolderKeys) -> (lngap_btc::bitcoin::OutPoint, lngap_btc::bitcoin::TxOut) {
+        use lngap_btc::bitcoin::{hashes::Hash as _, Amount, OutPoint, TxOut, Txid};
+        (
+            OutPoint {
+                txid: Txid::from_byte_array([81; 32]),
+                vout: 0,
+            },
+            TxOut {
+                value: Amount::from_sat(20_000),
+                script_pubkey: close::fee_script(keys).unwrap(),
+            },
+        )
+    }
+
+    #[test]
+    fn corrected_success_collects_the_right_bits_and_reserve_including_zero() {
+        use lngap_btc::bitcoin::{FeeRate, ScriptBuf};
+        for amount in [0u32, 15, 4_096] {
+            let (opening, keys, hub) = funded_opening();
+            let signature = Hashes(hub.b_corr.sign(&amount.to_be_bytes()).unwrap().hashes);
+            let corrected = Corrected::new(&opening, amount, &signature).unwrap();
+            let proof = corrected.mock_proof(&Trust::mock()).unwrap();
+            let asserted = corrected.assert(&keys, &proof).unwrap();
+            let (adopted, _, b) = Corrected::asserted(&opening, &asserted).unwrap();
+            let fee = fee_coin(&keys);
+            let paid = adopted.success(&keys, fee.clone()).unwrap();
+            assert!(adopted.is_success(&paid).unwrap());
+            assert!(!is_success(&opening, &paid).unwrap());
+            assert_eq!(paid.input[1].previous_output, fee.0);
+            let full = success(&opening, &keys, fee).unwrap();
+            assert!(!adopted.is_success(&full).unwrap());
+            let to = ScriptBuf::from_bytes(opening.base.parts().parties[0].payout_script.clone());
+            let rate = FeeRate::from_sat_per_vb(2).unwrap();
+            let swept = adopted.sweep(&keys, &paid, &b, to.clone(), rate).unwrap();
+            assert_eq!(swept.output.len(), 1);
+            assert!(swept.output[0].value >= to.minimal_non_dust());
+            assert!(swept
+                .input
+                .iter()
+                .all(|i| i.previous_output.txid == paid.compute_txid()));
+            assert!(close::sweep(&opening, &keys, &paid, amount, &b, to, rate).is_err());
+            assert_eq!(
+                swept.input.len(),
+                1 + (amount >> opening.babe.spec.terms.low_bits).count_ones() as usize
+            );
+            if amount == 0 {
+                assert_eq!(swept.input.len(), 1, "only her reserve is collected");
+            }
+        }
+    }
+
+    #[test]
+    fn corrected_challenges_and_answers_are_never_confused_with_full_claims() {
+        let (opening, _, hub) = funded_opening();
+        let signature = Hashes(hub.b_corr.sign(&15u32.to_be_bytes()).unwrap().hashes);
+        let corrected = Corrected::new(&opening, 15, &signature).unwrap();
+        let challenge = presign(&opening, CHALLENGE_CORRECTED).unwrap().tx.clone();
+        assert!(corrected.is_challenge(&challenge));
+        assert!(!is_challenge(&opening, &challenge));
+        let full = presign(&opening, CHALLENGE).unwrap().tx.clone();
+        assert!(!corrected.is_challenge(&full));
+        for p in opening
+            .set
+            .iter()
+            .filter(|p| p.name.starts_with("wrongly_challenged_"))
+        {
+            let is_corrected = p.name.contains("corrected");
+            assert_eq!(corrected.is_answer(&p.tx), is_corrected);
+            assert_eq!(is_answer(&opening, &p.tx), !is_corrected);
+        }
+    }
+
+    #[test]
+    #[ignore = "reconstructs garbled instances; run in release mode"]
+    fn a_corrected_challenge_opens_the_corrected_instances_and_collects() {
+        use crate::opening::{Context, Hub};
+        use lichen_babe::reveal::{complete, reveal_args};
+        use lngap_btc::bitcoin::{FeeRate, ScriptBuf};
+
+        let (opening, keys, hub_keys) = funded_opening();
+        let ctx = Context {
+            tip: 0,
+            trust: Trust::mock(),
+        };
+        let hub = Hub::load(include_bytes!("../tests/golden/hub-funded.bin"), &ctx).unwrap();
+        let [full, corrected_setup] = opening
+            .setups(|stage, index, _| {
+                let message =
+                    crate::wire::Envelope::from_bytes(&hub.instance(stage, index, &ctx)?)?;
+                let kept = crate::wire::Kept::decode(&message.body)?;
+                assert_eq!((kept.stage, kept.index), (stage, index));
+                Ok(kept.instance)
+            })
+            .unwrap();
+        let signature = Hashes(hub_keys.b_corr.sign(&15u32.to_be_bytes()).unwrap().hashes);
+        let corrected = Corrected::new(&opening, 15, &signature).unwrap();
+        let proof = corrected.mock_proof(&ctx.trust).unwrap();
+        let asserted = corrected.assert(&keys, &proof).unwrap();
+        let (_, _, b) = Corrected::asserted(&opening, &asserted).unwrap();
+        let (_, digits, _, _) = pi(&proof);
+        let preimages = keys.corrected.lamport.sign(&digits);
+        let secrets: Vec<_> = digits
+            .iter()
+            .enumerate()
+            .map(|(i, d)| hub_keys.corrected.dealer.reveal(i, *d))
+            .collect();
+        let wire = Babe::challenge_wire(reveal_args(
+            &preimages,
+            &complete(&corrected_setup.presigs, &digits, &secrets),
+        ));
+        let challenge = finished(&opening, CHALLENGE_CORRECTED, wire).unwrap();
+        assert!(!matches!(
+            corrected.answer(&keys, &full, &challenge, &proof, fee_coin(&keys)),
+            Ok(Some(_))
+        ));
+        let paid = corrected
+            .answer(&keys, &corrected_setup, &challenge, &proof, fee_coin(&keys))
+            .unwrap()
+            .expect("a valid corrected proof opens a kept instance");
+        assert!(corrected.is_answer(&paid));
+        assert!(!is_answer(&opening, &paid));
+        let to = ScriptBuf::from_bytes(opening.base.parts().parties[0].payout_script.clone());
+        let swept = corrected
+            .sweep(
+                &keys,
+                &paid,
+                &b,
+                to.clone(),
+                FeeRate::from_sat_per_vb(2).unwrap(),
+            )
+            .unwrap();
+        assert!(swept.output[0].value >= to.minimal_non_dust());
+    }
 
     /// A genuine proof as `licash-r0 native-wrap` exports it (a holder's
     /// claim on regtest, under the native holder program): its points

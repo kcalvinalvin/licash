@@ -1,6 +1,10 @@
 package org.licash.wallet.ui
 
 import android.net.Uri
+import android.content.Intent
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Column
@@ -35,10 +39,12 @@ import androidx.compose.ui.unit.dp
 import org.licash.core.Contract
 import org.licash.core.ContractQuote
 import org.licash.core.ContractSafety
+import org.licash.core.ContractInspection
 import org.licash.core.ContractState
 import org.licash.core.Recovery
 import org.licash.core.RecoveryStage
 import org.licash.wallet.Proving
+import org.licash.wallet.digits
 import org.licash.wallet.sat
 import org.licash.wallet.share
 import org.licash.wallet.safetyStatus
@@ -65,13 +71,21 @@ internal fun CoverRow(
     stopProving: () -> Unit = {},
     saveReceipt: (Uri) -> Unit = {},
     safety: suspend () -> ContractSafety? = { null },
+    inspection: suspend () -> ContractInspection? = { null },
+    explorer: (String) -> String? = { null },
 ) {
     val colors = MaterialTheme.colorScheme
     val cover = cover(c, height)
     val forcing = recovery?.let { forcing(it, height) }
     var open by rememberSaveable(c.id) { mutableStateOf(false) }
     var plan by remember(c.id) { mutableStateOf<ContractSafety?>(null) }
-    LaunchedEffect(open, c.id) { if (open && recovery == null) plan = safety() }
+    var details by remember(c.id) { mutableStateOf<ContractInspection?>(null) }
+    LaunchedEffect(open, c.id, c.state) {
+        if (open) {
+            if (recovery == null) plan = safety()
+            details = inspection()
+        }
+    }
     // While it is set up: the step it is at.
     val step = c.step?.let { setup(it) }
     val tint = when {
@@ -136,8 +150,47 @@ internal fun CoverRow(
                 } else {
                     Unfolded(c, cover, developer, end, forceClose, plan, height)
                 }
+                details?.let { ContractLayout(it, explorer) }
             }
         }
+    }
+}
+
+/** One lock, split into its payout pool and reserves. The claim cap is a
+ * limit inside the pool, never another slice of the same bitcoin. */
+@Composable
+private fun ContractLayout(info: ContractInspection, explorer: (String) -> String?) {
+    val colors = MaterialTheme.colorScheme
+    val context = LocalContext.current
+    var technical by remember(info.address) { mutableStateOf(false) }
+    Line("Locked on Bitcoin", sat(info.locked), tag = "contract-locked")
+    Row(Modifier.fillMaxWidth().height(12.dp).testTag("contract-split")) {
+        listOf(info.payoutPool to colors.primary, info.holderReserve to colors.tertiary, info.hubReserve to colors.secondary).forEach { (amount, color) ->
+            if (amount > 0uL) Box(Modifier.weight(amount.toFloat()).fillMaxHeight().background(color))
+        }
+    }
+    Line("Payout pool", sat(info.payoutPool))
+    Line("Your reserve", sat(info.holderReserve))
+    Line("Hub reserve", sat(info.hubReserve))
+    Line("Maximum claim", sat(info.claimLimit.toULong()))
+    Say("The claim limit is inside the pool, not extra bitcoin. The recovery outcome decides how the pool and reserves are paid.")
+    explorer(info.address)?.let { link ->
+        Entry("View contract on Bitcoin", tag = "contract-explorer", onClick = {
+            runCatching { context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(link))) }
+        })
+    }
+    TextButton(onClick = { technical = !technical }, modifier = Modifier.testTag("contract-technical")) {
+        Text(if (technical) "Hide technical details" else "Technical details")
+    }
+    if (technical) {
+        Line("Type", "Native corrected")
+        Line("Graph version", digits(info.graphVersion.toULong()))
+        Line("Claim note limit", digits(info.noteLimit.toULong()))
+        Line("Denominations (sat)", info.denominations.joinToString { digits(it) })
+        Line("Keyset", info.keyset)
+        Line("Holder program", info.holderProgram)
+        Line("Counter program", info.counterProgram)
+        Text(info.address, style = MaterialTheme.typography.bodySmall)
     }
 }
 
@@ -149,12 +202,18 @@ private fun Unfolded(c: Contract, cover: Cover, developer: Boolean, end: () -> U
     // Of what its hub holds, those ending first covering first.
     if (cover.on) Line("Covers now", sat(c.covers), tag = "covers")
     if (cover.ends != null) Line("Ends by itself in", cover.ends)
-    if (!cover.failed) Line("Cost", sat(c.price), share = share(c.price, c.cap))
+    if (!cover.failed) FeeLine("Cost", c.price, c.cap, value = sat(c.price), breakdown = setupCost(c.cap, c.price))
     if (cover.held) {
+        // Its status at a glance; the margin and what it means, when tapped.
         safety?.let {
-            Line("Recovery planning", safetyStatus(it, height))
-            Line("Your proof margin", "${it.proofMargin} blocks")
-            Say("Planning only. Start earlier for confirmation time. Stay online: a late hub answer can reduce your proving time until your timeout confirms.")
+            var planning by remember { mutableStateOf(false) }
+            Line("Recovery planning", safetyStatus(it, height), tag = "planning", onClick = { planning = true })
+            if (planning) {
+                Sheet("Recovery planning", dismiss = { planning = false }) {
+                    Line("Your proof margin", "${it.proofMargin} blocks")
+                    Say("Planning only. Start earlier for confirmation time. Stay online: a late hub answer can reduce your proving time until your timeout confirms.")
+                }
+            }
         }
     }
     if (developer) {
@@ -181,6 +240,11 @@ private fun Unfolded(c: Contract, cover: Cover, developer: Boolean, end: () -> U
 @Composable
 private fun Forced(r: Recovery, developer: Boolean, giveUp: () -> Unit, height: Int) {
     Line("Claimed", sat(r.claimed), tag = "recovery-claimed")
+    r.corrected?.let {
+        Line("Unspent claim", sat(it), tag = "recovery-corrected")
+        Say("Before reserves and Bitcoin fees.")
+    }
+    r.received?.let { Line("Back on Bitcoin", sat(it), tag = "recovery-received") }
     if (needsProof(r) && height > 0) r.deadline?.let {
         Line("Time left to prove", "${it.toLong().minus(height).coerceAtLeast(0)} blocks")
     }
@@ -196,14 +260,39 @@ private fun Forced(r: Recovery, developer: Boolean, giveUp: () -> Unit, height: 
         r.payout?.let { Line("Payout", it.take(16) + "…") }
         r.sweep?.let { Line("Sweep", it.take(16) + "…") }
     }
-    if (r.stage == RecoveryStage.CLAIMED && !r.irrevocable) {
-        TextButton(onClick = giveUp, modifier = Modifier.testTag("give-up-recovery")) { Text("Give up") }
+    if (forcing(r, height).revocable) {
+        TextButton(onClick = giveUp, modifier = Modifier.testTag("give-up-recovery")) { Text("Cancel closing") }
+    }
+}
+
+/** Cancel only this unsigned attempt, not the contract or the right to try again. */
+@Composable
+internal fun GiveUpSheet(recovery: Recovery?, busy: Boolean, confirm: () -> Unit, dismiss: () -> Unit) {
+    val allowed = recovery?.let { forcing(it, 0).revocable } == true
+    Sheet(if (allowed) "Cancel closing?" else "Closing changed", dismiss) {
+        if (allowed && recovery != null) {
+            Line("Back to wallet", sat(recovery.claimed))
+            Line("Notes", digits(recovery.notes.toULong()))
+            Say("Stops this attempt and releases its reserved notes. It does not close the contract or recover Bitcoin.")
+            Say("You can force close again while the contract allows it. An offline hub still cannot pay you.")
+            BigButton(
+                if (busy) "Canceling…" else "Stop this attempt",
+                Modifier.fillMaxWidth().testTag("give-up-recovery-confirm"),
+                enabled = !busy,
+                danger = true,
+                onClick = confirm,
+            )
+            TextButton(onClick = dismiss, enabled = !busy, modifier = Modifier.fillMaxWidth()) { Text("Keep closing") }
+        } else {
+            Say("This attempt has moved on. It can no longer be canceled here.")
+            BigButton("Done", Modifier.fillMaxWidth(), onClick = dismiss)
+        }
     }
 }
 
 /**
  * What forcing a protection closed does, before it is done: for a hub that
- * stopped answering only, and final once its request is on Bitcoin.
+ * stopped answering only, and final once its request is signed.
  */
 @Composable
 internal fun ForceSheet(c: Contract, held: ULong, force: () -> Unit, dismiss: () -> Unit) {
@@ -214,7 +303,7 @@ internal fun ForceSheet(c: Contract, held: ULong, force: () -> Unit, dismiss: ()
                 "Your ${sat(claimed)} there leave your balance and are claimed on Bitcoin, " +
                 "back on Bitcoin in a few days if the hub stays silent. Its fees are paid from your Bitcoin.",
         )
-        Say("Once its request is on Bitcoin, it cannot be undone.")
+        Say("Once its request is signed, it cannot be canceled, even before it is on Bitcoin.")
         BigButton("Force close", Modifier.fillMaxWidth().testTag("force-close-confirm"), danger = true) { force() }
     }
 }
@@ -223,7 +312,7 @@ internal fun ForceSheet(c: Contract, held: ULong, force: () -> Unit, dismiss: ()
 @Composable
 internal fun Worth(mock: Boolean) {
     Text(
-        if (mock) MOCK else UNRECOVERED,
+        if (mock) MOCK else EXTERNAL_RECOVERY,
         modifier = Modifier.padding(bottom = 8.dp).testTag("worth"),
         style = MaterialTheme.typography.bodySmall,
         color = MaterialTheme.colorScheme.error,
@@ -240,7 +329,7 @@ internal fun ProtectSheet(q: ContractQuote, open: () -> Unit, cashOutFirst: () -
     Sheet("Protect at ${name(q.hub)}", dismiss) {
         Line("Covers up to", sat(q.cap), tag = "quote-cap")
         Line("For", span(q.protectsFor.toLong()), tag = "quote-for")
-        Line("Cost", sat(q.price), tag = "quote-price", share = share(q.price, q.cap))
+        FeeLine("Cost", q.price, q.cap, tag = "quote-price", value = sat(q.price), breakdown = setupCost(q.cap, q.price))
         Line("Takes", "Up to an hour, $download")
         Worth(q.mock)
         Spacer(Modifier.height(8.dp))

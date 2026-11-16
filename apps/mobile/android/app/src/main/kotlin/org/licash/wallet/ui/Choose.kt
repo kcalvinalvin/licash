@@ -86,7 +86,7 @@ internal fun ChooseSheet(
                 modifier = Modifier.testTag("contract-blocks"),
             )
         }
-        Line("Cost", sat(price), tag = "quote-price", share = share(price, capped))
+        FeeLine("Cost", price, capped, tag = "quote-price", value = sat(price), breakdown = setupCost(capped, price))
         if (coins.size > 1) {
             Text("Paid from", modifier = Modifier.padding(top = 12.dp), style = MaterialTheme.typography.bodyLarge)
             Row(Modifier.horizontalScroll(rememberScrollState())) {

@@ -97,6 +97,14 @@ With `--tweaks` (and `--chain`), the hub indexes the silent payment
 tip at the first start) in `<data>/tweaks.sqlite`, and serves them to light
 wallets at `/v1/chain/tweaks`. Deleting the file only loses the index.
 
+The hub keeps the payments it releases for their payees when their payers
+ask, for 14 days, in `<data>/inbox.sqlite`: payees collect them at
+`/v1/inbox` and tell their payers they have them, through the hub, without
+Nostr. Anyone sees the inbox's feed, which tells how many payments were
+kept, not whom they pay or how much. Deleting the file only loses the
+payments kept: their payers send them to the payees' mailboxes on Nostr
+once no acknowledgment comes.
+
 With `--deposit-sweep-address ADDRESS` (and `--chain`), the hub takes
 deposits on Bitcoin: a payment to a deposit's address, once confirmed,
 locks the hub's own notes to its payer, and the preimage the payer claims

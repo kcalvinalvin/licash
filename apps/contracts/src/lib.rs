@@ -174,7 +174,8 @@ pub fn trust(profile: ChainProfile) -> Result<Trust> {
 /// `r0/build-guest.sh` with the toolchains it pins, from the commit
 /// `r0/README.md` names. Each is kept as `r0/programs/<image id>.bin`:
 /// the contracts opened under one are proven with it alone, so none named
-/// here is ever to go.
+/// here is ever to go. Import verification currently supports only this
+/// holder image; preserve it until prior-image verification is implemented.
 pub const SIGNET: Programs = Programs {
     holder: hex!("8be30cb2a683e896d251c7c363dddf794dc8ddb9d502922199cfa4d2f73b1390"),
     counter: hex!("25051741d3d6438bc7f78ebf074a4b93f30363729564345bb800efd43ce21129"),
@@ -225,6 +226,15 @@ pub fn parse_id(hex: &str) -> Result<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_holder_image_stays_fixed_until_prior_openings_remain_verifiable() {
+        assert_eq!(
+            SIGNET.holder,
+            hex!("8be30cb2a683e896d251c7c363dddf794dc8ddb9d502922199cfa4d2f73b1390"),
+            "changing the holder image strands prior funded openings: full and corrected proofs use the current authority; add prior-image verification and a genuine prior-image proof regression first"
+        );
+    }
 
     #[test]
     fn frames_read_back_as_written() {

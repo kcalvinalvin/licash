@@ -769,7 +769,7 @@ async fn a_wallet_file_of_version_4_gains_payouts() {
         .unwrap();
     assert_eq!(version(&path), 4);
     let wallet = Wallet::open(&path, Link(Net::new())).unwrap();
-    assert_eq!(version(&path), 8);
+    assert_eq!(version(&path), 9);
     // Trusted, as every hub of an older file.
     assert_eq!(wallet.hubs().unwrap().len(), 1);
     assert!(wallet.visited().unwrap().is_empty());

@@ -15,7 +15,7 @@ pub mod recovery;
 pub mod safety;
 mod store;
 
-use std::path::Path;
+use std::{collections::HashSet, path::Path};
 
 use anyhow::{anyhow, bail, ensure, Context as _, Result};
 use bitcoin::{OutPoint, ScriptBuf};
@@ -360,6 +360,213 @@ pub fn list(dir: &Path) -> Result<Vec<Contract>> {
     }
 }
 
+/// Snapshot the contract database while the caller holds its driver lock.
+/// Instance files are copied under the same lock by the bundle writer.
+pub fn snapshot_database(dir: &Path, to: &Path) -> Result<bool> {
+    let Some(store) = Store::existing(dir)? else {
+        return Ok(false);
+    };
+    store.snapshot(to)?;
+    Ok(true)
+}
+
+/// Check a restored store before installing it, without advancing a driver
+/// or touching the chain: every recovery row must be one this build carries
+/// on, and every signed opening it can read must have the instances its
+/// recovery needs. An opening this build cannot read is carried as it was,
+/// as on the phone it came from; it covers nothing here either.
+pub fn validate_backup<T: Transport>(wallet: &Wallet<T>, dir: &Path) -> Result<()> {
+    let Some(store) = Store::existing(dir)? else {
+        return Ok(());
+    };
+    recovery::validate_backup(&store).context("this backup needs a newer version of the app")?;
+    let ctx = licash_contract::opening::Context {
+        tip: 0,
+        trust: crate::trust(wallet.network())?,
+    };
+    let keys = wallet.contract_secrets();
+    for c in store.list()? {
+        if c.phase < Phase::Funded {
+            continue;
+        }
+        let (state, _) = store.state(&c.id)?;
+        let opening = match Holder::load(&state, keys.seed, keys.spend, &ctx)
+            .and_then(|holder| holder.opening())
+        {
+            Ok(opening) => opening,
+            Err(e) => {
+                tracing::warn!(id = %crate::hex_id(&c.id), "restoring an unreadable opening as is: {e:#}");
+                continue;
+            }
+        };
+        for (stage, instances) in opening.instances.iter().enumerate() {
+            for instance in instances {
+                ensure!(
+                    store.has_instance(&c.id, stage, instance.index),
+                    "the backup lacks a file a protection's recovery needs"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Financial and technical details from the holder's kept signed opening.
+pub struct Inspection {
+    pub address: String,
+    pub locked: u64,
+    pub payout_pool: u64,
+    pub holder_reserve: u64,
+    pub hub_reserve: u64,
+    pub claim_limit: u32,
+    pub note_limit: u32,
+    pub denominations: Vec<u64>,
+    pub keyset: String,
+    pub graph_version: u32,
+    pub holder_program: String,
+    pub counter_program: String,
+}
+
+/// Read only when requested. Earlier opening stages may not have a signed
+/// graph yet, in which case these details are unavailable rather than guessed.
+pub fn inspect<T: Transport>(
+    wallet: &Wallet<T>,
+    dir: &Path,
+    id: &[u8; 32],
+    tip: u32,
+) -> Result<Inspection> {
+    let store = Store::existing(dir)?.context("no contracts")?;
+    let (state, _) = store.state(id)?;
+    let secrets = wallet.contract_secrets();
+    let ctx = licash_contract::opening::Context {
+        tip,
+        trust: crate::trust(wallet.network())?,
+    };
+    let opening = Holder::load(&state, secrets.seed, secrets.spend, &ctx)?.opening()?;
+    let network = match wallet.network() {
+        licash::spend::ChainProfile::Core30Mainnet => bitcoin::Network::Bitcoin,
+        licash::spend::ChainProfile::Core30DefaultRegtest => bitcoin::Network::Regtest,
+        _ => bitcoin::Network::Signet,
+    };
+    inspection(&opening, network)
+}
+
+fn inspection(
+    opening: &licash_contract::opening::Opening,
+    network: bitcoin::Network,
+) -> Result<Inspection> {
+    let parts = opening.base.parts();
+    let script = opening.babe.tree()?.script_pubkey();
+    let locked = opening
+        .funding
+        .output
+        .iter()
+        .find(|out| out.script_pubkey == script)
+        .context("no contract output")?
+        .value
+        .to_sat();
+    ensure!(
+        locked == parts.graph.graph_value()?,
+        "contract lock disagrees with its signed terms"
+    );
+    Ok(Inspection {
+        address: bitcoin::Address::from_script(&script, network)?.to_string(),
+        locked,
+        payout_pool: u64::from(parts.graph.maximum_amount()?),
+        holder_reserve: parts.graph.reserve_alice,
+        hub_reserve: parts.graph.reserve_hub,
+        claim_limit: parts.cap,
+        note_limit: parts
+            .limits
+            .max_authorizations
+            .min(recovery::MAX_NOTES as u32),
+        denominations: parts.keyset.denominations().collect(),
+        keyset: crate::hex_id(parts.keyset.id()),
+        graph_version: parts.recipe.graph_version,
+        holder_program: crate::hex_id(&parts.recipe.holder_program),
+        counter_program: crate::hex_id(&parts.recipe.counter_program),
+    })
+}
+
+/// Precisely what live contracts can claim now, by id. Read signed opening
+/// terms rather than current hub offers. An unreadable or unsupported
+/// opening covers nothing; it never triggers recovery or reserves notes.
+pub fn coverage<T: Transport>(
+    wallet: &Wallet<T>,
+    dir: &Path,
+    contracts: &[Contract],
+    tip: u32,
+) -> Result<std::collections::HashMap<[u8; 32], u64>> {
+    let mut amounts = std::collections::HashMap::new();
+    if tip == 0 {
+        return Ok(amounts);
+    }
+    let Some(store) = Store::existing(dir)? else {
+        return Ok(amounts);
+    };
+    let trust = crate::trust(wallet.network())?;
+    let held = wallet.balance()?;
+    // A recovery fixes its notes once. The same one-shot graph cannot
+    // also protect notes left over or received after that decision.
+    let recovering = store.recoveries()?.into_iter().map(|r| r.id).collect();
+    let secrets = wallet.contract_secrets();
+    let ctx = licash_contract::opening::Context { tip, trust };
+    let mut ids = Vec::new();
+    let mut claims = Vec::new();
+    for c in coverage_order(contracts, tip, &held, &recovering) {
+        let read = || -> Result<_> {
+            let (state, _) = store.state(&c.id)?;
+            let opening = Holder::load(&state, secrets.seed, secrets.spend, &ctx)?.opening()?;
+            let parts = opening.base.parts();
+            ensure!(
+                trust.mock || parts.recipe.holder_program == trust.programs.holder,
+                "unsupported holder program"
+            );
+            Ok((
+                *parts.keyset.id(),
+                u64::from(parts.cap),
+                recovery::MAX_NOTES.min(parts.limits.max_authorizations as usize),
+            ))
+        };
+        match read() {
+            Ok(claim) => {
+                ids.push(c.id);
+                claims.push(claim);
+            }
+            Err(e) => {
+                tracing::warn!(id = %crate::hex_id(&c.id), "cannot count recovery coverage: {e:#}")
+            }
+        }
+    }
+    for (id, amount) in ids.into_iter().zip(wallet.claimable_amounts(&claims)?) {
+        if amount > 0 {
+            amounts.insert(id, amount);
+        }
+    }
+    Ok(amounts)
+}
+
+fn coverage_order<'a>(
+    contracts: &'a [Contract],
+    tip: u32,
+    held: &[licash_wallet::Balance],
+    recovering: &HashSet<[u8; 32]>,
+) -> Vec<&'a Contract> {
+    let mut live: Vec<_> = contracts
+        .iter()
+        .filter(|c| {
+            tip > 0
+                && c.live(tip)
+                && !recovering.contains(&c.id)
+                && held
+                    .iter()
+                    .any(|at| at.hub.trim_end_matches('/') == c.hub.trim_end_matches('/'))
+        })
+        .collect();
+    live.sort_by_key(|c| (c.assert_height, c.id));
+    live
+}
+
 /// The output of a contract's F in `dir`, confirmed, paying `pays` sat
 /// to `script`: a deposit she had F pay her change into
 /// ([`Change::Notes`]), to take back should its notes never come, its
@@ -613,6 +820,181 @@ mod tests {
     use licash_wallet::{Blocks, Response};
 
     use super::*;
+
+    #[test]
+    fn inspection_uses_the_funded_graph_not_the_deposit_and_never_adds_the_cap_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        let wallet = Wallet::create(
+            &dir.path().join("wallet.sqlite"),
+            &[7; 32],
+            ChainProfile::Core30DefaultRegtest,
+            Nowhere,
+        )
+        .unwrap();
+        let keys = wallet.contract_secrets();
+        let holder = Holder::load(
+            include_bytes!("../../../crates/licash-contract/tests/golden/holder-funded.bin"),
+            keys.seed,
+            keys.spend,
+            &licash_contract::opening::Context {
+                tip: 0,
+                trust: crate::trust(ChainProfile::Core30DefaultRegtest).unwrap(),
+            },
+        )
+        .unwrap();
+        let opening = holder.opening().unwrap();
+        let info = inspection(&opening, bitcoin::Network::Regtest).unwrap();
+        assert_eq!(
+            info.locked,
+            info.payout_pool + info.holder_reserve + info.hub_reserve
+        );
+        assert!(u64::from(info.claim_limit) <= info.payout_pool);
+        assert_eq!(
+            info.note_limit,
+            32.min(opening.base.parts().limits.max_authorizations)
+        );
+        assert_eq!(
+            info.denominations,
+            opening
+                .base
+                .parts()
+                .keyset
+                .denominations()
+                .collect::<Vec<_>>()
+        );
+        let address = info
+            .address
+            .parse::<bitcoin::Address<bitcoin::address::NetworkUnchecked>>()
+            .unwrap()
+            .require_network(bitcoin::Network::Regtest)
+            .unwrap();
+        assert_eq!(
+            address.script_pubkey(),
+            opening.babe.tree().unwrap().script_pubkey()
+        );
+        assert_eq!(
+            info.graph_version,
+            opening.base.parts().recipe.graph_version
+        );
+    }
+
+    #[test]
+    fn coverage_uses_live_trusted_contracts_in_deadline_and_id_order() {
+        let contract = |id, deadline, fate| Contract {
+            id: [id; 32],
+            hub: "http://hub.example".into(),
+            phase: Phase::Funded,
+            mock: false,
+            deposit: OutPoint::null(),
+            value: 60_000,
+            price: 23_000,
+            cap: 4_096,
+            assert_height: deadline,
+            close_height: 500,
+            funding: None,
+            fate: Some(fate),
+            abandoned: None,
+            created_at: 0,
+        };
+        let mut other = contract(5, 320, Fate::Live);
+        other.hub = "http://other.example".into();
+        let all = [
+            contract(3, 400, Fate::Live),
+            contract(2, 380, Fate::Live),
+            contract(1, 400, Fate::Live),
+            contract(4, 350, Fate::Open),
+            other,
+        ];
+        let held = [licash_wallet::Balance {
+            hub: "http://hub.example/".into(),
+            available: 104,
+            pending: 1_000,
+        }];
+        let ids = |tip| {
+            coverage_order(&all, tip, &held, &HashSet::new())
+                .iter()
+                .map(|c| c.id[0])
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(300), [2, 1, 3]);
+        assert_eq!(ids(380), [1, 3]);
+        assert!(ids(400).is_empty());
+        assert!(ids(0).is_empty());
+        assert_eq!(
+            coverage_order(&all, 300, &held, &HashSet::from([[2; 32]]))
+                .iter()
+                .map(|c| c.id[0])
+                .collect::<Vec<_>>(),
+            [1, 3]
+        );
+    }
+
+    #[test]
+    fn a_restored_funded_opening_needs_its_instances_and_an_unreadable_one_is_carried() {
+        let dir = tempfile::tempdir().unwrap();
+        let regtest = ChainProfile::Core30DefaultRegtest;
+        let wallet = Wallet::create(
+            &dir.path().join("wallet.sqlite"),
+            &[7; 32],
+            regtest,
+            Nowhere,
+        )
+        .unwrap();
+        // No contracts kept at all: nothing to check.
+        validate_backup(&wallet, dir.path()).unwrap();
+        let keys = wallet.contract_secrets();
+        let ctx = licash_contract::opening::Context {
+            tip: 0,
+            trust: crate::trust(regtest).unwrap(),
+        };
+        let bytes =
+            include_bytes!("../../../crates/licash-contract/tests/golden/holder-funded.bin");
+        let o = Holder::load(bytes, keys.seed, keys.spend, &ctx)
+            .unwrap()
+            .opening()
+            .unwrap();
+        let id = o.base.parts().nonce;
+        let store = Store::open(dir.path()).unwrap();
+        let insert = |id: [u8; 32], vout: u32, state: &[u8]| {
+            store
+                .insert(&New {
+                    id,
+                    hub: "http://hub.example",
+                    mock: true,
+                    deposit: OutPoint {
+                        txid: Txid::all_zeros(),
+                        vout,
+                    },
+                    value: 60_000,
+                    price: 23_000,
+                    cap: 4_096,
+                    assert_height: 300,
+                    close_height: 500,
+                    since: 0,
+                    state,
+                })
+                .unwrap();
+            store.save(&id, Phase::Funded, None, state).unwrap();
+        };
+        insert(id, 0, bytes);
+        let e = validate_backup(&wallet, dir.path()).unwrap_err();
+        assert!(format!("{e:#}").contains("lacks a file"), "{e:#}");
+        // Present is what is checked; a recovery reads them when it runs.
+        let all = o.instances.iter().enumerate();
+        let mut wanted: Vec<_> = all
+            .flat_map(|(stage, kept)| kept.iter().map(move |k| (stage, k.index)))
+            .collect();
+        let (stage, index) = wanted.pop().unwrap();
+        for (stage, index) in wanted {
+            store.keep(&id, stage, index, b"instance").unwrap();
+        }
+        assert!(validate_backup(&wallet, dir.path()).is_err());
+        store.keep(&id, stage, index, b"instance").unwrap();
+        validate_backup(&wallet, dir.path()).unwrap();
+        // One this build cannot read is restored as it was, not refused.
+        insert([9; 32], 1, b"of a later version");
+        validate_backup(&wallet, dir.path()).unwrap();
+    }
 
     /// No hub to reach.
     struct Nowhere;

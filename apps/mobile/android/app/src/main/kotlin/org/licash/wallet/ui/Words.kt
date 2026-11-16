@@ -79,7 +79,7 @@ const val NOT_PROTECTED = "Not protected"
 
 /** What each means, where asked. */
 const val PROTECTED_MEANS =
-    "Yours whatever happens: on Bitcoin, or backed by bitcoin a hub has locked for you."
+    "On Bitcoin, or claimable from a live recovery contract. Coverage counts whole eligible notes within each contract's payout and note limits. Recovering can require fees and a computer-made proof before its deadline."
 const val NOT_PROTECTED_MEANS =
     "Held on credit: a hub owes it to you, on its word alone. Protect it, or cash it out to Bitcoin."
 
@@ -195,14 +195,16 @@ internal fun optimizationCost(fee: ULong, state: State): String = when {
  */
 fun payingUpTo(hub: Hub, amount: ULong): ULong {
     val notes = 2uL * (ULong.SIZE_BITS - amount.countLeadingZeroBits()).toULong()
-    return hub.feeBase + hub.feePpm * amount / 1_000_000uL + (hub.feeOutputMsat * notes + 500uL) / 1_000uL
+    val made = (hub.feeOutputMsat * notes + 500uL) / 1_000uL
+    val due = feeDue(amount, org.licash.core.Rate(hub.feeBase, hub.feePpm))
+    return if (ULong.MAX_VALUE - due < made) ULong.MAX_VALUE else due + made
 }
 
 /** What protection under the mock authority is worth, said wherever one shows. */
 const val MOCK = "Test only: protects nothing"
 
-/** What genuine protection can do for now, said wherever one shows. */
-const val UNRECOVERED = "Recovery is not in this app yet: treat as not protected"
+/** A computer may be needed even when the contract counts as covered. */
+const val EXTERNAL_RECOVERY = "Recovery may need a computer"
 
 /**
  * A protection as a row says it: where it `stands`, in a word; whether it
@@ -232,7 +234,7 @@ fun cover(contract: Contract, height: Int): Cover {
         stands = when (state) {
             ContractState.Opening -> "Setting up"
             ContractState.Confirming -> "Confirming"
-            // A genuine one protects nothing this app can claim yet: live only.
+            // Keep the live status distinct from regtest's mock protection.
             ContractState.Protecting -> if (contract.mock) "Protecting" else "Live"
             ContractState.Ending -> "Ending"
             ContractState.Closed -> "Ended"
@@ -264,8 +266,8 @@ fun forcing(recovery: Recovery, height: Int): Forcing {
         RecoveryStage.REQUESTED -> "Requested" to (wait?.let { "The hub has $it to answer" } ?: "The hub may answer")
         RecoveryStage.TIMING_OUT -> "Paying back" to (wait?.let { "Back on Bitcoin in $it" } ?: "The hub did not answer")
         RecoveryStage.SWEEPING -> "Sweeping" to "To your Bitcoin, once in a block"
-        RecoveryStage.DONE -> "Recovered" to "${sat(recovery.claimed)} back on Bitcoin"
-        RecoveryStage.ANSWERED -> "Answered" to "The hub countered, which this app cannot answer yet"
+        RecoveryStage.DONE -> "Recovered" to "${sat(recovery.received ?: recovery.claimed)} back on Bitcoin"
+        RecoveryStage.ANSWERED -> "Preparing proof" to "Connect to Bitcoin to classify the hub's answer"
         RecoveryStage.LOST -> "Lost" to "Its bitcoin went elsewhere"
         RecoveryStage.PROVING -> "Proof needed" to proving(recovery, height)
         RecoveryStage.ASSERTING -> "Proving" to "Posting your proof on Bitcoin"

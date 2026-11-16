@@ -47,9 +47,11 @@ internal fun watchOf(ui: Ui, now: Long): Watch {
     val forcing = ui.recoveries.any { carriedOn(it) }
     // A proof posted: a challenge of it is answered within hours, not when a periodic job comes.
     val disputed = ui.recoveries.any { it.stage in DISPUTED }
+    // Mailed to its payee within the hour unless collected at its hub: a look now and then does.
+    val delivering = ui.onTheirWay > 0u
     return when {
         contracting || disputed || under.any { it.kind != Kind.OPTIMIZED && !unpaid(it, ui.under[it.key]) } -> Watch.NOW
-        under.isNotEmpty() || asked || forcing || ui.noteMaintenance -> Watch.LATER
+        under.isNotEmpty() || asked || forcing || delivering || ui.noteMaintenance -> Watch.LATER
         else -> Watch.NONE
     }
 }
@@ -57,7 +59,7 @@ internal fun watchOf(ui: Ui, now: Long): Watch {
 /** A forced close's stages from its proof's posting until paid: kept at work, the hub's challenge to answer in time. */
 internal val DISPUTED = setOf(RecoveryStage.ASSERTING, RecoveryStage.ASSERTED, RecoveryStage.CHALLENGED)
 
-/** Whether a forced close is carried on as blocks come: not once over, nor countered (which this app does not answer). */
+/** Legacy counters are reclassified when the app next advances them in the foreground. */
 internal fun carriedOn(recovery: Recovery): Boolean =
     recovery.stage !in setOf(RecoveryStage.DONE, RecoveryStage.ANSWERED, RecoveryStage.LOST)
 

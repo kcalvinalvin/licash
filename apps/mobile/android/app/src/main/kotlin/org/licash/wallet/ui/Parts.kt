@@ -42,6 +42,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.ModalBottomSheetProperties
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.material3.SheetValue
 import androidx.compose.material3.Surface
@@ -69,6 +70,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.window.SecureFlagPolicy
 import androidx.compose.ui.unit.sp
 import org.licash.core.Network
 
@@ -311,8 +313,8 @@ fun Entry(
  * tests, and `tag-share` its share.
  */
 @Composable
-fun Line(label: String, value: String, modifier: Modifier = Modifier, tag: String? = null, share: String? = null) {
-    Row(modifier.fillMaxWidth().padding(vertical = 12.dp)) {
+fun Line(label: String, value: String, modifier: Modifier = Modifier, tag: String? = null, share: String? = null, onClick: (() -> Unit)? = null) {
+    Row(modifier.fillMaxWidth().then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier).padding(vertical = 12.dp)) {
         Text(label, style = MaterialTheme.typography.bodyLarge)
         Spacer(Modifier.width(16.dp))
         Text(
@@ -330,6 +332,7 @@ fun Line(label: String, value: String, modifier: Modifier = Modifier, tag: Strin
                 color = MaterialTheme.colorScheme.outline,
             )
         }
+        if (onClick != null) Chevron()
     }
 }
 
@@ -370,7 +373,7 @@ fun Toggle(
  * What a tap asked for, from the bottom of the screen: a title and a
  * little under it. For what is read and left, or one choice made; what
  * is worked in gets a screen. Not `dismissable` while what it started is
- * under way.
+ * under way; `secure`, kept out of screenshots and the recent apps.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -378,11 +381,15 @@ fun Sheet(
     title: String,
     dismiss: () -> Unit,
     dismissable: Boolean = true,
+    secure: Boolean = false,
     content: @Composable ColumnScope.() -> Unit,
 ) {
     val leave by rememberUpdatedState(dismissable)
     ModalBottomSheet(
         onDismissRequest = { if (leave) dismiss() },
+        properties = ModalBottomSheetProperties(
+            securePolicy = if (secure) SecureFlagPolicy.SecureOn else SecureFlagPolicy.Inherit,
+        ),
         // All of it at once: no half-open sheet hiding its button.
         sheetState = rememberModalBottomSheetState(
             skipPartiallyExpanded = true,
@@ -590,6 +597,15 @@ internal object Glyphs {
     /** What is under the hood: advanced mode. */
     val code by lazy {
         icon("code", "M9.4,16.6L4.8,12l4.6,-4.6L8,6l-6,6 6,6 1.4,-1.4zM14.6,16.6l4.6,-4.6 -4.6,-4.6L16,6l6,6 -6,6 -1.4,-1.4z")
+    }
+
+    /** What restores the wallet: a key. */
+    val key by lazy {
+        icon(
+            "key",
+            "M12.65,10C11.83,7.67 9.61,6 7,6c-3.31,0 -6,2.69 -6,6s2.69,6 6,6c2.61,0 4.83,-1.67 5.65,-4" +
+                "H17v4h4v-4h2v-4H12.65zM7,14c-1.1,0 -2,-0.9 -2,-2s0.9,-2 2,-2 2,0.9 2,2 -0.9,2 -2,2z",
+        )
     }
 
     private fun icon(name: String, path: String): ImageVector =

@@ -305,10 +305,11 @@ async fn used(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
         held - after
     );
 
-    // Bob pays its code back, to its mailbox: the app takes it by itself.
+    // Bob pays its code back, kept at the hub for the app, which takes it
+    // there by itself: nothing mailed.
     let code: PaymentCode = phone.code().await?.parse()?;
-    let paid = wallet::pay(&bob, &code, Some(3_000), || Ok(Route::Direct)).await?;
-    ensure!(paid.delivered == Some(1), "{:?}", paid.undelivered);
+    let paid = wallet::pay(&bob, &code, Some(3_000)).await?;
+    ensure!(paid.paid.kept, "not kept at the hub: {paid:?}");
     let now = changed(phone, after, 90).await?;
     ensure!(now == after + 3_000, "{now} held after 3000 received");
     let lines = history(phone).await?;
@@ -332,7 +333,73 @@ async fn used(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     let again = phone.launch().await?;
     ensure!(again < Duration::from_secs(10), "{again:?} to start again");
     phone.wait_balance(held, 30).await?;
-    logs(phone).await
+    logs(phone).await?;
+    restored(phone, hub, &silent.to_string()).await
+}
+
+/// Backed up from Settings, deleted and brought back from the first
+/// screen: from its backup file, all it held; from its 24 words, its keys,
+/// the same silent payment address.
+async fn restored(phone: &Phone, hub: &str, silent: &str) -> anyhow::Result<()> {
+    phone.launch().await?;
+    let held = phone.balance().await?;
+    phone.tap("Settings").await?;
+    phone.tap_id("backup").await?;
+    phone.tap_id("backup-words").await?;
+    phone.tap_id("show-words").await?;
+    phone.by_id("word 24", 30).await?;
+    let views = phone.views().await?;
+    let words = (1..=24)
+        .map(|i| {
+            let word = views.iter().find(|v| v.id == format!("word {i}"));
+            Ok(word.with_context(|| format!("no word {i}"))?.text.clone())
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    phone.tap_id("words-done").await?;
+    phone.tap_id("backup-file").await?;
+    phone.tap_id("save-backup").await?;
+    // The system's file picker, the file's name suggested.
+    picked(phone, |text| text.eq_ignore_ascii_case("save")).await?;
+    phone.tap_id("backup-done").await?;
+    deleted(phone).await?;
+
+    phone.tap_id("restore-wallet").await?;
+    phone.tap_id("restore-file").await?;
+    picked(phone, |text| text.starts_with("licash-regtest-backup-")).await?;
+    phone.home(120).await?;
+    phone.wait_balance(held, 60).await?;
+    deleted(phone).await?;
+
+    phone.tap_id("restore-wallet").await?;
+    phone.tap_id("restore-words").await?;
+    phone.fill_id("phrase", &words.join(" ")).await?;
+    phone.tap_id("restore").await?;
+    // Its keys only: no hub until one is added again.
+    phone.by_id("choose-hub", 120).await?;
+    phone.connect(hub).await?;
+    silently(phone, silent).await
+}
+
+/// In the system's file picker, tap the first view whose text `wanted`.
+async fn picked(phone: &Phone, wanted: impl Fn(&str) -> bool) -> anyhow::Result<()> {
+    let view = until("the file picker", 60, || async {
+        Ok(phone.views().await?.into_iter().find(|v| wanted(&v.text)))
+    })
+    .await?;
+    phone.tap_view(&view).await
+}
+
+/// The wallet deleted from Settings' advanced page, from Home or a page
+/// of Settings: the first screen shown again.
+async fn deleted(phone: &Phone) -> anyhow::Result<()> {
+    phone.launch().await?;
+    phone.tap("Settings").await?;
+    phone.tap_id("advanced").await?;
+    let delete = phone.scroll_to_id("delete-wallet").await?;
+    phone.tap_view(&delete).await?;
+    phone.tap_id("delete").await?;
+    phone.by_id("create", 60).await?;
+    Ok(())
 }
 
 /// The question the app asks, or what it says went wrong, starting with
@@ -644,13 +711,15 @@ async fn contracted(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     phone.tagged("worth", MOCK, 10).await?;
     // Unfolded; in advanced mode, since onboarding: forcing it, not yet.
     phone.tap_view(&protecting).await?;
-    phone.wait("Force close", 10).await?;
-    phone.tap_id("close-contract").await?;
+    // Below its details: scrolled to, as often as the page moves.
+    phone.scroll_to_id("force-close").await?;
+    let end = phone.scroll_to_id("close-contract").await?;
+    phone.tap_view(&end).await?;
     // It ends by itself: to stop relying on the hub, cash out.
     phone.by_id("end-cash-out", 10).await?;
     phone.back().await?;
     phone.gone("end-cash-out", 10).await?;
-    phone.by_id("close-contract", 10).await?;
+    phone.scroll_to_id("close-contract").await?;
     phone.back_to("onchain").await?;
 
     // Its cap of the notes protected, past what is on Bitcoin, which is.

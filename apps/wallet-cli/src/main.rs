@@ -124,9 +124,23 @@ enum Command {
         #[arg(long)]
         details: bool,
     },
-    /// Receive the payments sent to the wallet's mailbox, on the relays its
-    /// hubs name, and unlink their notes.
+    /// Receive the payments the wallet's hubs keep for it and those sent to
+    /// its mailbox, on the relays its hubs name, and unlink their notes;
+    /// then mail the payments due to their payees, as `deliver` does.
+    #[command(alias = "collect")]
     Mailbox,
+    /// Mail the payments made to payment codes that are due to their
+    /// payees' mailboxes: those their payees did not collect at the hub
+    /// within an hour, or that their hub does not keep.
+    Deliver,
+    /// Receive and deliver until stopped, as `mailbox` does, every so
+    /// often: payments made reach their payees even if they never collect
+    /// them at the hub.
+    Watch {
+        /// Seconds between looks.
+        #[arg(long, default_value_t = 60)]
+        every: u64,
+    },
     /// Trust the hub at URL, or learn again what it charges.
     AddHub { url: String },
     /// The hubs trusted, and their fees.
@@ -597,7 +611,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             let text = if qr { code.qr() } else { code.to_string() };
             if !mailbox {
                 eprintln!(
-                    "warning: none of its hubs names mailbox relays: payments are handed over"
+                    "warning: none of its hubs names mailbox relays: payments they do not keep are handed over"
                 );
             }
             show(
@@ -620,6 +634,14 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Mailbox => {
             let route = route(tor.clone(), cli.proxy.as_deref())?;
             mailbox(&wallet, &route, json).await?;
+        }
+        Command::Deliver => {
+            let route = route(tor.clone(), cli.proxy.as_deref())?;
+            deliver(&wallet, &route, json).await?;
+        }
+        Command::Watch { every } => {
+            let route = route(tor.clone(), cli.proxy.as_deref())?;
+            watch(&wallet, &route, every, json).await?;
         }
         Command::AddHub { url } => {
             let info = wallet.add_hub(&url).await?;
@@ -738,7 +760,13 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 format!("received {}", say::sat(amount)),
             );
         }
-        Command::Resume => resume(&wallet, json).await?,
+        Command::Resume => {
+            let resumed = resume(&wallet, json).await;
+            // The payments it made among them.
+            let route = route(tor.clone(), cli.proxy.as_deref())?;
+            deliver_due(&wallet, &route).await;
+            resumed?
+        }
         Command::History => {
             let sends = wallet.sends()?;
             let rows = sends.iter().map(|s| {
@@ -1448,66 +1476,248 @@ async fn pay(
     if progress {
         eprintln!("Sending {}…", say::sat(plan.amount));
     }
-    let paid = licash_nostr::wallet::pay_planned(wallet, &code, &plan, || Ok(route.clone()));
-    let paid = paid.await?;
-    let (id, hub, amount) = (&paid.paid.id, &paid.hub, paid.amount);
+    let paid = licash_nostr::wallet::pay_planned(wallet, &code, &plan).await?;
+    let (id, hub, amount, kept) = (&paid.paid.id, &paid.hub, paid.amount, paid.paid.kept);
     if json || details {
         eprintln!("payment {id}");
     }
-    if let Some(reason) = &paid.undelivered {
-        eprintln!(
-            "warning: not sent to the payee's mailbox ({}): hand it over",
-            say::terminal(reason)
-        );
-    }
-    match paid.delivered {
-        Some(relays) => show(
+    let fee = format!(
+        "{}{}",
+        if fees == 0 { "" } else { "up to " },
+        say::fee_of(fees, amount)
+    );
+    let hub_line = match details {
+        true => format!("\nhub              {hub}"),
+        false => String::new(),
+    };
+    let mailbox = code.licash.as_ref().is_some_and(|c| c.mailbox.is_some());
+    // Not kept at its hub: to the payee's mailbox at once, the payer waiting.
+    let mailed = match mailbox && !kept {
+        true => Some(deliver_now(wallet, route, id).await),
+        false => None,
+    };
+    match (&mailed, kept && mailbox) {
+        (Some(Ok(relays)), _) => show(
             json,
-            json!({ "id": id, "hub": hub, "amount": amount, "relays": relays }),
+            json!({ "id": id, "hub": hub, "amount": amount, "kept": false, "relays": relays }),
             format!(
-                "sent to mailbox  {}\nfee              {}{}",
-                say::sat(amount),
-                if fees == 0 {
-                    String::new()
-                } else {
-                    "up to ".into()
-                },
-                say::fee_of(fees, amount)
-            ) + &if details {
-                format!("\nhub              {hub}")
-            } else {
-                String::new()
-            },
+                "sent to mailbox  {}\nfee              {fee}{hub_line}",
+                say::sat(amount)
+            ),
         ),
-        None => {
-            write_payment(&paid.paid.payment, out)?;
+        (None, true) => {
+            show(
+                json,
+                json!({ "id": id, "hub": hub, "amount": amount, "kept": true }),
+                format!(
+                    "kept at hub      {}\nfee              {fee}{hub_line}",
+                    say::sat(amount)
+                ),
+            );
             if !json {
                 eprintln!(
-                    "payment ready  {}\nfee            {}{}\nHand the payment to the recipient.",
-                    say::sat(amount),
-                    if fees == 0 { "" } else { "up to " },
-                    say::fee_of(fees, amount)
+                    "Kept at the hub, not yet collected: if the recipient has not collected it \
+                     within an hour, `licash-wallet deliver` mails it to them."
+                );
+            }
+        }
+        (mailed, _) => {
+            if let Some(Err(reason)) = mailed {
+                eprintln!(
+                    "warning: not sent to the payee's mailbox ({}): hand it over, or \
+                     `licash-wallet deliver` mails it again later",
+                    say::terminal(reason)
+                );
+            }
+            write_payment(&paid.paid.payment, out)?;
+            if !json {
+                let hand = match kept {
+                    true => "Kept at the hub for the recipient to collect, else hand the payment to them.",
+                    false => "Hand the payment to the recipient.",
+                };
+                eprintln!(
+                    "payment ready  {}\nfee            {fee}\n{hand}",
+                    say::sat(amount)
                 );
             }
         }
     }
-    // Its change, linked to it until then.
-    unlink(wallet).await;
+    // Preserve change unlinking, but leave older receipts to delivery runs:
+    // a relay timeout must not hold up a new payment kept at its hub.
+    let _ = unlink(wallet).await;
     Ok(())
 }
 
-/// Receive the payments in the wallet's mailbox, on the relays its hubs
-/// name: each once, of hubs it trusts only.
-async fn mailbox(wallet: &Wallet<Http>, route: &Route, json: bool) -> anyhow::Result<()> {
-    let collected = licash_nostr::wallet::collect(wallet, route).await?;
+/// The payments `collected` took, warned of what it did not look through
+/// or take.
+fn collected_said(collected: licash_nostr::wallet::Collected) -> Vec<licash_wallet::Received> {
     for (id, reason) in &collected.skipped {
         eprintln!("warning: {id} in the mailbox {}", say::terminal(reason));
     }
-    let received = collected.received;
-    let unlinked = match received.is_empty() {
-        true => Some(0),
-        false => unlink(wallet).await,
+    for (at, reason) in &collected.failed {
+        let at = match at.as_str() {
+            licash_nostr::wallet::MAILBOX => "the mailbox".to_owned(),
+            hub => format!("the payments kept at {hub}"),
+        };
+        eprintln!(
+            "warning: {at} not looked through ({}): looked through again next time",
+            say::terminal(reason)
+        );
+    }
+    collected.received
+}
+
+/// Mail the payments due to their payees' mailboxes, now and as `watch`
+/// does: those mailed, those not, and how many are still on their way.
+async fn deliver(wallet: &Wallet<Http>, route: &Route, json: bool) -> anyhow::Result<()> {
+    let delivered = licash_nostr::wallet::deliver(wallet, || Ok(route.clone())).await?;
+    let on_their_way = wallet.delivering()?;
+    let mut lines: Vec<String> = delivered
+        .mailed
+        .iter()
+        .map(|(id, relays)| format!("mailed {id} to {relays} relays"))
+        .collect();
+    for (id, why) in &delivered.failed {
+        lines.push(format!("not mailed {id}: {why}, mailed again later"));
+    }
+    lines.push(match (lines.is_empty(), on_their_way) {
+        (true, 0) => "nothing to deliver".into(),
+        (_, 0) => "nothing more on its way".into(),
+        (_, n) => format!("{n} on their way: kept at their hubs, or to mail later"),
+    });
+    let mailed = delivered
+        .mailed
+        .iter()
+        .map(|(id, r)| json!({ "id": id, "relays": r }));
+    let failed = delivered
+        .failed
+        .iter()
+        .map(|(id, r)| json!({ "id": id, "reason": r }));
+    show(
+        json,
+        json!({
+            "mailed": mailed.collect::<Vec<_>>(),
+            "failed": failed.collect::<Vec<_>>(),
+            "delivering": on_their_way,
+        }),
+        lines.join("\n"),
+    );
+    Ok(())
+}
+
+/// Receive and deliver every `every` seconds, until stopped: the payments
+/// the wallet's hubs keep for it and those in its mailbox taken, its
+/// relays kept connected between looks, and the payments due mailed.
+async fn watch(wallet: &Wallet<Http>, route: &Route, every: u64, json: bool) -> anyhow::Result<()> {
+    let mut kept = None;
+    loop {
+        let collect = licash_nostr::wallet::collect_kept(wallet, route, &mut kept);
+        let received = match collect.await {
+            Ok(collected) => collected_said(collected),
+            Err(e) => {
+                eprintln!(
+                    "warning: nothing received ({})",
+                    say::terminal(&format!("{e:#}"))
+                );
+                Vec::new()
+            }
+        };
+        let unlinking = async {
+            if !received.is_empty() {
+                unlink(wallet).await;
+            }
+        };
+        let (_, mailed) = tokio::join!(unlinking, deliver_due(wallet, route));
+        for r in &received {
+            show(
+                json,
+                json!({ "received": { "id": r.id, "hub": r.hub, "amount": r.amount } }),
+                format!("received {} at {}", say::sat(r.amount), r.hub),
+            );
+        }
+        for (id, relays) in &mailed {
+            show(
+                json,
+                json!({ "mailed": { "id": id, "relays": relays } }),
+                format!("mailed {id} to its payee"),
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(every.max(1))).await;
+    }
+}
+
+/// Mail the payments due to their payees' mailboxes, payment `id` among
+/// them: to how many relays it went, or why not. Those others not mailed
+/// are warned of, mailed again later as `id` is.
+async fn deliver_now(wallet: &Wallet<Http>, route: &Route, id: &str) -> Result<usize, String> {
+    let delivered = licash_nostr::wallet::deliver(wallet, || Ok(route.clone()));
+    let delivered = delivered.await.map_err(|e| format!("{e:#}"))?;
+    let mut mine = Err("it was not due".to_owned());
+    for (paid, relays) in delivered.mailed {
+        if paid == id {
+            mine = Ok(relays);
+        }
+    }
+    for (paid, why) in delivered.failed {
+        match paid == id {
+            true => mine = Err(why),
+            false => not_mailed(&paid, &why),
+        }
+    }
+    mine
+}
+
+/// Mail the payments due to their payees' mailboxes, if any is on its way
+/// there: those mailed, and those not, warned of and mailed again later.
+async fn deliver_due(wallet: &Wallet<Http>, route: &Route) -> Vec<(String, usize)> {
+    match wallet.delivering() {
+        Ok(0) => return Vec::new(),
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!(
+                "warning: payments due not mailed ({})",
+                say::terminal(&e.to_string())
+            );
+            return Vec::new();
+        }
+    }
+    match licash_nostr::wallet::deliver(wallet, || Ok(route.clone())).await {
+        Ok(delivered) => {
+            for (id, why) in &delivered.failed {
+                not_mailed(id, why);
+            }
+            delivered.mailed
+        }
+        Err(e) => {
+            eprintln!(
+                "warning: payments due not mailed ({})",
+                say::terminal(&format!("{e:#}"))
+            );
+            Vec::new()
+        }
+    }
+}
+
+fn not_mailed(id: &str, why: &str) {
+    eprintln!(
+        "warning: payment {id} not mailed to its payee ({}): mailed again later",
+        say::terminal(why)
+    );
+}
+
+/// Receive the payments the wallet's hubs keep for it, and those in its
+/// mailbox, on the relays its hubs name: each once, of hubs it trusts
+/// only. Then mail the payments due to their payees.
+async fn mailbox(wallet: &Wallet<Http>, route: &Route, json: bool) -> anyhow::Result<()> {
+    let collected = licash_nostr::wallet::collect(wallet, route).await?;
+    let received = collected_said(collected);
+    let unlinking = async {
+        match received.is_empty() {
+            true => Some(0),
+            false => unlink(wallet).await,
+        }
     };
+    let (unlinked, _) = tokio::join!(unlinking, deliver_due(wallet, route));
     let rows: Vec<_> = received
         .iter()
         .map(|r| json!({ "id": r.id, "hub": r.hub, "amount": r.amount }))
