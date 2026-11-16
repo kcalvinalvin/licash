@@ -54,6 +54,60 @@ const PAYEE: &str = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
 const MAX_FEE: u64 = 2_000;
 const ONE_SAT: FeeRate = FeeRate::from_sat_per_vb_u32(1);
 
+#[tokio::test]
+async fn a_payout_whose_lock_cannot_be_prepared_keeps_its_failed_history_line() {
+    let eco = Eco::new().await;
+    let before = eco.held();
+    let error = eco
+        .client
+        .payout(PROVIDER, A, PAYEE, 2_700, MAX_FEE, ONE_SAT)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::Insufficient { .. }), "{error}");
+    let payouts = eco.client.payouts().unwrap();
+    assert_eq!(payouts.len(), 1);
+    assert_eq!(
+        payouts[0].state,
+        PayoutState::Failed(format!("its lock was not made: {error}"))
+    );
+    assert!(payouts[0].lock.is_none());
+    assert!(eco.client.locks().unwrap().is_empty());
+    assert_eq!(eco.held(), before);
+}
+
+#[tokio::test]
+async fn a_legacy_payout_quote_estimates_the_lock_fee_before_gross_inputs_are_selected() {
+    let eco = Eco::with_fee(Fee {
+        base: 0,
+        ppm: 100_000,
+    })
+    .await;
+    let quote = eco
+        .client
+        .payout_quote(PROVIDER, A, PAYEE, 1_000, MAX_FEE, ONE_SAT)
+        .await
+        .unwrap();
+    let payout = eco
+        .client
+        .payout(PROVIDER, A, PAYEE, 1_000, quote.costs(), ONE_SAT)
+        .await
+        .unwrap();
+    let lock = eco
+        .client
+        .locks()
+        .unwrap()
+        .into_iter()
+        .find(|l| Some(&l.id) == payout.lock.as_ref())
+        .unwrap();
+    assert!(
+        lock.fee > quote.lock_fee,
+        "actual {}, quoted {}",
+        lock.fee,
+        quote.lock_fee
+    );
+    assert!(quote.budget + quote.fee + lock.fee > quote.costs());
+}
+
 /// A payout the provider took: its answer, and the coin's terms.
 struct Taken {
     answer: ChainSwap,
@@ -264,8 +318,12 @@ impl Eco {
     /// Hub A at height 3, a provider paying out on its chain, and a client
     /// holding 3000 at A.
     async fn new() -> Self {
+        Self::with_fee(FEE).await
+    }
+
+    async fn with_fee(fee: Fee) -> Self {
         let net = Net::new();
-        net.start_timed(A, FEE, TIMED);
+        net.start_timed(A, fee, TIMED);
         let dir = tempfile::tempdir().unwrap();
         let wallet = Wallet::create(
             &dir.path().join("provider.sqlite"),
