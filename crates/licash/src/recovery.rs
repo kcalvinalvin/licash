@@ -64,6 +64,46 @@ impl<'a> Reader<'a> {
     }
 }
 
+/// One OP_RETURN with a single PUSHDATA2 of `body`.
+fn push_script(body: Vec<u8>) -> Result<Vec<u8>, Error> {
+    if body.len() > MAX_PUBLICATION_BYTES {
+        return Err(bad("native publication exceeds its byte limit"));
+    }
+    let mut script = vec![0x6a, 0x4d];
+    script.extend((body.len() as u16).to_le_bytes());
+    script.extend(body);
+    Ok(script)
+}
+
+/// The body a [`push_script`] pushes.
+fn pushed(script: &[u8]) -> Result<&[u8], Error> {
+    if script.len() < 4 || script[..2] != [0x6a, 0x4d] {
+        return Err(bad("native publication script"));
+    }
+    let n = u16::from_le_bytes([script[2], script[3]]) as usize;
+    if script.len() != n + 4 || n < 76 {
+        return Err(bad("native publication push"));
+    }
+    Ok(&script[4..])
+}
+
+/// The script of `tx`'s unique output pushing a body that starts with
+/// `magic`.
+fn unique_push<'a>(tx: &'a Transaction, magic: &[u8]) -> Result<&'a [u8], Error> {
+    let mut found = tx.outputs().iter().filter(|output| {
+        output.script.len() > 4 + magic.len()
+            && output.script[..2] == [0x6a, 0x4d]
+            && output.script[4..].starts_with(magic)
+    });
+    let output = found
+        .next()
+        .ok_or_else(|| bad("no native publication output"))?;
+    if found.next().is_some() {
+        return Err(bad("ambiguous native publication outputs"));
+    }
+    Ok(&output.script)
+}
+
 /// Signed claim publication P: every counted field of E plus every Q
 /// signature. It is posted in a non-witness transaction after R; decoding
 /// recomputes E, so P is authority only for the E that R actually signed.
@@ -302,25 +342,11 @@ impl Publication {
 
     /// One OP_RETURN with a single PUSHDATA2 of the canonical body.
     pub fn script(&self) -> Result<Vec<u8>, Error> {
-        let body = self.to_bytes();
-        if body.len() > MAX_PUBLICATION_BYTES {
-            return Err(bad("native publication exceeds its byte limit"));
-        }
-        let mut script = vec![0x6a, 0x4d];
-        script.extend((body.len() as u16).to_le_bytes());
-        script.extend(body);
-        Ok(script)
+        push_script(self.to_bytes())
     }
 
     pub fn from_script(keyset: &Keyset, limit: usize, script: &[u8]) -> Result<Self, Error> {
-        if script.len() < 4 || script[..2] != [0x6a, 0x4d] {
-            return Err(bad("native publication script"));
-        }
-        let n = u16::from_le_bytes([script[2], script[3]]) as usize;
-        if script.len() != n + 4 || n < 76 {
-            return Err(bad("native publication push"));
-        }
-        Self::from_bytes(keyset, limit, &script[4..])
+        Self::from_bytes(keyset, limit, pushed(script)?)
     }
 
     /// The unique P output of a publication transaction. Inclusion, depth and
@@ -330,18 +356,7 @@ impl Publication {
         limit: usize,
         tx: &Transaction,
     ) -> Result<Self, Error> {
-        let mut found = tx.outputs().iter().filter(|output| {
-            output.script.len() > 4 + P_MAGIC.len()
-                && output.script[..2] == [0x6a, 0x4d]
-                && output.script[4..].starts_with(P_MAGIC)
-        });
-        let output = found
-            .next()
-            .ok_or_else(|| bad("no native publication output"))?;
-        if found.next().is_some() {
-            return Err(bad("ambiguous native publication outputs"));
-        }
-        Self::from_script(keyset, limit, &output.script)
+        Self::from_script(keyset, limit, unique_push(tx, P_MAGIC)?)
     }
 
     /// P is authority only for the request R signed under this opening.
@@ -659,8 +674,30 @@ pub fn prove_counter(
     chain: Option<&Chain>,
 ) -> Result<CounterJournal, Error> {
     publication.bind(base, d, request)?;
-    let keyset = &base.parts().keyset;
     let claim = publication.claim();
+    let (mask, executed) = void(&base.parts().keyset, claim, evidence, chain)?;
+    if mask == 0 {
+        return Err(bad("empty counter"));
+    }
+    Ok(CounterJournal {
+        final_digest: *d.as_bytes(),
+        claim_digest: *claim.digest(),
+        mask,
+        owed: live(claim, mask, &executed),
+        disclosure: counter_disclosures(evidence)?.digest(),
+    })
+}
+
+/// The items `evidence` voids (bit i for item i) and the sources it shows
+/// executed. Each evidence must void an item, or show a Plain source
+/// executed, which values its fallbacks. `chain` must be verified from the
+/// source terms' checkpoint; it is needed only for `Expired`.
+fn void(
+    keyset: &Keyset,
+    claim: &UnsignedClaim,
+    evidence: &[Evidence],
+    chain: Option<&Chain>,
+) -> Result<(u32, BTreeSet<ProposalId>), Error> {
     let items = &claim.parts().items;
     let sources: BTreeMap<_, _> = claim.parts().sources.iter().map(|s| (s.id(), s)).collect();
     let activated: BTreeSet<_> = claim.parts().activations.iter().map(|a| a.source).collect();
@@ -779,11 +816,15 @@ pub fn prove_counter(
             return Err(bad("counter evidence voids nothing"));
         }
     }
-    if mask == 0 {
-        return Err(bad("empty counter"));
-    }
+    Ok((mask, executed))
+}
+
+/// What no evidence voided: settled and timed items, and the fallbacks of
+/// the Plain sources shown executed, capped at the claim's amount.
+fn live(claim: &UnsignedClaim, mask: u32, executed: &BTreeSet<ProposalId>) -> u32 {
+    let sources: BTreeMap<_, _> = claim.parts().sources.iter().map(|s| (s.id(), s)).collect();
     let mut live = 0u128;
-    for (i, item) in items.iter().enumerate() {
+    for (i, item) in claim.parts().items.iter().enumerate() {
         if mask & (1 << i) != 0 {
             continue;
         }
@@ -797,13 +838,7 @@ pub fn prove_counter(
             live += u128::from(item.message().denomination());
         }
     }
-    Ok(CounterJournal {
-        final_digest: *d.as_bytes(),
-        claim_digest: *claim.digest(),
-        mask,
-        owed: u32::try_from(live.min(u128::from(claim.amount()))).expect("bounded by amount"),
-        disclosure: counter_disclosures(evidence)?.digest(),
-    })
+    u32::try_from(live.min(u128::from(claim.amount()))).expect("bounded by amount")
 }
 
 /// What the Hub did after R.
