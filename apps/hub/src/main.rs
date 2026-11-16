@@ -131,6 +131,12 @@ struct Chain {
     #[arg(long, env = "LICASH_HUB_CONTRACTS",
           value_parser = clap::builder::BoolishValueParser::new())]
     contracts: bool,
+    /// Automatically answer confirmed holder requests. Pins one request
+    /// witness per opening in responses.sqlite; never runs hub timeouts.
+    /// Before enabling on an older hub, reconcile any manual responses.
+    #[arg(long, env = "LICASH_HUB_CONTRACTS_RESPOND", requires = "contracts",
+          value_parser = clap::builder::BoolishValueParser::new())]
+    contracts_respond: bool,
     /// Fund and sign contracts with the wallet of the node at this URL, its
     /// JSON-RPC as `--chain` takes it, such as
     /// `http://host:port/wallet/NAME?cookie=PATH`: one apart from the chain
@@ -769,6 +775,9 @@ enum Command {
     Status {
         #[arg(long)]
         json: bool,
+        /// Include internal note and event counts.
+        #[arg(long)]
+        details: bool,
     },
     /// An interactive dashboard of the hub's records, beside the running
     /// hub or without it: payments, fees, reserves, contracts, privacy and
@@ -816,23 +825,33 @@ enum Command {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     logging(cli.log);
+    let structured = matches!(cli.log, Log::Json);
     match command(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            tracing::error!("{e:#}");
+            if structured {
+                tracing::error!("{e:#}");
+            } else {
+                eprintln!("error: {e:#}");
+            }
             ExitCode::FAILURE
         }
     }
 }
 
 fn logging(format: Log) {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        EnvFilter::new(match format {
+            Log::Text => "info,licash_wallet=warn,nostr_sdk=off",
+            Log::Json => "info",
+        })
+    });
     let logs = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
         .with_writer(std::io::stderr);
     match format {
-        Log::Text => logs.init(),
+        Log::Text => logs.without_time().with_target(false).init(),
         Log::Json => logs.json().init(),
     }
 }
@@ -841,7 +860,7 @@ fn command(cli: Cli) -> anyhow::Result<()> {
     let db = cli.data.join("hub.sqlite");
     let seed = cli.seed.unwrap_or_else(|| cli.data.join("seed"));
     match cli.command {
-        Command::Init { max_pow } => init(&cli.data, &seed, &db, max_pow),
+        Command::Init { max_pow } => init(&cli.data, &seed, &db, max_pow, cli.log),
         Command::Run {
             listen,
             policy,
@@ -858,6 +877,8 @@ fn command(cli: Cli) -> anyhow::Result<()> {
             let policy = policy.policy();
             let (indexing, tweaks_from) = (chain.tweaks, chain.tweaks_from);
             let contracting = chain.contracts;
+            let responding = chain.contracts_respond;
+            let response_poll = Duration::from_secs(chain.chain_poll);
             let range = chain.range();
             let wallet = match (&chain.contracts_wallet, &chain.url) {
                 (Some(url), _) => Some(url.parse::<Source>().context("--contracts-wallet")?),
@@ -977,6 +998,10 @@ fn command(cli: Cli) -> anyhow::Result<()> {
                     );
                     let openings = runtime.block_on(opening).context("open the contracts")?;
                     openings.spawn_sweeper();
+                    if responding {
+                        openings.spawn_responder(response_poll);
+                        tracing::info!("automatic contract responder enabled; one-time answers pinned in responses.sqlite");
+                    }
                     tracing::info!(
                         mock = openings.advertise().mock,
                         ?range,
@@ -1027,7 +1052,8 @@ fn command(cli: Cli) -> anyhow::Result<()> {
                         }
                         _ => Http::new(None)?,
                     };
-                    let provider = swap_provider(&swaps_dir, *profile, config, issuer, transport)?;
+                    let provider =
+                        swap_provider(&swaps_dir, *profile, config, issuer, transport, cli.log)?;
                     let provider = Arc::new(provider);
                     let notifier = match swaps_targets.is_empty() {
                         true => None,
@@ -1106,7 +1132,7 @@ fn command(cli: Cli) -> anyhow::Result<()> {
             runtime.block_on(serving)
         }
         Command::TestNotify { notify } => test_notify(&notify),
-        Command::Status { json } => status(&db, json),
+        Command::Status { json, details } => status(&db, json, details),
         Command::Dashboard { dashboard, url } => show(&cli.data, dashboard, url),
         Command::Events {
             after,
@@ -1139,7 +1165,7 @@ fn respond(data: &Path, id: &str, request: &Path, chain: &str) -> anyhow::Result
     })
 }
 
-fn init(data: &Path, seed: &Path, db: &Path, max_pow: u32) -> anyhow::Result<()> {
+fn init(data: &Path, seed: &Path, db: &Path, max_pow: u32, log: Log) -> anyhow::Result<()> {
     let mut dir = std::fs::DirBuilder::new();
     dir.recursive(true);
     #[cfg(unix)]
@@ -1147,7 +1173,11 @@ fn init(data: &Path, seed: &Path, db: &Path, max_pow: u32) -> anyhow::Result<()>
     dir.create(data)
         .with_context(|| format!("create {}", data.display()))?;
     Hub::init(seed, db, max_pow).context("create the hub")?;
-    tracing::info!(db = %db.display(), seed = %seed.display(), max_pow, "hub created: keep a copy of the seed");
+    if matches!(log, Log::Json) {
+        tracing::info!(db = %db.display(), seed = %seed.display(), max_pow, "hub created: keep a copy of the seed");
+    } else {
+        eprintln!("Hub created. Back up {}.", seed.display());
+    }
     Ok(())
 }
 
@@ -1352,6 +1382,7 @@ fn swap_provider(
     config: SwapsConfig,
     issuer: Issuer,
     transport: Http,
+    log: Log,
 ) -> anyhow::Result<Provider<Http>> {
     let (wallet, swaps) = (dir.join("wallet.sqlite"), dir.join("swaps.sqlite"));
     match (wallet.exists(), swaps.exists()) {
@@ -1379,7 +1410,14 @@ fn swap_provider(
             let address = hex::encode(wallet.address().to_bytes());
             let provider = Provider::create_issuing(&swaps, wallet, config, issuer)
                 .context("create the swaps file")?;
-            tracing::info!(dir = %dir.display(), %address, "swap provider created: back up its wallet file");
+            if matches!(log, Log::Json) {
+                tracing::info!(dir = %dir.display(), %address, "swap provider created: back up its wallet file");
+            } else {
+                eprintln!(
+                    "swap provider created: back up wallet.sqlite and swaps.sqlite in {}.",
+                    dir.display()
+                );
+            }
             Ok(provider)
         }
         _ => anyhow::bail!(
@@ -1428,14 +1466,13 @@ async fn serve(
     let listener = tokio::net::TcpListener::bind(listen)
         .await
         .with_context(|| format!("listen on {listen}"))?;
-    tracing::info!(
-        listen = %listener.local_addr()?,
-        policy = %serde_json::to_string(&policy)?,
-        "serving"
-    );
+    tracing::debug!(policy = %serde_json::to_string(&policy)?, "hub policy");
+    tracing::info!("serving at {}", listener.local_addr()?);
     let notifying = notifier.clone().map(|notifier| {
-        let targets: Vec<_> = notifier.targets().iter().map(Target::to_string).collect();
-        tracing::info!(targets = %targets.join(", "), "notifying");
+        tracing::info!(
+            "notifications enabled ({} targets)",
+            notifier.targets().len()
+        );
         tokio::spawn(notifier.run(hub.clone()))
     });
     let indexing = match (&chain, tweaks) {
@@ -1466,7 +1503,8 @@ async fn serve(
     }) = swapping
     {
         let address = hex::encode(provider.wallet().address().to_bytes());
-        tracing::info!(%address, config = %serde_json::to_string(provider.config())?, "providing swaps");
+        tracing::debug!(%address, config = %serde_json::to_string(provider.config())?, "swap configuration");
+        tracing::info!("providing swaps");
         swaps.push(tokio::spawn(licash_swaps_service::step(
             provider.clone(),
             every,
@@ -1482,7 +1520,8 @@ async fn serve(
     }
     let announcing = announcing.map(|a| {
         let (relays, urls) = (a.relays.join(", "), a.urls.join(", "));
-        tracing::info!(%relays, %urls, "announcing on Nostr");
+        tracing::debug!(%relays, %urls, "announcement configuration");
+        tracing::info!("announcing on Nostr");
         tokio::spawn(announce(hub.clone(), a.relays, a.route, a.urls, a.name))
     });
     axum::serve(listener, router)
@@ -1560,7 +1599,7 @@ fn show(data: &Path, args: licash_dashboard::Args, url: Option<String>) -> anyho
     args.run(move || dashboard::report(&data, Some(&probe)))
 }
 
-fn status(db: &Path, json: bool) -> anyhow::Result<()> {
+fn status(db: &Path, json: bool, details: bool) -> anyhow::Result<()> {
     let stats = Ledger::open(db).context("read the hub")?.stats()?;
     if json {
         println!("{}", serde_json::to_string(&stats)?);
@@ -1568,28 +1607,30 @@ fn status(db: &Path, json: bool) -> anyhow::Result<()> {
     }
     // What it earned first, then what it did.
     let n = |v: u64| licash_dashboard::grouped(v as i64);
-    for (name, value) in [
+    let mut rows = vec![
         ("income", format!("{} sat", n(stats.income))),
-        (
-            "offers",
-            format!("{}, {} released", n(stats.offers), n(stats.released)),
-        ),
-        (
-            "locks",
-            format!("{}, {} open", n(stats.locks), n(stats.open_locks)),
-        ),
-        (
-            "notes",
-            format!(
-                "{} issued, {} spent, {} unlinked",
-                n(stats.issued),
-                n(stats.spent),
-                n(stats.unlinked)
+        ("payments", format!("{} released", n(stats.released))),
+        ("locks", format!("{} open", n(stats.open_locks))),
+    ];
+    if details {
+        rows.extend([
+            ("offers", n(stats.offers)),
+            ("all locks", n(stats.locks)),
+            (
+                "notes",
+                format!(
+                    "{} issued, {} spent, {} unlinked",
+                    n(stats.issued),
+                    n(stats.spent),
+                    n(stats.unlinked)
+                ),
             ),
-        ),
-        ("events", n(stats.events)),
-    ] {
-        println!("{name:<6}  {value}");
+            ("events", n(stats.events)),
+        ]);
+    }
+    let width = rows.iter().map(|(label, _)| label.len()).max().unwrap_or(0);
+    for (name, value) in rows {
+        println!("{name:<width$}  {value}");
     }
     Ok(())
 }

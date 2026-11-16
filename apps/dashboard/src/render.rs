@@ -27,7 +27,7 @@ pub fn draw(f: &mut Frame, view: &View, ui: &Ui, status: &Status) {
     ])
     .areas(f.area());
     header(f, head, view, ui, status);
-    f.render_widget(tab_line(view, ui), tabs);
+    f.render_widget(tab_line(view, ui, tabs.width), tabs);
     if let Some(page) = view.pages.get(ui.page) {
         let heights = page.rows.iter().map(|row| {
             if row.iter().all(|p| matches!(p, PanelView::Cards { .. })) {
@@ -47,7 +47,7 @@ pub fn draw(f: &mut Frame, view: &View, ui: &Ui, status: &Status) {
     }
     footer(f, foot, status);
     if ui.help {
-        help(f, body);
+        help(f, body, status);
     }
 }
 
@@ -71,15 +71,25 @@ fn header(f: &mut Frame, area: Rect, view: &View, ui: &Ui, status: &Status) {
             Span::styled(text, DIM)
         });
     }
-    let (word, tone) = match view.health {
-        Tone::Bad => ("failing", Tone::Bad),
-        Tone::Warn => ("attention", Tone::Warn),
-        _ => ("healthy", Tone::Good),
+    let (word, tone) = if status.error.is_some() {
+        ("stale", Tone::Warn)
+    } else {
+        match view.health {
+            Tone::Bad => ("failing", Tone::Bad),
+            Tone::Warn => ("attention", Tone::Warn),
+            _ => ("healthy", Tone::Good),
+        }
     };
     right.push(Span::styled(
         format!("   {} {word}", style::glyph(tone)),
         style::tone(tone),
     ));
+    if left.iter().chain(&right).map(Span::width).sum::<usize>() >= area.width as usize {
+        right = vec![
+            Span::styled(format!(" {} ", ui.range), BOLD),
+            Span::styled(format!("{} {word} ", style::glyph(tone)), style::tone(tone)),
+        ];
+    }
     let read = if status.reading {
         "   reading…".to_string()
     } else {
@@ -94,6 +104,13 @@ fn header(f: &mut Frame, area: Rect, view: &View, ui: &Ui, status: &Status) {
     let subtitle = Span::styled(format!("  {}", view.subtitle), DIM);
     if fits(subtitle.width()) {
         left.push(subtitle);
+    } else if let Some((_, context)) = view.subtitle.rsplit_once(" · ") {
+        // A report can put its essential context (such as the network)
+        // after the separator, keeping it when the directory will not fit.
+        let context = Span::styled(format!("  {context}"), DIM);
+        if fits(context.width()) {
+            left.push(context);
+        }
     }
     let read = Span::styled(read, DIM);
     let fits = |more: usize| area.width as usize > width(&left) + width(&right) + more;
@@ -104,11 +121,22 @@ fn header(f: &mut Frame, area: Rect, view: &View, ui: &Ui, status: &Status) {
     f.render_widget(Paragraph::new(Line::from(right).right_aligned()), area);
 }
 
-fn tab_line(view: &View, ui: &Ui) -> Paragraph<'static> {
+fn tab_line(view: &View, ui: &Ui, width: u16) -> Paragraph<'static> {
     let mut spans = vec![Span::raw(" ")];
+    let full_width: usize = view
+        .pages
+        .iter()
+        .enumerate()
+        .map(|(i, page)| format!("{} {} ", i + 1, page.title).chars().count())
+        .sum::<usize>()
+        + 1;
     for (i, page) in view.pages.iter().enumerate() {
         let selected = i == ui.page;
-        spans.push(Span::styled(format!(" {} ", i + 1), DIM));
+        spans.push(Span::styled(format!("{} ", i + 1), DIM));
+        if !selected && full_width > width as usize {
+            spans.push(Span::raw(" "));
+            continue;
+        }
         spans.push(if selected {
             Span::styled(
                 page.title.clone(),
@@ -119,24 +147,35 @@ fn tab_line(view: &View, ui: &Ui) -> Paragraph<'static> {
         } else {
             Span::raw(page.title.clone())
         });
-        spans.push(Span::raw("  "));
+        spans.push(Span::raw(" "));
     }
     Paragraph::new(vec![Line::from(spans), Line::default()])
 }
 
 fn footer(f: &mut Frame, area: Rect, status: &Status) {
-    let keys = " ←→ page  [ ] range  ↑↓ scroll  ? help  q quit ";
-    if let Some(error) = status.error {
-        let line = Line::from(vec![
-            Span::styled(" ✗ ", style::tone(Tone::Bad)),
-            Span::styled(
-                format!("read failed, showing the last read: {error}"),
-                style::tone(Tone::Bad),
-            ),
-        ]);
-        f.render_widget(Paragraph::new(line), area);
+    let keys = if status.error.is_none() && area.width >= 48 {
+        " ←→ page  [ ] range  ↑↓ scroll  ? help  q quit "
+    } else if area.width >= 15 {
+        " ? help  q quit "
     } else {
-        f.render_widget(Paragraph::new(Line::styled(keys, DIM)), area);
+        " ? q "
+    };
+    let [message, keys_area] = Layout::horizontal([
+        Constraint::Fill(1),
+        Constraint::Length(Line::raw(keys).width() as u16),
+    ])
+    .areas(area);
+    f.render_widget(Paragraph::new(Line::styled(keys, DIM)), keys_area);
+    if status.error.is_some() {
+        let text = if message.width >= 38 {
+            "Read failed, showing last read"
+        } else {
+            "Read failed"
+        };
+        f.render_widget(
+            Paragraph::new(Span::styled(format!(" {text}"), style::tone(Tone::Bad))),
+            message,
+        );
     }
 }
 
@@ -403,7 +442,7 @@ fn breakdown(f: &mut Frame, area: Rect, b: &BreakdownView, focused: bool, offset
     // The labels take twice what each column does, or what the longest
     // needs, up to near half; the columns share the rest, two apart.
     let n = b.columns.len() as u16;
-    let inner = area.width.saturating_sub(2 + 2 * n);
+    let inner = area.width.saturating_sub(4 + 2 * n);
     let longest = b
         .rows
         .iter()
@@ -413,6 +452,50 @@ fn breakdown(f: &mut Frame, area: Rect, b: &BreakdownView, focused: bool, offset
     let share = 2 * inner / (n + 2);
     let labels = (longest as u16 + 2).clamp(share.min(inner * 9 / 20), share.max(inner * 9 / 20));
     let width = (inner.saturating_sub(labels) / n.max(1)) as usize;
+    // A squeezed right-aligned cell loses its leading digits. Switch the
+    // whole record to labeled, wrapped text instead of showing a false value.
+    let fits = longest + 2 <= labels as usize
+        && b.rows.iter().all(|row| {
+            row.cells
+                .iter()
+                .all(|cell| number(cell, row.color, width).width() <= width)
+        })
+        && b.columns
+            .iter()
+            .all(|column| column.chars().count() <= width);
+    if !b.rows.is_empty() && !fits {
+        let mut block = block(&title, focused, area.width);
+        if offset > 0 {
+            block = block.title_bottom(
+                Line::styled(format!(" {}/{} ", offset + 1, b.rows.len()), DIM).right_aligned(),
+            );
+        }
+        let rows = b.rows.iter().skip(offset).map(|row| {
+            let fields = b
+                .columns
+                .iter()
+                .zip(&row.cells)
+                .map(|(label, cell)| {
+                    let width = if matches!(cell, Number::Share(_)) {
+                        7
+                    } else {
+                        usize::MAX
+                    };
+                    let value = number(cell, row.color, width);
+                    let value: String = value
+                        .spans
+                        .iter()
+                        .map(|span| span.content.as_ref())
+                        .collect();
+                    format!("{label} {}", value.trim())
+                })
+                .collect::<Vec<_>>()
+                .join(" · ");
+            (Style::new(), format!("{} · {fields}", row.label))
+        });
+        stacked(f, area, block, rows);
+        return;
+    }
     let rows = b.rows.iter().skip(offset).map(|row| {
         let label = Line::from(vec![
             Span::styled("■ ", Style::new().fg(style::color(row.color))),
@@ -505,6 +588,33 @@ fn table(f: &mut Frame, area: Rect, t: &TableView, view: &View, focused: bool, o
             }
         }
     }
+    let columns = widths.len().saturating_sub(1);
+    let others = widths[..columns].iter().sum::<usize>() + 2 * columns;
+    let last = (area.width as usize).saturating_sub(4 + others);
+    let minimum_last = if t
+        .rows
+        .iter()
+        .any(|row| row.cells.last().is_some_and(numeric))
+    {
+        widths.last().copied().unwrap_or(0)
+    } else {
+        widths.last().copied().unwrap_or(0).min(12)
+    };
+    if last < minimum_last || others + 4 > area.width as usize {
+        let rows = t.rows.iter().zip(&texts).skip(offset).map(|(row, texts)| {
+            let fields = t
+                .columns
+                .iter()
+                .zip(texts)
+                .filter(|(_, value)| !value.is_empty())
+                .map(|(label, value)| format!("{label} {value}"))
+                .collect::<Vec<_>>()
+                .join(" · ");
+            (style::tone(row.tone), fields)
+        });
+        stacked(f, area, block, rows);
+        return;
+    }
     let constraints: Vec<Constraint> = widths
         .iter()
         .enumerate()
@@ -531,9 +641,6 @@ fn table(f: &mut Frame, area: Rect, t: &TableView, view: &View, focused: bool, o
     .style(DIM);
     // The last column takes what the others leave: its text wrapped
     // there rather than cut, up to three lines a row.
-    let columns = widths.len().saturating_sub(1);
-    let others = widths[..columns].iter().sum::<usize>() + 2 * columns;
-    let last = (area.width as usize).saturating_sub(4 + others);
     let rows = t.rows.iter().zip(&texts).skip(offset).map(|(row, texts)| {
         let mut height = 1;
         let cells: Vec<Cell> = texts
@@ -569,9 +676,35 @@ fn table(f: &mut Frame, area: Rect, t: &TableView, view: &View, focused: bool, o
     );
 }
 
-fn help(f: &mut Frame, area: Rect) {
+/// Compact tables become records, not truncated columns. Scrolling still
+/// moves by record, exactly as in the full-width table.
+fn stacked<'a>(
+    f: &mut Frame,
+    area: Rect,
+    block: Block<'a>,
+    rows: impl Iterator<Item = (Style, String)>,
+) {
+    let width = block.inner(area).width as usize;
+    let rows = rows.map(|(style, text)| {
+        let lines = format::wrap(&text, width);
+        let height = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+        Row::new([Cell::from(Text::from(
+            lines.into_iter().map(Line::raw).collect::<Vec<_>>(),
+        ))])
+        .height(height)
+        .bottom_margin(1)
+        .style(style)
+    });
+    f.render_widget(Table::new(rows, [Constraint::Fill(1)]).block(block), area);
+}
+
+fn help(f: &mut Frame, area: Rect, status: &Status) {
     let width = 64.min(area.width);
-    let height = 16.min(area.height);
+    let height = if status.error.is_some() {
+        area.height
+    } else {
+        16.min(area.height)
+    };
     let popup = Rect {
         x: area.x + (area.width - width) / 2,
         y: area.y + (area.height - height) / 2,
@@ -584,7 +717,7 @@ fn help(f: &mut Frame, area: Rect) {
             Span::raw(what.to_string()),
         ])
     };
-    let lines = vec![
+    let mut lines = vec![
         key("← → h l 1-9", "switch page"),
         key("[ ] - +", "shorter or longer range"),
         key("tab ⇧tab", "move between lists"),
@@ -598,6 +731,20 @@ fn help(f: &mut Frame, area: Rect) {
         Line::styled("the records, as they stood at each bucket's end.", DIM),
         Line::styled("Times are UTC.", DIM),
     ];
+    if let Some(error) = status.error {
+        let mut problem = vec![Line::styled(
+            "Last read failed (last good data kept):",
+            style::tone(Tone::Bad),
+        )];
+        problem.extend(
+            format::wrap(error, width.saturating_sub(4) as usize)
+                .into_iter()
+                .map(Line::raw),
+        );
+        problem.push(Line::default());
+        problem.extend(lines);
+        lines = problem;
+    }
     f.render_widget(Clear, popup);
     f.render_widget(
         Paragraph::new(lines).block(block("Keys", true, popup.width)),

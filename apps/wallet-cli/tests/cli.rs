@@ -1121,6 +1121,18 @@ fn owners_pay_payment_codes_through_mailboxes_or_by_hand() {
     );
     assert_eq!(json(&bob, &["mailbox"])["received"][0]["amount"], 20);
 
+    // Technical identity is available when asked, not in the default result.
+    let detailed = wallet(&alice, &["pay", &text, "1", "--details"], None);
+    let id = String::from_utf8_lossy(&detailed.stderr).into_owned();
+    assert_eq!(id.trim().strip_prefix("payment ").unwrap().len(), 64);
+    assert_eq!(
+        ok(detailed),
+        format!(
+            "sent to mailbox  1 sat\nfee              up to 1 sat (100%)\nhub              {}\n",
+            hub.url()
+        )
+    );
+
     // Carol's hub names no relays: her code has no mailbox, and the
     // payment is handed over. Alice trusts it, and pays there.
     let (carol, _) = party(dir.path(), "carol", Some(&plain));

@@ -13,6 +13,12 @@ licash-hub --data ./hub events --follow
 licash-hub --data ./hub dashboard
 ```
 
+`status` shows income, released payments and open locks. `status --details`
+adds the internal note and event counts; `status --json` keeps the full
+machine-readable statistics. Normal text logs omit timestamps and Rust
+targets. Configuration is diagnostic detail (`RUST_LOG=debug`); warnings
+remain visible. `--log json` retains structured logging.
+
 `dashboard` draws the hub's dashboard in the terminal: payments by kind
 (transfers, locks, Lightning out and in, deposits), their failures by
 reason and those under way, the fees earned, the notes outstanding and the
@@ -26,6 +32,9 @@ records themselves, over a range of 24 hours to all of it (30 days at
 first, or `--range`) against the range before; what no record dates, such
 as the collateral, is as it stands now. Arrows or digits turn the pages,
 `[` and `]` the range; `--json` prints the range's view once instead.
+Transaction fees include their share of the processed input, while contract
+prices are relative to their cap. A read failure keeps the last good data
+and the help/quit keys; `?` shows the error detail.
 
 `--network` (`bitcoin` by default, or `regtest`, `signet`, `mutinynet`) is
 the chain `--chain` must follow: the hub scans no other. The signets are for
@@ -123,28 +132,40 @@ On regtest, contracts are under a mock proof authority: such a contract
 protects nothing. On signet they are under the genuine programs kept in
 `r0/programs/`, a trial: RISC Zero's shared Groth16 setup, signet's headers
 checked by their work alone and not the network's signature of each block,
-and a hub that answers a recovery's request only when its operator asks
-(unanswered, the request pays the wallet at its timeout) and does not yet
-take its collateral back after the close. The hub's terms there are
+and no automatic collateral reclaim after the close. The hub's terms there are
 signet's least: a day
 for the wallet to answer a challenge and for each party's outputs to wait,
 3 blocks deep, and 12 blocks at least to respond to a request. No other
 network yet.
 
+With `--contracts-respond` (`LICASH_HUB_CONTRACTS_RESPOND=true`), the hub
+automatically answers confirmed requests, polling its contracts' Core
+wallet at `--chain-poll`. It needs `gettxout`, no txindex or historical
+rescan. Keep `<data>/responses.sqlite` with `openings.sqlite`: it pins each
+request's witness before one-time signing and retains the exact answer
+across restarts. Another witness for the same request txid is refused.
+Before enabling on an older installation, reconcile any previous manual
+answers; missing pins do not prove those keys were never used. Never use
+an older read-only responder alongside the new one. Disabling automation
+or rolling back the hub must preserve the pins for the next upgrade.
+
 When a wallet forces its contract closed, its request R comes on Bitcoin.
-The operator answers it beside the running hub, within the blocks the hub
-has to respond:
+The operator can also answer it beside the running hub:
 
 ```sh
 licash-hub --data ./hub respond OPENING_ID r.hex --chain URL
 ```
 
-`respond` reads the opening from `<data>/openings.sqlite` (it writes
-nothing, and needs neither the seed nor the contracts' wallet), checks that
+`respond` reads the opening from `<data>/openings.sqlite` and writes the
+same signing pin as automation (no seed or contracts' wallet needed). It checks that
 R (in hex, `-` for stdin) is that contract's request, broadcasts the hub's
 plain answer on `--chain` (`LICASH_HUB_CHAIN`) and prints its txid. The
 wallet must then prove its claim, its assert in a block by the contract's
-assert height.
+assert height. The response window enables the holder's timeout, but does
+not prohibit a later hub answer before that timeout wins on chain. A
+holder's local safety margin therefore also requires timely timeout
+confirmation and monitoring; it is not a guaranteed offline proving window.
+The responder never broadcasts the hub's assertion timeout.
 
 With `--swaps` (and `--chain`), the hub provides the swaps into it from the
 hubs of `--swaps-from URL=CAP`: a wallet locks its notes at such a hub to

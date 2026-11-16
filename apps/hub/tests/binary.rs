@@ -105,7 +105,13 @@ fn stats(data: &Path) -> serde_json::Value {
 fn a_hub_is_created_run_watched_and_stopped() {
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("hub");
-    stdout(&data, &["init", "--max-pow", "6"]);
+    let created = output(&data, &["init", "--max-pow", "6"]);
+    assert!(created.status.success(), "{created:?}");
+    let message = String::from_utf8_lossy(&created.stderr);
+    assert_eq!(
+        message,
+        format!("Hub created. Back up {}.\n", data.join("seed").display())
+    );
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -120,11 +126,12 @@ fn a_hub_is_created_run_watched_and_stopped() {
     assert_eq!(stats(&data)["events"], 0);
     // Read by a person: what it earned first, in sat, then what it did.
     let text = stdout(&data, &["status"]);
-    assert!(text.starts_with("income  0 sat\n"), "{text}");
-    assert!(
-        text.contains("\nnotes   0 issued, 0 spent, 0 unlinked\n"),
-        "{text}"
+    assert_eq!(
+        text,
+        "income    0 sat\npayments  0 released\nlocks     0 open\n"
     );
+    let text = stdout(&data, &["status", "--details"]);
+    assert!(text.contains("0 issued, 0 spent, 0 unlinked\n"), "{text}");
 
     let port = free_port();
     let listen = format!("127.0.0.1:{port}");
@@ -222,9 +229,19 @@ fn failures_exit_nonzero_and_log_as_asked() {
         .as_str()
         .unwrap()
         .contains("no hub database"));
+    let data = dir.path().join("structured");
+    let created = output(&data, &["--log", "json", "init", "--max-pow", "6"]);
+    assert!(created.status.success(), "{created:?}");
+    let line: serde_json::Value = serde_json::from_slice(&created.stderr).unwrap();
+    assert_eq!(line["level"], "INFO");
+    assert_eq!(line["fields"]["seed"], data.join("seed").to_str().unwrap());
+    assert_eq!(line["fields"]["max_pow"], 6);
     // Running needs a hub: it never creates one.
     let out = output(&missing, &["run", "--listen", "127.0.0.1:0"]);
     assert!(!out.status.success());
+    let error = String::from_utf8_lossy(&out.stderr);
+    assert!(error.starts_with("error: "), "{error}");
+    assert_eq!(error.lines().count(), 1, "{error}");
     assert!(!missing.exists());
     let out = output(&missing, &["init", "--max-pow", "63"]);
     assert!(!out.status.success());

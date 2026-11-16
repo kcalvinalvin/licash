@@ -20,13 +20,6 @@ a person sees. The apps differ in medium, not in manners.
    providers unless asked for (advanced mode, `--json`, a detail view).
    Times are spans (`about 2 hours`, `in 3 days`), not heights. Amounts
    are `12,345 sat`, digits grouped, the unit always said.
-9. **A fee says what it is of.** Wherever a cost is shown, its share of
-   the amount it is charged on is shown beside it: `12 sat · 0.24%` in
-   the app, `10,000 + 12 sat (0.12%)` in a terminal. Two significant
-   digits (`0.24%`, `1.2%`, `5%`, `12%`), `<0.01%` below that, nothing
-   for no fee (the word `None` says it). A protection's price is a share
-   of what it covers. A fee known only as terms (`1 sat + 0.5%`) stays
-   terms; a limit stays a limit (`Up to 21 sat · 0.21%`).
 5. **Risk is never hidden.** What is not protected, what is on credit,
    what failed, what a test network's contract is worth (`Test only:
    protects nothing`), and what cannot be undone are always said, in
@@ -40,6 +33,15 @@ a person sees. The apps differ in medium, not in manners.
 8. **Calm states.** Loading, empty and failed states are designed: a word
    for what is happening, nothing for what is empty unless it helps, and
    for a failure what failed (a title), why (a line) and what to do.
+9. **A fee says what it is of.** Wherever a cost is shown, its share of
+   the amount it is charged on is shown beside it: `12 sat · 0.24%` in
+   the app, `10,000 + 12 sat (0.12%)` in a terminal. Two significant
+   digits (`0.24%`, `1.2%`, `5%`, `12%`), `<0.01%` below that, nothing
+   for no fee (the word `None` says it). A protection's price is a share
+   of what it covers. A fee known only as terms (`1 sat + 0.5%`) stays
+   terms; a limit stays a limit (`Up to 21 sat · 0.21%`). Operator views
+   retain their existing percentage precision (two decimals below 1%,
+   otherwise one), but never round a nonzero fee to `0.00%`.
 
 ## Words
 
@@ -105,7 +107,13 @@ The wallet CLI (`licash-wallet`), the hub and swap services
   for pending, 1 for errors) and the texts tests pin may not without
   changing their consumers in the same commit.
 - **Lead with the answer.** A command prints its result first, in a line
-  or a short aligned table: `12,345 sat` before how it was reached.
+   or a short aligned table: `12,345 sat` before how it was reached.
+- **Summary first, literally.** `balance` does not list hubs; service
+  `status` does not list transactions or internal note counts. `--details`
+  reveals them (swaps also accepts `--swaps N`). Pending funds, losses,
+  uncounted funds and delivery failures stay visible in the summary.
+  Payment delivery to a mailbox is not receipt by the recipient. Fee
+  bounds are labeled `up to`, not presented as the exact price paid.
 - **Aligned key-value lines** (`label  value`), labels in plain words,
   values right where they line up; amounts grouped with their unit
   (`10,000 + 12 sat` for an amount and its fee); fees as sat and a
@@ -115,7 +123,13 @@ The wallet CLI (`licash-wallet`), the hub and swap services
   act on something.
 - **Errors** are `error: what failed: why` on stderr, one line, with what
   to do when known. Progress and logs go to stderr too, never mixed into
-  the result.
+   the result.
+- **Diagnostics are requested, not endured.** Wallet dependency logs are
+  off unless `--log` or `RUST_LOG` is set. Interactive payments say what
+  they are doing before the network wait; redirected and JSON output has
+  no progress decoration. Services retain warnings and concise lifecycle
+  logs; raw configuration is debug detail, recoverable relay errors do not
+  flood normal output. `--log json` retains structured service logging.
 - **Color** only on a terminal, never carrying meaning alone: green for
   done or healthy, yellow for attention, red for failure, dim for
   secondary detail.
@@ -124,7 +138,10 @@ The wallet CLI (`licash-wallet`), the hub and swap services
 - **Nothing cut.** Text too long for its place wraps under itself, or
   says less as a whole (a comparison dropped, a legend without its
   totals, `+2 more`, a title ending at a word in `…`): never a word cut
-  in half.
+   in half.
+  A table that cannot fit its columns becomes wrapped, labeled records.
+  Never crop a number to fit: `1,010 sat` must not become `010 sat`.
+  Scrolling still moves by record; wide terminals keep aligned columns.
 - **Dashboards**: the overview page first (the few numbers that matter,
   then health beside one chart, then what happened), detail on the
   following pages, each chart on one page only; one accent color, one

@@ -211,14 +211,17 @@ fn recent(r: &Records) -> Table {
                     "taken".into(),
                     format!("{} → {}", short(from), short(to)),
                     Some(*amount as i64),
-                    format!("fee {} sat", grouped(*fee as i64)),
+                    format!("fee {}", licash_dashboard::fee(*fee as i64, *amount as i64)),
                 ),
                 Some(Notice::Done { id, amount, fee }) => (
                     Tone::Good,
                     "done".into(),
                     route(id),
                     Some(*amount as i64),
-                    format!("earned {} sat", grouped(*fee as i64)),
+                    format!(
+                        "earned {}",
+                        licash_dashboard::fee(*fee as i64, *amount as i64)
+                    ),
                 ),
                 Some(Notice::Refunded { id, amount }) => (
                     Tone::Warn,

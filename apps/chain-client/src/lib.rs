@@ -661,7 +661,31 @@ impl Source {
         self.call(method, params).await
     }
 
+    /// A JSON-RPC method whose successful result may be null, as
+    /// `gettxout` for an absent or spent coin. RPC failures remain errors.
+    pub async fn rpc_optional<T: DeserializeOwned>(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> anyhow::Result<Option<T>> {
+        ensure!(
+            matches!(self.kind, Kind::Rpc { .. }),
+            "{self}: {method} needs a node's JSON-RPC"
+        );
+        self.call_optional(method, params).await
+    }
+
     async fn call<T: DeserializeOwned>(&self, method: &str, params: Value) -> anyhow::Result<T> {
+        self.call_optional(method, params)
+            .await?
+            .with_context(|| format!("{self}: {method}: no result"))
+    }
+
+    async fn call_optional<T: DeserializeOwned>(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> anyhow::Result<Option<T>> {
         let Kind::Rpc { url, auth } = &self.kind else {
             unreachable!("JSON-RPC on a node");
         };
@@ -697,9 +721,7 @@ impl Source {
         if let Some(e) = reply.error {
             bail!("{self}: {method}: {} ({})", e.message, e.code);
         }
-        reply
-            .result
-            .with_context(|| format!("{self}: {method}: no result"))
+        Ok(reply.result)
     }
 
     async fn text(&self, path: &str) -> anyhow::Result<String> {

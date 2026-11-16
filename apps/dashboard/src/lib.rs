@@ -22,6 +22,9 @@ mod style;
 mod view;
 mod window;
 
+#[cfg(any(test, feature = "test-support"))]
+pub mod testing;
+
 #[cfg(test)]
 mod tests;
 
@@ -32,7 +35,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 
-pub use format::{grouped, span};
+pub use format::{fee, fee_share, grouped, span};
 pub use page::{
     Better, Card, Cell, Check, Column, Measure, Page, Panel, Ref, Row, Table, Tone, Value,
 };
@@ -44,7 +47,8 @@ pub use series::{Fact, Kind, Series, Unit};
 pub struct Report {
     /// What the service is, such as `licash hub`.
     pub title: String,
-    /// Which one: its network, data directory or URL.
+    /// Which one: its network, data directory or URL. A suffix after ` · `
+    /// is retained at narrow widths when the full context does not fit.
     pub subtitle: String,
     /// Unix seconds.
     pub now: i64,

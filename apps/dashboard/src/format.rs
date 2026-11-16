@@ -78,10 +78,34 @@ pub fn percent(ratio: f64) -> String {
     }
 }
 
+/// A transaction fee as a share of its charging basis, when known.
+pub fn fee(fee: i64, basis: i64) -> String {
+    let value = amount(fee, Unit::Sat);
+    match fee_share(fee, basis) {
+        Some(share) => format!("{value} ({share})"),
+        None => value,
+    }
+}
+
+/// A nonzero fee's share, without a misleading rounded zero.
+pub fn fee_share(fee: i64, basis: i64) -> Option<String> {
+    if fee <= 0 || basis <= 0 {
+        return None;
+    }
+    let ratio = fee as f64 / basis as f64;
+    let share = if ratio < 0.00005 {
+        "<0.01%".into()
+    } else {
+        percent(ratio)
+    };
+    Some(share)
+}
+
 /// A relative change: `▲ 12.3%`, `▼ 4.0%`, `= 0%`, or `▲ new` from zero.
 pub fn change(change: Option<f64>, value: f64) -> String {
     match change {
-        None if value != 0.0 => "▲ new".into(),
+        None if value > 0.0 => "▲ new".into(),
+        None if value < 0.0 => "▼ new".into(),
         None => "–".into(),
         Some(c) if c.abs() < 0.0005 => "= 0%".into(),
         Some(c) => format!("{} {}", arrow(c), percent(c.abs())),
@@ -265,6 +289,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_fee_has_a_nonzero_share_only_with_a_known_basis() {
+        assert_eq!(fee(12, 5_000), "12 sat (0.24%)");
+        assert_eq!(fee(1, 50), "1 sat (2.0%)");
+        assert_eq!(fee(1, 1_000_000), "1 sat (<0.01%)");
+        assert_eq!(fee(0, 50), "0 sat");
+        assert_eq!(fee(1, 0), "1 sat");
+        assert_eq!(fee_share(23_000, 1_000_000), Some("2.3%".into()));
+    }
+
+    #[test]
     fn text_says_less_between_words() {
         assert_eq!(fit("Notes outstanding", 20), "Notes outstanding");
         assert_eq!(fit("Notes outstanding", 11), "Notes…");
@@ -298,6 +332,7 @@ mod tests {
         assert_eq!(change(Some(0.123), 1.0), "▲ 12.3%");
         assert_eq!(change(Some(-0.04), 1.0), "▼ 4.0%");
         assert_eq!(change(None, 5.0), "▲ new");
+        assert_eq!(change(None, -5.0), "▼ new");
         assert_eq!(change(None, 0.0), "–");
         assert_eq!(percent(0.0025), "0.25%");
         assert_eq!(points(-0.021), "▼ 2.1 pts");

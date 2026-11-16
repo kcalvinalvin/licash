@@ -393,10 +393,32 @@ mod tests {
 
     fn recent(r: &Records, now: i64) -> licash_dashboard::Table {
         let report = pages::report(r, now, licash_dashboard::unasked(), Path::new("hub"));
+        if std::env::var_os("DASHBOARD_SCREEN").is_some() {
+            for page in 0..report.pages.len() {
+                for (width, height) in [(80, 30), (140, 44)] {
+                    println!("HUB page {page} {width}x{height}");
+                    licash_dashboard::testing::screen(&report, page, width, height);
+                }
+            }
+        }
         let overview = &report.pages[0];
         match &overview.rows.last().unwrap()[..] {
             [licash_dashboard::Panel::Table(t)] if t.title == "Recent events" => t.clone(),
             _ => panic!("no recent events below the overview"),
+        }
+    }
+
+    #[test]
+    fn the_empty_hub_renders_every_page_at_terminal_sizes() {
+        let dir = tempfile::tempdir().unwrap();
+        licash_hub::Hub::init(&dir.path().join("seed"), &dir.path().join("hub.sqlite"), 6).unwrap();
+        let report = super::report(dir.path(), None).unwrap();
+        for page in 0..report.pages.len() {
+            for (width, height) in [(80, 30), (140, 44)] {
+                let screen = licash_dashboard::testing::screen(&report, page, width, height);
+                assert!(screen.contains("q quit"), "{screen}");
+                assert!(screen.contains("? help"), "{screen}");
+            }
         }
     }
 
@@ -544,7 +566,11 @@ mod tests {
                 (now - 50, Tone::Muted, "hub | key rotated |  | "),
                 (now - 100, Tone::Warn, "hub | alert |  | low on collateral"),
                 (now - 150, Tone::Muted, "contract | given up |  | 07070707"),
-                (now - 200, Tone::Warn, "lock | refunded | 50 | fee 1 sat"),
+                (
+                    now - 200,
+                    Tone::Warn,
+                    "lock | refunded | 50 | fee 1 sat (2.0%) of input"
+                ),
                 (
                     now - 200,
                     Tone::Normal,
@@ -570,7 +596,7 @@ mod tests {
                 (
                     now - 500,
                     Tone::Good,
-                    "transfer | released | 1000 | fee 1 sat"
+                    "transfer | released | 1000 | fee 1 sat (0.10%) of input"
                 ),
                 (now - 600, Tone::Muted, "hub | started |  | "),
                 (

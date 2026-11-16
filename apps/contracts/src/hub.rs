@@ -9,12 +9,13 @@
 //! effects cut short by a restart run again then.
 
 mod node;
+mod responses;
 mod run;
 mod store;
 pub mod terms;
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -55,6 +56,7 @@ const WAIT: Duration = Duration::from_secs(20);
 
 /// A hub's openings, with its node, whose wallet funds and signs F.
 pub struct Openings {
+    data: PathBuf,
     store: Mutex<Store>,
     /// The chain followed: its tip, checkpoints and fee rates, and
     /// broadcasting.
@@ -70,6 +72,14 @@ pub struct Openings {
     heavy: Arc<tokio::sync::Semaphore>,
     /// Held from funding an F to locking its coins: no two take the same.
     funding: tokio::sync::Mutex<()>,
+}
+
+/// One responder poll. A bad opening never hides the others; errors are
+/// also logged with the opening id.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ResponseRound {
+    pub answered: usize,
+    pub failed: usize,
 }
 
 /// Why a request was not answered with frames.
@@ -220,6 +230,7 @@ impl Openings {
         }
         let store = Store::open(data)?;
         let openings = Arc::new(Self {
+            data: data.to_owned(),
             store: Mutex::new(store),
             source,
             wallet,
@@ -307,8 +318,8 @@ impl Openings {
     /// Its plain answer to `r`, the holder's request on Bitcoin in
     /// opening `id`, to broadcast: her proof decides then. Refused for an
     /// opening not funded, given up or unknown, or a transaction not its
-    /// request. No answer is made by the hub on its own yet: an operator
-    /// (or a test) asks for it.
+    /// request. Pins its witness and answer in `responses.sqlite`, shared
+    /// with the operator command, before returning anything to broadcast.
     pub async fn respond(
         &self,
         id: &[u8; 32],
@@ -319,7 +330,92 @@ impl Openings {
             .await
             .map_err(|e| anyhow::anyhow!(e.reason))?;
         let row = self.store().row(id)?;
-        answer(row, &ctx, id, r)
+        answer(&self.data, row, &ctx, id, r)
+    }
+
+    /// Answer confirmed requests whose outputs are still unspent, without
+    /// a scan or txindex. Each opening's error is reported independently.
+    /// No hub timeout is broadcast, even after the assertion deadline.
+    pub async fn answer_requests(&self) -> Result<ResponseRound> {
+        let ids = self.store().signed_ids()?;
+        let mut round = ResponseRound::default();
+        for id in ids {
+            match self.answer_request(&id).await {
+                Ok(true) => round.answered += 1,
+                Ok(false) => {}
+                Err(e) => {
+                    round.failed += 1;
+                    tracing::error!(id = %crate::hex_id(&id), "answering a contract request: {e:#}")
+                }
+            }
+        }
+        Ok(round)
+    }
+
+    async fn answer_request(&self, id: &[u8; 32]) -> Result<bool> {
+        let ctx = self
+            .context()
+            .await
+            .map_err(|e| anyhow::anyhow!(e.reason))?;
+        let row = self.store().row(id)?.context("no signed opening")?;
+        let opening = Hub::load(&row.state, &ctx)?.opening()?;
+        let request = opening
+            .set
+            .iter()
+            .find(|p| p.name == "request")
+            .context("no request link")?;
+        let txid = request.tx.compute_txid();
+        // Include the chain only: an answer already in the mempool is
+        // rebroadcast, not mistaken for a confirmed resolution.
+        let coin: Option<serde_json::Value> = self
+            .wallet
+            .rpc_optional("gettxout", serde_json::json!([txid.to_string(), 0, false]))
+            .await?;
+        let Some(coin) = coin else {
+            return Ok(false);
+        };
+        let depth = coin["confirmations"].as_u64().context("no request depth")?;
+        if depth < u64::from(opening.base.parts().chain.request_depth) {
+            return Ok(false);
+        }
+        let tip = self.source.tip().await?;
+        ensure!(
+            coin["bestblock"].as_str() == Some(&tip.hash.to_string()),
+            "contracts wallet and chain source have different tips"
+        );
+        let height = u64::from(tip.height)
+            .checked_add(1)
+            .and_then(|h| h.checked_sub(depth))
+            .context("request depth exceeds chain height")?;
+        let hash = self.source.hash(u32::try_from(height)?).await?;
+        let block = self.source.block(&hash).await?;
+        ensure!(
+            block.check_witness_commitment(),
+            "request block has an invalid witness commitment"
+        );
+        let r = block
+            .txdata
+            .iter()
+            .find(|tx| tx.compute_txid() == txid)
+            .context("request missing from its confirmed block")?;
+        let answer = self.respond(id, r).await?;
+        let answered = self.source.broadcast(&answer).await?;
+        tracing::info!(id = %crate::hex_id(id), request = %txid, response = %answered, "contract request answered");
+        Ok(true)
+    }
+
+    /// Poll while the hub runs. Enabling this is an explicit operator
+    /// action, including for contracts from an older installation.
+    pub fn spawn_responder(self: &Arc<Self>, every: Duration) {
+        let this = self.clone();
+        tokio::spawn(async move {
+            loop {
+                if let Err(e) = this.answer_requests().await {
+                    tracing::error!("automatic contract responder: {e:#}");
+                }
+                tokio::time::sleep(every).await;
+            }
+        });
     }
 
     async fn context(&self) -> Result<Context, Refused> {
@@ -342,7 +438,8 @@ impl Openings {
 /// The plain answer to `r` in opening `id` of the openings in `data`, as
 /// [`Openings::respond`], on the chain `source` follows: read beside the
 /// running hub, for its operator. Needs neither the hub's seed nor its
-/// wallet, and writes nothing.
+/// wallet. Records its one-time signing pin in `responses.sqlite`, shared
+/// with the running hub. Keep that file with the opening's state.
 pub async fn respond(
     data: &Path,
     source: &Source,
@@ -351,10 +448,11 @@ pub async fn respond(
 ) -> Result<bitcoin::Transaction> {
     let trust = crate::trust(source.profile().await?)?;
     let tip = source.tip().await?.height;
-    answer(Store::read(data, id)?, &Context { tip, trust }, id, r)
+    answer(data, Store::read(data, id)?, &Context { tip, trust }, id, r)
 }
 
 fn answer(
+    data: &Path,
     row: Option<store::Row>,
     ctx: &Context,
     id: &[u8; 32],
@@ -362,7 +460,22 @@ fn answer(
 ) -> Result<bitcoin::Transaction> {
     let row = row.with_context(|| format!("no opening {}", crate::hex_id(id)))?;
     ensure!(!row.abandoned, "an opening given up");
-    Hub::load(&row.state, ctx)?.respond(r)
+    // Validate before pinning, but do not sign until the pin is durable.
+    let opening = Hub::load(&row.state, ctx)?.opening()?;
+    let request = opening
+        .set
+        .iter()
+        .find(|p| p.name == "request")
+        .context("no request link")?;
+    ensure!(
+        r.compute_txid() == request.tx.compute_txid(),
+        "not this contract's request"
+    );
+    let leaf = opening.prefix.leaf();
+    let items: Vec<Vec<u8>> = r.input[0].witness.iter().map(<[u8]>::to_vec).collect();
+    leaf.keys()
+        .decode_witness(&items, leaf.script(), leaf.control())?;
+    responses::Responses::open(data)?.answer(id, r, || Hub::load(&row.state, ctx)?.respond(r))
 }
 
 /// The routes of `openings`, at [`QUOTE`], [`OPEN`], [`STEP`] and

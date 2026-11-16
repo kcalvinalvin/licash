@@ -855,6 +855,11 @@ class Engine(context: Context) {
     /** What opening a recovery contract at `hub` costs now, and the coin that would pay it. */
     suspend fun contractQuote(hub: String): Result<ContractQuote> = io { local { it.contractQuote(hub) } }
 
+    /** Planning from this wallet's signed terms; never starts a close. */
+    suspend fun contractSafety(id: String): Result<org.licash.core.ContractSafety> = io {
+        local { it.contractSafety(id, proofMarginBlocks(prefs.proofMarginDays, state.value.network), 6u) }
+    }
+
     /**
      * Open a recovery contract at `hub` for at most `maxPrice`, of the
      * terms `chosen` within the hub's range if any, else of its fixed

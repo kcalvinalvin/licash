@@ -1,9 +1,7 @@
 //! The dashboard over a small report: what the view works out, what the
 //! terminal shows, and how keys move it.
 
-use ratatui::backend::TestBackend;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ratatui::Terminal;
 
 use crate::app::{Status, Ui};
 use crate::view::{Number, PanelView, View};
@@ -243,28 +241,154 @@ fn screen(ui: &Ui, width: u16, height: u16) -> String {
 }
 
 fn screen_of(report: &Report, ui: &Ui, width: u16, height: u16) -> String {
-    let view = View::new(report, ui.range);
-    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
     let status = Status {
         read: std::time::Duration::from_secs(3),
         reading: false,
         error: None,
     };
-    terminal
-        .draw(|f| render::draw(f, &view, ui, &status))
-        .unwrap();
-    let buffer = terminal.backend().buffer();
-    let mut out = String::new();
-    for y in 0..buffer.area.height {
-        for x in 0..buffer.area.width {
-            out.push_str(buffer[(x, y)].symbol());
+    crate::testing::draw(report, ui, width, height, &status)
+}
+
+#[test]
+fn a_read_failure_keeps_the_last_data_and_the_help_and_quit_keys() {
+    let report = report();
+    let mut ui = Ui::new(Range::Month);
+    let status = Status {
+        read: std::time::Duration::from_secs(120),
+        reading: false,
+        error: Some("cannot read records: database is busy"),
+    };
+    for width in [40, 80, 140] {
+        let out = crate::testing::draw(&report, &ui, width, 30, &status);
+        assert!(out.contains("Read failed"), "{out}");
+        assert!(out.contains("stale"), "{out}");
+        assert!(out.contains("? help") && out.contains("q quit"), "{out}");
+        assert!(out.contains("Overview"), "{out}");
+    }
+    ui.help = true;
+    let out = crate::testing::draw(&report, &ui, 80, 30, &status);
+    assert!(out.contains(status.error.unwrap()), "{out}");
+    assert!(out.contains("last good data kept"), "{out}");
+}
+
+#[test]
+fn narrow_tabs_keep_the_selected_name_and_all_page_numbers_whole() {
+    let mut report = report();
+    report.pages = [
+        "Overview",
+        "Payments",
+        "Fees",
+        "Reserves",
+        "Contracts",
+        "Privacy",
+        "Health",
+    ]
+    .into_iter()
+    .map(|title| Page::new(title, vec![]))
+    .collect();
+    let mut ui = Ui::new(Range::Month);
+    ui.page = 6;
+    for width in [40, 80] {
+        let out = screen_of(&report, &ui, width, 24);
+        let tabs = out.lines().nth(1).unwrap();
+        assert!(tabs.contains("7 Health"), "{tabs}");
+        for n in 1..=7 {
+            assert!(tabs.contains(&n.to_string()), "{tabs}");
         }
-        out.push('\n');
     }
-    if std::env::var_os("DASHBOARD_SCREEN").is_some() {
-        println!("{out}");
+}
+
+#[test]
+fn narrow_tables_wrap_records_without_losing_leading_digits() {
+    let table = Table::now(
+        "Under way",
+        &["kind", "amount", "state"],
+        vec![Row::new(
+            None,
+            Tone::Warn,
+            vec![
+                Cell::Text("deposit".into()),
+                Cell::Sat(1_010),
+                Cell::Text("awaiting payment".into()),
+            ],
+        )],
+        "none",
+    );
+    let mut report = report();
+    report.pages = vec![Page::new("Payments", vec![vec![Panel::Table(table)]])];
+    let out = screen_of(&report, &Ui::new(Range::Day), 40, 20);
+    assert!(out.contains("1,010 sat"), "{out}");
+    assert!(out.contains("awaiting") && out.contains("payment"), "{out}");
+}
+
+#[test]
+fn narrow_breakdowns_keep_whole_amounts_and_percentages() {
+    let mut money = Series::flow("money", "Balances", Unit::Sat);
+    money.add(NOW - 60, "hub A", 9_410);
+    money.add(NOW - 60, "hub B", 590);
+    let mut report = report();
+    report.series = vec![money];
+    report.pages = vec![Page::new(
+        "Liquidity",
+        vec![vec![Panel::breakdown(
+            "By hub",
+            "money",
+            vec![
+                Column::value("available", Ref::sum("money")),
+                Column::share("share", Ref::sum("money")),
+                Column::per_day("per day", Ref::sum("money")),
+            ],
+        )]],
+    )];
+    let out = screen_of(&report, &Ui::new(Range::Day), 40, 30);
+    for value in ["9,410 sat", "590 sat", "94.1%", "5.9%"] {
+        assert!(out.contains(value), "{value} missing: {out}");
     }
-    out
+}
+
+#[test]
+fn wrapped_records_remain_reachable_by_scrolling() {
+    let row = |amount, state: &str| {
+        Row::new(
+            None,
+            Tone::Warn,
+            vec![
+                Cell::Time(NOW - 60),
+                Cell::Text("deposit".into()),
+                Cell::Sat(amount),
+                Cell::Text(state.into()),
+            ],
+        )
+    };
+    let table = Table::now(
+        "Under way",
+        &["when", "kind", "amount", "state"],
+        vec![
+            row(
+                1_010,
+                "awaiting payment at the hub; confirmation is pending",
+            ),
+            row(98_765, "ready to receive, all funds still pending"),
+        ],
+        "none",
+    );
+    let mut report = report();
+    report.pages = vec![Page::new("Payments", vec![vec![Panel::Table(table)]])];
+    let mut ui = Ui::new(Range::Day);
+    let out = screen_of(&report, &ui, 40, 12);
+    assert!(
+        out.contains("when 1m ago"),
+        "not using the wrapped record layout: {out}"
+    );
+    assert!(out.contains("1,010 sat"), "{out}");
+    ui.press(
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+        &View::new(&report, ui.range),
+    );
+    assert_eq!(ui.offset(0), 1);
+    let out = screen_of(&report, &ui, 40, 12);
+    assert!(out.contains("98,765 sat"), "{out}");
+    assert!(out.contains("ready to receive"), "{out}");
 }
 
 #[test]

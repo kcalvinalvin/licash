@@ -137,6 +137,7 @@ async fn rpc(
     let params = &call["params"];
     let by_hash = |i: usize| chain.by_hash.get(params[i].as_str().unwrap_or_default());
     match call["method"].as_str().unwrap_or_default() {
+        "gettxout" => rpc_reply(Value::Null),
         "getblockchaininfo" => {
             let tip = chain.blocks.last().unwrap();
             rpc_reply(json!({
@@ -627,6 +628,37 @@ async fn a_block_or_header_that_is_not_the_one_asked_for_is_refused() {
         let block = source.block(&claimed).await.unwrap_err().to_string();
         assert!(block.contains("does not hash to itself"), "{block}");
     }
+}
+
+#[tokio::test]
+async fn a_null_rpc_result_is_optional_only_when_the_caller_asks_for_it() {
+    let address = serve(mine(1), PASSWORD, None).await;
+    let [node, esplora] = sources(&address);
+    let coin = node
+        .rpc_optional::<Value>("gettxout", json!(["missing", 0, false]))
+        .await
+        .unwrap();
+    assert_eq!(coin, None);
+    // Preserve the non-null call's previous error contract.
+    assert!(node
+        .rpc::<Value>("gettxout", json!([]))
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("no result"));
+    assert!(node
+        .rpc_optional::<Value>("not_a_method", json!([]))
+        .await
+        .is_err());
+    assert!(esplora
+        .rpc_optional::<Value>("gettxout", json!([]))
+        .await
+        .is_err());
+    let tip = node
+        .rpc_optional::<Value>("getblockchaininfo", json!([]))
+        .await
+        .unwrap();
+    assert!(tip.is_some());
 }
 
 #[tokio::test]
