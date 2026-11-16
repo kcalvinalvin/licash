@@ -142,6 +142,33 @@ async fn a_relay_that_never_answers_holds_nothing_up() {
 }
 
 #[tokio::test]
+async fn a_payment_too_large_for_the_relays_is_said_too_large_to_mail() {
+    let relay = MockRelay::run().await.unwrap();
+    let relays = [relay.url().await.to_string()];
+    let to = mailbox([1; 32]);
+    // Some 40 KB of payment, wrapped in some 77 KB: more than the relay
+    // takes, as most do.
+    let payment = format!(r#"{{"signed":"{}"}}"#, "ab".repeat(20_000));
+    let sent = mailbox::send(&to, &payment, &relays, &Route::Direct).await;
+    let why = format!("{:#}", sent.unwrap_err());
+    assert!(
+        why.starts_with("too large to mail, 7")
+            && why.contains(" KB where relays commonly take 64 KB at most: "),
+        "{why}"
+    );
+    assert!(why.contains("exceeds maximum allowed size"), "{why}");
+    assert!(mailbox::fetch(&[1; 32], &relays, &Route::Direct)
+        .await
+        .unwrap()
+        .is_empty());
+
+    // A payment that fits is mailed as ever.
+    let payment = format!(r#"{{"signed":"{}"}}"#, "ab".repeat(10_000));
+    let sent = mailbox::send(&to, &payment, &relays, &Route::Direct).await;
+    assert_eq!(sent.unwrap(), 1);
+}
+
+#[tokio::test]
 async fn no_relay_answering_fails_in_the_routes_time() {
     let relays = [silent_relay().await];
     let to = mailbox([1; 32]);

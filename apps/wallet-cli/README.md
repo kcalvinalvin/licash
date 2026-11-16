@@ -67,7 +67,9 @@ through the hub, signed with a secret only the two share. A payment not
 collected within an hour is sent to the payee's mailbox on Nostr by
 `deliver`, by `watch`, or after `mailbox` and `resume`; one the hub
 does not keep is sent there at once. A code naming no mailbox has its
-payment printed to hand over as well. `mailbox` (or `collect`) receives
+payment printed to hand over as well, as has one no relay took: a payment
+of many notes can be larger than the 64 KB relays commonly take, which
+the warning then says. `mailbox` (or `collect`) receives
 what the hubs keep for the wallet and what was sent to its mailbox; `watch`
 keeps receiving and delivering, every `--every` seconds (60), until
 stopped. Keep `watch` running, or schedule `deliver`, to send fallback mail
