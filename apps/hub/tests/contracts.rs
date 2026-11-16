@@ -541,6 +541,74 @@ async fn a_holder_forces_her_contract_closed_on_a_silent_hub_and_takes_her_notes
     Ok(())
 }
 
+/// The response window makes a timeout eligible, but does not expire the
+/// hub's answer. A holder must still be ready to prove after that window.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs bitcoind and a release build"]
+async fn a_hubs_answer_can_confirm_after_its_response_window() -> Result<()> {
+    use bitcoin::FeeRate;
+    use licash_contracts::holder::recovery::{self, Stage};
+
+    let rt = Regtest::start_standard()?;
+    let dir = tempfile::tempdir()?;
+    let at = dir.path().join("hub");
+    let (url, source, hub, openings) = hub_answering(&rt, &at).await?;
+    let chain = Node(source);
+    let mine = dir.path().join("wallet");
+    std::fs::create_dir(&mine)?;
+    let wallet = Wallet::create(
+        &mine.join("wallet.sqlite"),
+        &[19; 32],
+        ChainProfile::Core30DefaultRegtest,
+        Http::new(None)?,
+    )?;
+    wallet.add_hub(&url).await?;
+    wallet.watch_silent(None, rt.height()?)?;
+    for sats in [60_000, 50_000] {
+        rt.fund(
+            &wallet.fallback_address()?.script_pubkey(),
+            Amount::from_sat(sats),
+        )?;
+    }
+    rt.mine(1)?;
+    scan(&wallet, &chain).await?;
+    let opened = holder::open(&wallet, &chain, &mine, &url, ask()).await?;
+    wallet.receive(&pay(
+        &hub,
+        &at.join("seed"),
+        &url,
+        &wallet.address(),
+        3_000,
+    )?)?;
+    rt.mine(1)?;
+    holder::resume(&wallet, &chain, &mine).await?;
+    let rate = FeeRate::from_sat_per_vb(2).context("a rate")?;
+    let forced = recovery::force_close(&wallet, &chain, &mine, &opened.id, rate).await?;
+    rt.mine_to_height(forced.next_at.context("no lock")? - 1)?;
+    recovery::advance(&wallet, &chain, &mine, rate).await?;
+    rt.mine(1)?;
+    let requested = recovery::advance(&wallet, &chain, &mine, rate).await?;
+    ensure!(requested[0].stage == Stage::Requested, "{requested:?}");
+    let window_end = requested[0].next_at.context("no window")?;
+    let r = rt.get_tx(&requested[0].request.context("no request")?)?;
+
+    // No timeout is broadcast while the holder is offline. The response
+    // confirms strictly after the earliest timeout block.
+    rt.mine_to_height(window_end + 1)?;
+    let answer = openings.respond(&opened.id, &r).await?;
+    rt.send_raw(&answer)?;
+    rt.mine(1)?;
+    let observed = recovery::advance(&wallet, &chain, &mine, rate).await?;
+    ensure!(observed[0].error.is_none(), "{observed:?}");
+    ensure!(observed[0].stage.disputed(), "{observed:?}");
+    ensure!(
+        observed[0].response == Some(answer.compute_txid()),
+        "{observed:?}"
+    );
+    ensure!(observed[0].timeout.is_none(), "{observed:?}");
+    Ok(())
+}
+
 /// As [`hub_serving`], and its openings, for a test to answer a holder's
 /// request with.
 async fn hub_answering(
