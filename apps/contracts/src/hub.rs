@@ -637,6 +637,7 @@ mod tests {
         let keyset = Hub::peek(FUNDED).unwrap().base.parts().keyset.clone();
         let source: Source = "http://127.0.0.1:1".parse().unwrap();
         Openings {
+            data: dir.to_owned(),
             store: Mutex::new(Store::open(dir).unwrap()),
             source: source.clone(),
             wallet: source,
