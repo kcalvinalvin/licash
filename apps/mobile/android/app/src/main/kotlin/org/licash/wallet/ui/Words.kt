@@ -208,8 +208,8 @@ fun forcing(recovery: Recovery, height: Int): Forcing {
         RecoveryStage.REQUESTED -> "Requested" to (wait?.let { "The hub has $it to answer" } ?: "The hub may answer")
         RecoveryStage.TIMING_OUT -> "Paying back" to (wait?.let { "Back on Bitcoin in $it" } ?: "The hub did not answer")
         RecoveryStage.SWEEPING -> "Sweeping" to "To your Bitcoin, once in a block"
-        RecoveryStage.DONE -> "Recovered" to "${sat(recovery.claimed)} back on Bitcoin"
-        RecoveryStage.ANSWERED -> "Answered" to "The hub countered, which this app cannot answer yet"
+        RecoveryStage.DONE -> "Recovered" to "${sat(recovery.received ?: recovery.claimed)} back on Bitcoin"
+        RecoveryStage.ANSWERED -> "Preparing proof" to "Connect to Bitcoin to classify the hub's answer"
         RecoveryStage.LOST -> "Lost" to "Its bitcoin went elsewhere"
         RecoveryStage.PROVING -> "Proof needed" to proving(recovery, height)
         RecoveryStage.ASSERTING -> "Proving" to "Posting your proof on Bitcoin"

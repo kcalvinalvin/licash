@@ -14,6 +14,12 @@ import org.licash.core.RecoveryStage
 
 class CoverTest {
     @Test
+    fun a_corrected_recovery_shows_the_actual_sweep_not_the_original_claim() {
+        val done = recovery(RecoveryStage.DONE, true, null).copy(corrected = 0uL, received = 2_500uL)
+        assertEquals("2,500 sat back on Bitcoin", forcing(done, 1_000).says)
+    }
+
+    @Test
     fun note_count_counts_notes_not_their_denominations_across_hubs() {
         assertEquals(0uL, noteCount(emptyList()))
         assertEquals(7uL, noteCount(listOf(

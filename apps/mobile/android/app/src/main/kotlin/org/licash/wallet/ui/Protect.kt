@@ -234,6 +234,11 @@ private fun Unfolded(c: Contract, cover: Cover, developer: Boolean, end: () -> U
 @Composable
 private fun Forced(r: Recovery, developer: Boolean, giveUp: () -> Unit, height: Int) {
     Line("Claimed", sat(r.claimed), tag = "recovery-claimed")
+    r.corrected?.let {
+        Line("Unspent claim", sat(it), tag = "recovery-corrected")
+        Say("Before reserves and Bitcoin fees.")
+    }
+    r.received?.let { Line("Back on Bitcoin", sat(it), tag = "recovery-received") }
     if (needsProof(r) && height > 0) r.deadline?.let {
         Line("Time left to prove", "${it.toLong().minus(height).coerceAtLeast(0)} blocks")
     }

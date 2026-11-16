@@ -59,7 +59,7 @@ internal fun watchOf(ui: Ui, now: Long): Watch {
 /** A forced close's stages from its proof's posting until paid: kept at work, the hub's challenge to answer in time. */
 internal val DISPUTED = setOf(RecoveryStage.ASSERTING, RecoveryStage.ASSERTED, RecoveryStage.CHALLENGED)
 
-/** Whether a forced close is carried on as blocks come: not once over, nor countered (which this app does not answer). */
+/** Legacy counters are reclassified when the app next advances them in the foreground. */
 internal fun carriedOn(recovery: Recovery): Boolean =
     recovery.stage !in setOf(RecoveryStage.DONE, RecoveryStage.ANSWERED, RecoveryStage.LOST)
 

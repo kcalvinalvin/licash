@@ -148,6 +148,9 @@ The claim cap is a limit inside the payout pool, not extra collateral.
 Technical details reveal the signed note limit, denominations, keyset,
 graph version and program identities. Earlier opening stages show progress
 rather than guessed signed details.
+Corrected recoveries show the unspent claim separately from the original
+claim. Once done, the returned amount is the actual sweep output, including
+the effect of reserves and fees, not the original claimed amount.
 
 Before its request is signed, Cancel closing asks for confirmation and
 releases the notes reserved by that attempt. It does not close the contract

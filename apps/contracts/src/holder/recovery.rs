@@ -193,6 +193,10 @@ pub struct Recovery {
     pub irrevocable: bool,
     /// What her notes claimed come to, in sat, and how many they are.
     pub claimed: u64,
+    /// The selected corrected principal, before reserves and fees.
+    pub corrected: Option<u64>,
+    /// The actual sweep output once the recovery is done.
+    pub received: Option<u64>,
     pub notes: usize,
     /// Her request R and its publication P, once signed.
     pub request: Option<Txid>,
@@ -626,6 +630,18 @@ fn view(row: &RecoveryRow) -> Result<Recovery> {
         stage,
         irrevocable: row.irrevocable,
         claimed: u64::from(state.amount),
+        corrected: state.corrected.map(u64::from),
+        received: if stage == Stage::Done {
+            state
+                .sweep
+                .as_ref()
+                .and_then(|tx| match tx.output.as_slice() {
+                    [out] => Some(out.value.to_sat()),
+                    _ => None,
+                })
+        } else {
+            None
+        },
         notes: state.notes.len(),
         request: txid(&state.r),
         publication: txid(&state.p),

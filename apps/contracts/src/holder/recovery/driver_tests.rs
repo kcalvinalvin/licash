@@ -366,9 +366,13 @@ async fn lifecycle(amount: u32, challenged: bool) {
     assert_eq!(progressed[0].stage, Stage::Sweeping, "{progressed:?}");
     let sweep = chain.last();
     assert!(sweep.output[0].value >= sweep.output[0].script_pubkey.minimal_non_dust());
+    let received = sweep.output[0].value.to_sat();
     chain.mine(Some(sweep));
     let done = advance(&wallet, &chain, dir.path(), rate).await.unwrap();
     assert_eq!(done[0].stage, Stage::Done, "{done:?}");
+    assert_eq!(done[0].corrected, Some(u64::from(amount)));
+    assert_eq!(done[0].received, Some(received));
+    assert_eq!(done[0].claimed, 4_096);
     assert_eq!(
         State::decode(&store.recovery(&id).unwrap().unwrap())
             .unwrap()
