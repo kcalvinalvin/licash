@@ -40,6 +40,17 @@ const MAX_NOTES: usize = 32;
 /// forced the contract closed at: the rate may rise over the hub's window.
 const TIMEOUT_FEE_MARGIN: u64 = 2;
 
+/// The last blocks a watch saw that it looks at again on its next step: a
+/// reorganization as deep may put the spend it waits for (the hub's
+/// challenge, say) in a block replacing one it saw without it.
+const OVERLAP: u32 = 3;
+
+/// The first block a watch that looked from `from` to `tip` looks at
+/// next: the last [`OVERLAP`] again, none before `from`.
+fn rescan(from: u32, tip: u32) -> u32 {
+    (tip + 1).saturating_sub(OVERLAP).max(from)
+}
+
 /// The largest block her statement reads R or P in, in bytes.
 const MAX_BLOCK: usize = 4_000_000;
 
@@ -829,7 +840,7 @@ impl<'a, T: Transport, C: Chain> Run<'a, T, C> {
             state.r_height = Some(height);
             return Ok(Next::To(Stage::Irrevocable));
         }
-        state.from = Some(tip + 1);
+        state.from = Some(rescan(from, tip));
         if tip + 1 < f_height + wait {
             return Ok(Next::Save);
         }
@@ -1020,7 +1031,7 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
                     return Ok(Next::To(Stage::Lost));
                 }
                 None => {
-                    state.from = Some(tip + 1);
+                    state.from = Some(rescan(from, tip));
                     next = Next::Save;
                 }
             }
@@ -1084,7 +1095,7 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
             state.next_at = Some(height + close::sweep_delay(&self.o));
             return Ok(Next::To(Stage::TimedOut));
         }
-        state.from = Some(tip + 1);
+        state.from = Some(rescan(from, tip));
         if stage == Stage::TimingOut {
             self.broadcast(state.spend.as_ref().context("no timeout")?)
                 .await;
@@ -1142,7 +1153,7 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
                 Ok(Next::To(Stage::Lost))
             }
             None => {
-                state.from = Some(tip + 1);
+                state.from = Some(rescan(from, tip));
                 self.broadcast(&sweep).await;
                 Ok(Next::Save)
             }
@@ -1339,7 +1350,7 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
                 Ok(Some(Next::To(Stage::Lost)))
             }
             None => {
-                state.from = Some(tip + 1);
+                state.from = Some(rescan(from, tip));
                 Ok(None)
             }
         }
@@ -1375,7 +1386,7 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
                 self.trouble(format!("her assert's output went to {txid}"));
                 return Ok(Next::To(Stage::Lost));
             }
-            None => state.from = Some(tip + 1),
+            None => state.from = Some(rescan(from, tip)),
         }
         if stage == Stage::Succeeding {
             self.broadcast(state.payout.as_ref().context("no success")?)
@@ -1417,7 +1428,7 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
                 ));
                 return Ok(Next::To(Stage::Lost));
             }
-            None => state.from = Some(tip + 1),
+            None => state.from = Some(rescan(from, tip)),
         }
         if state.payout.is_none() {
             let setups = self
@@ -1556,6 +1567,16 @@ mod tests {
     /// A state of a hub silent writes as the build before the hub's
     /// answer was followed wrote it, which that build reads: no field of
     /// the answer's in it.
+    /// A watch looks at its last blocks again, never before where it began.
+    #[test]
+    fn a_watch_looks_again_at_the_last_blocks_it_saw() {
+        assert_eq!(rescan(100, 200), 198);
+        assert_eq!(rescan(199, 200), 199);
+        assert_eq!(rescan(0, 1), 0);
+        // Its first look past `from`, no block skipped.
+        assert_eq!(rescan(150, 150), 150);
+    }
+
     #[test]
     fn a_silent_recovery_s_state_is_written_as_before() {
         let state = State {
