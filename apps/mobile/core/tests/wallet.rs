@@ -990,8 +990,9 @@ fn a_phone_pays_a_lightning_invoice_through_its_hub_and_shows_what_it_cost() {
     let failing = net
         .node
         .invoice(100_000, [9; 32], 6, Outcome::Fail("no route".into()));
-    // Notes of 102 exactly are held: the gateway's fee alone.
-    assert_eq!(alice.invoice_quote(failing.clone()).unwrap().fee, 2);
+    // The privacy-oriented change lacks exact notes of 102: making
+    // them costs 1, in addition to the gateway's fee of 2.
+    assert_eq!(alice.invoice_quote(failing.clone()).unwrap().fee, 3);
     let before = notes(&alice);
     alice.pay_invoice(failing.clone(), hub.clone()).unwrap();
     net.runtime.block_on(net.lightning.round());
@@ -1002,9 +1003,9 @@ fn a_phone_pays_a_lightning_invoice_through_its_hub_and_shows_what_it_cost() {
         .find(|a| a.kind == Kind::Lightning && a.state == State::Failed)
         .unwrap();
     assert!(failed.detail.contains("no route"), "{failed:?}");
-    // Refunded but for the hub's refund fee.
+    // Refunded but for the hub's refund fee and the normalization fee.
     assert_eq!((failed.amount, failed.fee), (100, 1));
-    assert_eq!(notes(&alice), before - 1);
+    assert_eq!(notes(&alice), before - 2);
     match alice.details(Kind::Lightning, failed.id.clone()).unwrap() {
         Details::Lightning {
             preimage, failure, ..

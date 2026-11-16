@@ -12,6 +12,10 @@
 //! Notes are unlinked from the payments that made them ([`Wallet::unlink`]):
 //! those a hub no longer unlinks since it restarted are renewed, paid to
 //! the wallet itself within a fee limit ([`Wallet::set_renew_limit`]).
+//! Ordinary payments also shape change toward a common 18 to 24-note
+//! distribution with small denominations. Additional consolidation inputs
+//! must already be unlinked, and any increased fee must be allowed by
+//! contract ceilings or the automatic fee limit.
 //!
 //! A timed lock pays a payee on the preimage of a hash, or returns to the
 //! wallet once it expired unpaid: see [`Wallet::lock`] and
@@ -35,6 +39,7 @@ mod lightning;
 mod locks;
 mod payouts;
 mod renewals;
+mod shaping;
 mod silent;
 mod store;
 mod swaps;
@@ -770,7 +775,7 @@ impl<T: Transport> Wallet<T> {
     /// can spend together.
     pub fn send_fee(&self, url: &str, amount: u64) -> Result<u64, Error> {
         let (hub, info) = self.hub(&hub_url(url)?)?;
-        Ok(self.select(hub, amount, &info.fees.spending())?.1.fee)
+        Ok(self.payment_plan(hub, amount, &info.fees)?.1.selection.fee)
     }
 
     /// [`Wallet::send_fee`] of a lock of `amount` to another than the hub.
@@ -1152,16 +1157,17 @@ impl<T: Transport> Wallet<T> {
     async fn send_once(&self, url: &str, payee: &Address, amount: u64) -> Result<Paid, Error> {
         let (hub, info) = self.hub(url)?;
         let fees = self.agreed_fees(hub, url, &info)?;
-        let (keyset, selection) = self.select(hub, amount, &fees.spending())?;
+        let (keyset, plan) = self.payment_plan(hub, amount, &fees)?;
+        let selection = plan.selection;
         let inputs = self.notes_of(&keyset, &selection.inputs)?;
         let me = self.address();
         let ephemeral = Ephemeral::random();
         let parts = [
-            (payee, amount),
-            (&info.address, selection.fee),
-            (&me, selection.change()),
+            (payee, denominations(&keyset, amount)?),
+            (&info.address, denominations(&keyset, selection.fee)?),
+            (&me, plan.change),
         ];
-        let outputs = outputs(&keyset, &ephemeral, Branch::Pay, &parts)?;
+        let outputs = denominated_outputs(&ephemeral, Branch::Pay, &parts)?;
         let proposal = Proposal::new(&keyset, &inputs, ephemeral.public(), outputs, None)?;
         let id = proposal.id();
         let offer = serde_json::to_string(&Offer::new(&proposal, &inputs)).map_err(invalid)?;
@@ -1864,12 +1870,14 @@ impl<T: Transport> Wallet<T> {
                     r.get::<_, i64>(1)? as u64,
                     r.get::<_, i64>(2)? as u64,
                     r.get::<_, Option<String>>(3)?,
+                    r.get::<_, Option<String>>(4)?,
                 ))
             };
             let of = |table: &str| {
                 let sql = format!(
-                    "SELECT payee, amount, fee, {} FROM {table} WHERE id = ?1 AND abandoned IS NULL",
-                    if table == "locks" { "settled" } else { "NULL" }
+                    "SELECT payee, amount, fee, {}, {} FROM {table} WHERE id = ?1 AND abandoned IS NULL",
+                    if table == "locks" { "settled" } else { "NULL" },
+                    if table == "sends" { "offer" } else { "NULL" },
                 );
                 c.query_row(&sql, [id], row).optional()
             };
@@ -1877,8 +1885,37 @@ impl<T: Transport> Wallet<T> {
                 Some(send) => Some(send),
                 None => of("locks")?,
             };
-            let Some((payee, amount, fee, settled)) = operation else {
+            let Some((payee, amount, fee, settled, offer)) = operation else {
                 return Ok(Vec::new());
+            };
+            // Change may deliberately use more, smaller notes than the
+            // greedy split. Read its exact denominations from the kept
+            // proposal, including before the hub has released them.
+            let change = match offer {
+                Some(offer) => {
+                    let offer: Offer = serde_json::from_str(&offer).map_err(invalid)?;
+                    let proposal = Proposal::from_commitment_bytes(&offer.proposal.0)?;
+                    let mut ours: Vec<_> = self
+                        .owner
+                        .scan_key()
+                        .receive(&proposal)?
+                        .into_iter()
+                        .map(|r| r.derivation.message().denomination())
+                        .collect();
+                    if payee == self.address().to_bytes() {
+                        // A user self-payment has both ordinary payment
+                        // outputs and change to this same address.
+                        for denom in denominations(&keyset, amount)? {
+                            let at = ours.iter().position(|&d| d == denom).ok_or_else(|| {
+                                Error::Invalid("a self-payment is missing an output".into())
+                            })?;
+                            ours.swap_remove(at);
+                        }
+                    }
+                    ours.sort_unstable_by(|a, b| b.cmp(a));
+                    Some(ours)
+                }
+                None => None,
             };
             let shares = match settled.as_deref() {
                 // The refund branch: what came back is known, the rest the fee.
@@ -1896,9 +1933,12 @@ impl<T: Transport> Wallet<T> {
                 .into_iter()
                 .filter(|(_, amount)| *amount > 0)
                 .map(|(to, amount)| Part {
+                    notes: match (&to, &change) {
+                        (PartTo::Kept, Some(change)) => change.clone(),
+                        _ => coins::split(amount, keyset.denominations()).unwrap_or_default(),
+                    },
                     to,
                     amount,
-                    notes: coins::split(amount, keyset.denominations()).unwrap_or_default(),
                 })
                 .collect())
         })
@@ -2206,15 +2246,29 @@ fn outputs(
     branch: Branch,
     parts: &[(&Address, u64)],
 ) -> Result<Vec<Output>, Error> {
+    let parts = parts
+        .iter()
+        .map(|&(to, value)| Ok((to, denominations(keyset, value)?)))
+        .collect::<Result<Vec<_>, Error>>()?;
+    denominated_outputs(ephemeral, branch, &parts)
+}
+
+/// The minimum-note representation of `value`, or why it cannot be made.
+fn denominations(keyset: &Keyset, value: u64) -> Result<Vec<u64>, Error> {
+    coins::split(value, keyset.denominations())
+        .ok_or_else(|| Error::Invalid(format!("the keyset cannot make {value}")))
+}
+
+/// Construct exactly the planned denominations, retaining the common
+/// largest-first and randomized equal-denomination ordering.
+fn denominated_outputs(
+    ephemeral: &Ephemeral,
+    branch: Branch,
+    parts: &[(&Address, Vec<u64>)],
+) -> Result<Vec<Output>, Error> {
     let mut outputs = Vec::new();
-    for &(to, value) in parts {
-        let denoms = coins::split(value, keyset.denominations())
-            .ok_or_else(|| Error::Invalid(format!("the keyset cannot make {value}")))?;
-        outputs.extend(
-            denoms
-                .into_iter()
-                .map(|denom| (OsRng.next_u64(), denom, to)),
-        );
+    for (to, denoms) in parts {
+        outputs.extend(denoms.iter().map(|&denom| (OsRng.next_u64(), denom, *to)));
     }
     outputs.sort_by_key(|&(order, denom, _)| (Reverse(denom), order));
     Ok(outputs

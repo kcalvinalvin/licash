@@ -410,13 +410,31 @@ fn a_restored_backup_drops_the_notes_spent_since() {
 
     ok(wallet(&alice, &["send", &bob_at, "60"], None));
     assert_eq!(available(&backup), (100, 0));
-    assert_eq!(json(&backup, &["check"])["dropped"], 64);
-    assert_eq!(available(&backup), (36, 0));
+    // Consolidation consumed every original note. A stale backup knows
+    // none of the new change and must not count those old notes twice.
+    assert_eq!(json(&backup, &["check"])["dropped"], 100);
+    assert_eq!(available(&backup), (0, 0));
     assert_eq!(json(&backup, &["check"])["dropped"], 0);
-    // Spent from the backup, the 32 is gone from the first file too.
+    assert_eq!(available(&alice), (39, 0));
+
+    // A fresh copy sees the change. Notes spent from it are dropped by
+    // the first file too, whichever privately varied distribution was
+    // chosen. Compare with the actual inputs, not a specific layout.
+    std::fs::copy(&alice, &backup).unwrap();
     ok(wallet(&backup, &["send", &bob_at, "30"], None));
-    assert_eq!(json(&alice, &["check"])["dropped"], 32);
-    assert_eq!(available(&alice), (7, 0));
+    let db = rusqlite::Connection::open(&backup).unwrap();
+    let spent = db
+        .query_row(
+            "SELECT SUM(n.denom) FROM notes n JOIN sends s ON s.id = n.spent_by
+             WHERE s.amount = 30",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap() as u64;
+    assert!((31..=39).contains(&spent));
+    assert_eq!(json(&alice, &["check"])["dropped"], spent);
+    assert_eq!(available(&alice), (39 - spent, 0));
+    assert_eq!(available(&backup), (8, 0));
 }
 
 #[test]
@@ -547,7 +565,9 @@ fn owners_pay_invoices_and_get_paid_over_lightning() {
         .node()
         .invoice(10_000, lock_hash(&[6; 32]), 6, Outcome::Fail(reason.into()));
     failed(wallet(&alice, &["pay-invoice", &request], None), 1, reason);
-    assert_eq!(available(&alice), (15, 0));
+    // The smaller change already holds exact notes for this lock: no
+    // extra normalization payment, only the refund fee of 1.
+    assert_eq!(available(&alice), (16, 0));
     let text = ok(wallet(&alice, &["locks"], None));
     assert!(
         text.contains(&format!("lock refunded ({reason})  12 + 0 sat")),
@@ -564,11 +584,11 @@ fn owners_pay_invoices_and_get_paid_over_lightning() {
         "under way",
     );
     // Exact notes were at hand.
-    assert_eq!(available(&alice), (8, 7));
+    assert_eq!(available(&alice), (9, 7));
     hub.node().resolve(hash, Outcome::Pay(preimage));
     let resumed = json(&alice, &["resume"]);
     assert_eq!(resumed["locks"][0]["state"], "paid");
-    assert_eq!(available(&alice), (8, 0));
+    assert_eq!(available(&alice), (9, 0));
 
     failed(
         wallet(&alice, &["pay-invoice", "lnbcrt1nope"], None),

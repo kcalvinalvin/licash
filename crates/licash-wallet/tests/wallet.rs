@@ -826,6 +826,54 @@ async fn a_payment_pays_for_the_notes_it_makes_for_its_payee_and_as_change() {
 }
 
 #[tokio::test]
+async fn a_payment_consolidates_unlinked_extras_into_a_small_note_distribution() {
+    let net = charging(Fee { base: 0, ppm: 0 });
+    let (alice, bob) = (party(&net, 1).await, party(&net, 2).await);
+    alice.receive(&net.pay(HUB, &alice.address(), 64)).unwrap();
+    for _ in 0..40 {
+        alice.receive(&net.pay(HUB, &alice.address(), 1)).unwrap();
+    }
+    assert_eq!(alice.unlink().await.unwrap(), 41);
+    let quote = alice.send_fee(HUB, 8).unwrap();
+    let paid = alice.send(HUB, &bob.address(), 8).await.unwrap();
+    assert_eq!(bob.receive(&paid.payment).unwrap().amount, 8);
+    assert_eq!(alice.sends().unwrap()[0].fee, quote);
+    assert_eq!(available(&alice), (96, 0));
+    let held = alice.notes().unwrap();
+    let count: u64 = held.iter().map(|n| n.count).sum();
+    assert!((18..=24).contains(&count), "{held:?}");
+    assert!(held.iter().all(|n| n.denomination <= 8), "{held:?}");
+    let operation = alice.operation_notes(&paid.id).unwrap();
+    assert!(operation.spent.len() > 1);
+    assert!(operation.spent.len() <= licash_wallet::MAX_INPUTS);
+    assert!(operation
+        .spent
+        .iter()
+        .all(|n| n.unlinked == Unlinking::Unlinked));
+    assert_eq!(
+        operation.made.iter().map(|n| n.amount).sum::<u64>() + 8 + quote,
+        operation.spent.iter().map(|n| n.amount).sum::<u64>()
+    );
+}
+
+#[tokio::test]
+async fn a_shaped_payment_quotes_its_actual_output_fee_and_preserves_value() {
+    let net = Net::new();
+    net.start_per_note(HUB, Fee { base: 1, ppm: 100 }, 100);
+    let (alice, bob) = (party(&net, 1).await, party(&net, 2).await);
+    alice.receive(&net.pay(HUB, &alice.address(), 64)).unwrap();
+    let quote = alice.send_fee(HUB, 10).unwrap();
+    let paid = alice.send(HUB, &bob.address(), 10).await.unwrap();
+    assert_eq!(bob.receive(&paid.payment).unwrap().amount, 10);
+    let operation = alice.operation_notes(&paid.id).unwrap();
+    assert!((18..=24).contains(&operation.made.len()));
+    assert_eq!(alice.sends().unwrap()[0].fee, quote);
+    assert_eq!(available(&alice).0 + 10 + quote, 64);
+    let fee = alice.hubs().unwrap()[0].1.fees.spending();
+    assert!(quote >= fee.due(64, 10u64.count_ones() as usize + operation.made.len()));
+}
+
+#[tokio::test]
 async fn a_renewal_counts_the_notes_it_makes_in_its_fee_and_its_limit() {
     // A sat for each note: 100 renewed is 97 in three notes, and 3.
     let net = Net::new();

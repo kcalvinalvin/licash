@@ -31,6 +31,17 @@ and 0.1 sat per output (`LICASH_WALLET_RENEW_PPM`, 1000 by default, 0 for
 free renewals only). Live contract ceilings take precedence. `history`
 lists a renewal as a payment to the wallet's own address.
 
+Ordinary payments opportunistically consolidate already unlinked notes and
+shape their change toward 18 to 24 notes, using the smallest feasible
+largest denomination. This leaves receiving room below the 32-note claim
+limit without tying a distribution to a contract's cap. Linked notes are
+not added merely to consolidate. Any increase in the payment's fee must
+fit its live contract ceilings or the automatic fee allowance above.
+The resulting denominations can change whether a later Lightning lock
+needs a paid self-payment to make exact notes. Consolidation also consumes
+old notes: keep wallet backups current, since a stale copy does not know
+the replacement notes and cannot recover them from the seed alone.
+
 `code` prints a payment code (a BIP321 URI, `--qr` for QR codes) naming the
 wallet, the hubs it is paid at and its Nostr mailbox, if they name relays.
 `pay <code> [amount]` pays it at a hub it names that the wallet trusts and

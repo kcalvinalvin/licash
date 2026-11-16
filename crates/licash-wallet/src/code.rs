@@ -430,6 +430,7 @@ pub(crate) struct CodeKeys {
     pub(crate) silent: licash_onchain::silent::Keys,
     pub(crate) mailbox: SecretKey,
     pub(crate) contract: [u8; 32],
+    pub(crate) shaping: [u8; 32],
 }
 
 /// What a wallet brings to opening a recovery contract with a hub, as its
@@ -456,10 +457,12 @@ impl CodeKeys {
         let mailbox = SecretKey::from_slice(&mailbox)
             .map_err(|_| Error::Setup("no mailbox key from this seed".into()))?;
         let contract = tagged_hash("licash/contract/seed", &[seed]);
+        let shaping = tagged_hash("licash/shaping/key", &[seed]);
         Ok(Self {
             silent,
             mailbox,
             contract,
+            shaping,
         })
     }
 }
