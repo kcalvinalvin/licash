@@ -142,6 +142,13 @@ Genuine current-image contracts count with external proving available;
 unreadable or unsupported openings count as zero. Balance details show the
 total number of held notes.
 
+Unfold a signed contract for its locked value, payout-pool and reserve
+diagram, and a link to the contract address in the configured explorer.
+The claim cap is a limit inside the payout pool, not extra collateral.
+Technical details reveal the signed note limit, denominations, keyset,
+graph version and program identities. Earlier opening stages show progress
+rather than guessed signed details.
+
 Before its request is signed, Cancel closing asks for confirmation and
 releases the notes reserved by that attempt. It does not close the contract
 or recover Bitcoin; another attempt is possible while the contract permits

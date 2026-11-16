@@ -425,6 +425,23 @@ pub enum ContractState {
     Failed { reason: String },
 }
 
+/// Signed financial layout and technical details, fetched on request.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct ContractInspection {
+    pub address: String,
+    pub locked: u64,
+    pub payout_pool: u64,
+    pub holder_reserve: u64,
+    pub hub_reserve: u64,
+    pub claim_limit: u32,
+    pub note_limit: u32,
+    pub denominations: Vec<u64>,
+    pub keyset: String,
+    pub graph_version: u32,
+    pub holder_program: String,
+    pub counter_program: String,
+}
+
 /// What opening a contract at a hub costs now, and what pays it.
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct ContractQuote {

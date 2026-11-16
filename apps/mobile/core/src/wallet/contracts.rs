@@ -42,6 +42,30 @@ const CHANGES: &str = "contracts-change";
 /// Recovery contracts.
 #[uniffi::export]
 impl Wallet {
+    pub fn contract_inspection(
+        &self,
+        id: String,
+    ) -> Result<crate::ContractInspection, LicashError> {
+        let mut bytes = [0; 32];
+        hex::decode_to_slice(id, &mut bytes)
+            .map_err(|_| LicashError::invalid("not a contract id"))?;
+        let info = holder::inspect(&self.wallet, &self.dir, &bytes, self.tip()).map_err(failed)?;
+        Ok(crate::ContractInspection {
+            address: info.address,
+            locked: info.locked,
+            payout_pool: info.payout_pool,
+            holder_reserve: info.holder_reserve,
+            hub_reserve: info.hub_reserve,
+            claim_limit: info.claim_limit,
+            note_limit: info.note_limit,
+            denominations: info.denominations,
+            keyset: info.keyset,
+            graph_version: info.graph_version,
+            holder_program: info.holder_program,
+            counter_program: info.counter_program,
+        })
+    }
+
     /// What opening a contract at `hub`, a hub trusted, costs now, as it
     /// offers, and the coin on Bitcoin that would pay it.
     pub fn contract_quote(&self, hub: String) -> Result<ContractQuote, LicashError> {

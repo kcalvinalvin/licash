@@ -1,6 +1,10 @@
 package org.licash.wallet.ui
 
 import android.net.Uri
+import android.content.Intent
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Column
@@ -35,6 +39,7 @@ import androidx.compose.ui.unit.dp
 import org.licash.core.Contract
 import org.licash.core.ContractQuote
 import org.licash.core.ContractSafety
+import org.licash.core.ContractInspection
 import org.licash.core.ContractState
 import org.licash.core.Recovery
 import org.licash.core.RecoveryStage
@@ -66,13 +71,21 @@ internal fun CoverRow(
     stopProving: () -> Unit = {},
     saveReceipt: (Uri) -> Unit = {},
     safety: suspend () -> ContractSafety? = { null },
+    inspection: suspend () -> ContractInspection? = { null },
+    explorer: (String) -> String? = { null },
 ) {
     val colors = MaterialTheme.colorScheme
     val cover = cover(c, height)
     val forcing = recovery?.let { forcing(it, height) }
     var open by rememberSaveable(c.id) { mutableStateOf(false) }
     var plan by remember(c.id) { mutableStateOf<ContractSafety?>(null) }
-    LaunchedEffect(open, c.id) { if (open && recovery == null) plan = safety() }
+    var details by remember(c.id) { mutableStateOf<ContractInspection?>(null) }
+    LaunchedEffect(open, c.id, c.state) {
+        if (open) {
+            if (recovery == null) plan = safety()
+            details = inspection()
+        }
+    }
     // While it is set up: the step it is at.
     val step = c.step?.let { setup(it) }
     val tint = when {
@@ -137,8 +150,47 @@ internal fun CoverRow(
                 } else {
                     Unfolded(c, cover, developer, end, forceClose, plan, height)
                 }
+                details?.let { ContractLayout(it, explorer) }
             }
         }
+    }
+}
+
+/** One lock, split into its payout pool and reserves. The claim cap is a
+ * limit inside the pool, never another slice of the same bitcoin. */
+@Composable
+private fun ContractLayout(info: ContractInspection, explorer: (String) -> String?) {
+    val colors = MaterialTheme.colorScheme
+    val context = LocalContext.current
+    var technical by remember(info.address) { mutableStateOf(false) }
+    Line("Locked on Bitcoin", sat(info.locked), tag = "contract-locked")
+    Row(Modifier.fillMaxWidth().height(12.dp).testTag("contract-split")) {
+        listOf(info.payoutPool to colors.primary, info.holderReserve to colors.tertiary, info.hubReserve to colors.secondary).forEach { (amount, color) ->
+            if (amount > 0uL) Box(Modifier.weight(amount.toFloat()).fillMaxHeight().background(color))
+        }
+    }
+    Line("Payout pool", sat(info.payoutPool))
+    Line("Your reserve", sat(info.holderReserve))
+    Line("Hub reserve", sat(info.hubReserve))
+    Line("Maximum claim", sat(info.claimLimit.toULong()))
+    Say("The claim limit is inside the pool, not extra bitcoin. The recovery outcome decides how the pool and reserves are paid.")
+    explorer(info.address)?.let { link ->
+        Entry("View contract on Bitcoin", tag = "contract-explorer", onClick = {
+            runCatching { context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(link))) }
+        })
+    }
+    TextButton(onClick = { technical = !technical }, modifier = Modifier.testTag("contract-technical")) {
+        Text(if (technical) "Hide technical details" else "Technical details")
+    }
+    if (technical) {
+        Line("Type", "Native corrected")
+        Line("Graph version", digits(info.graphVersion.toULong()))
+        Line("Claim note limit", digits(info.noteLimit.toULong()))
+        Line("Denominations (sat)", info.denominations.joinToString { digits(it) })
+        Line("Keyset", info.keyset)
+        Line("Holder program", info.holderProgram)
+        Line("Counter program", info.counterProgram)
+        Text(info.address, style = MaterialTheme.typography.bodySmall)
     }
 }
 

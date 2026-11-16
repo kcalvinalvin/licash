@@ -13,7 +13,7 @@ pub mod recovery;
 pub mod safety;
 mod store;
 
-use std::path::Path;
+use std::{collections::HashSet, path::Path};
 
 use anyhow::{anyhow, ensure, Context as _, Result};
 use bitcoin::{OutPoint, ScriptBuf};
@@ -314,6 +314,83 @@ pub fn list(dir: &Path) -> Result<Vec<Contract>> {
     }
 }
 
+/// Financial and technical details from the holder's kept signed opening.
+pub struct Inspection {
+    pub address: String,
+    pub locked: u64,
+    pub payout_pool: u64,
+    pub holder_reserve: u64,
+    pub hub_reserve: u64,
+    pub claim_limit: u32,
+    pub note_limit: u32,
+    pub denominations: Vec<u64>,
+    pub keyset: String,
+    pub graph_version: u32,
+    pub holder_program: String,
+    pub counter_program: String,
+}
+
+/// Read only when requested. Earlier opening stages may not have a signed
+/// graph yet, in which case these details are unavailable rather than guessed.
+pub fn inspect<T: Transport>(
+    wallet: &Wallet<T>,
+    dir: &Path,
+    id: &[u8; 32],
+    tip: u32,
+) -> Result<Inspection> {
+    let store = Store::existing(dir)?.context("no contracts")?;
+    let (state, _) = store.state(id)?;
+    let secrets = wallet.contract_secrets();
+    let ctx = licash_contract::opening::Context {
+        tip,
+        trust: crate::trust(wallet.network())?,
+    };
+    let opening = Holder::load(&state, secrets.seed, secrets.spend, &ctx)?.opening()?;
+    let network = match wallet.network() {
+        licash::spend::ChainProfile::Core30Mainnet => bitcoin::Network::Bitcoin,
+        licash::spend::ChainProfile::Core30DefaultRegtest => bitcoin::Network::Regtest,
+        _ => bitcoin::Network::Signet,
+    };
+    inspection(&opening, network)
+}
+
+fn inspection(
+    opening: &licash_contract::opening::Opening,
+    network: bitcoin::Network,
+) -> Result<Inspection> {
+    let parts = opening.base.parts();
+    let script = opening.babe.tree()?.script_pubkey();
+    let locked = opening
+        .funding
+        .output
+        .iter()
+        .find(|out| out.script_pubkey == script)
+        .context("no contract output")?
+        .value
+        .to_sat();
+    ensure!(
+        locked == parts.graph.graph_value()?,
+        "contract lock disagrees with its signed terms"
+    );
+    Ok(Inspection {
+        address: bitcoin::Address::from_script(&script, network)?.to_string(),
+        locked,
+        payout_pool: u64::from(parts.graph.maximum_amount()?),
+        holder_reserve: parts.graph.reserve_alice,
+        hub_reserve: parts.graph.reserve_hub,
+        claim_limit: parts.cap,
+        note_limit: parts
+            .limits
+            .max_authorizations
+            .min(recovery::MAX_NOTES as u32),
+        denominations: parts.keyset.denominations().collect(),
+        keyset: crate::hex_id(parts.keyset.id()),
+        graph_version: parts.recipe.graph_version,
+        holder_program: crate::hex_id(&parts.recipe.holder_program),
+        counter_program: crate::hex_id(&parts.recipe.counter_program),
+    })
+}
+
 /// Precisely what live contracts can claim now, by id. Read signed opening
 /// terms rather than current hub offers. An unreadable or unsupported
 /// opening covers nothing; it never triggers recovery or reserves notes.
@@ -332,11 +409,14 @@ pub fn coverage<T: Transport>(
     };
     let trust = crate::trust(wallet.network())?;
     let held = wallet.balance()?;
+    // A recovery fixes its notes once. The same one-shot graph cannot
+    // also protect notes left over or received after that decision.
+    let recovering = store.recoveries()?.into_iter().map(|r| r.id).collect();
     let secrets = wallet.contract_secrets();
     let ctx = licash_contract::opening::Context { tip, trust };
     let mut ids = Vec::new();
     let mut claims = Vec::new();
-    for c in coverage_order(contracts, tip, &held) {
+    for c in coverage_order(contracts, tip, &held, &recovering) {
         let read = || -> Result<_> {
             let (state, _) = store.state(&c.id)?;
             let opening = Holder::load(&state, secrets.seed, secrets.spend, &ctx)?.opening()?;
@@ -373,12 +453,14 @@ fn coverage_order<'a>(
     contracts: &'a [Contract],
     tip: u32,
     held: &[licash_wallet::Balance],
+    recovering: &HashSet<[u8; 32]>,
 ) -> Vec<&'a Contract> {
     let mut live: Vec<_> = contracts
         .iter()
         .filter(|c| {
             tip > 0
                 && c.live(tip)
+                && !recovering.contains(&c.id)
                 && held
                     .iter()
                     .any(|at| at.hub.trim_end_matches('/') == c.hub.trim_end_matches('/'))
@@ -643,6 +725,63 @@ mod tests {
     use super::*;
 
     #[test]
+    fn inspection_uses_the_funded_graph_not_the_deposit_and_never_adds_the_cap_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        let wallet = Wallet::create(
+            &dir.path().join("wallet.sqlite"),
+            &[7; 32],
+            ChainProfile::Core30DefaultRegtest,
+            Nowhere,
+        )
+        .unwrap();
+        let keys = wallet.contract_secrets();
+        let holder = Holder::load(
+            include_bytes!("../../../crates/licash-contract/tests/golden/holder-funded.bin"),
+            keys.seed,
+            keys.spend,
+            &licash_contract::opening::Context {
+                tip: 0,
+                trust: crate::trust(ChainProfile::Core30DefaultRegtest).unwrap(),
+            },
+        )
+        .unwrap();
+        let opening = holder.opening().unwrap();
+        let info = inspection(&opening, bitcoin::Network::Regtest).unwrap();
+        assert_eq!(
+            info.locked,
+            info.payout_pool + info.holder_reserve + info.hub_reserve
+        );
+        assert!(u64::from(info.claim_limit) <= info.payout_pool);
+        assert_eq!(
+            info.note_limit,
+            32.min(opening.base.parts().limits.max_authorizations)
+        );
+        assert_eq!(
+            info.denominations,
+            opening
+                .base
+                .parts()
+                .keyset
+                .denominations()
+                .collect::<Vec<_>>()
+        );
+        let address = info
+            .address
+            .parse::<bitcoin::Address<bitcoin::address::NetworkUnchecked>>()
+            .unwrap()
+            .require_network(bitcoin::Network::Regtest)
+            .unwrap();
+        assert_eq!(
+            address.script_pubkey(),
+            opening.babe.tree().unwrap().script_pubkey()
+        );
+        assert_eq!(
+            info.graph_version,
+            opening.base.parts().recipe.graph_version
+        );
+    }
+
+    #[test]
     fn coverage_uses_live_trusted_contracts_in_deadline_and_id_order() {
         let contract = |id, deadline, fate| Contract {
             id: [id; 32],
@@ -675,7 +814,7 @@ mod tests {
             pending: 1_000,
         }];
         let ids = |tip| {
-            coverage_order(&all, tip, &held)
+            coverage_order(&all, tip, &held, &HashSet::new())
                 .iter()
                 .map(|c| c.id[0])
                 .collect::<Vec<_>>()
@@ -684,6 +823,13 @@ mod tests {
         assert_eq!(ids(380), [1, 3]);
         assert!(ids(400).is_empty());
         assert!(ids(0).is_empty());
+        assert_eq!(
+            coverage_order(&all, 300, &held, &HashSet::from([[2; 32]]))
+                .iter()
+                .map(|c| c.id[0])
+                .collect::<Vec<_>>(),
+            [1, 3]
+        );
     }
 
     /// No hub to reach.

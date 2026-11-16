@@ -720,12 +720,18 @@ class Engine(context: Context) {
 
     /** Where to see the transaction `txid`, if anywhere. */
     fun explorerLink(txid: String): String? {
+        return explorerBase()?.let { "$it/tx/$txid" }
+    }
+
+    fun explorerAddress(address: String): String? = explorerBase()?.let { "$it/address/$address" }
+
+    private fun explorerBase(): String? {
         val base = when (val chosen = prefs.explorer) {
             "default" -> explorer(state.value.network)
             "" -> null
             else -> chosen
         }
-        return base?.trimEnd('/')?.let { "$it/tx/$txid" }
+        return base?.trimEnd('/')
     }
 
     suspend fun scanned(text: String): Result<Scanned> = io { local { it.scanned(text) } }
@@ -861,6 +867,8 @@ class Engine(context: Context) {
 
     /** What opening a recovery contract at `hub` costs now, and the coin that would pay it. */
     suspend fun contractQuote(hub: String): Result<ContractQuote> = io { local { it.contractQuote(hub) } }
+
+    suspend fun contractInspection(id: String): Result<org.licash.core.ContractInspection> = io { local { it.contractInspection(id) } }
 
     /** Planning from this wallet's signed terms; never starts a close. */
     suspend fun contractSafety(id: String): Result<org.licash.core.ContractSafety> = io {

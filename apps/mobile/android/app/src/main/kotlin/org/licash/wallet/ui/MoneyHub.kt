@@ -103,6 +103,8 @@ internal fun HubPage(
                     ui.developer,
                     recovery = ui.recoveries.find { it.id == c.id },
                     safety = { engine.contractSafety(c.id).getOrNull() },
+                    inspection = { engine.contractInspection(c.id).getOrNull() },
+                    explorer = engine::explorerAddress,
                     end = { ending = c },
                     forceClose = { forcing = c },
                     giveUp = { canceling = c.id },
