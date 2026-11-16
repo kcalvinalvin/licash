@@ -13,6 +13,21 @@ licash-hub --data ./hub events --follow
 licash-hub --data ./hub dashboard
 ```
 
+A hub charges for what it does unless told otherwise. A payment, and each
+branch of a lock, pays `base + ppm of the notes spent + a fee for each note
+made for others than the hub`: by default 1 sat, 100 ppm (rounded up) and
+0.1 sat a note (their sum rounded to the nearest sat). `--spend-fee-base`
+and `--spend-fee-ppm` set the first two on a payment, `--lock-fee-*` and
+`--refund-fee-*` in a lock's pay and refund branches, `--output-fee-msat`
+the fee on a note, in thousandths of a sat, for all three. A payment
+received over Lightning costs `--ln-receive-fee-base` and
+`--ln-receive-fee-ppm`, 1 sat and 100 ppm by default. A hub that ran
+without these flags charged nothing: upgraded, it charges the defaults
+(`run` logs what it charges as it starts), and 0 on each keeps it free.
+Wallets that predate the fee on notes do not pay it, so a payment of theirs
+that makes five notes or more is refused until they upgrade:
+`--output-fee-msat 0` spares them.
+
 `status` shows income, released payments and open locks. `status --details`
 adds the internal note and event counts; `status --json` keeps the full
 machine-readable statistics. Normal text logs omit timestamps and Rust

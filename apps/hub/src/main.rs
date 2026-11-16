@@ -347,27 +347,40 @@ struct Announcing {
     name: Option<String>,
 }
 
+/// The fee a hub charges on everything unless told otherwise: a sat and a
+/// hundredth of a percent of what moves.
+const FEE: Fee = Fee { base: 1, ppm: 100 };
+
+/// And, on a spend or a branch of a lock, a tenth of a sat for each note
+/// made for others than the hub.
+const OUTPUT_FEE_MSAT: u64 = 100;
+
 /// What the hub charges and the locks it admits.
 #[derive(Args)]
 struct PolicyArgs {
     /// The fee on each spend, in the smallest unit.
-    #[arg(long, env = "LICASH_HUB_SPEND_FEE_BASE", default_value_t = 0)]
+    #[arg(long, env = "LICASH_HUB_SPEND_FEE_BASE", default_value_t = FEE.base)]
     spend_fee_base: u64,
     /// The fee on each spend, in parts per million of its inputs.
-    #[arg(long, env = "LICASH_HUB_SPEND_FEE_PPM", default_value_t = 0, value_parser = ppm())]
+    #[arg(long, env = "LICASH_HUB_SPEND_FEE_PPM", default_value_t = FEE.ppm, value_parser = ppm())]
     spend_fee_ppm: u64,
     /// The fee in a lock's pay branch, in the smallest unit.
-    #[arg(long, env = "LICASH_HUB_LOCK_FEE_BASE", default_value_t = 0)]
+    #[arg(long, env = "LICASH_HUB_LOCK_FEE_BASE", default_value_t = FEE.base)]
     lock_fee_base: u64,
     /// The fee in a lock's pay branch, in parts per million of its inputs.
-    #[arg(long, env = "LICASH_HUB_LOCK_FEE_PPM", default_value_t = 0, value_parser = ppm())]
+    #[arg(long, env = "LICASH_HUB_LOCK_FEE_PPM", default_value_t = FEE.ppm, value_parser = ppm())]
     lock_fee_ppm: u64,
     /// The fee in a lock's refund branch, in the smallest unit.
-    #[arg(long, env = "LICASH_HUB_REFUND_FEE_BASE", default_value_t = 0)]
+    #[arg(long, env = "LICASH_HUB_REFUND_FEE_BASE", default_value_t = FEE.base)]
     refund_fee_base: u64,
     /// The fee in a lock's refund branch, in parts per million of its inputs.
-    #[arg(long, env = "LICASH_HUB_REFUND_FEE_PPM", default_value_t = 0, value_parser = ppm())]
+    #[arg(long, env = "LICASH_HUB_REFUND_FEE_PPM", default_value_t = FEE.ppm, value_parser = ppm())]
     refund_fee_ppm: u64,
+    /// The fee on each note a spend, or a branch of a lock, makes for
+    /// others than the hub, in thousandths of the smallest unit: the sum
+    /// is rounded to the nearest unit.
+    #[arg(long, env = "LICASH_HUB_OUTPUT_FEE_MSAT", default_value_t = OUTPUT_FEE_MSAT)]
+    output_fee_msat: u64,
     /// A lock's expiry, depth and reaction fit within this many blocks of
     /// the scanned tip: the response window of the hub's contracts.
     #[arg(long, env = "LICASH_HUB_LOCK_WINDOW", default_value_t = Timing::default().window)]
@@ -423,10 +436,10 @@ struct LightningArgs {
           value_parser = ppm())]
     ln_pay_fee_ppm: u64,
     /// The fee on each payment received, in satoshis.
-    #[arg(long, env = "LICASH_HUB_LN_RECEIVE_FEE_BASE", default_value_t = 0)]
+    #[arg(long, env = "LICASH_HUB_LN_RECEIVE_FEE_BASE", default_value_t = FEE.base)]
     ln_receive_fee_base: u64,
     /// The fee on each payment received, in parts per million.
-    #[arg(long, env = "LICASH_HUB_LN_RECEIVE_FEE_PPM", default_value_t = 0, value_parser = ppm())]
+    #[arg(long, env = "LICASH_HUB_LN_RECEIVE_FEE_PPM", default_value_t = FEE.ppm, value_parser = ppm())]
     ln_receive_fee_ppm: u64,
     /// The largest invoice paid, in satoshis.
     #[arg(long, env = "LICASH_HUB_LN_MAX_PAY", default_value_t = Config::default().max_pay)]
@@ -702,6 +715,7 @@ impl PolicyArgs {
             spend: fee(self.spend_fee_base, self.spend_fee_ppm),
             lock: fee(self.lock_fee_base, self.lock_fee_ppm),
             refund: fee(self.refund_fee_base, self.refund_fee_ppm),
+            output_msat: self.output_fee_msat,
             timing: Timing {
                 window: self.lock_window,
                 reaction: self.lock_reaction,
@@ -1467,6 +1481,16 @@ async fn serve(
         .await
         .with_context(|| format!("listen on {listen}"))?;
     tracing::debug!(policy = %serde_json::to_string(&policy)?, "hub policy");
+    // Said plainly: the defaults charge, which a hub upgraded from one that
+    // charged nothing unless told to should see.
+    let said = |fee: Fee| format!("{} + {} ppm", fee.base, fee.ppm);
+    tracing::info!(
+        spend = %said(policy.spend),
+        lock = %said(policy.lock),
+        refund = %said(policy.refund),
+        output_msat = policy.output_msat,
+        "charging fees"
+    );
     tracing::info!("serving at {}", listener.local_addr()?);
     let notifying = notifier.clone().map(|notifier| {
         tracing::info!(

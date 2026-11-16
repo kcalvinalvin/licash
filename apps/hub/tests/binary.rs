@@ -160,6 +160,12 @@ fn a_hub_is_created_run_watched_and_stopped() {
     let body = info.split("\r\n\r\n").nth(1).unwrap();
     let info: licash_api::Info = serde_json::from_str(body).unwrap();
     assert_eq!(info.fees.spend.base, 3);
+    // What it is not told, it charges as by default: a sat and 100 ppm,
+    // and a tenth of a sat for each note made for others.
+    let usual = licash_api::Fee { base: 1, ppm: 100 };
+    assert_eq!(info.fees.spend.ppm, usual.ppm);
+    assert_eq!((info.fees.lock, info.fees.refund), (usual, usual));
+    assert_eq!(info.fees.output_msat, 100);
     assert_eq!(info.keysets().unwrap().len(), 1);
     assert_eq!(info.relays, ["wss://one.example", "ws://two.example"]);
 
