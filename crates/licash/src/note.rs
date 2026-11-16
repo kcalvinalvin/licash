@@ -875,11 +875,6 @@ impl Ownership {
         Self { seed }
     }
 
-    /// The retained seed, for encoding private guest input only.
-    pub(crate) fn seed(&self) -> [u8; 32] {
-        self.seed
-    }
-
     /// Recompute H("licash/tweak", compressed root, seed), then root+tG.
     /// This checks only the owner field. Issuance, monetary denomination/nonce,
     /// Q authorization and eligibility remain separate predicate obligations.

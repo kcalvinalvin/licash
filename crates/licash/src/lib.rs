@@ -2,10 +2,11 @@
 //!
 //! The protocol is specified in the paper (`paper/licash.pdf`). Modules by
 //! section: notes and owner keys (`note`, `address`, `crypto`, `ec`);
-//! contracts and reading Bitcoin (`base`, `opening`, `request`, `chain`,
-//! `payout`); payments, grants and unlinking (`spend`, `authorization`,
-//! `unlink`); recovery (`claim`, `hold`, `recovery`, `statement`,
-//! `disclosure`, `wots`, `guest`); interoperability (`source`, `route`).
+//! contracts and reading Bitcoin (`base`, `request`, `chain`); payments,
+//! grants and unlinking (`spend`, `authorization`, `unlink`); recovery
+//! (`claim`, `hold`, `recovery`, `disclosure`); interoperability
+//! (`source`, `route`). The Hub's statement over [`recovery::owed`] is
+//! `licash-hp`'s.
 //! `codec` holds the canonical bytes of what parties exchange.
 
 pub mod address;
@@ -17,19 +18,14 @@ mod codec;
 pub mod crypto;
 pub mod disclosure;
 pub mod ec;
-pub mod guest;
 pub mod hold;
 pub mod note;
-pub mod opening;
-pub mod payout;
 pub mod recovery;
 pub mod request;
 pub mod route;
 pub mod source;
 pub mod spend;
-pub mod statement;
 pub mod unlink;
-pub mod wots;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum Error {

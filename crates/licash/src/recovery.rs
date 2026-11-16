@@ -1,30 +1,24 @@
-//! Recovery: signed publication P, what a claim is owed, and settlement
-//! arithmetic.
+//! Recovery: the signed publication P, the claim as filed on Bitcoin
+//! ([`Filing`]), and what it is owed ([`owed`]).
 //!
-//! Two models live here until the holder-proves one is removed:
-//!
-//! - **Hub proves** ([`Filing`], [`owed`]). The holder files P with a public
-//!   eligibility witness and proves nothing; the Hub's statement decides
-//!   what the claim is owed, from the filing and its own evidence. Notes are
-//!   designated by their hold keys alone, not owned through Base's spend
-//!   root (see [`Filing`] for what that changes).
-//! - **Holder proves** ([`prove_holder`], [`prove_counter`], [`settle`]). The
-//!   holder proves eligibility and root ownership; the Hub counters.
-//!
-//! These host functions are the statements the guests evaluate; the
-//! Bitcoin graph learns only their journals. A journal binds final D and E, so
-//! a proof for one opening or claim is useless for any other. Settlement keeps
-//! the agreed Corrected policy: what is owed is owed (no penalty mode).
+//! The holder files P with a public eligibility witness and proves nothing.
+//! The Hub decides what the claim is owed from the filing and its own
+//! evidence, and proves that decision in its statement (`licash-hp`, whose
+//! guest evaluates [`owed`]). Notes are designated by their hold keys alone,
+//! not owned through any root key (see [`Filing`] for what that changes).
+//! A claim binds its opening's Base digest and E, so a proof for one opening
+//! or claim is useless for any other. What is owed is owed: there is no
+//! penalty mode.
 
 use crate::{
     authorization::{Authorization, SignedProposal, Unlock},
-    base::{Base, FinalDigest},
-    chain::{Activation, ActivationRef, Chain, Inclusion, Transaction},
+    base::Base,
+    chain::{Activation, ActivationRef, Chain, Inclusion},
     claim::{self, ActivationRecord, Branch, Item, Source, UnsignedClaim, MAX_ITEMS},
     crypto::{self, generator_mul, Point, ScalarBytes, Signature},
     disclosure::{Disclosures, SLOTS},
     hold::{self, Envelope, Record},
-    note::{Keyset, Message, Note, Ownership, PUBLIC_FIELDS_BYTES},
+    note::{Keyset, Message, Note, PUBLIC_FIELDS_BYTES},
     request::Request,
     source::Certificate,
     spend::{Proposal, ProposalId, TimedTerms, TIMED_TERMS_BYTES},
@@ -35,7 +29,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 const P_MAGIC: &[u8] = b"LICASH-P\x02";
 const F_MAGIC: &[u8] = b"LICASH-F\x01";
-/// One PUSHDATA2 OP_RETURN body; Core 30 relays it under default policy.
+/// A filing's limit: its bytes fit Lichen's claim carrier
+/// (`lichen_statement::claim_script`), which Core relays under default
+/// policy.
 pub const MAX_PUBLICATION_BYTES: usize = 64_000;
 const MAX_CERTIFICATE_BYTES: usize = 8_192;
 
@@ -84,48 +80,8 @@ fn put_blob(bytes: &mut Vec<u8>, blob: &[u8]) {
     bytes.extend(blob);
 }
 
-/// One OP_RETURN with a single PUSHDATA2 of `body`.
-fn push_script(body: Vec<u8>) -> Result<Vec<u8>, Error> {
-    if body.len() > MAX_PUBLICATION_BYTES {
-        return Err(bad("native publication exceeds its byte limit"));
-    }
-    let mut script = vec![0x6a, 0x4d];
-    script.extend((body.len() as u16).to_le_bytes());
-    script.extend(body);
-    Ok(script)
-}
-
-/// The body a [`push_script`] pushes.
-fn pushed(script: &[u8]) -> Result<&[u8], Error> {
-    if script.len() < 4 || script[..2] != [0x6a, 0x4d] {
-        return Err(bad("native publication script"));
-    }
-    let n = u16::from_le_bytes([script[2], script[3]]) as usize;
-    if script.len() != n + 4 || n < 76 {
-        return Err(bad("native publication push"));
-    }
-    Ok(&script[4..])
-}
-
-/// The script of `tx`'s unique output pushing a body that starts with
-/// `magic`.
-fn unique_push<'a>(tx: &'a Transaction, magic: &[u8]) -> Result<&'a [u8], Error> {
-    let mut found = tx.outputs().iter().filter(|output| {
-        output.script.len() > 4 + magic.len()
-            && output.script[..2] == [0x6a, 0x4d]
-            && output.script[4..].starts_with(magic)
-    });
-    let output = found
-        .next()
-        .ok_or_else(|| bad("no native publication output"))?;
-    if found.next().is_some() {
-        return Err(bad("ambiguous native publication outputs"));
-    }
-    Ok(&output.script)
-}
-
 /// Signed claim publication P: every counted field of E plus every Q
-/// signature. It is posted in a non-witness transaction after R; decoding
+/// signature, filed with its witness ([`Filing`]) after R. Decoding
 /// recomputes E, so P is authority only for the E that R actually signed.
 #[derive(Clone)]
 pub struct Publication {
@@ -169,7 +125,7 @@ impl Publication {
         let context = claim.context();
         let parts = claim.parts();
         let mut bytes = P_MAGIC.to_vec();
-        bytes.extend(context.final_digest);
+        bytes.extend(context.base);
         bytes.extend(context.deposit);
         bytes.extend(context.cap.to_be_bytes());
         bytes.extend(claim.keyset_id());
@@ -249,7 +205,7 @@ impl Publication {
         }
         let mut r = Reader(&bytes[P_MAGIC.len()..]);
         let context = claim::Context {
-            final_digest: r.array()?,
+            base: r.array()?,
             deposit: r.array()?,
             cap: r.u32()?,
         };
@@ -360,30 +316,11 @@ impl Publication {
         Ok(publication)
     }
 
-    /// One OP_RETURN with a single PUSHDATA2 of the canonical body.
-    pub fn script(&self) -> Result<Vec<u8>, Error> {
-        push_script(self.to_bytes())
-    }
-
-    pub fn from_script(keyset: &Keyset, limit: usize, script: &[u8]) -> Result<Self, Error> {
-        Self::from_bytes(keyset, limit, pushed(script)?)
-    }
-
-    /// The unique P output of a publication transaction. Inclusion, depth and
-    /// timing are the observer's checks against the opening's chain profile.
-    pub fn from_transaction(
-        keyset: &Keyset,
-        limit: usize,
-        tx: &Transaction,
-    ) -> Result<Self, Error> {
-        Self::from_script(keyset, limit, unique_push(tx, P_MAGIC)?)
-    }
-
     /// P is authority only for the request R signed under this opening.
-    pub fn bind(&self, base: &Base, d: &FinalDigest, request: &Request) -> Result<(), Error> {
+    pub fn bind(&self, base: &Base, request: &Request) -> Result<(), Error> {
         let parts = base.parts();
         let context = self.claim.context();
-        if &context.final_digest != d.as_bytes()
+        if context.base != base.digest()
             || context.deposit != parts.deposit
             || context.cap != parts.cap
             || self.claim.keyset_id() != parts.keyset.id()
@@ -446,36 +383,6 @@ impl SourceWitness {
     }
 }
 
-/// Private per-item eligibility. Ownership binds the item to Base's spending
-/// root; settled items add issuance evidence, pending ones the source output.
-#[derive(Clone)]
-pub enum ItemWitness {
-    Settled {
-        note: Box<Note>,
-        ownership: Ownership,
-    },
-    Pending {
-        ownership: Ownership,
-    },
-}
-
-#[derive(Clone)]
-pub struct HolderWitness {
-    pub items: Vec<ItemWitness>,
-    pub sources: Vec<SourceWitness>,
-    /// Positive witnesses for every advertised activation reference.
-    pub chain: Option<Chain>,
-    pub activations: Vec<Activation>,
-}
-
-/// The holder statement's journal: this exact opening, request and amount.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct HolderJournal {
-    pub final_digest: [u8; 32],
-    pub claim_digest: [u8; 32],
-    pub amount: u32,
-}
-
 fn opens(
     output: &crate::spend::Output,
     message: &Message,
@@ -486,120 +393,15 @@ fn opens(
         && output.blinded() == Point::from_projective(&blinded))
 }
 
-/// Holder recovery predicate: every claimed item is eligible, owned by Base's
-/// spending root and Q-authorized in P; every advertised activation is real.
-///
-/// The Pay outputs of a timed lock are eligible only under a Base opened on
-/// the checkpoint that the lock's terms name. Both programs read Bitcoin from
-/// Base's checkpoint, so under any other the Hub could never show that the
-/// lock expired, and an expired, refunded lock would be paid a second time.
-pub fn prove_holder(
-    base: &Base,
-    d: &FinalDigest,
-    request: &Request,
-    publication: &Publication,
-    witness: &HolderWitness,
-) -> Result<HolderJournal, Error> {
-    publication.bind(base, d, request)?;
-    let parts = base.parts();
-    let keyset = &parts.keyset;
-    let claim = publication.claim();
-    let items = &claim.parts().items;
-    if witness.items.len() != items.len() {
-        return Err(bad("holder witness item count"));
-    }
-    let claimed: BTreeMap<_, _> = claim.parts().sources.iter().map(|s| (s.id(), s)).collect();
-    let mut proposals = BTreeMap::new();
-    for source in &witness.sources {
-        let id = source.proposal().id();
-        let metadata = claimed
-            .get(&id)
-            .ok_or_else(|| bad("unclaimed source witness"))?;
-        source.authenticate(keyset, metadata)?;
-        proposals.insert(id, source.proposal());
-    }
-    if proposals.len() != claimed.len() {
-        return Err(bad("missing source witness"));
-    }
-    let checkpoint = &parts.chain.checkpoint;
-    let agreed = (checkpoint.profile(), checkpoint.commitment());
-    for (item, w) in items.iter().zip(&witness.items) {
-        match (item, w) {
-            (Item::Settled(message), ItemWitness::Settled { note, ownership }) => {
-                if note.message() != message {
-                    return Err(bad("settled witness message"));
-                }
-                note.verify(keyset)?;
-                ownership.verify(&parts.spend_root, message)?;
-            }
-            (
-                Item::Pending {
-                    message,
-                    source,
-                    branch,
-                    index,
-                    blinding,
-                    ..
-                },
-                ItemWitness::Pending { ownership },
-            ) => {
-                let proposal = proposals[source];
-                let timed_elsewhere = claimed[source]
-                    .terms()
-                    .is_some_and(|t| (t.profile(), *t.checkpoint()) != agreed);
-                if *branch == Branch::Pay && timed_elsewhere {
-                    return Err(bad("pay output of a lock timed on another checkpoint"));
-                }
-                let outputs = match branch {
-                    Branch::Pay => proposal.outputs(),
-                    Branch::Refund => proposal
-                        .lock()
-                        .ok_or_else(|| bad("refund of an untimed source"))?
-                        .refund(),
-                };
-                let output = outputs
-                    .get(*index as usize)
-                    .ok_or_else(|| bad("claimed source output index"))?;
-                if !opens(output, message, blinding)?
-                    || output.unlink_commitment() != &ownership.unlink_commitment()
-                {
-                    return Err(bad("pending item does not open its source output"));
-                }
-                ownership.verify(&parts.spend_root, message)?;
-            }
-            _ => return Err(bad("holder witness item class")),
-        }
-    }
-    for record in &claim.parts().activations {
-        let chain = witness
-            .chain
-            .as_ref()
-            .ok_or_else(|| bad("activation needs a chain"))?;
-        let activation = witness
-            .activations
-            .iter()
-            .find(|a| a.reference == record.reference)
-            .ok_or_else(|| bad("advertised activation lacks a witness"))?;
-        let terms = claimed[&record.source]
-            .terms()
-            .expect("admitted source is timed");
-        activation.verify(chain, terms, parts.limits.max_transaction_bytes as usize)?;
-    }
-    Ok(HolderJournal {
-        final_digest: *d.as_bytes(),
-        claim_digest: *claim.digest(),
-        amount: claim.amount(),
-    })
-}
-
-/// Hub counter evidence under the Corrected policy. Each evidence must void at
-/// least one item; voided items are excluded and everything else stays owed.
+/// The Hub's evidence against a claim. Each evidence must void at least one
+/// item (or value a Plain source's fallbacks); voided items are excluded and
+/// everything else stays owed.
 #[derive(Clone)]
 pub enum Evidence {
     /// An owner-signed spend. It voids items it consumes (own Y) and pending
     /// outputs of another source whose inputs it double-spends, except an
     /// activated certified Pay. Executing a Plain source values its fallbacks.
-    /// A granted spend is cited with its unlock, which the counter publishes:
+    /// A granted spend is cited with its unlock, which the Hub publishes:
     /// retiring the payer's inputs releases the payee's outputs.
     Spend {
         signed: SignedProposal,
@@ -616,7 +418,7 @@ pub enum Evidence {
         record: Record,
     },
     /// The Pay preimage of a timed source is known: its Refund items are void.
-    /// The counter publishes the preimage.
+    /// The Hub publishes the preimage.
     PayPreimage {
         source: ProposalId,
         preimage: [u8; 32],
@@ -626,37 +428,11 @@ pub enum Evidence {
     Expired { source: ProposalId },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CounterJournal {
-    pub final_digest: [u8; 32],
-    pub claim_digest: [u8; 32],
-    /// Bit i voids claim item i (item positions are mask positions).
-    pub mask: u32,
-    pub owed: u32,
-    /// Digest of the 32 disclosure slots the response must publish.
-    pub disclosure: [u8; 32],
-}
-
-impl CounterJournal {
-    pub const LEN: usize = 104;
-
-    /// The counter guest's public output: `D ‖ E ‖ mask ‖ owed ‖ H(slots)`.
-    pub fn to_bytes(&self) -> [u8; Self::LEN] {
-        let mut bytes = [0; Self::LEN];
-        bytes[..32].copy_from_slice(&self.final_digest);
-        bytes[32..64].copy_from_slice(&self.claim_digest);
-        bytes[64..68].copy_from_slice(&self.mask.to_be_bytes());
-        bytes[68..72].copy_from_slice(&self.owed.to_be_bytes());
-        bytes[72..].copy_from_slice(&self.disclosure);
-        bytes
-    }
-}
-
-/// The secrets a counter publishes with its response: the unlock of every
+/// The secrets the Hub publishes with its response: the unlock of every
 /// granted spend it cites and every Pay preimage, one slot per source in
-/// source-id order, zero padded. `prove_counter` commits their digest, and the
-/// holder statement accepts the counter only with these exact posted bytes.
-pub fn counter_disclosures(evidence: &[Evidence]) -> Result<Disclosures, Error> {
+/// source-id order, zero padded. Its statement holds only if its response
+/// disclosed these exact bytes (when any slot is set).
+pub fn disclosures(evidence: &[Evidence]) -> Result<Disclosures, Error> {
     let mut by_source = BTreeMap::new();
     for e in evidence {
         match e {
@@ -674,38 +450,13 @@ pub fn counter_disclosures(evidence: &[Evidence]) -> Result<Disclosures, Error> 
         }
     }
     if by_source.len() > SLOTS {
-        return Err(bad("counter disclosures exceed the publication"));
+        return Err(bad("disclosures exceed their slots"));
     }
     let mut disclosures = Disclosures::empty();
     for (slot, value) in disclosures.values.iter_mut().zip(by_source.values()) {
         *slot = *value;
     }
     Ok(disclosures)
-}
-
-/// Corrected counter predicate. `chain` must be verified from the source
-/// terms' checkpoint; it is needed only for `Expired`.
-pub fn prove_counter(
-    base: &Base,
-    d: &FinalDigest,
-    request: &Request,
-    publication: &Publication,
-    evidence: &[Evidence],
-    chain: Option<&Chain>,
-) -> Result<CounterJournal, Error> {
-    publication.bind(base, d, request)?;
-    let claim = publication.claim();
-    let (mask, executed) = void(&base.parts().keyset, claim, evidence, chain)?;
-    if mask == 0 {
-        return Err(bad("empty counter"));
-    }
-    Ok(CounterJournal {
-        final_digest: *d.as_bytes(),
-        claim_digest: *claim.digest(),
-        mask,
-        owed: live(claim, mask, &executed),
-        disclosure: counter_disclosures(evidence)?.digest(),
-    })
 }
 
 /// The items `evidence` voids (bit i for item i) and the sources it shows
@@ -833,7 +584,7 @@ fn void(
             }
         }
         if mask == before && !values_fallback {
-            return Err(bad("counter evidence voids nothing"));
+            return Err(bad("evidence voids nothing"));
         }
     }
     Ok((mask, executed))
@@ -862,8 +613,8 @@ fn live(claim: &UnsignedClaim, mask: u32, executed: &BTreeSet<ProposalId>) -> u3
 }
 
 /// The public evidence that a claim's items exist, filed with P under the
-/// hub-proves model: [`HolderWitness`] less its ownership, so that the Hub,
-/// not the holder, can evaluate eligibility.
+/// hub-proves model, so that the Hub, not the holder, can evaluate
+/// eligibility.
 #[derive(Clone)]
 pub struct Witness {
     /// The issued note of each settled item, in item order.
@@ -875,7 +626,8 @@ pub struct Witness {
 }
 
 /// A claim as filed on Bitcoin under the hub-proves model: P and its public
-/// witness W, one OP_RETURN body (`LICASH-F\x01 ‖ P ‖ W`) posted after R.
+/// witness W, `LICASH-F\x01 ‖ P ‖ W`, which the holder's publication
+/// carries after R (Lichen's claim slot, `lichen_statement::claim_script`).
 ///
 /// **Recovery authority.** There is no ownership check: an item is
 /// designated by its hold key Q signing this claim's context (P's
@@ -1057,31 +809,18 @@ impl Filing {
         }
         Ok(filing)
     }
-
-    /// One OP_RETURN with a single PUSHDATA2 of the canonical body.
-    pub fn script(&self) -> Result<Vec<u8>, Error> {
-        push_script(self.to_bytes())
-    }
-
-    /// The body of a filing transaction's unique filing output, undecoded:
-    /// what [`owed`] reads.
-    pub fn body(tx: &Transaction) -> Result<&[u8], Error> {
-        pushed(unique_push(tx, F_MAGIC)?)
-    }
 }
 
 /// Whether a decoded filing is eligible under this opening and request: an
-/// error is the holder's, and leaves the claim owed nothing. What
-/// [`prove_holder`] checks, less ownership, against `chain`, the Hub's.
-fn eligible(
-    filing: &Filing,
-    base: &Base,
-    d: &FinalDigest,
-    request: &Request,
-    chain: &Chain,
-) -> Result<(), Error> {
+/// error is the holder's, and leaves the claim owed nothing.
+///
+/// The Pay outputs of a timed lock are eligible only under a Base opened on
+/// the checkpoint that the lock's terms name: the statement reads Bitcoin
+/// from Base's checkpoint, so under any other the Hub could never show that
+/// the lock expired, and an expired, refunded lock would be paid twice.
+fn eligible(filing: &Filing, base: &Base, request: &Request, chain: &Chain) -> Result<(), Error> {
     let publication = &filing.publication;
-    publication.bind(base, d, request)?;
+    publication.bind(base, request)?;
     let parts = base.parts();
     let claim = publication.claim();
     let sources = &claim.parts().sources;
@@ -1155,14 +894,15 @@ pub struct Owed {
     pub owed: u32,
     /// Bit i: item i voided by the Hub's evidence.
     pub mask: u32,
-    /// Digest of the disclosure slots the Hub's response publishes.
-    pub disclosure: [u8; 32],
+    /// What the Hub's response must disclose ([`disclosures`]): nothing if
+    /// every slot is empty.
+    pub disclosures: Disclosures,
     /// Why the claim is owed nothing, if the holder filed it wrong.
     pub ineligible: Option<String>,
 }
 
 /// The Hub's statement under the hub-proves model: what the claim filed as
-/// `filed` (a filing's body, [`Filing::body`]) is owed under request R.
+/// `filed` (a filing's bytes, [`Filing::to_bytes`]) is owed under request R.
 ///
 /// A claim the holder got wrong is ineligible, and owed 0: bytes that don't
 /// decode, a P for another opening or request, a note the issuer didn't
@@ -1175,11 +915,11 @@ pub struct Owed {
 /// An error is the Hub's, and it can't prove with these inputs: evidence
 /// that doesn't verify or voids nothing, evidence against an ineligible
 /// claim, or a chain not from Base's checkpoint. The statement fixes
-/// `chain` (from Base's checkpoint, through the Hub's response), so the
-/// Hub can't shorten it to bury an activation less.
+/// `chain` (from Base's checkpoint through the block of the claim's
+/// publication), so the Hub can't shorten it to bury an activation less,
+/// and decides at signing what it proves later.
 pub fn owed(
     base: &Base,
-    d: &FinalDigest,
     request: &Request,
     filed: &[u8],
     evidence: &[Evidence],
@@ -1191,7 +931,7 @@ pub fn owed(
     }
     let limit = parts.limits.max_authorizations as usize;
     let filing = Filing::from_bytes(&parts.keyset, limit, filed)
-        .and_then(|filing| eligible(&filing, base, d, request, chain).map(|()| filing));
+        .and_then(|filing| eligible(&filing, base, request, chain).map(|()| filing));
     let filing = match filing {
         Ok(filing) => filing,
         Err(_) if !evidence.is_empty() => {
@@ -1201,7 +941,7 @@ pub fn owed(
             return Ok(Owed {
                 owed: 0,
                 mask: 0,
-                disclosure: Disclosures::empty().digest(),
+                disclosures: Disclosures::empty(),
                 ineligible: Some(e.to_string()),
             })
         }
@@ -1211,68 +951,7 @@ pub fn owed(
     Ok(Owed {
         owed: live(claim, mask, &executed),
         mask,
-        disclosure: counter_disclosures(evidence)?.digest(),
+        disclosures: disclosures(evidence)?,
         ineligible: None,
-    })
-}
-
-/// What the Hub did after R.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Response {
-    /// No response within the window: the request timeout pays b.
-    Silent,
-    /// Plain response: the holder must prove the full claim.
-    Plain,
-    /// A proven Corrected counter; an unproven one is treated as Plain.
-    Counter(CounterJournal),
-}
-
-/// Settled value in satoshis: principal through winning bits, the remainder
-/// from the holder terminal's reserve surplus (checked by RecoveryBudget).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Settlement {
-    pub owed: u32,
-    pub principal: u64,
-    pub remainder: u64,
-}
-
-pub fn settle(
-    base: &Base,
-    d: &FinalDigest,
-    request: &Request,
-    response: Response,
-    holder: Option<&HolderJournal>,
-) -> Result<Settlement, Error> {
-    let proven = holder.is_some_and(|j| {
-        j.final_digest == *d.as_bytes()
-            && j.claim_digest == request.claim_digest
-            && j.amount == request.amount
-    });
-    let owed = match response {
-        Response::Silent => request.amount,
-        Response::Plain => {
-            if proven {
-                request.amount
-            } else {
-                0
-            }
-        }
-        Response::Counter(c) => {
-            if c.final_digest != *d.as_bytes() || c.claim_digest != request.claim_digest {
-                return Err(bad("counter journal for another claim"));
-            }
-            if proven {
-                c.owed
-            } else {
-                0
-            }
-        }
-    };
-    let low = base.recovery_budget()?.low_bits();
-    let principal = u64::from(owed) & !((1u64 << low) - 1);
-    Ok(Settlement {
-        owed,
-        principal,
-        remainder: u64::from(owed) - principal,
     })
 }

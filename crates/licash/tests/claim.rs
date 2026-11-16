@@ -28,7 +28,7 @@ fn derive(index: u32) -> Derivation {
 }
 fn context() -> Context {
     Context {
-        final_digest: [31; 32],
+        base: [31; 32],
         deposit: [37; 36],
         cap: 128,
     }
@@ -168,7 +168,7 @@ fn the_e_formula_counts_and_binds_every_item() {
     let body = crypto::tagged_hash(
         "licash/claim-body/v2",
         &[
-            &context().final_digest,
+            &context().base,
             &context().deposit,
             keys.id(),
             &8u32.to_be_bytes(),
@@ -201,7 +201,7 @@ fn context_amount_item_order_keyset_and_full_messages_change_e() {
         let mut parts = settled(2);
         let mut amount = 8;
         match field {
-            0 => ctx.final_digest[0] ^= 1,
+            0 => ctx.base[0] ^= 1,
             1 => ctx.deposit[0] ^= 1,
             2 => amount = 4,
             3 => parts.items.reverse(),

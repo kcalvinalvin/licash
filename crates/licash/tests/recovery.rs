@@ -1,5 +1,5 @@
-//! Native recovery composition without Bitcoin Core: Base, gates, 32-item
-//! publication, holder proof, Corrected counters and settlement.
+//! Recovery without Bitcoin Core: the 32-item publication, its filing, and
+//! what the Hub's statement decides it is owed.
 
 use bitcoin::{
     absolute,
@@ -7,61 +7,32 @@ use bitcoin::{
     consensus::{deserialize, serialize},
     hashes::{sha256, sha256d, Hash},
     pow::CompactTarget,
-    secp256k1::{Secp256k1, XOnlyPublicKey},
-    taproot::{LeafVersion, TaprootBuilder},
-    transaction, Amount, Block, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid,
-    Witness,
+    transaction, Amount, Block, OutPoint, ScriptBuf, Transaction, TxIn, TxOut, Txid,
 };
 use k256::Scalar;
 use licash::{
     authorization::{Authorization, PreparedGrant, SignedProposal},
-    base::{
-        Base, ChainTerms, Fees, FinalDigest, GraphTerms, Limits, Parts, Party, Programs, Recipe,
-        ResponseKeys,
-    },
-    chain::{self, Activation, ActivationRef, Chain, Checkpoint, Inclusion, WitnessInclusion},
+    base::{Base, ChainTerms, Fees, GraphTerms, Limits, Parts, Party, Recipe},
+    chain::{self, Activation, ActivationRef, Chain, Checkpoint, Inclusion},
     claim::{self, ActivationRecord, Branch, Item, Source, UnsignedClaim},
     crypto::{self, Point},
-    guest::CounterInput,
     hold,
     note::Evidence as Issuance,
     note::{Derivation, HoldRoot, IssuerKeys, Keyset, Note},
-    opening::{FrozenPrefix, GraphOutput, RequestLeaf},
-    recovery::{
-        self, counter_disclosures, prove_counter, prove_holder, settle, Evidence, Filing,
-        HolderWitness, ItemWitness, Publication, Response, SourceWitness,
-    },
-    request::{Request, Signer},
+    recovery::{self, disclosures, Evidence, Filing, Owed, Publication, SourceWitness, Witness},
+    request::Request,
     source::Certificate,
     spend::{ChainProfile, Output, Proposal, TimedLock, TimedTerms},
-    statement::SecretKeys,
-    statement::{HubResponse, Observed, StatementInput},
 };
 
 const SEED: [u8; 32] = [7; 32];
 const SPEND: u64 = 17;
 const LIMIT: usize = 128;
-/// The fixture recipe's program identities, as both parties trust them.
-const PROGRAMS: Programs = Programs {
-    holder: [11; 32],
-    counter: [13; 32],
-};
-
 fn point(value: u64) -> Point {
     Point::from_projective(&crypto::generator_mul(&Scalar::from(value)))
 }
 fn hold() -> HoldRoot {
     HoldRoot::from_seed(&SEED).unwrap()
-}
-fn response_keys() -> ResponseKeys {
-    ResponseKeys::new(
-        SecretKeys::from_entropy(
-            std::array::from_fn(|i| [i as u8 + 1; 32]),
-            std::array::from_fn(|i| [i as u8 + 11; 32]),
-        )
-        .public(),
-    )
-    .unwrap()
 }
 fn party(value: u64) -> Party {
     let mut script = vec![0x51, 0x20];
@@ -78,12 +49,10 @@ fn base(keyset: Keyset) -> Base {
     deposit[32..].copy_from_slice(&7u32.to_le_bytes());
     Base::new(Parts {
         nonce: [53; 32],
-        spend_root: point(SPEND),
         claim_key: point(19).x_only(),
         keyset,
         deposit,
         cap: 128,
-        response_keys: response_keys(),
         parties: [party(23), party(29)],
         graph: GraphTerms {
             id: 7,
@@ -101,27 +70,23 @@ fn base(keyset: Keyset) -> Base {
             delta: 6,
             delta_prime: 6,
             deadline_margin: 8,
-            response_window: 6,
-            assert_height: 800,
-            hub_challenge: 12,
-            holder_answer: 6,
+            request_height: 800,
+            response_window: 12,
+            publication_window: 3,
+            assert_window: 12,
+            challenge_window: 24,
+            answer_window: 12,
         },
         recipe: Recipe {
-            graph_version: 1,
-            holder_program: [11; 32],
-            counter_program: [13; 32],
-            full_instances: 4,
-            full_kept: 2,
-            corrected_instances: 4,
-            corrected_kept: 2,
+            graph_version: 2,
+            program: [11; 32],
+            instances: 4,
+            kept: 2,
         },
         chain: ChainTerms {
             checkpoint: Checkpoint::genesis(ChainProfile::Core30DefaultRegtest).unwrap(),
             funding_depth: 1,
-            request_depth: 1,
-            publication_depth: 1,
-            lookback: 6,
-            observation_margin: 1,
+            work_depth: 6,
             max_headers: 1_000,
         },
         limits: Limits {
@@ -131,93 +96,10 @@ fn base(keyset: Keyset) -> Base {
             max_source_inputs: 128,
         },
         fees: Fees {
-            sweep_fee_max: 1_000,
-            external_fee_max: 2_000,
             max_rate_sat_per_kvb: 10_000,
             opening_fee_quote: 3_000,
         },
     })
-    .unwrap()
-}
-
-/// Single request-leaf F/R fixture; returns the prefix and its graph script.
-fn prefix(base: &Base) -> FrozenPrefix {
-    let p = base.parts();
-    let digest = base.digest();
-    let keys = Signer::derive(&SEED, &digest).public();
-    let (alice, hub, delay) = (
-        p.parties[0].payment,
-        p.parties[1].payment,
-        p.graph.to_self_delay,
-    );
-    let script = ScriptBuf::from_bytes(
-        keys.request_leaf_for_base(&digest, &alice, &hub, delay)
-            .unwrap(),
-    );
-    let nums = XOnlyPublicKey::from_slice(
-        &hex::decode("50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0").unwrap(),
-    )
-    .unwrap();
-    let tree = TaprootBuilder::with_huffman_tree([(1, script.clone())])
-        .unwrap()
-        .finalize(&Secp256k1::new(), nums)
-        .unwrap();
-    let spk = ScriptBuf::new_p2tr_tweaked(tree.output_key());
-    let control = tree
-        .control_block(&(script, LeafVersion::TapScript))
-        .unwrap()
-        .serialize();
-    let leaf = RequestLeaf::for_base(digest, keys, alice, hub, delay, control).unwrap();
-    let value = p.graph.graph_value().unwrap();
-    let od = base.deposit_outpoint();
-    let f = Transaction {
-        version: transaction::Version::TWO,
-        lock_time: absolute::LockTime::ZERO,
-        input: vec![TxIn {
-            previous_output: OutPoint {
-                txid: Txid::from_byte_array(od.txid),
-                vout: od.index,
-            },
-            ..Default::default()
-        }],
-        output: vec![TxOut {
-            value: Amount::from_sat(value),
-            script_pubkey: spk.clone(),
-        }],
-    };
-    let r = Transaction {
-        version: transaction::Version::TWO,
-        lock_time: absolute::LockTime::ZERO,
-        input: vec![TxIn {
-            previous_output: OutPoint {
-                txid: f.compute_txid(),
-                vout: 0,
-            },
-            sequence: Sequence::from_height(delay),
-            ..Default::default()
-        }],
-        output: vec![TxOut {
-            value: Amount::from_sat(value - 10_000),
-            script_pubkey: spk.clone(),
-        }],
-    };
-    let output = |value| chain::Output {
-        value,
-        script: spk.to_bytes(),
-    };
-    FrozenPrefix::new(
-        chain::Transaction::parse(&serialize(&f), 100_000).unwrap(),
-        chain::Transaction::parse(&serialize(&r), 100_000).unwrap(),
-        GraphOutput {
-            index: 0,
-            output: output(value),
-        },
-        GraphOutput {
-            index: 0,
-            output: output(value - 10_000),
-        },
-        leaf,
-    )
     .unwrap()
 }
 
@@ -255,7 +137,6 @@ fn mint(keys: &IssuerKeys, keyset: &Keyset, d: &Derivation) -> Note {
 struct Opened {
     issuer: IssuerKeys,
     base: Base,
-    d: FinalDigest,
 }
 
 fn open() -> Opened {
@@ -265,15 +146,28 @@ fn open() -> Opened {
 fn open_with(max_pow: u32) -> Opened {
     let issuer = IssuerKeys::random(max_pow).unwrap();
     let base = base(issuer.keyset().unwrap());
-    let prefix = prefix(&base);
-    let graph = prefix.funding_graph().output.script.clone();
-    let consent = base
-        .holder_gate(&prefix, &graph, &PROGRAMS, &SEED, &Scalar::from(SPEND), 0)
-        .unwrap();
-    let d = base
-        .hub_gate(&prefix, &graph, &PROGRAMS, &response_keys(), &consent, 0)
-        .unwrap();
-    Opened { issuer, base, d }
+    Opened { issuer, base }
+}
+
+/// The statement's chain with no block after Base's checkpoint.
+fn checkpoint_chain() -> Chain {
+    let cp = Checkpoint::genesis(ChainProfile::Core30DefaultRegtest).unwrap();
+    Chain::verify(cp.clone(), &cp.commitment(), vec![], 100).unwrap()
+}
+
+/// What the Hub's statement decides of `p` filed with `witness` under
+/// `request`, against `evidence`, on `chain` (or the checkpoint's alone).
+fn decide(
+    o: &Opened,
+    request: &Request,
+    p: &Publication,
+    witness: &Witness,
+    evidence: &[Evidence],
+    chain: Option<&Chain>,
+) -> Result<Owed, licash::Error> {
+    let filing = Filing::new(p.clone(), witness.clone()).unwrap();
+    let chain = chain.cloned().unwrap_or_else(checkpoint_chain);
+    recovery::owed(&o.base, request, &filing.to_bytes(), evidence, &chain)
 }
 
 fn claim(
@@ -289,7 +183,7 @@ fn claim(
     let p = o.base.parts();
     UnsignedClaim::new(
         claim::Context {
-            final_digest: *o.d.as_bytes(),
+            base: o.base.digest(),
             deposit: p.deposit,
             cap: p.cap,
         },
@@ -324,185 +218,7 @@ fn bob(denom: u64, index: u32) -> Output {
 }
 
 #[test]
-fn stale_thirty_two_item_claim_is_published_proven_countered_and_owed_its_unspent_part() {
-    let o = open();
-    let keyset = o.base.parts().keyset.clone();
-    let hold = hold();
-    let ds: Vec<_> = (0..32).map(|i| derive(SPEND, &hold, 4, 23, i)).collect();
-    let notes: Vec<_> = ds.iter().map(|d| mint(&o.issuer, &keyset, d)).collect();
-    // After her backup, the holder paid Bob 64 sats from 16 of the notes.
-    let owners: Vec<_> = (0..16).map(|i| owner(SPEND, 23, i)).collect();
-    let payment = spend(
-        &o,
-        &notes[..16],
-        &owners,
-        (0..8).map(|i| bob(8, i)).collect(),
-    );
-
-    // The stale backup still claims all 32 items, b = 128.
-    let items = ds
-        .iter()
-        .map(|d| Item::Settled(d.message().clone()))
-        .collect();
-    let unsigned = claim(&o, items, vec![], vec![], &ds, 128);
-    let publication = Publication::sign(unsigned, &hold_keys(&ds), LIMIT).unwrap();
-    let p_tx = Transaction {
-        version: transaction::Version::TWO,
-        lock_time: absolute::LockTime::ZERO,
-        input: vec![TxIn {
-            previous_output: OutPoint {
-                txid: Txid::from_byte_array([5; 32]),
-                vout: 0,
-            },
-            ..Default::default()
-        }],
-        output: vec![
-            TxOut {
-                value: Amount::from_sat(330),
-                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-            },
-            TxOut {
-                value: Amount::ZERO,
-                script_pubkey: ScriptBuf::from_bytes(publication.script().unwrap()),
-            },
-        ],
-    };
-    let parsed = chain::Transaction::parse(&serialize(&p_tx), 100_000).unwrap();
-    let posted = Publication::from_transaction(&keyset, LIMIT, &parsed).unwrap();
-    assert_eq!(posted.to_bytes(), publication.to_bytes());
-    assert!(posted.to_bytes().len() < 10_000);
-
-    // R signs exactly this E and b with the holder's Base-derived keys.
-    let request = Request {
-        amount: 128,
-        claim_digest: *posted.claim().digest(),
-    };
-    assert_eq!(
-        Signer::derive(&SEED, &o.base.digest())
-            .sign(request)
-            .request(),
-        request
-    );
-
-    let witness = HolderWitness {
-        items: ds
-            .iter()
-            .zip(&notes)
-            .map(|(d, note)| ItemWitness::Settled {
-                note: Box::new(note.clone()),
-                ownership: d.ownership(),
-            })
-            .collect(),
-        sources: vec![],
-        chain: None,
-        activations: vec![],
-    };
-    let holder = prove_holder(&o.base, &o.d, &request, &posted, &witness).unwrap();
-    assert_eq!(
-        (holder.amount, holder.claim_digest),
-        (128, request.claim_digest)
-    );
-    let spent = Evidence::Spend {
-        signed: payment.clone(),
-        notes: notes[..16].to_vec(),
-        unlock: None,
-    };
-    let counter = prove_counter(
-        &o.base,
-        &o.d,
-        &request,
-        &posted,
-        std::slice::from_ref(&spent),
-        None,
-    )
-    .unwrap();
-    assert_eq!((counter.mask, counter.owed), (0xffff, 64));
-
-    // A Q signature over any other claim voids that item as well.
-    let other = hold::Context {
-        final_digest: [1; 32],
-        deposit: [2; 36],
-        amount: 4,
-        claim_digest: [3; 32],
-    };
-    let record = hold::Envelope::sign(other, &hold_keys(&ds[20..21]), LIMIT)
-        .unwrap()
-        .records()[0]
-        .clone();
-    let second = Evidence::SecondClaim {
-        context: other,
-        record: record.clone(),
-    };
-    let both = prove_counter(
-        &o.base,
-        &o.d,
-        &request,
-        &posted,
-        &[spent.clone(), second.clone()],
-        None,
-    )
-    .unwrap();
-    assert_eq!((both.mask, both.owed), (0xffff | 1 << 20, 60));
-    // The counter guest's input survives its codec and rebuilds the request
-    // from P alone.
-    let input = CounterInput {
-        base: o.base.clone(),
-        prefix: prefix(&o.base),
-        publication: posted.clone(),
-        evidence: vec![spent.clone(), second],
-        chain: None,
-    };
-    let bytes = input.to_bytes().unwrap();
-    let decoded = CounterInput::from_bytes(&bytes).unwrap();
-    assert_eq!(decoded.run().unwrap(), both);
-    assert_eq!(decoded.to_bytes().unwrap(), bytes);
-    assert!(CounterInput::from_bytes(&bytes[..bytes.len() - 1]).is_err());
-    let same = Evidence::SecondClaim {
-        context: posted.claim().hold_context(),
-        record,
-    };
-    assert!(prove_counter(&o.base, &o.d, &request, &posted, &[same], None).is_err());
-
-    // An unrelated spend voids nothing and is not a counter.
-    let unrelated = derive(SPEND, &hold, 4, 23, 40);
-    let unrelated_note = mint(&o.issuer, &keyset, &unrelated);
-    let unrelated = spend(
-        &o,
-        std::slice::from_ref(&unrelated_note),
-        &[owner(SPEND, 23, 40)],
-        vec![bob(4, 9)],
-    );
-    let unrelated = Evidence::Spend {
-        signed: unrelated,
-        notes: vec![unrelated_note],
-        unlock: None,
-    };
-    assert!(prove_counter(&o.base, &o.d, &request, &posted, &[unrelated], None).is_err());
-
-    // Settlement: what is owed is owed, with no penalty for the stale backup.
-    let owed = |response, holder| settle(&o.base, &o.d, &request, response, holder).unwrap();
-    assert_eq!(owed(Response::Silent, None).owed, 128);
-    assert_eq!(owed(Response::Plain, Some(&holder)).owed, 128);
-    assert_eq!(owed(Response::Plain, None).owed, 0);
-    let corrected = owed(Response::Counter(counter), Some(&holder));
-    assert_eq!(
-        (corrected.owed, corrected.principal, corrected.remainder),
-        (64, 0, 64)
-    );
-    assert_eq!(owed(Response::Counter(both), Some(&holder)).owed, 60);
-    assert_eq!(owed(Response::Counter(counter), None).owed, 0);
-
-    // Publications and proofs are bound to this exact request.
-    let wrong = Request {
-        amount: 127,
-        ..request
-    };
-    assert!(prove_holder(&o.base, &o.d, &wrong, &posted, &witness).is_err());
-    assert!(prove_counter(&o.base, &o.d, &wrong, &posted, &[spent], None).is_err());
-}
-
-#[test]
-fn publication_codec_is_strict_and_unique_per_transaction() {
+fn publication_codec_is_strict() {
     let o = open();
     let keyset = o.base.parts().keyset.clone();
     let ds: Vec<_> = (0..3).map(|i| derive(SPEND, &hold(), 4, 23, i)).collect();
@@ -529,82 +245,6 @@ fn publication_codec_is_strict_and_unique_per_transaction() {
     forged[last] ^= 1; // a Q signature byte
     assert!(Publication::from_bytes(&keyset, LIMIT, &forged).is_err());
     assert!(Publication::from_bytes(&keyset, 2, &bytes).is_err());
-    let script = ScriptBuf::from_bytes(publication.script().unwrap());
-    let twice = Transaction {
-        version: transaction::Version::TWO,
-        lock_time: absolute::LockTime::ZERO,
-        input: vec![TxIn::default()],
-        output: vec![
-            TxOut {
-                value: Amount::ZERO,
-                script_pubkey: script.clone(),
-            },
-            TxOut {
-                value: Amount::ZERO,
-                script_pubkey: script,
-            },
-        ],
-    };
-    let parsed = chain::Transaction::parse(&serialize(&twice), 100_000).unwrap();
-    assert!(Publication::from_transaction(&keyset, LIMIT, &parsed).is_err());
-}
-
-#[test]
-fn funding_gates_require_own_keys_root_compiled_graph_retained_keys_and_time() {
-    let issuer = IssuerKeys::random(3).unwrap();
-    let base = base(issuer.keyset().unwrap());
-    let prefix = prefix(&base);
-    let graph = prefix.funding_graph().output.script.clone();
-    let secret = Scalar::from(SPEND);
-    let consent = base
-        .holder_gate(&prefix, &graph, &PROGRAMS, &SEED, &secret, 0)
-        .unwrap();
-    assert!(base
-        .holder_gate(&prefix, &graph, &PROGRAMS, &[8; 32], &secret, 0)
-        .is_err());
-    assert!(base
-        .holder_gate(&prefix, &graph, &PROGRAMS, &SEED, &Scalar::from(18u64), 0)
-        .is_err());
-    assert!(base
-        .holder_gate(&prefix, &[0x51], &PROGRAMS, &SEED, &secret, 0)
-        .is_err());
-    assert!(base
-        .holder_gate(&prefix, &graph, &PROGRAMS, &SEED, &secret, 790)
-        .is_err());
-    // An opening naming a proof program the party did not build is refused.
-    for untrusted in [
-        Programs {
-            holder: [12; 32],
-            ..PROGRAMS
-        },
-        Programs {
-            counter: [14; 32],
-            ..PROGRAMS
-        },
-    ] {
-        assert!(base
-            .holder_gate(&prefix, &graph, &untrusted, &SEED, &secret, 0)
-            .is_err());
-        assert!(base
-            .hub_gate(&prefix, &graph, &untrusted, &response_keys(), &consent, 0)
-            .is_err());
-    }
-    base.hub_gate(&prefix, &graph, &PROGRAMS, &response_keys(), &consent, 0)
-        .unwrap();
-    let other = ResponseKeys::new(SecretKeys::random().public()).unwrap();
-    assert!(base
-        .hub_gate(&prefix, &graph, &PROGRAMS, &other, &consent, 0)
-        .is_err());
-    assert!(base
-        .hub_gate(
-            &prefix,
-            &graph,
-            &PROGRAMS,
-            &response_keys(),
-            &crypto::Signature([0; 64]),
-            0
-        )
-        .is_err());
 }
 
 const Z: [u8; 32] = [83; 32];
@@ -647,7 +287,7 @@ fn activated_chain() -> (Chain, Activation) {
             input: vec![TxIn {
                 previous_output: OutPoint::null(),
                 script_sig: ScriptBuf::from_bytes(vec![1, height as u8, 0]),
-                witness: Witness::from_slice(&[reserved]),
+                witness: bitcoin::Witness::from_slice(&[reserved]),
                 ..Default::default()
             }],
             output: vec![TxOut {
@@ -664,7 +304,7 @@ fn activated_chain() -> (Chain, Activation) {
                         txid: Txid::from_byte_array([17; 32]),
                         vout: 1,
                     },
-                    witness: Witness::from_slice(&[vec![1; 3], vec![0x51]]),
+                    witness: bitcoin::Witness::from_slice(&[vec![1; 3], vec![0x51]]),
                     ..Default::default()
                 }],
                 output: vec![TxOut {
@@ -821,31 +461,32 @@ fn pending_sources_follow_activation_refund_and_preimage_rules() {
         };
         (p, request)
     };
-    let mut witness = HolderWitness {
-        items: vec![
-            ItemWitness::Settled {
-                note: Box::new(settled_note),
-                ownership: settled.ownership(),
-            },
-            ItemWitness::Pending {
-                ownership: pay.ownership(),
-            },
-            ItemWitness::Pending {
-                ownership: refund.ownership(),
-            },
-        ],
-        sources: vec![
-            SourceWitness::Certified {
-                proposal: bob_signed.proposal().clone(),
-                signatures: bob_signed.signatures().to_vec(),
-            },
-            SourceWitness::Signed {
-                signed: own_signed,
-                notes: vec![own_note],
-            },
-        ],
-        chain: Some(chain.clone()),
-        activations: vec![activation.clone()],
+    // The public witness: the settled note, each source's body (in P's
+    // source-id order), and the given activations' inclusions.
+    let witness = |activations: Vec<Inclusion>| {
+        let mut sources = vec![
+            (
+                bob_id,
+                SourceWitness::Certified {
+                    proposal: bob_signed.proposal().clone(),
+                    signatures: bob_signed.signatures().to_vec(),
+                },
+            ),
+            (
+                own_id,
+                SourceWitness::Signed {
+                    signed: own_signed.clone(),
+                    notes: vec![own_note.clone()],
+                },
+            ),
+        ];
+        sources.sort_by_key(|(id, _)| *id);
+        let sources = sources.into_iter().map(|(_, w)| w).collect();
+        Witness {
+            notes: vec![settled_note.clone()],
+            sources,
+            activations,
+        }
     };
     let bob_elsewhere = spend(
         &o,
@@ -858,8 +499,8 @@ fn pending_sources_follow_activation_refund_and_preimage_rules() {
         notes: vec![bob_note],
         unlock: None,
     };
-    let counter = |p: &Publication, r: &Request, e: Evidence| {
-        prove_counter(&o.base, &o.d, r, p, &[e], Some(&chain))
+    let counter = |p: &Publication, r: &Request, w: &Witness, e: Evidence| {
+        decide(&o, r, p, w, &[e], Some(&chain))
     };
 
     // Activated certified Pay: expiry and input sharing cannot void it.
@@ -868,87 +509,32 @@ fn pending_sources_follow_activation_refund_and_preimage_rules() {
         reference: activation.reference,
     };
     let (p, request) = publish(vec![record]);
-    prove_holder(&o.base, &o.d, &request, &p, &witness).unwrap();
-    // The holder guest's input carries sources, chain and activations; each
-    // is rebuilt through its validating constructor.
-    let empty = Inclusion {
-        transaction: vec![],
-        index: 0,
-        siblings: vec![],
-        coinbase: vec![],
-        coinbase_siblings: vec![],
-    };
-    let input = StatementInput {
-        c: 0,
-        base: o.base.clone(),
-        prefix: prefix(&o.base),
-        observed: Observed {
-            headers: vec![],
-            request_height: 1,
-            request: WitnessInclusion {
-                non_witness: empty.clone(),
-                full_transaction: vec![],
-                witness_siblings: vec![],
-                coinbase_witness_siblings: vec![],
-                reserved_value: [0; 32],
-            },
-            publication_height: 2,
-            publication: empty,
-        },
-        response: HubResponse::Plain {
-            e_sig: licash::wots::Hashes(vec![[4; 32]; 67]),
-        },
-        holder: witness.clone(),
-    };
-    let bytes = input.to_bytes().unwrap();
-    let decoded = StatementInput::from_bytes(&bytes).unwrap();
-    assert_eq!(decoded.to_bytes().unwrap(), bytes);
-    prove_holder(&o.base, &o.d, &request, &p, &decoded.holder).unwrap();
-    assert!(counter(&p, &request, Evidence::Expired { source: bob_id }).is_err());
-    assert!(counter(&p, &request, shared.clone()).is_err());
+    let activated = witness(vec![activation.inclusion.clone()]);
+    let uncontested = decide(&o, &request, &p, &activated, &[], Some(&chain)).unwrap();
+    assert_eq!((uncontested.owed, uncontested.ineligible), (12, None));
+    let expired = || Evidence::Expired { source: bob_id };
+    assert!(counter(&p, &request, &activated, expired()).is_err());
+    assert!(counter(&p, &request, &activated, shared.clone()).is_err());
     // The Pay preimage voids the holder's own refund; the rest stays owed.
-    let c = counter(
-        &p,
-        &request,
-        Evidence::PayPreimage {
-            source: own_id,
-            preimage: Z,
-        },
-    )
-    .unwrap();
-    assert_eq!((c.mask, c.owed), (0b100, 8));
-    // Voiding the refund publishes the preimage, which is what the payee of
-    // the lock needs to collect.
-    let posted = counter_disclosures(&[Evidence::PayPreimage {
+    let preimage = |preimage| Evidence::PayPreimage {
         source: own_id,
-        preimage: Z,
-    }])
-    .unwrap();
-    assert_eq!((posted.values[0], c.disclosure), (Z, posted.digest()));
-    assert!(counter(
-        &p,
-        &request,
-        Evidence::PayPreimage {
-            source: own_id,
-            preimage: [0; 32]
-        }
-    )
-    .is_err());
+        preimage,
+    };
+    let c = counter(&p, &request, &activated, preimage(Z)).unwrap();
+    assert_eq!((c.mask, c.owed), (0b100, 8));
+    // Voiding the refund discloses the preimage, which is what the payee of
+    // the lock needs to collect.
+    let posted = disclosures(&[preimage(Z)]).unwrap();
+    assert_eq!((posted.values[0], &c.disclosures), (Z, &posted));
+    assert!(counter(&p, &request, &activated, preimage([0; 32])).is_err());
 
     // Without an advertised activation, expiry or input sharing voids the Pay.
     let (p, request) = publish(vec![]);
-    let c = counter(&p, &request, Evidence::Expired { source: bob_id }).unwrap();
+    let plain = witness(vec![]);
+    let c = counter(&p, &request, &plain, expired()).unwrap();
     assert_eq!((c.mask, c.owed), (0b010, 8));
-    let input = CounterInput {
-        base: o.base.clone(),
-        prefix: prefix(&o.base),
-        publication: p.clone(),
-        evidence: vec![Evidence::Expired { source: bob_id }],
-        chain: Some(chain.clone()),
-    };
-    let decoded = CounterInput::from_bytes(&input.to_bytes().unwrap()).unwrap();
-    assert_eq!(decoded.run().unwrap(), c);
-    assert_eq!(counter(&p, &request, shared).unwrap().mask, 0b010);
+    assert_eq!(counter(&p, &request, &plain, shared).unwrap().mask, 0b010);
+    // The Hub can't shorten the chain to show an expiry it doesn't bury.
     let short = Chain::verify(
         chain.checkpoint().clone(),
         &chain.checkpoint().commitment(),
@@ -956,46 +542,11 @@ fn pending_sources_follow_activation_refund_and_preimage_rules() {
         100,
     )
     .unwrap();
-    assert!(prove_counter(
-        &o.base,
-        &o.d,
-        &request,
-        &p,
-        &[Evidence::Expired { source: bob_id }],
-        Some(&short)
-    )
-    .is_err());
+    assert!(decide(&o, &request, &p, &plain, &[expired()], Some(&short)).is_err());
 
-    // An advertised activation must be positively proven by the holder.
-    let (p, request) = publish(vec![record]);
-    witness.activations.clear();
-    assert!(prove_holder(&o.base, &o.d, &request, &p, &witness).is_err());
-}
-
-#[test]
-fn counter_k_carries_the_journal_values_and_rejects_other_layouts() {
-    use licash::{
-        recovery::CounterJournal,
-        statement::K_LEN,
-        statement::{counter_journal, counter_k},
-    };
-    let j = CounterJournal {
-        final_digest: [1; 32],
-        claim_digest: [2; 32],
-        mask: 0b10,
-        owed: 2048,
-        disclosure: [3; 32],
-    };
-    let k = counter_k(&j, &[9; 128]).unwrap();
-    assert_eq!(k.len(), K_LEN);
-    assert_eq!(counter_journal(&[1; 32], &[2; 32], &k, [3; 32]).unwrap(), j);
-    assert_ne!(counter_journal(&[1; 32], &[2; 32], &k, [4; 32]).unwrap(), j);
-    assert!(counter_k(&j, &[9; 127]).is_err());
-    let mut padded = k.clone();
-    padded[20] = 1;
-    assert!(counter_journal(&[1; 32], &[2; 32], &padded, [3; 32]).is_err());
-    assert_eq!(j.to_bytes()[64..72], [0, 0, 0, 2, 0, 0, 8, 0]);
-    assert_eq!(j.to_bytes()[72..], [3; 32]);
+    // An advertised activation must come with its inclusion.
+    let (p, _) = publish(vec![record]);
+    assert!(Filing::new(p, witness(vec![])).is_err());
 }
 
 /// The paper's example at half scale. Alice pays Bob 50 from a 128 note with
@@ -1010,7 +561,7 @@ struct Withheld {
     change: Vec<Derivation>,
     request: Request,
     publication: Publication,
-    witness: HolderWitness,
+    witness: Witness,
 }
 
 fn withheld() -> Withheld {
@@ -1068,20 +619,12 @@ fn withheld() -> Withheld {
         amount: 128,
         claim_digest: *publication.claim().digest(),
     };
-    let mut witnesses = vec![ItemWitness::Settled {
-        note: Box::new(note.clone()),
-        ownership: n.ownership(),
-    }];
-    witnesses.extend(change.iter().map(|d| ItemWitness::Pending {
-        ownership: d.ownership(),
-    }));
-    let witness = HolderWitness {
-        items: witnesses,
+    let witness = Witness {
+        notes: vec![note.clone()],
         sources: vec![SourceWitness::Signed {
             signed: signed.clone(),
             notes: vec![note.clone()],
         }],
-        chain: None,
         activations: vec![],
     };
     Withheld {
@@ -1101,18 +644,16 @@ fn withheld() -> Withheld {
 fn a_withheld_granted_payment_is_countered_only_by_publishing_its_unlock() {
     let w = withheld();
     let (o, keyset) = (&w.o, w.o.base.parts().keyset.clone());
-    // Without a counter Alice recovers her input in full.
-    let holder = prove_holder(&o.base, &o.d, &w.request, &w.publication, &w.witness).unwrap();
-    let owed = |response, holder| settle(&o.base, &o.d, &w.request, response, holder).unwrap();
-    assert_eq!(owed(Response::Plain, Some(&holder)).owed, 128);
+    let owed = |e: &[Evidence]| decide(o, &w.request, &w.publication, &w.witness, e, None);
+    // Unanswered, Alice recovers her input in full.
+    assert_eq!(owed(&[]).unwrap().owed, 128);
 
     let cite = |unlock| Evidence::Spend {
         signed: w.signed.clone(),
         notes: vec![w.note.clone()],
         unlock,
     };
-    let counter =
-        |e: Evidence| prove_counter(&o.base, &o.d, &w.request, &w.publication, &[e], None);
+    let counter = |e: Evidence| owed(&[e]);
     // The Hub cannot retire her input while keeping the unlock to itself.
     assert!(counter(cite(None)).is_err());
     assert!(counter(cite(Some([5; 32]))).is_err());
@@ -1127,19 +668,15 @@ fn a_withheld_granted_payment_is_countered_only_by_publishing_its_unlock() {
     )
     .is_err());
 
-    // The valid counter voids the input, values the change and commits the
-    // unlock it must publish.
-    let journal = counter(cite(Some(w.unlock))).unwrap();
-    assert_eq!((journal.mask, journal.owed), (1, 78));
-    let posted = counter_disclosures(&[cite(Some(w.unlock))]).unwrap();
+    // The valid evidence voids the input, values the change and names the
+    // unlock the Hub's response must disclose.
+    let c = counter(cite(Some(w.unlock))).unwrap();
+    assert_eq!((c.mask, c.owed), (1, 78));
+    let posted = disclosures(&[cite(Some(w.unlock))]).unwrap();
     assert_eq!(posted.values[0], w.unlock);
     assert!(posted.values[1..].iter().all(|slot| *slot == [0; 32]));
-    assert_eq!(journal.disclosure, posted.digest());
-    assert_ne!(
-        journal.disclosure,
-        counter_disclosures(&[cite(None)]).unwrap().digest()
-    );
-    assert_eq!(owed(Response::Counter(journal), Some(&holder)).owed, 78);
+    assert_eq!(c.disclosures, posted);
+    assert_ne!(c.disclosures, disclosures(&[cite(None)]).unwrap());
 
     // Bob, holding the grant, opens his 50 from the published slots alone;
     // Alice opens her change the same way.
@@ -1158,84 +695,6 @@ fn a_withheld_granted_payment_is_countered_only_by_publishing_its_unlock() {
     }
     assert_eq!(opened, 128);
     assert!(grant.unlock_in(&[[0; 32]; 32]).is_none());
-
-    // The counter guest's input carries the unlock through its codec.
-    let input = CounterInput {
-        base: o.base.clone(),
-        prefix: prefix(&o.base),
-        publication: w.publication.clone(),
-        evidence: vec![cite(Some(w.unlock))],
-        chain: None,
-    };
-    let bytes = input.to_bytes().unwrap();
-    assert_eq!(
-        CounterInput::from_bytes(&bytes).unwrap().run().unwrap(),
-        journal
-    );
-}
-
-/// Both programs read Bitcoin from Base's checkpoint. The Hub could never show
-/// that a lock timed on another checkpoint expired, so its Pay outputs are not
-/// claimable under this Base, whatever the claim says about an activation.
-#[test]
-fn pay_outputs_of_a_lock_timed_on_another_checkpoint_are_not_claimable() {
-    let o = open();
-    let keyset = o.base.parts().keyset.clone();
-    let prove = |terms: TimedTerms| {
-        let payer = HoldRoot::from_seed(&[9; 32]).unwrap();
-        let note = mint(&o.issuer, &keyset, &derive(41, &payer, 4, 29, 0));
-        let notes = std::slice::from_ref(&note);
-        let pay = derive(SPEND, &hold(), 4, 61, 0);
-        let lock = TimedLock::new(terms, vec![bob(4, 1)]).unwrap();
-        let outputs = vec![Output::from_derivation(&pay).unwrap()];
-        let body = Proposal::new(&keyset, notes, point(43), outputs, Some(lock)).unwrap();
-        let owners = [owner(41, 29, 0)];
-        let signed =
-            SignedProposal::sign(&keyset, body, notes, Authorization::Plain, &owners).unwrap();
-        let cert = Certificate::attest(&o.issuer, &signed, notes).unwrap();
-        let items = vec![Item::Pending {
-            message: pay.message().clone(),
-            source: signed.proposal().id(),
-            branch: Branch::Pay,
-            index: 0,
-            blinding: *pay.blinding(),
-            preimage: Some(Z),
-        }];
-        let signers = [pay.clone()];
-        let unsigned = claim(&o, items, vec![Source::Admitted(cert)], vec![], &signers, 4);
-        let p = Publication::sign(unsigned, &hold_keys(&signers), LIMIT).unwrap();
-        let request = Request {
-            amount: 4,
-            claim_digest: *p.claim().digest(),
-        };
-        let witness = HolderWitness {
-            items: vec![ItemWitness::Pending {
-                ownership: pay.ownership(),
-            }],
-            sources: vec![SourceWitness::Certified {
-                proposal: signed.proposal().clone(),
-                signatures: signed.signatures().to_vec(),
-            }],
-            chain: None,
-            activations: vec![],
-        };
-        prove_holder(&o.base, &o.d, &request, &p, &witness).map(|j| j.amount)
-    };
-    let here = terms();
-    assert_eq!(prove(here.clone()).unwrap(), 4);
-    let hash = *here.hash();
-    let elsewhere = TimedTerms::new(here.profile(), [7; 32], 4, 3, hash).unwrap();
-    let refused = prove(elsewhere).unwrap_err();
-    assert!(
-        refused.to_string().contains("another checkpoint"),
-        "{refused}"
-    );
-    let mainnet = TimedTerms::new(ChainProfile::Core30Mainnet, *here.checkpoint(), 4, 3, hash);
-    let refused = prove(mainnet.unwrap()).unwrap_err();
-    assert!(
-        refused.to_string().contains("another checkpoint"),
-        "{refused}"
-    );
 }
 
 /// A claim of the refund of an unsubmitted lock carries Q's authorization for
@@ -1282,28 +741,20 @@ fn second_claim_of_an_input_voids_the_outputs_of_a_lock_of_the_holders_own_notes
         amount: 8,
         claim_digest: *p.claim().digest(),
     };
-    let witness = HolderWitness {
-        items: vec![
-            ItemWitness::Settled {
-                note: Box::new(mint(&o.issuer, &keyset, &settled)),
-                ownership: settled.ownership(),
-            },
-            ItemWitness::Pending {
-                ownership: refund.ownership(),
-            },
-        ],
+    let witness = Witness {
+        notes: vec![mint(&o.issuer, &keyset, &settled)],
         sources: vec![SourceWitness::Signed {
             signed,
             notes: vec![own_note],
         }],
-        chain: None,
         activations: vec![],
     };
-    prove_holder(&o.base, &o.d, &request, &p, &witness).unwrap();
+    let owed = |e: &[Evidence]| decide(&o, &request, &p, &witness, e, None);
+    assert_eq!(owed(&[]).unwrap().owed, 8);
 
     // The locked note was claimed in another contract.
     let elsewhere = hold::Context {
-        final_digest: [1; 32],
+        base: [1; 32],
         deposit: [2; 36],
         amount: 4,
         claim_digest: [3; 32],
@@ -1315,11 +766,11 @@ fn second_claim_of_an_input_voids_the_outputs_of_a_lock_of_the_holders_own_notes
             .records()[0]
             .clone(),
     };
-    let c = prove_counter(&o.base, &o.d, &request, &p, &[second(&own)], None).unwrap();
+    let c = owed(&[second(&own)]).unwrap();
     assert_eq!((c.mask, c.owed), (0b10, 4));
     // A claim of a note that this one does not rely on is no evidence.
     let unrelated = derive(SPEND, &hold, 4, 23, 41);
-    assert!(prove_counter(&o.base, &o.d, &request, &p, &[second(&unrelated)], None).is_err());
+    assert!(owed(&[second(&unrelated)]).is_err());
 }
 
 /// The value left after a counter is capped by the request, whatever the
@@ -1352,7 +803,12 @@ fn surviving_value_beyond_u64_is_capped_at_the_request() {
         notes: notes[..1].to_vec(),
         unlock: None,
     };
-    let c = prove_counter(&o.base, &o.d, &request, &p, &[spent], None).unwrap();
+    let witness = Witness {
+        notes,
+        sources: vec![],
+        activations: vec![],
+    };
+    let c = decide(&o, &request, &p, &witness, &[spent], None).unwrap();
     assert_eq!((c.mask, c.owed), (0b1, 128));
 }
 
@@ -1376,7 +832,7 @@ fn second_claim_signature_cannot_be_assigned_to_a_different_note_with_the_same_q
         claim_digest: *p.claim().digest(),
     };
     let context = hold::Context {
-        final_digest: [1; 32],
+        base: [1; 32],
         deposit: [2; 36],
         amount: 4,
         claim_digest: [3; 32],
@@ -1385,7 +841,16 @@ fn second_claim_signature_cannot_be_assigned_to_a_different_note_with_the_same_q
     let mut record = envelope.records()[0].clone();
     record.message = second.message().clone();
     let evidence = Evidence::SecondClaim { context, record };
-    assert!(prove_counter(&o.base, &o.d, &request, &p, &[evidence], None).is_err());
+    let witness = Witness {
+        notes: vec![mint(&o.issuer, &o.base.parts().keyset, &second)],
+        sources: vec![],
+        activations: vec![],
+    };
+    assert_eq!(
+        decide(&o, &request, &p, &witness, &[], None).unwrap().owed,
+        8
+    );
+    assert!(decide(&o, &request, &p, &witness, &[evidence], None).is_err());
 }
 
 /// Input Q authority is required only for OwnInputs. Certified outputs belong
@@ -1430,13 +895,14 @@ fn input_claim_conflicts_preserve_certified_outputs_but_retire_all_own_outputs()
             });
             signers.push(d.clone());
         }
-        let mut activations = vec![];
+        let (mut activations, mut inclusions) = (vec![], vec![]);
         let source = if admitted {
             if branch == Branch::Pay {
                 activations.push(ActivationRecord {
                     source: id,
                     reference: activation.reference,
                 });
+                inclusions.push(activation.inclusion.clone());
             }
             Source::Admitted(cert.clone())
         } else {
@@ -1459,10 +925,26 @@ fn input_claim_conflicts_preserve_certified_outputs_but_retire_all_own_outputs()
             amount,
             claim_digest: *p.claim().digest(),
         };
-        (p, request)
+        let body = if admitted {
+            SourceWitness::Certified {
+                proposal: signed.proposal().clone(),
+                signatures: signed.signatures().to_vec(),
+            }
+        } else {
+            SourceWitness::Signed {
+                signed: signed.clone(),
+                notes: notes.clone(),
+            }
+        };
+        let witness = Witness {
+            notes: vec![mint(&o.issuer, &keyset, &settled)],
+            sources: vec![body],
+            activations: inclusions,
+        };
+        (p, request, witness)
     };
     let elsewhere = hold::Context {
-        final_digest: [1; 32],
+        base: [1; 32],
         deposit: [2; 36],
         amount: 4,
         claim_digest: [3; 32],
@@ -1474,26 +956,21 @@ fn input_claim_conflicts_preserve_certified_outputs_but_retire_all_own_outputs()
             .records()[0]
             .clone(),
     };
+    let e = std::slice::from_ref(&e);
     for branch in [Branch::Pay, Branch::Refund] {
-        let (p, r) = publish(branch, true, &[0, 1]);
-        assert!(prove_counter(
-            &o.base,
-            &o.d,
-            &r,
-            &p,
-            std::slice::from_ref(&e),
-            Some(&chain)
-        )
-        .is_err());
-        let (p, r) = publish(branch, false, &[0, 1]);
-        let c = prove_counter(&o.base, &o.d, &r, &p, std::slice::from_ref(&e), None).unwrap();
+        let (p, r, w) = publish(branch, true, &[0, 1]);
+        let eligible = decide(&o, &r, &p, &w, &[], Some(&chain)).unwrap();
+        assert_eq!((eligible.owed, eligible.ineligible), (12, None));
+        assert!(decide(&o, &r, &p, &w, e, Some(&chain)).is_err());
+        let (p, r, w) = publish(branch, false, &[0, 1]);
+        let c = decide(&o, &r, &p, &w, e, None).unwrap();
         assert_eq!((c.mask, c.owed), (0b110, 4));
     }
     // Even disjoint outputs of one OwnInputs source share its input Q
     // authorities: splitting this recovery across claims is not supported.
-    let (first, r1) = publish(Branch::Refund, false, &[0]);
-    let (second, r2) = publish(Branch::Refund, false, &[1]);
-    for (here, r, other) in [(&first, &r1, &second), (&second, &r2, &first)] {
+    let (first, r1, w1) = publish(Branch::Refund, false, &[0]);
+    let (second, r2, w2) = publish(Branch::Refund, false, &[1]);
+    for (here, r, w, other) in [(&first, &r1, &w1, &second), (&second, &r2, &w2, &first)] {
         let evidence = Evidence::SecondClaim {
             context: other.claim().hold_context(),
             record: other
@@ -1504,29 +981,13 @@ fn input_claim_conflicts_preserve_certified_outputs_but_retire_all_own_outputs()
                 .unwrap()
                 .clone(),
         };
-        let c = prove_counter(&o.base, &o.d, r, here, &[evidence], None).unwrap();
+        let c = decide(&o, r, here, w, &[evidence], None).unwrap();
         assert_eq!((c.mask, c.owed), (0b10, 4));
     }
 }
 
-// The hub-proves model: the holder files P with its public witness and
-// proves nothing; the Hub's statement (`recovery::owed`) decides what the
-// claim is owed.
-
-/// The filing's body as posted: one OP_RETURN of a transaction, read back.
-fn filed(filing: &Filing) -> Vec<u8> {
-    let tx = Transaction {
-        version: transaction::Version::TWO,
-        lock_time: absolute::LockTime::ZERO,
-        input: vec![TxIn::default()],
-        output: vec![TxOut {
-            value: Amount::ZERO,
-            script_pubkey: ScriptBuf::from_bytes(filing.script().unwrap()),
-        }],
-    };
-    let parsed = chain::Transaction::parse(&serialize(&tx), 100_000).unwrap();
-    Filing::body(&parsed).unwrap().to_vec()
-}
+// The holder files P with its public witness and proves nothing; the Hub's
+// statement (`recovery::owed`) decides what the claim is owed.
 
 /// `bytes` with the unique occurrence of `inside` replaced by `with`.
 fn swap(bytes: &[u8], inside: &[u8], with: &[u8]) -> Vec<u8> {
@@ -1579,18 +1040,17 @@ fn the_hub_decides_what_a_filed_claim_is_owed() {
     };
     let filing = Filing::new(
         p,
-        recovery::Witness {
+        Witness {
             notes: notes.clone(),
             sources: vec![],
             activations: vec![],
         },
     )
     .unwrap();
-    let bytes = filed(&filing);
-    assert_eq!(bytes, filing.to_bytes());
+    let bytes = filing.to_bytes();
     assert!(bytes.len() < 25_000, "{} bytes", bytes.len());
     let owed = |request: &Request, bytes: &[u8], evidence: &[Evidence]| {
-        recovery::owed(&o.base, &o.d, request, bytes, evidence, &chain)
+        recovery::owed(&o.base, request, bytes, evidence, &chain)
     };
 
     // Unanswered by evidence, the claim is owed in full: nothing to prove.
@@ -1605,22 +1065,9 @@ fn the_hub_decides_what_a_filed_claim_is_owed() {
     };
     let stale = owed(&request, &bytes, std::slice::from_ref(&spent)).unwrap();
     assert_eq!((stale.owed, stale.mask), (64, 0xffff));
-    let counter = prove_counter(
-        &o.base,
-        &o.d,
-        &request,
-        filing.publication(),
-        std::slice::from_ref(&spent),
-        None,
-    )
-    .unwrap();
-    assert_eq!(
-        (counter.owed, counter.mask, counter.disclosure),
-        (stale.owed, stale.mask, stale.disclosure)
-    );
     // A Q signature over any other claim, in any contract, voids its item.
     let other = hold::Context {
-        final_digest: [1; 32],
+        base: [1; 32],
         deposit: [2; 36],
         amount: 4,
         claim_digest: [3; 32],
@@ -1658,7 +1105,7 @@ fn the_hub_decides_what_a_filed_claim_is_owed() {
     assert!(owed(&request, &bytes, &[same]).is_err());
     let signet = Checkpoint::genesis(ChainProfile::Core30Signet).unwrap();
     let elsewhere = Chain::verify(signet.clone(), &signet.commitment(), vec![], 100).unwrap();
-    assert!(recovery::owed(&o.base, &o.d, &request, &bytes, &[], &elsewhere).is_err());
+    assert!(recovery::owed(&o.base, &request, &bytes, &[], &elsewhere).is_err());
 
     // A filing for another request is the holder's error: owed nothing, which
     // the Hub shows with no evidence (and may attach none).
@@ -1669,10 +1116,7 @@ fn the_hub_decides_what_a_filed_claim_is_owed() {
     let nothing = owed(&wrong, &bytes, &[]).unwrap();
     assert_eq!((nothing.owed, nothing.mask), (0, 0));
     assert!(nothing.ineligible.is_some());
-    assert_eq!(
-        nothing.disclosure,
-        counter_disclosures(&[]).unwrap().digest()
-    );
+    assert_eq!(nothing.disclosures, disclosures(&[]).unwrap());
     assert!(owed(&wrong, &bytes, &[spent]).is_err());
 }
 
@@ -1694,35 +1138,19 @@ fn a_note_is_claimed_in_any_contract_its_hold_key_designates() {
         amount: 8,
         claim_digest: *p.claim().digest(),
     };
-    // The holder-proves model refuses them: their owner keys don't derive
-    // from Base's spend root.
-    let witness = HolderWitness {
-        items: ds
-            .iter()
-            .zip(&notes)
-            .map(|(d, note)| ItemWitness::Settled {
-                note: Box::new(note.clone()),
-                ownership: d.ownership(),
-            })
-            .collect(),
-        sources: vec![],
-        chain: None,
-        activations: vec![],
-    };
-    assert!(prove_holder(&o.base, &o.d, &request, &p, &witness).is_err());
     // Filed, their Q signatures designate this contract, and they are owed.
     let signatures: Vec<_> = p.envelope().records().iter().map(|r| r.sig.0).collect();
     let filing = Filing::new(
         p,
-        recovery::Witness {
+        Witness {
             notes,
             sources: vec![],
             activations: vec![],
         },
     )
     .unwrap();
-    let bytes = filed(&filing);
-    let owed = |bytes: &[u8]| recovery::owed(&o.base, &o.d, &request, bytes, &[], &chain).unwrap();
+    let bytes = filing.to_bytes();
+    let owed = |bytes: &[u8]| recovery::owed(&o.base, &request, bytes, &[], &chain).unwrap();
     assert_eq!((owed(&bytes).owed, owed(&bytes).ineligible), (8, None));
 
     // Only the notes' Q keys designate. Another hold root (a payer's, say,
@@ -1767,16 +1195,16 @@ fn fabricated_or_malformed_filings_are_owed_nothing() {
     let file = |notes: Vec<Note>| {
         Filing::new(
             p.clone(),
-            recovery::Witness {
+            Witness {
                 notes,
                 sources: vec![],
                 activations: vec![],
             },
         )
     };
-    let bytes = filed(&file(notes.clone()).unwrap());
+    let bytes = file(notes.clone()).unwrap().to_bytes();
     let owed = |bytes: &[u8], evidence: &[Evidence]| {
-        recovery::owed(&o.base, &o.d, &request, bytes, evidence, &chain)
+        recovery::owed(&o.base, &request, bytes, evidence, &chain)
     };
     assert_eq!(owed(&bytes, &[]).unwrap().owed, 12);
     let nothing = |bytes: &[u8]| {
@@ -1938,17 +1366,17 @@ fn pending_items_are_eligible_by_their_sources_public_bodies() {
         };
         let filing = Filing::new(
             p,
-            recovery::Witness {
+            Witness {
                 notes: vec![settled_note.clone()],
                 sources: bodies.clone(),
                 activations: inclusions,
             },
         )
         .unwrap();
-        (filed(&filing), request)
+        (filing.to_bytes(), request)
     };
     let owed = |(bytes, request): &(Vec<u8>, Request), evidence: &[Evidence], chain: &Chain| {
-        recovery::owed(&o.base, &o.d, request, bytes, evidence, chain)
+        recovery::owed(&o.base, request, bytes, evidence, chain)
     };
     let nothing = |filed: &(Vec<u8>, Request), chain: &Chain| {
         let o = owed(filed, &[], chain).unwrap();
@@ -1976,10 +1404,7 @@ fn pending_items_are_eligible_by_their_sources_public_bodies() {
     assert!(owed(&activated, &[Evidence::Expired { source: bob_id }], &chain).is_err());
     let c = owed(&activated, std::slice::from_ref(&preimage), &chain).unwrap();
     assert_eq!((c.mask, c.owed), (0b100, 8));
-    assert_eq!(
-        c.disclosure,
-        counter_disclosures(&[preimage]).unwrap().digest()
-    );
+    assert_eq!(c.disclosures, disclosures(&[preimage]).unwrap());
     // Without an advertised activation, expiry voids the Pay.
     let plain = file(items(*refund.blinding()), sources(terms()), vec![], vec![]);
     let c = owed(&plain, &[Evidence::Expired { source: bob_id }], &chain).unwrap();
@@ -2066,7 +1491,7 @@ fn a_filed_pay_of_a_lock_timed_on_another_checkpoint_is_owed_nothing() {
         };
         let filing = Filing::new(
             p,
-            recovery::Witness {
+            Witness {
                 notes: vec![],
                 sources: vec![SourceWitness::Certified {
                     proposal: signed.proposal().clone(),
@@ -2076,7 +1501,7 @@ fn a_filed_pay_of_a_lock_timed_on_another_checkpoint_is_owed_nothing() {
             },
         )
         .unwrap();
-        recovery::owed(&o.base, &o.d, &request, &filed(&filing), &[], &chain).unwrap()
+        recovery::owed(&o.base, &request, &filing.to_bytes(), &[], &chain).unwrap()
     };
     let here = terms();
     assert_eq!(

@@ -1,147 +1,29 @@
-//! Canonical Base: the contract's terms, keys and programs, fixed before
-//! funding and committed by the final digest D.
+//! Canonical Base: the contract's terms, keys and program, fixed before
+//! the holder garbles for its statement, and committed by its digest
+//! ([`Base::digest`]): what every claim's context binds, and the word of
+//! the Hub's statement (`licash-hp`).
 //!
-//! Response keys are chosen independently before Base and use SHA-256 WOTS,
-//! not Alice's HASH160 request variant. K signs 160 bytes.
+//! The dispute is Lichen's hub-proves graph: the holder requests `b`, the
+//! Hub responds with what she is owed, `b′`, and proves it. Its payout
+//! rounds `b′` down to whole `2^low_bits` units (the bits below have no
+//! output): a holder recovering through a dispute loses less than
+//! `2^low_bits` satoshis to rounding, as she pays her own exit's fees.
 
 use crate::{
     chain::{Checkpoint, OutPoint},
-    crypto::{self, Point, Signature},
-    disclosure::CHUNK_DIGITS,
-    note::{non_identity, Keyset},
-    opening::FrozenPrefix,
-    payout::RecoveryBudget,
-    statement::HubKeys,
-    statement::K_DIGITS,
-    wots::{Hashes, B_DIGITS, MSG_DIGITS},
+    crypto,
+    note::Keyset,
     Error,
 };
 
-const BASE_TAG: &[u8] = b"LICASH-BASE\x02";
+const BASE_TAG: &[u8] = b"LICASH-BASE\x03";
 pub const MAX_BASE_BYTES: usize = 128_000;
 const MAX_MONEY: u64 = 2_100_000_000_000_000;
-
-const RESPONSE_TAG: &[u8] = b"LICASH-RSPK\x02";
-const ROLE_DIGITS: [usize; 10] = [
-    B_DIGITS,
-    MSG_DIGITS,
-    MSG_DIGITS,
-    K_DIGITS,
-    B_DIGITS,
-    CHUNK_DIGITS[0],
-    CHUNK_DIGITS[1],
-    CHUNK_DIGITS[2],
-    CHUNK_DIGITS[3],
-    CHUNK_DIGITS[4],
-];
-const ENDPOINTS: usize = 2 * B_DIGITS
-    + 2 * MSG_DIGITS
-    + K_DIGITS
-    + CHUNK_DIGITS[0]
-    + CHUNK_DIGITS[1]
-    + CHUNK_DIGITS[2]
-    + CHUNK_DIGITS[3]
-    + CHUNK_DIGITS[4];
-pub const RESPONSE_KEYS_BYTES: usize = RESPONSE_TAG.len() + 1 + 10 * 5 + ENDPOINTS * 32;
+/// The one graph a Base can name: Lichen's hub-proves graph.
+pub const GRAPH_VERSION: u32 = 2;
 
 fn bad(reason: &str) -> Error {
     Error::Protocol(reason.into())
-}
-
-/// Exact ten-role public response-key carrier, with no signing/admission
-/// authority. Shape checks prove neither independent secret generation nor
-/// one-time state. The funding gate must match retained Hub key material.
-#[derive(Clone, PartialEq, Eq)]
-pub struct ResponseKeys(HubKeys);
-
-impl std::fmt::Debug for ResponseKeys {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("ResponseKeys(..)")
-    }
-}
-
-impl ResponseKeys {
-    pub fn new(keys: HubKeys) -> Result<Self, Error> {
-        let keys = Self(keys);
-        if keys
-            .roles()
-            .iter()
-            .zip(ROLE_DIGITS)
-            .any(|(key, count)| key.len() != count)
-        {
-            return Err(bad("native sealed response-key shape"));
-        }
-        Ok(keys)
-    }
-
-    pub fn keys(&self) -> &HubKeys {
-        &self.0
-    }
-
-    fn roles(&self) -> [&Hashes; 10] {
-        let keys = &self.0;
-        [
-            &keys.b,
-            &keys.e_plain,
-            &keys.e_counter,
-            &keys.k,
-            &keys.b_corr,
-            &keys.disclosure[0],
-            &keys.disclosure[1],
-            &keys.disclosure[2],
-            &keys.disclosure[3],
-            &keys.disclosure[4],
-        ]
-    }
-
-    /// Canonical role count, ordered role tags, counted 32-byte endpoints.
-    /// This is not a serde/bincode encoding.
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(RESPONSE_KEYS_BYTES);
-        bytes.extend(RESPONSE_TAG);
-        bytes.push(10);
-        for (role, key) in self.roles().into_iter().enumerate() {
-            bytes.push(role as u8);
-            bytes.extend((key.len() as u32).to_be_bytes());
-            for endpoint in &key.0 {
-                bytes.extend(endpoint);
-            }
-        }
-        bytes
-    }
-
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
-        if bytes.len() != RESPONSE_KEYS_BYTES
-            || !bytes.starts_with(RESPONSE_TAG)
-            || bytes[RESPONSE_TAG.len()] != 10
-        {
-            return Err(bad("native response-key framing"));
-        }
-        let mut at = RESPONSE_TAG.len() + 1;
-        let mut keys = Vec::with_capacity(10);
-        for (role, count) in ROLE_DIGITS.into_iter().enumerate() {
-            if bytes[at] != role as u8
-                || u32::from_be_bytes(bytes[at + 1..at + 5].try_into().expect("fixed role header"))
-                    != count as u32
-            {
-                return Err(bad("native response-key role or count"));
-            }
-            at += 5;
-            let end = at + count * 32;
-            keys.push(Hashes(bytes[at..end].as_chunks::<32>().0.to_vec()));
-            at = end;
-        }
-        let [b, e_plain, e_counter, k, b_corr, d0, d1, d2, d3, d4] =
-            <[Hashes; 10]>::try_from(keys).expect("ten fixed roles");
-        Self::new(HubKeys {
-            b,
-            e_plain,
-            e_counter,
-            k,
-            b_corr,
-            disclosure: [d0, d1, d2, d3, d4],
-        })
-    }
 }
 
 /// Independent public party identities, holder first and Hub second. Payout
@@ -154,9 +36,9 @@ pub struct Party {
     pub payout_script: Vec<u8>,
 }
 
-/// Public parameters of the initial native Corrected graph recipe. Absolute
-/// deadlines in this recipe are block heights; old timestamp contracts stay
-/// unchanged. No duplicated request CSV or serialized graph funding value.
+/// The graph's public parameters (Lichen's `Terms`, `ChannelParams` and
+/// `Windows`). Absolute deadlines are block heights; windows are relative,
+/// in blocks.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GraphTerms {
     pub id: u32,
@@ -174,10 +56,20 @@ pub struct GraphTerms {
     pub delta: u16,
     pub delta_prime: u16,
     pub deadline_margin: u32,
+    /// The latest height of her request (`t_a`): the windows after it end
+    /// before `close_height`.
+    pub request_height: u32,
+    /// `w_H`: the Hub's response after her request.
     pub response_window: u16,
-    pub assert_height: u32,
-    pub hub_challenge: u16,
-    pub holder_answer: u16,
+    /// `k`: her claim's publication after her request; then the Hub may
+    /// reclaim the slot.
+    pub publication_window: u16,
+    /// `w_A`: the Hub's assertion after its response.
+    pub assert_window: u16,
+    /// `Δ2`: her challenge of the assertion.
+    pub challenge_window: u16,
+    /// `Δ1`: the Hub's answer to her challenge.
+    pub answer_window: u16,
 }
 
 impl GraphTerms {
@@ -186,6 +78,20 @@ impl GraphTerms {
             return Err(bad("native graph amount dimensions"));
         }
         Ok(((1u64 << self.bits) - 1) as u32)
+    }
+
+    /// The windows after her request, summed: none ends after
+    /// `close_height`.
+    fn dispute_blocks(&self) -> u32 {
+        [
+            self.response_window,
+            self.assert_window,
+            self.challenge_window,
+            self.answer_window,
+        ]
+        .into_iter()
+        .map(u32::from)
+        .sum()
     }
 
     pub fn graph_value(&self) -> Result<u64, Error> {
@@ -197,36 +103,26 @@ impl GraphTerms {
     }
 }
 
-/// Static recipe parameters and program identities, not generated instance
-/// hashes or verifying keys produced under D. The funding gate must recognize
-/// the actual recipe/programs; this unsigned carrier does not claim they exist.
+/// The statement's program and the cut-and-choose: the holder garbles
+/// `instances` for it, of which the Hub keeps `kept`. The program is the
+/// image id of the Hub's statement's guest; each party checks it is one it
+/// trusts before garbling or funding.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Recipe {
     pub graph_version: u32,
-    pub holder_program: [u8; 32],
-    pub counter_program: [u8; 32],
-    pub full_instances: u16,
-    pub full_kept: u16,
-    pub corrected_instances: u16,
-    pub corrected_kept: u16,
-}
-
-/// The proof programs a party trusts: the image ids it built or audited.
-/// Base only names programs; each funding gate compares them with these.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Programs {
-    pub holder: [u8; 32],
-    pub counter: [u8; 32],
+    pub program: [u8; 32],
+    pub instances: u16,
+    pub kept: u16,
 }
 
 #[derive(Clone, Debug)]
 pub struct ChainTerms {
     pub checkpoint: Checkpoint,
     pub funding_depth: u32,
-    pub request_depth: u32,
-    pub publication_depth: u32,
-    pub lookback: u32,
-    pub observation_margin: u32,
+    /// The work `W` the statement wants on top of the exit's last event,
+    /// in blocks at the checkpoint's difficulty.
+    pub work_depth: u32,
+    /// The statement's header budget from the checkpoint.
     pub max_headers: u32,
 }
 
@@ -238,12 +134,9 @@ pub struct Limits {
     pub max_source_inputs: u32,
 }
 
-/// Fee ceilings are explicit Base terms. The actual quote and all terminal
-/// reserve/fee-resource checks remain mandatory before funding signatures.
+/// Fee terms: the quote's rate ceiling and the opening's fee.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Fees {
-    pub sweep_fee_max: u64,
-    pub external_fee_max: u64,
     pub max_rate_sat_per_kvb: u64,
     pub opening_fee_quote: u64,
 }
@@ -251,13 +144,12 @@ pub struct Fees {
 #[derive(Clone)]
 pub struct Parts {
     pub nonce: [u8; 32],
-    pub spend_root: Point,
+    /// The holder's key authorizing her claim's publication.
     pub claim_key: [u8; 32],
     pub keyset: Keyset,
     /// Bitcoin outpoint bytes: raw txid followed by little-endian vout.
     pub deposit: [u8; 36],
     pub cap: u32,
-    pub response_keys: ResponseKeys,
     pub parties: [Party; 2],
     pub graph: GraphTerms,
     pub recipe: Recipe,
@@ -274,23 +166,6 @@ pub struct Base(Parts);
 impl std::fmt::Debug for Base {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("Base(..)")
-    }
-}
-
-/// Deliberately not interchangeable with the raw independent Base key context.
-/// No constructor from peer-supplied bytes or funding/admission authority.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub struct FinalDigest([u8; 32]);
-
-impl std::fmt::Debug for FinalDigest {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("FinalDigest(..)")
-    }
-}
-
-impl FinalDigest {
-    pub fn as_bytes(&self) -> &[u8; 32] {
-        &self.0
     }
 }
 
@@ -321,18 +196,8 @@ impl Base {
         }
     }
 
-    pub fn recovery_budget(&self) -> Result<RecoveryBudget, Error> {
-        RecoveryBudget::new(
-            self.0.graph.unit_sats,
-            self.0.graph.low_bits,
-            self.0.fees.sweep_fee_max,
-            self.0.fees.external_fee_max,
-        )
-    }
-
     fn validate(&self) -> Result<(), Error> {
         let p = &self.0;
-        non_identity(&p.spend_root)?;
         for key in [&p.claim_key].into_iter().chain(
             p.parties
                 .iter()
@@ -354,31 +219,34 @@ impl Base {
             }
         }
         let g = &p.graph;
-        let budget = self.recovery_budget()?;
         g.graph_value()?;
-        if g.dust != 330
+        let c = &p.chain;
+        if g.unit_sats != 1
+            || g.dust != 330
             || (1u64 << g.low_bits) < g.dust
             || g.reserve_alice < g.dust
-            || g.reserve_hub < budget.minimum_surplus()
+            || g.reserve_hub < g.dust
             || g.deposit_units > g.maximum_amount()?
             || g.to_self_delay == 0
             || g.delta == 0
             || g.delta_prime == 0
             || g.deadline_margin == 0
-            || g.response_window <= 1
-            || g.hub_challenge <= 1
-            || g.holder_answer <= 1
-            || g.assert_height <= p.chain.checkpoint.height()
-            || g.assert_height >= g.close_height
+            || g.publication_window <= 1
+            || g.response_window <= g.publication_window + 1
+            || u32::from(g.assert_window) <= c.work_depth + 1
+            || g.challenge_window <= 1
+            || g.answer_window <= 1
+            || g.request_height <= c.checkpoint.height()
             || g.close_height >= 500_000_000
+            || g.request_height
+                .checked_add(g.dispute_blocks())
+                .is_none_or(|end| end > g.close_height)
         {
             return Err(bad("native graph profile terms"));
         }
         if [
             g.commit_fee,
             g.presign_fee,
-            p.fees.sweep_fee_max,
-            p.fees.external_fee_max,
             p.fees.opening_fee_quote,
             p.fees.max_rate_sat_per_kvb,
         ]
@@ -388,19 +256,17 @@ impl Base {
         {
             return Err(bad("native fee quote range"));
         }
-        // Both programs read Bitcoin as a header chain from the checkpoint,
-        // and a statement can be needed until the assertion deadline. A
+        // The statement reads Bitcoin as a header chain from the checkpoint
+        // through the work on the Hub's response to the latest request. A
         // budget that ends earlier would leave a late recovery unprovable.
-        let c = &p.chain;
         if c.max_headers == 0
             || u64::from(c.checkpoint.height()) + u64::from(c.max_headers)
-                < u64::from(g.assert_height)
-            || [c.funding_depth, c.request_depth, c.publication_depth]
+                < u64::from(g.request_height)
+                    + u64::from(g.response_window)
+                    + u64::from(c.work_depth)
+            || [c.funding_depth, c.work_depth]
                 .into_iter()
                 .any(|depth| depth == 0 || depth > c.max_headers)
-            || c.observation_margin
-                .checked_add(c.request_depth)
-                .is_none_or(|need| need > u32::from(g.response_window))
         {
             return Err(bad("native chain confirmation profile"));
         }
@@ -414,14 +280,10 @@ impl Base {
             return Err(bad("native resource limits"));
         }
         let r = &p.recipe;
-        if r.graph_version != 1
-            || r.holder_program == [0; 32]
-            || r.counter_program == [0; 32]
-            || r.holder_program == r.counter_program
-            || r.full_kept == 0
-            || r.full_kept >= r.full_instances
-            || r.corrected_kept == 0
-            || r.corrected_kept >= r.corrected_instances
+        if r.graph_version != GRAPH_VERSION
+            || r.program == [0; 32]
+            || r.kept == 0
+            || r.kept >= r.instances
         {
             return Err(bad("native static recipe identity"));
         }
@@ -432,12 +294,10 @@ impl Base {
         let p = &self.0;
         let mut bytes = BASE_TAG.to_vec();
         bytes.extend(p.nonce);
-        bytes.extend(p.spend_root.0);
         bytes.extend(p.claim_key);
         put_blob(&mut bytes, &p.keyset.to_bytes());
         bytes.extend(p.deposit);
         bytes.extend(p.cap.to_be_bytes());
-        bytes.extend(p.response_keys.to_bytes());
         for party in &p.parties {
             bytes.extend(party.funding);
             bytes.extend(party.payment);
@@ -460,32 +320,26 @@ impl Base {
         bytes.extend(g.delta.to_be_bytes());
         bytes.extend(g.delta_prime.to_be_bytes());
         bytes.extend(g.deadline_margin.to_be_bytes());
-        bytes.extend(g.response_window.to_be_bytes());
-        bytes.extend(g.assert_height.to_be_bytes());
-        bytes.extend(g.hub_challenge.to_be_bytes());
-        bytes.extend(g.holder_answer.to_be_bytes());
+        bytes.extend(g.request_height.to_be_bytes());
+        for window in [
+            g.response_window,
+            g.publication_window,
+            g.assert_window,
+            g.challenge_window,
+            g.answer_window,
+        ] {
+            bytes.extend(window.to_be_bytes());
+        }
         let r = &p.recipe;
         bytes.extend(r.graph_version.to_be_bytes());
-        bytes.push(2); // Corrected only
-        bytes.extend(32u32.to_be_bytes()); // Actual item/unlock capacity, not a source-input cap.
-        bytes.extend(r.holder_program);
-        bytes.extend(r.counter_program);
-        for count in [
-            r.full_instances,
-            r.full_kept,
-            r.corrected_instances,
-            r.corrected_kept,
-        ] {
-            bytes.extend(count.to_be_bytes());
-        }
+        bytes.extend(r.program);
+        bytes.extend(r.instances.to_be_bytes());
+        bytes.extend(r.kept.to_be_bytes());
         let c = &p.chain;
         put_blob(&mut bytes, &c.checkpoint.to_bytes());
         for value in [
             c.funding_depth,
-            c.request_depth,
-            c.publication_depth,
-            c.lookback,
-            c.observation_margin,
+            c.work_depth,
             c.max_headers,
             p.limits.max_transaction_bytes,
             p.limits.max_publication_bytes,
@@ -494,12 +348,7 @@ impl Base {
         ] {
             bytes.extend(value.to_be_bytes());
         }
-        for value in [
-            p.fees.sweep_fee_max,
-            p.fees.external_fee_max,
-            p.fees.max_rate_sat_per_kvb,
-            p.fees.opening_fee_quote,
-        ] {
+        for value in [p.fees.max_rate_sat_per_kvb, p.fees.opening_fee_quote] {
             bytes.extend(value.to_be_bytes());
         }
         bytes
@@ -514,12 +363,10 @@ impl Base {
             return Err(bad("native Base tag"));
         }
         let nonce = reader.array()?;
-        let spend_root = Point(reader.array()?);
         let claim_key = reader.array()?;
         let keyset = Keyset::from_bytes(reader.blob(4_096)?)?;
         let deposit = reader.array()?;
         let cap = reader.u32()?;
-        let response_keys = ResponseKeys::from_bytes(reader.take(RESPONSE_KEYS_BYTES)?)?;
         let mut parties = Vec::with_capacity(2);
         for _ in 0..2 {
             parties.push(Party {
@@ -545,31 +392,23 @@ impl Base {
             delta: reader.u16()?,
             delta_prime: reader.u16()?,
             deadline_margin: reader.u32()?,
+            request_height: reader.u32()?,
             response_window: reader.u16()?,
-            assert_height: reader.u32()?,
-            hub_challenge: reader.u16()?,
-            holder_answer: reader.u16()?,
+            publication_window: reader.u16()?,
+            assert_window: reader.u16()?,
+            challenge_window: reader.u16()?,
+            answer_window: reader.u16()?,
         };
-        let graph_version = reader.u32()?;
-        if reader.array::<1>()? != [2] || reader.u32()? != 32 {
-            return Err(bad("native Corrected capacity recipe"));
-        }
         let recipe = Recipe {
-            graph_version,
-            holder_program: reader.array()?,
-            counter_program: reader.array()?,
-            full_instances: reader.u16()?,
-            full_kept: reader.u16()?,
-            corrected_instances: reader.u16()?,
-            corrected_kept: reader.u16()?,
+            graph_version: reader.u32()?,
+            program: reader.array()?,
+            instances: reader.u16()?,
+            kept: reader.u16()?,
         };
         let chain = ChainTerms {
             checkpoint: Checkpoint::from_bytes(reader.blob(256)?)?,
             funding_depth: reader.u32()?,
-            request_depth: reader.u32()?,
-            publication_depth: reader.u32()?,
-            lookback: reader.u32()?,
-            observation_margin: reader.u32()?,
+            work_depth: reader.u32()?,
             max_headers: reader.u32()?,
         };
         let limits = Limits {
@@ -579,8 +418,6 @@ impl Base {
             max_source_inputs: reader.u32()?,
         };
         let fees = Fees {
-            sweep_fee_max: reader.u64()?,
-            external_fee_max: reader.u64()?,
             max_rate_sat_per_kvb: reader.u64()?,
             opening_fee_quote: reader.u64()?,
         };
@@ -589,12 +426,10 @@ impl Base {
         }
         Self::new(Parts {
             nonce,
-            spend_root,
             claim_key,
             keyset,
             deposit,
             cap,
-            response_keys,
             parties: parties.try_into().expect("two fixed parties"),
             graph,
             recipe,
@@ -605,151 +440,38 @@ impl Base {
     }
 
     pub fn digest(&self) -> [u8; 32] {
-        crypto::tagged_hash("licash/base/v2", &[&self.to_bytes()])
+        crypto::tagged_hash("licash/base/v3", &[&self.to_bytes()])
     }
 
-    /// Bind known Base terms to the actual prefix, without certifying its full
-    /// tree or authorizing funding. Publication coin outpoints are deliberately
-    /// excluded: their plain scripts depend on the Base-derived Alice E key.
-    pub fn final_digest(&self, prefix: &FrozenPrefix) -> Result<FinalDigest, Error> {
-        let digest = self.digest();
-        if prefix.bound_base()? != &digest {
-            return Err(bad("frozen prefix Base mismatch"));
-        }
-        let p = &self.0;
-        if prefix.leaf().alice() != &p.parties[0].payment
-            || prefix.leaf().hub() != &p.parties[1].payment
-            || prefix.leaf().delay() != p.graph.to_self_delay
-            || prefix.funding_graph().output.value != p.graph.graph_value()?
-            || prefix
-                .funding()
-                .inputs()
-                .iter()
-                .filter(|input| input.previous == self.deposit_outpoint())
-                .count()
-                != 1
-        {
-            return Err(bad("native Base named-deposit or prefix terms mismatch"));
-        }
-        Ok(FinalDigest(crypto::tagged_hash(
-            "licash/final-statement/v2",
-            &[&digest, &prefix.commitment()],
-        )))
-    }
-
-    pub fn owner_consent_message(&self, prefix: &FrozenPrefix) -> Result<[u8; 32], Error> {
-        Ok(crypto::tagged_hash(
-            "licash/authorize-opening/v2",
-            &[self.final_digest(prefix)?.as_bytes()],
-        ))
-    }
-
-    /// Owner agreement only. The funding gate must independently compare its
-    /// own agreed Base, native/confirmed reserved coins, complete graph recipe,
-    /// every real instance/presignature, fee resource and actual deadline.
-    pub fn verify_owner_consent(
-        &self,
-        prefix: &FrozenPrefix,
-        signature: &Signature,
-    ) -> Result<(), Error> {
-        crypto::schnorr_verify(
-            &self.0.spend_root.x_only(),
-            &self.owner_consent_message(prefix)?,
-            signature,
-        )
-    }
-
-    /// Checks shared by both funding gates. `expected_graph` is the F graph
-    /// output script the caller compiled itself from this Base, the derived
-    /// request keys and the actual instances, never the peer's assertion.
-    fn check_opening(
-        &self,
-        prefix: &FrozenPrefix,
-        expected_graph: &[u8],
-        trusted: &Programs,
-        tip_height: u32,
-    ) -> Result<FinalDigest, Error> {
-        let d = self.final_digest(prefix)?;
-        // A counter program that accepts anything would let the Hub void any
-        // claim; a holder program that does would let the holder take the cap.
-        if self.0.recipe.holder_program != trusted.holder
-            || self.0.recipe.counter_program != trusted.counter
-        {
-            return Err(bad(
-                "opening names proof programs this party does not trust",
-            ));
-        }
-        if prefix.funding_graph().output.script != expected_graph {
-            return Err(bad("funded graph differs from the locally compiled graph"));
+    /// What each party checks of agreed terms before it garbles or funds:
+    /// the statement's program is the one it trusts (a program that
+    /// accepts anything would let the Hub void any claim), and F funded
+    /// at `tip_height` still lets her request in time.
+    pub fn check(&self, trusted: &[u8; 32], tip_height: u32) -> Result<(), Error> {
+        if &self.0.recipe.program != trusted {
+            return Err(bad("opening names a program this party does not trust"));
         }
         if !self.fundable_at(tip_height) {
             return Err(bad(
                 "opening cannot complete a recovery before its deadline",
             ));
         }
-        Ok(d)
+        Ok(())
     }
 
-    /// Whether F funded at `tip_height` still lets the holder complete a
-    /// recovery before the assertion deadline, as both funding gates
-    /// require: F buried, the exit's delay, her request buried and the
-    /// hub's response window, with the deadline margin to spare.
+    /// Whether F funded at `tip_height` still lets the holder request by
+    /// the latest height for it: F buried, then the request's delay, with
+    /// the deadline margin to spare.
     pub fn fundable_at(&self, tip_height: u32) -> bool {
         let g = &self.0.graph;
         [
             self.0.chain.funding_depth,
             u32::from(g.to_self_delay),
-            self.0.chain.request_depth,
-            u32::from(g.response_window),
             g.deadline_margin,
         ]
         .into_iter()
         .try_fold(tip_height, |sum, step| sum.checked_add(step))
-        .is_some_and(|height| height <= g.assert_height)
-    }
-
-    /// Holder funding gate: trusted proof programs, own request keys, own spending root, compiled
-    /// graph and deadline, then consent. Release funding signatures only after
-    /// this returns, and record the consent durably before releasing them.
-    pub fn holder_gate(
-        &self,
-        prefix: &FrozenPrefix,
-        expected_graph: &[u8],
-        trusted: &Programs,
-        seed: &[u8; 32],
-        spend_secret: &k256::Scalar,
-        tip_height: u32,
-    ) -> Result<Signature, Error> {
-        self.check_opening(prefix, expected_graph, trusted, tip_height)?;
-        if prefix.leaf().keys() != &crate::request::Signer::derive(seed, &self.digest()).public() {
-            return Err(bad("request keys are not the holder's own"));
-        }
-        if crypto::x_only_pub(spend_secret) != self.0.spend_root.x_only()
-            || crypto::Point::from_projective(&crypto::generator_mul(spend_secret))
-                != self.0.spend_root
-        {
-            return Err(bad("spending root is not the holder's"));
-        }
-        crypto::schnorr_sign(spend_secret, &self.owner_consent_message(prefix)?)
-    }
-
-    /// Hub funding gate: retained response keys, compiled graph, deadline and
-    /// the holder's consent. The Hub signs F's inputs only after this.
-    pub fn hub_gate(
-        &self,
-        prefix: &FrozenPrefix,
-        expected_graph: &[u8],
-        trusted: &Programs,
-        retained: &ResponseKeys,
-        consent: &Signature,
-        tip_height: u32,
-    ) -> Result<FinalDigest, Error> {
-        let d = self.check_opening(prefix, expected_graph, trusted, tip_height)?;
-        if retained != &self.0.response_keys {
-            return Err(bad("response keys are not the Hub's retained keys"));
-        }
-        self.verify_owner_consent(prefix, consent)?;
-        Ok(d)
+        .is_some_and(|height| height <= g.request_height)
     }
 }
 

@@ -18,10 +18,12 @@ fn bad(reason: &str) -> Error {
 }
 
 /// Opaque expected request binding. This type does not verify the opening,
-/// deposit, amount or composition of E. Final D is not a key-derivation input.
+/// deposit, amount or composition of E. The Base digest is not a
+/// key-derivation input.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Context {
-    pub final_digest: [u8; 32],
+    /// The opening's Base digest ([`crate::base::Base::digest`]).
+    pub base: [u8; 32],
     pub deposit: [u8; 36],
     pub amount: u32,
     pub claim_digest: [u8; 32],
@@ -36,7 +38,7 @@ impl std::fmt::Debug for Context {
 impl Context {
     fn bytes(&self) -> [u8; CONTEXT_BYTES] {
         let mut bytes = [0; CONTEXT_BYTES];
-        bytes[..32].copy_from_slice(&self.final_digest);
+        bytes[..32].copy_from_slice(&self.base);
         bytes[32..68].copy_from_slice(&self.deposit);
         bytes[68..72].copy_from_slice(&self.amount.to_be_bytes());
         bytes[72..].copy_from_slice(&self.claim_digest);
@@ -55,7 +57,7 @@ impl Context {
 
     fn from_bytes(bytes: &[u8]) -> Self {
         Self {
-            final_digest: bytes[..32].try_into().expect("checked context width"),
+            base: bytes[..32].try_into().expect("checked context width"),
             deposit: bytes[32..68].try_into().expect("checked context width"),
             amount: u32::from_be_bytes(bytes[68..72].try_into().expect("checked context width")),
             claim_digest: bytes[72..].try_into().expect("checked context width"),

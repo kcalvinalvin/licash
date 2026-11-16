@@ -31,7 +31,8 @@ fn count(n: usize) -> Result<[u8; 4], Error> {
 /// not authorize them; the complete predicate must verify the actual opening.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Context {
-    pub final_digest: [u8; 32],
+    /// The opening's Base digest ([`crate::base::Base::digest`]).
+    pub base: [u8; 32],
     pub deposit: [u8; 36],
     pub cap: u32,
 }
@@ -357,7 +358,7 @@ impl UnsignedClaim {
         let body_root = tagged_hash(
             "licash/claim-body/v2",
             &[
-                &context.final_digest,
+                &context.base,
                 &context.deposit,
                 keyset.id(),
                 &amount.to_be_bytes(),
@@ -399,7 +400,7 @@ impl UnsignedClaim {
     }
     pub fn hold_context(&self) -> hold::Context {
         hold::Context {
-            final_digest: self.context.final_digest,
+            base: self.context.base,
             deposit: self.context.deposit,
             amount: self.amount,
             claim_digest: self.digest,

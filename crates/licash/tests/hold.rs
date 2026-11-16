@@ -24,7 +24,7 @@ fn messages(entries: &[(Message, ScalarBytes)]) -> Vec<Message> {
 
 fn context(root: &[u8; 32]) -> Context {
     Context {
-        final_digest: [31; 32],
+        base: [31; 32],
         deposit: [37; 36],
         amount: 128,
         // Test fixture only, not a complete native claim/E formula.
@@ -45,7 +45,7 @@ fn thirty_two_hold_records_sign_only_with_their_independent_q_keys() {
         let digest = crypto::tagged_hash(
             "licash/hold-note-authorization/v2",
             &[
-                &ctx.final_digest,
+                &ctx.base,
                 &ctx.deposit,
                 &ctx.amount.to_be_bytes(),
                 &ctx.claim_digest,
@@ -75,7 +75,7 @@ fn request_final_digest_deposit_amount_and_e_are_all_scoped() {
     for field in 0..4 {
         let mut changed = ctx;
         match field {
-            0 => changed.final_digest[0] ^= 1,
+            0 => changed.base[0] ^= 1,
             1 => changed.deposit[0] ^= 1,
             2 => changed.amount += 1,
             _ => changed.claim_digest[0] ^= 1,
@@ -173,7 +173,7 @@ fn context_only_signatures_are_not_accepted_as_note_authorizations() {
     let old_digest = crypto::tagged_hash(
         "licash/hold-authorization/v2",
         &[
-            &ctx.final_digest,
+            &ctx.base,
             &ctx.deposit,
             &ctx.amount.to_be_bytes(),
             &ctx.claim_digest,
