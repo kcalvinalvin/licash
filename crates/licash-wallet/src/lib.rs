@@ -161,6 +161,10 @@ pub enum Error {
     UnknownPayment(String),
     #[error("{needed} needed, {available} available in one payment")]
     Insufficient { needed: u64, available: u64 },
+    /// More than the wallet agreed to pay there
+    /// ([`Wallet::set_fee_ceilings`]): its owner's to approve.
+    #[error("hub {hub} charges more than agreed: approve its fees to pay there")]
+    FeesRaised { hub: String },
     /// Another payment took a note meanwhile: nothing was paid.
     #[error("another payment took a note meanwhile: try again")]
     NoteTaken,
@@ -447,6 +451,8 @@ pub struct Wallet<T> {
     told_coins: Mutex<HashMap<[u8; 32], Told>>,
     /// The most it pays to renew notes, in parts per million of their value.
     renew_ppm: AtomicU32,
+    /// The most each hub may charge ([`Wallet::set_fee_ceilings`]).
+    ceilings: Mutex<HashMap<i64, licash_api::Fees>>,
 }
 
 /// A payout's coin as its provider told of it: its transaction, and its
@@ -506,6 +512,7 @@ impl<T: Transport> Wallet<T> {
             asked_secure: Mutex::default(),
             told_coins: Mutex::default(),
             renew_ppm: AtomicU32::new(RENEW_PPM),
+            ceilings: Mutex::default(),
         })
     }
 
@@ -542,6 +549,7 @@ impl<T: Transport> Wallet<T> {
             asked_secure: Mutex::default(),
             told_coins: Mutex::default(),
             renew_ppm: AtomicU32::new(RENEW_PPM),
+            ceilings: Mutex::default(),
         })
     }
 
@@ -562,6 +570,51 @@ impl<T: Transport> Wallet<T> {
     /// The most the wallet pays to renew notes ([`Wallet::set_renew_limit`]).
     pub fn renew_limit(&self) -> u32 {
         self.renew_ppm.load(Ordering::Relaxed)
+    }
+
+    /// Pay the hub at `url`, a hub the wallet knows, no fee above its
+    /// like in `ceilings`, as its owner agreed to there (the fees a
+    /// recovery contract opened under, say): while it charges more,
+    /// payments and locks there are refused as [`Error::FeesRaised`] and
+    /// its notes are not renewed, until the ceilings are raised. Under
+    /// them, notes are renewed whatever [`Wallet::set_renew_limit`] says.
+    /// None lifts them. Kept while the wallet is open only: whoever opens
+    /// it sets them.
+    pub fn set_fee_ceilings(
+        &self,
+        url: &str,
+        ceilings: Option<licash_api::Fees>,
+    ) -> Result<(), Error> {
+        let (hub, _) = self.hub(&hub_url(url)?)?;
+        let mut kept = self.ceilings.lock().unwrap_or_else(|e| e.into_inner());
+        match ceilings {
+            Some(ceilings) => kept.insert(hub, ceilings),
+            None => kept.remove(&hub),
+        };
+        Ok(())
+    }
+
+    /// The most the hub at `url` may charge, if set
+    /// ([`Wallet::set_fee_ceilings`]).
+    pub fn fee_ceilings(&self, url: &str) -> Result<Option<licash_api::Fees>, Error> {
+        let (hub, _) = self.hub(&hub_url(url)?)?;
+        Ok(self.ceilings_of(hub))
+    }
+
+    fn ceilings_of(&self, hub: i64) -> Option<licash_api::Fees> {
+        let kept = self.ceilings.lock().unwrap_or_else(|e| e.into_inner());
+        kept.get(&hub).copied()
+    }
+
+    /// What the hub `hub`, at `url`, charges, as `info` says: refused if
+    /// more than its ceilings.
+    fn agreed_fees(&self, hub: i64, url: &str, info: &Info) -> Result<licash_api::Fees, Error> {
+        match self.ceilings_of(hub) {
+            Some(ceilings) if info.fees.above(&ceilings) => Err(Error::FeesRaised {
+                hub: url.to_owned(),
+            }),
+            _ => Ok(info.fees),
+        }
     }
 
     /// How the wallet reaches its hubs, for what it does not ask itself.
@@ -1096,7 +1149,8 @@ impl<T: Transport> Wallet<T> {
 
     async fn send_once(&self, url: &str, payee: &Address, amount: u64) -> Result<Paid, Error> {
         let (hub, info) = self.hub(url)?;
-        let (keyset, selection) = self.select(hub, amount, &info.fees.spending())?;
+        let fees = self.agreed_fees(hub, url, &info)?;
+        let (keyset, selection) = self.select(hub, amount, &fees.spending())?;
         let inputs = self.notes_of(&keyset, &selection.inputs)?;
         let me = self.address();
         let ephemeral = Ephemeral::random();

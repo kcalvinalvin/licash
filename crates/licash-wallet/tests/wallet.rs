@@ -845,6 +845,53 @@ async fn a_renewal_counts_the_notes_it_makes_in_its_fee_and_its_limit() {
 }
 
 #[tokio::test]
+async fn a_hub_charging_more_than_agreed_is_not_paid_until_its_fees_are_approved() {
+    let fee = Fee { base: 1, ppm: 0 };
+    let net = charging(fee);
+    let (alice, bob) = (party(&net, 1).await, party(&net, 2).await);
+    alice.receive(&net.pay(HUB, &alice.address(), 100)).unwrap();
+    assert_eq!(alice.fee_ceilings(HUB).unwrap(), None);
+    assert!(matches!(
+        alice.set_fee_ceilings("http://other.test", None),
+        Err(Error::UnknownHub(_))
+    ));
+
+    // Agreed to less than it charges, in one fee of them: nothing is paid
+    // there, though what it would cost is still told.
+    let charged = alice.hubs().unwrap()[0].1.fees;
+    let agreed = licash_api::Fees {
+        spend: Fee::default(),
+        ..charged
+    };
+    alice.set_fee_ceilings(HUB, Some(agreed)).unwrap();
+    assert_eq!(alice.fee_ceilings(HUB).unwrap(), Some(agreed));
+    assert!(matches!(
+        alice.send(HUB, &bob.address(), 10).await,
+        Err(Error::FeesRaised { hub }) if hub == HUB
+    ));
+    assert_eq!(alice.send_fee(HUB, 10).unwrap(), 1);
+    assert_eq!(available(&alice), (100, 0));
+    assert!(alice.sends().unwrap().is_empty());
+    // Nor are its notes renewed, whatever the limit.
+    net.restart(HUB);
+    alice.set_renew_limit(1_000_000);
+    assert_eq!(alice.unlink().await.unwrap(), 0);
+    assert!(renewals(&alice).is_empty());
+
+    // Approved, it is paid, and its notes renewed whatever the limit.
+    alice.set_fee_ceilings(HUB, Some(charged)).unwrap();
+    alice.set_renew_limit(0);
+    assert!(alice.unlink().await.unwrap() > 0);
+    assert_eq!(available(&alice), (99, 0));
+    let payment = alice.send(HUB, &bob.address(), 10).await.unwrap().payment;
+    assert_eq!(bob.receive(&payment).unwrap().amount, 10);
+
+    // Lifted, the limit is back.
+    alice.set_fee_ceilings(HUB, None).unwrap();
+    assert_eq!(alice.fee_ceilings(HUB).unwrap(), None);
+}
+
+#[tokio::test]
 async fn a_renewal_refused_for_fees_changed_asks_them_again_once() {
     let net = charging(Fee {
         base: 0,

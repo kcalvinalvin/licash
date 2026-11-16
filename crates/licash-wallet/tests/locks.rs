@@ -126,6 +126,35 @@ async fn a_lock_unpaid_is_refunded_once_expired_at_depth() {
 }
 
 #[tokio::test]
+async fn a_lock_is_not_made_at_a_hub_charging_more_than_agreed() {
+    let (_net, alice, bob) = parties().await;
+    let charged = alice.hubs().unwrap()[0].1.fees;
+    // Either branch's fee raised refuses it.
+    for agreed in [
+        licash_api::Fees {
+            lock: Fee::default(),
+            ..charged
+        },
+        licash_api::Fees {
+            refund: Fee::default(),
+            ..charged
+        },
+    ] {
+        alice.set_fee_ceilings(HUB, Some(agreed)).unwrap();
+        assert!(matches!(
+            alice.lock(HUB, &bob.address(), 10, hash(), Some(8)).await,
+            Err(Error::FeesRaised { .. })
+        ));
+        assert!(alice.locks().unwrap().is_empty());
+    }
+    alice.set_fee_ceilings(HUB, Some(charged)).unwrap();
+    alice
+        .lock(HUB, &bob.address(), 10, hash(), Some(8))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn each_branch_of_a_lock_pays_for_the_notes_it_makes() {
     // 2 in each branch, and a sat for each note made for others than the
     // hub.

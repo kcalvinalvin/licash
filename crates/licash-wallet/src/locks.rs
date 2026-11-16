@@ -198,6 +198,7 @@ impl<T: Transport> Wallet<T> {
         if amount == 0 {
             return Err(Error::Invalid("nothing to lock".into()));
         }
+        let fees = self.agreed_fees(hub, url, info)?;
         let locks = info.locks.as_ref().ok_or_else(|| {
             Error::Invalid(format!("hub {url} follows no chain: it takes no locks"))
         })?;
@@ -228,11 +229,11 @@ impl<T: Transport> Wallet<T> {
             };
             (keyset, inputs, amount, 0)
         } else {
-            let (keyset, selection) = self.select(hub, amount, &info.fees.locking())?;
+            let (keyset, selection) = self.select(hub, amount, &fees.locking())?;
             (keyset, selection.inputs, selection.total, selection.fee)
         };
         // The refund branch returns all but its fee, which counts its notes.
-        let refunding = info.fees.refunding();
+        let refunding = fees.refunding();
         let refund_fee = coins::settle(total, 0, 0, &refunding, |value| made(&keyset, value))
             .map_err(|needed| Error::Insufficient {
                 needed,

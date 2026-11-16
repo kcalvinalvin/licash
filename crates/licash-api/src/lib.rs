@@ -176,6 +176,48 @@ impl Fees {
         self.with_outputs(self.refund)
     }
 
+    /// Whether any of these fees is more than its like in `other`: a hub
+    /// charging them asks more, of some payment, than one charging
+    /// `other`.
+    pub fn above(&self, other: &Fees) -> bool {
+        self.parts().iter().zip(other.parts()).any(|(a, b)| *a > b)
+    }
+
+    /// The lesser of each fee of the two.
+    pub fn least(&self, other: &Fees) -> Fees {
+        self.each(other, u64::min)
+    }
+
+    /// The greater of each fee of the two.
+    pub fn most(&self, other: &Fees) -> Fees {
+        self.each(other, u64::max)
+    }
+
+    fn parts(&self) -> [u64; 7] {
+        let (s, l, r) = (self.spend, self.lock, self.refund);
+        [
+            s.base,
+            s.ppm,
+            l.base,
+            l.ppm,
+            r.base,
+            r.ppm,
+            self.output_msat,
+        ]
+    }
+
+    fn each(&self, other: &Fees, pick: fn(u64, u64) -> u64) -> Fees {
+        let (a, b) = (self.parts(), other.parts());
+        let p: [u64; 7] = std::array::from_fn(|i| pick(a[i], b[i]));
+        let fee = |base, ppm| Fee { base, ppm };
+        Fees {
+            spend: fee(p[0], p[1]),
+            lock: fee(p[2], p[3]),
+            refund: fee(p[4], p[5]),
+            output_msat: p[6],
+        }
+    }
+
     fn with_outputs(&self, fee: Fee) -> NoteFee {
         NoteFee {
             fee,

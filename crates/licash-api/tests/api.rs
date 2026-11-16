@@ -276,6 +276,81 @@ fn problems_and_their_statuses_are_the_wire_contract() {
 }
 
 #[test]
+fn fees_compare_and_combine_each_with_its_like() {
+    let fee = |base, ppm| Fee { base, ppm };
+    let agreed = Fees {
+        spend: fee(1, 100),
+        lock: fee(1, 100),
+        refund: fee(1, 100),
+        output_msat: 100,
+    };
+    assert!(!agreed.above(&agreed));
+    assert!(!Fees::default().above(&agreed));
+    // One raised is above, whatever else went down.
+    for raised in [
+        Fees {
+            spend: fee(2, 0),
+            ..agreed
+        },
+        Fees {
+            spend: fee(0, 101),
+            ..agreed
+        },
+        Fees {
+            lock: fee(2, 100),
+            ..agreed
+        },
+        Fees {
+            lock: fee(1, 101),
+            ..agreed
+        },
+        Fees {
+            refund: fee(2, 100),
+            ..agreed
+        },
+        Fees {
+            refund: fee(1, 101),
+            ..agreed
+        },
+        Fees {
+            output_msat: 101,
+            ..Fees::default()
+        },
+    ] {
+        assert!(raised.above(&agreed), "{raised:?}");
+        assert!(!raised.most(&agreed).above(&raised.most(&agreed)));
+        assert!(!agreed.above(&raised.most(&agreed)));
+        assert!(!raised.above(&raised.most(&agreed)));
+        assert!(!raised.least(&agreed).above(&agreed));
+        assert!(!raised.least(&agreed).above(&raised));
+    }
+    let other = Fees {
+        spend: fee(0, 500),
+        lock: fee(3, 0),
+        refund: fee(1, 100),
+        output_msat: 0,
+    };
+    assert_eq!(
+        agreed.least(&other),
+        Fees {
+            spend: fee(0, 100),
+            lock: fee(1, 0),
+            refund: fee(1, 100),
+            output_msat: 0,
+        }
+    );
+    assert_eq!(
+        agreed.most(&other),
+        Fees {
+            spend: fee(1, 500),
+            lock: fee(3, 100),
+            refund: fee(1, 100),
+            output_msat: 100,
+        }
+    );
+}
+
+#[test]
 fn a_fee_on_the_notes_made_rounds_to_the_nearest_sat_beside_the_fee_on_value() {
     let fees = Fees {
         spend: Fee { base: 1, ppm: 100 },

@@ -117,12 +117,22 @@ impl<T: Transport> Wallet<T> {
             let spending = info.fees.spending();
             let fee = coins::settle(total, 0, 0, &spending, |value| made(keyset, value))
                 .unwrap_or_else(|due| due);
+            // Under the ceilings agreed to there, whatever it costs that
+            // leaves some; else within the limit.
             let limit = self.renew_limit();
-            if !within(fee, total, limit) {
-                tracing::info!(
-                    %url, total, fee, limit,
-                    "notes stay linked: renewing them costs more than the limit"
-                );
+            let refused = match self.ceilings_of(hub) {
+                Some(agreed) if info.fees.above(&agreed) => {
+                    Some("their hub charges more than agreed")
+                }
+                Some(_) if fee >= total => Some("renewing them would leave nothing"),
+                Some(_) => None,
+                None if !within(fee, total, limit) => {
+                    Some("renewing them costs more than the limit")
+                }
+                None => None,
+            };
+            if let Some(why) = refused {
+                tracing::info!(%url, total, fee, limit, "notes stay linked: {why}");
                 return Ok(false);
             }
             let Some(id) = self.start_renewal(hub, keyset, &ys, total, fee, &info)? else {
