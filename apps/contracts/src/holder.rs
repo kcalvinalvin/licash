@@ -174,8 +174,11 @@ pub async fn open_with<T: Transport, C: Chain>(
         .silent_coin_output(&deposit)?
         .context("a coin gone")?;
     let left = coin.value.to_sat() - price;
+    // A hub whose deposits are paid within fewer blocks would answer
+    // one too short to pay in F: not asked.
+    let window = info.deposits.as_ref().map_or(0, |d| d.window);
     let into = match change {
-        Change::Notes if left >= offer.quote.graph.dust => {
+        Change::Notes if left >= offer.quote.graph.dust && window >= 2 * DEPOSIT_MARGIN => {
             deposit_for_change(wallet, &hub, left, tip).await
         }
         _ => None,
@@ -345,7 +348,10 @@ pub fn paid_into<T: Transport>(
             continue;
         };
         let txid = f.tx.compute_txid();
-        let paying = f.tx.output.iter().position(|o| o.script_pubkey == *script);
+        let paying =
+            f.tx.output
+                .iter()
+                .position(|o| o.script_pubkey == *script && o.value.to_sat() == pays);
         if let Some(vout) = paying {
             let vout = u32::try_from(vout)?;
             return Ok(Some(OutPoint { txid, vout }));
@@ -447,8 +453,9 @@ fn wanted(offer: &Offer, tip: u32, blocks: u32) -> Result<Wanted> {
 
 /// A deposit at `hub` paid `left` exactly, F's change, the hub's fee in
 /// it, to pay in F at `tip`: its hash and the script F pays. None if the
-/// hub takes none so, or leaves too little time to sign F and have it
-/// confirm ([`DEPOSIT_MARGIN`]), its change then on Bitcoin.
+/// hub takes none so (its fee changed since its info was read, say), or
+/// leaves too little time to sign F and have it confirm
+/// ([`DEPOSIT_MARGIN`]), its change then on Bitcoin.
 async fn deposit_for_change<T: Transport>(
     wallet: &Wallet<T>,
     hub: &str,
@@ -464,10 +471,10 @@ async fn deposit_for_change<T: Transport>(
     };
     let script = asked.terms.as_ref().and_then(|terms| {
         let time = terms.fund_by >= tip.saturating_add(2 * DEPOSIT_MARGIN);
-        time.then(|| script_of(&terms.address))?
+        (time && terms.pays == left).then(|| script_of(&terms.address))?
     });
     if script.is_none() {
-        let why = "too little time to pay it in F";
+        let why = "not to be paid in F: too little time, or paid another amount";
         tracing::info!(%hub, left, hash = %asked.hash, "F's change stays on Bitcoin: {why}");
         let _ = wallet.give_up_deposit(&asked.hash, why);
     }
