@@ -10,7 +10,7 @@ use crate::{
 };
 
 const TAG: &[u8] = b"LICASH-HOLD\x02";
-const CONTEXT_BYTES: usize = 32 + 36 + 4 + 32;
+pub const CONTEXT_BYTES: usize = 32 + 36 + 4 + 32;
 pub const RECORD_BYTES: usize = PUBLIC_FIELDS_BYTES + 64;
 
 fn bad(reason: &str) -> Error {
@@ -36,7 +36,7 @@ impl std::fmt::Debug for Context {
 }
 
 impl Context {
-    fn bytes(&self) -> [u8; CONTEXT_BYTES] {
+    pub fn to_bytes(&self) -> [u8; CONTEXT_BYTES] {
         let mut bytes = [0; CONTEXT_BYTES];
         bytes[..32].copy_from_slice(&self.base);
         bytes[32..68].copy_from_slice(&self.deposit);
@@ -51,11 +51,11 @@ impl Context {
     pub fn signing_digest(&self, message: &Message) -> [u8; 32] {
         crypto::tagged_hash(
             "licash/hold-note-authorization/v2",
-            &[&self.bytes(), &message.public_fields()],
+            &[&self.to_bytes(), &message.public_fields()],
         )
     }
 
-    fn from_bytes(bytes: &[u8]) -> Self {
+    pub fn from_bytes(bytes: &[u8; CONTEXT_BYTES]) -> Self {
         Self {
             base: bytes[..32].try_into().expect("checked context width"),
             deposit: bytes[32..68].try_into().expect("checked context width"),
@@ -180,7 +180,7 @@ impl Envelope {
 
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = TAG.to_vec();
-        bytes.extend(self.context.bytes());
+        bytes.extend(self.context.to_bytes());
         bytes.extend(
             u32::try_from(self.records.len())
                 .expect("validated hold count")
@@ -205,7 +205,11 @@ impl Envelope {
         if bytes.len() < header || &bytes[..TAG.len()] != TAG {
             return Err(bad("hold envelope framing"));
         }
-        let context = Context::from_bytes(&bytes[TAG.len()..TAG.len() + CONTEXT_BYTES]);
+        let context = Context::from_bytes(
+            bytes[TAG.len()..TAG.len() + CONTEXT_BYTES]
+                .try_into()
+                .expect("checked context width"),
+        );
         if &context != expected_context {
             return Err(bad("hold request context mismatch"));
         }

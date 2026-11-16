@@ -1363,6 +1363,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "licash-hp"
+version = "0.0.1"
+dependencies = [
+ "bitcoin",
+ "k256",
+ "licash",
+ "lichen-statement",
+ "sha2",
+]
+
+[[package]]
 name = "licash-regtest"
 version = "0.0.1"
 dependencies = [
@@ -1406,13 +1417,11 @@ dependencies = [
  "ark-snark",
  "ark-std",
  "blake3",
+ "hex",
  "k256",
- "lichen-withdraw",
- "lngap-btc",
- "lngap-channel",
- "lngap-lamport",
- "lngap-sessions",
- "lngap-zk",
+ "lichen-btc",
+ "lichen-contract",
+ "lichen-statement",
  "rand_chacha",
  "rand_core 0.6.4",
  "serde",
@@ -1420,28 +1429,31 @@ dependencies = [
 ]
 
 [[package]]
-name = "lichen-shielded"
-version = "0.1.0"
+name = "lichen-btc"
+version = "0.4.5"
 dependencies = [
- "sha2",
+ "anyhow",
+ "bitcoin",
+ "hex",
+ "rand 0.8.8",
+ "secp256k1 0.29.1",
+ "serde",
 ]
 
 [[package]]
-name = "lichen-validity"
-version = "0.1.0"
+name = "lichen-contract"
+version = "0.4.5"
 dependencies = [
- "k256",
- "lichen-shielded",
- "sha2",
+ "anyhow",
+ "bitcoin",
+ "lichen-btc",
+ "serde",
 ]
 
 [[package]]
-name = "lichen-withdraw"
+name = "lichen-statement"
 version = "0.1.0"
 dependencies = [
- "k256",
- "lichen-shielded",
- "lichen-validity",
  "sha2",
 ]
 

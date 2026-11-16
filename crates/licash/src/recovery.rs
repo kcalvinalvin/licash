@@ -428,6 +428,106 @@ pub enum Evidence {
     Expired { source: ProposalId },
 }
 
+/// Most evidence a statement's input carries: one per item it voids, and
+/// one per source.
+pub const MAX_EVIDENCE: usize = 2 * MAX_ITEMS;
+
+/// The Hub's evidence, canonically encoded for its statement's input.
+pub fn evidence_to_bytes(evidence: &[Evidence]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    put_count(&mut bytes, evidence.len());
+    for e in evidence {
+        match e {
+            Evidence::Spend {
+                signed,
+                notes,
+                unlock,
+            } => {
+                bytes.push(0);
+                put_count(&mut bytes, notes.len());
+                for note in notes {
+                    put_blob(&mut bytes, &note.to_bytes());
+                }
+                put_blob(&mut bytes, &signed.to_bytes());
+                match unlock {
+                    None => bytes.push(0),
+                    Some(unlock) => {
+                        bytes.push(1);
+                        bytes.extend(unlock);
+                    }
+                }
+            }
+            Evidence::SecondClaim { context, record } => {
+                bytes.push(1);
+                bytes.extend(context.to_bytes());
+                bytes.extend(record.message.to_bytes());
+                bytes.extend(record.sig.0);
+            }
+            Evidence::PayPreimage { source, preimage } => {
+                bytes.push(2);
+                bytes.extend(source.as_bytes());
+                bytes.extend(preimage);
+            }
+            Evidence::Expired { source } => {
+                bytes.push(3);
+                bytes.extend(source.as_bytes());
+            }
+        }
+    }
+    bytes
+}
+
+/// Strict canonical decoding of [`evidence_to_bytes`]: every note verified
+/// under `keyset`, every signed spend against its notes. Whether the
+/// evidence voids anything is [`owed`]'s to decide.
+pub fn evidence_from_bytes(
+    keyset: &Keyset,
+    limit: usize,
+    bytes: &[u8],
+) -> Result<Vec<Evidence>, Error> {
+    let mut r = Reader(bytes);
+    let mut evidence = Vec::new();
+    for _ in 0..r.count(MAX_EVIDENCE)? {
+        evidence.push(match r.byte()? {
+            0 => {
+                let notes = (0..r.count(limit)?)
+                    .map(|_| Note::from_bytes(keyset, r.blob()?))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let signed = SignedProposal::from_bytes(keyset, &notes, r.blob()?)?;
+                let unlock = match r.byte()? {
+                    0 => None,
+                    1 => Some(r.array()?),
+                    _ => return Err(bad("evidence unlock tag")),
+                };
+                Evidence::Spend {
+                    signed,
+                    notes,
+                    unlock,
+                }
+            }
+            1 => Evidence::SecondClaim {
+                context: hold::Context::from_bytes(&r.array()?),
+                record: Record {
+                    message: Message::from_bytes(r.take(crate::note::MESSAGE_BYTES)?)?,
+                    sig: Signature(r.array()?),
+                },
+            },
+            2 => Evidence::PayPreimage {
+                source: ProposalId::from_bytes(r.array()?),
+                preimage: r.array()?,
+            },
+            3 => Evidence::Expired {
+                source: ProposalId::from_bytes(r.array()?),
+            },
+            _ => return Err(bad("evidence tag")),
+        });
+    }
+    if !r.0.is_empty() || evidence_to_bytes(&evidence) != bytes {
+        return Err(bad("noncanonical evidence"));
+    }
+    Ok(evidence)
+}
+
 /// The secrets the Hub publishes with its response: the unlock of every
 /// granted spend it cites and every Pay preimage, one slot per source in
 /// source-id order, zero padded. Its statement holds only if its response

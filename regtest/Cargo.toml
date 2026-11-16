@@ -8,7 +8,7 @@ description = "licash's recovery contract on Lichen's BABE graph, played on a lo
 # A workspace of its own, with the contract library: they pull Lichen and
 # ln-gap by path, which the core library must not depend on.
 [workspace]
-members = ["../crates/licash-contract"]
+members = ["../crates/licash-contract", "../crates/licash-hp"]
 
 [dependencies]
 licash = { path = "../crates/licash" }

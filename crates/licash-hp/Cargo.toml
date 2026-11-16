@@ -1,0 +1,24 @@
+# The Hub's statement on Lichen's hub-proves exit: what Bitcoin shows of
+# the exit (lichen-statement) and what the claim it carries is owed
+# (licash::recovery::owed). The guest r0/hp-guest proves it; the Hub
+# evaluates it natively to decide its response.
+[package]
+name = "licash-hp"
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "The Hub's statement for a Licash recovery on Lichen's hub-proves exit"
+# A member of regtest's workspace, as licash-contract: it pulls Lichen by
+# path, which the core library must not depend on.
+workspace = "../../regtest"
+
+[dependencies]
+licash = { path = "../licash" }
+lichen-statement = { path = "../../vendor/lichen/crates/statement" }
+sha2 = "0.10"
+
+[dev-dependencies]
+bitcoin = { version = "=0.32.102", default-features = false, features = ["std"] }
+k256 = { version = "0.13", features = ["hash2curve"] }
+lichen-statement = { path = "../../vendor/lichen/crates/statement", features = ["testing"] }

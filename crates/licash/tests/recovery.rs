@@ -19,7 +19,10 @@ use licash::{
     hold,
     note::Evidence as Issuance,
     note::{Derivation, HoldRoot, IssuerKeys, Keyset, Note},
-    recovery::{self, disclosures, Evidence, Filing, Owed, Publication, SourceWitness, Witness},
+    recovery::{
+        self, disclosures, evidence_from_bytes, evidence_to_bytes, Evidence, Filing, Owed,
+        Publication, SourceWitness, Witness,
+    },
     request::Request,
     source::Certificate,
     spend::{ChainProfile, Output, Proposal, TimedLock, TimedTerms},
@@ -695,6 +698,63 @@ fn a_withheld_granted_payment_is_countered_only_by_publishing_its_unlock() {
     }
     assert_eq!(opened, 128);
     assert!(grant.unlock_in(&[[0; 32]; 32]).is_none());
+}
+
+/// The Hub's evidence travels to its prover as bytes the guest decodes
+/// strictly, verifying the notes and the signed spend again.
+#[test]
+fn evidence_codec_is_strict() {
+    let w = withheld();
+    let keyset = w.o.base.parts().keyset.clone();
+    let id = w.signed.proposal().id();
+    let context = hold::Context {
+        base: [1; 32],
+        deposit: [2; 36],
+        amount: 4,
+        claim_digest: [3; 32],
+    };
+    let record = hold::Envelope::sign(context, &hold_keys(&w.change[..1]), LIMIT)
+        .unwrap()
+        .records()[0]
+        .clone();
+    let evidence = vec![
+        Evidence::Spend {
+            signed: w.signed.clone(),
+            notes: vec![w.note.clone()],
+            unlock: Some(w.unlock),
+        },
+        Evidence::SecondClaim { context, record },
+        Evidence::PayPreimage {
+            source: id,
+            preimage: [5; 32],
+        },
+        Evidence::Expired { source: id },
+    ];
+    let bytes = evidence_to_bytes(&evidence);
+    let decoded = evidence_from_bytes(&keyset, LIMIT, &bytes).unwrap();
+    assert_eq!(evidence_to_bytes(&decoded), bytes);
+    let c = decide(
+        &w.o,
+        &w.request,
+        &w.publication,
+        &w.witness,
+        &decoded[..1],
+        None,
+    )
+    .unwrap();
+    assert_eq!((c.mask, c.owed), (1, 78));
+    for n in (0..bytes.len()).step_by(7) {
+        assert!(evidence_from_bytes(&keyset, LIMIT, &bytes[..n]).is_err());
+    }
+    let mut trailing = bytes.clone();
+    trailing.push(0);
+    assert!(evidence_from_bytes(&keyset, LIMIT, &trailing).is_err());
+    let other = IssuerKeys::random(7).unwrap().keyset().unwrap();
+    assert!(evidence_from_bytes(&other, LIMIT, &bytes).is_err());
+    assert_eq!(
+        evidence_from_bytes(&keyset, LIMIT, &[0; 4]).unwrap().len(),
+        0
+    );
 }
 
 /// A claim of the refund of an unsubmitted lock carries Q's authorization for
