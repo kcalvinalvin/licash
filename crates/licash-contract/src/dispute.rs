@@ -25,7 +25,7 @@ use lngap_btc::witness::witness_args_consumption_order;
 use lngap_lamport::winternitz::{Wots256Sig, WotsParams, WotsSig};
 use lngap_sessions::skeleton::sig_name;
 
-use crate::close::{finished, presign, terminal, B_ITEMS, E_ITEMS};
+use crate::close::{self, finished, presign, terminal, B_ITEMS, E_ITEMS};
 use crate::graph::Babe;
 use crate::keys::{HolderKeys, HubKeys};
 use crate::opening::{journal, HubOpening, Opening, Setup, Trust};
@@ -39,8 +39,10 @@ pub const RESPOND_TIMEOUT: &str = "respond_timeout";
 pub const ASSERT: &str = "assert";
 pub const ASSERT_CORRECTED: &str = "assert_corrected";
 pub const SUCCESS: &str = "success";
+pub const SUCCESS_CORRECTED: &str = "success_corrected";
 /// The hub's challenge of her assertion, and its terminal paying it.
 pub const CHALLENGE: &str = "challenge_assert";
+pub const CHALLENGE_CORRECTED: &str = "challenge_corrected";
 pub const FAILURE: &str = "failure";
 
 /// A proof of her claim: Groth16's, on BN254.
@@ -416,7 +418,11 @@ pub fn holder_image(o: &Opening) -> [u8; 32] {
 /// her kept instances are garbled under, of the journal fixed at
 /// opening. A proof that does not opens none of them.
 pub fn proves(o: &Opening, trust: &Trust, proof: &Proof<Bn254>) -> bool {
-    let statement = (trust.statement)(&expected(o));
+    proves_journal(trust, &expected(o), proof)
+}
+
+fn proves_journal(trust: &Trust, journal: &licash::statement::Journal, proof: &ClaimProof) -> bool {
+    let statement = (trust.statement)(journal);
     <Groth16<Bn254> as ark_snark::SNARK<_>>::verify(&statement.vk, &statement.public, proof)
         .unwrap_or(false)
 }
@@ -491,9 +497,7 @@ impl<'a> Corrected<'a> {
     }
 
     pub fn proves(&self, trust: &Trust, proof: &ClaimProof) -> bool {
-        let statement = (trust.statement)(&self.expected());
-        <Groth16<Bn254> as ark_snark::SNARK<_>>::verify(&statement.vk, &statement.public, proof)
-            .unwrap_or(false)
+        proves_journal(trust, &self.expected(), proof)
     }
 
     pub fn mock_proof(&self, trust: &Trust) -> Result<ClaimProof> {
@@ -552,6 +556,65 @@ impl<'a> Corrected<'a> {
         let proof = proof_from_reveals(&spec.lamport, read.proof)?;
         Ok((corrected, proof, holder_b))
     }
+
+    pub fn success(&self, keys: &HolderKeys, fee: (OutPoint, TxOut)) -> Result<Transaction> {
+        terminal(self.opening, keys, SUCCESS_CORRECTED, vec![], fee)
+    }
+
+    pub fn is_success(&self, tx: &Transaction) -> Result<bool> {
+        is_terminal(self.opening, tx, SUCCESS_CORRECTED)
+    }
+
+    pub fn is_challenge(&self, tx: &Transaction) -> bool {
+        is(self.opening, tx, CHALLENGE_CORRECTED)
+    }
+
+    pub fn is_answer(&self, tx: &Transaction) -> bool {
+        is_answer_for(self.opening, tx, true)
+    }
+
+    /// Use only the corrected setup, checked by Opening::setups, to answer
+    /// a challenge of the corrected proof already posted.
+    pub fn answer(
+        &self,
+        keys: &HolderKeys,
+        setup: &Setup,
+        challenge: &Transaction,
+        proof: &ClaimProof,
+        fee: (OutPoint, TxOut),
+    ) -> Result<Option<Transaction>> {
+        answer_for(self.opening, keys, setup, challenge, proof, fee, true)
+    }
+
+    /// Collect with the holder amount signature read from the assertion.
+    /// Only the ordinary payment key signs; neither one-time key is used.
+    pub fn sweep(
+        &self,
+        keys: &HolderKeys,
+        payout: &Transaction,
+        b: &WotsSig,
+        to: lngap_btc::bitcoin::ScriptBuf,
+        rate: lngap_btc::bitcoin::FeeRate,
+    ) -> Result<Transaction> {
+        let spec = self
+            .opening
+            .babe
+            .spec
+            .corrected
+            .as_ref()
+            .context("no corrected assertion")?;
+        spec.b_key
+            .verify(b)
+            .context("holder's corrected amount signature")?;
+        close::sweep_with_key(
+            self.opening,
+            keys,
+            payout,
+            (self.amount, b, &spec.b_key),
+            to,
+            rate,
+        )
+    }
 }
 
 /// Whether `tx` is her `assert`, any proof's.
@@ -594,7 +657,11 @@ pub fn success(o: &Opening, keys: &HolderKeys, fee: (OutPoint, TxOut)) -> Result
 
 /// Whether `tx` is `success`, any fee inputs added.
 pub fn is_success(o: &Opening, tx: &Transaction) -> Result<bool> {
-    let p = presign(o, SUCCESS)?;
+    is_terminal(o, tx, SUCCESS)
+}
+
+fn is_terminal(o: &Opening, tx: &Transaction, name: &str) -> Result<bool> {
+    let p = presign(o, name)?;
     let at = p.tx.input[0].previous_output;
     Ok(tx.input.iter().any(|i| i.previous_output == at) && tx.output == p.tx.output)
 }
@@ -602,9 +669,15 @@ pub fn is_success(o: &Opening, tx: &Transaction) -> Result<bool> {
 /// Whether `tx` is her answer to the hub's challenge, from any kept
 /// instance, any fee inputs added.
 pub fn is_answer(o: &Opening, tx: &Transaction) -> bool {
+    is_answer_for(o, tx, false)
+}
+
+fn is_answer_for(o: &Opening, tx: &Transaction, corrected: bool) -> bool {
     o.set
         .iter()
-        .filter(|p| p.name.starts_with("wrongly_challenged_") && !p.name.contains("corrected"))
+        .filter(|p| {
+            p.name.starts_with("wrongly_challenged_") && p.name.contains("corrected") == corrected
+        })
         .any(|p| {
             let at = p.tx.input[0].previous_output;
             tx.input.iter().any(|i| i.previous_output == at) && tx.output == p.tx.output
@@ -630,9 +703,34 @@ pub fn answer(
     proof: &Proof<Bn254>,
     fee: (OutPoint, TxOut),
 ) -> Result<Option<Transaction>> {
-    ensure!(is_challenge(o, challenge), "not the hub's challenge");
+    answer_for(o, keys, setup, challenge, proof, fee, false)
+}
+
+fn answer_for(
+    o: &Opening,
+    keys: &HolderKeys,
+    setup: &Setup,
+    challenge: &Transaction,
+    proof: &ClaimProof,
+    fee: (OutPoint, TxOut),
+    corrected: bool,
+) -> Result<Option<Transaction>> {
+    let (name, lamport, prefix) = if corrected {
+        (
+            CHALLENGE_CORRECTED,
+            &o.babe
+                .spec
+                .corrected
+                .as_ref()
+                .context("no corrected assertion")?
+                .lamport,
+            "wrongly_challenged_corrected",
+        )
+    } else {
+        (CHALLENGE, &o.babe.spec.lamport, "wrongly_challenged")
+    };
+    ensure!(is(o, challenge, name), "not the hub's challenge");
     let (bits, digits, _, _) = pi(proof);
-    let lamport = &o.babe.spec.lamport;
     let (posted, revealed) = extract(lamport, &setup.presigs, &args(challenge))
         .ok_or_else(|| anyhow!("the challenge's secrets"))?;
     ensure!(
@@ -654,7 +752,7 @@ pub fn answer(
         let r_pi1 = evaluate(&instance.gc, &bits, &instance.labels(&bits, &secrets));
         let msg = decrypt(&instance.ct, &r_pi1, proof);
         if instance.is_msg(&msg) {
-            let name = format!("wrongly_challenged_{k}");
+            let name = format!("{prefix}_{k}");
             return terminal(o, keys, &name, Babe::wrongly_wire(&msg), fee).map(Some);
         }
     }
@@ -1097,6 +1195,140 @@ mod tests {
         let amount = opening.base.parts().cap + 1;
         let signature = Hashes(hub.b_corr.sign(&amount.to_be_bytes()).unwrap().hashes);
         assert!(Corrected::new(&opening, amount, &signature).is_err());
+    }
+
+    fn fee_coin(keys: &HolderKeys) -> (lngap_btc::bitcoin::OutPoint, lngap_btc::bitcoin::TxOut) {
+        use lngap_btc::bitcoin::{hashes::Hash as _, Amount, OutPoint, TxOut, Txid};
+        (
+            OutPoint {
+                txid: Txid::from_byte_array([81; 32]),
+                vout: 0,
+            },
+            TxOut {
+                value: Amount::from_sat(20_000),
+                script_pubkey: close::fee_script(keys).unwrap(),
+            },
+        )
+    }
+
+    #[test]
+    fn corrected_success_collects_the_right_bits_and_reserve_including_zero() {
+        use lngap_btc::bitcoin::{FeeRate, ScriptBuf};
+        for amount in [0u32, 15, 4_096] {
+            let (opening, keys, hub) = funded_opening();
+            let signature = Hashes(hub.b_corr.sign(&amount.to_be_bytes()).unwrap().hashes);
+            let corrected = Corrected::new(&opening, amount, &signature).unwrap();
+            let proof = corrected.mock_proof(&Trust::mock()).unwrap();
+            let asserted = corrected.assert(&keys, &proof).unwrap();
+            let (adopted, _, b) = Corrected::asserted(&opening, &asserted).unwrap();
+            let fee = fee_coin(&keys);
+            let paid = adopted.success(&keys, fee.clone()).unwrap();
+            assert!(adopted.is_success(&paid).unwrap());
+            assert!(!is_success(&opening, &paid).unwrap());
+            assert_eq!(paid.input[1].previous_output, fee.0);
+            let full = success(&opening, &keys, fee).unwrap();
+            assert!(!adopted.is_success(&full).unwrap());
+            let to = ScriptBuf::from_bytes(opening.base.parts().parties[0].payout_script.clone());
+            let rate = FeeRate::from_sat_per_vb(2).unwrap();
+            let swept = adopted.sweep(&keys, &paid, &b, to.clone(), rate).unwrap();
+            assert_eq!(swept.output.len(), 1);
+            assert!(swept.output[0].value >= to.minimal_non_dust());
+            assert!(swept
+                .input
+                .iter()
+                .all(|i| i.previous_output.txid == paid.compute_txid()));
+            assert!(close::sweep(&opening, &keys, &paid, amount, &b, to, rate).is_err());
+            assert_eq!(
+                swept.input.len(),
+                1 + (amount >> opening.babe.spec.terms.low_bits).count_ones() as usize
+            );
+            if amount == 0 {
+                assert_eq!(swept.input.len(), 1, "only her reserve is collected");
+            }
+        }
+    }
+
+    #[test]
+    fn corrected_challenges_and_answers_are_never_confused_with_full_claims() {
+        let (opening, _, hub) = funded_opening();
+        let signature = Hashes(hub.b_corr.sign(&15u32.to_be_bytes()).unwrap().hashes);
+        let corrected = Corrected::new(&opening, 15, &signature).unwrap();
+        let challenge = presign(&opening, CHALLENGE_CORRECTED).unwrap().tx.clone();
+        assert!(corrected.is_challenge(&challenge));
+        assert!(!is_challenge(&opening, &challenge));
+        let full = presign(&opening, CHALLENGE).unwrap().tx.clone();
+        assert!(!corrected.is_challenge(&full));
+        for p in opening
+            .set
+            .iter()
+            .filter(|p| p.name.starts_with("wrongly_challenged_"))
+        {
+            let is_corrected = p.name.contains("corrected");
+            assert_eq!(corrected.is_answer(&p.tx), is_corrected);
+            assert_eq!(is_answer(&opening, &p.tx), !is_corrected);
+        }
+    }
+
+    #[test]
+    #[ignore = "reconstructs garbled instances; run in release mode"]
+    fn a_corrected_challenge_opens_the_corrected_instances_and_collects() {
+        use crate::opening::{Context, Hub};
+        use lichen_babe::reveal::{complete, reveal_args};
+        use lngap_btc::bitcoin::{FeeRate, ScriptBuf};
+
+        let (opening, keys, hub_keys) = funded_opening();
+        let ctx = Context {
+            tip: 0,
+            trust: Trust::mock(),
+        };
+        let hub = Hub::load(include_bytes!("../tests/golden/hub-funded.bin"), &ctx).unwrap();
+        let [full, corrected_setup] = opening
+            .setups(|stage, index, _| {
+                let message =
+                    crate::wire::Envelope::from_bytes(&hub.instance(stage, index, &ctx)?)?;
+                let kept = crate::wire::Kept::decode(&message.body)?;
+                assert_eq!((kept.stage, kept.index), (stage, index));
+                Ok(kept.instance)
+            })
+            .unwrap();
+        let signature = Hashes(hub_keys.b_corr.sign(&15u32.to_be_bytes()).unwrap().hashes);
+        let corrected = Corrected::new(&opening, 15, &signature).unwrap();
+        let proof = corrected.mock_proof(&ctx.trust).unwrap();
+        let asserted = corrected.assert(&keys, &proof).unwrap();
+        let (_, _, b) = Corrected::asserted(&opening, &asserted).unwrap();
+        let (_, digits, _, _) = pi(&proof);
+        let preimages = keys.corrected.lamport.sign(&digits);
+        let secrets: Vec<_> = digits
+            .iter()
+            .enumerate()
+            .map(|(i, d)| hub_keys.corrected.dealer.reveal(i, *d))
+            .collect();
+        let wire = Babe::challenge_wire(reveal_args(
+            &preimages,
+            &complete(&corrected_setup.presigs, &digits, &secrets),
+        ));
+        let challenge = finished(&opening, CHALLENGE_CORRECTED, wire).unwrap();
+        assert!(!matches!(
+            corrected.answer(&keys, &full, &challenge, &proof, fee_coin(&keys)),
+            Ok(Some(_))
+        ));
+        let paid = corrected
+            .answer(&keys, &corrected_setup, &challenge, &proof, fee_coin(&keys))
+            .unwrap()
+            .expect("a valid corrected proof opens a kept instance");
+        assert!(corrected.is_answer(&paid));
+        assert!(!is_answer(&opening, &paid));
+        let to = ScriptBuf::from_bytes(opening.base.parts().parties[0].payout_script.clone());
+        let swept = corrected
+            .sweep(
+                &keys,
+                &paid,
+                &b,
+                to.clone(),
+                FeeRate::from_sat_per_vb(2).unwrap(),
+            )
+            .unwrap();
+        assert!(swept.output[0].value >= to.minimal_non_dust());
     }
 
     /// A genuine proof as `licash-r0 native-wrap` exports it (a holder's

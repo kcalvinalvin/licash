@@ -18,7 +18,7 @@ use lngap_btc::sighash::sign_tapscript;
 use lngap_btc::taptree::TapTree;
 use lngap_btc::tx::build_tx;
 use lngap_btc::witness::tapscript_witness;
-use lngap_lamport::winternitz::{WotsParams, WotsSig};
+use lngap_lamport::winternitz::{WotsParams, WotsPublic, WotsSig};
 use lngap_sessions::session::{bit_tree, reserve_tree};
 use lngap_sessions::skeleton::{anchor_tree_for, sig_name, Presign};
 
@@ -238,12 +238,25 @@ pub fn sweep(
     to: ScriptBuf,
     rate: FeeRate,
 ) -> Result<Transaction> {
+    sweep_with_key(o, keys, payout, (amount, b, &o.babe.spec.b_key), to, rate)
+}
+
+/// The same collection for either assertion's payout key. The signature
+/// is copied from R or a posted corrected assertion, never signed here.
+pub(crate) fn sweep_with_key(
+    o: &Opening,
+    keys: &HolderKeys,
+    payout: &Transaction,
+    (amount, b, b_key): (u32, &WotsSig, &WotsPublic),
+    to: ScriptBuf,
+    rate: FeeRate,
+) -> Result<Transaction> {
     ensure!(
         b.message() == amount.to_be_bytes(),
         "her signature of b reads another amount"
     );
     let spec = &o.babe.spec;
-    let (t, b_key) = (&spec.terms, &spec.b_key);
+    let t = &spec.terms;
     let ctx = o.babe.core().ctx();
     let bit_wire = Babe::request_wire(b);
     let mut ins: Vec<(TapTree, String, Vec<Vec<u8>>)> = (t.low_bits..t.bits)
