@@ -71,10 +71,12 @@ class ProverTest {
 
     @Test
     fun a_phone_with_less_memory_proves_smaller_segments() {
-        assertEquals(18, po2For(8L shl 30))
+        // A phone of 12 GB, one of 8 GB (Android counts a little less).
+        assertEquals(19, po2For(11L shl 30))
+        assertEquals(18, po2For(7_600_000_000))
         assertEquals(17, po2For(5L shl 30))
-        // The emulator's 2.9 GB.
-        assertEquals(16, po2For(3_047_932L * 1024))
+        // The emulator's 2.9 GB: smaller segments would save it no memory.
+        assertEquals(17, po2For(3_047_932L * 1024))
         assertEquals("under a minute", lasting(20))
         assertEquals("1 hour", lasting(3_600))
         assertEquals("30 hours", lasting(30 * 3_600))

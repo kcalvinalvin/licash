@@ -128,14 +128,15 @@ internal fun progressOf(lines: List<String>): Proving {
 }
 
 /**
- * The segments' size for a phone of `memory` bytes, as large as it holds: 2^18 cycles took 2.4 GB at
- * most to prove (and lift), 2^16 1.5 GB, and the smaller the segments, the more of them, and the more
- * work in all (the holder's claim: 4,475 segments of 2^16, 92 of 2^20).
+ * The segments' size for a phone of `memory` bytes, as large as it holds with room to spare. The
+ * holder's claim on 4 cores of a computer: 2^17 cycles a segment, 1,145 segments of 52 s each, at most
+ * 1.5 GB; 2^18, 436 of 88 s, 2.4 GB; 2^19, 194 of 142 s, 4.8 GB. Smaller segments save no memory
+ * (lifting each takes 1.5 GB) and cost far more time: 4,475 of 2^16, of 35 s each.
  */
 internal fun po2For(memory: Long): Int = when {
+    memory >= 10L shl 30 -> 19
     memory >= 6L shl 30 -> 18
-    memory >= 4L shl 30 -> 17
-    else -> 16
+    else -> 17
 }
 
 /** How long `secs` take, as a clock would say it. */
