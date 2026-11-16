@@ -465,8 +465,12 @@ fn main() -> ExitCode {
 }
 
 fn logging(format: Log) {
-    let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,nostr_sdk=off"));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        EnvFilter::new(match format {
+            Log::Text => "info,licash_wallet=warn,nostr_sdk=off",
+            Log::Json => "info",
+        })
+    });
     let logs = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
@@ -480,7 +484,7 @@ fn logging(format: Log) {
 fn command(cli: Cli) -> anyhow::Result<()> {
     let data = cli.data;
     match cli.command {
-        Command::Init { network } => init(&data, network),
+        Command::Init { network } => init(&data, network, cli.log),
         Command::Run {
             listen,
             terms,
@@ -598,7 +602,7 @@ fn command(cli: Cli) -> anyhow::Result<()> {
     }
 }
 
-fn init(data: &Path, network: ChainProfile) -> anyhow::Result<()> {
+fn init(data: &Path, network: ChainProfile, log: Log) -> anyhow::Result<()> {
     let mut dir = std::fs::DirBuilder::new();
     dir.recursive(true);
     #[cfg(unix)]
@@ -617,7 +621,14 @@ fn init(data: &Path, network: ChainProfile) -> anyhow::Result<()> {
         Wallet::create(&wallet, &seed, network, Http::new(None)?).context("create the wallet")?;
     let address = hex::encode(wallet.address().to_bytes());
     Provider::create(&swaps, wallet, Config::default()).context("create the swaps file")?;
-    tracing::info!(data = %data.display(), %address, %network, "provider created: back up its wallet file");
+    if matches!(log, Log::Json) {
+        tracing::info!(data = %data.display(), %address, %network, "provider created: back up its wallet file");
+    } else {
+        eprintln!(
+            "Provider created. Back up wallet.sqlite and swaps.sqlite in {}.",
+            data.display()
+        );
+    }
     println!("{address}");
     Ok(())
 }

@@ -836,8 +836,12 @@ fn main() -> ExitCode {
 }
 
 fn logging(format: Log) {
-    let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,nostr_sdk=off"));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        EnvFilter::new(match format {
+            Log::Text => "info,licash_wallet=warn,nostr_sdk=off",
+            Log::Json => "info",
+        })
+    });
     let logs = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
@@ -852,7 +856,7 @@ fn command(cli: Cli) -> anyhow::Result<()> {
     let db = cli.data.join("hub.sqlite");
     let seed = cli.seed.unwrap_or_else(|| cli.data.join("seed"));
     match cli.command {
-        Command::Init { max_pow } => init(&cli.data, &seed, &db, max_pow),
+        Command::Init { max_pow } => init(&cli.data, &seed, &db, max_pow, cli.log),
         Command::Run {
             listen,
             policy,
@@ -1031,7 +1035,8 @@ fn command(cli: Cli) -> anyhow::Result<()> {
                         }
                         _ => Http::new(None)?,
                     };
-                    let provider = swap_provider(&swaps_dir, *profile, config, issuer, transport)?;
+                    let provider =
+                        swap_provider(&swaps_dir, *profile, config, issuer, transport, cli.log)?;
                     let provider = Arc::new(provider);
                     let notifier = match swaps_targets.is_empty() {
                         true => None,
@@ -1143,7 +1148,7 @@ fn respond(data: &Path, id: &str, request: &Path, chain: &str) -> anyhow::Result
     })
 }
 
-fn init(data: &Path, seed: &Path, db: &Path, max_pow: u32) -> anyhow::Result<()> {
+fn init(data: &Path, seed: &Path, db: &Path, max_pow: u32, log: Log) -> anyhow::Result<()> {
     let mut dir = std::fs::DirBuilder::new();
     dir.recursive(true);
     #[cfg(unix)]
@@ -1151,7 +1156,11 @@ fn init(data: &Path, seed: &Path, db: &Path, max_pow: u32) -> anyhow::Result<()>
     dir.create(data)
         .with_context(|| format!("create {}", data.display()))?;
     Hub::init(seed, db, max_pow).context("create the hub")?;
-    tracing::info!(db = %db.display(), seed = %seed.display(), max_pow, "hub created: keep a copy of the seed");
+    if matches!(log, Log::Json) {
+        tracing::info!(db = %db.display(), seed = %seed.display(), max_pow, "hub created: keep a copy of the seed");
+    } else {
+        eprintln!("Hub created. Back up {}.", seed.display());
+    }
     Ok(())
 }
 
@@ -1280,6 +1289,7 @@ fn swap_provider(
     config: SwapsConfig,
     issuer: Issuer,
     transport: Http,
+    log: Log,
 ) -> anyhow::Result<Provider<Http>> {
     let (wallet, swaps) = (dir.join("wallet.sqlite"), dir.join("swaps.sqlite"));
     match (wallet.exists(), swaps.exists()) {
@@ -1307,7 +1317,14 @@ fn swap_provider(
             let address = hex::encode(wallet.address().to_bytes());
             let provider = Provider::create_issuing(&swaps, wallet, config, issuer)
                 .context("create the swaps file")?;
-            tracing::info!(dir = %dir.display(), %address, "swap provider created: back up its wallet file");
+            if matches!(log, Log::Json) {
+                tracing::info!(dir = %dir.display(), %address, "swap provider created: back up its wallet file");
+            } else {
+                eprintln!(
+                    "swap provider created: back up wallet.sqlite and swaps.sqlite in {}.",
+                    dir.display()
+                );
+            }
             Ok(provider)
         }
         _ => anyhow::bail!(

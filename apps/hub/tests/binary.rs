@@ -105,7 +105,13 @@ fn stats(data: &Path) -> serde_json::Value {
 fn a_hub_is_created_run_watched_and_stopped() {
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("hub");
-    stdout(&data, &["init", "--max-pow", "6"]);
+    let created = output(&data, &["init", "--max-pow", "6"]);
+    assert!(created.status.success(), "{created:?}");
+    let message = String::from_utf8_lossy(&created.stderr);
+    assert_eq!(
+        message,
+        format!("Hub created. Back up {}.\n", data.join("seed").display())
+    );
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -223,6 +229,13 @@ fn failures_exit_nonzero_and_log_as_asked() {
         .as_str()
         .unwrap()
         .contains("no hub database"));
+    let data = dir.path().join("structured");
+    let created = output(&data, &["--log", "json", "init", "--max-pow", "6"]);
+    assert!(created.status.success(), "{created:?}");
+    let line: serde_json::Value = serde_json::from_slice(&created.stderr).unwrap();
+    assert_eq!(line["level"], "INFO");
+    assert_eq!(line["fields"]["seed"], data.join("seed").to_str().unwrap());
+    assert_eq!(line["fields"]["max_pow"], 6);
     // Running needs a hub: it never creates one.
     let out = output(&missing, &["run", "--listen", "127.0.0.1:0"]);
     assert!(!out.status.success());

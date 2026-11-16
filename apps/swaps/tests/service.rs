@@ -130,10 +130,32 @@ fn init_creates_the_provider_once_and_status_reads_it() {
     let init = licash_swaps(&dir, &["init"]);
     assert!(init.status.success(), "{init:?}");
     let address = String::from_utf8(init.stdout).unwrap();
+    let message = String::from_utf8_lossy(&init.stderr);
+    assert!(
+        message.starts_with("Provider created. Back up wallet.sqlite and swaps.sqlite in "),
+        "{message}"
+    );
+    assert!(
+        !message.contains(address.trim()) && !message.contains("schema migrated"),
+        "{message}"
+    );
     assert_eq!(
         address.trim().len(),
         2 * licash::address::ADDRESS_BYTES,
         "{address}"
+    );
+    let machine = tempfile::tempdir().unwrap();
+    let created = licash_swaps(&machine, &["--log", "json", "init"]);
+    assert!(created.status.success(), "{created:?}");
+    let event = String::from_utf8_lossy(&created.stderr)
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .find(|line| line["fields"]["message"] == "provider created: back up its wallet file")
+        .unwrap();
+    assert_eq!(event["level"], "INFO");
+    assert_eq!(
+        event["fields"]["address"],
+        String::from_utf8_lossy(&created.stdout).trim()
     );
     let again = licash_swaps(&dir, &["init"]);
     assert!(!again.status.success());
