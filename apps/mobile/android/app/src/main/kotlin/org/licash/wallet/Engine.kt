@@ -1,6 +1,7 @@
 package org.licash.wallet
 
 import android.content.Context
+import android.net.Uri
 import androidx.lifecycle.DefaultLifecycleObserver
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.ProcessLifecycleOwner
@@ -917,6 +918,38 @@ class Engine(context: Context) {
     }
 
     /** Give up forcing contract `id` closed, its notes back: only until its request is final. */
+    /** Contract `id`'s statement to prove, saved `to` a file the user chose: private, it shows the notes claimed. */
+    suspend fun saveStatement(id: String, to: Uri): Result<Unit> = io {
+        val statement = local { it.recoveryStatement(id) }
+        val out = app.contentResolver.openOutputStream(to, "wt") ?: error("that file cannot be written")
+        out.use { it.write(statement) }
+        AppLog.info("statement of contract $id saved, ${statement.size} bytes")
+    }
+
+    /** The proof of contract `id`'s claim brought back `from` the file licash-r0 wrote: checked, kept, posted. */
+    fun bringProof(id: String, from: Uri) {
+        val light = light
+        if (light == null) {
+            notices.tryEmit(Event("Not connected to Bitcoin yet: try again in a moment."))
+            return
+        }
+        scope.launch {
+            try {
+                val export = withContext(Dispatchers.IO) {
+                    app.contentResolver.openInputStream(from)?.use { it.readBytes() }
+                } ?: error("that file cannot be read")
+                val brought = local { it.importRecoveryProof(GoChain(light), id, export) }
+                AppLog.info("proof of contract $id brought: ${brought.stage}")
+                notices.tryEmit(Event("Proof taken: posting it on Bitcoin"))
+            } catch (e: Exception) {
+                AppLog.warn("bringing the proof of contract $id", e)
+                notices.tryEmit(Event("Proof not taken. ${explain(e)}"))
+            } finally {
+                refresh()
+            }
+        }
+    }
+
     suspend fun giveUpRecovery(id: String): Result<Unit> = io {
         local { it.giveUpRecovery(id) }
         AppLog.info("forcing contract $id closed given up")

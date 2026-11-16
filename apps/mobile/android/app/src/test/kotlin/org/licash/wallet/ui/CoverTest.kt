@@ -123,6 +123,23 @@ class CoverTest {
     }
 
     @Test
+    fun a_forced_close_the_hub_answered_asks_for_its_proof_by_its_deadline() {
+        val answered = recovery(RecoveryStage.PROVING, irrevocable = true, nextAt = null)
+        assertEquals("The hub answered: preparing what to prove", forcing(answered, 1_000).says)
+        assertFalse(needsProof(answered))
+        val proving = answered.copy(deadline = 1_144u)
+        assertEquals("Proof needed", forcing(proving, 1_000).stands)
+        assertEquals("The hub answered: prove your claim within 24 hours", forcing(proving, 1_000).says)
+        assertTrue(needsProof(proving) && !forcing(proving, 1_000).failed)
+        assertFalse(needsProof(proving.copy(proved = true)))
+        val asserted = forcing(recovery(RecoveryStage.ASSERTED, true), 1_000)
+        assertEquals("The hub has 24 hours to challenge your proof", asserted.says)
+        assertEquals("Back on Bitcoin in 24 hours", forcing(recovery(RecoveryStage.PAID, true), 1_000).says)
+        // A counter, which this app does not answer: failed.
+        assertTrue(forcing(recovery(RecoveryStage.ANSWERED, true), 1_000).failed)
+    }
+
+    @Test
     fun the_coin_to_cash_out_first_pays_the_price_and_leaves_change() {
         assertEquals(33_000uL, firstCoin(23_000uL))
         assertEquals("0.00033000", btc(33_000uL))

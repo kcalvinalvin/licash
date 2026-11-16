@@ -87,6 +87,20 @@ class WatchTest {
     }
 
     @Test
+    fun a_proof_posted_keeps_the_app_at_work_until_paid() {
+        fun forced(stage: RecoveryStage) = Recovery(
+            id = "c0", stage = stage, irrevocable = true, claimed = 3_000uL, notes = 7u, request = null,
+            publication = null, timeout = null, sweep = null, nextAt = null, error = null, deadline = 2_000u,
+        )
+        for (stage in listOf(RecoveryStage.ASSERTING, RecoveryStage.ASSERTED, RecoveryStage.CHALLENGED)) {
+            assertEquals(stage.name, Watch.NOW, watchOf(Ui(recoveries = listOf(forced(stage))), now))
+        }
+        for (stage in listOf(RecoveryStage.PROVING, RecoveryStage.PAID)) {
+            assertEquals(stage.name, Watch.LATER, watchOf(Ui(recoveries = listOf(forced(stage))), now))
+        }
+    }
+
+    @Test
     fun a_lightning_invoice_asked_is_looked_for_later_for_a_day() {
         assertEquals(Watch.LATER, watchOf(Ui(asked = now - ASKED_SECS + 60), now))
         assertEquals(Watch.NONE, watchOf(Ui(asked = now - ASKED_SECS), now))

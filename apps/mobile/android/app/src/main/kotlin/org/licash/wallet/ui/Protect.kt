@@ -1,5 +1,6 @@
 package org.licash.wallet.ui
 
+import android.net.Uri
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Column
@@ -52,6 +53,8 @@ internal fun CoverRow(
     end: () -> Unit,
     forceClose: () -> Unit,
     giveUp: () -> Unit,
+    saveStatement: (Uri) -> Unit = {},
+    bringProof: (Uri) -> Unit = {},
 ) {
     val colors = MaterialTheme.colorScheme
     val cover = cover(c, height)
@@ -112,6 +115,7 @@ internal fun CoverRow(
             Column {
                 if (recovery != null) {
                     Forced(recovery, developer, giveUp)
+                    if (needsProof(recovery)) ProveElsewhere(recovery, saveStatement, bringProof)
                 } else {
                     Unfolded(c, cover, developer, end, forceClose)
                 }
@@ -159,6 +163,10 @@ private fun Forced(r: Recovery, developer: Boolean, giveUp: () -> Unit) {
         r.request?.let { Line("Request", it.take(16) + "…") }
         r.publication?.let { Line("Claim", it.take(16) + "…") }
         r.timeout?.let { Line("Payback", it.take(16) + "…") }
+        r.response?.let { Line("Hub's answer", it.take(16) + "…") }
+        r.deadline?.let { Line("Prove by", "block $it") }
+        r.assertion?.let { Line("Proof", it.take(16) + "…") }
+        r.payout?.let { Line("Payout", it.take(16) + "…") }
         r.sweep?.let { Line("Sweep", it.take(16) + "…") }
     }
     if (r.stage == RecoveryStage.CLAIMED && !r.irrevocable) {

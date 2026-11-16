@@ -45,14 +45,19 @@ internal fun watchOf(ui: Ui, now: Long): Watch {
     val asked = ui.asked?.let { it > now - ASKED_SECS } ?: false
     // A forced close moves on with blocks, an hour or a day apart: a look now and then.
     val forcing = ui.recoveries.any { carriedOn(it) }
+    // A proof posted: a challenge of it is answered within hours, not when a periodic job comes.
+    val disputed = ui.recoveries.any { it.stage in DISPUTED }
     return when {
-        contracting || under.any { !unpaid(it, ui.under[it.key]) } -> Watch.NOW
+        contracting || disputed || under.any { !unpaid(it, ui.under[it.key]) } -> Watch.NOW
         under.isNotEmpty() || asked || forcing -> Watch.LATER
         else -> Watch.NONE
     }
 }
 
-/** Whether a forced close is carried on as blocks come: not once over, nor answered (a proof this app does not make). */
+/** A forced close's stages from its proof's posting until paid: kept at work, the hub's challenge to answer in time. */
+internal val DISPUTED = setOf(RecoveryStage.ASSERTING, RecoveryStage.ASSERTED, RecoveryStage.CHALLENGED)
+
+/** Whether a forced close is carried on as blocks come: not once over, nor countered (which this app does not answer). */
 internal fun carriedOn(recovery: Recovery): Boolean =
     recovery.stage !in setOf(RecoveryStage.DONE, RecoveryStage.ANSWERED, RecoveryStage.LOST)
 

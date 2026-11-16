@@ -209,11 +209,24 @@ fun forcing(recovery: Recovery, height: Int): Forcing {
         RecoveryStage.TIMING_OUT -> "Paying back" to (wait?.let { "Back on Bitcoin in $it" } ?: "The hub did not answer")
         RecoveryStage.SWEEPING -> "Sweeping" to "To your Bitcoin, once in a block"
         RecoveryStage.DONE -> "Recovered" to "${sat(recovery.claimed)} back on Bitcoin"
-        RecoveryStage.ANSWERED -> "Answered" to "The hub answered: a proof is needed, which this app does not make yet"
+        RecoveryStage.ANSWERED -> "Answered" to "The hub countered, which this app cannot answer yet"
         RecoveryStage.LOST -> "Lost" to "Its bitcoin went elsewhere"
+        RecoveryStage.PROVING -> "Proof needed" to proving(recovery, height)
+        RecoveryStage.ASSERTING -> "Proving" to "Posting your proof on Bitcoin"
+        RecoveryStage.ASSERTED -> "Proved" to (wait?.let { "The hub has $it to challenge your proof" } ?: "Being paid")
+        RecoveryStage.CHALLENGED -> "Challenged" to "Answering the hub's challenge of your proof"
+        RecoveryStage.PAID -> "Paying back" to (wait?.let { "Back on Bitcoin in $it" } ?: "Paid on Bitcoin")
     }
     val failed = recovery.stage == RecoveryStage.ANSWERED || recovery.stage == RecoveryStage.LOST
     return Forcing(stands, says, revocable, failed)
+}
+
+/** What a forced close the hub answered waits for: the statement to prove, then its proof by its deadline. */
+private fun proving(recovery: Recovery, height: Int): String {
+    val deadline = recovery.deadline ?: return "The hub answered: preparing what to prove"
+    if (recovery.proved) return "Your proof is kept: posting it"
+    val left = span(deadline.toLong() - height).takeIf { height > 0 }
+    return left?.let { "The hub answered: prove your claim within $it" } ?: "The hub answered: prove your claim"
 }
 
 /** The steps of setting a protection up, the last its payment confirming. */

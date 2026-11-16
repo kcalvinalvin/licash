@@ -103,6 +103,10 @@ internal fun HubPage(
                     giveUp = {
                         scope.launch { engine.giveUpRecovery(c.id).onFailure { fail(explain(it)) } }
                     },
+                    saveStatement = { to ->
+                        scope.launch { engine.saveStatement(c.id, to).onFailure { fail(explain(it)) } }
+                    },
+                    bringProof = { from -> engine.bringProof(c.id, from) },
                 )
             }
             if (opening && !stepping) {

@@ -2,7 +2,10 @@
 //! hub, up to the contract's cap, claimed on Bitcoin, paid back on Bitcoin
 //! once the hub's window to answer passed. Started only by the holder's
 //! explicit choice, carried on with the other contracts as the chain
-//! moves.
+//! moves. A hub that answers instead leaves it to the holder's proof of
+//! her claim, made elsewhere from the statement the wallet exports
+//! ([`Wallet::recovery_statement`]) and brought back
+//! ([`Wallet::import_recovery_proof`]).
 
 use std::sync::{Arc, PoisonError};
 
@@ -44,6 +47,20 @@ pub struct Recovery {
     pub next_at: Option<u32>,
     /// What stopped its last step, if anything did.
     pub error: Option<String>,
+    /// The hub's answer to its request, its id in hex, and the last block
+    /// the proof may be posted in, once known.
+    #[uniffi(default = None)]
+    pub response: Option<String>,
+    #[uniffi(default = None)]
+    pub deadline: Option<u32>,
+    /// Whether its proof is kept.
+    #[uniffi(default = false)]
+    pub proved: bool,
+    /// The proof posted, and the payout after it, their ids in hex.
+    #[uniffi(default = None)]
+    pub assertion: Option<String>,
+    #[uniffi(default = None)]
+    pub payout: Option<String>,
 }
 
 /// Where a forced close stands.
@@ -63,11 +80,23 @@ pub enum RecoveryStage {
     Sweeping,
     /// Its value back in the wallet on Bitcoin.
     Done,
-    /// The hub answered: a proof is needed, which this app does not make
+    /// The hub countered its request, which this app does not answer
     /// yet.
     Answered,
     /// The contract's collateral went elsewhere.
     Lost,
+    /// The hub answered: the statement to prove being built from the
+    /// chain, then the proof needed by [`Recovery::deadline`].
+    Proving,
+    /// The proof posted on Bitcoin, until in a block.
+    Asserting,
+    /// The proof in a block: the hub's chance to challenge it running,
+    /// then the payout on its way.
+    Asserted,
+    /// The hub challenged the proof: the answer on its way.
+    Challenged,
+    /// The payout after the proof in a block: its delay running.
+    Paid,
 }
 
 fn stage(s: Stage) -> RecoveryStage {
@@ -75,15 +104,15 @@ fn stage(s: Stage) -> RecoveryStage {
         Stage::Claiming | Stage::Claimed | Stage::GivingUp => RecoveryStage::Claimed,
         Stage::Irrevocable | Stage::Signing | Stage::Published => RecoveryStage::Requesting,
         Stage::Requested => RecoveryStage::Requested,
-        Stage::TimingOut | Stage::TimedOut | Stage::Paid => RecoveryStage::TimingOut,
+        Stage::TimingOut | Stage::TimedOut => RecoveryStage::TimingOut,
         Stage::Sweeping => RecoveryStage::Sweeping,
         Stage::Done => RecoveryStage::Done,
-        Stage::Answered
-        | Stage::Proving
-        | Stage::Asserting
-        | Stage::Asserted
-        | Stage::Succeeding
-        | Stage::Answering => RecoveryStage::Answered,
+        Stage::Countered => RecoveryStage::Answered,
+        Stage::Answered | Stage::Proving => RecoveryStage::Proving,
+        Stage::Asserting => RecoveryStage::Asserting,
+        Stage::Asserted | Stage::Succeeding => RecoveryStage::Asserted,
+        Stage::Answering => RecoveryStage::Challenged,
+        Stage::Paid => RecoveryStage::Paid,
         Stage::Lost => RecoveryStage::Lost,
     }
 }
@@ -102,6 +131,11 @@ fn shown(r: &recovery::Recovery) -> Recovery {
         sweep: txid(r.sweep),
         next_at: r.next_at,
         error: r.error.clone(),
+        response: txid(r.response),
+        deadline: r.deadline,
+        proved: r.proved,
+        assertion: txid(r.assertion),
+        payout: txid(r.payout),
     }
 }
 
@@ -147,6 +181,38 @@ impl Wallet {
         Ok(all.iter().map(shown).collect())
     }
 
+    /// The statement to prove of contract `id` (in hex), once the hub
+    /// answered and it is built ([`RecoveryStage::Proving`]): to prove
+    /// on a computer (`licash-r0 native-prove-succinct`, then
+    /// `native-wrap`). Private: it shows the notes claimed.
+    pub fn recovery_statement(&self, id: String) -> Result<Vec<u8>, LicashError> {
+        let id = contract_id(&id)?;
+        recovery::statement(&self.dir, &id).map_err(failed)
+    }
+
+    /// Bring back the proof of contract `id`'s claim, `export` as
+    /// `licash-r0 native-wrap` wrote it: checked against the contract,
+    /// kept, and posted on Bitcoin through `chain` at once. The same proof
+    /// again is no error; another is refused once one is kept.
+    pub fn import_recovery_proof(
+        &self,
+        chain: Arc<dyn ChainSource>,
+        id: String,
+        export: Vec<u8>,
+    ) -> Result<Recovery, LicashError> {
+        let id = contract_id(&id)?;
+        let _contracting = self
+            .contracting
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let chain = Chain(chain, self.wallet.network());
+        let imported =
+            recovery::import_proof(&self.wallet, &chain, &self.dir, &id, &export, rate());
+        let imported = self.runtime.block_on(imported).map_err(failed)?;
+        tracing::warn!(id = %hex::encode(id), stage = imported.stage.as_str(), "a contract's proof brought");
+        Ok(shown(&imported))
+    }
+
     /// Give up forcing contract `id` closed, its notes back in the
     /// balance: only while [`RecoveryStage::Claimed`].
     pub fn give_up_recovery(&self, id: String) -> Result<(), LicashError> {
@@ -166,6 +232,32 @@ impl Wallet {
         let advanced = recovery::advance(&self.wallet, chain, &self.dir, rate());
         if let Err(e) = self.runtime.block_on(advanced) {
             tracing::warn!("forced closes not carried on: {e:#}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The app's stages of a forced close the hub answered: its proof
+    /// awaited, posted, challenged, paid; a counter, which this app does
+    /// not answer, as answered, at an end for it.
+    #[test]
+    fn a_disputed_close_shows_its_own_stages_and_a_counter_as_answered() {
+        let cases = [
+            (Stage::Answered, RecoveryStage::Proving),
+            (Stage::Proving, RecoveryStage::Proving),
+            (Stage::Asserting, RecoveryStage::Asserting),
+            (Stage::Asserted, RecoveryStage::Asserted),
+            (Stage::Succeeding, RecoveryStage::Asserted),
+            (Stage::Answering, RecoveryStage::Challenged),
+            (Stage::Paid, RecoveryStage::Paid),
+            (Stage::Countered, RecoveryStage::Answered),
+            (Stage::TimedOut, RecoveryStage::TimingOut),
+        ];
+        for (s, shown) in cases {
+            assert_eq!(stage(s), shown, "{}", s.as_str());
         }
     }
 }
