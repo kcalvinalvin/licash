@@ -60,6 +60,12 @@ class WatchTest {
     }
 
     @Test
+    fun a_payment_on_its_way_to_its_payee_is_looked_at_later() {
+        assertEquals(Watch.LATER, watchOf(Ui(onTheirWay = 1u), now))
+        assertEquals(Watch.NONE, watchOf(Ui(onTheirWay = 0u), now))
+    }
+
+    @Test
     fun a_contract_being_opened_is_watched_now() {
         assertEquals(Watch.NOW, watchOf(Ui(opening = "https://hub.example"), now))
     }

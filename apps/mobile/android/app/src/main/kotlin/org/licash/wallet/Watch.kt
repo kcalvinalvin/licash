@@ -47,9 +47,11 @@ internal fun watchOf(ui: Ui, now: Long): Watch {
     val forcing = ui.recoveries.any { carriedOn(it) }
     // A proof posted: a challenge of it is answered within hours, not when a periodic job comes.
     val disputed = ui.recoveries.any { it.stage in DISPUTED }
+    // Mailed to its payee within the hour unless collected at its hub: a look now and then does.
+    val delivering = ui.onTheirWay > 0u
     return when {
         contracting || disputed || under.any { !unpaid(it, ui.under[it.key]) } -> Watch.NOW
-        under.isNotEmpty() || asked || forcing -> Watch.LATER
+        under.isNotEmpty() || asked || forcing || delivering -> Watch.LATER
         else -> Watch.NONE
     }
 }

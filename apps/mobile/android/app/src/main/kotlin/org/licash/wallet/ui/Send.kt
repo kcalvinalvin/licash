@@ -84,8 +84,8 @@ private sealed interface Step {
     data object Busy : Step
     data object Quoting : Step
     data class PayingOut(val amount: ULong, val depth: UInt) : Step
-    /** To the code `code`, if one. */
-    data class Sent(val amount: ULong, val handover: String?, val code: String? = null) : Step
+    /** To the code `code`, if one; `kept` at its hub for the payee to collect. */
+    data class Sent(val amount: ULong, val handover: String?, val code: String? = null, val kept: Boolean = false) : Step
     data class Paid(val amount: ULong, val fee: ULong) : Step
     data object Later : Step
     data class Received(val amount: ULong) : Step
@@ -178,7 +178,7 @@ fun Send(
 
     suspend fun paying(code: String, amount: ULong?): Step =
         engine.pay(code, amount).fold(
-            { Step.Sent(it.amount, it.handover, code) },
+            { Step.Sent(it.amount, it.handover, code, it.kept) },
             { e -> if (e is LicashException.Pending) Step.Later else Step.Failed(explain(e)) },
         )
 
@@ -629,7 +629,7 @@ private fun Sent(s: Step.Sent, back: () -> Unit) {
         Spacer(Modifier.height(32.dp))
         Text("Sent ${sat(s.amount)}", style = MaterialTheme.typography.headlineSmall)
         Text(
-            "Hand them this to finish",
+            if (s.kept) "They collect it from the hub. If they can't, hand them this" else "Hand them this to finish",
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             textAlign = TextAlign.Center,
