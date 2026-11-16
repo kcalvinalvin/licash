@@ -80,6 +80,9 @@ pub struct Inboxed {
     /// The hubs not looked through, or not to the end, and why: looked
     /// through again from there next time.
     pub failed: Vec<(String, String)>,
+    /// How many hubs answered that they keep payments, their inboxes
+    /// looked through to the end or not.
+    pub served: usize,
 }
 
 /// Record that send `id`, to the payee sharing receipt secret `shared`,
@@ -393,21 +396,25 @@ impl<T: Transport> Wallet<T> {
             Ok(rows.collect::<Result<_, _>>()?)
         })?;
         let looked = each_at_most(HUBS_AT_ONCE, hubs, |(hub, url, after)| async move {
-            let mut received = Vec::new();
-            let failed = self.collect_at(hub, &url, after, &mut received).await;
+            let (mut received, mut served) = (Vec::new(), false);
+            let failed = self
+                .collect_at(hub, &url, after, &mut received, &mut served)
+                .await;
             let failed = failed.err().map(|e| (url, e.to_string()));
-            Ok::<_, Error>((received, failed))
+            Ok::<_, Error>((received, failed, served))
         });
         let mut inboxed = Inboxed::default();
-        for (received, failed) in looked.await? {
+        for (received, failed, served) in looked.await? {
             inboxed.received.extend(received);
             inboxed.failed.extend(failed);
+            inboxed.served += usize::from(served);
         }
         Ok(inboxed)
     }
 
     /// [`Wallet::collect_inbox`] at hub `hub`, at `url`, after entry
-    /// `after`, adding the payments taken to `received`. Only a failure to
+    /// `after`, adding the payments taken to `received`, and telling
+    /// `served` once the hub answers that it keeps payments. Only a failure to
     /// reach the hub or keep a payment holds the inbox where it was: an
     /// entry whose payment is not the wallet's, or does not open, is
     /// passed, so that no payer stalls the wallet's inbox with one.
@@ -417,6 +424,7 @@ impl<T: Transport> Wallet<T> {
         url: &str,
         mut after: i64,
         received: &mut Vec<Received>,
+        served: &mut bool,
     ) -> Result<(), Error> {
         let scan = self.owner.scan_key().clone();
         let mut refreshed = false;
@@ -424,6 +432,7 @@ impl<T: Transport> Wallet<T> {
             let Some(feed) = self.feed(url, after).await? else {
                 return Ok(());
             };
+            *served = true;
             let mine: Vec<(u64, [u8; 32])> = feed
                 .entries
                 .iter()

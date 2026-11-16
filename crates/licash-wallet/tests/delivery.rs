@@ -91,6 +91,7 @@ async fn a_payment_to_a_code_is_collected_at_its_hub_and_never_mailed() {
 
     let collected = bob.collect_inbox().await.unwrap();
     assert!(collected.failed.is_empty(), "{:?}", collected.failed);
+    assert_eq!(collected.served, 1);
     assert_eq!(collected.received.len(), 1);
     assert_eq!(collected.received[0].id, paid.id);
     assert_eq!(collected.received[0].amount, 8);
@@ -169,6 +170,7 @@ async fn a_hub_keeping_no_payments_has_them_mailed_at_once() {
     // Bob finds no inbox there, which is no failure.
     let collected = bob.collect_inbox().await.unwrap();
     assert!(collected.received.is_empty() && collected.failed.is_empty());
+    assert_eq!(collected.served, 0);
 }
 
 #[tokio::test]
