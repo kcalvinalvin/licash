@@ -123,7 +123,16 @@ estimate). `recoveries --chain <url>` carries every forced close on as
 far as the chain lets it and shows the block its next step waits for: run
 it until it is `done`, when the claimed notes' value and both reserves
 are back in the wallet on Bitcoin. A hub that answers the request instead
-(`answered`) needs a proof this wallet does not make yet.
+(`answered`) leaves it to the wallet's proof of its claim: once the request
+and its publication are deep enough, the forced close is `proving`, and
+`recovery-statement <id>` writes the statement to prove (it shows the
+wallet's notes: keep it private) with the commands that prove it with
+`licash-r0` on a machine with 16 GB of memory, the Groth16 step on x86
+with Docker. `import-proof <id> proof.json --chain <url>` brings the proof
+back before the block `recoveries` shows: checked, kept, and asserted on
+Bitcoin at once. `recoveries --chain <url>` then carries it on to `done`
+(`asserted`, `succeeding`, `paid`, `sweeping`), answering the hub if it
+challenges the proof. A hub's counter is not answered yet.
 
 `discover --relay wss://relay.example` lists the hubs announced on Nostr,
 at the URLs that answer as the hub that announced them; with `--swaps`, the

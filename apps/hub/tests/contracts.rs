@@ -618,7 +618,8 @@ async fn a_holder_proves_her_claim_against_a_hub_that_answered_and_takes_her_not
     let requested = &requested[0];
     ensure!(requested.stage == Stage::Requested, "{requested:?}");
 
-    // No proof is taken before the hub answers, nor anything not one.
+    // No statement to prove, nor proof taken, before the hub answers.
+    ensure!(recovery::statement(&mine, &opened.id).is_err());
     let early = recovery::import_proof(&wallet, &chain, &mine, &opened.id, b"{}", rate).await;
     ensure!(early.is_err(), "{early:?}");
 
@@ -668,6 +669,11 @@ async fn a_holder_proves_her_claim_against_a_hub_that_answered_and_takes_her_not
         .join(hex::encode(opened.id))
         .join("statement.input");
     ensure!(kept.exists(), "no statement kept at {}", kept.display());
+    // What another machine proves: her statement's input, whole.
+    let statement = recovery::statement(&mine, &opened.id)?;
+    ensure!(statement == std::fs::read(&kept)?);
+    licash::statement::StatementInput::from_bytes(&statement)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     // Another proof is refused: not an export, of another program.
     let refused = |e: Result<recovery::Recovery>| format!("{:#}", e.unwrap_err());

@@ -454,6 +454,24 @@ pub fn recoveries(dir: &std::path::Path) -> Result<Vec<Recovery>> {
     }
 }
 
+/// Her statement's input of contract `id` among those in `dir`, as kept
+/// once the hub answered her request: what her proof is of, to prove
+/// where she chooses (`licash-r0 native-prove-succinct`, then
+/// `native-wrap`) and bring back by [`import_proof`]. Private: it shows
+/// her notes and links them to her. Refused before it is built.
+pub fn statement(dir: &std::path::Path, id: &[u8; 32]) -> Result<Vec<u8>> {
+    let store = Store::existing(dir)?.context("no contracts")?;
+    let row = store.recovery(id)?.context("no recovery of it")?;
+    let stage = Stage::parse(&row.stage)?;
+    ensure!(
+        stage.disputed() && stage != Stage::Answered,
+        "no statement to prove at stage {}",
+        stage.as_str()
+    );
+    let path = store.statement_path(id);
+    std::fs::read(&path).with_context(|| format!("{}", path.display()))
+}
+
 /// Give up recovering contract `id`, her notes given back to her: only
 /// before her request is signed.
 pub fn give_up<T: Transport>(
