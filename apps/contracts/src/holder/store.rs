@@ -77,13 +77,20 @@ pub(super) struct RecoveryRow {
 /// in a directory of its id each.
 const KEPT_DIR: &str = "contracts";
 
+/// Beside a contract's kept instances, her statement's input once she
+/// forced it closed and the hub answered: what her proof is of.
+const STATEMENT: &str = "statement.input";
+
 /// Of the instances opening `id` in `dir` keeps, how many are on disk:
 /// those `Store::keep` finished writing. None if it keeps none there.
 pub fn kept(dir: &Path, id: &[u8; 32]) -> usize {
     let Ok(entries) = std::fs::read_dir(dir.join(KEPT_DIR).join(crate::hex_id(id))) else {
         return 0;
     };
-    let written = |e: &std::fs::DirEntry| !e.file_name().to_string_lossy().ends_with(".new");
+    let written = |e: &std::fs::DirEntry| {
+        let name = e.file_name().to_string_lossy().into_owned();
+        !name.ends_with(".new") && name != STATEMENT
+    };
     entries.filter_map(Result::ok).filter(written).count()
 }
 
@@ -365,6 +372,37 @@ impl Store {
         file.sync_all()?;
         std::fs::rename(&aside, &path)?;
         std::fs::File::open(&dir)?.sync_all()?;
+        Ok(())
+    }
+
+    /// Instance `index` of assertion `stage` of opening `id`, as kept.
+    pub fn kept_instance(&self, id: &[u8; 32], stage: usize, index: usize) -> Result<Vec<u8>> {
+        let path = self
+            .kept
+            .join(crate::hex_id(id))
+            .join(format!("{stage}-{index}"));
+        std::fs::read(&path).with_context(|| format!("{}", path.display()))
+    }
+
+    /// Where her statement's input of contract `id` is kept, beside its
+    /// instances.
+    pub fn statement_path(&self, id: &[u8; 32]) -> std::path::PathBuf {
+        self.kept.join(crate::hex_id(id)).join(STATEMENT)
+    }
+
+    /// Keep her statement's input of contract `id`, on disk whole before
+    /// her state relies on it.
+    pub fn keep_statement(&self, id: &[u8; 32], bytes: &[u8]) -> Result<()> {
+        let path = self.statement_path(id);
+        let aside = path.with_extension("new");
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).with_context(|| format!("{}", dir.display()))?;
+        }
+        let mut file =
+            std::fs::File::create(&aside).with_context(|| format!("{}", aside.display()))?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&aside, &path)?;
         Ok(())
     }
 

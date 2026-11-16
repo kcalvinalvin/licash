@@ -75,10 +75,15 @@ fn stage(s: Stage) -> RecoveryStage {
         Stage::Claiming | Stage::Claimed | Stage::GivingUp => RecoveryStage::Claimed,
         Stage::Irrevocable | Stage::Signing | Stage::Published => RecoveryStage::Requesting,
         Stage::Requested => RecoveryStage::Requested,
-        Stage::TimingOut | Stage::TimedOut => RecoveryStage::TimingOut,
+        Stage::TimingOut | Stage::TimedOut | Stage::Paid => RecoveryStage::TimingOut,
         Stage::Sweeping => RecoveryStage::Sweeping,
         Stage::Done => RecoveryStage::Done,
-        Stage::Answered => RecoveryStage::Answered,
+        Stage::Answered
+        | Stage::Proving
+        | Stage::Asserting
+        | Stage::Asserted
+        | Stage::Succeeding
+        | Stage::Answering => RecoveryStage::Answered,
         Stage::Lost => RecoveryStage::Lost,
     }
 }

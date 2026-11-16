@@ -18,7 +18,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use anyhow::{ensure, Result};
+use anyhow::{ensure, Context as _, Result};
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path as UrlPath, Query, State};
 use axum::http::StatusCode;
@@ -290,6 +290,26 @@ impl Openings {
                 }
             }
         });
+    }
+
+    /// Its plain answer to `r`, the holder's request on Bitcoin in
+    /// opening `id`, to broadcast: her proof decides then. Refused for an
+    /// opening not funded, given up or unknown, or a transaction not its
+    /// request. No answer is made by the hub on its own yet: an operator
+    /// (or a test) asks for it.
+    pub async fn respond(
+        &self,
+        id: &[u8; 32],
+        r: &bitcoin::Transaction,
+    ) -> Result<bitcoin::Transaction> {
+        let ctx = self
+            .context()
+            .await
+            .map_err(|e| anyhow::anyhow!(e.reason))?;
+        let row = self.store().row(id)?;
+        let row = row.with_context(|| format!("no opening {}", crate::hex_id(id)))?;
+        ensure!(!row.abandoned, "an opening given up");
+        Hub::load(&row.state, &ctx)?.respond(r)
     }
 
     async fn context(&self) -> Result<Context, Refused> {

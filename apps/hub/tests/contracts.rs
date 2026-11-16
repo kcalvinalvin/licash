@@ -541,6 +541,193 @@ async fn a_holder_forces_her_contract_closed_on_a_silent_hub_and_takes_her_notes
     Ok(())
 }
 
+/// As [`hub_serving`], and its openings, for a test to answer a holder's
+/// request with.
+async fn hub_answering(
+    rt: &Regtest,
+    dir: &Path,
+) -> Result<(String, Source, Arc<Hub>, Arc<Openings>)> {
+    std::fs::create_dir_all(dir)?;
+    let (seed, db) = (dir.join("seed"), dir.join("hub.sqlite"));
+    Hub::init(&seed, &db, 12)?;
+    let hub = Arc::new(Hub::open(&seed, &db, Policy::default())?);
+    let url = format!(
+        "{}/wallet/harness?cookie={}",
+        rt.rpc_url(),
+        rt.cookie().display()
+    );
+    let source: Source = url.parse()?;
+    let keyset = hub.info().keysets[0].clone();
+    let openings = Openings::with_wallet(dir, source.clone(), source.clone(), keyset, None);
+    let openings = openings.await?;
+    let services = Services {
+        contracts: Some(openings.clone()),
+        ..Default::default()
+    };
+    let app = licash_hub_service::router(hub.clone(), services);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let url = format!("http://{}", listener.local_addr()?);
+    tokio::spawn(async move { axum::serve(listener, app).await });
+    Ok((url, source, hub, openings))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs bitcoind and a release build"]
+async fn a_holder_proves_her_claim_against_a_hub_that_answered_and_takes_her_notes_value(
+) -> Result<()> {
+    use bitcoin::FeeRate;
+    use licash_contracts::holder::recovery::{self, Stage};
+
+    let rt = Regtest::start_standard()?;
+    let dir = tempfile::tempdir()?;
+    let at = dir.path().join("hub");
+    let (url, source, hub, openings) = hub_answering(&rt, &at).await?;
+    let chain = Node(source);
+    let mine = dir.path().join("wallet");
+    std::fs::create_dir(&mine)?;
+    let regtest = ChainProfile::Core30DefaultRegtest;
+    let wallet = Wallet::create(
+        &mine.join("wallet.sqlite"),
+        &[9; 32],
+        regtest,
+        Http::new(None)?,
+    )?;
+    wallet.add_hub(&url).await?;
+    wallet.watch_silent(None, rt.height()?)?;
+    for sats in [60_000, 50_000] {
+        let to = wallet.fallback_address()?.script_pubkey();
+        rt.fund(&to, Amount::from_sat(sats))?;
+    }
+    rt.mine(1)?;
+    ensure!(scan(&wallet, &chain).await? == 110_000);
+    let opened = holder::open(&wallet, &chain, &mine, &url, ask()).await?;
+    let rate = FeeRate::from_sat_per_vb(2).context("a rate")?;
+    let payment = pay(&hub, &at.join("seed"), &url, &wallet.address(), 3_000)?;
+    wallet.receive(&payment)?;
+    rt.mine(1)?;
+    holder::resume(&wallet, &chain, &mine).await?;
+
+    // Forced closed; R and P in a block once revocable no more.
+    let forced = recovery::force_close(&wallet, &chain, &mine, &opened.id, rate).await?;
+    ensure!(forced.stage == Stage::Claimed, "{forced:?}");
+    rt.mine_to_height(forced.next_at.context("no lock")? - 1)?;
+    let sent = recovery::advance(&wallet, &chain, &mine, rate).await?;
+    ensure!(sent[0].stage == Stage::Published, "{sent:?}");
+    rt.mine(1)?;
+    let requested = recovery::advance(&wallet, &chain, &mine, rate).await?;
+    let requested = &requested[0];
+    ensure!(requested.stage == Stage::Requested, "{requested:?}");
+
+    // No proof is taken before the hub answers, nor anything not one.
+    let early = recovery::import_proof(&wallet, &chain, &mine, &opened.id, b"{}", rate).await;
+    ensure!(early.is_err(), "{early:?}");
+
+    // The hub answers: her proof decides.
+    let r = rt.get_tx(&requested.request.context("no R")?)?;
+    let answer = openings.respond(&opened.id, &r).await?;
+    let wrong = openings.respond(&opened.id, &answer).await;
+    ensure!(wrong.is_err(), "an answer to its own answer");
+    rt.send_raw(&answer)?;
+    rt.mine(1)?;
+    let answered = &recovery::advance(&wallet, &chain, &mine, rate).await?[0];
+    ensure!(answered.error.is_none(), "{answered:?}");
+    ensure!(
+        answered.response == Some(answer.compute_txid()) && answered.timeout.is_none(),
+        "{answered:?}"
+    );
+    ensure!(
+        matches!(answered.stage, Stage::Answered | Stage::Asserting),
+        "{answered:?}"
+    );
+    let deadline = answered.deadline;
+
+    // Her statement built once R and P are deep enough, her proof made
+    // under the mock authority, her assert broadcast, then in a block.
+    let mut asserted = answered.clone();
+    for _ in 0..20 {
+        if asserted.stage == Stage::Asserted {
+            break;
+        }
+        ensure!(asserted.error.is_none(), "{asserted:?}");
+        rt.mine(1)?;
+        asserted = recovery::advance(&wallet, &chain, &mine, rate).await?[0].clone();
+    }
+    ensure!(asserted.stage == Stage::Asserted, "{asserted:?}");
+    ensure!(asserted.error.is_none(), "{asserted:?}");
+    ensure!(
+        asserted.proved && asserted.assertion.is_some(),
+        "{asserted:?}"
+    );
+    let deadline = deadline.or(asserted.deadline).context("no deadline")?;
+    ensure!(
+        asserted.asserted_at.is_some_and(|h| h <= deadline),
+        "{asserted:?}"
+    );
+    let kept = mine
+        .join("contracts")
+        .join(hex::encode(opened.id))
+        .join("statement.input");
+    ensure!(kept.exists(), "no statement kept at {}", kept.display());
+
+    // Another proof is refused: not an export, of another program.
+    let refused = |e: Result<recovery::Recovery>| format!("{:#}", e.unwrap_err());
+    let garbage = recovery::import_proof(&wallet, &chain, &mine, &opened.id, b"[", rate).await;
+    ensure!(refused(garbage).contains("not a proof's export"));
+    let other = serde_json::json!({
+        "image_id": hex::encode([0u8; 32]),
+        "journal": "",
+        "proof": hex::encode([0u8; 128]),
+    });
+    let other = serde_json::to_vec(&other)?;
+    let other = recovery::import_proof(&wallet, &chain, &mine, &opened.id, &other, rate).await;
+    ensure!(refused(other).contains("another program"));
+
+    // The hub's chance to challenge passes: success, of P's fee coin.
+    let chance_end = asserted.next_at.context("no chance")?;
+    rt.mine_to_height(chance_end - 2)?;
+    let held = recovery::advance(&wallet, &chain, &mine, rate).await?;
+    ensure!(held[0].stage == Stage::Asserted, "{held:?}");
+    rt.mine(1)?;
+    let succeeding = &recovery::advance(&wallet, &chain, &mine, rate).await?[0];
+    ensure!(succeeding.stage == Stage::Succeeding, "{succeeding:?}");
+    ensure!(succeeding.error.is_none(), "{succeeding:?}");
+    ensure!(succeeding.payout.is_some(), "{succeeding:?}");
+    rt.mine(1)?;
+    let paid = &recovery::advance(&wallet, &chain, &mine, rate).await?[0];
+    ensure!(
+        paid.stage == Stage::Paid && paid.paid_at == Some(rt.height()?),
+        "{paid:?}"
+    );
+
+    // Her bits and reserve, swept to her wallet once their delay passed.
+    let delay_end = paid.next_at.context("no delay")?;
+    rt.mine_to_height(delay_end - 2)?;
+    let held = recovery::advance(&wallet, &chain, &mine, rate).await?;
+    ensure!(held[0].stage == Stage::Paid, "{held:?}");
+    let before = scan(&wallet, &chain).await?;
+    rt.mine(1)?;
+    let sweeping = &recovery::advance(&wallet, &chain, &mine, rate).await?[0];
+    ensure!(sweeping.stage == Stage::Sweeping, "{sweeping:?}");
+    let sweep = sweeping.sweep.context("no sweep")?;
+    rt.mine(1)?;
+    let done = &recovery::advance(&wallet, &chain, &mine, rate).await?[0];
+    ensure!(
+        done.stage == Stage::Done && done.swept_at == Some(rt.height()?),
+        "{done:?}"
+    );
+    let swept = rt.get_tx(&sweep)?.output[0].value.to_sat();
+    let after = scan(&wallet, &chain).await?;
+    ensure!(
+        after == before + swept,
+        "{before} then {after}, {swept} swept"
+    );
+    ensure!(swept > 3_000, "{swept} swept");
+    eprintln!("swept {swept} sat to her wallet after her proof");
+    let over = recovery::advance(&wallet, &chain, &mine, rate).await?;
+    ensure!(over[0] == *done, "{over:?}");
+    Ok(())
+}
+
 /// A hub service opening contracts as [`hub_serving`], of notes up to
 /// 2^30 sat, taking deposits of up to 2 M sat for 1000 sat each, scanning
 /// `rt` once [`followed`]: its URL, chain, it and its deposits.

@@ -40,4 +40,10 @@ impl Chain for Node {
     async fn broadcast(&self, tx: &Transaction) -> Result<(), String> {
         self.0.broadcast(tx).await.map(|_| ()).map_err(text)
     }
+
+    /// The node's header alone, not its block's.
+    async fn header(&self, height: u32) -> Result<bitcoin::block::Header, String> {
+        let hash = self.0.hash(height).await.map_err(text)?;
+        self.0.header(&hash).await.map_err(text)
+    }
 }

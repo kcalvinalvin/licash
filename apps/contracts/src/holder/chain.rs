@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::future::Future;
 
 use anyhow::{anyhow, Result};
+use bitcoin::block::Header;
 use bitcoin::{OutPoint, Transaction, Txid};
 use licash::chain::Checkpoint;
 use licash_contract::opening::{Fate, Holder};
@@ -17,6 +18,19 @@ pub trait Chain: Blocks {
 
     /// Hand `tx` to the network; one it has already is no error.
     fn broadcast(&self, tx: &Transaction) -> impl Future<Output = Result<(), String>> + Send;
+
+    /// The header of block `height` of the best chain: its block's, by
+    /// default, which a chain that keeps headers answers at less cost.
+    fn header(&self, height: u32) -> impl Future<Output = Result<Header, String>> + Send {
+        async move {
+            let hash = self.hash(height).await?;
+            let block = self.block(&hash).await?;
+            if block.block_hash() != hash {
+                return Err(format!("block {hash} does not match its header"));
+            }
+            Ok(block.header)
+        }
+    }
 }
 
 /// Where `holder`'s F stands on `chain`, its inputs looked up in the
