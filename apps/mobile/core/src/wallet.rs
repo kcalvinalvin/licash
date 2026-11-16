@@ -81,6 +81,9 @@ pub struct Wallet {
     /// The height each deposit to refund whose payment its hub never saw
     /// was last looked for at, by its hash: in memory only.
     refunds_looked: Mutex<HashMap<String, u32>>,
+    /// The mailbox, its relays kept connected between looks
+    /// ([`Wallet::collect`]): opened at the first.
+    mailbox: Mutex<Option<licash_nostr::mailbox::Mailbox>>,
 }
 
 /// How long the hubs asked what URLs they name may take, all at once
@@ -232,6 +235,7 @@ impl Wallet {
             socks: Mutex::new(None),
             announced: Announcements::default(),
             refunds_looked: Mutex::new(HashMap::new()),
+            mailbox: Mutex::new(None),
         };
         wallet.onions();
         Ok(Arc::new(wallet))
@@ -910,7 +914,8 @@ impl Wallet {
     }
 
     /// Take the payments in the wallet's mailbox, on the relays its hubs
-    /// name: each once.
+    /// name: each once. Its relays stay connected until the next look,
+    /// which then asks them at once.
     pub fn collect(&self) -> Result<Vec<Activity>, LicashError> {
         if self
             .wallet
@@ -920,11 +925,13 @@ impl Wallet {
         {
             return Ok(Vec::new());
         }
-        let collect = licash_nostr::wallet::collect(&self.wallet, &self.route);
+        let mut kept = self.mailbox.lock().unwrap_or_else(PoisonError::into_inner);
+        let collect = licash_nostr::wallet::collect_kept(&self.wallet, &self.route, &mut kept);
         let collected = self
             .runtime
             .block_on(collect)
             .map_err(|e| LicashError::from_any(e, |reason| LicashError::Unavailable { reason }))?;
+        drop(kept);
         for (id, reason) in &collected.skipped {
             tracing::warn!(%id, %reason, "mail not taken");
         }

@@ -11,6 +11,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -131,9 +132,20 @@ class Engine(context: Context) {
     val events: SharedFlow<Event> = notices
     private val wake = Channel<Unit>(Channel.CONFLATED)
 
-    /** Look often: someone is waiting to be paid. */
+    /**
+     * Look often: someone is waiting to be paid. In the mailbox too, apart
+     * from the rounds, every [MAIL_MS]: its relays kept connected, a look
+     * takes about a second.
+     */
     @Volatile
     var eager = false
+        set(on) {
+            field = on
+            if (on) watchMailbox()
+        }
+
+    /** Looking in the mailbox apart from the rounds. */
+    private val watchingMailbox = AtomicBoolean(false)
 
     @Volatile
     private var foreground = false
@@ -192,6 +204,7 @@ class Engine(context: Context) {
                 // In sight: the only time the service may start.
                 if (state.value.watch == Watch.NOW) WatchService.start(app)
                 poke()
+                if (eager) watchMailbox()
             }
 
             override fun onStop(owner: LifecycleOwner) {
@@ -411,10 +424,7 @@ class Engine(context: Context) {
         }
         if (hubs.any { it.mailbox }) {
             try {
-                for (got in locked { it.collect() }) {
-                    AppLog.info("received ${got.amount} sat in the mailbox")
-                    notices.tryEmit(Event("Received ${sat(got.amount)}", got.amount))
-                }
+                collect()
             } catch (e: LicashException) {
                 failed("the mailbox", e)
             }
@@ -430,6 +440,43 @@ class Engine(context: Context) {
         state.update { it.copy(problem = problems.firstOrNull()) }
         refresh()
         tell()
+    }
+
+    /** Take the payments in the mailbox, each told of: whether there were any. */
+    private suspend fun collect(): Boolean {
+        val got = locked { it.collect() }
+        for (one in got) {
+            AppLog.info("received ${one.amount} sat in the mailbox")
+            notices.tryEmit(Event("Received ${sat(one.amount)}", one.amount))
+        }
+        return got.isNotEmpty()
+    }
+
+    /**
+     * Look in the mailbox every [MAIL_MS] while someone waits to be paid, in
+     * sight, apart from the rounds and what they wait on.
+     */
+    private fun watchMailbox() {
+        if (!watchingMailbox.compareAndSet(false, true)) return
+        scope.launch {
+            try {
+                while (eager && foreground) {
+                    val hubs = wallet?.let { runCatching { local { w -> w.hubs() } }.getOrNull() }
+                    if (hubs != null && hubs.any { it.mailbox }) {
+                        try {
+                            if (collect()) refresh()
+                        } catch (e: LicashException) {
+                            AppLog.warn("the mailbox, looked in apart", e)
+                        }
+                    }
+                    delay(MAIL_MS)
+                }
+            } finally {
+                watchingMailbox.set(false)
+            }
+            // Asked again as it stopped.
+            if (eager && foreground) watchMailbox()
+        }
     }
 
     /** Learn again what each hub trusted serves: it may have changed since added. */
@@ -999,6 +1046,7 @@ class Engine(context: Context) {
     companion object {
         private const val ROUND_MS = 20_000L
         private const val EAGER_MS = 4_000L
+        private const val MAIL_MS = 3_000L
         private const val AWAY_MS = 60_000L
         private const val PROVIDERS_MS = 15 * 60_000L
         private const val PROVIDERS_RETRY_MS = 2 * 60_000L
