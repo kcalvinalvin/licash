@@ -59,6 +59,7 @@ import org.licash.wallet.storage
 /** A page of Settings, behind a row of its first. */
 private enum class Page(val title: String) {
     Hubs("Hubs"),
+    Backup("Backup"),
     About("About"),
     Advanced("Advanced"),
 }
@@ -91,6 +92,7 @@ fun Settings(engine: Engine, ui: Ui, balance: () -> Unit, back: () -> Unit) {
                 TopBar(p.title, back = { page = null })
                 when (p) {
                     Page.Hubs -> HubsPage(engine, ui)
+                    Page.Backup -> BackupPage(engine, ui)
                     Page.About -> About(ui)
                     Page.Advanced -> Advanced(engine, ui, balance)
                 }
@@ -107,6 +109,10 @@ private fun Overview(engine: Engine, ui: Ui, open: (Page) -> Unit) {
     var torFailed by remember { mutableStateOf<String?>(null) }
     Group("") {
         Entry("Hubs", value = "${ui.hubs.size}", icon = Glyphs.bank, tag = "hubs") { open(Page.Hubs) }
+        if (ui.wallet) {
+            Divider()
+            Entry("Backup", icon = Glyphs.key, tag = "backup") { open(Page.Backup) }
+        }
     }
     Group("") {
         val (state, detail) = status(ui, ui.developer)
@@ -238,7 +244,11 @@ private fun Advanced(engine: Engine, ui: Ui, balance: () -> Unit) {
     }
     if (ui.wallet) Group("Renewing notes") { RenewLimit(engine) }
     if (ui.wallet) Group("Recovery safety") { ProofMargin(engine) }
-    Group("Bitcoin light client") { LightClient(engine) }
+    Group("Bitcoin light client") {
+        LightClient(engine)
+        Divider()
+        ResetChain(engine)
+    }
     if (engine.prover.sample) {
         Group("Proving on this phone") {
             val proofs by engine.prover.proofs.collectAsState()
@@ -260,7 +270,7 @@ private fun Advanced(engine: Engine, ui: Ui, balance: () -> Unit) {
     }
     if (deleting) {
         Sheet("Delete this wallet?", dismiss = { deleting = false }) {
-            Say("What it holds is lost for good: there is no backup yet.")
+            Say("What it holds is lost for good, unless you saved a backup file.")
             BigButton("Delete", Modifier.fillMaxWidth().testTag("delete"), danger = true) {
                 deleting = false
                 scope.launch { engine.delete() }

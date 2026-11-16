@@ -701,6 +701,94 @@ class Engine(context: Context) {
         poke()
     }
 
+    /** The 24 words restoring this wallet's keys: secret, shown only when asked, never logged. */
+    suspend fun backupPhrase(): Result<List<String>> = io { local { it.backupPhrase() }.split(" ") }
+
+    /**
+     * Everything this wallet holds as it is now, saved `to` a file the user
+     * chose: unencrypted, private. Written whole to the cache first, so a
+     * failure leaves no half a backup behind as if it were one.
+     */
+    suspend fun exportBackup(to: Uri): Result<Unit> = io {
+        val made = File(app.cacheDir, "backup-${System.nanoTime()}.licash")
+        try {
+            locked { it.exportStateBundle(made.path) }
+            val out = app.contentResolver.openOutputStream(to, "wt") ?: error("that file cannot be written")
+            out.use { o -> made.inputStream().use { it.copyTo(o) } }
+            AppLog.info("full backup saved, ${made.length()} bytes")
+        } finally {
+            made.delete()
+        }
+    }
+
+    /** A wallet of the network chosen from its 24 words: its keys, and its coins once Bitcoin is looked through. */
+    suspend fun restorePhrase(words: List<String>): Result<Unit> = restored {
+        Wallet.fromPhrase(walletDir, words.joinToString(" "), prefs.network, prefs.tor)
+    }
+
+    /** The wallet a full backup `from` holds, of its own network. Never over a wallet there. */
+    suspend fun restoreBackup(from: Uri): Result<Unit> {
+        val copy = File(app.cacheDir, "restore-${System.nanoTime()}.licash")
+        return try {
+            io {
+                val input = app.contentResolver.openInputStream(from) ?: error("that file cannot be read")
+                input.use { i -> copy.outputStream().use { i.copyTo(it) } }
+            }.fold(
+                { restored { Wallet.fromStateBundle(walletDir, copy.path, prefs.tor) } },
+                { Result.failure(it) },
+            )
+        } finally {
+            copy.delete()
+        }
+    }
+
+    /**
+     * The wallet `open` makes, there being none: its network the app's from
+     * now on, and Tor as that network has it unless chosen.
+     */
+    private suspend fun restored(open: () -> Wallet): Result<Unit> = io {
+        mutex.withLock {
+            check(wallet == null && !walletExists(walletDir)) { "a wallet is here already" }
+            var w = open()
+            prefs.network = w.network()
+            if (w.tor() != prefs.tor) {
+                w.destroy()
+                w = Wallet.open(walletDir, prefs.tor)
+            }
+            wallet = configured(w)
+            hubsLearned = false
+            AppLog.info("wallet restored, of ${chainName(prefs.network)}")
+        }
+        lightLock.withLock { startLight() }
+        refresh()
+        poke()
+    }
+
+    /**
+     * Look through Bitcoin again, as asked: the wallet from its first block,
+     * the light client's blocks fetched afresh. Notes, contracts and what is
+     * under way are untouched. Refused, nothing changed, if the wallet's
+     * first block cannot be known yet.
+     */
+    suspend fun resetChain(): Result<Unit> = io {
+        lightLock.withLock {
+            mutex.withLock {
+                wallet?.let { w ->
+                    val from = w.rescanChain(light?.let { GoChain(it) } ?: NoChain)
+                    AppLog.info("looking through Bitcoin again" + (from?.let { " from block $it" } ?: ""))
+                }
+                stopLight()
+            }
+            val dir = File(files, "chain-${chainName(wallet?.network() ?: prefs.network)}")
+            dir.deleteRecursively()
+            AppLog.info("light client's blocks forgotten")
+            state.update { it.copy(chain = ChainStatus(), scanned = null) }
+            startLight()
+        }
+        refresh()
+        poke()
+    }
+
     suspend fun addHub(url: String): Result<Hub> = io {
         val hub = locked { it.addHub(url) }
         refresh()

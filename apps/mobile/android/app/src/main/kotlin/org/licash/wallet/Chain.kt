@@ -30,3 +30,24 @@ class GoChain(private val light: LightClient) : ChainSource {
             throw ChainException.Failed(e.message ?: "the light client failed")
         }
 }
+
+/** No light client running: whatever needs Bitcoin fails, plainly. */
+object NoChain : ChainSource {
+    private fun none(): Nothing = throw ChainException.Failed("Bitcoin is not reached yet")
+
+    override fun height(): UInt = none()
+
+    override fun hash(height: UInt): ByteArray = none()
+
+    override fun header(height: UInt): ByteArray = none()
+
+    override fun time(height: UInt): Long = none()
+
+    override fun filter(hash: ByteArray): ByteArray = none()
+
+    override fun block(hash: ByteArray): ByteArray = none()
+
+    override fun broadcast(tx: ByteArray) = none()
+
+    override fun unconfirmed(script: ByteArray): ByteArray = none()
+}

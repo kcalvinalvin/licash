@@ -22,11 +22,37 @@ or provider/miner splits that were not saved are identified as unavailable,
 never reconstructed from today's terms.
 
 Settings is one page: the hubs (each tapped for its fees, more added by
-address or found on Nostr), Bitcoin's state, Tor, About (the version, the
-storage used and the logs to export) and advanced mode, whose own page
-holds the notes, the log, the limit for renewing notes, the light client's
-settings and deleting the wallet. How the app looks and speaks, and the
-shared parts to build a screen of, are in [../../DESIGN.md](../../DESIGN.md).
+address or found on Nostr), Backup, Bitcoin's state, Tor, About (the
+version, the storage used and the logs to export) and advanced mode, whose
+own page holds the notes, the log, the limit for renewing notes, the light
+client's settings, resetting its chain state and deleting the wallet. How
+the app looks and speaks, and the shared parts to build a screen of, are in
+[../../DESIGN.md](../../DESIGN.md).
+
+## Backup and restore
+
+- **Recovery words**: 24 words, shown after a warning, kept out of
+  screenshots. They encode the wallet's existing 256-bit seed as BIP39
+  entropy (not a BIP39 PBKDF seed, so other wallets do not read them). They
+  bring back the keys and coins on Bitcoin only, scanning from block 1:
+  notes held at hubs and contracts need the backup file.
+- **Backup file**: everything the wallet holds as of when it is saved (the
+  wallet and contract databases, the instances a contract's recovery needs,
+  contacts), in a checksummed, unencrypted tar the user saves through the
+  system file picker. Tor state, proofs made on the phone and the light
+  client's blocks are left out. Payments after it are not in it. Restore a
+  backup on one phone only: two live copies can reuse one-time recovery
+  keys and lose money.
+- **Restore**, from the first screen: from a backup file (its network is
+  the wallet's) or from the recovery words (of the network chosen). It never
+  lands over existing wallet state; a backup this build cannot carry on
+  ("needs a newer version of the app") or one missing a file a recovery
+  needs is refused before anything is installed.
+- **Reset chain state**, in advanced mode, after a confirmation: the wallet
+  looks for payments again from its first block and the light client's
+  blocks are fetched afresh. Notes, contracts, recoveries and payments under
+  way are untouched. Nothing runs on its own: existing wallets see no change
+  until a backup, restore or reset is asked for.
 
 ## Build
 
