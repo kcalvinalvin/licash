@@ -129,6 +129,11 @@ phone itself, for hours, carried on after any stop; that proof's last step
 saved from the row. The contracts are kept beside the wallet's file, made
 only once one is asked for.
 
+Before its request is signed, Cancel closing asks for confirmation and
+releases the notes reserved by that attempt. It does not close the contract
+or recover Bitcoin; another attempt is possible while the contract permits
+it. Once signed, even an unconfirmed request cannot be canceled.
+
 Advanced settings has a holder-owned recovery planning margin (14 estimated
 days by default). An unfolded contract reads the signed terms to show when
 its request should confirm. This does not authorize automatic closing.

@@ -123,6 +123,14 @@ class CoverTest {
     }
 
     @Test
+    fun canceling_requires_an_unsigned_claim_and_never_a_later_stage() {
+        for (stage in RecoveryStage.entries) {
+            assertEquals(stage == RecoveryStage.CLAIMED, forcing(recovery(stage), 0).revocable)
+            assertFalse(forcing(recovery(stage, irrevocable = true), 0).revocable)
+        }
+    }
+
+    @Test
     fun a_forced_close_the_hub_answered_asks_for_its_proof_by_its_deadline() {
         val answered = recovery(RecoveryStage.PROVING, irrevocable = true, nextAt = null)
         assertEquals("The hub answered: preparing what to prove", forcing(answered, 1_000).says)

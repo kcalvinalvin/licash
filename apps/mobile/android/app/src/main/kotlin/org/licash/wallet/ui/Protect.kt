@@ -39,6 +39,7 @@ import org.licash.core.ContractState
 import org.licash.core.Recovery
 import org.licash.core.RecoveryStage
 import org.licash.wallet.Proving
+import org.licash.wallet.digits
 import org.licash.wallet.sat
 import org.licash.wallet.share
 import org.licash.wallet.safetyStatus
@@ -196,14 +197,39 @@ private fun Forced(r: Recovery, developer: Boolean, giveUp: () -> Unit, height: 
         r.payout?.let { Line("Payout", it.take(16) + "…") }
         r.sweep?.let { Line("Sweep", it.take(16) + "…") }
     }
-    if (r.stage == RecoveryStage.CLAIMED && !r.irrevocable) {
-        TextButton(onClick = giveUp, modifier = Modifier.testTag("give-up-recovery")) { Text("Give up") }
+    if (forcing(r, height).revocable) {
+        TextButton(onClick = giveUp, modifier = Modifier.testTag("give-up-recovery")) { Text("Cancel closing") }
+    }
+}
+
+/** Cancel only this unsigned attempt, not the contract or the right to try again. */
+@Composable
+internal fun GiveUpSheet(recovery: Recovery?, busy: Boolean, confirm: () -> Unit, dismiss: () -> Unit) {
+    val allowed = recovery?.let { forcing(it, 0).revocable } == true
+    Sheet(if (allowed) "Cancel closing?" else "Closing changed", dismiss) {
+        if (allowed && recovery != null) {
+            Line("Back to wallet", sat(recovery.claimed))
+            Line("Notes", digits(recovery.notes.toULong()))
+            Say("Stops this attempt and releases its reserved notes. It does not close the contract or recover Bitcoin.")
+            Say("You can force close again while the contract allows it. An offline hub still cannot pay you.")
+            BigButton(
+                if (busy) "Canceling…" else "Stop this attempt",
+                Modifier.fillMaxWidth().testTag("give-up-recovery-confirm"),
+                enabled = !busy,
+                danger = true,
+                onClick = confirm,
+            )
+            TextButton(onClick = dismiss, enabled = !busy, modifier = Modifier.fillMaxWidth()) { Text("Keep closing") }
+        } else {
+            Say("This attempt has moved on. It can no longer be canceled here.")
+            BigButton("Done", Modifier.fillMaxWidth(), onClick = dismiss)
+        }
     }
 }
 
 /**
  * What forcing a protection closed does, before it is done: for a hub that
- * stopped answering only, and final once its request is on Bitcoin.
+ * stopped answering only, and final once its request is signed.
  */
 @Composable
 internal fun ForceSheet(c: Contract, held: ULong, force: () -> Unit, dismiss: () -> Unit) {
@@ -214,7 +240,7 @@ internal fun ForceSheet(c: Contract, held: ULong, force: () -> Unit, dismiss: ()
                 "Your ${sat(claimed)} there leave your balance and are claimed on Bitcoin, " +
                 "back on Bitcoin in a few days if the hub stays silent. Its fees are paid from your Bitcoin.",
         )
-        Say("Once its request is on Bitcoin, it cannot be undone.")
+        Say("Once its request is signed, it cannot be canceled, even before it is on Bitcoin.")
         BigButton("Force close", Modifier.fillMaxWidth().testTag("force-close-confirm"), danger = true) { force() }
     }
 }
