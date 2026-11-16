@@ -324,7 +324,7 @@ async fn short_deposit_lock(claimed_paid: bool) {
     .unwrap();
     let lock = net
         .hub
-        .lock_own(&keyset, ephemeral, vec![outputs[0].clone()], terms)
+        .lock_own(&keyset, ephemeral, vec![outputs[0]], terms)
         .unwrap();
     let id = lock.proposal.id();
     let db = rusqlite::Connection::open(net.dir.path().join("deposits.sqlite")).unwrap();

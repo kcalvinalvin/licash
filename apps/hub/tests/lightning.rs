@@ -275,7 +275,7 @@ async fn a_short_receipt_lock_does_not_receive_the_invoices_preimage() {
     .unwrap();
     let lock = net
         .hub
-        .lock_own(&keyset, ephemeral, vec![outputs[0].clone()], terms)
+        .lock_own(&keyset, ephemeral, vec![outputs[0]], terms)
         .unwrap();
     let id = lock.proposal.id();
     db.execute(
