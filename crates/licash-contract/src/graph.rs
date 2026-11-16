@@ -180,6 +180,14 @@ pub struct RespondExit {
     pub k: Option<Wots256Sig>,
 }
 
+/// Counter response reveals, without trusting its declared digit values.
+/// Script clamps those values, so they are not a canonical message codec.
+pub struct CounterResponseHashes {
+    pub e: Vec<[u8; 32]>,
+    pub k: Vec<[u8; 32]>,
+    pub b_corr: Vec<[u8; 32]>,
+}
+
 /// `assert`'s arguments: the preimages, π2, π3.
 pub type Asserted<'a> = (&'a [Vec<u8>], &'a [u8], &'a [u8]);
 
@@ -982,6 +990,46 @@ impl Babe {
         let k = counter.then(|| WotsParams::for_bytes(K_LEN as u32));
         Ok(Self::read_respond(args, k, 0, 0)?.0)
     }
+    /// A WOTS256 signature's reveal hashes, in message order. Digit items
+    /// are deliberately ignored: even multi-byte aliases can be valid in
+    /// a block. Authenticate the reveals against the opening's public key.
+    pub fn read_wots256_hashes(params: WotsParams, args: &[Vec<u8>]) -> Result<Vec<[u8; 32]>> {
+        args.get(..2 * params.total_digits() as usize)
+            .context("signature's arguments are too few")?
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .rev()
+            .map(|pair| pair[1][..].try_into().context("a reveal of 32 bytes"))
+            .collect()
+    }
+
+    /// The plain sidecar's hub E reveals. The statement authenticates them
+    /// against E from the chain-verified request, not its witness copy.
+    pub fn read_plain_publication_hashes(args: &[Vec<u8>]) -> Result<Vec<[u8; 32]>> {
+        Ok(Self::read_response_e_hashes(args)?.0)
+    }
+
+    /// As above, with the main input's two amount signatures first.
+    pub fn read_plain_response_hashes(args: &[Vec<u8>]) -> Result<Vec<[u8; 32]>> {
+        let b = 4 * WotsParams::for_bytes(4).total_digits() as usize;
+        Self::read_plain_publication_hashes(args.get(b..).context("no response E")?)
+    }
+
+    /// The main corrected response's hub signatures, ignoring declared
+    /// digits in both the holder's E and the hub's K and corrected amount.
+    pub fn read_corrected_response_hashes(
+        args: &[Vec<u8>],
+        k: WotsParams,
+    ) -> Result<CounterResponseHashes> {
+        let word = WotsParams::for_bytes(4);
+        let b = 2 * word.total_digits() as usize;
+        let b_corr =
+            Self::read_wots256_hashes(word, args.get(2 * b..).context("no corrected amount")?)?;
+        let (e, used) = Self::read_response_e_hashes(args.get(3 * b..).context("no counter E")?)?;
+        let k = Self::read_wots256_hashes(k, args.get(3 * b + used..).context("no counter K")?)?;
+        Ok(CounterResponseHashes { e, k, b_corr })
+    }
     /// Read `respond_counter`'s arguments for an exit whose counter is data
     /// below `K` ([`ExitKeys::counter_items`] items): the response, and the
     /// data.
@@ -1015,40 +1063,19 @@ impl Babe {
         items: usize,
         skip: usize,
     ) -> Result<(RespondExit, Vec<u8>)> {
-        let (b, e) = (
-            2 * WotsParams::for_bytes(4).total_digits() as usize,
-            WotsParams::for_bytes(32),
-        );
+        let b = 2 * WotsParams::for_bytes(4).total_digits() as usize;
         let args: Vec<Vec<u8>> = args
             .iter()
             .take(2 * b)
             .chain(args.iter().skip(2 * b + skip))
             .cloned()
             .collect();
-        let (n, msg) = (e.total_digits() as usize, e.message_digits as usize);
-        let alice_e = WotsSig::from_consumption_order(
-            e,
-            args.get(2 * b..2 * b + 2 * n)
+        let (mut exit, consumed) = Self::read_response_e(
+            args.get(2 * b..)
                 .context("respond's arguments are too few")?,
         )?;
-        // the tied signature, top first: each checksum digit's value and
-        // reveal, last first, then the message digits' reveals, last first
-        let tied = args
-            .get(2 * b + 2 * n..2 * b + 3 * n + (n - msg))
-            .context("respond's arguments are too few")?;
-        let mut hub_e = vec![[0u8; 32]; n];
-        for (k, i) in (msg..n).rev().enumerate() {
-            hub_e[i] = tied[2 * k + 1][..]
-                .try_into()
-                .context("a reveal of 32 bytes")?;
-        }
-        for (k, i) in (0..msg).rev().enumerate() {
-            hub_e[i] = tied[2 * (n - msg) + k][..]
-                .try_into()
-                .context("a reveal of 32 bytes")?;
-        }
-        let mut at = 2 * b + 3 * n + (n - msg);
-        let k = match k {
+        let mut at = 2 * b + consumed;
+        exit.k = match k {
             Some(p) => {
                 let sig = Wots256Sig::from_consumption_order(
                     p,
@@ -1063,14 +1090,48 @@ impl Babe {
         let data = args
             .get(at..at + items)
             .context("respond_counter's data items are too few")?;
+        Ok((exit, data.iter().rev().flatten().copied().collect()))
+    }
+
+    fn read_response_e(args: &[Vec<u8>]) -> Result<(RespondExit, usize)> {
+        let e = WotsParams::for_bytes(32);
+        let n = e.total_digits() as usize;
+        let alice_e = WotsSig::from_consumption_order(
+            e,
+            args.get(..2 * n)
+                .context("respond's arguments are too few")?,
+        )?;
+        let (hub_e, used) = Self::read_response_e_hashes(args)?;
         Ok((
             RespondExit {
                 e: alice_e.message(),
                 hub_e,
-                k,
+                k: None,
             },
-            data.iter().rev().flatten().copied().collect(),
+            used,
         ))
+    }
+
+    fn read_response_e_hashes(args: &[Vec<u8>]) -> Result<(Vec<[u8; 32]>, usize)> {
+        let e = WotsParams::for_bytes(32);
+        let (n, msg) = (e.total_digits() as usize, e.message_digits as usize);
+        // the tied signature, top first: each checksum digit's value and
+        // reveal, last first, then the message digits' reveals, last first
+        let tied = args
+            .get(2 * n..3 * n + (n - msg))
+            .context("respond's arguments are too few")?;
+        let mut hub_e = vec![[0u8; 32]; n];
+        for (k, i) in (msg..n).rev().enumerate() {
+            hub_e[i] = tied[2 * k + 1][..]
+                .try_into()
+                .context("a reveal of 32 bytes")?;
+        }
+        for (k, i) in (0..msg).rev().enumerate() {
+            hub_e[i] = tied[2 * (n - msg) + k][..]
+                .try_into()
+                .context("a reveal of 32 bytes")?;
+        }
+        Ok((hub_e, 3 * n + (n - msg)))
     }
     /// `respond`'s with the exit: as [`Babe::respond_wire`], then Alice's
     /// signature on `E` (from `request`) and the hub's, tied to it (its

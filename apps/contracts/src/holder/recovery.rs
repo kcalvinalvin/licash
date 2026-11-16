@@ -102,8 +102,8 @@ pub enum Stage {
     /// Her payout after the hub's answer (`success`, or her answer to its
     /// challenge) in a block: waiting out its delay.
     Paid,
-    /// The hub countered her request, which this build does not answer:
-    /// only watched, for its collateral going elsewhere.
+    /// A proven counter, whose corrected payout is not supported yet, or
+    /// an older build's counter still to classify. Its output is watched.
     Countered,
 }
 
@@ -1166,8 +1166,9 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
     /// The hub's answer read: a plain `respond` lets her proof decide.
     /// Her statement's input, from her notes claimed and the chain's
     /// evidence of R and P once both are deep enough, run as her proof
-    /// will be and kept beside her instances: then her proof is needed. A
-    /// counter, or an answer not read, stays here, with why.
+    /// will be and kept beside her instances: then her proof is needed.
+    /// An unproven counter also permits the full claim. A proven counter
+    /// is watched until corrected-payout recovery is supported.
     async fn answered(&self, state: &mut State, tip: u32) -> Result<Next> {
         // Its output taken meanwhile (her assert by another copy of her
         // wallet, or the hub's timeout): nothing to build.
@@ -1177,8 +1178,7 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
         }
         let spend = state.spend.clone().context("no answer")?;
         let response = match dispute::response(&self.o, &spend)? {
-            Response::Plain(response) => response,
-            Response::Counter => return Ok(Next::To(Stage::Countered)),
+            Response::Plain(response) | Response::Counter(response) => response,
         };
         let r_height = state.r_height.context("R in no block")?;
         let p_height = state.p_height.context("P in no block")?;
@@ -1189,10 +1189,22 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
             state.next_at = Some(deep);
             return Ok(Next::Save);
         }
-        let input = self.statement(state, response, deep).await?;
-        let (journal, paid) = input
-            .run(&mut |_, _| false)
-            .map_err(|e| anyhow!("her statement: {e}"))?;
+        let mut input = self.statement(state, response, deep).await?;
+        let (journal, paid) = match classify_statement(&mut input)? {
+            StatementResult::Full(journal, paid) => (journal, paid),
+            StatementResult::Counter(paid) => {
+                // An affirmative classification marker, in a field older
+                // builds already read. Do not fetch the chain again on
+                // every refresh of a proven counter.
+                state.deadline = Some(dispute::deadline(&self.o));
+                state.next_at = None;
+                self.trouble(format!(
+                    "the hub proved a counter paying {paid}, before block {}; corrected-payout recovery is not supported yet",
+                    dispute::deadline(&self.o)
+                ));
+                return Ok(Next::To(Stage::Countered));
+            }
+        };
         ensure!(
             journal.to_bytes() == dispute::expected(&self.o).to_bytes(),
             "her statement commits another journal than her contract fixed"
@@ -1210,10 +1222,15 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
         Ok(Next::To(Stage::Proving))
     }
 
-    /// The hub's counter, which this build does not answer, said; its
-    /// answer's output watched as while she proves.
+    /// Retry an older build's unclassified counter once. A proven counter
+    /// keeps its classification and only watches the answer's output.
     async fn countered(&self, state: &mut State, tip: u32) -> Result<Next> {
-        self.trouble("the hub countered her request, which this build does not answer yet".into());
+        if state.deadline.is_none() {
+            return self.answered(state, tip).await;
+        }
+        self.trouble(
+            "the hub proved a counter; corrected-payout recovery is not supported yet".into(),
+        );
         Ok(self.answer_spent(state, tip).await?.unwrap_or(Next::Save))
     }
 
@@ -1496,6 +1513,34 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
     }
 }
 
+#[derive(Debug)]
+enum StatementResult {
+    Full(licash::statement::Journal, u32),
+    Counter(u32),
+}
+
+/// Use the same counter verifier as the holder guest. Trying both journals
+/// leaves signature, ownership and proof validation in the statement itself.
+fn classify_statement(input: &mut StatementInput) -> Result<StatementResult> {
+    let program = input.base.parts().recipe.counter_program;
+    let mut verify = |seal: &[u8], public: &[u8]| licash_groth16::verify(&program, seal, public);
+    input.c = 0;
+    match input.run(&mut verify) {
+        Ok((journal, paid)) => Ok(StatementResult::Full(journal, paid)),
+        Err(full_error) => {
+            input.c = 1;
+            if let Ok((_, paid)) = input.run(&mut verify) {
+                return Ok(StatementResult::Counter(paid));
+            }
+            input.c = 0;
+            Err(anyhow!("her statement: {full_error}"))
+        }
+    }
+}
+
+#[cfg(test)]
+mod counter_tests;
+
 /// P's fee coin, which the hub's answer left hers: what pays the fee of
 /// her payout after it.
 fn fee_coin(state: &State) -> Result<(OutPoint, TxOut)> {
@@ -1652,5 +1697,39 @@ mod tests {
             assert_eq!(stage.over(), matches!(stage, Stage::Done | Stage::Lost));
         }
         assert!(Stage::parse("forgotten").is_err());
+    }
+
+    #[test]
+    fn an_older_counter_keeps_its_request_and_notes_when_classification_is_marked() {
+        let original = State {
+            notes: vec!["ab".into()],
+            amount: 3_000,
+            r: Some(tx()),
+            p: Some(tx()),
+            spend: Some(tx()),
+            r_height: Some(101),
+            p_height: Some(102),
+            spent_height: Some(103),
+            from: Some(103),
+            ..State::default()
+        };
+        let mut row = RecoveryRow {
+            id: [1; 32],
+            format: FORMAT,
+            stage: "countered".into(),
+            irrevocable: true,
+            error: None,
+            state: original.encode(),
+            created_at: 0,
+        };
+        let mut resumed = State::decode(&row).unwrap();
+        assert!(resumed.deadline.is_none());
+        resumed.deadline = Some(500);
+        row.state = resumed.encode();
+        let mut marked = State::decode(&row).unwrap();
+        assert_eq!(marked.deadline, Some(500));
+        marked.deadline = None;
+        assert_eq!(marked.encode(), original.encode());
+        assert_eq!(Stage::parse(&row.stage).unwrap(), Stage::Countered);
     }
 }

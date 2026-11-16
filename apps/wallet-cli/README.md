@@ -148,7 +148,11 @@ with Docker. `import-proof <id> proof.json --chain <url>` brings the proof
 back before the block `recoveries` shows: checked, kept, and asserted on
 Bitcoin at once. `recoveries --chain <url>` then carries it on to `done`
 (`asserted`, `succeeding`, `paid`, `sweeping`), answering the hub if it
-challenges the proof. A hub's counter is not answered yet.
+challenges the proof. An unproven counter or a response with any plain
+publication input follows the same full-claim proof path. A proven counter
+stays `countered`: its corrected payout is not supported yet, so no
+statement is exported for it. Older `countered` recoveries are classified
+on their next advance without changing their request or reserved notes.
 
 `discover --relay wss://relay.example` lists the hubs announced on Nostr,
 at the URLs that answer as the hub that announced them; with `--swaps`, the

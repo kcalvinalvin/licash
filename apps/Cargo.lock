@@ -4150,10 +4150,12 @@ dependencies = [
  "futures-util",
  "hex",
  "hex-literal",
+ "k256",
  "licash",
  "licash-api",
  "licash-chain-client",
  "licash-contract",
+ "licash-groth16",
  "licash-wallet",
  "rusqlite",
  "serde",
@@ -4200,6 +4202,14 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+]
+
+[[package]]
+name = "licash-groth16"
+version = "0.1.0"
+dependencies = [
+ "sha2 0.10.9",
+ "substrate-bn",
 ]
 
 [[package]]
@@ -6975,6 +6985,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6b1e7f9a428571be2dc5bc0505c13fb6bf936822b894ec87abf8a08a4e51742d"
 
 [[package]]
+name = "rustc-hex"
+version = "2.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3e75f6a532d0fd9f7f13144f392b6ad56a32696bfcd9c78f797f16bbb6f072d6"
+
+[[package]]
 name = "rustc_version"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7899,6 +7915,19 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "substrate-bn"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72b5bbfa79abbae15dd642ea8176a21a635ff3c00059961d1ea27ad04e5b441c"
+dependencies = [
+ "byteorder",
+ "crunchy",
+ "lazy_static",
+ "rand 0.8.8",
+ "rustc-hex",
 ]
 
 [[package]]

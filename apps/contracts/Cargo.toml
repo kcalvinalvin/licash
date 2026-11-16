@@ -11,6 +11,7 @@ licash.workspace = true
 licash-api.workspace = true
 licash-chain-client = { workspace = true, optional = true }
 licash-contract = { path = "../../crates/licash-contract" }
+licash-groth16 = { path = "../../crates/licash-groth16" }
 licash-wallet.workspace = true
 anyhow.workspace = true
 axum = { workspace = true, optional = true }
@@ -31,5 +32,6 @@ default = ["node"]
 node = ["dep:axum", "dep:licash-chain-client", "dep:sha2"]
 
 [dev-dependencies]
+k256 = "0.13"
 tempfile = "3.27"
 tower = { version = "0.5", features = ["util"] }
