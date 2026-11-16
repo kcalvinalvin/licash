@@ -4,6 +4,7 @@
 //! suite (`regtest/`) plays it on Bitcoin Core.
 
 pub mod close;
+pub mod dispute;
 pub mod graph;
 pub mod keys;
 pub mod opening;

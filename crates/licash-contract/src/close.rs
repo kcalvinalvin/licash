@@ -36,7 +36,7 @@ pub const TIMEOUT: &str = "request_timeout";
 const E_ITEMS: usize = 134;
 const B_ITEMS: usize = 20;
 
-fn presign<'a>(o: &'a Opening, name: &str) -> Result<&'a Presign> {
+pub(crate) fn presign<'a>(o: &'a Opening, name: &str) -> Result<&'a Presign> {
     o.set
         .iter()
         .find(|p| p.name == name)
@@ -44,7 +44,7 @@ fn presign<'a>(o: &'a Opening, name: &str) -> Result<&'a Presign> {
 }
 
 /// Presigned `name` of `o`, `wire` below both parties' signatures.
-fn finished(o: &Opening, name: &str, wire: Vec<Vec<u8>>) -> Result<Transaction> {
+pub(crate) fn finished(o: &Opening, name: &str, wire: Vec<Vec<u8>>) -> Result<Transaction> {
     let p = presign(o, name)?;
     let n = sig_name(name, 0);
     let hub = o
@@ -62,7 +62,7 @@ fn finished(o: &Opening, name: &str, wire: Vec<Vec<u8>>) -> Result<Transaction> 
 }
 
 /// The blocks `sequence` waits, a relative lock in blocks.
-fn blocks(sequence: Sequence) -> Result<u32> {
+pub(crate) fn blocks(sequence: Sequence) -> Result<u32> {
     match sequence.to_relative_lock_time() {
         Some(relative::LockTime::Blocks(h)) => Ok(u32::from(h.value())),
         None => Ok(0),
@@ -186,8 +186,21 @@ pub fn sign_fee_input(
 /// its window pass, with `fee`, a coin at her [`fee_script`], all of it
 /// its fee: the presigned outputs are fixed (ALL|ANYONECANPAY).
 pub fn timeout(o: &Opening, keys: &HolderKeys, fee: (OutPoint, TxOut)) -> Result<Transaction> {
-    let p = presign(o, TIMEOUT)?;
-    let mut tx = finished(o, TIMEOUT, vec![])?;
+    terminal(o, keys, TIMEOUT, vec![], fee)
+}
+
+/// Presigned terminal `name` of `o`, `wire` below both parties'
+/// signatures, with `fee`, a coin at her [`fee_script`], all of it its
+/// fee.
+pub(crate) fn terminal(
+    o: &Opening,
+    keys: &HolderKeys,
+    name: &str,
+    wire: Vec<Vec<u8>>,
+    fee: (OutPoint, TxOut),
+) -> Result<Transaction> {
+    let p = presign(o, name)?;
+    let mut tx = finished(o, name, wire)?;
     tx.input.push(fee_input(fee.0));
     sign_fee_input(keys, &mut tx, 1, &[p.prevout.clone(), fee.1])?;
     Ok(tx)
