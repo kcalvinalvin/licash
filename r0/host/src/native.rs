@@ -92,13 +92,15 @@ pub fn prove(program: Program, path: &str, out: &str) -> Result<()> {
     super::export_receipt(&bin, &receipt, out, expected.len())
 }
 
-/// The succinct (STARK) receipt only, written for [`wrap`] elsewhere: the
-/// part of a proof a phone can make, Groth16 needing an x86 machine.
-pub fn prove_succinct(program: Program, path: &str) -> Result<()> {
+/// The succinct (STARK) receipt only, the part of a proof a phone can
+/// make (Groth16 needs an x86 machine, [`wrap`]), carried on across runs
+/// in `dir`: run again after any stop, it goes on where it stopped.
+pub fn prove_succinct(program: Program, path: &str, dir: Option<&str>) -> Result<()> {
     let bytes = read(path)?;
     let bin = program.guest()?;
     let expected = program.expected(&bytes)?;
-    super::prove_bytes(&bin, program.name(), &bytes, &expected, false)?;
+    let dir = dir.map_or_else(|| format!("{path}.proof"), str::to_owned);
+    super::resumable::prove(&bin, program.name(), &bytes, &expected, dir.as_ref())?;
     Ok(())
 }
 

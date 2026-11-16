@@ -6,9 +6,11 @@
 //!                                           execute an input; prints journal and cycles
 //!   licash-r0 native-prove|native-counter-prove <input.bin> <out.json>
 //!                                           prove, wrap in Groth16, verify and export
-//!   licash-r0 native-prove-succinct <input.bin>
-//!                                           prove the holder's (STARK) only, as a phone
-//!                                           can: writes the receipt
+//!   licash-r0 native-prove-succinct|native-counter-prove-succinct <input.bin> [work-dir]
+//!                                           prove the STARK only, as a phone
+//!                                           can, a segment at a time, carried on across
+//!                                           runs in work-dir (<input.bin>.proof): writes
+//!                                           work-dir/receipt
 //!   licash-r0 native-wrap <receipt> <out.json>
 //!                                           wrap such a receipt in Groth16 (x86, Docker),
 //!                                           verify and export
@@ -16,6 +18,7 @@
 //! Packed guests are read from `r0/guests/` (built by r0/build-guest.sh).
 
 mod native;
+mod resumable;
 mod seal;
 
 use std::fs::{read, write, File, OpenOptions};
@@ -201,9 +204,14 @@ fn main() -> Result<()> {
         ["native-counter-exec", path] => native::exec(native::Program::Counter, path),
         ["native-prove", path, out] => native::prove(native::Program::Holder, path, out),
         ["native-counter-prove", path, out] => native::prove(native::Program::Counter, path, out),
-        ["native-prove-succinct", path] => native::prove_succinct(native::Program::Holder, path),
+        ["native-prove-succinct", path, dir @ ..] if dir.len() <= 1 => {
+            native::prove_succinct(native::Program::Holder, path, dir.first().copied())
+        }
+        ["native-counter-prove-succinct", path, dir @ ..] if dir.len() <= 1 => {
+            native::prove_succinct(native::Program::Counter, path, dir.first().copied())
+        }
         ["native-wrap", receipt, out] => native::wrap(native::Program::Holder, receipt, out),
-        _ => bail!("usage: licash-r0 pack <elf> <out.bin> | id <program.bin> | native-exec|native-counter-exec <input.bin> | native-prove|native-counter-prove <input.bin> <out.json> | native-prove-succinct <input.bin> | native-wrap <receipt> <out.json>"),
+        _ => bail!("usage: licash-r0 pack <elf> <out.bin> | id <program.bin> | native-exec|native-counter-exec <input.bin> | native-prove|native-counter-prove <input.bin> <out.json> | native-prove-succinct|native-counter-prove-succinct <input.bin> [work-dir] | native-wrap <receipt> <out.json>"),
     }
 }
 
