@@ -3,6 +3,7 @@
 //! payouts on Bitcoin follow, and its announcement on Nostr.
 
 pub mod dashboard;
+pub mod keeper;
 pub mod notify;
 
 use std::{sync::Arc, time::Duration};

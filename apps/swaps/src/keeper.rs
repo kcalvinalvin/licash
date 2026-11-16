@@ -1,0 +1,1106 @@
+//! The contracts protecting a provider's notes at the hubs it takes them
+//! from, kept: what it takes in at a hub is held to what the contracts
+//! there protect, each is replaced before it ends, what failed to be
+//! replaced is drained, and one is forced closed at its safe deadline if
+//! the others at its hub cannot recover all the notes held there. The
+//! first contract at a hub is its operator's to open (`licash-wallet
+//! open-contract`): until then, the provider takes none of that hub's
+//! notes in.
+//!
+//! What it decides is [`plan`], of what it reads ([`Hub`], [`Kept`]);
+//! [`Keeper`] reads, applies the plan and alerts the operator.
+
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+use anyhow::{anyhow, Result};
+use bitcoin::FeeRate;
+use licash::spend::ChainProfile;
+use licash_contracts::holder::{
+    self,
+    recovery::{self, Stage},
+    safety, Ask, Change, Contract, Fate, Node,
+};
+use licash_swaps::Provider;
+use licash_wallet::{Blocks as _, PayoutState, Transport};
+
+/// Blocks a day on `network`: Mutinynet's every 30 seconds, as the
+/// wallet apps count them.
+pub fn blocks_a_day(network: ChainProfile) -> u32 {
+    match network {
+        ChainProfile::Mutinynet => 2_880,
+        _ => 144,
+    }
+}
+
+/// When the keeper acts on a live contract.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Deadlines {
+    /// From this block on, a successor is opened to it.
+    pub renew_at: u32,
+    /// From this block on, it claims what the others at its hub cannot
+    /// recover.
+    pub claim_at: u32,
+}
+
+impl Deadlines {
+    /// Of a contract whose claim request must confirm by `request_by`
+    /// ([`safety::Safety::request_by`]), or none if its margin does not
+    /// fit: claimed a `day` of blocks before, at once if it does not fit,
+    /// and replaced `lead` blocks before that.
+    pub fn new(request_by: Option<u32>, day: u32, lead: u32) -> Self {
+        let claim_at = request_by.map_or(0, |by| by.saturating_sub(day));
+        Self {
+            renew_at: claim_at.saturating_sub(lead),
+            claim_at,
+        }
+    }
+}
+
+/// A hub whose notes contracts must protect, as the keeper reads it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Hub {
+    /// The hub's URL, as the provider's wallet names it.
+    pub url: String,
+    /// Every URL the wallet knows it by.
+    pub urls: Vec<String>,
+    /// What the provider holds and is owed there
+    /// ([`Provider::exposure`]).
+    pub exposure: u64,
+    /// The notes it holds there now: what a recovery claims of.
+    pub notes: u64,
+}
+
+/// A contract of the provider's, as the keeper reads it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Kept {
+    pub contract: Contract,
+    /// Of a live one, when the keeper acts on it: none if its terms could
+    /// not be read, which leaves it out.
+    pub deadlines: Option<Deadlines>,
+    /// Forced closed: a recovery of it under way, or over.
+    pub recovering: bool,
+    /// Of a live one past its `claim_at`: what the others at its hub,
+    /// claiming later, would recover of the notes there now.
+    pub others_recover: u64,
+}
+
+impl Kept {
+    /// Protecting notes now, as the keeper counts it.
+    fn live(&self, tip: u32) -> bool {
+        !self.recovering && self.contract.live(tip) && self.deadlines.is_some()
+    }
+
+    /// Being opened: neither live nor over.
+    fn opening(&self, tip: u32) -> bool {
+        !self.recovering
+            && !self.contract.over(tip)
+            && matches!(self.contract.fate, None | Some(Fate::Open))
+    }
+
+    fn deadlines(&self) -> Deadlines {
+        self.deadlines.unwrap_or(Deadlines {
+            renew_at: 0,
+            claim_at: 0,
+        })
+    }
+}
+
+/// A contract to open in place of one ending.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Successor {
+    /// At the hub, as the wallet names it.
+    pub hub: String,
+    pub replaces: [u8; 32],
+    pub cap: u32,
+    pub max_price: u64,
+}
+
+/// What the operator is told of, while it holds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Alert {
+    /// No contract protects notes at the hub, nor is one being opened.
+    NoContract { hub: String },
+    /// The provider holds or is owed more at the hub than its contracts
+    /// there protect.
+    Unprotected {
+        hub: String,
+        exposure: u64,
+        limit: u64,
+    },
+}
+
+impl Alert {
+    /// What tells it apart from others, as it changes.
+    pub fn key(&self) -> String {
+        match self {
+            Alert::NoContract { hub } => format!("no contract {hub}"),
+            Alert::Unprotected { hub, .. } => format!("unprotected {hub}"),
+        }
+    }
+}
+
+/// What the keeper does in a round ([`plan`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Plan {
+    /// The most the provider may hold at each hub
+    /// ([`Provider::limit_intake`]).
+    pub limits: HashMap<String, u64>,
+    /// Contracts to force closed now: past their `claim_at`, the others
+    /// at their hubs recovering less than the notes held there.
+    pub force_close: Vec<[u8; 32]>,
+    /// Successors to open, in turn.
+    pub successors: Vec<Successor>,
+    /// What to pay out to Bitcoin of each hub's notes, by its URL: what
+    /// the provider holds there beyond its limit, a contract there having
+    /// failed to be replaced.
+    pub drains: Vec<(String, u64)>,
+    pub alerts: Vec<Alert>,
+}
+
+/// What to do at block `tip` of the contracts `kept` at `hubs`, the
+/// replacements of those `failed` having failed, those `waiting` not to
+/// be tried again yet, a successor costing `max_price` at most if given,
+/// else its predecessor's price and a quarter.
+///
+/// At each hub, the provider may hold what its live contracts there
+/// protect, up to their caps: those not yet to be replaced
+/// ([`Deadlines::renew_at`]), and those to be whose successor is being
+/// opened, in its stead. A successor is a contract at the hub that
+/// started opening as the one it replaces was to be replaced, or later;
+/// each replaces one. A contract with none gets one, of its cap, unless
+/// waiting. Its hub is drained once its replacement failed, or it is
+/// past its `claim_at`. Past it, it is forced closed if the others there
+/// claiming later would recover less than the notes held there.
+pub fn plan(
+    tip: u32,
+    hubs: &[Hub],
+    kept: &[Kept],
+    failed: &HashSet<[u8; 32]>,
+    waiting: &HashSet<[u8; 32]>,
+    max_price: Option<u64>,
+) -> Plan {
+    let mut plan = Plan::default();
+    for hub in hubs {
+        let here: Vec<&Kept> = (kept.iter())
+            .filter(|k| k.contract.at(&hub.urls) && !k.contract.over(tip))
+            .collect();
+        let mut limit: u64 = (here.iter())
+            .filter(|k| k.live(tip) && tip < k.deadlines().renew_at)
+            .map(|k| u64::from(k.contract.cap))
+            .sum();
+        let mut ending: Vec<&Kept> = (here.iter().copied())
+            .filter(|k| k.live(tip) && k.deadlines().renew_at <= tip)
+            .collect();
+        ending.sort_by_key(|k| (k.deadlines().claim_at, k.contract.id));
+        let mut successors: Vec<&Kept> = (here.iter().copied())
+            .filter(|k| k.live(tip) || k.opening(tip))
+            .collect();
+        successors.sort_by_key(|k| (k.contract.since, k.contract.id));
+        let mut drain = false;
+        for old in ending {
+            let Deadlines { renew_at, claim_at } = old.deadlines();
+            let due = claim_at <= tip;
+            // Past it, what the others there do not protect goes, whether
+            // or not its successor is still being opened.
+            drain |= due;
+            let found = (successors.iter()).position(|new| {
+                new.contract.id != old.contract.id && new.contract.since >= renew_at
+            });
+            match found.map(|at| successors.remove(at)) {
+                Some(new) => {
+                    if !due && new.opening(tip) {
+                        limit += u64::from(old.contract.cap);
+                    }
+                }
+                None => {
+                    drain |= failed.contains(&old.contract.id);
+                    if !waiting.contains(&old.contract.id) {
+                        let price = old.contract.price.saturating_mul(5) / 4;
+                        plan.successors.push(Successor {
+                            hub: hub.url.clone(),
+                            replaces: old.contract.id,
+                            cap: old.contract.cap,
+                            max_price: max_price.unwrap_or(price),
+                        });
+                    }
+                }
+            }
+            if due && hub.notes > old.others_recover {
+                plan.force_close.push(old.contract.id);
+            }
+        }
+        let protecting = here.iter().any(|k| k.live(tip) || k.opening(tip));
+        if !protecting {
+            plan.alerts.push(Alert::NoContract {
+                hub: hub.url.clone(),
+            });
+        } else if hub.exposure > limit {
+            plan.alerts.push(Alert::Unprotected {
+                hub: hub.url.clone(),
+                exposure: hub.exposure,
+                limit,
+            });
+        }
+        if drain && hub.exposure > limit {
+            plan.drains.push((hub.url.clone(), hub.exposure - limit));
+        }
+        plan.limits.insert(hub.url.clone(), limit);
+    }
+    plan
+}
+
+/// What the keeper is told.
+#[derive(Clone, Debug)]
+pub struct Settings {
+    /// The hubs whose notes contracts must protect, by URL: every hub the
+    /// provider's wallet knows, if none named.
+    pub hubs: Option<Vec<String>>,
+    /// Blocks to prove a claim in, and for its timeout to confirm
+    /// ([`safety::of`]).
+    pub proof_margin: u32,
+    pub timeout_slack: u32,
+    /// Blocks a day on its chain ([`blocks_a_day`]).
+    pub day: u32,
+    /// Blocks from a contract's successor opening to its `claim_at`.
+    pub successor_lead: u32,
+    /// The most a successor costs, if not its predecessor's price and a
+    /// quarter.
+    pub max_price: Option<u64>,
+    /// The provider to pay out to Bitcoin through what a contract that
+    /// failed to be replaced leaves unprotected: none drains passively
+    /// only, taking nothing more in.
+    pub drain_via: Option<String>,
+    /// Whether to look for the wallet's coins on the chain itself, as
+    /// nothing else does.
+    pub scan: bool,
+    /// How the operator opens a contract at a hub, `{hub}` its URL.
+    pub open_hint: String,
+}
+
+/// How long a hub may answer nothing before the operator hears of it.
+const SILENCE: Duration = Duration::from_secs(60 * 60);
+
+/// The first wait before a failed replacement is tried again, doubled
+/// each time up to [`MAX_RETRY`].
+const RETRY: Duration = Duration::from_secs(10 * 60);
+const MAX_RETRY: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// Blocks a scan looks in at once.
+const SCAN_BATCH: u32 = 1_000;
+
+/// A replacement that failed.
+struct Failure {
+    attempts: u32,
+    retry_at: Instant,
+    error: String,
+}
+
+/// The keeper of a provider's contracts, in `dir`, beside its wallet.
+pub struct Keeper<T: Transport> {
+    provider: Arc<Provider<T>>,
+    chain: Node,
+    dir: PathBuf,
+    settings: Settings,
+    /// Each live contract's [`safety::Safety::request_by`]: its signed
+    /// terms never change.
+    request_by: HashMap<[u8; 32], Option<u32>>,
+    failures: HashMap<[u8; 32], Failure>,
+    /// The alerts told of, by key, while they hold: those of a round's
+    /// start, and of its end, after its openings.
+    told: HashSet<String>,
+    told_late: HashSet<String>,
+    /// When each hub last answered, or the keeper started.
+    answered: HashMap<String, Instant>,
+}
+
+impl<T: Transport + 'static> Keeper<T> {
+    /// The keeper of `provider`'s contracts in `dir`, on `chain`: from now
+    /// on, the provider takes no notes in at any hub until the keeper
+    /// says what its contracts there protect.
+    pub fn new(provider: Arc<Provider<T>>, chain: Node, dir: PathBuf, settings: Settings) -> Self {
+        provider.limit_intake(Some(HashMap::new()));
+        Self {
+            provider,
+            chain,
+            dir,
+            settings,
+            request_by: HashMap::new(),
+            failures: HashMap::new(),
+            told: HashSet::new(),
+            told_late: HashSet::new(),
+            answered: HashMap::new(),
+        }
+    }
+
+    /// Keep the contracts every `every`, for good.
+    pub async fn run(mut self, every: Duration) {
+        loop {
+            if let Err(e) = self.round().await {
+                tracing::warn!("keeping the contracts: {e:#}");
+            }
+            tokio::time::sleep(every).await;
+        }
+    }
+
+    /// One round: recoveries carried on, then the plan applied, the
+    /// limits and forced closes first, then the openings, which take
+    /// longest.
+    pub async fn round(&mut self) -> Result<Plan> {
+        let provider = self.provider.clone();
+        let wallet = provider.wallet();
+        let tip = self.chain.height().await.map_err(|e| anyhow!(e))?;
+        let mut alerts: Vec<(String, String)> = Vec::new();
+        if self.settings.scan {
+            if let Err(e) = self.scan(tip).await {
+                tracing::warn!("looking for the wallet's coins: {e:#}");
+            }
+        }
+        // Read from the contracts alone: nothing here stops a forced close.
+        if let Err(e) = holder::fees::agree(wallet, &self.dir, Some(tip)) {
+            tracing::warn!("agreeing to the fees the contracts opened under: {e:#}");
+        }
+        let rate = self.rate().await;
+        match recovery::advance(wallet, &self.chain, &self.dir, rate).await {
+            Ok(recoveries) => {
+                for r in recoveries.iter().filter(|r| r.stage == Stage::Proving) {
+                    let id = licash_contracts::hex_id(&r.id);
+                    alerts.push((
+                        format!("proof {id}"),
+                        format!(
+                            "contract {id}'s recovery needs its proof: make it from \
+                             `licash-wallet recovery-statement {id}` and bring it with \
+                             `licash-wallet import-proof {id}`"
+                        ),
+                    ));
+                }
+            }
+            Err(e) => tracing::warn!("carrying the recoveries on: {e:#}"),
+        }
+
+        let contracts = holder::list(&self.dir)?;
+        let kept = self.read(&contracts, tip, &mut alerts)?;
+        let hubs = self.hubs()?;
+        let kept = self.others_recover(kept, &hubs, tip)?;
+        let now = Instant::now();
+        self.failures
+            .retain(|id, _| kept.iter().any(|k| k.contract.id == *id));
+        let failed: HashSet<_> = self.failures.keys().copied().collect();
+        let waiting = (self.failures.iter())
+            .filter(|(_, f)| f.retry_at > now)
+            .map(|(id, _)| *id)
+            .collect();
+        let plan = plan(
+            tip,
+            &hubs,
+            &kept,
+            &failed,
+            &waiting,
+            self.settings.max_price,
+        );
+
+        self.provider.limit_intake(Some(plan.limits.clone()));
+        for id in &plan.force_close {
+            let hex = licash_contracts::hex_id(id);
+            let told = match recovery::force_close(wallet, &self.chain, &self.dir, id, rate).await
+            {
+                Ok(r) => format!(
+                    "forced contract {hex} closed at its safe deadline: claiming {} sat in {} notes \
+                     the others at its hub cannot recover",
+                    r.claimed, r.notes
+                ),
+                Err(e) => format!("could not force contract {hex} closed at its safe deadline: {e:#}"),
+            };
+            alerts.push((format!("force close {hex}"), told));
+        }
+        for alert in &plan.alerts {
+            alerts.push((alert.key(), self.say(alert)));
+        }
+        for hub in &hubs {
+            self.listen(hub, &mut alerts).await;
+        }
+        tell(&self.provider, &mut self.told, alerts);
+
+        if let Err(e) = holder::resume(wallet, &self.chain, &self.dir).await {
+            tracing::warn!("carrying the contracts being opened on: {e:#}");
+        }
+        let mut alerts = Vec::new();
+        if let Some(via) = self.settings.drain_via.clone() {
+            for (hub, excess) in &plan.drains {
+                self.drain(&via, &hubs, hub, *excess, rate, &mut alerts)
+                    .await;
+            }
+        }
+        if let Err(e) = self.follow_payouts().await {
+            tracing::warn!("following the drains' payouts: {e:#}");
+        }
+        for successor in &plan.successors {
+            self.replace(successor, &mut alerts).await;
+        }
+        for (id, failure) in &self.failures {
+            let hex = licash_contracts::hex_id(id);
+            alerts.push((
+                format!("replace {hex}"),
+                format!(
+                    "could not replace contract {hex} ({} tries): {}; its hub is drained",
+                    failure.attempts, failure.error
+                ),
+            ));
+        }
+        tell(&self.provider, &mut self.told_late, alerts);
+        Ok(plan)
+    }
+
+    /// The contracts as the keeper counts them, each live one's deadlines
+    /// read once.
+    fn read(
+        &mut self,
+        contracts: &[Contract],
+        tip: u32,
+        alerts: &mut Vec<(String, String)>,
+    ) -> Result<Vec<Kept>> {
+        let wallet = self.provider.wallet();
+        let recovering: HashSet<[u8; 32]> = (recovery::recoveries(&self.dir)?.into_iter())
+            .map(|r| r.id)
+            .collect();
+        let (margin, slack) = (self.settings.proof_margin, self.settings.timeout_slack);
+        let mut kept = Vec::new();
+        for contract in contracts {
+            let hex = licash_contracts::hex_id(&contract.id);
+            let deadlines = match contract.live(tip) {
+                false => None,
+                true => {
+                    let request_by = match self.request_by.get(&contract.id) {
+                        Some(by) => Ok(*by),
+                        None => safety::of(wallet, &self.dir, &contract.id, tip, margin, slack)
+                            .map(|s| s.request_by),
+                    };
+                    match request_by {
+                        Ok(by) => {
+                            self.request_by.insert(contract.id, by);
+                            if by.is_none() {
+                                alerts.push((
+                                    format!("margin {hex}"),
+                                    format!(
+                                        "contract {hex} leaves no room to prove a claim in: \
+                                         claiming from it at once, if needed"
+                                    ),
+                                ));
+                            }
+                            Some(Deadlines::new(
+                                by,
+                                self.settings.day,
+                                self.settings.successor_lead,
+                            ))
+                        }
+                        Err(e) => {
+                            alerts.push((
+                                format!("unreadable {hex}"),
+                                format!("contract {hex}'s terms cannot be read, so it counts for nothing: {e:#}"),
+                            ));
+                            None
+                        }
+                    }
+                }
+            };
+            kept.push(Kept {
+                contract: contract.clone(),
+                deadlines,
+                recovering: recovering.contains(&contract.id),
+                others_recover: 0,
+            });
+        }
+        Ok(kept)
+    }
+
+    /// The hubs whose notes contracts must protect, as they stand.
+    fn hubs(&self) -> Result<Vec<Hub>> {
+        let wallet = self.provider.wallet();
+        let named = match &self.settings.hubs {
+            Some(hubs) => hubs.clone(),
+            None => wallet.hubs()?.into_iter().map(|(url, _)| url).collect(),
+        };
+        let balance = wallet.balance()?;
+        let mut hubs = Vec::new();
+        for url in named {
+            let urls = wallet.hub_urls(&url)?;
+            if urls.is_empty() {
+                tracing::warn!(%url, "no hub the provider's wallet knows");
+                continue;
+            }
+            let notes = (balance.iter())
+                .filter(|b| urls.contains(&b.hub))
+                .map(|b| b.available)
+                .sum();
+            hubs.push(Hub {
+                exposure: self.provider.exposure(&url)?,
+                url,
+                urls,
+                notes,
+            });
+        }
+        Ok(hubs)
+    }
+
+    /// `kept`, with what the others at its hub claiming later would
+    /// recover of each live one past its `claim_at`.
+    fn others_recover(&self, mut kept: Vec<Kept>, hubs: &[Hub], tip: u32) -> Result<Vec<Kept>> {
+        let due: Vec<usize> = (0..kept.len())
+            .filter(|&i| kept[i].live(tip) && kept[i].deadlines().claim_at <= tip)
+            .collect();
+        for i in due {
+            let Some(hub) = hubs.iter().find(|h| kept[i].contract.at(&h.urls)) else {
+                continue;
+            };
+            let others: Vec<Contract> = (kept.iter())
+                .filter(|k| k.contract.at(&hub.urls) && k.live(tip))
+                .filter(|k| k.deadlines().claim_at > tip)
+                .map(|k| k.contract.clone())
+                .collect();
+            let each = holder::coverage(self.provider.wallet(), &self.dir, &others, tip)?;
+            kept[i].others_recover = each.values().sum();
+        }
+        Ok(kept)
+    }
+
+    /// The operator's words for `alert`.
+    fn say(&self, alert: &Alert) -> String {
+        match alert {
+            Alert::NoContract { hub } => format!(
+                "no contract protects the notes at hub {hub}: none are taken in there until \
+                 one is opened, with `{}`",
+                self.settings.open_hint.replace("{hub}", hub)
+            ),
+            Alert::Unprotected {
+                hub,
+                exposure,
+                limit,
+            } => format!(
+                "{exposure} sat held at or owed by hub {hub}, where contracts protect {limit} \
+                 sat: none more are taken in there"
+            ),
+        }
+    }
+
+    /// Ask `hub` how it stands: whether it answers, and charges no more
+    /// than its contracts agreed.
+    async fn listen(&mut self, hub: &Hub, alerts: &mut Vec<(String, String)>) {
+        let wallet = self.provider.wallet();
+        let now = Instant::now();
+        match wallet.hub_info(&hub.url).await {
+            Ok(info) => {
+                self.answered.insert(hub.url.clone(), now);
+                let ceilings = wallet.fee_ceilings(&hub.url).ok().flatten();
+                if ceilings.is_some_and(|c| info.fees.above(&c)) {
+                    alerts.push((
+                        format!("fees {}", hub.url),
+                        format!(
+                            "hub {} charges more than its contracts agreed: nothing is paid there \
+                             until its fees are approved, with `licash-wallet approve-fees {}`",
+                            hub.url, hub.url
+                        ),
+                    ));
+                }
+            }
+            Err(e) => {
+                let since = *self.answered.entry(hub.url.clone()).or_insert(now);
+                if now.duration_since(since) >= SILENCE {
+                    alerts.push((
+                        format!("silent {}", hub.url),
+                        format!(
+                            "hub {} has not answered for over an hour: {e}. Its contracts are \
+                             forced closed at their safe deadlines all the same, if needed",
+                            hub.url
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Pay out what the provider holds at `url` beyond its limit there
+    /// through the provider at `via`, to its own address on Bitcoin: one
+    /// payout under way from a hub at once.
+    async fn drain(
+        &self,
+        via: &str,
+        hubs: &[Hub],
+        url: &str,
+        excess: u64,
+        rate: FeeRate,
+        alerts: &mut Vec<(String, String)>,
+    ) {
+        let wallet = self.provider.wallet();
+        let Some(hub) = hubs.iter().find(|h| h.url == url) else {
+            return;
+        };
+        let under_way = |p: &licash_wallet::Payout| {
+            matches!(p.state, PayoutState::Open | PayoutState::Claimed)
+                && hub.urls.contains(&p.from)
+        };
+        let amount = excess.min(hub.notes);
+        let paid = async {
+            if wallet.payouts()?.iter().any(under_way) || amount == 0 {
+                return Ok(None);
+            }
+            let to = wallet.fallback_address()?.to_string();
+            let max_fee = (amount / 100).max(1_000);
+            wallet
+                .payout(via, url, &to, amount, max_fee, rate)
+                .await
+                .map(Some)
+        };
+        match paid.await {
+            Ok(Some(payout)) => alerts.push((
+                format!("drain {}", payout.hash),
+                format!("draining {amount} sat of hub {url}'s notes to Bitcoin through {via}"),
+            )),
+            Ok(None) => {}
+            Err(e) => alerts.push((
+                format!("drain failed {url}"),
+                format!("could not drain {amount} sat of hub {url}'s notes through {via}: {e}"),
+            )),
+        }
+    }
+
+    /// Carry the wallet's payouts on, its claims broadcast.
+    async fn follow_payouts(&self) -> Result<()> {
+        let wallet = self.provider.wallet();
+        let open =
+            |p: &licash_wallet::Payout| matches!(p.state, PayoutState::Open | PayoutState::Claimed);
+        if !wallet.payouts()?.iter().any(open) {
+            return Ok(());
+        }
+        let (_, pending) = wallet.follow_payouts(&self.chain).await?;
+        for (id, reason) in pending {
+            tracing::debug!(%id, reason, "drain pending");
+        }
+        for claim in wallet.payout_claims()? {
+            if let Err(e) = holder::Chain::broadcast(&self.chain, &claim).await {
+                tracing::warn!(txid = %claim.compute_txid(), "broadcasting a drain's claim: {e}");
+            }
+        }
+        Ok(())
+    }
+
+    /// Open `successor`, of the longest term its hub offers: a failure
+    /// kept to try again later.
+    async fn replace(&mut self, successor: &Successor, alerts: &mut Vec<(String, String)>) {
+        let wallet = self.provider.wallet();
+        let hex = licash_contracts::hex_id(&successor.replaces);
+        let opened = async {
+            let hubs = wallet.hubs()?;
+            let (_, info) = (hubs.iter())
+                .find(|(url, _)| *url == successor.hub)
+                .ok_or_else(|| anyhow!("the wallet no longer trusts {}", successor.hub))?;
+            let offered = (info.contracts)
+                .ok_or_else(|| anyhow!("{} opens no contracts now", successor.hub))?;
+            let (blocks, cap) = match offered.range {
+                Some(range) => (range.max_blocks, Some(successor.cap)),
+                None => (offered.blocks, None),
+            };
+            let ask = Ask {
+                blocks,
+                max_price: successor.max_price,
+                cap,
+                deposit: None,
+            };
+            holder::open_with(
+                wallet,
+                &self.chain,
+                &self.dir,
+                &successor.hub,
+                ask,
+                Change::Bitcoin,
+            )
+            .await
+        };
+        match opened.await {
+            Ok(new) => {
+                self.failures.remove(&successor.replaces);
+                alerts.push((
+                    format!("replaced {hex}"),
+                    format!(
+                        "opening contract {} at hub {} to replace contract {hex}: {} sat for {} sat \
+                         protected",
+                        licash_contracts::hex_id(&new.id),
+                        successor.hub,
+                        new.price,
+                        new.cap
+                    ),
+                ));
+            }
+            Err(e) => {
+                let failure = self.failures.entry(successor.replaces).or_insert(Failure {
+                    attempts: 0,
+                    retry_at: Instant::now(),
+                    error: String::new(),
+                });
+                failure.attempts += 1;
+                let wait = RETRY.saturating_mul(1 << failure.attempts.min(16).saturating_sub(1));
+                failure.retry_at = Instant::now() + wait.min(MAX_RETRY);
+                failure.error = format!("{e:#}");
+                tracing::warn!(contract = %hex, hub = %successor.hub, "replacing a contract: {e:#}");
+            }
+        }
+    }
+
+    /// Look for the wallet's coins up to `tip`: from it, the first time.
+    async fn scan(&self, tip: u32) -> Result<()> {
+        let wallet = self.provider.wallet();
+        if wallet.silent_next()?.is_none() {
+            wallet.watch_silent(None, tip)?;
+        }
+        loop {
+            let scanned = wallet.scan_silent(None, &self.chain, SCAN_BATCH).await?;
+            if scanned.next > scanned.height {
+                return Ok(());
+            }
+        }
+    }
+
+    /// The chain's estimate of a rate confirming within 6 blocks, at least
+    /// the least relayed.
+    async fn rate(&self) -> FeeRate {
+        let estimate = self.chain.0.fee_rate(6).await.unwrap_or_else(|e| {
+            tracing::warn!("no fee estimate: {e:#}");
+            None
+        });
+        estimate
+            .unwrap_or(FeeRate::BROADCAST_MIN)
+            .max(FeeRate::BROADCAST_MIN)
+    }
+}
+
+/// Tell the operator through `provider` of the `alerts` not in `told`,
+/// by key, and forget those that no longer hold: told again if they hold
+/// again.
+fn tell<T: Transport>(
+    provider: &Provider<T>,
+    told: &mut HashSet<String>,
+    alerts: Vec<(String, String)>,
+) {
+    let holding: HashSet<&String> = alerts.iter().map(|(key, _)| key).collect();
+    told.retain(|key| holding.contains(key));
+    for (key, message) in alerts {
+        if told.insert(key) {
+            tracing::warn!("{message}");
+            if let Err(e) = provider.alert(&message) {
+                tracing::warn!("alerting the operator: {e}");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitcoin::OutPoint;
+    use licash_contracts::holder::Phase;
+
+    const HUB: &str = "https://hub.example";
+    const OTHER: &str = "https://other.example";
+    const DAY: u32 = 144;
+    const LEAD: u32 = 14 * DAY;
+
+    /// A contract of `cap` at HUB whose claim request must confirm by
+    /// `request_by`, started opening at `since`, live.
+    fn kept(id: u8, cap: u32, since: u32, request_by: u32) -> Kept {
+        Kept {
+            contract: Contract {
+                id: [id; 32],
+                hub: HUB.into(),
+                phase: Phase::Funded,
+                mock: true,
+                deposit: OutPoint::null(),
+                value: 100_000,
+                price: 1_000,
+                cap,
+                assert_height: request_by + 3 * DAY,
+                close_height: request_by + 10 * DAY,
+                since,
+                funding: None,
+                fate: Some(Fate::Live),
+                abandoned: None,
+                created_at: 0,
+            },
+            deadlines: Some(Deadlines::new(Some(request_by), DAY, LEAD)),
+            recovering: false,
+            others_recover: 0,
+        }
+    }
+
+    /// As [`kept`], being opened.
+    fn opening(id: u8, cap: u32, since: u32) -> Kept {
+        let mut k = kept(id, cap, since, 1_000_000);
+        k.contract.fate = None;
+        k.contract.phase = Phase::Signing;
+        k.deadlines = None;
+        k
+    }
+
+    fn hub(exposure: u64, notes: u64) -> Hub {
+        Hub {
+            url: HUB.into(),
+            urls: vec![HUB.into(), "http://hub.example".into()],
+            exposure,
+            notes,
+        }
+    }
+
+    fn none() -> HashSet<[u8; 32]> {
+        HashSet::new()
+    }
+
+    fn planned(tip: u32, hubs: &[Hub], kept: &[Kept]) -> Plan {
+        plan(tip, hubs, kept, &none(), &none(), None)
+    }
+
+    #[test]
+    fn deadlines_come_a_day_before_the_request_and_a_lead_before_that() {
+        let d = Deadlines::new(Some(10_000), DAY, LEAD);
+        assert_eq!(
+            (d.claim_at, d.renew_at),
+            (10_000 - DAY, 10_000 - DAY - LEAD)
+        );
+        // A margin that does not fit: claimed at once.
+        let d = Deadlines::new(None, DAY, LEAD);
+        assert_eq!((d.claim_at, d.renew_at), (0, 0));
+        assert_eq!(Deadlines::new(Some(100), DAY, LEAD).renew_at, 0);
+        assert_eq!(blocks_a_day(ChainProfile::Mutinynet), 2_880);
+        assert_eq!(blocks_a_day(ChainProfile::Core30Signet), 144);
+    }
+
+    #[test]
+    fn a_hub_without_contracts_takes_nothing_in_and_is_told_of() {
+        let plan = planned(100, &[hub(500, 500)], &[]);
+        assert_eq!(plan.limits, HashMap::from([(HUB.to_owned(), 0)]));
+        assert_eq!(plan.alerts, [Alert::NoContract { hub: HUB.into() }]);
+        assert!(plan.successors.is_empty() && plan.force_close.is_empty());
+        // Nor is it drained: nothing was replaced, nothing failed.
+        assert!(plan.drains.is_empty());
+        // One being opened is no alert: the operator is opening it.
+        let plan = planned(100, &[hub(0, 0)], &[opening(1, 4_096, 90)]);
+        assert_eq!(plan.limits[HUB], 0);
+        assert!(plan.alerts.is_empty(), "{:?}", plan.alerts);
+    }
+
+    #[test]
+    fn a_hub_takes_in_up_to_the_caps_of_its_live_contracts() {
+        let at_other = Kept {
+            contract: Contract {
+                hub: OTHER.into(),
+                ..kept(3, 8_192, 0, 50_000).contract
+            },
+            ..kept(3, 8_192, 0, 50_000)
+        };
+        let mut recovering = kept(4, 2_048, 0, 50_000);
+        recovering.recovering = true;
+        let mut dead = opening(5, 2_048, 0);
+        dead.contract.fate = Some(Fate::Dead);
+        let mut unread = kept(6, 2_048, 0, 50_000);
+        unread.deadlines = None;
+        let all = [
+            kept(1, 4_096, 0, 50_000),
+            kept(2, 1_024, 0, 60_000),
+            at_other,
+            recovering,
+            dead,
+            unread,
+        ];
+        let plan = planned(100, &[hub(5_000, 4_000)], &all);
+        assert_eq!(plan.limits, HashMap::from([(HUB.to_owned(), 5_120)]));
+        assert!(plan.alerts.is_empty() && plan.successors.is_empty());
+        // Beyond them: told of.
+        let plan = planned(100, &[hub(6_000, 6_000)], &all);
+        assert_eq!(
+            plan.alerts,
+            [Alert::Unprotected {
+                hub: HUB.into(),
+                exposure: 6_000,
+                limit: 5_120
+            }]
+        );
+        assert!(plan.drains.is_empty());
+    }
+
+    #[test]
+    fn a_contract_to_be_replaced_gets_a_successor_of_its_cap_and_counts_while_it_opens() {
+        let old = kept(1, 4_096, 0, 50_000);
+        let renew_at = old.deadlines.unwrap().renew_at;
+        // Not yet: counted, no successor.
+        let plan = planned(
+            renew_at - 1,
+            &[hub(4_000, 4_000)],
+            std::slice::from_ref(&old),
+        );
+        assert_eq!(plan.limits[HUB], 4_096);
+        assert!(plan.successors.is_empty());
+        // Due to be replaced: not counted, a successor asked for at its
+        // price and a quarter, or the most given.
+        let plan = planned(renew_at, &[hub(4_000, 4_000)], std::slice::from_ref(&old));
+        assert_eq!(plan.limits[HUB], 0);
+        let successor = Successor {
+            hub: HUB.into(),
+            replaces: [1; 32],
+            cap: 4_096,
+            max_price: 1_250,
+        };
+        assert_eq!(plan.successors, [successor]);
+        assert!(plan.drains.is_empty() && plan.force_close.is_empty());
+        let most = super::plan(
+            renew_at,
+            &[hub(4_000, 4_000)],
+            std::slice::from_ref(&old),
+            &none(),
+            &none(),
+            Some(900),
+        );
+        assert_eq!(most.successors[0].max_price, 900);
+        // Its successor being opened: counted in its stead.
+        let new = opening(2, 4_096, renew_at);
+        let plan = planned(renew_at + 5, &[hub(4_000, 4_000)], &[old.clone(), new]);
+        assert_eq!(plan.limits[HUB], 4_096);
+        assert!(plan.successors.is_empty() && plan.alerts.is_empty());
+        // Its successor live: that counts, the old one not.
+        let new = kept(2, 4_096, renew_at, 90_000);
+        let plan = planned(renew_at + 5, &[hub(4_000, 4_000)], &[old, new]);
+        assert_eq!(plan.limits[HUB], 4_096);
+        assert!(plan.successors.is_empty() && plan.alerts.is_empty());
+    }
+
+    #[test]
+    fn a_contract_opened_before_another_was_to_be_replaced_is_not_its_successor() {
+        let old = kept(1, 4_096, 0, 50_000);
+        let renew_at = old.deadlines.unwrap().renew_at;
+        // Opened beside it, before: each replaced in turn.
+        let beside = kept(2, 4_096, renew_at - 1, 90_000);
+        let plan = planned(renew_at, &[hub(0, 0)], &[old.clone(), beside.clone()]);
+        assert_eq!(plan.successors.len(), 1);
+        assert_eq!(plan.successors[0].replaces, [1; 32]);
+        assert_eq!(plan.limits[HUB], 4_096);
+        // Two ending, one successor: the first ending replaced by it.
+        let other = kept(3, 2_048, 0, 51_000);
+        let new = opening(4, 4_096, renew_at + 2_000);
+        let tip = renew_at + 2_000;
+        let plan = planned(tip, &[hub(0, 0)], &[other, old, new, beside]);
+        assert_eq!(plan.successors.len(), 1);
+        assert_eq!(plan.successors[0].replaces, [3; 32]);
+        assert_eq!(plan.successors[0].cap, 2_048);
+        // The beside one, and the old one in place of its opening one.
+        assert_eq!(plan.limits[HUB], 4_096 + 4_096);
+    }
+
+    #[test]
+    fn a_hub_is_drained_once_a_replacement_failed_and_retried_once_waited() {
+        let old = kept(1, 4_096, 0, 50_000);
+        let renew_at = old.deadlines.unwrap().renew_at;
+        let failed = HashSet::from([[1; 32]]);
+        let hubs = [hub(3_000, 2_500)];
+        let plan = super::plan(
+            renew_at + 1,
+            &hubs,
+            std::slice::from_ref(&old),
+            &failed,
+            &failed,
+            None,
+        );
+        assert_eq!(plan.drains, [(HUB.to_owned(), 3_000)]);
+        assert!(plan.successors.is_empty());
+        // Waited: tried again, still draining.
+        let plan = super::plan(
+            renew_at + 1,
+            &hubs,
+            std::slice::from_ref(&old),
+            &failed,
+            &none(),
+            None,
+        );
+        assert_eq!(plan.drains, [(HUB.to_owned(), 3_000)]);
+        assert_eq!(plan.successors.len(), 1);
+        // Within what the others there protect: nothing to drain.
+        let beside = kept(2, 4_096, 0, 90_000);
+        let plan = super::plan(renew_at + 1, &hubs, &[old, beside], &failed, &failed, None);
+        assert!(plan.drains.is_empty());
+    }
+
+    #[test]
+    fn at_its_claim_deadline_a_contract_claims_only_what_the_others_cannot_recover() {
+        let mut old = kept(1, 4_096, 0, 50_000);
+        let claim_at = old.deadlines.unwrap().claim_at;
+        // A successor live, recovering all the notes there: no claim.
+        old.others_recover = 4_000;
+        let new = kept(2, 4_096, claim_at - LEAD, 90_000);
+        let all = [old.clone(), new.clone()];
+        let plan = planned(claim_at, &[hub(4_000, 4_000)], &all);
+        assert!(plan.force_close.is_empty() && plan.drains.is_empty());
+        assert_eq!(plan.limits[HUB], 4_096);
+        // Recovering less than the notes there: claimed, whatever the
+        // successor, and drained.
+        old.others_recover = 3_999;
+        let all = [old.clone(), new];
+        let plan = planned(claim_at, &[hub(4_000, 4_000)], &all);
+        assert_eq!(plan.force_close, [[1; 32]]);
+        // Its successor still being opened: no longer counted in its
+        // stead, so its hub is drained, and no other successor asked for.
+        let late = opening(2, 4_096, claim_at - LEAD);
+        let plan = planned(claim_at, &[hub(4_000, 4_000)], &[old.clone(), late]);
+        assert_eq!(plan.force_close, [[1; 32]]);
+        assert_eq!(plan.limits[HUB], 0);
+        assert_eq!(plan.drains, [(HUB.to_owned(), 4_000)]);
+        assert!(plan.successors.is_empty());
+        // No successor: claimed, drained, replaced all the same.
+        old.others_recover = 0;
+        let plan = planned(
+            claim_at + 3,
+            &[hub(4_000, 4_000)],
+            std::slice::from_ref(&old),
+        );
+        assert_eq!(plan.force_close, [[1; 32]]);
+        assert_eq!(plan.drains, [(HUB.to_owned(), 4_000)]);
+        assert_eq!(plan.successors.len(), 1);
+        assert_eq!(plan.limits[HUB], 0);
+        // No notes there: nothing to claim.
+        let plan = planned(claim_at, &[hub(0, 0)], std::slice::from_ref(&old));
+        assert!(plan.force_close.is_empty());
+        // Forced closed already: never again, nor replaced.
+        old.recovering = true;
+        let plan = planned(
+            claim_at + 3,
+            &[hub(4_000, 4_000)],
+            std::slice::from_ref(&old),
+        );
+        assert!(plan.force_close.is_empty() && plan.successors.is_empty());
+        // Past its assertion deadline: nothing left to do with it.
+        old.recovering = false;
+        let past = old.contract.assert_height;
+        let plan = planned(past, &[hub(4_000, 4_000)], &[old]);
+        assert!(plan.force_close.is_empty() && plan.successors.is_empty());
+    }
+
+    #[test]
+    fn a_contract_without_room_to_prove_in_is_claimed_from_at_once() {
+        let mut short = kept(1, 4_096, 0, 50_000);
+        short.deadlines = Some(Deadlines::new(None, DAY, LEAD));
+        let plan = planned(100, &[hub(1_000, 1_000)], &[short]);
+        assert_eq!(plan.force_close, [[1; 32]]);
+        assert_eq!(plan.limits[HUB], 0);
+    }
+
+    #[test]
+    fn each_hub_is_planned_apart() {
+        let mut other = hub(100, 100);
+        other.url = OTHER.into();
+        other.urls = vec![OTHER.into()];
+        let plan = planned(100, &[hub(0, 0), other], &[kept(1, 4_096, 0, 50_000)]);
+        assert_eq!(
+            plan.limits,
+            HashMap::from([(HUB.to_owned(), 4_096), (OTHER.to_owned(), 0)])
+        );
+        assert_eq!(plan.alerts, [Alert::NoContract { hub: OTHER.into() }]);
+    }
+}
