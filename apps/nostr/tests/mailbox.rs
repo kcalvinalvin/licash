@@ -151,3 +151,74 @@ async fn no_relay_answering_fails_in_the_routes_time() {
     assert!(why.contains("no Nostr relay answered"), "{why}");
     assert!(started.elapsed() < Duration::from_secs(15));
 }
+
+#[tokio::test]
+async fn a_look_waits_on_a_relay_never_answering_about_as_long_as_the_first_took() {
+    let relay = MockRelay::run().await.unwrap();
+    let relays = [relay.url().await.to_string(), silent_relay().await];
+    let alice = [1; 32];
+    let to = mailbox(alice);
+    let sent = mailbox::send(&to, r#"{"paid":1}"#, &relays, &Route::Direct);
+    assert_eq!(sent.await.unwrap(), 1);
+    // The relay answering does so at once: the other is given a second.
+    let started = std::time::Instant::now();
+    let mail = mailbox::fetch(&alice, &relays, &Route::Direct);
+    assert_eq!(mail.await.unwrap().len(), 1);
+    let took = started.elapsed();
+    assert!(took < Duration::from_secs(3), "{took:?}");
+}
+
+#[tokio::test]
+async fn a_mailbox_kept_open_finds_the_payments_sent_since() {
+    let relay = MockRelay::run().await.unwrap();
+    let relays = [relay.url().await.to_string(), silent_relay().await];
+    let (alice, bob) = ([1; 32], [2; 32]);
+    let kept = mailbox::Mailbox::open(&alice, &relays, &Route::Direct)
+        .await
+        .unwrap();
+    assert!(kept.is(&alice, &relays));
+    assert!(!kept.is(&bob, &relays));
+    assert!(!kept.is(&alice, &relays[..1]));
+    assert!(kept.fetch().await.unwrap().is_empty());
+    let to = mailbox(alice);
+    for paid in 1..=2 {
+        let content = format!(r#"{{"paid":{paid}}}"#);
+        mailbox::send(&to, &content, &relays, &Route::Direct)
+            .await
+            .unwrap();
+        // Connected already, the other still trying: answered at once.
+        let started = std::time::Instant::now();
+        let mail = kept.fetch().await.unwrap();
+        let took = started.elapsed();
+        assert!(took < Duration::from_secs(1), "{took:?}");
+        assert_eq!(mail.len(), paid);
+        assert_eq!(mail[paid - 1].content, content);
+    }
+    kept.close().await;
+}
+
+#[tokio::test]
+async fn mail_done_with_is_not_returned_again_by_the_mailbox_kept() {
+    let relay = MockRelay::run().await.unwrap();
+    let relays = [relay.url().await.to_string()];
+    let alice = [1; 32];
+    let to = mailbox(alice);
+    for paid in 1..=2 {
+        let content = format!(r#"{{"paid":{paid}}}"#);
+        mailbox::send(&to, &content, &relays, &Route::Direct)
+            .await
+            .unwrap();
+    }
+    let kept = mailbox::Mailbox::open(&alice, &relays, &Route::Direct)
+        .await
+        .unwrap();
+    let mail = kept.fetch().await.unwrap();
+    assert_eq!(mail.len(), 2);
+    kept.done(&mail[0].id);
+    kept.done("not an identifier");
+    assert_eq!(kept.fetch().await.unwrap(), [mail[1].clone()]);
+    // Another look, apart, sees it all.
+    let all = mailbox::fetch(&alice, &relays, &Route::Direct).await;
+    assert_eq!(all.unwrap(), mail);
+    kept.close().await;
+}

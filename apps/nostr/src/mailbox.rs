@@ -8,15 +8,18 @@
 //! Nothing says a payment arrived: a payer sends it again until its payee
 //! has it, or hands it over otherwise, and the payee takes each once.
 
+use std::collections::{BTreeSet, HashSet};
+use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 use anyhow::Context;
 use nostr::nips::nip59::{GiftWrapBuilder, UnwrappedGift};
 use nostr_sdk::prelude::{
-    Event, EventBuilder, Filter, FinalizeEvent, FinalizeUnsignedEvent, Keys, Kind, PublicKey,
+    Client, Event, EventBuilder, EventId, Filter, FinalizeEvent, FinalizeUnsignedEvent, Keys, Kind,
+    PublicKey, Relay, RelayStatus,
 };
 
-use crate::{client, connected, keys, Route};
+use crate::{ask_each, client, keys, Route, GRACE, MIN_GRACE};
 
 /// The kind of the rumors: a payment, in JSON.
 pub const PAYMENT: u16 = 8338;
@@ -59,25 +62,15 @@ pub async fn send(
         .finalize(&sealer)
         .context("gift wrap the payment")?;
     let client = client(relays, route, Some(sealer)).await?;
-    // To those that connected in time only: one down would hold it up.
-    let sent = match connected(&client, route).await {
-        Ok(relays) => client.send_event(&wrap).to(relays).await,
-        Err(e) => {
-            client.shutdown().await;
-            return Err(e);
-        }
-    };
+    // To each as soon as it connects: one slow would hold the others up.
+    let sent = ask_each(client.relays().await, route, GRACE, |relay| {
+        let wrap = wrap.clone();
+        async move { Ok(relay.send_event(&wrap).await?) }
+    })
+    .await;
     client.shutdown().await;
-    let sent = sent.context("send to the mailbox")?;
-    if sent.success.is_empty() {
-        let failed: Vec<String> = sent
-            .failed
-            .iter()
-            .map(|(relay, e)| format!("{relay}: {e}"))
-            .collect();
-        anyhow::bail!("no relay took the payment: {}", failed.join("; "));
-    }
-    Ok(sent.success.len())
+    let sent = sent.context("no relay took the payment")?;
+    Ok(sent.len())
 }
 
 /// The payments in the mailbox of `secret` on `relays`, asked through
@@ -88,31 +81,107 @@ pub async fn fetch(
     relays: &[String],
     route: &Route,
 ) -> anyhow::Result<Vec<Mail>> {
-    let keys = keys(secret)?;
-    // Relays may serve gift wraps only to their addressee (NIP-42).
-    let client = client(relays, route, Some(keys.clone())).await?;
-    let filter = Filter::new()
-        .kind(Kind::GiftWrap)
-        .pubkey(keys.public_key())
-        .limit(MAX_MAIL);
-    let events = match connected(&client, route).await {
-        Ok(relays) => {
-            let targets: Vec<_> = relays
-                .into_iter()
-                .map(|r| (r, vec![filter.clone()]))
-                .collect();
-            client.fetch_events(targets).timeout(route.timeout()).await
+    let mailbox = Mailbox::open(secret, relays, route).await?;
+    let mail = mailbox.fetch().await;
+    mailbox.close().await;
+    mail
+}
+
+/// A mailbox looked in again and again, its relays kept connected in
+/// between, for a wallet waiting for payments (an app open): a look asks
+/// those connected at once, rather than connecting to each anew, which
+/// takes seconds over Tor. Relays see what they would of each look apart:
+/// the mailbox asking for its mail, through the same circuits.
+pub struct Mailbox {
+    client: Client,
+    keys: Keys,
+    relays: Vec<String>,
+    route: Route,
+    /// The gift wraps dealt with for good ([`Mailbox::done`]), or that are
+    /// no payment of its: not opened again, a look then costing nothing
+    /// for each (opening a payment taken already takes milliseconds, and a
+    /// mailbox holds two weeks of them).
+    done: Mutex<HashSet<EventId>>,
+}
+
+impl Mailbox {
+    /// The mailbox of `secret` on `relays`, reached through `route`: not
+    /// connected until first looked in.
+    pub async fn open(secret: &[u8; 32], relays: &[String], route: &Route) -> anyhow::Result<Self> {
+        let keys = keys(secret)?;
+        // Relays may serve gift wraps only to their addressee (NIP-42).
+        let client = client(relays, route, Some(keys.clone())).await?;
+        Ok(Self {
+            client,
+            keys,
+            relays: relays.to_vec(),
+            route: route.clone(),
+            done: Mutex::default(),
+        })
+    }
+
+    /// Whether it is the mailbox of `secret` on `relays`.
+    pub fn is(&self, secret: &[u8; 32], relays: &[String]) -> bool {
+        let same = keys(secret).is_ok_and(|keys| keys.public_key() == self.keys.public_key());
+        same && self.relays == relays
+    }
+
+    /// The payments in it, as [`fetch`], but those [`Mailbox::done`]: from
+    /// the relays connected, if any, the others connecting for the next
+    /// look meanwhile; else from each as soon as it connects.
+    pub async fn fetch(&self) -> anyhow::Result<Vec<Mail>> {
+        let filter = Filter::new()
+            .kind(Kind::GiftWrap)
+            .pubkey(self.keys.public_key())
+            .limit(MAX_MAIL);
+        let timeout = self.route.timeout();
+        let mut relays: Vec<_> = self.client.relays().await.into_iter().collect();
+        let connected = |r: &Relay| r.status() == RelayStatus::Connected;
+        if relays.iter().any(|(_, r)| connected(r)) {
+            for (_, relay) in relays.iter().filter(|(_, r)| !connected(r)) {
+                let relay = relay.clone();
+                // Nothing if connecting already.
+                tokio::spawn(async move { relay.try_connect().timeout(timeout).await });
+            }
+            relays.retain(|(_, r)| connected(r));
         }
-        Err(e) => {
-            client.shutdown().await;
-            return Err(e);
+        let fetched = ask_each(relays, &self.route, MIN_GRACE, |relay| {
+            let filter = filter.clone();
+            async move { Ok(relay.fetch_events(filter).timeout(timeout).await?) }
+        })
+        .await?;
+        // Each once, whatever relays hold it.
+        let events: BTreeSet<Event> = fetched.into_iter().flatten().collect();
+        let mut done = self.done.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut mail = Vec::new();
+        for event in &events {
+            if done.contains(&event.id) {
+                continue;
+            }
+            match open(&self.keys, event) {
+                Some(one) => mail.push(one),
+                None => {
+                    done.insert(event.id);
+                }
+            }
         }
-    };
-    client.shutdown().await;
-    let events = events.context("ask the Nostr relays")?;
-    let mut mail: Vec<Mail> = events.into_iter().filter_map(|e| open(&keys, &e)).collect();
-    mail.sort_by(|a, b| a.at.cmp(&b.at).then_with(|| a.id.cmp(&b.id)));
-    Ok(mail)
+        mail.sort_by(|a, b| a.at.cmp(&b.at).then_with(|| a.id.cmp(&b.id)));
+        Ok(mail)
+    }
+
+    /// The mail `id` (in hex) dealt with for good: taken, or taken before.
+    /// Not opened again.
+    pub fn done(&self, id: &str) {
+        if let Ok(id) = EventId::from_hex(id) {
+            let mut done = self.done.lock().unwrap_or_else(PoisonError::into_inner);
+            done.insert(id);
+        }
+    }
+
+    /// Disconnect from its relays.
+    pub async fn close(self) {
+        self.client.shutdown().await;
+    }
 }
 
 /// `event`, if a payment gift wrapped to `keys` and sealed by its sender.

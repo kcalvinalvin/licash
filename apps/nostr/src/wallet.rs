@@ -9,7 +9,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::bail;
+use anyhow::{bail, Context};
 use bitcoin::FeeRate;
 use futures_util::future::join_all;
 use licash_api::{Info, Payment};
@@ -609,23 +609,78 @@ pub struct Collected {
 /// Take the payments in `wallet`'s mailbox, on the relays its hubs name,
 /// reached through `route`: each once, whenever asked again.
 pub async fn collect<T: Transport>(wallet: &Wallet<T>, route: &Route) -> anyhow::Result<Collected> {
+    let relays = mailbox_relays(wallet)?;
+    let mail = mailbox::fetch(&wallet.mailbox_secret(), &relays, route).await?;
+    Ok(take(wallet, mail, |_| {}))
+}
+
+/// [`collect`], looking through `kept`, the mailbox kept connected between
+/// calls ([`mailbox::Mailbox`]): opened the first time, and anew once the
+/// relays its hubs name change, or when none of those kept answers (their
+/// connections gone with the network, say). Mail taken, or taken before,
+/// is not opened again while it is kept.
+pub async fn collect_kept<T: Transport>(
+    wallet: &Wallet<T>,
+    route: &Route,
+    kept: &mut Option<mailbox::Mailbox>,
+) -> anyhow::Result<Collected> {
+    let relays = mailbox_relays(wallet)?;
+    let secret = wallet.mailbox_secret();
+    let fetched = match kept.as_ref().filter(|m| m.is(&secret, &relays)) {
+        Some(mailbox) => mailbox.fetch().await.map_err(|e| {
+            tracing::info!("the mailbox kept, opened anew: {e:#}");
+        }),
+        None => Err(()),
+    };
+    let mail = match fetched {
+        Ok(mail) => mail,
+        Err(()) => {
+            if let Some(old) = kept.take() {
+                old.close().await;
+            }
+            let mailbox = kept.insert(mailbox::Mailbox::open(&secret, &relays, route).await?);
+            mailbox.fetch().await?
+        }
+    };
+    let mailbox = kept.as_ref().context("a mailbox kept")?;
+    Ok(take(wallet, mail, |id| mailbox.done(id)))
+}
+
+/// The relays `wallet`'s mailbox is on: those its hubs name.
+fn mailbox_relays<T: Transport>(wallet: &Wallet<T>) -> anyhow::Result<Vec<String>> {
     let relays = hub_relays(wallet)?;
     if relays.is_empty() {
         bail!("no hub trusted names mailbox relays: adding a hub again learns them");
     }
+    Ok(relays)
+}
+
+/// The payments of `mail` `wallet` takes, each once, told to `done` by
+/// their mail's identifier as are those taken before and those that are
+/// no payment: none of which to take again.
+fn take<T: Transport>(
+    wallet: &Wallet<T>,
+    mail: Vec<mailbox::Mail>,
+    mut done: impl FnMut(&str),
+) -> Collected {
     let mut collected = Collected::default();
-    for mail in mailbox::fetch(&wallet.mailbox_secret(), &relays, route).await? {
+    for mail in mail {
         let Ok(payment) = serde_json::from_str::<Payment>(&mail.content) else {
+            done(&mail.id);
             collected.skipped.push((mail.id, "is not a payment".into()));
             continue;
         };
         match wallet.receive(&payment) {
-            Ok(received) => collected.received.push(received),
-            Err(Error::AlreadyReceived) => {}
+            Ok(received) => {
+                done(&mail.id);
+                collected.received.push(received);
+            }
+            Err(Error::AlreadyReceived) => done(&mail.id),
+            // Perhaps once its hub is trusted, say.
             Err(e) => collected.skipped.push((mail.id, format!("not taken: {e}"))),
         }
     }
-    Ok(collected)
+    collected
 }
 
 /// The relays `wallet`'s hubs name, each once, in the order of its hubs.

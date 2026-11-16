@@ -24,12 +24,12 @@ mod tor;
 #[cfg(feature = "wallet")]
 pub mod wallet;
 
-use std::{collections::HashMap, net::SocketAddr, time::Duration};
+use std::{collections::HashMap, future::Future, net::SocketAddr, time::Duration};
 
 use anyhow::{ensure, Context};
 use nostr_sdk::prelude::{
-    Client, Event, EventBuilder, Filter, FinalizeEvent, Keys, Kind, Proxy, RelayUrl, SecretKey,
-    SignerAuthenticator, Tag, Timestamp,
+    Client, Event, EventBuilder, Filter, FinalizeEvent, Keys, Kind, Proxy, Relay, RelayUrl,
+    SecretKey, SignerAuthenticator, Tag, Timestamp,
 };
 use serde::{Deserialize, Serialize};
 
@@ -336,27 +336,20 @@ pub async fn discover(
     network: &str,
 ) -> anyhow::Result<Vec<Found>> {
     let client = client(relays, route, None).await?;
-    let connected = match connected(&client, route).await {
-        Ok(relays) => relays,
-        Err(e) => {
-            client.shutdown().await;
-            return Err(e);
-        }
-    };
     let filter = Filter::new()
         .kind(Kind::Custom(KIND))
         .identifier(role.id())
         .hashtag(role.topic())
         .limit(MAX_EVENTS);
-    let targets: Vec<(RelayUrl, Vec<Filter>)> = connected
-        .into_iter()
-        .map(|relay| (relay, vec![filter.clone()]))
-        .collect();
-    let events = client.fetch_events(targets).timeout(route.timeout()).await;
+    let timeout = route.timeout();
+    let fetched = ask_each(client.relays().await, route, MIN_GRACE, |relay| {
+        let filter = filter.clone();
+        async move { Ok(relay.fetch_events(filter).timeout(timeout).await?) }
+    })
+    .await;
     client.shutdown().await;
-    let events = events.context("ask the Nostr relays")?;
     let mut newest: HashMap<String, Found> = HashMap::new();
-    for event in events {
+    for event in fetched?.into_iter().flatten() {
         let Some(found) = read(&event, role, network) else {
             continue;
         };
@@ -369,44 +362,96 @@ pub async fn discover(
     Ok(found)
 }
 
-/// How long the other relays have to connect once one did: those slower
-/// are left out, rather than hold up whoever waits (a payment being sent,
-/// providers being looked for, or the wallet, as it looks in its mailbox).
-/// One that never answers would take the route's whole timeout, and over
-/// Tor some often do not (an onion service gone, a relay blocking Tor).
+/// How long the other relays have to answer once one did, at most: those
+/// slower are left out, rather than hold up whoever waits (a payment being
+/// sent, providers being looked for, or the wallet, as it looks in its
+/// mailbox). One that never answers would take the route's whole timeout,
+/// and over Tor some often do not (an onion service gone, a relay blocking
+/// Tor).
 const GRACE: Duration = Duration::from_secs(4);
 
-/// The relays of `client` that connected in time, to ask only them: the
-/// first within the route's timeout, the others within [`GRACE`] of it.
-/// Fails if none did.
-async fn connected(client: &Client, route: &Route) -> anyhow::Result<Vec<RelayUrl>> {
+/// How long the other relays have to answer once one did, at least, when
+/// asked for events: as long again as the first took otherwise, as relays
+/// reached the same way answer in comparable times, one connected already
+/// within a second. Asked again soon, those left out are not missed for
+/// long; an event sent is given every relay [`GRACE`] can reach.
+const MIN_GRACE: Duration = Duration::from_secs(1);
+
+/// Each of `relays` asked through `ask` as soon as it connects, not
+/// once the others did or gave up: the answers of those that answered in
+/// time, the first within the route's timeout to connect and as long again
+/// to answer, the others within as long again as the first took, `least`
+/// to [`GRACE`]. Fails if none answered, saying why each did not. Those
+/// still connecting carry on, for a client kept to ask again
+/// ([`mailbox::Mailbox`]).
+async fn ask_each<T, F, A>(
+    relays: impl IntoIterator<Item = (RelayUrl, Relay)>,
+    route: &Route,
+    least: Duration,
+    ask: F,
+) -> anyhow::Result<Vec<T>>
+where
+    F: Fn(Relay) -> A,
+    A: Future<Output = anyhow::Result<T>> + Send + 'static,
+    T: Send + 'static,
+{
     let timeout = route.timeout();
+    let started = tokio::time::Instant::now();
     let mut trying = tokio::task::JoinSet::new();
-    for (url, relay) in client.relays().await {
-        trying.spawn(async move { (url, relay.try_connect().timeout(timeout).await) });
-    }
-    let mut until = tokio::time::Instant::now() + timeout;
-    let (mut connected, mut failed) = (Vec::new(), Vec::new());
-    while let Ok(Some(tried)) = tokio::time::timeout_at(until, trying.join_next()).await {
-        match tried {
-            Ok((url, Ok(()))) => {
-                if connected.is_empty() {
-                    until = until.min(tokio::time::Instant::now() + GRACE);
+    for (url, relay) in relays {
+        let asked = ask(relay.clone());
+        trying.spawn(async move {
+            let answer = async {
+                relay.try_connect().timeout(timeout).await?;
+                match tokio::time::timeout(timeout, asked).await {
+                    Ok(answer) => answer,
+                    Err(_) => anyhow::bail!("no answer in {} s", timeout.as_secs()),
                 }
-                connected.push(url);
+            };
+            (url, answer.await)
+        });
+    }
+    let mut until = None;
+    let (mut answers, mut failed) = (Vec::new(), Vec::new());
+    loop {
+        let tried = match until {
+            None => trying.join_next().await,
+            Some(until) => match tokio::time::timeout_at(until, trying.join_next()).await {
+                Ok(tried) => tried,
+                Err(_) => break,
+            },
+        };
+        match tried {
+            None => break,
+            Some(Ok((url, Ok(answer)))) => {
+                tracing::debug!(%url, took = ?started.elapsed(), "a relay answered");
+                until.get_or_insert_with(|| {
+                    let now = tokio::time::Instant::now();
+                    now + (now - started).clamp(least, GRACE)
+                });
+                answers.push(answer);
             }
-            Ok((url, Err(e))) => failed.push(format!("{url}: {e}")),
-            Err(e) => failed.push(format!("a relay: {e}")),
+            Some(Ok((url, Err(e)))) => failed.push(format!("{url}: {e:#}")),
+            Some(Err(e)) => failed.push(format!("a relay: {e}")),
         }
     }
-    // Those still trying end with the set, dropped.
-    if connected.is_empty() {
+    // Left to finish: a connection cut short would stay connecting for
+    // good, never tried again.
+    tracing::debug!(
+        answered = answers.len(),
+        left_out = trying.len(),
+        took = ?started.elapsed(),
+        failed = ?failed,
+        "relays asked"
+    );
+    trying.detach_all();
+    if answers.is_empty() {
         if failed.is_empty() {
             failed.push(format!("none in {} s", timeout.as_secs()));
         }
         anyhow::bail!("no Nostr relay answered: {}", failed.join("; "));
     }
-    Ok(connected)
+    Ok(answers)
 }
 
 /// `event`, if a valid, unexpired announcement of `role` for `network`.
