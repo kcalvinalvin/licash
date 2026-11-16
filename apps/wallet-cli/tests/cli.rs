@@ -438,6 +438,59 @@ fn a_restored_backup_drops_the_notes_spent_since() {
 }
 
 #[test]
+fn explicit_note_optimization_previews_its_fee_and_records_the_actual_operation() {
+    let hub = Server::start(FEE);
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, alice_at) = party(dir.path(), "alice", Some(&hub));
+    let funds = serde_json::to_string(&hub.pay(&address(&alice_at), 64)).unwrap();
+    ok(wallet(&alice, &["receive"], Some(&funds)));
+    let preview = json(&alice, &["optimize", &hub.url()]);
+    assert_eq!(preview["optimized"], false);
+    assert_eq!(preview["fee"], 1);
+    assert_eq!(preview["notes_before"], 1);
+    assert!((18..=24).contains(&preview["notes_after"].as_u64().unwrap()));
+    assert_eq!(available(&alice), (64, 0));
+    assert_eq!(json(&alice, &["history"]), Value::Array(vec![]));
+    failed(
+        wallet(&alice, &["optimize", &hub.url(), "--max-fee", "0"], None),
+        1,
+        "more than the limit",
+    );
+    let done = json(&alice, &["optimize", &hub.url(), "--max-fee", "1"]);
+    assert_eq!(done["optimized"], true);
+    assert_eq!(done["fee"], preview["fee"]);
+    assert_eq!(done["notes_after"], preview["notes_after"]);
+    assert_eq!(available(&alice), (63, 0));
+    let history = json(&alice, &["history"]);
+    assert_eq!(history.as_array().unwrap().len(), 1);
+    assert_eq!(history[0]["optimization"], true);
+    assert_eq!(history[0]["amount"], 0);
+    assert!(ok(wallet(&alice, &["history"], None)).contains("optimized notes"));
+    assert_eq!(json(&alice, &["resume"])["paid"], Value::Array(vec![]));
+}
+
+#[test]
+fn resume_automatically_shapes_rested_notes_without_handing_over_a_payment() {
+    let hub = Server::start(FEE);
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, alice_at) = party(dir.path(), "alice", Some(&hub));
+    let funds = serde_json::to_string(&hub.pay(&address(&alice_at), 64)).unwrap();
+    ok(wallet(&alice, &["receive"], Some(&funds)));
+    assert_eq!(json(&alice, &["history"]), Value::Array(vec![]));
+    let db = rusqlite::Connection::open(&alice).unwrap();
+    db.execute("UPDATE notes SET unlinked_at = 1 WHERE unlinked = 1", [])
+        .unwrap();
+    let resumed = json(&alice, &["resume"]);
+    assert_eq!(resumed["paid"], Value::Array(vec![]));
+    assert_eq!(available(&alice), (63, 0));
+    let history = json(&alice, &["history"]);
+    assert_eq!(history.as_array().unwrap().len(), 1);
+    assert_eq!(history[0]["optimization"], true);
+    json(&alice, &["resume"]);
+    assert_eq!(json(&alice, &["history"]).as_array().unwrap().len(), 1);
+}
+
+#[test]
 fn a_lock_pays_on_its_preimage_or_returns_once_expired() {
     let hub = Server::start(FEE);
     let dir = tempfile::tempdir().unwrap();

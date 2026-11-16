@@ -42,6 +42,22 @@ needs a paid self-payment to make exact notes. Consolidation also consumes
 old notes: keep wallet backups current, since a stale copy does not know
 the replacement notes and cannot recover them from the seed alone.
 
+A wallet that mostly receives gathers many small notes, so `unlink`,
+`receive`, `claim` and `resume` also maintain them: at most one remint per hub
+of unlinked notes to itself, toward the same distribution. Notes rest 1 to 6
+hours after unlinking (a few minutes when nearing the 32-note limit), as
+does the hub after each remint, so that a remint follows no payment closely.
+Its fee must fit the live contract ceilings or the automatic allowance
+above, and at most 1% of the notes held at that hub (at least 1 sat) is
+spent on it in any 24 hours. A failed remint never fails the command, and
+one refused for its fee is not retried at a higher one. `optimize <hub>`
+previews a remint with its fee; `optimize <hub> --max-fee SAT` makes it
+now, within that fee and the contract ceilings, bypassing the rests and the
+daily budget. `history` lists a remint as `optimized notes`, with its fee.
+A wallet file is upgraded to version 8 when first opened by this version,
+which older versions refuse: notes unlinked before begin their rest then,
+and nothing is reminted or asked of a hub by the upgrade itself.
+
 `code` prints a payment code (a BIP321 URI, `--qr` for QR codes) naming the
 wallet, the hubs it is paid at and its Nostr mailbox, if they name relays.
 `pay <code> [amount]` pays it at a hub it names that the wallet trusts and

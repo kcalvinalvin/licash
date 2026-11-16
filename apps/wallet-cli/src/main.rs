@@ -204,6 +204,14 @@ enum Command {
     },
     /// Unlink the notes held from the payments they came in.
     Unlink,
+    /// Preview a smaller-denomination note layout at a trusted hub.
+    /// --max-fee executes it within that satoshi limit, bypassing automatic
+    /// rest periods and the daily shaping budget, but not contract ceilings.
+    Optimize {
+        hub: String,
+        #[arg(long)]
+        max_fee: Option<u64>,
+    },
     /// Pay a Lightning invoice through a hub, its fee on top: the hub pays
     /// it for a lock of notes, refunded if the payment fails.
     PayInvoice {
@@ -737,14 +745,20 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 json!({
                     "id": s.id, "hub": s.hub, "payee": encode(&s.payee), "amount": s.amount,
                     "fee": s.fee, "state": state(&s.state), "created_at": s.created_at,
+                    "optimization": s.is_optimization(&wallet.address()),
                 })
             });
             let lines = sends.iter().map(|s| {
+                let amount = if s.is_optimization(&wallet.address()) {
+                    format!("optimized notes, fee {}", say::sat(s.fee))
+                } else {
+                    say::plus(s.amount, s.fee)
+                };
                 format!(
                     "{}  {}  {}  via {}  {}",
                     say::when(s.created_at),
                     state(&s.state),
-                    say::plus(s.amount, s.fee),
+                    amount,
                     s.hub,
                     s.id
                 )
@@ -832,11 +846,62 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         }
         Command::Unlink => {
             let unlinked = wallet.unlink().await?;
+            let optimized = maintain(&wallet).await;
             show(
                 json,
-                json!({ "unlinked": unlinked }),
+                json!({ "unlinked": unlinked, "optimized": optimized }),
                 format!("unlinked {unlinked} notes"),
             );
+        }
+        Command::Optimize { hub, max_fee } => {
+            let hub = hub.trim_end_matches('/');
+            anyhow::ensure!(
+                wallet.hubs()?.iter().any(|(url, _)| url == hub),
+                "{hub} is no hub this wallet trusts"
+            );
+            let (quote, id) = match max_fee {
+                Some(max_fee) => match wallet.optimize_notes(hub, max_fee).await? {
+                    Some(done) => (Some(done.quote), Some(done.id)),
+                    None => (None, None),
+                },
+                None => {
+                    wallet.add_hub(hub).await?;
+                    (wallet.optimization_quote(hub)?, None)
+                }
+            };
+            match quote {
+                Some(quote) => {
+                    let status = if id.is_some() { "optimized" } else { "preview" };
+                    let mut line = format!(
+                        "{status}: {} to {} notes, reminting {}, fee {}{}",
+                        quote.notes_before,
+                        quote.notes_after,
+                        say::sat(quote.value),
+                        say::sat(quote.fee),
+                        say::share(quote.fee, quote.value)
+                            .map(|s| format!(" ({s})"))
+                            .unwrap_or_default(),
+                    );
+                    if id.is_none() {
+                        line.push_str(&format!(
+                            "\n--max-fee {} executes this within that limit",
+                            quote.fee
+                        ));
+                    }
+                    show(
+                        json,
+                        json!({ "hub": quote.hub, "value": quote.value, "fee": quote.fee,
+                        "notes_before": quote.notes_before, "notes_after": quote.notes_after,
+                        "id": id, "optimized": id.is_some() }),
+                        line,
+                    );
+                }
+                None => show(
+                    json,
+                    json!({ "hub": hub, "optimized": false }),
+                    "no note optimization available (or one is pending)".into(),
+                ),
+            }
         }
         Command::PayInvoice { invoice, hub, wait } => {
             let hub = match hub {
@@ -1268,6 +1333,8 @@ fn init(path: &Path, network: ChainProfile, transport: Http, json: bool) -> anyh
 async fn resume(wallet: &Wallet<Http>, json: bool) -> anyhow::Result<()> {
     let resumed = wallet.resume().await?;
     let unlinked = unlink(wallet).await;
+    // `unlink` also runs best-effort maintenance. No optimization payment
+    // is returned as a handover by the wallet's resume.
     let mut lines = Vec::new();
     for paid in &resumed.paid {
         let id = &paid.id;
@@ -1472,11 +1539,28 @@ fn route(tor: Option<licash_tor::Tor>, proxy: Option<&str>) -> anyhow::Result<Ro
 
 /// Unlink what can be: a failure leaves notes linked until the next try.
 async fn unlink(wallet: &Wallet<Http>) -> Option<usize> {
-    match wallet.unlink().await {
+    let unlinked = match wallet.unlink().await {
         Ok(unlinked) => Some(unlinked),
         Err(e) => {
             eprintln!(
                 "warning: some notes stay linked for now ({}); resume unlinks them",
+                say::terminal(&e.to_string())
+            );
+            None
+        }
+    };
+    maintain(wallet).await;
+    unlinked
+}
+
+/// A failed background optimization never turns a successful payment or
+/// receipt into a failed command.
+async fn maintain(wallet: &Wallet<Http>) -> Option<usize> {
+    match wallet.maintain_notes().await {
+        Ok(optimized) => Some(optimized),
+        Err(e) => {
+            eprintln!(
+                "warning: note optimization deferred ({})",
                 say::terminal(&e.to_string())
             );
             None
