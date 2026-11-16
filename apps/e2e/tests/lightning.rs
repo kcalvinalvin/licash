@@ -10,6 +10,14 @@ fn available(wallet: &Wallet) -> u64 {
     balance.iter().map(|b| b.available).sum()
 }
 
+/// What `wallet` paid its hubs on its payments to itself, which make the
+/// exact notes a lock to a hub locks.
+fn exact_fees(wallet: &Wallet) -> u64 {
+    let me = wallet.address();
+    let sends = wallet.sends().unwrap();
+    sends.iter().filter(|s| s.payee == me).map(|s| s.fee).sum()
+}
+
 /// Follow `lock` until it is paid or refunded.
 async fn settled(wallet: &Wallet, lock: &Lock) -> anyhow::Result<Lock> {
     until(&format!("lock {}", lock.id), 180, || async {
@@ -45,7 +53,11 @@ async fn wallets_pay_and_get_paid_over_lightning_across_hubs() -> anyhow::Result
     assert_eq!(lock.state, LockState::Paid(hex_32(&preimage)));
     // The invoice, and the gateway's fee of 2 + 5000 ppm.
     assert_eq!(lock.amount, 20_000 + 2 + 100);
-    assert_eq!(available(&alice), 50_000 - 20_102);
+    // Her notes of 50 000 held none adding up to it: she paid hub1 its fee
+    // to make them first.
+    let fees = exact_fees(&alice);
+    assert!(fees > 0);
+    assert_eq!(available(&alice), 50_000 - 20_102 - fees);
     // Its route ended its timelock before the lock's expiry, by the
     // gateway's slack of 12 blocks at least.
     let timelocks = eco.timelocks("hub1-ln", &hash).await?;
@@ -72,8 +84,8 @@ async fn wallets_pay_and_get_paid_over_lightning_across_hubs() -> anyhow::Result
     .await?;
     assert_eq!(status.state, ReceiveState::Settled);
 
-    // A payment that fails refunds its lock.
-    let before = available(&alice);
+    // A payment that fails refunds its lock, less the hub's refund fee.
+    let (before, fees) = (available(&alice), exact_fees(&alice));
     let (request, hash, _) = eco.hold_invoice(OUTSIDE, 5_000).await?;
     let lock = alice.pay_invoice(hub1, &request).await?;
     until("the outside node holds the payment", 60, || async {
@@ -85,7 +97,9 @@ async fn wallets_pay_and_get_paid_over_lightning_across_hubs() -> anyhow::Result
     let lock = settled(&alice, &lock).await?;
     assert_eq!(lock.state, LockState::Refunded);
     assert!(lock.failure.is_some());
-    assert_eq!(available(&alice), before);
+    let refund_fee = lock.cost.unwrap();
+    let exact = exact_fees(&alice) - fees;
+    assert_eq!(available(&alice), before - exact - refund_fee);
 
     // hub1's operator sees them in its dashboard, read beside it running.
     let dashboard = eco.dashboard("hub1", "licash-hub").await?;
