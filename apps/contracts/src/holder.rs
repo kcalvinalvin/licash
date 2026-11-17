@@ -232,6 +232,9 @@ async fn open_at<T: Transport, C: Chain>(
             Some((_, script)) => script.clone(),
             None => wallet.fallback_address()?.script_pubkey(),
         },
+        // Her reserve back at the close, or after a corrected payout: to
+        // her wallet, which finds it as any payment.
+        payout: wallet.fallback_address()?.script_pubkey(),
         wanted,
         checkpoint,
     };

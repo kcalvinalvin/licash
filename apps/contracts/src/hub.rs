@@ -89,6 +89,8 @@ pub struct ResponseRound {
     pub answered: usize,
     /// Openings whose payout outputs of the hub's it swept to its wallet.
     pub swept: usize,
+    /// Contracts it ended by default at their close.
+    pub closed: usize,
     pub failed: usize,
 }
 
@@ -367,10 +369,10 @@ impl Openings {
         for id in ids {
             match self.play(&id).await {
                 Ok(Played::Posted(what)) => {
-                    if what == "sweep" {
-                        round.swept += 1;
-                    } else {
-                        round.answered += 1;
+                    match what {
+                        "sweep" => round.swept += 1,
+                        "default" => round.closed += 1,
+                        _ => round.answered += 1,
                     }
                     tracing::info!(id = %crate::hex_id(&id), what, "contract exit played");
                 }

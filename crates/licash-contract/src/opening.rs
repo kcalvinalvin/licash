@@ -19,7 +19,7 @@ use lichen_btc::bitcoin::{
     sighash::{Prevouts, SighashCache, TapSighashType},
     taproot, Amount, OutPoint, ScriptBuf, Transaction, TxOut, Txid,
 };
-use lichen_contract::{sig_name, sign_all, Presign};
+use lichen_contract::{sig_name, sign_all, PartyPubKeys, Presign};
 use rand_core::{OsRng, RngCore};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -237,6 +237,10 @@ fn price(g: &GraphTerms, f: &Fees) -> Result<u64> {
 fn check_deposit(open: &wire::Open, g: &GraphTerms, f: &Fees) -> Result<()> {
     ensure!(open.coin.script_pubkey.is_p2tr(), "deposit must be taproot");
     ensure!(segwit(&open.change), "change must be native segwit");
+    ensure!(
+        segwit(&open.party.payout_spk),
+        "the holder's payout must be native segwit"
+    );
     ensure!(
         open.coin.value.to_sat() >= price(g, f)?,
         "deposit below price"
@@ -501,6 +505,9 @@ pub struct Start {
     pub deposit: OutPoint,
     pub coin: TxOut,
     pub change: ScriptBuf,
+    /// Her wallet's script, which every payout and the default pay her
+    /// reserve to: no sweep of hers needed.
+    pub payout: ScriptBuf,
     pub wanted: wire::Wanted,
 }
 
@@ -562,7 +569,10 @@ impl Holder {
         s.quote.check(s.checkpoint.profile())?;
         let keys = HolderKeys::derive(&s.seed, &id);
         let open = wire::Open {
-            party: keys.party.public(),
+            party: PartyPubKeys {
+                payout_spk: s.payout,
+                ..keys.party.public()
+            },
             claim_key: keys.claim_key(),
             deposit: s.deposit,
             coin: s.coin,
@@ -834,6 +844,14 @@ impl Holder {
     }
     fn check_terms(&self, t: &wire::Terms, ctx: &Context) -> Result<()> {
         t.hub.check()?;
+        // Her payouts pay the hub's share to it: one that doesn't relay
+        // would keep them off the chain.
+        ensure!(
+            segwit(&ScriptBuf::from_bytes(
+                t.base.parts().parties[1].payout_script.clone()
+            )),
+            "the hub's payout must be native segwit"
+        );
         let expected = self.expected_base(ctx.trust.program, t.base.parts().parties[1].clone())?;
         ensure!(
             expected.to_bytes() == t.base.to_bytes(),
@@ -885,6 +903,9 @@ pub struct Hub {
     consent: Option<wire::Consent>,
     signed: Option<Transaction>,
     funded: Option<Transaction>,
+    /// Its wallet's script, which the default and its share of every
+    /// payout pay to: given new, read from its terms once stored.
+    payout: Option<ScriptBuf>,
 }
 impl Hub {
     /// The hub's own one-time keys. The driver must durably pin each
@@ -893,10 +914,23 @@ impl Hub {
         &self.keys
     }
 
-    pub fn new(quote: Quote, bounds: Bounds) -> Self {
+    /// A new opening of `quote`, paying the hub's share to `payout`, a
+    /// script of its wallet.
+    pub fn new(quote: Quote, bounds: Bounds, payout: ScriptBuf) -> Self {
         let mut secret = [0; 32];
         OsRng.fill_bytes(&mut secret);
-        Self::with(&secret, quote, Some(bounds))
+        let mut hub = Self::with(&secret, quote, Some(bounds));
+        hub.payout = Some(payout);
+        hub
+    }
+    /// The hub as a party of the terms: its keys and its payout script.
+    fn party(&self) -> Result<licash::base::Party> {
+        let payout = self.payout.clone().context("no payout script")?;
+        ensure!(segwit(&payout), "the hub's payout must be native segwit");
+        Ok(graph::party(&PartyPubKeys {
+            payout_spk: payout,
+            ..self.keys.party.public()
+        }))
     }
     fn with(secret: &[u8; 32], quote: Quote, bounds: Option<Bounds>) -> Self {
         Self {
@@ -916,6 +950,7 @@ impl Hub {
             consent: None,
             signed: None,
             funded: None,
+            payout: None,
         }
     }
     pub fn phase(&self) -> HubPhase {
@@ -1087,7 +1122,7 @@ impl Hub {
                             &o,
                             ctx.trust.program,
                             &self.quote.chain.checkpoint,
-                            graph::party(&self.keys.party.public()),
+                            self.party()?,
                         )?;
                         b.check(&ctx.trust.program, ctx.tip)?;
                         self.id = Some(m.id);
@@ -1370,6 +1405,10 @@ mod tests {
             })
             .unwrap_or_else(|| panic!("no {kind:?} in {out:?}"))
     }
+    /// A wallet's script (P2WSH), told apart by `n`.
+    fn wallet_script(n: u8) -> ScriptBuf {
+        ScriptBuf::from_bytes([&[0x00, 0x20][..], &[n; 32]].concat())
+    }
     fn reload(holder: &mut Holder, hub: &mut Hub, ctx: &Context) {
         let a = holder.to_bytes();
         let h = hub.to_bytes();
@@ -1415,6 +1454,50 @@ mod tests {
         let error = bounds.check(&wanted(1_100, 5), 1_000).unwrap_err();
         assert!(error.to_string().contains("window of 5 blocks"), "{error}");
         assert!(bounds.check(&wanted(1_100, 7), 1_000).is_ok());
+    }
+
+    #[test]
+    fn each_party_is_paid_to_a_native_segwit_script() {
+        let id = [3; 32];
+        let q = Quote::from_base(&testing::base(&id));
+        let keys = HolderKeys::derive(&[1; 32], &id);
+        let mut open = wire::Open {
+            party: PartyPubKeys {
+                payout_spk: wallet_script(5),
+                ..keys.party.public()
+            },
+            claim_key: keys.claim_key(),
+            deposit: OutPoint {
+                txid: Txid::from_byte_array([4; 32]),
+                vout: 0,
+            },
+            coin: TxOut {
+                value: Amount::from_sat(1002000),
+                script_pubkey: ScriptBuf::new_p2tr(SECP256K1, keys.claim_key(), None),
+            },
+            change: wallet_script(5),
+            wanted: wire::Wanted {
+                request_height: 100,
+                close_height: 1000,
+                response_window: 24,
+            },
+            mock: true,
+        };
+        assert!(check_deposit(&open, &q.graph, &q.fees).is_ok());
+        // A bare script relays no payout of hers.
+        let bare = ScriptBuf::from_bytes(vec![0x51]);
+        open.party.payout_spk = bare.clone();
+        let error = check_deposit(&open, &q.graph, &q.fees).unwrap_err();
+        assert!(error.to_string().contains("holder's payout"), "{error}");
+        let mut hub = Hub::with(&[2; 32], q, None);
+        assert!(hub.party().is_err(), "no payout script");
+        hub.payout = Some(bare);
+        assert!(hub.party().is_err());
+        hub.payout = Some(wallet_script(6));
+        assert_eq!(
+            hub.party().unwrap().payout_script,
+            wallet_script(6).to_bytes()
+        );
     }
 
     #[test]
@@ -1525,6 +1608,7 @@ mod tests {
                 },
                 coin: coin.clone(),
                 change: coin.script_pubkey.clone(),
+                payout: wallet_script(5),
                 wanted,
             },
             id,
@@ -1539,6 +1623,7 @@ mod tests {
                 response_window: 24,
             }),
         );
+        h.payout = Some(wallet_script(6));
         let terms = h
             .step(Input::Message(sent(&first, Kind::Open)), &ctx)
             .unwrap();
@@ -1706,6 +1791,22 @@ mod tests {
         let ao = a.signed().unwrap();
         let ho = h.signed().unwrap();
         assert_eq!(ao.funding, ho.funding);
+        // Ended with no exit, the default pays each its wallet's script,
+        // signed by both: the hub adds a fee coin to it.
+        let default = ho.default_close().unwrap();
+        let reserve = Amount::from_sat(ao.base.parts().graph.reserve_alice);
+        assert_eq!(default.output[0].script_pubkey, wallet_script(5));
+        assert_eq!(default.output[0].value, reserve);
+        assert_eq!(default.output[1].script_pubkey, wallet_script(6));
+        assert_eq!(
+            default.output[0].value + default.output[1].value,
+            ao.babe.value()
+        );
+        assert_eq!(
+            default.input[0].witness.len(),
+            4,
+            "both signatures, the leaf, its control"
+        );
         let request = ao.request(&a.keys, 3072, &[9; 32]).unwrap();
         assert_eq!(ho.requested_b(&request).unwrap(), (3072, [9; 32]));
         assert!(ao.offer.sigs.keys().all(|n| !HubProves::withheld(n)));

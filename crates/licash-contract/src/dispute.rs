@@ -154,6 +154,12 @@ impl HubOpening {
     pub fn finish(&self, name: &str, wire: Vec<Vec<u8>>) -> Result<Transaction> {
         finish(&self.set, &self.sigs, &self.consent.sigs, name, wire)
     }
+    /// The contract's end with no exit: after the close, the default pays
+    /// her reserve to her payout script and the rest to the hub's. It pays
+    /// no fee: the hub adds a fee coin ([`add_fee`]).
+    pub fn default_close(&self) -> Result<Transaction> {
+        self.finish("default", vec![])
+    }
     pub fn requested_b(&self, request: &Transaction) -> Result<(u32, [u8; 32])> {
         check_link(&self.set, "request", request)?;
         HubProves::requested_b(request)

@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, ensure, Context, Result};
 use bitcoin::consensus::{deserialize, serialize};
-use bitcoin::OutPoint;
+use bitcoin::{OutPoint, TxOut};
 use licash_api::Fees;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
@@ -50,6 +50,29 @@ const FEES: &str = "
 CREATE TABLE IF NOT EXISTS fees (
     id BLOB PRIMARY KEY REFERENCES openings (id),
     fees TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+) STRICT;
+";
+
+/// What the responder keeps across restarts, made with the first kept,
+/// as `fees`, and ignored by a build before them:
+/// - `fee_coins`: each coin its wallet funded to pay a terminal's fee
+///   (opening, terminal), made once: another made after a restart would
+///   be lost to the hub, as only that terminal spends it;
+/// - `ended`: the contracts whose exit or default left nothing of the
+///   hub's to play, deep enough not to look again. None ended (no table)
+///   only means each is looked at again.
+const RESPONDER: &str = "
+CREATE TABLE IF NOT EXISTS fee_coins (
+    id BLOB NOT NULL REFERENCES openings (id),
+    name TEXT NOT NULL,
+    outpoint BLOB NOT NULL,
+    output BLOB NOT NULL,
+    PRIMARY KEY (id, name)
+) STRICT;
+CREATE TABLE IF NOT EXISTS ended (
+    id BLOB PRIMARY KEY REFERENCES openings (id),
+    height INTEGER NOT NULL,
     created_at INTEGER NOT NULL
 ) STRICT;
 ";
@@ -241,15 +264,78 @@ impl Store {
         row(&self.0, id)
     }
 
-    /// The signed openings not given up, of this format: those whose exit
-    /// the hub plays.
+    /// The signed openings not given up nor ended, of this format: those
+    /// whose exit the hub plays.
     pub fn signed_ids(&self) -> Result<Vec<[u8; 32]>> {
-        let mut stmt = self.0.prepare(
+        let ended = match self.has("ended")? {
+            true => "AND id NOT IN (SELECT id FROM ended)",
+            false => "",
+        };
+        let mut stmt = self.0.prepare(&format!(
             "SELECT id FROM openings WHERE irrevocable = 1 AND abandoned = 0 AND format = ?1
-             ORDER BY created_at, rowid",
-        )?;
+             {ended} ORDER BY created_at, rowid"
+        ))?;
         let rows = stmt.query_map([FORMAT], |r| r.get(0))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Opening `id`'s contract ended at block `height`: nothing of the
+    /// hub's left in it to play.
+    pub fn end(&self, id: &[u8; 32], height: u32) -> Result<()> {
+        self.0.execute_batch(RESPONDER)?;
+        self.0.execute(
+            "INSERT INTO ended (id, height, created_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT DO NOTHING",
+            params![id, height, crate::now()],
+        )?;
+        Ok(())
+    }
+
+    /// The fee coin kept for terminal `name` of opening `id`, if one was.
+    pub fn fee_coin(&self, id: &[u8; 32], name: &str) -> Result<Option<(OutPoint, TxOut)>> {
+        if !self.has("fee_coins")? {
+            return Ok(None);
+        }
+        let row: Option<(Vec<u8>, Vec<u8>)> = self
+            .0
+            .query_row(
+                "SELECT outpoint, output FROM fee_coins WHERE id = ?1 AND name = ?2",
+                params![id, name],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        row.map(|(op, out)| Ok((deserialize(&op)?, deserialize(&out)?)))
+            .transpose()
+    }
+
+    /// Keep `coin` as terminal `name`'s fee coin of opening `id`, unless
+    /// one was kept: the one kept.
+    pub fn keep_fee_coin(
+        &self,
+        id: &[u8; 32],
+        name: &str,
+        coin: &(OutPoint, TxOut),
+    ) -> Result<(OutPoint, TxOut)> {
+        self.0.execute_batch(RESPONDER)?;
+        self.0.execute(
+            "INSERT INTO fee_coins (id, name, outpoint, output) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT DO NOTHING",
+            params![id, name, serialize(&coin.0), serialize(&coin.1)],
+        )?;
+        self.fee_coin(id, name)?.context("no fee coin kept")
+    }
+
+    /// Whether table `name` was made.
+    fn has(&self, name: &str) -> Result<bool> {
+        Ok(self
+            .0
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [name],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some())
     }
 
     /// The signed openings not given up stored in another format, which
@@ -414,6 +500,41 @@ fn outpoints(bytes: &[u8]) -> Result<Vec<OutPoint>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_fee_coin_is_kept_once_and_an_ended_contract_is_played_no_more() -> Result<()> {
+        let data = tempfile::tempdir()?;
+        let store = Store::open(data.path())?;
+        let deposit = |n| OutPoint {
+            txid: bitcoin::hashes::Hash::from_byte_array([n; 32]),
+            vout: 0,
+        };
+        for n in [1, 2] {
+            ensure!(store.insert(&[n; 32], 0, true, &deposit(n), &[0; 32], b"state")?);
+            store.save(&[n; 32], 0, true, &[0; 32], b"state")?;
+        }
+        let coin = |n| {
+            (
+                deposit(n),
+                TxOut {
+                    value: bitcoin::Amount::from_sat(330),
+                    script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![0x51, 0x20, n]),
+                },
+            )
+        };
+        ensure!(store.fee_coin(&[1; 32], "default")?.is_none());
+        ensure!(store.keep_fee_coin(&[1; 32], "default", &coin(7))? == coin(7));
+        // Another made after a restart: the first one kept is paid with.
+        ensure!(store.keep_fee_coin(&[1; 32], "default", &coin(8))? == coin(7));
+        ensure!(store.keep_fee_coin(&[1; 32], "success", &coin(8))? == coin(8));
+        store.end(&[1; 32], 100)?;
+        store.end(&[1; 32], 101)?;
+        drop(store);
+        let store = Store::open(data.path())?;
+        ensure!(store.fee_coin(&[1; 32], "default")? == Some(coin(7)));
+        ensure!(store.signed_ids()? == vec![[2; 32]]);
+        Ok(())
+    }
 
     #[test]
     fn uploaded_instances_are_durable_private_and_isolated() -> Result<()> {

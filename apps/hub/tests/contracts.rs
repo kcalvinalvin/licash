@@ -591,6 +591,70 @@ async fn a_hub_lets_an_honest_claim_time_out_to_its_holder() -> Result<()> {
     Ok(())
 }
 
+/// A contract no one exits ends at its close: the hub posts the default,
+/// which pays her reserve to her wallet and the rest to the hub's, once.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs bitcoind and a release build"]
+async fn a_hub_ends_a_contract_no_one_exited_by_default_at_its_close() -> Result<()> {
+    let rt = Regtest::start_standard()?;
+    let dir = tempfile::tempdir()?;
+    let (url, source, _, openings) = hub_answering(&rt, &dir.path().join("hub")).await?;
+    let chain = Node(source);
+    let (mine, wallet) = holder_wallet(&rt, &chain, dir.path(), &url, [23; 32], &[60_000]).await?;
+    let opened = holder::open(&wallet, &chain, &mine, &url, ask()).await?;
+    rt.mine(1)?;
+    holder::resume(&wallet, &chain, &mine).await?;
+    // F's change came back: 60 000 less the price.
+    ensure!(scan(&wallet, &chain).await? == 37_000);
+
+    // Not before its close: the default's lock is the close.
+    let close = opened.close_height;
+    rt.mine(u64::from(close) - u64::from(rt.height()?) - 1)?;
+    let round = openings.answer_requests().await?;
+    ensure!(round == Default::default(), "{round:?}");
+    rt.mine(1)?;
+    let round = openings.answer_requests().await?;
+    ensure!(round.closed == 1 && round.failed == 0, "{round:?}");
+    let again = openings.answer_requests().await?;
+    ensure!(again == Default::default(), "posted again: {again:?}");
+    rt.mine(1)?;
+
+    // Her reserve at her wallet; the rest, V_max and the hub's reserve, at
+    // the hub's.
+    ensure!(scan(&wallet, &chain).await? == 37_000 + 20_000);
+    let f = opened.funding.context("no F")?;
+    let spent: Option<serde_json::Value> = chain
+        .0
+        .rpc_optional("gettxout", serde_json::json!([f.to_string(), 0, true]))
+        .await?;
+    ensure!(spent.is_none(), "the contract stands");
+    let funding: serde_json::Value = chain
+        .0
+        .rpc(
+            "getrawtransaction",
+            serde_json::json!([f.to_string(), true]),
+        )
+        .await?;
+    let value = funding["vout"][0]["value"]
+        .as_f64()
+        .context("no contract output")?;
+    let share = (value * 1e8).round() as u64 - 20_000;
+    let ours: serde_json::Value = chain
+        .0
+        .rpc("listunspent", serde_json::json!([1, 1]))
+        .await?;
+    let back = ours
+        .as_array()
+        .context("no coins")?
+        .iter()
+        .filter_map(|c| c["amount"].as_f64())
+        .any(|btc| (btc * 1e8).round() as u64 == share);
+    ensure!(back, "the hub's share not in its wallet: {ours}");
+    let after = openings.answer_requests().await?;
+    ensure!(after == Default::default(), "{after:?}");
+    Ok(())
+}
+
 /// As [`hub_serving`], and its openings, for a test to answer a holder's
 /// request with.
 async fn hub_answering(

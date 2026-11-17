@@ -162,9 +162,8 @@ takes about 30 CPU seconds over a few threads, and the hub holds about
 On regtest, contracts are under a mock proof authority: such a contract
 protects nothing. On signet they are under the genuine programs kept in
 `r0/programs/`, a trial: RISC Zero's shared Groth16 setup, signet's headers
-checked by their work alone and not the network's signature of each block,
-and no automatic collateral reclaim after the close. The hub's terms there are
-signet's least: a day
+checked by their work alone and not the network's signature of each block.
+The hub's terms there are signet's least: a day
 for the wallet to answer a challenge and for each party's outputs to wait,
 3 blocks deep, 12 blocks at least to respond to a request and 48 for the
 hub to prove and assert its response (a proof takes hours on a CPU). No other
@@ -185,9 +184,14 @@ challenged, it answers with a kept instance. On regtest the proof is the
 mock authority's; on signet the hub runs `licash-r0 hp-prove`
 (`LICASH_HP_PROVER` names another) in the background, its files in
 `<data>/hp-proofs/<id>/`. It sweeps its outputs of each payout to its
-wallet. Keep `<data>/responses.sqlite` with `openings.sqlite`: it pins the
-evidence each response is decided on and each one-time signature (the
-response, the assertion) before it is made.
+wallet; a payout's rest and the holder's reserve pay each party's wallet
+directly. A contract no one exited ends at its close: the hub posts its
+default, which pays the holder her reserve and the hub its collateral back,
+to its wallet. The fee coins its wallet funds for these transactions are
+kept in `openings.sqlite` before use, and a contract ended 6 blocks deep is
+not looked at again. Keep `<data>/responses.sqlite` with `openings.sqlite`:
+it pins the evidence each response is decided on and each one-time
+signature (the response, the assertion) before it is made.
 
 With `--swaps` (and `--chain`), the hub provides the swaps into it from the
 hubs of `--swaps-from URL=CAP`: a wallet locks its notes at such a hub to

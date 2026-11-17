@@ -90,6 +90,7 @@ fn build() -> Opened {
             },
             coin: coin.clone(),
             change: coin.script_pubkey.clone(),
+            payout: coin.script_pubkey.clone(),
             wanted,
         },
         &ctx,
@@ -101,6 +102,13 @@ fn build() -> Opened {
             lock: 2000,
             response_window: 8,
         },
+        ScriptBuf::new_p2tr(
+            SECP256K1,
+            Keypair::from_secret_key(SECP256K1, &SecretKey::from_slice(&[13; 32]).unwrap())
+                .x_only_public_key()
+                .0,
+            None,
+        ),
     );
     // true is the holder's effect; false is the hub's.
     let mut queue: VecDeque<_> = first.into_iter().map(|o| (true, o)).collect();

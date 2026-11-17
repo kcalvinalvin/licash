@@ -182,7 +182,8 @@ impl Openings {
                     return Err(Refused::unavailable("too many openings under way: later"));
                 }
                 let bounds = self.timing.bounds(&quote);
-                let hub = Hub::new(*quote, bounds);
+                let payout = self.payout_script().await.map_err(Refused::unavailable)?;
+                let hub = Hub::new(*quote, bounds, payout);
                 let (hub, out) = stepped(&self.heavy, hub, Input::Message(message), ctx).await?;
                 let out = self.keep(&id, out)?;
                 let state = hub.to_bytes();

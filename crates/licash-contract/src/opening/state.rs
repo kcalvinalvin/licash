@@ -131,7 +131,11 @@ impl Holder {
         };
         same_kind(h.open.mock, ctx)?;
         ensure!(
-            h.open.party == h.keys.party.public() && h.open.claim_key == h.keys.claim_key(),
+            PartyPubKeys {
+                payout_spk: h.open.party.payout_spk.clone(),
+                ..h.keys.party.public()
+            } == h.open.party
+                && h.open.claim_key == h.keys.claim_key(),
             "state of another seed"
         );
         check_deposit(&h.open, &h.quote.graph, &h.quote.fees)?;
@@ -312,6 +316,10 @@ impl Hub {
         if phase < HubPhase::Signed {
             h.quote.check(h.quote.chain.checkpoint.profile())?;
         }
+        h.payout = h
+            .base
+            .as_ref()
+            .map(|b| ScriptBuf::from_bytes(b.parts().parties[1].payout_script.clone()));
         if let Some(open) = &h.open {
             same_kind(open.mock, ctx)?;
             check_deposit(open, &h.quote.graph, &h.quote.fees)?;
@@ -322,7 +330,7 @@ impl Hub {
                 open,
                 ctx.trust.program,
                 &h.quote.chain.checkpoint,
-                graph::party(&h.keys.party.public()),
+                h.party()?,
             )?;
             ensure!(
                 h.base.as_ref().unwrap().to_bytes() == expected.to_bytes(),

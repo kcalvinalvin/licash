@@ -21,7 +21,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use anyhow::{anyhow, bail, ensure, Context as _, Result};
-use bitcoin::{Amount, Block, FeeRate, OutPoint, Transaction, TxOut};
+use bitcoin::{Amount, Block, FeeRate, OutPoint, ScriptBuf, Transaction, TxOut};
 use licash::claim::UnsignedClaim;
 use licash::disclosure::Disclosures;
 use licash::recovery::{self, Evidence, Filing};
@@ -42,20 +42,16 @@ use crate::holder::node::Node;
 /// the claim is then owed what its notes are worth.
 pub type Evidencer = dyn Fn(&UnsignedClaim) -> Result<Vec<Evidence>> + Send + Sync;
 
-/// The caches of the responder: each coin's first spend once seen, and
-/// how far its blocks were looked through; the proofs being made; the
-/// fee coins made for terminals.
 /// A coin's first spend, once found: its block's height and it.
 type Spend = Option<(u32, Transaction)>;
 
-/// A fee coin made for a terminal: it and what it pays.
-type FeeCoin = (OutPoint, TxOut);
-
+/// The caches of the responder: each coin's first spend once seen, and
+/// how far its blocks were looked through; the proofs being made; what
+/// was noted once.
 #[derive(Default)]
 pub(super) struct Watch {
     spends: Mutex<HashMap<OutPoint, (u32, Spend)>>,
     proving: Arc<Mutex<HashSet<[u8; 32]>>>,
-    fee_coins: Mutex<HashMap<([u8; 32], String), FeeCoin>>,
     noted: Mutex<HashSet<([u8; 32], &'static str)>>,
 }
 
@@ -82,13 +78,22 @@ impl Openings {
             vout: 0,
         };
         let from = o.base.parts().chain.checkpoint.height();
-        // The cheap check first: her contract stands.
-        if self.unspent(contract).await? {
-            return Ok(Played::Idle);
+        // The cheap check first: her contract stands, and past its close
+        // the default ends it.
+        if self.unspent(contract, true).await? {
+            return self.close(id, &hub, &o, tip).await;
         }
         let Some((r_at, r)) = self.spend(contract, &funding.output[0], from, tip).await? else {
             return Ok(Played::Idle);
         };
+        let default = presign(&o.set, "default")?;
+        if r.input.first().map(|i| i.previous_output) == Some(contract)
+            && r.output == default.tx.output
+        {
+            // Each party's share went to its wallet: nothing left to play.
+            self.end_if_deep(id, r_at, tip)?;
+            return Ok(Played::Idle);
+        }
         let request = presign(&o.set, "request")?;
         if r.compute_txid() != request.tx.compute_txid() {
             self.note_once(id, "unknown", "her contract went to an unknown transaction");
@@ -104,26 +109,49 @@ impl Openings {
         };
         let respond = presign(&o.set, "respond")?;
         if x.compute_txid() != respond.tx.compute_txid() {
-            return self.collect(id, &hub, &o, &r, None, &x).await;
+            return self.collect(id, &hub, &o, &r, None, (x_at, &x), tip).await;
         }
         let Some((y_at, y)) = self.spend(main(&x), &x.output[0], x_at, tip).await? else {
             return self.assert(id, &hub, &o, &r, r_at, &x, x_at, tip).await;
         };
         let assert = presign(&o.set, "assert")?;
         if y.compute_txid() != assert.tx.compute_txid() {
-            return self.collect(id, &hub, &o, &r, Some(&x), &y).await;
+            return self
+                .collect(id, &hub, &o, &r, Some(&x), (y_at, &y), tip)
+                .await;
         }
         let Some((z_at, z)) = self.spend(main(&y), &y.output[0], y_at, tip).await? else {
             return Ok(Played::Idle);
         };
         let challenge = presign(&o.set, "challenge_assert")?;
         if z.compute_txid() != challenge.tx.compute_txid() {
-            return self.collect(id, &hub, &o, &r, Some(&x), &z).await;
+            return self
+                .collect(id, &hub, &o, &r, Some(&x), (z_at, &z), tip)
+                .await;
         }
         match self.spend(main(&z), &z.output[0], z_at, tip).await? {
             None => self.answer(id, &hub, &o, &y, &z).await,
-            Some((_, end)) => self.collect(id, &hub, &o, &r, Some(&x), &end).await,
+            Some((end_at, end)) => {
+                self.collect(id, &hub, &o, &r, Some(&x), (end_at, &end), tip)
+                    .await
+            }
         }
+    }
+
+    /// Her contract stands: past its close, the default, with a fee coin,
+    /// pays each party its share (the hub `V_max` and its reserve).
+    async fn close(&self, id: &[u8; 32], hub: &Hub, o: &HubOpening, tip: u32) -> Result<Played> {
+        if tip < o.base.parts().graph.close_height {
+            return Ok(Played::Idle);
+        }
+        let prevout = presign(&o.set, "default")?.prevout.clone();
+        let tx = self
+            .with_fee(id, hub, "default", o.default_close()?, prevout)
+            .await?;
+        if self.post(&tx).await && self.once(id, "default") {
+            return Ok(Played::Posted("default"));
+        }
+        Ok(Played::Idle)
     }
 
     /// Her request stands: what her publication is owed, and the response
@@ -458,8 +486,8 @@ impl Openings {
     }
 
     /// The one-input `tx` named `name`, spending `prevout`, with an exact
-    /// fee coin of the hub's wallet appended: made once and kept for the
-    /// poll after.
+    /// fee coin of the hub's wallet appended: made once, kept in
+    /// `openings.sqlite` before it is used.
     async fn with_fee(
         &self,
         id: &[u8; 32],
@@ -470,13 +498,7 @@ impl Openings {
     ) -> Result<Transaction> {
         let key = &hub.keys().party.payment;
         let script = dispute::fee_script(key)?;
-        let cached = self
-            .watch
-            .fee_coins
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(&(*id, name.to_string()))
-            .cloned();
+        let cached = self.store().fee_coin(id, name)?;
         let coin = match cached {
             Some(c) => c,
             None => {
@@ -521,12 +543,8 @@ impl Openings {
                     },
                     raw.output[vout].clone(),
                 );
-                self.watch
-                    .fee_coins
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .insert((*id, name.to_string()), coin.clone());
-                coin
+                // Kept at once: a restart pays with this one, not another.
+                self.store().keep_fee_coin(id, name, &coin)?
             }
         };
         dispute::add_fee(tx, prevout, coin, key)
@@ -534,6 +552,7 @@ impl Openings {
 
     /// A payout ended the exit: the hub's outputs of it, swept to its
     /// wallet once their waits are over.
+    #[allow(clippy::too_many_arguments)]
     async fn collect(
         &self,
         id: &[u8; 32],
@@ -541,7 +560,8 @@ impl Openings {
         o: &HubOpening,
         r: &Transaction,
         response: Option<&Transaction>,
-        payout: &Transaction,
+        (paid_at, payout): (u32, &Transaction),
+        tip: u32,
     ) -> Result<Played> {
         let spent = payout
             .input
@@ -577,16 +597,21 @@ impl Openings {
             .owned(payout, value_key, signer, amount, Role::Hub)?;
         if owned.is_empty() {
             self.note_once(id, "nothing", "nothing of the payout is the hub's");
+            self.end_if_deep(id, paid_at, tip)?;
             return Ok(Played::Idle);
         }
-        let address: String = self
-            .wallet
-            .rpc("getnewaddress", serde_json::json!(["", "bech32m"]))
-            .await?;
-        let to = address
-            .parse::<bitcoin::Address<bitcoin::address::NetworkUnchecked>>()?
-            .assume_checked()
-            .script_pubkey();
+        // Swept, in a block: ended once the payout is deep. The sweep pays
+        // the hub's wallet, whose node posts it again should a
+        // reorganization drop it.
+        let mut swept = true;
+        for out in &owned {
+            swept &= !self.unspent(out.op, false).await?;
+        }
+        if swept {
+            self.end_if_deep(id, paid_at, tip)?;
+            return Ok(Played::Idle);
+        }
+        let to = self.payout_script().await?;
         let rate = self.fee_rate().await;
         let sweep = dispute::sweep(
             &o.babe,
@@ -611,15 +636,41 @@ impl Openings {
         Ok(Played::Idle)
     }
 
-    async fn unspent(&self, coin: OutPoint) -> Result<bool> {
+    /// A new script of the hub's wallet: what its openings and sweeps pay
+    /// the hub to.
+    pub(super) async fn payout_script(&self) -> Result<ScriptBuf> {
+        let address: String = self
+            .wallet
+            .rpc("getnewaddress", serde_json::json!(["", "bech32m"]))
+            .await
+            .context("a new address of the hub's wallet")?;
+        Ok(address
+            .parse::<bitcoin::Address<bitcoin::address::NetworkUnchecked>>()?
+            .assume_checked()
+            .script_pubkey())
+    }
+
+    /// Whether `coin` is unspent: by the blocks, and by the mempool too
+    /// if `mempool`.
+    async fn unspent(&self, coin: OutPoint, mempool: bool) -> Result<bool> {
         let out: Option<serde_json::Value> = self
             .wallet
             .rpc_optional(
                 "gettxout",
-                serde_json::json!([coin.txid.to_string(), coin.vout, true]),
+                serde_json::json!([coin.txid.to_string(), coin.vout, mempool]),
             )
             .await?;
         Ok(out.is_some())
+    }
+
+    /// Opening `id` ended at block `at`: not looked at again once that
+    /// block is [`ENDED_DEPTH`] deep at `tip`.
+    fn end_if_deep(&self, id: &[u8; 32], at: u32, tip: u32) -> Result<()> {
+        if tip.saturating_sub(at) + 1 >= ENDED_DEPTH {
+            self.store().end(id, at)?;
+            tracing::info!(id = %crate::hex_id(id), at, "contract ended");
+        }
+        Ok(())
     }
 
     /// The first spend of `coin` (paying `out`) in blocks `from..=tip`,
@@ -713,14 +764,19 @@ impl Openings {
     }
 
     fn note_once(&self, id: &[u8; 32], what: &'static str, message: &str) {
-        let mut noted = self
-            .watch
-            .noted
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if noted.insert((*id, what)) {
+        if self.once(id, what) {
             tracing::info!(id = %crate::hex_id(id), "{message}");
         }
+    }
+
+    /// Whether this is the first time `what` happened to `id` since the
+    /// hub started.
+    fn once(&self, id: &[u8; 32], what: &'static str) -> bool {
+        self.watch
+            .noted
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert((*id, what))
     }
 }
 
@@ -742,6 +798,10 @@ fn tagged(id: &[u8; 32], tag: &[u8]) -> [u8; 32] {
     h.update(tag);
     h.finalize().into()
 }
+
+/// How many confirmations an end of a contract takes to be final for the
+/// responder.
+const ENDED_DEPTH: u32 = 6;
 
 /// The slot output of a request, her publication spending it, and of a
 /// response, the hub's disclosure spending it (Lichen's `SLOT_VOUT`).
