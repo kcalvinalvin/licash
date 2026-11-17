@@ -332,15 +332,25 @@ internal fun ProtectSheet(q: ContractQuote, open: () -> Unit, cashOutFirst: () -
 
 /** Why a protection does not end at once, and what to do instead: cash out what its hub holds. */
 @Composable
-internal fun EndSheet(c: Contract, height: Int, held: ULong, cashOut: () -> Unit, dismiss: () -> Unit) {
+internal fun EndSheet(
+    c: Contract,
+    height: Int,
+    held: ULong,
+    cashOut: () -> Unit,
+    endNow: () -> Unit,
+    dismiss: () -> Unit,
+) {
     val ends = cover(c, height).ends
     Sheet("Ends by itself", dismiss) {
         Say(
-            (if (ends != null) "In $ends, and no sooner. " else "It cannot end sooner. ") +
+            (if (ends != null) "In $ends. " else "") +
+                "Or end it now with ${name(c.hub)}: your part of its cost comes back on Bitcoin, and it protects nothing from then on. " +
                 "To stop relying on ${name(c.hub)}, cash out what you hold there.",
         )
         if (held > 0uL) {
             BigButton("Cash out ${sat(held)}", Modifier.fillMaxWidth().testTag("end-cash-out")) { cashOut() }
+            Spacer(Modifier.height(12.dp))
         }
+        BigButton("End now", Modifier.fillMaxWidth().testTag("end-now"), quiet = true) { endNow() }
     }
 }

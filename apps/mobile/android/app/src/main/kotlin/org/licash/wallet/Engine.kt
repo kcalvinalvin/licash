@@ -1155,6 +1155,32 @@ class Engine(context: Context) {
         }
     }
 
+    /**
+     * Close contract `id` early with its hub, in the background: its
+     * reserve back on Bitcoin. Told once done, or why not.
+     */
+    fun closeContract(id: String) {
+        val light = light
+        if (light == null) {
+            notices.tryEmit(Event("Not connected to Bitcoin yet: try again in a moment."))
+            return
+        }
+        AppLog.info("closing contract $id early")
+        scope.launch {
+            try {
+                val fold = local { it.closeContract(GoChain(light), id) }
+                AppLog.info("contract $id closed early by $fold")
+                notices.tryEmit(Event("Protection ended: your part comes back on Bitcoin"))
+            } catch (e: Exception) {
+                AppLog.warn("closing contract $id early", e)
+                notices.tryEmit(Event("Not ended. ${explain(e)}"))
+            } finally {
+                refresh()
+                poke()
+            }
+        }
+    }
+
     /** Give up forcing contract `id` closed, its notes back: only until its request is final. */
     suspend fun giveUpRecovery(id: String): Result<Unit> = io {
         local { it.giveUpRecovery(id) }

@@ -178,6 +178,10 @@ internal fun HubPage(
                 ending = null
                 cashOut(c.hub)
             },
+            endNow = {
+                ending = null
+                engine.closeContract(c.id)
+            },
             dismiss = { ending = null },
         )
     }
