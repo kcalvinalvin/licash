@@ -44,16 +44,16 @@ jobs:
         with:
           workspaces: apps
       # Its members only: --all would follow path dependencies into
-      # regtest's workspace and the vendored Lichen and ln-gap.
+      # regtest's workspace and the vendored Lichen.
       - working-directory: apps
         run: cargo fmt $(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | "-p " + .name') -- --check
       - working-directory: apps
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - working-directory: apps
         run: cargo test --locked --workspace
-      - name: Corrected recovery driver challenge and collection
+      - name: Recovery driver challenge and collection
         working-directory: apps
-        run: cargo test --release --locked -p licash-contracts --lib holder::recovery::driver_tests::a_selected_corrected_receipt_answers_a_challenge_and_collects -- --ignored --exact
+        run: cargo test --release --locked -p licash-contracts --lib holder::recovery::driver_tests::a_retained_hub_receipt_answers_a_challenge_and_collects -- --ignored --exact
       - working-directory: apps
         run: cargo doc --locked --no-deps --workspace
         env:
@@ -202,7 +202,7 @@ jobs:
           path: apps/target/e2e/
   regtest:
     runs-on: ubuntu-latest
-    # Core's tests alone take about 45 minutes, one at a time, LND's after.
+    # The contracts' openings garble and check real instances.
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
@@ -211,15 +211,9 @@ jobs:
           persist-credentials: false
       - uses: actions/checkout@v7
         with:
-          repository: AdamISZ/lichen
-          ref: 82c69a055a8ac9f2010d1f91ff15eef7ac1ca8ab
+          repository: lichenbtc-org/lichen
+          ref: 5cd7efc768270ccf42eb9f5a8ee3f1158b12555c
           path: lichen
-          persist-credentials: false
-      - uses: actions/checkout@v7
-        with:
-          repository: AdamISZ/ln-gap
-          ref: d7972035c12247a07b1dcc1b32e1682cd790d276
-          path: ln-gap
           persist-credentials: false
       - run: licash/vendor/fetch.sh
       - uses: dtolnay/rust-toolchain@stable
@@ -229,21 +223,15 @@ jobs:
         with:
           workspaces: licash/regtest
       - working-directory: licash
-        run: cargo fmt --manifest-path regtest/Cargo.toml -p licash-regtest -p licash-contract -- --check
+        run: cargo fmt --manifest-path regtest/Cargo.toml -p licash-contract -p licash-hp -- --check
       - working-directory: licash
         run: cargo clippy --locked --manifest-path regtest/Cargo.toml --workspace --all-targets --no-deps -- -D warnings
-      - name: Groth16 verifier agrees with golden receipts
-        working-directory: licash
-        run: CARGO_TARGET_DIR=regtest/target cargo test --locked --manifest-path crates/licash-groth16/Cargo.toml
       - name: The contract's opening messages
         working-directory: licash
         run: cargo test --release --locked --manifest-path regtest/Cargo.toml -p licash-contract -p licash-hp
-      - name: Bitcoin Core regtest (mock proofs)
+      - name: Contracts on Bitcoin Core regtest (mock proofs)
         working-directory: licash
-        run: regtest/run.sh -- --test-threads=1
-      - name: Lightning gateway against pinned LND
-        working-directory: licash
-        run: regtest/lightning.sh
+        run: regtest/run.sh
 
   # Publishing, from main only, once every job above passed: the services'
   # images to ghcr.io, the app to the main-build prerelease. Versioned

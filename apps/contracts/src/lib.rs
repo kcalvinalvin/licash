@@ -260,17 +260,15 @@ mod tests {
         use lichen_babe::statement::Kind;
         let journal = [5; 68];
         let trusted = trust(ChainProfile::Core30Signet).unwrap();
-        let statement = Kind::Risc0 {
-            image: trusted.program,
-        };
-        let pinned = Kind::Risc0 { image: SIGNET };
+        let statement = Kind::Risc0(trusted.program);
+        let pinned = Kind::Risc0(SIGNET);
         assert_eq!(
             statement.public_inputs(&journal),
             pinned.public_inputs(&journal)
         );
         assert_eq!(statement.verifying_key(), pinned.verifying_key());
         assert_ne!(statement.verifying_key(), Kind::Mock.verifying_key());
-        let another = Kind::Risc0 { image: [9; 32] };
+        let another = Kind::Risc0([9; 32]);
         assert_ne!(
             statement.public_inputs(&journal),
             another.public_inputs(&journal)

@@ -8,13 +8,13 @@ use bitcoin::{Amount, FeeRate, OutPoint, Sequence, Transaction, TxIn, TxOut, Txi
 use licash::claim::{self, Item, UnsignedClaim};
 use licash::recovery::{Filing, Publication, Witness as FilingWitness};
 use licash::request::Request;
+use licash_contract::graph::{link_args, HubProves};
 use licash_contract::{
     dispute::{self, presign, Payout},
     keys::HolderKeys,
     opening::{Context, Holder, Opening},
 };
 use licash_wallet::{first_spend, ClaimNote, ClaimSlot, Transport, Wallet};
-use lichen_babe::hp::{link_args, HubProves};
 use lichen_contract::Role;
 use serde::{Deserialize, Serialize};
 

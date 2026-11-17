@@ -59,8 +59,10 @@ done
 
 | Network | Program | Image id | Built from |
 |---|---|---|---|
-| signet | `native-claim` (holder) | `8be30cb2a683e896d251c7c363dddf794dc8ddb9d502922199cfa4d2f73b1390` | c325330 |
-| signet | `native-counter` (counter) | `25051741d3d6438bc7f78ebf074a4b93f30363729564345bb800efd43ce21129` | c325330 |
+| signet | `hp` (the Hub's statement) | `6bf78e6092f9c0959cee4908b449a032e575d527c5c889d8b9f3813b888f0d0c` | 0f86cc6 |
+
+The holder's and counter programs of the design before hub-proves are
+gone with it: no contract opened under them is played.
 
 Signet's are a trial under RISC Zero's shared Groth16 setup, and the
 programs check signet's headers by their work alone, not by the network's
@@ -74,9 +76,6 @@ To name new ones, build them from a commit, rebuild them in another
 checkout to see the same image ids, copy each `r0/guests/<name>.bin` to
 `r0/programs/<image id>.bin`, and name them in `apps/contracts`, keeping
 the programs named before for the contracts opened under them.
-Archived binaries alone do not provide prior-holder-image verification in
-the wallet: that support and a genuine prior-image proof regression must
-land before changing the holder image or receipt-verifier parameters.
 
 ## Execute and prove
 
@@ -108,10 +107,5 @@ with the signatures and DLEQ proofs a filing carries, so a filing at the
 contests a claim: it responds with less than the claim, and asserts the
 proof within the graph's assert window.
 
-The end-to-end test with a real proof plays the receipt on Bitcoin. It
-takes hours and about 10 GB of memory, so it is run explicitly:
-
-```sh
-LICASH_NATIVE_GUESTS=$PWD/r0/guests LICASH_R0=$PWD/r0/host/target/release/licash-r0 \
-  regtest/run.sh --test native_real_proof -- --ignored --nocapture
-```
+A hub proves on signet through `LICASH_HP_PROVER` (the host's
+`hp-prove`); no test plays a real proof on Bitcoin yet.

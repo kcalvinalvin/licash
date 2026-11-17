@@ -245,6 +245,13 @@ impl Openings {
             Err(e) => tracing::warn!("the contracts' wallet, {wallet}: {e:#}"),
         }
         let store = Store::open(data)?;
+        for (id, format) in store.unreadable_signed()? {
+            tracing::warn!(
+                id = %crate::hex_id(&id),
+                format,
+                "a signed contract stored in a format this build doesn't read: its exit isn't played"
+            );
+        }
         let openings = Arc::new(Self {
             data: data.to_owned(),
             store: Mutex::new(store),

@@ -22,9 +22,9 @@ use bitcoin::{Amount, Block, FeeRate, OutPoint, Transaction, TxOut};
 use licash::recovery::Evidence;
 use licash_contract::dispute::{self, presign, Payout};
 use licash_contract::graph;
+use licash_contract::graph::{link_args, HubProves};
 use licash_contract::opening::{Hub, HubOpening};
 use licash_wallet::first_spend;
-use lichen_babe::hp::{link_args, HubProves};
 use lichen_contract::Role;
 use sha2::{Digest, Sha256};
 

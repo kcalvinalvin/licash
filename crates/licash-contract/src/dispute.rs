@@ -6,7 +6,6 @@ use ark_bn254::Bn254;
 use ark_groth16::Proof;
 use lichen_babe::{
     gadget,
-    hp::{link_args, Assertion, HubProves},
     opening::{self, Garbler},
     reveal,
     setup::Instance,
@@ -20,17 +19,14 @@ use lichen_btc::{
     sighash::{sign_tapscript, sign_tapscript_acp},
     taptree::TapTree,
     tx::{build_spend, build_tx, Timelock},
-    winternitz::WotsPublic,
     witness::tapscript_witness,
 };
-use lichen_contract::{
-    skeleton::{anchor_tree_for, Owned, Presign},
-    Role,
-};
+use lichen_contract::{anchor_tree_for, Owned, Presign, Role};
+use lichen_wots::WotsPublic;
 use std::collections::HashMap;
 
 use crate::{
-    graph,
+    graph::{self, link_args, Assertion, HubProves},
     keys::{HolderKeys, HubKeys},
     opening::{HubOpening, Opening},
 };
@@ -224,7 +220,7 @@ impl HubOpening {
         let Some(inst) = Instance::from_bytes(bytes) else {
             return Ok(None);
         };
-        if inst.hmsg != self.babe.spec.hmsg[k] {
+        if inst.hmsg != self.babe.hmsg()[k] {
             return Ok(None);
         }
         check_link(&self.set, "assert", asserted)?;

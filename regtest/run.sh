@@ -1,15 +1,19 @@
 #!/usr/bin/env bash
+# The contracts played on a throwaway Bitcoin Core regtest node: the hub
+# service's ignored tests (apps/hub/tests/contracts.rs), a release build.
+# Arguments go to the test binary: a test's name, --nocapture.
 set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
 mkdir -p "$root/tmp/regtest"
 export TMPDIR="$root/tmp/regtest"
-export LNGAP_BITCOIND="${LNGAP_BITCOIND:-$root/regtest/bitcoind-docker.sh}"
+export LICHEN_BITCOIND="${LICHEN_BITCOIND:-$root/regtest/bitcoind-docker.sh}"
 
-if [[ "$LNGAP_BITCOIND" == "$root/regtest/bitcoind-docker.sh" ]]; then
+if [[ "$LICHEN_BITCOIND" == "$root/regtest/bitcoind-docker.sh" ]]; then
     image="${LICASH_BITCOIN_IMAGE:-bitcoin/bitcoin:30.0}"
     docker image inspect "$image" >/dev/null 2>&1 || docker pull "$image"
     docker image inspect "$image" --format 'Bitcoin image: {{.Id}}'
 fi
 
 cd "$root"
-exec cargo test --release --locked --manifest-path regtest/Cargo.toml "$@"
+exec cargo test --release --locked --manifest-path apps/Cargo.toml \
+    -p licash-hub-service --test contracts -- --ignored --test-threads=1 "$@"

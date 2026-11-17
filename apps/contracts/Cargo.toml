@@ -14,7 +14,6 @@ licash-contract = { path = "../../crates/licash-contract" }
 licash-hp = { path = "../../crates/licash-hp" }
 lichen-babe = { path = "../../vendor/lichen/crates/babe" }
 lichen-contract = { path = "../../vendor/lichen/crates/contract" }
-licash-groth16 = { path = "../../crates/licash-groth16" }
 licash-wallet.workspace = true
 anyhow.workspace = true
 ark-bn254 = "0.5"
@@ -38,7 +37,5 @@ node = ["dep:axum", "dep:licash-chain-client", "dep:sha2"]
 
 [dev-dependencies]
 k256 = "0.13"
-lngap-lamport = { path = "../../vendor/ln-gap/crates/lamport" }
-lngap-sessions = { path = "../../vendor/ln-gap/crates/apps/sessions" }
 tempfile = "3.27"
 tower = { version = "0.5", features = ["util"] }
