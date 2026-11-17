@@ -1006,6 +1006,8 @@ fn a_phone_pays_a_lightning_invoice_through_its_hub_and_shows_what_it_cost() {
         invoice: request.clone(),
         preimage: Some(hex::encode(preimage)),
         failure: None,
+        provider: None,
+        expiry: None,
     };
     assert_eq!(details, wanted);
 

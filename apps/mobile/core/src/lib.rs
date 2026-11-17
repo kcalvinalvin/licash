@@ -548,13 +548,31 @@ pub struct Notes {
 }
 
 /// A Lightning invoice to pay through `hub`: `amount` it asks, and `fee`,
-/// all paying it costs on top, with the notes held now.
+/// all paying it costs on top, with the notes held now. Paid by `hub`'s
+/// gateway, or by `provider` for a lock of notes at `hub`.
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct InvoiceQuote {
     pub hub: String,
     pub amount: u64,
     pub fee: u64,
     pub description: Option<String>,
+    pub provider: Option<ViaProvider>,
+}
+
+/// A swap provider paying a Lightning invoice from its own node for a lock
+/// of notes ([`InvoiceQuote`]).
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct ViaProvider {
+    /// Its URL, and the name it announced, if any.
+    pub url: String,
+    pub name: Option<String>,
+    /// The parts of the quote's fee: the provider's, routing included,
+    /// which [`crate::Wallet::pay_invoice_via`] pays at most, and the
+    /// hub's on the lock.
+    pub fee: u64,
+    pub lock_fee: u64,
+    /// Blocks until a failed payment's notes return, as its lock expires.
+    pub refund_blocks: u32,
 }
 
 /// Notes paid out to `address`, on Bitcoin, through a swap provider: what
@@ -847,12 +865,17 @@ pub enum Details {
         refund: Option<String>,
     },
     /// A Lightning invoice paid through `hub`: the `preimage` its payment
-    /// bought once paid, or why it was not.
+    /// bought once paid, or why it was not. Paid by `hub`'s gateway, or by
+    /// the swap `provider`, at its URL, for a lock of notes at `hub` that
+    /// expires at block `expiry`: a payment it failed returns its notes
+    /// only then.
     Lightning {
         hub: String,
         invoice: String,
         preimage: Option<String>,
         failure: Option<String>,
+        provider: Option<String>,
+        expiry: Option<u32>,
     },
     /// Paid over Lightning, through `hub`: its `invoice`, once the hub
     /// made it, and what it `asks` of the payer, the hub's fee on top; why

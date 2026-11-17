@@ -3513,6 +3513,7 @@ dependencies = [
  "licash-contracts",
  "licash-hub",
  "licash-hub-service",
+ "licash-lightning",
  "licash-nostr",
  "licash-onchain",
  "licash-swaps",

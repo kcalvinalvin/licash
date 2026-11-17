@@ -15,7 +15,7 @@ use futures_util::future::{join, join_all};
 use licash_api::{Info, Payment};
 use licash_wallet::{
     Error, HubId, Paid, PaymentCode, PayoutQuote, PayoutState, Received, SwapLimits, SwapQuote,
-    SwapState, Transport, Wallet,
+    SwapState, Transport, ViaQuote, Wallet,
 };
 
 use crate::{mailbox, Found, Role, Route, LIFETIME};
@@ -991,6 +991,53 @@ pub async fn payout_providers_with<T: Transport>(
         .collect();
     // Stable: the newest announced first among equals.
     providers.sort_by_key(|p| (!p.known, p.quote.costs()));
+    Ok(providers)
+}
+
+/// A swap provider announced on Nostr that pays Lightning invoices from
+/// its own node, and what it asks to pay one.
+#[derive(Clone, Debug)]
+pub struct InvoiceProvider {
+    /// The URL that answered as the provider: the first announced that
+    /// does, or where it last answered ([`Announcements`]).
+    pub url: String,
+    /// The key that announced it, x-only in hex.
+    pub key: String,
+    pub name: Option<String>,
+    pub quote: ViaQuote,
+}
+
+/// The swap providers announced on `relays` for `wallet`'s network, as
+/// `announced` keeps them, asked through `route`, that pay `request`, a
+/// BOLT11 invoice, for a lock of notes at hub `from`, added, for at most
+/// `max_fee` ([`Wallet::invoice_quote_via`]). Each is at the first URL it
+/// was announced at that answers as the key that announced it, or where it
+/// last answered. The cheapest first.
+pub async fn invoice_providers_with<T: Transport>(
+    wallet: &Wallet<T>,
+    announced: &Announcements,
+    (relays, route): (&[String], &Route),
+    from: &str,
+    request: &str,
+    max_fee: u64,
+) -> anyhow::Result<Vec<InvoiceProvider>> {
+    let network = wallet.network().name();
+    let ask = |url: String| async move {
+        let quote = wallet.invoice_quote_via(&url, from, request, max_fee);
+        quote.await
+    };
+    let on = (relays, route, network);
+    let answering = announced.answering(on, ask, |q: &ViaQuote| q.info.nostr.as_deref());
+    let mut providers: Vec<InvoiceProvider> = (answering.await?.into_iter())
+        .map(|(service, url, quote)| InvoiceProvider {
+            url,
+            key: service.key,
+            name: service.announcement.name,
+            quote,
+        })
+        .collect();
+    // Stable: the newest announced first among equals.
+    providers.sort_by_key(|p| p.quote.costs());
     Ok(providers)
 }
 

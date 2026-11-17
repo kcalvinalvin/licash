@@ -1,7 +1,8 @@
 //! Moving notes between the phone's own hubs through swap providers in
 //! this process, announced on a relay its hubs name: what it costs, the
 //! move itself, and the next provider tried only when one failed before
-//! the phone's notes were locked to it.
+//! the phone's notes were locked to it. And paying a Lightning invoice
+//! through such a provider, from its own node, when no hub's gateway does.
 
 #[path = "../../../hub/tests/chain/mod.rs"]
 mod chain;
@@ -28,13 +29,14 @@ use licash::{
     authorization::{Authorization, SignedProposal},
     claim::Branch,
     note::{Derivation, Evidence, IssuerKeys, Keyset, Note},
-    spend::{ChainProfile, Output as SpendOutput, Proposal},
+    spend::{lock_hash, ChainProfile, Output as SpendOutput, Proposal},
     unlink::Nonce,
 };
-use licash_api::{Code, Fee, Payment, Problem};
+use licash_api::{swaps, Code, Fee, Payment, Problem};
 use licash_hub::{Hub, Policy, Timing};
 use licash_hub_service::Services;
-use licash_mobile::{Details, Kind, MoveQuote, Network, State, Wallet};
+use licash_lightning::fake::{Fake, Outcome};
+use licash_mobile::{Details, InvoiceQuote, Kind, MoveQuote, Network, State, Wallet};
 use licash_nostr::Route;
 use licash_swaps::{Config, Provider};
 use licash_transport::Http;
@@ -277,6 +279,26 @@ struct Swaps {
 
 impl Swaps {
     fn start(hubs: &Hubs, seed: u8, terms: Config) -> Self {
+        Self::start_with(hubs, seed, terms, None)
+    }
+
+    /// [`Swaps::start`], paying Lightning invoices from `node` too, on
+    /// `lightning`'s terms, as the service does with `--lnd`.
+    fn start_paying(
+        hubs: &Hubs,
+        seed: u8,
+        terms: Config,
+        (node, lightning): (Arc<Fake>, swaps::Lightning),
+    ) -> Self {
+        Self::start_with(hubs, seed, terms, Some((node, lightning)))
+    }
+
+    fn start_with(
+        hubs: &Hubs,
+        seed: u8,
+        terms: Config,
+        lightning: Option<(Arc<Fake>, swaps::Lightning)>,
+    ) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let wallet = licash_wallet::Wallet::create(
             &dir.path().join("wallet.sqlite"),
@@ -306,13 +328,22 @@ impl Swaps {
                     wallet.add_hub(url).await.unwrap();
                 }
                 wallet.receive(&stocked).unwrap();
-                let provider = Arc::new(Provider::create(&swaps, wallet, terms).unwrap());
+                let provider = Provider::create(&swaps, wallet, terms).unwrap();
+                let paying = lightning.is_some();
+                let provider = match lightning {
+                    Some((node, lightning)) => provider.pay_lightning(node, lightning).unwrap(),
+                    None => provider,
+                };
+                let provider = Arc::new(provider);
                 let nostr = licash_nostr::public_key(&provider.nostr_secret().unwrap()).unwrap();
                 let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let addr = listener.local_addr().unwrap();
                 ready.send((addr, provider.clone())).unwrap();
                 let every = Duration::from_millis(100);
                 let stepping = tokio::spawn(licash_swaps_service::step(provider.clone(), every));
+                let paying = paying.then(|| {
+                    tokio::spawn(licash_swaps_service::pay_invoices(provider.clone(), every))
+                });
                 let announcing = tokio::spawn(licash_swaps_service::announce(
                     provider.clone(),
                     relays,
@@ -345,6 +376,9 @@ impl Swaps {
                     .unwrap();
                 stepping.abort();
                 announcing.abort();
+                if let Some(paying) = paying {
+                    paying.abort();
+                }
             });
         });
         let (addr, provider) = started.recv().unwrap();
@@ -592,4 +626,98 @@ fn a_move_is_never_tried_again_once_its_notes_were_locked() {
     // Its notes stay locked until the lock expires: none at the other hub.
     assert_eq!(held(&hubs, &phone, 1), 0);
     assert!(held(&hubs, &phone, 0) < 1_000 - 300);
+}
+
+/// The quote of paying `request` through a provider, once one is found,
+/// within 10 seconds.
+fn via_quote(phone: &Wallet, request: &str) -> InvoiceQuote {
+    let mut last = None;
+    for _ in 0..50 {
+        match phone.invoice_quote(request.to_owned()) {
+            Ok(quote) if quote.provider.is_some() => return quote,
+            other => last = Some(other),
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    panic!("{last:?}");
+}
+
+#[test]
+fn a_phone_pays_an_invoice_through_a_provider_when_no_hub_pays_it() {
+    let hubs = Hubs::start();
+    let node = Arc::new(Fake::new());
+    node.tip(3, [0; 32]);
+    // A fee of 2 and 1%, its routes ending 18 blocks before the lock does.
+    let lightning = swaps::Lightning {
+        node: node.pubkey(),
+        fee: Fee {
+            base: 2,
+            ppm: 10_000,
+        },
+        max: 2_000,
+        slack: licash_swaps::MIN_SLACK,
+    };
+    let swaps = Swaps::start_paying(&hubs, 0x52, TERMS, (node.clone(), lightning));
+    let phone = hubs.phone(1_000);
+    let preimage = [7; 32];
+    let request = node.invoice(100_000, lock_hash(&preimage), 6, Outcome::Pay(preimage));
+
+    // No hub of the phone's has a gateway: the provider pays it, for its
+    // fee of 3 and the hub's 1 on the lock, from notes at the first hub.
+    let quote = via_quote(&phone, &request);
+    let provider = quote.provider.clone().unwrap();
+    assert_eq!((quote.hub.clone(), quote.amount), (hubs.url(0), 100));
+    assert_eq!(provider.url, swaps.url());
+    assert_eq!(provider.name.as_deref(), Some("provider 82"));
+    assert_eq!((provider.fee, provider.lock_fee), (3, 1));
+    assert_eq!(quote.fee, provider.fee + provider.lock_fee);
+    assert!(provider.refund_blocks > 6 + 18, "{provider:?}");
+    let offers = phone.invoice_offers(request.clone()).unwrap();
+    assert_eq!(offers, vec![quote.clone()]);
+
+    let paying = phone
+        .pay_invoice_via(
+            request.clone(),
+            quote.hub.clone(),
+            provider.url.clone(),
+            provider.fee,
+        )
+        .unwrap();
+    assert_eq!(
+        (paying.kind, paying.state, paying.amount),
+        (Kind::Lightning, State::Pending, 100)
+    );
+    // Paid by the provider's node, which claims the lock with the preimage.
+    let mut paid = None;
+    for _ in 0..50 {
+        phone.resume().unwrap();
+        let history = phone.history().unwrap();
+        paid = history.into_iter().find(|a| a.id == paying.id);
+        if paid.as_ref().is_some_and(|a| a.state == State::Done) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let paid = paid.unwrap();
+    assert_eq!((paid.state, paid.amount), (State::Done, 100), "{paid:?}");
+    assert_eq!(node.sent().len(), 1);
+    match phone.details(Kind::Lightning, paid.id.clone()).unwrap() {
+        Details::Lightning {
+            hub,
+            invoice,
+            preimage: got,
+            failure,
+            provider: through,
+            expiry,
+        } => {
+            assert_eq!((hub, invoice), (hubs.url(0), request.clone()));
+            assert_eq!(got, Some(hex::encode(preimage)));
+            assert_eq!((failure, through), (None, Some(swaps.url())));
+            assert!(expiry.is_some());
+        }
+        other => panic!("{other:?}"),
+    }
+    // Paid through the provider: not again through it, nor anyone else.
+    let again = phone.pay_invoice_via(request, quote.hub, provider.url, provider.fee);
+    assert_eq!(again.unwrap().id, paid.id);
 }

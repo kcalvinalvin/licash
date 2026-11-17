@@ -46,6 +46,7 @@ uniffi = "0.32.2"
 licash-chain-client.workspace = true
 licash-hub.workspace = true
 licash-hub-service = { path = "../../hub", features = ["fake"] }
+licash-lightning = { workspace = true, features = ["fake"] }
 licash-onchain.workspace = true
 licash-swaps.workspace = true
 licash-swaps-service = { path = "../../swaps" }
