@@ -194,6 +194,9 @@ pub async fn list(
 }
 
 fn state(c: &Contract) -> String {
+    if let Some(fold) = c.folded {
+        return format!("closed early ({fold})");
+    }
     match (&c.abandoned, c.fate) {
         (Some(why), _) => format!("given up ({why})"),
         (None, Some(fate)) => format!("{fate:?}").to_lowercase(),
@@ -239,6 +242,7 @@ fn contract_json(c: &Contract) -> serde_json::Value {
         "price": c.price,
         "funding": c.funding.map(|t| t.to_string()),
         "abandoned": c.abandoned,
+        "folded": c.folded.map(|t| t.to_string()),
         "created_at": c.created_at,
     })
 }
@@ -271,6 +275,27 @@ pub async fn force_close(
     let rate = crate::onchain::rate(&chain.0, fee_rate).await?;
     let forced = recovery::force_close(wallet, &chain, dir(path), &id, rate).await?;
     show(json, recovery_json(&forced), recovery_line(&forced));
+    Ok(())
+}
+
+/// Close contract `id` early with its hub, cooperatively: the wallet's
+/// reserve back on Bitcoin at once, the protection over.
+pub async fn close(
+    wallet: &Wallet<Http>,
+    path: &Path,
+    chain: Option<&str>,
+    id: &str,
+    json: bool,
+) -> anyhow::Result<()> {
+    let chain = node(chain)?;
+    let id = contract_id(path, id)?;
+    let txid = licash_contracts::holder::close(wallet, &chain, dir(path), &id).await?;
+    let hex = licash_contracts::hex_id(&id);
+    show(
+        json,
+        json!({"id": hex, "fold": txid.to_string()}),
+        format!("{}  closed early by {txid}", &hex[..16]),
+    );
     Ok(())
 }
 

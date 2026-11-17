@@ -436,6 +436,16 @@ enum Command {
         #[arg(long, env = "LICASH_WALLET_CHAIN")]
         chain: Option<String>,
     },
+    /// Close contract ID (its id, or the start of it) early with its hub,
+    /// cooperatively: the wallet's reserve paid back on Bitcoin at once,
+    /// the hub's share less the fee to it. The contract protects nothing
+    /// from then on.
+    Close {
+        id: String,
+        /// The chain to read and broadcast to.
+        #[arg(long, env = "LICASH_WALLET_CHAIN")]
+        chain: Option<String>,
+    },
     /// Force contract ID (its id, or the start of it) closed when its hub
     /// stopped answering: the wallet's notes at the hub, up to its cap,
     /// claimed on Bitcoin, and once the hub's window to answer passed
@@ -1114,6 +1124,9 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         }
         Command::ApproveFees { url, yes } => {
             return contract::approve_fees(&wallet, &path, &url, yes, json).await;
+        }
+        Command::Close { id, chain } => {
+            return contract::close(&wallet, &path, chain.as_deref(), &id, json).await;
         }
         Command::ForceClose {
             id,

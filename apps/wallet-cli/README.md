@@ -196,6 +196,12 @@ they are under the genuine programs, a trial: `force-close` below recovers
 from them, not yet tried on signet itself (the hub's README says what else
 it lacks). No other network for now.
 
+`close <id> --chain <url>` closes a live contract early with its hub,
+cooperatively: the hub and the wallet sign its fold together (MuSig2), which
+pays the wallet's reserve back to it on Bitcoin at once and the rest to the
+hub, less the fee, which the hub pays from its share. The contract protects
+nothing from then on (`contracts` shows it `closed early`).
+
 `force-close <id> --chain <url>` forces a live contract closed when its hub
 stopped answering (`<id>` is the contract's id, or its start): its share
 of the wallet's notes at that hub (as `contracts --chain` shows it) leaves
