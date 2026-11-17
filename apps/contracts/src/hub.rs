@@ -373,7 +373,9 @@ impl Openings {
             .wallet
             .rpc("getwalletinfo", serde_json::json!([]))
             .await?;
-        let btc = info["balance"].as_f64().context("a wallet's info, no balance")?;
+        let btc = info["balance"]
+            .as_f64()
+            .context("a wallet's info, no balance")?;
         let balance = bitcoin::Amount::from_btc(btc)?.to_sat();
         let before = self
             .funds

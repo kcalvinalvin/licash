@@ -148,7 +148,10 @@ contract's cap up to that and how long it lasts up to
 `--contracts-max-blocks` (`/v1/contracts/quote?cap=SAT&blocks=N`), its cap
 at most `--contracts-per-coin` times (2 by default) the coin the wallet
 deposits, at the fixed price plus `--contracts-rate` millionths of the cap
-a year (10,000, 1% a year, by default); `/v1/info` then names that range.
+a year (10,000, 1% a year, by default); `/v1/info` then names that range,
+its largest cap no more than the contracts' wallet funds (its confirmed
+balance, asked each minute with `getwalletinfo`, less the hub's 100,000 sat
+reserve and 50,000 for fees): a larger cap is refused as unavailable.
 The collateral of a contract is the next power of two minus one sat at or
 above its cap (2,097,151 sat at least, 2,147,483,647 at most). F, a contract's
 funding, spends the wallet's coins, which stay locked while the opening
