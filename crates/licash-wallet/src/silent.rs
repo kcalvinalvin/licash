@@ -1042,16 +1042,50 @@ impl<T: Transport> Wallet<T> {
         amount: Option<u64>,
         rate: FeeRate,
     ) -> Result<Transaction, Error> {
-        self.spend_silent_keeping(to.into(), amount, rate, &[])
+        self.spend_silent_from(to.into(), amount, rate, Coins::Free)
     }
 
-    /// [`Wallet::spend_silent`], the coins of `keep` left unspent.
-    fn spend_silent_keeping(
+    /// [`Wallet::spend_silent`] of the one coin at `coin` alone, never
+    /// joined with another: its change, if any, to the wallet's change
+    /// address. For a wallet that never joins its coins, as joining them
+    /// tells they are one owner's.
+    pub fn spend_silent_coin(
+        &self,
+        to: impl Into<Payee>,
+        coin: OutPoint,
+        amount: Option<u64>,
+        rate: FeeRate,
+    ) -> Result<Transaction, Error> {
+        self.spend_silent_from(to.into(), amount, rate, Coins::One(coin))
+    }
+
+    /// The largest of the wallet's free coins, if it pays `amount` to `to`
+    /// alone, the fee at `rate` on top ([`Wallet::spend_silent_coin`]):
+    /// none if no one coin does.
+    pub fn silent_coin_paying(
+        &self,
+        to: &Payee,
+        amount: u64,
+        rate: FeeRate,
+    ) -> Result<Option<OutPoint>, Error> {
+        let script = match to {
+            Payee::Script(script) => script.clone(),
+            Payee::Silent(_) => any_taproot(),
+        };
+        let free = self.store.read(free_coins)?;
+        let largest = free.into_iter().max_by_key(|h| h.value);
+        Ok(largest
+            .filter(|h| plan(std::slice::from_ref(h), &script, Some(amount), rate).is_ok())
+            .map(|h| h.outpoint))
+    }
+
+    /// [`Wallet::spend_silent`] of `coins`.
+    fn spend_silent_from(
         &self,
         to: Payee,
         amount: Option<u64>,
         rate: FeeRate,
-        keep: &[OutPoint],
+        coins: Coins,
     ) -> Result<Transaction, Error> {
         if let Payee::Silent(address) = &to {
             let network = licash_onchain::network(self.network);
@@ -1067,7 +1101,13 @@ impl<T: Transport> Wallet<T> {
                 Payee::Script(script) => script.clone(),
                 Payee::Silent(_) => any_taproot(),
             };
-            let plan = plan(&kept(free_coins(t)?, keep), &script, amount, rate)?;
+            let held = coins.of(free_coins(t)?)?;
+            let plan = plan(&held, &script, amount, rate)?;
+            if matches!(coins, Coins::Whole(_)) && plan.change.is_some() {
+                return Err(Error::Invalid(
+                    "the coin pays more than is asked: change left".into(),
+                ));
+            }
             let secrets = plan
                 .inputs
                 .iter()
@@ -1141,29 +1181,20 @@ impl<T: Transport> Wallet<T> {
         Ok(tx)
     }
 
-    /// Deposit at the hub at `url` the coins at the silent payment address
-    /// that no transaction spends: notes of as much as they pay, the fee
-    /// at `rate` and the hub's on top, up to the most the hub takes. The
-    /// deposit, and the transaction paying it, signed and recorded as
-    /// spending its coins, for the application to broadcast. Should it
-    /// never confirm, [`Wallet::abandon_silent`] frees the coins, and the
-    /// deposit lapses unpaid. Nothing is kept of a deposit its hub did not
-    /// answer: the coins stay free, to deposit again.
+    /// Deposit at the hub at `url` the coin at `coin`, whole and alone:
+    /// notes of as much as it pays, the fee at `rate` and the hub's on
+    /// top, no change left (what is too little to pay out goes to the
+    /// fee). Refused if the hub takes less than all of it at once, or
+    /// more. The deposit, and the transaction paying it, signed and
+    /// recorded as spending the coin, for the application to broadcast.
+    /// Should it never confirm, [`Wallet::abandon_silent`] frees the
+    /// coin, and the deposit lapses unpaid. Nothing is kept of a deposit
+    /// its hub did not answer: the coin stays free, to deposit again.
     pub async fn deposit_silent(
         &self,
         url: &str,
+        coin: OutPoint,
         rate: FeeRate,
-    ) -> Result<(Deposit, Transaction), Error> {
-        self.deposit_silent_keeping(url, rate, &[]).await
-    }
-
-    /// [`Wallet::deposit_silent`] of the coins but those of `keep`, which
-    /// stay on Bitcoin.
-    pub async fn deposit_silent_keeping(
-        &self,
-        url: &str,
-        rate: FeeRate,
-        keep: &[OutPoint],
     ) -> Result<(Deposit, Transaction), Error> {
         let url = hub_url(url)?;
         self.not_visited(&url)?;
@@ -1171,9 +1202,9 @@ impl<T: Transport> Wallet<T> {
         let offer = info
             .deposits
             .ok_or_else(|| Error::Invalid(format!("hub {url} takes no deposits")))?;
-        // What the coins pay a taproot output, as a deposit's is.
+        // What the coin pays a taproot output, as a deposit's is.
         let taproot = any_taproot();
-        let held = kept(self.store.read(free_coins)?, keep);
+        let held = Coins::One(coin).of(self.store.read(free_coins)?)?;
         let total = held.iter().map(|h| h.value).sum::<u64>();
         let available = plan(&held, &taproot, None, rate).map_or(0, |p| p.pay);
         let fits = |amount: u64| offer.pays(amount).is_some_and(|pays| pays <= available);
@@ -1186,17 +1217,18 @@ impl<T: Transport> Wallet<T> {
             }
         }
         if amount < offer.min {
-            let output = TxOut {
-                value: Amount::ZERO,
-                script_pubkey: taproot,
-            };
-            let fee = fee(held.len().max(1), &[output], rate);
             return Err(Error::Insufficient {
-                needed: offer
-                    .pays(offer.min)
-                    .map_or(u64::MAX, |p| p.saturating_add(fee)),
+                needed: least_deposited(&offer, rate),
                 available: total,
             });
+        }
+        // All of it, or not at all: none left as change.
+        let pays = offer.pays(amount).unwrap_or(u64::MAX);
+        if plan(&held, &taproot, Some(pays), rate).is_ok_and(|p| p.change.is_some()) {
+            return Err(Error::Invalid(format!(
+                "a coin of {total} sat: more than {url} takes at once ({} sat of notes at most)",
+                offer.max
+            )));
         }
         let deposit = self.deposit_answered(hub, &info, amount).await?;
         let terms = match (&deposit.state, &deposit.terms) {
@@ -1217,8 +1249,12 @@ impl<T: Transport> Wallet<T> {
                     .ok()
             })
             .ok_or_else(|| Error::Invalid(format!("deposit address {}", terms.address)))?;
-        let tx =
-            self.spend_silent_keeping(to.script_pubkey().into(), Some(terms.pays), rate, keep)?;
+        let tx = self.spend_silent_from(
+            to.script_pubkey().into(),
+            Some(terms.pays),
+            rate,
+            Coins::Whole(coin),
+        )?;
         tracing::info!(hash = %deposit.hash, amount, txid = %tx.compute_txid(), "silent payment coins deposited");
         Ok((deposit, tx))
     }
@@ -1231,12 +1267,45 @@ struct Plan {
     change: Option<u64>,
 }
 
-/// `coins` but those of `keep`.
-fn kept(coins: Vec<Held>, keep: &[OutPoint]) -> Vec<Held> {
-    coins
-        .into_iter()
-        .filter(|h| !keep.contains(&h.outpoint))
-        .collect()
+/// The least a coin deposited whole at a hub offering `offer` holds, its
+/// fee at `rate`: in sat.
+pub fn least_deposited(offer: &licash_api::Deposits, rate: FeeRate) -> u64 {
+    let output = TxOut {
+        value: Amount::ZERO,
+        script_pubkey: any_taproot(),
+    };
+    let fee = fee(1, &[output], rate);
+    offer
+        .pays(offer.min)
+        .map_or(u64::MAX, |p| p.saturating_add(fee))
+}
+
+/// Which of the wallet's free coins a spend may take.
+#[derive(Clone, Copy)]
+enum Coins {
+    /// Any, as many as it needs.
+    Free,
+    /// This one alone.
+    One(OutPoint),
+    /// This one alone, all of it: no change.
+    Whole(OutPoint),
+}
+
+impl Coins {
+    /// Those of `free` it takes: fails if its one coin is not free.
+    fn of(self, free: Vec<Held>) -> Result<Vec<Held>, Error> {
+        let one = match self {
+            Self::Free => return Ok(free),
+            Self::One(one) | Self::Whole(one) => one,
+        };
+        let held: Vec<Held> = free.into_iter().filter(|h| h.outpoint == one).collect();
+        if held.is_empty() {
+            return Err(Error::Invalid(format!(
+                "no free coin of the wallet's at {one}"
+            )));
+        }
+        Ok(held)
+    }
 }
 
 /// The wallet's coin at `outpoint` that no block spends, and the

@@ -138,8 +138,11 @@ paid only, looking in them again for silent payments once a hub serves
 their tweaks; with no such hub, the first scan needs `--from <height>`.
 `onchain coins`
 lists the coins, `onchain send <to> <amount>` pays an address, a silent
-payment address or a code on Bitcoin, and `onchain move` deposits the coins
-for notes at a hub taking deposits.
+payment address or a code on Bitcoin, and `onchain move` deposits a coin
+for notes at a hub taking deposits. Coins are never joined: a send spends
+one coin alone (`--coin TXID:VOUT`, by default the largest, `--all` all of
+it), and a move deposits one coin whole, leaving no change (`--coin`, by
+default the largest), refused if the hub takes less than all of it.
 
 A broadcast error can follow successful relay. The signed transaction and
 its inputs stay reserved, and `onchain scan` rebroadcasts that same spend.

@@ -1127,10 +1127,10 @@ class Engine(context: Context) {
     /** An address on Bitcoin of this wallet's, to cash out to. */
     suspend fun bitcoinAddress(): Result<String> = io { local { it.bitcoinAddress() } }
 
-    /** Move all on Bitcoin into Licash now, what was cashed out here too. */
-    suspend fun moveAll(): Result<Activity> = io {
+    /** Move the largest coin on Bitcoin, whole and alone, into Licash now, one cashed out here too. */
+    suspend fun moveLargest(): Result<Activity> = io {
         val light = light ?: throw LicashException.Unavailable("not connected to Bitcoin yet")
-        val moving = locked { it.moveAllToLicash(GoChain(light)) }
+        val moving = locked { it.moveLargestToLicash(GoChain(light)) }
         refresh()
         poke()
         moving

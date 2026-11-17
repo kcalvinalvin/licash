@@ -247,7 +247,7 @@ private fun OnBitcoin(engine: Engine, ui: Ui, fail: (String) -> Unit) {
             Say(UNPROTECTED_MOVE)
             BigButton("Add anyway", Modifier.fillMaxWidth().testTag("move-in-anyway"), danger = true) {
                 warned = false
-                scope.launch { engine.moveAll().onFailure { fail(explain(it)) } }
+                scope.launch { engine.moveLargest().onFailure { fail(explain(it)) } }
             }
         }
     }
@@ -255,4 +255,5 @@ private fun OnBitcoin(engine: Engine, ui: Ui, fail: (String) -> Unit) {
 
 /** What adding Bitcoin to the balance with no protection risks. */
 internal const val UNPROTECTED_MOVE = "In your balance, it is held at your hub: if the hub fails or " +
-    "refuses to pay, it is lost. Protection recovers it on Bitcoin instead. Keep it here, or protect it first."
+    "refuses to pay, it is lost. Protection recovers it on Bitcoin instead. Keep it here, or protect it first. " +
+    "Your largest coin moves in whole, never joined with another."

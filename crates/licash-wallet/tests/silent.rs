@@ -27,7 +27,7 @@ use bitcoin::{
 use licash::spend::ChainProfile;
 use licash_api::{BlockTweaks, Fee, Hex, Info};
 use licash_onchain::silent::{self, SpAddress};
-use licash_wallet::{Blocks, Error, PaymentCode, Response, SilentSpend, Transport, Wallet};
+use licash_wallet::{Blocks, Error, Payee, PaymentCode, Response, SilentSpend, Transport, Wallet};
 use net::{Link, Net, HUB};
 
 const REGTEST: ChainProfile = ChainProfile::Core30DefaultRegtest;
@@ -573,6 +573,51 @@ async fn payments_are_found_and_spent_with_change_found_again() {
     assert_eq!(all.output.len(), 1);
     let fee = rate().fee_wu(all.weight()).unwrap().to_sat();
     assert_eq!(pays(&all, &elsewhere()), change.value - fee);
+}
+
+#[tokio::test]
+async fn a_spend_of_one_coin_never_joins_another() {
+    let s = setup().await;
+    s.wallet.watch_silent(HUB, 1).unwrap();
+    let me = s.address();
+    s.mine(vec![s.pay(&[me, me], &[30_000, 20_000])]);
+    s.scan().await.unwrap();
+    let coins = s.wallet.silent_coins().unwrap();
+    let coin = |value: u64| coins.iter().find(|c| c.value == value).unwrap().outpoint;
+    let payee = Payee::from(elsewhere());
+
+    // The largest, paying it alone; none if no one coin does.
+    let paying = |amount| s.wallet.silent_coin_paying(&payee, amount, rate()).unwrap();
+    assert_eq!(paying(10_000), Some(coin(30_000)));
+    assert_eq!(paying(25_000), Some(coin(30_000)));
+    assert_eq!(paying(35_000), None);
+
+    // One coin, its change back; another not free refused.
+    let spend = s
+        .wallet
+        .spend_silent_coin(elsewhere(), coin(20_000), Some(10_000), rate())
+        .unwrap();
+    assert_signed(&s.chain.lock().unwrap(), &spend);
+    assert_eq!((spend.input.len(), spend.output.len()), (1, 2));
+    assert_eq!(spend.input[0].previous_output, coin(20_000));
+    let again = s
+        .wallet
+        .spend_silent_coin(elsewhere(), coin(20_000), Some(1_000), rate());
+    assert!(matches!(again, Err(Error::Invalid(_))), "{again:?}");
+    // Too much for the coin alone, though both would pay it.
+    let more = s
+        .wallet
+        .spend_silent_coin(elsewhere(), coin(30_000), Some(35_000), rate());
+    assert!(matches!(more, Err(Error::Insufficient { .. })), "{more:?}");
+
+    // All of one: no change.
+    let all = s
+        .wallet
+        .spend_silent_coin(elsewhere(), coin(30_000), None, rate())
+        .unwrap();
+    assert_eq!((all.input.len(), all.output.len()), (1, 1));
+    let fee = rate().fee_wu(all.weight()).unwrap().to_sat();
+    assert_eq!(all.output[0].value.to_sat(), 30_000 - fee);
 }
 
 #[tokio::test]

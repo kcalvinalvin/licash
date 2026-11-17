@@ -32,26 +32,34 @@ pub enum Onchain {
     /// The coins found, not spent in a block yet.
     Coins,
     /// Pay AMOUNT to TO, a Bitcoin address, a silent payment address or a
-    /// payment code naming either, the fee on top: its transaction id.
+    /// payment code naming either, the fee on top, from one coin alone,
+    /// never joined with another: its transaction id.
     Send {
         to: String,
         /// In satoshis [default: what the code asks for].
         amount: Option<u64>,
-        /// Everything, the fee taken from it.
-        #[arg(long, conflicts_with = "amount")]
+        /// From this coin, `TXID:VOUT` [default: the largest, if it pays
+        /// it alone].
+        #[arg(long)]
+        coin: Option<bitcoin::OutPoint>,
+        /// The whole coin of --coin, the fee taken from it.
+        #[arg(long, conflicts_with = "amount", requires = "coin")]
         all: bool,
         /// In sat/vB [default: the chain's estimate within 6 blocks, at
         /// least 1].
         #[arg(long)]
         fee_rate: Option<u64>,
     },
-    /// Move the coins to notes at a hub taking deposits, up to the most it
-    /// takes: the deposit, which `resume` takes the notes of once its
-    /// payment confirmed.
+    /// Move one coin, whole, to notes at a hub taking deposits, never
+    /// joined with another nor leaving change: the deposit, which
+    /// `resume` takes the notes of once its payment confirmed.
     Move {
         /// At this hub [default: the first trusted taking deposits].
         #[arg(long)]
         hub: Option<String>,
+        /// This coin, `TXID:VOUT` [default: the largest free].
+        #[arg(long)]
+        coin: Option<bitcoin::OutPoint>,
         /// In sat/vB [default: the chain's estimate within 6 blocks, at
         /// least 1].
         #[arg(long)]
@@ -114,6 +122,7 @@ pub async fn run(
         Onchain::Send {
             to,
             amount,
+            coin,
             all,
             fee_rate,
         } => {
@@ -129,7 +138,16 @@ pub async fn run(
                 (None, None, false) => bail!("the code does not say how much: an AMOUNT or --all"),
             };
             let rate = rate(&source, fee_rate).await?;
-            let tx = wallet.spend_silent(payee, amount, rate)?;
+            let coin = match (coin, amount) {
+                (Some(coin), _) => coin,
+                (None, Some(amount)) => wallet
+                    .silent_coin_paying(&payee, amount, rate)?
+                    .with_context(|| {
+                        format!("no one coin pays {amount} sat and its fee: coins are never joined")
+                    })?,
+                (None, None) => bail!("--all sends the coin of --coin whole"),
+            };
+            let tx = wallet.spend_silent_coin(payee, coin, amount, rate)?;
             let txid = broadcast(&source, &tx).await?;
             let paid = tx.output.iter().map(|o| o.value.to_sat()).sum::<u64>();
             show(
@@ -139,7 +157,11 @@ pub async fn run(
             );
             Ok(())
         }
-        Onchain::Move { hub, fee_rate } => {
+        Onchain::Move {
+            hub,
+            coin,
+            fee_rate,
+        } => {
             let source = source()?;
             let hub = match hub {
                 Some(hub) => hub,
@@ -153,7 +175,15 @@ pub async fn run(
                 }
             };
             let rate = rate(&source, fee_rate).await?;
-            let (deposit, tx) = wallet.deposit_silent(&hub, rate).await?;
+            let coin = match coin {
+                Some(coin) => coin,
+                None => (wallet.silent_coins()?.into_iter())
+                    .filter(|c| c.spending.is_none())
+                    .max_by_key(|c| c.value)
+                    .map(|c| c.outpoint)
+                    .context("no free coin to move")?,
+            };
+            let (deposit, tx) = wallet.deposit_silent(&hub, coin, rate).await?;
             let txid = broadcast(&source, &tx).await?;
             eprintln!(
                 "deposit {}: {} sat in notes once {txid} confirms; `licash-wallet resume` takes them",

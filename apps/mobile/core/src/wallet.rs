@@ -504,7 +504,7 @@ impl Wallet {
 
     /// An address on Bitcoin of this wallet's, to cash notes out to: what
     /// the wallet's own payouts pay there stays on Bitcoin, unless moved
-    /// into Licash with [`Wallet::move_all_to_licash`].
+    /// into Licash with [`Wallet::move_largest_to_licash`].
     pub fn bitcoin_address(&self) -> Result<String, LicashError> {
         Ok(self.wallet.fallback_address()?.to_string())
     }
@@ -1445,19 +1445,23 @@ impl Wallet {
             .collect())
     }
 
-    /// Move the coins paid on Bitcoin to notes, at a hub trusted that
-    /// takes them, broadcasting through `chain`: the move, under way.
-    /// The coins the wallet's own payouts paid, cashed out to it
-    /// ([`Balance::kept`]), stay on Bitcoin.
+    /// Move the largest coin paid on Bitcoin, whole and alone, to notes,
+    /// at a hub trusted that takes it, broadcasting through `chain`: the
+    /// move, under way. The coins the wallet's own payouts paid, cashed
+    /// out to it ([`Balance::kept`]), stay on Bitcoin.
     pub fn move_to_licash(&self, chain: Arc<dyn ChainSource>) -> Result<Activity, LicashError> {
         let mut keep: Vec<OutPoint> = self.kept_coins()?.into_iter().map(|(c, _)| c).collect();
         keep.extend(self.opening_coins()?);
         self.move_keeping(chain, &keep, None)
     }
 
-    /// [`Wallet::move_to_licash`] of all the coins, those cashed out to the
-    /// wallet too: but those paying for contracts being opened.
-    pub fn move_all_to_licash(&self, chain: Arc<dyn ChainSource>) -> Result<Activity, LicashError> {
+    /// [`Wallet::move_to_licash`] of the largest of all the coins, those
+    /// cashed out to the wallet too: but those paying for contracts being
+    /// opened.
+    pub fn move_largest_to_licash(
+        &self,
+        chain: Arc<dyn ChainSource>,
+    ) -> Result<Activity, LicashError> {
         self.move_keeping(chain, &self.opening_coins()?, None)
     }
 }
@@ -1551,22 +1555,29 @@ impl Wallet {
         to: Option<&str>,
     ) -> Result<Activity, LicashError> {
         let hubs = self.wallet.hubs()?.into_iter();
-        let mut taking: Vec<String> = hubs
-            .filter(|(_, i)| i.deposits.is_some())
-            .map(|(u, _)| u)
-            .collect();
+        let mut taking: Vec<(String, licash_api::Deposits)> =
+            hubs.filter_map(|(u, i)| Some((u, i.deposits?))).collect();
         // `to` first, if it takes them.
-        taking
-            .sort_by_key(|u| Some(u.trim_end_matches('/')) != to.map(|t| t.trim_end_matches('/')));
-        let Some(hub) = taking.into_iter().next() else {
+        taking.sort_by_key(|(u, _)| {
+            Some(u.trim_end_matches('/')) != to.map(|t| t.trim_end_matches('/'))
+        });
+        let Some((hub, offer)) = taking.into_iter().next() else {
             return Err(LicashError::invalid(
                 "no hub trusted takes coins on Bitcoin",
             ));
         };
         let rate = FeeRate::from_sat_per_vb(DEPOSIT_RATE).expect("a rate");
-        let (deposit, tx) = self
-            .runtime
-            .block_on(self.wallet.deposit_silent_keeping(&hub, rate, keep))?;
+        // One coin, whole: coins are never joined, nor change left.
+        let coin = (self.wallet.silent_coins()?.into_iter())
+            .filter(|c| c.spending.is_none() && !keep.contains(&c.outpoint))
+            .max_by_key(|c| c.value)
+            .ok_or_else(|| LicashError::Insufficient {
+                needed: licash_wallet::least_deposited(&offer, rate),
+                available: 0,
+            })?;
+        let (deposit, tx) =
+            self.runtime
+                .block_on(self.wallet.deposit_silent(&hub, coin.outpoint, rate))?;
         if let Err(e) = chain.broadcast(bitcoin::consensus::serialize(&tx)) {
             // Relay may have succeeded before the response failed. Keep
             // the signed transaction and inputs; scanning retries it.
