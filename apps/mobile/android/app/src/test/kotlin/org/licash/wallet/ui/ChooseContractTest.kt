@@ -1,9 +1,10 @@
 package org.licash.wallet.ui
 
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import org.licash.core.ChangeProblem
+import org.licash.core.ChangeRange
 import org.licash.core.ContractRange
 
 class ChooseContractTest {
@@ -43,25 +44,37 @@ class ChooseContractTest {
     }
 
     @Test
-    fun the_rest_of_the_coin_joins_the_balance_by_default_only_if_all_protected() {
-        // The 10,000,000 sat coin, protecting 15,000,000 for 98,000 sat.
-        assertTrue(changeCovered(10_000_000uL, 98_000uL, 15_000_000uL))
-        assertTrue(changeCovered(10_000_000uL, 98_000uL, 9_902_000uL))
-        // Past the cap, it would not all be protected: it stays on Bitcoin.
-        assertFalse(changeCovered(10_000_000uL, 98_000uL, 9_901_999uL))
-        // Nothing left of the coin, or too little to pay it: none to move.
-        assertFalse(changeCovered(98_000uL, 98_000uL, 15_000_000uL))
-        assertFalse(changeCovered(50_000uL, 98_000uL, 15_000_000uL))
+    fun what_is_left_of_the_coin_is_covered_at_least() {
+        // The 10,000,000 sat coin: what is left of it once paid, at least.
+        assertEquals(9_902_000uL, coverAtLeast(4_096uL, 10_000_000uL, 98_000uL))
+        // Little or nothing left: the hub's least.
+        assertEquals(4_096uL, coverAtLeast(4_096uL, 25_000uL, 23_000uL))
+        assertEquals(4_096uL, coverAtLeast(4_096uL, 0uL, 23_000uL))
+    }
+
+    @Test
+    fun a_coin_that_cannot_turn_whole_into_protection_says_why() {
+        assertEquals("Costs more than this coin holds", whyNot(ChangeProblem.Short(23_000uL)))
+        assertTrue(whyNot(ChangeProblem.Uncovered(77_000uL)).contains("uncovered: cover more"))
+        assertTrue(whyNot(ChangeProblem.TooMuch(9_977_000uL, 5_001_000uL)).contains("smaller coin"))
     }
 
     @Test
     fun the_coin_cashed_out_first_pays_and_is_taken_for_the_cap() {
         // A cap at most 2 times its coin, as the signet hubs take.
         val range = ContractRange(least, 33_554_431uL, 432u, 52_560u, 2u, 1_000uL, 5_000u)
-        // A small cap: the price and some change.
-        assertEquals(firstCoin(1_100uL), coinFor(range, least, 1_100uL))
-        // A large one: half of it, rounded up.
-        assertEquals(500_001uL, coinFor(range, 1_000_001uL, 3_500uL))
+        val taken = ChangeRange(11_000uL, 5_001_000uL)
+        // The price itself, if the hub takes it for the cap: no change.
+        assertEquals(3_000uL, coinFor(range, 6_000uL, 3_000uL, 330uL, taken))
+        // A large cap: half of it, rounded up, its change taken into notes.
+        assertEquals(500_001uL, coinFor(range, 1_000_001uL, 3_500uL, 330uL, taken))
+        // Change less than the hub takes: as much more as that, covered.
+        assertEquals(14_100uL, coinFor(range, 20_000uL, 3_100uL, 330uL, taken))
+        // Not covered so: as it is, to refuse.
+        assertEquals(2_048uL, coinFor(range, least, 1_100uL, 330uL, taken))
+        // Under dust, to the fee: as it is.
+        assertEquals(5_001uL, coinFor(range, 10_001uL, 5_000uL, 330uL, taken))
+        assertEquals(500_001uL, coinFor(range, 1_000_001uL, 3_500uL, 330uL, null))
     }
 
     @Test

@@ -360,12 +360,6 @@ fun shown(contract: Contract, now: Long): Boolean = when (contract.state) {
     else -> true
 }
 
-/** What a payout to this wallet leaves as change, protecting from it. */
-private const val FIRST_CHANGE: ULong = 10_000uL
-
-/** The coin to cash out to this wallet to pay a protection of `price`: it, and some change. */
-fun firstCoin(price: ULong): ULong = price + FIRST_CHANGE
-
 /** `amount` sat in bitcoin, as a payment link says it: `0.00033000`. */
 fun btc(amount: ULong): String =
     "%d.%08d".format(Locale.US, (amount / 100_000_000uL).toLong(), (amount % 100_000_000uL).toLong())

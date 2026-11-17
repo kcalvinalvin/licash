@@ -150,7 +150,7 @@ data class Event(val text: String, val received: ULong? = null)
  * sat over `blocks`, paid from `coin` (`txid:vout`), its change moved into
  * Licash once its funding confirms if `moveChange`.
  */
-data class Chosen(val cap: ULong, val blocks: UInt, val coin: String, val moveChange: Boolean)
+data class Chosen(val cap: ULong, val blocks: UInt, val coin: String)
 
 /**
  * The wallet and the light client, and the loop keeping them in step while
@@ -496,7 +496,6 @@ class Engine(context: Context) {
         // Only with every coin found: a partial look could move part.
         if (caughtUp) {
             try {
-                moveChanges(chain)
                 offer()
             } catch (e: LicashException) {
                 failed("looking for protection to offer", e)
@@ -591,23 +590,6 @@ class Engine(context: Context) {
             } finally {
                 quoting.set(false)
             }
-        }
-    }
-
-    /**
-     * Move the change of contracts opened to move it, once their funding
-     * confirms. Nothing else on Bitcoin moves unasked: notes no contract
-     * protects are the hub's to lose, so a contract is offered instead
-     * ([offer]), and only its owner moves the rest.
-     */
-    private suspend fun moveChanges(chain: GoChain) {
-        try {
-            for (moving in locked { it.moveChanges(chain) }) {
-                AppLog.info("moving ${moving.amount} sat of a contract's change into Licash")
-                notices.tryEmit(Event("Adding ${sat(moving.amount)} of change to your balance"))
-            }
-        } catch (e: LicashException) {
-            AppLog.warn("moving a contract's change into Licash", e)
         }
     }
 
@@ -1215,7 +1197,7 @@ class Engine(context: Context) {
                         it.openContract(chain, hub, null, maxPrice)
                     } else {
                         it.openChosenContract(
-                            chain, hub, chosen.cap, chosen.blocks, maxPrice, chosen.coin, chosen.moveChange,
+                            chain, hub, chosen.cap, chosen.blocks, maxPrice, chosen.coin,
                         )
                     }
                 }
