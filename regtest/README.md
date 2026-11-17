@@ -1,30 +1,28 @@
-# Bitcoin integration
+# The contract's crates, and the contracts on Bitcoin
 
-The contract on Bitcoin: Lichen's BABE transaction graph
-(`crates/licash-contract`, played by `src/contract.rs`), opened from
-licash's Base by the holder's and the hub's state machines of
-`licash_contract::opening` over a byte pipe (`src/native.rs`, which has
-Bitcoin Core fund and sign F, and stores and reloads each party after
-each step it takes), with end-to-end tests that fund real
-contracts on a fresh Bitcoin Core 30 regtest node under the default relay
-policy. The garbled circuits are real; proofs are mocked (a test key)
-except in `tests/native_real_proof.rs`.
+`regtest/Cargo.toml` is the workspace of the recovery contract's crates,
+`crates/licash-contract` (Licash's front on Lichen's BABE graph, its
+opening and its dispute) and `crates/licash-hp` (the hub's statement),
+kept apart from the library's: they pull Lichen by path from `vendor/`.
+
+The contracts are played on Bitcoin by the hub service's tests
+(`apps/hub/tests/contracts.rs`): a wallet opens contracts at the hub
+service over HTTP on a fresh Bitcoin Core 30 regtest node, under the mock
+authority (the garbled circuits are real; proofs are mocked), and forces
+them closed.
 
 ## Prerequisites
 
-Rust, Docker, and Lichen and ln-gap at the revisions `vendor/fetch.sh`
-pins, which it copies into `vendor/` from checkouts beside this repository:
+Rust, Docker, and Lichen at the revision `vendor/fetch.sh` pins, which it
+copies into `vendor/` from a checkout beside this repository:
 
 ```sh
-git clone https://github.com/AdamISZ/lichen ../lichen
-git -C ../lichen fetch origin 82c69a055a8ac9f2010d1f91ff15eef7ac1ca8ab
-git clone https://github.com/AdamISZ/ln-gap ../ln-gap
-git -C ../ln-gap fetch origin d7972035c12247a07b1dcc1b32e1682cd790d276
+git clone https://github.com/lichenbtc-org/lichen ../lichen
 vendor/fetch.sh
 ```
 
 Each node runs in its own throwaway `bitcoin/bitcoin:30.0` container with a
-fresh datadir under `tmp/`. `LNGAP_BITCOIND` selects another `bitcoind`
+fresh datadir under `tmp/`. `LICHEN_BITCOIND` selects another `bitcoind`
 binary and `LICASH_BITCOIN_IMAGE` another image.
 
 ## Run
@@ -32,16 +30,7 @@ binary and `LICASH_BITCOIN_IMAGE` another image.
 From the repository root:
 
 ```sh
-regtest/run.sh -- --test-threads=1                                 # the whole suite
-regtest/run.sh --test native_lifecycle -- --test-threads=1         # recovery outcomes
-regtest/run.sh --test native_interop -- --test-threads=1           # swaps and routes
-regtest/run.sh --test native_opening -- --test-threads=1           # forged messages, stored openings
-regtest/run.sh --test native_fate -- --test-threads=1              # openings given up on the chain
-cargo test --release --locked --manifest-path regtest/Cargo.toml -p licash-contract  # codecs, key derivation
-regtest/lightning.sh                                               # Lightning, two pinned LND nodes
+cargo test --release --locked --manifest-path regtest/Cargo.toml -p licash-contract -p licash-hp
+regtest/run.sh                    # the contracts on Bitcoin Core
+regtest/run.sh --nocapture        # with their output
 ```
-
-`regtest/lightning.sh` creates a private Docker network and removes its
-containers on exit. With `LICASH_NATIVE_INPUTS=<dir>` the tests also write
-the guest inputs they use, for `r0/` to execute or prove (see
-[../r0/README.md](../r0/README.md), which also runs the real-proof test).

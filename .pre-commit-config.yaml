@@ -6,15 +6,15 @@ repos:
         # Patches keep the whitespace of the lines they apply to.
         exclude: \.patch$
       - id: end-of-file-fixer
-        # Preserve the exact verifier-vector bytes, and patches.
-        exclude: (^crates/licash-groth16/tests/data/(babe-60-42|babe-claim-60-42)\.hex|\.patch)$
+        # Patches keep the bytes of the lines they apply to.
+        exclude: \.patch$
       - id: check-yaml
       - id: check-merge-conflict
   - repo: local
     hooks:
       - id: cargo-fmt
         name: cargo fmt
-        entry: sh -c 'cargo fmt --all -- --check && cargo fmt --manifest-path r0/hp-guest/Cargo.toml -- --check && cargo fmt --manifest-path r0/host/Cargo.toml -- --check && cargo fmt --manifest-path regtest/Cargo.toml -p licash-regtest -p licash-contract -p licash-hp -- --check'
+        entry: sh -c 'cargo fmt --all -- --check && cargo fmt --manifest-path r0/hp-guest/Cargo.toml -- --check && cargo fmt --manifest-path r0/host/Cargo.toml -- --check && cargo fmt --manifest-path regtest/Cargo.toml -p licash-contract -p licash-hp -- --check'
         language: system
         types: [rust]
         pass_filenames: false
