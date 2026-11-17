@@ -126,7 +126,7 @@ async fn a_wallet_opens_contracts_at_a_hub_and_sees_them_confirm() -> Result<()>
     ensure!(first.phase == Phase::Funded, "{first:?}");
     ensure!(first.mock && first.cap == 4_096 && first.price == 23_000);
     ensure!(first.value == 60_000 && first.abandoned.is_none());
-    ensure!((first.close_height, first.assert_height) == (tip + 300, tip + 160));
+    ensure!((first.close_height, first.assert_height) == (tip + 300, tip + 140));
     let f = first.funding.context("no F")?;
     ensure!(first.fate == Some(Fate::Open), "{first:?}");
     let reserved = wallet.silent_coins()?;
@@ -260,7 +260,7 @@ async fn a_wallet_opens_a_contract_of_terms_it_chose_on_its_large_coin() -> Resu
     let first = holder::open(&wallet, &chain, &mine, &url, ask).await?;
     ensure!(first.phase == Phase::Funded, "{first:?}");
     ensure!(first.cap == 15_000_000 && first.price == price && first.value == 10_000_000);
-    ensure!((first.close_height, first.assert_height) == (tip + 2_000, tip + 1_860));
+    ensure!((first.close_height, first.assert_height) == (tip + 2_000, tip + 1_840));
 
     // Of the fixed terms beside it, on her small coin, as an app
     // installed asks.

@@ -84,7 +84,11 @@ pub struct Openings {
 /// also logged with the opening id.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ResponseRound {
+    /// Openings whose exit the hub contested or settled: a response, an
+    /// assertion, an answer to a challenge, a reclaimed slot.
     pub answered: usize,
+    /// Openings whose payout outputs of the hub's it swept to its wallet.
+    pub swept: usize,
     pub failed: usize,
 }
 
@@ -362,7 +366,11 @@ impl Openings {
         for id in ids {
             match self.play(&id).await {
                 Ok(Played::Posted(what)) => {
-                    round.answered += 1;
+                    if what == "sweep" {
+                        round.swept += 1;
+                    } else {
+                        round.answered += 1;
+                    }
                     tracing::info!(id = %crate::hex_id(&id), what, "contract exit played");
                 }
                 Ok(Played::Idle) => {}
