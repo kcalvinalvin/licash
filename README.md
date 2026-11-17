@@ -28,14 +28,13 @@ research implementation; it has not had a security review.
   itself, notes the hub issues.
 - `crates/licash-onchain`: Bitcoin outside the protocol: silent payments
   (BIP352), and the hash-locked coins of deposits and payouts.
-- `crates/licash-contract`: the contract's BABE transaction graph, on
-  Lichen and ln-gap, and its opening between a holder and a hub as two
-  message-driven state machines (built in regtest's workspace).
-- `crates/licash-groth16`: RISC Zero Groth16 receipt verification on the
-  host, used by the regtest harness to check exported proofs.
+- `crates/licash-contract`: the contract's transaction graph, Licash's
+  front on Lichen's BABE graph, and its opening between a holder and a hub
+  as two message-driven state machines (built in regtest's workspace).
 - `r0/`: the hub's statement as a RISC Zero zkVM program, and a host that
   executes and proves it. See [r0/README.md](r0/README.md).
-- `regtest/`: the contract played end to end on Bitcoin Core and LND. See
+- `regtest/`: the contract crates' workspace, and the contracts played
+  between a wallet and the hub service on Bitcoin Core. See
   [regtest/README.md](regtest/README.md).
 - `apps/`: the applications, a workspace of their own: the hub service
   (`apps/hub`), the swap provider service (`apps/swaps`), the wallet CLI
@@ -60,8 +59,8 @@ The library needs only Rust:
 cargo test --locked
 ```
 
-The applications build the contract on Lichen and ln-gap, which
-`vendor/fetch.sh` copies into `vendor/` at the revisions it pins (see
+The applications build the contract on Lichen, which `vendor/fetch.sh`
+copies into `vendor/` at the revision it pins (see
 [regtest/README.md](regtest/README.md)); so do their Docker images:
 
 ```sh

@@ -8,10 +8,10 @@ members = [
     "crates/licash-swaps",
     "crates/licash-wallet",
 ]
-# r0/ (RISC Zero guests and host), regtest/ (Bitcoin integration, needs
-# Lichen and ln-gap in vendor/, with crates/licash-contract) and apps/ (the
-# applications) are workspaces of their own.
-exclude = ["r0", "regtest", "apps", "crates/licash-groth16", "crates/licash-contract", "crates/licash-hp", "vendor"]
+# r0/ (RISC Zero guests and host), regtest/ (the contract's crates, which
+# need Lichen in vendor/) and apps/ (the applications) are workspaces of
+# their own.
+exclude = ["r0", "regtest", "apps", "crates/licash-contract", "crates/licash-hp", "vendor"]
 
 [profile.dev]
 debug = 0
