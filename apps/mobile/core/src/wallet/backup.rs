@@ -64,16 +64,20 @@ impl Wallet {
             .map_err(LicashError::failed)
     }
 
-    /// Explicit key-only restore. Its affirmative birthday requests a full
-    /// scan; missing metadata on ordinary startup never selects this path.
+    /// Explicit key-only restore, looking for its coins from `birthday`,
+    /// the block written down with the words, or from the first block
+    /// (a full scan) if none. Missing metadata on ordinary startup never
+    /// selects this path.
     #[uniffi::constructor]
     pub fn from_phrase(
         dir: String,
         phrase: String,
         network: Network,
+        birthday: Option<u32>,
         tor: bool,
     ) -> Result<Arc<Self>, LicashError> {
         let seed = seed_of(&phrase).map_err(failed)?;
+        let birthday = birthday.unwrap_or(1).max(1);
         let dir = std::path::PathBuf::from(dir);
         if holds_state(&dir) {
             return Err(LicashError::invalid("a wallet is there already"));
@@ -81,7 +85,7 @@ impl Wallet {
         fs::create_dir_all(&dir).map_err(LicashError::failed)?;
         fs::write(
             kept_file(&dir),
-            serde_json::to_vec(&Kept { birthday: 1 }).map_err(LicashError::failed)?,
+            serde_json::to_vec(&Kept { birthday }).map_err(LicashError::failed)?,
         )
         .map_err(LicashError::failed)?;
         Self::start(dir, tor, |path, http| {
@@ -478,8 +482,9 @@ mod tests {
         assert_eq!(phrase.split_whitespace().count(), 24);
         let restored = Wallet::from_phrase(
             dir.path().join("restored").display().to_string(),
-            phrase,
+            phrase.clone(),
             Network::Regtest,
+            None,
             false,
         )
         .unwrap();
@@ -494,6 +499,18 @@ mod tests {
             kept.birthday, 1,
             "full scanning requires this explicit restore action"
         );
+        // Its birthday written down with the words: looked from there.
+        assert_eq!(original.birthday(), Some(42));
+        let dated = Wallet::from_phrase(
+            dir.path().join("dated").display().to_string(),
+            phrase,
+            Network::Regtest,
+            original.birthday(),
+            false,
+        )
+        .unwrap();
+        assert_eq!(dated.birthday(), Some(42));
+        assert_eq!(dated.wallet.address(), original.wallet.address());
         assert!(seed_of("not a recovery phrase").is_err());
         assert!(seed_of(&Mnemonic::from_entropy(&[1; 16]).unwrap().to_string()).is_err());
     }
@@ -526,9 +543,7 @@ mod tests {
         assert_eq!(restored.wallet.address(), original.wallet.address());
         assert_eq!(restored.wallet.silent_next().unwrap(), Some(100));
         assert_eq!(fs::read(restored.dir.join("contacts.json")).unwrap(), b"[]");
-        let kept: Kept =
-            serde_json::from_slice(&fs::read(kept_file(&restored.dir)).unwrap()).unwrap();
-        assert_eq!(kept.birthday, 42);
+        assert_eq!(restored.birthday(), Some(42));
         let aside = fs::read_dir(dir.path())
             .unwrap()
             .filter_map(Result::ok)

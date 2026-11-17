@@ -827,6 +827,12 @@ fn a_phone_looks_for_payments_from_its_birthday_or_all_the_hub_indexed() {
     assert_eq!(light.fetched(), [after]);
     assert_eq!(scan(&unsure, &light), (2, 4_000));
     assert_eq!(light.fetched(), [before, after]);
+    // Where each looked from, kept as its birthday: the one lost, from
+    // the day before it was made, block 1 on this chain.
+    assert_eq!(young.birthday(), Some(born));
+    assert_eq!(unsure.birthday(), Some(1));
+    let again = unsure.scan(light.clone()).unwrap();
+    assert_eq!((again.from, again.next, again.tweaks), (1, after + 1, true));
     // A scan goes on from where it stood.
     let next = pay(5);
     assert_eq!(scan(&young, &light), (1, 2_000));
@@ -910,6 +916,9 @@ fn a_phone_whose_hubs_serve_no_tweaks_finds_its_fallback_payments_from_the_day_b
     assert_eq!(scan(&alice, &light), (1, 6_000));
     assert_eq!(light.fetched(), [before + 1]);
     assert_eq!(alice.balance().unwrap().onchain, 6_000);
+    // Its first block kept as its birthday; no tweaks to look with.
+    assert_eq!(alice.birthday(), Some(before + 1));
+    assert!(!alice.scan(light.clone()).unwrap().tweaks);
 
     // Moved to notes, more than the hub takes at once: the change found.
     let moving = alice.move_to_licash(light.clone()).unwrap();

@@ -21,7 +21,7 @@ use crate::{
     chain::Chain, Activity, Balance, ChainError, ChainSource, Code, ContractTerms, Details,
     FoundHub, Holding, Hub, HubsFound, InvoiceQuote, Kind, LicashError, LightningInvoice,
     LightningTerms, Linking, Network, NoteLine, Notes, NotesOf, NotesPaid, Onchain, Paid, PaidTo,
-    PayOffer, PayQuote, Range, Rate, Scan, Scanned, State,
+    PayOffer, PayQuote, Range, Rate, Scan, Scanned, State, TorStatus,
 };
 
 /// The rate deposits are paid at, in sat/vB: above what nodes relay.
@@ -164,6 +164,37 @@ impl Wallet {
     /// Whether it reaches hubs and relays through Tor.
     pub fn tor(&self) -> bool {
         self.tor
+    }
+
+    /// How far its Tor client is in connecting, none unless over Tor. Not
+    /// connected, it starts connecting now rather than at its first use.
+    pub fn tor_status(&self) -> Option<TorStatus> {
+        let Route::Tor(tor) = &self.route else {
+            return None;
+        };
+        let status = tor.status();
+        if !status.ready {
+            let tor = tor.clone();
+            self.runtime.spawn(async move {
+                if let Err(e) = tor.bootstrap().await {
+                    tracing::warn!("connecting to Tor: {e}");
+                }
+            });
+        }
+        Some(TorStatus {
+            percent: status.percent,
+            ready: status.ready,
+            summary: status.summary,
+            blocked: status.blocked,
+        })
+    }
+
+    /// The chain's height when the wallet was made, or the first block it
+    /// looks in for payments on Bitcoin: none of its coins is older. None
+    /// until known: write it down with the recovery words, as restoring
+    /// from them looks from there.
+    pub fn birthday(&self) -> Option<u32> {
+        Some(self.kept().birthday).filter(|b| *b > 0)
     }
 
     /// A SOCKS5 proxy through its Tor client, for the light client to
@@ -309,6 +340,14 @@ impl Wallet {
             tracing::info!("asking the hubs what URLs they name: not all answered in time");
         }
         self.onions();
+    }
+
+    /// Keep `kept`, whole or not at all.
+    fn keep(&self, kept: &Kept) -> Result<(), LicashError> {
+        let bytes = serde_json::to_vec(kept).map_err(LicashError::failed)?;
+        let new = self.dir.join("app.json.new");
+        std::fs::write(&new, bytes).map_err(LicashError::failed)?;
+        std::fs::rename(&new, kept_file(&self.dir)).map_err(LicashError::failed)
     }
 
     fn kept(&self) -> Kept {
@@ -1273,6 +1312,7 @@ impl Wallet {
             None => {
                 // Recorded before any block is looked in.
                 let from = self.first_block(chain.as_ref())?;
+                self.learn_birthday(from)?;
                 self.wallet.watch_silent(None, from)?;
                 tracing::info!(from, "looking for payments on Bitcoin");
                 from
@@ -1281,6 +1321,7 @@ impl Wallet {
         let source = Chain(chain.clone(), self.wallet.network());
         let mut failed = None;
         let mut scanned = None;
+        let mut tweaked = true;
         // Any hub serving the blocks: their tweaks are the chain's.
         for (url, _) in tweaks.iter().filter(|(_, first)| *first <= next) {
             let scan = self.wallet.scan_silent(url.as_str(), &source, SCAN_BATCH);
@@ -1302,6 +1343,7 @@ impl Wallet {
             (None, Some(e)) => return Err(e.into()),
             // None serves them: without tweaks, up to the first one does.
             (None, None) => {
+                tweaked = false;
                 let max = earliest.map_or(SCAN_BATCH, |first| SCAN_BATCH.min(first - next));
                 let scan = self.wallet.scan_silent(None, &source, max);
                 self.runtime.block_on(scan)?
@@ -1312,10 +1354,20 @@ impl Wallet {
         if scanned.next > scanned.height {
             self.broadcast_again(chain.as_ref());
             self.refund_deposits(chain.as_ref(), scanned.height);
+            // A wallet made before its birthday was kept, caught up: its
+            // first block, from the time it was made.
+            if self.kept().birthday == 0 {
+                match self.first_block(chain.as_ref()) {
+                    Ok(from) => self.learn_birthday(from)?,
+                    Err(e) => tracing::debug!(%e, "the wallet's first block"),
+                }
+            }
         }
         Ok(Scan {
+            from: self.kept().birthday,
             next: scanned.next,
             height: scanned.height,
+            tweaks: tweaked,
             found: scanned.found.len() as u32,
             found_value: scanned.found.iter().map(|c| c.value).sum(),
         })
@@ -1662,6 +1714,18 @@ impl Wallet {
         if let Err(e) = self.runtime.block_on(self.wallet.unlink()) {
             tracing::warn!(%e, "some notes stay linked for now");
         }
+    }
+
+    /// Keep `from`, the first block looked in, as the wallet's birthday if
+    /// it had none: for the recovery words' restore, and the backup file.
+    fn learn_birthday(&self, from: u32) -> Result<(), LicashError> {
+        let mut kept = self.kept();
+        if kept.birthday == 0 && from > 0 {
+            kept.birthday = from;
+            self.keep(&kept)?;
+            tracing::info!(from, "the wallet's first block kept");
+        }
+        Ok(())
     }
 
     /// The first block to look in for payments on Bitcoin: the chain's

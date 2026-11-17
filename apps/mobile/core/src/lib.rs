@@ -934,13 +934,32 @@ pub fn explorer(network: Network) -> Option<String> {
     }
 }
 
+/// How far the wallet's Tor client is in connecting to the Tor network.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct TorStatus {
+    /// Of the way, 0 to 100.
+    pub percent: u8,
+    /// Whether it can carry what the wallet sends.
+    pub ready: bool,
+    /// What it is doing.
+    pub summary: String,
+    /// Why it seems stuck, if it does.
+    pub blocked: Option<String>,
+}
+
 /// How far looking for payments on Bitcoin got.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct Scan {
+    /// The wallet's first block, where looking started: 0 if unknown.
+    pub from: u32,
     /// The next block to look in.
     pub next: u32,
-    /// The chain's height, as far as it could look.
+    /// The chain's height, as far as it could look: behind the light
+    /// client's while the hubs' tweaks are.
     pub height: u32,
+    /// Whether a hub's tweaks were used: without, only the fallback
+    /// addresses and the coins held are looked for.
+    pub tweaks: bool,
     /// The coins found, and their worth.
     pub found: u32,
     pub found_value: u64,
