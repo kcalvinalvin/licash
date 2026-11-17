@@ -106,6 +106,47 @@ impl Wallet {
         })
     }
 
+    /// The contract to offer the wallet, if any: for its largest coin on
+    /// Bitcoin, at the trusted hub letting it choose terms that protects
+    /// the most for the least ([`best`]), none at a hub it has one live or
+    /// being opened. Its quote, at first of the suggested terms; opened
+    /// only once she accepts them ([`Wallet::open_chosen_contract`]). None
+    /// if no hub offers one, no coin pays one for a tenth of it at most
+    /// ([`SHARE`]), or no hub answers.
+    pub fn contract_offer(&self) -> Result<Option<ContractQuote>, LicashError> {
+        let all = holder::list(&self.dir).map_err(failed)?;
+        let tip = self.tip();
+        let busy: Vec<&str> = all
+            .iter()
+            .filter(|c| {
+                matches!(
+                    state(c, tip),
+                    ContractState::Opening | ContractState::Confirming | ContractState::Protecting
+                )
+            })
+            .map(|c| c.hub.trim_end_matches('/'))
+            .collect();
+        let coins = holder::coins(&self.wallet, &self.dir).map_err(failed)?;
+        let Some(coin) = coins.first().map(|c| c.value) else {
+            return Ok(None);
+        };
+        let hubs: Vec<(String, licash_api::ContractRange)> = self
+            .wallet
+            .hubs()?
+            .into_iter()
+            .filter(|(url, _)| !busy.contains(&url.trim_end_matches('/')))
+            .filter_map(|(url, info)| Some((url, info.contracts?.range?)))
+            .filter(|(_, range)| check_range(range).is_ok())
+            .collect();
+        for hub in best(&hubs, coin) {
+            match self.contract_quote(hub.to_owned()) {
+                Ok(quote) => return Ok(Some(quote)),
+                Err(e) => tracing::info!(hub, "no contract offered there now: {e}"),
+            }
+        }
+        Ok(None)
+    }
+
     /// Open a contract at `hub`, a hub trusted, closing `blocks` from now
     /// (by default, as late as it allows), for at most `max_price` (by
     /// default, what its info says), broadcasting its funding through
@@ -501,6 +542,29 @@ fn suggested(range: &licash_api::ContractRange, coin: Option<u64>) -> (u32, u32)
     (cap, blocks)
 }
 
+/// The most of a coin a contract offered unasked costs: a tenth.
+const SHARE: u64 = 10;
+
+/// Of `hubs` letting the wallet choose terms, by their ranges, those to
+/// offer a contract at, paid from a `coin` of so many sat, of the
+/// suggested terms ([`suggested`]): the one protecting the most first,
+/// then the cheapest. None whose price is past a [`SHARE`] of the coin or
+/// that the coin does not pay.
+fn best(hubs: &[(String, licash_api::ContractRange)], coin: u64) -> Vec<&str> {
+    let mut offers: Vec<(&str, u32, u64)> = hubs
+        .iter()
+        .filter_map(|(hub, range)| {
+            let (cap, blocks) = suggested(range, Some(coin));
+            range.max_cap_for(coin)?;
+            let price = range.price(cap, blocks);
+            let pays = coin >= holder::least(Some(*range), cap, price);
+            (pays && price <= coin / SHARE).then_some((hub.as_str(), cap, price))
+        })
+        .collect();
+    offers.sort_by_key(|&(_, cap, price)| (std::cmp::Reverse(cap), price));
+    offers.into_iter().map(|(hub, ..)| hub).collect()
+}
+
 /// What becomes of the change of the contract paid from `deposit`.
 #[derive(Debug, PartialEq, Eq)]
 enum Change<'a> {
@@ -838,6 +902,36 @@ mod tests {
             ..range()
         };
         assert_eq!(suggested(&short, Some(10_000_000)).1, 4_000);
+    }
+
+    #[test]
+    fn a_contract_is_offered_where_it_protects_the_most_for_the_least() {
+        let hub = |name: &str, range| (format!("https://{name}"), range);
+        let dear = licash_api::ContractRange {
+            ppm_year: 20_000,
+            ..range()
+        };
+        let small = licash_api::ContractRange {
+            max_cap: 1_000_000,
+            ..range()
+        };
+        let hubs = [
+            hub("small", small),
+            hub("dear", dear),
+            hub("cheap", range()),
+        ];
+        // The 10 M sat coin: 15 M sat protected where it can be, for
+        // 98 k sat at the cheaper; 1 M sat at the other.
+        assert_eq!(
+            best(&hubs, 10_000_000),
+            ["https://cheap", "https://dear", "https://small"]
+        );
+        // Costing past a tenth of the coin: none offered.
+        assert!(best(&hubs, 200_000).is_empty());
+        assert_eq!(best(&hubs[2..], 300_000), ["https://cheap"]);
+        // A coin paying none: none.
+        assert!(best(&hubs, 2_000).is_empty());
+        assert!(best(&[], 10_000_000).is_empty());
     }
 
     #[test]
