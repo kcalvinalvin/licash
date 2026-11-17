@@ -125,6 +125,21 @@ impl Config {
         Ok(())
     }
 
+    /// Whether a lock of the latest expiry the hub of `timing` admits, at
+    /// the least depth a wallet locks with, outlasts a receipt's own lock,
+    /// its depth and the gateway's downtime: so that receipts are paid
+    /// inside the hub ([`Gateway::fulfill`]).
+    pub fn pays_inside(&self, timing: &Timing) -> bool {
+        let latest = timing
+            .window
+            .saturating_sub(timing.min_depth.max(1))
+            .saturating_sub(timing.reaction);
+        let needed = [timing.min_depth, self.downtime, 1]
+            .iter()
+            .try_fold(self.receive_blocks, |at, b| at.checked_add(*b));
+        needed.is_some_and(|needed| latest >= needed)
+    }
+
     /// What the hub's info says of the gateway, of `node`.
     fn lightning(&self, node: String) -> Lightning {
         Lightning {
@@ -185,9 +200,15 @@ impl Gateway {
         config: Config,
         path: &Path,
     ) -> anyhow::Result<Self> {
-        config
-            .check(&hub.info().policy.timing)
-            .map_err(anyhow::Error::msg)?;
+        let timing = hub.info().policy.timing;
+        config.check(&timing).map_err(anyhow::Error::msg)?;
+        if !config.pays_inside(&timing) {
+            tracing::warn!(
+                window = timing.window,
+                "the hub's locks are too short to pay its receipts inside it: \
+                 such payments are refused"
+            );
+        }
         Ok(Self {
             receipts: receive::Store::open(path)?,
             hub,
@@ -366,6 +387,22 @@ mod tests {
             ..Config::default()
         };
         assert!(slackless.check(&timing).is_err());
+    }
+
+    #[test]
+    fn receipts_are_paid_inside_the_hub_if_its_latest_locks_outlast_theirs() {
+        // The defaults: 144 - 3 - 6 against 12 + 3 + 6 + 1.
+        let timing = Timing::default();
+        assert!(Config::default().pays_inside(&timing));
+        let latest = timing.window - timing.min_depth - timing.reaction;
+        let at = |receive_blocks| Config {
+            receive_blocks,
+            ..Config::default()
+        };
+        let fits = latest - timing.min_depth - Config::default().downtime - 1;
+        assert!(at(fits).pays_inside(&timing));
+        assert!(!at(fits + 1).pays_inside(&timing));
+        assert!(!at(u32::MAX).pays_inside(&timing));
     }
 
     #[test]
