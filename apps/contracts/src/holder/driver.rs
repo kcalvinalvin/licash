@@ -30,6 +30,9 @@ const PATIENCE: u32 = 900;
 pub struct Traffic {
     pub bytes: u64,
     pub since: Instant,
+    /// About how many bytes it sends and gets in all, once it builds the
+    /// first of the instances it uploads, most of it.
+    pub expected: Option<u64>,
 }
 
 static TRAFFIC: LazyLock<Mutex<HashMap<[u8; 32], Traffic>>> = LazyLock::new(Mutex::default);
@@ -45,8 +48,24 @@ fn count(id: &[u8; 32], bytes: usize) {
     let traffic = all.entry(*id).or_insert_with(|| Traffic {
         bytes: 0,
         since: Instant::now(),
+        expected: None,
     });
     traffic.bytes = traffic.bytes.saturating_add(bytes as u64);
+}
+
+/// The opening `id` has `instances` of `bytes` each to upload still, from
+/// now: what it sends in all, about, unless known already.
+fn expect(id: &[u8; 32], instances: usize, bytes: usize) {
+    let mut all = TRAFFIC.lock().unwrap_or_else(PoisonError::into_inner);
+    let traffic = all.entry(*id).or_insert_with(|| Traffic {
+        bytes: 0,
+        since: Instant::now(),
+        expected: None,
+    });
+    let rest = (instances as u64).saturating_mul(bytes as u64);
+    traffic
+        .expected
+        .get_or_insert(traffic.bytes.saturating_add(rest));
 }
 
 /// The hub refused what she sent, or she what it sent: the opening goes
@@ -109,13 +128,19 @@ impl<T: Transport, C: Chain> Driver<'_, T, C> {
                     })
                     .await?;
                     self.holder = Some(holder);
+                    let bytes = bytes?;
+                    let serves = queue.iter().filter(|o| matches!(o, Out::Serve { .. }));
+                    expect(&self.id, 1 + serves.count(), bytes.len());
                     let message = Envelope {
                         id: self.id,
                         kind: Kind::Instance,
-                        body: wire::Instance { i, bytes: bytes? }.encode(),
+                        body: wire::Instance { i, bytes }.encode(),
                     }
                     .to_bytes();
-                    for frame in self.post(message).await? {
+                    let frames = self.post(message).await?;
+                    // The hub has it: not sent again if the opening resumes.
+                    self.store.served(&self.id, i)?;
+                    for frame in frames {
                         let Frame::Message(bytes) = frame;
                         queue.extend(self.step(Input::Message(bytes)).await?);
                     }
@@ -144,13 +169,28 @@ impl<T: Transport, C: Chain> Driver<'_, T, C> {
     }
 
     /// Carry on from her stored state. The pinned choice is stored before
-    /// either its opening shares or any rebuilt kept instance is uploaded.
+    /// either its opening shares or any rebuilt kept instance is uploaded:
+    /// but those the hub answered as had, until it has them all and still
+    /// waits, as if it lost one. Then all of them again, the next time.
     pub async fn resume(&mut self) -> Result<()> {
         let outs = self
             .holder()
             .pending()
             .map_err(|e| Refusal(format!("{e:#}")))?;
-        self.drive(outs).await
+        let served = self.store.served_of(&self.id)?;
+        let had = |o: &Out| matches!(o, Out::Serve { i } if served.contains(i));
+        let serves = outs
+            .iter()
+            .filter(|o| matches!(o, Out::Serve { .. }))
+            .count();
+        let all_served = serves > 0 && outs.iter().filter(|o| had(o)).count() == serves;
+        let outs: Vec<Out> = outs.into_iter().filter(|o| !had(o)).collect();
+        self.drive(outs).await?;
+        if all_served && self.holder().phase() == Phase::Chosen {
+            tracing::warn!(id = %crate::hex_id(&self.id), "the hub has every instance, yet waits: all again");
+            self.store.unserve(&self.id)?;
+        }
+        Ok(())
     }
 
     /// Give the opening up if `result` says the hub or she refused, short

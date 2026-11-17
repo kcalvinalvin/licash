@@ -13,6 +13,9 @@ use tokio::sync::Semaphore;
 use super::{Answer, Openings, Refused, MAX_UNDER_WAY, WAIT};
 use crate::{Frame, Opening};
 
+/// How often a patient step looks whether the opening is still busy.
+const BUSY_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// How deep the block a quote is checkpointed at may be.
 const MAX_AGE: u32 = 6;
 
@@ -80,16 +83,19 @@ impl Openings {
             quote: Box::new(opening.quote),
             deposit: open.deposit,
         };
-        self.take(envelope.id, opening.open, start).await
+        self.take(envelope.id, opening.open, start, false).await
     }
 
-    /// The holder's next message of opening `id`.
+    /// The holder's next message of opening `id`. An instance, large and
+    /// slow to send again, is answered once stepped, never 202: after
+    /// another task stepping the opening if one is.
     pub async fn step(self: &Arc<Self>, id: [u8; 32], message: Vec<u8>) -> Result<Answer, Refused> {
         let envelope = Envelope::from_bytes(&message).map_err(Refused::bad)?;
         if envelope.id != id {
             return Err(Refused::bad("a message of another opening"));
         }
-        self.take(id, message, Start::Stored).await
+        let patient = envelope.kind == Kind::Instance;
+        self.take(id, message, Start::Stored, patient).await
     }
 
     /// Refused unless `quote` is the hub's: its terms, checkpointed at a
@@ -128,15 +134,20 @@ impl Openings {
 
     /// Step opening `id` with `message` in a task of its own, answering
     /// its frames, or 202 if it takes longer than [`WAIT`] or another task
-    /// steps the opening.
+    /// steps the opening; if `patient`, its frames once the other task
+    /// and its own are done, however long they take.
     async fn take(
         self: &Arc<Self>,
         id: [u8; 32],
         message: Vec<u8>,
         start: Start,
+        patient: bool,
     ) -> Result<Answer, Refused> {
-        if !self.busy().insert(id) {
-            return Ok(Answer::Working);
+        while !self.busy().insert(id) {
+            if !patient {
+                return Ok(Answer::Working);
+            }
+            tokio::time::sleep(BUSY_POLL).await;
         }
         let busy = Busy(self.clone(), id);
         let this = self.clone();
@@ -144,7 +155,11 @@ impl Openings {
             let _busy = busy;
             this.run(id, message, start).await
         });
-        match tokio::time::timeout(WAIT, task).await {
+        let waited = match patient {
+            true => Ok(task.await),
+            false => tokio::time::timeout(WAIT, task).await,
+        };
+        match waited {
             Ok(Ok(answer)) => answer,
             Ok(Err(e)) => Err(Refused::unavailable(e)),
             Err(_) => Ok(Answer::Working),

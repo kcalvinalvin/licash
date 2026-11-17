@@ -103,6 +103,16 @@ CREATE TABLE IF NOT EXISTS folds (
 ) STRICT;
 ";
 
+/// The instances of each opening its hub answered as had, by the index
+/// of each: not sent again when the opening resumes. Made with the first.
+const SERVED: &str = "
+CREATE TABLE IF NOT EXISTS served (
+    id BLOB NOT NULL,
+    i INTEGER NOT NULL,
+    PRIMARY KEY (id, i)
+) STRICT;
+";
+
 /// A contract's claim terms as kept ([`CLAIM_TERMS`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct KeptTerms {
@@ -303,6 +313,35 @@ impl Store {
             )
             .optional()?;
         Ok(made.is_some())
+    }
+
+    /// Opening `id`'s instance `i`, answered by its hub as had.
+    pub fn served(&self, id: &[u8; 32], i: u32) -> Result<()> {
+        self.c.execute_batch(SERVED)?;
+        self.c.execute(
+            "INSERT INTO served (id, i) VALUES (?1, ?2) ON CONFLICT DO NOTHING",
+            params![id, i],
+        )?;
+        Ok(())
+    }
+
+    /// The instances of opening `id` its hub answered as had: none if
+    /// none was ever kept here.
+    pub fn served_of(&self, id: &[u8; 32]) -> Result<std::collections::BTreeSet<u32>> {
+        if !self.has("served")? {
+            return Ok(Default::default());
+        }
+        let mut stmt = self.c.prepare("SELECT i FROM served WHERE id = ?1")?;
+        let rows = stmt.query_map([id], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Opening `id`'s instances to be sent again, all of them.
+    pub fn unserve(&self, id: &[u8; 32]) -> Result<()> {
+        if self.has("served")? {
+            self.c.execute("DELETE FROM served WHERE id = ?1", [id])?;
+        }
+        Ok(())
     }
 
     /// Contract `id` closed early by the fold `txid`, before the hub can

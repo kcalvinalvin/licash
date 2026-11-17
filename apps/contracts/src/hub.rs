@@ -56,6 +56,13 @@ pub const IDLE: Duration = Duration::from_secs(3_600);
 /// How long a request waits for its step before answering 202.
 const WAIT: Duration = Duration::from_secs(20);
 
+/// How long a request to the openings' routes may take, its body read.
+const REQUEST_TIME: Duration = Duration::from_secs(300);
+
+/// How long an instance's upload may take, its body read and stepped: 25
+/// MB over Tor from a phone, at 15 KB/s at worst.
+const INSTANCE_TIME: Duration = Duration::from_secs(30 * 60);
+
 /// A hub's openings, with its node, whose wallet funds and signs F.
 pub struct Openings {
     data: PathBuf,
@@ -473,21 +480,23 @@ pub fn router(openings: Arc<Openings>) -> Router {
     // Separate budgets let existing openings progress while new opens or
     // instance uploads are saturated. Body permits precede extraction and
     // last until the response body is dropped, not merely constructed.
-    let budget =
-        |count| middleware::from_fn_with_state(Arc::new(tokio::sync::Semaphore::new(count)), admit);
+    let budget = |count, time| {
+        let limit = Arc::new(tokio::sync::Semaphore::new(count));
+        middleware::from_fn_with_state((limit, time), admit)
+    };
     Router::new()
-        .route(QUOTE, get(quote).layer(budget(2)))
-        .route(OPEN, post(open).layer(budget(2)))
-        .route(STEP, post(step).layer(budget(2)))
-        .route(INSTANCE, post(instance).layer(budget(4)))
-        .route(FOLD, post(offer_fold).layer(budget(2)))
-        .route(FOLD_SIGN, post(sign_fold).layer(budget(2)))
+        .route(QUOTE, get(quote).layer(budget(2, REQUEST_TIME)))
+        .route(OPEN, post(open).layer(budget(2, REQUEST_TIME)))
+        .route(STEP, post(step).layer(budget(2, REQUEST_TIME)))
+        .route(INSTANCE, post(instance).layer(budget(4, INSTANCE_TIME)))
+        .route(FOLD, post(offer_fold).layer(budget(2, REQUEST_TIME)))
+        .route(FOLD_SIGN, post(sign_fold).layer(budget(2, REQUEST_TIME)))
         .layer(DefaultBodyLimit::max(MAX_BODY))
         .with_state(openings)
 }
 
 async fn admit(
-    State(limit): State<Arc<tokio::sync::Semaphore>>,
+    State((limit, time)): State<(Arc<tokio::sync::Semaphore>, Duration)>,
     request: Request,
     next: Next,
 ) -> Response {
@@ -498,7 +507,7 @@ async fn admit(
         )
             .into_response();
     };
-    let response = match tokio::time::timeout(Duration::from_secs(300), next.run(request)).await {
+    let response = match tokio::time::timeout(time, next.run(request)).await {
         Ok(response) => response,
         Err(_) => return StatusCode::REQUEST_TIMEOUT.into_response(),
     };
@@ -606,7 +615,10 @@ mod tests {
         let limit = Arc::new(tokio::sync::Semaphore::new(1));
         let app = Router::new()
             .route("/", post(|_: Bytes| async { "ok" }))
-            .layer(middleware::from_fn_with_state(limit.clone(), admit));
+            .layer(middleware::from_fn_with_state(
+                (limit.clone(), REQUEST_TIME),
+                admit,
+            ));
         let response = app
             .clone()
             .oneshot(HttpRequest::post("/").body(Body::empty()).unwrap())
@@ -668,6 +680,35 @@ mod tests {
             folds: Mutex::default(),
             funds: Mutex::new(None),
         }
+    }
+
+    #[tokio::test]
+    async fn an_instance_waits_for_its_opening_where_a_step_is_answered_202() {
+        use licash_contract::wire::{Envelope, Kind};
+        let dir = tempfile::tempdir().unwrap();
+        let openings = Arc::new(test_openings(dir.path()));
+        let id = [9; 32];
+        let message = move |kind| {
+            Envelope {
+                id,
+                kind,
+                body: vec![],
+            }
+            .to_bytes()
+        };
+        openings.busy().insert(id);
+        // Another task steps the opening: a step is told to ask again.
+        let answer = openings.step(id, message(Kind::Consent)).await.unwrap();
+        assert_eq!(answer, Answer::Working);
+        // An instance, which she would send whole again, waits its turn.
+        let waiting = openings.clone();
+        let instance = tokio::spawn(async move { waiting.step(id, message(Kind::Instance)).await });
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(!instance.is_finished());
+        openings.busy().remove(&id);
+        // Stepped then, not 202: refused here, of no chain to ask.
+        let answer = instance.await.unwrap();
+        assert!(answer.is_err(), "{answer:?}");
     }
 
     #[test]

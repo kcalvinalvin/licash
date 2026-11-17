@@ -63,7 +63,7 @@ async fn hub_serving(
 }
 
 /// What the wallet finds on the chain to the tip: its coins' total.
-async fn scan(wallet: &Wallet<Http>, chain: &Node) -> Result<u64> {
+async fn scan<T: licash_wallet::Transport>(wallet: &Wallet<T>, chain: &Node) -> Result<u64> {
     wallet.scan_silent(None, chain, 10_000).await?;
     Ok(wallet.silent_coins()?.iter().map(|c| c.value).sum())
 }
@@ -99,6 +99,81 @@ async fn a_hub_learns_what_its_contracts_wallet_holds() -> Result<()> {
     ensure!(
         advertised == fundable,
         "{advertised} advertised, {fundable} funded"
+    );
+    Ok(())
+}
+
+/// [`Http`], but its second instance upload heard of no answer, once, as
+/// one timed out over Tor after the hub had it: and the uploads it sent.
+#[derive(Default)]
+struct Dropping {
+    http: Option<Http>,
+    sent: std::sync::Mutex<Vec<[u8; 32]>>,
+}
+
+impl licash_wallet::Transport for Dropping {
+    async fn request(
+        &self,
+        url: &str,
+        body: Option<Vec<u8>>,
+    ) -> Result<licash_wallet::Response, String> {
+        use bitcoin::hashes::Hash as _;
+        let http = self.http.as_ref().expect("an Http");
+        let instance = url.ends_with("/instances");
+        let answer = http.request(url, body.clone()).await;
+        if let (true, Some(body)) = (instance, &body) {
+            let mut sent = self.sent.lock().unwrap();
+            let hash = bitcoin::hashes::sha256::Hash::hash(body);
+            sent.push(hash.to_byte_array());
+            if sent.len() == 2 {
+                return Err("no answer over Tor in 120 s".into());
+            }
+        }
+        answer
+    }
+}
+
+/// An opening whose instance upload timed out resumes sending only those
+/// the hub did not answer as had: each of 25 MB on signet, over Tor.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs bitcoind and a release build"]
+async fn an_opening_resumed_sends_no_instance_the_hub_answered_again() -> Result<()> {
+    let rt = Regtest::start_standard()?;
+    let dir = tempfile::tempdir()?;
+    let (url, source) = hub(&rt, &dir.path().join("hub")).await?;
+    let chain = Node(source);
+    let mine = dir.path().join("wallet");
+    std::fs::create_dir(&mine)?;
+    let transport = Dropping {
+        http: Some(Http::new(None)?),
+        ..Default::default()
+    };
+    let regtest = ChainProfile::Core30DefaultRegtest;
+    let wallet = Wallet::create(&mine.join("wallet.sqlite"), &[31; 32], regtest, transport)?;
+    wallet.add_hub(&url).await?;
+    wallet.watch_silent(None, rt.height()?)?;
+    let to = wallet.fallback_address()?.script_pubkey();
+    rt.fund(&to, Amount::from_sat(60_000))?;
+    rt.mine(1)?;
+    ensure!(scan(&wallet, &chain).await? == 60_000);
+
+    // The second of its two instances unanswered: the opening waits.
+    let failed = holder::open(&wallet, &chain, &mine, &url, ask()).await;
+    ensure!(failed.is_err(), "{failed:?}");
+    let listed = holder::list(&mine)?;
+    ensure!(
+        listed.len() == 1 && listed[0].phase == Phase::Chosen,
+        "{listed:?}"
+    );
+
+    // Resumed: the first not sent again, the second again, and funded.
+    let contracts = holder::resume(&wallet, &chain, &mine).await?;
+    ensure!(contracts[0].phase == Phase::Funded, "{contracts:?}");
+    let sent = wallet.transport().sent.lock().unwrap().clone();
+    ensure!(sent.len() == 3, "{} instance uploads", sent.len());
+    ensure!(
+        sent[0] != sent[1] && sent[1] == sent[2],
+        "the first sent again"
     );
     Ok(())
 }
