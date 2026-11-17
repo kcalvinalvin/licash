@@ -13,7 +13,9 @@ one for what is on Bitcoin), the history behind Activity (or a swipe up),
 what a payment cost and how it was made behind its line, what a word means
 behind its (i). Times are said as times, never as blocks; ids, notes and
 providers show in advanced mode only. With no hub yet, Home lists the hubs
-announced on Nostr to pick from, or takes one by its address.
+announced on Nostr to pick from, or takes one by its address. While a new
+wallet first catches up with Bitcoin, Home lists each step and its
+progress; later, its "Catching up" line opens them.
 
 Tap a fee in a payment review or its history for the amount, percentage,
 and supplied recipient split. Current direct-payment estimates show base
@@ -24,7 +26,12 @@ rates or splits that were not saved are identified as unavailable, never
 reconstructed from today's terms.
 
 Settings is one page: the hubs (each tapped for its fees, more added by
-address or found on Nostr), Backup, Bitcoin's state, Tor, About (the
+address or found on Nostr), Backup, Bitcoin (each step of catching up:
+Tor, the nodes, the block headers and filters against the best peer's
+height, and the wallet's payments from its birthday, with their progress),
+Tor (on or off, and a page with its bootstrap progress, what it is doing,
+why it seems stuck, and a confirmed reset forgetting only its state and
+directory cache), About (the
 version, the storage used and the logs to export) and advanced mode, whose
 own page holds the notes, the log, the limit for renewing notes, the light
 client's settings, resetting its chain state and deleting the wallet. How
@@ -36,10 +43,13 @@ the app looks and speaks, and the shared parts to build a screen of, are in
 - **Recovery words**: 24 words, shown after a warning, kept out of
   screenshots. They encode the wallet's existing 256-bit seed as BIP39
   entropy (not a BIP39 PBKDF seed, so other wallets do not read them). They
-  bring back the keys and coins on Bitcoin only, scanning from block 1:
-  notes held at hubs and contracts need the backup file.
+  bring back the keys and coins on Bitcoin only: notes held at hubs and
+  contracts need the backup file. They are shown with the wallet's birthday,
+  the first block its payments are looked for from (learned on its first
+  scan if not known when it was made); restoring with it scans from there,
+  without it from block 1.
 - **Backup file**: everything the wallet holds as of when it is saved (the
-  wallet and contract databases, the instances a contract's recovery needs,
+  wallet and contract databases, the birthday, the instances a contract's recovery needs,
   contacts), in a checksummed, unencrypted tar the user saves through the
   system file picker. Tor state, proofs made on the phone and the light
   client's blocks are left out. Payments after it are not in it. Restore a
