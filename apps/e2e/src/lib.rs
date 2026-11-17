@@ -36,9 +36,16 @@ pub mod phone;
 /// Satoshis in each channel, half pushed to its other end.
 const CHANNEL: u64 = 2_000_000;
 
-/// The Lightning nodes: the outside one and each hub's.
+/// The Lightning nodes: the outside one, each hub's and the swap
+/// provider's.
 pub const OUTSIDE: &str = "outside-ln";
-pub const NODES: [&str; 3] = [OUTSIDE, "hub1-ln", "hub2-ln"];
+pub const SWAPS_LN: &str = "swaps-ln";
+pub const NODES: [&str; 4] = [OUTSIDE, "hub1-ln", "hub2-ln", SWAPS_LN];
+
+/// The channels, by their nodes in [`NODES`], the first opening each: one
+/// between each two of the outside node and the hubs', and the provider's
+/// to hub2's and the outside one.
+const CHANNELS: [(usize, usize); 5] = [(0, 1), (0, 2), (1, 2), (3, 2), (3, 0)];
 
 /// A wallet of the tests, over HTTP.
 pub type Wallet = licash_wallet::Wallet<Http>;
@@ -92,8 +99,8 @@ pub async fn until<T, F: Future<Output = anyhow::Result<Option<T>>>>(
 
 impl Eco {
     /// The stack of Compose project `$LICASH_E2E_PROJECT` (by default
-    /// `licash-e2e`), with its nodes funded, a channel between each two of
-    /// them, and its hubs' gateways up.
+    /// `licash-e2e`), with its nodes funded, the [`CHANNELS`] open, and its
+    /// hubs' gateways up.
     pub async fn up() -> anyhow::Result<Self> {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let project = std::env::var("LICASH_E2E_PROJECT").unwrap_or_else(|_| "licash-e2e".into());
@@ -485,6 +492,15 @@ impl Eco {
         Ok(response.json().await?)
     }
 
+    /// Where the invoice the provider pays for the client's lock `id`, in
+    /// hex, stands.
+    pub async fn lightning_payment(&self, id: &str) -> anyhow::Result<swaps::LightningSwap> {
+        let id = licash_api::lock_id(id).map_err(|p| anyhow::anyhow!(p.message))?;
+        let url = format!("{}{}", self.swaps, swaps::lightning_swap_state(&id));
+        let response = self.http.get(url).send().await?.error_for_status()?;
+        Ok(response.json().await?)
+    }
+
     /// Where the payout on Bitcoin of the client's lock `id`, in hex,
     /// stands.
     pub async fn payout_state(&self, id: &str) -> anyhow::Result<swaps::ChainSwap> {
@@ -649,8 +665,8 @@ impl Eco {
         Ok(open.any(|c| c["remote_pubkey"] == peer))
     }
 
-    /// Coins for the miner, a channel between each two nodes, half its
-    /// funds on each side, and every hub's gateway up: whatever is missing.
+    /// Coins for the miner, the [`CHANNELS`], half their funds on each
+    /// side, and every hub's gateway up: whatever is missing.
     async fn fund(&self) -> anyhow::Result<()> {
         if let Err(e) = self.rpc("", "createwallet", json!(["miner"])).await {
             ensure!(format!("{e}").contains("already exists"), e);
@@ -665,7 +681,7 @@ impl Eco {
             keys.push(self.pubkey(node).await?);
         }
         let mut missing = Vec::new();
-        for (a, b) in [(0, 1), (0, 2), (1, 2)] {
+        for (a, b) in CHANNELS {
             if !self.channel(NODES[a], &keys[b]).await? {
                 missing.push((a, b));
             }
@@ -704,13 +720,13 @@ impl Eco {
             .await?;
         }
         let mut inactive = false;
-        for (a, b) in [(0, 1), (0, 2), (1, 2)] {
+        for (a, b) in CHANNELS {
             inactive |= !self.active(NODES[a], &keys[b]).await?;
         }
         if inactive {
             self.mine(6).await?;
         }
-        for (a, b) in [(0, 1), (0, 2), (1, 2)] {
+        for (a, b) in CHANNELS {
             let (node, peer) = (NODES[a], &keys[b]);
             until(
                 &format!("{node}'s channel to {}", NODES[b]),

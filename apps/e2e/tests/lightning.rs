@@ -1,9 +1,10 @@
 //! Wallets pay and get paid over Lightning through their hubs' gateways,
-//! on the stack of `apps/e2e/run.sh`, which runs these.
+//! and through a swap provider paying invoices from its own node, on the
+//! stack of `apps/e2e/run.sh`, which runs these.
 
 use licash::spend::lock_hash;
-use licash_api::ReceiveState;
-use licash_e2e::{received, until, Eco, Wallet, OUTSIDE};
+use licash_api::{swaps::State, ReceiveState};
+use licash_e2e::{received, until, Eco, Wallet, OUTSIDE, SWAPS_LN};
 use licash_wallet::{InvoiceState, Lock, LockState};
 
 fn available(wallet: &Wallet) -> u64 {
@@ -288,6 +289,158 @@ async fn a_move_never_claimed_at_the_other_hub_returns_to_the_first() -> anyhow:
         available_at(&grace, hub1),
         30_000 - refund_fee - exact_fees(&grace)
     );
+    Ok(())
+}
+
+/// Follow the provider's payment for the client's lock `id` until it
+/// reaches `state`.
+async fn paid_as(
+    eco: &Eco,
+    id: &str,
+    state: State,
+) -> anyhow::Result<licash_api::swaps::LightningSwap> {
+    until(
+        &format!("the provider's payment for {id} {state:?}"),
+        180,
+        || async {
+            let payment = eco.lightning_payment(id).await?;
+            Ok((payment.state == state).then_some(payment))
+        },
+    )
+    .await
+}
+
+#[tokio::test]
+#[ignore = "needs the stack of apps/e2e/run.sh"]
+async fn a_provider_pays_a_hub_invoice_for_a_lock_at_another_hub() -> anyhow::Result<()> {
+    let eco = Eco::up().await?;
+    let (hub1, hub2) = (eco.hub(1), eco.hub(2));
+    let hal = eco.wallet("hal")?;
+    let ivy = eco.wallet("ivy")?;
+    eco.pay_in(&hal, hub1, 30_000).await?;
+
+    // Ivy asks hub2 for an invoice under a preimage only she knows; Hal
+    // locks notes at hub1 to the provider, which pays it from its node. No
+    // contract with either hub or the provider.
+    let invoice = ivy.invoice(hub2, 10_000).await?;
+    let request = invoice.request.as_deref().unwrap();
+    let payable = hal.read_invoice(request)?;
+    let offer = eco.swaps_info().await?;
+    let terms = offer
+        .lightning
+        .as_ref()
+        .expect("the provider pays invoices");
+    let lock = hal
+        .pay_invoice_via(eco.swaps(), hub1, request, 1_000)
+        .await?;
+    assert_eq!(lock.payee, offer.address);
+    assert_eq!(hex::encode(lock.hash), invoice.hash);
+    assert_eq!(lock.amount, terms.pays(payable.amount * 1000));
+
+    // Ivy claims at hub2 with her preimage, which settles hub2's invoice;
+    // the provider learns it and claims Hal's lock with it.
+    assert_eq!(received(&ivy, &invoice.hash).await?, InvoiceState::Received);
+    assert_eq!(available_at(&ivy, hub2), 10_000);
+    let lock = settled(&hal, &lock).await?;
+    let LockState::Paid(preimage) = lock.state else {
+        panic!("{lock:?}");
+    };
+    assert_eq!(hex::encode(lock_hash(&preimage)), invoice.hash);
+    let payment = paid_as(&eco, &lock.id, State::Done).await?;
+    assert_eq!(payment.preimage()?, Some(preimage));
+    assert_eq!(payment.amount, payable.amount);
+
+    // Its routes ended at least its slack of 80 blocks before Hal's lock
+    // expires.
+    let timelocks = eco.timelocks(SWAPS_LN, &invoice.hash).await?;
+    assert!(!timelocks.is_empty());
+    assert!(
+        timelocks.iter().all(|t| *t + 80 <= u64::from(lock.expiry)),
+        "{timelocks:?} for {}",
+        lock.expiry
+    );
+    // Hal paid the lock, and hub1 its fee for the exact notes it spent.
+    let cost = lock.cost.expect("a settled lock's cost");
+    assert!(cost >= lock.amount, "{lock:?}");
+    assert_eq!(available_at(&hal, hub1), 30_000 - cost - exact_fees(&hal));
+
+    // The same invoice asked again answers the same lock, locking nothing.
+    let again = hal
+        .pay_invoice_via(eco.swaps(), hub1, request, 1_000)
+        .await?;
+    assert_eq!(again.id, lock.id);
+    assert_eq!(available_at(&hal, hub1), 30_000 - cost - exact_fees(&hal));
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "needs the stack of apps/e2e/run.sh"]
+async fn a_payment_the_provider_fails_returns_once_its_lock_expires() -> anyhow::Result<()> {
+    let eco = Eco::up().await?;
+    let hub1 = eco.hub(1);
+    let jack = eco.wallet("jack")?;
+    eco.pay_in(&jack, hub1, 20_000).await?;
+
+    let (request, hash, _) = eco.hold_invoice(OUTSIDE, 5_000).await?;
+    let lock = jack
+        .pay_invoice_via(eco.swaps(), hub1, &request, 1_000)
+        .await?;
+    until("the outside node holds the payment", 60, || async {
+        let (state, _) = eco.invoice_state(OUTSIDE, &hash).await?;
+        Ok((state == "ACCEPTED").then_some(()))
+    })
+    .await?;
+    eco.lncli(OUTSIDE, &["cancelinvoice", &hash]).await?;
+    let payment = paid_as(&eco, &lock.id, State::Failed).await?;
+    assert!(payment.reason.is_some(), "{payment:?}");
+    assert_eq!(payment.preimage, None);
+
+    // The provider releases nothing early: the lock stands until expired.
+    let locked = jack.follow_lock(&lock.id).await?;
+    assert_eq!(locked.state, LockState::Locked);
+    let depth = eco
+        .info(hub1)
+        .await?
+        .locks
+        .expect("hub1 takes locks")
+        .min_depth;
+    let height = eco.height().await?;
+    eco.mine(lock.expiry - height + depth + 1).await?;
+    let lock = settled(&jack, &lock).await?;
+    assert_eq!(lock.state, LockState::Refunded);
+    // Only hub1's refund fee, and its fee for the exact notes, are lost.
+    let refund_fee = lock.cost.expect("a refunded lock's cost");
+    assert_eq!(
+        available_at(&jack, hub1),
+        20_000 - refund_fee - exact_fees(&jack)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "needs the stack of apps/e2e/run.sh"]
+async fn a_provider_restarted_mid_payment_claims_its_lock() -> anyhow::Result<()> {
+    let eco = Eco::up().await?;
+    let hub1 = eco.hub(1);
+    let kate = eco.wallet("kate")?;
+    eco.pay_in(&kate, hub1, 20_000).await?;
+
+    // The outside node holds the payment while the provider restarts.
+    let (request, hash, preimage) = eco.hold_invoice(OUTSIDE, 6_000).await?;
+    let lock = kate
+        .pay_invoice_via(eco.swaps(), hub1, &request, 1_000)
+        .await?;
+    until("the outside node holds the payment", 60, || async {
+        let (state, _) = eco.invoice_state(OUTSIDE, &hash).await?;
+        Ok((state == "ACCEPTED").then_some(()))
+    })
+    .await?;
+    eco.restart("swaps").await?;
+    eco.lncli(OUTSIDE, &["settleinvoice", &preimage]).await?;
+    let lock = settled(&kate, &lock).await?;
+    assert_eq!(lock.state, LockState::Paid(hex_32(&preimage)));
+    let payment = paid_as(&eco, &lock.id, State::Done).await?;
+    assert_eq!(payment.preimage()?, Some(hex_32(&preimage)));
     Ok(())
 }
 
