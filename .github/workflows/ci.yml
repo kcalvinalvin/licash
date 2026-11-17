@@ -22,7 +22,6 @@ jobs:
           RUSTDOCFLAGS: -D warnings
   apps:
     runs-on: ubuntu-latest
-    # The mobile prover builds the RISC Zero prover.
     timeout-minutes: 45
     # Line tables only: full debug info for every test binary of the
     # workspace, then three images, filled the runner's disk (the linker
@@ -238,10 +237,7 @@ jobs:
         run: CARGO_TARGET_DIR=regtest/target cargo test --locked --manifest-path crates/licash-groth16/Cargo.toml
       - name: The contract's opening messages
         working-directory: licash
-        run: cargo test --release --locked --manifest-path regtest/Cargo.toml -p licash-contract
-      - name: Corrected challenge and collection
-        working-directory: licash
-        run: cargo test --release --locked --manifest-path regtest/Cargo.toml -p licash-contract --lib dispute::tests::a_corrected_challenge_opens_the_corrected_instances_and_collects -- --ignored --exact
+        run: cargo test --release --locked --manifest-path regtest/Cargo.toml -p licash-contract -p licash-hp
       - name: Bitcoin Core regtest (mock proofs)
         working-directory: licash
         run: regtest/run.sh -- --test-threads=1
