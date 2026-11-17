@@ -485,6 +485,25 @@ impl Phone {
         Ok(code)
     }
 
+    /// The payment code with an address on Bitcoin any wallet pays, which
+    /// Receive shows once asked for among its other ways, back on Home
+    /// after.
+    pub async fn bitcoin_code(&self) -> anyhow::Result<String> {
+        self.tap_id("receive").await?;
+        self.tap_id("other-ways").await?;
+        self.tap_id("way-bitcoin").await?;
+        self.tagged("way", "Bitcoin address", 30).await?;
+        // The code shown before it gives way once the address is made.
+        let code = until("a code with an address on Bitcoin", 30, || async {
+            let shown = self.qr(30).await?;
+            Ok((!shown.to_lowercase().starts_with("bitcoin:?")).then_some(shown))
+        })
+        .await?;
+        self.tap("Back").await?;
+        self.home(30).await?;
+        Ok(code)
+    }
+
     /// Save what the screen shows to `path`, to see why a test failed.
     pub async fn screenshot(&self, path: &std::path::Path) -> anyhow::Result<()> {
         let image = self.adb(&["exec-out", "screencap", "-p"]).await?;

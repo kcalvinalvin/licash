@@ -146,11 +146,12 @@ async fn changed(phone: &Phone, from: u64, secs: u64) -> anyhow::Result<u64> {
     .await
 }
 
-/// Its silent payment address `silent` alone, one switch away on Receive,
-/// for any amount.
+/// Its silent payment address `silent` alone, among the other ways on
+/// Receive, for any amount.
 async fn silently(phone: &Phone, silent: &str) -> anyhow::Result<()> {
     phone.tap_id("receive").await?;
-    phone.tap_id("segment Silent").await?;
+    phone.tap_id("other-ways").await?;
+    phone.tap_id("way-silent").await?;
     phone.tagged("silent", silent, 30).await?;
     phone.tagged("asking", "Any amount, on Bitcoin", 10).await?;
     phone.tap("Back").await?;
@@ -185,8 +186,8 @@ async fn contact(phone: &Phone, bob: &licash_e2e::Wallet) -> anyhow::Result<()> 
 }
 
 /// Paid over Lightning: an invoice its hub makes asking the amount it
-/// enters, the hub's fee in it, shown as a QR code, which a node outside
-/// pays. Its notes are taken while shown, and the payment is in the
+/// enters, the hub's fee in it, shown as a QR code as soon as it has an
+/// amount, which a node outside pays. Its notes are taken while shown, and the payment is in the
 /// history.
 async fn lightning(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     let before = phone.balance().await?;
@@ -199,10 +200,11 @@ async fn lightning(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
         .find(|n| n + receive.due(*n) <= 4_000)
         .context("no amount fits 4000 with its fee")?;
     phone.tap_id("receive").await?;
-    phone.tap_id("segment Lightning").await?;
+    phone.tap_id("set-amount").await?;
     phone.tap_id("amount").await?;
     phone.type_text("4000").await?;
     phone.tap_id("done").await?;
+    phone.tagged("way", "Lightning invoice", 10).await?;
     phone.tagged("asking", "4,000 sat", 10).await?;
     // In upper case, as a QR code holds it best.
     let shown = phone.qr(60).await?;
@@ -247,9 +249,16 @@ async fn used(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     phone.onboard().await?;
     phone.connect(hub).await?;
 
-    // Its code names the hub and its mailbox, a silent payment address,
-    // the hub serving tweaks, and an address to fall back on.
-    let code: PaymentCode = phone.code().await?.parse()?;
+    // Its code names the hub and its mailbox, and a silent payment
+    // address, the hub serving tweaks: no address on Bitcoin for any
+    // wallet until asked for, among the other ways.
+    let shown: PaymentCode = phone.code().await?.parse()?;
+    ensure!(shown.address.is_none(), "an address in {shown}");
+    let code: PaymentCode = phone.bitcoin_code().await?.parse()?;
+    ensure!(
+        code.silent == shown.silent,
+        "another silent payment address"
+    );
     let fallback = code.address.clone().context("a fallback address")?;
     let fallback = fallback.assume_checked().to_string();
     let silent = code.silent.context("a silent payment address")?;
@@ -277,7 +286,7 @@ async fn used(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     phone.by_id("fee-network", 10).await?;
     phone.back().await?;
     phone.back_to("receive").await?;
-    let next: PaymentCode = phone.code().await?.parse()?;
+    let next: PaymentCode = phone.bitcoin_code().await?.parse()?;
     ensure!(next.address != code.address, "paid at, and shown again");
     ensure!(next.silent == code.silent, "another silent payment address");
 
@@ -677,7 +686,7 @@ async fn contracted(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     /// What a mock contract is worth, said wherever one shows.
     const MOCK: &str = "Test only: protects nothing";
     // Enough in notes to pay for it, and to pay with after.
-    let code: PaymentCode = phone.code().await?.parse()?;
+    let code: PaymentCode = phone.bitcoin_code().await?.parse()?;
     let fallback = code.address.context("a fallback address")?;
     let held = phone.balance().await?;
     eco.send_to(&fallback.assume_checked().to_string(), 100_000)

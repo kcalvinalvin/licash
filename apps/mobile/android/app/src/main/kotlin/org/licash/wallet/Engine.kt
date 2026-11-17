@@ -993,6 +993,9 @@ class Engine(context: Context) {
 
     suspend fun code(amount: ULong?): Result<Code> = io { local { it.paymentCode(amount) } }
 
+    /** [code], with an address on Bitcoin any wallet pays: handed out, and watched from then on. */
+    suspend fun bitcoinCode(amount: ULong?): Result<Code> = io { local { it.bitcoinCode(amount) } }
+
     /** More of a line of the history, as far as the wallet looked. */
     suspend fun details(activity: Activity): Result<Details> =
         io { local { it.details(activity.kind, activity.id) } }

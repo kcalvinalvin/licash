@@ -234,6 +234,36 @@ impl Wallet {
 }
 
 impl Wallet {
+    /// The wallet's code, `amount` if given, with its fallback address on
+    /// Bitcoin if `fallback`.
+    fn code(&self, amount: Option<u64>, fallback: bool) -> Result<Code, LicashError> {
+        let trusted = self.wallet.hubs()?;
+        let hubs: Vec<String> = trusted
+            .iter()
+            .map(|(url, _)| url.clone())
+            .take(MAX_HUBS)
+            .collect();
+        let mut code = self.wallet.payment_code(&hubs, false)?;
+        code.amount = amount.filter(|a| *a > 0);
+        // Payers pay a silent payment address rather than the fallback:
+        // only if a hub's tweaks find those payments.
+        if trusted.iter().any(|(_, info)| info.tweaks.is_some()) {
+            code.silent = Some(self.wallet.silent_keys().address());
+        }
+        if fallback {
+            code.address = Some(self.wallet.fallback_address()?.as_unchecked().clone());
+        }
+        Ok(Code {
+            text: code.to_string(),
+            qr: code.qr(),
+            address: code
+                .address
+                .as_ref()
+                .map(|a| a.assume_checked_ref().to_string()),
+            silent: code.silent.as_ref().map(|s| s.to_string()),
+        })
+    }
+
     fn start(
         dir: PathBuf,
         tor: bool,
@@ -510,30 +540,18 @@ impl Wallet {
     }
 
     /// The code to be paid at, `amount` if given: in notes at the hubs
-    /// trusted, and on Bitcoin.
+    /// trusted, and at the wallet's silent payment address while a hub's
+    /// tweaks find payments to it. No address on Bitcoin for any wallet:
+    /// that is [`Wallet::bitcoin_code`], on request.
     pub fn payment_code(&self, amount: Option<u64>) -> Result<Code, LicashError> {
-        let trusted = self.wallet.hubs()?;
-        let hubs: Vec<String> = trusted
-            .iter()
-            .map(|(url, _)| url.clone())
-            .take(MAX_HUBS)
-            .collect();
-        let mut code = self.wallet.payment_code(&hubs, true)?;
-        code.amount = amount.filter(|a| *a > 0);
-        // Payers pay a silent payment address rather than the fallback:
-        // only if a hub's tweaks find those payments.
-        if !trusted.iter().any(|(_, info)| info.tweaks.is_some()) {
-            code.silent = None;
-        }
-        Ok(Code {
-            text: code.to_string(),
-            qr: code.qr(),
-            address: code
-                .address
-                .as_ref()
-                .map(|a| a.assume_checked_ref().to_string()),
-            silent: code.silent.as_ref().map(|s| s.to_string()),
-        })
+        self.code(amount, false)
+    }
+
+    /// [`Wallet::payment_code`], with an address on Bitcoin any wallet
+    /// pays: handed out and watched from then on, the next once it is
+    /// paid.
+    pub fn bitcoin_code(&self, amount: Option<u64>) -> Result<Code, LicashError> {
+        self.code(amount, true)
     }
 
     /// What `text`, scanned or pasted, is: a code to pay in notes if it

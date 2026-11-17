@@ -129,8 +129,11 @@ The app needs a hub taking deposits on the same network: `licash-hub run
 their mailboxes, `--tweaks` for silent payments: the app's code holds a
 silent payment address only if a hub it uses serves tweaks, and `--lnd URL
 --lnd-macaroon FILE` for Lightning: the app pays invoices through the hub,
-and Receive, switched to Lightning, shows an invoice the hub makes, whose
-notes the app takes once paid. Tapping a hub in Settings lists its fees. Silent payments
+and Receive, given an amount, shows an invoice the hub makes, whose
+notes the app takes once paid. Without an amount Receive shows the
+wallet's code (its hubs, and its silent payment address); an address on
+Bitcoin any wallet pays, the code alone and the silent payment address
+alone are under Other ways, the address handed out only once asked for. Tapping a hub in Settings lists its fees. Silent payments
 before the first block the hub indexed are not found; payments to the
 fallback address are, from the day before the wallet was made.
 

@@ -549,9 +549,13 @@ fn a_phone_paid_on_bitcoin_moves_it_to_notes_and_pays_in_them() {
 
     // Paid at the silent payment address in her code: found in the one
     // block whose filter matches, and shown first in her history.
+    // No address on Bitcoin for any wallet, unless asked for.
     let code = alice.payment_code(None).unwrap();
-    assert!(code.qr.starts_with("BITCOIN:BCRT1P"), "{}", code.qr);
-    assert!(code.qr.contains("?SP=TSP1Q"), "{}", code.qr);
+    assert!(code.qr.starts_with("BITCOIN:?SP=TSP1Q"), "{}", code.qr);
+    assert_eq!(code.address, None);
+    let asked = alice.bitcoin_code(None).unwrap().qr;
+    assert!(asked.starts_with("BITCOIN:BCRT1P"), "{asked}");
+    assert!(asked.contains("?SP=TSP1Q"), "{asked}");
     assert!(code.qr.contains("&LICASH=TLICASH1Q"), "{}", code.qr);
     // The silent payment address on its own, as in the code.
     let silent = code.silent.clone().expect("a silent payment address");
@@ -846,18 +850,18 @@ fn a_phone_paid_at_its_fallback_address_finds_it_and_shows_the_next() {
     let net = Net::new(true);
     let light = Light::new(&net);
     let alice = net.wallet("alice", net.height());
-    let code = alice.payment_code(None).unwrap();
+    let code = alice.bitcoin_code(None).unwrap();
     let address = code.address.clone().expect("a fallback address");
     assert!(address.starts_with("bcrt1p"), "{address}");
     let uri = format!("bitcoin:{address}?sp=");
     assert!(code.text.starts_with(&uri), "{}", code.text);
     // The same until paid.
-    assert_eq!(alice.payment_code(None).unwrap(), code);
+    assert_eq!(alice.bitcoin_code(None).unwrap(), code);
     let payment = net.pay_plain(&address, 3_000, 1);
     net.mine(1, vec![payment]);
     assert_eq!(scan(&alice, &light), (1, 3_000));
     assert_eq!(alice.balance().unwrap().onchain, 3_000);
-    let next = alice.payment_code(None).unwrap().address.unwrap();
+    let next = alice.bitcoin_code(None).unwrap().address.unwrap();
     assert_ne!(next, address);
 }
 
@@ -868,7 +872,7 @@ fn a_phone_sees_payments_to_its_fallback_address_on_their_way() {
     let alice = net.wallet("alice", net.height());
     // No code shown yet: nothing to watch.
     assert_eq!(alice.incoming(light.clone()).unwrap(), []);
-    let address = alice.payment_code(None).unwrap().address.unwrap();
+    let address = alice.bitcoin_code(None).unwrap().address.unwrap();
     let payment = net.pay_plain(&address, 3_000, 1);
     net.backend.lock().unwrap().mempool.push(payment.clone());
     let incoming = alice.incoming(light.clone()).unwrap();
@@ -901,7 +905,7 @@ fn a_phone_whose_hubs_serve_no_tweaks_finds_its_fallback_payments_from_the_day_b
         .as_secs() as i64;
     assert!(!alice.hubs().unwrap()[0].silent);
     // No silent payment address, which no hub's tweaks would find paid.
-    let code = alice.payment_code(None).unwrap();
+    let code = alice.bitcoin_code(None).unwrap();
     assert!(!code.text.contains("sp="), "{}", code.text);
     assert_eq!(code.silent, None);
     let address = code.address.unwrap();
@@ -940,7 +944,7 @@ fn a_phone_born_before_its_hubs_tweaks_looks_in_each_block_once() {
     // Born at block 1, the hub's tweaks from block 3 on: blocks 1 and 2
     // looked in without them.
     let alice = net.wallet("alice", 1);
-    let code = alice.payment_code(None).unwrap();
+    let code = alice.bitcoin_code(None).unwrap();
     let silent = net.pay_silent(&code.text, 2_000, 1);
     net.mine(1, vec![silent]);
     let paid = net.height();
@@ -1073,7 +1077,7 @@ fn a_phone_pays_out_to_bitcoin_addresses_and_codes_of_hubs_it_does_not_trust() {
     // at its fallback address.
     let other = Net::new(true);
     let bob = other.wallet("bob", other.height());
-    let code = bob.payment_code(None).unwrap();
+    let code = bob.bitcoin_code(None).unwrap();
     let fallback = code.address.clone().unwrap();
     match alice.scanned(code.qr.clone()).unwrap() {
         Scanned::Visit {

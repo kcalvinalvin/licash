@@ -17,6 +17,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -49,21 +50,38 @@ private const val FOLLOW_MS = 3_000L
 /** How long copying says it copied, in ms. */
 internal const val COPIED_MS = 2_000L
 
-/** How to be paid, one segment each: those the wallet's hubs make possible. */
-internal enum class Way(val label: String) {
-    /** The wallet's code, paid in Licash or on Bitcoin alike. */
-    CODE("Bitcoin"),
+/**
+ * What Receive shows: the way it picks for the amount, or one of the
+ * others asked for, `label` naming it and `says` who pays it.
+ */
+internal enum class Way(val label: String, val says: String, val tag: String) {
+    /** A Lightning invoice a hub makes, for an amount: any wallet pays it. */
+    LIGHTNING("Lightning invoice", "Any Lightning wallet, for an amount", "way-lightning"),
 
-    /** A Lightning invoice a hub makes, for an amount. */
-    LIGHTNING("Lightning"),
+    /** The wallet's code: in Licash, or at its silent payment address. */
+    CODE("Licash code", "Licash wallets, cheaper and more private", "way-code"),
+
+    /** The code with an address on Bitcoin any wallet pays, handed out once asked for. */
+    BITCOIN("Bitcoin address", "Any Bitcoin wallet, on Bitcoin", "way-bitcoin"),
 
     /** The silent payment address alone, for wallets paying those only. */
-    SILENT("Silent"),
+    SILENT("Silent payment address", "Wallets paying silent payments, on Bitcoin", "way-silent"),
 }
 
+/**
+ * The way Receive picks for `amount`: an invoice any wallet pays, if a
+ * hub trusted takes `lightning` payments; else the wallet's code.
+ */
+internal fun picked(amount: Long?, lightning: Boolean): Way =
+    if (amount != null && lightning) Way.LIGHTNING else Way.CODE
+
 /** The ways to be paid while a hub trusted takes `lightning` payments, and `silent` ones. */
-internal fun ways(lightning: Boolean, silent: Boolean): List<Way> =
-    listOfNotNull(Way.CODE, Way.LIGHTNING.takeIf { lightning }, Way.SILENT.takeIf { silent })
+internal fun ways(lightning: Boolean, silent: Boolean): List<Way> = listOfNotNull(
+    Way.LIGHTNING.takeIf { lightning },
+    Way.CODE,
+    Way.BITCOIN,
+    Way.SILENT.takeIf { silent },
+)
 
 /**
  * What the payer of an invoice asked for an amount pays, and what the
@@ -75,12 +93,12 @@ internal fun invoiceWords(amount: ULong, asks: ULong, gets: ULong): String? = li
 ).joinToString("\n").ifEmpty { null }
 
 /**
- * What to be paid at, as a QR code and one Copy: the wallet's code, paid in
- * Licash or on Bitcoin alike, its fallback and silent payment addresses in
- * it; or instead a plain Lightning invoice, from a hub taking payments over
- * Lightning, for the amount the payer pays; or the silent payment address
- * alone, while a hub finds payments to it: one switch away. Under it, the
- * amount asked and nothing else.
+ * What to be paid at, as a QR code and one Copy, picked for the payer: for
+ * an amount, a Lightning invoice any wallet pays, from a hub taking
+ * payments over Lightning; for any amount, the wallet's code, paid in
+ * Licash or at its silent payment address. The other ways, an address on
+ * Bitcoin any wallet pays among them, one tap away in a sheet. Under it,
+ * what it is and the amount asked, and nothing else.
  */
 @Composable
 fun Receive(engine: Engine, back: () -> Unit) {
@@ -88,6 +106,7 @@ fun Receive(engine: Engine, back: () -> Unit) {
     val scope = rememberCoroutineScope()
     var amount by rememberSaveable { mutableStateOf<Long?>(null) }
     var code by remember { mutableStateOf<Code?>(null) }
+    var bitcoin by remember { mutableStateOf<Code?>(null) }
     var error by remember { mutableStateOf<String?>(null) }
     // The amount typed in, in place of the QR code: asked for once done.
     var editing by remember { mutableStateOf(false) }
@@ -102,26 +121,39 @@ fun Receive(engine: Engine, back: () -> Unit) {
     }
     var received by remember { mutableStateOf<String?>(null) }
     var copied by remember { mutableStateOf(false) }
+    var choosing by rememberSaveable { mutableStateOf(false) }
     val ui by engine.ui.collectAsState()
-    val ways = ways(ui.hubs.any { it.lightning != null }, ui.hubs.any { it.silent })
-    var chosen by rememberSaveable { mutableStateOf(Way.CODE) }
-    val way = chosen.takeIf { it in ways } ?: Way.CODE
-    // An invoice instead, made by a hub: for an amount, paid once.
+    val takesLightning = ui.hubs.any { it.lightning != null }
+    val ways = ways(takesLightning, ui.hubs.any { it.silent })
+    // Picked for the amount, unless another way was asked for.
+    var chosen by rememberSaveable { mutableStateOf<Way?>(null) }
+    val way = chosen?.takeIf { it in ways } ?: picked(amount, takesLightning)
     val lightning = way == Way.LIGHTNING
+    // An invoice, made by a hub: for an amount, paid once.
     var invoice by remember { mutableStateOf<LightningInvoice?>(null) }
     val request = invoice?.request?.takeIf { lightning }
     val silent = code?.silent?.takeIf { way == Way.SILENT }
     val shown = when (way) {
-        Way.LIGHTNING -> request?.let { "Lightning invoice" to it }
-        Way.SILENT -> silent?.let { "Silent payment address" to it }
-        Way.CODE -> code?.let { "Licash code" to it.text }
+        Way.LIGHTNING -> request?.let { way.label to it }
+        Way.SILENT -> silent?.let { way.label to it }
+        Way.CODE -> code?.let { way.label to it.text }
+        Way.BITCOIN -> bitcoin?.let { way.label to it.text }
     }
-    // Made again once paid: a fallback address paid gives way to the next.
     LaunchedEffect(amount, received) {
         code = null
         error = null
         engine.code(amount?.toULong())
             .onSuccess { code = it }
+            .onFailure { error = explain(it) }
+    }
+    // Only once asked for: an address handed out is watched from then on,
+    // and made again once paid.
+    LaunchedEffect(way == Way.BITCOIN, amount, received) {
+        bitcoin = null
+        if (way != Way.BITCOIN) return@LaunchedEffect
+        error = null
+        engine.bitcoinCode(amount?.toULong())
+            .onSuccess { bitcoin = it }
             .onFailure { error = explain(it) }
     }
     LaunchedEffect(lightning, amount) {
@@ -167,20 +199,25 @@ fun Receive(engine: Engine, back: () -> Unit) {
     LaunchedEffect(Unit) {
         engine.events.collect { event -> if (event.received != null) received = event.text }
     }
+    if (choosing) {
+        Sheet("Other ways", dismiss = { choosing = false }) {
+            ways.filter { it != way }.forEach { other ->
+                Entry(other.label, sub = other.says, tag = other.tag) {
+                    choosing = false
+                    chosen = other
+                    error = null
+                    // An invoice asks for an amount.
+                    if (other == Way.LIGHTNING && amount == null) edit() else editing = false
+                }
+            }
+        }
+    }
     Column(Modifier.fillMaxSize().padding(horizontal = 24.dp)) {
         TopBar("Receive", back)
         Column(
             Modifier.fillMaxWidth().weight(1f).verticalScroll(rememberScrollState()),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            if (ways.size > 1) {
-                Segmented(ways.map { it.label }, ways.indexOf(way), Modifier.fillMaxWidth()) { i ->
-                    chosen = ways[i]
-                    error = null
-                    // An invoice asks for an amount.
-                    if (chosen == Way.LIGHTNING && amount == null) edit() else editing = false
-                }
-            }
             Spacer(Modifier.height(16.dp))
             received?.let {
                 Text(
@@ -200,7 +237,7 @@ fun Receive(engine: Engine, back: () -> Unit) {
                     Spacer(Modifier.height(16.dp))
                 }
                 lightning && request != null -> QrCode(request.uppercase())
-                lightning && amount != null && error == null -> Waiting()
+                lightning -> if (amount != null && error == null) Waiting()
                 way == Way.SILENT -> when (silent) {
                     null -> if (error == null) Waiting()
                     else -> {
@@ -214,7 +251,7 @@ fun Receive(engine: Engine, back: () -> Unit) {
                         )
                     }
                 }
-                !lightning -> when (val made = code) {
+                else -> when (val made = if (way == Way.BITCOIN) bitcoin else code) {
                     null -> if (error == null) Waiting()
                     else -> QrCode(made.qr)
                 }
@@ -225,6 +262,13 @@ fun Receive(engine: Engine, back: () -> Unit) {
             }
             Spacer(Modifier.height(16.dp))
             if (!editing) {
+                Text(
+                    way.label,
+                    modifier = Modifier.testTag("way"),
+                    style = MaterialTheme.typography.labelLarge,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Spacer(Modifier.height(4.dp))
                 Text(
                     when {
                         way == Way.SILENT -> "Any amount, on Bitcoin"
@@ -240,6 +284,7 @@ fun Receive(engine: Engine, back: () -> Unit) {
             val waits = invoice?.reason?.takeIf { lightning && amount != null && request == null }
             val says = when (way) {
                 Way.SILENT -> "Found once in a block. Each payment lands at an address of its own."
+                Way.BITCOIN -> "Found once in a block. Once paid, the next address shows."
                 else -> paying ?: waits
             }
             says?.let {
@@ -249,6 +294,11 @@ fun Receive(engine: Engine, back: () -> Unit) {
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     textAlign = TextAlign.Center,
                 )
+            }
+            if (!editing) {
+                TextButton(onClick = { choosing = true }, modifier = Modifier.testTag("other-ways")) {
+                    Text("Other ways")
+                }
             }
         }
         Row(Modifier.padding(vertical = 24.dp), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
