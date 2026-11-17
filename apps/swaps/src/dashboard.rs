@@ -20,9 +20,10 @@ use rusqlite::{Connection, OpenFlags};
 /// The newest schemas read, as each file's `user_version`. Swaps version 4
 /// only adds the invoices paid, which the dashboard does not read.
 const SWAPS_VERSION: i64 = 4;
-/// Versions 8 and 9 only add payment deliveries and the notes' unlink
-/// time, which the dashboard does not read.
-const WALLET_VERSION: i64 = 9;
+/// Versions 8 to 10 only add payment deliveries, the notes' unlink time
+/// and the providers paying invoices for locks, which the dashboard does
+/// not read.
+const WALLET_VERSION: i64 = 10;
 
 /// Why a swap ended without paying, beside a reason recorded.
 const NEVER_CLAIMED: &str = "never claimed";
