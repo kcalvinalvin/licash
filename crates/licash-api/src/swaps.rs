@@ -61,6 +61,24 @@ pub const LIGHTNING_SWAPS: &str = "/v1/swaps/lightning";
 /// The path of [`lightning_swap_state`], as a route.
 pub const LIGHTNING_SWAP_STATE: &str = "/v1/swaps/lightning/{id}";
 
+/// Where a provider taking donations ([`Info::donations`]) serves the
+/// LNURL-pay request (LUD-06) of donations to the wallet of a Licash code,
+/// its text in place of `{code}`.
+pub const DONATE: &str = "/v1/lnurlp/{code}";
+/// Where a payer asks for the invoice of a donation (LNURL-pay's callback),
+/// its amount in millisatoshis as `?amount=`.
+pub const DONATE_CALLBACK: &str = "/v1/lnurlp/{code}/callback";
+
+/// The URL of [`DONATE`] for `code` at the provider whose public URL is
+/// `base` ([`Donations::url`]).
+pub fn donation_url(base: &str, code: &str) -> String {
+    format!(
+        "{}{}",
+        base.trim_end_matches('/'),
+        DONATE.replace("{code}", code)
+    )
+}
+
 /// Where the swap of the client's lock `id` stands.
 pub fn swap_state(id: &ProposalId) -> String {
     format!("{SWAPS}/{}", hex::encode(id.as_bytes()))
@@ -100,6 +118,10 @@ pub struct Info {
     /// What it pays over Lightning, if it does.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lightning: Option<Lightning>,
+    /// The donations it takes over Lightning for the wallets of Licash
+    /// codes, if it does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub donations: Option<Donations>,
 }
 
 impl Info {
@@ -156,6 +178,21 @@ impl Chain {
             .saturating_add(self.fee.due(value))
             .saturating_add(self.miner)
     }
+}
+
+/// What a provider takes donations on: over LNURL-pay at [`donation_url`]
+/// of its public `url`, for the wallet of any Licash code naming a hub it
+/// swaps at, paid there in notes less its fee, while its payee is offline.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Donations {
+    /// Where payers reach it, which may differ from where the wallet does.
+    pub url: String,
+    /// Its fee on each donation, taken from it.
+    pub fee: Fee,
+    /// The least and the most donated at once, in satoshis: at most what
+    /// it holds at the payee's hub, too.
+    pub min: u64,
+    pub max: u64,
 }
 
 /// What a provider pays over Lightning: invoices it pays from its own node,

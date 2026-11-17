@@ -470,9 +470,15 @@ async fn donations_over_lnurl_answer_as_lnurl_asks() {
     let node = Arc::new(Fake::new());
     let provider = Provider::create(&dir.path().join("swaps.sqlite"), wallet, Config::default())
         .unwrap()
-        .take_donations(node.clone(), licash_swaps::DonationTerms::default())
+        .take_donations(
+            node.clone(),
+            licash_swaps::DonationTerms::default(),
+            "https://swaps.test/",
+        )
         .unwrap();
-    let router = licash_swaps_service::lnurl(Arc::new(provider), "https://swaps.test".into());
+    let provider = Arc::new(provider);
+    let router = licash_swaps_service::lnurl(provider.clone())
+        .merge(licash_swaps_service::router(provider, None));
     let ask = |path: String| {
         let router = router.clone();
         async move {
@@ -490,6 +496,12 @@ async fn donations_over_lnurl_answer_as_lnurl_asks() {
         let reason = answer["reason"].as_str().unwrap();
         assert!(reason.contains(why), "{reason}");
     };
+    // Its info tells wallets where payers reach it.
+    let (status, info) = call(&router, swaps::SWAPS_INFO, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let info: serde_json::Value = serde_json::from_slice(&info).unwrap();
+    assert_eq!(info["donations"]["url"], "https://swaps.test", "{info}");
+    assert_eq!(info["donations"]["min"], 100, "{info}");
     // Not a code.
     let answer = ask("/v1/lnurlp/nonsense".into()).await;
     refused(&answer, "not a Licash code");

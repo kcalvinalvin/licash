@@ -274,6 +274,20 @@ fn fes_to_bytes(chars: &[u8]) -> Result<Vec<u8>, Error> {
     Ok(bytes)
 }
 
+impl LicashCode {
+    /// The static LNURL of donations to this code's wallet through the
+    /// provider whose public URL is `base` ([`licash_api::swaps::Donations`]):
+    /// its [`licash_api::swaps::donation_url`] in bech32, upper case, as a
+    /// QR code holds it best. Any Lightning wallet pays it, again and
+    /// again, while the payee is offline.
+    pub fn lnurl(&self, base: &str) -> String {
+        let url = licash_api::swaps::donation_url(base, &self.to_string());
+        let hrp = Hrp::parse("lnurl").expect("a valid prefix");
+        bitcoin::bech32::encode_upper::<bitcoin::bech32::Bech32>(hrp, url.as_bytes())
+            .expect("a URL short enough")
+    }
+}
+
 impl fmt::Display for LicashCode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let hrp = Self::hrp(self.network);

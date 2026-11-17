@@ -466,3 +466,21 @@ async fn a_wallet_code_says_where_it_reaches_its_hubs() {
     ];
     assert_eq!((read.locations, code.locations), (wanted.clone(), wanted));
 }
+
+#[test]
+fn the_static_lnurl_of_a_code_encodes_its_donation_url() {
+    let code = licash(REGTEST, MAX_HUBS);
+    let text = code.to_string();
+    let lnurl = code.lnurl("https://swaps.example/");
+    assert!(lnurl.starts_with("LNURL1"), "{lnurl}");
+    assert_eq!(lnurl, lnurl.to_uppercase());
+    // Past bech32's 90 characters of addresses: a code of real length.
+    assert!(lnurl.len() > 90, "{lnurl}");
+    let (hrp, data) = bitcoin::bech32::decode(&lnurl).unwrap();
+    assert_eq!(hrp.to_lowercase(), "lnurl");
+    assert_eq!(
+        String::from_utf8(data).unwrap(),
+        format!("https://swaps.example/v1/lnurlp/{text}")
+    );
+    assert_eq!(code.lnurl("https://swaps.example"), lnurl);
+}

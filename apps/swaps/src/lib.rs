@@ -128,21 +128,16 @@ fn paths<T: Transport + 'static, C: Chain + Send + 'static>(
 }
 
 /// Donations to the wallets of Licash codes over LNURL-pay (LUD-06), for
-/// `provider` taking them ([`Provider::take_donations`]), whose public URL
-/// is `base`: [`licash_swaps::DONATE`] answers the pay request of a code,
-/// [`licash_swaps::DONATE_CALLBACK`] a donation's invoice. Answered as
-/// LNURL asks, `{"status": "ERROR", "reason": ...}` when refused, to any
-/// origin.
-pub fn lnurl<T: Transport + 'static>(provider: Arc<Provider<T>>, base: String) -> Router {
+/// `provider` taking them ([`Provider::take_donations`]):
+/// [`swaps::DONATE`] answers the pay request of a code, at the provider's
+/// public URL, [`swaps::DONATE_CALLBACK`] a donation's invoice. Answered
+/// as LNURL asks, `{"status": "ERROR", "reason": ...}` when refused, to
+/// any origin.
+pub fn lnurl<T: Transport + 'static>(provider: Arc<Provider<T>>) -> Router {
     Router::new()
-        .route(licash_swaps::DONATE, get(pay_request::<T>))
-        .route(licash_swaps::DONATE_CALLBACK, get(donate::<T>))
-        .with_state(Arc::new(Donations { provider, base }))
-}
-
-struct Donations<T: Transport> {
-    provider: Arc<Provider<T>>,
-    base: String,
+        .route(swaps::DONATE, get(pay_request::<T>))
+        .route(swaps::DONATE_CALLBACK, get(donate::<T>))
+        .with_state(provider)
 }
 
 /// An answer of LNURL: `body`, or why not.
@@ -155,30 +150,33 @@ fn lnurl_answer(body: Result<Value, Problem>) -> Response {
 }
 
 async fn pay_request<T: Transport + 'static>(
-    State(served): State<Arc<Donations<T>>>,
+    State(provider): State<Arc<Provider<T>>>,
     Path(code): Path<String>,
 ) -> Response {
-    let request = served.provider.donation_range(&code).map(|(min, max)| {
-        json!({
+    let range = provider.donation_range(&code);
+    let request = range.and_then(|(min, max)| {
+        let declined = || Problem::new(Code::Declined, "the provider takes no donations");
+        let url = provider.donations().ok_or_else(declined)?.url;
+        Ok(json!({
             "tag": "payRequest",
-            "callback": format!("{}/callback", licash_swaps::donation_url(&served.base, &code)),
+            "callback": format!("{}/callback", swaps::donation_url(&url, &code)),
             "minSendable": min * 1000,
             "maxSendable": max * 1000,
             "metadata": licash_swaps::METADATA,
-        })
+        }))
     });
     lnurl_answer(request)
 }
 
 async fn donate<T: Transport + 'static>(
-    State(served): State<Arc<Donations<T>>>,
+    State(provider): State<Arc<Provider<T>>>,
     Path(code): Path<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
     let Some(msat) = query.get("amount").and_then(|a| a.parse::<u64>().ok()) else {
         return lnurl_answer(Err(Problem::invalid("an amount in millisatoshis")));
     };
-    let invoice = served.provider.donate(&code, msat).await;
+    let invoice = provider.donate(&code, msat).await;
     lnurl_answer(invoice.map(|pr| json!({ "pr": pr, "routes": [] })))
 }
 

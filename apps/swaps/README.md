@@ -109,7 +109,8 @@ With `--lnd` and `--lnurl-url URL`, the provider's public URL, it also
 takes donations to the wallets of Licash codes over LNURL-pay (LUD-06), for
 payees that need not be online. `licash-swaps lnurl --lnurl-url URL CODE`
 prints a code's static LNURL, to show as a QR code: any Lightning wallet
-pays it, again and again. Its pay request (`GET /v1/lnurlp/CODE`) offers
+pays it, again and again. Its info (`/v1/swaps/info`) names the URL and the
+terms under `donations`, for a Licash wallet to show its own. Its pay request (`GET /v1/lnurlp/CODE`) offers
 from `--donation-min` (100 sat) up to `--donation-max` (1,000,000 sat), or
 what the provider holds at a hub of the code if less, and its callback
 (`GET /v1/lnurlp/CODE/callback?amount=MSAT`) a held invoice of the node.

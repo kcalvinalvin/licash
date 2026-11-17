@@ -66,8 +66,8 @@ use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 pub use donations::{
-    donation_lnurl, donation_url, Donation, DonationState, DonationTerms, DONATE, DONATE_CALLBACK,
-    INVOICE_CLTV, INVOICE_EXPIRY, METADATA, SETTLE_MARGIN, START_ROOM,
+    Donation, DonationState, DonationTerms, INVOICE_CLTV, INVOICE_EXPIRY, METADATA, SETTLE_MARGIN,
+    START_ROOM,
 };
 pub use invoices::MIN_SLACK;
 pub use issue::Issuer;
@@ -743,6 +743,7 @@ impl<T: Transport> Provider<T> {
             hubs,
             nostr: None,
             chain: self.chain_info()?,
+            donations: self.donations(),
             lightning: self.lightning_terms().cloned(),
         })
     }

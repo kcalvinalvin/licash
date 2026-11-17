@@ -829,7 +829,9 @@ fn command(cli: Cli) -> anyhow::Result<()> {
             };
             let donating = donations.terms()?;
             let provider = match (&donating, node) {
-                (Some((_, terms)), Some(node)) => provider.take_donations(node, terms.clone())?,
+                (Some((url, terms)), Some(node)) => {
+                    provider.take_donations(node, terms.clone(), url)?
+                }
                 (Some(_), None) => anyhow::bail!("--lnurl-url needs --lnd"),
                 (None, _) => {
                     let open = provider.open_donations()?;
@@ -861,9 +863,7 @@ fn command(cli: Cli) -> anyhow::Result<()> {
                 None => licash_swaps_service::router(provider.clone(), nostr),
             };
             let router = match donating {
-                Some((base, _)) => {
-                    router.merge(licash_swaps_service::lnurl(provider.clone(), base))
-                }
+                Some(_) => router.merge(licash_swaps_service::lnurl(provider.clone())),
                 None => router,
             };
             let onion = match &client {
@@ -912,7 +912,7 @@ fn command(cli: Cli) -> anyhow::Result<()> {
                 .parse()
                 .map_err(|e| anyhow::anyhow!("a Licash code: {e}"))?;
             let base = lnurl_base(&url)?;
-            println!("{}", licash_swaps::donation_lnurl(&base, &code.to_string()));
+            println!("{}", code.lnurl(&base));
             Ok(())
         }
         Command::TestNotify { notify } => test_notify(&notify),

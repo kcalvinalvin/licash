@@ -64,35 +64,6 @@ const UNMADE_AFTER: i64 = 60;
 /// commit to its hash.
 pub const METADATA: &str = r#"[["text/plain","A donation to a Licash wallet"]]"#;
 
-/// Where a provider serves the LNURL-pay request of donations to the
-/// wallet of a Licash code, its text in place of `{code}`.
-pub const DONATE: &str = "/v1/lnurlp/{code}";
-
-/// Where a payer asks for the invoice of a donation (LNURL-pay's callback),
-/// its amount in millisatoshis as `?amount=`.
-pub const DONATE_CALLBACK: &str = "/v1/lnurlp/{code}/callback";
-
-/// The URL of [`DONATE`] for `code` at the provider at `base`, its public
-/// URL.
-pub fn donation_url(base: &str, code: &str) -> String {
-    format!(
-        "{}{}",
-        base.trim_end_matches('/'),
-        DONATE.replace("{code}", code)
-    )
-}
-
-/// The static LNURL donations to the wallet of `code` are paid to through
-/// the provider at `base`: [`donation_url`] in bech32, upper case, as a
-/// QR code holds it best. Reused for every donation, payable while the
-/// payee is offline.
-pub fn donation_lnurl(base: &str, code: &str) -> String {
-    use bitcoin::bech32::{self, Bech32, Hrp};
-    let hrp = Hrp::parse("lnurl").expect("a valid prefix");
-    bech32::encode_upper::<Bech32>(hrp, donation_url(base, code).as_bytes())
-        .expect("a URL short enough")
-}
-
 /// What the provider takes donations on, as its operator set it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DonationTerms {
@@ -178,6 +149,8 @@ pub struct Donation {
 pub(crate) struct Receiver {
     node: Arc<dyn Node>,
     terms: DonationTerms,
+    /// The provider's public URL, where payers reach it.
+    url: String,
     /// What the operator was alerted of, once each.
     alerted: Mutex<HashSet<String>>,
 }
@@ -199,7 +172,13 @@ impl<T: Transport> Provider<T> {
         mut self,
         node: Arc<dyn Node>,
         terms: DonationTerms,
+        url: &str,
     ) -> Result<Self, Error> {
+        if !(url.starts_with("https://") || url.starts_with("http://")) {
+            return Err(Error::Setup(format!(
+                "donations at {url}: an http(s):// URL, payers reach the provider at"
+            )));
+        }
         if terms.min == 0 || terms.min > terms.max || terms.max_open == 0 {
             return Err(Error::Setup(
                 "donations of at least 1 sat, at most the largest, and some open at once".into(),
@@ -214,6 +193,7 @@ impl<T: Transport> Provider<T> {
         self.donations = Some(Receiver {
             node,
             terms,
+            url: url.trim_end_matches('/').to_owned(),
             alerted: Mutex::default(),
         });
         Ok(self)
@@ -222,6 +202,19 @@ impl<T: Transport> Provider<T> {
     /// What it takes donations on, if it does.
     pub fn donation_terms(&self) -> Option<&DonationTerms> {
         self.donations.as_ref().map(|r| &r.terms)
+    }
+
+    /// The donations it takes, as its info tells wallets: at its public
+    /// URL, on its terms. None if it takes none.
+    pub fn donations(&self) -> Option<licash_api::swaps::Donations> {
+        self.donations
+            .as_ref()
+            .map(|r| licash_api::swaps::Donations {
+                url: r.url.clone(),
+                fee: r.terms.fee,
+                min: r.terms.min,
+                max: r.terms.max,
+            })
     }
 
     /// What a donation to the wallet of `code` may be, in satoshis: the

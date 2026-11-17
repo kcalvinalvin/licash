@@ -550,6 +550,7 @@ fn swap_bodies_name_hubs_by_address_and_locks_by_id() {
         nostr: None,
         chain: None,
         lightning: None,
+        donations: None,
     };
     assert_eq!(json(&info), info);
     let at_a = info.hub(&hub_a.address()).unwrap();
@@ -784,6 +785,46 @@ fn lightning_payment_bodies_name_their_fields_on_the_wire() {
                "max": 100_000, "slack": 12})
     );
     assert_eq!(json(&offering), offering);
+}
+
+#[test]
+fn a_provider_taking_donations_says_where_payers_reach_it() {
+    use licash_api::swaps;
+    use serde_json::json;
+
+    let hub = OwnerKeys::from_seed(&[1; 32]).unwrap();
+    // As a provider taking none answers: none.
+    let info: swaps::Info = serde_json::from_value(json!({
+        "address": hub.address(), "fee": {"base": 0, "ppm": 0}, "min": 1,
+        "max": 2, "margin": 12, "hubs": []
+    }))
+    .unwrap();
+    assert_eq!(info.donations, None);
+    assert!(!serde_json::to_string(&info).unwrap().contains("donations"));
+    let donating = swaps::Info {
+        donations: Some(swaps::Donations {
+            url: "https://swaps.example".into(),
+            fee: Fee { base: 2, ppm: 5000 },
+            min: 100,
+            max: 1_000_000,
+        }),
+        ..info
+    };
+    let value = serde_json::to_value(&donating).unwrap();
+    assert_eq!(
+        value["donations"],
+        json!({"url": "https://swaps.example", "fee": {"base": 2, "ppm": 5000},
+               "min": 100, "max": 1_000_000})
+    );
+    assert_eq!(json(&donating), donating);
+    assert_eq!(
+        swaps::donation_url("https://swaps.example/", "licash1abc"),
+        "https://swaps.example/v1/lnurlp/licash1abc"
+    );
+    assert_eq!(
+        (swaps::DONATE, swaps::DONATE_CALLBACK),
+        ("/v1/lnurlp/{code}", "/v1/lnurlp/{code}/callback")
+    );
 }
 
 #[test]

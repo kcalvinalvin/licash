@@ -143,6 +143,7 @@ impl Desk {
             nostr: None,
             chain: *self.terms.lock().unwrap(),
             lightning: None,
+            donations: None,
         }
     }
 

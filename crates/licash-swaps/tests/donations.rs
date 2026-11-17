@@ -30,6 +30,8 @@ const TERMS: DonationTerms = DonationTerms {
 };
 /// What the provider holds at A to start with.
 const HELD: u64 = 1_000;
+/// Where payers reach the provider.
+const URL: &str = "https://swaps.test";
 
 struct Eco {
     net: Arc<Net>,
@@ -65,7 +67,7 @@ impl Eco {
         let provider =
             Provider::create(&dir.path().join("swaps.sqlite"), wallet, Config::default())
                 .unwrap()
-                .take_donations(node.clone(), TERMS)
+                .take_donations(node.clone(), TERMS, URL)
                 .unwrap();
         let payee = Wallet::create(
             &dir.path().join("payee.sqlite"),
@@ -111,7 +113,7 @@ impl Eco {
             Config::default(),
         )
         .unwrap()
-        .take_donations(self.node.clone(), TERMS)
+        .take_donations(self.node.clone(), TERMS, URL)
         .unwrap();
         self.provider = Some(provider);
     }
@@ -193,6 +195,17 @@ impl Eco {
 #[tokio::test]
 async fn a_donation_paid_is_settled_once_its_payee_is_paid() {
     let eco = Eco::new().await;
+    // Its info tells wallets where payers reach it, and its terms.
+    let donations = eco.provider().info().unwrap().donations.unwrap();
+    assert_eq!(
+        (
+            donations.url.as_str(),
+            donations.fee,
+            donations.min,
+            donations.max
+        ),
+        (URL, TERMS.fee, 10, 2_000)
+    );
     assert_eq!(
         eco.provider().donation_range(&eco.code).unwrap(),
         (10, 1_000)
@@ -279,7 +292,7 @@ async fn donations_are_asked_within_the_terms_and_what_the_provider_holds() {
         Config::default(),
     )
     .unwrap()
-    .take_donations(cheap.node.clone(), free)
+    .take_donations(cheap.node.clone(), free, URL)
     .unwrap();
     let refused = provider.donate(&cheap.code, 100_000).await.unwrap_err();
     assert_eq!(refused.code, Code::Declined, "{refused:?}");
@@ -309,6 +322,10 @@ async fn donations_are_asked_within_the_terms_and_what_the_provider_holds() {
         Code::Declined
     );
     assert!(none.donation_terms().is_none());
+    assert!(none.info().unwrap().donations.is_none());
+    // Nor at a URL payers cannot reach over HTTP.
+    let refused = none.take_donations(eco.node.clone(), TERMS, "swaps.test");
+    assert!(refused.is_err());
 }
 
 #[tokio::test]
@@ -458,22 +475,4 @@ async fn open_donations_are_capped() {
     eco.age(&hashes[0], 700);
     eco.follow().await;
     eco.donate(20).await;
-}
-
-#[test]
-fn the_static_lnurl_of_a_code_encodes_its_donation_url() {
-    let code = "licash1qqqsyqcyq5rqwzqfpg9scrgwpugpzysn";
-    let url = licash_swaps::donation_url("https://swaps.example/", code);
-    assert_eq!(url, format!("https://swaps.example/v1/lnurlp/{code}"));
-    let lnurl = licash_swaps::donation_lnurl("https://swaps.example", code);
-    assert!(lnurl.starts_with("LNURL1"), "{lnurl}");
-    assert_eq!(lnurl, lnurl.to_uppercase());
-    let (hrp, data) = bitcoin::bech32::decode(&lnurl).unwrap();
-    assert_eq!(hrp.to_lowercase(), "lnurl");
-    assert_eq!(String::from_utf8(data).unwrap(), url);
-    // A code of real length, past bech32's 90 characters of addresses.
-    let long = "q".repeat(260);
-    let lnurl = licash_swaps::donation_lnurl("https://swaps.example", &long);
-    let (_, data) = bitcoin::bech32::decode(&lnurl).unwrap();
-    assert!(String::from_utf8(data).unwrap().ends_with(&long));
 }
