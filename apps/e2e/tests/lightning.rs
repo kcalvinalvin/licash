@@ -526,3 +526,77 @@ fn hex_32(text: &str) -> [u8; 32] {
     hex::decode_to_slice(text, &mut bytes).unwrap();
     bytes
 }
+
+#[tokio::test]
+#[ignore = "needs the stack of apps/e2e/run.sh"]
+async fn a_static_lnurl_takes_donations_for_a_wallet_offline() -> anyhow::Result<()> {
+    use bitcoin::hashes::{sha256, Hash};
+
+    let eco = Eco::up().await?;
+    let hub2 = eco.hub(2);
+    eco.stock(20_000).await?;
+    // Quinn hands out her code's static LNURL once, then goes offline.
+    let quinn = eco.wallet("quinn")?;
+    quinn.add_hub(hub2).await?;
+    let code = quinn.payment_code(&[hub2.to_owned()], false)?;
+    let code = code.licash.expect("a Licash code").to_string();
+    let lnurl = eco
+        .exec(
+            "swaps",
+            &["licash-swaps", "lnurl", "--lnurl-url", eco.swaps(), &code],
+        )
+        .await?;
+    let lnurl = String::from_utf8(lnurl)?;
+    let (_, url) = bitcoin::bech32::decode(lnurl.trim())?;
+    let url = String::from_utf8(url)?;
+    assert_eq!(url, format!("{}/v1/lnurlp/{code}", eco.swaps()));
+
+    // A payer's wallet reads it, as LNURL-pay has it.
+    let request = eco.get_json(&url).await?;
+    assert_eq!(request["tag"], "payRequest", "{request}");
+    let (min, max) = (
+        request["minSendable"].as_u64().unwrap(),
+        request["maxSendable"].as_u64().unwrap(),
+    );
+    assert!(min <= 5_000_000 && 5_000_000 <= max, "{request}");
+    let metadata = request["metadata"].as_str().unwrap();
+    let callback = request["callback"].as_str().unwrap();
+    let invoice = eco.get_json(&format!("{callback}?amount=5000000")).await?;
+    let pr = invoice["pr"].as_str().expect("an invoice");
+    // An invoice of the provider's node, committing to the metadata.
+    let decoded = eco.lncli(OUTSIDE, &["decodepayreq", pr]).await?;
+    assert_eq!(decoded["num_satoshis"], "5000");
+    let hash = sha256::Hash::hash(metadata.as_bytes());
+    assert_eq!(
+        decoded["description_hash"],
+        hex::encode(hash.to_byte_array())
+    );
+    let provider = eco.swaps_info().await?;
+    let node = eco.lncli(SWAPS_LN, &["getinfo"]).await?;
+    assert_eq!(
+        decoded["destination"], node["identity_pubkey"],
+        "{provider:?}"
+    );
+
+    // The outside node pays: the provider pays Quinn in notes at hub2,
+    // kept for her there, then settles.
+    let paying = eco.pay(OUTSIDE, pr);
+    let got = until("the donation collected", 180, || async {
+        let inboxed = quinn.collect_inbox().await?;
+        let got: u64 = inboxed.received.iter().map(|r| r.amount).sum();
+        Ok((got > 0).then_some(got))
+    })
+    .await?;
+    // Less the provider's default fee of 2 sat and 5,000 ppm.
+    assert_eq!(got, 5_000 - 2 - 25);
+    assert!(paying.await??, "the outside node's payment failed");
+    assert_eq!(available_at(&quinn, hub2), got);
+
+    // A second donation to the same LNURL: another invoice.
+    let again = eco.get_json(&format!("{callback}?amount=5000000")).await?;
+    assert_ne!(again["pr"], invoice["pr"]);
+    // Refused as LNURL says, not in whole satoshis.
+    let refused = eco.get_json(&format!("{callback}?amount=5000500")).await?;
+    assert_eq!(refused["status"], "ERROR", "{refused}");
+    Ok(())
+}
