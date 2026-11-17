@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# bitcoind-compatible launcher for ln-gap's isolated Regtest helper.
+# bitcoind-compatible launcher for lichen-btc's isolated Regtest helper.
 # Every invocation owns one throwaway container, never an existing node.
 set -euo pipefail
 

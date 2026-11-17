@@ -1,4 +1,5 @@
-//! LCOS 2 snapshots. Unknown, partial and older formats are rejected, not
+//! LCOS 3 snapshots (3: the contract output on lichenbtc-org/lichen, its
+//! internal key both parties' MuSig2 key). Unknown, partial and older formats are rejected, not
 //! upgraded or restarted. Drivers must never reuse an abandoned opening ID.
 //! Binding contracts retain their pinned program after a trust rotation.
 use super::*;
@@ -7,7 +8,7 @@ use crate::wire::{Reader, Writer};
 use lichen_btc::bitcoin::hashes::sha256;
 
 const MAGIC: [u8; 4] = *b"LCOS";
-pub const FORMAT: u16 = 2;
+pub const FORMAT: u16 = 3;
 
 #[derive(Clone, Debug)]
 pub struct Peek {

@@ -38,10 +38,3 @@ tokio = { version = "1.54", features = ["macros", "net", "rt-multi-thread", "sig
 tower-http = { version = "0.7", features = ["trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-
-# ln-gap's BitVMX-CPU fork, as regtest's workspace patches it: the
-# contract crate pulls it in through lngap-sessions.
-[patch."https://github.com/FairgateLabs/BitVMX-CPU"]
-emulator = { git = "https://github.com/AdamISZ/BitVMX-CPU", rev = "0b7d285fc5c7795d16fd58d380ff6ef25f2f0423" }
-bitvmx-cpu-definitions = { git = "https://github.com/AdamISZ/BitVMX-CPU", rev = "0b7d285fc5c7795d16fd58d380ff6ef25f2f0423" }
-bitcoin-script-riscv = { git = "https://github.com/AdamISZ/BitVMX-CPU", rev = "0b7d285fc5c7795d16fd58d380ff6ef25f2f0423" }

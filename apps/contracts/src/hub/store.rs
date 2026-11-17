@@ -19,8 +19,9 @@ use licash_api::Fees;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
 /// The format of the rows: a machine's stored bytes, of
-/// `licash_contract`'s format 2. Older rows are retained, not reinterpreted.
-pub(super) const FORMAT: i64 = 2;
+/// `licash_contract`'s format 3. Older rows are retained, not reinterpreted:
+/// no exit of theirs is played.
+pub(super) const FORMAT: i64 = 3;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS openings (
@@ -240,9 +241,25 @@ impl Store {
         row(&self.0, id)
     }
 
+    /// The signed openings not given up, of this format: those whose exit
+    /// the hub plays.
     pub fn signed_ids(&self) -> Result<Vec<[u8; 32]>> {
-        let mut stmt = self.0.prepare("SELECT id FROM openings WHERE irrevocable = 1 AND abandoned = 0 ORDER BY created_at, rowid")?;
-        let rows = stmt.query_map([], |r| r.get(0))?;
+        let mut stmt = self.0.prepare(
+            "SELECT id FROM openings WHERE irrevocable = 1 AND abandoned = 0 AND format = ?1
+             ORDER BY created_at, rowid",
+        )?;
+        let rows = stmt.query_map([FORMAT], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The signed openings not given up stored in another format, which
+    /// this build neither reads nor plays.
+    pub fn unreadable_signed(&self) -> Result<Vec<([u8; 32], i64)>> {
+        let mut stmt = self.0.prepare(
+            "SELECT id, format FROM openings WHERE irrevocable = 1 AND abandoned = 0 AND format != ?1
+             ORDER BY created_at, rowid",
+        )?;
+        let rows = stmt.query_map([FORMAT], |r| Ok((r.get(0)?, r.get(1)?)))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
@@ -452,6 +469,35 @@ mod tests {
         std::fs::write(blocked.path().join("opening-instances"), b"not a directory")?;
         assert!(store.keep(&[1; 32], 1, b"cannot save").is_err());
         assert!(store.row(&[1; 32])?.is_none());
+        Ok(())
+    }
+
+    /// A signed opening of an older format is kept and reported, but its
+    /// exit is never played: this build can't read it.
+    #[test]
+    fn signed_openings_of_another_format_are_kept_but_not_played() -> Result<()> {
+        use bitcoin::hashes::Hash as _;
+        let data = tempfile::tempdir()?;
+        let store = Store::open(data.path())?;
+        for (n, id) in [[1; 32], [2; 32], [3; 32]].iter().enumerate() {
+            let deposit = OutPoint {
+                txid: bitcoin::Txid::from_byte_array([n as u8 + 1; 32]),
+                vout: 0,
+            };
+            assert!(store.insert(id, 0, true, &deposit, &[0; 32], b"state")?);
+        }
+        store.save(&[1; 32], 0, true, &[0; 32], b"state")?;
+        store.save(&[2; 32], 0, true, &[0; 32], b"state")?;
+        store.0.execute(
+            "UPDATE openings SET format = ?2 WHERE id = ?1",
+            params![[2u8; 32], FORMAT - 1],
+        )?;
+        assert_eq!(store.signed_ids()?, vec![[1; 32]]);
+        assert_eq!(store.unreadable_signed()?, vec![([2; 32], FORMAT - 1)]);
+        assert!(store
+            .row(&[2; 32])
+            .err()
+            .is_some_and(|e| e.to_string().contains("format 2")));
         Ok(())
     }
 }

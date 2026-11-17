@@ -8,7 +8,6 @@ use licash::{
     spend::ChainProfile,
 };
 use lichen_babe::{
-    hp::HubProves,
     opening::{self as cut, Garbler},
     reveal::{check_presigs, points},
     setup::{par, Hash, Instance},
@@ -20,12 +19,12 @@ use lichen_btc::bitcoin::{
     sighash::{Prevouts, SighashCache, TapSighashType},
     taproot, Amount, OutPoint, ScriptBuf, Transaction, TxOut, Txid,
 };
-use lichen_contract::skeleton::{sig_name, sign_all, Presign};
+use lichen_contract::{sig_name, sign_all, Presign};
 use rand_core::{OsRng, RngCore};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::{
-    graph::{self, contract_output, HolderPub, HubPub, FUNDING_VOUT},
+    graph::{self, contract_output, HolderPub, HubProves, HubPub, FUNDING_VOUT},
     keys::{HolderKeys, HubKeys},
     wire::{self, Envelope, Kind},
     MAX_INSTANCES,
@@ -555,7 +554,7 @@ impl Holder {
     }
     /// Deterministic IDs are for fixtures only. Reusing a garbler's ID
     /// under another choice can disclose all of its kept secrets.
-    #[cfg(any(test, feature = "fixture"))]
+    #[cfg(test)]
     pub fn with_id(s: Start, id: [u8; 32], ctx: &Context) -> Result<(Self, Vec<Out>)> {
         Self::start_with_id(s, id, ctx)
     }
@@ -898,10 +897,6 @@ impl Hub {
         let mut secret = [0; 32];
         OsRng.fill_bytes(&mut secret);
         Self::with(&secret, quote, Some(bounds))
-    }
-    #[cfg(feature = "fixture")]
-    pub fn with_secret(secret: &[u8; 32], quote: Quote, bounds: Bounds) -> Self {
-        Self::with(secret, quote, Some(bounds))
     }
     fn with(secret: &[u8; 32], quote: Quote, bounds: Option<Bounds>) -> Self {
         Self {

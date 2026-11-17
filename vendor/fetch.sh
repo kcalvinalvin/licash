@@ -1,12 +1,12 @@
 #!/bin/sh
-# Lichen and ln-gap, which the contract builds on, at the revisions it is
-# tested with: copied from their git checkouts beside this repository (or
-# LICHEN_GIT, LNGAP_GIT) into vendor/lichen and vendor/ln-gap, as they lie
-# beside each other there. Temporary, until both are published.
+# Lichen (github.com/lichenbtc-org/lichen), which the contract builds on,
+# at the revision it is tested with: copied from its git checkout beside
+# this repository (or LICHEN_GIT) into vendor/lichen. Its workspace takes
+# lichen-btc, lichen-wots and lichen-risc0 from git. Temporary, until
+# Lichen is published.
 set -eu
 cd "$(dirname "$0")"
-LICHEN_REV=de1c3f17bb2b6938626cee8f024a9c1d6e5aa846
-LNGAP_REV=d7972035c12247a07b1dcc1b32e1682cd790d276
+LICHEN_REV=5cd7efc768270ccf42eb9f5a8ee3f1158b12555c
 
 copy() { # name, git dir, revision
     if [ "$(cat "$1/.rev" 2>/dev/null)" = "$3" ]; then return; fi
@@ -21,4 +21,3 @@ copy() { # name, git dir, revision
 }
 
 copy lichen "${LICHEN_GIT:-../../lichen}" "$LICHEN_REV"
-copy ln-gap "${LNGAP_GIT:-../../ln-gap}" "$LNGAP_REV"

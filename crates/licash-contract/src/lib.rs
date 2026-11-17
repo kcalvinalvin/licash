@@ -1,5 +1,5 @@
-//! licash's recovery contract on Lichen's hub-proves graph
-//! (`lichen_babe::hp`): the holder requests what she claims and publishes
+//! licash's recovery contract on Lichen's BABE graph (`lichen_babe::graph`)
+//! behind Licash's front, where the hub proves: the holder requests what she claims and publishes
 //! her claim, the hub responds with what she is owed and proves it, and
 //! she challenges a false proof with the instances she garbled at opening.
 //!

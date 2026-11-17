@@ -22,8 +22,8 @@ use licash_contract::opening::{Fate, Phase};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
 /// The format of the rows: a machine's stored bytes, of
-/// `licash_contract`'s format 1.
-const FORMAT: i64 = 1;
+/// `licash_contract`'s format 3.
+const FORMAT: i64 = 3;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS contracts (

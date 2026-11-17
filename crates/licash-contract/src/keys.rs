@@ -20,8 +20,8 @@ use lichen_babe::setup::DIGITS;
 use lichen_btc::bitcoin::key::Keypair;
 use lichen_btc::bitcoin::secp256k1::XOnlyPublicKey;
 use lichen_btc::keys::{xonly, Seed};
-use lichen_btc::winternitz::{WotsParams, WotsSecret};
 use lichen_contract::{PartyKeys, Role};
+use lichen_wots::{WotsParams, WotsSecret};
 
 use crate::graph::{HolderPub, HubPub};
 

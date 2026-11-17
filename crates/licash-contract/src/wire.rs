@@ -21,9 +21,9 @@ use lichen_btc::{
         secp256k1::{PublicKey, SecretKey, XOnlyPublicKey},
         OutPoint, ScriptBuf, Transaction, TxOut,
     },
-    winternitz::{WotsParams, WotsPublic},
 };
 use lichen_contract::PartyPubKeys;
+use lichen_wots::{WotsParams, WotsPublic};
 use std::collections::HashMap;
 
 use crate::{

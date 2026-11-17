@@ -1,13 +1,9 @@
 //! Contracts opened between a wallet and the hub service over HTTP, on a
 //! regtest node whose wallet funds F: under the mock authority, so they
-//! protect nothing. Needs `bitcoind` (`LNGAP_BITCOIND`, as
+//! protect nothing. Needs `bitcoind` (`LICHEN_BITCOIND`, as
 //! `regtest/run.sh` sets it) and a release build, as the openings build
-//! and check their garbled instances:
-//!
-//! ```sh
-//! LNGAP_BITCOIND=$PWD/../regtest/bitcoind-docker.sh \
-//!   cargo test --release -p licash-hub-service --test contracts -- --ignored
-//! ```
+//! and check their garbled instances: `regtest/run.sh` from the
+//! repository root.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -23,7 +19,7 @@ use licash_hub::{Hub, Policy};
 use licash_hub_service::{deposit, watch, Services};
 use licash_transport::Http;
 use licash_wallet::{DepositState, Transport as _, Wallet};
-use lngap_btc::regtest::Regtest;
+use lichen_btc::regtest::Regtest;
 
 /// A hub service opening contracts, funded by `rt`'s wallet: its URL.
 async fn hub(rt: &Regtest, dir: &Path) -> Result<(String, Source)> {
