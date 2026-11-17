@@ -115,6 +115,28 @@ async fn settle(eco: &Eco, phone: &Phone, moves: usize) -> anyhow::Result<()> {
     .await
 }
 
+/// What was paid on Bitcoin, once found there, added to the balance with
+/// no protection, as its owner asks once warned: nothing moves by itself.
+async fn move_in(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
+    on_bitcoin(phone).await?;
+    until("the payment found on Bitcoin", 300, || async {
+        mine(eco).await?;
+        Ok(phone.views().await?.into_iter().find(|v| v.id == "move-in"))
+    })
+    .await?;
+    ensure!(
+        !phone.has("moving").await?,
+        "what was paid on Bitcoin moved in by itself"
+    );
+    phone.tap_id("move-in").await?;
+    phone.wait("Not protected", 10).await?;
+    phone.tap_id("move-in-anyway").await?;
+    phone.gone("move-in-anyway", 30).await?;
+    phone.back_to("onchain").await?;
+    phone.back_to("receive").await?;
+    Ok(())
+}
+
 /// Wait for the balance Home shows to change from `from`: the new one.
 async fn changed(phone: &Phone, from: u64, secs: u64) -> anyhow::Result<u64> {
     until("the balance to change", secs, || async {
@@ -234,11 +256,12 @@ async fn used(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     let licash = code.licash.clone().context("a Licash code")?;
     ensure!(licash.mailbox.is_some(), "no mailbox in {code}");
     // Paid at the fallback address: Home says it is on its way, then it
-    // is found in a block and moved into the balance, the next address
-    // shown from then on.
+    // is found in a block and moved into the balance once asked, the next
+    // address shown from then on.
     eco.send_to(&fallback, 30_000).await?;
     phone.tagged("status", "Receiving 30,000 sat", 60).await?;
     eco.mine(1).await?;
+    move_in(eco, phone).await?;
     settle(eco, phone, 1).await?;
     let moved = phone.balance().await?;
     // Less the hub's 1000 and the fees of the move on Bitcoin.
@@ -261,6 +284,7 @@ async fn used(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     // Paid at its silent payment address: found and moved in too.
     eco.pay_silent(&silent.to_string(), 20_000).await?;
     eco.mine(1).await?;
+    move_in(eco, phone).await?;
     settle(eco, phone, 2).await?;
     let held = phone.balance().await?;
     ensure!(
@@ -390,7 +414,14 @@ async fn restored(phone: &Phone, hub: &str, silent: &str) -> anyhow::Result<()> 
 
     phone.tap_id("restore-wallet").await?;
     phone.tap_id("restore-words").await?;
-    phone.fill_id("phrase", &words.join(" ")).await?;
+    // A few words at a time: typed all at once, the last ones can be lost.
+    phone.tap_id("phrase").await?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    for few in words.chunks(6) {
+        phone.type_text(&format!("{} ", few.join(" "))).await?;
+    }
+    phone.hide_keyboard().await?;
+    phone.wait("24 of 24", 10).await?;
     phone.tap_id("restore").await?;
     // Its keys only: no hub until one is added again.
     phone.by_id("choose-hub", 120).await?;
@@ -591,8 +622,9 @@ async fn cashed_out(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
         "what was cashed out moved back in by itself"
     );
     phone.by_id("kept", 10).await?;
-    // Asked to: moved in, none left on Bitcoin.
+    // Asked to, once warned: moved in, none left on Bitcoin.
     phone.tap_id("move-in").await?;
+    phone.tap_id("move-in-anyway").await?;
     until("all moved back into the balance", 300, || async {
         mine(eco).await?;
         let views = phone.views().await?;
@@ -634,6 +666,8 @@ async fn cashed_out(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
 /// on credit no longer. Its price paid, its change kept on Bitcoin. Ending it, it is told to cash out
 /// instead.
 async fn contracted(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
+    /// The most keeping its notes few costs while it is set up, in sat.
+    const NOTES_UPKEEP: u64 = 50;
     // hub1's fixed price, and over it 1% of the cap a year for terms its
     // holders choose (licash-hub's --contracts-rate by default).
     const FIXED: u64 = 23_000;
@@ -648,6 +682,10 @@ async fn contracted(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     let held = phone.balance().await?;
     eco.send_to(&fallback.assume_checked().to_string(), 100_000)
         .await?;
+    // Too little for protection worth its price: none offered, moved in
+    // with none.
+    move_in(eco, phone).await?;
+    ensure!(!phone.has("offer").await?, "protection offered for 100000");
     until("100000 moved into the balance", 300, || async {
         mine(eco).await?;
         // Home's one line of what is going on: gone once nothing is.
@@ -659,8 +697,13 @@ async fn contracted(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     // No coin on Bitcoin pays its price: cashed out to itself first.
     at_hub(phone, eco.hub(1)).await?;
     phone.tap_id("open-contract").await?;
-    phone.tagged("quote-price", "23,000 sat", 60).await?;
+    // Its terms chosen all the same: at first covering the notes there,
+    // here the least.
+    let all = amount(&phone.by_id("quote-cap", 60).await?.text);
+    ensure!(all > 90_000, "a cap of {all} offered on the notes held");
+    phone.slide_id("contract-cap", 0.0).await?;
     phone.tagged("quote-cap", "4,096 sat", 10).await?;
+    phone.tagged("quote-price", "23,000 sat", 10).await?;
     phone.tagged("worth", MOCK, 10).await?;
     phone.tap_id("cash-out-first").await?;
     phone.tagged("to", "This wallet", 120).await?;
@@ -749,7 +792,6 @@ async fn contracted(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     })
     .await?;
     let now = amount(&phone.by_id("credit", 10).await?.text);
-    ensure!(now + cap == credit, "{now} on credit, {credit} before");
     phone.tap_id("onchain").await?;
     // Less than hub1 takes, its change stays on Bitcoin, moved in or not.
     let change = amount(&phone.by_id("kept", 30).await?.text);
@@ -757,7 +799,18 @@ async fn contracted(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     phone.back_to("onchain").await?;
     phone.back_to("receive").await?;
     let after = phone.balance().await?;
-    ensure!(after + paid == before, "{after} held, {before} before");
+    // Less its price, and what keeping its notes few may have cost meanwhile
+    // (a few sat, at times): off its credit too, with its cap.
+    let upkeep = (before - paid).checked_sub(after);
+    ensure!(
+        upkeep.is_some_and(|fee| fee <= NOTES_UPKEEP),
+        "{after} held, {before} before"
+    );
+    let upkeep = upkeep.unwrap_or_default();
+    ensure!(
+        now + cap + upkeep == credit,
+        "{now} on credit, {credit} before, {upkeep} on notes"
+    );
     // Home says some of it is protected.
     let share = phone.by_id("protection", 10).await?;
     ensure!(
