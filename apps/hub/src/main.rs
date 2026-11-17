@@ -1099,7 +1099,10 @@ fn command(cli: Cli) -> anyhow::Result<()> {
                     openings.charging(hub.info().policy.fees());
                     openings.spawn_sweeper();
                     // Holders' exits are played as they come: the hub
-                    // decides each claim, and proves what it answers.
+                    // decides each claim against its ledger, and proves
+                    // what it answers.
+                    let ledger = hub.clone();
+                    openings.evidence_with(Arc::new(move |claim| Ok(ledger.evidence(claim)?)));
                     openings.spawn_responder(response_poll);
                     tracing::info!(
                         mock = openings.advertise().mock,

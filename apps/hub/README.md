@@ -172,16 +172,21 @@ network yet.
 A hub with contracts plays its holders' exits itself, polling its
 contracts' Core wallet at `--chain-poll`. When a wallet forces its contract
 closed, its request R and its publication (the claim it files) come on
-Bitcoin. The hub decides what the claim is owed. Owed all it asks, the hub
-lets the holder's timeout pay her. Owed less (a claim of notes that are not
-the keyset's, or spent), it responds with what is owed, proves that
-statement and asserts the proof; challenged, it answers with a kept
-instance. On regtest the proof is the mock authority's; on signet the hub
-runs `licash-r0 hp-prove` (`LICASH_HP_PROVER` names another) in the
-background, its files in `<data>/hp-proofs/<id>/`. It sweeps its outputs of
-each payout to its wallet. Keep `<data>/responses.sqlite` with
-`openings.sqlite`: it pins each one-time signature (the response, the
-assertion) before it is made.
+Bitcoin. The hub decides what the claim is owed against its ledger: the
+spends it retired the claimed notes for (owner-signed, a granted one with
+its unlock) and, for each timed lock the claim names, the branch it did not
+settle it on (its preimage, or its expiry). Owed all it asks, the hub lets
+the holder's timeout pay her. Owed less (a claim of notes that are not the
+keyset's, or spent), it responds with what is owed, publishes in the
+response's disclose slot what that evidence needs public (a granted spend's
+unlock, a preimage), proves that statement and asserts the proof;
+challenged, it answers with a kept instance. On regtest the proof is the
+mock authority's; on signet the hub runs `licash-r0 hp-prove`
+(`LICASH_HP_PROVER` names another) in the background, its files in
+`<data>/hp-proofs/<id>/`. It sweeps its outputs of each payout to its
+wallet. Keep `<data>/responses.sqlite` with `openings.sqlite`: it pins the
+evidence each response is decided on and each one-time signature (the
+response, the assertion) before it is made.
 
 With `--swaps` (and `--chain`), the hub provides the swaps into it from the
 hubs of `--swaps-from URL=CAP`: a wallet locks its notes at such a hub to

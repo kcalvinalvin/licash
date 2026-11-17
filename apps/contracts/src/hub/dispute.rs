@@ -2,24 +2,30 @@
 //!
 //! Her request names a claim `b`; her publication carries the filing. The
 //! hub decides what the filing is owed against its evidence
-//! ([`licash::recovery::owed`]): owed all of `b`, it lets her timeout pay
-//! her; owed less, it responds `b′`, proves its statement
+//! ([`licash::recovery::owed`]), what its ledger holds against the claim
+//! ([`Evidencer`]) that the statement accepts: owed all of `b`, it lets her
+//! timeout pay her; owed less, it pins that evidence, responds `b′`,
+//! discloses what the evidence needs published (a granted spend's unlock,
+//! a preimage) in the response's disclose slot, proves its statement
 //! ([`licash_hp::check`]) and asserts the proof. Challenged, it answers
-//! with a kept instance whose circuit opens on the proof. Its one-time
-//! signatures (`b′`, the proof's digits) are pinned in `responses.sqlite`
-//! before they are made. Outputs of a payout that are the hub's are swept
-//! to its wallet.
+//! with a kept instance whose circuit opens on the proof. Its evidence and
+//! one-time signatures (`b′`, the proof's digits) are pinned in
+//! `responses.sqlite` before they are made. Outputs of a payout that are
+//! the hub's are swept to its wallet.
 //!
 //! Every step reads the chain again: nothing here is state but caches and
-//! the pins. Missing evidence, a stopped prover or a failed broadcast are
-//! retried on the next poll.
+//! the pins. A stopped prover or a failed broadcast is retried on the next
+//! poll.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use anyhow::{anyhow, bail, ensure, Context as _, Result};
 use bitcoin::{Amount, Block, FeeRate, OutPoint, Transaction, TxOut};
-use licash::recovery::Evidence;
+use licash::claim::UnsignedClaim;
+use licash::disclosure::Disclosures;
+use licash::recovery::{self, Evidence, Filing};
+use licash::request::Request;
 use licash_contract::dispute::{self, presign, Payout};
 use licash_contract::graph;
 use licash_contract::graph::{link_args, HubProves};
@@ -31,9 +37,10 @@ use sha2::{Digest, Sha256};
 use super::{responses::Responses, Openings};
 use crate::holder::node::Node;
 
-/// What the hub knows against a filing: its evidence. None known is no
-/// error: the filing is then owed what its notes are worth.
-pub type Evidencer = dyn Fn(&HubOpening, &[u8]) -> Result<Vec<Evidence>> + Send + Sync;
+/// What the hub's ledger holds against a claim: candidates, of which the
+/// responder cites those the statement accepts. None known is no error:
+/// the claim is then owed what its notes are worth.
+pub type Evidencer = dyn Fn(&UnsignedClaim) -> Result<Vec<Evidence>> + Send + Sync;
 
 /// The caches of the responder: each coin's first spend once seen, and
 /// how far its blocks were looked through; the proofs being made; the
@@ -163,19 +170,20 @@ impl Openings {
         let (b, e) = o.requested_b(r)?;
         let headers = self.headers(o, p_at).await?;
         let chain = licash_hp::chain(&o.base, &headers).map_err(|e| anyhow!("{e}"))?;
-        let evidence = self.evidence(o, &filed)?;
-        let owed = licash::recovery::owed(
-            &o.base,
-            &licash::request::Request {
-                amount: b,
-                claim_digest: e,
-            },
-            &filed,
-            &evidence,
-            &chain,
-        )
-        .map_err(|e| anyhow!("{e}"))?;
-        if owed.owed >= b {
+        let request = Request {
+            amount: b,
+            claim_digest: e,
+        };
+        let owed = |evidence: &[Evidence]| {
+            recovery::owed(&o.base, &request, &filed, evidence, &chain).map_err(|e| anyhow!("{e}"))
+        };
+        let pins = Responses::open(&self.data)?;
+        let evidence = match pins.evidence(id)? {
+            Some(pinned) => pinned_evidence(o, &pinned)?,
+            None => self.select(o, &filed, owed)?,
+        };
+        let mut decided = owed(&evidence)?;
+        if decided.owed >= b {
             self.note_once(
                 id,
                 "owed",
@@ -183,20 +191,77 @@ impl Openings {
             );
             return Ok(Played::Idle);
         }
+        // What is pinned first is what the hub answers on.
+        let pinned = pins.pin(id, r, &recovery::evidence_to_bytes(&evidence))?;
+        let evidence = pinned_evidence(o, &pinned)?;
+        decided = owed(&evidence)?;
         ensure!(
-            owed.disclosures == licash::disclosure::Disclosures::empty(),
-            "the evidence needs a disclosure, which this hub does not post yet"
+            decided.owed < b,
+            "the pinned evidence leaves her claim owed"
         );
         tracing::warn!(
             id = %crate::hex_id(id),
             claimed = b,
-            owed = owed.owed,
+            owed = decided.owed,
+            cited = evidence.len(),
             "a contract claim is owed less than it asks: responding"
         );
         let keys = hub.keys();
-        let response = Responses::open(&self.data)?.answer(id, r, || o.respond(keys, owed.owed))?;
+        let response = pins.answer(id, r, || o.respond(keys, decided.owed))?;
         self.post(&response).await;
+        // Its disclosure with it: the statement wants the contract's work
+        // on top of both, within the assertion window.
+        self.disclose(id, hub, o, &decided.disclosures).await?;
         Ok(Played::Posted("respond"))
+    }
+
+    /// Of the ledger's candidates against her filing, those the statement
+    /// accepts, in order: each must void something the ones before did not.
+    /// None against a claim ineligible or owed nothing.
+    fn select(
+        &self,
+        o: &HubOpening,
+        filed: &[u8],
+        owed: impl Fn(&[Evidence]) -> Result<recovery::Owed>,
+    ) -> Result<Vec<Evidence>> {
+        let Some(ledger) = self.evidencer.get() else {
+            return Ok(Vec::new());
+        };
+        let none = owed(&[])?;
+        if none.ineligible.is_some() || none.owed == 0 {
+            return Ok(Vec::new());
+        }
+        let p = o.base.parts();
+        let filing = Filing::from_bytes(&p.keyset, p.limits.max_authorizations as usize, filed)
+            .map_err(|e| anyhow!("{e}"))?;
+        let mut kept = Vec::new();
+        for candidate in ledger(filing.publication().claim())? {
+            kept.push(candidate);
+            if owed(&kept).is_err() {
+                kept.pop();
+            }
+        }
+        Ok(kept)
+    }
+
+    /// Post the disclosure of `disclosures` in the response's disclose
+    /// slot, with a fee coin of the hub's: nothing if there is none to
+    /// make. Whether it was broadcast.
+    async fn disclose(
+        &self,
+        id: &[u8; 32],
+        hub: &Hub,
+        o: &HubOpening,
+        disclosures: &Disclosures,
+    ) -> Result<bool> {
+        if *disclosures == Disclosures::empty() {
+            return Ok(false);
+        }
+        let respond = presign(&o.set, "respond")?;
+        let prevout = respond.tx.output[SLOT as usize].clone();
+        let tx = o.disclosure(hub.keys(), &disclosures.to_bytes(), vec![])?;
+        let tx = self.with_fee(id, hub, "disclose", tx, prevout).await?;
+        Ok(self.post(&tx).await)
     }
 
     /// The hub responded: its proof that her claim is owed no more, once
@@ -225,13 +290,39 @@ impl Openings {
             .spend(slot, &r.output[slot.vout as usize], r_at, tip)
             .await?
             .context("responded with no publication")?;
+        let pinned = Responses::open(&self.data)?
+            .evidence(id)?
+            .context("responded on no pinned evidence")?;
+        let evidence = pinned_evidence(o, &pinned)?;
+        let disclosures = recovery::disclosures(&evidence).map_err(|e| anyhow!("{e}"))?;
+        // Its disclosure, if the evidence needs one, deep enough too.
+        let disclosure = if disclosures == Disclosures::empty() {
+            None
+        } else {
+            let slot = OutPoint {
+                txid: x.compute_txid(),
+                vout: SLOT,
+            };
+            match self
+                .spend(slot, &x.output[SLOT as usize], x_at, tip)
+                .await?
+            {
+                None => {
+                    return Ok(if self.disclose(id, hub, o, &disclosures).await? {
+                        Played::Posted("disclose")
+                    } else {
+                        Played::Idle
+                    });
+                }
+                Some((d_at, _)) if tip < d_at.saturating_add(depth) => return Ok(Played::Idle),
+                Some((d_at, d)) => Some((self.block_at(d_at).await?, d.compute_txid())),
+            }
+        };
         let (r_block, p_block, x_block) = (
             self.block_at(r_at).await?,
             self.block_at(p_at).await?,
             self.block_at(x_at).await?,
         );
-        let request = presign(&o.set, "request")?;
-        let filed = dispute::published(&request.tx, &p_block, &p.compute_txid())?;
         let headers = self.headers(o, tip).await?;
         let exit = dispute::exit(
             headers,
@@ -239,12 +330,12 @@ impl Openings {
             (&r_block, &r.compute_txid()),
             (&p_block, &p.compute_txid()),
             (&x_block, &x.compute_txid()),
-            None,
+            disclosure.as_ref().map(|(block, txid)| (block, txid)),
         )?;
         let input = licash_hp::HubInput {
             base: o.base.clone(),
             exit,
-            evidence: self.evidence(o, &filed)?,
+            evidence,
         };
         let journal = graph::journal(&o.base);
         match licash_hp::check(&input) {
@@ -350,7 +441,8 @@ impl Openings {
                         "wrongly_challenged_{}",
                         o.kept.iter().position(|n| *n == i).unwrap_or(0)
                     );
-                    let tx = self.with_fee(id, hub, o, &name, tx).await?;
+                    let prevout = presign(&o.set, &name)?.prevout.clone();
+                    let tx = self.with_fee(id, hub, &name, tx, prevout).await?;
                     self.post(&tx).await;
                     return Ok(Played::Posted("wrongly_challenged"));
                 }
@@ -365,19 +457,19 @@ impl Openings {
         Ok(Played::Idle)
     }
 
-    /// The terminal `tx` named `name` with an exact fee coin of the hub's
-    /// wallet appended: made once and kept for the poll after.
+    /// The one-input `tx` named `name`, spending `prevout`, with an exact
+    /// fee coin of the hub's wallet appended: made once and kept for the
+    /// poll after.
     async fn with_fee(
         &self,
         id: &[u8; 32],
         hub: &Hub,
-        o: &HubOpening,
         name: &str,
         tx: Transaction,
+        prevout: TxOut,
     ) -> Result<Transaction> {
         let key = &hub.keys().party.payment;
         let script = dispute::fee_script(key)?;
-        let prevout = presign(&o.set, name)?.prevout.clone();
         let cached = self
             .watch
             .fee_coins
@@ -519,13 +611,6 @@ impl Openings {
         Ok(Played::Idle)
     }
 
-    fn evidence(&self, o: &HubOpening, filed: &[u8]) -> Result<Vec<Evidence>> {
-        match self.evidencer.get() {
-            Some(f) => f(o, filed),
-            None => Ok(Vec::new()),
-        }
-    }
-
     async fn unspent(&self, coin: OutPoint) -> Result<bool> {
         let out: Option<serde_json::Value> = self
             .wallet
@@ -639,6 +724,17 @@ impl Openings {
     }
 }
 
+/// The evidence pinned as `bytes`: none for empty bytes (a response pinned
+/// before evidence was).
+fn pinned_evidence(o: &HubOpening, bytes: &[u8]) -> Result<Vec<Evidence>> {
+    if bytes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let p = o.base.parts();
+    recovery::evidence_from_bytes(&p.keyset, p.limits.max_authorizations as usize, bytes)
+        .map_err(|e| anyhow!("the pinned evidence: {e}"))
+}
+
 fn tagged(id: &[u8; 32], tag: &[u8]) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(b"licash/contracts/hub-pin");
@@ -647,5 +743,6 @@ fn tagged(id: &[u8; 32], tag: &[u8]) -> [u8; 32] {
     h.finalize().into()
 }
 
-/// The output of her request her publication spends.
+/// The slot output of a request, her publication spending it, and of a
+/// response, the hub's disclosure spending it (Lichen's `SLOT_VOUT`).
 const SLOT: u32 = 2;

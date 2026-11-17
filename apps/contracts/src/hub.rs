@@ -351,9 +351,10 @@ impl Openings {
         });
     }
 
-    /// Find the evidence against filings with `f` from now on: the hub's
-    /// record of spent notes. Without, a filing is owed what its notes are
-    /// worth, and only claims that are none are answered.
+    /// Find the evidence against holders' claims with `f` from now on: the
+    /// hub's ledger of the spends it retired notes for and the locks it
+    /// settled. Without, a claim is owed what its notes are worth, and
+    /// only claims that are none are answered.
     pub fn evidence_with(&self, f: Arc<Evidencer>) {
         let _ = self.evidencer.set(f);
     }

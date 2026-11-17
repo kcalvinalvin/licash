@@ -16,7 +16,8 @@ research implementation; it has not had a security review.
   what a filed claim is owed). The crate docs map modules to paper sections.
 - `crates/licash-hp`: the hub's statement, which decides what a filed claim
   is owed from Bitcoin and the hub's evidence (built in regtest's workspace).
-- `crates/licash-hub`: a hub's operations over its own SQLite ledger.
+- `crates/licash-hub`: a hub's operations over its own SQLite ledger, and
+  the evidence it holds against a holder's claim.
 - `crates/licash-api`: the HTTP API bodies and error codes of hubs and swap
   providers.
 - `crates/licash-wallet`: a wallet over its own SQLite file: hubs, notes,

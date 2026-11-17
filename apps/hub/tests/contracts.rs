@@ -620,6 +620,9 @@ async fn hub_answering_with(
     let keyset = hub.info().keysets[0].clone();
     let openings = Openings::with_wallet(dir, source.clone(), source.clone(), keyset, range);
     let openings = openings.await?;
+    // Its ledger against holders' claims, as the hub service's.
+    let ledger = hub.clone();
+    openings.evidence_with(Arc::new(move |claim| Ok(ledger.evidence(claim)?)));
     let services = Services {
         contracts: Some(openings.clone()),
         ..Default::default()
@@ -629,6 +632,21 @@ async fn hub_answering_with(
     let url = format!("http://{}", listener.local_addr()?);
     tokio::spawn(async move { axum::serve(listener, app).await });
     Ok((url, source, hub, openings))
+}
+
+/// `from`'s files copied into `to`, made.
+fn copy_dir(from: &Path, to: &Path) -> Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let target = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir(&entry.path(), &target)?;
+        } else {
+            std::fs::copy(entry.path(), target)?;
+        }
+    }
+    Ok(())
 }
 
 /// A wallet of `seed` in `dir`'s `wallet`, trusting the hub at `url`,
@@ -746,6 +764,96 @@ async fn a_holder_recovers_her_cap_of_notes_beyond_it_from_a_hub_that_answered()
     let swept = swept.to_sat();
     ensure!(swept > 5_000, "{swept} swept");
     eprintln!("swept {swept} sat to her wallet of a claim of 5000");
+    Ok(())
+}
+
+/// A stale claim: she restores a copy of her wallet made before she paid
+/// a note away and forces her contract closed on it. The hub meets the
+/// claim with the spend it released, discloses that spend's unlock,
+/// responds what is left, proves it and asserts; her payout is that.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs bitcoind and a release build"]
+async fn a_hub_meets_a_stale_claim_with_the_spend_it_released_and_pays_what_is_left() -> Result<()>
+{
+    use bitcoin::FeeRate;
+    use licash_contracts::holder::recovery::{self, Stage};
+
+    let rt = Regtest::start_standard()?;
+    let dir = tempfile::tempdir()?;
+    let at = dir.path().join("hub");
+    let range = Range {
+        max_cap: 50_000_000,
+        max_blocks: 5_000,
+        per_coin: 2,
+        ppm_year: 10_000,
+    };
+    let (url, source, hub, openings) = hub_answering_with(&rt, &at, Some(range)).await?;
+    let chain = Node(source);
+    let (mine, wallet) =
+        holder_wallet(&rt, &chain, dir.path(), &url, [11; 32], &[60_000, 50_000]).await?;
+    let chosen = Ask {
+        cap: Some(5_000),
+        ..ask()
+    };
+    let opened = holder::open(&wallet, &chain, &mine, &url, chosen).await?;
+    let rate = FeeRate::from_sat_per_vb(2).context("a rate")?;
+    for _ in 0..3 {
+        let payment = pay(&hub, &at.join("seed"), &url, &wallet.address(), 2_048)?;
+        wallet.receive(&payment)?;
+    }
+    rt.mine(1)?;
+    holder::resume(&wallet, &chain, &mine).await?;
+    ensure!(available(&wallet)? == 6_144);
+
+    // Her wallet as it was, copied; then a note of it paid away.
+    drop(wallet);
+    let stale = dir.path().join("stale");
+    copy_dir(&mine, &stale)?;
+    let wallet = Wallet::open(&mine.join("wallet.sqlite"), Http::new(None)?)?;
+    let bob = licash::address::OwnerKeys::from_seed(&[0xbb; 32])?.address();
+    wallet.send(&url, &bob, 2_048).await?;
+    let left = available(&wallet)?;
+    ensure!(left < 6_144, "{left} left");
+    drop(wallet);
+
+    // Restored, the copy claims the note paid away too.
+    let wallet = Wallet::open(&stale.join("wallet.sqlite"), Http::new(None)?)?;
+    let mine = stale;
+    let forced = recovery::force_close(&wallet, &chain, &mine, &opened.id, rate).await?;
+    ensure!((forced.claimed, forced.notes) == (5_000, 3), "{forced:?}");
+    rt.mine_to_height(forced.next_at.context("no lock")? - 1)?;
+    recovery::advance(&wallet, &chain, &mine, rate).await?;
+    rt.mine(1)?;
+
+    // The hub responds what the spend it released leaves her, with its
+    // unlock disclosed, then asserts.
+    let mut now = None;
+    for _ in 0..600 {
+        rt.mine(1)?;
+        let round = openings.answer_requests().await?;
+        ensure!(round.failed == 0, "{round:?}");
+        let all = recovery::advance(&wallet, &chain, &mine, rate).await?;
+        let r = all[0].clone();
+        ensure!(
+            !matches!(r.stage, Stage::Lost | Stage::TimingOut | Stage::TimedOut),
+            "{r:?}"
+        );
+        if matches!(r.stage, Stage::Done) {
+            now = Some(r);
+            break;
+        }
+    }
+    let done = now.context("never paid")?;
+    let x = done.response.context("no response")?;
+    ensure!(rt.confirmations(&x)?.is_some(), "{done:?}");
+    // Its disclose slot spent: the unlock published.
+    ensure!(!rt.is_unspent(&bitcoin::OutPoint { txid: x, vout: 2 })?);
+    // Her notes less the one paid away: two of 2 048.
+    let corrected = done.corrected.context("no response")?;
+    ensure!(corrected == 4_096, "{done:?}");
+    ensure!(done.payout.is_some() && done.timeout.is_none(), "{done:?}");
+    let received = done.received.context("nothing received")?;
+    eprintln!("a stale claim of 5000 paid {corrected}, {received} swept to her wallet");
     Ok(())
 }
 
