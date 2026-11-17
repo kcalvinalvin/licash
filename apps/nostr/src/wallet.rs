@@ -9,7 +9,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::bail;
+use anyhow::{bail, ensure};
 use bitcoin::FeeRate;
 use futures_util::future::{join, join_all};
 use licash_api::{Info, Payment};
@@ -495,6 +495,16 @@ pub async fn pay_planned<T: Transport>(
             ),
             _ => return Err(under_way(hub, None)),
         }
+    }
+    if plan.trusted && plan.swap.is_none() {
+        // Held to what was quoted: the notes held or the hub's terms may
+        // have changed since.
+        let fee = wallet.send_fee(&plan.hub, amount)?;
+        ensure!(
+            fee <= plan.fee,
+            "nothing paid: the fee is {fee} sat now, not the {} quoted: quote again",
+            plan.fee
+        );
     }
     send(wallet, code, plan.hub.clone(), amount).await
 }

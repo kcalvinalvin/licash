@@ -1354,6 +1354,27 @@ fn a_phone_pays_a_code_as_quoted() {
 }
 
 #[test]
+fn a_phone_knows_what_paying_a_code_costs_without_the_network_and_pays_no_more() {
+    let net = Net::new(true);
+    let light = Light::new(&net);
+    let alice = funded(&net, &light, "alice");
+    let held = notes(&alice);
+    let bob = net.wallet("bob", net.height());
+    let open = bob.payment_code(None).unwrap();
+    for amount in [500, 1_234, held / 3] {
+        let fee = alice.pay_fee(open.qr.clone(), Some(amount)).unwrap().unwrap();
+        let quote = alice.pay_quote(open.qr.clone(), Some(amount)).unwrap();
+        assert_eq!(quote.fee, fee, "paying {amount}");
+        let before = notes(&alice);
+        alice.pay(open.qr.clone(), Some(amount)).unwrap();
+        assert_eq!(notes(&alice), before - amount - fee, "paying {amount}");
+    }
+    // More than held there: told over the network, by a quote.
+    assert_eq!(alice.pay_fee(open.qr.clone(), Some(held)).unwrap(), None);
+    assert!(alice.pay_fee("garbage".into(), Some(10)).is_err());
+}
+
+#[test]
 fn a_phone_paying_now_answers_once_paid_and_mails_it_and_unlinks_after() {
     let net = Net::new(true);
     let light = Light::new(&net);

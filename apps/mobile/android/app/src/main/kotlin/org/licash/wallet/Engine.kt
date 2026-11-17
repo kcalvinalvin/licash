@@ -946,6 +946,10 @@ class Engine(context: Context) {
      * all it costs: [pay] pays it so. At a hub not trusted, the payee's,
      * visited and proving it is the one named, if no hub trusted is.
      */
+    /** What paying `code` costs now at a hub trusted holding enough, asking nothing of the network: none if no such hub. */
+    suspend fun payFee(code: String, amount: ULong?): Result<ULong?> =
+        io { local { it.payFee(code, amount) } }
+
     suspend fun payQuote(code: String, amount: ULong?): Result<PayQuote> =
         io { local { it.payQuote(code, amount) } }
 

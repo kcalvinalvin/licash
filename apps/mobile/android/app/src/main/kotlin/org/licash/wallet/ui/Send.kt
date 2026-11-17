@@ -43,6 +43,7 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import org.licash.core.FeesRaised
 import org.licash.core.InvoiceQuote
@@ -206,14 +207,15 @@ fun Send(
         scope.launch { step = paying(code, amount) }
     }
 
-    // Quoted first: paid at once at a hub trusted holding enough, else
-    // reviewed, a swap or a hub not added in the way.
-    fun plan(s: Step.Paying, amount: ULong?) {
+    // Quoted first: paid at once at a hub trusted holding enough for no
+    // more than the fee `shown`, else reviewed, a swap, a hub not added or
+    // a fee risen in the way.
+    fun plan(s: Step.Paying, amount: ULong?, shown: ULong?) {
         step = Step.Planning
         scope.launch {
             step = engine.payQuote(s.code, amount).fold(
                 { quote ->
-                    if (quote.trusted && quote.swapFrom == null) {
+                    if (quote.trusted && quote.swapFrom == null && shown != null && quote.fee <= shown) {
                         step = Step.Busy
                         paying(s.code, amount)
                     } else {
@@ -299,7 +301,7 @@ fun Send(
                     // Or someone paid before, by name.
                     if (cashOut == null) Contacts(engine) { read(it.code) }
                 }
-                is Step.Paying -> Paying(ui, s) { amount -> plan(s, amount) }
+                is Step.Paying -> Paying(engine, ui, s) { amount, shown -> plan(s, amount, shown) }
                 Step.Busy -> Middle("One moment…")
                 Step.Planning -> Middle("One moment…")
                 is Step.Review -> Review(s.quote, s.through.takeIf { ui.developer }, { pay(s.code, s.amount) }) {
@@ -336,7 +338,7 @@ fun Send(
                     "Pay there",
                     {
                         val paying = Step.Paying(s.code, s.asked, s.address, visit = true)
-                        if (s.asked != null) plan(paying, null) else step = paying
+                        if (s.asked != null) plan(paying, null, null) else step = paying
                     },
                     back,
                 )
@@ -466,12 +468,21 @@ private fun Facts(facts: List<Fact>) {
  * added, what it costs is told next, once known.
  */
 @Composable
-private fun Paying(ui: Ui, s: Step.Paying, pay: (ULong?) -> Unit) {
+private fun Paying(engine: Engine, ui: Ui, s: Step.Paying, pay: (amount: ULong?, shown: ULong?) -> Unit) {
     var amount by remember { mutableStateOf(s.asked?.toLong()) }
-    // The most a hub would charge: the code may name several.
+    // What the wallet pays as things stand, at a hub trusted holding
+    // enough: none known, a swap or a visit in the way, told next.
+    var exact by remember { mutableStateOf<ULong?>(null) }
+    LaunchedEffect(amount, ui.balance) {
+        exact = null
+        val a = amount?.takeIf { !s.visit && it > 0 } ?: return@LaunchedEffect
+        delay(250)
+        exact = engine.payFee(s.code, if (s.asked == null) a.toULong() else null).getOrNull()
+    }
+    // Else the most a hub would charge: the code may name several.
     val estimatedHub = amount?.takeIf { !s.visit }
         ?.let { a -> ui.hubs.maxByOrNull { payingUpTo(it, a.toULong()) } }
-    val fee = amount?.let { a -> estimatedHub?.let { payingUpTo(it, a.toULong()) } }
+    val fee = exact ?: amount?.let { a -> estimatedHub?.let { payingUpTo(it, a.toULong()) } }
     Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
         Spacer(Modifier.height(32.dp))
         if (s.asked == null) {
@@ -484,14 +495,18 @@ private fun Paying(ui: Ui, s: Step.Paying, pay: (ULong?) -> Unit) {
                 listOf(
                     Fact(
                         "Fee",
-                        fee?.let { if (it == 0uL) "None" else "Up to ${sat(it)}" } ?: "",
+                        fee?.let { if (it == 0uL) "None" else if (exact != null) sat(it) else "Up to ${sat(it)}" } ?: "",
                         "fee",
                         fee?.let { f -> amount?.let { share(f, it.toULong()) } },
                         fee?.let { f -> amount?.let { a -> estimatedHub?.let { hub -> FeeBreakdown(
                             a.toULong(), f,
-                            components = listOf("Hub (estimate)" to f),
+                            components = listOf((if (exact != null) "Hub" else "Hub (estimate)") to f),
                             rate = org.licash.core.Rate(hub.feeBase, hub.feePpm),
-                            explanation = "Upper estimate using current terms at ${name(hub.url)}, with its fee for each note made. The hub used to pay may charge less.",
+                            explanation = if (exact != null) {
+                                "What paying costs now, the notes it spends and makes counted."
+                            } else {
+                                "Upper estimate using current terms at ${name(hub.url)}, with its fee for each note made. The hub used to pay may charge less."
+                            },
                         ) } } },
                     ),
                     Fact("Arrives", "Instantly", "arrives"),
@@ -500,7 +515,7 @@ private fun Paying(ui: Ui, s: Step.Paying, pay: (ULong?) -> Unit) {
         }
         Spacer(Modifier.height(24.dp))
         BigButton(if (s.visit) "Continue" else "Pay", Modifier.fillMaxWidth().testTag("confirm"), enabled = amount != null) {
-            pay(if (s.asked == null) amount?.toULong() else null)
+            pay(if (s.asked == null) amount?.toULong() else null, exact)
         }
     }
 }

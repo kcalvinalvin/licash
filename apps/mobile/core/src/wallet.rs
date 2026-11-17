@@ -745,6 +745,23 @@ impl Wallet {
             .collect())
     }
 
+    /// What paying `amount`, or what it asks, to the payment code `code`
+    /// costs at a hub it names that the wallet trusts and holds enough at:
+    /// the fee [`Wallet::pay`] pays there as things stand. None if no such
+    /// hub, a swap or a visit needed: [`Wallet::pay_quote`] tells, over
+    /// the network. Asks nothing of the network.
+    pub fn pay_fee(&self, code: String, amount: Option<u64>) -> Result<Option<u64>, LicashError> {
+        let code: PaymentCode = code.trim().parse().map_err(LicashError::invalid)?;
+        code.check(self.wallet.network())?;
+        let (Some(licash), Some(amount)) = (&code.licash, amount.or(code.amount)) else {
+            return Ok(None);
+        };
+        match self.wallet.hub_to_pay(licash, amount)? {
+            Some(hub) => Ok(Some(self.wallet.send_fee(&hub, amount)?)),
+            None => Ok(None),
+        }
+    }
+
     /// How paying `amount`, or what it asks, to the payment code `code` in
     /// notes goes, and all it costs: at a hub it names that the wallet
     /// trusts, else once a swap from another brings what it lacks there,

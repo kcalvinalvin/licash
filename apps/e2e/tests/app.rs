@@ -261,7 +261,6 @@ async fn used(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     silently(phone, &silent.to_string()).await?;
 
     // It pays Bob at the hub, an amount it enters, to his mailbox.
-    let info = eco.info(hub).await?;
     let bob = eco.wallet("bob")?;
     bob.add_hub(hub).await?;
     let bobs = bob.payment_code(&[hub.to_owned()], false)?;
@@ -276,14 +275,22 @@ async fn used(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     })
     .await?;
     phone.type_text("5000").await?;
-    // What it costs at most, and when it arrives, before it is paid.
+    // What it costs, as the wallet would pay it, and when it arrives,
+    // before it is paid.
     let fee = until("the fee of 5000", 10, || async {
         let views = phone.views().await?;
         let fee = views.into_iter().find(|v| v.id == "fee");
-        Ok(fee.filter(|v| v.text == "None" || v.text.starts_with("Up to")))
+        Ok(fee.and_then(|v| match v.text.as_str() {
+            "None" => Some(0),
+            text => text
+                .strip_suffix(" sat")?
+                .replace(',', "")
+                .parse::<u64>()
+                .ok(),
+        }))
     })
     .await?;
-    eprintln!("paying 5000, fee: {:?}", fee.text);
+    eprintln!("paying 5000, fee: {fee}");
     phone.tagged("arrives", "Instantly", 10).await?;
     phone.tap_id("confirm").await?;
     phone.tagged("result", "Sent", 60).await?;
@@ -298,7 +305,8 @@ async fn used(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
         "Bob got other than 5000"
     );
     let after = changed(phone, held, 30).await?;
-    let fee = info.fees.spend.due(held);
+    // At most what was shown: the wallet pays no more than it quoted, the
+    // notes it makes counted.
     ensure!(
         (5_000..=5_000 + fee).contains(&(held - after)),
         "{} spent paying 5000",
