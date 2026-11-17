@@ -4,6 +4,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Test
 import org.licash.core.Balance
+import org.licash.core.Transfer
 
 class WordsTest {
     private fun balance(notes: ULong = 0uL, onchain: ULong = 0uL, covered: ULong = 0uL, pending: ULong = 0uL) =
@@ -88,5 +89,24 @@ class WordsTest {
             refundWait(200u),
         )
         assertEquals("Not paid. Your money comes back by itself in about 2 hours.", notPaid(12u))
+    }
+
+    @Test
+    fun a_setup_says_how_much_it_sent_how_fast_and_how_long_the_rest_takes() {
+        assertEquals("0.0 MB of about 100 MB", transferred(Transfer(0uL, 0uL, 100_100_000uL)))
+        assertEquals(
+            "12 MB of about 100 MB · 1.5 MB/s · about 58 s left",
+            transferred(Transfer(12_000_000uL, 8uL, 100_100_000uL)),
+        )
+        assertEquals(
+            "1.0 MB of about 100 MB · 0.1 MB/s · about 17 min left",
+            transferred(Transfer(1_000_000uL, 10uL, 100_100_000uL)),
+        )
+        assertEquals(
+            "99 MB of about 99 MB · 9.9 MB/s · almost done",
+            transferred(Transfer(99_000_000uL, 10uL, 99_100_000uL)),
+        )
+        // Past what was expected: no time left to say.
+        assertEquals("120 MB of about 100 MB · 12 MB/s", transferred(Transfer(120_000_000uL, 10uL, 100_100_000uL)))
     }
 }

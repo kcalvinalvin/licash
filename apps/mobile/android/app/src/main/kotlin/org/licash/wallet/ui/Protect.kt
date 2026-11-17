@@ -109,6 +109,15 @@ internal fun CoverRow(
                         color = colors.onSurfaceVariant,
                     )
                 }
+                // How fast what it sends and gets goes, while it does.
+                c.transfer?.takeIf { forcing == null && step != null }?.let {
+                    Text(
+                        transferred(it),
+                        modifier = Modifier.testTag("contract-transfer"),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = colors.onSurfaceVariant,
+                    )
+                }
             }
             Text(
                 forcing?.stands ?: cover.stands,

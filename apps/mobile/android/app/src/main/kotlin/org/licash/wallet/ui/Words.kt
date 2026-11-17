@@ -16,11 +16,13 @@ import org.licash.core.Rate
 import org.licash.core.Recovery
 import org.licash.core.RecoveryStage
 import org.licash.core.State
+import org.licash.core.Transfer
 import org.licash.wallet.credit
 import org.licash.wallet.host
 import org.licash.wallet.percent
 import org.licash.wallet.sat
 import org.licash.wallet.total
+import kotlin.math.roundToLong
 
 /*
  * The app's words, where a screen does not own them: what is said the same
@@ -318,6 +320,34 @@ fun setup(step: OpeningStep): Pair<Float, String> = when (step) {
     OpeningStep.Signatures -> 4f to "Waiting for the hub"
     OpeningStep.Signing -> 5f to "Signing"
     is OpeningStep.Confirming -> 6f to if (step.confirmations == 0u) "Waiting for Bitcoin" else "Confirming"
+}
+
+/**
+ * What setting a protection up sent and got so far, its speed and about
+ * how long the rest takes at it: `12 MB of about 100 MB · 1.5 MB/s · about
+ * 1 min left`. Its speed once a second has passed, the rest once some is.
+ */
+fun transferred(t: Transfer): String {
+    val parts = mutableListOf("${megabytes(t.bytes)} of about ${megabytes(t.expected)}")
+    if (t.seconds > 0uL && t.bytes > 0uL) {
+        val rate = t.bytes / t.seconds
+        parts += "${megabytes(rate)}/s"
+        if (t.expected > t.bytes && rate > 0uL) {
+            val left = ((t.expected - t.bytes) / rate).toLong()
+            parts += when {
+                left == 0L -> "almost done"
+                left < 60 -> "about $left s left"
+                else -> "about ${(left + 59) / 60} min left"
+            }
+        }
+    }
+    return parts.joinToString(" · ")
+}
+
+/** `bytes` in megabytes, to a tenth below 10: `0.4 MB`, `12 MB`. */
+private fun megabytes(bytes: ULong): String {
+    val mb = bytes.toDouble() / 1_000_000
+    return if (mb < 10) String.format(Locale.US, "%.1f MB", mb) else "${mb.roundToLong()} MB"
 }
 
 /**
