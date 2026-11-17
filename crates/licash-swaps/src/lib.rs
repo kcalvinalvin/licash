@@ -43,6 +43,7 @@
 //! [`Config::own_lead`] blocks before the client's, between hubs of any
 //! windows.
 
+mod donations;
 mod invoices;
 mod issue;
 mod payouts;
@@ -64,6 +65,10 @@ use rand_core::{OsRng, RngCore};
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
+pub use donations::{
+    Donation, DonationState, DonationTerms, INVOICE_CLTV, INVOICE_EXPIRY, METADATA, SETTLE_MARGIN,
+    START_ROOM,
+};
 pub use invoices::MIN_SLACK;
 pub use issue::Issuer;
 use issue::{Issue, Issued};
@@ -458,17 +463,17 @@ impl Drop for Hold<'_> {
     }
 }
 
-fn declined(message: impl Into<String>) -> Problem {
+pub(crate) fn declined(message: impl Into<String>) -> Problem {
     Problem::new(Code::Declined, message)
 }
 
 /// A problem of the provider's own, for the client to retry.
-fn unavailable(e: impl std::fmt::Display) -> Problem {
+pub(crate) fn unavailable(e: impl std::fmt::Display) -> Problem {
     Problem::new(Code::Unavailable, e.to_string())
 }
 
 /// A client's request refused, as a wallet error says it.
-fn refused(e: licash_wallet::Error) -> Problem {
+pub(crate) fn refused(e: licash_wallet::Error) -> Problem {
     match e {
         licash_wallet::Error::Refused { hub, problem } => {
             declined(format!("hub {hub} refused: {}", problem.message))
@@ -508,6 +513,8 @@ pub struct Provider<T: Transport> {
     intake: Mutex<Option<HashMap<String, u64>>>,
     /// What it pays over Lightning, and through which node, if it does.
     lightning: Option<invoices::Payer>,
+    /// Donations taken, if any ([`Provider::take_donations`]).
+    donations: Option<donations::Receiver>,
 }
 
 /// The swaps into the provider's own hub under way, whose clients' locks
@@ -549,15 +556,25 @@ fn read_swaps(path: &Path) -> Result<Option<rusqlite::Connection>, Error> {
     Ok(Some(conn))
 }
 
-/// Any recorded swap reserves its hash, even terminal or not yet locked.
+/// Any recorded swap or donation reserves its hash, even terminal or not
+/// yet locked: a donation's invoice, public, must never back a receipt of
+/// a gateway sharing the provider's node, whose notes its settling would
+/// pay. A file of before donations, not yet migrated, holds none.
 pub fn holds_hash(path: &Path, hash: &[u8; 32]) -> Result<bool, Error> {
     let Some(conn) = read_swaps(path)? else {
         return Ok(false);
     };
-    let held = conn
+    let swap = conn
         .prepare("SELECT 1 FROM swaps WHERE hash = ?1")?
         .exists([hash])?;
-    Ok(held)
+    let donations = conn
+        .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'donations'")?
+        .exists([])?;
+    let donation = donations
+        && conn
+            .prepare("SELECT 1 FROM donations WHERE hash = ?1")?
+            .exists([hash])?;
+    Ok(swap || donation)
 }
 
 /// A recorded lock id proves swap ownership. A reserved hash alone does
@@ -647,6 +664,7 @@ impl<T: Transport> Provider<T> {
             issuer: issuer.map(Arc::new),
             intake: Mutex::default(),
             lightning: None,
+            donations: None,
         }
     }
 

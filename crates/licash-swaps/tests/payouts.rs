@@ -700,7 +700,7 @@ async fn a_swaps_file_of_version_1_gains_payouts() {
     )
     .unwrap();
     let provider = Provider::open(&path, wallet, CONFIG).unwrap();
-    assert_eq!(version(&path), 4);
+    assert_eq!(version(&path), 5);
     let records = provider.records(10).unwrap();
     assert_eq!(records.len(), 1);
     assert_eq!(
@@ -718,15 +718,15 @@ async fn a_swaps_file_of_version_1_gains_payouts() {
     // A newer file is refused untouched.
     rusqlite::Connection::open(&path)
         .unwrap()
-        .pragma_update(None, "user_version", 5)
+        .pragma_update(None, "user_version", 6)
         .unwrap();
     let wallet = Wallet::open(&dir.path().join("wallet.sqlite"), Link(net)).unwrap();
     match Provider::open(&path, wallet, CONFIG) {
-        Err(licash_swaps::Error::Setup(why)) => assert!(why.contains("schema 5"), "{why}"),
+        Err(licash_swaps::Error::Setup(why)) => assert!(why.contains("schema 6"), "{why}"),
         Err(e) => panic!("{e}"),
         Ok(_) => panic!("opened"),
     }
-    assert_eq!(version(&path), 5);
+    assert_eq!(version(&path), 6);
 }
 
 #[tokio::test]
@@ -747,16 +747,19 @@ async fn a_swaps_file_of_version_2_gains_the_locks_a_hub_issues() {
     .unwrap();
     drop(Provider::open(&path, wallet, CONFIG).unwrap());
     // As a provider of version 2 left it: its swaps and payouts, no
-    // issues nor invoices.
-    db().execute_batch("DROP TABLE invoices; DROP TABLE issues; PRAGMA user_version = 2;")
-        .unwrap();
+    // issues nor invoices nor donations.
+    db().execute_batch(
+        "DROP TABLE donations; DROP TABLE invoices; DROP TABLE issues;
+         PRAGMA user_version = 2;",
+    )
+    .unwrap();
     let wallet = Wallet::open(&dir.path().join("wallet.sqlite"), Link(net)).unwrap();
     let provider = Provider::open(&path, wallet, CONFIG).unwrap();
     let version: i64 = db()
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 4);
-    for table in ["issues", "invoices"] {
+    assert_eq!(version, 5);
+    for table in ["issues", "invoices", "donations"] {
         let count: i64 = db()
             .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
             .unwrap();
@@ -787,15 +790,15 @@ async fn a_swaps_file_of_version_3_gains_invoices() {
     )
     .unwrap();
     drop(Provider::open(&path, wallet, CONFIG).unwrap());
-    // As a provider of version 3 left it: no invoices.
-    db().execute_batch("DROP TABLE invoices; PRAGMA user_version = 3;")
+    // As a provider of version 3 left it: no invoices nor donations.
+    db().execute_batch("DROP TABLE donations; DROP TABLE invoices; PRAGMA user_version = 3;")
         .unwrap();
     let wallet = Wallet::open(&dir.path().join("wallet.sqlite"), Link(net)).unwrap();
     let provider = Provider::open(&path, wallet, CONFIG).unwrap();
     let version: i64 = db()
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 4);
+    assert_eq!(version, 5);
     let invoices: i64 = db()
         .query_row("SELECT count(*) FROM invoices", [], |r| r.get(0))
         .unwrap();
@@ -808,4 +811,49 @@ async fn a_swaps_file_of_version_3_gains_invoices() {
     );
     assert_eq!(provider.open_invoices().unwrap(), 0);
     assert_eq!(provider.last_event().unwrap(), 1);
+}
+
+#[tokio::test]
+async fn a_swaps_file_of_version_4_gains_donations() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("swaps.sqlite");
+    let db = || rusqlite::Connection::open(&path).unwrap();
+    db().execute_batch(include_str!("fixtures/swaps-v1.sql"))
+        .unwrap();
+    let net = Net::new();
+    net.start_timed(A, FEE, TIMED);
+    let wallet = Wallet::create(
+        &dir.path().join("wallet.sqlite"),
+        &[0x50; 32],
+        ChainProfile::Core30DefaultRegtest,
+        Link(net.clone()),
+    )
+    .unwrap();
+    drop(Provider::open(&path, wallet, CONFIG).unwrap());
+    // As a provider of version 4 left it: its invoices, no donations.
+    db().execute_batch("DROP TABLE donations; PRAGMA user_version = 4;")
+        .unwrap();
+    // Read before it is migrated: its swap's hash reserved, no other.
+    assert!(licash_swaps::holds_hash(&path, &[0xcd; 32]).unwrap());
+    assert!(!licash_swaps::holds_hash(&path, &[0xef; 32]).unwrap());
+    let wallet = Wallet::open(&dir.path().join("wallet.sqlite"), Link(net)).unwrap();
+    let provider = Provider::open(&path, wallet, CONFIG).unwrap();
+    let version: i64 = db()
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, 5);
+    let donations: i64 = db()
+        .query_row("SELECT count(*) FROM donations", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(donations, 0);
+    // Its swap untouched, and no donation under way nor taken.
+    let records = provider.records(10).unwrap();
+    assert_eq!(
+        (records.len(), records[0].stage, records[0].amount),
+        (1, Stage::Accepted, 1000)
+    );
+    assert!(provider.donation_terms().is_none());
+    assert!(provider.follow_donations().await.unwrap().is_empty());
+    assert!(licash_swaps::holds_hash(&path, &[0xcd; 32]).unwrap());
+    assert!(!licash_swaps::holds_hash(&path, &[0xef; 32]).unwrap());
 }

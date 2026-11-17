@@ -12,7 +12,32 @@ use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior};
 use crate::Error;
 
 /// The schema this provider reads and writes, as SQLite's `user_version`.
-const VERSION: i64 = 4;
+const VERSION: i64 = 5;
+
+/// Version 5: donations taken over Lightning (`crate::donations`). Each is
+/// a held invoice of the provider's node under `hash`, whose `preimage` the
+/// provider chose, asking `sat`, recorded before the node makes it, then
+/// its `request`. Once paid, the provider pays `amount` to the wallet of
+/// the Licash code `code` under the key `hash` (`licash_wallet::Wallet::
+/// pay_code_keyed`), then settles. `state` is open, owed (settled before
+/// that payment was released, which the provider still follows), settled,
+/// canceled or lost (paid and not settled, or settled and the payment
+/// given up).
+const DONATIONS: &str = "
+CREATE TABLE donations (
+    hash BLOB PRIMARY KEY,
+    preimage BLOB NOT NULL,
+    code TEXT NOT NULL,
+    sat INTEGER NOT NULL,
+    amount INTEGER NOT NULL,
+    request TEXT,
+    state TEXT NOT NULL,
+    reason TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+) STRICT;
+CREATE INDEX donations_state ON donations (state);
+";
 
 /// Version 4: Lightning invoices paid. A swap of kind `lightning` pays an
 /// invoice from the provider's node: its `to_url` is
@@ -137,6 +162,7 @@ impl Store {
             tx.execute_batch(PAYOUTS)?;
             tx.execute_batch(ISSUES)?;
             tx.execute_batch(INVOICES)?;
+            tx.execute_batch(DONATIONS)?;
             tx.pragma_update(None, "user_version", VERSION)?;
             tx.execute(
                 "INSERT INTO meta (one, nostr, created_at) VALUES (1, ?1, ?2)",
@@ -158,14 +184,17 @@ impl Store {
             let version: i64 = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
             match version {
                 VERSION => {}
-                1..=3 => {
+                1..=4 => {
                     if version < 2 {
                         tx.execute_batch(PAYOUTS)?;
                     }
                     if version < 3 {
                         tx.execute_batch(ISSUES)?;
                     }
-                    tx.execute_batch(INVOICES)?;
+                    if version < 4 {
+                        tx.execute_batch(INVOICES)?;
+                    }
+                    tx.execute_batch(DONATIONS)?;
                     tx.pragma_update(None, "user_version", VERSION)?;
                     tracing::info!("swaps file migrated to schema {VERSION}");
                 }

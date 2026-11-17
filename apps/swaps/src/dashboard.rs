@@ -17,9 +17,10 @@ use anyhow::{bail, Context as _, Result};
 use licash_dashboard::{Probe, Report, Series, Unit};
 use rusqlite::{Connection, OpenFlags};
 
-/// The newest schemas read, as each file's `user_version`. Swaps version 4
-/// only adds the invoices paid, which the dashboard does not read.
-const SWAPS_VERSION: i64 = 4;
+/// The newest schemas read, as each file's `user_version`. Swaps versions
+/// 4 and 5 only add the invoices paid and the donations taken, which the
+/// dashboard does not read.
+const SWAPS_VERSION: i64 = 5;
 /// Versions 8 to 11 only add payment deliveries, the notes' unlink time,
 /// the providers paying invoices and payment keys, which the dashboard
 /// does not read.
