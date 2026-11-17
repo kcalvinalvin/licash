@@ -96,7 +96,7 @@ impl Fake {
     /// `cltv`, whose payment ends as `outcome`.
     pub fn invoice(&self, msat: u64, hash: [u8; 32], cltv: u64, outcome: Outcome) -> String {
         self.state().outcomes.insert(hash, outcome);
-        bolt11(&self.payee, msat, hash, cltv, 3600)
+        bolt11(&self.payee, msat, hash, cltv, 3600, None)
     }
 
     /// The payment under way of `hash` ends as `outcome`.
@@ -178,10 +178,21 @@ fn since_epoch() -> Duration {
 }
 
 /// A regtest invoice by `key`.
-fn bolt11(key: &SecretKey, msat: u64, hash: [u8; 32], cltv: u64, expiry: u64) -> String {
+fn bolt11(
+    key: &SecretKey,
+    msat: u64,
+    hash: [u8; 32],
+    cltv: u64,
+    expiry: u64,
+    description: Option<[u8; 32]>,
+) -> String {
     let secp = Secp256k1::new();
-    InvoiceBuilder::new(Currency::Regtest)
-        .description(String::new())
+    let builder = InvoiceBuilder::new(Currency::Regtest);
+    let builder = match description {
+        Some(d) => builder.description_hash(sha256::Hash::from_byte_array(d)),
+        None => builder.description(String::new()),
+    };
+    builder
         .payment_hash(sha256::Hash::from_byte_array(hash))
         .payment_secret(PaymentSecret([42; 32]))
         .duration_since_epoch(since_epoch())
@@ -250,12 +261,26 @@ impl Node for Fake {
         Box::pin(async move { attempt })
     }
 
-    fn hold(&self, hash: [u8; 32], msat: u64, cltv_expiry: u32, expiry: u64) -> Call<'_, String> {
+    fn hold(
+        &self,
+        hash: [u8; 32],
+        msat: u64,
+        cltv_expiry: u32,
+        expiry: u64,
+        description: Option<[u8; 32]>,
+    ) -> Call<'_, String> {
         let held = self.up().and_then(|mut state| {
             if state.held.contains_key(&hash) {
                 return Err("invoice with payment hash already exists".into());
             }
-            let request = bolt11(&self.key, msat, hash, cltv_expiry.into(), expiry);
+            let request = bolt11(
+                &self.key,
+                msat,
+                hash,
+                cltv_expiry.into(),
+                expiry,
+                description,
+            );
             let held = Held {
                 state: HeldState::Open,
                 request: request.clone(),

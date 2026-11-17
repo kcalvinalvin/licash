@@ -264,14 +264,24 @@ impl Node for Lnd {
         })
     }
 
-    fn hold(&self, hash: [u8; 32], msat: u64, cltv_expiry: u32, expiry: u64) -> Call<'_, String> {
+    fn hold(
+        &self,
+        hash: [u8; 32],
+        msat: u64,
+        cltv_expiry: u32,
+        expiry: u64,
+        description: Option<[u8; 32]>,
+    ) -> Call<'_, String> {
         Box::pin(async move {
-            let body = json!({
+            let mut body = json!({
                 "hash": STANDARD.encode(hash),
                 "value_msat": msat.to_string(),
                 "cltv_expiry": cltv_expiry.to_string(),
                 "expiry": expiry.to_string(),
             });
+            if let Some(description) = description {
+                body["description_hash"] = STANDARD.encode(description).into();
+            }
             let invoice = self.post("/v2/invoices/hodl", body).await?;
             text(&invoice, "payment_request")
         })

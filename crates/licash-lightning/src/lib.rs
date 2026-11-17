@@ -84,8 +84,16 @@ pub trait Node: Send + Sync {
     fn payment(&self, hash: [u8; 32]) -> Call<'_, Option<Attempt>>;
     /// A held invoice of `msat` under `hash`, whose last HTLC expires at
     /// least `cltv_expiry` blocks after it arrives, payable for `expiry`
-    /// seconds: its request.
-    fn hold(&self, hash: [u8; 32], msat: u64, cltv_expiry: u32, expiry: u64) -> Call<'_, String>;
+    /// seconds, committing to the description of hash `description` if
+    /// given (as LNURL-pay asks): its request.
+    fn hold(
+        &self,
+        hash: [u8; 32],
+        msat: u64,
+        cltv_expiry: u32,
+        expiry: u64,
+        description: Option<[u8; 32]>,
+    ) -> Call<'_, String>;
     fn invoice(&self, hash: [u8; 32]) -> Call<'_, Option<Held>>;
     fn settle(&self, preimage: [u8; 32]) -> Call<'_, ()>;
     fn cancel(&self, hash: [u8; 32]) -> Call<'_, ()>;

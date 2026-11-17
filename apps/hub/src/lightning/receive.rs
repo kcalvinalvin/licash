@@ -274,7 +274,7 @@ impl Gateway {
         let cltv = c.receive_cltv(self.hub.info().policy.timing.min_depth);
         let held = self
             .node
-            .hold(hash, receipt.msat, cltv, c.invoice_expiry)
+            .hold(hash, receipt.msat, cltv, c.invoice_expiry, None)
             .await;
         let request = match held {
             Ok(request) => request,

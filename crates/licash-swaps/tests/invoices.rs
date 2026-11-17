@@ -403,7 +403,7 @@ async fn invoices_the_provider_does_not_pay_for_a_lock_are_declined() {
         .unwrap_err();
     declined(problem, "most");
     let hash = lock_hash(&[8; 32]);
-    let own = eco.node.hold(hash, 100_000, 40, 3600).await.unwrap();
+    let own = eco.node.hold(hash, 100_000, 40, 3600, None).await.unwrap();
     let pays = terms(&eco.node).pays(100_000);
     let lock = eco
         .client
