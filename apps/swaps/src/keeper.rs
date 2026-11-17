@@ -4,8 +4,9 @@
 //! replaced is drained, and one is forced closed at its safe deadline if
 //! the others at its hub cannot recover all the notes held there. The
 //! first contract at a hub is its operator's to open (`licash-wallet
-//! open-contract`): until then, the provider takes none of that hub's
-//! notes in.
+//! open-contract`), or the keeper's where its operator said of what cap
+//! ([`Settings::open_cap`]): until then, the provider takes none of that
+//! hub's notes in.
 //!
 //! What it decides is [`plan`], of what it reads ([`Hub`], [`Kept`]);
 //! [`Keeper`] reads, applies the plan and alerts the operator.
@@ -269,8 +270,13 @@ pub struct Settings {
     /// Blocks from a contract's successor opening to its `claim_at`.
     pub successor_lead: u32,
     /// The most a successor costs, if not its predecessor's price and a
-    /// quarter.
+    /// quarter: the most a contract the keeper opens first costs.
     pub max_price: Option<u64>,
+    /// With [`Settings::max_price`], the cap of a contract the keeper
+    /// opens at each kept hub where none protects notes nor is being
+    /// opened: the first, or one after all ended. None leaves those to
+    /// the operator.
+    pub open_cap: Option<u32>,
     /// The provider to pay out to Bitcoin through what a contract that
     /// failed to be replaced leaves unprotected: none drains passively
     /// only, taking nothing more in.
@@ -303,6 +309,7 @@ impl Settings {
             day,
             successor_lead: successor_days.saturating_mul(day),
             max_price: None,
+            open_cap: None,
             drain_via: None,
             scan: false,
             open_hint,
@@ -342,11 +349,30 @@ impl Running {
     }
 }
 
-/// A replacement that failed.
+/// A replacement, or a first contract, that failed to open.
 struct Failure {
     attempts: u32,
     retry_at: Instant,
     error: String,
+}
+
+impl Failure {
+    fn new() -> Self {
+        Self {
+            attempts: 0,
+            retry_at: Instant::now(),
+            error: String::new(),
+        }
+    }
+
+    /// Failed once more, with `error`: tried again later, the wait
+    /// doubled each time up to [`MAX_RETRY`].
+    fn again(&mut self, error: String) {
+        self.attempts += 1;
+        let wait = RETRY.saturating_mul(1 << self.attempts.min(16).saturating_sub(1));
+        self.retry_at = Instant::now() + wait.min(MAX_RETRY);
+        self.error = error;
+    }
 }
 
 /// The keeper of a provider's contracts, in `dir`, beside its wallet.
@@ -359,6 +385,8 @@ pub struct Keeper<T: Transport> {
     /// terms never change.
     request_by: HashMap<[u8; 32], Option<u32>>,
     failures: HashMap<[u8; 32], Failure>,
+    /// The first contracts that failed to open, by hub.
+    first_failures: HashMap<String, Failure>,
     /// The alerts told of, by key, while they hold: those of a round's
     /// start, and of its end, after its openings.
     told: HashSet<String>,
@@ -380,6 +408,7 @@ impl<T: Transport + 'static> Keeper<T> {
             settings,
             request_by: HashMap::new(),
             failures: HashMap::new(),
+            first_failures: HashMap::new(),
             told: HashSet::new(),
             told_late: HashSet::new(),
             answered: HashMap::new(),
@@ -516,12 +545,22 @@ impl<T: Transport + 'static> Keeper<T> {
         for successor in &plan.successors {
             self.replace(successor, &mut alerts).await;
         }
+        self.open_firsts(&plan, &mut alerts).await;
         for (id, failure) in &self.failures {
             let hex = licash_contracts::hex_id(id);
             alerts.push((
                 format!("replace {hex}"),
                 format!(
                     "could not replace contract {hex} ({} tries): {}; its hub is drained",
+                    failure.attempts, failure.error
+                ),
+            ));
+        }
+        for (hub, failure) in &self.first_failures {
+            alerts.push((
+                format!("open at {hub}"),
+                format!(
+                    "could not open a contract at hub {hub} ({} tries): {}",
                     failure.attempts, failure.error
                 ),
             ));
@@ -645,6 +684,10 @@ impl<T: Transport + 'static> Keeper<T> {
     /// The operator's words for `alert`.
     fn say(&self, alert: &Alert) -> String {
         match alert {
+            Alert::NoContract { hub } if self.settings.open_cap.is_some() => format!(
+                "no contract protects the notes at hub {hub}: none are taken in there until \
+                 the one the keeper opens is"
+            ),
             Alert::NoContract { hub } => format!(
                 "no contract protects the notes at hub {hub}: none are taken in there until \
                  one is opened, with `{}`",
@@ -764,38 +807,75 @@ impl<T: Transport + 'static> Keeper<T> {
         Ok(())
     }
 
+    /// Open a contract at each hub the plan says none protects notes at,
+    /// where the operator said of what cap ([`Settings::open_cap`]): a
+    /// failure kept to try again later.
+    async fn open_firsts(&mut self, plan: &Plan, alerts: &mut Vec<(String, String)>) {
+        let (Some(cap), Some(max_price)) = (self.settings.open_cap, self.settings.max_price) else {
+            return;
+        };
+        let none: Vec<&String> = (plan.alerts.iter())
+            .filter_map(|a| match a {
+                Alert::NoContract { hub } => Some(hub),
+                Alert::Unprotected { .. } => None,
+            })
+            .collect();
+        self.first_failures.retain(|hub, _| none.contains(&hub));
+        let now = Instant::now();
+        for hub in none {
+            if (self.first_failures.get(hub)).is_some_and(|f| f.retry_at > now) {
+                continue;
+            }
+            match self.open(hub, cap, max_price).await {
+                Ok(new) => {
+                    self.first_failures.remove(hub);
+                    alerts.push((
+                        format!("opened at {hub}"),
+                        format!(
+                            "opening contract {} at hub {hub}, none protecting notes there: {} sat \
+                             for {} sat protected",
+                            licash_contracts::hex_id(&new.id),
+                            new.price,
+                            new.cap
+                        ),
+                    ));
+                }
+                Err(e) => {
+                    tracing::warn!(%hub, "opening a contract: {e:#}");
+                    let failure = self.first_failures.entry(hub.clone());
+                    failure.or_insert_with(Failure::new).again(format!("{e:#}"));
+                }
+            }
+        }
+    }
+
+    /// Open a contract at `hub` of `cap`, of the longest term it offers,
+    /// costing `max_price` at most, from a coin of the wallet's own.
+    async fn open(&self, hub: &str, cap: u32, max_price: u64) -> Result<Contract> {
+        let wallet = self.provider.wallet();
+        let hubs = wallet.hubs()?;
+        let (_, info) = (hubs.iter())
+            .find(|(url, _)| url == hub)
+            .ok_or_else(|| anyhow!("the wallet no longer trusts {hub}"))?;
+        let offered = (info.contracts).ok_or_else(|| anyhow!("{hub} opens no contracts now"))?;
+        let (blocks, cap) = match offered.range {
+            Some(range) => (range.max_blocks, Some(cap)),
+            None => (offered.blocks, None),
+        };
+        let ask = Ask {
+            blocks,
+            max_price,
+            cap,
+            deposit: None,
+        };
+        holder::open_with(wallet, &self.chain, &self.dir, hub, ask, Change::Bitcoin).await
+    }
+
     /// Open `successor`, of the longest term its hub offers: a failure
     /// kept to try again later.
     async fn replace(&mut self, successor: &Successor, alerts: &mut Vec<(String, String)>) {
-        let wallet = self.provider.wallet();
         let hex = licash_contracts::hex_id(&successor.replaces);
-        let opened = async {
-            let hubs = wallet.hubs()?;
-            let (_, info) = (hubs.iter())
-                .find(|(url, _)| *url == successor.hub)
-                .ok_or_else(|| anyhow!("the wallet no longer trusts {}", successor.hub))?;
-            let offered = (info.contracts)
-                .ok_or_else(|| anyhow!("{} opens no contracts now", successor.hub))?;
-            let (blocks, cap) = match offered.range {
-                Some(range) => (range.max_blocks, Some(successor.cap)),
-                None => (offered.blocks, None),
-            };
-            let ask = Ask {
-                blocks,
-                max_price: successor.max_price,
-                cap,
-                deposit: None,
-            };
-            holder::open_with(
-                wallet,
-                &self.chain,
-                &self.dir,
-                &successor.hub,
-                ask,
-                Change::Bitcoin,
-            )
-            .await
-        };
+        let opened = self.open(&successor.hub, successor.cap, successor.max_price);
         match opened.await {
             Ok(new) => {
                 self.failures.remove(&successor.replaces);
@@ -812,15 +892,8 @@ impl<T: Transport + 'static> Keeper<T> {
                 ));
             }
             Err(e) => {
-                let failure = self.failures.entry(successor.replaces).or_insert(Failure {
-                    attempts: 0,
-                    retry_at: Instant::now(),
-                    error: String::new(),
-                });
-                failure.attempts += 1;
-                let wait = RETRY.saturating_mul(1 << failure.attempts.min(16).saturating_sub(1));
-                failure.retry_at = Instant::now() + wait.min(MAX_RETRY);
-                failure.error = format!("{e:#}");
+                let failure = self.failures.entry(successor.replaces);
+                failure.or_insert_with(Failure::new).again(format!("{e:#}"));
                 tracing::warn!(contract = %hex, hub = %successor.hub, "replacing a contract: {e:#}");
             }
         }

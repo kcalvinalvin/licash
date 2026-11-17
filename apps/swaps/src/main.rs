@@ -205,9 +205,21 @@ struct ContractArgs {
     #[arg(long, env = "LICASH_SWAPS_CONTRACT_PROOF_DAYS", default_value_t = 14)]
     contract_proof_days: u32,
     /// The most a successor costs, in sat [default: what the contract it
-    /// replaces cost, and a quarter].
+    /// replaces cost, and a quarter]: the most one --contract-open-cap
+    /// opens costs.
     #[arg(long, env = "LICASH_SWAPS_CONTRACT_MAX_PRICE")]
     contract_max_price: Option<u64>,
+    /// Open a contract of up to SAT protected at each hub where none
+    /// protects the provider's notes nor is being opened (the first, or
+    /// after all ended), costing --contract-max-price at most [default:
+    /// its operator opens those].
+    #[arg(
+        long,
+        value_name = "SAT",
+        env = "LICASH_SWAPS_CONTRACT_OPEN_CAP",
+        requires = "contract_max_price"
+    )]
+    contract_open_cap: Option<u32>,
     /// Pay out to the provider's own address on Bitcoin, through the swap
     /// provider at URL, what a contract that could not be replaced leaves
     /// unprotected [default: only take no more in there].
@@ -252,6 +264,7 @@ impl ContractArgs {
         );
         let settings = keeper::Settings {
             max_price: self.contract_max_price,
+            open_cap: self.contract_open_cap,
             drain_via: self.drain_via.clone(),
             ..settings
         };

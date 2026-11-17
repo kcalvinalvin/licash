@@ -1275,6 +1275,78 @@ async fn a_wallet_sweeps_its_coin_into_a_contract_and_notes_its_change_on_bitcoi
     ensure!(scan(&wallet, &chain).await? == 2_977_000);
     Ok(())
 }
+
+/// A provider's keeper told of what cap opens the first contract at a hub
+/// itself, once: its notes there taken in once it is live.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs bitcoind and a release build"]
+async fn a_providers_keeper_opens_the_first_contract_at_a_hub_where_told_to() -> Result<()> {
+    use std::collections::HashMap;
+
+    use licash_swaps::{Config as SwapsConfig, Provider};
+    use licash_swaps_service::keeper::{Alert, Keeper, Settings};
+
+    let rt = Regtest::start_standard()?;
+    let dir = tempfile::tempdir()?;
+    let at = dir.path().join("hub");
+    let (url, source, _hub) = hub_serving(&rt, &at, None).await?;
+    let mine = dir.path().join("provider");
+    std::fs::create_dir(&mine)?;
+    let regtest = ChainProfile::Core30DefaultRegtest;
+    let wallet = Wallet::create(
+        &mine.join("wallet.sqlite"),
+        &[12; 32],
+        regtest,
+        Http::new(None)?,
+    )?;
+    wallet.add_hub(&url).await?;
+    wallet.watch_silent(None, rt.height()?)?;
+    let to = wallet.fallback_address()?.script_pubkey();
+    rt.fund(&to, Amount::from_sat(60_000))?;
+    rt.mine(1)?;
+    let swaps = mine.join("swaps.sqlite");
+    let provider = Arc::new(Provider::create(&swaps, wallet, SwapsConfig::default())?);
+    let settings = Settings {
+        max_price: Some(30_000),
+        open_cap: Some(4_096),
+        scan: true,
+        ..Settings::new(regtest, 0, 0, "open-contract {hub}".into())
+    };
+    let mut keeper = Keeper::new(provider.clone(), Node(source), mine.clone(), settings);
+    let limited = |most: u64| Some(HashMap::from([(url.clone(), most)]));
+
+    // None at the hub: it opens one, taking nothing in meanwhile.
+    let plan = keeper.round().await?;
+    ensure!(
+        plan.alerts == [Alert::NoContract { hub: url.clone() }],
+        "{plan:?}"
+    );
+    ensure!(provider.intake() == limited(0));
+    let events = provider.events(0, 1_000)?;
+    ensure!(
+        (events.iter())
+            .any(|e| e.kind == "alert" && e.data.to_string().contains("opening contract")),
+        "{events:?}"
+    );
+    let opened = holder::list(&mine)?;
+    ensure!(opened.len() == 1 && opened[0].hub == url, "{opened:?}");
+    ensure!(opened[0].cap == 4_096 && opened[0].price <= 30_000);
+
+    // Once: being opened, then live, its cap taken in.
+    let plan = keeper.round().await?;
+    ensure!(plan.alerts.is_empty(), "{plan:?}");
+    rt.mine(1)?;
+    keeper.round().await?;
+    keeper.round().await?;
+    ensure!(holder::list(&mine)?.len() == 1);
+    ensure!(
+        provider.intake() == limited(4_096),
+        "{:?}",
+        provider.intake()
+    );
+    Ok(())
+}
+
 /// A provider's keeper, a round at a time: what the provider takes in at
 /// the hub held to its contracts there, the one ending replaced in time,
 /// and forced closed at its safe deadline only once its successor cannot

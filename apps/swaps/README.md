@@ -123,7 +123,11 @@ the chain of `--chain`, a round a minute:
 
 The first contract at each hub is the operator's to open, with
 `licash-wallet --wallet <data>/wallet.sqlite open-contract HUB --chain URL`:
-until one is, the provider takes none of that hub's notes in. Alerts name
+until one is, the provider takes none of that hub's notes in. With
+`--contract-open-cap SAT` (and `--contract-max-price`), the keeper opens it
+itself, of up to SAT protected, from the provider's coins on Bitcoin, and
+again at a hub where all its contracts ended; a failure is retried after
+growing waits, and alerted. Alerts name
 the hubs without contracts, notes beyond what is protected, recoveries
 whose collateral was lost, hubs silent for
 an hour, and fees raised beyond what the contracts agreed to
