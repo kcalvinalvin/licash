@@ -53,6 +53,10 @@ pub(super) struct Watch {
     spends: Mutex<HashMap<OutPoint, (u32, Spend)>>,
     proving: Arc<Mutex<HashSet<[u8; 32]>>>,
     noted: Mutex<HashSet<([u8; 32], &'static str)>>,
+    /// A dishonest hub's, for tests: it asserts proofs of another
+    /// statement ([`Openings::assert_false_proofs`]).
+    #[cfg(feature = "faults")]
+    false_proofs: std::sync::atomic::AtomicBool,
 }
 
 /// What a poll of one opening did.
@@ -136,6 +140,15 @@ impl Openings {
                     .await
             }
         }
+    }
+
+    /// Assert proofs of another statement from now on, as a dishonest hub
+    /// would: for tests of the holder's challenge.
+    #[cfg(feature = "faults")]
+    pub fn assert_false_proofs(&self) {
+        self.watch
+            .false_proofs
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Her contract stands: past its close, the default, with a fee coin,
@@ -380,8 +393,22 @@ impl Openings {
                 None => return Ok(Played::Idle),
             }
         };
+        #[cfg(feature = "faults")]
+        let (proof, dishonest) = match self
+            .watch
+            .false_proofs
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            true => (
+                lichen_babe::statement::mock_prove(b"another statement"),
+                true,
+            ),
+            false => (proof, false),
+        };
+        #[cfg(not(feature = "faults"))]
+        let dishonest = false;
         ensure!(
-            kind.verify(&journal, &proof),
+            dishonest || kind.verify(&journal, &proof),
             "the proof does not verify for this contract"
         );
         let tag = tagged(id, b"assert");

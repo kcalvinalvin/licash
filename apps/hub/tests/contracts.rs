@@ -831,16 +831,21 @@ async fn a_holder_recovers_her_cap_of_notes_beyond_it_from_a_hub_that_answered()
     Ok(())
 }
 
-/// A stale claim: she restores a copy of her wallet made before she paid
-/// a note away and forces her contract closed on it. The hub meets the
-/// claim with the spend it released, discloses that spend's unlock,
-/// responds what is left, proves it and asserts; her payout is that.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs bitcoind and a release build"]
-async fn a_hub_meets_a_stale_claim_with_the_spend_it_released_and_pays_what_is_left() -> Result<()>
-{
-    use bitcoin::FeeRate;
-    use licash_contracts::holder::recovery::{self, Stage};
+/// A stale claim requested at a hub that answers: she restores a copy of
+/// her wallet made before she paid a note away and forces her contract
+/// closed on it, claiming her cap of 5 000 sat in three notes of 2 048.
+struct Stale {
+    rt: Regtest,
+    _dir: tempfile::TempDir,
+    openings: Arc<Openings>,
+    chain: Node,
+    wallet: Wallet<Http>,
+    mine: std::path::PathBuf,
+    rate: bitcoin::FeeRate,
+}
+
+async fn stale_claim(seed: [u8; 32]) -> Result<Stale> {
+    use licash_contracts::holder::recovery;
 
     let rt = Regtest::start_standard()?;
     let dir = tempfile::tempdir()?;
@@ -854,13 +859,13 @@ async fn a_hub_meets_a_stale_claim_with_the_spend_it_released_and_pays_what_is_l
     let (url, source, hub, openings) = hub_answering_with(&rt, &at, Some(range)).await?;
     let chain = Node(source);
     let (mine, wallet) =
-        holder_wallet(&rt, &chain, dir.path(), &url, [11; 32], &[60_000, 50_000]).await?;
+        holder_wallet(&rt, &chain, dir.path(), &url, seed, &[60_000, 50_000]).await?;
     let chosen = Ask {
         cap: Some(5_000),
         ..ask()
     };
     let opened = holder::open(&wallet, &chain, &mine, &url, chosen).await?;
-    let rate = FeeRate::from_sat_per_vb(2).context("a rate")?;
+    let rate = bitcoin::FeeRate::from_sat_per_vb(2).context("a rate")?;
     for _ in 0..3 {
         let payment = pay(&hub, &at.join("seed"), &url, &wallet.address(), 2_048)?;
         wallet.receive(&payment)?;
@@ -888,36 +893,105 @@ async fn a_hub_meets_a_stale_claim_with_the_spend_it_released_and_pays_what_is_l
     rt.mine_to_height(forced.next_at.context("no lock")? - 1)?;
     recovery::advance(&wallet, &chain, &mine, rate).await?;
     rt.mine(1)?;
+    Ok(Stale {
+        rt,
+        _dir: dir,
+        openings,
+        chain,
+        wallet,
+        mine,
+        rate,
+    })
+}
 
-    // The hub responds what the spend it released leaves her, with its
-    // unlock disclosed, then asserts.
-    let mut now = None;
-    for _ in 0..600 {
-        rt.mine(1)?;
-        let round = openings.answer_requests().await?;
-        ensure!(round.failed == 0, "{round:?}");
-        let all = recovery::advance(&wallet, &chain, &mine, rate).await?;
-        let r = all[0].clone();
-        ensure!(
-            !matches!(r.stage, Stage::Lost | Stage::TimingOut | Stage::TimedOut),
+/// The hub's answers to a stale claim and hers, a block at a time while
+/// `hub` says the hub plays, until her recovery is done: it.
+async fn played(
+    s: &Stale,
+    mut hub: impl FnMut(&licash_contracts::holder::recovery::Recovery) -> bool,
+) -> Result<licash_contracts::holder::recovery::Recovery> {
+    use licash_contracts::holder::recovery::{self, Stage};
+
+    let mut last = None;
+    for _ in 0..800 {
+        s.rt.mine(1)?;
+        if last.as_ref().is_none_or(&mut hub) {
+            let round = s.openings.answer_requests().await?;
+            ensure!(round.failed == 0, "{round:?}");
+        }
+        let r = recovery::advance(&s.wallet, &s.chain, &s.mine, s.rate).await?[0].clone();
+        ensure!(r.stage != Stage::Lost, "{r:?}");
+        if r.stage == Stage::Done {
+            return Ok(r);
+        }
+        last = Some(r);
+    }
+    anyhow::bail!("never paid: {last:?}")
+}
+
+/// The hub meets the stale claim with the spend it released, discloses
+/// that spend's unlock, responds what is left, proves it and asserts; her
+/// payout is that.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs bitcoind and a release build"]
+async fn a_hub_meets_a_stale_claim_with_the_spend_it_released_and_pays_what_is_left() -> Result<()>
+{
+    use licash_contracts::holder::recovery::Stage;
+
+    let s = stale_claim([11; 32]).await?;
+    let done = played(&s, |r| {
+        assert!(
+            !matches!(r.stage, Stage::TimingOut | Stage::TimedOut),
             "{r:?}"
         );
-        if matches!(r.stage, Stage::Done) {
-            now = Some(r);
-            break;
-        }
-    }
-    let done = now.context("never paid")?;
+        true
+    })
+    .await?;
     let x = done.response.context("no response")?;
-    ensure!(rt.confirmations(&x)?.is_some(), "{done:?}");
+    ensure!(s.rt.confirmations(&x)?.is_some(), "{done:?}");
     // Its disclose slot spent: the unlock published.
-    ensure!(!rt.is_unspent(&bitcoin::OutPoint { txid: x, vout: 2 })?);
+    ensure!(!s.rt.is_unspent(&bitcoin::OutPoint { txid: x, vout: 2 })?);
     // Her notes less the one paid away: two of 2 048.
     let corrected = done.corrected.context("no response")?;
     ensure!(corrected == 4_096, "{done:?}");
     ensure!(done.payout.is_some() && done.timeout.is_none(), "{done:?}");
     let received = done.received.context("nothing received")?;
     eprintln!("a stale claim of 5000 paid {corrected}, {received} swept to her wallet");
+    Ok(())
+}
+
+/// The hub responds to the stale claim and stops: its assertion window
+/// passes, and her response timeout pays her all she claimed.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs bitcoind and a release build"]
+async fn a_hub_that_responds_and_never_asserts_pays_her_whole_claim() -> Result<()> {
+    let s = stale_claim([12; 32]).await?;
+    // The hub plays until she sees its response, then no more.
+    let done = played(&s, |r| r.response.is_none()).await?;
+    ensure!(done.assertion.is_none(), "{done:?}");
+    ensure!(done.corrected == Some(4_096), "{done:?}");
+    ensure!(done.timeout.is_some(), "not her timeout: {done:?}");
+    let received = done.received.context("nothing received")?;
+    ensure!(received > 5_000, "{received} of a claim of 5000: {done:?}");
+    Ok(())
+}
+
+/// A dishonest hub asserts a proof of another statement: she challenges
+/// it, no kept instance answers, and the assertion's failure pays her all
+/// she claimed.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs bitcoind and a release build"]
+async fn a_holder_challenges_a_false_assertion_and_its_failure_pays_her_whole_claim() -> Result<()>
+{
+    let s = stale_claim([13; 32]).await?;
+    s.openings.assert_false_proofs();
+    let done = played(&s, |_| true).await?;
+    ensure!(done.assertion.is_some() && !done.proved, "{done:?}");
+    ensure!(done.challenge.is_some(), "not challenged: {done:?}");
+    // Paid by `failure`, a timed payout of her claim and the hub's reserve.
+    ensure!(done.payout.is_some() && done.timeout == done.payout, "{done:?}");
+    let received = done.received.context("nothing received")?;
+    ensure!(received > 5_000, "{received} of a claim of 5000: {done:?}");
     Ok(())
 }
 

@@ -34,6 +34,8 @@ tracing.workspace = true
 # The hub's side, and a node or an Esplora API as the holder's chain.
 default = ["node"]
 node = ["dep:axum", "dep:licash-chain-client", "dep:sha2"]
+# A dishonest hub's behaviors, for tests.
+faults = ["node"]
 
 [dev-dependencies]
 k256 = "0.13"
