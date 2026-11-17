@@ -27,6 +27,7 @@ use tracing_subscriber::EnvFilter;
 mod contract;
 mod onchain;
 mod payout;
+mod qr;
 mod say;
 
 /// The exit status of a payment recorded but not finished: retry later.
@@ -88,7 +89,11 @@ enum Command {
         network: ChainProfile,
     },
     /// Where others pay this wallet.
-    Address,
+    Address {
+        /// Also draw it as a QR code, on a terminal.
+        #[arg(long)]
+        qr: bool,
+    },
     /// A payment code to show as text or a QR code: payers pay it in notes
     /// at a hub it names that they trust, else on Bitcoin to its silent
     /// payment address, if it has one.
@@ -101,7 +106,8 @@ enum Command {
         /// for payers to pay on Bitcoin: `onchain scan` finds what they pay.
         #[arg(long)]
         sp: bool,
-        /// In upper case, which a QR code holds in fewer modules.
+        /// In upper case, which a QR code holds in fewer modules, and drawn
+        /// as one on a terminal.
         #[arg(long)]
         qr: bool,
     },
@@ -257,6 +263,9 @@ enum Command {
         /// Through this hub [default: the only one trusted].
         #[arg(long)]
         hub: Option<String>,
+        /// Also draw it as a QR code, on a terminal.
+        #[arg(long)]
+        qr: bool,
     },
     /// The Lightning invoices asked for, newest first.
     Invoices,
@@ -269,6 +278,9 @@ enum Command {
         /// At this hub [default: the only one trusted].
         #[arg(long)]
         hub: Option<String>,
+        /// Also draw the URI as a QR code, on a terminal.
+        #[arg(long)]
+        qr: bool,
     },
     /// The deposits asked for, newest first.
     Deposits,
@@ -592,8 +604,9 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     contract::agree(&wallet, &path);
     match cli.command {
         Command::Init { .. } | Command::Discover { .. } => unreachable!("handled above"),
-        Command::Address => {
+        Command::Address { qr } => {
             let address = encode(&wallet.address());
+            show_qr(qr && !json, &address);
             show(json, json!({ "address": address }), address.clone());
         }
         Command::Code { hub, sp, qr } => {
@@ -616,6 +629,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                     "warning: none of its hubs names mailbox relays: payments they do not keep are handed over"
                 );
             }
+            show_qr(qr && !json, &text);
             show(
                 json,
                 json!({ "code": text, "hubs": hubs, "mailbox": mailbox, "sp": sp }),
@@ -956,7 +970,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             };
             return pay_invoice(&wallet, lock, wait, json).await;
         }
-        Command::Invoice { amount, hub } => {
+        Command::Invoice { amount, hub, qr } => {
             let hub = match hub {
                 Some(hub) => hub,
                 None => only_hub(&wallet)?,
@@ -964,6 +978,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             let invoice = wallet.invoice(&hub, amount).await?;
             eprintln!("invoice {}", invoice.hash);
             let request = invoice.request.clone().unwrap_or_default();
+            show_qr(qr && !json && !request.is_empty(), &request);
             show(json, invoice_json(&invoice), request);
         }
         Command::Invoices => {
@@ -975,7 +990,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 lines.join("\n"),
             );
         }
-        Command::Deposit { amount, hub } => {
+        Command::Deposit { amount, hub, qr } => {
             let hub = match hub {
                 Some(hub) => hub,
                 None => only_hub(&wallet)?,
@@ -998,6 +1013,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                     )
                 }
             };
+            show_qr(qr && !json, &text);
             show(json, deposit_json(&deposit), text);
         }
         Command::Deposits => {
@@ -2075,6 +2091,18 @@ fn show(json: bool, value: serde_json::Value, text: String) {
         println!("{value}");
     } else if !text.is_empty() {
         println!("{}", say::terminal(&text));
+    }
+}
+
+/// Draw `text` as a QR code above it, if `wanted` and stdout is a terminal:
+/// scripts reading stdout get the text alone, as without `--qr`.
+fn show_qr(wanted: bool, text: &str) {
+    if !wanted || !std::io::stdout().is_terminal() {
+        return;
+    }
+    match qr::draw(text) {
+        Ok(drawing) => print!("{drawing}"),
+        Err(e) => eprintln!("warning: {e}"),
     }
 }
 

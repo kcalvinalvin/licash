@@ -3705,6 +3705,7 @@ dependencies = [
  "bitcoin",
  "clap",
  "hex",
+ "libc",
  "licash",
  "licash-api",
  "licash-chain-client",
@@ -3719,7 +3720,9 @@ dependencies = [
  "licash-transport",
  "licash-wallet",
  "nostr-sdk",
+ "qrcode",
  "rand_core 0.6.4",
+ "rqrr",
  "rusqlite",
  "serde",
  "serde_json",
@@ -4679,6 +4682,12 @@ dependencies = [
  "paste",
  "thiserror 2.0.21",
 ]
+
+[[package]]
+name = "qrcode"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d68782463e408eb1e668cf6152704bd856c78c5b6417adaee3203d8f4c1fc9ec"
 
 [[package]]
 name = "quote"

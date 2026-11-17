@@ -14,6 +14,12 @@ licash-wallet resume                      # after a payment ended pending
 A wallet trusts hubs of one network, `bitcoin` unless `init --network`
 names `regtest`, `signet` or `mutinynet`.
 
+`address`, `code`, `invoice` and `deposit` take `--qr` to also draw what
+they print as a QR code, black on white, for a payer's phone to scan off
+the screen. It is drawn only when stdout is a terminal and without `--json`:
+a script reading stdout gets the same text as without `--qr`. `code --qr`
+prints the code in upper case too, which the QR code holds in fewer modules.
+
 A payment is JSON that only its payee can open: hand it over by any
 channel. `send` and `resume` exit with 75 when a payment is recorded but its
 hub has not answered; `resume` finishes it. Back up the wallet file: its
@@ -58,7 +64,7 @@ A wallet file is upgraded to version 8 when first opened by this version,
 which older versions refuse: notes unlinked before begin their rest then,
 and nothing is reminted or asked of a hub by the upgrade itself.
 
-`code` prints a payment code (a BIP321 URI, `--qr` for QR codes) naming the
+`code` prints a payment code (a BIP321 URI, `--qr` for a QR code) naming the
 wallet, the hubs it is paid at and its Nostr mailbox, if they name relays.
 `pay <code> [amount]` pays it at a hub it names that the wallet trusts and
 holds enough at, and is done once the hub releases the payment: the hub
