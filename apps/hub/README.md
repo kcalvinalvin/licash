@@ -153,8 +153,8 @@ The collateral of a contract is the next power of two minus one sat at or
 above its cap (2,097,151 sat at least, 2,147,483,647 at most). F, a contract's
 funding, spends the wallet's coins, which stay locked while the opening
 lives. Openings are kept in `<data>/openings.sqlite`, as sensitive as the
-seed: back it up with `hub.sqlite`. Each opening downloads about 100 MB of
-garbled instances to the wallet. The hub takes one opening's step, or
+seed: back it up with `hub.sqlite`. Each opening receives the kept garbled instances from
+the holder's wallet, kept in `<data>/opening-instances/`. The hub takes one opening's step, or
 builds one instance, at a time, the others waiting their turn: each opening
 takes about 30 CPU seconds over a few threads, and the hub holds about
 700 MB once it has opened a few: allow it 2 GB of memory.
@@ -169,34 +169,19 @@ for the wallet to answer a challenge and for each party's outputs to wait,
 3 blocks deep, and 12 blocks at least to respond to a request. No other
 network yet.
 
-With `--contracts-respond` (`LICASH_HUB_CONTRACTS_RESPOND=true`), the hub
-automatically answers confirmed requests, polling its contracts' Core
-wallet at `--chain-poll`. It needs `gettxout`, no txindex or historical
-rescan. Keep `<data>/responses.sqlite` with `openings.sqlite`: it pins each
-request's witness before one-time signing and retains the exact answer
-across restarts. Another witness for the same request txid is refused.
-Before enabling on an older installation, reconcile any previous manual
-answers; missing pins do not prove those keys were never used. Never use
-an older read-only responder alongside the new one. Disabling automation
-or rolling back the hub must preserve the pins for the next upgrade.
-
-When a wallet forces its contract closed, its request R comes on Bitcoin.
-The operator can also answer it beside the running hub:
-
-```sh
-licash-hub --data ./hub respond OPENING_ID r.hex --chain URL
-```
-
-`respond` reads the opening from `<data>/openings.sqlite` and writes the
-same signing pin as automation (no seed or contracts' wallet needed). It checks that
-R (in hex, `-` for stdin) is that contract's request, broadcasts the hub's
-plain answer on `--chain` (`LICASH_HUB_CHAIN`) and prints its txid. The
-wallet must then prove its claim, its assert in a block by the contract's
-assert height. The response window enables the holder's timeout, but does
-not prohibit a later hub answer before that timeout wins on chain. A
-holder's local safety margin therefore also requires timely timeout
-confirmation and monitoring; it is not a guaranteed offline proving window.
-The responder never broadcasts the hub's assertion timeout.
+A hub with contracts plays its holders' exits itself, polling its
+contracts' Core wallet at `--chain-poll`. When a wallet forces its contract
+closed, its request R and its publication (the claim it files) come on
+Bitcoin. The hub decides what the claim is owed. Owed all it asks, the hub
+lets the holder's timeout pay her. Owed less (a claim of notes that are not
+the keyset's, or spent), it responds with what is owed, proves that
+statement and asserts the proof; challenged, it answers with a kept
+instance. On regtest the proof is the mock authority's; on signet the hub
+runs `licash-r0 hp-prove` (`LICASH_HP_PROVER` names another) in the
+background, its files in `<data>/hp-proofs/<id>/`. It sweeps its outputs of
+each payout to its wallet. Keep `<data>/responses.sqlite` with
+`openings.sqlite`: it pins each one-time signature (the response, the
+assertion) before it is made.
 
 With `--swaps` (and `--chain`), the hub provides the swaps into it from the
 hubs of `--swaps-from URL=CAP`: a wallet locks its notes at such a hub to

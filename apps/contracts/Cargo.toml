@@ -11,9 +11,14 @@ licash.workspace = true
 licash-api.workspace = true
 licash-chain-client = { workspace = true, optional = true }
 licash-contract = { path = "../../crates/licash-contract" }
+licash-hp = { path = "../../crates/licash-hp" }
+lichen-babe = { path = "../../vendor/lichen/crates/babe" }
+lichen-contract = { path = "../../vendor/lichen/crates/contract" }
 licash-groth16 = { path = "../../crates/licash-groth16" }
 licash-wallet.workspace = true
 anyhow.workspace = true
+ark-bn254 = "0.5"
+ark-groth16 = { version = "0.5", default-features = false, features = ["std"] }
 axum = { workspace = true, optional = true }
 bitcoin = { version = "=0.32.102", default-features = false, features = ["std"] }
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
@@ -33,7 +38,6 @@ node = ["dep:axum", "dep:licash-chain-client", "dep:sha2"]
 
 [dev-dependencies]
 k256 = "0.13"
-lichen-babe = { path = "../../vendor/lichen/crates/babe" }
 lngap-lamport = { path = "../../vendor/ln-gap/crates/lamport" }
 lngap-sessions = { path = "../../vendor/ln-gap/crates/apps/sessions" }
 tempfile = "3.27"

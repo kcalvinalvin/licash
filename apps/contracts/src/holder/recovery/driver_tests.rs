@@ -1,14 +1,10 @@
-//! Driver lifecycle tests after selection, using the explicit mock proof
-//! authority and a synthetic chain. Counter cryptography is tested separately.
-
+//! Lifecycle tests after selection, on an explicit mock statement and a
+//! synthetic chain. The real graph's signatures and amounts are retained.
 use super::*;
-use bitcoin::{block, hashes::Hash as _, Block, BlockHash, Network, TxIn};
-use licash::disclosure::{Disclosures, CHUNK_BYTES};
+use bitcoin::{block, hashes::Hash as _, Block, BlockHash, Network, ScriptBuf};
 use licash::spend::ChainProfile;
-use licash_contract::{graph::Babe, keys::HubKeys, opening::Hub};
+use licash_contract::opening::{Hub, Trust};
 use licash_wallet::{Blocks, Response as HttpResponse};
-use lngap_lamport::winternitz::{WotsParams, WotsSig};
-use lngap_sessions::skeleton::sig_name;
 use std::{collections::BTreeMap, sync::Mutex};
 
 struct Offline;
@@ -17,7 +13,6 @@ impl Transport for Offline {
         Err("no network in a driver test".into())
     }
 }
-
 struct Ledger {
     blocks: Mutex<BTreeMap<u32, Block>>,
     sent: Mutex<Vec<Transaction>>,
@@ -100,64 +95,7 @@ impl Chain for Ledger {
     }
 }
 
-fn finish(o: &Opening, name: &str, wires: Vec<Vec<Vec<u8>>>) -> Transaction {
-    let p = o.set.iter().find(|p| p.name == name).unwrap();
-    let hub = (0..p.inputs())
-        .map(|i| o.signed.hub[&sig_name(name, i)].clone())
-        .collect::<Vec<_>>();
-    let alice = (0..p.inputs())
-        .map(|i| {
-            let key = sig_name(name, i);
-            o.signed
-                .alice
-                .get(&key)
-                .or_else(|| o.kept.get(&key))
-                .unwrap()
-                .clone()
-        })
-        .collect::<Vec<_>>();
-    p.finish_multi(wires, &hub, &alice)
-}
-
-fn counter(o: &Opening, hub: &HubKeys, seed: &[u8; 32], amount: u32) -> Transaction {
-    let request = Request {
-        amount: 4_096,
-        claim_digest: [22; 32],
-    };
-    let signed = Signer::derive(seed, &o.base.digest()).sign(request);
-    let r = close::request(o, &signed).unwrap();
-    let (_, b) = close::read_request(o, &r).unwrap();
-    let items = r.input[0]
-        .witness
-        .iter()
-        .take(134)
-        .map(<[u8]>::to_vec)
-        .collect::<Vec<_>>();
-    let e = WotsSig::from_consumption_order(
-        WotsParams::for_bytes(32),
-        &items.into_iter().rev().collect::<Vec<_>>(),
-    )
-    .unwrap();
-    let main = Babe::respond_corrected_wire(
-        &hub.b.sign(&request.amount.to_be_bytes()).unwrap(),
-        &b,
-        &e,
-        &hub.e_counter.sign(&request.claim_digest).unwrap(),
-        &hub.k.sign(&[0; licash::statement::K_LEN]).unwrap(),
-        &hub.b_corr.sign(&amount.to_be_bytes()).unwrap(),
-    );
-    let mut wires = vec![main];
-    let bytes = Disclosures::empty().to_bytes();
-    let mut at = 0;
-    for (i, size) in CHUNK_BYTES.into_iter().enumerate() {
-        let sig = hub.disclosure[i].sign(&bytes[at..at + size]).unwrap();
-        wires.push(sig.consumption_order().into_iter().rev().collect());
-        at += size;
-    }
-    finish(o, dispute::RESPOND_COUNTER, wires)
-}
-
-async fn lifecycle(amount: u32, challenged: bool) {
+async fn lifecycle(amount: u32, altered: bool, answer: bool) {
     use super::super::store::New;
     let dir = tempfile::tempdir().unwrap();
     let wallet = Wallet::create(
@@ -167,35 +105,21 @@ async fn lifecycle(amount: u32, challenged: bool) {
         Offline,
     )
     .unwrap();
-    let secrets = wallet.contract_secrets();
+    let saved = crate::testing::opened();
+    assert_eq!(wallet.contract_secrets().seed, saved.seed);
     let ctx = Context {
         tip: 0,
         trust: Trust::mock(),
     };
-    let bytes =
-        include_bytes!("../../../../../crates/licash-contract/tests/golden/holder-funded.bin");
-    let o = Holder::load(bytes, secrets.seed, secrets.spend, &ctx)
-        .unwrap()
-        .opening()
-        .unwrap();
-    let id = o.base.parts().nonce;
-    let raw_hub =
-        include_bytes!("../../../../../crates/licash-contract/tests/golden/hub-funded.bin");
-    let hub_keys = HubKeys::from_secret(raw_hub[9..41].try_into().unwrap());
-    let response = counter(&o, &hub_keys, &secrets.seed, amount);
-    let Response::Counter(HubResponse::Counter { corr_sig, .. }) =
-        dispute::response(&o, &response).unwrap()
-    else {
-        panic!("not a counter")
-    };
-    let claim = dispute::Corrected::new(&o, amount, &corr_sig).unwrap();
-    let proof = claim.mock_proof(&ctx.trust).unwrap();
-    let export = serde_json::to_vec(&serde_json::json!({
-        "image_id": hex::encode(dispute::holder_image(&o)),
-        "journal": hex::encode(claim.expected().to_bytes()),
-        "proof": hex::encode(dispute::proof_to_points(&proof)),
-    }))
-    .unwrap();
+    let holder = Holder::load(&saved.holder, &saved.seed, &ctx).unwrap();
+    let o = holder.signed().unwrap();
+    let hub = Hub::load(&saved.hub, &ctx).unwrap();
+    let ho = hub.signed().unwrap();
+    let id = holder.id();
+    let keys = HolderKeys::derive(&saved.seed, &id);
+    let response = ho.respond(hub.keys(), amount).unwrap();
+    let proof = lichen_babe::statement::mock_prove(&licash_contract::graph::journal(&o.base));
+    let assertion = ho.assert(hub.keys(), &proof).unwrap();
     let store = Store::open(dir.path()).unwrap();
     let deposit = o.base.deposit_outpoint();
     store
@@ -207,32 +131,17 @@ async fn lifecycle(amount: u32, challenged: bool) {
                 txid: Txid::from_byte_array(deposit.txid),
                 vout: deposit.index,
             },
-            value: 60_000,
-            price: 23_000,
+            value: 60000,
+            price: 23000,
             cap: o.base.parts().cap,
-            assert_height: o.babe.spec.windows.t_a,
-            close_height: o.babe.spec.terms.t_close,
+            assert_height: o.base.parts().graph.request_height,
+            close_height: o.base.parts().graph.close_height,
             since: 0,
-            state: bytes,
+            state: &saved.holder,
         })
         .unwrap();
-    if challenged {
-        let hub = Hub::load(raw_hub, &ctx).unwrap();
-        for (s, kept) in o.instances.iter().enumerate() {
-            for k in kept {
-                let message = licash_contract::wire::Envelope::from_bytes(
-                    &hub.instance(s, k.index, &ctx).unwrap(),
-                )
-                .unwrap();
-                let kept = licash_contract::wire::Kept::decode(&message.body).unwrap();
-                store.keep(&id, s, kept.index, &kept.instance).unwrap();
-            }
-        }
-    }
     let chain = Ledger::new();
     chain.mine(Some(response.clone()));
-    let rate = FeeRate::from_sat_per_vb(2).unwrap();
-    let keys = HolderKeys::derive(&secrets.seed, &id);
     let p = Transaction {
         version: bitcoin::transaction::Version::TWO,
         lock_time: bitcoin::absolute::LockTime::ZERO,
@@ -243,152 +152,138 @@ async fn lifecycle(amount: u32, challenged: bool) {
                 script_pubkey: ScriptBuf::new(),
             },
             TxOut {
-                value: Amount::from_sat(20_000),
-                script_pubkey: close::fee_script(&keys).unwrap(),
+                value: Amount::from_sat(20000),
+                script_pubkey: dispute::fee_script(&keys.party.payment).unwrap(),
             },
         ],
     };
     let state = State {
-        amount: 4_096,
-        corrected: Some(amount),
-        spend: Some(response),
+        amount: 4096,
+        reduced: Some(amount),
+        r: Some(o.request(&keys, 4096, &[22; 32]).unwrap()),
+        r_height: Some(0),
+        response: Some(response),
+        response_height: Some(1),
         p: Some(p),
-        spent_height: Some(1),
         from: Some(1),
-        deadline: Some(dispute::deadline(&o)),
         ..State::default()
     };
     store
-        .start_recovery(&id, FORMAT, Stage::Proving.as_str(), &state.encode())
+        .start_recovery(&id, FORMAT, Stage::Answered.as_str(), &state.encode())
         .unwrap();
     assert!(store
         .save_recovery(
             &id,
-            (Stage::Proving.as_str(), &state.encode()),
-            Stage::Proving.as_str(),
+            (Stage::Answered.as_str(), &state.encode()),
+            Stage::Answered.as_str(),
             true,
             &state.encode()
         )
         .unwrap());
-    // Wrong-mode imports leave the selected row and signing keys untouched.
-    let before = store.recovery(&id).unwrap().unwrap().state;
-    let mut wrong: serde_json::Value = serde_json::from_slice(&export).unwrap();
-    wrong["journal"] = hex::encode(dispute::expected(&o).to_bytes()).into();
-    assert!(import_proof(
-        &wallet,
-        &chain,
-        dir.path(),
-        &id,
-        &serde_json::to_vec(&wrong).unwrap(),
-        rate
-    )
-    .await
-    .is_err());
-    assert_eq!(store.recovery(&id).unwrap().unwrap().state, before);
-    assert!(chain.sent.lock().unwrap().is_empty());
-    let imported = import_proof(&wallet, &chain, dir.path(), &id, &export, rate)
-        .await
-        .unwrap();
-    assert_eq!(imported.stage, Stage::Asserting);
-    let assertion = chain.last();
-    import_proof(&wallet, &chain, dir.path(), &id, &export, rate)
-        .await
-        .unwrap();
-    assert_eq!(
-        chain.last(),
-        assertion,
-        "retry must not sign a different proof or amount"
-    );
-
-    // Only Pi1 is Lamport-signed. A miner can alter the unsigned Pi2/Pi3;
-    // the original verified receipt must survive confirmation unchanged.
-    let mut mined = assertion;
-    let mut witness = mined.input[0]
-        .witness
-        .iter()
-        .map(<[u8]>::to_vec)
-        .collect::<Vec<_>>();
-    let at = witness.len() - 4 - o.babe.spec.corrected.as_ref().unwrap().lamport.0.len() - 2;
-    witness[at] = vec![];
-    witness[at + 1] = vec![];
-    mined.input[0].witness = Witness::from_slice(&witness);
-    let asserted_at = chain.mine(Some(mined.clone()));
+    let rate = FeeRate::from_sat_per_vb(2).unwrap();
+    let mut mined = assertion.clone();
+    if altered {
+        let mut witness: Vec<_> = mined.input[0].witness.iter().map(|v| v.to_vec()).collect();
+        witness[0] = vec![];
+        witness[1] = vec![];
+        mined.input[0].witness = Witness::from_slice(&witness);
+    }
+    let asserted_at = chain.mine(Some(mined));
     let progressed = advance(&wallet, &chain, dir.path(), rate).await.unwrap();
-    assert_eq!(progressed[0].stage, Stage::Asserted, "{progressed:?}");
+    let observed = State::decode(&store.recovery(&id).unwrap().unwrap()).unwrap();
+    assert_eq!(observed.verified, Some(!altered));
+    let initial = if altered {
+        Stage::Challenging
+    } else {
+        Stage::Asserted
+    };
+    assert_eq!(progressed[0].stage, initial, "{progressed:?}");
+    let pinned = observed.assertion.clone();
+    advance(&wallet, &chain, dir.path(), rate).await.unwrap();
     assert_eq!(
         State::decode(&store.recovery(&id).unwrap().unwrap())
             .unwrap()
-            .proof,
-        Some(hex::encode(dispute::proof_bytes(&proof)))
+            .assertion,
+        pinned,
+        "retry must not select a different assertion or amount"
     );
-
-    if challenged {
-        use lichen_babe::reveal::{complete, reveal_args};
-        let preimages = mined.input[0]
-            .witness
-            .iter()
-            .map(<[u8]>::to_vec)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .skip(4)
-            .take(o.babe.spec.corrected.as_ref().unwrap().lamport.0.len())
-            .map(|p| p.try_into().unwrap())
-            .collect::<Vec<[u8; 20]>>();
-        let lamport = &o.babe.spec.corrected.as_ref().unwrap().lamport;
-        let digits = preimages
-            .iter()
-            .enumerate()
-            .map(|(i, p)| lamport.read(i, p).unwrap())
-            .collect::<Vec<_>>();
-        let revealed = digits
-            .iter()
-            .enumerate()
-            .map(|(i, d)| hub_keys.corrected.dealer.reveal(i, *d))
-            .collect::<Vec<_>>();
-        let wire = Babe::challenge_wire(reveal_args(
-            &preimages,
-            &complete(&o.presigs[1], &digits, &revealed),
-        ));
-        chain.mine(Some(finish(&o, dispute::CHALLENGE_CORRECTED, vec![wire])));
+    let paid_at = if altered {
+        let challenge = chain.last();
+        let challenged_at = chain.mine(Some(challenge.clone()));
         let progressed = advance(&wallet, &chain, dir.path(), rate).await.unwrap();
-        assert_eq!(progressed[0].stage, Stage::Answering, "{progressed:?}");
+        assert_eq!(progressed[0].stage, Stage::Challenged, "{progressed:?}");
+        if answer {
+            // Pi2/Pi3 are not signed. Even if a miner alters them, the hub
+            // retains its original proof and can answer the challenge.
+            let i = ho.kept[0];
+            let bytes = holder.instance(i).unwrap();
+            let tx = ho
+                .answer(&assertion, &challenge, i, &bytes)
+                .unwrap()
+                .unwrap();
+            chain.mine(Some(tx))
+        } else {
+            let delay = blocks(presign(&o.set, "failure").unwrap().tx.input[0].sequence).unwrap();
+            chain.to(challenged_at + delay - 1);
+            let progressed = advance(&wallet, &chain, dir.path(), rate).await.unwrap();
+            assert_eq!(progressed[0].stage, Stage::TimingOut, "{progressed:?}");
+            chain.mine(Some(chain.last()))
+        }
     } else {
-        chain.to(asserted_at + dispute::success_delay(&o) - 1);
+        let delay = blocks(presign(&o.set, "success").unwrap().tx.input[0].sequence).unwrap();
+        chain.to(asserted_at + delay - 1);
         let progressed = advance(&wallet, &chain, dir.path(), rate).await.unwrap();
         assert_eq!(progressed[0].stage, Stage::Succeeding, "{progressed:?}");
+        chain.mine(Some(chain.last()))
+    };
+    let progressed = advance(&wallet, &chain, dir.path(), rate).await.unwrap();
+    if amount == 0 && !altered {
+        // A corrected zero leaves her nothing of the payout to collect.
+        let done = advance(&wallet, &chain, dir.path(), rate).await.unwrap();
+        assert_eq!(done[0].stage, Stage::Done, "{progressed:?} {done:?}");
+        assert_eq!(done[0].received, Some(0));
+        return;
     }
-    let paid_at = chain.mine(Some(chain.last()));
-    let progressed = advance(&wallet, &chain, dir.path(), rate).await.unwrap();
-    assert_eq!(progressed[0].stage, Stage::Paid, "{progressed:?}");
-    chain.to(paid_at + close::sweep_delay(&o) - 1);
-    let progressed = advance(&wallet, &chain, dir.path(), rate).await.unwrap();
-    assert_eq!(progressed[0].stage, Stage::Sweeping, "{progressed:?}");
+    if progressed[0].stage != Stage::Sweeping {
+        assert!(
+            matches!(progressed[0].stage, Stage::Paid | Stage::TimedOut),
+            "{progressed:?}"
+        );
+        chain.to(progressed[0]
+            .next_at
+            .unwrap_or(paid_at + 6)
+            .saturating_sub(1));
+        let progressed = advance(&wallet, &chain, dir.path(), rate).await.unwrap();
+        assert_eq!(progressed[0].stage, Stage::Sweeping, "{progressed:?}");
+    }
     let sweep = chain.last();
     assert!(sweep.output[0].value >= sweep.output[0].script_pubkey.minimal_non_dust());
     let received = sweep.output[0].value.to_sat();
     chain.mine(Some(sweep));
     let done = advance(&wallet, &chain, dir.path(), rate).await.unwrap();
     assert_eq!(done[0].stage, Stage::Done, "{done:?}");
-    assert_eq!(done[0].corrected, Some(u64::from(amount)));
+    assert_eq!(done[0].corrected, Some(amount as u64));
     assert_eq!(done[0].received, Some(received));
-    assert_eq!(done[0].claimed, 4_096);
+    assert_eq!(done[0].claimed, 4096);
     assert_eq!(
         State::decode(&store.recovery(&id).unwrap().unwrap())
             .unwrap()
-            .corrected,
+            .reduced,
         Some(amount)
     );
 }
 
 #[tokio::test]
-async fn selected_corrected_receipts_import_assert_and_collect_including_zero() {
-    lifecycle(0, false).await;
-    lifecycle(1_024, false).await;
+async fn hub_receipts_collect_the_selected_amount_including_zero() {
+    lifecycle(0, false, false).await;
+    lifecycle(4096, false, false).await;
 }
-
+#[tokio::test]
+async fn an_invalid_assertion_pays_the_claim_when_no_answer_arrives() {
+    lifecycle(15, true, false).await;
+}
 #[tokio::test]
 #[ignore = "reconstructs garbled instances; run in release mode"]
-async fn a_selected_corrected_receipt_answers_a_challenge_and_collects() {
-    lifecycle(15, true).await;
+async fn a_retained_hub_receipt_answers_a_challenge_and_collects() {
+    lifecycle(15, true, true).await;
 }

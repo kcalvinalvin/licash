@@ -5,8 +5,7 @@ use licash::base::{ChainTerms, Fees, GraphTerms, Limits, Recipe};
 use licash::chain::Checkpoint;
 use licash::note::Keyset;
 use licash::spend::ChainProfile;
-use licash_contract::opening::{Bounds, Quote};
-use licash_contract::{INSTANCES, KEPT};
+use licash_contract::opening::{Bounds, Floors, Quote};
 
 /// The most blocks the hub's collateral is locked for.
 pub const LOCK: u32 = 1_000;
@@ -19,9 +18,6 @@ pub const RESERVE_ALICE: u64 = 20_000;
 
 /// The hub's fee for an opening, from her deposit.
 pub const OPENING_FEE: u64 = 3_000;
-
-/// What each of F's five publication outputs holds, of the hub's coins.
-pub const PUBLICATION_SATS: u64 = 20_000;
 
 /// The most F's and the graph's transactions pay, in sat per 1 000 vB.
 const MAX_RATE_SAT_PER_KVB: u64 = 10_000;
@@ -59,8 +55,9 @@ pub struct Range {
 /// quote, and its bounds; the terms holders may choose, if any.
 #[derive(Clone, Copy, Debug)]
 pub struct Timing {
-    /// Blocks the holder has to answer the hub's challenge.
-    holder_answer: u16,
+    profile: ChainProfile,
+    /// Blocks the holder has to challenge the hub's proof.
+    challenge_window: u16,
     /// Blocks each party's own outputs wait to be spent.
     to_self_delay: u16,
     /// Blocks deep F, a request and a publication are taken as final.
@@ -82,7 +79,7 @@ impl Timing {
     /// them. None elsewhere yet. Holders choose their terms within
     /// `range`, if any, the fixed terms among them.
     pub fn of(profile: ChainProfile, range: Option<Range>) -> Result<Self> {
-        let (holder_answer, to_self_delay, depth, response_window, min_blocks) = match profile {
+        let (challenge_window, to_self_delay, depth, response_window, min_blocks) = match profile {
             ChainProfile::Core30DefaultRegtest => (6, 6, 1, 2, 200),
             // Three days: her deadlines 180 blocks before the close.
             ChainProfile::Core30Signet => (144, 144, 3, 12, 432),
@@ -102,7 +99,8 @@ impl Timing {
             ensure!(r.per_coin >= 1, "a contract's cap of no times her coin");
         }
         Ok(Self {
-            holder_answer,
+            profile,
+            challenge_window,
             to_self_delay,
             depth,
             response_window,
@@ -201,6 +199,11 @@ impl Timing {
         blocks: u32,
     ) -> Quote {
         let bits = (u32::BITS - cap.leading_zeros()) as u8;
+        let floors = Floors::of(self.profile);
+        let (instances, kept) = match self.profile {
+            ChainProfile::Core30DefaultRegtest => (4, 2),
+            _ => (78, 10),
+        };
         Quote {
             keyset,
             cap,
@@ -221,26 +224,22 @@ impl Timing {
                 delta_prime: 6,
                 deadline_margin: 2,
                 response_window: 0,
-                assert_height: 0,
-                hub_challenge: 12,
-                holder_answer: self.holder_answer,
+                request_height: 0,
+                publication_window: floors.publication_window,
+                assert_window: 12,
+                challenge_window: self.challenge_window,
+                answer_window: 12,
             },
             recipe: Recipe {
-                graph_version: 1,
-                holder_program: [0; 32],
-                counter_program: [0; 32],
-                full_instances: INSTANCES as u16,
-                full_kept: KEPT as u16,
-                corrected_instances: INSTANCES as u16,
-                corrected_kept: KEPT as u16,
+                graph_version: 2,
+                program: [0; 32],
+                instances,
+                kept,
             },
             chain: ChainTerms {
                 checkpoint,
                 funding_depth: self.depth,
-                request_depth: self.depth,
-                publication_depth: self.depth,
-                lookback: 6,
-                observation_margin: 1,
+                work_depth: floors.work_depth,
                 max_headers: blocks,
             },
             limits: Limits {
@@ -250,8 +249,6 @@ impl Timing {
                 max_source_inputs: 128,
             },
             fees: Fees {
-                sweep_fee_max: 1_000,
-                external_fee_max: 2_000,
                 max_rate_sat_per_kvb: MAX_RATE_SAT_PER_KVB,
                 opening_fee_quote: self.fee(cap, blocks),
             },
@@ -268,8 +265,9 @@ mod tests {
 
     /// A hub's opening at Funded, of a mock opening on regtest: its keyset
     /// and checkpoint.
-    const FUNDED: &[u8] =
-        include_bytes!("../../../../crates/licash-contract/tests/golden/hub-funded.bin");
+    fn funded() -> &'static [u8] {
+        &crate::testing::opened().hub
+    }
 
     fn digest(q: &Quote) -> String {
         let mut w = Writer(Vec::new());
@@ -282,7 +280,7 @@ mod tests {
     /// quoted it, on each network.
     #[test]
     fn the_fixed_quote_is_as_it_always_was() {
-        let parts = Hub::peek(FUNDED).unwrap().base.parts().clone();
+        let parts = Hub::peek(funded()).unwrap().base.parts().clone();
         let (keyset, checkpoint) = (parts.keyset, parts.chain.checkpoint);
         // Whether the hub lets holders choose or not, at 1% a year.
         for range in [None, Some(RANGE)] {
@@ -294,13 +292,13 @@ mod tests {
             let (regtest, bounds) = quoted(ChainProfile::Core30DefaultRegtest);
             assert_eq!(
                 regtest,
-                "cb47276d1d570cde9b7605f0047bcd968d3abfb5e06c8722e12535a9ff01cc4a"
+                "7a527f4e217807b4f21e7475e1b8b7672ec55c135bed5f3798f7af17e56496a6"
             );
             assert_eq!((bounds.lock, bounds.response_window), (1_000, 2));
             let (signet, bounds) = quoted(ChainProfile::Core30Signet);
             assert_eq!(
                 signet,
-                "1f25979c47ec3c8f192b4ed2bd008423e50e68a821483fdf3c2074dd8fd0c34a"
+                "92f13e75f92425b52f4679c8b7c8cd46255cf1736fcf365dd9f86130d95f5109"
             );
             assert_eq!((bounds.lock, bounds.response_window), (1_000, 12));
         }
@@ -316,7 +314,7 @@ mod tests {
 
     #[test]
     fn a_quote_chosen_is_as_wide_as_its_cap_and_as_long_as_its_blocks() {
-        let parts = Hub::peek(FUNDED).unwrap().base.parts().clone();
+        let parts = Hub::peek(funded()).unwrap().base.parts().clone();
         let (keyset, checkpoint) = (parts.keyset.clone(), parts.chain.checkpoint.clone());
         let timing = Timing::of(ChainProfile::Core30Signet, Some(RANGE)).unwrap();
         let fixed = timing.quote(keyset.clone(), checkpoint.clone());

@@ -92,23 +92,6 @@ impl Openings {
         self.take(id, message, Start::Stored).await
     }
 
-    /// The instance `index` of assertion `stage` the hub serves opening
-    /// `id`'s holder, built again.
-    pub async fn instance(
-        &self,
-        id: [u8; 32],
-        stage: usize,
-        index: usize,
-    ) -> Result<Vec<u8>, Refused> {
-        let ctx = self.context().await?;
-        let row = self.store().row(&id).map_err(Refused::unavailable)?;
-        let row = row.ok_or_else(not_found)?;
-        let built = heavy(&self.heavy, move || {
-            Hub::load(&row.state, &ctx)?.instance(stage, index, &ctx)
-        });
-        built.await?.map_err(Refused::bad)
-    }
-
     /// Refused unless `quote` is the hub's: its terms, checkpointed at a
     /// block of its best chain at most [`MAX_AGE`] deep.
     async fn terms_of(&self, quote: &Quote) -> Result<(), Refused> {
@@ -178,11 +161,17 @@ impl Openings {
                 let hub = Hub::load(&row.state, &ctx).map_err(Refused::unavailable)?;
                 if row.last == last {
                     // Asked again: answered as before, its effects run.
-                    let out = hub.pending().map_err(Refused::unavailable)?;
+                    let mut out = hub.pending().map_err(Refused::unavailable)?;
+                    if matches!(Kind::peek(&message), Some(Kind::Opened | Kind::Instance)) {
+                        out.retain(
+                            |o| !matches!(o, Out::Send(b) if Kind::peek(b) == Some(Kind::Choose)),
+                        );
+                    }
                     (hub, out)
                 } else {
                     let (hub, out) =
                         stepped(&self.heavy, hub, Input::Message(message), ctx).await?;
+                    let out = self.keep(&id, out)?;
                     self.save(&id, &hub, &last)?;
                     (hub, out)
                 }
@@ -195,7 +184,8 @@ impl Openings {
                 let bounds = self.timing.bounds(&quote);
                 let hub = Hub::new(*quote, bounds);
                 let (hub, out) = stepped(&self.heavy, hub, Input::Message(message), ctx).await?;
-                let state = hub.to_bytes().map_err(Refused::unavailable)?;
+                let out = self.keep(&id, out)?;
+                let state = hub.to_bytes();
                 let inserted = self
                     .store()
                     .insert(&id, phase(&hub), ctx.trust.mock, &deposit, &last, &state)
@@ -210,8 +200,7 @@ impl Openings {
         self.effects(id, hub, out, last, ctx).await
     }
 
-    /// Carry out `out`, what `hub` asked: its messages and the instances
-    /// it serves answered, F funded, signed and broadcast by the node.
+    /// Carry out effects only after artifacts and state are durable.
     async fn effects(
         &self,
         id: [u8; 32],
@@ -225,15 +214,13 @@ impl Openings {
         while let Some(out) = queue.pop_front() {
             match out {
                 Out::Send(bytes) => frames.push(Frame::Message(bytes)),
-                Out::Serve { stage, index } => frames.push(Frame::Instance { stage, index }),
                 Out::Fund {
                     deposit,
                     coin,
                     outputs,
-                    publication,
                 } => {
                     let _funding = self.funding.lock().await;
-                    let funded = self.fund(deposit, &coin, outputs, &publication).await;
+                    let funded = self.fund(deposit, &coin, outputs).await;
                     let (funding, prevouts) = funded.map_err(Refused::unavailable)?;
                     let coins: Vec<OutPoint> = funding
                         .input
@@ -244,10 +231,13 @@ impl Openings {
                     let (next, more) =
                         stepped(&self.heavy, hub, Input::Funded { funding, prevouts }, ctx).await?;
                     hub = next;
-                    self.save(&id, &hub, &last)?;
+                    let more = self.keep(&id, more)?;
                     self.store()
                         .set_coins(&id, &coins)
                         .map_err(Refused::unavailable)?;
+                    // A crash may over-lock an unsigned selection, never
+                    // leave durable F inputs absent from restart locking.
+                    self.save(&id, &hub, &last)?;
                     self.lock_coins(&coins).await;
                     tracing::info!(id = %crate::hex_id(&id), coins = coins.len(), "F funded");
                     queue.extend(more);
@@ -270,6 +260,7 @@ impl Openings {
                     let (next, more) =
                         stepped(&self.heavy, hub, Input::Signed(signed), ctx).await?;
                     hub = next;
+                    let more = self.keep(&id, more)?;
                     self.save(&id, &hub, &last)?;
                     tracing::info!(id = %crate::hex_id(&id), "F signed");
                     queue.extend(more);
@@ -278,9 +269,9 @@ impl Openings {
                     Ok(txid) => tracing::info!(id = %crate::hex_id(&id), %txid, "F broadcast"),
                     Err(e) => tracing::warn!(id = %crate::hex_id(&id), "broadcasting F: {e:#}"),
                 },
-                Out::Keep { .. } => {
+                Out::Keep { .. } | Out::Serve { .. } => {
                     return Err(Refused::unavailable(
-                        "the hub was asked to keep an instance",
+                        "unexpected instance effect after state was saved",
                     ));
                 }
             }
@@ -288,9 +279,24 @@ impl Openings {
         Ok(Answer::Frames(frames))
     }
 
+    /// A state must never reference an artifact that has not reached disk.
+    fn keep(&self, id: &[u8; 32], out: Vec<Out>) -> Result<Vec<Out>, Refused> {
+        let mut effects = Vec::with_capacity(out.len());
+        for o in out {
+            match o {
+                Out::Keep { i, bytes } => self
+                    .store()
+                    .keep(id, i, &bytes)
+                    .map_err(Refused::unavailable)?,
+                effect => effects.push(effect),
+            }
+        }
+        Ok(effects)
+    }
+
     /// Store `hub` after a step that took the message of digest `last`.
     fn save(&self, id: &[u8; 32], hub: &Hub, last: &[u8; 32]) -> Result<(), Refused> {
-        let state = hub.to_bytes().map_err(Refused::unavailable)?;
+        let state = hub.to_bytes();
         // Past its signatures, it is the holder's to fund F.
         let irrevocable = !hub.abandonable();
         self.store()
@@ -300,7 +306,7 @@ impl Openings {
 }
 
 fn phase(hub: &Hub) -> u8 {
-    hub.phase().map_or(0, |p| p as u8)
+    hub.phase() as u8
 }
 
 /// `hub` stepped with `input` off the async threads, in its turn

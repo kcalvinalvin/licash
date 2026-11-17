@@ -10,6 +10,7 @@
 //! `IF NOT EXISTS` too.
 
 use std::collections::HashMap;
+#[cfg(test)]
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -457,7 +458,9 @@ impl Store {
     }
 
     /// Keep instance `index` of assertion `stage` of opening `id`, on disk
-    /// before her state names it.
+    /// before her state names it. Openings keep none now: what older ones
+    /// kept goes with them.
+    #[cfg(test)]
     pub fn keep(&self, id: &[u8; 32], stage: usize, index: usize, bytes: &[u8]) -> Result<()> {
         let dir = self.kept.join(crate::hex_id(id));
         let mut builder = std::fs::DirBuilder::new();
@@ -474,44 +477,6 @@ impl Store {
         file.sync_all()?;
         std::fs::rename(&aside, &path)?;
         std::fs::File::open(&dir)?.sync_all()?;
-        Ok(())
-    }
-
-    /// Whether instance `index` of `stage` that opening `id` keeps is on
-    /// disk, written whole: without reading it.
-    pub fn has_instance(&self, id: &[u8; 32], stage: usize, index: usize) -> bool {
-        let path = self.kept.join(crate::hex_id(id));
-        path.join(format!("{stage}-{index}")).is_file()
-    }
-
-    /// Instance `index` of assertion `stage` of opening `id`, as kept.
-    pub fn kept_instance(&self, id: &[u8; 32], stage: usize, index: usize) -> Result<Vec<u8>> {
-        let path = self
-            .kept
-            .join(crate::hex_id(id))
-            .join(format!("{stage}-{index}"));
-        std::fs::read(&path).with_context(|| format!("{}", path.display()))
-    }
-
-    /// Where her statement's input of contract `id` is kept, beside its
-    /// instances.
-    pub fn statement_path(&self, id: &[u8; 32]) -> std::path::PathBuf {
-        self.kept.join(crate::hex_id(id)).join(STATEMENT)
-    }
-
-    /// Keep her statement's input of contract `id`, on disk whole before
-    /// her state relies on it.
-    pub fn keep_statement(&self, id: &[u8; 32], bytes: &[u8]) -> Result<()> {
-        let path = self.statement_path(id);
-        let aside = path.with_extension("new");
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).with_context(|| format!("{}", dir.display()))?;
-        }
-        let mut file =
-            std::fs::File::create(&aside).with_context(|| format!("{}", aside.display()))?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        std::fs::rename(&aside, &path)?;
         Ok(())
     }
 
@@ -1010,10 +975,10 @@ mod tests {
         let copy = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();
         store.insert(&new(1, coin(0))).unwrap();
-        let state = br#"{"amount":4096,"corrected":0,"proof":"pinned"}"#;
-        store.start_recovery(&[1; 32], 1, "proving", state).unwrap();
+        let state = br#"{"amount":4096,"reduced":0}"#;
+        store.start_recovery(&[1; 32], 2, "signing", state).unwrap();
         assert!(store
-            .save_recovery(&[1; 32], ("proving", state), "proving", true, state)
+            .save_recovery(&[1; 32], ("signing", state), "signing", true, state)
             .unwrap());
         super::super::recovery::validate_backup(&store).unwrap();
         store
@@ -1023,7 +988,7 @@ mod tests {
         let row = copied.recovery(&[1; 32]).unwrap().unwrap();
         assert_eq!(row.state, state);
         assert!(row.irrevocable);
-        assert_eq!(row.stage, "proving");
+        assert_eq!(row.stage, "signing");
         assert!(!copied.drop_recovery(&[1; 32]).unwrap());
         assert!(store
             .snapshot(&copy.path().join("contracts.sqlite"))

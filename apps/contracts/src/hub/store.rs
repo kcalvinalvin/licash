@@ -9,17 +9,18 @@
 //! the file all the same. A migration to come must make them
 //! `IF NOT EXISTS` too.
 
-use std::path::Path;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Result};
+use anyhow::{bail, ensure, Context, Result};
 use bitcoin::consensus::{deserialize, serialize};
 use bitcoin::OutPoint;
 use licash_api::Fees;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
 /// The format of the rows: a machine's stored bytes, of
-/// `licash_contract`'s format 1.
-pub(super) const FORMAT: i64 = 1;
+/// `licash_contract`'s format 2. Older rows are retained, not reinterpreted.
+pub(super) const FORMAT: i64 = 2;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS openings (
@@ -75,7 +76,7 @@ pub(super) struct Listed {
 
 /// The openings, and what the hub charges, if told
 /// ([`Store::charging`]): kept with each that starts.
-pub(super) struct Store(Connection, Option<Fees>);
+pub(super) struct Store(Connection, Option<Fees>, PathBuf);
 
 impl Store {
     /// How many openings in `dir` the hub signed and did not give up,
@@ -139,7 +140,61 @@ impl Store {
             1 => {}
             v => bail!("openings.sqlite is of version {v}, newer than this hub knows"),
         }
-        Ok(Self(c, None))
+        Ok(Self(c, None, dir.to_path_buf()))
+    }
+
+    /// Persist an already-validated kept instance before saving the machine
+    /// state that names it. No artifact is removed automatically.
+    pub fn keep(&self, id: &[u8; 32], i: u32, bytes: &[u8]) -> Result<()> {
+        ensure!(i > 0, "instances are numbered from one");
+        let root = self.2.join("opening-instances");
+        let dir = root.join(crate::hex_id(id));
+        for directory in [&root, &dir] {
+            let mut builder = std::fs::DirBuilder::new();
+            #[cfg(unix)]
+            std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+            match builder.create(directory) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && directory.is_dir() => {}
+                Err(e) => return Err(e).with_context(|| directory.display().to_string()),
+            }
+            // A retry may have created this directory before interruption.
+            std::fs::File::open(directory.parent().context("artifact parent")?)?.sync_all()?;
+        }
+        let path = dir.join(i.to_string());
+        if path.exists() {
+            ensure!(
+                std::fs::read(&path)? == bytes,
+                "a different instance is already stored"
+            );
+            std::fs::File::open(&path)?.sync_all()?;
+            std::fs::File::open(&dir)?.sync_all()?;
+            return Ok(());
+        }
+        let aside = dir.join(format!(
+            ".{i}.{}.new",
+            hex::encode(licash::base::Base::fresh_nonce())
+        ));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let mut file = options.open(&aside)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&aside, &path)?;
+        std::fs::File::open(&dir)?.sync_all()?;
+        Ok(())
+    }
+
+    pub fn kept_instance(&self, id: &[u8; 32], i: u32) -> Result<Vec<u8>> {
+        ensure!(i > 0, "instances are numbered from one");
+        let path = self
+            .2
+            .join("opening-instances")
+            .join(crate::hex_id(id))
+            .join(i.to_string());
+        std::fs::read(&path).with_context(|| path.display().to_string())
     }
 
     /// Keep `fees`, what the hub charges, with each opening that starts
@@ -179,22 +234,6 @@ impl Store {
             }
         }
         Ok(all)
-    }
-
-    /// Opening `id` in `dir`, read only, beside the running hub: none if
-    /// it is not there, an error if no opening was ever stored there.
-    pub fn read(dir: &Path, id: &[u8; 32]) -> Result<Option<Row>> {
-        let path = dir.join("openings.sqlite");
-        if !path.exists() {
-            bail!("no openings in {}", dir.display());
-        }
-        let c = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        let version: i64 = c.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        match version {
-            0 => Ok(None),
-            1 => row(&c, id),
-            v => bail!("openings.sqlite is of version {v}, newer than this hub knows"),
-        }
     }
 
     pub fn row(&self, id: &[u8; 32]) -> Result<Option<Row>> {
@@ -353,4 +392,66 @@ fn row(c: &Connection, id: &[u8; 32]) -> Result<Option<Row>> {
 
 fn outpoints(bytes: &[u8]) -> Result<Vec<OutPoint>> {
     bytes.chunks(36).map(|c| Ok(deserialize(c)?)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uploaded_instances_are_durable_private_and_isolated() -> Result<()> {
+        let data = tempfile::tempdir()?;
+        let store = Store::open(data.path())?;
+        store.keep(&[1; 32], 1, b"first")?;
+        store.keep(&[1; 32], 2, b"second")?;
+        store.keep(&[2; 32], 1, b"another opening")?;
+        store.keep(&[1; 32], 1, b"first")?;
+        assert!(store.keep(&[1; 32], 1, b"different").is_err());
+        assert!(store.keep(&[1; 32], 0, b"zero").is_err());
+        drop(store);
+        let store = Store::open(data.path())?;
+        assert_eq!(store.kept_instance(&[1; 32], 1)?, b"first");
+        assert_eq!(store.kept_instance(&[1; 32], 2)?, b"second");
+        assert_eq!(store.kept_instance(&[2; 32], 1)?, b"another opening");
+        assert!(store.kept_instance(&[1; 32], 3).is_err());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let root = data.path().join("opening-instances");
+            let dir = root.join(crate::hex_id(&[1; 32]));
+            assert_eq!(
+                std::fs::metadata(&root)?.permissions().mode() & 0o777,
+                0o700
+            );
+            assert_eq!(std::fs::metadata(&dir)?.permissions().mode() & 0o777, 0o700);
+            assert_eq!(
+                std::fs::metadata(dir.join("1"))?.permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn partial_artifacts_are_not_state_and_are_not_removed() -> Result<()> {
+        let data = tempfile::tempdir()?;
+        let store = Store::open(data.path())?;
+        store.keep(&[1; 32], 1, b"complete")?;
+        let dir = data
+            .path()
+            .join("opening-instances")
+            .join(crate::hex_id(&[1; 32]));
+        let partial = dir.join(".2.interrupted.new");
+        std::fs::write(&partial, b"partial")?;
+        assert!(store.kept_instance(&[1; 32], 2).is_err());
+        store.keep(&[1; 32], 2, b"whole")?;
+        assert_eq!(store.kept_instance(&[1; 32], 2)?, b"whole");
+        assert_eq!(std::fs::read(partial)?, b"partial");
+        let blocked = tempfile::tempdir()?;
+        let store = Store::open(blocked.path())?;
+        std::fs::write(blocked.path().join("opening-instances"), b"not a directory")?;
+        assert!(store.keep(&[1; 32], 1, b"cannot save").is_err());
+        assert!(store.row(&[1; 32])?.is_none());
+        Ok(())
+    }
 }

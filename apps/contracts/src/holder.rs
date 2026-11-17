@@ -10,7 +10,7 @@ mod chain;
 mod driver;
 pub mod fees;
 #[cfg(feature = "node")]
-mod node;
+pub(crate) mod node;
 pub mod recovery;
 pub mod safety;
 mod store;
@@ -31,10 +31,6 @@ pub use node::Node;
 pub use store::{kept, Contract};
 use store::{New, Store};
 
-/// How many of the hub's instances an opening keeps: of each stage,
-/// those she chose, downloaded whole before she consents.
-pub const KEEPS: usize = licash_contract::wire::STAGES * licash_contract::KEPT;
-
 use crate::{Offer, QUOTE};
 
 /// Blocks from a recovery's assertion deadline to the close, at least:
@@ -51,7 +47,7 @@ const SPARE: u32 = 12;
 /// least.
 pub fn after_assert(quote: &Quote) -> u32 {
     let g = &quote.graph;
-    let windows: u32 = [g.hub_challenge, g.holder_answer, g.delta, g.delta_prime]
+    let windows: u32 = [g.challenge_window, g.answer_window, g.delta, g.delta_prime]
         .map(u32::from)
         .iter()
         .sum();
@@ -59,7 +55,7 @@ pub fn after_assert(quote: &Quote) -> u32 {
 }
 
 /// The blocks she has to respond to the hub's request, at least.
-pub const RESPONSE_WINDOW: u16 = 6;
+pub const RESPONSE_WINDOW: u16 = 8;
 
 /// Blocks F paying a deposit has, at least, from her signing it to the
 /// last its payment may confirm in: twice that when it is asked for, the
@@ -226,7 +222,6 @@ async fn open_at<T: Transport, C: Chain>(
     let secrets = wallet.contract_secrets();
     let start = Start {
         seed: secrets.seed,
-        spend: secrets.spend,
         quote: offer.quote.clone(),
         deposit,
         coin: coin.clone(),
@@ -246,7 +241,7 @@ async fn open_at<T: Transport, C: Chain>(
             }
         }
     };
-    let (holder, outs) = match Holder::new(start, &ctx) {
+    let (holder, outs) = match Holder::start(start, &ctx) {
         Ok(started) => started,
         Err(e) => {
             give_up("its opening never started");
@@ -262,7 +257,7 @@ async fn open_at<T: Transport, C: Chain>(
         value: coin.value.to_sat(),
         price,
         cap: offer.quote.cap,
-        assert_height: wanted.assert_height,
+        assert_height: wanted.request_height,
         close_height: wanted.close_height,
         since: tip,
         state: &holder.to_bytes(),
@@ -312,7 +307,7 @@ pub async fn resume<T: Transport, C: Chain>(
         let (state, _) = store.state(&id)?;
         let secrets = wallet.contract_secrets();
         let ctx = licash_contract::opening::Context { tip, trust };
-        let holder = match Holder::load(&state, secrets.seed, secrets.spend, &ctx) {
+        let holder = match Holder::load(&state, &secrets.seed, &ctx) {
             Ok(holder) => holder,
             Err(e) => {
                 // One that cannot be read (opened under programs this build
@@ -390,22 +385,8 @@ pub fn validate_backup<T: Transport>(wallet: &Wallet<T>, dir: &Path) -> Result<(
             continue;
         }
         let (state, _) = store.state(&c.id)?;
-        let opening = match Holder::load(&state, keys.seed, keys.spend, &ctx)
-            .and_then(|holder| holder.opening())
-        {
-            Ok(opening) => opening,
-            Err(e) => {
-                tracing::warn!(id = %crate::hex_id(&c.id), "restoring an unreadable opening as is: {e:#}");
-                continue;
-            }
-        };
-        for (stage, instances) in opening.instances.iter().enumerate() {
-            for instance in instances {
-                ensure!(
-                    store.has_instance(&c.id, stage, instance.index),
-                    "the backup lacks a file a protection's recovery needs"
-                );
-            }
+        if let Err(e) = Holder::load(&state, &keys.seed, &ctx).and_then(|holder| holder.signed()) {
+            tracing::warn!(id = %crate::hex_id(&c.id), "restoring an unreadable opening as is: {e:#}");
         }
     }
     Ok(())
@@ -423,8 +404,7 @@ pub struct Inspection {
     pub denominations: Vec<u64>,
     pub keyset: String,
     pub graph_version: u32,
-    pub holder_program: String,
-    pub counter_program: String,
+    pub program: String,
 }
 
 /// Read only when requested. Earlier opening stages may not have a signed
@@ -442,7 +422,7 @@ pub fn inspect<T: Transport>(
         tip,
         trust: crate::trust(wallet.network())?,
     };
-    let opening = Holder::load(&state, secrets.seed, secrets.spend, &ctx)?.opening()?;
+    let opening = Holder::load(&state, &secrets.seed, &ctx)?.signed()?;
     let network = match wallet.network() {
         licash::spend::ChainProfile::Core30Mainnet => bitcoin::Network::Bitcoin,
         licash::spend::ChainProfile::Core30DefaultRegtest => bitcoin::Network::Regtest,
@@ -483,8 +463,7 @@ fn inspection(
         denominations: parts.keyset.denominations().collect(),
         keyset: crate::hex_id(parts.keyset.id()),
         graph_version: parts.recipe.graph_version,
-        holder_program: crate::hex_id(&parts.recipe.holder_program),
-        counter_program: crate::hex_id(&parts.recipe.counter_program),
+        program: crate::hex_id(&parts.recipe.program),
     })
 }
 
@@ -516,12 +495,8 @@ pub fn coverage<T: Transport>(
     for c in coverage_order(contracts, tip, &held, &recovering) {
         let read = || -> Result<_> {
             let (state, _) = store.state(&c.id)?;
-            let opening = Holder::load(&state, secrets.seed, secrets.spend, &ctx)?.opening()?;
+            let opening = Holder::load(&state, &secrets.seed, &ctx)?.signed()?;
             let parts = opening.base.parts();
-            ensure!(
-                trust.mock || parts.recipe.holder_program == trust.programs.holder,
-                "unsupported holder program"
-            );
             Ok((
                 *parts.keyset.id(),
                 u64::from(parts.cap),
@@ -591,7 +566,7 @@ pub fn paid_into<T: Transport>(
         let (state, _) = store.state(&contract.id)?;
         let secrets = wallet.contract_secrets();
         let ctx = licash_contract::opening::Context { tip, trust };
-        let holder = match Holder::load(&state, secrets.seed, secrets.spend, &ctx) {
+        let holder = match Holder::load(&state, &secrets.seed, &ctx) {
             Ok(holder) => holder,
             Err(e) => {
                 tracing::warn!(id = %crate::hex_id(&contract.id), "loading a contract: {e:#}");
@@ -694,14 +669,19 @@ fn wanted(offer: &Offer, tip: u32, blocks: u32) -> Result<Wanted> {
     // The hub counts from its tip, at its checkpoint or past it.
     let latest = offer.quote.chain.checkpoint.height() + bounds.lock;
     let close_height = (tip + blocks).min(latest);
-    let assert_height = close_height
+    let response_window = RESPONSE_WINDOW
+        .max(bounds.response_window)
+        .max(offer.quote.graph.publication_window.saturating_add(2));
+    let request_height = close_height
         .checked_sub(after_assert(&offer.quote))
+        .and_then(|h| h.checked_sub(u32::from(response_window)))
+        .and_then(|h| h.checked_sub(u32::from(offer.quote.graph.assert_window)))
         .filter(|a| *a > tip)
         .with_context(|| format!("{blocks} blocks leave no time to recover in"))?;
     Ok(Wanted {
-        assert_height,
+        request_height,
         close_height,
-        response_window: RESPONSE_WINDOW.max(bounds.response_window),
+        response_window,
     })
 }
 
@@ -833,16 +813,15 @@ mod tests {
         .unwrap();
         let keys = wallet.contract_secrets();
         let holder = Holder::load(
-            include_bytes!("../../../crates/licash-contract/tests/golden/holder-funded.bin"),
-            keys.seed,
-            keys.spend,
+            &crate::testing::opened().holder,
+            &keys.seed,
             &licash_contract::opening::Context {
                 tip: 0,
                 trust: crate::trust(ChainProfile::Core30DefaultRegtest).unwrap(),
             },
         )
         .unwrap();
-        let opening = holder.opening().unwrap();
+        let opening = holder.signed().unwrap();
         let info = inspection(&opening, bitcoin::Network::Regtest).unwrap();
         assert_eq!(
             info.locked,
@@ -930,7 +909,7 @@ mod tests {
     }
 
     #[test]
-    fn a_restored_funded_opening_needs_its_instances_and_an_unreadable_one_is_carried() {
+    fn a_restored_garbler_needs_no_instance_files_and_an_unreadable_opening_is_carried() {
         let dir = tempfile::tempdir().unwrap();
         let regtest = ChainProfile::Core30DefaultRegtest;
         let wallet = Wallet::create(
@@ -947,11 +926,10 @@ mod tests {
             tip: 0,
             trust: crate::trust(regtest).unwrap(),
         };
-        let bytes =
-            include_bytes!("../../../crates/licash-contract/tests/golden/holder-funded.bin");
-        let o = Holder::load(bytes, keys.seed, keys.spend, &ctx)
+        let bytes = &crate::testing::opened().holder;
+        let o = Holder::load(bytes, &keys.seed, &ctx)
             .unwrap()
-            .opening()
+            .signed()
             .unwrap();
         let id = o.base.parts().nonce;
         let store = Store::open(dir.path()).unwrap();
@@ -977,19 +955,7 @@ mod tests {
             store.save(&id, Phase::Funded, None, state).unwrap();
         };
         insert(id, 0, bytes);
-        let e = validate_backup(&wallet, dir.path()).unwrap_err();
-        assert!(format!("{e:#}").contains("lacks a file"), "{e:#}");
-        // Present is what is checked; a recovery reads them when it runs.
-        let all = o.instances.iter().enumerate();
-        let mut wanted: Vec<_> = all
-            .flat_map(|(stage, kept)| kept.iter().map(move |k| (stage, k.index)))
-            .collect();
-        let (stage, index) = wanted.pop().unwrap();
-        for (stage, index) in wanted {
-            store.keep(&id, stage, index, b"instance").unwrap();
-        }
-        assert!(validate_backup(&wallet, dir.path()).is_err());
-        store.keep(&id, stage, index, b"instance").unwrap();
+        // The backed-up wallet seed regenerates the holder's circuits.
         validate_backup(&wallet, dir.path()).unwrap();
         // One this build cannot read is restored as it was, not refused.
         insert([9; 32], 1, b"of a later version");
@@ -1056,20 +1022,17 @@ mod tests {
             let window = u32::from(wanted.response_window);
             // After the assertion deadline: the hub's challenge, her answer
             // and the delays on what she is paid, whole.
-            let after = [g.hub_challenge, g.holder_answer, g.delta, g.delta_prime];
+            let after = [g.challenge_window, g.answer_window, g.delta, g.delta_prime];
             let after: u32 = after.map(u32::from).iter().sum();
-            let gap = wanted.close_height - wanted.assert_height;
+            let gap = wanted.close_height - wanted.request_height;
             assert!(gap > after, "{profile}: {gap} blocks after asserting");
             // Before it, Base's funding gate: F and a request deep enough,
             // her outputs' delay and the window to respond.
             let delay = u32::from(g.to_self_delay);
-            let gate = c.funding_depth + delay + c.request_depth + window + g.deadline_margin;
-            assert!(wanted.assert_height - tip >= gate, "{profile}");
+            let gate = c.funding_depth + delay + c.work_depth + window + g.deadline_margin;
+            assert!(wanted.request_height - tip >= gate, "{profile}");
             // A publication confirmed deep enough within the window.
-            assert!(
-                window > c.publication_depth + c.observation_margin,
-                "{profile}"
-            );
+            assert!(window > u32::from(g.publication_window) + 1, "{profile}");
         }
         // Regtest's as before; signet's 180 blocks after asserting, of
         // its 1 000, and 12 to respond.
@@ -1124,12 +1087,11 @@ mod tests {
                     let wanted = wanted(&offer, tip, blocks).unwrap();
                     offer.bounds.check(&wanted, tip).unwrap();
                     // Her headers reach the assertion deadline.
-                    assert!(checkpoint.height() + c.max_headers >= wanted.assert_height);
+                    assert!(checkpoint.height() + c.max_headers >= wanted.request_height);
                     let window = u32::from(wanted.response_window);
                     let delay = u32::from(g.to_self_delay);
-                    let gate =
-                        c.funding_depth + delay + c.request_depth + window + g.deadline_margin;
-                    let before = wanted.assert_height - tip;
+                    let gate = c.funding_depth + delay + c.work_depth + window + g.deadline_margin;
+                    let before = wanted.request_height - tip;
                     assert!(before >= gate, "{profile} {blocks}: {before} blocks");
                 }
             }

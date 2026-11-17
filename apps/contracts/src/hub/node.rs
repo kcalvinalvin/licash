@@ -3,7 +3,7 @@
 
 use anyhow::{Context as _, Result};
 use bitcoin::consensus::encode::{deserialize_hex, serialize_hex};
-use bitcoin::{absolute, transaction, Amount, OutPoint, ScriptBuf, Transaction, TxIn, TxOut};
+use bitcoin::{absolute, transaction, OutPoint, Transaction, TxIn, TxOut};
 use serde_json::{json, Value};
 
 use super::{terms, Openings};
@@ -21,20 +21,15 @@ fn coin(o: &OutPoint) -> Value {
 
 impl Openings {
     /// F: her `deposit`, worth `value`, and coins of the node's wallet,
-    /// paying `outputs` and each `publication` script once, and the coins
-    /// it spends, in input order. Its coins are not locked: the caller
+    /// paying `outputs`, with the contract fixed at vout zero, and the
+    /// coins it spends, in input order. Its coins are not locked: the caller
     /// stores F, then locks them, all under [`Openings::funding`].
     pub(super) async fn fund(
         &self,
         deposit: OutPoint,
         value: &TxOut,
         outputs: Vec<TxOut>,
-        publication: &[ScriptBuf; 5],
     ) -> Result<(Transaction, Vec<TxOut>)> {
-        let coins = publication.iter().map(|script| TxOut {
-            value: Amount::from_sat(terms::PUBLICATION_SATS),
-            script_pubkey: script.clone(),
-        });
         let unsigned = Transaction {
             version: transaction::Version::TWO,
             lock_time: absolute::LockTime::ZERO,
@@ -42,12 +37,13 @@ impl Openings {
                 previous_output: deposit,
                 ..Default::default()
             }],
-            output: outputs.into_iter().chain(coins).collect(),
+            output: outputs,
         };
         let options = json!({
             "add_inputs": true,
             "lock_unspents": false,
             "fee_rate": self.rate().await,
+            "changePosition": unsigned.output.len(),
             "input_weights": [{
                 "txid": deposit.txid.to_string(),
                 "vout": deposit.vout,

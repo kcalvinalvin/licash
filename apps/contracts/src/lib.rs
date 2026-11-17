@@ -5,9 +5,9 @@
 //! An opening is the exchange of `licash_contract::opening`'s two machines,
 //! carried as their envelopes. The holder takes the hub's [`Offer`] at
 //! [`QUOTE`], opens on it at [`OPEN`], then POSTs each of her messages to
-//! [`STEP`]. The hub answers each with its own messages and the instances
-//! she is to keep, which she fetches one by one at [`INSTANCE`]. A step of
-//! the hub's that takes long (funding, building its instances) answers
+//! [`STEP`]. The hub chooses which holder-garbled instances it keeps;
+//! she uploads them one by one at [`INSTANCE`]. A step of
+//! the hub's that takes long (funding, checking opened instances) answers
 //! 202 until done: she sends the same message again, and gets the answer.
 //!
 //! Openings under the mock authority (anyone "proves" anything) are for
@@ -20,15 +20,15 @@
 
 use anyhow::{bail, Result};
 use hex_literal::hex;
-use licash::base::Programs;
 use licash::spend::ChainProfile;
-use licash::statement::Journal;
-use licash_contract::opening::{Bounds, Quote, Statement, Trust};
+use licash_contract::opening::{Bounds, Quote, Trust};
 use licash_contract::wire::{Reader, Writer};
 
 pub mod holder;
 #[cfg(feature = "node")]
 pub mod hub;
+#[cfg(test)]
+mod testing;
 
 /// GET: the hub's [`Offer`].
 pub const QUOTE: &str = "/v1/contracts/quote";
@@ -36,8 +36,8 @@ pub const QUOTE: &str = "/v1/contracts/quote";
 pub const OPEN: &str = "/v1/contracts/open";
 /// POST the holder's next message of opening `id` (hex): as [`OPEN`].
 pub const STEP: &str = "/v1/contracts/openings/{id}";
-/// GET instance `index` of assertion `stage` the hub serves opening `id`.
-pub const INSTANCE: &str = "/v1/contracts/openings/{id}/instances/{stage}/{index}";
+/// POST a committed kept instance, as a versioned opening envelope.
+pub const INSTANCE: &str = "/v1/contracts/openings/{id}/instances";
 
 /// The most bytes a request or an answer of an opening holds.
 pub const MAX_BODY: usize = 64 << 20;
@@ -108,8 +108,6 @@ impl Opening {
 pub enum Frame {
     /// One of its messages.
     Message(Vec<u8>),
-    /// An instance the holder keeps, to fetch at [`INSTANCE`].
-    Instance { stage: usize, index: usize },
 }
 
 impl Frame {
@@ -121,11 +119,6 @@ impl Frame {
                 Frame::Message(bytes) => {
                     w.u8(0);
                     w.blob(bytes);
-                }
-                Frame::Instance { stage, index } => {
-                    w.u8(1);
-                    w.u16(*stage as u16);
-                    w.u16(*index as u16);
                 }
             }
         }
@@ -139,10 +132,6 @@ impl Frame {
         for _ in 0..n {
             frames.push(match r.u8()? {
                 0 => Frame::Message(r.blob()?.to_vec()),
-                1 => Frame::Instance {
-                    stage: usize::from(r.u16()?),
-                    index: usize::from(r.u16()?),
-                },
                 tag => bail!("a frame of tag {tag}"),
             });
         }
@@ -162,8 +151,7 @@ pub fn trust(profile: ChainProfile) -> Result<Trust> {
     match profile {
         ChainProfile::Core30DefaultRegtest => Ok(Trust::mock()),
         ChainProfile::Core30Signet => Ok(Trust {
-            programs: SIGNET,
-            statement: signet_statement,
+            program: SIGNET,
             mock: false,
         }),
         _ => bail!("contracts are not opened on {profile} yet"),
@@ -175,16 +163,10 @@ pub fn trust(profile: ChainProfile) -> Result<Trust> {
 /// `r0/README.md` names. Each is kept as `r0/programs/<image id>.bin`:
 /// the contracts opened under one are proven with it alone, so none named
 /// here is ever to go. Import verification currently supports only this
-/// holder image; preserve it until prior-image verification is implemented.
-pub const SIGNET: Programs = Programs {
-    holder: hex!("8be30cb2a683e896d251c7c363dddf794dc8ddb9d502922199cfa4d2f73b1390"),
-    counter: hex!("25051741d3d6438bc7f78ebf074a4b93f30363729564345bb800efd43ce21129"),
-};
-
-/// What a proof by [`SIGNET`]'s holder program answers.
-fn signet_statement(journal: &Journal) -> Statement {
-    Statement::genuine(&SIGNET.holder, journal)
-}
+/// program. Binding openings retain their stored image ID when opening
+/// trust changes, so each such program must remain available to the hub.
+pub const SIGNET: [u8; 32] =
+    hex!("6bf78e6092f9c0959cee4908b449a032e575d527c5c889d8b9f3813b888f0d0c");
 
 /// The SQLite file at `path`, readable by its owner only, made so before
 /// anything is written to it.
@@ -228,11 +210,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_holder_image_stays_fixed_until_prior_openings_remain_verifiable() {
+    fn the_hub_statement_image_is_pinned() {
         assert_eq!(
-            SIGNET.holder,
-            hex!("8be30cb2a683e896d251c7c363dddf794dc8ddb9d502922199cfa4d2f73b1390"),
-            "changing the holder image strands prior funded openings: full and corrected proofs use the current authority; add prior-image verification and a genuine prior-image proof regression first"
+            SIGNET,
+            hex!("6bf78e6092f9c0959cee4908b449a032e575d527c5c889d8b9f3813b888f0d0c"),
+            "keep every funded contract's pinned guest available when changing opening trust"
         );
     }
 
@@ -240,7 +222,7 @@ mod tests {
     fn frames_read_back_as_written() {
         let frames = vec![
             Frame::Message(vec![1, 2, 3]),
-            Frame::Instance { stage: 1, index: 3 },
+            Frame::Message(vec![4, 5]),
             Frame::Message(Vec::new()),
         ];
         let bytes = Frame::encode_all(&frames);
@@ -259,7 +241,7 @@ mod tests {
         // Signet's are genuine; none elsewhere yet.
         let signet = trust(ChainProfile::Core30Signet).unwrap();
         assert!(!signet.mock);
-        assert_eq!(signet.programs, SIGNET);
+        assert_eq!(signet.program, SIGNET);
         for profile in [ChainProfile::Core30Mainnet, ChainProfile::Mutinynet] {
             assert!(trust(profile).is_err());
         }
@@ -268,24 +250,30 @@ mod tests {
     #[test]
     fn the_programs_contracts_open_under_are_kept_by_image_id() {
         let kept = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../r0/programs");
-        for id in [SIGNET.holder, SIGNET.counter] {
-            let program = kept.join(format!("{}.bin", hex::encode(id)));
-            let size = std::fs::metadata(&program).map_or(0, |m| m.len());
-            assert!(size > 0, "{} is not kept", program.display());
-        }
+        let program = kept.join(format!("{}.bin", hex::encode(SIGNET)));
+        let size = std::fs::metadata(&program).map_or(0, |m| m.len());
+        assert!(size > 0, "{} is not kept", program.display());
     }
 
     #[test]
-    fn signet_proofs_answer_risc_zeros_key_for_its_holder_program() {
-        let journal = Journal::from_bytes(&[5; 68]).unwrap();
-        let statement = (trust(ChainProfile::Core30Signet).unwrap().statement)(&journal);
-        let holders = Statement::genuine(&SIGNET.holder, &journal);
-        assert_eq!(statement.public, holders.public);
-        assert_eq!(statement.vk, holders.vk);
-        // Not the mock key, nor the counter program's inputs.
-        let mock = (Trust::mock().statement)(&journal);
-        assert_ne!(statement.vk, mock.vk);
-        let counters = Statement::genuine(&SIGNET.counter, &journal);
-        assert_ne!(statement.public, counters.public);
+    fn signet_proofs_answer_risc_zeros_key_for_the_hub_statement() {
+        use lichen_babe::statement::Kind;
+        let journal = [5; 68];
+        let trusted = trust(ChainProfile::Core30Signet).unwrap();
+        let statement = Kind::Risc0 {
+            image: trusted.program,
+        };
+        let pinned = Kind::Risc0 { image: SIGNET };
+        assert_eq!(
+            statement.public_inputs(&journal),
+            pinned.public_inputs(&journal)
+        );
+        assert_eq!(statement.verifying_key(), pinned.verifying_key());
+        assert_ne!(statement.verifying_key(), Kind::Mock.verifying_key());
+        let another = Kind::Risc0 { image: [9; 32] };
+        assert_ne!(
+            statement.public_inputs(&journal),
+            another.public_inputs(&journal)
+        );
     }
 }

@@ -8,6 +8,7 @@
 //! again gets the answer the stored machine gives ([`Hub::pending`]), and
 //! effects cut short by a restart run again then.
 
+mod dispute;
 mod node;
 mod responses;
 mod run;
@@ -19,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use anyhow::{ensure, Context as _, Result};
+use anyhow::{ensure, Result};
 use axum::body::{Body, Bytes};
 use axum::extract::{DefaultBodyLimit, Path as UrlPath, Query, Request, State};
 use axum::http::StatusCode;
@@ -27,6 +28,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
+pub use dispute::{Evidencer, Played};
 use futures_util::StreamExt;
 use licash::note::Keyset;
 use licash::spend::ChainProfile;
@@ -72,6 +74,10 @@ pub struct Openings {
     heavy: Arc<tokio::sync::Semaphore>,
     /// Held from funding an F to locking its coins: no two take the same.
     funding: tokio::sync::Mutex<()>,
+    /// The responder's caches.
+    watch: dispute::Watch,
+    /// Where the responder finds its evidence against a filing.
+    evidencer: std::sync::OnceLock<Arc<Evidencer>>,
 }
 
 /// One responder poll. A bad opening never hides the others; errors are
@@ -195,7 +201,7 @@ fn peek(state: &[u8]) -> Option<Terms> {
         fee: p.fees.opening_fee_quote,
         reserve: p.graph.reserve_alice,
         graph: p.graph.graph_value().ok()?,
-        funding: peek.funding,
+        funding: peek.funding.map(|tx| tx.compute_txid()),
     })
 }
 
@@ -250,6 +256,8 @@ impl Openings {
             busy: Mutex::new(HashSet::new()),
             heavy: Arc::new(tokio::sync::Semaphore::new(HEAVY)),
             funding: tokio::sync::Mutex::new(()),
+            watch: dispute::Watch::default(),
+            evidencer: std::sync::OnceLock::new(),
         });
         // A node restarted forgets the coins it locked without persisting.
         let locked = openings.store().locked()?;
@@ -332,97 +340,35 @@ impl Openings {
         });
     }
 
-    /// Its plain answer to `r`, the holder's request on Bitcoin in
-    /// opening `id`, to broadcast: her proof decides then. Refused for an
-    /// opening not funded, given up or unknown, or a transaction not its
-    /// request. Pins its witness and answer in `responses.sqlite`, shared
-    /// with the operator command, before returning anything to broadcast.
-    pub async fn respond(
-        &self,
-        id: &[u8; 32],
-        r: &bitcoin::Transaction,
-    ) -> Result<bitcoin::Transaction> {
-        let ctx = self
-            .context()
-            .await
-            .map_err(|e| anyhow::anyhow!(e.reason))?;
-        let row = self.store().row(id)?;
-        answer(&self.data, row, &ctx, id, r)
+    /// Find the evidence against filings with `f` from now on: the hub's
+    /// record of spent notes. Without, a filing is owed what its notes are
+    /// worth, and only claims that are none are answered.
+    pub fn evidence_with(&self, f: Arc<Evidencer>) {
+        let _ = self.evidencer.set(f);
     }
 
-    /// Answer confirmed requests whose outputs are still unspent, without
-    /// a scan or txindex. Each opening's error is reported independently.
-    /// No hub timeout is broadcast, even after the assertion deadline.
+    /// Play each signed opening's exit, if any, one step
+    /// ([`dispute`]). Each opening's error is reported independently.
     pub async fn answer_requests(&self) -> Result<ResponseRound> {
         let ids = self.store().signed_ids()?;
         let mut round = ResponseRound::default();
         for id in ids {
-            match self.answer_request(&id).await {
-                Ok(true) => round.answered += 1,
-                Ok(false) => {}
+            match self.play(&id).await {
+                Ok(Played::Posted(what)) => {
+                    round.answered += 1;
+                    tracing::info!(id = %crate::hex_id(&id), what, "contract exit played");
+                }
+                Ok(Played::Idle) => {}
                 Err(e) => {
                     round.failed += 1;
-                    tracing::error!(id = %crate::hex_id(&id), "answering a contract request: {e:#}")
+                    tracing::error!(id = %crate::hex_id(&id), "playing a contract exit: {e:#}")
                 }
             }
         }
         Ok(round)
     }
 
-    async fn answer_request(&self, id: &[u8; 32]) -> Result<bool> {
-        let ctx = self
-            .context()
-            .await
-            .map_err(|e| anyhow::anyhow!(e.reason))?;
-        let row = self.store().row(id)?.context("no signed opening")?;
-        let opening = Hub::load(&row.state, &ctx)?.opening()?;
-        let request = opening
-            .set
-            .iter()
-            .find(|p| p.name == "request")
-            .context("no request link")?;
-        let txid = request.tx.compute_txid();
-        // Include the chain only: an answer already in the mempool is
-        // rebroadcast, not mistaken for a confirmed resolution.
-        let coin: Option<serde_json::Value> = self
-            .wallet
-            .rpc_optional("gettxout", serde_json::json!([txid.to_string(), 0, false]))
-            .await?;
-        let Some(coin) = coin else {
-            return Ok(false);
-        };
-        let depth = coin["confirmations"].as_u64().context("no request depth")?;
-        if depth < u64::from(opening.base.parts().chain.request_depth) {
-            return Ok(false);
-        }
-        let tip = self.source.tip().await?;
-        ensure!(
-            coin["bestblock"].as_str() == Some(&tip.hash.to_string()),
-            "contracts wallet and chain source have different tips"
-        );
-        let height = u64::from(tip.height)
-            .checked_add(1)
-            .and_then(|h| h.checked_sub(depth))
-            .context("request depth exceeds chain height")?;
-        let hash = self.source.hash(u32::try_from(height)?).await?;
-        let block = self.source.block(&hash).await?;
-        ensure!(
-            block.check_witness_commitment(),
-            "request block has an invalid witness commitment"
-        );
-        let r = block
-            .txdata
-            .iter()
-            .find(|tx| tx.compute_txid() == txid)
-            .context("request missing from its confirmed block")?;
-        let answer = self.respond(id, r).await?;
-        let answered = self.source.broadcast(&answer).await?;
-        tracing::info!(id = %crate::hex_id(id), request = %txid, response = %answered, "contract request answered");
-        Ok(true)
-    }
-
-    /// Poll while the hub runs. Enabling this is an explicit operator
-    /// action, including for contracts from an older installation.
+    /// Poll every `every` while the hub runs.
     pub fn spawn_responder(self: &Arc<Self>, every: Duration) {
         let this = self.clone();
         tokio::spawn(async move {
@@ -452,55 +398,11 @@ impl Openings {
     }
 }
 
-/// The plain answer to `r` in opening `id` of the openings in `data`, as
-/// [`Openings::respond`], on the chain `source` follows: read beside the
-/// running hub, for its operator. Needs neither the hub's seed nor its
-/// wallet. Records its one-time signing pin in `responses.sqlite`, shared
-/// with the running hub. Keep that file with the opening's state.
-pub async fn respond(
-    data: &Path,
-    source: &Source,
-    id: &[u8; 32],
-    r: &bitcoin::Transaction,
-) -> Result<bitcoin::Transaction> {
-    let trust = crate::trust(source.profile().await?)?;
-    let tip = source.tip().await?.height;
-    answer(data, Store::read(data, id)?, &Context { tip, trust }, id, r)
-}
-
-fn answer(
-    data: &Path,
-    row: Option<store::Row>,
-    ctx: &Context,
-    id: &[u8; 32],
-    r: &bitcoin::Transaction,
-) -> Result<bitcoin::Transaction> {
-    let row = row.with_context(|| format!("no opening {}", crate::hex_id(id)))?;
-    ensure!(!row.abandoned, "an opening given up");
-    // Validate before pinning, but do not sign until the pin is durable.
-    let opening = Hub::load(&row.state, ctx)?.opening()?;
-    let request = opening
-        .set
-        .iter()
-        .find(|p| p.name == "request")
-        .context("no request link")?;
-    ensure!(
-        r.compute_txid() == request.tx.compute_txid(),
-        "not this contract's request"
-    );
-    let leaf = opening.prefix.leaf();
-    let items: Vec<Vec<u8>> = r.input[0].witness.iter().map(<[u8]>::to_vec).collect();
-    leaf.keys()
-        .decode_witness(&items, leaf.script(), leaf.control())?;
-    responses::Responses::open(data)?.answer(id, r, || Hub::load(&row.state, ctx)?.respond(r))
-}
-
 /// The routes of `openings`, at [`QUOTE`], [`OPEN`], [`STEP`] and
 /// [`INSTANCE`].
 pub fn router(openings: Arc<Openings>) -> Router {
     // Separate budgets let existing openings progress while new opens or
-    // instance downloads are saturated. Four downloads preserve the
-    // holder's normal parallel fetch. Body permits precede extraction and
+    // instance uploads are saturated. Body permits precede extraction and
     // last until the response body is dropped, not merely constructed.
     let budget =
         |count| middleware::from_fn_with_state(Arc::new(tokio::sync::Semaphore::new(count)), admit);
@@ -508,7 +410,7 @@ pub fn router(openings: Arc<Openings>) -> Router {
         .route(QUOTE, get(quote).layer(budget(2)))
         .route(OPEN, post(open).layer(budget(2)))
         .route(STEP, post(step).layer(budget(2)))
-        .route(INSTANCE, get(instance).layer(budget(4)))
+        .route(INSTANCE, post(instance).layer(budget(4)))
         .layer(DefaultBodyLimit::max(MAX_BODY))
         .with_state(openings)
 }
@@ -587,10 +489,16 @@ async fn step(
 
 async fn instance(
     State(openings): State<Arc<Openings>>,
-    UrlPath((id, stage, index)): UrlPath<(String, usize, usize)>,
-) -> Result<Vec<u8>, Refused> {
+    UrlPath(id): UrlPath<String>,
+    body: Bytes,
+) -> Result<Answer, Refused> {
     let id = crate::parse_id(&id).map_err(Refused::bad)?;
-    openings.instance(id, stage, index).await
+    if licash_contract::wire::Kind::peek(&body) != Some(licash_contract::wire::Kind::Instance) {
+        return Err(Refused::bad(
+            "an instance upload requires an Instance envelope",
+        ));
+    }
+    openings.step(id, body.to_vec()).await
 }
 
 #[cfg(test)]
@@ -636,10 +544,9 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
     }
 
-    /// A hub's opening at Funded, as `licash_contract`'s golden test keeps
-    /// it: of a mock opening on regtest.
-    const FUNDED: &[u8] =
-        include_bytes!("../../../crates/licash-contract/tests/golden/hub-funded.bin");
+    fn funded() -> &'static [u8] {
+        &crate::testing::opened().hub
+    }
 
     fn deposit(vout: u32) -> bitcoin::OutPoint {
         use bitcoin::hashes::Hash as _;
@@ -651,7 +558,7 @@ mod tests {
 
     fn test_openings(dir: &Path) -> Openings {
         let profile = ChainProfile::Core30DefaultRegtest;
-        let keyset = Hub::peek(FUNDED).unwrap().base.parts().keyset.clone();
+        let keyset = Hub::peek(funded()).unwrap().base.parts().keyset.clone();
         let source: Source = "http://127.0.0.1:1".parse().unwrap();
         Openings {
             data: dir.to_owned(),
@@ -664,6 +571,8 @@ mod tests {
             busy: Mutex::new(HashSet::new()),
             heavy: Arc::new(tokio::sync::Semaphore::new(HEAVY)),
             funding: tokio::sync::Mutex::new(()),
+            watch: dispute::Watch::default(),
+            evidencer: std::sync::OnceLock::new(),
         }
     }
 
@@ -674,7 +583,7 @@ mod tests {
         let id = [5; 32];
         let store = openings.store();
         store
-            .insert(&id, 0, true, &deposit(0), &[0; 32], FUNDED)
+            .insert(&id, 0, true, &deposit(0), &[0; 32], funded())
             .unwrap();
         store.set_coins(&id, &[deposit(1)]).unwrap();
         std::thread::scope(|scope| {
@@ -704,7 +613,7 @@ mod tests {
         let id = [3; 32];
         openings
             .store()
-            .insert(&id, 0, true, &deposit(0), &[0; 32], FUNDED)
+            .insert(&id, 0, true, &deposit(0), &[0; 32], funded())
             .unwrap();
         openings.store().set_coins(&id, &[deposit(1)]).unwrap();
         assert_eq!(openings.store().stale(i64::MAX).unwrap(), vec![id]);
@@ -712,7 +621,7 @@ mod tests {
         assert!(openings.abandon_idle(&id, i64::MAX).unwrap().is_none());
         openings
             .store()
-            .save(&id, HubPhase::Funded as u8, true, &[0; 32], FUNDED)
+            .save(&id, HubPhase::Funded as u8, true, &[0; 32], funded())
             .unwrap();
         openings.busy().remove(&id);
         assert!(openings.abandon_idle(&id, i64::MAX).unwrap().is_none());
@@ -730,7 +639,7 @@ mod tests {
         let store = Store::open(dir.path()).unwrap();
         let id = [4; 32];
         store
-            .insert(&id, 0, true, &deposit(0), &[0; 32], FUNDED)
+            .insert(&id, 0, true, &deposit(0), &[0; 32], funded())
             .unwrap();
         store.set_coins(&id, &[deposit(1)]).unwrap();
         let db = rusqlite::Connection::open(dir.path().join("openings.sqlite")).unwrap();
@@ -738,7 +647,7 @@ mod tests {
             .unwrap();
         let before = crate::now() - 1;
         assert_eq!(store.stale(before).unwrap(), vec![id]);
-        store.save(&id, 0, false, &[1; 32], FUNDED).unwrap();
+        store.save(&id, 0, false, &[1; 32], funded()).unwrap();
         assert!(store.abandon(&id, before).unwrap().is_none());
         assert!(!store.row(&id).unwrap().unwrap().abandoned);
         // A candidate's coin snapshot is not an authorization to unlock it.
@@ -774,11 +683,11 @@ mod tests {
                     true,
                     &deposit(u32::from(id)),
                     &[0; 32],
-                    FUNDED
+                    funded()
                 )
                 .unwrap());
             store
-                .save(&[id; 32], HubPhase::Funded as u8, true, &[0; 32], FUNDED)
+                .save(&[id; 32], HubPhase::Funded as u8, true, &[0; 32], funded())
                 .unwrap();
         };
         // Not told what it charges: nothing kept, and the file as it was.
@@ -801,11 +710,11 @@ mod tests {
         // One never signed, one whose deposit is another's, one given up.
         assert!(openings
             .store()
-            .insert(&[3; 32], 0, true, &deposit(3), &[0; 32], FUNDED)
+            .insert(&[3; 32], 0, true, &deposit(3), &[0; 32], funded())
             .unwrap());
         assert!(!openings
             .store()
-            .insert(&[4; 32], 0, true, &deposit(3), &[0; 32], FUNDED)
+            .insert(&[4; 32], 0, true, &deposit(3), &[0; 32], funded())
             .unwrap());
         openings.store().abandon(&[3; 32], i64::MAX).unwrap();
         openings.charging(now);
@@ -831,10 +740,10 @@ mod tests {
         let store = Store::open(dir.path()).unwrap();
         assert!(openings(dir.path()).unwrap().is_empty());
         store
-            .insert(&[1; 32], 0, true, &deposit(0), &[0; 32], FUNDED)
+            .insert(&[1; 32], 0, true, &deposit(0), &[0; 32], funded())
             .unwrap();
         store
-            .save(&[1; 32], HubPhase::Funded as u8, true, &[0; 32], FUNDED)
+            .save(&[1; 32], HubPhase::Funded as u8, true, &[0; 32], funded())
             .unwrap();
         // A state that does not read, given up.
         store
@@ -850,7 +759,7 @@ mod tests {
         assert!(funded.mock && funded.signed && !funded.abandoned);
         assert!(funded.updated_at >= funded.created_at && funded.created_at > 0);
         let terms = funded.terms.as_ref().unwrap();
-        let peek = Hub::peek(FUNDED).unwrap();
+        let peek = Hub::peek(&crate::testing::opened().hub).unwrap();
         let parts = peek.base.parts();
         assert_eq!(
             (terms.cap, terms.close, terms.fee, terms.reserve),
@@ -872,7 +781,7 @@ mod tests {
             ),
             (4_096, 504, 3_000, 20_000, (1 << 21) - 1 + 120_000)
         );
-        assert_eq!(terms.funding, peek.funding);
+        assert_eq!(terms.funding, peek.funding.map(|tx| tx.compute_txid()));
         assert!(terms.funding.is_some());
         assert_eq!(abandoned.phase, Some(HubPhase::Termed));
         assert!(abandoned.abandoned && !abandoned.signed);

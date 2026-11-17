@@ -541,11 +541,11 @@ async fn a_holder_forces_her_contract_closed_on_a_silent_hub_and_takes_her_notes
     Ok(())
 }
 
-/// The response window makes a timeout eligible, but does not expire the
-/// hub's answer. A holder must still be ready to prove after that window.
+/// An honest forced close at a hub that plays exits: her claim is owed all
+/// it asks, so the hub posts nothing and her timeout pays her.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs bitcoind and a release build"]
-async fn a_hubs_answer_can_confirm_after_its_response_window() -> Result<()> {
+async fn a_hub_lets_an_honest_claim_time_out_to_its_holder() -> Result<()> {
     use bitcoin::FeeRate;
     use licash_contracts::holder::recovery::{self, Stage};
 
@@ -558,162 +558,40 @@ async fn a_hubs_answer_can_confirm_after_its_response_window() -> Result<()> {
     std::fs::create_dir(&mine)?;
     let wallet = Wallet::create(
         &mine.join("wallet.sqlite"),
-        &[19; 32],
+        &[21; 32],
         ChainProfile::Core30DefaultRegtest,
         Http::new(None)?,
     )?;
     wallet.add_hub(&url).await?;
     wallet.watch_silent(None, rt.height()?)?;
     for sats in [60_000, 50_000] {
-        rt.fund(
-            &wallet.fallback_address()?.script_pubkey(),
-            Amount::from_sat(sats),
-        )?;
+        let to = wallet.fallback_address()?.script_pubkey();
+        rt.fund(&to, Amount::from_sat(sats))?;
     }
     rt.mine(1)?;
     scan(&wallet, &chain).await?;
     let opened = holder::open(&wallet, &chain, &mine, &url, ask()).await?;
-    wallet.receive(&pay(
-        &hub,
-        &at.join("seed"),
-        &url,
-        &wallet.address(),
-        3_000,
-    )?)?;
+    let rate = FeeRate::from_sat_per_vb(2).context("a rate")?;
+    let payment = pay(&hub, &at.join("seed"), &url, &wallet.address(), 3_000)?;
+    wallet.receive(&payment)?;
     rt.mine(1)?;
     holder::resume(&wallet, &chain, &mine).await?;
-    let rate = FeeRate::from_sat_per_vb(2).context("a rate")?;
-    let forced = recovery::force_close(&wallet, &chain, &mine, &opened.id, rate).await?;
-    rt.mine_to_height(forced.next_at.context("no lock")? - 1)?;
-    recovery::advance(&wallet, &chain, &mine, rate).await?;
-    rt.mine(1)?;
-    let requested = recovery::advance(&wallet, &chain, &mine, rate).await?;
-    ensure!(requested[0].stage == Stage::Requested, "{requested:?}");
-    let window_end = requested[0].next_at.context("no window")?;
-    let r = rt.get_tx(&requested[0].request.context("no request")?)?;
+    recovery::force_close(&wallet, &chain, &mine, &opened.id, rate).await?;
 
-    // No timeout is broadcast while the holder is offline. The response
-    // confirms strictly after the earliest timeout block.
-    rt.mine_to_height(window_end + 1)?;
-    let answer = openings.respond(&opened.id, &r).await?;
-    rt.send_raw(&answer)?;
-    rt.mine(1)?;
-    let observed = recovery::advance(&wallet, &chain, &mine, rate).await?;
-    ensure!(observed[0].error.is_none(), "{observed:?}");
-    ensure!(observed[0].stage.disputed(), "{observed:?}");
-    ensure!(
-        observed[0].response == Some(answer.compute_txid()),
-        "{observed:?}"
-    );
-    ensure!(observed[0].timeout.is_none(), "{observed:?}");
-    Ok(())
-}
-
-/// The daemon needs no scan cursor and an upgraded opening needs no
-/// rewrite. A late first poll and a restart still use just one answer.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs bitcoind and a release build"]
-async fn a_hub_automatically_answers_and_restarts_with_the_same_one_time_answer() -> Result<()> {
-    use bitcoin::FeeRate;
-    use licash_contracts::holder::recovery::{self, Stage};
-
-    let rt = Regtest::start_standard()?;
-    let dir = tempfile::tempdir()?;
-    let at = dir.path().join("hub");
-    let (url, source, hub, openings) = hub_answering(&rt, &at).await?;
-    let chain = Node(source.clone());
-    let mine = dir.path().join("wallet");
-    std::fs::create_dir(&mine)?;
-    let wallet = Wallet::create(
-        &mine.join("wallet.sqlite"),
-        &[29; 32],
-        ChainProfile::Core30DefaultRegtest,
-        Http::new(None)?,
-    )?;
-    wallet.add_hub(&url).await?;
-    wallet.watch_silent(None, rt.height()?)?;
-    for sats in [60_000, 50_000] {
-        rt.fund(
-            &wallet.fallback_address()?.script_pubkey(),
-            Amount::from_sat(sats),
-        )?;
+    let mut done = None;
+    for _ in 0..400 {
+        rt.mine(1)?;
+        let round = openings.answer_requests().await?;
+        ensure!(round.answered == 0 && round.failed == 0, "{round:?}");
+        let all = recovery::advance(&wallet, &chain, &mine, rate).await?;
+        ensure!(all[0].stage != Stage::Answered, "{all:?}");
+        if all[0].stage == Stage::Done {
+            done = Some(all[0].clone());
+            break;
+        }
     }
-    rt.mine(1)?;
-    scan(&wallet, &chain).await?;
-    let opened = holder::open(&wallet, &chain, &mine, &url, ask()).await?;
-    wallet.receive(&pay(
-        &hub,
-        &at.join("seed"),
-        &url,
-        &wallet.address(),
-        3_000,
-    )?)?;
-    rt.mine(1)?;
-    holder::resume(&wallet, &chain, &mine).await?;
-    let rate = FeeRate::from_sat_per_vb(2).context("a rate")?;
-    let forced = recovery::force_close(&wallet, &chain, &mine, &opened.id, rate).await?;
-    rt.mine_to_height(forced.next_at.context("no lock")? - 1)?;
-    recovery::advance(&wallet, &chain, &mine, rate).await?;
-    // No signature for R while it is only in the mempool (depth 0).
-    ensure!(
-        openings.answer_requests().await?
-            == licash_contracts::hub::ResponseRound {
-                answered: 0,
-                failed: 0
-            }
-    );
-    ensure!(!at.join("responses.sqlite").exists());
-    rt.mine(1)?;
-    let requested = recovery::advance(&wallet, &chain, &mine, rate).await?;
-    let r = rt.get_tx(&requested[0].request.context("no request")?)?;
-    rt.mine_to_height(requested[0].next_at.context("no window")? + 1)?;
-
-    // A broken unrelated row must not hide the actual request.
-    let db = rusqlite::Connection::open(at.join("openings.sqlite"))?;
-    db.execute("INSERT INTO openings SELECT ?1, format, phase, mock, irrevocable, ?2, coins, last, x'00', abandoned, created_at, updated_at FROM openings WHERE id = ?3", rusqlite::params![[99_u8; 32], vec![99_u8; 36], opened.id])?;
-    ensure!(
-        openings.answer_requests().await?
-            == licash_contracts::hub::ResponseRound {
-                answered: 1,
-                failed: 1
-            }
-    );
-    let answer = openings.respond(&opened.id, &r).await?;
-    // Manual fallback shares and returns the exact same stored answer.
-    let manual = licash_contracts::hub::respond(&at, &source, &opened.id, &r).await?;
-    ensure!(manual == answer);
-    let restarted = Openings::with_wallet(
-        &at,
-        source.clone(),
-        source,
-        hub.info().keysets[0].clone(),
-        None,
-    )
-    .await?;
-    ensure!(
-        restarted.answer_requests().await?
-            == licash_contracts::hub::ResponseRound {
-                answered: 1,
-                failed: 1
-            }
-    );
-    ensure!(restarted.respond(&opened.id, &r).await? == answer);
-    rt.mine(1)?;
-    ensure!(
-        restarted.answer_requests().await?
-            == licash_contracts::hub::ResponseRound {
-                answered: 0,
-                failed: 1
-            }
-    );
-    let observed = recovery::advance(&wallet, &chain, &mine, rate).await?;
-    ensure!(observed[0].error.is_none(), "{observed:?}");
-    ensure!(observed[0].stage.disputed(), "{observed:?}");
-    ensure!(
-        observed[0].response == Some(answer.compute_txid()),
-        "{observed:?}"
-    );
-    ensure!(observed[0].stage != Stage::Lost);
+    let done = done.context("never paid")?;
+    ensure!(done.received.is_some_and(|r| r > 3_000), "{done:?}");
     Ok(())
 }
 
@@ -745,169 +623,6 @@ async fn hub_answering(
     let url = format!("http://{}", listener.local_addr()?);
     tokio::spawn(async move { axum::serve(listener, app).await });
     Ok((url, source, hub, openings))
-}
-
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs bitcoind and a release build"]
-async fn a_holder_proves_her_claim_against_a_hub_that_answered_and_takes_her_notes_value(
-) -> Result<()> {
-    use bitcoin::FeeRate;
-    use licash_contracts::holder::recovery::{self, Stage};
-
-    let rt = Regtest::start_standard()?;
-    let dir = tempfile::tempdir()?;
-    let at = dir.path().join("hub");
-    let (url, source, hub, openings) = hub_answering(&rt, &at).await?;
-    let chain = Node(source);
-    let mine = dir.path().join("wallet");
-    std::fs::create_dir(&mine)?;
-    let regtest = ChainProfile::Core30DefaultRegtest;
-    let wallet = Wallet::create(
-        &mine.join("wallet.sqlite"),
-        &[9; 32],
-        regtest,
-        Http::new(None)?,
-    )?;
-    wallet.add_hub(&url).await?;
-    wallet.watch_silent(None, rt.height()?)?;
-    for sats in [60_000, 50_000] {
-        let to = wallet.fallback_address()?.script_pubkey();
-        rt.fund(&to, Amount::from_sat(sats))?;
-    }
-    rt.mine(1)?;
-    ensure!(scan(&wallet, &chain).await? == 110_000);
-    let opened = holder::open(&wallet, &chain, &mine, &url, ask()).await?;
-    let rate = FeeRate::from_sat_per_vb(2).context("a rate")?;
-    let payment = pay(&hub, &at.join("seed"), &url, &wallet.address(), 3_000)?;
-    wallet.receive(&payment)?;
-    rt.mine(1)?;
-    holder::resume(&wallet, &chain, &mine).await?;
-
-    // Forced closed; R and P in a block once revocable no more.
-    let forced = recovery::force_close(&wallet, &chain, &mine, &opened.id, rate).await?;
-    ensure!(forced.stage == Stage::Claimed, "{forced:?}");
-    rt.mine_to_height(forced.next_at.context("no lock")? - 1)?;
-    let sent = recovery::advance(&wallet, &chain, &mine, rate).await?;
-    ensure!(sent[0].stage == Stage::Published, "{sent:?}");
-    rt.mine(1)?;
-    let requested = recovery::advance(&wallet, &chain, &mine, rate).await?;
-    let requested = &requested[0];
-    ensure!(requested.stage == Stage::Requested, "{requested:?}");
-
-    // No statement to prove, nor proof taken, before the hub answers.
-    ensure!(recovery::statement(&mine, &opened.id).is_err());
-    let early = recovery::import_proof(&wallet, &chain, &mine, &opened.id, b"{}", rate).await;
-    ensure!(early.is_err(), "{early:?}");
-
-    // The hub answers: her proof decides.
-    let r = rt.get_tx(&requested.request.context("no R")?)?;
-    let answer = openings.respond(&opened.id, &r).await?;
-    let wrong = openings.respond(&opened.id, &answer).await;
-    ensure!(wrong.is_err(), "an answer to its own answer");
-    rt.send_raw(&answer)?;
-    rt.mine(1)?;
-    let answered = &recovery::advance(&wallet, &chain, &mine, rate).await?[0];
-    ensure!(answered.error.is_none(), "{answered:?}");
-    ensure!(
-        answered.response == Some(answer.compute_txid()) && answered.timeout.is_none(),
-        "{answered:?}"
-    );
-    ensure!(
-        matches!(answered.stage, Stage::Answered | Stage::Asserting),
-        "{answered:?}"
-    );
-    let deadline = answered.deadline;
-
-    // Her statement built once R and P are deep enough, her proof made
-    // under the mock authority, her assert broadcast, then in a block.
-    let mut asserted = answered.clone();
-    for _ in 0..20 {
-        if asserted.stage == Stage::Asserted {
-            break;
-        }
-        ensure!(asserted.error.is_none(), "{asserted:?}");
-        rt.mine(1)?;
-        asserted = recovery::advance(&wallet, &chain, &mine, rate).await?[0].clone();
-    }
-    ensure!(asserted.stage == Stage::Asserted, "{asserted:?}");
-    ensure!(asserted.error.is_none(), "{asserted:?}");
-    ensure!(
-        asserted.proved && asserted.assertion.is_some(),
-        "{asserted:?}"
-    );
-    let deadline = deadline.or(asserted.deadline).context("no deadline")?;
-    ensure!(
-        asserted.asserted_at.is_some_and(|h| h <= deadline),
-        "{asserted:?}"
-    );
-    let kept = mine
-        .join("contracts")
-        .join(hex::encode(opened.id))
-        .join("statement.input");
-    ensure!(kept.exists(), "no statement kept at {}", kept.display());
-    // What another machine proves: her statement's input, whole.
-    let statement = recovery::statement(&mine, &opened.id)?;
-    ensure!(statement == std::fs::read(&kept)?);
-    licash::statement::StatementInput::from_bytes(&statement)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-    // Another proof is refused: not an export, of another program.
-    let refused = |e: Result<recovery::Recovery>| format!("{:#}", e.unwrap_err());
-    let garbage = recovery::import_proof(&wallet, &chain, &mine, &opened.id, b"[", rate).await;
-    ensure!(refused(garbage).contains("not a proof's export"));
-    let other = serde_json::json!({
-        "image_id": hex::encode([0u8; 32]),
-        "journal": "",
-        "proof": hex::encode([0u8; 128]),
-    });
-    let other = serde_json::to_vec(&other)?;
-    let other = recovery::import_proof(&wallet, &chain, &mine, &opened.id, &other, rate).await;
-    ensure!(refused(other).contains("another program"));
-
-    // The hub's chance to challenge passes: success, of P's fee coin.
-    let chance_end = asserted.next_at.context("no chance")?;
-    rt.mine_to_height(chance_end - 2)?;
-    let held = recovery::advance(&wallet, &chain, &mine, rate).await?;
-    ensure!(held[0].stage == Stage::Asserted, "{held:?}");
-    rt.mine(1)?;
-    let succeeding = &recovery::advance(&wallet, &chain, &mine, rate).await?[0];
-    ensure!(succeeding.stage == Stage::Succeeding, "{succeeding:?}");
-    ensure!(succeeding.error.is_none(), "{succeeding:?}");
-    ensure!(succeeding.payout.is_some(), "{succeeding:?}");
-    rt.mine(1)?;
-    let paid = &recovery::advance(&wallet, &chain, &mine, rate).await?[0];
-    ensure!(
-        paid.stage == Stage::Paid && paid.paid_at == Some(rt.height()?),
-        "{paid:?}"
-    );
-
-    // Her bits and reserve, swept to her wallet once their delay passed.
-    let delay_end = paid.next_at.context("no delay")?;
-    rt.mine_to_height(delay_end - 2)?;
-    let held = recovery::advance(&wallet, &chain, &mine, rate).await?;
-    ensure!(held[0].stage == Stage::Paid, "{held:?}");
-    let before = scan(&wallet, &chain).await?;
-    rt.mine(1)?;
-    let sweeping = &recovery::advance(&wallet, &chain, &mine, rate).await?[0];
-    ensure!(sweeping.stage == Stage::Sweeping, "{sweeping:?}");
-    let sweep = sweeping.sweep.context("no sweep")?;
-    rt.mine(1)?;
-    let done = &recovery::advance(&wallet, &chain, &mine, rate).await?[0];
-    ensure!(
-        done.stage == Stage::Done && done.swept_at == Some(rt.height()?),
-        "{done:?}"
-    );
-    let swept = rt.get_tx(&sweep)?.output[0].value.to_sat();
-    let after = scan(&wallet, &chain).await?;
-    ensure!(
-        after == before + swept,
-        "{before} then {after}, {swept} swept"
-    );
-    ensure!(swept > 3_000, "{swept} swept");
-    eprintln!("swept {swept} sat to her wallet after her proof");
-    let over = recovery::advance(&wallet, &chain, &mine, rate).await?;
-    ensure!(over[0] == *done, "{over:?}");
-    Ok(())
 }
 
 /// A hub service opening contracts as [`hub_serving`], of notes up to
@@ -1060,110 +775,5 @@ async fn a_wallet_sweeps_its_coin_into_a_contract_and_notes_its_change_on_bitcoi
     let contracts = holder::resume(&wallet, &chain, &mine).await?;
     ensure!(contracts.iter().all(|c| c.fate == Some(Fate::Live)));
     ensure!(scan(&wallet, &chain).await? == 2_977_000);
-    Ok(())
-}
-
-/// `licash-hub respond`, beside the running hub: the operator answers her
-/// request from the openings alone, and she sees its answer on Bitcoin.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs bitcoind and a release build"]
-async fn an_operator_answers_a_holders_request_beside_the_running_hub() -> Result<()> {
-    use std::io::Write as _;
-    use std::process::{Command, Stdio};
-
-    use bitcoin::FeeRate;
-    use licash_contracts::holder::recovery::{self, Stage};
-
-    let rt = Regtest::start_standard()?;
-    let dir = tempfile::tempdir()?;
-    let at = dir.path().join("hub");
-    let (url, source, hub, _openings) = hub_answering(&rt, &at).await?;
-    let chain = Node(source);
-    let mine = dir.path().join("wallet");
-    std::fs::create_dir(&mine)?;
-    let regtest = ChainProfile::Core30DefaultRegtest;
-    let wallet = Wallet::create(
-        &mine.join("wallet.sqlite"),
-        &[9; 32],
-        regtest,
-        Http::new(None)?,
-    )?;
-    wallet.add_hub(&url).await?;
-    wallet.watch_silent(None, rt.height()?)?;
-    for sats in [60_000, 50_000] {
-        let to = wallet.fallback_address()?.script_pubkey();
-        rt.fund(&to, Amount::from_sat(sats))?;
-    }
-    rt.mine(1)?;
-    ensure!(scan(&wallet, &chain).await? == 110_000);
-    let opened = holder::open(&wallet, &chain, &mine, &url, ask()).await?;
-    let rate = FeeRate::from_sat_per_vb(2).context("a rate")?;
-    let payment = pay(&hub, &at.join("seed"), &url, &wallet.address(), 3_000)?;
-    wallet.receive(&payment)?;
-    rt.mine(1)?;
-    let live = holder::resume(&wallet, &chain, &mine).await?;
-    let funding = live[0].funding.context("no F")?;
-
-    let forced = recovery::force_close(&wallet, &chain, &mine, &opened.id, rate).await?;
-    rt.mine_to_height(forced.next_at.context("no lock")? - 1)?;
-    recovery::advance(&wallet, &chain, &mine, rate).await?;
-    rt.mine(1)?;
-    let requested = recovery::advance(&wallet, &chain, &mine, rate).await?;
-    ensure!(requested[0].stage == Stage::Requested, "{requested:?}");
-    let r = rt.get_tx(&requested[0].request.context("no R")?)?;
-    let r_hex = bitcoin::consensus::encode::serialize_hex(&r);
-
-    let rpc = format!(
-        "{}/wallet/harness?cookie={}",
-        rt.rpc_url(),
-        rt.cookie().display()
-    );
-    let respond = |id: &str, request: &str| {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_licash-hub"));
-        command
-            .arg("--data")
-            .arg(&at)
-            .args(["respond", id, request, "--chain", &rpc])
-            .env_remove("LICASH_HUB_SEED")
-            .env("RUST_LOG", "info")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        command
-    };
-
-    // Refused for an opening it does not have, or what is not R.
-    let file = dir.path().join("r.hex");
-    std::fs::write(&file, &r_hex)?;
-    let unknown = respond(&"00".repeat(32), &file.to_string_lossy()).output()?;
-    ensure!(!unknown.status.success(), "{unknown:?}");
-    let id = licash_contracts::hex_id(&opened.id);
-    let other = dir.path().join("f.hex");
-    let f = rt.get_tx(&funding)?;
-    std::fs::write(&other, bitcoin::consensus::encode::serialize_hex(&f))?;
-    let wrong = respond(&id, &other.to_string_lossy()).output()?;
-    ensure!(!wrong.status.success(), "{wrong:?}");
-
-    // Its answer to R, read from stdin, broadcast and printed.
-    let mut child = respond(&id, "-").spawn()?;
-    child
-        .stdin
-        .take()
-        .context("no stdin")?
-        .write_all(r_hex.as_bytes())?;
-    let out = child.wait_with_output()?;
-    ensure!(out.status.success(), "{out:?}");
-    let txid: bitcoin::Txid = String::from_utf8(out.stdout)?.trim().parse()?;
-    rt.mine(1)?;
-    let answered = &recovery::advance(&wallet, &chain, &mine, rate).await?[0];
-    ensure!(answered.error.is_none(), "{answered:?}");
-    ensure!(
-        answered.response == Some(txid) && answered.timeout.is_none(),
-        "{answered:?}"
-    );
-    ensure!(
-        matches!(answered.stage, Stage::Answered | Stage::Asserting),
-        "{answered:?}"
-    );
     Ok(())
 }

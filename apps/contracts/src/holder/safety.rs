@@ -68,11 +68,11 @@ pub fn of<T: Transport>(
         tip,
         trust: crate::trust(wallet.network())?,
     };
-    let holder = Holder::load(&state, secrets.seed, secrets.spend, &ctx)?;
-    let opening = holder.opening()?;
+    let holder = Holder::load(&state, &secrets.seed, &ctx)?;
+    let opening = holder.signed()?;
     let graph = &opening.base.parts().graph;
     Ok(Safety::new(
-        graph.assert_height,
+        graph.request_height,
         u32::from(graph.response_window),
         proof_margin,
         timeout_slack,

@@ -132,12 +132,6 @@ struct Chain {
     #[arg(long, env = "LICASH_HUB_CONTRACTS",
           value_parser = clap::builder::BoolishValueParser::new())]
     contracts: bool,
-    /// Automatically answer confirmed holder requests. Pins one request
-    /// witness per opening in responses.sqlite; never runs hub timeouts.
-    /// Before enabling on an older hub, reconcile any manual responses.
-    #[arg(long, env = "LICASH_HUB_CONTRACTS_RESPOND", requires = "contracts",
-          value_parser = clap::builder::BoolishValueParser::new())]
-    contracts_respond: bool,
     /// Fund and sign contracts with the wallet of the node at this URL, its
     /// JSON-RPC as `--chain` takes it, such as
     /// `http://host:port/wallet/NAME?cookie=PATH`: one apart from the chain
@@ -817,24 +811,6 @@ enum Command {
         #[arg(long)]
         follow: bool,
     },
-    /// Answer a holder's request on Bitcoin in one of the hub's contracts,
-    /// beside the running hub: broadcast its plain answer and print its
-    /// txid. Her proof decides then. Reads the openings only, so it needs
-    /// neither the seed nor the contracts' wallet.
-    Respond {
-        /// The contract's opening, in hex.
-        id: String,
-        /// Her request R, a transaction in hex (`-` for stdin).
-        request: PathBuf,
-        /// The chain to read the tip from and broadcast to, as `run`'s.
-        #[arg(
-            long = "chain",
-            value_name = "URL",
-            env = "LICASH_HUB_CHAIN",
-            hide_env_values = true
-        )]
-        chain: String,
-    },
 }
 
 fn main() -> ExitCode {
@@ -892,7 +868,6 @@ fn command(cli: Cli) -> anyhow::Result<()> {
             let policy = policy.policy();
             let (indexing, tweaks_from) = (chain.tweaks, chain.tweaks_from);
             let contracting = chain.contracts;
-            let responding = chain.contracts_respond;
             let response_poll = Duration::from_secs(chain.chain_poll);
             let range = chain.range();
             let wallet = match (&chain.contracts_wallet, &chain.url) {
@@ -1017,10 +992,9 @@ fn command(cli: Cli) -> anyhow::Result<()> {
                     // What each holder agrees to pay at most from now on.
                     openings.charging(hub.info().policy.fees());
                     openings.spawn_sweeper();
-                    if responding {
-                        openings.spawn_responder(response_poll);
-                        tracing::info!("automatic contract responder enabled; one-time answers pinned in responses.sqlite");
-                    }
+                    // Holders' exits are played as they come: the hub
+                    // decides each claim, and proves what it answers.
+                    openings.spawn_responder(response_poll);
                     tracing::info!(
                         mock = openings.advertise().mock,
                         ?range,
@@ -1168,30 +1142,7 @@ fn command(cli: Cli) -> anyhow::Result<()> {
             limit,
             follow,
         } => events(&db, after, limit, follow),
-        Command::Respond { id, request, chain } => respond(&cli.data, &id, &request, &chain),
     }
-}
-
-fn respond(data: &Path, id: &str, request: &Path, chain: &str) -> anyhow::Result<()> {
-    let id = licash_contracts::parse_id(id.trim()).context("the opening's id")?;
-    let hex = match request.as_os_str() == "-" {
-        true => std::io::read_to_string(std::io::stdin()).context("read R from stdin")?,
-        false => std::fs::read_to_string(request)
-            .with_context(|| format!("read {}", request.display()))?,
-    };
-    let r: bitcoin::Transaction =
-        bitcoin::consensus::encode::deserialize_hex(hex.trim()).context("R, in hex")?;
-    let source: Source = chain.parse().context("--chain")?;
-    tokio::runtime::Runtime::new()?.block_on(async {
-        let answer = licash_contracts::hub::respond(data, &source, &id, &r).await?;
-        let txid = source
-            .broadcast(&answer)
-            .await
-            .context("broadcast the answer")?;
-        tracing::info!(%txid, request = %r.compute_txid(), "answered her request");
-        println!("{txid}");
-        Ok(())
-    })
 }
 
 fn init(data: &Path, seed: &Path, db: &Path, max_pow: u32, log: Log) -> anyhow::Result<()> {
