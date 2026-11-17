@@ -586,7 +586,7 @@ impl<T: Transport> Provider<T> {
         };
         let script = coin.htlc.script_pubkey();
         let tip = chain.height().await.map_err(licash_wallet::Error::Chain)?;
-        let first = coin.scanned.unwrap_or(height).max(height) + 1;
+        let first = first_to_scan(coin.scanned, height);
         let Some((at, spend)) = first_spend(chain, outpoint, &script, first..=tip).await? else {
             self.set_scanned(id, tip)?;
             if tip >= coin.htlc.timeout {
@@ -665,5 +665,28 @@ impl<T: Transport> Provider<T> {
             )?;
             Ok(())
         })
+    }
+}
+
+/// The first block to look in for the spend of a coin mined at `funding`,
+/// blocks up to `scanned` looked in already: the coin's own block first,
+/// as a claim broadcast before the coin confirmed may be mined with it.
+fn first_to_scan(scanned: Option<u32>, funding: u32) -> u32 {
+    scanned.map_or(funding, |scanned| (scanned + 1).max(funding))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::first_to_scan;
+
+    #[test]
+    fn a_coins_own_block_is_looked_in_for_its_spend() {
+        assert_eq!(first_to_scan(None, 100), 100);
+        // Looked in up to before it: from it.
+        assert_eq!(first_to_scan(Some(99), 100), 100);
+        assert_eq!(first_to_scan(Some(100), 100), 101);
+        assert_eq!(first_to_scan(Some(120), 100), 121);
+        // Mined again higher in a reorganization: from its new block.
+        assert_eq!(first_to_scan(Some(90), 100), 100);
     }
 }
