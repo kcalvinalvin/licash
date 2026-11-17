@@ -1,6 +1,7 @@
 //! The swap provider service: a [`Provider`] behind the HTTP API of
 //! [`licash_api::swaps`], the steps that take its swaps on, the chain its
-//! payouts on Bitcoin follow, and its announcement on Nostr.
+//! payouts on Bitcoin follow, the node its Lightning payments follow, and
+//! its announcement on Nostr.
 
 pub mod dashboard;
 pub mod keeper;
@@ -17,7 +18,7 @@ use axum::{
 };
 use bitcoin::{BlockHash, Transaction};
 use licash_api::{
-    swaps::{self, ChainRequest, ChainSwap, Request, Swap},
+    swaps::{self, ChainRequest, ChainSwap, LightningRequest, LightningSwap, Request, Swap},
     Code, Problem,
 };
 use licash_chain_client::Source;
@@ -118,6 +119,8 @@ fn paths<T: Transport + 'static, C: Chain + Send + 'static>(
         .route(swaps::SWAP_STATE, get(state::<T, C>))
         .route(swaps::CHAIN_SWAPS, post(take_payout::<T, C>))
         .route(swaps::CHAIN_SWAP_STATE, get(payout_state::<T, C>))
+        .route(swaps::LIGHTNING_SWAPS, post(take_invoice::<T, C>))
+        .route(swaps::LIGHTNING_SWAP_STATE, get(invoice_state::<T, C>))
         .with_state(Arc::new(served))
         .layer(DefaultBodyLimit::max(BODY_LIMIT))
 }
@@ -223,6 +226,34 @@ async fn payout_state<T: Transport + 'static, C>(
     }
 }
 
+/// Pay an invoice, declined unless the provider pays them
+/// ([`Provider::pay_lightning`]).
+async fn take_invoice<T: Transport + 'static, C>(
+    State(served): Shared<T, C>,
+    body: Result<Json<LightningRequest>, JsonRejection>,
+) -> Answer<LightningSwap> {
+    let Json(request) = body?;
+    let payment = served
+        .provider
+        .take_invoice(&request)
+        .await
+        .inspect_err(|p| {
+            tracing::debug!(code = ?p.code, message = %p.message, "invoice declined");
+        })?;
+    Ok(Json(payment))
+}
+
+async fn invoice_state<T: Transport + 'static, C>(
+    State(served): Shared<T, C>,
+    Path(id): Path<String>,
+) -> Answer<LightningSwap> {
+    let id = licash_api::lock_id(&id)?;
+    match served.provider.invoice(&id)? {
+        Some(payment) => Ok(Json(payment)),
+        None => Err(Problem::new(Code::UnknownLock, "no such payment").into()),
+    }
+}
+
 /// Take the swaps of `provider` on every `every`, and alert of the hubs it
 /// holds too little at to swap to, for good.
 pub async fn step<T: Transport + 'static>(provider: Arc<Provider<T>>, every: Duration) {
@@ -266,6 +297,23 @@ pub async fn follow<T: Transport + 'static, C: Chain>(
                 }
             }
             Err(e) => tracing::warn!("following the payouts: {e}"),
+        }
+        tokio::time::sleep(every).await;
+    }
+}
+
+/// Follow the Lightning payments of `provider` on its node every `every`,
+/// for good: a payment's preimage claims its client's lock as soon as it
+/// is bought.
+pub async fn pay_invoices<T: Transport + 'static>(provider: Arc<Provider<T>>, every: Duration) {
+    loop {
+        match provider.follow_invoices().await {
+            Ok(pending) => {
+                for (id, reason) in pending {
+                    tracing::debug!(%id, reason, "payment pending");
+                }
+            }
+            Err(e) => tracing::warn!("following the Lightning payments: {e}"),
         }
         tokio::time::sleep(every).await;
     }

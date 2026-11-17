@@ -637,6 +637,7 @@ fn hubs_read_as_their_hosts() {
         "hub.example.com:8338"
     );
     assert_eq!(short("bitcoin:regtest"), "on-chain");
+    assert_eq!(short("lightning:regtest"), "Lightning");
     let onion = format!("http://{}.onion", "abcdefghij".repeat(5) + "klmnop");
     assert_eq!(short(&onion), "abcdefgh….onion");
 }

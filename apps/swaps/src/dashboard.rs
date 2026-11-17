@@ -37,6 +37,8 @@ struct Swap {
     id: String,
     /// A payout on Bitcoin, not a swap of notes.
     chain: bool,
+    /// An invoice paid over Lightning, not a swap of notes.
+    lightning: bool,
     from: String,
     to: String,
     amount: i64,
@@ -193,6 +195,7 @@ fn read_swaps(c: &Connection, version: i64) -> Result<Vec<Swap>> {
     let rows = stmt.query_map([], |r| {
         Ok(Swap {
             chain: r.get::<_, String>(0)? == "chain",
+            lightning: r.get::<_, String>(0)? == "lightning",
             from: r.get(1)?,
             to: r.get(2)?,
             amount: r.get(3)?,
@@ -293,6 +296,9 @@ fn read_coins(c: &Connection, version: i64) -> Result<Option<Vec<i64>>> {
 pub fn short(url: &str) -> String {
     if url.starts_with("bitcoin:") {
         return "on-chain".to_owned();
+    }
+    if url.starts_with("lightning:") {
+        return "Lightning".to_owned();
     }
     let host = url.split("://").nth(1).unwrap_or(url).trim_end_matches('/');
     match host.split_once(".onion") {

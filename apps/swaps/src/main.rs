@@ -14,6 +14,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use licash::spend::ChainProfile;
 use licash_api::{swaps, Fee};
 use licash_contracts::holder::Node;
+use licash_lightning::{lnd::Lnd, Node as LightningNode};
 use licash_nostr::Route;
 use licash_notify::{Message, Priority, Target};
 use licash_swaps::{Config, Provider};
@@ -333,6 +334,88 @@ impl PayoutTerms {
     }
 }
 
+/// What the provider pays over Lightning, from an LND node, with `--lnd`.
+#[derive(Args)]
+struct LightningArgs {
+    /// Pay Lightning invoices for clients' locks from the LND node whose
+    /// REST API is at this URL, such as `https://127.0.0.1:8080`.
+    #[arg(long, value_name = "URL", env = "LICASH_SWAPS_LND")]
+    lnd: Option<String>,
+    /// The macaroon the provider calls LND with: it pays invoices and
+    /// reads its payments.
+    #[arg(
+        long,
+        value_name = "FILE",
+        env = "LICASH_SWAPS_LND_MACAROON",
+        requires = "lnd"
+    )]
+    lnd_macaroon: Option<PathBuf>,
+    /// LND's TLS certificate, pinned. Without it, the URL's certificate
+    /// must validate against the system's roots.
+    #[arg(
+        long,
+        value_name = "FILE",
+        env = "LICASH_SWAPS_LND_CERT",
+        requires = "lnd"
+    )]
+    lnd_cert: Option<PathBuf>,
+    /// The fee on each invoice paid, routing fees included, in satoshis.
+    #[arg(long, env = "LICASH_SWAPS_LN_FEE_BASE", default_value_t = 2)]
+    ln_fee_base: u64,
+    /// The fee on each invoice paid, in parts per million of its amount.
+    #[arg(long, env = "LICASH_SWAPS_LN_FEE_PPM", default_value_t = 5000,
+          value_parser = clap::value_parser!(u64).range(0..=1_000_000))]
+    ln_fee_ppm: u64,
+    /// The largest invoice paid, in satoshis.
+    #[arg(long, env = "LICASH_SWAPS_LN_MAX", default_value_t = 1_000_000)]
+    ln_max: u64,
+    /// Blocks between the end of a payment's route timelock and the expiry
+    /// of the client's lock paying for it: the provider's time to learn
+    /// the preimage, on Bitcoin at worst, and claim, its node's downtime
+    /// and its hubs' included.
+    #[arg(long, env = "LICASH_SWAPS_LN_SLACK", default_value_t = 80,
+          value_parser = clap::value_parser!(u32).range(i64::from(licash_swaps::MIN_SLACK)..))]
+    ln_slack: u32,
+}
+
+impl LightningArgs {
+    /// The node and what the provider pays through it, if it pays
+    /// invoices: the terms name the node's public key, as it says.
+    async fn payer(&self) -> anyhow::Result<Option<(Arc<dyn LightningNode>, swaps::Lightning)>> {
+        let Some(url) = &self.lnd else {
+            return Ok(None);
+        };
+        let macaroon = self
+            .lnd_macaroon
+            .as_ref()
+            .context("--lnd needs --lnd-macaroon")?;
+        let macaroon =
+            std::fs::read(macaroon).with_context(|| format!("read {}", macaroon.display()))?;
+        let cert = match &self.lnd_cert {
+            Some(path) => {
+                Some(std::fs::read(path).with_context(|| format!("read {}", path.display()))?)
+            }
+            None => None,
+        };
+        let node: Arc<dyn LightningNode> =
+            Arc::new(Lnd::new(url, &macaroon, cert.as_deref()).context("--lnd")?);
+        let info = node
+            .info()
+            .await
+            .map_err(|e| anyhow::anyhow!("--lnd: {e}"))?;
+        let terms = swaps::Lightning {
+            node: info.pubkey,
+            fee: Fee {
+                base: self.ln_fee_base,
+                ppm: self.ln_fee_ppm,
+            },
+            max: self.ln_max,
+            slack: self.ln_slack,
+        };
+        Ok(Some((node, terms)))
+    }
+}
+
 /// The provider's announcement on Nostr, for wallets to discover it.
 #[derive(Args)]
 struct AnnounceArgs {
@@ -489,6 +572,10 @@ enum Command {
         chain: ChainArgs,
         #[command(flatten)]
         payouts: PayoutTerms,
+        /// With --lnd, the provider pays Lightning invoices too, for
+        /// clients' locks at its hubs.
+        #[command(flatten)]
+        lightning: LightningArgs,
         #[command(flatten)]
         contracts: ContractArgs,
     },
@@ -588,6 +675,7 @@ fn command(cli: Cli) -> anyhow::Result<()> {
             announce,
             chain,
             payouts,
+            lightning,
             contracts,
         } => {
             let config = terms.config()?;
@@ -627,6 +715,17 @@ fn command(cli: Cli) -> anyhow::Result<()> {
                     anyhow::ensure!(
                         open == 0,
                         "{open} payouts on Bitcoin under way: they need --chain"
+                    );
+                    provider
+                }
+            };
+            let provider = match runtime.block_on(lightning.payer())? {
+                Some((node, terms)) => provider.pay_lightning(node, terms)?,
+                None => {
+                    let open = provider.open_invoices()?;
+                    anyhow::ensure!(
+                        open == 0,
+                        "{open} Lightning payments under way: they need --lnd"
                     );
                     provider
                 }
@@ -794,6 +893,14 @@ async fn serve(
         tracing::info!("paying out on Bitcoin");
         tokio::spawn(licash_swaps_service::follow(provider.clone(), chain, every))
     });
+    let paying = provider.lightning_terms().cloned().map(|terms| {
+        tracing::debug!(
+            terms = %serde_json::to_string(&terms).unwrap_or_default(),
+            "paying over Lightning"
+        );
+        tracing::info!(node = %terms.node, "paying Lightning invoices");
+        tokio::spawn(licash_swaps_service::pay_invoices(provider.clone(), every))
+    });
     let announcing = announcing.map(|a| {
         let (relays, urls) = (a.relays.join(", "), a.urls.join(", "));
         tracing::debug!(%relays, %urls, "announcement configuration");
@@ -809,7 +916,7 @@ async fn serve(
     axum::serve(listener, router)
         .with_graceful_shutdown(shutdown())
         .await?;
-    for task in [Some(stepping), following, announcing]
+    for task in [Some(stepping), following, paying, announcing]
         .into_iter()
         .flatten()
     {

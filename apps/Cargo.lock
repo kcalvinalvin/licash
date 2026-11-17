@@ -3619,6 +3619,7 @@ dependencies = [
  "licash-chain-client",
  "licash-contracts",
  "licash-dashboard",
+ "licash-lightning",
  "licash-nostr",
  "licash-notify",
  "licash-swaps",

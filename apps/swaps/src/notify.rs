@@ -134,13 +134,13 @@ impl<T: Transport + 'static> Outbox for Events<T> {
 pub fn message(event: &Event, outcome: Option<&Outcome>) -> Message {
     let record = outcome.map(|o| &o.record);
     let hub_fee = outcome.and_then(|o| o.hub_fee);
-    let payout = record.is_some_and(|r| r.to.starts_with("bitcoin:"));
+    let kind = record.map_or("Swap", |r| what(&r.to));
     let mut fields: Vec<(&str, String)> = Vec::new();
     if let Some(r) = record {
         fields.push(("Route", route(&r.from, &r.to)));
     }
     let named = |mut fields: Vec<(&str, String)>, id: &str| {
-        fields.push((if payout { "Payout" } else { "Swap" }, short(id)));
+        fields.push((kind, short(id)));
         list(&fields)
     };
     match event.notice() {
@@ -151,27 +151,22 @@ pub fn message(event: &Event, outcome: Option<&Outcome>) -> Message {
             from,
             to,
         }) => {
-            let payout = to.starts_with("bitcoin:");
+            let what = what(&to);
             let fields = [
                 ("Route", route(&from, &to)),
                 ("Amount", sat(amount)),
                 ("Fee", sat(fee)),
-                (if payout { "Payout" } else { "Swap" }, short(&id)),
+                (what, short(&id)),
             ];
-            let title = if payout {
-                "Payout accepted"
-            } else {
-                "Swap accepted"
-            };
-            Message::new(Priority::Low, title, list(&fields))
+            Message::new(Priority::Low, format!("{what} accepted"), list(&fields))
         }
         Some(Notice::Done { id, amount, fee }) => {
             fields.push(("Amount", sat(amount)));
             // The client's lock pays the provider in full: what it paid
             // beyond the amount, the fee and any more.
             let income = record.map_or(fee, |r| r.paid.saturating_sub(r.amount));
-            if payout {
-                // The miner fee it pays is in it.
+            if kind != "Swap" {
+                // The miner or routing fees it pays are in it.
                 fields.push(("Charged", sat_rate(signed(income), amount)));
             } else {
                 fields.push(("Income", sat_rate(signed(income), amount)));
@@ -181,8 +176,7 @@ pub fn message(event: &Event, outcome: Option<&Outcome>) -> Message {
                     fields.push(("Profit", sat_rate(profit, amount)));
                 }
             }
-            let title = if payout { "Payout done" } else { "Swap done" };
-            Message::new(Priority::Low, title, named(fields, &id))
+            Message::new(Priority::Low, format!("{kind} done"), named(fields, &id))
         }
         Some(Notice::Refunded { id, amount }) => {
             fields.push(("Amount", sat(amount)));
@@ -191,24 +185,22 @@ pub fn message(event: &Event, outcome: Option<&Outcome>) -> Message {
                 fields.push(("Costs", sat(cost)));
                 fields.push(("Profit", sat_signed(-signed(cost))));
             }
-            let title = if payout {
-                "Payout refunded"
-            } else {
-                "Swap refunded"
-            };
-            Message::new(Priority::Normal, title, named(fields, &id))
+            Message::new(
+                Priority::Normal,
+                format!("{kind} refunded"),
+                named(fields, &id),
+            )
         }
         Some(Notice::Failed { id, reason }) => {
             if let Some(r) = record {
                 fields.push(("Amount", sat(r.amount)));
             }
             fields.push(("Reason", reason));
-            let title = if payout {
-                "Payout failed"
-            } else {
-                "Swap failed"
-            };
-            Message::new(Priority::Normal, title, named(fields, &id))
+            Message::new(
+                Priority::Normal,
+                format!("{kind} failed"),
+                named(fields, &id),
+            )
         }
         Some(Notice::Lost { id, amount, reason }) => {
             fields.push(("Lost", sat(amount)));
@@ -218,8 +210,7 @@ pub fn message(event: &Event, outcome: Option<&Outcome>) -> Message {
                 fields.push(("Profit", sat_signed(-loss)));
             }
             fields.push(("Reason", reason));
-            let title = if payout { "Payout lost" } else { "Swap lost" };
-            Message::new(Priority::High, title, named(fields, &id))
+            Message::new(Priority::High, format!("{kind} lost"), named(fields, &id))
         }
         Some(Notice::Alert { message }) => Message::new(Priority::High, "Swaps alert", message),
         _ => Message::new(
@@ -230,11 +221,27 @@ pub fn message(event: &Event, outcome: Option<&Outcome>) -> Message {
     }
 }
 
-/// The way a swap goes: from hub `from` to hub `to`, or to Bitcoin.
+/// What a swap to `to` is: a payout on Bitcoin, an invoice paid over
+/// Lightning, or a swap of notes.
+fn what(to: &str) -> &'static str {
+    if to.starts_with("bitcoin:") {
+        "Payout"
+    } else if to.starts_with("lightning:") {
+        "Payment"
+    } else {
+        "Swap"
+    }
+}
+
+/// The way a swap goes: from hub `from` to hub `to`, to Bitcoin or over
+/// Lightning.
 fn route(from: &str, to: &str) -> String {
-    let to = match to.strip_prefix("bitcoin:") {
-        Some(network) => format!("Bitcoin ({network})"),
-        None => crate::dashboard::short(to),
+    let to = if let Some(network) = to.strip_prefix("bitcoin:") {
+        format!("Bitcoin ({network})")
+    } else if let Some(network) = to.strip_prefix("lightning:") {
+        format!("Lightning ({network})")
+    } else {
+        crate::dashboard::short(to)
     };
     format!("{} → {to}", crate::dashboard::short(from))
 }
@@ -439,6 +446,37 @@ mod tests {
             done.body,
             "• Route: a.example → Bitcoin (signet)\n• Amount: 125,000 sat\n\
              • Charged: 1,250 sat (1.0%)\n• Payout: cdcdcdcdcdcd…"
+        );
+    }
+
+    #[test]
+    fn an_invoice_paid_reads_as_a_payment_its_charge_with_the_routing_fees_in_it() {
+        let id = "ef".repeat(32);
+        let accepted = Notice::Accepted {
+            id: id.clone(),
+            amount: 10_000,
+            fee: 52,
+            from: "https://a.example".into(),
+            to: "lightning:regtest".into(),
+        };
+        let accepted = message(&event(&accepted), None);
+        assert_eq!(accepted.title, "Payment accepted");
+        assert_eq!(
+            accepted.body,
+            "• Route: a.example → Lightning (regtest)\n• Amount: 10,000 sat\n\
+             • Fee: 52 sat\n• Payment: efefefefefef…"
+        );
+        let paid = outcome("lightning:regtest", 10_000, 10_052, None);
+        let failed = Notice::Failed {
+            id,
+            reason: "not paid: no route".into(),
+        };
+        let failed = message(&event(&failed), Some(&paid));
+        assert_eq!(failed.title, "Payment failed");
+        assert_eq!(
+            failed.body,
+            "• Route: a.example → Lightning (regtest)\n• Amount: 10,000 sat\n\
+             • Reason: not paid: no route\n• Payment: efefefefefef…"
         );
     }
 

@@ -94,9 +94,9 @@ impl<'a> Now<'a> {
     }
 
     /// The height of the chain at `url`: its hub's scan, or for Bitcoin
-    /// itself the furthest any hub scanned.
+    /// itself, and Lightning's routes, the furthest any hub scanned.
     fn height(&self, url: &str) -> Option<i64> {
-        if url.starts_with("bitcoin:") {
+        if url.starts_with("bitcoin:") || url.starts_with("lightning:") {
             return self.stock.iter().filter_map(|s| s.hub.height()).max();
         }
         self.stock
@@ -346,6 +346,7 @@ fn under_way_table(state: &Now) -> Table {
         .map(|s| {
             let left = state.left(s);
             let what = match (s.state.as_str(), s.chain) {
+                ("accepted", _) if s.lightning => "paying the invoice",
                 ("accepted", false) => "locking",
                 ("accepted", true) => "paying the coin",
                 ("locked", false) => "client to claim",

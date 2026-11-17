@@ -81,6 +81,25 @@ the chain's estimate at start), `--payout-min` and `--payout-max` set the
 terms; `status` shows the coins. A provider with payouts under way refuses
 to start without `--chain`.
 
+With `--lnd URL --lnd-macaroon FILE` (and `--lnd-cert FILE` to pin LND's
+certificate), the provider also pays Lightning invoices from that LND node,
+for clients' locks at any of its hubs (`POST /v1/swaps/lightning`). A client
+locks the invoice's amount and the fee (`--ln-fee-base`, 2 sat, and
+`--ln-fee-ppm`, 5000, routing fees included) to the provider under the
+invoice's hash; the provider pays invoices up to `--ln-max` sat along routes
+whose timelock ends `--ln-slack` blocks (80 by default, 18 at least) before
+that lock expires, and claims the lock with the preimage the payment buys.
+The slack is the provider's time to learn the preimage, on Bitcoin if a
+channel closes, and claim while its node or the hub is down: past the
+lock's expiry the provider cannot claim it, having paid. When the invoice is
+a hub's, asked for by a wallet under a hash of its own, notes at one hub pay
+notes at another with no notes of the provider at the other. A payment that
+fails leaves the client's lock to be refunded once expired. These locks
+count like swaps against what the contracts at the source hub protect. The
+first start under this version upgrades `swaps.sqlite` to schema 4, which
+older versions refuse; a provider with Lightning payments under way refuses
+to start without `--lnd`.
+
 A hub could withhold the notes it holds of the provider's: a recovery
 contract at the hub (`licash-wallet open-contract`) recovers them, up to
 its cap, from its collateral. By default `run` takes in at each hub only
