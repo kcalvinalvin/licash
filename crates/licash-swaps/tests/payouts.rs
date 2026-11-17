@@ -641,6 +641,42 @@ async fn a_provider_without_coins_on_chain_pays_nothing_out() {
 }
 
 #[tokio::test]
+async fn the_operator_is_alerted_once_when_its_coins_pay_out_too_little() {
+    let alerts = |eco: &Eco| {
+        let events = eco.provider().events(0, 50).unwrap();
+        events
+            .iter()
+            .filter(|e| matches!(e.notice(), Some(licash_swaps::Notice::Alert { message }) if message.contains("Bitcoin")))
+            .count()
+    };
+    let eco = Eco::new(STOCK, TERMS).await;
+    assert!(!eco.provider().check_payouts().unwrap());
+    let eco = Eco::new(0, TERMS).await;
+    assert!(eco.provider().check_payouts().unwrap());
+    assert!(!eco.provider().check_payouts().unwrap());
+    assert_eq!(alerts(&eco), 1);
+    // Funded, it pays out again; spent down, it is told again.
+    let to = eco
+        .provider()
+        .wallet()
+        .fallback_address()
+        .unwrap()
+        .script_pubkey();
+    let coin = TxOut {
+        value: Amount::from_sat(2_500),
+        script_pubkey: to,
+    };
+    eco.net.confirm(A, vec![made_up(coin)]);
+    eco.follow().await;
+    assert!(!eco.provider().check_payouts().unwrap());
+    eco.pay_out(1_800).await;
+    eco.pool.mine();
+    eco.follow().await;
+    assert!(eco.provider().check_payouts().unwrap());
+    assert_eq!(alerts(&eco), 2);
+}
+
+#[tokio::test]
 async fn a_swaps_file_of_version_1_gains_payouts() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("swaps.sqlite");

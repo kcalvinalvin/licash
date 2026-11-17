@@ -493,6 +493,8 @@ pub struct Provider<T: Transport> {
     taking: Mutex<()>,
     /// The hubs the operator was told the provider holds too little at.
     short: Mutex<HashSet<String>>,
+    /// Whether the operator was told its coins pay out too little.
+    short_on_chain: std::sync::atomic::AtomicBool,
     /// What it pays out on Bitcoin, if it does.
     payouts: Option<swaps::Chain>,
     /// The swaps whose hub the operator was told keeps the preimage.
@@ -638,6 +640,7 @@ impl<T: Transport> Provider<T> {
             busy: Mutex::default(),
             taking: Mutex::default(),
             short: Mutex::default(),
+            short_on_chain: Default::default(),
             payouts: None,
             withheld: Mutex::default(),
             late: Mutex::default(),
@@ -918,6 +921,31 @@ impl<T: Transport> Provider<T> {
             }
         }
         Ok(alerted)
+    }
+
+    /// Alert the operator when the provider's coins on Bitcoin pay out
+    /// less than the least payout it takes: once, until they pay enough
+    /// again. Whether it alerted now: never if it pays nothing out on
+    /// Bitcoin, or its wallet watches no chain yet.
+    pub fn check_payouts(&self) -> Result<bool, Error> {
+        use std::sync::atomic::Ordering;
+        let Some(terms) = self.chain_info()? else {
+            return Ok(false);
+        };
+        if terms.max >= terms.min {
+            self.short_on_chain.store(false, Ordering::Relaxed);
+            return Ok(false);
+        }
+        if self.short_on_chain.swap(true, Ordering::Relaxed) {
+            return Ok(false);
+        }
+        self.alert(&format!(
+            "No payouts on Bitcoin for now: the provider's coins pay out {} at most, \
+             less than the {} it pays out at least. Send coins to its wallet.",
+            sat(terms.max),
+            sat(terms.min)
+        ))?;
+        Ok(true)
     }
 
     /// What the swaps accepted and not locked yet will lock at `url`.

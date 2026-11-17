@@ -279,6 +279,11 @@ pub async fn step<T: Transport + 'static>(provider: Arc<Provider<T>>, every: Dur
             }
             Err(e) => tracing::warn!("checking what it holds: {e}"),
         }
+        match provider.check_payouts() {
+            Ok(true) => tracing::warn!("too few coins on Bitcoin to pay out"),
+            Ok(false) => {}
+            Err(e) => tracing::warn!("checking its coins on Bitcoin: {e}"),
+        }
         tokio::time::sleep(every).await;
     }
 }

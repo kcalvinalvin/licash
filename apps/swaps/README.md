@@ -78,8 +78,9 @@ wallet watches the chain from its tip when first started with `--chain`, or
 from `--chain-from`. `--payout-fee-base`, `--payout-fee-ppm`,
 `--payout-miner` (the coin's miners, on top), `--payout-rate` (sat/vB, else
 the chain's estimate at start), `--payout-min` and `--payout-max` set the
-terms; `status` shows the coins. A provider with payouts under way refuses
-to start without `--chain`.
+terms; `status` shows the coins, and an alert says when they pay out less
+than `--payout-min`, once a start until they pay enough again. A provider
+with payouts under way refuses to start without `--chain`.
 
 With `--lnd URL --lnd-macaroon FILE` (and `--lnd-cert FILE` to pin LND's
 certificate), the provider also pays Lightning invoices from that LND node,
