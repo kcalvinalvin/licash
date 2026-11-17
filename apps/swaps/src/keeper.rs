@@ -74,6 +74,59 @@ pub struct Hub {
     pub exposure: u64,
     /// The notes it holds there now: what a recovery claims of.
     pub notes: u64,
+    /// The caps the provider may open a contract of there now: none if
+    /// the hub offers its fixed terms only.
+    pub sizes: Option<Sizes>,
+}
+
+/// The caps a contract the provider opens at a hub may be now, in sat:
+/// at least the hub's least, and at most both the hub's most, as its
+/// wallet funds it, and what the provider's largest free coin pays for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Sizes {
+    pub least: u32,
+    pub most: u32,
+}
+
+impl Sizes {
+    /// Of a hub's `range`, the provider's largest free coin holding
+    /// `coin` sat: none if that coin pays for none.
+    pub fn of(range: licash_api::ContractRange, coin: u64) -> Option<Self> {
+        let most = range.max_cap_for(coin)?;
+        Some(Self {
+            least: range.min_cap,
+            most,
+        })
+    }
+}
+
+/// A contract's cap, sized to what it protects: twice `cap` while what
+/// the provider holds at its hub (`exposure`) is three quarters of the
+/// `limit` its contracts there protect or more, half while it is less
+/// than a quarter, else `cap`; within `sizes`.
+pub fn resize(cap: u32, exposure: u64, limit: u64, sizes: Option<Sizes>) -> u32 {
+    let Some(Sizes { least, most }) = sizes else {
+        return cap;
+    };
+    let sized = if exposure.saturating_mul(4) >= limit.saturating_mul(3) {
+        cap.saturating_mul(2)
+    } else if exposure.saturating_mul(4) < limit {
+        cap / 2
+    } else {
+        cap
+    };
+    sized.clamp(least, most.max(least))
+}
+
+/// What a contract of `cap` costs at most, of one of `old_cap` costing
+/// `old_price`: a quarter more, as much more again as it is larger.
+fn scaled_price(old_price: u64, old_cap: u32, cap: u32) -> u64 {
+    let quarter_more = old_price.saturating_mul(5) / 4;
+    if cap <= old_cap || old_cap == 0 {
+        return quarter_more;
+    }
+    let scaled = u128::from(quarter_more) * u128::from(cap) / u128::from(old_cap);
+    u64::try_from(scaled).unwrap_or(u64::MAX)
 }
 
 /// A contract of the provider's, as the keeper reads it.
@@ -156,6 +209,9 @@ pub struct Plan {
     pub force_close: Vec<[u8; 32]>,
     /// Successors to open, in turn.
     pub successors: Vec<Successor>,
+    /// Contracts to open besides, at hubs whose contracts protect too
+    /// little of what is offered to the provider there: of what cap.
+    pub grows: Vec<(String, u32)>,
     /// What to pay out to Bitcoin of each hub's notes, by its URL: what
     /// the provider holds there beyond its limit, a contract there having
     /// failed to be replaced.
@@ -173,8 +229,10 @@ pub struct Plan {
 /// ([`Deadlines::renew_at`]), and those to be whose successor is being
 /// opened, in its stead. A successor is a contract at the hub that
 /// started opening as the one it replaces was to be replaced, or later;
-/// each replaces one. A contract with none gets one, of its cap, unless
-/// waiting. Its hub is drained once its replacement failed, or it is
+/// each replaces one. A contract with none gets one, unless waiting:
+/// of its cap, resized to what the provider holds there ([`resize`]).
+/// Where the provider holds nine tenths of what its contracts protect,
+/// none being opened, one more is opened, of as much as they protect. Its hub is drained once its replacement failed, or it is
 /// past its `claim_at`. Past it, it is forced closed if the others there
 /// claiming later would recover less than the notes held there.
 pub fn plan(
@@ -221,11 +279,13 @@ pub fn plan(
                 None => {
                     drain |= failed.contains(&old.contract.id);
                     if !waiting.contains(&old.contract.id) {
-                        let price = old.contract.price.saturating_mul(5) / 4;
+                        let total = limit + u64::from(old.contract.cap);
+                        let cap = resize(old.contract.cap, hub.exposure, total, hub.sizes);
+                        let price = scaled_price(old.contract.price, old.contract.cap, cap);
                         plan.successors.push(Successor {
                             hub: hub.url.clone(),
                             replaces: old.contract.id,
-                            cap: old.contract.cap,
+                            cap,
                             max_price: max_price.unwrap_or(price),
                         });
                     }
@@ -236,6 +296,17 @@ pub fn plan(
             }
         }
         let protecting = here.iter().any(|k| k.live(tip) || k.opening(tip));
+        let opening = here.iter().any(|k| k.opening(tip));
+        let replacing = plan.successors.iter().any(|s| s.hub == hub.url);
+        let full = limit > 0 && hub.exposure.saturating_mul(10) >= limit.saturating_mul(9);
+        let grow = protecting && !opening && !replacing && full && !drain;
+        if let Some(sizes) = hub.sizes.filter(|_| grow) {
+            let cap = u32::try_from(limit).unwrap_or(u32::MAX);
+            plan.grows.push((
+                hub.url.clone(),
+                cap.clamp(sizes.least, sizes.most.max(sizes.least)),
+            ));
+        }
         if !protecting {
             plan.alerts.push(Alert::NoContract {
                 hub: hub.url.clone(),
@@ -393,6 +464,8 @@ pub struct Keeper<T: Transport> {
     told_late: HashSet<String>,
     /// When each hub last answered, or the keeper started.
     answered: HashMap<String, Instant>,
+    /// The caps and durations each hub last said it offers.
+    ranges: HashMap<String, licash_api::ContractRange>,
 }
 
 impl<T: Transport + 'static> Keeper<T> {
@@ -412,6 +485,7 @@ impl<T: Transport + 'static> Keeper<T> {
             told: HashSet::new(),
             told_late: HashSet::new(),
             answered: HashMap::new(),
+            ranges: HashMap::new(),
         }
     }
 
@@ -639,6 +713,10 @@ impl<T: Transport + 'static> Keeper<T> {
             None => wallet.hubs()?.into_iter().map(|(url, _)| url).collect(),
         };
         let balance = wallet.balance()?;
+        let stored: HashMap<String, licash_api::Info> = wallet.hubs()?.into_iter().collect();
+        let largest = holder::coins(wallet, &self.dir)?
+            .first()
+            .map_or(0, |c| c.value);
         let mut hubs = Vec::new();
         for url in named {
             let urls = wallet.hub_urls(&url)?;
@@ -650,8 +728,16 @@ impl<T: Transport + 'static> Keeper<T> {
                 .filter(|b| urls.contains(&b.hub))
                 .map(|b| b.available)
                 .sum();
+            // As it last said, else as the wallet keeps it.
+            let range = (self.ranges.get(&url).copied()).or_else(|| {
+                stored
+                    .get(&url)
+                    .and_then(|i| i.contracts)
+                    .and_then(|c| c.range)
+            });
             hubs.push(Hub {
                 exposure: self.provider.exposure(&url)?,
+                sizes: range.and_then(|r| Sizes::of(r, largest)),
                 url,
                 urls,
                 notes,
@@ -712,6 +798,10 @@ impl<T: Transport + 'static> Keeper<T> {
         match wallet.hub_info(&hub.url).await {
             Ok(info) => {
                 self.answered.insert(hub.url.clone(), now);
+                match info.contracts.and_then(|c| c.range) {
+                    Some(range) => self.ranges.insert(hub.url.clone(), range),
+                    None => self.ranges.remove(&hub.url),
+                };
                 let ceilings = wallet.fee_ceilings(&hub.url).ok().flatten();
                 if ceilings.is_some_and(|c| info.fees.above(&c)) {
                     alerts.push((
@@ -808,32 +898,43 @@ impl<T: Transport + 'static> Keeper<T> {
     }
 
     /// Open a contract at each hub the plan says none protects notes at,
-    /// where the operator said of what cap ([`Settings::open_cap`]): a
-    /// failure kept to try again later.
+    /// where the operator said of what cap ([`Settings::open_cap`]), and
+    /// one more where the plan grows what is protected ([`Plan::grows`]),
+    /// each costing [`Settings::max_price`] at most: a failure kept to
+    /// try again later.
     async fn open_firsts(&mut self, plan: &Plan, alerts: &mut Vec<(String, String)>) {
-        let (Some(cap), Some(max_price)) = (self.settings.open_cap, self.settings.max_price) else {
+        let Some(max_price) = self.settings.max_price else {
             return;
         };
-        let none: Vec<&String> = (plan.alerts.iter())
+        let firsts = (plan.alerts.iter())
             .filter_map(|a| match a {
                 Alert::NoContract { hub } => Some(hub),
                 Alert::Unprotected { .. } => None,
             })
-            .collect();
-        self.first_failures.retain(|hub, _| none.contains(&hub));
+            .filter_map(|hub| {
+                Some((
+                    hub.clone(),
+                    self.settings.open_cap?,
+                    "none protecting notes there",
+                ))
+            });
+        let grows =
+            (plan.grows.iter()).map(|(hub, cap)| (hub.clone(), *cap, "those there nearly full"));
+        let opens: Vec<(String, u32, &str)> = firsts.chain(grows).collect();
+        self.first_failures
+            .retain(|hub, _| opens.iter().any(|(h, _, _)| h == hub));
         let now = Instant::now();
-        for hub in none {
-            if (self.first_failures.get(hub)).is_some_and(|f| f.retry_at > now) {
+        for (hub, cap, why) in opens {
+            if (self.first_failures.get(&hub)).is_some_and(|f| f.retry_at > now) {
                 continue;
             }
-            match self.open(hub, cap, max_price).await {
+            match self.open(&hub, cap, max_price).await {
                 Ok(new) => {
-                    self.first_failures.remove(hub);
+                    self.first_failures.remove(&hub);
                     alerts.push((
                         format!("opened at {hub}"),
                         format!(
-                            "opening contract {} at hub {hub}, none protecting notes there: {} sat \
-                             for {} sat protected",
+                            "opening contract {} at hub {hub}, {why}: {} sat for {} sat protected",
                             licash_contracts::hex_id(&new.id),
                             new.price,
                             new.cap
@@ -842,24 +943,36 @@ impl<T: Transport + 'static> Keeper<T> {
                 }
                 Err(e) => {
                     tracing::warn!(%hub, "opening a contract: {e:#}");
-                    let failure = self.first_failures.entry(hub.clone());
+                    let failure = self.first_failures.entry(hub);
                     failure.or_insert_with(Failure::new).again(format!("{e:#}"));
                 }
             }
         }
     }
 
-    /// Open a contract at `hub` of `cap`, of the longest term it offers,
-    /// costing `max_price` at most, from a coin of the wallet's own.
+    /// Open a contract at `hub` of `cap`, or as near as it and the
+    /// wallet's largest free coin let it be now ([`Sizes`]), of the
+    /// longest term it offers, costing `max_price` at most, from a coin
+    /// of the wallet's own.
     async fn open(&self, hub: &str, cap: u32, max_price: u64) -> Result<Contract> {
         let wallet = self.provider.wallet();
-        let hubs = wallet.hubs()?;
-        let (_, info) = (hubs.iter())
-            .find(|(url, _)| url == hub)
-            .ok_or_else(|| anyhow!("the wallet no longer trusts {hub}"))?;
+        if !wallet.hubs()?.iter().any(|(url, _)| url == hub) {
+            return Err(anyhow!("the wallet no longer trusts {hub}"));
+        }
+        let info = wallet.hub_info(hub).await?;
         let offered = (info.contracts).ok_or_else(|| anyhow!("{hub} opens no contracts now"))?;
         let (blocks, cap) = match offered.range {
-            Some(range) => (range.max_blocks, Some(cap)),
+            Some(range) => {
+                let largest = holder::coins(wallet, &self.dir)?
+                    .first()
+                    .map_or(0, |c| c.value);
+                let sizes = Sizes::of(range, largest)
+                    .ok_or_else(|| anyhow!("no free coin pays for a contract at {hub}"))?;
+                (
+                    range.max_blocks,
+                    Some(cap.clamp(sizes.least, sizes.most.max(sizes.least))),
+                )
+            }
             None => (offered.blocks, None),
         };
         let ask = Ask {
@@ -1014,6 +1127,7 @@ mod tests {
             urls: vec![HUB.into(), "http://hub.example".into()],
             exposure,
             notes,
+            sizes: None,
         }
     }
 
@@ -1023,6 +1137,94 @@ mod tests {
 
     fn planned(tip: u32, hubs: &[Hub], kept: &[Kept]) -> Plan {
         plan(tip, hubs, kept, &none(), &none(), None)
+    }
+
+    fn sized(exposure: u64, notes: u64, least: u32, most: u32) -> Hub {
+        Hub {
+            sizes: Some(Sizes { least, most }),
+            ..hub(exposure, notes)
+        }
+    }
+
+    #[test]
+    fn caps_double_while_nearly_full_and_halve_while_nearly_empty_within_sizes() {
+        let sizes = Some(Sizes {
+            least: 4_096,
+            most: 1_000_000,
+        });
+        assert_eq!(resize(100_000, 75_000, 100_000, sizes), 200_000);
+        assert_eq!(resize(100_000, 74_999, 100_000, sizes), 100_000);
+        assert_eq!(resize(100_000, 25_000, 100_000, sizes), 100_000);
+        assert_eq!(resize(100_000, 24_999, 100_000, sizes), 50_000);
+        // Within what the hub and the provider's coin let it be.
+        assert_eq!(resize(800_000, 800_000, 800_000, sizes), 1_000_000);
+        assert_eq!(resize(6_000, 0, 6_000, sizes), 4_096);
+        // Of fixed terms only: as it was.
+        assert_eq!(resize(4_096, 4_096, 4_096, None), 4_096);
+        // A coin of 10 000 sat, twice it at most, at a hub funding 33 554 431.
+        let range = licash_api::ContractRange {
+            min_cap: 4_096,
+            max_cap: 33_554_431,
+            min_blocks: 432,
+            max_blocks: 52_560,
+            per_coin: 2,
+            base: 23_000,
+            ppm_year: 10_000,
+        };
+        assert_eq!(
+            Sizes::of(range, 10_000),
+            Some(Sizes {
+                least: 4_096,
+                most: 20_000
+            })
+        );
+        assert_eq!(Sizes::of(range, 1_000), None);
+    }
+
+    #[test]
+    fn a_successor_is_sized_to_what_its_hub_holds_and_priced_as_much_more() {
+        let old = kept(1, 4_096, 0, 50_000);
+        let renew_at = old.deadlines.unwrap().renew_at;
+        let full = planned(
+            renew_at,
+            &[sized(4_000, 4_000, 4_096, 100_000)],
+            std::slice::from_ref(&old),
+        );
+        assert_eq!(full.successors[0].cap, 8_192);
+        let price = old.contract.price * 5 / 4 * 2;
+        assert_eq!(full.successors[0].max_price, price);
+        // Being replaced: none more besides.
+        assert!(full.grows.is_empty());
+        let idle = planned(
+            renew_at,
+            &[sized(500, 500, 1_024, 100_000)],
+            std::slice::from_ref(&old),
+        );
+        assert_eq!(idle.successors[0].cap, 2_048);
+        assert_eq!(idle.successors[0].max_price, old.contract.price * 5 / 4);
+    }
+
+    #[test]
+    fn a_hub_nearly_full_gets_one_more_contract_of_as_much() {
+        let live = kept(1, 100_000, 0, 50_000);
+        let plan = planned(
+            100,
+            &[sized(90_000, 90_000, 4_096, 1_000_000)],
+            std::slice::from_ref(&live),
+        );
+        assert_eq!(plan.grows, [(HUB.to_owned(), 100_000)]);
+        // Not yet nearly full, of fixed terms only, or one being opened: none.
+        let plan = planned(
+            100,
+            &[sized(89_999, 89_999, 4_096, 1_000_000)],
+            std::slice::from_ref(&live),
+        );
+        assert!(plan.grows.is_empty());
+        let plan = planned(100, &[hub(100_000, 100_000)], std::slice::from_ref(&live));
+        assert!(plan.grows.is_empty());
+        let both = [live, opening(2, 100_000, 90)];
+        let plan = planned(100, &[sized(100_000, 100_000, 4_096, 1_000_000)], &both);
+        assert!(plan.grows.is_empty());
     }
 
     #[test]

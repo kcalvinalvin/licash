@@ -109,9 +109,16 @@ would bring what it holds and is owed there past that, and keeps them on
 the chain of `--chain`, a round a minute:
 
 - `--contract-successor-days` (14) before a contract's safe deadline, a
-  successor of its cap is opened at the hub, from the wallet's coins on
-  Bitcoin, for at most `--contract-max-price` sat or a quarter more than the
-  contract cost; it counts in its stead while it opens.
+  successor is opened at the hub, from the wallet's coins on Bitcoin, for
+  at most `--contract-max-price` sat or a quarter more than the contract
+  cost (as much more again as it is larger); it counts in its stead while
+  it opens. Its cap follows what the provider holds there: twice the
+  contract's while that is three quarters of what is protected or more,
+  half while under a quarter, within the hub's range (which a hub narrows
+  to what its wallet funds) and what the largest free coin pays for.
+- Where the provider holds nine tenths of what its contracts at a hub
+  protect, none being opened or replaced, one more is opened there, of as
+  much as they protect, for at most `--contract-max-price` sat.
 - Its safe deadline comes a day before its claim would have to confirm,
   keeping `--contract-proof-days` (14) to prove the claim in. There it is
   forced closed, whatever its hub says, if the other contracts at the hub
