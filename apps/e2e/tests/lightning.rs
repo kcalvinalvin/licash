@@ -572,6 +572,9 @@ async fn a_static_lnurl_takes_donations_for_a_wallet_offline() -> anyhow::Result
         hex::encode(hash.to_byte_array())
     );
     let provider = eco.swaps_info().await?;
+    // Its info tells wallets where payers reach it, for them to show this.
+    let donations = provider.donations.clone().expect("donations taken");
+    assert_eq!(donations.url, eco.swaps());
     let node = eco.lncli(SWAPS_LN, &["getinfo"]).await?;
     assert_eq!(
         decoded["destination"], node["identity_pubkey"],
