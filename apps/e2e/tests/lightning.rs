@@ -1,6 +1,7 @@
 //! Wallets pay and get paid over Lightning through their hubs' gateways,
 //! on the stack of `apps/e2e/run.sh`, which runs these.
 
+use licash::spend::lock_hash;
 use licash_api::ReceiveState;
 use licash_e2e::{received, until, Eco, Wallet, OUTSIDE};
 use licash_wallet::{InvoiceState, Lock, LockState};
@@ -180,6 +181,113 @@ async fn hubs_restarted_mid_payment_finish_it() -> anyhow::Result<()> {
     );
     assert!(paying.await??, "the outside node's payment succeeded");
     assert_eq!(available(&erin), 4_000);
+    Ok(())
+}
+
+/// What `wallet` can spend at `hub`.
+fn available_at(wallet: &Wallet, hub: &str) -> u64 {
+    let balance = wallet.balance().unwrap();
+    balance
+        .iter()
+        .find(|b| b.hub == hub)
+        .map_or(0, |b| b.available)
+}
+
+#[tokio::test]
+#[ignore = "needs the stack of apps/e2e/run.sh"]
+async fn a_wallet_moves_its_notes_to_another_hub_over_lightning() -> anyhow::Result<()> {
+    let eco = Eco::up().await?;
+    let (hub1, hub2) = (eco.hub(1), eco.hub(2));
+    let frank = eco.wallet("frank")?;
+    eco.pay_in(&frank, hub1, 40_000).await?;
+    assert_eq!(available_at(&frank, hub1), 40_000);
+
+    // Frank asks hub2 for an invoice under a preimage only he knows, and
+    // pays it from hub1: no swap provider, no notes of either hub held by
+    // the other.
+    let invoice = frank.invoice(hub2, 10_000).await?;
+    let request = invoice.request.as_deref().unwrap();
+    let payable = frank.read_invoice(request)?;
+    assert!(payable.amount > 10_000, "hub2's receive fee: {payable:?}");
+    let lock = frank.pay_invoice(hub1, request).await?;
+    assert_eq!(hex::encode(lock.hash), invoice.hash);
+    // The invoice, and hub1's gateway fee of 2 + 5000 ppm.
+    assert_eq!(
+        lock.amount,
+        payable.amount + 2 + payable.amount.div_ceil(200)
+    );
+
+    // He claims at hub2 with his own preimage, which settles hub2's
+    // invoice, and Lightning carries it back to hub1 to settle his lock.
+    assert_eq!(
+        received(&frank, &invoice.hash).await?,
+        InvoiceState::Received
+    );
+    let lock = settled(&frank, &lock).await?;
+    let LockState::Paid(preimage) = lock.state else {
+        panic!("{lock:?}");
+    };
+    assert_eq!(hex::encode(lock_hash(&preimage)), invoice.hash);
+    let status = until("hub2 settles its invoice", 60, || async {
+        let status = eco.receipt(hub2, &invoice.hash).await?;
+        Ok((status.state == ReceiveState::Settled).then_some(status))
+    })
+    .await?;
+    assert_eq!(status.state, ReceiveState::Settled);
+
+    assert_eq!(available_at(&frank, hub2), 10_000);
+    // Hub1 kept what the lock cost, and its fee for making the exact
+    // notes the lock spent.
+    let cost = lock.cost.expect("a settled lock's cost");
+    assert!(cost >= lock.amount, "{lock:?}");
+    assert_eq!(
+        available_at(&frank, hub1),
+        40_000 - cost - exact_fees(&frank)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "needs the stack of apps/e2e/run.sh"]
+async fn a_move_never_claimed_at_the_other_hub_returns_to_the_first() -> anyhow::Result<()> {
+    let eco = Eco::up().await?;
+    let (hub1, hub2) = (eco.hub(1), eco.hub(2));
+    let grace = eco.wallet("grace")?;
+    eco.pay_in(&grace, hub1, 30_000).await?;
+
+    // Grace pays her own hub2 invoice from hub1, then never claims.
+    let invoice = grace.invoice(hub2, 6_000).await?;
+    let lock = grace
+        .pay_invoice(hub1, invoice.request.as_deref().unwrap())
+        .await?;
+    until("hub2 locks the payment to Grace", 60, || async {
+        let status = eco.receipt(hub2, &invoice.hash).await?;
+        Ok((status.state == ReceiveState::Locked).then_some(()))
+    })
+    .await?;
+
+    // Hub2's lock expires at depth: its blocks, 12, and the hub's depth,
+    // 3. Without the preimage hub2 cannot settle the invoice, so the
+    // HTLC fails back and hub1 refunds her lock.
+    eco.mine(12 + 3 + 1).await?;
+    until("hub2 cancels the invoice", 60, || async {
+        let status = eco.receipt(hub2, &invoice.hash).await?;
+        Ok((status.state == ReceiveState::Canceled).then_some(()))
+    })
+    .await?;
+    let lock = settled(&grace, &lock).await?;
+    assert_eq!(lock.state, LockState::Refunded);
+    assert!(lock.failure.is_some());
+
+    let state = received(&grace, &invoice.hash).await?;
+    assert!(matches!(state, InvoiceState::Canceled(_)), "{state:?}");
+    assert_eq!(available_at(&grace, hub2), 0);
+    // Only hub1's refund fee, and its fee for the exact notes, are lost.
+    let refund_fee = lock.cost.expect("a refunded lock's cost");
+    assert_eq!(
+        available_at(&grace, hub1),
+        30_000 - refund_fee - exact_fees(&grace)
+    );
     Ok(())
 }
 
