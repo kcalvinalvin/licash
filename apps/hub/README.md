@@ -166,7 +166,8 @@ checked by their work alone and not the network's signature of each block,
 and no automatic collateral reclaim after the close. The hub's terms there are
 signet's least: a day
 for the wallet to answer a challenge and for each party's outputs to wait,
-3 blocks deep, and 12 blocks at least to respond to a request. No other
+3 blocks deep, 12 blocks at least to respond to a request and 48 for the
+hub to prove and assert its response (a proof takes hours on a CPU). No other
 network yet.
 
 A hub with contracts plays its holders' exits itself, polling its

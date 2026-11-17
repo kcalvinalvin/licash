@@ -226,7 +226,7 @@ impl Timing {
                 response_window: 0,
                 request_height: 0,
                 publication_window: floors.publication_window,
-                assert_window: 12,
+                assert_window: assert_window(self.profile),
                 challenge_window: self.challenge_window,
                 answer_window: 12,
             },
@@ -256,6 +256,18 @@ impl Timing {
     }
 }
 
+/// Blocks from her request's response to its assertion's deadline: the
+/// response buried at its work depth, then the hub's proof made and its
+/// assertion confirmed. Regtest's proof is the mock authority's, made at
+/// once; elsewhere `hp-prove` took about 3.4 hours on a CPU (some 21
+/// signet blocks), so 48 leave as many again for a slow prover or blocks.
+fn assert_window(profile: ChainProfile) -> u16 {
+    match profile {
+        ChainProfile::Core30DefaultRegtest => 12,
+        _ => 48,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -277,7 +289,8 @@ mod tests {
 
     /// The quote every app asking without terms of its own opens on, as
     /// apps already installed do: byte for byte as the hub has always
-    /// quoted it, on each network.
+    /// quoted it, on each network (signet's since its assertion window
+    /// grew to 48 blocks, for the hub's proof).
     #[test]
     fn the_fixed_quote_is_as_it_always_was() {
         let parts = Hub::peek(funded()).unwrap().base.parts().clone();
@@ -298,7 +311,7 @@ mod tests {
             let (signet, bounds) = quoted(ChainProfile::Core30Signet);
             assert_eq!(
                 signet,
-                "92f13e75f92425b52f4679c8b7c8cd46255cf1736fcf365dd9f86130d95f5109"
+                "a00f06d4dd5917142dd700c81b20457856c63bae8722da06d1769d0c4e20e6b0"
             );
             assert_eq!((bounds.lock, bounds.response_window), (1_000, 12));
         }
