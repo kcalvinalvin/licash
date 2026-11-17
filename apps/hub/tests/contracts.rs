@@ -68,6 +68,41 @@ async fn scan(wallet: &Wallet<Http>, chain: &Node) -> Result<u64> {
     Ok(wallet.silent_coins()?.iter().map(|c| c.value).sum())
 }
 
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs bitcoind and a release build"]
+async fn a_hub_learns_what_its_contracts_wallet_holds() -> Result<()> {
+    let rt = Regtest::start_standard()?;
+    let dir = tempfile::tempdir()?;
+    let (seed, db) = (dir.path().join("seed"), dir.path().join("hub.sqlite"));
+    Hub::init(&seed, &db, 12)?;
+    let hub = Hub::open(&seed, &db, Policy::default())?;
+    let url = format!(
+        "{}/wallet/harness?cookie={}",
+        rt.rpc_url(),
+        rt.cookie().display()
+    );
+    let source: Source = url.parse()?;
+    let keyset = hub.info().keysets[0].clone();
+    let range = Range {
+        max_cap: licash_contracts::hub::terms::MAX_CAP,
+        max_blocks: 5_000,
+        per_coin: 2,
+        ppm_year: 10_000,
+    };
+    let openings =
+        Openings::with_wallet(dir.path(), source.clone(), source, keyset, Some(range)).await?;
+    // Its confirmed balance, as the node's wallet says it now.
+    let balance = openings.learn_funds().await?;
+    ensure!(balance > 0, "{balance}");
+    let fundable = licash_contracts::hub::terms::fundable(balance).context("none funded")?;
+    let advertised = openings.advertise().range.context("no range")?.max_cap;
+    ensure!(
+        advertised == fundable,
+        "{advertised} advertised, {fundable} funded"
+    );
+    Ok(())
+}
+
 fn ask() -> Ask {
     Ask {
         blocks: 300,

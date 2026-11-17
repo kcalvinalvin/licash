@@ -366,16 +366,17 @@ impl Openings {
         }
     }
 
-    /// Ask the node's wallet what it holds, confirmed: logged when the
-    /// largest cap it funds changes.
-    pub async fn learn_funds(&self) -> Result<()> {
-        let info: serde_json::Value = self
+    /// Ask the node's wallet what it holds, confirmed or its own
+    /// (`getbalances`, its `mine.trusted`): logged when the largest cap
+    /// it funds changes. Its balance, in sat.
+    pub async fn learn_funds(&self) -> Result<u64> {
+        let balances: serde_json::Value = self
             .wallet
-            .rpc("getwalletinfo", serde_json::json!([]))
+            .rpc("getbalances", serde_json::json!([]))
             .await?;
-        let btc = info["balance"]
+        let btc = balances["mine"]["trusted"]
             .as_f64()
-            .context("a wallet's info, no balance")?;
+            .context("a wallet's balances, none trusted")?;
         let balance = bitcoin::Amount::from_btc(btc)?.to_sat();
         let before = self
             .funds
@@ -389,7 +390,7 @@ impl Openings {
                 None => tracing::warn!(balance, "the contracts' wallet funds no contract"),
             }
         }
-        Ok(())
+        Ok(balance)
     }
 
     /// Sweep, and learn what the node's wallet holds, every minute, for
