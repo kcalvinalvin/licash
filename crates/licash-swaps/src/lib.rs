@@ -42,7 +42,7 @@ mod payouts;
 mod store;
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::Path,
     sync::{Arc, Mutex, PoisonError},
 };
@@ -487,6 +487,9 @@ pub struct Provider<T: Transport> {
     late: Mutex<HashSet<[u8; 32]>>,
     /// The provider's own hub, if it is one, which issues its locks there.
     issuer: Option<Arc<Issuer>>,
+    /// The most it may come to hold at each hub, if limited
+    /// ([`Provider::limit_intake`]).
+    intake: Mutex<Option<HashMap<String, u64>>>,
 }
 
 /// The swaps into the provider's own hub under way, whose clients' locks
@@ -623,6 +626,7 @@ impl<T: Transport> Provider<T> {
             withheld: Mutex::default(),
             late: Mutex::default(),
             issuer: issuer.map(Arc::new),
+            intake: Mutex::default(),
         }
     }
 
@@ -740,8 +744,8 @@ impl<T: Transport> Provider<T> {
             if info.address == own.address {
                 continue;
             }
-            if let Some((cap, urls)) = self.source(issuer, &url)? {
-                room = room.max(cap.saturating_sub(self.held(&urls)?));
+            if self.source(issuer, &url)?.is_some() {
+                room = room.max(self.room(&url)?.unwrap_or(u64::MAX));
             }
             hubs.push(Hub {
                 address: info.address,
@@ -774,8 +778,78 @@ impl<T: Transport> Provider<T> {
         Ok(cap.map(|cap| (cap, urls)))
     }
 
+    /// Limit what the provider may come to hold at each hub, through the
+    /// swaps and payouts it takes there, to `limits`, by the hub's URL as
+    /// its wallet knows it ([`Wallet::hubs`]): none at a hub not named.
+    /// None lifts the limit. As the contracts protecting its notes at each
+    /// hub allow: what a hub holds back is lost unless a contract recovers
+    /// it. Not limited until limited, which a provider required to be
+    /// protected is before it serves; what it holds already stays, and
+    /// what it pays out from there goes on.
+    pub fn limit_intake(&self, limits: Option<HashMap<String, u64>>) {
+        *self.intake.lock().unwrap_or_else(PoisonError::into_inner) = limits;
+    }
+
+    /// What [`Provider::limit_intake`] last set.
+    pub fn intake(&self) -> Option<HashMap<String, u64>> {
+        self.intake
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// What the provider holds of the notes of the hub at `url`, by any
+    /// URL its wallet knows it by, and is owed there by the clients of the
+    /// swaps and payouts it took from there: what it would lose if the hub
+    /// held them back.
+    pub fn exposure(&self, url: &str) -> Result<u64, Error> {
+        self.held(&self.wallet.hub_urls(url)?)
+    }
+
+    /// How much more of the notes of the hub at `url` the provider may
+    /// take: within its issuer's cap of that hub's notes, if it issues, and
+    /// within [`Provider::limit_intake`], beside what it holds and is owed
+    /// there already. None if neither limits it.
+    fn room(&self, url: &str) -> Result<Option<u64>, Error> {
+        let urls = self.wallet.hub_urls(url)?;
+        let mut most = (self.issuer.as_ref())
+            .map(|issuer| urls.iter().find_map(|u| issuer.cap_of(u)).unwrap_or(0));
+        let intake = self.intake.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(limits) = intake.as_ref() {
+            let limit = urls.iter().find_map(|u| limits.get(u)).copied();
+            let limit = limit.unwrap_or(0);
+            most = Some(most.map_or(limit, |most| most.min(limit)));
+        }
+        drop(intake);
+        match most {
+            Some(most) => Ok(Some(most.saturating_sub(self.held(&urls)?))),
+            None => Ok(None),
+        }
+    }
+
+    /// Whether the provider may take `paid` more of the notes of the hub
+    /// at `from` ([`Provider::room`]): declined if not. Called while
+    /// [`Provider::taking`] is held, as what it holds and is owed there
+    /// cannot grow between the check and the record.
+    fn admit(&self, from: &str, paid: u64) -> Result<(), Problem> {
+        match self.room(from).map_err(unavailable)? {
+            Some(room) if paid > room => {
+                let who = if self.issuer.is_some() {
+                    "hub"
+                } else {
+                    "provider"
+                };
+                Err(declined(format!(
+                    "the {who} takes no more of hub {from}'s notes now"
+                )))
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// What the provider holds of the notes of the hub at `urls`, and is
-    /// owed there by the clients of the swaps into its own hub.
+    /// owed there by the clients of the swaps and payouts under way it took
+    /// from there.
     fn held(&self, urls: &[String]) -> Result<u64, Error> {
         let listed = serde_json::to_string(urls).map_err(|e| Error::Setup(e.to_string()))?;
         // Owed first: a swap claimed between the reads is counted twice,
@@ -783,7 +857,7 @@ impl<T: Transport> Provider<T> {
         let owed = self.store.read(|c| {
             Ok(c.query_row(
                 "SELECT coalesce(sum(paid), 0) FROM swaps
-                 WHERE kind = 'own' AND state IN ('accepted', 'locked', 'paid')
+                 WHERE state IN ('accepted', 'locked', 'paid')
                     AND from_url IN (SELECT value FROM json_each(?1))",
                 [listed],
                 |r| r.get::<_, i64>(0),
@@ -1006,34 +1080,23 @@ impl<T: Transport> Provider<T> {
         own: bool,
     ) -> Result<(), Problem> {
         let _taking = self.taking.lock().unwrap_or_else(PoisonError::into_inner);
-        match self.issuer.as_ref().filter(|_| own) {
-            Some(issuer) => {
-                let source = self.source(issuer, terms.from).map_err(unavailable)?;
-                let (cap, urls) = source.unwrap_or_default();
-                let held = self.held(&urls).map_err(unavailable)?;
-                if held.saturating_add(terms.paid) > cap {
-                    return Err(declined(format!(
-                        "the hub takes no more of hub {}'s notes now",
-                        terms.from
-                    )));
-                }
-            }
-            None => {
-                let balance = self.wallet.balance().map_err(unavailable)?;
-                let available = balance
-                    .iter()
-                    .find(|b| b.hub == terms.to)
-                    .map_or(0, |b| b.available);
-                let reserved = self.reserved(terms.to).map_err(unavailable)?;
-                let needed = reserved
-                    .saturating_add(request.amount)
-                    .saturating_add(to_info.fees.locking().at_most(available));
-                if available < needed {
-                    return Err(declined(format!(
-                        "the provider holds too little at hub {} now",
-                        terms.to
-                    )));
-                }
+        self.admit(terms.from, terms.paid)?;
+        // A hub issues its own lock: it pays from no stock of its notes.
+        if !(own && self.issuer.is_some()) {
+            let balance = self.wallet.balance().map_err(unavailable)?;
+            let available = balance
+                .iter()
+                .find(|b| b.hub == terms.to)
+                .map_or(0, |b| b.available);
+            let reserved = self.reserved(terms.to).map_err(unavailable)?;
+            let needed = reserved
+                .saturating_add(request.amount)
+                .saturating_add(to_info.fees.locking().at_most(available));
+            if available < needed {
+                return Err(declined(format!(
+                    "the provider holds too little at hub {} now",
+                    terms.to
+                )));
             }
         }
         let notice = Notice::Accepted {

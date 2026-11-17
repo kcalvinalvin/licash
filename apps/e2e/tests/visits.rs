@@ -63,9 +63,10 @@ async fn a_wallet_pays_a_code_at_a_hub_it_does_not_trust_once_it_proves_it_is_th
     let apart = alice.visited_balance()?;
     assert_eq!(apart.len(), 1);
     assert_eq!(apart[0].hub, hub2);
-    // Less the payment and the hub's fee on it, at most as planned.
+    // Less the payment and the hub's fee on it, at most as planned: what
+    // the swap brought past the payment may be less than that most.
     let left = swap.provider.quote.amount - 5_000;
-    let range = left - plan.fee..=left;
+    let range = left.saturating_sub(plan.fee)..=left;
     assert!(range.contains(&apart[0].available), "{apart:?} {plan:?}");
     assert_eq!(alice.balance()?.len(), 1);
 

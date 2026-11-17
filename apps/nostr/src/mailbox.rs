@@ -34,6 +34,21 @@ const MAX_MAIL: usize = 500;
 /// The largest gift wrap opened: a payment is far smaller.
 const MAX_WRAP: usize = 512 * 1024;
 
+/// The largest event relays commonly take, in bytes of its JSON (the
+/// default of strfry and of nostr-sdk's relay). A payment wrapped larger
+/// is sent all the same, for relays that take more, but said too large
+/// to mail when none takes it: its payer hands it over instead.
+const COMMON_MAX_EVENT: usize = 64 * 1024;
+
+/// Why a payment wrapped in `bytes` is not mailed.
+fn too_large(bytes: usize) -> String {
+    format!(
+        "too large to mail, {} KB where relays commonly take {} KB at most",
+        bytes.div_ceil(1024),
+        COMMON_MAX_EVENT / 1024
+    )
+}
+
 /// How long a mailbox kept takes what its relays push alone, before
 /// asking them for all the mail again: a relay that dropped and
 /// reconnected pushes none sent in between.
@@ -66,6 +81,7 @@ pub async fn send(
         .expiration(KEEP)
         .finalize(&sealer)
         .context("gift wrap the payment")?;
+    let size = wrap.as_json().len();
     let client = client(relays, route, Some(sealer)).await?;
     // To each as soon as it connects: one slow would hold the others up.
     let sent = ask_each(client.relays().await, route, GRACE, |relay| {
@@ -74,7 +90,10 @@ pub async fn send(
     })
     .await;
     client.shutdown().await;
-    let sent = sent.context("no relay took the payment")?;
+    let sent = sent.with_context(|| match size > COMMON_MAX_EVENT {
+        true => too_large(size),
+        false => "no relay took the payment".to_owned(),
+    })?;
     Ok(sent.len())
 }
 

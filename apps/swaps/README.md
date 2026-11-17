@@ -6,13 +6,16 @@ another, with a timed lock at each under the client's hash.
 `licash-swaps --help` lists the commands, flags and environment variables.
 
 ```sh
-licash-swaps --data ./swaps init                # prints the provider's address
-export LICASH_WALLET=./swaps/wallet.sqlite
+licash-swaps --data ./swaps init --network signet  # prints the provider's address
+export LICASH_WALLET=./swaps/wallet.sqlite LICASH_WALLET_CHAIN=URL
 licash-wallet add-hub https://hub-a.example
 licash-wallet add-hub https://hub-b.example
 licash-wallet receive payment.json              # fund it at each hub
+licash-swaps --data ./swaps address --chain URL # fund it on Bitcoin
+licash-wallet open-contract https://hub-a.example  # protect its notes there
+licash-wallet open-contract https://hub-b.example
 licash-swaps --data ./swaps run --listen 0.0.0.0:8340 --fee-ppm 2000 \
-  --notify tgram://BOT_TOKEN/CHAT_ID
+  --chain URL --notify tgram://BOT_TOKEN/CHAT_ID
 licash-swaps --data ./swaps status
 licash-swaps --data ./swaps events --follow
 licash-swaps --data ./swaps dashboard
@@ -78,6 +81,40 @@ the chain's estimate at start), `--payout-min` and `--payout-max` set the
 terms; `status` shows the coins. A provider with payouts under way refuses
 to start without `--chain`.
 
+A hub could withhold the notes it holds of the provider's: a recovery
+contract at the hub (`licash-wallet open-contract`) recovers them, up to
+its cap, from its collateral. By default `run` takes in at each hub only
+what the live contracts there protect, declining each swap or payout that
+would bring what it holds and is owed there past that, and keeps them on
+the chain of `--chain`, a round a minute:
+
+- `--contract-successor-days` (14) before a contract's safe deadline, a
+  successor of its cap is opened at the hub, from the wallet's coins on
+  Bitcoin, for at most `--contract-max-price` sat or a quarter more than the
+  contract cost; it counts in its stead while it opens.
+- Its safe deadline comes a day before its claim would have to confirm,
+  keeping `--contract-proof-days` (14) to prove the claim in. There it is
+  forced closed, whatever its hub says, if the other contracts at the hub
+  cannot recover every note held there.
+- A failed replacement is retried after growing waits. Meanwhile nothing
+  more is taken in there, and with `--drain-via URL` what the hub holds
+  beyond what is protected is paid out through the provider at URL to the
+  provider's own address on Bitcoin.
+
+The first contract at each hub is the operator's to open, with
+`licash-wallet --wallet <data>/wallet.sqlite open-contract HUB --chain URL`:
+until one is, the provider takes none of that hub's notes in. Alerts name
+the hubs without contracts, notes beyond what is protected, recoveries
+whose collateral was lost, hubs silent for
+an hour, and fees raised beyond what the contracts agreed to
+(`approve-fees`). Contracts open on regtest, under the mock authority, and
+signet only for now: on other networks, or without `--chain`, `run` refuses
+to start unless `--no-contracts` runs it unprotected, which is reckless. A
+provider upgraded to this version takes nothing more in at a hub until a
+contract there is live; what it holds stays, and its payouts go on. The
+contracts and the payouts spend the same coins on Bitcoin, which the
+operator's `licash-wallet` should leave alone while the provider runs.
+
 The client reveals its preimage to the destination hub, which issues the
 provider's lock there and could keep the preimage from it. The provider
 would then learn it only from a refund request of its lock on Bitcoin,
@@ -116,7 +153,8 @@ provider starts again.
 
 ```sh
 docker build -f apps/swaps/Dockerfile -t licash-swaps .
-docker run --rm -v licash-swaps:/data licash-swaps init
+docker run --rm -v licash-swaps:/data licash-swaps init --network signet
 docker run --rm -v licash-swaps:/data --entrypoint licash-wallet licash-swaps add-hub https://hub-a.example
-docker run -d -p 8340:8340 -v licash-swaps:/data licash-swaps
+docker run --rm -v licash-swaps:/data --entrypoint licash-wallet licash-swaps open-contract https://hub-a.example --chain URL
+docker run -d -p 8340:8340 -v licash-swaps:/data licash-swaps run --chain URL
 ```

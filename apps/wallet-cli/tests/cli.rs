@@ -1277,7 +1277,8 @@ fn owners_pay_payment_codes_through_mailboxes_or_by_hand() {
         "{qr}"
     );
 
-    // Alice pays it: sent to his mailbox, nothing to hand over.
+    // Alice pays it: sent to his mailbox, nothing to hand over. Of her
+    // three notes received, it is well within what the relay takes.
     let output = wallet(&alice, &["--json", "pay", &qr, "30"], None);
     let diagnostic = String::from_utf8_lossy(&output.stderr).into_owned();
     let paid: Value = serde_json::from_str(&ok(output)).unwrap();
@@ -1301,15 +1302,30 @@ fn owners_pay_payment_codes_through_mailboxes_or_by_hand() {
     // and its fee is for Bitcoin, at the silent payment address.
     let asking = text.replacen("bitcoin:?", "bitcoin:?amount=0.0000002&", 1);
     let output = wallet(&alice, &["pay", &asking], None);
-    assert!(
-        output.stderr.is_empty(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert_eq!(
-        ok(output),
-        "sent to mailbox  20 sat\nfee              up to 1 sat (5%)\n"
-    );
+    let handed = match too_large_to_mail(&output) {
+        None => {
+            assert!(
+                output.stderr.is_empty(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                ok(output),
+                "sent to mailbox  20 sat\nfee              up to 1 sat (5%)\n"
+            );
+            None
+        }
+        Some(said) => {
+            assert!(
+                said.ends_with(
+                    "payment ready  20 sat\nfee            up to 1 sat (5%)\n\
+                     Hand the payment to the recipient.\n"
+                ),
+                "{said}"
+            );
+            Some(ok(output))
+        }
+    };
     failed(
         wallet(&alice, &["pay", &asking, "21"], None),
         1,
@@ -1327,19 +1343,45 @@ fn owners_pay_payment_codes_through_mailboxes_or_by_hand() {
         1,
         &format!("pay {sp} on Bitcoin"),
     );
-    assert_eq!(json(&bob, &["mailbox"])["received"][0]["amount"], 20);
+    match handed {
+        None => assert_eq!(json(&bob, &["mailbox"])["received"][0]["amount"], 20),
+        Some(payment) => {
+            let received = ok(wallet(&bob, &["--json", "receive"], Some(&payment)));
+            let received: Value = serde_json::from_str(&received).unwrap();
+            assert_eq!(received["amount"], 20);
+        }
+    }
 
     // Technical identity is available when asked, not in the default result.
     let detailed = wallet(&alice, &["pay", &text, "1", "--details"], None);
-    let id = String::from_utf8_lossy(&detailed.stderr).into_owned();
-    assert_eq!(id.trim().strip_prefix("payment ").unwrap().len(), 64);
-    assert_eq!(
-        ok(detailed),
-        format!(
-            "sent to mailbox  1 sat\nfee              up to 1 sat (100%)\nhub              {}\n",
-            hub.url()
-        )
-    );
+    let said = String::from_utf8_lossy(&detailed.stderr).into_owned();
+    let id = said.lines().next().unwrap();
+    assert_eq!(id.strip_prefix("payment ").unwrap().len(), 64);
+    match too_large_to_mail(&detailed) {
+        None => {
+            assert_eq!(said, format!("{id}\n"));
+            assert_eq!(
+                ok(detailed),
+                format!(
+                    "sent to mailbox  1 sat\nfee              up to 1 sat (100%)\nhub              {}\n",
+                    hub.url()
+                )
+            );
+        }
+        Some(said) => {
+            assert!(
+                said.ends_with(
+                    "payment ready  1 sat\nfee            up to 1 sat (100%)\n\
+                     Hand the payment to the recipient.\n"
+                ),
+                "{said}"
+            );
+            let payment = ok(detailed);
+            let received = ok(wallet(&bob, &["--json", "receive"], Some(&payment)));
+            let received: Value = serde_json::from_str(&received).unwrap();
+            assert_eq!(received["amount"], 1);
+        }
+    }
 
     // Carol's hub names no relays: her code has no mailbox, and the
     // payment is handed over. Alice trusts it, and pays there.
@@ -1373,6 +1415,24 @@ fn owners_pay_payment_codes_through_mailboxes_or_by_hand() {
         1,
         "no hub trusted names mailbox relays",
     );
+}
+
+/// What the payer said of `paid`, a payment to a mailbox, if it was too
+/// large to mail and is to be handed over: shaping may make a payment of
+/// many notes larger than the relay takes. None if it was not.
+fn too_large_to_mail(paid: &Output) -> Option<String> {
+    let said = String::from_utf8_lossy(&paid.stderr).into_owned();
+    let warned = said
+        .split_once("warning: not sent to the payee's mailbox (too large to mail, ")?
+        .1;
+    let kb: usize = warned.split(' ').next().unwrap().parse().unwrap();
+    assert!(kb > 64, "{said}");
+    assert!(
+        warned.contains("event size (")
+            && warned.contains("exceeds maximum allowed size (65536 bytes)"),
+        "{said}"
+    );
+    Some(said)
 }
 
 /// Time passes for the payments `file` delivers: `by` seconds.
@@ -1440,9 +1500,24 @@ fn payments_to_codes_are_kept_at_the_hub_and_mailed_only_if_not_collected_within
         .is_empty());
     later(&alice, 3_601);
     let delivered = json(&alice, &["deliver"]);
-    assert_eq!(delivered["mailed"][0]["id"], paid["id"]);
-    assert_eq!(delivered["mailed"][0]["relays"], 1);
-    assert_eq!(delivered["delivering"], 0);
+    match delivered["failed"][0]["reason"].as_str() {
+        // Shaping may make a payment of many notes larger than the relay
+        // takes: not mailed, still kept at the hub for him.
+        Some(why) if why.starts_with("too large to mail, ") => {
+            assert_eq!(delivered["failed"][0]["id"], paid["id"]);
+            assert!(
+                why.contains("exceeds maximum allowed size (65536 bytes)"),
+                "{why}"
+            );
+            assert_eq!(delivered["mailed"], serde_json::json!([]));
+            assert_eq!(delivered["delivering"], 1);
+        }
+        _ => {
+            assert_eq!(delivered["mailed"][0]["id"], paid["id"]);
+            assert_eq!(delivered["mailed"][0]["relays"], 1);
+            assert_eq!(delivered["delivering"], 0);
+        }
+    }
     // Taken once, from his mailbox or the hub.
     let got = json(&bob, &["mailbox"]);
     assert_eq!(got["received"].as_array().unwrap().len(), 1, "{got}");

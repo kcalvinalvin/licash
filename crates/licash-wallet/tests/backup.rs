@@ -3,7 +3,7 @@ mod net;
 
 use licash::spend::ChainProfile;
 use licash_api::Fee;
-use licash_wallet::Wallet;
+use licash_wallet::{ClaimSlot, Wallet};
 use net::{Link, Net, HUB};
 
 #[tokio::test]
@@ -23,7 +23,14 @@ async fn a_live_wal_snapshot_keeps_identity_notes_and_irrevocable_reservations()
         .receive(&net.pay(HUB, &wallet.address(), 100))
         .unwrap();
     let keyset = *net.hub(HUB).info().keysets[0].id();
-    wallet.claim_notes(&[1; 32], &keyset, 70, 32).unwrap();
+    let slot = ClaimSlot {
+        id: [1; 32],
+        keyset,
+        cap: 70,
+        max: 32,
+    };
+    // 64 + 32 of 64 + 32 + 4: they recover the cap, 64 + 4 short of it.
+    wallet.claim_notes(&[1; 32], &[slot]).unwrap();
     assert_eq!(wallet.backup_seed().unwrap(), [7; 32]);
     let to = dir.path().join("snapshot.sqlite");
     wallet.backup_to(&to).unwrap();
@@ -31,7 +38,7 @@ async fn a_live_wal_snapshot_keeps_identity_notes_and_irrevocable_reservations()
     let restored = Wallet::open(&to, Link(net)).unwrap();
     assert_eq!(restored.address(), wallet.address());
     assert_eq!(restored.backup_seed().unwrap(), [7; 32]);
-    assert_eq!(restored.balance().unwrap()[0].available, 32);
+    assert_eq!(restored.balance().unwrap()[0].available, 4);
     assert_eq!(wallet.balance().unwrap()[0].available, 100);
     assert_eq!(restored.claimed_notes(&[1; 32], &keyset).unwrap().len(), 2);
 }

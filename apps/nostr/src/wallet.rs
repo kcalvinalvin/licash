@@ -438,13 +438,18 @@ async fn charges_as_planned<T: Transport>(wallet: &Wallet<T>, plan: &Plan) -> an
         return Ok(());
     };
     let info = wallet.visit(&plan.hub, HubId::of(&kept.address)).await?;
-    let held = wallet.visited_balance()?;
-    let held = held
-        .into_iter()
-        .find(|b| b.hub == plan.hub)
-        .map_or(0, |b| b.available);
-    let swapped = plan.swap.as_ref().map_or(0, |s| s.provider.quote.amount);
-    let fee = info.fees.spending().at_most(held.saturating_add(swapped));
+    // Reckoned as planned ([`plans_with`]): without a swap, on the notes
+    // held there now; once a swap brought more, the most a spend of all
+    // held there may owe, however it parts them.
+    let fee = match &plan.swap {
+        None => wallet.send_fee(&plan.hub, plan.amount)?,
+        Some(swap) => {
+            let held = wallet.visited_balance()?;
+            let held = (held.into_iter().find(|b| b.hub == plan.hub)).map_or(0, |b| b.available);
+            let swapped = swap.provider.quote.amount;
+            info.fees.spending().at_most(held.saturating_add(swapped))
+        }
+    };
     if fee > plan.fee {
         bail!(
             "nothing paid: hub {} charges {fee} now, more than the {} planned",

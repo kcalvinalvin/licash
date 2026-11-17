@@ -6,6 +6,7 @@
 mod net;
 
 use std::{
+    collections::HashMap,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
@@ -1218,6 +1219,119 @@ async fn a_hub_caps_a_hub_it_swaps_from_at_every_url_its_wallet_knows_it_by() {
         .unwrap_err();
     assert!(declined.message.contains("no more"), "{declined:?}");
     assert_eq!(provider.records(10).unwrap().len(), 1);
+}
+
+/// Intake limits of these hubs' notes, by URL.
+fn limits(of: &[(&str, u64)]) -> Option<HashMap<String, u64>> {
+    Some(
+        of.iter()
+            .map(|&(url, most)| (url.to_owned(), most))
+            .collect(),
+    )
+}
+
+#[tokio::test]
+async fn a_provider_takes_notes_at_each_hub_only_within_its_limit_there() {
+    const SECURE_A: &str = "https://a.test";
+    let eco = Eco::new(200).await;
+    let fee = costs(20).0;
+    let provider = eco.provider();
+    // Not limited until limited.
+    assert_eq!(provider.intake(), None);
+    provider.limit_intake(limits(&[(A, 30)]));
+    let swap = eco
+        .client
+        .swap(PROVIDER, A, B, 20, SwapLimits::usual(20))
+        .await
+        .unwrap();
+    assert_eq!(swap.state, SwapState::Done);
+    // Owed 21 of A's notes, then holding them: counted once.
+    assert_eq!(provider.exposure(A).unwrap(), 20 + fee);
+    assert!(provider.step().await.unwrap().is_empty());
+    assert_eq!(provider.records(1).unwrap()[0].stage, Stage::Done);
+    assert_eq!(provider.exposure(A).unwrap(), 20 + fee);
+    assert_eq!(provider.exposure(B).unwrap(), held(provider.wallet(), B));
+
+    // A swap bringing it 21 more, 9 under its limit, is declined.
+    let (a, b, me) = (eco.address(A), eco.address(B), eco.client.address());
+    let to = provider.wallet().address();
+    let lock = eco.client.lock(A, &to, 20 + fee, lock_hash(&[6; 32]), None);
+    let lock = lock_id(&lock.await.unwrap().id);
+    let request = Request::new(&a, &lock, &b, &me, 20);
+    let declined = provider.take(&request).await.unwrap_err();
+    assert_eq!(declined.code, Code::Declined);
+    let no_more = "the provider takes no more of hub http://a.test's notes now";
+    assert_eq!(declined.message, no_more);
+    // As at a hub its limits do not name.
+    provider.limit_intake(limits(&[(B, 1_000)]));
+    let declined = provider.take(&request).await.unwrap_err();
+    assert_eq!(declined.message, no_more);
+    drop(provider);
+
+    // A answers over HTTPS too: a limit naming it there counts what it
+    // took at the old URL. Restarted, it is not limited until limited.
+    eco.net.alias(SECURE_A, A);
+    eco.restart();
+    let provider = eco.provider();
+    assert_eq!(provider.intake(), None);
+    provider.wallet().add_hub(A).await.unwrap();
+    assert_eq!(provider.wallet().hub_urls(A).unwrap(), [SECURE_A, A]);
+    provider.limit_intake(limits(&[(SECURE_A, 30)]));
+    assert_eq!(provider.intake(), limits(&[(SECURE_A, 30)]));
+    assert_eq!(provider.exposure(A).unwrap(), 20 + fee);
+    assert_eq!(provider.exposure(SECURE_A).unwrap(), 20 + fee);
+    let declined = provider.take(&request).await.unwrap_err();
+    assert!(declined.message.contains("takes no more"), "{declined:?}");
+    assert_eq!(provider.records(10).unwrap().len(), 1);
+
+    // Within it, or the limit lifted: taken.
+    provider.limit_intake(limits(&[(SECURE_A, 30 + 20 + fee)]));
+    provider.take(&request).await.unwrap();
+    assert_eq!(provider.records(10).unwrap().len(), 2);
+    assert_eq!(provider.exposure(A).unwrap(), 2 * (20 + fee));
+    provider.limit_intake(None);
+    assert_eq!(provider.intake(), None);
+}
+
+#[tokio::test]
+async fn a_hub_takes_another_hubs_notes_within_its_cap_and_its_limit_both() {
+    let eco = Eco::issuing(30, no_guard()).await;
+    let provider = eco.provider();
+    let left = || provider.info().unwrap().hub(&eco.address(B)).unwrap().max;
+    assert_eq!(left(), 30);
+    // The lesser of its cap and its limit, none at a hub not named.
+    provider.limit_intake(limits(&[(A, 10)]));
+    assert_eq!(left(), 10);
+    provider.limit_intake(limits(&[(A, 1_000)]));
+    assert_eq!(left(), 30);
+    provider.limit_intake(limits(&[]));
+    assert_eq!(left(), 0);
+    // A client locks nothing for more.
+    let e = eco
+        .client
+        .swap(PROVIDER, A, B, 20, SwapLimits::usual(20))
+        .await
+        .unwrap_err();
+    assert!(matches!(e, Error::Invalid(_)), "{e}");
+    assert!(eco.client.swaps().unwrap().is_empty());
+
+    // One that locks anyway, under its cap and over its limit, is declined.
+    provider.limit_intake(limits(&[(A, 15)]));
+    let fee = costs(20).0;
+    let (a, b, me) = (eco.address(A), eco.address(B), eco.client.address());
+    let to = provider.wallet().address();
+    let lock = eco.client.lock(A, &to, 20 + fee, lock_hash(&[6; 32]), None);
+    let lock = lock_id(&lock.await.unwrap().id);
+    let declined = provider
+        .take(&Request::new(&a, &lock, &b, &me, 20))
+        .await
+        .unwrap_err();
+    assert_eq!(declined.code, Code::Declined);
+    assert_eq!(
+        declined.message,
+        "the hub takes no more of hub http://a.test's notes now"
+    );
+    assert!(provider.records(10).unwrap().is_empty());
 }
 
 #[tokio::test]

@@ -134,7 +134,8 @@ services:
 
   # It provides the swaps into it from hub1, for 1 + 5000 ppm, holding or
   # owed at most 30 000 of hub1's notes: its own lock there is of notes it
-  # issues, which need not outlast its window.
+  # issues, which need not outlast its window. No contract protects hub1's
+  # notes here (the tests open none): unprotected, as only tests run.
   hub2:
     <<: *hub
     command:
@@ -143,6 +144,7 @@ services:
         --announce-url http://127.0.0.1:${LICASH_E2E_HUB2:-38339} --announce-name hub2
         --name hub2 --notify gotify://gotify/$$(cat /notify/token)
         --swaps --swaps-from http://hub1:8338=30000 --swaps-fee-base 1 --swaps-fee-ppm 5000
+        --swaps-no-contracts
     ports:
       - "127.0.0.1:${LICASH_E2E_HUB2:-38339}:8338"
     volumes:
@@ -159,7 +161,9 @@ services:
 
   # Swaps between the hubs, which it reaches on this network, for 1 + 5000
   # ppm, from hub1 to hub2 alone (from hub2, hub1's window is too long to
-  # outlast), and payouts on Bitcoin Core's chain; the tests fund it.
+  # outlast), and payouts on Bitcoin Core's chain; the tests fund it. No
+  # contract protects its notes (the tests open none): unprotected, as only
+  # tests run.
   swaps:
     image: licash-swaps:e2e
     build:
@@ -175,6 +179,7 @@ services:
         --chain http://licash:licash@bitcoind:18443 --payout-min 1000 --payout-margin 36
         --nostr-relay ws://relay:8080 --announce-url http://127.0.0.1:${LICASH_E2E_SWAPS:-38340}
         --announce-name swaps --name swaps --notify gotify://gotify/$$(cat /notify/token)
+        --no-contracts
     environment:
       LICASH_SWAPS_LOG: json
       LICASH_SWAPS_NETWORK: regtest

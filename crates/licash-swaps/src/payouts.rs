@@ -261,6 +261,7 @@ impl<T: Transport> Provider<T> {
         terms: &swaps::Chain,
     ) -> Result<Option<Transaction>, Problem> {
         let _taking = self.taking.lock().unwrap_or_else(PoisonError::into_inner);
+        self.admit(taken.from, taken.paid)?;
         if self.free_on_chain(terms).map_err(unavailable)? < taken.value {
             return Err(declined("the provider holds too little on chain now"));
         }

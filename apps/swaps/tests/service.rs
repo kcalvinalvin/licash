@@ -257,6 +257,33 @@ fn the_dashboard_reads_the_provider_as_json_and_draws_on_a_terminal_only() {
 }
 
 #[test]
+fn a_provider_runs_unprotected_by_contracts_only_when_told_to() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(licash_swaps(&dir, &["init"]).status.success());
+    let listen = ["--listen", "127.0.0.1:0"];
+    // None opens on Bitcoin yet: refused before it serves.
+    let out = licash_swaps(&dir, &[&["run"], &listen[..]].concat());
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("none opens on bitcoin") && stderr.contains("--no-contracts"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("serving at"), "{stderr}");
+    // Nor kept without a chain to follow.
+    let regtest = tempfile::tempdir().unwrap();
+    let init = licash_swaps(&regtest, &["init", "--network", "regtest"]);
+    assert!(init.status.success());
+    let out = licash_swaps(&regtest, &[&["run"], &listen[..]].concat());
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("kept with --chain") && stderr.contains("--no-contracts"),
+        "{stderr}"
+    );
+}
+
+#[test]
 fn announcements_are_checked_before_anything_runs() {
     let dir = tempfile::tempdir().unwrap();
     let relay = ["--nostr-relay", "ws://127.0.0.1:1"];

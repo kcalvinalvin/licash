@@ -67,7 +67,9 @@ through the hub, signed with a secret only the two share. A payment not
 collected within an hour is sent to the payee's mailbox on Nostr by
 `deliver`, by `watch`, or after `mailbox` and `resume`; one the hub
 does not keep is sent there at once. A code naming no mailbox has its
-payment printed to hand over as well. `mailbox` (or `collect`) receives
+payment printed to hand over as well, as has one no relay took: a payment
+of many notes can be larger than the 64 KB relays commonly take, which
+the warning then says. `mailbox` (or `collect`) receives
 what the hubs keep for the wallet and what was sent to its mailbox; `watch`
 keeps receiving and delivering, every `--every` seconds (60), until
 stopped. Keep `watch` running, or schedule `deliver`, to send fallback mail
@@ -177,16 +179,21 @@ are refused, its notes are not renewed, and `hubs` says so. `approve-fees
 `approve-fees <hub> --yes` agrees to what was last shown, each fee raised to
 it and none lowered. Contracts opened before fees were kept with them hold
 their hub to nothing, as does a hub with no live contract. `contracts` lists them; with `--chain`, it carries on those under
-way and sees where each one's funding stands. On regtest, contracts are
+way, sees where each one's funding stands, and says what each live one
+would claim of the wallet's notes now (`claims`, also in `--json`): the
+notes at a hub are shared out among the contracts there so that together
+they recover the most, the one ending first served first. On regtest, contracts are
 under a mock proof authority: such a contract protects nothing. On signet
 they are under the genuine programs, a trial: `force-close` below recovers
 from them, not yet tried on signet itself (the hub's README says what else
 it lacks). No other network for now.
 
 `force-close <id> --chain <url>` forces a live contract closed when its hub
-stopped answering (`<id>` is the contract's id, or its start): the wallet's
-notes at that hub, up to the contract's cap, leave its balance and are
-claimed on Bitcoin. Until its request may be in the next block (a day
+stopped answering (`<id>` is the contract's id, or its start): its share
+of the wallet's notes at that hub (as `contracts --chain` shows it) leaves
+its balance and is claimed on Bitcoin for their value, the contract's cap
+at most. A note worth more than the cap left is claimed for the cap when
+nothing else recovers as much: its excess is lost. Until its request may be in the next block (a day
 after the contract's funding on signet), `give-up-recovery <id>` gives
 them back; from then on it is irrevocable. The wallet pays its fees from
 its coins on Bitcoin at `--fee-rate` sat/vB (by default the chain's

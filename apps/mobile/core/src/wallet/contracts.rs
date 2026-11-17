@@ -668,6 +668,7 @@ mod tests {
             cap: 4_096,
             assert_height: 360,
             close_height: 500,
+            since: 200,
             funding: (phase == Phase::Funded).then(|| Txid::from_byte_array([id; 32])),
             fate,
             abandoned: None,

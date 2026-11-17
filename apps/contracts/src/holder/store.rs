@@ -4,10 +4,10 @@
 //! a list shows of it. Neither is made until a first contract opens.
 //!
 //! The file's version tells which of its tables a build must know to
-//! read it right. The `ceilings` are none of them: made with the first
-//! kept, whatever the version, and ignored by a build before them, which
-//! opens the file all the same. A migration to come must make them
-//! `IF NOT EXISTS` too.
+//! read it right. The `ceilings` and `claim_terms` are none of them: each
+//! made with the first kept, whatever the version, and ignored by a build
+//! before them, which opens the file all the same. A migration to come
+//! must make them `IF NOT EXISTS` too.
 
 use std::collections::HashMap;
 #[cfg(test)]
@@ -79,6 +79,27 @@ CREATE TABLE IF NOT EXISTS ceilings (
 ) STRICT;
 ";
 
+/// Of each contract, the keyset whose notes its claim holds, the most
+/// authorizations it may and the holder program it opened under: read
+/// from its state, kept so as not to read it whole again. No row tells
+/// nothing: its state tells.
+const CLAIM_TERMS: &str = "
+CREATE TABLE IF NOT EXISTS claim_terms (
+    id BLOB PRIMARY KEY REFERENCES contracts (id),
+    keyset BLOB NOT NULL,
+    authorizations INTEGER NOT NULL,
+    program BLOB NOT NULL
+) STRICT;
+";
+
+/// A contract's claim terms as kept ([`CLAIM_TERMS`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct KeptTerms {
+    pub keyset: [u8; 32],
+    pub authorizations: u32,
+    pub program: [u8; 32],
+}
+
 /// A recovery as stored.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct RecoveryRow {
@@ -135,6 +156,8 @@ pub struct Contract {
     pub assert_height: u32,
     /// The block its collateral returns to the hub from.
     pub close_height: u32,
+    /// The chain's height as she started opening it.
+    pub since: u32,
     /// F's id, once she knows F.
     pub funding: Option<Txid>,
     /// Where F stands, as last seen once she signed it.
@@ -149,6 +172,12 @@ impl Contract {
     /// ahead of `tip`.
     pub fn live(&self, tip: u32) -> bool {
         self.fate == Some(Fate::Live) && tip < self.assert_height
+    }
+
+    /// Whether it is at the hub reached at any of `urls`.
+    pub fn at(&self, urls: &[String]) -> bool {
+        let hub = self.hub.trim_end_matches('/');
+        urls.iter().any(|url| url.trim_end_matches('/') == hub)
     }
 
     /// Whether nothing is left to do for it: given up, F never to
@@ -316,6 +345,43 @@ impl Store {
         Ok(raised)
     }
 
+    /// Each contract's claim terms kept, by id.
+    pub(super) fn claim_terms(&self) -> Result<HashMap<[u8; 32], KeptTerms>> {
+        let made: Option<i64> = (self.c)
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'claim_terms'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if made.is_none() {
+            return Ok(HashMap::new());
+        }
+        let mut stmt =
+            (self.c).prepare("SELECT id, keyset, authorizations, program FROM claim_terms")?;
+        let rows = stmt.query_map([], |r| {
+            let terms = KeptTerms {
+                keyset: r.get(1)?,
+                authorizations: r.get(2)?,
+                program: r.get(3)?,
+            };
+            Ok((r.get(0)?, terms))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Keep the claim terms of `id`, as its state has them: of a contract
+    /// it keeps only, once.
+    pub(super) fn keep_claim_terms(&self, id: &[u8; 32], terms: &KeptTerms) -> Result<()> {
+        self.c.execute_batch(CLAIM_TERMS)?;
+        self.c.execute(
+            "INSERT OR IGNORE INTO claim_terms (id, keyset, authorizations, program)
+             SELECT ?1, ?2, ?3, ?4 WHERE EXISTS (SELECT 1 FROM contracts WHERE id = ?1)",
+            params![id, terms.keyset, terms.authorizations, terms.program],
+        )?;
+        Ok(())
+    }
+
     /// Opening `id` after a step: its phase, F once known, its state.
     /// Irrevocable from [`Phase::Funded`] on, in the same write: her
     /// signature of F leaves only after.
@@ -397,7 +463,7 @@ impl Store {
     pub fn list(&self) -> Result<Vec<Contract>> {
         let mut stmt = self.c.prepare(
             "SELECT id, hub, phase, mock, deposit, value, price, cap, assert_height,
-                    close_height, funding, fate, abandoned, created_at
+                    close_height, funding, fate, abandoned, created_at, since
              FROM contracts ORDER BY created_at DESC, id",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -417,6 +483,7 @@ impl Store {
                 r.get::<_, Option<String>>(11)?,
                 r.get::<_, Option<String>>(12)?,
                 r.get::<_, i64>(13)?,
+                r.get::<_, u32>(14)?,
             ))
         })?;
         let mut all = Vec::new();
@@ -433,6 +500,7 @@ impl Store {
                 fate,
                 abandoned,
                 created_at,
+                since,
             ) = row?;
             let phase = *Phase::ALL
                 .get(usize::from(phase))
@@ -448,6 +516,7 @@ impl Store {
                 cap,
                 assert_height: heights.0,
                 close_height: heights.1,
+                since,
                 funding: funding.map(|t| deserialize(&t)).transpose()?,
                 fate: fate.as_deref().map(text_fate).transpose()?,
                 abandoned,
@@ -710,7 +779,10 @@ mod tests {
             (first.deposit, first.value, first.price),
             (coin(0), 60_000, 23_000)
         );
-        assert_eq!((first.assert_height, first.close_height), (360, 500));
+        assert_eq!(
+            (first.assert_height, first.close_height, first.since),
+            (360, 500, 200)
+        );
         assert!(first.live(359) && !first.live(360) && !first.over(499) && first.over(500));
         assert_eq!(store.state(&[1; 32]).unwrap(), (b"funded".to_vec(), 200));
         let second = all.iter().find(|c| c.id == [2; 32]).unwrap();
@@ -855,6 +927,38 @@ mod tests {
         assert_eq!(store.ceilings().unwrap()[&[2; 32]], agreed);
         store.insert_under(&new(4, coin(2)), &agreed).unwrap();
         assert_eq!(store.ceilings().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn claim_terms_are_kept_once_beside_a_file_of_the_version_it_was() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store.insert(&new(1, coin(0))).unwrap();
+        // None kept: no table made by reading.
+        assert!(store.claim_terms().unwrap().is_empty());
+        let terms = |keyset, authorizations, program| KeptTerms {
+            keyset,
+            authorizations,
+            program,
+        };
+        store
+            .keep_claim_terms(&[1; 32], &terms([7; 32], 128, [5; 32]))
+            .unwrap();
+        // Kept once: never changed after.
+        store
+            .keep_claim_terms(&[1; 32], &terms([8; 32], 2, [6; 32]))
+            .unwrap();
+        let kept = HashMap::from([([1; 32], terms([7; 32], 128, [5; 32]))]);
+        assert_eq!(store.claim_terms().unwrap(), kept);
+        // Of a contract it does not know: not kept.
+        store
+            .keep_claim_terms(&[2; 32], &terms([7; 32], 1, [5; 32]))
+            .unwrap();
+        assert_eq!(store.claim_terms().unwrap(), kept);
+        assert_eq!(user_version(dir.path()), 1);
+        drop(store);
+        let store = Store::open(dir.path()).unwrap();
+        assert_eq!(store.claim_terms().unwrap(), kept);
     }
 
     #[test]

@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use licash::spend::ChainProfile;
 use licash_api::Fee;
-use licash_wallet::{ClaimNote, Error, Wallet};
+use licash_wallet::{ClaimNote, ClaimSlot, Error, Wallet};
 use net::{Link, Net, HUB};
 
 const FEE: Fee = Fee { base: 2, ppm: 0 };
@@ -55,6 +55,16 @@ fn available(wallet: &Wallet<Link>) -> u64 {
     wallet.balance().unwrap().iter().map(|b| b.available).sum()
 }
 
+/// The slot of contract `id` at the hub of `p`'s keyset.
+fn slot(p: &Party, id: [u8; 32], cap: u64, max: usize) -> ClaimSlot {
+    ClaimSlot {
+        id,
+        keyset: p.keyset,
+        cap,
+        max,
+    }
+}
+
 fn denominations(notes: &[ClaimNote]) -> Vec<u64> {
     notes
         .iter()
@@ -63,19 +73,22 @@ fn denominations(notes: &[ClaimNote]) -> Vec<u64> {
 }
 
 #[tokio::test]
-async fn a_claim_takes_the_largest_notes_its_cap_holds_out_of_every_payment() {
+async fn a_claim_takes_the_notes_recovering_its_cap_out_of_every_payment() {
     let net = network();
     // 64 + 32 + 4, then 4.
     let p = party(&net, 1, &[100, 4]).await;
     let w = &p.wallet;
     assert_eq!(available(w), 104);
 
-    // 32 would pass the cap, and the second 4 too.
-    let claimed = w.claim_notes(&ID, &p.keyset, 70, 32).unwrap();
-    assert_eq!(denominations(&claimed), [64, 4]);
-    assert_eq!(available(w), 36);
+    // A contract alone recovers its whole cap: of 64 + 4 + 4, 2 sat lost,
+    // rather than 68 of 64 + 4 (or 26 lost of 64 + 32).
+    let slots = [slot(&p, ID, 70, 32)];
+    assert_eq!(w.recoverable(&slots).unwrap()[&ID], 70);
+    let claimed = w.claim_notes(&ID, &slots).unwrap();
+    assert_eq!(denominations(&claimed), [64, 4, 4]);
+    assert_eq!(available(w), 32);
     let again = w.claimed_notes(&ID, &p.keyset).unwrap();
-    assert_eq!(denominations(&again), [64, 4]);
+    assert_eq!(denominations(&again), [64, 4, 4]);
 
     // No payment takes them.
     let to = party(&net, 2, &[]).await.wallet.address();
@@ -86,8 +99,38 @@ async fn a_claim_takes_the_largest_notes_its_cap_holds_out_of_every_payment() {
     w.send(HUB, &to, 30).await.unwrap();
     assert_eq!(
         denominations(&w.claimed_notes(&ID, &p.keyset).unwrap()),
-        [64, 4]
+        [64, 4, 4]
     );
+}
+
+#[tokio::test]
+async fn contracts_at_a_hub_recover_the_most_together_each_claiming_its_share() {
+    let net = network();
+    // 64 + 32 + 4 + 4.
+    let p = party(&net, 1, &[100, 4]).await;
+    let w = &p.wallet;
+    let other = [8; 32];
+    // The first alone would claim 64 + 4 + 4 for 70: together, all 104,
+    // the most to the first.
+    let slots = [slot(&p, ID, 70, 32), slot(&p, other, 40, 32)];
+    let recoverable = w.recoverable(&slots).unwrap();
+    assert_eq!((recoverable[&ID], recoverable[&other]), (68, 36));
+    // Reading it took nothing.
+    assert_eq!(available(w), 104);
+
+    let mine = w.claim_notes(&ID, &slots).unwrap();
+    assert_eq!(denominations(&mine), [64, 4]);
+    // Its recovery took its notes: it holds none back from the other.
+    let recoverable = w.recoverable(&slots).unwrap();
+    assert_eq!((recoverable[&ID], recoverable[&other]), (0, 36));
+    let theirs = w.claim_notes(&other, &slots).unwrap();
+    assert_eq!(denominations(&theirs), [32, 4]);
+    assert_eq!(available(w), 0);
+    // A recovery claims in a slot of its own only.
+    assert!(matches!(
+        w.claim_notes(&[9; 32], &slots),
+        Err(Error::Invalid(_))
+    ));
 }
 
 #[tokio::test]
@@ -95,7 +138,7 @@ async fn a_claimed_note_shows_its_ownership_under_the_wallet_s_spending_root() {
     let net = network();
     let p = party(&net, 1, &[100]).await;
     let w = &p.wallet;
-    let claimed = w.claim_notes(&ID, &p.keyset, 1_000, 32).unwrap();
+    let claimed = w.claim_notes(&ID, &[slot(&p, ID, 1_000, 32)]).unwrap();
     let ownerships = w.ownerships(&claimed).unwrap();
     assert_eq!(ownerships.len(), claimed.len());
     let root = w.address().spend();
@@ -106,7 +149,7 @@ async fn a_claimed_note_shows_its_ownership_under_the_wallet_s_spending_root() {
     let other = party(&net, 2, &[100]).await;
     let theirs = other
         .wallet
-        .claim_notes(&ID, &other.keyset, 1_000, 32)
+        .claim_notes(&ID, &[slot(&other, ID, 1_000, 32)])
         .unwrap();
     assert!(w.ownerships(&theirs).is_err());
     let root = other.wallet.address().spend();
@@ -119,7 +162,10 @@ async fn a_claimed_note_shows_its_ownership_under_the_wallet_s_spending_root() {
 async fn a_claim_takes_as_many_notes_as_it_may_hold() {
     let net = network();
     let p = party(&net, 1, &[100]).await;
-    let claimed = p.wallet.claim_notes(&ID, &p.keyset, 1_000, 2).unwrap();
+    let claimed = p
+        .wallet
+        .claim_notes(&ID, &[slot(&p, ID, 1_000, 2)])
+        .unwrap();
     assert_eq!(denominations(&claimed), [64, 32]);
 }
 
@@ -127,14 +173,19 @@ async fn a_claim_takes_as_many_notes_as_it_may_hold() {
 async fn coverage_previews_whole_notes_once_without_reserving_them() {
     let net = network();
     let p = party(&net, 1, &[100, 4]).await;
-    let requests = [(p.keyset, 70, 32), (p.keyset, 70, 32)];
-    assert_eq!(p.wallet.claimable_amounts(&requests).unwrap(), [68, 36]);
+    let other = [8; 32];
+    let slots = [slot(&p, ID, 70, 32), slot(&p, other, 70, 32)];
+    let shares = |w: &Wallet<Link>| {
+        let recoverable = w.recoverable(&slots).unwrap();
+        (recoverable[&ID], recoverable[&other])
+    };
+    assert_eq!(shares(&p.wallet), (68, 36));
     assert_eq!(available(&p.wallet), 104);
     assert!(p.wallet.claimed_notes(&ID, &p.keyset).unwrap().is_empty());
-    let first = p.wallet.claim_notes(&ID, &p.keyset, 70, 32).unwrap();
+    let first = p.wallet.claim_notes(&ID, &slots).unwrap();
     assert_eq!(denominations(&first).iter().sum::<u64>(), 68);
-    assert_eq!(p.wallet.claimable_amounts(&requests).unwrap(), [36, 0]);
-    let second = p.wallet.claim_notes(&[8; 32], &p.keyset, 70, 32).unwrap();
+    assert_eq!(shares(&p.wallet), (0, 36));
+    let second = p.wallet.claim_notes(&other, &slots).unwrap();
     assert_eq!(denominations(&second).iter().sum::<u64>(), 36);
 }
 
@@ -142,25 +193,19 @@ async fn coverage_previews_whole_notes_once_without_reserving_them() {
 async fn coverage_obeys_note_limits_caps_and_exact_keysets() {
     let net = network();
     let p = party(&net, 1, &[64]).await;
-    assert_eq!(
-        p.wallet.claimable_amounts(&[(p.keyset, 60, 32)]).unwrap(),
-        [0]
-    );
-    assert_eq!(
-        p.wallet.claimable_amounts(&[(p.keyset, 128, 0)]).unwrap(),
-        [0]
-    );
-    assert_eq!(
-        p.wallet.claimable_amounts(&[([9; 32], 128, 32)]).unwrap(),
-        [0]
-    );
+    let alone = |slot: ClaimSlot| p.wallet.recoverable(&[slot]).unwrap()[&slot.id];
+    // A note above the cap recovers the cap, its excess lost.
+    assert_eq!(alone(slot(&p, ID, 60, 32)), 60);
+    assert_eq!(alone(slot(&p, ID, 128, 0)), 0);
+    let elsewhere = ClaimSlot {
+        keyset: [9; 32],
+        ..slot(&p, ID, 128, 32)
+    };
+    assert_eq!(alone(elsewhere), 0);
     let p = party(&net, 2, &[100]).await;
-    assert_eq!(
-        p.wallet
-            .claimable_amounts(&[(p.keyset, 1_000, 2), (p.keyset, 1_000, 1)])
-            .unwrap(),
-        [96, 4]
-    );
+    let slots = [slot(&p, ID, 1_000, 2), slot(&p, [8; 32], 1_000, 1)];
+    let recoverable = p.wallet.recoverable(&slots).unwrap();
+    assert_eq!((recoverable[&ID], recoverable[&[8; 32]]), (96, 4));
 }
 
 #[tokio::test]
@@ -180,18 +225,10 @@ async fn coverage_excludes_notes_reserved_by_payments_unlinks_or_another_copy() 
         [&ID[..]],
     )
     .unwrap();
+    let slots = [slot(&p, [8; 32], 1_000, 32)];
+    assert_eq!(p.wallet.recoverable(&slots).unwrap()[&[8; 32]], 4);
     assert_eq!(
-        p.wallet
-            .claimable_amounts(&[(p.keyset, 1_000, 32)])
-            .unwrap(),
-        [4]
-    );
-    assert_eq!(
-        denominations(
-            &p.wallet
-                .claim_notes(&[8; 32], &p.keyset, 1_000, 32)
-                .unwrap()
-        ),
+        denominations(&p.wallet.claim_notes(&[8; 32], &slots).unwrap()),
         [4]
     );
 }
@@ -201,17 +238,12 @@ async fn a_recovery_claims_once_and_its_notes_come_back_when_given_up() {
     let net = network();
     let p = party(&net, 1, &[100]).await;
     let w = &p.wallet;
-    w.claim_notes(&ID, &p.keyset, 1_000, 32).unwrap();
+    let slots = [slot(&p, ID, 1_000, 32), slot(&p, [8; 32], 1_000, 32)];
+    w.claim_notes(&ID, &slots).unwrap();
     assert_eq!(available(w), 0);
-    assert!(matches!(
-        w.claim_notes(&ID, &p.keyset, 1_000, 32),
-        Err(Error::Invalid(_))
-    ));
+    assert!(matches!(w.claim_notes(&ID, &slots), Err(Error::Invalid(_))));
     // Another contract's recovery finds none left.
-    assert!(w
-        .claim_notes(&[8; 32], &p.keyset, 1_000, 32)
-        .unwrap()
-        .is_empty());
+    assert!(w.claim_notes(&[8; 32], &slots).unwrap().is_empty());
 
     assert_eq!(w.unclaim_notes(&ID).unwrap(), 3);
     assert_eq!(available(w), 100);
@@ -223,7 +255,13 @@ async fn a_claim_of_a_keyset_the_wallet_never_had_is_refused() {
     let net = network();
     let p = party(&net, 1, &[100]).await;
     assert!(matches!(
-        p.wallet.claim_notes(&ID, &[9; 32], 1_000, 32),
+        p.wallet.claim_notes(
+            &ID,
+            &[ClaimSlot {
+                keyset: [9; 32],
+                ..slot(&p, ID, 1_000, 32)
+            }]
+        ),
         Err(Error::Invalid(_))
     ));
     assert_eq!(available(&p.wallet), 100);
@@ -233,7 +271,9 @@ async fn a_claim_of_a_keyset_the_wallet_never_had_is_refused() {
 async fn claimed_notes_keep_their_keys_and_read_back_from_their_bytes() {
     let net = network();
     let p = party(&net, 1, &[100]).await;
-    let claimed = p.wallet.claim_notes(&ID, &p.keyset, 1_000, 32).unwrap();
+    let claimed = (p.wallet)
+        .claim_notes(&ID, &[slot(&p, ID, 1_000, 32)])
+        .unwrap();
     let keys = p.wallet.hold_keys(&claimed).unwrap();
     assert_eq!(keys.len(), 3);
     for (note, (message, _)) in claimed.iter().zip(&keys) {

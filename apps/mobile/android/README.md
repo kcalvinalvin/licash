@@ -153,9 +153,12 @@ moves into the balance at that hub once its funding confirms, unless
 switched off. Opening downloads about 100 MB and takes minutes to an hour,
 in the background, one at a time, the step it is at shown; several
 contracts at a hub, and at several hubs, add up. Each says what it covers
-now of the hub's notes once unfolded, those ending first covering first,
-and the hub's page how much of what it holds they protect; the notes they
-cover count as protected rather than not, on Home and behind the balance;
+now of the hub's notes once unfolded: what its recovery would claim of them
+now, the notes at a hub shared out among its contracts so that together
+they recover the most, those ending first served first. Notes still
+arriving count as not protected until they settle. The hub's page says how
+much of what it holds they protect; what they cover counts as protected,
+on Home and behind the balance;
 what a contract is worth for now (nothing, under the mock authority) is said
 wherever one shows. The fees a hub charges as a contract opens there are
 the most the app pays it from then on: a hub that raised them since is not
@@ -164,12 +167,13 @@ asked when a payment there is refused for it (old beside new, then paid)
 and on the hub's page in Settings. A contract ends no sooner: End says to cash out the
 hub's notes instead. In advanced mode, a contract whose hub stopped
 answering can be forced closed: the notes it covers are claimed on Bitcoin
-and paid back there once the hub's window to answer passed. A hub that
-answers instead says what the claim is owed, and must prove it on Bitcoin
-by a deadline the row shows: the app checks the hub's proof, challenges one
-that does not verify, and is paid what the outcome says. The phone proves
-nothing, and no root key of the wallet is revealed: the claim's notes are
-tied to no key that owns the contract. The contracts are kept beside the wallet's file, made
+(a note worth more than its cap for the cap, its excess lost) and paid back
+there once the hub's window to answer passed. A hub that answers instead
+says what the claim is owed, and must prove it on Bitcoin by a deadline the
+row shows: the app checks the hub's proof, challenges one that does not
+verify, and is paid what the outcome says. The phone proves nothing, and no
+root key of the wallet is revealed: the claim's notes are tied to no key
+that owns the contract. The contracts are kept beside the wallet's file, made
 only once one is asked for.
 
 Coverage uses the actual whole-note recovery selection, not nominal caps:

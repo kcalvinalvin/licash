@@ -29,7 +29,10 @@ use licash_hub_service::{
 use licash_nostr::{Announcement, Route};
 use licash_notify::{Message, Priority, Target};
 use licash_swaps::{Config as SwapsConfig, Issuer, Provider};
-use licash_swaps_service::notify::Notifier as SwapsNotifier;
+use licash_swaps_service::{
+    keeper::{self, Keeper},
+    notify::Notifier as SwapsNotifier,
+};
 use licash_tor::{Onion, Tor};
 use licash_transport::Http;
 use licash_wallet::Wallet;
@@ -647,6 +650,40 @@ struct SwapsArgs {
           default_value_t = SwapsConfig::default().confirm,
           value_parser = clap::value_parser!(u32).range(1..))]
     swaps_confirm: u32,
+    /// Take the notes of the hubs of `--swaps-from` in with no contract
+    /// protecting them there: reckless, as a hub that withholds them keeps
+    /// them. By default the provider takes in at each only what its
+    /// contracts there protect, the first opened by the operator with
+    /// `licash-wallet --wallet <data>/swaps/wallet.sqlite open-contract`,
+    /// and keeps them: replaced before they end, forced closed at their
+    /// safe deadline if needed. The hub's own notes need none.
+    #[arg(long, env = "LICASH_HUB_SWAPS_NO_CONTRACTS",
+          value_parser = clap::builder::BoolishValueParser::new())]
+    swaps_no_contracts: bool,
+    /// Days before a contract's safe deadline to open its successor.
+    #[arg(
+        long,
+        env = "LICASH_HUB_SWAPS_CONTRACT_SUCCESSOR_DAYS",
+        default_value_t = 14
+    )]
+    swaps_contract_successor_days: u32,
+    /// Days kept to prove a recovery's claim in, before each contract's
+    /// last block to assert it in: its safe deadline comes a day earlier.
+    #[arg(
+        long,
+        env = "LICASH_HUB_SWAPS_CONTRACT_PROOF_DAYS",
+        default_value_t = 14
+    )]
+    swaps_contract_proof_days: u32,
+    /// The most a successor costs, in sat [default: what the contract it
+    /// replaces cost, and a quarter].
+    #[arg(long, env = "LICASH_HUB_SWAPS_CONTRACT_MAX_PRICE")]
+    swaps_contract_max_price: Option<u64>,
+    /// Pay out to the provider's own address on Bitcoin, through the swap
+    /// provider at URL, what a contract that could not be replaced leaves
+    /// unprotected [default: only take no more in there].
+    #[arg(long, value_name = "URL", env = "LICASH_HUB_SWAPS_DRAIN_VIA")]
+    swaps_drain_via: Option<String>,
 }
 
 impl SwapsArgs {
@@ -662,6 +699,14 @@ impl SwapsArgs {
         if !self.swaps {
             anyhow::ensure!(from.is_empty(), "--swaps-from needs --swaps");
             anyhow::ensure!(!self.swaps_tor, "--swaps-tor needs --swaps");
+            anyhow::ensure!(
+                !self.swaps_no_contracts,
+                "--swaps-no-contracts needs --swaps"
+            );
+            anyhow::ensure!(
+                self.swaps_drain_via.is_none(),
+                "--swaps-drain-via needs --swaps"
+            );
             return Ok(None);
         }
         anyhow::ensure!(
@@ -684,6 +729,63 @@ impl SwapsArgs {
             confirm: self.swaps_confirm,
         };
         Ok(Some((config, from)))
+    }
+
+    /// Whether contracts protect the notes the provider takes in from the
+    /// hubs `from`, on `network`: refused where none opens, unless
+    /// --swaps-no-contracts runs it unprotected. None needed from no hub.
+    fn protected(&self, network: ChainProfile, from: &[Capped]) -> anyhow::Result<bool> {
+        if from.is_empty() {
+            return Ok(false);
+        }
+        if self.swaps_no_contracts {
+            tracing::warn!(
+                "--swaps-no-contracts: no contract protects the notes the hub takes in from \
+                 the hubs of --swaps-from, which a hub that withholds them keeps. Reckless \
+                 outside of tests"
+            );
+            return Ok(false);
+        }
+        licash_contracts::trust(network).with_context(|| {
+            format!(
+                "contracts protect the notes taken in from the hubs of --swaps-from, and none \
+                 opens on {network}: --swaps-no-contracts runs it unprotected, recklessly"
+            )
+        })?;
+        Ok(true)
+    }
+
+    /// The keeper of the contracts of `provider`, whose files are in `dir`,
+    /// on `chain` of `network`, protecting the notes of the hubs `from`.
+    fn keeper(
+        &self,
+        provider: &Arc<Provider<Http>>,
+        chain: Source,
+        network: ChainProfile,
+        dir: &Path,
+        from: &[Capped],
+    ) -> Keeper<Http> {
+        let wallet = dir.join("wallet.sqlite");
+        let hint = format!(
+            "licash-wallet --wallet {} open-contract {{hub}} --chain CHAIN",
+            wallet.display()
+        );
+        let settings = keeper::Settings::new(
+            network,
+            self.swaps_contract_proof_days,
+            self.swaps_contract_successor_days,
+            hint,
+        );
+        let settings = keeper::Settings {
+            hubs: Some(from.iter().map(|(url, _)| url.clone()).collect()),
+            max_price: self.swaps_contract_max_price,
+            drain_via: self.swaps_drain_via.clone(),
+            // Nothing else looks for the coins of the swaps' wallet.
+            scan: true,
+            ..settings
+        };
+        let chain = licash_contracts::holder::Node(chain);
+        Keeper::new(provider.clone(), chain, dir.to_owned(), settings)
     }
 }
 
@@ -920,6 +1022,10 @@ fn command(cli: Cli) -> anyhow::Result<()> {
                 swapping.is_none() || chain.is_some(),
                 "providing swaps (--swaps) needs --chain"
             );
+            let swaps_protected = match (&swapping, &chain) {
+                (Some((_, from)), Some((_, profile, _))) => swaps.protected(*profile, from)?,
+                _ => false,
+            };
             let swaps_dir = cli.data.join("swaps");
             if swapping.is_none() {
                 check_idle(&swaps_dir)?;
@@ -1030,7 +1136,7 @@ fn command(cli: Cli) -> anyhow::Result<()> {
                 false => None,
             };
             let swapping = match (swapping, &chain) {
-                (Some((config, from)), Some((_, profile, every))) => {
+                (Some((config, from)), Some((source, profile, every))) => {
                     if from.is_empty() {
                         tracing::warn!("providing swaps from no hub (--swaps-from)");
                     }
@@ -1057,6 +1163,10 @@ fn command(cli: Cli) -> anyhow::Result<()> {
                     let provider =
                         swap_provider(&swaps_dir, *profile, config, issuer, transport, cli.log)?;
                     let provider = Arc::new(provider);
+                    // Before it serves: nothing is taken in unprotected.
+                    let keeper = swaps_protected.then(|| {
+                        swaps.keeper(&provider, source.clone(), *profile, &swaps_dir, &from)
+                    });
                     let notifier = match swaps_targets.is_empty() {
                         true => None,
                         false => {
@@ -1077,6 +1187,7 @@ fn command(cli: Cli) -> anyhow::Result<()> {
                         provider,
                         every: *every,
                         notifier,
+                        keeper,
                     })
                 }
                 _ => None,
@@ -1425,6 +1536,9 @@ struct Swapping {
     provider: Arc<Provider<Http>>,
     every: Duration,
     notifier: Option<SwapsNotifier>,
+    /// The keeper of the contracts protecting the notes it takes in from
+    /// other hubs, unless run unprotected.
+    keeper: Option<Keeper<Http>>,
 }
 
 async fn serve(
@@ -1486,12 +1600,20 @@ async fn serve(
         tokio::spawn(deposits.run())
     });
     let mut swaps = Vec::new();
+    // Stopped as the hub stops: dropped on return.
+    let mut _keeping = None;
     if let Some(Swapping {
         provider,
         every,
         notifier,
+        keeper,
     }) = swapping
     {
+        if let Some(keeper) = keeper {
+            tracing::info!("keeping the contracts protecting the notes of the hubs swapped from");
+            let running = keeper.spawn(keeper::EVERY);
+            _keeping = Some(running.context("a thread for the swaps' contracts")?);
+        }
         let address = hex::encode(provider.wallet().address().to_bytes());
         tracing::debug!(%address, config = %serde_json::to_string(provider.config())?, "swap configuration");
         tracing::info!("providing swaps");

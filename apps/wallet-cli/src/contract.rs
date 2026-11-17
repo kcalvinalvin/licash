@@ -12,7 +12,7 @@ use anyhow::Context;
 use licash_contracts::holder::recovery::{self, Recovery};
 use licash_contracts::holder::{self, Ask, Contract, Node};
 use licash_transport::Http;
-use licash_wallet::Wallet;
+use licash_wallet::{Blocks as _, Wallet};
 use serde_json::json;
 
 use crate::show;
@@ -160,16 +160,36 @@ pub async fn list(
     chain: Option<&str>,
     json: bool,
 ) -> anyhow::Result<()> {
-    let contracts = match chain {
-        Some(_) => holder::resume(wallet, &node(chain)?, dir(path)).await?,
-        None => holder::list(dir(path))?,
+    let (contracts, claims) = match chain {
+        Some(_) => {
+            let node = node(chain)?;
+            let contracts = holder::resume(wallet, &node, dir(path)).await?;
+            let tip = node.height().await.map_err(|e| anyhow::anyhow!(e))?;
+            let each = holder::coverage(wallet, dir(path), &contracts, tip)?;
+            let claims = |c: &Contract| c.live(tip).then(|| each.get(&c.id).copied().unwrap_or(0));
+            let claims: Vec<_> = contracts.iter().map(claims).collect();
+            (contracts, claims)
+        }
+        None => {
+            let contracts = holder::list(dir(path))?;
+            let none = vec![None; contracts.len()];
+            (contracts, none)
+        }
     };
-    let lines: Vec<String> = contracts.iter().map(contract_line).collect();
-    show(
-        json,
-        contracts.iter().map(contract_json).collect(),
-        lines.join("\n"),
-    );
+    let lines: Vec<String> = (contracts.iter().zip(&claims))
+        .map(|(c, claims)| match claims {
+            Some(sat) => format!("{}  claims {} now", contract_line(c), crate::say::sat(*sat)),
+            None => contract_line(c),
+        })
+        .collect();
+    let values: serde_json::Value = (contracts.iter().zip(&claims))
+        .map(|(c, claims)| {
+            let mut value = contract_json(c);
+            value["claims"] = json!(claims);
+            value
+        })
+        .collect();
+    show(json, values, lines.join("\n"));
     Ok(())
 }
 

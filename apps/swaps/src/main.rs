@@ -13,11 +13,13 @@ use anyhow::Context;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use licash::spend::ChainProfile;
 use licash_api::{swaps, Fee};
+use licash_contracts::holder::Node;
 use licash_nostr::Route;
 use licash_notify::{Message, Priority, Target};
 use licash_swaps::{Config, Provider};
 use licash_swaps_service::{
     dashboard,
+    keeper::{self, Keeper},
     notify::{self, Notifier},
     ChainView,
 };
@@ -174,6 +176,91 @@ impl ChainArgs {
         };
         wallet.watch_silent(None, from)?;
         Ok(())
+    }
+}
+
+/// The recovery contracts protecting the provider's notes at its hubs.
+#[derive(Args)]
+struct ContractArgs {
+    /// Take notes in at any hub with no contract protecting them there:
+    /// reckless, as a hub that withholds them keeps them. By default a
+    /// provider takes in at each hub only what its contracts there
+    /// protect, the first opened by its operator with `licash-wallet
+    /// --wallet <data>/wallet.sqlite open-contract`, and keeps them with
+    /// --chain: replaced before they end, forced closed at their safe
+    /// deadline if needed.
+    #[arg(long, env = "LICASH_SWAPS_NO_CONTRACTS",
+          value_parser = clap::builder::BoolishValueParser::new())]
+    no_contracts: bool,
+    /// Days before a contract's safe deadline to open its successor.
+    #[arg(
+        long,
+        env = "LICASH_SWAPS_CONTRACT_SUCCESSOR_DAYS",
+        default_value_t = 14
+    )]
+    contract_successor_days: u32,
+    /// Days kept to prove a recovery's claim in, before each contract's
+    /// last block to assert it in: its safe deadline comes a day earlier.
+    #[arg(long, env = "LICASH_SWAPS_CONTRACT_PROOF_DAYS", default_value_t = 14)]
+    contract_proof_days: u32,
+    /// The most a successor costs, in sat [default: what the contract it
+    /// replaces cost, and a quarter].
+    #[arg(long, env = "LICASH_SWAPS_CONTRACT_MAX_PRICE")]
+    contract_max_price: Option<u64>,
+    /// Pay out to the provider's own address on Bitcoin, through the swap
+    /// provider at URL, what a contract that could not be replaced leaves
+    /// unprotected [default: only take no more in there].
+    #[arg(long, value_name = "URL", env = "LICASH_SWAPS_DRAIN_VIA")]
+    drain_via: Option<String>,
+}
+
+impl ContractArgs {
+    /// The keeper of the contracts of `provider`, whose files are in
+    /// `data`, on `chain`: none with --no-contracts. Refused where contracts
+    /// cannot protect its notes.
+    fn keeper(
+        &self,
+        provider: &Arc<Provider<Http>>,
+        chain: Option<&str>,
+        data: &Path,
+    ) -> anyhow::Result<Option<Keeper<Http>>> {
+        if self.no_contracts {
+            tracing::warn!(
+                "--no-contracts: no contract protects the notes the provider takes in at its \
+                 hubs, which a hub that withholds them keeps. Reckless outside of tests"
+            );
+            return Ok(None);
+        }
+        let reckless = "--no-contracts runs it unprotected, recklessly";
+        let network = provider.wallet().network();
+        licash_contracts::trust(network).with_context(|| {
+            format!("contracts protect a provider's notes, and none opens on {network}: {reckless}")
+        })?;
+        let chain = chain.with_context(|| {
+            format!("contracts protect a provider's notes, and are kept with --chain: {reckless}")
+        })?;
+        let wallet = data.join("wallet.sqlite");
+        let settings = keeper::Settings::new(
+            network,
+            self.contract_proof_days,
+            self.contract_successor_days,
+            format!(
+                "licash-wallet --wallet {} open-contract {{hub}} --chain CHAIN",
+                wallet.display()
+            ),
+        );
+        let settings = keeper::Settings {
+            max_price: self.contract_max_price,
+            drain_via: self.drain_via.clone(),
+            ..settings
+        };
+        let node = Node(chain.parse().context("--chain")?);
+        Ok(Some(Keeper::new(
+            provider.clone(),
+            node,
+            data.to_owned(),
+            settings,
+        )))
     }
 }
 
@@ -402,6 +489,8 @@ enum Command {
         chain: ChainArgs,
         #[command(flatten)]
         payouts: PayoutTerms,
+        #[command(flatten)]
+        contracts: ContractArgs,
     },
     /// Hand out an address on Bitcoin to fund the provider's payouts at:
     /// a plain taproot address of its wallet, watched from then on.
@@ -499,6 +588,7 @@ fn command(cli: Cli) -> anyhow::Result<()> {
             announce,
             chain,
             payouts,
+            contracts,
         } => {
             let config = terms.config()?;
             let source = chain.source()?;
@@ -542,6 +632,8 @@ fn command(cli: Cli) -> anyhow::Result<()> {
                 }
             };
             let provider = Arc::new(provider);
+            // Before it serves: nothing is taken in unprotected.
+            let keeper = contracts.keeper(&provider, chain.chain.as_deref(), &data)?;
             let nostr = match announcing {
                 Some(_) => Some(licash_nostr::public_key(&provider.nostr_secret()?)?),
                 None => None,
@@ -578,6 +670,15 @@ fn command(cli: Cli) -> anyhow::Result<()> {
                 Some(notifier)
             };
             let every = Duration::from_secs(step);
+            // Stopped as the provider stops: dropped on return.
+            let _keeping = match keeper {
+                Some(keeper) => {
+                    tracing::info!("keeping the contracts protecting the provider's notes");
+                    let running = keeper.spawn(keeper::EVERY);
+                    Some(running.context("a thread for the contracts")?)
+                }
+                None => None,
+            };
             let serving = serve(
                 provider, router, listen, every, notifier, announcing, source,
             );
@@ -968,6 +1069,53 @@ mod tests {
         let mut none = None;
         announce_over(&mut none, &tor, None).unwrap();
         assert!(none.is_none());
+    }
+
+    fn contracts(args: &[&str]) -> ContractArgs {
+        let cli = Cli::try_parse_from([&["licash-swaps", "run"], args].concat()).unwrap();
+        match cli.command {
+            Command::Run { contracts, .. } => contracts,
+            _ => unreachable!("run"),
+        }
+    }
+
+    #[test]
+    fn contracts_protect_a_providers_notes_unless_recklessly_told_not_to() {
+        let dir = tempfile::tempdir().unwrap();
+        let wallet = Wallet::create(
+            &dir.path().join("wallet.sqlite"),
+            &[7; 32],
+            ChainProfile::Core30DefaultRegtest,
+            Http::new(None).unwrap(),
+        )
+        .unwrap();
+        let swaps = dir.path().join("swaps.sqlite");
+        let provider = Arc::new(Provider::create(&swaps, wallet, Config::default()).unwrap());
+        let chain = Some("http://user:password@127.0.0.1:1");
+
+        let defaults = contracts(&[]);
+        assert!(!defaults.no_contracts);
+        assert_eq!(
+            (
+                defaults.contract_proof_days,
+                defaults.contract_successor_days
+            ),
+            (14, 14)
+        );
+        assert_eq!(
+            (defaults.contract_max_price, defaults.drain_via),
+            (None, None)
+        );
+        let unprotected = contracts(&["--no-contracts"]);
+        let none = unprotected.keeper(&provider, chain, dir.path()).unwrap();
+        assert!(none.is_none());
+        assert_eq!(provider.intake(), None);
+        // Kept: nothing taken in at any hub until its first round.
+        let kept = contracts(&[]).keeper(&provider, chain, dir.path()).unwrap();
+        assert!(kept.is_some());
+        assert_eq!(provider.intake(), Some(Default::default()));
+        let refused = contracts(&[]).keeper(&provider, None, dir.path());
+        assert!(refused.is_err());
     }
 
     #[test]
