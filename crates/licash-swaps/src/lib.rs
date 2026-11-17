@@ -705,6 +705,7 @@ impl<T: Transport> Provider<T> {
             hubs,
             nostr: None,
             chain: self.chain_info()?,
+            lightning: None,
         })
     }
 

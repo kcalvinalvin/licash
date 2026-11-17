@@ -549,6 +549,7 @@ fn swap_bodies_name_hubs_by_address_and_locks_by_id() {
         ],
         nostr: None,
         chain: None,
+        lightning: None,
     };
     assert_eq!(json(&info), info);
     let at_a = info.hub(&hub_a.address()).unwrap();
@@ -702,6 +703,87 @@ fn payout_bodies_name_their_fields_on_the_wire() {
     .unwrap();
     assert_eq!(info.chain, None);
     assert!(!serde_json::to_string(&info).unwrap().contains("chain"));
+}
+
+#[test]
+fn lightning_payment_bodies_name_their_fields_on_the_wire() {
+    use licash_api::swaps::{self, Lightning, LightningRequest, LightningSwap, State};
+    use serde_json::json;
+
+    let hub = OwnerKeys::from_seed(&[1; 32]).unwrap();
+    let id = ProposalId::from_bytes([0xcd; 32]);
+    let request = LightningRequest::new(&hub.address(), &id, "lnbcrt1...");
+    assert_eq!(json(&request), request);
+    assert_eq!(request.lock().unwrap(), id);
+    let value = serde_json::to_value(&request).unwrap();
+    let mut names: Vec<_> = value.as_object().unwrap().keys().cloned().collect();
+    names.sort();
+    assert_eq!(names, ["from", "lock", "request"]);
+
+    // Paying: no preimage yet, and nothing said of one.
+    let paying = LightningSwap {
+        id: Hex(id.as_bytes().to_vec()),
+        state: State::Accepted,
+        amount: 10_001,
+        preimage: None,
+        reason: None,
+    };
+    assert_eq!(
+        serde_json::to_value(&paying).unwrap(),
+        json!({"id": "cd".repeat(32), "state": "accepted", "amount": 10_001})
+    );
+    assert_eq!(json(&paying), paying);
+    assert_eq!(paying.preimage().unwrap(), None);
+    let paid = LightningSwap {
+        state: State::Paid,
+        preimage: Some(Hex(vec![0xef; 32])),
+        ..paying
+    };
+    assert_eq!(
+        serde_json::to_value(&paid).unwrap()["preimage"],
+        json!("ef".repeat(32))
+    );
+    assert_eq!(json(&paid), paid);
+    assert_eq!(paid.preimage().unwrap(), Some([0xef; 32]));
+    assert_eq!(
+        (swaps::LIGHTNING_SWAPS, swaps::lightning_swap_state(&id)),
+        (
+            "/v1/swaps/lightning",
+            format!("/v1/swaps/lightning/{}", "cd".repeat(32))
+        )
+    );
+
+    // The lock pays the invoice in whole satoshis, rounded up, and the fee
+    // on them.
+    let terms = Lightning {
+        node: "02".repeat(33),
+        fee: Fee { base: 2, ppm: 5000 },
+        max: 100_000,
+        slack: 12,
+    };
+    assert_eq!(terms.pays(10_000_000), 10_000 + 2 + 50);
+    assert_eq!(terms.pays(10_000_001), 10_001 + 2 + 51);
+
+    // A provider paying nothing over Lightning says nothing of it, and an
+    // older one's info reads as such.
+    let info: swaps::Info = serde_json::from_value(json!({
+        "address": hub.address(), "fee": {"base": 0, "ppm": 0}, "min": 1,
+        "max": 2, "margin": 12, "hubs": []
+    }))
+    .unwrap();
+    assert_eq!(info.lightning, None);
+    assert!(!serde_json::to_string(&info).unwrap().contains("lightning"));
+    let offering = swaps::Info {
+        lightning: Some(terms.clone()),
+        ..info
+    };
+    let value = serde_json::to_value(&offering).unwrap();
+    assert_eq!(
+        value["lightning"],
+        json!({"node": "02".repeat(33), "fee": {"base": 2, "ppm": 5000},
+               "max": 100_000, "slack": 12})
+    );
+    assert_eq!(json(&offering), offering);
 }
 
 #[test]

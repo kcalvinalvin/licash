@@ -8,6 +8,8 @@
 //! | `GET /v1/swaps/{id}` |  | [`Swap`] |
 //! | `POST /v1/swaps/chain` | [`ChainRequest`] | [`ChainSwap`] |
 //! | `GET /v1/swaps/chain/{id}` |  | [`ChainSwap`] |
+//! | `POST /v1/swaps/lightning` | [`LightningRequest`] | [`LightningSwap`] |
+//! | `GET /v1/swaps/lightning/{id}` |  | [`LightningSwap`] |
 //!
 //! The client draws a preimage and locks, at hub `from`, the amount and the
 //! provider's fee to [`Info::address`] under its hash, then asks for the
@@ -26,6 +28,17 @@
 //! pays its payee, and shows the provider the preimage it claims the
 //! client's lock with.
 //!
+//! A provider with [`Info::lightning`] pays Lightning invoices from its own
+//! node the same way: the client locks the invoice's amount and the
+//! provider's fee to it at hub `from`, under the invoice's hash, and the
+//! provider pays the invoice along routes whose timelock ends
+//! [`Lightning::slack`] blocks before that lock expires. The preimage the
+//! payment buys claims the client's lock. When the invoice is a hub's,
+//! asked for by a wallet under a hash of its own, that wallet claims what
+//! the hub locks to it with its own preimage: notes at one hub pay notes at
+//! another, with no notes of the provider at the other. A payment that
+//! fails leaves the client's lock to be refunded once expired.
+//!
 //! Hubs are named by their addresses ([`crate::Info::address`]), as client
 //! and provider may reach one hub at different URLs. Anything else is a
 //! [`Problem`]; [`crate::Code::Declined`] when the provider takes no such
@@ -43,6 +56,10 @@ pub const SWAP_STATE: &str = "/v1/swaps/{id}";
 pub const CHAIN_SWAPS: &str = "/v1/swaps/chain";
 /// The path of [`chain_swap_state`], as a route.
 pub const CHAIN_SWAP_STATE: &str = "/v1/swaps/chain/{id}";
+/// Where invoices are paid over Lightning ([`LightningRequest`]).
+pub const LIGHTNING_SWAPS: &str = "/v1/swaps/lightning";
+/// The path of [`lightning_swap_state`], as a route.
+pub const LIGHTNING_SWAP_STATE: &str = "/v1/swaps/lightning/{id}";
 
 /// Where the swap of the client's lock `id` stands.
 pub fn swap_state(id: &ProposalId) -> String {
@@ -52,6 +69,11 @@ pub fn swap_state(id: &ProposalId) -> String {
 /// Where the payout of the client's lock `id` stands.
 pub fn chain_swap_state(id: &ProposalId) -> String {
     format!("{CHAIN_SWAPS}/{}", hex::encode(id.as_bytes()))
+}
+
+/// Where the invoice payment for the client's lock `id` stands.
+pub fn lightning_swap_state(id: &ProposalId) -> String {
+    format!("{LIGHTNING_SWAPS}/{}", hex::encode(id.as_bytes()))
 }
 
 /// What a provider swaps, and on what terms.
@@ -75,6 +97,9 @@ pub struct Info {
     /// What it pays out on Bitcoin, if it does.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chain: Option<Chain>,
+    /// What it pays over Lightning, if it does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lightning: Option<Lightning>,
 }
 
 impl Info {
@@ -130,6 +155,36 @@ impl Chain {
         value
             .saturating_add(self.fee.due(value))
             .saturating_add(self.miner)
+    }
+}
+
+/// What a provider pays over Lightning: invoices it pays from its own node,
+/// for clients' locks at any of its hubs.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Lightning {
+    /// Its node's public key, in hex: it pays no invoice of its own.
+    pub node: String,
+    /// Its fee on an invoice's amount, in whole satoshis rounded up,
+    /// routing fees included, which the client's lock pays on top.
+    pub fee: Fee,
+    /// The most an invoice it pays may ask, in satoshis.
+    pub max: u64,
+    /// The client's lock expires at least this many blocks plus the
+    /// invoice's final CLTV delta, and 3, above the tip: its routes'
+    /// timelock ends this many blocks before the lock expires. The
+    /// provider claims the lock with the preimage before it expires, which
+    /// may reach it only on Bitcoin, once a route's last HTLC times out:
+    /// these blocks are its time to, its node's and the hub's downtime
+    /// included, as a routing node's CLTV delta.
+    pub slack: u32,
+}
+
+impl Lightning {
+    /// What a lock pays to have an invoice of `msat` paid: its amount in
+    /// whole satoshis and the provider's fee.
+    pub fn pays(&self, msat: u64) -> u64 {
+        let sat = msat.div_ceil(1000);
+        sat.saturating_add(self.fee.due(sat))
     }
 }
 
@@ -276,5 +331,59 @@ impl ChainSwap {
     /// The provider's refund key, decoded.
     pub fn refund(&self) -> Result<[u8; 32], Problem> {
         self.refund.array("refund")
+    }
+}
+
+/// Pay `request`, a BOLT11 invoice, for the client's `lock` at hub `from`,
+/// which pays the provider the invoice's amount and its fee on the preimage
+/// of the invoice's hash. The same request again answers where the payment
+/// stands.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LightningRequest {
+    pub from: Address,
+    pub lock: Hex,
+    pub request: String,
+}
+
+impl LightningRequest {
+    pub fn new(from: &Address, lock: &ProposalId, request: &str) -> Self {
+        Self {
+            from: *from,
+            lock: Hex(lock.as_bytes().to_vec()),
+            request: request.to_owned(),
+        }
+    }
+
+    pub fn lock(&self) -> Result<ProposalId, Problem> {
+        Ok(ProposalId::from_bytes(self.lock.array("lock")?))
+    }
+}
+
+/// Where an invoice payment stands, by the client's lock: `Accepted` while
+/// the provider pays it, `Paid` once paid, `Done` once the provider claimed
+/// the client's lock, `Failed` if it was not paid: the client's lock is
+/// refunded once expired.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LightningSwap {
+    /// The client's lock at `from`.
+    pub id: Hex,
+    pub state: State,
+    /// The invoice's amount, in satoshis rounded up.
+    pub amount: u64,
+    /// The preimage the payment bought, once paid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preimage: Option<Hex>,
+    /// Why it failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl LightningSwap {
+    /// The preimage, decoded.
+    pub fn preimage(&self) -> Result<Option<[u8; 32]>, Problem> {
+        self.preimage
+            .as_ref()
+            .map(|p| p.array("preimage"))
+            .transpose()
     }
 }
