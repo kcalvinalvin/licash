@@ -1036,6 +1036,9 @@ fn a_payment_at_a_hub_holding_too_little_swaps_there_first_within_its_fees() {
         (&listed[0]["state"], &listed[0]["amount"], &listed[0]["fee"]),
         (&"done".into(), &31.into(), &2.into())
     );
+    // Hers is done once she claimed the provider's lock; her change at A
+    // comes back once it claimed hers.
+    swaps.until(|r| r.stage == licash_swaps::Stage::Done);
     ok(wallet(&alice, &["resume"], None));
     assert_eq!(available(&alice), (100 - 4 - 30, 0));
     assert_eq!(json(&bob, &["mailbox"])["received"][0]["amount"], 30);
