@@ -480,6 +480,18 @@ async fn a_holder_forces_her_contract_closed_on_a_silent_hub_and_takes_her_notes
     ensure!(requested.requested_at == Some(tip), "{requested:?}");
     let window_end = requested.next_at.context("no window")?;
     ensure!(window_end > tip + 1, "{requested:?}");
+    // P's fees paid of one coin of hers alone, never joined with another:
+    // R's claim slot and anchor, and that coin.
+    let p = requested.publication.context("no P")?;
+    let found: serde_json::Value = chain
+        .0
+        .rpc(
+            "getrawtransaction",
+            serde_json::json!([p.to_string(), true]),
+        )
+        .await?;
+    let inputs = found["vin"].as_array().context("no inputs")?;
+    ensure!(inputs.len() == 3, "{found}");
 
     // Nothing to do until it passes; then request_timeout, paid of P's
     // fee coin.
