@@ -621,10 +621,10 @@ fn files_of_newer_versions_or_none_are_not_read() {
     assert!(err.starts_with("no swaps file at"), "{err}");
     drop(provider(dir.path()));
     let conn = Connection::open(dir.path().join("swaps.sqlite")).unwrap();
-    conn.pragma_update(None, "user_version", 4).unwrap();
+    conn.pragma_update(None, "user_version", 5).unwrap();
     let err = read(dir.path()).err().unwrap().to_string();
     assert!(
-        err.ends_with("is of version 4, newer than this provider reads"),
+        err.ends_with("is of version 5, newer than this provider reads"),
         "{err}"
     );
 }

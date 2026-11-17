@@ -31,12 +31,19 @@
 //! under the client's hash, and follows them with
 //! [`Provider::follow_payouts`], given a view of the chain ([`Chain`]).
 //!
+//! A provider may pay Lightning invoices too ([`Provider::pay_lightning`]):
+//! it takes them with [`Provider::take_invoice`], paying each from its own
+//! node under the client's lock's hash, and follows them with
+//! [`Provider::follow_invoices`]. The preimage the payment buys claims the
+//! client's lock.
+//!
 //! A hub may be the provider of the swaps into it ([`Issuer`],
 //! [`Provider::open_issuing`]): its lock there is of notes it issues
 //! itself, and it keeps no preimage from itself, so its lock expires only
 //! [`Config::own_lead`] blocks before the client's, between hubs of any
 //! windows.
 
+mod invoices;
 mod issue;
 mod payouts;
 mod store;
@@ -57,6 +64,7 @@ use rand_core::{OsRng, RngCore};
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
+pub use invoices::MIN_SLACK;
 pub use issue::Issuer;
 use issue::{Issue, Issued};
 pub use payouts::{Chain, PAYOUT_ROOM};
@@ -83,6 +91,9 @@ pub enum Error {
     /// The provider's own hub, issuing its locks ([`Issuer`]).
     #[error("its hub: {0}")]
     Hub(Problem),
+    /// Its Lightning node ([`Provider::pay_lightning`]).
+    #[error("its Lightning node: {0}")]
+    Lightning(String),
 }
 
 /// What a provider swaps, and on what terms.
@@ -350,6 +361,8 @@ struct Row {
     chain: bool,
     /// A swap into the provider's own hub, of notes it issues ([`Issuer`]).
     own: bool,
+    /// An invoice paid over Lightning, not a swap of notes.
+    lightning: bool,
 }
 
 impl Row {
@@ -387,7 +400,7 @@ const LAST_EVENT: &str = "SELECT coalesce(max(seq), 0) FROM events";
 
 const ROWS: &str = "SELECT id, hash, from_url, to_url, address, amount, fee, paid, expiry,
     lock, preimage, state, reason, created_at, updated_at, kind = 'chain', expiry_from,
-    kind = 'own'
+    kind = 'own', kind = 'lightning'
     FROM swaps";
 
 fn row_of(r: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
@@ -410,6 +423,7 @@ fn row_of(r: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
         chain: r.get(15)?,
         expiry_from: r.get(16)?,
         own: r.get(17)?,
+        lightning: r.get(18)?,
     })
 }
 
@@ -490,6 +504,8 @@ pub struct Provider<T: Transport> {
     /// The most it may come to hold at each hub, if limited
     /// ([`Provider::limit_intake`]).
     intake: Mutex<Option<HashMap<String, u64>>>,
+    /// What it pays over Lightning, and through which node, if it does.
+    lightning: Option<invoices::Payer>,
 }
 
 /// The swaps into the provider's own hub under way, whose clients' locks
@@ -627,6 +643,7 @@ impl<T: Transport> Provider<T> {
             late: Mutex::default(),
             issuer: issuer.map(Arc::new),
             intake: Mutex::default(),
+            lightning: None,
         }
     }
 
@@ -705,7 +722,7 @@ impl<T: Transport> Provider<T> {
             hubs,
             nostr: None,
             chain: self.chain_info()?,
-            lightning: None,
+            lightning: self.lightning_terms().cloned(),
         })
     }
 
@@ -1382,7 +1399,10 @@ impl<T: Transport> Provider<T> {
         };
         match row.stage {
             Stage::Paid => self.claim(id, &row).await,
-            Stage::Accepted | Stage::Locked if !row.chain => self.follow(id, &row).await,
+            // Payouts and invoices follow the chain or the node instead.
+            Stage::Accepted | Stage::Locked if !row.chain && !row.lightning => {
+                self.follow(id, &row).await
+            }
             _ => Ok(()),
         }
     }
@@ -1654,10 +1674,12 @@ impl<T: Transport> Provider<T> {
     }
 
     /// The swap of the client's lock `id`, as its client is told: none of
-    /// a payout ([`Provider::payout`]).
+    /// a payout ([`Provider::payout`]) or an invoice ([`Provider::invoice`]).
     pub fn swap(&self, id: &ProposalId) -> Result<Option<swaps::Swap>, Error> {
         let row = self.row(id.as_bytes())?;
-        Ok(row.filter(|row| !row.chain).map(|row| row.swap()))
+        Ok(row
+            .filter(|row| !row.chain && !row.lightning)
+            .map(|row| row.swap()))
     }
 
     /// The swap or payout of the client's lock `id`, in hex, and what it

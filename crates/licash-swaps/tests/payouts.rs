@@ -664,7 +664,7 @@ async fn a_swaps_file_of_version_1_gains_payouts() {
     )
     .unwrap();
     let provider = Provider::open(&path, wallet, CONFIG).unwrap();
-    assert_eq!(version(&path), 3);
+    assert_eq!(version(&path), 4);
     let records = provider.records(10).unwrap();
     assert_eq!(records.len(), 1);
     assert_eq!(
@@ -682,15 +682,15 @@ async fn a_swaps_file_of_version_1_gains_payouts() {
     // A newer file is refused untouched.
     rusqlite::Connection::open(&path)
         .unwrap()
-        .pragma_update(None, "user_version", 4)
+        .pragma_update(None, "user_version", 5)
         .unwrap();
     let wallet = Wallet::open(&dir.path().join("wallet.sqlite"), Link(net)).unwrap();
     match Provider::open(&path, wallet, CONFIG) {
-        Err(licash_swaps::Error::Setup(why)) => assert!(why.contains("schema 4"), "{why}"),
+        Err(licash_swaps::Error::Setup(why)) => assert!(why.contains("schema 5"), "{why}"),
         Err(e) => panic!("{e}"),
         Ok(_) => panic!("opened"),
     }
-    assert_eq!(version(&path), 4);
+    assert_eq!(version(&path), 5);
 }
 
 #[tokio::test]
@@ -711,23 +711,65 @@ async fn a_swaps_file_of_version_2_gains_the_locks_a_hub_issues() {
     .unwrap();
     drop(Provider::open(&path, wallet, CONFIG).unwrap());
     // As a provider of version 2 left it: its swaps and payouts, no
-    // issues.
-    db().execute_batch("DROP TABLE issues; PRAGMA user_version = 2;")
+    // issues nor invoices.
+    db().execute_batch("DROP TABLE invoices; DROP TABLE issues; PRAGMA user_version = 2;")
         .unwrap();
     let wallet = Wallet::open(&dir.path().join("wallet.sqlite"), Link(net)).unwrap();
     let provider = Provider::open(&path, wallet, CONFIG).unwrap();
     let version: i64 = db()
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 3);
-    let issues: i64 = db()
-        .query_row("SELECT count(*) FROM issues", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(issues, 0);
+    assert_eq!(version, 4);
+    for table in ["issues", "invoices"] {
+        let count: i64 = db()
+            .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "{table}");
+    }
     let records = provider.records(10).unwrap();
     assert_eq!(
         (records.len(), records[0].stage, records[0].amount),
         (1, Stage::Accepted, 1000)
     );
+    assert_eq!(provider.last_event().unwrap(), 1);
+}
+
+#[tokio::test]
+async fn a_swaps_file_of_version_3_gains_invoices() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("swaps.sqlite");
+    let db = || rusqlite::Connection::open(&path).unwrap();
+    db().execute_batch(include_str!("fixtures/swaps-v1.sql"))
+        .unwrap();
+    let net = Net::new();
+    net.start_timed(A, FEE, TIMED);
+    let wallet = Wallet::create(
+        &dir.path().join("wallet.sqlite"),
+        &[0x50; 32],
+        ChainProfile::Core30DefaultRegtest,
+        Link(net.clone()),
+    )
+    .unwrap();
+    drop(Provider::open(&path, wallet, CONFIG).unwrap());
+    // As a provider of version 3 left it: no invoices.
+    db().execute_batch("DROP TABLE invoices; PRAGMA user_version = 3;")
+        .unwrap();
+    let wallet = Wallet::open(&dir.path().join("wallet.sqlite"), Link(net)).unwrap();
+    let provider = Provider::open(&path, wallet, CONFIG).unwrap();
+    let version: i64 = db()
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, 4);
+    let invoices: i64 = db()
+        .query_row("SELECT count(*) FROM invoices", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(invoices, 0);
+    // Its swap untouched, and nothing paid over Lightning under way.
+    let records = provider.records(10).unwrap();
+    assert_eq!(
+        (records.len(), records[0].stage, records[0].amount),
+        (1, Stage::Accepted, 1000)
+    );
+    assert_eq!(provider.open_invoices().unwrap(), 0);
     assert_eq!(provider.last_event().unwrap(), 1);
 }

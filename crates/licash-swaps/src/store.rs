@@ -12,7 +12,23 @@ use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior};
 use crate::Error;
 
 /// The schema this provider reads and writes, as SQLite's `user_version`.
-const VERSION: i64 = 3;
+const VERSION: i64 = 4;
+
+/// Version 4: Lightning invoices paid. A swap of kind `lightning` pays an
+/// invoice from the provider's node: its `to_url` is
+/// `lightning:<network>`, `address` the invoice's payee, a public key,
+/// `amount` the invoice's satoshis, rounded up, and `expiry` the height its
+/// routes' timelock ends by at the latest.
+const INVOICES: &str = "
+-- The invoices, by their swaps' ids, recorded before the node pays them:
+-- `node` is the public key, in hex, of the provider's node that pays it,
+-- which alone knows how its payment ends.
+CREATE TABLE invoices (
+    id BLOB PRIMARY KEY REFERENCES swaps (id),
+    request TEXT NOT NULL,
+    node TEXT NOT NULL
+) STRICT;
+";
 
 /// Version 3: swaps into the provider's own hub. A swap of kind `own` has
 /// hub `to_url`, which the provider is, lock notes it issues itself
@@ -120,6 +136,7 @@ impl Store {
             tx.execute_batch(SCHEMA)?;
             tx.execute_batch(PAYOUTS)?;
             tx.execute_batch(ISSUES)?;
+            tx.execute_batch(INVOICES)?;
             tx.pragma_update(None, "user_version", VERSION)?;
             tx.execute(
                 "INSERT INTO meta (one, nostr, created_at) VALUES (1, ?1, ?2)",
@@ -141,11 +158,14 @@ impl Store {
             let version: i64 = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
             match version {
                 VERSION => {}
-                1 | 2 => {
-                    if version == 1 {
+                1..=3 => {
+                    if version < 2 {
                         tx.execute_batch(PAYOUTS)?;
                     }
-                    tx.execute_batch(ISSUES)?;
+                    if version < 3 {
+                        tx.execute_batch(ISSUES)?;
+                    }
+                    tx.execute_batch(INVOICES)?;
                     tx.pragma_update(None, "user_version", VERSION)?;
                     tracing::info!("swaps file migrated to schema {VERSION}");
                 }
