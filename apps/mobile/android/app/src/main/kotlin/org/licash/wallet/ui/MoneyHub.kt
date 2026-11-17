@@ -135,19 +135,30 @@ internal fun HubPage(
 
     if (fees && hub != null) HubFees(hub) { fees = false }
     quote?.let { q ->
-        // Of terms chosen, if the hub lets them be and a coin held pays within them.
+        // Of terms chosen, if the hub lets them be: paid from a coin held
+        // that pays within them, or from one cashed out to pay them first.
         val range = q.range
-        val paying = q.coins.filter { range != null && contractMaxCap(range, it.value) != null }
-        if (range != null && paying.isNotEmpty()) {
+        if (range != null) {
+            val cashFirst: (ULong) -> Unit = { amount ->
+                quote = null
+                scope.launch {
+                    engine.bitcoinAddress().fold(
+                        { payOwn("bitcoin:$it?amount=${btc(amount)}", it) },
+                        { fail(explain(it)) },
+                    )
+                }
+            }
             ChooseSheet(
                 q,
                 range,
-                paying,
+                q.coins.filter { contractMaxCap(range, it.value) != null },
                 open = { chosen, price ->
                     quote = null
                     engine.openContract(q.hub, price, chosen)
                 },
                 dismiss = { quote = null },
+                held = holding.available,
+                cashOutFirst = cashFirst,
             )
         } else {
             ProtectSheet(

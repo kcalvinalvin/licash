@@ -294,11 +294,16 @@ internal fun ForceSheet(c: Contract, held: ULong, force: () -> Unit, dismiss: ()
     }
 }
 
-/** What a protection is worth for now, said where one shows and before one is paid for. */
+/**
+ * That a protection is worth nothing, under the mock authority, said where
+ * one shows and before one is paid for. A genuine one this app recovers
+ * from by itself: the hub proves, the holder only checks.
+ */
 @Composable
 internal fun Worth(mock: Boolean) {
+    if (!mock) return
     Text(
-        if (mock) MOCK else EXTERNAL_RECOVERY,
+        MOCK,
         modifier = Modifier.padding(bottom = 8.dp).testTag("worth"),
         style = MaterialTheme.typography.bodySmall,
         color = MaterialTheme.colorScheme.error,

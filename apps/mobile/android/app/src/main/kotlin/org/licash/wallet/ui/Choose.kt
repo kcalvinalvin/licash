@@ -74,6 +74,10 @@ internal fun OfferSheet(engine: Engine, q: ContractQuote, dismiss: () -> Unit) {
  * prices them; which of `coins` pays, if there are several, and whether
  * what is left of it joins the balance once paid: at first only if it
  * covers all of it. Offered unasked, it can be declined.
+ *
+ * With no coin to pay it, the terms are chosen all the same, at first
+ * covering the `held` notes, and [coinFor] them is cashed out first
+ * (`cashOutFirst`), if `held` pays it.
  */
 @Composable
 internal fun ChooseSheet(
@@ -83,18 +87,22 @@ internal fun ChooseSheet(
     open: (Chosen, price: ULong) -> Unit,
     dismiss: () -> Unit,
     decline: (() -> Unit)? = null,
+    held: ULong = 0uL,
+    cashOutFirst: (ULong) -> Unit = {},
 ) {
     val colors = MaterialTheme.colorScheme
     val download = android.text.format.Formatter.formatShortFileSize(LocalContext.current, q.download.toLong())
-    var coin by remember(q) { mutableStateOf(coins.first()) }
-    var cap by remember(q) { mutableStateOf(q.suggestedCap) }
+    var coin by remember(q) { mutableStateOf(coins.firstOrNull()) }
+    val start = if (coins.isEmpty()) maxOf(q.suggestedCap, held) else q.suggestedCap
+    var cap by remember(q) { mutableStateOf(start) }
     var blocks by remember(q) { mutableStateOf(q.suggestedBlocks.coerceIn(range.minBlocks, range.maxBlocks)) }
-    val most = contractMaxCap(range, coin.value) ?: range.minCap
+    val most = coin?.let { contractMaxCap(range, it.value) ?: range.minCap } ?: range.maxCap
     val capped = cap.coerceIn(range.minCap, most)
     val price = contractPrice(range, capped, blocks)
-    var moveChange by remember(q) { mutableStateOf(changeCovered(coin.value, price, capped)) }
-    val pays = coin.value > price
-    val change = if (pays) coin.value - price else 0uL
+    val value = coin?.value ?: 0uL
+    var moveChange by remember(q, coin) { mutableStateOf(changeCovered(value, price, capped)) }
+    val pays = value > price
+    val change = if (pays) value - price else 0uL
     // It stops protecting a little before it ends.
     val protectsFor = if (blocks > q.afterAssert) blocks - q.afterAssert else 0u
     Sheet("Protect at ${name(q.hub)}", dismiss) {
@@ -129,7 +137,10 @@ internal fun ChooseSheet(
                 }
             }
         }
-        if (pays) {
+        val first = coinFor(range, capped, price)
+        if (coin == null) {
+            Say("Paid from Bitcoin you hold, and you hold none yet. Cash out to yourself first, then protect.")
+        } else if (pays) {
             Row(
                 Modifier.fillMaxWidth().clickable { moveChange = !moveChange }.heightIn(min = 56.dp),
                 verticalAlignment = Alignment.CenterVertically,
@@ -171,8 +182,17 @@ internal fun ChooseSheet(
         )
         Worth(q.mock)
         Spacer(Modifier.height(8.dp))
-        BigButton("Protect for ${sat(price)}", Modifier.fillMaxWidth().testTag("protect"), enabled = pays) {
-            open(Chosen(capped, blocks, coin.outpoint, pays && moveChange), price)
+        val c = coin
+        if (c != null) {
+            BigButton("Protect for ${sat(price)}", Modifier.fillMaxWidth().testTag("protect"), enabled = pays) {
+                open(Chosen(capped, blocks, c.outpoint, pays && moveChange), price)
+            }
+        } else {
+            BigButton(
+                "Cash out ${sat(first)}",
+                Modifier.fillMaxWidth().testTag("cash-out-first"),
+                enabled = first <= held,
+            ) { cashOutFirst(first) }
         }
         decline?.let {
             Spacer(Modifier.height(8.dp))
@@ -191,6 +211,16 @@ internal const val DUTY = "Open Licash now and then, and before it ends: what it
  * protected: only then is it moved by default.
  */
 internal fun changeCovered(coin: ULong, price: ULong, cap: ULong): Boolean = coin > price && coin - price <= cap
+
+/**
+ * The coin to cash out to this wallet to pay, within `range`, `price`
+ * for protection of up to `cap` sat: one the hub takes as paying for so
+ * large a cap, and [firstCoin] of `price`, whichever is more.
+ */
+internal fun coinFor(range: ContractRange, cap: ULong, price: ULong): ULong {
+    val perCoin = range.perCoin.toULong().coerceAtLeast(1uL)
+    return maxOf((cap + perCoin - 1uL) / perCoin, firstCoin(price))
+}
 
 /**
  * The cap at `position`, from 0 to 1, of a slider from `least` to `most`

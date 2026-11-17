@@ -79,7 +79,7 @@ const val NOT_PROTECTED = "Not protected"
 
 /** What each means, where asked. */
 const val PROTECTED_MEANS =
-    "On Bitcoin, or claimable from a live recovery contract. Coverage counts whole eligible notes within each contract's payout and note limits. Recovering can require fees and a computer-made proof before its deadline."
+    "On Bitcoin, or claimable from a live recovery contract. Coverage counts whole eligible notes within each contract's payout and note limits. Recovering costs Bitcoin fees and needs the app opened before the contract's deadline."
 const val NOT_PROTECTED_MEANS =
     "Held on credit: a hub owes it to you, on its word alone. Protect it, or cash it out to Bitcoin."
 
@@ -219,9 +219,6 @@ fun payingUpTo(hub: Hub, amount: ULong): ULong {
 
 /** What protection under the mock authority is worth, said wherever one shows. */
 const val MOCK = "Test only: protects nothing"
-
-/** A computer may be needed even when the contract counts as covered. */
-const val EXTERNAL_RECOVERY = "Recovery may need a computer"
 
 /**
  * A protection as a row says it: where it `stands`, in a word; whether it
