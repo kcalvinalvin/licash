@@ -16,6 +16,7 @@ licash-chain-client.workspace = true
 licash-dashboard.workspace = true
 licash-contracts = { path = "../contracts" }
 licash-hub.workspace = true
+licash-lightning.workspace = true
 licash-nostr = { workspace = true, features = ["tor"] }
 licash-notify.workspace = true
 licash-onchain.workspace = true
@@ -26,15 +27,12 @@ licash-transport = { workspace = true, features = ["tor"] }
 licash-wallet.workspace = true
 anyhow.workspace = true
 axum.workspace = true
-base64 = "0.23"
 bitcoin = { version = "=0.32.102", default-features = false, features = ["std", "secp-recovery"] }
 clap.workspace = true
 hex = "0.4"
 lightning-invoice = { version = "0.34", features = ["std"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
-reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
-rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["time"] }
@@ -44,7 +42,7 @@ tracing-subscriber.workspace = true
 
 [features]
 # An in-memory Lightning node, for tests.
-fake = []
+fake = ["licash-lightning/fake"]
 
 [dev-dependencies]
 licash-dashboard = { workspace = true, features = ["test-support"] }

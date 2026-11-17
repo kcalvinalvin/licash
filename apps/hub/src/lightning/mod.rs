@@ -14,101 +14,26 @@
 //! refunded unclaimed cancels it. Receipts are recorded in the gateway's
 //! own SQLite file before their invoice exists.
 
-#[cfg(feature = "fake")]
-pub mod fake;
-pub mod lnd;
 mod pay;
 mod receive;
 
 use std::{
     collections::{HashMap, HashSet},
-    future::Future,
     path::Path,
-    pin::Pin,
     sync::{Arc, Mutex},
     time::Duration,
 };
 
 use licash_api::{Code, Fee, Lightning, Problem};
 use licash_hub::{Error, Hub, Timing};
-pub use lightning_invoice::Currency;
+#[cfg(feature = "fake")]
+pub use licash_lightning::fake;
+use licash_lightning::now;
+pub use licash_lightning::{
+    lnd, Attempt, Call, Currency, Held, HeldState, Liquidity, Node, NodeInfo, Status,
+};
 
 use crate::{peer::Peer, Failure};
-
-/// What a node answers, or why it did not.
-pub type Call<'a, T> = Pin<Box<dyn Future<Output = Result<T, String>> + Send + 'a>>;
-
-/// What a node says of itself.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct NodeInfo {
-    /// Its public key, in hex.
-    pub pubkey: String,
-    pub height: u32,
-    /// The hash of its block at `height`, in internal byte order.
-    pub block_hash: [u8; 32],
-    pub currency: Currency,
-}
-
-/// What a node can pay and be paid over its channels now, in satoshis.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Liquidity {
-    pub local: u64,
-    pub remote: u64,
-}
-
-/// The latest attempt of a node to pay a hash.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Attempt {
-    pub status: Status,
-    /// When it started, in Unix nanoseconds.
-    pub created_ns: u64,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Status {
-    InFlight,
-    Succeeded([u8; 32]),
-    Failed(String),
-}
-
-/// A held invoice of the node.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Held {
-    pub state: HeldState,
-    pub request: String,
-    /// The lowest expiry height of the HTLCs it holds, once accepted.
-    pub min_expiry: Option<u32>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum HeldState {
-    Open,
-    /// Paid, its HTLCs held until it is settled or canceled.
-    Accepted,
-    Settled,
-    Canceled,
-}
-
-/// A Lightning node the gateway pays and is paid through, such as
-/// [`lnd::Lnd`].
-pub trait Node: Send + Sync {
-    fn info(&self) -> Call<'_, NodeInfo>;
-    fn liquidity(&self) -> Call<'_, Liquidity>;
-    /// Start paying `request`, for at most `fee_limit` satoshis of routing
-    /// fees, along routes whose timelock ends within `cltv_limit` blocks,
-    /// trying for at most `timeout` seconds. A payment already under way
-    /// or made is no error.
-    fn pay(&self, request: String, fee_limit: u64, cltv_limit: u32, timeout: u32) -> Call<'_, ()>;
-    /// The node's latest attempt to pay `hash`, if it knows one.
-    fn payment(&self, hash: [u8; 32]) -> Call<'_, Option<Attempt>>;
-    /// A held invoice of `msat` under `hash`, whose last HTLC expires at
-    /// least `cltv_expiry` blocks after it arrives, payable for `expiry`
-    /// seconds: its request.
-    fn hold(&self, hash: [u8; 32], msat: u64, cltv_expiry: u32, expiry: u64) -> Call<'_, String>;
-    fn invoice(&self, hash: [u8; 32]) -> Call<'_, Option<Held>>;
-    fn settle(&self, preimage: [u8; 32]) -> Call<'_, ()>;
-    fn cancel(&self, hash: [u8; 32]) -> Call<'_, ()>;
-}
 
 /// What the gateway charges, the amounts it takes and its timing, in
 /// satoshis, blocks and seconds.
@@ -392,13 +317,6 @@ fn node_down(e: String) -> Failure {
 /// The gateway refuses a payment for `detail`.
 fn refused(detail: &str) -> Failure {
     Failure(Problem::new(Code::Forward, detail))
-}
-
-/// The current Unix time, in seconds.
-fn now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
 }
 
 #[cfg(test)]

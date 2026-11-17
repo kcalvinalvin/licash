@@ -3742,7 +3742,6 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "axum",
- "base64 0.23.1",
  "bitcoin",
  "clap",
  "hex",
@@ -3754,6 +3753,7 @@ dependencies = [
  "licash-dashboard",
  "licash-hub",
  "licash-hub-service",
+ "licash-lightning",
  "licash-nostr",
  "licash-notify",
  "licash-onchain",
@@ -3766,9 +3766,7 @@ dependencies = [
  "lngap-btc",
  "nostr-sdk",
  "rand_core 0.6.4",
- "reqwest",
  "rusqlite",
- "rustls",
  "serde",
  "serde_json",
  "tempfile",
@@ -3777,6 +3775,20 @@ dependencies = [
  "tower-http 0.7.1",
  "tracing",
  "tracing-subscriber 0.3.23",
+]
+
+[[package]]
+name = "licash-lightning"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "base64 0.23.1",
+ "bitcoin",
+ "hex",
+ "lightning-invoice",
+ "reqwest",
+ "rustls",
+ "serde_json",
 ]
 
 [[package]]

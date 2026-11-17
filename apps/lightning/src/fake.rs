@@ -13,7 +13,7 @@ use bitcoin::{
 };
 use lightning_invoice::{Bolt11Invoice, Currency, InvoiceBuilder, PaymentSecret};
 
-use super::{Attempt, Call, Held, HeldState, Liquidity, Node, NodeInfo, Status};
+use crate::{Attempt, Call, Held, HeldState, Liquidity, Node, NodeInfo, Status};
 
 /// How a payment the node makes ends.
 #[derive(Clone, Debug, PartialEq, Eq)]

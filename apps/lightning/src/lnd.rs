@@ -17,7 +17,7 @@ use rustls::{
 };
 use serde_json::{json, Value};
 
-use super::{Attempt, Call, Currency, Held, HeldState, Liquidity, Node, NodeInfo, Status};
+use crate::{Attempt, Call, Currency, Held, HeldState, Liquidity, Node, NodeInfo, Status};
 
 /// How long a call waits for the node.
 const TIMEOUT: Duration = Duration::from_secs(30);
@@ -40,7 +40,7 @@ impl Lnd {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let mut client = reqwest::Client::builder()
             .connect_timeout(TIMEOUT)
-            .user_agent(concat!("licash-hub/", env!("CARGO_PKG_VERSION")));
+            .user_agent(concat!("licash/", env!("CARGO_PKG_VERSION")));
         if let Some(pem) = cert {
             client = client.tls_backend_preconfigured(pinned(pem)?);
         }

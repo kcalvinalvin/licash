@@ -1,21 +1,15 @@
 //! Payments out: invoices the gateway pays for locks that pay the hub.
 
-use std::{collections::HashMap, time::Duration};
+use std::collections::HashMap;
 
 use licash::spend::ProposalId;
 use licash_api::{Code, Hex, Pay, PayState, Paying, Problem};
 use licash_hub::{Error, Forward, Forwarded, Refusal};
+use licash_lightning::{expires, judge, unpayable, Judged};
 use lightning_invoice::Bolt11Invoice;
 
-use super::{now, refused, Attempt, Gateway, Status, View};
+use super::{now, refused, Gateway, View};
 use crate::Failure;
-
-/// Blocks a route's timelock may take beyond the invoice's final delta,
-/// at least.
-const CLTV_MARGIN: u32 = 3;
-
-/// Seconds an invoice must stay payable past the routing timeout.
-const EXPIRY_MARGIN: u64 = 60;
 
 impl Gateway {
     /// Pay the invoice of `body` for its lock, or say where its payment
@@ -143,10 +137,7 @@ impl Gateway {
         if msat > self.config.max_pay.saturating_mul(1000) {
             return Err("above the most the gateway pays");
         }
-        if invoice.features().is_some_and(|f| {
-            // AMP, bits 30 and 31, splits a payment under other hashes.
-            f.requires_unknown_bits() || f.le_flags().get(3).is_some_and(|b| b & 0xc0 != 0)
-        }) {
+        if unpayable(invoice) {
             return Err("an invoice of features the gateway does not pay");
         }
         if expires(invoice, self.config.pay_timeout) {
@@ -168,11 +159,7 @@ impl Gateway {
     /// `expiry`, at height `tip`: ending [`super::Config::pay_slack`]
     /// blocks before, if that leaves the invoice its final delta.
     fn cltv_limit(&self, expiry: u32, tip: u32, invoice: &Bolt11Invoice) -> Option<u32> {
-        let delta = u32::try_from(invoice.min_final_cltv_expiry_delta()).ok()?;
-        let limit = expiry
-            .checked_sub(tip)?
-            .checked_sub(self.config.pay_slack)?;
-        (limit >= delta.checked_add(CLTV_MARGIN)?).then_some(limit)
+        licash_lightning::cltv_limit(expiry, tip, self.config.pay_slack, invoice)
     }
 }
 
@@ -208,28 +195,15 @@ impl Gateway {
             Ok(attempt) => attempt,
             Err(e) => return tracing::warn!(error = %e, "the Lightning node does not answer"),
         };
-        // The node keeps one attempt per hash: one started before the
-        // forward was recorded is not the forward's.
-        let recorded = u64::try_from(forward.created_at)
-            .unwrap_or(0)
-            .saturating_mul(1_000_000_000);
-        let known = match attempt {
-            Some(Attempt {
-                status: Status::Succeeded(preimage),
-                ..
-            }) => return self.paid(&forward, preimage).await,
-            Some(Attempt {
-                status: Status::InFlight,
-                ..
-            }) => return,
-            Some(Attempt {
-                status: Status::Failed(reason),
-                created_ns,
-            }) if created_ns >= recorded => {
+        let recorded = u64::try_from(forward.created_at).unwrap_or(0);
+        let known = match judge(attempt, recorded) {
+            Judged::Paid(preimage) => return self.paid(&forward, preimage).await,
+            Judged::InFlight => return,
+            Judged::Failed(reason) => {
                 misses.remove(id.as_bytes());
                 return self.failed(&forward, &reason).await;
             }
-            known => known.is_some(),
+            Judged::Unstarted { known } => known,
         };
         if let Some((limit, fee_limit)) = self.resend(&forward, view) {
             misses.remove(id.as_bytes());
@@ -245,7 +219,7 @@ impl Gateway {
         // the node shows that twice after the grace period.
         let missed = misses.entry(*id.as_bytes()).or_default();
         *missed += 1;
-        let waited = now().saturating_sub(recorded / 1_000_000_000) >= self.config.grace;
+        let waited = now().saturating_sub(recorded) >= self.config.grace;
         if known || (waited && *missed >= 2) {
             misses.remove(id.as_bytes());
             self.failed(&forward, "not started in time").await;
@@ -322,10 +296,4 @@ impl Gateway {
             reason,
         })
     }
-}
-
-/// Whether `invoice` expires within `timeout` seconds and a margin.
-fn expires(invoice: &Bolt11Invoice, timeout: u32) -> bool {
-    let at = now().saturating_add(u64::from(timeout) + EXPIRY_MARGIN);
-    invoice.would_expire(Duration::from_secs(at))
 }
