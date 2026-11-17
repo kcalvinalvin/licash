@@ -1362,7 +1362,10 @@ fn a_phone_knows_what_paying_a_code_costs_without_the_network_and_pays_no_more()
     let bob = net.wallet("bob", net.height());
     let open = bob.payment_code(None).unwrap();
     for amount in [500, 1_234, held / 3] {
-        let fee = alice.pay_fee(open.qr.clone(), Some(amount)).unwrap().unwrap();
+        let fee = alice
+            .pay_fee(open.qr.clone(), Some(amount))
+            .unwrap()
+            .unwrap();
         let quote = alice.pay_quote(open.qr.clone(), Some(amount)).unwrap();
         assert_eq!(quote.fee, fee, "paying {amount}");
         let before = notes(&alice);
