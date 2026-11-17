@@ -25,6 +25,24 @@ const MAX_ANSWER: usize = 4 << 20;
 /// How long a [`Transport::download`] may take: its answer is large.
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(900);
 
+/// How long an answer may take, but for sending a large body.
+const ANSWER_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// A body larger than this is given time to be sent ([`sending`]).
+const LARGE_BODY: usize = 1 << 20;
+
+/// The slowest a large body is sent, in bytes a second: Tor's slowest
+/// circuits, from a phone.
+const SLOWEST_SEND: usize = 32 << 10;
+
+/// How long POSTing `bytes` and its answer may take, if that is longer
+/// than a client's own: an instance of a contract's opening, 25 MB, has
+/// 15 minutes.
+fn sending(bytes: usize) -> Option<Duration> {
+    let secs = (bytes / SLOWEST_SEND) as u64;
+    (bytes > LARGE_BODY).then(|| ANSWER_TIMEOUT + Duration::from_secs(secs))
+}
+
 /// A wallet's [`Transport`] over HTTP(S).
 pub struct Http {
     route: Route,
@@ -183,7 +201,8 @@ impl Transport for Http {
         url: &str,
         body: Option<Vec<u8>>,
     ) -> impl std::future::Future<Output = Result<Response, String>> + Send {
-        self.exchange(url, body, MAX_ANSWER, None, false)
+        let timeout = body.as_ref().and_then(|b| sending(b.len()));
+        self.exchange(url, body, MAX_ANSWER, timeout, false)
     }
 
     fn download(
@@ -378,6 +397,15 @@ mod tests {
             routed,
             Some(("https://hub.example".into(), format!("{outer}/v1/info")))
         );
+    }
+
+    #[test]
+    fn a_large_body_has_the_time_to_be_sent_over_tor() {
+        assert_eq!(sending(0), None);
+        assert_eq!(sending(LARGE_BODY), None);
+        let instance = sending(25_024_328).unwrap();
+        assert_eq!(instance, ANSWER_TIMEOUT + Duration::from_secs(763));
+        assert!(sending(LARGE_BODY + 1).unwrap() > ANSWER_TIMEOUT);
     }
 
     #[test]
