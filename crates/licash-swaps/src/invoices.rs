@@ -133,6 +133,23 @@ fn payable(
     Ok(msat)
 }
 
+/// The most an invoice may ask, in sat, for the provider to pay it on
+/// `terms` from `local` sat in its channels: what it asks and the routing
+/// fees its fee allows, both. All its channels together, an upper bound:
+/// reserves and routes may leave less.
+fn most_paid(terms: &swaps::Lightning, local: u64) -> u64 {
+    let (mut fits, mut over) = (0, local.saturating_add(1));
+    while over - fits > 1 {
+        let mid = fits + (over - fits) / 2;
+        if terms.pays(mid.saturating_mul(1000)) <= local {
+            fits = mid;
+        } else {
+            over = mid;
+        }
+    }
+    fits
+}
+
 /// Invoices taken.
 impl<T: Transport> Provider<T> {
     /// Pay Lightning invoices for clients' locks at any of its hubs, on
@@ -161,6 +178,26 @@ impl<T: Transport> Provider<T> {
     /// What it pays over Lightning, as its operator set it.
     pub fn lightning_terms(&self) -> Option<&swaps::Lightning> {
         self.lightning.as_ref().map(|payer| &payer.terms)
+    }
+
+    /// What it pays over Lightning now: as its operator set it, up to what
+    /// its node's channels pay, its fee in it; nothing if the node does
+    /// not answer. Clients ask no more, so that none locks notes for a
+    /// payment the provider would decline or fail.
+    pub async fn lightning_now(&self) -> Option<swaps::Lightning> {
+        let payer = self.lightning.as_ref()?;
+        let local = match payer.node.liquidity().await {
+            Ok(liquidity) => liquidity.local,
+            Err(e) => {
+                tracing::warn!(error = %e, "the Lightning node tells not what it pays");
+                0
+            }
+        };
+        let terms = &payer.terms;
+        Some(swaps::Lightning {
+            max: terms.max.min(most_paid(terms, local)),
+            ..terms.clone()
+        })
     }
 
     /// Invoices whose payment is under way, which only
@@ -207,6 +244,13 @@ impl<T: Transport> Provider<T> {
             .await
             .map_err(|e| unavailable(format!("its Lightning node: {e}")))?;
         let msat = payable(&invoice, terms, &info).map_err(declined)?;
+        // Its fee pays the routes: what the channels must pay, both.
+        let local = (payer.node.liquidity().await)
+            .map_err(|e| unavailable(format!("its Lightning node: {e}")))?
+            .local;
+        if terms.pays(msat) > local {
+            return Err(declined("above what the provider's channels pay now"));
+        }
         let sat = msat.div_ceil(1000);
         let Some(_hold) = Hold::take(&self.busy, key) else {
             return Err(unavailable("the payment is under way"));
