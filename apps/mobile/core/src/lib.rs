@@ -651,6 +651,27 @@ pub struct InvoiceQuote {
     pub provider: Option<ViaProvider>,
 }
 
+/// The wallet's static address of donations ([`crate::Wallet::
+/// donation_address`]): an LNURL any Lightning wallet pays, through a swap
+/// provider that pays each donation in notes, less its fee.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct DonationAddress {
+    /// The LNURL, upper case, as a QR code holds it best.
+    pub lnurl: String,
+    /// The provider's URL, and the name it announced, if any.
+    pub provider: String,
+    pub name: Option<String>,
+    /// Its fee on each donation: `base` plus `ppm` millionths of it.
+    pub fee_base: u64,
+    pub fee_ppm: u64,
+    /// The least and the most donated at once, in satoshis.
+    pub min: u64,
+    pub max: u64,
+    /// Whether it holds enough to take a donation now: if not, payers are
+    /// refused until it does.
+    pub stocked: bool,
+}
+
 /// A swap provider paying a Lightning invoice from its own node for a lock
 /// of notes ([`InvoiceQuote`]).
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]

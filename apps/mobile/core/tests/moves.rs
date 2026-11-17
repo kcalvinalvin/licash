@@ -279,7 +279,14 @@ struct Swaps {
 
 impl Swaps {
     fn start(hubs: &Hubs, seed: u8, terms: Config) -> Self {
-        Self::start_with(hubs, seed, terms, None)
+        Self::start_with(hubs, seed, terms, None, None)
+    }
+
+    /// [`Swaps::start`], taking donations through `node` too, payers
+    /// reaching it at [`DONATIONS`], as the service does with
+    /// `--lnurl-url`.
+    fn start_donating(hubs: &Hubs, seed: u8, terms: Config, node: Arc<Fake>) -> Self {
+        Self::start_with(hubs, seed, terms, None, Some(node))
     }
 
     /// [`Swaps::start`], paying Lightning invoices from `node` too, on
@@ -290,7 +297,7 @@ impl Swaps {
         terms: Config,
         (node, lightning): (Arc<Fake>, swaps::Lightning),
     ) -> Self {
-        Self::start_with(hubs, seed, terms, Some((node, lightning)))
+        Self::start_with(hubs, seed, terms, Some((node, lightning)), None)
     }
 
     fn start_with(
@@ -298,6 +305,7 @@ impl Swaps {
         seed: u8,
         terms: Config,
         lightning: Option<(Arc<Fake>, swaps::Lightning)>,
+        donating: Option<Arc<Fake>>,
     ) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let wallet = licash_wallet::Wallet::create(
@@ -332,6 +340,13 @@ impl Swaps {
                 let paying = lightning.is_some();
                 let provider = match lightning {
                     Some((node, lightning)) => provider.pay_lightning(node, lightning).unwrap(),
+                    None => provider,
+                };
+                let provider = match donating {
+                    Some(node) => {
+                        let terms = licash_swaps::DonationTerms::default();
+                        provider.take_donations(node, terms, DONATIONS).unwrap()
+                    }
                     None => provider,
                 };
                 let provider = Arc::new(provider);
@@ -630,6 +645,52 @@ fn a_move_is_never_tried_again_once_its_notes_were_locked() {
 
 /// The quote of paying `request` through a provider, once one is found,
 /// within 10 seconds.
+/// Where payers reach a provider taking donations.
+const DONATIONS: &str = "https://donate.test";
+
+#[test]
+fn a_phone_finds_its_static_donation_address_at_a_provider_taking_them() {
+    let hubs = Hubs::start();
+    let phone = hubs.phone(1_000);
+    // No provider, then one taking no donations: no address.
+    assert_eq!(phone.donation_address().unwrap(), None);
+    let swapping = Swaps::start(&hubs, 0x51, TERMS);
+    offers(&hubs, &phone, Some(300), 1);
+    assert_eq!(phone.donation_address().unwrap(), None);
+
+    let donating = Swaps::start_donating(&hubs, 0x53, TERMS, Arc::new(Fake::new()));
+    let mut found = None;
+    for _ in 0..50 {
+        found = phone.donation_address().unwrap();
+        if found.is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let address = found.expect("a donation address");
+    assert_eq!(address.provider, donating.url());
+    assert_eq!(address.name.as_deref(), Some("provider 83"));
+    let terms = licash_swaps::DonationTerms::default();
+    assert_eq!(
+        (address.fee_base, address.fee_ppm, address.min, address.max),
+        (terms.fee.base, terms.fee.ppm, terms.min, terms.max)
+    );
+    // It holds 3,000 at the second hub.
+    assert!(address.stocked, "{address:?}");
+    // The code the phone shows, at the provider's public URL.
+    let code: PaymentCode = phone.payment_code(None).unwrap().qr.parse().unwrap();
+    let code = code.licash.unwrap().to_string();
+    let (_, url) = bitcoin::bech32::decode(&address.lnurl).unwrap();
+    assert_eq!(
+        String::from_utf8(url).unwrap(),
+        format!("{DONATIONS}/v1/lnurlp/{code}")
+    );
+    assert_eq!(address.lnurl, address.lnurl.to_uppercase());
+    // Asked again: the same.
+    assert_eq!(phone.donation_address().unwrap(), Some(address));
+    drop((swapping, donating));
+}
+
 fn via_quote(phone: &Wallet, request: &str) -> InvoiceQuote {
     let mut last = None;
     for _ in 0..50 {

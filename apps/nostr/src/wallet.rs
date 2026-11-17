@@ -14,8 +14,8 @@ use bitcoin::FeeRate;
 use futures_util::future::{join, join_all};
 use licash_api::{Info, Payment};
 use licash_wallet::{
-    Error, HubId, Paid, PaymentCode, PayoutQuote, PayoutState, Received, SwapLimits, SwapQuote,
-    SwapState, Transport, ViaQuote, Wallet,
+    DonationAddress, Error, HubId, Paid, PaymentCode, PayoutQuote, PayoutState, Received,
+    SwapLimits, SwapQuote, SwapState, Transport, ViaQuote, Wallet,
 };
 
 use crate::{mailbox, watch::Watch, Found, Role, Route, LIFETIME};
@@ -1057,6 +1057,52 @@ pub async fn invoice_providers_with<T: Transport>(
         .collect();
     // Stable: the newest announced first among equals.
     providers.sort_by_key(|p| p.quote.costs());
+    Ok(providers)
+}
+
+/// A swap provider announced on Nostr taking donations to the wallet's
+/// code, and the wallet's static address of donations through it.
+#[derive(Clone, Debug)]
+pub struct DonationProvider {
+    /// The URL that answered as the provider: the first announced that
+    /// does, or where it last answered ([`Announcements`]).
+    pub url: String,
+    /// The key that announced it, x-only in hex.
+    pub key: String,
+    pub name: Option<String>,
+    pub address: DonationAddress,
+}
+
+/// The swap providers announced on `relays` for `wallet`'s network, as
+/// `announced` keeps them, asked through `route`, that take donations to
+/// `wallet`'s code at a hub of it ([`Wallet::donation_address`]). Those
+/// holding enough there to take one first, then the cheapest on a
+/// donation of 10,000 sat, then by public URL: the same one while nothing
+/// changes, as an address handed out stays.
+pub async fn donation_providers_with<T: Transport>(
+    wallet: &Wallet<T>,
+    announced: &Announcements,
+    (relays, route): (&[String], &Route),
+) -> anyhow::Result<Vec<DonationProvider>> {
+    let network = wallet.network().name();
+    let ask = |url: String| async move { wallet.donation_address(&url).await };
+    let on = (relays, route, network);
+    let answering = announced.answering(on, ask, |a: &DonationAddress| a.info.nostr.as_deref());
+    let mut providers: Vec<DonationProvider> = (answering.await?.into_iter())
+        .map(|(service, url, address)| DonationProvider {
+            url,
+            key: service.key,
+            name: service.announcement.name,
+            address,
+        })
+        .collect();
+    providers.sort_by(|a, b| {
+        let key = |p: &DonationProvider| {
+            let (stocked, donations) = (p.address.stocked, &p.address.donations);
+            (!stocked, donations.fee.due(10_000), donations.url.clone())
+        };
+        key(a).cmp(&key(b))
+    });
     Ok(providers)
 }
 

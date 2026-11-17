@@ -36,6 +36,7 @@ const DAY: i64 = 86_400;
 mod backup;
 mod contacts;
 mod contracts;
+mod donations;
 mod fees;
 mod moves;
 mod payouts;
