@@ -162,11 +162,20 @@ async fn contact(phone: &Phone, bob: &licash_e2e::Wallet) -> anyhow::Result<()> 
     Ok(())
 }
 
-/// Paid over Lightning: an invoice its hub makes for an amount it enters,
-/// shown as a QR code, which a node outside pays. Its notes are taken while
-/// shown, and the payment is in the history.
+/// Paid over Lightning: an invoice its hub makes asking the amount it
+/// enters, the hub's fee in it, shown as a QR code, which a node outside
+/// pays. Its notes are taken while shown, and the payment is in the
+/// history.
 async fn lightning(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     let before = phone.balance().await?;
+    // What the wallet gets of an invoice asking 4000: the most that fits
+    // with the hub's fee on it.
+    let info = eco.info(eco.hub(1)).await?;
+    let receive = info.lightning.context("hub 1 takes no Lightning")?.receive;
+    let gets = (0..=4_000u64)
+        .rev()
+        .find(|n| n + receive.due(*n) <= 4_000)
+        .context("no amount fits 4000 with its fee")?;
     phone.tap_id("receive").await?;
     phone.tap_id("segment Lightning").await?;
     phone.tap_id("amount").await?;
@@ -181,14 +190,15 @@ async fn lightning(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
         "{shown} shown for an invoice"
     );
     let paying = eco.pay(OUTSIDE, &request);
-    phone.tagged("received", "Received 4,000 sat", 120).await?;
+    let says = format!("Received {},{:03} sat", gets / 1_000, gets % 1_000);
+    phone.tagged("received", &says, 120).await?;
     ensure!(paying.await??, "the node outside did not pay {request}");
     phone.tap("Back").await?;
     phone.home(30).await?;
     let now = changed(phone, before, 30).await?;
     ensure!(
-        now == before + 4_000,
-        "{now} held after 4000 over Lightning"
+        now == before + gets,
+        "{now} held after {gets} of 4000 over Lightning"
     );
     opened(phone, "Received over Lightning").await?;
     phone.tagged("state", "In your balance", 10).await?;
