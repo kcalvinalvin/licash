@@ -36,6 +36,7 @@ import org.licash.core.Contract
 import org.licash.core.ContractQuote
 import org.licash.core.ContractState
 import org.licash.core.Details
+import org.licash.core.DonationAddress
 import org.licash.core.FeesRaised
 import org.licash.core.Holding
 import org.licash.core.Hub
@@ -977,6 +978,12 @@ class Engine(context: Context) {
 
     /** [code], with an address on Bitcoin any wallet pays: handed out, and watched from then on. */
     suspend fun bitcoinCode(amount: ULong?): Result<Code> = io { local { it.bitcoinCode(amount) } }
+
+    /**
+     * The wallet's static address of donations, through a swap provider
+     * announced that takes them at a hub of its code: null if none does.
+     */
+    suspend fun donationAddress(): Result<DonationAddress?> = io { local { it.donationAddress() } }
 
     /** More of a line of the history, as far as the wallet looked. */
     suspend fun details(activity: Activity): Result<Details> =

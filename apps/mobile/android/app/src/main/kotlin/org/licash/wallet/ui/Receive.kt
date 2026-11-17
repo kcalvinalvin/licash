@@ -38,10 +38,12 @@ import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import org.licash.core.Code
+import org.licash.core.DonationAddress
 import org.licash.core.LightningInvoice
 import org.licash.core.State
 import org.licash.wallet.Engine
 import org.licash.wallet.explain
+import org.licash.wallet.percent
 import org.licash.wallet.sat
 
 /** How often an invoice shown is followed, in ms. */
@@ -66,6 +68,9 @@ internal enum class Way(val label: String, val says: String, val tag: String) {
 
     /** The silent payment address alone, for wallets paying those only. */
     SILENT("Silent payment address", "Wallets paying silent payments, on Bitcoin", "way-silent"),
+
+    /** A static LNURL of a swap provider's: any wallet pays it, again, while the phone is off. */
+    DONATIONS("Donation address", "Any Lightning wallet, again and again, even while you're offline", "way-donations"),
 }
 
 /**
@@ -75,13 +80,34 @@ internal enum class Way(val label: String, val says: String, val tag: String) {
 internal fun picked(amount: Long?, lightning: Boolean): Way =
     if (amount != null && lightning) Way.LIGHTNING else Way.CODE
 
-/** The ways to be paid while a hub trusted takes `lightning` payments, and `silent` ones. */
-internal fun ways(lightning: Boolean, silent: Boolean): List<Way> = listOfNotNull(
+/**
+ * The ways to be paid while a hub trusted takes `lightning` payments, and
+ * `silent` ones, and while a provider takes `donations` to the wallet.
+ */
+internal fun ways(lightning: Boolean, silent: Boolean, donations: Boolean = false): List<Way> = listOfNotNull(
     Way.LIGHTNING.takeIf { lightning },
     Way.CODE,
     Way.BITCOIN,
     Way.SILENT.takeIf { silent },
+    Way.DONATIONS.takeIf { donations },
 )
+
+/** What a donation address takes and costs, and who pays it on, in words. */
+internal fun donationWords(address: DonationAddress): String {
+    val by = address.name ?: address.provider.substringAfter("://").trimEnd('/')
+    val fee = listOfNotNull(
+        sat(address.feeBase).takeIf { address.feeBase > 0u },
+        percent(address.feePpm).takeIf { address.feePpm > 0u },
+    ).joinToString(" + ")
+    val paid = when {
+        fee.isEmpty() -> "Paid to you in notes by $by, with no fee."
+        else -> "Paid to you in notes by $by, less its fee of $fee."
+    }
+    return when {
+        address.stocked -> paid
+        else -> "$paid It can't take donations right now: payers are refused until it can."
+    }
+}
 
 /**
  * What the payer of an invoice asked for an amount pays, and what the
@@ -107,6 +133,8 @@ fun Receive(engine: Engine, back: () -> Unit) {
     var amount by rememberSaveable { mutableStateOf<Long?>(null) }
     var code by remember { mutableStateOf<Code?>(null) }
     var bitcoin by remember { mutableStateOf<Code?>(null) }
+    // Looked for once, out of sight: a way to be paid only if found.
+    var donations by remember { mutableStateOf<DonationAddress?>(null) }
     var error by remember { mutableStateOf<String?>(null) }
     // The amount typed in, in place of the QR code: asked for once done.
     var editing by remember { mutableStateOf(false) }
@@ -124,7 +152,7 @@ fun Receive(engine: Engine, back: () -> Unit) {
     var choosing by rememberSaveable { mutableStateOf(false) }
     val ui by engine.ui.collectAsState()
     val takesLightning = ui.hubs.any { it.lightning != null }
-    val ways = ways(takesLightning, ui.hubs.any { it.silent })
+    val ways = ways(takesLightning, ui.hubs.any { it.silent }, donations != null)
     // Picked for the amount, unless another way was asked for.
     var chosen by rememberSaveable { mutableStateOf<Way?>(null) }
     val way = chosen?.takeIf { it in ways } ?: picked(amount, takesLightning)
@@ -133,9 +161,12 @@ fun Receive(engine: Engine, back: () -> Unit) {
     var invoice by remember { mutableStateOf<LightningInvoice?>(null) }
     val request = invoice?.request?.takeIf { lightning }
     val silent = code?.silent?.takeIf { way == Way.SILENT }
+    // No amount, as a silent payment address.
+    val anyAmount = way == Way.SILENT || way == Way.DONATIONS
     val shown = when (way) {
         Way.LIGHTNING -> request?.let { way.label to it }
         Way.SILENT -> silent?.let { way.label to it }
+        Way.DONATIONS -> donations?.let { way.label to it.lnurl }
         Way.CODE -> code?.let { way.label to it.text }
         Way.BITCOIN -> bitcoin?.let { way.label to it.text }
     }
@@ -155,6 +186,9 @@ fun Receive(engine: Engine, back: () -> Unit) {
         engine.bitcoinCode(amount?.toULong())
             .onSuccess { bitcoin = it }
             .onFailure { error = explain(it) }
+    }
+    LaunchedEffect(ui.hubs) {
+        donations = engine.donationAddress().getOrNull()
     }
     LaunchedEffect(lightning, amount) {
         invoice = null
@@ -238,6 +272,7 @@ fun Receive(engine: Engine, back: () -> Unit) {
                 }
                 lightning && request != null -> QrCode(request.uppercase())
                 lightning -> if (amount != null && error == null) Waiting()
+                way == Way.DONATIONS -> donations?.let { QrCode(it.lnurl) }
                 way == Way.SILENT -> when (silent) {
                     null -> if (error == null) Waiting()
                     else -> {
@@ -272,6 +307,7 @@ fun Receive(engine: Engine, back: () -> Unit) {
                 Text(
                     when {
                         way == Way.SILENT -> "Any amount, on Bitcoin"
+                        way == Way.DONATIONS -> donations?.let { "${sat(it.min)} to ${sat(it.max)}" } ?: "Any amount"
                         else -> amount?.let { sat(it.toULong()) } ?: if (lightning) "Choose an amount" else "Any amount"
                     },
                     modifier = Modifier.testTag("asking"),
@@ -285,6 +321,7 @@ fun Receive(engine: Engine, back: () -> Unit) {
             val says = when (way) {
                 Way.SILENT -> "Found once in a block. Each payment lands at an address of its own."
                 Way.BITCOIN -> "Found once in a block. Once paid, the next address shows."
+                Way.DONATIONS -> donations?.let { donationWords(it) }
                 else -> paying ?: waits
             }
             says?.let {
@@ -306,8 +343,8 @@ fun Receive(engine: Engine, back: () -> Unit) {
                 BigButton("Cancel", Modifier.weight(1f), quiet = true) { editing = false }
                 BigButton("Done", Modifier.weight(1f).testTag("done")) { done() }
             } else {
-                // A silent payment address asks for no amount.
-                if (way != Way.SILENT) {
+                // A silent payment address or a donation one asks for no amount.
+                if (!anyAmount) {
                     BigButton("Amount", Modifier.weight(1f).testTag("set-amount"), quiet = true, onClick = edit)
                 }
                 BigButton(if (copied) "Copied" else "Copy", Modifier.weight(1f).testTag("copy"), enabled = shown != null) {

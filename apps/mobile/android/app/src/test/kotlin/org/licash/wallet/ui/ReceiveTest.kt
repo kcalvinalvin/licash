@@ -3,6 +3,7 @@ package org.licash.wallet.ui
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Test
+import org.licash.core.DonationAddress
 
 class ReceiveTest {
     @Test
@@ -34,6 +35,37 @@ class ReceiveTest {
         assertEquals(
             "The payer pays 100,001 sat\nYou get 100,000 sat, the hub's fee taken",
             invoiceWords(100_002u, 100_001u, 100_000u),
+        )
+    }
+
+    @Test
+    fun a_donation_address_is_another_way_once_a_provider_takes_donations() {
+        assertEquals(
+            listOf(Way.CODE, Way.BITCOIN, Way.DONATIONS),
+            ways(lightning = false, silent = false, donations = true),
+        )
+        assertEquals(Way.DONATIONS, ways(lightning = true, silent = true, donations = true).last())
+        // Never picked for an amount: asked for.
+        assertEquals(Way.LIGHTNING, picked(amount = 500, lightning = true))
+    }
+
+    @Test
+    fun a_donation_address_says_who_pays_it_on_and_for_what() {
+        val address = DonationAddress(
+            lnurl = "LNURL1DP68GURN8GHJ7",
+            provider = "https://swaps.example/",
+            name = null,
+            feeBase = 2u,
+            feePpm = 5_000u,
+            min = 100u,
+            max = 1_000_000u,
+            stocked = true,
+        )
+        assertEquals("Paid to you in notes by swaps.example, less its fee of 2 sat + 0.5%.", donationWords(address))
+        assertEquals(
+            "Paid to you in notes by Swaps, with no fee. " +
+                "It can't take donations right now: payers are refused until it can.",
+            donationWords(address.copy(name = "Swaps", feeBase = 0u, feePpm = 0u, stocked = false)),
         )
     }
 }
