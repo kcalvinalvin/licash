@@ -33,7 +33,8 @@ use rand_core::{OsRng, RngCore};
 use rusqlite::{params, OptionalExtension, Row};
 
 use crate::{
-    hub_url, invalid, now, sql, unavailable, Address, Error, Lock, LockState, Transport, Wallet,
+    hub_url, invalid, locks::Pays, now, sql, unavailable, Address, Error, Lock, LockState,
+    Transport, Wallet,
 };
 
 /// Blocks a route's timelock may take beyond an invoice's final delta, at
@@ -266,10 +267,16 @@ impl<T: Transport> Wallet<T> {
         let url = hub_url(url)?;
         let invoice = decode(request)?;
         let msat = self.payable(&invoice)?;
+        let hash: [u8; 32] = *invoice.payment_hash().as_ref();
+        if let Some(lock) = self.live_lock(&hash, |l| l.via.is_some())? {
+            return Err(Error::Invalid(format!(
+                "the invoice is being paid through a swap provider, by lock {}",
+                lock.id
+            )));
+        }
         let (hub, info) = self.refresh(&url).await?;
         let lightning = gateway(&url, &info, msat)?;
         let expiry = lock_expiry(&url, &info, lightning, &invoice)?;
-        let hash: [u8; 32] = *invoice.payment_hash().as_ref();
         let amount = lightning.pay_lock(msat);
         let request = invoice.to_string();
         tracing::info!(%url, msat, amount, "paying an invoice");
@@ -279,7 +286,7 @@ impl<T: Transport> Wallet<T> {
             amount,
             hash,
             Some(expiry),
-            Some(&request),
+            Pays::Gateway(&request),
         )
         .await
     }
@@ -356,8 +363,107 @@ fn via_expiry(
     Ok(soonest.saturating_add(ROUTE_BLOCKS).min(latest))
 }
 
+/// What a lock paying `invoice`, of `msat`, through the provider at
+/// `provider` saying `offer` of itself, from notes at the hub at `url`
+/// saying `info`, pays the provider, the provider's fee in it, and when it
+/// expires ([`via_expiry`]). Refused unless the provider pays invoices that
+/// big for locks at that hub, for at most `max_fee`.
+fn via_terms(
+    provider: &str,
+    offer: &swaps::Info,
+    (url, info): (&str, &licash_api::Info),
+    invoice: &Bolt11Invoice,
+    msat: u64,
+    max_fee: u64,
+) -> Result<(u64, u64, u32), Error> {
+    let refuse = |why: String| Err(Error::Invalid(format!("provider {provider} {why}")));
+    let Some(terms) = offer.lightning.as_ref() else {
+        return refuse("pays no Lightning invoices".into());
+    };
+    if offer.hub(&info.address).is_none() {
+        return refuse(format!("takes no lock at {url}"));
+    }
+    // A lock to a hub's own address is the hub's to settle.
+    if offer.address == info.address {
+        return refuse("names a hub's address as its own".into());
+    }
+    if msat > terms.max.saturating_mul(1000) {
+        return refuse(format!("pays invoices of at most {} sat", terms.max));
+    }
+    let amount = terms.pays(msat);
+    let fee = amount - msat.div_ceil(1000);
+    if fee > max_fee {
+        return refuse(format!("asks a fee of {fee} sat, more than {max_fee}"));
+    }
+    let expiry = via_expiry(url, info, terms, invoice)?;
+    Ok((amount, fee, expiry))
+}
+
+/// What paying an invoice through a swap provider costs, from notes at a
+/// hub ([`Wallet::invoice_quote_via`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ViaQuote {
+    /// What the provider said of itself, with what it pays over Lightning.
+    pub info: swaps::Info,
+    /// What the invoice asks, in sat rounded up.
+    pub amount: u64,
+    /// The provider's fee, routing fees included: the lock pays it on top.
+    pub fee: u64,
+    /// The hub's fee on the wallet's lock, as it charges now.
+    pub lock_fee: u64,
+    /// The height the lock would expire at: should the payment fail, its
+    /// notes return once it is that deep.
+    pub expiry: u32,
+    /// Blocks from the hub's tip until they do.
+    pub refund_blocks: u32,
+}
+
+impl ViaQuote {
+    /// What paying it costs on top of what the invoice asks.
+    pub fn costs(&self) -> u64 {
+        self.fee.saturating_add(self.lock_fee)
+    }
+}
+
 /// Paying invoices through a swap provider.
 impl<T: Transport> Wallet<T> {
+    /// What paying `request`, a BOLT11 invoice, through the swap provider
+    /// at `provider` costs from the notes held now at the hub at `url`, as
+    /// it last said of itself. Refused as [`Error::Invalid`] if the
+    /// provider pays no such invoice for a lock there, or asks more than
+    /// `max_fee`, and as [`Error::Insufficient`] if the notes there pay
+    /// not the lock. Nothing is recorded or locked:
+    /// [`Wallet::pay_invoice_via`] checks it again.
+    pub async fn invoice_quote_via(
+        &self,
+        provider: &str,
+        url: &str,
+        request: &str,
+        max_fee: u64,
+    ) -> Result<ViaQuote, Error> {
+        let provider = hub_url(provider)?;
+        let url = hub_url(url)?;
+        let invoice = decode(request)?;
+        let msat = self.payable(&invoice)?;
+        let (hub, info) = self.hub(&url)?;
+        let offer: swaps::Info = self.get(&provider, swaps::SWAPS_INFO).await?;
+        let at = (url.as_str(), &info);
+        let (locked, fee, expiry) = via_terms(&provider, &offer, at, &invoice, msat, max_fee)?;
+        let fees = self.agreed_fees(hub, &url, &info)?;
+        let (_, selection) = self.select(hub, locked, &fees.locking())?;
+        let depth = info.locks.as_ref().map_or(0, |l| {
+            expiry.saturating_sub(l.height).saturating_add(l.min_depth)
+        });
+        Ok(ViaQuote {
+            info: offer,
+            amount: msat.div_ceil(1000),
+            fee,
+            lock_fee: selection.fee,
+            expiry,
+            refund_blocks: depth,
+        })
+    }
+
     /// Pay `request`, a BOLT11 invoice, through the swap provider at
     /// `provider`, from notes at the hub at `url`: lock the invoice's amount
     /// and the provider's fee to the provider under the invoice's hash,
@@ -381,40 +487,31 @@ impl<T: Transport> Wallet<T> {
         let msat = self.payable(&invoice)?;
         let (hub, info) = self.refresh(&url).await?;
         let offer: swaps::Info = self.get(&provider, swaps::SWAPS_INFO).await?;
-        let terms = offer.lightning.as_ref().ok_or_else(|| {
-            Error::Invalid(format!("provider {provider} pays no Lightning invoices"))
-        })?;
-        if msat > terms.max.saturating_mul(1000) {
-            return Err(Error::Invalid(format!(
-                "provider {provider} pays invoices of at most {} sat",
-                terms.max
-            )));
-        }
-        let amount = terms.pays(msat);
-        let fee = amount - msat.div_ceil(1000);
-        if fee > max_fee {
-            return Err(Error::Invalid(format!(
-                "provider {provider} asks a fee of {fee} sat, more than {max_fee}"
-            )));
-        }
         let hash: [u8; 32] = *invoice.payment_hash().as_ref();
         let request = invoice.to_string();
         let lock = match self.lock_via(&url, &offer.address, &hash)? {
-            Some(lock) => lock,
+            Some(lock) => self.follow_lock(&lock.id).await?,
             None => {
-                let expiry = via_expiry(&url, &info, terms, &invoice)?;
+                if let Some(lock) = self.live_lock(&hash, |l| l.invoice.is_some())? {
+                    return Err(Error::Invalid(format!(
+                        "the invoice is being paid through hub {}, by lock {}",
+                        lock.hub, lock.id
+                    )));
+                }
+                let at = (url.as_str(), &info);
+                let (amount, _, expiry) =
+                    via_terms(&provider, &offer, at, &invoice, msat, max_fee)?;
                 tracing::info!(%url, %provider, msat, amount, expiry, "paying an invoice through a provider");
                 let at = (url.as_str(), hub, &info);
-                self.lock_paying(at, &offer.address, amount, hash, Some(expiry), None)
+                let pays = Pays::Via {
+                    provider: &provider,
+                    invoice: &request,
+                };
+                self.lock_paying(at, &offer.address, amount, hash, Some(expiry), pays)
                     .await?
             }
         };
-        let lock = match lock.state {
-            LockState::Requested => self.follow_lock(&lock.id).await?,
-            _ => lock,
-        };
         match lock.state {
-            LockState::Locked => self.ask_provider(&provider, &info, lock, &request).await,
             LockState::Requested => Err(Error::Pending {
                 id: lock.id,
                 reason: "its lock is not certified yet".into(),
@@ -436,45 +533,64 @@ impl<T: Transport> Wallet<T> {
         }))
     }
 
-    /// Ask the provider at `provider` to pay `request` for `lock`, certified
-    /// at the hub saying `info`: its lock where it stands, a payment given
-    /// up recorded as its failure. No answer leaves it to be asked again.
-    async fn ask_provider(
+    /// The latest lock under `hash`, unless refunded or given up, that
+    /// `paying` says pays its invoice.
+    fn live_lock(
         &self,
+        hash: &[u8; 32],
+        paying: impl Fn(&Lock) -> bool,
+    ) -> Result<Option<Lock>, Error> {
+        let locks = self.locks()?;
+        Ok(locks.into_iter().find(|l| {
+            l.hash == *hash
+                && paying(l)
+                && !matches!(l.state, LockState::Refunded | LockState::Abandoned(_))
+        }))
+    }
+
+    /// Ask the provider at `provider` to pay `invoice` for lock `id`,
+    /// certified at the hub at `url`: asked again each time the lock is
+    /// followed, the provider answering where its payment stands. A payment
+    /// it gave up or declined is recorded as the lock's failure, which ends
+    /// the asking: the lock is refunded once expired. No answer is asked
+    /// again.
+    pub(crate) async fn ask_provider(
+        &self,
+        url: &str,
         provider: &str,
-        info: &licash_api::Info,
-        lock: Lock,
-        request: &str,
-    ) -> Result<Lock, Error> {
-        let mut id = [0; 32];
-        hex::decode_to_slice(&lock.id, &mut id).map_err(invalid)?;
-        let id = ProposalId::from_bytes(id);
-        let asked = LightningRequest::new(&info.address, &id, request);
-        let failure = match self
+        id: &ProposalId,
+        invoice: &str,
+    ) -> Result<(), Error> {
+        let key = hex::encode(id.as_bytes());
+        let (_, info) = self.hub(url)?;
+        let asked = LightningRequest::new(&info.address, id, invoice);
+        let asked = self
             .post::<LightningSwap>(provider, swaps::LIGHTNING_SWAPS, &asked)
-            .await
-        {
+            .await;
+        let failure = match asked {
             Ok(LightningSwap {
                 state: swaps::State::Failed,
                 reason,
                 ..
             }) => reason.unwrap_or_else(|| "the payment failed".into()),
             Ok(answer) => {
-                tracing::info!(id = %lock.id, %provider, state = ?answer.state, "the provider pays");
-                return Ok(lock);
+                tracing::debug!(id = %key, %provider, state = ?answer.state, "the provider pays");
+                return Ok(());
             }
             Err(Error::Refused { problem, .. }) => format!("the provider declined: {problem}"),
-            Err(e) => return Err(e),
+            Err(e) => {
+                tracing::warn!(id = %key, %provider, error = %e, "cannot ask the provider to pay");
+                return Ok(());
+            }
         };
-        tracing::warn!(id = %lock.id, %provider, failure, "invoice not paid");
+        tracing::warn!(id = %key, %provider, failure, "invoice not paid");
         self.store.write(|tx| {
             tx.execute(
                 "UPDATE locks SET failure = ?2 WHERE id = ?1 AND failure IS NULL",
                 params![id.as_bytes(), failure],
             )?;
             Ok(())
-        })?;
-        self.follow_lock(&lock.id).await
+        })
     }
 }
 

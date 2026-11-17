@@ -473,6 +473,27 @@ async fn a_provider_without_lightning_terms_pays_no_invoice() {
 #[derive(Clone)]
 struct Via(Arc<Net>, Arc<Provider<Link>>);
 
+/// [`Via`], but the provider never hears what it is asked to pay.
+#[derive(Clone)]
+struct Unheard(Via);
+
+impl Transport for Unheard {
+    fn request(
+        &self,
+        url: &str,
+        body: Option<Vec<u8>>,
+    ) -> impl std::future::Future<Output = Result<Response, String>> + Send {
+        let asked = url == format!("{PROVIDER}{}", swaps::LIGHTNING_SWAPS);
+        let answer = self.0.request(url, body);
+        async move {
+            match asked {
+                true => Err("connection reset".into()),
+                false => answer.await,
+            }
+        }
+    }
+}
+
 impl Transport for Via {
     fn request(
         &self,
@@ -627,4 +648,65 @@ async fn a_wallet_locks_nothing_for_a_provider_asking_too_much() {
     }
     assert!(client.locks().unwrap().is_empty());
     assert!(node.sent().is_empty());
+}
+
+#[tokio::test]
+async fn a_payment_the_provider_never_heard_of_is_asked_for_again() {
+    let (net, dir, node, provider, client) = via().await;
+    let path = dir.path().join("client.sqlite");
+    drop(client);
+    let unheard = Unheard(Via(net.clone(), provider.clone()));
+    let client = Wallet::open(&path, unheard).unwrap();
+    let preimage = [8; 32];
+    let request = node.invoice(
+        1_000_000,
+        lock_hash(&preimage),
+        DELTA,
+        Outcome::Pay(preimage),
+    );
+    let tip = net.view(A).height();
+    let quote = client
+        .invoice_quote_via(PROVIDER, A, &request, 100)
+        .await
+        .unwrap();
+    let lock = client
+        .pay_invoice_via(PROVIDER, A, &request, 100)
+        .await
+        .unwrap();
+    // As quoted: the invoice and the provider's fee locked, expiring then,
+    // its notes back that many blocks from now should it fail.
+    assert_eq!(lock.amount, quote.amount + quote.fee);
+    assert_eq!(lock.expiry, quote.expiry);
+    assert_eq!(quote.refund_blocks, quote.expiry - tip + TIMED.min_depth);
+    // Locked, but the provider never heard of it: recorded with the lock.
+    assert_eq!((&lock.state, &lock.failure), (&LockState::Locked, &None));
+    let recorded = lock.via.clone().unwrap();
+    assert_eq!(recorded.provider, PROVIDER);
+    assert_eq!(recorded.invoice, request);
+    assert!(node.sent().is_empty());
+
+    // Opened again, as once the app is back: resuming asks the provider.
+    drop(client);
+    let client = Wallet::open(&path, Via(net, provider.clone())).unwrap();
+    client.resume().await.unwrap();
+    assert_eq!(node.sent().len(), 1);
+    provider.follow_invoices().await.unwrap();
+    let paid = client.follow_lock(&lock.id).await.unwrap();
+    assert_eq!(paid.state, LockState::Paid(preimage));
+    assert_eq!(paid.via, Some(recorded));
+}
+
+#[tokio::test]
+async fn an_invoice_paid_through_a_provider_is_not_paid_through_the_hub_too() {
+    let (_net, _dir, node, _provider, client) = via().await;
+    let request = node.invoice(1_000_000, lock_hash(&[6; 32]), DELTA, Outcome::Hang);
+    let lock = client
+        .pay_invoice_via(PROVIDER, A, &request, 100)
+        .await
+        .unwrap();
+    match client.pay_invoice(A, &request).await {
+        Err(Error::Invalid(why)) => assert!(why.contains(&lock.id), "{why}"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(client.locks().unwrap().len(), 1);
 }

@@ -1164,7 +1164,7 @@ async fn pay_invoice(
     let until = std::time::Instant::now() + std::time::Duration::from_secs(wait);
     let mut pending = None;
     // A provider's payment given up: its lock is refunded only once expired.
-    let given_up = |lock: &Lock| lock.invoice.is_none() && lock.failure.is_some();
+    let given_up = |lock: &Lock| lock.via.is_some() && lock.failure.is_some();
     while matches!(lock.state, LockState::Requested | LockState::Locked)
         && !given_up(&lock)
         && std::time::Instant::now() < until
@@ -1875,6 +1875,7 @@ fn lock_json(lock: &Lock) -> serde_json::Value {
         "id": lock.id, "hub": lock.hub, "payee": encode(&lock.payee), "amount": lock.amount,
         "fee": lock.fee, "hash": hex::encode(lock.hash), "expiry": lock.expiry,
         "state": lock_state(&lock.state), "preimage": preimage, "invoice": lock.invoice,
+        "via": lock.via.as_ref().map(|v| json!({"provider": v.provider, "invoice": v.invoice})),
         "failure": lock.failure, "created_at": lock.created_at,
     })
 }

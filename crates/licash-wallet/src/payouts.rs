@@ -39,7 +39,9 @@ use rusqlite::{params, OptionalExtension, Row};
 
 use crate::{
     deposits::{random_key, x_only},
-    hub_url, invalid, now, sql, unavailable, Blocks, Error, LockState, Transport, Wallet,
+    hub_url, invalid,
+    locks::Pays,
+    now, sql, unavailable, Blocks, Error, LockState, Transport, Wallet,
 };
 
 /// Blocks a payout's coin must have left before its timeout when the
@@ -314,7 +316,14 @@ impl<T: Transport> Wallet<T> {
         let total = quote.value().saturating_add(quote.fee);
         let at = (from.as_str(), from_hub, &from_info);
         match self
-            .lock_paying(at, &quote.info.address, total, hash, Some(expiry), None)
+            .lock_paying(
+                at,
+                &quote.info.address,
+                total,
+                hash,
+                Some(expiry),
+                Pays::Nothing,
+            )
             .await
         {
             Ok(_) | Err(Error::Pending { .. }) => {}

@@ -46,14 +46,40 @@ pub struct Lock {
     pub state: LockState,
     /// The Lightning invoice the lock pays through its hub, if any.
     pub invoice: Option<String>,
-    /// Why its hub failed or refused to pay the invoice: the lock is
-    /// refunded.
+    /// The Lightning invoice a swap provider pays for the lock, if any.
+    pub via: Option<Via>,
+    /// Why its hub, or the provider, failed or refused to pay the invoice:
+    /// the lock is refunded, once expired if paying a provider.
     pub failure: Option<String>,
     /// What it cost this wallet once settled: the notes it spent less those
     /// its branch returned, what it paid included; for a refund, the hub's
     /// refund fee.
     pub cost: Option<u64>,
     pub created_at: i64,
+}
+
+/// A Lightning invoice a swap provider pays from its own node for a lock to
+/// it, which it claims with the preimage the payment buys.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Via {
+    /// The provider's URL.
+    pub provider: String,
+    /// The BOLT11 invoice it is asked to pay.
+    pub invoice: String,
+}
+
+/// Who pays the Lightning invoice a lock is made for, if any, once the
+/// lock is certified.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Pays<'a> {
+    Nothing,
+    /// Its hub's gateway.
+    Gateway(&'a str),
+    /// The swap provider at `provider`, to which it pays.
+    Via {
+        provider: &'a str,
+        invoice: &'a str,
+    },
 }
 
 /// A lock at a hub that pays this wallet, as its hub holds it: certified,
@@ -109,6 +135,7 @@ pub(crate) struct PreparedLock {
     pub(crate) fee: u64,
     request: String,
     invoice: Option<String>,
+    via: Option<Via>,
     inputs: Vec<[u8; 33]>,
     height: u32,
 }
@@ -117,8 +144,9 @@ impl PreparedLock {
     pub(crate) fn record(&self, tx: &rusqlite::Transaction<'_>) -> Result<(), Error> {
         tx.execute(
             "INSERT INTO locks
-                (id, hub, payee, hash, expiry, amount, fee, request, invoice, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                (id, hub, payee, hash, expiry, amount, fee, request, invoice, via,
+                    via_invoice, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 self.id.as_bytes(),
                 self.hub,
@@ -129,6 +157,8 @@ impl PreparedLock {
                 sql(self.fee),
                 self.request,
                 self.invoice,
+                self.via.as_ref().map(|v| &v.provider),
+                self.via.as_ref().map(|v| &v.invoice),
                 now()
             ],
         )?;
@@ -158,12 +188,20 @@ impl<T: Transport> Wallet<T> {
             return Err(Error::Invalid("nothing to lock".into()));
         }
         let (hub, info) = self.refresh(&url).await?;
-        self.lock_paying((&url, hub, &info), payee, amount, hash, expiry, None)
-            .await
+        self.lock_paying(
+            (&url, hub, &info),
+            payee,
+            amount,
+            hash,
+            expiry,
+            Pays::Nothing,
+        )
+        .await
     }
 
     /// [`Wallet::lock`] at the hub `hub` reached at `url`, `info` what it
-    /// just said of itself, paying `invoice` through it once certified.
+    /// just said of itself, then asked to pay as `pays` says once
+    /// certified.
     pub(crate) async fn lock_paying(
         &self,
         (url, hub, info): (&str, i64, &Info),
@@ -171,10 +209,10 @@ impl<T: Transport> Wallet<T> {
         amount: u64,
         hash: [u8; 32],
         expiry: Option<u32>,
-        invoice: Option<&str>,
+        pays: Pays<'_>,
     ) -> Result<Lock, Error> {
         let prepared = self
-            .prepare_lock((url, hub, info), payee, amount, hash, expiry, invoice)
+            .prepare_lock((url, hub, info), payee, amount, hash, expiry, pays)
             .await?;
         self.store.write(|tx| prepared.record(tx))?;
         let id = prepared.id;
@@ -193,7 +231,7 @@ impl<T: Transport> Wallet<T> {
         amount: u64,
         hash: [u8; 32],
         expiry: Option<u32>,
-        invoice: Option<&str>,
+        pays: Pays<'_>,
     ) -> Result<PreparedLock, Error> {
         if amount == 0 {
             return Err(Error::Invalid("nothing to lock".into()));
@@ -272,7 +310,17 @@ impl<T: Transport> Wallet<T> {
             amount,
             fee,
             request,
-            invoice: invoice.map(str::to_owned),
+            invoice: match pays {
+                Pays::Gateway(invoice) => Some(invoice.to_owned()),
+                _ => None,
+            },
+            via: match pays {
+                Pays::Via { provider, invoice } => Some(Via {
+                    provider: provider.to_owned(),
+                    invoice: invoice.to_owned(),
+                }),
+                _ => None,
+            },
             inputs,
             height: locks.height,
         })
@@ -337,12 +385,14 @@ impl<T: Transport> Wallet<T> {
             bool,
             Option<String>,
             Option<String>,
+            Option<(String, String)>,
         );
         let row: Row = self.store.read(|c| {
             Ok(c.query_row(
                 "SELECT l.hub, r.url, l.request, l.certificate IS NOT NULL,
                     l.done_at IS NOT NULL, l.abandoned,
-                    CASE WHEN l.failure IS NULL THEN l.invoice END
+                    CASE WHEN l.failure IS NULL THEN l.invoice END,
+                    CASE WHEN l.failure IS NULL THEN l.via END, l.via_invoice
                  FROM locks l JOIN reach r ON r.hub = l.hub WHERE l.id = ?1",
                 [id.as_bytes()],
                 |r| {
@@ -354,11 +404,12 @@ impl<T: Transport> Wallet<T> {
                         r.get(4)?,
                         r.get(5)?,
                         r.get(6)?,
+                        r.get::<_, Option<String>>(7)?.zip(r.get(8)?),
                     ))
                 },
             )?)
         })?;
-        let (hub, url, request, certified, done, abandoned, invoice) = row;
+        let (hub, url, request, certified, done, abandoned, invoice, via) = row;
         if let Some(reason) = abandoned {
             let id = hex::encode(id.as_bytes());
             return Err(Error::Abandoned { id, reason });
@@ -394,6 +445,11 @@ impl<T: Transport> Wallet<T> {
         }
         if let Some(invoice) = invoice {
             self.ask_payment(&url, id, &invoice).await?;
+        }
+        // Each step until it settles: the provider answers where its
+        // payment stands, and learns of it if it never heard.
+        if let Some((provider, invoice)) = via {
+            self.ask_provider(&url, &provider, id, &invoice).await?;
         }
         let terms = signed.proposal().lock().expect("a lock").terms().clone();
         let state: licash_api::LockState = self.get(&url, &licash_api::lock_state(id)).await?;
@@ -684,7 +740,7 @@ impl<T: Transport> Wallet<T> {
 
 const LOCKS: &str = "SELECT l.id, r.url, l.payee, l.hash, l.amount, l.fee, l.expiry,
     l.certificate IS NOT NULL, l.settled, l.preimage, l.done_at IS NOT NULL, l.abandoned,
-    l.created_at, l.invoice, l.failure,
+    l.created_at, l.invoice, l.failure, l.via, l.via_invoice,
     (SELECT SUM(n.denom) FROM notes n WHERE n.spent_by = l.id),
     (SELECT COALESCE(SUM(n.denom), 0) FROM notes n WHERE n.proposal = l.id)
     FROM locks l JOIN reach r ON r.hub = l.hub";
@@ -705,7 +761,11 @@ fn lock_of(r: &Row<'_>) -> rusqlite::Result<Result<Lock, Error>> {
         _ if certified => LockState::Locked,
         _ => LockState::Requested,
     };
-    let (spent, kept): (Option<i64>, i64) = (r.get(15)?, r.get(16)?);
+    let (spent, kept): (Option<i64>, i64) = (r.get(17)?, r.get(18)?);
+    let via: Option<String> = r.get(15)?;
+    let via = via
+        .zip(r.get(16)?)
+        .map(|(provider, invoice)| Via { provider, invoice });
     let cost = match state {
         LockState::Paid(_) | LockState::Refunded => spent.map(|s| s.saturating_sub(kept) as u64),
         _ => None,
@@ -723,6 +783,7 @@ fn lock_of(r: &Row<'_>) -> rusqlite::Result<Result<Lock, Error>> {
         expiry: r.get(6)?,
         state,
         invoice: r.get(13)?,
+        via,
         failure: r.get(14)?,
         cost,
         created_at: r.get(12)?,

@@ -17,7 +17,7 @@ use licash_api::{
 use rand_core::{OsRng, RngCore};
 use rusqlite::{params, OptionalExtension, Row};
 
-use crate::{hub_url, now, sql, unavailable, Error, LockState, Transport, Wallet};
+use crate::{hub_url, locks::Pays, now, sql, unavailable, Error, LockState, Transport, Wallet};
 
 /// Blocks the provider's lock leaves the wallet to claim it, beyond the
 /// provider's margin: the wallet's lock expires no later, so that its notes
@@ -178,7 +178,7 @@ impl<T: Transport> Wallet<T> {
         let total = amount.saturating_add(fee);
         let at = (from.as_str(), from_hub, &from_info);
         match self
-            .lock_paying(at, &offer.address, total, hash, Some(expiry), None)
+            .lock_paying(at, &offer.address, total, hash, Some(expiry), Pays::Nothing)
             .await
         {
             Ok(_) | Err(Error::Pending { .. }) => {}

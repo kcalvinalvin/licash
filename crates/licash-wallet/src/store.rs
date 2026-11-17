@@ -26,7 +26,17 @@ const MIGRATIONS: &[&str] = &[
     RENEWALS,
     DELIVERIES,
     UNLINKED_AT,
+    VIA,
 ];
+
+/// Version 10: Lightning invoices paid through swap providers. A lock
+/// paying one names the provider's URL, `via`, and the invoice it asks it
+/// to pay, `via_invoice`: both or neither. Its `invoice` stays NULL, which
+/// names one its hub's gateway pays. No lock of an older file names one.
+const VIA: &str = "
+ALTER TABLE locks ADD COLUMN via TEXT;
+ALTER TABLE locks ADD COLUMN via_invoice TEXT;
+";
 
 /// Version 9: a privacy rest starts when a note finishes unlinking, not
 /// when it was received. Existing unlinked notes have an unknown unlink
