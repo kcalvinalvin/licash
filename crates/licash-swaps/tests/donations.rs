@@ -15,7 +15,7 @@ use licash_lightning::{fake::Fake, HeldState, Node};
 use licash_swaps::{
     Config, DonationState, DonationTerms, Notice, Provider, INVOICE_CLTV, METADATA, SETTLE_MARGIN,
 };
-use licash_wallet::{State, Wallet};
+use licash_wallet::{Response, State, Transport, Wallet};
 use lightning_invoice::{Bolt11Invoice, Bolt11InvoiceDescriptionRef};
 use net::{Conduct, Fault, Link, Net};
 
@@ -475,4 +475,83 @@ async fn open_donations_are_capped() {
     eco.age(&hashes[0], 700);
     eco.follow().await;
     eco.donate(20).await;
+}
+
+/// The test net, and a provider at [`PROVIDER`] answering its info as
+/// `.1`.
+#[derive(Clone)]
+struct Via(Arc<Net>, licash_api::swaps::Info);
+
+const PROVIDER: &str = "http://swaps.test";
+
+impl Transport for Via {
+    fn request(
+        &self,
+        url: &str,
+        body: Option<Vec<u8>>,
+    ) -> impl std::future::Future<Output = Result<Response, String>> + Send {
+        let info = format!("{PROVIDER}{}", licash_api::swaps::SWAPS_INFO);
+        let answer = match url == info {
+            true => Ok(Response {
+                status: 200,
+                body: serde_json::to_vec(&self.1).unwrap(),
+            }),
+            false => self.0.serve(url, body),
+        };
+        std::future::ready(answer)
+    }
+}
+
+#[tokio::test]
+async fn a_wallet_finds_its_static_donation_address_at_a_provider_taking_them() {
+    let eco = Eco::new().await;
+    let info = eco.provider().info().unwrap();
+    let payee = |info: licash_api::swaps::Info| {
+        let path = eco.dir.path().join("payee.sqlite");
+        Wallet::open(&path, Via(eco.net.clone(), info)).unwrap()
+    };
+    let address = payee(info.clone())
+        .donation_address(PROVIDER)
+        .await
+        .unwrap();
+    // Its own code, at the provider's public URL, in an LNURL.
+    let (_, url) = bitcoin::bech32::decode(&address.lnurl).unwrap();
+    let url = String::from_utf8(url).unwrap();
+    assert_eq!(url, format!("{URL}/v1/lnurlp/{}", eco.code));
+    assert_eq!(address.lnurl, address.lnurl.to_uppercase());
+    assert_eq!(
+        (address.donations.fee, address.donations.min),
+        (TERMS.fee, 10)
+    );
+    // It holds 1,000 at the code's hub.
+    assert!(info.hubs[0].max >= TERMS.min, "{info:?}");
+    assert!(address.stocked);
+    // The provider's very URL serves it.
+    assert_eq!(
+        eco.provider().donation_range(&eco.code).unwrap(),
+        (10, 1_000)
+    );
+
+    // Holding too little at the code's hubs: payers refused for now.
+    let mut empty = info.clone();
+    empty.hubs[0].max = 0;
+    let address = payee(empty).donation_address(PROVIDER).await.unwrap();
+    assert!(!address.stocked);
+    // Swapping at none of the payee's hubs, or taking no donations: none.
+    let mut elsewhere = info.clone();
+    elsewhere.hubs.clear();
+    let refused = payee(elsewhere).donation_address(PROVIDER).await;
+    assert!(
+        matches!(refused, Err(licash_wallet::Error::Invalid(_))),
+        "{refused:?}"
+    );
+    let none = licash_api::swaps::Info {
+        donations: None,
+        ..info
+    };
+    let refused = payee(none).donation_address(PROVIDER).await;
+    assert!(
+        matches!(refused, Err(licash_wallet::Error::Invalid(_))),
+        "{refused:?}"
+    );
 }

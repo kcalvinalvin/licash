@@ -274,6 +274,21 @@ fn fes_to_bytes(chars: &[u8]) -> Result<Vec<u8>, Error> {
     Ok(bytes)
 }
 
+/// A wallet's static address of donations through a swap provider
+/// ([`Wallet::donation_address`]).
+#[derive(Clone, Debug)]
+pub struct DonationAddress {
+    /// The LNURL any Lightning wallet pays, upper case.
+    pub lnurl: String,
+    /// What the provider takes donations on.
+    pub donations: licash_api::swaps::Donations,
+    /// Whether it holds enough at a hub of the code now to take the least
+    /// donation: if not, payers are refused until it does.
+    pub stocked: bool,
+    /// The provider's info, as it answered.
+    pub info: licash_api::swaps::Info,
+}
+
 impl LicashCode {
     /// The static LNURL of donations to this code's wallet through the
     /// provider whose public URL is `base` ([`licash_api::swaps::Donations`]):
@@ -521,6 +536,44 @@ impl<T: Transport> Wallet<T> {
                 hubs: ids,
                 locations,
             }),
+        })
+    }
+
+    /// The static address of donations to this wallet through the swap
+    /// provider at `provider`, if it takes them at a hub of the wallet's
+    /// code: its code at the hubs it trusts, the first [`MAX_HUBS`], as
+    /// an LNURL of the provider's ([`LicashCode::lnurl`]). Refused if the
+    /// provider takes no donations, or swaps at none of those hubs.
+    pub async fn donation_address(&self, provider: &str) -> Result<DonationAddress, Error> {
+        let provider = crate::hub_url(provider)?;
+        let info: licash_api::swaps::Info =
+            self.get(&provider, licash_api::swaps::SWAPS_INFO).await?;
+        let Some(donations) = info.donations.clone() else {
+            return Err(Error::Invalid(format!("{provider} takes no donations")));
+        };
+        let trusted = self.hubs()?;
+        let hubs: Vec<String> = trusted.iter().map(|(url, _)| url.clone()).collect();
+        let hubs = &hubs[..hubs.len().min(MAX_HUBS)];
+        let code = self
+            .payment_code(hubs, false)?
+            .licash
+            .expect("a Licash code");
+        let at: Vec<&licash_api::swaps::Hub> = info
+            .hubs
+            .iter()
+            .filter(|h| code.hubs.contains(&HubId::of(&h.address)))
+            .collect();
+        if at.is_empty() {
+            return Err(Error::Invalid(format!(
+                "{provider} swaps at none of the hubs you trust"
+            )));
+        }
+        let stocked = at.iter().any(|h| h.max >= donations.min);
+        Ok(DonationAddress {
+            lnurl: code.lnurl(&donations.url),
+            stocked,
+            donations,
+            info,
         })
     }
 
