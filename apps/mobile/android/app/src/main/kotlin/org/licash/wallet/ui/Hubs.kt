@@ -37,6 +37,7 @@ import org.licash.wallet.Ui
 import org.licash.wallet.explain
 import org.licash.wallet.digits
 import org.licash.wallet.feeOf
+import org.licash.wallet.percent
 import org.licash.wallet.sat
 
 /*
@@ -128,11 +129,36 @@ internal fun HubFees(
         }
         hub.contracts?.let {
             Group("Protection") {
-                Entry("Price", value = feeOf(it.price, it.cap))
-                Divider()
-                Entry("Covers up to", value = sat(it.cap))
-                Divider()
-                Entry("For", value = span(it.blocks.toLong()))
+                // Terms chosen within its range, priced by cap and length;
+                // else its one fixed contract.
+                val range = it.range
+                if (range != null) {
+                    Entry(
+                        "Price",
+                        value = "${sat(range.base)} + ${percent(range.ppmYear.toULong())} a year",
+                        sub = "of what it covers",
+                        tag = "protection-price",
+                    )
+                    Divider()
+                    Entry(
+                        "Covers",
+                        value = between(range.minCap, range.maxCap),
+                        sub = "Up to ${range.perCoin} times the coin paying for it",
+                        tag = "protection-cap",
+                    )
+                    Divider()
+                    Entry(
+                        "For",
+                        value = "${span(range.minBlocks.toLong())} to ${span(range.maxBlocks.toLong())}",
+                        tag = "protection-for",
+                    )
+                } else {
+                    Entry("Price", value = feeOf(it.price, it.cap))
+                    Divider()
+                    Entry("Covers up to", value = sat(it.cap), tag = "protection-cap")
+                    Divider()
+                    Entry("For", value = span(it.blocks.toLong()))
+                }
             }
         }
         if (full) {
