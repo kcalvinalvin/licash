@@ -612,7 +612,7 @@ private fun Providers(load: suspend () -> Result<List<Offer>>) {
                 if (o.current) {
                     Text("Chosen", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
                 } else {
-                    TextButton(onClick = o.choose) { Text("Use") }
+                    TextButton(onClick = o.choose, modifier = Modifier.testTag("use ${o.name}")) { Text("Use") }
                 }
             }
         }

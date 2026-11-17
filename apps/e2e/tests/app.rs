@@ -229,6 +229,65 @@ async fn lightning(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Paid an invoice of the node outside through the swap provider, chosen
+/// in advanced mode over its hub's gateway: the provider's node pays it for
+/// a lock of the app's notes at hub 1, and claims the lock with the
+/// preimage. The confirm screen names the provider and how long the sats
+/// would wait should it not pay; the history, who paid it.
+async fn paid_through_provider(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
+    let before = phone.balance().await?;
+    let (request, hash) = eco.invoice(OUTSIDE, 2_000).await?;
+    phone.link(&format!("lightning:{request}")).await?;
+    phone.tagged("paying", "2,000 sat", 120).await?;
+    // Every way to pay it: hub 1's gateway and the provider, announced as
+    // "swaps"; the provider chosen, unless it was already, the cheapest.
+    phone.tap_id("providers").await?;
+    phone.wait("swaps", 120).await?;
+    if phone.has("use swaps").await? {
+        phone.tap_id("use swaps").await?;
+    }
+    phone.tagged("through", "swaps", 30).await?;
+    let wait = phone.by_id("refund-wait", 10).await?;
+    ensure!(
+        wait.text.contains("declines or fails"),
+        "{:?} said of a payment the provider may not make",
+        wait.text
+    );
+    phone.tagged("arrives", "In seconds", 10).await?;
+    phone.tap_id("confirm").await?;
+    // Paid at once, or under way while the provider pays.
+    let result = until("the payment's result", 60, || async {
+        let views = phone.views().await?;
+        let result = views.into_iter().find(|v| v.id == "result");
+        Ok(result.filter(|v| v.text.starts_with("Paid") || v.text == "Under way"))
+    })
+    .await?;
+    eprintln!("paying through the provider: {:?}", result.text);
+    phone.tap_id("done").await?;
+    until("the outside invoice settled", 180, || async {
+        let (state, _) = eco.invoice_state(OUTSIDE, &hash).await?;
+        Ok((state == "SETTLED").then_some(()))
+    })
+    .await?;
+    phone.back_to("receive").await?;
+    // Less what it asked and fees of a few sat, once the lock's change is
+    // back in the balance.
+    let after = until("the balance less the payment", 60, || async {
+        let now = phone.balance().await?;
+        Ok((now < before - 2_000 && now > before - 2_100).then_some(now))
+    })
+    .await?;
+    eprintln!("{after} held after paying 2000 through the provider from {before}");
+    // Claimed by the provider with the preimage: paid, through it.
+    opened(phone, "Paid over Lightning").await?;
+    phone.tagged("state", "Paid", 180).await?;
+    let through = phone.by_id("through", 10).await?;
+    eprintln!("paid through {:?}", through.text);
+    phone.back().await?;
+    phone.back_to("receive").await?;
+    Ok(())
+}
+
 /// Collect Bob's mailbox, for up to `secs`, until it holds payments: their
 /// sum.
 async fn collected(bob: &licash_e2e::Wallet, secs: u64) -> anyhow::Result<u64> {
@@ -363,6 +422,7 @@ async fn used(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     contact(phone, &bob).await?;
 
     lightning(eco, phone).await?;
+    paid_through_provider(eco, phone).await?;
     refused(eco, phone, &bobs).await?;
     hub_down(eco, phone, &bob, &bobs).await?;
     found_hubs(phone).await?;
