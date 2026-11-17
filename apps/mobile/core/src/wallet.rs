@@ -1452,7 +1452,7 @@ impl Wallet {
     pub fn move_to_licash(&self, chain: Arc<dyn ChainSource>) -> Result<Activity, LicashError> {
         let mut keep: Vec<OutPoint> = self.kept_coins()?.into_iter().map(|(c, _)| c).collect();
         keep.extend(self.opening_coins()?);
-        self.move_keeping(chain, &keep, None)
+        self.move_keeping(chain, &keep)
     }
 
     /// [`Wallet::move_to_licash`] of the largest of all the coins, those
@@ -1462,7 +1462,7 @@ impl Wallet {
         &self,
         chain: Arc<dyn ChainSource>,
     ) -> Result<Activity, LicashError> {
-        self.move_keeping(chain, &self.opening_coins()?, None)
+        self.move_keeping(chain, &self.opening_coins()?)
     }
 }
 
@@ -1548,20 +1548,14 @@ impl Wallet {
         Ok(moving)
     }
 
-    pub(super) fn move_keeping(
+    fn move_keeping(
         &self,
         chain: Arc<dyn ChainSource>,
         keep: &[OutPoint],
-        to: Option<&str>,
     ) -> Result<Activity, LicashError> {
         let hubs = self.wallet.hubs()?.into_iter();
-        let mut taking: Vec<(String, licash_api::Deposits)> =
-            hubs.filter_map(|(u, i)| Some((u, i.deposits?))).collect();
-        // `to` first, if it takes them.
-        taking.sort_by_key(|(u, _)| {
-            Some(u.trim_end_matches('/')) != to.map(|t| t.trim_end_matches('/'))
-        });
-        let Some((hub, offer)) = taking.into_iter().next() else {
+        let mut taking = hubs.filter_map(|(u, i)| Some((u, i.deposits?)));
+        let Some((hub, offer)) = taking.next() else {
             return Err(LicashError::invalid(
                 "no hub trusted takes coins on Bitcoin",
             ));
