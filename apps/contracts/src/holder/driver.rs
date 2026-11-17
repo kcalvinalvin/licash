@@ -23,6 +23,10 @@ const RETRY: Duration = Duration::from_secs(2);
 /// How many times to ask a working hub again before trying later.
 const PATIENCE: u32 = 900;
 
+/// How many instances are uploaded beside each other, each on a circuit
+/// of its own over Tor: one carries only so much.
+const UPLOADS: usize = 3;
+
 /// What an opening sent to and got from its hub since this process
 /// started driving it, in bytes, and since when: its speed. Kept in
 /// memory only, lost with the process, which says nothing of it then.
@@ -121,26 +125,13 @@ impl<T: Transport, C: Chain> Driver<'_, T, C> {
                     }
                 }
                 Out::Serve { i } => {
-                    let holder = self.holder.take().expect("a holder between steps");
-                    let (holder, bytes) = tokio::task::spawn_blocking(move || {
-                        let bytes = holder.instance(i);
-                        (holder, bytes)
-                    })
-                    .await?;
-                    self.holder = Some(holder);
-                    let bytes = bytes?;
-                    let serves = queue.iter().filter(|o| matches!(o, Out::Serve { .. }));
-                    expect(&self.id, 1 + serves.count(), bytes.len());
-                    let message = Envelope {
-                        id: self.id,
-                        kind: Kind::Instance,
-                        body: wire::Instance { i, bytes }.encode(),
+                    // With those after it, sent beside each other.
+                    let mut batch = vec![i];
+                    while let Some(&Out::Serve { i }) = queue.front() {
+                        batch.push(i);
+                        queue.pop_front();
                     }
-                    .to_bytes();
-                    let frames = self.post(message).await?;
-                    // The hub has it: not sent again if the opening resumes.
-                    self.store.served(&self.id, i)?;
-                    for frame in frames {
+                    for frame in self.serve(batch).await? {
                         let Frame::Message(bytes) = frame;
                         queue.extend(self.step(Input::Message(bytes)).await?);
                     }
@@ -305,26 +296,71 @@ impl<T: Transport, C: Chain> Driver<'_, T, C> {
         }
     }
 
+    /// Her instances `batch` built and uploaded, [`UPLOADS`] at a time:
+    /// the hub's answers to them, once all are, or the first failure. Each
+    /// the hub answered is kept as served, whatever the others do.
+    async fn serve(&mut self, batch: Vec<u32>) -> Result<Vec<Frame>> {
+        use futures_util::StreamExt as _;
+        let holder = std::sync::Arc::new(self.holder.take().expect("a holder between steps"));
+        let (id, total) = (self.id, batch.len());
+        let this = &*self;
+        let uploads = futures_util::stream::iter(batch).map(|i| {
+            let holder = holder.clone();
+            async move {
+                let built = tokio::task::spawn_blocking(move || holder.instance(i)).await;
+                let bytes = built.map_err(|e| anyhow!(e))??;
+                expect(&id, total, bytes.len());
+                let message = Envelope {
+                    id,
+                    kind: Kind::Instance,
+                    body: wire::Instance { i, bytes }.encode(),
+                }
+                .to_bytes();
+                let frames = this.send(message).await?;
+                // The hub has it: not sent again if the opening resumes.
+                this.store.served(&id, i)?;
+                Ok::<_, anyhow::Error>(frames)
+            }
+        });
+        let answers: Vec<Result<Vec<Frame>>> = uploads.buffer_unordered(UPLOADS).collect().await;
+        let holder = std::sync::Arc::try_unwrap(holder);
+        self.holder = Some(holder.unwrap_or_else(|_| unreachable!("every upload done")));
+        let mut frames = Vec::new();
+        for answer in answers {
+            frames.extend(answer?);
+        }
+        Ok(frames)
+    }
+
     /// POST `message` to the hub: its answer, asked again while it works.
     async fn post(&mut self, message: Vec<u8>) -> Result<Vec<Frame>> {
-        let (url, body) = match self.quote.take() {
-            Some(quote) if matches!(Kind::peek(&message), Some(Kind::Open)) => {
+        if let Some(quote) = self.quote.take() {
+            if matches!(Kind::peek(&message), Some(Kind::Open)) {
                 let opening = Opening {
                     quote,
                     open: message,
                 };
-                (format!("{}{OPEN}", self.hub), opening.encode())
+                let url = format!("{}{OPEN}", self.hub);
+                return self.ask(url, opening.encode()).await;
             }
-            _ => {
-                let route = if Kind::peek(&message) == Some(Kind::Instance) {
-                    INSTANCE
-                } else {
-                    STEP
-                };
-                let path = route.replace("{id}", &crate::hex_id(&self.id));
-                (format!("{}{path}", self.hub), message)
-            }
+        }
+        self.send(message).await
+    }
+
+    /// POST `message`, of an opening under way, to the hub: its answer,
+    /// asked again while it works.
+    async fn send(&self, message: Vec<u8>) -> Result<Vec<Frame>> {
+        let route = if Kind::peek(&message) == Some(Kind::Instance) {
+            INSTANCE
+        } else {
+            STEP
         };
+        let path = route.replace("{id}", &crate::hex_id(&self.id));
+        self.ask(format!("{}{path}", self.hub), message).await
+    }
+
+    /// POST `body` to `url`: the hub's answer, asked again while it works.
+    async fn ask(&self, url: String, body: Vec<u8>) -> Result<Vec<Frame>> {
         let started = Instant::now();
         for _ in 0..PATIENCE {
             let request = Some(body.clone());

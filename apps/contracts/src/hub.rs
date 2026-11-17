@@ -488,7 +488,8 @@ pub fn router(openings: Arc<Openings>) -> Router {
         .route(QUOTE, get(quote).layer(budget(2, REQUEST_TIME)))
         .route(OPEN, post(open).layer(budget(2, REQUEST_TIME)))
         .route(STEP, post(step).layer(budget(2, REQUEST_TIME)))
-        .route(INSTANCE, post(instance).layer(budget(4, INSTANCE_TIME)))
+        // A holder uploads three at a time: two holders at once.
+        .route(INSTANCE, post(instance).layer(budget(6, INSTANCE_TIME)))
         .route(FOLD, post(offer_fold).layer(budget(2, REQUEST_TIME)))
         .route(FOLD_SIGN, post(sign_fold).layer(budget(2, REQUEST_TIME)))
         .layer(DefaultBodyLimit::max(MAX_BODY))

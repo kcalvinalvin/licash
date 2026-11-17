@@ -201,8 +201,10 @@ impl Transport for Http {
         url: &str,
         body: Option<Vec<u8>>,
     ) -> impl std::future::Future<Output = Result<Response, String>> + Send {
+        // A large body on circuits of its own, as a download: sent beside
+        // others to the same host.
         let timeout = body.as_ref().and_then(|b| sending(b.len()));
-        self.exchange(url, body, MAX_ANSWER, timeout, false)
+        self.exchange(url, body, MAX_ANSWER, timeout, timeout.is_some())
     }
 
     fn download(
