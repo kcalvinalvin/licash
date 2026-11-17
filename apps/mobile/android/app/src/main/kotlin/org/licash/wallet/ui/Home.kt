@@ -47,6 +47,7 @@ import org.licash.core.Activity
 import org.licash.wallet.Engine
 import org.licash.wallet.Ui
 import org.licash.wallet.digits
+import org.licash.wallet.sat
 import org.licash.wallet.total
 
 /**
@@ -114,6 +115,7 @@ fun Home(
             } else {
                 Total(ui) { money(null) }
                 Going(engine, ui, money, history, open)
+                Offer(engine, ui)
                 // A new wallet's first catching up: each step, as it goes.
                 if (ui.history.isEmpty() && catchingUp(ui)) {
                     Spacer(Modifier.height(16.dp))
@@ -215,6 +217,26 @@ private fun Going(engine: Engine, ui: Ui, money: (String?) -> Unit, history: () 
     )
     why?.let { Sheet("Not up to date", dismiss = { why = null }) { Say(it) } }
     if (steps) Sheet("Catching up", dismiss = { steps = false }) { SyncStages(engine, ui) }
+}
+
+/**
+ * The protection offered for what was paid on Bitcoin, to pay with it
+ * once protected: until accepted, declined or being opened.
+ */
+@Composable
+private fun Offer(engine: Engine, ui: Ui) {
+    val q = ui.offer?.takeIf { !ui.offerDeclined && ui.opening == null } ?: return
+    val coin = q.coins.firstOrNull() ?: return
+    var choosing by remember(q) { mutableStateOf(false) }
+    Spacer(Modifier.height(8.dp))
+    Pill(
+        icon = Glyphs.shield,
+        text = "Protect ${sat(coin.value)} to pay with it",
+        tint = MaterialTheme.colorScheme.primary,
+        tag = "offer",
+        onClick = { choosing = true },
+    )
+    if (choosing) OfferSheet(engine, q) { choosing = false }
 }
 
 /**

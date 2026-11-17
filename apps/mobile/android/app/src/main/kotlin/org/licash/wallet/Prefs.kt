@@ -41,6 +41,11 @@ class Prefs(context: Context) {
         get() = prefs.getBoolean("tor", network != Network.REGTEST)
         set(on) = prefs.edit().putBoolean("tor", on).apply()
 
+    /** The coin on Bitcoin (`txid:vout`) whose offer of protection was last declined, if any. */
+    var offerDeclined: String?
+        get() = prefs.getString("offer_declined", null)
+        set(coin) = prefs.edit().putString("offer_declined", coin).apply()
+
     /** Whether [tor] was set rather than the default. */
     val torChosen: Boolean
         get() = prefs.contains("tor")

@@ -31,6 +31,7 @@ import org.licash.core.DepositCoin
 import org.licash.core.contractMaxCap
 import org.licash.core.contractPrice
 import org.licash.wallet.Chosen
+import org.licash.wallet.Engine
 import org.licash.wallet.sat
 import org.licash.wallet.share
 import kotlin.math.exp
@@ -42,10 +43,37 @@ import kotlin.math.pow
 import kotlin.math.roundToLong
 
 /**
+ * The protection offered for what was paid on Bitcoin ([org.licash.wallet.Ui.offer]),
+ * as [ChooseSheet]: opened once accepted, or declined so it is not offered
+ * unasked again. None if no coin pays one within its hub's range.
+ */
+@Composable
+internal fun OfferSheet(engine: Engine, q: ContractQuote, dismiss: () -> Unit) {
+    val range = q.range ?: return
+    val paying = q.coins.filter { contractMaxCap(range, it.value) != null }
+    if (paying.isEmpty()) return
+    ChooseSheet(
+        q,
+        range,
+        paying,
+        open = { chosen, price ->
+            dismiss()
+            engine.openContract(q.hub, price, chosen)
+        },
+        dismiss = dismiss,
+        decline = {
+            engine.declineOffer(q)
+            dismiss()
+        },
+    )
+}
+
+/**
  * Protection of terms chosen within what its hub allows: how much it
  * covers and for how long, at first as `q` suggests, priced as the hub
  * prices them; which of `coins` pays, if there are several, and whether
- * what is left of it joins the balance once paid.
+ * what is left of it joins the balance once paid: at first only if it
+ * covers all of it. Offered unasked, it can be declined.
  */
 @Composable
 internal fun ChooseSheet(
@@ -54,16 +82,17 @@ internal fun ChooseSheet(
     coins: List<DepositCoin>,
     open: (Chosen, price: ULong) -> Unit,
     dismiss: () -> Unit,
+    decline: (() -> Unit)? = null,
 ) {
     val colors = MaterialTheme.colorScheme
     val download = android.text.format.Formatter.formatShortFileSize(LocalContext.current, q.download.toLong())
     var coin by remember(q) { mutableStateOf(coins.first()) }
     var cap by remember(q) { mutableStateOf(q.suggestedCap) }
     var blocks by remember(q) { mutableStateOf(q.suggestedBlocks.coerceIn(range.minBlocks, range.maxBlocks)) }
-    var moveChange by remember(q) { mutableStateOf(true) }
     val most = contractMaxCap(range, coin.value) ?: range.minCap
     val capped = cap.coerceIn(range.minCap, most)
     val price = contractPrice(range, capped, blocks)
+    var moveChange by remember(q) { mutableStateOf(changeCovered(coin.value, price, capped)) }
     val pays = coin.value > price
     val change = if (pays) coin.value - price else 0uL
     // It stops protecting a little before it ends.
@@ -134,13 +163,34 @@ internal fun ChooseSheet(
             )
         }
         Line("Takes", "Up to an hour, $download")
+        Text(
+            DUTY,
+            modifier = Modifier.padding(vertical = 8.dp).testTag("contract-duty"),
+            style = MaterialTheme.typography.bodySmall,
+            color = colors.onSurfaceVariant,
+        )
         Worth(q.mock)
         Spacer(Modifier.height(8.dp))
         BigButton("Protect for ${sat(price)}", Modifier.fillMaxWidth().testTag("protect"), enabled = pays) {
             open(Chosen(capped, blocks, coin.outpoint, pays && moveChange), price)
         }
+        decline?.let {
+            Spacer(Modifier.height(8.dp))
+            BigButton("Not now", Modifier.fillMaxWidth().testTag("decline-offer"), quiet = true, onClick = it)
+        }
     }
 }
+
+/** What protection asks of its owner, said before it is paid for. */
+internal const val DUTY = "Open Licash now and then, and before it ends: what it protects " +
+    "is recovered by this app, and is safe after it ends only once cashed out or protected again."
+
+/**
+ * Whether what is left of a coin of `coin` sat paying `price` for
+ * protection of up to `cap` sat, moved into the balance, is all
+ * protected: only then is it moved by default.
+ */
+internal fun changeCovered(coin: ULong, price: ULong, cap: ULong): Boolean = coin > price && coin - price <= cap
 
 /**
  * The cap at `position`, from 0 to 1, of a slider from `least` to `most`

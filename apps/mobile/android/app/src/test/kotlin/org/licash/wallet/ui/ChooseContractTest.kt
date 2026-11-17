@@ -1,6 +1,7 @@
 package org.licash.wallet.ui
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -38,6 +39,18 @@ class ChooseContractTest {
         }
         // Evenly by ratio: halfway is about the geometric mean, not the middle.
         assertEquals(290_000uL, capAt(0.5f, least, most))
+    }
+
+    @Test
+    fun the_rest_of_the_coin_joins_the_balance_by_default_only_if_all_protected() {
+        // The 10,000,000 sat coin, protecting 15,000,000 for 98,000 sat.
+        assertTrue(changeCovered(10_000_000uL, 98_000uL, 15_000_000uL))
+        assertTrue(changeCovered(10_000_000uL, 98_000uL, 9_902_000uL))
+        // Past the cap, it would not all be protected: it stays on Bitcoin.
+        assertFalse(changeCovered(10_000_000uL, 98_000uL, 9_901_999uL))
+        // Nothing left of the coin, or too little to pay it: none to move.
+        assertFalse(changeCovered(98_000uL, 98_000uL, 15_000_000uL))
+        assertFalse(changeCovered(50_000uL, 98_000uL, 15_000_000uL))
     }
 
     @Test

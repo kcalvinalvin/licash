@@ -80,7 +80,7 @@ fun Money(
         when (at) {
             null -> TopBar("Balance", back)
             ON_BITCOIN -> TopBar("On Bitcoin", back = { go(null) }) {
-                Info("On Bitcoin", "Bitcoin you hold yourself. Add it to your balance to pay with it.")
+                Info("On Bitcoin", "Bitcoin you hold yourself. Protect it to add it to your balance and pay with it.")
             }
             else -> TopBar(name(at), back = { go(null) })
         }
@@ -201,13 +201,18 @@ private fun Share(icon: ImageVector, tint: Color, label: String, amount: ULong, 
     }
 }
 
-/** What is held on Bitcoin, by where it stands, and what is on its way. */
+/**
+ * What is held on Bitcoin, by where it stands, and what is on its way: to
+ * protect, as offered ([Ui.offer]), or to add to the balance unprotected,
+ * once warned.
+ */
 @Composable
 private fun OnBitcoin(engine: Engine, ui: Ui, fail: (String) -> Unit) {
     val b = ui.balance
     val scope = rememberCoroutineScope()
     val coming = ui.incoming.sumOf { it.amount }
-    val waiting = if (b.onchain > b.kept) b.onchain - b.kept else 0uL
+    var choosing by remember { mutableStateOf(false) }
+    var warned by remember { mutableStateOf(false) }
     Text(
         sat(b.onchain + b.moving + b.opening),
         modifier = Modifier.padding(horizontal = 4.dp, vertical = 8.dp),
@@ -215,8 +220,7 @@ private fun OnBitcoin(engine: Engine, ui: Ui, fail: (String) -> Unit) {
     )
     // What each is called, how much, and its tag for the tests.
     val rows = listOf(
-        Triple("Kept here", b.kept, "kept"),
-        Triple("Waiting to be added", waiting, "waiting"),
+        Triple("Kept here", b.onchain, "kept"),
         Triple("Being added", b.moving, "moving"),
         Triple("Change coming back", b.opening, "change"),
         Triple("Arriving", coming, "coming"),
@@ -228,10 +232,27 @@ private fun OnBitcoin(engine: Engine, ui: Ui, fail: (String) -> Unit) {
             Line(label, sat(amount), tag = tag)
         }
     }
-    if (b.kept > 0uL && b.moving == 0uL) {
+    val offer = ui.offer?.takeIf { ui.opening == null }
+    if (offer != null) {
         Spacer(Modifier.height(20.dp))
-        BigButton("Add to balance", Modifier.fillMaxWidth().testTag("move-in")) {
-            scope.launch { engine.moveAll().onFailure { fail(explain(it)) } }
+        BigButton("Protect and add to balance", Modifier.fillMaxWidth().testTag("offer-protect")) { choosing = true }
+    }
+    if (b.onchain > 0uL && b.moving == 0uL) {
+        Spacer(Modifier.height(if (offer != null) 8.dp else 20.dp))
+        BigButton("Add without protection", Modifier.fillMaxWidth().testTag("move-in"), quiet = true) { warned = true }
+    }
+    if (choosing && offer != null) OfferSheet(engine, offer) { choosing = false }
+    if (warned) {
+        Sheet("Not protected", dismiss = { warned = false }) {
+            Say(UNPROTECTED_MOVE)
+            BigButton("Add anyway", Modifier.fillMaxWidth().testTag("move-in-anyway"), danger = true) {
+                warned = false
+                scope.launch { engine.moveAll().onFailure { fail(explain(it)) } }
+            }
         }
     }
 }
+
+/** What adding Bitcoin to the balance with no protection risks. */
+internal const val UNPROTECTED_MOVE = "In your balance, it is held at your hub: if the hub fails or " +
+    "refuses to pay, it is lost. Protection recovers it on Bitcoin instead. Keep it here, or protect it first."

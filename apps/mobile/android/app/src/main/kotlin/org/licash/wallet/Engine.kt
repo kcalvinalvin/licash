@@ -93,6 +93,12 @@ data class Ui(
     val recoveries: List<Recovery> = emptyList(),
     /** The hub a contract is being opened at, while one is. */
     val opening: String? = null,
+    /**
+     * The contract offered for what was paid on Bitcoin, if any: opened only
+     * once its owner accepts it, and not offered unasked once `offerDeclined`.
+     */
+    val offer: ContractQuote? = null,
+    val offerDeclined: Boolean = false,
     /** Where each line of the history under way stands, by [key]. */
     val under: Map<String, Details> = emptyMap(),
     /** How closely what is under way is watched, out of sight too. */
@@ -148,9 +154,8 @@ data class Chosen(val cap: ULong, val blocks: UInt, val coin: String, val moveCh
 /**
  * The wallet and the light client, and the loop keeping them in step while
  * the app is in sight, or out of sight while a payment is under way (see
- * [Watch]): looking for payments on Bitcoin, moving them into Licash once
- * there is enough, finishing what is under way and taking what arrives in
- * the mailbox. Every wallet call is on an IO thread; those
+ * [Watch]): looking for payments on Bitcoin, offering to protect them,
+ * finishing what is under way and taking what arrives in the mailbox. Every wallet call is on an IO thread; those
  * reaching the network or changing what the wallet holds one at a time,
  * those reading it alongside.
  */
@@ -216,6 +221,10 @@ class Engine(context: Context) {
 
     /** The coins on Bitcoin and payments on their way already told of. */
     private var told: MutableSet<String>? = null
+
+    /** What was on Bitcoin when a contract was last looked for to offer, and when, in ms. */
+    private var offeredFor: ULong? = null
+    private var offeredAt = 0L
 
     /** How the light client stood when last logged. */
     private var logged: ChainStatus? = null
@@ -471,9 +480,10 @@ class Engine(context: Context) {
         // Only with every coin found: a partial look could move part.
         if (caughtUp) {
             try {
-                move(chain)
+                moveChanges(chain)
+                offer()
             } catch (e: LicashException) {
-                failed("moving into Licash", e)
+                failed("looking for protection to offer", e)
             }
         }
         // Common SDK guards handle privacy rest, fee ceilings and the
@@ -541,11 +551,12 @@ class Engine(context: Context) {
     }
 
     /**
-     * Move what was paid on Bitcoin into Licash, all at once, once it is
-     * enough: but what was cashed out to this wallet, which stays.
+     * Move the change of contracts opened to move it, once their funding
+     * confirms. Nothing else on Bitcoin moves unasked: notes no contract
+     * protects are the hub's to lose, so a contract is offered instead
+     * ([offer]), and only its owner moves the rest.
      */
-    private suspend fun move(chain: GoChain) {
-        // The change of contracts opened to move it, once their funding confirms.
+    private suspend fun moveChanges(chain: GoChain) {
         try {
             for (moving in locked { it.moveChanges(chain) }) {
                 AppLog.info("moving ${moving.amount} sat of a contract's change into Licash")
@@ -554,15 +565,38 @@ class Engine(context: Context) {
         } catch (e: LicashException) {
             AppLog.warn("moving a contract's change into Licash", e)
         }
+    }
+
+    /**
+     * Look for a contract to offer for what was paid on Bitcoin, to protect
+     * it once in the balance ([Ui.offer]): again once what is there
+     * changes, or every [OFFER_MS]. None for what was cashed out to this
+     * wallet, which stays, nor while one is being opened.
+     */
+    private suspend fun offer() {
         val balance = local { it.balance() }
-        if (balance.onchain <= balance.kept || balance.moving > 0uL) return
-        try {
-            val moving = locked { it.moveToLicash(chain) }
-            AppLog.info("moving ${moving.amount} sat into Licash")
-            notices.tryEmit(Event("Adding ${sat(moving.amount)} to your balance"))
-        } catch (_: LicashException.Insufficient) {
-            // Too little for the hub yet: more payments may come.
+        if (balance.onchain <= balance.kept || state.value.opening != null) {
+            state.update { it.copy(offer = null) }
+            return
         }
+        val now = System.currentTimeMillis()
+        if (balance.onchain == offeredFor && now - offeredAt < OFFER_MS) return
+        val offer = try {
+            local { it.contractOffer() }
+        } catch (e: LicashException) {
+            AppLog.info("no contract to offer now: ${explain(e)}")
+            return
+        }
+        offeredFor = balance.onchain
+        offeredAt = now
+        AppLog.info(offer?.let { "offering a contract at ${it.hub} of ${it.suggestedCap} sat" } ?: "no contract to offer")
+        state.update { it.copy(offer = offer, offerDeclined = offerDeclined(offer, prefs.offerDeclined)) }
+    }
+
+    /** Not to offer `q` again unasked: its coin's offers are declined. */
+    fun declineOffer(q: ContractQuote) {
+        prefs.offerDeclined = offeredCoin(q) ?: return
+        state.update { it.copy(offerDeclined = true) }
     }
 
     /**
@@ -1099,7 +1133,7 @@ class Engine(context: Context) {
         var started = false
         state.update {
             started = it.opening == null
-            if (started) it.copy(opening = hub) else it
+            if (started) it.copy(opening = hub, offer = null) else it
         }
         if (!started) return
         AppLog.info("opening a contract at $hub${chosen?.let { " of ${it.cap} sat over ${it.blocks} blocks" } ?: ""}")
@@ -1121,6 +1155,8 @@ class Engine(context: Context) {
                 AppLog.warn("opening a contract at $hub", e)
                 notices.tryEmit(Event("Protection not set up. ${explain(e)}"))
             } finally {
+                // What is left on Bitcoin is offered for afresh.
+                offeredFor = null
                 state.update { it.copy(opening = null) }
                 refresh()
                 poke()
@@ -1319,5 +1355,13 @@ class Engine(context: Context) {
         private const val AWAY_MS = 60_000L
         private const val PROVIDERS_MS = 15 * 60_000L
         private const val PROVIDERS_RETRY_MS = 2 * 60_000L
+        private const val OFFER_MS = 30 * 60_000L
     }
 }
+
+/** The coin `q` is offered for, by its outpoint: its largest. */
+internal fun offeredCoin(q: ContractQuote): String? = q.coins.firstOrNull()?.outpoint
+
+/** Whether the offer `q` was declined: its coin's, `declined` the coin last declined. */
+internal fun offerDeclined(q: ContractQuote?, declined: String?): Boolean =
+    q != null && declined != null && offeredCoin(q) == declined
