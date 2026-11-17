@@ -287,74 +287,6 @@ pub fn give_up(wallet: &Wallet<Http>, path: &Path, id: &str) -> anyhow::Result<(
     recovery::give_up(wallet, dir(path), &id)
 }
 
-/// The statement to prove of contract `id`, written to `out` (default:
-/// `<id>.statement.input` here, its id's first 16 digits), and how to
-/// prove it elsewhere and bring the proof back.
-pub fn statement(path: &Path, id: &str, out: Option<&Path>, json: bool) -> anyhow::Result<()> {
-    let id = contract_id(path, id)?;
-    let bytes = recovery::statement(dir(path), &id)?;
-    let short = &licash_contracts::hex_id(&id)[..16];
-    let out = out.map_or_else(
-        || std::path::PathBuf::from(format!("{short}.statement.input")),
-        Path::to_path_buf,
-    );
-    let mut file = std::fs::OpenOptions::new();
-    file.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut file, 0o600);
-    let mut file = file
-        .open(&out)
-        .with_context(|| format!("{}", out.display()))?;
-    std::io::Write::write_all(&mut file, &bytes)?;
-    file.sync_all()?;
-    let deadline = recovery::recoveries(dir(path))?
-        .into_iter()
-        .find(|r| r.id == id)
-        .and_then(|r| r.deadline);
-    let by = deadline.map_or_else(String::new, |d| format!(" before block {d}"));
-    let at = out.display();
-    let text = format!(
-        "wrote {at} ({} bytes), the statement the wallet's proof is of. It shows the wallet's \
-         notes: keep it private.\n\
-         Prove it on a machine with RISC Zero's prover (16 GB of memory; x86 with Docker for \
-         the second step), each step carried on where it stopped if run again:\n  \
-         licash-r0 native-prove-succinct {at}\n  \
-         licash-r0 native-wrap {at}.proof/receipt proof.json\n\
-         Then bring the proof back{by}:\n  \
-         licash-wallet import-proof {short} proof.json --chain CHAIN",
-        bytes.len(),
-    );
-    let value = json!({
-        "id": licash_contracts::hex_id(&id),
-        "statement": at.to_string(),
-        "bytes": bytes.len(),
-        "deadline": deadline,
-    });
-    show(json, value, text);
-    Ok(())
-}
-
-/// Bring back the proof of contract `id`'s claim from `file`: checked,
-/// kept, and asserted on Bitcoin at once, its fees at `fee_rate` sat/vB
-/// [default: the chain's estimate].
-pub async fn import_proof(
-    wallet: &Wallet<Http>,
-    path: &Path,
-    chain: Option<&str>,
-    id: &str,
-    file: &Path,
-    fee_rate: Option<u64>,
-    json: bool,
-) -> anyhow::Result<()> {
-    let chain = node(chain)?;
-    let id = contract_id(path, id)?;
-    let export = std::fs::read(file).with_context(|| format!("{}", file.display()))?;
-    let rate = crate::onchain::rate(&chain.0, fee_rate).await?;
-    let r = recovery::import_proof(wallet, &chain, dir(path), &id, &export, rate).await?;
-    show(json, recovery_json(&r), recovery_line(&r));
-    Ok(())
-}
-
 fn recovery_line(r: &Recovery) -> String {
     let mut line = format!(
         "{}  {}  claims {} sat in {} notes",
@@ -366,11 +298,14 @@ fn recovery_line(r: &Recovery) -> String {
     if let Some(at) = r.next_at {
         line.push_str(&format!("  next step at block {at}"));
     }
-    if r.stage == recovery::Stage::Proving {
+    if r.stage == recovery::Stage::Answered {
         let by = r
             .deadline
             .map_or_else(String::new, |d| format!(" by block {d}"));
-        line.push_str(&format!("  its proof needed{by}: see recovery-statement"));
+        let owed = r
+            .corrected
+            .map_or_else(String::new, |c| format!(" {c} sat owed,"));
+        line.push_str(&format!("  the hub says{owed} to prove{by}"));
     }
     if let Some(error) = &r.error {
         line.push_str(&format!("  ({error})"));

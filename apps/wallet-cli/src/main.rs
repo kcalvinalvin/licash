@@ -450,27 +450,6 @@ enum Command {
     /// Give up forcing contract ID closed, its notes back to the wallet:
     /// only before its request is signed.
     GiveUpRecovery { id: String },
-    /// The statement to prove of contract ID, forced closed and answered
-    /// by its hub: written to a file, with how to prove it on another
-    /// machine and bring the proof back with `import-proof`.
-    RecoveryStatement {
-        id: String,
-        /// Where to write it [default: ID.statement.input here].
-        #[arg(long)]
-        out: Option<PathBuf>,
-    },
-    /// Bring back the proof of contract ID's claim from FILE, as
-    /// `licash-r0 native-wrap` wrote it: checked, kept, and asserted on
-    /// Bitcoin at once. Run `recoveries --chain` until it is done.
-    ImportProof {
-        id: String,
-        file: PathBuf,
-        /// Its fees' rate, in sat/vB [default: the chain's estimate].
-        #[arg(long)]
-        fee_rate: Option<u64>,
-        #[arg(long, env = "LICASH_WALLET_CHAIN")]
-        chain: Option<String>,
-    },
     /// Hubs announced on Nostr relays, at the URLs that answer as the hub
     /// that announced them. Needs no wallet.
     Discover {
@@ -1120,18 +1099,6 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             return contract::recoveries(&wallet, &path, chain.as_deref(), fee_rate, json).await;
         }
         Command::GiveUpRecovery { id } => contract::give_up(&wallet, &path, &id)?,
-        Command::RecoveryStatement { id, out } => {
-            contract::statement(&path, &id, out.as_deref(), json)?
-        }
-        Command::ImportProof {
-            id,
-            file,
-            fee_rate,
-            chain,
-        } => {
-            let chain = chain.as_deref();
-            return contract::import_proof(&wallet, &path, chain, &id, &file, fee_rate, json).await;
-        }
         Command::Swaps => {
             let swaps = wallet.swaps()?;
             let lines = swaps.iter().map(swap_line).collect::<Vec<_>>();

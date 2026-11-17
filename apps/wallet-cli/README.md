@@ -194,25 +194,12 @@ estimate). `recoveries --chain <url>` carries every forced close on as
 far as the chain lets it and shows the block its next step waits for: run
 it until it is `done`, when the claimed notes' value and both reserves
 are back in the wallet on Bitcoin. A hub that answers the request instead
-(`answered`) leaves it to the wallet's proof of its claim: once the request
-and its publication are deep enough, the forced close is `proving`, and
-`recovery-statement <id>` writes the statement to prove (it shows the
-wallet's notes: keep it private) with the commands that prove it with
-`licash-r0` on a machine with 16 GB of memory, the Groth16 step on x86
-with Docker. `import-proof <id> proof.json --chain <url>` brings the proof
-back before the block `recoveries` shows: checked, kept, and asserted on
-Bitcoin at once. `recoveries --chain <url>` then carries it on to `done`
-(`asserted`, `succeeding`, `paid`, `sweeping`), answering the hub if it
-challenges the proof. An unproven counter or a response with any plain
-publication input follows the same full-claim proof path. A proven counter
-keeps its corrected statement at `proving`; the same export/import flow
-asserts its corrected payout, answers challenges, and collects the unspent
-remainder and reserves, including the reserves when the remainder is zero.
-Older `countered` recoveries are classified
-on their next advance without changing their request or reserved notes.
-Full-claim recovery state stays unchanged. Older wallet builds refuse new
-corrected recovery rows, leaving their notes reserved; do not downgrade
-while a corrected recovery is in progress, as its deadline keeps running.
+(`answered`) says what the claim is owed, and must prove it on Bitcoin
+before the block `recoveries` shows; otherwise the wallet's timeout pays
+the whole claim. The wallet proves nothing: it checks the hub's proof once
+asserted (`asserted`), challenges one that does not verify (`challenging`,
+`challenged`), and carries the payout on to `done` (`succeeding`, `paid`,
+`sweeping`), collecting what the outcome pays it and its reserve.
 
 `discover --relay wss://relay.example` lists the hubs announced on Nostr,
 at the URLs that answer as the hub that announced them; with `--swaps`, the
