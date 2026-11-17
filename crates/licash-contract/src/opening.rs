@@ -50,7 +50,7 @@ impl Trust {
         }
     }
 }
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub struct Context {
     pub tip: u32,
     pub trust: Trust,
@@ -495,8 +495,8 @@ impl HubPhase {
     ];
 }
 
-pub struct Start<'a> {
-    pub seed: &'a [u8; 32],
+pub struct Start {
+    pub seed: [u8; 32],
     pub quote: Quote,
     pub checkpoint: Checkpoint,
     pub deposit: OutPoint,
@@ -550,18 +550,18 @@ pub struct Holder {
     funded: Option<Transaction>,
 }
 impl Holder {
-    pub fn start(s: Start<'_>, ctx: &Context) -> Result<(Self, Vec<Out>)> {
+    pub fn start(s: Start, ctx: &Context) -> Result<(Self, Vec<Out>)> {
         Self::start_with_id(s, Base::fresh_nonce(), ctx)
     }
     /// Deterministic IDs are for fixtures only. Reusing a garbler's ID
     /// under another choice can disclose all of its kept secrets.
     #[cfg(any(test, feature = "fixture"))]
-    pub fn with_id(s: Start<'_>, id: [u8; 32], ctx: &Context) -> Result<(Self, Vec<Out>)> {
+    pub fn with_id(s: Start, id: [u8; 32], ctx: &Context) -> Result<(Self, Vec<Out>)> {
         Self::start_with_id(s, id, ctx)
     }
-    fn start_with_id(s: Start<'_>, id: [u8; 32], ctx: &Context) -> Result<(Self, Vec<Out>)> {
+    fn start_with_id(s: Start, id: [u8; 32], ctx: &Context) -> Result<(Self, Vec<Out>)> {
         s.quote.check(s.checkpoint.profile())?;
-        let keys = HolderKeys::derive(s.seed, &id);
+        let keys = HolderKeys::derive(&s.seed, &id);
         let open = wire::Open {
             party: keys.party.public(),
             claim_key: keys.claim_key(),
@@ -888,6 +888,12 @@ pub struct Hub {
     funded: Option<Transaction>,
 }
 impl Hub {
+    /// The hub's own one-time keys. The driver must durably pin each
+    /// response and assertion before using them to sign.
+    pub fn keys(&self) -> &HubKeys {
+        &self.keys
+    }
+
     pub fn new(quote: Quote, bounds: Bounds) -> Self {
         let mut secret = [0; 32];
         OsRng.fill_bytes(&mut secret);
@@ -1515,7 +1521,7 @@ mod tests {
         };
         let (mut a, first) = Holder::with_id(
             Start {
-                seed: &[1; 32],
+                seed: [1; 32],
                 quote: q.clone(),
                 checkpoint: q.chain.checkpoint.clone(),
                 deposit: OutPoint {

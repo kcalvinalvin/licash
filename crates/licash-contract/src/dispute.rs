@@ -18,6 +18,7 @@ use lichen_btc::{
         Transaction, TxIn, TxOut, Txid,
     },
     sighash::{sign_tapscript, sign_tapscript_acp},
+    taptree::TapTree,
     tx::{build_spend, build_tx, Timelock},
     winternitz::WotsPublic,
     witness::tapscript_witness,
@@ -60,6 +61,24 @@ fn finish(
         holder.get(name).context("missing holder signature")?,
     ))
 }
+fn carrier_outputs(
+    mut tx: Transaction,
+    key: &Keypair,
+    tree: &TapTree,
+    leaf_name: &str,
+    prevout: &TxOut,
+    outputs: Vec<TxOut>,
+) -> Result<Transaction> {
+    if outputs.is_empty() {
+        return Ok(tx);
+    }
+    tx.output.extend(outputs);
+    let leaf = tree.leaf(leaf_name)?;
+    let signature = sign_tapscript_acp(key, &tx, 0, prevout, &leaf.script)?;
+    tx.input[0].witness =
+        tapscript_witness(&[signature], &leaf.script, &tree.control_block(leaf_name)?);
+    Ok(tx)
+}
 impl Opening {
     pub fn finish(&self, name: &str, wire: Vec<Vec<u8>>) -> Result<Transaction> {
         finish(&self.set, &self.offer.sigs, &self.consent.sigs, name, wire)
@@ -75,7 +94,14 @@ impl Opening {
             HubProves::request_wire(&keys.b.sign(&b.to_be_bytes())?, &keys.e.sign(e)?),
         )
     }
-    pub fn publication(&self, keys: &HolderKeys, bytes: &[u8]) -> Result<Transaction> {
+    /// Publish the claim with optional fee coins and change outputs, all
+    /// fixed before its claim-key signature is made. Fee inputs may follow.
+    pub fn publication(
+        &self,
+        keys: &HolderKeys,
+        bytes: &[u8],
+        outputs: Vec<TxOut>,
+    ) -> Result<Transaction> {
         ensure!(
             keys.claim_key().serialize() == self.base.parts().claim_key,
             "another claim key"
@@ -89,11 +115,15 @@ impl Opening {
             txid: request.tx.compute_txid(),
             vout: lichen_statement::SLOT_VOUT,
         };
-        self.babe.publication(
+        let prevout = &request.tx.output[slot.vout as usize];
+        let tx = self.babe.publication(&keys.claim, slot, prevout, bytes)?;
+        carrier_outputs(
+            tx,
             &keys.claim,
-            slot,
-            &request.tx.output[slot.vout as usize],
-            bytes,
+            &self.babe.slot()?,
+            "publish",
+            prevout,
+            outputs,
         )
     }
     pub fn assertion(&self, tx: &Transaction) -> Result<Assertion> {
@@ -143,18 +173,29 @@ impl HubOpening {
             HubProves::respond_wire(&keys.b.sign(&b_prime.to_be_bytes())?),
         )
     }
-    pub fn disclosure(&self, keys: &HubKeys, bytes: &[u8]) -> Result<Transaction> {
+    pub fn disclosure(
+        &self,
+        keys: &HubKeys,
+        bytes: &[u8],
+        outputs: Vec<TxOut>,
+    ) -> Result<Transaction> {
         ensure!(keys.public() == self.hub, "another hub's keys");
         let respond = presign(&self.set, "respond")?;
         let slot = OutPoint {
             txid: respond.tx.compute_txid(),
             vout: lichen_statement::SLOT_VOUT,
         };
-        self.babe.disclosure(
+        let prevout = &respond.tx.output[slot.vout as usize];
+        let tx = self
+            .babe
+            .disclosure(&keys.party.payment, slot, prevout, bytes)?;
+        carrier_outputs(
+            tx,
             &keys.party.payment,
-            slot,
-            &respond.tx.output[slot.vout as usize],
-            bytes,
+            &self.babe.disclose()?,
+            "disclose",
+            prevout,
+            outputs,
         )
     }
     pub fn assert(&self, keys: &HubKeys, proof: &Proof<Bn254>) -> Result<Transaction> {
@@ -350,13 +391,27 @@ pub fn exit(
     request: (&Block, &Txid),
     publish: (&Block, &Txid),
     respond: (&Block, &Txid),
-    disclosure: (&Block, &Txid),
+    disclosure: Option<(&Block, &Txid)>,
 ) -> Result<lichen_statement::Exit> {
     Ok(lichen_statement::Exit {
         headers,
         request: lichen_babe::exit::request(funding, request.0, request.1)?,
         publish: lichen_babe::exit::slot_spend(publish.0, publish.1)?,
         respond: lichen_babe::exit::respond(respond.0, respond.1)?,
-        disclosure: Some(lichen_babe::exit::slot_spend(disclosure.0, disclosure.1)?),
+        disclosure: disclosure
+            .map(|(b, t)| lichen_babe::exit::slot_spend(b, t))
+            .transpose()?,
     })
+}
+
+/// The claim bytes `publication` carries in the request's slot.
+pub fn published(request: &Transaction, publication: &Block, txid: &Txid) -> Result<Vec<u8>> {
+    let spend = lichen_babe::exit::slot_spend(publication, txid)?;
+    let slot = lichen_statement::btc::OutPoint {
+        txid: lichen_btc::bitcoin::hashes::Hash::to_byte_array(request.compute_txid()),
+        vout: lichen_statement::SLOT_VOUT,
+    };
+    spend
+        .carrying(&slot)
+        .context("the publication carries no claim in the request's slot")
 }
