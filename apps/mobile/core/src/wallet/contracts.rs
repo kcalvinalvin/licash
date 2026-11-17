@@ -628,6 +628,9 @@ fn state(c: &holder::Contract, tip: u32) -> ContractState {
             reason: reason.clone(),
         };
     }
+    if c.folded.is_some() {
+        return ContractState::Closed;
+    }
     match c.fate {
         Some(Fate::Dead) => ContractState::Failed {
             reason: DEAD.into(),
@@ -673,6 +676,7 @@ mod tests {
             fate,
             abandoned: None,
             created_at: 0,
+            folded: None,
         }
     }
 

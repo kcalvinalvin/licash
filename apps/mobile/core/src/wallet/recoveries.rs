@@ -178,6 +178,27 @@ impl Wallet {
         Ok(shown(&forced))
     }
 
+    /// Close contract `id` (in hex) early with its hub, cooperatively:
+    /// her reserve back to the wallet on Bitcoin at once, the protection
+    /// over. The fold's txid. Refused for a contract not protecting yet,
+    /// forced closed, or past its close, when its reserve comes back anyway.
+    pub fn close_contract(
+        &self,
+        chain: Arc<dyn ChainSource>,
+        id: String,
+    ) -> Result<String, LicashError> {
+        let id = contract_id(&id)?;
+        let _contracting = self
+            .contracting
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let chain = Chain(chain, self.wallet.network());
+        let closed = licash_contracts::holder::close(&self.wallet, &chain, &self.dir, &id);
+        let txid = self.runtime.block_on(closed).map_err(failed)?;
+        tracing::info!(id = %hex::encode(id), %txid, "contract closed early");
+        Ok(txid.to_string())
+    }
+
     /// The contracts forced closed, the oldest first, as last seen.
     pub fn recoveries(&self) -> Result<Vec<Recovery>, LicashError> {
         let all = recovery::recoveries(&self.dir).map_err(failed)?;
