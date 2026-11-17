@@ -5,6 +5,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import org.licash.core.InvoiceQuote
 import org.licash.core.Rate
 import org.licash.wallet.percent
 import org.licash.wallet.sat
@@ -56,6 +57,17 @@ internal fun payoutFee(amount: ULong, fee: ULong, hub: ULong, provider: ULong, n
         quoted -> FeeBreakdown(amount, fee, parts, explanation = provided)
         else -> FeeBreakdown(amount, fee, parts, explanation = "As recorded. $provided Base and rate terms were not saved.")
     }
+}
+
+/**
+ * A Lightning invoice's fee as quoted: all the hub's gateway asks, or the
+ * hub's on the lock and the swap provider's, Lightning routing in it.
+ */
+internal fun invoiceFee(quote: InvoiceQuote): FeeBreakdown {
+    val provider = quote.provider ?: return FeeBreakdown(quote.amount, quote.fee)
+    val parts = feeParts(quote.fee, listOf("Hub" to provider.lockFee, "Swap provider" to provider.fee))
+    return if (parts.isEmpty()) FeeBreakdown(quote.amount, quote.fee)
+    else FeeBreakdown(quote.amount, quote.fee, parts, explanation = "The swap provider's fee includes Lightning routing.")
 }
 
 /** A move's fee as recorded: the hub's on the lock and the swap provider's. */

@@ -84,6 +84,23 @@ const val NOT_PROTECTED_MEANS =
     "Held on credit: a hub owes it to you, on its word alone. Protect it, or cash it out to Bitcoin."
 
 /**
+ * What paying through a swap provider risks, said before paying: should it
+ * decline or fail the payment, the sats wait `blocks` for their lock to
+ * expire.
+ */
+fun refundWait(blocks: UInt): String =
+    "If the provider declines or fails the payment, your sats come back by themselves, in about ${span(blocks.toLong())}."
+
+/**
+ * Where a payment through a swap provider that it declined or failed
+ * stands: its sats back once its lock expires, `blocks` from now if known.
+ */
+fun notPaid(blocks: UInt?): String = when {
+    blocks == null || blocks == 0u -> "Not paid. Your money comes back by itself."
+    else -> "Not paid. Your money comes back by itself in about ${span(blocks.toLong())}."
+}
+
+/**
  * How long `blocks` take, ten minutes each, as a clock would say it: `6
  * days`. Never a block height: what a block is, nobody needs to know.
  */

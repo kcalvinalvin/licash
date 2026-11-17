@@ -193,6 +193,9 @@ internal fun status(activity: Activity, coming: Boolean, details: Details?): Str
         else -> "${activity.detail}. Your money comes back by itself."
     }
     activity.state == State.FAILED -> activity.detail
+    // A swap provider declined or failed it: its lock returns the sats once expired.
+    activity.state == State.PENDING && details is Details.Lightning && details.provider != null &&
+        details.failure != null -> notPaid(details.refundBlocks)
     else -> when (details) {
         is Details.Payout -> when {
             activity.state == State.DONE -> "Arrived"
@@ -380,6 +383,7 @@ private fun Summary(activity: Activity, details: Details?, tx: Onchain?, develop
                     costs(recordedFee(activity.amount, activity.fee))
                 }
                 Line("From", name(details.hub))
+                details.provider?.let { Line("Through", host(it), tag = "through") }
             }
             is Details.Payout -> {
                 costs(payoutFee(activity.amount, activity.fee, details.lockFee, details.providerFee, details.claimFee, quoted = false))
@@ -464,6 +468,8 @@ private fun Technical(activity: Activity, details: Details?, copy: (String, Stri
                 Fact("Invoice", details.invoice, copy)
                 details.preimage?.let { Fact("Preimage", it, copy) }
                 details.failure?.let { Fact("Failure", it, copy) }
+                details.provider?.let { Fact("Provider", it, copy) }
+                details.expiry?.let { Fact("Expiry", "$it", copy) }
             }
             is Details.Payout -> {
                 Fact("Payout hash", activity.id, copy)

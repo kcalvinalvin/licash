@@ -1012,12 +1012,26 @@ class Engine(context: Context) {
         paid
     }
 
-    /** What paying the Lightning invoice `text` costs, through the hub paying it for least. */
+    /**
+     * What paying the Lightning invoice `text` costs the cheapest way: through
+     * a hub's gateway, or through a swap provider.
+     */
     suspend fun invoiceQuote(text: String): Result<InvoiceQuote> = io { local { it.invoiceQuote(text) } }
 
-    /** Pay the Lightning invoice `text` through `hub`: done, or under way. */
-    suspend fun payInvoice(text: String, hub: String): Result<Activity> = io {
-        val paid = locked { it.payInvoice(text, hub) }
+    /** Every way to pay the Lightning invoice `text`, the cheapest first. */
+    suspend fun invoiceOffers(text: String): Result<List<InvoiceQuote>> = io { local { it.invoiceOffers(text) } }
+
+    /**
+     * Pay the Lightning invoice `text` as `quote` says: through its hub's
+     * gateway, or through its provider for a lock of notes at its hub, for
+     * no more than the provider quoted. Done, or under way.
+     */
+    suspend fun payInvoice(text: String, quote: InvoiceQuote): Result<Activity> = io {
+        val provider = quote.provider
+        val paid = locked {
+            if (provider == null) it.payInvoice(text, quote.hub)
+            else it.payInvoiceVia(text, quote.hub, provider.url, provider.fee)
+        }
         refresh()
         poke()
         paid

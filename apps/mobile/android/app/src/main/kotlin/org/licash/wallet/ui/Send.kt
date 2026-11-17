@@ -234,12 +234,12 @@ fun Send(
         }
     }
 
-    fun payInvoice(text: String, hub: String) {
+    fun payInvoice(text: String, quote: InvoiceQuote) {
         step = Step.Busy
         scope.launch {
-            step = engine.payInvoice(text, hub).fold(
+            step = engine.payInvoice(text, quote).fold(
                 { if (it.state == State.DONE) Step.Paid(it.amount, it.fee) else Step.Later },
-                { e -> unpaid(e) { payInvoice(text, hub) } },
+                { e -> unpaid(e) { payInvoice(text, quote) } },
             )
         }
     }
@@ -355,7 +355,22 @@ fun Send(
                     back,
                 )
                 Step.Quoting -> Middle("Getting a price…")
-                is Step.Invoice -> Invoice(s.quote, ui.hubs.size > 1) { payInvoice(s.text, s.quote.hub) }
+                is Step.Invoice -> Invoice(s.quote, ui.hubs.size > 1, { payInvoice(s.text, s.quote) }) {
+                    if (ui.developer) {
+                        Providers {
+                            engine.invoiceOffers(s.text).map { offers ->
+                                offers.map { o ->
+                                    val through = o.provider?.let { it.name ?: host(it.url) } ?: "${name(o.hub)}'s gateway"
+                                    Offer(
+                                        through,
+                                        "Fees ${feeOf(o.fee, o.amount)}, from ${name(o.hub)}",
+                                        o == s.quote,
+                                    ) { step = Step.Invoice(s.text, o) }
+                                }
+                            }
+                        }
+                    }
+                }
                 is Step.Address -> ToAddress(s.address) { amount -> quote(s.address, amount) }
                 is Step.Payout -> Payout(s.quote, s.quote.address == own, ui.hubs.size > 1, { payOut(s.quote, s.asked) }) {
                     if (ui.developer) {
@@ -607,16 +622,34 @@ private fun Providers(load: suspend () -> Result<List<Offer>>) {
     }
 }
 
-/** A Lightning invoice to pay: what it asks, and all it costs on top; from which hub, with `several`. */
+/**
+ * A Lightning invoice to pay: what it asks, and all it costs on top; from
+ * which hub, with `several`; through which swap provider, if one, and how
+ * long its sats wait should it not pay. `more` under the button.
+ */
 @Composable
-private fun Invoice(quote: InvoiceQuote, several: Boolean, pay: () -> Unit) {
+private fun Invoice(quote: InvoiceQuote, several: Boolean, pay: () -> Unit, more: @Composable () -> Unit) {
+    val provider = quote.provider
     Confirm(
         quote.amount,
-        costs(quote.amount, quote.fee, "In seconds") + listOfNotNull(
-            if (several) Fact("From", name(quote.hub), "from") else null,
+        costs(quote.amount, quote.fee, "In seconds", invoiceFee(quote)) + listOfNotNull(
+            if (several || provider != null) Fact("From", name(quote.hub), "from") else null,
+            provider?.let { Fact("Through", it.name ?: host(it.url), "through") },
         ),
         "Pay",
         pay,
+        more = {
+            provider?.let {
+                Text(
+                    refundWait(it.refundBlocks),
+                    modifier = Modifier.fillMaxWidth().padding(top = 12.dp).testTag("refund-wait"),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    textAlign = TextAlign.Center,
+                )
+            }
+            more()
+        },
         head = {
             quote.description?.let {
                 Text(

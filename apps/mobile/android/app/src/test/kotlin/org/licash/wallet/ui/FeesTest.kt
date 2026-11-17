@@ -4,6 +4,8 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import org.licash.core.ViaProvider
+import org.licash.core.InvoiceQuote
 import org.licash.core.Rate
 
 class FeesTest {
@@ -54,5 +56,15 @@ class FeesTest {
         assertEquals("Total cost", cost.totalLabel)
         assertEquals("Setup cost", cost.title)
         assertNull(cost.rate)
+    }
+
+    @Test
+    fun an_invoice_through_a_provider_splits_its_fee_and_through_a_gateway_does_not() {
+        val gateway = InvoiceQuote(hub = "https://hub.example", amount = 1_000uL, fee = 5uL, description = null, provider = null)
+        assertTrue(invoiceFee(gateway).components.isEmpty())
+        val provider = ViaProvider(url = "https://swaps.example", name = null, fee = 12uL, lockFee = 1uL, refundBlocks = 200u)
+        val via = invoiceFee(gateway.copy(fee = 13uL, provider = provider))
+        assertEquals(listOf("Hub" to 1uL, "Swap provider" to 12uL), via.components)
+        assertTrue(via.explanation.contains("routing"))
     }
 }

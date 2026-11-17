@@ -140,6 +140,18 @@ trusts at their address, through a swap provider paying out on Bitcoin
 (`--nostr-relay URL --announce-url URL`); a hub's page, behind the balance,
 cashes out all the notes there to an address that way.
 
+Lightning invoices are paid the cheapest way found: through a trusted hub's
+gateway, or through a swap provider announced the same way that pays
+invoices from its own node (`licash-swaps run --lnd URL --lnd-macaroon
+FILE`) for a lock of notes at a hub holding enough. Gateways come first
+among equal fees. The confirm screen names the provider and says how long
+the sats wait should it decline or fail the payment: they return only once
+the lock expires, about a day or more, where a hub's gateway refunds at once.
+The app records the provider with the lock and asks it again on each round
+until the payment settles, so one interrupted before the provider heard of
+it is still made. In advanced mode, "All providers" lists every way to pay
+it, to choose another.
+
 A code naming no hub the app trusts, but saying where to reach the payee's,
 is paid there in notes once the owner agrees: the hub proves it is the one the
 code names, a swap brings notes there from a hub of the app's, and the payment

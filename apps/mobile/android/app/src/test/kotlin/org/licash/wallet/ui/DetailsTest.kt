@@ -123,4 +123,25 @@ class DetailsTest {
         assertEquals("Sent on Bitcoin", title(line(Kind.PAYOUT), coming = false))
         assertEquals("From Bitcoin", title(line(Kind.MOVED), coming = false))
     }
+
+    private fun lightning(provider: String?, failure: String?, refundBlocks: UInt? = null) = Details.Lightning(
+        hub = "https://hub.example", invoice = "lnbc", preimage = null, failure = failure, provider = provider,
+        expiry = provider?.let { 1_200u }, refundBlocks = refundBlocks,
+    )
+
+    @Test
+    fun a_payment_a_swap_provider_did_not_make_waits_for_its_lock_to_expire() {
+        val under = line(Kind.LIGHTNING)
+        assertEquals("Under way", status(under, false, lightning("https://swaps.example", null, 200u)))
+        assertEquals(
+            "Not paid. Your money comes back by itself in about 33 hours.",
+            status(under, false, lightning("https://swaps.example", "declined", 200u)),
+        )
+        assertEquals(
+            "Not paid. Your money comes back by itself.",
+            status(under, false, lightning("https://swaps.example", "declined")),
+        )
+        // A hub's gateway refunds a failed payment at once: never this.
+        assertEquals("Under way", status(under, false, lightning(null, "no route")))
+    }
 }

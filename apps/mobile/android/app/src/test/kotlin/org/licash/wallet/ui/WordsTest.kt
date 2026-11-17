@@ -80,4 +80,13 @@ class WordsTest {
         assertEquals("Nov 13", day(now - 2 * 86_400, now, zone, us))
         assertEquals("Dec 31, 2025", day(1_767_182_400L, now, zone, us))
     }
+
+    @Test
+    fun paying_through_a_provider_says_how_long_its_sats_may_wait() {
+        assertEquals(
+            "If the provider declines or fails the payment, your sats come back by themselves, in about 33 hours.",
+            refundWait(200u),
+        )
+        assertEquals("Not paid. Your money comes back by itself in about 2 hours.", notPaid(12u))
+    }
 }
