@@ -1,0 +1,22 @@
+[package]
+name = "licash-lightning"
+description = "A Lightning node as Licash's gateways and providers pay and are paid through: LND over its REST API, and an in-memory node for tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = { workspace = true, optional = true }
+base64 = { version = "0.23", optional = true }
+bitcoin = { version = "=0.32.102", default-features = false, features = ["std", "secp-recovery"], optional = true }
+hex = { workspace = true, optional = true }
+lightning-invoice = { version = "0.34", features = ["std"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
+serde_json = { workspace = true, optional = true }
+
+[features]
+# LND, over its REST API.
+lnd = ["dep:anyhow", "dep:base64", "dep:hex", "dep:reqwest", "dep:rustls", "dep:serde_json"]
+# An in-memory Lightning node, for tests.
+fake = ["dep:bitcoin", "dep:hex"]

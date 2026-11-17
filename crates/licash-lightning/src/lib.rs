@@ -1,13 +1,15 @@
 //! A Lightning node, as the hub's gateway and the swap provider use it:
-//! the [`Node`] they pay and are paid through, [`lnd::Lnd`] over its REST
-//! API and, for tests, an in-memory `fake::Fake` (feature `fake`). Beside it, what paying
-//! an invoice for a timed lock takes whoever pays it: the invoices a payer
+//! the [`Node`] they pay and are paid through, `lnd::Lnd` over its REST
+//! API (feature `lnd`) and, for tests, an in-memory `fake::Fake` (feature
+//! `fake`). Beside it, what paying an invoice for a timed lock takes
+//! whoever pays it: the invoices a payer
 //! takes ([`unpayable`], [`expires`]), the timelock its routes may use
 //! ([`cltv_limit`]), and what the node's attempt says of a payment
 //! recorded before it ([`judge`]).
 
 #[cfg(feature = "fake")]
 pub mod fake;
+#[cfg(feature = "lnd")]
 pub mod lnd;
 
 use std::{future::Future, pin::Pin, time::Duration};
@@ -69,7 +71,7 @@ pub enum HeldState {
     Canceled,
 }
 
-/// A Lightning node to pay and be paid through, such as [`lnd::Lnd`].
+/// A Lightning node to pay and be paid through, such as LND (`lnd::Lnd`).
 pub trait Node: Send + Sync {
     fn info(&self) -> Call<'_, NodeInfo>;
     fn liquidity(&self) -> Call<'_, Liquidity>;
