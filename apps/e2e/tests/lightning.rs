@@ -292,6 +292,83 @@ async fn a_move_never_claimed_at_the_other_hub_returns_to_the_first() -> anyhow:
     Ok(())
 }
 
+/// Why `node`'s payment of `hash` failed, if it did.
+async fn failure(eco: &Eco, node: &str, hash: &str) -> anyhow::Result<Option<String>> {
+    let payments = eco
+        .lncli(node, &["listpayments", "--include_incomplete"])
+        .await?;
+    let payments = payments["payments"].as_array().cloned().unwrap_or_default();
+    let payment = payments.iter().find(|p| p["payment_hash"] == hash);
+    Ok(payment
+        .filter(|p| p["status"] == "FAILED")
+        .and_then(|p| p["failure_reason"].as_str().map(str::to_owned)))
+}
+
+#[tokio::test]
+#[ignore = "needs the stack of apps/e2e/run.sh"]
+async fn an_invoice_of_a_wallet_at_the_same_hub_is_paid_inside_it() -> anyhow::Result<()> {
+    let eco = Eco::up().await?;
+    let hub1 = eco.hub(1);
+    let lena = eco.wallet("lena")?;
+    let mike = eco.wallet("mike")?;
+    eco.pay_in(&lena, hub1, 30_000).await?;
+
+    // Mike asks hub1 for an invoice; Lena pays it through hub1, which
+    // pays it inside the hub: no gateway fee, nothing over Lightning.
+    let invoice = mike.invoice(hub1, 10_000).await?;
+    let request = invoice.request.as_deref().unwrap();
+    let payable = lena.read_invoice(request)?;
+    // Cheaper than an invoice of the outside node, by the gateway's fee:
+    // only the hub's fee on making notes worth the lock exactly is left.
+    let (outside, _) = eco.invoice(OUTSIDE, 10_000).await?;
+    let (inside, over) = (
+        lena.invoice_fee(hub1, request)?,
+        lena.invoice_fee(hub1, &outside)?,
+    );
+    assert!(inside < over, "{inside} inside, {over} over Lightning");
+    let lock = lena.pay_invoice(hub1, request).await?;
+    assert_eq!(lock.amount, payable.amount);
+    // LND canceled the invoice while open: no HTLC may back it any more.
+    let (state, _) = eco.invoice_state("hub1-ln", &invoice.hash).await?;
+    assert_eq!(state, "CANCELED");
+
+    assert_eq!(
+        received(&mike, &invoice.hash).await?,
+        InvoiceState::Received
+    );
+    assert_eq!(available_at(&mike, hub1), 10_000);
+    let lock = settled(&lena, &lock).await?;
+    let LockState::Paid(preimage) = lock.state else {
+        panic!("{lock:?}");
+    };
+    assert_eq!(hex::encode(lock_hash(&preimage)), invoice.hash);
+    let status = until("hub1 settles the receipt", 60, || async {
+        let status = eco.receipt(hub1, &invoice.hash).await?;
+        Ok((status.state == ReceiveState::Settled).then_some(status))
+    })
+    .await?;
+    assert_eq!(status.state, ReceiveState::Settled);
+    let cost = lock.cost.expect("a settled lock's cost");
+    assert_eq!(available_at(&lena, hub1), 30_000 - cost - exact_fees(&lena));
+    // Hub1's node paid nothing for it.
+    let payments = eco.lncli("hub1-ln", &["listpayments"]).await?;
+    let paid = payments["payments"].as_array().cloned().unwrap_or_default();
+    assert!(paid
+        .iter()
+        .all(|p| p["payment_hash"] != invoice.hash.as_str()));
+
+    // Paid over Lightning afterwards, the canceled invoice fails back.
+    let paying = eco.pay(OUTSIDE, request);
+    assert!(!paying.await??, "the outside node's payment failed");
+    let why = failure(&eco, OUTSIDE, &invoice.hash).await?;
+    assert_eq!(
+        why.as_deref(),
+        Some("FAILURE_REASON_INCORRECT_PAYMENT_DETAILS")
+    );
+    assert_eq!(available_at(&mike, hub1), 10_000);
+    Ok(())
+}
+
 /// Follow the provider's payment for the client's lock `id` until it
 /// reaches `state`.
 async fn paid_as(
