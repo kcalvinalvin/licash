@@ -6,6 +6,7 @@ import androidx.lifecycle.DefaultLifecycleObserver
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.ProcessLifecycleOwner
 import java.io.File
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CoroutineScope
@@ -233,6 +234,20 @@ class Engine(context: Context) {
     @Volatile
     private var hubsLearned = false
 
+    /** When they were last learned, in ms: again every [HUBS_MS], their fees and terms fresh. */
+    @Volatile
+    private var hubsLearnedAt = 0L
+
+    /**
+     * Each hub's contract quote, asked ahead so protecting shows at once,
+     * with what was on Bitcoin when asked and when, in ms: fresh for
+     * [QUOTE_MS] while that holds ([contractQuote]).
+     */
+    private val quotes = ConcurrentHashMap<String, Triple<ContractQuote, ULong, Long>>()
+
+    /** Asking the hubs for quotes ahead, apart from the rounds. */
+    private val quoting = AtomicBoolean(false)
+
     /** Carrying on with contracts, apart from the rounds: it may take minutes. */
     private val contracting = AtomicBoolean(false)
 
@@ -386,6 +401,7 @@ class Engine(context: Context) {
                     AppLog.warn("sync", e)
                     state.update { it.copy(problem = explain(e)) }
                 }
+                prefetchQuotes()
                 if (state.value.chain.synced) rounds.update { it + 1 }
             }
             // Out of sight, what is watched waits for blocks: no hurry.
@@ -404,7 +420,7 @@ class Engine(context: Context) {
         state.update { it.copy(chain = status, torStatus = torStatus()) }
         var hubs = wallet?.let { local { w -> w.hubs() } } ?: return
         if (hubs.isEmpty()) return
-        if (!hubsLearned) {
+        if (!hubsLearned || System.currentTimeMillis() - hubsLearnedAt > HUBS_MS) {
             learnHubs(hubs)
             hubs = local { it.hubs() }
         }
@@ -548,6 +564,34 @@ class Engine(context: Context) {
             }
         }
         hubsLearned = true
+        hubsLearnedAt = System.currentTimeMillis()
+    }
+
+    /**
+     * Ask each hub trusted that opens contracts for its quote ahead, in
+     * the background, once the last is older than [QUOTE_MS] or what is
+     * on Bitcoin changed: protecting shows at once ([contractQuote]).
+     */
+    private fun prefetchQuotes() {
+        if (!foreground || !state.value.chain.synced || state.value.opening != null) return
+        if (!quoting.compareAndSet(false, true)) return
+        scope.launch {
+            try {
+                val onchain = local { it.balance() }.onchain
+                val now = System.currentTimeMillis()
+                for (hub in local { it.hubs() }.filter { it.contracts != null }) {
+                    val cached = quotes[hub.url]
+                    if (cached != null && cached.second == onchain && now - cached.third < QUOTE_MS / 2) continue
+                    runCatching { local { it.contractQuote(hub.url) } }
+                        .onSuccess { quotes[hub.url] = Triple(it, onchain, System.currentTimeMillis()) }
+                        .onFailure { AppLog.info("asking ${hub.url} for a quote ahead: ${it.message}") }
+                }
+            } catch (e: LicashException) {
+                AppLog.warn("asking for quotes ahead", e)
+            } finally {
+                quoting.set(false)
+            }
+        }
     }
 
     /**
@@ -1123,7 +1167,19 @@ class Engine(context: Context) {
     }
 
     /** What opening a recovery contract at `hub` costs now, and the coin that would pay it. */
-    suspend fun contractQuote(hub: String): Result<ContractQuote> = io { local { it.contractQuote(hub) } }
+    /**
+     * `hub`'s contract quote: the one asked ahead if fresh ([prefetchQuotes]),
+     * at once, else asked now.
+     */
+    suspend fun contractQuote(hub: String): Result<ContractQuote> = io {
+        val onchain = local { it.balance() }.onchain
+        val cached = quotes[hub]
+        if (cached != null && cached.second == onchain && System.currentTimeMillis() - cached.third < QUOTE_MS) {
+            cached.first
+        } else {
+            local { it.contractQuote(hub) }.also { quotes[hub] = Triple(it, onchain, System.currentTimeMillis()) }
+        }
+    }
 
     suspend fun contractInspection(id: String): Result<org.licash.core.ContractInspection> = io { local { it.contractInspection(id) } }
 
@@ -1370,6 +1426,8 @@ class Engine(context: Context) {
         private const val PROVIDERS_MS = 15 * 60_000L
         private const val PROVIDERS_RETRY_MS = 2 * 60_000L
         private const val OFFER_MS = 30 * 60_000L
+        private const val HUBS_MS = 5 * 60_000L
+        private const val QUOTE_MS = 4 * 60_000L
     }
 }
 
