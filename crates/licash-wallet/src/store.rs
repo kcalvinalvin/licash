@@ -27,7 +27,17 @@ const MIGRATIONS: &[&str] = &[
     DELIVERIES,
     UNLINKED_AT,
     VIA,
+    KEYED,
 ];
+
+/// Version 11: payments made under a key of their payer's, at most one
+/// each ([`crate::Wallet::pay_code_keyed`]), recorded with the payment:
+/// a payer that stopped mid-way finds by its key whether it paid. No
+/// payment of an older file has a key.
+const KEYED: &str = "
+ALTER TABLE sends ADD COLUMN key BLOB;
+CREATE UNIQUE INDEX sends_key ON sends (key) WHERE key IS NOT NULL;
+";
 
 /// Version 10: Lightning invoices paid through swap providers. A lock
 /// paying one names the provider's URL, `via`, and the invoice it asks it

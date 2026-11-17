@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use licash::{address::OwnerKeys, spend::ChainProfile};
 use licash_api::{inbox, Fee};
-use licash_wallet::{Delivery, Error, LicashCode, Wallet, ACK_WITHIN};
+use licash_wallet::{Delivery, Error, LicashCode, State, Wallet, ACK_WITHIN};
 use net::{Conduct, Fault, Link, Net, HUB};
 
 const REGTEST: ChainProfile = ChainProfile::Core30DefaultRegtest;
@@ -347,4 +347,98 @@ async fn a_payment_sent_plainly_is_neither_kept_nor_mailed() {
     assert_eq!(alice.delivery(&paid.id).unwrap(), None);
     assert!(alice.due().await.unwrap().is_empty());
     assert_eq!(net.kept(HUB), (0, 0));
+}
+
+#[tokio::test]
+async fn a_payment_under_a_key_is_made_once_and_found_by_it() {
+    let Pair {
+        net,
+        alice,
+        bob,
+        code,
+        ..
+    } = pair(Conduct::Keeps).await;
+    let key = [7; 32];
+    assert!(alice.sent_by_key(&key).unwrap().is_none());
+    let paid = alice.pay_code_keyed(HUB, &code, 8, key).await.unwrap();
+    assert!(paid.kept);
+    let sent = alice.sent_by_key(&key).unwrap().unwrap();
+    assert_eq!(
+        (sent.id.as_str(), sent.amount, sent.state),
+        (paid.id.as_str(), 8, State::Done)
+    );
+    // Never again under it.
+    let again = alice.pay_code_keyed(HUB, &code, 8, key).await;
+    assert!(
+        matches!(&again, Err(Error::Invalid(why)) if why.contains(&paid.id)),
+        "{again:?}"
+    );
+    assert_eq!(alice.sends().unwrap().len(), 1);
+    assert_eq!(held(&alice), 50 - 8 - 1);
+    // Unkeyed payments, and other keys, are none of it.
+    alice.pay_code(HUB, &code, 4).await.unwrap();
+    assert!(alice.sent_by_key(&[8; 32]).unwrap().is_none());
+    assert_eq!(alice.sent_by_key(&key).unwrap().unwrap().id, paid.id);
+    assert_eq!(bob.collect_inbox().await.unwrap().received.len(), 2);
+    assert_eq!(net.kept(HUB), (2, 2));
+}
+
+#[tokio::test]
+async fn a_payment_under_a_key_left_unanswered_is_found_by_it_and_resumed() {
+    let Pair {
+        net, alice, code, ..
+    } = pair(Conduct::Keeps).await;
+    let key = [7; 32];
+    net.fail(licash_api::RELEASE, Fault::Dropped);
+    let id = match alice.pay_code_keyed(HUB, &code, 8, key).await {
+        Err(Error::Pending { id, .. }) => id,
+        other => panic!("{other:?}"),
+    };
+    let sent = alice.sent_by_key(&key).unwrap().unwrap();
+    assert_eq!(sent.id, id);
+    assert!(
+        matches!(sent.state, State::Offered | State::Signed),
+        "{sent:?}"
+    );
+    // Not paid again under it while under way.
+    assert!(alice.pay_code_keyed(HUB, &code, 8, key).await.is_err());
+    let resumed = alice.resume().await.unwrap();
+    assert_eq!(resumed.paid.len(), 1);
+    assert_eq!(alice.sent_by_key(&key).unwrap().unwrap().state, State::Done);
+    assert_eq!(alice.sends().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_payment_under_a_key_refused_for_its_fee_is_given_up_not_made_again() {
+    let net = Net::new();
+    net.start(HUB, Fee { base: 1, ppm: 0 });
+    net.conduct(HUB, Conduct::Keeps);
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, bob) = (wallet(&net, &dir, 1), wallet(&net, &dir, 2));
+    // Alice agreed to fees the hub no longer charges.
+    *net.stale.lock().unwrap() = Some(Fee { base: 0, ppm: 0 });
+    alice.add_hub(HUB).await.unwrap();
+    *net.stale.lock().unwrap() = None;
+    bob.add_hub(HUB).await.unwrap();
+    alice.receive(&net.pay(HUB, &alice.address(), 50)).unwrap();
+    let code = bob
+        .payment_code(&[HUB.into()], false)
+        .unwrap()
+        .licash
+        .unwrap();
+    let key = [7; 32];
+    let refused = alice.pay_code_keyed(HUB, &code, 8, key).await;
+    assert!(
+        matches!(&refused, Err(Error::Refused { problem, .. }) if problem.code == licash_api::Code::Fee),
+        "{refused:?}"
+    );
+    // Given up, its notes freed: one payment under the key, ever.
+    let sent = alice.sent_by_key(&key).unwrap().unwrap();
+    assert!(matches!(sent.state, State::Abandoned(_)), "{sent:?}");
+    assert_eq!(held(&alice), 50);
+    assert!(alice.pay_code_keyed(HUB, &code, 8, key).await.is_err());
+    assert_eq!(alice.sends().unwrap().len(), 1);
+    // Unkeyed, the payment is made at the new fees.
+    alice.pay_code(HUB, &code, 8).await.unwrap();
+    assert_eq!(held(&alice), 50 - 8 - 1);
 }

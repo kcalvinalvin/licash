@@ -1178,22 +1178,24 @@ impl<T: Transport> Wallet<T> {
         if amount == 0 {
             return Err(Error::Invalid("nothing to pay".into()));
         }
-        match self.send_once(&url, payee, amount, delivered).await {
+        match self.send_once(&url, payee, amount, delivered, None).await {
             Err(Error::Refused { problem, .. }) if problem.code == Code::Fee => {
                 tracing::info!(%url, %problem, "fees changed, paying the new ones");
                 self.refresh(&url).await?;
-                self.send_once(&url, payee, amount, delivered).await
+                self.send_once(&url, payee, amount, delivered, None).await
             }
             sent => sent,
         }
     }
 
-    async fn send_once(
+    /// One payment, under `key` if given, recorded with it.
+    pub(crate) async fn send_once(
         &self,
         url: &str,
         payee: &Address,
         amount: u64,
         delivered: Option<Option<[u8; 32]>>,
+        key: Option<[u8; 32]>,
     ) -> Result<Paid, Error> {
         let (hub, info) = self.hub(url)?;
         let fees = self.agreed_fees(hub, url, &info)?;
@@ -1217,8 +1219,8 @@ impl<T: Transport> Wallet<T> {
         };
         self.store.write(|tx| {
             tx.execute(
-                "INSERT INTO sends (id, hub, payee, amount, fee, offer, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO sends (id, hub, payee, amount, fee, offer, created_at, key)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     id.as_bytes(),
                     hub,
@@ -1226,7 +1228,8 @@ impl<T: Transport> Wallet<T> {
                     sql(amount),
                     sql(selection.fee),
                     offer,
-                    now()
+                    now(),
+                    key
                 ],
             )?;
             if let (Some(mailbox), Some(shared)) = (delivered, shared) {
@@ -1738,14 +1741,27 @@ impl<T: Transport> Wallet<T> {
 
     /// The payments made, newest first.
     pub fn sends(&self) -> Result<Vec<Sent>, Error> {
+        self.sends_under(None)
+    }
+
+    /// The payment made under `key` ([`Wallet::pay_code_keyed`]), if one
+    /// was: where it stands decides what its payer does, whatever the call
+    /// that made it returned.
+    pub fn sent_by_key(&self, key: &[u8; 32]) -> Result<Option<Sent>, Error> {
+        Ok(self.sends_under(Some(key))?.pop())
+    }
+
+    /// The payments made, latest first: those under `key` only if given.
+    fn sends_under(&self, key: Option<&[u8; 32]>) -> Result<Vec<Sent>, Error> {
         self.store.read(|c| {
             let mut stmt = c.prepare(
                 "SELECT s.id, r.url, s.payee, s.amount, s.fee, s.release IS NOT NULL,
                     s.done_at IS NOT NULL, s.abandoned, s.created_at
                  FROM sends s JOIN reach r ON r.hub = s.hub
+                 WHERE ?1 IS NULL OR s.key = ?1
                  ORDER BY s.created_at DESC, s.rowid DESC",
             )?;
-            let rows = stmt.query_map([], |r| {
+            let rows = stmt.query_map([key], |r| {
                 let state = match (r.get::<_, Option<String>>(7)?, r.get(6)?, r.get(5)?) {
                     (Some(reason), _, _) => State::Abandoned(reason),
                     (None, true, _) => State::Done,

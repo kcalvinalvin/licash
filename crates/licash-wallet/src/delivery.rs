@@ -168,6 +168,33 @@ impl<T: Transport> Wallet<T> {
             .await
     }
 
+    /// [`Wallet::pay_code`] under `key`, once: no other payment is ever
+    /// made under it, not even after this one is given up, nor again at
+    /// fees changed meanwhile. The key is recorded with the payment, before
+    /// its hub hears of it, so that a payer stopped at any point learns
+    /// from [`Wallet::sent_by_key`] alone whether it paid, and decides by
+    /// that rather than by what this returned.
+    pub async fn pay_code_keyed(
+        &self,
+        url: &str,
+        code: &LicashCode,
+        amount: u64,
+        key: [u8; 32],
+    ) -> Result<Paid, Error> {
+        let url = crate::hub_url(url)?;
+        if amount == 0 {
+            return Err(Error::Invalid("nothing to pay".into()));
+        }
+        if let Some(sent) = self.sent_by_key(&key)? {
+            return Err(Error::Invalid(format!(
+                "payment {} was made under this key",
+                sent.id
+            )));
+        }
+        self.send_once(&url, &code.address, amount, Some(code.mailbox), Some(key))
+            .await
+    }
+
     /// The payments to mail to their payees' mailboxes now: those whose
     /// payees did not say they have them in time, as their hubs tell,
     /// asked here. Those neither collected nor mailed in the days a hub
