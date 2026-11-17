@@ -770,7 +770,7 @@ fn command(cli: Cli) -> anyhow::Result<()> {
             };
             let every = Duration::from_secs(step);
             // Stopped as the provider stops: dropped on return.
-            let _keeping = match keeper {
+            let keeping = match keeper {
                 Some(keeper) => {
                     tracing::info!("keeping the contracts protecting the provider's notes");
                     let running = keeper.spawn(keeper::EVERY);
@@ -779,7 +779,7 @@ fn command(cli: Cli) -> anyhow::Result<()> {
                 None => None,
             };
             let serving = serve(
-                provider, router, listen, every, notifier, announcing, source,
+                provider, router, listen, every, notifier, announcing, source, keeping,
             );
             runtime.block_on(serving)
         }
@@ -849,6 +849,8 @@ fn open(data: &Path, transport: Http, config: Config) -> anyhow::Result<Provider
     Provider::open(&data.join("swaps.sqlite"), wallet, config).context("open the swaps file")
 }
 
+// Each an explicit part of what it serves: no bundle would say more.
+#[allow(clippy::too_many_arguments)]
 async fn serve(
     provider: Arc<Provider<Http>>,
     router: axum::Router,
@@ -857,6 +859,7 @@ async fn serve(
     notifier: Option<Notifier>,
     announcing: Option<Announcing>,
     chain: Option<Arc<ChainView>>,
+    keeping: Option<keeper::Running>,
 ) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(listen)
         .await
@@ -882,8 +885,12 @@ async fn serve(
         );
         tokio::spawn(notifier.run())
     });
-    let stepping = tokio::spawn(licash_swaps_service::step(provider.clone(), every));
-    let following = chain.map(|chain| {
+    let mut critical = Critical::default();
+    critical.spawn(
+        "the swaps' rounds",
+        licash_swaps_service::step(provider.clone(), every),
+    );
+    if let Some(chain) = chain {
         let terms = provider.payout_terms().copied();
         tracing::debug!(
             chain = %chain.0,
@@ -891,16 +898,29 @@ async fn serve(
             "paying out on Bitcoin"
         );
         tracing::info!("paying out on Bitcoin");
-        tokio::spawn(licash_swaps_service::follow(provider.clone(), chain, every))
-    });
-    let paying = provider.lightning_terms().cloned().map(|terms| {
+        critical.spawn(
+            "the payouts' follower",
+            licash_swaps_service::follow(provider.clone(), chain, every),
+        );
+    }
+    if let Some(terms) = provider.lightning_terms().cloned() {
         tracing::debug!(
             terms = %serde_json::to_string(&terms).unwrap_or_default(),
             "paying over Lightning"
         );
         tracing::info!(node = %terms.node, "paying Lightning invoices");
-        tokio::spawn(licash_swaps_service::pay_invoices(provider.clone(), every))
-    });
+        critical.spawn(
+            "the invoices' payer",
+            licash_swaps_service::pay_invoices(provider.clone(), every),
+        );
+    }
+    if let Some(mut keeping) = keeping {
+        // Its thread ending stops the provider; the provider stopping
+        // drops it, which stops the thread.
+        critical.spawn("the contracts' keeper", async move {
+            keeping.ended().await;
+        });
+    }
     let announcing = announcing.map(|a| {
         let (relays, urls) = (a.relays.join(", "), a.urls.join(", "));
         tracing::debug!(%relays, %urls, "announcement configuration");
@@ -913,22 +933,65 @@ async fn serve(
             a.name,
         ))
     });
+    // Stopped by a signal, or by a critical task's end: then with an
+    // error, for the provider's supervisor (its container's restart
+    // policy) to start it again. Dropped, the others are aborted.
+    let (tell, mut told) = tokio::sync::oneshot::channel();
+    let stop = async move {
+        tokio::select! {
+            () = shutdown() => {}
+            why = critical.stopped() => {
+                tracing::error!("stopping: {why}");
+                let _ = tell.send(why);
+            }
+        }
+    };
     axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown())
+        .with_graceful_shutdown(stop)
         .await?;
-    for task in [Some(stepping), following, paying, announcing]
-        .into_iter()
-        .flatten()
-    {
-        task.abort();
+    if let Some(announcing) = announcing {
+        announcing.abort();
     }
     if let (Some(notifying), Some(notifier)) = (notifying, notifier) {
         // Events not yet sent go out after the next start.
         notifying.abort();
         notifier.stopped().await;
     }
+    if let Ok(why) = told.try_recv() {
+        anyhow::bail!("{why}");
+    }
     tracing::info!("stopped");
     Ok(())
+}
+
+/// The tasks the provider can't serve without, each looping for as long
+/// as it runs: one that returns or panics stops the provider.
+#[derive(Default)]
+struct Critical {
+    set: tokio::task::JoinSet<()>,
+    names: std::collections::HashMap<tokio::task::Id, &'static str>,
+}
+
+impl Critical {
+    fn spawn(
+        &mut self,
+        name: &'static str,
+        task: impl std::future::Future<Output = ()> + Send + 'static,
+    ) {
+        let id = self.set.spawn(task).id();
+        self.names.insert(id, name);
+    }
+
+    /// Why the first of them stopped; pending forever if none runs.
+    async fn stopped(&mut self) -> String {
+        let name = |id| self.names.get(&id).copied().unwrap_or("a task");
+        match self.set.join_next_with_id().await {
+            None => std::future::pending().await,
+            Some(Ok((id, ()))) => format!("{} stopped", name(id)),
+            Some(Err(e)) if e.is_panic() => format!("{} panicked", name(e.id())),
+            Some(Err(e)) => format!("{} was cancelled", name(e.id())),
+        }
+    }
 }
 
 fn test_notify(notify: &Notify) -> anyhow::Result<()> {
@@ -1153,6 +1216,18 @@ fn events(data: &Path, mut after: u64, limit: u32, follow: bool) -> anyhow::Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn the_first_critical_task_to_stop_or_panic_is_named() {
+        let mut critical = Critical::default();
+        critical.spawn("forever", std::future::pending());
+        critical.spawn("the follower", async {});
+        assert_eq!(critical.stopped().await, "the follower stopped");
+        critical.spawn("the keeper", async { panic!("a bug") });
+        assert_eq!(critical.stopped().await, "the keeper panicked");
+        let waited = tokio::time::timeout(Duration::from_millis(50), critical.stopped());
+        assert!(waited.await.is_err(), "the one that runs on stopped");
+    }
 
     fn announcing(route: Route) -> Option<Announcing> {
         Some(Announcing {

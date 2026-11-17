@@ -329,7 +329,18 @@ const MAX_RETRY: Duration = Duration::from_secs(6 * 60 * 60);
 const SCAN_BATCH: u32 = 1_000;
 
 /// A keeper running on its own thread ([`Keeper::spawn`]), until dropped.
-pub struct Running(#[allow(dead_code)] tokio::sync::oneshot::Sender<()>);
+pub struct Running {
+    _stop: tokio::sync::oneshot::Sender<()>,
+    ended: tokio::sync::oneshot::Receiver<()>,
+}
+
+impl Running {
+    /// Done once the keeper's thread ends: by a panic, as it never returns
+    /// otherwise while running.
+    pub async fn ended(&mut self) {
+        let _ = (&mut self.ended).await;
+    }
+}
 
 /// A replacement that failed.
 struct Failure {
@@ -386,9 +397,12 @@ impl<T: Transport + 'static> Keeper<T> {
             .enable_all()
             .build()?;
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        // Dropped as the thread ends, however it does: told to `ended`.
+        let (end, ended) = tokio::sync::oneshot::channel::<()>();
         std::thread::Builder::new()
             .name("contracts".into())
             .spawn(move || {
+                let _end = end;
                 runtime.block_on(async move {
                     tokio::select! {
                         () = self.run(every) => {}
@@ -396,7 +410,7 @@ impl<T: Transport + 'static> Keeper<T> {
                     }
                 });
             })?;
-        Ok(Running(stop))
+        Ok(Running { _stop: stop, ended })
     }
 
     /// Keep the contracts every `every`, for good.
@@ -864,6 +878,20 @@ mod tests {
     use super::*;
     use bitcoin::OutPoint;
     use licash_contracts::holder::Phase;
+
+    #[tokio::test]
+    async fn a_keepers_thread_ending_in_a_panic_is_told() {
+        let (stop, _stopped) = tokio::sync::oneshot::channel();
+        let (end, ended) = tokio::sync::oneshot::channel::<()>();
+        let mut running = Running { _stop: stop, ended };
+        let thread = std::thread::spawn(move || {
+            let _end = end;
+            panic!("a bug");
+        });
+        assert!(thread.join().is_err());
+        let told = tokio::time::timeout(std::time::Duration::from_secs(1), running.ended());
+        assert!(told.await.is_ok());
+    }
 
     const HUB: &str = "https://hub.example";
     const OTHER: &str = "https://other.example";
