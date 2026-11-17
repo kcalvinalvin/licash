@@ -19,6 +19,13 @@ pub const RESERVE_ALICE: u64 = 20_000;
 /// The hub's fee for an opening, from her deposit.
 pub const OPENING_FEE: u64 = 3_000;
 
+/// The hub's reserve in F, from its wallet.
+const RESERVE_HUB: u64 = 100_000;
+
+/// What the hub's wallet keeps besides a contract's collateral and its
+/// reserve, for F's fee and those of the hub's exits, in sat.
+const FUNDING_MARGIN: u64 = 50_000;
+
 /// The most F's and the graph's transactions pay, in sat per 1 000 vB.
 const MAX_RATE_SAT_PER_KVB: u64 = 10_000;
 
@@ -34,6 +41,19 @@ pub const MAX_CAP: u32 = (1 << 31) - 1;
 /// The fewest bits of the graph's payout: as wide as the fixed terms'
 /// graph, whatever the cap.
 const MIN_BITS: u8 = 21;
+
+/// The largest cap the hub's wallet funds with `balance` sat: its
+/// graph's payout, all ones in as many bits as it is wide, at least
+/// [`MIN_BITS`]; its reserve; and [`FUNDING_MARGIN`]. None if not even
+/// the narrowest graph is funded.
+pub fn fundable(balance: u64) -> Option<u32> {
+    let left = balance.checked_sub(RESERVE_HUB + FUNDING_MARGIN)?;
+    let bits = (u64::BITS - left.saturating_add(1).leading_zeros()).saturating_sub(1);
+    (bits >= u32::from(MIN_BITS)).then(|| {
+        let most = (1u64 << bits.min(31)) - 1;
+        u32::try_from(most).unwrap_or(MAX_CAP).min(MAX_CAP)
+    })
+}
 
 /// The caps and durations a hub lets holders choose besides its fixed
 /// terms ([`CAP`] sat over [`LOCK`] blocks), as its operator sets them.
@@ -215,7 +235,7 @@ impl Timing {
                 deposit_units: 500_000,
                 close_height: 0,
                 reserve_alice: RESERVE_ALICE,
-                reserve_hub: 100_000,
+                reserve_hub: RESERVE_HUB,
                 to_self_delay: self.to_self_delay,
                 commit_fee: 1_000,
                 presign_fee: 1_000,
@@ -274,6 +294,17 @@ mod tests {
     use licash_contract::opening::Hub;
     use licash_contract::wire::Writer;
     use sha2::{Digest, Sha256};
+
+    #[test]
+    fn a_wallet_funds_the_widest_graph_it_holds_with_its_reserve_and_margin() {
+        let narrowest = (1u64 << MIN_BITS) - 1 + RESERVE_HUB + FUNDING_MARGIN;
+        assert_eq!(fundable(narrowest), Some(2_097_151));
+        assert_eq!(fundable(narrowest - 1), None);
+        assert_eq!(fundable(0), None);
+        // Half a bitcoin: 25 bits, short of 26.
+        assert_eq!(fundable(50_000_000), Some(33_554_431));
+        assert_eq!(fundable(u64::MAX), Some(MAX_CAP));
+    }
 
     /// A hub's opening at Funded, of a mock opening on regtest: its keyset
     /// and checkpoint.

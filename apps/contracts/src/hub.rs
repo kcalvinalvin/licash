@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use anyhow::{ensure, Result};
+use anyhow::{ensure, Context as _, Result};
 use axum::body::{Body, Bytes};
 use axum::extract::{DefaultBodyLimit, Path as UrlPath, Query, Request, State};
 use axum::http::StatusCode;
@@ -80,6 +80,9 @@ pub struct Openings {
     evidencer: std::sync::OnceLock<Arc<Evidencer>>,
     /// Each contract's fold offered, until its holder signs or asks again.
     folds: Mutex<HashMap<[u8; 32], dispute::PendingFold>>,
+    /// What the node's wallet last said it holds, in sat: the most it
+    /// funds an F with ([`terms::fundable`]). None until it says.
+    funds: Mutex<Option<u64>>,
 }
 
 /// One responder poll. A bad opening never hides the others; errors are
@@ -241,10 +244,6 @@ impl Openings {
         // Not fatal: a node may load its wallet after the hub starts. F
         // goes unfunded, and its openings given up, until it does. Fatal
         // on another network: no F it funds could be the chain's.
-        let info = wallet.rpc::<serde_json::Value>("getwalletinfo", serde_json::json!([]));
-        if let Err(e) = info.await {
-            tracing::warn!("contracts need the node's wallet, to fund F: {e:#}");
-        }
         match wallet.profile().await {
             Ok(theirs) => ensure!(
                 theirs == profile,
@@ -274,7 +273,11 @@ impl Openings {
             watch: dispute::Watch::default(),
             evidencer: std::sync::OnceLock::new(),
             folds: Mutex::default(),
+            funds: Mutex::new(None),
         });
+        if let Err(e) = openings.learn_funds().await {
+            tracing::warn!("contracts need the node's wallet, to fund F: {e:#}");
+        }
         // A node restarted forgets the coins it locked without persisting.
         let locked = openings.store().locked()?;
         openings.lock_coins(&locked).await;
@@ -294,6 +297,12 @@ impl Openings {
     pub async fn offer(&self, chosen: Option<(u32, u32)>) -> Result<Offer, Refused> {
         let (cap, blocks) = chosen.unwrap_or((terms::CAP, terms::LOCK));
         self.timing.allows(cap, blocks).map_err(Refused::bad)?;
+        let most = self.most_funded(terms::MAX_CAP);
+        if cap > most {
+            return Err(Refused::unavailable(format!(
+                "the hub's wallet funds caps of {most} sat at most now"
+            )));
+        }
         let tip = self.source.tip().await.map_err(Refused::unavailable)?;
         let checkpoint = self.source.checkpoint(tip.height).await;
         let checkpoint = checkpoint.map_err(Refused::unavailable)?;
@@ -306,8 +315,12 @@ impl Openings {
 
     /// What the hub's info says of its contracts: its fixed terms, as
     /// apps installed open on, and those holders may choose, if any.
+    /// Its range's largest cap, as much as its wallet funds now.
     pub fn advertise(&self) -> licash_api::Contracts {
-        let range = self.timing.range();
+        let range = self.timing.range().map(|mut r| {
+            r.max_cap = self.most_funded(r.max_cap).max(r.min_cap);
+            r
+        });
         licash_api::Contracts {
             cap: terms::CAP,
             price: self.timing.price(terms::CAP, terms::LOCK),
@@ -343,12 +356,50 @@ impl Openings {
         self.store().abandon(id, before)
     }
 
-    /// Sweep every minute, for as long as the hub runs: never returns.
+    /// `most`, or less if the node's wallet, as it last said, funds no F
+    /// of a cap so large: none if it funds none. As `most` if not known.
+    fn most_funded(&self, most: u32) -> u32 {
+        let funds = *self.funds.lock().unwrap_or_else(PoisonError::into_inner);
+        match funds {
+            Some(balance) => terms::fundable(balance).unwrap_or(0).min(most),
+            None => most,
+        }
+    }
+
+    /// Ask the node's wallet what it holds, confirmed: logged when the
+    /// largest cap it funds changes.
+    pub async fn learn_funds(&self) -> Result<()> {
+        let info: serde_json::Value = self
+            .wallet
+            .rpc("getwalletinfo", serde_json::json!([]))
+            .await?;
+        let btc = info["balance"].as_f64().context("a wallet's info, no balance")?;
+        let balance = bitcoin::Amount::from_btc(btc)?.to_sat();
+        let before = self
+            .funds
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .replace(balance);
+        let cap = terms::fundable(balance);
+        if before.map(terms::fundable) != Some(cap) {
+            match cap {
+                Some(cap) => tracing::info!(balance, cap, "the contracts' wallet funds caps up to"),
+                None => tracing::warn!(balance, "the contracts' wallet funds no contract"),
+            }
+        }
+        Ok(())
+    }
+
+    /// Sweep, and learn what the node's wallet holds, every minute, for
+    /// as long as the hub runs: never returns.
     pub async fn sweep_every_minute(self: Arc<Self>) {
         loop {
             tokio::time::sleep(Duration::from_secs(60)).await;
             if let Err(e) = self.sweep().await {
                 tracing::error!("giving up idle openings: {e:#}");
+            }
+            if let Err(e) = self.learn_funds().await {
+                tracing::warn!("what the contracts' wallet holds: {e:#}");
             }
         }
     }
@@ -612,7 +663,30 @@ mod tests {
             watch: dispute::Watch::default(),
             evidencer: std::sync::OnceLock::new(),
             folds: Mutex::default(),
+            funds: Mutex::new(None),
         }
+    }
+
+    #[test]
+    fn its_range_is_as_large_as_its_wallet_funds() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut openings = test_openings(dir.path());
+        let range = Range {
+            max_cap: 100_000_000,
+            max_blocks: 52_560,
+            per_coin: 2,
+            ppm_year: 10_000,
+        };
+        openings.timing = Timing::of(ChainProfile::Core30DefaultRegtest, Some(range)).unwrap();
+        let max = |o: &Openings| o.advertise().range.unwrap().max_cap;
+        // Not known yet: as the operator set it.
+        assert_eq!(max(&openings), 100_000_000);
+        *openings.funds.lock().unwrap() = Some(50_000_000);
+        assert_eq!(max(&openings), 33_554_431);
+        // None funded: its least, and opening one is refused.
+        *openings.funds.lock().unwrap() = Some(1_000_000);
+        assert_eq!(max(&openings), terms::CAP);
+        assert_eq!(openings.most_funded(terms::CAP), 0);
     }
 
     #[test]
