@@ -12,7 +12,10 @@ mod socks;
 use std::{
     collections::HashMap,
     path::Path,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, Instant},
 };
 
@@ -62,6 +65,8 @@ pub struct Tor {
     tls: TlsConnector,
     isolation: Arc<Isolation>,
     kept: Arc<Kept>,
+    /// Whether a [`Tor::bootstrap`] is under way.
+    connecting: Arc<AtomicBool>,
 }
 
 /// Which circuits streams may share: those to the same host only, so that
@@ -123,7 +128,38 @@ impl Tor {
             tls: TlsConnector::from(Arc::new(tls)),
             isolation: Arc::default(),
             kept: Arc::new(Kept::new(KEPT_FOR)),
+            connecting: Arc::default(),
         })
+    }
+
+    /// How far the client is in connecting to the Tor network.
+    pub fn status(&self) -> Status {
+        let s = self.client.bootstrap_status();
+        Status {
+            percent: (s.as_frac().clamp(0.0, 1.0) * 100.0).round() as u8,
+            ready: s.ready_for_traffic(),
+            summary: s.to_string(),
+            blocked: s.blocked().map(|b| b.to_string()),
+        }
+    }
+
+    /// Connect to the Tor network now rather than at the first stream:
+    /// done at once if connected, else when it is. Done at once too if
+    /// another call is already connecting, so that asking again and again
+    /// starts one attempt at a time.
+    pub async fn bootstrap(&self) -> Result<(), String> {
+        struct Connecting<'a>(&'a AtomicBool);
+        impl Drop for Connecting<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        if self.connecting.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        // Cleared however it ends, dropped half way included.
+        let _connecting = Connecting(&self.connecting);
+        self.client.bootstrap().await.map_err(|e| e.to_string())
     }
 
     /// This client, its streams on circuits of their own, shared with no
@@ -136,6 +172,7 @@ impl Tor {
             tls: self.tls.clone(),
             isolation: Arc::default(),
             kept: Arc::new(Kept::new(KEPT_FOR)),
+            connecting: self.connecting.clone(),
         }
     }
 
@@ -287,6 +324,19 @@ impl Tor {
             .map_err(|e| format!("TLS: {e}"))?;
         Ok(Box::new(stream))
     }
+}
+
+/// How far a client is in connecting to the Tor network.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Status {
+    /// Of the way, 0 to 100.
+    pub percent: u8,
+    /// Whether it can carry streams.
+    pub ready: bool,
+    /// What it is doing, as Arti says.
+    pub summary: String,
+    /// Why it seems stuck, if it does: a clock wrong, the network blocked.
+    pub blocked: Option<String>,
 }
 
 /// What `open` opened, tried once more on new circuits (`renew`) should
@@ -708,6 +758,15 @@ mod tests {
         assert_eq!(tor.isolation.of("hub.example"), hub);
         assert!(!Arc::ptr_eq(&one.kept, &tor.kept));
         assert!(Arc::ptr_eq(&one.client, &tor.client));
+    }
+
+    #[tokio::test]
+    async fn a_client_never_used_is_not_connected() {
+        let dir = tempfile::tempdir().unwrap();
+        let status = Tor::new(dir.path()).unwrap().status();
+        assert!(!status.ready, "{status:?}");
+        assert!(status.percent < 100, "{status:?}");
+        assert!(!status.summary.is_empty());
     }
 
     #[tokio::test]
