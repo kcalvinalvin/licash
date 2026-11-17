@@ -2,10 +2,10 @@
 //! hub, up to the contract's cap, claimed on Bitcoin, paid back on Bitcoin
 //! once the hub's window to answer passed. Started only by the holder's
 //! explicit choice, carried on with the other contracts as the chain
-//! moves. A hub that answers instead leaves it to the holder's proof of
-//! her claim, made elsewhere from the statement the wallet exports
-//! ([`Wallet::recovery_statement`]) and brought back
-//! ([`Wallet::import_recovery_proof`]).
+//! moves. A hub that answers instead says what the claim is owed and must
+//! prove it on Bitcoin: the wallet checks the hub's proof, challenges one
+//! that does not verify, and is paid what the outcome says. The phone
+//! proves nothing.
 
 use std::sync::{Arc, PoisonError};
 
@@ -48,20 +48,21 @@ pub struct Recovery {
     /// What stopped its last step, if anything did.
     pub error: Option<String>,
     /// The hub's answer to its request, its id in hex, and the last block
-    /// the proof may be posted in, once known.
+    /// the hub's proof may be posted in, once known.
     #[uniffi(default = None)]
     pub response: Option<String>,
     #[uniffi(default = None)]
     pub deadline: Option<u32>,
-    /// Whether its proof is kept.
+    /// Whether the hub's proof, once posted, verifies.
     #[uniffi(default = false)]
     pub proved: bool,
-    /// The proof posted, and the payout after it, their ids in hex.
+    /// The hub's proof posted, and the payout after it, their ids in hex.
     #[uniffi(default = None)]
     pub assertion: Option<String>,
     #[uniffi(default = None)]
     pub payout: Option<String>,
-    /// Corrected principal, distinct from the original claim and net sweep.
+    /// What the hub says the claim is owed, distinct from the claim and
+    /// from what was received.
     #[uniffi(default = None)]
     pub corrected: Option<u64>,
     #[uniffi(default = None)]
@@ -85,19 +86,16 @@ pub enum RecoveryStage {
     Sweeping,
     /// Its value back in the wallet on Bitcoin.
     Done,
-    /// A legacy counter awaiting reclassification on the next advance.
+    /// The hub answered that the claim is owed less: its proof awaited.
     Answered,
     /// The contract's collateral went elsewhere.
     Lost,
-    /// The hub answered: the statement to prove being built from the
-    /// chain, then the proof needed by [`Recovery::deadline`].
-    Proving,
-    /// The proof posted on Bitcoin, until in a block.
-    Asserting,
-    /// The proof in a block: the hub's chance to challenge it running,
-    /// then the payout on its way.
+    /// The hub's proof in a block: checked, then the payout on its way.
     Asserted,
-    /// The hub challenged the proof: the answer on its way.
+    /// The hub's proof did not verify: the wallet's challenge on its way.
+    Challenging,
+    /// The challenge in a block: the hub's chance to answer it running,
+    /// then the payout on its way.
     Challenged,
     /// The payout after the proof in a block: its delay running.
     Paid,
@@ -111,11 +109,10 @@ fn stage(s: Stage) -> RecoveryStage {
         Stage::TimingOut | Stage::TimedOut => RecoveryStage::TimingOut,
         Stage::Sweeping => RecoveryStage::Sweeping,
         Stage::Done => RecoveryStage::Done,
-        Stage::Countered => RecoveryStage::Answered,
-        Stage::Answered | Stage::Proving => RecoveryStage::Proving,
-        Stage::Asserting => RecoveryStage::Asserting,
+        Stage::Answered => RecoveryStage::Answered,
         Stage::Asserted | Stage::Succeeding => RecoveryStage::Asserted,
-        Stage::Answering => RecoveryStage::Challenged,
+        Stage::Challenging => RecoveryStage::Challenging,
+        Stage::Challenged => RecoveryStage::Challenged,
         Stage::Paid => RecoveryStage::Paid,
         Stage::Lost => RecoveryStage::Lost,
     }
@@ -187,49 +184,6 @@ impl Wallet {
         Ok(all.iter().map(shown).collect())
     }
 
-    /// The statement to prove of contract `id` (in hex), once the hub
-    /// answered and it is built (`RecoveryStage::Proving`): to prove
-    /// on a computer (`licash-r0 native-prove-succinct`, then
-    /// `native-wrap`). Private: it shows the notes claimed.
-    pub fn recovery_statement(&self, id: String) -> Result<Vec<u8>, LicashError> {
-        let id = contract_id(&id)?;
-        recovery::statement(&self.dir, &id).map_err(failed)
-    }
-
-    /// The program contract `id`'s statement is proved with, its image id
-    /// in hex: the app proves it with `<image id>.bin` among those it
-    /// carries (`r0/programs`). Refused before the statement is built.
-    pub fn recovery_program(&self, id: String) -> Result<String, LicashError> {
-        let id = contract_id(&id)?;
-        let statement = recovery::statement(&self.dir, &id).map_err(failed)?;
-        let input = licash::statement::StatementInput::from_bytes(&statement)
-            .map_err(|e| failed(anyhow::anyhow!("its statement: {e}")))?;
-        Ok(hex::encode(input.base.parts().recipe.holder_program))
-    }
-
-    /// Bring back the proof of contract `id`'s claim, `export` as
-    /// `licash-r0 native-wrap` wrote it: checked against the contract,
-    /// kept, and posted on Bitcoin through `chain` at once. The same proof
-    /// again is no error; another is refused once one is kept.
-    pub fn import_recovery_proof(
-        &self,
-        chain: Arc<dyn ChainSource>,
-        id: String,
-        export: Vec<u8>,
-    ) -> Result<Recovery, LicashError> {
-        let id = contract_id(&id)?;
-        let _contracting = self
-            .contracting
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        let chain = Chain(chain, self.wallet.network());
-        let imported =
-            recovery::import_proof(&self.wallet, &chain, &self.dir, &id, &export, rate());
-        let imported = self.runtime.block_on(imported).map_err(failed)?;
-        tracing::warn!(id = %hex::encode(id), stage = imported.stage.as_str(), "a contract's proof brought");
-        Ok(shown(&imported))
-    }
-
     /// Give up forcing contract `id` closed, its notes back in the
     /// balance: only while `RecoveryStage::Claimed`.
     pub fn give_up_recovery(&self, id: String) -> Result<(), LicashError> {
@@ -258,19 +212,16 @@ mod tests {
     use super::*;
 
     /// The app's stages of a forced close the hub answered: its proof
-    /// awaited, posted, challenged, paid; a counter, which this app does
-    /// not answer, as answered, at an end for it.
+    /// awaited, posted, challenged, paid.
     #[test]
-    fn a_disputed_close_shows_its_own_stages_and_a_counter_as_answered() {
+    fn a_disputed_close_shows_its_own_stages() {
         let cases = [
-            (Stage::Answered, RecoveryStage::Proving),
-            (Stage::Proving, RecoveryStage::Proving),
-            (Stage::Asserting, RecoveryStage::Asserting),
+            (Stage::Answered, RecoveryStage::Answered),
             (Stage::Asserted, RecoveryStage::Asserted),
             (Stage::Succeeding, RecoveryStage::Asserted),
-            (Stage::Answering, RecoveryStage::Challenged),
+            (Stage::Challenging, RecoveryStage::Challenging),
+            (Stage::Challenged, RecoveryStage::Challenged),
             (Stage::Paid, RecoveryStage::Paid),
-            (Stage::Countered, RecoveryStage::Answered),
             (Stage::TimedOut, RecoveryStage::TimingOut),
         ];
         for (s, shown) in cases {

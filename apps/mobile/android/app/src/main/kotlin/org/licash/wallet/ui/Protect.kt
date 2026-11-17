@@ -43,7 +43,6 @@ import org.licash.core.ContractInspection
 import org.licash.core.ContractState
 import org.licash.core.Recovery
 import org.licash.core.RecoveryStage
-import org.licash.wallet.Proving
 import org.licash.wallet.digits
 import org.licash.wallet.sat
 import org.licash.wallet.share
@@ -64,12 +63,6 @@ internal fun CoverRow(
     end: () -> Unit,
     forceClose: () -> Unit,
     giveUp: () -> Unit,
-    saveStatement: (Uri) -> Unit = {},
-    bringProof: (Uri) -> Unit = {},
-    proving: Proving? = null,
-    proveHere: (() -> Unit)? = null,
-    stopProving: () -> Unit = {},
-    saveReceipt: (Uri) -> Unit = {},
     safety: suspend () -> ContractSafety? = { null },
     inspection: suspend () -> ContractInspection? = { null },
     explorer: (String) -> String? = { null },
@@ -141,12 +134,6 @@ internal fun CoverRow(
             Column {
                 if (recovery != null) {
                     Forced(recovery, developer, giveUp, height)
-                    if (needsProof(recovery)) {
-                        ProveElsewhere(recovery, saveStatement, bringProof)
-                        proveHere?.let {
-                            ProveHere(proving, "${recovery.id.take(16)}.receipt", it, stopProving, saveReceipt)
-                        }
-                    }
                 } else {
                     Unfolded(c, cover, developer, end, forceClose, plan, height)
                 }
@@ -188,8 +175,7 @@ private fun ContractLayout(info: ContractInspection, explorer: (String) -> Strin
         Line("Claim note limit", digits(info.noteLimit.toULong()))
         Line("Denominations (sat)", info.denominations.joinToString { digits(it) })
         Line("Keyset", info.keyset)
-        Line("Holder program", info.holderProgram)
-        Line("Counter program", info.counterProgram)
+        Line("Hub program", info.program)
         Text(info.address, style = MaterialTheme.typography.bodySmall)
     }
 }
@@ -211,7 +197,7 @@ private fun Unfolded(c: Contract, cover: Cover, developer: Boolean, end: () -> U
             if (planning) {
                 Sheet("Recovery planning", dismiss = { planning = false }) {
                     Line("Your proof margin", "${it.proofMargin} blocks")
-                    Say("Planning only. Start earlier for confirmation time. Stay online: a late hub answer can reduce your proving time until your timeout confirms.")
+                    Say("Planning only. Start earlier for confirmation time. Stay online: the wallet checks the hub's proof and must challenge a bad one in time.")
                 }
             }
         }
@@ -241,12 +227,12 @@ private fun Unfolded(c: Contract, cover: Cover, developer: Boolean, end: () -> U
 private fun Forced(r: Recovery, developer: Boolean, giveUp: () -> Unit, height: Int) {
     Line("Claimed", sat(r.claimed), tag = "recovery-claimed")
     r.corrected?.let {
-        Line("Unspent claim", sat(it), tag = "recovery-corrected")
+        Line("Owed, the hub says", sat(it), tag = "recovery-corrected")
         Say("Before reserves and Bitcoin fees.")
     }
     r.received?.let { Line("Back on Bitcoin", sat(it), tag = "recovery-received") }
-    if (needsProof(r) && height > 0) r.deadline?.let {
-        Line("Time left to prove", "${it.toLong().minus(height).coerceAtLeast(0)} blocks")
+    if (r.stage == RecoveryStage.ANSWERED && height > 0) r.deadline?.let {
+        Line("Hub's time left to prove", "${it.toLong().minus(height).coerceAtLeast(0)} blocks")
     }
     r.error?.let { Line("Stopped by", it) }
     if (developer) {
@@ -255,8 +241,8 @@ private fun Forced(r: Recovery, developer: Boolean, giveUp: () -> Unit, height: 
         r.publication?.let { Line("Claim", it.take(16) + "…") }
         r.timeout?.let { Line("Payback", it.take(16) + "…") }
         r.response?.let { Line("Hub's answer", it.take(16) + "…") }
-        r.deadline?.let { Line("Prove by", "block $it") }
-        r.assertion?.let { Line("Proof", it.take(16) + "…") }
+        r.deadline?.let { Line("Hub proves by", "block $it") }
+        r.assertion?.let { Line("Hub's proof", it.take(16) + "…") }
         r.payout?.let { Line("Payout", it.take(16) + "…") }
         r.sweep?.let { Line("Sweep", it.take(16) + "…") }
     }

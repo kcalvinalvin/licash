@@ -56,12 +56,17 @@ internal fun watchOf(ui: Ui, now: Long): Watch {
     }
 }
 
-/** A forced close's stages from its proof's posting until paid: kept at work, the hub's challenge to answer in time. */
-internal val DISPUTED = setOf(RecoveryStage.ASSERTING, RecoveryStage.ASSERTED, RecoveryStage.CHALLENGED)
+/** A forced close's stages from the hub's answer until paid: kept at work, the hub's proof to check and challenge in time. */
+internal val DISPUTED = setOf(
+    RecoveryStage.ANSWERED,
+    RecoveryStage.ASSERTED,
+    RecoveryStage.CHALLENGING,
+    RecoveryStage.CHALLENGED,
+)
 
-/** Legacy counters are reclassified when the app next advances them in the foreground. */
+/** Whether `recovery` still has steps to carry on. */
 internal fun carriedOn(recovery: Recovery): Boolean =
-    recovery.stage !in setOf(RecoveryStage.DONE, RecoveryStage.ANSWERED, RecoveryStage.LOST)
+    recovery.stage !in setOf(RecoveryStage.DONE, RecoveryStage.LOST)
 
 /**
  * A deposit whose own payment on Bitcoin was never sent: it ends only once

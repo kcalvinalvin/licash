@@ -64,7 +64,6 @@ internal fun HubPage(
     var forcing by remember { mutableStateOf<Contract?>(null) }
     var canceling by remember { mutableStateOf<String?>(null) }
     var cancelingBusy by remember { mutableStateOf(false) }
-    val proofs by engine.prover.proofs.collectAsState()
     var fees by remember { mutableStateOf(false) }
     var moving by remember { mutableStateOf(false) }
 
@@ -108,20 +107,6 @@ internal fun HubPage(
                     end = { ending = c },
                     forceClose = { forcing = c },
                     giveUp = { canceling = c.id },
-                    saveStatement = { to ->
-                        scope.launch { engine.saveStatement(c.id, to).onFailure { fail(explain(it)) } }
-                    },
-                    bringProof = { from -> engine.bringProof(c.id, from) },
-                    proving = proofs[c.id],
-                    proveHere = if (engine.prover.available) {
-                        { scope.launch { engine.proveHere(c.id).onFailure { fail(explain(it)) } } }
-                    } else {
-                        null
-                    },
-                    stopProving = { engine.stopProving() },
-                    saveReceipt = { to ->
-                        scope.launch { engine.saveReceipt(c.id, to).onFailure { fail(explain(it)) } }
-                    },
                 )
             }
             if (opening && !stepping) {

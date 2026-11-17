@@ -267,24 +267,27 @@ fun forcing(recovery: Recovery, height: Int): Forcing {
         RecoveryStage.TIMING_OUT -> "Paying back" to (wait?.let { "Back on Bitcoin in $it" } ?: "The hub did not answer")
         RecoveryStage.SWEEPING -> "Sweeping" to "To your Bitcoin, once in a block"
         RecoveryStage.DONE -> "Recovered" to "${sat(recovery.received ?: recovery.claimed)} back on Bitcoin"
-        RecoveryStage.ANSWERED -> "Preparing proof" to "Connect to Bitcoin to classify the hub's answer"
+        RecoveryStage.ANSWERED -> "Answered" to answered(recovery, height)
         RecoveryStage.LOST -> "Lost" to "Its bitcoin went elsewhere"
-        RecoveryStage.PROVING -> "Proof needed" to proving(recovery, height)
-        RecoveryStage.ASSERTING -> "Proving" to "Posting your proof on Bitcoin"
-        RecoveryStage.ASSERTED -> "Proved" to (wait?.let { "The hub has $it to challenge your proof" } ?: "Being paid")
-        RecoveryStage.CHALLENGED -> "Challenged" to "Answering the hub's challenge of your proof"
+        RecoveryStage.ASSERTED -> "Hub proved" to (wait?.let { "${owed(recovery)}: paid in $it" } ?: "Being paid")
+        RecoveryStage.CHALLENGING -> "Challenging" to "The hub's proof does not check: challenging it on Bitcoin"
+        RecoveryStage.CHALLENGED -> "Challenged" to (wait?.let { "The hub has $it to answer the challenge" } ?: "Being paid")
         RecoveryStage.PAID -> "Paying back" to (wait?.let { "Back on Bitcoin in $it" } ?: "Paid on Bitcoin")
     }
-    val failed = recovery.stage == RecoveryStage.ANSWERED || recovery.stage == RecoveryStage.LOST
+    val failed = recovery.stage == RecoveryStage.LOST
     return Forcing(stands, says, revocable, failed)
 }
 
-/** What a forced close the hub answered waits for: the statement to prove, then its proof by its deadline. */
-private fun proving(recovery: Recovery, height: Int): String {
-    val deadline = recovery.deadline ?: return "The hub answered: preparing what to prove"
-    if (recovery.proved) return "Your proof is kept: posting it"
+/** What the hub says the claim is owed, in words. */
+private fun owed(recovery: Recovery): String =
+    recovery.corrected?.let { "The hub says ${sat(it)} is owed" } ?: "The hub answered"
+
+/** A forced close the hub answered: its proof awaited, by its deadline. */
+private fun answered(recovery: Recovery, height: Int): String {
+    val deadline = recovery.deadline ?: return owed(recovery)
     val left = span(deadline.toLong() - height).takeIf { height > 0 }
-    return left?.let { "The hub answered: prove your claim within $it" } ?: "The hub answered: prove your claim"
+    return left?.let { "${owed(recovery)}: it must prove so within $it, or you are paid your claim" }
+        ?: "${owed(recovery)}: it must prove so, or you are paid your claim"
 }
 
 /** The steps of setting a protection up, the last its payment confirming. */
@@ -296,13 +299,8 @@ const val SETUP_STEPS = 7f
  */
 fun setup(step: OpeningStep): Pair<Float, String> = when (step) {
     OpeningStep.Terms -> 0f to "Asking the hub"
-    OpeningStep.Instances -> 1f to "The hub is preparing"
-    OpeningStep.Checking -> 2f to "Checking"
-    is OpeningStep.Downloading -> {
-        // Of its downloads, how far; then what they are for, built.
-        val part = step.kept.toFloat() / step.keeping.coerceAtLeast(1u).toFloat()
-        3f + part * 0.9f to if (step.kept < step.keeping) "Downloading ${step.kept} of ${step.keeping}" else "Building"
-    }
+    OpeningStep.Choosing -> 1.5f to "The hub is choosing"
+    OpeningStep.Uploading -> 3f to "Sending to the hub"
     OpeningStep.Signatures -> 4f to "Waiting for the hub"
     OpeningStep.Signing -> 5f to "Signing"
     is OpeningStep.Confirming -> 6f to if (step.confirmations == 0u) "Waiting for Bitcoin" else "Confirming"

@@ -134,9 +134,7 @@ class CoverTest {
         // The chain's height unknown: no wait said.
         assertNull(forcing(recovery(RecoveryStage.CLAIMED), height = 0).says)
         assertEquals("3,000 sat back on Bitcoin", forcing(recovery(RecoveryStage.DONE, true, null), 1_000).says)
-        for (stage in listOf(RecoveryStage.ANSWERED, RecoveryStage.LOST)) {
-            assertTrue(forcing(recovery(stage, true), 1_000).failed)
-        }
+        assertTrue(forcing(recovery(RecoveryStage.LOST, true), 1_000).failed)
     }
 
     @Test
@@ -148,20 +146,20 @@ class CoverTest {
     }
 
     @Test
-    fun a_forced_close_the_hub_answered_asks_for_its_proof_by_its_deadline() {
-        val answered = recovery(RecoveryStage.PROVING, irrevocable = true, nextAt = null)
-        assertEquals("The hub answered: preparing what to prove", forcing(answered, 1_000).says)
-        assertFalse(needsProof(answered))
-        val proving = answered.copy(deadline = 1_144u)
-        assertEquals("Proof needed", forcing(proving, 1_000).stands)
-        assertEquals("The hub answered: prove your claim within 24 hours", forcing(proving, 1_000).says)
-        assertTrue(needsProof(proving) && !forcing(proving, 1_000).failed)
-        assertFalse(needsProof(proving.copy(proved = true)))
-        val asserted = forcing(recovery(RecoveryStage.ASSERTED, true), 1_000)
-        assertEquals("The hub has 24 hours to challenge your proof", asserted.says)
+    fun a_forced_close_the_hub_answered_awaits_the_hubs_proof_by_its_deadline() {
+        val answered = recovery(RecoveryStage.ANSWERED, irrevocable = true, nextAt = null)
+        assertEquals("The hub answered", forcing(answered, 1_000).says)
+        assertFalse(forcing(answered, 1_000).failed)
+        val owed = answered.copy(deadline = 1_144u, corrected = 1_000uL)
+        assertEquals("Answered", forcing(owed, 1_000).stands)
+        assertEquals(
+            "The hub says 1,000 sat is owed: it must prove so within 24 hours, or you are paid your claim",
+            forcing(owed, 1_000).says,
+        )
+        val asserted = forcing(recovery(RecoveryStage.ASSERTED, true).copy(corrected = 1_000uL), 1_000)
+        assertEquals("The hub says 1,000 sat is owed: paid in 24 hours", asserted.says)
+        assertEquals("Challenging", forcing(recovery(RecoveryStage.CHALLENGING, true), 1_000).stands)
         assertEquals("Back on Bitcoin in 24 hours", forcing(recovery(RecoveryStage.PAID, true), 1_000).says)
-        // A counter, which this app does not answer: failed.
-        assertTrue(forcing(recovery(RecoveryStage.ANSWERED, true), 1_000).failed)
     }
 
     @Test

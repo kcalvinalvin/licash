@@ -64,15 +64,9 @@ Needs a JDK 17 or later, the Android SDK (platform 37) with the NDK at
 
 ```sh
 ./native.sh                 # the core, its Kotlin bindings and the chain AAR
-./prover.sh                 # optional: the phone's prover and the programs it proves
 ./gradlew assembleDebug     # app/build/outputs/apk/debug/app-debug.apk
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
-
-`./prover.sh` builds `r0/host`'s `licash-r0` for each ABI (about 60 MB
-each) and copies `r0/programs`; with `SAMPLE=<statement input>`, it adds a
-sample statement that advanced mode proves on the phone, to see how long a
-proof takes there.
 
 ## Releases
 
@@ -171,20 +165,17 @@ and on the hub's page in Settings. A contract ends no sooner: End says to cash o
 hub's notes instead. In advanced mode, a contract whose hub stopped
 answering can be forced closed: the notes it covers are claimed on Bitcoin
 and paid back there once the hub's window to answer passed. A hub that
-answers instead leaves it to a proof of the claim, by a deadline the row
-shows: it offers to save the statement to prove on a computer (`licash-r0`,
-as [the wallet's README](../../wallet-cli/README.md) says) and to bring the
-proof back, and, in an app built with `./prover.sh`, to prove it on the
-phone itself, for hours, carried on after any stop; that proof's last step
-(its Groth16 wrap) still needs an x86 computer with Docker, its receipt
-saved from the row. The contracts are kept beside the wallet's file, made
+answers instead says what the claim is owed, and must prove it on Bitcoin
+by a deadline the row shows: the app checks the hub's proof, challenges one
+that does not verify, and is paid what the outcome says. The phone proves
+nothing, and no root key of the wallet is revealed: the claim's notes are
+tied to no key that owns the contract. The contracts are kept beside the wallet's file, made
 only once one is asked for.
 
 Coverage uses the actual whole-note recovery selection, not nominal caps:
 only settled, unreserved notes of the opening's keyset, at most 32 or its
 lower signed note limit. Notes are allocated once, earliest deadline first.
-Genuine current-image contracts count with external proving available;
-unreadable or unsupported openings count as zero. Balance details show the
+Genuine current-image contracts count; unreadable or unsupported openings count as zero. Balance details show the
 total number of held notes.
 
 Unfold a signed contract for its locked value, payout-pool and reserve
@@ -193,8 +184,8 @@ The claim cap is a limit inside the payout pool, not extra collateral.
 Technical details reveal the signed note limit, denominations, keyset,
 graph version and program identities. Earlier opening stages show progress
 rather than guessed signed details.
-Corrected recoveries show the unspent claim separately from the original
-claim. Once done, the returned amount is the actual sweep output, including
+Answered recoveries show what the hub says is owed separately from the
+original claim. Once done, the returned amount is the actual sweep output, including
 the effect of reserves and fees, not the original claimed amount.
 
 Before its request is signed, Cancel closing asks for confirmation and

@@ -394,13 +394,11 @@ pub struct Contract {
 pub enum OpeningStep {
     /// The hub's terms, for the wallet's open.
     Terms,
-    /// The hub's commitment to the instances of its programs it builds.
-    Instances,
-    /// The instances the hub opened, checked by the wallet.
-    Checking,
-    /// The instances the wallet keeps, downloaded from the hub: `kept`
-    /// of `keeping` so far, then the contract's transactions built.
-    Downloading { kept: u32, keeping: u32 },
+    /// The hub's choice of the instances the wallet garbled it keeps.
+    Choosing,
+    /// Those instances, sent to the hub, then the contract's transactions
+    /// built.
+    Uploading,
     /// The hub's signatures of those transactions.
     Signatures,
     /// The wallet's signature of the funding.
@@ -483,8 +481,8 @@ pub struct ContractInspection {
     pub denominations: Vec<u64>,
     pub keyset: String,
     pub graph_version: u32,
-    pub holder_program: String,
-    pub counter_program: String,
+    /// The image id of the program the hub proves its answers with.
+    pub program: String,
 }
 
 /// What opening a contract at a hub costs now, and what pays it.
