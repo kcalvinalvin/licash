@@ -20,8 +20,13 @@
 //! Timed locks ([`Hub::lock`]) pay on a preimage or refund once expired,
 //! as the hub's scan of Bitcoin decides ([`Hub::observe`]).
 //!
+//! Against a holder's recovery claim, the ledger yields its evidence
+//! ([`Hub::evidence`]): the spends that retired the claimed notes and the
+//! branch each claimed lock was not settled on.
+//!
 //! [`Ledger`] reads the database beside a running hub, for monitoring.
 
+mod evidence;
 mod forwards;
 mod locks;
 mod records;

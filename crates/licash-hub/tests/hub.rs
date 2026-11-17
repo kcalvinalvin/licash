@@ -360,6 +360,71 @@ fn a_spend_is_offered_once_released_once_and_pays_the_hub() {
     assert_eq!(income, (1, 1));
 }
 
+/// A claim of `coins`, as a holder files it in a contract at the hub.
+fn claim_of(keyset: &Keyset, coins: &[&Coin]) -> licash::claim::UnsignedClaim {
+    use licash::claim::{Context, Item, Parts, UnsignedClaim};
+    let items: Vec<_> = coins
+        .iter()
+        .map(|c| Item::Settled(c.note.message().clone()))
+        .collect();
+    let mut authorizations: Vec<_> = items.iter().map(|i| i.message().clone()).collect();
+    authorizations.sort_by_key(|m| m.identifier().unwrap());
+    let context = Context {
+        base: [7; 32],
+        deposit: [8; 36],
+        cap: 1_000,
+    };
+    let parts = Parts {
+        items,
+        sources: vec![],
+        activations: vec![],
+        authorizations,
+    };
+    UnsignedClaim::new(context, keyset, 1, parts, 16).unwrap()
+}
+
+#[test]
+fn a_claim_of_notes_the_hub_released_a_spend_of_meets_that_spend_and_its_unlock() {
+    use licash::recovery::Evidence as Against;
+    let files = files();
+    let hub = open(&files, Policy::default());
+    let (_, keyset) = issuer(&files);
+    let (alice, bob) = (owner(1), owner(2));
+    let (spent, kept) = (mint(&files, &alice, 8), mint(&files, &alice, 4));
+    // Nothing against notes the ledger never retired.
+    assert!(hub
+        .evidence(&claim_of(&keyset, &[&spent, &kept]))
+        .unwrap()
+        .is_empty());
+    let spend = Spend::new(&keyset, std::slice::from_ref(&spent), &[(bob.address(), 8)]);
+    let grant = spend.offer(&hub).unwrap();
+    let signed = spend.sign(&keyset, Authorization::Granted(Box::new(grant.clone())));
+    let unlock = hub.release(&signed, &spend.notes()).unwrap();
+
+    let found = hub.evidence(&claim_of(&keyset, &[&kept, &spent])).unwrap();
+    let [Against::Spend {
+        signed: cited,
+        notes,
+        unlock: Some(cited_unlock),
+    }] = &found[..]
+    else {
+        panic!("not the released spend alone");
+    };
+    assert_eq!(cited.proposal().id(), spend.proposal.id());
+    assert_eq!(notes.len(), 1);
+    assert_eq!(notes[0].to_bytes(), spent.note.to_bytes());
+    assert_eq!(*cited_unlock, unlock);
+    grant.verify_unlock(&keyset, cited_unlock).unwrap();
+    // The same ledger, the same evidence, across a restart.
+    drop(hub);
+    let hub = open(&files, Policy::default());
+    let again = hub.evidence(&claim_of(&keyset, &[&spent])).unwrap();
+    assert_eq!(
+        licash::recovery::evidence_to_bytes(&again),
+        licash::recovery::evidence_to_bytes(&found)
+    );
+}
+
 #[test]
 fn spends_pay_the_policy_fee_in_outputs_to_the_hub() {
     let files = files();
