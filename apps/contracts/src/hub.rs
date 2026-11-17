@@ -340,17 +340,14 @@ impl Openings {
         self.store().abandon(id, before)
     }
 
-    /// Sweep every minute, for as long as the hub runs.
-    pub fn spawn_sweeper(self: &Arc<Self>) {
-        let this = self.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_secs(60)).await;
-                if let Err(e) = this.sweep().await {
-                    tracing::error!("giving up idle openings: {e:#}");
-                }
+    /// Sweep every minute, for as long as the hub runs: never returns.
+    pub async fn sweep_every_minute(self: Arc<Self>) {
+        loop {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            if let Err(e) = self.sweep().await {
+                tracing::error!("giving up idle openings: {e:#}");
             }
-        });
+        }
     }
 
     /// Find the evidence against holders' claims with `f` from now on: the
@@ -386,17 +383,14 @@ impl Openings {
         Ok(round)
     }
 
-    /// Poll every `every` while the hub runs.
-    pub fn spawn_responder(self: &Arc<Self>, every: Duration) {
-        let this = self.clone();
-        tokio::spawn(async move {
-            loop {
-                if let Err(e) = this.answer_requests().await {
-                    tracing::error!("automatic contract responder: {e:#}");
-                }
-                tokio::time::sleep(every).await;
+    /// Play the exits every `every` while the hub runs: never returns.
+    pub async fn respond_every(self: Arc<Self>, every: Duration) {
+        loop {
+            if let Err(e) = self.answer_requests().await {
+                tracing::error!("automatic contract responder: {e:#}");
             }
-        });
+            tokio::time::sleep(every).await;
+        }
     }
 
     async fn context(&self) -> Result<Context, Refused> {

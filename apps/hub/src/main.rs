@@ -1097,13 +1097,11 @@ fn command(cli: Cli) -> anyhow::Result<()> {
                     let openings = runtime.block_on(opening).context("open the contracts")?;
                     // What each holder agrees to pay at most from now on.
                     openings.charging(hub.info().policy.fees());
-                    openings.spawn_sweeper();
                     // Holders' exits are played as they come: the hub
                     // decides each claim against its ledger, and proves
                     // what it answers.
                     let ledger = hub.clone();
                     openings.evidence_with(Arc::new(move |claim| Ok(ledger.evidence(claim)?)));
-                    openings.spawn_responder(response_poll);
                     tracing::info!(
                         mock = openings.advertise().mock,
                         ?range,
@@ -1209,6 +1207,8 @@ fn command(cli: Cli) -> anyhow::Result<()> {
             };
             let announced = announcing.as_ref().map(|a| a.urls.clone());
             let urls = Arc::new(std::sync::RwLock::new(announced.unwrap_or_default()));
+            // Sweeping idle openings and playing exits as they come.
+            let responding = contracts.clone().map(|c| (c, response_poll));
             let services = Services {
                 gateway: gateway.clone(),
                 deposits: deposits.clone(),
@@ -1237,6 +1237,7 @@ fn command(cli: Cli) -> anyhow::Result<()> {
                 _ => None,
             };
             let tasks = Tasks {
+                contracts: responding,
                 chain,
                 notifier,
                 gateway,
@@ -1523,6 +1524,8 @@ fn swap_provider(
 
 /// What runs beside the API, if configured.
 struct Tasks {
+    /// The contracts, their exits played every so often.
+    contracts: Option<(Arc<Openings>, Duration)>,
     chain: Option<(Source, ChainProfile, Duration)>,
     notifier: Option<Notifier>,
     gateway: Option<Arc<Gateway>>,
@@ -1552,6 +1555,7 @@ async fn serve(
     tasks: Tasks,
 ) -> anyhow::Result<()> {
     let Tasks {
+        contracts,
         chain,
         notifier,
         gateway,
@@ -1582,26 +1586,36 @@ async fn serve(
         );
         tokio::spawn(notifier.run(hub.clone()))
     });
-    let indexing = match (&chain, tweaks) {
-        (Some((source, network, every)), Some((index, from))) => {
-            let indexing = tweaks::index(index, source.clone(), *network, from, *every);
-            Some(tokio::spawn(indexing))
-        }
-        _ => None,
-    };
-    let watching = chain
-        .map(|(source, network, every)| tokio::spawn(watch(hub.clone(), source, network, every)));
-    if watching.is_none() {
-        tracing::warn!("following no chain (--chain): locks are refused");
+    // What the hub can't do without: one stopping stops it.
+    let mut critical = Critical::default();
+    if let Some((openings, every)) = contracts {
+        critical.spawn(
+            "the idle openings' sweeper",
+            openings.clone().sweep_every_minute(),
+        );
+        critical.spawn("the contracts' responder", openings.respond_every(every));
     }
-    let paying = gateway.clone().map(|gateway| {
+    if let (Some((source, network, every)), Some((index, from))) = (&chain, tweaks) {
+        let indexing = tweaks::index(index, source.clone(), *network, from, *every);
+        critical.spawn("the tweaks' index", indexing);
+    }
+    match chain {
+        Some((source, network, every)) => {
+            critical.spawn(
+                "the chain's watch",
+                watch(hub.clone(), source, network, every),
+            );
+        }
+        None => tracing::warn!("following no chain (--chain): locks are refused"),
+    }
+    if let Some(gateway) = gateway.clone() {
         tracing::info!("running a Lightning gateway");
-        tokio::spawn(gateway.run())
-    });
-    let depositing = deposits.map(|deposits| {
+        critical.spawn("the Lightning gateway", gateway.run());
+    }
+    if let Some(deposits) = deposits {
         tracing::info!("taking deposits on Bitcoin");
-        tokio::spawn(deposits.run())
-    });
+        critical.spawn("the deposits", deposits.run());
+    }
     let mut swaps = Vec::new();
     // Stopped as the hub stops: dropped on return.
     let mut _keeping = None;
@@ -1620,10 +1634,10 @@ async fn serve(
         let address = hex::encode(provider.wallet().address().to_bytes());
         tracing::debug!(%address, config = %serde_json::to_string(provider.config())?, "swap configuration");
         tracing::info!("providing swaps");
-        swaps.push(tokio::spawn(licash_swaps_service::step(
-            provider.clone(),
-            every,
-        )));
+        critical.spawn(
+            "the swaps",
+            licash_swaps_service::step(provider.clone(), every),
+        );
         // Its events not yet sent go out after the next start.
         swaps.extend(notifier.map(|notifier| tokio::spawn(notifier.run())));
         if let Some(a) = &announcing {
@@ -1639,14 +1653,23 @@ async fn serve(
         tracing::info!("announcing on Nostr");
         tokio::spawn(announce(hub.clone(), a.relays, a.route, a.urls, a.name))
     });
+    // Stopped by a signal, or by a critical task's end: then with an
+    // error, for the hub's supervisor (its container's restart policy) to
+    // start it again. Dropped, the others are aborted.
+    let (tell, mut told) = tokio::sync::oneshot::channel();
+    let stop = async move {
+        tokio::select! {
+            () = shutdown() => {}
+            why = critical.stopped() => {
+                tracing::error!("stopping: {why}");
+                let _ = tell.send(why);
+            }
+        }
+    };
     axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown())
+        .with_graceful_shutdown(stop)
         .await?;
-    for task in [watching, indexing, paying, depositing, announcing]
-        .into_iter()
-        .flatten()
-        .chain(swaps)
-    {
+    for task in announcing.into_iter().chain(swaps) {
         task.abort();
     }
     if let (Some(notifying), Some(notifier)) = (notifying, notifier) {
@@ -1654,8 +1677,41 @@ async fn serve(
         notifying.abort();
         notifier.stopped().await;
     }
+    if let Ok(why) = told.try_recv() {
+        anyhow::bail!("{why}");
+    }
     tracing::info!("stopped");
     Ok(())
+}
+
+/// The tasks the hub can't serve without, each looping for as long as it
+/// runs: one that returns or panics stops the hub.
+#[derive(Default)]
+struct Critical {
+    set: tokio::task::JoinSet<()>,
+    names: std::collections::HashMap<tokio::task::Id, &'static str>,
+}
+
+impl Critical {
+    fn spawn(
+        &mut self,
+        name: &'static str,
+        task: impl std::future::Future<Output = ()> + Send + 'static,
+    ) {
+        let id = self.set.spawn(task).id();
+        self.names.insert(id, name);
+    }
+
+    /// Why the first of them stopped; pending forever if none runs.
+    async fn stopped(&mut self) -> String {
+        let name = |id| self.names.get(&id).copied().unwrap_or("a task");
+        match self.set.join_next_with_id().await {
+            None => std::future::pending().await,
+            Some(Ok((id, ()))) => format!("{} stopped", name(id)),
+            Some(Err(e)) if e.is_panic() => format!("{} panicked", name(e.id())),
+            Some(Err(e)) => format!("{} was cancelled", name(e.id())),
+        }
+    }
 }
 
 fn test_notify(notify: &Notify) -> anyhow::Result<()> {
@@ -1778,7 +1834,19 @@ fn events(db: &Path, mut after: u64, limit: u32, follow: bool) -> anyhow::Result
 mod tests {
     use clap::Parser;
 
-    use super::{Cli, Command};
+    use super::{Cli, Command, Critical};
+
+    #[tokio::test]
+    async fn the_first_critical_task_to_stop_or_panic_is_named() {
+        let mut critical = Critical::default();
+        critical.spawn("forever", std::future::pending());
+        critical.spawn("the watch", async {});
+        assert_eq!(critical.stopped().await, "the watch stopped");
+        critical.spawn("the responder", async { panic!("a bug") });
+        assert_eq!(critical.stopped().await, "the responder panicked");
+        let waited = tokio::time::timeout(std::time::Duration::from_millis(50), critical.stopped());
+        assert!(waited.await.is_err(), "the one that runs on stopped");
+    }
 
     fn mailboxes(args: &[&str]) -> Vec<String> {
         let cli = Cli::try_parse_from([&["licash-hub", "run"], args].concat()).unwrap();

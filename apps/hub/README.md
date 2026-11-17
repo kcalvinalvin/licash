@@ -193,6 +193,11 @@ not looked at again. Keep `<data>/responses.sqlite` with `openings.sqlite`:
 it pins the evidence each response is decided on and each one-time
 signature (the response, the assertion) before it is made.
 
+The hub stops, with an error, when one of its loops stops: the chain's
+watch, the tweaks' index, the gateways, the contracts' responder and
+sweeper, the swaps. Run it under a supervisor that starts it again (as
+Docker's `restart: unless-stopped`).
+
 With `--swaps` (and `--chain`), the hub provides the swaps into it from the
 hubs of `--swaps-from URL=CAP`: a wallet locks its notes at such a hub to
 the hub's provider, and the hub locks notes it issues to the wallet under
