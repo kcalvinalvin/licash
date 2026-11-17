@@ -12,6 +12,8 @@
 # The recovery contract, on Lichen and ln-gap as vendor/fetch.sh copies
 # them: run it before building an image.
 !crates/licash-contract
+# The hub's statement, of the contract and of its recovery.
+!crates/licash-hp
 # Its corrected claims' proofs, verified by the holder's recovery.
 !crates/licash-groth16
 !regtest/Cargo.toml
