@@ -105,6 +105,14 @@ runs `lock <address> <amount> <hash>`, and the payee runs `claim <id>
 Through a hub with a Lightning gateway, `pay-invoice <bolt11>` pays an
 invoice with a lock refunded if the payment fails, and `invoice <amount>`
 prints an invoice paying the wallet; `resume` takes the payment once made.
+`pay-invoice <bolt11> --via <provider>` has a swap provider paying
+Lightning invoices pay it from its own node instead, for a lock of notes
+at `--hub` to the provider, its fee on top (at most `--max-fee`, 1% and 100
+sat by default). The lock expires soon after the provider's routes end: a
+payment that fails leaves it to be refunded then. Running it again for the
+same invoice asks again with the same lock. An invoice another wallet asked
+its hub for pays that wallet notes there: notes at one hub pay notes at
+another, with no notes of the provider at the other.
 
 Through a hub taking deposits, `deposit <amount>` prints a BIP21 URI to pay
 on Bitcoin, the hub's fee on top; `resume` takes the notes once the payment

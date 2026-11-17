@@ -17,8 +17,8 @@ use licash_api::Payment;
 use licash_nostr::{wallet::swap_providers, Role, Route};
 use licash_transport::Http;
 use licash_wallet::{
-    Deposit, DepositState, Error, Invoice, InvoiceState, Lock, LockState, PaymentCode, State, Swap,
-    SwapLimits, SwapState, Wallet,
+    Deposit, DepositState, Error, Invoice, InvoiceState, Lock, LockState, Payable, PaymentCode,
+    State, Swap, SwapLimits, SwapState, Wallet,
 };
 use rand_core::{OsRng, RngCore};
 use serde_json::json;
@@ -227,12 +227,23 @@ enum Command {
         max_fee: Option<u64>,
     },
     /// Pay a Lightning invoice through a hub, its fee on top: the hub pays
-    /// it for a lock of notes, refunded if the payment fails.
+    /// it for a lock of notes, refunded if the payment fails. With --via,
+    /// a swap provider pays it instead, for a lock of notes at the hub to
+    /// it, refunded once expired if the payment fails.
     PayInvoice {
         invoice: String,
-        /// Through this hub [default: the one holding the most].
+        /// Through this hub, or from notes at it with --via [default: the
+        /// one holding the most].
         #[arg(long)]
         hub: Option<String>,
+        /// Through the swap provider at this URL, from its own Lightning
+        /// node, rather than through the hub.
+        #[arg(long, value_name = "URL")]
+        via: Option<String>,
+        /// The provider's fee at most, in sat, with --via [default: 1% and
+        /// 100].
+        #[arg(long, requires = "via")]
+        max_fee: Option<u64>,
         /// Seconds to wait for the payment to end; `resume` follows it
         /// after.
         #[arg(long, default_value_t = 60)]
@@ -912,12 +923,27 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 ),
             }
         }
-        Command::PayInvoice { invoice, hub, wait } => {
+        Command::PayInvoice {
+            invoice,
+            hub,
+            via,
+            max_fee,
+            wait,
+        } => {
             let hub = match hub {
                 Some(hub) => hub,
                 None => richest(&wallet)?,
             };
-            let lock = wallet.pay_invoice(&hub, &invoice).await?;
+            let lock = match via {
+                Some(provider) => {
+                    let amount = Payable::read(&invoice)?.amount;
+                    let max_fee = max_fee.unwrap_or(SwapLimits::usual(amount).fee);
+                    wallet
+                        .pay_invoice_via(&provider, &hub, &invoice, max_fee)
+                        .await?
+                }
+                None => wallet.pay_invoice(&hub, &invoice).await?,
+            };
             return pay_invoice(&wallet, lock, wait, json).await;
         }
         Command::Invoice { amount, hub } => {
@@ -1124,7 +1150,10 @@ async fn pay_invoice(
 ) -> anyhow::Result<()> {
     let until = std::time::Instant::now() + std::time::Duration::from_secs(wait);
     let mut pending = None;
+    // A provider's payment given up: its lock is refunded only once expired.
+    let given_up = |lock: &Lock| lock.invoice.is_none() && lock.failure.is_some();
     while matches!(lock.state, LockState::Requested | LockState::Locked)
+        && !given_up(&lock)
         && std::time::Instant::now() < until
     {
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -1143,8 +1172,13 @@ async fn pay_invoice(
         _ => lock_line(&lock),
     };
     show(json, lock_json(&lock), text);
+    let given_up = given_up(&lock);
     match (&lock.state, lock.failure) {
         (LockState::Paid(_), _) => Ok(()),
+        (LockState::Locked, Some(failure)) if given_up => bail!(
+            "the invoice was not paid ({failure}); its lock is refunded once expired at {}",
+            lock.expiry
+        ),
         (LockState::Requested | LockState::Locked, _) => Err(Error::Pending {
             id: lock.id,
             reason: pending.unwrap_or_else(|| "the payment is under way".into()),

@@ -18,10 +18,11 @@ use licash_lightning::{
     Node,
 };
 use licash_swaps::{Config, Notice, Provider, Stage, MIN_SLACK};
-use licash_wallet::{Lock, LockState, Wallet};
+use licash_wallet::{Error, Lock, LockState, Response, Transport, Wallet, ROUTE_BLOCKS};
 use net::{Link, Net, TIMING};
 
 const A: &str = "http://a.test";
+const PROVIDER: &str = "http://swaps.test";
 const FEE: Fee = Fee { base: 1, ppm: 0 };
 /// Locks of up to 141 blocks: room for an invoice's routes and the slack.
 const TIMED: Timing = Timing {
@@ -466,4 +467,164 @@ async fn a_provider_without_lightning_terms_pays_no_invoice() {
         other.pay_lightning(node, too_little),
         Err(licash_swaps::Error::Setup(_))
     ));
+}
+
+/// A client's way to the hub and the provider.
+#[derive(Clone)]
+struct Via(Arc<Net>, Arc<Provider<Link>>);
+
+impl Transport for Via {
+    fn request(
+        &self,
+        url: &str,
+        body: Option<Vec<u8>>,
+    ) -> impl std::future::Future<Output = Result<Response, String>> + Send {
+        let (net, provider, url) = (self.0.clone(), self.1.clone(), url.to_owned());
+        async move {
+            let Some(path) = url.strip_prefix(PROVIDER) else {
+                return net.serve(&url, body);
+            };
+            let answer = match (path, body) {
+                (swaps::SWAPS_INFO, None) => {
+                    Ok(serde_json::to_vec(&provider.info().unwrap()).unwrap())
+                }
+                (swaps::LIGHTNING_SWAPS, Some(body)) => {
+                    let request: LightningRequest = serde_json::from_slice(&body).unwrap();
+                    provider
+                        .take_invoice(&request)
+                        .await
+                        .map(|answer| serde_json::to_vec(&answer).unwrap())
+                }
+                _ => Err(licash_api::Problem::invalid("no such route")),
+            };
+            Ok(match answer {
+                Ok(body) => Response { status: 200, body },
+                Err(problem) => Response {
+                    status: problem.code.status(),
+                    body: serde_json::to_vec(&problem).unwrap(),
+                },
+            })
+        }
+    }
+}
+
+/// Hub A, a provider paying invoices through its node, and a client
+/// holding 3,000 at A reaching both.
+async fn via() -> (
+    Arc<Net>,
+    tempfile::TempDir,
+    Arc<Fake>,
+    Arc<Provider<Link>>,
+    Wallet<Via>,
+) {
+    let net = Net::new();
+    net.start_timed(A, FEE, TIMED);
+    let dir = tempfile::tempdir().unwrap();
+    let wallet = Wallet::create(
+        &dir.path().join("wallet.sqlite"),
+        &[0x50; 32],
+        ChainProfile::Core30DefaultRegtest,
+        Link(net.clone()),
+    )
+    .unwrap();
+    wallet.add_hub(A).await.unwrap();
+    let node = Arc::new(Fake::new());
+    node.tip(net.view(A).height(), [0; 32]);
+    let provider = Provider::create(&dir.path().join("swaps.sqlite"), wallet, CONFIG)
+        .unwrap()
+        .pay_lightning(node.clone(), terms(&node))
+        .unwrap();
+    let provider = Arc::new(provider);
+    let client = Wallet::create(
+        &dir.path().join("client.sqlite"),
+        &[0xc1; 32],
+        ChainProfile::Core30DefaultRegtest,
+        Via(net.clone(), provider.clone()),
+    )
+    .unwrap();
+    client.add_hub(A).await.unwrap();
+    client
+        .receive(&net.pay(A, &client.address(), HELD))
+        .unwrap();
+    (net, dir, node, provider, client)
+}
+
+#[tokio::test]
+async fn a_wallet_pays_an_invoice_through_a_provider_once() {
+    let (net, _dir, node, provider, client) = via().await;
+    let preimage = [7; 32];
+    let request = node.invoice(
+        1_000_000,
+        lock_hash(&preimage),
+        DELTA,
+        Outcome::Pay(preimage),
+    );
+    let tip = net.view(A).height();
+    let lock = client
+        .pay_invoice_via(PROVIDER, A, &request, 100)
+        .await
+        .unwrap();
+    // To the provider, the invoice and its fee, expiring once its routes
+    // and its slack end, and a hop more.
+    assert_eq!(lock.state, LockState::Locked);
+    assert_eq!(lock.payee, provider.wallet().address());
+    assert_eq!(lock.amount, terms(&node).pays(1_000_000));
+    assert_eq!(lock.expiry, tip + 24 + DELTA as u32 + 3 + ROUTE_BLOCKS);
+    assert_eq!(lock.invoice, None);
+    assert_eq!(node.sent().len(), 1);
+
+    provider.follow_invoices().await.unwrap();
+    let paid = client.follow_lock(&lock.id).await.unwrap();
+    assert_eq!(paid.state, LockState::Paid(preimage));
+    // Asked again: the same lock, paid, and nothing more locked or paid.
+    let again = client
+        .pay_invoice_via(PROVIDER, A, &request, 100)
+        .await
+        .unwrap();
+    assert_eq!(
+        (again.id, again.state),
+        (lock.id, LockState::Paid(preimage))
+    );
+    assert_eq!(client.locks().unwrap().len(), 1);
+    assert_eq!(node.sent().len(), 1);
+}
+
+#[tokio::test]
+async fn a_payment_a_provider_gave_up_leaves_one_lock_to_expire() {
+    let (_net, _dir, node, provider, client) = via().await;
+    let failed = Outcome::Fail("FAILURE_REASON_NO_ROUTE".into());
+    let request = node.invoice(500_000, lock_hash(&[3; 32]), DELTA, failed);
+    let lock = client
+        .pay_invoice_via(PROVIDER, A, &request, 100)
+        .await
+        .unwrap();
+    assert_eq!((lock.state, lock.failure), (LockState::Locked, None));
+    provider.follow_invoices().await.unwrap();
+    // Asked again: the provider says it failed, which the lock records.
+    let again = client
+        .pay_invoice_via(PROVIDER, A, &request, 100)
+        .await
+        .unwrap();
+    assert_eq!((&again.id, &again.state), (&lock.id, &LockState::Locked));
+    assert!(again.failure.unwrap().contains("NO_ROUTE"));
+    assert_eq!(client.locks().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_wallet_locks_nothing_for_a_provider_asking_too_much() {
+    let (_net, _dir, node, _provider, client) = via().await;
+    let request = node.invoice(1_000_000, lock_hash(&[4; 32]), DELTA, Outcome::Hang);
+    // Its fee is 2 sat and 1%: 12.
+    match client.pay_invoice_via(PROVIDER, A, &request, 11).await {
+        Err(Error::Invalid(why)) => assert!(why.contains("fee of 12 sat"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+    // Nor for an invoice whose final delta outlasts the hub's locks.
+    let long = node.invoice(1_000_000, lock_hash(&[5; 32]), 200, Outcome::Hang);
+    match client.pay_invoice_via(PROVIDER, A, &long, 100).await {
+        Err(Error::Invalid(why)) => assert!(why.contains("outlast"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+    assert!(client.locks().unwrap().is_empty());
+    assert!(node.sent().is_empty());
 }
