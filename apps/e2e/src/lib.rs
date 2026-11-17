@@ -518,6 +518,12 @@ impl Eco {
         Ok(txid.as_str().context("a txid")?.to_owned())
     }
 
+    /// What `url` answers in JSON, an LNURL's for instance.
+    pub async fn get_json(&self, url: &str) -> anyhow::Result<Value> {
+        let response = self.http.get(url).send().await?.error_for_status()?;
+        Ok(response.json().await?)
+    }
+
     /// The most the provider locks at hub 2 now.
     pub async fn stocked(&self) -> anyhow::Result<u64> {
         let at = self.info(self.hub(2)).await?.address;
@@ -732,6 +738,20 @@ impl Eco {
                 &format!("{node}'s channel to {}", NODES[b]),
                 120,
                 || async move { Ok(self.active(node, peer).await?.then_some(())) },
+            )
+            .await?;
+        }
+        // Active is not routable yet: a payment right after fails with no
+        // route, for good, until the node's router has the channel.
+        for (a, b) in CHANNELS {
+            let (node, peer) = (NODES[a], &keys[b]);
+            until(
+                &format!("{node}'s route to {}", NODES[b]),
+                120,
+                || async move {
+                    let args = ["queryroutes", "--dest", peer, "--amt", "1000"];
+                    Ok(self.lncli(node, &args).await.ok().map(|_| ()))
+                },
             )
             .await?;
         }
