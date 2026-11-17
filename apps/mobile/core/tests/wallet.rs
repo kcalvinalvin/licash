@@ -142,6 +142,8 @@ impl Net {
             pay_slack: 4,
             receive: Fee { base: 3, ppm: 0 },
             max_receive: 10_000,
+            // Short, for the hub's short locks to pay receipts inside it.
+            downtime: 2,
             ..lightning::Config::default()
         };
         let path = dir.path().join("lightning.sqlite");
@@ -1298,6 +1300,45 @@ fn a_phone_asks_for_an_invoice_of_the_amount_entered_its_fee_in_it() {
         assert!(refused.contains(&said), "{refused}");
     }
     assert_eq!(alice.ask_invoice_for(10_003).unwrap().amount, 10_000);
+}
+
+#[test]
+fn a_phone_pays_an_invoice_of_a_phone_at_its_hub_inside_it_without_the_gateways_fee() {
+    let net = Net::new(false);
+    let light = Light::new(&net);
+    let alice = funded(&net, &light, "alice");
+    let bob = net.wallet("bob", net.height());
+    let asked = bob.ask_invoice_for(500).unwrap();
+    let request = asked.request.clone().unwrap();
+    let held_before = notes(&alice);
+    // Quoted through its hub, without the gateway's fee of 2.
+    let quote = alice.invoice_quote(request.clone()).unwrap();
+    assert_eq!(
+        (quote.hub.as_str(), quote.amount),
+        (asked.hub.as_str(), 500)
+    );
+    assert!(quote.fee < 2, "{quote:?}");
+    let paying = alice
+        .pay_invoice(request.clone(), quote.hub.clone())
+        .unwrap();
+    assert_eq!(
+        (paying.kind, paying.state),
+        (Kind::Lightning, State::Pending),
+        "{paying:?}"
+    );
+    // Nothing goes over Lightning: no HTLC can pay it any more.
+    let hash = held(&asked.hash);
+    assert!(!net.node.try_pay_held(hash, net.height() + 100));
+    let paid = bob.follow_invoice(asked.hash.clone()).unwrap();
+    assert_eq!((paid.state, paid.asks), (State::Done, Some(500)));
+    assert_eq!(notes(&bob), 497);
+    net.runtime.block_on(net.lightning.round());
+    alice.resume().unwrap();
+    let history = alice.history().unwrap();
+    let line = history.iter().find(|a| a.kind == Kind::Lightning).unwrap();
+    assert_eq!((line.state, line.amount), (State::Done, 500), "{line:?}");
+    assert_eq!(notes(&alice), held_before - 500 - quote.fee);
+    assert!(net.node.sent().is_empty());
 }
 
 /// The payment hash `hash` of an invoice, in hex, as the node holds it.
