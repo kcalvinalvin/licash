@@ -81,7 +81,7 @@ pub use code::{ContractSecrets, HubId, LicashCode, PaymentCode, MAX_HUBS};
 pub use coins::MAX_INPUTS;
 pub use delivery::{Delivery, Due, Inboxed, ACK_WITHIN};
 pub use deposits::{Deposit, DepositState, DepositTerms};
-pub use lightning::{Invoice, InvoiceState, Payable, ViaQuote, ROUTE_BLOCKS};
+pub use lightning::{refund_blocks, Invoice, InvoiceState, Payable, ViaQuote, ROUTE_BLOCKS};
 pub use locks::{Incoming, Lock, LockState, Via, CLAIM_MARGIN};
 pub use payouts::{
     first_spend, payout_depth, Payout, PayoutProgress, PayoutQuote, PayoutState, CLAIM_ROOM,

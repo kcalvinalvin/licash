@@ -709,11 +709,14 @@ fn a_phone_pays_an_invoice_through_a_provider_when_no_hub_pays_it() {
             failure,
             provider: through,
             expiry,
+            refund_blocks,
         } => {
             assert_eq!((hub, invoice), (hubs.url(0), request.clone()));
             assert_eq!(got, Some(hex::encode(preimage)));
             assert_eq!((failure, through), (None, Some(swaps.url())));
             assert!(expiry.is_some());
+            // Paid: nothing waits to come back.
+            assert_eq!(refund_blocks, None);
         }
         other => panic!("{other:?}"),
     }

@@ -868,7 +868,7 @@ pub enum Details {
     /// bought once paid, or why it was not. Paid by `hub`'s gateway, or by
     /// the swap `provider`, at its URL, for a lock of notes at `hub` that
     /// expires at block `expiry`: a payment it failed returns its notes
-    /// only then.
+    /// only then, `refund_blocks` from the hub's tip while under way.
     Lightning {
         hub: String,
         invoice: String,
@@ -876,6 +876,7 @@ pub enum Details {
         failure: Option<String>,
         provider: Option<String>,
         expiry: Option<u32>,
+        refund_blocks: Option<u32>,
     },
     /// Paid over Lightning, through `hub`: its `invoice`, once the hub
     /// made it, and what it `asks` of the payer, the hub's fee on top; why

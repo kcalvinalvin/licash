@@ -1243,6 +1243,17 @@ impl Wallet {
                     None => (None, lock.invoice.unwrap_or_default()),
                 };
                 let expiry = provider.is_some().then_some(lock.expiry);
+                // Only a provider's payment waits for its lock to expire.
+                let under_way = matches!(
+                    lock.state,
+                    licash_wallet::LockState::Requested | licash_wallet::LockState::Locked
+                );
+                let refund_blocks = match (&provider, under_way) {
+                    (Some(_), true) => (self.wallet.hubs()?.into_iter())
+                        .find(|(url, _)| *url == lock.hub)
+                        .map(|(_, info)| licash_wallet::refund_blocks(&info, lock.expiry)),
+                    _ => None,
+                };
                 Ok(Details::Lightning {
                     hub: lock.hub,
                     invoice,
@@ -1250,6 +1261,7 @@ impl Wallet {
                     failure,
                     provider,
                     expiry,
+                    refund_blocks,
                 })
             }
             Kind::Moved => {

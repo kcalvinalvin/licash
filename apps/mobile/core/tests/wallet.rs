@@ -1008,6 +1008,7 @@ fn a_phone_pays_a_lightning_invoice_through_its_hub_and_shows_what_it_cost() {
         failure: None,
         provider: None,
         expiry: None,
+        refund_blocks: None,
     };
     assert_eq!(details, wanted);
 

@@ -399,6 +399,15 @@ fn via_terms(
     Ok((amount, fee, expiry))
 }
 
+/// Blocks from the tip of the hub saying `info`, as it last said, until a
+/// lock there expiring at `expiry` returns its notes: once that deep. None
+/// if it follows no chain.
+pub fn refund_blocks(info: &licash_api::Info, expiry: u32) -> u32 {
+    info.locks.as_ref().map_or(0, |l| {
+        expiry.saturating_sub(l.height).saturating_add(l.min_depth)
+    })
+}
+
 /// What paying an invoice through a swap provider costs, from notes at a
 /// hub ([`Wallet::invoice_quote_via`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -451,16 +460,13 @@ impl<T: Transport> Wallet<T> {
         let (locked, fee, expiry) = via_terms(&provider, &offer, at, &invoice, msat, max_fee)?;
         let fees = self.agreed_fees(hub, &url, &info)?;
         let (_, selection) = self.select(hub, locked, &fees.locking())?;
-        let depth = info.locks.as_ref().map_or(0, |l| {
-            expiry.saturating_sub(l.height).saturating_add(l.min_depth)
-        });
         Ok(ViaQuote {
             info: offer,
             amount: msat.div_ceil(1000),
             fee,
             lock_fee: selection.fee,
             expiry,
-            refund_blocks: depth,
+            refund_blocks: refund_blocks(&info, expiry),
         })
     }
 
