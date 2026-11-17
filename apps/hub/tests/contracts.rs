@@ -989,7 +989,10 @@ async fn a_holder_challenges_a_false_assertion_and_its_failure_pays_her_whole_cl
     ensure!(done.assertion.is_some() && !done.proved, "{done:?}");
     ensure!(done.challenge.is_some(), "not challenged: {done:?}");
     // Paid by `failure`, a timed payout of her claim and the hub's reserve.
-    ensure!(done.payout.is_some() && done.timeout == done.payout, "{done:?}");
+    ensure!(
+        done.payout.is_some() && done.timeout == done.payout,
+        "{done:?}"
+    );
     let received = done.received.context("nothing received")?;
     ensure!(received > 5_000, "{received} of a claim of 5000: {done:?}");
     Ok(())
