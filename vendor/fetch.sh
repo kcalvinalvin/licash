@@ -5,7 +5,7 @@
 # beside each other there. Temporary, until both are published.
 set -eu
 cd "$(dirname "$0")"
-LICHEN_REV=3ee4e8f8408db14ccc37146d5af33c4e34c0a053
+LICHEN_REV=de1c3f17bb2b6938626cee8f024a9c1d6e5aa846
 LNGAP_REV=d7972035c12247a07b1dcc1b32e1682cd790d276
 
 copy() { # name, git dir, revision

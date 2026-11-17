@@ -1338,20 +1338,15 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "ark-bn254",
- "ark-ec",
- "ark-ff",
  "ark-groth16",
- "ark-snark",
  "k256",
  "licash",
+ "licash-hp",
  "lichen-babe",
- "lngap-btc",
- "lngap-channel",
- "lngap-lamport",
- "lngap-sessions",
- "rand_chacha",
+ "lichen-btc",
+ "lichen-contract",
+ "lichen-statement",
  "rand_core 0.6.4",
- "serde",
 ]
 
 [[package]]

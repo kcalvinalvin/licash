@@ -1,16 +1,19 @@
-//! licash's recovery contract on Lichen's BABE transaction graph: `graph`
-//! builds and presigns the graph, `opening` opens it between a holder and
-//! a hub, each with its own `keys`, over `wire`'s messages. The regtest
-//! suite (`regtest/`) plays it on Bitcoin Core.
+//! licash's recovery contract on Lichen's hub-proves graph
+//! (`lichen_babe::hp`): the holder requests what she claims and publishes
+//! her claim, the hub responds with what she is owed and proves it, and
+//! she challenges a false proof with the instances she garbled at opening.
+//!
+//! `graph` builds the graph from Base and both parties' keys (`keys`);
+//! `opening` opens it between a holder and a hub over `wire`'s messages;
+//! `dispute` is each side's moves on the chain. The regtest suite
+//! (`regtest/`) plays it on Bitcoin Core.
 
-pub mod close;
 pub mod dispute;
 pub mod graph;
 pub mod keys;
 pub mod opening;
 pub mod wire;
 
-/// Instances the hub builds of each assertion, and how many the holder
-/// keeps.
-pub const INSTANCES: usize = 4;
-pub const KEPT: usize = 2;
+/// The most instances a holder garbles for an opening: what the hub may
+/// ask of her, as each costs her a garbling (and the kept ones an upload).
+pub const MAX_INSTANCES: u16 = 128;

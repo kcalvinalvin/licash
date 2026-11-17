@@ -1,72 +1,79 @@
-//! The opening's messages as bytes: an envelope (`LCOP`, version, kind,
-//! the opening's id, the body's length) around a body of fixed-width
-//! fields, length-prefixed blobs and counts. Whatever arrives is refused
-//! unless whole and of this version: a receiver checks what it says, not
-//! only that it reads.
+//! Canonical, versioned opening messages. Counts are bounded by the
+//! remaining input before allocation, and decoders require the whole body.
+use anyhow::{ensure, Context, Result};
+use k256::ProjectivePoint;
+use licash::{
+    base::{Base, ChainTerms, Fees, GraphTerms, Limits, Recipe},
+    chain::Checkpoint,
+    crypto::Point,
+    note::Keyset,
+};
+use lichen_babe::{
+    opening::Opened as ShareOpening,
+    reveal::LamportPub,
+    setup::{DIGITS, VALUES},
+    vsss::Dealing,
+};
+use lichen_btc::{
+    adaptor::AdaptorSig,
+    bitcoin::{
+        consensus::{deserialize, serialize},
+        secp256k1::{PublicKey, SecretKey, XOnlyPublicKey},
+        OutPoint, ScriptBuf, Transaction, TxOut,
+    },
+    winternitz::{WotsParams, WotsPublic},
+};
+use lichen_contract::PartyPubKeys;
+use std::collections::HashMap;
 
-use anyhow::{bail, ensure, Context, Result};
-use k256::elliptic_curve::sec1::FromEncodedPoint;
-use k256::{AffinePoint, EncodedPoint, ProjectivePoint};
-use licash::base::{ChainTerms, Fees, GraphTerms, Limits, Recipe};
-use licash::chain::Checkpoint;
-use licash::crypto::{Point, Signature};
-use licash::note::Keyset;
-use lichen_babe::reveal::LamportPub;
-use lichen_babe::setup::{Hash, Secret, DIGITS, VALUES};
-use lichen_babe::vsss::Dealing;
-use lngap_btc::adaptor::AdaptorSig;
-use lngap_btc::bitcoin::consensus::{deserialize, serialize};
-use lngap_btc::bitcoin::secp256k1::{PublicKey, SecretKey, XOnlyPublicKey};
-use lngap_btc::bitcoin::{OutPoint, ScriptBuf, Transaction, TxOut};
-use lngap_channel::PartyPubKeys;
-
-use crate::opening::Quote;
+use crate::{
+    graph::{HolderPub, HubPub},
+    opening::Quote,
+};
 
 pub const MAGIC: [u8; 4] = *b"LCOP";
-pub const VERSION: u16 = 1;
+pub const VERSION: u16 = 2;
 
-/// What a message is, in the order of the opening; `Instance` carries one
-/// kept instance after `Opened`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
 pub enum Kind {
     Open = 1,
     Terms,
-    Keys,
     Commit,
     Choose,
     Opened,
+    Instance,
+    Offer,
     Consent,
     Signed,
     Funded,
-    Instance,
 }
 
 impl Kind {
-    const ALL: [Kind; 10] = [
-        Kind::Open,
-        Kind::Terms,
-        Kind::Keys,
-        Kind::Commit,
-        Kind::Choose,
-        Kind::Opened,
-        Kind::Consent,
-        Kind::Signed,
-        Kind::Funded,
-        Kind::Instance,
-    ];
-
-    fn from_u8(kind: u8) -> Option<Kind> {
-        Kind::ALL.iter().find(|k| **k as u8 == kind).copied()
+    pub fn from_u8(n: u8) -> Option<Self> {
+        Some(match n {
+            1 => Self::Open,
+            2 => Self::Terms,
+            3 => Self::Commit,
+            4 => Self::Choose,
+            5 => Self::Opened,
+            6 => Self::Instance,
+            7 => Self::Offer,
+            8 => Self::Consent,
+            9 => Self::Signed,
+            10 => Self::Funded,
+            _ => return None,
+        })
     }
 
-    /// The kind of a message's bytes, unchecked: to route or log it.
-    pub fn peek(bytes: &[u8]) -> Option<Kind> {
-        bytes.get(MAGIC.len() + 2).and_then(|k| Kind::from_u8(*k))
+    pub fn peek(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < 7 || bytes[..4] != MAGIC || bytes[4..6] != VERSION.to_be_bytes() {
+            return None;
+        }
+        Self::from_u8(bytes[6])
     }
 }
 
-/// One message: its kind, the opening it belongs to (the holder's nonce,
-/// Base's) and its body.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Envelope {
     pub kind: Kind,
@@ -77,21 +84,19 @@ pub struct Envelope {
 impl Envelope {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut w = Writer::default();
-        w.0.extend(MAGIC);
-        w.0.extend(VERSION.to_be_bytes());
-        w.0.push(self.kind as u8);
-        w.0.extend(self.id);
+        w.bytes(&MAGIC);
+        w.u16(VERSION);
+        w.u8(self.kind as u8);
+        w.bytes(&self.id);
         w.blob(&self.body);
         w.0
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         let mut r = Reader(bytes);
-        ensure!(r.array::<4>()? == MAGIC, "not an opening's message");
-        let version = u16::from_be_bytes(r.array()?);
-        ensure!(version == VERSION, "message of version {version}");
-        let kind = r.u8()?;
-        let kind = Kind::from_u8(kind).with_context(|| format!("message of kind {kind}"))?;
+        ensure!(r.array::<4>()? == MAGIC, "not an opening message");
+        ensure!(r.u16()? == VERSION, "another opening version");
+        let kind = Kind::from_u8(r.u8()?).context("unknown message kind")?;
         let id = r.array()?;
         let body = r.blob()?.to_vec();
         r.end()?;
@@ -99,68 +104,67 @@ impl Envelope {
     }
 }
 
-/// A message body's fields, written in order.
 #[derive(Default)]
 pub struct Writer(pub Vec<u8>);
-
-/// A message body's fields, read in the order written.
 pub struct Reader<'a>(pub &'a [u8]);
 
 impl Writer {
-    pub fn u8(&mut self, v: u8) {
-        self.0.push(v);
+    pub fn u8(&mut self, n: u8) {
+        self.0.push(n);
     }
-    pub fn u16(&mut self, v: u16) {
-        self.0.extend(v.to_be_bytes());
+    pub fn u16(&mut self, n: u16) {
+        self.bytes(&n.to_be_bytes());
     }
-    pub fn u32(&mut self, v: u32) {
-        self.0.extend(v.to_be_bytes());
+    pub fn u32(&mut self, n: u32) {
+        self.bytes(&n.to_be_bytes());
     }
-    pub fn u64(&mut self, v: u64) {
-        self.0.extend(v.to_be_bytes());
+    pub fn u64(&mut self, n: u64) {
+        self.bytes(&n.to_be_bytes());
     }
-    pub fn bytes(&mut self, v: &[u8]) {
-        self.0.extend(v);
+    pub fn bytes(&mut self, b: &[u8]) {
+        self.0.extend_from_slice(b);
     }
     pub fn count(&mut self, n: usize) {
-        self.u32(u32::try_from(n).expect("a count of a message fits 32 bits"));
+        self.u32(n.try_into().expect("count fits u32"));
     }
-    pub fn blob(&mut self, v: &[u8]) {
-        self.count(v.len());
-        self.0.extend(v);
+    pub fn blob(&mut self, b: &[u8]) {
+        self.count(b.len());
+        self.bytes(b);
     }
     pub fn tx(&mut self, tx: &Transaction) {
         self.blob(&serialize(tx));
     }
-    pub fn outpoint(&mut self, o: &OutPoint) {
-        self.bytes(&serialize(o));
+    pub fn outpoint(&mut self, op: &OutPoint) {
+        self.bytes(&serialize(op));
     }
-    pub fn txout(&mut self, o: &TxOut) {
-        self.blob(&serialize(o));
+    pub fn txout(&mut self, out: &TxOut) {
+        self.blob(&serialize(out));
     }
     pub fn party(&mut self, p: &PartyPubKeys) {
-        for key in [p.funding, p.payment, p.delayed] {
-            self.bytes(&key.serialize());
+        for k in [p.funding, p.payment, p.delayed] {
+            self.bytes(&k.serialize());
         }
         self.blob(p.payout_spk.as_bytes());
     }
-    /// Hashes of fixed width, counted.
     pub fn hashes<const N: usize>(&mut self, hashes: &[[u8; N]]) {
         self.count(hashes.len());
-        hashes.iter().for_each(|h| self.bytes(h));
+        for hash in hashes {
+            self.bytes(hash);
+        }
     }
-    /// A digit's four values each, counted by digit.
     pub fn digits<T>(&mut self, digits: &[[T; VALUES]], mut each: impl FnMut(&mut Self, &T)) {
         self.count(digits.len());
-        for d in digits {
-            d.iter().for_each(|v| each(self, v));
+        for v in digits.iter().flatten() {
+            each(self, v);
         }
     }
     pub fn dealing(&mut self, d: &Dealing) {
         self.count(d.commitments.len());
-        for value in d.commitments.iter().flatten() {
-            self.count(value.len());
-            value.iter().for_each(|c| self.bytes(&point(c)));
+        for v in d.commitments.iter().flatten() {
+            self.count(v.len());
+            for p in v {
+                self.bytes(&Point::from_projective(p).0);
+            }
         }
     }
     pub fn adaptor_sig(&mut self, s: &AdaptorSig) {
@@ -168,9 +172,8 @@ impl Writer {
         self.bytes(&s.r.serialize());
         self.bytes(&s.s_prime.secret_bytes());
     }
-    /// Signatures by name, in the order of their names.
-    pub fn sigs(&mut self, sigs: &std::collections::HashMap<String, Vec<u8>>) {
-        let mut names: Vec<&String> = sigs.keys().collect();
+    pub fn sigs(&mut self, sigs: &HashMap<String, Vec<u8>>) {
+        let mut names: Vec<_> = sigs.keys().collect();
         names.sort();
         self.count(names.len());
         for name in names {
@@ -178,21 +181,87 @@ impl Writer {
             self.blob(&sigs[name]);
         }
     }
-}
-
-fn point(p: &ProjectivePoint) -> [u8; 33] {
-    Point::from_projective(p).0
+    fn wots(&mut self, key: &WotsPublic) {
+        self.u32(key.params.message_digits);
+        self.u32(key.params.checksum_digits);
+        self.hashes(&key.digits);
+    }
+    pub fn holder_pub(&mut self, p: &HolderPub) {
+        self.wots(&p.b_key);
+        self.wots(&p.e_key);
+    }
+    pub fn hub_pub(&mut self, p: &HubPub) {
+        self.wots(&p.b_key);
+        self.digits(&p.lamport.0, |w, h| w.bytes(h));
+        self.digits(&p.adaptor, |w, k| w.bytes(&k.serialize()));
+    }
+    pub fn opened(&mut self, opened: &[ShareOpening]) {
+        self.count(opened.len());
+        for o in opened {
+            self.u32(o.i);
+            self.bytes(&o.seed);
+            self.digits(&o.shares, |w, s| w.bytes(s));
+        }
+    }
+    pub fn quote(&mut self, q: &Quote) {
+        self.blob(&q.keyset.to_bytes());
+        self.u32(q.cap);
+        let g = &q.graph;
+        self.u32(g.id);
+        self.u64(g.unit_sats);
+        self.u8(g.bits);
+        self.u8(g.low_bits);
+        self.u32(g.deposit_units);
+        self.u32(g.close_height);
+        self.u64(g.reserve_alice);
+        self.u64(g.reserve_hub);
+        self.u16(g.to_self_delay);
+        for n in [g.commit_fee, g.presign_fee, g.dust] {
+            self.u64(n);
+        }
+        self.u16(g.delta);
+        self.u16(g.delta_prime);
+        self.u32(g.deadline_margin);
+        self.u32(g.request_height);
+        for n in [
+            g.response_window,
+            g.publication_window,
+            g.assert_window,
+            g.challenge_window,
+            g.answer_window,
+        ] {
+            self.u16(n);
+        }
+        self.u32(q.recipe.graph_version);
+        self.bytes(&q.recipe.program);
+        self.u16(q.recipe.instances);
+        self.u16(q.recipe.kept);
+        self.blob(&q.chain.checkpoint.to_bytes());
+        for n in [
+            q.chain.funding_depth,
+            q.chain.work_depth,
+            q.chain.max_headers,
+            q.limits.max_transaction_bytes,
+            q.limits.max_publication_bytes,
+            q.limits.max_authorizations,
+            q.limits.max_source_inputs,
+        ] {
+            self.u32(n);
+        }
+        self.u64(q.fees.max_rate_sat_per_kvb);
+        self.u64(q.fees.opening_fee_quote);
+    }
 }
 
 impl<'a> Reader<'a> {
     pub fn take(&mut self, n: usize) -> Result<&'a [u8]> {
-        ensure!(self.0.len() >= n, "message cut short");
+        ensure!(n <= self.0.len(), "message cut short");
         let (head, rest) = self.0.split_at(n);
         self.0 = rest;
         Ok(head)
     }
     pub fn array<const N: usize>(&mut self) -> Result<[u8; N]> {
-        Ok(self.take(N)?.try_into().expect("N bytes"))
+        Ok(self.take(N)?.try_into()?)
     }
     pub fn u8(&mut self) -> Result<u8> {
         Ok(self.take(1)?[0])
@@ -206,14 +275,9 @@ impl<'a> Reader<'a> {
     pub fn u64(&mut self) -> Result<u64> {
         Ok(u64::from_be_bytes(self.array()?))
     }
-    /// A count of items of at least `min` bytes each: no more than the
-    /// rest could hold.
     pub fn count(&mut self, min: usize) -> Result<usize> {
         let n = self.u32()? as usize;
-        ensure!(
-            n.saturating_mul(min.max(1)) <= self.0.len(),
-            "count past the message"
-        );
+        ensure!(n <= self.0.len() / min.max(1), "count past message");
         Ok(n)
     }
     pub fn blob(&mut self) -> Result<&'a [u8]> {
@@ -221,7 +285,7 @@ impl<'a> Reader<'a> {
         self.take(n)
     }
     pub fn end(&self) -> Result<()> {
-        ensure!(self.0.is_empty(), "bytes past the message");
+        ensure!(self.0.is_empty(), "bytes past message");
         Ok(())
     }
     pub fn tx(&mut self) -> Result<Transaction> {
@@ -234,7 +298,7 @@ impl<'a> Reader<'a> {
         Ok(deserialize(self.blob()?)?)
     }
     pub fn xonly(&mut self) -> Result<XOnlyPublicKey> {
-        Ok(XOnlyPublicKey::from_slice(&self.array::<32>()?)?)
+        Ok(XOnlyPublicKey::from_slice(self.take(32)?)?)
     }
     pub fn party(&mut self) -> Result<PartyPubKeys> {
         Ok(PartyPubKeys {
@@ -254,29 +318,35 @@ impl<'a> Reader<'a> {
         mut each: impl FnMut(&mut Self) -> Result<T>,
     ) -> Result<Vec<[T; VALUES]>> {
         let n = self.count(size * VALUES)?;
-        ensure!(n == DIGITS, "{n} digits, not {DIGITS}");
+        ensure!(n == DIGITS, "wrong digit count");
         (0..n)
             .map(|_| {
-                let values: Vec<T> = (0..VALUES).map(|_| each(self)).collect::<Result<_>>()?;
-                Ok(values
-                    .try_into()
-                    .unwrap_or_else(|_| unreachable!("four values")))
+                let v: Vec<_> = (0..VALUES).map(|_| each(self)).collect::<Result<_>>()?;
+                Ok(v.try_into().unwrap_or_else(|_| unreachable!()))
             })
             .collect()
     }
     pub fn dealing(&mut self) -> Result<Dealing> {
         let n = self.count(VALUES * 4)?;
+        ensure!(n == DIGITS, "wrong dealing digit count");
         let commitments = (0..n)
             .map(|_| {
                 let values: Vec<Vec<ProjectivePoint>> = (0..VALUES)
                     .map(|_| {
                         let n = self.count(33)?;
-                        (0..n).map(|_| decode_point(&self.array()?)).collect()
+                        (0..n)
+                            .map(|_| {
+                                let bytes: [u8; 33] = self.array()?;
+                                ensure!(
+                                    matches!(bytes[0], 2 | 3),
+                                    "dealing point must not be identity"
+                                );
+                                Ok(Point(bytes).to_projective()?)
+                            })
+                            .collect()
                     })
                     .collect::<Result<_>>()?;
-                Ok(values
-                    .try_into()
-                    .unwrap_or_else(|_| unreachable!("four values")))
+                Ok(values.try_into().unwrap_or_else(|_| unreachable!()))
             })
             .collect::<Result<_>>()?;
         Ok(Dealing { commitments })
@@ -288,737 +358,417 @@ impl<'a> Reader<'a> {
             s_prime: SecretKey::from_slice(self.take(32)?)?,
         })
     }
-    pub fn sigs(&mut self) -> Result<std::collections::HashMap<String, Vec<u8>>> {
+    pub fn sigs(&mut self) -> Result<HashMap<String, Vec<u8>>> {
         let n = self.count(8)?;
-        let mut sigs = std::collections::HashMap::new();
-        let mut last: Option<String> = None;
+        let mut out = HashMap::new();
+        let mut last = None;
         for _ in 0..n {
             let name = String::from_utf8(self.blob()?.to_vec())?;
-            ensure!(last.as_ref() < Some(&name), "signatures out of order");
-            sigs.insert(name.clone(), self.blob()?.to_vec());
+            ensure!(
+                last.as_ref() < Some(&name),
+                "signatures not strictly ordered"
+            );
+            out.insert(name.clone(), self.blob()?.to_vec());
             last = Some(name);
         }
-        Ok(sigs)
+        Ok(out)
     }
-}
-
-fn decode_point(bytes: &[u8; 33]) -> Result<ProjectivePoint> {
-    ensure!(matches!(bytes[0], 2 | 3), "a point not compressed");
-    let encoded = EncodedPoint::from_bytes(bytes)?;
-    let affine: Option<AffinePoint> = AffinePoint::from_encoded_point(&encoded).into();
-    Ok(affine.context("not a point")?.into())
-}
-
-/// The assertion a dispute step or a dealing belongs to: the exit's own
-/// (journal `c = 0`) or a Corrected contract's (`c = 1`).
-pub const STAGES: usize = 2;
-
-/// M1, the holder's: her opening's terms and her side of Base.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Open {
-    pub spend_root: Point,
-    pub party: PartyPubKeys,
-    pub deposit: OutPoint,
-    /// Her deposit's coin: a taproot output, whose value F pays her
-    /// reserve, her fee and her change from.
-    pub coin: TxOut,
-    /// Where F pays her change.
-    pub change: ScriptBuf,
-    pub wanted: Wanted,
-    /// Whether she trusts mock proofs: an opening of either kind only.
-    pub mock: bool,
-}
-
-/// The deadlines a holder asks of a hub.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Wanted {
-    pub assert_height: u32,
-    pub close_height: u32,
-    pub response_window: u16,
-}
-
-impl Open {
-    pub fn encode(&self) -> Vec<u8> {
-        let mut w = Writer::default();
-        w.bytes(&self.spend_root.0);
-        w.party(&self.party);
-        w.outpoint(&self.deposit);
-        w.txout(&self.coin);
-        w.blob(self.change.as_bytes());
-        w.u32(self.wanted.assert_height);
-        w.u32(self.wanted.close_height);
-        w.u16(self.wanted.response_window);
-        w.u8(u8::from(self.mock));
-        w.0
-    }
-    pub fn decode(bytes: &[u8]) -> Result<Self> {
-        let mut r = Reader(bytes);
-        let open = Self {
-            spend_root: Point(r.array()?),
-            party: r.party()?,
-            deposit: r.outpoint()?,
-            coin: r.txout()?,
-            change: ScriptBuf::from_bytes(r.blob()?.to_vec()),
-            wanted: Wanted {
-                assert_height: r.u32()?,
-                close_height: r.u32()?,
-                response_window: r.u16()?,
+    fn wots(&mut self) -> Result<WotsPublic> {
+        Ok(WotsPublic {
+            params: WotsParams {
+                message_digits: self.u32()?,
+                checksum_digits: self.u32()?,
             },
-            mock: match r.u8()? {
-                0 => false,
-                1 => true,
-                other => bail!("trust {other}"),
-            },
+            digits: self.hashes()?,
+        })
+    }
+    pub fn holder_pub(&mut self) -> Result<HolderPub> {
+        let p = HolderPub {
+            b_key: self.wots()?,
+            e_key: self.wots()?,
         };
-        r.end()?;
-        Ok(open)
+        p.check()?;
+        Ok(p)
     }
-}
-
-fn stages<T>(
-    r: &mut Reader<'_>,
-    mut each: impl FnMut(&mut Reader<'_>) -> Result<T>,
-) -> Result<[T; STAGES]> {
-    Ok([each(r)?, each(r)?])
-}
-
-/// M3, the holder's: her public keys under Base: her request keys (her
-/// exit's `b` and `E`), and for each assertion π1's Lamport key and the
-/// challenge's adaptor keys; her corrected `b`'s chains.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Keys {
-    pub request: licash::request::PublicKeys,
-    pub lamport: [LamportPub; STAGES],
-    pub adaptor: [Vec<[XOnlyPublicKey; VALUES]>; STAGES],
-    pub corrected_b: Vec<[u8; 20]>,
-}
-
-impl Keys {
-    pub fn encode(&self) -> Vec<u8> {
-        let mut w = Writer::default();
-        w.blob(&self.request.to_bytes());
-        for stage in 0..STAGES {
-            w.digits(&self.lamport[stage].0, |w, h| w.bytes(h));
-            w.digits(&self.adaptor[stage], |w, k| w.bytes(&k.serialize()));
-        }
-        w.hashes(&self.corrected_b);
-        w.0
-    }
-    pub fn decode(bytes: &[u8]) -> Result<Self> {
-        let mut r = Reader(bytes);
-        let request = licash::request::PublicKeys::from_bytes(r.blob()?)?;
-        let [full, corrected] = stages(&mut r, |r| {
-            Ok((
-                LamportPub(r.digits(20, |r| r.array())?),
-                r.digits(32, |r| r.xonly())?,
-            ))
-        })?;
-        let keys = Self {
-            request,
-            lamport: [full.0, corrected.0],
-            adaptor: [full.1, corrected.1],
-            corrected_b: r.hashes()?,
+    pub fn hub_pub(&mut self) -> Result<HubPub> {
+        let p = HubPub {
+            b_key: self.wots()?,
+            lamport: LamportPub(self.digits(20, |r| r.array())?),
+            adaptor: self.digits(32, |r| r.xonly())?,
         };
-        r.end()?;
-        Ok(keys)
+        p.check()?;
+        Ok(p)
     }
-}
-
-/// M4, the hub's: F as it funds it, unsigned, the coins it spends (one
-/// per input, in order), the publication coins among its outputs, final
-/// D, and for each assertion its dealing and its instances' commitments,
-/// all before the holder chooses.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Commit {
-    pub funding: Transaction,
-    pub prevouts: Vec<TxOut>,
-    pub publication: [(OutPoint, TxOut); 5],
-    pub d: [u8; 32],
-    pub dealings: [Dealing; STAGES],
-    pub commitments: [Vec<Hash>; STAGES],
-}
-
-impl Commit {
-    pub fn encode(&self) -> Vec<u8> {
-        let mut w = Writer::default();
-        w.tx(&self.funding);
-        w.count(self.prevouts.len());
-        self.prevouts.iter().for_each(|o| w.txout(o));
-        for (outpoint, txout) in &self.publication {
-            w.outpoint(outpoint);
-            w.txout(txout);
-        }
-        w.bytes(&self.d);
-        self.dealings.iter().for_each(|d| w.dealing(d));
-        self.commitments.iter().for_each(|c| w.hashes(c));
-        w.0
+    pub fn opened(&mut self) -> Result<Vec<ShareOpening>> {
+        let n = self.count(40)?;
+        (0..n)
+            .map(|_| {
+                Ok(ShareOpening {
+                    i: self.u32()?,
+                    seed: self.array()?,
+                    shares: self.digits(32, |r| r.array())?,
+                })
+            })
+            .collect()
     }
-    pub fn decode(bytes: &[u8]) -> Result<Self> {
-        let mut r = Reader(bytes);
-        let funding = r.tx()?;
-        let prevouts = (0..r.count(4)?).map(|_| r.txout()).collect::<Result<_>>()?;
-        let publication: Vec<(OutPoint, TxOut)> = (0..5)
-            .map(|_| Ok((r.outpoint()?, r.txout()?)))
-            .collect::<Result<_>>()?;
-        let commit = Self {
-            funding,
-            prevouts,
-            publication: publication.try_into().expect("five coins"),
-            d: r.array()?,
-            dealings: stages(&mut r, |r| r.dealing())?,
-            commitments: stages(&mut r, |r| r.hashes())?,
-        };
-        r.end()?;
-        Ok(commit)
-    }
-}
-
-/// M5, the holder's: the instances she keeps of each assertion (0-based,
-/// ascending); the hub opens the others.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Choose {
-    pub kept: [Vec<usize>; STAGES],
-}
-
-impl Choose {
-    pub fn encode(&self) -> Vec<u8> {
-        let mut w = Writer::default();
-        for kept in &self.kept {
-            w.count(kept.len());
-            kept.iter()
-                .for_each(|k| w.u8(u8::try_from(*k).expect("an instance of 256")));
-        }
-        w.0
-    }
-    pub fn decode(bytes: &[u8]) -> Result<Self> {
-        let mut r = Reader(bytes);
-        let choose = Self {
-            kept: stages(&mut r, |r| {
-                let n = r.count(1)?;
-                (0..n).map(|_| Ok(usize::from(r.u8()?))).collect()
-            })?,
-        };
-        r.end()?;
-        Ok(choose)
-    }
-}
-
-/// One opened instance: its index (0-based), its garbling seed and its
-/// input secrets, the dealing's shares at `index + 1`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Shown {
-    pub index: usize,
-    pub seed: [u8; 32],
-    pub shares: Vec<[Secret; VALUES]>,
-}
-
-/// M6, the hub's: each assertion's instances the holder did not keep,
-/// opened. The kept follow, one `Instance` message each.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Opened {
-    pub opened: [Vec<Shown>; STAGES],
-}
-
-impl Opened {
-    pub fn encode(&self) -> Vec<u8> {
-        let mut w = Writer::default();
-        for opened in &self.opened {
-            w.count(opened.len());
-            for s in opened {
-                w.u8(u8::try_from(s.index).expect("an instance of 256"));
-                w.bytes(&s.seed);
-                w.digits(&s.shares, |w, v| w.bytes(v));
-            }
-        }
-        w.0
-    }
-    pub fn decode(bytes: &[u8]) -> Result<Self> {
-        let mut r = Reader(bytes);
-        let opened = Self {
-            opened: stages(&mut r, |r| {
-                let n = r.count(33)?;
-                (0..n)
-                    .map(|_| {
-                        Ok(Shown {
-                            index: usize::from(r.u8()?),
-                            seed: r.array()?,
-                            shares: r.digits(32, |r| r.array())?,
-                        })
-                    })
-                    .collect()
-            })?,
-        };
-        r.end()?;
-        Ok(opened)
-    }
-}
-
-/// M10, the hub's: one kept instance of one assertion, as
-/// `lichen_babe::setup::Instance::to_bytes` writes it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Kept {
-    pub stage: usize,
-    pub index: usize,
-    pub instance: Vec<u8>,
-}
-
-impl Kept {
-    pub fn encode(&self) -> Vec<u8> {
-        let mut w = Writer::default();
-        w.u8(u8::try_from(self.stage).expect("a stage"));
-        w.u8(u8::try_from(self.index).expect("an instance of 256"));
-        w.blob(&self.instance);
-        w.0
-    }
-    pub fn decode(bytes: &[u8]) -> Result<Self> {
-        let mut r = Reader(bytes);
-        let kept = Self {
-            stage: usize::from(r.u8()?),
-            index: usize::from(r.u8()?),
-            instance: r.blob()?.to_vec(),
-        };
-        ensure!(kept.stage < STAGES, "stage {}", kept.stage);
-        r.end()?;
-        Ok(kept)
-    }
-}
-
-/// M7, the holder's: her consent to D, her adaptor pre-signatures of each
-/// assertion's challenge, and her signatures of the graph but those she
-/// withholds (`Babe::withheld`).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Consent {
-    pub consent: Signature,
-    pub presigs: [Vec<[AdaptorSig; VALUES]>; STAGES],
-    pub sigs: std::collections::HashMap<String, Vec<u8>>,
-}
-
-impl Consent {
-    pub fn encode(&self) -> Vec<u8> {
-        let mut w = Writer::default();
-        w.bytes(&self.consent.0);
-        for presigs in &self.presigs {
-            w.digits(presigs, |w, s| w.adaptor_sig(s));
-        }
-        w.sigs(&self.sigs);
-        w.0
-    }
-    pub fn decode(bytes: &[u8]) -> Result<Self> {
-        let mut r = Reader(bytes);
-        let consent = Self {
-            consent: Signature(r.array()?),
-            presigs: stages(&mut r, |r| r.digits(97, |r| r.adaptor_sig()))?,
-            sigs: r.sigs()?,
-        };
-        r.end()?;
-        Ok(consent)
-    }
-}
-
-/// M8, the hub's: its signatures of every graph transaction, and F with
-/// its own inputs' witnesses.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Signed {
-    pub sigs: std::collections::HashMap<String, Vec<u8>>,
-    pub funding: Transaction,
-}
-
-impl Signed {
-    pub fn encode(&self) -> Vec<u8> {
-        let mut w = Writer::default();
-        w.sigs(&self.sigs);
-        w.tx(&self.funding);
-        w.0
-    }
-    pub fn decode(bytes: &[u8]) -> Result<Self> {
-        let mut r = Reader(bytes);
-        let signed = Self {
-            sigs: r.sigs()?,
-            funding: r.tx()?,
-        };
-        r.end()?;
-        Ok(signed)
-    }
-}
-
-/// M9, the holder's: F signed whole, for either party to broadcast.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Funded {
-    pub funding: Transaction,
-}
-
-impl Funded {
-    pub fn encode(&self) -> Vec<u8> {
-        let mut w = Writer::default();
-        w.tx(&self.funding);
-        w.0
-    }
-    pub fn decode(bytes: &[u8]) -> Result<Self> {
-        let mut r = Reader(bytes);
-        let funded = Self { funding: r.tx()? };
-        r.end()?;
-        Ok(funded)
-    }
-}
-
-/// A quote's fields, each struct destructured whole: a term Base gains
-/// is a term a stored quote must keep, or this does not compile.
-impl Writer {
-    pub fn quote(&mut self, q: &Quote) {
-        let Quote {
-            keyset,
-            cap,
-            graph,
-            recipe,
-            chain,
-            limits,
-            fees,
-        } = q;
-        self.blob(&keyset.to_bytes());
-        self.u32(*cap);
-        let GraphTerms {
-            id,
-            unit_sats,
-            bits,
-            low_bits,
-            deposit_units,
-            close_height,
-            reserve_alice,
-            reserve_hub,
-            to_self_delay,
-            commit_fee,
-            presign_fee,
-            dust,
-            delta,
-            delta_prime,
-            deadline_margin,
-            response_window,
-            assert_height,
-            hub_challenge,
-            holder_answer,
-        } = graph;
-        self.u32(*id);
-        self.u64(*unit_sats);
-        self.u8(*bits);
-        self.u8(*low_bits);
-        self.u32(*deposit_units);
-        self.u32(*close_height);
-        self.u64(*reserve_alice);
-        self.u64(*reserve_hub);
-        self.u16(*to_self_delay);
-        self.u64(*commit_fee);
-        self.u64(*presign_fee);
-        self.u64(*dust);
-        self.u16(*delta);
-        self.u16(*delta_prime);
-        self.u32(*deadline_margin);
-        self.u16(*response_window);
-        self.u32(*assert_height);
-        self.u16(*hub_challenge);
-        self.u16(*holder_answer);
-        let Recipe {
-            graph_version,
-            holder_program,
-            counter_program,
-            full_instances,
-            full_kept,
-            corrected_instances,
-            corrected_kept,
-        } = recipe;
-        self.u32(*graph_version);
-        self.bytes(holder_program);
-        self.bytes(counter_program);
-        for n in [
-            full_instances,
-            full_kept,
-            corrected_instances,
-            corrected_kept,
-        ] {
-            self.u16(*n);
-        }
-        let ChainTerms {
-            checkpoint,
-            funding_depth,
-            request_depth,
-            publication_depth,
-            lookback,
-            observation_margin,
-            max_headers,
-        } = chain;
-        self.blob(&checkpoint.to_bytes());
-        for n in [
-            funding_depth,
-            request_depth,
-            publication_depth,
-            lookback,
-            observation_margin,
-            max_headers,
-        ] {
-            self.u32(*n);
-        }
-        let Limits {
-            max_transaction_bytes,
-            max_publication_bytes,
-            max_authorizations,
-            max_source_inputs,
-        } = limits;
-        for n in [
-            max_transaction_bytes,
-            max_publication_bytes,
-            max_authorizations,
-            max_source_inputs,
-        ] {
-            self.u32(*n);
-        }
-        let Fees {
-            sweep_fee_max,
-            external_fee_max,
-            max_rate_sat_per_kvb,
-            opening_fee_quote,
-        } = fees;
-        for n in [
-            sweep_fee_max,
-            external_fee_max,
-            max_rate_sat_per_kvb,
-            opening_fee_quote,
-        ] {
-            self.u64(*n);
-        }
-    }
-}
-
-impl Reader<'_> {
     pub fn quote(&mut self) -> Result<Quote> {
-        let keyset = Keyset::from_bytes(self.blob()?)?;
-        let cap = self.u32()?;
-        let graph = GraphTerms {
-            id: self.u32()?,
-            unit_sats: self.u64()?,
-            bits: self.u8()?,
-            low_bits: self.u8()?,
-            deposit_units: self.u32()?,
-            close_height: self.u32()?,
-            reserve_alice: self.u64()?,
-            reserve_hub: self.u64()?,
-            to_self_delay: self.u16()?,
-            commit_fee: self.u64()?,
-            presign_fee: self.u64()?,
-            dust: self.u64()?,
-            delta: self.u16()?,
-            delta_prime: self.u16()?,
-            deadline_margin: self.u32()?,
-            response_window: self.u16()?,
-            assert_height: self.u32()?,
-            hub_challenge: self.u16()?,
-            holder_answer: self.u16()?,
-        };
-        let recipe = Recipe {
-            graph_version: self.u32()?,
-            holder_program: self.array()?,
-            counter_program: self.array()?,
-            full_instances: self.u16()?,
-            full_kept: self.u16()?,
-            corrected_instances: self.u16()?,
-            corrected_kept: self.u16()?,
-        };
-        let chain = ChainTerms {
-            checkpoint: Checkpoint::from_bytes(self.blob()?)?,
-            funding_depth: self.u32()?,
-            request_depth: self.u32()?,
-            publication_depth: self.u32()?,
-            lookback: self.u32()?,
-            observation_margin: self.u32()?,
-            max_headers: self.u32()?,
-        };
-        let limits = Limits {
-            max_transaction_bytes: self.u32()?,
-            max_publication_bytes: self.u32()?,
-            max_authorizations: self.u32()?,
-            max_source_inputs: self.u32()?,
-        };
-        let fees = Fees {
-            sweep_fee_max: self.u64()?,
-            external_fee_max: self.u64()?,
-            max_rate_sat_per_kvb: self.u64()?,
-            opening_fee_quote: self.u64()?,
-        };
         Ok(Quote {
-            keyset,
-            cap,
-            graph,
-            recipe,
-            chain,
-            limits,
-            fees,
+            keyset: Keyset::from_bytes(self.blob()?)?,
+            cap: self.u32()?,
+            graph: GraphTerms {
+                id: self.u32()?,
+                unit_sats: self.u64()?,
+                bits: self.u8()?,
+                low_bits: self.u8()?,
+                deposit_units: self.u32()?,
+                close_height: self.u32()?,
+                reserve_alice: self.u64()?,
+                reserve_hub: self.u64()?,
+                to_self_delay: self.u16()?,
+                commit_fee: self.u64()?,
+                presign_fee: self.u64()?,
+                dust: self.u64()?,
+                delta: self.u16()?,
+                delta_prime: self.u16()?,
+                deadline_margin: self.u32()?,
+                request_height: self.u32()?,
+                response_window: self.u16()?,
+                publication_window: self.u16()?,
+                assert_window: self.u16()?,
+                challenge_window: self.u16()?,
+                answer_window: self.u16()?,
+            },
+            recipe: Recipe {
+                graph_version: self.u32()?,
+                program: self.array()?,
+                instances: self.u16()?,
+                kept: self.u16()?,
+            },
+            chain: ChainTerms {
+                checkpoint: Checkpoint::from_bytes(self.blob()?)?,
+                funding_depth: self.u32()?,
+                work_depth: self.u32()?,
+                max_headers: self.u32()?,
+            },
+            limits: Limits {
+                max_transaction_bytes: self.u32()?,
+                max_publication_bytes: self.u32()?,
+                max_authorizations: self.u32()?,
+                max_source_inputs: self.u32()?,
+            },
+            fees: Fees {
+                max_rate_sat_per_kvb: self.u64()?,
+                opening_fee_quote: self.u64()?,
+            },
         })
     }
 }
 
+// The common framing stays here; each message lists its fields in wire order.
+macro_rules! message {
+    ($name:ident, $w:ident, $s:ident, $r:ident, $encode:block, $decode:block) => {
+        impl $name {
+            pub fn encode(&$s) -> Vec<u8> { let mut $w = Writer::default(); $encode; $w.0 }
+            pub fn decode(bytes: &[u8]) -> Result<Self> {
+                let mut $r = Reader(bytes); let value = $decode; $r.end()?; Ok(value)
+            }
+        }
+    };
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Wanted {
+    pub request_height: u32,
+    pub close_height: u32,
+    pub response_window: u16,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Open {
+    pub party: PartyPubKeys,
+    pub claim_key: XOnlyPublicKey,
+    pub deposit: OutPoint,
+    pub coin: TxOut,
+    pub change: ScriptBuf,
+    pub wanted: Wanted,
+    pub mock: bool,
+}
+message!(
+    Open,
+    w,
+    self,
+    r,
+    {
+        w.party(&self.party);
+        w.bytes(&self.claim_key.serialize());
+        w.outpoint(&self.deposit);
+        w.txout(&self.coin);
+        w.blob(self.change.as_bytes());
+        w.u32(self.wanted.request_height);
+        w.u32(self.wanted.close_height);
+        w.u16(self.wanted.response_window);
+        w.u8(self.mock as u8);
+    },
+    {
+        let party = r.party()?;
+        let claim_key = r.xonly()?;
+        let deposit = r.outpoint()?;
+        let coin = r.txout()?;
+        let change = ScriptBuf::from_bytes(r.blob()?.to_vec());
+        let wanted = Wanted {
+            request_height: r.u32()?,
+            close_height: r.u32()?,
+            response_window: r.u16()?,
+        };
+        let mock = r.u8()?;
+        ensure!(mock <= 1, "invalid mock flag");
+        Self {
+            party,
+            claim_key,
+            deposit,
+            coin,
+            change,
+            wanted,
+            mock: mock == 1,
+        }
+    }
+);
+
+#[derive(Clone, Debug)]
+pub struct Terms {
+    pub base: Base,
+    pub hub: HubPub,
+}
+message!(
+    Terms,
+    w,
+    self,
+    r,
+    {
+        w.blob(&self.base.to_bytes());
+        w.hub_pub(&self.hub);
+    },
+    {
+        Self {
+            base: Base::from_bytes(r.blob()?)?,
+            hub: r.hub_pub()?,
+        }
+    }
+);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Commit {
+    pub holder: HolderPub,
+    pub commitments: Vec<[u8; 32]>,
+    pub dealing: Dealing,
+}
+message!(
+    Commit,
+    w,
+    self,
+    r,
+    {
+        w.holder_pub(&self.holder);
+        w.hashes(&self.commitments);
+        w.dealing(&self.dealing);
+    },
+    {
+        Self {
+            holder: r.holder_pub()?,
+            commitments: r.hashes()?,
+            dealing: r.dealing()?,
+        }
+    }
+);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Choose {
+    pub kept: Vec<u32>,
+}
+message!(
+    Choose,
+    w,
+    self,
+    r,
+    {
+        w.count(self.kept.len());
+        for i in &self.kept {
+            w.u32(*i);
+        }
+    },
+    {
+        let n = r.count(4)?;
+        Self {
+            kept: (0..n).map(|_| r.u32()).collect::<Result<_>>()?,
+        }
+    }
+);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Opened {
+    pub opened: Vec<ShareOpening>,
+}
+message!(
+    Opened,
+    w,
+    self,
+    r,
+    {
+        w.opened(&self.opened);
+    },
+    {
+        Self {
+            opened: r.opened()?,
+        }
+    }
+);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Instance {
+    pub i: u32,
+    pub bytes: Vec<u8>,
+}
+message!(
+    Instance,
+    w,
+    self,
+    r,
+    {
+        w.u32(self.i);
+        w.blob(&self.bytes);
+    },
+    {
+        Self {
+            i: r.u32()?,
+            bytes: r.blob()?.to_vec(),
+        }
+    }
+);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Offer {
+    pub funding: Transaction,
+    pub prevouts: Vec<TxOut>,
+    pub sigs: HashMap<String, Vec<u8>>,
+    pub presigs: Vec<[AdaptorSig; VALUES]>,
+}
+message!(
+    Offer,
+    w,
+    self,
+    r,
+    {
+        w.tx(&self.funding);
+        w.count(self.prevouts.len());
+        for out in &self.prevouts {
+            w.txout(out);
+        }
+        w.sigs(&self.sigs);
+        w.digits(&self.presigs, |w, s| w.adaptor_sig(s));
+    },
+    {
+        let funding = r.tx()?;
+        let n = r.count(4)?;
+        let prevouts = (0..n).map(|_| r.txout()).collect::<Result<_>>()?;
+        Self {
+            funding,
+            prevouts,
+            sigs: r.sigs()?,
+            presigs: r.digits(97, |r| r.adaptor_sig())?,
+        }
+    }
+);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Consent {
+    pub sigs: HashMap<String, Vec<u8>>,
+}
+message!(
+    Consent,
+    w,
+    self,
+    r,
+    {
+        w.sigs(&self.sigs);
+    },
+    { Self { sigs: r.sigs()? } }
+);
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Signed {
+    pub funding: Transaction,
+}
+message!(
+    Signed,
+    w,
+    self,
+    r,
+    {
+        w.tx(&self.funding);
+    },
+    { Self { funding: r.tx()? } }
+);
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Funded {
+    pub funding: Transaction,
+}
+message!(
+    Funded,
+    w,
+    self,
+    r,
+    {
+        w.tx(&self.funding);
+    },
+    { Self { funding: r.tx()? } }
+);
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::keys::{HolderKeys, HubKeys};
-    use lichen_babe::reveal::points;
-    use lngap_btc::bitcoin::hashes::Hash as _;
-    use lngap_btc::bitcoin::secp256k1::Message;
-    use lngap_btc::bitcoin::{absolute, transaction, Amount, TxIn, Txid};
-
-    fn tx() -> Transaction {
-        Transaction {
-            version: transaction::Version::TWO,
-            lock_time: absolute::LockTime::ZERO,
-            input: vec![TxIn {
-                previous_output: outpoint(1),
-                ..Default::default()
-            }],
-            output: vec![TxOut {
-                value: Amount::from_sat(1_000),
-                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-            }],
-        }
-    }
-
-    fn outpoint(n: u8) -> OutPoint {
-        OutPoint {
-            txid: Txid::from_byte_array([n; 32]),
-            vout: u32::from(n),
-        }
-    }
-
-    fn envelope(kind: Kind) -> Vec<u8> {
-        Envelope {
-            kind,
+    #[test]
+    fn envelopes_are_whole_and_versioned() {
+        let e = Envelope {
+            kind: Kind::Consent,
             id: [5; 32],
             body: vec![1, 2, 3],
+        };
+        let bytes = e.to_bytes();
+        assert_eq!(Envelope::from_bytes(&bytes).unwrap(), e);
+        assert_eq!(Kind::peek(&bytes), Some(e.kind));
+        for len in 0..bytes.len() {
+            assert!(Envelope::from_bytes(&bytes[..len]).is_err());
         }
-        .to_bytes()
+        let mut bad = bytes.clone();
+        bad.push(0);
+        assert!(Envelope::from_bytes(&bad).is_err());
+        let mut bad = bytes;
+        bad[5] = 1;
+        assert!(Envelope::from_bytes(&bad).is_err());
     }
-
     #[test]
-    fn envelopes_read_whole_and_of_this_version_only() {
-        let bytes = envelope(Kind::Consent);
-        assert_eq!(Kind::peek(&bytes), Some(Kind::Consent));
-        let read = Envelope::from_bytes(&bytes).unwrap();
-        assert_eq!(
-            (read.kind, read.id, read.body),
-            (Kind::Consent, [5; 32], vec![1, 2, 3])
-        );
-        let mut magic = bytes.clone();
-        magic[0] ^= 1;
-        let mut version = bytes.clone();
-        version[5] = 2;
-        let mut kind = bytes.clone();
-        kind[6] = 11;
-        let mut long = bytes.clone();
-        long.push(0);
-        let mut length = bytes.clone();
-        length[42] = 4;
-        let short = &bytes[..bytes.len() - 1];
-        for bad in [&magic[..], &version, &kind, &long, &length, short, &[]] {
-            assert!(Envelope::from_bytes(bad).is_err());
-        }
-        assert_eq!(Kind::peek(&kind), None);
+    fn counts_are_checked_before_allocation() {
+        let bytes = u32::MAX.to_be_bytes();
+        assert!(Reader(&bytes).hashes::<32>().is_err());
+        assert!(Reader(&bytes).sigs().is_err());
+        assert!(Reader(&bytes).blob().is_err());
     }
-
     #[test]
-    fn counts_past_the_message_are_refused_before_allocating() {
+    fn keys_and_quote_round_trip() {
+        let a = crate::keys::HolderKeys::derive(&[1; 32], &[2; 32]).public();
+        let h = crate::keys::HubKeys::from_secret(&[3; 32]).public();
+        let q = Quote::from_base(&crate::opening::testing::base(&[2; 32]));
         let mut w = Writer::default();
-        w.u32(u32::MAX);
-        assert!(Reader(&w.0).hashes::<32>().is_err());
-        assert!(Reader(&w.0).blob().is_err());
-        assert!(Reader(&w.0).sigs().is_err());
-    }
-
-    #[test]
-    fn the_holders_messages_read_back() {
-        let keys = HolderKeys::derive(&[1; 32], &[2; 32]);
-        let open = Open {
-            spend_root: Point([2; 33]),
-            party: keys.party.public(),
-            deposit: outpoint(3),
-            coin: tx().output[0].clone(),
-            change: ScriptBuf::from_bytes(vec![0x51, 0x20, 7]),
-            wanted: Wanted {
-                assert_height: 160,
-                close_height: 300,
-                response_window: 6,
-            },
-            mock: true,
-        };
-        assert_eq!(Open::decode(&open.encode()).unwrap(), open);
-        let mut trust = open.encode();
-        *trust.last_mut().unwrap() = 2;
-        assert!(Open::decode(&trust).is_err());
-        let public = Keys {
-            request: licash::request::Signer::derive(&[7; 32], &[1; 32]).public(),
-            lamport: [keys.lamport.public(), keys.corrected.lamport.public()],
-            adaptor: [keys.adaptor.public(), keys.corrected.adaptor.public()],
-            corrected_b: keys.corrected.b_key.public().digits,
-        };
-        assert_eq!(Keys::decode(&public.encode()).unwrap(), public);
-        let choose = Choose {
-            kept: [vec![0, 3], vec![1, 2]],
-        };
-        assert_eq!(Choose::decode(&choose.encode()).unwrap(), choose);
-        let hub = HubKeys::from_secret(&[3; 32]);
-        let msg = Message::from_digest([9; 32]);
-        let mut sigs = std::collections::HashMap::new();
-        sigs.insert("request".to_owned(), vec![4; 64]);
-        sigs.insert("assert#1".to_owned(), vec![6; 64]);
-        let consent = Consent {
-            consent: Signature([8; 64]),
-            presigs: [
-                keys.adaptor.presign(&msg, &points(&hub.full.dealing)),
-                keys.corrected
-                    .adaptor
-                    .presign(&msg, &points(&hub.corrected.dealing)),
-            ],
-            sigs,
-        };
-        assert_eq!(Consent::decode(&consent.encode()).unwrap(), consent);
-        let funded = Funded { funding: tx() };
-        assert_eq!(Funded::decode(&funded.encode()).unwrap(), funded);
-    }
-
-    #[test]
-    fn the_hubs_messages_read_back() {
-        let hub = HubKeys::from_secret(&[3; 32]);
-        let commit = Commit {
-            funding: tx(),
-            prevouts: tx().output,
-            publication: std::array::from_fn(|i| (outpoint(i as u8), tx().output[0].clone())),
-            d: [4; 32],
-            dealings: [hub.full.dealing.clone(), hub.corrected.dealing.clone()],
-            commitments: [vec![[1; 32]; 4], vec![[2; 32]; 4]],
-        };
-        assert_eq!(Commit::decode(&commit.encode()).unwrap(), commit);
-        let opened = Opened {
-            opened: std::array::from_fn(|s| {
-                (0..2)
-                    .map(|i| Shown {
-                        index: i,
-                        seed: [s as u8; 32],
-                        shares: hub.full.dealer.shares(i as u64 + 1),
-                    })
-                    .collect()
-            }),
-        };
-        assert_eq!(Opened::decode(&opened.encode()).unwrap(), opened);
-        let kept = Kept {
-            stage: 1,
-            index: 3,
-            instance: vec![7; 100],
-        };
-        assert_eq!(Kept::decode(&kept.encode()).unwrap(), kept);
-        let mut stage = kept.encode();
-        stage[0] = 2;
-        assert!(Kept::decode(&stage).is_err());
-        let mut sigs = std::collections::HashMap::new();
-        sigs.insert("respond".to_owned(), vec![5; 64]);
-        let signed = Signed {
-            sigs,
-            funding: tx(),
-        };
-        assert_eq!(Signed::decode(&signed.encode()).unwrap(), signed);
+        w.holder_pub(&a);
+        w.hub_pub(&h);
+        w.quote(&q);
+        let mut r = Reader(&w.0);
+        assert_eq!(r.holder_pub().unwrap(), a);
+        assert_eq!(r.hub_pub().unwrap(), h);
+        let read = r.quote().unwrap();
+        let mut original = Writer::default();
+        original.quote(&q);
+        let mut decoded = Writer::default();
+        decoded.quote(&read);
+        assert_eq!(original.0, decoded.0);
+        r.end().unwrap();
     }
 }
