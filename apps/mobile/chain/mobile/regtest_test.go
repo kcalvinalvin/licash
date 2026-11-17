@@ -56,6 +56,14 @@ func TestRegtestChainAsTheAppsSeeIt(t *testing.T) {
 	if c.Peers() != 1 {
 		t.Fatalf("%d peers", c.Peers())
 	}
+	// Caught up: the headers, the filters and the peer at one height.
+	headers, err := c.Headers()
+	if err != nil || fmt.Sprint(headers) != core(t, "getblockcount") {
+		t.Fatalf("headers at %d: %v", headers, err)
+	}
+	if fmt.Sprint(c.PeerHeight()) != core(t, "getblockcount") {
+		t.Fatalf("the peer at %d", c.PeerHeight())
+	}
 
 	// Hashes in internal order: reversed from how Core shows them.
 	hash, err := c.Hash(100)

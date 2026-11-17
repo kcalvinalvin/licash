@@ -192,6 +192,24 @@ func (n *Node) Tip() (height int32, hash chainhash.Hash, err error) {
 	return best.Height, best.Hash, nil
 }
 
+// Headers is the height of the newest block header kept: ahead of Tip
+// while the filter headers catch up.
+func (n *Node) Headers() (int32, error) {
+	_, height, err := n.cs.BlockHeaders.ChainTip()
+	return int32(height), err
+}
+
+// PeerHeight is the highest block a connected peer told of: 0 with none.
+func (n *Node) PeerHeight() int32 {
+	var best int32
+	for _, sp := range n.cs.Peers() {
+		if h := sp.LastBlock(); h > best {
+			best = h
+		}
+	}
+	return best
+}
+
 // Synced reports whether the node believes it has caught up with its peers.
 func (n *Node) Synced() bool {
 	return n.cs.IsCurrent()

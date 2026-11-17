@@ -235,6 +235,18 @@ func (c *Chain) Unconfirmed(script []byte) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
+// Headers is the height of the newest block header kept: ahead of Height
+// while the filter headers, which Height waits for, catch up.
+func (c *Chain) Headers() (int32, error) {
+	return c.node.Headers()
+}
+
+// PeerHeight is the highest block a connected peer told of, the height the
+// client catches up to: 0 with no peer.
+func (c *Chain) PeerHeight() int32 {
+	return c.node.PeerHeight()
+}
+
 // Synced is whether the client believes it caught up with its peers.
 func (c *Chain) Synced() bool {
 	return c.node.Synced()
