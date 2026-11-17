@@ -20,6 +20,7 @@ import androidx.compose.material.icons.filled.Build
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
@@ -42,6 +43,7 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.licash.core.Hub
@@ -50,6 +52,7 @@ import org.licash.wallet.BuildConfig
 import org.licash.wallet.Engine
 import org.licash.wallet.Storage
 import org.licash.wallet.Ui
+import org.licash.wallet.digits
 import org.licash.wallet.explain
 import org.licash.wallet.exportLogs
 import org.licash.wallet.percent
@@ -59,6 +62,8 @@ import org.licash.wallet.storage
 private enum class Page(val title: String) {
     Hubs("Hubs"),
     Backup("Backup"),
+    Bitcoin("Bitcoin"),
+    Tor("Tor"),
     About("About"),
     Advanced("Advanced"),
 }
@@ -92,6 +97,8 @@ fun Settings(engine: Engine, ui: Ui, balance: () -> Unit, back: () -> Unit) {
                 when (p) {
                     Page.Hubs -> HubsPage(engine, ui)
                     Page.Backup -> BackupPage(engine, ui)
+                    Page.Bitcoin -> BitcoinPage(engine, ui)
+                    Page.Tor -> TorPage(engine, ui)
                     Page.About -> About(ui)
                     Page.Advanced -> Advanced(engine, ui, balance)
                 }
@@ -115,7 +122,7 @@ private fun Overview(engine: Engine, ui: Ui, open: (Page) -> Unit) {
     }
     Group("") {
         val (state, detail) = status(ui, ui.developer)
-        Entry("Bitcoin", value = state, sub = detail, icon = Glyphs.bitcoin, tag = "chain")
+        Entry("Bitcoin", value = state, sub = detail, icon = Glyphs.bitcoin, tag = "chain") { open(Page.Bitcoin) }
         ui.problem?.let { Problem(it) }
         Divider()
         Toggle("Tor", ui.tor, sub = "Hides where you are, slower", icon = Icons.Filled.Lock, means = TOR_MEANS) { on ->
@@ -123,6 +130,17 @@ private fun Overview(engine: Engine, ui: Ui, open: (Page) -> Unit) {
             scope.launch { engine.setTor(on).onFailure { torFailed = explain(it) } }
         }
         torFailed?.let { Problem(it) }
+        if (ui.tor) {
+            Divider()
+            val tor = ui.torStatus
+            val value = when {
+                tor == null -> "Starting"
+                tor.ready -> "Connected"
+                tor.blocked != null -> "Stuck"
+                else -> "${tor.percent}%"
+            }
+            Entry("Tor status", value = value, tag = "tor-status") { open(Page.Tor) }
+        }
     }
     Group("") {
         Entry("About", icon = Icons.Outlined.Info, tag = "about") { open(Page.About) }
@@ -221,6 +239,90 @@ private fun StorageUsed(k: Storage, advanced: Boolean) {
 private fun bytes(context: Context, bytes: Long): String = Formatter.formatShortFileSize(context, bytes)
 
 /**
+ * How the app catches up with Bitcoin, step by step, and the block the
+ * wallet's payments are looked for from.
+ */
+@Composable
+private fun BitcoinPage(engine: Engine, ui: Ui) {
+    var birthday by remember { mutableStateOf<UInt?>(null) }
+    LaunchedEffect(ui.scan?.from) { birthday = engine.birthday().getOrNull() }
+    Group("") { SyncStages(engine, ui) }
+    ui.problem?.let { Problem(it) }
+    Group("") {
+        Line("Network", ui.network.name.lowercase())
+        Divider()
+        Line("Wallet birthday", birthday?.let { "Block ${digits(it.toULong())}" } ?: "Not known yet", tag = "birthday")
+        ui.scan?.let {
+            Divider()
+            Line("Payments looked for up to", "Block ${digits((it.next.toLong() - 1).coerceAtLeast(0).toULong())}")
+        }
+    }
+}
+
+/**
+ * How the wallet's Tor client stands: how far it is in connecting, what
+ * it is doing, and why it seems stuck; and starting it afresh, after a yes.
+ */
+@Composable
+private fun TorPage(engine: Engine, ui: Ui) {
+    val scope = rememberCoroutineScope()
+    var asking by remember { mutableStateOf(false) }
+    var busy by remember { mutableStateOf(false) }
+    var error by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            engine.live()
+            delay(2_000)
+        }
+    }
+    val tor = ui.torStatus
+    Group("") {
+        if (!ui.tor) {
+            Line("Status", "Off")
+        } else {
+            Line("Status", if (tor?.ready == true) "Connected" else "Connecting", tag = "tor-state")
+            Divider()
+            Line("Progress", tor?.let { "${it.percent}%" } ?: "…", tag = "tor-percent")
+            tor?.let {
+                if (!it.ready) LinearProgressIndicator(progress = { it.percent.toFloat() / 100f }, modifier = Modifier.fillMaxWidth())
+                Divider()
+                Text(
+                    it.summary,
+                    modifier = Modifier.padding(vertical = 12.dp).testTag("tor-summary"),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                it.blocked?.let { why -> Problem("Stuck: $why") }
+            }
+        }
+    }
+    if (ui.tor) {
+        Group("") {
+            Entry("Reset Tor", sub = "Forget what Tor learned and connect afresh", tag = "reset-tor") {
+                error = null
+                asking = true
+            }
+            error?.let { Problem(it) }
+        }
+    }
+    if (asking) {
+        Sheet("Reset Tor?", dismiss = { asking = false }, dismissable = !busy) {
+            Say("Forgets what Tor learned of its network and connects from the start. Use it when Tor does not connect. Nothing you hold is touched.")
+            BigButton(if (busy) "Resetting…" else "Reset", Modifier.fillMaxWidth().testTag("reset-tor-confirm"), enabled = !busy) {
+                busy = true
+                scope.launch {
+                    engine.resetTor().onFailure { error = explain(it) }
+                    busy = false
+                    asking = false
+                }
+            }
+            Spacer(Modifier.height(12.dp))
+            BigButton("Cancel", Modifier.fillMaxWidth(), quiet = true, enabled = !busy) { asking = false }
+        }
+    }
+}
+
+/**
  * How far the app follows Bitcoin, in a word, and what there is to add:
  * in advanced mode, the block it is at and the nodes it hears from.
  */
@@ -230,8 +332,8 @@ private fun status(ui: Ui, developer: Boolean): Pair<String, String?> {
     return when {
         chain.peers == 0L -> "Connecting" to null
         !chain.synced -> "Catching up" to "Block ${chain.height}, $nodes".takeIf { developer }
-        ui.scanned != null && ui.scanned.toInt() <= chain.height ->
-            "Checking" to "Block ${ui.scanned} of ${chain.height}".takeIf { developer }
+        ui.scan != null && ui.scan.next.toInt() <= chain.height ->
+            "Checking" to "Block ${ui.scan.next} of ${chain.height}".takeIf { developer }
         else -> "Up to date" to "Block ${chain.height}, $nodes".takeIf { developer }
     }
 }

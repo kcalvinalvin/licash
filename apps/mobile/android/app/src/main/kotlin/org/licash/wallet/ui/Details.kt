@@ -67,7 +67,7 @@ fun ActivityDetails(engine: Engine, ui: Ui, shown: Activity, back: () -> Unit) {
     var error by remember { mutableStateOf<String?>(null) }
     var unopened by remember { mutableStateOf(false) }
     var notes by remember { mutableStateOf<NotesOf?>(null) }
-    LaunchedEffect(activity, ui.scanned) {
+    LaunchedEffect(activity, ui.scan?.next) {
         engine.details(activity)
             .onSuccess { details = it; error = null }
             .onFailure { error = explain(it) }

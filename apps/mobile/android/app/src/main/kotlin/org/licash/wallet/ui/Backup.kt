@@ -32,6 +32,7 @@ import org.licash.wallet.Engine
 import org.licash.wallet.PHRASE_WORDS
 import org.licash.wallet.Ui
 import org.licash.wallet.backupName
+import org.licash.wallet.digits
 import org.licash.wallet.explain
 import org.licash.wallet.phraseWords
 
@@ -56,6 +57,7 @@ internal fun BackupPage(engine: Engine, ui: Ui) {
 private fun Phrase(engine: Engine, dismiss: () -> Unit) {
     val scope = rememberCoroutineScope()
     var words by remember { mutableStateOf<List<String>?>(null) }
+    var birthday by remember { mutableStateOf<UInt?>(null) }
     var error by remember { mutableStateOf<String?>(null) }
     Sheet("Recovery words", dismiss, secure = true) {
         val shown = words
@@ -65,11 +67,19 @@ private fun Phrase(engine: Engine, dismiss: () -> Unit) {
             error?.let { Problem(it) }
             BigButton("Show words", Modifier.fillMaxWidth().testTag("show-words")) {
                 error = null
-                scope.launch { engine.backupPhrase().onSuccess { words = it }.onFailure { error = explain(it) } }
+                scope.launch {
+                    engine.backupPhrase().onSuccess { words = it }.onFailure { error = explain(it) }
+                    birthday = engine.birthday().getOrNull()
+                }
             }
         } else {
             WordList(shown)
-            Spacer(Modifier.height(16.dp))
+            Spacer(Modifier.height(12.dp))
+            birthday?.let {
+                Line("Wallet birthday", "Block ${digits(it.toULong())}", tag = "birthday")
+                Say("Write it down with the words: restoring looks for your coins from there, much faster.")
+            }
+            Spacer(Modifier.height(4.dp))
             BigButton("Done", Modifier.fillMaxWidth().testTag("words-done"), onClick = dismiss)
         }
     }
@@ -139,6 +149,7 @@ internal fun Restore(engine: Engine, dismiss: () -> Unit) {
     val scope = rememberCoroutineScope()
     var typing by remember { mutableStateOf(false) }
     var text by remember { mutableStateOf("") }
+    var born by remember { mutableStateOf("") }
     var busy by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
     fun run(restore: suspend () -> Result<Unit>) {
@@ -179,13 +190,29 @@ internal fun Restore(engine: Engine, dismiss: () -> Unit) {
             ),
             shape = RoundedCornerShape(14.dp),
         )
+        Spacer(Modifier.height(8.dp))
+        val birthday = born.trim().takeIf { it.isNotEmpty() }?.toUIntOrNull()
+        val badBirthday = born.isNotBlank() && (birthday == null || birthday == 0u)
+        OutlinedTextField(
+            value = born,
+            onValueChange = { v -> born = v.filter(Char::isDigit); error = null },
+            modifier = Modifier.fillMaxWidth().testTag("restore-birthday"),
+            label = { Text("Wallet birthday (optional)") },
+            supportingText = {
+                Text(if (badBirthday) "A block number" else "The block written with the words. Empty: looks through all of Bitcoin.")
+            },
+            isError = badBirthday,
+            singleLine = true,
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+            shape = RoundedCornerShape(14.dp),
+        )
         error?.let { Problem(it) }
         Spacer(Modifier.height(12.dp))
         BigButton(
             if (busy) "Restoring…" else "Restore",
             Modifier.fillMaxWidth().testTag("restore"),
-            enabled = !busy && words.size == PHRASE_WORDS,
-        ) { run { engine.restorePhrase(words) } }
+            enabled = !busy && words.size == PHRASE_WORDS && !badBirthday,
+        ) { run { engine.restorePhrase(words, birthday) } }
     }
 }
 

@@ -53,8 +53,10 @@ import org.licash.core.PayQuote
 import org.licash.core.PayoutQuote
 import org.licash.core.HubsFound
 import org.licash.core.PayOffer
+import org.licash.core.Scan
 import org.licash.core.Scanned
 import org.licash.core.State
+import org.licash.core.TorStatus
 import org.licash.core.Wallet
 import org.licash.core.chainName
 import org.licash.core.defaultRelays
@@ -77,8 +79,10 @@ data class Ui(
     val noteMaintenance: Boolean = false,
     val tor: Boolean = false,
     val chain: ChainStatus = ChainStatus(),
-    /** The next block to look in for payments on Bitcoin, once looking. */
-    val scanned: UInt? = null,
+    /** How far looking for payments on Bitcoin got, once looking. */
+    val scan: Scan? = null,
+    /** How far the wallet's Tor client is in connecting, over Tor. */
+    val torStatus: TorStatus? = null,
     /** Payments on Bitcoin on their way: in no block yet. */
     val incoming: List<Activity> = emptyList(),
     /** Why the last round of syncing fell short, if it did. */
@@ -109,7 +113,27 @@ internal fun detailsToRead(history: List<Activity>): List<Activity> = history
     .filter { it.state == State.PENDING }
     .filterIndexed { index, activity -> index < UNDER_READ || activity.kind == Kind.PAYOUT }
 
-data class ChainStatus(val height: Int = 0, val peers: Long = 0, val synced: Boolean = false)
+/**
+ * How the light client stands: the height of its block filters (`height`,
+ * what the wallet looks in), of its block headers, and of the best of its
+ * peers, which it catches up to (0 if none told).
+ */
+data class ChainStatus(
+    val height: Int = 0,
+    val peers: Long = 0,
+    val synced: Boolean = false,
+    val headers: Int = 0,
+    val peerHeight: Int = 0,
+)
+
+/** How `light` stands now. */
+private fun statusOf(light: LightClient): ChainStatus = ChainStatus(
+    height = light.height(),
+    peers = light.peers(),
+    synced = light.synced(),
+    headers = runCatching { light.headers() }.getOrDefault(0),
+    peerHeight = light.peerHeight(),
+)
 
 /** Something to tell the user once; `received` if it is money in. */
 data class Event(val text: String, val received: ULong? = null)
@@ -367,8 +391,8 @@ class Engine(context: Context) {
 
     private suspend fun sync() {
         val light = light ?: return
-        val status = ChainStatus(light.height(), light.peers(), light.synced())
-        state.update { it.copy(chain = status) }
+        val status = statusOf(light)
+        state.update { it.copy(chain = status, torStatus = torStatus()) }
         var hubs = wallet?.let { local { w -> w.hubs() } } ?: return
         if (hubs.isEmpty()) return
         if (!hubsLearned) {
@@ -381,8 +405,8 @@ class Engine(context: Context) {
             AppLog.warn(step, e)
             problems += explain(e)
         }
-        if (status != logged) {
-            logged = status
+        if (status.copy(headers = 0, peerHeight = 0) != logged) {
+            logged = status.copy(headers = 0, peerHeight = 0)
             AppLog.info(
                 "block ${status.height}, ${status.peers} peers, " + if (status.synced) "synced" else "syncing",
             )
@@ -399,7 +423,7 @@ class Engine(context: Context) {
                     hubsLearned = false
                     break
                 }
-                state.update { it.copy(scanned = scan.next) }
+                state.update { it.copy(scan = scan) }
                 if (scan.found > 0u) {
                     AppLog.info("found ${scan.found} coins of ${scan.foundValue} sat to block ${scan.next - 1u}")
                 }
@@ -744,9 +768,54 @@ class Engine(context: Context) {
         }
     }
 
-    /** A wallet of the network chosen from its 24 words: its keys, and its coins once Bitcoin is looked through. */
-    suspend fun restorePhrase(words: List<String>): Result<Unit> = restored {
-        Wallet.fromPhrase(walletDir, words.joinToString(" "), prefs.network, prefs.tor)
+    /**
+     * A wallet of the network chosen from its 24 words: its keys, and its
+     * coins once Bitcoin is looked through from `birthday`, the block
+     * written down with them, or from the first block if none.
+     */
+    suspend fun restorePhrase(words: List<String>, birthday: UInt?): Result<Unit> = restored {
+        Wallet.fromPhrase(walletDir, words.joinToString(" "), prefs.network, birthday, prefs.tor)
+    }
+
+    /** The block the wallet's coins on Bitcoin are looked for from, once known. */
+    suspend fun birthday(): Result<UInt?> = io { local { it.birthday() } }
+
+    /** How the light client and Tor stand now, for a screen showing them: not waiting for the next round. */
+    suspend fun live() {
+        val light = light
+        val chain = withContext(Dispatchers.IO) { light?.let { runCatching { statusOf(it) }.getOrNull() } }
+        val tor = withContext(Dispatchers.IO) { torStatus() }
+        state.update { it.copy(chain = chain ?: it.chain, torStatus = tor) }
+    }
+
+    /** How the wallet's Tor client stands, over Tor; it starts connecting if it is not. */
+    private fun torStatus(): TorStatus? = runCatching { wallet?.torStatus() }.getOrNull()
+
+    /**
+     * Start Tor afresh, as asked: what it learned of the Tor network (its
+     * state and directory cache) forgotten, the wallet opened again and
+     * the light client started again through it. Nothing the wallet holds
+     * is touched.
+     */
+    suspend fun resetTor(): Result<Unit> = io {
+        lightLock.withLock {
+            mutex.withLock {
+                // The light client reaches Bitcoin through the wallet's Tor.
+                stopLight()
+                wallet?.destroy()
+                wallet = null
+                try {
+                    for (part in listOf("state", "cache")) File(walletDir, "tor/$part").deleteRecursively()
+                    AppLog.info("Tor's state forgotten")
+                } finally {
+                    if (walletExists(walletDir)) wallet = configured(Wallet.open(walletDir, prefs.tor))
+                }
+            }
+            state.update { it.copy(torStatus = null) }
+            startLight()
+        }
+        refresh()
+        poke()
     }
 
     /** The wallet a full backup `from` holds, of its own network. Never over a wallet there. */
@@ -805,7 +874,7 @@ class Engine(context: Context) {
             val dir = File(files, "chain-${chainName(wallet?.network() ?: prefs.network)}")
             dir.deleteRecursively()
             AppLog.info("light client's blocks forgotten")
-            state.update { it.copy(chain = ChainStatus(), scanned = null) }
+            state.update { it.copy(chain = ChainStatus(), scan = null) }
             startLight()
         }
         refresh()

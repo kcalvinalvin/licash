@@ -1,5 +1,6 @@
 package org.licash.wallet.ui
 
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.layout.Arrangement
@@ -112,7 +113,15 @@ fun Home(
                 ChooseHub(engine, ui)
             } else {
                 Total(ui) { money(null) }
-                Going(ui, money, history, open)
+                Going(engine, ui, money, history, open)
+                // A new wallet's first catching up: each step, as it goes.
+                if (ui.history.isEmpty() && catchingUp(ui)) {
+                    Spacer(Modifier.height(16.dp))
+                    Column(
+                        Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp))
+                            .background(MaterialTheme.colorScheme.surfaceContainer).padding(horizontal = 16.dp, vertical = 8.dp),
+                    ) { SyncStages(engine, ui) }
+                }
             }
         }
         if (ui.hubs.isNotEmpty()) {
@@ -186,9 +195,10 @@ private fun Total(ui: Ui, open: () -> Unit) {
 
 /** What is going on, in a line: see [glance]. */
 @Composable
-private fun Going(ui: Ui, money: (String?) -> Unit, history: () -> Unit, open: (Activity) -> Unit) {
+private fun Going(engine: Engine, ui: Ui, money: (String?) -> Unit, history: () -> Unit, open: (Activity) -> Unit) {
     val going = glance(ui, System.currentTimeMillis() / 1000) ?: return
     var why by remember { mutableStateOf<String?>(null) }
+    var steps by remember { mutableStateOf(false) }
     Spacer(Modifier.height(8.dp))
     Pill(
         icon = Icons.Default.Warning,
@@ -200,10 +210,11 @@ private fun Going(ui: Ui, money: (String?) -> Unit, history: () -> Unit, open: (
             is Glance.Many -> history
             is Glance.Protecting -> ({ money(going.hub) })
             is Glance.Behind -> ({ why = going.reason })
-            Glance.Syncing -> null
+            Glance.Syncing -> ({ steps = true })
         },
     )
     why?.let { Sheet("Not up to date", dismiss = { why = null }) { Say(it) } }
+    if (steps) Sheet("Catching up", dismiss = { steps = false }) { SyncStages(engine, ui) }
 }
 
 /**

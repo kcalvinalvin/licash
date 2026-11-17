@@ -75,7 +75,7 @@ fun exportLogs(context: Context, ui: Ui): Intent {
         w.appendLine(
             "${ui.network.name}: block ${chain.height}, ${chain.peers} peers, " +
                 (if (chain.synced) "synced" else "syncing") +
-                ", looked in to ${ui.scanned ?: "none"}, ${ui.hubs.size} hubs, tor ${ui.tor}",
+                ", looked in to ${ui.scan?.next ?: "none"}, ${ui.hubs.size} hubs, tor ${ui.tor}",
         )
         ui.problem?.let { w.appendLine("problem: $it") }
         for (name in listOf("app.log", "chain.log")) {
