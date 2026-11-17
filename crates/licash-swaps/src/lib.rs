@@ -66,8 +66,8 @@ use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 pub use donations::{
-    Donation, DonationState, DonationTerms, INVOICE_CLTV, INVOICE_EXPIRY, METADATA, SETTLE_MARGIN,
-    START_ROOM,
+    donation_lnurl, donation_url, Donation, DonationState, DonationTerms, DONATE, DONATE_CALLBACK,
+    INVOICE_CLTV, INVOICE_EXPIRY, METADATA, SETTLE_MARGIN, START_ROOM,
 };
 pub use invoices::MIN_SLACK;
 pub use issue::Issuer;

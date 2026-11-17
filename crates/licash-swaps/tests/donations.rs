@@ -212,6 +212,7 @@ async fn a_donation_paid_is_settled_once_its_payee_is_paid() {
     // Nothing is paid until its invoice is.
     eco.follow().await;
     assert_eq!(eco.state(&hash), DonationState::Open);
+    assert_eq!(eco.provider().open_donations().unwrap(), 1);
     assert_eq!(eco.held(), HELD);
     eco.pay(hash, 40);
     eco.follow().await;
@@ -221,6 +222,7 @@ async fn a_donation_paid_is_settled_once_its_payee_is_paid() {
         (donation.state, donation.amount),
         (DonationState::Settled, 98)
     );
+    assert_eq!(eco.provider().open_donations().unwrap(), 0);
     // The payee collects it, the hub's fee paid of the provider's.
     assert_eq!(eco.held(), HELD - 98 - 1);
     assert_eq!(eco.collected().await, 98);
@@ -415,6 +417,7 @@ async fn a_payment_signed_by_the_deadline_is_settled_and_followed_until_released
     eco.follow().await;
     assert_eq!(eco.node.held(hash).unwrap().0, HeldState::Settled);
     assert_eq!(eco.state(&hash), DonationState::Owed);
+    assert_eq!(eco.provider().open_donations().unwrap(), 1);
     // The provider's step releases it: done.
     eco.provider().step().await.unwrap();
     eco.follow().await;
@@ -455,4 +458,22 @@ async fn open_donations_are_capped() {
     eco.age(&hashes[0], 700);
     eco.follow().await;
     eco.donate(20).await;
+}
+
+#[test]
+fn the_static_lnurl_of_a_code_encodes_its_donation_url() {
+    let code = "licash1qqqsyqcyq5rqwzqfpg9scrgwpugpzysn";
+    let url = licash_swaps::donation_url("https://swaps.example/", code);
+    assert_eq!(url, format!("https://swaps.example/v1/lnurlp/{code}"));
+    let lnurl = licash_swaps::donation_lnurl("https://swaps.example", code);
+    assert!(lnurl.starts_with("LNURL1"), "{lnurl}");
+    assert_eq!(lnurl, lnurl.to_uppercase());
+    let (hrp, data) = bitcoin::bech32::decode(&lnurl).unwrap();
+    assert_eq!(hrp.to_lowercase(), "lnurl");
+    assert_eq!(String::from_utf8(data).unwrap(), url);
+    // A code of real length, past bech32's 90 characters of addresses.
+    let long = "q".repeat(260);
+    let lnurl = licash_swaps::donation_lnurl("https://swaps.example", &long);
+    let (_, data) = bitcoin::bech32::decode(&lnurl).unwrap();
+    assert!(String::from_utf8(data).unwrap().ends_with(&long));
 }

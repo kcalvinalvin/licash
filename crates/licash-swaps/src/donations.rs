@@ -64,6 +64,35 @@ const UNMADE_AFTER: i64 = 60;
 /// commit to its hash.
 pub const METADATA: &str = r#"[["text/plain","A donation to a Licash wallet"]]"#;
 
+/// Where a provider serves the LNURL-pay request of donations to the
+/// wallet of a Licash code, its text in place of `{code}`.
+pub const DONATE: &str = "/v1/lnurlp/{code}";
+
+/// Where a payer asks for the invoice of a donation (LNURL-pay's callback),
+/// its amount in millisatoshis as `?amount=`.
+pub const DONATE_CALLBACK: &str = "/v1/lnurlp/{code}/callback";
+
+/// The URL of [`DONATE`] for `code` at the provider at `base`, its public
+/// URL.
+pub fn donation_url(base: &str, code: &str) -> String {
+    format!(
+        "{}{}",
+        base.trim_end_matches('/'),
+        DONATE.replace("{code}", code)
+    )
+}
+
+/// The static LNURL donations to the wallet of `code` are paid to through
+/// the provider at `base`: [`donation_url`] in bech32, upper case, as a
+/// QR code holds it best. Reused for every donation, payable while the
+/// payee is offline.
+pub fn donation_lnurl(base: &str, code: &str) -> String {
+    use bitcoin::bech32::{self, Bech32, Hrp};
+    let hrp = Hrp::parse("lnurl").expect("a valid prefix");
+    bech32::encode_upper::<Bech32>(hrp, donation_url(base, code).as_bytes())
+        .expect("a URL short enough")
+}
+
 /// What the provider takes donations on, as its operator set it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DonationTerms {
@@ -287,6 +316,19 @@ impl<T: Transport> Provider<T> {
             .map_err(unavailable)?;
         tracing::info!(hash = %hex::encode(hash), sat, amount, "donation invoice made");
         Ok(request)
+    }
+
+    /// Donations under way: their invoices open or held, or their payees'
+    /// payments not released yet. Each needs the node, and the provider
+    /// following it.
+    pub fn open_donations(&self) -> Result<u64, Error> {
+        self.store.read(|c| {
+            Ok(c.query_row(
+                "SELECT count(*) FROM donations WHERE state IN ('open', 'owed')",
+                [],
+                |r| r.get::<_, i64>(0),
+            )? as u64)
+        })
     }
 
     /// The donation under `hash`, if one is.
