@@ -14,6 +14,7 @@ licash-contract = { path = "../../crates/licash-contract" }
 licash-hp = { path = "../../crates/licash-hp" }
 lichen-babe = { path = "../../vendor/lichen/crates/babe" }
 lichen-contract = { path = "../../vendor/lichen/crates/contract" }
+lichen-btc = { git = "https://github.com/lichenbtc-org/lichen-btc", rev = "d7d2de04f7f8d51b44f61a68c7e1789f36502071" }
 licash-wallet.workspace = true
 anyhow.workspace = true
 ark-bn254 = "0.5"

@@ -655,6 +655,79 @@ async fn a_hub_ends_a_contract_no_one_exited_by_default_at_its_close() -> Result
     Ok(())
 }
 
+/// A holder closes her contract early with the hub, cooperatively: its
+/// fold pays her reserve to her wallet at once, the rest to the hub's less
+/// the fee, and the contract protects nothing from then on. The hub's
+/// watcher takes the fold as the contract's end, and posts no default.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs bitcoind and a release build"]
+async fn a_holder_closes_her_contract_early_with_the_hub_and_gets_her_reserve_back() -> Result<()> {
+    let rt = Regtest::start_standard()?;
+    let dir = tempfile::tempdir()?;
+    let (url, source, _, openings) = hub_answering(&rt, &dir.path().join("hub")).await?;
+    let chain = Node(source);
+    let (mine, wallet) = holder_wallet(&rt, &chain, dir.path(), &url, [29; 32], &[60_000]).await?;
+    let opened = holder::open(&wallet, &chain, &mine, &url, ask()).await?;
+    rt.mine(1)?;
+    holder::resume(&wallet, &chain, &mine).await?;
+    ensure!(scan(&wallet, &chain).await? == 37_000);
+    let tip = rt.height()?;
+    let listed = holder::list(&mine)?;
+    ensure!(listed[0].live(tip), "not live: {:?}", listed[0]);
+
+    let txid = holder::close(&wallet, &chain, &mine, &opened.id).await?;
+    let listed = holder::list(&mine)?;
+    ensure!(listed[0].folded == Some(txid), "{:?}", listed[0]);
+    ensure!(!listed[0].live(tip) && listed[0].over(tip));
+    // Asked again, its fold in the mempool: the hub refuses before she
+    // signs another, and it stays closed.
+    let again = holder::close(&wallet, &chain, &mine, &opened.id).await;
+    ensure!(
+        again
+            .as_ref()
+            .is_err_and(|e| format!("{e:#}").contains("spent")),
+        "{again:?}"
+    );
+    ensure!(holder::list(&mine)?[0].folded == Some(txid));
+    rt.mine(1)?;
+
+    // Her reserve at her wallet; the hub's share less the fee at its own.
+    ensure!(scan(&wallet, &chain).await? == 37_000 + 20_000);
+    let fold: serde_json::Value = chain
+        .0
+        .rpc(
+            "getrawtransaction",
+            serde_json::json!([txid.to_string(), true]),
+        )
+        .await?;
+    let f = opened.funding.context("no F")?;
+    ensure!(fold["vin"][0]["txid"] == f.to_string(), "{fold}");
+    ensure!(fold["confirmations"].as_u64() == Some(1), "{fold}");
+    let sats = |v: &serde_json::Value| (v["value"].as_f64().unwrap_or(0.0) * 1e8).round() as u64;
+    let outs = fold["vout"].as_array().context("no outputs")?;
+    ensure!(outs.len() == 2 && sats(&outs[0]) == 20_000, "{fold}");
+    let funding: serde_json::Value = chain
+        .0
+        .rpc(
+            "getrawtransaction",
+            serde_json::json!([f.to_string(), true]),
+        )
+        .await?;
+    let value = sats(&funding["vout"][0]);
+    let fee = value - 20_000 - sats(&outs[1]);
+    ensure!((1..2_000).contains(&fee), "a fee of {fee}: {fold}");
+
+    // The hub posts no default, now or at the close, and ends it.
+    let round = openings.answer_requests().await?;
+    ensure!(round == Default::default(), "{round:?}");
+    let close = opened.close_height;
+    rt.mine(u64::from(close) - u64::from(rt.height()?) + 1)?;
+    let round = openings.answer_requests().await?;
+    ensure!(round == Default::default(), "{round:?}");
+    ensure!(scan(&wallet, &chain).await? == 37_000 + 20_000);
+    Ok(())
+}
+
 /// As [`hub_serving`], and its openings, for a test to answer a holder's
 /// request with.
 async fn hub_answering(

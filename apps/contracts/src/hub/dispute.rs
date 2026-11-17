@@ -16,6 +16,11 @@
 //! Every step reads the chain again: nothing here is state but caches and
 //! the pins. A stopped prover or a failed broadcast is retried on the next
 //! poll.
+//!
+//! Before any of it, she may close her contract early with the hub: its
+//! fold, on the contract output's key path ([`Openings::offer_fold`],
+//! [`Openings::sign_fold`]). Only both parties sign a key-path spend: the
+//! watcher takes any as the fold, and the contract as ended.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -34,8 +39,9 @@ use licash_wallet::first_spend;
 use lichen_contract::Role;
 use sha2::{Digest, Sha256};
 
-use super::{responses::Responses, Openings};
+use super::{responses::Responses, Openings, Refused};
 use crate::holder::node::Node;
+use crate::FoldOffer;
 
 /// What the hub's ledger holds against a claim: candidates, of which the
 /// responder cites those the statement accepts. None known is no error:
@@ -57,6 +63,15 @@ pub(super) struct Watch {
     /// statement ([`Openings::assert_false_proofs`]).
     #[cfg(feature = "faults")]
     false_proofs: std::sync::atomic::AtomicBool,
+}
+
+/// A fold offered a holder: the hub's secret nonce, its holder's public
+/// one then the hub's, and the fee. Kept in memory only, and taken out
+/// before the hub signs: no nonce of it ever signs twice.
+pub(super) struct PendingFold {
+    sec: lichen_btc::musig::SecNonce,
+    nonces: [lichen_btc::musig::PubNonce; 2],
+    fee: Amount,
 }
 
 /// What a poll of one opening did.
@@ -91,8 +106,13 @@ impl Openings {
             return Ok(Played::Idle);
         };
         let default = presign(&o.set, "default")?;
-        if r.input.first().map(|i| i.previous_output) == Some(contract)
-            && r.output == default.tx.output
+        let folded = r
+            .input
+            .iter()
+            .any(|i| i.previous_output == contract && i.witness.len() == 1);
+        if folded
+            || r.input.first().map(|i| i.previous_output) == Some(contract)
+                && r.output == default.tx.output
         {
             // Each party's share went to its wallet: nothing left to play.
             self.end_if_deep(id, r_at, tip)?;
@@ -140,6 +160,103 @@ impl Openings {
                     .await
             }
         }
+    }
+
+    /// The first round of contract `id`'s fold: her public nonce `nonce`
+    /// taken, the hub's made, and the fee it takes from its share at the
+    /// rate of the day. Kept until she signs, or asks again.
+    pub(super) async fn offer_fold(
+        &self,
+        id: &[u8; 32],
+        nonce: &[u8],
+    ) -> Result<FoldOffer, Refused> {
+        let hers = lichen_btc::musig::PubNonce::from_slice(nonce).map_err(Refused::bad)?;
+        let (hub, o) = self.standing(id).await?;
+        let fee = fold_fee(&o, self.fee_rate().await).map_err(Refused::unavailable)?;
+        let fold = crate::fold(&o.babe, &o.funding, fee).map_err(Refused::bad)?;
+        // Its share above dust, or the fee would take it whole.
+        if fold.tx.output.len() != 2 {
+            return Err(Refused::unavailable("fees too high to fold now: later"));
+        }
+        let (sec, mine) = fold
+            .nonce(&hub.keys().party.payment, id)
+            .map_err(Refused::unavailable)?;
+        let pending = PendingFold {
+            sec,
+            nonces: [hers, mine],
+            fee,
+        };
+        self.folds().insert(*id, pending);
+        tracing::info!(id = %crate::hex_id(id), %fee, "a fold offered");
+        Ok(FoldOffer {
+            nonce: mine.0,
+            fee: fee.to_sat(),
+        })
+    }
+
+    /// The second round of contract `id`'s fold: her partial signature
+    /// on the fold last offered checked, the hub's added, the fold
+    /// broadcast. Its nonce is taken out first, whatever follows: asked
+    /// again, it is offered anew.
+    pub(super) async fn sign_fold(
+        &self,
+        id: &[u8; 32],
+        partial: &[u8],
+    ) -> Result<Transaction, Refused> {
+        let partial: lichen_btc::musig::Partial = partial
+            .try_into()
+            .map_err(|_| Refused::bad("a partial signature is 32 bytes"))?;
+        let (hub, o) = self.standing(id).await?;
+        let Some(pending) = self.folds().remove(id) else {
+            return Err(Refused::bad("no fold offered: POST a nonce first"));
+        };
+        let fold = crate::fold(&o.babe, &o.funding, pending.fee).map_err(Refused::bad)?;
+        let holder = &o.babe.core().pubs[0].payment;
+        let nonces = &pending.nonces;
+        fold.verify_partial(holder, &nonces[0], nonces, &partial)
+            .map_err(|e| Refused::bad(format!("her partial signature: {e:#}")))?;
+        let signed = fold
+            .sign(&hub.keys().party.payment, pending.sec, nonces)
+            .and_then(|mine| fold.finish(nonces, &[partial, mine]))
+            .map_err(Refused::unavailable)?;
+        // Hers to broadcast too: a failure here is no reason to keep it.
+        if self.post(&signed).await {
+            tracing::info!(id = %crate::hex_id(id), txid = %signed.compute_txid(), "contract folded");
+        }
+        Ok(signed)
+    }
+
+    /// Opening `id`, signed, its contract output unspent, even by the
+    /// mempool: one to fold.
+    async fn standing(&self, id: &[u8; 32]) -> Result<(Hub, HubOpening), Refused> {
+        let ctx = self.context().await?;
+        let row = self.store().row(id).map_err(Refused::unavailable)?;
+        let row = row.ok_or_else(|| Refused::bad("no such contract"))?;
+        if row.abandoned {
+            return Err(Refused::bad("an opening given up"));
+        }
+        let hub = Hub::load(&row.state, &ctx).map_err(Refused::unavailable)?;
+        let o = hub
+            .signed()
+            .map_err(|_| Refused::bad("not a signed contract"))?;
+        let contract = OutPoint {
+            txid: o.funding.compute_txid(),
+            vout: 0,
+        };
+        if !self
+            .unspent(contract, true)
+            .await
+            .map_err(Refused::unavailable)?
+        {
+            return Err(Refused::bad(
+                "its contract output is spent, or not yet funded",
+            ));
+        }
+        Ok((hub, o))
+    }
+
+    fn folds(&self) -> std::sync::MutexGuard<'_, HashMap<[u8; 32], PendingFold>> {
+        self.folds.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Assert proofs of another statement from now on, as a dishonest hub
@@ -833,3 +950,11 @@ const ENDED_DEPTH: u32 = 6;
 /// The slot output of a request, her publication spending it, and of a
 /// response, the hub's disclosure spending it (Lichen's `SLOT_VOUT`).
 const SLOT: u32 = 2;
+
+/// The fee of `o`'s fold at `rate`: of its size signed, one key-path
+/// signature its witness.
+fn fold_fee(o: &HubOpening, rate: FeeRate) -> Result<Amount> {
+    let mut tx = crate::fold(&o.babe, &o.funding, Amount::ZERO)?.tx;
+    tx.input[0].witness = bitcoin::Witness::from_slice(&[[0u8; 64]]);
+    rate.fee_vb(tx.vsize() as u64).context("fee overflow")
+}

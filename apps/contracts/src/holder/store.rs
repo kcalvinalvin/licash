@@ -4,7 +4,7 @@
 //! a list shows of it. Neither is made until a first contract opens.
 //!
 //! The file's version tells which of its tables a build must know to
-//! read it right. The `ceilings` and `claim_terms` are none of them: each
+//! read it right. The `ceilings`, `claim_terms` and `folds` are none of them: each
 //! made with the first kept, whatever the version, and ignored by a build
 //! before them, which opens the file all the same. A migration to come
 //! must make them `IF NOT EXISTS` too.
@@ -92,6 +92,17 @@ CREATE TABLE IF NOT EXISTS claim_terms (
 ) STRICT;
 ";
 
+/// The contracts she closed early with their hub, each by its last fold's
+/// txid: kept before the hub can sign it, and never dropped: whatever the
+/// hub answers, it may have signed.
+const FOLDS: &str = "
+CREATE TABLE IF NOT EXISTS folds (
+    id BLOB PRIMARY KEY REFERENCES contracts (id),
+    txid BLOB NOT NULL,
+    created_at INTEGER NOT NULL
+) STRICT;
+";
+
 /// A contract's claim terms as kept ([`CLAIM_TERMS`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct KeptTerms {
@@ -165,13 +176,15 @@ pub struct Contract {
     /// Why it was given up, short of her signing F.
     pub abandoned: Option<String>,
     pub created_at: i64,
+    /// Its fold's txid, once she closed it early with its hub.
+    pub folded: Option<Txid>,
 }
 
 impl Contract {
     /// Whether it protects notes now: F buried, its assertion deadline
-    /// ahead of `tip`.
+    /// ahead of `tip`, not closed early.
     pub fn live(&self, tip: u32) -> bool {
-        self.fate == Some(Fate::Live) && tip < self.assert_height
+        self.fate == Some(Fate::Live) && tip < self.assert_height && self.folded.is_none()
     }
 
     /// Whether it is at the hub reached at any of `urls`.
@@ -181,9 +194,12 @@ impl Contract {
     }
 
     /// Whether nothing is left to do for it: given up, F never to
-    /// confirm, or past its close.
+    /// confirm, closed early, or past its close.
     pub fn over(&self, tip: u32) -> bool {
-        self.abandoned.is_some() || self.fate == Some(Fate::Dead) || tip >= self.close_height
+        self.abandoned.is_some()
+            || self.fate == Some(Fate::Dead)
+            || self.folded.is_some()
+            || tip >= self.close_height
     }
 }
 
@@ -273,15 +289,32 @@ impl Store {
 
     /// Whether any contract's ceilings were ever kept here.
     fn keeps_ceilings(&self) -> Result<bool> {
+        self.has("ceilings")
+    }
+
+    /// Whether table `name` was ever made here.
+    fn has(&self, name: &str) -> Result<bool> {
         let made: Option<i64> = self
             .c
             .query_row(
-                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'ceilings'",
-                [],
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [name],
                 |r| r.get(0),
             )
             .optional()?;
         Ok(made.is_some())
+    }
+
+    /// Contract `id` closed early by the fold `txid`, before the hub can
+    /// sign it.
+    pub fn fold(&self, id: &[u8; 32], txid: &Txid) -> Result<()> {
+        self.c.execute_batch(FOLDS)?;
+        self.c.execute(
+            "INSERT INTO folds (id, txid, created_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT (id) DO UPDATE SET txid = ?2, created_at = ?3",
+            params![id, serialize(txid), crate::now()],
+        )?;
+        Ok(())
     }
 
     /// The most the hub of each contract may charge her: none of a
@@ -461,11 +494,15 @@ impl Store {
 
     /// Every contract, the newest first.
     pub fn list(&self) -> Result<Vec<Contract>> {
-        let mut stmt = self.c.prepare(
+        let folds = match self.has("folds")? {
+            true => "(SELECT txid FROM folds WHERE folds.id = contracts.id)",
+            false => "NULL",
+        };
+        let mut stmt = self.c.prepare(&format!(
             "SELECT id, hub, phase, mock, deposit, value, price, cap, assert_height,
-                    close_height, funding, fate, abandoned, created_at, since
-             FROM contracts ORDER BY created_at DESC, id",
-        )?;
+                    close_height, funding, fate, abandoned, created_at, since, {folds}
+             FROM contracts ORDER BY created_at DESC, id"
+        ))?;
         let rows = stmt.query_map([], |r| {
             Ok((
                 r.get::<_, [u8; 32]>(0)?,
@@ -483,7 +520,7 @@ impl Store {
                 r.get::<_, Option<String>>(11)?,
                 r.get::<_, Option<String>>(12)?,
                 r.get::<_, i64>(13)?,
-                r.get::<_, u32>(14)?,
+                (r.get::<_, u32>(14)?, r.get::<_, Option<Vec<u8>>>(15)?),
             ))
         })?;
         let mut all = Vec::new();
@@ -500,7 +537,7 @@ impl Store {
                 fate,
                 abandoned,
                 created_at,
-                since,
+                (since, folded),
             ) = row?;
             let phase = *Phase::ALL
                 .get(usize::from(phase))
@@ -521,6 +558,7 @@ impl Store {
                 fate: fate.as_deref().map(text_fate).transpose()?,
                 abandoned,
                 created_at,
+                folded: folded.map(|t| deserialize(&t)).transpose()?,
             });
         }
         Ok(all)
@@ -787,6 +825,27 @@ mod tests {
         assert_eq!(store.state(&[1; 32]).unwrap(), (b"funded".to_vec(), 200));
         let second = all.iter().find(|c| c.id == [2; 32]).unwrap();
         assert_eq!((second.phase, second.fate), (Phase::Started, None));
+    }
+
+    #[test]
+    fn a_contract_folded_protects_nothing_and_is_over_by_its_last_fold() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store.insert(&new(1, coin(0))).unwrap();
+        store.set_fate(&[1; 32], Fate::Live).unwrap();
+        // No table yet: none folded.
+        assert!(!store.has("folds").unwrap());
+        assert_eq!(store.list().unwrap()[0].folded, None);
+        let fold = Txid::from_byte_array([7; 32]);
+        store.fold(&[1; 32], &fold).unwrap();
+        let folded = &store.list().unwrap()[0];
+        assert_eq!(folded.folded, Some(fold));
+        assert!(!folded.live(300) && folded.over(300));
+        // Asked again: the last.
+        let again = Txid::from_byte_array([8; 32]);
+        store.fold(&[1; 32], &again).unwrap();
+        assert_eq!(store.list().unwrap()[0].folded, Some(again));
+        assert!(!store.list().unwrap()[0].live(300));
     }
 
     #[test]

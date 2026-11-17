@@ -159,6 +159,7 @@ mod tests {
             fate: Some(Fate::Live),
             abandoned: None,
             created_at: 0,
+            folded: None,
         }
     }
 

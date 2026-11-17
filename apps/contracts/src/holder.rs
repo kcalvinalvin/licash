@@ -12,6 +12,7 @@ mod chain;
 pub mod claims;
 mod driver;
 pub mod fees;
+mod fold;
 #[cfg(feature = "node")]
 pub(crate) mod node;
 pub mod recovery;
@@ -28,6 +29,7 @@ use licash_wallet::{SilentCoin, Transport, Wallet};
 
 pub use chain::Chain;
 use driver::Driver;
+pub use fold::close;
 pub use licash_contract::opening::{Fate, Phase};
 #[cfg(feature = "node")]
 pub use node::Node;
@@ -859,6 +861,7 @@ mod tests {
             fate: Some(fate),
             abandoned: None,
             created_at: 0,
+            folded: None,
         };
         let mut other = contract(5, 320, Fate::Live);
         other.hub = "http://other.example".into();

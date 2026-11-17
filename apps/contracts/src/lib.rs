@@ -10,6 +10,12 @@
 //! the hub's that takes long (funding, checking opened instances) answers
 //! 202 until done: she sends the same message again, and gets the answer.
 //!
+//! Once open, she may close it early with the hub, cooperatively: she
+//! POSTs her MuSig2 nonce for the fold of its output at [`FOLD`], and gets
+//! the hub's [`FoldOffer`]; then her partial signature at [`FOLD_SIGN`],
+//! and gets the fold, signed and broadcast. It pays her reserve back, the
+//! hub the rest less the fee, taken from the hub's share.
+//!
 //! Openings under the mock authority (anyone "proves" anything) are for
 //! regtest only, and say so; on signet they are under the genuine programs
 //! kept in `r0/programs/`: [`trust`].
@@ -38,6 +44,12 @@ pub const OPEN: &str = "/v1/contracts/open";
 pub const STEP: &str = "/v1/contracts/openings/{id}";
 /// POST a committed kept instance, as a versioned opening envelope.
 pub const INSTANCE: &str = "/v1/contracts/openings/{id}/instances";
+/// POST her public nonce (66 bytes) for the fold of contract `id`: the
+/// hub's [`FoldOffer`].
+pub const FOLD: &str = "/v1/contracts/openings/{id}/fold";
+/// POST her partial signature (32 bytes) on the fold last offered: the
+/// fold, signed by both and broadcast, in consensus bytes.
+pub const FOLD_SIGN: &str = "/v1/contracts/openings/{id}/fold/sign";
 
 /// The most bytes a request or an answer of an opening holds.
 pub const MAX_BODY: usize = 64 << 20;
@@ -78,6 +90,49 @@ impl Offer {
             .reserve_alice
             .saturating_add(q.fees.opening_fee_quote)
     }
+}
+
+/// The hub's half of a fold's first round: its public nonce, and the fee
+/// it takes from its own share.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FoldOffer {
+    pub nonce: [u8; 66],
+    pub fee: u64,
+}
+
+impl FoldOffer {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = Writer(Vec::new());
+        w.bytes(&self.nonce);
+        w.u64(self.fee);
+        w.0
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut r = Reader(bytes);
+        let offer = Self {
+            nonce: r.array()?,
+            fee: r.u64()?,
+        };
+        r.end()?;
+        Ok(offer)
+    }
+}
+
+/// The fold of the contract output of `babe`, funded by `funding`: its
+/// cooperative close, paying the holder her reserve back and the hub the
+/// rest less `fee`.
+pub(crate) fn fold(
+    babe: &licash_contract::graph::HubProves,
+    funding: &bitcoin::Transaction,
+    fee: bitcoin::Amount,
+) -> Result<lichen_contract::Fold> {
+    let contract = bitcoin::OutPoint {
+        txid: funding.compute_txid(),
+        vout: 0,
+    };
+    babe.core()
+        .fold(&babe.tree()?, contract, bitcoin::Amount::ZERO, fee)
 }
 
 /// What a holder POSTs to open: the quote she opens on, and her Open.
@@ -208,6 +263,19 @@ pub fn parse_id(hex: &str) -> Result<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_fold_offer_reads_as_written_and_nothing_else() {
+        let offer = FoldOffer {
+            nonce: [3; 66],
+            fee: 1_234,
+        };
+        let bytes = offer.encode();
+        assert_eq!(bytes.len(), 74);
+        assert_eq!(FoldOffer::decode(&bytes).unwrap(), offer);
+        assert!(FoldOffer::decode(&bytes[..73]).is_err());
+        assert!(FoldOffer::decode(&[bytes.as_slice(), &[0]].concat()).is_err());
+    }
 
     #[test]
     fn the_hub_statement_image_is_pinned() {

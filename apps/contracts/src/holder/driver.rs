@@ -278,7 +278,7 @@ impl<T: Transport, C: Chain> Driver<'_, T, C> {
 }
 
 /// The hub's answer of `status`: refused if it will refuse it again.
-fn failed(hub: &str, status: u16, body: &[u8]) -> anyhow::Error {
+pub(super) fn failed(hub: &str, status: u16, body: &[u8]) -> anyhow::Error {
     let reason = String::from_utf8_lossy(&body[..body.len().min(500)]).into_owned();
     if (400..500).contains(&status) {
         Refusal(format!("{hub} refused it: {reason}")).into()

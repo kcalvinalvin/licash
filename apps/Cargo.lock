@@ -3368,6 +3368,7 @@ dependencies = [
  "licash-hp",
  "licash-wallet",
  "lichen-babe",
+ "lichen-btc",
  "lichen-contract",
  "rusqlite",
  "serde",

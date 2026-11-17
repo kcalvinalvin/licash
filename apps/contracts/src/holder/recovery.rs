@@ -274,8 +274,10 @@ pub async fn force_close<T: Transport, C: Chain>(
             contract.fate == Some(Fate::Live),
             "its F is not buried in the chain yet"
         );
+        // Closed early too: a fold that never confirmed leaves it to
+        // recover, and one that did makes the recovery give back.
         ensure!(
-            contract.live(tip),
+            tip < contract.assert_height,
             "its protection ended at block {}",
             contract.assert_height
         );

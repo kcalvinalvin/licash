@@ -185,7 +185,12 @@ mock authority's; on signet the hub runs `licash-r0 hp-prove`
 (`LICASH_HP_PROVER` names another) in the background, its files in
 `<data>/hp-proofs/<id>/`. It sweeps its outputs of each payout to its
 wallet; a payout's rest and the holder's reserve pay each party's wallet
-directly. A contract no one exited ends at its close: the hub posts its
+directly. A holder may close her contract early: at
+`/v1/contracts/openings/{id}/fold` and `.../fold/sign` the hub signs the
+fold with her (MuSig2, its nonce kept in memory and used at most once),
+paying her reserve back and the rest to the hub less the fee at its fee
+rate, and broadcasts it; any key-path spend of a contract output is such a
+fold, and ends the contract. A contract no one exited ends at its close: the hub posts its
 default, which pays the holder her reserve and the hub its collateral back,
 to its wallet. The fee coins its wallet funds for these transactions are
 kept in `openings.sqlite` before use, and a contract ended 6 blocks deep is

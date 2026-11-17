@@ -36,7 +36,7 @@ use licash_chain_client::Source;
 pub use licash_contract::opening::HubPhase;
 use licash_contract::opening::{Context, Hub, Trust};
 
-use crate::{Frame, Offer, INSTANCE, MAX_BODY, OPEN, QUOTE, STEP};
+use crate::{Frame, Offer, FOLD, FOLD_SIGN, INSTANCE, MAX_BODY, OPEN, QUOTE, STEP};
 use store::Store;
 use terms::{Range, Timing};
 
@@ -78,6 +78,8 @@ pub struct Openings {
     watch: dispute::Watch,
     /// Where the responder finds its evidence against a filing.
     evidencer: std::sync::OnceLock<Arc<Evidencer>>,
+    /// Each contract's fold offered, until its holder signs or asks again.
+    folds: Mutex<HashMap<[u8; 32], dispute::PendingFold>>,
 }
 
 /// One responder poll. A bad opening never hides the others; errors are
@@ -271,6 +273,7 @@ impl Openings {
             funding: tokio::sync::Mutex::new(()),
             watch: dispute::Watch::default(),
             evidencer: std::sync::OnceLock::new(),
+            folds: Mutex::default(),
         });
         // A node restarted forgets the coins it locked without persisting.
         let locked = openings.store().locked()?;
@@ -410,8 +413,8 @@ impl Openings {
     }
 }
 
-/// The routes of `openings`, at [`QUOTE`], [`OPEN`], [`STEP`] and
-/// [`INSTANCE`].
+/// The routes of `openings`, at [`QUOTE`], [`OPEN`], [`STEP`],
+/// [`INSTANCE`], [`FOLD`] and [`FOLD_SIGN`].
 pub fn router(openings: Arc<Openings>) -> Router {
     // Separate budgets let existing openings progress while new opens or
     // instance uploads are saturated. Body permits precede extraction and
@@ -423,6 +426,8 @@ pub fn router(openings: Arc<Openings>) -> Router {
         .route(OPEN, post(open).layer(budget(2)))
         .route(STEP, post(step).layer(budget(2)))
         .route(INSTANCE, post(instance).layer(budget(4)))
+        .route(FOLD, post(offer_fold).layer(budget(2)))
+        .route(FOLD_SIGN, post(sign_fold).layer(budget(2)))
         .layer(DefaultBodyLimit::max(MAX_BODY))
         .with_state(openings)
 }
@@ -513,6 +518,27 @@ async fn instance(
     openings.step(id, body.to_vec()).await
 }
 
+/// Her nonce for contract `id`'s fold: the hub's, and the fee.
+async fn offer_fold(
+    State(openings): State<Arc<Openings>>,
+    UrlPath(id): UrlPath<String>,
+    body: Bytes,
+) -> Result<Vec<u8>, Refused> {
+    let id = crate::parse_id(&id).map_err(Refused::bad)?;
+    Ok(openings.offer_fold(&id, &body).await?.encode())
+}
+
+/// Her partial signature on contract `id`'s fold: the fold, broadcast.
+async fn sign_fold(
+    State(openings): State<Arc<Openings>>,
+    UrlPath(id): UrlPath<String>,
+    body: Bytes,
+) -> Result<Vec<u8>, Refused> {
+    let id = crate::parse_id(&id).map_err(Refused::bad)?;
+    let fold = openings.sign_fold(&id, &body).await?;
+    Ok(bitcoin::consensus::serialize(&fold))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -585,6 +611,7 @@ mod tests {
             funding: tokio::sync::Mutex::new(()),
             watch: dispute::Watch::default(),
             evidencer: std::sync::OnceLock::new(),
+            folds: Mutex::default(),
         }
     }
 

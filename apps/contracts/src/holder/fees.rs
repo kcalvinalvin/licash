@@ -228,6 +228,7 @@ mod tests {
             fate,
             abandoned: None,
             created_at: 0,
+            folded: None,
         }
     }
 
