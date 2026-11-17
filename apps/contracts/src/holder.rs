@@ -77,9 +77,12 @@ pub enum Change {
     #[default]
     Bitcoin,
     /// Into notes at the contract's hub, F paying a deposit there with
-    /// it, the hub's fee in it: no change left on Bitcoin. On Bitcoin
-    /// all the same where the hub takes no deposit paid so much exactly,
-    /// or leaves too little time to pay it in.
+    /// it, the hub's fee in it: no change left on Bitcoin, her coin
+    /// turned whole into the contract and notes it protects. The opening
+    /// is refused where that cannot be: the hub takes no deposit paid so
+    /// much exactly, leaves too little time to pay it in, or the change
+    /// is more than the contract protects. Change too little to be an
+    /// output goes to F's fee.
     Notes,
 }
 
@@ -220,8 +223,19 @@ async fn open_at<T: Transport, C: Chain>(
     // one too short to pay in F: not asked.
     let window = info.deposits.as_ref().map_or(0, |d| d.window);
     let into = match change {
-        Change::Notes if left >= offer.quote.graph.dust && window >= 2 * DEPOSIT_MARGIN => {
-            deposit_for_change(wallet, &hub, left, tip).await
+        Change::Notes if left >= offer.quote.graph.dust => {
+            let cap = u64::from(offer.quote.cap);
+            ensure!(
+                left <= cap,
+                "{deposit}: {left} sat left over the price, more than the {cap} sat protected: \
+                 choose a smaller coin or a larger cap"
+            );
+            ensure!(
+                window >= 2 * DEPOSIT_MARGIN,
+                "{hub} takes deposits for too short a while to pay {left} sat in F: \
+                 choose a coin of the price"
+            );
+            Some(deposit_for_change(wallet, &hub, left, tip).await?)
         }
         _ => None,
     };
@@ -673,33 +687,30 @@ fn wanted(offer: &Offer, tip: u32, blocks: u32) -> Result<Wanted> {
 }
 
 /// A deposit at `hub` paid `left` exactly, F's change, the hub's fee in
-/// it, to pay in F at `tip`: its hash and the script F pays. None if the
-/// hub takes none so (its fee changed since its info was read, say), or
-/// leaves too little time to sign F and have it confirm
-/// ([`DEPOSIT_MARGIN`]), its change then on Bitcoin.
+/// it, to pay in F at `tip`: its hash and the script F pays. Fails if
+/// the hub takes none so (its fee changed since its info was read, say),
+/// or leaves too little time to sign F and have it confirm
+/// ([`DEPOSIT_MARGIN`]).
 async fn deposit_for_change<T: Transport>(
     wallet: &Wallet<T>,
     hub: &str,
     left: u64,
     tip: u32,
-) -> Option<(String, ScriptBuf)> {
-    let asked = match wallet.deposit_paying(hub, left).await {
-        Ok(asked) => asked,
-        Err(e) => {
-            tracing::info!(%hub, left, "F's change stays on Bitcoin: {e}");
-            return None;
-        }
-    };
+) -> Result<(String, ScriptBuf)> {
+    let asked = (wallet.deposit_paying(hub, left).await)
+        .with_context(|| format!("{left} sat left over the price, not to be notes at {hub}"))?;
     let script = asked.terms.as_ref().and_then(|terms| {
         let time = terms.fund_by >= tip.saturating_add(2 * DEPOSIT_MARGIN);
         (time && terms.pays == left).then(|| script_of(&terms.address))?
     });
-    if script.is_none() {
-        let why = "not to be paid in F: too little time, or paid another amount";
-        tracing::info!(%hub, left, hash = %asked.hash, "F's change stays on Bitcoin: {why}");
-        let _ = wallet.give_up_deposit(&asked.hash, why);
+    match script {
+        Some(script) => Ok((asked.hash, script)),
+        None => {
+            let why = "not to be paid in F: too little time, or paid another amount";
+            let _ = wallet.give_up_deposit(&asked.hash, why);
+            bail!("{left} sat left over the price, not to be notes at {hub}: {why}")
+        }
     }
-    Some((asked.hash, script?))
 }
 
 /// The output script of `address`, a deposit's, as the wallet recorded

@@ -1141,7 +1141,13 @@ async fn hub_taking_deposits(
     );
     let source: Source = url.parse()?;
     let keyset = hub.info().keysets[0].clone();
-    let openings = Openings::with_wallet(dir, source.clone(), source.clone(), keyset, None);
+    let range = Range {
+        max_cap: 50_000_000,
+        max_blocks: 5_000,
+        per_coin: 2,
+        ppm_year: 10_000,
+    };
+    let openings = Openings::with_wallet(dir, source.clone(), source.clone(), keyset, Some(range));
     let config = deposit::Config {
         max: 2_000_000,
         ..deposit::Config::new(bitcoin::ScriptBuf::new_op_return([]))
@@ -1175,8 +1181,7 @@ async fn followed(hub: &Arc<Hub>, source: &Source, deposits: &deposit::Gateway) 
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs bitcoind and a release build"]
-async fn a_wallet_sweeps_its_coin_into_a_contract_and_notes_its_change_on_bitcoin_if_too_much(
-) -> Result<()> {
+async fn a_wallet_turns_its_coin_whole_into_a_contract_and_notes_or_opens_none() -> Result<()> {
     let rt = Regtest::start_standard()?;
     let dir = tempfile::tempdir()?;
     let (url, source, hub, deposits) = hub_taking_deposits(&rt, &dir.path().join("hub")).await?;
@@ -1208,21 +1213,28 @@ async fn a_wallet_sweeps_its_coin_into_a_contract_and_notes_its_change_on_bitcoi
     let small = coins.iter().find(|c| c.value == 1_000_000);
     let small = small.context("no coin")?.outpoint;
 
-    // Opened on the small one, her change into notes: F pays a deposit
-    // of hers exactly, 977 000 sat, the hub's 1000 in it.
-    let swept = Ask {
-        deposit: Some(small),
-        ..ask()
+    let range = (info.contracts.and_then(|c| c.range)).context("no range")?;
+    let chosen = |coin, cap| Ask {
+        blocks: 300,
+        max_price: 30_000,
+        cap: Some(cap),
+        deposit: Some(coin),
     };
+
+    // Opened on the small one, her change into notes it protects: F pays
+    // a deposit of hers exactly, the hub's 1000 in it.
+    let price = range.price(1_000_000, 300);
+    let (pays, amount) = (1_000_000 - price, 1_000_000 - price - 1_000);
+    let swept = chosen(small, 1_000_000);
     let first = holder::open_with(&wallet, &chain, &mine, &url, swept, Change::Notes).await?;
     ensure!(
-        first.phase == Phase::Funded && first.price == 23_000,
+        first.phase == Phase::Funded && first.price == price,
         "{first:?}"
     );
     let asked = wallet.deposits()?;
     ensure!(asked.len() == 1, "{asked:?}");
     let terms = asked[0].terms.clone().context("no terms")?;
-    ensure!(asked[0].amount == 976_000 && terms.pays == 977_000);
+    ensure!(asked[0].amount == amount && terms.pays == pays);
     ensure!(asked[0].state == DepositState::Open, "{asked:?}");
     let f = first.funding.context("no F")?;
     let found: serde_json::Value = chain
@@ -1235,7 +1247,7 @@ async fn a_wallet_sweeps_its_coin_into_a_contract_and_notes_its_change_on_bitcoi
     let outputs = found["vout"].as_array().context("no outputs")?;
     let paid = outputs.iter().any(|o| {
         o["scriptPubKey"]["address"] == terms.address.as_str()
-            && (o["value"].as_f64().unwrap_or(0.0) * 1e8).round() as u64 == 977_000
+            && (o["value"].as_f64().unwrap_or(0.0) * 1e8).round() as u64 == pays
     });
     ensure!(paid, "{found}");
 
@@ -1252,7 +1264,7 @@ async fn a_wallet_sweeps_its_coin_into_a_contract_and_notes_its_change_on_bitcoi
     }
     ensure!(state == DepositState::Received, "{state:?}");
     let held: u64 = wallet.balance()?.iter().map(|b| b.available).sum();
-    ensure!(held == 976_000, "{held}");
+    ensure!(held == amount, "{held}");
     let contracts = holder::resume(&wallet, &chain, &mine).await?;
     ensure!(contracts[0].fate == Some(Fate::Live), "{contracts:?}");
     ensure!(scan(&wallet, &chain).await? == 3_000_000);
@@ -1260,19 +1272,30 @@ async fn a_wallet_sweeps_its_coin_into_a_contract_and_notes_its_change_on_bitcoi
     let address: bitcoin::Address<_> = terms.address.parse()?;
     let script = address.assume_checked().script_pubkey();
     let tip = rt.height()?;
-    let into = holder::paid_into(&wallet, &mine, &script, 977_000, tip)?;
+    let into = holder::paid_into(&wallet, &mine, &script, pays, tip)?;
     ensure!(into.map(|o| o.txid) == Some(f), "{into:?}");
-    ensure!(holder::paid_into(&wallet, &mine, &script, 977_001, tip)?.is_none());
+    ensure!(holder::paid_into(&wallet, &mine, &script, pays + 1, tip)?.is_none());
 
-    // On the large one, its change more than the hub takes: on Bitcoin,
-    // as asked otherwise, no deposit asked for.
-    let second = holder::open_with(&wallet, &chain, &mine, &url, ask(), Change::Notes).await?;
-    ensure!(second.phase == Phase::Funded && second.value == 3_000_000);
+    // On the large one, its change more than the contract protects, or
+    // than the hub takes: none opened, no deposit asked, no change left.
+    let large = (wallet.silent_coins()?.into_iter())
+        .find(|c| c.value == 3_000_000)
+        .context("no coin")?
+        .outpoint;
+    let unprotected = chosen(large, 1_000_000);
+    let refused = holder::open_with(&wallet, &chain, &mine, &url, unprotected, Change::Notes).await;
+    let refused = refused.expect_err("change unprotected").to_string();
+    ensure!(
+        refused.contains("more than the 1000000 sat protected"),
+        "{refused}"
+    );
+    let too_much = chosen(large, 3_000_000);
+    let refused = holder::open_with(&wallet, &chain, &mine, &url, too_much, Change::Notes).await;
+    let refused = format!("{:#}", refused.expect_err("change over the hub's most"));
+    ensure!(refused.contains("not to be notes"), "{refused}");
     ensure!(wallet.deposits()?.len() == 1);
-    rt.mine(1)?;
-    let contracts = holder::resume(&wallet, &chain, &mine).await?;
-    ensure!(contracts.iter().all(|c| c.fate == Some(Fate::Live)));
-    ensure!(scan(&wallet, &chain).await? == 2_977_000);
+    ensure!(holder::list(&mine)?.len() == 1);
+    ensure!(scan(&wallet, &chain).await? == 3_000_000);
     Ok(())
 }
 
