@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use licash::spend::ProposalId;
 use licash_api::{Code, Hex, Pay, PayState, Paying, Problem};
-use licash_hub::{Error, Forward, Forwarded, Refusal};
+use licash_hub::{Error, Forward, Forwarded, Refusal, LOCAL};
 use licash_lightning::{expires, judge, unpayable, Judged};
 use lightning_invoice::Bolt11Invoice;
 
@@ -15,7 +15,8 @@ impl Gateway {
     /// Pay the invoice of `body` for its lock, or say where its payment
     /// stands. An invoice the gateway does not pay for the lock fails the
     /// payment at once, which refunds the lock, if the lock is of the
-    /// invoice's hash and pays the hub alone.
+    /// invoice's hash and pays the hub alone. An invoice of the gateway's
+    /// own node is paid inside the hub, if it is a receipt's still open.
     pub async fn pay(&self, body: &Pay) -> Result<Paying, Failure> {
         let id = body.lock()?;
         let invoice: Bolt11Invoice = body
@@ -29,10 +30,16 @@ impl Gateway {
             if forward.request != request {
                 return Err(refused("the lock pays another invoice"));
             }
-            if forward.state == Forwarded::Pending {
-                if let Ok(view) = self.view().await {
-                    self.act(&id, &view, &mut misses).await;
+            match forward.state {
+                Forwarded::Pending if forward.node == LOCAL => {
+                    self.resume_local(forward.hash).await
                 }
+                Forwarded::Pending => {
+                    if let Ok(view) = self.view().await {
+                        self.act(&id, &view, &mut misses).await;
+                    }
+                }
+                _ => {}
             }
             return self.paying_of(id).await;
         }
@@ -45,6 +52,9 @@ impl Gateway {
             .terms()
             .expiry();
         let (hash, node) = (*invoice.payment_hash().as_ref(), view.info.pubkey.clone());
+        if hex::encode(invoice.get_payee_pub_key().serialize()) == node {
+            return self.fulfill(id, &invoice, &view, expiry).await;
+        }
         let least = match self.payable(&invoice, &view, expiry) {
             Ok(msat) => self.config.lightning(node.clone()).pay_lock(msat),
             Err(why) => return self.refuse(id, hash, request, node, why).await,
@@ -70,7 +80,7 @@ impl Gateway {
     /// Refuse to pay `request` for lock `id` for `why`: the payment is
     /// recorded failed, which refunds the lock, if the engine would have
     /// forwarded it; refused as is otherwise.
-    async fn refuse(
+    pub(super) async fn refuse(
         &self,
         id: ProposalId,
         hash: [u8; 32],
@@ -146,9 +156,6 @@ impl Gateway {
         if invoice.currency() != view.info.currency {
             return Err("an invoice of another network");
         }
-        if hex::encode(invoice.get_payee_pub_key().serialize()) == view.info.pubkey {
-            return Err("an invoice of the hub's own node");
-        }
         if self.cltv_limit(expiry, view.tip, invoice).is_none() {
             return Err("the lock expires too soon for the invoice");
         }
@@ -179,6 +186,14 @@ impl Gateway {
             }
             Err(e) => return tracing::warn!(error = %e, "cannot read a payment"),
         };
+        // Paid inside the hub, by its receipt's claim: no node pays it.
+        if forward.node == LOCAL {
+            misses.remove(id.as_bytes());
+            if view.tip >= forward.expiry {
+                self.late(&forward).await;
+            }
+            return;
+        }
         let name = hex::encode(id.as_bytes());
         if forward.node != view.info.pubkey {
             let message = format!(
@@ -282,7 +297,7 @@ impl Gateway {
         self.alert(format!("late {name}"), message).await;
     }
 
-    async fn paying_of(&self, id: ProposalId) -> Result<Paying, Failure> {
+    pub(super) async fn paying_of(&self, id: ProposalId) -> Result<Paying, Failure> {
         let forward = self.on_hub(move |hub| hub.forward_of(&id)).await?;
         let forward = forward.ok_or(Failure(Problem::new(Code::UnknownLock, "no payment")))?;
         let (state, preimage, reason) = match forward.state {

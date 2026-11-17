@@ -55,7 +55,7 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use store::{now, setup_io, Store};
 
-pub use forwards::{Forward, Forwarded};
+pub use forwards::{Forward, Forwarded, LOCAL};
 pub use locks::{Lock, Settled, Timing};
 pub use records::{ForwardRecord, LockRecord, Movement, Notes, Unlinks};
 

@@ -457,19 +457,307 @@ async fn a_failed_payment_refunds_its_lock_at_once() {
 }
 
 #[tokio::test]
-async fn an_invoice_of_the_hubs_own_node_is_refused_and_refunded() {
+async fn an_invoice_of_a_receipt_at_the_same_hub_is_paid_inside_it() {
     let net = Net::new().await;
     let alice = net.funded("alice", 40).await;
     let bob = net.wallet("bob");
     let invoice = bob.invoice(HUB, 10).await.unwrap();
+    let (request, hash) = (invoice.request.clone().unwrap(), bytes(&invoice.hash));
+    // The invoice's 11, its receipt fee in it, and no gateway fee.
+    assert_eq!(alice.invoice_fee(HUB, &request).unwrap(), 0);
+    let lock = alice.pay_invoice(HUB, &request).await.unwrap();
+    assert_eq!((lock.amount, lock.state.clone()), (11, LockState::Locked));
+    assert_eq!(lock.failure, None);
+    // No HTLC backs the receipt any more: one arriving now is failed back.
+    assert_eq!(net.node.held(hash).unwrap().0, HeldState::Canceled);
+    assert!(!net.node.try_pay_held(hash, net.height() + 100));
+    let status = net.gateway.receive_status(&hash).unwrap();
+    assert_eq!(status.state, ReceiveState::Locked);
+
+    let received = bob.follow_invoice(&invoice.hash).await.unwrap();
+    assert_eq!(received.state, InvoiceState::Received);
+    assert_eq!(available(&bob), 10);
+    net.gateway.round().await;
+    assert_eq!(
+        net.gateway.receive_status(&hash).unwrap().state,
+        ReceiveState::Settled
+    );
+    let lock = alice.follow_lock(&lock.id).await.unwrap();
+    let preimage = preimage_of(&net, "bob", &invoice.hash);
+    assert_eq!(lock.state, LockState::Paid(preimage));
+    assert_eq!(available(&alice), 40 - 11);
+    // Nothing went over Lightning, and no one was alerted.
+    assert!(net.node.sent().is_empty());
+    assert_eq!(alerts(&net.hub), 0);
+    net.gateway.round().await;
+    assert!(net.node.sent().is_empty());
+}
+
+#[tokio::test]
+async fn an_invoice_paid_over_lightning_first_is_refused_for_a_lock() {
+    let net = Net::new().await;
+    let alice = net.funded("alice", 40).await;
+    let bob = net.wallet("bob");
+    let invoice = bob.invoice(HUB, 10).await.unwrap();
+    let hash = bytes(&invoice.hash);
+    net.pay_held(&invoice.hash);
     let lock = alice
         .pay_invoice(HUB, invoice.request.as_deref().unwrap())
         .await
         .unwrap();
     assert_eq!(lock.state, LockState::Refunded);
-    assert!(lock.failure.unwrap().contains("own node"));
-    assert!(net.node.sent().is_empty());
+    assert!(lock.failure.unwrap().contains("paid or canceled"));
     assert_eq!(available(&alice), 40);
+    // The HTLC backs the receipt, as ever.
+    net.gateway.round().await;
+    let received = bob.follow_invoice(&invoice.hash).await.unwrap();
+    assert_eq!(received.state, InvoiceState::Received);
+    net.gateway.round().await;
+    assert_eq!(net.node.held(hash).unwrap(), (HeldState::Settled, 11_000));
+}
+
+#[tokio::test]
+async fn an_invoice_of_the_hubs_own_node_but_no_receipt_is_refused() {
+    let net = Net::new().await;
+    let alice = net.funded("alice", 40).await;
+    let bob = net.wallet("bob");
+    let invoice = bob.invoice(HUB, 10).await.unwrap();
+    // Another invoice of the receipt's hash, by the same node.
+    let hash = bytes(&invoice.hash);
+    let db = rusqlite::Connection::open(net.dir.path().join("lightning.sqlite")).unwrap();
+    db.execute("DELETE FROM receipts WHERE hash = ?1", [hash])
+        .unwrap();
+    let lock = alice
+        .pay_invoice(HUB, invoice.request.as_deref().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(lock.state, LockState::Refunded);
+    assert!(lock.failure.unwrap().contains("does not wait for"));
+    assert_eq!(net.node.held(hash).unwrap().0, HeldState::Open);
+    assert_eq!(available(&alice), 40);
+}
+
+#[tokio::test]
+async fn a_receipt_is_paid_inside_the_hub_once_of_two_payers() {
+    let net = Net::new().await;
+    let alice = net.funded("alice", 40).await;
+    let carol = net.funded("carol", 40).await;
+    let bob = net.wallet("bob");
+    let invoice = bob.invoice(HUB, 10).await.unwrap();
+    let request = invoice.request.clone().unwrap();
+    let first = alice.pay_invoice(HUB, &request).await.unwrap();
+    assert_eq!((first.state, first.failure), (LockState::Locked, None));
+    let second = carol.pay_invoice(HUB, &request).await.unwrap();
+    // Refused: its notes return once its lock expired.
+    assert!(second.failure.is_some(), "{second:?}");
+    bob.follow_invoice(&invoice.hash).await.unwrap();
+    net.gateway.round().await;
+    let first = alice.follow_lock(&first.id).await.unwrap();
+    assert!(matches!(first.state, LockState::Paid(_)));
+    assert_eq!(available(&bob), 10);
+    let id = proposal_id(&second.id);
+    assert!(!matches!(
+        net.hub.forward_of(&id).unwrap().map(|f| f.state),
+        Some(licash_hub::Forwarded::Paid(_) | licash_hub::Forwarded::Pending)
+    ));
+    assert_eq!(net.hub.locked(&id).unwrap().settled, None);
+}
+
+#[tokio::test]
+async fn a_receipt_paid_inside_the_hub_and_unclaimed_refunds_its_payer() {
+    let net = Net::new().await;
+    let alice = net.funded("alice", 40).await;
+    let bob = net.wallet("bob");
+    let invoice = bob.invoice(HUB, 10).await.unwrap();
+    let hash = bytes(&invoice.hash);
+    let lock = alice
+        .pay_invoice(HUB, invoice.request.as_deref().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(lock.state, LockState::Locked);
+    // The receipt's lock expired at depth, unclaimed.
+    net.mine(6 + 1, None);
+    net.gateway.round().await;
+    assert_eq!(
+        net.gateway.receive_status(&hash).unwrap().state,
+        ReceiveState::Canceled
+    );
+    let lock = alice.follow_lock(&lock.id).await.unwrap();
+    assert_eq!(lock.state, LockState::Refunded);
+    assert_eq!(
+        lock.failure.as_deref(),
+        Some("the payee did not claim the payment")
+    );
+    assert_eq!(available(&alice), 40);
+    let invoice = bob.follow_invoice(&invoice.hash).await.unwrap();
+    assert!(matches!(invoice.state, InvoiceState::Canceled(_)));
+    assert_eq!(available(&bob), 0);
+    assert_eq!(alerts(&net.hub), 0);
+}
+
+#[tokio::test]
+async fn a_lock_made_inside_the_hub_before_a_crash_is_taken_for_its_receipt() {
+    let net = Net::new().await;
+    let alice = net.funded("alice", 40).await;
+    let bob = net.wallet("bob");
+    let invoice = bob.invoice(HUB, 10).await.unwrap();
+    let hash = bytes(&invoice.hash);
+    let lock = alice
+        .pay_invoice(HUB, invoice.request.as_deref().unwrap())
+        .await
+        .unwrap();
+    let locked = net.gateway.receive_status(&hash).unwrap().lock;
+    assert!(locked.is_some());
+    // As if the gateway stopped between locking and recording the lock.
+    let db = rusqlite::Connection::open(net.dir.path().join("lightning.sqlite")).unwrap();
+    db.execute(
+        "UPDATE receipts SET state = 'open', lock = NULL WHERE hash = ?1",
+        [hash],
+    )
+    .unwrap();
+    net.gateway.round().await;
+    let status = net.gateway.receive_status(&hash).unwrap();
+    assert_eq!((status.state, status.lock), (ReceiveState::Locked, locked));
+    bob.follow_invoice(&invoice.hash).await.unwrap();
+    net.gateway.round().await;
+    let lock = alice.follow_lock(&lock.id).await.unwrap();
+    assert!(matches!(lock.state, LockState::Paid(_)));
+    assert_eq!(available(&bob), 10);
+    assert!(net.node.sent().is_empty());
+}
+
+#[tokio::test]
+async fn a_forward_inside_the_hub_short_of_its_receipt_backs_nothing() {
+    let net = Net::new().await;
+    let alice = net.funded("alice", 40).await;
+    let bob = net.wallet("bob");
+    let invoice = bob.invoice(HUB, 10).await.unwrap();
+    let (request, hash) = (invoice.request.clone().unwrap(), bytes(&invoice.hash));
+    // A lock of 1 to the hub, recorded paying the receipt inside the hub,
+    // as a refusal's first write once was.
+    let address = net.info().await.address;
+    let lock = alice.lock(HUB, &address, 1, hash, None).await.unwrap();
+    let id = proposal_id(&lock.id);
+    net.hub
+        .forward(&id, &hash, &request, licash_hub::LOCAL, 0)
+        .unwrap();
+    net.gateway.round().await;
+    let status = net.gateway.receive_status(&hash).unwrap();
+    assert_eq!((status.state, status.lock), (ReceiveState::Open, None));
+    assert!(net.hub.own_lock_of(&hash).unwrap().is_none());
+    assert_eq!(net.node.held(hash).unwrap().0, HeldState::Open);
+    let given_up = net.hub.forward_of(&id).unwrap().unwrap().state;
+    assert!(matches!(given_up, licash_hub::Forwarded::Failed(_)));
+    // The receipt still open, a lock paying its invoice in full backs it.
+    let paying = alice.pay_invoice(HUB, &request).await.unwrap();
+    assert_eq!((paying.state, paying.failure), (LockState::Locked, None));
+    let paid = net.hub.forward_of(&proposal_id(&paying.id)).unwrap();
+    assert_eq!(paid.unwrap().node, licash_hub::LOCAL);
+    let status = net.gateway.receive_status(&hash).unwrap();
+    assert_eq!(status.state, ReceiveState::Locked);
+}
+
+#[tokio::test]
+async fn a_preimage_activated_after_the_receipts_lock_expired_pays_the_payer() {
+    let net = Net::new().await;
+    let alice = net.funded("alice", 40).await;
+    let bob = net.wallet("bob");
+    let invoice = bob.invoice(HUB, 10).await.unwrap();
+    let hash = bytes(&invoice.hash);
+    let lock = alice
+        .pay_invoice(HUB, invoice.request.as_deref().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        net.gateway.receive_status(&hash).unwrap().state,
+        ReceiveState::Locked
+    );
+    // Activated at the receipt's lock's expiry: too late for it.
+    net.mine(6, None);
+    let preimage = preimage_of(&net, "bob", &invoice.hash);
+    net.mine(1, Some(preimage));
+    net.gateway.round().await;
+    net.gateway.round().await;
+    assert_eq!(
+        net.gateway.receive_status(&hash).unwrap().state,
+        ReceiveState::Canceled
+    );
+    let id = proposal_id(&lock.id);
+    let resolved = net.hub.forward_of(&id).unwrap().unwrap().state;
+    assert_eq!(resolved, licash_hub::Forwarded::Paid(preimage));
+    let lock = alice.follow_lock(&lock.id).await.unwrap();
+    assert_eq!(lock.state, LockState::Paid(preimage));
+}
+
+#[tokio::test]
+async fn a_receipt_whose_payer_lock_is_settled_before_it_is_backed_is_canceled() {
+    let net = Net::new().await;
+    let alice = net.funded("alice", 40).await;
+    let bob = net.wallet("bob");
+    let invoice = bob.invoice(HUB, 10).await.unwrap();
+    let (request, hash) = (invoice.request.clone().unwrap(), bytes(&invoice.hash));
+    net.node.down(true);
+    let lock = alice.pay_invoice(HUB, &request).await.unwrap();
+    let id = proposal_id(&lock.id);
+    net.hub
+        .forward(&id, &hash, &request, licash_hub::LOCAL, 11)
+        .unwrap();
+    // The payee settles the payer's lock itself, before its own is made.
+    let preimage = preimage_of(&net, "bob", &invoice.hash);
+    net.hub.settle(&id, &preimage).unwrap();
+    net.mine(lock.expiry - net.height() - 9, None);
+    net.node.down(false);
+    net.gateway.round().await;
+    assert_eq!(
+        net.gateway.receive_status(&hash).unwrap().state,
+        ReceiveState::Canceled
+    );
+    assert_eq!(net.node.held(hash).unwrap().0, HeldState::Canceled);
+    assert!(net.hub.own_lock_of(&hash).unwrap().is_none());
+    let paid = net.hub.forward_of(&id).unwrap().unwrap().state;
+    assert_eq!(paid, licash_hub::Forwarded::Paid(preimage));
+}
+
+#[tokio::test]
+async fn a_receipt_the_node_cannot_cancel_is_left_to_lightning_once_too_late() {
+    let net = Net::new().await;
+    let alice = net.funded("alice", 40).await;
+    let bob = net.wallet("bob");
+    let invoice = bob.invoice(HUB, 10).await.unwrap();
+    let (request, hash) = (invoice.request.clone().unwrap(), bytes(&invoice.hash));
+    // The node is down: the lock waits for its payment.
+    net.node.down(true);
+    let lock = alice.pay_invoice(HUB, &request).await.unwrap();
+    assert_eq!(
+        (lock.state.clone(), lock.failure.clone()),
+        (LockState::Locked, None)
+    );
+    // As if the gateway recorded the payment inside the hub, then stopped
+    // before canceling the invoice.
+    let id = proposal_id(&lock.id);
+    net.hub
+        .forward(&id, &hash, &request, licash_hub::LOCAL, 11)
+        .unwrap();
+    net.gateway.round().await;
+    assert_eq!(
+        net.gateway.receive_status(&hash).unwrap().state,
+        ReceiveState::Open
+    );
+    // Too late for the receipt's lock to end before the payer's: given up.
+    net.mine(lock.expiry - net.height() - 9, None);
+    net.gateway.round().await;
+    let lock = alice.follow_lock(&lock.id).await.unwrap();
+    assert_eq!(lock.state, LockState::Refunded);
+    assert_eq!(available(&alice), 40);
+    // The invoice is still open, and paid over Lightning.
+    net.node.down(false);
+    assert_eq!(net.node.held(hash).unwrap().0, HeldState::Open);
+    net.pay_held(&invoice.hash);
+    net.gateway.round().await;
+    let received = bob.follow_invoice(&invoice.hash).await.unwrap();
+    assert_eq!(received.state, InvoiceState::Received);
+    net.gateway.round().await;
+    assert_eq!(net.node.held(hash).unwrap().0, HeldState::Settled);
 }
 
 #[tokio::test]

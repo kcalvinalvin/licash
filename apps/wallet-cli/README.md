@@ -105,6 +105,8 @@ runs `lock <address> <amount> <hash>`, and the payee runs `claim <id>
 Through a hub with a Lightning gateway, `pay-invoice <bolt11>` pays an
 invoice with a lock refunded if the payment fails, and `invoice <amount>`
 prints an invoice paying the wallet; `resume` takes the payment once made.
+An invoice another wallet asked the same hub for is paid inside the hub,
+for its amount alone, with no gateway fee.
 `pay-invoice <bolt11> --via <provider>` has a swap provider that pays
 Lightning invoices pay it from its own node instead, for a lock of notes
 at `--hub` to the provider, its fee on top (at most `--max-fee`, 1% and 100

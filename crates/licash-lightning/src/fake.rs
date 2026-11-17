@@ -121,10 +121,20 @@ impl Fake {
     /// Another node pays the held invoice under `hash`, its HTLCs expiring
     /// at `expiry`.
     pub fn pay_held(&self, hash: [u8; 32], expiry: u32) {
+        assert!(self.try_pay_held(hash, expiry), "an open invoice");
+    }
+
+    /// Another node tries to pay the held invoice under `hash`, its HTLCs
+    /// expiring at `expiry`: whether the node accepted them, which it does
+    /// for an open invoice only, failing them back otherwise.
+    pub fn try_pay_held(&self, hash: [u8; 32], expiry: u32) -> bool {
         let mut state = self.state();
         let (held, _) = state.held.get_mut(&hash).expect("a held invoice");
-        assert_eq!(held.state, HeldState::Open, "an open invoice");
+        if held.state != HeldState::Open {
+            return false;
+        }
         (held.state, held.min_expiry) = (HeldState::Accepted, Some(expiry));
+        true
     }
 
     /// The held invoice under `hash`: its state and amount.

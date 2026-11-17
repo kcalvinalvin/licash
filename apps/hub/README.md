@@ -85,7 +85,10 @@ installation; no records are discarded or migrated.
 
 With `--lnd URL --lnd-macaroon FILE` (and `--chain`), the hub also runs a
 Lightning gateway over LND: it pays invoices for locks that pay the hub,
-and makes hold invoices paid with locks of its notes. `--lnd-cert` pins
+and makes hold invoices paid with locks of its notes. An invoice of its
+own node, a receipt still open, is paid inside the hub for its amount
+alone: the payer's lock backs the receipt instead of an HTLC, and its
+invoice is canceled. `--lnd-cert` pins
 LND's certificate. The gateway keeps its invoices in
 `<data>/lightning.sqlite`: back it up with `hub.sqlite`. An alert says when
 LND's channels can no longer pay or receive the most it takes.

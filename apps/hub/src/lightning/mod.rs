@@ -13,6 +13,14 @@
 //! preimage the wallet reveals to claim them settles the invoice; a lock
 //! refunded unclaimed cancels it. Receipts are recorded in the gateway's
 //! own SQLite file before their invoice exists.
+//!
+//! Between the two: an invoice of a receipt, paid for a lock at the same
+//! hub, is paid inside it. The payer's lock backs the receipt's own lock
+//! instead of an HTLC: its forward is recorded ([`licash_hub::LOCAL`]),
+//! the invoice canceled so that no HTLC backs it too, then the own lock
+//! made. The preimage that claims the own lock pays the payer's; its
+//! refund refunds the payer's. One backing per receipt, ever: an invoice
+//! whose HTLC arrived first is refused for a lock.
 
 mod pay;
 mod receive;
@@ -150,6 +158,10 @@ pub struct Gateway {
     /// Held while acting on payments out, one at a time: how often in a
     /// row the node did not know each.
     paying: tokio::sync::Mutex<HashMap<[u8; 32], u32>>,
+    /// Held while deciding what backs a receipt, an HTLC or a lock paying
+    /// it inside the hub, and while acting on a receipt: taken after
+    /// `paying` when both are.
+    receiving: tokio::sync::Mutex<()>,
     /// The node's public key, once it answered.
     identity: Mutex<Option<String>>,
     /// What the operator was alerted of, once each.
@@ -182,6 +194,7 @@ impl Gateway {
             node,
             config,
             paying: tokio::sync::Mutex::default(),
+            receiving: tokio::sync::Mutex::default(),
             identity: Mutex::default(),
             alerted: Mutex::default(),
             peer: Peer::default(),

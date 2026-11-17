@@ -4,7 +4,10 @@
 //! alone, under the invoice's hash, recording the invoice with the lock.
 //! Once the lock is certified the wallet asks the hub to pay the invoice:
 //! the preimage the payment buys settles the lock, and a failed payment
-//! refunds it. Following the lock asks again until one or the other.
+//! refunds it. Following the lock asks again until one or the other. An
+//! invoice of the gateway's own node, a receipt at the same hub, is paid
+//! inside the hub, for its amount alone: the lock backs the receipt, and
+//! the preimage its payee reveals to claim it settles the lock.
 //!
 //! Paying through a swap provider instead ([`Wallet::pay_invoice_via`]):
 //! the wallet locks the invoice's amount and the provider's fee to the
@@ -193,9 +196,7 @@ impl<T: Transport> Wallet<T> {
         let invoice = decode(request)?;
         let msat = self.payable(&invoice)?;
         let (hub, info) = self.hub(&url)?;
-        let lightning = gateway(&url, &info, msat)?;
-        lock_expiry(&url, &info, lightning, &invoice)?;
-        let lock = lightning.pay_lock(msat);
+        let (lock, _) = gateway_lock(&url, &info, &invoice, msat)?;
         let exact = match self.exact(hub, lock)? {
             Some(_) => 0,
             None => self.send_fee(&url, lock)?,
@@ -204,15 +205,22 @@ impl<T: Transport> Wallet<T> {
     }
 }
 
-/// The expiry of a lock paying `invoice` through the hub at `url` saying
-/// `info`, the latest it admits: if that leaves its gateway room for the
-/// invoice's final delta.
-fn lock_expiry(
+/// The amount and expiry of a lock paying `invoice`, of `msat`, through
+/// the hub at `url` saying `info`. An invoice of its gateway's own node,
+/// a receipt there, is paid inside the hub: for its amount alone. Any
+/// other, over Lightning: for its amount and the gateway's fee, if the
+/// latest expiry the hub admits leaves its gateway room for the invoice's
+/// final delta.
+fn gateway_lock(
     url: &str,
     info: &licash_api::Info,
-    lightning: &Lightning,
     invoice: &Bolt11Invoice,
-) -> Result<u32, Error> {
+    msat: u64,
+) -> Result<(u64, u32), Error> {
+    let lightning = info
+        .lightning
+        .as_ref()
+        .ok_or_else(|| Error::Invalid(format!("hub {url} pays no Lightning invoices")))?;
     let locks = info
         .locks
         .as_ref()
@@ -220,6 +228,15 @@ fn lock_expiry(
     let expiry = locks
         .latest_expiry(locks.min_depth.max(1))
         .map_err(|p| unavailable(url, p))?;
+    if pays_inside(lightning, invoice) {
+        return Ok((msat.div_ceil(1000), expiry));
+    }
+    if msat > lightning.max_pay.saturating_mul(1000) {
+        return Err(Error::Invalid(format!(
+            "hub {url} pays invoices of at most {} sat",
+            lightning.max_pay
+        )));
+    }
     let room = expiry
         .saturating_sub(locks.height)
         .saturating_sub(lightning.pay_slack);
@@ -229,23 +246,13 @@ fn lock_expiry(
             "the invoice's final delta of {delta} blocks outlasts the locks of hub {url}"
         )));
     }
-    Ok(expiry)
+    Ok((lightning.pay_lock(msat), expiry))
 }
 
-/// The Lightning gateway of the hub at `url` saying `info`, if it pays
-/// an invoice of `msat`.
-fn gateway<'a>(url: &str, info: &'a licash_api::Info, msat: u64) -> Result<&'a Lightning, Error> {
-    let lightning = info
-        .lightning
-        .as_ref()
-        .ok_or_else(|| Error::Invalid(format!("hub {url} pays no Lightning invoices")))?;
-    if msat > lightning.max_pay.saturating_mul(1000) {
-        return Err(Error::Invalid(format!(
-            "hub {url} pays invoices of at most {} sat",
-            lightning.max_pay
-        )));
-    }
-    Ok(lightning)
+/// Whether `invoice` is of the node of the gateway `lightning`: a receipt
+/// at its hub, which the hub pays inside it.
+fn pays_inside(lightning: &Lightning, invoice: &Bolt11Invoice) -> bool {
+    hex::encode(invoice.get_payee_pub_key().serialize()) == lightning.node
 }
 
 fn hash_id(hash: &str) -> Result<[u8; 32], Error> {
@@ -275,9 +282,7 @@ impl<T: Transport> Wallet<T> {
             )));
         }
         let (hub, info) = self.refresh(&url).await?;
-        let lightning = gateway(&url, &info, msat)?;
-        let expiry = lock_expiry(&url, &info, lightning, &invoice)?;
-        let amount = lightning.pay_lock(msat);
+        let (amount, expiry) = gateway_lock(&url, &info, &invoice, msat)?;
         let request = invoice.to_string();
         tracing::info!(%url, msat, amount, "paying an invoice");
         self.lock_paying(

@@ -9,6 +9,11 @@
 //! preimage settles one lock only. A failed forward refunds its lock at
 //! once, as the hub gives up a claim it never paid for: an activation of
 //! the hash after that owes no one.
+//!
+//! A forward by [`LOCAL`] is paid inside the hub: the payee is a receipt
+//! of the hub's own gateway, which backs its own lock under the hash with
+//! the forward's lock rather than an HTLC. No node pays it: the preimage
+//! the payee reveals to claim the own lock pays it.
 
 use licash::spend::{lock_hash, ProposalId};
 use rusqlite::{params, Connection, OptionalExtension, Row};
@@ -17,6 +22,10 @@ use crate::{
     locks::{settled_of, tip},
     notify, now, sql, Error, Hub, Notice, Refusal,
 };
+
+/// The node of a forward paid inside the hub, to a receipt of its own
+/// gateway: no Lightning node's key.
+pub const LOCAL: &str = "local";
 
 /// A payment the hub makes outside its ledger for a lock.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -178,6 +187,18 @@ impl Hub {
     /// The forward for lock `id`, if any.
     pub fn forward_of(&self, id: &ProposalId) -> Result<Option<Forward>, Error> {
         self.store.read(|c| forward_of(c, id))
+    }
+
+    /// The forward of `hash` pending or paid, if any: one at most.
+    pub fn live_forward(&self, hash: &[u8; 32]) -> Result<Option<Forward>, Error> {
+        self.store.read(|c| {
+            Ok(c.query_row(
+                &format!("{FORWARDS} WHERE hash = ?1 AND state IN ('pending', 'paid')"),
+                [hash],
+                forward,
+            )
+            .optional()?)
+        })
     }
 
     /// The forwards pending, oldest first.
