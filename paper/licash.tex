@@ -1,11 +1,8 @@
 \documentclass[11pt]{article}
 \usepackage[margin=1.1in]{geometry}
 \usepackage{amsmath,amssymb}
-\usepackage{booktabs}
-\usepackage{array}
-\usepackage{tabularx}
 \usepackage[protrusion=true,expansion=false]{microtype}
-\usepackage[table]{xcolor}
+\usepackage{xcolor}
 \usepackage{enumitem}
 \usepackage{tikz}
 \usepackage{float}
@@ -20,7 +17,7 @@
 \renewcommand\@seccntformat[1]{\csname the#1\endcsname.\hspace{0.7em}}
 \makeatother
 
-\newcommand{\paperversion}{0.5}
+\newcommand{\paperversion}{0.6}
 
 \newcommand{\vmax}{V_{\max}}
 \newcommand{\wH}{w_H}
@@ -28,15 +25,12 @@
 \newcommand{\Ht}[1]{H_{\mathsf{#1}}}
 \newcommand{\htc}{\mathsf{h2c}}
 \newcommand{\id}{\mathsf{id}}
-\newcommand{\bcorr}{b_{\mathrm{corr}}}
+\newcommand{\bresp}{b'}
 \newcommand{\DLEQ}{\mathsf{DLEQ}}
-\newcommand{\Sign}{\mathsf{Sign}}
 \newcommand{\Kiss}{K_{\mathrm{iss}}}
 \newcommand{\kiss}{k_{\mathrm{iss}}}
 \newcommand{\G}{\mathcal{G}}
-\newcommand{\prop}[1]{\paragraph{Property #1.}}
-\newcolumntype{L}{>{\raggedright\arraybackslash}X}
-\renewcommand{\arraystretch}{1.3}
+\newcommand{\prop}[2]{\paragraph{Property #1 (#2).}}
 
 \definecolor{coop}{RGB}{232,245,233}
 \definecolor{hubc}{RGB}{255,243,214}
@@ -49,64 +43,61 @@
 \maketitle
 
 \begin{abstract}
-Licash is ecash in which every holder has an individual, collateralized right to recover their notes on Bitcoin from the issuer, the \emph{hub}. Payments are offchain reissuances between owner keys. They are immediate, use no blockspace and leave no public trace, and the hub cannot link the spending of a note to its issuance. A holder recovers by claiming their own notes on Bitcoin. The hub can reduce a claim only by exhibiting a spend that the holder authorized, and a claim made from a stale backup is paid exactly its unspent part. Payments are atomic without trust: the payee's notes are issued in advance under a one-time pad, and the hub must publish the pad's key on Bitcoin to retire the payer's inputs. Either the payer recovers her inputs, or the payee is paid and the payer receives her change. The same rule, publish the secret or pay the refund, yields hash-locked payments that connect a hub to onchain Bitcoin, to Lightning and to other hubs. We specify the protocol, argue its security and privacy properties, and report an implementation in which every outcome, including swaps, Lightning payments and routes across three hubs, is carried out with Bitcoin transactions.
+Licash is ecash in which every holder has an individual, collateralized right to recover their notes on Bitcoin from the issuer, the \emph{hub}. Payments are offchain reissuances between one-time keys: they are immediate, use no blockspace and leave no public trace, and the hub cannot link the spending of a note to its issuance. A holder recovers by publishing a claim to her own notes. The burden of proof is on the hub: the claim is paid in full unless the hub proves on Bitcoin, with a spend the holder authorized, that she is owed less. A wallet therefore never produces a proof, never reads shared state and never needs to be online to be paid, and a claim from a stale backup is paid exactly its unspent part. Payments are atomic without trust, because the hub can use a payer's signature against her only by publishing the key that releases the payee's notes. The same rule, publish the secret or pay the refund, connects a hub to onchain Bitcoin, to Lightning and to other hubs.
 \end{abstract}
 
 \section{Introduction}
 
 Licash comes from lichen ecash and is pronounced ``lee cash.''
 
-Bitcoin payments are public and compete for blockspace. Receiving to fresh addresses does not help once the coins are spent together, because consolidation links its inputs. Our goal is to move routine payments and the merging of value offchain, so that they are private, cheap and fast, while every user keeps the ability to recover their money on Bitcoin without anyone's cooperation.
+Bitcoin payments are public and compete for blockspace. Receiving to fresh addresses does not help once the coins are spent together, because consolidation links its inputs. Our goal is to move routine payments and the merging of value offchain, so that they are private, cheap and fast, while every user keeps the ability to recover their money on Bitcoin without anyone's cooperation, from a phone.
 
-Ecash~\cite{chaum,cashu,fedimint} is private and cheap, but custodial: users trust the mint with their money. Designs with unilateral exit usually judge an exit against shared state, such as a state root, a transaction tree~\cite{ark}, or nullifiers reconstructed from Bitcoin~\cite{shieldedcsv,shieldedbitcoin}. That history must be ordered and available to everyone. Lichen~\cite{lichen} instead gives each user a bilateral Bitcoin contract with an operator, and in its BABE variant~\cite{babe} a dispute verifies a Groth16 proof through the contract's transaction graph.
+Ecash~\cite{chaum,cashu,fedimint} is private and cheap, but custodial: users trust the mint with their money. Designs with unilateral exit usually judge an exit against shared state, such as a transaction tree~\cite{ark} or nullifiers reconstructed from Bitcoin~\cite{shieldedcsv,shieldedbitcoin}, which must be ordered and available to everyone. Lichen~\cite{lichen} instead gives each user a bilateral Bitcoin contract with an operator, in which a dispute verifies a Groth16 proof through the contract's transaction graph with BABE~\cite{babe}.
 
-Licash uses such contracts to back \emph{owner-bound ecash}. A payment reissues value to keys that only the recipient controls, without naming any contract. A holder recovers through the contract registered under their own spending identity, never through another user's. Instead of proving absence from a global spent set, the holder proves that their notes were issued and are theirs, and the hub must exhibit an authorized spend to reduce the claim. Recovery is therefore local: its witness concerns only the holder's notes.
+Licash uses such contracts to back \emph{owner-bound ecash}. A payment reissues value to one-time keys that only the recipient controls, without naming any account or contract. To recover, the holder lists her own notes on Bitcoin and signs for each with its key. She does not prove that the notes are unspent. The hub, which keeps the record of spends, must prove that a listed note was spent, and the only proof it can give is a spend that the holder signed. Recovery is therefore \emph{local}: it concerns only the holder's notes and her contract.
 
-Paying for something offchain is a fair exchange, which is impossible without a trusted third party~\cite{fairexchange}. As in~\cite{andrychowicz,bentov}, that party is Bitcoin, and it is used only in a dispute. The recovery rule turns the usual swap intuition around. The hub must release a secret to \emph{prevent} the payer from recovering her inputs, and that secret is what pays the payee and returns the payer's change.
+This puts the burden of proof on the party that has the data, the resources and the reason to reduce a claim, and an honest claim is paid without anyone proving anything. A wallet never proves, downloads no shared history, manages no channels or liquidity, and need not be online to be paid.
 
-A payment system is only useful if value can enter and leave it. A single mechanism, a note spend locked under a hash with an expiry, connects a hub to onchain Bitcoin, to the Lightning network and to other hubs, with the same guarantee: each party either learns the secret from Bitcoin or is refunded.
+Paying offchain is a fair exchange, impossible without a trusted third party~\cite{fairexchange}. As in~\cite{andrychowicz,bentov}, that party is Bitcoin, used only in a dispute. The hub must release a secret to \emph{prevent} the payer from recovering her inputs, and that secret pays the payee and returns the payer's change. A note spend locked under a hash carries the same rule, publish the secret or pay the refund, to onchain Bitcoin, to Lightning and to other hubs.
 
-\textbf{Contributions.}
+\paragraph{Related designs.} Users of ecash mints and federations trust them to hold and redeem the backing bitcoin, without a unilateral exit. A self-custodial Lightning user maintains channels with inbound capacity, is online to receive, and monitors the chain for revoked states, herself or through a watchtower. Ark users receive without managing liquidity, but must renew their outputs of a shared transaction tree before they expire, or exit by broadcasting their path of the tree. In Shielded CSV~\cite{shieldedcsv}, a recipient verifies a proof of each coin she receives and scans Bitcoin for published nullifiers. A Licash user does none of these. Within her contracts she has the recovery right of a channel without its liquidity or watching, and beyond them the trust model of a mint. Between payments she holds notes, and to exit she publishes a claim that the hub must disprove.
+
+\paragraph{Contributions.}
 \begin{itemize}[leftmargin=1.5em, itemsep=0pt]
-\item \emph{Owner-bound notes with local recovery.} A claim lists the holder's own notes, the hub answers with a proof of which of them were spent, and the contract pays the rest (Sections~\ref{sec:model} and~\ref{sec:rec}).
-\item \emph{Grants.} The payee's notes are sealed under a hash pad whose key must be published to counter the payer, which makes an offchain payment atomic. Their security reduces to that of ordinary blind issuance (Section~\ref{sec:pay}).
-\item \emph{Timed locks.} Hash-locked payments with forced publication of the preimage and onchain activation give swaps, Lightning payments in both directions and routes across hubs, with one deadline rule (Section~\ref{sec:interop}).
-\item \emph{Unlinking.} A blinded proof of correct issuance removes the link between a note's issuance and its spending, with perfect blindness (Section~\ref{sec:model}).
-\item \emph{Security, privacy and implementation.} We state and argue the properties of the protocol (Sections~\ref{sec:security} and~\ref{sec:privacy}) and evaluate a complete implementation on Bitcoin transactions (Section~\ref{sec:impl}).
+\item \emph{Recovery that the hub must disprove.} A claim lists the holder's notes, designated by one-time keys and bound to no identity, and is paid unless the hub proves that some were spent, which leaves the holder's part light enough for a phone (Sections~\ref{sec:rec} and~\ref{sec:light}).
+\item \emph{Grants.} The payee's notes are sealed under a pad whose key the hub must publish to use the payer's signature against her, which makes an offchain payment atomic (Section~\ref{sec:pay}).
+\item \emph{Timed locks.} Hash-locked payments with forced publication of the preimage give swaps, Lightning payments and routes across hubs (Section~\ref{sec:interop}).
+\item \emph{Unlinking.} A perfectly blinded proof of correct issuance unlinks a note's spending from its issuance (Section~\ref{sec:model}).
 \end{itemize}
 
 \section{Model}
 \label{sec:model}
 
-\paragraph{Parties and assumptions.} The hub issues notes and funds the collateral of every contract. It may refuse service, withhold answers, issue notes it should not, collude with users or disappear. Users may double spend, claim notes they have spent and collude with each other. We assume that the discrete logarithm problem is hard in secp256k1, and that so is the one-more gap Diffie-Hellman problem~\cite{jkk,privacypass}, also against an adversary who runs the interactive Chaum-Pedersen protocol with the hub, with challenges of its choice, on points whose evaluation it has already received, that tagged hashes (including hash-to-curve) are random oracles, that BIP340 signatures are unforgeable~\cite{bip340}, that the zkVM and its Groth16 wrapper are knowledge sound~\cite{risc0,groth16}, and that BABE is sound~\cite{babe,lichenbuilt}. No party can produce in private, within the lifetime of a contract, as many valid Bitcoin blocks as the confirmation depth that the contract requires. A party that must act on Bitcoin by a deadline can get a transaction confirmed within a known number of blocks, and each party keeps its own records.
+\paragraph{Parties.} The hub issues notes and funds the collateral of every contract. It may refuse service, withhold answers, issue notes it should not, collude with users or disappear. Users may double spend, claim notes they have spent and collude with each other. The cryptographic assumptions are listed in Section~\ref{sec:security}. No party can produce in private, within the lifetime of a contract, as many valid Bitcoin blocks as the confirmation depth that the contract requires. A party that must act on Bitcoin by a deadline can get a transaction confirmed within a known number of blocks, and each party keeps its own records.
 
-\paragraph{Notation.} $G$ is the secp256k1 generator; lowercase scalars multiply uppercase points. A denomination $d$, a power of two in satoshis, selects the hub's secret key $k_d$ with public key $K_d=k_dG$. $\DLEQ(G,K;B,C)$ is a Chaum-Pedersen proof~\cite{chaumpedersen} that $K=kG$ and $C=kB$ for the same $k$. $H_{\mathsf{tag}}$ are tagged hashes, and $\htc$ hashes a message to a curve point with the secp256k1 suite of RFC~9380~\cite{rfc9380}. A separate issuer key $\Kiss=\kiss G$ signs grants and certificates.
+\paragraph{Notation.} $G$ is the secp256k1 generator; lowercase scalars multiply uppercase points. A denomination $d$, a power of two in satoshis, selects the hub's secret key $k_d$ with public key $K_d=k_dG$. $\DLEQ(G,K;B,C)$ is a Chaum-Pedersen proof~\cite{chaumpedersen} that $K=kG$ and $C=kB$ for the same $k$. $H_{\mathsf{tag}}$ are tagged hashes, and $\htc$ hashes to the curve~\cite{rfc9380}. An issuer key $\Kiss=\kiss G$ signs grants and certificates.
 
-\paragraph{Notes.} As in Cashu~\cite{cashu}, a note is a message $x$ with a point $C=k_dY$, where $Y=\htc(x)$ is the note's \emph{identifier}. To issue it, the holder sends $B=Y+rG$ for a random $r$, the hub returns $C'=k_dB$ with $\DLEQ(G,K_d;B,C')$, and the holder computes $C=C'-rK_d$. A note is \emph{settled} once its holder has a proof that $C=k_dY$. The hub keeps a private log of the identifiers it has seen spent.
+\paragraph{Notes.} As in Cashu~\cite{cashu}, a note is a message $x$ with a point $C=k_dY$, where $Y=\htc(x)$ is the note's \emph{identifier}. To issue it, the holder sends $B=Y+rG$ for a random $r$, the hub returns $C'=k_dB$ with $\DLEQ(G,K_d;B,C')$, and the holder computes $C=C'-rK_d$. A note is \emph{settled} once its holder has a proof, its \emph{evidence}, that $C=k_dY$. The hub keeps a private log of the identifiers it has seen spent.
 
-\paragraph{Owner keys.} A user has independent spend, scan and hold keys $b_s,b_v,b_h$. The public key $B_s$ is their \emph{spending root} and $(B_s,B_v,B_h)$ is their address. A payer picks an ephemeral key $A=aG$ and derives output $j$ as in silent payments~\cite{bip352}:
+\paragraph{Owner keys.} A user has independent spend, scan and hold keys $b_s,b_v,b_h$, and $(B_s,B_v,B_h)$ is their address. A payer picks an ephemeral key $A=aG$ and derives output $j$ as in silent payments~\cite{bip352}:
 \begin{gather*}
 \varsigma = \Ht{ecdh}(\mathsf{xcoord}(aB_v)),\qquad s_j = \Ht{seed}(\varsigma, j),\\
 P_j = B_s + \Ht{tweak}(B_s, s_j)\,G,\qquad Q_j = B_h + \Ht{hold}(B_h,B_s,s_j)\,G,\\
 x_j = (d_j, P_j, \nu_j, Q_j),\qquad B_j = \htc(x_j) + r_jG,
 \end{gather*}
-with the nonce $\nu_j$ and blinding $r_j$ also derived from $\varsigma$. The recipient recomputes both keys from $A$ before accepting an output. Only the recipient can sign for the \emph{owner key} $P_j$, which authorizes spending the note, and for the \emph{hold key} $Q_j$, which authorizes claiming it on Bitcoin. Change is derived the same way and is not marked as change. A spent note reveals $P_j$ but not $s_j$, so it does not reveal the spending root.
+with the nonce $\nu_j$ and blinding $r_j$ also derived from $\varsigma$. The recipient recomputes both keys from $A$ before accepting an output. Only she can sign for the \emph{owner key} $P_j$, which authorizes spending the note, and for the \emph{hold key} $Q_j$, which authorizes claiming it on Bitcoin. Change is derived the same way and is not marked as change. Neither key reveals the address or any other note of its owner.
 
 \paragraph{Unlinking.} The proof received at issuance contains $B$, so it would link a later spend to that issuance. The holder replaces it with a proof on $(Y,C)$ directly by blinding the Chaum-Pedersen protocol the way one blinds a Schnorr signature. The hub picks a nonce $w$ and sends $(R_1,R_2)=(wG,wB)$. The holder picks blinding scalars $\alpha,\beta$ and sends the blinded challenge $e$:
 \[
 R_1' = R_1 + \alpha G + \beta K_d,\quad R_2' = R_2 - rR_1 + \alpha Y + \beta C,\quad e' = \Ht{dleq}(R_1', R_2', K_d, C),\quad e = e' + \beta .
 \]
-The hub answers $s=w+ek_d$, once per nonce, and $(e',s+\alpha)$ is a valid proof of $\DLEQ(G,K_d;Y,C)$. Since $\alpha$ and $\beta$ are uniform, every completed session is equally likely to have produced any given unlinked proof: the blinding is perfect. A note carries either proof as its \emph{evidence}. If the hub refuses to unlink, the note keeps its value and its issuance-linked evidence.
+The hub answers $s=w+ek_d$, once per nonce, and $(e',s+\alpha)$ is a valid proof of $\DLEQ(G,K_d;Y,C)$. Since $\alpha$ and $\beta$ are uniform, every completed session is equally likely to have produced any given unlinked proof: the blinding is perfect. A note carries either proof as its evidence. If the hub refuses to unlink, the note keeps its value and its issuance-linked evidence.
 
-\paragraph{Contracts.} A user and the hub open a contract by funding a Bitcoin output with the hub's collateral: a cap $\vmax$, the most the contract can pay, plus reserves for fees. The output is spent by a presigned transaction graph that uses BABE with signed payout amounts~\cite{lichen,lichenbuilt,delving}. The contract's terms, its \emph{base}, fix the hub's note keys, the user's spending root $B_s$, the cap, both parties' keys, every deadline, a Bitcoin checkpoint and the two proof programs of Section~\ref{sec:rec}. A digest $D$ binds the base to the prepared graph. Both parties verify $D$ before the funding transaction is signed, the user by signing it with $b_s$, which registers $B_s$ with the hub.
+\paragraph{Contracts.} A user and the hub open a contract by funding a Bitcoin output with the hub's collateral, a cap $\vmax$ on what the contract can pay, and a fee reserve from each party. The output is spent by a presigned transaction graph that verifies a Groth16 proof of the hub with BABE~\cite{babe,lichen} and pays amounts signed with one-time signatures~\cite{delving}. The contract's terms, its \emph{base}, fix the hub's note keys, the cap, both parties' contract keys, every deadline, a Bitcoin checkpoint and the program of the hub's statement (Section~\ref{sec:rec}). A digest $D$ binds the base to the graph, and both parties check it before the funding transaction is signed.
 
-A contract is a recovery right, not an account. Notes are issued and spent without reference to any contract, and a settled note can be claimed in any one contract of its owner's spending root. A contract supports one recovery, of at most 32 items and at most $\vmax$. A holder's notes are \emph{protected} while they fit in their open contracts; value beyond that is held on trust until it is spent or a further contract covers it. Receiving a payment requires neither the recipient's presence nor unused capacity.
+A contract is a recovery right, not an account. It names no address and no notes, and notes are issued and spent without reference to any contract. Whoever can sign with a note's hold key can claim it, in any one contract with the note's hub. A holder's notes are \emph{protected} while they fit in her open contracts; value beyond that is held on trust until it is spent or a further contract covers it. A contract supports one recovery, of at most 32 items and at most $\vmax$. Receiving a payment requires neither a contract nor the recipient's presence.
 
-Between payments a holder does not watch the chain or refresh notes. Each contract has an expiry, and before its \emph{last safe action}, early enough to finish a dispute, the holder spends the notes, moves them under a newer contract or requests recovery. After expiry the collateral returns to the hub. The hub must be able to answer a request within its response window whenever one arrives.
-
-\paragraph{Reading Bitcoin.} The proofs of Section~\ref{sec:rec} establish facts about Bitcoin, such as the height at which a transaction confirmed. They do so from a chain of block headers that extends the base's checkpoint and satisfies proof of work, the difficulty adjustment and the timestamp rules, together with Merkle inclusion proofs. Such a chain shows that an event is buried at the required depth in \emph{some} valid chain, which by our assumption on private blocks is Bitcoin's. The required confirmation depth and a header budget reaching the assertion deadline are part of the base.
-
-\paragraph{Payout units and fees.} Denominations and payouts count satoshis. A payout omits the $L$ lowest bits of its amount to avoid dust, and the hub's reserve compensates: the base is accepted only if every transaction that pays the holder leaves her at least the omitted remainder and the fee ceilings beyond her own reserve. A holder who recovers $b$ therefore nets at least $b$ after fees, up to those ceilings.
+Each contract has an expiry, after which the collateral returns to the hub. Before its \emph{last safe action}, early enough to finish a dispute, the holder spends her notes, moves them under a newer contract or recovers.
 
 \section{Payments}
 \label{sec:pay}
@@ -120,8 +111,8 @@ If the hub issued the outputs only after recording the spend, it could record Al
 \[
 C'_j = k_{d_j}B_j,\qquad \pi_j=\DLEQ(G,K_{d_j};B_j,C'_j),\qquad c_j = (C'_j \,\|\, \pi_j) \oplus \Ht{pad}(\id(S), t, j, d_j).
 \]
-The pad is expanded to the 97 bytes of $C'_j \,\|\, \pi_j$ by hashing with a counter. The hub returns the grant $\G = \big(\id(S),\ \Ht{lock}(\id(S),t),\ (d_j,B_j,c_j)_j\big)$, with the unlinking nonce commitments of the outputs and its signature under $\kiss$.
-\item Alice checks that $\G$ lists her outputs and signs $\Ht{auth}(\id(S), \mathsf{com}(\G))$ with each input's owner key, where $\mathsf{com}(\G)$ is a hash of the whole grant, including the nonce commitments and the hub's signature. Her authorization is thereby valid for this grant only.
+It returns the grant $\G = \big(\id(S),\ \Ht{lock}(\id(S),t),\ (d_j,B_j,c_j)_j\big)$, with the unlinking nonces of the outputs and its signature under $\kiss$.
+\item Alice checks that $\G$ lists her outputs and signs $\Ht{auth}(\id(S), \mathsf{com}(\G))$ with each input's owner key, where $\mathsf{com}(\G)$ is a hash of the whole grant. Her authorization is valid for this grant only.
 \item The hub records the authorized spend and releases $t$.
 \item Alice sends $S$, $\G$ and $t$ to Bob. Anyone holding $\G$ and $t$ checks the lock hash, removes each pad, verifies $\pi_j$ under the ordinary key $K_{d_j}$ and unblinds $C_j=C'_j-r_jK_{d_j}$.
 \end{enumerate}
@@ -145,233 +136,160 @@ The pad is expanded to the 97 bytes of $C'_j \,\|\, \pi_j$ by hashing with a cou
 
 An opened note is an ordinary note with ordinary evidence, and its holder unlinks it like any other. Bob treats a payment as settled when he holds $t$ and his outputs open. Until then he has nothing, and the grant alone gives him nothing: without $t$ every $c_j$ is indistinguishable from random bytes.
 
-Alice cannot inspect the sealed notes before she signs, and she does not need to. The hub can use her signature against her only through a counter that publishes $t$ and proves that \emph{every} sealed note of the grant opens correctly (Section~\ref{sec:rec}). A grant whose notes do not open is thus a refusal of service: the hub can never cite the spend, and Alice recovers her inputs.
+Alice cannot inspect the sealed notes before she signs, and she does not need to. The hub can use her signature against her only by citing her spend in a recovery, and it can cite a granted spend only by publishing $t$ and proving that \emph{every} sealed note of the grant opens correctly (Section~\ref{sec:rec}). A grant whose notes do not open is thus a refusal of service: the hub can never cite the spend, and Alice recovers her inputs.
 
-Bob need not be online when Alice pays. She keeps the payment until he or his agent acknowledges it, and a mailbox or the hub can relay it. Once paid, Bob respends the notes to outputs that only he can derive and unlinks them, after which Alice no longer recognizes them.
+Bob need not be online when Alice pays: she keeps the payment until he acknowledges it, and a mailbox or the hub can relay it. Once paid, Bob respends the notes to outputs that only he can derive and unlinks them.
 
 A spend whose outputs all return to the spender, such as a consolidation or a change of denominations, needs no grant. The hub issues its outputs directly, and until it does the spender can claim them as fallbacks (Section~\ref{sec:rec}).
 
 \section{Recovery}
 \label{sec:rec}
 
-\paragraph{Request.} A holder starts a recovery with two transactions. The \emph{request} spends the contract output and carries her one-time signatures on an amount $b$ and a claim digest $E$. The \emph{claim body} publishes the claim that $E$ commits to, in an output of at most 64,000 bytes, and must confirm within a fixed number of blocks of the request so that the hub can read it inside its response window $\wH$. A contract accepts one request.
-
-\paragraph{Claims.} A claim lists at most 32 items of three kinds.
+\paragraph{The claim.} A holder starts a recovery with two transactions. The \emph{request} spends the contract output and carries her one-time signatures on an amount $b$ and a claim digest $E$. The \emph{publication}, which must confirm soon after, carries the claim that $E$ commits to. A claim lists at most 32 items of three kinds:
 \begin{itemize}[leftmargin=1.5em, itemsep=0pt]
-\item A \emph{settled note}, given by its message $x$.
-\item A \emph{fallback}: an output of a spend that the holder signed and the hub has not answered. The claim names the spend, and all of its inputs must be among the claim's settled notes. A fallback adds nothing to $b$. It stands in for those inputs if the hub turns out to have recorded the spend.
-\item An output of a \emph{timed lock} (Section~\ref{sec:interop}).
+\item a \emph{settled note};
+\item a \emph{fallback}: an output of a spend that the holder signed and the hub has not answered, all of whose inputs are claimed as settled notes. A fallback adds nothing to $b$. It stands in for those inputs if the hub turns out to have recorded the spend;
+\item an output of a \emph{timed lock} (Section~\ref{sec:interop}).
 \end{itemize}
-Each item carries a \emph{hold authorization}, a signature under its hold key $Q_j$ over the note's public fields, $D$, the deposit, $b$ and $E$. It binds that exact note to this contract and claim, even if another note shares its hold key. A payer who claims a timed lock on the authority of its inputs, rather than a hub certificate, authorizes its inputs in the same way and recovers that lock's outputs in one claim, never split across contracts. The amount satisfies $b \le \min(\vmax, \sum_{i\notin F} d_i)$, where $F$ is the set of fallbacks. On reading a claim the hub stops accepting spends of the claimed notes until the recovery ends.
+Each item carries a \emph{hold authorization}, a signature under its hold key $Q_j$ over the note's public fields, $D$, $b$ and $E$. That signature is the whole of the authority to recover the item. The claim names no address and contains no proof. It is published with a witness that lets anyone check it: the evidence of each settled note, the body of each spend or lock whose outputs it claims, and the Bitcoin inclusion of any lock activation that it relies on. The amount satisfies $b \le \min(\vmax, \sum_{i\notin F} d_i)$, where $F$ is the set of fallbacks. On reading a claim, the hub stops accepting spends of the claimed notes.
 
-\paragraph{The holder's proof.} The holder proves, in a zkVM program fixed by the base, that the request and the claim body confirmed on Bitcoin in time and carry her signatures on $b$ and $E$; that every settled note has valid evidence under the hub's keys; that every item's owner key derives from the base's spending root, which she shows by revealing the item's seed $s_j$ to the program; that every hold authorization verifies; and that every fallback opens an output of an authentic spend whose inputs are claimed. The proof is private: it shows nothing about her notes beyond what the claim body lists.
-
-\paragraph{Counters.} The hub can reduce a claim only with evidence of four kinds. Against notes and fallbacks the evidence is a signature of the claimant, and against the outputs of a lock it is the resolution of that lock:
+\paragraph{What a claim is owed.} A claim whose witness does not check is the holder's error and is owed nothing. Otherwise it is owed $b$, unless the hub has evidence of four kinds. Against notes and fallbacks the evidence is a signature of the claimant, and against the outputs of a lock it is the resolution of that lock:
 \begin{itemize}[leftmargin=1.5em, itemsep=0pt]
-\item $\mathsf{Spend}(S)$: an owner-authorized spend that consumes a claimed note;
-\item $\mathsf{Claim}(E')$: a hold authorization for a different claim, under the hold key of a claimed note or of an input of a claimed lock of the claimant's own notes, whose outputs it then voids;
+\item $\mathsf{Spend}(S)$: an owner-authorized spend that consumes a claimed note, or the inputs of a claimed lock other than $S$ itself;
+\item $\mathsf{Claim}(E')$: a hold authorization of a claimed note for a different claim, in this contract or any other;
 \item $\mathsf{Preimage}(z)$ and $\mathsf{Expired}$, for the outputs of timed locks (Section~\ref{sec:interop}).
 \end{itemize}
-Every piece of evidence must void an item or cite the spend of a fallback. The result is a mask $M$ of voided items and a corrected amount in which the fallbacks of every cited spend take the place of its voided inputs:
+Each piece of evidence must void an item or cite the spend of a fallback. With $M$ the set of voided items, the fallbacks of every cited spend take the place of its voided inputs, and the claim is owed
 \[
-\bcorr = \min\Big(b,\ \sum_{i \notin M,\ i \notin F} d_i \;+ \sum_{i \in F \setminus M,\ \text{source of } i \text{ cited}} d_i\Big).
+\bresp = \min\Big(b,\ \sum_{i \notin M,\ i \notin F} d_i \;+ \sum_{i \in F \setminus M,\ \text{source of } i \text{ cited}} d_i\Big).
 \]
-The hub proves $(M,\bcorr)$ in a second zkVM program, whose public output binds $D$, $E$, the mask, the amount and a digest of the secrets disclosed below. There is no penalty. A claim made from an old backup is not fraud, and it is paid exactly the value that is still unspent: a claim of 3072 of which 1024 was spent is paid 2048. A backup protects the notes that it contains. The change of a spend made after the backup can be claimed only as a fallback of that spend, which the backup does not know, so a wallet stores every spend durably before signing it and every note when it receives it.
+There is no penalty. A claim made from an old backup is not fraud, and it is paid exactly the value that is still unspent: a claim of 3072 of which 1024 was spent is paid 2048. The change of a spend made after the backup can be claimed only as a fallback of that spend, so a wallet stores every spend before signing it.
 
-\paragraph{Mandatory disclosure.} A counter must not let the hub retire a payer's inputs while keeping the payee's notes sealed. A $\mathsf{Spend}$ that cites a granted spend must therefore supply the unlock $t$, and the counter program checks that $t$ matches the grant's lock and that every sealed note of the grant opens to a valid proof. Since the owners signed $\mathsf{com}(\G)$, a granted spend cannot be cited as an ungranted one. The response transaction publishes up to 32 such secrets in signed chunks whose bytes Script authenticates, and the holder's proof recomputes their digest from the bytes actually posted. A counter whose secrets were not published is no counter.
+\paragraph{Mandatory disclosure.} The hub must not retire a payer's inputs while keeping the payee's notes sealed. Citing a granted spend therefore requires its unlock $t$, which must open every sealed note of the grant. Since the owners signed $\mathsf{com}(\G)$, a granted spend cannot be cited as an ungranted one. The hub must publish on Bitcoin every unlock and preimage that its evidence uses.
 
-\paragraph{Response and payout.} Within $\wH$ of the request the hub signs $E$ either \emph{plainly} or with a counter: the counter proof, $\bcorr$ and the disclosed secrets. The holder then has until the assertion deadline to post a proof for one of two statements: \emph{full}, that her claim holds and the response contains no valid counter, which pays $b$; or \emph{corrected}, that her claim holds and the counter is valid, which pays $\bcorr$. BABE lets the hub challenge an assertion. A valid proof answers any challenge and is paid; an invalid one forfeits the contract to the hub. The payout is made bit by bit under the signed amount~\cite{delving}: the holder collects the set bits and the hub the clear ones.
-\begin{center}
-\small
-\begin{tabularx}{0.95\linewidth}{LLl}
-\toprule
-the hub's response & the holder proves & the holder receives \\
-\midrule
-none within $\wH$ & nothing & $b$ \\
-plain & her claim & $b$ \\
-a counter that is invalid or lacks its secrets & her claim, and that the counter fails & $b$ \\
-a valid counter & her claim, and that the counter holds & $\bcorr$ \\
-any & nothing valid & nothing \\
-\bottomrule
-\end{tabularx}
-\end{center}
+\paragraph{The dispute.} The contract's graph is BABE with the roles of Lichen~\cite[App.~A]{lichen}: the hub proves and the holder verifies (Figure~\ref{fig:dispute}). Within its response window $\wH$ the hub may \emph{respond}: it signs an amount $\bresp<b$ with a one-time key and publishes the secrets that its evidence needs. It must then \emph{assert} a proof of its statement:
+\begin{quote}
+\emph{the claim published under this contract is owed at most $\bresp$, and the response published every secret that the evidence uses.}
+\end{quote}
+The statement's program, fixed by the base, reads the request, the publication and the response from Bitcoin headers that extend the base's checkpoint with the required work on top, which by the assumption on private blocks are Bitcoin's. It judges the claim on the chain up to the publication's block, so the hub cannot choose the chain it is judged on.
+
+The holder's wallet checks the asserted proof. If it is valid she concedes, and the contract pays her $\bresp$. If it is not she challenges, and BABE lets the hub answer a challenge only with a valid proof. A hub that does not respond, does not assert, or cannot answer a challenge pays $b$ and its own reserve. The payout rounds the amount down to the contract's payout unit, and each party pays the fees of the transactions it broadcasts.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[font=\small, >={Stealth[length=5pt]},
+  box/.style={draw, rounded corners=3pt, inner sep=3pt, align=center},
+  hold/.style={box, fill=coop}, hub/.style={box, fill=hubc},
+  pay/.style={font=\small, align=left}]
+\node[hold] (req) at (0,0) {request $(b,E)$\\ and publication};
+\node[hub] (resp) at (0,-1.25) {respond $\bresp$\\ and disclose};
+\node[hub] (as) at (0,-2.5) {assert proof};
+\node[hold] (ch) at (0,-3.5) {challenge};
+\node[pay] (t1) at (5.2,0) {after $\wH$: holder paid $b$ and the hub's reserve};
+\node[pay] (t2) at (5.2,-1.25) {no assertion: holder paid $b$};
+\node[pay] (t3) at (5.2,-2.5) {no challenge: holder paid $\bresp$};
+\node[pay] (t4) at (5.2,-3.5) {valid proof: $\bresp$; otherwise $b$};
+\draw[->] (req) -- (resp);
+\draw[->] (resp) -- (as);
+\draw[->] (as) -- (ch);
+\draw[->, black!50] (req) -- (t1.west);
+\draw[->, black!50] (resp) -- (t2.west);
+\draw[->, black!50] (as) -- (t3.west);
+\draw[->, black!50] (ch) -- (t4.west);
+\end{tikzpicture}
+\caption{A recovery. Green transactions are the holder's, yellow ones the hub's.}
+\label{fig:dispute}
+\end{figure}
+
+When the hub has nothing against a claim, it lets the window pass and nobody proves anything. A proof is made only to reduce a claim, by the party that holds the evidence.
 
 \paragraph{Example.} Alice holds notes of 2048 and 1024. She pays Bob 512 from the first, with change of 1024 and 512, under a grant. The hub records her signed spend and withholds $t$. Alice claims both notes for 3072 and lists the two change outputs as fallbacks. If the hub does nothing she is paid 3072 and the payment never happened. To do better the hub must cite her spend, which publishes $t$: the 2048 note is voided, the change takes its place, Alice is paid $1024+1536=2560$, and Bob opens his 512 with the published $t$. The hub cannot tell an honest Alice whose answer was withheld from a dishonest Alice claiming a note she spent, and it does not need to: both are paid what they are owed.
 
 \section{Interoperability}
 \label{sec:interop}
 
-Value enters and leaves a hub through one mechanism. A \emph{timed lock} is a spend with two sets of outputs and terms $(h, e, \delta)$: the \emph{pay} outputs are issued to the payee if a preimage $z$ of $h$ is shown before Bitcoin height $e$, and the \emph{refund} outputs are issued to the payer otherwise. Anything else that pays under the same hash, a Bitcoin HTLC~\cite{htlc}, a Lightning invoice or a lock at another hub, can then be exchanged for notes atomically. The hub signs a \emph{certificate} of each lock it accepts, binding $\id(S)$, the input identifiers and the terms. It is the hub's acknowledgment of the debt to a payee, who cannot inspect the payer's notes.
-
-An honest hub issues the pay outputs when it learns $z$ before $e$ and the refund outputs once the lock has expired. On Bitcoin, three rules enforce this against a hub that does neither.
+Value enters and leaves a hub through one mechanism. A \emph{timed lock} is a spend with two sets of outputs and terms $(h, e, \delta)$: the \emph{pay} outputs are issued to the payee if a preimage $z$ of $h$ is shown before Bitcoin height $e$, and the \emph{refund} outputs are issued to the payer otherwise. Anything else that pays under the same hash, a Bitcoin HTLC~\cite{htlc}, a Lightning invoice or a lock at another hub, can then be exchanged for notes atomically. The hub signs a \emph{certificate} of each lock it accepts, its acknowledgment of the debt to the payee. An honest hub issues the pay outputs when it learns $z$ before $e$, and the refund outputs once the lock has expired. Against a hub that does neither, three rules apply on Bitcoin.
 \begin{itemize}[leftmargin=1.5em, itemsep=0pt]
-\item \emph{Refund.} The payer claims the refund outputs as items. Apart from spends and claims that she signed herself, the only evidence that voids them is $\mathsf{Preimage}(z)$, and $z$ is then among the secrets that the response must publish. The payer is refunded or reads $z$ from Bitcoin.
-\item \emph{Activation.} The payee can publish $z$ in a Bitcoin transaction. If it confirms below height $e$ and reaches depth $\delta$, the lock is \emph{activated}. The payee claims the pay outputs of a certified lock with $z$ and a proof of the activation, and neither expiry nor a spend of the lock's inputs voids them.
-\item \emph{Expiry.} Pay outputs claimed without an activation are voided by $\mathsf{Expired}$, a header chain reaching height $e+\delta$, or by another spend of the lock's inputs.
+\item \emph{Refund.} The payer claims the refund outputs. Apart from what she signed herself, only $\mathsf{Preimage}(z)$ voids them, and the hub must then publish $z$. The payer is refunded or reads $z$ from Bitcoin.
+\item \emph{Activation.} The payee can publish $z$ in a Bitcoin transaction. If it confirms below height $e$ and reaches depth $\delta$, the lock is \emph{activated}, and the payee's claim of the pay outputs, which carries $z$, cannot be voided by expiry or by another spend of the lock's inputs.
+\item \emph{Expiry.} Pay outputs claimed without an activation are voided by another spend of the lock's inputs, or by $\mathsf{Expired}$: the chain reached height $e+\delta$ before the claim was published.
 \end{itemize}
-The terms of a lock also name the checkpoint from which $e$ is counted. An activation and an expiry are both proven from the checkpoint of the claiming contract, so the holder's program accepts the pay outputs of a lock only in a contract opened on the checkpoint that the lock names. The hub can then prove the expiry against every claim of them, and a payee checks that the terms name her contract's checkpoint before she relies on a certificate. Refund outputs need no such condition, because no proof about them reads the chain.
+The hub never pays both sides: if the lock was activated or its pay outputs claimed, $z$ is public and voids the refund, and otherwise expiry voids the pay outputs. Heights count from a checkpoint that the lock's terms name, and the payee claims in a contract opened on it. Since a payer may request her refund at any time, a hub accepts a lock only if its expiry, at depth, falls within its response window.
 
-A claim cannot list both sides of a lock, a lock's outputs beside its inputs, or two locks of the same inputs. The hub never pays both sides. If the lock was activated, $z$ is on Bitcoin and voids the refund. If it was not, expiry voids the pay outputs, unless the hub itself issued them, in which case it knows $z$.
+\paragraph{Onchain swaps.} To sell notes for bitcoin, Alice picks $z$ and locks notes to a provider under $h$. The provider funds a Bitcoin HTLC that pays Alice with $z$ and refunds him before $e$. Alice takes the HTLC, which reveals $z$ on Bitcoin, and the provider collects the pay outputs, activating the lock if the hub does not answer. To buy notes with bitcoin, Alice funds an HTLC that pays the provider with $z$, and the provider locks notes to her with an earlier expiry. Alice reveals $z$ to the hub for her notes, or activates the lock, which publishes $z$ for the provider. The provider may be the hub itself, locking a note that it issued to itself, which is how a new user funds her first notes.
 
-A payer may request her refund on Bitcoin at any time, and the hub can answer plainly only after it has seen the lock expire without an activation. The hub therefore accepts a lock at height $n$ only if $e>n$ and its response window contains the expiry: $e + \delta + \rho \le n + \wH$, where $\rho$ is the time it needs to respond.
+\paragraph{Lightning.} A hub that runs a Lightning node~\cite{lightning} is a gateway in both directions. To pay an invoice, Alice locks notes to the hub under its hash, and the hub pays the invoice before $e$. The preimage is Alice's proof of payment, and if the hub keeps it, her refund request forces it onto Bitcoin. To be paid, Alice has the hub issue a hold invoice under her hash, and when the payment arrives the hub locks a note of its own to her, expiring before the incoming HTLC. Alice reveals $z$ to the hub, or activates the lock, and the hub settles the invoice with it.
 
-\paragraph{Onchain swaps.} To sell notes for bitcoin, Alice picks $z$ and locks notes to a provider under $h$. The provider funds a Bitcoin HTLC that pays Alice with $z$ and refunds him at a height before $e$. Alice takes the HTLC, which reveals $z$ on Bitcoin, and the provider collects the pay outputs from the hub, or activates the lock if the hub does not answer. If Alice then also claims her refund, the hub voids it with the $z$ she published. If she never takes the HTLC, both sides are refunded.
-
-To buy notes with bitcoin, Alice picks $z$ and funds an HTLC that pays the provider with $z$. The provider locks notes to her, with an expiry before the HTLC's refund height. Alice reveals $z$ to the hub for her notes, and if the hub does not answer she activates the lock, which publishes $z$ for the provider. If she lets the lock expire she takes her bitcoin back, and a later claim of the notes is voided by the expired chain. The provider may be the hub itself, locking a note that it issued to itself. It then learns $z$ as the issuer, no third party is involved, and a new user can fund their first notes this way. When Alice reveals $z$ to the hub offchain, a third-party provider learns it only from the hub, which can keep it, so its HTLC must also outlive the refund request that forces $z$ out of the hub.
-
-\paragraph{Lightning.} A hub that runs a Lightning node~\cite{lightning} is a gateway in both directions. To pay an invoice with hash $h$, Alice locks notes to the hub under $h$, and the hub pays the invoice with a Lightning timeout below $e$. The preimage that the hub learns is Alice's proof of payment. If the hub keeps it, she requests her refund and the hub can keep her notes only by publishing it. To be paid over Lightning, Alice picks $z$ and the hub issues a hold invoice under $h$. When the incoming HTLC arrives, the hub certifies a lock of its own note to Alice that expires before that HTLC does. Alice reveals $z$ to the hub, or activates the lock on Bitcoin, and the hub settles the invoice with it.
-
-\paragraph{Other hubs.} A hub is a client of the hubs that it is paid at, with notes and a recovery contract at each. A payment from a sender at hub $H_n$ to a recipient at hub $H_1$ is one lock per hub under a common hash. The lock at $H_i$ has expiry $e_i$ and pays, under a certificate, the recipient at $H_1$ and $H_{i-1}$ at every other hub. Its payer is the sender at $H_n$, and at every other hub the hub itself, locking a note that it issued to itself. The recipient reveals $z$ to $H_1$ for her notes, and each hub that learns $z$ as an issuer reveals it to the hub upstream for its own. A forwarding hub charges the difference between the two locks.
-
-Each forwarding hub thus learns $z$ from its own lock, which its payee can settle only by revealing $z$ to it or by activating the lock on Bitcoin, and no other party can keep $z$ from it. In the opposite direction, where $H_{i+1}$ pays at $H_i$ with notes that it holds there, $H_i$ would learn $z$ first and could keep it, and $H_{i+1}$ would have to force it out with a refund request. Let $q$ be the number of blocks a hub needs to read $z$ from Bitcoin, and $g$ the blocks within which a transaction that it broadcasts confirms. A hub reads every block from the checkpoints of its contracts. A forwarding hub $H_i$ whose lock is settled holds $z$ by height $e_i+q$: its payee revealed $z$ to it before $e_i$, or published it in an activation below $e_i$, which an honest hub reads within $q$ blocks. If $H_{i+1}$ does not then issue its pay outputs, $H_i$ activates the lock at $H_{i+1}$, and the activation confirms by $e_i+q+g$. The route is safe for every forwarding hub if each upstream lock outlives that height with a margin $m$,
+\paragraph{Other hubs.} A hub is a client of the hubs it is paid at, with notes and a contract at each. A payment from a sender at hub $H_n$ to a recipient at hub $H_1$ is one lock per hub under a common hash. The lock at $H_i$ pays the recipient at $H_1$ and $H_{i-1}$ at every other hub, and at every hub but the sender's it is issued by the hub itself, from a note it issued to itself. Each forwarding hub thus learns $z$ from its own lock, whose payee can settle it only by revealing $z$ to it or activating it on Bitcoin, and no one can keep $z$ from it. If it needs $q$ blocks to read $z$ from Bitcoin and $g$ blocks to confirm an activation, the route is safe for every forwarding hub when each upstream lock outlives its downstream one with a margin $m$:
 \[
 e_{i+1} > e_i + q + g + m.
 \]
-Each hub also accepts its own lock only under the acceptance rule, $e_i+\delta+\rho \le n+w_i$. The windows are independent of one another: each must contain the expiry of a single lock, and the expiries grow by more than $q+g+m$ per hub.
+The same rule orders every pair of locks in this section: whichever settles first expires first, and the other outlives the time by which the party between them holds the secret.
 
-One rule orders every pair of locks in this section. Whichever lock is settled first must expire first, and the other must outlive the height by which the party between them holds the secret. A party that issued the first lock, or reads the secret from Bitcoin, holds it within $q$ blocks of the first expiry $e$. A party that paid at a hub without issuing the lock, such as a third-party provider, holds it only at $e+g+w+q$, after its refund request has confirmed and the hub's response window $w$ has elapsed. A Bitcoin HTLC expires softly: it can still be claimed until its refund confirms, so a lock settled after it must outlive its refund height by $g$ more blocks. For a party that pays at $H_i$ and is paid at $H_{i+1}$, the bound $e+g+w+q$ and the acceptance rule at $H_{i+1}$ make the windows nest, $w_{i+1} > w_i+g+q+m+\delta+\rho$, which is why every forwarding hub pays at its own hub, as the issuer of the lock.
+\section{Light clients}
+\label{sec:light}
+
+Because the hub carries the burden of proof, a Licash wallet does very little, and almost all of it is ordinary signing.
+\begin{itemize}[leftmargin=1.5em, itemsep=0pt]
+\item \emph{To pay and be paid}, it derives one-time keys, signs spends and verifies Chaum-Pedersen proofs. A recipient need not be online, have a contract or hold liquidity in advance.
+\item \emph{Between payments}, it keeps its notes and a seed. It does not watch the chain, refresh notes or follow other users' activity, because no other user's state can affect its claim. Its deadlines are the last safe action of each contract and, if a hub does not answer, the expiry of a lock that pays it.
+\item \emph{To open a contract}, it garbles the BABE instances for the hub's statement once and uploads those the hub keeps. It keeps only the seed they derive from, and the hub stores the instances.
+\item \emph{To recover}, it signs and publishes a claim with the evidence it already holds, follows the dispute's deadlines, checks the hub's proof if one is asserted, challenges a false one within a window of about a day, and collects its payout, paying the fees of the transactions it broadcasts.
+\end{itemize}
+The work that a dispute requires falls on the hub: it reads Bitcoin, evaluates the claim against its spend log, and proves the result. The hub is a server that is online anyway and is the only party that gains from reducing a claim. Had the holder to prove her own claim, as in earlier designs, she would need hours of proving on a large machine at the moment she has lost confidence in the hub.
+
+Two properties of the claim make the holder's part simple. A note is claimed with its hold key alone, bound to no identity, so any of the holder's contracts with its hub can recover it, including one opened after the note was received. And a claim is judged only against signatures of the claimant, so a wallet restored from a backup can claim everything it remembers without risk: what was spent since is removed, and nothing else.
+
+The one duty that cannot be delegated without trust is the challenge, because the secrets that a challenge reveals would let a colluding hub answer any challenge~\cite[App.~A]{lichen}. It arises only in a dispute that the holder started, against a hub that asserts a false proof.
 
 \section{Security}
 \label{sec:security}
 
-We state the properties that the protocol provides and argue each from the assumptions of Section~\ref{sec:model}. A holder or hub is \emph{honest} if it follows the protocol, keeps its records and acts on Bitcoin within its deadlines.
+We assume that the discrete logarithm problem is hard in secp256k1, and so is the one-more gap Diffie-Hellman problem~\cite{jkk,privacypass}, also against an adversary who runs the interactive Chaum-Pedersen protocol with the hub on points whose evaluation it has already received. Tagged hashes are random oracles, BIP340 signatures are unforgeable~\cite{bip340}, the hub's statement is proven by a knowledge-sound zkVM with a Groth16 wrapper~\cite{risc0,groth16}, and BABE is sound~\cite{babe}. A holder or hub is \emph{honest} if it follows the protocol, keeps its records and acts on Bitcoin within its deadlines.
 
-\prop{1 (Evidence soundness)} If a note's evidence verifies, in either form, then $C=k_dY$, except with negligible probability.
+\prop{1}{Issuance} Evidence that verifies, in either form, shows $C=k_dY$, and a coalition to whom the hub has released $\ell$ notes of denomination $d$ holds valid evidence for at most $\ell$ identifiers of that denomination.
 
-\emph{Argument.} Both forms are Fiat-Shamir transcripts of the Chaum-Pedersen protocol, on $(B,C')$ and on $(Y,C)$. If $C\ne k_dY$, then for any commitment $(R_1,R_2)$ at most one challenge has an accepting answer. The challenge is a random oracle output and $Y$ is a hash-to-curve output, so a false statement verifies with probability at most $q_1q_2/|G|$ after $q_1$ and $q_2$ queries to the two oracles. The bound is statistical. It holds for an adversary who knows nothing of $k_d$ and equally for one who runs any number of concurrent issuance and unlinking sessions with the hub.
+\emph{Argument.} Both forms of evidence are Fiat-Shamir transcripts of the Chaum-Pedersen protocol, so a false statement verifies with negligible probability. Evidence for $\ell+1$ identifiers would then solve the one-more gap Diffie-Hellman problem, if the rest of the coalition's view is simulatable without $k_d$. Issuance proofs are zero knowledge, and an unlinking session is the interactive prover of our assumption: a Schnorr identification of $K_d$~\cite{bellarepalacio}, blinded as in blind Schnorr signatures~\cite{fps}. Concurrent-session attacks~\cite{ros} do not apply, because a transcript verifies only for a pair $(Y,k_dY)$. An unreleased grant's packets are random strings, and releasing it amounts to ordinary issuances. The hub releases a note only against inputs of the same value or a payment it received, so valid unspent notes never exceed the value it was paid to issue.
 
-\prop{2 (Issuance)} For every denomination $d$, a coalition of users to whom the hub has released $\ell$ notes of denomination $d$ holds valid evidence for at most $\ell$ identifiers of that denomination.
+\prop{2}{Holder recovery} An honest holder who claims protected notes worth $b$ before the last safe action of her contract is paid $b$, up to rounding and the fees of her own transactions, or the owed amount $\bresp$ for evidence in which every item is an authorization that she signed or the resolution of a lock that she entered. Every unlock or preimage the evidence uses is then published on Bitcoin.
 
-\emph{Argument.} By Property~1, evidence for $\ell+1$ identifiers gives $\ell+1$ pairs $(Y, k_dY)$ on random oracle outputs $Y$, a solution of the one-more gap Diffie-Hellman problem, provided that everything else the coalition sees can be produced without $k_d$. An issuance is one evaluation $B\mapsto k_dB$, and its proof is zero knowledge: it is simulated by programming $\Ht{dleq}$. An unlinking session exists only for a point $B$ whose evaluation $C'$ was released, and the hub answers one challenge per session, with a fresh nonce: it is the interactive prover of our assumption. Restricted to its first generator, a session is a Schnorr identification of $K_d$, which withstands active and concurrent attacks under the one-more discrete logarithm assumption~\cite{bellarepalacio}, and the blinding that the holder applies is that of blind Schnorr signatures~\cite{fps}. Attacks that combine concurrent sessions into additional accepting transcripts~\cite{ros} gain nothing here. A transcript is not a signature on a message of the adversary's choice: by Property~1 it verifies only for a pair $(Y,k_dY)$, and producing such a pair for a new $Y$ is the problem assumed hard.
+\emph{Argument.} Her witness checks, so her claim is owed $b$ unless evidence voids an item. If the hub does not respond, does not assert, or cannot answer her challenge, the graph pays $b$. If it asserts a valid proof, the statement shows that the claim is owed at most $\bresp$ under evidence that verifies and was disclosed. A $\mathsf{Spend}$ carries signatures under her owner keys, and a $\mathsf{Claim}$ a signature under her hold key, neither of which can be forged. An honest holder signs one claim per note, so only spends she signed reduce her claim, and for each of them her fallbacks count her change. Lock outputs are covered by Property~5.
 
-A grant that has not been released is independent of $k_d$. The unlock $t$ has 256 bits of entropy and appears only inside $\Ht{lock}$ and $\Ht{pad}$, so until it is released every packet $c_j$ is a uniformly random string to the adversary. A simulator sends random packets and, when the hub releases $t$, obtains each $C'_j$ from one evaluation and programs $\Ht{pad}$ to open $c_j$ to it. A released grant is therefore $|\G|$ ordinary issuances and an unreleased grant is none. The hub releases a note, directly or through an unlock, only against inputs of the same value that it records as spent or against a payment it has received. The value of valid unspent notes never exceeds the value the hub was paid to issue.
+\prop{3}{Hub safety} An honest hub pays each note at most once, by reissuing it or on Bitcoin, and pays at most $\vmax$ per contract.
 
-\prop{3 (Holder recovery)} An honest holder who requests recovery of protected notes worth $b$ before the last safe action of her contract is paid $b$, or is paid $\bcorr$ for a counter in which every piece of evidence is an authorization that she signed or the resolution of a lock that she entered. In the second case every unlock or preimage that the counter relies on is published on Bitcoin.
+\emph{Argument.} An eligible claim lists only notes the hub issued (Property~1), and for each one in its spent log the hub holds the owner-signed spend. A claim names no owner, so a note may be claimed in two contracts, but each claim's hold authorization voids the note in the other: a holder who claims twice is paid nothing for it. While a claim is open the hub accepts no spend of its notes, and once it is paid the hub records them as spent. A fallback counts only when its spend is cited, in place of inputs of the same value. The two sides of a lock are never both paid (Property~5), and $b$ is signed below the cap. The statement is a deterministic function of Bitcoin and the hub's evidence, so an honest hub evaluates it before responding and never responds with an amount it cannot prove.
 
-\emph{Argument.} Her proof exists: her notes carry valid evidence, their keys derive from her spending root, and her request and claim body confirm in time. If the hub does not respond within $\wH$, the contract pays $b$. Otherwise she proves the full or the corrected statement, and by the soundness of BABE a valid proof is paid whatever the hub does. The corrected statement requires a valid counter proof. By the soundness of the counter program its evidence is genuine: a $\mathsf{Spend}$ carries signatures under her owner keys, a $\mathsf{Claim}$ carries a signature under her hold key, and neither can be forged. An honest holder authorizes one claim per note, so only spends that she signed can reduce her claim, and for each of them $\bcorr$ counts her change. Lock outputs are the subject of Property~6. Her proof recomputes the digest of the disclosed secrets from the bytes in the response transaction, so a counter that withholds an unlock or a preimage does not verify, and she proves the full statement instead. The same holds for any response that is not a valid counter proof, however it is encoded: whatever the hub signs, one of the two statements is provable. The payout rule of Section~\ref{sec:model} makes the amount she nets at least the amount she proves, within the fee ceilings.
+\prop{4}{Payment atomicity} If Alice, with protected inputs, signs a granted spend that pays Bob, then either the hub never counts her inputs as spent and she recovers them in full, or the unlock $t$ reaches her or Bitcoin, every sealed note opens, Bob can open his outputs and Alice holds her change.
 
-\prop{4 (Hub safety)} An honest hub pays each note at most once, by reissuing it or on Bitcoin, and pays at most $\vmax$ per contract.
+\emph{Argument.} Alice's signature covers $\mathsf{com}(\G)$, so it authorizes this grant and no other spend of her inputs. If the hub releases $t$, the payment completes. Otherwise Alice claims her inputs with her change as fallbacks. By Property~2 she is paid in full unless the hub cites her spend, which requires publishing a $t$ that opens every sealed note. Her change then replaces her inputs, and Bob opens his outputs with the published $t$.
 
-\emph{Argument.} A payout requires a proof that each settled note has valid evidence, which by Properties~1 and~2 the hub issued, that its owner key derives from the contract's spending root, and that its hold key authorized this claim. The hub records a spend only with its owner signatures, so for every claimed note in its spent log it holds $\mathsf{Spend}$ evidence and voids the item. A note claimed in two contracts is voided by the hold authorization of the other claim, which the same holder signed. So are the outputs of a lock that the hub never received when an input of that lock is claimed elsewhere, because their claim carries the hold authorization of every input. While a claim is open the hub accepts no spend of its notes, and once the claim is paid it records them as spent. A fallback is counted only when its spend is cited, and then the spend's inputs are voided. Since outputs and inputs of a spend have equal value, fallbacks replace value and never add to it. The two sides of a lock are never both paid (Property~6). The amount $b$ is signed below the cap, and the collateral that pays it was locked when the contract was funded.
+\prop{5}{Locks and routes} For a lock accepted under the rule of Section~\ref{sec:interop}, (a) a payer with protected inputs who requests her refund is refunded or reads the preimage from Bitcoin; (b) a payee who holds the certificate and activates the lock is paid in a contract on its checkpoint; (c) an honest hub never pays both sides. In a route whose expiries satisfy $e_{i+1} > e_i+q+g+m$, every honest forwarding hub that pays is paid upstream.
 
-\prop{5 (Payment atomicity)} Let Alice, with protected inputs, sign a granted spend that pays Bob and returns her change. Then either the hub never counts her inputs as spent and she can recover them in full, or the unlock $t$ is known to her or published on Bitcoin, every sealed note of the grant opens to a valid note, Bob can open his outputs and Alice holds her change. Bob never treats as paid a note that he cannot spend or, within the capacity of his contracts, recover.
-
-\emph{Argument.} Alice's signature covers $\mathsf{com}(\G)$, so it authorizes this grant and no other spend of her inputs. If the hub releases a $t$ that opens every sealed note, Alice has her change and forwards $t$ to Bob, and the payment is complete. Otherwise Alice requests recovery of her inputs and lists her change as fallbacks. By Property~3 she is paid in full unless the hub counters with her spend. The counter program accepts a granted spend only with its unlock and only if all sealed notes open, and the unlock is published. Her change then replaces the voided inputs in $\bcorr$, and Bob opens his outputs with the published $t$. A grant whose sealed notes are not valid can never be cited, so it costs Alice nothing but the delay. Bob accepts a payment only once his outputs open to notes with valid evidence, which by Property~1 are notes the hub issued, and from then on Properties~3 and~4 apply to him as their holder.
-
-\prop{6 (Lock atomicity)} For a lock with terms $(h,e,\delta)$ accepted by a hub at a height $n<e$ under the rule $e+\delta+\rho\le n+\wH$:
-\begin{enumerate}[leftmargin=1.8em, itemsep=0pt, label=(\alph*)]
-\item a payer with protected inputs who requests her refund on Bitcoin is paid the refund, or the preimage is published on Bitcoin in the hub's response;
-\item a payee who holds the certificate, has a contract on the lock's checkpoint that covers the pay outputs and activates the lock is paid them;
-\item an honest hub never pays both sides.
-\end{enumerate}
-
-\emph{Argument.} (a) The refund outputs are items of the payer's claim. Evidence that she did not sign can void them only as $\mathsf{Preimage}(z)$ with $H(z)=h$, which the counter must disclose. Property~3 gives the rest. (b) The certificate is the hub's signature on the lock and its inputs, so the payee's proof needs no evidence of notes that are not hers. The counter program refuses $\mathsf{Expired}$ and any conflicting $\mathsf{Spend}$ against pay outputs whose claim proves an activation below $e$ at depth $\delta$. The remaining evidence, a spend or a second claim of the pay outputs themselves, needs her own signature, and she is paid as in Property~3. (c) If the lock was activated, $z$ is on Bitcoin and voids any refund claim. If it was not, and the hub did not issue the pay outputs, a claim of them is voided by $\mathsf{Expired}$ once the chain reaches $e+\delta$. Such a claim is valid only in a contract on the lock's checkpoint, from which the hub's header chain to $e+\delta$ is accepted. The acceptance rule guarantees that this height lies inside the response window of any request made after the lock was accepted, so the hub can wait for it. If the hub issued the pay outputs, it did so on learning $z$, and holds it against the refund.
-
-\prop{7 (Routes)} In a route whose expiries satisfy $e_{i+1} > e_i+q+g+m$ and whose hubs apply the acceptance rule, an honest forwarding hub that pays at its own hub is paid at the hub upstream, the sender is refunded or obtains the preimage, and a recipient who reveals the preimage to her hub, and activates the lock if the hub does not answer, is paid.
-
-\emph{Argument.} Let $H_i$, $i<n$, be a forwarding hub. It locks a note of its own only once it holds the certificate of the lock at $H_{i+1}$, of which it is the payee, and a contract there on that lock's checkpoint that covers the pay outputs and that no other pending lock relies on. It gives its own lock a depth no less than that lock's. An honest $H_i$ issues the pay outputs of its own lock only on learning $z$ before $e_i$. Otherwise a claim of them is voided by the expiry rule unless the lock was activated below $e_i$, which $H_i$ reads by $e_i+q$. So if $H_i$ pays, it holds $z$ by $e_i+q$, and no other party can keep $z$ from it. It reveals $z$ to $H_{i+1}$, and if $H_{i+1}$ does not issue the pay outputs, $H_i$ activates that lock, and the activation confirms by $e_i+q+g<e_{i+1}$. If $z$ was published in an activation of its own lock, that activation already activates the lock at $H_{i+1}$, which expires later and requires no greater depth. By Property~6(b), $H_i$ is paid. The sender is the payer of the last lock, and Property~6(a) applies to her directly: the preimage is her receipt. The recipient holds the certificate of the first lock. If $H_1$ does not issue her notes when she reveals $z$, she activates the lock before $e_1$ and is paid by Property~6(b). An offchain failure of any hub costs the others time and at most one recovery, and never value.
+\emph{Argument.} (a) Evidence that she did not sign can void her refund only as $\mathsf{Preimage}(z)$, which the hub must publish. (b) An activated pay output can be voided only with her own signature. (c) A claim of the pay outputs carries $z$, which voids any refund. The hub answers a refund claim plainly only after seeing the lock reach $e+\delta$ unactivated, which the acceptance rule places inside its response window, and a later claim of the pay outputs is then voided by $\mathsf{Expired}$. For a route, a forwarding hub $H_i$ that pays holds $z$ by $e_i+q$, because its own lock's payee must reveal $z$ to it or activate the lock. It reveals $z$ upstream, or activates the lock there by $e_i+q+g<e_{i+1}$, and is paid by (b).
 
 \section{Privacy}
 \label{sec:privacy}
 
-A payment is a message between a payer, the hub and a payee, and nothing about it reaches Bitcoin. We describe what each party learns, assuming that users reach the hub over an anonymous network connection.
+Nothing about a payment reaches Bitcoin. We assume that users reach the hub over an anonymous network connection.
 
-\paragraph{The hub.} The hub sees every spend: its input notes, the denominations and blinded form of its outputs, and the time. It does not see who is paying or being paid. A spend names no account, contract or spending root, and each input shows only its one-time keys $P_j$ and $Q_j$, which reveal neither the address they derive from nor any other note of the same owner.
+\paragraph{The hub.} The hub sees every spend: its input notes, the denominations and blinded form of its outputs, and the time. A spend names no account, contract or address, and its one-time keys reveal no other note of the same owner. The hub cannot connect an input to the issuance that created it: at issuance it sees $B=Y+rG$, which is independent of $Y$, and the note's unlinked evidence is perfectly blinded. This holds without computational assumptions, and the set of candidates grows with the use of the hub. What remains visible is the shape of activity. Notes spent together belong to one wallet, denominations bound amounts, and a note spent moments after its issuance is easy to guess, so a wallet unlinks notes on receipt and lets them rest before merging them.
 
-The hub cannot connect an input to the issuance that created it. At issuance it sees $B=Y+rG$, which is uniformly distributed and independent of $Y$, and the unlinked evidence that the note later presents is perfectly blinded (Section~\ref{sec:model}). The hub's transcripts therefore give it no information about which unlinked, unspent note of a denomination is being spent. This holds without computational assumptions, and the set of candidates grows with the use of the hub.
+\paragraph{Counterparties.} Alice derives Bob's outputs, so she recognizes those notes, but she can neither spend nor claim them, and once Bob respends and unlinks them no transcript links his notes to the payment, for Alice, the hub or both together. Bob learns Alice's ephemeral key and the inputs of this one spend. A swap provider, a Lightning peer or a hub on a route sees the hash, amount and timing of its lock, as in any hash-locked protocol. A Bitcoin HTLC shares its hash with the lock at the hub, so the two can be connected by anyone who sees both.
 
-What remains visible to the hub is the shape of activity: notes spent together in one spend belong to one wallet, denominations bound amounts, and a note spent moments after it was issued is easy to guess. A wallet therefore unlinks notes when it receives them and avoids merging notes that it obtained in distinguishable ways until they have rested.
+\paragraph{The chain.} Opening a contract publishes its funding transaction, whose coins may say something about the user, but nothing about her notes or address, and payments never reference contracts. A recovery is public. Its witness reveals the claimed notes and their evidence, and the bodies of the payments in flight that the claim relies on, including the payer's inputs and signatures. The hub knew all of this already. An observer learns which notes a holder held at that moment and the payments they rest on, but not how she came by the notes, which unlinking hides. A published unlock or preimage identifies a payment only to those who already know its grant or its hash. A timed lock names the checkpoint of the payee's contract, which reveals only the period in which it was opened when a hub opens all contracts of a period on one checkpoint.
 
-\paragraph{The payer and the payee.} Alice derives Bob's outputs, so she recognizes those notes, but she can neither spend nor claim them. With the hub's help she could recognize Bob's first spend of them. Bob ends this by respending what he receives to outputs that he derives alone and unlinking them. From then on no transcript links his notes to this payment, for Alice, for the hub or for both together. Bob learns Alice's ephemeral key and the inputs of this one spend, and nothing about her other notes, her root or her contracts.
-
-\paragraph{Lock counterparties.} A swap provider, a Lightning peer or a hub on a route sees the hash, amount and timing of the lock it takes part in, as it would in any hash-locked protocol. A Bitcoin HTLC is public and shares its hash with the lock at the hub, so the hub and an onchain observer can connect the two. The notes on the far side of the lock are protected as above once they are respent and unlinked.
-
-\paragraph{The chain.} Opening a contract shows the hub a spending root and any coins that the user contributes to the funding transaction. Payments do not reference contracts, so an opening is connected to nothing that the wallet later does. There are two exceptions. A timed lock names the checkpoint of the payee's contract, which tells the payer and the hub that the payee has a contract opened on that block. A hub that opens all the contracts of a period on one checkpoint makes this the period and not the contract. The other exception is a recovery. Its claim body publishes the claimed notes, and the claim connects them to the contract. A holder who recovers thus reveals to the hub and to the chain which notes she holds at that moment. She does not reveal how she came by them, which unlinking hides, and her proof discloses nothing further. Of her earlier payments the hub learns only those that spent a claimed item: a stale claim shows that the spends of its already spent notes were hers. An unlock that a counter publishes is a random string to anyone who does not hold its grant, and a published preimage identifies a lock only to those who already know its hash.
-
-\paragraph{A private wallet.} A silent payments wallet~\cite{bip352} receives each payment to a fresh output, but spending several of them in one transaction links them publicly and permanently. With Licash the wallet swaps each received coin into a hub separately, lets the notes rest unlinked, combines and spends them offchain, and swaps out when it needs an onchain coin. An observer of the chain sees unrelated swaps instead of a common-input consolidation, and the hub sees notes that it cannot follow through unlinking.
-
-The wallet needs no channels and no long-lived network identity. Lightning wallets that run their own node have both, and Kappos et al.~\cite{kappos} show that channels can be linked to onchain activity and that nodes on a payment's path can infer its endpoints. A Licash wallet that pays over Lightning appears on the network only as its hub's node.
-
-\section{Implementation and evaluation}
-\label{sec:impl}
-
-We implemented the protocol in Rust: a library for notes, spends, grants, locks, claims and both statements; the holder's and the hub's programs for the RISC Zero zkVM~\cite{risc0}, whose proofs are wrapped in Groth16~\cite{groth16}; and the contract's transaction graph on the BABE implementation of Lichen~\cite{lichenbuilt}, with its garbled circuits generated for every contract. Every transaction is accepted under the default relay policy of Bitcoin Core~30. The Lightning tests run against two LND nodes with a channel between them.
-
-\paragraph{Outcomes.} Table~\ref{tab:outcomes} lists the scenarios that the test suite carries out with funded contracts and Bitcoin transactions, from the funding of the contract to the last payout. Each row was run to completion, and the amounts are the values of the payout outputs that the holder spends. We also executed both programs in the zkVM on the inputs of every run. They agree with the library on each, including on the claims and counters that must be refused. To keep each run within seconds, the graph's verifier is keyed in these runs with a test key. A separate production-key harness generates proofs for both programs in the stale-backup scenario and includes a challenge of a true assertion.
-
-\begin{table}[!htb]
-\centering
-\small
-\begin{tabularx}{\linewidth}{>{\raggedright\arraybackslash}p{0.36\linewidth}L}
-\toprule
-scenario & result on Bitcoin \\
-\midrule
-honest claim of 3072, plain response & paid 3072 \\
-hub does not respond & paid 3072 after $\wH$ \\
-stale backup: 1024 of 3072 was spent & countered with the spend, paid 2048 \\
-hub signs a counter that is not a well-formed proof & treated as no counter, paid 3072 in full \\
-claim of 32 notes, the item limit & paid 4096 \\
-claim of 32 notes, 16 of them spent in 16 spends & countered with the 16 spends, paid 2048 \\
-claim of 32 notes, 16 of them paid away under 16 grants & countered with the 16 spends, all 16 unlocks published, paid 2048 \\
-granted payment, unlock withheld & counter publishes $t$; payer paid her change, payee opens his notes \\
-counter that keeps its unlock & not a counter; the hub challenges and loses, paid 3072 \\
-false assertion by the holder & challenged, the challenge cannot be answered, contract forfeited to the hub \\
-claim body confirmed late & no statement is provable, the hub recovers its collateral \\
-swap-out, seller takes the bitcoin and claims her refund & refund voided with the preimage she published, paid the rest \\
-swap-out, HTLC never taken & lock expires, both sides refunded in full \\
-swap-in, hub silent, lock activated & paid in full; neither expiry nor a respend of the hub's note voids it \\
-swap-in, lock left to expire & buyer takes her bitcoin back; her claim of the notes is voided by the chain \\
-payment under a hash inside one hub, receipt withheld & the payer requests her refund; the hub keeps her notes only by publishing $z$, her receipt \\
-routes of two and three hubs, every hub upstream of the recipient's silent & the recipient's hub learns $z$ in its lock's last block and activates the lock upstream once its own has expired; every forwarding hub is paid in full in its contract upstream, and the sender's refund is voided with $z$, her receipt \\
-route of two hubs, the recipient's hub silent as well & the recipient activates the first lock and is paid in full in her own contract; her hub is paid upstream with the same activation, the sender as above \\
-third-party provider between two hubs with nested windows, both hubs silent & the provider requests its refund at the recipient's hub and reads $z$ in the response before the lock that pays it expires; it activates that lock and is paid in full \\
-payee claims an expired lock in a contract on another checkpoint & no statement is provable, the hub recovers its collateral \\
-Lightning payment out, receipt withheld & invoice paid by LND; preimage forced onto Bitcoin as the receipt \\
-Lightning payment in, hub silent & hold invoice accepted, lock activated, hub settles the invoice with the published preimage \\
-\bottomrule
-\end{tabularx}
-\caption{Scenarios carried out on Bitcoin transactions.}
-\label{tab:outcomes}
-\end{table}
-
-\paragraph{Cost of a payment.} A payment uses no Bitcoin transaction and no zero-knowledge proof. Per output, the hub computes the evaluation $k_dB$, a Chaum-Pedersen proof, a nonce commitment and a hash pad, and the payment takes two round trips between the payer and the hub.
-
-\paragraph{Cost of a recovery.} Table~\ref{tab:sizes} gives the measured transaction sizes. A recovery that the hub ignores costs about 4 kvB, one that it answers plainly about 35 kvB, and one that it counters about 90 kvB. A claim of 32 items adds 8 kvB to each. Most of a response is one-time signatures, on the claim digest and, in a counter, on the proof and the disclosed secrets. Fees are paid from the reserves locked in the contract.
-
-\begin{table}[!htb]
-\centering
-\small
-\begin{tabular}{lr}
-\toprule
-transaction & size (vB) \\
-\midrule
-request & 2,450 \\
-claim body, two to four items & 800 to 2,300 \\
-claim body, 32 items & 9,000 \\
-plain response & 23,600 \\
-counter response, with its disclosed secrets & 76,900 \\
-assertion, full or corrected & 7,700 or 8,300 \\
-challenge & 20,700 \\
-payout, or timeout of the request & 780 to 810 \\
-lock activation & 165 \\
-\bottomrule
-\end{tabular}
-\caption{Transaction sizes of a recovery.}
-\label{tab:sizes}
-\end{table}
-
-\paragraph{Proofs.} The holder's statement for two notes and a plain response executes in $1.8\cdot10^7$ zkVM cycles, and each further note adds $1.8\cdot10^6$, so a claim of 32 notes takes $7.2\cdot10^7$. Against a counter the statement takes between $3.6\cdot10^7$ and $4.7\cdot10^7$ cycles for claims of two to four items with fallbacks and lock outputs, and $9.0\cdot10^7$ for 32 notes. The hub's counters for the small-payment scenarios of Table~\ref{tab:outcomes} take between $0.9\cdot10^7$ and $1.4\cdot10^7$ cycles.
-
-A counter's cost grows with the spends that it cites, because it verifies every input of a cited spend and every sealed output of a cited grant. Against a claim of 32 notes, 32 separate spends take $9.1\cdot10^7$ cycles, and $1.8\cdot10^8$ when each of them is a granted payment with four outputs. A hub therefore limits the number of inputs and outputs of the spends it accepts, so that the largest counter it can ever need fits in its response window.
-
-Our prover runs at about 3,100 cycles per second on four CPU threads with 10 GB of memory, and the Groth16 wrap adds two minutes. At that throughput a typical counter takes about an hour and the two large ones would take eight and sixteen hours, and a holder's proof between two and eight hours. These estimates set the response window and the assertion deadline of a contract. A window of one day covers the estimated proving time of the largest counter that we measured. The zkVM proves a program in segments that can be proven in parallel, and a hub needs proving capacity for all the recoveries that can be open at once. Proofs are needed only in a dispute and never for a payment.
+The result composes with Bitcoin. A silent payments wallet~\cite{bip352} that swaps each received coin into a hub separately, lets the notes rest unlinked, and swaps out when it needs an onchain coin, shows the chain unrelated swaps instead of a common-input consolidation. Paying over Lightning, it appears on the network only as its hub's node.
 
 \section{Limitations and conclusion}
 \label{sec:conclusion}
 
-\paragraph{Limitations.} The guarantees have a price, paid mostly by the hub. It locks collateral for every contract, up to the cap, for the contract's lifetime, and a user holding more than her contracts cover holds the excess on trust. The hub must be online, and it must be able to prove and publish a counter within its window for every recovery that can be open at once, so its proving capacity and fee reserves bound the number of contracts it can serve safely. A recovery is expensive in blockspace, between 4 and 100 kvB, and ends its contract, so the design relies on disputes being rare. A dispute gains its initiator nothing beyond what they are owed, but a user can impose its cost on the hub, which a hub must price into its contracts. Forcing a withheld unlock or preimage costs the payer such a recovery. A contract supports one recovery of at most 32 items, and wallets consolidate to stay within it. A backup protects only the notes it contains: without the hub's cooperation, a recovery made from an old backup does not return change or payments received after it. A forwarding hub holds the notes it is paid at the hub upstream, which only its contracts there protect, and this bounds what hubs forward for one another. A provider between two hubs that is neither of them needs nested response windows. The hub can refuse service to anyone, in which case the user recovers, and it observes the timing and denominations of spends. Finally, the security arguments of Section~\ref{sec:security} are given in the random oracle model and inherit the assumptions of BABE and of the proof system.
+\paragraph{Limitations.} The guarantees have a price, paid mostly by the hub. It locks collateral up to the cap for each contract's lifetime, and value beyond a user's contracts is held on trust. It must be online and able to prove within its windows for every recovery that can be open at once, which bounds the contracts it can serve. A recovery is expensive in blockspace and ends its contract, so the design relies on disputes being rare. A dispute gains its initiator nothing beyond what they are owed, but a user can impose its cost on the hub, which must price it into its contracts. Forcing a withheld unlock or preimage costs the payer such a recovery. A contract supports one recovery of at most 32 items, so wallets consolidate to stay within it.
 
-\paragraph{Conclusion.} Licash gives ecash a recovery right that is individual and local. A holder needs only her own notes and her own contract to recover on Bitcoin, and no shared state has to be ordered, published or kept available. The hub can reduce a holder's claim to her notes only with what she signed, so a claim from a stale backup is never punished and is paid the unspent part of what it lists, and a hub that records a payment must complete it: retiring the payer's inputs releases the payee's notes and the payer's change. The same principle, that a secret is either published or the money returned, carries payments across the boundary of a hub, to onchain Bitcoin, to Lightning and through other hubs. Payments inside a hub and between hubs stay offchain, immediate and unlinkable, and they reach Bitcoin only when a party stops cooperating. The implementation carries out every one of these outcomes with Bitcoin transactions that relay today, without any change to Bitcoin.
+On the holder's side, a recovery publishes her claimed notes and the in-flight payments they rest on. A claim whose witness does not check is owed nothing, so a wallet must assemble it correctly. Opening a contract requires garbling and an upload, and a holder must be able to challenge a false proof herself within the challenge window of her own dispute. A backup protects only the notes it contains: without the hub's cooperation, a recovery from an old backup does not return change or payments received after it.
+
+Across hubs, a forwarding hub holds the notes it is paid upstream, which only its contracts there protect, and this bounds what hubs forward for one another. A provider between two hubs that is neither of them must wait out a hub's response window to force the preimage out, so the windows of its locks must nest. Finally, our security arguments are given in the random oracle model and inherit the assumptions of BABE and of the proof system.
+
+\paragraph{Conclusion.} Licash gives ecash a recovery right that is individual and local, and places the burden of proof where the evidence is. A holder recovers on Bitcoin with only her own notes and her own signatures, without proving anything, without shared state and without anyone's cooperation. The hub can reduce a claim only with what the holder signed, so a stale backup is never punished, and a hub that records a payment must complete it. One principle, that a secret is either published or the money returned, carries payments across the boundary of a hub to onchain Bitcoin, to Lightning and through other hubs. Payments stay offchain, immediate and unlinkable, and reach Bitcoin only when a party stops cooperating. The result is ecash that a phone can hold with a right of exit on Bitcoin, and that requires no change to Bitcoin.
 
 \begin{thebibliography}{99}
 \small
@@ -388,7 +306,7 @@ Our prover runs at about 3,100 cycles per second on four CPU threads with 10 GB 
 
 \bibitem{shieldedbitcoin} C.~Shikhelman, M.~Komarov and A.~Moskvin. Shielded Bitcoin: private transfers on the Bitcoin L1. ePrint 2026/2749.
 
-\bibitem{lichen} waxwing. Lichen: L2s in channels enforced by Bitcoin. Version 0.5, November 2026. \url{https://github.com/AdamISZ/lichen/blob/f025f81c646fe62d138f4476c52bdaf3f03faec2/papers/lichen-v0.5.0.pdf}
+\bibitem{lichen} waxwing. Lichen: L2s in channels enforced by Bitcoin. Version 0.5, November 2026. \url{https://github.com/AdamISZ/lichen/blob/de1c3f17bb2b6938626cee8f024a9c1d6e5aa846/papers/lichen-v0.5.0.pdf}
 
 \bibitem{babe} S.~Garg, D.~Kolonelos, M.~Sergeevitch, S.~Sridhar and D.~Tse. BABE: verifying proofs on Bitcoin made 1000x cheaper. ePrint 2026/065. \url{https://eprint.iacr.org/2026/065}
 
@@ -408,8 +326,6 @@ Our prover runs at about 3,100 cycles per second on four CPU threads with 10 GB 
 
 \bibitem{groth16} J.~Groth. On the size of pairing-based non-interactive arguments. EUROCRYPT 2016.
 
-\bibitem{lichenbuilt} waxwing. Lichen as built: the BABE gadget, the hub's ledger and the exit. Version 0.1 (draft), October 2026. \url{https://github.com/AdamISZ/lichen/blob/master/papers/lichen-built-v0.1.1.pdf}
-
 \bibitem{chaumpedersen} D.~Chaum and T.~P.~Pedersen. Wallet databases with observers. CRYPTO '92.
 
 \bibitem{rfc9380} A.~Faz-Hernandez et al. Hashing to elliptic curves. RFC 9380, 2023. \url{https://www.rfc-editor.org/rfc/rfc9380}
@@ -427,8 +343,6 @@ Our prover runs at about 3,100 cycles per second on four CPU threads with 10 GB 
 \bibitem{fps} G.~Fuchsbauer, A.~Plouviez and Y.~Seurin. Blind Schnorr signatures and signed ElGamal encryption in the algebraic group model. EUROCRYPT 2020.
 
 \bibitem{ros} F.~Benhamouda, T.~Lepoint, J.~Loss, M.~Orr\`u and M.~Raykova. On the (in)security of ROS. EUROCRYPT 2021.
-
-\bibitem{kappos} G.~Kappos, H.~Yousaf, A.~Piotrowska, S.~Kanjalkar, S.~Delgado-Segura, A.~Miller and S.~Meiklejohn. An empirical analysis of privacy in the Lightning Network. Financial Cryptography and Data Security, LNCS 12674, pp.~167 to 186, 2021. \url{https://doi.org/10.1007/978-3-662-64322-8_8}
 
 \end{thebibliography}
 

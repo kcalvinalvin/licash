@@ -21,7 +21,8 @@
 //! The holder garbles for this journal at opening (BABE with the roles
 //! swapped); the Hub evaluates [`check`] natively to decide its response
 //! (the same chain, the same evidence), and proves it in `r0/hp-guest`
-//! only if the holder challenges its assertion.
+//! only when it contests the claim, for the assertion that follows its
+//! response.
 
 use licash::{
     base::Base,

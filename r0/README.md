@@ -104,8 +104,9 @@ $licash hp-prove tmp/hp-inputs/answered.bin tmp/answered.json
 The answered input (a 20 kB filing, 32 settled notes, a 16-note spend as
 evidence) executes in about 68 M cycles (71 segments of 2^20). Cycles grow
 with the signatures and DLEQ proofs a filing carries, so a filing at the
-64 kB limit is roughly three times that. The Hub proves only when the
-holder challenges its assertion, within the graph's assert window.
+64 kB limit is roughly three times that. The Hub proves only when it
+contests a claim: it responds with less than the claim, and asserts the
+proof within the graph's assert window.
 
 The end-to-end test with a real proof plays the receipt on Bitcoin. It
 takes hours and about 10 GB of memory, so it is run explicitly:
