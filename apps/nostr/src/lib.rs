@@ -24,6 +24,8 @@ mod tor;
 #[cfg(feature = "wallet")]
 pub mod wallet;
 
+pub mod watch;
+
 use std::{collections::HashMap, future::Future, net::SocketAddr, time::Duration};
 
 use anyhow::{ensure, Context};

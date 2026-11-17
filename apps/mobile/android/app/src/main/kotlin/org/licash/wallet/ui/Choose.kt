@@ -1,33 +1,32 @@
 package org.licash.wallet.ui
 
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Slider
-import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
-import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
+import org.licash.core.ChangeProblem
+import org.licash.core.ChangeRange
 import org.licash.core.ContractQuote
 import org.licash.core.ContractRange
 import org.licash.core.DepositCoin
+import org.licash.core.contractChangeProblem
 import org.licash.core.contractMaxCap
 import org.licash.core.contractPrice
 import org.licash.wallet.Chosen
@@ -71,9 +70,11 @@ internal fun OfferSheet(engine: Engine, q: ContractQuote, dismiss: () -> Unit) {
 /**
  * Protection of terms chosen within what its hub allows: how much it
  * covers and for how long, at first as `q` suggests, priced as the hub
- * prices them; which of `coins` pays, if there are several, and whether
- * what is left of it joins the balance once paid: at first only if it
- * covers all of it. Offered unasked, it can be declined.
+ * prices them, and which of `coins` pays, if there are several. A coin
+ * turns whole into the protection and notes it covers: what is left of
+ * it joins the balance, never left as change on Bitcoin, so it covers
+ * that at least; a coin that cannot is refused, said why
+ * ([contractChangeProblem]). Offered unasked, it can be declined.
  *
  * With no coin to pay it, the terms are chosen all the same, at first
  * covering the `held` notes, and [coinFor] them is cashed out first
@@ -92,25 +93,31 @@ internal fun ChooseSheet(
 ) {
     val colors = MaterialTheme.colorScheme
     val download = android.text.format.Formatter.formatShortFileSize(LocalContext.current, q.download.toLong())
-    var coin by remember(q) { mutableStateOf(coins.firstOrNull()) }
     val start = if (coins.isEmpty()) maxOf(q.suggestedCap, held) else q.suggestedCap
-    var cap by remember(q) { mutableStateOf(start) }
     var blocks by remember(q) { mutableStateOf(q.suggestedBlocks.coerceIn(range.minBlocks, range.maxBlocks)) }
+    // At first the largest that pays as suggested, whole.
+    var coin by remember(q) {
+        val price = contractPrice(range, start, blocks)
+        val whole = coins.firstOrNull { contractChangeProblem(it.value, price, start, q.dust, q.change) == null }
+        mutableStateOf(whole ?: coins.firstOrNull())
+    }
+    var cap by remember(q) { mutableStateOf(start) }
     val most = coin?.let { contractMaxCap(range, it.value) ?: range.minCap } ?: range.maxCap
-    val capped = cap.coerceIn(range.minCap, most)
-    val price = contractPrice(range, capped, blocks)
     val value = coin?.value ?: 0uL
-    var moveChange by remember(q, coin) { mutableStateOf(changeCovered(value, price, capped)) }
-    val pays = value > price
-    val change = if (pays) value - price else 0uL
+    // As asked, what is left of the coin it covers at least: it costs more then, leaving less.
+    val asked = contractPrice(range, cap.coerceIn(range.minCap, most), blocks)
+    val least = coverAtLeast(range.minCap, value, asked).coerceAtMost(most)
+    val capped = cap.coerceIn(least, most)
+    val price = contractPrice(range, capped, blocks)
+    val change = if (value > price) value - price else 0uL
     // It stops protecting a little before it ends.
     val protectsFor = if (blocks > q.afterAssert) blocks - q.afterAssert else 0u
     Sheet("Protect at ${name(q.hub)}", dismiss) {
         Line("Covers up to", sat(capped), tag = "quote-cap")
-        if (most > range.minCap) {
+        if (most > least) {
             Slider(
-                value = capPosition(capped, range.minCap, most),
-                onValueChange = { cap = capAt(it, range.minCap, most) },
+                value = capPosition(capped, least, most),
+                onValueChange = { cap = capAt(it, least, most) },
                 modifier = Modifier.testTag("contract-cap"),
             )
         }
@@ -137,39 +144,19 @@ internal fun ChooseSheet(
                 }
             }
         }
-        val first = coinFor(range, capped, price)
+        val first = coinFor(range, capped, price, q.dust, q.change)
+        val paying = coin?.value ?: first
+        val problem = contractChangeProblem(paying, price, capped, q.dust, q.change)
         if (coin == null) {
             Say("Paid from Bitcoin you hold, and you hold none yet. Cash out to yourself first, then protect.")
-        } else if (pays) {
-            Row(
-                Modifier.fillMaxWidth().clickable { moveChange = !moveChange }.heightIn(min = 56.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Column(Modifier.weight(1f)) {
-                    Text("Add the rest to your balance", style = MaterialTheme.typography.bodyLarge)
-                    Text(
-                        "About ${sat(change)}",
-                        modifier = Modifier.testTag("contract-change"),
-                        style = MaterialTheme.typography.bodySmall,
-                        color = colors.onSurfaceVariant,
-                    )
-                }
-                Switch(moveChange, { moveChange = it }, Modifier.testTag("contract-move-change"))
-            }
-            // Past what it covers: said before it is paid for.
-            if (moveChange && change > capped) {
-                Text(
-                    "${sat(change - capped)} of it will not be protected",
-                    modifier = Modifier.padding(bottom = 8.dp).testTag("contract-over"),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = colors.error,
-                )
-            }
-        } else {
+        } else if (problem == null && change >= q.dust) {
+            Line("Joins your balance, covered", "About ${sat(change)}", tag = "contract-change")
+        }
+        problem?.let {
             Text(
-                "Costs more than this coin holds",
-                modifier = Modifier.padding(vertical = 12.dp),
-                style = MaterialTheme.typography.bodyLarge,
+                whyNot(it),
+                modifier = Modifier.padding(vertical = 8.dp).testTag("contract-problem"),
+                style = MaterialTheme.typography.bodyMedium,
                 color = colors.error,
             )
         }
@@ -184,14 +171,18 @@ internal fun ChooseSheet(
         Spacer(Modifier.height(8.dp))
         val c = coin
         if (c != null) {
-            BigButton("Protect for ${sat(price)}", Modifier.fillMaxWidth().testTag("protect"), enabled = pays) {
-                open(Chosen(capped, blocks, c.outpoint, pays && moveChange), price)
+            BigButton(
+                "Protect for ${sat(price)}",
+                Modifier.fillMaxWidth().testTag("protect"),
+                enabled = problem == null,
+            ) {
+                open(Chosen(capped, blocks, c.outpoint), price)
             }
         } else {
             BigButton(
                 "Cash out ${sat(first)}",
                 Modifier.fillMaxWidth().testTag("cash-out-first"),
-                enabled = first <= held,
+                enabled = first <= held && problem == null,
             ) { cashOutFirst(first) }
         }
         decline?.let {
@@ -206,20 +197,43 @@ internal const val DUTY = "Open Licash now and then, and before it ends: what it
     "is recovered by this app, and is safe after it ends only once cashed out or protected again."
 
 /**
- * Whether what is left of a coin of `coin` sat paying `price` for
- * protection of up to `cap` sat, moved into the balance, is all
- * protected: only then is it moved by default.
+ * The least protection paid from a coin of `coin` sat at about `price`
+ * covers: what is left of the coin once paid, which joins the balance,
+ * and the hub's least, `minCap`.
  */
-internal fun changeCovered(coin: ULong, price: ULong, cap: ULong): Boolean = coin > price && coin - price <= cap
+internal fun coverAtLeast(minCap: ULong, coin: ULong, price: ULong): ULong =
+    maxOf(minCap, if (coin > price) coin - price else 0uL)
+
+/** Why a coin cannot pay for protection, turned whole into it and the notes it covers. */
+internal fun whyNot(p: ChangeProblem): String = when (p) {
+    is ChangeProblem.Short -> "Costs more than this coin holds"
+    is ChangeProblem.Uncovered ->
+        "The ${sat(p.change)} left of this coin would join your balance uncovered: cover more"
+    is ChangeProblem.NotTaken ->
+        "This hub takes nothing left of a coin into your balance: pay with a coin of the cost"
+    is ChangeProblem.TooLittle ->
+        "The ${sat(p.change)} left of this coin is less than the hub takes into your balance " +
+            "(${sat(p.least)}): choose another coin or other terms"
+    is ChangeProblem.TooMuch ->
+        "The ${sat(p.change)} left of this coin is more than the hub takes at once " +
+            "(${sat(p.most)}): pay with a smaller coin"
+}
 
 /**
  * The coin to cash out to this wallet to pay, within `range`, `price`
- * for protection of up to `cap` sat: one the hub takes as paying for so
- * large a cap, and [firstCoin] of `price`, whichever is more.
+ * for protection of up to `cap` sat, turned whole into it and notes: one
+ * the hub takes as paying for so large a cap, and the price, whichever is
+ * more; if what is left of it is less than the hub takes into notes
+ * (`change`), and more than its funding's `dust`, as much more as that,
+ * should the cap still cover it. Otherwise no coin pays for so small a
+ * cap ([contractChangeProblem] says why).
  */
-internal fun coinFor(range: ContractRange, cap: ULong, price: ULong): ULong {
+internal fun coinFor(range: ContractRange, cap: ULong, price: ULong, dust: ULong, change: ChangeRange?): ULong {
     val perCoin = range.perCoin.toULong().coerceAtLeast(1uL)
-    return maxOf((cap + perCoin - 1uL) / perCoin, firstCoin(price))
+    val coin = maxOf((cap + perCoin - 1uL) / perCoin, price)
+    val left = coin - price
+    val bump = change != null && left >= dust && left < change.least && change.least <= minOf(cap, change.most)
+    return if (bump) price + change.least else coin
 }
 
 /**

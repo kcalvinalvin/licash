@@ -23,6 +23,8 @@ class OfferTest {
         coins = coins.mapIndexed { i, c -> DepositCoin(c, 10_000_000uL - i.toULong()) },
         suggestedCap = 15_000_000uL,
         suggestedBlocks = 26_280u,
+        dust = 330uL,
+        change = null,
     )
 
     @Test

@@ -95,6 +95,9 @@ private sealed interface Step {
     /** A hub charging more than agreed, in the way of a payment: made `again` once approved. */
     class Approve(val raised: FeesRaised, val again: () -> Unit) : Step
     data class Failed(val why: String, val title: String = "Couldn't pay") : Step
+
+    /** Too little in the balance to pay, and bitcoin to protect into it. */
+    data class ProtectFirst(val why: String) : Step
 }
 
 /**
@@ -116,8 +119,24 @@ fun Send(
     // Opened with a link: no camera to start.
     var step by remember { mutableStateOf<Step>(if (link == null) Step.Looking else Step.Busy) }
     var empty by remember { mutableStateOf(false) }
+    // Protection offered, the balance being too little to pay.
+    var protecting by remember { mutableStateOf(false) }
+    val offer = ui.offer?.takeIf { ui.opening == null }
+    if (protecting && offer != null) {
+        OfferSheet(engine, offer) {
+            protecting = false
+            back()
+        }
+    }
     // This wallet's own address, once cashing out to it.
     var own by remember { mutableStateOf(ownAddress) }
+
+    // Too little to pay with: protection offered first, if a coin pays for
+    // one, its rest joining the balance; else why.
+    fun tooLittle(e: Throwable, title: String = "Couldn't pay"): Step {
+        val none = e is LicashException.Insufficient || ui.balance.notes == 0uL
+        return if (none && ui.offer != null) Step.ProtectFirst(explain(e)) else Step.Failed(explain(e), title)
+    }
 
     suspend fun taking(payment: String, trust: Boolean): Step =
         engine.receive(payment, trust).fold(
@@ -139,7 +158,7 @@ fun Send(
         step = Step.Quoting
         return engine.payoutQuote(address, amount, cashOut).fold(
             { Step.Payout(it, amount) },
-            { Step.Failed(explain(it), "Can't send on Bitcoin") },
+            { tooLittle(it, "Can't send on Bitcoin") },
         )
     }
 
@@ -225,7 +244,7 @@ fun Send(
                 { e ->
                     val address = s.address
                     if (address == null || e is LicashException.Insufficient) {
-                        Step.Failed(explain(e))
+                        tooLittle(e)
                     } else {
                         Step.Unpayable(explain(e), address, amount ?: s.asked)
                     }
@@ -417,10 +436,21 @@ fun Send(
                     back,
                 )
                 is Step.Failed -> Ask(s.title, s.why, "Try again", { step = Step.Looking }, back, failed = true)
+                is Step.ProtectFirst -> Ask(
+                    "Protect your bitcoin first",
+                    "${s.why}\n\n$PROTECT_FIRST",
+                    "Protect",
+                    { protecting = true },
+                    back,
+                )
             }
         }
     }
 }
+
+/** Why protecting comes before paying, with nothing in the balance yet. */
+internal const val PROTECT_FIRST = "You pay from your balance, and your bitcoin joins it once protected: " +
+    "one of your coins pays for the protection, whole, and what is left of it joins your balance, covered."
 
 /** One fact of a payment to confirm: `tag` names its value, for the tests; a fee's `share` of the amount. */
 private class Fact(val label: String, val value: String, val tag: String, val share: String? = null, val fee: FeeBreakdown? = null)
@@ -612,7 +642,7 @@ private fun Providers(load: suspend () -> Result<List<Offer>>) {
                 if (o.current) {
                     Text("Chosen", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
                 } else {
-                    TextButton(onClick = o.choose) { Text("Use") }
+                    TextButton(onClick = o.choose, modifier = Modifier.testTag("use ${o.name}")) { Text("Use") }
                 }
             }
         }

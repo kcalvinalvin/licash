@@ -912,29 +912,27 @@ fn a_phone_whose_hubs_serve_no_tweaks_finds_its_fallback_payments_from_the_day_b
     let early = net.pay_plain(&address, 1_000, 1);
     net.mine(1, vec![early]);
     let before = net.height();
-    let late = net.pay_plain(&address, 6_000, 2);
+    let late = net.pay_plain(&address, 4_000, 2);
     net.mine(1, vec![late]);
     // Block `before` claims a time just before the day before the wallet
     // was made, the next just after.
     let claimed = light.time(before).unwrap();
     let skew = made - 86_400 - 300 - claimed;
     light.skew.store(skew, Ordering::SeqCst);
-    assert_eq!(scan(&alice, &light), (1, 6_000));
+    assert_eq!(scan(&alice, &light), (1, 4_000));
     assert_eq!(light.fetched(), [before + 1]);
-    assert_eq!(alice.balance().unwrap().onchain, 6_000);
+    assert_eq!(alice.balance().unwrap().onchain, 4_000);
     // Its first block kept as its birthday; no tweaks to look with.
     assert_eq!(alice.birthday(), Some(before + 1));
     assert!(!alice.scan(light.clone()).unwrap().tweaks);
 
-    // Moved to notes, more than the hub takes at once: the change found.
-    let moving = alice.move_to_licash(light.clone()).unwrap();
+    // Moved to notes, whole and alone: no change.
+    alice.move_to_licash(light.clone()).unwrap();
     let sent = net.sent();
-    let outputs: u64 = sent[0].output.iter().map(|o| o.value.to_sat()).sum();
-    let change = outputs - (moving.amount + moving.fee);
-    assert!(change > 0);
+    assert_eq!((sent[0].input.len(), sent[0].output.len()), (1, 1));
     net.confirm_sent();
-    assert_eq!(scan(&alice, &light), (1, change));
-    assert_eq!(alice.balance().unwrap().onchain, change);
+    assert_eq!(scan(&alice, &light), (0, 0));
+    assert_eq!(alice.balance().unwrap().onchain, 0);
 }
 
 #[test]

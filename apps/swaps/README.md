@@ -88,7 +88,10 @@ certificate), the provider also pays Lightning invoices from that LND node,
 for clients' locks at any of its hubs (`POST /v1/swaps/lightning`). A client
 locks the invoice's amount and the fee (`--ln-fee-base`, 2 sat, and
 `--ln-fee-ppm`, 5000, routing fees included) to the provider under the
-invoice's hash; the provider pays invoices up to `--ln-max` sat along routes
+invoice's hash; the provider pays invoices up to `--ln-max` sat, and no more
+than its node's channels pay now with the fee (all of them together, which
+reserves and routes may cut further; nothing while the node does not
+answer), as `/v1/swaps/info` says, along routes
 whose timelock ends `--ln-slack` blocks (80 by default, 18 at least) before
 that lock expires, and claims the lock with the preimage the payment buys.
 The slack is the provider's time to learn the preimage, on Bitcoin if a

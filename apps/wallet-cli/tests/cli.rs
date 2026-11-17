@@ -1712,8 +1712,15 @@ fn coins_paid_on_bitcoin_are_found_spent_and_moved_to_notes() {
     assert_eq!(values(&scanned["found"]), [change]);
     assert_eq!(scanned["found"][0]["change"], true);
 
-    // The rest moved to notes, the deposit's fee and the hub's on top:
-    // once at depth, resume takes them.
+    // Coins are never joined: a send no one coin pays is refused.
+    failed(
+        onchain(&alice, &["send", &code, "3000"]),
+        1,
+        "coins are never joined",
+    );
+
+    // The largest coin moved to notes, whole and alone, the deposit's fee
+    // and the hub's on top: once at depth, resume takes them.
     let moved: Value =
         serde_json::from_str(&ok(onchain(&alice, &["--json", "move", "--fee-rate", "1"]))).unwrap();
     assert_eq!(moved["state"], "open");
@@ -1723,13 +1730,17 @@ fn coins_paid_on_bitcoin_are_found_spent_and_moved_to_notes() {
         .into_iter()
         .find(|t| t.compute_txid().to_string() == moved["txid"].as_str().unwrap());
     let deposit = deposit.unwrap();
-    assert_eq!((deposit.input.len(), deposit.output.len()), (2, 1));
+    assert_eq!((deposit.input.len(), deposit.output.len()), (1, 1));
     assert_eq!(deposit.output[0].value.to_sat(), amount + 100);
-    let fee = 2_500 + change - amount - 100;
+    let fee = 2_500 - amount - 100;
     let rate = bitcoin::FeeRate::from_sat_per_vb_u32(1);
     assert_eq!(fee, rate.fee_wu(deposit.weight()).unwrap().to_sat());
-    // Nothing left to move.
-    failed(onchain(&alice, &["move"]), 1, "0 available");
+    // Her change, too little to move alone, stays.
+    failed(
+        onchain(&alice, &["move"]),
+        1,
+        &format!("{change} available"),
+    );
     hub.confirm_sent();
     hub.round();
     hub.mine(1, None);
@@ -1739,8 +1750,8 @@ fn coins_paid_on_bitcoin_are_found_spent_and_moved_to_notes() {
         "received"
     );
     assert_eq!(available(&alice), (amount, 0));
-    assert_eq!(scan(&alice)["spent"].as_array().unwrap().len(), 2);
-    assert_eq!(json(&alice, &["onchain", "coins"]), serde_json::json!([]));
+    assert_eq!(scan(&alice)["spent"].as_array().unwrap().len(), 1);
+    assert_eq!(values(&json(&alice, &["onchain", "coins"])), [change]);
 }
 
 #[test]

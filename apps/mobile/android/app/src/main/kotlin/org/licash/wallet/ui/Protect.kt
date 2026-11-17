@@ -43,6 +43,7 @@ import org.licash.core.ContractInspection
 import org.licash.core.ContractState
 import org.licash.core.Recovery
 import org.licash.core.RecoveryStage
+import org.licash.core.contractChangeProblem
 import org.licash.wallet.digits
 import org.licash.wallet.sat
 import org.licash.wallet.share
@@ -333,11 +334,26 @@ internal fun ProtectSheet(q: ContractQuote, open: () -> Unit, cashOutFirst: () -
         Line("Takes", "Up to an hour, $download")
         Worth(q.mock)
         Spacer(Modifier.height(8.dp))
-        if (q.coin != null) {
-            BigButton("Protect for ${sat(q.price)}", Modifier.fillMaxWidth().testTag("protect")) { open() }
+        val coin = q.coin
+        if (coin != null) {
+            // Its coin turned whole into it and notes it covers, or refused.
+            val problem = contractChangeProblem(coin, q.price, q.cap, q.dust, q.change)
+            problem?.let {
+                Text(
+                    whyNot(it),
+                    modifier = Modifier.padding(vertical = 8.dp).testTag("contract-problem"),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.error,
+                )
+            }
+            BigButton(
+                "Protect for ${sat(q.price)}",
+                Modifier.fillMaxWidth().testTag("protect"),
+                enabled = problem == null,
+            ) { open() }
         } else {
             Say("Paid from Bitcoin you hold, and you hold too little. Cash out to yourself first, then protect.")
-            BigButton("Cash out ${sat(firstCoin(q.price))}", Modifier.fillMaxWidth().testTag("cash-out-first")) {
+            BigButton("Cash out ${sat(q.price)}", Modifier.fillMaxWidth().testTag("cash-out-first")) {
                 cashOutFirst()
             }
         }

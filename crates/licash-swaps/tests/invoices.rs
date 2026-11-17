@@ -710,3 +710,77 @@ async fn an_invoice_paid_through_a_provider_is_not_paid_through_the_hub_too() {
     }
     assert_eq!(client.locks().unwrap().len(), 1);
 }
+
+#[tokio::test]
+async fn the_provider_pays_no_more_than_its_channels_do() {
+    let eco = Eco::new().await;
+    // As the operator set it, while the channels pay more.
+    assert_eq!(eco.provider().lightning_now().await, Some(terms(&eco.node)));
+    // 988 and the fee of 2 and 1% on it pay 1,000, all the channels hold.
+    eco.node.channels(1_000, 0);
+    let now = eco.provider().lightning_now().await.unwrap();
+    assert_eq!(now.max, 988);
+    assert_eq!(now.pays(988_000), 1_000);
+    assert_eq!(
+        eco.provider().info().unwrap().lightning,
+        Some(terms(&eco.node))
+    );
+
+    // One more is declined before the node is asked, nothing recorded.
+    let expiry = eco.height() + 100;
+    let (request, lock) = eco.lock(989, [4; 32], Outcome::Hang, expiry).await;
+    let problem = eco
+        .provider()
+        .take_invoice(&eco.request(&lock, &request))
+        .await
+        .unwrap_err();
+    assert_eq!(problem.code, Code::Declined);
+    assert!(problem.message.contains("channels"), "{}", problem.message);
+    assert!(eco.node.sent().is_empty());
+    assert!(eco.provider().records(1).unwrap().is_empty());
+    // As much is paid.
+    let (request, lock) = eco.lock(988, [5; 32], Outcome::Hang, expiry).await;
+    let answer = eco
+        .provider()
+        .take_invoice(&eco.request(&lock, &request))
+        .await
+        .unwrap();
+    assert_eq!(answer.state, State::Accepted);
+    assert_eq!(eco.node.sent().len(), 1);
+
+    // A node not answering pays nothing, as far as clients are told.
+    eco.node.down(true);
+    assert_eq!(eco.provider().lightning_now().await.unwrap().max, 0);
+}
+
+#[tokio::test]
+async fn an_invoice_under_way_for_one_lock_is_not_paid_for_another() {
+    let eco = Eco::new().await;
+    let preimage = [6; 32];
+    let expiry = eco.height() + 100;
+    let (request, first) = eco.lock(500, preimage, Outcome::Hang, expiry).await;
+    let answer = eco
+        .provider()
+        .take_invoice(&eco.request(&first, &request))
+        .await
+        .unwrap();
+    assert_eq!(answer.state, State::Accepted);
+    // Another lock of the client's, under the same hash, for the same
+    // invoice: declined before the node is asked to pay it again.
+    let address = eco.provider().wallet().address();
+    let pays = terms(&eco.node).pays(500_000);
+    let second = eco
+        .client
+        .lock(A, &address, pays, lock_hash(&preimage), Some(expiry))
+        .await
+        .unwrap();
+    assert_ne!(second.id, first.id);
+    let problem = eco
+        .provider()
+        .take_invoice(&eco.request(&second, &request))
+        .await
+        .unwrap_err();
+    assert_eq!(problem.code, Code::Declined);
+    assert_eq!(eco.node.sent().len(), 1);
+    assert_eq!(eco.provider().records(2).unwrap().len(), 1);
+}

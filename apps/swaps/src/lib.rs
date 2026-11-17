@@ -228,6 +228,8 @@ async fn info<T: Transport + 'static, C>(State(served): Shared<T, C>) -> Answer<
     if served.chain.is_none() {
         info.chain = None;
     }
+    // Up to what its node's channels pay now.
+    info.lightning = served.provider.lightning_now().await;
     info.nostr = served.nostr.clone();
     Ok(Json(info))
 }

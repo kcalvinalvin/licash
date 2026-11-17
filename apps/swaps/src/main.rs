@@ -379,7 +379,8 @@ struct LightningArgs {
     #[arg(long, env = "LICASH_SWAPS_LN_FEE_PPM", default_value_t = 5000,
           value_parser = clap::value_parser!(u64).range(0..=1_000_000))]
     ln_fee_ppm: u64,
-    /// The largest invoice paid, in satoshis.
+    /// The largest invoice paid, in satoshis: less while the node's
+    /// channels pay less, with the fee.
     #[arg(long, env = "LICASH_SWAPS_LN_MAX", default_value_t = 1_000_000)]
     ln_max: u64,
     /// Blocks between the end of a payment's route timelock and the expiry

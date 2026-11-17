@@ -144,7 +144,9 @@ pub async fn open(
         cap: asked.cap,
         deposit: asked.coin,
     };
-    let (dir, change) = (dir(path), holder::Change::Bitcoin);
+    // Her coin turned whole into the contract and the notes it protects:
+    // never change left on Bitcoin.
+    let (dir, change) = (dir(path), holder::Change::Notes);
     let contract = match asked.any_fees {
         true => holder::open_anyway(wallet, &chain, dir, hub, ask, change).await,
         false => holder::open_with(wallet, &chain, dir, hub, ask, change).await,

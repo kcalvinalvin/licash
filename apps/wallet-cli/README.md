@@ -14,6 +14,12 @@ licash-wallet resume                      # after a payment ended pending
 A wallet trusts hubs of one network, `bitcoin` unless `init --network`
 names `regtest`, `signet` or `mutinynet`.
 
+`address`, `code`, `invoice` and `deposit` take `--qr` to also draw what
+they print as a QR code, black on white, for a payer's phone to scan off
+the screen. It is drawn only when stdout is a terminal and without `--json`:
+a script reading stdout gets the same text as without `--qr`. `code --qr`
+prints the code in upper case too, which the QR code holds in fewer modules.
+
 A payment is JSON that only its payee can open: hand it over by any
 channel. `send` and `resume` exit with 75 when a payment is recorded but its
 hub has not answered; `resume` finishes it. Back up the wallet file: its
@@ -58,7 +64,7 @@ A wallet file is upgraded to version 8 when first opened by this version,
 which older versions refuse: notes unlinked before begin their rest then,
 and nothing is reminted or asked of a hub by the upgrade itself.
 
-`code` prints a payment code (a BIP321 URI, `--qr` for QR codes) naming the
+`code` prints a payment code (a BIP321 URI, `--qr` for a QR code) naming the
 wallet, the hubs it is paid at and its Nostr mailbox, if they name relays.
 `pay <code> [amount]` pays it at a hub it names that the wallet trusts and
 holds enough at, and is done once the hub releases the payment: the hub
@@ -134,8 +140,11 @@ paid only, looking in them again for silent payments once a hub serves
 their tweaks; with no such hub, the first scan needs `--from <height>`.
 `onchain coins`
 lists the coins, `onchain send <to> <amount>` pays an address, a silent
-payment address or a code on Bitcoin, and `onchain move` deposits the coins
-for notes at a hub taking deposits.
+payment address or a code on Bitcoin, and `onchain move` deposits a coin
+for notes at a hub taking deposits. Coins are never joined: a send spends
+one coin alone (`--coin TXID:VOUT`, by default the largest, `--all` all of
+it), and a move deposits one coin whole, leaving no change (`--coin`, by
+default the largest), refused if the hub takes less than all of it.
 
 A broadcast error can follow successful relay. The signed transaction and
 its inputs stay reserved, and `onchain scan` rebroadcasts that same spend.
@@ -172,10 +181,14 @@ claims: run it until the payout is done.
 `open-contract <hub> --chain <url>` opens a recovery contract at a hub the
 wallet trusts that opens them: its collateral protects the wallet's notes
 there, up to its cap, until the contract's deadline. The wallet pays the
-hub's price from its smallest coin on Bitcoin that covers it, its change
-back to the wallet, and downloads about 100 MB of instances, kept in
-`contracts/` next to the wallet file with `contracts.sqlite`: back them
-up with it. `--blocks` sets the blocks to its close (by default the most
+hub's price from its smallest coin on Bitcoin that covers it, turned whole
+into the contract and notes: its change, if any, becomes notes at the hub
+in the contract's own funding, never left on Bitcoin. The opening is refused
+if the change is more than the contract protects or the hub would not take
+it as a deposit then (choose another coin with `--coin`, or another cap);
+change too small to be an output goes to the fee. It downloads about
+100 MB of instances, kept in `contracts/` next to the wallet file with
+`contracts.sqlite`: back them up with it. `--blocks` sets the blocks to its close (by default the most
 the hub allows), `--max-price` the most to pay (by default the price the
 hub's info says). At a hub that lets wallets choose (its info names a
 range), `--cap` with `--blocks` sets the most the contract protects, at the

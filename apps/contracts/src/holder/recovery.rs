@@ -775,7 +775,7 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
             .checked_sub(r_total)
             .context("R creates money")?;
         let bytes = filing.to_bytes();
-        let mut inputs = vec![
+        let base = vec![
             (
                 OutPoint {
                     txid: r.compute_txid(),
@@ -791,11 +791,17 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
                 anchor,
             ),
         ];
-        for coin in super::coins(self.wallet, self.dir)? {
+        // One coin of hers alone, the smallest that pays: coins are never
+        // joined, not to tie them together on Bitcoin.
+        let mut coins = super::coins(self.wallet, self.dir)?;
+        coins.reverse();
+        let most = coins.last().map_or(0, |c| c.value);
+        for coin in coins {
             let output = self
                 .wallet
                 .silent_coin_output(&coin.outpoint)?
                 .context("unknown fee coin")?;
+            let mut inputs = base.clone();
             inputs.push((coin.outpoint, output));
             let prevouts: Vec<_> = inputs.iter().map(|(_, out)| out.clone()).collect();
             let total: Amount = prevouts.iter().map(|out| out.value).sum();
@@ -844,7 +850,10 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
             p.input[0].witness = final_carrier.input[0].witness.clone();
             return Ok((p, prevouts));
         }
-        bail!("too little of hers on Bitcoin to pay her request's fees")
+        bail!(
+            "too little of hers on Bitcoin to pay her request's fees: \
+             sats needed in one coin, her largest {most} sat"
+        )
     }
     fn sign(&self, state: &mut State) -> Result<Next> {
         let mut p = state.p.clone().context("no publication transaction")?;

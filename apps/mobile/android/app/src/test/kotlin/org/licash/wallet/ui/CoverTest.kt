@@ -163,8 +163,7 @@ class CoverTest {
     }
 
     @Test
-    fun the_coin_to_cash_out_first_pays_the_price_and_leaves_change() {
-        assertEquals(33_000uL, firstCoin(23_000uL))
+    fun a_payment_link_says_its_amount_in_bitcoin() {
         assertEquals("0.00033000", btc(33_000uL))
         assertEquals("1.00000001", btc(100_000_001uL))
     }

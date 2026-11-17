@@ -243,6 +243,80 @@ pub fn contract_max_cap(range: ContractRange, coin: u64) -> Option<u64> {
     range.api().max_cap_for(coin).map(u64::from)
 }
 
+/// What is left of a coin paying for a contract, its change, that its hub
+/// takes into notes in the contract's funding, in sat: a coin turns whole
+/// into a contract and the notes it protects, never leaving change on
+/// Bitcoin ([`contract_change_problem`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct ChangeRange {
+    pub least: u64,
+    pub most: u64,
+}
+
+impl ChangeRange {
+    /// What a hub offering `deposits` takes so: none unless it leaves the
+    /// time to pay one in a contract's funding.
+    pub(crate) fn of(deposits: &licash_api::Deposits) -> Option<Self> {
+        if deposits.window < 2 * licash_contracts::holder::DEPOSIT_MARGIN {
+            return None;
+        }
+        Some(Self {
+            least: deposits.pays(deposits.min)?,
+            most: deposits.pays(deposits.max)?,
+        })
+    }
+}
+
+/// Why a coin cannot pay for a contract, turned whole into it and notes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum ChangeProblem {
+    /// It holds less than the price.
+    Short { needed: u64 },
+    /// Its change is more than the contract protects: notes unprotected.
+    Uncovered { change: u64 },
+    /// Its hub takes no change into notes.
+    NotTaken { change: u64 },
+    /// Its change is less than its hub takes into notes.
+    TooLittle { change: u64, least: u64 },
+    /// Its change is more than its hub takes into notes at once.
+    TooMuch { change: u64, most: u64 },
+}
+
+/// Why a coin of `coin` sat cannot pay `price` for a contract protecting
+/// up to `cap` sat, its change turned into notes as `change` lets, at a
+/// hub whose contracts' outputs are at least `dust` sat (change under it
+/// goes to the funding's fee): none if it can.
+#[uniffi::export]
+pub fn contract_change_problem(
+    coin: u64,
+    price: u64,
+    cap: u64,
+    dust: u64,
+    change: Option<ChangeRange>,
+) -> Option<ChangeProblem> {
+    let Some(left) = coin.checked_sub(price) else {
+        return Some(ChangeProblem::Short { needed: price });
+    };
+    if left < dust {
+        return None;
+    }
+    if left > cap {
+        return Some(ChangeProblem::Uncovered { change: left });
+    }
+    match change {
+        None => Some(ChangeProblem::NotTaken { change: left }),
+        Some(r) if left < r.least => Some(ChangeProblem::TooLittle {
+            change: left,
+            least: r.least,
+        }),
+        Some(r) if left > r.most => Some(ChangeProblem::TooMuch {
+            change: left,
+            most: r.most,
+        }),
+        Some(_) => None,
+    }
+}
+
 /// A fee, in sat: `base` plus `ppm` millionths of what it is on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct Rate {
@@ -531,6 +605,12 @@ pub struct ContractQuote {
     /// again to receive, over half a year. The fixed terms without one.
     pub suggested_cap: u64,
     pub suggested_blocks: u32,
+    /// The least an output of its funding holds: change less than this
+    /// goes to its fee.
+    pub dust: u64,
+    /// The change of its coin the hub takes into notes: none if it takes
+    /// none ([`contract_change_problem`]).
+    pub change: Option<ChangeRange>,
 }
 
 /// A coin of the wallet's on Bitcoin.

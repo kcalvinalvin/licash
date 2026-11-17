@@ -202,3 +202,57 @@ async fn a_relay_down_is_skipped_while_another_answers() {
         .await
         .is_err());
 }
+
+#[tokio::test]
+async fn a_watch_is_pushed_each_provider_announced_once_looked_at() {
+    use licash_nostr::watch::Watch;
+    let relay = MockRelay::run().await.unwrap();
+    let relays = [relay.url().await.to_string()];
+    let first = Announcer::new(&[7; 32], Role::Swaps, &relays, &Route::Direct)
+        .await
+        .unwrap();
+    first
+        .announce(&announcement("https://one.example", "regtest"))
+        .await
+        .unwrap();
+    let watch = Watch::open(&relays, &Route::Direct, Role::Swaps, "regtest")
+        .await
+        .unwrap();
+    assert!(watch.is(&relays, Role::Swaps, "regtest"));
+    assert!(!watch.is(&relays, Role::Hub, "regtest"));
+    // Nothing kept until looked at; then what the relay holds.
+    assert!(watch.kept().is_empty());
+    let found = watch.found().await.unwrap();
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].key, first.key());
+
+    // Announced since: pushed, kept without asking.
+    let second = Announcer::new(&[8; 32], Role::Swaps, &relays, &Route::Direct)
+        .await
+        .unwrap();
+    second
+        .announce(&announcement("https://two.example", "regtest"))
+        .await
+        .unwrap();
+    // Of another network: left out.
+    let other = Announcer::new(&[9; 32], Role::Swaps, &relays, &Route::Direct)
+        .await
+        .unwrap();
+    other
+        .announce(&announcement("https://three.example", "bitcoin"))
+        .await
+        .unwrap();
+    let waited = std::time::Instant::now();
+    while watch.kept().len() < 2 && waited.elapsed() < Duration::from_secs(5) {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let kept = watch.kept();
+    assert_eq!(kept.len(), 2, "{kept:?}");
+    let mut urls: Vec<&str> = kept
+        .iter()
+        .map(|f| f.announcement.urls[0].as_str())
+        .collect();
+    urls.sort_unstable();
+    assert_eq!(urls, ["https://one.example", "https://two.example"]);
+    assert_eq!(watch.found().await.unwrap(), kept);
+}

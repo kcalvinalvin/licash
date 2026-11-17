@@ -171,7 +171,7 @@ internal fun HubPage(
                     quote = null
                     scope.launch {
                         engine.bitcoinAddress().fold(
-                            { payOwn("bitcoin:$it?amount=${btc(firstCoin(q.price))}", it) },
+                            { payOwn("bitcoin:$it?amount=${btc(q.price)}", it) },
                             { fail(explain(it)) },
                         )
                     }

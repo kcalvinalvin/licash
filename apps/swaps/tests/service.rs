@@ -160,7 +160,14 @@ async fn a_provider_paying_over_lightning_says_so_and_takes_invoices_from_its_hu
     let (status, body) = call(&router, swaps::SWAPS_INFO, None).await;
     assert_eq!(status, StatusCode::OK);
     let info: swaps::Info = serde_json::from_slice(&body).unwrap();
-    assert_eq!(info.lightning, Some(terms));
+    assert_eq!(info.lightning, Some(terms.clone()));
+    // No more than its node's channels pay, its fee in it: 9,948 and 2 and
+    // 0.5% on it pay 10,000.
+    node.channels(10_000, 0);
+    let (_, body) = call(&router, swaps::SWAPS_INFO, None).await;
+    let info: swaps::Info = serde_json::from_slice(&body).unwrap();
+    let max = info.lightning.map(|l| l.max);
+    assert_eq!(max, Some(9_948));
 
     // From a hub it does not know.
     let id = licash::spend::ProposalId::from_bytes([1; 32]);

@@ -102,6 +102,13 @@ pub(super) struct Listed {
 /// ([`Store::charging`]): kept with each that starts.
 pub(super) struct Store(Connection, Option<Fees>, PathBuf);
 
+/// Every opening, as [`Store::listed`] reads them: unsorted, as sorting
+/// their states in SQLite spills them to a temporary file, past what a
+/// small `/tmp` holds ("database or disk is full").
+const LISTED: &str =
+    "SELECT id, format, phase, mock, irrevocable, abandoned, created_at, updated_at, state, rowid
+     FROM openings";
+
 impl Store {
     /// How many openings in `dir` the hub signed and did not give up,
     /// read only: none if no opening was ever stored there.
@@ -133,12 +140,10 @@ impl Store {
             1 => {}
             v => bail!("openings.sqlite is of version {v}, newer than this hub knows"),
         }
-        let mut stmt = c.prepare(
-            "SELECT id, format, phase, mock, irrevocable, abandoned, created_at, updated_at, state
-             FROM openings ORDER BY created_at, rowid",
-        )?;
+        let mut stmt = c.prepare(LISTED)?;
         let rows = stmt.query_map([], |r| {
-            Ok(Listed {
+            let at: (i64, i64) = (r.get(6)?, r.get(9)?);
+            let listed = Listed {
                 id: r.get(0)?,
                 format: r.get(1)?,
                 phase: r.get(2)?,
@@ -148,9 +153,13 @@ impl Store {
                 created_at: r.get(6)?,
                 updated_at: r.get(7)?,
                 state: r.get(8)?,
-            })
+            };
+            Ok((at, listed))
         })?;
-        Ok(rows.collect::<Result<_, _>>()?)
+        let mut rows = rows.collect::<Result<Vec<_>, _>>()?;
+        // Oldest first, sorted here, in memory with them all.
+        rows.sort_by_key(|(at, _)| *at);
+        Ok(rows.into_iter().map(|(_, listed)| listed).collect())
     }
 
     pub fn open(dir: &Path) -> Result<Self> {
@@ -533,6 +542,41 @@ mod tests {
         let store = Store::open(data.path())?;
         ensure!(store.fee_coin(&[1; 32], "default")? == Some(coin(7)));
         ensure!(store.signed_ids()? == vec![[2; 32]]);
+        Ok(())
+    }
+
+    #[test]
+    fn openings_are_listed_oldest_first_without_sorting_their_states_on_disk() -> Result<()> {
+        let data = tempfile::tempdir()?;
+        let store = Store::open(data.path())?;
+        let deposit = |n| OutPoint {
+            txid: bitcoin::hashes::Hash::from_byte_array([n; 32]),
+            vout: 0,
+        };
+        for n in [3, 1, 2] {
+            ensure!(store.insert(&[n; 32], 0, true, &deposit(n), &[0; 32], b"state")?);
+        }
+        // The second made first, the first last; the third as made.
+        let at = |n: u8, t: i64| {
+            store.0.execute(
+                "UPDATE openings SET created_at = ?2 WHERE id = ?1",
+                params![[n; 32], t],
+            )
+        };
+        at(1, 30)?;
+        at(2, 10)?;
+        at(3, 10)?;
+        let listed = Store::listed(data.path())?;
+        let ids: Vec<[u8; 32]> = listed.iter().map(|l| l.id).collect();
+        ensure!(ids == [[3; 32], [2; 32], [1; 32]], "{ids:?}");
+        // SQLite sorts none of it: no temporary B-tree, which large states
+        // spill to a file in /tmp.
+        let plan: Vec<String> = store
+            .0
+            .prepare(&format!("EXPLAIN QUERY PLAN {LISTED}"))?
+            .query_map([], |r| r.get(3))?
+            .collect::<rusqlite::Result<_>>()?;
+        ensure!(plan.iter().all(|p| !p.contains("TEMP B-TREE")), "{plan:?}");
         Ok(())
     }
 

@@ -5,7 +5,7 @@
 use std::{
     collections::{HashMap, HashSet},
     future::Future,
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -18,7 +18,7 @@ use licash_wallet::{
     SwapState, Transport, ViaQuote, Wallet,
 };
 
-use crate::{mailbox, Found, Role, Route, LIFETIME};
+use crate::{mailbox, watch::Watch, Found, Role, Route, LIFETIME};
 
 /// How long a swap provider announced has to answer at a URL.
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(30);
@@ -36,10 +36,14 @@ const KEPT_FOR: Duration = Duration::from_secs(30 * 60);
 /// did: one never refreshed keeps none, each quote looking. Each provider
 /// is asked first at the URL it last answered at, for half an hour after,
 /// while it still announces it: one of its URLs down (say, an onion
-/// service not opening) is not waited on again for each quote.
+/// service not opening) is not waited on again for each quote. The relays
+/// stay connected between refreshes, pushing each provider announced
+/// since as it is ([`Watch`]).
 #[derive(Default)]
 pub struct Announcements {
     kept: Mutex<Option<Kept>>,
+    /// The relays watched for providers, once refreshed.
+    watch: Mutex<Option<Arc<Watch>>>,
     /// By the key that announced it, the URL each provider last answered
     /// at as that key, and since when.
     answered: Mutex<HashMap<String, (String, Instant)>>,
@@ -71,11 +75,22 @@ impl Announcements {
         route: &Route,
         network: &str,
     ) -> anyhow::Result<usize> {
-        let found = crate::discover(relays, route, Role::Swaps, network).await?;
+        let relays = set_of(relays);
+        let kept = (self.watch.lock().unwrap_or_else(|e| e.into_inner()).clone())
+            .filter(|w| w.is(&relays, Role::Swaps, network));
+        let watch = match kept {
+            Some(watch) => watch,
+            None => {
+                let watch = Arc::new(Watch::open(&relays, route, Role::Swaps, network).await?);
+                *self.watch.lock().unwrap_or_else(|e| e.into_inner()) = Some(watch.clone());
+                watch
+            }
+        };
+        let found = watch.found().await?;
         let count = found.len();
         let kept = Kept {
             found,
-            relays: set_of(relays),
+            relays,
             network: network.to_owned(),
             at: Instant::now(),
         };
@@ -92,11 +107,15 @@ impl Announcements {
         {
             return None;
         }
+        // What the relays watched pushed since, too.
+        let watched = (self.watch.lock().unwrap_or_else(|e| e.into_inner()).clone())
+            .filter(|w| w.is(&kept.relays, Role::Swaps, network))
+            .map(|w| w.kept());
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let found: Vec<Found> = (kept.found.iter())
+        let found: Vec<Found> = (watched.as_ref().unwrap_or(&kept.found).iter())
             .filter(|f| f.at.saturating_add(LIFETIME.as_secs()) > now)
             .cloned()
             .collect();

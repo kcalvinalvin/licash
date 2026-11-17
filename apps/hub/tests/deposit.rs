@@ -1127,7 +1127,7 @@ fn fee_of(tx: &Transaction, paid: u64) -> u64 {
 }
 
 #[tokio::test]
-async fn silent_payment_coins_are_deposited_whole_up_to_the_most_a_hub_takes() {
+async fn a_silent_payment_coin_is_deposited_whole_and_alone_or_not_at_all() {
     use licash_hub_service::tweaks::{step, Tweaks};
     let net = Net::new().await;
     let index = Arc::new(Tweaks::open(&net.dir.path().join("tweaks.sqlite")).unwrap());
@@ -1161,37 +1161,48 @@ async fn silent_payment_coins_are_deposited_whole_up_to_the_most_a_hub_takes() {
         e => panic!("{e:?}"),
     };
 
-    // Nothing to deposit, or too little for the least the hub takes: no
-    // deposit asked.
-    let none = alice.deposit_silent(HUB, rate).await.unwrap_err();
-    let (needed, held) = insufficient(none);
-    assert_eq!(held, 0);
-    assert!(needed > 1_100, "{needed}");
+    let invalid = |e: licash_wallet::Error| match e {
+        licash_wallet::Error::Invalid(reason) => reason,
+        e => panic!("{e:?}"),
+    };
+    let coin = |value: u64| {
+        let coins = alice.silent_coins().unwrap();
+        coins.iter().find(|c| c.value == value).unwrap().outpoint
+    };
+
+    // No coin of the wallet's, or too little for the least the hub takes:
+    // no deposit asked.
+    let none = OutPoint::new(Txid::from_byte_array([0; 32]), 0);
+    let reason = invalid(alice.deposit_silent(HUB, none, rate).await.unwrap_err());
+    assert!(reason.contains("no free coin"), "{reason}");
     paid(1_000, 2);
     assert_eq!(scan().await.found.len(), 1);
-    let (needed, held) = insufficient(alice.deposit_silent(HUB, rate).await.unwrap_err());
+    let small = alice.deposit_silent(HUB, coin(1_000), rate).await;
+    let (needed, held) = insufficient(small.unwrap_err());
     assert_eq!(held, 1_000);
     assert!(needed > 1_100, "{needed}");
     assert!(alice.deposits().unwrap().is_empty());
 
-    // Enough with another coin: both deposited, all of them but the fee.
+    // Enough in another coin: it alone deposited, whole, never joined with
+    // the first.
     paid(2_600, 3);
     assert_eq!(scan().await.found.len(), 1);
-    let (deposit, tx) = alice.deposit_silent(HUB, rate).await.unwrap();
+    let (deposit, tx) = alice.deposit_silent(HUB, coin(2_600), rate).await.unwrap();
     let terms = deposit.terms.clone().unwrap();
     assert_eq!(deposit.state, DepositState::Open);
     assert_eq!(terms.pays, deposit.amount + 100);
-    assert_eq!((tx.input.len(), tx.output.len()), (2, 1));
+    assert_eq!((tx.input.len(), tx.output.len()), (1, 1));
+    assert_eq!(tx.input[0].previous_output, coin(2_600));
     let address: Address<_> = terms.address.parse().unwrap();
     assert_eq!(
         tx.output[0].script_pubkey,
         address.assume_checked().script_pubkey()
     );
     assert_eq!(tx.output[0].value.to_sat(), terms.pays);
-    assert_eq!(fee_of(&tx, 3_600), tx.vsize() as u64);
-    // Its coins taken: nothing more to deposit.
-    let (_, held) = insufficient(alice.deposit_silent(HUB, rate).await.unwrap_err());
-    assert_eq!(held, 0);
+    assert_eq!(fee_of(&tx, 2_600), tx.vsize() as u64);
+    // Being spent: not to deposit again.
+    let again = alice.deposit_silent(HUB, coin(2_600), rate).await;
+    assert!(invalid(again.unwrap_err()).contains("no free coin"));
     assert_eq!(alice.deposits().unwrap().len(), 1);
 
     // Broadcast, confirmed at depth: the notes.
@@ -1208,85 +1219,20 @@ async fn silent_payment_coins_are_deposited_whole_up_to_the_most_a_hub_takes() {
     let receipts = alice.receipts().unwrap();
     assert_eq!(received.lock.as_ref(), Some(&receipts[0].id));
     let scanned = scan().await;
-    assert_eq!(scanned.spent.len(), 2);
-    assert!(alice.silent_coins().unwrap().is_empty());
+    assert_eq!(scanned.spent.len(), 1);
+    let left = alice.silent_coins().unwrap();
+    assert_eq!(left.len(), 1);
+    assert!(left[0].value == 1_000 && left[0].spending.is_none());
 
-    // More than the hub takes: its most, the rest back as change.
+    // More than the hub takes at once: refused, rather than change left.
     paid(10_000, 4);
     scan().await;
-    let (most, tx) = alice.deposit_silent(HUB, rate).await.unwrap();
-    assert_eq!((most.amount, most.terms.unwrap().pays), (4_000, 4_100));
-    assert_eq!(tx.output.len(), 2);
-    let change: u64 = tx.output.iter().map(|o| o.value.to_sat()).sum::<u64>() - 4_100;
-    net.backend.lock().unwrap().mempool.push(tx.clone());
-    net.confirm_sent();
-    scan().await;
+    let most = alice.deposit_silent(HUB, coin(10_000), rate).await;
+    let reason = invalid(most.unwrap_err());
+    assert!(reason.contains("more than"), "{reason}");
+    assert_eq!(alice.deposits().unwrap().len(), 1);
     let coins = alice.silent_coins().unwrap();
-    assert_eq!(coins.len(), 1);
-    assert!(coins[0].change && coins[0].spending.is_none());
-    assert_eq!(coins[0].value, change);
-    assert_eq!(fee_of(&tx, 10_000), 10_000 - 4_100 - change);
-}
-
-#[tokio::test]
-async fn coins_a_wallet_keeps_stay_out_of_its_deposits() {
-    use licash_hub_service::tweaks::{step, Tweaks};
-    let net = Net::new().await;
-    let index = Arc::new(Tweaks::open(&net.dir.path().join("tweaks.sqlite")).unwrap());
-    step(&index, &net.source, None).await.unwrap();
-    let services = Services {
-        deposits: Some(net.deposits.clone()),
-        tweaks: Some(index.clone()),
-        ..Default::default()
-    };
-    let app = licash_hub_service::router(net.hub.clone(), services);
-    let path = net.dir.path().join("alice.sqlite");
-    let network = ChainProfile::Core30DefaultRegtest;
-    let alice = Wallet::create(&path, &[1; 32], network, Local(app)).unwrap();
-    alice.add_hub(HUB).await.unwrap();
-    alice
-        .watch_silent(HUB, index.first().unwrap().unwrap())
-        .unwrap();
-    let to = alice.silent_keys().address();
-    let rate = FeeRate::from_sat_per_vb_u32(1);
-    let light = Light(net.backend.clone());
-    for (value, n) in [(2_000, 2), (3_000, 3)] {
-        let payment = pay_silent(&net, &to, value, n);
-        net.mine(1, vec![payment]);
-    }
-    step(&index, &net.source, None).await.unwrap();
-    alice.scan_silent(HUB, &light, u32::MAX).await.unwrap();
-    let coins = alice.silent_coins().unwrap();
-    assert_eq!(coins.len(), 2);
-    let kept = coins.iter().find(|c| c.value == 3_000).unwrap().outpoint;
-
-    // All kept: nothing to deposit.
-    let both = [
-        kept,
-        coins.iter().find(|c| c.value == 2_000).unwrap().outpoint,
-    ];
-    let none = alice.deposit_silent_keeping(HUB, rate, &both).await;
-    match none.unwrap_err() {
-        licash_wallet::Error::Insufficient { available, .. } => assert_eq!(available, 0),
-        e => panic!("{e:?}"),
-    }
-    assert!(alice.deposits().unwrap().is_empty());
-
-    // One kept: the other alone deposited, the kept one left free.
-    let (deposit, tx) = alice
-        .deposit_silent_keeping(HUB, rate, &[kept])
-        .await
-        .unwrap();
-    assert_eq!(tx.input.len(), 1);
-    assert_ne!(tx.input[0].previous_output, kept);
-    assert_eq!(fee_of(&tx, 2_000), tx.vsize() as u64);
-    assert_eq!(deposit.terms.unwrap().pays, tx.output[0].value.to_sat());
-    let coins = alice.silent_coins().unwrap();
-    let left = coins.iter().find(|c| c.outpoint == kept).unwrap();
-    assert!(left.spending.is_none());
-    // Not kept any more: deposited too.
-    let (_, tx) = alice.deposit_silent(HUB, rate).await.unwrap();
-    assert_eq!(tx.input[0].previous_output, kept);
+    assert!(coins.iter().all(|c| c.spending.is_none()));
 }
 
 /// The hub behind a front refusing what is posted while `.1` is set, with
@@ -1343,8 +1289,9 @@ async fn a_deposit_its_hub_never_answered_is_abandoned_and_a_silent_one_never_ke
 
     // Its coins never asked a deposit the hub answered: none kept, however
     // often asked, and the coins free.
+    let coin = found.found[0].outpoint;
     for _ in 0..3 {
-        let unanswered = alice.deposit_silent(HUB, rate).await.unwrap_err();
+        let unanswered = alice.deposit_silent(HUB, coin, rate).await.unwrap_err();
         assert!(
             matches!(unanswered, Error::Unavailable { .. }),
             "{unanswered:?}"
@@ -1376,7 +1323,7 @@ async fn a_deposit_its_hub_never_answered_is_abandoned_and_a_silent_one_never_ke
 
     // Answered: kept with its terms, its coins spent on it, and not to be
     // given up.
-    let (deposit, tx) = alice.deposit_silent(HUB, rate).await.unwrap();
+    let (deposit, tx) = alice.deposit_silent(HUB, coin, rate).await.unwrap();
     assert_eq!(deposit.state, DepositState::Open);
     assert_eq!(deposit.terms.as_ref().unwrap().pays, deposit.amount + 100);
     assert_eq!(fee_of(&tx, 3_000), tx.vsize() as u64);
