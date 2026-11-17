@@ -723,7 +723,8 @@ async fn cashed_out(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
 /// with no coin on Bitcoin to pay its price, notes cashed out to itself
 /// for it first, as the quote offers; then of the cap and length it
 /// chooses, signed, confirmed and protecting its cap of the notes there,
-/// on credit no longer. Its price paid, its change kept on Bitcoin. Ending it, it is told to cash out
+/// on credit no longer. Its price paid of a coin turned whole into it,
+/// none left as change on Bitcoin. Ending it, it is told to cash out
 /// instead.
 async fn contracted(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     /// The most keeping its notes few costs while it is set up, in sat.
@@ -767,7 +768,8 @@ async fn contracted(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     phone.tagged("worth", MOCK, 10).await?;
     phone.tap_id("cash-out-first").await?;
     phone.tagged("to", "This wallet", 120).await?;
-    phone.tagged("paying", "33,000 sat", 10).await?;
+    // The price exactly: a coin to turn whole into it, no change.
+    phone.tagged("paying", "23,000 sat", 10).await?;
     reviewed(phone, 10).await?;
     phone.tap_id("confirm").await?;
     phone.tagged("result", "Sending", 60).await?;
@@ -780,20 +782,21 @@ async fn contracted(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     })
     .await?;
     let coin = amount(&coin.text);
+    ensure!(coin == FIXED, "a coin of {coin} cashed out for {FIXED}");
     phone.back_to("onchain").await?;
     let credit = amount(&phone.by_id("credit", 10).await?.text);
     phone.back_to("receive").await?;
     let before = phone.balance().await?;
     eprintln!("a coin of {coin} kept, {before} held, {credit} on credit");
 
-    // Paid from it now, its change back, of terms chosen within hub1's
-    // range: at first a cap of half again the coin, over the longest hub1
-    // allows, priced as hub1 prices them as they change.
+    // Paid from it now, of terms chosen within hub1's range: at first a
+    // cap of half again the coin, over the longest hub1 allows, priced as
+    // hub1 prices them as they change.
     at_hub(phone, eco.hub(1)).await?;
     phone.tap_id("open-contract").await?;
     let cap = amount(&phone.by_id("quote-cap", 60).await?.text);
     ensure!(cap == coin + coin / 2, "a cap of {cap} offered on {coin}");
-    let costs = |blocks: u32| async move {
+    let costs = |cap: u64, blocks: u32| async move {
         let want = price(cap, blocks);
         until(&format!("{want} for {blocks} blocks"), 10, || async {
             let views = phone.views().await?;
@@ -802,14 +805,27 @@ async fn contracted(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
         })
         .await
     };
-    costs(1_000).await?;
+    costs(cap, 1_000).await?;
     // Its shortest costs less, at once; the longest again, to protect.
     phone.slide_id("contract-blocks", 0.0).await?;
-    costs(200).await?;
+    costs(cap, 200).await?;
     phone.slide_id("contract-blocks", 1.0).await?;
-    costs(1_000).await?;
+    costs(cap, 1_000).await?;
+    ensure!(
+        price(cap, 1_000) > price(cap, 200),
+        "the longest costs more"
+    );
+    // So large a cap costs more than the coin holds: refused, said why.
+    ensure!(price(cap, 1_000) > coin, "{cap} costs no more than {coin}");
+    phone.by_id("contract-problem", 10).await?;
+    // The least, the coin's price exactly: it turns whole into it.
+    phone.slide_id("contract-cap", 0.0).await?;
+    phone.tagged("quote-cap", "4,096 sat", 10).await?;
+    let cap = 4_096;
+    costs(cap, 1_000).await?;
     let paid = price(cap, 1_000);
-    ensure!(paid > price(cap, 200) && paid > FIXED, "{paid} for {cap}");
+    ensure!(paid == coin, "{paid} for {cap} of a coin of {coin}");
+    phone.gone("contract-problem", 10).await?;
     phone.tagged("worth", MOCK, 10).await?;
     phone.tap_id("protect").await?;
     // Being set up: said at once, then the step it is at.
@@ -843,20 +859,16 @@ async fn contracted(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     phone.scroll_to_id("close-contract").await?;
     phone.back_to("onchain").await?;
 
-    // Its cap of the notes protected, past what is on Bitcoin, which is.
+    // Its cap of the notes protected; nothing left on Bitcoin, its coin
+    // turned whole into it.
     until("its cap protected", 30, || async {
         let views = phone.views().await?;
         let of = |id: &str| views.iter().find(|v| v.id == id).map(|v| amount(&v.text));
         let (protected, onchain) = (of("protected"), of("onchain"));
-        Ok((protected.is_some() && protected == onchain.map(|o| o + cap)).then_some(()))
+        Ok((protected == Some(cap) && onchain == Some(0)).then_some(()))
     })
     .await?;
     let now = amount(&phone.by_id("credit", 10).await?.text);
-    phone.tap_id("onchain").await?;
-    // Less than hub1 takes, its change stays on Bitcoin, moved in or not.
-    let change = amount(&phone.by_id("kept", 30).await?.text);
-    ensure!(change + paid == coin, "{change} back of {coin}");
-    phone.back_to("onchain").await?;
     phone.back_to("receive").await?;
     let after = phone.balance().await?;
     // Less its price, and what keeping its notes few may have cost meanwhile
