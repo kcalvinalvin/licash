@@ -20,9 +20,15 @@ use crate::{
     Transfer,
 };
 
-/// What opening a contract downloads and keeps, in bytes, about: the
-/// hub's instances its holder keeps, four of 25 MB.
-const DOWNLOAD: u64 = 100_100_000;
+/// How large an instance of a contract's opening is, about: her wallet
+/// uploads each the hub keeps.
+const INSTANCE: u64 = 25_100_000;
+
+/// What opening a contract sends, in bytes, about: the `kept` instances
+/// the hub keeps of its quote's.
+fn upload(kept: u16) -> u64 {
+    u64::from(kept) * INSTANCE
+}
 
 /// How long a contract being opened keeps its coin from moving into
 /// Licash, in seconds: the hub gives up on one idle an hour, and a coin
@@ -85,7 +91,7 @@ impl Wallet {
             protects_for: blocks.saturating_sub(after_assert),
             mock: trust.mock,
             coin: coin.map(|c| c.value),
-            download: DOWNLOAD,
+            download: upload(offer.quote.recipe.kept),
             range: terms.range.map(Into::into),
             after_assert,
             coins: coins
@@ -345,7 +351,8 @@ impl Wallet {
             .map(|t| Transfer {
                 bytes: t.bytes,
                 seconds: t.since.elapsed().as_secs(),
-                expected: DOWNLOAD,
+                // As a hub keeps on signet or mainnet, until it builds one.
+                expected: t.expected.unwrap_or(upload(10)).max(t.bytes),
             });
         Contract {
             id: hex(&c.id),
