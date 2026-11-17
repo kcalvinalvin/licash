@@ -1,17 +1,18 @@
 //! The swap provider service: a [`Provider`] behind the HTTP API of
 //! [`licash_api::swaps`], the steps that take its swaps on, the chain its
-//! payouts on Bitcoin follow, the node its Lightning payments follow, and
-//! its announcement on Nostr.
+//! payouts on Bitcoin follow, the node its Lightning payments follow, the
+//! donations it takes over LNURL-pay ([`lnurl`]), and its announcement on
+//! Nostr.
 
 pub mod dashboard;
 pub mod keeper;
 pub mod notify;
 
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use axum::{
-    extract::{rejection::JsonRejection, DefaultBodyLimit, Path, State},
-    http::StatusCode,
+    extract::{rejection::JsonRejection, DefaultBodyLimit, Path, Query, State},
+    http::{header, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -25,6 +26,7 @@ use licash_chain_client::Source;
 use licash_nostr::{Announcement, Announcer, Role, Route};
 use licash_swaps::{Chain, Provider};
 use licash_wallet::Transport;
+use serde_json::{json, Value};
 use tower_http::trace::TraceLayer;
 
 /// The largest request body: a swap request is far smaller.
@@ -123,6 +125,61 @@ fn paths<T: Transport + 'static, C: Chain + Send + 'static>(
         .route(swaps::LIGHTNING_SWAP_STATE, get(invoice_state::<T, C>))
         .with_state(Arc::new(served))
         .layer(DefaultBodyLimit::max(BODY_LIMIT))
+}
+
+/// Donations to the wallets of Licash codes over LNURL-pay (LUD-06), for
+/// `provider` taking them ([`Provider::take_donations`]), whose public URL
+/// is `base`: [`licash_swaps::DONATE`] answers the pay request of a code,
+/// [`licash_swaps::DONATE_CALLBACK`] a donation's invoice. Answered as
+/// LNURL asks, `{"status": "ERROR", "reason": ...}` when refused, to any
+/// origin.
+pub fn lnurl<T: Transport + 'static>(provider: Arc<Provider<T>>, base: String) -> Router {
+    Router::new()
+        .route(licash_swaps::DONATE, get(pay_request::<T>))
+        .route(licash_swaps::DONATE_CALLBACK, get(donate::<T>))
+        .with_state(Arc::new(Donations { provider, base }))
+}
+
+struct Donations<T: Transport> {
+    provider: Arc<Provider<T>>,
+    base: String,
+}
+
+/// An answer of LNURL: `body`, or why not.
+fn lnurl_answer(body: Result<Value, Problem>) -> Response {
+    let body = body.unwrap_or_else(|p| {
+        tracing::debug!(code = ?p.code, message = %p.message, "donation declined");
+        json!({ "status": "ERROR", "reason": p.message })
+    });
+    ([(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")], Json(body)).into_response()
+}
+
+async fn pay_request<T: Transport + 'static>(
+    State(served): State<Arc<Donations<T>>>,
+    Path(code): Path<String>,
+) -> Response {
+    let request = served.provider.donation_range(&code).map(|(min, max)| {
+        json!({
+            "tag": "payRequest",
+            "callback": format!("{}/callback", licash_swaps::donation_url(&served.base, &code)),
+            "minSendable": min * 1000,
+            "maxSendable": max * 1000,
+            "metadata": licash_swaps::METADATA,
+        })
+    });
+    lnurl_answer(request)
+}
+
+async fn donate<T: Transport + 'static>(
+    State(served): State<Arc<Donations<T>>>,
+    Path(code): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let Some(msat) = query.get("amount").and_then(|a| a.parse::<u64>().ok()) else {
+        return lnurl_answer(Err(Problem::invalid("an amount in millisatoshis")));
+    };
+    let invoice = served.provider.donate(&code, msat).await;
+    lnurl_answer(invoice.map(|pr| json!({ "pr": pr, "routes": [] })))
 }
 
 /// A [`Problem`] answered with its status.
@@ -319,6 +376,42 @@ pub async fn pay_invoices<T: Transport + 'static>(provider: Arc<Provider<T>>, ev
                 }
             }
             Err(e) => tracing::warn!("following the Lightning payments: {e}"),
+        }
+        tokio::time::sleep(every).await;
+    }
+}
+
+/// Follow the donations of `provider` every `every`, for good: pay each
+/// payee once its invoice is paid, settle or cancel, and mail the payments
+/// due to their payees' mailboxes on relays reached through `route`.
+pub async fn take_donations<T: Transport + 'static>(
+    provider: Arc<Provider<T>>,
+    route: Route,
+    every: Duration,
+) {
+    loop {
+        match provider.follow_donations().await {
+            Ok(pending) => {
+                for (hash, reason) in pending {
+                    tracing::debug!(%hash, reason, "donation pending");
+                }
+            }
+            Err(e) => tracing::warn!("following the donations: {e}"),
+        }
+        match provider.wallet().delivering() {
+            Ok(0) => {}
+            Ok(_) => {
+                let route = route.clone();
+                match licash_nostr::wallet::deliver(provider.wallet(), || Ok(route)).await {
+                    Ok(delivered) => {
+                        for (id, why) in delivered.failed {
+                            tracing::warn!(%id, why, "a payment to mail to its payee, again later");
+                        }
+                    }
+                    Err(e) => tracing::warn!("mailing payments to their payees: {e:#}"),
+                }
+            }
+            Err(e) => tracing::warn!("payments to mail: {e}"),
         }
         tokio::time::sleep(every).await;
     }

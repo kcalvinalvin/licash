@@ -448,3 +448,127 @@ async fn a_new_target_hears_of_what_the_provider_says_from_its_start_on() {
     assert_eq!(heard.len(), 1, "{heard:?}");
     assert!(heard[0].contains("as it starts"), "{}", heard[0]);
 }
+
+#[tokio::test]
+async fn donations_over_lnurl_answer_as_lnurl_asks() {
+    let dir = tempfile::tempdir().unwrap();
+    let wallet = Wallet::create(
+        &dir.path().join("wallet.sqlite"),
+        &[5; 32],
+        ChainProfile::Core30DefaultRegtest,
+        Offline,
+    )
+    .unwrap();
+    let code = a_code(&wallet);
+    let node = Arc::new(Fake::new());
+    let provider = Provider::create(&dir.path().join("swaps.sqlite"), wallet, Config::default())
+        .unwrap()
+        .take_donations(node.clone(), licash_swaps::DonationTerms::default())
+        .unwrap();
+    let router = licash_swaps_service::lnurl(Arc::new(provider), "https://swaps.test".into());
+    let ask = |path: String| {
+        let router = router.clone();
+        async move {
+            let request = Request::get(path).body(Body::empty()).unwrap();
+            let response = router.oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let origin = response.headers()["access-control-allow-origin"].clone();
+            assert_eq!(origin, "*");
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()
+        }
+    };
+    let refused = |answer: &serde_json::Value, why: &str| {
+        assert_eq!(answer["status"], "ERROR", "{answer}");
+        let reason = answer["reason"].as_str().unwrap();
+        assert!(reason.contains(why), "{reason}");
+    };
+    // Not a code.
+    let answer = ask("/v1/lnurlp/nonsense".into()).await;
+    refused(&answer, "not a Licash code");
+    let answer = ask("/v1/lnurlp/nonsense/callback?amount=100000".into()).await;
+    refused(&answer, "not a Licash code");
+    // No amount asked.
+    let answer = ask("/v1/lnurlp/nonsense/callback".into()).await;
+    refused(&answer, "millisatoshis");
+    // A code of a hub where the provider holds nothing: none taken.
+    let answer = ask(format!("/v1/lnurlp/{code}")).await;
+    refused(&answer, "holds too little");
+    let answer = ask(format!("/v1/lnurlp/{code}/callback?amount=100000")).await;
+    refused(&answer, "holds too little");
+    assert!(node.sent().is_empty());
+}
+
+/// A Licash code of `wallet`'s, paid at a hub of its own address.
+fn a_code<T: Transport>(wallet: &Wallet<T>) -> String {
+    let code = licash_wallet::LicashCode {
+        network: ChainProfile::Core30DefaultRegtest,
+        address: wallet.address(),
+        mailbox: None,
+        hubs: vec![licash_wallet::HubId::of(&wallet.address())],
+        locations: Vec::new(),
+    };
+    code.to_string()
+}
+
+#[test]
+fn donations_need_a_node_and_the_lnurl_of_a_code_is_printed() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(licash_swaps(&dir, &["init", "--network", "regtest"])
+        .status
+        .success());
+    let listen = ["--listen", "127.0.0.1:0", "--no-contracts"];
+    let out = licash_swaps(
+        &dir,
+        &[&["run", "--lnurl-url", "https://swaps.test"], &listen[..]].concat(),
+    );
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--lnd"));
+
+    // A donation under way, recorded by a provider taking them: refused
+    // without its node, before it serves.
+    let swaps = rusqlite::Connection::open(dir.path().join("data/swaps.sqlite")).unwrap();
+    swaps
+        .execute_batch(
+            "INSERT INTO donations (hash, preimage, code, sat, amount, request, state,
+                created_at, updated_at)
+             VALUES (x'01', x'02', 'licash1', 100, 98, 'lnbcrt', 'open', 0, 0);",
+        )
+        .unwrap();
+    drop(swaps);
+    let out = licash_swaps(&dir, &[&["run"], &listen[..]].concat());
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("1 donations under way: they need --lnurl-url and --lnd"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("serving at"), "{stderr}");
+
+    // The static LNURL of a code: its donation URL, in bech32.
+    let out = licash_swaps(
+        &dir,
+        &["lnurl", "--lnurl-url", "https://swaps.test/", "nonsense"],
+    );
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("a Licash code"));
+    let wallet = Wallet::create(
+        &dir.path().join("payee.sqlite"),
+        &[6; 32],
+        ChainProfile::Core30DefaultRegtest,
+        Offline,
+    )
+    .unwrap();
+    let code = a_code(&wallet);
+    let out = licash_swaps(
+        &dir,
+        &["lnurl", "--lnurl-url", "https://swaps.test/", &code],
+    );
+    assert!(out.status.success());
+    let lnurl = String::from_utf8(out.stdout).unwrap();
+    let (_, url) = bitcoin::bech32::decode(lnurl.trim()).unwrap();
+    assert_eq!(
+        String::from_utf8(url).unwrap(),
+        format!("https://swaps.test/v1/lnurlp/{code}")
+    );
+}

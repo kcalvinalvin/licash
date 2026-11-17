@@ -19,6 +19,7 @@ licash-swaps --data ./swaps run --listen 0.0.0.0:8340 --fee-ppm 2000 \
 licash-swaps --data ./swaps status
 licash-swaps --data ./swaps events --follow
 licash-swaps --data ./swaps dashboard
+licash-swaps lnurl --lnurl-url https://swaps.example CODE  # a static donation LNURL
 ```
 
 `status` shows earnings, aggregate balances, swap outcomes and losses,
@@ -100,6 +101,29 @@ count like swaps against what the contracts at the source hub protect. The
 first start under this version upgrades `swaps.sqlite` to schema 4, which
 older versions refuse; a provider with Lightning payments under way refuses
 to start without `--lnd`.
+
+With `--lnd` and `--lnurl-url URL`, the provider's public URL, it also
+takes donations to the wallets of Licash codes over LNURL-pay (LUD-06), for
+payees that need not be online. `licash-swaps lnurl --lnurl-url URL CODE`
+prints a code's static LNURL, to show as a QR code: any Lightning wallet
+pays it, again and again. Its pay request (`GET /v1/lnurlp/CODE`) offers
+from `--donation-min` (100 sat) up to `--donation-max` (1,000,000 sat), or
+what the provider holds at a hub of the code if less, and its callback
+(`GET /v1/lnurlp/CODE/callback?amount=MSAT`) a held invoice of the node.
+Once that invoice is paid, the provider pays the donation, less its fee
+(`--donation-fee-base`, 2 sat, and `--donation-fee-ppm`, 5000, the hub's
+fee included), to the code's wallet in notes at that hub, kept there for
+the payee to collect for 14 days, or mailed to its mailbox; then it
+settles the invoice. While nothing is released to the payee, the invoice is
+canceled and the payer refunded: a donation whose fee does not cover the
+hub's, or paid too close to its HTLCs' expiry, is never paid on. A payment
+signed but not released 18 blocks before the HTLCs expire is settled all
+the same and followed until released; one given up after that alerts the
+operator. At most `--donation-max-open` invoices are open at once. The
+first start under this version upgrades `swaps.sqlite` to schema 5; a
+provider with donations under way refuses to start without `--lnurl-url`
+and `--lnd`. The provider must stay up while donations are under way: down
+past an HTLC's expiry, it may have paid the payee and lose the donation.
 
 A hub could withhold the notes it holds of the provider's: a recovery
 contract at the hub (`licash-wallet open-contract`) recovers them, up to

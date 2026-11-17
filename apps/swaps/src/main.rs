@@ -17,7 +17,7 @@ use licash_contracts::holder::Node;
 use licash_lightning::{lnd::Lnd, Node as LightningNode};
 use licash_nostr::Route;
 use licash_notify::{Message, Priority, Target};
-use licash_swaps::{Config, Provider};
+use licash_swaps::{Config, DonationTerms, Provider};
 use licash_swaps_service::{
     dashboard,
     keeper::{self, Keeper},
@@ -26,7 +26,7 @@ use licash_swaps_service::{
 };
 use licash_tor::{Onion, Tor};
 use licash_transport::Http;
-use licash_wallet::Wallet;
+use licash_wallet::{LicashCode, Wallet};
 use rand_core::{OsRng, RngCore};
 use tracing_subscriber::EnvFilter;
 
@@ -429,6 +429,73 @@ impl LightningArgs {
     }
 }
 
+/// Donations to the wallets of Licash codes, over LNURL-pay, with
+/// `--lnurl-url`.
+#[derive(Args)]
+struct DonationArgs {
+    /// Take donations to the wallets of Licash codes over LNURL-pay,
+    /// through the node of `--lnd`, payers reaching the provider at this
+    /// public URL, such as `https://swaps.example.com`. `licash-swaps
+    /// lnurl` prints the static LNURL of a code.
+    #[arg(
+        long,
+        value_name = "URL",
+        env = "LICASH_SWAPS_LNURL_URL",
+        requires = "lnd"
+    )]
+    lnurl_url: Option<String>,
+    /// The fee on each donation, taken from it, in satoshis: the hub's fee
+    /// on paying the payee comes out of it.
+    #[arg(long, env = "LICASH_SWAPS_DONATION_FEE_BASE",
+          default_value_t = DonationTerms::default().fee.base)]
+    donation_fee_base: u64,
+    /// The fee on each donation, in parts per million of it.
+    #[arg(long, env = "LICASH_SWAPS_DONATION_FEE_PPM",
+          default_value_t = DonationTerms::default().fee.ppm,
+          value_parser = clap::value_parser!(u64).range(0..=1_000_000))]
+    donation_fee_ppm: u64,
+    /// The smallest donation, in satoshis.
+    #[arg(long, env = "LICASH_SWAPS_DONATION_MIN", default_value_t = DonationTerms::default().min)]
+    donation_min: u64,
+    /// The largest donation, in satoshis.
+    #[arg(long, env = "LICASH_SWAPS_DONATION_MAX", default_value_t = DonationTerms::default().max)]
+    donation_max: u64,
+    /// The most donations whose invoices are open at once.
+    #[arg(long, env = "LICASH_SWAPS_DONATION_MAX_OPEN",
+          default_value_t = DonationTerms::default().max_open)]
+    donation_max_open: u64,
+}
+
+impl DonationArgs {
+    /// The provider's public URL and its terms, if it takes donations.
+    fn terms(&self) -> anyhow::Result<Option<(String, DonationTerms)>> {
+        let Some(url) = &self.lnurl_url else {
+            return Ok(None);
+        };
+        Ok(Some((
+            lnurl_base(url)?,
+            DonationTerms {
+                fee: Fee {
+                    base: self.donation_fee_base,
+                    ppm: self.donation_fee_ppm,
+                },
+                min: self.donation_min,
+                max: self.donation_max,
+                max_open: self.donation_max_open,
+            },
+        )))
+    }
+}
+
+/// The public URL `url` of the provider, as `--lnurl-url` gives it.
+fn lnurl_base(url: &str) -> anyhow::Result<String> {
+    anyhow::ensure!(
+        url.starts_with("https://") || url.starts_with("http://"),
+        "--lnurl-url {url}: an https:// URL (http:// for an onion or a test)"
+    );
+    Ok(url.trim_end_matches('/').to_owned())
+}
+
 /// The provider's announcement on Nostr, for wallets to discover it.
 #[derive(Args)]
 struct AnnounceArgs {
@@ -589,8 +656,21 @@ enum Command {
         /// clients' locks at its hubs.
         #[command(flatten)]
         lightning: LightningArgs,
+        /// With --lnurl-url and --lnd, the provider takes donations to
+        /// the wallets of Licash codes over LNURL-pay too.
+        #[command(flatten)]
+        donations: DonationArgs,
         #[command(flatten)]
         contracts: ContractArgs,
+    },
+    /// Print the static LNURL of donations to the wallet of a Licash code
+    /// through the provider at `--lnurl-url`, for a QR code: any Lightning
+    /// wallet pays it, again and again, while the payee is offline.
+    Lnurl {
+        #[arg(long = "lnurl-url", value_name = "URL", env = "LICASH_SWAPS_LNURL_URL")]
+        url: String,
+        /// The payee's Licash code.
+        code: String,
     },
     /// Hand out an address on Bitcoin to fund the provider's payouts at:
     /// a plain taproot address of its wallet, watched from then on.
@@ -689,6 +769,7 @@ fn command(cli: Cli) -> anyhow::Result<()> {
             chain,
             payouts,
             lightning,
+            donations,
             contracts,
         } => {
             let config = terms.config()?;
@@ -732,7 +813,9 @@ fn command(cli: Cli) -> anyhow::Result<()> {
                     provider
                 }
             };
-            let provider = match runtime.block_on(lightning.payer())? {
+            let payer = runtime.block_on(lightning.payer())?;
+            let node = payer.as_ref().map(|(node, _)| node.clone());
+            let provider = match payer {
                 Some((node, terms)) => provider.pay_lightning(node, terms)?,
                 None => {
                     let open = provider.open_invoices()?;
@@ -742,6 +825,26 @@ fn command(cli: Cli) -> anyhow::Result<()> {
                     );
                     provider
                 }
+            };
+            let donating = donations.terms()?;
+            let provider = match (&donating, node) {
+                (Some((_, terms)), Some(node)) => provider.take_donations(node, terms.clone())?,
+                (Some(_), None) => anyhow::bail!("--lnurl-url needs --lnd"),
+                (None, _) => {
+                    let open = provider.open_donations()?;
+                    anyhow::ensure!(
+                        open == 0,
+                        "{open} donations under way: they need --lnurl-url and --lnd"
+                    );
+                    provider
+                }
+            };
+            // Payments to donations' payees are mailed as announcements go.
+            let mailing = match (&donating, &proxy, &client) {
+                (None, _, _) => None,
+                (Some(_), Some(proxy), _) => Some(Route::socks(proxy).context("--proxy")?),
+                (Some(_), None, Some(client)) => Some(Route::Tor(client.clone())),
+                (Some(_), None, None) => Some(Route::Direct),
             };
             let provider = Arc::new(provider);
             // Before it serves: nothing is taken in unprotected.
@@ -755,6 +858,12 @@ fn command(cli: Cli) -> anyhow::Result<()> {
                     licash_swaps_service::router_paying_out(provider.clone(), nostr, source.clone())
                 }
                 None => licash_swaps_service::router(provider.clone(), nostr),
+            };
+            let router = match donating {
+                Some((base, _)) => {
+                    router.merge(licash_swaps_service::lnurl(provider.clone(), base))
+                }
+                None => router,
             };
             let onion = match &client {
                 Some(client) if onion => {
@@ -792,11 +901,19 @@ fn command(cli: Cli) -> anyhow::Result<()> {
                 None => None,
             };
             let serving = serve(
-                provider, router, listen, every, notifier, announcing, source, keeping,
+                provider, router, listen, every, notifier, announcing, source, keeping, mailing,
             );
             runtime.block_on(serving)
         }
         Command::Address { chain } => address(&data, &chain),
+        Command::Lnurl { url, code } => {
+            let code: LicashCode = code
+                .parse()
+                .map_err(|e| anyhow::anyhow!("a Licash code: {e}"))?;
+            let base = lnurl_base(&url)?;
+            println!("{}", licash_swaps::donation_lnurl(&base, &code.to_string()));
+            Ok(())
+        }
         Command::TestNotify { notify } => test_notify(&notify),
         Command::Status {
             json,
@@ -873,6 +990,7 @@ async fn serve(
     announcing: Option<Announcing>,
     chain: Option<Arc<ChainView>>,
     keeping: Option<keeper::Running>,
+    mailing: Option<Route>,
 ) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(listen)
         .await
@@ -925,6 +1043,19 @@ async fn serve(
         critical.spawn(
             "the invoices' payer",
             licash_swaps_service::pay_invoices(provider.clone(), every),
+        );
+    }
+    if let (Some(terms), Some(route)) = (provider.donation_terms(), mailing) {
+        tracing::info!(
+            fee_base = terms.fee.base,
+            fee_ppm = terms.fee.ppm,
+            min = terms.min,
+            max = terms.max,
+            "taking donations over LNURL-pay"
+        );
+        critical.spawn(
+            "the donations' follower",
+            licash_swaps_service::take_donations(provider.clone(), route, every),
         );
     }
     if let Some(mut keeping) = keeping {
