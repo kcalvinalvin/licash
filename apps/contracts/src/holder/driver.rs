@@ -2,7 +2,8 @@
 //! answers, each step stored before its disclosures, instance uploads,
 //! signatures or other effects leave the wallet.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{LazyLock, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context as _, Result};
@@ -21,6 +22,32 @@ const RETRY: Duration = Duration::from_secs(2);
 
 /// How many times to ask a working hub again before trying later.
 const PATIENCE: u32 = 900;
+
+/// What an opening sent to and got from its hub since this process
+/// started driving it, in bytes, and since when: its speed. Kept in
+/// memory only, lost with the process, which says nothing of it then.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Traffic {
+    pub bytes: u64,
+    pub since: Instant,
+}
+
+static TRAFFIC: LazyLock<Mutex<HashMap<[u8; 32], Traffic>>> = LazyLock::new(Mutex::default);
+
+/// The opening `id`'s [`Traffic`], if this process drove it.
+pub fn traffic(id: &[u8; 32]) -> Option<Traffic> {
+    let all = TRAFFIC.lock().unwrap_or_else(PoisonError::into_inner);
+    all.get(id).copied()
+}
+
+fn count(id: &[u8; 32], bytes: usize) {
+    let mut all = TRAFFIC.lock().unwrap_or_else(PoisonError::into_inner);
+    let traffic = all.entry(*id).or_insert_with(|| Traffic {
+        bytes: 0,
+        since: Instant::now(),
+    });
+    traffic.bytes = traffic.bytes.saturating_add(bytes as u64);
+}
 
 /// The hub refused what she sent, or she what it sent: the opening goes
 /// no further.
@@ -260,9 +287,10 @@ impl<T: Transport, C: Chain> Driver<'_, T, C> {
         };
         let started = Instant::now();
         for _ in 0..PATIENCE {
-            let body = Some(body.clone());
-            let response = self.wallet.transport().request(&url, body).await;
+            let request = Some(body.clone());
+            let response = self.wallet.transport().request(&url, request).await;
             let response = response.map_err(|e| anyhow!("{}: {e}", self.hub))?;
+            count(&self.id, body.len() + response.body.len());
             match response.status {
                 200 => {
                     let (id, took) = (crate::hex_id(&self.id), started.elapsed());

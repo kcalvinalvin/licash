@@ -19,7 +19,7 @@ use licash_contracts::holder::{self, Ask, Fate, Phase};
 use super::Wallet;
 use crate::{
     chain::Chain, Activity, Balance, ChainSource, Contract, ContractQuote, ContractState,
-    DepositCoin, Details, Kind, LicashError, OpeningStep, State,
+    DepositCoin, Details, Kind, LicashError, OpeningStep, State, Transfer,
 };
 
 /// What opening a contract downloads and keeps, in bytes, about: the
@@ -410,11 +410,20 @@ impl Wallet {
             }
             _ => None,
         };
+        let transfer = (matches!(state, ContractState::Opening))
+            .then(|| holder::traffic(&c.id))
+            .flatten()
+            .map(|t| Transfer {
+                bytes: t.bytes,
+                seconds: t.since.elapsed().as_secs(),
+                expected: DOWNLOAD,
+            });
         Contract {
             id: hex(&c.id),
             hub: c.hub.clone(),
             state,
             step,
+            transfer,
             mock: c.mock,
             cap: u64::from(c.cap),
             covers,

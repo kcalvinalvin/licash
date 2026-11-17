@@ -388,6 +388,18 @@ pub struct Contract {
     /// While [`ContractState::Opening`] or [`ContractState::Confirming`]:
     /// what it waits on now.
     pub step: Option<OpeningStep>,
+    /// While [`ContractState::Opening`], what it sent to and got from its
+    /// hub so far, if this run of the app drove it.
+    pub transfer: Option<Transfer>,
+}
+
+/// What an opening sent to and got from its hub so far: `bytes` in
+/// `seconds`, of about `expected` in all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct Transfer {
+    pub bytes: u64,
+    pub seconds: u64,
+    pub expected: u64,
 }
 
 /// What a contract being opened waits on now, in order: each step done
