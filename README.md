@@ -1,5 +1,7 @@
 # Licash
 
+![Licash](assets/brand/banner.png)
+
 Owner-bound ecash with local Bitcoin recovery. Payments are private, offchain
 reissuances by a hub; every holder keeps an individual, collateralized right
 to recover her own notes on Bitcoin. A claim is paid in full unless the hub
