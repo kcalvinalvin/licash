@@ -764,6 +764,40 @@ async fn a_lock_its_client_never_claims_returns_to_the_provider() {
 }
 
 #[tokio::test]
+async fn a_lock_its_hub_holds_is_followed_on_though_a_later_step_is_refused() {
+    let eco = Eco::new(200).await;
+    // The client's claim is lost: the provider's lock stands at B.
+    eco.net.fail(licash_api::SETTLE, Fault::Lost);
+    let e = eco
+        .client
+        .swap(PROVIDER, A, B, 20, SwapLimits::usual(20))
+        .await
+        .unwrap_err();
+    assert!(matches!(e, Error::Pending { .. }), "{e}");
+    let provider = eco.provider();
+    let record = provider.records(1).unwrap().remove(0);
+    assert_eq!(record.stage, Stage::Locked);
+    // B refuses to say where the lock stands, to the wallet resuming its
+    // payments then to the swap followed: no reason to give the swap up,
+    // whose lock its client may still claim.
+    let lock = lock_id(&record.lock.unwrap());
+    let path: &'static str = licash_api::lock_state(&lock).leak();
+    for _ in 0..2 {
+        eco.net.fail(path, Fault::Refused(Code::UnknownLock));
+    }
+    let pending = provider.step().await.unwrap();
+    assert_eq!(pending.len(), 1, "{pending:?}");
+    assert_eq!(provider.records(1).unwrap()[0].stage, Stage::Locked);
+    assert_eq!(eco.kinds(), ["accepted"]);
+    // The client claims after all, and the provider claims its lock.
+    let resumed = eco.client.resume().await.unwrap();
+    assert_eq!(resumed.swaps[0].state, SwapState::Done, "{resumed:?}");
+    assert!(provider.step().await.unwrap().is_empty());
+    assert_eq!(provider.records(1).unwrap()[0].stage, Stage::Done);
+    assert_eq!(held(provider.wallet(), A), 20 + costs(20).0);
+}
+
+#[tokio::test]
 async fn a_provider_restarted_takes_its_swaps_on() {
     let eco = Eco::new(200).await;
     let swap = eco.pending(20).await;

@@ -1485,10 +1485,16 @@ impl<T: Transport> Provider<T> {
         let state = match self.wallet.follow_lock(&hex::encode(lock)).await {
             Ok(lock) => lock.state,
             Err(licash_wallet::Error::Abandoned { reason, .. }) => LockState::Abandoned(reason),
-            Err(licash_wallet::Error::Refused { problem, .. }) => {
-                LockState::Abandoned(problem.to_string())
-            }
             Err(e) => {
+                // Refused for good only once the wallet gave the lock up,
+                // its hub having refused to take it. Refused at any later
+                // step, by a hub holding it, the lock stands: followed on.
+                if let licash_wallet::Error::Refused { .. } = e {
+                    let record = self.wallet.lock_record(&ProposalId::from_bytes(lock))?;
+                    if let LockState::Abandoned(reason) = record.state {
+                        return self.fail(id, row, &format!("its hub refused the lock: {reason}"));
+                    }
+                }
                 if row.stage == Stage::Locked {
                     self.check_withheld(id, row, &lock)?;
                 }
