@@ -37,7 +37,7 @@ pub trait Chain: Blocks {
 
     /// The rate a transaction confirms at within `blocks`, as the chain
     /// estimates it: by default, from the chain alone, as a light client
-    /// reads it ([`fee_rate_of`] of its last [`RATE_BLOCKS`] blocks).
+    /// reads it (`fee_rate_of` of its last `RATE_BLOCKS` blocks).
     fn fee_rate(
         &self,
         blocks: u16,

@@ -55,7 +55,8 @@ pub const MAX_LIVE: usize = 32;
 
 /// The most openings signed whose F is in no block, as the responder last
 /// saw, before new ones are refused: each holds coins of the hub's locked
-/// until it confirms or is made never to ([`dispute::UNFUNDED_FOR`]).
+/// until it confirms or is made never to (a day after the hub first saw
+/// it unconfirmed).
 pub const MAX_UNFUNDED: usize = 16;
 
 /// The most steps of openings and instances built at once. Each takes
@@ -965,11 +966,7 @@ mod tests {
         }
         let fee = terms::OPENING_FEE;
         let at = |m: u64| terms::RESERVE_ALICE + fee * m;
-        assert_eq!(
-            prices,
-            [1, 1, 1, 1, 2, 4, 8, 16, 16].map(at),
-            "{prices:?}"
-        );
+        assert_eq!(prices, [1, 1, 1, 1, 2, 4, 8, 16, 16].map(at), "{prices:?}");
         let load = openings.load().unwrap();
         assert_eq!((load.live, load.max, load.step), (8, 8, None));
         let refused = openings.step_now().unwrap_err();
