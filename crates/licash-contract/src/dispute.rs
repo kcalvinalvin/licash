@@ -79,12 +79,33 @@ impl Opening {
     pub fn finish(&self, name: &str, wire: Vec<Vec<u8>>) -> Result<Transaction> {
         finish(&self.set, &self.offer.sigs, &self.consent.sigs, name, wire)
     }
+    /// Whether she can force it closed: refused unless the hub's
+    /// signature kept signs `request` as this build of the graph makes it,
+    /// as of a contract opened under an older one (say, before `request`
+    /// paid her purse), whose request would never be valid.
+    pub fn forcible(&self) -> Result<()> {
+        let signed = self
+            .offer
+            .sigs
+            .get("request")
+            .context("missing hub signature")?;
+        presign(&self.set, "request")?
+            .verify_input(&self.babe.core().pubs[1].payment, 0, signed)
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "opened under an older protocol: no forced close, close it with the hub"
+                )
+            })
+    }
+    /// Her request of `b`, her claim's digest `e`, if she can force it
+    /// closed ([`Opening::forcible`]).
     pub fn request(&self, keys: &HolderKeys, b: u32, e: &[u8; 32]) -> Result<Transaction> {
         ensure!(keys.public() == self.holder, "another holder's keys");
         ensure!(
             b <= self.base.parts().cap,
             "claim exceeds contract capacity"
         );
+        self.forcible()?;
         self.finish(
             "request",
             HubProves::request_wire(&keys.b.sign(&b.to_be_bytes())?, &keys.e.sign(e)?),

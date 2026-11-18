@@ -287,3 +287,72 @@ async fn an_invalid_assertion_pays_the_claim_when_no_answer_arrives() {
 async fn a_retained_hub_receipt_answers_a_challenge_and_collects() {
     lifecycle(15, true, true).await;
 }
+
+fn signed() -> (Opening, HolderKeys) {
+    let saved = crate::testing::opened();
+    let ctx = Context {
+        tip: 0,
+        trust: Trust::mock(),
+    };
+    let holder = Holder::load(&saved.holder, &saved.seed, &ctx).unwrap();
+    let keys = HolderKeys::derive(&saved.seed, &holder.id());
+    (holder.signed().unwrap(), keys)
+}
+
+/// `request` pays her all her reserve but the dust limit (at most half
+/// the hub's), for her forced close's fees, at the vout after its slot; where the hub's proof stands
+/// she gets that much less of her reserve, and the hub's is as before.
+#[test]
+fn a_request_pays_her_purse_of_her_reserve_and_each_ends_with_what_it_would() {
+    let (o, keys) = signed();
+    let g = &o.base.parts().graph;
+    let (r_a, r_h, dust) = (g.reserve_alice, g.reserve_hub, g.dust);
+    let purse = o.babe.purse().unwrap().to_sat();
+    assert_eq!(purse, (r_a - dust).min(r_h / 2));
+    let r = o.request(&keys, 4096, &[22; 32]).unwrap();
+    assert_eq!(r.output.len(), 4);
+    // Her claim's slot just before it, where the statement reads it.
+    assert_eq!(r.output[PURSE_VOUT as usize - 1].value.to_sat(), 330);
+    let mine = dispute::fee_script(&keys.party.payment).unwrap();
+    assert_eq!(r.output[PURSE_VOUT as usize].value.to_sat(), purse);
+    assert_eq!(r.output[PURSE_VOUT as usize].script_pubkey, mine);
+    let value = o.babe.value().to_sat();
+    let bits = (g.low_bits..g.bits).count();
+    let paid = |name: &str| {
+        let p = presign(&o.set, name).unwrap();
+        // What the links before it took of the contract, her purse too.
+        (p.tx.output.clone(), value - p.prevout.value.to_sat())
+    };
+    // Her claim stands: both reserves less what the links took, her purse
+    // among it, which she has.
+    for name in ["request_timeout", "respond_timeout", "failure"] {
+        let (outs, taken) = paid(name);
+        assert_eq!(outs[bits].value.to_sat(), r_a + r_h - taken, "{name}");
+    }
+    // The hub's proof stands: her reserve less her purse, to her payout
+    // script; the hub's less the links' floors alone.
+    for name in ["success", "wrongly_challenged_0"] {
+        let (outs, taken) = paid(name);
+        assert_eq!(outs[bits].value.to_sat(), r_a - purse, "{name}");
+        assert_eq!(outs[bits].script_pubkey, o.babe.core().pubs[0].payout_spk);
+        assert_eq!(
+            outs[bits + 1].value.to_sat(),
+            r_h - (taken - purse),
+            "{name}"
+        );
+    }
+}
+
+/// A contract the hub signed under another graph (opened before `request`
+/// paid her purse, say): no forced close, as its request would be invalid.
+#[test]
+fn a_request_the_hub_signed_under_another_graph_is_refused() {
+    let (mut o, keys) = signed();
+    let respond = o.offer.sigs["respond"].clone();
+    o.offer.sigs.insert("request".into(), respond);
+    let refused = o.request(&keys, 4096, &[22; 32]).unwrap_err();
+    assert!(
+        format!("{refused:#}").contains("opened under an older protocol"),
+        "{refused:#}"
+    );
+}

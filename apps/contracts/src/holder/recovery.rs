@@ -8,7 +8,7 @@ use bitcoin::{Amount, FeeRate, OutPoint, Sequence, Transaction, TxIn, TxOut, Txi
 use licash::claim::{self, Item, UnsignedClaim};
 use licash::recovery::{Filing, Publication, Witness as FilingWitness};
 use licash::request::Request;
-use licash_contract::graph::{link_args, HubProves};
+use licash_contract::graph::{link_args, HubProves, PURSE_VOUT};
 use licash_contract::{
     dispute::{self, presign, Payout},
     keys::HolderKeys,
@@ -549,6 +549,8 @@ impl<'a, T: Transport, C: Chain> Run<'a, T, C> {
     /// other contracts there ([`claims`]), and claimed: the claim signed
     /// by each note's hold key, for their face value, its cap at most.
     fn claim(&self, state: &mut State, tip: u32) -> Result<Next> {
+        // Before any note of hers is taken.
+        self.o.forcible()?;
         let parts = self.o.base.parts();
         let keyset = *parts.keyset.id();
         let mut notes = self.wallet.claimed_notes(&self.id, &keyset)?;
@@ -716,7 +718,11 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
     fn request(&self, state: &mut State) -> Result<Next> {
         let request = self.requested(state)?;
         let r = match &state.r {
-            Some(r) => r.clone(),
+            // Pinned under an older build of the graph: never valid now.
+            Some(r) => {
+                self.o.forcible()?;
+                r.clone()
+            }
             None => self
                 .o
                 .request(&self.keys, request.amount, &request.claim_digest)?,
@@ -775,34 +781,35 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
             .checked_sub(r_total)
             .context("R creates money")?;
         let bytes = filing.to_bytes();
-        let base = vec![
-            (
-                OutPoint {
-                    txid: r.compute_txid(),
-                    vout: 2,
-                },
-                slot,
-            ),
-            (
-                OutPoint {
-                    txid: r.compute_txid(),
-                    vout: 1,
-                },
-                anchor,
-            ),
-        ];
-        // One coin of hers alone, the smallest that pays: coins are never
-        // joined, not to tie them together on Bitcoin.
+        let at = |vout| OutPoint {
+            txid: r.compute_txid(),
+            vout,
+        };
+        let mut base = vec![(at(2), slot), (at(1), anchor)];
+        // Her purse, R's, pays it unless the fees run past it.
+        if let Some(value) = self.o.babe.purse() {
+            let purse = r.output.get(PURSE_VOUT as usize).context("no purse")?;
+            ensure!(
+                purse.value == value && purse.script_pubkey == fee_coin.script_pubkey,
+                "request purse is not hers"
+            );
+            base.push((at(PURSE_VOUT), purse.clone()));
+        }
+        // Else one coin of hers alone too, the smallest that pays: coins
+        // are never joined, not to tie them together on Bitcoin.
         let mut coins = super::coins(self.wallet, self.dir)?;
         coins.reverse();
         let most = coins.last().map_or(0, |c| c.value);
-        for coin in coins {
+        let coins = coins.into_iter().map(|coin| -> Result<_> {
             let output = self
                 .wallet
                 .silent_coin_output(&coin.outpoint)?
                 .context("unknown fee coin")?;
+            Ok(Some((coin.outpoint, output)))
+        });
+        for coin in std::iter::once(Ok(None)).chain(coins) {
             let mut inputs = base.clone();
-            inputs.push((coin.outpoint, output));
+            inputs.extend(coin?);
             let prevouts: Vec<_> = inputs.iter().map(|(_, out)| out.clone()).collect();
             let total: Amount = prevouts.iter().map(|out| out.value).sum();
             let mut p = self.o.publication(
@@ -822,9 +829,12 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
                 ..Default::default()
             }));
             let mut weighed = p.clone();
-            dispute::sign_fee_input(&self.keys.party.payment, &mut weighed, 1, &prevouts)?;
-            for input in weighed.input.iter_mut().skip(2) {
-                input.witness = Witness::from_slice(&[[0u8; 64]]);
+            for i in 1..weighed.input.len() {
+                if prevouts[i].script_pubkey == fee_coin.script_pubkey {
+                    dispute::sign_fee_input(&self.keys.party.payment, &mut weighed, i, &prevouts)?;
+                } else {
+                    weighed.input[i].witness = Witness::from_slice(&[[0u8; 64]]);
+                }
             }
             let own = self
                 .rate
@@ -857,8 +867,12 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
     }
     fn sign(&self, state: &mut State) -> Result<Next> {
         let mut p = state.p.clone().context("no publication transaction")?;
-        dispute::sign_fee_input(&self.keys.party.payment, &mut p, 1, &state.prevouts)?;
-        for i in 2..p.input.len() {
+        let fee_script = dispute::fee_script(&self.keys.party.payment)?;
+        for i in 1..p.input.len() {
+            if state.prevouts[i].script_pubkey == fee_script {
+                dispute::sign_fee_input(&self.keys.party.payment, &mut p, i, &state.prevouts)?;
+                continue;
+            }
             match self.wallet.sign_input(&p, &state.prevouts, i) {
                 Ok(signed) => p.input[i].witness = signed.input[i].witness.clone(),
                 Err(e @ (licash_wallet::Error::Invalid(_) | licash_wallet::Error::NoteTaken)) => {
@@ -882,8 +896,18 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
         state.p = Some(p);
         Ok(Next::To(Stage::Published))
     }
+    /// Her coin paying P, if any, kept from her other spends.
     fn keep_p(&self, p: &Transaction, prevouts: &[TxOut]) {
-        for i in 2..p.input.len() {
+        let Ok(fee_script) = dispute::fee_script(&self.keys.party.payment) else {
+            return;
+        };
+        for i in 1..p.input.len() {
+            if prevouts
+                .get(i)
+                .is_none_or(|o| o.script_pubkey == fee_script)
+            {
+                continue;
+            }
             if let Err(e) = self.wallet.sign_input(p, prevouts, i) {
                 tracing::debug!(id = %crate::hex_id(&self.id), "a fee coin not reserved again: {e}");
             }

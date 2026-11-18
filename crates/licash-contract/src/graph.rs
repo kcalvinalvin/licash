@@ -4,7 +4,8 @@
 //! keys, and the kept instances' hashlocks:
 //!
 //! ```text
-//! request (the holder: b, E; her claim published by spending its slot)
+//! request (the holder: b, E; her claim published by spending its slot;
+//!  │         her purse, of her reserve, for her fees)
 //!  ├─ request_timeout (after w_H)          → the holder: b
 //!  └─ respond (the hub: b′; its disclose slot)
 //!      ├─ respond_timeout (after w_A)      → the holder: b
@@ -48,7 +49,7 @@ use lichen_btc::taptree::{Leaf, TapTree};
 use lichen_btc::tx::{build_spend, Timelock};
 use lichen_btc::witness::tapscript_witness;
 use lichen_contract::{
-    wots_shape, ContractParams, Core, PartyPubKeys, Presign, Role, Terms, POST_CSV,
+    anchor_tree, wots_shape, ContractParams, Core, PartyPubKeys, Presign, Role, Terms, POST_CSV,
 };
 use lichen_statement::{JOURNAL_LEN, SLOT_VOUT};
 use lichen_wots::{WotsParams, WotsPublic, WotsSig};
@@ -63,6 +64,10 @@ pub const SLOT: Amount = Amount::from_sat(330);
 
 /// What `success` pays: `b′`, read from the hub's signature in `respond`.
 const REDUCED: Payout = Payout::Other("reduced");
+
+/// Where `request` pays the holder her purse ([`Spec::purse`]), after its
+/// slot.
+pub const PURSE_VOUT: u32 = SLOT_VOUT + 1;
 
 /// The holder's one-time keys: for `b`, which her payout's bits read,
 /// and for `E`, her claim's digest.
@@ -263,6 +268,21 @@ impl Spec {
         self.pubs[Role::Hub.idx()].payment
     }
 
+    /// What `request` pays the holder of her reserve at once, to her
+    /// anchor's script, for the fees of her forced close: all of it but
+    /// the dust limit, so that she needs no coin of her own on Bitcoin to
+    /// force it (her reserve has no other use on that path). Taken in
+    /// `request`, it is short of her reserve wherever it is paid after
+    /// ([`Front::pay`]): each party ends with what it would have. Where
+    /// her claim stands it counts among the floors the hub's reserve
+    /// pays, so at most half of that, the other half for the links'
+    /// floors. None if it would be dust.
+    fn purse(&self) -> Option<Amount> {
+        let dust = self.params.dust;
+        let purse = (self.terms.reserve_alice.checked_sub(dust)?).min(self.terms.reserve_hub / 2);
+        (purse >= dust).then_some(purse)
+    }
+
     /// `request`'s slot: the holder's `publish`, any time, a transaction
     /// whose outputs carry her claim under her signature; or, after `k`,
     /// the hub's `reclaim` of a slot she left unspent (then her claim
@@ -310,6 +330,13 @@ impl Front for Spec {
             value: SLOT,
             script_pubkey: tree.script_pubkey(),
         };
+        let mut request = vec![slot(self.slot()?)];
+        if let Some(value) = self.purse() {
+            request.push(TxOut {
+                value,
+                script_pubkey: anchor_tree(&ctx, Role::User)?.script_pubkey(),
+            });
+        }
         Ok(vec![
             FrontLink {
                 name: "request",
@@ -318,7 +345,7 @@ impl Front for Spec {
                     verify_drop(verify_drop(b, &self.b_key), &self.e_key)
                 }),
                 shape: wots_shape([&self.e_key, &self.b_key]),
-                extra: vec![slot(self.slot()?)],
+                extra: request,
                 terminal: "request_timeout",
                 window: self.windows.w_h,
                 pays: Payout::User,
@@ -340,7 +367,21 @@ impl Front for Spec {
         match which {
             Payout::User => self.view().pay_alice(&self.b_key, available),
             Payout::Hub => Ok(self.view().pay_hub(available)),
-            REDUCED => self.view().pay_reduced(&self.hub_b, available),
+            // Her purse paid already (`request`'s): of her reserve, not
+            // of the hub's, which counts it among its floors.
+            REDUCED => {
+                let purse = self.purse().unwrap_or(Amount::ZERO);
+                let terms = Terms {
+                    reserve_alice: self.terms.reserve_alice - purse,
+                    reserve_hub: self.terms.reserve_hub + purse,
+                    ..self.terms
+                };
+                let core = Core {
+                    terms: &terms,
+                    ..self.view()
+                };
+                core.pay_reduced(&self.hub_b, available)
+            }
             Payout::Other(other) => bail!("no payout {other}"),
         }
     }
@@ -396,6 +437,12 @@ impl HubProves {
     /// `request`'s slot output's tree ([`SLOT`], at `SLOT_VOUT`).
     pub fn slot(&self) -> Result<TapTree> {
         self.spec.slot()
+    }
+    /// What `request` pays the holder at [`PURSE_VOUT`] for her forced
+    /// close's fees, to her anchor's script ([`Spec::purse`]): none if it
+    /// would be dust.
+    pub fn purse(&self) -> Option<Amount> {
+        self.spec.purse()
     }
     /// `respond`'s disclose slot output's tree ([`SLOT`], at `SLOT_VOUT`).
     pub fn disclose(&self) -> Result<TapTree> {

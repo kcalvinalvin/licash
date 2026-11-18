@@ -535,6 +535,8 @@ async fn a_holder_forces_her_contract_closed_on_a_silent_hub_and_takes_her_notes
     ensure!(available(&wallet)? == 3_000 && recovery::recoveries(&mine)?.is_empty());
     rt.mine(1)?;
     holder::resume(&wallet, &chain, &mine).await?;
+    // No coin of hers left on Bitcoin: her purse pays her forced close.
+    empty(&rt, &wallet, &chain).await?;
 
     // Forced closed: her notes claimed, out of her balance; revocable
     // until R may be in the next block, after its lock from F.
@@ -590,18 +592,23 @@ async fn a_holder_forces_her_contract_closed_on_a_silent_hub_and_takes_her_notes
     ensure!(requested.requested_at == Some(tip), "{requested:?}");
     let window_end = requested.next_at.context("no window")?;
     ensure!(window_end > tip + 1, "{requested:?}");
-    // P's fees paid of one coin of hers alone, never joined with another:
-    // R's claim slot and anchor, and that coin.
+    // P's fees paid of R's alone: its claim slot, its anchor and her
+    // purse, no coin of hers.
     let p = requested.publication.context("no P")?;
-    let found: serde_json::Value = chain
-        .0
-        .rpc(
-            "getrawtransaction",
-            serde_json::json!([p.to_string(), true]),
-        )
-        .await?;
-    let inputs = found["vin"].as_array().context("no inputs")?;
-    ensure!(inputs.len() == 3, "{found}");
+    let r = requested.request.context("no R")?;
+    let (r, p) = (rt.get_tx(&r)?, rt.get_tx(&p)?);
+    let spent: Vec<_> = p.input.iter().map(|i| i.previous_output).collect();
+    let of_r = |vout| bitcoin::OutPoint {
+        txid: r.compute_txid(),
+        vout,
+    };
+    ensure!(spent == [of_r(2), of_r(1), of_r(3)], "{p:?}");
+    eprintln!(
+        "R {} vB, P {} vB, purse {} sat",
+        r.vsize(),
+        p.vsize(),
+        r.output[3].value
+    );
 
     // Nothing to do until it passes; then request_timeout, paid of P's
     // fee coin.
@@ -650,12 +657,102 @@ async fn a_holder_forces_her_contract_closed_on_a_silent_hub_and_takes_her_notes
         after == before + paid,
         "{before} then {after}, {paid} swept"
     );
-    // Her claim's bits and her reserve, less the sweep's fee.
-    ensure!(paid > 3_000, "{paid} swept");
+    // Her claim's bits and both reserves, less the links' floors, her
+    // purse (P's, taken already) and the sweep's fee: far more than her
+    // bits and her own 20 000, as the hub, silent, forfeits its 100 000.
+    ensure!(paid > 3_000 + 20_000 + 50_000, "{paid} swept");
     eprintln!("swept {paid} sat to her wallet");
     // Nothing more to do.
     let over = recovery::advance(&wallet, &chain, &mine, rate).await?;
     ensure!(over[0] == *done, "{over:?}");
+    Ok(())
+}
+
+/// Her wallet's coins on Bitcoin, all spent away, mined.
+async fn empty(rt: &Regtest, wallet: &Wallet<Http>, chain: &Node) -> Result<()> {
+    if scan(wallet, chain).await? > 0 {
+        let away =
+            bitcoin::ScriptBuf::new_p2wsh(&bitcoin::ScriptBuf::from(vec![0x51]).wscript_hash());
+        let rate = bitcoin::FeeRate::from_sat_per_vb(2).context("a rate")?;
+        let tx = wallet.spend_silent(away, None, rate)?;
+        rt.send_and_confirm(&tx)?;
+    }
+    ensure!(scan(wallet, chain).await? == 0, "coins left");
+    Ok(())
+}
+
+/// A forced close at a fee rate her purse falls short of, no coin of hers
+/// on Bitcoin: put off, said why, revocable still. Then paid of one coin
+/// of hers more, once she has one.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs bitcoind and a release build"]
+async fn a_holder_adds_one_coin_to_her_purse_where_fees_run_past_it() -> Result<()> {
+    use bitcoin::FeeRate;
+    use licash_contracts::holder::recovery::{self, Stage};
+
+    let rt = Regtest::start_standard()?;
+    let dir = tempfile::tempdir()?;
+    let at = dir.path().join("hub");
+    let (url, source, hub) = hub_serving(&rt, &at, None).await?;
+    let chain = Node(source);
+    let mine = dir.path().join("wallet");
+    std::fs::create_dir(&mine)?;
+    let regtest = ChainProfile::Core30DefaultRegtest;
+    let wallet = Wallet::create(
+        &mine.join("wallet.sqlite"),
+        &[9; 32],
+        regtest,
+        Http::new(None)?,
+    )?;
+    wallet.add_hub(&url).await?;
+    wallet.watch_silent(None, rt.height()?)?;
+    let to = wallet.fallback_address()?.script_pubkey();
+    rt.fund(&to, Amount::from_sat(60_000))?;
+    rt.mine(1)?;
+    ensure!(scan(&wallet, &chain).await? == 60_000);
+    let opened = holder::open(&wallet, &chain, &mine, &url, ask()).await?;
+    let payment = pay(&hub, &at.join("seed"), &url, &wallet.address(), 3_000)?;
+    wallet.receive(&payment)?;
+    rt.mine(2)?;
+    holder::resume(&wallet, &chain, &mine).await?;
+    empty(&rt, &wallet, &chain).await?;
+
+    // 20 sat/vB: R's package alone is past her purse.
+    let rate = FeeRate::from_sat_per_vb(20).context("a rate")?;
+    let forced = recovery::force_close(&wallet, &chain, &mine, &opened.id, rate).await?;
+    let lock_end = forced.next_at.context("no lock")?;
+    rt.mine_to_height(lock_end - 1)?;
+    let short = &recovery::advance(&wallet, &chain, &mine, rate).await?[0];
+    ensure!(
+        short.stage == Stage::Claimed && !short.irrevocable,
+        "{short:?}"
+    );
+    let why = short.error.clone().context("no error")?;
+    ensure!(why.contains("too little of hers on Bitcoin"), "{why}");
+
+    // A coin of hers: R's slot, anchor and purse, and that coin alone.
+    let (coin, _) = rt.fund(
+        &wallet.fallback_address()?.script_pubkey(),
+        Amount::from_sat(200_000),
+    )?;
+    rt.mine(1)?;
+    ensure!(scan(&wallet, &chain).await? == 200_000);
+    let sent = &recovery::advance(&wallet, &chain, &mine, rate).await?[0];
+    ensure!(
+        sent.stage == Stage::Published && sent.irrevocable && sent.error.is_none(),
+        "{sent:?}"
+    );
+    let p = rt.get_tx(&sent.publication.context("no P")?)?;
+    let r = rt.get_tx(&sent.request.context("no R")?)?;
+    let spent: Vec<_> = p.input.iter().map(|i| i.previous_output).collect();
+    let of_r = |vout| bitcoin::OutPoint {
+        txid: r.compute_txid(),
+        vout,
+    };
+    ensure!(spent == [of_r(2), of_r(1), of_r(3), coin], "{p:?}");
+    rt.mine(1)?;
+    let requested = &recovery::advance(&wallet, &chain, &mine, rate).await?[0];
+    ensure!(requested.stage == Stage::Requested, "{requested:?}");
     Ok(())
 }
 
