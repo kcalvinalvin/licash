@@ -9,6 +9,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -62,6 +63,7 @@ internal fun HubPage(
     var quote by remember { mutableStateOf<ContractQuote?>(null) }
     var ending by remember { mutableStateOf<Contract?>(null) }
     var forcing by remember { mutableStateOf<Contract?>(null) }
+    var shortfall by remember { mutableStateOf<ULong?>(null) }
     var canceling by remember { mutableStateOf<String?>(null) }
     var cancelingBusy by remember { mutableStateOf(false) }
     var fees by remember { mutableStateOf(false) }
@@ -198,14 +200,20 @@ internal fun HubPage(
         )
     }
     forcing?.let { c ->
+        LaunchedEffect(c.id) { shortfall = engine.challengeShortfall().getOrNull() }
         ForceSheet(
             c,
             held,
+            shortfall,
             force = {
                 forcing = null
+                shortfall = null
                 engine.forceClose(c.id)
             },
-            dismiss = { forcing = null },
+            dismiss = {
+                forcing = null
+                shortfall = null
+            },
         )
     }
     canceling?.let { id ->

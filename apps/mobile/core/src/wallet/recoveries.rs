@@ -7,20 +7,54 @@
 //! that does not verify, and is paid what the outcome says. The phone
 //! proves nothing.
 
-use std::sync::{Arc, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 
-use bitcoin::FeeRate;
+use bitcoin::{BlockHash, FeeRate};
 use licash_contracts::holder::recovery::{self, Stage};
+use licash_contracts::holder::Chain as _;
+use licash_wallet::Blocks as _;
 
 use super::Wallet;
 use crate::{chain::Chain, ChainSource, LicashError};
 
-/// Its fees' rate, in sat/vB: the wallet knows no estimates, and on signet
-/// blocks have room. Neither P nor the timeout's fee coin is bumped later.
+/// The least rate of its fees, in sat/vB, and its rate without one of the
+/// chain's. Neither P nor the timeout's fee coin is bumped later.
 const RECOVERY_RATE: u64 = 2;
 
-fn rate() -> FeeRate {
-    FeeRate::from_sat_per_vb(RECOVERY_RATE).expect("a rate")
+/// The last rate read, of the best chain's block of this hash.
+static RATE: Mutex<Option<(BlockHash, FeeRate)>> = Mutex::new(None);
+
+/// Its fees' rate: what the chain's last blocks paid, as the light client
+/// reads them (no peer estimates), [`RECOVERY_RATE`] at least. Its blocks
+/// are fetched whole: asked for only while a close is under way, once a
+/// block.
+async fn rate(chain: &Chain) -> FeeRate {
+    let floor = FeeRate::from_sat_per_vb(RECOVERY_RATE).expect("a rate");
+    let tip = match chain.height().await {
+        Ok(height) => chain.hash(height).await,
+        Err(e) => Err(e),
+    };
+    let tip = match tip {
+        Ok(tip) => tip,
+        Err(e) => {
+            tracing::warn!("no fee rate of the chain's blocks: {e}");
+            return floor;
+        }
+    };
+    let cached = *RATE.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some((_, rate)) = cached.filter(|(hash, _)| *hash == tip) {
+        return rate;
+    }
+    let rate = match chain.fee_rate(6).await {
+        Ok(Some(rate)) => rate.max(floor),
+        Ok(None) => floor,
+        Err(e) => {
+            tracing::warn!("no fee rate of the chain's blocks: {e}");
+            return floor;
+        }
+    };
+    *RATE.lock().unwrap_or_else(PoisonError::into_inner) = Some((tip, rate));
+    rate
 }
 
 /// A contract being forced closed, as the wallet last saw it.
@@ -172,10 +206,28 @@ impl Wallet {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         let chain = Chain(chain, self.wallet.network());
-        let forced = recovery::force_close(&self.wallet, &chain, &self.dir, &id, rate());
+        let forced = async {
+            let rate = rate(&chain).await;
+            recovery::force_close(&self.wallet, &chain, &self.dir, &id, rate).await
+        };
         let forced = self.runtime.block_on(forced).map_err(failed)?;
         tracing::warn!(id = %hex::encode(id), stage = forced.stage.as_str(), "contract forced closed");
         Ok(shown(&forced))
+    }
+
+    /// The least, in sat, a coin of hers on Bitcoin besides her others
+    /// should hold before she forces a contract closed, if she holds none:
+    /// should the hub prove falsely, her challenge's fee comes of it, at
+    /// the rate of `chain`'s last blocks. Without it, a challenge pays
+    /// what her coins hold, and may come too late.
+    pub fn challenge_shortfall(
+        &self,
+        chain: Arc<dyn ChainSource>,
+    ) -> Result<Option<u64>, LicashError> {
+        let chain = Chain(chain, self.wallet.network());
+        let rate = self.runtime.block_on(rate(&chain));
+        let short = recovery::challenge_shortfall(&self.wallet, &self.dir, rate).map_err(failed)?;
+        Ok(short.map(|a| a.to_sat()))
     }
 
     /// Close contract `id` (in hex) early with its hub, cooperatively:
@@ -221,7 +273,15 @@ impl Wallet {
     /// Carry every forced close on as far as `chain` lets it, the wallet
     /// contracting: one that cannot go on holds up nothing else.
     pub(super) fn advance_recoveries(&self, chain: &Chain) {
-        let advanced = recovery::advance(&self.wallet, chain, &self.dir, rate());
+        let active =
+            recovery::recoveries(&self.dir).is_ok_and(|all| all.iter().any(|r| !r.stage.over()));
+        if !active {
+            return;
+        }
+        let advanced = async {
+            let rate = rate(chain).await;
+            recovery::advance(&self.wallet, chain, &self.dir, rate).await
+        };
         if let Err(e) = self.runtime.block_on(advanced) {
             tracing::warn!("forced closes not carried on: {e:#}");
         }

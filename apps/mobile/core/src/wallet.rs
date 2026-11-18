@@ -548,8 +548,15 @@ impl Wallet {
             balance.notes_pending += at.pending;
         }
         let mut reserved = Vec::new();
+        let aside = self.set_aside()?;
+        let mut kept_aside = 0;
         for coin in self.wallet.silent_coins()? {
             match coin.spending {
+                // Held for a challenge's fee: on Bitcoin, kept, not moving.
+                Some(by) if aside.contains(&by) => {
+                    balance.onchain += coin.value;
+                    kept_aside += coin.value;
+                }
                 Some(by) => {
                     balance.moving += coin.value;
                     reserved.push((by, coin.value));
@@ -559,6 +566,7 @@ impl Wallet {
         }
         balance.moving += self.confirmed_moves(&reserved)?;
         balance.kept = self.kept_coins()?.iter().map(|(_, value)| value).sum();
+        balance.kept += kept_aside;
         self.contracted(&mut balance, &held, &reserved)?;
         Ok(balance)
     }
@@ -1159,10 +1167,11 @@ impl Wallet {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
+        let aside = self.set_aside()?;
         for coin in self.wallet.silent_coins()? {
             let state = match coin.spending {
-                Some(_) => State::Pending,
-                None => State::Done,
+                Some(by) if !aside.contains(&by) => State::Pending,
+                _ => State::Done,
             };
             history.push(Activity {
                 id: coin.outpoint.to_string(),
@@ -1333,7 +1342,15 @@ impl Wallet {
             Kind::Onchain => {
                 let outpoint: OutPoint = id.parse().map_err(|_| unknown())?;
                 let mut coins = self.wallet.silent_coins()?.into_iter();
-                let coin = coins.find(|c| c.outpoint == outpoint);
+                let mut coin = coins.find(|c| c.outpoint == outpoint);
+                // Held for a challenge's fee: no transaction moves it.
+                let aside = self.set_aside()?;
+                if let Some(c) = coin
+                    .as_mut()
+                    .filter(|c| c.spending.is_some_and(|by| aside.contains(&by)))
+                {
+                    c.spending = None;
+                }
                 let height = coin.as_ref().map(|c| c.height);
                 let tx = Onchain {
                     txid: outpoint.txid.to_string(),
@@ -1537,6 +1554,19 @@ impl Wallet {
                 }))
             }
         }
+    }
+
+    /// What the wallet's coins held for a challenge's fee are held under,
+    /// one for each of its contracts: the txid of no transaction
+    /// ([`licash_contracts::holder::recovery::challenge_marker`]).
+    fn set_aside(&self) -> Result<Vec<bitcoin::Txid>, LicashError> {
+        let all = licash_contracts::holder::list(&self.dir).map_err(|e| LicashError::Failed {
+            reason: format!("{e:#}"),
+        })?;
+        Ok(all
+            .iter()
+            .map(|c| licash_contracts::holder::recovery::challenge_marker(&c.id))
+            .collect())
     }
 
     /// The coins not spent that the claims of the wallet's payouts paid,

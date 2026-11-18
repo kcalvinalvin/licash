@@ -1216,6 +1216,16 @@ class Engine(context: Context) {
 
     suspend fun contractInspection(id: String): Result<org.licash.core.ContractInspection> = io { local { it.contractInspection(id) } }
 
+    /**
+     * The least a coin of hers on Bitcoin should hold before she forces a
+     * contract closed, for a challenge's fee, if she holds none: null if she
+     * does, or while not connected to Bitcoin.
+     */
+    suspend fun challengeShortfall(): Result<ULong?> = io {
+        val light = light ?: return@io null
+        local { it.challengeShortfall(GoChain(light)) }
+    }
+
     /** Planning from this wallet's signed terms; never starts a close. */
     suspend fun contractSafety(id: String): Result<org.licash.core.ContractSafety> = io {
         local { it.contractSafety(id, exitMarginBlocks(prefs.exitMarginDays, state.value.network), 6u) }

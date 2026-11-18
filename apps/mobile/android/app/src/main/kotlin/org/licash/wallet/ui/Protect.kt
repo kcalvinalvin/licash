@@ -293,10 +293,11 @@ internal fun GiveUpSheet(recovery: Recovery?, busy: Boolean, confirm: () -> Unit
 
 /**
  * What forcing a protection closed does, before it is done: for a hub that
- * stopped answering only, and final once its request is signed.
+ * stopped answering only, and final once its request is signed. With the
+ * `shortfall` of her coins for a challenge's fee, if she holds none.
  */
 @Composable
-internal fun ForceSheet(c: Contract, held: ULong, force: () -> Unit, dismiss: () -> Unit) {
+internal fun ForceSheet(c: Contract, held: ULong, shortfall: ULong?, force: () -> Unit, dismiss: () -> Unit) {
     val claimed = if (held < c.cap) held else c.cap
     Sheet("Force close", dismiss) {
         Say(
@@ -304,6 +305,13 @@ internal fun ForceSheet(c: Contract, held: ULong, force: () -> Unit, dismiss: ()
                 "Your ${sat(claimed)} there leave your balance and are claimed on Bitcoin, " +
                 "back on Bitcoin in a few days if the hub stays silent. Its fees come from your reserve in the contract.",
         )
+        if (shortfall != null) {
+            Say(
+                "Keep a coin of at least ${sat(shortfall)} on Bitcoin besides your others first: should the hub " +
+                    "prove falsely, your challenge's fee comes from it, set aside until the close is over. " +
+                    "Without it, a challenge pays what your coins hold, and may come too late.",
+            )
+        }
         Say("Once its request is signed, it cannot be canceled, even before it is on Bitcoin.")
         BigButton("Force close", Modifier.fillMaxWidth().testTag("force-close-confirm"), danger = true) { force() }
     }
