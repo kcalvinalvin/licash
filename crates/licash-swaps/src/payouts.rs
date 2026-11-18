@@ -786,21 +786,8 @@ impl<T: Transport> Provider<T> {
                 .refund_capped(outpoint, value, to.clone(), rate, &coin.refund_key)
                 .map_err(|e| licash_wallet::Error::Invalid(e.to_string()))
         };
-        let fee = |tx: &Transaction| value - tx.output[0].value;
-        let mut tx = build(rate)?;
-        if let Some(old) = &coin.refund {
-            let vsize = tx.vsize() as u64;
-            if fee(old) < fee(&tx) && !deadline::replaces(fee(&tx), vsize, fee(old)) {
-                // Paying past its rate, but too little to replace it: what
-                // does, if it can.
-                let least = fee(old).to_sat() + vsize;
-                let wu = tx.weight().to_wu();
-                tx = build(FeeRate::from_sat_per_kwu((least * 1000).div_ceil(wu)))?;
-            }
-        }
-        let tx = match &coin.refund {
-            Some(old) if !deadline::replaces(fee(&tx), tx.vsize() as u64, fee(old)) => old.clone(),
-            _ => {
+        let tx = match deadline::remake(coin.refund.as_ref(), value, rate, build)? {
+            Some(tx) => {
                 self.store.write(|t| {
                     t.execute(
                         "UPDATE payouts SET refund_tx = ?2 WHERE id = ?1",
@@ -809,11 +796,12 @@ impl<T: Transport> Provider<T> {
                     Ok(())
                 })?;
                 tracing::info!(
-                    id = %hex::encode(id), txid = %tx.compute_txid(), fee = %fee(&tx), left,
+                    id = %hex::encode(id), txid = %tx.compute_txid(), %rate, left,
                     "taking a payout's coin back"
                 );
                 tx
             }
+            None => coin.refund.clone().expect("a refund made before"),
         };
         self.broadcast_refund(id, &tx, chain).await;
         Ok(())
