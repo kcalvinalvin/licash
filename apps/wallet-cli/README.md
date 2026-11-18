@@ -236,8 +236,10 @@ them back; from then on it is irrevocable. The wallet pays its fees from
 its coins on Bitcoin at `--fee-rate` sat/vB (by default the chain's
 estimate). `recoveries --chain <url>` carries every forced close on as
 far as the chain lets it and shows the block its next step waits for: run
-it until it is `done`, when the claimed notes' value and both reserves
-are back in the wallet on Bitcoin. A hub that answers the request instead
+it until it is `done`, when the claimed notes' value and the wallet's
+reserve are back in it on Bitcoin (with the hub's reserve too on a
+contract opened before graph id 8, or once the hub answered and failed to
+prove its answer). A hub that answers the request instead
 (`answered`) says what the claim is owed, and must prove it on Bitcoin
 before the block `recoveries` shows; otherwise the wallet's timeout pays
 the whole claim. The wallet proves nothing: it checks the hub's proof once

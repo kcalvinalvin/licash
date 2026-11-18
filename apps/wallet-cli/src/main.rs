@@ -461,7 +461,8 @@ enum Command {
     /// Force contract ID (its id, or the start of it) closed when its hub
     /// stopped answering: the wallet's notes at the hub, up to its cap,
     /// claimed on Bitcoin, and once the hub's window to answer passed
-    /// unanswered, paid to the wallet on Bitcoin with both reserves. Past
+    /// unanswered, paid to the wallet on Bitcoin with its reserve (and the
+    /// hub's, on a contract opened before graph id 8). Past
     /// its first step, irrevocable: those notes leave the wallet's balance
     /// for good. Run `recoveries --chain` until it is done.
     ForceClose {
