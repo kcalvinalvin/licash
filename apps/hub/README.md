@@ -208,6 +208,19 @@ not looked at again. Keep `<data>/responses.sqlite` with `openings.sqlite`:
 it pins the evidence each response is decided on and each one-time
 signature (the response, the assertion) before it is made.
 
+A dispute's links are presigned at 1 sat/vB, each with a 330 sat anchor
+only its poster spends. The hub posts its response and its assertion with
+a fee child spending the anchor and fee coins of its wallet, as one package
+(Core's `submitpackage`, else each in turn): at the node's estimate for
+half the blocks left before the link's deadline, doubled for each 3 blocks
+fewer than 12 left, 16 times at most, and made again at the higher rate
+while the link is in no block. The pair pays at most what missing the
+deadline costs the hub (the claim it would pay beyond what it responded,
+and its reserve for the assertion); the hub alerts once above that, and
+once a link is in no block halfway to its deadline. Its answer to a
+challenge and its terminals take a larger fee coin the same way. Its
+children and their coins are kept in `openings.sqlite` before broadcast.
+
 A response commits the hub to a proof: its assertion must confirm within
 the assert window (48 blocks on signet, 2 of them to confirm in), or the
 holder's timeout pays her what she claims, as if it had not responded. So
