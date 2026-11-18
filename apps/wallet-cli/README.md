@@ -176,7 +176,11 @@ top of the amount (the claim's fee, the provider's and the hub's). Without
 the relays its hubs name) that pays the amount out within `--max-fee`: one
 it paid out through before, else the cheapest.
 `payouts --chain <url>` takes the payouts under way on and broadcasts their
-claims: run it until the payout is done.
+claims: run it until the payout is done. A claim still in no block fewer
+than 12 blocks before the provider may take its coin back is made again at
+twice its fee, doubling every 3 blocks (16 times at most), the address paid
+that much less: the preimage is out by then, and the provider's refund would
+lose the whole amount.
 
 `open-contract <hub> --chain <url>` opens a recovery contract at a hub the
 wallet trusts that opens them: its collateral protects the wallet's notes

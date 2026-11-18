@@ -11,7 +11,9 @@
 //! after its timeout. Once the wallet found the coin on its own view of the
 //! chain, confirmed and worth what was asked, with room left before its
 //! timeout, it claims it, paying the payee exactly the amount asked and the
-//! rest of the coin as the claim's fee. The claim reveals the preimage,
+//! rest of the coin as the claim's fee; should the claim be in no block as
+//! the timeout nears, it is made again at a higher fee, the payee paid
+//! less ([`Wallet::payout_claims`]). The claim reveals the preimage,
 //! with which the provider claims the wallet's lock. Nothing is revealed
 //! before: if the provider never locks a coin the wallet takes, the
 //! wallet's lock is refunded once expired.
@@ -35,7 +37,10 @@ use licash_api::{
     swaps::{self, State as Theirs},
     Info,
 };
-use licash_onchain::deposit::{self, Htlc};
+use licash_onchain::{
+    deadline,
+    deposit::{self, Htlc},
+};
 use rand_core::{OsRng, RngCore};
 use rusqlite::{params, OptionalExtension, Row};
 
@@ -506,7 +511,9 @@ impl<T: Transport> Wallet<T> {
 
     /// The claims of payouts not done, to broadcast: again after each
     /// follow, as a claim dropped or not confirmed yet loses the coin to
-    /// the provider once it times out.
+    /// the provider once it times out. A follow near the timeout may make
+    /// a claim again at a higher fee, in place of the one before: the
+    /// latest is returned.
     pub fn payout_claims(&self) -> Result<Vec<Transaction>, Error> {
         let claims: Vec<Vec<u8>> = self.store.read(|c| {
             let mut stmt = c.prepare(
@@ -874,7 +881,10 @@ impl<T: Transport> Wallet<T> {
                 height - 1,
                 format!("its claim has {} of {need} confirmations", tip + 1 - height),
             ),
-            None => (tip, "its claim is not confirmed yet".to_string()),
+            None => {
+                self.remake_claim(hash, record, &htlc, &claim, tip)?;
+                (tip, "its claim is not confirmed yet".to_string())
+            }
         };
         self.store.write(|tx| {
             tx.execute(
@@ -887,6 +897,66 @@ impl<T: Transport> Wallet<T> {
             id: hex::encode(hash),
             reason,
         })
+    }
+
+    /// Make the claim of the payout `hash` again in place of `claim`, still
+    /// in no block at `tip`, once its coin's timeout nears: at twice its
+    /// first rate from fewer than [`CLAIM_ROOM`] blocks before it, doubling
+    /// every 3 blocks to 16 times ([`deadline::rate`]), the payee's output
+    /// lowered to pay it (dust at least). The preimage is out: the payee
+    /// paid less beats the provider taking its coin back with the wallet's
+    /// lock paid. Recorded before anything is broadcast; kept while it pays
+    /// that rate.
+    fn remake_claim(
+        &self,
+        hash: &[u8; 32],
+        record: &Record,
+        htlc: &Htlc,
+        claim: &Transaction,
+        tip: u32,
+    ) -> Result<(), Error> {
+        let (funding, _, value) = record
+            .funding
+            .ok_or_else(|| invalid("a claim of no coin"))?;
+        let value = Amount::from_sat(value);
+        let weight = claim.weight();
+        // Its first rate: the coin less the amount, over its weight.
+        let first = value.to_sat().saturating_sub(record.amount);
+        let base = FeeRate::from_sat_per_kwu((first * 1000 / weight.to_wu().max(1)).max(1));
+        let rate = deadline::rate(Some(base), base, htlc.timeout.saturating_sub(tip));
+        let (key, dust) = (record.claim_key()?, record.script.minimal_non_dust());
+        let amount = Amount::from_sat(record.amount);
+        let build = |rate: FeeRate| {
+            let fee = rate.fee_wu(weight).unwrap_or(Amount::MAX);
+            let pays = value.checked_sub(fee).unwrap_or(Amount::ZERO);
+            let pays = pays.max(dust).min(amount);
+            htlc.claim_exact(
+                funding,
+                value,
+                record.script.clone(),
+                pays,
+                &key,
+                &record.preimage,
+            )
+        };
+        let Some(remade) = deadline::remake(Some(claim), value, rate, build).map_err(invalid)?
+        else {
+            return Ok(());
+        };
+        self.store.write(|tx| {
+            tx.execute(
+                "UPDATE payouts SET claim_tx = ?2
+                 WHERE hash = ?1 AND done_at IS NULL AND failed IS NULL",
+                params![hash, serialize(&remade)],
+            )?;
+            Ok(())
+        })?;
+        tracing::warn!(
+            hash = %hex::encode(hash), claim = %remade.compute_txid(), %rate,
+            pays = %remade.output[0].value, timeout = htlc.timeout, tip,
+            "claiming the provider's coin again, at a higher fee, the payee paid less"
+        );
+        Ok(())
     }
 
     /// Give the payout of `hash` up, unless its claim was made: nothing

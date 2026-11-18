@@ -811,12 +811,59 @@ async fn a_claim_made_is_kept_across_a_restart_until_it_confirms() {
     };
     assert_eq!(eco.client.payouts().unwrap(), vec![claimed.clone()]);
     assert_eq!(eco.client.payout_claims().unwrap(), claims);
-    // Not confirmed as the provider's coin times out: broadcast still.
+    // Not confirmed as the provider's coin times out: broadcast still, made
+    // again at a higher fee, of the same coin to the same payee.
     eco.mine_to(eco.timeout() + 1);
     pending(eco.follow(&payout).await, "not confirmed yet");
-    assert_eq!(eco.client.payout_claims().unwrap(), claims);
-    eco.net.confirm(A, claims);
+    let again = eco.client.payout_claims().unwrap();
+    assert_eq!(again.len(), 1);
+    assert_eq!(
+        again[0].input[0].previous_output,
+        claims[0].input[0].previous_output
+    );
+    assert_eq!(again[0].output[0].script_pubkey, payee());
+    assert!(again[0].output[0].value < claims[0].output[0].value);
+    eco.net.confirm(A, again);
     assert_eq!(eco.follow(&payout).await.unwrap().state, PayoutState::Done);
+}
+
+#[tokio::test]
+async fn a_claim_in_no_block_as_the_timeout_nears_pays_more_the_payee_paid_less() {
+    let eco = Eco::new().await;
+    let payout = eco.pay_out(1000).await;
+    let coin = eco.desk.fund(None, None);
+    eco.follow(&payout).await.unwrap();
+    let first = eco.client.payout_claims().unwrap().remove(0);
+    let value = payout.amount + payout.budget;
+    let fee = |claim: &Transaction| value - claim.output[0].value.to_sat();
+    assert_eq!(fee(&first), payout.budget);
+    // Kept while CLAIM_ROOM blocks are left.
+    eco.mine_to(eco.timeout() - CLAIM_ROOM);
+    pending(eco.follow(&payout).await, "not confirmed yet");
+    assert_eq!(eco.client.payout_claims().unwrap(), vec![first.clone()]);
+    // One fewer: made again, at twice its fee or so, of the payee's 1000.
+    eco.mine(1);
+    pending(eco.follow(&payout).await, "not confirmed yet");
+    let second = eco.client.payout_claims().unwrap().remove(0);
+    assert_ne!(second, first);
+    let doubled = fee(&second);
+    assert!(
+        doubled >= 2 * payout.budget - 2 && doubled <= 2 * payout.budget,
+        "{doubled} of {}",
+        payout.budget
+    );
+    assert_eq!(
+        second.output[0].value.to_sat(),
+        1000 - (doubled - payout.budget)
+    );
+    // Followed again at that rate: kept.
+    pending(eco.follow(&payout).await, "not confirmed yet");
+    assert_eq!(eco.client.payout_claims().unwrap(), vec![second.clone()]);
+    // The first mined after all: done, the provider paid its lock.
+    eco.net.confirm(A, vec![first.clone()]);
+    let done = eco.follow(&payout).await.unwrap();
+    assert_eq!(done.state, PayoutState::Done);
+    eco.desk.settle(&first, coin).await;
 }
 
 #[tokio::test]
