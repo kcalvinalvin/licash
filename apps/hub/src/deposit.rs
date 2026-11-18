@@ -34,7 +34,10 @@ use licash_api::{
 };
 use licash_chain_client::{Follow, Source};
 use licash_hub::{Error, Hub, Refusal, Settled, Timing};
-use licash_onchain::deposit::{self, Htlc};
+use licash_onchain::{
+    deadline,
+    deposit::{self, Htlc},
+};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 
 use crate::{
@@ -207,13 +210,16 @@ struct Record {
 const RECORDS: &str = "SELECT hash, body, amount, pays, claim, refund, timeout, fund_by, txid,
     vout, height, lock, preimage, sweep, spent_by, state FROM deposits";
 
+/// The key in column `i` of `r`.
+fn x_only(r: &Row<'_>, i: usize) -> rusqlite::Result<XOnlyPublicKey> {
+    let bytes: [u8; 32] = r.get(i)?;
+    XOnlyPublicKey::from_slice(&bytes).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(i, rusqlite::types::Type::Blob, e.into())
+    })
+}
+
 fn record(r: &Row<'_>) -> rusqlite::Result<Record> {
-    let key = |i| {
-        let bytes: [u8; 32] = r.get(i)?;
-        XOnlyPublicKey::from_slice(&bytes).map_err(|e| {
-            rusqlite::Error::FromSqlConversionFailure(i, rusqlite::types::Type::Blob, e.into())
-        })
-    };
+    let key = |i| x_only(r, i);
     let hash: [u8; 32] = r.get(0)?;
     let funding = match (r.get::<_, Option<[u8; 32]>>(8)?, r.get(9)?, r.get(10)?) {
         (Some(txid), Some(vout), Some(height)) => Some((
@@ -403,9 +409,9 @@ impl Store {
                 ))
             })?
             .collect::<rusqlite::Result<_>>()?;
-        let mut paid: HashMap<OutPoint, ([u8; 32], Option<[u8; 32]>)> = tx
+        let mut paid: HashMap<OutPoint, Htlc> = tx
             .prepare(
-                "SELECT txid, vout, hash, sweep_txid FROM deposits
+                "SELECT txid, vout, hash, claim, refund, timeout FROM deposits
                  WHERE done_at IS NULL AND txid IS NOT NULL AND spent IS NULL",
             )?
             .query_map([], |r| {
@@ -415,18 +421,25 @@ impl Store {
                         txid,
                         vout: r.get(1)?,
                     },
-                    (r.get(2)?, r.get(3)?),
+                    Htlc {
+                        hash: r.get(2)?,
+                        claim: x_only(r, 3)?,
+                        refund: x_only(r, 4)?,
+                        timeout: r.get(5)?,
+                    },
                 ))
             })?
             .collect::<rusqlite::Result<_>>()?;
         for t in &block.txdata {
             let txid = t.compute_txid();
             for input in &t.input {
-                let Some((hash, sweep)) = paid.remove(&input.previous_output) else {
+                let Some(htlc) = paid.remove(&input.previous_output) else {
                     continue;
                 };
-                // Claimed by the hub, done; else the payer took it back.
-                let ours = sweep == Some(txid.to_byte_array());
+                let hash = htlc.hash;
+                // Claimed by the hub, by whichever of its claims, done;
+                // else the payer took it back.
+                let ours = htlc.claimed_by(t, input.previous_output);
                 tx.execute(
                     "UPDATE deposits SET spent = ?2, spent_by = ?3,
                          done_at = CASE WHEN ?4 THEN ?5 ELSE done_at END
@@ -944,8 +957,9 @@ impl Gateway {
         self.finish(record, "settled")
     }
 
-    /// Claim the coins of settled `record` to the sweep address, made once
-    /// and broadcast each round until a block spends them; alert the
+    /// Claim the coins of settled `record` to the sweep address, broadcast
+    /// each round until a block spends them, and made again in place of
+    /// the one before as the rate its timeout calls for rises; alert the
     /// operator if another spend did, or once the timeout nears.
     async fn claim(&self, record: &Record, scanned: u32) -> Result<(), Failure> {
         let name = hex::encode(record.hash);
@@ -958,24 +972,28 @@ impl Gateway {
             self.alert(format!("lost {name}"), message).await;
             return self.store.done(&record.hash).map_err(store_down);
         }
-        let tx = match &record.sweep {
-            Some(raw) => deserialize::<Transaction>(raw).map_err(|_| store_gone())?,
-            None => {
-                let Some(tx) = self.make_claim(record).await? else {
-                    return Ok(());
-                };
+        let old = match &record.sweep {
+            Some(raw) => Some(deserialize::<Transaction>(raw).map_err(|_| store_gone())?),
+            None => None,
+        };
+        let left = record.htlc.timeout.saturating_sub(scanned);
+        let tx = match self.make_claim(record, old.as_ref(), left).await? {
+            Some(tx) => {
                 self.store
                     .set_sweep(&record.hash, &tx)
                     .map_err(store_down)?;
                 let txid = tx.compute_txid();
-                tracing::info!(hash = %name, %txid, "deposit claim made");
+                tracing::info!(hash = %name, %txid, left, "deposit claim made");
                 tx
             }
+            None => match old {
+                Some(old) => old,
+                None => return Ok(()),
+            },
         };
         if let Err(e) = self.source.broadcast(&tx).await {
             tracing::warn!(hash = %name, "cannot broadcast a deposit's claim: {e:#}");
         }
-        let left = record.htlc.timeout.saturating_sub(scanned);
         if left <= self.config.sweep_blocks / 2 {
             let message = format!(
                 "The claim {} of deposit {name} is unconfirmed {left} blocks before its payer may \
@@ -987,26 +1005,43 @@ impl Gateway {
         Ok(())
     }
 
-    /// The claim of `record`, at the fee rate the chain estimates confirms
-    /// well within the sweep blocks: none if its coins cannot pay it.
-    async fn make_claim(&self, record: &Record) -> Result<Option<Transaction>, Failure> {
+    /// The claim of `record` to broadcast in place of `old`, the one made
+    /// before if any, `left` blocks before its timeout: at the fee rate the
+    /// chain estimates confirms well within the sweep blocks or half of
+    /// those left, whichever is sooner, rising as they run out
+    /// ([`deadline::rate`]), all of its coins but dust at most. None while
+    /// `old` pays that rate already, or if its coins cannot pay a claim.
+    async fn make_claim(
+        &self,
+        record: &Record,
+        old: Option<&Transaction>,
+        left: u32,
+    ) -> Result<Option<Transaction>, Failure> {
         let c = &self.config;
         let (outpoint, _) = record.funding.ok_or_else(store_gone)?;
         let preimage = record.preimage.ok_or_else(store_gone)?;
-        let target = u16::try_from(c.sweep_blocks / 3).unwrap_or(u16::MAX).max(1);
+        // Well within the sweep blocks, sooner as the timeout nears.
+        let sweep = u16::try_from(c.sweep_blocks / 3).unwrap_or(u16::MAX).max(1);
+        let target = deadline::target(left).min(sweep);
         let estimated = self.source.fee_rate(target).await.unwrap_or_else(|e| {
             tracing::warn!(chain = %self.source, "cannot estimate a fee rate: {e:#}");
             None
         });
-        let rate = estimated.map_or(c.min_fee_rate, |rate| rate.max(c.min_fee_rate));
+        let rate = deadline::rate(estimated, c.min_fee_rate, left);
         let secret = self.claim_key(&record.hash)?;
         let value = Amount::from_sat(record.pays);
-        let to = c.sweep_to.clone();
-        match record
-            .htlc
-            .claim_tx(outpoint, value, to, rate, &secret, &preimage)
-        {
-            Ok(tx) => Ok(Some(tx)),
+        let build = |rate| {
+            record.htlc.claim_capped(
+                outpoint,
+                value,
+                c.sweep_to.clone(),
+                rate,
+                &secret,
+                &preimage,
+            )
+        };
+        match deadline::remake(old, value, rate, build) {
+            Ok(tx) => Ok(tx),
             Err(e @ deposit::Error::TooSmall { .. }) => {
                 let name = hex::encode(record.hash);
                 let message = format!("Deposit {name} cannot be claimed: {e}.");

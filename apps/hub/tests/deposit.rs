@@ -731,6 +731,55 @@ async fn a_deposit_paid_at_depth_is_received_and_its_coins_claimed() {
 }
 
 #[tokio::test]
+async fn a_deposit_claim_left_unmined_pays_more_as_its_timeout_nears_and_any_of_them_is_the_hubs() {
+    let net = Net::new().await;
+    let alice = net.wallet("alice");
+    let deposit = alice.deposit(HUB, 3_000).await.unwrap();
+    let terms = deposit.terms.clone().unwrap();
+    net.mine(1, vec![payment(&terms.address, 3_100, 1)]);
+    net.mine(1, Vec::new());
+    net.deposits.round().await;
+    // Its notes claimed, the hub settles and claims the coins.
+    let received = alice.follow_deposit(&deposit.hash).await.unwrap();
+    assert_eq!(received.state, DepositState::Received);
+    net.deposits.round().await;
+    net.deposits.round().await;
+    let hash = bytes(&deposit.hash);
+    let fee = |tx: &Transaction| 3_100 - tx.output[0].value.to_sat();
+    let at = |rate, tx: &Transaction| {
+        let rate = FeeRate::from_sat_per_vb_u32(rate);
+        rate.fee_wu(tx.weight()).unwrap().to_sat()
+    };
+    let sent = net.sent();
+    assert_eq!(sent.len(), 1);
+    let first = sent[0].clone();
+    // Far from its timeout, at the estimate.
+    assert_eq!(fee(&first), at(3, &first));
+    // Unmined until 11 blocks are left: made again, at twice it.
+    net.mine(terms.timeout - 11 - net.height(), Vec::new());
+    net.deposits.round().await;
+    let sent = net.sent();
+    assert_eq!(sent.len(), 2);
+    let second = &sent[1];
+    assert_eq!(
+        second.input[0].previous_output,
+        first.input[0].previous_output
+    );
+    assert_eq!(fee(second), at(6, second));
+    // Broadcast again, not made again, while the rate is its own.
+    net.deposits.round().await;
+    assert_eq!(net.sent().len(), 2);
+    // The first mined after all: the hub's still.
+    net.mine(1, vec![first]);
+    net.deposits.round().await;
+    assert_eq!(
+        net.deposits.deposit_status(&hash).unwrap().status.state,
+        ReceiveState::Settled
+    );
+    assert!(alerts(&net.hub).is_empty(), "{:?}", alerts(&net.hub));
+}
+
+#[tokio::test]
 async fn deposits_paid_wrong_late_or_never_lock_nothing_and_are_refunded() {
     let net = Net::new().await;
     let alice = net.wallet("alice");
