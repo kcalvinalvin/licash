@@ -483,6 +483,12 @@ struct LightningArgs {
     /// The largest invoice paid, in satoshis.
     #[arg(long, env = "LICASH_HUB_LN_MAX_PAY", default_value_t = Config::default().max_pay)]
     ln_max_pay: u64,
+    /// The most paid over Lightning in any 24 hours, in satoshis, the
+    /// gateway's fee in it: past it invoices are refused, their locks
+    /// refunded, and the operator alerted. It bounds what a thief of the
+    /// hub's seed takes over Lightning in a day. Without it, no limit.
+    #[arg(long, env = "LICASH_HUB_LN_MAX_PAY_DAY", value_name = "SAT")]
+    ln_max_pay_day: Option<u64>,
     /// The least received, in satoshis.
     #[arg(long, env = "LICASH_HUB_LN_MIN_RECEIVE", default_value_t = Config::default().min_receive)]
     ln_min_receive: u64,
@@ -538,6 +544,7 @@ impl LightningArgs {
             pay: fee(self.ln_pay_fee_base, self.ln_pay_fee_ppm),
             receive: fee(self.ln_receive_fee_base, self.ln_receive_fee_ppm),
             max_pay: self.ln_max_pay,
+            max_pay_day: self.ln_max_pay_day,
             min_receive: self.ln_min_receive,
             max_receive: self.ln_max_receive,
             max_receipts: self.ln_max_receipts,
@@ -1974,6 +1981,19 @@ mod tests {
             Command::Run { announce, .. } => announce.mailboxes(),
             _ => unreachable!(),
         }
+    }
+
+    #[test]
+    fn the_most_paid_over_lightning_in_a_day_is_unlimited_unless_given() {
+        let most = |args: &[&str]| {
+            let cli = Cli::try_parse_from([&["licash-hub", "run"], args].concat()).unwrap();
+            match cli.command {
+                Command::Run { lightning, .. } => lightning.ln_max_pay_day,
+                _ => unreachable!(),
+            }
+        };
+        assert_eq!(most(&[]), None);
+        assert_eq!(most(&["--ln-max-pay-day", "500000"]), Some(500_000));
     }
 
     #[test]

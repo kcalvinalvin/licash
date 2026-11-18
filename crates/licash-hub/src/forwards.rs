@@ -194,6 +194,22 @@ impl Hub {
         })
     }
 
+    /// What the locks of the forwards recorded at or after `since`, Unix
+    /// seconds, pay the hub, of those pending or paid: at least what left
+    /// the hub outside its ledger since, or may yet. Those paid inside
+    /// the hub ([`LOCAL`]) left nothing.
+    pub fn forwarded_since(&self, since: i64) -> Result<u64, Error> {
+        self.store.read(|c| {
+            let sum: i64 = c.query_row(
+                "SELECT coalesce(sum(amount), 0) FROM forwards
+                 WHERE state IN ('pending', 'paid') AND node != ?1 AND created_at >= ?2",
+                params![LOCAL, since],
+                |r| r.get(0),
+            )?;
+            Ok(sum as u64)
+        })
+    }
+
     /// The forwards pending, oldest first.
     pub fn forwards(&self) -> Result<Vec<Forward>, Error> {
         self.store.read(|c| {

@@ -73,6 +73,11 @@ impl Net {
     }
 
     fn with(policy: Policy) -> Self {
+        Self::configured(policy, config())
+    }
+
+    /// A hub of `policy` whose gateway is of `config`.
+    fn configured(policy: Policy, config: Config) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let (seed, db) = (dir.path().join("seed"), dir.path().join("hub.sqlite"));
         Hub::init(&seed, &db, MAX_POW).unwrap();
@@ -81,7 +86,7 @@ impl Net {
         hub.add_checkpoint(&chain.checkpoint(0)).unwrap();
         let node = Arc::new(Fake::new());
         let path = dir.path().join("lightning.sqlite");
-        let gateway = Gateway::open(hub.clone(), node.clone(), config(), &path).unwrap();
+        let gateway = Gateway::open(hub.clone(), node.clone(), config, &path).unwrap();
         let gateway = Arc::new(gateway);
         let net = Self {
             app: licash_hub_service::router(
@@ -1334,4 +1339,95 @@ async fn notes_the_ledger_never_issued_pause_payments_out_until_resumed() {
     net.gateway.round().await;
     let lock = alice.follow_lock(&lock.id).await.unwrap();
     assert_eq!(lock.state, LockState::Paid(preimage));
+}
+
+/// Past what the gateway may pay out in a day, invoices are refused and
+/// their locks refunded, the operator alerted once: what was paid or is
+/// under way counts, the gateway's fee in it, not what failed or was paid
+/// inside the hub.
+#[tokio::test]
+async fn invoices_past_the_most_paid_in_a_day_are_refused_and_refunded() {
+    let policy = Policy {
+        timing: TIMING,
+        ..Policy::default()
+    };
+    let config = Config {
+        max_pay_day: Some(50),
+        ..config()
+    };
+    let net = Net::configured(policy, config);
+    net.gateway.round().await;
+    let alice = net.funded("alice", 90).await;
+    let since = || net.hub.forwarded_since(0).unwrap();
+    let invoice = |sat: u64, n: u8, outcome: Outcome| {
+        net.node
+            .invoice(sat * 1000, lock_hash(&[n; 32]), 18, outcome)
+    };
+
+    // Failed, and paid inside the hub: neither counts.
+    let request = invoice(18, 1, Outcome::Fail("FAILURE_REASON_NO_ROUTE".into()));
+    let lock = alice.pay_invoice(HUB, &request).await.unwrap();
+    net.gateway.round().await;
+    let lock = alice.follow_lock(&lock.id).await.unwrap();
+    assert_eq!(lock.state, LockState::Refunded);
+    let bob = net.wallet("bob");
+    let inside = bob.invoice(HUB, 10).await.unwrap();
+    let lock = alice
+        .pay_invoice(HUB, inside.request.as_ref().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(lock.state, LockState::Locked);
+    assert_eq!(since(), 0);
+
+    // Paid, and under way: 20 each, of an invoice of 18 and the fee.
+    let lock = alice
+        .pay_invoice(HUB, &invoice(18, 2, Outcome::Pay([2; 32])))
+        .await
+        .unwrap();
+    net.gateway.round().await;
+    let lock = alice.follow_lock(&lock.id).await.unwrap();
+    assert_eq!(lock.state, LockState::Paid([2; 32]));
+    let hung = alice
+        .pay_invoice(HUB, &invoice(18, 3, Outcome::Hang))
+        .await
+        .unwrap();
+    assert_eq!(hung.state, LockState::Locked);
+    assert_eq!(since(), 40);
+    assert_eq!(net.hub.forwarded_since(i64::MAX).unwrap(), 0);
+    assert_eq!(alerts(&net.hub), 0);
+
+    // 20 more would be 60: refused, refunded, the node never asked.
+    let sent = net.node.sent().len();
+    let before = available(&alice);
+    for n in [4, 5] {
+        let lock = alice
+            .pay_invoice(HUB, &invoice(18, n, Outcome::Pay([n; 32])))
+            .await
+            .unwrap();
+        net.gateway.round().await;
+        let lock = alice.follow_lock(&lock.id).await.unwrap();
+        assert_eq!(lock.state, LockState::Refunded);
+        assert_eq!(
+            lock.failure.as_deref(),
+            Some("above the most the gateway pays in a day")
+        );
+    }
+    assert_eq!(net.node.sent().len(), sent);
+    assert_eq!((available(&alice), since()), (before, 40));
+    // Told once.
+    assert_eq!(alerts(&net.hub), 1);
+    let events = net.hub.events(0, 1000).unwrap();
+    let alert = events.iter().rfind(|e| e.kind == "alert").unwrap();
+    let told = alert.data.to_string();
+    assert!(told.contains("--ln-max-pay-day 50"), "{told}");
+
+    // 10 more are exactly 50: paid.
+    let lock = alice
+        .pay_invoice(HUB, &invoice(8, 6, Outcome::Pay([6; 32])))
+        .await
+        .unwrap();
+    net.gateway.round().await;
+    let lock = alice.follow_lock(&lock.id).await.unwrap();
+    assert_eq!(lock.state, LockState::Paid([6; 32]));
+    assert_eq!(since(), 50);
 }

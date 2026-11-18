@@ -1414,3 +1414,35 @@ fn the_ledger_counts_the_notes_it_retired_beyond_those_it_issued() {
     hub.forward_paid(&paying.id(), &SECRET).unwrap();
     assert_eq!(excess(), [Excess { notes: 2, ..one }]);
 }
+
+/// What left the hub outside its ledger since a time, or may yet: what
+/// the locks of its forwards pending or paid pay it. Not those failed,
+/// nor those paid inside the hub.
+#[test]
+fn the_forwards_since_a_time_sum_what_is_paid_or_under_way() {
+    let (files, hub, chain) = setup(policy());
+    let expiry = chain.height() + 5;
+    let forwarded = |secret: [u8; 32], node: &str| {
+        let checkpoint = hub.checkpoint().unwrap().commitment();
+        let profile = ChainProfile::Core30DefaultRegtest;
+        let terms = TimedTerms::new(profile, checkpoint, expiry, 1, lock_hash(&secret)).unwrap();
+        let l = to_hub(&files, &hub, terms);
+        hub.lock(&l.signed, &l.notes).unwrap();
+        hub.forward(&l.id(), &lock_hash(&secret), "lnbcrt1", node, 4)
+            .unwrap();
+        l.id()
+    };
+    assert_eq!(hub.forwarded_since(0).unwrap(), 0);
+    let paid = forwarded([1; 32], "node");
+    let failed = forwarded([2; 32], "node");
+    forwarded([3; 32], "node");
+    forwarded([4; 32], licash_hub::LOCAL);
+    assert_eq!(hub.forwarded_since(0).unwrap(), 12);
+    hub.forward_paid(&paid, &[1; 32]).unwrap();
+    hub.forward_failed(&failed, "no route").unwrap();
+    assert_eq!(hub.forwarded_since(0).unwrap(), 8);
+    // Recorded now: none since later.
+    let now = hub.forward_of(&paid).unwrap().unwrap().created_at;
+    assert_eq!(hub.forwarded_since(now).unwrap(), 8);
+    assert_eq!(hub.forwarded_since(now + 1).unwrap(), 0);
+}

@@ -15,6 +15,12 @@ use crate::Failure;
 /// ([`crate::payouts`]).
 const PAUSED: &str = "the gateway's payments out are paused";
 
+/// Why an invoice is refused past [`Config::max_pay_day`].
+const OVER_THE_DAY: &str = "above the most the gateway pays in a day";
+
+/// The seconds [`Config::max_pay_day`] is counted over.
+const DAY: u64 = 24 * 60 * 60;
+
 impl Gateway {
     /// Pay the invoice of `body` for its lock, or say where its payment
     /// stands. An invoice the gateway does not pay for the lock fails the
@@ -66,6 +72,9 @@ impl Gateway {
             Ok(msat) => self.config.lightning(node.clone()).pay_lock(msat),
             Err(why) => return self.refuse(id, hash, request, node, why).await,
         };
+        if self.over_the_day(least).await? {
+            return self.refuse(id, hash, request, node, OVER_THE_DAY).await;
+        }
         let (paid, node_of) = (request.clone(), node.clone());
         match self
             .on_hub(move |hub| hub.forward(&id, &hash, &paid, &node_of, least))
@@ -135,6 +144,29 @@ impl Gateway {
             self.act(&forward.lock, &view, &mut misses).await;
         }
         Ok(())
+    }
+
+    /// Whether a lock paying the hub `amount` for an invoice would take
+    /// what the gateway paid out in the last 24 hours, and may yet pay,
+    /// past [`Config::max_pay_day`]. The operator is alerted, once a day:
+    /// the limit is too low for the hub's holders, or someone drains it.
+    async fn over_the_day(&self, amount: u64) -> Result<bool, Failure> {
+        let Some(most) = self.config.max_pay_day else {
+            return Ok(false);
+        };
+        let now = now();
+        let since = i64::try_from(now.saturating_sub(DAY)).unwrap_or(i64::MAX);
+        let paid = self.on_hub(move |hub| hub.forwarded_since(since)).await?;
+        if paid.saturating_add(amount) <= most {
+            return Ok(false);
+        }
+        let message = format!(
+            "The Lightning gateway refuses invoices: the {paid} sat it paid out in the last 24 \
+             hours leave no room for {amount} more within --ln-max-pay-day {most}. Their locks \
+             are refunded, until earlier payments are a day old."
+        );
+        self.alert(format!("day {}", now / DAY), message).await;
+        Ok(true)
     }
 
     /// The msat an invoice asks for, if the gateway pays it, now at `view`,

@@ -53,6 +53,11 @@ pub struct Config {
     pub receive: Fee,
     /// The most an invoice paid may ask.
     pub max_pay: u64,
+    /// The most the locks of the invoices paid over the node may pay the
+    /// hub in any 24 hours, the gateway's fee in it: past it invoices are
+    /// refused. It bounds what leaves over Lightning in a day, whoever
+    /// asks, also for notes made with a stolen seed. None for no limit.
+    pub max_pay_day: Option<u64>,
     /// The notes a receipt locks: at least and at most.
     pub min_receive: u64,
     pub max_receive: u64,
@@ -85,6 +90,7 @@ impl Default for Config {
             pay: Fee { base: 2, ppm: 5000 },
             receive: Fee::default(),
             max_pay: 1_000_000,
+            max_pay_day: None,
             min_receive: 1,
             max_receive: 1_000_000,
             max_receipts: 1024,
