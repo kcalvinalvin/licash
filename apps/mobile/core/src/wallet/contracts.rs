@@ -30,11 +30,6 @@ fn upload(kept: u16) -> u64 {
     u64::from(kept) * INSTANCE
 }
 
-/// How long a contract being opened keeps its coin from moving into
-/// Licash, in seconds: the hub gives up on one idle an hour, and a coin
-/// kept longer would never move.
-const OPENING: i64 = 86_400;
-
 /// Blocks a contract chosen lasts at first: half a year.
 const HALF_YEAR: u32 = 26_280;
 
@@ -424,15 +419,17 @@ impl Wallet {
     }
 
     /// The coins contracts being opened will deposit, not reserved for
-    /// their funding yet: no move is to take them. Those asked for long
-    /// ago, their hub surely gone, keep none.
+    /// their funding yet: no move is to take them. Those older than an
+    /// opening may take ([`holder::OPENS_WITHIN`]), given up, keep none.
     pub(super) fn opening_coins(&self) -> Result<Vec<OutPoint>, LicashError> {
         let all = holder::list(&self.dir).map_err(failed)?;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs() as i64);
         let opening = all.iter().filter(|c| {
-            c.abandoned.is_none() && c.phase < Phase::Funded && now - c.created_at < OPENING
+            c.abandoned.is_none()
+                && c.phase < Phase::Funded
+                && now - c.created_at < holder::OPENS_WITHIN
         });
         Ok(opening.map(|c| c.deposit).collect())
     }

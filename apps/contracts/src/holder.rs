@@ -318,6 +318,19 @@ async fn open_at<T: Transport, C: Chain>(
     found(&store, &id)
 }
 
+/// How long an opening may take, from her first message to her signing
+/// F: over Tor, minutes, an hour at worst. Its hub gives up one idle for
+/// an hour; resumed past this, an upload dropped would be sent again and
+/// again, 25 MB at a time.
+pub const OPENS_WITHIN: i64 = 86_400;
+
+/// An opening at `phase`, begun at `began`, still short of her signing F
+/// [`OPENS_WITHIN`] later, at `now`: to give up. She never signed her
+/// deposit into an F, so none can confirm, and her coin is free.
+fn overdue(phase: Phase, began: i64, now: i64) -> bool {
+    phase < Phase::Signing && now - began > OPENS_WITHIN
+}
+
 /// Carry on with the openings in `dir` under way, and see where the F
 /// of each signed stands: every contract, the newest first. Nothing is
 /// made in `dir` if none was ever opened there.
@@ -331,12 +344,20 @@ pub async fn resume<T: Transport, C: Chain>(
     };
     let tip = chain.height().await.map_err(|e| anyhow!(e))?;
     let trust = crate::trust(wallet.network())?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64);
     for contract in store.list()? {
         let settled = matches!(contract.fate, Some(Fate::Live | Fate::Dead));
         if contract.over(tip) || settled {
             continue;
         }
         let id = contract.id;
+        if overdue(contract.phase, contract.created_at, now) {
+            tracing::warn!(id = %crate::hex_id(&id), "an opening not opened in a day: given up");
+            store.abandon(&id, "not opened in a day")?;
+            continue;
+        }
         let (state, _) = store.state(&id)?;
         let secrets = wallet.contract_secrets();
         let ctx = licash_contract::opening::Context { tip, trust };
@@ -808,6 +829,25 @@ mod tests {
     use licash_wallet::{Blocks, Response};
 
     use super::*;
+
+    #[test]
+    fn an_opening_short_of_her_signing_f_a_day_on_is_given_up() {
+        let began = 1_794_900_000;
+        let day = began + OPENS_WITHIN;
+        for phase in [
+            Phase::Started,
+            Phase::Committed,
+            Phase::Chosen,
+            Phase::Consented,
+        ] {
+            assert!(!overdue(phase, began, day), "{phase:?} within a day");
+            assert!(overdue(phase, began, day + 1), "{phase:?} past a day");
+        }
+        // Her deposit signed into F: never given up for its age.
+        for phase in [Phase::Signing, Phase::Funded] {
+            assert!(!overdue(phase, began, day + 365 * 86_400), "{phase:?}");
+        }
+    }
 
     #[test]
     fn inspection_uses_the_funded_graph_not_the_deposit_and_never_adds_the_cap_twice() {
