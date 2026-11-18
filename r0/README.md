@@ -8,8 +8,8 @@
 - `host/`: packs, executes and proves it. Every command also runs
   `licash_hp::check` natively and fails when the guest disagrees with it.
 
-Each is a workspace of its own. The guest needs Lichen's statement crate in
-`vendor/` (`vendor/fetch.sh`).
+Each is a workspace of its own. The guest takes Lichen's statement crate
+from git, at the revision its `Cargo.lock` pins.
 
 ## Prerequisites
 

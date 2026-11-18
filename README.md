@@ -60,12 +60,11 @@ The library needs only Rust:
 cargo test --locked
 ```
 
-The applications build the contract on Lichen, which `vendor/fetch.sh`
-copies into `vendor/` at the revision it pins (see
-[regtest/README.md](regtest/README.md)); so do their Docker images:
+The applications build the contract on Lichen, which Cargo fetches from
+git at the revision `apps/Cargo.lock` pins (see
+[regtest/README.md](regtest/README.md)):
 
 ```sh
-vendor/fetch.sh
 cargo test --locked --manifest-path apps/Cargo.toml   # the applications
 apps/e2e/run.sh                                       # the ecosystem (Docker)
 ```
