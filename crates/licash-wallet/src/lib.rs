@@ -719,6 +719,15 @@ impl<T: Transport> Wallet<T> {
     pub async fn add_hub(&self, url: &str) -> Result<Info, Error> {
         let url = hub_url(url)?;
         let refreshed = self.learn(&url, Keep::Add).await;
+        // Added anew, as a wallet restored from its seed does: the
+        // deposits it asked there before, if any, found.
+        if let Ok((hub, info)) = &refreshed {
+            if info.deposits.is_some() && self.deposit_next(*hub)?.is_none() {
+                if let Err(e) = self.find_deposits_at(*hub, &url, info).await {
+                    tracing::warn!(%url, "looking for the deposits asked there: {e}");
+                }
+            }
+        }
         let hub = match &refreshed {
             Ok((hub, _)) => Some(*hub),
             Err(Error::Unavailable { .. }) => self.hub(&url).ok().map(|(hub, _)| hub),

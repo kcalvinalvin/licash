@@ -491,6 +491,9 @@ pub(crate) struct CodeKeys {
     pub(crate) mailbox: SecretKey,
     pub(crate) contract: [u8; 32],
     pub(crate) shaping: [u8; 32],
+    /// What the secrets of the deposits asked derive from, with their hub
+    /// and number ([`crate::deposits`]).
+    pub(crate) deposit: [u8; 32],
 }
 
 /// What a wallet brings to opening a recovery contract with a hub, as its
@@ -518,11 +521,13 @@ impl CodeKeys {
             .map_err(|_| Error::Setup("no mailbox key from this seed".into()))?;
         let contract = tagged_hash("licash/contract/seed", &[seed]);
         let shaping = tagged_hash("licash/shaping/key", &[seed]);
+        let deposit = tagged_hash("licash/deposit/seed", &[seed]);
         Ok(Self {
             silent,
             mailbox,
             contract,
             shaping,
+            deposit,
         })
     }
 }

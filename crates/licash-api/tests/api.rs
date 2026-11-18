@@ -919,6 +919,8 @@ fn deposit_bodies_are_receipts_with_a_refund_key_and_a_payment() {
             lock: None,
         },
         funding: None,
+        request: None,
+        terms: None,
     };
     assert_eq!(serde_json::to_string(&open).unwrap(), r#"{"state":"open"}"#);
     let locked = DepositStatus {
@@ -931,8 +933,16 @@ fn deposit_bodies_are_receipts_with_a_refund_key_and_a_payment() {
             vout: 1,
             height: 120,
         }),
+        request: None,
+        terms: None,
     };
     assert_eq!(json(&locked), locked);
+    // What was asked and answered, for a wallet finding it again.
+    let found = DepositStatus {
+        terms: Some(depositing.clone()),
+        ..open.clone()
+    };
+    assert_eq!(json(&found), found);
     let deposits = Deposits {
         fee: Fee {
             base: 500,

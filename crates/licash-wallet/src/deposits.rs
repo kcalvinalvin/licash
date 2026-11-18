@@ -10,6 +10,13 @@
 //! learns the preimage that claims the coins. A deposit whose notes are
 //! never claimed returns to its payer after its timeout
 //! ([`Wallet::refund_deposit`]).
+//!
+//! A deposit's secrets (its preimage, refund key and outputs' ephemeral
+//! key) derive from the seed, its hub's address and its number there, the
+//! next of each hub's: a wallet of the same seed that lost its file finds
+//! the deposits it asked for there by their hashes, the hub answering what
+//! was asked and its terms, and takes them on, until [`GAP`] numbers in a
+//! row are unknown there ([`Wallet::find_deposits`]).
 
 use bitcoin::{
     hashes::Hash,
@@ -19,9 +26,10 @@ use bitcoin::{
 use licash::{
     address::Ephemeral,
     claim::Branch,
+    crypto::{scalar_from_hash, tagged_hash},
     spend::{lock_hash, ProposalId},
 };
-use licash_api::{DepositStatus, Depositing, Hex, Info, Receive, ReceiveState};
+use licash_api::{Code, DepositStatus, Depositing, Hex, Info, Receive, ReceiveState};
 use licash_onchain::deposit::Htlc;
 use rand_core::{OsRng, RngCore};
 use rusqlite::{params, OptionalExtension, Row};
@@ -31,6 +39,27 @@ use crate::{hub_url, invalid, now, sql, unavailable, Error, Transport, Wallet};
 /// Blocks a hub's tip may move between its info and its answer: the
 /// timeout it answers may be that much later than its info promises.
 const TIP_MARGIN: u32 = 6;
+
+/// Numbers in a row a hub knows no deposit under, after which a wallet
+/// looking for its deposits there stops: asks that never reached it
+/// leave gaps.
+pub const GAP: u32 = 20;
+
+/// The secrets of the deposit numbered `number` at the hub of `address`,
+/// of the wallet whose deposit seed is `seed`: its preimage, refund key and
+/// outputs' ephemeral key.
+fn secrets(
+    seed: &[u8; 32],
+    address: &[u8],
+    number: u32,
+) -> Result<([u8; 32], SecretKey, Ephemeral), Error> {
+    let part = |tag| tagged_hash(tag, &[seed, address, &number.to_be_bytes()]);
+    let preimage = part("licash/deposit/preimage");
+    let refund = SecretKey::from_slice(&part("licash/deposit/refund")).map_err(invalid)?;
+    let ephemeral = scalar_from_hash(&part("licash/deposit/ephemeral"));
+    let ephemeral = Ephemeral::from_scalar(ephemeral).map_err(invalid)?;
+    Ok((preimage, refund, ephemeral))
+}
 
 /// A deposit asked for, and where it stands.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -118,7 +147,8 @@ impl<T: Transport> Wallet<T> {
                 deposits.min, deposits.max
             )));
         }
-        let asked = self.draw_deposit(&url, &info, amount)?;
+        let number = self.deposit_number(hub, &url, &info).await?;
+        let asked = self.draw_deposit(&url, &info, amount, number)?;
         self.store.write(|tx| asked.keep(tx, hub))?;
         tracing::info!(hash = %hex::encode(asked.hash), %url, amount, "asking for a deposit");
         self.advance_deposit(&asked.hash).await
@@ -183,7 +213,8 @@ impl<T: Transport> Wallet<T> {
         amount: u64,
     ) -> Result<Deposit, Error> {
         let url = self.reached(hub)?;
-        let asked = self.draw_deposit(&url, info, amount)?;
+        let number = self.deposit_number(hub, &url, info).await?;
+        let asked = self.draw_deposit(&url, info, amount, number)?;
         let hash = asked.hash;
         tracing::info!(hash = %hex::encode(hash), %url, amount, "asking for a deposit");
         let terms: Depositing = self.post(&url, licash_api::DEPOSIT, &asked.body).await?;
@@ -221,10 +252,18 @@ impl<T: Transport> Wallet<T> {
     }
 
     /// A deposit of notes worth `amount` to ask the hub at `url`, which
-    /// says `info` of itself, for.
-    fn draw_deposit(&self, url: &str, info: &Info, amount: u64) -> Result<Asked, Error> {
+    /// says `info` of itself, for, numbered `number` there.
+    fn draw_deposit(
+        &self,
+        url: &str,
+        info: &Info,
+        amount: u64,
+        number: u32,
+    ) -> Result<Asked, Error> {
         let keysets = info.keysets().map_err(|p| unavailable(url, p))?;
-        let (ephemeral, me) = (Ephemeral::random(), self.address());
+        let address = info.address.to_bytes();
+        let (preimage, refund_key, ephemeral) = secrets(&self.keys.deposit, &address, number)?;
+        let me = self.address();
         let (keyset, outputs) = keysets
             .iter()
             .find_map(|k| {
@@ -232,9 +271,6 @@ impl<T: Transport> Wallet<T> {
                 Some((k, outputs.ok()?))
             })
             .ok_or_else(|| Error::Invalid(format!("hub {url} has no keyset making {amount}")))?;
-        let mut preimage = [0; 32];
-        OsRng.fill_bytes(&mut preimage);
-        let refund_key = random_key();
         let hash = lock_hash(&preimage);
         let body = licash_api::Deposit {
             receive: Receive::new(keyset.id(), &ephemeral.public(), &outputs, &hash),
@@ -247,6 +283,162 @@ impl<T: Transport> Wallet<T> {
             amount,
             body,
         })
+    }
+}
+
+impl<T: Transport> Wallet<T> {
+    /// The next number of a deposit at the hub `hub`, reached at `url`,
+    /// saying `info` of itself, taken whether or not the deposit is then
+    /// asked: once the deposits of the wallet's seed were looked for there.
+    async fn deposit_number(&self, hub: i64, url: &str, info: &Info) -> Result<u32, Error> {
+        if self.deposit_next(hub)?.is_none() {
+            self.find_deposits_at(hub, url, info).await?;
+        }
+        self.store.write(|tx| {
+            let taken: Option<i64> = tx
+                .query_row(
+                    "UPDATE hubs SET deposit_next = deposit_next + 1
+                     WHERE id = ?1 AND deposit_next IS NOT NULL RETURNING deposit_next - 1",
+                    [hub],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            taken
+                .and_then(|n| u32::try_from(n).ok())
+                .ok_or_else(|| Error::Invalid(format!("hub {url}: no deposit number left")))
+        })
+    }
+
+    /// The next number of a deposit at the hub `hub`: none until its
+    /// deposits were looked for there.
+    pub(crate) fn deposit_next(&self, hub: i64) -> Result<Option<u32>, Error> {
+        self.store.read(|c| {
+            Ok(
+                c.query_row("SELECT deposit_next FROM hubs WHERE id = ?1", [hub], |r| {
+                    r.get(0)
+                })?,
+            )
+        })
+    }
+
+    /// Look for the deposits the wallet's seed asked of the hub at `url`,
+    /// by number from the first, until [`GAP`] in a row are unknown there:
+    /// those it kept no record of, as a wallet restored from its seed,
+    /// kept as the hub answers them, checked to be the wallet's, then
+    /// taken on as any other ([`Wallet::follow_deposit`], refunded if
+    /// paid and never received). Those found; the next number after them
+    /// from then on.
+    pub async fn find_deposits(&self, url: &str) -> Result<Vec<Deposit>, Error> {
+        let url = hub_url(url)?;
+        let (hub, info) = self.refresh(&url).await?;
+        self.find_deposits_at(hub, &url, &info).await
+    }
+
+    pub(crate) async fn find_deposits_at(
+        &self,
+        hub: i64,
+        url: &str,
+        info: &Info,
+    ) -> Result<Vec<Deposit>, Error> {
+        let address = info.address.to_bytes();
+        let (mut number, mut unknown, mut next) = (0u32, 0u32, 0u32);
+        let mut found = Vec::new();
+        while unknown < GAP {
+            let (preimage, refund, ephemeral) = secrets(&self.keys.deposit, &address, number)?;
+            let hash = lock_hash(&preimage);
+            let kept = self.store.read(|c| {
+                let kept =
+                    c.query_row("SELECT 1 FROM deposits WHERE hash = ?1", [hash], |_| Ok(()));
+                Ok(kept.optional()?.is_some())
+            })?;
+            let known = kept
+                || match self.get(url, &licash_api::deposit_state(&hash)).await {
+                    Ok(status) => {
+                        let drawn = (preimage, refund, ephemeral.public());
+                        match self.found_deposit(hub, url, drawn, status) {
+                            Ok(()) => found.push(self.deposit_record(&hash)?),
+                            Err(Error::Invalid(reason)) => {
+                                tracing::warn!(hash = %hex::encode(hash), %url, %reason, "a deposit found not this wallet's");
+                            }
+                            Err(e) => return Err(e),
+                        }
+                        true
+                    }
+                    Err(Error::Refused { problem, .. }) if problem.code == Code::UnknownLock => {
+                        false
+                    }
+                    Err(e) => return Err(e),
+                };
+            match known {
+                true => (unknown, next) = (0, number.saturating_add(1)),
+                false => unknown += 1,
+            }
+            number = number
+                .checked_add(1)
+                .ok_or_else(|| Error::Invalid(format!("hub {url}: no deposit number left")))?;
+        }
+        self.store.write(|tx| {
+            tx.execute(
+                "UPDATE hubs SET deposit_next = MAX(COALESCE(deposit_next, 0), ?2) WHERE id = ?1",
+                params![hub, next],
+            )?;
+            Ok(())
+        })?;
+        tracing::info!(%url, found = found.len(), next, "deposits looked for");
+        Ok(found)
+    }
+
+    /// Keep the deposit of this wallet's seed `drawn` (its preimage,
+    /// refund key and outputs' ephemeral key) as the hub `hub` at `url`
+    /// says it stands, `status`: what was asked and the terms answered
+    /// checked to be of its hash and keys. Refused as invalid otherwise.
+    fn found_deposit(
+        &self,
+        hub: i64,
+        url: &str,
+        drawn: ([u8; 32], SecretKey, licash::crypto::Point),
+        status: DepositStatus,
+    ) -> Result<(), Error> {
+        let (preimage, refund_key, mine) = drawn;
+        let wrong = |why: &str| Error::Invalid(format!("hub {url} found a deposit {why}"));
+        let (Some(request), Some(terms)) = (status.request, status.terms) else {
+            return Err(wrong("but not what was asked"));
+        };
+        let (_, ephemeral, hash) = request.receive.terms().map_err(|p| unavailable(url, p))?;
+        let refund = Hex(x_only(&refund_key).serialize().to_vec());
+        if hash != lock_hash(&preimage) || ephemeral != mine || request.refund != refund {
+            return Err(wrong("asked by another"));
+        }
+        let outputs = request.receive.outputs().map_err(|p| unavailable(url, p))?;
+        let amount = outputs
+            .iter()
+            .try_fold(0u64, |sum, o| sum.checked_add(o.denomination()))
+            .ok_or_else(|| wrong("of outputs overflowing"))?;
+        let claim =
+            XOnlyPublicKey::from_slice(&terms.claim.0).map_err(|_| wrong("claimed by no key"))?;
+        let htlc = Htlc {
+            hash,
+            claim,
+            refund: x_only(&refund_key),
+            timeout: terms.timeout,
+        };
+        let network = licash_onchain::network(self.network());
+        if htlc.address(network).to_string() != terms.address {
+            return Err(wrong(&format!("at {}, not its terms", terms.address)));
+        }
+        let found = Asked {
+            hash,
+            preimage,
+            refund_key,
+            amount,
+            body: request,
+        };
+        self.store.write(|tx| {
+            found.keep(tx, hub)?;
+            keep_terms(tx, &hash, &htlc, &terms, network)
+        })?;
+        tracing::info!(hash = %hex::encode(hash), %url, amount, "deposit found");
+        Ok(())
     }
 }
 

@@ -60,12 +60,13 @@ one refused for its fee is not retried at a higher one. `optimize <hub>`
 previews a remint with its fee; `optimize <hub> --max-fee SAT` makes it
 now, within that fee and the contract ceilings, bypassing the rests and the
 daily budget. `history` lists a remint as `optimized notes`, with its fee.
-A wallet file is upgraded to version 15 when first opened by this version,
+A wallet file is upgraded to version 16 when first opened by this version,
 which older versions refuse: notes unlinked before version 8 begin their
 rest then, no lock reads as claimed by a recovery or owed to the wallet
 on Bitcoin, no payout as paying a silent payment address, no cold storage
-is configured, and nothing is reminted or asked of a hub by the upgrade
-itself.
+is configured, each hub's deposits are numbered from the seed from then on
+(those made before keep their random secrets and are not looked for), and
+nothing is reminted or asked of a hub by the upgrade itself.
 
 `code` prints a payment code (a BIP321 URI, `--qr` for a QR code) naming the
 wallet, the hubs it is paid at and its Nostr mailbox, if they name relays.
@@ -132,7 +133,10 @@ another, with no notes of the provider at the other.
 Through a hub taking deposits, `deposit <amount>` prints a BIP21 URI to pay
 on Bitcoin, the hub's fee on top; `resume` takes the notes once the payment
 confirmed. A deposit never received is taken back after its timeout with
-`refund <hash> --to <address> --chain <url>`.
+`refund <hash> --to <address> --chain <url>`. A deposit's secrets derive
+from the seed, the hub and its number there: a wallet restored from its
+seed finds the deposits it asked at a hub as it adds it (until 20 numbers
+in a row are unknown there), then takes them on or refunds them as any.
 
 `code` prints `licash:<code>`, naming the wallet's mailbox and at most three
 of its hubs: by default those whose contracts have the most room to protect

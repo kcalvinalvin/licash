@@ -735,7 +735,7 @@ pub struct LockOutput {
 /// Ask for an invoice whose payment locks the hub's own notes to
 /// `outputs`, under `keyset`, derived with `ephemeral`, on the preimage of
 /// `hash`. The invoice asks for their value and the hub's receive fee.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Receive {
     pub keyset: Hex,
     pub ephemeral: Hex,
@@ -1006,7 +1006,7 @@ impl Deposits {
 /// own notes to the outputs of `receive`, as over Lightning, on the
 /// preimage of its hash. `refund`, an x-only key, takes the coins back
 /// after the deposit's timeout.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Deposit {
     #[serde(flatten)]
     pub receive: Receive,
@@ -1027,13 +1027,19 @@ pub struct Depositing {
 }
 
 /// Where a deposit stands: as a receipt over Lightning, with its payment
-/// once confirmed.
+/// once confirmed. With what was asked, `request`, and the terms answered,
+/// `terms`: a wallet that lost its record of the deposit, its secrets
+/// derived from its seed, finds it again by its hash and takes it on.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DepositStatus {
     #[serde(flatten)]
     pub status: ReceiveStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub funding: Option<Funding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request: Option<Deposit>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terms: Option<Depositing>,
 }
 
 /// A deposit's payment: output `vout` of transaction `txid`, confirmed in

@@ -32,6 +32,7 @@ const MIGRATIONS: &[&str] = &[
     OWED_LOCKS,
     SILENT_PAYOUTS,
     COLD,
+    DEPOSIT_NUMBERS,
 ];
 
 /// Version 15: cold storage ([`crate::Wallet::set_cold`]), at most one: the
@@ -70,6 +71,17 @@ CREATE TABLE cold_coins (
 const SILENT_PAYOUTS: &str = "
 ALTER TABLE payouts ADD COLUMN blind BLOB;
 ALTER TABLE payouts ADD COLUMN share BLOB;
+";
+
+/// Version 16: deposits' secrets derived from the seed, by hub and number
+/// ([`crate::deposits`]), and the next number at each hub: none at a hub
+/// added since, until its deposits are looked for there, those asked of a
+/// wallet of the same seed that lost its file. A hub of an older file
+/// holds none of them, its deposits' secrets drawn at random: the first
+/// number is next there, and none is looked for.
+const DEPOSIT_NUMBERS: &str = "
+ALTER TABLE hubs ADD COLUMN deposit_next INTEGER;
+UPDATE hubs SET deposit_next = 0;
 ";
 
 /// Version 13: the locks paying the wallet whose preimage it revealed to

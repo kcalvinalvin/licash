@@ -705,7 +705,12 @@ impl Gateway {
         if record.body != canonical {
             return Err(refused("another deposit under this hash"));
         }
-        Ok(Depositing {
+        Ok(self.terms(&record))
+    }
+
+    /// The terms answered for the deposit `record`.
+    fn terms(&self, record: &Record) -> Depositing {
+        Depositing {
             address: record
                 .htlc
                 .address(licash_chain_client::network(self.profile))
@@ -714,10 +719,11 @@ impl Gateway {
             claim: Hex(record.htlc.claim.serialize().to_vec()),
             timeout: record.htlc.timeout,
             fund_by: record.fund_by,
-        })
+        }
     }
 
-    /// Where the deposit under `hash` stands.
+    /// Where the deposit under `hash` stands, with what was asked and the
+    /// terms answered: whoever knows its hash, its wallet, finds it again.
     pub fn deposit_status(&self, hash: &[u8; 32]) -> Result<DepositStatus, Failure> {
         let record = self.store.get(hash).map_err(store_down)?.ok_or_else(|| {
             Failure(Problem::new(
@@ -735,6 +741,8 @@ impl Gateway {
                 vout: outpoint.vout,
                 height,
             }),
+            request: serde_json::from_str(&record.body).ok(),
+            terms: Some(self.terms(&record)),
         })
     }
 

@@ -551,7 +551,7 @@ fn a_wallet_file_of_version_5_trusts_every_hub_it_had() {
     let version: i64 = db
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 15);
+    assert_eq!(version, 16);
     assert_eq!(wallet.hubs().unwrap().len(), 1);
     assert_eq!(wallet.balance().unwrap().len(), 1);
     assert!(wallet.visited().unwrap().is_empty());
@@ -572,7 +572,7 @@ async fn a_wallet_file_of_version_6_renews_nothing_unasked() {
     let version: i64 = db
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 15);
+    assert_eq!(version, 16);
     assert_eq!(wallet.unlink().await.unwrap(), 0);
     assert!(wallet.sends().unwrap().is_empty());
     assert_eq!(wallet.hubs().unwrap().len(), 1);
@@ -614,6 +614,7 @@ async fn a_wallet_file_of_version_8_starts_a_privacy_rest_without_reminting() {
          ALTER TABLE locks DROP COLUMN via_invoice;
          ALTER TABLE locks DROP COLUMN claimed_by;
          DROP TABLE owed_locks;
+         ALTER TABLE hubs DROP COLUMN deposit_next;
          UPDATE notes SET added_at = 1;
          PRAGMA user_version = 8;",
     )
@@ -703,7 +704,13 @@ async fn a_wallet_file_of_version_7_mails_nothing_unasked() {
     let version: i64 = db
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 15);
+    assert_eq!(version, 16);
+    // Its hub holds no deposit of the seed's: its first number next, none
+    // looked for.
+    let next: Option<i64> = db
+        .query_row("SELECT deposit_next FROM hubs", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(next, Some(0));
     // Its payments were mailed, or handed over, as they were made.
     assert_eq!(wallet.delivering().unwrap(), 0);
     assert!(wallet.due().await.unwrap().is_empty());

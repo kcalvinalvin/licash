@@ -939,6 +939,53 @@ async fn a_deposit_paid_an_amount_exactly_is_given_up_unpaid_or_refunded_once_du
 }
 
 #[tokio::test]
+async fn a_wallet_restored_from_its_seed_finds_the_deposits_it_asked_and_takes_them_on() {
+    let net = Net::new().await;
+    let alice = net.wallet("alice");
+    // Two asked, one paid, then the wallet's file lost.
+    let paid = alice.deposit(HUB, 3_000).await.unwrap();
+    let unpaid = alice.deposit_paying(HUB, 2_100).await.unwrap();
+    let terms = paid.terms.clone().unwrap();
+    net.mine(1, vec![payment(&terms.address, 3_100, 1)]);
+    net.deposits.round().await;
+    let asked = alice.deposits().unwrap();
+    drop(alice);
+
+    // The same seed, a new file: adding the hub finds both, as they were
+    // asked and answered, the payment as its hub saw it.
+    let path = net.dir.path().join("restored.sqlite");
+    let mut seed = [0; 32];
+    seed[..5].copy_from_slice(b"alice");
+    let network = ChainProfile::Core30DefaultRegtest;
+    let restored = Wallet::create(&path, &seed, network, Local(net.app.clone())).unwrap();
+    restored.add_hub(HUB).await.unwrap();
+    let found = restored.deposits().unwrap();
+    let key = |d: &licash_wallet::Deposit| (d.hash.clone(), d.amount, d.terms.clone());
+    let mut want: Vec<_> = asked.iter().map(key).collect();
+    let mut got: Vec<_> = found.iter().map(key).collect();
+    want.sort_by(|a, b| a.0.cmp(&b.0));
+    got.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(got, want);
+    // Taken on: the paid one received at depth.
+    net.mine(1, Vec::new());
+    net.deposits.round().await;
+    let received = restored.follow_deposit(&paid.hash).await.unwrap();
+    assert_eq!(received.state, DepositState::Received);
+    assert_eq!(available(&restored), 3_000);
+    // Looked for again, none new; the next one asked under a hash of its
+    // own, the hub answering it.
+    assert!(restored.find_deposits(HUB).await.unwrap().is_empty());
+    let next = restored.deposit(HUB, 1_000).await.unwrap();
+    assert!(next.terms.is_some(), "{next:?}");
+    assert!(![&paid.hash, &unpaid.hash].contains(&&next.hash));
+
+    // Another seed's wallet finds none of them.
+    let bob = net.wallet("bob");
+    bob.add_hub(HUB).await.unwrap();
+    assert!(bob.deposits().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn a_payment_reorganized_away_locks_nothing_and_one_locked_alerts() {
     let net = Net::new().await;
     let alice = net.wallet("alice");
