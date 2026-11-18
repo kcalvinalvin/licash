@@ -426,6 +426,7 @@ impl Openings {
     /// ([`dispute`]). Each opening's error is reported independently.
     pub async fn answer_requests(&self) -> Result<ResponseRound> {
         let ids = self.store().signed_ids()?;
+        self.keep_loaded(&ids);
         let mut round = ResponseRound::default();
         for id in ids {
             match self.play(&id).await {

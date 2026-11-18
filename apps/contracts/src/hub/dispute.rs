@@ -51,11 +51,16 @@ pub type Evidencer = dyn Fn(&UnsignedClaim) -> Result<Vec<Evidence>> + Send + Sy
 /// A coin's first spend, once found: its block's height and it.
 type Spend = Option<(u32, Transaction)>;
 
-/// The caches of the responder: each coin's first spend once seen, and
-/// how far its blocks were looked through; the proofs being made; what
-/// was noted once.
+/// A signed opening as loaded, checked and its graph built: by the digest
+/// of the state it was loaded from.
+type Loaded = ([u8; 32], Arc<(Hub, HubOpening)>);
+
+/// The caches of the responder: each signed opening as loaded, while its
+/// state is unchanged; each coin's first spend once seen, and how far its
+/// blocks were looked through; the proofs being made; what was noted once.
 #[derive(Default)]
 pub(super) struct Watch {
+    loaded: Mutex<HashMap<[u8; 32], Loaded>>,
     spends: Mutex<HashMap<OutPoint, (u32, Spend)>>,
     proving: Arc<Mutex<HashSet<[u8; 32]>>>,
     noted: Mutex<HashSet<([u8; 32], &'static str)>>,
@@ -84,12 +89,51 @@ pub enum Played {
 }
 
 impl Openings {
+    /// Opening `id` loaded from `state`: checked, its graph built and
+    /// signed, which takes seconds, once for each state it is in rather
+    /// than every poll. Its checks see nothing but `state` and the trusted
+    /// program.
+    fn loaded(
+        &self,
+        id: &[u8; 32],
+        state: &[u8],
+        ctx: &licash_contract::opening::Context,
+    ) -> Result<Arc<(Hub, HubOpening)>> {
+        let digest: [u8; 32] = Sha256::digest(state).into();
+        let cache = || {
+            self.watch
+                .loaded
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+        };
+        if let Some((seen, loaded)) = cache().get(id) {
+            if *seen == digest {
+                return Ok(loaded.clone());
+            }
+        }
+        let hub = Hub::load(state, ctx)?;
+        let o = hub.signed()?;
+        let loaded = Arc::new((hub, o));
+        cache().insert(*id, (digest, loaded.clone()));
+        Ok(loaded)
+    }
+
+    /// Forget the openings loaded but those of `ids`: played no more.
+    pub(super) fn keep_loaded(&self, ids: &[[u8; 32]]) {
+        let mut cache = self
+            .watch
+            .loaded
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        cache.retain(|id, _| ids.contains(id));
+    }
+
     pub(super) async fn play(&self, id: &[u8; 32]) -> Result<Played> {
         let ctx = self.context().await.map_err(|e| anyhow!(e.reason))?;
         let row = self.store().row(id)?.context("no signed opening")?;
         ensure!(!row.abandoned, "an opening given up");
-        let hub = Hub::load(&row.state, &ctx)?;
-        let o = hub.signed()?;
+        let loaded = self.loaded(id, &row.state, &ctx)?;
+        let (hub, o) = (&loaded.0, &loaded.1);
         let tip = ctx.tip;
         let funding = &o.funding;
         let contract = OutPoint {
@@ -100,7 +144,7 @@ impl Openings {
         // The cheap check first: her contract stands, and past its close
         // the default ends it.
         if self.unspent(contract, true).await? {
-            return self.close(id, &hub, &o, tip).await;
+            return self.close(id, hub, o, tip).await;
         }
         let Some((r_at, r)) = self.spend(contract, &funding.output[0], from, tip).await? else {
             return Ok(Played::Idle);
@@ -129,34 +173,34 @@ impl Openings {
         };
         // Whatever followed her request, then what follows that.
         let Some((x_at, x)) = self.spend(main(&r), &r.output[0], r_at, tip).await? else {
-            return self.decide(id, &hub, &o, &r, r_at, tip).await;
+            return self.decide(id, hub, o, &r, r_at, tip).await;
         };
         let respond = presign(&o.set, "respond")?;
         if x.compute_txid() != respond.tx.compute_txid() {
-            return self.collect(id, &hub, &o, &r, None, (x_at, &x), tip).await;
+            return self.collect(id, hub, o, &r, None, (x_at, &x), tip).await;
         }
         let Some((y_at, y)) = self.spend(main(&x), &x.output[0], x_at, tip).await? else {
-            return self.assert(id, &hub, &o, &r, r_at, &x, x_at, tip).await;
+            return self.assert(id, hub, o, &r, r_at, &x, x_at, tip).await;
         };
         let assert = presign(&o.set, "assert")?;
         if y.compute_txid() != assert.tx.compute_txid() {
             return self
-                .collect(id, &hub, &o, &r, Some(&x), (y_at, &y), tip)
+                .collect(id, hub, o, &r, Some(&x), (y_at, &y), tip)
                 .await;
         }
         let Some((z_at, z)) = self.spend(main(&y), &y.output[0], y_at, tip).await? else {
-            return self.succeed(id, &hub, &o, y_at, tip).await;
+            return self.succeed(id, hub, o, y_at, tip).await;
         };
         let challenge = presign(&o.set, "challenge_assert")?;
         if z.compute_txid() != challenge.tx.compute_txid() {
             return self
-                .collect(id, &hub, &o, &r, Some(&x), (z_at, &z), tip)
+                .collect(id, hub, o, &r, Some(&x), (z_at, &z), tip)
                 .await;
         }
         match self.spend(main(&z), &z.output[0], z_at, tip).await? {
-            None => self.answer(id, &hub, &o, &y, &z).await,
+            None => self.answer(id, hub, o, &y, &z).await,
             Some((end_at, end)) => {
-                self.collect(id, &hub, &o, &r, Some(&x), (end_at, &end), tip)
+                self.collect(id, hub, o, &r, Some(&x), (end_at, &end), tip)
                     .await
             }
         }
