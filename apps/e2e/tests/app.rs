@@ -325,7 +325,6 @@ async fn donated(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     phone.home(30).await?;
 
     // Stopped, the app is paid as LNURL-pay has it.
-    // Read the balance here so optimization during navigation is accounted for.
     let before = phone.balance().await?;
     phone
         .shell(&format!("am force-stop {}", licash_e2e::phone::PACKAGE))
@@ -348,12 +347,17 @@ async fn donated(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     phone.launch().await?;
     phone.home(60).await?;
     let gets = donated - terms.fee.due(donated);
-    let now = changed(phone, before, 120).await?;
-    ensure!(
-        now == before + gets,
-        "{now} held after a donation of {donated}, expected {before} + {gets}"
-    );
-    Ok(())
+    // Resuming can also charge a note optimization fee. Check the
+    // donation itself in Activity, where it is separate from that fee.
+    until("the balance to increase after the donation", 120, || async {
+        Ok((phone.balance().await? > before).then_some(()))
+    })
+    .await?;
+    opened(phone, "Received").await?;
+    phone.tagged("amount", &format!("+{} sat", digits(gets)), 10).await?;
+    phone.tagged("state", "Received", 10).await?;
+    phone.back().await?;
+    phone.back_to("receive").await
 }
 
 /// `12,345`, as the app writes amounts.
