@@ -62,10 +62,12 @@ done
 
 | Network | Program | Image id | Built from |
 |---|---|---|---|
-| signet | `hp` (the Hub's statement), new contracts | `aa7f2d19079b339b1fee1e7666f445232f012965dc7c0ab8c35fb560a4d68a73` | 9d0f04f |
+| signet | `hp` (the Hub's statement), new contracts | `817b403459c7b3ed2ea6dd707f0a75b7cc8ac564a601c74da6de92d9c0b6bd52` | 31fb677 |
+| signet | `hp`, contracts opened before (v3 and v4 Bases) | `aa7f2d19079b339b1fee1e7666f445232f012965dc7c0ab8c35fb560a4d68a73` | 9d0f04f |
 | signet | `hp`, contracts opened before (v3 Bases) | `6bf78e6092f9c0959cee4908b449a032e575d527c5c889d8b9f3813b888f0d0c` | 0f86cc6 |
 
-The program before checks no signature of her request (a v3 Base binds
+The newest program reads co-funded (v5) Bases as well, whose claims name
+the notes she funded her contract with. The oldest program checks no signature of her request (a v3 Base binds
 no keys), reads a request's digits above 15 as Bitcoin doesn't, and owes
 a lock's refund claimed before its expiry, which a payer may take and
 then activate the lock as its payee: its contracts keep that exposure

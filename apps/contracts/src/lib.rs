@@ -312,17 +312,18 @@ pub fn trust(profile: ChainProfile) -> Result<Trust> {
 /// proven with it alone, so none named here or in [`SIGNET_BEFORE`] is
 /// ever to go. A contract keeps its program when this one changes.
 pub const SIGNET: [u8; 32] =
-    hex!("aa7f2d19079b339b1fee1e7666f445232f012965dc7c0ab8c35fb560a4d68a73");
+    hex!("817b403459c7b3ed2ea6dd707f0a75b7cc8ac564a601c74da6de92d9c0b6bd52");
 
 /// The programs signet contracts opened under before [`SIGNET`], newest
 /// first: no contract opens under them, those that did are played still.
-/// `6bf78e60…`'s statement (of v3 Bases) checks no signature of her
-/// request, reads a request's digits above 15 as Bitcoin doesn't, and
-/// owes a lock's Refund before it expired: a trial's exposure, left to its
-/// contracts' end.
-pub const SIGNET_BEFORE: [[u8; 32]; 1] = [hex!(
-    "6bf78e6092f9c0959cee4908b449a032e575d527c5c889d8b9f3813b888f0d0c"
-)];
+/// `aa7f2d19…` reads v3 and v4 Bases, not the co-funded v5. `6bf78e60…`'s
+/// statement (of v3 Bases) checks no signature of her request, reads a
+/// request's digits above 15 as Bitcoin doesn't, and owes a lock's Refund
+/// before it expired: a trial's exposure, left to its contracts' end.
+pub const SIGNET_BEFORE: [[u8; 32]; 2] = [
+    hex!("aa7f2d19079b339b1fee1e7666f445232f012965dc7c0ab8c35fb560a4d68a73"),
+    hex!("6bf78e6092f9c0959cee4908b449a032e575d527c5c889d8b9f3813b888f0d0c"),
+];
 
 /// The programs contracts on `profile` opened under before the one they
 /// open under now ([`trust`]): played still.
@@ -441,14 +442,15 @@ mod tests {
     fn the_hub_statement_image_is_pinned() {
         assert_eq!(
             SIGNET,
-            hex!("aa7f2d19079b339b1fee1e7666f445232f012965dc7c0ab8c35fb560a4d68a73"),
+            hex!("817b403459c7b3ed2ea6dd707f0a75b7cc8ac564a601c74da6de92d9c0b6bd52"),
             "keep every funded contract's pinned guest available when changing opening trust"
         );
         assert_eq!(
             SIGNET_BEFORE,
-            [hex!(
-                "6bf78e6092f9c0959cee4908b449a032e575d527c5c889d8b9f3813b888f0d0c"
-            )],
+            [
+                hex!("aa7f2d19079b339b1fee1e7666f445232f012965dc7c0ab8c35fb560a4d68a73"),
+                hex!("6bf78e6092f9c0959cee4908b449a032e575d527c5c889d8b9f3813b888f0d0c"),
+            ],
             "a program contracts opened under is never to go"
         );
     }
