@@ -69,10 +69,13 @@ async fn notes_are_paid_out_to_a_bitcoin_address_through_the_provider() -> anyho
     let quote = alice
         .payout_quote(eco.swaps(), hub1, &payee, 10_000, 3_000, rate)
         .await?;
-    assert_eq!(found[0].quote, quote);
-    let payout = alice
-        .payout(eco.swaps(), hub1, &payee, 10_000, 3_000, rate)
-        .await?;
+    // As asked, each under a ticket of its own.
+    let asked =
+        |q: &licash_wallet::PayoutQuote| (q.info.clone(), q.amount, q.budget, q.fee, q.lock_fee);
+    assert_eq!(asked(&found[0].quote), asked(&quote));
+    assert_ne!(found[0].quote.ticket, quote.ticket);
+    let payout = alice.payout(&quote).await?;
+    assert_eq!(payout.hash, quote.ticket);
     assert_eq!(payout.state, PayoutState::Open, "{payout:?}");
     assert_eq!((payout.budget, payout.fee), (quote.budget, quote.fee));
     let lock = payout.lock.clone().context("a lock")?;
@@ -139,7 +142,7 @@ async fn notes_are_paid_out_to_a_bitcoin_address_through_the_provider() -> anyho
     // Beyond what it pays out: Alice locks nothing.
     let max = eco.swaps_info().await?.chain.unwrap().max;
     let e = alice
-        .payout(eco.swaps(), hub1, &payee, max, 3_000, rate)
+        .payout_quote(eco.swaps(), hub1, &payee, max, 3_000, rate)
         .await
         .unwrap_err();
     assert!(matches!(e, licash_wallet::Error::Invalid(_)), "{e}");

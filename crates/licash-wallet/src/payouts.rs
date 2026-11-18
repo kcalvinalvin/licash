@@ -1,9 +1,11 @@
 //! Payouts: notes paid out on Bitcoin through a swap provider
 //! ([`licash_api::swaps`]), as a reverse submarine swap.
 //!
-//! The wallet draws a preimage and a key to claim with, and records them
-//! with the payee before it locks the coin's value and the provider's fee
-//! to the provider at hub `from`, under the preimage's hash. The provider
+//! The wallet draws a preimage when it is quoted ([`PayoutQuote::ticket`]
+//! is its hash), and a key to claim with when it pays the quote out. It
+//! records them with the payee, the lock of the coin's value and the
+//! provider's fee to the provider at hub `from`, under the preimage's
+//! hash, and the notes that lock takes, at once, before it sends anything. The provider
 //! then locks a coin on Bitcoin under the same hash ([`Htlc`]): the
 //! wallet's key and the preimage claim it, the provider's key takes it back
 //! after its timeout. Once the wallet found the coin on its own view of the
@@ -70,9 +72,27 @@ pub fn payout_depth(network: ChainProfile) -> u32 {
 }
 
 /// What a provider asks to pay notes out on Bitcoin
-/// ([`Wallet::payout_quote`]).
+/// ([`Wallet::payout_quote`]), and the payout it is for: what
+/// [`Wallet::payout`] pays, once.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PayoutQuote {
+    /// The payout's id once paid ([`Payout::hash`]), known before: the
+    /// hash of the preimage it is drawn under.
+    pub ticket: String,
+    /// The provider's URL, normalized.
+    pub provider: String,
+    /// The URL of the hub the notes are at, normalized.
+    pub from: String,
+    /// The payee, an address on Bitcoin, as shown.
+    pub address: String,
+    /// The most the payout may cost on top of the amount, the hub's lock
+    /// fee as signed included.
+    pub max_fee: u64,
+    /// The rate the claim was budgeted for.
+    pub rate: FeeRate,
+    /// The height the wallet's lock expires at, at the latest: how long
+    /// its notes may stay locked if the provider never pays.
+    pub expiry: u32,
     /// What the provider said of itself, with what it pays out.
     pub info: swaps::Info,
     /// What the payee gets.
@@ -84,6 +104,25 @@ pub struct PayoutQuote {
     /// The hub's fee on the wallet's lock, as it charges now: on what is
     /// locked, in as many notes as it may take.
     pub lock_fee: u64,
+    preimage: Preimage,
+}
+
+/// A payout's preimage, secret until its claim: never shown.
+#[derive(Clone, PartialEq, Eq)]
+struct Preimage([u8; 32]);
+
+impl std::fmt::Debug for Preimage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Preimage(..)")
+    }
+}
+
+impl Preimage {
+    fn draw() -> Self {
+        let mut preimage = [0; 32];
+        OsRng.fill_bytes(&mut preimage);
+        Self(preimage)
+    }
 }
 
 impl PayoutQuote {
@@ -94,9 +133,14 @@ impl PayoutQuote {
 
     /// What the payout costs on top of the amount.
     pub fn costs(&self) -> u64 {
+        self.signed_costs(self.lock_fee)
+    }
+
+    /// What it costs on top of the amount, its lock's fee `lock_fee`.
+    fn signed_costs(&self, lock_fee: u64) -> u64 {
         self.budget
             .saturating_add(self.fee)
-            .saturating_add(self.lock_fee)
+            .saturating_add(lock_fee)
     }
 }
 
@@ -234,59 +278,70 @@ impl<T: Transport> Wallet<T> {
     ) -> Result<PayoutQuote, Error> {
         let provider = hub_url(provider)?;
         let from = hub_url(from)?;
-        let (script, _) = self.payout_payee(to)?;
-        let (_, from_info) = self.hub(&from)?;
-        let info: swaps::Info = self.get(&provider, swaps::SWAPS_INFO).await?;
-        let terms = Terms {
-            provider: &provider,
-            from: (&from, &from_info),
-            script: &script,
-            amount,
-            max_fee,
-            rate,
-        };
-        terms.quote(info)
-    }
-
-    /// Pay `amount` to `to`, an address on Bitcoin, from notes at the hub
-    /// at `from`, added, through the provider at `provider`, on the terms
-    /// of [`Wallet::payout_quote`]: lock the coin's value and the fees to
-    /// the provider at `from`, then claim the coin it locks on Bitcoin.
-    /// Where the payout stands once its lock is made, whatever the provider
-    /// answered; [`Wallet::follow_payout`] takes it on.
-    pub async fn payout(
-        &self,
-        provider: &str,
-        from: &str,
-        to: &str,
-        amount: u64,
-        max_fee: u64,
-        rate: FeeRate,
-    ) -> Result<Payout, Error> {
-        let provider = hub_url(provider)?;
-        let from = hub_url(from)?;
         let (script, address) = self.payout_payee(to)?;
-        let from_hub = self.hub(&from)?.0;
+        self.hub(&from)?;
         let (_, from_info) = self.refresh(&from).await?;
         let info: swaps::Info = self.get(&provider, swaps::SWAPS_INFO).await?;
         let terms = Terms {
             provider: &provider,
             from: (&from, &from_info),
             script: &script,
+            address: &address,
             amount,
             max_fee,
             rate,
+            expiry: None,
         };
-        let quote = terms.quote(info)?;
+        terms.quote(info, Preimage::draw())
+    }
+
+    /// Pay out as `quote` says, under its ticket: lock the coin's value and
+    /// the fees to the provider at its hub, then claim the coin it locks
+    /// on Bitcoin. The provider is asked again: refused as
+    /// [`Error::Invalid`] if it now asks more than the quote's `max_fee`,
+    /// the hub's lock fee as signed included, or its coin would time out
+    /// too soon for a lock expiring by the quote's `expiry`, or the quote
+    /// was paid already. Where the payout stands once its lock is made,
+    /// whatever the provider answered; [`Wallet::follow_payout`] takes it
+    /// on. Failed before any lock was made, the payout is recorded failed
+    /// all the same, nothing locked.
+    pub async fn payout(&self, quote: &PayoutQuote) -> Result<Payout, Error> {
+        let (provider, from) = (&quote.provider, &quote.from);
+        let preimage = quote.preimage.0;
+        let hash = lock_hash(&preimage);
+        let paid = self.store.read(|c| {
+            Ok(
+                c.query_row("SELECT 1 FROM payouts WHERE hash = ?1", [hash], |_| Ok(()))
+                    .optional()?
+                    .is_some(),
+            )
+        })?;
+        if paid {
+            return Err(Error::Invalid(format!(
+                "payout {} was made already: ask for another quote",
+                quote.ticket
+            )));
+        }
+        let (script, address) = self.payout_payee(&quote.address)?;
+        let from_hub = self.hub(from)?.0;
+        let (_, from_info) = self.refresh(from).await?;
+        let info: swaps::Info = self.get(provider, swaps::SWAPS_INFO).await?;
+        let terms = Terms {
+            provider,
+            from: (from, &from_info),
+            script: &script,
+            address: &address,
+            amount: quote.amount,
+            max_fee: quote.max_fee,
+            rate: quote.rate,
+            expiry: Some(quote.expiry),
+        };
+        // Asked again, within the quote's bounds.
+        let quote = terms.quote(info, quote.preimage.clone())?;
         let locks = from_info.locks.as_ref().ok_or_else(|| {
             Error::Invalid(format!("hub {from} follows no chain: it takes no locks"))
         })?;
-        let expiry = locks
-            .latest_expiry(locks.min_depth.max(1))
-            .map_err(|p| unavailable(&from, p))?;
-        let mut preimage = [0; 32];
-        OsRng.fill_bytes(&mut preimage);
-        let hash = lock_hash(&preimage);
+        let amount = quote.amount;
         let claim_key = random_key().secret_bytes();
         let insert = |tx: &rusqlite::Transaction<'_>| -> Result<(), Error> {
             tx.execute(
@@ -314,16 +369,17 @@ impl<T: Transport> Wallet<T> {
         // Its lock prepared first, then the payout, its lock and its notes
         // taken at once: no follower ever sees the payout without its lock.
         let admitted = match self
-            .prepare_lock(
-                at,
-                &quote.info.address,
-                total,
-                hash,
-                Some(expiry),
-                Pays::Nothing,
-            )
+            .prepare_lock(at, &quote.info.address, total, hash, Some(quote.expiry), Pays::Nothing)
             .await
         {
+            // Its fee as the hub's lock signs it, not as estimated.
+            Ok(prepared) if quote.signed_costs(prepared.fee) > quote.max_fee => {
+                Err(Error::Invalid(format!(
+                    "provider {provider} and hub {from} ask {} sat to pay out {amount}, more than {}",
+                    quote.signed_costs(prepared.fee),
+                    quote.max_fee
+                )))
+            }
             Ok(prepared) => self
                 .store
                 .write(|tx| {
@@ -346,7 +402,7 @@ impl<T: Transport> Wallet<T> {
             hash = %hex::encode(hash), %provider, %from, %address, amount,
             budget = quote.budget, fee = quote.fee, "paying out"
         );
-        match self.send_lock(&from, &prepared).await {
+        match self.send_lock(from, &prepared).await {
             Ok(_) | Err(Error::Pending { .. }) => {}
             Err(e) => {
                 self.fail_payout(&hash, &format!("its lock was not made: {e}"))?;
@@ -922,16 +978,20 @@ struct Terms<'a> {
     provider: &'a str,
     from: (&'a str, &'a Info),
     script: &'a ScriptBuf,
+    address: &'a str,
     amount: u64,
     max_fee: u64,
     rate: FeeRate,
+    /// The latest the wallet's lock may expire at, if bounded.
+    expiry: Option<u32>,
 }
 
 impl Terms<'_> {
-    /// The quote of the provider saying `info` of itself, unless it pays
-    /// out nothing for a lock at `from`, not that much now, or asks more
-    /// than allowed.
-    fn quote(&self, info: swaps::Info) -> Result<PayoutQuote, Error> {
+    /// The quote of the provider saying `info` of itself, for a payout
+    /// drawn under `preimage`, unless it pays out nothing for a lock at
+    /// `from`, not that much now, times its coin out too soon for a lock
+    /// expiring by the bound, or asks more than allowed.
+    fn quote(&self, info: swaps::Info, preimage: Preimage) -> Result<PayoutQuote, Error> {
         let (provider, (from, from_info)) = (self.provider, self.from);
         let refuse = |why: String| Err(Error::Invalid(format!("provider {provider} {why}")));
         if self.amount == 0 {
@@ -953,6 +1013,7 @@ impl Terms<'_> {
         let latest = locks
             .latest_expiry(locks.min_depth.max(1))
             .map_err(|p| unavailable(from, p))?;
+        let latest = self.expiry.map_or(latest, |bound| bound.min(latest));
         if latest.saturating_sub(chain.margin) < locks.height.saturating_add(2 * CLAIM_ROOM) {
             return refuse(format!(
                 "times its coin out {} blocks before a lock at {from} expires: too soon to claim it",
@@ -977,11 +1038,19 @@ impl Terms<'_> {
         let fee = chain.pays(value) - value;
         let lock_fee = from_info.fees.locking().at_most(value.saturating_add(fee));
         let quote = PayoutQuote {
+            ticket: hex::encode(lock_hash(&preimage.0)),
+            provider: provider.into(),
+            from: from.into(),
+            address: self.address.into(),
+            max_fee: self.max_fee,
+            rate: self.rate,
+            expiry: latest,
             info,
             amount: self.amount,
             budget,
             fee,
             lock_fee,
+            preimage,
         };
         if quote.costs() > self.max_fee {
             return refuse(format!(

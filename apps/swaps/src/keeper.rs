@@ -859,10 +859,10 @@ impl<T: Transport + 'static> Keeper<T> {
                 return Ok(None);
             }
             let to = wallet.fallback_address()?.to_string();
-            wallet
-                .payout(via, url, &to, amount, max_fee, rate)
-                .await
-                .map(Some)
+            let quote = wallet
+                .payout_quote(via, url, &to, amount, max_fee, rate)
+                .await?;
+            wallet.payout(&quote).await.map(Some)
         };
         match paid.await {
             Ok(Some(payout)) => alerts.push((

@@ -93,17 +93,8 @@ impl Wallet {
     /// payout whose lock was made but which fails gets its notes back once
     /// the lock expires.
     pub fn pay_out(&self, quote: PayoutQuote) -> Result<Activity, LicashError> {
-        let pay = self.wallet.payout(
-            &quote.provider,
-            &quote.hub,
-            &quote.address,
-            quote.amount,
-            quote.fee,
-            claim_rate(),
-        );
-        let payout = self.runtime.block_on(pay)?;
-        tracing::info!(hash = %payout.hash, address = %payout.address, "paying out");
-        Ok(activity(&payout, self.lock_fee(&payout)?))
+        let ticketed = self.ticketed(&quote)?;
+        self.pay_ticketed(&ticketed)
     }
 
     /// Pay out as `quote` says, as [`Wallet::pay_out`]; if its provider
@@ -185,6 +176,26 @@ fn no_provider(amount: u64) -> LicashError {
 }
 
 impl Wallet {
+    /// The wallet's quote of `quote`, asked again, under a ticket of its
+    /// own: what pays it out, once.
+    fn ticketed(&self, quote: &PayoutQuote) -> Result<licash_wallet::PayoutQuote, LicashError> {
+        let ask = self.wallet.payout_quote(
+            &quote.provider,
+            &quote.hub,
+            &quote.address,
+            quote.amount,
+            quote.fee,
+            claim_rate(),
+        );
+        Ok(self.runtime.block_on(ask)?)
+    }
+
+    fn pay_ticketed(&self, quote: &licash_wallet::PayoutQuote) -> Result<Activity, LicashError> {
+        let payout = self.runtime.block_on(self.wallet.payout(quote))?;
+        tracing::info!(hash = %payout.hash, address = %payout.address, "paying out");
+        Ok(activity(&payout, self.lock_fee(&payout)?))
+    }
+
     /// The payout asked for, and the providers announced that quote it,
     /// the one to prefer first.
     fn payout_found(
@@ -354,14 +365,21 @@ impl Wallet {
         &self,
         quote: &PayoutQuote,
     ) -> Result<Result<Activity, LicashError>, LicashError> {
-        let before: Vec<String> = self.wallet.payouts()?.into_iter().map(|p| p.hash).collect();
-        let e = match self.pay_out(quote.clone()) {
+        let ticketed = match self.ticketed(quote) {
+            Ok(ticketed) => ticketed,
+            // Nothing recorded, nothing locked.
+            Err(e) => {
+                tracing::info!(provider = %quote.provider, "paying out failed, not quoted: {e}");
+                return Ok(Err(e));
+            }
+        };
+        let e = match self.pay_ticketed(&ticketed) {
             Ok(paying) => return Ok(Ok(paying)),
             Err(e) => e,
         };
-        // Newest first: the one this attempt recorded, if any.
+        // The one this attempt recorded, by its ticket, if any.
         let payouts = self.wallet.payouts()?;
-        match payouts.into_iter().find(|p| !before.contains(&p.hash)) {
+        match payouts.into_iter().find(|p| p.hash == ticketed.ticket) {
             // Under way: it is followed, never replaced.
             Some(payout) if matches!(payout.state, PayoutState::Open | PayoutState::Claimed) => {
                 tracing::info!(hash = %payout.hash, "paying out, pending: {e}");

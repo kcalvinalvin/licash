@@ -27,7 +27,7 @@ use licash_onchain::deposit::Htlc;
 use licash_wallet::{
     Error, LockState, Payout, PayoutState, Response, Transport, Wallet, CLAIM_ROOM,
 };
-use net::{Link, Net, View, TIMING};
+use net::{Fault, Link, Net, View, TIMING};
 
 const A: &str = "http://a.test";
 const PROVIDER: &str = "http://payouts.test";
@@ -58,11 +58,12 @@ const ONE_SAT: FeeRate = FeeRate::from_sat_per_vb_u32(1);
 async fn a_payout_whose_lock_cannot_be_prepared_keeps_its_failed_history_line() {
     let eco = Eco::new().await;
     let before = eco.held();
-    let error = eco
+    let quote = eco
         .client
-        .payout(PROVIDER, A, PAYEE, 2_700, MAX_FEE, ONE_SAT)
+        .payout_quote(PROVIDER, A, PAYEE, 2_700, MAX_FEE, ONE_SAT)
         .await
-        .unwrap_err();
+        .unwrap();
+    let error = eco.client.payout(&quote).await.unwrap_err();
     assert!(matches!(error, Error::Insufficient { .. }), "{error}");
     let payouts = eco.client.payouts().unwrap();
     assert_eq!(payouts.len(), 1);
@@ -75,37 +76,142 @@ async fn a_payout_whose_lock_cannot_be_prepared_keeps_its_failed_history_line() 
     assert_eq!(eco.held(), before);
 }
 
+/// The hub's lock fee as estimated is below what its lock signs once the
+/// notes it takes are chosen: the payout is refused at its quote's ceiling
+/// before anything is locked, a line of the history all the same.
 #[tokio::test]
-async fn a_legacy_payout_quote_estimates_the_lock_fee_before_gross_inputs_are_selected() {
+async fn a_payout_whose_signed_lock_fee_passes_its_ceiling_locks_nothing() {
     let eco = Eco::with_fee(Fee {
         base: 0,
         ppm: 100_000,
     })
     .await;
+    let before = eco.held();
+    let estimated = eco
+        .client
+        .payout_quote(PROVIDER, A, PAYEE, 1_000, MAX_FEE, ONE_SAT)
+        .await
+        .unwrap();
+    let quote = eco
+        .client
+        .payout_quote(PROVIDER, A, PAYEE, 1_000, estimated.costs(), ONE_SAT)
+        .await
+        .unwrap();
+    let error = eco.client.payout(&quote).await.unwrap_err();
+    assert!(matches!(error, Error::Invalid(_)), "{error}");
+    assert!(
+        error
+            .to_string()
+            .contains(&format!("more than {}", quote.costs())),
+        "{error}"
+    );
+    let payouts = eco.client.payouts().unwrap();
+    assert_eq!(payouts.len(), 1);
+    assert_eq!(payouts[0].hash, quote.ticket);
+    assert_eq!(
+        payouts[0].state,
+        PayoutState::Failed(format!("its lock was not made: {error}"))
+    );
+    assert!(payouts[0].lock.is_none());
+    assert!(eco.client.locks().unwrap().is_empty());
+    assert_eq!(eco.held(), before);
+    // Within a ceiling the signed fee fits: paid out, under its ticket.
     let quote = eco
         .client
         .payout_quote(PROVIDER, A, PAYEE, 1_000, MAX_FEE, ONE_SAT)
         .await
         .unwrap();
-    let payout = eco
-        .client
-        .payout(PROVIDER, A, PAYEE, 1_000, quote.costs(), ONE_SAT)
-        .await
-        .unwrap();
-    let lock = eco
-        .client
-        .locks()
-        .unwrap()
-        .into_iter()
-        .find(|l| Some(&l.id) == payout.lock.as_ref())
-        .unwrap();
+    let payout = eco.client.payout(&quote).await.unwrap();
+    assert_eq!(payout.hash, quote.ticket);
+    let lock = eco.client.locks().unwrap().remove(0);
     assert!(
         lock.fee > quote.lock_fee,
-        "actual {}, quoted {}",
+        "{} by {}",
         lock.fee,
         quote.lock_fee
     );
-    assert!(quote.budget + quote.fee + lock.fee > quote.costs());
+}
+
+/// A payout admitted whose lock never reached its hub (as if the wallet
+/// stopped before sending it) is open with its lock and notes: reopened,
+/// the wallet sends that lock and has the provider take the payout.
+#[tokio::test]
+async fn a_payout_whose_lock_was_never_sent_goes_on_once_reopened() {
+    let eco = Eco::new().await;
+    let quote = eco
+        .client
+        .payout_quote(PROVIDER, A, PAYEE, 500, MAX_FEE, ONE_SAT)
+        .await
+        .unwrap();
+    // Sent, then sent again before the provider is asked: both lost.
+    eco.net.fail(licash_api::LOCK, Fault::Lost);
+    eco.net.fail(licash_api::LOCK, Fault::Lost);
+    let payout = eco.client.payout(&quote).await.unwrap();
+    assert_eq!(payout.state, PayoutState::Open, "{payout:?}");
+    let lock = eco.client.locks().unwrap().remove(0);
+    assert_eq!(Some(&lock.id), payout.lock.as_ref());
+    assert_eq!(lock.state, LockState::Requested);
+    assert!(eco.desk.taken.lock().unwrap().is_empty());
+    let reopened = Eco::client(&eco.net, &eco.desk, &eco.dir, false).await;
+    match reopened.follow_payout(&payout.hash, &eco.view).await {
+        Ok(_) | Err(Error::Pending { .. }) => {}
+        Err(e) => panic!("{e}"),
+    }
+    let lock = reopened.locks().unwrap().remove(0);
+    assert_eq!(lock.state, LockState::Locked, "{lock:?}");
+    assert_eq!(eco.desk.taken.lock().unwrap().len(), 1);
+    let payout = reopened.payouts().unwrap().remove(0);
+    assert_eq!(payout.state, PayoutState::Open, "{payout:?}");
+}
+
+/// A quote pays out once: paid again, it is refused, nothing more locked.
+#[tokio::test]
+async fn a_quote_pays_out_once() {
+    let eco = Eco::new().await;
+    let quote = eco
+        .client
+        .payout_quote(PROVIDER, A, PAYEE, 500, MAX_FEE, ONE_SAT)
+        .await
+        .unwrap();
+    eco.client.payout(&quote).await.unwrap();
+    let held = eco.held();
+    let e = eco.client.payout(&quote).await.unwrap_err();
+    assert!(matches!(e, Error::Invalid(_)), "{e}");
+    assert_eq!(eco.client.payouts().unwrap().len(), 1);
+    assert_eq!(eco.client.locks().unwrap().len(), 1);
+    assert_eq!(eco.held(), held);
+}
+
+/// A quote's expiry bounds its lock's: paid out blocks later, the lock
+/// expires no later than quoted; quoted too long before, the provider's
+/// coin would time out too soon, and nothing is locked.
+#[tokio::test]
+async fn a_quotes_expiry_bounds_its_lock() {
+    let eco = Eco::new().await;
+    let quote = eco
+        .client
+        .payout_quote(PROVIDER, A, PAYEE, 500, MAX_FEE, ONE_SAT)
+        .await
+        .unwrap();
+    eco.mine(2);
+    let payout = eco.client.payout(&quote).await.unwrap();
+    let lock = eco.client.locks().unwrap().remove(0);
+    assert_eq!(Some(&lock.id), payout.lock.as_ref());
+    assert!(
+        lock.expiry <= quote.expiry,
+        "{} by {}",
+        lock.expiry,
+        quote.expiry
+    );
+    let stale = eco
+        .client
+        .payout_quote(PROVIDER, A, PAYEE, 500, MAX_FEE, ONE_SAT)
+        .await
+        .unwrap();
+    eco.mine_to(stale.expiry);
+    let e = eco.client.payout(&stale).await.unwrap_err();
+    assert!(e.to_string().contains("too soon to claim it"), "{e}");
+    assert_eq!(eco.client.payouts().unwrap().len(), 1);
 }
 
 /// A follower elsewhere (here a second handle on the same wallet, on
@@ -421,11 +527,12 @@ impl Eco {
     /// Pay `amount` out to [`PAYEE`]: the client's lock made, the provider
     /// asked.
     async fn pay_out(&self, amount: u64) -> Payout {
-        let payout = self
+        let quote = self
             .client
-            .payout(PROVIDER, A, PAYEE, amount, MAX_FEE, ONE_SAT)
+            .payout_quote(PROVIDER, A, PAYEE, amount, MAX_FEE, ONE_SAT)
             .await
             .unwrap();
+        let payout = self.client.payout(&quote).await.unwrap();
         assert!(payout.lock.is_some(), "{payout:?}");
         payout
     }
@@ -589,8 +696,13 @@ async fn a_payout_pays_the_address_exactly_and_the_provider_its_lock() {
 async fn a_payout_asks_its_hub_what_it_says_of_itself_once_to_lock() {
     let eco = Eco::new().await;
     let asked = || eco.client.transport().2.load(Ordering::Relaxed);
+    let quote = eco
+        .client
+        .payout_quote(PROVIDER, A, PAYEE, 1000, MAX_FEE, ONE_SAT)
+        .await
+        .unwrap();
     let before = asked();
-    let payout = eco.pay_out(1000).await;
+    let payout = eco.client.payout(&quote).await.unwrap();
     // Once for its terms, its lock and whether that expired: each round
     // trip a wait over Tor.
     assert_eq!(asked() - before, 1);
@@ -786,11 +898,8 @@ async fn a_payout_is_refused_beyond_its_terms_before_any_lock() {
         quote(PAYEE, 1000, MAX_FEE).await,
         "pays nothing out on Bitcoin",
     );
-    let e = eco
-        .client
-        .payout(PROVIDER, A, PAYEE, 1000, MAX_FEE, ONE_SAT)
-        .await
-        .unwrap_err();
+    // Asked again when paid: quoted before, refused now.
+    let e = eco.client.payout(&usual).await.unwrap_err();
     assert!(matches!(e, Error::Invalid(_)), "{e}");
     assert!(eco.client.locks().unwrap().is_empty());
     assert!(eco.client.payouts().unwrap().is_empty());

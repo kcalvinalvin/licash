@@ -289,11 +289,12 @@ impl Eco {
     }
 
     async fn pay_out(&self, amount: u64) -> Payout {
-        let payout = self
+        let quote = self
             .client
-            .payout(PROVIDER, A, PAYEE, amount, MAX_FEE, ONE_SAT)
+            .payout_quote(PROVIDER, A, PAYEE, amount, MAX_FEE, ONE_SAT)
             .await
             .unwrap();
+        let payout = self.client.payout(&quote).await.unwrap();
         assert!(payout.lock.is_some(), "{payout:?}");
         payout
     }
@@ -604,11 +605,12 @@ async fn a_payout_takes_notes_at_a_hub_only_within_the_providers_limit_there() {
     provider.limit_intake(Some(HashMap::from([(A.to_owned(), paid + 1)])));
     let more = eco.net.pay(A, &eco.client.address(), HELD);
     eco.client.receive(&more).unwrap();
-    let declined = eco
+    let quote = eco
         .client
-        .payout(PROVIDER, A, PAYEE, 1_000, MAX_FEE, ONE_SAT)
+        .payout_quote(PROVIDER, A, PAYEE, 1_000, MAX_FEE, ONE_SAT)
         .await
         .unwrap();
+    let declined = eco.client.payout(&quote).await.unwrap();
     match &declined.state {
         PayoutState::Failed(why) => assert!(
             why.contains("the provider takes no more of hub http://a.test's notes now"),

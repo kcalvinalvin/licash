@@ -40,8 +40,12 @@ pub async fn pay(
     let source = source(chain)?;
     let rate = onchain::rate(&source, fee_rate).await?;
     let max_fee = max_fee.unwrap_or(amount / 100 + USUAL_MAX_FEE);
-    let provider = match provider {
-        Provider::At(url) => url,
+    let quote = match provider {
+        Provider::At(url) => {
+            wallet
+                .payout_quote(&url, from, to, amount, max_fee, rate)
+                .await?
+        }
         Provider::Announced(relays, route) => {
             let relays = match relays {
                 relays if !relays.is_empty() => relays,
@@ -57,12 +61,10 @@ pub async fn pay(
             })?;
             let (costs, known) = (found.quote.costs(), found.known);
             tracing::info!(provider = %found.url, costs, known, "provider found");
-            found.url
+            found.quote
         }
     };
-    let payout = wallet
-        .payout(&provider, from, to, amount, max_fee, rate)
-        .await?;
+    let payout = wallet.payout(&quote).await?;
     if let PayoutState::Failed(reason) = &payout.state {
         show(json, payout_json(&payout), payout_line(&payout));
         bail!("the payout failed ({reason}): its lock, if made, returns once expired");
