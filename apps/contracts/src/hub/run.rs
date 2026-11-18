@@ -78,10 +78,10 @@ impl Openings {
             false => 0..=terms::MAX_STEP,
         };
         // Reject cheap size/collateral and policy failures before node RPC.
-        self.timing
+        self.timing()
             .covers(opening.quote.cap, open.coin.value.to_sat())
             .map_err(Refused::bad)?;
-        self.timing
+        self.timing()
             .allows(opening.quote.cap, opening.quote.chain.max_headers)
             .map_err(Refused::bad)?;
         self.terms_of(&opening.quote, steps).await?;
@@ -135,7 +135,7 @@ impl Openings {
         }
         // The terms she chose, if within the hub's: those of the quote.
         let (cap, blocks) = (quote.cap, quote.chain.max_headers);
-        self.timing.allows(cap, blocks).map_err(Refused::bad)?;
+        self.timing().allows(cap, blocks).map_err(Refused::bad)?;
         let checkpoint = self.source.checkpoint(height).await;
         let checkpoint = checkpoint.map_err(Refused::unavailable)?;
         let bytes = |q: &Quote| {
@@ -146,7 +146,7 @@ impl Openings {
         let theirs = bytes(quote);
         // One quoted at another surcharge than now: asked again.
         for step in steps {
-            let timing = self.timing.at_step(step);
+            let timing = self.timing().at_step(step);
             let ours = timing.quote_for(self.keyset.clone(), checkpoint.clone(), cap, blocks);
             if bytes(&ours) == theirs {
                 return self.keep_checkpoint(&ours.chain.checkpoint);
@@ -220,7 +220,7 @@ impl Openings {
                     return Err(Refused::unavailable("too many openings under way: later"));
                 }
                 self.step_now()?;
-                let bounds = self.timing.bounds(&quote);
+                let bounds = self.timing().bounds(&quote);
                 let payout = self
                     .opening_payout_script()
                     .await
@@ -345,7 +345,7 @@ impl Openings {
             })?;
             all.push(base_cycles(&peek.base));
         }
-        let blocks = self.timing.proof_blocks();
+        let blocks = self.timing().proof_blocks();
         let (need, have) = prover.room(&all, blocks).map_err(|why| {
             Refused::unavailable(format!("the hub's prover is not ready ({why}): later"))
         })?;

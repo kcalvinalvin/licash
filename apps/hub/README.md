@@ -330,6 +330,16 @@ for the wallet to answer a challenge and for each party's outputs to wait,
 hub to prove and assert its response (a proof takes hours on a CPU). No other
 network yet.
 
+A proof reads Bitcoin through block headers, so a hub's statement asks for
+work on top of a holder's request's response: a chain mined in private
+would have to carry that much to fool it. By default it asks the network's
+floor (6 blocks on signet, 1 on regtest). The more value its contracts
+protect, the more an operator should ask: `--contracts-work-depth` sets it
+for the contracts quoted from then on, up to 144 blocks beyond the floor.
+The assertion window and the shortest contract a holder may choose grow by
+as many blocks, so the prover keeps as long to prove; contracts already
+open keep their terms.
+
 A hub with contracts plays its holders' exits itself, polling its
 contracts' Core wallet at `--chain-poll`. When a wallet forces its contract
 closed, its request R and its publication (the claim it files) come on

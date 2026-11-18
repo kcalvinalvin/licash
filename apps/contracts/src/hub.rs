@@ -96,7 +96,9 @@ pub struct Openings {
     payout: std::sync::OnceLock<Source>,
     keyset: Keyset,
     trust: Trust,
-    timing: Timing,
+    /// Its terms: set once, with the work they ask
+    /// ([`Openings::ask_work`]).
+    timing: std::sync::RwLock<Timing>,
     /// The openings a task is stepping.
     busy: Mutex<HashSet<[u8; 32]>>,
     /// A permit for each step or instance built at once: [`HEAVY`].
@@ -343,7 +345,7 @@ impl Openings {
             payout: std::sync::OnceLock::new(),
             keyset,
             trust,
-            timing,
+            timing: std::sync::RwLock::new(timing),
             busy: Mutex::new(HashSet::new()),
             heavy: Arc::new(tokio::sync::Semaphore::new(HEAVY)),
             funding: tokio::sync::Mutex::new(()),
@@ -424,6 +426,20 @@ impl Openings {
         Ok(())
     }
 
+    /// Ask `depth` blocks of work on top of a request's response in the
+    /// contracts quoted from now on ([`Timing::with_work_depth`]), the
+    /// network's floor unless told: those open already keep theirs.
+    pub fn ask_work(&self, depth: u32) -> Result<()> {
+        let mut timing = self.timing.write().unwrap_or_else(|e| e.into_inner());
+        *timing = timing.with_work_depth(depth)?;
+        Ok(())
+    }
+
+    /// Its terms now.
+    fn timing(&self) -> Timing {
+        *self.timing.read().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Keep `fees`, what the hub charges, with each opening that starts
     /// from now on: what its holder agrees to pay at most
     /// ([`opened_for_less`]). Nothing is kept until told.
@@ -470,7 +486,7 @@ impl Openings {
     /// else its fixed one.
     pub async fn offer(&self, chosen: Option<(u32, u32)>) -> Result<Offer, Refused> {
         let (cap, blocks) = chosen.unwrap_or((terms::CAP, terms::LOCK));
-        self.timing.allows(cap, blocks).map_err(Refused::bad)?;
+        self.timing().allows(cap, blocks).map_err(Refused::bad)?;
         let most = self.most_funded(terms::MAX_CAP);
         if cap > most {
             return Err(Refused::unavailable(format!(
@@ -481,9 +497,9 @@ impl Openings {
         let height = self.opening_height(tip.height)?;
         let checkpoint = self.source.checkpoint(height).await;
         let checkpoint = checkpoint.map_err(Refused::unavailable)?;
-        let timing = self.timing.at_step(self.step_now()?);
+        let timing = self.timing().at_step(self.step_now()?);
         let quote = timing.quote_for(self.keyset.clone(), checkpoint, cap, blocks);
-        let bounds = self.timing.bounds(&quote);
+        let bounds = self.timing().bounds(&quote);
         Ok(Offer { quote, bounds })
     }
 
@@ -500,7 +516,7 @@ impl Openings {
                 terms::MAX_STEP
             }
         };
-        let timing = self.timing.at_step(step);
+        let timing = self.timing().at_step(step);
         let range = timing.range().map(|mut r| {
             r.max_cap = self.most_funded(r.max_cap).max(r.min_cap);
             r
@@ -700,7 +716,7 @@ impl Openings {
         }
         if let Some(prover) = &self.prover {
             prover.polled();
-            let blocks = self.timing.proof_blocks();
+            let blocks = self.timing().proof_blocks();
             if let Some(defendable) = prover.defendable(blocks) {
                 let open = round_open as u64;
                 let over = open > defendable;
@@ -1015,7 +1031,7 @@ mod tests {
             payout: std::sync::OnceLock::new(),
             keyset,
             trust: crate::trust(profile).unwrap(),
-            timing: Timing::of(profile, None).unwrap(),
+            timing: std::sync::RwLock::new(Timing::of(profile, None).unwrap()),
             busy: Mutex::new(HashSet::new()),
             heavy: Arc::new(tokio::sync::Semaphore::new(HEAVY)),
             funding: tokio::sync::Mutex::new(()),
@@ -1076,7 +1092,8 @@ mod tests {
             per_coin: 2,
             ppm_year: 10_000,
         };
-        openings.timing = Timing::of(ChainProfile::Core30DefaultRegtest, Some(range)).unwrap();
+        *openings.timing.get_mut().unwrap() =
+            Timing::of(ChainProfile::Core30DefaultRegtest, Some(range)).unwrap();
         let max = |o: &Openings| o.advertise().range.unwrap().max_cap;
         // Not known yet: as the operator set it.
         assert_eq!(max(&openings), 100_000_000);
@@ -1170,7 +1187,7 @@ mod tests {
         // Estimated from its quote before her Base is, no less.
         let p = base.parts();
         let mut quote = openings
-            .timing
+            .timing()
             .quote(p.keyset.clone(), p.chain.checkpoint.clone());
         // The fixture's own limits.
         quote.limits = p.limits.clone();

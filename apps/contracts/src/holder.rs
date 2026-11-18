@@ -1142,8 +1142,16 @@ mod tests {
         let keyset = keyset.keyset().unwrap();
         let regtest = ChainProfile::Core30DefaultRegtest;
         let signet = ChainProfile::Core30Signet;
-        for profile in [regtest, signet] {
+        // At the floor's work and at the most a hub asks beyond it.
+        let deepest = |profile| {
+            let floor = licash_contract::opening::Floors::of(profile).work_depth;
             let timing = Timing::of(profile, None).unwrap();
+            (timing.with_work_depth(floor + crate::hub::terms::MAX_EXTRA_WORK)).unwrap()
+        };
+        let timings = [regtest, signet].into_iter().flat_map(|profile| {
+            [(profile, Timing::of(profile, None).unwrap()), (profile, deepest(profile))]
+        });
+        for (profile, timing) in timings {
             let checkpoint = Checkpoint::genesis(profile).unwrap();
             let tip = checkpoint.height();
             let quote = timing.quote(keyset.clone(), checkpoint);

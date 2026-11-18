@@ -108,7 +108,14 @@ pub struct Timing {
     /// The step of the hub's surcharge: its fee, of its fixed terms and
     /// rate alike, `2^step` times its own.
     step: u32,
+    /// Blocks of work its statement reads on top of her request's
+    /// response, at least the network's floor ([`Timing::with_work_depth`]).
+    work_depth: u32,
 }
+
+/// The most blocks of work a hub may ask for beyond its network's floor:
+/// a day's, which its windows and her deadlines lengthen by.
+pub const MAX_EXTRA_WORK: u32 = 144;
 
 impl Timing {
     /// The hub's timing on `profile`: on regtest, a test's few blocks; on
@@ -150,7 +157,45 @@ impl Timing {
             min_blocks,
             range,
             step: 0,
+            work_depth: Floors::of(profile).work_depth,
         })
+    }
+
+    /// These terms, its statement reading `depth` blocks of work on top
+    /// of her request's response, from the network's floor to
+    /// [`MAX_EXTRA_WORK`] more: the more a private chain must carry to
+    /// fool it, so the more value the hub's contracts may protect. Its
+    /// assertion window and the fewest blocks a contract lasts grow as
+    /// much, so that its prover has as long as at the floor.
+    pub fn with_work_depth(self, depth: u32) -> Result<Self> {
+        let floor = Floors::of(self.profile).work_depth;
+        ensure!(
+            (floor..=floor + MAX_EXTRA_WORK).contains(&depth),
+            "{depth} blocks of work: not {floor} to {}",
+            floor + MAX_EXTRA_WORK
+        );
+        Ok(Self {
+            work_depth: depth,
+            ..self
+        })
+    }
+
+    /// Blocks of work asked beyond the network's floor.
+    fn extra_work(&self) -> u32 {
+        self.work_depth - Floors::of(self.profile).work_depth
+    }
+
+    /// Blocks from her request's response to its assertion's deadline,
+    /// grown by the work asked beyond the floor.
+    fn assert_window(&self) -> u16 {
+        let extra = u16::try_from(self.extra_work()).expect("MAX_EXTRA_WORK fits");
+        assert_window(self.profile) + extra
+    }
+
+    /// The fewest blocks a contract chosen lasts, grown by the work asked
+    /// beyond the floor.
+    fn min_blocks(&self) -> u32 {
+        self.min_blocks + self.extra_work()
     }
 
     /// These terms, the hub's fee surcharged `step` steps
@@ -173,7 +218,7 @@ impl Timing {
         self.range.map(|r| licash_api::ContractRange {
             min_cap: CAP,
             max_cap: r.max_cap,
-            min_blocks: self.min_blocks,
+            min_blocks: self.min_blocks(),
             max_blocks: r.max_blocks,
             per_coin: r.per_coin,
             base: RESERVE_ALICE + OPENING_FEE * u64::from(self.surcharge()),
@@ -247,8 +292,8 @@ impl Timing {
     /// to: the assert window less its response's burial, the block the
     /// assertion confirms in and the deadline margin (2).
     pub fn proof_blocks(&self) -> u32 {
-        u32::from(assert_window(self.profile))
-            .saturating_sub(Floors::of(self.profile).work_depth)
+        u32::from(self.assert_window())
+            .saturating_sub(self.work_depth)
             .saturating_sub(1 + 2)
     }
 
@@ -297,7 +342,7 @@ impl Timing {
                 response_window: 0,
                 request_height: 0,
                 publication_window: floors.publication_window,
-                assert_window: assert_window(self.profile),
+                assert_window: self.assert_window(),
                 challenge_window: self.challenge_window,
                 answer_window: 12,
             },
@@ -310,7 +355,7 @@ impl Timing {
             chain: ChainTerms {
                 checkpoint,
                 funding_depth: self.depth,
-                work_depth: floors.work_depth,
+                work_depth: self.work_depth,
                 max_headers: blocks,
             },
             limits: Limits {
@@ -498,6 +543,38 @@ mod tests {
         let quote = |t: Timing| digest(&t.quote(keyset.clone(), checkpoint.clone()));
         assert_eq!(quote(timing.at_step(0)), quote(timing));
         assert_ne!(quote(timing.at_step(1)), quote(timing));
+    }
+
+    /// Work asked beyond the floor lengthens the assertion window and the
+    /// shortest contract by as much, the prover's time unchanged; at the
+    /// floor, the quote is as it always was.
+    #[test]
+    fn more_work_lengthens_the_assertion_window_by_as_much() {
+        let parts = Hub::peek(funded()).unwrap().base.parts().clone();
+        let (keyset, checkpoint) = (parts.keyset, parts.chain.checkpoint);
+        for profile in [ChainProfile::Core30DefaultRegtest, ChainProfile::Core30Signet] {
+            let timing = Timing::of(profile, Some(RANGE)).unwrap();
+            let floor = Floors::of(profile).work_depth;
+            let quote = |t: &Timing| t.quote(keyset.clone(), checkpoint.clone());
+            let at_floor = timing.with_work_depth(floor).unwrap();
+            assert_eq!(digest(&quote(&at_floor)), digest(&quote(&timing)));
+            let deeper = timing.with_work_depth(floor + MAX_EXTRA_WORK).unwrap();
+            let (base, more) = (quote(&timing), quote(&deeper));
+            assert_eq!(more.chain.work_depth, floor + MAX_EXTRA_WORK);
+            assert_eq!(
+                u32::from(more.graph.assert_window),
+                u32::from(base.graph.assert_window) + MAX_EXTRA_WORK
+            );
+            more.check(profile).unwrap();
+            assert_eq!(deeper.proof_blocks(), timing.proof_blocks());
+            let (shortest, longer) = (timing.range().unwrap(), deeper.range().unwrap());
+            assert_eq!(longer.min_blocks, shortest.min_blocks + MAX_EXTRA_WORK);
+            for wrong in [floor.saturating_sub(1), floor + MAX_EXTRA_WORK + 1] {
+                if wrong != floor {
+                    assert!(timing.with_work_depth(wrong).is_err(), "{profile} {wrong}");
+                }
+            }
+        }
     }
 
     #[test]

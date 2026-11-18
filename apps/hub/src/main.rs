@@ -231,6 +231,20 @@ struct Chain {
         requires = "contracts"
     )]
     contracts_max_live: usize,
+    /// Blocks of work the hub's statement reads on top of a holder's
+    /// request's response, in the contracts it quotes from now on: the
+    /// work a private chain must carry to fool a proof, so the more value
+    /// its contracts protect, the more to ask. From the network's floor
+    /// (1 on regtest, 6 on signet) to 144 more; the assertion window and
+    /// the shortest contract grow as much, its prover's time unchanged.
+    /// By default, the floor.
+    #[arg(
+        long = "contracts-work-depth",
+        value_name = "BLOCKS",
+        env = "LICASH_HUB_CONTRACTS_WORK_DEPTH",
+        requires = "contracts"
+    )]
+    contracts_work_depth: Option<u32>,
 }
 
 impl Chain {
@@ -1037,6 +1051,7 @@ fn command(cli: Cli) -> anyhow::Result<()> {
             let range = chain.range();
             let max_live = chain.contracts_max_live;
             let proof_scale = chain.contracts_proof_scale;
+            let work_depth = chain.contracts_work_depth;
             let wallet = match (&chain.contracts_wallet, &chain.url) {
                 (Some(url), _) => Some(url.parse::<Source>().context("--contracts-wallet")?),
                 (None, Some(url)) if contracting && url.starts_with("esplora+") => anyhow::bail!(
@@ -1178,6 +1193,11 @@ fn command(cli: Cli) -> anyhow::Result<()> {
                             .context("--contracts-payout-wallet")?;
                     }
                     openings.limit_live(max_live);
+                    if let Some(depth) = work_depth {
+                        openings
+                            .ask_work(depth)
+                            .context("--contracts-work-depth")?;
+                    }
                     openings
                         .scale_proofs(proof_scale)
                         .context("--contracts-proof-scale")?;
