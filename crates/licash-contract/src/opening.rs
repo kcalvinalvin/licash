@@ -1809,6 +1809,23 @@ mod tests {
         );
         let request = ao.request(&a.keys, 3072, &[9; 32]).unwrap();
         assert_eq!(ho.requested_b(&request).unwrap(), (3072, [9; 32]));
+        // Bitcoin accepts a digit of 15 written as 16 (the script clamps it
+        // with OP_MIN): read as 15, as the statement does. A negative
+        // digit fails the script, and the read.
+        let fifteens = ao.request(&a.keys, 3072, &[0xff; 32]).unwrap();
+        let rewrite = |to: &[u8]| {
+            let mut tx = fifteens.clone();
+            let items: Vec<Vec<u8>> = tx.input[0]
+                .witness
+                .iter()
+                .map(|i| if i == [15] { to.to_vec() } else { i.to_vec() })
+                .collect();
+            tx.input[0].witness = items.into();
+            tx
+        };
+        assert_ne!(rewrite(&[16]), fifteens);
+        assert_eq!(ho.requested_b(&rewrite(&[16])).unwrap(), (3072, [0xff; 32]));
+        assert!(ho.requested_b(&rewrite(&[0x81])).is_err());
         assert!(ao.offer.sigs.keys().all(|n| !HubProves::withheld(n)));
         assert!(ao.consent.sigs.keys().any(|n| HubProves::withheld(n)));
         let response = ho.respond(&h.keys, 1024).unwrap();

@@ -54,7 +54,7 @@ use lichen_contract::{
     anchor_tree, payout_less, wots_shape, ContractParams, Core, PartyPubKeys, Presign, Role, Terms,
     POST_CSV,
 };
-use lichen_statement::{JOURNAL_LEN, SLOT_VOUT};
+use lichen_statement::{script_digit, JOURNAL_LEN, SLOT_VOUT};
 use lichen_wots::{WotsParams, WotsPublic, WotsSig};
 
 pub use lichen_babe::graph::link_args;
@@ -564,8 +564,8 @@ impl HubProves {
             "a request of {} arguments",
             args.len()
         );
-        let b = WotsSig::from_consumption_order(bp, &args[..nb])?;
-        let e = WotsSig::from_consumption_order(ep, &args[nb..])?;
+        let b = script_signature(bp, &args[..nb])?;
+        let e = script_signature(ep, &args[nb..])?;
         Ok((b, e))
     }
     /// A signature on `b` or `b′` as the payout's leaves take it (bottom
@@ -583,7 +583,7 @@ impl HubProves {
         let params = WotsParams::for_bytes(4);
         let n = 2 * params.total_digits() as usize;
         ensure!(args.len() == n, "a respond of {} arguments", args.len());
-        WotsSig::from_consumption_order(params, args)
+        script_signature(params, args)
     }
     /// `assert`'s: π1's digits, Lamport-signed, then π2 and π3.
     pub fn assert_wire(preimages: &[Preimage], pi2: &[u8], pi3: &[u8]) -> Vec<Vec<u8>> {
@@ -728,6 +728,23 @@ impl Assertion {
     }
 }
 
+/// A one-time signature from a link's arguments (consumption order: each
+/// digit, then its hash), each digit read as the verifying script reads it
+/// (`lichen_statement::script_digit`): Bitcoin accepts a 15 written as 16,
+/// so the hub and holder must read it as the statement does.
+fn script_signature(params: WotsParams, args: &[Vec<u8>]) -> Result<WotsSig> {
+    let items = args
+        .iter()
+        .enumerate()
+        .map(|(k, item)| match k % 2 {
+            0 => script_digit(item)
+                .map(|d| vec![d])
+                .context("a digit the script refuses"),
+            _ => Ok(item.clone()),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    WotsSig::from_consumption_order(params, &items)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
