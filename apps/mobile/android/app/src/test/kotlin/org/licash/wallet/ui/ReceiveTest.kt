@@ -60,12 +60,19 @@ class ReceiveTest {
             min = 100u,
             max = 1_000_000u,
             stocked = true,
+            reachable = true,
         )
         assertEquals("Paid to you in notes by swaps.example, less its fee of 2 sat + 0.5%.", donationWords(address))
         assertEquals(
             "Paid to you in notes by Swaps, with no fee. " +
                 "It can't take donations right now: payers are refused until it can.",
             donationWords(address.copy(name = "Swaps", feeBase = 0u, feePpm = 0u, stocked = false)),
+        )
+        // Unheard: shown as kept, the phone perhaps offline.
+        assertEquals(
+            "Paid to you in notes by swaps.example, less its fee of 2 sat + 0.5%. " +
+                "It isn't answering right now: payers may be refused until it does.",
+            donationWords(address.copy(stocked = false, reachable = false)),
         )
     }
 }

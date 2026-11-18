@@ -999,6 +999,9 @@ class Engine(context: Context) {
      */
     suspend fun donationAddress(): Result<DonationAddress?> = io { local { it.donationAddress() } }
 
+    /** Keep the provider of the donation address `lnurl` shown: it shows from then on. */
+    suspend fun keepDonationAddress(lnurl: String): Result<Unit> = io { local { it.keepDonationAddress(lnurl) } }
+
     /** More of a line of the history, as far as the wallet looked. */
     suspend fun details(activity: Activity): Result<Details> =
         io { local { it.details(activity.kind, activity.id) } }

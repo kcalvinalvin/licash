@@ -104,6 +104,7 @@ internal fun donationWords(address: DonationAddress): String {
         else -> "Paid to you in notes by $by, less its fee of $fee."
     }
     return when {
+        !address.reachable -> "$paid It isn't answering right now: payers may be refused until it does."
         address.stocked -> paid
         else -> "$paid It can't take donations right now: payers are refused until it can."
     }
@@ -189,6 +190,11 @@ fun Receive(engine: Engine, back: () -> Unit) {
     }
     LaunchedEffect(ui.hubs) {
         donations = engine.donationAddress().getOrNull()
+    }
+    // Shown, its provider is kept: the same address shows from then on.
+    val shownDonations = donations?.lnurl?.takeIf { way == Way.DONATIONS }
+    LaunchedEffect(shownDonations) {
+        shownDonations?.let { engine.keepDonationAddress(it) }
     }
     LaunchedEffect(lightning, amount) {
         invoice = null

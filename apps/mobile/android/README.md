@@ -138,7 +138,10 @@ Once a swap provider announced on the hubs' relays takes donations
 (`licash-swaps run` with `--lnd` and `--lnurl-url URL`) at a hub of the code, Other ways also
 offers a donation address: a static LNURL any Lightning wallet pays, again
 and again, while the phone is offline, the provider paying each donation in
-notes at the code's hub, less its fee. Tapping a hub in Settings lists its fees. Silent payments
+notes at the code's hub, less its fee. Once shown, its provider is kept
+and shown again, even unreachable, as an address handed out stays: another
+takes its place only once it takes no more donations, or has failed to for a
+week while another can. Tapping a hub in Settings lists its fees. Silent payments
 before the first block the hub indexed are not found; payments to the
 fallback address are, from the day before the wallet was made.
 
