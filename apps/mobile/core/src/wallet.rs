@@ -85,6 +85,11 @@ pub struct Wallet {
     /// The mailbox, its relays kept connected between looks
     /// ([`Wallet::collect`]): opened at the first.
     mailbox: Mutex<Option<licash_nostr::mailbox::Mailbox>>,
+    /// Held while changing what the app keeps ([`Wallet::update_kept`]).
+    keeping: Mutex<()>,
+    /// The donation address last offered, for the app to keep once shown
+    /// ([`Wallet::keep_donation_address`]): by its LNURL.
+    offered: Mutex<Option<(String, donations::Pinned)>>,
 }
 
 /// How long the hubs asked what URLs they name may take, all at once
@@ -103,6 +108,15 @@ struct Kept {
     /// before its file was made.
     #[serde(default)]
     birthday: u32,
+    /// The provider of the donation address shown, kept while it takes
+    /// donations ([`donations::Pinned`]). One unreadable is none: it never
+    /// costs the rest.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "donations::lenient"
+    )]
+    donations: Option<donations::Pinned>,
 }
 
 fn holding(b: licash_wallet::Balance) -> Holding {
@@ -144,7 +158,11 @@ impl Wallet {
             return Err(LicashError::invalid("a wallet is there already"));
         }
         std::fs::create_dir_all(&dir).map_err(LicashError::failed)?;
-        let kept = serde_json::to_vec(&Kept { birthday }).map_err(LicashError::failed)?;
+        let kept = Kept {
+            birthday,
+            ..Kept::default()
+        };
+        let kept = serde_json::to_vec(&kept).map_err(LicashError::failed)?;
         std::fs::write(kept_file(&dir), kept).map_err(LicashError::failed)?;
         let mut seed = [0; 32];
         OsRng.fill_bytes(&mut seed);
@@ -300,6 +318,8 @@ impl Wallet {
             announced: Announcements::default(),
             refunds_looked: Mutex::new(HashMap::new()),
             mailbox: Mutex::new(None),
+            keeping: Mutex::new(()),
+            offered: Mutex::new(None),
         };
         wallet.onions();
         wallet.agree_fees();
@@ -372,6 +392,15 @@ impl Wallet {
             tracing::info!("asking the hubs what URLs they name: not all answered in time");
         }
         self.onions();
+    }
+
+    /// Change what the app keeps by `change`, kept whole or not at all,
+    /// one change at a time.
+    fn update_kept(&self, change: impl FnOnce(&mut Kept)) -> Result<(), LicashError> {
+        let _keeping = self.keeping.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut kept = self.kept();
+        change(&mut kept);
+        self.keep(&kept)
     }
 
     /// Keep `kept`, whole or not at all.
@@ -1756,13 +1785,15 @@ impl Wallet {
     /// Keep `from`, the first block looked in, as the wallet's birthday if
     /// it had none: for the recovery words' restore, and the backup file.
     fn learn_birthday(&self, from: u32) -> Result<(), LicashError> {
-        let mut kept = self.kept();
-        if kept.birthday == 0 && from > 0 {
-            kept.birthday = from;
-            self.keep(&kept)?;
-            tracing::info!(from, "the wallet's first block kept");
+        if self.kept().birthday != 0 || from == 0 {
+            return Ok(());
         }
-        Ok(())
+        self.update_kept(|kept| {
+            if kept.birthday == 0 {
+                kept.birthday = from;
+                tracing::info!(from, "the wallet's first block kept");
+            }
+        })
     }
 
     /// The first block to look in for payments on Bitcoin: the chain's

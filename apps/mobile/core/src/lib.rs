@@ -709,6 +709,9 @@ pub struct DonationAddress {
     /// Whether it holds enough to take a donation now: if not, payers are
     /// refused until it does.
     pub stocked: bool,
+    /// Whether it answered now: if not, it is shown as last kept, and
+    /// payers may be refused until it answers again.
+    pub reachable: bool,
 }
 
 /// A swap provider paying a Lightning invoice from its own node for a lock

@@ -85,7 +85,11 @@ impl Wallet {
         fs::create_dir_all(&dir).map_err(LicashError::failed)?;
         fs::write(
             kept_file(&dir),
-            serde_json::to_vec(&Kept { birthday }).map_err(LicashError::failed)?,
+            serde_json::to_vec(&Kept {
+                birthday,
+                ..Kept::default()
+            })
+            .map_err(LicashError::failed)?,
         )
         .map_err(LicashError::failed)?;
         Self::start(dir, tor, |path, http| {

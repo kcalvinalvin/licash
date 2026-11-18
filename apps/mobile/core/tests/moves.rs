@@ -282,11 +282,16 @@ impl Swaps {
         Self::start_with(hubs, seed, terms, None, None)
     }
 
-    /// [`Swaps::start`], taking donations through `node` too, payers
-    /// reaching it at [`DONATIONS`], as the service does with
+    /// [`Swaps::start`], taking donations on `donating` through its node
+    /// too, payers reaching it at [`DONATIONS`], as the service does with
     /// `--lnurl-url`.
-    fn start_donating(hubs: &Hubs, seed: u8, terms: Config, node: Arc<Fake>) -> Self {
-        Self::start_with(hubs, seed, terms, None, Some(node))
+    fn start_donating(
+        hubs: &Hubs,
+        seed: u8,
+        terms: Config,
+        donating: (Arc<Fake>, licash_swaps::DonationTerms),
+    ) -> Self {
+        Self::start_with(hubs, seed, terms, None, Some(donating))
     }
 
     /// [`Swaps::start`], paying Lightning invoices from `node` too, on
@@ -305,7 +310,7 @@ impl Swaps {
         seed: u8,
         terms: Config,
         lightning: Option<(Arc<Fake>, swaps::Lightning)>,
-        donating: Option<Arc<Fake>>,
+        donating: Option<(Arc<Fake>, licash_swaps::DonationTerms)>,
     ) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let wallet = licash_wallet::Wallet::create(
@@ -343,10 +348,7 @@ impl Swaps {
                     None => provider,
                 };
                 let provider = match donating {
-                    Some(node) => {
-                        let terms = licash_swaps::DonationTerms::default();
-                        provider.take_donations(node, terms, DONATIONS).unwrap()
-                    }
+                    Some((node, terms)) => provider.take_donations(node, terms, DONATIONS).unwrap(),
                     None => provider,
                 };
                 let provider = Arc::new(provider);
@@ -658,7 +660,8 @@ fn a_phone_finds_its_static_donation_address_at_a_provider_taking_them() {
     offers(&hubs, &phone, Some(300), 1);
     assert_eq!(phone.donation_address().unwrap(), None);
 
-    let donating = Swaps::start_donating(&hubs, 0x53, TERMS, Arc::new(Fake::new()));
+    let terms = licash_swaps::DonationTerms::default();
+    let donating = Swaps::start_donating(&hubs, 0x53, TERMS, (Arc::new(Fake::new()), terms));
     let mut found = None;
     for _ in 0..50 {
         found = phone.donation_address().unwrap();
@@ -687,8 +690,36 @@ fn a_phone_finds_its_static_donation_address_at_a_provider_taking_them() {
     );
     assert_eq!(address.lnurl, address.lnurl.to_uppercase());
     // Asked again: the same.
-    assert_eq!(phone.donation_address().unwrap(), Some(address));
-    drop((swapping, donating));
+    assert_eq!(phone.donation_address().unwrap(), Some(address.clone()));
+    assert!(address.reachable);
+
+    // Shown, its provider is kept: a cheaper one found since, or the
+    // phone started again, change nothing.
+    assert!(phone.keep_donation_address("LNURL1OTHER".into()).is_err());
+    phone.keep_donation_address(address.lnurl.clone()).unwrap();
+    let free = licash_swaps::DonationTerms {
+        fee: Fee { base: 0, ppm: 0 },
+        ..terms
+    };
+    let cheaper = Swaps::start_donating(&hubs, 0x54, TERMS, (Arc::new(Fake::new()), free));
+    // Found: each of the three swaps too.
+    phone.refresh_providers().unwrap();
+    offers(&hubs, &phone, Some(300), 3);
+    assert_eq!(phone.donation_address().unwrap(), Some(address.clone()));
+    drop(phone);
+    let dir = hubs.dir.path().join("phone").display().to_string();
+    let phone = Wallet::open(dir, false).unwrap();
+    assert_eq!(phone.donation_address().unwrap(), Some(address.clone()));
+
+    // Its provider gone: shown as kept, unheard, rather than another's.
+    drop(donating);
+    let shown = phone.donation_address().unwrap().unwrap();
+    assert_eq!(
+        (&shown.lnurl, &shown.provider),
+        (&address.lnurl, &address.provider)
+    );
+    assert!(!shown.reachable && !shown.stocked, "{shown:?}");
+    drop((swapping, cheaper));
 }
 
 fn via_quote(phone: &Wallet, request: &str) -> InvoiceQuote {
