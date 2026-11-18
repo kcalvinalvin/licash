@@ -254,6 +254,10 @@ A lock of her notes at a hub where a contract protects them expires early
 enough for that forced close to claim its refund should the hub never
 settle it; a payment needing a later expiry (near the contract's end) is
 refused there until a contract lasting longer protects her notes.
+A lock paying her whose hub never issues it once told its preimage is
+activated on Bitcoin with a coin of her wallet as its expiry nears, if a
+contract of hers there can still claim it; that contract is then not
+closed early but forced closed, its claim taking the lock's pay branch.
 
 A counterpart on the command line:
 

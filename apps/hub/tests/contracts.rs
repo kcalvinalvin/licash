@@ -1817,8 +1817,8 @@ impl licash_wallet::Transport for NoSettle {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs bitcoind and a release build"]
 async fn a_force_close_claims_a_lock_paying_her_once_activated_at_depth() -> Result<()> {
-    use licash_contracts::holder::activation;
     use licash_contracts::holder::recovery::{self, Stage};
+    use licash_contracts::holder::{activation, exit};
 
     let rt = Regtest::start_standard()?;
     let dir = tempfile::tempdir()?;
@@ -1900,6 +1900,12 @@ async fn a_force_close_claims_a_lock_paying_her_once_activated_at_depth() -> Res
     // Done: nothing more until claimed.
     let kept = activation::keep(&bob, &chain, &mine, rate).await?;
     ensure!(kept.is_empty(), "{kept:?}");
+    // Her exit counts it as what only this contract's forced close claims.
+    let exits = exit::drive(&bob, &chain, &mine, &NoProvider, 144, rate).await?;
+    ensure!(
+        exits.len() == 1 && exits[0].owed > 0 && exits[0].owed <= 1_000,
+        "{exits:?}"
+    );
 
     rt.mine_to_height(expiry.max(activated + depth) + 1)?;
     while !watch::step(&hub, &source).await? {}

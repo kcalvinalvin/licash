@@ -11,22 +11,20 @@
 //! by the statement's own rule, and one in doubt is not filed: its lock is
 //! left to its hub.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::{anyhow, ensure, Context as _, Result};
 use bitcoin::hashes::Hash as _;
 use bitcoin::{FeeRate, ScriptBuf};
 use licash::base::{Base, Version};
-use licash::chain::{
-    activation_script, Activation, ActivationRef, Chain as Headers, Checkpoint, Inclusion,
-};
+use licash::chain::{activation_script, Activation, ActivationRef, Chain as Headers, Inclusion};
 use licash::recovery::SourceWitness;
 use licash::spend::ProposalId;
 use licash_contract::opening::{Context, Holder};
 use licash_wallet::{LockClaim, OwedLock, Transport, Wallet};
 
-use super::exit::blocks_a_day;
+use super::exit::{self, blocks_a_day};
 use super::recovery::confirmed_at;
 use super::store::Store;
 use super::Chain;
@@ -162,7 +160,7 @@ async fn step<T: Transport, C: Chain>(
     if tip >= last {
         return Ok(Some("late"));
     }
-    if !protecting(wallet, store, o, &anchor, tip)? {
+    if claimant(wallet, store, dir, o, tip)?.is_none() {
         return Ok(Some("unprotected"));
     }
     // Its hub knows the preimage already: it may pay it still.
@@ -212,41 +210,76 @@ async fn activation_of<C: Chain>(
     })
 }
 
-/// Whether a contract of hers at `o`'s hub can claim it once activated,
-/// at `tip`: protecting notes, not under recovery, of a Base valuing a pay
-/// branch by its activation, whose checkpoint is no later than `anchor`
-/// (its claim's chain starts there), and whose recovery may still assert
-/// after the lock's expiry at depth.
-fn protecting<T: Transport>(
+/// The contract of hers in `dir` that claims owed lock `o` once
+/// activated, at `tip`: of those at its hub protecting notes, not under
+/// recovery, of a Base of its keyset valuing a pay branch by its
+/// activation, whose checkpoint is no later than its anchor (its claim's
+/// chain starts there), and whose forced close her exit plans after its
+/// expiry at depth ([`exit::planned_force_at`]), the one planned last.
+/// None if none, or its anchor is unknown.
+pub(super) fn claimant<T: Transport>(
     wallet: &Wallet<T>,
     store: &Store,
+    dir: &Path,
     o: &OwedLock,
-    anchor: &Checkpoint,
     tip: u32,
-) -> Result<bool> {
+) -> Result<Option<[u8; 32]>> {
+    let Some(anchor) = o.anchor.as_ref() else {
+        return Ok(None);
+    };
     let urls = wallet.hub_urls(&o.hub)?;
     let recovering: HashSet<[u8; 32]> = store.recoveries()?.iter().map(|r| r.id).collect();
     let after = o.expiry.saturating_add(o.depth);
-    let seed = wallet.contract_secrets().seed;
+    let (seed, network) = (wallet.contract_secrets().seed, wallet.network());
     let ctx = Context {
         tip,
-        trust: crate::trust(wallet.network())?,
+        trust: crate::trust(network)?,
     };
+    let mut last = None;
     for c in store.list()? {
-        if !c.at(&urls) || !c.live(tip) || recovering.contains(&c.id) || c.assert_height <= after {
+        if !c.at(&urls) || !c.live(tip) || recovering.contains(&c.id) {
             continue;
         }
         let (state, _) = store.state(&c.id)?;
         let opening = Holder::load(&state, &seed, &ctx)?.signed()?;
-        let base = &opening.base;
-        if matches!(base.version(), Version::V4 { .. })
-            && base.parts().chain.checkpoint.height() <= anchor.height()
-            && *base.parts().keyset.id() == o.keyset
+        let parts = opening.base.parts();
+        if !matches!(opening.base.version(), Version::V4 { .. })
+            || parts.chain.checkpoint.height() > anchor.height()
+            || *parts.keyset.id() != o.keyset
         {
-            return Ok(true);
+            continue;
+        }
+        let force_at = exit::planned_force_at(&seed, network, dir, &c.id, tip)?;
+        if force_at >= after && last.is_none_or(|(at, _)| force_at > at) {
+            last = Some((force_at, c.id));
         }
     }
-    Ok(false)
+    Ok(last.map(|(_, id)| id))
+}
+
+/// What the locks owed to her that only a forced close may claim are
+/// worth, by the contract claiming each ([`claimant`]), at `tip`: those
+/// unclaimed, activated or still to be before their expiry.
+pub(super) fn at_stake<T: Transport>(
+    wallet: &Wallet<T>,
+    store: &Store,
+    dir: &Path,
+    tip: u32,
+) -> Result<HashMap<[u8; 32], u64>> {
+    let mut stake = HashMap::new();
+    for o in wallet.owed_locks()? {
+        if o.claimed || (o.activated_at.is_none() && tip >= o.expiry) {
+            continue;
+        }
+        let Some(id) = claimant(wallet, store, dir, &o, tip)? else {
+            continue;
+        };
+        let Some(claim) = wallet.owed_claim(&o.id, &o.keyset)? else {
+            continue;
+        };
+        *stake.entry(id).or_insert(0u64) += claim.value;
+    }
+    Ok(stake)
 }
 
 /// The owed locks of `base`'s keyset, activated at depth by `tip`, whose

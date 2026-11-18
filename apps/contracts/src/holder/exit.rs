@@ -115,17 +115,27 @@ fn lock_horizon(
         return Ok(None);
     };
     let recovering: HashSet<[u8; 32]> = store.recoveries()?.iter().map(|r| r.id).collect();
-    let margin = consent(dir)?.map_or(0, |c| c.exit_margin);
-    let day = blocks_a_day(network);
     let mut horizon = None;
     for c in
         (store.list()?.iter()).filter(|c| c.at(urls) && c.live(tip) && !recovering.contains(&c.id))
     {
-        let s = safety::of_seed(seed, network, dir, &c.id, tip, (margin, TIMEOUT_SLACK))?;
-        let (_, force_at) = deadlines(s.request_by.unwrap_or(0), day);
-        horizon = horizon.max(Some(force_at));
+        horizon = horizon.max(Some(planned_force_at(seed, network, dir, &c.id, tip)?));
     }
     Ok(horizon)
+}
+
+/// The block from which her exit forces contract `id` in `dir` closed, as
+/// planned at `tip` with her consent's margin, or none without it.
+pub(super) fn planned_force_at(
+    seed: &[u8; 32],
+    network: ChainProfile,
+    dir: &Path,
+    id: &[u8; 32],
+    tip: u32,
+) -> Result<u32> {
+    let margin = consent(dir)?.map_or(0, |c| c.exit_margin);
+    let s = safety::of_seed(seed, network, dir, id, tip, (margin, TIMEOUT_SLACK))?;
+    Ok(deadlines(s.request_by.unwrap_or(0), blocks_a_day(network)).1)
 }
 
 /// Revoke her consent: no step more is taken. Those under way go on.
@@ -176,6 +186,9 @@ pub struct Exit {
     pub force_at: u32,
     /// Her notes at its hub the others there do not recover.
     pub uncovered: u64,
+    /// The locks owed to her that it alone claims on Bitcoin
+    /// ([`super::activation`]): what only its forced close recovers.
+    pub owed: u64,
     /// Why its step failed this round, if it did.
     pub error: Option<String>,
 }
@@ -190,6 +203,8 @@ pub struct View {
     pub since: u32,
     pub consented: bool,
     pub uncovered: u64,
+    /// The locks owed to her it claims, which no payout recovers.
+    pub owed: u64,
     /// Her notes at its hub held by payments and locks under way.
     pub pending: u64,
     /// A payout from its hub under way, hers or the exit's.
@@ -203,7 +218,7 @@ pub fn plan(v: View) -> Step {
     if v.tip < v.cash_at {
         return Step::Waiting;
     }
-    let at_risk = v.uncovered > FLOOR;
+    let at_risk = v.uncovered.saturating_add(v.owed) > FLOOR;
     if !at_risk {
         // Paid out by the exit, and nothing more on its way back: folded.
         return match (v.cashed, v.consented) {
@@ -223,6 +238,11 @@ pub fn plan(v: View) -> Step {
     }
     if v.paying {
         return Step::Paying;
+    }
+    // Only what a forced close claims is at risk: not folded, forced
+    // closed in time.
+    if v.uncovered <= FLOOR {
+        return Step::Waiting;
     }
     Step::CashingOut
 }
@@ -273,6 +293,7 @@ pub async fn drive<T: Transport, C: Chain>(
         .iter()
         .map(|p| (p.hash.as_str(), &p.state))
         .collect();
+    let stake = super::activation::at_stake(wallet, &store, dir, tip)?;
     let mut acted: HashSet<String> = HashSet::new();
     let mut exits = Vec::new();
     for c in &live {
@@ -301,6 +322,7 @@ pub async fn drive<T: Transport, C: Chain>(
             since: c.since,
             consented: consent.is_some(),
             uncovered: held(|b| b.available).saturating_sub(covered),
+            owed: stake.get(&c.id).copied().unwrap_or(0),
             pending: held(|b| b.pending),
             paying,
             cashed,
@@ -313,6 +335,7 @@ pub async fn drive<T: Transport, C: Chain>(
             cash_at,
             force_at,
             uncovered: view.uncovered,
+            owed: view.owed,
             error: None,
         };
         let acts = matches!(step, Step::CashingOut | Step::Folding | Step::ForceClosing);
@@ -399,6 +422,7 @@ mod tests {
             since: 10,
             consented: true,
             uncovered: 50_000,
+            owed: 0,
             pending: 0,
             paying: false,
             cashed: false,
@@ -490,6 +514,54 @@ mod tests {
         assert_eq!(plan(View { paying: true, ..v }), Step::Paying);
         // Past force_at too: nothing at risk is forced closed.
         assert_eq!(plan(View { tip: 1_188, ..v }), Step::Folding);
+    }
+
+    #[test]
+    fn locks_owed_on_bitcoin_keep_it_from_folding_until_forced_closed() {
+        let owed = View {
+            uncovered: 0,
+            owed: FLOOR + 1,
+            ..view()
+        };
+        // No payout recovers them: it waits for its forced close.
+        assert_eq!(plan(owed), Step::Waiting);
+        assert_eq!(plan(View { tip: 1_188, ..owed }), Step::ForceClosing);
+        // Paid out of her notes, it does not fold.
+        let cashed = View {
+            cashed: true,
+            ..owed
+        };
+        assert_eq!(plan(cashed), Step::Waiting);
+        assert_eq!(
+            plan(View {
+                tip: 1_188,
+                ..cashed
+            }),
+            Step::ForceClosing
+        );
+        // Beside notes at risk, those are paid out first.
+        assert_eq!(
+            plan(View {
+                uncovered: 50_000,
+                ..owed
+            }),
+            Step::CashingOut
+        );
+        // With notes too few on their own, together at risk.
+        let both = View {
+            uncovered: FLOOR,
+            owed: 1,
+            ..view()
+        };
+        assert_eq!(plan(both), Step::Waiting);
+        assert_eq!(plan(View { tip: 1_188, ..both }), Step::ForceClosing);
+        assert_eq!(
+            plan(View {
+                consented: false,
+                ..owed
+            }),
+            Step::NeedsConsent
+        );
     }
 
     #[test]
