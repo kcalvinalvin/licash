@@ -52,15 +52,9 @@ pub const IMMUTABLE_DEPTH: u32 = 144;
 pub fn answer_from(openings: &licash_contracts::hub::Openings, hub: Arc<Hub>) {
     let ledger = hub.clone();
     openings.evidence_with(Arc::new(move |claim, published_at| {
-        // Its evidence is pinned once given: none before the ledger saw
-        // what the statement judges the claim on. A ledger following no
-        // chain admitted no lock, so a scan would find it nothing.
-        if let Some((top, _)) = ledger.scanned()? {
-            anyhow::ensure!(
-                top >= published_at,
-                "the ledger has scanned to {top}, not yet the claim's block {published_at}"
-            );
-        }
+        let timed = claim.parts().sources.iter().any(|s| s.terms().is_some());
+        let top = ledger.scanned()?.map(|(top, _)| top);
+        scanned_for(timed, top, published_at)?;
         Ok(ledger.evidence(claim)?)
     }));
     openings.claims_with(Arc::new(move |contract, publication| {
@@ -92,6 +86,22 @@ pub fn open_on_lock_checkpoints(openings: &licash_contracts::hub::Openings, hub:
             Ok(hub.add_checkpoint(checkpoint)?)
         }),
     });
+}
+
+/// Whether a ledger scanned to `top`, if it follows a chain, may give its
+/// evidence against a claim published at `published_at`, which cites a
+/// lock if `timed`. Its evidence is pinned once given, and an activation
+/// up to that block gives a preimage that voids her refund: a claim of a
+/// lock waits for the scan. One of none needs no chain, nor does a
+/// ledger following none, which admitted no lock.
+fn scanned_for(timed: bool, top: Option<u32>, published_at: u32) -> anyhow::Result<()> {
+    if let (true, Some(top)) = (timed, top) {
+        anyhow::ensure!(
+            top >= published_at,
+            "the ledger has scanned to {top}, not yet the claim's block {published_at}"
+        );
+    }
+    Ok(())
 }
 
 /// The height of the newest lock checkpoint of a ledger scanned to `top`,
@@ -578,6 +588,15 @@ async fn inbox_acks(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_claim_of_a_lock_waits_for_the_scan_of_its_block() {
+        assert!(scanned_for(true, Some(99), 100).is_err());
+        assert!(scanned_for(true, Some(100), 100).is_ok());
+        // Of no lock, or following no chain: at once.
+        assert!(scanned_for(false, Some(10), 100).is_ok());
+        assert!(scanned_for(true, None, 100).is_ok());
+    }
 
     #[test]
     fn contracts_open_buried_in_a_scan_that_keeps_up_with_the_tip() {

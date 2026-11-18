@@ -1547,7 +1547,6 @@ struct Stale {
     rt: Regtest,
     _dir: tempfile::TempDir,
     hub: Arc<Hub>,
-    source: Source,
     openings: Arc<Openings>,
     chain: Node,
     wallet: Wallet<Http>,
@@ -1617,7 +1616,6 @@ async fn stale_claim_scanned(seed: [u8; 32], scanned: bool) -> Result<Stale> {
         rt,
         _dir: dir,
         hub,
-        source,
         openings,
         chain,
         wallet,
@@ -1682,32 +1680,22 @@ async fn a_hub_meets_a_stale_claim_with_the_spend_it_released_and_pays_what_is_l
     Ok(())
 }
 
-/// A hub whose ledger follows the chain answers a claim only once it has
-/// scanned the claim's block: its evidence is pinned once given, and an
-/// activation up to that block could void her refund.
+/// A hub whose ledger follows the chain, its scan stopped before her
+/// request, still meets a claim of no lock with the spend it holds: only
+/// a claim of a lock waits for the scan of its block.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs bitcoind and a release build"]
-async fn a_hub_answers_a_claim_only_once_its_ledger_scanned_the_claims_block() -> Result<()> {
-    use licash_contracts::holder::recovery;
-
-    // Scanned to before her request: then no further.
+async fn a_hub_meets_a_claim_of_no_lock_while_its_ledgers_scan_lags() -> Result<()> {
     let s = stale_claim_scanned([13; 32], true).await?;
-    let mut refused = false;
-    for _ in 0..40 {
-        s.rt.mine(1)?;
-        let round = s.openings.answer_requests().await?;
-        let r = recovery::advance(&s.wallet, &s.chain, &s.mine, s.rate).await?[0].clone();
-        ensure!(r.response.is_none(), "answered unscanned: {r:?}");
-        if round.failed > 0 {
-            refused = true;
-            break;
-        }
-    }
-    ensure!(refused, "the hub never came to her claim");
-    // Scanned to her block: answered as ever.
-    while !watch::step(&s.hub, &s.source).await? {}
     let done = played(&s, |_| true).await?;
     ensure!(done.corrected == Some(4_096), "{done:?}");
+    let scanned = s.hub.scanned()?.context("no scan")?.0;
+    // Before her request, so before her publication.
+    let requested = done.requested_at.context("no request")?;
+    ensure!(
+        scanned < requested,
+        "scanned to {scanned}, requested at {requested}"
+    );
     Ok(())
 }
 
