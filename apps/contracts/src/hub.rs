@@ -497,7 +497,7 @@ impl Openings {
         }
         if let Some(prover) = &self.prover {
             prover.polled();
-            let blocks = self.timing.proving_blocks();
+            let blocks = self.timing.proof_blocks();
             if let Some(defendable) = prover.defendable(blocks) {
                 let open = round_open as u64;
                 let over = open > defendable;

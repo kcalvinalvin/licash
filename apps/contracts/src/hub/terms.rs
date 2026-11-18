@@ -205,7 +205,7 @@ impl Timing {
     /// The blocks the hub's prover has for a proof its quotes commit it
     /// to: the assert window less its response's burial, the block the
     /// assertion confirms in and the deadline margin (2).
-    pub fn proving_blocks(&self) -> u32 {
+    pub fn proof_blocks(&self) -> u32 {
         u32::from(assert_window(self.profile))
             .saturating_sub(Floors::of(self.profile).work_depth)
             .saturating_sub(1 + 2)
