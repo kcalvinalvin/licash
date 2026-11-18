@@ -539,25 +539,54 @@ impl<T: Transport> Wallet<T> {
         })
     }
 
-    /// The static address of donations to this wallet through the swap
-    /// provider at `provider`, if it takes them at a hub of the wallet's
-    /// code: its code at the hubs it trusts, the first [`MAX_HUBS`], as
-    /// an LNURL of the provider's ([`LicashCode::lnurl`]). Refused if the
-    /// provider takes no donations, or swaps at none of those hubs.
-    pub async fn donation_address(&self, provider: &str) -> Result<DonationAddress, Error> {
+    /// The code to take donations at: `kept`, a code given out before, as
+    /// long as it still pays this wallet, at hubs it all trusts, so that
+    /// an address handed out stays as hubs are added; else its code at the
+    /// hubs it trusts, the first [`MAX_HUBS`], as it shows it.
+    pub fn donation_code(&self, kept: Option<&str>) -> Result<LicashCode, Error> {
+        let trusted: Vec<HubId> = (self.hubs()?.iter())
+            .map(|(_, info)| HubId::of(&info.address))
+            .collect();
+        let mailbox = self.keys.mailbox.x_only_public_key(&Secp256k1::new()).0;
+        let pays = |code: &LicashCode| {
+            code.network == self.network
+                && code.address == self.address()
+                && code.mailbox.is_none_or(|key| key == mailbox.serialize())
+                && !code.hubs.is_empty()
+                && code.hubs.iter().all(|id| trusted.contains(id))
+        };
+        if let Some(code) = kept.and_then(|text| text.parse::<LicashCode>().ok()) {
+            if pays(&code) {
+                return Ok(code);
+            }
+        }
+        let hubs: Vec<String> = (self.hubs()?.into_iter())
+            .map(|(url, _)| url)
+            .take(MAX_HUBS)
+            .collect();
+        if hubs.is_empty() {
+            return Err(Error::Invalid("no donations without a hub".into()));
+        }
+        let code = self.payment_code(&hubs, false)?.licash;
+        Ok(code.expect("a Licash code"))
+    }
+
+    /// The static address of donations to `code`, this wallet's
+    /// ([`Wallet::donation_code`]), through the swap provider at
+    /// `provider`, if it takes them at a hub of the code: an LNURL of the
+    /// provider's ([`LicashCode::lnurl`]). Refused if the provider takes
+    /// no donations, or swaps at none of those hubs.
+    pub async fn donation_address(
+        &self,
+        provider: &str,
+        code: &LicashCode,
+    ) -> Result<DonationAddress, Error> {
         let provider = crate::hub_url(provider)?;
         let info: licash_api::swaps::Info =
             self.get(&provider, licash_api::swaps::SWAPS_INFO).await?;
         let Some(donations) = info.donations.clone() else {
             return Err(Error::Invalid(format!("{provider} takes no donations")));
         };
-        let trusted = self.hubs()?;
-        let hubs: Vec<String> = trusted.iter().map(|(url, _)| url.clone()).collect();
-        let hubs = &hubs[..hubs.len().min(MAX_HUBS)];
-        let code = self
-            .payment_code(hubs, false)?
-            .licash
-            .expect("a Licash code");
         let at: Vec<&licash_api::swaps::Hub> = info
             .hubs
             .iter()

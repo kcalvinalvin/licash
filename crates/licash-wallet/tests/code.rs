@@ -484,3 +484,37 @@ fn the_static_lnurl_of_a_code_encodes_its_donation_url() {
     );
     assert_eq!(code.lnurl("https://swaps.example"), lnurl);
 }
+
+#[tokio::test]
+async fn a_code_given_out_for_donations_stays_while_it_pays_the_wallet() {
+    let net = Net::new();
+    net.start(HUB, Fee { base: 0, ppm: 0 });
+    net.start(HUB2, Fee { base: 0, ppm: 0 });
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, bob) = (wallet(&net, &dir, 1), wallet(&net, &dir, 2));
+    // No hub, no donations.
+    assert!(matches!(alice.donation_code(None), Err(Error::Invalid(_))));
+    alice.add_hub(HUB).await.unwrap();
+    let given = alice.donation_code(None).unwrap();
+    assert_eq!(given.hubs.len(), 1);
+    // A hub added: the code shown names it, the one given out stays.
+    alice.add_hub(HUB2).await.unwrap();
+    let now = alice.donation_code(None).unwrap();
+    assert_eq!(now.hubs.len(), 2);
+    let text = given.to_string();
+    assert_eq!(alice.donation_code(Some(&text)).unwrap(), given);
+    // Not one paying her, at hubs she trusts: the code shown instead.
+    let mut unknown = given.clone();
+    unknown.hubs.push(HubId([9; 16]));
+    let mut mailed = given.clone();
+    mailed.mailbox = Some([7; 32]);
+    let bobs = {
+        bob.add_hub(HUB).await.unwrap();
+        bob.donation_code(None).unwrap()
+    };
+    for other in [unknown, mailed, bobs] {
+        let kept = alice.donation_code(Some(&other.to_string())).unwrap();
+        assert_eq!(kept, now, "{other:?}");
+    }
+    assert_eq!(alice.donation_code(Some("nonsense")).unwrap(), now);
+}

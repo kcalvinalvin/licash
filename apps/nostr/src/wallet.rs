@@ -14,8 +14,8 @@ use bitcoin::FeeRate;
 use futures_util::future::{join, join_all};
 use licash_api::{Info, Payment};
 use licash_wallet::{
-    DonationAddress, Error, HubId, Paid, PaymentCode, PayoutQuote, PayoutState, Received,
-    SwapLimits, SwapQuote, SwapState, Transport, ViaQuote, Wallet,
+    DonationAddress, Error, HubId, LicashCode, Paid, PaymentCode, PayoutQuote, PayoutState,
+    Received, SwapLimits, SwapQuote, SwapState, Transport, ViaQuote, Wallet,
 };
 
 use crate::{mailbox, watch::Watch, Found, Role, Route, LIFETIME};
@@ -1075,7 +1075,8 @@ pub struct DonationProvider {
 
 /// The swap providers announced on `relays` for `wallet`'s network, as
 /// `announced` keeps them, asked through `route`, that take donations to
-/// `wallet`'s code at a hub of it ([`Wallet::donation_address`]). Those
+/// `code`, `wallet`'s ([`Wallet::donation_code`]), at a hub of it
+/// ([`Wallet::donation_address`]). Those
 /// holding enough there to take one first, then the cheapest on a
 /// donation of 10,000 sat, then by public URL: the same one while nothing
 /// changes, as an address handed out stays.
@@ -1083,9 +1084,10 @@ pub async fn donation_providers_with<T: Transport>(
     wallet: &Wallet<T>,
     announced: &Announcements,
     (relays, route): (&[String], &Route),
+    code: &LicashCode,
 ) -> anyhow::Result<Vec<DonationProvider>> {
     let network = wallet.network().name();
-    let ask = |url: String| async move { wallet.donation_address(&url).await };
+    let ask = |url: String| async move { wallet.donation_address(&url, code).await };
     let on = (relays, route, network);
     let answering = announced.answering(on, ask, |a: &DonationAddress| a.info.nostr.as_deref());
     let mut providers: Vec<DonationProvider> = (answering.await?.into_iter())

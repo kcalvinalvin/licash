@@ -502,6 +502,14 @@ impl Transport for Via {
     }
 }
 
+/// The donation address of `wallet`'s code at [`PROVIDER`].
+async fn donation(
+    wallet: Wallet<Via>,
+) -> Result<licash_wallet::DonationAddress, licash_wallet::Error> {
+    let code = wallet.donation_code(None)?;
+    wallet.donation_address(PROVIDER, &code).await
+}
+
 #[tokio::test]
 async fn a_wallet_finds_its_static_donation_address_at_a_provider_taking_them() {
     let eco = Eco::new().await;
@@ -510,10 +518,7 @@ async fn a_wallet_finds_its_static_donation_address_at_a_provider_taking_them() 
         let path = eco.dir.path().join("payee.sqlite");
         Wallet::open(&path, Via(eco.net.clone(), info)).unwrap()
     };
-    let address = payee(info.clone())
-        .donation_address(PROVIDER)
-        .await
-        .unwrap();
+    let address = donation(payee(info.clone())).await.unwrap();
     // Its own code, at the provider's public URL, in an LNURL.
     let (_, url) = bitcoin::bech32::decode(&address.lnurl).unwrap();
     let url = String::from_utf8(url).unwrap();
@@ -535,12 +540,12 @@ async fn a_wallet_finds_its_static_donation_address_at_a_provider_taking_them() 
     // Holding too little at the code's hubs: payers refused for now.
     let mut empty = info.clone();
     empty.hubs[0].max = 0;
-    let address = payee(empty).donation_address(PROVIDER).await.unwrap();
+    let address = donation(payee(empty)).await.unwrap();
     assert!(!address.stocked);
     // Swapping at none of the payee's hubs, or taking no donations: none.
     let mut elsewhere = info.clone();
     elsewhere.hubs.clear();
-    let refused = payee(elsewhere).donation_address(PROVIDER).await;
+    let refused = donation(payee(elsewhere)).await;
     assert!(
         matches!(refused, Err(licash_wallet::Error::Invalid(_))),
         "{refused:?}"
@@ -549,7 +554,7 @@ async fn a_wallet_finds_its_static_donation_address_at_a_provider_taking_them() 
         donations: None,
         ..info
     };
-    let refused = payee(none).donation_address(PROVIDER).await;
+    let refused = donation(payee(none)).await;
     assert!(
         matches!(refused, Err(licash_wallet::Error::Invalid(_))),
         "{refused:?}"
