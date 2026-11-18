@@ -23,6 +23,13 @@ const RETRY: Duration = Duration::from_secs(2);
 /// How many times to ask a working hub again before trying later.
 const PATIENCE: u32 = 900;
 
+/// How many times a step that never reached the hub, or whose answer
+/// never came back, is sent again at once: a circuit over Tor drops now
+/// and then, and the hub takes a step it has again as it took it. Not an
+/// instance's upload, 25 MB on signet: left to the opening's resumption,
+/// which sends none the hub answered.
+const RECONNECTS: u32 = 3;
+
 /// How many instances are uploaded beside each other, each on a circuit
 /// of its own over Tor: one carries only so much.
 const UPLOADS: usize = 3;
@@ -420,10 +427,23 @@ impl<T: Transport, C: Chain> Driver<'_, T, C> {
     /// POST `body` to `url`: the hub's answer, asked again while it works.
     async fn ask(&self, url: String, body: Vec<u8>) -> Result<Vec<Frame>> {
         let started = Instant::now();
+        let mut dropped = match Kind::peek(&body) {
+            Some(Kind::Instance) => RECONNECTS,
+            _ => 0,
+        };
         for _ in 0..PATIENCE {
             let request = Some(body.clone());
-            let response = self.wallet.transport().request(&url, request).await;
-            let response = response.map_err(|e| anyhow!("{}: {e}", self.hub))?;
+            let response = match self.wallet.transport().request(&url, request).await {
+                Ok(response) => response,
+                Err(e) if dropped < RECONNECTS => {
+                    dropped += 1;
+                    let id = crate::hex_id(&self.id);
+                    tracing::warn!(%id, dropped, "asking the hub again: {e}");
+                    tokio::time::sleep(RETRY * dropped).await;
+                    continue;
+                }
+                Err(e) => bail!("{}: {e}", self.hub),
+            };
             count(&self.id, body.len() + response.body.len());
             match response.status {
                 200 => {
