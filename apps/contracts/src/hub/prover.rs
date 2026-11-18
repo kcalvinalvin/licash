@@ -981,6 +981,61 @@ mod tests {
         );
     }
 
+    /// Many holders close at once, all claiming more than they are owed:
+    /// the hub responds to the claims of the largest stakes its prover can
+    /// prove in time, whatever order it found them in, and proves those
+    /// earliest deadline first. (Claims owed in full never get here: the
+    /// hub lets them pay without a proof.)
+    #[test]
+    fn a_mass_exit_proves_the_largest_stakes_in_time_earliest_deadline_first() {
+        let dir = tempfile::tempdir().unwrap();
+        // 2 M cycles: 2,600 s with the margin.
+        let speed = Speed {
+            device: "cuda".into(),
+            segment_cycles: 1_000_000,
+            segment: 1_000.0,
+            tail: 0.0,
+        };
+        let p = ready(dir.path(), speed);
+        // Claim i saves 10 i sat; its deadlines are spread over 110 to
+        // 117, from tip 100: 10,800 s at most, four proofs.
+        let deadline = |i: u8| 110 + u32::from(i) * 3 % 8;
+        let found = [3u8, 7, 1, 8, 5, 2, 6, 4];
+        let admit = |i: u8| {
+            let stake = 10 * u64::from(i);
+            p.admit(&[i; 32], &[0; 32], stake, 2_000_000, deadline(i), 100, 100)
+        };
+        for i in found {
+            assert_eq!(admit(i), Admission::Wait);
+        }
+        p.polled();
+        let mut answered = Vec::new();
+        for i in found {
+            match admit(i) {
+                Admission::Admit => {
+                    p.commit(&[i; 32], [0; 32], deadline(i), 100, 2_000_000, true, false, 100);
+                    answered.push(i);
+                }
+                Admission::Withhold(why) => assert!(
+                    why.contains("larger stake") || why.contains("in time"),
+                    "{i}: {why}"
+                ),
+                Admission::Wait => panic!("{i} seen a poll before"),
+            }
+        }
+        answered.sort();
+        assert_eq!(answered, [5, 6, 7, 8]);
+        // Proved earliest deadline first: 110, 112, 115, 117.
+        let mut proved = Vec::new();
+        loop {
+            let next = p.0.next(&p.0.state());
+            let Some((id, _)) = next else { break };
+            proved.push(id[0]);
+            p.commit(&id, [0; 32], deadline(id[0]), 100, 2_000_000, true, true, 100);
+        }
+        assert_eq!(proved, [8, 6, 7, 5]);
+    }
+
     #[test]
     fn the_exits_defendable_are_the_smallest_proofs_a_window_holds() {
         let dir = tempfile::tempdir().unwrap();
