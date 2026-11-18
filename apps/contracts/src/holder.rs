@@ -29,7 +29,7 @@ use licash_wallet::{SilentCoin, Transport, Wallet};
 
 pub use chain::Chain;
 use driver::Driver;
-pub use driver::{traffic, Traffic};
+pub use driver::{stepping, traffic, Traffic};
 pub use fold::close;
 pub use licash_contract::opening::{Fate, Phase};
 #[cfg(feature = "node")]

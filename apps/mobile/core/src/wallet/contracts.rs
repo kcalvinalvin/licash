@@ -335,7 +335,13 @@ impl Wallet {
     fn contract(&self, c: &holder::Contract, covers: u64) -> Contract {
         let (tip, state) = (self.tip(), state(c, self.tip()));
         let step = match state {
-            ContractState::Opening => Some(opening_step(c.phase)),
+            ContractState::Opening => Some(match (c.phase, holder::stepping(&c.id)) {
+                // Its terms got: working out what it commits to on them.
+                (Phase::Started, Some(took)) => OpeningStep::Preparing {
+                    seconds: took.as_secs(),
+                },
+                (phase, _) => opening_step(phase),
+            }),
             ContractState::Confirming => {
                 // As deep as the wallet saw her coin's spend: F, which
                 // spends it.

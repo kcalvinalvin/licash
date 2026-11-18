@@ -286,6 +286,20 @@ class Engine(context: Context) {
             load()
             loop()
         }
+        scope.launch {
+            // A protection being set up, in sight: its step, how long it
+            // has taken and its speed kept current between rounds.
+            while (true) {
+                delay(OPENING_TICK_MS)
+                if (foreground && state.value.contracts.any { it.state == ContractState.Opening }) tickContracts()
+            }
+        }
+    }
+
+    /** The contracts alone read again: cheap enough every few seconds. */
+    private fun tickContracts() {
+        val contracts = wallet?.let { runCatching { it.contracts() }.getOrNull() } ?: return
+        state.update { it.copy(contracts = contracts) }
     }
 
     /** Keep at work out of sight, or no longer: for the service watching. */
@@ -1412,6 +1426,7 @@ class Engine(context: Context) {
 
     companion object {
         private const val ROUND_MS = 20_000L
+        private const val OPENING_TICK_MS = 2_000L
         private const val EAGER_MS = 4_000L
         private const val MAIL_MS = 1_000L
         private const val AWAY_MS = 60_000L

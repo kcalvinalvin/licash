@@ -315,11 +315,18 @@ const val SETUP_STEPS = 7f
  */
 fun setup(step: OpeningStep): Pair<Float, String> = when (step) {
     OpeningStep.Terms -> 0f to "Asking the hub"
+    is OpeningStep.Preparing -> 0.75f to "Preparing it, a few minutes · ${ticking(step.seconds)}"
     OpeningStep.Choosing -> 1.5f to "The hub is choosing"
     OpeningStep.Uploading -> 3f to "Sending to the hub"
     OpeningStep.Signatures -> 4f to "Waiting for the hub"
     OpeningStep.Signing -> 5f to "Signing"
     is OpeningStep.Confirming -> 6f to if (step.confirmations == 0u) "Waiting for Bitcoin" else "Confirming"
+}
+
+/** `seconds` as a clock ticks them: `45 s`, `2 min 05 s`. */
+fun ticking(seconds: ULong): String {
+    val (m, s) = seconds.toLong() / 60 to seconds.toLong() % 60
+    return if (m == 0L) "$s s" else "$m min ${s.toString().padStart(2, '0')} s"
 }
 
 /**

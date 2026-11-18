@@ -518,6 +518,9 @@ pub struct Transfer {
 pub enum OpeningStep {
     /// The hub's terms, for the wallet's open.
     Terms,
+    /// The wallet preparing the contract on those terms, garbling the
+    /// instances it commits to: minutes on a phone, `seconds` so far.
+    Preparing { seconds: u64 },
     /// The hub's choice of the instances the wallet garbled it keeps.
     Choosing,
     /// Those instances, sent to the hub, then the contract's transactions

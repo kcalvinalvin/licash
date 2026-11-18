@@ -2,8 +2,10 @@ package org.licash.wallet.ui
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.licash.core.Balance
+import org.licash.core.OpeningStep
 import org.licash.core.Transfer
 
 class WordsTest {
@@ -89,6 +91,15 @@ class WordsTest {
             refundWait(200u),
         )
         assertEquals("Not paid. Your money comes back by itself in about 2 hours.", notPaid(12u))
+    }
+
+    @Test
+    fun a_setup_preparing_says_how_long_so_far_between_its_first_steps() {
+        assertEquals("45 s", ticking(45uL))
+        assertEquals("2 min 05 s", ticking(125uL))
+        val (done, says) = setup(OpeningStep.Preparing(125uL))
+        assertEquals("Preparing it, a few minutes · 2 min 05 s", says)
+        assertTrue(done > setup(OpeningStep.Terms).first && done < setup(OpeningStep.Choosing).first)
     }
 
     @Test

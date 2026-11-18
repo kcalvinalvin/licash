@@ -47,6 +47,36 @@ pub fn traffic(id: &[u8; 32]) -> Option<Traffic> {
     all.get(id).copied()
 }
 
+/// The openings whose holder works out a step of her own now, by when
+/// she started it: a long one, garbling her instances, takes minutes on
+/// a phone. In memory only, as [`TRAFFIC`].
+static STEPPING: LazyLock<Mutex<HashMap<[u8; 32], Instant>>> = LazyLock::new(Mutex::default);
+
+/// How long the holder of opening `id` has been working out a step of her
+/// own, if she is.
+pub fn stepping(id: &[u8; 32]) -> Option<std::time::Duration> {
+    let all = STEPPING.lock().unwrap_or_else(PoisonError::into_inner);
+    all.get(id).map(Instant::elapsed)
+}
+
+/// Marks opening `id` as stepping until dropped.
+struct Stepping([u8; 32]);
+
+impl Stepping {
+    fn start(id: [u8; 32]) -> Self {
+        let mut all = STEPPING.lock().unwrap_or_else(PoisonError::into_inner);
+        all.insert(id, Instant::now());
+        Self(id)
+    }
+}
+
+impl Drop for Stepping {
+    fn drop(&mut self) {
+        let mut all = STEPPING.lock().unwrap_or_else(PoisonError::into_inner);
+        all.remove(&self.0);
+    }
+}
+
 fn count(id: &[u8; 32], bytes: usize) {
     let mut all = TRAFFIC.lock().unwrap_or_else(PoisonError::into_inner);
     let traffic = all.entry(*id).or_insert_with(|| Traffic {
@@ -266,11 +296,14 @@ impl<T: Transport, C: Chain> Driver<'_, T, C> {
         let ctx = self.context().await?;
         let started = Instant::now();
         let mut holder = self.holder.take().expect("a holder between steps");
+        let stepping = Stepping::start(self.id);
         let stepped = tokio::task::spawn_blocking(move || {
             let out = holder.step(input, &ctx);
             (holder, out)
         });
-        let (holder, out) = stepped.await?;
+        let stepped = stepped.await;
+        drop(stepping);
+        let (holder, out) = stepped?;
         self.holder = Some(holder);
         let out = out.map_err(|e| Refusal(format!("{e:#}")))?;
         let holder = self.holder();
@@ -388,5 +421,21 @@ pub(super) fn failed(hub: &str, status: u16, body: &[u8]) -> anyhow::Error {
         Refusal(format!("{hub} refused it: {reason}")).into()
     } else {
         anyhow!("{hub}: status {status}: {reason}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_opening_is_stepping_while_its_holder_works_out_a_step() {
+        let id = [7; 32];
+        assert_eq!(stepping(&id), None);
+        let marked = Stepping::start(id);
+        assert!(stepping(&id).is_some());
+        assert_eq!(stepping(&[8; 32]), None);
+        drop(marked);
+        assert_eq!(stepping(&id), None);
     }
 }
