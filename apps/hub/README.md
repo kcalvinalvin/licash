@@ -173,7 +173,10 @@ hub first saw it, or once F may no longer fund its contract, the hub
 spends one of its own coins F spends back to its wallet, then gives the
 opening up once that is deep. At most 16 signed openings may wait unfunded
 like this; past that, new openings are refused as unavailable, and the
-operator is alerted once. Openings are kept in `<data>/openings.sqlite`, as sensitive as the
+operator is alerted once. This version quotes contracts of graph id 8,
+whose graph returns the hub its reserve if it never responds: apps older
+than this version open no contract at an upgraded hub until they are
+updated, while contracts opened before keep their terms. Openings are kept in `<data>/openings.sqlite`, as sensitive as the
 seed: back it up with `hub.sqlite`. Each opening receives the kept garbled instances from
 the holder's wallet, kept in `<data>/opening-instances/`. The hub takes one opening's step, or
 builds one instance, at a time, the others waiting their turn: each opening
