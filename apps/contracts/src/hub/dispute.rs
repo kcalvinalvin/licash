@@ -202,7 +202,21 @@ impl Openings {
                 .await;
         }
         match self.spend(main(&z), &z.output[0], z_at, tip).await? {
-            None => self.answer(id, hub, o, &y, &z).await,
+            None => {
+                // Missing its deadline pays her claim and the hub's reserve.
+                let unit = Amount::from_sat(o.base.parts().graph.unit_sats);
+                let (b, _) = o.requested_b(&r)?;
+                let (responded, _) = HubProves::responded_b(&x)?;
+                let stake =
+                    unit * u64::from(b.saturating_sub(responded)) + o.babe.spec.terms.reserve_hub;
+                let g = &o.base.parts().graph;
+                let deadline = z_at
+                    .saturating_add(u32::from(g.answer_window))
+                    .saturating_sub(1)
+                    .saturating_sub(g.deadline_margin);
+                self.answer(id, hub, o, &y, &z, (deadline, stake), tip)
+                    .await
+            }
             Some((end_at, end)) => {
                 self.collect(id, hub, o, &r, Some(&x), (end_at, &end), tip)
                     .await
@@ -790,7 +804,9 @@ impl Openings {
     }
 
     /// She challenged the assertion: answered with the first kept
-    /// instance whose circuit opens on the proof.
+    /// instance whose circuit opens on the proof, in a block by `by`'s
+    /// deadline, its fee `by`'s stake at most ([`Self::with_fee_by`]).
+    #[allow(clippy::too_many_arguments)]
     async fn answer(
         &self,
         id: &[u8; 32],
@@ -798,6 +814,8 @@ impl Openings {
         o: &HubOpening,
         asserted: &Transaction,
         challenge: &Transaction,
+        by: (u32, Amount),
+        tip: u32,
     ) -> Result<Played> {
         for &i in &o.kept {
             let bytes = match self.store().kept_instance(id, i) {
@@ -814,7 +832,9 @@ impl Openings {
                         o.kept.iter().position(|n| *n == i).unwrap_or(0)
                     );
                     let prevout = presign(&o.set, &name)?.prevout.clone();
-                    let tx = self.with_fee(id, hub, &name, tx, prevout).await?;
+                    let tx = self
+                        .with_fee_by(id, hub, &name, tx, prevout, by, tip)
+                        .await?;
                     self.post(&tx).await;
                     return Ok(Played::Posted("wrongly_challenged"));
                 }
@@ -864,6 +884,61 @@ impl Openings {
             }
         };
         dispute::add_fee(tx, prevout, coin, key)
+    }
+
+    /// [`Self::with_fee`], for a terminal to be in a block by `deadline`,
+    /// the last tip it confirms in time from: while it is in none, once the
+    /// rate [`deadline::rate`] gives for the blocks left pays more than its
+    /// coin, a larger coin is funded, `stake` at most, what missing the
+    /// deadline costs the hub, and taken in place of the first once it is
+    /// in a block (a replacement spends no other unconfirmed coin,
+    /// BIP125). Kept beside the first, which stays valid.
+    #[allow(clippy::too_many_arguments)]
+    async fn with_fee_by(
+        &self,
+        id: &[u8; 32],
+        hub: &Hub,
+        name: &str,
+        tx: Transaction,
+        prevout: TxOut,
+        (deadline, stake): (u32, Amount),
+        tip: u32,
+    ) -> Result<Transaction> {
+        let first = self
+            .with_fee(id, hub, name, tx.clone(), prevout.clone())
+            .await?;
+        let first_coin = self.store().fee_coin(id, name)?.context("no fee coin")?;
+        let mut extra = Vec::new();
+        let kept = self.store().extra_coins(id, name)?;
+        for c in kept {
+            // In a block and unspent, else in the mempool, unspent.
+            let state = match self.unspent(c.0, false).await? {
+                true => Some(true),
+                false => self.unspent(c.0, true).await?.then_some(false),
+            };
+            extra.push((c, state));
+        }
+        let left = deadline.saturating_sub(tip);
+        let estimate = self
+            .source
+            .fee_rate(deadline::target(left))
+            .await
+            .ok()
+            .flatten();
+        let floor = FeeRate::from_sat_per_vb_u32(if estimate.is_some() { 1 } else { 2 });
+        let rate = deadline::rate(estimate, floor, left);
+        let needed = rate.fee_vb(first.vsize() as u64).context("fee overflow")?;
+        let (coin, fund) = terminal_coin(first_coin, &extra, needed, stake);
+        if let Some(value) = fund {
+            let key = &hub.keys().party.payment;
+            let more = self.fund_coin(&dispute::fee_script(key)?, value).await?;
+            self.store().keep_extra_coin(id, name, &more)?;
+            tracing::warn!(
+                id = %crate::hex_id(id), %rate, %value, deadline, tip,
+                "{name} pays too little to be in a block in time: a larger fee coin funded"
+            );
+        }
+        dispute::add_fee(tx, prevout, coin, &hub.keys().party.payment)
     }
 
     /// A coin of `value` paying `script`, from the hub's wallet.
@@ -954,7 +1029,7 @@ impl Openings {
         // the last one spent and those in a block (a replacement spends no
         // other unconfirmed coin, BIP125).
         let mut usable = Vec::new();
-        let kept = self.store().link_coins(id, name)?;
+        let kept = self.store().extra_coins(id, name)?;
         let waiting = kept.len();
         for coin in kept {
             let spent_before = old
@@ -1004,7 +1079,7 @@ impl Openings {
             .clamp(Amount::from_sat(1_000), stake.max(Amount::from_sat(1_000)));
             let key = &hub.keys().party.payment;
             let coin = self.fund_coin(&dispute::fee_script(key)?, value).await?;
-            self.store().keep_link_coin(id, name, &coin)?;
+            self.store().keep_extra_coin(id, name, &coin)?;
             if old.is_none() {
                 usable.push(coin);
             }
@@ -1021,7 +1096,7 @@ impl Openings {
         let child = match (build(rate), &old) {
             (Ok(child), None) => Some(child),
             (Ok(child), Some(old)) => {
-                let coins = self.store().link_coins(id, name)?;
+                let coins = self.store().extra_coins(id, name)?;
                 let fee = |tx: &Transaction| child_fee(tx, &link.output, &coins);
                 let (new, before) = (fee(&child), fee(old));
                 if new <= before {
@@ -1324,6 +1399,33 @@ impl Openings {
 /// its proof is not made.
 const NEAR: u32 = 6;
 
+/// The fee coin a terminal pays with, needing `needed` to be in a block in
+/// time, of `stake` at most: the largest of `first` and the `extra` ones in
+/// a block (`Some(true)`), and the value of a larger one to fund, unless
+/// one is in the mempool only (`Some(false)`) or pays enough already (none
+/// are spent ones).
+fn terminal_coin(
+    first: (OutPoint, TxOut),
+    extra: &[((OutPoint, TxOut), Option<bool>)],
+    needed: Amount,
+    stake: Amount,
+) -> ((OutPoint, TxOut), Option<Amount>) {
+    let needed = needed.min(stake);
+    let confirmed = extra
+        .iter()
+        .filter(|(_, s)| *s == Some(true))
+        .map(|(c, _)| c);
+    let coin = confirmed.fold(first, |best, c| match c.1.value > best.1.value {
+        true => c.clone(),
+        false => best,
+    });
+    let waiting = extra
+        .iter()
+        .any(|(c, s)| *s == Some(false) && c.1.value >= needed);
+    let fund = (coin.1.value < needed && !waiting).then(|| (needed * 2).min(stake.max(needed)));
+    (coin, fund)
+}
+
 /// About the virtual size of a link's fee child of `inputs` inputs, each
 /// a script spend of the hub's fee key, and one output.
 fn child_vb(inputs: usize) -> u64 {
@@ -1412,4 +1514,63 @@ fn fold_fee(o: &HubOpening, rate: FeeRate) -> Result<Amount> {
     let mut tx = crate::fold(&o.babe, &o.funding, Amount::ZERO)?.tx;
     tx.input[0].witness = bitcoin::Witness::from_slice(&[[0u8; 64]]);
     rate.fee_vb(tx.vsize() as u64).context("fee overflow")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn coin(n: u8, sat: u64) -> (OutPoint, TxOut) {
+        let txid = bitcoin::hashes::Hash::from_byte_array([n; 32]);
+        let out = TxOut {
+            value: Amount::from_sat(sat),
+            script_pubkey: ScriptBuf::new(),
+        };
+        (OutPoint { txid, vout: 0 }, out)
+    }
+
+    #[test]
+    fn a_terminal_pays_with_its_largest_coin_in_a_block_and_funds_a_larger_one_once() {
+        let sat = Amount::from_sat;
+        let (first, stake) = (coin(1, 1_000), sat(50_000));
+        // Its first pays enough: nothing funded.
+        assert_eq!(
+            terminal_coin(first.clone(), &[], sat(800), stake),
+            (first.clone(), None)
+        );
+        // Too little: twice what it needs, the stake at most.
+        assert_eq!(
+            terminal_coin(first.clone(), &[], sat(3_000), stake).1,
+            Some(sat(6_000))
+        );
+        assert_eq!(
+            terminal_coin(first.clone(), &[], sat(30_000), stake).1,
+            Some(stake)
+        );
+        assert_eq!(
+            terminal_coin(first.clone(), &[], sat(90_000), stake).1,
+            Some(stake)
+        );
+        // One funded, in the mempool only: waited for, the first paid with.
+        let pending = [(coin(2, 6_000), Some(false))];
+        assert_eq!(
+            terminal_coin(first.clone(), &pending, sat(3_000), stake),
+            (first.clone(), None)
+        );
+        // The rate rose past it meanwhile: a larger one more.
+        assert_eq!(
+            terminal_coin(first.clone(), &pending, sat(8_000), stake).1,
+            Some(sat(16_000))
+        );
+        // In a block: the largest paid with; a spent one never.
+        let extra = [
+            (coin(2, 6_000), Some(true)),
+            (coin(3, 4_000), Some(true)),
+            (coin(4, 9_000), None),
+        ];
+        assert_eq!(
+            terminal_coin(first, &extra, sat(3_000), stake),
+            (coin(2, 6_000), None)
+        );
+    }
 }

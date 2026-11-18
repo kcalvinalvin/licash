@@ -83,9 +83,10 @@ CREATE TABLE IF NOT EXISTS ended (
 ) STRICT;
 ";
 
-/// The name of fee coin `n` of link `name`'s child, among the terminals'.
-fn link_coin(name: &str, n: &str) -> String {
-    format!("{name}/child/{n}")
+/// The name of extra fee coin `n` of transaction `name`, beside the first
+/// kept under `name` itself.
+fn extra_coin(name: &str, n: &str) -> String {
+    format!("{name}/{n}")
 }
 
 /// An opening as stored.
@@ -345,9 +346,10 @@ impl Store {
         self.fee_coin(id, name)?.context("no fee coin kept")
     }
 
-    /// The fee coins kept for the child of link `name` of opening `id`,
-    /// in the order kept ([`Store::keep_link_coin`]).
-    pub fn link_coins(&self, id: &[u8; 32], name: &str) -> Result<Vec<(OutPoint, TxOut)>> {
+    /// The extra fee coins kept for transaction `name` of opening `id`, in
+    /// the order kept ([`Store::keep_extra_coin`]): a link's child's, or a
+    /// terminal's larger ones.
+    pub fn extra_coins(&self, id: &[u8; 32], name: &str) -> Result<Vec<(OutPoint, TxOut)>> {
         if !self.has("fee_coins")? {
             return Ok(Vec::new());
         }
@@ -355,7 +357,7 @@ impl Store {
             "SELECT outpoint, output FROM fee_coins
              WHERE id = ?1 AND substr(name, 1, length(?2)) = ?2 ORDER BY rowid",
         )?;
-        let rows = stmt.query_map(params![id, link_coin(name, "")], |r| {
+        let rows = stmt.query_map(params![id, extra_coin(name, "")], |r| {
             Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?))
         })?;
         rows.map(|row| {
@@ -365,17 +367,17 @@ impl Store {
         .collect()
     }
 
-    /// Keep `coin` as one more fee coin of link `name`'s child: the coins
-    /// kept for it, `coin` last.
-    pub fn keep_link_coin(
+    /// Keep `coin` as one more extra fee coin of transaction `name`: the
+    /// extra coins kept for it, `coin` last.
+    pub fn keep_extra_coin(
         &self,
         id: &[u8; 32],
         name: &str,
         coin: &(OutPoint, TxOut),
     ) -> Result<Vec<(OutPoint, TxOut)>> {
-        let n = self.link_coins(id, name)?.len();
-        self.keep_fee_coin(id, &link_coin(name, &n.to_string()), coin)?;
-        self.link_coins(id, name)
+        let n = self.extra_coins(id, name)?.len();
+        self.keep_fee_coin(id, &extra_coin(name, &n.to_string()), coin)?;
+        self.extra_coins(id, name)
     }
 
     /// The fee child of link `name` of opening `id` last made, if any.
@@ -618,7 +620,7 @@ mod tests {
     }
 
     #[test]
-    fn a_links_fee_coins_add_up_and_its_child_is_the_last_made() -> Result<()> {
+    fn extra_fee_coins_add_up_and_a_links_child_is_the_last_made() -> Result<()> {
         let data = tempfile::tempdir()?;
         let store = Store::open(data.path())?;
         let id = [1; 32];
@@ -636,13 +638,13 @@ mod tests {
         };
         ensure!(store.insert(&id, 0, true, &coin(9).0, &[0; 32], b"state")?);
         ensure!(
-            store.link_coins(&id, "assert")?.is_empty() && store.child(&id, "assert")?.is_none()
+            store.extra_coins(&id, "assert")?.is_empty() && store.child(&id, "assert")?.is_none()
         );
         // A terminal's coin is none of a link's.
         store.keep_fee_coin(&id, "assert_timeout", &coin(5))?;
-        ensure!(store.keep_link_coin(&id, "assert", &coin(1))? == vec![coin(1)]);
-        ensure!(store.keep_link_coin(&id, "assert", &coin(2))? == vec![coin(1), coin(2)]);
-        ensure!(store.keep_link_coin(&id, "respond", &coin(3))? == vec![coin(3)]);
+        ensure!(store.keep_extra_coin(&id, "assert", &coin(1))? == vec![coin(1)]);
+        ensure!(store.keep_extra_coin(&id, "assert", &coin(2))? == vec![coin(1), coin(2)]);
+        ensure!(store.keep_extra_coin(&id, "respond", &coin(3))? == vec![coin(3)]);
         let tx = |n: u32| Transaction {
             version: bitcoin::transaction::Version::TWO,
             lock_time: bitcoin::absolute::LockTime::from_consensus(n),
@@ -655,7 +657,7 @@ mod tests {
         let store = Store::open(data.path())?;
         ensure!(store.child(&id, "assert")? == Some(tx(2)));
         ensure!(store.child(&id, "respond")?.is_none());
-        ensure!(store.link_coins(&id, "assert")? == vec![coin(1), coin(2)]);
+        ensure!(store.extra_coins(&id, "assert")? == vec![coin(1), coin(2)]);
         ensure!(store.fee_coin(&id, "assert_timeout")? == Some(coin(5)));
         Ok(())
     }
