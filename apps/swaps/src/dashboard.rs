@@ -21,10 +21,11 @@ use rusqlite::{Connection, OpenFlags};
 /// 4 and 5 only add the invoices paid and the donations taken, which the
 /// dashboard does not read.
 const SWAPS_VERSION: i64 = 5;
-/// Versions 8 to 12 only add payment deliveries, the notes' unlink time,
-/// the providers paying invoices, payment keys and the recoveries claiming
-/// locks' refunds, which the dashboard does not read.
-const WALLET_VERSION: i64 = 12;
+/// Versions 8 to 13 only add payment deliveries, the notes' unlink time,
+/// the providers paying invoices, payment keys, the recoveries claiming
+/// locks' refunds and the locks owed to the wallet, which the dashboard
+/// does not read.
+const WALLET_VERSION: i64 = 13;
 
 /// Why a swap ended without paying, beside a reason recorded.
 const NEVER_CLAIMED: &str = "never claimed";
