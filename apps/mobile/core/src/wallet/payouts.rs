@@ -258,11 +258,8 @@ impl Wallet {
         provider: licash_nostr::wallet::PayoutProvider,
     ) -> Result<PayoutQuote, LicashError> {
         let hub = &asked.hub;
-        let quote = match asked.amount {
-            Some(_) => {
-                self.wallet.lock_fee(hub, locked(&provider.quote))?;
-                provider.quote
-            }
+        let mut quote = match asked.amount {
+            Some(_) => provider.quote,
             None => self.fit(
                 &provider.url,
                 (hub, asked.held),
@@ -270,10 +267,21 @@ impl Wallet {
                 provider.quote,
             )?,
         };
+        // The hub charges on the selected notes, which can exceed the
+        // value locked to the provider. Include that fee before consent.
+        let selected_fee = self.wallet.lock_fee(hub, locked(&quote))?;
+        quote.lock_fee = quote.lock_fee.max(selected_fee);
+        let fee = quote.costs();
+        if fee > quote.max_fee {
+            return Err(LicashError::invalid(format!(
+                "payout costs {fee} sat, more than {}",
+                quote.max_fee
+            )));
+        }
         Ok(PayoutQuote {
             address: asked.address.clone(),
             amount: quote.amount,
-            fee: quote.costs(),
+            fee,
             provider_fee: quote.fee,
             claim_fee: quote.budget,
             lock_fee: quote.lock_fee,
