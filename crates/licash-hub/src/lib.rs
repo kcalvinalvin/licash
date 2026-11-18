@@ -419,6 +419,8 @@ fn events(conn: &Connection, after: u64, limit: u32) -> Result<Vec<Event>, Error
 pub struct Hub {
     store: Store,
     keysets: BTreeMap<[u8; 32], (IssuerKeys, Keyset)>,
+    /// The id of the keyset of [`Hub::issuing`].
+    issuing: [u8; 32],
     owner: OwnerKeys,
     unlock_secret: [u8; 32],
     /// The Nostr key's secret, and its public key, x-only in hex.
@@ -489,6 +491,9 @@ impl Hub {
                 .collect::<Result<_, _>>()?;
             Ok(rows)
         })?;
+        // By index: the first is the one it issues under.
+        let issuing = rows.first().map(|(id, _, _)| *id);
+        let issuing = issuing.ok_or_else(|| Error::Setup("the database has no keyset".into()))?;
         let mut keysets = BTreeMap::new();
         for (id, index, max_pow) in rows {
             let keys = IssuerKeys::from_seed(&secret, index, max_pow)?;
@@ -509,6 +514,7 @@ impl Hub {
         let hub = Self {
             store,
             keysets,
+            issuing,
             owner: OwnerKeys::from_seed(&tagged_hash("licash-hub/owner", &[&secret]))?,
             unlock_secret: tagged_hash("licash-hub/unlock", &[&secret]),
             nostr: nostr_key(tagged_hash("licash-hub/nostr", &[&secret]))?,
@@ -595,6 +601,14 @@ impl Hub {
             advertised.proof = Some(licash_api::Hex(signature.0.to_vec()));
         }
         Ok(advertised)
+    }
+
+    /// The keyset the hub issues under where it is the one to choose, as
+    /// for the contracts it opens: of the lowest index, the only one it
+    /// makes for now. A wallet names the keyset of what it asks for, and
+    /// [`Hub::info`] lists them all, ordered by id.
+    pub fn issuing(&self) -> &Keyset {
+        &self.keysets[&self.issuing].1
     }
 
     /// The hub's keyset `id`, to decode requests under.

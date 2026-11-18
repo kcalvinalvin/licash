@@ -1162,8 +1162,7 @@ fn command(cli: Cli) -> anyhow::Result<()> {
             let _entered = runtime.enter();
             let contracts = match (contracting, &chain) {
                 (true, Some((source, _, _))) => {
-                    let keysets = hub.info().keysets;
-                    let keyset = keysets.first().context("the hub has no keyset")?;
+                    let keyset = hub.issuing();
                     let wallet = wallet.unwrap_or_else(|| source.clone());
                     let opening = Openings::with_wallet(
                         &cli.data,

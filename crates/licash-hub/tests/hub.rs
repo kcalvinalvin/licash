@@ -260,6 +260,33 @@ fn init_never_replaces_a_seed_or_ledger_and_open_needs_both_matching() {
     assert!(why.contains("schema 3"), "{why}");
 }
 
+/// The keyset the hub issues under is its first by index, whatever the
+/// order of their ids, which is the order it lists them in.
+#[test]
+fn a_hub_issues_under_its_keyset_of_the_lowest_index() {
+    let files = files();
+    let (_, first) = issuer(&files);
+    assert_eq!(open(&files, Policy::default()).issuing().id(), first.id());
+    // A later keyset of an id before the first's.
+    let mut seed = [0; 32];
+    let text = std::fs::read_to_string(&files.seed).unwrap();
+    hex::decode_to_slice(text.trim(), &mut seed).unwrap();
+    let (index, later) = (1..64)
+        .map(|index| (index, IssuerKeys::from_seed(&seed, index, MAX_POW).unwrap()))
+        .find(|(_, keys)| keys.id() < first.id())
+        .unwrap();
+    sql(&files.db)
+        .execute(
+            "INSERT INTO keysets (id, idx, max_pow, created_at) VALUES (?1, ?2, ?3, 0)",
+            rusqlite::params![later.id(), index, MAX_POW],
+        )
+        .unwrap();
+    let hub = open(&files, Policy::default());
+    let listed: Vec<_> = hub.info().keysets.iter().map(|k| *k.id()).collect();
+    assert_eq!(listed, [*later.id(), *first.id()]);
+    assert_eq!(hub.issuing().id(), first.id());
+}
+
 #[test]
 fn a_hub_names_one_nostr_key_of_its_seed_across_restarts() {
     use bitcoin::secp256k1::{Keypair, Secp256k1};
