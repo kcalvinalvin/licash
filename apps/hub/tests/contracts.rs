@@ -40,7 +40,7 @@ async fn hub_serving(
 ) -> Result<(String, Source, Arc<Hub>)> {
     std::fs::create_dir_all(dir)?;
     let (seed, db) = (dir.join("seed"), dir.join("hub.sqlite"));
-    Hub::init(&seed, &db, 12)?;
+    Hub::init(&seed, &db, NOTE_POW)?;
     let hub = Arc::new(Hub::open(&seed, &db, Policy::default())?);
     let url = format!(
         "{}/wallet/harness?cookie={}",
@@ -74,7 +74,7 @@ async fn a_hub_learns_what_its_contracts_wallet_holds() -> Result<()> {
     let rt = Regtest::start_standard()?;
     let dir = tempfile::tempdir()?;
     let (seed, db) = (dir.path().join("seed"), dir.path().join("hub.sqlite"));
-    Hub::init(&seed, &db, 12)?;
+    Hub::init(&seed, &db, NOTE_POW)?;
     let hub = Hub::open(&seed, &db, Policy::default())?;
     let url = format!(
         "{}/wallet/harness?cookie={}",
@@ -322,7 +322,7 @@ async fn a_wallet_opens_contracts_at_a_hub_and_sees_them_confirm() -> Result<()>
     )?;
     let info = wallet.add_hub(&url).await?;
     let offered = info.contracts.context("no contracts in the hub's info")?;
-    ensure!(offered.mock && offered.cap == 4_096 && offered.price == 23_000);
+    ensure!(offered.mock && offered.cap == 131_071 && offered.price == 23_000);
     ensure!(holder::list(&mine)?.is_empty());
     ensure!(!mine.join("contracts.sqlite").exists(), "made by a list");
 
@@ -348,7 +348,7 @@ async fn a_wallet_opens_contracts_at_a_hub_and_sees_them_confirm() -> Result<()>
     let tip = rt.height()?;
     let first = holder::open(&wallet, &chain, &mine, &url, ask()).await?;
     ensure!(first.phase == Phase::Funded, "{first:?}");
-    ensure!(first.mock && first.cap == 4_096 && first.price == 23_000);
+    ensure!(first.mock && first.cap == 131_071 && first.price == 23_000);
     ensure!(first.value == 60_000 && first.abandoned.is_none());
     ensure!((first.close_height, first.assert_height) == (tip + 300, tip + 140));
     let f = first.funding.context("no F")?;
@@ -465,19 +465,22 @@ async fn a_wallet_opens_a_contract_of_terms_it_chose_on_its_large_coin() -> Resu
     // Its fixed terms, as apps installed open on, and the range beside.
     let info = wallet.add_hub(&url).await?;
     let offered = info.contracts.context("no contracts in the hub's info")?;
-    ensure!(offered.cap == 4_096 && offered.price == 23_000 && offered.blocks == 1_000);
     let chosen = offered.range.context("no range in the hub's info")?;
     ensure!((chosen.min_blocks, chosen.max_blocks, chosen.per_coin) == (200, 5_000, 2));
-    // 15 M sat over 2 000 blocks: 1% a year of it over the fixed price.
+    // Its fixed terms priced by the same formula: 1% a year of their cap.
+    let fixed_price = chosen.price(131_071, 1_000, 0);
+    ensure!(fixed_price == 23_000 + 24, "{fixed_price}");
+    ensure!(offered.cap == 131_071 && offered.price == fixed_price && offered.blocks == 1_000);
+    // 2^24 - 1 sat over 2 000 blocks: 1% a year of it over the fixed fee.
     let price = chosen.price(16_777_215, 2_000, 0);
-    ensure!(price == 23_000 + 6_383, "{price}");
+    ensure!(price == 23_000 + 6_384, "{price}");
 
     // Asked of terms she chose: those exactly, a graph as wide as them.
-    let offer = holder::offer(&wallet, &url, Some((15_000_000, 2_000)), 0).await?;
-    ensure!(offer.quote.cap == 15_000_000 && offer.bounds.lock == 2_000);
+    let offer = holder::offer(&wallet, &url, Some((16_777_215, 2_000)), 0).await?;
+    ensure!(offer.quote.cap == 16_777_215 && offer.bounds.lock == 2_000);
     ensure!(offer.quote.graph.bits == 24 && offer.price() == price);
     // Out of its range, or half asked: refused.
-    let refused = holder::offer(&wallet, &url, Some((4_096, 199)), 0).await;
+    let refused = holder::offer(&wallet, &url, Some((131_071, 199)), 0).await;
     let refused = refused.err().context("offered 199 blocks")?;
     ensure!(format!("{refused:#}").contains("status 400"), "{refused:#}");
     let half = format!("{url}{}?cap=5000", licash_contracts::QUOTE);
@@ -499,18 +502,18 @@ async fn a_wallet_opens_a_contract_of_terms_it_chose_on_its_large_coin() -> Resu
         .find(|c| c.value == 60_000)
         .context("no coin")?;
 
-    // 15 M sat on her small coin: more than twice it, refused before
+    // 2^24 - 1 sat on her small coin: more than twice it, refused before
     // asking the hub; nothing kept.
     let ask = Ask {
         blocks: 2_000,
         max_price: price,
-        cap: Some(15_000_000),
+        cap: Some(16_777_215),
         deposit: Some(small.outpoint),
         funded: 0,
     };
     let refused = holder::open(&wallet, &chain, &mine, &url, ask).await;
     let refused = format!("{:#}", refused.unwrap_err());
-    ensure!(refused.contains("7500000 at least"), "{refused}");
+    ensure!(refused.contains("8388608 at least"), "{refused}");
     ensure!(holder::list(&mine)?.is_empty());
 
     // On the coin large enough, the smallest that is: F funded whole.
@@ -521,20 +524,20 @@ async fn a_wallet_opens_a_contract_of_terms_it_chose_on_its_large_coin() -> Resu
     };
     let first = holder::open(&wallet, &chain, &mine, &url, ask).await?;
     ensure!(first.phase == Phase::Funded, "{first:?}");
-    ensure!(first.cap == 15_000_000 && first.price == price && first.value == 10_000_000);
+    ensure!(first.cap == 16_777_215 && first.price == price && first.value == 10_000_000);
     ensure!((first.close_height, first.assert_height) == (tip + 2_000, tip + 1_840));
 
     // Of the fixed terms beside it, on her small coin, as an app
     // installed asks.
     let fixed = Ask {
         blocks: 300,
-        max_price: 23_000,
+        max_price: fixed_price,
         cap: None,
         deposit: None,
         funded: 0,
     };
     let second = holder::open(&wallet, &chain, &mine, &url, fixed).await?;
-    ensure!(second.cap == 4_096 && second.price == 23_000 && second.value == 60_000);
+    ensure!(second.cap == 131_071 && second.price == fixed_price && second.value == 60_000);
 
     // Both live; the hub's collateral for hers 2^24 - 1 sat at least.
     rt.mine(1)?;
@@ -557,6 +560,10 @@ async fn a_wallet_opens_a_contract_of_terms_it_chose_on_its_large_coin() -> Resu
     ensure!(most >= (1 << 24) - 1, "{found}");
     Ok(())
 }
+
+/// The largest note of the hubs [`pay`] pays from: 2^16 sat, half the
+/// least contract size and some.
+const NOTE_POW: u32 = 16;
 
 /// A payment of `amount` to `to` at `hub`, of seed file `seed`, its fee
 /// paid, from notes its keys made for someone outside any wallet.
@@ -586,7 +593,7 @@ fn pay(
     let text = std::fs::read_to_string(seed)?;
     let mut bytes = [0; 32];
     hex::decode_to_slice(text.trim(), &mut bytes)?;
-    let keys = IssuerKeys::from_seed(&bytes, 0, 12)?;
+    let keys = IssuerKeys::from_seed(&bytes, 0, NOTE_POW)?;
     let keyset = keys.keyset()?;
     let info = hub.info();
     let mut total = amount;
@@ -1317,8 +1324,9 @@ async fn a_holder_closes_her_contract_early_with_the_hub_and_gets_her_reserve_ba
 }
 
 /// A holder's wallet of `seed` over `transport` with a contract of a cap of
-/// 5 000 sat at a hub, and three notes of 2 048 there, the hub's largest:
-/// more than its cap, so that a claim of them lets 1 144 sat of their face
+/// 131 071 sat at a hub, and three notes of 65 536 there, the largest
+/// [`pay`] makes:
+/// more than its cap, so that a claim of them lets 65 537 sat of their face
 /// value go, as a forced close's does.
 struct Notes<T: licash_wallet::Transport> {
     rt: Regtest,
@@ -1337,10 +1345,11 @@ async fn with_notes<T: licash_wallet::Transport>(seed: [u8; 32], transport: T) -
     let dir = tempfile::tempdir()?;
     let at = dir.path().join("hub");
     let range = Range {
-        max_cap: 50_000_000,
+        max_cap: licash_contracts::hub::terms::MAX_CAP,
         max_blocks: 5_000,
         per_coin: 2,
         ppm_year: 10_000,
+        ppm_year_funded: 0,
     };
     let (url, source, hub, openings) = hub_answering_with(&rt, &at, Some(range)).await?;
     let chain = Node(source);
@@ -1355,18 +1364,18 @@ async fn with_notes<T: licash_wallet::Transport>(seed: [u8; 32], transport: T) -
     )
     .await?;
     let chosen = Ask {
-        cap: Some(5_000),
+        cap: Some(131_071),
         ..ask()
     };
     let contract = holder::open(&wallet, &chain, &mine, &url, chosen).await?;
-    ensure!(contract.cap == 5_000, "{contract:?}");
+    ensure!(contract.cap == 131_071, "{contract:?}");
     for _ in 0..3 {
-        let payment = pay(&hub, &at.join("seed"), &url, &wallet.address(), 2_048)?;
+        let payment = pay(&hub, &at.join("seed"), &url, &wallet.address(), 65_536)?;
         wallet.receive(&payment)?;
     }
     rt.mine(1)?;
     holder::resume(&wallet, &chain, &mine).await?;
-    ensure!(available(&wallet)? == 6_144);
+    ensure!(available(&wallet)? == 196_608);
     Ok(Notes {
         rt,
         dir,
@@ -1405,7 +1414,7 @@ async fn a_holder_closes_her_contract_on_her_notes_and_its_fold_pays_them_to_her
     ensure!(rows.len() == 1, "{rows:?}");
     let row = &rows[0];
     ensure!(
-        row.stage == Stage::Folding && row.irrevocable && (row.claimed, row.notes) == (5_000, 3),
+        row.stage == Stage::Folding && row.irrevocable && (row.claimed, row.notes) == (131_071, 3),
         "{row:?}"
     );
     ensure!(holder::list(mine)?[0].folded == Some(txid));
@@ -1432,16 +1441,19 @@ async fn a_holder_closes_her_contract_on_her_notes_and_its_fold_pays_them_to_her
     // fee: her notes' value beyond her cap is not paid.
     let fold = rt.get_tx(&txid)?;
     ensure!(fold.output.len() == 2, "{fold:?}");
-    ensure!(fold.output[0].value.to_sat() == 5_000 + 20_000, "{fold:?}");
-    ensure!(scan(wallet, chain).await? == before + 25_000);
+    ensure!(
+        fold.output[0].value.to_sat() == 131_071 + 20_000,
+        "{fold:?}"
+    );
+    ensure!(scan(wallet, chain).await? == before + 151_071);
     let rate = FeeRate::from_sat_per_vb(2).context("a rate")?;
     let done = recovery::advance(wallet, chain, mine, rate).await?;
     ensure!(
         done.len() == 1
             && done[0].stage == Stage::Done
             && done[0].fold == Some(txid)
-            && done[0].received == Some(25_000)
-            && done[0].claimed == 5_000,
+            && done[0].received == Some(151_071)
+            && done[0].claimed == 131_071,
         "{done:?}"
     );
     // Her notes stay out of her balance for good.
@@ -1452,7 +1464,7 @@ async fn a_holder_closes_her_contract_on_her_notes_and_its_fold_pays_them_to_her
     rt.mine(u64::from(n.contract.close_height) - u64::from(rt.height()?) + 1)?;
     let round = n.openings.answer_requests().await?;
     ensure!(round == Default::default(), "{round:?}");
-    ensure!(scan(wallet, chain).await? == before + 25_000);
+    ensure!(scan(wallet, chain).await? == before + 151_071);
     Ok(())
 }
 
@@ -1487,7 +1499,7 @@ async fn a_fold_is_refused_on_a_claim_of_a_note_the_hub_spent() -> Result<()> {
 
     // The copy claims the note paid away too.
     let wallet = Wallet::open(&stale.join("wallet.sqlite"), Http::new(None)?)?;
-    ensure!(available(&wallet)? == 6_144);
+    ensure!(available(&wallet)? == 196_608);
     let closed = holder::close(&wallet, &chain, &stale, &id).await;
     ensure!(
         closed
@@ -1495,7 +1507,7 @@ async fn a_fold_is_refused_on_a_claim_of_a_note_the_hub_spent() -> Result<()> {
             .is_err_and(|e| format!("{e:#}").contains("spent")),
         "{closed:?}"
     );
-    ensure!(available(&wallet)? == 6_144, "notes not given back");
+    ensure!(available(&wallet)? == 196_608, "notes not given back");
     ensure!(recovery::recoveries(&stale)?.is_empty());
     ensure!(holder::list(&stale)?[0].folded.is_none());
     ensure!(holder::list(&stale)?[0].live(rt.height()?));
@@ -1540,7 +1552,7 @@ async fn a_fold_the_hub_never_signs_gives_way_to_her_request_on_the_same_claim()
         rows.len() == 1 && rows[0].stage == Stage::Folding && rows[0].irrevocable,
         "{rows:?}"
     );
-    ensure!((rows[0].claimed, rows[0].notes) == (5_000, 3), "{rows:?}");
+    ensure!((rows[0].claimed, rows[0].notes) == (131_071, 3), "{rows:?}");
     ensure!(available(wallet)? == 0);
 
     // Block by block: waiting for the fold, then her request, the hub's
@@ -1560,11 +1572,11 @@ async fn a_fold_the_hub_never_signs_gives_way_to_her_request_on_the_same_claim()
     }
     ensure!(forced, "never forced closed");
     ensure!(
-        now.stage == Stage::Done && now.claimed == 5_000 && now.fold.is_none(),
+        now.stage == Stage::Done && now.claimed == 131_071 && now.fold.is_none(),
         "{now:?}"
     );
     let swept = rt.get_tx(&now.sweep.context("no sweep")?)?.output[0].value;
-    ensure!(swept.to_sat() > 5_000, "{swept} swept");
+    ensure!(swept.to_sat() > 131_071, "{swept} swept");
     Ok(())
 }
 
@@ -1764,7 +1776,7 @@ async fn hub_answering_through(
 ) -> Result<(String, Source, Arc<Hub>, Arc<Openings>)> {
     std::fs::create_dir_all(dir)?;
     let (seed, db) = (dir.join("seed"), dir.join("hub.sqlite"));
-    Hub::init(&seed, &db, 12)?;
+    Hub::init(&seed, &db, NOTE_POW)?;
     let hub = Arc::new(Hub::open(&seed, &db, Policy::default())?);
     let url = format!(
         "{}/wallet/harness?cookie={}",
@@ -2077,29 +2089,29 @@ async fn a_holder_recovers_her_cap_of_notes_beyond_it_from_a_hub_that_answered()
     let (mine, wallet) =
         holder_wallet(&rt, &chain, dir.path(), &url, [10; 32], &[60_000, 50_000]).await?;
     let chosen = Ask {
-        cap: Some(5_000),
+        cap: Some(131_071),
         ..ask()
     };
     let opened = holder::open(&wallet, &chain, &mine, &url, chosen).await?;
-    ensure!(opened.cap == 5_000, "{opened:?}");
+    ensure!(opened.cap == 131_071, "{opened:?}");
     let rate = FeeRate::from_sat_per_vb(2).context("a rate")?;
-    // Three notes of 2 048 sat, the hub's largest: two recover 4 096 of
-    // her cap, three all of it.
-    for _ in 0..3 {
-        let payment = pay(&hub, &at.join("seed"), &url, &wallet.address(), 2_048)?;
+    // Four notes of 32 768 sat: three recover 98 304 of her cap, four all
+    // of it.
+    for _ in 0..4 {
+        let payment = pay(&hub, &at.join("seed"), &url, &wallet.address(), 32_768)?;
         wallet.receive(&payment)?;
     }
-    ensure!(available(&wallet)? == 6_144);
+    ensure!(available(&wallet)? == 131_072);
     rt.mine(1)?;
     holder::resume(&wallet, &chain, &mine).await?;
-    // What it protects: its cap, of the three.
+    // What it protects: its cap, of the four.
     let each = recoverable(&wallet, &mine, rt.height()?)?;
-    ensure!(each.get(&opened.id) == Some(&5_000), "{each:?}");
+    ensure!(each.get(&opened.id) == Some(&131_071), "{each:?}");
 
     // Forced closed: the notes claimed for her cap, their excess lost.
     let forced = recovery::force_close(&wallet, &chain, &mine, &opened.id, rate).await?;
     ensure!(forced.stage == Stage::Claimed, "{forced:?}");
-    ensure!((forced.claimed, forced.notes) == (5_000, 3), "{forced:?}");
+    ensure!((forced.claimed, forced.notes) == (131_071, 4), "{forced:?}");
     ensure!(available(&wallet)? == 0);
     rt.mine_to_height(forced.next_at.context("no lock")? - 1)?;
     let sent = recovery::advance(&wallet, &chain, &mine, rate).await?;
@@ -2122,17 +2134,20 @@ async fn a_holder_recovers_her_cap_of_notes_beyond_it_from_a_hub_that_answered()
         ensure!(round.answered == 0 && round.failed == 0, "{round:?}");
         now = recovery::advance(&wallet, &chain, &mine, rate).await?[0].clone();
     }
-    ensure!(now.stage == Stage::Done && now.claimed == 5_000, "{now:?}");
+    ensure!(
+        now.stage == Stage::Done && now.claimed == 131_071,
+        "{now:?}"
+    );
     let swept = rt.get_tx(&now.sweep.context("no sweep")?)?.output[0].value;
     let swept = swept.to_sat();
-    ensure!(swept > 5_000, "{swept} swept");
-    eprintln!("swept {swept} sat to her wallet of a claim of 5000");
+    ensure!(swept > 131_071, "{swept} swept");
+    eprintln!("swept {swept} sat to her wallet of a claim of 131071");
     Ok(())
 }
 
 /// A stale claim requested at a hub that answers: she restores a copy of
 /// her wallet made before she paid a note away and forces her contract
-/// closed on it, claiming her cap of 5 000 sat in three notes of 2 048.
+/// closed on it, claiming her cap of 131 071 sat in four notes of 32 768.
 struct Stale {
     rt: Regtest,
     _dir: tempfile::TempDir,
@@ -2168,18 +2183,18 @@ async fn stale_claim_scanned(seed: [u8; 32], scanned: bool) -> Result<Stale> {
     let (mine, wallet) =
         holder_wallet(&rt, &chain, dir.path(), &url, seed, &[60_000, 50_000]).await?;
     let chosen = Ask {
-        cap: Some(5_000),
+        cap: Some(131_071),
         ..ask()
     };
     let opened = holder::open(&wallet, &chain, &mine, &url, chosen).await?;
     let rate = bitcoin::FeeRate::from_sat_per_vb(2).context("a rate")?;
-    for _ in 0..3 {
-        let payment = pay(&hub, &at.join("seed"), &url, &wallet.address(), 2_048)?;
+    for _ in 0..4 {
+        let payment = pay(&hub, &at.join("seed"), &url, &wallet.address(), 32_768)?;
         wallet.receive(&payment)?;
     }
     rt.mine(1)?;
     holder::resume(&wallet, &chain, &mine).await?;
-    ensure!(available(&wallet)? == 6_144);
+    ensure!(available(&wallet)? == 131_072);
 
     // Her wallet as it was, copied; then a note of it paid away.
     drop(wallet);
@@ -2187,9 +2202,9 @@ async fn stale_claim_scanned(seed: [u8; 32], scanned: bool) -> Result<Stale> {
     copy_dir(&mine, &stale)?;
     let wallet = Wallet::open(&mine.join("wallet.sqlite"), Http::new(None)?)?;
     let bob = licash::address::OwnerKeys::from_seed(&[0xbb; 32])?.address();
-    wallet.send(&url, &bob, 2_048).await?;
+    wallet.send(&url, &bob, 32_768).await?;
     let left = available(&wallet)?;
-    ensure!(left < 6_144, "{left} left");
+    ensure!(left < 131_072, "{left} left");
     drop(wallet);
 
     // Restored, the copy claims the note paid away too.
@@ -2199,7 +2214,7 @@ async fn stale_claim_scanned(seed: [u8; 32], scanned: bool) -> Result<Stale> {
         while !watch::step(&hub, &source).await? {}
     }
     let forced = recovery::force_close(&wallet, &chain, &mine, &opened.id, rate).await?;
-    ensure!((forced.claimed, forced.notes) == (5_000, 3), "{forced:?}");
+    ensure!((forced.claimed, forced.notes) == (131_071, 4), "{forced:?}");
     rt.mine_to_height(forced.next_at.context("no lock")? - 1)?;
     recovery::advance(&wallet, &chain, &mine, rate).await?;
     rt.mine(1)?;
@@ -2262,12 +2277,12 @@ async fn a_hub_meets_a_stale_claim_with_the_spend_it_released_and_pays_what_is_l
     ensure!(s.rt.confirmations(&x)?.is_some(), "{done:?}");
     // Its disclose slot spent: the unlock published.
     ensure!(!s.rt.is_unspent(&bitcoin::OutPoint { txid: x, vout: 2 })?);
-    // Her notes less the one paid away: two of 2 048.
+    // Her notes less the one paid away: three of 32 768.
     let corrected = done.corrected.context("no response")?;
-    ensure!(corrected == 4_096, "{done:?}");
+    ensure!(corrected == 98_304, "{done:?}");
     ensure!(done.payout.is_some() && done.timeout.is_none(), "{done:?}");
     let received = done.received.context("nothing received")?;
-    eprintln!("a stale claim of 5000 paid {corrected}, {received} swept to her wallet");
+    eprintln!("a stale claim of 131071 paid {corrected}, {received} swept to her wallet");
     Ok(())
 }
 
@@ -2296,7 +2311,7 @@ async fn a_force_close_claims_an_unsettled_locks_refund_once_expired_at_depth() 
         holder_wallet(&rt, &chain, dir.path(), &url, [17; 32], &[60_000, 50_000]).await?;
     // Long enough for her exit to close it after the lock's refund is owed.
     let chosen = Ask {
-        cap: Some(10_000),
+        cap: Some(131_071),
         blocks: 1_000,
         ..ask()
     };
@@ -2423,7 +2438,7 @@ async fn a_force_close_claims_a_lock_paying_her_once_activated_at_depth() -> Res
     )
     .await?;
     let chosen = Ask {
-        cap: Some(10_000),
+        cap: Some(131_071),
         blocks: 1_000,
         ..ask()
     };
@@ -2549,6 +2564,7 @@ async fn an_activation_whose_block_leaves_the_chain_is_found_again_and_claimed()
         max_blocks: 5_000,
         per_coin: 2,
         ppm_year: 10_000,
+        ppm_year_funded: 0,
     };
     let (url, source, hub, openings) = hub_answering_with(&rt, &at, Some(range)).await?;
     licash_hub_service::open_on_lock_checkpoints(&openings, hub.clone());
@@ -2566,7 +2582,7 @@ async fn an_activation_whose_block_leaves_the_chain_is_found_again_and_claimed()
     )
     .await?;
     let chosen = Ask {
-        cap: Some(10_000),
+        cap: Some(131_071),
         blocks: 1_000,
         ..ask()
     };
@@ -2662,7 +2678,7 @@ async fn an_activation_whose_block_leaves_the_chain_is_found_again_and_claimed()
 async fn a_hub_meets_a_claim_of_no_lock_while_its_ledgers_scan_lags() -> Result<()> {
     let s = stale_claim_scanned([13; 32], true).await?;
     let done = played(&s, |_| true).await?;
-    ensure!(done.corrected == Some(4_096), "{done:?}");
+    ensure!(done.corrected == Some(98_304), "{done:?}");
     let scanned = s.hub.scanned()?.context("no scan")?.0;
     // Before her request, so before her publication.
     let requested = done.requested_at.context("no request")?;
@@ -2682,10 +2698,13 @@ async fn a_hub_that_responds_and_never_asserts_pays_her_whole_claim() -> Result<
     // The hub plays until she sees its response, then no more.
     let done = played(&s, |r| r.response.is_none()).await?;
     ensure!(done.assertion.is_none(), "{done:?}");
-    ensure!(done.corrected == Some(4_096), "{done:?}");
+    ensure!(done.corrected == Some(98_304), "{done:?}");
     ensure!(done.timeout.is_some(), "not her timeout: {done:?}");
     let received = done.received.context("nothing received")?;
-    ensure!(received > 5_000, "{received} of a claim of 5000: {done:?}");
+    ensure!(
+        received > 131_071,
+        "{received} of a claim of 131071: {done:?}"
+    );
     Ok(())
 }
 
@@ -2738,7 +2757,7 @@ async fn a_hub_whose_ledger_gives_no_evidence_alerts_and_pays_her_whole_claim() 
         done.response.is_none() && done.timeout.is_some(),
         "{done:?}"
     );
-    ensure!(done.claimed == 5_000, "{done:?}");
+    ensure!(done.claimed == 131_071, "{done:?}");
     Ok(())
 }
 
@@ -2822,10 +2841,13 @@ async fn a_hub_that_lost_its_pinned_response_signs_no_other() -> Result<()> {
         done.response.is_some() && done.assertion.is_none(),
         "{done:?}"
     );
-    ensure!(done.corrected == Some(4_096), "{done:?}");
+    ensure!(done.corrected == Some(98_304), "{done:?}");
     ensure!(done.timeout.is_some(), "not her timeout: {done:?}");
     let received = done.received.context("nothing received")?;
-    ensure!(received > 5_000, "{received} of a claim of 5000: {done:?}");
+    ensure!(
+        received > 131_071,
+        "{received} of a claim of 131071: {done:?}"
+    );
     Ok(())
 }
 
@@ -2987,7 +3009,7 @@ async fn a_hubs_answer_can_confirm_after_its_response_window() -> Result<()> {
     // Its assertion within the fresh window, then her challenge window.
     let done = played(&s, |_| true).await?;
     ensure!(done.assertion.is_some() && done.proved, "{done:?}");
-    ensure!(done.corrected == Some(4_096), "{done:?}");
+    ensure!(done.corrected == Some(98_304), "{done:?}");
     ensure!(done.payout.is_some() && done.timeout.is_none(), "{done:?}");
     // The hub's response and assertion relayed and confirmed at their
     // presigned fee, with a fee child each.
@@ -3015,7 +3037,10 @@ async fn her_timeout_wins_over_a_late_answer_that_confirms_after_it() -> Result<
     ensure!(done.response.is_none(), "{done:?}");
     ensure!(done.timeout.is_some(), "not her timeout: {done:?}");
     let received = done.received.context("nothing received")?;
-    ensure!(received > 5_000, "{received} of a claim of 5000: {done:?}");
+    ensure!(
+        received > 131_071,
+        "{received} of a claim of 131071: {done:?}"
+    );
     Ok(())
 }
 
@@ -3050,7 +3075,10 @@ async fn a_holder_challenges_a_false_assertion_and_its_failure_pays_her_whole_cl
         "{done:?}"
     );
     let received = done.received.context("nothing received")?;
-    ensure!(received > 5_000, "{received} of a claim of 5000: {done:?}");
+    ensure!(
+        received > 131_071,
+        "{received} of a claim of 131071: {done:?}"
+    );
     // Her challenge and the hub's assertion, each at its presigned fee.
     paid_its_way(&s.rt, &done.assertion.context("no assertion")?)?;
     let challenge = done.challenge.context("no challenge")?;
@@ -3191,35 +3219,39 @@ async fn her_contracts_at_a_hub_each_claim_their_share_of_her_notes() -> Result<
     // The one asserting first served first: by id, of the same deadline.
     both.sort_by_key(|c| (c.assert_height, c.id));
     let [first, later] = both;
-    ensure!(first.cap == 4_096 && later.cap == 4_096);
+    ensure!(first.cap == 131_071 && later.cap == 131_071);
     let rate = FeeRate::from_sat_per_vb(2).context("a rate")?;
-    // 4 096 + 2 048 + 1 024: within their caps together.
-    let payment = pay(&hub, &at.join("seed"), &url, &wallet.address(), 7_168)?;
-    wallet.receive(&payment)?;
+    // 65 536 twice, 32 768 and 16 384: within their caps together, the
+    // first taking the three smaller, which fit its cap, the later the
+    // other 65 536.
+    for sat in [65_536, 65_536, 49_152] {
+        let payment = pay(&hub, &at.join("seed"), &url, &wallet.address(), sat)?;
+        wallet.receive(&payment)?;
+    }
     rt.mine(1)?;
     holder::resume(&wallet, &chain, &mine).await?;
     let tip = rt.height()?;
     let each = recoverable(&wallet, &mine, tip)?;
     let shares = (each.get(&first.id), each.get(&later.id));
-    ensure!(shares == (Some(&4_096), Some(&3_072)), "{each:?}");
+    ensure!(shares == (Some(&114_688), Some(&65_536)), "{each:?}");
 
-    // The later forced closed first: its share only, not the largest
-    // note within its cap, which the first would then miss.
+    // The later forced closed first: its share only, not the smaller
+    // notes within its cap too, which the first would then miss.
     let forced = recovery::force_close(&wallet, &chain, &mine, &later.id, rate).await?;
     ensure!(forced.stage == Stage::Claimed, "{forced:?}");
-    ensure!((forced.claimed, forced.notes) == (3_072, 2), "{forced:?}");
-    ensure!(available(&wallet)? == 4_096);
+    ensure!((forced.claimed, forced.notes) == (65_536, 1), "{forced:?}");
+    ensure!(available(&wallet)? == 114_688);
     let each = recoverable(&wallet, &mine, tip)?;
     let shares = (each.get(&first.id), each.get(&later.id));
-    ensure!(shares == (Some(&4_096), None), "{each:?}");
+    ensure!(shares == (Some(&114_688), None), "{each:?}");
     let forced = recovery::force_close(&wallet, &chain, &mine, &first.id, rate).await?;
-    ensure!((forced.claimed, forced.notes) == (4_096, 1), "{forced:?}");
+    ensure!((forced.claimed, forced.notes) == (114_688, 3), "{forced:?}");
     ensure!(available(&wallet)? == 0);
 
     // Both given up: her notes back.
     recovery::give_up(&wallet, &mine, &later.id)?;
     recovery::give_up(&wallet, &mine, &first.id)?;
-    ensure!(available(&wallet)? == 7_168);
+    ensure!(available(&wallet)? == 180_224);
     Ok(())
 }
 
@@ -3406,7 +3438,7 @@ async fn a_providers_keeper_opens_the_first_contract_at_a_hub_where_told_to() ->
     let provider = Arc::new(Provider::create(&swaps, wallet, SwapsConfig::default())?);
     let settings = Settings {
         max_price: Some(30_000),
-        open_cap: Some(4_096),
+        open_cap: Some(131_071),
         scan: true,
         ..Settings::new(regtest, 0, 0, "open-contract {hub}".into())
     };
@@ -3428,7 +3460,7 @@ async fn a_providers_keeper_opens_the_first_contract_at_a_hub_where_told_to() ->
     );
     let opened = holder::list(&mine)?;
     ensure!(opened.len() == 1 && opened[0].hub == url, "{opened:?}");
-    ensure!(opened[0].cap == 4_096 && opened[0].price <= 30_000);
+    ensure!(opened[0].cap == 131_071 && opened[0].price <= 30_000);
 
     // Once: being opened, then live, its cap taken in.
     let plan = keeper.round().await?;
@@ -3438,7 +3470,7 @@ async fn a_providers_keeper_opens_the_first_contract_at_a_hub_where_told_to() ->
     keeper.round().await?;
     ensure!(holder::list(&mine)?.len() == 1);
     ensure!(
-        provider.intake() == limited(4_096),
+        provider.intake() == limited(131_071),
         "{:?}",
         provider.intake()
     );
@@ -3683,7 +3715,7 @@ async fn a_providers_keeper_holds_its_intake_to_its_contracts_and_replaces_them(
     keeper.round().await?;
     keeper.round().await?;
     ensure!(
-        provider.intake() == limited(4_096),
+        provider.intake() == limited(131_071),
         "{:?}",
         provider.intake()
     );
@@ -3695,7 +3727,7 @@ async fn a_providers_keeper_holds_its_intake_to_its_contracts_and_replaces_them(
     rt.mine_to_height(renew_at - 1)?;
     let plan = keeper.round().await?;
     ensure!(plan.successors.is_empty(), "{plan:?}");
-    ensure!(provider.intake() == limited(4_096));
+    ensure!(provider.intake() == limited(131_071));
 
     // Due to be replaced: a successor of its cap opened, counted in its
     // stead while it opens.
@@ -3711,12 +3743,12 @@ async fn a_providers_keeper_holds_its_intake_to_its_contracts_and_replaces_them(
         .find(|c| c.id != first.id)
         .context("no successor")?;
     ensure!(
-        second.since >= renew_at && second.cap == 4_096 && second.price <= 30_000,
+        second.since >= renew_at && second.cap == 131_071 && second.price <= 30_000,
         "{second:?}"
     );
     let plan = keeper.round().await?;
     ensure!(plan.successors.is_empty(), "{plan:?}");
-    ensure!(provider.intake() == limited(4_096));
+    ensure!(provider.intake() == limited(131_071));
     // Live: it counts, and nothing more is opened.
     rt.mine(1)?;
     keeper.round().await?;
@@ -3725,7 +3757,7 @@ async fn a_providers_keeper_holds_its_intake_to_its_contracts_and_replaces_them(
         plan.successors.is_empty() && plan.force_close.is_empty(),
         "{plan:?}"
     );
-    ensure!(provider.intake() == limited(4_096));
+    ensure!(provider.intake() == limited(131_071));
     ensure!(holder::list(&mine)?.len() == 2);
 
     // At its safe deadline, its successor recovers every note there: not
@@ -3752,12 +3784,15 @@ async fn a_providers_keeper_holds_its_intake_to_its_contracts_and_replaces_them(
         &at.join("seed"),
         &url,
         &provider.wallet().address(),
-        2_000,
+        130_000,
     )?;
     provider.wallet().receive(&payment)?;
     let plan = keeper.round().await?;
     ensure!(plan.force_close == [first.id], "{plan:?}");
-    ensure!(plan.drains == [(url.clone(), 5_000 - 4_096)], "{plan:?}");
+    ensure!(
+        plan.drains == [(url.clone(), 133_000 - 131_071)],
+        "{plan:?}"
+    );
     let recoveries = recovery::recoveries(&mine)?;
     ensure!(
         recoveries.len() == 1 && recoveries[0].id == first.id,
