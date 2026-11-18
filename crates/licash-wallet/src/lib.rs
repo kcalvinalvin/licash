@@ -1349,28 +1349,47 @@ impl<T: Transport> Wallet<T> {
         }
         let keysets = self.keysets(hub)?;
         let lookup = |id: &[u8; 32]| keysets.iter().find(|k| k.id() == id);
-        let release: Release = match release {
+        let offer: Offer = serde_json::from_str(&offer).map_err(invalid)?;
+        let mut release: Release = match release {
             Some(release) => serde_json::from_str(&release).map_err(invalid)?,
-            None => {
-                let offer: Offer = serde_json::from_str(&offer).map_err(invalid)?;
-                self.sign(&url, id, &offer, lookup).await?
-            }
+            None => self.sign(&url, id, &offer, lookup).await?,
         };
-        let (signed, notes) = release.decode(lookup).map_err(invalid)?;
-        let keyset = lookup(signed.proposal().keyset_id())
-            .ok_or_else(|| Error::Invalid("a send under a keyset its hub no longer has".into()))?;
-        let Authorization::Granted(grant) = signed.authorization() else {
-            return Err(Error::Invalid("a send without a grant".into()));
-        };
-        // Whether its hub keeps it for its payee, if asked here.
-        let (unlock, kept) = match unlock {
-            Some(unlock) => (unlock, None),
-            None => {
-                let (unlock, kept) = self
-                    .release(&url, id, &release, keep, keyset, grant)
-                    .await?;
-                (unlock, Some(kept))
-            }
+        let mut offered_again = false;
+        let (signed, notes, keyset, unlock, kept) = loop {
+            let (signed, notes) = release.decode(lookup).map_err(invalid)?;
+            let keyset = lookup(signed.proposal().keyset_id()).ok_or_else(|| {
+                Error::Invalid("a send under a keyset its hub no longer has".into())
+            })?;
+            let Authorization::Granted(grant) = signed.authorization() else {
+                return Err(Error::Invalid("a send without a grant".into()));
+            };
+            // Whether its hub keeps it for its payee, if asked here.
+            let (unlock, kept) = match unlock {
+                Some(unlock) => (unlock, None),
+                None => match self
+                    .release(&url, id, &release, keep.clone(), keyset, grant)
+                    .await
+                {
+                    Ok((unlock, kept)) => (unlock, Some(kept)),
+                    // Its hub forgot the offer, left unreleased long: offered
+                    // and signed again, once.
+                    Err(Error::Refused { problem, .. })
+                        if problem.code == Code::UnknownOffer && !offered_again =>
+                    {
+                        offered_again = true;
+                        release = self.offer_again(&url, id, &offer, &release, lookup).await?;
+                        continue;
+                    }
+                    Err(Error::Refused { problem, .. }) if problem.code == Code::UnknownOffer => {
+                        return Err(Error::Pending {
+                            id: hex::encode(id.as_bytes()),
+                            reason: format!("hub {url} refused its release: {problem}"),
+                        });
+                    }
+                    Err(e) => return Err(e),
+                },
+            };
+            break (signed, notes, keyset, unlock, kept);
         };
         let change = self
             .owner
@@ -1404,6 +1423,31 @@ impl<T: Transport> Wallet<T> {
             payment: Payment::new(&url, &signed, &notes, &unlock),
             kept,
         })
+    }
+
+    /// Send `id` offered and signed again, its hub having forgotten the
+    /// offer `release` was signed under: a hub deletes those left
+    /// unreleased long. That signature can never be released now, its
+    /// offer's salt gone, so it is dropped; a refusal of the new offer
+    /// gives the send up as [`Self::sign`]'s would.
+    async fn offer_again<'k>(
+        &self,
+        url: &str,
+        id: &ProposalId,
+        offer: &Offer,
+        release: &Release,
+        keysets: impl Fn(&[u8; 32]) -> Option<&'k Keyset>,
+    ) -> Result<Release, Error> {
+        let signed = serde_json::to_string(release).map_err(invalid)?;
+        self.store.write(|tx| {
+            tx.execute(
+                "UPDATE sends SET release = NULL
+                 WHERE id = ?1 AND release = ?2 AND unlock IS NULL AND abandoned IS NULL",
+                params![id.as_bytes(), signed],
+            )?;
+            Ok(())
+        })?;
+        self.sign(url, id, offer, keysets).await
     }
 
     /// The hub's offer for `offer`, signed and recorded: from then on the
@@ -1461,7 +1505,8 @@ impl<T: Transport> Wallet<T> {
     /// The hub's unlock for the signed `release`, checked to open its
     /// grant, and whether it keeps the payment for its payee, asked to if
     /// `keep`. A hub that spent an input otherwise will never release it:
-    /// the send is given up. Any other refusal leaves it pending.
+    /// the send is given up. One that forgot its offer is refused as such,
+    /// to offer it again. Any other refusal leaves it pending.
     async fn release(
         &self,
         url: &str,
@@ -1483,6 +1528,10 @@ impl<T: Transport> Wallet<T> {
             Ok(released) => released,
             Err(Error::Refused { problem, .. }) if problem.code == Code::Spent => {
                 return Err(self.refused(url, id, problem, Step::Release).await?);
+            }
+            // Its offer forgotten: the caller offers it again.
+            Err(Error::Refused { hub, problem }) if problem.code == Code::UnknownOffer => {
+                return Err(Error::Refused { hub, problem });
             }
             Err(Error::Refused { problem, .. }) => {
                 return Err(Error::Pending {

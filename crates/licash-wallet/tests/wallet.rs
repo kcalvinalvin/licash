@@ -302,11 +302,11 @@ async fn a_signed_send_refused_otherwise_stays_pending_and_finishes() {
     let net = network();
     let (alice, bob) = (party(&net, 1).await, party(&net, 2).await);
     alice.receive(&net.pay(HUB, &alice.address(), 64)).unwrap();
-    net.fail(RELEASE, Fault::Refused(Code::UnknownOffer));
+    net.fail(RELEASE, Fault::Refused(Code::Invalid));
     let Err(Error::Pending { id, reason }) = alice.send(HUB, &bob.address(), 10).await else {
         panic!("not pending");
     };
-    assert!(reason.contains("UnknownOffer"), "{reason}");
+    assert!(reason.contains("Invalid"), "{reason}");
     assert_eq!(alice.sends().unwrap()[0].state, State::Signed);
     assert_eq!(available(&alice), (0, 64));
     assert!(matches!(alice.payment(&id), Err(Error::Pending { .. })));
@@ -314,6 +314,32 @@ async fn a_signed_send_refused_otherwise_stays_pending_and_finishes() {
     assert_eq!(resumed.paid[0].id, id);
     assert_eq!(bob.receive(&resumed.paid[0].payment).unwrap().amount, 10);
     assert!(same(&alice.payment(&id).unwrap(), &resumed.paid[0].payment));
+}
+
+/// A hub that forgot a signed send's offer (it deletes those left
+/// unreleased long) is offered it again and released it under the new
+/// offer, once per attempt: forgotten twice, the send stays pending and
+/// finishes later.
+#[tokio::test]
+async fn a_signed_send_whose_offer_its_hub_forgot_is_offered_again() {
+    let net = network();
+    let (alice, bob) = (party(&net, 1).await, party(&net, 2).await);
+    alice.receive(&net.pay(HUB, &alice.address(), 64)).unwrap();
+    net.fail(RELEASE, Fault::Refused(Code::UnknownOffer));
+    let paid = alice.send(HUB, &bob.address(), 10).await.unwrap();
+    assert_eq!(bob.receive(&paid.payment).unwrap().amount, 10);
+    net.fail(RELEASE, Fault::Refused(Code::UnknownOffer));
+    net.fail(RELEASE, Fault::Refused(Code::UnknownOffer));
+    let Err(Error::Pending { id, reason }) = alice.send(HUB, &bob.address(), 10).await else {
+        panic!("not pending");
+    };
+    assert!(reason.contains("UnknownOffer"), "{reason}");
+    let sends = alice.sends().unwrap();
+    let send = sends.iter().find(|s| s.id == id).unwrap();
+    assert_eq!(send.state, State::Signed);
+    let resumed = alice.resume().await.unwrap();
+    assert_eq!(resumed.paid[0].id, id);
+    assert_eq!(bob.receive(&resumed.paid[0].payment).unwrap().amount, 10);
 }
 
 #[tokio::test]
