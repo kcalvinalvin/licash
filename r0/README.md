@@ -66,8 +66,10 @@ done
 | signet | `hp`, contracts opened before (v3 Bases) | `6bf78e6092f9c0959cee4908b449a032e575d527c5c889d8b9f3813b888f0d0c` | 0f86cc6 |
 
 The program before checks no signature of her request (a v3 Base binds
-no keys) and reads a request's digits above 15 as Bitcoin doesn't: its
-contracts keep that exposure to their end.
+no keys), reads a request's digits above 15 as Bitcoin doesn't, and owes
+a lock's refund claimed before its expiry, which a payer may take and
+then activate the lock as its payee: its contracts keep that exposure
+to their end.
 
 The holder's and counter programs of the design before hub-proves are
 gone with it: no contract opened under them is played.

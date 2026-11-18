@@ -224,9 +224,11 @@ pub const SIGNET: [u8; 32] =
 
 /// The programs signet contracts opened under before [`SIGNET`], newest
 /// first: no contract opens under them, those that did are played still.
-/// `6bf78e60…`'s statement checks no signature of her request (a v3
-/// Base), and reads a request's digits above 15 as Bitcoin doesn't: a
-/// trial's exposure, left to its contracts' end.
+/// `6bf78e60…`'s statement (of v3 Bases) checks no signature of her
+/// request, reads a request's digits above 15 as Bitcoin doesn't, owes a
+/// lock's Pay without an activation once the Hub can't show its expiry,
+/// and its Refund before it expired: a trial's exposure, left to its
+/// contracts' end.
 pub const SIGNET_BEFORE: [[u8; 32]; 1] = [hex!(
     "6bf78e6092f9c0959cee4908b449a032e575d527c5c889d8b9f3813b888f0d0c"
 )];

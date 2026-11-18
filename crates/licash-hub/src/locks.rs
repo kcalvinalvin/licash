@@ -30,8 +30,10 @@ use crate::{forwards, notify, now, retire, sql, Error, Hub, Notice, Refusal};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Timing {
-    /// Response window of the hub's recovery contracts: a refund request
-    /// posted when a lock is admitted is answered within it.
+    /// The blocks a lock lives at most from its admission: its expiry,
+    /// depth and the hub's reaction fit within them. A refund is owed on
+    /// Bitcoin only once its lock expired at depth (under a v4 Base), so
+    /// this bounds how long the hub holds a lock open, not a response.
     pub window: u32,
     /// Blocks the hub needs to produce and confirm a response.
     pub reaction: u32,
@@ -710,9 +712,6 @@ impl Hub {
         if !self.is_synced() {
             return Err(Refusal::Unsynced.into());
         }
-        // A refund request commits its claim when it is posted: once the
-        // hub answers requests on its contracts, the oldest unanswered one
-        // bounds this height too.
         let (now, _) = tip(tx)?.ok_or(Refusal::NoChain)?;
         let hop = Hop {
             window: t.window,

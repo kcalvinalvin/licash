@@ -406,7 +406,7 @@ struct PolicyArgs {
     #[arg(long, env = "LICASH_HUB_OUTPUT_FEE_MSAT", default_value_t = OUTPUT_FEE_MSAT)]
     output_fee_msat: u64,
     /// A lock's expiry, depth and reaction fit within this many blocks of
-    /// the scanned tip: the response window of the hub's contracts.
+    /// the scanned tip: how long a lock lives at most.
     #[arg(long, env = "LICASH_HUB_LOCK_WINDOW", default_value_t = Timing::default().window)]
     lock_window: u32,
     /// Blocks the hub needs to produce and confirm a response.
