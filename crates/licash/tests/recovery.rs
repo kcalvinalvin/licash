@@ -731,6 +731,108 @@ fn v4_owes_a_locks_pay_only_on_an_activation_anchored_to_its_checkpoint() {
     assert_eq!((c.owed, c.ineligible), (4, None));
 }
 
+/// Under v4 a lock's Refund is owed only once the chain judged reaches its
+/// expiry at depth: before, she could take it and her payee activate the
+/// lock later, both owed. Then, as ever, its preimage voids it.
+#[test]
+fn v4_owes_a_locks_refund_only_once_it_expired_at_depth() {
+    let issuer = IssuerKeys::random(3).unwrap();
+    let version = base::Version::V4 {
+        holder_wots: [5; 32],
+    };
+    let o = Opened {
+        base: base_of(issuer.keyset().unwrap(), version),
+        issuer,
+    };
+    let keyset = o.base.parts().keyset.clone();
+    let hold = hold();
+    // Seven blocks: the lock expires at 4, 3 deep at 7.
+    let (chain, _) = activated_chain_at(1);
+    assert_eq!(chain.tip_height(), 7);
+    let to = |top: u32| {
+        Chain::verify(
+            chain.checkpoint().clone(),
+            &chain.checkpoint().commitment(),
+            (1..=top).map(|h| *chain.header(h).unwrap()).collect(),
+            100,
+        )
+        .unwrap()
+    };
+    // The holder locked one of her own notes to Carol and claims its refund.
+    let own = derive(SPEND, &hold, 4, 23, 40);
+    let own_note = mint(&o.issuer, &keyset, &own);
+    let refund = derive(SPEND, &hold, 4, 67, 0);
+    let carol = derive(53, &HoldRoot::from_seed(&[11; 32]).unwrap(), 4, 31, 0);
+    let lock = TimedLock::new(terms(), vec![Output::from_derivation(&refund).unwrap()]).unwrap();
+    let body = Proposal::new(
+        &keyset,
+        std::slice::from_ref(&own_note),
+        point(47),
+        vec![Output::from_derivation(&carol).unwrap()],
+        Some(lock),
+    )
+    .unwrap();
+    let own_signed = SignedProposal::sign(
+        &keyset,
+        body,
+        std::slice::from_ref(&own_note),
+        Authorization::Plain,
+        &[owner(SPEND, 23, 40)],
+    )
+    .unwrap();
+    let own_id = own_signed.proposal().id();
+    let settled = derive(SPEND, &hold, 4, 23, 0);
+    let settled_note = mint(&o.issuer, &keyset, &settled);
+    let items = vec![
+        Item::Settled(settled.message().clone()),
+        Item::Pending {
+            message: refund.message().clone(),
+            source: own_id,
+            branch: Branch::Refund,
+            index: 0,
+            blinding: *refund.blinding(),
+            preimage: None,
+        },
+    ];
+    let sources = vec![Source::OwnInputs {
+        id: own_id,
+        inputs: vec![own_note.message().identifier().unwrap()],
+        terms: terms(),
+    }];
+    let signers = [settled.clone(), refund.clone(), own];
+    let unsigned = claim(&o, items, sources, vec![], &signers, 8);
+    let p = Publication::sign(unsigned, &hold_keys(&signers), LIMIT).unwrap();
+    let request = Request {
+        amount: 8,
+        claim_digest: *p.claim().digest(),
+    };
+    let witness = Witness {
+        notes: vec![settled_note],
+        sources: vec![SourceWitness::Signed {
+            signed: own_signed,
+            notes: vec![own_note],
+        }],
+        activations: vec![],
+    };
+    let owed = |top: u32, evidence: &[Evidence]| {
+        decide(&o, &request, &p, &witness, evidence, Some(&to(top))).unwrap()
+    };
+    // Expired at depth: owed in full.
+    assert_eq!((owed(7, &[]).owed, owed(7, &[]).ineligible), (8, None));
+    // Short of it, expired or not: the refund is owed nothing, the rest is.
+    for top in [3, 4, 6] {
+        let c = owed(top, &[]);
+        assert_eq!((c.owed, c.ineligible), (4, None), "at {top}");
+    }
+    // Its preimage voids it, as under v3.
+    let preimage = Evidence::PayPreimage {
+        source: own_id,
+        preimage: Z,
+    };
+    let c = owed(7, &[preimage]);
+    assert_eq!((c.mask, c.owed), (0b10, 4));
+}
+
 /// The paper's example at half scale. Alice pays Bob 50 from a 128 note with
 /// 78 change, under a grant. The Hub records the spend and withholds the
 /// unlock. Alice claims her input with the change as fallbacks.

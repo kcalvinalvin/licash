@@ -704,12 +704,15 @@ fn void(
 /// a timed lock's Pay item counts only if the claim advertises an
 /// activation of the lock (which [`eligible`] verified on Bitcoin): the
 /// statement can't see an expiry, so a Pay without one may have been
-/// refunded.
+/// refunded. And its Refund item counts only once the chain judged, to
+/// `judged`, reaches its expiry at depth: any activation is buried by
+/// then, so the Hub holds its preimage, and can't be owed the Pay later.
 fn live(
     version: Version,
     claim: &UnsignedClaim,
     mask: u32,
     executed: &BTreeSet<ProposalId>,
+    judged: u32,
 ) -> u32 {
     let sources: BTreeMap<_, _> = claim.parts().sources.iter().map(|s| (s.id(), s)).collect();
     let activated: BTreeSet<_> = claim.parts().activations.iter().map(|a| a.source).collect();
@@ -722,9 +725,13 @@ fn live(
             Item::Settled(_) => true,
             Item::Pending { source, branch, .. } => match sources[source].terms() {
                 None => executed.contains(source),
-                Some(_) => match (version, branch) {
+                Some(terms) => match (version, branch) {
                     (Version::V4 { .. }, Branch::Pay) => activated.contains(source),
-                    _ => true,
+                    (Version::V4 { .. }, Branch::Refund) => terms
+                        .expiry()
+                        .checked_add(terms.depth())
+                        .is_some_and(|settled| judged >= settled),
+                    (Version::V3, _) => true,
                 },
             },
         };
@@ -1074,7 +1081,8 @@ pub struct Owed {
 /// checkpoint, which must be a block of `chain`). Otherwise the claim is
 /// owed what the Hub's evidence leaves live, capped at its amount: with no
 /// evidence, its amount, less under v4 any lock's Pay it advertises no
-/// activation of.
+/// activation of and any lock's Refund `chain` doesn't reach the expiry of
+/// at depth.
 ///
 /// An error is the Hub's, and it can't prove with these inputs: evidence
 /// that doesn't verify or voids nothing, evidence against an ineligible
@@ -1113,7 +1121,7 @@ pub fn owed(
     let claim = filing.publication.claim();
     let (mask, executed) = void(base.version(), &parts.keyset, claim, evidence, Some(chain))?;
     Ok(Owed {
-        owed: live(base.version(), claim, mask, &executed),
+        owed: live(base.version(), claim, mask, &executed, chain.tip_height()),
         mask,
         disclosures: disclosures(evidence)?,
         ineligible: None,
