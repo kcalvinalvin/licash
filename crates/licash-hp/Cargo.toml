@@ -14,6 +14,8 @@ description = "The Hub's statement for a Licash recovery on Lichen's hub-proves 
 workspace = "../../regtest"
 
 [dependencies]
+# HASH160, her request's one-time signatures' chains (licash's own version)
+bitcoin = { version = "=0.32.102", default-features = false, features = ["std"] }
 licash = { path = "../licash" }
 lichen-statement = { git = "https://github.com/lichenbtc-org/lichen", branch = "feat/hub-proves-exit" }
 sha2 = "0.10"

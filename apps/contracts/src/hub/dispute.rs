@@ -867,6 +867,7 @@ impl Openings {
             base: o.base.clone(),
             exit,
             evidence,
+            keys: Some(o.holder.request_keys()?),
         };
         match licash_hp::check(&input) {
             Ok(j) if j == graph::journal(&o.base) => Ok(Ok(input)),

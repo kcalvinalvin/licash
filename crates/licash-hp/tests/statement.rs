@@ -2,6 +2,7 @@
 //! genesis (Base's checkpoint) carrying her request, her publication of a
 //! filing, the Hub's response and its disclosure.
 
+use bitcoin::hashes::{hash160, Hash as _};
 use k256::Scalar;
 use licash::{
     authorization::{Authorization, PreparedGrant, SignedProposal},
@@ -14,9 +15,10 @@ use licash::{
     recovery::{disclosures, Evidence, Filing, Publication, SourceWitness, Witness},
     spend::{ChainProfile, Output, Proposal},
 };
-use licash_hp::{check, contract, decide, HubInput, Refusal, C};
+use licash_hp::{check, contract, decide, HubInput, Refusal, RequestKeys, C};
 use lichen_statement::{
     btc::{bare_tx, sha256d, Header, OutPoint},
+    checksum_digits,
     testing::{headers_on, published, request_on, request_witness, respond_block},
     Exit, Hash, SLOT_VOUT,
 };
@@ -42,10 +44,13 @@ fn party(value: u64) -> Party {
     }
 }
 fn base(keyset: Keyset, nonce: u8) -> Base {
+    base_of(keyset, nonce, Version::V3)
+}
+fn base_of(keyset: Keyset, nonce: u8, version: Version) -> Base {
     let mut deposit = [31; 36];
     deposit[32..].copy_from_slice(&7u32.to_le_bytes());
     Base::new(Parts {
-        version: Version::V3,
+        version,
         nonce: [nonce; 32],
         claim_key: point(19).x_only(),
         keyset,
@@ -182,9 +187,12 @@ fn file(
 /// 32 notes of 4, of which the holder paid 16 to Bob after her backup;
 /// she claims all 32, b = 128. The Hub's evidence: the spend.
 fn stale() -> (Filed, Evidence) {
+    stale_under(Version::V3)
+}
+fn stale_under(version: Version) -> (Filed, Evidence) {
     let issuer = IssuerKeys::random(3).unwrap();
     let keyset = issuer.keyset().unwrap();
-    let base = base(keyset.clone(), 53);
+    let base = base_of(keyset.clone(), 53, version);
     let ds: Vec<_> = (0..32).map(|i| derive(SPEND, &hold(), 4, 23, i)).collect();
     let notes: Vec<_> = ds.iter().map(|d| mint(&issuer, &keyset, d)).collect();
     let owners: Vec<_> = (0..16).map(|i| owner(SPEND, 23, i)).collect();
@@ -234,8 +242,13 @@ fn sorted(ds: &[Derivation]) -> Vec<licash::note::Message> {
 /// her publication carrying `claim` (block 2), six blocks, the Hub's
 /// response of `b2` (block 9), six blocks.
 fn exit(base: &Base, b: u32, e: &Hash, claim: &[u8], b2: u32) -> Exit {
+    signed_exit(base, &request_witness(e, b), claim, b2)
+}
+
+/// [`exit`] with her request's witness `witness`.
+fn signed_exit(base: &Base, witness: &[Vec<u8>], claim: &[u8], b2: u32) -> Exit {
     let c = contract(base);
-    let (rh, request) = request_on(&c.checkpoint.hash, &c.deposit, &request_witness(e, b));
+    let (rh, request) = request_on(&c.checkpoint.hash, &c.deposit, witness);
     let slot = OutPoint {
         txid: request.txid().unwrap(),
         vout: SLOT_VOUT,
@@ -273,7 +286,44 @@ fn input(base: &Base, exit: Exit, evidence: Vec<Evidence>) -> HubInput {
         base: base.clone(),
         exit,
         evidence,
+        keys: None,
     }
+}
+
+/// A one-time key of `bytes` bytes from `seed`: its chain ends, and its
+/// signature on `msg` as the witness carries it (bottom first: each
+/// digit's hash, then the digit), as `lichen_wots` signs.
+fn wots(seed: u8, msg: &[u8]) -> (Vec<[u8; 20]>, Vec<Vec<u8>>) {
+    let chain = |h: [u8; 20], n: u8| (0..n).fold(h, |h, _| hash160::Hash::hash(&h).to_byte_array());
+    let mut digits: Vec<u8> = msg.iter().flat_map(|b| [b >> 4, b & 0xf]).collect();
+    let mut sum: u32 = digits.iter().map(|d| 15 - u32::from(*d)).sum();
+    let at = digits.len();
+    digits.resize(at + checksum_digits(msg.len()), 0);
+    for d in digits[at..].iter_mut().rev() {
+        *d = (sum % 16) as u8;
+        sum /= 16;
+    }
+    let secret = |i: usize| hash160::Hash::hash(&[seed, i as u8]).to_byte_array();
+    let ends = (0..digits.len()).map(|i| chain(secret(i), 15)).collect();
+    let items = digits
+        .iter()
+        .enumerate()
+        .flat_map(|(i, d)| {
+            let digit = if *d == 0 { vec![] } else { vec![*d] };
+            [chain(secret(i), *d).to_vec(), digit]
+        })
+        .collect();
+    (ends, items)
+}
+
+/// Her keys from `seed`, and her request's witness signing `b` and `e`
+/// under them.
+fn signed_request(seed: u8, e: &Hash, b: u32) -> (RequestKeys, Vec<Vec<u8>>) {
+    let (e_ends, mut witness) = wots(seed, e);
+    let (b_ends, b_items) = wots(seed.wrapping_add(1), &b.to_be_bytes());
+    witness.extend(b_items);
+    witness.extend([vec![1; 64], vec![2; 64], vec![0x51], vec![0xc0; 33]]);
+    (RequestKeys::new(b_ends, e_ends).unwrap(), witness)
 }
 
 /// The inputs r0/host measures the guest on (`licash-r0 hp-exec`),
@@ -320,7 +370,7 @@ fn the_hub_proves_what_its_evidence_leaves_owed() {
     let journal = contract(&f.base).journal();
     // The spend leaves half owed: the Hub responds 64 and proves it.
     let x = exit(&f.base, f.b, &f.e, &f.bytes, 64);
-    let (owed, read) = decide(&f.base, &x, std::slice::from_ref(&spent)).unwrap();
+    let (owed, read) = decide(&f.base, None, &x, std::slice::from_ref(&spent)).unwrap();
     assert_eq!(
         (owed.owed, owed.mask, read.b, read.b2),
         (64, 0xffff, 128, 64)
@@ -353,6 +403,98 @@ fn the_hub_proves_what_its_evidence_leaves_owed() {
         check(&input(&other, x, vec![spent])),
         Err(Refusal::Evidence(_))
     ));
+}
+
+/// Under a v4 Base the statement holds only of a request signed under the
+/// keys Base binds: the Hub can't prove of an exit she didn't start, on a
+/// chain of its own, however long before.
+#[test]
+fn under_v4_her_request_must_be_signed_under_the_keys_base_binds() {
+    let (keys, _) = signed_request(3, &[0; 32], 0);
+    let (f, spent) = stale_under(Version::V4 {
+        holder_wots: keys.digest(),
+    });
+    let journal = contract(&f.base).journal();
+    let (_, witness) = signed_request(3, &f.e, f.b);
+    let x = signed_exit(&f.base, &witness, &f.bytes, 64);
+    let signed = HubInput {
+        keys: Some(keys.clone()),
+        ..input(&f.base, x.clone(), vec![spent.clone()])
+    };
+    assert_eq!(check(&signed).unwrap(), journal);
+    // Its keys travel with the input, after the evidence.
+    let bytes = signed.to_bytes();
+    let decoded = HubInput::from_bytes(&bytes).unwrap();
+    assert_eq!(decoded.keys.as_ref(), Some(&keys));
+    assert_eq!(check(&decoded).unwrap(), journal);
+    for n in [bytes.len() - 1, bytes.len() - 20 * 77] {
+        assert_eq!(
+            HubInput::from_bytes(&bytes[..n]).err(),
+            Some(Refusal::Input)
+        );
+    }
+    // A 15 written as 16, which Bitcoin accepts, signs as 15.
+    let mut loose = witness.clone();
+    for item in loose.iter_mut().filter(|i| i.as_slice() == [15]) {
+        *item = vec![16];
+    }
+    assert_ne!(loose, witness);
+    let x = signed_exit(&f.base, &loose, &f.bytes, 64);
+    assert_eq!(
+        check(&HubInput {
+            keys: Some(keys.clone()),
+            ..input(&f.base, x, vec![spent.clone()])
+        })
+        .unwrap(),
+        journal
+    );
+    // Her (b, E) signed under other keys, or a request no key signed, or
+    // the input's keys not those Base binds, or none: no proof.
+    let (other, forged) = signed_request(5, &f.e, f.b);
+    for (keys, witness) in [
+        (Some(&keys), forged.clone()),
+        (Some(&keys), request_witness(&f.e, f.b)),
+        (Some(&other), forged),
+        (None, witness.clone()),
+    ] {
+        let x = signed_exit(&f.base, &witness, &f.bytes, 64);
+        assert_eq!(
+            check(&HubInput {
+                keys: keys.cloned(),
+                ..input(&f.base, x, vec![spent.clone()])
+            }),
+            Err(Refusal::Unsigned)
+        );
+    }
+    // A digit changed, its hash not: the chain doesn't reach the key.
+    let mut changed = witness;
+    let at = changed.iter().position(|i| i.as_slice() == [15]).unwrap();
+    changed[at] = vec![14];
+    let x = signed_exit(&f.base, &changed, &f.bytes, 64);
+    assert!(check(&HubInput {
+        keys: Some(keys),
+        ..input(&f.base, x, vec![spent])
+    })
+    .is_err());
+}
+
+/// Under v3 the input is what v3's program reads: no keys, whatever the
+/// Hub holds.
+#[test]
+fn under_v3_the_input_carries_no_keys() {
+    let (f, spent) = stale();
+    let (keys, _) = signed_request(3, &f.e, f.b);
+    let x = exit(&f.base, f.b, &f.e, &f.bytes, 64);
+    let plain = input(&f.base, x, vec![spent]);
+    let with = HubInput {
+        keys: Some(keys),
+        ..plain.clone()
+    };
+    assert_eq!(with.to_bytes(), plain.to_bytes());
+    assert!(HubInput::from_bytes(&plain.to_bytes())
+        .unwrap()
+        .keys
+        .is_none());
 }
 
 #[test]

@@ -18,23 +18,31 @@
 //! every claim's context binds, so a proof for one contract is useless for
 //! any other.
 //!
+//! Under a v4 Base the statement also checks her request's one-time
+//! signatures on `b` and `E` against the keys Base binds
+//! ([`RequestKeys`]): only she can sign a request, so no proof can be made
+//! of an exit she didn't start, on any chain, however long before.
+//!
 //! The holder garbles for this journal at opening (BABE with the roles
 //! swapped); the Hub evaluates [`check`] natively to decide its response
 //! (the same chain, the same evidence), and proves it in `r0/hp-guest`
 //! only when it contests the claim, for the assertion that follows its
 //! response.
 
+use bitcoin::hashes::{hash160, Hash};
 use licash::{
-    base::Base,
+    base::{Base, Version},
     chain::Chain,
+    crypto::tagged_hash,
     disclosure::Disclosures,
     recovery::{self, Evidence, Owed},
     request::Request,
 };
 use lichen_statement::{
     btc::{self, Header, OutPoint},
+    checksum_digits,
     codec::{R, W},
-    Checkpoint, Contract, Exit, Read, Reject, JOURNAL_LEN,
+    script_digit, Checkpoint, Contract, Exit, Read, Reject, JOURNAL_LEN,
 };
 use sha2::{Digest, Sha256};
 
@@ -54,6 +62,9 @@ pub enum Refusal {
     Chain(String),
     /// The Hub's evidence doesn't prove what it says (licash's reason).
     Evidence(String),
+    /// Her request isn't signed under the one-time keys a v4 Base binds,
+    /// or the input's keys aren't those.
+    Unsigned,
     /// The response didn't disclose what the evidence needs.
     Undisclosed,
     /// The claim is owed more than `b′`.
@@ -67,6 +78,7 @@ impl std::fmt::Display for Refusal {
             Refusal::Exit(r) => write!(f, "the exit doesn't read: {r:?}"),
             Refusal::Chain(e) => write!(f, "the chain doesn't verify: {e}"),
             Refusal::Evidence(e) => write!(f, "the evidence doesn't prove: {e}"),
+            Refusal::Unsigned => f.write_str("her request isn't signed under the keys Base binds"),
             Refusal::Undisclosed => f.write_str("the response didn't disclose what is needed"),
             Refusal::Owed => f.write_str("the claim is owed more than the response says"),
         }
@@ -117,21 +129,104 @@ pub fn through_publication<'a>(contract: &Contract, exit: &'a Exit, read: &Read)
     &exit.headers[..at as usize]
 }
 
-/// The statement's input: Base, the exit as the Hub shows it, and its
-/// evidence against the claim.
+/// Her request's one-time public keys, each digit's chain end (HASH160
+/// chains, as `lichen_wots`'s `WotsPublic`): `b`'s 8 message digits and 2
+/// checksum digits, `E`'s 64 and 3. A v4 Base binds their digest.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RequestKeys {
+    b: Vec<[u8; 20]>,
+    e: Vec<[u8; 20]>,
+}
+
+/// The digits of a signature on `bytes` bytes: its message's and checksum's.
+fn digits(bytes: usize) -> usize {
+    2 * bytes + checksum_digits(bytes)
+}
+
+impl RequestKeys {
+    pub fn new(b: Vec<[u8; 20]>, e: Vec<[u8; 20]>) -> Option<Self> {
+        (b.len() == digits(4) && e.len() == digits(32)).then_some(Self { b, e })
+    }
+
+    /// What a v4 Base binds of them (`Version::V4`'s `holder_wots`).
+    pub fn digest(&self) -> [u8; 32] {
+        tagged_hash(
+            "licash/hp/request-keys",
+            &[&self.b.concat(), &self.e.concat()],
+        )
+    }
+
+    fn write(&self, w: &mut W) {
+        for key in self.b.iter().chain(&self.e) {
+            w.put(key);
+        }
+    }
+
+    fn read(r: &mut R) -> Option<Self> {
+        let mut key = || r.take::<20>().ok();
+        let b = (0..digits(4)).map(|_| key()).collect::<Option<_>>()?;
+        let e = (0..digits(32)).map(|_| key()).collect::<Option<_>>()?;
+        Self::new(b, e)
+    }
+
+    /// Whether her request's witness (bottom first: her signature on `E`,
+    /// then on `b`, then the 2-of-2's) is signed under these keys, as the
+    /// request's script checks it: each digit read as the script reads it
+    /// ([`script_digit`]), its item hashed up its chain to the key's end,
+    /// and the checksum digits those of the message's.
+    pub fn signed(&self, witness: &[&[u8]]) -> bool {
+        let e_items = 2 * self.e.len();
+        witness.len() >= e_items + 2 * self.b.len()
+            && signs(&witness[..e_items], &self.e, 32)
+            && signs(&witness[e_items..], &self.b, 4)
+    }
+}
+
+/// Whether `items` (bottom first: `hash_0, digit_0, hash_1, …`) are a
+/// Winternitz signature on `bytes` bytes under the chain ends `keys`.
+fn signs(items: &[&[u8]], keys: &[[u8; 20]], bytes: usize) -> bool {
+    let mut read = Vec::with_capacity(keys.len());
+    for (i, end) in keys.iter().enumerate() {
+        let (Some(item), Some(digit)) = (items.get(2 * i), items.get(2 * i + 1)) else {
+            return false;
+        };
+        let Some(digit) = script_digit(digit) else {
+            return false;
+        };
+        let mut h = item.to_vec();
+        for _ in digit..15 {
+            h = hash160::Hash::hash(&h).to_byte_array().to_vec();
+        }
+        if h != end {
+            return false;
+        }
+        read.push(u32::from(digit));
+    }
+    let (message, checksum) = read.split_at(2 * bytes);
+    let sum: u32 = message.iter().map(|d| 15 - d).sum();
+    checksum.iter().fold(0, |value, d| value * 16 + d) == sum
+}
+
+/// The statement's input: Base, the exit as the Hub shows it, its
+/// evidence against the claim and, under a v4 Base, her request's keys.
 #[derive(Clone)]
 pub struct HubInput {
     pub base: Base,
     pub exit: Exit,
     pub evidence: Vec<Evidence>,
+    pub keys: Option<RequestKeys>,
 }
 
 impl HubInput {
+    /// Under v3, the bytes v3's program reads: the keys aren't written.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut w = W(Vec::new());
         w.bytes(&self.base.to_bytes());
         self.exit.write(&mut w);
         w.bytes(&recovery::evidence_to_bytes(&self.evidence));
+        if let (Version::V4 { .. }, Some(keys)) = (self.base.version(), &self.keys) {
+            keys.write(&mut w);
+        }
         w.0
     }
 
@@ -149,20 +244,43 @@ impl HubInput {
             &r.bytes().map_err(|_| Refusal::Input)?,
         )
         .map_err(|_| Refusal::Input)?;
+        let keys = match base.version() {
+            Version::V3 => None,
+            Version::V4 { .. } => Some(RequestKeys::read(&mut r).ok_or(Refusal::Input)?),
+        };
         r.end().map_err(|_| Refusal::Input)?;
         Ok(Self {
             base,
             exit,
             evidence,
+            keys,
         })
     }
 }
 
 /// What the statement decides of `exit` under `base` against `evidence`:
-/// what the claim is owed, and what Bitcoin shows of the exit.
-pub fn decide(base: &Base, exit: &Exit, evidence: &[Evidence]) -> Result<(Owed, Read), Refusal> {
+/// what the claim is owed, and what Bitcoin shows of the exit. Under a v4
+/// Base, her request must be signed under `keys`, the keys Base binds.
+pub fn decide(
+    base: &Base,
+    keys: Option<&RequestKeys>,
+    exit: &Exit,
+    evidence: &[Evidence],
+) -> Result<(Owed, Read), Refusal> {
     let contract = contract(base);
     let read = lichen_statement::read(&contract, exit).map_err(Refusal::Exit)?;
+    if let Version::V4 { holder_wots } = base.version() {
+        let keys = keys
+            .filter(|k| k.digest() == holder_wots)
+            .ok_or(Refusal::Unsigned)?;
+        let witness = exit
+            .request
+            .spending(&contract.deposit)
+            .ok_or(Refusal::Exit(Reject::Posted))?;
+        if !keys.signed(&witness) {
+            return Err(Refusal::Unsigned);
+        }
+    }
     let chain = chain(base, through_publication(&contract, exit, &read))?;
     let request = Request {
         amount: read.b,
@@ -177,7 +295,12 @@ pub fn decide(base: &Base, exit: &Exit, evidence: &[Evidence]) -> Result<(Owed, 
 /// response's `b′`, and the response disclosed what the evidence needs.
 /// On success, the journal fixed at opening.
 pub fn check(input: &HubInput) -> Result<[u8; JOURNAL_LEN], Refusal> {
-    let (owed, read) = decide(&input.base, &input.exit, &input.evidence)?;
+    let (owed, read) = decide(
+        &input.base,
+        input.keys.as_ref(),
+        &input.exit,
+        &input.evidence,
+    )?;
     if owed.disclosures != Disclosures::empty()
         && read.disclosed.as_deref() != Some(&owed.disclosures.to_bytes()[..])
     {

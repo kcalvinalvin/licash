@@ -3422,6 +3422,7 @@ dependencies = [
 name = "licash-hp"
 version = "0.0.1"
 dependencies = [
+ "bitcoin",
  "licash",
  "lichen-statement",
  "sha2 0.10.9",

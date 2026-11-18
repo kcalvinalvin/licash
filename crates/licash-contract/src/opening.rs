@@ -1828,6 +1828,19 @@ mod tests {
         assert_ne!(rewrite(&[16]), fifteens);
         assert_eq!(ho.requested_b(&rewrite(&[16])).unwrap(), (3072, [0xff; 32]));
         assert!(ho.requested_b(&rewrite(&[0x81])).is_err());
+        // The hub's statement checks her request against the keys the graph
+        // compiles with (lichen_wots's signatures, as the script does).
+        let keys = ho.holder.request_keys().unwrap();
+        let signed = |tx: &Transaction| {
+            let witness: Vec<&[u8]> = tx.input[0].witness.iter().collect();
+            keys.signed(&witness)
+        };
+        assert!(signed(&request) && signed(&fifteens) && signed(&rewrite(&[16])));
+        assert!(!signed(&rewrite(&[14])));
+        let stranger = HolderKeys::derive(&[8; 32], &[1; 32]).public();
+        let theirs = stranger.request_keys().unwrap();
+        let witness: Vec<&[u8]> = request.input[0].witness.iter().collect();
+        assert!(!theirs.signed(&witness));
         assert!(ao.offer.sigs.keys().all(|n| !HubProves::withheld(n)));
         assert!(ao.consent.sigs.keys().any(|n| HubProves::withheld(n)));
         let response = ho.respond(&h.keys, 1024).unwrap();

@@ -117,6 +117,14 @@ impl HolderPub {
         wots_of(&self.b_key, 4, "a key for b")?;
         wots_of(&self.e_key, 32, "a key for E")
     }
+
+    /// Her request's keys as the hub's statement checks her request
+    /// against them; a v4 Base binds their digest.
+    pub fn request_keys(&self) -> Result<licash_hp::RequestKeys> {
+        self.check()?;
+        licash_hp::RequestKeys::new(self.b_key.digits.clone(), self.e_key.digits.clone())
+            .context("her request's keys")
+    }
 }
 
 impl HubPub {
