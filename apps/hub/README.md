@@ -142,12 +142,21 @@ stolen: look at the alert and the ledger, then `licash-hub resume-payouts`
 resumes, beside the running hub (within 30 seconds) or without it, taking
 what the ledger shows then as known. This tells late, only once forged
 notes outnumber all the outstanding notes of a denomination, and stops
-only what leaves over Lightning, not swaps or contract claims: it limits a
-theft under way, and is no reason to keep the seed less safe. What it knows
-is in `<data>/payouts.json` (`baseline`, and `paused` with the reason). A
-hub upgraded to this version has none: it takes what its ledger shows at
-its first look as known, alerts if that is any, and pauses nothing. A file
-that does not read pauses, and is left as it is.
+only what leaves over Lightning from the hub, not swaps, contract claims
+or the invoices a `licash-swaps --lnd` pays from the same node: it limits
+a theft under way, and is no reason to keep the seed less safe. What it
+knows is in `<data>/payouts.json` (`baseline`, and `paused` with the
+reason). A hub upgraded to this version has none: it takes what its ledger
+shows at its first look as known, alerts if that is any, and pauses
+nothing. A file that does not read pauses, and is left as it is.
+
+Only a hub that knows of no such note is told of forged ones alone. A
+`hub.sqlite` restored from an older copy shows the same as a theft: the
+notes it issued since that copy come back to it, never issued as far as it
+remembers (and it takes again those spent since). And once some are known,
+their count rises as holders spend the hub's own notes, so a resumed hub
+pauses again, and is resumed again, until the most there ever were are
+known. From then on it tells only of more of them.
 
 The gateway calls eight of LND's RPCs: bake it a macaroon for those
 rather than give it `admin.macaroon`.
@@ -357,15 +366,19 @@ it pins the evidence each response is decided on and each one-time
 signature (the response, the assertion) before it is made. Back them up
 together, `responses.sqlite` never older than `openings.sqlite`: a second
 answer signed with a one-time key over other evidence gives the holder the
-hub's outputs. So the hub signs none where it cannot tell: `openings.sqlite`
-keeps each answer before it is signed, and one kept with nothing pinned for
-it, as when `responses.sqlite` was lost or restored older, is not decided
-anew. Nor is one neither file keeps (both restored older, or an answer
-signed before this version) while a transaction in the mempool already
-spends what only that answer can. The operator is alerted, and her timeout
-pays her what she claims: restoring the newer `responses.sqlite` is the
-only way back. A hub upgraded to this version keeps the answers it has
-pinned as it posts them again, and plays every other contract as before.
+hub's outputs. So the hub signs none where it can tell one was:
+`openings.sqlite` keeps each answer before it is signed, and one kept with
+nothing pinned for it, as when `responses.sqlite` was lost or restored
+older, is not decided anew. Nor is one neither file keeps (both restored
+older, or an answer signed before this version) while a transaction in the
+node's mempool already spends what only that answer can. Where neither
+tells (both files older and that transaction gone from the mempool) it
+decides anew: nothing replaces the backup. A response in a block whose
+evidence is lost is not asserted on. Where it signs none the operator is
+alerted, and her timeout pays her what she claims, with the hub's reserve
+once a response is in a block: restoring the newer `responses.sqlite` is
+the only way back. A hub upgraded to this version keeps the answers it has pinned
+as it posts them again, and plays every other contract as before.
 
 A dispute's links are presigned at 1 sat/vB, each with a 330 sat anchor
 only its poster spends. The hub posts its response and its assertion with
