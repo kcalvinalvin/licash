@@ -317,6 +317,74 @@ pub fn add_fee(
     sign_fee_input(key, &mut tx, 1, &[prevout, fee.1])?;
     Ok(tx)
 }
+/// A presigned link's anchor output: only its poster's payment key spends
+/// it ([`fee_script`]), in its fee child ([`link_child`]).
+pub const ANCHOR_VOUT: u32 = 1;
+
+/// The fee child of `link`, which pays `link_fee` itself: it spends the
+/// link's anchor ([`ANCHOR_VOUT`]) and `coins`, pays the rest to `change`,
+/// and brings the pair to `rate`, its own relay floor (1 sat/vB) at least.
+/// `sign` signs every input, given the prevouts in order. Refused if the
+/// coins fall short of its fee and a change output of dust.
+pub fn link_child(
+    link: &Transaction,
+    link_fee: Amount,
+    coins: &[(OutPoint, TxOut)],
+    change: ScriptBuf,
+    rate: FeeRate,
+    sign: impl Fn(&mut Transaction, &[TxOut]) -> Result<()>,
+) -> Result<Transaction> {
+    let anchor = link
+        .output
+        .get(ANCHOR_VOUT as usize)
+        .context("a link without an anchor")?;
+    let anchor = (
+        OutPoint {
+            txid: link.compute_txid(),
+            vout: ANCHOR_VOUT,
+        },
+        anchor.clone(),
+    );
+    let inputs: Vec<&(OutPoint, TxOut)> = std::iter::once(&anchor).chain(coins).collect();
+    let prevouts: Vec<TxOut> = inputs.iter().map(|(_, out)| out.clone()).collect();
+    let value: Amount = prevouts.iter().map(|o| o.value).sum();
+    let dust = change.minimal_non_dust();
+    let make = |fee: Amount| -> Result<Transaction> {
+        let pays = value
+            .checked_sub(fee)
+            .filter(|pays| *pays >= dust)
+            .with_context(|| format!("fee coins of {value} short of a child's fee of {fee}"))?;
+        let mut tx = Transaction {
+            version: lichen_btc::bitcoin::transaction::Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: inputs
+                .iter()
+                .map(|(outpoint, _)| TxIn {
+                    previous_output: *outpoint,
+                    sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                    ..Default::default()
+                })
+                .collect(),
+            output: vec![TxOut {
+                value: pays,
+                script_pubkey: change.clone(),
+            }],
+        };
+        sign(&mut tx, &prevouts)?;
+        Ok(tx)
+    };
+    // Signed at no fee for its size: signatures of a fixed size.
+    let size = make(Amount::ZERO)?.vsize() as u64;
+    let pair = rate
+        .fee_vb(link.vsize() as u64 + size)
+        .context("fee overflow")?;
+    let fee = pair
+        .checked_sub(link_fee)
+        .unwrap_or(Amount::ZERO)
+        .max(Amount::from_sat(size));
+    make(fee)
+}
+
 pub fn fee_script(key: &Keypair) -> Result<ScriptBuf> {
     Ok(anchor_tree_for(&key.x_only_public_key().0)?.script_pubkey())
 }
@@ -466,4 +534,105 @@ pub fn published(request: &Transaction, publication: &Block, txid: &Txid) -> Res
     spend
         .carrying(&slot)
         .context("the publication carries no claim in the request's slot")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lichen_btc::bitcoin::{secp256k1::Secp256k1, transaction::Version, Witness};
+
+    fn key() -> Keypair {
+        Keypair::from_seckey_slice(&Secp256k1::new(), &[7; 32]).unwrap()
+    }
+
+    /// A link of about 1 000 vB, its anchor the key's.
+    fn link() -> Transaction {
+        let mut witness = Witness::new();
+        witness.push(vec![0; 3_900]);
+        Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                witness,
+                ..Default::default()
+            }],
+            output: vec![
+                TxOut {
+                    value: Amount::from_sat(50_000),
+                    script_pubkey: ScriptBuf::new_op_return([]),
+                },
+                TxOut {
+                    value: Amount::from_sat(330),
+                    script_pubkey: fee_script(&key()).unwrap(),
+                },
+            ],
+        }
+    }
+
+    fn coin(value: u64) -> (OutPoint, TxOut) {
+        let txid = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::from_consensus(value as u32),
+            input: vec![],
+            output: vec![],
+        }
+        .compute_txid();
+        (
+            OutPoint { txid, vout: 0 },
+            TxOut {
+                value: Amount::from_sat(value),
+                script_pubkey: fee_script(&key()).unwrap(),
+            },
+        )
+    }
+
+    fn sign(tx: &mut Transaction, prevouts: &[TxOut]) -> Result<()> {
+        (0..tx.input.len()).try_for_each(|i| sign_fee_input(&key(), tx, i, prevouts))
+    }
+
+    fn fee(child: &Transaction, coins: &[(OutPoint, TxOut)]) -> u64 {
+        let value: u64 = 330 + coins.iter().map(|c| c.1.value.to_sat()).sum::<u64>();
+        value - child.output[0].value.to_sat()
+    }
+
+    #[test]
+    fn a_links_child_brings_the_pair_to_the_rate_crediting_the_links_fee() {
+        let (link, coins) = (link(), [coin(20_000)]);
+        // At 1 sat/vB of its own size, as a link pays its floor.
+        let floor = Amount::from_sat(link.vsize() as u64);
+        let change = fee_script(&key()).unwrap();
+        let rate = FeeRate::from_sat_per_vb_u32(5);
+        let fee_of = |rate| {
+            let child = link_child(&link, floor, &coins, change.clone(), rate, sign).unwrap();
+            assert_eq!(child.input[0].previous_output.txid, link.compute_txid());
+            assert_eq!(child.input[0].previous_output.vout, ANCHOR_VOUT);
+            assert_eq!(child.input[1].previous_output, coins[0].0);
+            (fee(&child, &coins), child.vsize() as u64)
+        };
+        let (paid, size) = fee_of(rate);
+        let pair = link.vsize() as u64 + size;
+        assert_eq!(paid + floor.to_sat(), 5 * pair);
+        // At the link's own rate or less: its own relay floor.
+        assert_eq!(fee_of(FeeRate::from_sat_per_vb_u32(1)).0, size);
+    }
+
+    #[test]
+    fn a_child_whose_coins_fall_short_is_refused() {
+        let change = fee_script(&key()).unwrap();
+        let rate = FeeRate::from_sat_per_vb_u32(50);
+        let short = link_child(
+            &link(),
+            Amount::from_sat(1_000),
+            &[coin(20_000)],
+            change.clone(),
+            rate,
+            sign,
+        );
+        assert!(format!("{:#}", short.unwrap_err()).contains("short"));
+        // Two coins pay it.
+        let coins = [coin(20_000), coin(60_000)];
+        let child =
+            link_child(&link(), Amount::from_sat(1_000), &coins, change, rate, sign).unwrap();
+        assert_eq!(child.input.len(), 3);
+    }
 }
