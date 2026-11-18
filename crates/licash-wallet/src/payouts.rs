@@ -56,6 +56,13 @@ use crate::{
 /// the coin back.
 pub const CLAIM_ROOM: u32 = 12;
 
+/// Blocks a payout's coin is quoted to time out after, at most, past the
+/// height of the hub its lock is at: room for the lock to be made and the
+/// coin to be paid and claimed, and no more, so that the provider's coin
+/// and the wallet's notes are held no longer than that should either side
+/// never go on. Within the most a hub admits.
+pub const PAYOUT_WINDOW: u32 = 72;
+
 /// A claim is budgeted at this many times the fee rate judged when it was
 /// asked for: the rate may be higher once it is broadcast.
 const HEADROOM: u64 = 3;
@@ -1084,6 +1091,8 @@ impl Terms<'_> {
             .latest_expiry(locks.min_depth.max(1))
             .map_err(|p| unavailable(from, p))?;
         let latest = self.expiry.map_or(latest, |bound| bound.min(latest));
+        let soonest = (locks.height.saturating_add(chain.margin)).saturating_add(PAYOUT_WINDOW);
+        let latest = latest.min(soonest);
         if latest.saturating_sub(chain.margin) < locks.height.saturating_add(2 * CLAIM_ROOM) {
             return refuse(format!(
                 "times its coin out {} blocks before a lock at {from} expires: too soon to claim it",

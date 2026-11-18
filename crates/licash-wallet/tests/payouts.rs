@@ -25,7 +25,7 @@ use licash_api::{
 use licash_hub::Timing;
 use licash_onchain::deposit::Htlc;
 use licash_wallet::{
-    Error, LockState, Payout, PayoutState, Response, Transport, Wallet, CLAIM_ROOM,
+    Error, LockState, Payout, PayoutState, Response, Transport, Wallet, CLAIM_ROOM, PAYOUT_WINDOW,
 };
 use net::{Fault, Link, Net, View, TIMING};
 
@@ -212,6 +212,28 @@ async fn a_quotes_expiry_bounds_its_lock() {
     let e = eco.client.payout(&stale).await.unwrap_err();
     assert!(e.to_string().contains("too soon to claim it"), "{e}");
     assert_eq!(eco.client.payouts().unwrap().len(), 1);
+}
+
+/// A payout is quoted to expire as soon as its coin may be paid and
+/// claimed, not as late as its hub admits: the provider's coin and the
+/// wallet's notes are held no longer than that if either never goes on.
+#[tokio::test]
+async fn a_quote_expires_as_soon_as_a_payout_can_be_made() {
+    let eco = Eco::new().await;
+    let height = eco.view.height();
+    let quote = eco
+        .client
+        .payout_quote(PROVIDER, A, PAYEE, 500, MAX_FEE, ONE_SAT)
+        .await
+        .unwrap();
+    // The hub admits locks expiring 141 blocks on.
+    assert!(height + TERMS.margin + PAYOUT_WINDOW < height + TIMED.window - 3);
+    assert_eq!(quote.expiry, height + TERMS.margin + PAYOUT_WINDOW);
+    let payout = eco.client.payout(&quote).await.unwrap();
+    let lock = eco.client.locks().unwrap().remove(0);
+    assert_eq!(Some(&lock.id), payout.lock.as_ref());
+    assert!(lock.expiry <= quote.expiry, "{}", lock.expiry);
+    assert_eq!(eco.timeout(), lock.expiry - TERMS.margin);
 }
 
 /// A follower elsewhere (here a second handle on the same wallet, on
