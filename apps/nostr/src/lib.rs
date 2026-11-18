@@ -64,6 +64,10 @@ const MAX_URL: usize = 256;
 /// The most announcements asked of each relay.
 const MAX_EVENTS: usize = 500;
 
+/// How far ahead of the clock an announcement may say it was signed: a
+/// service's clock off by a little.
+const MAX_AHEAD: Duration = Duration::from_secs(15 * 60);
+
 /// Relays to look for hubs and providers on besides those a wallet's hubs
 /// name: the signet hubs and provider announce there. They were chosen for
 /// serving readers over Tor without NIP-42 and keeping addressable events,
@@ -456,11 +460,18 @@ where
     Ok(answers)
 }
 
-/// `event`, if a valid, unexpired announcement of `role` for `network`.
+/// `event`, if a valid, unexpired announcement of `role` for `network`,
+/// signed no later than [`MAX_AHEAD`] from now: one dated later would
+/// outlast and stand in for those its key makes in time.
 fn read(event: &Event, role: Role, network: &str) -> Option<Found> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
     let valid = event.kind == Kind::Custom(KIND)
         && event.tags.identifier().as_deref() == Some(role.id())
         && !event.is_expired()
+        && event.created_at.as_secs() <= now.saturating_add(MAX_AHEAD.as_secs())
         && event.content.len() <= MAX_CONTENT
         && event.verify().is_ok();
     if !valid {
@@ -504,6 +515,29 @@ mod tests {
         assert!(clear.iter().all(|r| all.contains(r)));
         assert!(default_relays("regtest", true).is_empty());
         assert!(default_relays("regtest", false).is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_announcement_signed_well_ahead_of_the_clock_is_not_read() {
+        let announcer = Announcer {
+            client: Client::default(),
+            keys: keys(&[3; 32]).unwrap(),
+            role: Role::Hub,
+        };
+        let announcement = Announcement {
+            urls: vec!["https://hub.example".into()],
+            network: "regtest".into(),
+            name: None,
+        };
+        let at = |ahead: u64| {
+            let at = Timestamp::now() + Duration::from_secs(ahead);
+            let event = announcer.event(&announcement, at);
+            read(&event.unwrap(), Role::Hub, "regtest")
+        };
+        assert!(at(0).is_some());
+        assert!(at(60).is_some(), "a clock a little off");
+        assert!(at(MAX_AHEAD.as_secs() + 60).is_none());
+        assert!(at(365 * 24 * 3600).is_none());
     }
 
     #[test]

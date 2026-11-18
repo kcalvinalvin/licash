@@ -31,6 +31,16 @@ pub const KEEP: Duration = Duration::from_secs(14 * 24 * 60 * 60);
 /// The most gift wraps asked of each relay.
 const MAX_MAIL: usize = 500;
 
+/// The most gift wraps pushed kept between looks: past them, the next
+/// look asks the relays for all the mail instead, as they keep it. Anyone
+/// may gift wrap to a mailbox.
+const MAX_PUSHED: usize = MAX_MAIL;
+
+/// The most gift wraps dealt with remembered at once, in two halves: the
+/// older half forgotten as the newer fills. One forgotten is opened again
+/// if a relay still holds it, then dealt with as before.
+const MAX_DONE: usize = 8 * 1024;
+
 /// The largest gift wrap opened: a payment is far smaller.
 const MAX_WRAP: usize = 512 * 1024;
 
@@ -124,8 +134,8 @@ pub struct Mailbox {
     /// The gift wraps dealt with for good ([`Mailbox::done`]), or that are
     /// no payment of its: not opened again, a look then costing nothing
     /// for each (opening a payment taken already takes milliseconds, and a
-    /// mailbox holds two weeks of them).
-    done: Mutex<HashSet<EventId>>,
+    /// mailbox holds two weeks of them). [`MAX_DONE`] at most.
+    done: Mutex<Done>,
     /// The payments the last look returned, not [`Mailbox::done`] since:
     /// returned again by the next, whether the relays are asked or not.
     returned: Mutex<BTreeSet<Event>>,
@@ -145,6 +155,38 @@ struct Pushed {
     relays: HashSet<RelayUrl>,
     /// When the relays were last asked for all the mail: never if none.
     asked: Option<Instant>,
+}
+
+impl Pushed {
+    /// `event`, pushed: [`MAX_PUSHED`] kept at most, the relays asked for
+    /// all the mail next instead.
+    fn take(&mut self, event: Event) {
+        if self.events.len() < MAX_PUSHED {
+            self.events.insert(event);
+        } else {
+            self.asked = None;
+        }
+    }
+}
+
+/// The gift wraps dealt with, the newest [`MAX_DONE`] at most.
+#[derive(Default)]
+struct Done {
+    newer: HashSet<EventId>,
+    older: HashSet<EventId>,
+}
+
+impl Done {
+    fn contains(&self, id: &EventId) -> bool {
+        self.newer.contains(id) || self.older.contains(id)
+    }
+
+    fn insert(&mut self, id: EventId) {
+        if self.newer.len() >= MAX_DONE / 2 {
+            self.older = std::mem::take(&mut self.newer);
+        }
+        self.newer.insert(id);
+    }
 }
 
 impl Drop for Mailbox {
@@ -168,7 +210,7 @@ impl Mailbox {
                 // Each the first time seen: what the looks return too.
                 if let ClientNotification::Event { event, .. } = notification {
                     if event.kind == Kind::GiftWrap {
-                        lock(&into).events.insert(*event);
+                        lock(&into).take(*event);
                     }
                 }
             }
@@ -322,6 +364,46 @@ mod tests {
     use nostr_sdk::prelude::MockRelay;
 
     use super::*;
+
+    #[test]
+    fn a_flood_pushed_between_looks_is_asked_for_instead_of_kept() {
+        let keys = Keys::generate();
+        let wrap = |n: usize| {
+            EventBuilder::new(Kind::GiftWrap, n.to_string())
+                .finalize(&keys)
+                .unwrap()
+        };
+        let mut pushed = Pushed {
+            asked: Some(Instant::now()),
+            ..Pushed::default()
+        };
+        for n in 0..MAX_PUSHED {
+            pushed.take(wrap(n));
+        }
+        assert_eq!(pushed.events.len(), MAX_PUSHED);
+        assert!(pushed.asked.is_some());
+        pushed.take(wrap(MAX_PUSHED));
+        assert_eq!(pushed.events.len(), MAX_PUSHED);
+        assert!(pushed.asked.is_none(), "the relays asked for all next");
+    }
+
+    #[test]
+    fn the_mail_dealt_with_is_remembered_the_newest_first() {
+        let id = |n: usize| {
+            let mut bytes = [0; 32];
+            bytes[24..].copy_from_slice(&(n as u64).to_be_bytes());
+            EventId::from_slice(&bytes)
+        };
+        let mut done = Done::default();
+        for n in 0..10 * MAX_DONE {
+            done.insert(id(n).unwrap());
+        }
+        assert!(done.newer.len() + done.older.len() <= MAX_DONE);
+        let last = 10 * MAX_DONE - 1;
+        assert!(done.contains(&id(last).unwrap()));
+        assert!(done.contains(&id(last + 1 - MAX_DONE / 2).unwrap()));
+        assert!(!done.contains(&id(0).unwrap()));
+    }
 
     #[tokio::test]
     async fn a_mailbox_kept_is_pushed_the_mail_sent_once_looked_in() {

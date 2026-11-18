@@ -43,12 +43,39 @@ struct Kept {
 }
 
 impl Kept {
-    /// `found`, if newer than what its key announced before.
+    /// `found`, if newer than what its key announced before. Past
+    /// [`MAX_KEPT`] keys, those expired are forgotten, then the oldest.
     fn take(&mut self, found: Found) {
         if (self.found.get(&found.key)).is_none_or(|old| old.at < found.at) {
             self.found.insert(found.key.clone(), found);
         }
+        if self.found.len() > MAX_KEPT {
+            let now = now();
+            (self.found).retain(|_, f| f.at.saturating_add(LIFETIME.as_secs()) > now);
+        }
+        while self.found.len() > MAX_KEPT {
+            let oldest = (self.found.values())
+                .min_by(|a, b| a.at.cmp(&b.at).then_with(|| a.key.cmp(&b.key)))
+                .map(|f| f.key.clone());
+            if let Some(key) = oldest {
+                self.found.remove(&key);
+            }
+        }
     }
+}
+
+/// The most keys' announcements a watch keeps: as many as its relays
+/// answer when asked for all, each, [`MAX_EVENTS`] at most, of a few
+/// relays. Announcing is free, so a flood of keys would otherwise be kept
+/// for as long as the watch is.
+const MAX_KEPT: usize = 4 * MAX_EVENTS;
+
+/// Now, in seconds since the epoch.
+fn now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 impl Drop for Watch {
@@ -161,10 +188,7 @@ impl Watch {
 
     /// What it kept, unexpired, newest first.
     pub fn kept(&self) -> Vec<Found> {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let now = now();
         let kept = lock(&self.kept);
         let mut found: Vec<Found> = (kept.found.values())
             .filter(|f| f.at.saturating_add(LIFETIME.as_secs()) > now)
@@ -181,4 +205,43 @@ fn connected(relay: &Relay) -> bool {
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Announcement;
+
+    fn found(key: usize, at: u64) -> Found {
+        Found {
+            key: format!("{key:064}"),
+            announcement: Announcement {
+                urls: vec![format!("https://{key}.test")],
+                network: "regtest".into(),
+                name: None,
+            },
+            at,
+        }
+    }
+
+    #[test]
+    fn a_flood_of_keys_is_kept_no_more_than_relays_answer() {
+        let now = now();
+        let mut kept = Kept::default();
+        // Expired ones go first, then the oldest.
+        let expired = now - LIFETIME.as_secs() - 1;
+        kept.take(found(0, expired));
+        kept.take(found(1, now - 10));
+        for key in 2..MAX_KEPT + 100 {
+            kept.take(found(key, now));
+        }
+        assert_eq!(kept.found.len(), MAX_KEPT);
+        assert!(!kept.found.contains_key(&found(0, 0).key));
+        assert!(!kept.found.contains_key(&found(1, 0).key));
+        // A newer announcement of a key kept stands in for its older one.
+        let key = found(MAX_KEPT, 0).key;
+        kept.take(found(MAX_KEPT, now + 1));
+        assert_eq!(kept.found[&key].at, now + 1);
+        assert_eq!(kept.found.len(), MAX_KEPT);
+    }
 }

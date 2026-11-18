@@ -24,6 +24,7 @@ tracing.workspace = true
 [dev-dependencies]
 nostr-sdk = { version = "0.45.6", features = ["local-relay"] }
 tempfile = "3.27"
+tokio = { workspace = true, features = ["test-util"] }
 
 [features]
 # Reach relays through a Tor client of the application's own.

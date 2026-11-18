@@ -1241,14 +1241,16 @@ async fn discover(
     let found = licash_nostr::discover(relays, &route, role, network).await?;
     let http = Arc::new(http);
     let mut checks = tokio::task::JoinSet::new();
+    let at_once = Arc::new(tokio::sync::Semaphore::new(CHECKS_AT_ONCE));
     for (i, service) in found.iter().enumerate() {
         for url in &service.announcement.urls {
             if is_onion(url) && !onions {
                 tracing::warn!(%url, "skipped: an onion service needs --proxy or --tor");
                 continue;
             }
-            let (http, url) = (http.clone(), url.clone());
+            let (http, url, at_once) = (http.clone(), url.clone(), at_once.clone());
             checks.spawn(async move {
+                let _turn = at_once.acquire_owned().await;
                 let info = tokio::time::timeout(CHECK_TIMEOUT, info_at(&http, &url, swaps)).await;
                 let info = info.unwrap_or_else(|_| Err("no answer in time".into()));
                 (i, url, info)
@@ -1322,6 +1324,10 @@ async fn discover(
 
 /// How long a service announced has to answer.
 const CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The most URLs announced asked at once: announcing is free, so relays
+/// may hold thousands, each naming a few.
+const CHECKS_AT_ONCE: usize = 32;
 
 /// What a service announced says of itself.
 enum Answer {

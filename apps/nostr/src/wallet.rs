@@ -12,7 +12,10 @@ use std::{
 
 use anyhow::{bail, ensure};
 use bitcoin::FeeRate;
-use futures_util::future::{join, join_all};
+use futures_util::{
+    future::{join, join_all},
+    stream::{self, StreamExt},
+};
 use licash_api::{Info, Payment};
 use licash_wallet::{
     DonationAddress, Error, HubId, LicashCode, Paid, PaymentCode, PayoutQuote, PayoutState,
@@ -21,8 +24,13 @@ use licash_wallet::{
 
 use crate::{mailbox, watch::Watch, Found, Role, Route, LIFETIME};
 
-/// How long a swap provider announced has to answer at a URL.
+/// How long a service announced has to answer, at all its URLs together:
+/// one announcing URLs that never answer holds a look no longer.
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The most services announced asked at once: hubs are all asked, and
+/// providers the wallet heard from besides [`STRANGERS`].
+const ASKED_AT_ONCE: usize = 32;
 
 /// How long the swap providers announced, as last found, are used without
 /// looking for them again: well within an announcement's [`LIFETIME`].
@@ -231,6 +239,9 @@ impl Announcements {
         let keys: Vec<String> = found.iter().map(|f| f.key.clone()).collect();
         let answering = answering(found, ask, nostr).await?;
         let mut answered = lock();
+        // Those heard from too long ago count for nothing: forgotten, so
+        // that keys announcing once each are kept no longer.
+        answered.retain(|_, (_, at)| at.elapsed() < KEPT_FOR);
         for key in keys {
             let at = answering.iter().find(|(f, ..)| f.key == key);
             let Some((_, url, _)) = at else {
@@ -1217,8 +1228,9 @@ fn known(service: &Found, used: &HashSet<String>) -> bool {
 /// Each service of `found` at the first URL it announced whose answer to
 /// `ask` names the key that announced it (as `nostr` reads it), with that
 /// answer: only then may its URL be used. The others are skipped, as are
-/// those not answering in time, but [`Error::UnknownHub`] fails them all:
-/// no service is one to ask.
+/// those not answering in time, [`ANSWER_TIMEOUT`] at all its URLs
+/// together, but [`Error::UnknownHub`] fails them all: no service is one
+/// to ask. [`ASKED_AT_ONCE`] are asked at once.
 async fn answering<Q, Fut>(
     found: Vec<Found>,
     ask: impl Fn(String) -> Fut,
@@ -1230,8 +1242,9 @@ where
     let ask = &ask;
     let asked = found.into_iter().map(|service| async move {
         let mut answered = None;
+        let by = tokio::time::Instant::now() + ANSWER_TIMEOUT;
         for url in &service.announcement.urls {
-            match tokio::time::timeout(ANSWER_TIMEOUT, ask(url.clone())).await {
+            match tokio::time::timeout_at(by, ask(url.clone())).await {
                 Ok(Ok(answer)) if service.named_by(nostr(&answer)) => {
                     answered = Some((url.clone(), answer));
                     break;
@@ -1244,8 +1257,9 @@ where
         }
         Ok(answered.map(|(url, answer)| (service, url, answer)))
     });
+    let mut asked = stream::iter(asked).buffered(ASKED_AT_ONCE);
     let mut answering = Vec::new();
-    for asked in join_all(asked).await {
+    while let Some(asked) = asked.next().await {
         answering.extend(asked?);
     }
     Ok(answering)
@@ -1322,6 +1336,89 @@ mod tests {
             keys(&announced.chosen(few.clone(), &HashSet::new())),
             keys(&few)
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_service_announcing_urls_that_never_answer_holds_a_look_no_longer_than_one() {
+        // One announcing URLs that never answer, the others answering.
+        let mut found: Vec<Found> = (0..3)
+            .map(|i| at(i, &format!("https://{i}.test")))
+            .collect();
+        found[0].announcement.urls = (0..4).map(|i| format!("https://slow{i}.test")).collect();
+        let keys: HashMap<String, String> = (found.iter())
+            .flat_map(|f| {
+                f.announcement
+                    .urls
+                    .iter()
+                    .map(|u| (u.clone(), f.key.clone()))
+            })
+            .collect();
+        let ask = |url: String| {
+            let key = keys[&url].clone();
+            async move {
+                if url.contains("slow") {
+                    std::future::pending::<()>().await;
+                }
+                Ok(Answer(key))
+            }
+        };
+        let started = tokio::time::Instant::now();
+        let answered = answering(found, ask, named).await.unwrap();
+        assert_eq!(answered.len(), 2);
+        assert_eq!(started.elapsed(), ANSWER_TIMEOUT);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn services_announced_are_asked_a_few_dozen_at_a_time() {
+        let found: Vec<Found> = (0..3 * ASKED_AT_ONCE)
+            .map(|i| at(i, &format!("https://{i}.test")))
+            .collect();
+        let (now, most) = (Arc::new(Mutex::new(0)), Arc::new(Mutex::new(0)));
+        let ask = |url: String| {
+            let (now, most) = (now.clone(), most.clone());
+            let key = found.iter().find(|f| f.announcement.urls[0] == url);
+            let key = key.unwrap().key.clone();
+            async move {
+                let at_once = {
+                    let mut now = now.lock().unwrap();
+                    *now += 1;
+                    *now
+                };
+                {
+                    let mut most = most.lock().unwrap();
+                    *most = (*most).max(at_once);
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                *now.lock().unwrap() -= 1;
+                Ok(Answer(key))
+            }
+        };
+        let answered = answering(found.clone(), ask, named).await.unwrap();
+        assert_eq!(answered.len(), found.len());
+        assert_eq!(*most.lock().unwrap(), ASKED_AT_ONCE);
+        // In the order found.
+        assert!(answered.iter().zip(&found).all(|(a, f)| a.0.key == f.key));
+    }
+
+    #[tokio::test]
+    async fn providers_heard_from_long_ago_are_forgotten() {
+        let announced = Announcements::default();
+        let Some(long_ago) = Instant::now().checked_sub(KEPT_FOR) else {
+            return;
+        };
+        for i in 0..100 {
+            (announced.answered.lock().unwrap())
+                .insert(format!("{i:064}"), (format!("https://{i}.test"), long_ago));
+        }
+        let found = vec![at(200, "https://200.test")];
+        let key = found[0].key.clone();
+        let ask = |_: String| {
+            let key = key.clone();
+            async move { Ok(Answer(key)) }
+        };
+        announced.asked(found, ask, named).await.unwrap();
+        let answered = announced.answered.lock().unwrap();
+        assert_eq!(answered.keys().collect::<Vec<_>>(), [&key]);
     }
 
     #[test]
