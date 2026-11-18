@@ -71,6 +71,9 @@ enum Pay {
     All(FeeRate),
     /// Exactly an amount, the rest of the deposit its fee.
     Exact(Amount),
+    /// All of the deposit but the fee at a rate, or all of it but dust if
+    /// that fee takes more.
+    Capped(FeeRate),
 }
 
 impl Htlc {
@@ -140,6 +143,29 @@ impl Htlc {
         )
     }
 
+    /// [`Htlc::claim_tx`] at `rate`, or paying `to` only dust if the fee at
+    /// `rate` takes more: a claim racing a deadline, its claimer losing more
+    /// than the fee if it is late.
+    pub fn claim_capped(
+        &self,
+        funding: OutPoint,
+        value: Amount,
+        to: ScriptBuf,
+        rate: FeeRate,
+        secret: &SecretKey,
+        preimage: &[u8; 32],
+    ) -> Result<Transaction, Error> {
+        self.check_preimage(preimage)?;
+        self.spend(
+            funding,
+            value,
+            to,
+            Pay::Capped(rate),
+            secret,
+            Path::Claim(*preimage),
+        )
+    }
+
     /// The claim of `funding`, worth `value`, paying `to` exactly `amount`
     /// and the rest of it as its fee: a payout's, whose payee is owed
     /// `amount` whatever the fee comes to, which its claimer judges.
@@ -194,6 +220,19 @@ impl Htlc {
         secret: &SecretKey,
     ) -> Result<Transaction, Error> {
         self.spend(funding, value, to, Pay::All(rate), secret, Path::Refund)
+    }
+
+    /// [`Htlc::refund_tx`] at `rate`, or paying `to` only dust if the fee at
+    /// `rate` takes more ([`Htlc::claim_capped`]).
+    pub fn refund_capped(
+        &self,
+        funding: OutPoint,
+        value: Amount,
+        to: ScriptBuf,
+        rate: FeeRate,
+        secret: &SecretKey,
+    ) -> Result<Transaction, Error> {
+        self.spend(funding, value, to, Pay::Capped(rate), secret, Path::Refund)
     }
 }
 
@@ -260,6 +299,11 @@ impl Htlc {
                     .filter(|left| *left >= dust)
                     .ok_or(Error::TooSmall { value, fee })?
             }
+            Pay::Capped(rate) if value >= dust => {
+                let fee = rate.fee_wu(tx.weight()).unwrap_or(Amount::MAX);
+                value.checked_sub(fee).unwrap_or(dust).max(dust)
+            }
+            Pay::Capped(_) => return Err(Error::TooSmall { value, fee: value }),
             Pay::Exact(amount) if amount <= value && amount >= dust => amount,
             Pay::Exact(amount) => return Err(Error::Exact { value, amount }),
         };

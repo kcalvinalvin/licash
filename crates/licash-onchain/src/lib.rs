@@ -3,6 +3,7 @@
 //! coins of deposits, which turn coins into a hub's notes, and of payouts,
 //! which a swap provider pays a wallet's notes out with.
 
+pub mod deadline;
 pub mod deposit;
 pub mod silent;
 

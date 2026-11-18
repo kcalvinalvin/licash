@@ -154,6 +154,44 @@ fn a_deposit_too_small_for_its_fee_is_not_spent() {
 }
 
 #[test]
+fn a_spend_racing_its_deadline_pays_all_but_dust_at_most() {
+    let htlc = htlc();
+    let small = Amount::from_sat(1_500);
+    let dust = to().minimal_non_dust();
+    let rate = FeeRate::from_sat_per_vb(10).unwrap();
+    // As much as the plain spend while the fee leaves more than dust.
+    let enough = Amount::from_sat(2_000);
+    let plain = htlc
+        .refund_tx(funding(), enough, to(), rate, &secret(2))
+        .unwrap();
+    let capped = htlc
+        .refund_capped(funding(), enough, to(), rate, &secret(2))
+        .unwrap();
+    assert_eq!(capped, plain);
+    // Else all of it but dust.
+    let tx = htlc
+        .refund_capped(funding(), small, to(), rate, &secret(2))
+        .unwrap();
+    assert_eq!(tx.output[0].value, dust);
+    let huge = FeeRate::from_sat_per_vb(VALUE.to_sat()).unwrap();
+    let tx = htlc
+        .refund_capped(funding(), VALUE, to(), huge, &secret(2))
+        .unwrap();
+    assert_eq!(tx.output[0].value, dust);
+    verify(&htlc, &tx, &htlc.refund_script(), &htlc.refund);
+    let claim = htlc
+        .claim_capped(funding(), VALUE, to(), huge, &secret(1), &[7; 32])
+        .unwrap();
+    assert_eq!(claim.output[0].value, dust);
+    verify(&htlc, &claim, &htlc.claim_script(), &htlc.claim);
+    let wrong = htlc.claim_capped(funding(), VALUE, to(), huge, &secret(1), &[8; 32]);
+    assert!(wrong.is_err());
+    // A coin that is dust itself is not spent.
+    let spent = htlc.refund_capped(funding(), dust - Amount::ONE_SAT, to(), rate, &secret(2));
+    assert!(matches!(spent, Err(Error::TooSmall { .. })), "{spent:?}");
+}
+
+#[test]
 fn a_payout_claims_exactly_its_amount_the_rest_its_fee() {
     let htlc = htlc();
     let amount = Amount::from_sat(99_000);
