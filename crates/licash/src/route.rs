@@ -16,14 +16,15 @@
 //! Bitcoin, which the hub can void only by publishing the preimage. Its
 //! lock elsewhere must outlive that hub's response window as well.
 //!
-//! A hub answers a refund request plainly only after it has seen the lock
-//! expire unactivated, so it admits a lock only if that fits its response
-//! window.
+//! A refund is owed on Bitcoin only once the lock expired at depth (under
+//! a v4 Base), when the hub holds any preimage. A hub admits a lock only if
+//! it expires, at depth, within its window, which bounds a lock's life.
 
 /// One hub's timing for a lock it issues, in blocks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Hop {
-    /// Response window `w` of the hub's recovery contracts.
+    /// Response window `w` of the hub's recovery contracts, and the most
+    /// blocks a lock it admits lives.
     pub window: u32,
     /// Blocks within which a transaction the party broadcasts confirms: an
     /// activation upstream, or a refund request and its claim body. It may
@@ -40,8 +41,8 @@ pub struct Hop {
 }
 
 impl Hop {
-    /// The hub can watch the lock expire, at depth, and still answer a
-    /// request posted as early as `now`.
+    /// The lock expires, at depth and with the hub's reaction, within the
+    /// window from `now`.
     pub fn admits(&self, now: u32, expiry: u32) -> bool {
         let Some(decided) = sum(&[expiry, self.depth, self.reaction]) else {
             return false;

@@ -698,7 +698,7 @@ impl Hub {
 
 impl Hub {
     /// Check `terms` against the hub's chain and timing: the height by
-    /// which it answers a refund request on the lock.
+    /// which it decides the lock, expired at depth, with its reaction.
     fn admit(&self, tx: &Transaction<'_>, terms: &TimedTerms) -> Result<u32, Error> {
         let t = self.policy.timing;
         let checkpoint =
