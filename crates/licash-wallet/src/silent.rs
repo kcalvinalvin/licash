@@ -245,9 +245,10 @@ fn give_up(t: &Sql<'_>, txid: &Txid) -> Result<usize, Error> {
     Ok(freed.max(known))
 }
 
-/// The coins the wallet's own spends take, by the spend.
+/// The coins the wallet's own spends take, by the spend: the latest of
+/// them, a coin's spend replaced ([`Wallet::replace_silent`]).
 fn pending_inputs(t: &Sql<'_>) -> Result<HashMap<OutPoint, Txid>, Error> {
-    let mut stmt = t.prepare("SELECT txid, tx FROM silent_spends")?;
+    let mut stmt = t.prepare("SELECT txid, tx FROM silent_spends ORDER BY created_at, rowid")?;
     let rows = stmt.query_map([], |r| {
         Ok((r.get::<_, [u8; 32]>(0)?, r.get::<_, Vec<u8>>(1)?))
     })?;
@@ -889,39 +890,33 @@ impl<T: Transport> Wallet<T> {
             let mut stmt = c.prepare("SELECT tx FROM silent_spends ORDER BY created_at, txid")?;
             let rows = stmt.query_map([], |r| r.get::<_, Vec<u8>>(0))?;
             let raw = rows.collect::<Result<Vec<_>, _>>()?;
-            let mut coin = c.prepare(
-                "SELECT value, spent_by, spent_at FROM silent_coins WHERE txid = ?1 AND vout = ?2",
-            )?;
             let mut spends = Vec::new();
             for tx in raw {
                 let tx: Transaction = bitcoin::consensus::deserialize(&tx).map_err(invalid)?;
-                if !tx.output.iter().any(|o| o.script_pubkey == *script) {
-                    continue;
+                if tx.output.iter().any(|o| o.script_pubkey == *script) {
+                    spends.push(described(c, tx)?);
                 }
-                let txid = tx.compute_txid().to_byte_array();
-                let (mut held, mut height) = (Some(0u64), None);
-                for input in &tx.input {
-                    let spent = input.previous_output;
-                    let params = params![spent.txid.to_byte_array(), spent.vout];
-                    let row = coin.query_row(params, |r| {
-                        let by: Option<[u8; 32]> = r.get(1)?;
-                        Ok((r.get::<_, i64>(0)? as u64, by, r.get::<_, Option<u32>>(2)?))
-                    });
-                    match row.optional()? {
-                        Some((value, by, at)) => {
-                            held = held.and_then(|h| h.checked_add(value));
-                            if by == Some(txid) {
-                                height = height.or(at);
-                            }
-                        }
-                        None => held = None,
-                    }
-                }
-                let paid: u64 = tx.output.iter().map(|o| o.value.to_sat()).sum();
-                let fee = held.and_then(|h| h.checked_sub(paid));
-                spends.push(SilentSpend { tx, fee, height });
             }
             Ok(spends)
+        })
+    }
+
+    /// The wallet's transaction `txid` of its coins, in a block or not:
+    /// none unless it made it and did not give it up.
+    pub fn silent_spend(&self, txid: &Txid) -> Result<Option<SilentSpend>, Error> {
+        self.store.read(|c| {
+            let raw: Option<Vec<u8>> = c
+                .query_row(
+                    "SELECT tx FROM silent_spends WHERE txid = ?1",
+                    [txid.to_byte_array()],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            raw.map(|raw| {
+                let tx = bitcoin::consensus::deserialize(&raw).map_err(invalid)?;
+                described(c, tx)
+            })
+            .transpose()
         })
     }
 
@@ -1029,6 +1024,115 @@ impl<T: Transport> Wallet<T> {
         }
         tracing::info!(%txid, freed, "silent payment spend abandoned");
         Ok(())
+    }
+
+    /// Cancel the wallet's spend `txid`, in no block yet: a spend of its
+    /// coins, all of them, back to the wallet's change address at `rate`,
+    /// or at what takes the place of `txid` in a mempool if more (its fee
+    /// and 1 sat/vB of its own size, BIP125), signed and recorded as their
+    /// spend in its place, for the application to broadcast. A cancel is
+    /// made again the same way. Refused unless `txid` is the wallet's spend
+    /// of each of its coins, and no block spends them. Whichever of the two
+    /// a block holds, a scan sees the coins spent by it, and the other
+    /// given up.
+    pub fn replace_silent(&self, txid: &Txid, rate: FeeRate) -> Result<Transaction, Error> {
+        let keys = &self.keys.silent;
+        let tx = self.store.write(|t| {
+            let old: Option<Vec<u8>> = t
+                .query_row(
+                    "SELECT tx FROM silent_spends WHERE txid = ?1",
+                    [txid.to_byte_array()],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let Some(old) = old else {
+                return Err(Error::UnknownPayment(txid.to_string()));
+            };
+            let old: Transaction = bitcoin::consensus::deserialize(&old).map_err(invalid)?;
+            let mut inputs = Vec::new();
+            for input in &old.input {
+                match coin(t, &input.previous_output)? {
+                    Some((held, Some(by))) if by == *txid => inputs.push(held),
+                    _ => {
+                        return Err(Error::Invalid(format!(
+                            "spend {txid}: not the wallet's spend of coin {}, or in a block",
+                            input.previous_output
+                        )))
+                    }
+                }
+            }
+            let held: u64 = inputs.iter().map(|h| h.value).sum();
+            let old_fee = old
+                .output
+                .iter()
+                .try_fold(held, |left, o| left.checked_sub(o.value.to_sat()))
+                .ok_or_else(|| Error::Invalid(format!("spend {txid} pays more than its coins")))?;
+            let secrets = inputs
+                .iter()
+                .map(|h| keys.spend_secret(&h.found))
+                .collect::<Result<Vec<SecretKey>, _>>()
+                .map_err(invalid)?;
+            let keyed: Vec<(SecretKey, bool)> = secrets.iter().map(|s| (*s, true)).collect();
+            let outpoints: Vec<OutPoint> = inputs.iter().map(|h| h.outpoint).collect();
+            let change = keys.scanner([]).labeled(CHANGE);
+            let script = silent::outputs(&keyed, &outpoints, &[change])
+                .map_err(invalid)?
+                .into_iter()
+                .map(p2tr)
+                .next()
+                .expect("the change's output");
+            let output = |value: u64| TxOut {
+                value: Amount::from_sat(value),
+                script_pubkey: script.clone(),
+            };
+            let vsize = fee(inputs.len(), &[output(0)], FeeRate::from_sat_per_vb_u32(1));
+            let fee = fee(inputs.len(), &[output(0)], rate).max(old_fee.saturating_add(vsize));
+            let dust = script.minimal_non_dust().to_sat();
+            let back =
+                held.checked_sub(fee)
+                    .filter(|back| *back >= dust)
+                    .ok_or(Error::Insufficient {
+                        needed: fee.saturating_add(dust),
+                        available: held,
+                    })?;
+            let tx = sign(&inputs, &secrets, vec![output(back)])?;
+            let new = tx.compute_txid().to_byte_array();
+            t.execute(
+                "INSERT INTO silent_spends (txid, tx, created_at) VALUES (?1, ?2, ?3)",
+                params![new, bitcoin::consensus::serialize(&tx), now()],
+            )?;
+            t.execute(
+                "UPDATE silent_coins SET spent_by = ?2 WHERE spent_by = ?1 AND spent_at IS NULL",
+                params![txid.to_byte_array(), new],
+            )?;
+            Ok(tx)
+        })?;
+        tracing::info!(replaced = %txid, txid = %tx.compute_txid(), "silent payment spend canceled");
+        Ok(tx)
+    }
+
+    /// What spends the wallet's coin at `outpoint`, and the block a scan
+    /// saw it in, if any: none unless the coin is the wallet's and a
+    /// transaction of its own or a block spends it.
+    pub fn silent_spender(
+        &self,
+        outpoint: &OutPoint,
+    ) -> Result<Option<(Txid, Option<u32>)>, Error> {
+        self.store.read(|c| {
+            let row = c
+                .query_row(
+                    "SELECT spent_by, spent_at FROM silent_coins WHERE txid = ?1 AND vout = ?2",
+                    params![outpoint.txid.to_byte_array(), outpoint.vout],
+                    |r| {
+                        Ok((
+                            r.get::<_, Option<[u8; 32]>>(0)?,
+                            r.get::<_, Option<u32>>(1)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            Ok(row.and_then(|(by, at)| by.map(|by| (Txid::from_byte_array(by), at))))
+        })
     }
 
     /// A transaction paying `amount` to `to`, or everything if `None`, of
@@ -1343,6 +1447,35 @@ fn coin(
         },
     };
     Ok(Some((held, spent_by.map(Txid::from_byte_array))))
+}
+
+/// The wallet's spend `tx`, its fee and its block as its coins tell.
+fn described(c: &rusqlite::Connection, tx: Transaction) -> Result<SilentSpend, Error> {
+    let mut coin = c.prepare_cached(
+        "SELECT value, spent_by, spent_at FROM silent_coins WHERE txid = ?1 AND vout = ?2",
+    )?;
+    let txid = tx.compute_txid().to_byte_array();
+    let (mut held, mut height) = (Some(0u64), None);
+    for input in &tx.input {
+        let spent = input.previous_output;
+        let params = params![spent.txid.to_byte_array(), spent.vout];
+        let row = coin.query_row(params, |r| {
+            let by: Option<[u8; 32]> = r.get(1)?;
+            Ok((r.get::<_, i64>(0)? as u64, by, r.get::<_, Option<u32>>(2)?))
+        });
+        match row.optional()? {
+            Some((value, by, at)) => {
+                held = held.and_then(|h| h.checked_add(value));
+                if by == Some(txid) {
+                    height = height.or(at);
+                }
+            }
+            None => held = None,
+        }
+    }
+    let paid: u64 = tx.output.iter().map(|o| o.value.to_sat()).sum();
+    let fee = held.and_then(|h| h.checked_sub(paid));
+    Ok(SilentSpend { tx, fee, height })
 }
 
 /// The coins no transaction spends, largest first.

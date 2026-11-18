@@ -735,6 +735,133 @@ async fn an_abandoned_spend_frees_its_coins() {
     assert_eq!(coins[0].spending, None);
 }
 
+#[tokio::test]
+async fn a_spend_canceled_pays_its_coins_back_in_its_place() {
+    let s = setup().await;
+    s.wallet.watch_silent(HUB, 1).unwrap();
+    let paying = s.pay(&[s.address(), s.address()], &[30_000, 20_000]);
+    s.mine(vec![paying]);
+    s.scan().await.unwrap();
+    let coins: Vec<OutPoint> = s
+        .wallet
+        .silent_coins()
+        .unwrap()
+        .iter()
+        .map(|c| c.outpoint)
+        .collect();
+    let spend = s
+        .wallet
+        .spend_silent(elsewhere(), Some(35_000), rate())
+        .unwrap();
+    let txid = spend.compute_txid();
+    assert_eq!(
+        s.wallet.silent_spender(&coins[0]).unwrap(),
+        Some((txid, None))
+    );
+    let at = |vb: u64| FeeRate::from_sat_per_vb(vb).unwrap();
+    let old_fee = s.wallet.silent_spend(&txid).unwrap().unwrap().fee.unwrap();
+    // At its own rate it pays too little to take its place: what does.
+    let least = s.wallet.replace_silent(&txid, rate()).unwrap();
+    let paid = 50_000 - least.output[0].value.to_sat();
+    assert_eq!(paid, old_fee + least.vsize() as u64);
+    let least_txid = least.compute_txid();
+    let cancel = s.wallet.replace_silent(&least_txid, at(10)).unwrap();
+    assert_signed(&s.chain.lock().unwrap(), &cancel);
+    assert_eq!(cancel.input.len(), 2);
+    assert!(cancel.input.iter().all(|i| spend
+        .input
+        .iter()
+        .any(|o| o.previous_output == i.previous_output)));
+    assert_eq!(cancel.output.len(), 1);
+    let fee = at(10).fee_wu(cancel.weight()).unwrap().to_sat();
+    assert_eq!(cancel.output[0].value.to_sat(), 50_000 - fee);
+    let canceled = cancel.compute_txid();
+    assert_eq!(
+        s.wallet.silent_spends().unwrap(),
+        std::slice::from_ref(&cancel)
+    );
+    assert!(s
+        .wallet
+        .silent_coins()
+        .unwrap()
+        .iter()
+        .all(|c| c.spending == Some(canceled)));
+    let spent = s.wallet.silent_spend(&canceled).unwrap().unwrap();
+    assert_eq!((spent.fee, spent.height), (Some(fee), None));
+    // The spends it took the place of are the coins' no more.
+    for replaced in [txid, least_txid] {
+        let again = s.wallet.replace_silent(&replaced, at(50));
+        assert!(matches!(again, Err(Error::Invalid(_))), "{again:?}");
+    }
+    let unknown = s
+        .wallet
+        .replace_silent(&Txid::from_byte_array([1; 32]), at(50));
+    assert!(
+        matches!(unknown, Err(Error::UnknownPayment(_))),
+        "{unknown:?}"
+    );
+    // Canceled again higher, the cancel is replaced the same way.
+    let higher = s.wallet.replace_silent(&canceled, at(20)).unwrap();
+    let higher_txid = higher.compute_txid();
+    assert_eq!(
+        s.wallet.silent_spends().unwrap(),
+        std::slice::from_ref(&higher)
+    );
+
+    // Mined: its coin back, as change.
+    s.mine(vec![higher.clone()]);
+    let scanned = s.scan().await.unwrap();
+    assert_eq!(scanned.spent.len(), 2);
+    assert_eq!(scanned.found.len(), 1);
+    assert!(scanned.found[0].change);
+    assert_eq!(scanned.found[0].value, higher.output[0].value.to_sat());
+    assert!(s.wallet.silent_spends().unwrap().is_empty());
+    assert_eq!(
+        s.wallet.silent_spender(&coins[0]).unwrap(),
+        Some((higher_txid, Some(4)))
+    );
+    // Its block replaced: the latest cancel is broadcast again.
+    s.chain.lock().unwrap().fork(4);
+    s.chain.lock().unwrap().mine_empty(2);
+    s.scan().await.unwrap();
+    assert_eq!(s.wallet.silent_spends().unwrap(), [higher]);
+    assert_eq!(
+        s.wallet.silent_spender(&coins[0]).unwrap(),
+        Some((higher_txid, None))
+    );
+}
+
+#[tokio::test]
+async fn a_spend_canceled_that_confirms_after_all_gives_its_cancel_up() {
+    let s = setup().await;
+    s.wallet.watch_silent(HUB, 1).unwrap();
+    let paying = s.pay(&[s.address()], &[30_000]);
+    s.mine(vec![paying]);
+    s.scan().await.unwrap();
+    let coin = s.wallet.silent_coins().unwrap()[0].outpoint;
+    let spend = s
+        .wallet
+        .spend_silent(elsewhere(), Some(10_000), rate())
+        .unwrap();
+    let txid = spend.compute_txid();
+    let rate = FeeRate::from_sat_per_vb(10).unwrap();
+    s.wallet.replace_silent(&txid, rate).unwrap();
+    s.mine(vec![spend.clone()]);
+    s.scan().await.unwrap();
+    assert!(s.wallet.silent_spends().unwrap().is_empty());
+    assert_eq!(
+        s.wallet.silent_spender(&coin).unwrap(),
+        Some((txid, Some(4)))
+    );
+    let paid = s.wallet.silent_spends_paying(&elsewhere()).unwrap();
+    assert_eq!(paid.len(), 1);
+    assert_eq!((paid[0].tx.compute_txid(), paid[0].height), (txid, Some(4)));
+    // Its change found, free.
+    let coins = s.wallet.silent_coins().unwrap();
+    assert_eq!(coins.len(), 1);
+    assert!(coins[0].change && coins[0].spending.is_none());
+}
+
 /// A transaction spending another party's coin, then the wallet's coin
 /// `coin`, paying `value` elsewhere, and the coins it spends: a contract's
 /// funding, as far as the wallet sees it.
