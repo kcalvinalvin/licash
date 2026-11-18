@@ -3736,6 +3736,7 @@ dependencies = [
 [[package]]
 name = "lichen-babe"
 version = "0.4.5"
+source = "git+https://github.com/lichenbtc-org/lichen?branch=feat%2Fhub-proves-exit#32d177972603cecd4395ecaa3e4b83c726f4330f"
 dependencies = [
  "anyhow",
  "ark-bn254",
@@ -3782,6 +3783,7 @@ dependencies = [
 [[package]]
 name = "lichen-contract"
 version = "0.4.5"
+source = "git+https://github.com/lichenbtc-org/lichen?branch=feat%2Fhub-proves-exit#32d177972603cecd4395ecaa3e4b83c726f4330f"
 dependencies = [
  "anyhow",
  "bitcoin",
@@ -3806,6 +3808,7 @@ dependencies = [
 [[package]]
 name = "lichen-statement"
 version = "0.1.0"
+source = "git+https://github.com/lichenbtc-org/lichen?branch=feat%2Fhub-proves-exit#32d177972603cecd4395ecaa3e4b83c726f4330f"
 dependencies = [
  "sha2 0.10.9",
 ]

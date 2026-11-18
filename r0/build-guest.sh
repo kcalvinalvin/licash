@@ -49,11 +49,9 @@ if [ "$rustc_commit" != "$pinned_rustc" ] || [ "$gcc_version" != "$pinned_gcc" ]
 fi
 # The guest's sources as the checkout has them, uncommitted changes and
 # all: the root manifest (crates/licash inherits from it), the crates the
-# guest depends on, and the guest; and Lichen's statement crate, fetched
-# into vendor/ at vendor/fetch.sh's pinned revision.
+# guest depends on, and the guest. Lichen's statement crate comes from git,
+# at the revision the guest's Cargo.lock pins, under cargo's directory.
 sources=(Cargo.toml crates/licash crates/licash-hp "r0/$dir")
-lichen=vendor/lichen/crates/statement
-[ -f "$lichen/Cargo.toml" ] || { echo "no $lichen: run vendor/fetch.sh" >&2; exit 1; }
 if [ -n "$(git status --porcelain -- "${sources[@]}")" ]; then
     echo "uncommitted changes in the guest's sources: not a guest to keep" >&2
 fi
@@ -64,8 +62,6 @@ rm -rf "$src"
 mkdir "$src"
 git ls-files -z --cached --others --exclude-standard -- "${sources[@]}" |
     tar --null -T - -cf - | tar -xf - -C "$src"
-mkdir -p "$src/$(dirname "$lichen")"
-cp -R "$lichen" "$src/$lichen"
 export CC_riscv32im_risc0_zkvm_elf="$cc" AR_riscv32im_risc0_zkvm_elf="${cc%gcc}ar"
 export CFLAGS_riscv32im_risc0_zkvm_elf="-march=rv32im -nostdlib -ffile-prefix-map=$src=licash -ffile-prefix-map=$cargo_home=cargo"
 CARGO_ENCODED_RUSTFLAGS="$flags" RISC0_FEATURE_bigint2= RUSTC="$tc/bin/rustc" CARGO_TARGET_DIR="$build/target" \

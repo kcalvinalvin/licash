@@ -5,8 +5,8 @@ edition = "2021"
 license = "MIT"
 publish = false
 description = "licash's recovery contract on Lichen's hub-proves graph"
-# A member of regtest's workspace, not the core one: it pulls Lichen by
-# path, which the core library must not depend on.
+# A member of regtest's workspace, not the core one: it pulls Lichen,
+# which the core library must not depend on.
 workspace = "../../regtest"
 
 [dependencies]
@@ -16,10 +16,10 @@ ark-groth16 = { version = "0.5", default-features = false, features = ["std"] }
 k256 = "0.13"
 licash = { path = "../licash" }
 licash-hp = { path = "../licash-hp" }
-lichen-babe = { path = "../../vendor/lichen/crates/babe" }
+lichen-babe = { git = "https://github.com/lichenbtc-org/lichen", branch = "feat/hub-proves-exit" }
 # as Lichen's workspace takes them
 lichen-btc = { git = "https://github.com/lichenbtc-org/lichen-btc", rev = "d7d2de04f7f8d51b44f61a68c7e1789f36502071" }
 lichen-wots = { git = "https://github.com/lichenbtc-org/lichen-btc", rev = "d7d2de04f7f8d51b44f61a68c7e1789f36502071" }
-lichen-contract = { path = "../../vendor/lichen/crates/contract" }
-lichen-statement = { path = "../../vendor/lichen/crates/statement" }
+lichen-contract = { git = "https://github.com/lichenbtc-org/lichen", branch = "feat/hub-proves-exit" }
+lichen-statement = { git = "https://github.com/lichenbtc-org/lichen", branch = "feat/hub-proves-exit" }
 rand_core = { version = "0.6", features = ["getrandom"] }

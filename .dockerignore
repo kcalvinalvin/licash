@@ -10,8 +10,7 @@
 !crates/licash-onchain
 !crates/licash-swaps
 !crates/licash-wallet
-# The recovery contract, on Lichen as vendor/fetch.sh copies it: run it
-# before building an image.
+# The recovery contract, on Lichen (from git).
 !crates/licash-contract
 # The hub's statement, of the contract and of its recovery.
 !crates/licash-hp
@@ -19,7 +18,6 @@
 !r0/host
 !r0/programs
 !regtest/Cargo.toml
-!vendor/lichen
 !apps
 **/target
 **/tmp

@@ -9,16 +9,16 @@ edition = "2021"
 license = "MIT"
 publish = false
 description = "The Hub's statement for a Licash recovery on Lichen's hub-proves exit"
-# A member of regtest's workspace, as licash-contract: it pulls Lichen by
-# path, which the core library must not depend on.
+# A member of regtest's workspace, as licash-contract: it pulls Lichen,
+# which the core library must not depend on.
 workspace = "../../regtest"
 
 [dependencies]
 licash = { path = "../licash" }
-lichen-statement = { path = "../../vendor/lichen/crates/statement" }
+lichen-statement = { git = "https://github.com/lichenbtc-org/lichen", branch = "feat/hub-proves-exit" }
 sha2 = "0.10"
 
 [dev-dependencies]
 bitcoin = { version = "=0.32.102", default-features = false, features = ["std"] }
 k256 = { version = "0.13", features = ["hash2curve"] }
-lichen-statement = { path = "../../vendor/lichen/crates/statement", features = ["testing"] }
+lichen-statement = { git = "https://github.com/lichenbtc-org/lichen", branch = "feat/hub-proves-exit", features = ["testing"] }

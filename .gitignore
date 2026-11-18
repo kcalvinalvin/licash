@@ -3,6 +3,3 @@ target/
 tmp/
 # Locally built guests (r0/build-guest.sh).
 r0/guests/
-# Copies vendor/fetch.sh makes.
-vendor/lichen/
-vendor/ln-gap/

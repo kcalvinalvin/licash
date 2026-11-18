@@ -1,5 +1,5 @@
 # The recovery contract's crates, a workspace of their own: they pull
-# Lichen by path (vendor/), which the core library must not depend on.
+# Lichen, which the core library must not depend on.
 # The contract is played on Bitcoin by the hub service's tests
 # (apps/hub/tests/contracts.rs, run.sh here).
 [workspace]

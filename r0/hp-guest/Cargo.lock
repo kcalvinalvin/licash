@@ -994,6 +994,7 @@ dependencies = [
 [[package]]
 name = "lichen-statement"
 version = "0.1.0"
+source = "git+https://github.com/lichenbtc-org/lichen?branch=feat%2Fhub-proves-exit#32d177972603cecd4395ecaa3e4b83c726f4330f"
 dependencies = [
  "sha2",
 ]
