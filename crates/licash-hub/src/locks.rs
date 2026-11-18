@@ -551,6 +551,11 @@ impl Hub {
     /// Refund lock `id`, of which the hub gets `amount`, at once: its
     /// forward failed for `reason`, recorded in the same transaction if
     /// `new`.
+    ///
+    /// Safe before expiry only because a forward's lock pays the hub: its
+    /// Pay output is the hub's own, which no holder's claim can name, so a
+    /// holder can't be owed that Pay on Bitcoin after this refund. A lock
+    /// whose Pay a holder owns is refunded only once expired at depth.
     pub(crate) fn refund_failed(
         &self,
         id: &ProposalId,
