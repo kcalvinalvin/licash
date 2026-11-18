@@ -250,6 +250,10 @@ those under way are finished. The consent keeps the exit margin given with
 it; saving a new margin gives it again. While any contract protects notes
 the periodic job looks every 15 minutes or so, and a disputed forced close
 notifies her to keep the app online until its challenge window passes.
+A lock of her notes at a hub where a contract protects them expires early
+enough for that forced close to claim its refund should the hub never
+settle it; a payment needing a later expiry (near the contract's end) is
+refused there until a contract lasting longer protects her notes.
 
 A counterpart on the command line:
 

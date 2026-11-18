@@ -16,6 +16,7 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::Path;
 use std::str::FromStr;
+use std::sync::Arc;
 
 use anyhow::{anyhow, ensure, Context as _, Result};
 use bitcoin::FeeRate;
@@ -84,6 +85,47 @@ pub fn consent_to<T: Transport>(
     ensure!(exit_margin > 0, "an exit margin of no blocks");
     store.consent_to_exit(&address, exit_margin)?;
     consent(dir)?.context("consent not kept")
+}
+
+/// Keep the locks `wallet` makes at a hub claimable on Bitcoin by her
+/// contracts there in `dir` ([`Wallet::guard_locks`]), as
+/// [`lock_horizon`] says.
+pub fn guard_locks<T: Transport>(wallet: &Wallet<T>, dir: &Path) {
+    let (seed, network) = (wallet.contract_secrets().seed, wallet.network());
+    let dir = dir.to_path_buf();
+    wallet.guard_locks(Arc::new(move |urls: &[String], tip: u32| {
+        lock_horizon(&seed, network, &dir, urls, tip).map_err(|e| format!("{e:#}"))
+    }));
+}
+
+/// The block by which a lock at the hub of `urls` must have expired at
+/// depth, at `tip`, for the forced close of one of her contracts there in
+/// `dir` to claim its refund: the latest of those her exit plans ([`drive`],
+/// a close takes only the refunds owed as it starts). Planned with her
+/// consent's margin, or none without it: she forces it herself then, as
+/// late as she may. None if no contract protects notes there.
+fn lock_horizon(
+    seed: &[u8; 32],
+    network: ChainProfile,
+    dir: &Path,
+    urls: &[String],
+    tip: u32,
+) -> Result<Option<u32>> {
+    let Some(store) = Store::existing(dir)? else {
+        return Ok(None);
+    };
+    let recovering: HashSet<[u8; 32]> = store.recoveries()?.iter().map(|r| r.id).collect();
+    let margin = consent(dir)?.map_or(0, |c| c.exit_margin);
+    let day = blocks_a_day(network);
+    let mut horizon = None;
+    for c in
+        (store.list()?.iter()).filter(|c| c.at(urls) && c.live(tip) && !recovering.contains(&c.id))
+    {
+        let s = safety::of_seed(seed, network, dir, &c.id, tip, (margin, TIMEOUT_SLACK))?;
+        let (_, force_at) = deadlines(s.request_by.unwrap_or(0), day);
+        horizon = horizon.max(Some(force_at));
+    }
+    Ok(horizon)
 }
 
 /// Revoke her consent: no step more is taken. Those under way go on.

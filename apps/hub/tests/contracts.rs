@@ -1702,8 +1702,10 @@ async fn a_force_close_claims_an_unsettled_locks_refund_once_expired_at_depth() 
     let chain = Node(source.clone());
     let (mine, wallet) =
         holder_wallet(&rt, &chain, dir.path(), &url, [17; 32], &[60_000, 50_000]).await?;
+    // Long enough for her exit to close it after the lock's refund is owed.
     let chosen = Ask {
         cap: Some(10_000),
+        blocks: 1_000,
         ..ask()
     };
     let opened = holder::open(&wallet, &chain, &mine, &url, chosen).await?;
@@ -1720,6 +1722,14 @@ async fn a_force_close_claims_an_unsettled_locks_refund_once_expired_at_depth() 
     let expiry = rt.height()? + 6;
     let bob = licash::address::OwnerKeys::from_seed(&[0xbb; 32])?.address();
     let hash = licash::spend::lock_hash(&[7; 32]);
+    // One owed its refund only after her contract closes is refused.
+    let late =
+        (holder::list(&mine)?.iter().map(|c| c.assert_height).max()).context("no contract")?;
+    let refused = wallet.lock(&url, &bob, 1_000, hash, Some(late)).await;
+    ensure!(
+        matches!(&refused, Err(licash_wallet::Error::Invalid(why)) if why.contains("unprotected")),
+        "{refused:?}"
+    );
     let lock = wallet.lock(&url, &bob, 1_000, hash, Some(expiry)).await?;
     ensure!(lock.state == licash_wallet::LockState::Locked, "{lock:?}");
     let left = available(&wallet)?;

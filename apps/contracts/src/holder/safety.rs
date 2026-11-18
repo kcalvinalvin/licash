@@ -2,6 +2,7 @@
 //! timeout must win promptly on chain for the planned exit time to hold.
 
 use anyhow::{Context as _, Result};
+use licash::spend::ChainProfile;
 use licash_contract::opening::{Context, Holder};
 use licash_wallet::{Transport, Wallet};
 
@@ -62,14 +63,28 @@ pub fn of<T: Transport>(
     exit_margin: u32,
     timeout_slack: u32,
 ) -> Result<Safety> {
+    let seed = wallet.contract_secrets().seed;
+    let terms = (exit_margin, timeout_slack);
+    of_seed(&seed, wallet.network(), dir, id, tip, terms)
+}
+
+/// As [`of`], by the wallet's contract seed and network: its exit margin
+/// and timeout slack in `planned`.
+pub(super) fn of_seed(
+    seed: &[u8; 32],
+    network: ChainProfile,
+    dir: &std::path::Path,
+    id: &[u8; 32],
+    tip: u32,
+    (exit_margin, timeout_slack): (u32, u32),
+) -> Result<Safety> {
     let store = Store::existing(dir)?.context("no contracts")?;
     let (state, _) = store.state(id)?;
-    let secrets = wallet.contract_secrets();
     let ctx = Context {
         tip,
-        trust: crate::trust(wallet.network())?,
+        trust: crate::trust(network)?,
     };
-    let holder = Holder::load(&state, &secrets.seed, &ctx)?;
+    let holder = Holder::load(&state, seed, &ctx)?;
     let opening = holder.signed()?;
     let graph = &opening.base.parts().graph;
     Ok(Safety::new(

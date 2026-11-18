@@ -84,10 +84,13 @@ pub fn abusive(fees: &Fees, range: Option<&ContractRange>) -> Option<String> {
 /// a hub that protect notes at `tip` (all whose F is buried, if the tip is
 /// not known), the least of each fee they opened under or she approved
 /// since. No ceilings at a hub with no such contract, or whose contracts
-/// were opened before any were kept: nothing is refused there. To call as
+/// were opened before any were kept: nothing is refused there. Its locks
+/// kept claimable as [`super::exit::guard_locks`] says. To call as
 /// the wallet opens, and whenever its contracts changed ([`super::resume`]
 /// and [`approve`] do).
 pub fn agree<T: Transport>(wallet: &Wallet<T>, dir: &Path, tip: Option<u32>) -> Result<()> {
+    // Its locks too: what keeps them claimable reads the contracts afresh.
+    super::exit::guard_locks(wallet, dir);
     let (contracts, ceilings) = match Store::existing(dir)? {
         Some(store) => (store.list()?, store.ceilings()?),
         None => return Ok(()),
