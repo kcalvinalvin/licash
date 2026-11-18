@@ -811,9 +811,14 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
                 .context("unknown fee coin")?;
             Ok(Some((coin.outpoint, output)))
         });
+        // What one coin more must hold, of R's own paying too little: its
+        // shortfall, the coin's input's fee and its change's dust limit.
+        let mut needed = None;
         for coin in std::iter::once(Ok(None)).chain(coins) {
+            let coin = coin?;
+            let alone = coin.is_none();
             let mut inputs = base.clone();
-            inputs.extend(coin?);
+            inputs.extend(coin);
             let prevouts: Vec<_> = inputs.iter().map(|(_, out)| out.clone()).collect();
             let total: Amount = prevouts.iter().map(|out| out.value).sum();
             let mut p = self.o.publication(
@@ -850,6 +855,10 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
                 .context("request package fee")?;
             let fee = own.max(package.checked_sub(r_fee).unwrap_or(Amount::ZERO));
             let Some(left) = total.checked_sub(fee_coin.value + fee) else {
+                if alone {
+                    let input = self.rate.fee_vb(58).context("input fee")?;
+                    needed = Some(fee_coin.value + fee + input - total + DUST);
+                }
                 continue;
             };
             if left >= DUST {
@@ -864,9 +873,10 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
             p.input[0].witness = final_carrier.input[0].witness.clone();
             return Ok((p, prevouts));
         }
+        let needed = needed.map_or(0, |n| n.to_sat());
         bail!(
             "too little of hers on Bitcoin to pay her request's fees: \
-             sats needed in one coin, her largest {most} sat"
+             about {needed} sat needed in one coin, her largest {most} sat"
         )
     }
     fn sign(&self, state: &mut State) -> Result<Next> {

@@ -729,6 +729,14 @@ async fn a_holder_adds_one_coin_to_her_purse_where_fees_run_past_it() -> Result<
     );
     let why = short.error.clone().context("no error")?;
     ensure!(why.contains("too little of hers on Bitcoin"), "{why}");
+    // How much more, in sats: some, and less than the coin she gets next.
+    let needed: u64 = why
+        .split("about ")
+        .nth(1)
+        .and_then(|rest| rest.split(' ').next())
+        .and_then(|n| n.parse().ok())
+        .context("no sats needed said")?;
+    ensure!(needed > 0 && needed < 200_000, "{why}");
 
     // A coin of hers: R's slot, anchor and purse, and that coin alone.
     let (coin, _) = rt.fund(
