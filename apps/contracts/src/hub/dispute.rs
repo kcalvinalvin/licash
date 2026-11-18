@@ -36,6 +36,7 @@ use licash_contract::dispute::{self, presign, Payout};
 use licash_contract::graph;
 use licash_contract::graph::{link_args, HubProves};
 use licash_contract::opening::{Hub, HubOpening};
+use licash_onchain::deadline;
 use licash_wallet::first_spend;
 use lichen_contract::Role;
 use sha2::{Digest, Sha256};
@@ -452,7 +453,12 @@ impl Openings {
             let program = o.base.parts().recipe.program;
             prover.commit(id, program, deadline, release, cycles, false, false, tip);
         }
-        self.post(&response).await;
+        let window = (r_at, respond_deadline(o, r_at));
+        let unit = Amount::from_sat(o.base.parts().graph.unit_sats);
+        let stake = unit * u64::from(b.saturating_sub(decided.owed));
+        let prevout = &r.output[0];
+        self.post_link(id, hub, "respond", &response, prevout, window, stake, tip)
+            .await?;
         // Its disclosure with it: the statement wants the contract's work
         // on top of both, within the assertion window.
         self.disclose(id, hub, o, &decided.disclosures).await?;
@@ -526,8 +532,18 @@ impl Openings {
     ) -> Result<Played> {
         let tag = tagged(id, b"assert");
         let pins = Responses::open(&self.data)?;
+        // Missing its deadline pays her claim and the hub's reserve.
+        let (b, _) = o.requested_b(r)?;
+        let (responded, _) = HubProves::responded_b(x)?;
+        let unit = Amount::from_sat(o.base.parts().graph.unit_sats);
+        let stake = unit * u64::from(b.saturating_sub(responded)) + o.babe.spec.terms.reserve_hub;
+        let window = (x_at, assert_deadline(o, x_at));
+        let post = |tx: Transaction| async move {
+            self.post_link(id, hub, "assert", &tx, &x.output[0], window, stake, tip)
+                .await
+        };
         if let Some(tx) = pins.response(&tag)? {
-            self.post(&tx).await;
+            post(tx).await?;
             return Ok(Played::Posted("assert"));
         }
         let journal = graph::journal(&o.base);
@@ -545,7 +561,7 @@ impl Openings {
             "the proof does not verify for this contract"
         );
         let tx = pins.answer(&tag, r, || o.assert(hub.keys(), &proof))?;
-        self.post(&tx).await;
+        post(tx).await?;
         Ok(Played::Posted("assert"))
     }
 
@@ -842,40 +858,213 @@ impl Openings {
                     .fee_vb(size * 2)
                     .context("fee overflow")?
                     .max(Amount::from_sat(330));
-                let network = self.source.network().await?;
-                let address = bitcoin::Address::from_script(&script, network)?;
-                let txid: String = self
-                    .wallet
-                    .rpc(
-                        "sendtoaddress",
-                        serde_json::json!([address.to_string(), value.to_btc()]),
-                    )
-                    .await
-                    .context("fund a fee coin")?;
-                let funded: serde_json::Value = self
-                    .wallet
-                    .rpc("gettransaction", serde_json::json!([txid, false, true]))
-                    .await?;
-                let raw: Transaction = bitcoin::consensus::encode::deserialize_hex(
-                    funded["hex"].as_str().context("no fee coin transaction")?,
-                )?;
-                let vout = raw
-                    .output
-                    .iter()
-                    .position(|o| o.script_pubkey == script)
-                    .context("no fee coin output")?;
-                let coin = (
-                    OutPoint {
-                        txid: raw.compute_txid(),
-                        vout: vout as u32,
-                    },
-                    raw.output[vout].clone(),
-                );
+                let coin = self.fund_coin(&script, value).await?;
                 // Kept at once: a restart pays with this one, not another.
                 self.store().keep_fee_coin(id, name, &coin)?
             }
         };
         dispute::add_fee(tx, prevout, coin, key)
+    }
+
+    /// A coin of `value` paying `script`, from the hub's wallet.
+    async fn fund_coin(&self, script: &ScriptBuf, value: Amount) -> Result<(OutPoint, TxOut)> {
+        let network = self.source.network().await?;
+        let address = bitcoin::Address::from_script(script, network)?;
+        let txid: String = self
+            .wallet
+            .rpc(
+                "sendtoaddress",
+                serde_json::json!([address.to_string(), value.to_btc()]),
+            )
+            .await
+            .context("fund a fee coin")?;
+        let funded: serde_json::Value = self
+            .wallet
+            .rpc("gettransaction", serde_json::json!([txid, false, true]))
+            .await?;
+        let raw: Transaction = bitcoin::consensus::encode::deserialize_hex(
+            funded["hex"].as_str().context("no fee coin transaction")?,
+        )?;
+        let vout = raw
+            .output
+            .iter()
+            .position(|o| &o.script_pubkey == script)
+            .context("no fee coin output")?;
+        Ok((
+            OutPoint {
+                txid: raw.compute_txid(),
+                vout: vout as u32,
+            },
+            raw.output[vout].clone(),
+        ))
+    }
+
+    /// Post link `name` of contract `id`, presigned at its floor, spending
+    /// `prevout`, to be in a block by `deadline`, the last tip it confirms
+    /// in time from, its window open since `opened`: with its fee child
+    /// ([`dispute::link_child`]) while the rate [`deadline::rate`] gives
+    /// for the blocks left is above its floor, made again at a higher one,
+    /// in place of the one before, as the deadline nears. The pair pays
+    /// `stake` at most, what missing the deadline costs the hub: past it,
+    /// the operator is told, as when the link is in no block halfway
+    /// through its window. The child's fee coins come from the hub's
+    /// wallet, each kept before it is used; the child is kept before it is
+    /// broadcast. Whether the node took the link.
+    #[allow(clippy::too_many_arguments)]
+    async fn post_link(
+        &self,
+        id: &[u8; 32],
+        hub: &Hub,
+        name: &'static str,
+        link: &Transaction,
+        prevout: &TxOut,
+        (opened, deadline): (u32, u32),
+        stake: Amount,
+        tip: u32,
+    ) -> Result<bool> {
+        if tip >= opened.saturating_add(deadline.saturating_sub(opened) / 2) && self.once(id, name)
+        {
+            self.alert(&format!(
+                "contract {}: its {name} is in no block halfway to its deadline, block \
+                 {deadline} (now {tip}): its fee is raised as the deadline nears",
+                crate::hex_id(id)
+            ));
+        }
+        let left = deadline.saturating_sub(tip);
+        let estimate = self
+            .source
+            .fee_rate(deadline::target(left))
+            .await
+            .ok()
+            .flatten();
+        // Without an estimate, as `fee_rate`'s: 2 sat/vB.
+        let floor = FeeRate::from_sat_per_vb_u32(if estimate.is_some() { 1 } else { 2 });
+        let mut rate = deadline::rate(estimate, floor, left);
+        let paid: Amount = link.output.iter().map(|o| o.value).sum();
+        let link_fee = prevout
+            .value
+            .checked_sub(paid)
+            .context("a link paying out more")?;
+        let old = self.store().child(id, name)?;
+        let one = FeeRate::from_sat_per_vb_u32(1);
+        if rate <= one && old.is_none() {
+            return Ok(self.post(link).await);
+        }
+        // The coins a child may spend: any while none was made; then those
+        // the last one spent and those in a block (a replacement spends no
+        // other unconfirmed coin, BIP125).
+        let mut usable = Vec::new();
+        let kept = self.store().link_coins(id, name)?;
+        let waiting = kept.len();
+        for coin in kept {
+            let spent_before = old
+                .as_ref()
+                .is_some_and(|old| old.input.iter().any(|i| i.previous_output == coin.0));
+            if old.is_none() || spent_before || self.unspent(coin.0, false).await? {
+                usable.push(coin);
+            }
+        }
+        let link_vb = link.vsize() as u64;
+        let pair = |inputs: usize, rate: FeeRate| {
+            let fee = rate
+                .fee_vb(link_vb + child_vb(inputs))
+                .unwrap_or(Amount::MAX);
+            fee.checked_sub(link_fee).unwrap_or(Amount::ZERO)
+        };
+        // At most the stake, the link's fee among it.
+        let inputs = usable.len().max(1) + 1;
+        let most = stake.to_sat().saturating_add(link_fee.to_sat()) * 1_000
+            / ((link_vb + child_vb(inputs)) * 4).max(1);
+        let most = FeeRate::from_sat_per_kwu(most);
+        if rate > most {
+            let capped = match name {
+                "respond" => "respond capped",
+                _ => "assert capped",
+            };
+            if self.once(id, capped) {
+                self.alert(&format!(
+                    "contract {}: its {name} would pay {rate} to be in a block by block \
+                     {deadline} (now {tip}), more than the {stake} at stake: it pays {most}",
+                    crate::hex_id(id)
+                ));
+            }
+            rate = most;
+        }
+        let have: Amount = usable.iter().map(|c| c.1.value).sum();
+        // One coin more, for twice the rate too, the stake at most: unless
+        // one funded already waits for a block.
+        let waiting = waiting > usable.len();
+        if have < pair(inputs, rate) && !waiting {
+            let value = pair(
+                inputs + 1,
+                FeeRate::from_sat_per_kwu(rate.to_sat_per_kwu() * 2),
+            )
+            .checked_sub(have)
+            .unwrap_or(Amount::ZERO)
+            .clamp(Amount::from_sat(1_000), stake.max(Amount::from_sat(1_000)));
+            let key = &hub.keys().party.payment;
+            let coin = self.fund_coin(&dispute::fee_script(key)?, value).await?;
+            self.store().keep_link_coin(id, name, &coin)?;
+            if old.is_none() {
+                usable.push(coin);
+            }
+        }
+        let change = match &old {
+            Some(old) => old.output[0].script_pubkey.clone(),
+            None => self.payout_script().await?,
+        };
+        let key = &hub.keys().party.payment;
+        let sign = |tx: &mut Transaction, prevouts: &[TxOut]| {
+            (0..tx.input.len()).try_for_each(|i| dispute::sign_fee_input(key, tx, i, prevouts))
+        };
+        let build = |rate| dispute::link_child(link, link_fee, &usable, change.clone(), rate, sign);
+        let child = match (build(rate), &old) {
+            (Ok(child), None) => Some(child),
+            (Ok(child), Some(old)) => {
+                let coins = self.store().link_coins(id, name)?;
+                let fee = |tx: &Transaction| child_fee(tx, &link.output, &coins);
+                let (new, before) = (fee(&child), fee(old));
+                if new <= before {
+                    None
+                } else if deadline::replaces(new, child.vsize() as u64, before) {
+                    Some(child)
+                } else {
+                    // The least that replaces it, as a rate of the pair.
+                    let least = before.to_sat() + child.vsize() as u64 + link_fee.to_sat();
+                    let weight = (link_vb + child.vsize() as u64) * 4;
+                    let least = FeeRate::from_sat_per_kwu((least * 1_000).div_ceil(weight));
+                    build(least)
+                        .ok()
+                        .filter(|c| deadline::replaces(fee(c), c.vsize() as u64, before))
+                }
+            }
+            // Its coins short until the one funded is in a block.
+            (Err(e), _) => {
+                tracing::debug!(id = %crate::hex_id(id), "{name}'s child waits: {e:#}");
+                None
+            }
+        };
+        let child = match child {
+            Some(child) => {
+                self.store().keep_child(id, name, &child)?;
+                tracing::info!(
+                    id = %crate::hex_id(id), txid = %child.compute_txid(), %rate,
+                    "{name}'s fee child made"
+                );
+                child
+            }
+            None => match old {
+                Some(old) => old,
+                None => return Ok(self.post(link).await),
+            },
+        };
+        match self.source.broadcast_package(&[link.clone(), child]).await {
+            Ok(_) => Ok(true),
+            Err(e) => {
+                tracing::debug!(txid = %link.compute_txid(), "not broadcast yet: {e:#}");
+                Ok(false)
+            }
+        }
     }
 
     /// A payout ended the exit: the hub's outputs of it, swept to its
@@ -1134,6 +1323,37 @@ impl Openings {
 /// How many blocks before an assertion's deadline its operator is told
 /// its proof is not made.
 const NEAR: u32 = 6;
+
+/// About the virtual size of a link's fee child of `inputs` inputs, each
+/// a script spend of the hub's fee key, and one output.
+fn child_vb(inputs: usize) -> u64 {
+    54 + 76 * inputs as u64
+}
+
+/// The fee of `child`, spending the anchor of a link of `outputs` and some
+/// of `coins`.
+fn child_fee(child: &Transaction, outputs: &[TxOut], coins: &[(OutPoint, TxOut)]) -> Amount {
+    let anchor = outputs
+        .get(dispute::ANCHOR_VOUT as usize)
+        .map_or(Amount::ZERO, |o| o.value);
+    let spent: Amount = coins
+        .iter()
+        .filter(|c| child.input.iter().any(|i| i.previous_output == c.0))
+        .map(|c| c.1.value)
+        .sum();
+    let paid: Amount = child.output.iter().map(|o| o.value).sum();
+    (anchor + spent).checked_sub(paid).unwrap_or(Amount::ZERO)
+}
+
+/// The last tip at which the hub's response, broadcast, still confirms
+/// before her `request_timeout`, `w_h` blocks after her request at `r_at`:
+/// `deadline_margin` blocks to confirm in.
+fn respond_deadline(o: &HubOpening, r_at: u32) -> u32 {
+    let g = &o.base.parts().graph;
+    r_at.saturating_add(u32::from(g.response_window))
+        .saturating_sub(1)
+        .saturating_sub(g.deadline_margin)
+}
 
 /// The last tip at which the hub's assertion, broadcast, still confirms
 /// before her `respond_timeout`, `w_a` blocks after its response at

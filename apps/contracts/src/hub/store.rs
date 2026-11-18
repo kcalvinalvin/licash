@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, ensure, Context, Result};
 use bitcoin::consensus::{deserialize, serialize};
-use bitcoin::{OutPoint, TxOut};
+use bitcoin::{OutPoint, Transaction, TxOut};
 use licash_api::Fees;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
@@ -70,12 +70,23 @@ CREATE TABLE IF NOT EXISTS fee_coins (
     output BLOB NOT NULL,
     PRIMARY KEY (id, name)
 ) STRICT;
+CREATE TABLE IF NOT EXISTS children (
+    id BLOB NOT NULL REFERENCES openings (id),
+    name TEXT NOT NULL,
+    tx BLOB NOT NULL,
+    PRIMARY KEY (id, name)
+) STRICT;
 CREATE TABLE IF NOT EXISTS ended (
     id BLOB PRIMARY KEY REFERENCES openings (id),
     height INTEGER NOT NULL,
     created_at INTEGER NOT NULL
 ) STRICT;
 ";
+
+/// The name of fee coin `n` of link `name`'s child, among the terminals'.
+fn link_coin(name: &str, n: &str) -> String {
+    format!("{name}/child/{n}")
+}
 
 /// An opening as stored.
 pub(super) struct Row {
@@ -334,6 +345,67 @@ impl Store {
         self.fee_coin(id, name)?.context("no fee coin kept")
     }
 
+    /// The fee coins kept for the child of link `name` of opening `id`,
+    /// in the order kept ([`Store::keep_link_coin`]).
+    pub fn link_coins(&self, id: &[u8; 32], name: &str) -> Result<Vec<(OutPoint, TxOut)>> {
+        if !self.has("fee_coins")? {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.0.prepare(
+            "SELECT outpoint, output FROM fee_coins
+             WHERE id = ?1 AND substr(name, 1, length(?2)) = ?2 ORDER BY rowid",
+        )?;
+        let rows = stmt.query_map(params![id, link_coin(name, "")], |r| {
+            Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?))
+        })?;
+        rows.map(|row| {
+            let (op, out) = row?;
+            Ok((deserialize(&op)?, deserialize(&out)?))
+        })
+        .collect()
+    }
+
+    /// Keep `coin` as one more fee coin of link `name`'s child: the coins
+    /// kept for it, `coin` last.
+    pub fn keep_link_coin(
+        &self,
+        id: &[u8; 32],
+        name: &str,
+        coin: &(OutPoint, TxOut),
+    ) -> Result<Vec<(OutPoint, TxOut)>> {
+        let n = self.link_coins(id, name)?.len();
+        self.keep_fee_coin(id, &link_coin(name, &n.to_string()), coin)?;
+        self.link_coins(id, name)
+    }
+
+    /// The fee child of link `name` of opening `id` last made, if any.
+    pub fn child(&self, id: &[u8; 32], name: &str) -> Result<Option<Transaction>> {
+        if !self.has("children")? {
+            return Ok(None);
+        }
+        let tx: Option<Vec<u8>> = self
+            .0
+            .query_row(
+                "SELECT tx FROM children WHERE id = ?1 AND name = ?2",
+                params![id, name],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(tx.map(|tx| deserialize(&tx)).transpose()?)
+    }
+
+    /// Keep `tx` as link `name`'s fee child, in place of the one before:
+    /// kept before it is broadcast.
+    pub fn keep_child(&self, id: &[u8; 32], name: &str, tx: &Transaction) -> Result<()> {
+        self.0.execute_batch(RESPONDER)?;
+        self.0.execute(
+            "INSERT INTO children (id, name, tx) VALUES (?1, ?2, ?3)
+             ON CONFLICT (id, name) DO UPDATE SET tx = excluded.tx",
+            params![id, name, serialize(tx)],
+        )?;
+        Ok(())
+    }
+
     /// Whether table `name` was made.
     fn has(&self, name: &str) -> Result<bool> {
         Ok(self
@@ -542,6 +614,49 @@ mod tests {
         let store = Store::open(data.path())?;
         ensure!(store.fee_coin(&[1; 32], "default")? == Some(coin(7)));
         ensure!(store.signed_ids()? == vec![[2; 32]]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_links_fee_coins_add_up_and_its_child_is_the_last_made() -> Result<()> {
+        let data = tempfile::tempdir()?;
+        let store = Store::open(data.path())?;
+        let id = [1; 32];
+        let coin = |n: u8| {
+            (
+                OutPoint {
+                    txid: bitcoin::hashes::Hash::from_byte_array([n; 32]),
+                    vout: 1,
+                },
+                TxOut {
+                    value: bitcoin::Amount::from_sat(1_000 * u64::from(n)),
+                    script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![0x51, 0x20, n]),
+                },
+            )
+        };
+        ensure!(store.insert(&id, 0, true, &coin(9).0, &[0; 32], b"state")?);
+        ensure!(
+            store.link_coins(&id, "assert")?.is_empty() && store.child(&id, "assert")?.is_none()
+        );
+        // A terminal's coin is none of a link's.
+        store.keep_fee_coin(&id, "assert_timeout", &coin(5))?;
+        ensure!(store.keep_link_coin(&id, "assert", &coin(1))? == vec![coin(1)]);
+        ensure!(store.keep_link_coin(&id, "assert", &coin(2))? == vec![coin(1), coin(2)]);
+        ensure!(store.keep_link_coin(&id, "respond", &coin(3))? == vec![coin(3)]);
+        let tx = |n: u32| Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::from_consensus(n),
+            input: vec![],
+            output: vec![],
+        };
+        store.keep_child(&id, "assert", &tx(1))?;
+        store.keep_child(&id, "assert", &tx(2))?;
+        drop(store);
+        let store = Store::open(data.path())?;
+        ensure!(store.child(&id, "assert")? == Some(tx(2)));
+        ensure!(store.child(&id, "respond")?.is_none());
+        ensure!(store.link_coins(&id, "assert")? == vec![coin(1), coin(2)]);
+        ensure!(store.fee_coin(&id, "assert_timeout")? == Some(coin(5)));
         Ok(())
     }
 

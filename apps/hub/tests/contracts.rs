@@ -1381,6 +1381,43 @@ fn paid_its_way(rt: &Regtest, txid: &bitcoin::Txid) -> Result<()> {
     Ok(())
 }
 
+/// The fee of `tx`, of transactions the node has.
+fn fee_of(rt: &Regtest, tx: &bitcoin::Transaction) -> Result<u64> {
+    let mut spent = 0;
+    for input in &tx.input {
+        let prev = rt.get_tx(&input.previous_output.txid)?;
+        spent += prev.output[input.previous_output.vout as usize]
+            .value
+            .to_sat();
+    }
+    Ok(spent - tx.output.iter().map(|o| o.value.to_sat()).sum::<u64>())
+}
+
+/// That link `txid` confirmed with its poster's fee child, spending its
+/// anchor (output 1) in its block, the pair paying `rate` sat/vB at least:
+/// as the hub posts a link at 2 sat/vB without an estimate, as on regtest.
+fn paid_with_child(rt: &Regtest, txid: &bitcoin::Txid, rate: u64) -> Result<()> {
+    let link = rt.get_tx(txid)?;
+    let at = rt.confirmations(txid)?.context("unconfirmed")?;
+    let anchor = bitcoin::OutPoint {
+        txid: *txid,
+        vout: 1,
+    };
+    let child = rt
+        .block_txs(at)?
+        .into_iter()
+        .find(|tx| tx.input.iter().any(|i| i.previous_output == anchor))
+        .with_context(|| format!("no fee child of {txid} in block {at}"))?;
+    let fee = fee_of(rt, &link)? + fee_of(rt, &child)?;
+    let vsize = (link.vsize() + child.vsize()) as u64;
+    eprintln!("{txid} and its child: {vsize} vB, {fee} sat");
+    ensure!(
+        fee >= rate * vsize,
+        "{txid} and its child pay {fee} sat for {vsize} vB"
+    );
+    Ok(())
+}
+
 /// The stale claim's request and publication buried, the hub not playing
 /// and her timeout not posted: the block her response timeout is valid
 /// from, then mined past, her wallet offline.
@@ -1429,8 +1466,12 @@ async fn a_hubs_answer_can_confirm_after_its_response_window() -> Result<()> {
     ensure!(done.assertion.is_some() && done.proved, "{done:?}");
     ensure!(done.corrected == Some(4_096), "{done:?}");
     ensure!(done.payout.is_some() && done.timeout.is_none(), "{done:?}");
-    // The hub's assertion relayed and confirmed at its presigned fee.
-    paid_its_way(&s.rt, &done.assertion.context("no assertion")?)?;
+    // The hub's response and assertion relayed and confirmed at their
+    // presigned fee, with a fee child each.
+    let assertion = done.assertion.context("no assertion")?;
+    paid_its_way(&s.rt, &assertion)?;
+    paid_with_child(&s.rt, &x, 2)?;
+    paid_with_child(&s.rt, &assertion, 2)?;
     Ok(())
 }
 
