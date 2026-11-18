@@ -298,7 +298,6 @@ async fn paid_through_provider(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
 async fn donated(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     use bitcoin::bech32;
 
-    let before = phone.balance().await?;
     let terms = eco.swaps_info().await?.donations;
     let terms = terms.context("the provider takes no donations")?;
     let code: PaymentCode = phone.code().await?.parse()?;
@@ -326,6 +325,8 @@ async fn donated(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     phone.home(30).await?;
 
     // Stopped, the app is paid as LNURL-pay has it.
+    // Read the balance here so optimization during navigation is accounted for.
+    let before = phone.balance().await?;
     phone
         .shell(&format!("am force-stop {}", licash_e2e::phone::PACKAGE))
         .await?;
@@ -350,7 +351,7 @@ async fn donated(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     let now = changed(phone, before, 120).await?;
     ensure!(
         now == before + gets,
-        "{now} held after a donation of {donated}, {gets} expected"
+        "{now} held after a donation of {donated}, expected {before} + {gets}"
     );
     Ok(())
 }
