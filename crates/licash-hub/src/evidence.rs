@@ -35,7 +35,7 @@ impl Hub {
     /// refuses an expiry, so the dispute drops it). Ordered by proposal, then
     /// source. A spend the ledger can no longer read back (its keyset gone)
     /// is left out. Then each other claim on Bitcoin of any of its notes
-    /// ([`Hub::hold_claimed`]).
+    /// ([`Hub::retire_claimed`]).
     pub fn evidence(&self, claim: &UnsignedClaim) -> Result<Vec<Evidence>, Error> {
         let parts = claim.parts();
         let mut ys = Vec::new();
