@@ -43,22 +43,31 @@ pub async fn close<T: Transport, C: Chain>(
         store.recovery(id)?.is_none(),
         "forced closed already: its recovery goes on"
     );
-    ensure!(
-        contract.fate == Some(Fate::Live),
-        "its F is not buried in the chain yet"
-    );
     let tip = chain.height().await.map_err(|e| anyhow!(e))?;
     ensure!(
         tip < contract.close_height,
         "past its close: the hub's default pays her reserve"
     );
-    let (state, _) = store.state(id)?;
+    let (state, since) = store.state(id)?;
     let secrets = wallet.contract_secrets();
     let context = Context {
         tip,
         trust: crate::trust(wallet.network())?,
     };
-    let o = Holder::load(&state, &secrets.seed, &context)?.signed()?;
+    let holder = Holder::load(&state, &secrets.seed, &context)?;
+    // As the chain says now, not as last seen: buried since, say.
+    let mut fate = contract.fate;
+    if fate != Some(Fate::Live) {
+        if let Some(now) = super::chain::fate(&holder, chain, since).await? {
+            store.set_fate(id, now)?;
+            fate = Some(now);
+        }
+    }
+    ensure!(
+        fate == Some(Fate::Live),
+        "its F is not buried in the chain yet"
+    );
+    let o = holder.signed()?;
     let key = HolderKeys::derive(&secrets.seed, &o.base.parts().nonce)
         .party
         .payment;

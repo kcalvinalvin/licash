@@ -921,6 +921,32 @@ async fn a_hub_ends_a_contract_no_one_exited_by_default_at_its_close() -> Result
 /// fold pays her reserve to her wallet at once, the rest to the hub's less
 /// the fee, and the contract protects nothing from then on. The hub's
 /// watcher takes the fold as the contract's end, and posts no default.
+/// Closed early as soon as its F is buried, her wallet not told so
+/// before: the close looks at the chain itself.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs bitcoind and a release build"]
+async fn a_holder_closes_a_contract_buried_since_she_last_looked() -> Result<()> {
+    let rt = Regtest::start_standard()?;
+    let dir = tempfile::tempdir()?;
+    let (url, source, _, _openings) = hub_answering(&rt, &dir.path().join("hub")).await?;
+    let chain = Node(source);
+    let (mine, wallet) = holder_wallet(&rt, &chain, dir.path(), &url, [33; 32], &[60_000]).await?;
+    let opened = holder::open(&wallet, &chain, &mine, &url, ask()).await?;
+    ensure!(holder::list(&mine)?[0].fate != Some(Fate::Live));
+    let early = holder::close(&wallet, &chain, &mine, &opened.id).await;
+    ensure!(
+        early
+            .as_ref()
+            .is_err_and(|e| format!("{e:#}").contains("not buried")),
+        "{early:?}"
+    );
+    rt.mine(1)?;
+    let txid = holder::close(&wallet, &chain, &mine, &opened.id).await?;
+    let listed = holder::list(&mine)?;
+    ensure!(listed[0].folded == Some(txid), "{:?}", listed[0]);
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs bitcoind and a release build"]
 async fn a_holder_closes_her_contract_early_with_the_hub_and_gets_her_reserve_back() -> Result<()> {
