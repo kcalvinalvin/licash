@@ -110,6 +110,7 @@ pub struct Ask {
 /// from her first message on, with the fees the hub charges now: the most
 /// it may charge her since ([`fees`]). Refused at a hub charging more
 /// than is sane ([`fees::abusive`]).
+/// Driven once: an upload dropped leaves it to [`resume`].
 pub async fn open<T: Transport, C: Chain>(
     wallet: &Wallet<T>,
     chain: &C,
@@ -117,11 +118,17 @@ pub async fn open<T: Transport, C: Chain>(
     hub: &str,
     ask: Ask,
 ) -> Result<Contract> {
-    open_with(wallet, chain, dir, hub, ask, Change::Bitcoin).await
+    open_at(wallet, chain, dir, hub, ask, Change::Bitcoin, true, 0).await
 }
 
+/// How many times [`open_with`] resumes an opening that failed short of
+/// F but for a refusal: over Tor, a 25 MB instance's upload drops now and
+/// then, a step's answer too.
+const RESUMES: u32 = 2;
+
 /// [`open`], F's `change` going where asked: into notes at the hub, F
-/// sweeping her coin whole, if it can.
+/// sweeping her coin whole, if it can. Resumed at once, up to [`RESUMES`]
+/// times, should it fail short of F but for a refusal.
 pub async fn open_with<T: Transport, C: Chain>(
     wallet: &Wallet<T>,
     chain: &C,
@@ -130,7 +137,7 @@ pub async fn open_with<T: Transport, C: Chain>(
     ask: Ask,
     change: Change,
 ) -> Result<Contract> {
-    open_at(wallet, chain, dir, hub, ask, change, true).await
+    open_at(wallet, chain, dir, hub, ask, change, true, RESUMES).await
 }
 
 /// [`open_with`], at a hub charging more than is sane too
@@ -143,9 +150,10 @@ pub async fn open_anyway<T: Transport, C: Chain>(
     ask: Ask,
     change: Change,
 ) -> Result<Contract> {
-    open_at(wallet, chain, dir, hub, ask, change, false).await
+    open_at(wallet, chain, dir, hub, ask, change, false, RESUMES).await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn open_at<T: Transport, C: Chain>(
     wallet: &Wallet<T>,
     chain: &C,
@@ -154,6 +162,7 @@ async fn open_at<T: Transport, C: Chain>(
     ask: Ask,
     change: Change,
     sane: bool,
+    resumes: u32,
 ) -> Result<Contract> {
     let hub = hub.trim_end_matches('/').to_owned();
     let trust = crate::trust(wallet.network())?;
@@ -303,6 +312,7 @@ async fn open_at<T: Transport, C: Chain>(
         quote: Some(offer.quote),
     };
     let driven = driver.drive(outs).await;
+    let driven = driver.carry_on(driven, resumes).await;
     driver.settle(driven)?;
     refresh(&driver, chain).await?;
     found(&store, &id)

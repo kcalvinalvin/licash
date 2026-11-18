@@ -238,6 +238,27 @@ impl<T: Transport, C: Chain> Driver<'_, T, C> {
         Ok(())
     }
 
+    /// `driven`, or, where it failed short of F but for a refusal (an
+    /// instance's upload dropped over Tor, say), the opening resumed up to
+    /// `tries` times, sending none the hub answered.
+    pub async fn carry_on(&mut self, mut driven: Result<()>, tries: u32) -> Result<()> {
+        for n in 1..=tries {
+            match &driven {
+                Err(e)
+                    if e.downcast_ref::<Refusal>().is_none()
+                        && self.holder().phase() < Phase::Funded =>
+                {
+                    let id = crate::hex_id(&self.id);
+                    tracing::warn!(%id, n, "carrying an opening on: {e:#}");
+                    tokio::time::sleep(RETRY * n).await;
+                    driven = self.resume().await;
+                }
+                _ => break,
+            }
+        }
+        driven
+    }
+
     /// Give the opening up if `result` says the hub or she refused, short
     /// of her signing F: her coin freed if she signed it into F.
     pub fn settle(&self, result: Result<()>) -> Result<()> {
@@ -374,7 +395,9 @@ impl<T: Transport, C: Chain> Driver<'_, T, C> {
                     body: wire::Instance { i, bytes }.encode(),
                 }
                 .to_bytes();
-                let frames = this.send(message).await?;
+                let frames = this.send(message).await.inspect_err(|e| {
+                    tracing::warn!(id = %crate::hex_id(&id), i, "an instance not uploaded: {e:#}");
+                })?;
                 // The hub has it: not sent again if the opening resumes.
                 this.store.served(&id, i)?;
                 Ok::<_, anyhow::Error>(frames)
@@ -392,7 +415,13 @@ impl<T: Transport, C: Chain> Driver<'_, T, C> {
         self.holder = Some(holder.unwrap_or_else(|_| unreachable!("every upload done")));
         let mut frames = beside?;
         for answer in answers {
-            frames.extend(answer?);
+            for frame in answer? {
+                // The hub's offer, say, answering more than one of them:
+                // stepped once, or her consent, then F's signing, twice.
+                if !frames.contains(&frame) {
+                    frames.push(frame);
+                }
+            }
         }
         Ok(frames)
     }

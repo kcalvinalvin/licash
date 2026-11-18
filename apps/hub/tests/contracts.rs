@@ -178,6 +178,41 @@ async fn an_opening_resumed_sends_no_instance_the_hub_answered_again() -> Result
     Ok(())
 }
 
+/// An opening whose instance upload dropped, opened as the apps open
+/// one: resumed at once, the instance sent again, the one answered not.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs bitcoind and a release build"]
+async fn an_opening_carries_on_where_an_instance_upload_dropped() -> Result<()> {
+    let rt = Regtest::start_standard()?;
+    let dir = tempfile::tempdir()?;
+    let (url, source) = hub(&rt, &dir.path().join("hub")).await?;
+    let chain = Node(source);
+    let mine = dir.path().join("wallet");
+    std::fs::create_dir(&mine)?;
+    let transport = Dropping {
+        http: Some(Http::new(None)?),
+        ..Default::default()
+    };
+    let regtest = ChainProfile::Core30DefaultRegtest;
+    let wallet = Wallet::create(&mine.join("wallet.sqlite"), &[32; 32], regtest, transport)?;
+    wallet.add_hub(&url).await?;
+    wallet.watch_silent(None, rt.height()?)?;
+    let to = wallet.fallback_address()?.script_pubkey();
+    rt.fund(&to, Amount::from_sat(60_000))?;
+    rt.mine(1)?;
+    ensure!(scan(&wallet, &chain).await? == 60_000);
+
+    let opened = holder::open_with(&wallet, &chain, &mine, &url, ask(), Change::Bitcoin).await?;
+    ensure!(opened.phase == Phase::Funded, "{opened:?}");
+    let sent = wallet.transport().sent.lock().unwrap().clone();
+    ensure!(sent.len() == 3, "{} instance uploads", sent.len());
+    ensure!(
+        sent[0] != sent[1] && sent[1] == sent[2],
+        "the first sent again"
+    );
+    Ok(())
+}
+
 fn ask() -> Ask {
     Ask {
         blocks: 300,
