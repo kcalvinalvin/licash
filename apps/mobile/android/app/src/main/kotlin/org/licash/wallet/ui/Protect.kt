@@ -271,6 +271,7 @@ internal fun GiveUpSheet(recovery: Recovery?, busy: Boolean, confirm: () -> Unit
             Line("Notes", digits(recovery.notes.toULong()))
             Say("Stops this attempt and releases its reserved notes. It does not close the contract or recover Bitcoin.")
             Say("You can force close again while the contract allows it. An offline hub still cannot pay you.")
+            if (busy) Say("Waiting for the contract sync under way to finish first: over Tor, this can take a few minutes.")
             BigButton(
                 if (busy) "Canceling…" else "Stop this attempt",
                 Modifier.fillMaxWidth().testTag("give-up-recovery-confirm"),
@@ -297,7 +298,7 @@ internal fun ForceSheet(c: Contract, held: ULong, force: () -> Unit, dismiss: ()
         Say(
             "Only if ${name(c.hub)} stopped answering: while it answers, cash out instead. " +
                 "Your ${sat(claimed)} there leave your balance and are claimed on Bitcoin, " +
-                "back on Bitcoin in a few days if the hub stays silent. Its fees are paid from your Bitcoin.",
+                "back on Bitcoin in a few days if the hub stays silent. Its fees come from your reserve in the contract.",
         )
         Say("Once its request is signed, it cannot be canceled, even before it is on Bitcoin.")
         BigButton("Force close", Modifier.fillMaxWidth().testTag("force-close-confirm"), danger = true) { force() }
