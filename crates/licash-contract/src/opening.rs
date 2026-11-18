@@ -211,8 +211,12 @@ fn offer(
     recipe.program = program;
     let mut chain = quote.chain.clone();
     chain.checkpoint = checkpoint.clone();
+    let version = match open.request_keys {
+        Some(holder_wots) => Version::V4 { holder_wots },
+        None => Version::V3,
+    };
     Ok(Base::new(Parts {
-        version: Version::V3,
+        version,
         nonce: id,
         claim_key: open.claim_key.serialize(),
         keyset: quote.keyset.clone(),
@@ -580,6 +584,7 @@ impl Holder {
             change: s.change,
             wanted: s.wanted,
             mock: ctx.trust.mock,
+            request_keys: Some(keys.public().request_keys()?.digest()),
         };
         check_deposit(&open, &s.quote.graph, &s.quote.fees)?;
         let h = Self {
@@ -1112,6 +1117,12 @@ impl Hub {
                             ensure!(*previous == o, "another Open");
                             return self.pending();
                         }
+                        // Unbound, the statement could be proved of an exit
+                        // she never started: no new contract opens so.
+                        ensure!(
+                            o.request_keys.is_some(),
+                            "an opening must bind her request's keys"
+                        );
                         self.bounds
                             .context("no opening bounds")?
                             .check(&o.wanted, ctx.tip)?;
@@ -1137,6 +1148,12 @@ impl Hub {
                             return self.pending();
                         }
                         ensure!(self.base.is_some(), "commit out of order");
+                        if let Version::V4 { holder_wots } = self.base.as_ref().unwrap().version() {
+                            ensure!(
+                                c.holder.request_keys()?.digest() == holder_wots,
+                                "her request's keys aren't those Base binds"
+                            );
+                        }
                         let r = &self.base.as_ref().unwrap().parts().recipe;
                         ensure!(
                             c.commitments.len() == r.instances as usize,
@@ -1484,6 +1501,7 @@ mod tests {
                 response_window: 24,
             },
             mock: true,
+            request_keys: None,
         };
         assert!(check_deposit(&open, &q.graph, &q.fees).is_ok());
         // A bare script relays no payout of hers.
@@ -1527,6 +1545,7 @@ mod tests {
                 response_window: 24,
             },
             mock: true,
+            request_keys: None,
         };
         let graph =
             graph::build(&base, &keys.public(), &hub.public(), graph::draft_hmsg(2)).unwrap();
@@ -1617,23 +1636,56 @@ mod tests {
             &ctx,
         )
         .unwrap();
-        let mut h = Hub::with(
-            &[2; 32],
-            q,
-            Some(Bounds {
-                lock: 2000,
-                response_window: 24,
-            }),
-        );
+        let bounds = Bounds {
+            lock: 2000,
+            response_window: 24,
+        };
+        let mut h = Hub::with(&[2; 32], q.clone(), Some(bounds));
         h.payout = Some(wallet_script(6));
+        // An Open that binds no request keys opens nothing: the statement
+        // could be proved of an exit she never started.
+        let open = Envelope::from_bytes(&sent(&first, Kind::Open))
+            .unwrap()
+            .body;
+        let unbound = wire::Open {
+            request_keys: None,
+            ..wire::Open::decode(&open).unwrap()
+        };
+        let mut fresh = Hub::with(&[2; 32], q, Some(bounds));
+        fresh.payout = Some(wallet_script(6));
+        let error = fresh
+            .step(message(id, Kind::Open, unbound.encode()), &ctx)
+            .unwrap_err();
+        assert!(error.to_string().contains("request's keys"), "{error}");
         let terms = h
             .step(Input::Message(sent(&first, Kind::Open)), &ctx)
             .unwrap();
+        // Bound, Base is v4 on her keys.
+        let request_keys = a.keys.public().request_keys().unwrap();
+        assert_eq!(
+            h.base().unwrap().version(),
+            Version::V4 {
+                holder_wots: request_keys.digest()
+            }
+        );
         reload(&mut a, &mut h, &ctx);
         let commit = a
             .step(Input::Message(sent(&terms, Kind::Terms)), &ctx)
             .unwrap();
         reload(&mut a, &mut h, &ctx);
+        // A commitment under other keys than Base binds is refused.
+        let body = Envelope::from_bytes(&sent(&commit, Kind::Commit))
+            .unwrap()
+            .body;
+        let swapped = wire::Commit {
+            holder: HolderKeys::derive(&[8; 32], &id).public(),
+            ..wire::Commit::decode(&body).unwrap()
+        };
+        let mut other = Hub::load(&h.to_bytes(), &ctx).unwrap();
+        let error = other
+            .step(message(id, Kind::Commit, swapped.encode()), &ctx)
+            .unwrap_err();
+        assert!(error.to_string().contains("Base binds"), "{error}");
         let chosen = h
             .step(Input::Message(sent(&commit, Kind::Commit)), &ctx)
             .unwrap();

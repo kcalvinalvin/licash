@@ -491,6 +491,11 @@ pub struct Open {
     pub change: ScriptBuf,
     pub wanted: Wanted,
     pub mock: bool,
+    /// The digest of her request's one-time keys
+    /// ([`HolderPub::request_keys`]), which a v4 Base binds. Written last,
+    /// and only if present: an Open stored before it reads as none, and
+    /// its opening goes on under v3, as it began.
+    pub request_keys: Option<[u8; 32]>,
 }
 message!(
     Open,
@@ -507,6 +512,9 @@ message!(
         w.u32(self.wanted.close_height);
         w.u16(self.wanted.response_window);
         w.u8(self.mock as u8);
+        if let Some(digest) = &self.request_keys {
+            w.bytes(digest);
+        }
     },
     {
         let party = r.party()?;
@@ -521,6 +529,11 @@ message!(
         };
         let mock = r.u8()?;
         ensure!(mock <= 1, "invalid mock flag");
+        let request_keys = if r.0.is_empty() {
+            None
+        } else {
+            Some(r.array()?)
+        };
         Self {
             party,
             claim_key,
@@ -529,6 +542,7 @@ message!(
             change,
             wanted,
             mock: mock == 1,
+            request_keys,
         }
     }
 );
@@ -770,5 +784,43 @@ mod tests {
         decoded.quote(&read);
         assert_eq!(original.0, decoded.0);
         r.end().unwrap();
+    }
+    /// An Open stored before it bound her request's keys still reads, as
+    /// binding none; one binding them reads back whole.
+    #[test]
+    fn an_open_binds_her_request_keys_or_reads_as_before() {
+        let keys = crate::keys::HolderKeys::derive(&[1; 32], &[2; 32]);
+        let coin = TxOut {
+            value: lichen_btc::bitcoin::Amount::from_sat(1000),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        };
+        let unbound = Open {
+            party: keys.party.public(),
+            claim_key: keys.claim_key(),
+            deposit: OutPoint::null(),
+            coin: coin.clone(),
+            change: coin.script_pubkey,
+            wanted: Wanted {
+                request_height: 100,
+                close_height: 1000,
+                response_window: 24,
+            },
+            mock: false,
+            request_keys: None,
+        };
+        let digest = keys.public().request_keys().unwrap().digest();
+        let bound = Open {
+            request_keys: Some(digest),
+            ..unbound.clone()
+        };
+        let old = unbound.encode();
+        let new = bound.encode();
+        assert_eq!(new, [old.as_slice(), &digest].concat());
+        assert_eq!(Open::decode(&old).unwrap(), unbound);
+        assert_eq!(Open::decode(&new).unwrap(), bound);
+        for cut in [1, 31] {
+            assert!(Open::decode(&new[..new.len() - cut]).is_err());
+        }
+        assert!(Open::decode(&[new.as_slice(), &[0]].concat()).is_err());
     }
 }
