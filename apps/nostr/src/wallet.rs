@@ -3,8 +3,9 @@
 //! that swap between two of its hubs, or pay notes out on Bitcoin.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{hash_map::RandomState, HashMap, HashSet},
     future::Future,
+    hash::BuildHasher,
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -27,6 +28,17 @@ const ANSWER_TIMEOUT: Duration = Duration::from_secs(30);
 /// looking for them again: well within an announcement's [`LIFETIME`].
 const KEPT_FOR: Duration = Duration::from_secs(30 * 60);
 
+/// The most providers asked at once that the wallet neither went through
+/// before nor heard answer within [`KEPT_FOR`]: announcing is free, so a
+/// flood of announcements, each naming URLs that never answer, costs each
+/// quote this many askings at most, not one for each.
+const STRANGERS: usize = 16;
+
+/// How long a provider the wallet's last swap or payout through failed
+/// is offered after the others: one that took its notes locked and never
+/// went on is not chosen again first, while it may have failed by chance.
+const FAILED_FOR: Duration = Duration::from_secs(7 * 24 * 3600);
+
 /// The swap providers announced, as last found on some relays for a
 /// network: quotes ask them without looking for them first, as the
 /// wallet's owner waits, once looked for out of sight
@@ -47,6 +59,9 @@ pub struct Announcements {
     /// By the key that announced it, the URL each provider last answered
     /// at as that key, and since when.
     answered: Mutex<HashMap<String, (String, Instant)>>,
+    /// The order the [`STRANGERS`] asked are taken in: this wallet's
+    /// own, which no announcer can choose its keys to come first in.
+    order: RandomState,
 }
 
 /// Announcements found, and where and when.
@@ -133,6 +148,7 @@ impl Announcements {
     async fn answering<Q, Fut>(
         &self,
         (relays, route, network): (&[String], &Route, &str),
+        used: &HashSet<String>,
         ask: impl Fn(String) -> Fut,
         nostr: fn(&Q) -> Option<&str>,
     ) -> anyhow::Result<Vec<(Found, String, Q)>>
@@ -140,6 +156,7 @@ impl Announcements {
         Fut: Future<Output = Result<Q, Error>>,
     {
         if let Some(found) = self.kept(relays, network) {
+            let found = self.chosen(found, used);
             let answered = self.asked(found, &ask, nostr).await?;
             if !answered.is_empty() {
                 return Ok(answered);
@@ -147,7 +164,40 @@ impl Announcements {
             tracing::info!("no swap provider kept answered: looking for them again");
         }
         let found = crate::discover(relays, route, Role::Swaps, network).await?;
+        let found = self.chosen(found, used);
         Ok(self.asked(found, &ask, nostr).await?)
+    }
+
+    /// Those of `found` to ask: each the wallet went through before (at a
+    /// URL of `used`) or heard answer within [`KEPT_FOR`], and
+    /// [`STRANGERS`] of the others at most, in an order of its own, as
+    /// found.
+    fn chosen(&self, found: Vec<Found>, used: &HashSet<String>) -> Vec<Found> {
+        let mut ask: Vec<bool> = {
+            let answered = self.answered.lock().unwrap_or_else(|e| e.into_inner());
+            let heard =
+                |f: &Found| (answered.get(&f.key)).is_some_and(|(_, at)| at.elapsed() < KEPT_FOR);
+            found.iter().map(|f| known(f, used) || heard(f)).collect()
+        };
+        let mut strangers: Vec<(u64, usize)> = (found.iter().enumerate())
+            .filter(|(i, _)| !ask[*i])
+            .map(|(i, f)| (self.order.hash_one(&f.key), i))
+            .collect();
+        if strangers.len() <= STRANGERS {
+            return found;
+        }
+        strangers.sort_unstable();
+        for (_, i) in &strangers[..STRANGERS] {
+            ask[*i] = true;
+        }
+        tracing::debug!(
+            found = found.len(),
+            "{} providers never heard from not asked",
+            strangers.len() - STRANGERS
+        );
+        (found.into_iter().zip(ask))
+            .filter_map(|(f, ask)| ask.then_some(f))
+            .collect()
     }
 
     /// Those of `found` answering `ask` ([`answering`]), each asked first
@@ -840,29 +890,34 @@ pub async fn swap_providers_with<T: Transport>(
     limits: SwapLimits,
 ) -> anyhow::Result<Vec<SwapProvider>> {
     let network = wallet.network().name();
-    let used: HashSet<String> = wallet
-        .swaps()?
-        .into_iter()
-        .filter(|s| s.state == SwapState::Done)
-        .map(|s| s.provider)
-        .collect();
+    let (used, failed) = standing(
+        wallet.swaps()?.into_iter().filter_map(|s| match s.state {
+            SwapState::Done => Some((s.provider, s.created_at, true)),
+            SwapState::Failed(_) => Some((s.provider, s.created_at, false)),
+            _ => None,
+        }),
+        now(),
+    );
     let ask = |url: String| async move { wallet.swap_quote(&url, from, to, amount, limits).await };
     let on = (relays, route, network);
-    let answering = announced.answering(on, ask, |q: &SwapQuote| q.info.nostr.as_deref());
+    let answering = announced.answering(on, &used, ask, |q: &SwapQuote| q.info.nostr.as_deref());
     let answering = answering.await?;
-    let mut providers: Vec<SwapProvider> = answering
+    let mut providers: Vec<(bool, SwapProvider)> = answering
         .into_iter()
-        .map(|(service, url, quote)| SwapProvider {
-            known: known(&service, &used),
-            url,
-            key: service.key,
-            name: service.announcement.name,
-            quote,
+        .map(|(service, url, quote)| {
+            let provider = SwapProvider {
+                known: known(&service, &used),
+                url,
+                key: service.key.clone(),
+                name: service.announcement.name.clone(),
+                quote,
+            };
+            (known(&service, &failed), provider)
         })
         .collect();
     // Stable: the newest announced first among equals.
-    providers.sort_by_key(|p| (!p.known, p.quote.fee, p.quote.margin));
-    Ok(providers)
+    providers.sort_by_key(|(failed, p)| (*failed, !p.known, p.quote.fee, p.quote.margin));
+    Ok(providers.into_iter().map(|(_, p)| p).collect())
 }
 
 /// A hub announced on Nostr, and what it says of itself.
@@ -985,32 +1040,37 @@ pub async fn payout_providers_with<T: Transport>(
     (max_fee, rate): (u64, FeeRate),
 ) -> anyhow::Result<Vec<PayoutProvider>> {
     let network = wallet.network().name();
-    let used: HashSet<String> = wallet
-        .payouts()?
-        .into_iter()
-        .filter(|p| p.state == PayoutState::Done)
-        .map(|p| p.provider)
-        .collect();
+    let (used, failed) = standing(
+        wallet.payouts()?.into_iter().filter_map(|p| match p.state {
+            PayoutState::Done => Some((p.provider, p.created_at, true)),
+            PayoutState::Failed(_) => Some((p.provider, p.created_at, false)),
+            _ => None,
+        }),
+        now(),
+    );
     let ask = |url: String| async move {
         let quote = wallet.payout_quote(&url, from, to, amount, max_fee, rate);
         quote.await
     };
     let on = (relays, route, network);
-    let answering = announced.answering(on, ask, |q: &PayoutQuote| q.info.nostr.as_deref());
+    let answering = announced.answering(on, &used, ask, |q: &PayoutQuote| q.info.nostr.as_deref());
     let answering = answering.await?;
-    let mut providers: Vec<PayoutProvider> = answering
+    let mut providers: Vec<(bool, PayoutProvider)> = answering
         .into_iter()
-        .map(|(service, url, quote)| PayoutProvider {
-            known: known(&service, &used),
-            url,
-            key: service.key,
-            name: service.announcement.name,
-            quote,
+        .map(|(service, url, quote)| {
+            let provider = PayoutProvider {
+                known: known(&service, &used),
+                url,
+                key: service.key.clone(),
+                name: service.announcement.name.clone(),
+                quote,
+            };
+            (known(&service, &failed), provider)
         })
         .collect();
     // Stable: the newest announced first among equals.
-    providers.sort_by_key(|p| (!p.known, p.quote.costs()));
-    Ok(providers)
+    providers.sort_by_key(|(failed, p)| (*failed, !p.known, p.quote.costs()));
+    Ok(providers.into_iter().map(|(_, p)| p).collect())
 }
 
 /// A swap provider announced on Nostr that pays Lightning invoices from
@@ -1046,7 +1106,8 @@ pub async fn invoice_providers_with<T: Transport>(
         quote.await
     };
     let on = (relays, route, network);
-    let answering = announced.answering(on, ask, |q: &ViaQuote| q.info.nostr.as_deref());
+    let none = HashSet::new();
+    let answering = announced.answering(on, &none, ask, |q: &ViaQuote| q.info.nostr.as_deref());
     let mut providers: Vec<InvoiceProvider> = (answering.await?.into_iter())
         .map(|(service, url, quote)| InvoiceProvider {
             url,
@@ -1089,7 +1150,10 @@ pub async fn donation_providers_with<T: Transport>(
     let network = wallet.network().name();
     let ask = |url: String| async move { wallet.donation_address(&url, code).await };
     let on = (relays, route, network);
-    let answering = announced.answering(on, ask, |a: &DonationAddress| a.info.nostr.as_deref());
+    let none = HashSet::new();
+    let answering = announced.answering(on, &none, ask, |a: &DonationAddress| {
+        a.info.nostr.as_deref()
+    });
     let mut providers: Vec<DonationProvider> = (answering.await?.into_iter())
         .map(|(service, url, address)| DonationProvider {
             url,
@@ -1106,6 +1170,42 @@ pub async fn donation_providers_with<T: Transport>(
         key(a).cmp(&key(b))
     });
     Ok(providers)
+}
+
+/// Of the providers the wallet's swaps or payouts went through, by URL, as
+/// `finished` says of each (its provider's URL, when it was made, in
+/// seconds, and whether it was done) at `now`: those it went through, and
+/// those whose last one failed within [`FAILED_FOR`].
+fn standing(
+    finished: impl IntoIterator<Item = (String, i64, bool)>,
+    now: i64,
+) -> (HashSet<String>, HashSet<String>) {
+    let url = |u: &str| u.trim().trim_end_matches('/').to_owned();
+    let mut last: HashMap<String, (i64, bool)> = HashMap::new();
+    let mut used = HashSet::new();
+    for (provider, at, done) in finished {
+        let provider = url(&provider);
+        if done {
+            used.insert(provider.clone());
+        }
+        let latest = last.entry(provider).or_insert((at, done));
+        if at >= latest.0 {
+            *latest = (at, done);
+        }
+    }
+    let since = now.saturating_sub(FAILED_FOR.as_secs() as i64);
+    let failed = (last.into_iter())
+        .filter(|(_, (at, done))| !done && *at >= since)
+        .map(|(provider, _)| provider)
+        .collect();
+    (used, failed)
+}
+
+/// Now, in seconds since the epoch.
+fn now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
 }
 
 /// Whether `service` announced a URL of those in `used`.
@@ -1184,6 +1284,68 @@ mod tests {
         Some(&answer.0)
     }
 
+    /// A provider announced under `key` at `url`.
+    fn at(key: usize, url: &str) -> Found {
+        let mut found = provider(0);
+        found.key = format!("{key:064}");
+        found.announcement.urls = vec![url.into()];
+        found
+    }
+
+    #[test]
+    fn a_flood_of_providers_never_heard_from_is_asked_a_few_at_a_time() {
+        let announced = Announcements::default();
+        let mut found: Vec<Found> = (0..100)
+            .map(|i| at(i, &format!("https://{i}.test")))
+            .collect();
+        // One gone through before, one heard answer lately: both asked.
+        found[70].announcement.urls = vec!["https://used.test/".into()];
+        (announced.answered.lock().unwrap()).insert(
+            found[90].key.clone(),
+            ("https://90.test".into(), Instant::now()),
+        );
+        let used = HashSet::from(["https://used.test".to_owned()]);
+        let keys = |found: &[Found]| found.iter().map(|f| f.key.clone()).collect::<Vec<_>>();
+        let chosen = announced.chosen(found.clone(), &used);
+        assert_eq!(chosen.len(), STRANGERS + 2);
+        assert!(keys(&chosen).contains(&found[70].key));
+        assert!(keys(&chosen).contains(&found[90].key));
+        // In the order found, the same ones each time for this wallet.
+        let order: Vec<usize> = (chosen.iter())
+            .map(|c| found.iter().position(|f| f.key == c.key).unwrap())
+            .collect();
+        assert!(order.windows(2).all(|w| w[0] < w[1]), "{order:?}");
+        assert_eq!(keys(&announced.chosen(found.clone(), &used)), keys(&chosen));
+        // A few: all asked.
+        let few = found[..STRANGERS].to_vec();
+        assert_eq!(
+            keys(&announced.chosen(few.clone(), &HashSet::new())),
+            keys(&few)
+        );
+    }
+
+    #[test]
+    fn a_provider_last_failed_through_lately_is_offered_last() {
+        const DAY: i64 = 24 * 3600;
+        let now = 100 * DAY;
+        let (used, failed) = standing(
+            [
+                // Failed once, done since.
+                ("https://a.test".to_owned(), now - 3 * DAY, false),
+                ("https://a.test/".to_owned(), now - DAY, true),
+                // Done once, failed since.
+                ("https://b.test".to_owned(), now - 3 * DAY, true),
+                ("https://b.test".to_owned(), now - DAY, false),
+                // Failed long ago.
+                ("https://c.test".to_owned(), now - 8 * DAY, false),
+            ],
+            now,
+        );
+        let set = |urls: &[&str]| urls.iter().map(|u| u.to_string()).collect::<HashSet<_>>();
+        assert_eq!(used, set(&["https://a.test", "https://b.test"]));
+        assert_eq!(failed, set(&["https://b.test"]));
+    }
+
     #[tokio::test]
     async fn providers_found_are_kept_for_quotes_without_the_relays() {
         let relay = MockRelay::run().await.unwrap();
@@ -1204,11 +1366,12 @@ mod tests {
         let down = |_: String| async { Err::<Answer, _>(Error::Invalid("down".into())) };
         let route = Route::Direct;
         let announced = Announcements::default();
+        let none = HashSet::new();
 
         // Looked for as asked, but not kept: a provider announced since
         // would be found the next time.
         let found = announced
-            .answering((&relays[..], &route, "regtest"), answers, named)
+            .answering((&relays[..], &route, "regtest"), &none, answers, named)
             .await;
         assert_eq!(found.unwrap()[0].1, "https://swaps.example");
         assert!(announced.kept(&relays, "regtest").is_none());
@@ -1219,12 +1382,12 @@ mod tests {
         relay.shutdown();
         let twice = [relays[0].clone(), relays[0].clone()];
         let found = announced
-            .answering((&twice[..], &route, "regtest"), answers, named)
+            .answering((&twice[..], &route, "regtest"), &none, answers, named)
             .await;
         assert_eq!(found.unwrap().len(), 1);
         // None of those kept answering, they are looked for again.
         assert!(announced
-            .answering((&relays[..], &route, "regtest"), down, named)
+            .answering((&relays[..], &route, "regtest"), &none, down, named)
             .await
             .is_err());
         // Not for another network, nor other relays: those are asked.
@@ -1232,7 +1395,7 @@ mod tests {
         let others = ["ws://127.0.0.1:1".to_owned()];
         assert!(announced.kept(&others, "regtest").is_none());
         assert!(announced
-            .answering((&others[..], &route, "regtest"), answers, named)
+            .answering((&others[..], &route, "regtest"), &none, answers, named)
             .await
             .is_err());
         // Failing to find them again, those kept stay.
