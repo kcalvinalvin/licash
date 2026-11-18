@@ -428,7 +428,7 @@ fn activation_checks_real_inclusion_exact_reference_shared_context_and_mature_de
     )
     .unwrap();
     assert_eq!(
-        activation.verify(&chain, &terms, 100_000).unwrap(),
+        activation.verify(&chain, &cp, &terms, 100_000).unwrap(),
         [83; 32]
     );
     let shallow = Chain::verify(
@@ -438,7 +438,7 @@ fn activation_checks_real_inclusion_exact_reference_shared_context_and_mature_de
         1,
     )
     .unwrap();
-    assert!(activation.verify(&shallow, &terms, 100_000).is_err());
+    assert!(activation.verify(&shallow, &cp, &terms, 100_000).is_err());
     for field in 0..4 {
         let mut changed = activation.clone();
         match field {
@@ -447,7 +447,7 @@ fn activation_checks_real_inclusion_exact_reference_shared_context_and_mature_de
             2 => changed.reference.txid[0] ^= 1,
             _ => changed.reference.output = 1,
         }
-        assert!(changed.verify(&chain, &terms, 100_000).is_err());
+        assert!(changed.verify(&chain, &cp, &terms, 100_000).is_err());
     }
     for (profile, checkpoint, expiry, hash) in [
         (
@@ -461,9 +461,76 @@ fn activation_checks_real_inclusion_exact_reference_shared_context_and_mature_de
         (cp.profile(), cp.commitment(), 4, [0; 32]),
     ] {
         let bad = TimedTerms::new(profile, checkpoint, expiry, 3, hash).unwrap();
-        assert!(activation.verify(&chain, &bad, 100_000).is_err());
+        assert!(activation.verify(&chain, &cp, &bad, 100_000).is_err());
     }
     assert_eq!(activation.reference.to_bytes().len(), 72);
+}
+
+/// A lock's checkpoint as of `header`, the block after the genesis one.
+fn second_block_checkpoint(cp: &Checkpoint, header: &Header) -> Checkpoint {
+    let genesis: Header = deserialize(cp.header()).unwrap();
+    Checkpoint::new(
+        cp.profile(),
+        1,
+        serialize(header).try_into().unwrap(),
+        vec![genesis.time, header.time],
+        None,
+    )
+    .unwrap()
+}
+
+/// An activation is anchored to the checkpoint its lock names, which must
+/// be a block of the chain: after Base's checkpoint, the activation comes
+/// after it, and a block off the chain anchors nothing.
+#[test]
+fn an_activation_is_anchored_to_its_locks_checkpoint_on_the_chain() {
+    let (cp, blocks, chain) = fixture(1);
+    let raw = serialize(&blocks[0]);
+    let activation = Activation {
+        reference: ActivationRef {
+            height: 1,
+            block_hash: blocks[0].block_hash().to_byte_array(),
+            txid: blocks[0].txdata[1].compute_txid().to_byte_array(),
+            output: 0,
+        },
+        inclusion: Inclusion::capture(&raw, 1, raw.len()).unwrap(),
+    };
+    let terms = |anchor: &Checkpoint| {
+        TimedTerms::new(
+            anchor.profile(),
+            anchor.commitment(),
+            4,
+            2,
+            sha256::Hash::hash(&[83; 32]).to_byte_array(),
+        )
+        .unwrap()
+    };
+    assert_eq!(
+        activation
+            .verify(&chain, &cp, &terms(&cp), 100_000)
+            .unwrap(),
+        [83; 32]
+    );
+    // Anchored at its own block, the activation is not after the lock.
+    let on_chain = second_block_checkpoint(&cp, &blocks[0].header);
+    let error = activation
+        .verify(&chain, &on_chain, &terms(&on_chain), 100_000)
+        .unwrap_err();
+    assert!(error.to_string().contains("height or depth"), "{error}");
+    // A block at that height off the chain anchors nothing, though the
+    // lock names it.
+    let genesis: Header = deserialize(cp.header()).unwrap();
+    let other = block(&genesis, 1, vec![]);
+    assert_ne!(other.block_hash(), blocks[0].block_hash());
+    let off_chain = second_block_checkpoint(&cp, &other.header);
+    let error = activation
+        .verify(&chain, &off_chain, &terms(&off_chain), 100_000)
+        .unwrap_err();
+    assert!(error.to_string().contains("not on the chain"), "{error}");
+    // Nor does the filed anchor stand for another one the lock names.
+    assert!(activation
+        .verify(&chain, &on_chain, &terms(&cp), 100_000)
+        .is_err());
 }
 
 #[test]

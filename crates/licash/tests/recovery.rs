@@ -20,8 +20,8 @@ use licash::{
     note::Evidence as Issuance,
     note::{Derivation, HoldRoot, IssuerKeys, Keyset, Note},
     recovery::{
-        self, disclosures, evidence_from_bytes, evidence_to_bytes, Evidence, Filing, Owed,
-        Publication, SourceWitness, Witness,
+        self, disclosures, evidence_from_bytes, evidence_to_bytes, ActivationWitness, Evidence,
+        Filing, Owed, Publication, SourceWitness, Witness,
     },
     request::Request,
     source::Certificate,
@@ -48,10 +48,13 @@ fn party(value: u64) -> Party {
     }
 }
 fn base(keyset: Keyset) -> Base {
+    base_of(keyset, base::Version::V3)
+}
+fn base_of(keyset: Keyset, version: base::Version) -> Base {
     let mut deposit = [31; 36];
     deposit[32..].copy_from_slice(&7u32.to_le_bytes());
     Base::new(Parts {
-        version: base::Version::V3,
+        version,
         nonce: [53; 32],
         claim_key: point(19).x_only(),
         keyset,
@@ -278,8 +281,24 @@ fn merkle(mut hashes: Vec<[u8; 32]>) -> [u8; 32] {
     hashes[0]
 }
 
+/// v3's activation witnesses: their inclusions, unanchored.
+fn v3_activations(inclusions: Vec<Inclusion>) -> Vec<ActivationWitness> {
+    inclusions
+        .into_iter()
+        .map(|inclusion| ActivationWitness {
+            inclusion,
+            anchor: None,
+        })
+        .collect()
+}
+
 /// Seven regtest-difficulty blocks; block 1 carries the Pay activation.
 fn activated_chain() -> (Chain, Activation) {
+    activated_chain_at(1)
+}
+
+/// Seven regtest-difficulty blocks; block `at` carries the Pay activation.
+fn activated_chain_at(at: u32) -> (Chain, Activation) {
     let cp = Checkpoint::genesis(ChainProfile::Core30DefaultRegtest).unwrap();
     let mut previous: Header = deserialize(cp.header()).unwrap();
     let (mut headers, mut activation) = (vec![], None);
@@ -299,7 +318,7 @@ fn activated_chain() -> (Chain, Activation) {
                 script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
             }],
         }];
-        if height == 1 {
+        if height == at {
             txdata.push(Transaction {
                 version: transaction::Version::TWO,
                 lock_time: absolute::LockTime::ZERO,
@@ -343,11 +362,11 @@ fn activated_chain() -> (Chain, Activation) {
         while block.header.validate_pow(block.header.target()).is_err() {
             block.header.nonce += 1;
         }
-        if height == 1 {
+        if height == at {
             let raw = serialize(&block);
             activation = Some(Activation {
                 reference: ActivationRef {
-                    height: 1,
+                    height: at,
                     block_hash: block.block_hash().to_byte_array(),
                     txid: block.txdata[1].compute_txid().to_byte_array(),
                     output: 0,
@@ -489,7 +508,7 @@ fn pending_sources_follow_activation_refund_and_preimage_rules() {
         Witness {
             notes: vec![settled_note.clone()],
             sources,
-            activations,
+            activations: v3_activations(activations),
         }
     };
     let bob_elsewhere = spend(
@@ -551,6 +570,165 @@ fn pending_sources_follow_activation_refund_and_preimage_rules() {
     // An advertised activation must come with its inclusion.
     let (p, _) = publish(vec![record]);
     assert!(Filing::new(p, witness(vec![])).is_err());
+}
+
+/// Under v4 a lock's Pay is owed only with an activation, anchored to the
+/// checkpoint the lock names: any block of the chain the statement reads,
+/// after Base's. Expiry is no evidence: without an activation the Pay is
+/// owed nothing, whether or not the lock expired.
+#[test]
+fn v4_owes_a_locks_pay_only_on_an_activation_anchored_to_its_checkpoint() {
+    let issuer = IssuerKeys::random(3).unwrap();
+    let version = base::Version::V4 {
+        holder_wots: [5; 32],
+    };
+    let o = Opened {
+        base: base_of(issuer.keyset().unwrap(), version),
+        issuer,
+    };
+    let keyset = o.base.parts().keyset.clone();
+    let hold = hold();
+    let (chain, activation) = activated_chain_at(3);
+    // The lock names block 1, after Base's checkpoint (the genesis block).
+    let anchor = |height: u32| {
+        let times = (0..=height)
+            .map(|h| u32::from_le_bytes(chain.header(h).unwrap()[68..72].try_into().unwrap()))
+            .collect();
+        Checkpoint::new(
+            ChainProfile::Core30DefaultRegtest,
+            height,
+            *chain.header(height).unwrap(),
+            times,
+            None,
+        )
+        .unwrap()
+    };
+    let lock_cp = anchor(1);
+    let terms = TimedTerms::new(
+        lock_cp.profile(),
+        lock_cp.commitment(),
+        5,
+        3,
+        sha256::Hash::hash(&Z).to_byte_array(),
+    )
+    .unwrap();
+    // Bob pays the holder 4 sats under an issuer-certified timed lock.
+    let bob_hold = HoldRoot::from_seed(&[9; 32]).unwrap();
+    let bob_note = mint(&o.issuer, &keyset, &derive(41, &bob_hold, 4, 29, 0));
+    let pay = derive(SPEND, &hold, 4, 61, 0);
+    let body = Proposal::new(
+        &keyset,
+        std::slice::from_ref(&bob_note),
+        point(43),
+        vec![Output::from_derivation(&pay).unwrap()],
+        Some(TimedLock::new(terms, vec![bob(4, 1)]).unwrap()),
+    )
+    .unwrap();
+    let bob_signed = SignedProposal::sign(
+        &keyset,
+        body,
+        std::slice::from_ref(&bob_note),
+        Authorization::Plain,
+        &[owner(41, 29, 0)],
+    )
+    .unwrap();
+    let cert =
+        Certificate::attest(&o.issuer, &bob_signed, std::slice::from_ref(&bob_note)).unwrap();
+    let bob_id = bob_signed.proposal().id();
+    let settled = derive(SPEND, &hold, 4, 23, 0);
+    let settled_note = mint(&o.issuer, &keyset, &settled);
+    let items = vec![
+        Item::Settled(settled.message().clone()),
+        Item::Pending {
+            message: pay.message().clone(),
+            source: bob_id,
+            branch: Branch::Pay,
+            index: 0,
+            blinding: *pay.blinding(),
+            preimage: Some(Z),
+        },
+    ];
+    let signers = [settled.clone(), pay.clone()];
+    let publish = |activations| {
+        let unsigned = claim(
+            &o,
+            items.clone(),
+            vec![Source::Admitted(cert.clone())],
+            activations,
+            &signers,
+            8,
+        );
+        let p = Publication::sign(unsigned, &hold_keys(&signers), LIMIT).unwrap();
+        let request = Request {
+            amount: 8,
+            claim_digest: *p.claim().digest(),
+        };
+        (p, request)
+    };
+    let witness = |activations| Witness {
+        notes: vec![settled_note.clone()],
+        sources: vec![SourceWitness::Certified {
+            proposal: bob_signed.proposal().clone(),
+            signatures: bob_signed.signatures().to_vec(),
+        }],
+        activations,
+    };
+    let anchored = |anchor| {
+        vec![ActivationWitness {
+            inclusion: activation.inclusion.clone(),
+            anchor,
+        }]
+    };
+    let record = ActivationRecord {
+        source: bob_id,
+        reference: activation.reference,
+    };
+
+    // Activated and anchored: owed in full, and expiry is no evidence.
+    let (p, request) = publish(vec![record]);
+    let full = witness(anchored(Some(lock_cp.clone())));
+    let c = decide(&o, &request, &p, &full, &[], Some(&chain)).unwrap();
+    assert_eq!((c.owed, c.ineligible), (8, None));
+    let expired = Evidence::Expired { source: bob_id };
+    let error = decide(&o, &request, &p, &full, &[expired], Some(&chain)).unwrap_err();
+    assert!(error.to_string().contains("under v4"), "{error}");
+    // The anchored filing has its own magic, and decodes as it was.
+    let bytes = Filing::new(p.clone(), full.clone()).unwrap().to_bytes();
+    assert!(bytes.starts_with(b"LICASH-F\x02"));
+    let decoded = Filing::from_bytes(&keyset, LIMIT, &bytes).unwrap();
+    assert_eq!(decoded.to_bytes(), bytes);
+    for n in [bytes.len() - 1, bytes.len() - 40] {
+        assert!(Filing::from_bytes(&keyset, LIMIT, &bytes[..n]).is_err());
+    }
+    // Unanchored (as v3 files it), or anchored to another block than the
+    // lock names, the activation makes the claim ineligible.
+    let ineligible = |w: &Witness| {
+        decide(&o, &request, &p, w, &[], Some(&chain))
+            .unwrap()
+            .ineligible
+    };
+    assert!(ineligible(&witness(anchored(None)))
+        .unwrap()
+        .contains("another Base version"));
+    assert!(ineligible(&witness(anchored(Some(anchor(2))))).is_some());
+    // On a chain that doesn't bury the activation at the lock's depth, too.
+    let short = Chain::verify(
+        chain.checkpoint().clone(),
+        &chain.checkpoint().commitment(),
+        (1..=4).map(|h| *chain.header(h).unwrap()).collect(),
+        100,
+    )
+    .unwrap();
+    assert!(decide(&o, &request, &p, &full, &[], Some(&short))
+        .unwrap()
+        .ineligible
+        .is_some());
+
+    // Without an activation the Pay is owed nothing; the rest is owed, and
+    // the lock's checkpoint not being Base's makes nothing ineligible.
+    let (p, request) = publish(vec![]);
+    let c = decide(&o, &request, &p, &witness(vec![]), &[], Some(&chain)).unwrap();
+    assert_eq!((c.owed, c.ineligible), (4, None));
 }
 
 /// The paper's example at half scale. Alice pays Bob 50 from a 128 note with
@@ -1000,7 +1178,7 @@ fn input_claim_conflicts_preserve_certified_outputs_but_retire_all_own_outputs()
         let witness = Witness {
             notes: vec![mint(&o.issuer, &keyset, &settled)],
             sources: vec![body],
-            activations: inclusions,
+            activations: v3_activations(inclusions),
         };
         (p, request, witness)
     };
@@ -1430,7 +1608,7 @@ fn pending_items_are_eligible_by_their_sources_public_bodies() {
             Witness {
                 notes: vec![settled_note.clone()],
                 sources: bodies.clone(),
-                activations: inclusions,
+                activations: v3_activations(inclusions),
             },
         )
         .unwrap();

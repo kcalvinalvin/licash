@@ -30,7 +30,9 @@ impl Hub {
     /// against each of its timed sources the branch the hub did not settle
     /// it on: the preimage of a lock paid, the expiry of one refunded, of
     /// one unsettled the preimage if the hub saw it, else its expiry, which
-    /// the statement checks against the chain. Ordered by proposal, then
+    /// the statement checks against the chain (a v3 contract's only: under
+    /// v4 a Pay without an activation is owed nothing, and the statement
+    /// refuses an expiry, so the dispute drops it). Ordered by proposal, then
     /// source. A spend the ledger can no longer read back (its keyset gone)
     /// is left out. Then each other claim on Bitcoin of any of its notes
     /// ([`Hub::hold_claimed`]).

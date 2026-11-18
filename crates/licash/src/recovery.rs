@@ -12,8 +12,8 @@
 
 use crate::{
     authorization::{Authorization, SignedProposal, Unlock},
-    base::Base,
-    chain::{Activation, ActivationRef, Chain, Inclusion},
+    base::{Base, Version},
+    chain::{Activation, ActivationRef, Chain, Checkpoint, Inclusion},
     claim::{self, ActivationRecord, Branch, Item, Source, UnsignedClaim, MAX_ITEMS},
     crypto::{self, generator_mul, Point, ScalarBytes, Signature},
     disclosure::{Disclosures, SLOTS},
@@ -28,7 +28,10 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
 const P_MAGIC: &[u8] = b"LICASH-P\x02";
+/// A filing's magic: its activations unanchored (v3's), or each with the
+/// lock checkpoint it is anchored to (v4's).
 const F_MAGIC: &[u8] = b"LICASH-F\x01";
+const F_MAGIC_ANCHORED: &[u8] = b"LICASH-F\x02";
 /// A filing's limit: its bytes fit Lichen's claim carrier
 /// (`lichen_statement::claim_script`), which Core relays under default
 /// policy.
@@ -424,7 +427,8 @@ pub enum Evidence {
         preimage: [u8; 32],
     },
     /// The source expired at depth with no activation referenced by the claim:
-    /// its Pay items are void (the refund branch holds).
+    /// its Pay items are void (the refund branch holds). v3 only: under v4 a
+    /// lock's Pay is owed only with an activation, so expiry voids nothing.
     Expired { source: ProposalId },
 }
 
@@ -562,8 +566,10 @@ pub fn disclosures(evidence: &[Evidence]) -> Result<Disclosures, Error> {
 /// The items `evidence` voids (bit i for item i) and the sources it shows
 /// executed. Each evidence must void an item, or show a Plain source
 /// executed, which values its fallbacks. `chain` must be verified from the
-/// source terms' checkpoint; it is needed only for `Expired`.
+/// source terms' checkpoint; it is needed only for `Expired`, which only
+/// v3 admits.
 fn void(
+    version: Version,
     keyset: &Keyset,
     claim: &UnsignedClaim,
     evidence: &[Evidence],
@@ -655,6 +661,9 @@ fn void(
                 }
             }
             Evidence::Expired { source } => {
+                if version != Version::V3 {
+                    return Err(bad("expiry voids nothing under v4"));
+                }
                 let terms = sources
                     .get(source)
                     .and_then(|s| s.terms())
@@ -691,9 +700,19 @@ fn void(
 }
 
 /// What no evidence voided: settled and timed items, and the fallbacks of
-/// the Plain sources shown executed, capped at the claim's amount.
-fn live(claim: &UnsignedClaim, mask: u32, executed: &BTreeSet<ProposalId>) -> u32 {
+/// the Plain sources shown executed, capped at the claim's amount. Under v4
+/// a timed lock's Pay item counts only if the claim advertises an
+/// activation of the lock (which [`eligible`] verified on Bitcoin): the
+/// statement can't see an expiry, so a Pay without one may have been
+/// refunded.
+fn live(
+    version: Version,
+    claim: &UnsignedClaim,
+    mask: u32,
+    executed: &BTreeSet<ProposalId>,
+) -> u32 {
     let sources: BTreeMap<_, _> = claim.parts().sources.iter().map(|s| (s.id(), s)).collect();
+    let activated: BTreeSet<_> = claim.parts().activations.iter().map(|a| a.source).collect();
     let mut live = 0u128;
     for (i, item) in claim.parts().items.iter().enumerate() {
         if mask & (1 << i) != 0 {
@@ -701,9 +720,13 @@ fn live(claim: &UnsignedClaim, mask: u32, executed: &BTreeSet<ProposalId>) -> u3
         }
         let valued = match item {
             Item::Settled(_) => true,
-            Item::Pending { source, .. } => {
-                sources[source].terms().is_some() || executed.contains(source)
-            }
+            Item::Pending { source, branch, .. } => match sources[source].terms() {
+                None => executed.contains(source),
+                Some(_) => match (version, branch) {
+                    (Version::V4 { .. }, Branch::Pay) => activated.contains(source),
+                    _ => true,
+                },
+            },
         };
         if valued {
             live += u128::from(item.message().denomination());
@@ -721,13 +744,25 @@ pub struct Witness {
     pub notes: Vec<Note>,
     /// The body of each claimed source, in P's (source-id) order.
     pub sources: Vec<SourceWitness>,
-    /// The inclusion of each advertised activation, in P's order.
-    pub activations: Vec<Inclusion>,
+    /// The evidence of each advertised activation, in P's order.
+    pub activations: Vec<ActivationWitness>,
+}
+
+/// An advertised activation's public evidence: its transaction's inclusion
+/// and, under a v4 Base, the lock checkpoint it is anchored to (the one the
+/// lock's terms name), which must be a block of the chain the statement
+/// reads. Under v3 the lock's checkpoint must be Base's, and none is filed.
+#[derive(Clone)]
+pub struct ActivationWitness {
+    pub inclusion: Inclusion,
+    pub anchor: Option<Checkpoint>,
 }
 
 /// A claim as filed on Bitcoin under the hub-proves model: P and its public
 /// witness W, `LICASH-F\x01 ‖ P ‖ W`, which the holder's publication
 /// carries after R (Lichen's claim slot, `lichen_statement::claim_script`).
+/// Its activations anchored, `LICASH-F\x02 ‖ P ‖ W`, each activation's
+/// inclusion followed by its anchor.
 ///
 /// **Recovery authority.** There is no ownership check: an item is
 /// designated by its hold key Q signing this claim's context (P's
@@ -783,6 +818,8 @@ impl Filing {
                 .zip(&parts.sources)
                 .any(|(w, source)| w.proposal().id() != source.id())
             || witness.activations.len() != parts.activations.len()
+            || witness.activations.iter().any(|a| a.anchor.is_some())
+                && witness.activations.iter().any(|a| a.anchor.is_none())
         {
             return Err(bad("the witness does not line up with P"));
         }
@@ -799,9 +836,17 @@ impl Filing {
         &self.witness
     }
 
+    fn anchored(&self) -> bool {
+        self.witness.activations.iter().any(|a| a.anchor.is_some())
+    }
+
     pub fn to_bytes(&self) -> Vec<u8> {
         let w = &self.witness;
-        let mut bytes = F_MAGIC.to_vec();
+        let magic = match self.anchored() {
+            false => F_MAGIC,
+            true => F_MAGIC_ANCHORED,
+        };
+        let mut bytes = magic.to_vec();
         put_blob(&mut bytes, &self.publication.to_bytes());
         put_count(&mut bytes, w.notes.len());
         for note in &w.notes {
@@ -832,7 +877,7 @@ impl Filing {
             }
         }
         put_count(&mut bytes, w.activations.len());
-        for inclusion in &w.activations {
+        for ActivationWitness { inclusion, anchor } in &w.activations {
             put_blob(&mut bytes, &inclusion.transaction);
             bytes.extend(inclusion.index.to_be_bytes());
             put_count(&mut bytes, inclusion.siblings.len());
@@ -844,6 +889,9 @@ impl Filing {
             for sibling in &inclusion.coinbase_siblings {
                 bytes.extend(sibling);
             }
+            if let Some(anchor) = anchor {
+                put_blob(&mut bytes, &anchor.to_bytes());
+            }
         }
         bytes
     }
@@ -852,7 +900,8 @@ impl Filing {
     /// it, every note verified under `keyset` and every signed source against
     /// its notes. The keyset and authorization limit are the opening's.
     pub fn from_bytes(keyset: &Keyset, limit: usize, bytes: &[u8]) -> Result<Self, Error> {
-        if bytes.len() > MAX_PUBLICATION_BYTES || !bytes.starts_with(F_MAGIC) {
+        let anchored = bytes.starts_with(F_MAGIC_ANCHORED);
+        if bytes.len() > MAX_PUBLICATION_BYTES || !(anchored || bytes.starts_with(F_MAGIC)) {
             return Err(bad("filing framing"));
         }
         let mut r = Reader(&bytes[F_MAGIC.len()..]);
@@ -885,13 +934,18 @@ impl Filing {
         };
         let mut activations = Vec::new();
         for _ in 0..r.count(MAX_ITEMS)? {
-            activations.push(Inclusion {
+            let inclusion = Inclusion {
                 transaction: r.blob()?.to_vec(),
                 index: r.u32()?,
                 siblings: siblings(&mut r)?,
                 coinbase: r.blob()?.to_vec(),
                 coinbase_siblings: siblings(&mut r)?,
-            });
+            };
+            let anchor = match anchored {
+                true => Some(Checkpoint::from_bytes(r.blob()?)?),
+                false => None,
+            };
+            activations.push(ActivationWitness { inclusion, anchor });
         }
         if !r.0.is_empty() {
             return Err(bad("trailing filing bytes"));
@@ -914,10 +968,13 @@ impl Filing {
 /// Whether a decoded filing is eligible under this opening and request: an
 /// error is the holder's, and leaves the claim owed nothing.
 ///
-/// The Pay outputs of a timed lock are eligible only under a Base opened on
-/// the checkpoint that the lock's terms name: the statement reads Bitcoin
-/// from Base's checkpoint, so under any other the Hub could never show that
-/// the lock expired, and an expired, refunded lock would be paid twice.
+/// Under v3, the Pay outputs of a timed lock are eligible only under a Base
+/// opened on the checkpoint that the lock's terms name: the statement reads
+/// Bitcoin from Base's checkpoint, so under any other the Hub could never
+/// show that the lock expired, and an expired, refunded lock would be paid
+/// twice. Under v4 a lock may name any checkpoint on the chain the
+/// statement reads, its activation anchored to it, and a Pay is owed only
+/// with an activation ([`live`]).
 fn eligible(filing: &Filing, base: &Base, request: &Request, chain: &Chain) -> Result<(), Error> {
     let publication = &filing.publication;
     publication.bind(base, request)?;
@@ -951,7 +1008,7 @@ fn eligible(filing: &Filing, base: &Base, request: &Request, chain: &Chain) -> R
         let timed_elsewhere = metadata[source]
             .terms()
             .is_some_and(|t| (t.profile(), *t.checkpoint()) != agreed);
-        if *branch == Branch::Pay && timed_elsewhere {
+        if *branch == Branch::Pay && timed_elsewhere && base.version() == Version::V3 {
             return Err(bad("pay output of a lock timed on another checkpoint"));
         }
         let outputs = match branch {
@@ -969,7 +1026,7 @@ fn eligible(filing: &Filing, base: &Base, request: &Request, chain: &Chain) -> R
         }
     }
     let max = parts.limits.max_transaction_bytes as usize;
-    for (record, inclusion) in claim
+    for (record, w) in claim
         .parts()
         .activations
         .iter()
@@ -978,11 +1035,16 @@ fn eligible(filing: &Filing, base: &Base, request: &Request, chain: &Chain) -> R
         let terms = metadata[&record.source]
             .terms()
             .expect("admitted source is timed");
+        let anchor = match (base.version(), &w.anchor) {
+            (Version::V3, None) => chain.checkpoint(),
+            (Version::V4 { .. }, Some(anchor)) => anchor,
+            _ => return Err(bad("activation anchor of another Base version")),
+        };
         Activation {
             reference: record.reference,
-            inclusion: inclusion.clone(),
+            inclusion: w.inclusion.clone(),
         }
-        .verify(chain, terms, max)?;
+        .verify(chain, anchor, terms, max)?;
     }
     Ok(())
 }
@@ -1007,10 +1069,12 @@ pub struct Owed {
 /// A claim the holder got wrong is ineligible, and owed 0: bytes that don't
 /// decode, a P for another opening or request, a note the issuer didn't
 /// sign, a source body that doesn't authenticate or an output it doesn't
-/// open, a Pay of a lock timed on another checkpoint, an activation `chain`
-/// doesn't bury at its terms' depth. Otherwise the claim is owed what the
-/// Hub's evidence leaves live, capped at its amount: with no evidence, its
-/// amount.
+/// open, under v3 a Pay of a lock timed on another checkpoint, an activation
+/// `chain` doesn't bury at its terms' depth (under v4, after the lock's
+/// checkpoint, which must be a block of `chain`). Otherwise the claim is
+/// owed what the Hub's evidence leaves live, capped at its amount: with no
+/// evidence, its amount, less under v4 any lock's Pay it advertises no
+/// activation of.
 ///
 /// An error is the Hub's, and it can't prove with these inputs: evidence
 /// that doesn't verify or voids nothing, evidence against an ineligible
@@ -1047,9 +1111,9 @@ pub fn owed(
         }
     };
     let claim = filing.publication.claim();
-    let (mask, executed) = void(&parts.keyset, claim, evidence, Some(chain))?;
+    let (mask, executed) = void(base.version(), &parts.keyset, claim, evidence, Some(chain))?;
     Ok(Owed {
-        owed: live(claim, mask, &executed),
+        owed: live(base.version(), claim, mask, &executed),
         mask,
         disclosures: disclosures(evidence)?,
         ineligible: None,

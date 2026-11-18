@@ -768,20 +768,30 @@ pub struct Activation {
 }
 
 impl Activation {
+    /// The lock's secret, if this activation of it is on `chain`: in a
+    /// block after `anchor`, the checkpoint the lock's terms name, and
+    /// before the lock's expiry, buried at the terms' depth. `anchor` must
+    /// be a block of `chain`: its own checkpoint, or one of its headers.
+    ///
     /// A missing, shallow, late or context-mismatched positive witness is an
     /// error, not evidence of nonactivation. No absence proof is claimed here.
     pub fn verify(
         &self,
         chain: &Chain,
+        anchor: &Checkpoint,
         terms: &TimedTerms,
         max_transaction_bytes: usize,
     ) -> Result<[u8; 32], Error> {
-        let checkpoint = chain.checkpoint();
         let reference = &self.reference;
-        if terms.profile() != checkpoint.profile()
-            || terms.checkpoint() != &checkpoint.commitment()
-            || terms.expiry() <= checkpoint.height()
-            || reference.height <= checkpoint.height()
+        if anchor.profile() != chain.checkpoint().profile()
+            || chain.block_hash(anchor.height()) != Some(sha256d(anchor.header()))
+        {
+            return Err(bad("activation anchor is not on the chain"));
+        }
+        if terms.profile() != anchor.profile()
+            || terms.checkpoint() != &anchor.commitment()
+            || terms.expiry() <= anchor.height()
+            || reference.height <= anchor.height()
             || reference.height >= terms.expiry()
             || chain.block_hash(reference.height) != Some(reference.block_hash)
             || chain
