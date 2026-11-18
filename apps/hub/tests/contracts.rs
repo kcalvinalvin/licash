@@ -213,6 +213,83 @@ async fn an_opening_carries_on_where_an_instance_upload_dropped() -> Result<()> 
     Ok(())
 }
 
+/// A quote the hub no longer makes once she sends her Open, its fee
+/// surcharged meanwhile as its contracts filled up: refused as such, her
+/// opening is given up and made again on a quote asked anew, at the price
+/// now, within her ceiling.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs bitcoind and a release build"]
+async fn a_wallet_quoted_before_the_hub_surcharged_opens_on_a_quote_asked_again() -> Result<()> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let rt = Regtest::start_standard()?;
+    let dir = tempfile::tempdir()?;
+    // Armed, the hub's most contracts falls to 2 once it answered a quote.
+    let armed = Arc::new(AtomicBool::new(false));
+    let arm = armed.clone();
+    let serve = move |app: axum::Router, openings: Arc<Openings>| {
+        app.layer(axum::middleware::from_fn(
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                let (armed, openings) = (arm.clone(), openings.clone());
+                async move {
+                    let quote = request.uri().path() == licash_contracts::QUOTE;
+                    let response = next.run(request).await;
+                    if quote && armed.swap(false, Ordering::SeqCst) {
+                        openings.limit_live(2);
+                    }
+                    response
+                }
+            },
+        ))
+    };
+    let (url, source, _hub, _) =
+        hub_answering_through(&rt, &dir.path().join("hub"), None, serve).await?;
+    let chain = Node(source);
+    let mine = dir.path().join("wallet");
+    std::fs::create_dir(&mine)?;
+    let regtest = ChainProfile::Core30DefaultRegtest;
+    let wallet = Wallet::create(
+        &mine.join("wallet.sqlite"),
+        &[7; 32],
+        regtest,
+        Http::new(None)?,
+    )?;
+    wallet.add_hub(&url).await?;
+    wallet.watch_silent(None, rt.height()?)?;
+    for sats in [100_000, 60_000] {
+        let to = wallet.fallback_address()?.script_pubkey();
+        rt.fund(&to, Amount::from_sat(sats))?;
+    }
+    rt.mine(1)?;
+    ensure!(scan(&wallet, &chain).await? == 160_000);
+    let ask = Ask {
+        max_price: 60_000,
+        ..ask()
+    };
+    let first = holder::open(&wallet, &chain, &mine, &url, ask).await?;
+    ensure!(
+        first.phase == Phase::Funded && first.price == 23_000,
+        "{first:?}"
+    );
+
+    // One of 2 live once the hub quoted her: its fee doubled since.
+    armed.store(true, Ordering::SeqCst);
+    let second = holder::open(&wallet, &chain, &mine, &url, ask).await?;
+    ensure!(second.phase == Phase::Funded, "{second:?}");
+    ensure!(
+        second.price > first.price,
+        "{} not surcharged",
+        second.price
+    );
+    ensure!(!armed.load(Ordering::SeqCst), "not quoted");
+    let contracts = holder::list(&mine)?;
+    let given_up = contracts.iter().filter(|c| c.abandoned.is_some()).count();
+    ensure!(contracts.len() == 3 && given_up == 1, "{contracts:?}");
+    let abandoned = contracts.iter().find(|c| c.abandoned.is_some()).unwrap();
+    let why = abandoned.abandoned.as_deref().unwrap_or_default();
+    ensure!(why.contains("not the hub's quote"), "{why}");
+    Ok(())
+}
+
 fn ask() -> Ask {
     Ask {
         blocks: 300,
@@ -1053,6 +1130,17 @@ async fn hub_answering_with(
     dir: &Path,
     range: Option<Range>,
 ) -> Result<(String, Source, Arc<Hub>, Arc<Openings>)> {
+    hub_answering_through(rt, dir, range, |app, _| app).await
+}
+
+/// As [`hub_answering_with`], its service made by `serve` of the hub
+/// service's router and its contracts.
+async fn hub_answering_through(
+    rt: &Regtest,
+    dir: &Path,
+    range: Option<Range>,
+    serve: impl FnOnce(axum::Router, Arc<Openings>) -> axum::Router,
+) -> Result<(String, Source, Arc<Hub>, Arc<Openings>)> {
     std::fs::create_dir_all(dir)?;
     let (seed, db) = (dir.join("seed"), dir.join("hub.sqlite"));
     Hub::init(&seed, &db, 12)?;
@@ -1073,7 +1161,10 @@ async fn hub_answering_with(
         contracts: Some(openings.clone()),
         ..Default::default()
     };
-    let app = licash_hub_service::router(hub.clone(), services);
+    let app = serve(
+        licash_hub_service::router(hub.clone(), services),
+        openings.clone(),
+    );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let url = format!("http://{}", listener.local_addr()?);
     tokio::spawn(async move { axum::serve(listener, app).await });

@@ -197,7 +197,9 @@ alike, not the holder's reserve) doubles at each eighth more: 2, 4, 8, then
 16 times at 87.5%. At the maximum it opens none until one ends. So the half
 it can always defend pays its way, and the rest pays for more or better
 hardware. `/v1/info` prices contracts as surcharged now, and a quote made
-at another step is refused for the wallet to ask again. An alert says when
+at another step is refused with 409: wallets give that opening up and ask
+for a quote once more, opening at the new price if within what their
+holder agreed to pay. An alert says when
 the surcharge rises or the hub is full. An upgraded hub already past the
 maximum keeps its contracts and opens no new ones until some end.
 

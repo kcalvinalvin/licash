@@ -154,8 +154,32 @@ pub async fn open_anyway<T: Transport, C: Chain>(
     open_at(wallet, chain, dir, hub, ask, change, false, RESUMES).await
 }
 
+/// One opening as [`open_once`], or, refused as the hub quotes otherwise
+/// now (its fee surcharged since, say), given up and made once more on a
+/// quote asked anew: within her ceilings still.
 #[allow(clippy::too_many_arguments)]
 async fn open_at<T: Transport, C: Chain>(
+    wallet: &Wallet<T>,
+    chain: &C,
+    dir: &Path,
+    hub: &str,
+    ask: Ask,
+    change: Change,
+    sane: bool,
+    resumes: u32,
+) -> Result<Contract> {
+    let opened = open_once(wallet, chain, dir, hub, ask, change, sane, resumes).await;
+    match opened {
+        Err(e) if e.downcast_ref::<driver::Requote>().is_some() => {
+            tracing::info!(%hub, "its quote refused as the hub's no longer: asked again: {e:#}");
+            open_once(wallet, chain, dir, hub, ask, change, sane, resumes).await
+        }
+        opened => opened,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn open_once<T: Transport, C: Chain>(
     wallet: &Wallet<T>,
     chain: &C,
     dir: &Path,

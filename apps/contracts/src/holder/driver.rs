@@ -122,6 +122,18 @@ impl std::fmt::Display for Refusal {
 
 impl std::error::Error for Refusal {}
 
+/// A [`Refusal`] of a quote the hub no longer makes (409): its fee rose
+/// as its contracts filled up, or the quote's block is too old. Asked
+/// again, it quotes anew.
+#[derive(Debug)]
+pub(super) struct Requote;
+
+impl std::fmt::Display for Requote {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the hub quotes otherwise now")
+    }
+}
+
 pub(super) struct Driver<'a, T, C> {
     pub wallet: &'a Wallet<T>,
     pub chain: &'a C,
@@ -491,8 +503,11 @@ impl<T: Transport, C: Chain> Driver<'_, T, C> {
 /// The hub's answer of `status`: refused if it will refuse it again.
 pub(super) fn failed(hub: &str, status: u16, body: &[u8]) -> anyhow::Error {
     let reason = String::from_utf8_lossy(&body[..body.len().min(500)]).into_owned();
-    if (400..500).contains(&status) {
-        Refusal(format!("{hub} refused it: {reason}")).into()
+    let refusal = Refusal(format!("{hub} refused it: {reason}"));
+    if status == 409 {
+        anyhow::Error::new(refusal).context(Requote)
+    } else if (400..500).contains(&status) {
+        refusal.into()
     } else {
         anyhow!("{hub}: status {status}: {reason}")
     }
@@ -501,6 +516,22 @@ pub(super) fn failed(hub: &str, status: u16, body: &[u8]) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A 409 is a refusal, its opening given up, of a quote to ask again;
+    /// another 4xx a refusal alone; a 5xx neither.
+    #[test]
+    fn a_stale_quote_is_refused_to_be_asked_again() {
+        let stale = failed("hub", 409, b"not the hub's quote: ask again");
+        assert!(stale.downcast_ref::<Refusal>().is_some());
+        assert!(stale.downcast_ref::<Requote>().is_some());
+        assert!(format!("{stale:#}").contains("not the hub's quote"));
+        let bad = failed("hub", 400, b"no");
+        assert!(bad.downcast_ref::<Refusal>().is_some());
+        assert!(bad.downcast_ref::<Requote>().is_none());
+        let down = failed("hub", 503, b"later");
+        assert!(down.downcast_ref::<Refusal>().is_none());
+        assert!(down.downcast_ref::<Requote>().is_none());
+    }
 
     #[test]
     fn an_opening_is_stepping_while_its_holder_works_out_a_step() {

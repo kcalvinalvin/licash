@@ -166,6 +166,14 @@ impl Refused {
         }
     }
 
+    /// A quote the hub no longer makes: 409, for her to ask again.
+    pub(crate) fn stale(reason: impl std::fmt::Display) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            reason: format!("{reason:#}"),
+        }
+    }
+
     pub(crate) fn unavailable(reason: impl std::fmt::Display) -> Self {
         Self {
             status: StatusCode::SERVICE_UNAVAILABLE,

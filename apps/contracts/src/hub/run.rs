@@ -125,7 +125,7 @@ impl Openings {
             .map_err(Refused::unavailable)?
             .height;
         if height > tip || tip - height > MAX_AGE {
-            return Err(Refused::bad(format!(
+            return Err(Refused::stale(format!(
                 "a quote of block {height}, the tip at {tip}: ask again"
             )));
         }
@@ -148,7 +148,7 @@ impl Openings {
                 return Ok(());
             }
         }
-        Err(Refused::bad("not the hub's quote: ask again"))
+        Err(Refused::stale("not the hub's quote: ask again"))
     }
 
     /// Step opening `id` with `message` in a task of its own, answering
