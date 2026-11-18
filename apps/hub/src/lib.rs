@@ -69,7 +69,7 @@ pub fn open_on_lock_checkpoints(openings: &licash_contracts::hub::Openings, hub:
             let (top, _) = scan
                 .scanned()?
                 .ok_or_else(|| anyhow::anyhow!("the hub follows no chain yet"))?;
-            Ok((top.min(tip) + 1).saturating_sub(bury))
+            lock_checkpoint_height(top, tip, bury)
         }),
         keep: Box::new(move |checkpoint| {
             if hub
@@ -81,6 +81,18 @@ pub fn open_on_lock_checkpoints(openings: &licash_contracts::hub::Openings, hub:
             Ok(hub.add_checkpoint(checkpoint)?)
         }),
     });
+}
+
+/// The height of the newest lock checkpoint of a ledger scanned to `top`,
+/// the chain's tip at `tip`: buried `bury` deep in its scan. None while
+/// its scan lags the tip by more than `bury` blocks: a contract opened on
+/// it would be shortened by as many, or refused by her wallet.
+fn lock_checkpoint_height(top: u32, tip: u32, bury: u32) -> anyhow::Result<u32> {
+    anyhow::ensure!(
+        tip.saturating_sub(top) <= bury,
+        "the hub's scan of the chain is at {top}, the tip at {tip}: it opens no contract until it catches up"
+    );
+    Ok((top.min(tip) + 1).saturating_sub(bury))
 }
 
 /// What a hub serves beside its ledger, each if it runs it.
@@ -550,4 +562,19 @@ async fn inbox_acks(
         Ok(licash_api::inbox::Acks { acks })
     })
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn contracts_open_buried_in_a_scan_that_keeps_up_with_the_tip() {
+        assert_eq!(lock_checkpoint_height(100, 100, 6).unwrap(), 95);
+        assert_eq!(lock_checkpoint_height(100, 106, 6).unwrap(), 95);
+        // A tip behind the scan (a node of another view): from the tip.
+        assert_eq!(lock_checkpoint_height(100, 98, 6).unwrap(), 93);
+        assert!(lock_checkpoint_height(100, 107, 6).is_err());
+        assert_eq!(lock_checkpoint_height(3, 3, 6).unwrap(), 0);
+    }
 }

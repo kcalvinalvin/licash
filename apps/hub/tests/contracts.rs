@@ -428,7 +428,8 @@ async fn a_hub_opens_contracts_on_its_newest_lock_checkpoint() -> Result<()> {
     let at = offer.quote.chain.checkpoint.clone();
     let bury = Policy::default().timing.bury;
     ensure!(at.height() == tip + 1 - bury && at.height() > first.height());
-    ensure!(newest(&hub) == Some(at.commitment()), "not kept");
+    // A quote keeps nothing: an opening does.
+    ensure!(newest(&hub) == Some(first.commitment()), "kept on a quote");
     let opened = holder::open(&wallet, &chain, &mine, &url, ask()).await?;
     ensure!(opened.phase == Phase::Funded, "{opened:?}");
     ensure!(newest(&hub) == Some(at.commitment()));

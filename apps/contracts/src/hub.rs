@@ -414,8 +414,9 @@ impl Openings {
         })
     }
 
-    /// The hub's offer now, checkpointed at the ledger's newest lock
-    /// checkpoint ([`Openings::checkpoints_with`]), else at its tip: its
+    /// The hub's offer now, checkpointed at the block the ledger would
+    /// take as its newest lock checkpoint ([`Openings::checkpoints_with`]),
+    /// kept as one once a contract opens on it, else at its tip: its
     /// quote of `cap` sat over `blocks` she chose, if within its terms,
     /// else its fixed one.
     pub async fn offer(&self, chosen: Option<(u32, u32)>) -> Result<Offer, Refused> {
@@ -431,7 +432,6 @@ impl Openings {
         let height = self.opening_height(tip.height)?;
         let checkpoint = self.source.checkpoint(height).await;
         let checkpoint = checkpoint.map_err(Refused::unavailable)?;
-        self.keep_checkpoint(&checkpoint)?;
         let timing = self.timing.at_step(self.step_now()?);
         let quote = timing.quote_for(self.keyset.clone(), checkpoint, cap, blocks);
         let bounds = self.timing.bounds(&quote);

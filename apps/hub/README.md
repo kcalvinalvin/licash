@@ -172,9 +172,11 @@ login limited by `-rpcwhitelist` needs `getbalances` among its calls, or
 the hub advertises the range's largest cap whatever its wallet holds.
 The collateral of a contract is the next power of two minus one sat at or
 above its cap (2,097,151 sat at least, 2,147,483,647 at most). A contract
-opens on the hub's newest lock checkpoint, a block as deep as those, which it takes
-as one if newer, so that every lock named after it can be claimed in it:
-the hub offers no contract until its scan of the chain has begun. F, a contract's
+opens on a block as deep in the hub's scan as its lock checkpoints, which
+it takes as one when the contract opens if newer, so that every lock
+named after it can be claimed in it: the hub offers no contract until its
+scan of the chain has begun, nor while it lags the tip by more than that
+depth. F, a contract's
 funding, spends the wallet's coins, which stay locked while the opening
 lives. A wallet that has the hub sign F and never broadcasts it holds
 those coins locked, so the hub frees them itself. Once a coin F spends is
