@@ -95,6 +95,9 @@ pub struct Openings {
     alert: std::sync::OnceLock<Arc<Alert>>,
     /// The claims given no response this round, for want of the prover.
     withheld: Mutex<Vec<String>>,
+    /// Whether more contracts are open than its prover can contest the
+    /// exits of at once, as last told.
+    over_capacity: std::sync::atomic::AtomicBool,
     /// Each contract's fold offered, until its holder signs or asks again.
     folds: Mutex<HashMap<[u8; 32], dispute::PendingFold>>,
     /// What the node's wallet last said it holds, in sat: the most it
@@ -293,6 +296,7 @@ impl Openings {
                 .then(|| prover::Prover::start(data, trust.program, prover::spacing(profile))),
             alert: std::sync::OnceLock::new(),
             withheld: Mutex::default(),
+            over_capacity: Default::default(),
             folds: Mutex::default(),
             funds: Mutex::new(None),
         });
@@ -472,6 +476,7 @@ impl Openings {
     pub async fn answer_requests(&self) -> Result<ResponseRound> {
         let ids = self.store().signed_ids()?;
         self.keep_loaded(&ids);
+        let round_open = ids.len();
         let mut round = ResponseRound::default();
         for id in ids {
             match self.play(&id).await {
@@ -492,6 +497,27 @@ impl Openings {
         }
         if let Some(prover) = &self.prover {
             prover.polled();
+            let blocks = self.timing.proving_blocks();
+            if let Some(defendable) = prover.defendable(blocks) {
+                let open = round_open as u64;
+                let over = open > defendable;
+                if over
+                    && !self
+                        .over_capacity
+                        .swap(true, std::sync::atomic::Ordering::Relaxed)
+                {
+                    self.alert(&format!(
+                        "{open} contracts are open, and the hub's prover makes about {defendable} \
+                         proofs of the smallest in an assert window ({blocks} blocks): exits by \
+                         more of their holders at once than it can prove for are paid what they \
+                         claim"
+                    ));
+                }
+                if !over {
+                    self.over_capacity
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
         }
         let withheld =
             std::mem::take(&mut *self.withheld.lock().unwrap_or_else(PoisonError::into_inner));
@@ -743,6 +769,7 @@ mod tests {
             prover: None,
             alert: std::sync::OnceLock::new(),
             withheld: Mutex::default(),
+            over_capacity: Default::default(),
             folds: Mutex::default(),
             funds: Mutex::new(None),
         }

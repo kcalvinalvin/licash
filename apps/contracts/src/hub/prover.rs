@@ -259,6 +259,17 @@ impl Prover {
         self.0.alert(message);
     }
 
+    /// How many proofs of the smallest contract's statement (the
+    /// benchmark's input, 15 headers) the prover makes in `blocks`: what
+    /// bounds the exits it can contest at once. None until it is ready.
+    pub fn defendable(&self, blocks: u32) -> Option<u64> {
+        let Some(Readiness::Ready(speed)) = &self.0.state().readiness else {
+            return None;
+        };
+        let seconds = speed.seconds(cycles(15, 33_600));
+        Some((f64::from(blocks) * self.0.spacing / seconds) as u64)
+    }
+
     /// The work directory of `id`'s proof.
     pub fn dir(&self, id: &[u8; 32]) -> PathBuf {
         self.0.dir.join(crate::hex_id(id))
@@ -868,6 +879,24 @@ mod tests {
             p.admit(&[2; 32], 5, 2_000_000, 111, 101, 100),
             Admission::Admit
         );
+    }
+
+    #[test]
+    fn the_exits_defendable_are_the_smallest_proofs_a_window_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        // About 1,000 s with the margin.
+        let segment = 1_000.0 / MARGIN / 335.0;
+        let speed = Speed {
+            device: "cuda".into(),
+            segment_cycles: cycles(15, 33_600).div_ceil(335),
+            segment,
+            tail: 0.0,
+        };
+        let p = ready(dir.path(), speed);
+        // Signet's 39 blocks: 23,400 s.
+        assert_eq!(p.defendable(39), Some(23));
+        p.0.state().readiness = Some(Readiness::NotReady("no GPU".into()));
+        assert_eq!(p.defendable(39), None);
     }
 
     #[test]

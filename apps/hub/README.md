@@ -220,7 +220,9 @@ changing the GPU). A prover not ready (none installed, no
 Groth16 setup, under 8.5 GB of memory, a failed benchmark) responds to no
 contested claim. The hub's notifications alert it, a prover that fails, a
 proof the plan would make late, an assertion's deadline 6 blocks away
-unproven, and the claims a round gave no response to. Each proof's work is
+unproven, the claims a round gave no response to, and more contracts open
+than proofs of the smallest one its prover makes in an assert window (the
+exits it can contest at once). Each proof's work is
 in `<data>/hp-proofs/<id>/`: its input, frozen once it first holds, the
 prover's progress, carried on across restarts, its `prover.log` and
 `proof.json`. The proof is pinned in `responses.sqlite` before the assertion
