@@ -79,7 +79,8 @@ impl Gateway {
 
     /// Refuse to pay `request` for lock `id` for `why`: the payment is
     /// recorded failed, which refunds the lock, if the engine would have
-    /// forwarded it; refused as is otherwise.
+    /// forwarded it; refused as is otherwise. Never recorded pending, it
+    /// is never started.
     pub(super) async fn refuse(
         &self,
         id: ProposalId,
@@ -89,10 +90,7 @@ impl Gateway {
         why: &'static str,
     ) -> Result<Paying, Failure> {
         let recorded = self
-            .on_hub(move |hub| {
-                hub.forward(&id, &hash, &request, &node, 0)?;
-                hub.forward_failed(&id, why)
-            })
+            .on_hub(move |hub| hub.forward_refused(&id, &hash, &request, &node, why))
             .await;
         match recorded {
             Ok(()) => {
@@ -242,14 +240,18 @@ impl Gateway {
     }
 
     /// The timelock and fee limit to start `forward` with, if it can
-    /// still be paid in time.
+    /// still be paid in time, and is one the gateway pays, for no more
+    /// than its lock pays the hub. A forward recorded pending though
+    /// refused, as a refusal was recorded before it failed at once, is
+    /// never started: given up as one too late.
     fn resend(&self, forward: &Forward, view: &View) -> Option<(u32, u64)> {
         let invoice: Bolt11Invoice = forward.request.parse().ok()?;
-        if expires(&invoice, self.config.pay_timeout) {
+        let msat = self.payable(&invoice, view, forward.expiry).ok()?;
+        let limit = self.cltv_limit(forward.expiry, view.tip, &invoice)?;
+        let sat = msat.div_ceil(1000);
+        if sat > forward.amount {
             return None;
         }
-        let limit = self.cltv_limit(forward.expiry, view.tip, &invoice)?;
-        let sat = invoice.amount_milli_satoshis()?.div_ceil(1000);
         let fee_limit = self
             .config
             .pay

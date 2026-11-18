@@ -71,6 +71,40 @@ impl Hub {
         node: &str,
         least: u64,
     ) -> Result<Forward, Error> {
+        let new = self.new_forward(id, hash, request, node, least)?;
+        let forward = self.store.write(|tx| record(tx, &new))?;
+        tracing::info!(proposal = %hex::encode(id.as_bytes()), amount = new.amount, "forwarding");
+        Ok(forward)
+    }
+
+    /// Refuse the payment of `request`, of `hash`, by `node`, for lock
+    /// `id`, for `reason`: recorded as [`Hub::forward`] records it,
+    /// whatever the lock pays, but failed in the same transaction, which
+    /// refunds the lock. Never pending, it is never one to start.
+    pub fn forward_refused(
+        &self,
+        id: &ProposalId,
+        hash: &[u8; 32],
+        request: &str,
+        node: &str,
+        reason: &str,
+    ) -> Result<(), Error> {
+        let new = self.new_forward(id, hash, request, node, 0)?;
+        self.refund_failed(id, reason, new.amount, Some(&new))?;
+        tracing::warn!(proposal = %hex::encode(id.as_bytes()), reason, "forward refused");
+        Ok(())
+    }
+
+    /// The forward of `request` for lock `id` to record, if the lock is
+    /// under `hash`, pays the hub only, and at least `least`.
+    fn new_forward<'a>(
+        &self,
+        id: &ProposalId,
+        hash: &[u8; 32],
+        request: &'a str,
+        node: &'a str,
+        least: u64,
+    ) -> Result<New<'a>, Error> {
         let lock = self.locked(id)?;
         if lock.own {
             return Err(Refusal::Forward("the hub's own lock").into());
@@ -91,56 +125,15 @@ impl Hub {
         if terms.hash() != hash {
             return Err(Refusal::Forward("the payment is not of the lock's hash").into());
         }
-        let synced = self.is_synced();
-        let forward = self.store.write(|tx| {
-            if let Some(forward) = forward_of(tx, id)? {
-                return match forward.state {
-                    _ if forward.request != request => {
-                        Err(Refusal::Forward("the lock pays another payment").into())
-                    }
-                    Forwarded::Pending => Ok(forward),
-                    Forwarded::Paid(_) => Err(Refusal::Settled.into()),
-                    Forwarded::Failed(_) => Err(Refusal::Forward("the payment failed").into()),
-                };
-            }
-            if settled_of(tx, id)?.is_some() {
-                return Err(Refusal::Settled.into());
-            }
-            let (top, _) = tip(tx)?.ok_or(Refusal::NoChain)?;
-            if top >= terms.expiry() {
-                return Err(Refusal::LockExpired.into());
-            }
-            if !synced {
-                return Err(Refusal::Unsynced.into());
-            }
-            let live: bool = tx
-                .query_row(
-                    "SELECT 1 FROM forwards WHERE hash = ?1 AND state IN ('pending', 'paid')",
-                    [terms.hash()],
-                    |_| Ok(true),
-                )
-                .optional()?
-                .unwrap_or(false);
-            if live {
-                return Err(Refusal::Forward("a payment of this hash is under way or made").into());
-            }
-            tx.execute(
-                "INSERT INTO forwards (lock, hash, request, node, amount, expiry, state, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7)",
-                params![
-                    id.as_bytes(),
-                    terms.hash(),
-                    request,
-                    node,
-                    sql(charge.pay),
-                    terms.expiry(),
-                    now()
-                ],
-            )?;
-            forward_of(tx, id)?.ok_or(Error::Halted)
-        })?;
-        tracing::info!(proposal = %hex::encode(id.as_bytes()), amount = charge.pay, "forwarding");
-        Ok(forward)
+        Ok(New {
+            id: *id,
+            hash: *hash,
+            expiry: terms.expiry(),
+            request,
+            node,
+            amount: charge.pay,
+            synced: self.is_synced(),
+        })
     }
 
     /// The forward for lock `id` paid, buying `preimage`: the lock pays the
@@ -179,7 +172,7 @@ impl Hub {
             Forwarded::Failed(_) => return Ok(()),
             Forwarded::Paid(_) => return Err(Refusal::Settled.into()),
         }
-        self.refund_failed(id, reason, forward.amount)?;
+        self.refund_failed(id, reason, forward.amount, None)?;
         tracing::warn!(proposal = %hex::encode(id.as_bytes()), reason, "forward failed");
         Ok(())
     }
@@ -211,6 +204,70 @@ impl Hub {
             Ok(rows.collect::<Result<_, _>>()?)
         })
     }
+}
+
+/// A forward checked against its lock, to record.
+pub(crate) struct New<'a> {
+    id: ProposalId,
+    hash: [u8; 32],
+    expiry: u32,
+    request: &'a str,
+    node: &'a str,
+    amount: u64,
+    /// Whether the hub followed the chain when checked.
+    synced: bool,
+}
+
+/// Record `new` pending, in `tx`: the forward already recorded for its
+/// lock if pending and of the same request; refused if the lock is settled
+/// or expired, or another forward of its hash is live.
+pub(crate) fn record(tx: &rusqlite::Transaction<'_>, new: &New<'_>) -> Result<Forward, Error> {
+    let id = &new.id;
+    if let Some(forward) = forward_of(tx, id)? {
+        return match forward.state {
+            _ if forward.request != new.request => {
+                Err(Refusal::Forward("the lock pays another payment").into())
+            }
+            Forwarded::Pending => Ok(forward),
+            Forwarded::Paid(_) => Err(Refusal::Settled.into()),
+            Forwarded::Failed(_) => Err(Refusal::Forward("the payment failed").into()),
+        };
+    }
+    if settled_of(tx, id)?.is_some() {
+        return Err(Refusal::Settled.into());
+    }
+    let (top, _) = tip(tx)?.ok_or(Refusal::NoChain)?;
+    if top >= new.expiry {
+        return Err(Refusal::LockExpired.into());
+    }
+    if !new.synced {
+        return Err(Refusal::Unsynced.into());
+    }
+    let live: bool = tx
+        .query_row(
+            "SELECT 1 FROM forwards WHERE hash = ?1 AND state IN ('pending', 'paid')",
+            [new.hash],
+            |_| Ok(true),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if live {
+        return Err(Refusal::Forward("a payment of this hash is under way or made").into());
+    }
+    tx.execute(
+        "INSERT INTO forwards (lock, hash, request, node, amount, expiry, state, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7)",
+        params![
+            id.as_bytes(),
+            new.hash,
+            new.request,
+            new.node,
+            sql(new.amount),
+            new.expiry,
+            now()
+        ],
+    )?;
+    forward_of(tx, id)?.ok_or(Error::Halted)
 }
 
 /// Whether a forward for lock `id` is pending.

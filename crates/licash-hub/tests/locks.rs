@@ -1137,6 +1137,42 @@ fn a_failed_forward_refunds_its_lock_at_once() {
 }
 
 #[test]
+fn a_refused_forward_is_recorded_failed_with_its_refund_never_pending() {
+    let (files, hub, mut chain) = setup(policy());
+    let (_, keyset) = issuer(&files);
+    let l = to_hub(&files, &hub, terms(&hub, chain.height() + 5, 1));
+    hub.lock(&l.signed, &l.notes).unwrap();
+    // Whatever the lock pays: refused before paying anything.
+    hub.forward_refused(&l.id(), &lock_hash(&SECRET), "lnbcrt1", "node", "too much")
+        .unwrap();
+    let forward = hub.forward_of(&l.id()).unwrap().unwrap();
+    assert_eq!(forward.state, Forwarded::Failed("too much".into()));
+    assert!(hub.forwards().unwrap().is_empty(), "none to start");
+    assert_eq!(hub.locked(&l.id()).unwrap().settled, Some(Settled::Refund));
+    let refunded = hub.refund(&l.id()).unwrap();
+    assert_eq!(opened(&keyset, &refunded, &l.refund).len(), 1);
+    assert!(kinds(&hub).contains(&"forwarded".to_owned()));
+    // Refused again, or forwarded after all: as a failed forward.
+    for again in [
+        hub.forward_refused(&l.id(), &lock_hash(&SECRET), "lnbcrt1", "node", "too much"),
+        hub.forward(&l.id(), &lock_hash(&SECRET), "lnbcrt1", "node", 0)
+            .map(drop),
+    ] {
+        assert!(matches!(refused(again), Refusal::Forward(_)));
+    }
+    // A lock the engine would not forward is refused as is: nothing recorded.
+    let late = to_hub(&files, &hub, terms(&hub, chain.height() + 2, 1));
+    hub.lock(&late.signed, &late.notes).unwrap();
+    chain.mine(&hub, 2);
+    assert_eq!(
+        refused(hub.forward_refused(&late.id(), &lock_hash(&SECRET), "lnbcrt2", "node", "no")),
+        Refusal::LockExpired
+    );
+    assert_eq!(hub.forward_of(&late.id()).unwrap(), None);
+    assert_eq!(hub.locked(&late.id()).unwrap().settled, None);
+}
+
+#[test]
 fn only_a_lock_paying_the_hub_alone_is_forwarded() {
     let (files, hub, chain) = setup(policy());
     let (_, keyset) = issuer(&files);

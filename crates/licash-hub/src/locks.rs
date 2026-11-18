@@ -549,20 +549,22 @@ impl Hub {
     }
 
     /// Refund lock `id`, of which the hub gets `amount`, at once: its
-    /// forward failed for `reason`.
+    /// forward failed for `reason`, recorded in the same transaction if
+    /// `new`.
     pub(crate) fn refund_failed(
         &self,
         id: &ProposalId,
         reason: &str,
         amount: u64,
+        new: Option<&forwards::New<'_>>,
     ) -> Result<(), Error> {
-        self.refund_as(id, Some((reason, amount))).map(drop)
+        self.refund_as(id, Some((reason, amount, new))).map(drop)
     }
 
     fn refund_as(
         &self,
         id: &ProposalId,
-        failed: Option<(&str, u64)>,
+        failed: Option<(&str, u64, Option<&forwards::New<'_>>)>,
     ) -> Result<Vec<MintResponse>, Error> {
         let Row {
             lock,
@@ -587,6 +589,9 @@ impl Hub {
             (issuances, income)
         };
         let refunded = self.store.write(|tx| {
+            if let Some((_, _, Some(new))) = failed {
+                forwards::record(tx, new)?;
+            }
             match settled_of(tx, id)? {
                 Some(Settled::Refund) => return Ok(false),
                 Some(Settled::Pay) => return Err(Refusal::Settled.into()),
@@ -594,7 +599,7 @@ impl Hub {
             }
             match failed {
                 // The hub gives up its claim, which it never paid for.
-                Some((reason, amount)) => forwards::fail(tx, id, reason, amount)?,
+                Some((reason, amount, _)) => forwards::fail(tx, id, reason, amount)?,
                 None => self.expired(tx, id, &terms, anchor)?,
             }
             if !lock.own {

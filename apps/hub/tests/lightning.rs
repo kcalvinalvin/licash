@@ -827,6 +827,50 @@ async fn a_payment_the_node_lost_is_sent_again_or_given_up_once_too_late() {
 }
 
 #[tokio::test]
+async fn a_refusal_left_pending_by_an_earlier_hub_is_never_paid() {
+    let net = Net::new().await;
+    let alice = net.funded("alice", 40).await;
+    let hash = lock_hash(&[8; 32]);
+    let request = net.node.invoice(20_000, hash, 18, Outcome::Hang);
+    // A lock of 1 for an invoice of 20, recorded pending as a refusal's
+    // first write once was, the gateway stopped before the second.
+    let address = net.info().await.address;
+    let lock = alice.lock(HUB, &address, 1, hash, None).await.unwrap();
+    let id = proposal_id(&lock.id);
+    let node = net.node.pubkey();
+    net.hub.forward(&id, &hash, &request, &node, 0).unwrap();
+    net.gateway.round().await;
+    assert!(net.node.sent().is_empty());
+    net.gateway.round().await;
+    assert!(net.node.sent().is_empty());
+    let lock = alice.follow_lock(&lock.id).await.unwrap();
+    assert_eq!(lock.state, LockState::Refunded);
+    assert_eq!(
+        net.hub.forward_of(&id).unwrap().unwrap().state,
+        licash_hub::Forwarded::Failed("not started in time".into())
+    );
+}
+
+#[tokio::test]
+async fn an_invoice_refused_for_a_lock_refunds_it_at_once_and_is_never_paid() {
+    let net = Net::new().await;
+    let alice = net.funded("alice", 40).await;
+    let hash = lock_hash(&[8; 32]);
+    let request = net.node.invoice(20_000, hash, 18, Outcome::Hang);
+    let address = net.info().await.address;
+    let lock = alice.lock(HUB, &address, 1, hash, None).await.unwrap();
+    let id = proposal_id(&lock.id);
+    let paying: Paying = post(&net, licash_api::LN_PAY, &Pay::new(&id, &request)).await;
+    assert_eq!(paying.state, PayState::Failed);
+    assert!(net.hub.forwards().unwrap().is_empty());
+    net.gateway.round().await;
+    assert!(net.node.sent().is_empty());
+    let lock = alice.follow_lock(&lock.id).await.unwrap();
+    assert_eq!(lock.state, LockState::Refunded);
+    assert_eq!(available(&alice), 40);
+}
+
+#[tokio::test]
 async fn htlcs_expiring_too_soon_cancel_the_invoice() {
     let net = Net::new().await;
     let wallet = net.wallet("alice");
