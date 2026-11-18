@@ -287,7 +287,7 @@ impl Openings {
         }
         // A node restarted forgets the coins it locked without persisting.
         let locked = openings.store().locked()?;
-        openings.lock_coins(&locked).await;
+        openings.relock_coins(&locked).await;
         Ok(openings)
     }
 

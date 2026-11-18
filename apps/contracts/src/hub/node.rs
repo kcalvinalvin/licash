@@ -15,6 +15,22 @@ const KEY_SPEND_WEIGHT: u64 = 230;
 /// The rate F pays when the node estimates none, in sat/vB.
 const FALLBACK_RATE: f64 = 2.0;
 
+/// Those of `coins` among `unspent`, what `listunspent` answered.
+fn still_free(coins: &[OutPoint], unspent: &Value) -> Vec<OutPoint> {
+    let free: std::collections::HashSet<OutPoint> = unspent
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|u| {
+            Some(OutPoint {
+                txid: u["txid"].as_str()?.parse().ok()?,
+                vout: u32::try_from(u["vout"].as_u64()?).ok()?,
+            })
+        })
+        .collect();
+    coins.iter().copied().filter(|o| free.contains(o)).collect()
+}
+
 fn coin(o: &OutPoint) -> Value {
     json!({ "txid": o.txid.to_string(), "vout": o.vout })
 }
@@ -146,6 +162,23 @@ impl Openings {
         self.lock(coins, false).await;
     }
 
+    /// Lock again, as the hub starts, those of `coins` the node's wallet
+    /// still holds free: one an F spent, or locked already across the
+    /// node's restart, needs none. All of them if it cannot say which.
+    pub(super) async fn relock_coins(&self, coins: &[OutPoint]) {
+        let unspent = self
+            .wallet
+            .rpc::<Value>("listunspent", json!([0, 9_999_999, [], true]))
+            .await;
+        match unspent {
+            Ok(unspent) => self.lock(&still_free(coins, &unspent), false).await,
+            Err(e) => {
+                tracing::warn!("the node's free coins, to lock those of F again: {e:#}");
+                self.lock(coins, false).await;
+            }
+        }
+    }
+
     pub(super) async fn unlock_coins(&self, coins: &[OutPoint]) {
         self.lock(coins, true).await;
     }
@@ -163,5 +196,27 @@ impl Openings {
                 tracing::warn!(coin = %o, unlock, "locking a coin of F: {e:#}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_the_coins_still_free_are_locked_again() {
+        let txid = "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b";
+        let at = |vout| OutPoint {
+            txid: txid.parse().unwrap(),
+            vout,
+        };
+        // vout 1 spent by an F, vout 2 locked across the node's restart.
+        let unspent = json!([
+            { "txid": txid, "vout": 0, "amount": 0.001 },
+            { "txid": "nonsense", "vout": 1 },
+            { "txid": txid, "vout": 3 },
+        ]);
+        assert_eq!(still_free(&[at(0), at(1), at(2)], &unspent), vec![at(0)]);
+        assert!(still_free(&[at(0)], &json!({})).is_empty());
     }
 }
