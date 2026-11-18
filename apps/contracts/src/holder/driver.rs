@@ -147,6 +147,23 @@ impl<T: Transport, C: Chain> Driver<'_, T, C> {
                         tracing::warn!(id = %crate::hex_id(&self.id), "telling the hub F is signed: {e:#}");
                     }
                 }
+                // Her opened instances, which the hub checks at length,
+                // beside her kept ones' uploads: it takes them in any
+                // order, and offers once it has all.
+                Out::Send(message)
+                    if Kind::peek(&message) == Some(Kind::Opened)
+                        && matches!(queue.front(), Some(Out::Serve { .. })) =>
+                {
+                    let mut batch = vec![];
+                    while let Some(&Out::Serve { i }) = queue.front() {
+                        batch.push(i);
+                        queue.pop_front();
+                    }
+                    for frame in self.serve(Some(message), batch).await? {
+                        let Frame::Message(bytes) = frame;
+                        queue.extend(self.step(Input::Message(bytes)).await?);
+                    }
+                }
                 Out::Send(message) => {
                     let frames = self.post(message).await?;
                     for frame in frames {
@@ -161,7 +178,7 @@ impl<T: Transport, C: Chain> Driver<'_, T, C> {
                         batch.push(i);
                         queue.pop_front();
                     }
-                    for frame in self.serve(batch).await? {
+                    for frame in self.serve(None, batch).await? {
                         let Frame::Message(bytes) = frame;
                         queue.extend(self.step(Input::Message(bytes)).await?);
                     }
@@ -329,10 +346,11 @@ impl<T: Transport, C: Chain> Driver<'_, T, C> {
         }
     }
 
-    /// Her instances `batch` built and uploaded, [`UPLOADS`] at a time:
-    /// the hub's answers to them, once all are, or the first failure. Each
-    /// the hub answered is kept as served, whatever the others do.
-    async fn serve(&mut self, batch: Vec<u32>) -> Result<Vec<Frame>> {
+    /// Her instances `batch` built and uploaded, [`UPLOADS`] at a time,
+    /// and `beside`, if any, sent meanwhile: the hub's answers to it, then
+    /// to them, once all are, or the first failure. Each the hub answered
+    /// is kept as served, whatever the others do.
+    async fn serve(&mut self, beside: Option<Vec<u8>>, batch: Vec<u32>) -> Result<Vec<Frame>> {
         use futures_util::StreamExt as _;
         let holder = std::sync::Arc::new(self.holder.take().expect("a holder between steps"));
         let (id, total) = (self.id, batch.len());
@@ -355,10 +373,17 @@ impl<T: Transport, C: Chain> Driver<'_, T, C> {
                 Ok::<_, anyhow::Error>(frames)
             }
         });
-        let answers: Vec<Result<Vec<Frame>>> = uploads.buffer_unordered(UPLOADS).collect().await;
+        let beside = async {
+            match beside {
+                Some(message) => this.send(message).await,
+                None => Ok(Vec::new()),
+            }
+        };
+        let (beside, answers): (_, Vec<Result<Vec<Frame>>>) =
+            tokio::join!(beside, uploads.buffer_unordered(UPLOADS).collect());
         let holder = std::sync::Arc::try_unwrap(holder);
         self.holder = Some(holder.unwrap_or_else(|_| unreachable!("every upload done")));
-        let mut frames = Vec::new();
+        let mut frames = beside?;
         for answer in answers {
             frames.extend(answer?);
         }
