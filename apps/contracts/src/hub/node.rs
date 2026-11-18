@@ -15,20 +15,10 @@ const KEY_SPEND_WEIGHT: u64 = 230;
 /// The rate F pays when the node estimates none, in sat/vB.
 const FALLBACK_RATE: f64 = 2.0;
 
-/// Those of `coins` among `unspent`, what `listunspent` answered.
-fn still_free(coins: &[OutPoint], unspent: &Value) -> Vec<OutPoint> {
-    let free: std::collections::HashSet<OutPoint> = unspent
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|u| {
-            Some(OutPoint {
-                txid: u["txid"].as_str()?.parse().ok()?,
-                vout: u32::try_from(u["vout"].as_u64()?).ok()?,
-            })
-        })
-        .collect();
-    coins.iter().copied().filter(|o| free.contains(o)).collect()
+/// Whether a coin is to lock, as `gettxout` (`found`) says of it: not
+/// when it says none, spent; when it cannot say, as before.
+fn unspent(found: &Result<Value>) -> bool {
+    !matches!(found, Ok(Value::Null))
 }
 
 fn coin(o: &OutPoint) -> Value {
@@ -162,21 +152,18 @@ impl Openings {
         self.lock(coins, false).await;
     }
 
-    /// Lock again, as the hub starts, those of `coins` the node's wallet
-    /// still holds free: one an F spent, or locked already across the
-    /// node's restart, needs none. All of them if it cannot say which.
+    /// Lock again, as the hub starts, those of `coins` still unspent: one
+    /// an F spent, confirmed or in the mempool, needs none. Asked with
+    /// `gettxout`, which the node's RPC whitelist allows the hub already.
     pub(super) async fn relock_coins(&self, coins: &[OutPoint]) {
-        let unspent = self
-            .wallet
-            .rpc::<Value>("listunspent", json!([0, 9_999_999, [], true]))
-            .await;
-        match unspent {
-            Ok(unspent) => self.lock(&still_free(coins, &unspent), false).await,
-            Err(e) => {
-                tracing::warn!("the node's free coins, to lock those of F again: {e:#}");
-                self.lock(coins, false).await;
+        let mut free = Vec::with_capacity(coins.len());
+        for o in coins {
+            let args = json!([o.txid.to_string(), o.vout, true]);
+            if unspent(&self.wallet.rpc::<Value>("gettxout", args).await) {
+                free.push(*o);
             }
         }
+        self.lock(&free, false).await;
     }
 
     pub(super) async fn unlock_coins(&self, coins: &[OutPoint]) {
@@ -204,19 +191,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_the_coins_still_free_are_locked_again() {
-        let txid = "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b";
-        let at = |vout| OutPoint {
-            txid: txid.parse().unwrap(),
-            vout,
-        };
-        // vout 1 spent by an F, vout 2 locked across the node's restart.
-        let unspent = json!([
-            { "txid": txid, "vout": 0, "amount": 0.001 },
-            { "txid": "nonsense", "vout": 1 },
-            { "txid": txid, "vout": 3 },
-        ]);
-        assert_eq!(still_free(&[at(0), at(1), at(2)], &unspent), vec![at(0)]);
-        assert!(still_free(&[at(0)], &json!({})).is_empty());
+    fn only_a_coin_gettxout_says_is_spent_is_not_locked_again() {
+        assert!(!unspent(&Ok(Value::Null)));
+        assert!(unspent(&Ok(json!({ "confirmations": 3, "value": 0.001 }))));
+        assert!(unspent(&Err(anyhow::anyhow!("HTTP 403 Forbidden"))));
     }
 }
