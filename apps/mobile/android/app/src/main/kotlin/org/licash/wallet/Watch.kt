@@ -1,7 +1,9 @@
 package org.licash.wallet
 
 import org.licash.core.Activity
+import org.licash.core.ContractExit
 import org.licash.core.ContractState
+import org.licash.core.ExitStep
 import org.licash.core.Details
 import org.licash.core.Kind
 import org.licash.core.Recovery
@@ -49,9 +51,11 @@ internal fun watchOf(ui: Ui, now: Long): Watch {
     val disputed = ui.recoveries.any { it.stage in DISPUTED }
     // Mailed to its payee within the hour unless collected at its hub: a look now and then does.
     val delivering = ui.onTheirWay > 0u
+    // A contract protecting nears its end by blocks: its exit is looked at now and then.
+    val protecting = ui.contracts.any { it.state == ContractState.Protecting }
     return when {
         contracting || disputed || under.any { it.kind != Kind.OPTIMIZED && !unpaid(it, ui.under[it.key]) } -> Watch.NOW
-        under.isNotEmpty() || asked || forcing || delivering || ui.noteMaintenance -> Watch.LATER
+        under.isNotEmpty() || asked || forcing || delivering || protecting || ui.noteMaintenance -> Watch.LATER
         else -> Watch.NONE
     }
 }
@@ -63,6 +67,51 @@ internal val DISPUTED = setOf(
     RecoveryStage.CHALLENGING,
     RecoveryStage.CHALLENGED,
 )
+
+/** A notification of a contract's exit or forced close: `key` told once, `urgent` asking her to act or stay online. */
+internal data class ExitNotice(val key: String, val urgent: Boolean, val text: String)
+
+/**
+ * What to tell of the contracts' `exits` this round and of the forced
+ * closes `recoveries` disputed: what the exit did, what she must do, and
+ * when to keep the app online. Amounts only, never a hub's name.
+ */
+internal fun exitNotices(exits: List<ContractExit>, recoveries: List<Recovery>): List<ExitNotice> {
+    val told = exits.mapNotNull { e ->
+        val key = "exit ${e.id} ${e.step}"
+        val done = e.error == null
+        when (e.step) {
+            ExitStep.NEEDS_CONSENT -> ExitNotice(
+                key,
+                true,
+                "Protection of ${sat(e.uncovered)} ends soon. Allow exits in Settings, Recovery safety, " +
+                    "or pay those notes out yourself.",
+            )
+            ExitStep.NEVER_FITTED -> ExitNotice(
+                key,
+                true,
+                "A contract ends sooner than your exit margin allows. Pay its notes out or force close it yourself.",
+            )
+            ExitStep.CASHING_OUT -> if (done) ExitNotice(key, false, "Paying out ${sat(e.uncovered)} to your address as protection ends") else null
+            ExitStep.FOLDING -> if (done) ExitNotice(key, false, "Paid out, a contract closed early: its reserve back") else null
+            ExitStep.FORCE_CLOSING -> if (done) {
+                ExitNotice(key, true, "Not paid out in time: a contract forced closed. Keep Licash online until it is done.")
+            } else {
+                ExitNotice("$key failed", true, "A contract ending could not be forced closed. Open Licash to try again.")
+            }
+            ExitStep.WAITING, ExitStep.COVERED, ExitStep.PAYING -> null
+        }
+    }
+    val disputed = recoveries.filter { it.stage in DISPUTED }.map {
+        ExitNotice(
+            "dispute ${it.id}",
+            true,
+            "A hub answered a forced close. Keep Licash online with a connection until it is done, " +
+                "so a false proof is challenged in time.",
+        )
+    }
+    return told + disputed
+}
 
 /** Whether `recovery` still has steps to carry on. */
 internal fun carriedOn(recovery: Recovery): Boolean =

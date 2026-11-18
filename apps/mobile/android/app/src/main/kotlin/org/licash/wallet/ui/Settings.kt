@@ -46,6 +46,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import org.licash.core.ExitConsent
 import org.licash.core.Hub
 import org.licash.wallet.AppLog
 import org.licash.wallet.BuildConfig
@@ -362,7 +363,13 @@ private fun Advanced(engine: Engine, ui: Ui, balance: () -> Unit) {
         }
     }
     if (ui.wallet) Group("Renewing notes") { RenewLimit(engine) }
-    if (ui.wallet) Group("Recovery safety") { ExitMargin(engine) }
+    if (ui.wallet) {
+        Group("Recovery safety") {
+            ExitMargin(engine)
+            Divider()
+            ExitConsentEntry(engine, ui.contracts.isNotEmpty())
+        }
+    }
     Group("Bitcoin light client") {
         LightClient(engine)
         Divider()
@@ -431,18 +438,57 @@ private fun RenewLimit(engine: Engine) {
     }
 }
 
-/** A holder-owned planning margin, never automatic spending consent. */
+/** A holder-owned planning margin: what exits plan with once she consents, never consent itself. */
 @Composable
 private fun ExitMargin(engine: Engine) {
+    val scope = rememberCoroutineScope()
     var days by remember { mutableStateOf(engine.prefs.exitMarginDays.toString()) }
     var saved by remember { mutableStateOf(false) }
     val value = days.toIntOrNull()?.takeIf { it in 1..30 }
-    Say("Time reserved for a forced close to play out (your exit margin), about 14 days by default. This is planning only, not automatic closing. Your wallet must stay online and confirm its timeout promptly; a hub may answer late until that timeout wins.")
+    Say("Time reserved for a forced close to play out (your exit margin), about 14 days by default. Nothing closes on its own unless you allow exits below. Your wallet must stay online and confirm its timeout promptly; a hub may answer late until that timeout wins.")
     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
         Field(days, { days = it; saved = false }, "Days", "1 to 30, estimated from block times", Modifier.weight(1f), failed = value == null, number = true)
         FilledTonalButton(enabled = value != null && !saved, onClick = {
-            value?.let { engine.prefs.exitMarginDays = it; saved = true }
+            value?.let { scope.launch { engine.setExitMargin(it).onSuccess { saved = true } } }
         }) { Text(if (saved) "Saved" else "Save") }
+    }
+}
+
+/**
+ * Her consent to exit contracts ending, with the address their notes are
+ * paid out to: given, shown and revoked here only, never assumed.
+ */
+@Composable
+private fun ExitConsentEntry(engine: Engine, contracts: Boolean) {
+    val scope = rememberCoroutineScope()
+    var consent by remember { mutableStateOf<ExitConsent?>(null) }
+    var address by remember { mutableStateOf("") }
+    var error by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(contracts) { consent = engine.exitConsent().getOrNull() }
+    Column(Modifier.padding(vertical = 12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Text("Exits", style = MaterialTheme.typography.bodyLarge)
+        Say(
+            "Allowed, as a contract nears its end and no other at its hub protects your notes there, Licash pays " +
+                "those notes out to your address for at most 1% and 1,000 sat, then closes the contract early. " +
+                "If they are not paid out a day before its last safe block, it forces the contract closed. " +
+                "Not allowed, it only tells you. Revoking stops new steps; steps under way are finished.",
+        )
+        val given = consent
+        if (given != null) {
+            Say("Allowed, paying out to ${given.address}.")
+            FilledTonalButton(onClick = {
+                scope.launch { engine.revokeExitConsent().onSuccess { consent = null }.onFailure { error = explain(it) } }
+            }, modifier = Modifier.testTag("revoke-exits")) { Text("Revoke") }
+        } else if (!contracts) {
+            Say("Asked once a contract protects your notes.")
+        } else {
+            Field(address, { address = it; error = null }, "Bitcoin address", error ?: "Where your notes are paid out to", failed = error != null)
+            FilledTonalButton(enabled = address.isNotBlank(), onClick = {
+                scope.launch {
+                    engine.consentToExit(address.trim()).onSuccess { consent = it }.onFailure { error = explain(it) }
+                }
+            }, modifier = Modifier.testTag("allow-exits")) { Text("Allow exits") }
+        }
     }
 }
 

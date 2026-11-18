@@ -233,9 +233,23 @@ it. Once signed, even an unconfirmed request cannot be canceled.
 
 Advanced settings has a holder-owned recovery planning margin (14 estimated
 days by default). An unfolded contract reads the signed terms to show when
-its request should confirm. This does not authorize automatic closing.
+its request should confirm. The margin alone authorizes nothing.
 A late hub answer remains possible until the holder's timeout wins on
 chain, so the margin requires online monitoring and prompt confirmation.
+
+Below it, Exits asks for the holder's consent, given once a contract
+protects her notes, with a Bitcoin address. With it, as a contract nears
+its end (three days before its request should confirm) and no other
+contract at its hub protects her notes there, the app pays those notes out
+to that address through the cheapest provider within 1% and 1,000 sat,
+then closes the contract early. Not paid out a day before, the contract is
+forced closed. Without consent, including on upgraded installs and after
+a restore (consent is not carried in a backup bundle), nothing is done:
+a high-priority notification asks her to act. Revoking stops new steps;
+those under way are finished. The consent keeps the exit margin given with
+it; saving a new margin gives it again. While any contract protects notes
+the periodic job looks every 15 minutes or so, and a disputed forced close
+notifies her to keep the app online until its challenge window passes.
 
 A counterpart on the command line:
 

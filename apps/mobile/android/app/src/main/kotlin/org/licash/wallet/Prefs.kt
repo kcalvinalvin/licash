@@ -77,6 +77,11 @@ class Prefs(context: Context) {
         get() = prefs.getStringSet("watched", null)?.toSet()
         set(keys) = prefs.edit().apply { if (keys == null) remove("watched") else putStringSet("watched", keys) }.apply()
 
+    /** The exits and disputes already told of, by [ExitNotice.key]. */
+    var exitsTold: Set<String>
+        get() = prefs.getStringSet("exits_told", null)?.toSet().orEmpty()
+        set(keys) = prefs.edit().putStringSet("exits_told", keys).apply()
+
     /** The payouts already warned of as their deadline neared, by key. */
     var warned: Set<String>
         get() = prefs.getStringSet("warned", null)?.toSet().orEmpty()

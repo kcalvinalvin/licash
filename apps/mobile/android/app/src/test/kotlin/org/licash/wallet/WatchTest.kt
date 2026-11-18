@@ -5,6 +5,10 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.licash.core.Activity
+import org.licash.core.Contract
+import org.licash.core.ContractExit
+import org.licash.core.ContractState
+import org.licash.core.ExitStep
 import org.licash.core.Details
 import org.licash.core.Kind
 import org.licash.core.LockStep
@@ -107,6 +111,55 @@ class WatchTest {
         for (stage in listOf(RecoveryStage.DONE, RecoveryStage.LOST)) {
             assertEquals(stage.name, Watch.NONE, watchOf(Ui(recoveries = listOf(forced(stage))), now))
         }
+    }
+
+    @Test
+    fun a_contract_protecting_is_looked_at_later_for_its_exit() {
+        fun contract(state: ContractState) = Contract(
+            id = "c0", hub = "https://hub.example", state = state, mock = false, cap = 4_096uL, covers = 3_000uL,
+            price = 1_000uL, paidFrom = 0uL, protectsUntil = 5_000u, closesAt = 5_500u, funding = null,
+            createdAt = 0L, step = null, transfer = null,
+        )
+        assertEquals(Watch.LATER, watchOf(Ui(contracts = listOf(contract(ContractState.Protecting))), now))
+        for (state in listOf(ContractState.Ending, ContractState.Closed)) {
+            assertEquals(Watch.NONE, watchOf(Ui(contracts = listOf(contract(state))), now))
+        }
+    }
+
+    @Test
+    fun an_exit_tells_what_it_did_and_what_she_must_do_never_where() {
+        fun exit(step: ExitStep, error: String? = null, id: String = "c0") = ContractExit(
+            id = id, hub = "https://hub.example", step = step, cashAt = 900u, forceAt = 1_188u,
+            uncovered = 3_000uL, error = error,
+        )
+        val quiet = listOf(ExitStep.WAITING, ExitStep.COVERED, ExitStep.PAYING).map { exit(it) }
+        assertTrue(exitNotices(quiet, emptyList()).isEmpty())
+        // Retried each round until done: told once it is.
+        assertTrue(exitNotices(listOf(exit(ExitStep.CASHING_OUT, "no provider")), emptyList()).isEmpty())
+        val told = exitNotices(
+            listOf(
+                exit(ExitStep.NEEDS_CONSENT, id = "a"),
+                exit(ExitStep.CASHING_OUT, id = "b"),
+                exit(ExitStep.FORCE_CLOSING, "no fee coin", id = "c"),
+            ),
+            emptyList(),
+        )
+        assertEquals(listOf("exit a NEEDS_CONSENT", "exit b CASHING_OUT", "exit c FORCE_CLOSING failed"), told.map { it.key })
+        assertEquals(listOf(true, false, true), told.map { it.urgent })
+        assertTrue(told[0].text, told[0].text.contains("3,000 sat") && told[0].text.contains("Allow exits"))
+        assertTrue(told.none { it.text.contains("hub.example") })
+    }
+
+    @Test
+    fun a_disputed_forced_close_asks_her_to_stay_online() {
+        fun forced(stage: RecoveryStage) = Recovery(
+            id = "c0", stage = stage, irrevocable = true, claimed = 3_000uL, notes = 7u, request = null,
+            publication = null, timeout = null, sweep = null, nextAt = null, error = null, deadline = 2_000u,
+        )
+        val told = exitNotices(emptyList(), listOf(forced(RecoveryStage.ASSERTED)))
+        assertEquals(listOf("dispute c0"), told.map { it.key })
+        assertTrue(told[0].urgent && told[0].text.contains("online"))
+        assertTrue(exitNotices(emptyList(), listOf(forced(RecoveryStage.REQUESTED))).isEmpty())
     }
 
     @Test

@@ -33,10 +33,12 @@ import org.licash.core.Balance
 import org.licash.core.Code
 import org.licash.core.Contact
 import org.licash.core.Contract
+import org.licash.core.ContractExit
 import org.licash.core.ContractQuote
 import org.licash.core.ContractState
 import org.licash.core.Details
 import org.licash.core.DonationAddress
+import org.licash.core.ExitConsent
 import org.licash.core.FeesRaised
 import org.licash.core.Holding
 import org.licash.core.Hub
@@ -93,6 +95,8 @@ data class Ui(
     val contracts: List<Contract> = emptyList(),
     /** The contracts forced closed, the oldest first. */
     val recoveries: List<Recovery> = emptyList(),
+    /** Each live contract's exit, as the last round left it. */
+    val exits: List<ContractExit> = emptyList(),
     /** The hub a contract is being opened at, while one is. */
     val opening: String? = null,
     /**
@@ -671,13 +675,25 @@ class Engine(context: Context) {
         val waiting = ui.contracts.any {
             it.state == ContractState.Opening || it.state == ContractState.Confirming
         } || ui.recoveries.any { carriedOn(it) }
-        if (!waiting || !contracting.compareAndSet(false, true)) return
+        val protecting = ui.contracts.any { it.state == ContractState.Protecting }
+        if (!(waiting || protecting) || !contracting.compareAndSet(false, true)) return
         scope.launch {
             try {
-                local { it.resumeContracts(chain) }
+                if (waiting) local { it.resumeContracts(chain) }
             } catch (e: Exception) {
                 // Not to bring the app down from a coroutine of its own.
                 AppLog.warn("carrying on with contracts", e)
+            }
+            try {
+                // As she consented, else only told: nothing done without.
+                if (protecting) {
+                    val margin = exitMarginBlocks(prefs.exitMarginDays, ui.network)
+                    val exits = local { it.driveExits(chain, margin) }
+                    for (e in exits) e.error?.let { AppLog.warn("exit of contract ${e.id}, ${e.step}: $it") }
+                    state.update { it.copy(exits = exits) }
+                }
+            } catch (e: Exception) {
+                AppLog.warn("exiting contracts ending", e)
             } finally {
                 contracting.set(false)
             }
@@ -788,6 +804,14 @@ class Engine(context: Context) {
             }
         }
         prefs.warned = warned
+        // In sight or not: nothing else shows them. Each told once.
+        var told = prefs.exitsTold
+        for (notice in exitNotices(ui.exits, ui.recoveries)) {
+            if (notice.key in told) continue
+            if (notice.urgent) notifier.deadline(notice.key, notice.text) else notifier.payment(notice.key, notice.text)
+            told = told + notice.key
+        }
+        prefs.exitsTold = told
         if (level == Watch.NOW && foreground) WatchService.start(app)
         val periodic = level != Watch.NONE
         if (periodic != looking) {
@@ -1359,6 +1383,34 @@ class Engine(context: Context) {
 
     /** The most the wallet pays to renew notes, in parts per million, if there is a wallet. */
     fun renewLimit(): UInt? = wallet?.renewLimit()
+
+    /** Her consent to exit contracts ending, if given: none before a first contract opens. */
+    suspend fun exitConsent(): Result<ExitConsent?> = io { local { it.exitConsent() } }
+
+    /**
+     * Consent to exit contracts ending, paying their notes out to
+     * `address`, with the exit margin set now.
+     */
+    suspend fun consentToExit(address: String): Result<ExitConsent> = io {
+        val margin = exitMarginBlocks(prefs.exitMarginDays, state.value.network)
+        val given = local { it.consentToExit(address, margin) }
+        AppLog.info("consented to exit contracts ending, margin $margin blocks")
+        poke()
+        given
+    }
+
+    /** Revoke her consent to exit: no step more taken. */
+    suspend fun revokeExitConsent(): Result<Unit> = io {
+        local { it.revokeExitConsent() }
+        AppLog.info("consent to exit contracts revoked")
+    }
+
+    /** The exit margin set to `days`, her consent to exit given again with it if given. */
+    suspend fun setExitMargin(days: Int): Result<Unit> = io {
+        prefs.exitMarginDays = days
+        local { it.exitConsent() }?.let { local { w -> w.consentToExit(it.address, exitMarginBlocks(days, state.value.network)) } }
+        Unit
+    }
 
     /** The wallet `w` opened, as its owner set it: what its renewals may cost. */
     private fun configured(w: Wallet): Wallet {
