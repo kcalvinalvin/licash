@@ -174,6 +174,7 @@ services:
   # from its node for 2 + 5000 ppm, its routes ending 80 blocks before the
   # client's lock expires; the tests fund it. No contract protects its
   # notes (the tests open none): unprotected, as only tests run.
+  # Use a fixed payout minimum for the wallet scenarios.
   swaps:
     image: licash-swaps:e2e
     build:
@@ -189,6 +190,7 @@ services:
         until licash-wallet add-hub $$hub >/dev/null; do sleep 1; done; done;
         exec licash-swaps run --step 1 --fee-base 1 --fee-ppm 5000 --max 200000
         --chain http://licash:licash@bitcoind:18443 --payout-min 1000 --payout-margin 36
+        --payout-fee-share 0
         --nostr-relay ws://relay:8080 --announce-url http://127.0.0.1:${LICASH_E2E_SWAPS:-38340}
         --announce-name swaps --name swaps --notify gotify://gotify/$$(cat /notify/token)
         --no-contracts --lnd https://swaps-ln:8080
