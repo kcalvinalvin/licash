@@ -290,6 +290,84 @@ async fn paid_through_provider(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Paid at its static donation address, among the other ways on Receive
+/// once the provider announced takes donations at its hub: an LNURL of the
+/// provider's, its code in it, which the node outside pays while the app is
+/// stopped. The provider pays the donation, its fee taken, in notes kept at
+/// the hub, which the app takes once started again.
+async fn donated(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
+    use bitcoin::bech32;
+
+    let before = phone.balance().await?;
+    let terms = eco.swaps_info().await?.donations;
+    let terms = terms.context("the provider takes no donations")?;
+    let code: PaymentCode = phone.code().await?.parse()?;
+    let code = code.licash.context("a Licash code")?.to_string();
+    phone.tap_id("receive").await?;
+    phone.tap_id("other-ways").await?;
+    // Listed once the provider is found, looked for as Receive opens.
+    phone.by_id("way-donations", 120).await?;
+    phone.tap_id("way-donations").await?;
+    phone.tagged("way", "Donation address", 30).await?;
+    let range = format!("{} sat to {} sat", digits(terms.min), digits(terms.max));
+    phone.tagged("asking", &range, 10).await?;
+    phone.wait("Paid to you in notes by swaps", 10).await?;
+    // In upper case, as a QR code holds it best: the app's very code, at
+    // the URL payers reach the provider at.
+    let shown = phone.qr(30).await?;
+    ensure!(shown.starts_with("LNURL1"), "{shown} shown for donations");
+    let (_, url) = bech32::decode(&shown)?;
+    let url = String::from_utf8(url)?;
+    ensure!(
+        url == format!("{}/v1/lnurlp/{code}", terms.url),
+        "{url} for the code {code}"
+    );
+    phone.tap("Back").await?;
+    phone.home(30).await?;
+
+    // Stopped, the app is paid as LNURL-pay has it.
+    phone
+        .shell(&format!("am force-stop {}", licash_e2e::phone::PACKAGE))
+        .await?;
+    let request = eco.get_json(&url).await?;
+    ensure!(request["tag"] == "payRequest", "{request}");
+    let callback = request["callback"].as_str().context("a callback")?;
+    let donated = 1_000;
+    let invoice = eco
+        .get_json(&format!("{callback}?amount={}", donated * 1_000))
+        .await?;
+    let pr = invoice["pr"]
+        .as_str()
+        .with_context(|| format!("{invoice}"))?;
+    ensure!(
+        eco.pay(OUTSIDE, pr).await??,
+        "the node outside did not pay {pr}"
+    );
+
+    phone.launch().await?;
+    phone.home(60).await?;
+    let gets = donated - terms.fee.due(donated);
+    let now = changed(phone, before, 120).await?;
+    ensure!(
+        now == before + gets,
+        "{now} held after a donation of {donated}, {gets} expected"
+    );
+    Ok(())
+}
+
+/// `12,345`, as the app writes amounts.
+fn digits(amount: u64) -> String {
+    let text = amount.to_string();
+    let mut out = String::new();
+    for (i, c) in text.chars().enumerate() {
+        if i > 0 && (text.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// Collect Bob's mailbox, for up to `secs`, until it holds payments: their
 /// sum.
 async fn collected(bob: &licash_e2e::Wallet, secs: u64) -> anyhow::Result<u64> {
@@ -432,6 +510,7 @@ async fn used(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
 
     lightning(eco, phone).await?;
     paid_through_provider(eco, phone).await?;
+    donated(eco, phone).await?;
     refused(eco, phone, &bobs).await?;
     hub_down(eco, phone, &bob, &bobs).await?;
     found_hubs(phone).await?;
