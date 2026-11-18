@@ -171,7 +171,7 @@ There is no penalty. A claim made from an old backup is not fraud, and it is pai
 \end{quote}
 The statement's program, fixed by the base, reads the request, the publication and the response from blocks whose headers extend the base's checkpoint, with the required work on top, which by the assumption on private blocks are Bitcoin's. It judges the claim on the chain up to the publication's block, so the hub cannot choose the chain it is judged on.
 
-The holder's wallet checks the asserted proof. If it is valid she concedes, and the contract pays her $\bresp$. If it is not she challenges, and BABE lets the hub answer a challenge only with a valid proof. A hub that does not respond, does not assert, or cannot answer a challenge pays $b$ and its own reserve. The payout rounds the amount down to the contract's payout unit, and each party pays the fees of the transactions it broadcasts.
+The holder's wallet checks the asserted proof. If it is valid she concedes, and the contract pays her $\bresp$. If it is not she challenges, and BABE lets the hub answer a challenge only with a valid proof. A hub that does not respond pays $b$ and the fees of her request, and keeps the rest of its reserve: it may have been kept from answering, by a flood of requests say, and a holder gains nothing from silencing it beyond her claim. A hub that responds but does not assert, or cannot answer a challenge, pays $b$ and its own reserve. The payout rounds the amount down to the contract's payout unit, and each party pays the fees of the transactions it broadcasts.
 
 \begin{figure}[htb]
 \centering
@@ -183,7 +183,7 @@ The holder's wallet checks the asserted proof. If it is valid she concedes, and 
 \node[hub] (resp) at (0,-1.25) {respond $\bresp$\\ and disclose};
 \node[hub] (as) at (0,-2.5) {assert proof};
 \node[hold] (ch) at (0,-3.5) {challenge};
-\node[pay] (t1) at (5.2,0) {no response within $\wH$: holder paid $b$};
+\node[pay] (t1) at (5.2,0) {no response within $\wH$: holder paid $b$ and her fees};
 \node[pay] (t2) at (5.2,-1.25) {no assertion: holder paid $b$};
 \node[pay] (t3) at (5.2,-2.5) {no challenge: holder paid $\bresp$};
 \node[pay] (t4) at (5.2,-3.5) {answered with a valid proof: $\bresp$; otherwise $b$};
