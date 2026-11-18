@@ -1,6 +1,11 @@
-# The hub service. Build from the repository root:
+# The hub service, with the prover of its statement (r0/host) on x86-64.
+# Build from the repository root:
 #   docker build -f apps/hub/Dockerfile -t licash-hub .
-# --platform linux/arm64 or linux/arm/v7 cross-compiles (apps/image-build.sh).
+# --platform linux/arm64 or linux/arm/v7 cross-compiles (apps/image-build.sh),
+# without a prover: such a hub responds to no contested exit on a network
+# with genuine proofs (see the README).
+ARG TARGETARCH
+
 FROM --platform=$BUILDPLATFORM rust:1-slim-trixie AS build
 ARG TARGETPLATFORM
 WORKDIR /src
@@ -9,16 +14,63 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/src/apps/target,sharing=locked \
     apps/image-build.sh licash-hub-service:licash-hub
 
-FROM debian:trixie-slim
-# Root certificates, for notifications and Esplora over HTTPS.
+# The prover: its CPU build, and its CUDA build, which the CPU build proves
+# through when the container is given a GPU (CUDA 12.4: NVIDIA drivers 550
+# and newer), for the GPU generations of CUDA_ARCHS (Turing on). With RISC
+# Zero's Groth16 setup and native prover, from its prover image, and the
+# programs contracts open under (r0/programs).
+FROM nvidia/cuda:12.4.1-devel-ubuntu22.04 AS prover-amd64
+ARG CUDA_ARCHS="75 80 86 89"
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends ca-certificates curl build-essential pkg-config clang protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
+RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+ENV PATH=/root/.cargo/bin:$PATH CARGO_PROFILE_RELEASE_DEBUG=0 CARGO_PROFILE_RELEASE_STRIP=true
+WORKDIR /src
+COPY . .
+RUN --mount=type=cache,id=licash-r0-registry,target=/root/.cargo/registry,sharing=locked \
+    --mount=type=cache,id=licash-r0-target,target=/src/r0/host/target,sharing=locked \
+    set -eu; \
+    # Built again whatever the cached target's times: a source edited while
+    # an earlier build ran is older than what that build left.
+    find r0/host/src crates/licash-hp/src -name '*.rs' -exec touch {} +; \
+    flags=; for a in $CUDA_ARCHS; do flags="$flags -gencode arch=compute_$a,code=sm_$a"; done; \
+    newest=${CUDA_ARCHS##* }; \
+    export NVCC_APPEND_FLAGS="$flags -gencode arch=compute_$newest,code=compute_$newest"; \
+    cargo build --locked --release --manifest-path r0/host/Cargo.toml --features cuda --target-dir r0/host/target/cuda; \
+    unset NVCC_APPEND_FLAGS; \
+    cargo build --locked --release --manifest-path r0/host/Cargo.toml; \
+    share=/opt/r0/share/licash-r0; \
+    mkdir -p /opt/r0/bin "$share/programs" "$share/groth16"; \
+    cp r0/host/target/release/licash-r0 /opt/r0/bin/; \
+    cp r0/host/target/cuda/release/licash-r0 /opt/r0/bin/licash-r0-cuda; \
+    cp r0/programs/*.bin "$share/programs/"; \
+    cp r0/host/bench.bin "$share/"
+COPY --from=risczero/risc0-groth16-prover:v2026-10-20.1@sha256:e8c2068fb34bbc41447255aa980a89cbb7d6e5a80c0d66041264431f2a955e47 \
+    /usr/local/bin/stark_verify /usr/local/bin/prover \
+    /app/stark_verify.dat /app/stark_verify.cs /app/stark_verify_final.pk.dmp \
+    /opt/r0/share/licash-r0/groth16/
+
+# No prover on ARM: RISC Zero's Groth16 prover is x86-64 only.
+FROM --platform=$BUILDPLATFORM debian:trixie-slim AS prover-none
+RUN mkdir -p /opt/r0
+FROM prover-none AS prover-arm64
+FROM prover-none AS prover-arm
+FROM prover-${TARGETARCH} AS prover
+
+FROM debian:trixie-slim
+# Root certificates, for notifications and Esplora over HTTPS; GMP, for the
+# Groth16 witness generator.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates libgmp10 \
     && rm -rf /var/lib/apt/lists/*
 RUN useradd --system --uid 10001 --home-dir /data --shell /usr/sbin/nologin licash \
     && mkdir -p /data && chown licash /data && chmod 700 /data
+COPY --from=prover /opt/r0/ /usr/local/
 COPY --from=build /usr/local/bin/licash-hub /usr/local/bin/licash-hub
 USER 10001
-ENV LICASH_HUB_DATA=/data LICASH_HUB_LISTEN=0.0.0.0:8338
+# The GPU's compute, when the container is given one (--gpus).
+ENV LICASH_HUB_DATA=/data LICASH_HUB_LISTEN=0.0.0.0:8338 NVIDIA_DRIVER_CAPABILITIES=compute,utility
 VOLUME /data
 EXPOSE 8338
 # Unhealthy once the hub halts (see the README).

@@ -15,6 +15,9 @@
 !crates/licash-contract
 # The hub's statement, of the contract and of its recovery.
 !crates/licash-hp
+# Its prover, and the programs contracts open under.
+!r0/host
+!r0/programs
 !regtest/Cargo.toml
 !vendor/lichen
 !apps

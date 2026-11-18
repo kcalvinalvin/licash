@@ -58,12 +58,47 @@ jobs:
         run: cargo doc --locked --no-deps --workspace
         env:
           RUSTDOCFLAGS: -D warnings
-      - name: Hub image
-        run: docker build -f apps/hub/Dockerfile .
       - name: Wallet image
         run: docker build -f apps/wallet-cli/Dockerfile .
       - name: Swaps image
         run: docker build -f apps/swaps/Dockerfile .
+  # The hub's prover (r0/host), its CPU build: the CUDA build is the hub
+  # image's.
+  r0:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: r0/host
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/vendor
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: r0/host
+      - run: cargo fmt -- --check
+      - run: cargo clippy --locked --release --all-targets -- -D warnings
+      - run: cargo test --locked --release
+  # The hub's image builds its prover's CUDA kernels, on a CUDA image: a
+  # job of its own, for its time and its disk.
+  hub-image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Room on the disk, without the toolchains this job never uses
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache
+          df -h /
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/vendor
+      - run: docker build -f apps/hub/Dockerfile .
   chain:
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -240,7 +275,7 @@ jobs:
   # Each platform's images on a runner of its architecture where there is
   # one, pushed by digest only: images-tag names them.
   images:
-    needs: [rust, apps, chain, android, e2e, app-e2e, regtest]
+    needs: [rust, apps, r0, hub-image, chain, android, e2e, app-e2e, regtest]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     strategy:
       matrix:
@@ -264,6 +299,12 @@ jobs:
     env:
       PREFIX: ghcr.io/${{ github.repository_owner }}/licash-
     steps:
+      # The hub's prover, on x86-64: a CUDA image to build on.
+      - if: matrix.platform == 'linux/amd64'
+        name: Room on the disk, without the toolchains this job never uses
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache
+          df -h /
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
@@ -345,7 +386,7 @@ jobs:
 
   # The app signed, on the main-build prerelease, replaced on each push.
   publish-app:
-    needs: [rust, apps, chain, android, e2e, app-e2e, regtest]
+    needs: [rust, apps, r0, hub-image, chain, android, e2e, app-e2e, regtest]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 10
