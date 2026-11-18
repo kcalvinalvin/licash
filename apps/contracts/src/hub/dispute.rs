@@ -778,8 +778,9 @@ impl Openings {
                 "contract {}: the hub signed its {name} with a one-time key, or was about \
                  to, and responses.sqlite no longer holds what it answered on, as when that \
                  file is lost or restored older than openings.sqlite. It signs no other: \
-                 her timeout pays her what she claims. Restore responses.sqlite as recent \
-                 as openings.sqlite.",
+                 her timeout pays her what she claims, and the hub's reserve once a \
+                 response is in a block. Restore responses.sqlite as recent as \
+                 openings.sqlite.",
                 crate::hex_id(id)
             ));
         }
@@ -843,9 +844,20 @@ impl Openings {
         let bytes = match frozen {
             Some(bytes) => bytes,
             None => {
-                let pinned = Responses::open(&self.data)?
-                    .evidence(id)?
-                    .context("responded on no pinned evidence")?;
+                let pinned = Responses::open(&self.data)?.evidence(id)?;
+                if pinned.is_none() && self.once(id, "pin lost") {
+                    // Its response is in a block: no answer of another
+                    // kept tells of this, and nothing else alerts.
+                    self.alert(&format!(
+                        "contract {}: the hub responded, and responses.sqlite no longer holds \
+                         the evidence it responded on, as when that file is lost or restored \
+                         older than openings.sqlite. It asserts nothing without it: her \
+                         timeout pays her what she claims and the hub's reserve. Restore \
+                         responses.sqlite as recent as openings.sqlite.",
+                        crate::hex_id(id)
+                    ));
+                }
+                let pinned = pinned.context("responded on no pinned evidence")?;
                 let release = x_at.saturating_add(depth);
                 commit(
                     release,

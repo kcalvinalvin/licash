@@ -2297,6 +2297,58 @@ async fn a_hub_that_lost_its_pinned_response_signs_no_other() -> Result<()> {
     Ok(())
 }
 
+/// A hub whose response is in a block, `responses.sqlite` lost since: no
+/// answer begun and nothing in the mempool tell of it, but it cannot
+/// assert on evidence it no longer holds, and the operator is told, once.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs bitcoind and a release build"]
+async fn a_hub_that_lost_what_it_responded_on_is_told_it_asserts_nothing() -> Result<()> {
+    let s = stale_claim([21; 32]).await?;
+    let data = s._dir.path().join("hub");
+    let told = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let alerts = told.clone();
+    s.openings.alert_with(Arc::new(move |message: &str| {
+        alerts.lock().unwrap().push(message.to_owned())
+    }));
+    let lost = || {
+        let told = told.lock().unwrap();
+        told.iter()
+            .filter(|m| m.contains("responses.sqlite no longer holds"))
+            .count()
+    };
+    let mut responded = false;
+    for _ in 0..50 {
+        let round = s.openings.answer_requests().await?;
+        ensure!(round.failed == 0, "{round:?}");
+        if round.answered == 1 {
+            responded = true;
+            break;
+        }
+        s.rt.mine(1)?;
+    }
+    ensure!(responded && lost() == 0, "{:?}", told.lock().unwrap());
+    // Its response in a block, then the file lost.
+    s.rt.mine(1)?;
+    for end in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(data.join(format!("responses.sqlite{end}")));
+    }
+    for _ in 0..3 {
+        let round = s.openings.answer_requests().await?;
+        ensure!(round.answered == 0, "{round:?}");
+        s.rt.mine(1)?;
+    }
+    let told = told.lock().unwrap();
+    let asserts: Vec<_> = told
+        .iter()
+        .filter(|m| m.contains("responses.sqlite no longer holds"))
+        .collect();
+    ensure!(
+        asserts.len() == 1 && asserts[0].contains("asserts nothing"),
+        "{told:?}"
+    );
+    Ok(())
+}
+
 /// Transaction `txid` of a dispute, confirmed on `rt`'s standard node at
 /// the fee its graph presigned: at least 1 sat/vB of its actual size,
 /// what a node relays by default, with nothing to bump it.
