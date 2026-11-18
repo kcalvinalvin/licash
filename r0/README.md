@@ -50,8 +50,9 @@ Contracts open under the program `apps/contracts` names (`SIGNET` in
 `apps/contracts/src/lib.rs`), and those opened under the ones before
 (`SIGNET_BEFORE`) are played still. Each is kept in `r0/programs/` as
 `<image id>.bin`: a contract opened under one is proven with it alone, so
-none named there is ever removed, and the hub's prover is ready only with
-all of them installed. Each file's image id is its name:
+none named there is ever removed. A hub's prover lacking one responds to
+no contested claim of its contracts (and alerts), so install every
+program before starting an upgraded hub. Each file's image id is its name:
 
 ```sh
 for p in r0/programs/*.bin; do

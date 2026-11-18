@@ -549,7 +549,8 @@ impl Openings {
             // In sats: what responding saves the hub.
             let unit = o.base.parts().graph.unit_sats;
             let stake = u64::from(b.saturating_sub(decided.owed)) * unit;
-            match prover.admit(id, stake, cycles, deadline, release, tip) {
+            let program = &o.base.parts().recipe.program;
+            match prover.admit(id, program, stake, cycles, deadline, release, tip) {
                 Admission::Admit => {}
                 Admission::Wait => return Ok(Played::Idle),
                 Admission::Withhold(why) => {

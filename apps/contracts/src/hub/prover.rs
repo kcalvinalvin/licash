@@ -211,6 +211,9 @@ struct State {
     /// Polls of every contract completed.
     polls: u64,
     tip: u32,
+    /// The programs contracts opened under before that the probe found
+    /// not installed: their contracts' claims are withheld.
+    uninstalled: Vec<[u8; 32]>,
 }
 
 struct Inner {
@@ -226,29 +229,19 @@ struct Inner {
     alert: OnceLock<Arc<Alert>>,
 }
 
-/// What `probe` doesn't install of the programs: `program`, which
-/// contracts open under, and `before`, which they opened under before.
-fn uninstalled(probe: &serde_json::Value, program: &[u8; 32], before: &[[u8; 32]]) -> Vec<String> {
+/// Those of `programs` that `probe` doesn't install.
+fn uninstalled(probe: &serde_json::Value, programs: &[[u8; 32]]) -> Vec<[u8; 32]> {
     let installed = |id: &[u8; 32]| {
         let id = hex::encode(id);
         probe["programs"]
             .as_array()
             .is_some_and(|p| p.iter().any(|p| p.as_str() == Some(&id)))
     };
-    let mut missing = Vec::new();
-    if !installed(program) {
-        missing.push(format!(
-            "the program contracts open under, {}, is not installed",
-            hex::encode(program)
-        ));
-    }
-    for id in before.iter().filter(|id| !installed(id)) {
-        missing.push(format!(
-            "the program contracts opened under before, {}, is not installed",
-            hex::encode(id)
-        ));
-    }
-    missing
+    programs
+        .iter()
+        .filter(|id| !installed(id))
+        .copied()
+        .collect()
 }
 
 /// The hub's one prover: see the module.
@@ -464,16 +457,19 @@ impl Prover {
         fits
     }
 
-    /// Whether the hub may respond to `id`'s claim, which saves it `stake`
-    /// sat if proved, and whose proof of `cycles` it would make before
-    /// `deadline`, from `release`: its prover is ready, the claim was seen
+    /// Whether the hub may respond to `id`'s claim, opened under
+    /// `program`, which saves it `stake` sat if proved, and whose proof of
+    /// `cycles` it would make before `deadline`, from `release`: its
+    /// prover is ready and installs `program`, the claim was seen
     /// on a poll before this one (all the proofs committed to are known
     /// then, and its stake against the others'), and its proof fits with
     /// those committed to and those of larger stakes, none of which it
     /// would make late. Why not, if not.
+    #[allow(clippy::too_many_arguments)]
     pub fn admit(
         &self,
         id: &[u8; 32],
+        program: &[u8; 32],
         stake: u64,
         cycles: u64,
         deadline: u32,
@@ -502,6 +498,10 @@ impl Prover {
             }
             _ => return Admission::Wait,
         };
+        if s.uninstalled.contains(program) {
+            let program = hex::encode(program);
+            return Admission::Withhold(format!("its program, {program}, is not installed"));
+        }
         if first == polls {
             return Admission::Wait;
         }
@@ -643,11 +643,26 @@ impl Inner {
                     .collect()
             })
             .unwrap_or_default();
-        problems.extend(uninstalled(&probe, &self.program, &self.before));
         let program = hex::encode(self.program);
+        if !uninstalled(&probe, &[self.program]).is_empty() {
+            problems.push(format!(
+                "the program contracts open under, {program}, is not installed"
+            ));
+        }
         if !problems.is_empty() {
             bail!("{}", problems.join("; "));
         }
+        // Those before missing: their contracts' claims alone withheld.
+        let missing = uninstalled(&probe, &self.before);
+        if !missing.is_empty() && self.state().uninstalled != missing {
+            let ids: Vec<_> = missing.iter().map(hex::encode).collect();
+            self.alert(&format!(
+                "the hub's prover lacks programs contracts opened under before ({}): \
+                 it responds to no contested claim of their contracts",
+                ids.join(", ")
+            ));
+        }
+        self.state().uninstalled = missing;
         let device = probe["device"].as_str().unwrap_or("cpu").to_owned();
         if device == "cpu" {
             tracing::warn!("the hub's prover has no GPU: it proves on the CPU, hours a proof");
@@ -910,31 +925,31 @@ mod tests {
         let p = ready(dir.path(), speed);
         // Not before a poll saw it.
         assert_eq!(
-            p.admit(&[1; 32], 10, 2_000_000, 110, 100, 100),
+            p.admit(&[1; 32], &[0; 32], 10, 2_000_000, 110, 100, 100),
             Admission::Wait
         );
         p.polled();
         assert_eq!(
-            p.admit(&[1; 32], 10, 2_000_000, 110, 100, 100),
+            p.admit(&[1; 32], &[0; 32], 10, 2_000_000, 110, 100, 100),
             Admission::Admit
         );
         p.commit(&[1; 32], [0; 32], 110, 100, 2_000_000, true, false, 100);
         // Two more claims, one of a larger stake: room for one of them.
-        let _ = p.admit(&[2; 32], 5, 2_000_000, 110, 100, 100);
-        let _ = p.admit(&[3; 32], 50, 2_000_000, 110, 100, 100);
+        let _ = p.admit(&[2; 32], &[0; 32], 5, 2_000_000, 110, 100, 100);
+        let _ = p.admit(&[3; 32], &[0; 32], 50, 2_000_000, 110, 100, 100);
         p.polled();
-        let small = p.admit(&[2; 32], 5, 2_000_000, 110, 100, 100);
+        let small = p.admit(&[2; 32], &[0; 32], 5, 2_000_000, 110, 100, 100);
         assert!(
             matches!(&small, Admission::Withhold(w) if w.contains("larger stake")),
             "{small:?}"
         );
         assert_eq!(
-            p.admit(&[3; 32], 50, 2_000_000, 110, 100, 100),
+            p.admit(&[3; 32], &[0; 32], 50, 2_000_000, 110, 100, 100),
             Admission::Admit
         );
         p.commit(&[3; 32], [0; 32], 110, 100, 2_000_000, false, false, 100);
         // Seen later, it would not be in time now.
-        let late = p.admit(&[2; 32], 5, 2_000_000, 111, 101, 100);
+        let late = p.admit(&[2; 32], &[0; 32], 5, 2_000_000, 111, 101, 100);
         assert!(
             matches!(&late, Admission::Withhold(w) if w.contains("in time")),
             "{late:?}"
@@ -942,7 +957,7 @@ mod tests {
         // A proof made frees its room.
         p.commit(&[1; 32], [0; 32], 110, 100, 2_000_000, true, true, 100);
         assert_eq!(
-            p.admit(&[2; 32], 5, 2_000_000, 111, 101, 100),
+            p.admit(&[2; 32], &[0; 32], 5, 2_000_000, 111, 101, 100),
             Admission::Admit
         );
     }
@@ -979,7 +994,7 @@ mod tests {
         );
         p.0.state().readiness = Some(Readiness::NotReady("no GPU".into()));
         p.polled();
-        let e = p.admit(&[1; 32], 1, 1, 110, 100, 100);
+        let e = p.admit(&[1; 32], &[0; 32], 1, 1, 110, 100, 100);
         assert!(
             matches!(&e, Admission::Withhold(w) if w.contains("no GPU")),
             "{e:?}"
@@ -1130,22 +1145,31 @@ esac
         assert_eq!(calls, "probe\n");
     }
 
-    /// Each program contracts open or opened under must be installed: a
-    /// prover missing one is not ready, as its contracts can't be proven.
+    /// A program contracts opened under before, not installed: the prover
+    /// is ready, and withholds only the claims of its contracts.
     #[test]
-    fn a_prover_proves_the_programs_contracts_opened_under_before() {
+    fn a_prover_withholds_only_the_claims_of_programs_it_lacks() {
         let probe = |ids: &[[u8; 32]]| serde_json::json!({ "programs": ids.iter().map(hex::encode).collect::<Vec<_>>() });
-        let (now, before) = ([7; 32], [[8; 32], [9; 32]]);
-        assert!(uninstalled(&probe(&[now, [8; 32], [9; 32]]), &now, &before).is_empty());
-        let missing = uninstalled(&probe(&[now, [9; 32]]), &now, &before);
-        assert_eq!(missing.len(), 1);
-        assert!(missing[0].contains(&hex::encode([8; 32])), "{missing:?}");
-        let missing = uninstalled(&probe(&[[8; 32], [9; 32]]), &now, &before);
-        assert!(
-            missing.len() == 1 && missing[0].contains("open under,"),
-            "{missing:?}"
-        );
-        assert_eq!(uninstalled(&serde_json::json!({}), &now, &before).len(), 3);
+        let before = [[8; 32], [9; 32]];
+        assert!(uninstalled(&probe(&[[7; 32], [8; 32], [9; 32]]), &before).is_empty());
+        assert_eq!(uninstalled(&probe(&[[7; 32], [9; 32]]), &before), [[8; 32]]);
+        assert_eq!(uninstalled(&serde_json::json!({}), &before), before);
+        let dir = tempfile::tempdir().unwrap();
+        let speed = Speed {
+            device: "cuda".into(),
+            segment_cycles: 250_000,
+            segment: 3.0,
+            tail: 100.0,
+        };
+        let p = Prover::ready_at(dir.path(), speed);
+        p.0.state().uninstalled = vec![[8; 32]];
+        let admit = |id: u8, program: [u8; 32]| p.admit(&[id; 32], &program, 1, 1_000, 900, 10, 0);
+        let Admission::Withhold(why) = admit(1, [8; 32]) else {
+            panic!("admitted")
+        };
+        assert!(why.contains(&hex::encode([8; 32])), "{why}");
+        assert!(matches!(admit(2, [9; 32]), Admission::Wait));
+        assert!(matches!(admit(3, [7; 32]), Admission::Wait));
     }
 
     /// A probe's problems, or a program not installed, and it is not ready:
@@ -1170,7 +1194,7 @@ esac
         p.alert_with(Arc::new(move |m| kept.lock().unwrap().push(m.to_owned())));
         assert!(told.lock().unwrap()[0].contains("responds to no contested claim"));
         p.polled();
-        let e = p.admit(&[1; 32], 1, 1, 110, 100, 100);
+        let e = p.admit(&[1; 32], &[0; 32], 1, 1, 110, 100, 100);
         assert!(
             matches!(&e, Admission::Withhold(w) if w.contains("memory")),
             "{e:?}"

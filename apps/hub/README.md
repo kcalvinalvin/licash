@@ -303,7 +303,9 @@ its CUDA build, which it proves on when the container has a GPU (`--gpus
 all`, or a Compose `deploy.resources.reservations.devices` entry with the
 NVIDIA runtime; drivers 550 or newer, Turing or newer, 6 GB of memory are
 enough), RISC Zero's Groth16 setup and the programs contracts open and
-opened under: the prover is not ready unless it has them all.
+opened under: the prover is not ready without the one they open under,
+and responds to no claim of a contract whose program it lacks (alerting
+the operator).
 On an RTX 2060 a proof takes about 20 minutes (the Groth16 wrap about 3 of
 them, on the CPU) plus about 7 minutes for each 1,000 headers since the
 contract's checkpoint: one of signet's most, 26,280 headers (half a year),
