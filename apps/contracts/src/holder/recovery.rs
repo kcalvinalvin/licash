@@ -15,7 +15,7 @@ use licash_contract::{
     opening::{Context, Holder, Opening},
 };
 use licash_onchain::deadline;
-use licash_wallet::{first_spend, ClaimNote, ClaimSlot, Transport, Wallet};
+use licash_wallet::{first_spend, ClaimNote, ClaimSlot, LockRefund, Transport, Wallet};
 use lichen_contract::Role;
 use serde::{Deserialize, Serialize};
 
@@ -612,24 +612,32 @@ impl<'a, T: Transport, C: Chain> Run<'a, T, C> {
     /// Her notes of the hub's keyset taken, its share of them with her
     /// other contracts there ([`claims`]), and claimed: the claim signed
     /// by each note's hold key, for their face value, its cap at most.
+    /// The refunds of her locks there that expired at depth unsettled
+    /// first ([`LockRefund`]), within its cap.
     fn claim(&self, state: &mut State, tip: u32) -> Result<Next> {
         // Before any note of hers is taken.
         self.o.forcible()?;
         let parts = self.o.base.parts();
         let keyset = *parts.keyset.id();
         let mut notes = self.wallet.claimed_notes(&self.id, &keyset)?;
-        if notes.is_empty() {
-            notes = self.wallet.claim_notes(&self.id, &self.slots(tip)?)?;
-            self.took.store(!notes.is_empty(), Ordering::SeqCst);
+        let mut refunds = self.wallet.claimed_refunds(&self.id, &keyset)?;
+        if notes.is_empty() && refunds.is_empty() {
+            (notes, refunds) = self
+                .wallet
+                .claim_with_refunds(&self.id, &self.slots(tip)?, tip)?;
+            self.took
+                .store(!(notes.is_empty() && refunds.is_empty()), Ordering::SeqCst);
         }
-        if notes.is_empty() {
+        if notes.is_empty() && refunds.is_empty() {
             self.give_back("no notes at its hub to claim")?;
             bail!("no notes at its hub to claim");
         }
         // A note beyond what is left of the cap is claimed for that much.
-        let held: u64 = notes.iter().map(|n| n.note.message().denomination()).sum();
+        let held: u64 = (notes.iter().map(|n| n.note.message().denomination()))
+            .chain(refunds.iter().map(|r| r.value))
+            .sum();
         state.amount = parts.cap.min(u32::try_from(held).unwrap_or(u32::MAX));
-        let filing = match self.filing(&notes, state.amount) {
+        let filing = match self.filing(&notes, &refunds, state.amount) {
             Ok(filing) => filing,
             Err(e) => {
                 self.give_back(&format!("{e:#}"))?;
@@ -656,12 +664,20 @@ impl<'a, T: Transport, C: Chain> Run<'a, T, C> {
         Ok(claims::claim_slots(mine, &terms))
     }
 
-    fn filing(&self, notes: &[ClaimNote], amount: u32) -> Result<Filing> {
+    fn filing(&self, notes: &[ClaimNote], refunds: &[LockRefund], amount: u32) -> Result<Filing> {
         let p = self.o.base.parts();
         let limit = p.limits.max_authorizations as usize;
+        // In the claim's order of sources, which their witnesses follow.
+        let mut refunds = refunds.to_vec();
+        refunds.sort_by_key(|r| r.id);
         let messages: Vec<_> = notes.iter().map(|n| n.note.message().clone()).collect();
-        let mut authorizations = messages.clone();
+        let mut keys = self.wallet.hold_keys(notes)?;
+        keys.extend(refunds.iter().flat_map(|r| r.keys.iter().cloned()));
+        let mut authorizations: Vec<_> = keys.iter().map(|(m, _)| m.clone()).collect();
         authorizations.sort_by_key(|m| m.identifier().ok());
+        let items = (messages.into_iter().map(Item::Settled))
+            .chain(refunds.iter().flat_map(|r| r.items.iter().cloned()))
+            .collect();
         let claim = UnsignedClaim::new(
             claim::Context {
                 base: self.o.base.digest(),
@@ -671,19 +687,19 @@ impl<'a, T: Transport, C: Chain> Run<'a, T, C> {
             &p.keyset,
             amount,
             claim::Parts {
-                items: messages.into_iter().map(Item::Settled).collect(),
-                sources: vec![],
+                items,
+                sources: refunds.iter().map(|r| r.source.clone()).collect(),
                 activations: vec![],
                 authorizations,
             },
             limit,
         )?;
-        let publication = Publication::sign(claim, &self.wallet.hold_keys(notes)?, limit)?;
+        let publication = Publication::sign(claim, &keys, limit)?;
         let filing = Filing::new(
             publication,
             FilingWitness {
                 notes: notes.iter().map(|n| n.note.clone()).collect(),
-                sources: vec![],
+                sources: refunds.iter().map(|r| r.witness.clone()).collect(),
                 activations: vec![],
             },
         )?;

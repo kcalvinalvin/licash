@@ -1680,6 +1680,91 @@ async fn a_hub_meets_a_stale_claim_with_the_spend_it_released_and_pays_what_is_l
     Ok(())
 }
 
+/// A lock of hers the hub certified and never settled is refunded on
+/// Bitcoin: her force close past its expiry at depth claims its refund
+/// beside her notes, and the hub, once its ledger scanned her claim's
+/// block, finds it owed all she asks: her timeout pays it.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs bitcoind and a release build"]
+async fn a_force_close_claims_an_unsettled_locks_refund_once_expired_at_depth() -> Result<()> {
+    use licash_contracts::holder::recovery::{self, Stage};
+
+    let rt = Regtest::start_standard()?;
+    let dir = tempfile::tempdir()?;
+    let at = dir.path().join("hub");
+    let range = Range {
+        max_cap: 50_000_000,
+        max_blocks: 5_000,
+        per_coin: 2,
+        ppm_year: 10_000,
+    };
+    let (url, source, hub, openings) = hub_answering_with(&rt, &at, Some(range)).await?;
+    let chain = Node(source.clone());
+    let (mine, wallet) =
+        holder_wallet(&rt, &chain, dir.path(), &url, [17; 32], &[60_000, 50_000]).await?;
+    let chosen = Ask {
+        cap: Some(10_000),
+        ..ask()
+    };
+    let opened = holder::open(&wallet, &chain, &mine, &url, chosen).await?;
+    for _ in 0..3 {
+        let payment = pay(&hub, &at.join("seed"), &url, &wallet.address(), 2_048)?;
+        wallet.receive(&payment)?;
+    }
+    rt.mine(1)?;
+    holder::resume(&wallet, &chain, &mine).await?;
+    ensure!(available(&wallet)? == 6_144);
+
+    // A lock to Bob the hub certifies, then never asked to settle.
+    while !watch::step(&hub, &source).await? {}
+    let expiry = rt.height()? + 6;
+    let bob = licash::address::OwnerKeys::from_seed(&[0xbb; 32])?.address();
+    let hash = licash::spend::lock_hash(&[7; 32]);
+    let lock = wallet.lock(&url, &bob, 1_000, hash, Some(expiry)).await?;
+    ensure!(lock.state == licash_wallet::LockState::Locked, "{lock:?}");
+    let left = available(&wallet)?;
+    ensure!(left == 4_096, "{left} left");
+    // Past its expiry at any depth the hub takes.
+    rt.mine_to_height(expiry + 12)?;
+    while !watch::step(&hub, &source).await? {}
+
+    let rate = bitcoin::FeeRate::from_sat_per_vb(2).context("a rate")?;
+    let forced = recovery::force_close(&wallet, &chain, &mine, &opened.id, rate).await?;
+    // Her two notes, and the lock's refund less the hub's fee.
+    let refund = forced.claimed - 4_096;
+    ensure!(
+        forced.notes == 2 && refund > 1_000 && refund <= 2_048,
+        "{forced:?}"
+    );
+    rt.mine_to_height(forced.next_at.context("no lock")? - 1)?;
+    recovery::advance(&wallet, &chain, &mine, rate).await?;
+    let mut done = None;
+    for _ in 0..800 {
+        rt.mine(1)?;
+        while !watch::step(&hub, &source).await? {}
+        let round = openings.answer_requests().await?;
+        ensure!(round.failed == 0, "{round:?}");
+        let r = recovery::advance(&wallet, &chain, &mine, rate).await?[0].clone();
+        ensure!(r.stage != Stage::Lost, "{r:?}");
+        if r.stage == Stage::Done {
+            done = Some(r);
+            break;
+        }
+    }
+    let done = done.context("never paid")?;
+    ensure!(
+        done.response.is_none() && done.timeout.is_some() && done.payout == done.timeout,
+        "{done:?}"
+    );
+    // Its hub refunds it no more, nor pays it.
+    let followed = wallet.follow_lock(&lock.id).await?;
+    ensure!(
+        followed.state == licash_wallet::LockState::Locked,
+        "{followed:?}"
+    );
+    Ok(())
+}
+
 /// A hub whose ledger follows the chain, its scan stopped before her
 /// request, still meets a claim of no lock with the spend it holds: only
 /// a claim of a lock waits for the scan of its block.
