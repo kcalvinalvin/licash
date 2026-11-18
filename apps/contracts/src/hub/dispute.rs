@@ -1756,7 +1756,7 @@ fn estimated_cycles(o: &HubOpening, evidence: usize, at: u32) -> u64 {
         .saturating_add(1)
         .min(chain.max_headers);
     let other = o.base.to_bytes().len() + evidence + 8_192;
-    prover::cycles(u64::from(headers), other as u64)
+    prover::cycles(u64::from(headers), other as u64) + prover::SIGNATURE_CYCLES
 }
 
 /// The evidence pinned as `bytes`: none for empty bytes (a response pinned

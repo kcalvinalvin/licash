@@ -38,6 +38,11 @@ use licash::spend::ChainProfile;
 pub(super) const HEADER_CYCLES: u64 = 28_000;
 pub(super) const BYTE_CYCLES: u64 = 2_000;
 
+/// Cycles the check of her request's signatures takes under a v4 Base,
+/// beyond its keys' bytes: the answered input under a v4 Base took 5.8 M
+/// cycles more for 1,570 bytes more (73.4 M). Counted for every contract.
+pub(super) const SIGNATURE_CYCLES: u64 = 3_000_000;
+
 /// What the benchmark may be off by on a real proof.
 pub(super) const MARGIN: f64 = 1.3;
 
@@ -114,10 +119,11 @@ pub(super) fn cycles(headers: u64, other: u64) -> u64 {
 /// The cycles of the largest proof of an exit a contract commits the hub
 /// to: of each of its `headers`, from its checkpoint to its close, and of
 /// its Base (`base` bytes), its publication (`publication` bytes at most),
-/// as much evidence again and its exit's transactions (8 kB).
+/// as much evidence again and its exit's transactions (8 kB), and of her
+/// request's signatures.
 pub(super) fn worst_cycles(headers: u32, publication: u32, base: usize) -> u64 {
     let other = base as u64 + 2 * u64::from(publication) + 8_192;
-    cycles(u64::from(headers), other)
+    cycles(u64::from(headers), other) + SIGNATURE_CYCLES
 }
 
 /// The cycles of the statement's input `bytes` (`HubInput::to_bytes`):
