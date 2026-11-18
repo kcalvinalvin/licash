@@ -122,6 +122,11 @@ pub struct Info {
     /// codes, if it does.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub donations: Option<Donations>,
+    /// What it takes beyond this version of the protocol, by name, such
+    /// as a later way of paying for swaps: a client uses one only if it
+    /// names it. Empty from older providers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub features: Vec<String>,
 }
 
 impl Info {
@@ -303,6 +308,10 @@ pub enum State {
     /// The provider did not lock: the client's lock is refunded once
     /// expired.
     Failed,
+    /// A state of a later version of the protocol: read as the swap under
+    /// way, nothing of it final.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Pay the client's `lock` at hub `from`, which pays the provider, out on

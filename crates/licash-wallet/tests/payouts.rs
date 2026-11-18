@@ -290,6 +290,7 @@ impl Desk {
             chain: *self.terms.lock().unwrap(),
             lightning: None,
             donations: None,
+            features: Vec::new(),
         }
     }
 

@@ -329,6 +329,12 @@ pub struct Info {
     /// None from hubs following no chain, and from older hubs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proof: Option<Hex>,
+    /// What the hub takes beyond this version of the protocol, by name,
+    /// such as a later way of paying for contracts: a wallet uses one only
+    /// if it names it. Not part of its [`Info::identity`]. Empty from
+    /// older hubs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub features: Vec<String>,
 }
 
 impl Info {
@@ -346,6 +352,7 @@ impl Info {
             contracts: None,
             urls: Vec::new(),
             proof: None,
+            features: Vec::new(),
         }
     }
 
@@ -585,6 +592,10 @@ pub enum Code {
     /// A swap provider takes no such swap: outside its limits, its hubs or
     /// what it holds.
     Declined,
+    /// A code of a later version of the protocol: a refusal, read by its
+    /// message alone.
+    #[serde(other)]
+    Unknown,
 }
 
 impl Code {

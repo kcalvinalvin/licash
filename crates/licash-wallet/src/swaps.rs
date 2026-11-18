@@ -335,6 +335,13 @@ impl<T: Transport> Wallet<T> {
                     reason: "the provider is locking".into(),
                 });
             }
+            // A later protocol's state: nothing final, asked again later.
+            Theirs::Unknown => {
+                return Err(Error::Pending {
+                    id: hex::encode(hash),
+                    reason: "the provider reports a state this wallet does not know".into(),
+                });
+            }
             Theirs::Failed | Theirs::Refunded => {
                 let reason = swap.reason.as_deref().unwrap_or("no reason given");
                 self.fail_swap(hash, &format!("the provider gave the swap up: {reason}"))?;

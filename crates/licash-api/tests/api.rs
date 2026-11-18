@@ -551,6 +551,7 @@ fn swap_bodies_name_hubs_by_address_and_locks_by_id() {
         chain: None,
         lightning: None,
         donations: None,
+        features: Vec::new(),
     };
     assert_eq!(json(&info), info);
     let at_a = info.hub(&hub_a.address()).unwrap();
@@ -1099,4 +1100,24 @@ fn a_deposit_paying_an_amount_exactly_locks_what_its_fee_leaves() {
         }
     }
     assert_eq!(deposits(0, 0).paid_by(u64::MAX), Some(u64::MAX));
+}
+
+#[test]
+fn a_later_versions_codes_states_and_features_read_as_unknown_or_ignored() {
+    use licash_api::swaps;
+
+    // A refusal by a code this version does not know: still a refusal.
+    let problem: Problem =
+        serde_json::from_str(r#"{"code":"prepay_required","message":"pay first"}"#).unwrap();
+    assert_eq!((problem.code, problem.code.status()), (Code::Unknown, 409));
+    // A swap state this version does not know.
+    let state: swaps::State = serde_json::from_str(r#""prepaid""#).unwrap();
+    assert_eq!(state, swaps::State::Unknown);
+    // Features named, and none by older hubs and providers.
+    let owner = OwnerKeys::from_seed(&[1; 32]).unwrap();
+    let mut info = Info::new(&[], owner.address(), Fees::default(), None);
+    assert!(!serde_json::to_string(&info).unwrap().contains("features"));
+    info.features = vec!["prepay".into()];
+    let read: Info = serde_json::from_str(&serde_json::to_string(&info).unwrap()).unwrap();
+    assert_eq!(read.features, ["prepay"]);
 }

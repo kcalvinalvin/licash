@@ -745,6 +745,7 @@ impl<T: Transport> Provider<T> {
             chain: self.chain_info()?,
             donations: self.donations(),
             lightning: self.lightning_terms().cloned(),
+            features: Vec::new(),
         })
     }
 
