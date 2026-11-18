@@ -285,7 +285,9 @@ async fn an_invalid_assertion_pays_the_claim_when_no_answer_arrives() {
 #[tokio::test]
 #[ignore = "reconstructs garbled instances; run in release mode"]
 async fn a_retained_hub_receipt_answers_a_challenge_and_collects() {
-    lifecycle(15, true, true).await;
+    // Not 15: corrected to that, her payout rounds down to no output of
+    // hers, nothing to collect.
+    lifecycle(4096, true, true).await;
 }
 
 fn signed() -> (Opening, HolderKeys) {
