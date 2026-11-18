@@ -251,6 +251,10 @@ internal fun capAt(position: Float, least: ULong, most: ULong): ULong {
     val lo = ln(least.coerceAtLeast(1uL).toDouble())
     val exact = exp(lo + position * (ln(most.toDouble()) - lo))
     val unit = 10.0.pow(max(0.0, floor(log10(exact)) - 1))
+    // Within half a step of an end: that end, not the round number past
+    // it (4,100 sat where the thumb shows the least, 4,096).
+    if (exact < least.toDouble() + unit / 2) return least
+    if (exact > most.toDouble() - unit / 2) return most
     return ((exact / unit).roundToLong() * unit).roundToLong().toULong().coerceIn(least, most)
 }
 

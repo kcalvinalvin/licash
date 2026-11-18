@@ -21,6 +21,13 @@ class ChooseContractTest {
     }
 
     @Test
+    fun the_cap_slider_a_hair_off_an_end_is_at_it() {
+        // Its thumb drawn at the start, a touch past it: the least, not 4,100.
+        assertEquals(least, capAt(0.0005f, least, most))
+        assertEquals(most, capAt(0.9999f, least, most))
+    }
+
+    @Test
     fun caps_between_are_round_and_where_the_slider_shows_them() {
         // Half again a 10,000,000 sat coin, as the app suggests at first.
         val suggested = 15_000_000uL
