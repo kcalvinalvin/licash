@@ -493,13 +493,28 @@ impl Store {
         tx.commit()
     }
 
+    /// The oldest block kept.
+    fn oldest(&self) -> rusqlite::Result<Option<u32>> {
+        self.conn()
+            .query_row("SELECT MIN(height) FROM blocks", [], |r| r.get(0))
+    }
+
     /// Forget the blocks from `height` up, which left the best chain, and
     /// what was found in them: the payments of deposits not locked yet,
     /// and spends. Those locked keep theirs: the hub's notes are out.
-    fn rewind(&self, height: u32) -> rusqlite::Result<Vec<[u8; 32]>> {
+    /// `below`, the best chain's block before `height`, is kept as scanned
+    /// should none older be: the scan goes on from `height`.
+    fn rewind(&self, height: u32, below: Option<BlockHash>) -> rusqlite::Result<Vec<[u8; 32]>> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         tx.execute("DELETE FROM blocks WHERE height >= ?1", [height])?;
+        if let (Some(hash), Some(at)) = (below, height.checked_sub(1)) {
+            tx.execute(
+                "INSERT INTO blocks (height, hash) VALUES (?1, ?2)
+                 ON CONFLICT (height) DO UPDATE SET hash = excluded.hash",
+                params![at, hash.to_byte_array()],
+            )?;
+        }
         tx.execute(
             "UPDATE deposits SET txid = NULL, vout = NULL, height = NULL
              WHERE height >= ?1 AND state = 'open' AND done_at IS NULL",
@@ -796,7 +811,16 @@ impl Gateway {
             match self.source.follow(top, first, ours).await? {
                 Follow::Next(height, block) => self.store.scanned(height, &block)?,
                 Follow::Rewind(height) => {
-                    for hash in self.store.rewind(height)? {
+                    // None kept below: rather than from the tip, on from
+                    // there, the best chain's block before it as scanned.
+                    let below = match (self.store.oldest()?, height.checked_sub(1)) {
+                        (Some(oldest), Some(at)) if oldest >= height => {
+                            tracing::warn!(chain = %self.source, height, "deposits: the chain left the oldest block scanned; scanning again from it");
+                            Some(self.source.hash(at).await?)
+                        }
+                        _ => None,
+                    };
+                    for hash in self.store.rewind(height, below)? {
                         let name = hex::encode(hash);
                         let message = format!(
                             "The payment of deposit {name}, whose notes the hub locked, left the \

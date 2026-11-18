@@ -985,6 +985,31 @@ async fn a_payment_reorganized_away_locks_nothing_and_one_locked_alerts() {
     assert!(alerts[0].contains("left the best chain"), "{alerts:?}");
 }
 
+/// A reorganization that takes even the oldest block scanned is scanned
+/// again from that block, not from the new tip: a deposit paid there is
+/// found.
+#[tokio::test]
+async fn a_reorganization_past_every_block_scanned_scans_again_from_the_oldest() {
+    let net = Net::new().await;
+    let alice = net.wallet("alice");
+    let deposit = alice.deposit(HUB, 3_000).await.unwrap();
+    let hash = bytes(&deposit.hash);
+    let address = deposit.terms.clone().unwrap().address;
+    // The only block scanned so far, the tip, leaves the best chain: the
+    // payment is in its replacement, under others.
+    let oldest = net.height();
+    net.fork(oldest);
+    net.mine(1, vec![payment(&address, 3_100, 1)]);
+    net.mine(3, Vec::new());
+    net.deposits.round().await;
+    let funding = net.deposits.deposit_status(&hash).unwrap().funding;
+    assert_eq!(funding.map(|f| f.height), Some(oldest));
+    assert_eq!(
+        alice.follow_deposit(&deposit.hash).await.unwrap().state,
+        DepositState::Received
+    );
+}
+
 async fn call(net: &Net, method: Method, path: &str, body: Option<String>) -> (u16, Problem) {
     let request = Request::builder().method(method).uri(path);
     let request = match body {
