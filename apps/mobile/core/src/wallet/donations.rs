@@ -273,24 +273,47 @@ impl Wallet {
     }
 }
 
+/// What the provider `pin` answered at its URL: its answer only if it
+/// answers as the key that announced it, else unheard there, as one that
+/// moved (another there now, its URL taken over, or on the way to it):
+/// found again only where that key announces it.
+fn asked_of(
+    pin: &Pinned,
+    asked: Result<licash_wallet::DonationAddress, licash_wallet::Error>,
+) -> Asked {
+    match asked {
+        Ok(address) => {
+            let key = address.info.nostr.as_deref();
+            if key.is_some_and(|key| key.eq_ignore_ascii_case(&pin.key)) {
+                return Asked::Took(Box::new(address));
+            }
+            tracing::warn!(
+                provider = %pin.url, ?key, pinned = %pin.key,
+                "the donation provider kept answers as another key: unheard"
+            );
+            Asked::Unheard
+        }
+        Err(licash_wallet::Error::Invalid(why)) => {
+            tracing::info!(provider = %pin.url, "the donation address kept gives way: {why}");
+            Asked::Refused
+        }
+        Err(e) => {
+            tracing::info!(provider = %pin.url, "the donation address kept is unheard: {e}");
+            Asked::Unheard
+        }
+    }
+}
+
 impl Wallet {
     /// What to show of donations to `code`, given the provider `pinned`,
     /// asked first at its URL.
     fn offer(&self, pinned: Option<Pinned>, code: &LicashCode) -> Choice {
         let kept = pinned.map(|mut pin| {
             pin.code = Some(code.to_string());
-            let asked = self.runtime.block_on(self.wallet.donation_address(&pin.url, code));
-            let asked = match asked {
-                Ok(address) => Asked::Took(Box::new(address)),
-                Err(licash_wallet::Error::Invalid(why)) => {
-                    tracing::info!(provider = %pin.url, "the donation address kept gives way: {why}");
-                    Asked::Refused
-                }
-                Err(e) => {
-                    tracing::info!(provider = %pin.url, "the donation address kept is unheard: {e}");
-                    Asked::Unheard
-                }
-            };
+            let asked = self
+                .runtime
+                .block_on(self.wallet.donation_address(&pin.url, code));
+            let asked = asked_of(&pin, asked);
             (pin, asked)
         });
         choose(kept, || self.donation_providers(code), now())
@@ -395,6 +418,28 @@ mod tests {
         assert_eq!((live(&choice), &choice.pin), ("b", &None));
         let choice = choose(None, Vec::new, 0);
         assert!(choice.shown.is_none() && choice.pin.is_none());
+    }
+
+    #[test]
+    fn the_provider_kept_is_taken_only_answering_as_the_key_that_announced_it() {
+        let pinned = pin("a", None);
+        let answering = |nostr: Option<&str>| {
+            let mut address = address("https://a.test", true);
+            address.info.nostr = nostr.map(Into::into);
+            asked_of(&pinned, Ok(address))
+        };
+        assert!(matches!(answering(Some("a")), Asked::Took(_)));
+        assert!(matches!(answering(Some("A")), Asked::Took(_)));
+        // Another key at its URL, or none: as if it moved, unheard there.
+        assert!(matches!(answering(Some("b")), Asked::Unheard));
+        assert!(matches!(answering(None), Asked::Unheard));
+        // So the one found where its key announces it is shown instead.
+        let choice = choose(
+            Some((pin("a", None), answering(Some("b")))),
+            || vec![provider("a", true)],
+            DAY,
+        );
+        assert_eq!(live(&choice), "a");
     }
 
     #[test]
