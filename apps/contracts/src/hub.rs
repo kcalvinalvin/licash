@@ -89,6 +89,9 @@ pub struct Openings {
     source: Source,
     /// The node whose wallet funds and signs F, and locks its coins.
     wallet: Source,
+    /// The wallet new contracts pay the hub's share to, if another than
+    /// `wallet` ([`Openings::pay_out_to`]).
+    payout: std::sync::OnceLock<Source>,
     keyset: Keyset,
     trust: Trust,
     timing: Timing,
@@ -332,6 +335,7 @@ impl Openings {
             store: Mutex::new(store),
             source,
             wallet,
+            payout: std::sync::OnceLock::new(),
             keyset,
             trust,
             timing,
@@ -363,6 +367,45 @@ impl Openings {
         let locked = openings.store().locked()?;
         openings.relock_coins(&locked).await;
         Ok(openings)
+    }
+
+    /// Pay the hub's share of each contract opened from now on to a new
+    /// script of the wallet `wallet` names (its JSON-RPC, as
+    /// [`Openings::with_wallet`] takes one), rather than of the wallet that
+    /// funds F: one that watches a descriptor whose keys are kept offline,
+    /// so that what contracts return at their close, their fold or a
+    /// default is out of reach of this host. Contracts opened before pay
+    /// the script they were signed with; fee coins' change, the outputs a
+    /// dispute leaves the hub and coins spent back stay with the funding
+    /// wallet, which signs for them. Set once.
+    ///
+    /// Refused on another network than the chain's. A wallet that does not
+    /// answer is not fatal, as the funding wallet's: no contract opens
+    /// until it gives a script, and none is ever paid to the funding
+    /// wallet instead.
+    pub async fn pay_out_to(&self, wallet: Source) -> Result<()> {
+        let profile: ChainProfile = self.source.profile().await?;
+        match wallet.profile().await {
+            Ok(theirs) => ensure!(
+                theirs == profile,
+                "the contracts' payout wallet, {wallet}, is on {theirs}, the chain on {profile}"
+            ),
+            Err(e) => tracing::warn!("the contracts' payout wallet, {wallet}: {e:#}"),
+        }
+        let info: Result<serde_json::Value> =
+            wallet.rpc("getwalletinfo", serde_json::json!([])).await;
+        match info {
+            Ok(info) if info["private_keys_enabled"].as_bool() != Some(false) => tracing::warn!(
+                "the contracts' payout wallet, {wallet}, holds private keys: what contracts \
+                 return is only out of this host's reach in a wallet that watches a \
+                 descriptor (createwallet with disable_private_keys)"
+            ),
+            Ok(_) => {}
+            Err(e) => tracing::warn!("the contracts' payout wallet, {wallet}: {e:#}"),
+        }
+        tracing::info!(%wallet, "new contracts pay the hub's share to another wallet");
+        let _ = self.payout.set(wallet);
+        Ok(())
     }
 
     /// Scale the prover's estimate of each proof by `by` as openings are
@@ -939,6 +982,7 @@ mod tests {
             store: Mutex::new(Store::open(dir).unwrap()),
             source: source.clone(),
             wallet: source,
+            payout: std::sync::OnceLock::new(),
             keyset,
             trust: crate::trust(profile).unwrap(),
             timing: Timing::of(profile, None).unwrap(),

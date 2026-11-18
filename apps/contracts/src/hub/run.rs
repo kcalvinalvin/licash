@@ -221,7 +221,10 @@ impl Openings {
                 }
                 self.step_now()?;
                 let bounds = self.timing.bounds(&quote);
-                let payout = self.payout_script().await.map_err(Refused::unavailable)?;
+                let payout = self
+                    .opening_payout_script()
+                    .await
+                    .map_err(Refused::unavailable)?;
                 let hub = Hub::new(*quote, bounds, payout);
                 let (hub, out) = stepped(&self.heavy, hub, Input::Message(message), ctx).await?;
                 let out = self.keep(&id, out)?;

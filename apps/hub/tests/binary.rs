@@ -375,6 +375,36 @@ fn failures_exit_nonzero_and_log_as_asked() {
     assert!(!missing.exists());
 }
 
+/// A payout wallet is of the contracts the hub opens, and a node's: its
+/// URL refused before anything is opened, its password unshown.
+#[test]
+fn a_payout_wallet_needs_contracts_and_a_nodes_json_rpc() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("none");
+    let wallet = "http://user:hunter2@node:8332/wallet/cold";
+    let out = output(&missing, &["run", "--contracts-payout-wallet", wallet]);
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("--contracts"), "{stderr}");
+    for (url, says) in [
+        ("esplora+https://esplora.example/api", "not an Esplora API"),
+        ("ftp://user:hunter2@node:8332", "unknown scheme"),
+        ("http://user:hunter2@node:8332?x=1", "parameter"),
+    ] {
+        let args = ["run", "--contracts", "--contracts-payout-wallet", url];
+        let out = output(&missing, &args);
+        assert!(!out.status.success());
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("--contracts-payout-wallet")
+                && stderr.contains(says)
+                && !stderr.contains("hunter2"),
+            "{url}: {stderr}"
+        );
+    }
+    assert!(!missing.exists());
+}
+
 /// Give the hub at `data` an own lock under `hash`, which it may yet pay,
 /// as for a deposit, a Lightning receipt or a swap: the lock's id.
 fn own_lock(data: &Path, hash: [u8; 32]) -> String {

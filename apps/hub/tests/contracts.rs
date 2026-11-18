@@ -1163,6 +1163,173 @@ async fn a_holder_closes_her_contract_early_with_the_hub_and_gets_her_reserve_ba
     Ok(())
 }
 
+/// The JSON-RPC of `rt`'s node: of its wallet `wallet`, if any.
+fn rpc_of(rt: &Regtest, wallet: Option<&str>) -> Result<Source> {
+    let wallet = wallet.map(|w| format!("/wallet/{w}")).unwrap_or_default();
+    format!("{}{wallet}?cookie={}", rt.rpc_url(), rt.cookie().display()).parse()
+}
+
+/// A wallet of `rt`'s node without private keys, `cold`, watching the
+/// taproot descriptor of another, `cold-keys`, which stands for a signer
+/// kept offline: its JSON-RPC.
+async fn watch_only(rt: &Regtest) -> Result<Source> {
+    use serde_json::{json, Value};
+    let node = rpc_of(rt, None)?;
+    let _: Value = node.rpc("createwallet", json!(["cold-keys"])).await?;
+    let listed: Value = rpc_of(rt, Some("cold-keys"))?
+        .rpc("listdescriptors", json!([]))
+        .await?;
+    let descriptor = listed["descriptors"]
+        .as_array()
+        .context("no descriptors")?
+        .iter()
+        .filter(|d| d["internal"] == false)
+        .filter_map(|d| d["desc"].as_str())
+        .find(|d| d.starts_with("tr("))
+        .context("no taproot descriptor")?
+        .to_owned();
+    // Named, without private keys, blank.
+    let _: Value = node
+        .rpc("createwallet", json!(["cold", true, true]))
+        .await?;
+    let cold = rpc_of(rt, Some("cold"))?;
+    let import = json!([[{
+        "desc": descriptor,
+        "active": true,
+        "internal": false,
+        "timestamp": "now",
+        "range": [0, 100],
+    }]]);
+    let imported: Value = cold.rpc("importdescriptors", import).await?;
+    ensure!(imported[0]["success"] == true, "{imported}");
+    Ok(cold)
+}
+
+/// Whether `address` is of the wallet `wallet` names.
+async fn is_mine(wallet: &Source, address: &str) -> Result<bool> {
+    let info: serde_json::Value = wallet
+        .rpc("getaddressinfo", serde_json::json!([address]))
+        .await?;
+    info["ismine"].as_bool().context("no ismine")
+}
+
+/// A hub told of a payout wallet is paid its share of a contract ended by
+/// default there, at an address of a descriptor its funding wallet holds
+/// no key of, and ends the contract all the same.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs bitcoind and a release build"]
+async fn a_hub_is_paid_its_share_of_a_default_at_its_payout_wallet() -> Result<()> {
+    let rt = Regtest::start_standard()?;
+    let dir = tempfile::tempdir()?;
+    let (url, source, _, openings) = hub_answering(&rt, &dir.path().join("hub")).await?;
+    let cold = watch_only(&rt).await?;
+    openings.pay_out_to(cold.clone()).await?;
+    let chain = Node(source.clone());
+    let (mine, wallet) = holder_wallet(&rt, &chain, dir.path(), &url, [41; 32], &[60_000]).await?;
+    let opened = holder::open(&wallet, &chain, &mine, &url, ask()).await?;
+    rt.mine(1)?;
+    holder::resume(&wallet, &chain, &mine).await?;
+
+    rt.mine(u64::from(opened.close_height) - u64::from(rt.height()?))?;
+    let round = openings.answer_requests().await?;
+    ensure!(round.closed == 1 && round.failed == 0, "{round:?}");
+    rt.mine(1)?;
+
+    // Her reserve at her wallet; the rest at the payout wallet, and at no
+    // address of the wallet that funded it.
+    ensure!(scan(&wallet, &chain).await? == 37_000 + 20_000);
+    let f = opened.funding.context("no F")?;
+    let funding: serde_json::Value = source
+        .rpc(
+            "getrawtransaction",
+            serde_json::json!([f.to_string(), true]),
+        )
+        .await?;
+    let value = funding["vout"][0]["value"]
+        .as_f64()
+        .context("no contract output")?;
+    let share = (value * 1e8).round() as u64 - 20_000;
+    let coins: serde_json::Value = cold.rpc("listunspent", serde_json::json!([1])).await?;
+    let coins = coins.as_array().context("no coins")?;
+    ensure!(coins.len() == 1, "{coins:?}");
+    let sats = (coins[0]["amount"].as_f64().context("no amount")? * 1e8).round() as u64;
+    ensure!(sats == share, "{sats} of {share}");
+    let address = coins[0]["address"].as_str().context("no address")?;
+    ensure!(
+        !is_mine(&source, address).await?,
+        "paid to the funding wallet"
+    );
+    // Ended: the hub looks for its share in no wallet.
+    let after = openings.answer_requests().await?;
+    ensure!(after == Default::default(), "{after:?}");
+    Ok(())
+}
+
+/// A hub told of a payout wallet is paid its share of a contract its
+/// holder closes early there too: the fold pays the script the contract
+/// was opened with.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs bitcoind and a release build"]
+async fn a_hub_is_paid_its_share_of_a_fold_at_its_payout_wallet() -> Result<()> {
+    let rt = Regtest::start_standard()?;
+    let dir = tempfile::tempdir()?;
+    let (url, source, _, openings) = hub_answering(&rt, &dir.path().join("hub")).await?;
+    let cold = watch_only(&rt).await?;
+    openings.pay_out_to(cold.clone()).await?;
+    let chain = Node(source.clone());
+    let (mine, wallet) = holder_wallet(&rt, &chain, dir.path(), &url, [43; 32], &[60_000]).await?;
+    let opened = holder::open(&wallet, &chain, &mine, &url, ask()).await?;
+    rt.mine(1)?;
+    holder::resume(&wallet, &chain, &mine).await?;
+
+    let txid = holder::close(&wallet, &chain, &mine, &opened.id).await?;
+    rt.mine(1)?;
+    ensure!(scan(&wallet, &chain).await? == 37_000 + 20_000);
+    let fold: serde_json::Value = source
+        .rpc(
+            "getrawtransaction",
+            serde_json::json!([txid.to_string(), true]),
+        )
+        .await?;
+    let outs = fold["vout"].as_array().context("no outputs")?;
+    ensure!(outs.len() == 2, "{fold}");
+    let address = outs[1]["scriptPubKey"]["address"]
+        .as_str()
+        .context("no address")?;
+    ensure!(is_mine(&cold, address).await?, "not the payout wallet's");
+    ensure!(
+        !is_mine(&source, address).await?,
+        "paid to the funding wallet"
+    );
+    // The hub posts no default, and ends it.
+    let round = openings.answer_requests().await?;
+    ensure!(round == Default::default(), "{round:?}");
+    Ok(())
+}
+
+/// A hub whose payout wallet gives no address opens no contract: it never
+/// pays its funding wallet instead.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs bitcoind and a release build"]
+async fn a_hub_opens_no_contract_its_payout_wallet_gives_no_address_for() -> Result<()> {
+    let rt = Regtest::start_standard()?;
+    let dir = tempfile::tempdir()?;
+    let (url, source, _, openings) = hub_answering(&rt, &dir.path().join("hub")).await?;
+    // A wallet its node never loaded.
+    openings.pay_out_to(rpc_of(&rt, Some("absent"))?).await?;
+    let chain = Node(source);
+    let (mine, wallet) = holder_wallet(&rt, &chain, dir.path(), &url, [47; 32], &[60_000]).await?;
+    let refused = holder::open(&wallet, &chain, &mine, &url, ask()).await;
+    ensure!(
+        refused
+            .as_ref()
+            .is_err_and(|e| format!("{e:#}").contains("payout wallet")),
+        "{refused:?}"
+    );
+    ensure!(openings.load()?.live == 0, "an opening started");
+    Ok(())
+}
+
 /// As [`hub_serving`], and its openings, for a test to answer a holder's
 /// request with.
 async fn hub_answering(

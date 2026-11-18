@@ -147,6 +147,21 @@ struct Chain {
         requires = "contracts"
     )]
     contracts_wallet: Option<String>,
+    /// Pay the hub's share of each new contract to a new address of the
+    /// wallet of the node at this URL, as `--contracts-wallet` takes one,
+    /// rather than of the wallet that funds it: a wallet without private
+    /// keys watching a descriptor whose keys are offline, so that what
+    /// contracts return at their end is out of this host's reach. Contracts
+    /// open before keep the address they were signed with; no contract
+    /// opens while this wallet gives no address.
+    #[arg(
+        long = "contracts-payout-wallet",
+        value_name = "URL",
+        env = "LICASH_HUB_CONTRACTS_PAYOUT_WALLET",
+        hide_env_values = true,
+        requires = "contracts"
+    )]
+    contracts_payout_wallet: Option<String>,
     /// Scale the prover's estimate of each proof by this as the hub admits
     /// contracts: it opens one only if its prover could prove an exit of
     /// every contract it holds at once, in an assert window. Above 1 for a
@@ -1015,6 +1030,16 @@ fn command(cli: Cli) -> anyhow::Result<()> {
                 ),
                 (None, _) => None,
             };
+            let payout_wallet = match &chain.contracts_payout_wallet {
+                Some(url) => {
+                    anyhow::ensure!(
+                        !url.trim_start().starts_with("esplora+"),
+                        "--contracts-payout-wallet: a node's JSON-RPC, not an Esplora API"
+                    );
+                    Some(url.parse::<Source>().context("--contracts-payout-wallet")?)
+                }
+                None => None,
+            };
             let chain = chain.source(&policy)?;
             anyhow::ensure!(
                 !indexing || chain.is_some(),
@@ -1131,6 +1156,11 @@ fn command(cli: Cli) -> anyhow::Result<()> {
                         range,
                     );
                     let openings = runtime.block_on(opening).context("open the contracts")?;
+                    if let Some(payout) = payout_wallet {
+                        runtime
+                            .block_on(openings.pay_out_to(payout))
+                            .context("--contracts-payout-wallet")?;
+                    }
                     openings.limit_live(max_live);
                     openings
                         .scale_proofs(proof_scale)

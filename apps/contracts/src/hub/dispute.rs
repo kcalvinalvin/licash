@@ -1493,18 +1493,26 @@ impl Openings {
         .remove(&coin);
     }
 
-    /// A new script of the hub's wallet: what its openings and sweeps pay
-    /// the hub to.
+    /// A new script of the hub's wallet: what its sweeps pay the hub to,
+    /// and its openings unless they pay another wallet
+    /// ([`Openings::opening_payout_script`]).
     pub(super) async fn payout_script(&self) -> Result<ScriptBuf> {
-        let address: String = self
-            .wallet
-            .rpc("getnewaddress", serde_json::json!(["", "bech32m"]))
+        new_script(&self.wallet)
             .await
-            .context("a new address of the hub's wallet")?;
-        Ok(address
-            .parse::<bitcoin::Address<bitcoin::address::NetworkUnchecked>>()?
-            .assume_checked()
-            .script_pubkey())
+            .context("a new address of the hub's wallet")
+    }
+
+    /// A new script for the hub's share of a contract opening now: of its
+    /// payout wallet, if it has one ([`Openings::pay_out_to`]), else of
+    /// the wallet that funds it. Never of the funding wallet for want of
+    /// an answer from the payout wallet: the opening is refused then.
+    pub(super) async fn opening_payout_script(&self) -> Result<ScriptBuf> {
+        match self.payout.get() {
+            Some(payout) => new_script(payout)
+                .await
+                .context("a new address of the contracts' payout wallet"),
+            None => self.payout_script().await,
+        }
     }
 
     /// Whether `coin` is unspent: by the blocks, and by the mempool too
@@ -1674,6 +1682,17 @@ impl Openings {
             .unwrap_or_else(PoisonError::into_inner)
             .insert((*id, what))
     }
+}
+
+/// A new taproot script of the wallet `wallet` names.
+async fn new_script(wallet: &licash_chain_client::Source) -> Result<ScriptBuf> {
+    let address: String = wallet
+        .rpc("getnewaddress", serde_json::json!(["", "bech32m"]))
+        .await?;
+    Ok(address
+        .parse::<bitcoin::Address<bitcoin::address::NetworkUnchecked>>()?
+        .assume_checked()
+        .script_pubkey())
 }
 
 /// How many blocks before an assertion's deadline its operator is told
