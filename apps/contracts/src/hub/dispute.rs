@@ -145,7 +145,7 @@ impl Openings {
                 .await;
         }
         let Some((z_at, z)) = self.spend(main(&y), &y.output[0], y_at, tip).await? else {
-            return Ok(Played::Idle);
+            return self.succeed(id, &hub, &o, y_at, tip).await;
         };
         let challenge = presign(&o.set, "challenge_assert")?;
         if z.compute_txid() != challenge.tx.compute_txid() {
@@ -306,7 +306,10 @@ impl Openings {
             // She never published: the slot is the hub's after k.
             let k = u32::from(o.babe.spec.windows.k);
             if tip.saturating_add(1) >= r_at.saturating_add(k) {
+                // Its slot's value alone pays no fee: a fee coin with it.
+                let prevout = r.output[slot.vout as usize].clone();
                 let tx = o.reclaim(hub.keys())?;
+                let tx = self.with_fee(id, hub, "reclaim", tx, prevout).await?;
                 if self.post(&tx).await {
                     return Ok(Played::Posted("reclaim"));
                 }
@@ -314,11 +317,11 @@ impl Openings {
             return Ok(Played::Idle);
         };
         let request = presign(&o.set, "request")?;
-        if p.input.iter().all(|i| i.previous_output != slot)
-            || p.compute_txid() == o.reclaim(hub.keys())?.compute_txid()
-        {
+        if p.input.iter().all(|i| i.previous_output != slot) {
             return Ok(Played::Idle);
         }
+        // Her slot spent by her publication, or by the hub's reclaim: then
+        // her claim reads as empty, owed nothing, and is answered so.
         let depth = o.base.parts().chain.funding_depth.max(1);
         if tip.saturating_add(1) < p_at.saturating_add(depth) {
             return Ok(Played::Idle);
@@ -587,6 +590,35 @@ impl Openings {
                 .remove(&id);
         });
         Ok(None)
+    }
+
+    /// Its assertion unchallenged past `success`'s wait: `success`, with a
+    /// fee coin, paying the hub its reserve. She may post it too, but need
+    /// not: with no claim published (the slot reclaimed), she has no fee
+    /// coin of her own for it.
+    async fn succeed(
+        &self,
+        id: &[u8; 32],
+        hub: &Hub,
+        o: &HubOpening,
+        asserted_at: u32,
+        tip: u32,
+    ) -> Result<Played> {
+        let success = presign(&o.set, "success")?;
+        let wait = match success.tx.input[0].sequence.to_relative_lock_time() {
+            Some(bitcoin::relative::LockTime::Blocks(h)) => u32::from(h.value()),
+            _ => bail!("success waits for no number of blocks"),
+        };
+        if tip.saturating_add(1) < asserted_at.saturating_add(wait) {
+            return Ok(Played::Idle);
+        }
+        let prevout = success.prevout.clone();
+        let tx = o.finish("success", vec![])?;
+        let tx = self.with_fee(id, hub, "success", tx, prevout).await?;
+        if self.post(&tx).await && self.once(id, "success") {
+            return Ok(Played::Posted("success"));
+        }
+        Ok(Played::Idle)
     }
 
     /// She challenged the assertion: answered with the first kept

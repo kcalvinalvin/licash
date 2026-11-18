@@ -167,6 +167,10 @@ struct State {
     f_height: Option<u32>,
     r_height: Option<u32>,
     p_height: Option<u32>,
+    /// Her claim's slot taken by the hub's reclaim, P never published:
+    /// her terminals' fee coin is her purse, and `success` the hub's to
+    /// post.
+    reclaimed: bool,
     #[serde(with = "consensus")]
     response: Option<Transaction>,
     response_height: Option<u32>,
@@ -970,6 +974,23 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
                 );
                 Ok(Next::To(Stage::Requested))
             }
+            // The hub's reclaim, P too late: her claim reads as empty, owed
+            // nothing, and the hub's answer to it pays her reserve back
+            // (less her purse), or its silence her request. Followed so.
+            Some((_, tx)) if self.reclaimed(&tx)? => {
+                let _ = self.wallet.abandon_silent(&p.compute_txid());
+                self.trouble(format!(
+                    "her claim was not published in time: the hub took its slot ({}), so it reads as empty",
+                    tx.compute_txid()
+                ));
+                state.reclaimed = true;
+                state.from = Some(r_height);
+                state.next_at = Some(
+                    r_height
+                        + blocks(presign(&self.o.set, "request_timeout")?.tx.input[0].sequence)?,
+                );
+                Ok(Next::To(Stage::Requested))
+            }
             Some((_, tx)) => bail!("claim slot spent by {}, not P", tx.compute_txid()),
             None => {
                 self.keep_p(&p, &state.prevouts);
@@ -996,6 +1017,12 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
     }
     fn is_link(&self, name: &str, tx: &Transaction) -> Result<bool> {
         Ok(tx.compute_txid() == presign(&self.o.set, name)?.tx.compute_txid())
+    }
+    /// Whether `tx`, spending her request's claim slot, is the hub's
+    /// reclaim of it: its one output paying the hub's payout script.
+    fn reclaimed(&self, tx: &Transaction) -> Result<bool> {
+        let hub = licash_contract::graph::party_pub(&self.o.base.parts().parties[1])?;
+        Ok(matches!(&tx.output[..], [out] if out.script_pubkey == hub.payout_spk))
     }
     fn is_terminal(&self, name: &str, tx: &Transaction) -> Result<bool> {
         let p = presign(&self.o.set, name)?;
@@ -1164,6 +1191,12 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
                     state.verified == Some(true),
                     "assertion validity is unknown"
                 );
+                // Her claim never published (the hub reclaimed its slot):
+                // nothing of it hers but her reserve's dust, so the hub
+                // posts it, its reserve paid by it.
+                if state.reclaimed {
+                    return Ok(Next::Save);
+                }
                 "success"
             }
             Stage::Challenged => "failure",
@@ -1320,14 +1353,23 @@ fn blocks(sequence: Sequence) -> Result<u32> {
         Some(other) => bail!("a relative lock of {other}, not in blocks"),
     }
 }
+/// Her terminal's fee coin: P's, or, P never published (her claim's slot
+/// reclaimed), her purse, R's, whole.
 fn fee_coin(state: &State) -> Result<(OutPoint, TxOut)> {
-    let p = state.p.as_ref().context("no P")?;
+    let (tx, vout) = if state.reclaimed {
+        (state.r.as_ref().context("no R")?, PURSE_VOUT)
+    } else {
+        (state.p.as_ref().context("no P")?, 1)
+    };
     Ok((
         OutPoint {
-            txid: p.compute_txid(),
-            vout: 1,
+            txid: tx.compute_txid(),
+            vout,
         },
-        p.output.get(1).context("no terminal fee coin")?.clone(),
+        tx.output
+            .get(vout as usize)
+            .context("no terminal fee coin")?
+            .clone(),
     ))
 }
 async fn confirmed_at(

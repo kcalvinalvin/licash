@@ -1290,6 +1290,105 @@ async fn a_holder_challenges_a_false_assertion_and_its_failure_pays_her_whole_cl
     Ok(())
 }
 
+/// Her chain, but her claim's publication (P, spending R's claim slot
+/// first) never handed to the network: a holder who requests and never
+/// publishes.
+struct Withholding(Node);
+
+impl licash_wallet::Blocks for Withholding {
+    async fn height(&self) -> Result<u32, String> {
+        self.0.height().await
+    }
+    async fn hash(&self, height: u32) -> Result<bitcoin::BlockHash, String> {
+        self.0.hash(height).await
+    }
+    async fn filter(&self, hash: &bitcoin::BlockHash) -> Result<Option<Vec<u8>>, String> {
+        self.0.filter(hash).await
+    }
+    async fn block(&self, hash: &bitcoin::BlockHash) -> Result<bitcoin::Block, String> {
+        self.0.block(hash).await
+    }
+}
+
+impl holder::Chain for Withholding {
+    async fn checkpoint(&self, height: u32) -> Result<licash::chain::Checkpoint, String> {
+        self.0.checkpoint(height).await
+    }
+    async fn broadcast(&self, tx: &bitcoin::Transaction) -> Result<(), String> {
+        let publication = tx.input.len() >= 3
+            && tx.input[0].previous_output.vout == 2
+            && tx.input[1].previous_output.vout == 1
+            && tx.input[0].previous_output.txid == tx.input[1].previous_output.txid;
+        if publication {
+            return Ok(());
+        }
+        self.0.broadcast(tx).await
+    }
+}
+
+/// She requests and never publishes her claim: the hub reclaims its slot
+/// after k, answers her claim, empty, owed nothing, proves it and asserts;
+/// her request's timeout never pays her, and her reserve comes back.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs bitcoind and a release build"]
+async fn a_hub_reclaims_a_claim_never_published_and_answers_it_owed_nothing() -> Result<()> {
+    use licash_contracts::holder::recovery::{self, Stage};
+
+    let rt = Regtest::start_standard()?;
+    let dir = tempfile::tempdir()?;
+    let at = dir.path().join("hub");
+    let (url, source, hub, openings) = hub_answering(&rt, &at).await?;
+    let node = Node(source.clone());
+    let (mine, wallet) =
+        holder_wallet(&rt, &node, dir.path(), &url, [14; 32], &[60_000, 50_000]).await?;
+    let opened = holder::open(&wallet, &node, &mine, &url, ask()).await?;
+    let payment = pay(&hub, &at.join("seed"), &url, &wallet.address(), 3_000)?;
+    wallet.receive(&payment)?;
+    rt.mine(2)?;
+    holder::resume(&wallet, &node, &mine).await?;
+
+    let chain = Withholding(Node(source));
+    let rate = bitcoin::FeeRate::from_sat_per_vb(2).context("a rate")?;
+    let forced = recovery::force_close(&wallet, &chain, &mine, &opened.id, rate).await?;
+    rt.mine_to_height(forced.next_at.context("no lock")? - 1)?;
+    let mut last = None;
+    for _ in 0..800 {
+        let round = openings.answer_requests().await?;
+        ensure!(round.failed == 0, "{round:?}");
+        let r = recovery::advance(&wallet, &chain, &mine, rate).await?[0].clone();
+        ensure!(r.stage != Stage::Lost, "{r:?}");
+        ensure!(
+            !matches!(r.stage, Stage::TimingOut | Stage::TimedOut),
+            "{r:?}"
+        );
+        if r.stage == Stage::Done {
+            last = Some(r);
+            break;
+        }
+        last = Some(r);
+        rt.mine(1)?;
+    }
+    let done = last.context("no recovery")?;
+    ensure!(done.stage == Stage::Done, "never done: {done:?}");
+    // Her request confirmed, her publication never; the hub's response,
+    // its assertion and `success` did.
+    let r = done.request.context("no R")?;
+    ensure!(rt.confirmations(&r)?.is_some(), "{done:?}");
+    let p = done.publication.context("no P")?;
+    // Unknown to the node: never published.
+    ensure!(rt.get_tx(&p).is_err(), "P published: {done:?}");
+    let slot = bitcoin::OutPoint { txid: r, vout: 2 };
+    ensure!(!rt.is_unspent(&slot)?, "slot never reclaimed");
+    ensure!(done.corrected == Some(0), "{done:?}");
+    ensure!(done.assertion.is_some() && done.proved, "{done:?}");
+    ensure!(
+        done.payout.is_some() && done.timeout.is_none(),
+        "not success: {done:?}"
+    );
+    eprintln!("reclaimed: {done:?}");
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs bitcoind and a release build"]
 async fn her_contracts_at_a_hub_each_claim_their_share_of_her_notes() -> Result<()> {
