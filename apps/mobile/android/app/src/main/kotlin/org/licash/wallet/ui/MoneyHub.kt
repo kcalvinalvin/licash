@@ -7,7 +7,9 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -46,7 +48,7 @@ internal fun HubPage(
     holding: Holding,
     others: List<Holding>,
     notes: List<Notes>,
-    cashOut: (String) -> Unit,
+    cashOut: (hub: String, amount: ULong?) -> Unit,
     payOwn: (link: String, address: String) -> Unit,
     fail: (String) -> Unit,
     changed: () -> Unit,
@@ -73,9 +75,31 @@ internal fun HubPage(
     var cancelingBusy by remember { mutableStateOf(false) }
     var fees by remember { mutableStateOf(false) }
     var moving by remember { mutableStateOf(false) }
+    val cover = hubCover(holding.hub, holding, ui.contracts, notes)
+    // Not protected and worth a contract: protect it or cash part out, until dismissed.
+    var dismissed by remember(holding.hub) { mutableStateOf(engine.prefs.unprotectedDismissed(holding.hub)) }
+    val suggest = suggestProtecting(cover, hub, dismissed)
+
+    fun protect() {
+        quoting = true
+        scope.launch {
+            engine.contractQuote(holding.hub).fold({ quote = it }, { fail(explain(it)) })
+            quoting = false
+        }
+    }
 
     Text(sat(holding.available), modifier = Modifier.padding(horizontal = 4.dp, vertical = 8.dp), style = Heading)
     if (holding.pending > 0uL) Line("Settling", sat(holding.pending), Modifier.padding(horizontal = 4.dp))
+    // How much of it its contracts cover, what they leave out, the room they have left.
+    cover.says?.let {
+        CoverBar(cover, Modifier.padding(horizontal = 4.dp, vertical = 4.dp))
+        Text(
+            "$it · ${cover.noteWords}",
+            modifier = Modifier.padding(horizontal = 4.dp).testTag("hub-cover"),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
     Spacer(Modifier.height(12.dp))
     Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
         BigButton(
@@ -83,15 +107,28 @@ internal fun HubPage(
             Modifier.weight(1f).testTag("cash-out"),
             enabled = holding.available > 0uL,
             quiet = true,
-        ) { cashOut(holding.hub) }
+        ) { cashOut(holding.hub, null) }
         if (hub?.contracts != null && ui.opening == null) {
-            BigButton("Protect", Modifier.weight(1f).testTag("open-contract"), enabled = !quoting) {
-                quoting = true
-                scope.launch {
-                    engine.contractQuote(holding.hub).fold({ quote = it }, { fail(explain(it)) })
-                    quoting = false
+            BigButton("Protect", Modifier.weight(1f).testTag("open-contract"), enabled = !quoting) { protect() }
+        }
+    }
+    if (suggest && ui.opening == null) {
+        Group("Not protected") {
+            Text(
+                unprotectedWords(cover.missing, holding.hub),
+                modifier = Modifier.padding(vertical = 12.dp).testTag("unprotected"),
+                style = MaterialTheme.typography.bodyMedium,
+            )
+            Row(Modifier.padding(bottom = 12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                BigButton("Protect", Modifier.weight(1f).testTag("suggest-protect"), enabled = !quoting) { protect() }
+                BigButton("Cash out part", Modifier.weight(1f).testTag("suggest-cash-out"), quiet = true) {
+                    cashOut(holding.hub, cover.missing)
                 }
             }
+            TextButton(onClick = {
+                engine.prefs.dismissUnprotected(holding.hub, cover.missing)
+                dismissed = cover.missing
+            }, Modifier.testTag("suggest-dismiss")) { Text("Not now") }
         }
     }
     if (covers.isNotEmpty() || opening) {
@@ -195,7 +232,7 @@ internal fun HubPage(
             holding.available,
             cashOut = {
                 ending = null
-                cashOut(c.hub)
+                cashOut(c.hub, null)
             },
             close = {
                 ending = null

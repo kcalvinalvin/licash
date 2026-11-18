@@ -49,13 +49,17 @@ private sealed interface Screen {
     data object Home : Screen
     data object Receive : Screen
 
-    /** Sending, or with `cashOut`, a hub, paying all the notes there out. */
+    /**
+     * Sending, or with `cashOut`, a hub, paying notes there out: all of
+     * them, or as much as chosen, `amount` suggested.
+     */
     data class Send(
         val link: String?,
         val cashOut: String? = null,
         val from: Screen = Home,
         /** The address of this wallet's that `link` pays, if it does. */
         val own: String? = null,
+        val amount: ULong? = null,
     ) : Screen
     data object Settings : Screen
 
@@ -158,7 +162,7 @@ private fun App(engine: Engine, link: String?, linkShown: () -> Unit) {
                     )
                     Screen.History -> History(ui, open = { screen = Screen.Details(it) }) { screen = Screen.Home }
                     Screen.Receive -> Receive(engine) { screen = Screen.Home }
-                    is Screen.Send -> Send(engine, ui, s.link, s.cashOut, s.own) { screen = s.from }
+                    is Screen.Send -> Send(engine, ui, s.link, s.cashOut, s.own, s.amount) { screen = s.from }
                     Screen.Settings -> Settings(engine, ui, balance = { screen = Screen.Money(Screen.Settings) }) {
                         screen = Screen.Home
                     }
@@ -167,7 +171,7 @@ private fun App(engine: Engine, link: String?, linkShown: () -> Unit) {
                         ui,
                         at = s.at,
                         go = { screen = s.copy(at = it) },
-                        cashOut = { screen = Screen.Send(null, it, s) },
+                        cashOut = { hub, amount -> screen = Screen.Send(null, hub, s, amount = amount) },
                         payOwn = { link, own -> screen = Screen.Send(link, from = s, own = own) },
                     ) { screen = s.from }
                     is Screen.Details -> ActivityDetails(engine, ui, s.activity) { screen = s.from }

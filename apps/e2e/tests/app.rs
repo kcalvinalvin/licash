@@ -711,9 +711,9 @@ async fn visited(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Cashed out to itself: all its notes paid out on Bitcoin to its own
-/// address, and kept there rather than moved back into the balance, until
-/// it is asked to.
+/// Cashed out to itself: half its notes paid out on Bitcoin to its own
+/// address, the rest left in the balance, and kept there rather than moved
+/// back into the balance, until it is asked to.
 async fn cashed_out(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     let pays = || async {
         let chain = eco.swaps_info().await?.chain;
@@ -737,6 +737,11 @@ async fn cashed_out(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     at_hub(phone, eco.hub(1)).await?;
     phone.tap_id("cash-out").await?;
     phone.tap_id("to-own").await?;
+    // As much as chosen: half of it, the rest left there.
+    phone.tagged("to", "To this wallet", 30).await?;
+    let half = held / 2;
+    phone.fill_id("amount", &half.to_string()).await?;
+    phone.tap_id("continue").await?;
     phone.tagged("to", "This wallet", 120).await?;
     reviewed(phone, 10).await?;
     // In advanced mode (since onboarding), every provider's offer: the
@@ -772,6 +777,12 @@ async fn cashed_out(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     })
     .await?;
     eprintln!("cashed out, kept: {:?}", kept.text);
+    // Half of it, not all.
+    let cashed = amount(&kept.text);
+    ensure!(
+        cashed >= half && cashed < held * 6 / 10,
+        "{cashed} kept once {half} of {held} cashed out"
+    );
     // Rounds later, not moved back in by itself.
     tokio::time::sleep(Duration::from_secs(20)).await;
     mine(eco).await?;

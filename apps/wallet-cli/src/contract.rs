@@ -195,6 +195,54 @@ pub async fn list(
     Ok(())
 }
 
+/// What is not protected at a hub: `held` there, of which its live
+/// contracts cover `covered`.
+pub struct Unprotected {
+    pub hub: String,
+    pub held: u64,
+    pub covered: u64,
+}
+
+impl Unprotected {
+    pub fn missing(&self) -> u64 {
+        self.held.saturating_sub(self.covered)
+    }
+}
+
+/// The hubs holding more than their live contracts cover, by at least the
+/// least a contract there protects: worth protecting or cashing part out.
+/// Judged at the tip each hub last said, read from the contracts kept by
+/// the wallet at `path`, never driving them.
+pub fn unprotected(wallet: &Wallet<Http>, path: &Path) -> anyhow::Result<Vec<Unprotected>> {
+    let contracts = holder::list(dir(path))?;
+    let mut found = Vec::new();
+    for (url, info) in wallet.hubs()? {
+        let Some(terms) = &info.contracts else {
+            continue;
+        };
+        let smallest = u64::from(terms.range.map_or(terms.cap, |r| r.min_cap));
+        let held: u64 = wallet
+            .balance()?
+            .iter()
+            .filter(|b| b.hub == url)
+            .map(|b| b.available + b.pending)
+            .sum();
+        let tip = info.locks.as_ref().map_or(0, |l| l.height);
+        let urls = wallet.hub_urls(&url)?;
+        let here: Vec<Contract> = contracts.iter().filter(|c| c.at(&urls)).cloned().collect();
+        let covered: u64 = holder::coverage(wallet, dir(path), &here, tip)?.values().sum();
+        let one = Unprotected {
+            hub: url,
+            held,
+            covered: covered.min(held),
+        };
+        if one.missing() >= smallest {
+            found.push(one);
+        }
+    }
+    Ok(found)
+}
+
 fn state(c: &Contract) -> String {
     if let Some(fold) = c.folded {
         return format!("closed early ({fold})");

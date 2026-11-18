@@ -46,6 +46,19 @@ class Prefs(context: Context) {
         get() = prefs.getString("offer_declined", null)
         set(coin) = prefs.edit().putString("offer_declined", coin).apply()
 
+    /**
+     * How much was not protected at `hub` when the owner last dismissed the
+     * suggestion to protect it or cash part out: suggested again only once
+     * more is not protected.
+     */
+    fun unprotectedDismissed(hub: String): ULong? =
+        prefs.getLong(dismissedKey(hub), -1L).takeIf { it >= 0 }?.toULong()
+
+    fun dismissUnprotected(hub: String, amount: ULong) =
+        prefs.edit().putLong(dismissedKey(hub), amount.toLong()).apply()
+
+    private fun dismissedKey(hub: String) = "unprotected_dismissed:" + hub.trimEnd('/')
+
     /** Whether [tor] was set rather than the default. */
     val torChosen: Boolean
         get() = prefs.contains("tor")

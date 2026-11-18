@@ -49,7 +49,8 @@ const val ON_BITCOIN = "bitcoin"
  * Where the money is: how much is protected and how much is not, and what
  * is held at each hub and on Bitcoin. A row opens its page, `at` a hub's
  * URL or [ON_BITCOIN], through `go`: what is held there, and what to do
- * with it. `cashOut` pays all held at a hub out on Bitcoin; `payOwn` pays
+ * with it. `cashOut` pays out on Bitcoin what is held at a hub, as much as
+ * the owner chooses, the amount suggested if any; `payOwn` pays
  * a link to an address of this wallet's, the address given.
  */
 @Composable
@@ -58,7 +59,7 @@ fun Money(
     ui: Ui,
     at: String?,
     go: (String?) -> Unit,
-    cashOut: (String) -> Unit,
+    cashOut: (hub: String, amount: ULong?) -> Unit,
     payOwn: (link: String, address: String) -> Unit,
     back: () -> Unit,
 ) {
@@ -149,12 +150,17 @@ private fun Summary(
     Line("Notes", digits(noteCount(notes)), tag = "note-count")
     Group("") {
         held.forEach { holding ->
+            // How much of it its contracts cover, and the notes it is in.
+            val cover = hubCover(holding.hub, holding, ui.contracts, notes)
             Entry(
                 name(holding.hub),
                 value = sat(holding.available + holding.pending),
+                sub = listOfNotNull(cover.says, cover.noteWords.takeIf { cover.notes > 0uL })
+                    .joinToString(" · ").ifEmpty { null },
                 tag = "holding",
                 onClick = { go(holding.hub) },
             )
+            CoverBar(cover, Modifier.padding(bottom = 12.dp))
             Divider()
         }
         Entry("On Bitcoin", value = sat(b.onchain + b.moving + b.opening), tag = "onchain", onClick = { go(ON_BITCOIN) })

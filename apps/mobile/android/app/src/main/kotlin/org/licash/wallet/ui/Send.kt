@@ -102,7 +102,8 @@ private sealed interface Step {
 
 /**
  * Scan or paste: a code to pay, or a payment handed over to take; with
- * `cashOut`, a hub, a Bitcoin address to pay all the notes there out to.
+ * `cashOut`, a hub, a Bitcoin address to pay notes there out to, as much
+ * as chosen: all of them, or `cashOutAmount` as suggested.
  * `ownAddress`, if `link` pays this wallet's own address, is shown so.
  */
 @Composable
@@ -112,6 +113,7 @@ fun Send(
     link: String?,
     cashOut: String? = null,
     ownAddress: String? = null,
+    cashOutAmount: ULong? = null,
     back: () -> Unit,
 ) {
     val scope = rememberCoroutineScope()
@@ -172,9 +174,12 @@ fun Send(
             step = engine.scanned(text).fold(
                 { scanned ->
                     when {
-                        // Cashing out: all to an address, nothing else.
+                        // Cashing out: to an address, nothing else, as much as chosen.
                         cashOut != null -> when (scanned) {
-                            is Scanned.Bitcoin -> quoting(scanned.address, null)
+                            is Scanned.Bitcoin -> when (val asked = scanned.amount) {
+                                null -> Step.Address(scanned.address)
+                                else -> quoting(scanned.address, asked)
+                            }
                             else -> Step.Failed("To cash out, scan or paste a Bitcoin address.", "Not a Bitcoin address")
                         }
                         scanned is Scanned.Code -> when {
@@ -284,7 +289,7 @@ fun Send(
                         BigButton("To this wallet", Modifier.fillMaxWidth().testTag("to-own")) {
                             scope.launch {
                                 engine.bitcoinAddress().fold(
-                                    { own = it; quote(it, null) },
+                                    { own = it; step = Step.Address(it) },
                                     { step = Step.Failed(explain(it)) },
                                 )
                             }
@@ -390,7 +395,12 @@ fun Send(
                         }
                     }
                 }
-                is Step.Address -> ToAddress(s.address) { amount -> quote(s.address, amount) }
+                is Step.Address -> ToAddress(
+                    s.address,
+                    own = s.address == own,
+                    prefill = cashOutAmount.takeIf { cashOut != null },
+                    all = if (cashOut != null) "Cash out all" else "Send all",
+                ) { amount -> quote(s.address, amount) }
                 is Step.Payout -> Payout(s.quote, s.quote.address == own, ui.hubs.size > 1, { payOut(s.quote, s.asked) }) {
                     if (ui.developer) {
                         Providers {
@@ -700,23 +710,23 @@ private fun Invoice(quote: InvoiceQuote, several: Boolean, pay: () -> Unit, more
  * keyboard's action continues to what it costs, to confirm.
  */
 @Composable
-private fun ToAddress(address: String, quote: (ULong?) -> Unit) {
-    var amount by remember { mutableStateOf<Long?>(null) }
+private fun ToAddress(address: String, own: Boolean, prefill: ULong?, all: String, quote: (ULong?) -> Unit) {
+    var amount by remember { mutableStateOf(prefill?.toLong()) }
     Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
         Spacer(Modifier.height(32.dp))
         AmountField(amount, { amount = it }, action = ImeAction.Go) { amount?.let { quote(it.toULong()) } }
         Text(
-            "To ${shortAddress(address)}",
+            if (own) "To this wallet" else "To ${shortAddress(address)}",
             modifier = Modifier.testTag("to"),
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
         Spacer(Modifier.height(32.dp))
-        BigButton("Continue", Modifier.fillMaxWidth(), enabled = amount != null) {
+        BigButton("Continue", Modifier.fillMaxWidth().testTag("continue"), enabled = amount != null) {
             amount?.let { quote(it.toULong()) }
         }
         Spacer(Modifier.height(12.dp))
-        BigButton("Send all", Modifier.fillMaxWidth(), quiet = true) { quote(null) }
+        BigButton(all, Modifier.fillMaxWidth().testTag("all"), quiet = true) { quote(null) }
     }
 }
 

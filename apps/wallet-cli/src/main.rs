@@ -745,6 +745,18 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                     ));
                 }
             }
+            // Worth protecting, or cashing part out.
+            match contract::unprotected(&wallet, &path) {
+                Ok(found) => lines.extend(found.iter().map(|u| {
+                    format!(
+                        "not protected  {} of {} at {}: open-contract to protect it, or payout part of it",
+                        say::sat(u.missing()),
+                        say::sat(u.held),
+                        u.hub
+                    )
+                })),
+                Err(e) => tracing::warn!("what contracts protect: {e:#}"),
+            }
             show(json, rows.collect(), lines.join("\n"));
         }
         Command::Send {

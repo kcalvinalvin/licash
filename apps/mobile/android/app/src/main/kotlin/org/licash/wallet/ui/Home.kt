@@ -25,6 +25,7 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -44,6 +45,7 @@ import androidx.compose.ui.unit.Velocity
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import org.licash.core.Activity
+import org.licash.core.Holding
 import org.licash.wallet.Engine
 import org.licash.wallet.Ui
 import org.licash.wallet.digits
@@ -116,6 +118,7 @@ fun Home(
                 Total(ui) { money(null) }
                 Going(engine, ui, money, history, open)
                 Offer(engine, ui)
+                Unprotected(engine, ui, money)
                 // A new wallet's first catching up: each step, as it goes.
                 if (ui.history.isEmpty() && catchingUp(ui)) {
                     Spacer(Modifier.height(16.dp))
@@ -237,6 +240,29 @@ private fun Offer(engine: Engine, ui: Ui) {
         onClick = { choosing = true },
     )
     if (choosing) OfferSheet(engine, q) { choosing = false }
+}
+
+/**
+ * A hub holding more than its contracts protect, by at least its smallest
+ * contract: said until dismissed on its page, which offers protecting it
+ * or cashing part out.
+ */
+@Composable
+private fun Unprotected(engine: Engine, ui: Ui, money: (String?) -> Unit) {
+    var holdings by remember { mutableStateOf<List<Holding>>(emptyList()) }
+    LaunchedEffect(ui.balance, ui.contracts, ui.hubs) { engine.holdings().onSuccess { holdings = it } }
+    val (hub, missing) = holdings.firstNotNullOfOrNull { h ->
+        val cover = hubCover(h.hub, h, ui.contracts, emptyList())
+        val terms = ui.hubs.find { sameHub(it.url, h.hub) }
+        (h.hub to cover.missing).takeIf { suggestProtecting(cover, terms, engine.prefs.unprotectedDismissed(h.hub)) }
+    } ?: return
+    Spacer(Modifier.height(8.dp))
+    Pill(
+        icon = Glyphs.shieldOff,
+        text = "${sat(missing)} at ${name(hub)} not protected",
+        tag = "unprotected",
+        onClick = { money(hub) },
+    )
 }
 
 /**
