@@ -672,7 +672,9 @@ struct SwapsArgs {
     /// a day earlier.
     #[arg(
         long,
-        env = "LICASH_HUB_SWAPS_CONTRACT_EXIT_DAYS",
+        // As named when it was the proof margin, for deployments that set it.
+        alias = "swaps-contract-proof-days",
+        env = "LICASH_HUB_SWAPS_CONTRACT_PROOF_DAYS",
         default_value_t = 14
     )]
     swaps_contract_exit_days: u32,
@@ -1863,6 +1865,20 @@ mod tests {
             Command::Run { announce, .. } => announce.mailboxes(),
             _ => unreachable!(),
         }
+    }
+
+    #[test]
+    fn the_swaps_exit_margin_keeps_its_name_as_the_proof_margin() {
+        let days = |args: &[&str]| {
+            let cli = Cli::try_parse_from([&["licash-hub", "run"], args].concat()).unwrap();
+            match cli.command {
+                Command::Run { swaps, .. } => swaps.swaps_contract_exit_days,
+                _ => unreachable!(),
+            }
+        };
+        assert_eq!(days(&[]), 14);
+        assert_eq!(days(&["--swaps-contract-exit-days", "9"]), 9);
+        assert_eq!(days(&["--swaps-contract-proof-days", "9"]), 9);
     }
 
     #[test]

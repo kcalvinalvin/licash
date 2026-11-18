@@ -203,7 +203,14 @@ struct ContractArgs {
     /// Days kept for a forced close to play out in (the exit margin),
     /// before each contract's last request height: its safe deadline comes
     /// a day earlier.
-    #[arg(long, env = "LICASH_SWAPS_CONTRACT_EXIT_DAYS", default_value_t = 14)]
+    // Its environment variable and alias keep the name it had as the
+    // proof margin, so deployments setting them keep their margin.
+    #[arg(
+        long,
+        alias = "contract-proof-days",
+        env = "LICASH_SWAPS_CONTRACT_PROOF_DAYS",
+        default_value_t = 14
+    )]
     contract_exit_days: u32,
     /// The most a successor costs, in sat [default: what the contract it
     /// replaces cost, and a quarter]: the most one --contract-open-cap
@@ -1405,6 +1412,13 @@ mod tests {
             Command::Run { contracts, .. } => contracts,
             _ => unreachable!("run"),
         }
+    }
+
+    #[test]
+    fn the_exit_margin_keeps_its_name_as_the_proof_margin() {
+        let named = contracts(&["--contract-exit-days", "9"]);
+        let old = contracts(&["--contract-proof-days", "9"]);
+        assert_eq!((named.contract_exit_days, old.contract_exit_days), (9, 9));
     }
 
     #[test]
