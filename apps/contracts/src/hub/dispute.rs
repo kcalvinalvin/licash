@@ -54,6 +54,11 @@ pub type Evidencer = dyn Fn(&UnsignedClaim) -> Result<Vec<Evidence>> + Send + Sy
 /// A coin's first spend, once found: its block's height and it.
 type Spend = Option<(u32, Transaction)>;
 
+/// How far a coin's blocks were looked through: the last one's height and
+/// hash. Still the chain's at that height, so are all those before it, and
+/// what was found in them stands.
+type Through = (u32, BlockHash);
+
 /// A signed opening as loaded, checked and its graph built: by the digest
 /// of the state it was loaded from.
 type Loaded = ([u8; 32], Arc<(Hub, HubOpening)>);
@@ -65,7 +70,7 @@ type Loaded = ([u8; 32], Arc<(Hub, HubOpening)>);
 #[derive(Default)]
 pub(super) struct Watch {
     loaded: Mutex<HashMap<[u8; 32], Loaded>>,
-    spends: Mutex<HashMap<OutPoint, (u32, Spend)>>,
+    spends: Mutex<HashMap<OutPoint, (Through, Spend)>>,
     headers: Mutex<HashMap<BlockHash, Header>>,
     noted: Mutex<HashSet<([u8; 32], &'static str)>>,
     /// A dishonest hub's, for tests: it asserts proofs of another
@@ -1416,7 +1421,9 @@ impl Openings {
     }
 
     /// The first spend of `coin` (paying `out`) in blocks `from..=tip`,
-    /// looked up once each block.
+    /// looked up once each block while the chain stands: from `from` again
+    /// once the last block looked through left it, which a spend found may
+    /// have left with it, as after a restart.
     async fn spend(
         &self,
         coin: OutPoint,
@@ -1431,15 +1438,20 @@ impl Openings {
             .unwrap_or_else(PoisonError::into_inner)
             .get(&coin)
             .cloned();
-        let start = match seen {
-            Some((_, Some(found))) => return Ok(Some(found)),
-            // Look again at the last blocks seen: a reorganization.
-            Some((through, None)) => through.saturating_sub(3).max(from),
-            None => from,
+        let now = match &seen {
+            Some(((through, _), _)) if *through <= tip => Some(self.source.hash(*through).await?),
+            _ => None,
+        };
+        let start = match looked(seen, now, from) {
+            Ok(found) => return Ok(Some(found)),
+            Err(start) => start,
         };
         if start > tip {
             return Ok(None);
         }
+        // Read before looking, so that blocks replaced meanwhile are looked
+        // through again next time.
+        let through = (tip, self.source.hash(tip).await?);
         let node = Node(self.source.clone());
         let found = first_spend(&node, coin, &out.script_pubkey, start..=tip)
             .await
@@ -1448,7 +1460,7 @@ impl Openings {
             .spends
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .insert(coin, (tip, found.clone()));
+            .insert(coin, (through, found.clone()));
         Ok(found)
     }
 
@@ -1671,6 +1683,21 @@ fn fold_fee(o: &HubOpening, rate: FeeRate) -> Result<Amount> {
     rate.fee_vb(tx.vsize() as u64).context("fee overflow")
 }
 
+/// A coin's spend as `seen` before, if the chain still has the block it was
+/// looked through to, `now` that block's hash at its height (none if past
+/// the tip): else the first block to look in for it, `from` if the chain
+/// moved under what was seen.
+fn looked(
+    seen: Option<(Through, Spend)>,
+    now: Option<BlockHash>,
+    from: u32,
+) -> std::result::Result<(u32, Transaction), u32> {
+    match seen {
+        Some(((through, hash), found)) if now == Some(hash) => found.ok_or(through + 1),
+        _ => Err(from),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1727,5 +1754,30 @@ mod tests {
             terminal_coin(first, &extra, sat(3_000), stake),
             (coin(2, 6_000), None)
         );
+    }
+
+    #[test]
+    fn a_spend_seen_stands_only_while_the_blocks_looked_through_do() {
+        let hash = |n: u8| bitcoin::hashes::Hash::from_byte_array([n; 32]);
+        let spend = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![],
+            output: vec![],
+        };
+        let found = Some((105, spend.clone()));
+        // Never looked for: from the start.
+        assert_eq!(looked(None, None, 100), Err(100));
+        // Found, its blocks still the chain's: kept.
+        let seen = |found: &Spend| Some(((110, hash(1)), found.clone()));
+        assert_eq!(looked(seen(&found), Some(hash(1)), 100), Ok((105, spend)));
+        // None found: on from the block after the last looked through.
+        assert_eq!(looked(seen(&None), Some(hash(1)), 100), Err(111));
+        // The chain moved under them, however deep, or is shorter now:
+        // looked for again from the start, found or not.
+        for found in [found, None] {
+            assert_eq!(looked(seen(&found), Some(hash(2)), 100), Err(100));
+            assert_eq!(looked(seen(&found), None, 100), Err(100));
+        }
     }
 }
