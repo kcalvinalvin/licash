@@ -949,6 +949,43 @@ async fn a_coin_signed_into_anothers_transaction_is_reserved_for_it() {
 }
 
 #[tokio::test]
+async fn a_coin_set_aside_under_a_marker_is_taken_by_nothing_until_freed() {
+    let s = setup().await;
+    s.wallet.watch_silent(HUB, 1).unwrap();
+    let paying = s.pay(&[s.address()], &[10_000]);
+    s.mine(vec![paying]);
+    s.scan().await.unwrap();
+    let coin = s.wallet.silent_coins().unwrap()[0].outpoint;
+    let marker = Txid::from_byte_array([7; 32]);
+
+    // Set aside, again with no error: nothing to broadcast, no spend.
+    s.wallet.reserve_silent(&coin, &marker).unwrap();
+    s.wallet.reserve_silent(&coin, &marker).unwrap();
+    assert_eq!(s.wallet.silent_coins().unwrap()[0].spending, Some(marker));
+    assert!(s.wallet.silent_spends().unwrap().is_empty());
+    let spend = s.wallet.spend_silent(elsewhere(), None, rate());
+    assert!(
+        matches!(spend, Err(Error::Insufficient { .. })),
+        "{spend:?}"
+    );
+    // Neither another's transaction nor another marker takes it.
+    let (tx, prevouts) = shared(&s.chain.lock().unwrap(), coin, 55_000);
+    let signed = s.wallet.sign_input(&tx, &prevouts, 1);
+    assert!(matches!(signed, Err(Error::NoteTaken)), "{signed:?}");
+    let other = s
+        .wallet
+        .reserve_silent(&coin, &Txid::from_byte_array([8; 32]));
+    assert!(matches!(other, Err(Error::NoteTaken)), "{other:?}");
+    let unknown = OutPoint::new(Txid::from_byte_array([9; 32]), 0);
+    let unknown = s.wallet.reserve_silent(&unknown, &marker);
+    assert!(matches!(unknown, Err(Error::Invalid(_))), "{unknown:?}");
+
+    // Freed, another's transaction takes it.
+    s.wallet.abandon_silent(&marker).unwrap();
+    s.wallet.sign_input(&tx, &prevouts, 1).unwrap();
+}
+
+#[tokio::test]
 async fn the_block_a_coin_signed_into_anothers_transaction_is_spent_in_is_known() {
     let s = setup().await;
     s.wallet.watch_silent(HUB, 1).unwrap();

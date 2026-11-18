@@ -1014,6 +1014,38 @@ impl<T: Transport> Wallet<T> {
         Ok(signed)
     }
 
+    /// Set the wallet's coin at `outpoint` aside under `marker`, a txid of
+    /// no transaction, as [`Wallet::sign_input`] sets one aside for a
+    /// transaction to come: no spend or deposit takes it until
+    /// [`Wallet::abandon_silent`] of `marker` frees it, or a scan sees it
+    /// spent. Setting it aside again under `marker` is no error; a coin
+    /// set aside otherwise, spent or not the wallet's is refused. A
+    /// reorganization of its block frees it.
+    pub fn reserve_silent(&self, outpoint: &OutPoint, marker: &Txid) -> Result<(), Error> {
+        self.store.write(|t| {
+            let Some((_, spent_by)) = coin(t, outpoint)? else {
+                return Err(Error::Invalid(format!(
+                    "coin {outpoint}: not the wallet's, or spent"
+                )));
+            };
+            if spent_by.is_some_and(|by| by != *marker) {
+                return Err(Error::NoteTaken);
+            }
+            t.execute(
+                "UPDATE silent_coins SET spent_by = ?3
+                 WHERE txid = ?1 AND vout = ?2 AND spent_at IS NULL",
+                params![
+                    outpoint.txid.to_byte_array(),
+                    outpoint.vout,
+                    marker.to_byte_array()
+                ],
+            )?;
+            Ok(())
+        })?;
+        tracing::info!(%marker, %outpoint, "silent payment coin set aside");
+        Ok(())
+    }
+
     /// Give up the wallet's spend `txid`, never broadcast or dropped by the
     /// network, freeing its coins: should it reach a block after all, a
     /// scan sees them spent.
