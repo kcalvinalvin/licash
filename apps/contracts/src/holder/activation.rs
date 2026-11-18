@@ -25,7 +25,6 @@ use licash_contract::opening::{Context, Holder};
 use licash_wallet::{LockClaim, OwedLock, Transport, Wallet};
 
 use super::exit::{self, blocks_a_day};
-use super::recovery::confirmed_at;
 use super::store::Store;
 use super::Chain;
 
@@ -48,8 +47,9 @@ pub fn lead(network: licash::spend::ChainProfile) -> u32 {
 pub struct Kept {
     /// The lock's id, in hex.
     pub id: String,
-    /// "paid" by its hub at last, "activated" (broadcast), "confirmed" (its
-    /// activation recorded), "forgotten" (its block left the chain), "late"
+    /// "paid" by its hub at last, "activated" (broadcast), "bumped" (its
+    /// fee raised as its expiry nears), "confirmed" (its activation
+    /// recorded), "forgotten" (its block left the chain), "late"
     /// (no activation can confirm before its expiry), or "unprotected" (no
     /// contract of hers at its hub could claim it).
     pub step: &'static str,
@@ -129,19 +129,25 @@ async fn step<T: Transport, C: Chain>(
     let script = ScriptBuf::from_bytes(activation_script(&o.preimage));
     let lead = lead(wallet.network());
     let last = o.expiry.saturating_sub(1);
-    if let Some(spend) = wallet.silent_spends_paying(&script)?.into_iter().next() {
-        let tx = spend.tx;
-        let txid = tx.compute_txid();
-        // Its record is in no block filter: its change is, if any.
-        let found = match tx.output.iter().find(|o| !o.script_pubkey.is_op_return()) {
+    let spends = wallet.silent_spends_paying(&script)?;
+    if let Some(first) = spends.first() {
+        // Its versions, each bumping the one before, spend one coin and
+        // pay one change: its record is in no block filter, its change is.
+        let from = o.expiry.saturating_sub(lead + 1).max(anchor.height() + 1);
+        let found = match first
+            .tx
+            .output
+            .iter()
+            .find(|o| !o.script_pubkey.is_op_return())
+        {
             Some(change) => {
-                let from = o.expiry.saturating_sub(lead + 1).max(anchor.height() + 1);
-                confirmed_at(chain, txid, &change.script_pubkey, from..=tip.min(last)).await?
+                let txs: Vec<_> = spends.iter().map(|s| &s.tx).collect();
+                confirmed(chain, &txs, &change.script_pubkey, from..=tip.min(last)).await?
             }
-            None => spend.height,
+            None => (spends.iter()).find_map(|s| Some((s.height?, &s.tx))),
         };
-        if let Some(height) = found.filter(|h| *h > anchor.height() && *h <= last) {
-            let activation = activation_of(chain, &tx, height).await?;
+        if let Some((height, tx)) = found.filter(|(h, _)| *h > anchor.height() && *h <= last) {
+            let activation = activation_of(chain, tx, height).await?;
             wallet.record_activation(&o.id, Some((&activation, &anchor)))?;
             return Ok(Some("confirmed"));
         }
@@ -149,10 +155,30 @@ async fn step<T: Transport, C: Chain>(
         if tip >= last {
             return Ok(None);
         }
+        // The version its coin's spend is now, if not given up.
+        let coin = first.tx.input[0].previous_output;
+        let Some((txid, None)) = wallet.silent_spender(&coin)? else {
+            return Ok(None);
+        };
+        let Some(live) = spends.iter().find(|s| s.tx.compute_txid() == txid) else {
+            return Ok(None);
+        };
+        let value = (wallet.owed_claim(&o.id, &o.keyset)?).map_or(0, |c| c.value);
+        let bump = live
+            .fee
+            .and_then(|paid| bump_to(rate, tip, o.expiry, lead, value, paid, live.tx.vsize()));
+        let (tx, step) = match bump.map(|to| wallet.bump_silent(&txid, to)) {
+            Some(Ok(tx)) => (tx, Some("bumped")),
+            Some(Err(e)) => {
+                tracing::warn!(%txid, "bumping an activation: {e}");
+                (live.tx.clone(), None)
+            }
+            None => (live.tx.clone(), None),
+        };
         if let Err(e) = chain.broadcast(&tx).await {
-            tracing::warn!(%txid, "rebroadcasting an activation: {e}");
+            tracing::warn!(txid = %tx.compute_txid(), "broadcasting an activation: {e}");
         }
-        return Ok(None);
+        return Ok(step);
     }
     if tip.saturating_add(lead) < o.expiry {
         return Ok(None);
@@ -179,6 +205,62 @@ async fn step<T: Transport, C: Chain>(
         tracing::warn!(txid = %tx.compute_txid(), "broadcasting an activation: {e}");
     }
     Ok(Some("activated"))
+}
+
+/// The rate to bump an activation to at `tip`, its lock expiring at
+/// `expiry`, made `lead` blocks before: `rate`, doubled each quarter of
+/// `lead` since, its fee half the lock's `value` at most. None unless that
+/// pays more than its `paid` fee and 1 sat/vB of its `vsize`, as a
+/// replacement must.
+fn bump_to(
+    rate: FeeRate,
+    tip: u32,
+    expiry: u32,
+    lead: u32,
+    value: u64,
+    paid: u64,
+    vsize: usize,
+) -> Option<FeeRate> {
+    let vsize = u64::try_from(vsize).ok()?.max(1);
+    let since = tip.saturating_sub(expiry.saturating_sub(lead));
+    let doublings = (since / (lead / 4).max(1)).min(4);
+    let wanted = rate.to_sat_per_kwu().saturating_mul(1 << doublings);
+    let most = (value / 2).saturating_mul(250) / vsize;
+    let to = FeeRate::from_sat_per_kwu(wanted.min(most));
+    let fee = to.fee_vb(vsize)?.to_sat();
+    (fee >= paid.saturating_add(vsize)).then_some(to)
+}
+
+/// The block of `chain` in `heights` holding one of `txs`, which all pay
+/// `script`, and which: none if none does.
+async fn confirmed<'a, C: Chain>(
+    chain: &C,
+    txs: &[&'a bitcoin::Transaction],
+    script: &bitcoin::Script,
+    heights: std::ops::RangeInclusive<u32>,
+) -> Result<Option<(u32, &'a bitcoin::Transaction)>> {
+    let ids: Vec<_> = txs.iter().map(|t| t.compute_txid()).collect();
+    for height in heights {
+        let hash = chain.hash(height).await.map_err(|e| anyhow!(e))?;
+        if let Some(filter) = chain.filter(&hash).await.map_err(|e| anyhow!(e))? {
+            if !bitcoin::bip158::BlockFilter::new(&filter)
+                .match_any(&hash, std::iter::once(script.as_bytes()))?
+            {
+                continue;
+            }
+        }
+        let block = chain.block(&hash).await.map_err(|e| anyhow!(e))?;
+        ensure!(
+            block.block_hash() == hash && block.check_merkle_root(),
+            "block {hash} does not match its header"
+        );
+        for tx in &block.txdata {
+            if let Some(i) = ids.iter().position(|id| *id == tx.compute_txid()) {
+                return Ok(Some((height, txs[i])));
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// The activation `tx` makes in block `height` of `chain`, with its
@@ -365,4 +447,33 @@ async fn verify<C: Chain>(chain: &C, claim: &LockClaim, from: u32, max: usize) -
     }
     .verify(&headers, anchor, terms, max)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_activation_is_bumped_ever_higher_as_its_expiry_nears_half_its_lock_at_most() {
+        let rate = FeeRate::from_sat_per_vb_u32(2);
+        let (expiry, lead, vsize) = (1_000, 12, 150);
+        let at = |tip, value, paid| {
+            bump_to(rate, tip, expiry, lead, value, paid, vsize).map(FeeRate::to_sat_per_vb_floor)
+        };
+        // Made at its rate: not bumped until a quarter of its lead passed,
+        // then doubled each quarter, sixteen-fold by its last blocks.
+        assert_eq!(at(988, 100_000, 300), None);
+        assert_eq!(at(990, 100_000, 300), None);
+        assert_eq!(at(991, 100_000, 300), Some(4));
+        assert_eq!(at(994, 100_000, 600), Some(8));
+        assert_eq!(at(997, 100_000, 1_200), Some(16));
+        assert_eq!(at(998, 100_000, 2_400), None);
+        // Doubled four times at most.
+        assert_eq!(at(1_100, 100_000, 1_200), Some(32));
+        // Its fee half the lock's value at most: 1 500 sat, 10 sat/vB.
+        assert_eq!(at(997, 3_000, 300), Some(10));
+        // Paying that already, or about: not bumped.
+        assert_eq!(at(997, 3_000, 1_400), None);
+        assert_eq!(at(999, 0, 0), None);
+    }
 }

@@ -1850,7 +1850,7 @@ fn fee_coin(state: &State) -> Result<(OutPoint, TxOut)> {
             .clone(),
     ))
 }
-pub(super) async fn confirmed_at(
+async fn confirmed_at(
     chain: &impl Chain,
     txid: Txid,
     script: &bitcoin::Script,
