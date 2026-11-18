@@ -39,7 +39,7 @@ pub(super) const HEADER_CYCLES: u64 = 28_000;
 pub(super) const BYTE_CYCLES: u64 = 2_000;
 
 /// What the benchmark may be off by on a real proof.
-const MARGIN: f64 = 1.3;
+pub(super) const MARGIN: f64 = 1.3;
 
 /// Not seen in this many polls, a contract's proof is no longer needed:
 /// its assertion confirmed, or her timeout paid her. A poll that failed
@@ -109,6 +109,15 @@ fn not_ready(why: &str) -> String {
 /// bytes besides.
 pub(super) fn cycles(headers: u64, other: u64) -> u64 {
     HEADER_CYCLES * headers + BYTE_CYCLES * other
+}
+
+/// The cycles of the largest proof of an exit a contract commits the hub
+/// to: of each of its `headers`, from its checkpoint to its close, and of
+/// its Base (`base` bytes), its publication (`publication` bytes at most),
+/// as much evidence again and its exit's transactions (8 kB).
+pub(super) fn worst_cycles(headers: u32, publication: u32, base: usize) -> u64 {
+    let other = base as u64 + 2 * u64::from(publication) + 8_192;
+    cycles(u64::from(headers), other)
 }
 
 /// The cycles of the statement's input `bytes` (`HubInput::to_bytes`):
@@ -268,6 +277,41 @@ impl Prover {
         };
         let seconds = speed.seconds(cycles(15, 33_600));
         Some((f64::from(blocks) * self.0.spacing / seconds) as u64)
+    }
+
+    /// The seconds proofs of each of `cycles`, made one after another,
+    /// take, and the seconds the prover has in `blocks`; why not if it
+    /// isn't ready.
+    pub fn room(&self, cycles: &[u64], blocks: u32) -> Result<(f64, f64), String> {
+        let speed = match &self.0.state().readiness {
+            Some(Readiness::Ready(speed)) => speed.clone(),
+            Some(Readiness::NotReady(why)) => return Err(why.clone()),
+            None => return Err("it is being probed".into()),
+        };
+        let need = cycles.iter().map(|c| speed.seconds(*c)).sum();
+        Ok((need, f64::from(blocks) * self.0.spacing))
+    }
+
+    /// A prover of `speed`, ready, proving nothing, on a chain of a
+    /// block every 600 s.
+    #[cfg(test)]
+    pub(super) fn ready_at(dir: &Path, speed: Speed) -> Self {
+        let inner = Arc::new(Inner {
+            dir: dir.to_owned(),
+            command: "false".into(),
+            program: [0; 32],
+            spacing: 600.0,
+            state: Mutex::default(),
+            wake: Condvar::new(),
+            alert: OnceLock::new(),
+        });
+        inner.state().readiness = Some(Readiness::Ready(speed));
+        Self(inner)
+    }
+
+    #[cfg(test)]
+    pub(super) fn not_ready(&self, why: &str) {
+        self.0.state().readiness = Some(Readiness::NotReady(why.into()));
     }
 
     /// The work directory of `id`'s proof.
@@ -817,17 +861,7 @@ mod tests {
     }
 
     fn ready(dir: &Path, speed: Speed) -> Prover {
-        let inner = Arc::new(Inner {
-            dir: dir.to_owned(),
-            command: "false".into(),
-            program: [0; 32],
-            spacing: 600.0,
-            state: Mutex::default(),
-            wake: Condvar::new(),
-            alert: OnceLock::new(),
-        });
-        inner.state().readiness = Some(Readiness::Ready(speed));
-        Prover(inner)
+        Prover::ready_at(dir, speed)
     }
 
     /// A proof of 1 M cycles takes 1,300 s with the margin; one of 2 M,

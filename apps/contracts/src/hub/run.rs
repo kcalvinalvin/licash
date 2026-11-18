@@ -5,12 +5,13 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use bitcoin::{OutPoint, TxOut};
+use licash::base::Base;
 use licash_contract::opening::{Context, Hub, Input, Out, Quote};
 use licash_contract::wire::{self, Envelope, Kind, Writer};
 use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 
-use super::{terms, Answer, Openings, Refused, MAX_UNDER_WAY, MAX_UNFUNDED, WAIT};
+use super::{prover, terms, Answer, Openings, Refused, MAX_UNDER_WAY, MAX_UNFUNDED, WAIT};
 use crate::{Frame, Opening};
 
 /// How often a patient step looks whether the opening is still busy.
@@ -84,6 +85,8 @@ impl Openings {
             .allows(opening.quote.cap, opening.quote.chain.max_headers)
             .map_err(Refused::bad)?;
         self.terms_of(&opening.quote, steps).await?;
+        // Before she garbles for it; again, held, as it is funded.
+        self.room_for(&envelope.id, quote_cycles(&opening.quote))?;
         let confirmed = self.confirmed(open.deposit, &open.coin).await;
         if !confirmed.map_err(Refused::unavailable)? {
             return Err(Refused::bad(
@@ -256,6 +259,12 @@ impl Openings {
                     outputs,
                 } => {
                     let _funding = self.funding.lock().await;
+                    // Held until its coins are kept: no two openings
+                    // take the same room.
+                    let base = hub
+                        .base()
+                        .ok_or_else(|| Refused::unavailable("F before Base"))?;
+                    self.room_for(&id, base_cycles(base))?;
                     let funded = self.fund(deposit, &coin, outputs).await;
                     let (funding, prevouts) = funded.map_err(Refused::unavailable)?;
                     let coins: Vec<OutPoint> = funding
@@ -315,6 +324,38 @@ impl Openings {
         Ok(Answer::Frames(frames))
     }
 
+    /// Refused 503 unless the hub's prover makes, in an assert window, the
+    /// largest proof of an exit of each contract it committed to and one of
+    /// `cycles` for opening `id`, one after another: their holders may all
+    /// exit at once, and a claim it does not prove in time is paid all it
+    /// asks. Without a prover (the mock authority's proofs), room for any.
+    pub(super) fn room_for(&self, id: &[u8; 32], cycles: u64) -> Result<(), Refused> {
+        let Some(prover) = &self.prover else {
+            return Ok(());
+        };
+        let states = self.store().committed(id).map_err(Refused::unavailable)?;
+        let mut all = vec![cycles];
+        for state in states {
+            let peek = Hub::peek(&state).map_err(|e| {
+                Refused::unavailable(format!("a contract the hub committed to is unread: {e:#}"))
+            })?;
+            all.push(base_cycles(&peek.base));
+        }
+        let blocks = self.timing.proof_blocks();
+        let (need, have) = prover.room(&all, blocks).map_err(|why| {
+            Refused::unavailable(format!("the hub's prover is not ready ({why}): later"))
+        })?;
+        let need = need * self.proof_scale.get().copied().unwrap_or(1.0);
+        if need > have {
+            return Err(Refused::unavailable(format!(
+                "no room for another contract: the hub proves an exit of each of {} at once in \
+                 about {need:.0} s, and has {have:.0} s ({blocks} blocks): later",
+                all.len()
+            )));
+        }
+        Ok(())
+    }
+
     /// A state must never reference an artifact that has not reached disk.
     fn keep(&self, id: &[u8; 32], out: Vec<Out>) -> Result<Vec<Out>, Refused> {
         let mut effects = Vec::with_capacity(out.len());
@@ -339,6 +380,23 @@ impl Openings {
             .save(id, phase(hub), irrevocable, last, &state)
             .map_err(Refused::unavailable)
     }
+}
+
+/// The cycles of the largest proof of an exit of a contract of `base`.
+pub(super) fn base_cycles(base: &Base) -> u64 {
+    let p = base.parts();
+    let (headers, publication) = (p.chain.max_headers, p.limits.max_publication_bytes);
+    prover::worst_cycles(headers, publication, base.to_bytes().len())
+}
+
+/// As [`base_cycles`], of a contract on `quote`, before its Base is: the
+/// quote, as large as its keyset and terms, and 4 kB for the rest.
+pub(super) fn quote_cycles(quote: &Quote) -> u64 {
+    let mut w = Writer(Vec::new());
+    w.quote(quote);
+    let base = w.0.len() + 4_096;
+    let (headers, publication) = (quote.chain.max_headers, quote.limits.max_publication_bytes);
+    prover::worst_cycles(headers, publication, base)
 }
 
 fn phase(hub: &Hub) -> u8 {

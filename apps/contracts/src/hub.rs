@@ -110,6 +110,9 @@ pub struct Openings {
     alert: std::sync::OnceLock<Arc<Alert>>,
     /// The claims given no response this round, for want of the prover.
     withheld: Mutex<Vec<String>>,
+    /// What the operator scales the prover's estimates by, as it admits
+    /// openings ([`Openings::scale_proofs`]): 1 unless told.
+    proof_scale: std::sync::OnceLock<f64>,
     /// Whether more contracts are open than its prover can contest the
     /// exits of at once, as last told.
     over_capacity: std::sync::atomic::AtomicBool,
@@ -339,6 +342,7 @@ impl Openings {
                 .then(|| prover::Prover::start(data, trust.program, prover::spacing(profile))),
             alert: std::sync::OnceLock::new(),
             withheld: Mutex::default(),
+            proof_scale: std::sync::OnceLock::new(),
             over_capacity: Default::default(),
             unfunded_full: Default::default(),
             max_live: std::sync::atomic::AtomicUsize::new(MAX_LIVE),
@@ -353,6 +357,16 @@ impl Openings {
         let locked = openings.store().locked()?;
         openings.relock_coins(&locked).await;
         Ok(openings)
+    }
+
+    /// Scale the prover's estimate of each proof by `by` as openings are
+    /// admitted ([`Openings::open`]): above 1 for a prover slower than its
+    /// benchmark says, below 1 to admit more contracts than it can be
+    /// sure to defend at once. 1 unless told; set once.
+    pub fn scale_proofs(&self, by: f64) -> Result<()> {
+        ensure!(by.is_finite() && by > 0.0, "a proof scale of {by}: above 0");
+        let _ = self.proof_scale.set(by);
+        Ok(())
     }
 
     /// Keep `fees`, what the hub charges, with each opening that starts
@@ -900,6 +914,7 @@ mod tests {
             prover: None,
             alert: std::sync::OnceLock::new(),
             withheld: Mutex::default(),
+            proof_scale: std::sync::OnceLock::new(),
             over_capacity: Default::default(),
             unfunded_full: Default::default(),
             max_live: std::sync::atomic::AtomicUsize::new(MAX_LIVE),
@@ -1029,6 +1044,86 @@ mod tests {
             drop(store);
             assert_eq!(sweeping.join().unwrap().unwrap(), Some(vec![deposit(1)]));
         });
+    }
+
+    /// A contract's largest proof takes 1,000 s; regtest's assert window
+    /// leaves the prover 8 blocks, 4,800 s.
+    #[test]
+    fn an_opening_is_admitted_only_if_the_prover_can_defend_every_contract_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut openings = test_openings(dir.path());
+        let base = Hub::peek(funded()).unwrap().base;
+        let largest = run::base_cycles(&base);
+        // Estimated from its quote before her Base is, no less.
+        let p = base.parts();
+        let mut quote = openings
+            .timing
+            .quote(p.keyset.clone(), p.chain.checkpoint.clone());
+        // The fixture's own limits.
+        quote.limits = p.limits.clone();
+        assert_eq!(quote.chain.max_headers, p.chain.max_headers);
+        assert!(run::quote_cycles(&quote) >= largest);
+        let speed = prover::Speed {
+            device: "cuda".into(),
+            segment_cycles: largest,
+            segment: 1_000.0 / prover::MARGIN,
+            tail: 0.0,
+        };
+        // Without a prover, room for any.
+        assert!(openings.room_for(&[0; 32], u64::MAX).is_ok());
+        openings.prover = Some(prover::Prover::ready_at(dir.path(), speed));
+        let commit = |n: u8| {
+            let id = [n; 32];
+            let store = openings.store();
+            store
+                .insert(&id, 0, false, &deposit(u32::from(n)), &[0; 32], funded())
+                .unwrap();
+            store
+                .set_coins(&id, &[deposit(100 + u32::from(n))])
+                .unwrap();
+        };
+        let room = |openings: &Openings| openings.room_for(&[0; 32], largest);
+        for n in 1..=3 {
+            commit(n);
+        }
+        assert!(room(&openings).is_ok());
+        commit(4);
+        let full = room(&openings).unwrap_err();
+        assert_eq!(full.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(full.reason.contains("no room"), "{}", full.reason);
+        // Not counted: an opening not funded, given up, ended, or the mock
+        // authority's, nor the opening asking itself.
+        assert!(openings.room_for(&[4; 32], largest).is_ok());
+        openings
+            .store()
+            .insert(&[5; 32], 0, false, &deposit(5), &[0; 32], funded())
+            .unwrap();
+        openings
+            .store()
+            .insert(&[6; 32], 0, true, &deposit(6), &[0; 32], funded())
+            .unwrap();
+        openings
+            .store()
+            .set_coins(&[6; 32], &[deposit(106)])
+            .unwrap();
+        assert!(room(&openings).is_err());
+        openings.store().end(&[4; 32], 100).unwrap();
+        assert!(room(&openings).is_ok());
+        commit(7);
+        assert!(openings.abandon_idle(&[7; 32], i64::MAX).unwrap().is_some());
+        assert!(room(&openings).is_ok());
+        // The operator's scale: a slower prover than measured.
+        commit(8);
+        assert!(room(&openings).is_err());
+        let mut scaled = test_openings(dir.path());
+        scaled.prover = openings.prover.take();
+        scaled.scale_proofs(0.5).unwrap();
+        assert!(room(&scaled).is_ok());
+        assert!(scaled.scale_proofs(0.0).is_err());
+        // Not ready: nothing admitted, and why.
+        scaled.prover.as_ref().unwrap().not_ready("no GPU");
+        let why = room(&scaled).unwrap_err().reason;
+        assert!(why.contains("not ready (no GPU)"), "{why}");
     }
 
     #[test]

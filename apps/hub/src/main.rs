@@ -147,6 +147,19 @@ struct Chain {
         requires = "contracts"
     )]
     contracts_wallet: Option<String>,
+    /// Scale the prover's estimate of each proof by this as the hub admits
+    /// contracts: it opens one only if its prover could prove an exit of
+    /// every contract it holds at once, in an assert window. Above 1 for a
+    /// prover slower than its benchmark; below 1 admits more contracts than
+    /// it is sure to defend if their holders exit together.
+    #[arg(
+        long = "contracts-proof-scale",
+        value_name = "FACTOR",
+        env = "LICASH_HUB_CONTRACTS_PROOF_SCALE",
+        default_value_t = 1.0,
+        requires = "contracts"
+    )]
+    contracts_proof_scale: f64,
     /// Let holders choose a contract's cap up to this many sat, and how
     /// long it lasts up to `--contracts-max-blocks`, besides the fixed
     /// terms (4 096 sat over 1 000 blocks) apps without that choice open
@@ -994,6 +1007,7 @@ fn command(cli: Cli) -> anyhow::Result<()> {
             let response_poll = Duration::from_secs(chain.chain_poll);
             let range = chain.range();
             let max_live = chain.contracts_max_live;
+            let proof_scale = chain.contracts_proof_scale;
             let wallet = match (&chain.contracts_wallet, &chain.url) {
                 (Some(url), _) => Some(url.parse::<Source>().context("--contracts-wallet")?),
                 (None, Some(url)) if contracting && url.starts_with("esplora+") => anyhow::bail!(
@@ -1118,6 +1132,9 @@ fn command(cli: Cli) -> anyhow::Result<()> {
                     );
                     let openings = runtime.block_on(opening).context("open the contracts")?;
                     openings.limit_live(max_live);
+                    openings
+                        .scale_proofs(proof_scale)
+                        .context("--contracts-proof-scale")?;
                     // What each holder agrees to pay at most from now on.
                     openings.charging(hub.info().policy.fees());
                     // Holders' exits are played as they come: the hub

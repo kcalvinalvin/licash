@@ -272,7 +272,17 @@ timeouts pay them (a claim is decided on the poll after the one that first
 saw it, all of them known). It plans with its prover's speed, measured at
 startup (`licash-r0 probe`, then `licash-r0 bench` once per device, kept in
 `<data>/hp-proofs/bench.json`: delete it to measure again, as after
-changing the GPU). A prover not ready (none installed, no
+changing the GPU). So that no claim it could reduce is paid by a timeout,
+it opens a contract only if its prover could make, one after another in an
+assert window, the largest proof of an exit of every contract it is
+committed to and of the new one (all its headers to the close, and the
+most its publication and evidence may carry): its holders may all exit at
+once. It checks this as a holder opens and again, holding its funding lock,
+as it funds F, and refuses an opening with 503 when there is no room, or
+while its prover is not ready. `--contracts-proof-scale` scales each
+proof's estimate (1 by default): above 1 for a prover slower than its
+benchmark, below 1 to admit more than it can surely defend. Long contracts
+take the most room, as a proof grows with the headers it checks. A prover not ready (none installed, no
 Groth16 setup, under 8.5 GB of memory, a failed benchmark) responds to no
 contested claim. The hub's notifications alert it, a prover that fails, a
 proof the plan would make late, an assertion's deadline 6 blocks away

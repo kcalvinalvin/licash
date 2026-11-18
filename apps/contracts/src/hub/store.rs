@@ -311,6 +311,23 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// The states of the openings but `except` the hub committed to and
+    /// may yet have to prove an exit of: funded or signed, of this format,
+    /// not the mock authority's, not given up nor ended.
+    pub fn committed(&self, except: &[u8; 32]) -> Result<Vec<Vec<u8>>> {
+        let ended = match self.has("ended")? {
+            true => "AND id NOT IN (SELECT id FROM ended)",
+            false => "",
+        };
+        let mut stmt = self.0.prepare(&format!(
+            "SELECT state FROM openings
+             WHERE (irrevocable = 1 OR length(coins) > 0) AND abandoned = 0 AND mock = 0
+               AND format = ?1 AND id != ?2 {ended}"
+        ))?;
+        let rows = stmt.query_map(params![FORMAT, except], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     /// Opening `id`'s contract ended at block `height`: nothing of the
     /// hub's left in it to play.
     pub fn end(&self, id: &[u8; 32], height: u32) -> Result<()> {
