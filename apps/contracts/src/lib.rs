@@ -220,7 +220,7 @@ pub fn trust(profile: ChainProfile) -> Result<Trust> {
 /// proven with it alone, so none named here or in [`SIGNET_BEFORE`] is
 /// ever to go. A contract keeps its program when this one changes.
 pub const SIGNET: [u8; 32] =
-    hex!("4f236e2763d716a44c8c6458b400e6d096507229af71e9c5e69eb725a365e58d");
+    hex!("aa7f2d19079b339b1fee1e7666f445232f012965dc7c0ab8c35fb560a4d68a73");
 
 /// The programs signet contracts opened under before [`SIGNET`], newest
 /// first: no contract opens under them, those that did are played still.
@@ -308,7 +308,7 @@ mod tests {
     fn the_hub_statement_image_is_pinned() {
         assert_eq!(
             SIGNET,
-            hex!("4f236e2763d716a44c8c6458b400e6d096507229af71e9c5e69eb725a365e58d"),
+            hex!("aa7f2d19079b339b1fee1e7666f445232f012965dc7c0ab8c35fb560a4d68a73"),
             "keep every funded contract's pinned guest available when changing opening trust"
         );
         assert_eq!(

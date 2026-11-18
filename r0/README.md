@@ -62,7 +62,7 @@ done
 
 | Network | Program | Image id | Built from |
 |---|---|---|---|
-| signet | `hp` (the Hub's statement), new contracts | `4f236e2763d716a44c8c6458b400e6d096507229af71e9c5e69eb725a365e58d` | 61d6500 |
+| signet | `hp` (the Hub's statement), new contracts | `aa7f2d19079b339b1fee1e7666f445232f012965dc7c0ab8c35fb560a4d68a73` | 9d0f04f |
 | signet | `hp`, contracts opened before (v3 Bases) | `6bf78e6092f9c0959cee4908b449a032e575d527c5c889d8b9f3813b888f0d0c` | 0f86cc6 |
 
 The program before checks no signature of her request (a v3 Base binds
