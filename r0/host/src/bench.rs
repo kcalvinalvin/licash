@@ -40,10 +40,20 @@ fn input() -> Result<Vec<u8>> {
     read(&path).with_context(|| format!("no input to measure with at {}", path.display()))
 }
 
+/// Where to measure: a directory beside `out`, removed once done. Not in
+/// the system's temporary directory: the Groth16 wrap's witness takes
+/// hundreds of MB, more than a hardened container's /tmp holds, and cut
+/// short there it fails the wrap.
+fn work_beside(out: &Path) -> Result<tempfile::TempDir> {
+    let dir = out.parent().filter(|p| !p.as_os_str().is_empty());
+    let dir = dir.unwrap_or(Path::new("."));
+    Ok(tempfile::Builder::new().prefix(".bench-").tempdir_in(dir)?)
+}
+
 /// The orchestrating build's measure, written to `out`: through the CUDA
 /// build when a GPU is usable, as [`crate::hp::prove`] proves.
 pub fn bench(out: &Path, program: Option<&str>) -> Result<()> {
-    let work = tempfile::tempdir()?;
+    let work = work_beside(out)?;
     let dir = work.path();
     let (device, stark) = match probe::cuda_build().filter(|_| probe::gpu_usable()) {
         Some(cuda) => {
@@ -140,4 +150,20 @@ pub fn stark(dir: &Path, po2: u32, program: Option<&str>) -> Result<Value> {
     });
     keep(&dir.join("stark.json"), &serde_json::to_vec(&report)?)?;
     Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn it_measures_beside_where_it_keeps_its_measure() {
+        let kept = tempfile::tempdir().unwrap();
+        let out = kept.path().join("bench.json");
+        let work = work_beside(&out).unwrap();
+        assert_eq!(work.path().parent(), Some(kept.path()));
+        let path = work.path().to_path_buf();
+        drop(work);
+        assert!(!path.exists(), "left behind");
+    }
 }
