@@ -498,6 +498,11 @@ pub struct Open {
     /// under v3 and its own program; one before binding no longer loads
     /// once the program contracts open under changes, before any funding.
     pub request_keys: Option<[u8; 32]>,
+    /// The outputs she funds the contract with herself, in order, which a
+    /// v5 Base commits to and the Hub issues her notes for once F
+    /// confirms: worth the quote's `deposit_units`. Written after her
+    /// request keys, which they need, and only if any.
+    pub funded: Vec<licash::spend::Output>,
 }
 message!(
     Open,
@@ -516,6 +521,12 @@ message!(
         w.u8(self.mock as u8);
         if let Some(digest) = &self.request_keys {
             w.bytes(digest);
+            if !self.funded.is_empty() {
+                w.count(self.funded.len());
+                for output in &self.funded {
+                    w.bytes(&output.to_bytes());
+                }
+            }
         }
     },
     {
@@ -536,6 +547,15 @@ message!(
         } else {
             Some(r.array()?)
         };
+        let mut funded = Vec::new();
+        if !r.0.is_empty() {
+            let n = r.count(licash::spend::OUTPUT_BYTES)?;
+            ensure!(n > 0, "an empty funded list");
+            for _ in 0..n {
+                let bytes = r.take(licash::spend::OUTPUT_BYTES)?;
+                funded.push(licash::spend::Output::from_bytes(bytes)?);
+            }
+        }
         Self {
             party,
             claim_key,
@@ -545,6 +565,7 @@ message!(
             wanted,
             mock: mock == 1,
             request_keys,
+            funded,
         }
     }
 );
@@ -809,6 +830,7 @@ mod tests {
             },
             mock: false,
             request_keys: None,
+            funded: vec![],
         };
         let digest = keys.public().request_keys().unwrap().digest();
         let bound = Open {
@@ -824,5 +846,27 @@ mod tests {
             assert!(Open::decode(&new[..new.len() - cut]).is_err());
         }
         assert!(Open::decode(&[new.as_slice(), &[0]].concat()).is_err());
+
+        // Her funded outputs follow her keys, and need them.
+        let output = |n: u64| {
+            let point = licash::crypto::generator_mul(&n.into());
+            licash::spend::Output::new(
+                n,
+                licash::crypto::Point::from_projective(&point),
+                [n as u8; 32],
+            )
+            .unwrap()
+        };
+        let funding = Open {
+            funded: vec![output(4), output(8)],
+            ..bound.clone()
+        };
+        let encoded = funding.encode();
+        assert_eq!(Open::decode(&encoded).unwrap(), funding);
+        for cut in [1, 73] {
+            assert!(Open::decode(&encoded[..encoded.len() - cut]).is_err());
+        }
+        let empty = [new.as_slice(), &0u32.to_be_bytes()].concat();
+        assert!(Open::decode(&empty).is_err());
     }
 }

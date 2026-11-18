@@ -509,6 +509,7 @@ fn pending_sources_follow_activation_refund_and_preimage_rules() {
             notes: vec![settled_note.clone()],
             sources,
             activations: v3_activations(activations),
+            funded: vec![],
         }
     };
     let bob_elsewhere = spend(
@@ -672,6 +673,7 @@ fn v4_owes_a_locks_pay_only_on_an_activation_anchored_to_its_checkpoint() {
             signatures: bob_signed.signatures().to_vec(),
         }],
         activations,
+        funded: vec![],
     };
     let anchored = |anchor| {
         vec![ActivationWitness {
@@ -813,6 +815,7 @@ fn v4_owes_a_locks_refund_only_once_it_expired_at_depth() {
             notes: vec![own_note.clone()],
         }],
         activations: vec![],
+        funded: vec![],
     };
     let owed = |top: u32, evidence: &[Evidence]| {
         decide(&o, &request, &p, &witness, evidence, Some(&to(top))).unwrap()
@@ -926,6 +929,7 @@ fn withheld() -> Withheld {
             notes: vec![note.clone()],
         }],
         activations: vec![],
+        funded: vec![],
     };
     Withheld {
         o,
@@ -1105,6 +1109,7 @@ fn second_claim_of_an_input_voids_the_outputs_of_a_lock_of_the_holders_own_notes
             notes: vec![own_note],
         }],
         activations: vec![],
+        funded: vec![],
     };
     let owed = |e: &[Evidence]| decide(&o, &request, &p, &witness, e, None);
     assert_eq!(owed(&[]).unwrap().owed, 8);
@@ -1164,6 +1169,7 @@ fn surviving_value_beyond_u64_is_capped_at_the_request() {
         notes,
         sources: vec![],
         activations: vec![],
+        funded: vec![],
     };
     let c = decide(&o, &request, &p, &witness, &[spent], None).unwrap();
     assert_eq!((c.mask, c.owed), (0b1, 128));
@@ -1202,6 +1208,7 @@ fn second_claim_signature_cannot_be_assigned_to_a_different_note_with_the_same_q
         notes: vec![mint(&o.issuer, &o.base.parts().keyset, &second)],
         sources: vec![],
         activations: vec![],
+        funded: vec![],
     };
     assert_eq!(
         decide(&o, &request, &p, &witness, &[], None).unwrap().owed,
@@ -1297,6 +1304,7 @@ fn input_claim_conflicts_preserve_certified_outputs_but_retire_all_own_outputs()
             notes: vec![mint(&o.issuer, &keyset, &settled)],
             sources: vec![body],
             activations: v3_activations(inclusions),
+            funded: vec![],
         };
         (p, request, witness)
     };
@@ -1401,6 +1409,7 @@ fn the_hub_decides_what_a_filed_claim_is_owed() {
             notes: notes.clone(),
             sources: vec![],
             activations: vec![],
+            funded: vec![],
         },
     )
     .unwrap();
@@ -1503,6 +1512,7 @@ fn a_note_is_claimed_in_any_contract_its_hold_key_designates() {
             notes,
             sources: vec![],
             activations: vec![],
+            funded: vec![],
         },
     )
     .unwrap();
@@ -1556,6 +1566,7 @@ fn fabricated_or_malformed_filings_are_owed_nothing() {
                 notes,
                 sources: vec![],
                 activations: vec![],
+                funded: vec![],
             },
         )
     };
@@ -1727,6 +1738,7 @@ fn pending_items_are_eligible_by_their_sources_public_bodies() {
                 notes: vec![settled_note.clone()],
                 sources: bodies.clone(),
                 activations: v3_activations(inclusions),
+                funded: vec![],
             },
         )
         .unwrap();
@@ -1855,6 +1867,7 @@ fn a_filed_pay_of_a_lock_timed_on_another_checkpoint_is_owed_nothing() {
                     signatures: signed.signatures().to_vec(),
                 }],
                 activations: vec![],
+                funded: vec![],
             },
         )
         .unwrap();
@@ -1873,5 +1886,309 @@ fn a_filed_pay_of_a_lock_timed_on_another_checkpoint_is_owed_nothing() {
         assert_eq!(refused.owed, 0);
         let reason = refused.ineligible.unwrap();
         assert!(reason.contains("another checkpoint"), "{reason}");
+    }
+}
+
+/// A v5 Base of `issuer`'s keyset whose holder funds it with `outputs`.
+fn funded_base(issuer: &IssuerKeys, outputs: &[Output], amount: u32) -> Base {
+    let mut parts = base(issuer.keyset().unwrap()).parts().clone();
+    parts.version = base::Version::V5 {
+        holder_wots: [5; 32],
+        funded: licash::spend::funded_root(outputs).unwrap(),
+    };
+    parts.graph.deposit_units = amount;
+    Base::new(parts).unwrap()
+}
+
+fn funded_items(ds: &[Derivation], indices: &[u32]) -> Vec<Item> {
+    indices
+        .iter()
+        .map(|&i| Item::Funded {
+            message: ds[i as usize].message().clone(),
+            index: i,
+            blinding: *ds[i as usize].blinding(),
+        })
+        .collect()
+}
+
+/// Of a v5 Base, the notes its holder funded it with: claimed by the
+/// outputs it commits to, owed at face whether issued or not, and void
+/// only once spent or claimed elsewhere.
+#[test]
+fn v5_owes_her_funded_notes_unless_spent_or_claimed_elsewhere() {
+    let issuer = IssuerKeys::random(3).unwrap();
+    let keyset = issuer.keyset().unwrap();
+    let ds: Vec<_> = (0..4).map(|i| derive(SPEND, &hold(), 4, 24, i)).collect();
+    let outputs: Vec<_> = ds
+        .iter()
+        .map(|d| Output::from_derivation(d).unwrap())
+        .collect();
+    let o = Opened {
+        base: funded_base(&issuer, &outputs, 16),
+        issuer,
+    };
+    assert_eq!(
+        o.base.version().funded(),
+        Some(licash::spend::funded_root(&outputs).unwrap())
+    );
+    let decoded = Base::from_bytes(&o.base.to_bytes()).unwrap();
+    assert_eq!(decoded.digest(), o.base.digest());
+    assert_eq!(decoded.version(), o.base.version());
+
+    // Three of the four claimed: 12 sat.
+    let p = Publication::sign(
+        claim(
+            &o,
+            funded_items(&ds, &[0, 1, 3]),
+            vec![],
+            vec![],
+            &[ds[0].clone(), ds[1].clone(), ds[3].clone()],
+            12,
+        ),
+        &hold_keys(&[ds[0].clone(), ds[1].clone(), ds[3].clone()]),
+        LIMIT,
+    )
+    .unwrap();
+    let request = Request {
+        amount: 12,
+        claim_digest: *p.claim().digest(),
+    };
+    let witness = Witness {
+        notes: vec![],
+        sources: vec![],
+        activations: vec![],
+        funded: outputs.clone(),
+    };
+    let filing = Filing::new(p.clone(), witness.clone()).unwrap();
+    let bytes = filing.to_bytes();
+    assert!(bytes.starts_with(b"LICASH-F\x03"));
+    assert_eq!(
+        Filing::from_bytes(&o.base.parts().keyset, LIMIT, &bytes)
+            .unwrap()
+            .to_bytes(),
+        bytes
+    );
+    for n in 0..bytes.len() {
+        assert!(Filing::from_bytes(&o.base.parts().keyset, LIMIT, &bytes[..n]).is_err());
+    }
+    let whole = decide(&o, &request, &p, &witness, &[], None).unwrap();
+    assert_eq!((whole.owed, whole.mask, whole.ineligible), (12, 0, None));
+
+    // Issued and spent: void.
+    let note = mint(&o.issuer, &o.base.parts().keyset, &ds[1]);
+    let spent = Evidence::Spend {
+        signed: spend(
+            &o,
+            std::slice::from_ref(&note),
+            &[owner(SPEND, 24, 1)],
+            vec![bob(4, 0)],
+        ),
+        notes: vec![note],
+        unlock: None,
+    };
+    let after = decide(
+        &o,
+        &request,
+        &p,
+        &witness,
+        std::slice::from_ref(&spent),
+        None,
+    )
+    .unwrap();
+    assert_eq!((after.owed, after.mask), (8, 0b010));
+    // Claimed in another contract: void.
+    let other = hold::Context {
+        base: [1; 32],
+        deposit: [2; 36],
+        amount: 4,
+        claim_digest: [3; 32],
+    };
+    let record = hold::Envelope::sign(other, &hold_keys(&ds[3..4]), LIMIT)
+        .unwrap()
+        .records()[0]
+        .clone();
+    let second = Evidence::SecondClaim {
+        context: other,
+        record,
+    };
+    let both = decide(&o, &request, &p, &witness, &[spent, second], None).unwrap();
+    assert_eq!((both.owed, both.mask), (4, 0b110));
+    // No preimage or expiry touches them: evidence voiding nothing.
+    let preimage = Evidence::PayPreimage {
+        source: licash::spend::ProposalId::from_bytes([9; 32]),
+        preimage: Z,
+    };
+    assert!(decide(&o, &request, &p, &witness, &[preimage], None).is_err());
+
+    // Filed against outputs Base doesn't commit to, or opening none: owed
+    // nothing.
+    let mut fewer = witness.clone();
+    fewer.funded.pop();
+    let ineligible = decide(&o, &request, &p, &fewer, &[], None).unwrap();
+    assert_eq!(ineligible.owed, 0);
+    assert!(ineligible.ineligible.unwrap().contains("funded outputs"));
+    let mut swapped = witness.clone();
+    swapped.funded.swap(0, 1);
+    assert_eq!(
+        decide(&o, &request, &p, &swapped, &[], None).unwrap().owed,
+        0
+    );
+    let wrong = vec![Item::Funded {
+        message: ds[0].message().clone(),
+        index: 1,
+        blinding: *ds[0].blinding(),
+    }];
+    let p_wrong = Publication::sign(
+        claim(&o, wrong, vec![], vec![], &ds[..1], 4),
+        &hold_keys(&ds[..1]),
+        LIMIT,
+    )
+    .unwrap();
+    let request_wrong = Request {
+        amount: 4,
+        claim_digest: *p_wrong.claim().digest(),
+    };
+    let owed = decide(&o, &request_wrong, &p_wrong, &witness, &[], None).unwrap();
+    assert!(owed.ineligible.unwrap().contains("does not open"));
+
+    // Funded items and the outputs they open come together.
+    assert!(Filing::new(
+        p.clone(),
+        Witness {
+            funded: vec![],
+            ..witness.clone()
+        }
+    )
+    .is_err());
+    let settled = Publication::sign(
+        claim(
+            &o,
+            vec![Item::Settled(ds[2].message().clone())],
+            vec![],
+            vec![],
+            &ds[2..3],
+            4,
+        ),
+        &hold_keys(&ds[2..3]),
+        LIMIT,
+    )
+    .unwrap();
+    assert!(Filing::new(settled, witness.clone()).is_err());
+    // One output claimed twice: refused.
+    let p = o.base.parts();
+    let twice = UnsignedClaim::new(
+        claim::Context {
+            base: o.base.digest(),
+            deposit: p.deposit,
+            cap: p.cap,
+        },
+        &p.keyset,
+        4,
+        claim::Parts {
+            items: vec![
+                funded_items(&ds, &[0]).remove(0),
+                Item::Funded {
+                    message: ds[1].message().clone(),
+                    index: 0,
+                    blinding: *ds[1].blinding(),
+                },
+            ],
+            sources: vec![],
+            activations: vec![],
+            authorizations: {
+                let mut m: Vec<_> = ds[..2].iter().map(|d| d.message().clone()).collect();
+                m.sort_by_key(|m| m.identifier().unwrap());
+                m
+            },
+        },
+        LIMIT,
+    );
+    assert!(twice.is_err());
+}
+
+/// A claim of funded items under a Base committing to no funded outputs
+/// (v3, v4) is owed nothing.
+#[test]
+fn funded_items_under_a_base_of_no_funding_are_owed_nothing() {
+    let o = open();
+    let ds: Vec<_> = (0..2).map(|i| derive(SPEND, &hold(), 4, 24, i)).collect();
+    let outputs: Vec<_> = ds
+        .iter()
+        .map(|d| Output::from_derivation(d).unwrap())
+        .collect();
+    let p = Publication::sign(
+        claim(&o, funded_items(&ds, &[0, 1]), vec![], vec![], &ds, 8),
+        &hold_keys(&ds),
+        LIMIT,
+    )
+    .unwrap();
+    let request = Request {
+        amount: 8,
+        claim_digest: *p.claim().digest(),
+    };
+    let witness = Witness {
+        notes: vec![],
+        sources: vec![],
+        activations: vec![],
+        funded: outputs,
+    };
+    let owed = decide(&o, &request, &p, &witness, &[], None).unwrap();
+    assert_eq!(owed.owed, 0);
+    assert!(owed.ineligible.is_some());
+}
+
+#[test]
+fn a_v5_base_funds_at_most_its_cap_and_something() {
+    let issuer = IssuerKeys::random(3).unwrap();
+    let outputs = vec![bob(4, 0)];
+    let mut parts = funded_base(&issuer, &outputs, 4).parts().clone();
+    for (units, funded) in [(0, [1; 32]), (129, [1; 32]), (4, [0; 32])] {
+        parts.graph.deposit_units = units;
+        parts.version = base::Version::V5 {
+            holder_wots: [5; 32],
+            funded,
+        };
+        assert!(Base::new(parts.clone()).is_err(), "{units}");
+    }
+    parts.version = base::Version::V5 {
+        holder_wots: [0; 32],
+        funded: [1; 32],
+    };
+    assert!(Base::new(parts).is_err());
+    assert!(licash::spend::funded_root(&[]).is_err());
+}
+
+/// Her funded outputs are owed only if worth exactly what she funded.
+#[test]
+fn funded_outputs_worth_other_than_she_funded_are_owed_nothing() {
+    let ds: Vec<_> = (0..2).map(|i| derive(SPEND, &hold(), 4, 24, i)).collect();
+    let outputs: Vec<_> = ds
+        .iter()
+        .map(|d| Output::from_derivation(d).unwrap())
+        .collect();
+    for (amount, owed) in [(8, 8), (7, 0), (9, 0)] {
+        let issuer = IssuerKeys::random(3).unwrap();
+        let o = Opened {
+            base: funded_base(&issuer, &outputs, amount),
+            issuer,
+        };
+        let p = Publication::sign(
+            claim(&o, funded_items(&ds, &[0, 1]), vec![], vec![], &ds, 8),
+            &hold_keys(&ds),
+            LIMIT,
+        )
+        .unwrap();
+        let request = Request {
+            amount: 8,
+            claim_digest: *p.claim().digest(),
+        };
+        let witness = Witness {
+            notes: vec![],
+            sources: vec![],
+            activations: vec![],
+            funded: outputs.clone(),
+        };
+        let decided = decide(&o, &request, &p, &witness, &[], None).unwrap();
+        assert_eq!(decided.owed, owed, "{amount}");
     }
 }

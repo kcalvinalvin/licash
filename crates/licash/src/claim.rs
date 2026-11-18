@@ -139,6 +139,15 @@ pub enum Item {
         blinding: ScalarBytes,
         preimage: Option<[u8; 32]>,
     },
+    /// A note the holder funded the contract with herself, of a v5 Base:
+    /// it opens output `index` of the outputs the Base commits to, with
+    /// `blinding`. Never a settled note, though worth its face: only its
+    /// spend or a second claim of it voids it.
+    Funded {
+        message: Message,
+        index: u32,
+        blinding: ScalarBytes,
+    },
 }
 impl std::fmt::Debug for Item {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -148,28 +157,42 @@ impl std::fmt::Debug for Item {
 impl Item {
     pub fn message(&self) -> &Message {
         match self {
-            Self::Settled(message) | Self::Pending { message, .. } => message,
+            Self::Settled(message)
+            | Self::Pending { message, .. }
+            | Self::Funded { message, .. } => message,
         }
     }
     fn encode(&self, bytes: &mut Vec<u8>) {
-        bytes.push(u8::from(matches!(self, Self::Pending { .. })));
+        bytes.push(match self {
+            Self::Settled(_) => 0,
+            Self::Pending { .. } => 1,
+            Self::Funded { .. } => 2,
+        });
         bytes.extend(self.message().public_fields());
-        if let Self::Pending {
-            source,
-            branch,
-            index,
-            blinding,
-            preimage,
-            ..
-        } = self
-        {
-            bytes.extend(source.as_bytes());
-            bytes.push(branch.tag());
-            bytes.extend(index.to_be_bytes());
-            bytes.extend(blinding.0);
-            bytes.push(u8::from(preimage.is_some()));
-            if let Some(z) = preimage {
-                bytes.extend(z);
+        match self {
+            Self::Settled(_) => {}
+            Self::Pending {
+                source,
+                branch,
+                index,
+                blinding,
+                preimage,
+                ..
+            } => {
+                bytes.extend(source.as_bytes());
+                bytes.push(branch.tag());
+                bytes.extend(index.to_be_bytes());
+                bytes.extend(blinding.0);
+                bytes.push(u8::from(preimage.is_some()));
+                if let Some(z) = preimage {
+                    bytes.extend(z);
+                }
+            }
+            Self::Funded {
+                index, blinding, ..
+            } => {
+                bytes.extend(index.to_be_bytes());
+                bytes.extend(blinding.0);
             }
         }
     }
@@ -251,10 +274,20 @@ impl UnsignedClaim {
         let mut required = identifiers.clone();
         let mut branches = BTreeMap::new();
         let mut positions = BTreeSet::new();
+        let mut funded = BTreeSet::new();
         let mut value = 0u128;
         for item in &parts.items {
             let fallback = match item {
                 Item::Settled(_) => false,
+                Item::Funded {
+                    index, blinding, ..
+                } => {
+                    blinding.to_scalar()?;
+                    if !funded.insert(*index) {
+                        return Err(bad("duplicate claimed funded output"));
+                    }
+                    false
+                }
                 Item::Pending {
                     source,
                     branch,

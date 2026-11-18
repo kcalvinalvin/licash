@@ -18,7 +18,7 @@
 //! every claim's context binds, so a proof for one contract is useless for
 //! any other.
 //!
-//! Under a v4 Base the statement also checks her request's one-time
+//! Under a v4 or v5 Base the statement also checks her request's one-time
 //! signatures on `b` and `E` against the keys Base binds
 //! ([`RequestKeys`]): only she can sign a request, so no proof can be made
 //! of an exit she didn't start, on any chain, however long before.
@@ -31,7 +31,7 @@
 
 use bitcoin::hashes::{hash160, Hash};
 use licash::{
-    base::{Base, Version},
+    base::Base,
     chain::Chain,
     crypto::tagged_hash,
     disclosure::Disclosures,
@@ -148,7 +148,7 @@ impl RequestKeys {
         (b.len() == digits(4) && e.len() == digits(32)).then_some(Self { b, e })
     }
 
-    /// What a v4 Base binds of them (`Version::V4`'s `holder_wots`).
+    /// What a v4 or v5 Base binds of them (`Version::holder_wots`).
     pub fn digest(&self) -> [u8; 32] {
         tagged_hash(
             "licash/hp/request-keys",
@@ -224,7 +224,7 @@ impl HubInput {
         w.bytes(&self.base.to_bytes());
         self.exit.write(&mut w);
         w.bytes(&recovery::evidence_to_bytes(&self.evidence));
-        if let (Version::V4 { .. }, Some(keys)) = (self.base.version(), &self.keys) {
+        if let (Some(_), Some(keys)) = (self.base.version().holder_wots(), &self.keys) {
             keys.write(&mut w);
         }
         w.0
@@ -244,9 +244,9 @@ impl HubInput {
             &r.bytes().map_err(|_| Refusal::Input)?,
         )
         .map_err(|_| Refusal::Input)?;
-        let keys = match base.version() {
-            Version::V3 => None,
-            Version::V4 { .. } => Some(RequestKeys::read(&mut r).ok_or(Refusal::Input)?),
+        let keys = match base.version().holder_wots() {
+            None => None,
+            Some(_) => Some(RequestKeys::read(&mut r).ok_or(Refusal::Input)?),
         };
         r.end().map_err(|_| Refusal::Input)?;
         Ok(Self {
@@ -269,7 +269,7 @@ pub fn decide(
 ) -> Result<(Owed, Read), Refusal> {
     let contract = contract(base);
     let read = lichen_statement::read(&contract, exit).map_err(Refusal::Exit)?;
-    if let Version::V4 { holder_wots } = base.version() {
+    if let Some(holder_wots) = base.version().holder_wots() {
         let keys = keys
             .filter(|k| k.digest() == holder_wots)
             .ok_or(Refusal::Unsigned)?;

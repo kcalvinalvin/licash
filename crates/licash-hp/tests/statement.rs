@@ -222,6 +222,69 @@ fn stale_under(version: Version) -> (Filed, Evidence) {
         notes: notes.clone(),
         sources: vec![],
         activations: vec![],
+        funded: vec![],
+    };
+    let filed = file(issuer, base, parts, &ds, 128, witness);
+    let spent = Evidence::Spend {
+        signed,
+        notes: notes[..16].to_vec(),
+        unlock: None,
+    };
+    (filed, spent)
+}
+
+/// Under a v5 Base on `keys`, she funded 32 notes of 4 herself, which the
+/// Hub issued her; she spent 16 of them to Bob after her backup and claims
+/// all 32 as funded, b = 128. The Hub's evidence: the spend.
+fn funded_under(keys: &RequestKeys) -> (Filed, Evidence) {
+    let issuer = IssuerKeys::random(3).unwrap();
+    let keyset = issuer.keyset().unwrap();
+    let ds: Vec<_> = (0..32).map(|i| derive(SPEND, &hold(), 4, 23, i)).collect();
+    let outputs: Vec<_> = ds
+        .iter()
+        .map(|d| Output::from_derivation(d).unwrap())
+        .collect();
+    let mut parts = base(keyset.clone(), 53).parts().clone();
+    parts.version = Version::V5 {
+        holder_wots: keys.digest(),
+        funded: licash::spend::funded_root(&outputs).unwrap(),
+    };
+    parts.graph.deposit_units = 128;
+    let base = Base::new(parts).unwrap();
+    let notes: Vec<_> = ds.iter().map(|d| mint(&issuer, &keyset, d)).collect();
+    let owners: Vec<_> = (0..16).map(|i| owner(SPEND, 23, i)).collect();
+    let bob = HoldRoot::from_seed(&[9; 32]).unwrap();
+    let to = (0..8)
+        .map(|i| Output::from_derivation(&derive(41, &bob, 8, 29, i)).unwrap())
+        .collect();
+    let proposal = Proposal::new(&keyset, &notes[..16], point(43), to, None).unwrap();
+    let signed = SignedProposal::sign(
+        &keyset,
+        proposal,
+        &notes[..16],
+        Authorization::Plain,
+        &owners,
+    )
+    .unwrap();
+    let parts = claim::Parts {
+        items: ds
+            .iter()
+            .enumerate()
+            .map(|(i, d)| Item::Funded {
+                message: d.message().clone(),
+                index: i as u32,
+                blinding: *d.blinding(),
+            })
+            .collect(),
+        sources: vec![],
+        activations: vec![],
+        authorizations: sorted(&ds),
+    };
+    let witness = Witness {
+        notes: vec![],
+        sources: vec![],
+        activations: vec![],
+        funded: outputs,
     };
     let filed = file(issuer, base, parts, &ds, 128, witness);
     let spent = Evidence::Spend {
@@ -328,8 +391,9 @@ fn signed_request(seed: u8, e: &Hash, b: u32) -> (RequestKeys, Vec<Vec<u8>>) {
 
 /// The inputs r0/host measures the guest on (`licash-r0 hp-exec`),
 /// written to `LICASH_HP_INPUTS` if set: the 32-item claim the Hub
-/// answers with a 16-note spend, the same claim unanswered, and the
-/// answered one under a v4 Base, her request's signatures checked.
+/// answers with a 16-note spend, the same claim unanswered, the answered
+/// one under a v4 Base, her request's signatures checked, and its like of
+/// notes she funded a v5 Base with.
 #[test]
 fn export_inputs() {
     let Ok(dir) = std::env::var("LICASH_HP_INPUTS") else {
@@ -345,6 +409,16 @@ fn export_inputs() {
     });
     let (_, witness) = signed_request(3, &f.e, f.b);
     let signed = HubInput {
+        keys: Some(keys.clone()),
+        ..input(
+            &f.base,
+            signed_exit(&f.base, &witness, &f.bytes, 64),
+            vec![spent],
+        )
+    };
+    let (f, spent) = funded_under(&keys);
+    let (_, witness) = signed_request(3, &f.e, f.b);
+    let funded = HubInput {
         keys: Some(keys),
         ..input(
             &f.base,
@@ -356,6 +430,7 @@ fn export_inputs() {
         ("answered", answered),
         ("unanswered", unanswered),
         ("answered-v4", signed),
+        ("answered-v5", funded),
     ];
     for (name, i) in inputs {
         let bytes = i.to_bytes();
@@ -497,6 +572,35 @@ fn under_v4_her_request_must_be_signed_under_the_keys_base_binds() {
     .is_err());
 }
 
+/// Under a v5 Base her funded notes are owed as the outputs it commits to,
+/// those spent void: the Hub proves the rest owed, on her signed request.
+#[test]
+fn under_v5_her_funded_notes_are_owed_unless_spent() {
+    let (keys, _) = signed_request(3, &[0; 32], 0);
+    let (f, spent) = funded_under(&keys);
+    let journal = contract(&f.base).journal();
+    let (_, witness) = signed_request(3, &f.e, f.b);
+    let x = signed_exit(&f.base, &witness, &f.bytes, 64);
+    let (owed, _) = decide(&f.base, Some(&keys), &x, std::slice::from_ref(&spent)).unwrap();
+    assert_eq!((owed.owed, owed.mask, owed.ineligible), (64, 0xffff, None));
+    let signed = HubInput {
+        keys: Some(keys.clone()),
+        ..input(&f.base, x, vec![spent.clone()])
+    };
+    assert_eq!(check(&signed).unwrap(), journal);
+    let decoded = HubInput::from_bytes(&signed.to_bytes()).unwrap();
+    assert_eq!(check(&decoded).unwrap(), journal);
+    // Without the spend all 128 stay owed: a response of 64 proves nothing.
+    let x = signed_exit(&f.base, &witness, &f.bytes, 64);
+    assert_eq!(
+        check(&HubInput {
+            keys: Some(keys),
+            ..input(&f.base, x, vec![])
+        }),
+        Err(Refusal::Owed)
+    );
+}
+
 /// Under v3 the input is what v3's program reads: no keys, whatever the
 /// Hub holds.
 #[test]
@@ -601,6 +705,7 @@ fn evidence_that_needs_a_disclosure_proves_only_with_it() {
             notes: vec![note.clone()],
         }],
         activations: vec![],
+        funded: vec![],
     };
     let f = file(issuer, base, parts, &held, 128, witness);
     let cite = Evidence::Spend {

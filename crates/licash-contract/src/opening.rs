@@ -211,9 +211,23 @@ fn offer(
     recipe.program = program;
     let mut chain = quote.chain.clone();
     chain.checkpoint = checkpoint.clone();
-    let version = match open.request_keys {
-        Some(holder_wots) => Version::V4 { holder_wots },
-        None => Version::V3,
+    let version = match (open.request_keys, graph.deposit_units) {
+        (None, 0) => Version::V3,
+        (Some(holder_wots), 0) => {
+            ensure!(
+                open.funded.is_empty(),
+                "funded outputs of an unfunded quote"
+            );
+            Version::V4 { holder_wots }
+        }
+        (Some(holder_wots), units) => {
+            check_funded(&open.funded, &quote.keyset, &quote.limits, units)?;
+            Version::V5 {
+                holder_wots,
+                funded: licash::spend::funded_root(&open.funded)?,
+            }
+        }
+        (None, _) => bail!("funding her part needs her request's keys"),
     };
     Ok(Base::new(Parts {
         version,
@@ -231,12 +245,45 @@ fn offer(
     })?)
 }
 
+/// The outputs she funds her part with: notes the keyset issues, at most
+/// as many as one claim can hold, worth exactly her part.
+fn check_funded(
+    outputs: &[licash::spend::Output],
+    keyset: &licash::note::Keyset,
+    limits: &licash::base::Limits,
+    units: u32,
+) -> Result<()> {
+    let most = licash::claim::MAX_ITEMS.min(limits.max_authorizations as usize);
+    ensure!(
+        !outputs.is_empty() && outputs.len() <= most,
+        "{} funded outputs, not 1 to {most}",
+        outputs.len()
+    );
+    let mut worth = 0u64;
+    for output in outputs {
+        keyset
+            .key(output.denomination())
+            .context("a funded output the keyset doesn't issue")?;
+        worth = worth
+            .checked_add(output.denomination())
+            .context("funded outputs overflow")?;
+    }
+    ensure!(
+        worth == u64::from(units),
+        "funded outputs worth {worth}, not her part of {units}"
+    );
+    Ok(())
+}
+
 fn segwit(script: &ScriptBuf) -> bool {
     script.is_p2wpkh() || script.is_p2wsh() || script.is_p2tr()
 }
+/// What her deposit pays: her reserve, the fee, and her part of the
+/// contract, which the Hub issues back to her as notes.
 fn price(g: &GraphTerms, f: &Fees) -> Result<u64> {
     g.reserve_alice
         .checked_add(f.opening_fee_quote)
+        .and_then(|p| p.checked_add(u64::from(g.deposit_units)))
         .context("price overflow")
 }
 fn check_deposit(open: &wire::Open, g: &GraphTerms, f: &Fees) -> Result<()> {
@@ -514,6 +561,9 @@ pub struct Start {
     /// reserve to: no sweep of hers needed.
     pub payout: ScriptBuf,
     pub wanted: wire::Wanted,
+    /// The outputs she funds her part of the contract with, worth the
+    /// quote's `deposit_units`: none unless she funds some.
+    pub funded: Vec<licash::spend::Output>,
 }
 
 /// What the holder keeps to play a funded contract. She needs no uploaded
@@ -585,6 +635,7 @@ impl Holder {
             wanted: s.wanted,
             mock: ctx.trust.mock,
             request_keys: Some(keys.public().request_keys()?.digest()),
+            funded: s.funded,
         };
         check_deposit(&open, &s.quote.graph, &s.quote.fees)?;
         let h = Self {
@@ -1148,7 +1199,9 @@ impl Hub {
                             return self.pending();
                         }
                         ensure!(self.base.is_some(), "commit out of order");
-                        if let Version::V4 { holder_wots } = self.base.as_ref().unwrap().version() {
+                        if let Some(holder_wots) =
+                            self.base.as_ref().unwrap().version().holder_wots()
+                        {
                             ensure!(
                                 c.holder.request_keys()?.digest() == holder_wots,
                                 "her request's keys aren't those Base binds"
@@ -1362,7 +1415,7 @@ pub mod testing {
                 unit_sats: 1,
                 bits: 12,
                 low_bits: 9,
-                deposit_units: 3584,
+                deposit_units: 0,
                 close_height: 1000,
                 reserve_alice: 1000000,
                 reserve_hub: 1000000,
@@ -1502,6 +1555,7 @@ mod tests {
             },
             mock: true,
             request_keys: None,
+            funded: vec![],
         };
         assert!(check_deposit(&open, &q.graph, &q.fees).is_ok());
         // A bare script relays no payout of hers.
@@ -1518,6 +1572,98 @@ mod tests {
             hub.party().unwrap().payout_script,
             wallet_script(6).to_bytes()
         );
+    }
+
+    /// A quote she funds part of opens v5 on her outputs, worth exactly
+    /// her part in notes the keyset issues; her deposit pays that part on
+    /// top of her reserve and the fee, and her change is that much less.
+    #[test]
+    fn her_funded_part_opens_v5_on_outputs_worth_it() {
+        let id = [3; 32];
+        let base = testing::base(&id);
+        let mut q = Quote::from_base(&base);
+        q.graph.deposit_units = 12;
+        let keys = HolderKeys::derive(&[1; 32], &id);
+        let output = |n: u64| {
+            let point = licash::crypto::generator_mul(&n.into());
+            licash::spend::Output::new(
+                n,
+                licash::crypto::Point::from_projective(&point),
+                [n as u8; 32],
+            )
+            .unwrap()
+        };
+        let coin = TxOut {
+            value: Amount::from_sat(1_002_000),
+            script_pubkey: ScriptBuf::new_p2tr(SECP256K1, keys.claim_key(), None),
+        };
+        let digest = keys.public().request_keys().unwrap().digest();
+        let open = wire::Open {
+            party: keys.party.public(),
+            claim_key: keys.claim_key(),
+            deposit: OutPoint {
+                txid: Txid::from_byte_array([4; 32]),
+                vout: 0,
+            },
+            coin: coin.clone(),
+            change: wallet_script(5),
+            wanted: wire::Wanted {
+                request_height: 100,
+                close_height: 1000,
+                response_window: 24,
+            },
+            mock: true,
+            request_keys: Some(digest),
+            funded: vec![output(8), output(4)],
+        };
+        let hub = graph::party(&HubKeys::from_secret(&[2; 32]).party.public());
+        let checkpoint = q.chain.checkpoint.clone();
+        let b = offer(&q, id, &open, [11; 32], &checkpoint, hub.clone()).unwrap();
+        assert_eq!(
+            b.version(),
+            Version::V5 {
+                holder_wots: digest,
+                funded: licash::spend::funded_root(&open.funded).unwrap(),
+            }
+        );
+        assert_eq!(price(&b.parts().graph, &b.parts().fees).unwrap(), 1_001_012);
+        assert_eq!(
+            change(&b, &open).unwrap().unwrap().value.to_sat(),
+            1_002_000 - 1_001_012
+        );
+        check_deposit(&open, &q.graph, &q.fees).unwrap();
+        let short = wire::Open {
+            coin: TxOut {
+                value: Amount::from_sat(1_001_011),
+                ..coin
+            },
+            ..open.clone()
+        };
+        assert!(check_deposit(&short, &q.graph, &q.fees).is_err());
+
+        for (funded, error) in [
+            (vec![output(8)], "worth 8"),
+            (vec![output(8), output(4), output(1)], "worth 13"),
+            (vec![output(12)], "keyset"),
+            (vec![], "1 to"),
+            ((0..33).map(|_| output(1)).collect(), "1 to"),
+        ] {
+            let other = wire::Open {
+                funded,
+                ..open.clone()
+            };
+            let e = offer(&q, id, &other, [11; 32], &checkpoint, hub.clone()).unwrap_err();
+            assert!(e.to_string().contains(error), "{e}");
+        }
+        let unbound = wire::Open {
+            request_keys: None,
+            ..open.clone()
+        };
+        assert!(offer(&q, id, &unbound, [11; 32], &checkpoint, hub.clone()).is_err());
+        // Outputs of a quote she funds none of open nothing.
+        q.graph.deposit_units = 0;
+        let e = offer(&q, id, &open, [11; 32], &checkpoint, hub).unwrap_err();
+        assert!(e.to_string().contains("unfunded"), "{e}");
     }
 
     #[test]
@@ -1546,6 +1692,7 @@ mod tests {
             },
             mock: true,
             request_keys: None,
+            funded: vec![],
         };
         let graph =
             graph::build(&base, &keys.public(), &hub.public(), graph::draft_hmsg(2)).unwrap();
@@ -1631,6 +1778,7 @@ mod tests {
                 change: coin.script_pubkey.clone(),
                 payout: wallet_script(5),
                 wanted,
+                funded: vec![],
             },
             id,
             &ctx,
@@ -1649,6 +1797,7 @@ mod tests {
             .body;
         let unbound = wire::Open {
             request_keys: None,
+            funded: vec![],
             ..wire::Open::decode(&open).unwrap()
         };
         let mut fresh = Hub::with(&[2; 32], q, Some(bounds));

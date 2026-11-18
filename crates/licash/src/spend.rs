@@ -13,7 +13,7 @@ use crate::{
 };
 
 const TAG: &[u8] = b"LICASH-SP\x02";
-const OUTPUT_BYTES: usize = 8 + 33 + 32;
+pub const OUTPUT_BYTES: usize = 8 + 33 + 32;
 pub const TIMED_TERMS_BYTES: usize = 1 + 32 + 4 + 4 + 32;
 
 fn bad(reason: &str) -> Error {
@@ -271,6 +271,20 @@ impl Output {
         bytes.extend(self.unlink_commitment);
     }
 
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(OUTPUT_BYTES);
+        self.encode(&mut bytes);
+        bytes
+    }
+
+    /// Exactly [`OUTPUT_BYTES`] of [`Output::to_bytes`].
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
+        if bytes.len() != OUTPUT_BYTES {
+            return Err(bad("output length"));
+        }
+        Self::decode(&mut Reader(bytes))
+    }
+
     fn decode(reader: &mut Reader<'_>) -> Result<Self, Error> {
         Self::new(
             u64::from_be_bytes(reader.array()?),
@@ -526,6 +540,15 @@ fn count<T>(items: &[T]) -> Result<u32, Error> {
         return Err(bad("empty proposal vector"));
     }
     u32::try_from(items.len()).map_err(|_| bad("proposal count overflow"))
+}
+
+/// The commitment a v5 Base makes to the outputs its holder funds, in
+/// order ([`crate::base::Version::V5`]): refused if there are none.
+pub fn funded_root(outputs: &[Output]) -> Result<[u8; 32], Error> {
+    count(outputs)?;
+    let mut bytes = Vec::new();
+    encode_outputs(outputs, &mut bytes);
+    Ok(tagged_hash("licash/funded-outputs/v1", &[&bytes]))
 }
 
 fn encode_outputs(outputs: &[Output], bytes: &mut Vec<u8>) {

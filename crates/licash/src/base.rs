@@ -19,6 +19,7 @@ use crate::{
 /// The tags of the Base's versions: each names its own statement rules.
 const BASE_TAG_V3: &[u8] = b"LICASH-BASE\x03";
 const BASE_TAG_V4: &[u8] = b"LICASH-BASE\x04";
+const BASE_TAG_V5: &[u8] = b"LICASH-BASE\x05";
 pub const MAX_BASE_BYTES: usize = 128_000;
 const MAX_MONEY: u64 = 2_100_000_000_000_000;
 /// The one graph a Base can name: Lichen's hub-proves graph.
@@ -156,6 +157,39 @@ pub enum Version {
     /// its lock checkpoint, and a pending Pay counts only with an
     /// activation.
     V4 { holder_wots: [u8; 32] },
+    /// As v4, and the holder funds part of the contract herself: her
+    /// `deposit_units` of it, owed to her as notes the Hub issues for her
+    /// blinded outputs, whose ordered list `funded` commits to
+    /// ([`crate::spend::funded_root`]). She may claim those of them it
+    /// never issued her ([`crate::claim::Item::Funded`]).
+    V5 {
+        holder_wots: [u8; 32],
+        funded: [u8; 32],
+    },
+}
+
+impl Version {
+    /// Her request's one-time keys, bound from v4 on.
+    pub fn holder_wots(&self) -> Option<[u8; 32]> {
+        match *self {
+            Self::V3 => None,
+            Self::V4 { holder_wots } | Self::V5 { holder_wots, .. } => Some(holder_wots),
+        }
+    }
+
+    /// The commitment to her funded outputs, of v5.
+    pub fn funded(&self) -> Option<[u8; 32]> {
+        match *self {
+            Self::V5 { funded, .. } => Some(funded),
+            _ => None,
+        }
+    }
+
+    /// Whether v4's rules hold: a lock anchored to its own checkpoint, a
+    /// Pay owed only with an activation. Of v4 and v5.
+    pub fn anchored(&self) -> bool {
+        !matches!(self, Self::V3)
+    }
 }
 
 #[derive(Clone)]
@@ -223,11 +257,15 @@ impl Base {
         ) {
             k256::schnorr::VerifyingKey::from_bytes(key).map_err(|_| Error::InvalidPoint)?;
         }
+        let funded_bad = match p.version.funded() {
+            Some(root) => {
+                root == [0; 32] || p.graph.deposit_units == 0 || p.graph.deposit_units > p.cap
+            }
+            None => false,
+        };
         if p.nonce == [0; 32]
-            || p.version
-                == (Version::V4 {
-                    holder_wots: [0; 32],
-                })
+            || p.version.holder_wots() == Some([0; 32])
+            || funded_bad
             || p.deposit[..32] == [0; 32]
             || p.parties[0].payment == p.parties[1].payment
             || p.cap == 0
@@ -317,6 +355,7 @@ impl Base {
         let mut bytes = match p.version {
             Version::V3 => BASE_TAG_V3,
             Version::V4 { .. } => BASE_TAG_V4,
+            Version::V5 { .. } => BASE_TAG_V5,
         }
         .to_vec();
         bytes.extend(p.nonce);
@@ -377,8 +416,11 @@ impl Base {
         for value in [p.fees.max_rate_sat_per_kvb, p.fees.opening_fee_quote] {
             bytes.extend(value.to_be_bytes());
         }
-        if let Version::V4 { holder_wots } = p.version {
+        if let Some(holder_wots) = p.version.holder_wots() {
             bytes.extend(holder_wots);
+        }
+        if let Some(funded) = p.version.funded() {
+            bytes.extend(funded);
         }
         bytes
     }
@@ -388,9 +430,10 @@ impl Base {
             return Err(bad("native Base byte limit"));
         }
         let mut reader = Reader(bytes);
-        let v4 = match reader.take(BASE_TAG_V3.len())? {
-            tag if tag == BASE_TAG_V3 => false,
-            tag if tag == BASE_TAG_V4 => true,
+        let tag = match reader.take(BASE_TAG_V3.len())? {
+            tag if tag == BASE_TAG_V3 => 3,
+            tag if tag == BASE_TAG_V4 => 4,
+            tag if tag == BASE_TAG_V5 => 5,
             _ => return Err(bad("native Base tag")),
         };
         let nonce = reader.array()?;
@@ -452,12 +495,15 @@ impl Base {
             max_rate_sat_per_kvb: reader.u64()?,
             opening_fee_quote: reader.u64()?,
         };
-        let version = if v4 {
-            Version::V4 {
+        let version = match tag {
+            3 => Version::V3,
+            4 => Version::V4 {
                 holder_wots: reader.array()?,
-            }
-        } else {
-            Version::V3
+            },
+            _ => Version::V5 {
+                holder_wots: reader.array()?,
+                funded: reader.array()?,
+            },
         };
         if !reader.0.is_empty() {
             return Err(bad("trailing native Base bytes"));
@@ -482,6 +528,7 @@ impl Base {
         let domain = match self.0.version {
             Version::V3 => "licash/base/v3",
             Version::V4 { .. } => "licash/base/v4",
+            Version::V5 { .. } => "licash/base/v5",
         };
         crypto::tagged_hash(domain, &[&self.to_bytes()])
     }
