@@ -328,7 +328,8 @@ fn signed_request(seed: u8, e: &Hash, b: u32) -> (RequestKeys, Vec<Vec<u8>>) {
 
 /// The inputs r0/host measures the guest on (`licash-r0 hp-exec`),
 /// written to `LICASH_HP_INPUTS` if set: the 32-item claim the Hub
-/// answers with a 16-note spend, and the same claim unanswered.
+/// answers with a 16-note spend, the same claim unanswered, and the
+/// answered one under a v4 Base, her request's signatures checked.
 #[test]
 fn export_inputs() {
     let Ok(dir) = std::env::var("LICASH_HP_INPUTS") else {
@@ -338,7 +339,25 @@ fn export_inputs() {
     println!("filing: {} bytes", f.bytes.len());
     let answered = input(&f.base, exit(&f.base, f.b, &f.e, &f.bytes, 64), vec![spent]);
     let unanswered = input(&f.base, exit(&f.base, f.b, &f.e, &f.bytes, 127), vec![]);
-    for (name, i) in [("answered", answered), ("unanswered", unanswered)] {
+    let (keys, _) = signed_request(3, &[0; 32], 0);
+    let (f, spent) = stale_under(Version::V4 {
+        holder_wots: keys.digest(),
+    });
+    let (_, witness) = signed_request(3, &f.e, f.b);
+    let signed = HubInput {
+        keys: Some(keys),
+        ..input(
+            &f.base,
+            signed_exit(&f.base, &witness, &f.bytes, 64),
+            vec![spent],
+        )
+    };
+    let inputs = [
+        ("answered", answered),
+        ("unanswered", unanswered),
+        ("answered-v4", signed),
+    ];
+    for (name, i) in inputs {
         let bytes = i.to_bytes();
         println!("{name}: {} input bytes, {:?}", bytes.len(), check(&i).err());
         std::fs::write(format!("{dir}/{name}.bin"), bytes).unwrap();
