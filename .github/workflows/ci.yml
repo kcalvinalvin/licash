@@ -36,7 +36,6 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - uses: ./.github/actions/vendor
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -44,7 +43,7 @@ jobs:
         with:
           workspaces: apps
       # Its members only: --all would follow path dependencies into
-      # regtest's workspace and the vendored Lichen.
+      # regtest's workspace.
       - working-directory: apps
         run: cargo fmt $(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | "-p " + .name') -- --check
       - working-directory: apps
@@ -74,7 +73,6 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - uses: ./.github/actions/vendor
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -97,7 +95,6 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - uses: ./.github/actions/vendor
       - run: docker build -f apps/hub/Dockerfile .
   chain:
     runs-on: ubuntu-latest
@@ -133,7 +130,6 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - uses: ./.github/actions/vendor
       - uses: gradle/actions/wrapper-validation@v6
       - uses: actions/setup-java@v6
         with:
@@ -181,7 +177,6 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - uses: ./.github/actions/vendor
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -201,7 +196,6 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - uses: ./.github/actions/vendor
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -244,13 +238,6 @@ jobs:
         with:
           path: licash
           persist-credentials: false
-      - uses: actions/checkout@v7
-        with:
-          repository: lichenbtc-org/lichen
-          ref: 5cd7efc768270ccf42eb9f5a8ee3f1158b12555c
-          path: lichen
-          persist-credentials: false
-      - run: licash/vendor/fetch.sh
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -308,7 +295,6 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - uses: ./.github/actions/vendor
       # For the runtime stage's few commands only: the binaries are
       # cross-compiled.
       - if: matrix.platform == 'linux/arm/v7'
