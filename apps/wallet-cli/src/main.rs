@@ -455,6 +455,23 @@ enum Command {
         #[arg(long, env = "LICASH_WALLET_CHAIN")]
         chain: Option<String>,
     },
+    /// What a contract at HUB costs, itemized, before opening it: the
+    /// hub's opening fee, its interest by the year on the part it funds
+    /// and on yours, your reserve and your part, and the sizes and
+    /// durations it lets holders choose.
+    ContractTerms {
+        hub: String,
+        /// Blocks from now to its close [default: the hub's fixed terms].
+        #[arg(long)]
+        blocks: Option<u32>,
+        /// The notes it protects, in sat, one of the hub's sizes [default:
+        /// the hub's fixed terms].
+        #[arg(long)]
+        cap: Option<u32>,
+        /// Sat of it to fund yourself [default: none].
+        #[arg(long, default_value_t = 0)]
+        funded: u32,
+    },
     /// What the hub at URL charges now, asked again, beside what the
     /// wallet agreed to pay it at most: its fees as the wallet's contracts
     /// there opened. A hub charging more is paid nothing, and its notes
@@ -1214,6 +1231,12 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             };
             return contract::open(&wallet, &path, chain.as_deref(), &hub, ask, json).await;
         }
+        Command::ContractTerms {
+            hub,
+            blocks,
+            cap,
+            funded,
+        } => return contract::terms(&wallet, &hub, (cap, blocks), funded, json),
         Command::Contracts { chain } => {
             return contract::list(&wallet, &path, chain.as_deref(), json).await;
         }

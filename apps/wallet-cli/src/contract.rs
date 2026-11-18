@@ -135,11 +135,8 @@ pub async fn open(
         .contracts
         .with_context(|| format!("{hub} opens no contracts"))?;
     let blocks = asked.blocks.unwrap_or(offered.blocks);
-    let price = match (asked.cap, offered.range) {
-        (Some(cap), Some(range)) => range.price(cap, blocks, asked.funded),
-        (Some(_), None) => anyhow::bail!("{hub} offers no contracts of other caps"),
-        (None, _) => offered.price,
-    };
+    let terms = Terms::of(hub, &offered, asked.cap, Some(blocks), asked.funded)?;
+    let price = terms.price;
     let ask = Ask {
         blocks,
         max_price: asked.max_price.unwrap_or(price),
@@ -152,8 +149,214 @@ pub async fn open(
         true => holder::open_anyway(wallet, &chain, dir, hub, ask).await,
         false => holder::open_with(wallet, &chain, dir, hub, ask).await,
     }?;
-    show(json, contract_json(&contract), contract_line(&contract));
+    let mut value = contract_json(&contract);
+    value["terms"] = terms.json();
+    let line = format!("{}\n{}", terms.lines(), contract_line(&contract));
+    show(json, value, line);
     Ok(())
+}
+
+/// What a contract at `hub` costs, itemized, before it is opened: `cap`
+/// sat over `blocks` [default: the hub's fixed terms], `funded` of it hers,
+/// and the sizes it lets holders choose.
+pub fn terms(
+    wallet: &Wallet<Http>,
+    hub: &str,
+    chosen: (Option<u32>, Option<u32>),
+    funded: u32,
+    json: bool,
+) -> anyhow::Result<()> {
+    let hub = hub.trim_end_matches('/');
+    let hubs = wallet.hubs()?;
+    let (_, info) = hubs
+        .iter()
+        .find(|(url, _)| url == hub)
+        .with_context(|| format!("{hub} is no hub this wallet trusts: add-hub first"))?;
+    let offered = info
+        .contracts
+        .with_context(|| format!("{hub} opens no contracts"))?;
+    let (cap, blocks) = chosen;
+    let terms = Terms::of(hub, &offered, cap, blocks, funded)?;
+    let mut value = terms.json();
+    let mut lines = terms.lines();
+    if let Some(range) = offered.range {
+        let sizes = range.sizes();
+        value["sizes"] = json!(sizes);
+        value["min_blocks"] = json!(range.min_blocks);
+        value["max_blocks"] = json!(range.max_blocks);
+        value["per_coin"] = json!(range.per_coin);
+        let sizes: Vec<_> = sizes
+            .iter()
+            .map(|&s| crate::say::grouped(s.into()))
+            .collect();
+        lines.push_str(&format!(
+            "\nsizes        {} sat, at most {} times the coin paying it\nblocks       {} to {}",
+            sizes.join(", "),
+            range.per_coin,
+            crate::say::grouped(range.min_blocks.into()),
+            crate::say::grouped(range.max_blocks.into()),
+        ));
+    }
+    show(json, value, lines);
+    Ok(())
+}
+
+/// A contract's terms and what opening it costs, itemized: the hub's
+/// opening fee, its interest by the year on the part it funds and on
+/// hers, her reserve (returned as it closes) and her part (issued back to
+/// her as notes). Of a hub offering fixed terms only, its fee in one.
+struct Terms {
+    cap: u32,
+    blocks: u32,
+    funded: u32,
+    reserve: u64,
+    price: u64,
+    /// The fee itemized, of a hub that lets holders choose.
+    fee: Option<(licash_api::ContractRange, licash_api::ContractFee)>,
+}
+
+impl Terms {
+    fn of(
+        hub: &str,
+        offered: &licash_api::Contracts,
+        cap: Option<u32>,
+        blocks: Option<u32>,
+        funded: u32,
+    ) -> anyhow::Result<Self> {
+        // Its fixed terms are priced over its blocks, whatever the close
+        // she wants.
+        let blocks = match cap {
+            Some(_) => blocks.unwrap_or(offered.blocks),
+            None => offered.blocks,
+        };
+        let Some(range) = offered.range else {
+            anyhow::ensure!(
+                cap.is_none() && funded == 0,
+                "{hub} offers no contracts but of {} sat, none co-funded",
+                crate::say::grouped(offered.cap.into()),
+            );
+            return Ok(Self {
+                cap: offered.cap,
+                blocks,
+                funded: 0,
+                reserve: offered.reserve,
+                price: offered.price,
+                fee: None,
+            });
+        };
+        let cap = cap.unwrap_or(offered.cap);
+        let sizes = range.sizes();
+        anyhow::ensure!(
+            sizes.contains(&cap),
+            "{hub} offers no contracts of {} sat: choose one of {} sat",
+            crate::say::grouped(cap.into()),
+            (sizes.iter().map(|&s| crate::say::grouped(s.into())))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        anyhow::ensure!(
+            funded <= cap,
+            "{} sat funded is more than the contract's {}",
+            crate::say::grouped(funded.into()),
+            crate::say::sat(cap.into())
+        );
+        Ok(Self {
+            cap,
+            blocks,
+            funded,
+            reserve: range.reserve,
+            price: range.price(cap, blocks, funded),
+            fee: Some((range, range.fee(cap, blocks, funded))),
+        })
+    }
+
+    fn json(&self) -> serde_json::Value {
+        let mut value = json!({
+            "cap": self.cap,
+            "blocks": self.blocks,
+            "funded": self.funded,
+            "reserve": self.reserve,
+            "fee": self.price - self.reserve,
+            "price": self.price,
+            "pays": self.price + u64::from(self.funded),
+        });
+        if let Some((range, fee)) = self.fee {
+            value["opening_fee"] = json!(fee.opening);
+            value["ppm_year"] = json!(range.ppm_year);
+            value["interest"] = json!(fee.interest);
+            value["ppm_year_funded"] = json!(range.ppm_year_funded);
+            value["interest_funded"] = json!(fee.interest_funded);
+        }
+        value
+    }
+
+    fn lines(&self) -> String {
+        use crate::say::{grouped, percent, sat};
+        let hubs = self.cap - self.funded;
+        let mut lines = vec![
+            format!(
+                "covers       {}{}",
+                sat(self.cap.into()),
+                match self.funded {
+                    0 => String::new(),
+                    f => format!(
+                        ", {} funded by the hub, {} by you",
+                        grouped(hubs.into()),
+                        grouped(f.into())
+                    ),
+                }
+            ),
+            format!(
+                "over         {} blocks (about {} days)",
+                grouped(self.blocks.into()),
+                grouped(u64::from(self.blocks).div_ceil(144))
+            ),
+        ];
+        let fee = self.price - self.reserve;
+        match self.fee {
+            Some((range, f)) => {
+                lines.push(format!("opening fee  {}", sat(f.opening)));
+                lines.push(format!(
+                    "interest     {}, {} a year on the hub's {}",
+                    sat(f.interest),
+                    percent(range.ppm_year.into()),
+                    grouped(hubs.into())
+                ));
+                if self.funded > 0 {
+                    lines.push(format!(
+                        "interest     {}, {} a year on your {}",
+                        sat(f.interest_funded),
+                        percent(range.ppm_year_funded.into()),
+                        grouped(self.funded.into())
+                    ));
+                }
+            }
+            None => lines.push(format!("hub's fee    {}", sat(fee))),
+        }
+        lines.push(format!(
+            "reserve      {}, returned as it closes",
+            sat(self.reserve)
+        ));
+        lines.push(format!(
+            "price        {}: fee {}{}",
+            sat(self.price),
+            sat(fee),
+            crate::say::share(fee, self.cap.into())
+                .map(|s| format!(" ({s} of what it covers)"))
+                .unwrap_or_default()
+        ));
+        if self.funded > 0 {
+            lines.push(format!(
+                "your part    {}, issued back to you as notes once its funding is buried",
+                sat(self.funded.into())
+            ));
+            lines.push(format!(
+                "paid         {} from your coin, and the transaction's fee",
+                sat(self.price + u64::from(self.funded))
+            ));
+        }
+        lines.join("\n")
+    }
 }
 
 /// The wallet's contracts, those under way carried on and their F watched.
@@ -538,4 +741,91 @@ fn recovery_json(r: &Recovery) -> serde_json::Value {
         "payout": txid(r.payout),
         "paid_at": r.paid_at,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn offered(range: Option<licash_api::ContractRange>) -> licash_api::Contracts {
+        licash_api::Contracts {
+            cap: 131_071,
+            price: 23_002,
+            reserve: 20_000,
+            blocks: 1_000,
+            mock: true,
+            range,
+        }
+    }
+
+    fn range() -> licash_api::ContractRange {
+        licash_api::ContractRange {
+            min_cap: 131_071,
+            max_cap: 1_048_575,
+            min_blocks: 300,
+            max_blocks: 52_560,
+            per_coin: 4,
+            reserve: 20_000,
+            fee: 3_000,
+            ppm_year: 20_000,
+            ppm_year_funded: 5_000,
+        }
+    }
+
+    #[test]
+    fn a_co_funded_contract_is_itemized_its_interest_on_each_part() {
+        let t = Terms::of(
+            "hub",
+            &offered(Some(range())),
+            Some(262_143),
+            Some(52_560),
+            62_143,
+        )
+        .unwrap();
+        // 2% of the hub's 200 000 and 0.5% of her 62 143, over a year.
+        let value = t.json();
+        assert_eq!(value["opening_fee"], 3_000);
+        assert_eq!(value["interest"], 4_000);
+        assert_eq!(value["interest_funded"], 310);
+        assert_eq!(value["fee"], 7_310);
+        assert_eq!(value["price"], 27_310);
+        assert_eq!(value["pays"], 27_310 + 62_143);
+        let lines = t.lines();
+        for said in [
+            "covers       262,143 sat, 200,000 funded by the hub, 62,143 by you",
+            "opening fee  3,000 sat",
+            "interest     4,000 sat, 2% a year on the hub's 200,000",
+            "interest     310 sat, 0.5% a year on your 62,143",
+            "reserve      20,000 sat, returned as it closes",
+            "price        27,310 sat: fee 7,310 sat",
+            "your part    62,143 sat",
+            "paid         89,453 sat from your coin",
+        ] {
+            assert!(lines.contains(said), "{said} not in\n{lines}");
+        }
+    }
+
+    #[test]
+    fn fixed_terms_are_priced_over_the_hubs_blocks_and_only_sizes_are_chosen() {
+        let fixed = Terms::of("hub", &offered(Some(range())), None, Some(300), 0).unwrap();
+        assert_eq!((fixed.cap, fixed.blocks), (131_071, 1_000));
+        assert_eq!(fixed.price, range().price(131_071, 1_000, 0));
+        let odd = Terms::of("hub", &offered(Some(range())), Some(200_000), Some(300), 0);
+        let odd = format!("{:#}", odd.err().unwrap());
+        assert!(
+            odd.contains("131,071, 262,143, 524,287, 1,048,575 sat"),
+            "{odd}"
+        );
+        let over = Terms::of("hub", &offered(Some(range())), Some(131_071), None, 131_072);
+        assert!(over.is_err());
+        // A hub of fixed terms only: its fee in one.
+        let only = Terms::of("hub", &offered(None), None, None, 0).unwrap();
+        assert!(
+            only.lines().contains("hub's fee    3,002 sat"),
+            "{}",
+            only.lines()
+        );
+        assert!(Terms::of("hub", &offered(None), None, None, 1).is_err());
+        assert!(Terms::of("hub", &offered(None), Some(131_071), Some(9), 0).is_err());
+    }
 }
