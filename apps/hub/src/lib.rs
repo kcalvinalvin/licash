@@ -51,7 +51,18 @@ pub const IMMUTABLE_DEPTH: u32 = 144;
 /// Bitcoin.
 pub fn answer_from(openings: &licash_contracts::hub::Openings, hub: Arc<Hub>) {
     let ledger = hub.clone();
-    openings.evidence_with(Arc::new(move |claim| Ok(ledger.evidence(claim)?)));
+    openings.evidence_with(Arc::new(move |claim, published_at| {
+        // Its evidence is pinned once given: none before the ledger saw
+        // what the statement judges the claim on. A ledger following no
+        // chain admitted no lock, so a scan would find it nothing.
+        if let Some((top, _)) = ledger.scanned()? {
+            anyhow::ensure!(
+                top >= published_at,
+                "the ledger has scanned to {top}, not yet the claim's block {published_at}"
+            );
+        }
+        Ok(ledger.evidence(claim)?)
+    }));
     openings.claims_with(Arc::new(move |contract, publication| {
         Ok(hub.retire_claimed(contract, publication)?)
     }));

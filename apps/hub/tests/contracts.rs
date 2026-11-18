@@ -1546,6 +1546,8 @@ async fn a_holder_recovers_her_cap_of_notes_beyond_it_from_a_hub_that_answered()
 struct Stale {
     rt: Regtest,
     _dir: tempfile::TempDir,
+    hub: Arc<Hub>,
+    source: Source,
     openings: Arc<Openings>,
     chain: Node,
     wallet: Wallet<Http>,
@@ -1554,6 +1556,12 @@ struct Stale {
 }
 
 async fn stale_claim(seed: [u8; 32]) -> Result<Stale> {
+    stale_claim_scanned(seed, false).await
+}
+
+/// As [`stale_claim`], its hub's ledger scanned, if `scanned`, to before
+/// her request.
+async fn stale_claim_scanned(seed: [u8; 32], scanned: bool) -> Result<Stale> {
     use licash_contracts::holder::recovery;
 
     let rt = Regtest::start_standard()?;
@@ -1566,7 +1574,7 @@ async fn stale_claim(seed: [u8; 32]) -> Result<Stale> {
         ppm_year: 10_000,
     };
     let (url, source, hub, openings) = hub_answering_with(&rt, &at, Some(range)).await?;
-    let chain = Node(source);
+    let chain = Node(source.clone());
     let (mine, wallet) =
         holder_wallet(&rt, &chain, dir.path(), &url, seed, &[60_000, 50_000]).await?;
     let chosen = Ask {
@@ -1597,6 +1605,9 @@ async fn stale_claim(seed: [u8; 32]) -> Result<Stale> {
     // Restored, the copy claims the note paid away too.
     let wallet = Wallet::open(&stale.join("wallet.sqlite"), Http::new(None)?)?;
     let mine = stale;
+    if scanned {
+        while !watch::step(&hub, &source).await? {}
+    }
     let forced = recovery::force_close(&wallet, &chain, &mine, &opened.id, rate).await?;
     ensure!((forced.claimed, forced.notes) == (5_000, 3), "{forced:?}");
     rt.mine_to_height(forced.next_at.context("no lock")? - 1)?;
@@ -1605,6 +1616,8 @@ async fn stale_claim(seed: [u8; 32]) -> Result<Stale> {
     Ok(Stale {
         rt,
         _dir: dir,
+        hub,
+        source,
         openings,
         chain,
         wallet,
@@ -1666,6 +1679,35 @@ async fn a_hub_meets_a_stale_claim_with_the_spend_it_released_and_pays_what_is_l
     ensure!(done.payout.is_some() && done.timeout.is_none(), "{done:?}");
     let received = done.received.context("nothing received")?;
     eprintln!("a stale claim of 5000 paid {corrected}, {received} swept to her wallet");
+    Ok(())
+}
+
+/// A hub whose ledger follows the chain answers a claim only once it has
+/// scanned the claim's block: its evidence is pinned once given, and an
+/// activation up to that block could void her refund.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs bitcoind and a release build"]
+async fn a_hub_answers_a_claim_only_once_its_ledger_scanned_the_claims_block() -> Result<()> {
+    use licash_contracts::holder::recovery;
+
+    // Scanned to before her request: then no further.
+    let s = stale_claim_scanned([13; 32], true).await?;
+    let mut refused = false;
+    for _ in 0..40 {
+        s.rt.mine(1)?;
+        let round = s.openings.answer_requests().await?;
+        let r = recovery::advance(&s.wallet, &s.chain, &s.mine, s.rate).await?[0].clone();
+        ensure!(r.response.is_none(), "answered unscanned: {r:?}");
+        if round.failed > 0 {
+            refused = true;
+            break;
+        }
+    }
+    ensure!(refused, "the hub never came to her claim");
+    // Scanned to her block: answered as ever.
+    while !watch::step(&s.hub, &s.source).await? {}
+    let done = played(&s, |_| true).await?;
+    ensure!(done.corrected == Some(4_096), "{done:?}");
     Ok(())
 }
 

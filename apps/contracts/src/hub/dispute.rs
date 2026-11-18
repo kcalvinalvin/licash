@@ -50,10 +50,12 @@ use super::{responses::Responses, Openings, Refused};
 use crate::holder::node::Node;
 use crate::FoldOffer;
 
-/// What the hub's ledger holds against a claim: candidates, of which the
-/// responder cites those the statement accepts. None known is no error:
-/// the claim is then owed what its notes are worth.
-pub type Evidencer = dyn Fn(&UnsignedClaim) -> Result<Vec<Evidence>> + Send + Sync;
+/// What the hub's ledger holds against a claim published in the block at
+/// a height: candidates, of which the responder cites those the statement
+/// accepts. None known is no error: the claim is then owed what its notes
+/// are worth. An error if the ledger hasn't seen that block yet: an
+/// activation in it, or before, gives a preimage that voids her refund.
+pub type Evidencer = dyn Fn(&UnsignedClaim, u32) -> Result<Vec<Evidence>> + Send + Sync;
 
 /// The hub ledger's lock checkpoints, as new contracts open on them
 /// ([`Openings::checkpoints_with`]).
@@ -518,7 +520,7 @@ impl Openings {
         let pins = Responses::open(&self.data)?;
         let evidence = match pins.evidence(id)? {
             Some(pinned) => pinned_evidence(o, &pinned)?,
-            None => self.select(o, &filed, owed)?,
+            None => self.select(o, &filed, p_at, owed)?,
         };
         let mut decided = owed(&evidence)?;
         if decided.owed >= b {
@@ -602,6 +604,7 @@ impl Openings {
         &self,
         o: &HubOpening,
         filed: &[u8],
+        published_at: u32,
         owed: impl Fn(&[Evidence]) -> Result<recovery::Owed>,
     ) -> Result<Vec<Evidence>> {
         let Some(ledger) = self.evidencer.get() else {
@@ -615,7 +618,7 @@ impl Openings {
         let filing = Filing::from_bytes(&p.keyset, p.limits.max_authorizations as usize, filed)
             .map_err(|e| anyhow!("{e}"))?;
         let mut kept = Vec::new();
-        for candidate in ledger(filing.publication().claim())? {
+        for candidate in ledger(filing.publication().claim(), published_at)? {
             kept.push(candidate);
             if owed(&kept).is_err() {
                 kept.pop();
