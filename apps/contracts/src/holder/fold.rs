@@ -58,8 +58,8 @@ pub async fn close<T: Transport, C: Chain>(
     // As the chain says now, not as last seen: buried since, say.
     let mut fate = contract.fate;
     if fate != Some(Fate::Live) {
-        if let Some(now) = super::chain::fate(&holder, chain, since).await? {
-            store.set_fate(id, now)?;
+        if let Some((now, block)) = super::chain::fate(&holder, chain, since).await? {
+            store.settle_fate(id, now, block)?;
             fate = Some(now);
         }
     }

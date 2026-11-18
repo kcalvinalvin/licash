@@ -5,7 +5,7 @@ use std::future::Future;
 
 use anyhow::{anyhow, Result};
 use bitcoin::block::Header;
-use bitcoin::{Amount, Block, FeeRate, OutPoint, Transaction, Txid};
+use bitcoin::{Amount, Block, BlockHash, FeeRate, OutPoint, Transaction, Txid};
 use licash::chain::Checkpoint;
 use licash_contract::opening::{Fate, Holder};
 use licash_wallet::Blocks;
@@ -91,14 +91,22 @@ pub fn fee_rate_of(block: &Block, height: u32) -> Option<FeeRate> {
 }
 
 /// Where `holder`'s F stands on `chain`, its inputs looked up in the
-/// blocks from `since` to the tip: none before she knows F.
-pub async fn fate(holder: &Holder, chain: &impl Chain, since: u32) -> Result<Option<Fate>> {
+/// blocks from `since` to the tip: none before she knows F. Once live,
+/// with the block F is in, its height and hash: while the chain keeps
+/// that block, F stays buried.
+pub async fn fate(
+    holder: &Holder,
+    chain: &impl Chain,
+    since: u32,
+) -> Result<Option<(Fate, Option<(u32, BlockHash)>)>> {
     let Some(funding) = holder.funding() else {
         return Ok(None);
     };
+    let txid = funding.tx.compute_txid();
     let inputs: Vec<OutPoint> = funding.tx.input.iter().map(|i| i.previous_output).collect();
     let tip = chain.height().await.map_err(|e| anyhow!(e))?;
     let mut spent: HashMap<OutPoint, (Txid, u32)> = HashMap::new();
+    let mut found = None;
     for height in since..=tip {
         let hash = chain.hash(height).await.map_err(|e| anyhow!(e))?;
         let block = chain.block(&hash).await.map_err(|e| anyhow!(e))?;
@@ -106,14 +114,20 @@ pub async fn fate(holder: &Holder, chain: &impl Chain, since: u32) -> Result<Opt
             for input in &tx.input {
                 if inputs.contains(&input.previous_output) {
                     let depth = tip - height + 1;
-                    spent.insert(input.previous_output, (tx.compute_txid(), depth));
+                    let by = tx.compute_txid();
+                    if by == txid {
+                        found = Some((height, hash));
+                    }
+                    spent.insert(input.previous_output, (by, depth));
                 }
             }
         }
     }
-    holder
-        .fate(|o| Ok::<_, std::convert::Infallible>(spent.get(&o).copied()))
-        .map_err(|e| match e {})
+    let fate = match holder.fate(|o| Ok::<_, std::convert::Infallible>(spent.get(&o).copied())) {
+        Ok(fate) => fate,
+        Err(e) => match e {},
+    };
+    Ok(fate.map(|fate| (fate, found.filter(|_| fate == Fate::Live))))
 }
 
 #[cfg(test)]

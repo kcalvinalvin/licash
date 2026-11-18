@@ -4,8 +4,8 @@
 //! a list shows of it. Neither is made until a first contract opens.
 //!
 //! The file's version tells which of its tables a build must know to
-//! read it right. The `ceilings`, `claim_terms`, `folds`, `exit_consent`
-//! and `exit_payouts` are none of them: each
+//! read it right. The `ceilings`, `claim_terms`, `folds`, `exit_consent`,
+//! `exit_payouts` and `fate_blocks` are none of them: each
 //! made with the first kept, whatever the version, and ignored by a build
 //! before them, which opens the file all the same. A migration to come
 //! must make them `IF NOT EXISTS` too.
@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, ensure, Context as _, Result};
 use bitcoin::consensus::{deserialize, serialize};
-use bitcoin::{OutPoint, Txid};
+use bitcoin::{BlockHash, OutPoint, Txid};
 use licash_api::Fees;
 use licash_contract::opening::{Fate, Phase};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
@@ -120,6 +120,23 @@ CREATE TABLE IF NOT EXISTS folds (
     created_at INTEGER NOT NULL
 ) STRICT;
 ";
+
+/// The block each contract's F was found buried in, its height and hash,
+/// while not [`BURIED`] deep: once the chain no longer has it there, F's
+/// fate is to be found again. A contract live without one was found so
+/// by a build before it, or is buried: trusted as it stands. Made with the
+/// first.
+const FATE_BLOCKS: &str = "
+CREATE TABLE IF NOT EXISTS fate_blocks (
+    id BLOB PRIMARY KEY REFERENCES contracts (id),
+    height INTEGER NOT NULL,
+    hash BLOB NOT NULL
+) STRICT;
+";
+
+/// How deep F's block is followed, after which no reorganization is
+/// expected to take it out of the chain.
+pub const BURIED: u32 = 6;
 
 /// The instances of each opening its hub answered as had, by the index
 /// of each: not sent again when the opening resumes. Made with the first.
@@ -557,12 +574,70 @@ impl Store {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn set_fate(&self, id: &[u8; 32], fate: Fate) -> Result<()> {
-        self.c.execute(
+        self.settle_fate(id, fate, None)
+    }
+
+    /// F of contract `id` found to be `fate`: if live, in `block`, its
+    /// height and hash, followed until buried ([`FATE_BLOCKS`]).
+    pub fn settle_fate(
+        &self,
+        id: &[u8; 32],
+        fate: Fate,
+        block: Option<(u32, BlockHash)>,
+    ) -> Result<()> {
+        let t = rusqlite::Transaction::new_unchecked(&self.c, TransactionBehavior::Immediate)?;
+        t.execute(
             "UPDATE contracts SET fate = ?2, updated_at = ?3 WHERE id = ?1",
             params![id, fate_text(fate), crate::now()],
         )?;
+        match block.filter(|_| fate == Fate::Live) {
+            Some((height, hash)) => {
+                t.execute_batch(FATE_BLOCKS)?;
+                t.execute(
+                    "INSERT INTO fate_blocks (id, height, hash) VALUES (?1, ?2, ?3)
+                     ON CONFLICT (id) DO UPDATE SET height = ?2, hash = ?3",
+                    params![id, height, bitcoin::hashes::Hash::as_byte_array(&hash)],
+                )?;
+            }
+            None => unfollow(&t, id)?,
+        }
+        t.commit()?;
         Ok(())
+    }
+
+    /// The block F of contract `id` was found buried in, its height and
+    /// hash, while followed.
+    pub fn fate_block(&self, id: &[u8; 32]) -> Result<Option<(u32, BlockHash)>> {
+        if !self.has("fate_blocks")? {
+            return Ok(None);
+        }
+        let row: Option<(u32, [u8; 32])> = self
+            .c
+            .query_row(
+                "SELECT height, hash FROM fate_blocks WHERE id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        Ok(row.map(|(height, hash)| {
+            (
+                height,
+                <BlockHash as bitcoin::hashes::Hash>::from_byte_array(hash),
+            )
+        }))
+    }
+
+    /// F of contract `id` buried, its block no longer followed.
+    pub fn buried(&self, id: &[u8; 32]) -> Result<()> {
+        unfollow(&self.c, id)
+    }
+
+    /// The block F of contract `id` was found buried in left the chain:
+    /// its fate open again, to be found anew.
+    pub fn unbury(&self, id: &[u8; 32]) -> Result<()> {
+        self.settle_fate(id, Fate::Open, None)
     }
 
     /// Give up opening `id` short of her signing F, and why: never one
@@ -854,6 +929,21 @@ fn insert(c: &Connection, new: &New<'_>) -> Result<()> {
             now
         ],
     )?;
+    Ok(())
+}
+
+/// The block of contract `id`'s F no longer followed, if it was.
+fn unfollow(c: &Connection, id: &[u8; 32]) -> Result<()> {
+    let made: Option<i64> = c
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'fate_blocks'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if made.is_some() {
+        c.execute("DELETE FROM fate_blocks WHERE id = ?1", [id])?;
+    }
     Ok(())
 }
 

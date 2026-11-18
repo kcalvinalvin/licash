@@ -382,11 +382,22 @@ pub async fn resume<T: Transport, C: Chain>(
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64);
     for contract in store.list()? {
-        let settled = matches!(contract.fate, Some(Fate::Live | Fate::Dead));
-        if contract.over(tip) || settled {
+        let id = contract.id;
+        if contract.over(tip) || contract.fate == Some(Fate::Dead) {
             continue;
         }
-        let id = contract.id;
+        // Live: carried on, F broadcast again and its fate found anew, only
+        // once its block left the chain.
+        if contract.fate == Some(Fate::Live) {
+            match unburied_f(&store, chain, &id, tip).await {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(e) => {
+                    tracing::warn!(id = %crate::hex_id(&id), "following F's block: {e:#}");
+                    continue;
+                }
+            }
+        }
         if unreadable().contains(&id) {
             continue;
         }
@@ -436,6 +447,35 @@ pub async fn resume<T: Transport, C: Chain>(
         tracing::warn!("what her contracts' hubs may charge: {e:#}");
     }
     Ok(all)
+}
+
+/// Whether F of the live contract `id` left the chain, at `tip`, since
+/// found buried: the block it was found in, followed until
+/// [`store::BURIED`] deep, replaced. Its fate is then open again, to be
+/// found anew. One found live by a build before is not followed: trusted
+/// as it stands.
+async fn unburied_f(store: &Store, chain: &impl Chain, id: &[u8; 32], tip: u32) -> Result<bool> {
+    let Some((height, hash)) = store.fate_block(id)? else {
+        return Ok(false);
+    };
+    match chain.hash(height).await {
+        Ok(now) if now == hash => {
+            if tip.saturating_add(1).saturating_sub(height) >= store::BURIED {
+                store.buried(id)?;
+            }
+            Ok(false)
+        }
+        Ok(_) => {
+            tracing::warn!(id = %crate::hex_id(id), height, "F's block left the chain: its fate found again");
+            store.unbury(id)?;
+            Ok(true)
+        }
+        // A chain shorter, or not read: looked at again next time.
+        Err(e) => {
+            tracing::debug!(id = %crate::hex_id(id), "no block at {height}: {e}");
+            Ok(false)
+        }
+    }
 }
 
 /// The contracts in `dir`, the newest first: none if none was ever
@@ -824,10 +864,10 @@ async fn refresh<T: Transport, C: Chain>(driver: &Driver<'_, T, C>, chain: &C) -
         return Ok(());
     }
     let (_, since) = driver.store.state(&driver.id)?;
-    let Some(fate) = chain::fate(holder, chain, since).await? else {
+    let Some((fate, block)) = chain::fate(holder, chain, since).await? else {
         return Ok(());
     };
-    driver.store.set_fate(&driver.id, fate)?;
+    driver.store.settle_fate(&driver.id, fate, block)?;
     if fate == Fate::Dead {
         driver.store.forget(&driver.id)?;
     }
@@ -1235,5 +1275,152 @@ mod tests {
             again.iter().find(|c| c.id == [3; 32]).unwrap().abandoned,
             None
         );
+    }
+
+    /// A chain made up to `tip`, of the fork `fork`, with `f` in the block
+    /// at `at` if given: what is broadcast kept, the hashes asked counted.
+    struct Fork {
+        tip: u32,
+        fork: u32,
+        f: Option<(u32, Transaction)>,
+        asked: std::sync::atomic::AtomicU32,
+        sent: std::sync::Mutex<Vec<Transaction>>,
+    }
+
+    impl Fork {
+        fn new(tip: u32, fork: u32, f: Option<(u32, &Transaction)>) -> Self {
+            Self {
+                tip,
+                fork,
+                f: f.map(|(at, tx)| (at, tx.clone())),
+                asked: Default::default(),
+                sent: Default::default(),
+            }
+        }
+
+        fn at(&self, height: u32) -> Block {
+            let mut header = bitcoin::constants::genesis_block(bitcoin::Network::Regtest).header;
+            (header.nonce, header.time) = (height, self.fork);
+            let txdata = match &self.f {
+                Some((at, tx)) if *at == height => vec![tx.clone()],
+                _ => vec![],
+            };
+            Block { header, txdata }
+        }
+    }
+
+    impl Blocks for Fork {
+        async fn height(&self) -> Result<u32, String> {
+            Ok(self.tip)
+        }
+        async fn hash(&self, height: u32) -> Result<BlockHash, String> {
+            self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            match height <= self.tip {
+                true => Ok(self.at(height).block_hash()),
+                false => Err(format!("no block {height}")),
+            }
+        }
+        async fn filter(&self, _: &BlockHash) -> Result<Option<Vec<u8>>, String> {
+            Ok(None)
+        }
+        async fn block(&self, hash: &BlockHash) -> Result<Block, String> {
+            (0..=self.tip)
+                .map(|h| self.at(h))
+                .find(|b| b.block_hash() == *hash)
+                .ok_or_else(|| format!("no block {hash}"))
+        }
+    }
+
+    impl Chain for Fork {
+        async fn checkpoint(&self, _: u32) -> Result<Checkpoint, String> {
+            Err("not asked".into())
+        }
+        async fn broadcast(&self, tx: &Transaction) -> Result<(), String> {
+            self.sent.lock().unwrap().push(tx.clone());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_live_f_whose_block_leaves_the_chain_is_watched_again_until_buried() {
+        let dir = tempfile::tempdir().unwrap();
+        let regtest = ChainProfile::Core30DefaultRegtest;
+        let path = dir.path().join("wallet.sqlite");
+        let wallet = Wallet::create(&path, &[7; 32], regtest, Nowhere).unwrap();
+        let bytes = &crate::testing::opened().holder;
+        let ctx = licash_contract::opening::Context {
+            tip: 0,
+            trust: crate::trust(regtest).unwrap(),
+        };
+        let holder = Holder::load(bytes, &wallet.contract_secrets().seed, &ctx).unwrap();
+        let f = holder.funding().unwrap().tx.clone();
+        let id = holder.signed().unwrap().base.parts().nonce;
+        let store = Store::open(dir.path()).unwrap();
+        store
+            .insert(&New {
+                id,
+                hub: "http://hub.example",
+                mock: true,
+                deposit: f.input[0].previous_output,
+                value: 60_000,
+                price: 23_000,
+                cap: 4_096,
+                assert_height: 300,
+                close_height: 500,
+                since: 240,
+                state: bytes,
+            })
+            .unwrap();
+        store
+            .save(&id, Phase::Funded, Some(f.compute_txid()), bytes)
+            .unwrap();
+        async fn fate_of(
+            wallet: &Wallet<Nowhere>,
+            chain: &Fork,
+            dir: &Path,
+            id: [u8; 32],
+        ) -> Option<Fate> {
+            let all = resume(wallet, chain, dir).await.unwrap();
+            all.iter().find(|c| c.id == id).unwrap().fate
+        }
+        let fate = |chain| fate_of(&wallet, chain, dir.path(), id);
+
+        // Found live by a build before: trusted, its chain not asked.
+        store.set_fate(&id, Fate::Live).unwrap();
+        let chain = Fork::new(250, 0, Some((247, &f)));
+        assert_eq!(fate(&chain).await, Some(Fate::Live));
+        assert_eq!(chain.asked.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        // Found live in its block: followed while that block stands,
+        // until buried.
+        store.set_fate(&id, Fate::Open).unwrap();
+        assert_eq!(fate(&chain).await, Some(Fate::Live));
+        let block = (247, chain.at(247).block_hash());
+        assert_eq!(store.fate_block(&id).unwrap(), Some(block));
+        // Not carried on: F not broadcast again.
+        chain.sent.lock().unwrap().clear();
+        assert_eq!(fate(&chain).await, Some(Fate::Live));
+        assert_eq!(store.fate_block(&id).unwrap(), Some(block));
+        assert!(chain.sent.lock().unwrap().is_empty());
+
+        // Its block replaced, F in none: open again, and broadcast again.
+        let replaced = Fork::new(250, 1, None);
+        assert_eq!(fate(&replaced).await, Some(Fate::Open));
+        assert_eq!(store.fate_block(&id).unwrap(), None);
+        assert_eq!(*replaced.sent.lock().unwrap(), std::slice::from_ref(&f));
+
+        // Mined again in another block: live, followed there; buried six
+        // deep, no longer.
+        let again = Fork::new(250, 1, Some((249, &f)));
+        assert_eq!(fate(&again).await, Some(Fate::Live));
+        let block = (249, again.at(249).block_hash());
+        assert_eq!(store.fate_block(&id).unwrap(), Some(block));
+        let buried = Fork::new(254, 1, Some((249, &f)));
+        assert_eq!(fate(&buried).await, Some(Fate::Live));
+        assert_eq!(store.fate_block(&id).unwrap(), None);
+        // Then never looked at again.
+        let deep = Fork::new(260, 2, None);
+        assert_eq!(fate(&deep).await, Some(Fate::Live));
+        assert_eq!(deep.asked.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 }
