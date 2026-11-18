@@ -5,7 +5,7 @@
 use k256::Scalar;
 use licash::{
     authorization::{Authorization, PreparedGrant, SignedProposal},
-    base::{Base, ChainTerms, Fees, GraphTerms, Limits, Parts, Party, Recipe},
+    base::{Base, ChainTerms, Fees, GraphTerms, Limits, Parts, Party, Recipe, Version},
     chain::Checkpoint,
     claim::{self, Branch, Item, Source, UnsignedClaim},
     crypto::{self, Point},
@@ -45,6 +45,7 @@ fn base(keyset: Keyset, nonce: u8) -> Base {
     let mut deposit = [31; 36];
     deposit[32..].copy_from_slice(&7u32.to_le_bytes());
     Base::new(Parts {
+        version: Version::V3,
         nonce: [nonce; 32],
         claim_key: point(19).x_only(),
         keyset,

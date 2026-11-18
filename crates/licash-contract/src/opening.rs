@@ -2,7 +2,7 @@
 //! every `Keep` artifact, then state, then sends, signatures, or broadcasts.
 use anyhow::{bail, ensure, Context as _, Result};
 use licash::{
-    base::{Base, ChainTerms, Fees, GraphTerms, Limits, Parts, Recipe},
+    base::{Base, ChainTerms, Fees, GraphTerms, Limits, Parts, Recipe, Version},
     chain::Checkpoint,
     note::Keyset,
     spend::ChainProfile,
@@ -212,6 +212,7 @@ fn offer(
     let mut chain = quote.chain.clone();
     chain.checkpoint = checkpoint.clone();
     Ok(Base::new(Parts {
+        version: Version::V3,
         nonce: id,
         claim_key: open.claim_key.serialize(),
         keyset: quote.keyset.clone(),
@@ -1321,6 +1322,7 @@ pub mod testing {
         let holder = HolderKeys::derive(&[1; 32], id);
         let hub = HubKeys::from_secret(&[2; 32]);
         Base::new(Parts {
+            version: Version::V3,
             nonce: *id,
             claim_key: holder.claim_key().serialize(),
             keyset: licash::note::IssuerKeys::from_seed(&[7; 32], 0, 3)

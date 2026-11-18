@@ -16,7 +16,9 @@ use crate::{
     Error,
 };
 
-const BASE_TAG: &[u8] = b"LICASH-BASE\x03";
+/// The tags of the Base's versions: each names its own statement rules.
+const BASE_TAG_V3: &[u8] = b"LICASH-BASE\x03";
+const BASE_TAG_V4: &[u8] = b"LICASH-BASE\x04";
 pub const MAX_BASE_BYTES: usize = 128_000;
 const MAX_MONEY: u64 = 2_100_000_000_000_000;
 /// The one graph a Base can name: Lichen's hub-proves graph.
@@ -141,8 +143,24 @@ pub struct Fees {
     pub opening_fee_quote: u64,
 }
 
+/// A Base's version, and with it the rules its statement judges by. A
+/// contract keeps its version's rules for its life: v3's for those opened
+/// under it, v4's for every new one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Version {
+    /// The first rules: a claim's chain evidence is judged only up to its
+    /// publication, and her request's keys are not bound.
+    V3,
+    /// Her request's one-time keys are bound (`holder_wots`, the digest of
+    /// her keys on `b` and `E`), a lock's chain evidence is anchored to
+    /// its lock checkpoint, and a pending Pay counts only with an
+    /// activation.
+    V4 { holder_wots: [u8; 32] },
+}
+
 #[derive(Clone)]
 pub struct Parts {
+    pub version: Version,
     pub nonce: [u8; 32],
     /// The holder's key authorizing her claim's publication.
     pub claim_key: [u8; 32],
@@ -206,6 +224,10 @@ impl Base {
             k256::schnorr::VerifyingKey::from_bytes(key).map_err(|_| Error::InvalidPoint)?;
         }
         if p.nonce == [0; 32]
+            || p.version
+                == (Version::V4 {
+                    holder_wots: [0; 32],
+                })
             || p.deposit[..32] == [0; 32]
             || p.parties[0].payment == p.parties[1].payment
             || p.cap == 0
@@ -292,7 +314,11 @@ impl Base {
 
     pub fn to_bytes(&self) -> Vec<u8> {
         let p = &self.0;
-        let mut bytes = BASE_TAG.to_vec();
+        let mut bytes = match p.version {
+            Version::V3 => BASE_TAG_V3,
+            Version::V4 { .. } => BASE_TAG_V4,
+        }
+        .to_vec();
         bytes.extend(p.nonce);
         bytes.extend(p.claim_key);
         put_blob(&mut bytes, &p.keyset.to_bytes());
@@ -351,6 +377,9 @@ impl Base {
         for value in [p.fees.max_rate_sat_per_kvb, p.fees.opening_fee_quote] {
             bytes.extend(value.to_be_bytes());
         }
+        if let Version::V4 { holder_wots } = p.version {
+            bytes.extend(holder_wots);
+        }
         bytes
     }
 
@@ -359,9 +388,11 @@ impl Base {
             return Err(bad("native Base byte limit"));
         }
         let mut reader = Reader(bytes);
-        if reader.take(BASE_TAG.len())? != BASE_TAG {
-            return Err(bad("native Base tag"));
-        }
+        let v4 = match reader.take(BASE_TAG_V3.len())? {
+            tag if tag == BASE_TAG_V3 => false,
+            tag if tag == BASE_TAG_V4 => true,
+            _ => return Err(bad("native Base tag")),
+        };
         let nonce = reader.array()?;
         let claim_key = reader.array()?;
         let keyset = Keyset::from_bytes(reader.blob(4_096)?)?;
@@ -421,10 +452,18 @@ impl Base {
             max_rate_sat_per_kvb: reader.u64()?,
             opening_fee_quote: reader.u64()?,
         };
+        let version = if v4 {
+            Version::V4 {
+                holder_wots: reader.array()?,
+            }
+        } else {
+            Version::V3
+        };
         if !reader.0.is_empty() {
             return Err(bad("trailing native Base bytes"));
         }
         Self::new(Parts {
+            version,
             nonce,
             claim_key,
             keyset,
@@ -440,7 +479,15 @@ impl Base {
     }
 
     pub fn digest(&self) -> [u8; 32] {
-        crypto::tagged_hash("licash/base/v3", &[&self.to_bytes()])
+        let domain = match self.0.version {
+            Version::V3 => "licash/base/v3",
+            Version::V4 { .. } => "licash/base/v4",
+        };
+        crypto::tagged_hash(domain, &[&self.to_bytes()])
+    }
+
+    pub fn version(&self) -> Version {
+        self.0.version
     }
 
     /// What each party checks of agreed terms before it garbles or funds:

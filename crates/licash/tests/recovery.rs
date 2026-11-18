@@ -12,7 +12,7 @@ use bitcoin::{
 use k256::Scalar;
 use licash::{
     authorization::{Authorization, PreparedGrant, SignedProposal},
-    base::{Base, ChainTerms, Fees, GraphTerms, Limits, Parts, Party, Recipe},
+    base::{self, Base, ChainTerms, Fees, GraphTerms, Limits, Parts, Party, Recipe},
     chain::{self, Activation, ActivationRef, Chain, Checkpoint, Inclusion},
     claim::{self, ActivationRecord, Branch, Item, Source, UnsignedClaim},
     crypto::{self, Point},
@@ -51,6 +51,7 @@ fn base(keyset: Keyset) -> Base {
     let mut deposit = [31; 36];
     deposit[32..].copy_from_slice(&7u32.to_le_bytes());
     Base::new(Parts {
+        version: base::Version::V3,
         nonce: [53; 32],
         claim_key: point(19).x_only(),
         keyset,

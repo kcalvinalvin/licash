@@ -1,6 +1,6 @@
 use k256::Scalar;
 use licash::{
-    base::{Base, ChainTerms, Fees, GraphTerms, Limits, Parts, Party, Recipe},
+    base::{Base, ChainTerms, Fees, GraphTerms, Limits, Parts, Party, Recipe, Version},
     chain::Checkpoint,
     crypto::{self, tagged_hash, Point},
     note::IssuerKeys,
@@ -108,6 +108,7 @@ fn parts() -> Parts {
     let mut deposit = [31; 36];
     deposit[32..].copy_from_slice(&7u32.to_le_bytes());
     Parts {
+        version: Version::V3,
         nonce: [53; 32],
         claim_key: point(19).x_only(),
         keyset: IssuerKeys::random(2).unwrap().keyset().unwrap(),
@@ -187,6 +188,47 @@ fn complete_base_roundtrips_with_explicit_keyset_checkpoint_and_fee_preimages() 
     let mut flipped = bytes;
     flipped[0] ^= 1;
     assert!(Base::from_bytes(&flipped).is_err());
+}
+
+/// A v4 Base carries her request keys' digest after the v3 fields, under
+/// its own tag and digest domain; v3's bytes and digest are unchanged.
+#[test]
+fn a_v4_base_binds_her_request_keys_and_keeps_v3_as_it_was() {
+    let mut p = parts();
+    let v3 = Base::new(p.clone()).unwrap();
+    p.version = Version::V4 {
+        holder_wots: [9; 32],
+    };
+    let v4 = Base::new(p.clone()).unwrap();
+    let (old, new) = (v3.to_bytes(), v4.to_bytes());
+    assert!(old.starts_with(b"LICASH-BASE\x03"));
+    assert!(new.starts_with(b"LICASH-BASE\x04"));
+    assert_eq!(new[12..new.len() - 32], old[12..]);
+    assert_eq!(new[new.len() - 32..], [9; 32]);
+    assert_eq!(v4.digest(), tagged_hash("licash/base/v4", &[&new]));
+    assert_eq!(v3.digest(), tagged_hash("licash/base/v3", &[&old]));
+    let restored = Base::from_bytes(&new).unwrap();
+    assert_eq!(restored.version(), p.version);
+    assert_eq!(Base::from_bytes(&old).unwrap().version(), Version::V3);
+    // A v4 Base without its keys, or v3's bytes under v4's tag, is refused.
+    let mut short = new.clone();
+    short.truncate(new.len() - 1);
+    assert!(Base::from_bytes(&short).is_err());
+    let mut retagged = old.clone();
+    retagged[11] = 4;
+    assert!(Base::from_bytes(&retagged).is_err());
+    let mut extended = old;
+    extended.extend([9; 32]);
+    assert!(Base::from_bytes(&extended).is_err());
+    // Each key digest is its own contract.
+    p.version = Version::V4 {
+        holder_wots: [8; 32],
+    };
+    assert_ne!(Base::new(p.clone()).unwrap().digest(), v4.digest());
+    p.version = Version::V4 {
+        holder_wots: [0; 32],
+    };
+    assert!(Base::new(p).is_err());
 }
 
 #[test]
