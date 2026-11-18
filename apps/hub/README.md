@@ -189,9 +189,8 @@ keyset's, or spent), it responds with what is owed, publishes in the
 response's disclose slot what that evidence needs public (a granted spend's
 unlock, a preimage), proves that statement and asserts the proof;
 challenged, it answers with a kept instance. On regtest the proof is the
-mock authority's; on signet the hub runs `licash-r0 hp-prove`
-(`LICASH_HP_PROVER` names another) in the background, its files in
-`<data>/hp-proofs/<id>/`. It sweeps its outputs of each payout to its
+mock authority's; on signet the hub proves with `licash-r0` (r0/README.md,
+`LICASH_HP_PROVER` names another), as described below. It sweeps its outputs of each payout to its
 wallet; a payout's rest and the holder's reserve pay each party's wallet
 directly. A holder may close her contract early: at
 `/v1/contracts/openings/{id}/fold` and `.../fold/sign` the hub signs the
@@ -205,6 +204,40 @@ kept in `openings.sqlite` before use, and a contract ended 6 blocks deep is
 not looked at again. Keep `<data>/responses.sqlite` with `openings.sqlite`:
 it pins the evidence each response is decided on and each one-time
 signature (the response, the assertion) before it is made.
+
+A response commits the hub to a proof: its assertion must confirm within
+the assert window (48 blocks on signet, 2 of them to confirm in), or the
+holder's timeout pays her what she claims, as if it had not responded. So
+the hub proves one statement at a time, earliest deadline first, and
+responds to a claim only if its prover can still make that proof in time
+without making one it committed to late; contested by more holders at once
+than it can prove for, it proves for the largest stakes and lets the others'
+timeouts pay them (a claim is decided on the poll after the one that first
+saw it, all of them known). It plans with its prover's speed, measured at
+startup (`licash-r0 probe`, then `licash-r0 bench` once per device, kept in
+`<data>/hp-proofs/bench.json`: delete it to measure again, as after
+changing the GPU). A prover not ready (none installed, no
+Groth16 setup, under 8.5 GB of memory, a failed benchmark) responds to no
+contested claim. The hub's notifications alert it, a prover that fails, a
+proof the plan would make late, an assertion's deadline 6 blocks away
+unproven, and the claims a round gave no response to. Each proof's work is
+in `<data>/hp-proofs/<id>/`: its input, frozen once it first holds, the
+prover's progress, carried on across restarts, its `prover.log` and
+`proof.json`. The proof is pinned in `responses.sqlite` before the assertion
+is signed.
+
+The image of apps/hub/Dockerfile (x86-64) has the prover: its CPU build,
+its CUDA build, which it proves on when the container has a GPU (`--gpus
+all`, or a Compose `deploy.resources.reservations.devices` entry with the
+NVIDIA runtime; drivers 550 or newer, Turing or newer, 6 GB of memory are
+enough), RISC Zero's Groth16 setup and the programs contracts open under.
+On an RTX 2060 a proof takes about 20 minutes (the Groth16 wrap about 3 of
+them, on the CPU) plus about 7 minutes for each 1,000 headers since the
+contract's checkpoint: one of signet's most, 26,280 headers (half a year),
+about 3.3 hours, so a hub proves only two such in an assert window. On a CPU alone
+a proof takes hours, too slow for signet's window but for the smallest
+contracts. Give it 10 GB of memory or more. ARM images have no
+prover: their hubs respond to no contested claim on signet.
 
 The hub stops, with an error, when one of its loops stops: the chain's
 watch, the tweaks' index, the gateways, the contracts' responder and

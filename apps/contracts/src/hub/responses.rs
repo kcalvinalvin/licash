@@ -77,6 +77,51 @@ impl Responses {
         Ok(row.map(Option::unwrap_or_default))
     }
 
+    /// The answer signed for `id`, if one was.
+    pub fn response(&self, id: &[u8; 32]) -> Result<Option<Transaction>> {
+        let row: Option<Option<Vec<u8>>> = self
+            .0
+            .query_row("SELECT response FROM responses WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        row.flatten()
+            .map(|b| deserialize(&b).context("pinned response"))
+            .transpose()
+    }
+
+    /// The proof `proof` (its bytes) pinned for the assertion `id` of
+    /// `request`, in its evidence, unless one was pinned first or its
+    /// answer was signed before proofs were pinned: what is pinned, none
+    /// then. `request` must be validated before this call.
+    pub fn pin_proof(
+        &self,
+        id: &[u8; 32],
+        request: &Transaction,
+        proof: &[u8],
+    ) -> Result<Option<Vec<u8>>> {
+        self.0.execute(
+            "INSERT INTO responses (id, request) VALUES (?1, ?2) ON CONFLICT DO NOTHING",
+            params![id, serialize(request)],
+        )?;
+        self.0.execute(
+            "UPDATE responses SET evidence = ?2
+             WHERE id = ?1 AND evidence IS NULL AND response IS NULL",
+            params![id, proof],
+        )?;
+        let (pinned, proof): (Vec<u8>, Option<Vec<u8>>) = self.0.query_row(
+            "SELECT request, evidence FROM responses WHERE id = ?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let pinned: Transaction = deserialize(&pinned).context("pinned request")?;
+        ensure!(
+            pinned.compute_wtxid() == request.compute_wtxid(),
+            "request witness differs from the one-time signing pin; refusing to sign again"
+        );
+        Ok(proof)
+    }
+
     /// `request` must be validated before this call. Its witness, not its
     /// txid alone, binds the one-time signatures. No signing in a SQL
     /// transaction: the pin must survive even a stopped signer.
@@ -248,6 +293,35 @@ mod tests {
             pins.answer(&[2; 32], &request(1), || panic!("signed again"))?,
             request(2)
         );
+        Ok(())
+    }
+
+    /// An assertion's proof is pinned once, before it is signed; one signed
+    /// before proofs were pinned (a request alone pinned, then its answer)
+    /// keeps its answer and pins none.
+    #[test]
+    fn a_proof_is_pinned_once_and_not_after_its_answer() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let pins = Responses::open(dir.path())?;
+        assert_eq!(pins.response(&[1; 32])?, None);
+        assert_eq!(
+            pins.pin_proof(&[1; 32], &request(1), b"first")?,
+            Some(b"first".to_vec())
+        );
+        assert_eq!(
+            pins.pin_proof(&[1; 32], &request(1), b"later")?,
+            Some(b"first".to_vec())
+        );
+        assert!(pins.pin_proof(&[1; 32], &request(9), b"first").is_err());
+        assert_eq!(
+            pins.answer(&[1; 32], &request(1), || Ok(request(3)))?,
+            request(3)
+        );
+        assert_eq!(pins.response(&[1; 32])?, Some(request(3)));
+
+        pins.answer(&[2; 32], &request(1), || Ok(request(4)))?;
+        assert_eq!(pins.pin_proof(&[2; 32], &request(1), b"late")?, None);
+        assert_eq!(pins.response(&[2; 32])?, Some(request(4)));
         Ok(())
     }
 }

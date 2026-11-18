@@ -26,7 +26,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use anyhow::{anyhow, bail, ensure, Context as _, Result};
-use bitcoin::{Amount, Block, FeeRate, OutPoint, ScriptBuf, Transaction, TxOut};
+use bitcoin::block::Header;
+use bitcoin::{Amount, Block, BlockHash, FeeRate, OutPoint, ScriptBuf, Transaction, TxOut};
 use licash::claim::UnsignedClaim;
 use licash::disclosure::Disclosures;
 use licash::recovery::{self, Evidence, Filing};
@@ -39,6 +40,7 @@ use licash_wallet::first_spend;
 use lichen_contract::Role;
 use sha2::{Digest, Sha256};
 
+use super::prover::{self, Admission};
 use super::{responses::Responses, Openings, Refused};
 use crate::holder::node::Node;
 use crate::FoldOffer;
@@ -57,12 +59,13 @@ type Loaded = ([u8; 32], Arc<(Hub, HubOpening)>);
 
 /// The caches of the responder: each signed opening as loaded, while its
 /// state is unchanged; each coin's first spend once seen, and how far its
-/// blocks were looked through; the proofs being made; what was noted once.
+/// blocks were looked through; each header by its hash; what was noted
+/// once.
 #[derive(Default)]
 pub(super) struct Watch {
     loaded: Mutex<HashMap<[u8; 32], Loaded>>,
     spends: Mutex<HashMap<OutPoint, (u32, Spend)>>,
-    proving: Arc<Mutex<HashSet<[u8; 32]>>>,
+    headers: Mutex<HashMap<BlockHash, Header>>,
     noted: Mutex<HashSet<([u8; 32], &'static str)>>,
     /// A dishonest hub's, for tests: it asserts proofs of another
     /// statement ([`Openings::assert_false_proofs`]).
@@ -396,6 +399,37 @@ impl Openings {
             );
             return Ok(Played::Idle);
         }
+        // A response commits the hub to a proof in time: none unless its
+        // prover has room for it (once signed, it is posted again whatever).
+        let prover = self.prover.as_ref().filter(|_| !o.mock);
+        let responded = pins.response(id)?.is_some();
+        // At the earliest, its response confirms in the next block.
+        let job = |evidence: &[Evidence]| {
+            let x_at = tip.saturating_add(1);
+            let release = x_at.saturating_add(o.base.parts().chain.work_depth);
+            let bytes = recovery::evidence_to_bytes(evidence).len();
+            (
+                assert_deadline(o, x_at),
+                release,
+                estimated_cycles(o, bytes, release),
+            )
+        };
+        if let Some(prover) = prover.filter(|_| !responded) {
+            let (deadline, release, cycles) = job(&evidence);
+            // In sats: what responding saves the hub.
+            let unit = o.base.parts().graph.unit_sats;
+            let stake = u64::from(b.saturating_sub(decided.owed)) * unit;
+            match prover.admit(id, stake, cycles, deadline, release, tip) {
+                Admission::Admit => {}
+                Admission::Wait => return Ok(Played::Idle),
+                Admission::Withhold(why) => {
+                    if self.once(id, "withheld") {
+                        self.withheld(id, b, decided.owed, &why);
+                    }
+                    return Ok(Played::Idle);
+                }
+            }
+        }
         // What is pinned first is what the hub answers on.
         let pinned = pins.pin(id, r, &recovery::evidence_to_bytes(&evidence))?;
         let evidence = pinned_evidence(o, &pinned)?;
@@ -413,6 +447,11 @@ impl Openings {
         );
         let keys = hub.keys();
         let response = pins.answer(id, r, || o.respond(keys, decided.owed))?;
+        if let Some(prover) = prover {
+            let (deadline, release, cycles) = job(&evidence);
+            let program = o.base.parts().recipe.program;
+            prover.commit(id, program, deadline, release, cycles, false, false, tip);
+        }
         self.post(&response).await;
         // Its disclosure with it: the statement wants the contract's work
         // on top of both, within the assertion window.
@@ -470,7 +509,9 @@ impl Openings {
     }
 
     /// The hub responded: its proof that her claim is owed no more, once
-    /// the response is deep enough, then its assertion.
+    /// the response is deep enough, then its assertion. What it decides
+    /// on, first found first: the assertion signed, the proof pinned for
+    /// it, the proof made of the input frozen for it.
     #[allow(clippy::too_many_arguments)]
     async fn assert(
         &self,
@@ -483,10 +524,166 @@ impl Openings {
         x_at: u32,
         tip: u32,
     ) -> Result<Played> {
-        let depth = o.base.parts().chain.work_depth;
-        if tip < x_at.saturating_add(depth) {
-            return Ok(Played::Idle);
+        let tag = tagged(id, b"assert");
+        let pins = Responses::open(&self.data)?;
+        if let Some(tx) = pins.response(&tag)? {
+            self.post(&tx).await;
+            return Ok(Played::Posted("assert"));
         }
+        let journal = graph::journal(&o.base);
+        let kind = graph::kind(&o.base, o.mock);
+        let proof = match pins.evidence(&tag)?.filter(|p| !p.is_empty()) {
+            Some(pinned) => lichen_babe::statement::proof_from_bytes(&pinned)
+                .context("the pinned proof does not decode")?,
+            None => match self.prove(id, o, r, r_at, x, x_at, tip, hub).await? {
+                Ok(proof) => proof,
+                Err(played) => return Ok(played),
+            },
+        };
+        ensure!(
+            kind.verify(&journal, &proof) || self.false_proofs(),
+            "the proof does not verify for this contract"
+        );
+        let tx = pins.answer(&tag, r, || o.assert(hub.keys(), &proof))?;
+        self.post(&tx).await;
+        Ok(Played::Posted("assert"))
+    }
+
+    /// Whether this hub asserts proofs of another statement (tests).
+    fn false_proofs(&self) -> bool {
+        #[cfg(feature = "faults")]
+        return self
+            .watch
+            .false_proofs
+            .load(std::sync::atomic::Ordering::Relaxed);
+        #[cfg(not(feature = "faults"))]
+        false
+    }
+
+    /// The proof of the hub's statement for its assertion, pinned: once its
+    /// response is deep enough, its disclosure too (else what it played
+    /// instead), its input frozen, and its prover made it (the mock
+    /// authority's at once).
+    #[allow(clippy::too_many_arguments)]
+    async fn prove(
+        &self,
+        id: &[u8; 32],
+        o: &HubOpening,
+        r: &Transaction,
+        r_at: u32,
+        x: &Transaction,
+        x_at: u32,
+        tip: u32,
+        hub: &Hub,
+    ) -> Result<std::result::Result<ark_groth16::Proof<ark_bn254::Bn254>, Played>> {
+        let parts = o.base.parts();
+        let depth = parts.chain.work_depth;
+        let prover = self.prover.as_ref().filter(|_| !o.mock);
+        let deadline = assert_deadline(o, x_at);
+        let program = parts.recipe.program;
+        let commit = |release: u32, cycles: u64, frozen: bool, proven: bool| {
+            let Some(prover) = prover else { return };
+            let fits = prover.commit(id, program, deadline, release, cycles, frozen, proven, tip);
+            if proven {
+                return;
+            }
+            if !fits && self.once(id, "late") {
+                self.alert(&format!(
+                    "contract {}: its proof may not be made before its assertion's deadline, \
+                     block {deadline} (now {tip}): her timeout would pay her what she claims",
+                    crate::hex_id(id)
+                ));
+            }
+            if tip.saturating_add(NEAR) >= deadline && self.once(id, "near") {
+                self.alert(&format!(
+                    "contract {}: its assertion's deadline, block {deadline}, is near (now \
+                     {tip}), and its proof not made",
+                    crate::hex_id(id)
+                ));
+            }
+        };
+        let frozen = prover.and_then(|p| p.frozen(id));
+        let bytes = match frozen {
+            Some(bytes) => bytes,
+            None => {
+                let pinned = Responses::open(&self.data)?
+                    .evidence(id)?
+                    .context("responded on no pinned evidence")?;
+                let release = x_at.saturating_add(depth);
+                commit(
+                    release,
+                    estimated_cycles(o, pinned.len(), release),
+                    false,
+                    false,
+                );
+                if tip < release {
+                    return Ok(Err(Played::Idle));
+                }
+                let input = match self
+                    .input(id, hub, o, r, r_at, x, x_at, tip, &pinned)
+                    .await?
+                {
+                    Ok(input) => input,
+                    Err(played) => return Ok(Err(played)),
+                };
+                let bytes = input.to_bytes();
+                match prover {
+                    Some(prover) => prover.freeze(id, &bytes)?,
+                    None => bytes,
+                }
+            }
+        };
+        let journal = graph::journal(&o.base);
+        let kind = graph::kind(&o.base, o.mock);
+        let proof = match prover {
+            None => lichen_babe::statement::mock_prove(&journal),
+            Some(prover) => {
+                let seal = prover.proof(id, &program)?;
+                let proof = match seal {
+                    Some(seal) => lichen_babe::risc0::proof_from_seal(&seal)?,
+                    None => {
+                        commit(tip, prover::input_cycles(&bytes), true, false);
+                        return Ok(Err(Played::Idle));
+                    }
+                };
+                if !kind.verify(&journal, &proof) {
+                    prover.reject(id, "it does not verify for this contract")?;
+                    return Ok(Err(Played::Idle));
+                }
+                commit(tip, prover::input_cycles(&bytes), true, true);
+                proof
+            }
+        };
+        let proof = match self.false_proofs() {
+            true => lichen_babe::statement::mock_prove(b"another statement"),
+            false => proof,
+        };
+        let tag = tagged(id, b"assert");
+        let pinned = Responses::open(&self.data)?
+            .pin_proof(&tag, r, &lichen_babe::statement::proof_to_bytes(&proof))?
+            .context("an assertion signed before its proof was pinned")?;
+        let proof = lichen_babe::statement::proof_from_bytes(&pinned)
+            .context("the pinned proof does not decode")?;
+        Ok(Ok(proof))
+    }
+
+    /// The statement's input for the hub's assertion on `pinned` evidence,
+    /// checked: once its disclosure, if the evidence needs one, is deep
+    /// enough (else what it played instead).
+    #[allow(clippy::too_many_arguments)]
+    async fn input(
+        &self,
+        id: &[u8; 32],
+        hub: &Hub,
+        o: &HubOpening,
+        r: &Transaction,
+        r_at: u32,
+        x: &Transaction,
+        x_at: u32,
+        tip: u32,
+        pinned: &[u8],
+    ) -> Result<std::result::Result<licash_hp::HubInput, Played>> {
+        let depth = o.base.parts().chain.work_depth;
         let slot = OutPoint {
             txid: r.compute_txid(),
             vout: SLOT,
@@ -495,12 +692,8 @@ impl Openings {
             .spend(slot, &r.output[slot.vout as usize], r_at, tip)
             .await?
             .context("responded with no publication")?;
-        let pinned = Responses::open(&self.data)?
-            .evidence(id)?
-            .context("responded on no pinned evidence")?;
-        let evidence = pinned_evidence(o, &pinned)?;
+        let evidence = pinned_evidence(o, pinned)?;
         let disclosures = recovery::disclosures(&evidence).map_err(|e| anyhow!("{e}"))?;
-        // Its disclosure, if the evidence needs one, deep enough too.
         let disclosure = if disclosures == Disclosures::empty() {
             None
         } else {
@@ -513,13 +706,15 @@ impl Openings {
                 .await?
             {
                 None => {
-                    return Ok(if self.disclose(id, hub, o, &disclosures).await? {
+                    return Ok(Err(if self.disclose(id, hub, o, &disclosures).await? {
                         Played::Posted("disclose")
                     } else {
                         Played::Idle
-                    });
+                    }));
                 }
-                Some((d_at, _)) if tip < d_at.saturating_add(depth) => return Ok(Played::Idle),
+                Some((d_at, _)) if tip < d_at.saturating_add(depth) => {
+                    return Ok(Err(Played::Idle))
+                }
                 Some((d_at, d)) => Some((self.block_at(d_at).await?, d.compute_txid())),
             }
         };
@@ -542,98 +737,11 @@ impl Openings {
             exit,
             evidence,
         };
-        let journal = graph::journal(&o.base);
         match licash_hp::check(&input) {
-            Ok(j) if j == journal => {}
+            Ok(j) if j == graph::journal(&o.base) => Ok(Ok(input)),
             Ok(_) => bail!("the statement's journal is not the contract's"),
             Err(e) => bail!("the hub's statement does not hold: {e}"),
         }
-        let kind = graph::kind(&o.base, o.mock);
-        let proof = if o.mock {
-            lichen_babe::statement::mock_prove(&journal)
-        } else {
-            match self.proof(id, &input)? {
-                Some(p) => p,
-                None => return Ok(Played::Idle),
-            }
-        };
-        #[cfg(feature = "faults")]
-        let (proof, dishonest) = match self
-            .watch
-            .false_proofs
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
-            true => (
-                lichen_babe::statement::mock_prove(b"another statement"),
-                true,
-            ),
-            false => (proof, false),
-        };
-        #[cfg(not(feature = "faults"))]
-        let dishonest = false;
-        ensure!(
-            dishonest || kind.verify(&journal, &proof),
-            "the proof does not verify for this contract"
-        );
-        let tag = tagged(id, b"assert");
-        let tx = Responses::open(&self.data)?.answer(&tag, r, || o.assert(hub.keys(), &proof))?;
-        self.post(&tx).await;
-        Ok(Played::Posted("assert"))
-    }
-
-    /// The proof of the hub's statement on `input`, once the prover made
-    /// it: `LICASH_HP_PROVER` (default `licash-r0`) `hp-prove`, run in the
-    /// background, its files in `<data>/hp-proofs/<id>/`.
-    fn proof(
-        &self,
-        id: &[u8; 32],
-        input: &licash_hp::HubInput,
-    ) -> Result<Option<ark_groth16::Proof<ark_bn254::Bn254>>> {
-        let dir = self.data.join("hp-proofs").join(crate::hex_id(id));
-        let out = dir.join("proof.json");
-        if out.exists() {
-            let json: serde_json::Value = serde_json::from_slice(&std::fs::read(&out)?)?;
-            let seal = hex::decode(json["seal"].as_str().context("no seal")?)?;
-            return Ok(Some(lichen_babe::risc0::proof_from_seal(&seal)?));
-        }
-        let mut proving = self
-            .watch
-            .proving
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if !proving.insert(*id) {
-            return Ok(None);
-        }
-        drop(proving);
-        std::fs::create_dir_all(&dir)?;
-        let input_path = dir.join("input.bin");
-        std::fs::write(&input_path, input.to_bytes())?;
-        let prover = std::env::var("LICASH_HP_PROVER").unwrap_or_else(|_| "licash-r0".into());
-        let log = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(dir.join("prover.log"))?;
-        let tmp = dir.join("proof.json.tmp");
-        let mut cmd = std::process::Command::new(&prover);
-        cmd.arg("hp-prove")
-            .arg(&input_path)
-            .arg(&tmp)
-            .stdout(log.try_clone()?)
-            .stderr(log);
-        let proving = self.watch.proving.clone();
-        let (id, hex) = (*id, crate::hex_id(id));
-        tracing::warn!(id = %hex, %prover, "proving the hub's statement");
-        std::thread::spawn(move || {
-            let ok = cmd.status().is_ok_and(|s| s.success()) && std::fs::rename(&tmp, &out).is_ok();
-            if !ok {
-                tracing::error!(id = %hex, "the prover failed (see its prover.log); trying again");
-            }
-            proving
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .remove(&id);
-        });
-        Ok(None)
     }
 
     /// Its assertion unchallenged past `success`'s wait: `success`, with a
@@ -940,7 +1048,9 @@ impl Openings {
         Ok(block)
     }
 
-    /// The headers after `o`'s checkpoint through block `to`.
+    /// The headers after `o`'s checkpoint through block `to`: back from
+    /// `to`'s, each its parent's child, those seen before not fetched again
+    /// (a header is its hash's).
     async fn headers(&self, o: &HubOpening, to: u32) -> Result<Vec<[u8; 80]>> {
         let parts = o.base.parts();
         let from = parts.chain.checkpoint.height().saturating_add(1);
@@ -948,18 +1058,39 @@ impl Openings {
             from.saturating_add(parts.chain.max_headers)
                 .saturating_sub(1),
         );
-        let mut headers = Vec::new();
-        for h in from..=to {
-            let hash = self.source.hash(h).await?;
-            let header = self.source.header(&hash).await?;
+        if to < from {
+            return Ok(Vec::new());
+        }
+        let mut hash = self.source.hash(to).await?;
+        let mut headers = Vec::with_capacity((to - from + 1) as usize);
+        for _ in from..=to {
+            let cached = self.header_cache().get(&hash).copied();
+            let header = match cached {
+                Some(header) => header,
+                None => {
+                    let header = self.source.header(&hash).await?;
+                    ensure!(header.block_hash() == hash, "header {hash}");
+                    self.header_cache().insert(hash, header);
+                    header
+                }
+            };
             let bytes = bitcoin::consensus::serialize(&header);
             headers.push(
                 bytes
                     .try_into()
                     .map_err(|_| anyhow!("a header of 80 bytes"))?,
             );
+            hash = header.prev_blockhash;
         }
+        headers.reverse();
         Ok(headers)
+    }
+
+    fn header_cache(&self) -> std::sync::MutexGuard<'_, HashMap<BlockHash, Header>> {
+        self.watch
+            .headers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     async fn fee_rate(&self) -> FeeRate {
@@ -998,6 +1129,34 @@ impl Openings {
             .unwrap_or_else(PoisonError::into_inner)
             .insert((*id, what))
     }
+}
+
+/// How many blocks before an assertion's deadline its operator is told
+/// its proof is not made.
+const NEAR: u32 = 6;
+
+/// The last tip at which the hub's assertion, broadcast, still confirms
+/// before her `respond_timeout`, `w_a` blocks after its response at
+/// `x_at`: `deadline_margin` blocks to confirm in.
+fn assert_deadline(o: &HubOpening, x_at: u32) -> u32 {
+    let g = &o.base.parts().graph;
+    x_at.saturating_add(u32::from(g.assert_window))
+        .saturating_sub(1)
+        .saturating_sub(g.deadline_margin)
+}
+
+/// The cycles of the proof of `o`'s statement on `evidence` bytes of
+/// evidence, its input made at `at`: until its input is, from its headers
+/// and its size (the exit's transactions and proofs about 8 kB).
+fn estimated_cycles(o: &HubOpening, evidence: usize, at: u32) -> u64 {
+    let chain = &o.base.parts().chain;
+    let from = chain.checkpoint.height().saturating_add(1);
+    let headers = at
+        .saturating_sub(from)
+        .saturating_add(1)
+        .min(chain.max_headers);
+    let other = o.base.to_bytes().len() + evidence + 8_192;
+    prover::cycles(u64::from(headers), other as u64)
 }
 
 /// The evidence pinned as `bytes`: none for empty bytes (a response pinned

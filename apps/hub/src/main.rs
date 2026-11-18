@@ -1103,6 +1103,14 @@ fn command(cli: Cli) -> anyhow::Result<()> {
                     // what it answers.
                     let ledger = hub.clone();
                     openings.evidence_with(Arc::new(move |claim| Ok(ledger.evidence(claim)?)));
+                    // Its prover not ready, failing or short of time, a
+                    // notification.
+                    let notify = hub.clone();
+                    openings.alert_with(Arc::new(move |message| {
+                        if let Err(e) = notify.alert(message) {
+                            tracing::error!("notifying an alert: {e:#}");
+                        }
+                    }));
                     tracing::info!(
                         mock = openings.advertise().mock,
                         ?range,

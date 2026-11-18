@@ -10,6 +10,7 @@
 
 mod dispute;
 mod node;
+mod prover;
 mod responses;
 mod run;
 mod store;
@@ -29,6 +30,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
 pub use dispute::{Evidencer, Played};
+/// How the hub tells its operator what needs them ([`Openings::alert_with`]).
+pub type Alert = dyn Fn(&str) + Send + Sync;
 use futures_util::StreamExt;
 use licash::note::Keyset;
 use licash::spend::ChainProfile;
@@ -85,6 +88,13 @@ pub struct Openings {
     watch: dispute::Watch,
     /// Where the responder finds its evidence against a filing.
     evidencer: std::sync::OnceLock<Arc<Evidencer>>,
+    /// The prover of the hub's statement: none where proofs are the mock
+    /// authority's.
+    prover: Option<prover::Prover>,
+    /// How the operator is told what needs them.
+    alert: std::sync::OnceLock<Arc<Alert>>,
+    /// The claims given no response this round, for want of the prover.
+    withheld: Mutex<Vec<String>>,
     /// Each contract's fold offered, until its holder signs or asks again.
     folds: Mutex<HashMap<[u8; 32], dispute::PendingFold>>,
     /// What the node's wallet last said it holds, in sat: the most it
@@ -279,6 +289,10 @@ impl Openings {
             funding: tokio::sync::Mutex::new(()),
             watch: dispute::Watch::default(),
             evidencer: std::sync::OnceLock::new(),
+            prover: (!trust.mock)
+                .then(|| prover::Prover::start(data, trust.program, prover::spacing(profile))),
+            alert: std::sync::OnceLock::new(),
+            withheld: Mutex::default(),
             folds: Mutex::default(),
             funds: Mutex::new(None),
         });
@@ -422,6 +436,37 @@ impl Openings {
         let _ = self.evidencer.set(f);
     }
 
+    /// Tell the operator through `f` from now on (the hub's notifications):
+    /// its prover is not ready or fails, a claim is answered with no
+    /// response for want of it, an assertion's deadline nears unproven.
+    pub fn alert_with(&self, f: Arc<Alert>) {
+        if let Some(prover) = &self.prover {
+            prover.alert_with(f.clone());
+        }
+        let _ = self.alert.set(f);
+    }
+
+    fn alert(&self, message: &str) {
+        match self.alert.get() {
+            Some(alert) => alert(message),
+            None => tracing::error!("alert: {message}"),
+        }
+    }
+
+    /// `id`'s claim of `b` units, owed `owed`, gets no response: `why`.
+    /// Told the operator at the end of the round, with the others.
+    fn withheld(&self, id: &[u8; 32], b: u32, owed: u32, why: &str) {
+        let message = format!(
+            "contract {} (claims {b} units, owed {owed}): {why}",
+            crate::hex_id(id)
+        );
+        tracing::warn!("no response: {message}");
+        self.withheld
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(message);
+    }
+
     /// Play each signed opening's exit, if any, one step
     /// ([`dispute`]). Each opening's error is reported independently.
     pub async fn answer_requests(&self) -> Result<ResponseRound> {
@@ -444,6 +489,22 @@ impl Openings {
                     tracing::error!(id = %crate::hex_id(&id), "playing a contract exit: {e:#}")
                 }
             }
+        }
+        if let Some(prover) = &self.prover {
+            prover.polled();
+        }
+        let withheld =
+            std::mem::take(&mut *self.withheld.lock().unwrap_or_else(PoisonError::into_inner));
+        if let Some(first) = withheld.first() {
+            self.alert(&format!(
+                "{} contested claims get no response, for want of the hub's prover (their \
+                 timeouts pay what they claim): {first}{}",
+                withheld.len(),
+                match withheld.len() {
+                    1 => String::new(),
+                    n => format!(", and {} more", n - 1),
+                }
+            ));
         }
         Ok(round)
     }
@@ -679,6 +740,9 @@ mod tests {
             funding: tokio::sync::Mutex::new(()),
             watch: dispute::Watch::default(),
             evidencer: std::sync::OnceLock::new(),
+            prover: None,
+            alert: std::sync::OnceLock::new(),
+            withheld: Mutex::default(),
             folds: Mutex::default(),
             funds: Mutex::new(None),
         }
