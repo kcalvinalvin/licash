@@ -146,10 +146,12 @@ async fn a_recovery_claims_an_unsettled_locks_refund_once_expired_at_depth() {
     };
     let (first, second) = ([7; 32], [8; 32]);
     // At its expiry, short of its depth: owed nothing on Bitcoin yet.
-    let (notes, refunds) = alice.claim_with_refunds(&first, &[slot(first)], 8).unwrap();
+    let (notes, refunds) = alice
+        .claim_with_locks(&first, &[slot(first)], 8, None)
+        .unwrap();
     assert!(notes.is_empty() && refunds.is_empty());
     let (_, refunds) = alice
-        .claim_with_refunds(&first, &[slot(first)], 100)
+        .claim_with_locks(&first, &[slot(first)], 100, None)
         .unwrap();
     assert_eq!(refunds.len(), 1);
     let refund = &refunds[0];
@@ -164,12 +166,12 @@ async fn a_recovery_claims_an_unsettled_locks_refund_once_expired_at_depth() {
         i,
         Item::Pending { branch: Branch::Refund, preimage: None, source, .. } if *source == refund.id
     )));
-    let again = alice.claimed_refunds(&first, &keyset).unwrap();
+    let again = alice.claimed_locks(&first, &keyset).unwrap();
     assert_eq!(again.len(), 1);
     assert_eq!(again[0].id, refund.id);
     // Taken: no other recovery claims it.
     let (_, none) = alice
-        .claim_with_refunds(&second, &[slot(second)], 100)
+        .claim_with_locks(&second, &[slot(second)], 100, None)
         .unwrap();
     assert!(none.is_empty());
     // Settled on Bitcoin, not asked of its hub.
@@ -180,12 +182,129 @@ async fn a_recovery_claims_an_unsettled_locks_refund_once_expired_at_depth() {
     );
     // Given up: its hub refunds it.
     alice.unclaim_notes(&first).unwrap();
-    assert!(alice.claimed_refunds(&first, &keyset).unwrap().is_empty());
+    assert!(alice.claimed_locks(&first, &keyset).unwrap().is_empty());
     assert_eq!(
         alice.follow_lock(&lock.id).await.unwrap().state,
         LockState::Refunded
     );
     assert_eq!(available(&alice), (62, 0));
+}
+
+/// A lock paying the wallet that its hub never issued, its preimage
+/// revealed, is recorded as owed before the hub learns it, and its pay
+/// branch claimed on Bitcoin once activated at depth, by one recovery
+/// only; issued since, it is owed no more.
+#[tokio::test]
+async fn a_recovery_claims_an_owed_locks_pay_once_activated_at_depth() {
+    use licash::chain::{Activation, ActivationRef, Inclusion};
+    use licash::recovery::SourceWitness;
+
+    let (net, alice, bob) = parties().await;
+    let lock = alice
+        .lock(HUB, &bob.address(), 10, hash(), Some(20))
+        .await
+        .unwrap();
+    // Her settle never reaches the hub.
+    net.fail(licash_api::SETTLE, Fault::Lost);
+    assert!(bob.claim(HUB, &lock.id, &PREIMAGE).await.is_err());
+    let owed = bob.owed_locks().unwrap();
+    assert_eq!(owed.len(), 1);
+    let o = &owed[0];
+    assert_eq!(hex::encode(o.id.as_bytes()), lock.id);
+    assert_eq!((o.preimage, o.hash, o.expiry), (PREIMAGE, hash(), 20));
+    let anchor = o.anchor.clone().expect("its hub's checkpoint");
+    assert_eq!(anchor.commitment(), o.checkpoint);
+    assert!(o.activated_at.is_none() && !o.claimed);
+
+    let keyset = *net.hub(HUB).info().keysets[0].id();
+    let slot = |id: [u8; 32]| ClaimSlot {
+        id,
+        keyset,
+        cap: 1_000,
+        max: 32,
+    };
+    let (first, second) = ([7; 32], [8; 32]);
+    let any = |_: &licash_wallet::LockClaim| true;
+    // Not activated: nothing to claim.
+    let (_, none) = bob
+        .claim_with_locks(&first, &[slot(first)], 100, Some(&any))
+        .unwrap();
+    assert!(none.is_empty());
+    bob.unclaim_notes(&first).unwrap();
+    let activation = Activation {
+        reference: ActivationRef {
+            height: 10,
+            block_hash: [3; 32],
+            txid: [4; 32],
+            output: 1,
+        },
+        inclusion: Inclusion {
+            transaction: vec![1],
+            index: 1,
+            siblings: vec![],
+            coinbase: vec![2],
+            coinbase_siblings: vec![],
+        },
+    };
+    bob.record_activation(&o.id, Some((&activation, &anchor)))
+        .unwrap();
+    let depth = o.depth;
+    // Short of its depth, or refused by the caller: not claimed.
+    let (_, none) = bob
+        .claim_with_locks(&first, &[slot(first)], 10 + depth - 2, Some(&any))
+        .unwrap();
+    assert!(none.is_empty());
+    bob.unclaim_notes(&first).unwrap();
+    let (_, none) = bob
+        .claim_with_locks(
+            &first,
+            &[slot(first)],
+            100,
+            Some(&|_: &licash_wallet::LockClaim| false),
+        )
+        .unwrap();
+    assert!(none.is_empty());
+    bob.unclaim_notes(&first).unwrap();
+    let (_, none) = bob
+        .claim_with_locks(&first, &[slot(first)], 100, None)
+        .unwrap();
+    assert!(none.is_empty());
+    bob.unclaim_notes(&first).unwrap();
+    let (_, pays) = bob
+        .claim_with_locks(&first, &[slot(first)], 10 + depth - 1, Some(&any))
+        .unwrap();
+    assert_eq!(pays.len(), 1);
+    let pay = &pays[0];
+    assert_eq!((pay.id, pay.branch, pay.value), (o.id, Branch::Pay, 10));
+    assert_eq!(pay.keys.len(), pay.items.len());
+    assert!(pay.items.iter().all(|i| matches!(
+        i,
+        Item::Pending { branch: Branch::Pay, preimage: Some(p), source, .. }
+            if *p == PREIMAGE && *source == pay.id
+    )));
+    assert!(matches!(pay.witness, SourceWitness::Certified { .. }));
+    let (record, _) = pay.activation.as_ref().expect("its activation");
+    assert_eq!(
+        (record.source, record.reference),
+        (o.id, activation.reference)
+    );
+    assert_eq!(bob.claimed_locks(&first, &keyset).unwrap().len(), 1);
+    assert!(bob.owed_locks().unwrap()[0].claimed);
+    // Claimed: by no other recovery, its activation kept as filed.
+    let (_, none) = bob
+        .claim_with_locks(&second, &[slot(second)], 100, Some(&any))
+        .unwrap();
+    assert!(none.is_empty());
+    assert!(bob.record_activation(&o.id, None).is_err());
+    // Given up, then issued by its hub: owed no more.
+    bob.unclaim_notes(&first).unwrap();
+    bob.unclaim_notes(&second).unwrap();
+    bob.claim(HUB, &lock.id, &PREIMAGE).await.unwrap();
+    assert!(bob.owed_locks().unwrap().is_empty());
+    let (_, none) = bob
+        .claim_with_locks(&first, &[slot(first)], 100, Some(&any))
+        .unwrap();
+    assert!(none.is_empty());
 }
 
 /// A wallet whose contracts at a hub are closed by some block keeps its

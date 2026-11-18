@@ -29,7 +29,36 @@ const MIGRATIONS: &[&str] = &[
     VIA,
     KEYED,
     LOCK_CLAIMS,
+    OWED_LOCKS,
 ];
+
+/// Version 13: the locks paying the wallet whose preimage it revealed to
+/// their hub, with what proves them on Bitcoin should the hub not issue
+/// them ([`crate::OwedLock`]): recorded before revealing it. None of an
+/// older file is recorded, so none is activated or claimed.
+const OWED_LOCKS: &str = "
+CREATE TABLE owed_locks (
+    id BLOB PRIMARY KEY,
+    hub INTEGER NOT NULL REFERENCES hubs (id),
+    keyset BLOB NOT NULL,
+    proposal BLOB NOT NULL,
+    certificate BLOB NOT NULL,
+    -- Its payer's owner signatures, 64 bytes each.
+    signatures BLOB NOT NULL,
+    preimage BLOB NOT NULL,
+    expiry INTEGER NOT NULL,
+    depth INTEGER NOT NULL,
+    -- The checkpoint its terms name, once known: its hub's, as it was
+    -- revealed, or found on the chain.
+    anchor BLOB,
+    -- Its activation on Bitcoin, as JSON, and its block's height.
+    activation TEXT,
+    activated_at INTEGER,
+    -- The recovery claiming it on Bitcoin.
+    claimed_by BLOB,
+    created_at INTEGER NOT NULL
+) STRICT;
+";
 
 /// Version 12: the refunds of locks a contract's recovery claims on
 /// Bitcoin, under its id, `claimed_by`. No older version claims one, so

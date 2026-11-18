@@ -15,7 +15,7 @@ use licash_contract::{
     opening::{Context, Holder, Opening},
 };
 use licash_onchain::deadline;
-use licash_wallet::{first_spend, ClaimNote, ClaimSlot, LockRefund, Transport, Wallet};
+use licash_wallet::{first_spend, ClaimNote, ClaimSlot, LockClaim, Transport, Wallet};
 use lichen_contract::Role;
 use serde::{Deserialize, Serialize};
 
@@ -613,18 +613,18 @@ impl<'a, T: Transport, C: Chain> Run<'a, T, C> {
     /// other contracts there ([`claims`]), and claimed: the claim signed
     /// by each note's hold key, for their face value, its cap at most.
     /// The refunds of her locks there that expired at depth unsettled
-    /// first ([`LockRefund`]), within its cap.
+    /// first ([`LockClaim`]), within its cap.
     fn claim(&self, state: &mut State, tip: u32) -> Result<Next> {
         // Before any note of hers is taken.
         self.o.forcible()?;
         let parts = self.o.base.parts();
         let keyset = *parts.keyset.id();
         let mut notes = self.wallet.claimed_notes(&self.id, &keyset)?;
-        let mut refunds = self.wallet.claimed_refunds(&self.id, &keyset)?;
+        let mut refunds = self.wallet.claimed_locks(&self.id, &keyset)?;
         if notes.is_empty() && refunds.is_empty() {
-            (notes, refunds) = self
-                .wallet
-                .claim_with_refunds(&self.id, &self.slots(tip)?, tip)?;
+            (notes, refunds) =
+                self.wallet
+                    .claim_with_locks(&self.id, &self.slots(tip)?, tip, None)?;
             self.took
                 .store(!(notes.is_empty() && refunds.is_empty()), Ordering::SeqCst);
         }
@@ -664,7 +664,7 @@ impl<'a, T: Transport, C: Chain> Run<'a, T, C> {
         Ok(claims::claim_slots(mine, &terms))
     }
 
-    fn filing(&self, notes: &[ClaimNote], refunds: &[LockRefund], amount: u32) -> Result<Filing> {
+    fn filing(&self, notes: &[ClaimNote], refunds: &[LockClaim], amount: u32) -> Result<Filing> {
         let p = self.o.base.parts();
         let limit = p.limits.max_authorizations as usize;
         // In the claim's order of sources, which their witnesses follow.

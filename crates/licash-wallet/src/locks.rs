@@ -608,7 +608,7 @@ impl<T: Transport> Wallet<T> {
     pub async fn incoming(&self, url: &str, id: &str) -> Result<Incoming, Error> {
         let url = hub_url(url)?;
         let id = payment_id(id)?;
-        let (info, _, view) = self.lock_view(&url, &id).await?;
+        let (_, info, _, view) = self.lock_view(&url, &id).await?;
         let proposal = &view.proposal;
         let outputs = proposal.outputs();
         let amount: u64 = self
@@ -636,12 +636,12 @@ impl<T: Transport> Wallet<T> {
     }
 
     /// The lock `id` as the hub at `url` holds it, decoded and checked, with
-    /// its keyset and what the hub says of itself.
+    /// its keyset and the hub's id and what it says of itself.
     async fn lock_view(
         &self,
         url: &str,
         id: &ProposalId,
-    ) -> Result<(licash_api::Info, Keyset, licash_api::LockView), Error> {
+    ) -> Result<(i64, licash_api::Info, Keyset, licash_api::LockView), Error> {
         let (hub, info) = self.refresh(url).await?;
         let keysets = self.keysets(hub)?;
         let lookup = |id: &[u8; 32]| keysets.iter().find(|k| k.id() == id);
@@ -651,7 +651,7 @@ impl<T: Transport> Wallet<T> {
             return Err(unavailable(url, "it answered with another lock"));
         }
         let keyset = lookup(view.proposal.keyset_id()).expect("decoded under it");
-        Ok((info, keyset.clone(), view))
+        Ok((hub, info, keyset.clone(), view))
     }
 
     /// Take the notes the lock `id` at the hub at `url` pays this wallet,
@@ -698,7 +698,7 @@ impl<T: Transport> Wallet<T> {
     ) -> Result<Received, Error> {
         let url = hub_url(url)?;
         let id = payment_id(id)?;
-        let (info, keyset, view) = self.lock_view(&url, &id).await?;
+        let (hub, info, keyset, view) = self.lock_view(&url, &id).await?;
         let keyset = &keyset;
         let proposal = &view.proposal;
         let terms = proposal.lock().expect("a lock").terms();
@@ -729,7 +729,7 @@ impl<T: Transport> Wallet<T> {
             Some(Settled::Pay) => {}
             None if revealed => {}
             None => {
-                let height = info.locks.map_or(u32::MAX, |l| l.height);
+                let height = info.locks.as_ref().map_or(u32::MAX, |l| l.height);
                 if height.saturating_add(CLAIM_MARGIN) >= terms.expiry() {
                     return Err(Error::Invalid(format!(
                         "too late to claim: the lock expires at {}, its hub is at {height}",
@@ -737,6 +737,14 @@ impl<T: Transport> Wallet<T> {
                     )));
                 }
             }
+        }
+        // Before its hub learns the preimage: what proves the lock on
+        // Bitcoin, should it not issue it.
+        if let Some(signatures) = &view.signatures {
+            let anchor = (info.locks.as_ref())
+                .and_then(|l| l.checkpoint().ok())
+                .filter(|c| c.commitment() == *terms.checkpoint());
+            self.owe(hub, keyset, &view, signatures, preimage, anchor)?;
         }
         let issued: Issued = self
             .post(&url, licash_api::SETTLE, &Settle::new(&id, preimage))
@@ -746,9 +754,45 @@ impl<T: Transport> Wallet<T> {
         self.keep(keyset, url, proposal, &ours)
     }
 
-    /// The locks made, newest first.
+    /// Record the lock of `view` at hub `hub` owed to the wallet, as its
+    /// preimage is revealed ([`crate::OwedLock`]): once.
+    fn owe(
+        &self,
+        hub: i64,
+        keyset: &Keyset,
+        view: &licash_api::LockView,
+        signatures: &[licash::crypto::Signature],
+        preimage: &[u8; 32],
+        anchor: Option<licash::chain::Checkpoint>,
+    ) -> Result<(), Error> {
+        let proposal = &view.proposal;
+        let terms = proposal.lock().expect("a lock").terms();
+        let signatures: Vec<u8> = signatures.iter().flat_map(|s| s.0).collect();
+        self.store.write(|t| {
+            t.execute(
+                "INSERT INTO owed_locks (id, hub, keyset, proposal, certificate, signatures,
+                    preimage, expiry, depth, anchor, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) ON CONFLICT DO NOTHING",
+                rusqlite::params![
+                    proposal.id().as_bytes(),
+                    hub,
+                    keyset.id(),
+                    proposal.commitment_bytes(),
+                    view.certificate.to_bytes(),
+                    signatures,
+                    preimage,
+                    terms.expiry(),
+                    terms.depth(),
+                    anchor.map(|a| a.to_bytes()),
+                    crate::now(),
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
     /// Whether a contract's recovery claims lock `id`'s refund on Bitcoin
-    /// ([`crate::LockRefund`]): then it is settled there, not asked of its
+    /// ([`crate::LockClaim`]): then it is settled there, not asked of its
     /// hub, until the recovery is given up.
     fn refund_claimed(&self, id: &ProposalId) -> Result<bool, Error> {
         self.store.read(|c| {
@@ -760,6 +804,7 @@ impl<T: Transport> Wallet<T> {
         })
     }
 
+    /// The locks made, newest first.
     pub fn locks(&self) -> Result<Vec<Lock>, Error> {
         self.store.read(|c| {
             let mut stmt =
