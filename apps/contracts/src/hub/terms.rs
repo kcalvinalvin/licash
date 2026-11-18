@@ -60,7 +60,7 @@ const MIN_BITS: u8 = 21;
 
 /// The largest cap the hub's wallet funds with `balance` sat: its
 /// graph's payout, all ones in as many bits as it is wide, at least
-/// [`MIN_BITS`]; its reserve; and [`FUNDING_MARGIN`]. None if not even
+/// `MIN_BITS`; its reserve; and `FUNDING_MARGIN`. None if not even
 /// the narrowest graph is funded.
 pub fn fundable(balance: u64) -> Option<u32> {
     let left = balance.checked_sub(RESERVE_HUB + FUNDING_MARGIN)?;

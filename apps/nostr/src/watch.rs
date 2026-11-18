@@ -102,7 +102,7 @@ impl Watch {
     /// The newest unexpired announcement of each key, newest first. The
     /// relays connected are asked for them all, each first asked to push
     /// the new ones (the others connecting for the next look), unless
-    /// within [`ASK_EVERY`] of the last ask one of those pushing is still
+    /// within `ASK_EVERY` of the last ask one of those pushing is still
     /// connected: then what was kept, at once. Fails only if none was
     /// kept and no relay answered.
     pub async fn found(&self) -> anyhow::Result<Vec<Found>> {

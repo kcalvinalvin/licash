@@ -105,11 +105,11 @@ impl Wallet {
 
     /// The contract to offer the wallet, if any: for its largest coin on
     /// Bitcoin, at the trusted hub letting it choose terms that protects
-    /// the most for the least ([`best`]), none at a hub it has one live or
+    /// the most for the least (`best`), none at a hub it has one live or
     /// being opened. Its quote, at first of the suggested terms; opened
     /// only once she accepts them ([`Wallet::open_chosen_contract`]). None
     /// if no hub offers one, no coin pays one for a tenth of it at most
-    /// ([`SHARE`]), or no hub answers.
+    /// (`SHARE`), or no hub answers.
     pub fn contract_offer(&self) -> Result<Option<ContractQuote>, LicashError> {
         let all = holder::list(&self.dir).map_err(failed)?;
         let tip = self.tip();

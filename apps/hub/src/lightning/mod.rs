@@ -128,7 +128,7 @@ impl Config {
     /// Whether a lock of the latest expiry the hub of `timing` admits, at
     /// the least depth a wallet locks with, outlasts a receipt's own lock,
     /// its depth and the gateway's downtime: so that receipts are paid
-    /// inside the hub ([`Gateway::fulfill`]).
+    /// inside the hub (`Gateway::fulfill`).
     pub fn pays_inside(&self, timing: &Timing) -> bool {
         let latest = timing
             .window

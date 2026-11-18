@@ -99,7 +99,7 @@ pub async fn until<T, F: Future<Output = anyhow::Result<Option<T>>>>(
 
 impl Eco {
     /// The stack of Compose project `$LICASH_E2E_PROJECT` (by default
-    /// `licash-e2e`), with its nodes funded, the [`CHANNELS`] open, and its
+    /// `licash-e2e`), with its nodes funded, the `CHANNELS` open, and its
     /// hubs' gateways up.
     pub async fn up() -> anyhow::Result<Self> {
         let _ = rustls::crypto::ring::default_provider().install_default();

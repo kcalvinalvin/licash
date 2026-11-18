@@ -128,7 +128,7 @@ pub async fn open<T: Transport, C: Chain>(
 const RESUMES: u32 = 2;
 
 /// [`open`], F's `change` going where asked: into notes at the hub, F
-/// sweeping her coin whole, if it can. Resumed at once, up to [`RESUMES`]
+/// sweeping her coin whole, if it can. Resumed at once, up to `RESUMES`
 /// times, should it fail short of F but for a refusal.
 pub async fn open_with<T: Transport, C: Chain>(
     wallet: &Wallet<T>,

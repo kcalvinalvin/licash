@@ -548,7 +548,7 @@ impl Openings {
     }
 
     /// Play each signed opening's exit, if any, one step
-    /// ([`dispute`]). Each opening's error is reported independently.
+    /// (`dispute`). Each opening's error is reported independently.
     pub async fn answer_requests(&self) -> Result<ResponseRound> {
         let ids = self.store().signed_ids()?;
         self.keep_loaded(&ids);
