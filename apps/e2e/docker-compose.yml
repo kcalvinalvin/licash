@@ -37,6 +37,25 @@ x-lnd: &lnd
   - --rpclisten=0.0.0.0:10009
   - --restlisten=0.0.0.0:8080
 
+# The macaroon a hub's gateway needs of its LND node, and no more: baked
+# beside the node, in its network and data, for the eight calls it makes
+# (apps/hub/README.md). A hub given it could not run on a call left out.
+x-macaroon: &macaroon
+  <<: *lnd
+  healthcheck:
+    disable: true
+  restart: "no"
+  entrypoint: ["lncli", "--network=regtest", "bakemacaroon", "--save_to=/root/.lnd/hub.macaroon"]
+  command:
+  - uri:/lnrpc.Lightning/GetInfo
+  - uri:/lnrpc.Lightning/ChannelBalance
+  - uri:/routerrpc.Router/SendPaymentV2
+  - uri:/routerrpc.Router/TrackPaymentV2
+  - uri:/invoicesrpc.Invoices/AddHoldInvoice
+  - uri:/lnrpc.Lightning/LookupInvoice
+  - uri:/invoicesrpc.Invoices/SettleInvoice
+  - uri:/invoicesrpc.Invoices/CancelInvoice
+
 x-hub: &hub
   image: licash-hub:e2e
   build:
@@ -52,7 +71,7 @@ x-hub: &hub
     LICASH_HUB_NETWORK: regtest
     LICASH_HUB_CHAIN_POLL: "1"
     LICASH_HUB_TWEAKS: "true"
-    LICASH_HUB_LND_MACAROON: /lnd/data/chain/bitcoin/regtest/admin.macaroon
+    LICASH_HUB_LND_MACAROON: /lnd/hub.macaroon
     LICASH_HUB_LND_CERT: /lnd/tls.cert
     LICASH_HUB_NOSTR_RELAYS: ws://relay:8080
     # The relay as wallets on this host reach it.
@@ -102,6 +121,24 @@ services:
     volumes:
       - hub2-ln:/root/.lnd
 
+  hub1-macaroon:
+    <<: *macaroon
+    network_mode: service:hub1-ln
+    volumes:
+      - hub1-ln:/root/.lnd
+    depends_on:
+      hub1-ln:
+        condition: service_healthy
+
+  hub2-macaroon:
+    <<: *macaroon
+    network_mode: service:hub2-ln
+    volumes:
+      - hub2-ln:/root/.lnd
+    depends_on:
+      hub2-ln:
+        condition: service_healthy
+
   # The swap provider's, with channels to hub2's node and the outside one.
   swaps-ln:
     <<: *lnd
@@ -134,8 +171,8 @@ services:
       - hub1-ln:/lnd:ro
       - notify:/notify:ro
     depends_on:
-      hub1-ln:
-        condition: service_healthy
+      hub1-macaroon:
+        condition: service_completed_successfully
       gotify-app:
         condition: service_completed_successfully
       relay:
@@ -161,8 +198,8 @@ services:
       - hub2-ln:/lnd:ro
       - notify:/notify:ro
     depends_on:
-      hub2-ln:
-        condition: service_healthy
+      hub2-macaroon:
+        condition: service_completed_successfully
       gotify-app:
         condition: service_completed_successfully
       relay:
