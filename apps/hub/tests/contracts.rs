@@ -1340,6 +1340,78 @@ async fn a_hub_that_responds_and_never_asserts_pays_her_whole_claim() -> Result<
     Ok(())
 }
 
+/// The stale claim's request and publication buried, the hub not playing
+/// and her timeout not posted: the block her response timeout is valid
+/// from, then mined past, her wallet offline.
+async fn past_the_response_window(s: &Stale) -> Result<u32> {
+    use licash_contracts::holder::recovery::{self, Stage};
+
+    let mut last = None;
+    for _ in 0..50 {
+        let r = recovery::advance(&s.wallet, &s.chain, &s.mine, s.rate).await?[0].clone();
+        if r.stage == Stage::Requested && r.publication.is_some() {
+            let window_end = r.next_at.context("no response window")?;
+            s.rt.mine_to_height(window_end + 1)?;
+            return Ok(window_end);
+        }
+        last = Some(r);
+        s.rt.mine(1)?;
+    }
+    anyhow::bail!("never requested: {last:?}")
+}
+
+/// The response window makes her timeout valid, but does not expire the
+/// hub's answer: one confirming after it, before her timeout, still gets
+/// a fresh assertion window, and her a fresh challenge window after the
+/// assertion. Here the hub proves and asserts, and pays what is left.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs bitcoind and a release build"]
+async fn a_hubs_answer_can_confirm_after_its_response_window() -> Result<()> {
+    use licash_contracts::holder::recovery;
+
+    let s = stale_claim([15; 32]).await?;
+    let window_end = past_the_response_window(&s).await?;
+    // The hub plays first: its response confirms strictly after the
+    // earliest timeout block.
+    let round = s.openings.answer_requests().await?;
+    ensure!(round.failed == 0 && round.answered == 1, "{round:?}");
+    s.rt.mine(1)?;
+    let observed = recovery::advance(&s.wallet, &s.chain, &s.mine, s.rate).await?[0].clone();
+    ensure!(observed.error.is_none(), "{observed:?}");
+    ensure!(observed.stage.disputed(), "{observed:?}");
+    let x = observed.response.context("no response")?;
+    let confirmed_at = s.rt.confirmations(&x)?.context("unconfirmed")?;
+    ensure!(confirmed_at > window_end, "{confirmed_at} by {window_end}");
+    ensure!(observed.timeout.is_none(), "{observed:?}");
+    // Its assertion within the fresh window, then her challenge window.
+    let done = played(&s, |_| true).await?;
+    ensure!(done.assertion.is_some() && done.proved, "{done:?}");
+    ensure!(done.corrected == Some(4_096), "{done:?}");
+    ensure!(done.payout.is_some() && done.timeout.is_none(), "{done:?}");
+    Ok(())
+}
+
+/// Past the response window, her timeout confirms before the hub's late
+/// answer: the timeout wins, and pays her all she claimed.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs bitcoind and a release build"]
+async fn her_timeout_wins_over_a_late_answer_that_confirms_after_it() -> Result<()> {
+    use licash_contracts::holder::recovery::{self, Stage};
+
+    let s = stale_claim([16; 32]).await?;
+    past_the_response_window(&s).await?;
+    // She plays first: her timeout confirms before the hub plays.
+    let r = recovery::advance(&s.wallet, &s.chain, &s.mine, s.rate).await?[0].clone();
+    ensure!(r.stage == Stage::TimingOut, "{r:?}");
+    s.rt.mine(1)?;
+    let done = played(&s, |_| true).await?;
+    ensure!(done.response.is_none(), "{done:?}");
+    ensure!(done.timeout.is_some(), "not her timeout: {done:?}");
+    let received = done.received.context("nothing received")?;
+    ensure!(received > 5_000, "{received} of a claim of 5000: {done:?}");
+    Ok(())
+}
+
 /// A dishonest hub asserts a proof of another statement: she challenges
 /// it, no kept instance answers, and the assertion's failure pays her all
 /// she claimed.
