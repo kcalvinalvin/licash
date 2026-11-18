@@ -1068,6 +1068,23 @@ impl<T: Transport> Wallet<T> {
     /// a block holds, a scan sees the coins spent by it, and the other
     /// given up.
     pub fn replace_silent(&self, txid: &Txid, rate: FeeRate) -> Result<Transaction, Error> {
+        let tx = self.replace(txid, rate, false)?;
+        tracing::info!(replaced = %txid, txid = %tx.compute_txid(), "silent payment spend canceled");
+        Ok(tx)
+    }
+
+    /// Bump the wallet's spend `txid`, in no block yet: as
+    /// [`Wallet::replace_silent`], but paying all `txid` pays besides its
+    /// change, the fee taken from its change, which must stay. Refused
+    /// as a cancel is, or if its change is gone or would be dust.
+    pub fn bump_silent(&self, txid: &Txid, rate: FeeRate) -> Result<Transaction, Error> {
+        let tx = self.replace(txid, rate, true)?;
+        tracing::info!(replaced = %txid, txid = %tx.compute_txid(), "silent payment spend bumped");
+        Ok(tx)
+    }
+
+    /// [`Wallet::replace_silent`], or, `keep`, [`Wallet::bump_silent`].
+    fn replace(&self, txid: &Txid, rate: FeeRate, keep: bool) -> Result<Transaction, Error> {
         let keys = &self.keys.silent;
         let tx = self.store.write(|t| {
             let old: Option<Vec<u8>> = t
@@ -1117,17 +1134,38 @@ impl<T: Transport> Wallet<T> {
                 value: Amount::from_sat(value),
                 script_pubkey: script.clone(),
             };
-            let vsize = fee(inputs.len(), &[output(0)], FeeRate::from_sat_per_vb_u32(1));
-            let fee = fee(inputs.len(), &[output(0)], rate).max(old_fee.saturating_add(vsize));
+            // What it pays besides its change, in its order, if kept.
+            let (mut paid, mut change) = (Vec::new(), None);
+            for (i, o) in old.output.iter().enumerate() {
+                match o.script_pubkey == script {
+                    true => change = Some(i),
+                    false => paid.push(o.clone()),
+                }
+            }
+            if !keep {
+                paid.clear();
+            } else if change.is_none() {
+                return Err(Error::Invalid(format!(
+                    "spend {txid} pays no change to bump it with"
+                )));
+            }
+            let pays = paid.iter().map(|o| o.value.to_sat()).sum::<u64>();
+            let mut outputs = paid;
+            let at = change.filter(|_| keep).unwrap_or(0).min(outputs.len());
+            outputs.insert(at, output(0));
+            let vsize = fee(inputs.len(), &outputs, FeeRate::from_sat_per_vb_u32(1));
+            let fee = fee(inputs.len(), &outputs, rate).max(old_fee.saturating_add(vsize));
             let dust = script.minimal_non_dust().to_sat();
-            let back =
-                held.checked_sub(fee)
-                    .filter(|back| *back >= dust)
-                    .ok_or(Error::Insufficient {
-                        needed: fee.saturating_add(dust),
-                        available: held,
-                    })?;
-            let tx = sign(&inputs, &secrets, vec![output(back)])?;
+            let needed = fee.saturating_add(dust).saturating_add(pays);
+            let back = (held.checked_sub(pays))
+                .and_then(|left| left.checked_sub(fee))
+                .filter(|back| *back >= dust)
+                .ok_or(Error::Insufficient {
+                    needed,
+                    available: held,
+                })?;
+            outputs[at] = output(back);
+            let tx = sign(&inputs, &secrets, outputs)?;
             let new = tx.compute_txid().to_byte_array();
             t.execute(
                 "INSERT INTO silent_spends (txid, tx, created_at) VALUES (?1, ?2, ?3)",
@@ -1139,7 +1177,6 @@ impl<T: Transport> Wallet<T> {
             )?;
             Ok(tx)
         })?;
-        tracing::info!(replaced = %txid, txid = %tx.compute_txid(), "silent payment spend canceled");
         Ok(tx)
     }
 

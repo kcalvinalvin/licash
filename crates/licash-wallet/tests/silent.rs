@@ -832,6 +832,83 @@ async fn a_spend_canceled_pays_its_coins_back_in_its_place() {
 }
 
 #[tokio::test]
+async fn a_spend_bumped_pays_the_same_its_change_paying_the_fee() {
+    let s = setup().await;
+    s.wallet.watch_silent(HUB, 1).unwrap();
+    let paying = s.pay(&[s.address(), s.address()], &[30_000, 20_000]);
+    s.mine(vec![paying]);
+    s.scan().await.unwrap();
+    let at = |vb: u64| FeeRate::from_sat_per_vb(vb).unwrap();
+    let coin = s.wallet.silent_coins().unwrap()[0].outpoint;
+    // A record of no value, as an activation of a lock.
+    let record = ScriptBuf::from_bytes([&[0x6a, 4][..], b"lock"].concat());
+    let spend = s
+        .wallet
+        .spend_silent_coin(record.clone(), coin, Some(0), rate())
+        .unwrap();
+    let txid = spend.compute_txid();
+    let old_fee = s.wallet.silent_spend(&txid).unwrap().unwrap().fee.unwrap();
+    let bumped = s.wallet.bump_silent(&txid, at(10)).unwrap();
+    assert_signed(&s.chain.lock().unwrap(), &bumped);
+    let spent = |tx: &Transaction| {
+        tx.input
+            .iter()
+            .map(|i| i.previous_output)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(spent(&bumped), spent(&spend));
+    assert_eq!(bumped.output.len(), spend.output.len());
+    let kept = |tx: &Transaction| tx.output.iter().position(|o| o.script_pubkey == record);
+    assert_eq!(kept(&bumped), kept(&spend));
+    let change = |tx: &Transaction| {
+        (tx.output.iter().find(|o| o.script_pubkey != record))
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(change(&bumped).script_pubkey, change(&spend).script_pubkey);
+    let fee = change(&spend).value.to_sat() - change(&bumped).value.to_sat() + old_fee;
+    assert_eq!(fee, at(10).fee_wu(bumped.weight()).unwrap().to_sat());
+    let bumped_txid = bumped.compute_txid();
+    assert_eq!(
+        s.wallet.silent_spends().unwrap(),
+        std::slice::from_ref(&bumped)
+    );
+    assert_eq!(
+        s.wallet.silent_spender(&coin).unwrap(),
+        Some((bumped_txid, None))
+    );
+    // Both pay the record until one is in a block.
+    assert_eq!(s.wallet.silent_spends_paying(&record).unwrap().len(), 2);
+    // The spend it took the place of is the coin's no more.
+    let again = s.wallet.bump_silent(&txid, at(50));
+    assert!(matches!(again, Err(Error::Invalid(_))), "{again:?}");
+    // Its change cannot pay so much: refused, not dropped.
+    let much = s.wallet.bump_silent(&bumped_txid, at(10_000));
+    assert!(matches!(much, Err(Error::Insufficient { .. })), "{much:?}");
+
+    // Mined: the record paid, its change back.
+    s.mine(vec![bumped.clone()]);
+    let scanned = s.scan().await.unwrap();
+    assert_eq!(scanned.found.len(), 1);
+    assert!(scanned.found[0].change);
+    assert_eq!(scanned.found[0].value, change(&bumped).value.to_sat());
+    let paid = s.wallet.silent_spends_paying(&record).unwrap();
+    let mined: Vec<_> = paid.iter().filter(|p| p.height.is_some()).collect();
+    assert_eq!(mined.len(), 1);
+    assert_eq!(mined[0].tx, bumped);
+
+    // One paying no change cannot be bumped.
+    let other = s.wallet.silent_coins().unwrap();
+    let whole = other.iter().find(|c| !c.change).unwrap().outpoint;
+    let all = s
+        .wallet
+        .spend_silent_coin(elsewhere(), whole, None, rate())
+        .unwrap();
+    let none = s.wallet.bump_silent(&all.compute_txid(), at(10));
+    assert!(matches!(none, Err(Error::Invalid(_))), "{none:?}");
+}
+
+#[tokio::test]
 async fn a_spend_canceled_that_confirms_after_all_gives_its_cancel_up() {
     let s = setup().await;
     s.wallet.watch_silent(HUB, 1).unwrap();
