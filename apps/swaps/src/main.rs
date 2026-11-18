@@ -317,6 +317,24 @@ struct PayoutTerms {
     /// at least: the provider's time to claim it once the coin is claimed.
     #[arg(long, env = "LICASH_SWAPS_PAYOUT_MARGIN", default_value_t = 36)]
     payout_margin: u32,
+    /// Payouts from one hub whose clients never claimed their coins, in
+    /// the last day, from which more from that hub are declined: each cost
+    /// the fees of its coin and of its refund.
+    #[arg(long, env = "LICASH_SWAPS_PAYOUT_MAX_UNCLAIMED", default_value_t = 8)]
+    payout_max_unclaimed: u32,
+    /// Payouts under way at once, from which no more are taken.
+    #[arg(long, env = "LICASH_SWAPS_PAYOUT_MAX_OPEN", default_value_t = 32)]
+    payout_max_open: u64,
+    /// The most blocks a payout's coin is held before it times out: locks
+    /// expiring later are declined.
+    #[arg(long, env = "LICASH_SWAPS_PAYOUT_MAX_BLOCKS", default_value_t = 144)]
+    payout_max_blocks: u32,
+    /// The least a payout's coin is worth, in multiples of what it and its
+    /// refund pay in fees at the rate it is paid at (with --payout-min, the
+    /// larger): a client never claiming costs the provider no more than
+    /// this share of what it pays out.
+    #[arg(long, env = "LICASH_SWAPS_PAYOUT_FEE_SHARE", default_value_t = 20)]
+    payout_fee_share: u64,
 }
 
 impl PayoutTerms {
@@ -353,6 +371,16 @@ impl PayoutTerms {
             max: self.payout_max,
             margin: self.payout_margin,
         })
+    }
+
+    /// What payouts whose clients never claim may cost the provider.
+    fn limits(&self) -> licash_swaps::PayoutLimits {
+        licash_swaps::PayoutLimits {
+            no_shows: self.payout_max_unclaimed,
+            open: self.payout_max_open,
+            max_blocks: self.payout_max_blocks,
+            fee_share: self.payout_fee_share,
+        }
     }
 }
 
@@ -812,7 +840,7 @@ fn command(cli: Cli) -> anyhow::Result<()> {
                 Some(source) => {
                     runtime.block_on(chain.watch(provider.wallet(), Some(source)))?;
                     let terms = runtime.block_on(payouts.terms(source))?;
-                    provider.pay_out(terms)
+                    provider.pay_out(terms).limit_payouts(payouts.limits())
                 }
                 None => {
                     let open = provider.open_payouts()?;

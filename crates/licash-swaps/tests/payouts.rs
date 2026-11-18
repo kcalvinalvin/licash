@@ -20,7 +20,7 @@ use licash_api::{
     Code, Fee, Problem,
 };
 use licash_hub::Timing;
-use licash_swaps::{Chain, Config, Provider, Stage};
+use licash_swaps::{Chain, Config, PayoutLimits, Provider, Stage, NO_SHOW_VSIZE};
 use licash_wallet::{Blocks, Error, Payout, PayoutState, Response, Transport, Wallet};
 use net::{Link, Net, View, TIMING};
 
@@ -301,6 +301,22 @@ impl Eco {
         let provider = Provider::open(&self.dir.path().join("swaps.sqlite"), wallet, CONFIG)
             .unwrap()
             .pay_out(TERMS);
+        *self.desk.provider.lock().unwrap() = Some(Arc::new(provider));
+    }
+
+    /// The provider, opened again with its payouts bounded by `limits`.
+    fn limit(&self, limits: PayoutLimits) {
+        let provider = self.desk.provider.lock().unwrap().take().unwrap();
+        drop(Arc::into_inner(provider).expect("the provider is held once"));
+        let wallet = Wallet::open(
+            &self.dir.path().join("wallet.sqlite"),
+            Link(self.net.clone()),
+        )
+        .unwrap();
+        let provider = Provider::open(&self.dir.path().join("swaps.sqlite"), wallet, CONFIG)
+            .unwrap()
+            .pay_out(TERMS)
+            .limit_payouts(limits);
         *self.desk.provider.lock().unwrap() = Some(Arc::new(provider));
     }
 
@@ -790,6 +806,108 @@ async fn a_payout_takes_notes_at_a_hub_only_within_the_providers_limit_there() {
     }
     assert_eq!(provider.records(10).unwrap().len(), 1);
     assert!(eco.pool.waiting().is_empty());
+}
+
+/// Bounds as wide as the terms: each test narrows one.
+const UNBOUNDED: PayoutLimits = PayoutLimits {
+    no_shows: u32::MAX,
+    open: u64::MAX,
+    max_blocks: u32::MAX,
+    fee_share: 0,
+};
+
+/// A payout whose client never claims costs the provider its coin's fees
+/// and the refund's, at no cost to the client: the provider bounds how
+/// many are under way, and declines a hub's once too many of its clients
+/// never claimed lately.
+#[tokio::test]
+async fn payouts_never_claimed_are_bounded_at_once_and_by_their_hub() {
+    let eco = Eco::new(STOCK, TERMS).await;
+    eco.limit(PayoutLimits {
+        no_shows: 1,
+        open: 1,
+        ..UNBOUNDED
+    });
+    eco.pay_out(1_000).await;
+    // One under way: no more paid out, said before a lock is made.
+    assert!(eco.provider().info().unwrap().chain.is_none());
+    let quote = eco
+        .client
+        .payout_quote(PROVIDER, A, PAYEE, 500, MAX_FEE, ONE_SAT)
+        .await;
+    assert!(
+        matches!(&quote, Err(Error::Invalid(why)) if why.contains("pays nothing out")),
+        "{quote:?}"
+    );
+    // Never claimed: taken back once timed out.
+    eco.pool.mine();
+    eco.follow().await;
+    eco.mine_to(timeout(&eco));
+    eco.follow().await;
+    eco.pool.mine();
+    eco.follow().await;
+    assert_eq!(eco.stage(), Stage::Refunded);
+    let lock = eco.client.locks().unwrap().remove(0);
+    eco.mine_to(lock.expiry + 1);
+    eco.client.resume().await.unwrap();
+    // Its hub's clients never claimed once lately: no more from there.
+    assert!(eco.provider().info().unwrap().chain.is_some());
+    let quote = eco
+        .client
+        .payout_quote(PROVIDER, A, PAYEE, 500, MAX_FEE, ONE_SAT)
+        .await
+        .unwrap();
+    let declined = eco.client.payout(&quote).await;
+    let why = format!("{declined:?}");
+    assert!(why.contains("went unclaimed lately"), "{why}");
+    assert!(eco.pool.waiting().is_empty());
+}
+
+/// A payout's coin is held no longer than the provider bounds, and worth
+/// some times what it and its refund pay in fees at least, as the rate
+/// it is paid at rises.
+#[tokio::test]
+async fn a_payout_is_declined_held_too_long_or_worth_too_little_for_its_fees() {
+    let eco = Eco::new(STOCK, TERMS).await;
+    eco.limit(PayoutLimits {
+        max_blocks: 30,
+        ..UNBOUNDED
+    });
+    let quote = eco
+        .client
+        .payout_quote(PROVIDER, A, PAYEE, 1_000, MAX_FEE, ONE_SAT)
+        .await
+        .unwrap();
+    let declined = format!("{:?}", eco.client.payout(&quote).await);
+    assert!(declined.contains("more than 30 blocks"), "{declined}");
+
+    let eco = Eco::new(STOCK, TERMS).await;
+    eco.limit(PayoutLimits {
+        fee_share: 5,
+        ..UNBOUNDED
+    });
+    // At 1 sat/vB: 320 sat of fees, 1,600 at least.
+    let least = |eco: &Eco| eco.provider().info().unwrap().chain.unwrap().min;
+    assert_eq!(least(&eco), 5 * NO_SHOW_VSIZE);
+    let quote = eco
+        .client
+        .payout_quote(PROVIDER, A, PAYEE, 1_000, MAX_FEE, ONE_SAT)
+        .await;
+    assert!(
+        matches!(&quote, Err(Error::Invalid(why)) if why.contains("coins of 1600")),
+        "{quote:?}"
+    );
+    // The rate risen since its quote: declined once its lock is made, and
+    // told of to the next.
+    eco.pool.estimate(Some(rate(2)));
+    let quote = eco
+        .client
+        .payout_quote(PROVIDER, A, PAYEE, 2_000, MAX_FEE, ONE_SAT)
+        .await
+        .unwrap();
+    let declined = format!("{:?}", eco.client.payout(&quote).await);
+    assert!(declined.contains("coins of 3200"), "{declined}");
+    assert_eq!(least(&eco), 10 * NO_SHOW_VSIZE);
 }
 
 #[tokio::test]

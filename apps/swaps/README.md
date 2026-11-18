@@ -88,6 +88,17 @@ terms; `status` shows the coins, and an alert says when they pay out less
 than `--payout-min`, once a start until they pay enough again. A provider
 with payouts under way refuses to start without `--chain`.
 
+A client who never claims its coin costs the provider the fees of that coin
+and of its refund, and holds the coin until it times out, while its own
+lock simply expires back to it. So the provider bounds what such payouts can
+cost: it takes at most `--payout-max-open` (32) payouts at once, declines a
+hub's payouts once `--payout-max-unclaimed` (8) of them went unclaimed in the
+last day, declines a lock whose coin would be held more than
+`--payout-max-blocks` (144) blocks, and pays out no coin worth less than
+`--payout-fee-share` (20) times what it and its refund pay in fees at the
+rate the last one was paid at (or `--payout-min`, if larger). Each limit is a
+plain decline (`declined`), never a charge: nothing is paid up front.
+
 With `--lnd URL --lnd-macaroon FILE` (and `--lnd-cert FILE` to pin LND's
 certificate), the provider also pays Lightning invoices from that LND node,
 for clients' locks at any of its hubs (`POST /v1/swaps/lightning`). A client

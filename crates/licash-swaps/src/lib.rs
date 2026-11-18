@@ -72,7 +72,7 @@ pub use donations::{
 pub use invoices::MIN_SLACK;
 pub use issue::Issuer;
 use issue::{Issue, Issued};
-pub use payouts::{Chain, PAYOUT_ROOM};
+pub use payouts::{Chain, PayoutLimits, NO_SHOW_VSIZE, PAYOUT_ROOM};
 use store::{now, Store};
 
 /// Blocks a provider's lock leaves at least before it expires: for the
@@ -502,6 +502,12 @@ pub struct Provider<T: Transport> {
     short_on_chain: std::sync::atomic::AtomicBool,
     /// What it pays out on Bitcoin, if it does.
     payouts: Option<swaps::Chain>,
+    /// What payouts whose clients never claim may cost it, if bounded
+    /// ([`Provider::limit_payouts`]).
+    payout_limits: Option<payouts::PayoutLimits>,
+    /// The rate it last paid a payout's coin at, by which
+    /// [`payouts::PayoutLimits::fee_share`] bounds the least it pays out.
+    payout_rate: Mutex<Option<bitcoin::FeeRate>>,
     /// The swaps whose hub the operator was told keeps the preimage.
     withheld: Mutex<HashSet<[u8; 32]>>,
     /// The swaps the operator was told the provider claims late.
@@ -659,6 +665,8 @@ impl<T: Transport> Provider<T> {
             short: Mutex::default(),
             short_on_chain: Default::default(),
             payouts: None,
+            payout_limits: None,
+            payout_rate: Mutex::default(),
             withheld: Mutex::default(),
             late: Mutex::default(),
             issuer: issuer.map(Arc::new),

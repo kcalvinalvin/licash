@@ -66,6 +66,42 @@ const SCAN_BATCH: u32 = 100;
 /// it could be mined too late for the provider.
 pub const CANCEL_LEFT: u32 = 12;
 
+/// Virtual bytes of a payout's coin and of its refund, about: what a
+/// payout whose client never claims costs the provider, at its rate.
+pub const NO_SHOW_VSIZE: u64 = 320;
+
+/// How long a payout refunded, its client never claiming, counts against
+/// its hub ([`PayoutLimits::no_shows`]): a day.
+const NO_SHOW_FOR: i64 = 24 * 3600;
+
+/// What payouts whose clients never claim their coins may cost a
+/// provider: each costs the fees of its coin and of the refund taking it
+/// back, and holds its coin until it times out, at no cost to its client,
+/// whose lock expires back to it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PayoutLimits {
+    /// Payouts from one hub refunded within a day from which more from
+    /// there are declined, as a client paying from there never claims.
+    pub no_shows: u32,
+    /// Payouts under way at once, from which it pays out nothing more.
+    pub open: u64,
+    /// The most blocks after the chain's tip a payout's coin may time out.
+    pub max_blocks: u32,
+    /// The least a payout's coin is worth: this many times what it and its
+    /// refund pay in fees ([`NO_SHOW_VSIZE`]) at the rate it is paid at.
+    pub fee_share: u64,
+}
+
+impl PayoutLimits {
+    /// The least a payout's coin is worth at `rate`, at `min` at least.
+    fn least(&self, min: u64, rate: FeeRate) -> u64 {
+        let fees = rate
+            .fee_vb(NO_SHOW_VSIZE)
+            .map_or(u64::MAX, |fee| fee.to_sat());
+        fees.saturating_mul(self.fee_share).max(min)
+    }
+}
+
 /// Bitcoin, as a provider paying out on it sees it: the blocks a wallet
 /// reads ([`Blocks`]), a way to broadcast, and the fee rates it estimates.
 pub trait Chain: Blocks + Sync {
@@ -144,6 +180,13 @@ impl<T: Transport> Provider<T> {
         self.payouts.as_ref()
     }
 
+    /// Bound what payouts whose clients never claim cost it to `limits`:
+    /// unbounded until bounded.
+    pub fn limit_payouts(mut self, limits: PayoutLimits) -> Self {
+        self.payout_limits = Some(limits);
+        self
+    }
+
     /// What it pays out on Bitcoin now: nothing until its wallet watches
     /// the chain, and coins up to what its coins free now pay.
     pub(crate) fn chain_info(&self) -> Result<Option<swaps::Chain>, Error> {
@@ -153,7 +196,19 @@ impl<T: Transport> Provider<T> {
         if self.wallet.silent_next()?.is_none() {
             return Ok(None);
         }
+        let mut min = terms.min;
+        if let Some(limits) = self.payout_limits {
+            if self.open_payouts()? >= limits.open {
+                return Ok(None);
+            }
+            let rate = *self
+                .payout_rate
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            min = limits.least(min, rate.unwrap_or(self.floor()).max(self.floor()));
+        }
         Ok(Some(swaps::Chain {
+            min,
             max: terms.max.min(self.free_on_chain(&terms)?),
             ..terms
         }))
@@ -261,12 +316,32 @@ impl<T: Transport> Provider<T> {
                 incoming.expiry, terms.margin
             )));
         }
+        let limits = self.payout_limits;
+        if let Some(most) = limits.map(|l| l.max_blocks) {
+            if timeout.saturating_sub(tip) > most {
+                return Err(declined(format!(
+                    "the lock expires at {}: a coin timed out {} blocks earlier would be held \
+                     more than {most} blocks",
+                    incoming.expiry, terms.margin
+                )));
+            }
+        }
         // To confirm before it would be canceled.
         let left = timeout.saturating_sub(CANCEL_LEFT).saturating_sub(tip);
         let estimate = self.estimate(chain, left).await;
         let Some(rate) = funding_rate(estimate, self.floor(), left, self.wallet.network()) else {
             return Err(declined("no fee estimate now"));
         };
+        if let Some(limits) = limits {
+            *self
+                .payout_rate
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(rate);
+            let least = limits.least(terms.min, rate);
+            if request.value < least {
+                return Err(declined(format!("coins of {least} to {} now", terms.max)));
+            }
+        }
         let refund_key = random_key();
         let htlc = Htlc {
             hash: incoming.hash,
@@ -328,6 +403,23 @@ impl<T: Transport> Provider<T> {
     ) -> Result<Option<Transaction>, Problem> {
         let _taking = self.taking.lock().unwrap_or_else(PoisonError::into_inner);
         self.admit(taken.from, taken.paid)?;
+        if let Some(limits) = self.payout_limits {
+            if self.open_payouts().map_err(unavailable)? >= limits.open {
+                return Err(declined("too many payouts under way now"));
+            }
+            let no_shows = self.no_shows(taken.from).map_err(unavailable)?;
+            if no_shows >= u64::from(limits.no_shows) {
+                tracing::warn!(
+                    from = taken.from,
+                    no_shows,
+                    "payouts from a hub declined: too many of its clients never claimed lately"
+                );
+                return Err(declined(format!(
+                    "too many payouts from hub {} went unclaimed lately",
+                    taken.from
+                )));
+            }
+        }
         if self.free_on_chain(terms).map_err(unavailable)? < taken.value {
             return Err(declined("the provider holds too little on chain now"));
         }
@@ -580,6 +672,21 @@ impl<T: Transport> Provider<T> {
             }
         }
         Ok(pending)
+    }
+
+    /// Payouts from the hub at `from`, by any URL the wallet knows it by,
+    /// refunded within [`NO_SHOW_FOR`]: their clients never claimed.
+    fn no_shows(&self, from: &str) -> Result<u64, Error> {
+        let urls = self.wallet.hub_urls(from)?;
+        let listed = serde_json::to_string(&urls).map_err(|e| Error::Setup(e.to_string()))?;
+        self.store.read(|c| {
+            Ok(c.query_row(
+                "SELECT count(*) FROM swaps WHERE kind = 'chain' AND state = 'refunded'
+                    AND updated_at >= ?2 AND from_url IN (SELECT value FROM json_each(?1))",
+                params![listed, now() - NO_SHOW_FOR],
+                |r| r.get::<_, i64>(0),
+            )? as u64)
+        })
     }
 
     /// Payouts under way, which only [`Provider::follow_payouts`] takes on.
