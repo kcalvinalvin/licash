@@ -44,7 +44,6 @@ import org.licash.core.ContractState
 import org.licash.core.Network
 import org.licash.core.Recovery
 import org.licash.core.RecoveryStage
-import org.licash.core.contractChangeProblem
 import org.licash.wallet.digits
 import org.licash.wallet.sat
 import org.licash.wallet.share
@@ -202,6 +201,10 @@ private fun Unfolded(c: Contract, cover: Cover, developer: Boolean, end: () -> U
     if (cover.on) Line("Covers now", sat(c.covers), tag = "covers")
     if (cover.ends != null) Line("Ends by itself in", cover.ends)
     if (!cover.failed) FeeLine("Cost", c.price, c.cap, value = sat(c.price), breakdown = setupCost(c.cap, c.price))
+    // What she funded of it herself: hers once issued, else its recovery claims it.
+    if (c.funded > 0uL && !cover.failed) {
+        Line("You funded", "${sat(c.funded)} · ${if (c.fundedReceived) "in your balance" else "on its way"}", tag = "contract-funded")
+    }
     if (cover.held) {
         // Its status at a glance; the margin and what it means, when tapped.
         safety?.let {
@@ -351,20 +354,12 @@ internal fun ProtectSheet(q: ContractQuote, open: () -> Unit, cashOutFirst: () -
         Spacer(Modifier.height(8.dp))
         val coin = q.coin
         if (coin != null) {
-            // Its coin turned whole into it and notes it covers, or refused.
-            val problem = contractChangeProblem(coin, q.price, q.cap, q.dust, q.change)
-            problem?.let {
-                Text(
-                    whyNot(it),
-                    modifier = Modifier.padding(vertical = 8.dp).testTag("contract-problem"),
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.error,
-                )
-            }
+            // Paid from a coin of the price at least, the rest back on Bitcoin.
+            val left = if (coin > q.price) coin - q.price else 0uL
+            if (left >= q.dust) Line("Back to your Bitcoin", "About ${sat(left)}", tag = "contract-change")
             BigButton(
                 "Protect for ${sat(q.price)}",
                 Modifier.fillMaxWidth().testTag("protect"),
-                enabled = problem == null,
             ) { open() }
         } else {
             Say("Paid from Bitcoin you hold, and you hold too little. Cash out to yourself first, then protect.")

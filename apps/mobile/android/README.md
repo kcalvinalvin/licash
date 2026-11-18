@@ -195,12 +195,17 @@ to its cap, until its last block to recover in, then closes by itself, its
 collateral back to the hub. Its price is paid from a coin of the wallet's on
 Bitcoin, its change kept there; with none, the quote offers to cash notes
 out to the wallet first. At a hub that lets the wallet choose
-(`--contracts-max-cap`), sliders choose its cap (at first half again the
-largest coin, at most the hub's `--contracts-per-coin` times the coin
-paying) and how long it lasts (at first half a year), priced live as the hub
-prices them, and the coin paying, if there are several; its change then
-moves into the balance at that hub once its funding confirms, unless
-switched off. Opening downloads about 100 MB and takes minutes to an hour,
+(`--contracts-max-cap`), sliders choose its cap among the hub's sizes
+(`2^n - 1` sat; at first the size up to half again the largest coin, at
+most the hub's `--contracts-per-coin` times the coin paying), how long it
+lasts (at first half a year) and how much of it the owner funds herself
+(at first all the coin pays beside the price): the hub charges its
+interest on its own part only, and her part joins her balance at that hub
+once its funding is 3 blocks deep, or is claimed by a recovery should the
+hub never issue it. Priced live as the hub prices them, itemized (the
+hub's opening fee, its yearly interest on each part, her reserve), and
+paid from the coin chosen, if there are several; what is left of it stays
+on Bitcoin. Opening downloads about 100 MB and takes minutes to an hour,
 in the background, one at a time, the step it is at shown; several
 contracts at a hub, and at several hubs, add up. Each says what it covers
 now of the hub's notes once unfolded: what its recovery would claim of them

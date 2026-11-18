@@ -5,8 +5,11 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import org.licash.core.ContractFee
+import org.licash.core.ContractRange
 import org.licash.core.InvoiceQuote
 import org.licash.core.Rate
+import org.licash.wallet.digits
 import org.licash.wallet.percent
 import org.licash.wallet.sat
 import org.licash.wallet.share
@@ -34,6 +37,31 @@ internal fun setupCost(amount: ULong, cost: ULong) = FeeBreakdown(
     explanation = "Setup cost relative to the maximum payout, not a payment fee. A separate hub-fee and reserve split is not supplied here; reserves may return during recovery.",
     title = "Setup cost", totalLabel = "Total cost", amountLabel = "Maximum payout",
 )
+
+/**
+ * What protection of `cap` sat chosen within `range` costs, `price`,
+ * itemized as its hub prices it: its opening fee, its interest by the year
+ * on the part it funds and on the `funded` part hers, and her reserve,
+ * returned as it closes. Her part is paid beside it and comes back to her.
+ */
+internal fun contractCost(range: ContractRange, cap: ULong, price: ULong, fee: ContractFee, funded: ULong): FeeBreakdown {
+    val hubs = cap - funded.coerceAtMost(cap)
+    val parts = listOf(
+        "Hub's opening fee" to fee.opening,
+        "Interest on the hub's part" to fee.interest,
+        "Interest on your part" to fee.interestFunded,
+        "Your reserve" to range.reserve,
+    )
+    val yours = if (funded == 0uL) "" else
+        " and ${percent(range.ppmYearFunded.toULong())} a year on the ${digits(funded)} sat you fund yourself, " +
+            "paid from your coin beside this cost and joining your balance once its funding confirms"
+    return FeeBreakdown(
+        cap, price, feeParts(price, parts),
+        explanation = "Interest: ${percent(range.ppmYear.toULong())} a year on the ${digits(hubs)} sat the hub " +
+            "funds$yours. Your reserve returns to you as it closes; a recovery may use it.",
+        title = "Setup cost", totalLabel = "Total cost", amountLabel = "Maximum payout",
+    )
+}
 
 /**
  * A fee's parts by who gets them, as quoted or recorded: those of 0 left

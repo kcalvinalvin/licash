@@ -677,6 +677,58 @@ pub fn least(range: Option<licash_api::ContractRange>, cap: u32, price: u64) -> 
     }
 }
 
+/// The most of `wanted` sat a contract can be funded with by its holder,
+/// in `notes` notes at most of `denominations` (a keyset's, the fewest
+/// notes largest first): what a funding of `wanted` rounds down to, that
+/// a claim names them all should the hub never issue them.
+pub fn fundable(denominations: &[u64], notes: usize, wanted: u64) -> u64 {
+    let mut sorted = denominations.to_vec();
+    sorted.sort_unstable_by(|a, b| b.cmp(a));
+    let (mut left, mut taken, mut made) = (wanted, 0, 0);
+    for denom in sorted.into_iter().filter(|&d| d > 0) {
+        while left >= denom && made < notes {
+            left -= denom;
+            taken += denom;
+            made += 1;
+        }
+    }
+    taken
+}
+
+/// What a contract on `quote` can be funded with by its holder: the
+/// denominations of its keyset and the most notes, those a claim names
+/// ([`fundable`]).
+pub fn funding_notes(quote: &Quote) -> (Vec<u64>, usize) {
+    let terms = claims::ClaimTerms::new(*quote.keyset.id(), quote.limits.max_authorizations);
+    (quote.keyset.denominations().collect(), terms.max)
+}
+
+/// The most of a contract within `range` of `cap` sat over `blocks` its
+/// holder funds from a coin of `coin` sat, her part and the price it then
+/// has paid from it, rounded down to what `denominations` make in `notes`
+/// notes ([`fundable`]): none if the coin pays no more than the price.
+pub fn most_funded(
+    range: &licash_api::ContractRange,
+    (cap, blocks): (u32, u32),
+    coin: u64,
+    (denominations, notes): (&[u64], usize),
+) -> u64 {
+    // What the coin pays grows with her part, never by more than it.
+    let pays = |funded: u32| u64::from(funded) + range.price(cap, blocks, funded);
+    let (mut low, mut high) = (0, cap);
+    if pays(0) > coin {
+        return 0;
+    }
+    while low < high {
+        let mid = low + (high - low).div_ceil(2);
+        match pays(mid) <= coin {
+            true => low = mid,
+            false => high = mid - 1,
+        }
+    }
+    fundable(denominations, notes, u64::from(low))
+}
+
 /// The offer of `hub` now: of `chosen` terms, a cap in sat over blocks,
 /// if any, else its fixed ones, `funded` sat of it hers. Refused unless
 /// of those terms exactly, as a hub offering no others answers.
@@ -769,9 +821,14 @@ fn funded_notes<T: Transport>(
     let most = claims::ClaimTerms::new(*quote.keyset.id(), quote.limits.max_authorizations).max;
     ensure!(
         outputs.len() <= most,
-        "{funded} sat are {} notes at the hub, more than the {most} a claim names: fund a \
-         rounder amount",
-        outputs.len()
+        "{funded} sat are {} notes at the hub, more than the {most} a claim names: fund {} \
+         sat, say",
+        outputs.len(),
+        fundable(
+            &quote.keyset.denominations().collect::<Vec<_>>(),
+            most,
+            funded
+        )
     );
     Ok(licash_contract::wire::FundedNotes { ephemeral, outputs })
 }
@@ -873,6 +930,46 @@ mod tests {
         let ranked = rank_code_hubs(hubs);
         let wanted = ["d", "a", "b", "f", "e", "c"].map(|h| format!("http://{h}.test"));
         assert_eq!(ranked, wanted);
+    }
+
+    #[test]
+    fn a_funding_rounds_down_to_as_many_notes_as_a_claim_names() {
+        let twos: Vec<u64> = (0..12).map(|i| 1 << i).collect();
+        assert_eq!(fundable(&twos, 32, 4_095), 4_095);
+        // 2 048 at most a note: 31 of them, and 1 024 of the 2 047 left.
+        assert_eq!(fundable(&twos, 32, 65_535), 2_048 * 31 + 1_024);
+        assert_eq!(fundable(&twos, 3, 7_000), 2_048 * 3);
+        assert_eq!(fundable(&twos, 3, 5), 5);
+        assert_eq!(fundable(&twos, 0, 5), 0);
+        let wide: Vec<u64> = (0..32).map(|i| 1 << i).collect();
+        assert_eq!(fundable(&wide, 16, 1_000_000), 1_000_000);
+    }
+
+    #[test]
+    fn she_funds_what_her_coin_pays_beside_the_price_of_the_rest() {
+        let range = licash_api::ContractRange {
+            min_cap: 131_071,
+            max_cap: 16_777_215,
+            min_blocks: 300,
+            max_blocks: 52_560,
+            per_coin: 4,
+            reserve: 20_000,
+            fee: 3_000,
+            ppm_year: 20_000,
+            ppm_year_funded: 0,
+        };
+        let wide: Vec<u64> = (0..32).map(|i| 1 << i).collect();
+        let most = |cap, coin| most_funded(&range, (cap, 52_560), coin, (&wide, 32));
+        // 1 M sat: the price of the rest of 1 048 575, and her part.
+        let funded = most(1_048_575, 1_000_000);
+        let pays = funded + range.price(1_048_575, 52_560, funded as u32);
+        assert!(pays <= 1_000_000 && pays + 2 > 1_000_000, "{funded} {pays}");
+        // All of it hers, at most; none of a coin short of the price.
+        assert_eq!(most(131_071, 10_000_000), 131_071);
+        assert_eq!(most(131_071, 25_000), 0);
+        let twos: Vec<u64> = (0..12).map(|i| 1 << i).collect();
+        let rounded = most_funded(&range, (1_048_575, 52_560), 1_000_000, (&twos, 32));
+        assert_eq!(rounded, 2_048 * 32);
     }
 
     #[test]

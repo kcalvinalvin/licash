@@ -155,10 +155,11 @@ data class Event(val text: String, val received: ULong? = null)
 
 /**
  * A contract's terms its owner chose, within its hub's range: up to `cap`
- * sat over `blocks`, paid from `coin` (`txid:vout`), its change moved into
- * Licash once its funding confirms if `moveChange`.
+ * sat over `blocks`, paid from `coin` (`txid:vout`), `funded` sat of it
+ * funded by her from that coin, issued back to her balance once its
+ * funding confirms; the rest of the coin back on Bitcoin.
  */
-data class Chosen(val cap: ULong, val blocks: UInt, val coin: String)
+data class Chosen(val cap: ULong, val blocks: UInt, val coin: String, val funded: ULong = 0uL)
 
 /**
  * The wallet and the light client, and the loop keeping them in step while
@@ -1266,7 +1267,7 @@ class Engine(context: Context) {
             if (started) it.copy(opening = hub, offer = null) else it
         }
         if (!started) return
-        AppLog.info("opening a contract at $hub${chosen?.let { " of ${it.cap} sat over ${it.blocks} blocks" } ?: ""}")
+        AppLog.info("opening a contract at $hub${chosen?.let { " of ${it.cap} sat over ${it.blocks} blocks, ${it.funded} funded" } ?: ""}")
         scope.launch {
             try {
                 val chain = GoChain(light)
@@ -1275,7 +1276,7 @@ class Engine(context: Context) {
                         it.openContract(chain, hub, null, maxPrice)
                     } else {
                         it.openChosenContract(
-                            chain, hub, chosen.cap, chosen.blocks, maxPrice, chosen.coin,
+                            chain, hub, chosen.cap, chosen.blocks, chosen.funded, maxPrice, chosen.coin,
                         )
                     }
                 }

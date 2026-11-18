@@ -12,7 +12,7 @@ class OfferTest {
     private fun offer(vararg coins: String) = ContractQuote(
         hub = "https://hub.example",
         price = 23_000uL,
-        cap = 4_096uL,
+        cap = 131_071uL,
         blocks = 1_000u,
         protectsFor = 820u,
         mock = false,
@@ -24,7 +24,8 @@ class OfferTest {
         suggestedCap = 15_000_000uL,
         suggestedBlocks = 26_280u,
         dust = 330uL,
-        change = null,
+        denominations = (0..31).map { 1uL shl it },
+        fundedNotes = 32u,
     )
 
     @Test

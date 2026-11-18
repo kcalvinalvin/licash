@@ -38,7 +38,9 @@ a person sees. The apps differ in medium, not in manners.
    the app, `10,000 + 12 sat (0.12%)` in a terminal. Two significant
    digits (`0.24%`, `1.2%`, `5%`, `12%`), `<0.01%` below that, nothing
    for no fee (the word `None` says it). A protection's price is a share
-   of what it covers. A fee known only as terms (`1 sat + 0.5%`, or
+   of what it covers, and is itemized before it is paid: the hub's
+   opening fee, its interest by the year on the part it funds (and on
+   hers, if she funds part), and her reserve, returned. A fee known only as terms (`1 sat + 0.5%`, or
    `1 sat + 0.01% + 0.1 sat a note` at a hub that charges for the notes a
    payment makes) stays terms; a limit stays a limit (`Up to 21 sat ·
    0.21%`). Operator views retain their existing percentage precision

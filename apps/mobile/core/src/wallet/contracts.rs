@@ -15,9 +15,8 @@ use licash_contracts::holder::{self, Ask, Fate, Phase};
 
 use super::Wallet;
 use crate::{
-    chain::Chain, contract_change_problem, Activity, Balance, ChainSource, ChangeRange, Contract,
-    ContractQuote, ContractState, DepositCoin, Details, Kind, LicashError, OpeningStep, State,
-    Transfer,
+    chain::Chain, Activity, Balance, ChainSource, Contract, ContractQuote, ContractState,
+    DepositCoin, Details, Kind, LicashError, OpeningStep, State, Transfer,
 };
 
 /// How large an instance of a contract's opening is, about: her wallet
@@ -63,7 +62,6 @@ impl Wallet {
     /// offers, and the coin on Bitcoin that would pay it.
     pub fn contract_quote(&self, hub: String) -> Result<ContractQuote, LicashError> {
         let (hub, terms) = self.contracting_hub(&hub)?;
-        let change = self.change_range(&hub)?;
         let trust = licash_contracts::trust(self.wallet.network());
         let trust = trust.map_err(|e| LicashError::invalid(format!("{e:#}")))?;
         let offer = holder::offer(&self.wallet, &hub, None, 0);
@@ -74,6 +72,7 @@ impl Wallet {
         let blocks = offer.bounds.lock;
         let after_assert = holder::after_assert(&offer.quote);
         let largest = coins.first().map(|c| c.value);
+        let (denominations, funded_notes) = holder::funding_notes(&offer.quote);
         let (suggested_cap, suggested_blocks) = match &terms.range {
             Some(range) => suggested(range, largest),
             None => (offer.quote.cap, blocks),
@@ -99,7 +98,8 @@ impl Wallet {
             suggested_cap: u64::from(suggested_cap),
             suggested_blocks,
             dust: offer.quote.graph.dust,
-            change,
+            denominations,
+            funded_notes: u32::try_from(funded_notes).unwrap_or(u32::MAX),
         })
     }
 
@@ -132,11 +132,8 @@ impl Wallet {
             .hubs()?
             .into_iter()
             .filter(|(url, _)| !busy.contains(&url.trim_end_matches('/')))
-            .filter_map(|(url, info)| {
-                let change = info.deposits.as_ref().and_then(ChangeRange::of);
-                Some((url, info.contracts?.range?, change))
-            })
-            .filter(|(_, range, _)| check_range(range).is_ok())
+            .filter_map(|(url, info)| Some((url, info.contracts?.range?)))
+            .filter(|(_, range)| check_range(range).is_ok())
             .collect();
         for hub in best(&hubs, coin) {
             match self.contract_quote(hub.to_owned()) {
@@ -151,10 +148,10 @@ impl Wallet {
     /// (by default, as late as it allows), for at most `max_price` (by
     /// default, what its info says), broadcasting its funding through
     /// `chain`: the contract, confirming once its funding is signed.
-    /// Paid from the smallest coin on Bitcoin that pays it, whole: its
-    /// change into notes it protects ([`holder::Change::Notes`]). Takes
-    /// minutes: its downloads are large. One at a time; under way,
-    /// [`Wallet::resume_contracts`] carries it on.
+    /// Paid from the smallest coin on Bitcoin that pays it, its change
+    /// back to the wallet on Bitcoin. Takes minutes: its downloads are
+    /// large. One at a time; under way, [`Wallet::resume_contracts`]
+    /// carries it on.
     pub fn open_contract(
         &self,
         chain: Arc<dyn ChainSource>,
@@ -179,10 +176,12 @@ impl Wallet {
 
     /// Open a contract at `hub`, a hub trusted that lets the wallet
     /// choose (its terms' range), protecting up to `cap` sat and closing
-    /// `blocks` from now, for at most `max_price`, paid from `coin`
-    /// (`txid:vout`; by default the smallest large enough), as
-    /// [`Wallet::open_contract`]: the coin turned whole into the contract
-    /// and the notes it protects, never leaving change on Bitcoin.
+    /// `blocks` from now, `funded` sat of it funded by her, for at most
+    /// `max_price`, paid from `coin` (`txid:vout`; by default the smallest
+    /// large enough), as [`Wallet::open_contract`]. What she funds is paid
+    /// from the coin beside the price, the hub's interest charged on the
+    /// rest only, and issued her as notes at the hub once its funding is
+    /// buried ([`crate::contract_fundable`] says what amounts can be).
     #[allow(clippy::too_many_arguments)]
     pub fn open_chosen_contract(
         &self,
@@ -190,6 +189,7 @@ impl Wallet {
         hub: String,
         cap: u64,
         blocks: u32,
+        funded: u64,
         max_price: u64,
         coin: Option<String>,
     ) -> Result<Contract, LicashError> {
@@ -211,7 +211,7 @@ impl Wallet {
                 .parse::<OutPoint>()
                 .map_err(|e| LicashError::invalid(format!("a coin {coin}: {e}")))?,
             None => {
-                let least = holder::least(Some(range), cap, max_price);
+                let least = holder::least(Some(range), cap, max_price.saturating_add(funded));
                 let coin = holder::coin(&self.wallet, &self.dir, least).map_err(failed)?;
                 let coin = coin.ok_or_else(|| {
                     LicashError::invalid(format!(
@@ -226,7 +226,7 @@ impl Wallet {
             max_price,
             cap: Some(cap),
             deposit: Some(deposit),
-            funded: 0,
+            funded,
         };
         self.opened(chain, &hub, ask)
     }
@@ -283,15 +283,6 @@ impl Wallet {
 
     /// `hub`, a hub trusted that opens contracts, by its URL as contracts
     /// keep it, and its terms as its info says.
-    /// The change of a coin paying for a contract that `hub` takes into
-    /// notes, as its info says.
-    fn change_range(&self, hub: &str) -> Result<Option<ChangeRange>, LicashError> {
-        let hub = hub.trim_end_matches('/');
-        let mut trusted = self.wallet.hubs()?.into_iter();
-        let info = trusted.find(|(url, _)| url.trim_end_matches('/') == hub);
-        Ok(info.and_then(|(_, i)| i.deposits.as_ref().and_then(ChangeRange::of)))
-    }
-
     fn contracting_hub(&self, hub: &str) -> Result<(String, licash_api::Contracts), LicashError> {
         let hub = hub.trim().trim_end_matches('/');
         let trusted = self.wallet.hubs()?.into_iter();
@@ -368,6 +359,8 @@ impl Wallet {
             cap: u64::from(c.cap),
             covers,
             price: c.price,
+            funded: c.funded,
+            funded_received: c.funded_received,
             paid_from: c.value,
             protects_until: c.assert_height,
             closes_at: c.close_height,
@@ -468,25 +461,22 @@ fn suggested(range: &licash_api::ContractRange, coin: Option<u64>) -> (u32, u32)
 /// The most of a coin a contract offered unasked costs: a tenth.
 const SHARE: u64 = 10;
 
-/// A hub letting the wallet choose terms: its URL, its range, and the
-/// change it takes into notes.
-type Offering = (String, licash_api::ContractRange, Option<ChangeRange>);
+/// A hub letting the wallet choose terms: its URL and its range.
+type Offering = (String, licash_api::ContractRange);
 
 /// Of `hubs`, those to offer a contract at, paid from a `coin` of so many
-/// sat, of the suggested terms ([`suggested`]): the one protecting the
-/// most first, then the cheapest. None whose price is past a [`SHARE`]
-/// of the coin, that the coin does not pay, or that would not take its
-/// change whole into notes it protects ([`contract_change_problem`]).
+/// sat, of the suggested terms ([`suggested`]), none of it funded by her:
+/// the one protecting the most first, then the cheapest. None whose price
+/// is past a [`SHARE`] of the coin, or that the coin does not pay.
 fn best(hubs: &[Offering], coin: u64) -> Vec<&str> {
     let mut offers: Vec<(&str, u32, u64)> = hubs
         .iter()
-        .filter_map(|(hub, range, change)| {
+        .filter_map(|(hub, range)| {
             let (cap, blocks) = suggested(range, Some(coin));
             range.max_cap_for(coin)?;
             let price = range.price(cap, blocks, 0);
             let pays = coin >= holder::least(Some(*range), cap, price);
-            let whole = contract_change_problem(coin, price, cap.into(), 0, *change).is_none();
-            (pays && whole && price <= coin / SHARE).then_some((hub.as_str(), cap, price))
+            (pays && price <= coin / SHARE).then_some((hub.as_str(), cap, price))
         })
         .collect();
     offers.sort_by_key(|&(_, cap, price)| (std::cmp::Reverse(cap), price));
@@ -791,11 +781,7 @@ mod tests {
 
     #[test]
     fn a_contract_is_offered_where_it_protects_the_most_for_the_least() {
-        let taken = Some(ChangeRange {
-            least: 11_000,
-            most: 50_000_000,
-        });
-        let hub = |name: &str, range| (format!("https://{name}"), range, taken);
+        let hub = |name: &str, range| (format!("https://{name}"), range);
         let dear = licash_api::ContractRange {
             ppm_year: 20_000,
             ..range()
@@ -810,17 +796,11 @@ mod tests {
             hub("cheap", range()),
         ];
         // The 10 M sat coin: 16 777 215 sat protected where it can be,
-        // for 106 886 sat at the cheaper; none where 1 M sat at most is,
-        // its change unprotected notes.
-        assert_eq!(best(&hubs, 10_000_000), ["https://cheap", "https://dear"]);
-        // Nor where the hub takes no change, or not so much at once.
-        let none = [(hubs[2].0.clone(), range(), None)];
-        assert!(best(&none, 10_000_000).is_empty());
-        let less = Some(ChangeRange {
-            least: 11_000,
-            most: 5_001_000,
-        });
-        assert!(best(&[(hubs[2].0.clone(), range(), less)], 10_000_000).is_empty());
+        // for 106 886 sat at the cheaper; 524 287 where 1 M sat at most is.
+        assert_eq!(
+            best(&hubs, 10_000_000),
+            ["https://cheap", "https://dear", "https://small"]
+        );
         // Costing past a tenth of the coin: none offered.
         assert!(best(&hubs, 200_000).is_empty());
         assert_eq!(best(&hubs[2..], 300_000), ["https://cheap"]);
@@ -830,82 +810,51 @@ mod tests {
     }
 
     #[test]
-    fn a_coin_pays_for_a_contract_only_turned_whole_into_it_and_notes_it_protects() {
-        use crate::ChangeProblem as P;
-        let taken = Some(ChangeRange {
-            least: 11_000,
-            most: 5_001_000,
-        });
-        let problem = |coin, cap, change| contract_change_problem(coin, 23_000, cap, 330, change);
-        // Of the price, or change under dust: paid, the dust to the fee.
-        assert_eq!(problem(23_000, 4_096, None), None);
-        assert_eq!(problem(23_329, 4_096, None), None);
-        assert_eq!(
-            problem(22_999, 4_096, taken),
-            Some(P::Short { needed: 23_000 })
-        );
-        // Change into notes it protects, as the hub takes them.
-        assert_eq!(problem(100_000, 100_000, taken), None);
-        assert_eq!(
-            problem(100_000, 76_999, taken),
-            Some(P::Uncovered { change: 77_000 })
-        );
-        assert_eq!(
-            problem(100_000, 100_000, None),
-            Some(P::NotTaken { change: 77_000 })
-        );
-        assert_eq!(
-            problem(33_000, 100_000, taken),
-            Some(P::TooLittle {
-                change: 10_000,
-                least: 11_000
-            })
-        );
-        assert_eq!(
-            problem(10_000_000, 15_000_000, taken),
-            Some(P::TooMuch {
-                change: 9_977_000,
-                most: 5_001_000
-            })
-        );
-        // A hub leaving too little time to pay one in the funding: none.
-        let deposits = |window| licash_api::Deposits {
-            fee: licash_api::Fee {
-                base: 1_000,
-                ppm: 0,
-            },
-            min: 10_000,
-            max: 5_000_000,
-            depth: 1,
-            window,
-            timeout: 1_000,
-        };
-        assert_eq!(ChangeRange::of(&deposits(47)), None);
-        assert_eq!(ChangeRange::of(&deposits(48)), taken);
+    fn a_contract_chosen_starts_at_a_size_its_coin_pays() {
+        let range = crate::ContractRange::from(range());
+        let start = |coin, cap| crate::payable_size(range, coin, cap, 26_280);
+        // The 10 M sat coin pays the size above half again itself.
+        assert_eq!(start(10_000_000, 16_777_215), Some(16_777_215));
+        // Asked between sizes: the one below.
+        assert_eq!(start(10_000_000, 20_000_000), Some(16_777_215));
+        // Twice the coin at most: the largest the coin pays.
+        assert_eq!(start(10_000_000, 33_554_431), Some(16_777_215));
+        // A coin of 70 k sat pays the least, 131 071 sat, the rest back.
+        assert_eq!(start(70_000, 262_143), Some(131_071));
+        // Too small a coin for the least: none.
+        assert_eq!(start(23_000, 131_071), None);
     }
 
     #[test]
-    fn a_contract_chosen_starts_at_a_cap_its_coin_pays() {
-        let taken = Some(ChangeRange {
-            least: 11_000,
-            most: 50_000_000,
-        });
+    fn she_funds_what_her_coin_pays_beside_the_price_rounded_to_notes_a_claim_names() {
         let range = crate::ContractRange::from(range());
-        let start = |coin, cap| crate::payable_cap(range, coin, cap, 26_280, 330, taken);
-        // The 10 M sat coin pays the size above half again itself.
-        assert_eq!(start(10_000_000, 16_777_215), Some(16_777_215));
-        // Asked between sizes: the one below, if it covers the change.
-        assert_eq!(start(10_000_000, 20_000_000), Some(16_777_215));
-        // Of 8 388 607, 10 M sat leaves more than it protects: the largest
-        // the coin pays.
-        assert_eq!(start(10_000_000, 8_388_607), Some(16_777_215));
-        // A coin of 70 k sat pays the least, 131 071 sat, its 46 k sat
-        // left taken into notes.
-        assert_eq!(start(70_000, 262_143), Some(131_071));
-        // A coin of 30 k sat leaves too little to take into notes, 6 k.
-        assert_eq!(start(30_000, 131_071), None);
-        // Too small a coin for the least: none.
-        assert_eq!(start(23_000, 131_071), None);
+        let wide: Vec<u64> = (0..32).map(|i| 1 << i).collect();
+        let most =
+            |cap, coin| crate::contract_most_funded(range, cap, 26_280, coin, wide.clone(), 32);
+        let funded = most(131_071, 100_000);
+        let pays = |f| f + crate::contract_price(range, 131_071, 26_280, f);
+        assert!(
+            pays(funded) <= 100_000 && pays(funded + 1) > 100_000,
+            "{funded}"
+        );
+        assert_eq!(
+            crate::contract_least_coin(range, 131_071, 26_280, funded),
+            pays(funded)
+        );
+        // All of it hers at most; none of a coin short of the price, or
+        // too small for so large a cap.
+        assert_eq!(most(131_071, 1_000_000), 131_071);
+        assert_eq!(most(131_071, 20_000), 0);
+        assert_eq!(most(1_048_575, 300_000), 0);
+        assert_eq!(
+            crate::contract_least_coin(range, 1_048_575, 26_280, 0),
+            524_288
+        );
+        // A hub of notes 2 048 at most: 32 of them at most.
+        let twos: Vec<u64> = (0..12).map(|i| 1 << i).collect();
+        assert_eq!(crate::contract_fundable(twos.clone(), 32, 65_535), 64_512);
+        let rounded = crate::contract_most_funded(range, 131_071, 26_280, 100_000, twos, 32);
+        assert_eq!(rounded, 65_536);
     }
 
     #[test]
@@ -933,12 +882,22 @@ mod tests {
         assert_eq!(range.api(), super::tests::range());
         // 16 777 215 sat for half a year at 1% a year, over the reserve
         // and fee.
-        assert_eq!(crate::contract_price(range, 16_777_215, 26_280), 106_886);
-        assert_eq!(crate::contract_price(range, 131_071, 1_000), 23_024);
+        assert_eq!(crate::contract_price(range, 16_777_215, 26_280, 0), 106_886);
+        assert_eq!(crate::contract_price(range, 131_071, 1_000, 0), 23_024);
+        // Half of it hers: interest on the hub's half only.
+        let fee = crate::contract_fee(range, 16_777_215, 26_280, 8_388_607);
+        assert_eq!(
+            (fee.opening, fee.interest, fee.interest_funded),
+            (3_000, 41_943, 0)
+        );
+        assert_eq!(
+            crate::contract_price(range, 16_777_215, 26_280, 8_388_607),
+            20_000 + 3_000 + 41_943
+        );
         assert_eq!(crate::contract_sizes(range).len(), 10);
         // A cap past what a hub could offer: priced as the most.
-        let most = crate::contract_price(range, u64::from(u32::MAX), 26_280);
-        assert_eq!(crate::contract_price(range, u64::MAX, 26_280), most);
+        let most = crate::contract_price(range, u64::from(u32::MAX), 26_280, 0);
+        assert_eq!(crate::contract_price(range, u64::MAX, 26_280, 0), most);
         assert_eq!(crate::contract_max_cap(range, 10_000_000), Some(16_777_215));
         assert_eq!(crate::contract_max_cap(range, 65_535), None);
     }

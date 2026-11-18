@@ -32,7 +32,7 @@ class CoverTest {
     private val created = 1_800_000_000L
 
     private fun contract(state: ContractState, mock: Boolean = true) = Contract(
-        id = "c0", hub = "https://hub.example", state = state, mock = mock, cap = 4_096uL, price = 23_000uL,
+        id = "c0", hub = "https://hub.example", state = state, mock = mock, cap = 131_071uL, price = 23_000uL, funded = 0uL, fundedReceived = false,
         paidFrom = 33_000uL, protectsUntil = 1_861u, closesAt = 2_005u, funding = null, createdAt = created,
         covers = 0uL, step = null, transfer = null,
     )

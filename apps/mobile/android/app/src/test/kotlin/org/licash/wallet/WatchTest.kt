@@ -117,7 +117,7 @@ class WatchTest {
     fun a_contract_protecting_is_looked_at_later_for_its_exit() {
         fun contract(state: ContractState) = Contract(
             id = "c0", hub = "https://hub.example", state = state, mock = false, cap = 4_096uL, covers = 3_000uL,
-            price = 1_000uL, paidFrom = 0uL, protectsUntil = 5_000u, closesAt = 5_500u, funding = null,
+            price = 1_000uL, funded = 0uL, fundedReceived = false, paidFrom = 0uL, protectsUntil = 5_000u, closesAt = 5_500u, funding = null,
             createdAt = 0L, step = null, transfer = null,
         )
         assertEquals(Watch.LATER, watchOf(Ui(contracts = listOf(contract(ContractState.Protecting))), now))

@@ -227,21 +227,29 @@ another node's wallet instead, by its JSON-RPC as `--chain` takes it
 (`http://host:port/wallet/NAME?cookie=PATH`), on the same network: the hub
 may then follow the chain through an Esplora API. A wallet of its own,
 funded with what the hub may lock, bounds the collateral at stake.
-`/v1/info` names its fixed terms: the cap (4,096 sat), the price a wallet
+`/v1/info` names its fixed terms: the cap (131,071 sat), the price a wallet
 pays to open one and the blocks to its close (1,000); the openings take
 `/v1/contracts`. With `--contracts-max-cap SAT`, wallets may also choose a
 contract's cap up to that and how long it lasts up to
 `--contracts-max-blocks` (`/v1/contracts/quote?cap=SAT&blocks=N`), its cap
-at most `--contracts-per-coin` times (2 by default) the coin the wallet
-deposits, at the fixed price plus `--contracts-rate` millionths of the cap
-a year (10,000, 1% a year, by default); `/v1/info` then names that range,
+one of the sizes (`2^n - 1` sat, 131,071 to 2,147,483,647; the operator's
+largest rounded down to one) and at most `--contracts-per-coin` times (2 by
+default) the coin the wallet deposits, at the reserve and opening fee plus
+`--contracts-rate` millionths of the part of the cap the hub funds a year
+(10,000, 1% a year, by default). A wallet may fund part of the cap itself
+(`&funded=SAT`, a v5 contract): it pays that much more from its coin in F,
+`--contracts-rate-funded` millionths of it a year (none by default), and
+once F is 3 blocks deep (and as deep as the hub's funding depth) the hub
+issues it notes of that value at `/v1/contracts/openings/{id}/funded`,
+through a lock of its own settled at once; never issued, the wallet's
+claim names them, and a recovery pays them. `/v1/info` then names that range,
 its largest cap no more than the contracts' wallet funds (its confirmed
 balance, asked each minute with `getbalances`, less the hub's 100,000 sat
 reserve and 50,000 for fees): a larger cap is refused as unavailable. A
 login limited by `-rpcwhitelist` needs `getbalances` among its calls, or
 the hub advertises the range's largest cap whatever its wallet holds.
-The collateral of a contract is the next power of two minus one sat at or
-above its cap (2,097,151 sat at least, 2,147,483,647 at most). A contract
+The collateral of a contract is its cap exactly, every size of all ones in
+as many bits. A contract
 opens on a block as deep in the hub's scan as its lock checkpoints, which
 it takes as one when the contract opens if newer, so that every lock
 named after it can be claimed in it: the hub offers no contract until its

@@ -136,14 +136,17 @@ internal fun HubFees(
                     Entry(
                         "Price",
                         value = "${sat(range.reserve + range.fee)} + ${percent(range.ppmYear.toULong())} a year",
-                        sub = "of what it covers",
+                        sub = "${sat(range.fee)} opening fee and ${sat(range.reserve)} reserve, returned; " +
+                            "interest on the part the hub funds" +
+                            if (range.ppmYearFunded == 0u) ", none on yours" else
+                                ", ${percent(range.ppmYearFunded.toULong())} a year on yours",
                         tag = "protection-price",
                     )
                     Divider()
                     Entry(
                         "Covers",
                         value = between(range.minCap, range.maxCap),
-                        sub = "Up to ${range.perCoin} times the coin paying for it",
+                        sub = "In sizes doubling from the least, up to ${range.perCoin} times the coin paying for it",
                         tag = "protection-cap",
                     )
                     Divider()
