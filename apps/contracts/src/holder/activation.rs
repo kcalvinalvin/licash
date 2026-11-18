@@ -1,6 +1,6 @@
 //! The locks owed to her on Bitcoin ([`licash_wallet::OwedLock`]): their
 //! activations, made as one nears its expiry unpaid ([`keep`]), and as a
-//! recovery files them ([`shown`]).
+//! recovery files them.
 //!
 //! An activation reveals her preimage to all: made only while it can
 //! confirm before the lock's expiry, which makes its hub owe her the lock,

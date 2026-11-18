@@ -88,8 +88,7 @@ pub fn consent_to<T: Transport>(
 }
 
 /// Keep the locks `wallet` makes at a hub claimable on Bitcoin by her
-/// contracts there in `dir` ([`Wallet::guard_locks`]), as
-/// [`lock_horizon`] says.
+/// contracts there in `dir` ([`Wallet::guard_locks`]).
 pub fn guard_locks<T: Transport>(wallet: &Wallet<T>, dir: &Path) {
     let (seed, network) = (wallet.contract_secrets().seed, wallet.network());
     let dir = dir.to_path_buf();
