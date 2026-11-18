@@ -67,7 +67,14 @@ CREATE TABLE IF NOT EXISTS fees (
 ///   confirm, and made so by the hub some blocks after
 ///   ([`Store::unfunded`]). None (or no table), of a row signed before
 ///   these were kept, proves nothing: its blocks count from the first
-///   seen.
+///   seen;
+/// - `signing`: each answer of a one-time key (opening, `respond` or
+///   `assert`) the hub was about to sign, or had signed: kept once what
+///   it answers on is pinned in `responses.sqlite`, and before it signs
+///   ([`Store::begin_signing`]). One with nothing pinned there any more
+///   tells that file was lost, or restored older than this one: an answer
+///   decided anew could differ from the one signed. None (or no table),
+///   of an answer signed before these were kept, proves nothing.
 const RESPONDER: &str = "
 CREATE TABLE IF NOT EXISTS fee_coins (
     id BLOB NOT NULL REFERENCES openings (id),
@@ -91,6 +98,12 @@ CREATE TABLE IF NOT EXISTS unfunded (
     id BLOB PRIMARY KEY REFERENCES openings (id),
     height INTEGER NOT NULL,
     created_at INTEGER NOT NULL
+) STRICT;
+CREATE TABLE IF NOT EXISTS signing (
+    id BLOB NOT NULL REFERENCES openings (id),
+    name TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (id, name)
 ) STRICT;
 ";
 
@@ -434,6 +447,37 @@ impl Store {
             params![id, name, serialize(tx)],
         )?;
         Ok(())
+    }
+
+    /// The hub is about to sign answer `name` of opening `id` with its
+    /// one-time key, or has: kept before it signs, once what it answers
+    /// on is pinned in `responses.sqlite`.
+    pub fn begin_signing(&self, id: &[u8; 32], name: &str) -> Result<()> {
+        self.0.execute_batch(RESPONDER)?;
+        self.0.execute(
+            "INSERT INTO signing (id, name, created_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT DO NOTHING",
+            params![id, name, crate::now()],
+        )?;
+        Ok(())
+    }
+
+    /// Whether the hub was about to sign answer `name` of opening `id`, or
+    /// had ([`Store::begin_signing`]): not of one signed before these were
+    /// kept.
+    pub fn began_signing(&self, id: &[u8; 32], name: &str) -> Result<bool> {
+        if !self.has("signing")? {
+            return Ok(false);
+        }
+        Ok(self
+            .0
+            .query_row(
+                "SELECT 1 FROM signing WHERE id = ?1 AND name = ?2",
+                params![id, name],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some())
     }
 
     /// The block opening `id`'s F was first seen in no block at: `tip`,
@@ -797,6 +841,40 @@ mod tests {
         ensure!(store.child(&id, "respond")?.is_none());
         ensure!(store.extra_coins(&id, "assert")? == vec![coin(1), coin(2)]);
         ensure!(store.fee_coin(&id, "assert_timeout")? == Some(coin(5)));
+        Ok(())
+    }
+
+    /// Each one-time answer the hub began signing is kept, apart from the
+    /// other of its opening and across a restart. Openings kept by a build
+    /// before these were tell nothing, and the table is made with the
+    /// first kept.
+    #[test]
+    fn answers_begun_are_kept_and_openings_from_before_tell_nothing() -> Result<()> {
+        let data = tempfile::tempdir()?;
+        let store = Store::open(data.path())?;
+        let deposit = |n| OutPoint {
+            txid: bitcoin::hashes::Hash::from_byte_array([n; 32]),
+            vout: 0,
+        };
+        let (id, other) = ([1; 32], [2; 32]);
+        for id in [id, other] {
+            ensure!(store.insert(&id, 0, true, &deposit(id[0]), &[0; 32], b"state")?);
+        }
+        // As a build before made its responder's tables: without this one.
+        store.end(&other, 100)?;
+        store.0.execute_batch("DROP TABLE signing")?;
+        ensure!(!store.began_signing(&id, "respond")?);
+
+        store.begin_signing(&id, "respond")?;
+        store.begin_signing(&id, "respond")?;
+        ensure!(store.began_signing(&id, "respond")?);
+        ensure!(!store.began_signing(&id, "assert")?);
+        ensure!(!store.began_signing(&other, "respond")?);
+        store.begin_signing(&id, "assert")?;
+        drop(store);
+        let store = Store::open(data.path())?;
+        ensure!(store.began_signing(&id, "respond")? && store.began_signing(&id, "assert")?);
+        ensure!(!store.began_signing(&other, "assert")?);
         Ok(())
     }
 

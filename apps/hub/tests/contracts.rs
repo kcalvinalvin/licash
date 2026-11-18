@@ -2137,6 +2137,93 @@ async fn a_hub_that_responds_and_never_asserts_pays_her_whole_claim() -> Result<
     Ok(())
 }
 
+/// A hub that signed its response and lost `responses.sqlite` signs no
+/// other, decided anew: its openings tell it began that answer, and where
+/// they tell nothing either, as of a response signed by a build before
+/// they did, its response in the mempool does. The one it broadcast
+/// confirms, it proves nothing of evidence it no longer holds, and her
+/// response timeout pays her all she claimed.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs bitcoind and a release build"]
+async fn a_hub_that_lost_its_pinned_response_signs_no_other() -> Result<()> {
+    use licash_contracts::holder::recovery::{self, Stage};
+
+    let s = stale_claim([19; 32]).await?;
+    let data = s._dir.path().join("hub");
+    let told = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let alerts = told.clone();
+    s.openings.alert_with(Arc::new(move |message: &str| {
+        alerts.lock().unwrap().push(message.to_owned())
+    }));
+    let lost = || {
+        let told = told.lock().unwrap();
+        told.iter()
+            .filter(|m| m.contains("responses.sqlite no longer holds"))
+            .count()
+    };
+    // Its response signed and broadcast, in no block yet.
+    let mut responded = false;
+    for _ in 0..50 {
+        let round = s.openings.answer_requests().await?;
+        ensure!(round.failed == 0, "{round:?}");
+        if round.answered == 1 {
+            responded = true;
+            break;
+        }
+        s.rt.mine(1)?;
+    }
+    ensure!(responded && lost() == 0, "{:?}", told.lock().unwrap());
+    let db = rusqlite::Connection::open(data.join("openings.sqlite"))?;
+    let begun = || db.query_row("SELECT count(*) FROM signing", [], |r| r.get::<_, i64>(0));
+    ensure!(begun()? == 1);
+    let lose = || {
+        for end in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(data.join(format!("responses.sqlite{end}")));
+        }
+    };
+
+    // The file lost: no response is decided anew, and the operator is
+    // told, once.
+    lose();
+    for _ in 0..2 {
+        let round = s.openings.answer_requests().await?;
+        ensure!(round.answered == 0 && round.failed == 0, "{round:?}");
+    }
+    ensure!(lost() == 1, "{:?}", told.lock().unwrap());
+
+    // Its openings telling nothing either: the mempool does, and it is
+    // kept.
+    db.execute("DELETE FROM signing", [])?;
+    lose();
+    let round = s.openings.answer_requests().await?;
+    ensure!(round.answered == 0 && round.failed == 0, "{round:?}");
+    ensure!(begun()? == 1);
+
+    // The response it broadcast confirms; it asserts nothing.
+    let mut done = None;
+    for _ in 0..800 {
+        s.rt.mine(1)?;
+        let round = s.openings.answer_requests().await?;
+        ensure!(round.answered == 0, "{round:?}");
+        let r = recovery::advance(&s.wallet, &s.chain, &s.mine, s.rate).await?[0].clone();
+        ensure!(r.stage != Stage::Lost, "{r:?}");
+        if r.stage == Stage::Done {
+            done = Some(r);
+            break;
+        }
+    }
+    let done = done.context("never paid")?;
+    ensure!(
+        done.response.is_some() && done.assertion.is_none(),
+        "{done:?}"
+    );
+    ensure!(done.corrected == Some(4_096), "{done:?}");
+    ensure!(done.timeout.is_some(), "not her timeout: {done:?}");
+    let received = done.received.context("nothing received")?;
+    ensure!(received > 5_000, "{received} of a claim of 5000: {done:?}");
+    Ok(())
+}
+
 /// Transaction `txid` of a dispute, confirmed on `rt`'s standard node at
 /// the fee its graph presigned: at least 1 sat/vB of its actual size,
 /// what a node relays by default, with nothing to bump it.

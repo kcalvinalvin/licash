@@ -518,6 +518,17 @@ impl Openings {
             recovery::owed(&o.base, &request, &filed, evidence, &chain).map_err(|e| anyhow!("{e}"))
         };
         let pins = Responses::open(&self.data)?;
+        let spends = OutPoint {
+            txid: r.compute_txid(),
+            vout: 0,
+        };
+        // Hers after `w_H` blocks: until then only a response spends it.
+        let hers_at = r_at.saturating_add(u32::from(o.base.parts().graph.response_window));
+        let lone = tip.saturating_add(1) < hers_at;
+        let pinned = pins.evidence(id)?.is_some();
+        if !pinned && self.pin_lost(id, "respond", spends, lone).await? {
+            return Ok(Played::Idle);
+        }
         let evidence = match pins.evidence(id)? {
             Some(pinned) => pinned_evidence(o, &pinned)?,
             None => self.select(o, &filed, p_at, owed)?,
@@ -578,6 +589,7 @@ impl Openings {
             cited = evidence.len(),
             "a contract claim is owed less than it asks: responding"
         );
+        self.store().begin_signing(id, "respond")?;
         let keys = hub.keys();
         let response = pins.answer(id, r, || o.respond(keys, decided.owed))?;
         if let Some(prover) = prover {
@@ -675,9 +687,21 @@ impl Openings {
             self.post_link(id, hub, "assert", &tx, &x.output[0], window, stake, tip)
                 .await
         };
+        let spends = OutPoint {
+            txid: x.compute_txid(),
+            vout: 0,
+        };
         if let Some(tx) = pins.response(&tag)? {
+            self.store().begin_signing(id, "assert")?;
             post(tx).await?;
             return Ok(Played::Posted("assert"));
+        }
+        // Hers after `w_A` blocks: until then only an assertion spends it.
+        let hers_at = x_at.saturating_add(u32::from(o.base.parts().graph.assert_window));
+        let lone = tip.saturating_add(1) < hers_at;
+        let pinned = pins.evidence(&tag)?.is_some();
+        if !pinned && self.pin_lost(id, "assert", spends, lone).await? {
+            return Ok(Played::Idle);
         }
         let journal = graph::journal(&o.base);
         let kind = graph::kind(&o.base, o.mock);
@@ -693,9 +717,49 @@ impl Openings {
             kind.verify(&journal, &proof) || self.false_proofs(),
             "the proof does not verify for this contract"
         );
+        self.store().begin_signing(id, "assert")?;
         let tx = pins.answer(&tag, r, || o.assert(hub.keys(), &proof))?;
         post(tx).await?;
         Ok(Played::Posted("assert"))
+    }
+
+    /// Whether the hub signed answer `name` of opening `id`, or was about
+    /// to: asked while `responses.sqlite` holds nothing it answered on, as
+    /// once that file is lost, or restored older. Another answer, decided
+    /// anew, could differ from the one signed with the same one-time key,
+    /// which gives her the hub's outputs: then none is signed, her timeout
+    /// pays her what she claims, and the operator is told, once a run.
+    ///
+    /// Told by `openings.sqlite`, which keeps each answer before it is
+    /// signed ([`Store::begin_signing`]). Where it keeps none (signed by a
+    /// build before it did, or restored older too), by the mempool while
+    /// `lone`: nothing but this answer can spend `coin` yet, her timeout
+    /// being some blocks away, so a transaction spending it there is one
+    /// the hub signed. Kept then, to stand past her timeout's first block,
+    /// from which the mempool tells nothing.
+    async fn pin_lost(
+        &self,
+        id: &[u8; 32],
+        name: &'static str,
+        coin: OutPoint,
+        lone: bool,
+    ) -> Result<bool> {
+        let mut lost = self.store().began_signing(id, name)?;
+        if !lost && lone && !self.unspent(coin, true).await? && self.unspent(coin, false).await? {
+            self.store().begin_signing(id, name)?;
+            lost = true;
+        }
+        if lost && self.once(id, "pin lost") {
+            self.alert(&format!(
+                "contract {}: the hub signed its {name} with a one-time key, or was about \
+                 to, and responses.sqlite no longer holds what it answered on, as when that \
+                 file is lost or restored older than openings.sqlite. It signs no other: \
+                 her timeout pays her what she claims. Restore responses.sqlite as recent \
+                 as openings.sqlite.",
+                crate::hex_id(id)
+            ));
+        }
+        Ok(lost)
     }
 
     /// Whether this hub asserts proofs of another statement (tests).
