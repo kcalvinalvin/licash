@@ -2056,9 +2056,29 @@ async fn a_force_close_claims_a_lock_paying_her_once_activated_at_depth() -> Res
     rt.mine_to_height(expiry - lead)?;
     let kept = activation::keep(&bob, &chain, &mine, rate).await?;
     ensure!(kept.len() == 1 && kept[0].step == "activated", "{kept:?}");
+    let script = bitcoin::ScriptBuf::from_bytes(licash::chain::activation_script(&preimage));
+    let first = bob.silent_spends_paying(&script)?[0].tx.compute_txid();
+    // Left out of blocks a quarter of its lead: bumped, paying the same.
+    for _ in 0..lead / 4 {
+        rt.mine_with(&[])?;
+    }
+    let kept = activation::keep(&bob, &chain, &mine, rate).await?;
+    ensure!(kept.len() == 1 && kept[0].step == "bumped", "{kept:?}");
+    let spends = bob.silent_spends_paying(&script)?;
+    ensure!(spends.len() == 2, "{spends:?}");
+    let bumped = spends
+        .iter()
+        .find(|s| s.tx.compute_txid() != first)
+        .context("no bump")?;
+    let old = spends
+        .iter()
+        .find(|s| s.tx.compute_txid() == first)
+        .context("no first")?;
+    ensure!(bumped.fee > old.fee, "{spends:?}");
     rt.mine(1)?;
     let kept = activation::keep(&bob, &chain, &mine, rate).await?;
     ensure!(kept.len() == 1 && kept[0].step == "confirmed", "{kept:?}");
+    ensure!(rt.confirmations(&bumped.tx.compute_txid())?.is_some());
     let activated = (bob.owed_locks()?[0].activated_at).context("not recorded")?;
     ensure!(
         activated < expiry,
