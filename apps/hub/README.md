@@ -180,6 +180,19 @@ builds one instance, at a time, the others waiting their turn: each opening
 takes about 30 CPU seconds over a few threads, and the hub holds about
 700 MB once it has opened a few: allow it 2 GB of memory.
 
+Every live contract (signed and not ended, or under way) is an exit the hub
+may have to prove at once, should all its holders force their contracts
+closed together. `--contracts-max-live` (32 by default, sized for a prover
+with a GPU) bounds them. Up to half of it, contracts cost what the hub's
+terms say. Past half, the hub's fee (the fixed one and its yearly rate
+alike, not the holder's reserve) doubles at each eighth more: 2, 4, 8, then
+16 times at 87.5%. At the maximum it opens none until one ends. So the half
+it can always defend pays its way, and the rest pays for more or better
+hardware. `/v1/info` prices contracts as surcharged now, and a quote made
+at another step is refused for the wallet to ask again. An alert says when
+the surcharge rises or the hub is full. An upgraded hub already past the
+maximum keeps its contracts and opens no new ones until some end.
+
 On regtest, contracts are under a mock proof authority: such a contract
 protects nothing. On signet they are under the genuine programs kept in
 `r0/programs/`, a trial: RISC Zero's shared Groth16 setup, signet's headers

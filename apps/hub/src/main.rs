@@ -190,6 +190,19 @@ struct Chain {
         requires = "contracts_max_cap"
     )]
     contracts_rate: u32,
+    /// The most contracts live at once, signed and not ended or under
+    /// way: as many as the hub proves the exits of, all at once, within
+    /// an assertion window, twice over. Past half of them its fee doubles
+    /// at each eighth more, up to 16 times; at the most, it opens none.
+    #[arg(
+        long = "contracts-max-live",
+        value_name = "N",
+        env = "LICASH_HUB_CONTRACTS_MAX_LIVE",
+        default_value_t = licash_contracts::hub::MAX_LIVE,
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..),
+        requires = "contracts"
+    )]
+    contracts_max_live: usize,
 }
 
 impl Chain {
@@ -980,6 +993,7 @@ fn command(cli: Cli) -> anyhow::Result<()> {
             let contracting = chain.contracts;
             let response_poll = Duration::from_secs(chain.chain_poll);
             let range = chain.range();
+            let max_live = chain.contracts_max_live;
             let wallet = match (&chain.contracts_wallet, &chain.url) {
                 (Some(url), _) => Some(url.parse::<Source>().context("--contracts-wallet")?),
                 (None, Some(url)) if contracting && url.starts_with("esplora+") => anyhow::bail!(
@@ -1103,6 +1117,7 @@ fn command(cli: Cli) -> anyhow::Result<()> {
                         range,
                     );
                     let openings = runtime.block_on(opening).context("open the contracts")?;
+                    openings.limit_live(max_live);
                     // What each holder agrees to pay at most from now on.
                     openings.charging(hub.info().policy.fees());
                     // Holders' exits are played as they come: the hub

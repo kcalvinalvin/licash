@@ -27,6 +27,21 @@ const RESERVE_HUB: u64 = 100_000;
 /// reserve, for F's fee and those of the hub's exits, in sat.
 const FUNDING_MARGIN: u64 = 50_000;
 
+/// The highest step of the hub's surcharge ([`Timing::at_step`]): its fee
+/// 16 times its own, short of its most contracts.
+pub const MAX_STEP: u32 = 4;
+
+/// The step of the hub's surcharge with `live` of its most `max`
+/// contracts live: none below half, then one more at each eighth more,
+/// up to [`MAX_STEP`]. None once all are: it opens no more.
+pub fn step(live: usize, max: usize) -> Option<u32> {
+    if live >= max {
+        return None;
+    }
+    let eighths = (live as u128 * 8 / max as u128) as u32;
+    Some(eighths.saturating_sub(3).min(MAX_STEP))
+}
+
 /// The most F's and the graph's transactions pay, in sat per 1 000 vB.
 const MAX_RATE_SAT_PER_KVB: u64 = 10_000;
 
@@ -90,6 +105,9 @@ pub struct Timing {
     min_blocks: u32,
     /// The terms holders may choose, if any.
     range: Option<Range>,
+    /// The step of the hub's surcharge: its fee, of its fixed terms and
+    /// rate alike, `2^step` times its own.
+    step: u32,
 }
 
 impl Timing {
@@ -104,6 +122,10 @@ impl Timing {
             ChainProfile::Core30DefaultRegtest => (6, 6, 1, 2, 200),
             // Three days: her deadlines 180 blocks before the close.
             ChainProfile::Core30Signet => (144, 144, 3, 12, 432),
+            // Mainnet waits for windows set from a measured proof time and
+            // a real proof played on Bitcoin; its hub reserve must then
+            // cover the hub's answer to a challenge at some 25 sat/vB,
+            // about 520 000 sat, not RESERVE_HUB's 100 000.
             _ => bail!("the hub offers no contracts on {profile} yet"),
         };
         if let Some(r) = range {
@@ -127,7 +149,23 @@ impl Timing {
             response_window,
             min_blocks,
             range,
+            step: 0,
         })
+    }
+
+    /// These terms, the hub's fee surcharged `step` steps
+    /// ([`MAX_STEP`] at most): `2^step` times its own, as its contracts
+    /// fill up ([`step`]).
+    pub fn at_step(self, step: u32) -> Self {
+        Self {
+            step: step.min(MAX_STEP),
+            ..self
+        }
+    }
+
+    /// What the hub's fee is multiplied by, at its step.
+    fn surcharge(&self) -> u32 {
+        1 << self.step
     }
 
     /// The terms holders may choose, if any, as the hub's info says them.
@@ -138,8 +176,8 @@ impl Timing {
             min_blocks: self.min_blocks,
             max_blocks: r.max_blocks,
             per_coin: r.per_coin,
-            base: RESERVE_ALICE + OPENING_FEE,
-            ppm_year: r.ppm_year,
+            base: RESERVE_ALICE + OPENING_FEE * u64::from(self.surcharge()),
+            ppm_year: r.ppm_year.saturating_mul(self.surcharge()),
         })
     }
 
@@ -180,10 +218,12 @@ impl Timing {
     }
 
     /// What the hub's opening fee is for `cap` sat over `blocks`: the
-    /// fixed one, and its rate on the cap by the year.
+    /// fixed one, and its rate on the cap by the year, both surcharged at
+    /// its step, as its range says them.
     fn fee(&self, cap: u32, blocks: u32) -> u64 {
-        let ppm = self.range.map_or(0, |r| r.ppm_year);
-        OPENING_FEE.saturating_add(licash_api::rate(ppm, cap, blocks))
+        let m = self.surcharge();
+        let ppm = self.range.map_or(0, |r| r.ppm_year).saturating_mul(m);
+        (OPENING_FEE * u64::from(m)).saturating_add(licash_api::rate(ppm, cap, blocks))
     }
 
     /// What opening a contract of `cap` sat over `blocks` costs its
@@ -414,6 +454,50 @@ mod tests {
             })
         };
         assert!(base(&quote(MAX_CAP, 1_000)).is_ok());
+    }
+
+    /// Past half its most contracts, the hub's fee doubles at each eighth
+    /// more, up to 16 times; it opens none once all are live.
+    #[test]
+    fn the_fee_doubles_at_each_eighth_past_half_the_most_contracts() {
+        let steps: Vec<_> = (0..=32).map(|live| step(live, 32)).collect();
+        assert_eq!(&steps[..16], &[Some(0); 16]);
+        assert_eq!(&steps[16..20], &[Some(1); 4]);
+        assert_eq!(&steps[20..24], &[Some(2); 4]);
+        assert_eq!(&steps[24..28], &[Some(3); 4]);
+        assert_eq!(&steps[28..32], &[Some(4); 4]);
+        assert_eq!(steps[32], None);
+        assert_eq!((step(0, 1), step(1, 1), step(5, 0)), (Some(0), None, None));
+        assert_eq!(step(usize::MAX - 1, usize::MAX), Some(MAX_STEP));
+    }
+
+    /// At each step, the quote, the price and the range wallets price
+    /// with agree: the hub's fee and rate surcharged alike, her reserve
+    /// not.
+    #[test]
+    fn a_surcharged_quote_costs_what_the_info_says() {
+        let parts = Hub::peek(funded()).unwrap().base.parts().clone();
+        let (keyset, checkpoint) = (parts.keyset, parts.chain.checkpoint);
+        let timing = Timing::of(ChainProfile::Core30Signet, Some(RANGE)).unwrap();
+        for step in 0..=MAX_STEP + 1 {
+            let at = timing.at_step(step);
+            let m = 1u64 << step.min(MAX_STEP);
+            let range = at.range().unwrap();
+            assert_eq!(range.base, RESERVE_ALICE + OPENING_FEE * m);
+            assert_eq!(u64::from(range.ppm_year), 10_000 * m);
+            for (cap, blocks) in [(CAP, LOCK), (15_000_000, 26_280)] {
+                let quote = at.quote_for(keyset.clone(), checkpoint.clone(), cap, blocks);
+                let fee = quote.fees.opening_fee_quote;
+                assert_eq!(at.price(cap, blocks), RESERVE_ALICE + fee);
+                assert_eq!(range.price(cap, blocks), RESERVE_ALICE + fee);
+            }
+            let chosen = at.quote_for(keyset.clone(), checkpoint.clone(), 15_000_000, 26_280);
+            assert_eq!(chosen.fees.opening_fee_quote, 78_000 * m);
+        }
+        // Step 0, the quote as it always was.
+        let quote = |t: Timing| digest(&t.quote(keyset.clone(), checkpoint.clone()));
+        assert_eq!(quote(timing.at_step(0)), quote(timing));
+        assert_ne!(quote(timing.at_step(1)), quote(timing));
     }
 
     #[test]

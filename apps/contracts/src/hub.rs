@@ -46,6 +46,13 @@ use terms::{Range, Timing};
 /// The most openings short of the hub's signatures at once.
 pub const MAX_UNDER_WAY: usize = 16;
 
+/// The most contracts live at once by default: signed and not ended, or
+/// under way. Past half of them, the hub's fee doubles at each eighth more
+/// ([`terms::step`]), so that the half it can prove the exits of at once
+/// with room to spare pays for the hardware the rest need. Sized for a
+/// prover with a GPU; [`Openings::limit_live`] sets another.
+pub const MAX_LIVE: usize = 32;
+
 /// The most openings signed whose F is in no block, as the responder last
 /// saw, before new ones are refused: each holds coins of the hub's locked
 /// until it confirms or is made never to ([`dispute::UNFUNDED_FOR`]).
@@ -105,11 +112,28 @@ pub struct Openings {
     over_capacity: std::sync::atomic::AtomicBool,
     /// Whether [`MAX_UNFUNDED`] was told reached, not since left.
     unfunded_full: std::sync::atomic::AtomicBool,
+    /// The most contracts live at once: [`MAX_LIVE`] unless set.
+    max_live: std::sync::atomic::AtomicUsize,
+    /// The step of the surcharge last told, one past [`terms::MAX_STEP`]
+    /// once full: told again only as it rises.
+    load_told: std::sync::atomic::AtomicU32,
     /// Each contract's fold offered, until its holder signs or asks again.
     folds: Mutex<HashMap<[u8; 32], dispute::PendingFold>>,
     /// What the node's wallet last said it holds, in sat: the most it
     /// funds an F with ([`terms::fundable`]). None until it says.
     funds: Mutex<Option<u64>>,
+}
+
+/// How full the hub's contracts are ([`Openings::load`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Load {
+    /// Contracts live: signed and not ended, or under way.
+    pub live: usize,
+    /// The most it opens ([`Openings::limit_live`]).
+    pub max: usize,
+    /// The step its fee is surcharged at ([`terms::step`]): none once
+    /// full.
+    pub step: Option<u32>,
 }
 
 /// One responder poll. A bad opening never hides the others; errors are
@@ -305,6 +329,8 @@ impl Openings {
             withheld: Mutex::default(),
             over_capacity: Default::default(),
             unfunded_full: Default::default(),
+            max_live: std::sync::atomic::AtomicUsize::new(MAX_LIVE),
+            load_told: Default::default(),
             folds: Mutex::default(),
             funds: Mutex::new(None),
         });
@@ -324,6 +350,38 @@ impl Openings {
         self.store().charging(fees);
     }
 
+    /// Open at most `max` contracts at once, 1 at least, from now on
+    /// ([`MAX_LIVE`]). Those live past it stay: new ones wait for them to
+    /// end.
+    pub fn limit_live(&self, max: usize) {
+        (self.max_live).store(max.max(1), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// How full the hub's contracts are: those live now, signed and not
+    /// ended or under way, and the most it opens.
+    pub fn load(&self) -> Result<Load> {
+        let store = self.store();
+        let live = store.signed_ids()?.len() + store.under_way()?;
+        let max = self.max_live.load(std::sync::atomic::Ordering::Relaxed);
+        Ok(Load {
+            live,
+            max,
+            step: terms::step(live, max),
+        })
+    }
+
+    /// The step the hub's fee is surcharged at now, as its contracts fill
+    /// up: refused as unavailable once full.
+    fn step_now(&self) -> Result<u32, Refused> {
+        let load = self.load().map_err(Refused::unavailable)?;
+        load.step.ok_or_else(|| {
+            Refused::unavailable(format!(
+                "the hub has {} contracts live, its most: later",
+                load.live
+            ))
+        })
+    }
+
     /// The hub's offer now, checkpointed at its tip: its quote of `cap`
     /// sat over `blocks` she chose, if within its terms, else its fixed
     /// one.
@@ -339,24 +397,33 @@ impl Openings {
         let tip = self.source.tip().await.map_err(Refused::unavailable)?;
         let checkpoint = self.source.checkpoint(tip.height).await;
         let checkpoint = checkpoint.map_err(Refused::unavailable)?;
-        let quote = self
-            .timing
-            .quote_for(self.keyset.clone(), checkpoint, cap, blocks);
+        let timing = self.timing.at_step(self.step_now()?);
+        let quote = timing.quote_for(self.keyset.clone(), checkpoint, cap, blocks);
         let bounds = self.timing.bounds(&quote);
         Ok(Offer { quote, bounds })
     }
 
     /// What the hub's info says of its contracts: its fixed terms, as
     /// apps installed open on, and those holders may choose, if any.
-    /// Its range's largest cap, as much as its wallet funds now.
+    /// Its range's largest cap, as much as its wallet funds now; its
+    /// prices as surcharged now, at the highest step once full or if its
+    /// load is unknown.
     pub fn advertise(&self) -> licash_api::Contracts {
-        let range = self.timing.range().map(|mut r| {
+        let step = match self.load() {
+            Ok(load) => load.step.unwrap_or(terms::MAX_STEP),
+            Err(e) => {
+                tracing::warn!("the contracts' load: {e:#}");
+                terms::MAX_STEP
+            }
+        };
+        let timing = self.timing.at_step(step);
+        let range = timing.range().map(|mut r| {
             r.max_cap = self.most_funded(r.max_cap).max(r.min_cap);
             r
         });
         licash_api::Contracts {
             cap: terms::CAP,
-            price: self.timing.price(terms::CAP, terms::LOCK),
+            price: timing.price(terms::CAP, terms::LOCK),
             blocks: terms::LOCK,
             mock: self.trust.mock,
             range,
@@ -526,6 +593,27 @@ impl Openings {
                         .store(false, std::sync::atomic::Ordering::Relaxed);
                 }
             }
+        }
+        let load = self.load()?;
+        let level = load.step.unwrap_or(terms::MAX_STEP + 1);
+        let told = self
+            .load_told
+            .swap(level, std::sync::atomic::Ordering::Relaxed);
+        if level > told {
+            self.alert(&match load.step {
+                Some(step) => format!(
+                    "{} of the hub's most {} contracts are live: its fee is {} times its own \
+                     for new ones (--contracts-max-live)",
+                    load.live,
+                    load.max,
+                    1u32 << step
+                ),
+                None => format!(
+                    "{} contracts are live, the hub's most: it opens no more until some end \
+                     (--contracts-max-live)",
+                    load.live
+                ),
+            });
         }
         let unfunded = self.store().unfunded_count()?;
         let full = unfunded >= MAX_UNFUNDED;
@@ -793,6 +881,8 @@ mod tests {
             withheld: Mutex::default(),
             over_capacity: Default::default(),
             unfunded_full: Default::default(),
+            max_live: std::sync::atomic::AtomicUsize::new(MAX_LIVE),
+            load_told: Default::default(),
             folds: Mutex::default(),
             funds: Mutex::new(None),
         }
@@ -847,6 +937,51 @@ mod tests {
         *openings.funds.lock().unwrap() = Some(1_000_000);
         assert_eq!(max(&openings), terms::CAP);
         assert_eq!(openings.most_funded(terms::CAP), 0);
+    }
+
+    /// Past half its most contracts live, the hub's info prices new ones
+    /// higher at each eighth more; once all are, it opens none until one
+    /// ends or is given up.
+    #[test]
+    fn contracts_cost_more_as_they_fill_up_and_none_open_once_full() {
+        let dir = tempfile::tempdir().unwrap();
+        let openings = test_openings(dir.path());
+        assert_eq!(openings.load().unwrap().max, MAX_LIVE);
+        openings.limit_live(8);
+        let price = |o: &Openings| o.advertise().price;
+        let mut prices = vec![price(&openings)];
+        for n in 0..8u8 {
+            let store = openings.store();
+            let id = [n; 32];
+            store
+                .insert(&id, 0, true, &deposit(u32::from(n)), &[0; 32], funded())
+                .unwrap();
+            // Signed or under way alike.
+            if n % 2 == 0 {
+                store.save(&id, 0, true, &[0; 32], funded()).unwrap();
+            }
+            drop(store);
+            prices.push(price(&openings));
+        }
+        let fee = terms::OPENING_FEE;
+        let at = |m: u64| terms::RESERVE_ALICE + fee * m;
+        assert_eq!(
+            prices,
+            [1, 1, 1, 1, 2, 4, 8, 16, 16].map(at),
+            "{prices:?}"
+        );
+        let load = openings.load().unwrap();
+        assert_eq!((load.live, load.max, load.step), (8, 8, None));
+        let refused = openings.step_now().unwrap_err();
+        assert_eq!(refused.status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        // One ended, one under way given up: two free, at 8 times again.
+        openings.store().end(&[0; 32], 100).unwrap();
+        openings.store().abandon(&[1; 32], i64::MAX).unwrap();
+        assert_eq!(openings.step_now().unwrap(), 3);
+        assert_eq!(price(&openings), at(8));
+        // More allowed: cheaper at once.
+        openings.limit_live(64);
+        assert_eq!(openings.step_now().unwrap(), 0);
     }
 
     #[test]

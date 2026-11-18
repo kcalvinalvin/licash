@@ -10,7 +10,7 @@ use licash_contract::wire::{self, Envelope, Kind, Writer};
 use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 
-use super::{Answer, Openings, Refused, MAX_UNDER_WAY, MAX_UNFUNDED, WAIT};
+use super::{terms, Answer, Openings, Refused, MAX_UNDER_WAY, MAX_UNFUNDED, WAIT};
 use crate::{Frame, Opening};
 
 /// How often a patient step looks whether the opening is still busy.
@@ -54,27 +54,28 @@ impl Openings {
             return Err(Refused::bad("an opening starts with an Open"));
         }
         let open = wire::Open::decode(&envelope.body).map_err(Refused::bad)?;
-        {
-            let store = self.store();
-            if store
-                .row(&envelope.id)
-                .map_err(Refused::unavailable)?
-                .is_none()
-                && store.under_way().map_err(Refused::unavailable)? >= MAX_UNDER_WAY
-            {
-                return Err(Refused::unavailable("too many openings under way: later"));
+        let new = (self.store().row(&envelope.id))
+            .map_err(Refused::unavailable)?
+            .is_none();
+        // Its terms at the surcharge now, if new; if sent again, at
+        // whichever it started at.
+        let steps = match new {
+            true => {
+                let store = self.store();
+                if store.under_way().map_err(Refused::unavailable)? >= MAX_UNDER_WAY {
+                    return Err(Refused::unavailable("too many openings under way: later"));
+                }
+                if store.unfunded_count().map_err(Refused::unavailable)? >= MAX_UNFUNDED {
+                    return Err(Refused::unavailable(
+                        "too many openings signed and not funded: later",
+                    ));
+                }
+                drop(store);
+                let step = self.step_now()?;
+                step..=step
             }
-            if store.unfunded_count().map_err(Refused::unavailable)? >= MAX_UNFUNDED
-                && store
-                    .row(&envelope.id)
-                    .map_err(Refused::unavailable)?
-                    .is_none()
-            {
-                return Err(Refused::unavailable(
-                    "too many openings signed and not funded: later",
-                ));
-            }
-        }
+            false => 0..=terms::MAX_STEP,
+        };
         // Reject cheap size/collateral and policy failures before node RPC.
         self.timing
             .covers(opening.quote.cap, open.coin.value.to_sat())
@@ -82,7 +83,7 @@ impl Openings {
         self.timing
             .allows(opening.quote.cap, opening.quote.chain.max_headers)
             .map_err(Refused::bad)?;
-        self.terms_of(&opening.quote).await?;
+        self.terms_of(&opening.quote, steps).await?;
         let confirmed = self.confirmed(open.deposit, &open.coin).await;
         if !confirmed.map_err(Refused::unavailable)? {
             return Err(Refused::bad(
@@ -108,9 +109,14 @@ impl Openings {
         self.take(id, message, Start::Stored, patient).await
     }
 
-    /// Refused unless `quote` is the hub's: its terms, checkpointed at a
-    /// block of its best chain at most [`MAX_AGE`] deep.
-    async fn terms_of(&self, quote: &Quote) -> Result<(), Refused> {
+    /// Refused unless `quote` is the hub's: its terms surcharged at one of
+    /// `steps`, checkpointed at a block of its best chain at most
+    /// [`MAX_AGE`] deep.
+    async fn terms_of(
+        &self,
+        quote: &Quote,
+        steps: std::ops::RangeInclusive<u32>,
+    ) -> Result<(), Refused> {
         let height = quote.chain.checkpoint.height();
         let tip = self
             .source
@@ -128,18 +134,21 @@ impl Openings {
         self.timing.allows(cap, blocks).map_err(Refused::bad)?;
         let checkpoint = self.source.checkpoint(height).await;
         let checkpoint = checkpoint.map_err(Refused::unavailable)?;
-        let ours = self
-            .timing
-            .quote_for(self.keyset.clone(), checkpoint, cap, blocks);
         let bytes = |q: &Quote| {
             let mut w = Writer(Vec::new());
             w.quote(q);
             w.0
         };
-        if bytes(&ours) != bytes(quote) {
-            return Err(Refused::bad("not the hub's quote: ask again"));
+        let theirs = bytes(quote);
+        // One quoted at another surcharge than now: asked again.
+        for step in steps {
+            let timing = self.timing.at_step(step);
+            let ours = timing.quote_for(self.keyset.clone(), checkpoint.clone(), cap, blocks);
+            if bytes(&ours) == theirs {
+                return Ok(());
+            }
         }
-        Ok(())
+        Err(Refused::bad("not the hub's quote: ask again"))
     }
 
     /// Step opening `id` with `message` in a task of its own, answering
@@ -206,6 +215,7 @@ impl Openings {
                 if self.store().under_way().map_err(Refused::unavailable)? >= MAX_UNDER_WAY {
                     return Err(Refused::unavailable("too many openings under way: later"));
                 }
+                self.step_now()?;
                 let bounds = self.timing.bounds(&quote);
                 let payout = self.payout_script().await.map_err(Refused::unavailable)?;
                 let hub = Hub::new(*quote, bounds, payout);
