@@ -406,6 +406,24 @@ impl<T: Transport> Wallet<T> {
         })
     }
 
+    /// The pay branch of the owed lock `id` as a recovery under `keyset`
+    /// would claim it, without taking it: none if under another keyset,
+    /// paying the wallet nothing or not owed.
+    pub fn owed_claim(
+        &self,
+        id: &ProposalId,
+        keyset: &[u8; 32],
+    ) -> Result<Option<LockClaim>, Error> {
+        let keyset = self.keyset_of(keyset)?;
+        let rows = self
+            .store
+            .read(|c| owed_rows(c, "WHERE o.id = ?1", params![id.as_bytes()]))?;
+        match rows.first() {
+            Some((_, row)) => self.lock_pay(&keyset, row),
+            None => Ok(None),
+        }
+    }
+
     /// Record the owed lock `id`'s activation on Bitcoin and the checkpoint
     /// its terms name, which it is anchored to: none forgets it, as when
     /// its block left the chain. Refused once a recovery claims it.
