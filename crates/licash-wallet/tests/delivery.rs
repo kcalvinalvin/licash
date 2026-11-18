@@ -241,6 +241,44 @@ async fn entries_others_put_in_the_way_do_not_hold_the_inbox() {
 }
 
 #[tokio::test]
+async fn an_inbox_that_never_moves_on_fails_rather_than_holding_the_wallet() {
+    let Pair { net, bob, .. } = pair(Conduct::Repeats).await;
+    net.pay_kept(HUB, &bob.address(), 8, &bob.address());
+    // Its first page taken, the same entries again after it: refused.
+    let collected = bob.collect_inbox().await.unwrap();
+    assert_eq!(collected.received.len(), 1);
+    assert_eq!(collected.received[0].amount, 8);
+    assert_eq!(collected.failed.len(), 1);
+    assert!(
+        collected.failed[0].1.contains("out of order"),
+        "{collected:?}"
+    );
+    // And at once the next time, nothing taken twice.
+    let collected = bob.collect_inbox().await.unwrap();
+    assert!(collected.received.is_empty());
+    assert_eq!(collected.failed.len(), 1);
+    assert_eq!(held(&bob), 8);
+}
+
+#[tokio::test]
+async fn an_inbox_without_end_is_looked_through_a_few_pages_at_a_time() {
+    let Pair { bob, dir, .. } = pair(Conduct::Endless).await;
+    let after = || -> i64 {
+        let db = rusqlite::Connection::open(dir.path().join("2.sqlite")).unwrap();
+        db.query_row("SELECT inbox_after FROM hubs", [], |r| r.get(0))
+            .unwrap()
+    };
+    let page = inbox::MAX_ENTRIES as i64;
+    let pages = licash_wallet::PAGES_AT_ONCE as i64;
+    let collected = bob.collect_inbox().await.unwrap();
+    assert!(collected.received.is_empty() && collected.failed.is_empty());
+    assert_eq!(after(), pages * page);
+    // The rest next time, from where it was.
+    bob.collect_inbox().await.unwrap();
+    assert_eq!(after(), 2 * pages * page);
+}
+
+#[tokio::test]
 async fn an_inbox_not_looked_through_is_looked_through_again_from_where_it_was() {
     let Pair { net, bob, .. } = pair(Conduct::Keeps).await;
     net.pay_kept(HUB, &bob.address(), 8, &bob.address());

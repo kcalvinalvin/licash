@@ -39,6 +39,24 @@ const MAIL_AGAIN_WITHIN: i64 = 60 * 60;
 /// Hubs looked at, at once.
 const HUBS_AT_ONCE: usize = 4;
 
+/// The most pages of a hub's inbox one collection looks through: a hub
+/// answering more without end holds the wallet no longer.
+pub const PAGES_AT_ONCE: usize = 16;
+
+/// Whether `feed`, answered after entry `after`, moves the inbox on: at
+/// most [`inbox::MAX_ENTRIES`] entries, each after the one before, the
+/// first after `after`, and some if it says there are more.
+fn advances(feed: &Feed, after: i64) -> bool {
+    let mut last = u64::try_from(after).unwrap_or(0);
+    feed.entries.len() <= inbox::MAX_ENTRIES
+        && !(feed.more && feed.entries.is_empty())
+        && feed.entries.iter().all(|entry| {
+            let next = entry.seq > last;
+            last = entry.seq;
+            next
+        })
+}
+
 /// Where a payment to a payment code stands in reaching its payee.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Delivery {
@@ -444,7 +462,8 @@ impl<T: Transport> Wallet<T> {
     /// `served` once the hub answers that it keeps payments. Only a failure to
     /// reach the hub or keep a payment holds the inbox where it was: an
     /// entry whose payment is not the wallet's, or does not open, is
-    /// passed, so that no payer stalls the wallet's inbox with one.
+    /// passed, so that no payer stalls the wallet's inbox with one. At most
+    /// [`PAGES_AT_ONCE`] pages are looked through, the rest next time.
     async fn collect_at(
         &self,
         hub: i64,
@@ -455,11 +474,14 @@ impl<T: Transport> Wallet<T> {
     ) -> Result<(), Error> {
         let scan = self.owner.scan_key().clone();
         let mut refreshed = false;
-        loop {
+        for _ in 0..PAGES_AT_ONCE {
             let Some(feed) = self.feed(url, after).await? else {
                 return Ok(());
             };
             *served = true;
+            if !advances(&feed, after) {
+                return Err(unavailable(url, "its inbox answered entries out of order"));
+            }
             let mine: Vec<(u64, [u8; 32])> = feed
                 .entries
                 .iter()
@@ -539,6 +561,7 @@ impl<T: Transport> Wallet<T> {
                 return Ok(());
             }
         }
+        Ok(())
     }
 
     /// The entries of the inbox of the hub at `url` after `after`: none if

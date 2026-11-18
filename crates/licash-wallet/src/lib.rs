@@ -79,7 +79,7 @@ use serde::{de::DeserializeOwned, Serialize};
 pub use claims::{ClaimNote, ClaimSlot};
 pub use code::{ContractSecrets, DonationAddress, HubId, LicashCode, PaymentCode, MAX_HUBS};
 pub use coins::MAX_INPUTS;
-pub use delivery::{Delivery, Due, Inboxed, ACK_WITHIN};
+pub use delivery::{Delivery, Due, Inboxed, ACK_WITHIN, PAGES_AT_ONCE};
 pub use deposits::{Deposit, DepositState, DepositTerms};
 pub use lightning::{refund_blocks, Invoice, InvoiceState, Payable, ViaQuote, ROUTE_BLOCKS};
 pub use locks::{Incoming, Lock, LockState, Via, CLAIM_MARGIN};

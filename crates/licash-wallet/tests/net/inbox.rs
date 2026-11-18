@@ -20,6 +20,12 @@ pub enum Conduct {
     Withholds,
     /// Tells an ack of its own of every payment, which it cannot know.
     Forges,
+    /// Answers every entry it keeps whatever it is asked after, and that
+    /// there are more: an inbox that never moves on.
+    Repeats,
+    /// Answers a full page of entries no one can take after any entry, and
+    /// that there are more: an inbox without end.
+    Endless,
 }
 
 struct Kept {
@@ -53,7 +59,7 @@ impl Inbox {
         match self.conduct {
             Conduct::None => return Ok(false),
             Conduct::Withholds => return Ok(true),
-            Conduct::Keeps | Conduct::Forges => {}
+            Conduct::Keeps | Conduct::Forges | Conduct::Repeats | Conduct::Endless => {}
         }
         if self.kept.iter().any(|k| k.proposal == proposal) {
             return Ok(true);
@@ -82,17 +88,32 @@ impl Inbox {
             (path, None) => {
                 let after = path.strip_prefix("/v1/inbox?after=")?;
                 let after: u64 = after.parse().map_err(|_| Problem::invalid("after")).ok()?;
+                if self.conduct == Conduct::Endless {
+                    let entries = (1..=inbox::MAX_ENTRIES as u64)
+                        .map(|n| Entry {
+                            seq: after + n,
+                            ephemeral: Hex(vec![2; 33]),
+                            tag: Hex(vec![0; inbox::TAG]),
+                        })
+                        .collect();
+                    let feed = Feed {
+                        entries,
+                        more: true,
+                    };
+                    return Some(Ok(serde_json::to_vec(&feed).unwrap()));
+                }
+                let repeats = self.conduct == Conduct::Repeats;
                 let entries: Vec<Entry> = self
                     .kept
                     .iter()
-                    .filter(|k| k.seq > after)
+                    .filter(|k| repeats || k.seq > after)
                     .map(|k| Entry {
                         seq: k.seq,
                         ephemeral: Hex(k.ephemeral.clone()),
                         tag: Hex(k.tag.clone()),
                     })
                     .collect();
-                let more = entries.len() > inbox::MAX_ENTRIES;
+                let more = repeats || entries.len() > inbox::MAX_ENTRIES;
                 let entries = entries.into_iter().take(inbox::MAX_ENTRIES).collect();
                 Ok(serde_json::to_vec(&Feed { entries, more }).unwrap())
             }
