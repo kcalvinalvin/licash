@@ -210,10 +210,14 @@ pub struct ContractRange {
     pub max_blocks: u32,
     /// Its cap at most this many times the coin paying for it.
     pub per_coin: u32,
-    /// What opening one costs, in sat: this, and `ppm_year` millionths of
-    /// its cap for each year it lasts.
-    pub base: u64,
+    /// Its holder's reserve, in sat, paid back as it closes.
+    pub reserve: u64,
+    /// The hub's fixed fee for one, in sat.
+    pub fee: u64,
+    /// Millionths of the part of its cap the hub funds it charges for
+    /// each year it lasts, and of the part its holder funds.
     pub ppm_year: u32,
+    pub ppm_year_funded: u32,
 }
 
 impl From<licash_api::ContractRange> for ContractRange {
@@ -224,8 +228,10 @@ impl From<licash_api::ContractRange> for ContractRange {
             min_blocks: r.min_blocks,
             max_blocks: r.max_blocks,
             per_coin: r.per_coin,
-            base: r.base,
+            reserve: r.reserve,
+            fee: r.fee,
             ppm_year: r.ppm_year,
+            ppm_year_funded: r.ppm_year_funded,
         }
     }
 }
@@ -240,8 +246,10 @@ impl ContractRange {
             min_blocks: self.min_blocks,
             max_blocks: self.max_blocks,
             per_coin: self.per_coin,
-            base: self.base,
+            reserve: self.reserve,
+            fee: self.fee,
             ppm_year: self.ppm_year,
+            ppm_year_funded: self.ppm_year_funded,
         }
     }
 }
@@ -251,11 +259,17 @@ impl ContractRange {
 #[uniffi::export]
 pub fn contract_price(range: ContractRange, cap: u64, blocks: u32) -> u64 {
     let cap = u32::try_from(cap).unwrap_or(u32::MAX);
-    range.api().price(cap, blocks)
+    range.api().price(cap, blocks, 0)
+}
+
+/// The sizes a contract within `range` comes in, in sat, smallest first.
+#[uniffi::export]
+pub fn contract_sizes(range: ContractRange) -> Vec<u64> {
+    range.api().sizes().into_iter().map(u64::from).collect()
 }
 
 /// The most a contract within `range` protects, paid from a coin of
-/// `coin` sat: none if less than the least.
+/// `coin` sat: the largest size it covers, none if less than the least.
 #[uniffi::export]
 pub fn contract_max_cap(range: ContractRange, coin: u64) -> Option<u64> {
     range.api().max_cap_for(coin).map(u64::from)
@@ -351,24 +365,19 @@ pub fn payable_cap(
     let most = contract_max_cap(range, coin)?;
     let price = |cap| contract_price(range, cap, blocks);
     let fits = |cap| contract_change_problem(coin, price(cap), cap, dust, change).is_none();
-    let asked = start.clamp(range.min_cap, most);
+    let sizes: Vec<u64> = contract_sizes(range)
+        .into_iter()
+        .filter(|&s| s <= most)
+        .collect();
+    // The size asked, down to one.
+    let asked = sizes.iter().rev().find(|&&s| s <= start).copied();
+    let asked = asked.unwrap_or(range.min_cap);
     if fits(asked) {
         return Some(asked);
     }
     // Its price grows with the cap: the largest the coin pays.
-    let (mut lo, mut hi) = (range.min_cap, most);
-    if price(lo) > coin {
-        return None;
-    }
-    while lo < hi {
-        let mid = lo + (hi - lo).div_ceil(2);
-        if price(mid) <= coin {
-            lo = mid;
-        } else {
-            hi = mid - 1;
-        }
-    }
-    fits(lo).then_some(lo)
+    let paid = sizes.into_iter().rev().find(|&s| price(s) <= coin)?;
+    fits(paid).then_some(paid)
 }
 
 /// A fee, in sat: `base` plus `ppm` millionths of what it is on.

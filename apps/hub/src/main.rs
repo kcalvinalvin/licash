@@ -175,10 +175,10 @@ struct Chain {
         requires = "contracts"
     )]
     contracts_proof_scale: f64,
-    /// Let holders choose a contract's cap up to this many sat, and how
-    /// long it lasts up to `--contracts-max-blocks`, besides the fixed
-    /// terms (4 096 sat over 1 000 blocks) apps without that choice open
-    /// on. By default, the fixed terms only.
+    /// Let holders choose a contract's cap up to this many sat, taken
+    /// down to a size (2^n - 1 sat, 131 071 the least), and how long it
+    /// lasts up to `--contracts-max-blocks`, besides the fixed terms
+    /// (131 071 sat over 1 000 blocks). By default, the fixed terms only.
     #[arg(
         long = "contracts-max-cap",
         value_name = "SAT",
@@ -207,9 +207,9 @@ struct Chain {
         requires = "contracts_max_cap"
     )]
     contracts_per_coin: u32,
-    /// What a contract a holder chooses costs over the fixed price, in
-    /// millionths of its cap for each year (52 560 blocks) it lasts, with
-    /// `--contracts-max-cap`: 10 000 is 1% a year.
+    /// What a contract costs over the fixed price, in millionths of the
+    /// part of its cap the hub funds for each year (52 560 blocks) it
+    /// lasts, with `--contracts-max-cap`: 10 000 is 1% a year.
     #[arg(
         long = "contracts-rate",
         value_name = "PPM",
@@ -218,6 +218,16 @@ struct Chain {
         requires = "contracts_max_cap"
     )]
     contracts_rate: u32,
+    /// Likewise, of the part of its cap its holder funds herself: none
+    /// by default, her own coin locked for her own notes.
+    #[arg(
+        long = "contracts-rate-funded",
+        value_name = "PPM",
+        env = "LICASH_HUB_CONTRACTS_RATE_FUNDED",
+        default_value_t = 0,
+        requires = "contracts_max_cap"
+    )]
+    contracts_rate_funded: u32,
     /// The most contracts live at once, signed and not ended or under
     /// way: as many as the hub proves the exits of, all at once, within
     /// an assertion window, twice over. Past half of them its fee doubles
@@ -256,6 +266,7 @@ impl Chain {
                 max_blocks: self.contracts_max_blocks,
                 per_coin: self.contracts_per_coin,
                 ppm_year: self.contracts_rate,
+                ppm_year_funded: self.contracts_rate_funded,
             })
     }
 

@@ -69,7 +69,7 @@ class ChooseContractTest {
     @Test
     fun the_coin_cashed_out_first_pays_and_is_taken_for_the_cap() {
         // A cap at most 2 times its coin, as the signet hubs take.
-        val range = ContractRange(least, 33_554_431uL, 432u, 52_560u, 2u, 1_000uL, 5_000u)
+        val range = ContractRange(least, 33_554_431uL, 432u, 52_560u, 2u, 0uL, 1_000uL, 5_000u, 0u)
         val taken = ChangeRange(11_000uL, 5_001_000uL)
         // The price itself, if the hub takes it for the cap: no change.
         assertEquals(3_000uL, coinFor(range, 6_000uL, 3_000uL, 330uL, taken))

@@ -1074,45 +1074,72 @@ fn a_hubs_urls_are_left_out_when_none_and_are_not_its_identity() {
 }
 
 #[test]
-fn a_hubs_contract_range_is_left_out_when_none_and_prices_the_cap_by_the_year() {
-    // As an older hub says it, without one: read, none.
-    let older = r#"{"cap":4096,"price":23000,"blocks":1000,"mock":false}"#;
-    let read: Contracts = serde_json::from_str(older).unwrap();
+fn a_hubs_contract_range_is_left_out_when_none_and_prices_the_hubs_part_by_the_year() {
+    // Without one: read, none.
+    let fixed = r#"{"cap":131071,"price":23000,"reserve":20000,"blocks":1000,"mock":false}"#;
+    let read: Contracts = serde_json::from_str(fixed).unwrap();
     assert_eq!(read.range, None);
     let sent = serde_json::to_value(read).unwrap();
     assert!(sent.get("range").is_none(), "{sent}");
 
     let range = ContractRange {
-        min_cap: 4_096,
-        max_cap: 100_000_000,
+        min_cap: 131_071,
+        max_cap: 134_217_727,
         min_blocks: 432,
         max_blocks: 26_280,
         per_coin: 2,
-        base: 23_000,
+        reserve: 20_000,
+        fee: 3_000,
         ppm_year: 10_000,
+        ppm_year_funded: 0,
     };
     let offered = Contracts {
         range: Some(range),
         ..read
     };
     assert_eq!(json(&offered), offered);
-    // Read by an app knowing of no range, as installed ones: the rest.
-    let text = serde_json::to_string(&offered).unwrap();
-    let mut seen: serde_json::Value = serde_json::from_str(&text).unwrap();
-    seen.as_object_mut().unwrap().remove("range");
-    assert_eq!(serde_json::from_value::<Contracts>(seen).unwrap(), read);
 
-    // 1% a year: 15 M sat for half a year, 75 000 sat over the base; the
-    // fixed terms nothing over it, rounded down.
-    assert_eq!(range.price(15_000_000, 26_280), 98_000);
-    assert_eq!(range.price(4_096, 1_000), 23_000);
+    // 1% a year: 16 777 215 sat for half a year, 83 886 sat of interest
+    // over her reserve and the fixed fee, rounded down.
+    let fee = range.fee(16_777_215, 26_280, 0);
+    assert_eq!(
+        (fee.opening, fee.interest, fee.interest_funded),
+        (3_000, 83_886, 0)
+    );
+    assert_eq!(range.price(16_777_215, 26_280, 0), 106_886);
+    // Half of it hers: interest on the hub's half only, none on hers.
+    let fee = range.fee(16_777_215, 26_280, 8_388_607);
+    assert_eq!((fee.interest, fee.interest_funded), (41_943, 0));
+    assert_eq!(range.price(16_777_215, 26_280, 8_388_607), 64_943);
+    // Unless the hub charges for hers too; never more than the cap hers.
+    let funded = ContractRange {
+        ppm_year_funded: 2_000,
+        ..range
+    };
+    assert_eq!(
+        funded.fee(16_777_215, 26_280, 8_388_607).interest_funded,
+        8_388
+    );
+    assert_eq!(funded.fee(131_071, 1_000, u32::MAX).interest, 0);
     assert_eq!(rate(10_000, u32::MAX, u32::MAX), 3_509_654_502_496);
-    // Twice her coin at most, within the hub's bounds.
-    assert_eq!(range.max_cap_for(10_000_000), Some(20_000_000));
-    assert_eq!(range.max_cap_for(90_000_000), Some(100_000_000));
-    assert_eq!(range.max_cap_for(2_048), Some(4_096));
-    assert_eq!(range.max_cap_for(2_047), None);
-    assert_eq!(range.max_cap_for(u64::MAX), Some(100_000_000));
+
+    // Its sizes: 2^n - 1 sat within its bounds, 131 071 the least.
+    let sizes = range.sizes();
+    assert_eq!(sizes.len(), 11);
+    assert_eq!(
+        (sizes[0], sizes[1], sizes[10]),
+        (131_071, 262_143, 134_217_727)
+    );
+    assert_eq!(licash_api::sizes().count(), 15);
+    assert_eq!(licash_api::sizes().last(), Some(2_147_483_647));
+    assert!(licash_api::is_size(1_048_575) && !licash_api::is_size(1_048_576));
+    assert!(!licash_api::is_size(65_535));
+    // The largest size twice her coin covers, within the hub's bounds.
+    assert_eq!(range.max_cap_for(10_000_000), Some(16_777_215));
+    assert_eq!(range.max_cap_for(90_000_000), Some(134_217_727));
+    assert_eq!(range.max_cap_for(65_536), Some(131_071));
+    assert_eq!(range.max_cap_for(65_535), None);
+    assert_eq!(range.max_cap_for(u64::MAX), Some(134_217_727));
 }
 
 #[test]

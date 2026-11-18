@@ -498,7 +498,7 @@ impl Openings {
         let checkpoint = self.source.checkpoint(height).await;
         let checkpoint = checkpoint.map_err(Refused::unavailable)?;
         let timing = self.timing().at_step(self.step_now()?);
-        let quote = timing.quote_for(self.keyset.clone(), checkpoint, cap, blocks);
+        let quote = timing.quote_for(self.keyset.clone(), checkpoint, cap, blocks, 0);
         let bounds = self.timing().bounds(&quote);
         Ok(Offer { quote, bounds })
     }
@@ -523,7 +523,8 @@ impl Openings {
         });
         licash_api::Contracts {
             cap: terms::CAP,
-            price: timing.price(terms::CAP, terms::LOCK),
+            price: timing.price(terms::CAP, terms::LOCK, 0),
+            reserve: terms::RESERVE_ALICE,
             blocks: terms::LOCK,
             mock: self.trust.mock,
             range,
@@ -1091,16 +1092,19 @@ mod tests {
             max_blocks: 52_560,
             per_coin: 2,
             ppm_year: 10_000,
+            ppm_year_funded: 0,
         };
         *openings.timing.get_mut().unwrap() =
             Timing::of(ChainProfile::Core30DefaultRegtest, Some(range)).unwrap();
         let max = |o: &Openings| o.advertise().range.unwrap().max_cap;
-        // Not known yet: as the operator set it.
-        assert_eq!(max(&openings), 100_000_000);
+        // Not known yet: as the operator set it, down to a size.
+        assert_eq!(max(&openings), 67_108_863);
         *openings.funds.lock().unwrap() = Some(50_000_000);
         assert_eq!(max(&openings), 33_554_431);
-        // None funded: its least, and opening one is refused.
         *openings.funds.lock().unwrap() = Some(1_000_000);
+        assert_eq!(max(&openings), 524_287);
+        // None funded: its least, and opening one is refused.
+        *openings.funds.lock().unwrap() = Some(200_000);
         assert_eq!(max(&openings), terms::CAP);
         assert_eq!(openings.most_funded(terms::CAP), 0);
     }
@@ -1420,7 +1424,7 @@ mod tests {
                 parts.graph.reserve_alice
             )
         );
-        // A 21-bit graph, her reserve 20 000 sat and the hub's 100 000.
+        // A 17-bit graph, her reserve 20 000 sat and the hub's 100 000.
         assert_eq!(
             (
                 terms.cap,
@@ -1429,7 +1433,7 @@ mod tests {
                 terms.reserve,
                 terms.graph
             ),
-            (4_096, 504, 3_000, 20_000, (1 << 21) - 1 + 120_000)
+            (131_071, 504, 3_000, 20_000, (1 << 17) - 1 + 120_000)
         );
         assert_eq!(terms.funding, peek.funding.map(|tx| tx.compute_txid()));
         assert!(terms.funding.is_some());

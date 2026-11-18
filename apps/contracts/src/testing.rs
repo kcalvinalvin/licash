@@ -69,12 +69,12 @@ fn build(id: u32) -> Opened {
     .unwrap();
     let seed = wallet.contract_secrets().seed;
     let mut quote = Quote::from_base(&opening::testing::base(&[3; 32]));
-    quote.cap = 4096;
+    quote.cap = 131_071;
     quote.graph.id = id;
-    quote.graph.bits = 21;
+    quote.graph.bits = 17;
     quote.graph.reserve_alice = 20000;
     quote.graph.reserve_hub = 100000;
-    quote.graph.deposit_units = 500000;
+    quote.graph.deposit_units = 0;
     quote.graph.request_height = 360;
     quote.graph.close_height = 504;
     quote.fees.opening_fee_quote = 3000;

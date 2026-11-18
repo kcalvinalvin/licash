@@ -134,7 +134,7 @@ pub async fn open(
         .with_context(|| format!("{hub} opens no contracts"))?;
     let blocks = asked.blocks.unwrap_or(offered.blocks);
     let price = match (asked.cap, offered.range) {
-        (Some(cap), Some(range)) => range.price(cap, blocks),
+        (Some(cap), Some(range)) => range.price(cap, blocks, 0),
         (Some(_), None) => anyhow::bail!("{hub} offers no contracts of other caps"),
         (None, _) => offered.price,
     };

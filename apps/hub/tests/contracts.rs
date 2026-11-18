@@ -88,6 +88,7 @@ async fn a_hub_learns_what_its_contracts_wallet_holds() -> Result<()> {
         max_blocks: 5_000,
         per_coin: 2,
         ppm_year: 10_000,
+        ppm_year_funded: 0,
     };
     let openings =
         Openings::with_wallet(dir.path(), source.clone(), source, keyset, Some(range)).await?;
@@ -446,6 +447,7 @@ async fn a_wallet_opens_a_contract_of_terms_it_chose_on_its_large_coin() -> Resu
         max_blocks: 5_000,
         per_coin: 2,
         ppm_year: 10_000,
+        ppm_year_funded: 0,
     };
     let (url, source) = hub_with(&rt, &dir.path().join("hub"), Some(range)).await?;
     let chain = Node(source);
@@ -466,8 +468,8 @@ async fn a_wallet_opens_a_contract_of_terms_it_chose_on_its_large_coin() -> Resu
     let chosen = offered.range.context("no range in the hub's info")?;
     ensure!((chosen.min_blocks, chosen.max_blocks, chosen.per_coin) == (200, 5_000, 2));
     // 15 M sat over 2 000 blocks: 1% a year of it over the fixed price.
-    let price = chosen.price(15_000_000, 2_000);
-    ensure!(price == 23_000 + 5_707, "{price}");
+    let price = chosen.price(16_777_215, 2_000, 0);
+    ensure!(price == 23_000 + 6_383, "{price}");
 
     // Asked of terms she chose: those exactly, a graph as wide as them.
     let offer = holder::offer(&wallet, &url, Some((15_000_000, 2_000))).await?;
@@ -1982,6 +1984,7 @@ async fn a_holder_recovers_her_cap_of_notes_beyond_it_from_a_hub_that_answered()
         max_blocks: 5_000,
         per_coin: 2,
         ppm_year: 10_000,
+        ppm_year_funded: 0,
     };
     let (url, source, hub, openings) = hub_answering_with(&rt, &at, Some(range)).await?;
     let chain = Node(source);
@@ -2072,6 +2075,7 @@ async fn stale_claim_scanned(seed: [u8; 32], scanned: bool) -> Result<Stale> {
         max_blocks: 5_000,
         per_coin: 2,
         ppm_year: 10_000,
+        ppm_year_funded: 0,
     };
     let (url, source, hub, openings) = hub_answering_with(&rt, &at, Some(range)).await?;
     let chain = Node(source.clone());
@@ -3154,6 +3158,7 @@ async fn hub_taking_deposits(
         max_blocks: 5_000,
         per_coin: 2,
         ppm_year: 10_000,
+        ppm_year_funded: 0,
     };
     let openings = Openings::with_wallet(dir, source.clone(), source.clone(), keyset, Some(range));
     let config = deposit::Config {
@@ -3234,7 +3239,7 @@ async fn a_wallet_turns_its_coin_whole_into_a_contract_and_notes_or_opens_none()
 
     // Opened on the small one, her change into notes it protects: F pays
     // a deposit of hers exactly, the hub's 1000 in it.
-    let price = range.price(1_000_000, 300);
+    let price = range.price(1_048_575, 300, 0);
     let (pays, amount) = (1_000_000 - price, 1_000_000 - price - 1_000);
     let swept = chosen(small, 1_000_000);
     let first = holder::open_with(&wallet, &chain, &mine, &url, swept, Change::Notes).await?;
@@ -3408,6 +3413,7 @@ async fn her_exit_needs_consent_then_forces_closed_what_it_could_not_pay_out() -
         max_blocks: 5_000,
         per_coin: 2,
         ppm_year: 10_000,
+        ppm_year_funded: 0,
     };
     let (url, source, hub) = hub_serving(&rt, &at, Some(range)).await?;
     let chain = Node(source);
@@ -3498,6 +3504,7 @@ async fn her_exit_tries_to_pay_out_before_forcing_closed() -> Result<()> {
         max_blocks: 5_000,
         per_coin: 2,
         ppm_year: 10_000,
+        ppm_year_funded: 0,
     };
     let (url, source, hub) = hub_serving(&rt, &at, Some(range)).await?;
     let chain = Node(source);

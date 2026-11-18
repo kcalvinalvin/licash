@@ -133,8 +133,10 @@ impl Openings {
                 "a quote of block {height}, the tip at {tip}: ask again"
             )));
         }
-        // The terms she chose, if within the hub's: those of the quote.
+        // The terms she chose, if within the hub's: those of the quote,
+        // and what she funds of it (`deposit_units`, of 1-sat units).
         let (cap, blocks) = (quote.cap, quote.chain.max_headers);
+        let funded = quote.graph.deposit_units;
         self.timing().allows(cap, blocks).map_err(Refused::bad)?;
         let checkpoint = self.source.checkpoint(height).await;
         let checkpoint = checkpoint.map_err(Refused::unavailable)?;
@@ -147,7 +149,8 @@ impl Openings {
         // One quoted at another surcharge than now: asked again.
         for step in steps {
             let timing = self.timing().at_step(step);
-            let ours = timing.quote_for(self.keyset.clone(), checkpoint.clone(), cap, blocks);
+            let ours =
+                timing.quote_for(self.keyset.clone(), checkpoint.clone(), cap, blocks, funded);
             if bytes(&ours) == theirs {
                 return self.keep_checkpoint(&ours.chain.checkpoint);
             }

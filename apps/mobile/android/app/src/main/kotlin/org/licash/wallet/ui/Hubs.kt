@@ -135,7 +135,7 @@ internal fun HubFees(
                 if (range != null) {
                     Entry(
                         "Price",
-                        value = "${sat(range.base)} + ${percent(range.ppmYear.toULong())} a year",
+                        value = "${sat(range.reserve + range.fee)} + ${percent(range.ppmYear.toULong())} a year",
                         sub = "of what it covers",
                         tag = "protection-price",
                     )

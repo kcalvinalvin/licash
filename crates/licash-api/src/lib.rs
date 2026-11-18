@@ -827,10 +827,13 @@ impl ReceiveStatus {
 /// now: the terms an opening binds are those of its quote then.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Contracts {
-    /// The most notes a contract protects, in sat.
+    /// The most notes a contract protects, in sat: one of the [`sizes`].
     pub cap: u32,
-    /// What opening one costs its holder, in sat, from her deposit.
+    /// What opening one costs its holder, in sat, from her deposit: her
+    /// reserve, returned as it closes, and the hub's fee.
     pub price: u64,
+    /// Her reserve, of `price`.
+    pub reserve: u64,
     /// Blocks from its opening to its close, at most.
     pub blocks: u32,
     /// Under the mock authority, for regtest only: anyone "proves"
@@ -846,10 +849,54 @@ pub struct Contracts {
 /// Blocks in a year, as a contract's price counts them: 144 a day.
 pub const YEAR_BLOCKS: u64 = 144 * 365;
 
+/// The fewest and most bits of a contract's size (size ([`sizes`])).
+pub const MIN_SIZE_BITS: u32 = 17;
+pub const MAX_SIZE_BITS: u32 = 31;
+
+/// The sizes a contract comes in, in sat, smallest first: `2^n - 1` for
+/// `n` of [`MIN_SIZE_BITS`] to [`MAX_SIZE_BITS`], 131 071 to
+/// 2 147 483 647. Its graph pays out in as many bits, all of them ones:
+/// the hub locks exactly what it protects.
+pub fn sizes() -> impl DoubleEndedIterator<Item = u32> {
+    (MIN_SIZE_BITS..=MAX_SIZE_BITS).map(|n| ((1u64 << n) - 1) as u32)
+}
+
+/// Whether `cap` is one of the [`sizes`].
+pub fn is_size(cap: u32) -> bool {
+    sizes().any(|s| s == cap)
+}
+
+/// The largest of the [`sizes`] no more than `sat`, if any.
+pub fn size_at_most(sat: u64) -> Option<u32> {
+    sizes().rev().find(|&s| u64::from(s) <= sat)
+}
+
+/// What a contract's opening costs its holder, besides her reserve,
+/// itemized: the hub's fixed fee and its interest by the year on the
+/// part of the contract it funds, and on hers if any.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ContractFee {
+    /// The fixed part.
+    pub opening: u64,
+    /// Interest on the hub's part: `ppm_year` of it by the year.
+    pub interest: u64,
+    /// Interest on the part she funds herself, if any.
+    pub interest_funded: u64,
+}
+
+impl ContractFee {
+    pub fn total(&self) -> u64 {
+        self.opening
+            .saturating_add(self.interest)
+            .saturating_add(self.interest_funded)
+    }
+}
+
 /// The caps and durations a hub lets holders choose, and what each costs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContractRange {
-    /// The notes a contract protects, in sat: at least, at most.
+    /// The notes a contract protects, in sat: at least, at most, each a
+    /// size ([`sizes`]), and those between of the [`sizes`] only.
     pub min_cap: u32,
     pub max_cap: u32,
     /// Blocks from its opening to its close: at least, at most.
@@ -858,26 +905,51 @@ pub struct ContractRange {
     /// Its cap at most this many times the value of the coin its holder
     /// deposits.
     pub per_coin: u32,
-    /// What opening one costs its holder, in sat, from her deposit: this,
-    /// and [`ContractRange::ppm_year`] of its cap.
-    pub base: u64,
-    /// Millionths of its cap for each year of blocks ([`YEAR_BLOCKS`])
-    /// it lasts, rounded down.
+    /// Her reserve, from her deposit, returned as it closes.
+    pub reserve: u64,
+    /// The hub's fixed fee for an opening, from her deposit.
+    pub fee: u64,
+    /// Millionths of the part of its cap the hub funds for each year of
+    /// blocks ([`YEAR_BLOCKS`]) it lasts, rounded down.
     pub ppm_year: u32,
+    /// Millionths of the part she funds herself, likewise.
+    pub ppm_year_funded: u32,
 }
 
 impl ContractRange {
-    /// What opening a contract of `cap` sat over `blocks` costs.
-    pub fn price(&self, cap: u32, blocks: u32) -> u64 {
-        self.base.saturating_add(rate(self.ppm_year, cap, blocks))
+    /// The hub's fee for a contract of `cap` sat over `blocks`, `funded`
+    /// sat of it funded by its holder.
+    pub fn fee(&self, cap: u32, blocks: u32, funded: u32) -> ContractFee {
+        let funded = funded.min(cap);
+        ContractFee {
+            opening: self.fee,
+            interest: rate(self.ppm_year, cap - funded, blocks),
+            interest_funded: rate(self.ppm_year_funded, funded, blocks),
+        }
     }
 
-    /// The most a contract may protect, its holder depositing a coin of
-    /// `coin` sat: none less than the least.
+    /// What opening a contract of `cap` sat over `blocks` costs, `funded`
+    /// of it hers: her reserve and the hub's fee (not what she funds,
+    /// paid back to her in notes).
+    pub fn price(&self, cap: u32, blocks: u32, funded: u32) -> u64 {
+        self.reserve
+            .saturating_add(self.fee(cap, blocks, funded).total())
+    }
+
+    /// The [`sizes`] a holder may choose, smallest first.
+    pub fn sizes(&self) -> Vec<u32> {
+        sizes()
+            .filter(|s| (self.min_cap..=self.max_cap).contains(s))
+            .collect()
+    }
+
+    /// The largest size a contract may have, its holder depositing a
+    /// coin of `coin` sat: none less than the least.
     pub fn max_cap_for(&self, coin: u64) -> Option<u32> {
-        let most = coin.saturating_mul(u64::from(self.per_coin));
-        let most = u32::try_from(most).unwrap_or(u32::MAX).min(self.max_cap);
-        (most >= self.min_cap).then_some(most)
+        let most = coin
+            .saturating_mul(u64::from(self.per_coin))
+            .min(u64::from(self.max_cap));
+        size_at_most(most).filter(|&s| s >= self.min_cap)
     }
 }
 

@@ -100,21 +100,23 @@ impl Sizes {
     }
 }
 
-/// A contract's cap, sized to what it protects: twice `cap` while what
-/// the provider holds at its hub (`exposure`) is three quarters of the
-/// `limit` its contracts there protect or more, half while it is less
-/// than a quarter, else `cap`; within `sizes`.
+/// A contract's cap, sized to what it protects: the next size up
+/// ([`licash_api::sizes`], about twice `cap`) while what the provider
+/// holds at its hub (`exposure`) is three quarters of the `limit` its
+/// contracts there protect or more, the next down while it is less than
+/// a quarter, else `cap`, down to a size; within `sizes`.
 pub fn resize(cap: u32, exposure: u64, limit: u64, sizes: Option<Sizes>) -> u32 {
     let Some(Sizes { least, most }) = sizes else {
         return cap;
     };
     let sized = if exposure.saturating_mul(4) >= limit.saturating_mul(3) {
-        cap.saturating_mul(2)
+        u64::from(cap) * 2 + 1
     } else if exposure.saturating_mul(4) < limit {
-        cap / 2
+        u64::from(cap) / 2
     } else {
-        cap
+        u64::from(cap)
     };
+    let sized = licash_api::size_at_most(sized).unwrap_or(least);
     sized.clamp(least, most.max(least))
 }
 
@@ -1149,58 +1151,66 @@ mod tests {
     #[test]
     fn caps_double_while_nearly_full_and_halve_while_nearly_empty_within_sizes() {
         let sizes = Some(Sizes {
-            least: 4_096,
-            most: 1_000_000,
+            least: 131_071,
+            most: 4_194_303,
         });
-        assert_eq!(resize(100_000, 75_000, 100_000, sizes), 200_000);
-        assert_eq!(resize(100_000, 74_999, 100_000, sizes), 100_000);
-        assert_eq!(resize(100_000, 25_000, 100_000, sizes), 100_000);
-        assert_eq!(resize(100_000, 24_999, 100_000, sizes), 50_000);
+        let cap = 1_048_575;
+        assert_eq!(resize(cap, 75_000, 100_000, sizes), 2_097_151);
+        assert_eq!(resize(cap, 74_999, 100_000, sizes), cap);
+        assert_eq!(resize(cap, 25_000, 100_000, sizes), cap);
+        assert_eq!(resize(cap, 24_999, 100_000, sizes), 524_287);
         // Within what the hub and the provider's coin let it be.
-        assert_eq!(resize(800_000, 800_000, 800_000, sizes), 1_000_000);
-        assert_eq!(resize(6_000, 0, 6_000, sizes), 4_096);
+        assert_eq!(resize(4_194_303, 800_000, 800_000, sizes), 4_194_303);
+        assert_eq!(resize(131_071, 0, 6_000, sizes), 131_071);
+        // A cap of no size, down to one.
+        assert_eq!(resize(1_500_000, 50, 100, sizes), 1_048_575);
         // Of fixed terms only: as it was.
-        assert_eq!(resize(4_096, 4_096, 4_096, None), 4_096);
-        // A coin of 10 000 sat, twice it at most, at a hub funding 33 554 431.
+        assert_eq!(resize(131_071, 4_096, 4_096, None), 131_071);
+        // A coin of 1 000 000 sat, twice it at most, at a hub funding
+        // 33 554 431: the largest size within.
         let range = licash_api::ContractRange {
-            min_cap: 4_096,
+            min_cap: 131_071,
             max_cap: 33_554_431,
             min_blocks: 432,
             max_blocks: 52_560,
             per_coin: 2,
-            base: 23_000,
+            reserve: 20_000,
+            fee: 3_000,
             ppm_year: 10_000,
+            ppm_year_funded: 0,
         };
         assert_eq!(
-            Sizes::of(range, 10_000),
+            Sizes::of(range, 1_000_000),
             Some(Sizes {
-                least: 4_096,
-                most: 20_000
+                least: 131_071,
+                most: 1_048_575
             })
         );
-        assert_eq!(Sizes::of(range, 1_000), None);
+        assert_eq!(Sizes::of(range, 65_535), None);
     }
 
     #[test]
     fn a_successor_is_sized_to_what_its_hub_holds_and_priced_as_much_more() {
-        let old = kept(1, 4_096, 0, 50_000);
+        let old = kept(1, 131_071, 0, 50_000);
         let renew_at = old.deadlines.unwrap().renew_at;
         let full = planned(
             renew_at,
-            &[sized(4_000, 4_000, 4_096, 100_000)],
+            &[sized(100_000, 100_000, 131_071, 4_194_303)],
             std::slice::from_ref(&old),
         );
-        assert_eq!(full.successors[0].cap, 8_192);
+        // The next size up, about twice it.
+        assert_eq!(full.successors[0].cap, 262_143);
         let price = old.contract.price * 5 / 4 * 2;
         assert_eq!(full.successors[0].max_price, price);
         // Being replaced: none more besides.
         assert!(full.grows.is_empty());
+        let old = kept(1, 262_143, 0, 50_000);
         let idle = planned(
             renew_at,
-            &[sized(500, 500, 1_024, 100_000)],
+            &[sized(500, 500, 131_071, 4_194_303)],
             std::slice::from_ref(&old),
         );
-        assert_eq!(idle.successors[0].cap, 2_048);
+        assert_eq!(idle.successors[0].cap, 131_071);
         assert_eq!(idle.successors[0].max_price, old.contract.price * 5 / 4);
     }
 

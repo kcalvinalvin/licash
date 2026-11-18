@@ -767,13 +767,15 @@ pub fn coins<T: Transport>(wallet: &Wallet<T>, dir: &Path) -> Result<Vec<SilentC
 }
 
 /// The least a coin she deposits holds: the price, and for a cap she
-/// chose within a hub's `range`, the cap over the times her coin it may
-/// be ([`licash_api::ContractRange::per_coin`]).
+/// chose within a hub's `range` larger than its least (the fixed terms'),
+/// the cap over the times her coin it may be
+/// ([`licash_api::ContractRange::per_coin`]).
 pub fn least(range: Option<licash_api::ContractRange>, cap: u32, price: u64) -> u64 {
-    let per_coin = range.map_or(0, |r| u64::from(r.per_coin));
-    match per_coin {
-        0 => price,
-        k => price.max(u64::from(cap).div_ceil(k)),
+    match range {
+        Some(r) if r.per_coin > 0 && cap > r.min_cap => {
+            price.max(u64::from(cap).div_ceil(u64::from(r.per_coin)))
+        }
+        _ => price,
     }
 }
 
@@ -1265,6 +1267,7 @@ mod tests {
             max_blocks: 26_280,
             per_coin: 2,
             ppm_year: 10_000,
+            ppm_year_funded: 0,
         };
         for profile in [
             ChainProfile::Core30DefaultRegtest,
@@ -1275,10 +1278,10 @@ mod tests {
             let checkpoint = Checkpoint::genesis(profile).unwrap();
             for (cap, blocks) in [
                 (CAP, r.min_blocks),
-                (15_000_000, 26_280),
+                (16_777_215, 26_280),
                 (r.max_cap, r.max_blocks),
             ] {
-                let quote = timing.quote_for(keyset.clone(), checkpoint.clone(), cap, blocks);
+                let quote = timing.quote_for(keyset.clone(), checkpoint.clone(), cap, blocks, 0);
                 quote.check(profile).unwrap();
                 let offer = Offer {
                     bounds: timing.bounds(&quote),

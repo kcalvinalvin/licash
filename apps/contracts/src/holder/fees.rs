@@ -36,7 +36,7 @@ pub const SANE_PPM_YEAR: u32 = 200_000;
 /// chosen within `range` if any: the first of its fees that is more than
 /// is sane ([`SANE`], [`SANE_PPM_YEAR`]). None if none is.
 pub fn abusive(fees: &Fees, range: Option<&ContractRange>) -> Option<String> {
-    let year = range.map_or(0, |r| u64::from(r.ppm_year));
+    let year = range.map_or(0, |r| u64::from(r.ppm_year.max(r.ppm_year_funded)));
     let parts = [
         (
             "a payment's base fee, in sat",
@@ -243,8 +243,10 @@ mod tests {
             min_blocks: 1,
             max_blocks: 1_000,
             per_coin: 1,
-            base: 1_000_000,
+            reserve: 20_000,
+            fee: 1_000_000,
             ppm_year,
+            ppm_year_funded: 0,
         };
         assert_eq!(abusive(&Fees::default(), None), None);
         assert_eq!(abusive(&fees(1, 100, 100), Some(&range(10_000))), None);
