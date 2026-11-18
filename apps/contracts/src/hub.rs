@@ -29,10 +29,11 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
-pub use dispute::{Claims, Evidencer, Played};
+pub use dispute::{Claims, Evidencer, LockCheckpoints, Played};
 /// How the hub tells its operator what needs them ([`Openings::alert_with`]).
 pub type Alert = dyn Fn(&str) + Send + Sync;
 use futures_util::StreamExt;
+use licash::chain::Checkpoint;
 use licash::note::Keyset;
 use licash::spend::ChainProfile;
 use licash_chain_client::Source;
@@ -103,6 +104,8 @@ pub struct Openings {
     evidencer: std::sync::OnceLock<Arc<Evidencer>>,
     /// Where the responder retires the notes a filing names.
     claims: std::sync::OnceLock<Arc<Claims>>,
+    /// The ledger's lock checkpoints, which new contracts open on.
+    checkpoints: std::sync::OnceLock<LockCheckpoints>,
     /// The prover of the hub's statement: none where proofs are the mock
     /// authority's.
     prover: Option<prover::Prover>,
@@ -338,6 +341,7 @@ impl Openings {
             watch: dispute::Watch::default(),
             evidencer: std::sync::OnceLock::new(),
             claims: std::sync::OnceLock::new(),
+            checkpoints: std::sync::OnceLock::new(),
             prover: (!trust.mock)
                 .then(|| prover::Prover::start(data, trust.program, prover::spacing(profile))),
             alert: std::sync::OnceLock::new(),
@@ -408,9 +412,10 @@ impl Openings {
         })
     }
 
-    /// The hub's offer now, checkpointed at its tip: its quote of `cap`
-    /// sat over `blocks` she chose, if within its terms, else its fixed
-    /// one.
+    /// The hub's offer now, checkpointed at the ledger's newest lock
+    /// checkpoint ([`Openings::checkpoints_with`]), else at its tip: its
+    /// quote of `cap` sat over `blocks` she chose, if within its terms,
+    /// else its fixed one.
     pub async fn offer(&self, chosen: Option<(u32, u32)>) -> Result<Offer, Refused> {
         let (cap, blocks) = chosen.unwrap_or((terms::CAP, terms::LOCK));
         self.timing.allows(cap, blocks).map_err(Refused::bad)?;
@@ -421,8 +426,10 @@ impl Openings {
             )));
         }
         let tip = self.source.tip().await.map_err(Refused::unavailable)?;
-        let checkpoint = self.source.checkpoint(tip.height).await;
+        let height = self.opening_height(tip.height)?;
+        let checkpoint = self.source.checkpoint(height).await;
         let checkpoint = checkpoint.map_err(Refused::unavailable)?;
+        self.keep_checkpoint(&checkpoint)?;
         let timing = self.timing.at_step(self.step_now()?);
         let quote = timing.quote_for(self.keyset.clone(), checkpoint, cap, blocks);
         let bounds = self.timing.bounds(&quote);
@@ -539,6 +546,34 @@ impl Openings {
     /// only claims that are none are answered.
     pub fn evidence_with(&self, f: Arc<Evidencer>) {
         let _ = self.evidencer.set(f);
+    }
+
+    /// Open contracts from now on on the newest block the ledger takes as
+    /// a lock checkpoint, kept first as its newest. Every lock named after
+    /// a contract opens then names its checkpoint or a later one, a block
+    /// of the chain its statement reads, so the lock's activation can be
+    /// judged in it. Without, contracts open at the tip.
+    pub fn checkpoints_with(&self, checkpoints: LockCheckpoints) {
+        let _ = self.checkpoints.set(checkpoints);
+    }
+
+    /// The height new contracts open at, the chain's tip at `tip`.
+    pub(crate) fn opening_height(&self, tip: u32) -> Result<u32, Refused> {
+        match self.checkpoints.get() {
+            Some(c) => (c.height)(tip)
+                .map_err(|e| Refused::unavailable(format!("the ledger's lock checkpoint: {e:#}"))),
+            None => Ok(tip),
+        }
+    }
+
+    /// Keep `checkpoint`, of a contract opening, as the ledger's lock
+    /// checkpoint if it is newer than its newest.
+    pub(crate) fn keep_checkpoint(&self, checkpoint: &Checkpoint) -> Result<(), Refused> {
+        match self.checkpoints.get() {
+            Some(c) => (c.keep)(checkpoint)
+                .map_err(|e| Refused::unavailable(format!("the ledger's lock checkpoint: {e:#}"))),
+            None => Ok(()),
+        }
     }
 
     /// Retire the notes of each holder's published claim with `f` from
@@ -911,6 +946,7 @@ mod tests {
             watch: dispute::Watch::default(),
             evidencer: std::sync::OnceLock::new(),
             claims: std::sync::OnceLock::new(),
+            checkpoints: std::sync::OnceLock::new(),
             prover: None,
             alert: std::sync::OnceLock::new(),
             withheld: Mutex::default(),

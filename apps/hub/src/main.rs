@@ -1141,6 +1141,9 @@ fn command(cli: Cli) -> anyhow::Result<()> {
                     // decides each claim against its ledger, and proves
                     // what it answers.
                     licash_hub_service::answer_from(&openings, hub.clone());
+                    // Contracts open on its lock checkpoints, so that every
+                    // later lock is judged on their chain.
+                    licash_hub_service::open_on_lock_checkpoints(&openings, hub.clone());
                     // Its prover not ready, failing or short of time, a
                     // notification.
                     let notify = hub.clone();

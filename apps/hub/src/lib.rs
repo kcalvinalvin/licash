@@ -57,6 +57,32 @@ pub fn answer_from(openings: &licash_contracts::hub::Openings, hub: Arc<Hub>) {
     }));
 }
 
+/// New contracts in `openings` opened on `hub`'s lock checkpoints: on a
+/// block buried as one, kept as its newest if newer. Every lock named
+/// after a contract opens is then judged on the chain its statement
+/// reads.
+pub fn open_on_lock_checkpoints(openings: &licash_contracts::hub::Openings, hub: Arc<Hub>) {
+    let bury = hub.info().policy.timing.bury;
+    let scan = hub.clone();
+    openings.checkpoints_with(licash_contracts::hub::LockCheckpoints {
+        height: Box::new(move |tip| {
+            let (top, _) = scan
+                .scanned()?
+                .ok_or_else(|| anyhow::anyhow!("the hub follows no chain yet"))?;
+            Ok((top.min(tip) + 1).saturating_sub(bury))
+        }),
+        keep: Box::new(move |checkpoint| {
+            if hub
+                .checkpoint()
+                .is_some_and(|newest| newest.height() >= checkpoint.height())
+            {
+                return Ok(());
+            }
+            Ok(hub.add_checkpoint(checkpoint)?)
+        }),
+    });
+}
+
 /// What a hub serves beside its ledger, each if it runs it.
 #[derive(Clone, Default)]
 pub struct Services {

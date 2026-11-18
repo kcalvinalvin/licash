@@ -55,6 +55,20 @@ use crate::FoldOffer;
 /// the claim is then owed what its notes are worth.
 pub type Evidencer = dyn Fn(&UnsignedClaim) -> Result<Vec<Evidence>> + Send + Sync;
 
+/// The hub ledger's lock checkpoints, as new contracts open on them
+/// ([`Openings::checkpoints_with`]).
+pub struct LockCheckpoints {
+    /// The height of the newest block the ledger takes as a lock
+    /// checkpoint, the chain's tip at the height given: buried in its scan.
+    pub height: Box<dyn Fn(u32) -> Result<u32> + Send + Sync>,
+    /// Keep a contract's checkpoint as the newest lock checkpoint, if it
+    /// is newer than that.
+    pub keep: Box<KeepCheckpoint>,
+}
+
+/// Keep a contract's checkpoint as a lock checkpoint ([`LockCheckpoints`]).
+pub type KeepCheckpoint = dyn Fn(&licash::chain::Checkpoint) -> Result<()> + Send + Sync;
+
 /// Where the hub's ledger retires the notes that a holder's published
 /// claim in a contract names ([`Openings::claims_with`]): spent by nothing
 /// else from then on. Again is nothing new.

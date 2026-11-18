@@ -400,6 +400,41 @@ async fn a_wallet_opens_contracts_at_a_hub_and_sees_them_confirm() -> Result<()>
     Ok(())
 }
 
+/// A hub following Bitcoin opens contracts on the newest block its ledger
+/// takes as a lock checkpoint, kept as its newest: every lock named after
+/// a contract opens is on the chain its statement reads.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs bitcoind and a release build"]
+async fn a_hub_opens_contracts_on_its_newest_lock_checkpoint() -> Result<()> {
+    let newest = |hub: &Hub| hub.checkpoint().map(|c| c.commitment());
+    let rt = Regtest::start_standard()?;
+    let dir = tempfile::tempdir()?;
+    let (url, source, hub, openings) = hub_answering(&rt, &dir.path().join("hub")).await?;
+    licash_hub_service::open_on_lock_checkpoints(&openings, hub.clone());
+    let chain = Node(source.clone());
+    // Following no chain yet: no offer.
+    ensure!(openings.offer(None).await.is_err());
+    let seed = [7; 32];
+    let (mine, wallet) = holder_wallet(&rt, &chain, dir.path(), &url, seed, &[100_000]).await?;
+    while !watch::step(&hub, &source).await? {}
+    let first = hub.checkpoint().context("no checkpoint")?;
+    // Later blocks, too few for the hub to take another checkpoint.
+    rt.mine(20)?;
+    while !watch::step(&hub, &source).await? {}
+    ensure!(newest(&hub) == Some(first.commitment()));
+    let tip = rt.height()?;
+    let offer = openings.offer(None).await;
+    let offer = offer.map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    let at = offer.quote.chain.checkpoint.clone();
+    let bury = Policy::default().timing.bury;
+    ensure!(at.height() == tip + 1 - bury && at.height() > first.height());
+    ensure!(newest(&hub) == Some(at.commitment()), "not kept");
+    let opened = holder::open(&wallet, &chain, &mine, &url, ask()).await?;
+    ensure!(opened.phase == Phase::Funded, "{opened:?}");
+    ensure!(newest(&hub) == Some(at.commitment()));
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs bitcoind and a release build"]
 async fn a_wallet_opens_a_contract_of_terms_it_chose_on_its_large_coin() -> Result<()> {
@@ -2024,8 +2059,11 @@ async fn hub_taking_deposits(
     let path = dir.join("deposits.sqlite");
     let deposits = deposit::Gateway::open(hub.clone(), source.clone(), regtest, config, &path)?;
     let deposits = Arc::new(deposits);
+    let openings = openings.await?;
+    // On its lock checkpoints, as the hub service's.
+    licash_hub_service::open_on_lock_checkpoints(&openings, hub.clone());
     let services = Services {
-        contracts: Some(openings.await?),
+        contracts: Some(openings),
         deposits: Some(deposits.clone()),
         ..Default::default()
     };

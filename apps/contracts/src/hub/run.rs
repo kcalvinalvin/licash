@@ -17,7 +17,7 @@ use crate::{Frame, Opening};
 /// How often a patient step looks whether the opening is still busy.
 const BUSY_POLL: std::time::Duration = std::time::Duration::from_millis(250);
 
-/// How deep the block a quote is checkpointed at may be.
+/// How many blocks deeper than a new one a quote's checkpoint may be.
 const MAX_AGE: u32 = 6;
 
 /// Clears an opening's busy mark however its task ends.
@@ -113,8 +113,8 @@ impl Openings {
     }
 
     /// Refused unless `quote` is the hub's: its terms surcharged at one of
-    /// `steps`, checkpointed at a block of its best chain at most
-    /// [`MAX_AGE`] deep.
+    /// `steps`, checkpointed at a block of its best chain buried as a new
+    /// quote's, at most [`MAX_AGE`] deeper, and kept as a lock checkpoint.
     async fn terms_of(
         &self,
         quote: &Quote,
@@ -127,7 +127,8 @@ impl Openings {
             .await
             .map_err(Refused::unavailable)?
             .height;
-        if height > tip || tip - height > MAX_AGE {
+        let newest = self.opening_height(tip)?;
+        if height > tip || newest.saturating_sub(height) > MAX_AGE {
             return Err(Refused::stale(format!(
                 "a quote of block {height}, the tip at {tip}: ask again"
             )));
@@ -148,7 +149,7 @@ impl Openings {
             let timing = self.timing.at_step(step);
             let ours = timing.quote_for(self.keyset.clone(), checkpoint.clone(), cap, blocks);
             if bytes(&ours) == theirs {
-                return Ok(());
+                return self.keep_checkpoint(&ours.chain.checkpoint);
             }
         }
         Err(Refused::stale("not the hub's quote: ask again"))
