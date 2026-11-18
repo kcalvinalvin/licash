@@ -11,6 +11,7 @@
 mod chain;
 pub mod claims;
 mod driver;
+pub mod exit;
 pub mod fees;
 mod fold;
 #[cfg(feature = "node")]

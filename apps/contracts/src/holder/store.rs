@@ -4,7 +4,8 @@
 //! a list shows of it. Neither is made until a first contract opens.
 //!
 //! The file's version tells which of its tables a build must know to
-//! read it right. The `ceilings`, `claim_terms` and `folds` are none of them: each
+//! read it right. The `ceilings`, `claim_terms`, `folds`, `exit_consent`
+//! and `exit_payouts` are none of them: each
 //! made with the first kept, whatever the version, and ignored by a build
 //! before them, which opens the file all the same. A migration to come
 //! must make them `IF NOT EXISTS` too.
@@ -95,6 +96,23 @@ CREATE TABLE IF NOT EXISTS claim_terms (
 /// The contracts she closed early with their hub, each by its last fold's
 /// txid: kept before the hub can sign it, and never dropped: whatever the
 /// hub answers, it may have signed.
+/// Her consent to exit contracts ending ([`super::exit`]), a row at most,
+/// and the payouts the exit made, by ticket, before each was paid.
+const EXITS: &str = "
+CREATE TABLE IF NOT EXISTS exit_consent (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    address TEXT NOT NULL,
+    exit_margin INTEGER NOT NULL,
+    given_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS exit_payouts (
+    ticket TEXT PRIMARY KEY,
+    contract BLOB NOT NULL,
+    hub TEXT NOT NULL,
+    at INTEGER NOT NULL
+);
+";
+
 const FOLDS: &str = "
 CREATE TABLE IF NOT EXISTS folds (
     id BLOB PRIMARY KEY REFERENCES contracts (id),
@@ -342,6 +360,65 @@ impl Store {
             self.c.execute("DELETE FROM served WHERE id = ?1", [id])?;
         }
         Ok(())
+    }
+
+    /// Her consent to exit, if given: where to pay out, and the exit
+    /// margin she gave with it. None if never given or revoked.
+    pub fn exit_consent(&self) -> Result<Option<(String, u32, i64)>> {
+        if !self.has("exit_consent")? {
+            return Ok(None);
+        }
+        Ok(self
+            .c
+            .query_row(
+                "SELECT address, exit_margin, given_at FROM exit_consent WHERE id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?)
+    }
+
+    /// Her consent to exit, paying out to `address`, with `exit_margin`:
+    /// in place of any given before.
+    pub fn consent_to_exit(&self, address: &str, exit_margin: u32) -> Result<()> {
+        self.c.execute_batch(EXITS)?;
+        self.c.execute(
+            "INSERT INTO exit_consent (id, address, exit_margin, given_at) VALUES (1, ?1, ?2, ?3)
+             ON CONFLICT (id) DO UPDATE SET address = ?1, exit_margin = ?2, given_at = ?3",
+            params![address, exit_margin, crate::now()],
+        )?;
+        Ok(())
+    }
+
+    /// Her consent to exit revoked, if given.
+    pub fn revoke_exit_consent(&self) -> Result<()> {
+        if self.has("exit_consent")? {
+            self.c.execute("DELETE FROM exit_consent", [])?;
+        }
+        Ok(())
+    }
+
+    /// The exit's payout `ticket`, for contract `id` from the hub at `hub`,
+    /// at block `at`: kept before it is paid.
+    pub fn exit_payout(&self, ticket: &str, id: &[u8; 32], hub: &str, at: u32) -> Result<()> {
+        self.c.execute_batch(EXITS)?;
+        self.c.execute(
+            "INSERT INTO exit_payouts (ticket, contract, hub, at) VALUES (?1, ?2, ?3, ?4)",
+            params![ticket, id, hub, at],
+        )?;
+        Ok(())
+    }
+
+    /// The tickets of the payouts the exit made for contract `id`.
+    pub fn exit_payouts(&self, id: &[u8; 32]) -> Result<Vec<String>> {
+        if !self.has("exit_payouts")? {
+            return Ok(vec![]);
+        }
+        let mut stmt = self
+            .c
+            .prepare("SELECT ticket FROM exit_payouts WHERE contract = ?1 ORDER BY at")?;
+        let tickets = stmt.query_map([id], |r| r.get(0))?;
+        Ok(tickets.collect::<rusqlite::Result<_>>()?)
     }
 
     /// Contract `id` closed early by the fold `txid`, before the hub can

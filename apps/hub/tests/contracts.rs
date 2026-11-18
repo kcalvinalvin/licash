@@ -1839,6 +1839,165 @@ async fn a_providers_keeper_opens_the_first_contract_at_a_hub_where_told_to() ->
     Ok(())
 }
 
+/// A provider found by her app that pays nothing out.
+struct NoProvider;
+
+impl licash_contracts::holder::exit::CashOut for NoProvider {
+    async fn quote_all(&self, _: &str, _: &str) -> Result<licash_wallet::PayoutQuote> {
+        anyhow::bail!("no provider pays out now")
+    }
+}
+
+/// Her exit from a contract ending, notes at its hub no other contract
+/// recovers: nothing done without her consent, only told; consented, her
+/// notes paid out, which fails here, then forced closed a day before its
+/// request would have to confirm.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs bitcoind and a release build"]
+async fn her_exit_needs_consent_then_forces_closed_what_it_could_not_pay_out() -> Result<()> {
+    use bitcoin::FeeRate;
+    use licash_contracts::holder::{exit, recovery, safety};
+
+    let rt = Regtest::start_standard()?;
+    let dir = tempfile::tempdir()?;
+    let at = dir.path().join("hub");
+    let range = Range {
+        max_cap: 50_000_000,
+        max_blocks: 5_000,
+        per_coin: 2,
+        ppm_year: 10_000,
+    };
+    let (url, source, hub) = hub_serving(&rt, &at, Some(range)).await?;
+    let chain = Node(source);
+    let coins = [60_000, 60_000];
+    let (mine, wallet) = holder_wallet(&rt, &chain, dir.path(), &url, [12; 32], &coins).await?;
+    let address = wallet.fallback_address()?.to_string();
+    let (margin, rate) = (10, FeeRate::from_sat_per_vb_u32(2));
+    let drive = || exit::drive(&wallet, &chain, &mine, &NoProvider, margin, rate);
+    // No contract: nothing to consent to exit, nothing made.
+    ensure!(exit::consent_to(&wallet, &mine, &address, margin).is_err());
+    ensure!(drive().await?.is_empty());
+    ensure!(!mine.join("contracts.sqlite").exists());
+
+    let ask = Ask {
+        blocks: 1_000,
+        ..ask()
+    };
+    let contract = holder::open(&wallet, &chain, &mine, &url, ask).await?;
+    rt.mine(1)?;
+    holder::resume(&wallet, &chain, &mine).await?;
+    let live = holder::list(&mine)?;
+    ensure!(live[0].live(rt.height()?), "{live:?}");
+    let payment = pay(&hub, &at.join("seed"), &url, &wallet.address(), 3_000)?;
+    wallet.receive(&payment)?;
+    let tip = rt.height()?;
+    let s = safety::of(
+        &wallet,
+        &mine,
+        &contract.id,
+        tip,
+        margin,
+        exit::TIMEOUT_SLACK,
+    )?;
+    let by = s.request_by.context("no request deadline")?;
+    let (cash_at, force_at) = (by - 3 * 144, by - 144);
+    ensure!(cash_at > tip, "{s:?} at {tip}");
+
+    let exits = drive().await?;
+    ensure!(exits.len() == 1, "{exits:?}");
+    ensure!(
+        (exits[0].step, exits[0].cash_at, exits[0].force_at)
+            == (exit::Step::Waiting, cash_at, force_at),
+        "{exits:?}"
+    );
+    // Due, her notes at risk, and no consent: she is told, nothing done,
+    // even past its forced close's block.
+    rt.mine_to_height(force_at)?;
+    let exits = drive().await?;
+    ensure!(exits[0].step == exit::Step::NeedsConsent, "{exits:?}");
+    ensure!(exits[0].uncovered == 3_000, "{exits:?}");
+    ensure!(recovery::recoveries(&mine)?.is_empty());
+    ensure!(exit::consent(&mine)?.is_none());
+
+    // Consented: forced closed at once, its notes not paid out in time.
+    let consent = exit::consent_to(&wallet, &mine, &address, margin)?;
+    ensure!(consent.address == address && consent.exit_margin == margin);
+    let exits = drive().await?;
+    ensure!(
+        exits[0].step == exit::Step::ForceClosing && exits[0].error.is_none(),
+        "{exits:?}"
+    );
+    let recoveries = recovery::recoveries(&mine)?;
+    ensure!(
+        recoveries.len() == 1 && recoveries[0].id == contract.id,
+        "{recoveries:?}"
+    );
+    // Under recovery: the exit has nothing more to do of it.
+    ensure!(drive().await?.is_empty());
+    exit::revoke(&mine)?;
+    ensure!(exit::consent(&mine)?.is_none());
+    Ok(())
+}
+
+/// Her exit, consented, before its forced close's block: her notes paid
+/// out, which fails without a provider, told and tried again next round,
+/// nothing locked.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs bitcoind and a release build"]
+async fn her_exit_tries_to_pay_out_before_forcing_closed() -> Result<()> {
+    use bitcoin::FeeRate;
+    use licash_contracts::holder::{exit, recovery, safety};
+
+    let rt = Regtest::start_standard()?;
+    let dir = tempfile::tempdir()?;
+    let at = dir.path().join("hub");
+    let range = Range {
+        max_cap: 50_000_000,
+        max_blocks: 5_000,
+        per_coin: 2,
+        ppm_year: 10_000,
+    };
+    let (url, source, hub) = hub_serving(&rt, &at, Some(range)).await?;
+    let chain = Node(source);
+    let coins = [60_000, 60_000];
+    let (mine, wallet) = holder_wallet(&rt, &chain, dir.path(), &url, [13; 32], &coins).await?;
+    let address = wallet.fallback_address()?.to_string();
+    let (margin, rate) = (10, FeeRate::from_sat_per_vb_u32(2));
+    let ask = Ask {
+        blocks: 1_000,
+        ..ask()
+    };
+    let contract = holder::open(&wallet, &chain, &mine, &url, ask).await?;
+    rt.mine(1)?;
+    holder::resume(&wallet, &chain, &mine).await?;
+    let payment = pay(&hub, &at.join("seed"), &url, &wallet.address(), 3_000)?;
+    wallet.receive(&payment)?;
+    exit::consent_to(&wallet, &mine, &address, margin)?;
+    let s = safety::of(
+        &wallet,
+        &mine,
+        &contract.id,
+        rt.height()?,
+        margin,
+        exit::TIMEOUT_SLACK,
+    )?;
+    let by = s.request_by.context("no request deadline")?;
+    rt.mine_to_height(by - 3 * 144)?;
+    for _ in 0..2 {
+        let exits = exit::drive(&wallet, &chain, &mine, &NoProvider, margin, rate).await?;
+        ensure!(exits[0].step == exit::Step::CashingOut, "{exits:?}");
+        let error = exits[0].error.as_deref().unwrap_or_default();
+        ensure!(error.contains("no provider pays out now"), "{exits:?}");
+        ensure!(recovery::recoveries(&mine)?.is_empty());
+        ensure!(wallet.payouts()?.is_empty() && wallet.locks()?.is_empty());
+        rt.mine(1)?;
+    }
+    // A margin preferred since changes nothing: her consent's is planned.
+    let exits = exit::drive(&wallet, &chain, &mine, &NoProvider, 1_000, rate).await?;
+    ensure!(exits[0].step == exit::Step::CashingOut, "{exits:?}");
+    Ok(())
+}
+
 /// A provider's keeper, a round at a time: what the provider takes in at
 /// the hub held to its contracts there, the one ending replaced in time,
 /// and forced closed at its safe deadline only once its successor cannot

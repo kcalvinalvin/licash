@@ -3366,6 +3366,7 @@ dependencies = [
  "licash-chain-client",
  "licash-contract",
  "licash-hp",
+ "licash-onchain",
  "licash-wallet",
  "lichen-babe",
  "lichen-btc",
