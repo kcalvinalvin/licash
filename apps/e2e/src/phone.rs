@@ -332,13 +332,15 @@ impl Phone {
         self.shell(&format!("input swipe {from} {y} {to} {y} 500"))
             .await?;
         tokio::time::sleep(Duration::from_millis(300)).await;
-        // A swipe may stop short of an end: a tap at it clamps there.
+        // A swipe may stop short of an end: a tap at it clamps there,
+        // where the slider is now (a sheet shrinking as it moved, say).
         let end = match at {
             at if at <= 0.0 => Some(left + 1),
             at if at >= 1.0 => Some(right - 1),
             _ => None,
         };
         if let Some(x) = end {
+            let (_, y) = self.by_id(id, 10).await?.center();
             self.shell(&format!("input tap {x} {y}")).await?;
             tokio::time::sleep(Duration::from_millis(300)).await;
         }
