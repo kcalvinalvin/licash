@@ -39,8 +39,9 @@ use std::{future::Future, sync::PoisonError};
 use bitcoin::{
     absolute::LOCK_TIME_THRESHOLD,
     consensus::{deserialize, serialize},
+    hashes::Hash,
     secp256k1::{Secp256k1, SecretKey, XOnlyPublicKey},
-    Amount, FeeRate, OutPoint, ScriptBuf, Transaction,
+    Amount, BlockHash, FeeRate, OutPoint, ScriptBuf, Transaction,
 };
 use licash::spend::{ChainProfile, ProposalId};
 use licash_api::{
@@ -819,9 +820,18 @@ impl<T: Transport> Provider<T> {
         };
         let script = coin.htlc.script_pubkey();
         let tip = chain.height().await.map_err(licash_wallet::Error::Chain)?;
-        let first = first_to_scan(coin.scanned, height);
+        // Read before looking, so that a block replaced meanwhile is looked
+        // in again next time.
+        let through = (
+            tip,
+            chain.hash(tip).await.map_err(licash_wallet::Error::Chain)?,
+        );
+        let Some(scanned) = self.looked_through(id, coin.scanned, tip, chain).await? else {
+            return Ok(());
+        };
+        let first = first_to_scan(scanned, height);
         let Some((at, spend)) = first_spend(chain, outpoint, &script, first..=tip).await? else {
-            self.set_scanned(id, tip)?;
+            self.set_scanned(id, through)?;
             if tip >= coin.htlc.timeout {
                 self.refund(id, row, coin, chain).await?;
             }
@@ -829,7 +839,6 @@ impl<T: Transport> Provider<T> {
         };
         if let Some(preimage) = coin.htlc.preimage_in(&spend, outpoint) {
             tracing::info!(id = %hex::encode(id), height = at, "payout's coin claimed");
-            self.set_scanned(id, at)?;
             self.advance(id, Stage::Locked, Stage::Paid, Some(&preimage), None)?;
             let row = self.row(id)?.expect("recorded");
             return self.claim(id, &row).await;
@@ -838,13 +847,12 @@ impl<T: Transport> Provider<T> {
         let need = payout_depth(self.wallet.network());
         if tip + 1 - at < need {
             // Looked for again next time, to count its confirmations.
-            self.set_scanned(id, at - 1)?;
             if let Some(tx) = &coin.refund {
                 self.broadcast_refund(id, tx, chain).await;
             }
             return Ok(());
         }
-        self.set_scanned(id, tip)?;
+        self.set_scanned(id, through)?;
         tracing::info!(id = %hex::encode(id), "refunded: the client never claimed the coin");
         let notice = Notice::Refunded {
             id: hex::encode(id),
@@ -920,16 +928,79 @@ impl<T: Transport> Provider<T> {
         }
     }
 
-    fn set_scanned(&self, id: &[u8; 32], height: u32) -> Result<(), Error> {
+    /// The coin of payout `id` looked through to block `through`, its
+    /// height and hash: none of its spends in the chain ending there, but
+    /// the provider's refund once refunded.
+    fn set_scanned(&self, id: &[u8; 32], (height, hash): (u32, BlockHash)) -> Result<(), Error> {
         self.store.write(|t| {
             t.execute(
                 "UPDATE payouts SET scanned = ?2 WHERE id = ?1",
                 params![id, height],
             )?;
+            t.execute(
+                "INSERT INTO payout_anchors (id, height, hash) VALUES (?1, ?2, ?3)
+                 ON CONFLICT (id) DO UPDATE SET height = ?2, hash = ?3",
+                params![id, height, hash.as_byte_array()],
+            )?;
             Ok(())
         })
     }
+
+    /// The block of payout `id` to be anchored at, its height and hash, if
+    /// recorded at `scanned`: none at another height was written before
+    /// `scanned` was by a provider of a version before.
+    fn anchor(&self, id: &[u8; 32], scanned: u32) -> Result<Option<BlockHash>, Error> {
+        let hash: Option<[u8; 32]> = self.store.read(|c| {
+            Ok(c.query_row(
+                "SELECT hash FROM payout_anchors WHERE id = ?1 AND height = ?2",
+                params![id, scanned],
+                |r| r.get(0),
+            )
+            .optional()?)
+        })?;
+        Ok(hash.map(BlockHash::from_byte_array))
+    }
+
+    /// How far the coin of payout `id`, looked through to `scanned`, was
+    /// looked through in the chain as it is at `tip`: as far, if the block
+    /// it was looked through to is still the chain's there; not at all if
+    /// replaced, from its own block again. Without that block's hash, as
+    /// a provider of a version before left it, [`REORG`] blocks less. None
+    /// while the chain is shorter than that, or its block unknown: waited
+    /// for.
+    async fn looked_through(
+        &self,
+        id: &[u8; 32],
+        scanned: Option<u32>,
+        tip: u32,
+        chain: &impl Chain,
+    ) -> Result<Option<Option<u32>>, Error> {
+        let Some(scanned) = scanned else {
+            return Ok(Some(None));
+        };
+        let Some(hash) = self.anchor(id, scanned)? else {
+            return Ok(Some(Some(scanned.saturating_sub(REORG))));
+        };
+        if scanned > tip {
+            return Ok(None);
+        }
+        match chain.hash(scanned).await {
+            Ok(now) if now == hash => Ok(Some(Some(scanned))),
+            Ok(_) => {
+                tracing::info!(id = %hex::encode(id), scanned, "payout's coin looked for again: its blocks replaced");
+                Ok(Some(None))
+            }
+            Err(e) => {
+                tracing::debug!(id = %hex::encode(id), "no block at {scanned}: {e}");
+                Ok(None)
+            }
+        }
+    }
 }
+
+/// How deep a reorganization a payout's coin is looked back through for,
+/// where the block it was looked through to is not known.
+const REORG: u32 = 6;
 
 /// The first block to look in for the spend of a coin mined at `funding`,
 /// blocks up to `scanned` looked in already: the coin's own block first,

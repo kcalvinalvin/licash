@@ -152,6 +152,20 @@ impl Net {
         assert!(hub.synced(chain.height(), &chain.tip()).unwrap());
     }
 
+    /// Bitcoin reorganizes the chain of the hub at `url` above `height`:
+    /// its blocks past it are gone, which its hub forgets, and those mined
+    /// next differ from them.
+    #[allow(dead_code)]
+    pub fn reorg(&self, url: &str, height: u32) {
+        let (hub, chain) = {
+            let sites = self.sites.lock().unwrap();
+            (sites[url].hub.clone().unwrap(), sites[url].chain.clone())
+        };
+        let mut chain = chain.lock().unwrap();
+        chain.blocks.truncate(height as usize + 1);
+        hub.rewind(height + 1).unwrap();
+    }
+
     /// The chain of the hub at `url`, as a wallet reads it.
     #[allow(dead_code)]
     pub fn view(&self, url: &str) -> View {

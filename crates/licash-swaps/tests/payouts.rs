@@ -674,6 +674,54 @@ async fn a_refund_left_out_of_the_blocks_is_made_again_at_a_rising_rate() {
     assert_eq!(eco.stage(), Stage::Refunded);
 }
 
+/// A payout's coin looked through to three blocks past its own, which
+/// Bitcoin then replaces with others, its client's claim in the first:
+/// the provider takes the claim and is paid. `legacy`: the file holds no
+/// hash of the block looked through to, as a provider of a version before
+/// left it.
+async fn claimed_in_blocks_replacing_those_looked_through(legacy: bool) {
+    let eco = Eco::new(STOCK, TERMS).await;
+    let payout = eco.pay_out(1_000).await;
+    eco.pool.mine();
+    eco.follow().await;
+    assert_eq!(eco.stage(), Stage::Locked);
+    let coin_at = eco.pool.view.height();
+    assert_eq!(
+        eco.client_follows(&payout).await.state,
+        PayoutState::Claimed
+    );
+    let claim = eco.pool.waiting();
+    eco.pool.mine_if(|_| false);
+    eco.mine_to(coin_at + 3);
+    eco.follow().await;
+    assert_eq!(eco.stage(), Stage::Locked);
+    if legacy {
+        rusqlite::Connection::open(eco.dir.path().join("swaps.sqlite"))
+            .unwrap()
+            .execute("DELETE FROM payout_anchors", [])
+            .unwrap();
+    }
+    eco.net.reorg(A, coin_at);
+    for tx in &claim {
+        eco.pool.broadcast(tx).await.unwrap();
+    }
+    assert!(eco.pool.mine().iter().any(is_claim));
+    eco.mine_to(coin_at + 4);
+    eco.follow().await;
+    assert_eq!(eco.stage(), Stage::Done);
+    assert!(eco.provider_held() > 1_000);
+}
+
+#[tokio::test]
+async fn a_claim_mined_in_blocks_replacing_those_looked_through_pays_the_provider() {
+    claimed_in_blocks_replacing_those_looked_through(false).await;
+}
+
+#[tokio::test]
+async fn a_claim_mined_in_blocks_replacing_those_a_provider_before_looked_through_pays_it() {
+    claimed_in_blocks_replacing_those_looked_through(true).await;
+}
+
 #[tokio::test]
 async fn a_provider_stopped_mid_payout_takes_it_on() {
     let eco = Eco::new(STOCK, TERMS).await;

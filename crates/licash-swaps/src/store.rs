@@ -39,6 +39,20 @@ CREATE TABLE donations (
 CREATE INDEX donations_state ON donations (state);
 ";
 
+/// The block a payout's coin was looked through to (`payouts.scanned`),
+/// by its hash: while the chain still has it there, so are the blocks
+/// before, and what they held stands. Made at open whatever the schema
+/// version, so that a provider of a version before still reads the file:
+/// one at `scanned` is to be trusted, and none, or one at another height
+/// (`scanned` written since by a provider without it), tells nothing.
+const ANCHORS: &str = "
+CREATE TABLE IF NOT EXISTS payout_anchors (
+    id BLOB PRIMARY KEY,
+    height INTEGER NOT NULL,
+    hash BLOB NOT NULL
+) STRICT;
+";
+
 /// Version 4: Lightning invoices paid. A swap of kind `lightning` pays an
 /// invoice from the provider's node: its `to_url` is
 /// `lightning:<network>`, `address` the invoice's payee, a public key,
@@ -163,6 +177,7 @@ impl Store {
             tx.execute_batch(ISSUES)?;
             tx.execute_batch(INVOICES)?;
             tx.execute_batch(DONATIONS)?;
+            tx.execute_batch(ANCHORS)?;
             tx.pragma_update(None, "user_version", VERSION)?;
             tx.execute(
                 "INSERT INTO meta (one, nostr, created_at) VALUES (1, ?1, ?2)",
@@ -204,6 +219,7 @@ impl Store {
                     )))
                 }
             }
+            tx.execute_batch(ANCHORS)?;
             Ok(())
         })?;
         Ok(store)
