@@ -163,7 +163,15 @@ the hub advertises the range's largest cap whatever its wallet holds.
 The collateral of a contract is the next power of two minus one sat at or
 above its cap (2,097,151 sat at least, 2,147,483,647 at most). F, a contract's
 funding, spends the wallet's coins, which stay locked while the opening
-lives. Openings are kept in `<data>/openings.sqlite`, as sensitive as the
+lives. A wallet that has the hub sign F and never broadcasts it holds
+those coins locked, so the hub frees them itself. Once a coin F spends is
+spent elsewhere 6 blocks deep (her deposit, say), it gives the opening up
+and unlocks them. If F is still in no block 144 blocks (a day) after the
+hub first saw it, or once F may no longer fund its contract, the hub
+spends one of its own coins F spends back to its wallet, then gives the
+opening up once that is deep. At most 16 signed openings may wait unfunded
+like this; past that, new openings are refused as unavailable, and the
+operator is alerted once. Openings are kept in `<data>/openings.sqlite`, as sensitive as the
 seed: back it up with `hub.sqlite`. Each opening receives the kept garbled instances from
 the holder's wallet, kept in `<data>/opening-instances/`. The hub takes one opening's step, or
 builds one instance, at a time, the others waiting their turn: each opening

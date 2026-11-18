@@ -46,6 +46,11 @@ use terms::{Range, Timing};
 /// The most openings short of the hub's signatures at once.
 pub const MAX_UNDER_WAY: usize = 16;
 
+/// The most openings signed whose F is in no block, as the responder last
+/// saw, before new ones are refused: each holds coins of the hub's locked
+/// until it confirms or is made never to ([`dispute::UNFUNDED_FOR`]).
+pub const MAX_UNFUNDED: usize = 16;
+
 /// The most steps of openings and instances built at once. Each takes
 /// hundreds of MB, and anyone may start an opening (a confirmed coin is all
 /// it asks): one at a time bounds the hub's memory, the others waiting
@@ -98,6 +103,8 @@ pub struct Openings {
     /// Whether more contracts are open than its prover can contest the
     /// exits of at once, as last told.
     over_capacity: std::sync::atomic::AtomicBool,
+    /// Whether [`MAX_UNFUNDED`] was told reached, not since left.
+    unfunded_full: std::sync::atomic::AtomicBool,
     /// Each contract's fold offered, until its holder signs or asks again.
     folds: Mutex<HashMap<[u8; 32], dispute::PendingFold>>,
     /// What the node's wallet last said it holds, in sat: the most it
@@ -297,6 +304,7 @@ impl Openings {
             alert: std::sync::OnceLock::new(),
             withheld: Mutex::default(),
             over_capacity: Default::default(),
+            unfunded_full: Default::default(),
             folds: Mutex::default(),
             funds: Mutex::new(None),
         });
@@ -518,6 +526,20 @@ impl Openings {
                         .store(false, std::sync::atomic::Ordering::Relaxed);
                 }
             }
+        }
+        let unfunded = self.store().unfunded_count()?;
+        let full = unfunded >= MAX_UNFUNDED;
+        if self
+            .unfunded_full
+            .swap(full, std::sync::atomic::Ordering::Relaxed)
+            != full
+            && full
+        {
+            self.alert(&format!(
+                "{unfunded} openings are signed and their F in no block: new openings are \
+                 refused until they confirm or are made never to, {} blocks after",
+                dispute::UNFUNDED_FOR
+            ));
         }
         let withheld =
             std::mem::take(&mut *self.withheld.lock().unwrap_or_else(PoisonError::into_inner));
@@ -770,6 +792,7 @@ mod tests {
             alert: std::sync::OnceLock::new(),
             withheld: Mutex::default(),
             over_capacity: Default::default(),
+            unfunded_full: Default::default(),
             folds: Mutex::default(),
             funds: Mutex::new(None),
         }

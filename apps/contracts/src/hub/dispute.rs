@@ -148,11 +148,16 @@ impl Openings {
         // The cheap check first: her contract stands, and past its close
         // the default ends it.
         if self.unspent(contract, true).await? {
+            let was = self.store().was_unfunded(id)?;
+            if was && self.unspent(contract, false).await? {
+                self.store().funded(id)?;
+            }
             return self.close(id, hub, o, tip).await;
         }
         let Some((r_at, r)) = self.spend(contract, &funding.output[0], from, tip).await? else {
-            return Ok(Played::Idle);
+            return self.unfunded(id, hub, o, contract, tip).await;
         };
+        self.store().funded(id)?;
         let default = presign(&o.set, "default")?;
         let folded = r
             .input
@@ -1228,6 +1233,151 @@ impl Openings {
         Ok(Played::Idle)
     }
 
+    /// Signed opening `id`, `hub` and `o`, whose F is in no block at `tip`
+    /// (its `contract` output neither unspent nor spent in one). Given up,
+    /// its coins unlocked, once a coin F spends is spent in a block by
+    /// another transaction [`ENDED_DEPTH`] deep (her funding depth, if
+    /// deeper): F can never confirm then. Short of it, F is made so
+    /// [`UNFUNDED_FOR`] blocks after it was first seen in no block, or once
+    /// it may no longer fund its contract: one of the hub's coins F spends
+    /// is spent back to its wallet, while nothing spends any, in the
+    /// mempool either. F confirming first, the contract stands. Its coins
+    /// are never unlocked before: F, signed by the hub, binds them until
+    /// it may never confirm.
+    async fn unfunded(
+        &self,
+        id: &[u8; 32],
+        hub: &Hub,
+        o: &HubOpening,
+        contract: OutPoint,
+        tip: u32,
+    ) -> Result<Played> {
+        // Unspent in the blocks, spent in the mempool: F is in a block,
+        // her request not yet. Played once it is.
+        if self.unspent(contract, false).await? {
+            return Ok(Played::Idle);
+        }
+        let since = self.store().unfunded(id, tip)?;
+        let Some(f) = hub.funding() else {
+            return Ok(Played::Idle);
+        };
+        let txid = f.tx.compute_txid();
+        let from = o.base.parts().chain.checkpoint.height();
+        let deep = o.base.parts().chain.funding_depth.max(ENDED_DEPTH);
+        let mut untouched = true;
+        for (input, coin) in f.tx.input.iter().zip(f.prevouts) {
+            let outpoint = input.previous_output;
+            if self.unspent(outpoint, false).await? {
+                untouched &= self.unspent(outpoint, true).await?;
+                continue;
+            }
+            untouched = false;
+            let Some((at, by)) = self.spend(outpoint, coin, from, tip).await? else {
+                continue;
+            };
+            let by = by.compute_txid();
+            if by == txid || tip.saturating_sub(at) + 1 < deep {
+                continue;
+            }
+            // Read again, as cached spends are kept: a reorganization may
+            // have taken it out of its block.
+            let block = self.block_at(at).await?;
+            if !block.txdata.iter().any(|tx| tx.compute_txid() == by) {
+                self.forget_spend(outpoint);
+                continue;
+            }
+            return self.give_up_unfunded(id, outpoint, by).await;
+        }
+        let due = tip >= since.saturating_add(UNFUNDED_FOR) || hub.lapsed(tip);
+        if !due || !untouched {
+            return Ok(Played::Idle);
+        }
+        let Some((outpoint, coin)) = f.hub_coins().into_iter().next() else {
+            return Ok(Played::Idle);
+        };
+        let spent = self.spend_back(outpoint, coin).await?;
+        tracing::warn!(
+            id = %crate::hex_id(id), %txid, since, coin = %outpoint, spent = %spent,
+            "a signed opening's F in no block: a coin of the hub's it spends spent back, so that it never confirms"
+        );
+        Ok(Played::Idle)
+    }
+
+    /// Spend the hub's `coin` at `outpoint` whole back to its wallet, at
+    /// the node's rate: the transaction, broadcast.
+    async fn spend_back(&self, outpoint: OutPoint, coin: &TxOut) -> Result<bitcoin::Txid> {
+        let to = self.payout_script().await?;
+        let make = |fee: Amount| -> Result<Transaction> {
+            let value = coin
+                .value
+                .checked_sub(fee)
+                .context("a coin smaller than its fee")?;
+            ensure!(
+                value >= to.minimal_non_dust(),
+                "a coin worth no more than its fee"
+            );
+            Ok(Transaction {
+                version: bitcoin::transaction::Version::TWO,
+                lock_time: bitcoin::absolute::LockTime::ZERO,
+                input: vec![bitcoin::TxIn {
+                    previous_output: outpoint,
+                    sequence: bitcoin::Sequence::ENABLE_RBF_NO_LOCKTIME,
+                    ..Default::default()
+                }],
+                output: vec![TxOut {
+                    value,
+                    script_pubkey: to.clone(),
+                }],
+            })
+        };
+        // Signed once to weigh it, its size the same at any fee.
+        let weighed = self.sign(&make(Amount::ZERO)?, &[]).await?;
+        let rate = self.fee_rate().await;
+        let fee = rate
+            .fee_vb(weighed.vsize() as u64)
+            .context("a fee too large")?;
+        let tx = self.sign(&make(fee)?, &[]).await?;
+        ensure!(self.post(&tx).await, "{} not broadcast", tx.compute_txid());
+        Ok(tx.compute_txid())
+    }
+
+    /// Give up signed opening `id`, its F never to confirm, `outpoint`
+    /// spent by `by` deep in a block: its coins unlocked. Not while a step
+    /// of its holder's runs: tried again next poll.
+    async fn give_up_unfunded(
+        &self,
+        id: &[u8; 32],
+        outpoint: OutPoint,
+        by: bitcoin::Txid,
+    ) -> Result<Played> {
+        let coins = {
+            let busy = self.busy();
+            if busy.contains(id) {
+                return Ok(Played::Idle);
+            }
+            self.store().give_up_unfunded(id)?
+        };
+        if let Some(coins) = coins {
+            self.unlock_coins(&coins).await;
+            tracing::warn!(
+                id = %crate::hex_id(id), coin = %outpoint, %by,
+                "a signed opening given up, its F never to confirm: its coins unlocked"
+            );
+        }
+        Ok(Played::Idle)
+    }
+
+    /// Look for `coin`'s spend again from the start: the one found left
+    /// its block.
+    fn forget_spend(&self, coin: OutPoint) {
+        (self
+            .watch
+            .spends
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner))
+        .remove(&coin);
+    }
+
     /// A new script of the hub's wallet: what its openings and sweeps pay
     /// the hub to.
     pub(super) async fn payout_script(&self) -> Result<ScriptBuf> {
@@ -1503,6 +1653,11 @@ fn tagged(id: &[u8; 32], tag: &[u8]) -> [u8; 32] {
 /// How many confirmations an end of a contract takes to be final for the
 /// responder.
 const ENDED_DEPTH: u32 = 6;
+
+/// Blocks after a signed opening's F was first seen in no block from which
+/// the hub makes sure it never confirms: a day. Its holder broadcasts it
+/// once signed.
+pub(super) const UNFUNDED_FOR: u32 = 144;
 
 /// The slot output of a request, her publication spending it, and of a
 /// response, the hub's disclosure spending it (Lichen's `SLOT_VOUT`).

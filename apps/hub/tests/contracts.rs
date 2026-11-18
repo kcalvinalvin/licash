@@ -1080,6 +1080,194 @@ async fn hub_answering_with(
     Ok((url, source, hub, openings))
 }
 
+/// [`Node`], but stalling at its first broadcast, kept: as a holder whose
+/// app stops once the hub signed F, before it hands F to the network or
+/// tells the hub, which would broadcast it too.
+struct Stalling {
+    node: Node,
+    f: std::sync::Mutex<Option<bitcoin::Transaction>>,
+}
+
+impl licash_wallet::Blocks for Stalling {
+    async fn height(&self) -> Result<u32, String> {
+        self.node.height().await
+    }
+
+    async fn hash(&self, height: u32) -> Result<bitcoin::BlockHash, String> {
+        self.node.hash(height).await
+    }
+
+    async fn filter(&self, hash: &bitcoin::BlockHash) -> Result<Option<Vec<u8>>, String> {
+        self.node.filter(hash).await
+    }
+
+    async fn block(&self, hash: &bitcoin::BlockHash) -> Result<bitcoin::Block, String> {
+        self.node.block(hash).await
+    }
+}
+
+impl holder::Chain for Stalling {
+    async fn checkpoint(&self, height: u32) -> Result<licash::chain::Checkpoint, String> {
+        self.node.checkpoint(height).await
+    }
+
+    async fn broadcast(&self, tx: &bitcoin::Transaction) -> Result<(), String> {
+        self.f.lock().unwrap().get_or_insert_with(|| tx.clone());
+        std::future::pending().await
+    }
+
+    async fn fee_rate(&self, blocks: u16) -> Result<Option<bitcoin::FeeRate>, String> {
+        self.node.fee_rate(blocks).await
+    }
+}
+
+/// An opening at `url` by `wallet` (of `mine`) stalled once the hub signed
+/// F, before F is broadcast: F.
+async fn stalled_opening(
+    wallet: &Wallet<Http>,
+    source: &Source,
+    mine: &Path,
+    url: &str,
+) -> Result<bitcoin::Transaction> {
+    let stalling = Stalling {
+        node: Node(source.clone()),
+        f: Default::default(),
+    };
+    let reached = async {
+        while stalling.f.lock().unwrap().is_none() {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    };
+    tokio::select! {
+        opened = holder::open(wallet, &stalling, mine, url, ask()) => {
+            anyhow::bail!("opened, never stalled: {opened:?}")
+        }
+        () = reached => {}
+    }
+    let f = stalling.f.lock().unwrap().clone();
+    f.context("no F")
+}
+
+/// The hub frees the coins of an opening it signed whose F never confirms:
+/// at once once her deposit is spent elsewhere, deep; else, a day after it
+/// first saw F in no block (or once F may no longer fund its contract),
+/// by spending one of its own coins F spends back to its wallet.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs bitcoind and a release build"]
+async fn a_hub_frees_the_coins_of_an_opening_it_signed_whose_f_never_confirms() -> Result<()> {
+    use bitcoin::FeeRate;
+    let rt = Regtest::start_standard()?;
+    let dir = tempfile::tempdir()?;
+    let hub_dir = dir.path().join("hub");
+    let (url, source, _, openings) = hub_answering(&rt, &hub_dir).await?;
+    let chain = Node(source.clone());
+    let locked = || async {
+        let locked: Vec<serde_json::Value> = chain
+            .0
+            .rpc("listlockunspent", serde_json::json!([]))
+            .await?;
+        anyhow::Ok(locked.len())
+    };
+    let gettxout = |coin: bitcoin::OutPoint, mempool: bool| {
+        let chain = &chain;
+        async move {
+            let args = serde_json::json!([coin.txid.to_string(), coin.vout, mempool]);
+            let out: Option<serde_json::Value> = chain.0.rpc_optional("gettxout", args).await?;
+            anyhow::Ok(out.is_some_and(|out| !out.is_null()))
+        }
+    };
+
+    // Three holders whose apps stop once the hub signed their F.
+    let mut stalled = Vec::new();
+    for (n, seed) in [[41; 32], [42; 32], [43; 32]].into_iter().enumerate() {
+        let at = dir.path().join(format!("holder{n}"));
+        std::fs::create_dir(&at)?;
+        let (mine, wallet) = holder_wallet(&rt, &chain, &at, &url, seed, &[60_000]).await?;
+        let deposit = wallet.silent_coins()?[0].outpoint;
+        let f = stalled_opening(&wallet, &source, &mine, &url).await?;
+        ensure!(f.input.iter().any(|i| i.previous_output == deposit));
+        stalled.push((wallet, f, deposit));
+    }
+    ensure!(licash_contracts::hub::signed(&hub_dir)? == 3);
+    openings.answer_requests().await?;
+    let seen = rt.height()?;
+
+    // One's F broadcast late, once the hub saw it in no block: its
+    // contract stands, its coins never spent back.
+    let late = stalled.pop().context("three")?.1;
+    rt.send_raw(&late)?;
+    rt.mine(1)?;
+    openings.answer_requests().await?;
+    let held = locked().await?;
+    ensure!(held >= 2, "{held} coins locked");
+
+    // Her deposit spent elsewhere: given up once that is deep, its coins
+    // unlocked.
+    let (wallet, f, deposit) = &stalled[1];
+    wallet.abandon_silent(&f.compute_txid())?;
+    let to = wallet.fallback_address()?.script_pubkey();
+    let rate = FeeRate::from_sat_per_vb_u32(2);
+    let elsewhere =
+        wallet.spend_silent_coin(licash_wallet::Payee::Script(to), *deposit, None, rate)?;
+    rt.send_raw(&elsewhere)?;
+    rt.mine(5)?;
+    openings.answer_requests().await?;
+    ensure!(
+        licash_contracts::hub::signed(&hub_dir)? == 3,
+        "given up 5 deep"
+    );
+    rt.mine(1)?;
+    openings.answer_requests().await?;
+    ensure!(
+        licash_contracts::hub::signed(&hub_dir)? == 2,
+        "not given up 6 deep"
+    );
+    let mid = locked().await?;
+    ensure!(mid < held, "{mid} of {held} coins locked");
+
+    // The other: one of the hub's coins F spends is spent back to its
+    // wallet, not at once, a day after F was first seen in no block at
+    // the latest.
+    let (_, f, deposit) = &stalled[0];
+    let hub_coins: Vec<bitcoin::OutPoint> = (f.input.iter())
+        .map(|i| i.previous_output)
+        .filter(|o| o != deposit)
+        .collect();
+    let spent_back = || async {
+        for coin in &hub_coins {
+            if gettxout(*coin, false).await? && !gettxout(*coin, true).await? {
+                return anyhow::Ok(true);
+            }
+        }
+        anyhow::Ok(false)
+    };
+    ensure!(!spent_back().await?, "spent back at once");
+    let mut at = None;
+    while rt.height()? < seen + 144 {
+        rt.mine(1)?;
+        openings.answer_requests().await?;
+        if spent_back().await? {
+            at = Some(rt.height()?);
+            break;
+        }
+    }
+    let at = at.context("no coin of the hub's spent back")?;
+    ensure!(at > seen + 1, "spent back at {at}, first seen at {seen}");
+    ensure!(gettxout(*deposit, true).await?, "her deposit spent");
+    // Deep: given up, its coins unlocked. The late one stands.
+    rt.mine(6)?;
+    openings.answer_requests().await?;
+    ensure!(
+        licash_contracts::hub::signed(&hub_dir)? == 1,
+        "not given up"
+    );
+    let contract = bitcoin::OutPoint::new(late.compute_txid(), 0);
+    ensure!(gettxout(contract, false).await?, "the late contract gone");
+    let left = locked().await?;
+    ensure!(left < mid, "{left} of {mid} coins locked");
+    Ok(())
+}
+
 /// `from`'s files copied into `to`, made.
 fn copy_dir(from: &Path, to: &Path) -> Result<()> {
     std::fs::create_dir_all(to)?;

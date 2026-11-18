@@ -61,7 +61,13 @@ CREATE TABLE IF NOT EXISTS fees (
 ///   be lost to the hub, as only that terminal spends it;
 /// - `ended`: the contracts whose exit or default left nothing of the
 ///   hub's to play, deep enough not to look again. None ended (no table)
-///   only means each is looked at again.
+///   only means each is looked at again;
+/// - `unfunded`: the signed openings whose F the responder saw in no
+///   block, and the block it first did: given up once F can never
+///   confirm, and made so by the hub some blocks after
+///   ([`Store::unfunded`]). None (or no table), of a row signed before
+///   these were kept, proves nothing: its blocks count from the first
+///   seen.
 const RESPONDER: &str = "
 CREATE TABLE IF NOT EXISTS fee_coins (
     id BLOB NOT NULL REFERENCES openings (id),
@@ -77,6 +83,11 @@ CREATE TABLE IF NOT EXISTS children (
     PRIMARY KEY (id, name)
 ) STRICT;
 CREATE TABLE IF NOT EXISTS ended (
+    id BLOB PRIMARY KEY REFERENCES openings (id),
+    height INTEGER NOT NULL,
+    created_at INTEGER NOT NULL
+) STRICT;
+CREATE TABLE IF NOT EXISTS unfunded (
     id BLOB PRIMARY KEY REFERENCES openings (id),
     height INTEGER NOT NULL,
     created_at INTEGER NOT NULL
@@ -408,6 +419,76 @@ impl Store {
         Ok(())
     }
 
+    /// The block opening `id`'s F was first seen in no block at: `tip`,
+    /// if it was not before. Its holder may refresh `updated_at` at will,
+    /// by sending a message again: not this.
+    pub fn unfunded(&self, id: &[u8; 32], tip: u32) -> Result<u32> {
+        self.0.execute_batch(RESPONDER)?;
+        self.0.execute(
+            "INSERT INTO unfunded (id, height, created_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT DO NOTHING",
+            params![id, tip, crate::now()],
+        )?;
+        Ok(self
+            .0
+            .query_row("SELECT height FROM unfunded WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })?)
+    }
+
+    /// Whether opening `id`'s F was seen in no block, and not since in one.
+    pub fn was_unfunded(&self, id: &[u8; 32]) -> Result<bool> {
+        if !self.has("unfunded")? {
+            return Ok(false);
+        }
+        Ok(self
+            .0
+            .query_row("SELECT 1 FROM unfunded WHERE id = ?1", [id], |r| {
+                r.get::<_, i64>(0)
+            })
+            .optional()?
+            .is_some())
+    }
+
+    /// Opening `id`'s F is in a block: its count of blocks unfunded over.
+    pub fn funded(&self, id: &[u8; 32]) -> Result<()> {
+        if self.has("unfunded")? {
+            self.0.execute("DELETE FROM unfunded WHERE id = ?1", [id])?;
+        }
+        Ok(())
+    }
+
+    /// How many signed openings not given up have their F in no block, as
+    /// the responder last saw.
+    pub fn unfunded_count(&self) -> Result<usize> {
+        if !self.has("unfunded")? {
+            return Ok(0);
+        }
+        Ok(self.0.query_row(
+            "SELECT count(*) FROM unfunded u JOIN openings o ON o.id = u.id WHERE o.abandoned = 0",
+            [],
+            |r| r.get::<_, i64>(0),
+        )? as usize)
+    }
+
+    /// Give up signed opening `id`, whose F can never confirm: its coins,
+    /// to unlock, if it was not given up before. Its deposit is free for
+    /// another opening. Never by [`Store::abandon`], which gives up only
+    /// what the hub never signed.
+    pub fn give_up_unfunded(&self, id: &[u8; 32]) -> Result<Option<Vec<OutPoint>>> {
+        let coins: Option<Vec<u8>> = self
+            .0
+            .query_row(
+                "UPDATE openings SET abandoned = 1, updated_at = ?2
+                 WHERE id = ?1 AND abandoned = 0 AND irrevocable = 1
+                 RETURNING coins",
+                params![id, crate::now()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        coins.map(|coins| outpoints(&coins)).transpose()
+    }
+
     /// Whether table `name` was made.
     fn has(&self, name: &str) -> Result<bool> {
         Ok(self
@@ -616,6 +697,46 @@ mod tests {
         let store = Store::open(data.path())?;
         ensure!(store.fee_coin(&[1; 32], "default")? == Some(coin(7)));
         ensure!(store.signed_ids()? == vec![[2; 32]]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_signed_opening_unfunded_counts_its_blocks_from_first_seen_and_is_given_up_once(
+    ) -> Result<()> {
+        let data = tempfile::tempdir()?;
+        let store = Store::open(data.path())?;
+        let outpoint = |n| OutPoint {
+            txid: bitcoin::hashes::Hash::from_byte_array([n; 32]),
+            vout: 0,
+        };
+        for n in [1, 2] {
+            ensure!(store.insert(&[n; 32], 0, true, &outpoint(n), &[0; 32], b"state")?);
+            store.save(&[n; 32], 0, true, &[0; 32], b"state")?;
+            store.set_coins(&[n; 32], &[outpoint(10 + n)])?;
+        }
+        // Rows from before the table: nothing unfunded, nothing proved.
+        ensure!(!store.was_unfunded(&[1; 32])? && store.unfunded_count()? == 0);
+        store.funded(&[1; 32])?;
+        ensure!(store.unfunded(&[1; 32], 100)? == 100);
+        // Seen again later, or its holder's messages refreshing it: the
+        // first block stays.
+        store.save(&[1; 32], 0, true, &[1; 32], b"state")?;
+        ensure!(store.unfunded(&[1; 32], 150)? == 100);
+        ensure!(store.unfunded(&[2; 32], 120)? == 120);
+        ensure!(store.unfunded_count()? == 2 && store.was_unfunded(&[2; 32])?);
+        // Funded since: counted no more.
+        store.funded(&[2; 32])?;
+        ensure!(store.unfunded_count()? == 1 && !store.was_unfunded(&[2; 32])?);
+        // Given up once, its coins unlocked once, played no more, and its
+        // deposit free for another opening.
+        ensure!(store.give_up_unfunded(&[1; 32])? == Some(vec![outpoint(11)]));
+        ensure!(store.give_up_unfunded(&[1; 32])?.is_none());
+        ensure!(store.unfunded_count()? == 0);
+        ensure!(store.signed_ids()? == vec![[2; 32]]);
+        ensure!(store.locked()? == vec![outpoint(12)]);
+        ensure!(store.insert(&[3; 32], 0, true, &outpoint(1), &[0; 32], b"state")?);
+        // Never what the idle sweep gives up.
+        ensure!(store.abandon(&[2; 32], i64::MAX)?.is_none());
         Ok(())
     }
 

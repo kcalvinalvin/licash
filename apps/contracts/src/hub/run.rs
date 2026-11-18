@@ -10,7 +10,7 @@ use licash_contract::wire::{self, Envelope, Kind, Writer};
 use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 
-use super::{Answer, Openings, Refused, MAX_UNDER_WAY, WAIT};
+use super::{Answer, Openings, Refused, MAX_UNDER_WAY, MAX_UNFUNDED, WAIT};
 use crate::{Frame, Opening};
 
 /// How often a patient step looks whether the opening is still busy.
@@ -63,6 +63,16 @@ impl Openings {
                 && store.under_way().map_err(Refused::unavailable)? >= MAX_UNDER_WAY
             {
                 return Err(Refused::unavailable("too many openings under way: later"));
+            }
+            if store.unfunded_count().map_err(Refused::unavailable)? >= MAX_UNFUNDED
+                && store
+                    .row(&envelope.id)
+                    .map_err(Refused::unavailable)?
+                    .is_none()
+            {
+                return Err(Refused::unavailable(
+                    "too many openings signed and not funded: later",
+                ));
             }
         }
         // Reject cheap size/collateral and policy failures before node RPC.
