@@ -16,8 +16,10 @@
 //!              └─ failure (after Δ1)       → the holder: b
 //! ```
 //!
-//! Paying `b`, the hub forfeits its reserve; paying `b′`, each party keeps
-//! its own. Each value is read from the chain, signed under a one-time key
+//! Paying `b`, the hub forfeits its reserve, but on `request_timeout` of
+//! graphs from id [`RETURNING`] on, where the hub only kept silent, it
+//! gets its reserve back less her request's fees (her purse); paying `b′`,
+//! each party keeps its own. Each value is read from the chain, signed under a one-time key
 //! in a link's witness: `b` under the holder's in `request`'s, `b′` under
 //! the hub's in `respond`'s, so the statement reads `b′` from Bitcoin as it
 //! reads the claim (`lichen_statement`).
@@ -49,7 +51,8 @@ use lichen_btc::taptree::{Leaf, TapTree};
 use lichen_btc::tx::{build_spend, Timelock};
 use lichen_btc::witness::tapscript_witness;
 use lichen_contract::{
-    anchor_tree, wots_shape, ContractParams, Core, PartyPubKeys, Presign, Role, Terms, POST_CSV,
+    anchor_tree, payout_less, wots_shape, ContractParams, Core, PartyPubKeys, Presign, Role, Terms,
+    POST_CSV,
 };
 use lichen_statement::{JOURNAL_LEN, SLOT_VOUT};
 use lichen_wots::{WotsParams, WotsPublic, WotsSig};
@@ -64,6 +67,20 @@ pub const SLOT: Amount = Amount::from_sat(330);
 
 /// What `success` pays: `b′`, read from the hub's signature in `respond`.
 const REDUCED: Payout = Payout::Other("reduced");
+
+/// What `request_timeout` pays from graph id [`RETURNING`] on: `b`, read
+/// from the holder's signature in `request`, all her reserve (her purse
+/// refunded of the hub's), and the hub's reserve back to the hub less what
+/// the links took, her purse among it.
+const RETURNED: Payout = Payout::Other("returned");
+
+/// The first graph id whose `request_timeout` returns the hub its reserve
+/// ([`RETURNED`]): a hub that never responds pays `b` and the fees of her
+/// request, but forfeits no more of its reserve to a holder who may have
+/// asked only to tie it up. Graphs of
+/// earlier ids (contracts opened before) pay her both reserves, as they
+/// were signed.
+pub const RETURNING: u32 = 8;
 
 /// Where `request` pays the holder her purse ([`Spec::purse`]), after its
 /// slot.
@@ -274,9 +291,10 @@ impl Spec {
     /// force it (her reserve has no other use on that path). Taken in
     /// `request`, it is short of her reserve wherever it is paid after
     /// ([`Front::pay`]): each party ends with what it would have. Where
-    /// her claim stands it counts among the floors the hub's reserve
-    /// pays, so at most half of that, the other half for the links'
-    /// floors. None if it would be dust.
+    /// her claim stands and the hub forfeits its reserve it counts among
+    /// the floors that reserve pays, so at most half of it, the other half
+    /// for the links' floors (on [`RETURNED`] too, which refunds it of the
+    /// hub's reserve). None if it would be dust.
     fn purse(&self) -> Option<Amount> {
         let dust = self.params.dust;
         let purse = (self.terms.reserve_alice.checked_sub(dust)?).min(self.terms.reserve_hub / 2);
@@ -348,7 +366,10 @@ impl Front for Spec {
                 extra: request,
                 terminal: "request_timeout",
                 window: self.windows.w_h,
-                pays: Payout::User,
+                pays: match self.terms.id >= RETURNING {
+                    true => RETURNED,
+                    false => Payout::User,
+                },
             },
             FrontLink {
                 name: "respond",
@@ -381,6 +402,26 @@ impl Front for Spec {
                     ..self.view()
                 };
                 core.pay_reduced(&self.hub_b, available)
+            }
+            // Her claim stands, the hub silent: all her reserve, her purse
+            // refunded (a reserve output of the holder's, as
+            // `Payout::User`'s); the rest, the hub's reserve less what the
+            // links took, her purse, floors and anchors, the hub's.
+            RETURNED => {
+                let terms = Terms {
+                    reserve_hub: Amount::ZERO,
+                    ..self.terms
+                };
+                let ctx = self.view().ctx();
+                payout_less(
+                    &ctx,
+                    &terms,
+                    &self.b_key,
+                    Role::User,
+                    available,
+                    Amount::ZERO,
+                    Amount::ZERO,
+                )
             }
             Payout::Other(other) => bail!("no payout {other}"),
         }
@@ -455,6 +496,12 @@ impl HubProves {
     /// The outputs paying `b′` in bits, each party its reserve.
     pub fn pay_reduced(&self, available: Amount) -> Result<Vec<TxOut>> {
         self.spec.pay(REDUCED, available)
+    }
+    /// The outputs paying `b` in bits and her reserve to the holder, the
+    /// hub's reserve less what the links took back to the hub
+    /// ([`RETURNING`]).
+    pub fn pay_returned(&self, available: Amount) -> Result<Vec<TxOut>> {
+        self.spec.pay(RETURNED, available)
     }
 
     /// Every transaction the parties pre-sign, the contract output at
