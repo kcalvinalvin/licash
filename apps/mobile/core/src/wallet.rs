@@ -37,6 +37,7 @@ mod backup;
 mod contacts;
 mod contracts;
 mod donations;
+mod exits;
 mod fees;
 mod moves;
 mod payouts;

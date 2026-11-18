@@ -2034,6 +2034,13 @@ fn a_phone_whose_hub_opens_no_contracts_has_none_and_keeps_no_file_for_them() {
     assert!(opened.contains("opens no contracts"), "{opened}");
     let other = invalid(alice.contract_quote("https://other.example".into()));
     assert!(other.contains("no hub you use"), "{other}");
+    // No contract to exit: no consent taken, nothing driven.
+    assert_eq!(alice.exit_consent().unwrap(), None);
+    let address = alice.bitcoin_address().unwrap();
+    let consent = invalid(alice.consent_to_exit(address, 2_016));
+    assert!(consent.contains("no contracts"), "{consent}");
+    assert!(alice.drive_exits(light.clone(), 2_016).unwrap().is_empty());
+    alice.revoke_exit_consent().unwrap();
     let dir = std::path::Path::new(&net.dir("alice")).to_owned();
     assert!(dir.join("wallet.sqlite").exists());
     assert!(!dir.join("contracts.sqlite").exists() && !dir.join("contracts").exists());

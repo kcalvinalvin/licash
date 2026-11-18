@@ -135,6 +135,8 @@ impl Wallet {
                 "bundle network disagrees with its wallet"
             );
             licash_contracts::holder::validate_backup(&wallet, staged.path())?;
+            // Consent to exit is given on the phone it acts on, not restored.
+            licash_contracts::holder::exit::revoke(staged.path())?;
             drop(wallet);
             ensure!(
                 !holds_state(&dir),
@@ -530,6 +532,18 @@ mod tests {
         assert!(original.bundle(&bundle).is_err());
         assert!(!bundle.exists());
         fs::write(original.dir.join("contacts.json"), b"[]").unwrap();
+        // Her consent to exit, given on this phone only.
+        File::create(original.dir.join("contracts.sqlite")).unwrap();
+        let address = original.bitcoin_address().unwrap();
+        let wrong = "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx".to_owned();
+        assert!(original.consent_to_exit(wrong, 2_016).is_err());
+        assert!(original.consent_to_exit("not one".into(), 2_016).is_err());
+        assert!(original.consent_to_exit(address.clone(), 0).is_err());
+        let given = original.consent_to_exit(address.clone(), 2_016).unwrap();
+        assert_eq!(
+            (given.address.as_str(), given.exit_margin),
+            (address.as_str(), 2_016)
+        );
         original.bundle(&bundle).unwrap();
         assert_eq!(original.wallet.silent_next().unwrap(), Some(100));
         // Never over a file there already.
@@ -548,6 +562,8 @@ mod tests {
         assert_eq!(restored.wallet.silent_next().unwrap(), Some(100));
         assert_eq!(fs::read(restored.dir.join("contacts.json")).unwrap(), b"[]");
         assert_eq!(restored.birthday(), Some(42));
+        assert_eq!(restored.exit_consent().unwrap(), None);
+        assert_eq!(original.exit_consent().unwrap(), Some(given));
         let aside = fs::read_dir(dir.path())
             .unwrap()
             .filter_map(Result::ok)

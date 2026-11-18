@@ -178,7 +178,10 @@ fn no_provider(amount: u64) -> LicashError {
 impl Wallet {
     /// The wallet's quote of `quote`, asked again, under a ticket of its
     /// own: what pays it out, once.
-    fn ticketed(&self, quote: &PayoutQuote) -> Result<licash_wallet::PayoutQuote, LicashError> {
+    pub(super) fn ticketed(
+        &self,
+        quote: &PayoutQuote,
+    ) -> Result<licash_wallet::PayoutQuote, LicashError> {
         let ask = self.wallet.payout_quote(
             &quote.provider,
             &quote.hub,
