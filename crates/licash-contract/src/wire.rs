@@ -493,8 +493,10 @@ pub struct Open {
     pub mock: bool,
     /// The digest of her request's one-time keys
     /// ([`HolderPub::request_keys`]), which a v4 Base binds. Written last,
-    /// and only if present: an Open stored before it reads as none, and
-    /// its opening goes on under v3, as it began.
+    /// and only if present: an Open stored before it reads as none. Such
+    /// an opening past binding (the hub's Signed, her Funded) goes on
+    /// under v3 and its own program; one before binding no longer loads
+    /// once the program contracts open under changes, before any funding.
     pub request_keys: Option<[u8; 32]>,
 }
 message!(
