@@ -5,6 +5,7 @@ use licash::base::{ChainTerms, Fees, GraphTerms, Limits, Recipe};
 use licash::chain::Checkpoint;
 use licash::note::Keyset;
 use licash::spend::ChainProfile;
+use licash_contract::graph::RETURNING;
 use licash_contract::opening::{Bounds, Floors, Quote};
 
 /// The most blocks the hub's collateral is locked for.
@@ -218,8 +219,9 @@ impl Timing {
     /// The hub's quote on `keyset` at `checkpoint` of `cap` sat over
     /// `blocks`: a graph of 1-sat units as wide as the cap needs, 21 bits
     /// at least, its headers reaching the close, its challenge 12 blocks,
-    /// her reserve 20 000 sat and its fee 3 000 and its rate. Of [`CAP`]
-    /// and [`LOCK`], the fixed quote, as it always was.
+    /// her reserve 20 000 sat and its fee 3 000 and its rate, its graph
+    /// returning the hub its reserve if it never responds ([`RETURNING`]).
+    /// Of [`CAP`] and [`LOCK`], the fixed quote.
     pub fn quote_for(
         &self,
         keyset: Keyset,
@@ -237,7 +239,7 @@ impl Timing {
             keyset,
             cap,
             graph: GraphTerms {
-                id: 7,
+                id: RETURNING,
                 unit_sats: 1,
                 bits: bits.max(MIN_BITS),
                 low_bits: 9,
@@ -328,9 +330,10 @@ mod tests {
     }
 
     /// The quote every app asking without terms of its own opens on, as
-    /// apps already installed do: byte for byte as the hub has always
-    /// quoted it, on each network (signet's since its assertion window
-    /// grew to 48 blocks, for the hub's proof).
+    /// apps already installed do: byte for byte as the hub quotes it, on
+    /// each network (signet's since its assertion window grew to 48
+    /// blocks, for the hub's proof, and both since its graph returns the
+    /// hub its reserve on `request_timeout`, id 8).
     #[test]
     fn the_fixed_quote_is_as_it_always_was() {
         let parts = Hub::peek(funded()).unwrap().base.parts().clone();
@@ -345,13 +348,13 @@ mod tests {
             let (regtest, bounds) = quoted(ChainProfile::Core30DefaultRegtest);
             assert_eq!(
                 regtest,
-                "7a527f4e217807b4f21e7475e1b8b7672ec55c135bed5f3798f7af17e56496a6"
+                "ba21b25dd4ec3b304b93d662f7fabe046e00a99d78bd9b8e5097b73c2dfd4c92"
             );
             assert_eq!((bounds.lock, bounds.response_window), (1_000, 2));
             let (signet, bounds) = quoted(ChainProfile::Core30Signet);
             assert_eq!(
                 signet,
-                "a00f06d4dd5917142dd700c81b20457856c63bae8722da06d1769d0c4e20e6b0"
+                "ecd9bfb08cc1ac4f39a2952742447cea1c0b312ef543feeacae570049c2f1be3"
             );
             assert_eq!((bounds.lock, bounds.response_window), (1_000, 12));
         }

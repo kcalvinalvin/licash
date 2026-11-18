@@ -289,7 +289,10 @@ async fn a_retained_hub_receipt_answers_a_challenge_and_collects() {
 }
 
 fn signed() -> (Opening, HolderKeys) {
-    let saved = crate::testing::opened();
+    signed_of(crate::testing::opened())
+}
+
+fn signed_of(saved: &crate::testing::Opened) -> (Opening, HolderKeys) {
     let ctx = Context {
         tip: 0,
         trust: Trust::mock(),
@@ -341,6 +344,81 @@ fn a_request_pays_her_purse_of_her_reserve_and_each_ends_with_what_it_would() {
             "{name}"
         );
     }
+}
+
+/// From graph id `RETURNING` on, a hub that never responds pays her claim
+/// and her request's fees but keeps the rest of its reserve:
+/// `request_timeout` pays her bits as before, all her reserve, her purse
+/// refunded, to her reserve output, and the hub its reserve less what the
+/// links took, her purse among it; the other exits pay as before.
+#[test]
+fn a_silent_hub_of_a_returning_graph_pays_her_claim_and_gets_its_reserve_back() {
+    let (o, _) = signed_of(crate::testing::opened_returning());
+    let g = &o.base.parts().graph;
+    assert_eq!(g.id, licash_contract::graph::RETURNING);
+    let (r_a, r_h) = (g.reserve_alice, g.reserve_hub);
+    let purse = o.babe.purse().unwrap().to_sat();
+    let value = o.babe.value().to_sat();
+    let bits = (g.low_bits..g.bits).count();
+    let paid = |name: &str| {
+        let p = presign(&o.set, name).unwrap();
+        (p.tx.clone(), value - p.prevout.value.to_sat())
+    };
+    let (timeout, taken) = paid("request_timeout");
+    let (responded, _) = paid("respond_timeout");
+    assert_eq!(timeout.output[..bits], responded.output[..bits]);
+    assert_eq!(timeout.output[bits].value.to_sat(), r_a);
+    assert_eq!(
+        timeout.output[bits].script_pubkey,
+        responded.output[bits].script_pubkey
+    );
+    let pubs = &o.babe.core().pubs;
+    // With the bits below `low_bits`, the hub's as on every exit.
+    let below = (1u64 << g.low_bits) - 1;
+    assert_eq!(timeout.output[bits + 1].value.to_sat(), r_h - taken + below);
+    assert_eq!(timeout.output[bits + 1].script_pubkey, pubs[1].payout_spk);
+    assert_eq!(timeout.output.len(), bits + 2);
+    // Hers to sweep: her bits and her reserve output, as on any exit she
+    // signed.
+    let core = o.babe.core();
+    let owned = core
+        .owned(&timeout, &o.holder.b_key, Role::User, 4096, Role::User)
+        .unwrap();
+    let reserve = owned
+        .iter()
+        .find(|out| out.leaf == "alice_reserve")
+        .unwrap();
+    assert_eq!(reserve.out.value.to_sat(), r_a);
+    assert!(taken > purse);
+    // Her claim stands on the others: both reserves, as before.
+    for name in ["respond_timeout", "failure"] {
+        let (tx, taken) = paid(name);
+        assert_eq!(tx.output[bits].value.to_sat(), r_a + r_h - taken, "{name}");
+    }
+}
+
+/// A contract opened under graph id 7 (as every one opened before
+/// `RETURNING`) still loads, the holder's and the hub's, their stored signatures
+/// checked against the graph they were signed under: its `request_timeout` pays her both reserves.
+#[test]
+fn a_contract_of_an_earlier_graph_id_loads_and_pays_as_it_was_signed() {
+    let saved = crate::testing::opened_before();
+    let (o, _) = signed_of(saved);
+    let g = &o.base.parts().graph;
+    assert_eq!(g.id, 7);
+    let ctx = Context {
+        tip: 0,
+        trust: Trust::mock(),
+    };
+    let hub = Hub::load(&saved.hub, &ctx).unwrap();
+    assert_eq!(hub.phase(), licash_contract::opening::HubPhase::Funded);
+    let p = presign(&o.set, "request_timeout").unwrap();
+    let bits = (g.low_bits..g.bits).count();
+    let taken = o.babe.value().to_sat() - p.prevout.value.to_sat();
+    assert_eq!(
+        p.tx.output[bits].value.to_sat(),
+        g.reserve_alice + g.reserve_hub - taken
+    );
 }
 
 /// A contract the hub signed under another graph (opened before `request`

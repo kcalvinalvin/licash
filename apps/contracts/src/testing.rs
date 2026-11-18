@@ -30,7 +30,19 @@ pub(crate) struct Opened {
 }
 pub(crate) fn opened() -> &'static Opened {
     static OPENED: OnceLock<Opened> = OnceLock::new();
-    OPENED.get_or_init(build)
+    OPENED.get_or_init(|| build(0))
+}
+/// As [`opened`], of graph id 7, as every hub quoted before
+/// `graph::RETURNING`.
+pub(crate) fn opened_before() -> &'static Opened {
+    static OPENED: OnceLock<Opened> = OnceLock::new();
+    OPENED.get_or_init(|| build(7))
+}
+/// As [`opened`], of a graph returning the hub its reserve on
+/// `request_timeout` (`graph::RETURNING`), as hubs quote now.
+pub(crate) fn opened_returning() -> &'static Opened {
+    static OPENED: OnceLock<Opened> = OnceLock::new();
+    OPENED.get_or_init(|| build(licash_contract::graph::RETURNING))
 }
 fn sign(tx: &mut Transaction, prevouts: &[TxOut], inputs: &[usize], key: &Keypair) {
     for &i in inputs {
@@ -45,7 +57,8 @@ fn sign(tx: &mut Transaction, prevouts: &[TxOut], inputs: &[usize], key: &Keypai
         tx.input[i].witness = Witness::from_slice(&[signature.as_ref()]);
     }
 }
-fn build() -> Opened {
+/// An opening of graph id `id`.
+fn build(id: u32) -> Opened {
     let dir = tempfile::tempdir().unwrap();
     let wallet = Wallet::create(
         &dir.path().join("wallet.sqlite"),
@@ -57,6 +70,7 @@ fn build() -> Opened {
     let seed = wallet.contract_secrets().seed;
     let mut quote = Quote::from_base(&opening::testing::base(&[3; 32]));
     quote.cap = 4096;
+    quote.graph.id = id;
     quote.graph.bits = 21;
     quote.graph.reserve_alice = 20000;
     quote.graph.reserve_hub = 100000;

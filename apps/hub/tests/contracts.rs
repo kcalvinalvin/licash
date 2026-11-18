@@ -695,10 +695,28 @@ async fn a_holder_forces_her_contract_closed_on_a_silent_hub_and_takes_her_notes
         after == before + paid,
         "{before} then {after}, {paid} swept"
     );
-    // Her claim's bits and both reserves, less the links' floors, her
-    // purse (P's, taken already) and the sweep's fee: far more than her
-    // bits and her own 20 000, as the hub, silent, forfeits its 100 000.
-    ensure!(paid > 3_000 + 20_000 + 50_000, "{paid} swept");
+    // Her claim's bits (3 000 rounded down to 2 560) and all her 20 000,
+    // her purse (P's, taken already) refunded, less the sweep's fee (its
+    // bits' witnesses are large): the hub, only silent, gets its 100 000
+    // back less what the links took, her purse among it (its graph id 8's
+    // `request_timeout`).
+    ensure!(
+        paid > 2_560 + 20_000 - 3_000 && paid < 2_560 + 20_000,
+        "{paid} swept"
+    );
+    let timeout = timed_out.timeout.context("no timeout")?;
+    let found: serde_json::Value = chain
+        .0
+        .rpc(
+            "getrawtransaction",
+            serde_json::json!([timeout.to_string(), true]),
+        )
+        .await?;
+    let outputs = found["vout"].as_array().context("no outputs")?;
+    // After the bits and her reserve, last.
+    let last = outputs.last().and_then(|o| o["value"].as_f64());
+    let back = (last.context("no output")? * 1e8).round() as u64;
+    ensure!((70_000..80_000).contains(&back), "the hub's {back} back");
     eprintln!("swept {paid} sat to her wallet");
     // Nothing more to do.
     let over = recovery::advance(&wallet, &chain, &mine, rate).await?;
