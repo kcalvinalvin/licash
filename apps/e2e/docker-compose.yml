@@ -42,6 +42,8 @@ x-hub: &hub
   build:
     context: ../..
     dockerfile: apps/hub/Dockerfile
+    # Regtest uses mock proofs and does not need the production prover.
+    target: runtime
   # Root, to read its LND node's macaroon.
   user: "0:0"
   entrypoint: ["sh", "-c"]

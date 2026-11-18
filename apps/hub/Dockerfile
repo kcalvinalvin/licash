@@ -58,7 +58,7 @@ FROM prover-none AS prover-arm64
 FROM prover-none AS prover-arm
 FROM prover-${TARGETARCH} AS prover
 
-FROM debian:trixie-slim
+FROM debian:trixie-slim AS runtime
 # Root certificates, for notifications and Esplora over HTTPS; GMP, for the
 # Groth16 witness generator.
 RUN apt-get update \
@@ -66,7 +66,6 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 RUN useradd --system --uid 10001 --home-dir /data --shell /usr/sbin/nologin licash \
     && mkdir -p /data && chown licash /data && chmod 700 /data
-COPY --from=prover /opt/r0/ /usr/local/
 COPY --from=build /usr/local/bin/licash-hub /usr/local/bin/licash-hub
 USER 10001
 # The GPU's compute, when the container is given one (--gpus).
@@ -78,3 +77,6 @@ HEALTHCHECK --interval=30s --timeout=5s \
     CMD ["bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/${LICASH_HUB_LISTEN##*:} && printf 'GET /health HTTP/1.0\\r\\n\\r\\n' >&3 && head -n1 <&3 | grep -q ' 200 '"]
 ENTRYPOINT ["licash-hub"]
 CMD ["run"]
+
+FROM runtime AS production
+COPY --from=prover /opt/r0/ /usr/local/
