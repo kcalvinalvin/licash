@@ -245,7 +245,14 @@ before the block `recoveries` shows; otherwise the wallet's timeout pays
 the whole claim. The wallet proves nothing: it checks the hub's proof once
 asserted (`asserted`), challenges one that does not verify (`challenging`,
 `challenged`), and carries the payout on to `done` (`succeeding`, `paid`,
-`sweeping`), collecting what the outcome pays it and its reserve.
+`sweeping`), collecting what the outcome pays it and its reserve. From the
+publication of its claim until the hub's proof verifies, the wallet sets a
+coin of its own aside for a challenge's fee (for twice a challenge's fee
+at the rate, about 42,000 vB): `force-close` warns first if it holds none
+besides the others. A challenge is posted with a fee child spending its
+anchor and that coin, at the chain's estimate for the blocks left before
+the hub's payout becomes valid, made again at a higher rate while it is in
+no block, and paying at most what the challenge wins.
 
 `discover --relay wss://relay.example` lists the hubs announced on Nostr,
 at the URLs that answer as the hub that announced them; with `--swaps`, the

@@ -275,6 +275,17 @@ pub async fn force_close(
     let chain = node(chain)?;
     let id = contract_id(path, id)?;
     let rate = crate::onchain::rate(&chain.0, fee_rate).await?;
+    let forcing = recovery::recoveries(dir(path))?.iter().all(|r| r.id != id);
+    if forcing {
+        if let Some(need) = recovery::challenge_shortfall(wallet, dir(path), rate)? {
+            eprintln!(
+                "warning: no coin of {} sat on Bitcoin besides the others to set aside for a \
+                 challenge's fee: should the hub prove falsely, a challenge pays what the \
+                 coins hold, and may come too late",
+                need.to_sat()
+            );
+        }
+    }
     let forced = recovery::force_close(wallet, &chain, dir(path), &id, rate).await?;
     show(json, recovery_json(&forced), recovery_line(&forced));
     Ok(())
