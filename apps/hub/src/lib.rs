@@ -45,6 +45,18 @@ pub const HEALTH: &str = "/health";
 /// never changing: no reorganization reaches so deep.
 pub const IMMUTABLE_DEPTH: u32 = 144;
 
+/// Holders' claims in `openings` answered from `hub`'s ledger: decided
+/// against the spends and locks it holds, and the notes of each published
+/// claim retired, spent by nobody else, since she may be paid for them on
+/// Bitcoin.
+pub fn answer_from(openings: &licash_contracts::hub::Openings, hub: Arc<Hub>) {
+    let ledger = hub.clone();
+    openings.evidence_with(Arc::new(move |claim| Ok(ledger.evidence(claim)?)));
+    openings.claims_with(Arc::new(move |contract, publication| {
+        Ok(hub.retire_claimed(contract, publication)?)
+    }));
+}
+
 /// What a hub serves beside its ledger, each if it runs it.
 #[derive(Clone, Default)]
 pub struct Services {

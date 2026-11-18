@@ -29,7 +29,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
-pub use dispute::{Evidencer, Played};
+pub use dispute::{Claims, Evidencer, Played};
 /// How the hub tells its operator what needs them ([`Openings::alert_with`]).
 pub type Alert = dyn Fn(&str) + Send + Sync;
 use futures_util::StreamExt;
@@ -101,6 +101,8 @@ pub struct Openings {
     watch: dispute::Watch,
     /// Where the responder finds its evidence against a filing.
     evidencer: std::sync::OnceLock<Arc<Evidencer>>,
+    /// Where the responder retires the notes a filing names.
+    claims: std::sync::OnceLock<Arc<Claims>>,
     /// The prover of the hub's statement: none where proofs are the mock
     /// authority's.
     prover: Option<prover::Prover>,
@@ -332,6 +334,7 @@ impl Openings {
             funding: tokio::sync::Mutex::new(()),
             watch: dispute::Watch::default(),
             evidencer: std::sync::OnceLock::new(),
+            claims: std::sync::OnceLock::new(),
             prover: (!trust.mock)
                 .then(|| prover::Prover::start(data, trust.program, prover::spacing(profile))),
             alert: std::sync::OnceLock::new(),
@@ -522,6 +525,14 @@ impl Openings {
     /// only claims that are none are answered.
     pub fn evidence_with(&self, f: Arc<Evidencer>) {
         let _ = self.evidencer.set(f);
+    }
+
+    /// Retire the notes of each holder's published claim with `f` from
+    /// now on: the hub's ledger, which then spends them for nobody.
+    /// Without, the ledger may let her spend notes the hub pays her for on
+    /// Bitcoin.
+    pub fn claims_with(&self, f: Arc<Claims>) {
+        let _ = self.claims.set(f);
     }
 
     /// Tell the operator through `f` from now on (the hub's notifications):
@@ -885,6 +896,7 @@ mod tests {
             funding: tokio::sync::Mutex::new(()),
             watch: dispute::Watch::default(),
             evidencer: std::sync::OnceLock::new(),
+            claims: std::sync::OnceLock::new(),
             prover: None,
             alert: std::sync::OnceLock::new(),
             withheld: Mutex::default(),

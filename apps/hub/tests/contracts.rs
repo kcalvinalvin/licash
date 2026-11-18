@@ -948,6 +948,19 @@ async fn a_hub_lets_an_honest_claim_time_out_to_its_holder() -> Result<()> {
     }
     let done = done.context("never paid")?;
     ensure!(done.received.is_some_and(|r| r > 3_000), "{done:?}");
+    // The notes she was paid for on Bitcoin are spent at the hub: no
+    // spend takes them.
+    let claimed: Vec<licash::crypto::Point> =
+        rusqlite::Connection::open(mine.join("wallet.sqlite"))?
+            .prepare("SELECT y FROM notes WHERE spent_by IS NOT NULL")?
+            .query_map([], |r| r.get::<_, [u8; 33]>(0))?
+            .map(|y| Ok(licash::crypto::Point(y?)))
+            .collect::<Result<_>>()?;
+    ensure!(!claimed.is_empty(), "no claimed note");
+    ensure!(
+        hub.spent(&claimed)?.iter().all(|s| *s),
+        "a claimed note unspent"
+    );
     Ok(())
 }
 
@@ -1155,8 +1168,7 @@ async fn hub_answering_through(
     let openings = Openings::with_wallet(dir, source.clone(), source.clone(), keyset, range);
     let openings = openings.await?;
     // Its ledger against holders' claims, as the hub service's.
-    let ledger = hub.clone();
-    openings.evidence_with(Arc::new(move |claim| Ok(ledger.evidence(claim)?)));
+    licash_hub_service::answer_from(&openings, hub.clone());
     let services = Services {
         contracts: Some(openings.clone()),
         ..Default::default()

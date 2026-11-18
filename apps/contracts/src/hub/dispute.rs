@@ -13,6 +13,10 @@
 //! `responses.sqlite` before they are made. Outputs of a payout that are
 //! the hub's are swept to its wallet.
 //!
+//! Once her publication is as deep as the hub decides on, the hub's ledger
+//! retires the notes it names ([`Claims`]), on every path of the dispute:
+//! whatever it pays her, she gave them up for it.
+//!
 //! Every step reads the chain again: nothing here is state but caches and
 //! the pins. A stopped prover or a failed broadcast is retried on the next
 //! poll.
@@ -30,7 +34,7 @@ use bitcoin::block::Header;
 use bitcoin::{Amount, Block, BlockHash, FeeRate, OutPoint, ScriptBuf, Transaction, TxOut};
 use licash::claim::UnsignedClaim;
 use licash::disclosure::Disclosures;
-use licash::recovery::{self, Evidence, Filing};
+use licash::recovery::{self, Evidence, Filing, Publication};
 use licash::request::Request;
 use licash_contract::dispute::{self, presign, Payout};
 use licash_contract::graph;
@@ -50,6 +54,11 @@ use crate::FoldOffer;
 /// responder cites those the statement accepts. None known is no error:
 /// the claim is then owed what its notes are worth.
 pub type Evidencer = dyn Fn(&UnsignedClaim) -> Result<Vec<Evidence>> + Send + Sync;
+
+/// Where the hub's ledger retires the notes that a holder's published
+/// claim in a contract names ([`Openings::claims_with`]): spent by nothing
+/// else from then on. Again is nothing new.
+pub type Claims = dyn Fn(&[u8; 32], &Publication) -> Result<()> + Send + Sync;
 
 /// A coin's first spend, once found: its block's height and it.
 type Spend = Option<(u32, Transaction)>;
@@ -181,6 +190,7 @@ impl Openings {
             self.note_once(id, "unknown", "her contract went to an unknown transaction");
             return Ok(Played::Idle);
         }
+        self.retire_claimed(id, o, &r, r_at, tip).await;
         let main = |tx: &Transaction| OutPoint {
             txid: tx.compute_txid(),
             vout: 0,
@@ -354,6 +364,87 @@ impl Openings {
             return Ok(Played::Posted("default"));
         }
         Ok(Played::Idle)
+    }
+
+    /// The notes her publication names, retired in the hub's ledger once
+    /// it is as deep as the hub decides on: before it decides, and
+    /// whatever ends the dispute. Once a run; the ledger keeps them. A
+    /// reclaim, or bytes that decode to no claim, name nothing. Not
+    /// retired, the dispute goes on, the operator is told, and the next
+    /// poll tries again.
+    async fn retire_claimed(
+        &self,
+        id: &[u8; 32],
+        o: &HubOpening,
+        r: &Transaction,
+        r_at: u32,
+        tip: u32,
+    ) {
+        let Some(claims) = self.claims.get() else {
+            return;
+        };
+        if self.seen(id, "retired") {
+            return;
+        }
+        match self.claimed(o, r, r_at, tip).await {
+            Ok(None) => {}
+            Ok(Some(Some(publication))) => {
+                if let Err(e) = claims(id, &publication) {
+                    if self.once(id, "unretired") {
+                        self.alert(&format!(
+                            "contract {}: her claimed notes are not retired, so the hub may \
+                             accept spends of notes it pays her for on Bitcoin: {e:#}",
+                            crate::hex_id(id)
+                        ));
+                    }
+                    return;
+                }
+                self.once(id, "retired");
+            }
+            Ok(Some(None)) => {
+                self.once(id, "retired");
+            }
+            Err(e) => tracing::warn!(id = %crate::hex_id(id), "reading her publication: {e:#}"),
+        }
+    }
+
+    /// Her publication, once as deep as the hub decides on: none yet, or
+    /// the claim it carries, if any.
+    async fn claimed(
+        &self,
+        o: &HubOpening,
+        r: &Transaction,
+        r_at: u32,
+        tip: u32,
+    ) -> Result<Option<Option<Publication>>> {
+        let slot = OutPoint {
+            txid: r.compute_txid(),
+            vout: SLOT,
+        };
+        let Some((p_at, p)) = self
+            .spend(slot, &r.output[slot.vout as usize], r_at, tip)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let depth = o.base.parts().chain.funding_depth.max(1);
+        if tip.saturating_add(1) < p_at.saturating_add(depth) {
+            return Ok(None);
+        }
+        let request = presign(&o.set, "request")?;
+        let block = self.block_at(p_at).await?;
+        let parts = o.base.parts();
+        let filing = dispute::published(&request.tx, &block, &p.compute_txid())
+            .ok()
+            .and_then(|filed| {
+                Filing::from_bytes(
+                    &parts.keyset,
+                    parts.limits.max_authorizations as usize,
+                    &filed,
+                )
+                .ok()
+            });
+        Ok(Some(filing.map(|f| f.publication().clone())))
     }
 
     /// Her request stands: what her publication is owed, and the response
@@ -1544,6 +1635,15 @@ impl Openings {
         if self.once(id, what) {
             tracing::info!(id = %crate::hex_id(id), "{message}");
         }
+    }
+
+    /// Whether `what` happened to `id` since the hub started.
+    fn seen(&self, id: &[u8; 32], what: &'static str) -> bool {
+        self.watch
+            .noted
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(&(*id, what))
     }
 
     /// Whether this is the first time `what` happened to `id` since the

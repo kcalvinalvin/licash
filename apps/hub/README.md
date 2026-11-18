@@ -65,7 +65,10 @@ testing only: header checks cannot tell their blocks from forged ones.
 
 `<data>/seed` is the hub's only secret: keep a copy offline. Never replace
 `<data>/hub.sqlite` while the hub runs: the hub halts, and `/health` answers
-503, until it is restarted.
+503, until it is restarted. A newer hub upgrades its schema when it opens it,
+once its seed matches, and an older one then refuses it. A database of the
+first schema gains the record of claimed notes empty: the claims of
+disputes that ended before the upgrade are not recorded.
 
 A spend's offer (its grant) its payer never released within a day is
 deleted, so that offers never made into spends cost no row for good; a
@@ -216,10 +219,14 @@ network yet.
 A hub with contracts plays its holders' exits itself, polling its
 contracts' Core wallet at `--chain-poll`. When a wallet forces its contract
 closed, its request R and its publication (the claim it files) come on
-Bitcoin. The hub decides what the claim is owed against its ledger: the
-spends it retired the claimed notes for (owner-signed, a granted one with
-its unlock) and, for each timed lock the claim names, the branch it did not
-settle it on (its preimage, or its expiry). Owed all it asks, the hub lets
+Bitcoin. Once the publication is as deep as a contract's funding, the hub
+records every note the claim names as spent in `hub.sqlite`, whatever the
+dispute pays her: no spend takes them after, and her claim of them is
+evidence against any other claim of the same notes, in any contract. Then
+it decides what the claim is owed against its ledger: the spends it retired
+the claimed notes for (owner-signed, a granted one with its unlock), other
+claims of them, and, for each timed lock the claim names, the branch it did
+not settle it on (its preimage, or its expiry). Owed all it asks, the hub lets
 the holder's timeout pay her. Owed less (a claim of notes that are not the
 keyset's, or spent), it responds with what is owed, publishes in the
 response's disclose slot what that evidence needs public (a granted spend's

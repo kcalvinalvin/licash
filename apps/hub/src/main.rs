@@ -1123,8 +1123,7 @@ fn command(cli: Cli) -> anyhow::Result<()> {
                     // Holders' exits are played as they come: the hub
                     // decides each claim against its ledger, and proves
                     // what it answers.
-                    let ledger = hub.clone();
-                    openings.evidence_with(Arc::new(move |claim| Ok(ledger.evidence(claim)?)));
+                    licash_hub_service::answer_from(&openings, hub.clone());
                     // Its prover not ready, failing or short of time, a
                     // notification.
                     let notify = hub.clone();
