@@ -324,6 +324,15 @@ async fn open_at<T: Transport, C: Chain>(
 /// again, 25 MB at a time.
 pub const OPENS_WITHIN: i64 = 86_400;
 
+/// The openings this process found it cannot load: those whose F she
+/// signed, kept as they are, not read again at each of the app's syncs
+/// for nothing. Not stored: a later build may read them.
+fn unreadable() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<[u8; 32]>> {
+    static UNREADABLE: std::sync::Mutex<std::collections::BTreeSet<[u8; 32]>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
+    UNREADABLE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// An opening at `phase`, begun at `began`, still short of her signing F
 /// [`OPENS_WITHIN`] later, at `now`: to give up. She never signed her
 /// deposit into an F, so none can confirm, and her coin is free.
@@ -353,6 +362,9 @@ pub async fn resume<T: Transport, C: Chain>(
             continue;
         }
         let id = contract.id;
+        if unreadable().contains(&id) {
+            continue;
+        }
         if overdue(contract.phase, contract.created_at, now) {
             tracing::warn!(id = %crate::hex_id(&id), "an opening not opened in a day: given up");
             store.abandon(&id, "not opened in a day")?;
@@ -369,6 +381,7 @@ pub async fn resume<T: Transport, C: Chain>(
                 // if she never signed its F, else kept as it is.
                 tracing::warn!(id = %crate::hex_id(&id), "loading an opening: {e:#}");
                 store.abandon(&id, &format!("cannot be carried on: {e}"))?;
+                unreadable().insert(id);
                 continue;
             }
         };
@@ -1186,5 +1199,16 @@ mod tests {
         assert!(reason.starts_with("cannot be carried on"), "{reason}");
         assert_eq!(of(2).abandoned, None);
         assert_eq!(of(2).phase, Phase::Funded);
+        // Not read again at each sync of the app: one found unreadable
+        // is passed over, even one she never signed F for that loading
+        // would give up.
+        assert!(unreadable().contains(&[2; 32]));
+        store.insert(&new(3, 2)).unwrap();
+        unreadable().insert([3; 32]);
+        let again = resume(&wallet, &Tip, dir.path()).await.unwrap();
+        assert_eq!(
+            again.iter().find(|c| c.id == [3; 32]).unwrap().abandoned,
+            None
+        );
     }
 }
