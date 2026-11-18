@@ -156,7 +156,7 @@ impl<T: Transport> Wallet<T> {
         let mut preimage = [0; 32];
         OsRng.fill_bytes(&mut preimage);
         let hash = lock_hash(&preimage);
-        self.store.write(|tx| {
+        let insert = |tx: &rusqlite::Transaction<'_>| -> Result<(), Error> {
             tx.execute(
                 "INSERT INTO swaps
                     (hash, provider, preimage, from_hub, to_hub, amount, fee, created_at)
@@ -173,14 +173,34 @@ impl<T: Transport> Wallet<T> {
                 ],
             )?;
             Ok(())
-        })?;
-        tracing::info!(hash = %hex::encode(hash), %provider, %from, %to, amount, fee, "swapping");
+        };
         let total = amount.saturating_add(fee);
         let at = (from.as_str(), from_hub, &from_info);
-        match self
-            .lock_paying(at, &offer.address, total, hash, Some(expiry), Pays::Nothing)
+        // Its lock prepared first, then the swap, its lock and its notes
+        // taken at once: no follower ever sees the swap without its lock.
+        let admitted = match self
+            .prepare_lock(at, &offer.address, total, hash, Some(expiry), Pays::Nothing)
             .await
         {
+            Ok(prepared) => self
+                .store
+                .write(|tx| {
+                    insert(tx)?;
+                    prepared.record(tx)
+                })
+                .map(|()| prepared),
+            Err(e) => Err(e),
+        };
+        let prepared = match admitted {
+            Ok(prepared) => prepared,
+            Err(e) => {
+                self.store.write(insert)?;
+                self.fail_swap(&hash, &format!("its lock was not made: {e}"))?;
+                return Err(e);
+            }
+        };
+        tracing::info!(hash = %hex::encode(hash), %provider, %from, %to, amount, fee, "swapping");
+        match self.send_lock(&from, &prepared).await {
             Ok(_) | Err(Error::Pending { .. }) => {}
             Err(e) => {
                 self.fail_swap(&hash, &format!("its lock was not made: {e}"))?;

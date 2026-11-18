@@ -436,6 +436,51 @@ async fn a_swap_moves_notes_from_one_hub_to_another_for_the_providers_fee() {
     assert_eq!(theirs.unwrap().unwrap().state, swaps::State::Done);
 }
 
+/// A follower elsewhere (a second handle on the client's wallet, on
+/// another thread) never sees a swap without its lock, which it would fail
+/// as one whose lock was never made: the swap, its lock and its notes are
+/// recorded at once.
+#[tokio::test]
+async fn a_concurrent_follower_never_fails_a_swap_being_made() {
+    let eco = Eco::new(200).await;
+    let path = eco.dir.path().join("client.sqlite");
+    let follower = Wallet::open(&path, Client(eco.net.clone(), eco.desk.clone())).unwrap();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stopping = stop.clone();
+    let following = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let mut rounds = 0;
+            while !stopping.load(std::sync::atomic::Ordering::Relaxed) {
+                follower.resume().await.unwrap();
+                rounds += 1;
+            }
+            rounds
+        })
+    });
+    // As many as its 50 sat at A pay.
+    for _ in 0..2 {
+        // Taken on by the follower at the same time, it may be pending.
+        match eco
+            .client
+            .swap(PROVIDER, A, B, 20, SwapLimits::usual(20))
+            .await
+        {
+            Ok(swap) => assert!(!matches!(swap.state, SwapState::Failed(_)), "{swap:?}"),
+            Err(Error::Pending { .. }) => {}
+            Err(e) => panic!("{e}"),
+        }
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    assert!(following.join().unwrap() > 0);
+    for swap in eco.client.swaps().unwrap() {
+        assert!(!matches!(swap.state, SwapState::Failed(_)), "{swap:?}");
+    }
+}
+
 #[tokio::test]
 async fn a_client_locks_nothing_for_a_swap_the_provider_would_decline() {
     let eco = Eco::new(60).await;

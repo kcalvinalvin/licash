@@ -288,7 +288,7 @@ impl<T: Transport> Wallet<T> {
         OsRng.fill_bytes(&mut preimage);
         let hash = lock_hash(&preimage);
         let claim_key = random_key().secret_bytes();
-        self.store.write(|tx| {
+        let insert = |tx: &rusqlite::Transaction<'_>| -> Result<(), Error> {
             tx.execute(
                 "INSERT INTO payouts (hash, provider, preimage, claim_key, from_hub, address,
                     script, amount, budget, fee, created_at)
@@ -308,15 +308,13 @@ impl<T: Transport> Wallet<T> {
                 ],
             )?;
             Ok(())
-        })?;
-        tracing::info!(
-            hash = %hex::encode(hash), %provider, %from, %address, amount,
-            budget = quote.budget, fee = quote.fee, "paying out"
-        );
+        };
         let total = quote.value().saturating_add(quote.fee);
         let at = (from.as_str(), from_hub, &from_info);
-        match self
-            .lock_paying(
+        // Its lock prepared first, then the payout, its lock and its notes
+        // taken at once: no follower ever sees the payout without its lock.
+        let admitted = match self
+            .prepare_lock(
                 at,
                 &quote.info.address,
                 total,
@@ -326,6 +324,29 @@ impl<T: Transport> Wallet<T> {
             )
             .await
         {
+            Ok(prepared) => self
+                .store
+                .write(|tx| {
+                    insert(tx)?;
+                    prepared.record(tx)
+                })
+                .map(|()| prepared),
+            Err(e) => Err(e),
+        };
+        let prepared = match admitted {
+            Ok(prepared) => prepared,
+            // A line of the history all the same, failed, nothing locked.
+            Err(e) => {
+                self.store.write(insert)?;
+                self.fail_payout(&hash, &format!("its lock was not made: {e}"))?;
+                return Err(e);
+            }
+        };
+        tracing::info!(
+            hash = %hex::encode(hash), %provider, %from, %address, amount,
+            budget = quote.budget, fee = quote.fee, "paying out"
+        );
+        match self.send_lock(&from, &prepared).await {
             Ok(_) | Err(Error::Pending { .. }) => {}
             Err(e) => {
                 self.fail_payout(&hash, &format!("its lock was not made: {e}"))?;

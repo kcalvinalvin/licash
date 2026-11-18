@@ -215,9 +215,17 @@ impl<T: Transport> Wallet<T> {
             .prepare_lock((url, hub, info), payee, amount, hash, expiry, pays)
             .await?;
         self.store.write(|tx| prepared.record(tx))?;
+        self.send_lock(url, &prepared).await
+    }
+
+    /// Send `prepared`, recorded, to its hub at `url`: where it stands.
+    pub(crate) async fn send_lock(
+        &self,
+        url: &str,
+        prepared: &PreparedLock,
+    ) -> Result<Lock, Error> {
         let id = prepared.id;
-        let fee = prepared.fee;
-        let expiry = prepared.expiry;
+        let (amount, fee, expiry) = (prepared.amount, prepared.fee, prepared.expiry);
         tracing::info!(id = %hex::encode(id.as_bytes()), %url, amount, fee, expiry, "locking");
         self.advance_lock(&id, Some(prepared.height)).await
     }

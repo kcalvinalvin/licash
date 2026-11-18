@@ -108,6 +108,46 @@ async fn a_legacy_payout_quote_estimates_the_lock_fee_before_gross_inputs_are_se
     assert!(quote.budget + quote.fee + lock.fee > quote.costs());
 }
 
+/// A follower elsewhere (here a second handle on the same wallet, on
+/// another thread) never sees a payout without its lock, which it would
+/// fail as one whose lock was never made: the payout, its lock and its
+/// notes are recorded at once.
+#[tokio::test]
+async fn a_concurrent_follower_never_fails_a_payout_being_made() {
+    let eco = Eco::new().await;
+    let follower = Eco::client(&eco.net, &eco.desk, &eco.dir, false).await;
+    let view = eco.net.view(A);
+    let stop = Arc::new(AtomicBool::new(false));
+    let stopping = stop.clone();
+    let following = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let mut rounds = 0;
+            while !stopping.load(Ordering::Relaxed) {
+                follower.follow_payouts(&view).await.unwrap();
+                rounds += 1;
+            }
+            rounds
+        })
+    });
+    for _ in 0..3 {
+        eco.pay_out(500).await;
+    }
+    stop.store(true, Ordering::Relaxed);
+    assert!(following.join().unwrap() > 0);
+    let payouts = eco.client.payouts().unwrap();
+    assert_eq!(payouts.len(), 3);
+    for payout in payouts {
+        assert!(
+            !matches!(payout.state, PayoutState::Failed(_)),
+            "{payout:?}"
+        );
+    }
+}
+
 /// A payout the provider took: its answer, and the coin's terms.
 struct Taken {
     answer: ChainSwap,
