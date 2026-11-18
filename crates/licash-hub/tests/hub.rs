@@ -550,6 +550,16 @@ fn a_spent_note_is_refused_before_any_work_on_it() {
     assert_eq!(refused(hub.offer(&again.proposal, &[])), Refusal::Spent);
     // The spend released, offered again: its grant, as before.
     first.offer(&hub).unwrap();
+    // Refused as spent from a database changed under the hub: halted
+    // instead, as any write would.
+    sql(&files.db)
+        .execute("UPDATE meta SET seq = seq + 1", [])
+        .unwrap();
+    assert!(matches!(
+        hub.offer(&again.proposal, &[]),
+        Err(Error::Halted)
+    ));
+    assert!(hub.halted());
 }
 
 /// One note is offered in so many spends not released at most by a hub

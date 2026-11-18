@@ -894,7 +894,7 @@ impl Hub {
 
     /// Whether any of `identifiers` is spent by a proposal other than `id`.
     fn spent_by_other(&self, id: &ProposalId, identifiers: &[Point]) -> Result<bool, Error> {
-        self.store.read(|c| {
+        self.store.read_current(|c| {
             let mut stmt = c.prepare_cached("SELECT proposal FROM spent WHERE y = ?1")?;
             for y in identifiers {
                 let by: Option<[u8; 32]> = stmt.query_row([&y.0], |r| r.get(0)).optional()?;

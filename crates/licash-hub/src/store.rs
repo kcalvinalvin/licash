@@ -269,6 +269,23 @@ impl Store {
         op(&self.lock()?.conn)
     }
 
+    /// [`Self::read`], halting the hub as [`Self::write`] would should the
+    /// database's write count not be this hub's: for a refusal made on a
+    /// read alone, which must not answer from a database changed under it.
+    pub(crate) fn read_current<T>(
+        &self,
+        op: impl FnOnce(&Connection) -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        let inner = self.lock()?;
+        let seq: i64 = inner
+            .conn
+            .query_row("SELECT seq FROM meta", [], |r| r.get(0))?;
+        if seq != inner.seq {
+            return Err(self.halt("the database changed under the running hub"));
+        }
+        op(&inner.conn)
+    }
+
     pub(crate) fn halted(&self) -> bool {
         self.halted.load(Ordering::SeqCst)
     }
