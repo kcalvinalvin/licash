@@ -1000,6 +1000,30 @@ async fn call(net: &Net, method: Method, path: &str, body: Option<String>) -> (u
 }
 
 #[tokio::test]
+async fn deposits_asked_and_not_paid_are_bounded_retries_aside() {
+    let net = Net::new().await;
+    let mut bodies = Vec::new();
+    for name in ["alice", "bob"] {
+        let deposit = net.wallet(name).deposit(HUB, 3_000).await.unwrap();
+        bodies.push(net.asked(name, &deposit.hash).1);
+    }
+    let path = net.dir.path().join("bounded.sqlite");
+    let bounded = deposit::Config {
+        max_open: 1,
+        ..config()
+    };
+    let profile = ChainProfile::Core30DefaultRegtest;
+    let gateway =
+        deposit::Gateway::open(net.hub.clone(), net.source.clone(), profile, bounded, &path)
+            .unwrap();
+    let first = gateway.deposit(&bodies[0]).await.unwrap();
+    let refused = gateway.deposit(&bodies[1]).await.unwrap_err().0;
+    assert_eq!(refused.code, Code::Unavailable, "{refused:?}");
+    // The one asked, asked again: the same.
+    assert_eq!(gateway.deposit(&bodies[0]).await.unwrap(), first);
+}
+
+#[tokio::test]
 async fn deposits_outside_the_hubs_terms_are_refused() {
     let net = Net::new().await;
     let alice = net.wallet("alice");

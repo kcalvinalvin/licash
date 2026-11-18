@@ -70,6 +70,10 @@ pub struct Config {
     pub sweep_to: ScriptBuf,
     /// Between rounds of scanning and following deposits.
     pub poll: Duration,
+    /// Deposits asked and not yet paid at once, from which new ones are
+    /// refused as unavailable: each is scanned for in every block of its
+    /// window, at no cost to whoever asked.
+    pub max_open: u32,
 }
 
 impl Config {
@@ -90,6 +94,7 @@ impl Config {
             min_fee_rate: FeeRate::from_sat_per_vb_u32(2),
             sweep_to,
             poll: Duration::from_secs(5),
+            max_open: 1024,
         }
     }
 
@@ -110,6 +115,9 @@ impl Config {
         }
         if self.min == 0 || self.min > self.max {
             return Err("the least deposit must be positive and at most the largest".into());
+        }
+        if self.max_open == 0 {
+            return Err("the limit of deposits asked must be positive".into());
         }
         if self.timeout_blocks(timing.min_depth).is_none() {
             return Err("the deposit timing overflows".into());
@@ -309,7 +317,8 @@ impl Store {
         live
     }
 
-    /// Record a deposit unless one under its hash is.
+    /// Record a deposit unless one under its hash is, or `most` are
+    /// asked and not paid: false then.
     fn insert(
         &self,
         body: &str,
@@ -317,11 +326,15 @@ impl Store {
         pays: u64,
         htlc: &Htlc,
         fund_by: u32,
-    ) -> rusqlite::Result<()> {
-        self.conn().execute(
+        most: u32,
+    ) -> rusqlite::Result<bool> {
+        let conn = self.conn();
+        let inserted = conn.execute(
             "INSERT INTO deposits (hash, body, amount, pays, claim, refund, timeout, fund_by,
                  script, state, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'open', ?10) ON CONFLICT DO NOTHING",
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'open', ?10
+             WHERE (SELECT count(*) FROM deposits WHERE state = 'open' AND done_at IS NULL) < ?11
+             ON CONFLICT DO NOTHING",
             params![
                 htlc.hash,
                 body,
@@ -333,9 +346,10 @@ impl Store {
                 fund_by,
                 htlc.script_pubkey().as_bytes(),
                 sql(now()),
+                most,
             ],
         )?;
-        Ok(())
+        Ok(inserted == 1)
     }
 
     fn set(
@@ -655,9 +669,16 @@ impl Gateway {
                 timeout,
             };
             let fund_by = from.saturating_add(c.window);
-            self.store
-                .insert(&canonical, amount, pays, &htlc, fund_by)
+            let inserted = self
+                .store
+                .insert(&canonical, amount, pays, &htlc, fund_by, c.max_open)
                 .map_err(store_down)?;
+            if !inserted && self.store.get(&hash).map_err(store_down)?.is_none() {
+                return Err(Failure(Problem::new(
+                    Code::Unavailable,
+                    "too many deposits asked and not paid: retry later",
+                )));
+            }
             tracing::info!(hash = %hex::encode(hash), amount, pays, fund_by, timeout, "deposit asked");
         }
         drop(turn);

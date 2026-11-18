@@ -113,7 +113,9 @@ deposits on Bitcoin: a payment to a deposit's address, once confirmed,
 locks the hub's own notes to its payer, and the preimage the payer claims
 them with lets the hub claim the coins to the sweep address. Unclaimed
 deposits return to their payer after a timeout. `--deposit-*` flags set
-the fee, amounts and timing. Deposits are kept in `<data>/deposits.sqlite`:
+the fee, amounts and timing. `--deposit-max-open` bounds deposits asked and
+not yet paid (1024 by default): past it, new ones are refused as
+unavailable, never retries or deposits under way. Deposits are kept in `<data>/deposits.sqlite`:
 back it up with `hub.sqlite`. A claim left unmined is made again at a
 higher fee rate as the timeout nears (twice the estimate once fewer than 12 blocks
 are left, doubling every 3 blocks, all of the coin but dust at most), and

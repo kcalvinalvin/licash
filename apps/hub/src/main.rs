@@ -554,6 +554,10 @@ struct DepositArgs {
           default_value_t = deposits().min_fee_rate.to_sat_per_vb_ceil(),
           value_parser = clap::value_parser!(u64).range(1..=10_000))]
     deposit_min_fee_rate: u64,
+    /// The most deposits asked and not yet paid at once: new ones are
+    /// refused past it, never retries or those under way.
+    #[arg(long, env = "LICASH_HUB_DEPOSIT_MAX_OPEN", default_value_t = deposits().max_open)]
+    deposit_max_open: u32,
 }
 
 /// The defaults of deposits.
@@ -588,6 +592,7 @@ impl DepositArgs {
             downtime: self.deposit_downtime,
             sweep_blocks: self.deposit_sweep_blocks,
             min_fee_rate,
+            max_open: self.deposit_max_open,
             ..deposit::Config::new(address.script_pubkey())
         }))
     }
