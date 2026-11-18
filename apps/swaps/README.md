@@ -77,7 +77,10 @@ never claimed comes back to the provider once timed out. Each coin is paid at
 the chain's estimate when taken (no payout on mainnet without one); a coin in
 no block 12 blocks before its timeout is canceled, its coins paid back to the
 provider in its place, and a refund in no block is made again at a higher rate
-as the client's lock's expiry nears, all of the coin at most. Fund it on chain at
+as the client's lock's expiry nears, all of the coin at most. A refund is
+followed until six blocks deep: one a reorganization takes out of the chain is
+alerted and taken on again, the coin refunded anew or the client's claim taken
+on the hub. Fund it on chain at
 the address `licash-swaps --data ./swaps address --chain URL` prints: its
 wallet watches the chain from its tip when first started with `--chain`, or
 from `--chain-from`. `--payout-fee-base`, `--payout-fee-ppm`,

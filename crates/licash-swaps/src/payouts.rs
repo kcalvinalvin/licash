@@ -672,6 +672,26 @@ impl<T: Transport> Provider<T> {
                 pending.push((hex::encode(id), e.to_string()));
             }
         }
+        // Refunded lately: until their refunds are buried.
+        let refunded: Vec<[u8; 32]> = self.store.read(|c| {
+            let mut stmt = c.prepare(
+                "SELECT s.id FROM swaps s JOIN payouts p ON p.id = s.id
+                    JOIN payout_anchors a ON a.id = s.id AND a.height = p.scanned
+                 WHERE s.kind = 'chain' AND s.state = 'refunded'
+                 ORDER BY s.created_at, s.rowid",
+            )?;
+            let rows = stmt.query_map([], |r| r.get(0))?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })?;
+        for id in refunded {
+            let Some(_hold) = Hold::take(&self.busy, id) else {
+                continue;
+            };
+            if let Err(e) = self.recheck_refund(&id, chain).await {
+                tracing::warn!(id = %hex::encode(id), "refund not looked at again: {e}");
+                pending.push((hex::encode(id), e.to_string()));
+            }
+        }
         Ok(pending)
     }
 
@@ -852,6 +872,7 @@ impl<T: Transport> Provider<T> {
             }
             return Ok(());
         }
+        // Looked at again until buried (Provider::recheck_refund).
         self.set_scanned(id, through)?;
         tracing::info!(id = %hex::encode(id), "refunded: the client never claimed the coin");
         let notice = Notice::Refunded {
@@ -996,10 +1017,76 @@ impl<T: Transport> Provider<T> {
             }
         }
     }
+
+    /// Look again at payout `id`, refunded, its refund seen buried in the
+    /// chain ending at the block it is anchored at, until that block is
+    /// [`REORG`] deep. Replaced, the coin is looked for from its own block:
+    /// its refund found again, anchored anew; else the payout is taken on
+    /// again, locked, its refund made again or its client's claim taken,
+    /// which the claim's lack of a timelock still allows.
+    async fn recheck_refund(&self, id: &[u8; 32], chain: &impl Chain) -> Result<(), Error> {
+        let (Some(row), Some(coin)) = (self.row(id)?, self.coin(id)?) else {
+            return Ok(());
+        };
+        let (Some(scanned), Some(outpoint)) = (coin.scanned, coin.outpoint()) else {
+            return Ok(());
+        };
+        let Some(hash) = self.anchor(id, scanned)? else {
+            return Ok(());
+        };
+        let tip = chain.height().await.map_err(licash_wallet::Error::Chain)?;
+        let through = (
+            tip,
+            chain.hash(tip).await.map_err(licash_wallet::Error::Chain)?,
+        );
+        if scanned > tip {
+            return Ok(());
+        }
+        let now = chain
+            .hash(scanned)
+            .await
+            .map_err(licash_wallet::Error::Chain)?;
+        if now == hash {
+            if tip >= scanned + REORG {
+                self.store.write(|t| {
+                    t.execute("DELETE FROM payout_anchors WHERE id = ?1", [id])?;
+                    Ok(())
+                })?;
+            }
+            return Ok(());
+        }
+        let Some(height) = self.funding_height(&coin)? else {
+            // Its coin out of the chain too: waited for.
+            return Ok(());
+        };
+        let script = coin.htlc.script_pubkey();
+        let spend = first_spend(chain, outpoint, &script, height..=tip).await?;
+        if let Some((_, spend)) = &spend {
+            if coin.htlc.preimage_in(spend, outpoint).is_none() {
+                // Its refund, in another block.
+                return self.set_scanned(id, through);
+            }
+        }
+        let name = hex::encode(id);
+        tracing::warn!(id = %name, "payout's refund out of the chain: taken on again");
+        self.store.write(|t| {
+            t.execute("DELETE FROM payout_anchors WHERE id = ?1", [id])?;
+            t.execute("UPDATE payouts SET scanned = NULL WHERE id = ?1", [id])?;
+            Ok(())
+        })?;
+        if self.advance(id, Stage::Refunded, Stage::Locked, None, None)? {
+            self.alert(&format!(
+                "Payout {name} of {} was refunded, then its refund left the chain: taken on again.",
+                row.amount
+            ))?;
+        }
+        Ok(())
+    }
 }
 
 /// How deep a reorganization a payout's coin is looked back through for,
-/// where the block it was looked through to is not known.
+/// where the block it was looked through to is not known; and how deep its
+/// refund is followed once buried.
 const REORG: u32 = 6;
 
 /// The first block to look in for the spend of a coin mined at `funding`,

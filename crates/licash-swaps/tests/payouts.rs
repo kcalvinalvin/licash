@@ -722,6 +722,94 @@ async fn a_claim_mined_in_blocks_replacing_those_a_provider_before_looked_throug
     claimed_in_blocks_replacing_those_looked_through(true).await;
 }
 
+/// The operator's alerts of refunds that left the chain.
+fn refunds_undone(eco: &Eco) -> usize {
+    let events = eco.provider().events(0, 50).unwrap();
+    events
+        .iter()
+        .filter(|e| matches!(e.notice(), Some(licash_swaps::Notice::Alert { message }) if message.contains("left the chain")))
+        .count()
+}
+
+/// A payout's coin, never claimed but by `claim` if given, refunded once
+/// timed out: its refund, mined at the tip.
+async fn refunded(eco: &Eco, claim: bool) -> Vec<Transaction> {
+    let payout = eco.pay_out(1_000).await;
+    eco.pool.mine();
+    eco.follow().await;
+    let mut held = Vec::new();
+    if claim {
+        eco.client_follows(&payout).await;
+        held = eco.pool.waiting();
+        assert!(held.iter().any(is_claim));
+        eco.pool.mine_if(|_| false);
+    }
+    eco.mine_to(timeout(eco));
+    eco.follow().await;
+    let refund = eco.pool.waiting();
+    assert_eq!(refund.len(), 1);
+    eco.pool.mine();
+    eco.follow().await;
+    assert_eq!(eco.stage(), Stage::Refunded);
+    if claim {
+        held
+    } else {
+        refund
+    }
+}
+
+#[tokio::test]
+async fn a_refund_replaced_out_of_the_chain_is_made_again() {
+    let eco = Eco::new(STOCK, TERMS).await;
+    let refund = refunded(&eco, false).await;
+    let at = eco.pool.view.height();
+    // Mined again in the block replacing its own: refunded still.
+    eco.net.reorg(A, at - 1);
+    for tx in &refund {
+        eco.pool.broadcast(tx).await.unwrap();
+    }
+    eco.pool.mine();
+    eco.follow().await;
+    assert_eq!(eco.stage(), Stage::Refunded);
+    assert_eq!(refunds_undone(&eco), 0);
+    // Left out of those replacing its own: taken on again, and refunded.
+    eco.net.reorg(A, at - 1);
+    eco.mine_to(at + 1);
+    eco.follow().await;
+    assert_eq!(refunds_undone(&eco), 1);
+    eco.follow().await;
+    assert_eq!(eco.stage(), Stage::Locked);
+    assert_eq!(eco.pool.waiting().len(), 1);
+    eco.pool.mine();
+    eco.follow().await;
+    assert_eq!(eco.stage(), Stage::Refunded);
+    // Buried, never looked at again.
+    eco.mine_to(eco.pool.view.height() + 6);
+    eco.follow().await;
+    eco.net.reorg(A, at);
+    eco.mine_to(at + 10);
+    eco.follow().await;
+    assert_eq!(eco.stage(), Stage::Refunded);
+    assert_eq!(refunds_undone(&eco), 1);
+}
+
+#[tokio::test]
+async fn a_claim_mined_in_place_of_a_refund_still_pays_the_provider() {
+    let eco = Eco::new(STOCK, TERMS).await;
+    let claim = refunded(&eco, true).await;
+    let at = eco.pool.view.height();
+    eco.net.reorg(A, at - 1);
+    for tx in &claim {
+        eco.pool.broadcast(tx).await.unwrap();
+    }
+    assert!(eco.pool.mine().iter().any(is_claim));
+    eco.follow().await;
+    assert_eq!(refunds_undone(&eco), 1);
+    eco.follow().await;
+    assert_eq!(eco.stage(), Stage::Done);
+    assert!(eco.provider_held() > 1_000);
+}
+
 #[tokio::test]
 async fn a_provider_stopped_mid_payout_takes_it_on() {
     let eco = Eco::new(STOCK, TERMS).await;
