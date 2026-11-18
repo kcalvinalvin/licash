@@ -70,6 +70,12 @@ fn rescan(from: u32, tip: u32) -> u32 {
     tip.saturating_add(1).saturating_sub(OVERLAP).max(from)
 }
 
+/// Whether a transaction mined at `height` is `depth` deep at `tip`, one
+/// at least: a reorganization no longer expected to take it out.
+fn deep(height: u32, tip: u32, depth: u32) -> bool {
+    tip.saturating_add(1).saturating_sub(height) >= depth.max(1)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stage {
     Claiming,
@@ -1724,6 +1730,12 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
             .unwrap_or(state.payout_height.context("payout is unconfirmed")?);
         match first_spend(self.chain, coin, script, from..=tip).await? {
             Some((height, tx)) if tx.compute_txid() == sweep.compute_txid() => {
+                // Done once as deep as F had to be: looked for again until
+                // then, from where it was, and broadcast again if it left
+                // the chain.
+                if !deep(height, tip, self.o.base.parts().chain.funding_depth) {
+                    return Ok(Next::Wait);
+                }
                 state.swept_height = Some(height);
                 state.next_at = None;
                 Ok(Next::To(Stage::Done))
@@ -1833,6 +1845,17 @@ mod tests {
         assert_eq!(rescan(199, 200), 199);
         assert_eq!(rescan(0, 1), 0);
         assert_eq!(rescan(150, 150), 150);
+    }
+    #[test]
+    fn a_sweep_is_done_only_as_deep_as_f_had_to_be() {
+        // Two deep wanted: mined at the tip, not yet; one block on, done.
+        assert!(!deep(100, 100, 2));
+        assert!(deep(100, 101, 2));
+        // One at least, whatever the chain's terms say.
+        assert!(deep(100, 100, 0));
+        assert!(deep(100, 100, 1));
+        // A tip below it, after a reorganization: not deep.
+        assert!(!deep(100, 99, 1));
     }
     #[test]
     fn every_stage_reads_back_and_only_done_or_lost_is_over() {
