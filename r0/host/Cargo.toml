@@ -10,10 +10,16 @@ license = "MIT"
 [workspace]
 resolver = "3"
 
+# The GPU build, `licash-r0-cuda` (CUDA's nvcc to build, its driver to run).
+[features]
+cuda = ["risc0-zkvm/cuda", "dep:risc0-zkp", "risc0-zkp/cuda"]
+
 [dependencies]
 licash-hp = { path = "../../crates/licash-hp" }
 risc0-zkvm = { version = "=3.1.0", default-features = false, features = ["prove", "std"] }
 risc0-binfmt = "=3.0.6"
+risc0-groth16 = { version = "=3.0.6", features = ["prove"] }
+risc0-zkp = { version = "=3.0.6", optional = true }
 risc0-zkos-v1compat = "=2.2.3"
 anyhow = "1"
 bincode = "1.3"

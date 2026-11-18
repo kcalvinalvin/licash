@@ -1,31 +1,37 @@
 //! licash-r0: packs, executes and proves the Hub's statement guest
 //! (`r0/hp-guest`, `licash_hp::check`).
 //!
-//!   licash-r0 pack <elf> <out.bin>          pack an ELF with the zkOS kernel; prints the image id
-//!   licash-r0 id <program.bin>              a packed program's image id
-//!   licash-r0 hp-exec <input.bin>           execute an input; prints journal and cycles
-//!   licash-r0 hp-prove <input.bin> <out.json>
-//!                                           prove, wrap in Groth16, verify and export
-//!   licash-r0 hp-prove-succinct <input.bin> [work-dir]
-//!                                           prove the STARK only, a segment at a time,
-//!                                           carried on across runs in work-dir
-//!                                           (<input.bin>.proof): writes work-dir/receipt
-//!   licash-r0 hp-wrap <receipt> <out.json>  wrap such a receipt in Groth16 (x86, Docker),
-//!                                           verify and export
+//!   licash-r0 pack <elf> <out.bin>         pack an ELF with the zkOS kernel; prints the image id
+//!   licash-r0 id <program.bin>             a packed program's image id
+//!   licash-r0 hp-exec <input.bin> [program]
+//!                                          execute an input; prints journal and cycles
+//!   licash-r0 hp-prove <input.bin> <work-dir> [program]
+//!                                          prove, wrap in Groth16, verify and export to
+//!                                          work-dir/proof.json, carried on across runs
+//!   licash-r0 probe                        what this machine proves with, as JSON
+//!   licash-r0 bench <out.json> [program]   how fast it proves, as JSON
+//!
+//! A program is a packed guest's path, or an image id kept in the programs
+//! directory ([`probe::share`]); by default the checkout's `r0/guests/hp.bin`
+//! (built by r0/build-guest.sh).
 //!
 //! The export is JSON: the image id, the journal and the 256-byte Groth16
 //! seal (`lichen_babe::risc0::proof_from_seal`'s input), all hex.
-//! Packed guests are read from `r0/guests/` (built by r0/build-guest.sh).
+//!
+//! Built with the `cuda` feature (as `licash-r0-cuda`), it proves on the
+//! GPU. The CPU build proves through such a build beside it when it finds a
+//! usable GPU, and on the CPU otherwise: one command, whichever the device.
 
+mod bench;
+mod groth16;
 mod hp;
+mod probe;
 mod resumable;
 
-use std::fs::{read, write, File, OpenOptions};
-use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::fs::{read, write};
 
 use anyhow::{bail, ensure, Context, Result};
-use risc0_zkvm::{compute_image_id, default_prover, ExecutorEnv, ProverOpts, Receipt};
+use risc0_zkvm::{compute_image_id, ExecutorEnv, Receipt};
 
 fn words(bytes: &[u8]) -> Vec<u32> {
     bytes
@@ -38,16 +44,18 @@ fn words(bytes: &[u8]) -> Vec<u32> {
         .collect()
 }
 
-fn env_for(input: &[u8]) -> Result<ExecutorEnv<'static>> {
+/// The guest's environment for `input`, in segments of 2^`po2` cycles (or
+/// the zkVM's default). The segment size does not change what is proven.
+fn env_for(input: &[u8], po2: Option<u32>) -> Result<ExecutorEnv<'static>> {
     let mut env = ExecutorEnv::builder();
-    if let Some(po2) = segment_limit(std::env::var("LICASH_SEGMENT_PO2").ok().as_deref())? {
+    if let Some(po2) = po2 {
         env.segment_limit_po2(po2);
     }
     env.write(&(input.len() as u32))?.write_slice(&words(input));
     env.build()
 }
 
-/// Segment size for measurements; it does not change what is proven.
+/// `LICASH_SEGMENT_PO2`, a segment size for measurements, if set.
 fn segment_limit(value: Option<&str>) -> Result<Option<u32>> {
     let Some(value) = value else { return Ok(None) };
     let po2 = value
@@ -60,112 +68,17 @@ fn segment_limit(value: Option<&str>) -> Result<Option<u32>> {
     Ok(Some(po2))
 }
 
-/// Allocate private, exclusive output handles before expensive proving. Never
-/// reopen a predictable temporary path after a proof has been generated.
-struct ProofArtifacts {
-    directory: PathBuf,
-    receipt: File,
-    groth16: Option<File>,
-    name: String,
+fn segment_override() -> Result<Option<u32>> {
+    segment_limit(std::env::var("LICASH_SEGMENT_PO2").ok().as_deref())
 }
 
-fn create_artifact(path: &Path) -> std::io::Result<File> {
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    options.open(path)
-}
-
-impl ProofArtifacts {
-    fn create(name: &str, groth16: bool) -> Result<Self> {
-        ensure!(
-            !name.is_empty() && name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-'),
-            "proof artifact name must be a simple workload label"
-        );
-        let mut builder = tempfile::Builder::new();
-        builder.prefix("licash-proof-");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            builder.permissions(std::fs::Permissions::from_mode(0o700));
-        }
-        let directory = builder.tempdir()?;
-        let receipt = create_artifact(&directory.path().join(format!("{name}.receipt")))?;
-        let groth16 = if groth16 {
-            Some(create_artifact(
-                &directory.path().join(format!("{name}.groth16")),
-            )?)
-        } else {
-            None
-        };
-        Ok(Self {
-            directory: directory.keep(),
-            receipt,
-            groth16,
-            name: name.into(),
-        })
-    }
-
-    fn path(&self, extension: &str) -> PathBuf {
-        self.directory.join(format!("{}.{extension}", self.name))
-    }
-}
-
-fn prove_bytes(
-    bin: &[u8],
-    name: &str,
-    bytes: &[u8],
-    expected: &[u8],
-    groth16: bool,
-) -> Result<Receipt> {
-    let mut artifacts = ProofArtifacts::create(name, groth16)?;
-    println!("proof artifacts: {}", artifacts.directory.display());
+/// The export of a Groth16 `receipt` of `bin`, verified, its journal
+/// `expected`. The consumer must still compare the journal to its own
+/// opening and verify the proof.
+fn export(bin: &[u8], receipt: &Receipt, expected: &[u8]) -> Result<Vec<u8>> {
     let id = compute_image_id(bin)?;
-    let t = Instant::now();
-    let info = default_prover().prove_with_opts(env_for(bytes)?, bin, &ProverOpts::succinct())?;
-    let succinct_s = t.elapsed().as_secs_f64();
-    let receipt: Receipt = info.receipt;
     receipt.verify(id)?;
     ensure!(receipt.journal.bytes == expected, "journal");
-    println!(
-        "{name}: succinct receipt in {succinct_s:.1} s, {} user cycles, {} segments, journal D {}.., receipt {} bytes",
-        info.stats.user_cycles,
-        info.stats.segments,
-        hex::encode(&receipt.journal.bytes[..4]),
-        bincode::serialize(&receipt)?.len()
-    );
-    bincode::serialize_into(&mut artifacts.receipt, &receipt)?;
-    artifacts.receipt.sync_all()?;
-    println!("written {}", artifacts.path("receipt").display());
-    if groth16 {
-        let t = Instant::now();
-        let wrapped = default_prover().compress(&ProverOpts::groth16(), &receipt)?;
-        let wrap_s = t.elapsed().as_secs_f64();
-        wrapped.verify(id)?;
-        let seal = wrapped.inner.groth16().map(|g| g.seal.len()).unwrap_or(0);
-        println!("{name}: groth16 wrap in {wrap_s:.1} s, seal {seal} bytes");
-        let file = artifacts
-            .groth16
-            .as_mut()
-            .context("unallocated Groth16 output")?;
-        bincode::serialize_into(&mut *file, &wrapped)?;
-        file.sync_all()?;
-        println!("written {}", artifacts.path("groth16").display());
-        return Ok(wrapped);
-    }
-    Ok(receipt)
-}
-
-/// Export only a verified receipt of the current guest. The consumer must
-/// still compare the journal to its own opening and verify the proof.
-fn export_receipt(bin: &[u8], receipt: &Receipt, out: &str, journal_len: usize) -> Result<()> {
-    let id = compute_image_id(bin)?;
-    receipt.verify(id)?;
-    ensure!(receipt.journal.bytes.len() == journal_len, "journal length");
     let groth16 = receipt
         .inner
         .groth16()
@@ -176,9 +89,7 @@ fn export_receipt(bin: &[u8], receipt: &Receipt, out: &str, journal_len: usize) 
         "journal": hex::encode(&receipt.journal.bytes),
         "seal": hex::encode(&groth16.seal),
     });
-    write(out, serde_json::to_vec_pretty(&data)?)?;
-    println!("verified and exported {out}");
-    Ok(())
+    Ok(serde_json::to_vec_pretty(&data)?)
 }
 
 fn main() -> Result<()> {
@@ -199,20 +110,38 @@ fn main() -> Result<()> {
             println!("{}", compute_image_id(&read(bin)?)?);
             Ok(())
         }
-        ["hp-exec", path] => hp::exec(path),
-        ["hp-prove", path, out] => hp::prove(path, out),
-        ["hp-prove-succinct", path, dir @ ..] if dir.len() <= 1 => {
-            hp::prove_succinct(path, dir.first().copied())
+        ["hp-exec", input, program @ ..] if program.len() <= 1 => {
+            hp::exec(input, program.first().copied())
         }
-        ["hp-wrap", receipt, out] => hp::wrap(receipt, out),
-        _ => bail!("usage: licash-r0 pack <elf> <out.bin> | id <program.bin> | hp-exec <input.bin> | hp-prove <input.bin> <out.json> | hp-prove-succinct <input.bin> [work-dir] | hp-wrap <receipt> <out.json>"),
+        ["hp-prove", input, work, program @ ..] if program.len() <= 1 => {
+            hp::prove(input, work.as_ref(), program.first().copied())
+        }
+        // The CUDA build's part of hp-prove: the succinct receipt and its
+        // identity_p254 seal, in segments of 2^po2.
+        ["hp-stark", input, work, po2, program @ ..] if program.len() <= 1 => {
+            hp::stark_command(input, work.as_ref(), po2, program.first().copied())
+        }
+        ["bench", out, program @ ..] if program.len() <= 1 => {
+            bench::bench(out.as_ref(), program.first().copied())
+        }
+        // The CUDA build's part of bench.
+        ["bench-stark", dir, po2, program @ ..] if program.len() <= 1 => {
+            let po2 = segment_limit(Some(po2))?.context("a segment size")?;
+            bench::stark(dir.as_ref(), po2, program.first().copied()).map(drop)
+        }
+        ["probe"] => {
+            println!("{}", serde_json::to_string(&probe::probe())?);
+            Ok(())
+        }
+        // The CUDA build's own check of its GPU, for the CPU build's probe.
+        ["probe-gpu"] => probe::gpu(),
+        _ => bail!("usage: licash-r0 pack <elf> <out.bin> | id <program.bin> | hp-exec <input.bin> [program] | hp-prove <input.bin> <work-dir> [program] | probe | bench <out.json> [program]"),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
 
     #[test]
     fn segmentation_is_optional_and_bounded() {
@@ -225,53 +154,6 @@ mod tests {
         }
         for value in ["", "12", "21", "invalid", "-1"] {
             assert!(segment_limit(Some(value)).is_err());
-        }
-    }
-
-    #[test]
-    fn proof_artifact_files_are_exclusive_and_do_not_truncate_existing_data() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("existing.receipt");
-        write(&path, b"keep this data").unwrap();
-        assert_eq!(
-            create_artifact(&path).unwrap_err().kind(),
-            std::io::ErrorKind::AlreadyExists
-        );
-        assert_eq!(read(path).unwrap(), b"keep this data");
-    }
-
-    #[test]
-    fn concurrent_workload_labels_get_distinct_private_artifacts() {
-        let mut first = ProofArtifacts::create("counter-file", true).unwrap();
-        let second = ProofArtifacts::create("counter-file", true).unwrap();
-        assert_ne!(first.directory, second.directory);
-        first.receipt.write_all(b"first receipt").unwrap();
-        assert_eq!(read(first.path("receipt")).unwrap(), b"first receipt");
-        assert!(read(second.path("receipt")).unwrap().is_empty());
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            assert_eq!(
-                std::fs::metadata(&first.directory)
-                    .unwrap()
-                    .permissions()
-                    .mode()
-                    & 0o777,
-                0o700
-            );
-            assert_eq!(
-                first.receipt.metadata().unwrap().permissions().mode() & 0o777,
-                0o600
-            );
-        }
-        std::fs::remove_dir_all(first.directory).unwrap();
-        std::fs::remove_dir_all(second.directory).unwrap();
-    }
-
-    #[test]
-    fn artifact_labels_cannot_select_external_paths() {
-        for name in ["", "../target", "/absolute", "a/b"] {
-            assert!(ProofArtifacts::create(name, true).is_err());
         }
     }
 }

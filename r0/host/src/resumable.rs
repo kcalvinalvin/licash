@@ -43,7 +43,7 @@ struct Executed {
 }
 
 /// `bytes` to `path` whole or not at all.
-fn keep(path: &Path, bytes: &[u8]) -> Result<()> {
+pub fn keep(path: &Path, bytes: &[u8]) -> Result<()> {
     let part = path.with_extension("part");
     write(&part, bytes)?;
     std::fs::File::open(&part)?.sync_all()?;
@@ -97,10 +97,17 @@ fn forget(dir: &Path) -> Result<()> {
 
 /// Execute `bin` on `input` in `dir`, every segment written there, then
 /// what it made: refused unless its journal is `expected`.
-fn execute(bin: &[u8], name: &str, input: &[u8], expected: &[u8], dir: &Path) -> Result<Executed> {
+fn execute(
+    bin: &[u8],
+    name: &str,
+    input: &[u8],
+    expected: &[u8],
+    dir: &Path,
+    po2: Option<u32>,
+) -> Result<Executed> {
     let start = Instant::now();
     forget(dir)?;
-    let session = ExecutorImpl::from_elf(super::env_for(input)?, bin)?.run_with_callback(
+    let session = ExecutorImpl::from_elf(super::env_for(input, po2)?, bin)?.run_with_callback(
         |segment| -> Result<Box<dyn SegmentRef>> {
             let path = segment_path(dir, segment.index as usize);
             keep(&path, &bincode::serialize(&segment)?)?;
@@ -162,10 +169,17 @@ fn rss() -> String {
     format!("rss {} kB, peak {} kB", field("VmRSS:"), field("VmHWM:"))
 }
 
-/// Prove `bin` on `input`, its journal `expected`, carrying on the work kept
-/// in `dir`: the verified succinct receipt, also written to `dir/receipt`.
-pub fn prove(bin: &[u8], name: &str, input: &[u8], expected: &[u8], dir: &Path) -> Result<Receipt> {
-    let po2 = super::segment_limit(std::env::var("LICASH_SEGMENT_PO2").ok().as_deref())?;
+/// Prove `bin` on `input`, its journal `expected`, in segments of 2^`po2`
+/// cycles, carrying on the work kept in `dir`: the verified succinct
+/// receipt, also written to `dir/receipt`.
+pub fn prove(
+    bin: &[u8],
+    name: &str,
+    input: &[u8],
+    expected: &[u8],
+    dir: &Path,
+    po2: Option<u32>,
+) -> Result<Receipt> {
     let id = compute_image_id(bin)?;
     claim_dir(dir, &id.to_string(), input, po2)?;
     let start = Instant::now();
@@ -180,7 +194,7 @@ pub fn prove(bin: &[u8], name: &str, input: &[u8], expected: &[u8], dir: &Path) 
             );
             executed
         }
-        None => execute(bin, name, input, expected, dir)?,
+        None => execute(bin, name, input, expected, dir, po2)?,
     };
     ensure!(executed.journal == expected, "journal");
     let n = executed.segments;

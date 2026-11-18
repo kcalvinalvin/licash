@@ -88,24 +88,49 @@ LICASH_HP_INPUTS=$PWD/tmp/hp-inputs cargo test --release \
   --manifest-path regtest/Cargo.toml -p licash-hp export_inputs
 ```
 
-Then execute (journal and cycle count) or prove (succinct receipt, Groth16
-wrap, verified and exported as JSON with the 256-byte seal that
-`lichen_babe::risc0::proof_from_seal` reads):
+Then execute (journal and cycle count) or prove: a succinct receipt, its
+Groth16 wrap, verified and exported to `<work-dir>/proof.json` as JSON with
+the 256-byte seal that `lichen_babe::risc0::proof_from_seal` reads. The work
+directory keeps the prover's progress (each segment proved), so a stopped
+proof carries on where it was:
 
 ```sh
 licash=r0/host/target/release/licash-r0
 $licash hp-exec tmp/hp-inputs/answered.bin
-$licash hp-prove tmp/hp-inputs/answered.bin tmp/answered.json
+$licash hp-prove tmp/hp-inputs/answered.bin tmp/answered
+$licash probe
+$licash bench tmp/bench.json
 ```
+
+`probe` prints what the machine proves with (`cuda` or `cpu`, the programs
+installed, its memory) and what it lacks; `bench` proves two segments of
+`r0/host/bench.bin` (the answered input), then wraps them, and prints the
+seconds a segment takes and those of the wrap, as the hub plans its proofs
+on. A program is a path, or an image id installed in
+`$LICASH_R0_SHARE/programs/<id>.bin` (by default `../share/licash-r0` beside
+the binary); RISC Zero's Groth16 setup is in its `groth16/` directory
+(`stark_verify`, `stark_verify.dat`, `prover`, `stark_verify.cs`,
+`stark_verify_final.pk.dmp`, from `risczero/risc0-groth16-prover`), x86-64
+only. The hub's image (apps/hub/Dockerfile) installs both.
+
+Built with `--features cuda` and installed beside it as `licash-r0-cuda`,
+the CUDA build proves on the GPU: `licash-r0` uses it when
+`licash-r0-cuda probe-gpu` finds a usable GPU, in segments of 2^18, then
+2^17 should the GPU run out of memory (each attempt in a process of its
+own), and proves on the CPU in segments of 2^19 otherwise. The Groth16 wrap
+runs on the CPU either way. On an RTX 2060 (6 GB) the answered input proves
+in about 20 minutes; on 6 CPU cores, about 8.5 hours.
 
 `LICASH_SEGMENT_PO2` (13 to 20) sets the zkVM segment size.
 
 The answered input (a 20 kB filing, 32 settled notes, a 16-note spend as
-evidence) executes in about 68 M cycles (71 segments of 2^20). Cycles grow
+evidence) executes in about 68 M cycles (71 segments of 2^20). Each header
+of the exit adds about 28 k cycles: 3,000 more headers, 152 M cycles. Cycles grow
 with the signatures and DLEQ proofs a filing carries, so a filing at the
 64 kB limit is roughly three times that. The Hub proves only when it
 contests a claim: it responds with less than the claim, and asserts the
 proof within the graph's assert window.
 
-A hub proves on signet through `LICASH_HP_PROVER` (the host's
-`hp-prove`); no test plays a real proof on Bitcoin yet.
+A hub proves on signet through `licash-r0` (`LICASH_HP_PROVER` names
+another), one proof at a time (apps/hub/README.md); no test plays a real
+proof on Bitcoin yet.

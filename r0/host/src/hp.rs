@@ -3,24 +3,38 @@
 //! Groth16 seal the holder's garbling opens to. Each command also runs
 //! `licash_hp::check` natively, and a guest that disagrees with it is an
 //! error.
+//!
+//! A proof is made in a work directory, a stage at a time, each kept
+//! there: the succinct receipt (itself a segment at a time,
+//! [`crate::resumable`]), its `identity_p254` seal, the Groth16 wrap
+//! ([`crate::groth16`]), the export. Run again after any stop, it carries
+//! on where it stopped.
 
-use std::fs::read;
+use std::fs::{create_dir_all, read, remove_dir_all};
+use std::path::Path;
+use std::process::Command;
 use std::time::Instant;
 
 use anyhow::{bail, ensure, Context, Result};
 use licash_hp::HubInput;
-use risc0_zkvm::default_executor;
+use risc0_zkvm::sha::Digestible;
+use risc0_zkvm::{
+    compute_image_id, default_executor, get_prover_server, Groth16Receipt,
+    Groth16ReceiptVerifierParameters, InnerReceipt, ProverOpts, Receipt,
+};
+
+use crate::probe;
+use crate::resumable::keep;
 
 const NAME: &str = "hp";
 
-/// The packed guest, from `LICASH_R0_GUESTS` if set (a host moved to
-/// another machine), else from this checkout's.
-fn guest() -> Result<Vec<u8>> {
-    let dir = std::env::var("LICASH_R0_GUESTS")
-        .unwrap_or_else(|_| format!("{}/../guests", env!("CARGO_MANIFEST_DIR")));
-    let path = format!("{dir}/{NAME}.bin");
-    read(&path).with_context(|| format!("no packed guest at {path}: run r0/build-guest.sh {NAME}"))
-}
+/// Segment sizes on a GPU, the largest first: 2^18 cycles takes about 3 GB
+/// of its memory, 2^17 half that.
+pub const GPU_PO2: [u32; 2] = [18, 17];
+
+/// The segment size on a CPU: 2^19 cycles takes about 4.6 GB of memory,
+/// and is faster than 2^18.
+pub const CPU_PO2: u32 = 19;
 
 /// The journal the library computes for this input, or its refusal.
 fn expected(bytes: &[u8]) -> Result<Vec<u8>> {
@@ -28,12 +42,12 @@ fn expected(bytes: &[u8]) -> Result<Vec<u8>> {
     Ok(licash_hp::check(&input)?.to_vec())
 }
 
-pub fn exec(path: &str) -> Result<()> {
+pub fn exec(path: &str, program: Option<&str>) -> Result<()> {
     let bytes = read(path)?;
-    let bin = guest()?;
+    let bin = probe::program(program)?;
     let expected = expected(&bytes);
     let t = Instant::now();
-    let run = default_executor().execute(super::env_for(&bytes)?, &bin);
+    let run = default_executor().execute(super::env_for(&bytes, super::segment_override()?)?, &bin);
     let ms = t.elapsed().as_millis();
     match (run, expected) {
         (Ok(s), Ok(j)) => {
@@ -56,37 +70,127 @@ pub fn exec(path: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn prove(path: &str, out: &str) -> Result<()> {
+/// Prove the input at `path` with `program` in `work`, and export the
+/// proof to `work/proof.json`: on the GPU through the CUDA build if one is
+/// usable (a smaller segment size if the larger fails), else on the CPU.
+/// The Groth16 wrap runs on the CPU either way.
+pub fn prove(path: &str, work: &Path, program: Option<&str>) -> Result<()> {
     let bytes = read(path)?;
-    let bin = guest()?;
+    let bin = probe::program(program)?;
     let expected = expected(&bytes)?;
-    let receipt = super::prove_bytes(&bin, NAME, &bytes, &expected, true)?;
-    super::export_receipt(&bin, &receipt, out, expected.len())
-}
-
-/// The succinct (STARK) receipt only (Groth16 needs an x86 machine,
-/// [`wrap`]), carried on across runs in `dir`: run again after any stop,
-/// it goes on where it stopped.
-pub fn prove_succinct(path: &str, dir: Option<&str>) -> Result<()> {
-    let bytes = read(path)?;
-    let bin = guest()?;
-    let expected = expected(&bytes)?;
-    let dir = dir.map_or_else(|| format!("{path}.proof"), str::to_owned);
-    super::resumable::prove(&bin, NAME, &bytes, &expected, dir.as_ref())?;
+    create_dir_all(work)?;
+    let out = work.join("proof.json");
+    if out.exists() {
+        println!("{NAME}: proven already: {}", out.display());
+        return Ok(());
+    }
+    let start = Instant::now();
+    if !work.join("p254").exists() {
+        match probe::cuda_build().filter(|_| probe::gpu_usable()) {
+            Some(cuda) => {
+                let sizes = super::segment_override()?.map_or(GPU_PO2.to_vec(), |p| vec![p]);
+                let mut failed = None;
+                for po2 in sizes {
+                    let status = Command::new(&cuda)
+                        .arg("hp-stark")
+                        .arg(path)
+                        .arg(work)
+                        .arg(po2.to_string())
+                        .args(program)
+                        .status()
+                        .context("run the CUDA prover")?;
+                    if status.success() {
+                        failed = None;
+                        break;
+                    }
+                    println!("{NAME}: the GPU failed at segments of 2^{po2}: {status}");
+                    failed = Some(status);
+                }
+                if let Some(status) = failed {
+                    bail!("the GPU prover failed: {status}");
+                }
+            }
+            None => stark(
+                &bin,
+                &bytes,
+                &expected,
+                work,
+                super::segment_override()?.unwrap_or(CPU_PO2),
+            )?,
+        }
+    }
+    let succinct: Receipt = bincode::deserialize(&read(work.join("receipt"))?)?;
+    let claim = succinct
+        .inner
+        .succinct()
+        .context("a succinct receipt")?
+        .claim
+        .clone();
+    let p254 = read(work.join("p254"))?;
+    let seal = crate::groth16::wrap(&probe::groth16_dir(), &p254, &work.join("groth16"))?;
+    let groth16 = Groth16Receipt::new(
+        seal.to_vec(),
+        claim,
+        Groth16ReceiptVerifierParameters::default().digest(),
+    );
+    let receipt = Receipt::new(InnerReceipt::Groth16(groth16), succinct.journal.bytes);
+    keep(&out, &super::export(&bin, &receipt, &expected)?)?;
+    let _ = remove_dir_all(work.join("groth16"));
+    println!(
+        "{NAME}: verified and exported {} ({:.1} s this run)",
+        out.display(),
+        start.elapsed().as_secs_f64()
+    );
     Ok(())
 }
 
-/// A succinct receipt of the guest at `receipt`, wrapped in Groth16,
-/// verified and exported to `out`.
-pub fn wrap(receipt: &str, out: &str) -> Result<()> {
-    let bin = guest()?;
-    let succinct: risc0_zkvm::Receipt = bincode::deserialize(&read(receipt)?)?;
-    let id = risc0_zkvm::compute_image_id(&bin)?;
-    succinct.verify(id).context("not a receipt of this guest")?;
-    let journal = succinct.journal.bytes.len();
+/// The succinct receipt of `bin` on `bytes` in segments of 2^`po2`, kept
+/// as `work/receipt`, then its `identity_p254` seal, kept as `work/p254`,
+/// on this build's device.
+pub fn stark(bin: &[u8], bytes: &[u8], expected: &[u8], work: &Path, po2: u32) -> Result<()> {
+    let id = compute_image_id(bin)?;
+    let kept = work.join("receipt");
+    let succinct: Receipt = match read(&kept) {
+        Ok(b) => bincode::deserialize(&b)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let device = if cfg!(feature = "cuda") {
+                "cuda"
+            } else {
+                "cpu"
+            };
+            let dir = work.join(format!("stark-{device}-{po2}"));
+            let r = crate::resumable::prove(bin, NAME, bytes, expected, &dir, Some(po2))?;
+            keep(&kept, &bincode::serialize(&r)?)?;
+            // Its segments' work, and that of sizes that failed before.
+            for entry in std::fs::read_dir(work)? {
+                let path = entry?.path();
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if name.starts_with("stark-") {
+                    let _ = remove_dir_all(&path);
+                }
+            }
+            r
+        }
+        Err(e) => return Err(e.into()),
+    };
+    succinct.verify(id).context("the kept receipt")?;
+    ensure!(succinct.journal.bytes == expected, "journal");
     let t = Instant::now();
-    let opts = risc0_zkvm::ProverOpts::groth16();
-    let wrapped = risc0_zkvm::default_prover().compress(&opts, &succinct)?;
-    println!("{NAME}: groth16 wrap in {:.1} s", t.elapsed().as_secs_f64());
-    super::export_receipt(&bin, &wrapped, out, journal)
+    let inner = succinct.inner.succinct().context("a succinct receipt")?;
+    let ident = get_prover_server(&ProverOpts::succinct())?.identity_p254(inner)?;
+    keep(&work.join("p254"), &ident.get_seal_bytes())?;
+    println!(
+        "{NAME}: identity_p254 in {:.1} s",
+        t.elapsed().as_secs_f64()
+    );
+    Ok(())
+}
+
+/// `hp-stark`, the CUDA build's part of [`prove`].
+pub fn stark_command(path: &str, work: &Path, po2: &str, program: Option<&str>) -> Result<()> {
+    let bytes = read(path)?;
+    let bin = probe::program(program)?;
+    let expected = expected(&bytes)?;
+    let po2 = super::segment_limit(Some(po2))?.context("a segment size")?;
+    stark(&bin, &bytes, &expected, work, po2)
 }
