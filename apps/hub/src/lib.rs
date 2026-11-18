@@ -7,6 +7,7 @@ pub mod deposit;
 pub mod inbox;
 pub mod lightning;
 pub mod notify;
+pub mod payouts;
 pub mod peer;
 pub mod tweaks;
 pub mod watch;

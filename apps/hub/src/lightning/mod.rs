@@ -28,7 +28,7 @@ mod receive;
 use std::{
     collections::{HashMap, HashSet},
     path::Path,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
 
@@ -41,7 +41,7 @@ pub use licash_lightning::{
     lnd, Attempt, Call, Currency, Held, HeldState, Liquidity, Node, NodeInfo, Status,
 };
 
-use crate::{peer::Peer, Failure};
+use crate::{payouts::Guard, peer::Peer, Failure};
 
 /// What the gateway charges, the amounts it takes and its timing, in
 /// satoshis, blocks and seconds.
@@ -183,6 +183,8 @@ pub struct Gateway {
     alerted: Mutex<HashSet<String>>,
     /// The deposits, if the hub takes them.
     pub(crate) peer: Peer,
+    /// The watch over the hub's payments out, if it runs one.
+    guard: OnceLock<Arc<Guard>>,
 }
 
 /// The node and the hub on the same chain: the node's view, and the
@@ -219,7 +221,20 @@ impl Gateway {
             identity: Mutex::default(),
             alerted: Mutex::default(),
             peer: Peer::default(),
+            guard: OnceLock::new(),
         })
+    }
+
+    /// Pay no invoice while `guard` has the hub's payments out paused:
+    /// each is refused, which refunds its lock, and one not yet started is
+    /// started no more. Receipts are taken as ever.
+    pub fn guard_with(&self, guard: Arc<Guard>) {
+        let _ = self.guard.set(guard);
+    }
+
+    /// Whether the hub's payments out are paused.
+    fn paused(&self) -> bool {
+        self.guard.get().is_some_and(|guard| guard.paused())
     }
 
     /// What the hub's info says of the gateway: nothing until its node
@@ -230,7 +245,15 @@ impl Gateway {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()?;
-        Some(self.config.lightning(node))
+        let lightning = self.config.lightning(node);
+        // Said before a wallet locks notes for an invoice refused.
+        Some(match self.paused() {
+            true => Lightning {
+                max_pay: 0,
+                ..lightning
+            },
+            false => lightning,
+        })
     }
 
     /// Follow payments and receipts until the task is dropped.

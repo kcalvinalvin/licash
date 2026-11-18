@@ -11,6 +11,10 @@ use lightning_invoice::Bolt11Invoice;
 use super::{now, refused, Gateway, View};
 use crate::Failure;
 
+/// Why an invoice is refused while the hub's payments out are paused
+/// ([`crate::payouts`]).
+const PAUSED: &str = "the gateway's payments out are paused";
+
 impl Gateway {
     /// Pay the invoice of `body` for its lock, or say where its payment
     /// stands. An invoice the gateway does not pay for the lock fails the
@@ -54,6 +58,9 @@ impl Gateway {
         let (hash, node) = (*invoice.payment_hash().as_ref(), view.info.pubkey.clone());
         if hex::encode(invoice.get_payee_pub_key().serialize()) == node {
             return self.fulfill(id, &invoice, &view, expiry).await;
+        }
+        if self.paused() {
+            return self.refuse(id, hash, request, node, PAUSED).await;
         }
         let least = match self.payable(&invoice, &view, expiry) {
             Ok(msat) => self.config.lightning(node.clone()).pay_lock(msat),
@@ -243,8 +250,12 @@ impl Gateway {
     /// still be paid in time, and is one the gateway pays, for no more
     /// than its lock pays the hub. A forward recorded pending though
     /// refused, as a refusal was recorded before it failed at once, is
-    /// never started: given up as one too late.
+    /// never started: given up as one too late. Nor is any while the
+    /// hub's payments out are paused.
     fn resend(&self, forward: &Forward, view: &View) -> Option<(u32, u64)> {
+        if self.paused() {
+            return None;
+        }
         let invoice: Bolt11Invoice = forward.request.parse().ok()?;
         let msat = self.payable(&invoice, view, forward.expiry).ok()?;
         let limit = self.cltv_limit(forward.expiry, view.tip, &invoice)?;

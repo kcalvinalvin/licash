@@ -893,3 +893,48 @@ fn the_operator_is_notified_of_starts_and_stops() {
     assert!(until("stop", || running.0.try_wait().unwrap()).success());
     assert_eq!(taken(), ["north: Hub started", "north: Hub stopped"]);
 }
+
+/// The hub watches what it pays out from its first run, pausing nothing
+/// on what it never kept; a `payouts.json` that does not read pauses and
+/// alerts, until the operator resumes.
+#[test]
+fn payments_out_are_watched_and_resumed_by_the_operator() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("hub");
+    stdout(&data, &["init", "--max-pow", "6"]);
+    let file = data.join("payouts.json");
+    let kept =
+        || -> serde_json::Value { serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap() };
+    let clear = serde_json::json!({"baseline": [], "paused": null});
+    let alerts = || {
+        let events = stdout(&data, &["events"]);
+        events.lines().filter(|l| l.contains("alert")).count()
+    };
+
+    // A hub that never ran the watch: kept at its first look, no alert.
+    let running = serving(&data, free_port(), &[]);
+    until("watched", || file.exists().then_some(()));
+    assert_eq!(kept(), clear);
+    assert_eq!(alerts(), 0);
+    drop(running);
+
+    // What does not read pauses, told once, and is not written over.
+    std::fs::write(&file, b"{").unwrap();
+    let running = serving(&data, free_port(), &[]);
+    until("alerted", || (alerts() == 1).then_some(()));
+    assert!(stdout(&data, &["events"]).contains("payouts.json does not read"));
+    assert_eq!(std::fs::read(&file).unwrap(), b"{");
+    // Resumed beside the running hub.
+    let resumed = stdout(&data, &["resume-payouts"]);
+    assert!(
+        resumed.starts_with("Lightning payments out resumed. They were paused: payouts.json"),
+        "{resumed}"
+    );
+    assert_eq!(kept(), clear);
+    drop(running);
+    assert_eq!(
+        stdout(&data, &["resume-payouts"]).lines().next(),
+        Some("Lightning payments out were not paused.")
+    );
+    assert_eq!(alerts(), 1);
+}

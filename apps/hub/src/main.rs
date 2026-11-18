@@ -21,7 +21,7 @@ use licash_hub_service::{
     inbox::Inbox,
     lightning::{lnd::Lnd, Config, Gateway},
     notify::{self, Notifier},
-    peer,
+    payouts, peer,
     tweaks::{self, Tweaks},
     watch::watch,
     Services,
@@ -950,6 +950,13 @@ enum Command {
         #[arg(long)]
         url: Option<String>,
     },
+    /// Resume the Lightning payments out the hub paused on finding notes
+    /// retired that its ledger never issued, beside the running hub (which
+    /// resumes within half a minute) or without it. What its ledger shows
+    /// now is taken as known: more found later pause again. Look at the
+    /// alert and the ledger first: such notes were made with the hub's
+    /// seed outside it.
+    ResumePayouts,
     /// The hub's events as JSON lines, oldest first.
     Events {
         /// Only events after this sequence number.
@@ -1110,11 +1117,14 @@ fn command(cli: Cli) -> anyhow::Result<()> {
             if depositing.is_none() {
                 check_gateway_idle(&hub, &cli.data.join("deposits.sqlite"), true)?;
             }
+            // Paused as it was when the hub stopped, before anything is paid.
+            let guard = payouts::Guard::open(&cli.data);
             let gateway = match lightning {
                 Some((lnd, config)) => {
                     let path = cli.data.join("lightning.sqlite");
                     let gateway = Gateway::open(hub.clone(), Arc::new(lnd), config, &path)
                         .context("open the Lightning gateway")?;
+                    gateway.guard_with(guard.clone());
                     Some(Arc::new(gateway))
                 }
                 None => None,
@@ -1321,6 +1331,7 @@ fn command(cli: Cli) -> anyhow::Result<()> {
                 chain,
                 notifier,
                 gateway,
+                guard,
                 deposits,
                 announcing,
                 tweaks: tweaks.map(|index| (index, tweaks_from)),
@@ -1331,6 +1342,7 @@ fn command(cli: Cli) -> anyhow::Result<()> {
         }
         Command::TestNotify { notify } => test_notify(&notify),
         Command::Status { json, details } => status(&db, json, details),
+        Command::ResumePayouts => resume_payouts(&cli.data),
         Command::Dashboard { dashboard, url } => show(&cli.data, dashboard, url),
         Command::Events {
             after,
@@ -1609,6 +1621,8 @@ struct Tasks {
     chain: Option<(Source, ChainProfile, Duration)>,
     notifier: Option<Notifier>,
     gateway: Option<Arc<Gateway>>,
+    /// The watch over the hub's payments out.
+    guard: Arc<payouts::Guard>,
     deposits: Option<Arc<deposit::Gateway>>,
     announcing: Option<Announcing>,
     /// With the first block to index if the index is new.
@@ -1639,6 +1653,7 @@ async fn serve(
         chain,
         notifier,
         gateway,
+        guard,
         deposits,
         announcing,
         tweaks,
@@ -1688,6 +1703,12 @@ async fn serve(
         }
         None => tracing::warn!("following no chain (--chain): locks are refused"),
     }
+    if guard.paused() {
+        tracing::error!(
+            "Lightning payments out are paused (payouts.json): `licash-hub resume-payouts` resumes them"
+        );
+    }
+    critical.spawn("the watch over payments out", guard.run(hub.clone()));
     if let Some(gateway) = gateway.clone() {
         tracing::info!("running a Lightning gateway");
         critical.spawn("the Lightning gateway", gateway.run());
@@ -1792,6 +1813,25 @@ impl Critical {
             Some(Err(e)) => format!("{} was cancelled", name(e.id())),
         }
     }
+}
+
+fn resume_payouts(data: &Path) -> anyhow::Result<()> {
+    let (paused, now) = payouts::resume(data)?;
+    match paused {
+        Some(why) => println!("Lightning payments out resumed. They were paused: {why}."),
+        None => println!("Lightning payments out were not paused."),
+    }
+    for e in &now.baseline {
+        println!(
+            "known: {} notes of {} sat of keyset {} retired beyond those issued",
+            e.notes, e.denom, e.keyset
+        );
+    }
+    println!(
+        "A running hub takes this within {} s.",
+        payouts::EVERY.as_secs()
+    );
+    Ok(())
 }
 
 fn test_notify(notify: &Notify) -> anyhow::Result<()> {

@@ -79,7 +79,8 @@ pub(super) fn report(r: &Records, now: i64, service: Check, data: &Path) -> Repo
     let mut series = flows(r);
     series.extend(levels(r));
     let failures = failures(&series[2]);
-    let checks = checks(r, &state, now, service);
+    let mut checks = checks(r, &state, now, service);
+    checks.push(payouts(r, data));
     // Where its records are; how far it follows the chain is its health's.
     let subtitle = data.display().to_string();
     let pages = vec![
@@ -846,6 +847,34 @@ fn alerts(r: &Records) -> Table {
     }
     rows.reverse();
     Table::in_range("Alerts", &["when", "what"], rows, "no alert")
+}
+
+/// Whether the hub's payments out are paused, as `data` keeps it
+/// ([`crate::payouts`]), and the notes the ledger retired beyond those it
+/// issued.
+fn payouts(r: &Records, data: &Path) -> Check {
+    let beyond: u64 = r.notes.excess().iter().map(|e| e.notes).sum();
+    let paused = match crate::payouts::kept(data) {
+        Ok(Some(kept)) => kept.paused,
+        Ok(None) if beyond == 0 => {
+            return Check::new("Payouts", Tone::Muted, "not watched yet");
+        }
+        Ok(None) => None,
+        Err(_) => Some("payouts.json does not read".into()),
+    };
+    match (paused, beyond) {
+        (Some(why), _) => Check::new(
+            "Payouts",
+            Tone::Bad,
+            format!("Lightning payments out paused: {why}"),
+        ),
+        (None, 0) => Check::new("Payouts", Tone::Good, "every note retired was issued"),
+        (None, n) => Check::new(
+            "Payouts",
+            Tone::Warn,
+            format!("{n} notes retired beyond those issued, taken as known"),
+        ),
+    }
 }
 
 fn checks(r: &Records, state: &Now, now: i64, service: Check) -> Vec<Check> {

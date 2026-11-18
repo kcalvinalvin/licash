@@ -2,7 +2,7 @@
 //! ([`Ledger`]): notes issued and retired, locks, payments outside the
 //! ledger and the chain as scanned. Read-only, as `Ledger` is.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use licash::note::Note;
 use rusqlite::OptionalExtension;
@@ -88,6 +88,42 @@ pub struct Notes {
     pub movements: Vec<Movement>,
     /// By keyset then denomination.
     pub unlinks: Vec<Unlinks>,
+}
+
+/// Of one keyset's notes of one denomination: how many more the ledger
+/// retired of holders than it issued them ([`Notes::excess`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Excess {
+    /// The keyset's index.
+    pub keyset: u32,
+    pub denom: u64,
+    pub notes: u64,
+}
+
+impl Notes {
+    /// By keyset then denomination, the notes of holders retired beyond
+    /// those issued to them. A note is issued before it is retired, so
+    /// there are none while the ledger issued every note it took: any was
+    /// made with the keyset's secret outside it, as by whoever else holds
+    /// the hub's seed. The hub's own notes are left out: what such a note
+    /// pays the hub is issued too, and would hide it. None tells little:
+    /// such notes show only once more of a denomination were retired than
+    /// holders ever held of it.
+    pub fn excess(&self) -> Vec<Excess> {
+        let mut retired: BTreeMap<(u32, u64), i64> = BTreeMap::new();
+        for m in self.movements.iter().filter(|m| !m.hub) {
+            *retired.entry((m.keyset, m.denom)).or_default() += if m.issued { -1 } else { 1 };
+        }
+        retired
+            .into_iter()
+            .filter(|(_, notes)| *notes > 0)
+            .map(|((keyset, denom), notes)| Excess {
+                keyset,
+                denom,
+                notes: notes as u64,
+            })
+            .collect()
+    }
 }
 
 fn id(bytes: Vec<u8>) -> Result<[u8; 32], Error> {

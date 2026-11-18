@@ -58,7 +58,7 @@ use store::{now, setup_io, Store};
 
 pub use forwards::{Forward, Forwarded, LOCAL};
 pub use locks::{Lock, Settled, Timing};
-pub use records::{ForwardRecord, LockRecord, Movement, Notes, Unlinks};
+pub use records::{Excess, ForwardRecord, LockRecord, Movement, Notes, Unlinks};
 
 /// The largest denomination exponent a hub issues: its ledger keeps
 /// denominations as SQLite integers.

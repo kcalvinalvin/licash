@@ -20,7 +20,9 @@ use licash::{
     spend::{lock_hash, ChainProfile, Output, Proposal, ProposalId, TimedLock, TimedTerms},
     unlink::{Nonce, Session},
 };
-use licash_hub::{Error, Fee, Forwarded, Hub, Ledger, Notice, Policy, Refusal, Settled, Timing};
+use licash_hub::{
+    Error, Excess, Fee, Forwarded, Hub, Ledger, Notice, Policy, Refusal, Settled, Timing,
+};
 
 const MAX_POW: u32 = 6;
 const SECRET: [u8; 32] = [7; 32];
@@ -1359,4 +1361,56 @@ fn the_ledger_reads_back_locks_forwards_and_the_notes_they_moved() {
     // Each payer's 4, but none of the own lock's inputs.
     assert_eq!((value(false, false), value(false, true)), (12, 0));
     assert!(notes.unlinks.is_empty());
+}
+
+/// Notes made with the hub's keys outside its ledger show once it retired
+/// more of a denomination than it ever issued to holders: as these tests'
+/// payers' notes are made ([`mint`]). The inputs of its own locks, which
+/// were never notes, show nothing.
+#[test]
+fn the_ledger_counts_the_notes_it_retired_beyond_those_it_issued() {
+    let (files, hub, chain) = setup(policy());
+    let (_, keyset) = issuer(&files);
+    let excess = || Ledger::open(&files.db).unwrap().notes().unwrap().excess();
+    assert_eq!(excess(), []);
+    let expiry = chain.height() + 5;
+    // Its own lock, paid: Alice's 4, issued by the ledger.
+    let e = Ephemeral::random();
+    let d = e.derive(&owner(3).address(), 4, Branch::Pay, 0).unwrap();
+    let own = hub
+        .lock_own(
+            keyset.id(),
+            e.public(),
+            vec![Output::from_derivation(&d).unwrap()],
+            terms(&hub, expiry, 1),
+        )
+        .unwrap()
+        .proposal
+        .id();
+    hub.settle(&own, &SECRET).unwrap();
+    assert_eq!(excess(), []);
+    // A payer's 4, of no issuance of the ledger's, shows nothing while
+    // Alice's is outstanding; another is one beyond all it issued.
+    let forged = standard(&files, &hub, terms(&hub, expiry, 1));
+    hub.lock(&forged.signed, &forged.notes).unwrap();
+    let one = Excess {
+        keyset: 0,
+        denom: 4,
+        notes: 1,
+    };
+    assert_eq!(excess(), []);
+    let another = standard(&files, &hub, terms(&hub, expiry, 1));
+    hub.lock(&another.signed, &another.notes).unwrap();
+    assert_eq!(excess(), [one]);
+    // Paid, it issues Bob 2 and 1 and the hub 1: none of 4.
+    hub.settle(&forged.id(), &SECRET).unwrap();
+    assert_eq!(excess(), [one]);
+    // One paying the hub 4, as for an invoice: the hub's own 4 is no
+    // holder's, and hides nothing.
+    let paying = to_hub(&files, &hub, terms(&hub, expiry, 1));
+    hub.lock(&paying.signed, &paying.notes).unwrap();
+    hub.forward(&paying.id(), &lock_hash(&SECRET), "lnbcrt1", "node", 4)
+        .unwrap();
+    hub.forward_paid(&paying.id(), &SECRET).unwrap();
+    assert_eq!(excess(), [Excess { notes: 2, ..one }]);
 }

@@ -1137,3 +1137,201 @@ async fn the_dashboard_reads_payments_fees_failures_and_notes_from_the_records()
     let at: Vec<_> = recent.rows.iter().map(|r| r.at.unwrap()).collect();
     assert!(at.is_sorted_by(|a, b| a >= b), "{at:?}");
 }
+
+/// A payment of `amount` to `to`, its fee paid, from notes made with the
+/// hub's seed outside its ledger: as whoever else held the seed would.
+fn forged(net: &Net, to: &licash::address::Address, amount: u64) -> licash_api::Payment {
+    use licash::address::{Ephemeral, OwnerKeys};
+    use licash::authorization::{Authorization, SignedProposal};
+    use licash::claim::Branch;
+    use licash::note::{Evidence, IssuerKeys, Note};
+    use licash::spend::{Output, Proposal};
+    use licash::unlink::Nonce;
+
+    let split = |mut amount: u64| {
+        let mut denoms = Vec::new();
+        while amount > 0 {
+            let d = 1u64 << (63 - amount.leading_zeros());
+            denoms.push(d);
+            amount -= d;
+        }
+        denoms
+    };
+    let text = std::fs::read_to_string(net.dir.path().join("seed")).unwrap();
+    let mut seed = [0; 32];
+    hex::decode_to_slice(text.trim(), &mut seed).unwrap();
+    let keys = IssuerKeys::from_seed(&seed, 0, MAX_POW).unwrap();
+    let keyset = keys.keyset().unwrap();
+    let info = net.hub.info();
+    let mut total = amount;
+    while amount + info.policy.spend.due(total) != total {
+        total = amount + info.policy.spend.due(total);
+    }
+    let payer = OwnerKeys::from_seed(&[0xfa; 32]).unwrap();
+    let mut inputs = Vec::new();
+    for denom in split(total) {
+        let d = Ephemeral::random()
+            .derive(&payer.address(), denom, Branch::Pay, 0)
+            .unwrap();
+        let output = Output::from_derivation(&d).unwrap();
+        let proof = keys.prove_blinded(denom, output.blinded()).unwrap();
+        let note = Note::from_parts(
+            &keyset,
+            *keyset.id(),
+            d.message().clone(),
+            proof.open_point(&keyset, &d).unwrap(),
+            Evidence::Linked {
+                dleq: proof.dleq(),
+                blinding: *d.blinding(),
+                commit: Nonce::new(&keyset, &output).unwrap().commit().unwrap(),
+            },
+        )
+        .unwrap();
+        inputs.push((note, d));
+    }
+    let notes: Vec<Note> = inputs.iter().map(|(note, _)| note.clone()).collect();
+    let ephemeral = Ephemeral::random();
+    let to_hub = split(total - amount)
+        .into_iter()
+        .map(|d| (d, &info.address));
+    let outputs = split(amount)
+        .into_iter()
+        .map(|d| (d, to))
+        .chain(to_hub)
+        .enumerate()
+        .map(|(i, (d, to))| {
+            Output::from_derivation(&ephemeral.derive(to, d, Branch::Pay, i).unwrap()).unwrap()
+        })
+        .collect();
+    let proposal = Proposal::new(&keyset, &notes, ephemeral.public(), outputs, None).unwrap();
+    let grant = net.hub.offer(&proposal, &notes).unwrap();
+    let owners: Vec<_> = inputs
+        .iter()
+        .map(|(_, d)| d.ownership().owner_secret(payer.spend_secret()).unwrap())
+        .collect();
+    let signed = SignedProposal::sign(
+        &keyset,
+        proposal,
+        &notes,
+        Authorization::Granted(Box::new(grant)),
+        &owners,
+    )
+    .unwrap();
+    let unlock = net.hub.release(&signed, &notes).unwrap();
+    licash_api::Payment::new(HUB, &signed, &notes, &unlock)
+}
+
+/// Notes made with the hub's seed outside its ledger, paid out over
+/// Lightning, pause the gateway's payments out once the ledger retired
+/// more than it issued: invoices are refused, their locks refunded, and
+/// wallets told it pays none, until the operator resumes them. What the
+/// ledger issued itself, paid in, paid out and refunded, pauses nothing.
+#[tokio::test]
+async fn notes_the_ledger_never_issued_pause_payments_out_until_resumed() {
+    use licash_hub_service::payouts::{self, Guard};
+
+    let net = Net::new().await;
+    let guard = Guard::open(net.dir.path());
+    net.gateway.guard_with(guard.clone());
+    let excess = || {
+        let ledger = licash_hub::Ledger::open(&net.dir.path().join("hub.sqlite")).unwrap();
+        ledger.notes().unwrap().excess()
+    };
+    let invoice = |sat: u64, n: u8, outcome: fn([u8; 32]) -> Outcome| {
+        let preimage = [n; 32];
+        let request = net
+            .node
+            .invoice(sat * 1000, lock_hash(&preimage), 18, outcome(preimage));
+        (request, preimage)
+    };
+    let fail = |_| Outcome::Fail("FAILURE_REASON_NO_ROUTE".to_owned());
+
+    // Paid in, paid out and refunded, of notes the ledger issued.
+    let alice = net.funded("alice", 40).await;
+    let (request, preimage) = invoice(10, 1, Outcome::Pay);
+    let lock = alice.pay_invoice(HUB, &request).await.unwrap();
+    net.gateway.round().await;
+    let lock = alice.follow_lock(&lock.id).await.unwrap();
+    assert_eq!(lock.state, LockState::Paid(preimage));
+    let (request, _) = invoice(10, 2, fail);
+    let lock = alice.pay_invoice(HUB, &request).await.unwrap();
+    net.gateway.round().await;
+    let lock = alice.follow_lock(&lock.id).await.unwrap();
+    assert_eq!(lock.state, LockState::Refunded);
+    assert_eq!(excess(), []);
+    assert_eq!(guard.check(), Vec::<String>::new());
+    assert!(!guard.paused());
+    assert_eq!(net.info().await.lightning.unwrap().max_pay, 100);
+
+    // Mallory's 60, of notes the ledger never issued, paid out 18 at a
+    // time: more than Alice holds, so more than the ledger issued.
+    let mallory = net.wallet("mallory");
+    mallory.add_hub(HUB).await.unwrap();
+    mallory
+        .receive(&forged(&net, &mallory.address(), 60))
+        .unwrap();
+    let mut alerts = Vec::new();
+    let mut paid = 0;
+    for n in 3..6 {
+        let (request, preimage) = invoice(18, n, Outcome::Pay);
+        let lock = mallory.pay_invoice(HUB, &request).await.unwrap();
+        net.gateway.round().await;
+        let lock = mallory.follow_lock(&lock.id).await.unwrap();
+        assert_eq!(lock.state, LockState::Paid(preimage));
+        paid += 1;
+        alerts = guard.check();
+        if !alerts.is_empty() {
+            break;
+        }
+    }
+    assert!(
+        alerts.len() == 1 && alerts[0].contains("payments out are paused"),
+        "{paid} paid: {alerts:?}"
+    );
+    assert!(guard.paused() && !excess().is_empty());
+    // Told once, and kept across a restart.
+    assert_eq!(guard.check(), Vec::<String>::new());
+    assert!(Guard::open(net.dir.path()).paused());
+
+    // Wallets are told it pays none; a lock made anyway is refunded.
+    assert_eq!(net.info().await.lightning.unwrap().max_pay, 0);
+    let (request, _) = invoice(10, 7, Outcome::Pay);
+    assert!(alice.pay_invoice(HUB, &request).await.is_err());
+    let before = available(&alice);
+    let sent = net.node.sent().len();
+    let address = net.info().await.address;
+    let hash = *request
+        .parse::<Bolt11Invoice>()
+        .unwrap()
+        .payment_hash()
+        .as_ref();
+    let lock = alice.lock(HUB, &address, 12, hash, None).await.unwrap();
+    let id = proposal_id(&lock.id);
+    let paying: Paying = post(&net, licash_api::LN_PAY, &Pay::new(&id, &request)).await;
+    assert_eq!(paying.state, PayState::Failed);
+    assert_eq!(
+        net.hub.forward_of(&id).unwrap().unwrap().state,
+        licash_hub::Forwarded::Failed("the gateway's payments out are paused".into())
+    );
+    net.gateway.round().await;
+    assert_eq!(net.node.sent().len(), sent);
+    let lock = alice.follow_lock(&lock.id).await.unwrap();
+    assert_eq!(lock.state, LockState::Refunded);
+    assert_eq!(available(&alice), before);
+    // Receipts are taken as ever.
+    net.funded("bob", 10).await;
+
+    // Resumed by the operator, beside the running hub: at its next look.
+    let (was, now) = payouts::resume(net.dir.path()).unwrap();
+    assert!(was.unwrap().contains("never issued"));
+    assert_eq!((now.baseline, now.paused), (excess(), None));
+    assert!(guard.paused());
+    assert_eq!(guard.check(), Vec::<String>::new());
+    assert!(!guard.paused());
+    assert_eq!(net.info().await.lightning.unwrap().max_pay, 100);
+    let (request, preimage) = invoice(10, 8, Outcome::Pay);
+    let lock = alice.pay_invoice(HUB, &request).await.unwrap();
+    net.gateway.round().await;
+    let lock = alice.follow_lock(&lock.id).await.unwrap();
+    assert_eq!(lock.state, LockState::Paid(preimage));
+}
