@@ -256,3 +256,27 @@ fn the_preimage_is_read_from_a_claim_and_from_nothing_else() {
         .unwrap();
     assert_eq!(htlc.preimage_in(&refund, funding()), None);
 }
+
+#[test]
+fn a_claim_is_told_from_a_refund_whatever_it_pays() {
+    let htlc = htlc();
+    let rate = FeeRate::from_sat_per_vb(2).unwrap();
+    let higher = FeeRate::from_sat_per_vb(20).unwrap();
+    for claim in [
+        htlc.claim_tx(funding(), VALUE, to(), rate, &secret(1), &[7; 32])
+            .unwrap(),
+        htlc.claim_capped(funding(), VALUE, to(), higher, &secret(1), &[7; 32])
+            .unwrap(),
+    ] {
+        assert!(htlc.claimed_by(&claim, funding()));
+        let other = OutPoint {
+            vout: 0,
+            ..funding()
+        };
+        assert!(!htlc.claimed_by(&claim, other));
+    }
+    let refund = htlc
+        .refund_tx(funding(), VALUE, to(), rate, &secret(2))
+        .unwrap();
+    assert!(!htlc.claimed_by(&refund, funding()));
+}

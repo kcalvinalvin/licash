@@ -6,7 +6,7 @@
 //! before when it pays more ([`replaces`]): a rate fixed once, the mempool's
 //! floor rising past it, would leave it unmined past its deadline.
 
-use bitcoin::{Amount, FeeRate};
+use bitcoin::{Amount, FeeRate, Transaction};
 
 /// Blocks left from which the rate rises above the estimate.
 const RISE_FROM: u32 = 12;
@@ -40,9 +40,86 @@ pub fn replaces(fee: Amount, vsize: u64, old: Amount) -> bool {
         .is_some_and(|least| fee >= least)
 }
 
+/// The spend of a coin worth `value` to broadcast in place of `old`, the
+/// one made before if any, now that the rate to pay is `rate`: `build`
+/// makes it at a rate. None while `old` pays as much as `rate` would, or
+/// nothing `build` makes pays enough more to replace it; at the least rate
+/// that replaces it if `rate` pays more than `old` but too little to.
+pub fn remake<E>(
+    old: Option<&Transaction>,
+    value: Amount,
+    rate: FeeRate,
+    build: impl Fn(FeeRate) -> Result<Transaction, E>,
+) -> Result<Option<Transaction>, E> {
+    let fee = |tx: &Transaction| {
+        let paid = tx.output.iter().map(|o| o.value).sum();
+        value.checked_sub(paid).unwrap_or(Amount::ZERO)
+    };
+    let mut tx = build(rate)?;
+    let Some(old) = old else {
+        return Ok(Some(tx));
+    };
+    if fee(&tx) <= fee(old) {
+        return Ok(None);
+    }
+    if !replaces(fee(&tx), tx.vsize() as u64, fee(old)) {
+        let least = fee(old).to_sat().saturating_add(tx.vsize() as u64);
+        let per_kwu = least
+            .saturating_mul(1_000)
+            .div_ceil(tx.weight().to_wu().max(1));
+        tx = build(FeeRate::from_sat_per_kwu(per_kwu))?;
+    }
+    Ok(replaces(fee(&tx), tx.vsize() as u64, fee(old)).then_some(tx))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bitcoin::{absolute::LockTime, transaction, OutPoint, ScriptBuf, TxIn, TxOut, Witness};
+
+    /// A spend of a coin of 10,000 at `rate`, all of it but 330 at most.
+    fn spend(rate: FeeRate) -> Result<Transaction, ()> {
+        let mut tx = Transaction {
+            version: transaction::Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                witness: Witness::from_slice(&[[0u8; 116]]),
+                ..Default::default()
+            }],
+            output: vec![TxOut {
+                value: Amount::ZERO,
+                script_pubkey: ScriptBuf::new_op_return([0; 8]),
+            }],
+        };
+        let fee = rate.fee_wu(tx.weight()).ok_or(())?;
+        let left = Amount::from_sat(10_000).checked_sub(fee);
+        tx.output[0].value = left.unwrap_or(Amount::ZERO).max(Amount::from_sat(330));
+        Ok(tx)
+    }
+
+    #[test]
+    fn a_spend_is_made_again_once_the_rate_rises_past_its_own() {
+        let value = Amount::from_sat(10_000);
+        let first = remake(None, value, TWO, spend).unwrap().unwrap();
+        assert_eq!(first.vsize(), 100);
+        // Its rate, or less: kept.
+        assert_eq!(remake(Some(&first), value, TWO, spend).unwrap(), None);
+        assert_eq!(remake(Some(&first), value, ONE, spend).unwrap(), None);
+        let fee = |tx: &Transaction| 10_000 - tx.output[0].value.to_sat();
+        // A little more: at what replaces it, its fee and a sat a vbyte.
+        let three = FeeRate::from_sat_per_vb_u32(3);
+        let next = remake(Some(&first), value, three, spend).unwrap().unwrap();
+        assert_eq!(fee(&next), fee(&first) + 100);
+        let more = FeeRate::from_sat_per_vb_u32(9);
+        let next = remake(Some(&next), value, more, spend).unwrap().unwrap();
+        assert_eq!(fee(&next), 900);
+        // All of it but dust, then nothing more to replace it with: kept.
+        let all = FeeRate::from_sat_per_vb_u32(200);
+        let last = remake(Some(&next), value, all, spend).unwrap().unwrap();
+        assert_eq!(fee(&last), 10_000 - 330);
+        assert_eq!(remake(Some(&last), value, all, spend).unwrap(), None);
+    }
 
     const TWO: FeeRate = FeeRate::from_sat_per_vb_u32(2);
     const ONE: FeeRate = FeeRate::from_sat_per_vb_u32(1);

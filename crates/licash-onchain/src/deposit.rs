@@ -202,6 +202,19 @@ impl Htlc {
         })
     }
 
+    /// Whether `tx` spends `outpoint` by the claim's script: a claim of
+    /// the claimer's, whichever it made, not the payer's refund.
+    pub fn claimed_by(&self, tx: &Transaction, outpoint: OutPoint) -> bool {
+        tx.input
+            .iter()
+            .find(|i| i.previous_output == outpoint)
+            .and_then(|i| i.witness.taproot_leaf_script())
+            .is_some_and(|leaf| {
+                leaf.version == LeafVersion::TapScript
+                    && leaf.script == self.claim_script().as_script()
+            })
+    }
+
     fn check_preimage(&self, preimage: &[u8; 32]) -> Result<(), Error> {
         if bitcoin::hashes::sha256::Hash::hash(preimage).to_byte_array() != self.hash {
             return Err(Error::Preimage);
