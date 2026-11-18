@@ -4,8 +4,10 @@
 //! offline: the provider pays each donation in notes at the code's hub,
 //! kept there for the wallet or mailed to it.
 //!
-//! Once shown, its provider is kept ([`Pinned`], in the app's file) and
-//! shown again while it takes donations, as an address handed out stays:
+//! Once shown, its provider and code are kept ([`Pinned`], in the app's
+//! file) and shown again while it takes donations, as an address handed
+//! out stays: the code while it pays the wallet at hubs it trusts, hubs
+//! added since or not ([`licash_wallet::Wallet::donation_code`]); the provider
 //! another, cheaper or holding more, takes its place only when it says it
 //! takes no more ([`Asked::Refused`]), or once it failed to take any for
 //! [`PATIENCE`] while another can now. Unheard, it is shown all the same,
@@ -18,7 +20,7 @@ use std::{
 
 use licash_api::swaps::Donations;
 use licash_nostr::wallet::{donation_providers_with, hub_relays, DonationProvider};
-use licash_wallet::MAX_HUBS;
+use licash_wallet::LicashCode;
 use serde::{Deserialize, Deserializer, Serialize};
 
 use super::Wallet;
@@ -43,16 +45,20 @@ pub(crate) struct Pinned {
     /// little, if it does now (unix seconds).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failing_since: Option<u64>,
+    /// The code in the address, as text: none, the one the wallet shows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
 }
 
 impl Pinned {
-    fn of(found: &DonationProvider) -> Self {
+    fn of(found: &DonationProvider, code: &LicashCode) -> Self {
         Self {
             url: found.url.clone(),
             key: found.key.clone(),
             name: found.name.clone(),
             donations: found.address.donations.clone(),
             failing_since: None,
+            code: Some(code.to_string()),
         }
     }
 
@@ -188,44 +194,46 @@ impl Wallet {
     /// ([`Wallet::keep_donation_address`]).
     pub fn donation_address(&self) -> Result<Option<DonationAddress>, LicashError> {
         let pinned = self.kept().donations;
-        let kept = pinned.map(|pin| {
-            let asked = self.runtime.block_on(self.wallet.donation_address(&pin.url));
-            let asked = match asked {
-                Ok(address) => Asked::Took(Box::new(address)),
-                Err(licash_wallet::Error::Invalid(why)) => {
-                    tracing::info!(provider = %pin.url, "the donation address kept gives way: {why}");
-                    Asked::Refused
-                }
-                Err(e) => {
-                    tracing::info!(provider = %pin.url, "the donation address kept is unheard: {e}");
-                    Asked::Unheard
-                }
-            };
-            (pin, asked)
-        });
-        let had = kept.as_ref().map(|(pin, _)| pin.clone());
-        let choice = choose(kept, || self.donation_providers(), now());
+        let kept_code = pinned.as_ref().and_then(|p| p.code.clone());
+        let code = match self.wallet.donation_code(kept_code.as_deref()) {
+            Ok(code) => code,
+            // No hub, no donations.
+            Err(licash_wallet::Error::Invalid(_)) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let had = pinned.clone();
+        let mut choice = self.offer(pinned, &code);
+        // None at the hubs of the code kept: the one the wallet shows now.
+        let mut code = code;
+        if choice.shown.is_none() && kept_code.is_some() {
+            let now = self.wallet.donation_code(None)?;
+            if now != code {
+                choice = self.offer(None, &now);
+                code = now;
+            }
+        }
         if choice.pin != had {
             let pin = choice.pin.clone();
             self.update_kept(|kept| kept.donations = pin)?;
         }
-        let shown = match choice.shown {
-            None => None,
-            Some(Shown::Live(p)) => Some(DonationAddress {
-                lnurl: p.address.lnurl.clone(),
-                provider: p.url.clone(),
-                name: p.name.clone(),
-                fee_base: p.address.donations.fee.base,
-                fee_ppm: p.address.donations.fee.ppm,
-                min: p.address.donations.min,
-                max: p.address.donations.max,
-                stocked: p.address.stocked,
-                reachable: true,
-            })
-            .map(|shown| (shown, Pinned::of(&p))),
-            Some(Shown::Kept(pin)) => Some((
-                DonationAddress {
-                    lnurl: self.licash_code()?.lnurl(&pin.donations.url),
+        let shown = choice.shown.map(|shown| match shown {
+            Shown::Live(p) => {
+                let address = DonationAddress {
+                    lnurl: p.address.lnurl.clone(),
+                    provider: p.url.clone(),
+                    name: p.name.clone(),
+                    fee_base: p.address.donations.fee.base,
+                    fee_ppm: p.address.donations.fee.ppm,
+                    min: p.address.donations.min,
+                    max: p.address.donations.max,
+                    stocked: p.address.stocked,
+                    reachable: true,
+                };
+                (address, Pinned::of(&p, &code))
+            }
+            Shown::Kept(pin) => {
+                let address = DonationAddress {
+                    lnurl: code.lnurl(&pin.donations.url),
                     provider: pin.url.clone(),
                     name: pin.name.clone(),
                     fee_base: pin.donations.fee.base,
@@ -234,10 +242,10 @@ impl Wallet {
                     max: pin.donations.max,
                     stocked: false,
                     reachable: false,
-                },
-                pin,
-            )),
-        };
+                };
+                (address, pin)
+            }
+        });
         let mut offered = self.offered.lock().unwrap_or_else(PoisonError::into_inner);
         *offered = shown
             .as_ref()
@@ -266,33 +274,43 @@ impl Wallet {
 }
 
 impl Wallet {
+    /// What to show of donations to `code`, given the provider `pinned`,
+    /// asked first at its URL.
+    fn offer(&self, pinned: Option<Pinned>, code: &LicashCode) -> Choice {
+        let kept = pinned.map(|mut pin| {
+            pin.code = Some(code.to_string());
+            let asked = self.runtime.block_on(self.wallet.donation_address(&pin.url, code));
+            let asked = match asked {
+                Ok(address) => Asked::Took(Box::new(address)),
+                Err(licash_wallet::Error::Invalid(why)) => {
+                    tracing::info!(provider = %pin.url, "the donation address kept gives way: {why}");
+                    Asked::Refused
+                }
+                Err(e) => {
+                    tracing::info!(provider = %pin.url, "the donation address kept is unheard: {e}");
+                    Asked::Unheard
+                }
+            };
+            (pin, asked)
+        });
+        choose(kept, || self.donation_providers(code), now())
+    }
+
     /// The providers announced on the relays the hubs name that take
-    /// donations to the wallet's code, the best first: none if they are
-    /// not reached.
-    fn donation_providers(&self) -> Vec<DonationProvider> {
+    /// donations to `code`, the best first: none if they are not reached.
+    fn donation_providers(&self, code: &LicashCode) -> Vec<DonationProvider> {
         let Ok(relays) = hub_relays(&self.wallet) else {
             return Vec::new();
         };
         if relays.is_empty() {
             return Vec::new();
         }
-        let found = donation_providers_with(&self.wallet, &self.announced, (&relays, &self.route));
+        let on = (&relays[..], &self.route);
+        let found = donation_providers_with(&self.wallet, &self.announced, on, code);
         self.runtime.block_on(found).unwrap_or_else(|e| {
             tracing::info!("no provider found taking donations: {e:#}");
             Vec::new()
         })
-    }
-
-    /// The wallet's code at the hubs it trusts, the first [`MAX_HUBS`]: the
-    /// one it shows.
-    fn licash_code(&self) -> Result<licash_wallet::LicashCode, LicashError> {
-        let hubs: Vec<String> = (self.wallet.hubs()?.into_iter())
-            .map(|(url, _)| url)
-            .take(MAX_HUBS)
-            .collect();
-        let code = self.wallet.payment_code(&hubs, false)?;
-        code.licash
-            .ok_or_else(|| LicashError::invalid("no Licash code without a hub"))
     }
 }
 
@@ -349,9 +367,17 @@ mod tests {
     }
 
     fn pin(key: &str, failing_since: Option<u64>) -> Pinned {
+        let owner = OwnerKeys::from_seed(&[1; 32]).unwrap();
+        let code = LicashCode {
+            network: licash::spend::ChainProfile::Core30DefaultRegtest,
+            address: owner.address(),
+            mailbox: None,
+            hubs: vec![licash_wallet::HubId([1; 16])],
+            locations: Vec::new(),
+        };
         Pinned {
             failing_since,
-            ..Pinned::of(&provider(key, true))
+            ..Pinned::of(&provider(key, true), &code)
         }
     }
 
