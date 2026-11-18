@@ -72,8 +72,14 @@ impl Hop {
 
     /// Height by which a payer of a lock it did not issue, expiring at
     /// `expiry`, whose refund request confirms within `confirm` blocks of
-    /// it, has read the preimage or is owed the refund.
+    /// it, has read the preimage or is owed the refund. None unless
+    /// `confirm` exceeds the lock's depth: her refund is owed only on a
+    /// chain past `expiry + depth`, so she requests it no earlier (filed
+    /// before, it is owed nothing and given up).
     pub fn forced_by(&self, expiry: u32) -> Option<u32> {
+        if self.confirm <= self.depth {
+            return None;
+        }
         sum(&[expiry, self.confirm, self.window, self.detect])
     }
 
@@ -83,7 +89,8 @@ impl Hop {
     }
 
     /// Blocks by which a lock elsewhere that pays that payer outlives the
-    /// lock at least: `forced_upstream_expiry(e) - e`.
+    /// lock at least: `forced_upstream_expiry(e) - e`, if `confirm`
+    /// exceeds the depth (which callers of it alone check).
     pub fn forced_lead(&self) -> Option<u32> {
         sum(&[self.confirm, self.window, self.detect, self.margin, 1])
     }
@@ -170,6 +177,11 @@ mod tests {
         assert_eq!(to.forced_lead(), Some(30));
         assert_eq!(to.lead(), Some(6));
         assert_eq!(to.upstream_expiry(105), Some(111));
+        // A refund is owed only past the lock's expiry at depth: a request
+        // due no later is none.
+        let early = Hop { depth: 2, ..to };
+        assert_eq!(early.forced_by(105), None);
+        assert_eq!(early.forced_upstream_expiry(105), None);
         // A lock that pays it elsewhere must outlive that window, which a
         // hub with the same window cannot admit.
         assert!(!hop(24).admits(100, 135));

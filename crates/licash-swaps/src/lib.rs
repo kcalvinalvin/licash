@@ -139,7 +139,8 @@ impl Config {
     /// Blocks by which the client's lock outlives the provider's at a hub
     /// of `locks` at least, if the provider may lock there: once its lock
     /// expires, the provider learns the hub keeps the preimage before the
-    /// refund request is due.
+    /// refund request is due, past the lock's expiry at depth, before
+    /// which a refund is owed nothing on Bitcoin.
     pub fn lead(&self, locks: &Locks) -> Option<u32> {
         let seen = locks.min_depth.max(1).saturating_add(locks.reaction);
         if self.confirm <= seen {
@@ -1629,15 +1630,18 @@ impl<T: Transport> Provider<T> {
             .forced_lead();
             deadline = deadline.min(row.expiry_from.saturating_sub(after.unwrap_or(u32::MAX)));
         }
+        // Told past the lock's expiry at depth: a refund requested now is
+        // owed, one confirmed before would have been given up.
         let message = format!(
             "Hub {} has neither paid nor refunded the provider's lock {} of swap {}, expired \
              at {}: it may keep the preimage. Request the lock's refund on Bitcoin, confirmed \
-             by height {deadline}, for the hub to publish the preimage, and claim the client's \
-             lock at {} with it before it expires at {}.",
+             after height {} and by height {deadline}, for the hub to publish the preimage, \
+             and claim the client's lock at {} with it before it expires at {}.",
             row.to,
             hex::encode(lock),
             hex::encode(id),
             row.expiry,
+            row.expiry.saturating_add(depth),
             row.from,
             row.expiry_from
         );
