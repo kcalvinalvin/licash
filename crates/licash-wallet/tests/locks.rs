@@ -188,6 +188,56 @@ async fn a_recovery_claims_an_unsettled_locks_refund_once_expired_at_depth() {
     assert_eq!(available(&alice), (62, 0));
 }
 
+/// A wallet whose contracts at a hub are closed by some block keeps its
+/// locks there claimable on Bitcoin: one of no expiry asked expires, at
+/// depth, by then; one asked to expire later is refused, as is any once no
+/// lock fits, or while its protection is unknown.
+#[tokio::test]
+async fn a_lock_expires_at_depth_before_her_contracts_at_its_hub_close() {
+    let (net, alice, bob) = parties().await;
+    alice.receive(&net.pay(HUB, &alice.address(), 64)).unwrap();
+    let horizon = |h: Result<Option<u32>, String>| {
+        Arc::new(move |urls: &[String], _tip: u32| {
+            assert!(urls.iter().any(|u| u.trim_end_matches('/') == HUB));
+            h.clone()
+        })
+    };
+    let refused = |r: Result<licash_wallet::Lock, Error>, what: &str| {
+        assert!(
+            matches!(&r, Err(Error::Invalid(why)) if why.contains(what)),
+            "{r:?}"
+        );
+    };
+    // Depth 1 here: a lock of expiry 9 is owed its refund from block 10.
+    alice.guard_locks(horizon(Ok(Some(10))));
+    let lock = alice
+        .lock(HUB, &bob.address(), 1, hash(), None)
+        .await
+        .unwrap();
+    assert_eq!(lock.expiry, 9);
+    refused(
+        alice.lock(HUB, &bob.address(), 1, hash(), Some(10)).await,
+        "unprotected",
+    );
+    alice.guard_locks(horizon(Ok(Some(0))));
+    refused(
+        alice.lock(HUB, &bob.address(), 1, hash(), None).await,
+        "unprotected",
+    );
+    alice.guard_locks(horizon(Err("no store".into())));
+    refused(
+        alice.lock(HUB, &bob.address(), 1, hash(), None).await,
+        "protection is unknown",
+    );
+    // No contract there: as ever.
+    alice.guard_locks(horizon(Ok(None)));
+    let lock = alice
+        .lock(HUB, &bob.address(), 1, hash(), Some(20))
+        .await
+        .unwrap();
+    assert_eq!(lock.expiry, 20);
+}
+
 #[tokio::test]
 async fn a_lock_is_not_made_at_a_hub_charging_more_than_agreed() {
     let (_net, alice, bob) = parties().await;

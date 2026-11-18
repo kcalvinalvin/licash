@@ -475,7 +475,17 @@ pub struct Wallet<T> {
     renew_ppm: AtomicU32,
     /// The most each hub may charge ([`Wallet::set_fee_ceilings`]).
     ceilings: Mutex<HashMap<i64, licash_api::Fees>>,
+    /// What keeps its locks claimable ([`Wallet::guard_locks`]).
+    horizon: Mutex<Option<LockHorizon>>,
 }
+
+/// The height by which a lock at the hub reached at any of the URLs given,
+/// at the chain's height given, must have expired at depth for its refund
+/// to be claimed on Bitcoin, by the contracts protecting its payer there
+/// ([`Wallet::guard_locks`]): none if none does. An error refuses the
+/// lock.
+pub type LockHorizon =
+    std::sync::Arc<dyn Fn(&[String], u32) -> Result<Option<u32>, String> + Send + Sync>;
 
 /// A payout's coin as its provider told of it: its transaction, and its
 /// block once confirmed.
@@ -535,6 +545,7 @@ impl<T: Transport> Wallet<T> {
             told_coins: Mutex::default(),
             renew_ppm: AtomicU32::new(RENEW_PPM),
             ceilings: Mutex::default(),
+            horizon: Mutex::default(),
         })
     }
 
@@ -572,6 +583,7 @@ impl<T: Transport> Wallet<T> {
             told_coins: Mutex::default(),
             renew_ppm: AtomicU32::new(RENEW_PPM),
             ceilings: Mutex::default(),
+            horizon: Mutex::default(),
         })
     }
 
@@ -616,6 +628,32 @@ impl<T: Transport> Wallet<T> {
             None => kept.remove(&hub),
         };
         Ok(())
+    }
+
+    /// Keep each lock the wallet makes claimable on Bitcoin by the
+    /// contracts protecting it, as `horizon` says: one of no expiry asked
+    /// expires early enough, one asked to expire later is refused. Kept
+    /// while the wallet is open only: whoever opens it sets it.
+    pub fn guard_locks(&self, horizon: LockHorizon) {
+        *self.horizon.lock().unwrap_or_else(|e| e.into_inner()) = Some(horizon);
+    }
+
+    /// [`Wallet::guard_locks`]' horizon of the hub at `url` at `tip`.
+    pub(crate) fn lock_horizon(&self, url: &str, tip: u32) -> Result<Option<u32>, Error> {
+        let horizon = self
+            .horizon
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let Some(horizon) = horizon else {
+            return Ok(None);
+        };
+        let urls = self.hub_urls(url)?;
+        horizon(&urls, tip).map_err(|why| {
+            Error::Invalid(format!(
+                "no lock at {url}: its protection is unknown, {why}"
+            ))
+        })
     }
 
     /// The most the hub at `url` may charge, if set

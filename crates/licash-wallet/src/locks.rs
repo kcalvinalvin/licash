@@ -253,7 +253,31 @@ impl<T: Transport> Wallet<T> {
         let latest = locks
             .latest_expiry(depth)
             .map_err(|p| unavailable(url, p))?;
-        let expiry = expiry.unwrap_or(latest);
+        // Its refund claimable on Bitcoin by her contracts there, if any:
+        // owed from its expiry at depth, by the time they are closed.
+        let expiry = match (self.lock_horizon(url, locks.height)?, expiry) {
+            (None, expiry) => expiry.unwrap_or(latest),
+            (Some(horizon), None) => {
+                let fits = latest.min(horizon.saturating_sub(depth));
+                if fits <= locks.height {
+                    return Err(Error::Invalid(format!(
+                        "no lock at {url} can expire, at depth {depth}, by block {horizon}, \
+                         when her contracts there are closed: its refund would be unprotected"
+                    )));
+                }
+                fits
+            }
+            (Some(horizon), Some(expiry)) => {
+                if expiry.saturating_add(depth) > horizon {
+                    return Err(Error::Invalid(format!(
+                        "a lock at {url} expiring at {expiry} is owed its refund at depth \
+                         {depth} only after block {horizon}, when her contracts there are \
+                         closed: it would be unprotected"
+                    )));
+                }
+                expiry
+            }
+        };
         if expiry <= locks.height || expiry > latest {
             return Err(Error::Invalid(format!(
                 "expiry {expiry} outside what hub {url} admits, {} to {latest}",
