@@ -216,30 +216,66 @@ struct State {
 struct Inner {
     dir: PathBuf,
     command: String,
+    /// The program contracts open under: benchmarked.
     program: [u8; 32],
+    /// Those contracts opened under before, proven with still.
+    before: Vec<[u8; 32]>,
     spacing: f64,
     state: Mutex<State>,
     wake: Condvar,
     alert: OnceLock<Arc<Alert>>,
 }
 
+/// What `probe` doesn't install of the programs: `program`, which
+/// contracts open under, and `before`, which they opened under before.
+fn uninstalled(probe: &serde_json::Value, program: &[u8; 32], before: &[[u8; 32]]) -> Vec<String> {
+    let installed = |id: &[u8; 32]| {
+        let id = hex::encode(id);
+        probe["programs"]
+            .as_array()
+            .is_some_and(|p| p.iter().any(|p| p.as_str() == Some(&id)))
+    };
+    let mut missing = Vec::new();
+    if !installed(program) {
+        missing.push(format!(
+            "the program contracts open under, {}, is not installed",
+            hex::encode(program)
+        ));
+    }
+    for id in before.iter().filter(|id| !installed(id)) {
+        missing.push(format!(
+            "the program contracts opened under before, {}, is not installed",
+            hex::encode(id)
+        ));
+    }
+    missing
+}
+
 /// The hub's one prover: see the module.
 pub(super) struct Prover(Arc<Inner>);
 
 impl Prover {
-    /// The prover of `data`'s contracts, which open under `program` on a
-    /// chain of a block every `spacing` seconds: probed and benchmarked,
-    /// then proving, on a thread of its own.
-    pub fn start(data: &Path, program: [u8; 32], spacing: f64) -> Self {
+    /// The prover of `data`'s contracts, which open under `program`, and
+    /// opened under `before` before, on a chain of a block every
+    /// `spacing` seconds: probed and benchmarked, then proving, on a
+    /// thread of its own.
+    pub fn start(data: &Path, program: [u8; 32], before: &[[u8; 32]], spacing: f64) -> Self {
         let command = std::env::var("LICASH_HP_PROVER").unwrap_or_else(|_| "licash-r0".into());
-        Self::start_with(data, command, program, spacing)
+        Self::start_with(data, command, program, before, spacing)
     }
 
-    fn start_with(data: &Path, command: String, program: [u8; 32], spacing: f64) -> Self {
+    fn start_with(
+        data: &Path,
+        command: String,
+        program: [u8; 32],
+        before: &[[u8; 32]],
+        spacing: f64,
+    ) -> Self {
         let inner = Arc::new(Inner {
             dir: data.join("hp-proofs"),
             command,
             program,
+            before: before.to_vec(),
             spacing,
             state: Mutex::default(),
             wake: Condvar::new(),
@@ -300,6 +336,7 @@ impl Prover {
             dir: dir.to_owned(),
             command: "false".into(),
             program: [0; 32],
+            before: Vec::new(),
             spacing: 600.0,
             state: Mutex::default(),
             wake: Condvar::new(),
@@ -606,13 +643,8 @@ impl Inner {
                     .collect()
             })
             .unwrap_or_default();
+        problems.extend(uninstalled(&probe, &self.program, &self.before));
         let program = hex::encode(self.program);
-        let programs = probe["programs"].as_array();
-        if !programs.is_some_and(|p| p.iter().any(|p| p.as_str() == Some(&program))) {
-            problems.push(format!(
-                "the program contracts open under, {program}, is not installed"
-            ));
-        }
         if !problems.is_empty() {
             bail!("{}", problems.join("; "));
         }
@@ -1020,7 +1052,7 @@ mod tests {
         std::fs::write(&path, format!("#!/bin/sh\nset -e\n{script}")).unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        Prover::start_with(dir, path.display().to_string(), [7; 32], 600.0)
+        Prover::start_with(dir, path.display().to_string(), [7; 32], &[], 600.0)
     }
 
     fn until(what: &str, f: impl Fn() -> bool) {
@@ -1096,6 +1128,24 @@ esac
         });
         let calls = std::fs::read_to_string(dir.path().join("calls")).unwrap();
         assert_eq!(calls, "probe\n");
+    }
+
+    /// Each program contracts open or opened under must be installed: a
+    /// prover missing one is not ready, as its contracts can't be proven.
+    #[test]
+    fn a_prover_proves_the_programs_contracts_opened_under_before() {
+        let probe = |ids: &[[u8; 32]]| serde_json::json!({ "programs": ids.iter().map(hex::encode).collect::<Vec<_>>() });
+        let (now, before) = ([7; 32], [[8; 32], [9; 32]]);
+        assert!(uninstalled(&probe(&[now, [8; 32], [9; 32]]), &now, &before).is_empty());
+        let missing = uninstalled(&probe(&[now, [9; 32]]), &now, &before);
+        assert_eq!(missing.len(), 1);
+        assert!(missing[0].contains(&hex::encode([8; 32])), "{missing:?}");
+        let missing = uninstalled(&probe(&[[8; 32], [9; 32]]), &now, &before);
+        assert!(
+            missing.len() == 1 && missing[0].contains("open under,"),
+            "{missing:?}"
+        );
+        assert_eq!(uninstalled(&serde_json::json!({}), &now, &before).len(), 3);
     }
 
     /// A probe's problems, or a program not installed, and it is not ready:

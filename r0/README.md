@@ -46,10 +46,12 @@ machine. One build at a time uses that directory.
 
 ## Programs kept
 
-Contracts open under the programs `apps/contracts` names (`SIGNET` in
-`apps/contracts/src/lib.rs`), each kept in `r0/programs/` as
+Contracts open under the program `apps/contracts` names (`SIGNET` in
+`apps/contracts/src/lib.rs`), and those opened under the ones before
+(`SIGNET_BEFORE`) are played still. Each is kept in `r0/programs/` as
 `<image id>.bin`: a contract opened under one is proven with it alone, so
-none named there is ever removed. Each file's image id is its name:
+none named there is ever removed, and the hub's prover is ready only with
+all of them installed. Each file's image id is its name:
 
 ```sh
 for p in r0/programs/*.bin; do
@@ -59,7 +61,12 @@ done
 
 | Network | Program | Image id | Built from |
 |---|---|---|---|
-| signet | `hp` (the Hub's statement) | `6bf78e6092f9c0959cee4908b449a032e575d527c5c889d8b9f3813b888f0d0c` | 0f86cc6 |
+| signet | `hp` (the Hub's statement), new contracts | `4f236e2763d716a44c8c6458b400e6d096507229af71e9c5e69eb725a365e58d` | 61d6500 |
+| signet | `hp`, contracts opened before (v3 Bases) | `6bf78e6092f9c0959cee4908b449a032e575d527c5c889d8b9f3813b888f0d0c` | 0f86cc6 |
+
+The program before checks no signature of her request (a v3 Base binds
+no keys) and reads a request's digits above 15 as Bitcoin doesn't: its
+contracts keep that exposure to their end.
 
 The holder's and counter programs of the design before hub-proves are
 gone with it: no contract opened under them is played.
@@ -74,8 +81,9 @@ compare image ids, not files.
 
 To name new ones, build them from a commit, rebuild them in another
 checkout to see the same image ids, copy each `r0/guests/<name>.bin` to
-`r0/programs/<image id>.bin`, and name them in `apps/contracts`, keeping
-the programs named before for the contracts opened under them.
+`r0/programs/<image id>.bin`, and name them in `apps/contracts`, moving
+the programs named before to `SIGNET_BEFORE` for the contracts opened
+under them.
 
 ## Execute and prove
 

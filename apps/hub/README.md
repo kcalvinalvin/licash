@@ -171,7 +171,10 @@ reserve and 50,000 for fees): a larger cap is refused as unavailable. A
 login limited by `-rpcwhitelist` needs `getbalances` among its calls, or
 the hub advertises the range's largest cap whatever its wallet holds.
 The collateral of a contract is the next power of two minus one sat at or
-above its cap (2,097,151 sat at least, 2,147,483,647 at most). F, a contract's
+above its cap (2,097,151 sat at least, 2,147,483,647 at most). A contract
+opens on the hub's newest lock checkpoint, a block as deep as those, which it takes
+as one if newer, so that every lock named after it can be claimed in it:
+the hub offers no contract until its scan of the chain has begun. F, a contract's
 funding, spends the wallet's coins, which stay locked while the opening
 lives. A wallet that has the hub sign F and never broadcasts it holds
 those coins locked, so the hub frees them itself. Once a coin F spends is
@@ -208,7 +211,8 @@ maximum keeps its contracts and opens no new ones until some end.
 
 On regtest, contracts are under a mock proof authority: such a contract
 protects nothing. On signet they are under the genuine programs kept in
-`r0/programs/`, a trial: RISC Zero's shared Groth16 setup, signet's headers
+`r0/programs/` (new contracts under the newest, those opened before under
+theirs, each played to its end), a trial: RISC Zero's shared Groth16 setup, signet's headers
 checked by their work alone and not the network's signature of each block.
 The hub's terms there are signet's least: a day
 for the wallet to answer a challenge and for each party's outputs to wait,
@@ -298,7 +302,8 @@ The image of apps/hub/Dockerfile (x86-64) has the prover: its CPU build,
 its CUDA build, which it proves on when the container has a GPU (`--gpus
 all`, or a Compose `deploy.resources.reservations.devices` entry with the
 NVIDIA runtime; drivers 550 or newer, Turing or newer, 6 GB of memory are
-enough), RISC Zero's Groth16 setup and the programs contracts open under.
+enough), RISC Zero's Groth16 setup and the programs contracts open and
+opened under: the prover is not ready unless it has them all.
 On an RTX 2060 a proof takes about 20 minutes (the Groth16 wrap about 3 of
 them, on the CPU) plus about 7 minutes for each 1,000 headers since the
 contract's checkpoint: one of signet's most, 26,280 headers (half a year),

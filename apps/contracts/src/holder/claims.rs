@@ -40,14 +40,16 @@ impl ClaimTerms {
 /// The claim terms of `contracts`, of those in `store`, by id: as kept,
 /// or read from their state as stored at `tip` (no hub asked), then kept.
 /// None of one whose state cannot be read, nor of one opened under a
-/// program this build does not trust: its recovery claims nothing.
+/// program this build does not play ([`crate::plays`]): its recovery
+/// claims nothing.
 pub(super) fn terms<T: Transport>(
     wallet: &Wallet<T>,
     store: &Store,
     contracts: &[&Contract],
     tip: u32,
 ) -> Result<HashMap<[u8; 32], ClaimTerms>> {
-    let trust = crate::trust(wallet.network())?;
+    // Contracts are opened on this network, or none claims.
+    crate::trust(wallet.network())?;
     let kept = store.claim_terms()?;
     let mut terms = HashMap::with_capacity(contracts.len());
     for c in contracts {
@@ -65,7 +67,7 @@ pub(super) fn terms<T: Transport>(
                 }
             },
         };
-        if !trust.mock && read.program != trust.program {
+        if !crate::plays(wallet.network(), &read.program) {
             tracing::warn!(%id, "a contract of an unsupported program claims nothing");
             continue;
         }
@@ -262,7 +264,7 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();
-        for id in 1..=3 {
+        for id in 1..=4 {
             let deposit = OutPoint {
                 txid: bitcoin::Txid::from_byte_array([9; 32]),
                 vout: u32::from(id),
@@ -291,10 +293,13 @@ mod tests {
         let genuine = crate::SIGNET;
         store.keep_claim_terms(&[1; 32], &kept([5; 32])).unwrap();
         store.keep_claim_terms(&[2; 32], &kept(genuine)).unwrap();
+        let before = crate::SIGNET_BEFORE[0];
+        store.keep_claim_terms(&[4; 32], &kept(before)).unwrap();
         let all = [
             contract(1, 4_096, 360),
             contract(2, 4_096, 360),
             contract(3, 4_096, 360),
+            contract(4, 4_096, 360),
         ];
         let all: Vec<&Contract> = all.iter().collect();
         let terms_on = |profile, name: &str| {
@@ -305,12 +310,16 @@ mod tests {
             ids.sort();
             ids
         };
-        // On signet, of the genuine program alone; of none whose state
-        // cannot be read, kept or not.
-        assert_eq!(terms_on(ChainProfile::Core30Signet, "signet.sqlite"), [2]);
+        // On signet, of the genuine programs alone, the one contracts
+        // open under and those they opened under before; of none whose
+        // state cannot be read, kept or not.
+        assert_eq!(
+            terms_on(ChainProfile::Core30Signet, "signet.sqlite"),
+            [2, 4]
+        );
         // Under the mock authority, any program.
         let regtest = ChainProfile::Core30DefaultRegtest;
-        assert_eq!(terms_on(regtest, "regtest.sqlite"), [1, 2]);
-        assert_eq!(store.claim_terms().unwrap().len(), 2);
+        assert_eq!(terms_on(regtest, "regtest.sqlite"), [1, 2, 4]);
+        assert_eq!(store.claim_terms().unwrap().len(), 3);
     }
 }

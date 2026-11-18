@@ -213,15 +213,41 @@ pub fn trust(profile: ChainProfile) -> Result<Trust> {
     }
 }
 
-/// The genuine programs contracts open under on signet, as built by
+/// The genuine program contracts open under on signet, as built by
 /// `r0/build-guest.sh` with the toolchains it pins, from the commit
-/// `r0/README.md` names. Each is kept as `r0/programs/<image id>.bin`:
-/// the contracts opened under one are proven with it alone, so none named
-/// here is ever to go. Import verification currently supports only this
-/// program. Binding openings retain their stored image ID when opening
-/// trust changes, so each such program must remain available to the hub.
+/// `r0/README.md` names. Each program contracts opened under is kept as
+/// `r0/programs/<image id>.bin`: the contracts opened under one are
+/// proven with it alone, so none named here or in [`SIGNET_BEFORE`] is
+/// ever to go. A contract keeps its program when this one changes.
 pub const SIGNET: [u8; 32] =
-    hex!("6bf78e6092f9c0959cee4908b449a032e575d527c5c889d8b9f3813b888f0d0c");
+    hex!("4f236e2763d716a44c8c6458b400e6d096507229af71e9c5e69eb725a365e58d");
+
+/// The programs signet contracts opened under before [`SIGNET`], newest
+/// first: no contract opens under them, those that did are played still.
+/// `6bf78e60…`'s statement checks no signature of her request (a v3
+/// Base), and reads a request's digits above 15 as Bitcoin doesn't: a
+/// trial's exposure, left to its contracts' end.
+pub const SIGNET_BEFORE: [[u8; 32]; 1] = [hex!(
+    "6bf78e6092f9c0959cee4908b449a032e575d527c5c889d8b9f3813b888f0d0c"
+)];
+
+/// The programs contracts on `profile` opened under before the one they
+/// open under now ([`trust`]): played still.
+pub fn programs_before(profile: ChainProfile) -> &'static [[u8; 32]] {
+    match profile {
+        ChainProfile::Core30Signet => &SIGNET_BEFORE,
+        _ => &[],
+    }
+}
+
+/// Whether a contract on `profile` opened under `program` is played,
+/// recovered from and proved: any under the mock authority, else one
+/// under the program contracts open under now or one they did before.
+pub fn plays(profile: ChainProfile, program: &[u8; 32]) -> bool {
+    trust(profile).is_ok_and(|t| {
+        t.mock || t.program == *program || programs_before(profile).contains(program)
+    })
+}
 
 /// The SQLite file at `path`, readable by its owner only, made so before
 /// anything is written to it.
@@ -281,8 +307,15 @@ mod tests {
     fn the_hub_statement_image_is_pinned() {
         assert_eq!(
             SIGNET,
-            hex!("6bf78e6092f9c0959cee4908b449a032e575d527c5c889d8b9f3813b888f0d0c"),
+            hex!("4f236e2763d716a44c8c6458b400e6d096507229af71e9c5e69eb725a365e58d"),
             "keep every funded contract's pinned guest available when changing opening trust"
+        );
+        assert_eq!(
+            SIGNET_BEFORE,
+            [hex!(
+                "6bf78e6092f9c0959cee4908b449a032e575d527c5c889d8b9f3813b888f0d0c"
+            )],
+            "a program contracts opened under is never to go"
         );
     }
 
@@ -318,9 +351,23 @@ mod tests {
     #[test]
     fn the_programs_contracts_open_under_are_kept_by_image_id() {
         let kept = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../r0/programs");
-        let program = kept.join(format!("{}.bin", hex::encode(SIGNET)));
-        let size = std::fs::metadata(&program).map_or(0, |m| m.len());
-        assert!(size > 0, "{} is not kept", program.display());
+        for id in std::iter::once(&SIGNET).chain(&SIGNET_BEFORE) {
+            let program = kept.join(format!("{}.bin", hex::encode(id)));
+            let size = std::fs::metadata(&program).map_or(0, |m| m.len());
+            assert!(size > 0, "{} is not kept", program.display());
+        }
+    }
+
+    #[test]
+    fn contracts_of_the_programs_before_are_played_but_none_opens_under_them() {
+        let signet = ChainProfile::Core30Signet;
+        assert!(plays(signet, &SIGNET));
+        for before in SIGNET_BEFORE {
+            assert!(plays(signet, &before) && before != SIGNET);
+        }
+        assert!(!plays(signet, &[9; 32]));
+        assert!(plays(ChainProfile::Core30DefaultRegtest, &[9; 32]));
+        assert!(!plays(ChainProfile::Core30Mainnet, &SIGNET));
     }
 
     #[test]

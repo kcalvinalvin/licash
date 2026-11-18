@@ -342,8 +342,10 @@ impl Openings {
             evidencer: std::sync::OnceLock::new(),
             claims: std::sync::OnceLock::new(),
             checkpoints: std::sync::OnceLock::new(),
-            prover: (!trust.mock)
-                .then(|| prover::Prover::start(data, trust.program, prover::spacing(profile))),
+            prover: (!trust.mock).then(|| {
+                let before = crate::programs_before(profile);
+                prover::Prover::start(data, trust.program, before, prover::spacing(profile))
+            }),
             alert: std::sync::OnceLock::new(),
             withheld: Mutex::default(),
             proof_scale: std::sync::OnceLock::new(),
