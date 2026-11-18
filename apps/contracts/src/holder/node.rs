@@ -41,6 +41,19 @@ impl Chain for Node {
         self.0.broadcast(tx).await.map(|_| ()).map_err(text)
     }
 
+    async fn broadcast_package(&self, txs: &[Transaction]) -> Result<(), String> {
+        self.0
+            .broadcast_package(txs)
+            .await
+            .map(|_| ())
+            .map_err(text)
+    }
+
+    /// The node's or Esplora's estimate.
+    async fn fee_rate(&self, blocks: u16) -> Result<Option<bitcoin::FeeRate>, String> {
+        self.0.fee_rate(blocks).await.map_err(text)
+    }
+
     /// The node's header alone, not its block's.
     async fn header(&self, height: u32) -> Result<bitcoin::block::Header, String> {
         let hash = self.0.hash(height).await.map_err(text)?;
