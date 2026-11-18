@@ -1194,7 +1194,7 @@ class Engine(context: Context) {
 
     /** Planning from this wallet's signed terms; never starts a close. */
     suspend fun contractSafety(id: String): Result<org.licash.core.ContractSafety> = io {
-        local { it.contractSafety(id, proofMarginBlocks(prefs.proofMarginDays, state.value.network), 6u) }
+        local { it.contractSafety(id, exitMarginBlocks(prefs.exitMarginDays, state.value.network), 6u) }
     }
 
     /**

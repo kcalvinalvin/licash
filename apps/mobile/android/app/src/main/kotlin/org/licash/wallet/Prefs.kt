@@ -59,11 +59,11 @@ class Prefs(context: Context) {
         set(ppm) = prefs.edit().putLong("renew_ppm", ppm?.toLong() ?: -1L).apply()
 
     /** Local planning only. A missing preference never authorizes a close. */
-    var proofMarginDays: Int
-        get() = prefs.getInt("proof_margin_days", 14).takeIf { it in 1..30 } ?: 14
+    var exitMarginDays: Int
+        get() = prefs.getInt("exit_margin_days", 14).takeIf { it in 1..30 } ?: 14
         set(days) {
             require(days in 1..30)
-            prefs.edit().putInt("proof_margin_days", days).apply()
+            prefs.edit().putInt("exit_margin_days", days).apply()
         }
 
     /**

@@ -41,6 +41,7 @@ import org.licash.core.ContractQuote
 import org.licash.core.ContractSafety
 import org.licash.core.ContractInspection
 import org.licash.core.ContractState
+import org.licash.core.Network
 import org.licash.core.Recovery
 import org.licash.core.RecoveryStage
 import org.licash.core.contractChangeProblem
@@ -48,6 +49,7 @@ import org.licash.wallet.digits
 import org.licash.wallet.sat
 import org.licash.wallet.share
 import org.licash.wallet.safetyStatus
+import org.licash.wallet.checkInHours
 
 /**
  * A protection at a hub, in a row: how much it covers, how long it has
@@ -59,6 +61,7 @@ import org.licash.wallet.safetyStatus
 internal fun CoverRow(
     c: Contract,
     height: Int,
+    network: Network,
     developer: Boolean,
     recovery: Recovery?,
     end: () -> Unit,
@@ -145,7 +148,7 @@ internal fun CoverRow(
                 if (recovery != null) {
                     Forced(recovery, developer, giveUp, height)
                 } else {
-                    Unfolded(c, cover, developer, end, forceClose, plan, height)
+                    Unfolded(c, cover, developer, end, forceClose, plan, height, network)
                 }
                 details?.let { ContractLayout(it, explorer) }
             }
@@ -192,7 +195,7 @@ private fun ContractLayout(info: ContractInspection, explorer: (String) -> Strin
 
 /** A protection's row unfolded: what it covers and costs; ending it, forcing it closed in advanced mode. */
 @Composable
-private fun Unfolded(c: Contract, cover: Cover, developer: Boolean, end: () -> Unit, forceClose: () -> Unit, safety: ContractSafety?, height: Int) {
+private fun Unfolded(c: Contract, cover: Cover, developer: Boolean, end: () -> Unit, forceClose: () -> Unit, safety: ContractSafety?, height: Int, network: Network) {
     val state = c.state
     if (state is ContractState.Failed) Line("Why", state.reason)
     // Of what its hub holds, those ending first covering first.
@@ -206,8 +209,9 @@ private fun Unfolded(c: Contract, cover: Cover, developer: Boolean, end: () -> U
             Line("Recovery planning", safetyStatus(it, height), tag = "planning", onClick = { planning = true })
             if (planning) {
                 Sheet("Recovery planning", dismiss = { planning = false }) {
-                    Line("Your proof margin", "${it.proofMargin} blocks")
-                    Say("Planning only. Start earlier for confirmation time. Stay online: the wallet checks the hub's proof and must challenge a bad one in time.")
+                    Line("Your exit margin", "${it.exitMargin} blocks")
+                    Line("During a forced close", "Come online at least every ${checkInHours(it.challengeWindow, network)} hours")
+                    Say("Planning only. Start earlier for confirmation time. Stay online: the wallet checks the hub's proof and must challenge a bad one within ${it.challengeWindow} blocks.")
                 }
             }
         }

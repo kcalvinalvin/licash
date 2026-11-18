@@ -332,9 +332,9 @@ pub struct Settings {
     /// The hubs whose notes contracts must protect, by URL: every hub the
     /// provider's wallet knows, if none named.
     pub hubs: Option<Vec<String>>,
-    /// Blocks to prove a claim in, and for its timeout to confirm
-    /// ([`safety::of`]).
-    pub proof_margin: u32,
+    /// Blocks kept for a forced close to play out in, and for its timeout
+    /// to confirm ([`safety::of`]).
+    pub exit_margin: u32,
     pub timeout_slack: u32,
     /// Blocks a day on its chain ([`blocks_a_day`]).
     pub day: u32,
@@ -361,21 +361,21 @@ pub struct Settings {
 
 impl Settings {
     /// On `network`, every hub the provider's wallet knows kept, with
-    /// `proof_days` to prove a claim in and a successor opened
+    /// `exit_days` for a forced close to play out in and a successor opened
     /// `successor_days` before its predecessor's safe deadline, each a
     /// day of its blocks; told to open a first contract at a hub with
     /// `open_hint`. Its successors cost a quarter more than their
     /// predecessors at most, it drains nothing, and looks for no coins.
     pub fn new(
         network: ChainProfile,
-        proof_days: u32,
+        exit_days: u32,
         successor_days: u32,
         open_hint: String,
     ) -> Self {
         let day = blocks_a_day(network);
         Self {
             hubs: None,
-            proof_margin: proof_days.saturating_mul(day),
+            exit_margin: exit_days.saturating_mul(day),
             timeout_slack: TIMEOUT_SLACK,
             day,
             successor_lead: successor_days.saturating_mul(day),
@@ -655,7 +655,7 @@ impl<T: Transport + 'static> Keeper<T> {
         let recovering: HashSet<[u8; 32]> = (recovery::recoveries(&self.dir)?.into_iter())
             .map(|r| r.id)
             .collect();
-        let (margin, slack) = (self.settings.proof_margin, self.settings.timeout_slack);
+        let (margin, slack) = (self.settings.exit_margin, self.settings.timeout_slack);
         let mut kept = Vec::new();
         for contract in contracts {
             let hex = licash_contracts::hex_id(&contract.id);
@@ -674,7 +674,7 @@ impl<T: Transport + 'static> Keeper<T> {
                                 alerts.push((
                                     format!("margin {hex}"),
                                     format!(
-                                        "contract {hex} leaves no room to prove a claim in: \
+                                        "contract {hex} leaves no room for a forced close to play out: \
                                          claiming from it at once, if needed"
                                     ),
                                 ));

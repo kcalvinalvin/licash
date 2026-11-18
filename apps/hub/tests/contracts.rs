@@ -1804,7 +1804,7 @@ async fn a_providers_keeper_holds_its_intake_to_its_contracts_and_replaces_them(
     let provider = Arc::new(Provider::create(&swaps, wallet, SwapsConfig::default())?);
     let (day, lead, margin, slack) = (2, 20, 10, 6);
     let settings = Settings {
-        proof_margin: margin,
+        exit_margin: margin,
         timeout_slack: slack,
         day,
         successor_lead: lead,

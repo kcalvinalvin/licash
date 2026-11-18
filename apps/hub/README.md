@@ -229,7 +229,7 @@ at each hub opened by the operator with `licash-wallet --wallet
 <data>/swaps/wallet.sqlite open-contract URL --chain URL`, then replaced
 before they end and forced closed at their safe deadline if needed, the
 provider's wallet looking for its coins on the hub's chain. The
-`--swaps-contract-successor-days`, `--swaps-contract-proof-days`,
+`--swaps-contract-successor-days`, `--swaps-contract-exit-days`,
 `--swaps-contract-max-price` and `--swaps-drain-via` flags match the
 provider's. The hub's own notes, which it issues, need no contract. With
 `--swaps-from`, a hub on a network where no contract opens (only regtest

@@ -200,10 +200,11 @@ struct ContractArgs {
         default_value_t = 14
     )]
     contract_successor_days: u32,
-    /// Days kept to prove a recovery's claim in, before each contract's
-    /// last block to assert it in: its safe deadline comes a day earlier.
-    #[arg(long, env = "LICASH_SWAPS_CONTRACT_PROOF_DAYS", default_value_t = 14)]
-    contract_proof_days: u32,
+    /// Days kept for a forced close to play out in (the exit margin),
+    /// before each contract's last request height: its safe deadline comes
+    /// a day earlier.
+    #[arg(long, env = "LICASH_SWAPS_CONTRACT_EXIT_DAYS", default_value_t = 14)]
+    contract_exit_days: u32,
     /// The most a successor costs, in sat [default: what the contract it
     /// replaces cost, and a quarter]: the most one --contract-open-cap
     /// opens costs.
@@ -255,7 +256,7 @@ impl ContractArgs {
         let wallet = data.join("wallet.sqlite");
         let settings = keeper::Settings::new(
             network,
-            self.contract_proof_days,
+            self.contract_exit_days,
             self.contract_successor_days,
             format!(
                 "licash-wallet --wallet {} open-contract {{hub}} --chain CHAIN",
@@ -1424,7 +1425,7 @@ mod tests {
         assert!(!defaults.no_contracts);
         assert_eq!(
             (
-                defaults.contract_proof_days,
+                defaults.contract_exit_days,
                 defaults.contract_successor_days
             ),
             (14, 14)

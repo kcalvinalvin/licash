@@ -148,7 +148,8 @@ the chain of `--chain`, a round a minute:
   protect, none being opened or replaced, one more is opened there, of as
   much as they protect, for at most `--contract-max-price` sat.
 - Its safe deadline comes a day before its claim would have to confirm,
-  keeping `--contract-proof-days` (14) to prove the claim in. There it is
+  keeping `--contract-exit-days` (14), the exit margin, for a forced close
+  to play out in. There it is
   forced closed, whatever its hub says, if the other contracts at the hub
   cannot recover every note held there.
 - A failed replacement is retried after growing waits. Meanwhile nothing

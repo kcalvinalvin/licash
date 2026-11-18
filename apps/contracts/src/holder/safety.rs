@@ -1,5 +1,5 @@
 //! Holder-owned planning, not a promise that a hub's answer expires. The
-//! timeout must win promptly on chain for the planned proving time to hold.
+//! timeout must win promptly on chain for the planned exit time to hold.
 
 use anyhow::{Context as _, Result};
 use licash_contract::opening::{Context, Holder};
@@ -7,14 +7,18 @@ use licash_wallet::{Transport, Wallet};
 
 use super::Store;
 
-/// Local proof time and timeout-confirmation allowance, in blocks. No
-/// policy is persisted here and calculating it never starts a recovery.
+/// The holder's exit margin (blocks kept for a forced close to play out
+/// before her last request height) and timeout-confirmation allowance,
+/// with the signed challenge window: the most blocks she may stay offline
+/// once the hub asserts. No policy is persisted here and calculating it
+/// never starts a recovery.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Safety {
     pub assert_height: u32,
     pub response_window: u32,
-    pub proof_margin: u32,
+    pub exit_margin: u32,
     pub timeout_slack: u32,
+    pub challenge_window: u32,
     /// Latest planned R confirmation, not the time to start broadcasting.
     /// None if the margin does not fit before the assertion deadline.
     pub request_by: Option<u32>,
@@ -24,18 +28,20 @@ impl Safety {
     pub fn new(
         assert_height: u32,
         response_window: u32,
-        proof_margin: u32,
+        exit_margin: u32,
         timeout_slack: u32,
+        challenge_window: u32,
     ) -> Self {
         let request_by = response_window
-            .checked_add(proof_margin)
+            .checked_add(exit_margin)
             .and_then(|n| n.checked_add(timeout_slack))
             .and_then(|n| assert_height.checked_sub(n));
         Self {
             assert_height,
             response_window,
-            proof_margin,
+            exit_margin,
             timeout_slack,
+            challenge_window,
             request_by,
         }
     }
@@ -43,11 +49,6 @@ impl Safety {
     /// Planning is feasible at the boundary, overdue one block later.
     pub fn overdue(self, tip: u32) -> bool {
         self.request_by.is_none_or(|by| tip > by)
-    }
-
-    /// Actual blocks left to assert once the hub's answer confirms.
-    pub fn proving_blocks(self, answered_at: u32) -> u32 {
-        self.assert_height.saturating_sub(answered_at)
     }
 }
 
@@ -58,7 +59,7 @@ pub fn of<T: Transport>(
     dir: &std::path::Path,
     id: &[u8; 32],
     tip: u32,
-    proof_margin: u32,
+    exit_margin: u32,
     timeout_slack: u32,
 ) -> Result<Safety> {
     let store = Store::existing(dir)?.context("no contracts")?;
@@ -74,8 +75,9 @@ pub fn of<T: Transport>(
     Ok(Safety::new(
         graph.request_height,
         u32::from(graph.response_window),
-        proof_margin,
+        exit_margin,
         timeout_slack,
+        u32::from(graph.challenge_window),
     ))
 }
 
@@ -85,25 +87,20 @@ mod tests {
 
     #[test]
     fn the_holder_chooses_the_margin_and_the_equal_boundary_fits() {
-        let s = Safety::new(10_000, 12, 2_016, 6);
+        let s = Safety::new(10_000, 12, 2_016, 6, 144);
         assert_eq!(s.request_by, Some(7_966));
         assert!(!s.overdue(7_966));
         assert!(s.overdue(7_967));
-        assert_eq!(Safety::new(10_000, 12, 1_008, 6).request_by, Some(8_974));
+        assert_eq!(
+            Safety::new(10_000, 12, 1_008, 6, 144).request_by,
+            Some(8_974)
+        );
     }
 
     #[test]
     fn short_and_overflowing_terms_are_not_feasible() {
-        assert_eq!(Safety::new(100, 12, 2_016, 6).request_by, None);
-        assert!(Safety::new(100, 12, 2_016, 6).overdue(0));
-        assert_eq!(Safety::new(u32::MAX, 12, u32::MAX, 6).request_by, None);
-    }
-
-    #[test]
-    fn actual_proving_time_shrinks_when_the_hub_answers_late() {
-        let s = Safety::new(10_000, 12, 2_016, 6);
-        assert_eq!(s.proving_blocks(7_984), 2_016);
-        assert_eq!(s.proving_blocks(9_999), 1);
-        assert_eq!(s.proving_blocks(10_001), 0);
+        assert_eq!(Safety::new(100, 12, 2_016, 6, 144).request_by, None);
+        assert!(Safety::new(100, 12, 2_016, 6, 144).overdue(0));
+        assert_eq!(Safety::new(u32::MAX, 12, u32::MAX, 6, 144).request_by, None);
     }
 }

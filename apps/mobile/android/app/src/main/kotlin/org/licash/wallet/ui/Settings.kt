@@ -362,7 +362,7 @@ private fun Advanced(engine: Engine, ui: Ui, balance: () -> Unit) {
         }
     }
     if (ui.wallet) Group("Renewing notes") { RenewLimit(engine) }
-    if (ui.wallet) Group("Recovery safety") { ProofMargin(engine) }
+    if (ui.wallet) Group("Recovery safety") { ExitMargin(engine) }
     Group("Bitcoin light client") {
         LightClient(engine)
         Divider()
@@ -433,15 +433,15 @@ private fun RenewLimit(engine: Engine) {
 
 /** A holder-owned planning margin, never automatic spending consent. */
 @Composable
-private fun ProofMargin(engine: Engine) {
-    var days by remember { mutableStateOf(engine.prefs.proofMarginDays.toString()) }
+private fun ExitMargin(engine: Engine) {
+    var days by remember { mutableStateOf(engine.prefs.exitMarginDays.toString()) }
     var saved by remember { mutableStateOf(false) }
     val value = days.toIntOrNull()?.takeIf { it in 1..30 }
-    Say("Time reserved for a disputed proof, about 14 days by default. This is planning only, not automatic closing. Your wallet must stay online and confirm its timeout promptly; a hub may answer late until that timeout wins.")
+    Say("Time reserved for a forced close to play out (your exit margin), about 14 days by default. This is planning only, not automatic closing. Your wallet must stay online and confirm its timeout promptly; a hub may answer late until that timeout wins.")
     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
         Field(days, { days = it; saved = false }, "Days", "1 to 30, estimated from block times", Modifier.weight(1f), failed = value == null, number = true)
         FilledTonalButton(enabled = value != null && !saved, onClick = {
-            value?.let { engine.prefs.proofMarginDays = it; saved = true }
+            value?.let { engine.prefs.exitMarginDays = it; saved = true }
         }) { Text(if (saved) "Saved" else "Save") }
     }
 }

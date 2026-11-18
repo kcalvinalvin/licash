@@ -99,6 +99,7 @@ internal fun HubPage(
                 CoverRow(
                     c,
                     ui.chain.height,
+                    ui.network,
                     ui.developer,
                     recovery = ui.recoveries.find { it.id == c.id },
                     safety = { engine.contractSafety(c.id).getOrNull() },

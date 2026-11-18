@@ -667,14 +667,15 @@ struct SwapsArgs {
         default_value_t = 14
     )]
     swaps_contract_successor_days: u32,
-    /// Days kept to prove a recovery's claim in, before each contract's
-    /// last block to assert it in: its safe deadline comes a day earlier.
+    /// Days kept for a forced close to play out in (the exit margin),
+    /// before each contract's last request height: its safe deadline comes
+    /// a day earlier.
     #[arg(
         long,
-        env = "LICASH_HUB_SWAPS_CONTRACT_PROOF_DAYS",
+        env = "LICASH_HUB_SWAPS_CONTRACT_EXIT_DAYS",
         default_value_t = 14
     )]
-    swaps_contract_proof_days: u32,
+    swaps_contract_exit_days: u32,
     /// The most a successor costs, in sat [default: what the contract it
     /// replaces cost, and a quarter].
     #[arg(long, env = "LICASH_HUB_SWAPS_CONTRACT_MAX_PRICE")]
@@ -772,7 +773,7 @@ impl SwapsArgs {
         );
         let settings = keeper::Settings::new(
             network,
-            self.swaps_contract_proof_days,
+            self.swaps_contract_exit_days,
             self.swaps_contract_successor_days,
             hint,
         );
