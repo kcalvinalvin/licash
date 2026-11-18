@@ -60,9 +60,11 @@ one refused for its fee is not retried at a higher one. `optimize <hub>`
 previews a remint with its fee; `optimize <hub> --max-fee SAT` makes it
 now, within that fee and the contract ceilings, bypassing the rests and the
 daily budget. `history` lists a remint as `optimized notes`, with its fee.
-A wallet file is upgraded to version 8 when first opened by this version,
-which older versions refuse: notes unlinked before begin their rest then,
-and nothing is reminted or asked of a hub by the upgrade itself.
+A wallet file is upgraded to version 13 when first opened by this version,
+which older versions refuse: notes unlinked before version 8 begin their
+rest then, no lock reads as claimed by a recovery or owed to the wallet
+on Bitcoin, and nothing is reminted or asked of a hub by the upgrade
+itself.
 
 `code` prints a payment code (a BIP321 URI, `--qr` for a QR code) naming the
 wallet, the hubs it is paid at and its Nostr mailbox, if they name relays.
