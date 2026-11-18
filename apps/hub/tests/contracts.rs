@@ -588,6 +588,9 @@ async fn a_holder_forces_her_contract_closed_on_a_silent_hub_and_takes_her_notes
     // Given up: her notes back. Then forced closed again.
     recovery::give_up(&wallet, &mine, &opened.id)?;
     ensure!(available(&wallet)? == 3_000 && recovery::recoveries(&mine)?.is_empty());
+    // Asked again, as a second tap waiting behind the first: done already.
+    recovery::give_up(&wallet, &mine, &opened.id)?;
+    ensure!(available(&wallet)? == 3_000);
     let forced = recovery::force_close(&wallet, &chain, &mine, &opened.id, rate).await?;
     ensure!(
         forced.stage == Stage::Claimed && forced.claimed == 3_000,

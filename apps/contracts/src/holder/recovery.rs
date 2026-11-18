@@ -340,7 +340,15 @@ pub fn give_up<T: Transport>(
     id: &[u8; 32],
 ) -> Result<()> {
     let store = Store::existing(dir)?.context("no contracts")?;
-    ensure!(store.recovery(id)?.is_some(), "no recovery of it");
+    if store.recovery(id)?.is_none() {
+        // Given up already, asked twice (a second tap waiting behind the
+        // first, say): nothing left to give back.
+        ensure!(
+            store.list()?.iter().any(|c| &c.id == id),
+            "no such contract"
+        );
+        return Ok(());
+    }
     ensure!(
         store.revoke_recovery(id, Stage::GivingUp.as_str(), Some("given up"))?,
         "past giving up: her request is signed"
