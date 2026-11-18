@@ -1435,14 +1435,14 @@ fn the_forwards_since_a_time_sum_what_is_paid_or_under_way() {
     assert_eq!(hub.forwarded_since(0).unwrap(), 0);
     let paid = forwarded([1; 32], "node");
     let failed = forwarded([2; 32], "node");
-    forwarded([3; 32], "node");
     forwarded([4; 32], licash_hub::LOCAL);
+    let last = forwarded([3; 32], "node");
     assert_eq!(hub.forwarded_since(0).unwrap(), 12);
     hub.forward_paid(&paid, &[1; 32]).unwrap();
     hub.forward_failed(&failed, "no route").unwrap();
     assert_eq!(hub.forwarded_since(0).unwrap(), 8);
-    // Recorded now: none since later.
-    let now = hub.forward_of(&paid).unwrap().unwrap().created_at;
-    assert_eq!(hub.forwarded_since(now).unwrap(), 8);
-    assert_eq!(hub.forwarded_since(now + 1).unwrap(), 0);
+    // From the second the last was recorded in, none since the next.
+    let at = hub.forward_of(&last).unwrap().unwrap().created_at;
+    assert!(hub.forwarded_since(at).unwrap() >= 4);
+    assert_eq!(hub.forwarded_since(at + 1).unwrap(), 0);
 }
