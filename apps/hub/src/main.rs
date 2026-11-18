@@ -962,7 +962,7 @@ enum Command {
     /// resumes within half a minute) or without it. What its ledger shows
     /// now is taken as known: more found later pause again. Look at the
     /// alert and the ledger first: such notes were made with the hub's
-    /// seed outside it.
+    /// seed outside it, unless its ledger was restored from an older copy.
     ResumePayouts,
     /// The hub's events as JSON lines, oldest first.
     Events {

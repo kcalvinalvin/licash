@@ -12,16 +12,24 @@
 //! notes of a denomination. And it stops only what leaves over Lightning,
 //! not swaps or contract claims.
 //!
+//! A ledger restored from an older copy shows the same: the notes it
+//! issued since that copy are retired and, to it, never issued. So does a
+//! hub resumed with such notes known, for what it retires beyond those
+//! issued is the notes made outside it less those of its own outstanding,
+//! and rises again as its holders spend theirs. Only a hub that knows of
+//! none is told of nothing but notes made outside its ledger.
+//!
 //! Kept in `<data>/payouts.json`, read again at every look, so that
 //! `licash-hub resume-payouts` reaches the running hub:
 //! - no file, as of a hub that never ran this watch: what the ledger shows
 //!   then is taken as known, told the operator if any, and nothing pauses;
-//! - `baseline`: the notes beyond those issued the operator knows of. More
-//!   than these pause; fewer lower it;
+//! - `baseline`: the notes beyond those issued the operator knows of, as
+//!   of the last resume. More than these pause;
 //! - `paused`: why payments out are paused, across restarts;
 //! - a file that does not read pauses, and is told.
 
 use std::collections::HashSet;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -50,7 +58,8 @@ pub struct Kept {
 pub struct Guard {
     data: PathBuf,
     paused: Mutex<Option<String>>,
-    /// What the operator was alerted of, once each.
+    /// What the operator was alerted of, once each until payments out
+    /// resume.
     told: Mutex<HashSet<String>>,
 }
 
@@ -78,8 +87,8 @@ impl Guard {
     }
 
     /// Look at the ledger once, and keep what is found: what to alert the
-    /// operator of, each thing once a run. A ledger that does not read
-    /// changes nothing.
+    /// operator of, each thing once until payments out resume. A ledger
+    /// that does not read changes nothing.
     pub fn check(&self) -> Vec<String> {
         let before = match kept(&self.data) {
             Ok(before) => before,
@@ -102,13 +111,20 @@ impl Guard {
         };
         let (now, alert) = judge(before.clone(), &excess);
         // Kept before it takes effect; in effect even if it cannot be.
+        let mut alerts = Vec::new();
         if before.as_ref() != Some(&now) {
             if let Err(e) = keep(&self.data, &now) {
                 tracing::error!("cannot keep {FILE}: {e:#}");
+                alerts = self.once(format!(
+                    "The watch over Lightning payments out cannot keep {FILE}: what it finds \
+                     is lost when the hub restarts, and with no such file it takes what the \
+                     ledger shows as known and pauses nothing."
+                ));
             }
         }
         self.pause(now.paused);
-        alert.map_or_else(Vec::new, |alert| self.once(alert))
+        alerts.extend(alert.map_or_else(Vec::new, |alert| self.once(alert)));
+        alerts
     }
 
     /// Look at the ledger every [`EVERY`], alerting the operator through
@@ -131,7 +147,12 @@ impl Guard {
     }
 
     fn pause(&self, why: Option<String>) {
-        *self.paused.lock().unwrap_or_else(|e| e.into_inner()) = why;
+        let mut paused = self.paused.lock().unwrap_or_else(|e| e.into_inner());
+        if paused.is_some() && why.is_none() {
+            // Resumed: a pause after it is told again, whatever its words.
+            self.told.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        }
+        *paused = why;
     }
 
     fn once(&self, alert: String) -> Vec<String> {
@@ -151,8 +172,9 @@ fn judge(before: Option<Kept>, excess: &[Excess]) -> (Kept, Option<String>) {
         let alert = (!excess.is_empty()).then(|| {
             format!(
                 "The ledger retired notes it never issued ({}), before it was watched for \
-                 them: made with the hub's seed outside its ledger. Taken as known: payments \
-                 out are not paused, and pause if more are found.",
+                 them: made with the hub's seed outside its ledger, or issued after the copy \
+                 a restored ledger was taken at. Taken as known: payments out are not \
+                 paused, and pause if more are found.",
                 listed(excess)
             )
         });
@@ -171,16 +193,9 @@ fn judge(before: Option<Kept>, excess: &[Excess]) -> (Kept, Option<String>) {
         .filter(|e| e.notes > known(e))
         .copied()
         .collect();
-    // Lowered as the ledger issues: what it found before, found again,
-    // pauses.
-    let baseline = excess
-        .iter()
-        .map(|e| Excess {
-            notes: e.notes.min(known(e)),
-            ..*e
-        })
-        .filter(|e| e.notes > 0)
-        .collect();
+    // What is known stays so until the operator resumes. Lowered as the
+    // ledger issues, it would pause as holders spend what it issued them:
+    // each note issued takes one from the excess, and spent, gives it back.
     let (paused, alert) = match (before.paused, new.is_empty()) {
         (Some(paused), _) => (Some(paused), None),
         (None, true) => (None, None),
@@ -191,12 +206,15 @@ fn judge(before: Option<Kept>, excess: &[Excess]) -> (Kept, Option<String>) {
             );
             let alert = format!(
                 "Lightning payments out are paused: {why}, made with the hub's seed outside \
-                 its ledger. Treat the seed as held by someone else. Invoices are refused and \
-                 their locks refunded until `licash-hub resume-payouts`."
+                 its ledger. Unless the ledger was restored from an older copy, or notes \
+                 like these were known when payments out last resumed, treat the seed as \
+                 held by someone else. Invoices are refused and their locks refunded until \
+                 `licash-hub resume-payouts`."
             );
             (Some(why), Some(alert))
         }
     };
+    let baseline = before.baseline;
     (Kept { baseline, paused }, alert)
 }
 
@@ -227,11 +245,14 @@ pub fn kept(data: &Path) -> Result<Option<Kept>> {
     Ok(Some(serde_json::from_slice(&bytes)?))
 }
 
-/// Keep `kept` in `data`, whole or not at all.
+/// Keep `kept` in `data`, whole or not at all, a power cut included.
 fn keep(data: &Path, kept: &Kept) -> Result<()> {
     let (file, part) = (data.join(FILE), data.join(format!("{FILE}.part")));
-    std::fs::write(&part, serde_json::to_vec_pretty(kept)?)?;
+    let mut written = std::fs::File::create(&part)?;
+    written.write_all(&serde_json::to_vec_pretty(kept)?)?;
+    written.sync_all()?;
     std::fs::rename(&part, &file)?;
+    std::fs::File::open(data)?.sync_all()?;
     Ok(())
 }
 
@@ -301,20 +322,20 @@ mod tests {
         assert!(kept.paused.is_some() && alert.is_some());
     }
 
+    /// A note the ledger issues takes one from what it retired beyond
+    /// those issued, and spent, gives it back: no more than was known.
     #[test]
-    fn what_is_known_lowers_as_the_ledger_issues() {
+    fn what_is_known_stays_as_the_ledger_issues_and_its_holders_spend() {
         let known = Kept {
             baseline: vec![of(4, 5), of(8, 1)],
             paused: None,
         };
-        let (kept, alert) = judge(Some(known), &[of(4, 3)]);
-        assert_eq!(
-            (kept.baseline.clone(), kept.paused.clone()),
-            (vec![of(4, 3)], None)
-        );
-        assert_eq!(alert, None);
-        // Found again as before: more than is known now.
-        let (kept, alert) = judge(Some(kept), &[of(4, 5)]);
+        for found in [vec![of(4, 3)], vec![], vec![of(4, 5), of(8, 1)]] {
+            assert_eq!(judge(Some(known.clone()), &found), (known.clone(), None));
+        }
+        // One more than was known pauses, whatever was found between.
+        let (kept, alert) = judge(Some(known.clone()), &[of(4, 6)]);
+        assert_eq!(kept.baseline, known.baseline);
         assert!(kept.paused.is_some() && alert.is_some());
     }
 
@@ -360,5 +381,26 @@ mod tests {
         assert!(was.unwrap().contains("does not read"));
         guard.check();
         assert!(!guard.paused());
+        // Paused again for the same after a resume: told again.
+        std::fs::write(dir.path().join(FILE), b"{").unwrap();
+        assert_eq!(guard.check().len(), 1);
+        assert!(guard.paused());
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_kept_is_told_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (seed, db) = (dir.path().join("seed"), dir.path().join("hub.sqlite"));
+        Hub::init(&seed, &db, 6).unwrap();
+        // Nothing is written over a directory.
+        std::fs::create_dir(dir.path().join(format!("{FILE}.part"))).unwrap();
+        let guard = Guard::open(dir.path());
+        let alerts = guard.check();
+        assert!(
+            alerts.len() == 1 && alerts[0].contains("cannot keep"),
+            "{alerts:?}"
+        );
+        assert_eq!(guard.check(), Vec::<String>::new());
+        assert!(!guard.paused() && kept(dir.path()).unwrap().is_none());
     }
 }
