@@ -317,6 +317,42 @@ pub fn contract_change_problem(
     }
 }
 
+/// The cap a contract within `range` over `blocks` paid from a coin of
+/// `coin` sat starts at: `start`, if the coin pays it ([`contract_change_problem`]),
+/// else the most the coin pays, little or nothing left of it, if that has
+/// no problem. None if neither: a coin too small for the least, say.
+#[uniffi::export]
+pub fn payable_cap(
+    range: ContractRange,
+    coin: u64,
+    start: u64,
+    blocks: u32,
+    dust: u64,
+    change: Option<ChangeRange>,
+) -> Option<u64> {
+    let most = contract_max_cap(range, coin)?;
+    let price = |cap| contract_price(range, cap, blocks);
+    let fits = |cap| contract_change_problem(coin, price(cap), cap, dust, change).is_none();
+    let asked = start.clamp(range.min_cap, most);
+    if fits(asked) {
+        return Some(asked);
+    }
+    // Its price grows with the cap: the largest the coin pays.
+    let (mut lo, mut hi) = (range.min_cap, most);
+    if price(lo) > coin {
+        return None;
+    }
+    while lo < hi {
+        let mid = lo + (hi - lo).div_ceil(2);
+        if price(mid) <= coin {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    fits(lo).then_some(lo)
+}
+
 /// A fee, in sat: `base` plus `ppm` millionths of what it is on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct Rate {

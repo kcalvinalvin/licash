@@ -29,6 +29,7 @@ import org.licash.core.DepositCoin
 import org.licash.core.contractChangeProblem
 import org.licash.core.contractMaxCap
 import org.licash.core.contractPrice
+import org.licash.core.payableCap
 import org.licash.wallet.Chosen
 import org.licash.wallet.Engine
 import org.licash.wallet.sat
@@ -69,7 +70,8 @@ internal fun OfferSheet(engine: Engine, q: ContractQuote, dismiss: () -> Unit) {
 
 /**
  * Protection of terms chosen within what its hub allows: how much it
- * covers and for how long, at first as `q` suggests, priced as the hub
+ * covers and for how long, at first as `q` suggests (covering less if the
+ * coin pays no more, [payableCap]), priced as the hub
  * prices them, and which of `coins` pays, if there are several. A coin
  * turns whole into the protection and notes it covers: what is left of
  * it joins the balance, never left as change on Bitcoin, so it covers
@@ -95,13 +97,15 @@ internal fun ChooseSheet(
     val download = android.text.format.Formatter.formatShortFileSize(LocalContext.current, q.download.toLong())
     val start = if (coins.isEmpty()) maxOf(q.suggestedCap, held) else q.suggestedCap
     var blocks by remember(q) { mutableStateOf(q.suggestedBlocks.coerceIn(range.minBlocks, range.maxBlocks)) }
-    // At first the largest that pays as suggested, whole.
+    // At first the largest that pays as suggested, whole, else the largest
+    // that pays less: never a cost past the coin to start with.
+    val payable = { c: DepositCoin -> payableCap(range, c.value, start, blocks, q.dust, q.change) }
     var coin by remember(q) {
         val price = contractPrice(range, start, blocks)
         val whole = coins.firstOrNull { contractChangeProblem(it.value, price, start, q.dust, q.change) == null }
-        mutableStateOf(whole ?: coins.firstOrNull())
+        mutableStateOf(whole ?: coins.firstOrNull { payable(it) != null } ?: coins.firstOrNull())
     }
-    var cap by remember(q) { mutableStateOf(start) }
+    var cap by remember(q) { mutableStateOf(coin?.let(payable) ?: start) }
     val most = coin?.let { contractMaxCap(range, it.value) ?: range.minCap } ?: range.maxCap
     val value = coin?.value ?: 0uL
     // As asked, what is left of the coin it covers at least: it costs more then, leaving less.

@@ -798,13 +798,21 @@ async fn contracted(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     let before = phone.balance().await?;
     eprintln!("a coin of {coin} kept, {before} held, {credit} on credit");
 
-    // Paid from it now, of terms chosen within hub1's range: at first a
-    // cap of half again the coin, over the longest hub1 allows, priced as
-    // hub1 prices them as they change.
+    // Paid from it now, of terms chosen within hub1's range, over the
+    // longest hub1 allows, priced as hub1 prices them as they change: at
+    // first not half again the coin, which costs more than it holds, but
+    // the most it pays, its price exactly.
     at_hub(phone, eco.hub(1)).await?;
     phone.tap_id("open-contract").await?;
     let cap = amount(&phone.by_id("quote-cap", 60).await?.text);
-    ensure!(cap == coin + coin / 2, "a cap of {cap} offered on {coin}");
+    ensure!(
+        price(coin + coin / 2, 1_000) > coin,
+        "half again {coin} paid"
+    );
+    ensure!(
+        price(cap, 1_000) == coin && price(cap + 1, 1_000) > coin,
+        "a cap of {cap} offered on {coin}"
+    );
     let costs = |cap: u64, blocks: u32| async move {
         let want = price(cap, blocks);
         until(&format!("{want} for {blocks} blocks"), 10, || async {
@@ -815,18 +823,29 @@ async fn contracted(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
         .await
     };
     costs(cap, 1_000).await?;
+    // Not refused at first: nothing to say against it.
+    ensure!(
+        !phone.has("contract-problem").await?,
+        "a problem with {cap}"
+    );
+    // The most the coin allows costs more than it holds: refused, said why.
+    phone.slide_id("contract-cap", 1.0).await?;
+    let most = amount(&phone.by_id("quote-cap", 10).await?.text);
+    costs(most, 1_000).await?;
+    ensure!(
+        price(most, 1_000) > coin,
+        "{most} costs no more than {coin}"
+    );
+    phone.by_id("contract-problem", 10).await?;
     // Its shortest costs less, at once; the longest again, to protect.
     phone.slide_id("contract-blocks", 0.0).await?;
-    costs(cap, 200).await?;
+    costs(most, 200).await?;
     phone.slide_id("contract-blocks", 1.0).await?;
-    costs(cap, 1_000).await?;
+    costs(most, 1_000).await?;
     ensure!(
-        price(cap, 1_000) > price(cap, 200),
+        price(most, 1_000) > price(most, 200),
         "the longest costs more"
     );
-    // So large a cap costs more than the coin holds: refused, said why.
-    ensure!(price(cap, 1_000) > coin, "{cap} costs no more than {coin}");
-    phone.by_id("contract-problem", 10).await?;
     // The least, the coin's price exactly: it turns whole into it.
     phone.slide_id("contract-cap", 0.0).await?;
     phone.tagged("quote-cap", "4,096 sat", 10).await?;

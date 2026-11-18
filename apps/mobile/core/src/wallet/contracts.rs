@@ -874,6 +874,31 @@ mod tests {
     }
 
     #[test]
+    fn a_contract_chosen_starts_at_a_cap_its_coin_pays() {
+        let taken = Some(ChangeRange {
+            least: 11_000,
+            most: 50_000_000,
+        });
+        let range = crate::ContractRange::from(range());
+        let start = |coin, cap| crate::payable_cap(range, coin, cap, 26_280, 330, taken);
+        // The 10 M sat coin pays half again itself: as suggested.
+        assert_eq!(start(10_000_000, 15_000_000), Some(15_000_000));
+        // A coin of 30 k sat pays 45 k sat, its 7 k sat left too little
+        // to take into notes; no cap leaves less but past twice the coin.
+        assert_eq!(start(30_000, 45_000), None);
+        // A coin of 23,100 sat pays no 34,650 sat (23,173): the most it
+        // pays, of what costs 23,100 exactly, nothing left of it.
+        let cap = start(23_100, 34_650).unwrap();
+        let price = |cap| crate::contract_price(range, cap, 26_280);
+        assert_eq!(price(cap), 23_100);
+        assert!(price(cap + 1) > 23_100, "{cap} is not the most");
+        assert!(cap >= range.min_cap && cap < 34_650);
+        // Too small a coin for the least, 23,020 sat: none.
+        assert_eq!(start(23_000, 34_650), None);
+        assert_eq!(start(2_000, 4_096), None);
+    }
+
+    #[test]
     fn inverted_contract_ranges_are_refused_before_suggesting_terms() {
         assert!(check_range(&range()).is_ok());
         let mut inverted = range();
