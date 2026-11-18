@@ -482,6 +482,18 @@ impl Drop for Open {
     }
 }
 
+/// `e` and what caused it, as hyper's "connection error" says nothing of
+/// why: a circuit closed, a stream reset.
+fn why(e: &(dyn std::error::Error + 'static)) -> String {
+    let mut text = e.to_string();
+    let mut source = e.source();
+    while let Some(cause) = source {
+        text = format!("{text}: {cause}");
+        source = cause.source();
+    }
+    text
+}
+
 /// How a request on a connection failed.
 enum Lost {
     /// Not sent: the connection had closed. The request back.
@@ -508,7 +520,7 @@ impl Open {
             Err(mut e) => {
                 return Err(match e.take_message() {
                     Some(request) => Lost::Unsent(Box::new(request)),
-                    None => Lost::Sent(e.into_error().to_string()),
+                    None => Lost::Sent(why(&e.into_error())),
                 })
             }
         };
@@ -520,7 +532,7 @@ impl Open {
             let stalled = || format!("the answer stalled for {} s", STALLED.as_secs());
             match frame.map_err(|_| Lost::Sent(stalled()))? {
                 None => return Ok((status, bytes)),
-                Some(Err(e)) => return Err(Lost::Sent(format!("the answer: {e}"))),
+                Some(Err(e)) => return Err(Lost::Sent(format!("the answer: {}", why(&*e)))),
                 Some(Ok(frame)) => {
                     if let Ok(data) = frame.into_data() {
                         bytes.extend_from_slice(&data);
@@ -621,6 +633,25 @@ impl Kept {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failure_says_what_caused_it() {
+        #[derive(Debug)]
+        struct Connection(std::io::Error);
+        impl std::fmt::Display for Connection {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("connection error")
+            }
+        }
+        impl std::error::Error for Connection {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+        let reset = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "circuit closed");
+        assert_eq!(why(&Connection(reset)), "connection error: circuit closed");
+        assert_eq!(why(&std::io::Error::other("no stream")), "no stream");
+    }
 
     fn target(host: &str, port: u16, tls: bool) -> Target {
         Target {
