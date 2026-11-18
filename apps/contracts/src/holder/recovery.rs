@@ -1293,19 +1293,21 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
             payout.amount,
             Role::User,
         )?;
-        if owned.is_empty() {
+        let left = left_in_request(state, self.rate)?;
+        if owned.is_empty() && left.is_empty() {
             // Nothing of the payout is hers (a corrected zero): done.
             state.swept_height = Some(height);
             state.next_at = None;
             return Ok(Next::To(Stage::Done));
         }
-        let sweep = dispute::sweep(
+        let sweep = dispute::sweep_with(
             &self.o.babe,
             &self.keys.party.payment,
             payout,
             Role::User,
             self.wallet.fallback_address()?.script_pubkey(),
             self.rate,
+            &left,
         )?;
         let delay = sweep
             .input
@@ -1328,8 +1330,14 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
     async fn swept(&self, state: &mut State, tip: u32) -> Result<Next> {
         let sweep = state.sweep.as_ref().context("no pinned sweep")?;
         let payout = state.payout.as_ref().context("no payout")?;
-        let coin = sweep.input.last().context("empty sweep")?.previous_output;
-        let script = &payout
+        let coin = sweep.input.first().context("empty sweep")?.previous_output;
+        // A payout's output, or her request's left to her (its purse).
+        let r = state.r.as_ref().context("no R")?;
+        let from_tx = [payout, r]
+            .into_iter()
+            .find(|tx| tx.compute_txid() == coin.txid)
+            .context("unknown sweep input")?;
+        let script = &from_tx
             .output
             .get(coin.vout as usize)
             .context("unknown sweep input")?
@@ -1363,6 +1371,33 @@ fn blocks(sequence: Sequence) -> Result<u32> {
         Some(other) => bail!("a relative lock of {other}, not in blocks"),
     }
 }
+/// Her request's anchor and purse, if her claim's slot was reclaimed, P
+/// never published to spend them, and her payout spent neither as its
+/// fee coin: hers alone, swept with her payout. Each worth more than its
+/// input's fee at `rate`.
+fn left_in_request(state: &State, rate: FeeRate) -> Result<Vec<(OutPoint, TxOut)>> {
+    if !state.reclaimed {
+        return Ok(Vec::new());
+    }
+    let r = state.r.as_ref().context("no R")?;
+    let payout = state.payout.as_ref().context("no payout")?;
+    let spent: Vec<OutPoint> = payout.input.iter().map(|i| i.previous_output).collect();
+    Ok([1, PURSE_VOUT]
+        .into_iter()
+        .filter_map(|vout| {
+            let op = OutPoint {
+                txid: r.compute_txid(),
+                vout,
+            };
+            let out = r.output.get(vout as usize)?;
+            // Its fee leaf spent: a signature, the script and a control
+            // block, about 75 vB.
+            let worth = rate.fee_vb(75).is_some_and(|fee| out.value > fee);
+            (worth && !spent.contains(&op)).then(|| (op, out.clone()))
+        })
+        .collect())
+}
+
 /// Her terminal's fee coin: P's, or, P never published (her claim's slot
 /// reclaimed), her purse, R's, whole.
 fn fee_coin(state: &State) -> Result<(OutPoint, TxOut)> {

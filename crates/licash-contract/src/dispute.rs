@@ -362,6 +362,20 @@ pub fn sweep(
     to: ScriptBuf,
     rate: FeeRate,
 ) -> Result<Transaction> {
+    sweep_with(babe, key, payout, party, to, rate, &[])
+}
+/// [`sweep`], `coins` of `key`'s fee script ([`fee_script`]) swept with
+/// what the payout owes: a request's anchor and purse, say, no claim
+/// published to spend them. Of those alone if the payout owes nothing.
+pub fn sweep_with(
+    babe: &HubProves,
+    key: &Keypair,
+    payout: Payout<'_>,
+    party: Role,
+    to: ScriptBuf,
+    rate: FeeRate,
+    coins: &[(OutPoint, TxOut)],
+) -> Result<Transaction> {
     let owned = babe.core().owned(
         payout.transaction,
         payout.value_key,
@@ -369,31 +383,48 @@ pub fn sweep(
         payout.amount,
         party,
     )?;
-    sweep_owned(&owned, key, payout.wire, to, rate)
+    sweep_owned(&owned, coins, key, payout.wire, to, rate)
 }
 fn sweep_owned(
     owned: &[Owned],
+    coins: &[(OutPoint, TxOut)],
     key: &Keypair,
     wire: &[Vec<u8>],
     to: ScriptBuf,
     rate: FeeRate,
 ) -> Result<Transaction> {
-    ensure!(!owned.is_empty(), "no owned outputs");
-    let prevouts: Vec<_> = owned.iter().map(|o| o.out.clone()).collect();
+    ensure!(!owned.is_empty() || !coins.is_empty(), "no owned outputs");
+    let prevouts: Vec<_> = (owned.iter().map(|o| o.out.clone()))
+        .chain(coins.iter().map(|(_, out)| out.clone()))
+        .collect();
     let total = prevouts.iter().try_fold(Amount::ZERO, |s, o| {
         s.checked_add(o.value).context("sweep overflow")
     })?;
+    let inputs: Vec<_> = (owned.iter().map(|o| (o.op, o.sequence)))
+        .chain(
+            coins
+                .iter()
+                .map(|(op, _)| (*op, Sequence::ENABLE_RBF_NO_LOCKTIME)),
+        )
+        .collect();
     let mut tx = build_tx(
-        &owned.iter().map(|o| (o.op, o.sequence)).collect::<Vec<_>>(),
+        &inputs,
         vec![TxOut {
             value: total,
             script_pubkey: to,
         }],
         LockTime::ZERO,
     );
-    for (i, o) in owned.iter().enumerate() {
-        tx.input[i].witness = o.witness(&tx, i, &prevouts, key, wire)?;
-    }
+    let sign = |tx: &mut Transaction| -> Result<()> {
+        for (i, o) in owned.iter().enumerate() {
+            tx.input[i].witness = o.witness(tx, i, &prevouts, key, wire)?;
+        }
+        for i in owned.len()..tx.input.len() {
+            sign_fee_input(key, tx, i, &prevouts)?;
+        }
+        Ok(())
+    };
+    sign(&mut tx)?;
     let fee = rate
         .fee_vb(tx.vsize() as u64)
         .context("sweep fee overflow")?;
@@ -402,9 +433,7 @@ fn sweep_owned(
         tx.output[0].value >= tx.output[0].script_pubkey.minimal_non_dust(),
         "dust sweep"
     );
-    for (i, o) in owned.iter().enumerate() {
-        tx.input[i].witness = o.witness(&tx, i, &prevouts, key, wire)?;
-    }
+    sign(&mut tx)?;
     Ok(tx)
 }
 

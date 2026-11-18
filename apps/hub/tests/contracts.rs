@@ -1428,6 +1428,13 @@ async fn a_hub_reclaims_a_claim_never_published_and_answers_it_owed_nothing() ->
         done.payout.is_some() && done.timeout.is_none(),
         "not success: {done:?}"
     );
+    // Her purse, R's, never spent by a P: swept back to her.
+    let purse = bitcoin::OutPoint { txid: r, vout: 3 };
+    ensure!(!rt.is_unspent(&purse)?, "purse stranded: {done:?}");
+    ensure!(
+        done.sweep.is_some() && done.received.is_some_and(|sat| sat > 10_000),
+        "purse not swept: {done:?}"
+    );
     eprintln!("reclaimed: {done:?}");
     Ok(())
 }
