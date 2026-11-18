@@ -458,6 +458,51 @@ impl Source {
         }
     }
 
+    /// Hand `txs` to the network as one package, a child after its
+    /// parents: a parent paying less than the source's mempool takes alone
+    /// relays with the child paying for both. Where the source takes no
+    /// package (a node older than 28, an Esplora without `/txs/package`),
+    /// or refuses it, each goes in turn, as [`Source::broadcast`]: its
+    /// refusal is the error. Their ids.
+    pub async fn broadcast_package(&self, txs: &[Transaction]) -> anyhow::Result<Vec<Txid>> {
+        if txs.len() > 1 && self.submit_package(txs).await.is_ok() {
+            return Ok(txs.iter().map(Transaction::compute_txid).collect());
+        }
+        let mut ids = Vec::with_capacity(txs.len());
+        for tx in txs {
+            ids.push(self.broadcast(tx).await?);
+        }
+        Ok(ids)
+    }
+
+    /// `submitpackage`, from the node or Esplora's `/txs/package`: an
+    /// error unless every transaction is in the mempool after.
+    async fn submit_package(&self, txs: &[Transaction]) -> anyhow::Result<()> {
+        let hexes: Vec<String> = txs.iter().map(serialize_hex).collect();
+        let result: Value = match &self.kind {
+            Kind::Rpc { .. } => self.call("submitpackage", json!([hexes])).await?,
+            Kind::Esplora { base } => {
+                let url = format!("{base}/txs/package");
+                let response = self
+                    .client
+                    .post(&url)
+                    .json(&hexes)
+                    .send()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{self}: {}", e.without_url()))?;
+                let status = response.status();
+                let text = response.text().await.unwrap_or_default();
+                ensure!(status.is_success(), "{self}: {url}: HTTP {status}: {text}");
+                serde_json::from_str(&text).with_context(|| format!("{self}: {url}: {text}"))?
+            }
+        };
+        ensure!(
+            result["package_msg"] == "success",
+            "{self}: package refused: {result}"
+        );
+        Ok(())
+    }
+
     /// The fee rate the source estimates confirms a transaction within
     /// `blocks`: None while it has no estimate, as on a chain of few
     /// transactions.

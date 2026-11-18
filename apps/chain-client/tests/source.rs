@@ -196,6 +196,10 @@ async fn rpc(
             Ok(txid) => rpc_reply(json!(txid)),
             Err((code, message)) => rpc_error(code, message),
         },
+        "submitpackage" => match params[0].as_array() {
+            Some(raws) => rpc_reply(send_package(&chain, raws)),
+            None => rpc_error(-8, "package must be an array"),
+        },
         "estimatesmartfee" => match params[0].as_u64() {
             Some(target @ 1..=144) => rpc_reply(json!({"feerate": 0.00012, "blocks": target})),
             _ => {
@@ -260,12 +264,39 @@ fn unspent<'a>(chain: &'a Chain, script: &'a ScriptBuf) -> Vec<(OutPoint, &'a Tx
     found
 }
 
-/// Take `tx` into the mempool, as a node does, or why not.
+/// Take `tx` into the mempool, as a node does, or why not. A transaction
+/// locked to height 1 pays less than the mempool takes alone.
 fn send(chain: &Chain, raw: &str) -> Result<String, (i64, &'static str)> {
-    let tx: Transaction = hex::decode(raw)
+    let tx = decode(raw)?;
+    if tx.lock_time == LockTime::from_height(1).unwrap() {
+        return Err((-26, "min relay fee not met"));
+    }
+    take(chain, tx)
+}
+
+fn decode(raw: &str) -> Result<Transaction, (i64, &'static str)> {
+    hex::decode(raw)
         .ok()
         .and_then(|raw| deserialize(&raw).ok())
-        .ok_or((-22, "TX decode failed"))?;
+        .ok_or((-22, "TX decode failed"))
+}
+
+/// `submitpackage`'s answer: a child pays for its parents.
+fn send_package(chain: &Chain, raws: &[Value]) -> Value {
+    let txs: Result<Vec<Transaction>, _> = raws
+        .iter()
+        .map(|r| decode(r.as_str().unwrap_or_default()))
+        .collect();
+    let taken = txs.and_then(|txs| txs.into_iter().try_for_each(|tx| take(chain, tx).map(drop)));
+    match taken {
+        Ok(()) => json!({"package_msg": "success", "tx-results": {}}),
+        Err((_, why)) => {
+            json!({"package_msg": "transaction failed", "tx-results": {"x": {"error": why}}})
+        }
+    }
+}
+
+fn take(chain: &Chain, tx: Transaction) -> Result<String, (i64, &'static str)> {
     let txid = tx.compute_txid();
     let confirmed = chain.blocks.iter().flat_map(|b| &b.txdata);
     if confirmed.clone().any(|t| t.compute_txid() == txid) {
@@ -275,7 +306,12 @@ fn send(chain: &Chain, raw: &str) -> Result<String, (i64, &'static str)> {
     if !sent.iter().any(|t| t.compute_txid() == txid) {
         let spends = confirmed.flat_map(|t| &t.input).map(|i| i.previous_output);
         let spent: Vec<OutPoint> = spends.collect();
-        let spendable = |o: &OutPoint| chain.outputs.contains_key(o) && !spent.contains(o);
+        let pending = |o: &OutPoint| {
+            sent.iter()
+                .any(|t| t.compute_txid() == o.txid && (o.vout as usize) < t.output.len())
+        };
+        let spendable =
+            |o: &OutPoint| (chain.outputs.contains_key(o) || pending(o)) && !spent.contains(o);
         if !tx.input.iter().all(|i| spendable(&i.previous_output)) {
             return Err((-25, "bad-txns-inputs-missingorspent"));
         }
@@ -309,6 +345,13 @@ async fn esplora_send(
             (StatusCode::BAD_REQUEST, text).into_response()
         }
     }
+}
+
+async fn esplora_package(
+    State(chain): State<Arc<Chain>>,
+    Json(raws): Json<Vec<Value>>,
+) -> Json<Value> {
+    Json(send_package(&chain, &raws))
 }
 
 async fn esplora_fees() -> Json<Value> {
@@ -438,8 +481,11 @@ async fn serve(
         .route("/api/block/{hash}/{part}", get(esplora_block))
         .route("/api/block/{hash}/txs/{start}", get(esplora_txs))
         .route("/api/tx", post(esplora_send))
+        .route("/api/txs/package", post(esplora_package))
         .route("/api/fee-estimates", get(esplora_fees))
         .route("/api/address/{address}/utxo", get(esplora_utxo))
+        // An Esplora taking no packages.
+        .route("/old/tx", post(esplora_send))
         .with_state(chain);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -610,6 +656,95 @@ async fn both_broadcast_estimate_fees_and_find_what_pays_an_address() {
     }
     // Unconfirmed, it pays the address nothing yet.
     assert_eq!(esplora.unspent(&to(script(0, 1))).await.unwrap().len(), 3);
+}
+
+/// A spend of `coin`, paying `value` to a key hash.
+fn spending(coin: OutPoint, value: u64, lock_time: LockTime) -> Transaction {
+    Transaction {
+        version: transaction::Version::TWO,
+        lock_time,
+        input: vec![TxIn {
+            previous_output: coin,
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(value),
+            script_pubkey: script(0, 2),
+        }],
+    }
+}
+
+#[tokio::test]
+async fn a_parent_below_the_mempools_floor_relays_with_its_child_as_a_package() {
+    let blocks = mine(4);
+    let address = serve(blocks.clone(), PASSWORD, None).await;
+    let [node, esplora] = sources(&address);
+    let low = LockTime::from_height(1).unwrap();
+    for (vout, source) in [(10, &node), (11, &esplora)] {
+        let coin = OutPoint {
+            txid: coinbase_of(&blocks, 4),
+            vout,
+        };
+        let parent = spending(coin, 45, low);
+        let child = spending(
+            OutPoint {
+                txid: parent.compute_txid(),
+                vout: 0,
+            },
+            30,
+            LockTime::ZERO,
+        );
+        let alone = format!("{:#}", source.broadcast(&parent).await.unwrap_err());
+        assert!(alone.contains("min relay fee not met"), "{source}: {alone}");
+        let ids = source
+            .broadcast_package(&[parent.clone(), child.clone()])
+            .await
+            .unwrap();
+        assert_eq!(
+            ids,
+            [parent.compute_txid(), child.compute_txid()],
+            "{source}"
+        );
+        // Again: both known.
+        source.broadcast_package(&[parent, child]).await.unwrap();
+    }
+    // An Esplora taking no packages: each in turn, the parent refused.
+    let old: Source = format!("esplora+http://{address}/old/").parse().unwrap();
+    let coin = OutPoint {
+        txid: coinbase_of(&blocks, 4),
+        vout: 12,
+    };
+    let parent = spending(coin, 45, low);
+    let child = spending(
+        OutPoint {
+            txid: parent.compute_txid(),
+            vout: 0,
+        },
+        30,
+        LockTime::ZERO,
+    );
+    let refused = format!(
+        "{:#}",
+        old.broadcast_package(&[parent, child]).await.unwrap_err()
+    );
+    assert!(refused.contains("min relay fee not met"), "{refused}");
+    // One paying its way: in turn, the child after it.
+    let parent = spending(coin, 45, LockTime::ZERO);
+    let child = spending(
+        OutPoint {
+            txid: parent.compute_txid(),
+            vout: 0,
+        },
+        30,
+        LockTime::ZERO,
+    );
+    let ids = old
+        .broadcast_package(&[parent.clone(), child.clone()])
+        .await
+        .unwrap();
+    assert_eq!(ids, [parent.compute_txid(), child.compute_txid()]);
 }
 
 fn coinbase_of(blocks: &[Block], height: usize) -> bitcoin::Txid {
