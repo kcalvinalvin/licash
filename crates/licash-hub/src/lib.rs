@@ -68,6 +68,15 @@ pub const MAX_POW: u32 = 62;
 /// could otherwise have it offered endlessly, each grant a row kept.
 pub const MAX_OFFERS: u8 = 8;
 
+/// How long, in seconds, a grant left unreleased is kept: a day. Then it
+/// is deleted with its proposal, unless a double spend of it was refused,
+/// and its payer releasing it after is refused as an unknown offer, to
+/// offer the spend again: no row is kept for good of a spend never made.
+pub const UNRELEASED_FOR: i64 = 24 * 3600;
+
+/// How often at most offers delete the grants left unreleased too long.
+const FORGET_EVERY: std::time::Duration = std::time::Duration::from_secs(3600);
+
 /// Why the hub did not serve a request, or could not.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -425,6 +434,8 @@ pub struct Hub {
     /// identifier's bytes: [`MAX_OFFERS`] at most. Never stored, so
     /// nothing old is refused, and a restart forgets.
     offers: Mutex<HashMap<[u8; 33], u8>>,
+    /// When this process last deleted the grants left unreleased too long.
+    forgotten_at: Mutex<Option<Instant>>,
     policy: Policy,
     /// The newest checkpoint, as stored.
     newest: Mutex<Option<Checkpoint>>,
@@ -504,6 +515,7 @@ impl Hub {
             boot_key: tagged_hash("licash-hub/boot", &[&secret, &drawn]),
             answered: Mutex::default(),
             offers: Mutex::default(),
+            forgotten_at: Mutex::default(),
             policy,
             newest: Mutex::new(newest),
             synced_at: Mutex::default(),
@@ -708,6 +720,7 @@ impl Hub {
             ys.iter()
                 .any(|y| offers.get(&y.0).is_some_and(|n| *n >= MAX_OFFERS))
         };
+        self.forget_unreleased()?;
         // Refused before its grant is made, unless offered before: its
         // grant then, as kept.
         if full(&self.offers.lock().unwrap_or_else(PoisonError::into_inner))
@@ -771,6 +784,42 @@ impl Hub {
         Ok(grant)
     }
 
+    /// Delete the grants left unreleased [`UNRELEASED_FOR`], with their
+    /// proposals, at most once each [`FORGET_EVERY`]. One released never
+    /// has rows elsewhere: its issuance and inputs are kept at release.
+    fn forget_unreleased(&self) -> Result<(), Error> {
+        {
+            let mut at = self
+                .forgotten_at
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if at.is_some_and(|at| at.elapsed() < FORGET_EVERY) {
+                return Ok(());
+            }
+            *at = Some(Instant::now());
+        }
+        let before = now() - UNRELEASED_FOR;
+        let forgotten = self.store.write(|tx| {
+            let ids = tx
+                .prepare(
+                    "SELECT g.id FROM grants g JOIN proposals p ON p.id = g.id
+                     WHERE g.released_at IS NULL AND p.double_spent_at IS NULL
+                       AND p.created_at < ?1",
+                )?
+                .query_map([before], |r| r.get::<_, Vec<u8>>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            for id in &ids {
+                tx.execute("DELETE FROM grants WHERE id = ?1", [id])?;
+                tx.execute("DELETE FROM proposals WHERE id = ?1", [id])?;
+            }
+            Ok(ids.len())
+        })?;
+        if forgotten > 0 {
+            tracing::info!(forgotten, "offers left unreleased for a day deleted");
+        }
+        Ok(())
+    }
+
     /// Whether proposal `id` was offered.
     fn offered(&self, id: &ProposalId) -> Result<bool, Error> {
         self.store.read(|c| {
@@ -817,11 +866,15 @@ impl Hub {
             .collect::<Result<Vec<_>, Error>>()?;
         let mut spent_by = None;
         let released = self.store.write(|tx| {
-            let released: Option<i64> = tx.query_row(
-                "SELECT released_at FROM grants WHERE id = ?1",
-                [id.as_bytes()],
-                |r| r.get(0),
-            )?;
+            // Deleted meanwhile, left unreleased too long: unknown now.
+            let released: Option<i64> = tx
+                .query_row(
+                    "SELECT released_at FROM grants WHERE id = ?1",
+                    [id.as_bytes()],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .ok_or(Refusal::UnknownOffer)?;
             if released.is_some() {
                 return Ok(false);
             }

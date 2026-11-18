@@ -10,6 +10,7 @@ use licash::{
 };
 use licash_hub::{
     Error, Fee, Hub, Ledger, Notes, Notice, Policy, Refusal, Stats, Unlinks, MAX_OFFERS,
+    UNRELEASED_FOR,
 };
 
 const MAX_POW: u32 = 6;
@@ -560,6 +561,78 @@ fn a_spent_note_is_refused_before_any_work_on_it() {
         Err(Error::Halted)
     ));
     assert!(hub.halted());
+}
+
+/// A grant left unreleased a day is deleted, its proposal with it, as
+/// offers come: released after, it is an unknown offer, and offered again
+/// it gets a grant anew that releases. One released, or one whose double
+/// spend was refused, is kept.
+#[test]
+fn grants_left_unreleased_a_day_are_deleted_and_offered_again() {
+    let files = files();
+    let hub = open(&files, Policy::default());
+    let (_, keyset) = issuer(&files);
+    let (alice, bob, carol) = (owner(1), owner(2), owner(3));
+    let pay = |to: &OwnerKeys| {
+        let coin = mint(&files, &alice, 8);
+        Spend::new(&keyset, &[coin], &[(to.address(), 8)])
+    };
+    let (left, released, double) = (pay(&bob), pay(&bob), pay(&bob));
+    let grant = left.offer(&hub).unwrap();
+    released.complete(&hub, &keyset);
+    // Another spend of its note released first: the double spend refused.
+    let other = Spend::new(
+        &keyset,
+        &[double.inputs[0].clone()],
+        &[(carol.address(), 8)],
+    );
+    let doubled = double.sign(
+        &keyset,
+        Authorization::Granted(Box::new(double.offer(&hub).unwrap())),
+    );
+    other.complete(&hub, &keyset);
+    assert_eq!(
+        refused(hub.release(&doubled, &double.notes())),
+        Refusal::Spent
+    );
+    let count = |table: &str| -> i64 {
+        sql(&files.db)
+            .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap()
+    };
+    let (grants, proposals) = (count("grants"), count("proposals"));
+    sql(&files.db)
+        .execute(
+            "UPDATE proposals SET created_at = created_at - ?1",
+            [UNRELEASED_FOR + 1],
+        )
+        .unwrap();
+    // Not before an offer comes, once this process deleted none yet.
+    let signed = left.sign(&keyset, Authorization::Granted(Box::new(grant.clone())));
+    drop(hub);
+    let hub = open(&files, Policy::default());
+    assert_eq!((count("grants"), count("proposals")), (grants, proposals));
+    pay(&carol).offer(&hub).unwrap();
+    assert_eq!(
+        (count("grants"), count("proposals")),
+        (grants, proposals),
+        "one deleted, one made"
+    );
+    assert_eq!(
+        refused(hub.release(&signed, &left.notes())),
+        Refusal::UnknownOffer
+    );
+    // Released and double spent ones kept.
+    released.complete(&hub, &keyset);
+    assert_eq!(
+        refused(hub.release(&doubled, &double.notes())),
+        Refusal::Spent
+    );
+    // Offered again: a grant anew, released.
+    let again = left.offer(&hub).unwrap();
+    assert_ne!(again, grant);
+    let signed = left.sign(&keyset, Authorization::Granted(Box::new(again)));
+    hub.release(&signed, &left.notes()).unwrap();
 }
 
 /// One note is offered in so many spends not released at most by a hub
