@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="36 28 38 52" width="380" height="520">
+  <!-- The bare mark on a transparent background. -->
+  <g fill="#A8E06C">
+    <path d="M38,30h10v38h24c0,5.5 -4.5,10 -10,10H38z"/>
+    <path fill-opacity="0.55" d="M54,30a16,16 0,0 1,16 16h-10a6,6 0,0 0,-6 -6z"/>
+  </g>
+</svg>
