@@ -8,7 +8,9 @@ use licash::{
     spend::{ChainProfile, Output, Proposal, TimedLock, TimedTerms},
     unlink::{Nonce, Request, Session},
 };
-use licash_hub::{Error, Fee, Hub, Ledger, Notes, Notice, Policy, Refusal, Stats, Unlinks};
+use licash_hub::{
+    Error, Fee, Hub, Ledger, Notes, Notice, Policy, Refusal, Stats, Unlinks, MAX_OFFERS,
+};
 
 const MAX_POW: u32 = 6;
 
@@ -548,6 +550,46 @@ fn a_spent_note_is_refused_before_any_work_on_it() {
     assert_eq!(refused(hub.offer(&again.proposal, &[])), Refusal::Spent);
     // The spend released, offered again: its grant, as before.
     first.offer(&hub).unwrap();
+}
+
+/// One note is offered in so many spends not released at most by a hub
+/// process: each input of a spend counts, the same spend offered again
+/// does not, nor a spend refused, and a restart forgets.
+#[test]
+fn a_note_is_offered_in_a_bounded_number_of_spends_until_the_hub_restarts() {
+    let files = files();
+    let hub = open(&files, Policy::default());
+    let (_, keyset) = issuer(&files);
+    let alice = owner(1);
+    let (coin, other) = (mint(&files, &alice, 8), mint(&files, &alice, 8));
+    // Distinct spends of the same coins: to payee `k`.
+    let to = |k: u8, coins: &[_]| {
+        let payee = owner(10 + k).address();
+        let outputs: Vec<_> = coins.iter().map(|_| (payee, 8)).collect();
+        Spend::new(&keyset, coins, &outputs)
+    };
+    let both = [coin.clone(), other.clone()];
+    // Notes that are none of the spend's: refused, counting nothing.
+    for _ in 0..=MAX_OFFERS {
+        assert!(hub.offer(&to(0, &both).proposal, &[]).is_err());
+    }
+    // One of both notes, then those of the one alone up to the most.
+    let first = to(1, &both);
+    let grant = first.offer(&hub).unwrap();
+    for k in 2..=MAX_OFFERS {
+        to(k, std::slice::from_ref(&coin)).offer(&hub).unwrap();
+    }
+    let over = to(MAX_OFFERS + 1, std::slice::from_ref(&coin));
+    assert_eq!(refused(over.offer(&hub)), Refusal::Offered);
+    assert_eq!(refused(to(0, &both).offer(&hub)), Refusal::Offered);
+    // Offered before: the same grant all the same.
+    assert_eq!(first.offer(&hub).unwrap(), grant);
+    // The other note, counted once, offered still.
+    to(2, std::slice::from_ref(&other)).offer(&hub).unwrap();
+    // A restart forgets.
+    drop(hub);
+    let hub = open(&files, Policy::default());
+    over.offer(&hub).unwrap();
 }
 
 #[test]

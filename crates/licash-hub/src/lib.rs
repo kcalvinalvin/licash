@@ -63,6 +63,11 @@ pub use records::{ForwardRecord, LockRecord, Movement, Notes, Unlinks};
 /// denominations as SQLite integers.
 pub const MAX_POW: u32 = 62;
 
+/// The most grants a hub process makes for one note not spent: a payer
+/// abandoning a spend and trying again needs a few; anyone holding a note
+/// could otherwise have it offered endlessly, each grant a row kept.
+pub const MAX_OFFERS: u8 = 8;
+
 /// Why the hub did not serve a request, or could not.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -131,6 +136,8 @@ pub enum Refusal {
     Activated,
     #[error("an own lock under this hash exists")]
     Exists,
+    #[error("a note offered in too many spends not released: release or wait for a restart")]
+    Offered,
     #[error("an input is already spent")]
     Spent,
     #[error("an output is already issued")]
@@ -176,7 +183,7 @@ impl Refusal {
             Self::LockExpired => Code::LockExpired,
             Self::Unexpired => Code::Unexpired,
             Self::Activated => Code::Activated,
-            Self::Block(_) | Self::Exists => Code::Invalid,
+            Self::Block(_) | Self::Exists | Self::Offered => Code::Invalid,
         }
     }
 }
@@ -414,6 +421,10 @@ pub struct Hub {
     /// What this process answered: the hash of each request by its output.
     /// It outlives no nonce, so it is the authority over them.
     answered: Mutex<HashMap<[u8; 32], [u8; 32]>>,
+    /// How many grants this process made for each note not spent, its
+    /// identifier's bytes: [`MAX_OFFERS`] at most. Never stored, so
+    /// nothing old is refused, and a restart forgets.
+    offers: Mutex<HashMap<[u8; 33], u8>>,
     policy: Policy,
     /// The newest checkpoint, as stored.
     newest: Mutex<Option<Checkpoint>>,
@@ -492,6 +503,7 @@ impl Hub {
             boot,
             boot_key: tagged_hash("licash-hub/boot", &[&secret, &drawn]),
             answered: Mutex::default(),
+            offers: Mutex::default(),
             policy,
             newest: Mutex::new(newest),
             synced_at: Mutex::default(),
@@ -692,6 +704,17 @@ impl Hub {
         if fee < due {
             return Err(Refusal::Fee { due, paid: fee }.into());
         }
+        let full = |offers: &HashMap<[u8; 33], u8>| {
+            ys.iter()
+                .any(|y| offers.get(&y.0).is_some_and(|n| *n >= MAX_OFFERS))
+        };
+        // Refused before its grant is made, unless offered before: its
+        // grant then, as kept.
+        if full(&self.offers.lock().unwrap_or_else(PoisonError::into_inner))
+            && !self.offered(&id)?
+        {
+            return Err(Refusal::Offered.into());
+        }
         let mut salt = [0; 32];
         OsRng.fill_bytes(&mut salt);
         let unlock = self.unlock(keyset.id(), &id, &salt);
@@ -699,7 +722,9 @@ impl Hub {
             PreparedGrant::derive(keys, proposal, unlock, &self.nonce_secret(id.as_bytes()))?
                 .offer();
         let offer = grant.to_bytes()?;
-        self.store.write(|tx| {
+        // Held over the write: racing offers of a note count to the most.
+        let mut offers = self.offers.lock().unwrap_or_else(PoisonError::into_inner);
+        let (grant, new) = self.store.write(|tx| {
             for y in &ys {
                 let spent: Option<[u8; 32]> = tx
                     .query_row("SELECT proposal FROM spent WHERE y = ?1", [&y.0], |r| {
@@ -718,7 +743,10 @@ impl Hub {
                 )
                 .optional()?;
             if let Some(offered) = offered {
-                return Ok(Grant::from_bytes(&offered)?);
+                return Ok((Grant::from_bytes(&offered)?, false));
+            }
+            if full(&offers) {
+                return Err(Refusal::Offered.into());
             }
             for output in proposal.outputs() {
                 if issued(tx, keyset.id(), output)? {
@@ -733,7 +761,21 @@ impl Hub {
                 "INSERT INTO grants (id, offer, salt, boot) VALUES (?1, ?2, ?3, ?4)",
                 params![id.as_bytes(), offer, salt, self.boot],
             )?;
-            Ok(grant)
+            Ok((grant, true))
+        })?;
+        if new {
+            for y in &ys {
+                *offers.entry(y.0).or_default() += 1;
+            }
+        }
+        Ok(grant)
+    }
+
+    /// Whether proposal `id` was offered.
+    fn offered(&self, id: &ProposalId) -> Result<bool, Error> {
+        self.store.read(|c| {
+            Ok(c.prepare_cached("SELECT 1 FROM grants WHERE id = ?1")?
+                .exists([id.as_bytes()])?)
         })
     }
 
@@ -841,6 +883,11 @@ impl Hub {
         }
         if released? {
             tracing::info!(proposal = %hex::encode(id.as_bytes()), amount, fee, "released");
+            // Its notes spent: offered no more, not counted.
+            let mut offers = self.offers.lock().unwrap_or_else(PoisonError::into_inner);
+            for y in &ys {
+                offers.remove(&y.0);
+            }
         }
         Ok(unlock)
     }
