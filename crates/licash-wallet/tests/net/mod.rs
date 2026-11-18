@@ -363,12 +363,15 @@ fn release(hub: &Hub, kept: &Mutex<inbox::Inbox>, body: &[u8]) -> Result<Vec<u8>
 }
 
 fn lock_state(hub: &Hub, id: &str) -> Result<Vec<u8>, Problem> {
-    let lock = hub.locked(&licash_api::lock_id(id)?).map_err(problem)?;
+    let id = licash_api::lock_id(id)?;
+    let lock = hub.locked(&id).map_err(problem)?;
+    let signatures = hub.lock_signatures(&id).map_err(problem)?;
     let settled = lock.settled.map(|branch| match branch {
         Settled::Pay => licash_api::Settled::Pay,
         Settled::Refund => licash_api::Settled::Refund,
     });
-    let state = LockState::new(&lock.proposal, &lock.certificate, settled, lock.preimage);
+    let state = LockState::new(&lock.proposal, &lock.certificate, settled, lock.preimage)
+        .with_signatures(&signatures);
     Ok(serde_json::to_vec(&state).unwrap())
 }
 

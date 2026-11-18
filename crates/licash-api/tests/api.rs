@@ -467,6 +467,22 @@ fn lock_bodies_carry_a_lock_and_its_settlement() {
     let view = json(&open).decode(lookup).unwrap();
     assert_eq!(view.proposal.id(), id);
     assert_eq!((view.settled, view.preimage), (None, None));
+    // Its payer's signatures, as its hub kept them, prove it with its
+    // certificate; none from an older hub, and others are refused.
+    assert!(view.signatures.is_none());
+    assert!(serde_json::to_value(&open)
+        .unwrap()
+        .get("signatures")
+        .is_none());
+    let kept = licash::authorization::SignedProposal::plain_signatures(&signed.to_bytes()).unwrap();
+    assert_eq!(kept, signed.signatures());
+    let proven = open.clone().with_signatures(&kept);
+    let view = json(&proven).decode(lookup).unwrap();
+    assert_eq!(view.signatures.as_deref(), Some(signed.signatures()));
+    let forged = open
+        .clone()
+        .with_signatures(&[licash::crypto::Signature([1; 64])]);
+    assert_eq!(forged.decode(lookup).unwrap_err().code, Code::Invalid);
     let paid = LockState::new(
         signed.proposal(),
         &certificate,

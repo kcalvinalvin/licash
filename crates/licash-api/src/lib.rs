@@ -509,6 +509,11 @@ pub struct LockState {
     pub certificate: Hex,
     pub settled: Option<Settled>,
     pub preimage: Option<Hex>,
+    /// Its payer's owner signatures, which with its certificate prove it on
+    /// Bitcoin to its payee: none from a hub older than them, or of a lock
+    /// the hub made of its own notes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub signatures: Vec<Hex>,
 }
 
 /// The branch of a lock its hub issued.
@@ -526,6 +531,9 @@ pub struct LockView {
     pub certificate: Certificate,
     pub settled: Option<Settled>,
     pub preimage: Option<[u8; 32]>,
+    /// Its payer's owner signatures, checked against its certificate, if
+    /// its hub gave them ([`LockState::signatures`]).
+    pub signatures: Option<Vec<Signature>>,
 }
 
 /// Issue the pay branch of `lock` for `preimage`.
@@ -1169,7 +1177,14 @@ impl LockState {
             certificate: Hex(certificate.to_bytes()),
             settled,
             preimage: preimage.map(|p| Hex(p.to_vec())),
+            signatures: vec![],
         }
+    }
+
+    /// With its payer's owner `signatures` ([`LockState::signatures`]).
+    pub fn with_signatures(mut self, signatures: &[Signature]) -> Self {
+        self.signatures = signatures.iter().map(|s| Hex(s.0.to_vec())).collect();
+        self
     }
 
     /// The lock under the keyset its proposal names among `keysets`, its
@@ -1199,11 +1214,22 @@ impl LockState {
         if preimage.is_some_and(|p| lock_hash(&p) != hash) {
             return Err(Problem::invalid("not the preimage of the lock's hash"));
         }
+        let signatures = match self.signatures.is_empty() {
+            true => None,
+            false => {
+                let signatures = (self.signatures.iter())
+                    .map(|s| s.array::<64>("signature").map(Signature))
+                    .collect::<Result<Vec<_>, _>>()?;
+                certificate.authenticate_source(keyset, &proposal, &signatures)?;
+                Some(signatures)
+            }
+        };
         Ok(LockView {
             proposal,
             certificate,
             settled: self.settled,
             preimage,
+            signatures,
         })
     }
 }

@@ -381,17 +381,17 @@ async fn lock(
 
 async fn lock_state(State(hub): State<Arc<Hub>>, Path(id): Path<String>) -> Answer<LockState> {
     blocking(hub, move |hub| {
-        let lock = hub.locked(&licash_api::lock_id(&id)?)?;
+        let id = licash_api::lock_id(&id)?;
+        let lock = hub.locked(&id)?;
+        let signatures = hub.lock_signatures(&id)?;
         let settled = lock.settled.map(|branch| match branch {
             Settled::Pay => licash_api::Settled::Pay,
             Settled::Refund => licash_api::Settled::Refund,
         });
-        Ok(LockState::new(
-            &lock.proposal,
-            &lock.certificate,
-            settled,
-            lock.preimage,
-        ))
+        Ok(
+            LockState::new(&lock.proposal, &lock.certificate, settled, lock.preimage)
+                .with_signatures(&signatures),
+        )
     })
     .await
 }

@@ -14,7 +14,7 @@ use licash::{
     authorization::{Authorization, SignedProposal},
     chain::{activation_secret, Checkpoint},
     claim::Branch,
-    crypto::Point,
+    crypto::{Point, Signature},
     note::{MintResponse, Note},
     route::Hop,
     source::Certificate,
@@ -688,6 +688,23 @@ impl Hub {
     pub fn locked(&self, id: &ProposalId) -> Result<Lock, Error> {
         let row = self.store.read(|c| self.row(c, id))?;
         Ok(row.ok_or(Refusal::UnknownLock)?.lock)
+    }
+
+    /// The owner signatures the lock `id` was made with, for its payee to
+    /// prove it on Bitcoin with its certificate: none for the hub's own.
+    pub fn lock_signatures(&self, id: &ProposalId) -> Result<Vec<Signature>, Error> {
+        let signed: Option<(Vec<u8>, bool)> = self.store.read(|c| {
+            Ok(c.query_row(
+                "SELECT signed, own FROM locks WHERE id = ?1",
+                [id.as_bytes()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?)
+        })?;
+        match signed.ok_or(Refusal::UnknownLock)? {
+            (_, true) => Ok(vec![]),
+            (signed, false) => Ok(SignedProposal::plain_signatures(&signed)?),
+        }
     }
 
     /// The hub's own lock under `hash`, if any ([`Hub::lock_own`]).

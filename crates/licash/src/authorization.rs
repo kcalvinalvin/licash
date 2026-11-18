@@ -589,6 +589,24 @@ impl SignedProposal {
         Self::from_parts(keyset, proposal, notes, authorization, signatures)
     }
 
+    /// The owner signatures of a Plain proposal's `to_bytes`, unverified:
+    /// for whoever holds its certificate to check them against it
+    /// ([`crate::source::Certificate::authenticate_source`]) without the
+    /// notes it spends. Empty for a Granted one.
+    pub fn plain_signatures(bytes: &[u8]) -> Result<Vec<Signature>, Error> {
+        let mut r = Reader::new(bytes, "signed proposal", SIGNED_TAG)?;
+        r.blob()?;
+        if r.byte()? != 0 {
+            return Ok(vec![]);
+        }
+        let count = r.count(64)?;
+        let signatures = (0..count)
+            .map(|_| r.array().map(Signature))
+            .collect::<Result<_, _>>()?;
+        r.finish()?;
+        Ok(signatures)
+    }
+
     pub fn proposal(&self) -> &Proposal {
         &self.proposal
     }
