@@ -810,7 +810,7 @@ fn v4_owes_a_locks_refund_only_once_it_expired_at_depth() {
         notes: vec![settled_note],
         sources: vec![SourceWitness::Signed {
             signed: own_signed,
-            notes: vec![own_note],
+            notes: vec![own_note.clone()],
         }],
         activations: vec![],
     };
@@ -830,6 +830,22 @@ fn v4_owes_a_locks_refund_only_once_it_expired_at_depth() {
         preimage: Z,
     };
     let c = owed(7, &[preimage]);
+    assert_eq!((c.mask, c.owed), (0b10, 4));
+    // A lock of hers the hub never admitted, its inputs spent in another
+    // the hub holds (one it admitted, say): expired at depth or not, that
+    // spend voids its refund.
+    let admitted = spend(
+        &o,
+        std::slice::from_ref(&own_note),
+        &[owner(SPEND, 23, 40)],
+        vec![Output::from_derivation(&carol).unwrap()],
+    );
+    let shared = Evidence::Spend {
+        signed: admitted,
+        notes: vec![own_note],
+        unlock: None,
+    };
+    let c = owed(7, &[shared]);
     assert_eq!((c.mask, c.owed), (0b10, 4));
 }
 
