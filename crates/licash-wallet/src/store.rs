@@ -28,7 +28,15 @@ const MIGRATIONS: &[&str] = &[
     UNLINKED_AT,
     VIA,
     KEYED,
+    LOCK_CLAIMS,
 ];
+
+/// Version 12: the refunds of locks a contract's recovery claims on
+/// Bitcoin, under its id, `claimed_by`. No older version claims one, so
+/// none of an older file is claimed.
+const LOCK_CLAIMS: &str = "
+ALTER TABLE locks ADD COLUMN claimed_by BLOB;
+";
 
 /// Version 11: payments made under a key of their payer's, at most one
 /// each ([`crate::Wallet::pay_code_keyed`]), recorded with the payment:

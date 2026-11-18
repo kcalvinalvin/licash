@@ -15,18 +15,44 @@
 //! first served first, then the fewest notes. A note above what is left
 //! of a cap may be claimed for that much only, its excess lost, when
 //! nothing else recovers as much.
+//!
+//! A recovery claims the refund of each of the wallet's locks at its hub
+//! that the hub certified and never settled, once it expired at depth
+//! ([`LockRefund`]): first, within its cap, before its share of the
+//! notes. Taken as the notes are, under its id, given back with them.
 
 use std::cmp::Reverse;
 use std::collections::HashMap;
 
 use licash::{
-    claim::Branch,
+    claim::{Branch, Item, Source},
     crypto::{Point, ScalarBytes},
     note::{Keyset, Message, Note, Ownership},
+    recovery::SourceWitness,
+    source::Certificate,
+    spend::{Output, ProposalId},
 };
 use rusqlite::{params, OptionalExtension};
 
-use crate::{held, Error, Held, Transport, Wallet};
+use crate::{held, invalid, Error, Held, Transport, Wallet};
+
+/// The refund of a lock this wallet made, claimed on Bitcoin: its hub
+/// certified it and settled neither branch, and it expired at depth, when
+/// the refund is owed (filed earlier, it would be owed nothing and given
+/// up). Its refund outputs paying the wallet, as pending items of the
+/// claim, each authorized by its hold key; the hub's certificate of it and
+/// its signed body show the hub admitted it.
+#[derive(Clone)]
+pub struct LockRefund {
+    pub id: ProposalId,
+    pub items: Vec<Item>,
+    pub source: Source,
+    pub witness: SourceWitness,
+    /// Each item's message and hold key.
+    pub keys: Vec<(Message, ScalarBytes)>,
+    /// What its items are worth.
+    pub value: u64,
+}
 
 /// A note a contract's recovery claims, as the wallet keeps it: the note,
 /// and what derives its keys again (its proposal's ephemeral key, its
@@ -147,42 +173,181 @@ impl<T: Transport> Wallet<T> {
     /// [`Wallet::claimed_notes`] are its own. What it recovers is their
     /// face value, its cap at most.
     pub fn claim_notes(&self, id: &[u8; 32], slots: &[ClaimSlot]) -> Result<Vec<ClaimNote>, Error> {
-        let slot = slots
-            .iter()
-            .find(|s| s.id == *id)
-            .ok_or_else(|| Error::Invalid("a recovery claiming in no slot".into()))?;
-        let keyset = self.keyset_of(&slot.keyset)?;
+        let keyset = self.keyset_of(&slot_of(id, slots)?.keyset)?;
         self.store.write(|t| {
-            let taken: Option<i64> = t
-                .query_row(
-                    "SELECT 1 FROM notes WHERE spent_by = ?1 LIMIT 1",
-                    [id],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            if taken.is_some() {
+            if took(t, id)? {
                 return Err(Error::Invalid(
                     "this recovery took its notes already".into(),
                 ));
             }
-            let (open, ys, stock) = claimable(t, slots)?;
-            let plan = allocate(&stock, &open);
-            let mine = open.iter().position(|s| s.id == *id);
-            let picked = mine.map_or(&[][..], |i| &plan[i]);
-            let mut notes = Vec::with_capacity(picked.len());
-            for y in picked.iter().map(|&i| &ys[i]) {
+            take_notes(t, &keyset, id, slots)
+        })
+    }
+
+    /// [`Wallet::claim_notes`], after the refunds of the wallet's locks
+    /// under its slot's keyset that expired at depth by `tip` unsettled
+    /// ([`LockRefund`]), the largest first, as many as fit its cap and its
+    /// count: its share of the notes is of what they leave of both. All in
+    /// one, or none.
+    pub fn claim_with_refunds(
+        &self,
+        id: &[u8; 32],
+        slots: &[ClaimSlot],
+        tip: u32,
+    ) -> Result<(Vec<ClaimNote>, Vec<LockRefund>), Error> {
+        let slot = *slot_of(id, slots)?;
+        let keyset = self.keyset_of(&slot.keyset)?;
+        self.store.write(|t| {
+            if took(t, id)? {
+                return Err(Error::Invalid(
+                    "this recovery took its notes already".into(),
+                ));
+            }
+            let mut stmt = t.prepare(
+                "SELECT id, request, certificate, expiry FROM locks
+                 WHERE certificate IS NOT NULL AND settled IS NULL AND done_at IS NULL
+                    AND abandoned IS NULL AND claimed_by IS NULL AND expiry <= ?1",
+            )?;
+            let rows = stmt
+                .query_map([tip], |r| {
+                    Ok((
+                        r.get::<_, [u8; 32]>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Vec<u8>>(2)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            drop(stmt);
+            let mut due = Vec::new();
+            for (lock, request, certificate) in rows {
+                // One the wallet can't read back is left to its hub.
+                match self.lock_refund(&keyset, &request, &certificate) {
+                    Ok(Some((refund, expired))) if expired <= tip => due.push(refund),
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(
+                        lock = %hex::encode(lock), "a lock's refund not claimable: {e}"
+                    ),
+                }
+            }
+            due.sort_by_key(|r| (Reverse(r.value), *r.id.as_bytes()));
+            let (mut cap, mut max) = (slot.cap, slot.max);
+            let mut refunds = Vec::new();
+            for refund in due {
+                if refund.value <= cap && refund.keys.len() <= max {
+                    cap -= refund.value;
+                    max -= refund.keys.len();
+                    refunds.push(refund);
+                }
+            }
+            let left: Vec<_> = (slots.iter())
+                .map(|s| match s.id == *id {
+                    true => ClaimSlot { cap, max, ..*s },
+                    false => *s,
+                })
+                .collect();
+            // Before the refunds are marked, which close its slot.
+            let notes = match cap > 0 && max > 0 {
+                true => take_notes(t, &keyset, id, &left)?,
+                false => vec![],
+            };
+            for refund in &refunds {
                 let taken = t.execute(
-                    "UPDATE notes SET spent_by = ?1
-                     WHERE y = ?2 AND spent_by IS NULL AND session IS NULL AND gone_at IS NULL",
-                    params![id, y],
+                    "UPDATE locks SET claimed_by = ?1 WHERE id = ?2 AND claimed_by IS NULL",
+                    params![id, refund.id.as_bytes()],
                 )?;
                 if taken != 1 {
                     return Err(Error::NoteTaken);
                 }
-                notes.push(claim_note(t, &keyset, y)?);
             }
-            Ok(notes)
+            Ok((notes, refunds))
         })
+    }
+
+    /// The lock refunds the recovery of contract `id` took
+    /// ([`Wallet::claim_with_refunds`]), of the keyset of id `keyset`.
+    pub fn claimed_refunds(
+        &self,
+        id: &[u8; 32],
+        keyset: &[u8; 32],
+    ) -> Result<Vec<LockRefund>, Error> {
+        let keyset = self.keyset_of(keyset)?;
+        let rows: Vec<(String, Vec<u8>)> = self.store.read(|c| {
+            let mut stmt = c.prepare(
+                "SELECT request, certificate FROM locks WHERE claimed_by = ?1 ORDER BY id",
+            )?;
+            let rows = stmt.query_map([id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })?;
+        let mut refunds = Vec::with_capacity(rows.len());
+        for (request, certificate) in rows {
+            if let Some((refund, _)) = self.lock_refund(&keyset, &request, &certificate)? {
+                refunds.push(refund);
+            }
+        }
+        Ok(refunds)
+    }
+
+    /// The refund of the lock of `request`, certified by `certificate`,
+    /// under `keyset`, and the height at which it is owed, its expiry at
+    /// depth: none if under another keyset or paying the wallet nothing.
+    fn lock_refund(
+        &self,
+        keyset: &Keyset,
+        request: &str,
+        certificate: &[u8],
+    ) -> Result<Option<(LockRefund, u32)>, Error> {
+        let request: licash_api::Lock = serde_json::from_str(request).map_err(invalid)?;
+        if request.keyset.0 != keyset.id() {
+            return Ok(None);
+        }
+        let lookup = |id: &[u8; 32]| (id == keyset.id()).then_some(keyset);
+        let (signed, notes) = request.decode(lookup).map_err(invalid)?;
+        let certificate = Certificate::from_bytes(keyset, certificate)?;
+        let proposal = signed.proposal();
+        let lock = (proposal.lock()).ok_or_else(|| Error::Invalid("a lock of no terms".into()))?;
+        let terms = lock.terms();
+        let owed = (terms.expiry())
+            .checked_add(terms.depth())
+            .ok_or_else(|| Error::Invalid("a lock's expiry at depth overflows".into()))?;
+        let (mut items, mut keys, mut value) = (Vec::new(), Vec::new(), 0u64);
+        for (index, output) in lock.refund().iter().enumerate() {
+            let derivation = self.owner.scan_key().derive(
+                &proposal.ephemeral(),
+                output.denomination(),
+                Branch::Refund,
+                index,
+            )?;
+            // The hub's refund fee, say: not the wallet's to claim.
+            if Output::from_derivation(&derivation)? != *output {
+                continue;
+            }
+            let message = derivation.message().clone();
+            keys.push((
+                message.clone(),
+                derivation.hold_key(self.owner.hold_root())?,
+            ));
+            items.push(Item::Pending {
+                message,
+                source: proposal.id(),
+                branch: Branch::Refund,
+                index: u32::try_from(index).map_err(invalid)?,
+                blinding: *derivation.blinding(),
+                preimage: None,
+            });
+            value = value.saturating_add(output.denomination());
+        }
+        if items.is_empty() {
+            return Ok(None);
+        }
+        let refund = LockRefund {
+            id: proposal.id(),
+            items,
+            source: Source::Admitted(certificate),
+            witness: SourceWitness::Signed { signed, notes },
+            keys,
+            value,
+        };
+        Ok(Some((refund, owed)))
     }
 
     /// The notes the recovery of contract `id` took, of the keyset of id
@@ -202,11 +367,17 @@ impl<T: Transport> Wallet<T> {
 
     /// Give back the notes the recovery of contract `id` took, for it was
     /// given up before its request was signed: how many.
+    /// The lock refunds it took are given back too.
     pub fn unclaim_notes(&self, id: &[u8; 32]) -> Result<usize, Error> {
-        let freed = self.store.write(|t| {
-            Ok(t.execute("UPDATE notes SET spent_by = NULL WHERE spent_by = ?1", [id])?)
+        let (freed, locks) = self.store.write(|t| {
+            let freed = t.execute("UPDATE notes SET spent_by = NULL WHERE spent_by = ?1", [id])?;
+            let locks = t.execute(
+                "UPDATE locks SET claimed_by = NULL WHERE claimed_by = ?1",
+                [id],
+            )?;
+            Ok((freed, locks))
         })?;
-        tracing::info!(id = %hex::encode(id), freed, "claimed notes given back");
+        tracing::info!(id = %hex::encode(id), freed, locks, "claimed notes given back");
         Ok(freed)
     }
 
@@ -264,6 +435,48 @@ impl<T: Transport> Wallet<T> {
     }
 }
 
+fn slot_of<'s>(id: &[u8; 32], slots: &'s [ClaimSlot]) -> Result<&'s ClaimSlot, Error> {
+    (slots.iter().find(|s| s.id == *id))
+        .ok_or_else(|| Error::Invalid("a recovery claiming in no slot".into()))
+}
+
+/// Whether the recovery of contract `id` took notes or lock refunds.
+fn took(c: &rusqlite::Connection, id: &[u8; 32]) -> Result<bool, Error> {
+    Ok(c.query_row(
+        "SELECT EXISTS (SELECT 1 FROM notes WHERE spent_by = ?1)
+            OR EXISTS (SELECT 1 FROM locks WHERE claimed_by = ?1)",
+        [id],
+        |r| r.get(0),
+    )?)
+}
+
+/// Take for the recovery of contract `id`, one of `slots`, its share of
+/// the wallet's spendable notes, of `keyset`.
+fn take_notes(
+    t: &rusqlite::Transaction<'_>,
+    keyset: &Keyset,
+    id: &[u8; 32],
+    slots: &[ClaimSlot],
+) -> Result<Vec<ClaimNote>, Error> {
+    let (open, ys, stock) = claimable(t, slots)?;
+    let plan = allocate(&stock, &open);
+    let mine = open.iter().position(|s| s.id == *id);
+    let picked = mine.map_or(&[][..], |i| &plan[i]);
+    let mut notes = Vec::with_capacity(picked.len());
+    for y in picked.iter().map(|&i| &ys[i]) {
+        let taken = t.execute(
+            "UPDATE notes SET spent_by = ?1
+             WHERE y = ?2 AND spent_by IS NULL AND session IS NULL AND gone_at IS NULL",
+            params![id, y],
+        )?;
+        if taken != 1 {
+            return Err(Error::NoteTaken);
+        }
+        notes.push(claim_note(t, keyset, y)?);
+    }
+    Ok(notes)
+}
+
 fn claim_note(c: &rusqlite::Connection, keyset: &Keyset, y: &[u8; 33]) -> Result<ClaimNote, Error> {
     let held = held(c, keyset, y)?;
     Ok(ClaimNote {
@@ -284,12 +497,7 @@ type Claimable = (Vec<ClaimSlot>, Vec<[u8; 33]>, Vec<([u8; 32], u64)>);
 fn claimable(c: &rusqlite::Connection, slots: &[ClaimSlot]) -> Result<Claimable, Error> {
     let mut open = Vec::with_capacity(slots.len());
     for slot in slots {
-        let took: bool = c.query_row(
-            "SELECT EXISTS (SELECT 1 FROM notes WHERE spent_by = ?1)",
-            [slot.id],
-            |r| r.get(0),
-        )?;
-        if !took {
+        if !took(c, &slot.id)? {
             open.push(*slot);
         }
     }

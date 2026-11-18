@@ -422,7 +422,7 @@ impl<T: Transport> Wallet<T> {
             let id = hex::encode(id.as_bytes());
             return Err(Error::Abandoned { id, reason });
         }
-        if done {
+        if done || self.refund_claimed(id)? {
             return Ok(());
         }
         let keysets = self.keysets(hub)?;
@@ -723,6 +723,19 @@ impl<T: Transport> Wallet<T> {
     }
 
     /// The locks made, newest first.
+    /// Whether a contract's recovery claims lock `id`'s refund on Bitcoin
+    /// ([`crate::LockRefund`]): then it is settled there, not asked of its
+    /// hub, until the recovery is given up.
+    fn refund_claimed(&self, id: &ProposalId) -> Result<bool, Error> {
+        self.store.read(|c| {
+            Ok(c.query_row(
+                "SELECT claimed_by IS NOT NULL FROM locks WHERE id = ?1",
+                [id.as_bytes()],
+                |r| r.get(0),
+            )?)
+        })
+    }
+
     pub fn locks(&self) -> Result<Vec<Lock>, Error> {
         self.store.read(|c| {
             let mut stmt =

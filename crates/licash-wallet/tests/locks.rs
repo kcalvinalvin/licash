@@ -3,9 +3,10 @@ mod net;
 
 use std::sync::Arc;
 
+use licash::claim::{Branch, Item};
 use licash::spend::{lock_hash, ChainProfile};
 use licash_api::{Code, Fee};
-use licash_wallet::{Error, LockState, PartTo, Wallet};
+use licash_wallet::{ClaimSlot, Error, LockState, PartTo, Wallet};
 use net::{Fault, Link, Net, HUB};
 
 const FEE: Fee = Fee { base: 2, ppm: 0 };
@@ -123,6 +124,68 @@ async fn a_lock_unpaid_is_refunded_once_expired_at_depth() {
         bob.claim(HUB, &lock.id, &PREIMAGE).await,
         Err(Error::Invalid(why)) if why.contains("refunded")
     ));
+}
+
+/// A lock its hub certified and never settled is refunded on Bitcoin, by
+/// a contract's recovery, once expired at depth: its refund outputs paying
+/// the payer, claimed by one recovery only, and no longer asked of its
+/// hub until that recovery is given up.
+#[tokio::test]
+async fn a_recovery_claims_an_unsettled_locks_refund_once_expired_at_depth() {
+    let (net, alice, bob) = parties().await;
+    let lock = alice
+        .lock(HUB, &bob.address(), 10, hash(), Some(8))
+        .await
+        .unwrap();
+    let keyset = *net.hub(HUB).info().keysets[0].id();
+    let slot = |id: [u8; 32]| ClaimSlot {
+        id,
+        keyset,
+        cap: 1_000,
+        max: 32,
+    };
+    let (first, second) = ([7; 32], [8; 32]);
+    // At its expiry, short of its depth: owed nothing on Bitcoin yet.
+    let (notes, refunds) = alice.claim_with_refunds(&first, &[slot(first)], 8).unwrap();
+    assert!(notes.is_empty() && refunds.is_empty());
+    let (_, refunds) = alice
+        .claim_with_refunds(&first, &[slot(first)], 100)
+        .unwrap();
+    assert_eq!(refunds.len(), 1);
+    let refund = &refunds[0];
+    assert_eq!(
+        refund.id.as_bytes().as_slice(),
+        &hex::decode(&lock.id).unwrap()[..]
+    );
+    // All but the hub's refund fee, its output not hers.
+    assert_eq!(refund.value, 62);
+    assert_eq!(refund.keys.len(), refund.items.len());
+    assert!(refund.items.iter().all(|i| matches!(
+        i,
+        Item::Pending { branch: Branch::Refund, preimage: None, source, .. } if *source == refund.id
+    )));
+    let again = alice.claimed_refunds(&first, &keyset).unwrap();
+    assert_eq!(again.len(), 1);
+    assert_eq!(again[0].id, refund.id);
+    // Taken: no other recovery claims it.
+    let (_, none) = alice
+        .claim_with_refunds(&second, &[slot(second)], 100)
+        .unwrap();
+    assert!(none.is_empty());
+    // Settled on Bitcoin, not asked of its hub.
+    net.mine(HUB, 6, None);
+    assert_eq!(
+        alice.follow_lock(&lock.id).await.unwrap().state,
+        LockState::Locked
+    );
+    // Given up: its hub refunds it.
+    alice.unclaim_notes(&first).unwrap();
+    assert!(alice.claimed_refunds(&first, &keyset).unwrap().is_empty());
+    assert_eq!(
+        alice.follow_lock(&lock.id).await.unwrap().state,
+        LockState::Refunded
+    );
+    assert_eq!(available(&alice), (62, 0));
 }
 
 #[tokio::test]

@@ -551,7 +551,7 @@ fn a_wallet_file_of_version_5_trusts_every_hub_it_had() {
     let version: i64 = db
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 11);
+    assert_eq!(version, 12);
     assert_eq!(wallet.hubs().unwrap().len(), 1);
     assert_eq!(wallet.balance().unwrap().len(), 1);
     assert!(wallet.visited().unwrap().is_empty());
@@ -572,7 +572,7 @@ async fn a_wallet_file_of_version_6_renews_nothing_unasked() {
     let version: i64 = db
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 11);
+    assert_eq!(version, 12);
     assert_eq!(wallet.unlink().await.unwrap(), 0);
     assert!(wallet.sends().unwrap().is_empty());
     assert_eq!(wallet.hubs().unwrap().len(), 1);
@@ -608,6 +608,7 @@ async fn a_wallet_file_of_version_8_starts_a_privacy_rest_without_reminting() {
          ALTER TABLE sends DROP COLUMN key;
          ALTER TABLE locks DROP COLUMN via;
          ALTER TABLE locks DROP COLUMN via_invoice;
+         ALTER TABLE locks DROP COLUMN claimed_by;
          UPDATE notes SET added_at = 1;
          PRAGMA user_version = 8;",
     )
@@ -697,7 +698,7 @@ async fn a_wallet_file_of_version_7_mails_nothing_unasked() {
     let version: i64 = db
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 11);
+    assert_eq!(version, 12);
     // Its payments were mailed, or handed over, as they were made.
     assert_eq!(wallet.delivering().unwrap(), 0);
     assert!(wallet.due().await.unwrap().is_empty());
