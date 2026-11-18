@@ -1432,15 +1432,32 @@ async fn holder_wallet(
     seed: [u8; 32],
     coins: &[u64],
 ) -> Result<(std::path::PathBuf, Wallet<Http>)> {
-    let mine = dir.join("wallet");
+    holder_wallet_over(
+        rt,
+        chain,
+        &dir.join("wallet"),
+        url,
+        seed,
+        coins,
+        Http::new(None)?,
+    )
+    .await
+}
+
+/// As [`holder_wallet`], in `mine`, over `transport`.
+async fn holder_wallet_over<T: licash_wallet::Transport>(
+    rt: &Regtest,
+    chain: &Node,
+    mine: &Path,
+    url: &str,
+    seed: [u8; 32],
+    coins: &[u64],
+    transport: T,
+) -> Result<(std::path::PathBuf, Wallet<T>)> {
+    let mine = mine.to_path_buf();
     std::fs::create_dir(&mine)?;
     let regtest = ChainProfile::Core30DefaultRegtest;
-    let wallet = Wallet::create(
-        &mine.join("wallet.sqlite"),
-        &seed,
-        regtest,
-        Http::new(None)?,
-    )?;
+    let wallet = Wallet::create(&mine.join("wallet.sqlite"), &seed, regtest, transport)?;
     wallet.add_hub(url).await?;
     wallet.watch_silent(None, rt.height()?)?;
     for sats in coins {
@@ -1452,7 +1469,7 @@ async fn holder_wallet(
     Ok((mine, wallet))
 }
 
-fn available(wallet: &Wallet<Http>) -> Result<u64> {
+fn available<T: licash_wallet::Transport>(wallet: &Wallet<T>) -> Result<u64> {
     Ok(wallet.balance()?.iter().map(|b| b.available).sum())
 }
 
@@ -1771,6 +1788,143 @@ async fn a_force_close_claims_an_unsettled_locks_refund_once_expired_at_depth() 
     ensure!(
         followed.state == licash_wallet::LockState::Locked,
         "{followed:?}"
+    );
+    Ok(())
+}
+
+/// A transport that loses every request to settle a lock: its hub never
+/// learns a preimage from the wallet.
+struct NoSettle(Http);
+
+impl licash_wallet::Transport for NoSettle {
+    async fn request(
+        &self,
+        url: &str,
+        body: Option<Vec<u8>>,
+    ) -> Result<licash_wallet::Response, String> {
+        if body.is_some() && url.contains(licash_api::SETTLE) {
+            return Err("lost".into());
+        }
+        self.0.request(url, body).await
+    }
+}
+
+/// A lock paying her whose settle never reaches its hub is owed to her
+/// on Bitcoin: as its expiry nears unpaid, her wallet activates it with a
+/// coin of hers, records the activation once confirmed, and her force
+/// close past it at depth claims its pay branch beside her notes; the
+/// hub, finding it owed all she asks, lets her timeout pay it.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs bitcoind and a release build"]
+async fn a_force_close_claims_a_lock_paying_her_once_activated_at_depth() -> Result<()> {
+    use licash_contracts::holder::activation;
+    use licash_contracts::holder::recovery::{self, Stage};
+
+    let rt = Regtest::start_standard()?;
+    let dir = tempfile::tempdir()?;
+    let at = dir.path().join("hub");
+    let range = Range {
+        max_cap: 50_000_000,
+        max_blocks: 5_000,
+        per_coin: 2,
+        ppm_year: 10_000,
+    };
+    let (url, source, hub, openings) = hub_answering_with(&rt, &at, Some(range)).await?;
+    // As the hub service: every lock named after a contract opens is
+    // anchored no earlier than its Base.
+    licash_hub_service::open_on_lock_checkpoints(&openings, hub.clone());
+    while !watch::step(&hub, &source).await? {}
+    let chain = Node(source.clone());
+    let rate = bitcoin::FeeRate::from_sat_per_vb(2).context("a rate")?;
+    let (mine, bob) = holder_wallet_over(
+        &rt,
+        &chain,
+        &dir.path().join("bob"),
+        &url,
+        [18; 32],
+        &[60_000, 50_000],
+        NoSettle(Http::new(None)?),
+    )
+    .await?;
+    let chosen = Ask {
+        cap: Some(10_000),
+        blocks: 1_000,
+        ..ask()
+    };
+    let opened = holder::open(&bob, &chain, &mine, &url, chosen).await?;
+    let payment = pay(&hub, &at.join("seed"), &url, &bob.address(), 2_048)?;
+    bob.receive(&payment)?;
+    rt.mine(1)?;
+    holder::resume(&bob, &chain, &mine).await?;
+    ensure!(available(&bob)? == 2_048);
+
+    // Alice, of no contract, locks 1 000 to him.
+    let (_, alice) = holder_wallet(&rt, &chain, dir.path(), &url, [17; 32], &[]).await?;
+    for _ in 0..2 {
+        let payment = pay(&hub, &at.join("seed"), &url, &alice.address(), 2_048)?;
+        alice.receive(&payment)?;
+    }
+    while !watch::step(&hub, &source).await? {}
+    let preimage = [9; 32];
+    let expiry = rt.height()? + 40;
+    let lock = (alice.lock(
+        &url,
+        &bob.address(),
+        1_000,
+        licash::spend::lock_hash(&preimage),
+        Some(expiry),
+    ))
+    .await?;
+    ensure!(lock.state == licash_wallet::LockState::Locked, "{lock:?}");
+    // His claim never reaches the hub: owed to him, provable.
+    ensure!(bob.claim(&url, &lock.id, &preimage).await.is_err());
+    let owed = bob.owed_locks()?;
+    ensure!(owed.len() == 1 && owed[0].anchor.is_some(), "{owed:?}");
+    let depth = owed[0].depth;
+
+    // Not yet near its expiry: nothing done.
+    let kept = activation::keep(&bob, &chain, &mine, rate).await?;
+    ensure!(kept.is_empty(), "{kept:?}");
+    let lead = activation::lead(ChainProfile::Core30DefaultRegtest);
+    rt.mine_to_height(expiry - lead)?;
+    let kept = activation::keep(&bob, &chain, &mine, rate).await?;
+    ensure!(kept.len() == 1 && kept[0].step == "activated", "{kept:?}");
+    rt.mine(1)?;
+    let kept = activation::keep(&bob, &chain, &mine, rate).await?;
+    ensure!(kept.len() == 1 && kept[0].step == "confirmed", "{kept:?}");
+    let activated = (bob.owed_locks()?[0].activated_at).context("not recorded")?;
+    ensure!(
+        activated < expiry,
+        "activated at {activated}, expiring at {expiry}"
+    );
+    // Done: nothing more until claimed.
+    let kept = activation::keep(&bob, &chain, &mine, rate).await?;
+    ensure!(kept.is_empty(), "{kept:?}");
+
+    rt.mine_to_height(expiry.max(activated + depth) + 1)?;
+    while !watch::step(&hub, &source).await? {}
+    let forced = recovery::force_close(&bob, &chain, &mine, &opened.id, rate).await?;
+    // His note, and the lock's pay branch.
+    let paid = forced.claimed - 2_048;
+    ensure!(forced.notes == 1 && paid > 0 && paid <= 1_000, "{forced:?}");
+    ensure!(bob.owed_locks()?[0].claimed);
+    let mut done = None;
+    for _ in 0..800 {
+        rt.mine(1)?;
+        while !watch::step(&hub, &source).await? {}
+        let round = openings.answer_requests().await?;
+        ensure!(round.failed == 0, "{round:?}");
+        let r = recovery::advance(&bob, &chain, &mine, rate).await?[0].clone();
+        ensure!(r.stage != Stage::Lost, "{r:?}");
+        if r.stage == Stage::Done {
+            done = Some(r);
+            break;
+        }
+    }
+    let done = done.context("never paid")?;
+    ensure!(
+        done.response.is_none() && done.timeout.is_some() && done.payout == done.timeout,
+        "{done:?}"
     );
     Ok(())
 }

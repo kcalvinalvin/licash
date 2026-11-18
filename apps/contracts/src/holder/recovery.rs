@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{anyhow, bail, ensure, Context as _, Result};
 use bitcoin::{Amount, FeeRate, OutPoint, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
-use licash::claim::{self, Item, UnsignedClaim};
+use licash::claim::{self, Branch, Item, UnsignedClaim};
 use licash::recovery::{Filing, Publication, Witness as FilingWitness};
 use licash::request::Request;
 use licash_contract::graph::{link_args, HubProves, PURSE_VOUT};
@@ -19,6 +19,7 @@ use licash_wallet::{first_spend, ClaimNote, ClaimSlot, LockClaim, Transport, Wal
 use lichen_contract::Role;
 use serde::{Deserialize, Serialize};
 
+use super::activation;
 use super::claims::{self, ClaimTerms};
 use super::store::{RecoveryRow, Store};
 use super::{Chain, Fate};
@@ -356,6 +357,10 @@ pub async fn advance<T: Transport, C: Chain>(
     let Some(store) = Store::existing(dir)? else {
         return Ok(vec![]);
     };
+    // Before a recovery claims them: as provable as they can be.
+    if let Err(e) = activation::keep(wallet, chain, dir, rate).await {
+        tracing::warn!("keeping the locks owed to her provable: {e:#}");
+    }
     for row in store.recoveries()? {
         if Stage::parse(&row.stage).is_ok_and(Stage::over) {
             continue;
@@ -535,7 +540,7 @@ impl<'a, T: Transport, C: Chain> Run<'a, T, C> {
             let tip = self.chain.height().await.map_err(|e| anyhow!(e))?;
             self.hold_challenge_coin(stage, &state)?;
             let next = match stage {
-                Stage::Claiming => self.claim(&mut state, tip)?,
+                Stage::Claiming => self.claim(&mut state, tip).await?,
                 Stage::Claimed => self.commit(&mut state, tip).await?,
                 Stage::Irrevocable => self.request(&mut state)?,
                 Stage::Signing => self.sign(&mut state)?,
@@ -612,32 +617,51 @@ impl<'a, T: Transport, C: Chain> Run<'a, T, C> {
     /// Her notes of the hub's keyset taken, its share of them with her
     /// other contracts there ([`claims`]), and claimed: the claim signed
     /// by each note's hold key, for their face value, its cap at most.
-    /// The refunds of her locks there that expired at depth unsettled
-    /// first ([`LockClaim`]), within its cap.
-    fn claim(&self, state: &mut State, tip: u32) -> Result<Next> {
+    /// The branches of her locks there owed on Bitcoin first
+    /// ([`LockClaim`]), within its cap: the refunds of those she made that
+    /// expired at depth unsettled, and the pay branches of those paying her
+    /// whose activation its statement shows ([`activation::shown`]). Should
+    /// the claim not be filed with those, it is without them.
+    async fn claim(&self, state: &mut State, tip: u32) -> Result<Next> {
         // Before any note of hers is taken.
         self.o.forcible()?;
         let parts = self.o.base.parts();
         let keyset = *parts.keyset.id();
         let mut notes = self.wallet.claimed_notes(&self.id, &keyset)?;
-        let mut refunds = self.wallet.claimed_locks(&self.id, &keyset)?;
-        if notes.is_empty() && refunds.is_empty() {
-            (notes, refunds) =
+        let mut locks = self.wallet.claimed_locks(&self.id, &keyset)?;
+        if notes.is_empty() && locks.is_empty() {
+            let shown = activation::shown(self.wallet, self.chain, &self.o.base, tip).await?;
+            let pays = |p: &LockClaim| shown.contains(&p.id);
+            (notes, locks) =
                 self.wallet
-                    .claim_with_locks(&self.id, &self.slots(tip)?, tip, None)?;
+                    .claim_with_locks(&self.id, &self.slots(tip)?, tip, Some(&pays))?;
+            let held = (notes.iter().map(|n| n.note.message().denomination()))
+                .chain(locks.iter().map(|r| r.value))
+                .sum::<u64>();
+            let amount = parts.cap.min(u32::try_from(held).unwrap_or(u32::MAX));
+            let paying = locks.iter().any(|r| r.branch == Branch::Pay);
+            if paying {
+                if let Err(e) = self.filing(&notes, &locks, amount) {
+                    tracing::warn!(id = %crate::hex_id(&self.id), "a claim filed without the locks paying her: {e:#}");
+                    self.wallet.unclaim_notes(&self.id)?;
+                    (notes, locks) =
+                        self.wallet
+                            .claim_with_locks(&self.id, &self.slots(tip)?, tip, None)?;
+                }
+            }
             self.took
-                .store(!(notes.is_empty() && refunds.is_empty()), Ordering::SeqCst);
+                .store(!(notes.is_empty() && locks.is_empty()), Ordering::SeqCst);
         }
-        if notes.is_empty() && refunds.is_empty() {
+        if notes.is_empty() && locks.is_empty() {
             self.give_back("no notes at its hub to claim")?;
             bail!("no notes at its hub to claim");
         }
         // A note beyond what is left of the cap is claimed for that much.
         let held: u64 = (notes.iter().map(|n| n.note.message().denomination()))
-            .chain(refunds.iter().map(|r| r.value))
+            .chain(locks.iter().map(|r| r.value))
             .sum();
         state.amount = parts.cap.min(u32::try_from(held).unwrap_or(u32::MAX));
-        let filing = match self.filing(&notes, &refunds, state.amount) {
+        let filing = match self.filing(&notes, &locks, state.amount) {
             Ok(filing) => filing,
             Err(e) => {
                 self.give_back(&format!("{e:#}"))?;
@@ -664,19 +688,19 @@ impl<'a, T: Transport, C: Chain> Run<'a, T, C> {
         Ok(claims::claim_slots(mine, &terms))
     }
 
-    fn filing(&self, notes: &[ClaimNote], refunds: &[LockClaim], amount: u32) -> Result<Filing> {
+    fn filing(&self, notes: &[ClaimNote], locks: &[LockClaim], amount: u32) -> Result<Filing> {
         let p = self.o.base.parts();
         let limit = p.limits.max_authorizations as usize;
         // In the claim's order of sources, which their witnesses follow.
-        let mut refunds = refunds.to_vec();
-        refunds.sort_by_key(|r| r.id);
+        let mut locks = locks.to_vec();
+        locks.sort_by_key(|r| r.id);
         let messages: Vec<_> = notes.iter().map(|n| n.note.message().clone()).collect();
         let mut keys = self.wallet.hold_keys(notes)?;
-        keys.extend(refunds.iter().flat_map(|r| r.keys.iter().cloned()));
+        keys.extend(locks.iter().flat_map(|r| r.keys.iter().cloned()));
         let mut authorizations: Vec<_> = keys.iter().map(|(m, _)| m.clone()).collect();
         authorizations.sort_by_key(|m| m.identifier().ok());
         let items = (messages.into_iter().map(Item::Settled))
-            .chain(refunds.iter().flat_map(|r| r.items.iter().cloned()))
+            .chain(locks.iter().flat_map(|r| r.items.iter().cloned()))
             .collect();
         let claim = UnsignedClaim::new(
             claim::Context {
@@ -688,8 +712,10 @@ impl<'a, T: Transport, C: Chain> Run<'a, T, C> {
             amount,
             claim::Parts {
                 items,
-                sources: refunds.iter().map(|r| r.source.clone()).collect(),
-                activations: vec![],
+                sources: locks.iter().map(|r| r.source.clone()).collect(),
+                activations: (locks.iter())
+                    .filter_map(|r| r.activation.as_ref().map(|(a, _)| *a))
+                    .collect(),
                 authorizations,
             },
             limit,
@@ -699,8 +725,10 @@ impl<'a, T: Transport, C: Chain> Run<'a, T, C> {
             publication,
             FilingWitness {
                 notes: notes.iter().map(|n| n.note.clone()).collect(),
-                sources: refunds.iter().map(|r| r.witness.clone()).collect(),
-                activations: vec![],
+                sources: locks.iter().map(|r| r.witness.clone()).collect(),
+                activations: (locks.iter())
+                    .filter_map(|r| r.activation.as_ref().map(|(_, w)| w.clone()))
+                    .collect(),
             },
         )?;
         ensure!(
@@ -1822,7 +1850,7 @@ fn fee_coin(state: &State) -> Result<(OutPoint, TxOut)> {
             .clone(),
     ))
 }
-async fn confirmed_at(
+pub(super) async fn confirmed_at(
     chain: &impl Chain,
     txid: Txid,
     script: &bitcoin::Script,

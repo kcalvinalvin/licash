@@ -8,6 +8,7 @@
 //! contracts at a hub share her notes there out, to show and to claim
 //! alike: [`claims`].
 
+pub mod activation;
 mod chain;
 pub mod claims;
 mod driver;
