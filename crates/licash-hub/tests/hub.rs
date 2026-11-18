@@ -532,6 +532,24 @@ fn an_input_is_spent_once_and_a_second_signed_spend_is_alerted() {
     assert_eq!(issued, 1);
 }
 
+/// A spend of a note spent elsewhere is refused before the hub checks its
+/// notes or makes its grant: no work for a spent note, however often.
+#[test]
+fn a_spent_note_is_refused_before_any_work_on_it() {
+    let files = files();
+    let hub = open(&files, Policy::default());
+    let (_, keyset) = issuer(&files);
+    let (alice, bob, carol) = (owner(1), owner(2), owner(3));
+    let coin = mint(&files, &alice, 8);
+    let first = Spend::new(&keyset, std::slice::from_ref(&coin), &[(bob.address(), 8)]);
+    first.complete(&hub, &keyset);
+    let again = Spend::new(&keyset, &[coin], &[(carol.address(), 8)]);
+    // Its notes not even given: refused as spent all the same.
+    assert_eq!(refused(hub.offer(&again.proposal, &[])), Refusal::Spent);
+    // The spend released, offered again: its grant, as before.
+    first.offer(&hub).unwrap();
+}
+
 #[test]
 fn outputs_are_issued_once() {
     let files = files();

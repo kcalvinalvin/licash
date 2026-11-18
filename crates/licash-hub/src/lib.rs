@@ -675,13 +675,23 @@ impl Hub {
         if proposal.lock().is_some() {
             return Err(Refusal::Timed.into());
         }
+        let id = proposal.id();
+        // A note spent by another proposal is refused before any work on
+        // it: checked again once the grant is made, as a spend may race.
+        let named = proposal
+            .inputs()
+            .iter()
+            .map(|message| message.identifier())
+            .collect::<Result<Vec<Point>, _>>()?;
+        if self.spent_by_other(&id, &named)? {
+            return Err(Refusal::Spent.into());
+        }
         let ys = proposal.verify(keyset, notes)?;
         let (amount, fee, made) = self.charge(proposal)?;
         let due = self.policy.fees().spending().due(amount, made);
         if fee < due {
             return Err(Refusal::Fee { due, paid: fee }.into());
         }
-        let id = proposal.id();
         let mut salt = [0; 32];
         OsRng.fill_bytes(&mut salt);
         let unlock = self.unlock(keyset.id(), &id, &salt);
@@ -833,6 +843,20 @@ impl Hub {
             tracing::info!(proposal = %hex::encode(id.as_bytes()), amount, fee, "released");
         }
         Ok(unlock)
+    }
+
+    /// Whether any of `identifiers` is spent by a proposal other than `id`.
+    fn spent_by_other(&self, id: &ProposalId, identifiers: &[Point]) -> Result<bool, Error> {
+        self.store.read(|c| {
+            let mut stmt = c.prepare_cached("SELECT proposal FROM spent WHERE y = ?1")?;
+            for y in identifiers {
+                let by: Option<[u8; 32]> = stmt.query_row([&y.0], |r| r.get(0)).optional()?;
+                if by.is_some_and(|by| &by != id.as_bytes()) {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        })
     }
 
     /// Whether each of the notes with these identifiers is spent: retired
