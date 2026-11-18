@@ -407,8 +407,6 @@ impl Server {
 
     /// Serve again, at the same address.
     pub fn up(&mut self) {
-        let socket = tokio::net::TcpSocket::new_v4().unwrap();
-        socket.set_reuseaddr(true).unwrap();
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
         let (bound, addr) = std::sync::mpsc::channel();
         let (hub, at) = (self.hub.clone(), self.addr);
@@ -423,8 +421,12 @@ impl Server {
                 .build()
                 .unwrap();
             runtime.block_on(async move {
-                socket.bind(at).unwrap();
-                let listener = socket.listen(64).unwrap();
+                let listener = within(|| {
+                    let socket = tokio::net::TcpSocket::new_v4()?;
+                    socket.set_reuseaddr(true)?;
+                    socket.bind(at)?;
+                    socket.listen(64)
+                });
                 bound.send(listener.local_addr().unwrap()).unwrap();
                 axum::serve(
                     listener,
@@ -472,7 +474,7 @@ impl Server {
         let before = Arc::into_inner(self.hub).expect("the only hold of the run before");
         drop(before);
         let db = self._dir.path().join("hub.sqlite");
-        let hub = Hub::open(&self.seed, &db, policy).unwrap();
+        let hub = within(|| Hub::open(&self.seed, &db, policy));
         {
             let chain = &self.backend.lock().unwrap().chain;
             assert!(hub.synced(chain.height(), &chain.tip()).unwrap());
@@ -585,4 +587,19 @@ pub fn wallet(wallet: &Path, args: &[&str], input: Option<&str>) -> Output {
         stdin.write_all(input.as_bytes()).unwrap();
     }
     child.wait_with_output().unwrap()
+}
+
+/// `attempt`'s value, tried again for a few seconds while it fails: the
+/// port given up by the run before may be another test's connection's for
+/// a moment, and its lock held by a process another test spawns, until
+/// that process runs its program.
+fn within<T, E: std::fmt::Debug>(mut attempt: impl FnMut() -> Result<T, E>) -> T {
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match attempt() {
+            Ok(value) => return value,
+            Err(e) if std::time::Instant::now() > until => panic!("{e:?}"),
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(50)),
+        }
+    }
 }
