@@ -220,6 +220,10 @@ struct State {
     /// The programs contracts opened under before that the probe found
     /// not installed: their contracts' claims are withheld.
     uninstalled: Vec<[u8; 32]>,
+    /// The programs the probe found installed, once probed: the claims of
+    /// a contract under any other are withheld, whatever program this
+    /// build knows it by.
+    installed: Option<Vec<[u8; 32]>>,
 }
 
 struct Inner {
@@ -248,6 +252,13 @@ fn uninstalled(probe: &serde_json::Value, programs: &[[u8; 32]]) -> Vec<[u8; 32]
         .filter(|id| !installed(id))
         .copied()
         .collect()
+}
+
+/// The programs `probe` installs.
+fn installed(probe: &serde_json::Value) -> Vec<[u8; 32]> {
+    let ids = probe["programs"].as_array().into_iter().flatten();
+    let id = |p: &serde_json::Value| <[u8; 32]>::try_from(hex::decode(p.as_str()?).ok()?).ok();
+    ids.filter_map(id).collect()
 }
 
 /// The hub's one prover: see the module.
@@ -504,7 +515,8 @@ impl Prover {
             }
             _ => return Admission::Wait,
         };
-        if s.uninstalled.contains(program) {
+        let lacking = s.installed.as_ref().is_some_and(|i| !i.contains(program));
+        if lacking || s.uninstalled.contains(program) {
             let program = hex::encode(program);
             return Admission::Withhold(format!("its program, {program}, is not installed"));
         }
@@ -669,6 +681,7 @@ impl Inner {
             ));
         }
         self.state().uninstalled = missing;
+        self.state().installed = Some(installed(&probe));
         let device = probe["device"].as_str().unwrap_or("cpu").to_owned();
         if device == "cpu" {
             tracing::warn!("the hub's prover has no GPU: it proves on the CPU, hours a proof");
@@ -1176,6 +1189,30 @@ esac
         assert!(why.contains(&hex::encode([8; 32])), "{why}");
         assert!(matches!(admit(2, [9; 32]), Admission::Wait));
         assert!(matches!(admit(3, [7; 32]), Admission::Wait));
+    }
+
+    /// A contract under a program the probe found missing, though this
+    /// build names it nowhere: its claims withheld too, not proved late.
+    #[test]
+    fn a_prover_withholds_the_claims_of_any_program_not_installed() {
+        let probe =
+            serde_json::json!({ "programs": [hex::encode([7; 32]), "zz", hex::encode([1; 3])] });
+        assert_eq!(installed(&probe), [[7; 32]]);
+        let dir = tempfile::tempdir().unwrap();
+        let speed = Speed {
+            device: "cuda".into(),
+            segment_cycles: 250_000,
+            segment: 3.0,
+            tail: 100.0,
+        };
+        let p = Prover::ready_at(dir.path(), speed);
+        p.0.state().installed = Some(installed(&probe));
+        let admit = |id: u8, program: [u8; 32]| p.admit(&[id; 32], &program, 1, 1_000, 900, 10, 0);
+        let Admission::Withhold(why) = admit(1, [6; 32]) else {
+            panic!("admitted")
+        };
+        assert!(why.contains(&hex::encode([6; 32])), "{why}");
+        assert!(matches!(admit(2, [7; 32]), Admission::Wait));
     }
 
     /// A probe's problems, or a program not installed, and it is not ready:
