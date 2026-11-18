@@ -970,11 +970,8 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
             } else {
                 p.output.pop();
             }
-            // ALL|ACP commits outputs, so sign the final output values.
-            let final_carrier = self
-                .o
-                .publication(&self.keys, &bytes, p.output[1..].to_vec())?;
-            p.input[0].witness = final_carrier.input[0].witness.clone();
+            // Over its every input and final output: none can be added.
+            self.o.sign_publication(&self.keys, &mut p, &prevouts)?;
             return Ok((p, prevouts));
         }
         let needed = needed.map_or(0, |n| n.to_sat());

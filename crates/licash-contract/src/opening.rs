@@ -1863,6 +1863,44 @@ mod tests {
         );
         let request = ao.request(&a.keys, 3072, &[9; 32]).unwrap();
         assert_eq!(ho.requested_b(&request).unwrap(), (3072, [9; 32]));
+        // Her publication, a fee input added, signed over every input: its
+        // carrier's signature commits to them, so none can be added.
+        let slot = crate::dispute::presign(&ao.set, "request")
+            .unwrap()
+            .tx
+            .output[lichen_statement::SLOT_VOUT as usize]
+            .clone();
+        let fee = TxOut {
+            value: Amount::from_sat(5_000),
+            script_pubkey: wallet_script(5),
+        };
+        let mut p = ao
+            .publication(&a.keys, &[1, 2, 3], vec![fee.clone()])
+            .unwrap();
+        p.input.push(TxIn::default());
+        let prevouts = [slot.clone(), fee.clone()];
+        assert!(ao
+            .sign_publication(&a.keys, &mut p, &prevouts[..1])
+            .is_err());
+        ao.sign_publication(&a.keys, &mut p, &prevouts).unwrap();
+        let sig = p.input[0].witness.nth(0).unwrap();
+        assert_eq!(sig.len(), 64, "SIGHASH_DEFAULT, no sighash byte");
+        let sig = lichen_btc::bitcoin::secp256k1::schnorr::Signature::from_slice(sig).unwrap();
+        let leaf = ao
+            .babe
+            .slot()
+            .unwrap()
+            .leaf("publish")
+            .unwrap()
+            .script
+            .clone();
+        let verify = |tx: &Transaction, prevouts: &[TxOut]| {
+            lichen_btc::sighash::verify_tapscript(&a.keys.claim_key(), &sig, tx, 0, prevouts, &leaf)
+        };
+        verify(&p, &prevouts).unwrap();
+        let mut pinned = p.clone();
+        pinned.input.push(TxIn::default());
+        assert!(verify(&pinned, &[slot, fee.clone(), fee]).is_err());
         // Bitcoin accepts a digit of 15 written as 16 (the script clamps it
         // with OP_MIN): read as 15, as the statement does. A negative
         // digit fails the script, and the read.

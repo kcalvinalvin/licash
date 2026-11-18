@@ -143,6 +143,36 @@ impl Opening {
             outputs,
         )
     }
+    /// Sign `tx`, a [`Opening::publication`] with every input it spends
+    /// (`prevouts`, in order) and its outputs final, over all of them: no
+    /// one else can add an input to it, as one could to its
+    /// `ALL|ANYONECANPAY` carrier, and so pin it with a conflict of a
+    /// larger fee at a lower rate until its window passes. Its fee inputs
+    /// are signed after, and may not change.
+    pub fn sign_publication(
+        &self,
+        keys: &HolderKeys,
+        tx: &mut Transaction,
+        prevouts: &[TxOut],
+    ) -> Result<()> {
+        ensure!(
+            keys.claim_key().serialize() == self.base.parts().claim_key,
+            "another claim key"
+        );
+        ensure!(
+            tx.input.len() == prevouts.len(),
+            "a publication's inputs and their coins differ"
+        );
+        let tree = self.babe.slot()?;
+        let leaf = tree.leaf("publish")?;
+        let sig = sign_tapscript(&keys.claim, tx, 0, prevouts, &leaf.script)?;
+        tx.input[0].witness = tapscript_witness(
+            &[sig.as_ref().to_vec()],
+            &leaf.script,
+            &tree.control_block("publish")?,
+        );
+        Ok(())
+    }
     pub fn assertion(&self, tx: &Transaction) -> Result<Assertion> {
         check_link(&self.set, "assert", tx)?;
         self.babe.assertion(tx)
