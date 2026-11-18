@@ -24,7 +24,7 @@ use licash::spend::ChainProfile;
 use licash_contracts::holder::{
     self,
     recovery::{self, Stage},
-    safety, Ask, Change, Contract, Fate, Node,
+    safety, Ask, Contract, Fate, Node,
 };
 use licash_swaps::Provider;
 use licash_wallet::{Blocks as _, PayoutState, Transport};
@@ -982,8 +982,9 @@ impl<T: Transport + 'static> Keeper<T> {
             max_price,
             cap,
             deposit: None,
+            funded: 0,
         };
-        holder::open_with(wallet, &self.chain, &self.dir, hub, ask, Change::Bitcoin).await
+        holder::open_with(wallet, &self.chain, &self.dir, hub, ask).await
     }
 
     /// Open `successor`, of the longest term its hub offers: a failure
@@ -1107,6 +1108,8 @@ mod tests {
                 abandoned: None,
                 created_at: 0,
                 folded: None,
+                funded: 0,
+                funded_received: false,
             },
             deadlines: Some(Deadlines::new(Some(request_by), DAY, LEAD)),
             recovering: false,

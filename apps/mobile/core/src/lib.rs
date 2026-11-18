@@ -289,7 +289,7 @@ impl ChangeRange {
     /// What a hub offering `deposits` takes so: none unless it leaves the
     /// time to pay one in a contract's funding.
     pub(crate) fn of(deposits: &licash_api::Deposits) -> Option<Self> {
-        if deposits.window < 2 * licash_contracts::holder::DEPOSIT_MARGIN {
+        if deposits.window < 48 {
             return None;
         }
         Some(Self {

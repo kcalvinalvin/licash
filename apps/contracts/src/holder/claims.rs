@@ -131,7 +131,13 @@ pub fn claim_slots<'a>(
         .map(|(c, terms)| ClaimSlot {
             id: c.id,
             keyset: terms.keyset,
-            cap: u64::from(c.cap),
+            // What she funded it with herself, until her wallet holds
+            // those notes, its claim names first: the rest of its cap is
+            // left to her other notes.
+            cap: match c.funded_received {
+                true => u64::from(c.cap),
+                false => u64::from(c.cap).saturating_sub(c.funded),
+            },
             max: terms.max,
         })
         .collect()
@@ -162,6 +168,8 @@ mod tests {
             abandoned: None,
             created_at: 0,
             folded: None,
+            funded: 0,
+            funded_received: false,
         }
     }
 

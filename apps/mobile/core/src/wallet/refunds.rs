@@ -5,7 +5,6 @@
 //! itself: the refund key is the wallet's alone.
 
 use bitcoin::{Amount, FeeRate, OutPoint, Txid};
-use licash_contracts::holder;
 use licash_wallet::{Deposit, DepositState};
 
 use super::Wallet;
@@ -46,7 +45,7 @@ impl Wallet {
             if !self.refund_turn(&deposit.hash, terms.timeout, tip) {
                 continue;
             }
-            let Some(funding) = self.deposit_paid(&deposit, tip) else {
+            let Some(funding) = self.deposit_paid(&deposit) else {
                 continue;
             };
             let to = match self.wallet.fallback_address() {
@@ -91,9 +90,9 @@ impl Wallet {
     }
 
     /// Where the payment of `deposit` is, as far as the wallet knows: a
-    /// transaction of the wallet's in a block paying it, else the F of a
-    /// contract paying its change in, else the payment its hub saw.
-    fn deposit_paid(&self, deposit: &Deposit, tip: u32) -> Option<OutPoint> {
+    /// transaction of the wallet's in a block paying it, else the payment
+    /// its hub saw.
+    fn deposit_paid(&self, deposit: &Deposit) -> Option<OutPoint> {
         let terms = deposit.terms.as_ref()?;
         let address: bitcoin::Address<bitcoin::address::NetworkUnchecked> =
             terms.address.parse().ok()?;
@@ -111,12 +110,7 @@ impl Wallet {
                 return Some(OutPoint::new(txid, vout as u32));
             }
         }
-        let paid = holder::paid_into(&self.wallet, &self.dir, &script, terms.pays, tip);
-        let paid = paid.unwrap_or_else(|e| {
-            tracing::warn!(hash = %deposit.hash, "a contract paying a deposit: {e:#}");
-            None
-        });
-        paid.or(deposit.funding.map(|(funding, _)| funding))
+        deposit.funding.map(|(funding, _)| funding)
     }
 
     /// Whether the refund `txid` made of a deposit was found in a block:

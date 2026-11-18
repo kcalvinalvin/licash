@@ -49,8 +49,12 @@ pub const IMMUTABLE_DEPTH: u32 = 144;
 /// Holders' claims in `openings` answered from `hub`'s ledger: decided
 /// against the spends and locks it holds, and the notes of each published
 /// claim retired, spent by nobody else, since she may be paid for them on
-/// Bitcoin.
+/// Bitcoin. The notes she funds a contract with are issued there too.
 pub fn answer_from(openings: &licash_contracts::hub::Openings, hub: Arc<Hub>) {
+    let issuer = hub.clone();
+    openings.issue_with(Arc::new(move |issue, new| {
+        issue_funded(&issuer, issue, new)
+    }));
     let ledger = hub.clone();
     openings.evidence_with(Arc::new(move |claim, published_at| {
         let timed = claim.parts().sources.iter().any(|s| s.terms().is_some());
@@ -69,6 +73,48 @@ pub fn answer_from(openings: &licash_contracts::hub::Openings, hub: Arc<Hub>) {
             Ok(ledger.claim_for_fold(contract, publication)?)
         }),
     }));
+}
+
+/// Her funded notes `issue` on `hub`'s ledger, by its own lock under the
+/// hash of her issue's preimage, settled at once: the lock's id. Of a lock
+/// under that hash already, that one, settled; else none unless `new`.
+/// The lock expires as late as the hub admits, though it never waits.
+fn issue_funded(
+    hub: &Hub,
+    issue: &licash_contracts::hub::FundedIssue,
+    new: bool,
+) -> anyhow::Result<Option<[u8; 32]>> {
+    let hash = licash::spend::lock_hash(&issue.preimage);
+    let lock = match hub.own_lock_of(&hash)? {
+        Some(lock) => lock,
+        None if !new => return Ok(None),
+        None => {
+            let (top, _) = hub
+                .scanned()?
+                .ok_or_else(|| anyhow::anyhow!("the hub follows no chain yet"))?;
+            let checkpoint = hub
+                .checkpoint()
+                .ok_or_else(|| anyhow::anyhow!("the hub has no lock checkpoint yet"))?;
+            let t = hub.info().policy.timing;
+            let expiry = t
+                .window
+                .checked_sub(t.min_depth.saturating_add(t.reaction))
+                .filter(|left| *left > 0)
+                .and_then(|left| top.checked_add(left))
+                .ok_or_else(|| anyhow::anyhow!("the hub's window admits no lock"))?;
+            let terms = licash::spend::TimedTerms::new(
+                checkpoint.profile(),
+                checkpoint.commitment(),
+                expiry,
+                t.min_depth,
+                hash,
+            )?;
+            hub.lock_own(&issue.keyset, issue.ephemeral, issue.outputs.clone(), terms)?
+        }
+    };
+    let id = lock.proposal.id();
+    hub.settle(&id, &issue.preimage)?;
+    Ok(Some(*id.as_bytes()))
 }
 
 /// New contracts in `openings` opened on `hub`'s lock checkpoints: on a

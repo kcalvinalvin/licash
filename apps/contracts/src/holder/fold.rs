@@ -41,10 +41,11 @@ use crate::{FoldAsk, FoldOffer, FOLD, FOLD_CLAIM, FOLD_SIGN};
 /// notes there (up to its cap) as well as her reserve: its fold's txid,
 /// broadcast by the hub and by her. Asked again of one closed already,
 /// another fold paying her the same. Refused once forced closed, before F
-/// is buried, from its close on, when the default pays her reserve, and
-/// near the end of its protection, when only a forced close leaves time to
-/// file her claim should the hub not fold; and where locks owed to her
-/// depend on it, which a forced close claims.
+/// is buried, while the notes she funded it with are not received, from
+/// its close on, when the default pays her reserve, and near the end of its
+/// protection, when only a forced close leaves time to file her claim
+/// should the hub not fold; and where locks owed to her depend on it, which
+/// a forced close claims.
 pub async fn close<T: Transport, C: Chain>(
     wallet: &Wallet<T>,
     chain: &C,
@@ -100,6 +101,17 @@ pub async fn close<T: Transport, C: Chain>(
         fate == Some(Fate::Live),
         "its F is not buried in the chain yet"
     );
+    // Her funded notes, while owed, are hers only through the contract:
+    // a fold would give them up.
+    if contract.funded > 0 && !contract.funded_received {
+        let owed = super::funded::unreceived(wallet, holder.funded_notes())?;
+        ensure!(
+            owed.is_empty(),
+            "the notes she funded it with are not received yet: closed early, they would be lost"
+        );
+        store.funded_received(id)?;
+    }
+
     // Time to file her claim should the hub take it and not fold.
     let near_end = !resuming
         && tip.saturating_add(1)
@@ -220,7 +232,7 @@ pub async fn close<T: Transport, C: Chain>(
 }
 
 /// POST `body` to `url` at `hub`: its answer.
-async fn post<T: Transport>(
+pub(super) async fn post<T: Transport>(
     wallet: &Wallet<T>,
     hub: &str,
     url: &str,

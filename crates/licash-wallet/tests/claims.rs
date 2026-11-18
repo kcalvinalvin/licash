@@ -291,3 +291,32 @@ async fn claimed_notes_keep_their_keys_and_read_back_from_their_bytes() {
     let other = party(&net, 2, &[]).await;
     assert!(other.wallet.hold_keys(&claimed).is_err());
 }
+
+/// The outputs she funds a contract with are hers, worth what she funds,
+/// and named in a claim by notes she derives again from their ephemeral
+/// key alone: no other wallet's.
+#[tokio::test]
+async fn funded_outputs_are_derived_again_as_her_notes_and_no_one_elses() {
+    let net = network();
+    let p = party(&net, 1, &[]).await;
+    let other = party(&net, 2, &[]).await;
+    let keyset = net.hub(HUB).info().keysets[0].clone();
+    let (ephemeral, outputs) = p.wallet.funded_outputs(&keyset, 1_000).unwrap();
+    let worth: u64 = outputs.iter().map(|o| o.denomination()).sum();
+    assert_eq!(worth, 1_000);
+    assert!(outputs
+        .windows(2)
+        .all(|w| w[0].denomination() >= w[1].denomination()));
+    let notes = p.wallet.funded_notes(&ephemeral, &outputs).unwrap();
+    for (i, (note, output)) in notes.iter().zip(&outputs).enumerate() {
+        assert_eq!(note.index, i as u32);
+        assert_eq!(
+            &licash::spend::Output::from_derivation(&note.derivation).unwrap(),
+            output
+        );
+    }
+    assert!(other.wallet.funded_notes(&ephemeral, &outputs).is_err());
+    let mut swapped = outputs.clone();
+    swapped.swap(0, 1);
+    assert!(p.wallet.funded_notes(&ephemeral, &swapped).is_err());
+}

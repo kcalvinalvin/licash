@@ -440,6 +440,12 @@ enum Command {
         /// smallest free that pays it].
         #[arg(long)]
         coin: Option<bitcoin::OutPoint>,
+        /// Sat of the contract to fund yourself, at most its cap: paid
+        /// from the coin beside the price, the hub's interest charged on
+        /// the rest only, and issued back as notes at the hub once its
+        /// funding is buried [default: none].
+        #[arg(long, default_value_t = 0)]
+        funded: u32,
         /// Open it at a hub charging more than is sane too: over 10 sat
         /// or 1% a payment, lock or refund, a sat for each note made, or
         /// 20% of the cap chosen a year.
@@ -1194,6 +1200,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             max_price,
             cap,
             coin,
+            funded,
             any_fees,
             chain,
         } => {
@@ -1202,6 +1209,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 max_price,
                 cap,
                 coin,
+                funded,
                 any_fees,
             };
             return contract::open(&wallet, &path, chain.as_deref(), &hub, ask, json).await;

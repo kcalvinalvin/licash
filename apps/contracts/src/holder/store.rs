@@ -5,10 +5,10 @@
 //!
 //! The file's version tells which of its tables a build must know to
 //! read it right. The `ceilings`, `claim_terms`, `folds`, `exit_consent`,
-//! `exit_payouts`, `fate_blocks` and `recovery_tips` are none of them: each
-//! made with the first kept, whatever the version, and ignored by a build
-//! before them, which opens the file all the same. A migration to come
-//! must make them `IF NOT EXISTS` too.
+//! `exit_payouts`, `fate_blocks`, `recovery_tips` and `funded` are none of
+//! them: each made with the first kept, whatever the version, and ignored
+//! by a build before them, which opens the file all the same. A migration
+//! to come must make them `IF NOT EXISTS` too.
 
 use std::collections::HashMap;
 #[cfg(test)]
@@ -148,6 +148,17 @@ CREATE TABLE IF NOT EXISTS fate_blocks (
 ) STRICT;
 ";
 
+/// What she funded of each contract herself, in sat, of those funding
+/// some, and once her wallet received the notes its hub issues her for
+/// it ([`super::funded`]). Made with the first.
+const FUNDED: &str = "
+CREATE TABLE IF NOT EXISTS funded (
+    id BLOB PRIMARY KEY REFERENCES contracts (id),
+    amount INTEGER NOT NULL,
+    received_at INTEGER
+) STRICT;
+";
+
 /// The instances of each opening its hub answered as had, by the index
 /// of each: not sent again when the opening resumes. Made with the first.
 const SERVED: &str = "
@@ -233,6 +244,11 @@ pub struct Contract {
     pub created_at: i64,
     /// Its fold's txid, once she closed it early with its hub.
     pub folded: Option<Txid>,
+    /// What she funded of it herself, in sat: notes its hub issues her
+    /// once F is buried, else her recovery claims.
+    pub funded: u64,
+    /// Whether her wallet received those notes.
+    pub funded_received: bool,
 }
 
 impl Contract {
@@ -330,7 +346,9 @@ impl Store {
 
     /// Insert a contract and `fees`, the most its hub may charge her, in
     /// the same write.
-    pub fn insert_under(&self, new: &New<'_>, fees: &Fees) -> Result<()> {
+    /// [`Store::insert`], with the ceilings of its hub's `fees`, and the
+    /// sat she `funded` of it herself, if any.
+    pub fn insert_under(&self, new: &New<'_>, fees: &Fees, funded: u64) -> Result<()> {
         let t = rusqlite::Transaction::new_unchecked(&self.c, TransactionBehavior::Immediate)?;
         t.execute_batch(CEILINGS)?;
         insert(&t, new)?;
@@ -338,7 +356,35 @@ impl Store {
             "INSERT INTO ceilings (id, fees, updated_at) VALUES (?1, ?2, ?3)",
             params![new.id, serde_json::to_string(fees)?, crate::now()],
         )?;
+        if funded > 0 {
+            t.execute_batch(FUNDED)?;
+            t.execute(
+                "INSERT INTO funded (id, amount) VALUES (?1, ?2)",
+                params![new.id, i64::try_from(funded)?],
+            )?;
+        }
         t.commit()?;
+        Ok(())
+    }
+
+    /// The contracts whose funded notes her wallet has not received yet.
+    pub fn funded_unreceived(&self) -> Result<Vec<[u8; 32]>> {
+        if !self.has("funded")? {
+            return Ok(vec![]);
+        }
+        let mut stmt = self
+            .c
+            .prepare("SELECT id FROM funded WHERE received_at IS NULL")?;
+        let ids = stmt.query_map([], |r| r.get(0))?;
+        Ok(ids.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The funded notes of contract `id`, all received by her wallet.
+    pub fn funded_received(&self, id: &[u8; 32]) -> Result<()> {
+        self.c.execute(
+            "UPDATE funded SET received_at = ?2 WHERE id = ?1 AND received_at IS NULL",
+            params![id, crate::now()],
+        )?;
         Ok(())
     }
 
@@ -694,9 +740,16 @@ impl Store {
             true => "(SELECT txid FROM folds WHERE folds.id = contracts.id)",
             false => "NULL",
         };
+        let funded = match self.has("funded")? {
+            true => {
+                "(SELECT amount FROM funded WHERE funded.id = contracts.id),
+                 (SELECT received_at IS NOT NULL FROM funded WHERE funded.id = contracts.id)"
+            }
+            false => "NULL, NULL",
+        };
         let mut stmt = self.c.prepare(&format!(
             "SELECT id, hub, phase, mock, deposit, value, price, cap, assert_height,
-                    close_height, funding, fate, abandoned, created_at, since, {folds}
+                    close_height, funding, fate, abandoned, created_at, since, {folds}, {funded}
              FROM contracts ORDER BY created_at DESC, id"
         ))?;
         let rows = stmt.query_map([], |r| {
@@ -717,6 +770,7 @@ impl Store {
                 r.get::<_, Option<String>>(12)?,
                 r.get::<_, i64>(13)?,
                 (r.get::<_, u32>(14)?, r.get::<_, Option<Vec<u8>>>(15)?),
+                (r.get::<_, Option<i64>>(16)?, r.get::<_, Option<bool>>(17)?),
             ))
         })?;
         let mut all = Vec::new();
@@ -734,6 +788,7 @@ impl Store {
                 abandoned,
                 created_at,
                 (since, folded),
+                (funded, received),
             ) = row?;
             let phase = *Phase::ALL
                 .get(usize::from(phase))
@@ -755,6 +810,8 @@ impl Store {
                 abandoned,
                 created_at,
                 folded: folded.map(|t| deserialize(&t)).transpose()?,
+                funded: funded.map_or(0, |f| f as u64),
+                funded_received: received.unwrap_or(false),
             });
         }
         Ok(all)
@@ -1256,14 +1313,14 @@ mod tests {
         assert!(!store.keeps_ceilings().unwrap());
 
         let agreed = fees(1, 100, 100);
-        store.insert_under(&new(2, coin(1)), &agreed).unwrap();
+        store.insert_under(&new(2, coin(1)), &agreed, 0).unwrap();
         assert_eq!(
             store.ceilings().unwrap(),
             HashMap::from([([2; 32], agreed)])
         );
         // Neither its deposit taken nor its ceilings kept, if it is refused.
         assert!(store
-            .insert_under(&new(3, coin(1)), &fees(0, 0, 0))
+            .insert_under(&new(3, coin(1)), &fees(0, 0, 0), 0)
             .is_err());
         assert_eq!(store.list().unwrap().len(), 2);
         assert_eq!(store.ceilings().unwrap().len(), 1);
@@ -1274,7 +1331,7 @@ mod tests {
         assert!(store.start_recovery(&[2; 32], 1, "claiming", b"s").unwrap());
         assert_eq!(user_version(dir.path()), 2);
         assert_eq!(store.ceilings().unwrap()[&[2; 32]], agreed);
-        store.insert_under(&new(4, coin(2)), &agreed).unwrap();
+        store.insert_under(&new(4, coin(2)), &agreed, 0).unwrap();
         assert_eq!(store.ceilings().unwrap().len(), 2);
     }
 
@@ -1316,13 +1373,13 @@ mod tests {
         let store = Store::open(dir.path()).unwrap();
         store.insert(&new(1, coin(0))).unwrap();
         store
-            .insert_under(&new(2, coin(1)), &fees(1, 100, 100))
+            .insert_under(&new(2, coin(1)), &fees(1, 100, 100), 0)
             .unwrap();
         store
-            .insert_under(&new(3, coin(2)), &fees(5, 50, 0))
+            .insert_under(&new(3, coin(2)), &fees(5, 50, 0), 0)
             .unwrap();
         store
-            .insert_under(&new(4, coin(3)), &fees(0, 0, 0))
+            .insert_under(&new(4, coin(3)), &fees(0, 0, 0), 0)
             .unwrap();
         // Of those named only, and only those it raises: the one that
         // kept none keeps none.
@@ -1343,10 +1400,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();
         store
-            .insert_under(&new(1, coin(0)), &fees(1, 100, 100))
+            .insert_under(&new(1, coin(0)), &fees(1, 100, 100), 0)
             .unwrap();
         store
-            .insert_under(&new(2, coin(1)), &fees(1, 100, 100))
+            .insert_under(&new(2, coin(1)), &fees(1, 100, 100), 0)
             .unwrap();
         store
             .c

@@ -106,6 +106,7 @@ fn build(id: u32) -> Opened {
             change: coin.script_pubkey.clone(),
             payout: coin.script_pubkey.clone(),
             wanted,
+            funded: None,
         },
         &ctx,
     )

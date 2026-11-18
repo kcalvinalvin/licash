@@ -66,7 +66,7 @@ impl Wallet {
         let change = self.change_range(&hub)?;
         let trust = licash_contracts::trust(self.wallet.network());
         let trust = trust.map_err(|e| LicashError::invalid(format!("{e:#}")))?;
-        let offer = holder::offer(&self.wallet, &hub, None);
+        let offer = holder::offer(&self.wallet, &hub, None, 0);
         let offer = self.runtime.block_on(offer).map_err(unavailable)?;
         let price = offer.price();
         let coin = holder::coin(&self.wallet, &self.dir, price).map_err(failed)?;
@@ -168,6 +168,7 @@ impl Wallet {
             max_price: max_price.unwrap_or(terms.price),
             cap: None,
             deposit: None,
+            funded: 0,
         };
         let _contracting = self
             .contracting
@@ -225,6 +226,7 @@ impl Wallet {
             max_price,
             cap: Some(cap),
             deposit: Some(deposit),
+            funded: 0,
         };
         self.opened(chain, &hub, ask)
     }
@@ -273,8 +275,7 @@ impl Wallet {
         let chain = Chain(chain, self.wallet.network());
         let tip = self.runtime.block_on(licash_wallet::Blocks::height(&chain));
         self.saw(tip.map_err(|reason| LicashError::Unavailable { reason })?);
-        let notes = holder::Change::Notes;
-        let opened = holder::open_with(&self.wallet, &chain, &self.dir, hub, ask, notes);
+        let opened = holder::open_with(&self.wallet, &chain, &self.dir, hub, ask);
         let opened = self.runtime.block_on(opened).map_err(unavailable)?;
         // Protecting nothing before its funding is buried.
         Ok(self.contract(&opened, 0))
@@ -620,6 +621,8 @@ mod tests {
             abandoned: None,
             created_at: 0,
             folded: None,
+            funded: 0,
+            funded_received: false,
         }
     }
 

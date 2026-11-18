@@ -16,7 +16,9 @@ use licash_contract::{
     opening::{Context, Holder, Opening},
 };
 use licash_onchain::deadline;
-use licash_wallet::{first_spend, ClaimNote, ClaimSlot, LockClaim, PayoutState, Transport, Wallet};
+use licash_wallet::{
+    first_spend, ClaimNote, ClaimSlot, FundedNote, LockClaim, PayoutState, Transport, Wallet,
+};
 use lichen_contract::Role;
 use serde::{Deserialize, Serialize};
 
@@ -1031,51 +1033,46 @@ impl<'a, T: Transport, C: Chain> Run<'a, T, C> {
     /// Her notes of the hub's keyset taken, its share of them with her
     /// other contracts there ([`claims`]), and claimed: the claim signed
     /// by each note's hold key, for their face value, its cap at most.
-    /// The branches of her locks there owed on Bitcoin first
-    /// ([`LockClaim`]), within its cap: the refunds of those she made that
-    /// expired at depth unsettled, and the pay branches of those paying her
-    /// whose activation its statement shows ([`activation::shown`]). Should
-    /// the claim not be filed with those, it is without them.
+    /// The notes she funded it with that her wallet never received are
+    /// claimed first ([`super::funded`]), then the branches of her locks
+    /// there owed on Bitcoin ([`LockClaim`]), within its cap: the refunds
+    /// of those she made that expired at depth unsettled, and the pay
+    /// branches of those paying her whose activation its statement shows
+    /// ([`activation::shown`]). Should the claim not be filed with those,
+    /// it is without them.
     async fn claim(&self, state: &mut State, tip: u32) -> Result<Next> {
         // Before any note of hers is taken.
         self.o.forcible()?;
         let parts = self.o.base.parts();
         let keyset = *parts.keyset.id();
+        let funded = super::funded::unreceived(self.wallet, self.o.funded.as_ref())?;
         let mut notes = self.wallet.claimed_notes(&self.id, &keyset)?;
         let mut locks = self.wallet.claimed_locks(&self.id, &keyset)?;
         if notes.is_empty() && locks.is_empty() {
             let shown = activation::shown(self.wallet, self.chain, &self.o.base, tip).await?;
             let pays = |p: &LockClaim| shown.contains(&p.id);
-            (notes, locks) =
-                self.wallet
-                    .claim_with_locks(&self.id, &self.slots(tip)?, tip, Some(&pays))?;
-            let held = (notes.iter().map(|n| n.note.message().denomination()))
-                .chain(locks.iter().map(|r| r.value))
-                .sum::<u64>();
-            let amount = parts.cap.min(u32::try_from(held).unwrap_or(u32::MAX));
+            let slots = self.slots(tip, &funded)?;
+            (notes, locks) = self
+                .wallet
+                .claim_with_locks(&self.id, &slots, tip, Some(&pays))?;
             let paying = locks.iter().any(|r| r.branch == Branch::Pay);
             if paying {
-                if let Err(e) = self.filing(&notes, &locks, amount) {
+                let amount = self.amount(&notes, &funded, &locks);
+                if let Err(e) = self.filing(&notes, &funded, &locks, amount) {
                     tracing::warn!(id = %crate::hex_id(&self.id), "a claim filed without the locks paying her: {e:#}");
                     self.wallet.unclaim_notes(&self.id)?;
-                    (notes, locks) =
-                        self.wallet
-                            .claim_with_locks(&self.id, &self.slots(tip)?, tip, None)?;
+                    (notes, locks) = self.wallet.claim_with_locks(&self.id, &slots, tip, None)?;
                 }
             }
             self.took
                 .store(!(notes.is_empty() && locks.is_empty()), Ordering::SeqCst);
         }
-        if notes.is_empty() && locks.is_empty() {
+        if notes.is_empty() && locks.is_empty() && funded.is_empty() {
             self.give_back("no notes at its hub to claim")?;
             bail!("no notes at its hub to claim");
         }
-        // A note beyond what is left of the cap is claimed for that much.
-        let held: u64 = (notes.iter().map(|n| n.note.message().denomination()))
-            .chain(locks.iter().map(|r| r.value))
-            .sum();
-        state.amount = parts.cap.min(u32::try_from(held).unwrap_or(u32::MAX));
-        let filing = match self.filing(&notes, &locks, state.amount) {
+        state.amount = self.amount(&notes, &funded, &locks);
+        let filing = match self.filing(&notes, &funded, &locks, state.amount) {
             Ok(filing) => filing,
             Err(e) => {
                 self.give_back(&format!("{e:#}"))?;
@@ -1087,9 +1084,25 @@ impl<'a, T: Transport, C: Chain> Run<'a, T, C> {
         Ok(Next::To(Stage::Claimed))
     }
 
-    /// The slots her notes at its hub are shared out to: its own, and
-    /// those of her other contracts there protecting notes at `tip`.
-    fn slots(&self, tip: u32) -> Result<Vec<ClaimSlot>> {
+    /// What a claim of `notes`, `funded` and `locks` is for: their face
+    /// value, its cap at most, as a note beyond what is left of the cap
+    /// is claimed for that much.
+    fn amount(&self, notes: &[ClaimNote], funded: &[FundedNote], locks: &[LockClaim]) -> u32 {
+        let held: u64 = (notes.iter().map(|n| n.note.message().denomination()))
+            .chain(funded.iter().map(|f| f.derivation.message().denomination()))
+            .chain(locks.iter().map(|r| r.value))
+            .sum();
+        self.o
+            .base
+            .parts()
+            .cap
+            .min(u32::try_from(held).unwrap_or(u32::MAX))
+    }
+
+    /// The slots her notes at its hub are shared out to: its own, less
+    /// what its `funded` notes claim of it, and those of her other
+    /// contracts there protecting notes at `tip`.
+    fn slots(&self, tip: u32, funded: &[FundedNote]) -> Result<Vec<ClaimSlot>> {
         let all = self.store.list()?;
         let this = (all.iter().find(|c| c.id == self.id)).context("a contract not stored")?;
         let urls = self.wallet.hub_urls(&this.hub).unwrap_or_default();
@@ -1099,10 +1112,26 @@ impl<'a, T: Transport, C: Chain> Run<'a, T, C> {
         let mut terms = claims::terms(self.wallet, self.store, &others, tip)?;
         terms.insert(self.id, ClaimTerms::of(&self.o));
         let mine = others.into_iter().chain([this]);
-        Ok(claims::claim_slots(mine, &terms))
+        let mut slots = claims::claim_slots(mine, &terms);
+        let owed: u64 = (funded.iter())
+            .map(|f| f.derivation.message().denomination())
+            .sum();
+        for slot in slots.iter_mut().filter(|s| s.id == self.id) {
+            // Not lowered twice: the store's record of her funded part is
+            // replaced by what her wallet holds of it.
+            slot.cap = u64::from(this.cap).saturating_sub(owed);
+            slot.max = slot.max.saturating_sub(funded.len());
+        }
+        Ok(slots)
     }
 
-    fn filing(&self, notes: &[ClaimNote], locks: &[LockClaim], amount: u32) -> Result<Filing> {
+    fn filing(
+        &self,
+        notes: &[ClaimNote],
+        funded: &[FundedNote],
+        locks: &[LockClaim],
+        amount: u32,
+    ) -> Result<Filing> {
         let p = self.o.base.parts();
         let limit = p.limits.max_authorizations as usize;
         // In the claim's order of sources, which their witnesses follow.
@@ -1110,12 +1139,25 @@ impl<'a, T: Transport, C: Chain> Run<'a, T, C> {
         locks.sort_by_key(|r| r.id);
         let messages: Vec<_> = notes.iter().map(|n| n.note.message().clone()).collect();
         let mut keys = self.wallet.hold_keys(notes)?;
+        keys.extend((funded.iter()).map(|f| (f.derivation.message().clone(), f.hold_key)));
         keys.extend(locks.iter().flat_map(|r| r.keys.iter().cloned()));
         let mut authorizations: Vec<_> = keys.iter().map(|(m, _)| m.clone()).collect();
         authorizations.sort_by_key(|m| m.identifier().ok());
         let items = (messages.into_iter().map(Item::Settled))
+            .chain(funded.iter().map(|f| Item::Funded {
+                message: f.derivation.message().clone(),
+                index: f.index,
+                blinding: *f.derivation.blinding(),
+            }))
             .chain(locks.iter().flat_map(|r| r.items.iter().cloned()))
             .collect();
+        let witnessed = match funded.is_empty() {
+            true => vec![],
+            false => (self.o.funded.as_ref())
+                .context("funded notes of a contract funding none")?
+                .outputs
+                .clone(),
+        };
         let claim = UnsignedClaim::new(
             claim::Context {
                 base: self.o.base.digest(),
@@ -1143,6 +1185,7 @@ impl<'a, T: Transport, C: Chain> Run<'a, T, C> {
                 activations: (locks.iter())
                     .filter_map(|r| r.activation.as_ref().map(|(_, w)| w.clone()))
                     .collect(),
+                funded: witnessed,
             },
         )?;
         ensure!(
@@ -2606,7 +2649,7 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
             amount: parts.cap.min(u32::try_from(held).unwrap_or(u32::MAX)),
             ..State::default()
         };
-        let filing = self.filing(&notes, &[], state.amount)?;
+        let filing = self.filing(&notes, &[], &[], state.amount)?;
         state.notes = notes.iter().map(|n| hex::encode(n.to_bytes())).collect();
         state.filing = Some(hex::encode(filing.to_bytes()));
         let row = self.store.recovery(&self.id)?.context("given up")?;

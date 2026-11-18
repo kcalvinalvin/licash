@@ -232,6 +232,8 @@ mod tests {
             abandoned: None,
             created_at: 0,
             folded: None,
+            funded: 0,
+            funded_received: false,
         }
     }
 
@@ -372,12 +374,20 @@ mod tests {
         // and one given up, at the first hub; one never to be, at the other.
         store.insert(&new(1, a)).unwrap();
         store.set_fate(&[1; 32], Fate::Live).unwrap();
-        store.insert_under(&new(2, a), &fees(1, 100, 100)).unwrap();
+        store
+            .insert_under(&new(2, a), &fees(1, 100, 100), 0)
+            .unwrap();
         store.set_fate(&[2; 32], Fate::Live).unwrap();
-        store.insert_under(&new(3, a), &fees(1, 100, 100)).unwrap();
-        store.insert_under(&new(4, a), &fees(1, 100, 100)).unwrap();
+        store
+            .insert_under(&new(3, a), &fees(1, 100, 100), 0)
+            .unwrap();
+        store
+            .insert_under(&new(4, a), &fees(1, 100, 100), 0)
+            .unwrap();
         store.abandon(&[4; 32], "refused").unwrap();
-        store.insert_under(&new(5, b), &fees(1, 100, 100)).unwrap();
+        store
+            .insert_under(&new(5, b), &fees(1, 100, 100), 0)
+            .unwrap();
         store.set_fate(&[5; 32], Fate::Dead).unwrap();
         drop(store);
 

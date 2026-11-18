@@ -105,6 +105,8 @@ pub struct Asked {
     pub max_price: Option<u64>,
     pub cap: Option<u32>,
     pub coin: Option<bitcoin::OutPoint>,
+    /// What she funds of it herself, in sat.
+    pub funded: u32,
     /// At a hub charging more than is sane too.
     pub any_fees: bool,
 }
@@ -112,8 +114,8 @@ pub struct Asked {
 /// Open a contract at `hub` closing `blocks` from now [default: as late
 /// as the hub allows], paying at most `max_price` [default: what its info
 /// said, or its range prices the terms chosen at], protecting `cap` sat
-/// if chosen [default: the hub's fixed terms], paid from `coin` [default:
-/// the smallest free that pays it].
+/// if chosen [default: the hub's fixed terms], `funded` sat of it hers,
+/// paid from `coin` [default: the smallest free that pays it and that].
 pub async fn open(
     wallet: &Wallet<Http>,
     path: &Path,
@@ -134,7 +136,7 @@ pub async fn open(
         .with_context(|| format!("{hub} opens no contracts"))?;
     let blocks = asked.blocks.unwrap_or(offered.blocks);
     let price = match (asked.cap, offered.range) {
-        (Some(cap), Some(range)) => range.price(cap, blocks, 0),
+        (Some(cap), Some(range)) => range.price(cap, blocks, asked.funded),
         (Some(_), None) => anyhow::bail!("{hub} offers no contracts of other caps"),
         (None, _) => offered.price,
     };
@@ -143,13 +145,12 @@ pub async fn open(
         max_price: asked.max_price.unwrap_or(price),
         cap: asked.cap,
         deposit: asked.coin,
+        funded: u64::from(asked.funded),
     };
-    // Her coin turned whole into the contract and the notes it protects:
-    // never change left on Bitcoin.
-    let (dir, change) = (dir(path), holder::Change::Notes);
+    let dir = dir(path);
     let contract = match asked.any_fees {
-        true => holder::open_anyway(wallet, &chain, dir, hub, ask, change).await,
-        false => holder::open_with(wallet, &chain, dir, hub, ask, change).await,
+        true => holder::open_anyway(wallet, &chain, dir, hub, ask).await,
+        false => holder::open_with(wallet, &chain, dir, hub, ask).await,
     }?;
     show(json, contract_json(&contract), contract_line(&contract));
     Ok(())
@@ -273,7 +274,7 @@ fn contract_line(c: &Contract) -> String {
         ""
     };
     format!(
-        "{}  {}  {}  covers {}  until block {}  closes at block {}  deposit {}  price {}{share}{mock}",
+        "{}  {}  {}  covers {}  until block {}  closes at block {}  deposit {}  price {}{share}{funded}{mock}",
         &licash_contracts::hex_id(&c.id)[..16],
         c.hub,
         state(c),
@@ -285,6 +286,11 @@ fn contract_line(c: &Contract) -> String {
         share = crate::say::share(c.price, c.cap.into())
             .map(|s| format!(" ({s} of what it covers)"))
             .unwrap_or_default(),
+        funded = match (c.funded, c.funded_received) {
+            (0, _) => String::new(),
+            (f, true) => format!("  funded {} (notes received)", crate::say::sat(f)),
+            (f, false) => format!("  funded {} (notes owed)", crate::say::sat(f)),
+        },
     )
 }
 
@@ -302,6 +308,8 @@ fn contract_json(c: &Contract) -> serde_json::Value {
         "deposit": c.deposit.to_string(),
         "value": c.value,
         "price": c.price,
+        "funded": c.funded,
+        "funded_received": c.funded_received,
         "funding": c.funding.map(|t| t.to_string()),
         "abandoned": c.abandoned,
         "folded": c.folded.map(|t| t.to_string()),

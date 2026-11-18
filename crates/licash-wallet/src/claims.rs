@@ -27,10 +27,11 @@ use std::cmp::Reverse;
 use std::collections::{hash_map::Entry, BTreeSet, HashMap};
 
 use licash::{
+    address::Ephemeral,
     chain::{Activation, Checkpoint},
     claim::{ActivationRecord, Branch, Item, Source},
     crypto::{Point, ScalarBytes, Signature},
-    note::{Keyset, Message, Note, Ownership},
+    note::{Derivation, Keyset, Message, Note, Ownership},
     recovery::{ActivationWitness, SourceWitness},
     source::Certificate,
     spend::{Output, Proposal, ProposalId},
@@ -182,7 +183,77 @@ fn recovered(slot: &ClaimSlot, notes: &[([u8; 32], u64)], picked: &[usize]) -> u
     sum.min(slot.cap)
 }
 
+/// A note she funds a contract with herself ([`Wallet::funded_outputs`]):
+/// what her claim names it by should its hub never issue it her.
+pub struct FundedNote {
+    /// Its output's position among those she funded with.
+    pub index: u32,
+    pub derivation: Derivation,
+    /// Its hold key, which authorizes it in a claim.
+    pub hold_key: ScalarBytes,
+}
+
 impl<T: Transport> Wallet<T> {
+    /// Outputs worth `amount` under `keyset`, paying this wallet, for her
+    /// to fund a contract with: the ephemeral key they are derived with,
+    /// which their issuance carries, and them, the largest first.
+    pub fn funded_outputs(
+        &self,
+        keyset: &Keyset,
+        amount: u64,
+    ) -> Result<(Point, Vec<Output>), Error> {
+        let ephemeral = Ephemeral::random();
+        let outputs = crate::pay_outputs(keyset, &ephemeral, &self.address(), amount)?;
+        Ok((ephemeral.public(), outputs))
+    }
+
+    /// The notes of `outputs`, as [`Wallet::funded_outputs`] made them
+    /// with `ephemeral`: refused for one not of this wallet's keys.
+    pub fn funded_notes(
+        &self,
+        ephemeral: &Point,
+        outputs: &[Output],
+    ) -> Result<Vec<FundedNote>, Error> {
+        let scan = self.owner.scan_key();
+        let mine = |e: licash::Error| Error::Invalid(format!("a funded output: {e}"));
+        (outputs.iter().enumerate())
+            .map(|(i, output)| {
+                let derivation = scan
+                    .derive(ephemeral, output.denomination(), Branch::Pay, i)
+                    .map_err(mine)?;
+                if Output::from_derivation(&derivation).map_err(mine)? != *output {
+                    return Err(Error::Invalid(
+                        "a funded output not of this wallet's keys".into(),
+                    ));
+                }
+                let hold_key = derivation.hold_key(self.owner.hold_root()).map_err(mine)?;
+                Ok(FundedNote {
+                    index: u32::try_from(i)
+                        .map_err(|_| Error::Invalid("too many outputs".into()))?,
+                    derivation,
+                    hold_key,
+                })
+            })
+            .collect()
+    }
+
+    /// Whether this wallet holds the note of each of `outputs`, as
+    /// [`Wallet::funded_outputs`] made them with `ephemeral`: received
+    /// once, held for good, spent or not.
+    pub fn funded_held(&self, ephemeral: &Point, outputs: &[Output]) -> Result<Vec<bool>, Error> {
+        let held: Vec<(u32, u64)> = self.store.read(|c| {
+            let mut stmt =
+                c.prepare("SELECT position, denom FROM notes WHERE ephemeral = ?1 AND branch = 0")?;
+            let rows = stmt.query_map([ephemeral.0.as_slice()], |r| {
+                Ok((r.get::<_, u32>(0)?, r.get::<_, i64>(1)? as u64))
+            })?;
+            Ok::<_, Error>(rows.collect::<rusqlite::Result<_>>()?)
+        })?;
+        Ok((outputs.iter().enumerate())
+            .map(|(i, o)| held.contains(&(i as u32, o.denomination())))
+            .collect())
+    }
+
     /// What each of `slots`, the contracts at a hub with the one asserting
     /// first first, would recover of the wallet's notes at `tip`, by id:
     /// what [`Wallet::claim_with_locks`] would take for it, each in turn,

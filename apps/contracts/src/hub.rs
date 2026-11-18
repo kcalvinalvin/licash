@@ -10,6 +10,7 @@
 
 mod dispute;
 mod fold;
+mod funded;
 mod node;
 mod prover;
 mod responses;
@@ -32,6 +33,7 @@ use axum::routing::{get, post};
 use axum::Router;
 pub use dispute::{Claims, Evidencer, LockCheckpoints, Played};
 pub use fold::FoldLedger;
+pub use funded::{FundedIssue, Issuer, FUNDED_DEPTH};
 /// How the hub tells its operator what needs them ([`Openings::alert_with`]).
 pub type Alert = dyn Fn(&str) + Send + Sync;
 use futures_util::StreamExt;
@@ -42,7 +44,9 @@ use licash_chain_client::Source;
 pub use licash_contract::opening::HubPhase;
 use licash_contract::opening::{Context, Hub, Trust};
 
-use crate::{Frame, Offer, FOLD, FOLD_CLAIM, FOLD_SIGN, INSTANCE, MAX_BODY, OPEN, QUOTE, STEP};
+use crate::{
+    Frame, Offer, FOLD, FOLD_CLAIM, FOLD_SIGN, FUNDED, INSTANCE, MAX_BODY, OPEN, QUOTE, STEP,
+};
 use store::Store;
 use terms::{Range, Timing};
 
@@ -114,6 +118,8 @@ pub struct Openings {
     /// Where a fold finds whether the notes of her claim are open to it,
     /// and retires them.
     fold_ledger: std::sync::OnceLock<Arc<FoldLedger>>,
+    /// Where her funded notes are issued ([`Openings::issue_with`]).
+    issuer: std::sync::OnceLock<Arc<Issuer>>,
     /// The ledger's lock checkpoints, which new contracts open on.
     checkpoints: std::sync::OnceLock<LockCheckpoints>,
     /// The prover of the hub's statement: none where proofs are the mock
@@ -353,6 +359,7 @@ impl Openings {
             evidencer: std::sync::OnceLock::new(),
             claims: std::sync::OnceLock::new(),
             fold_ledger: std::sync::OnceLock::new(),
+            issuer: std::sync::OnceLock::new(),
             checkpoints: std::sync::OnceLock::new(),
             prover: (!trust.mock).then(|| {
                 let before = crate::programs_before(profile);
@@ -483,14 +490,19 @@ impl Openings {
     /// take as its newest lock checkpoint ([`Openings::checkpoints_with`]),
     /// kept as one once a contract opens on it, else at its tip: its
     /// quote of `cap` sat over `blocks` she chose, if within its terms,
-    /// else its fixed one.
-    pub async fn offer(&self, chosen: Option<(u32, u32)>) -> Result<Offer, Refused> {
+    /// else its fixed one; `funded` sat of it hers, the rest the hub's.
+    pub async fn offer(&self, chosen: Option<(u32, u32)>, funded: u32) -> Result<Offer, Refused> {
         let (cap, blocks) = chosen.unwrap_or((terms::CAP, terms::LOCK));
         self.timing().allows(cap, blocks).map_err(Refused::bad)?;
+        if funded > cap {
+            return Err(Refused::bad(format!(
+                "{funded} sat funded, more than the {cap} sat contract"
+            )));
+        }
         let most = self.most_funded(terms::MAX_CAP);
-        if cap > most {
+        if cap - funded > most {
             return Err(Refused::unavailable(format!(
-                "the hub's wallet funds caps of {most} sat at most now"
+                "the hub's wallet funds {most} sat of a contract at most now"
             )));
         }
         let tip = self.source.tip().await.map_err(Refused::unavailable)?;
@@ -498,7 +510,7 @@ impl Openings {
         let checkpoint = self.source.checkpoint(height).await;
         let checkpoint = checkpoint.map_err(Refused::unavailable)?;
         let timing = self.timing().at_step(self.step_now()?);
-        let quote = timing.quote_for(self.keyset.clone(), checkpoint, cap, blocks, 0);
+        let quote = timing.quote_for(self.keyset.clone(), checkpoint, cap, blocks, funded);
         let bounds = self.timing().bounds(&quote);
         Ok(Offer { quote, bounds })
     }
@@ -818,7 +830,7 @@ impl Openings {
 }
 
 /// The routes of `openings`, at [`QUOTE`], [`OPEN`], [`STEP`],
-/// [`INSTANCE`], [`FOLD`] and [`FOLD_SIGN`].
+/// [`INSTANCE`], [`FOLD`], [`FOLD_SIGN`] and [`FUNDED`].
 pub fn router(openings: Arc<Openings>) -> Router {
     // Separate budgets let existing openings progress while new opens or
     // instance uploads are saturated. Body permits precede extraction and
@@ -839,6 +851,7 @@ pub fn router(openings: Arc<Openings>) -> Router {
             post(offer_fold_claim).layer(budget(2, REQUEST_TIME)),
         )
         .route(FOLD_SIGN, post(sign_fold).layer(budget(2, REQUEST_TIME)))
+        .route(FUNDED, post(funded).layer(budget(2, REQUEST_TIME)))
         .layer(DefaultBodyLimit::max(MAX_BODY))
         .with_state(openings)
 }
@@ -883,7 +896,7 @@ impl IntoResponse for Answer {
 }
 
 /// The hub's quote, of the terms she chose (`?cap=SAT&blocks=N`, both or
-/// neither), else its fixed one.
+/// neither), else its fixed one, `funded=SAT` of it hers if asked.
 async fn quote(
     State(openings): State<Arc<Openings>>,
     Query(asked): Query<HashMap<String, String>>,
@@ -899,7 +912,16 @@ async fn quote(
         (None, None) => None,
         _ => return Err(Refused::bad("a cap and blocks, both or neither")),
     };
-    Ok(openings.offer(chosen).await?.encode())
+    let funded = number("funded")?.unwrap_or(0);
+    Ok(openings.offer(chosen, funded).await?.encode())
+}
+
+async fn funded(
+    State(openings): State<Arc<Openings>>,
+    UrlPath(id): UrlPath<String>,
+) -> Result<Vec<u8>, Refused> {
+    let id = crate::parse_id(&id).map_err(Refused::bad)?;
+    Ok(openings.funded(id).await?.encode())
 }
 
 async fn open(State(openings): State<Arc<Openings>>, body: Bytes) -> Result<Answer, Refused> {
@@ -1040,6 +1062,7 @@ mod tests {
             evidencer: std::sync::OnceLock::new(),
             claims: std::sync::OnceLock::new(),
             fold_ledger: std::sync::OnceLock::new(),
+            issuer: std::sync::OnceLock::new(),
             checkpoints: std::sync::OnceLock::new(),
             prover: None,
             alert: std::sync::OnceLock::new(),

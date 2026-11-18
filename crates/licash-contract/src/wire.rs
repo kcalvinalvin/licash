@@ -498,11 +498,19 @@ pub struct Open {
     /// under v3 and its own program; one before binding no longer loads
     /// once the program contracts open under changes, before any funding.
     pub request_keys: Option<[u8; 32]>,
-    /// The outputs she funds the contract with herself, in order, which a
-    /// v5 Base commits to and the Hub issues her notes for once F
-    /// confirms: worth the quote's `deposit_units`. Written after her
-    /// request keys, which they need, and only if any.
-    pub funded: Vec<licash::spend::Output>,
+    /// What she funds of the contract herself, which a v5 Base commits
+    /// to: written after her request keys, which it needs, if any.
+    pub funded: Option<FundedNotes>,
+}
+
+/// The notes she funds her part of a contract with: the outputs, in
+/// order, that the Hub issues her once F confirms, worth the quote's
+/// `deposit_units`, and the ephemeral key she derived them with, which
+/// its issuance carries for her to find them by.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FundedNotes {
+    pub ephemeral: licash::crypto::Point,
+    pub outputs: Vec<licash::spend::Output>,
 }
 message!(
     Open,
@@ -521,9 +529,10 @@ message!(
         w.u8(self.mock as u8);
         if let Some(digest) = &self.request_keys {
             w.bytes(digest);
-            if !self.funded.is_empty() {
-                w.count(self.funded.len());
-                for output in &self.funded {
+            if let Some(funded) = &self.funded {
+                w.bytes(&funded.ephemeral.0);
+                w.count(funded.outputs.len());
+                for output in &funded.outputs {
                     w.bytes(&output.to_bytes());
                 }
             }
@@ -547,15 +556,20 @@ message!(
         } else {
             Some(r.array()?)
         };
-        let mut funded = Vec::new();
-        if !r.0.is_empty() {
+        let funded = if r.0.is_empty() {
+            None
+        } else {
+            let ephemeral = licash::crypto::Point(r.array()?);
+            ephemeral.to_projective()?;
             let n = r.count(licash::spend::OUTPUT_BYTES)?;
             ensure!(n > 0, "an empty funded list");
+            let mut outputs = Vec::with_capacity(n);
             for _ in 0..n {
                 let bytes = r.take(licash::spend::OUTPUT_BYTES)?;
-                funded.push(licash::spend::Output::from_bytes(bytes)?);
+                outputs.push(licash::spend::Output::from_bytes(bytes)?);
             }
-        }
+            Some(FundedNotes { ephemeral, outputs })
+        };
         Self {
             party,
             claim_key,
@@ -830,7 +844,7 @@ mod tests {
             },
             mock: false,
             request_keys: None,
-            funded: vec![],
+            funded: None,
         };
         let digest = keys.public().request_keys().unwrap().digest();
         let bound = Open {
@@ -858,7 +872,10 @@ mod tests {
             .unwrap()
         };
         let funding = Open {
-            funded: vec![output(4), output(8)],
+            funded: Some(FundedNotes {
+                ephemeral: output(3).blinded(),
+                outputs: vec![output(4), output(8)],
+            }),
             ..bound.clone()
         };
         let encoded = funding.encode();
@@ -866,7 +883,7 @@ mod tests {
         for cut in [1, 73] {
             assert!(Open::decode(&encoded[..encoded.len() - cut]).is_err());
         }
-        let empty = [new.as_slice(), &0u32.to_be_bytes()].concat();
+        let empty = [new.as_slice(), &output(3).blinded().0, &0u32.to_be_bytes()].concat();
         assert!(Open::decode(&empty).is_err());
     }
 }

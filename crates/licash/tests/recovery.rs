@@ -1917,7 +1917,6 @@ fn funded_items(ds: &[Derivation], indices: &[u32]) -> Vec<Item> {
 #[test]
 fn v5_owes_her_funded_notes_unless_spent_or_claimed_elsewhere() {
     let issuer = IssuerKeys::random(3).unwrap();
-    let keyset = issuer.keyset().unwrap();
     let ds: Vec<_> = (0..4).map(|i| derive(SPEND, &hold(), 4, 24, i)).collect();
     let outputs: Vec<_> = ds
         .iter()

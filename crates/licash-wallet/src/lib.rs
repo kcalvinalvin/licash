@@ -77,7 +77,7 @@ use rand_core::{OsRng, RngCore};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{de::DeserializeOwned, Serialize};
 
-pub use claims::{ClaimNote, ClaimSlot, LockClaim, OwedLock, SlotPays};
+pub use claims::{ClaimNote, ClaimSlot, FundedNote, LockClaim, OwedLock, SlotPays};
 pub use code::{
     ContractSecrets, DonationAddress, HubId, LicashCode, PaymentCode, CODE_HUBS, MAX_HUBS,
 };

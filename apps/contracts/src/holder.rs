@@ -1,8 +1,9 @@
 //! The holder's side of openings, in her wallet: [`open`] a contract at
 //! a hub she trusts, [`resume`] those under way and watch their F, and
 //! [`list`] them. Her deposit is a coin of the wallet's, signed into F by
-//! it; her change returns to its fallback address, or into notes at the
-//! hub ([`Change::Notes`]). One her hub left silent she forces closed, in
+//! it; her change returns to its fallback address. She may fund part of
+//! the contract herself, the hub issuing her notes of as much once F is
+//! buried ([`funded`]). One her hub left silent she forces closed, in
 //! [`recovery`]. What a hub charged as a contract opened there is the most
 //! it may charge her since, until she agrees to more: [`fees`]. Her
 //! contracts at a hub share her notes there out, to show and to claim
@@ -15,6 +16,7 @@ mod driver;
 pub mod exit;
 pub mod fees;
 mod fold;
+pub mod funded;
 #[cfg(feature = "node")]
 pub(crate) mod node;
 pub mod recovery;
@@ -24,7 +26,7 @@ mod store;
 use std::{collections::HashSet, path::Path};
 
 use anyhow::{anyhow, bail, ensure, Context as _, Result};
-use bitcoin::{OutPoint, ScriptBuf};
+use bitcoin::OutPoint;
 use licash_contract::opening::{Holder, Quote, Start};
 use licash_contract::wire::Wanted;
 use licash_wallet::{SilentCoin, Transport, Wallet};
@@ -65,29 +67,6 @@ pub fn after_assert(quote: &Quote) -> u32 {
 /// The blocks she has to respond to the hub's request, at least.
 pub const RESPONSE_WINDOW: u16 = 8;
 
-/// Blocks F paying a deposit has, at least, from her signing it to the
-/// last its payment may confirm in: twice that when it is asked for, the
-/// opening's messages and downloads to come first. Short, not to give an
-/// opening up for nothing: one paid too late is taken back after the
-/// deposit's timeout.
-pub const DEPOSIT_MARGIN: u32 = 24;
-
-/// Where F's change goes, her deposit less her price.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Change {
-    /// To the wallet's fallback address, on Bitcoin.
-    #[default]
-    Bitcoin,
-    /// Into notes at the contract's hub, F paying a deposit there with
-    /// it, the hub's fee in it: no change left on Bitcoin, her coin
-    /// turned whole into the contract and notes it protects. The opening
-    /// is refused where that cannot be: the hub takes no deposit paid so
-    /// much exactly, leaves too little time to pay it in, or the change
-    /// is more than the contract protects. Change too little to be an
-    /// output goes to F's fee.
-    Notes,
-}
-
 /// What she asks of a hub.
 #[derive(Clone, Copy, Debug)]
 pub struct Ask {
@@ -101,8 +80,13 @@ pub struct Ask {
     /// none for its fixed terms.
     pub cap: Option<u32>,
     /// The coin she deposits: none for the smallest free that pays the
-    /// price and is large enough for the cap.
+    /// price and what she funds, and is large enough for the cap.
     pub deposit: Option<OutPoint>,
+    /// What she funds of the contract herself, in sat, at most its cap:
+    /// paid in F with the price, the hub's interest charged on the rest
+    /// only, and issued her as notes at the hub once F is buried. None
+    /// for 0.
+    pub funded: u64,
 }
 
 /// Open a contract at `hub`, a hub `wallet` trusts, on its offer now:
@@ -120,7 +104,7 @@ pub async fn open<T: Transport, C: Chain>(
     hub: &str,
     ask: Ask,
 ) -> Result<Contract> {
-    open_at(wallet, chain, dir, hub, ask, Change::Bitcoin, true, 0).await
+    open_at(wallet, chain, dir, hub, ask, true, 0).await
 }
 
 /// How many times [`open_with`] resumes an opening that failed short of
@@ -128,18 +112,16 @@ pub async fn open<T: Transport, C: Chain>(
 /// then, a step's answer too.
 const RESUMES: u32 = 2;
 
-/// [`open`], F's `change` going where asked: into notes at the hub, F
-/// sweeping her coin whole, if it can. Resumed at once, up to `RESUMES`
-/// times, should it fail short of F but for a refusal.
+/// [`open`], resumed at once, up to `RESUMES` times, should it fail
+/// short of F but for a refusal.
 pub async fn open_with<T: Transport, C: Chain>(
     wallet: &Wallet<T>,
     chain: &C,
     dir: &Path,
     hub: &str,
     ask: Ask,
-    change: Change,
 ) -> Result<Contract> {
-    open_at(wallet, chain, dir, hub, ask, change, true, RESUMES).await
+    open_at(wallet, chain, dir, hub, ask, true, RESUMES).await
 }
 
 /// [`open_with`], at a hub charging more than is sane too
@@ -150,43 +132,38 @@ pub async fn open_anyway<T: Transport, C: Chain>(
     dir: &Path,
     hub: &str,
     ask: Ask,
-    change: Change,
 ) -> Result<Contract> {
-    open_at(wallet, chain, dir, hub, ask, change, false, RESUMES).await
+    open_at(wallet, chain, dir, hub, ask, false, RESUMES).await
 }
 
 /// One opening as [`open_once`], or, refused as the hub quotes otherwise
 /// now (its fee surcharged since, say), given up and made once more on a
 /// quote asked anew: within her ceilings still.
-#[allow(clippy::too_many_arguments)]
 async fn open_at<T: Transport, C: Chain>(
     wallet: &Wallet<T>,
     chain: &C,
     dir: &Path,
     hub: &str,
     ask: Ask,
-    change: Change,
     sane: bool,
     resumes: u32,
 ) -> Result<Contract> {
-    let opened = open_once(wallet, chain, dir, hub, ask, change, sane, resumes).await;
+    let opened = open_once(wallet, chain, dir, hub, ask, sane, resumes).await;
     match opened {
         Err(e) if e.downcast_ref::<driver::Requote>().is_some() => {
             tracing::info!(%hub, "its quote refused as the hub's no longer: asked again: {e:#}");
-            open_once(wallet, chain, dir, hub, ask, change, sane, resumes).await
+            open_once(wallet, chain, dir, hub, ask, sane, resumes).await
         }
         opened => opened,
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn open_once<T: Transport, C: Chain>(
     wallet: &Wallet<T>,
     chain: &C,
     dir: &Path,
     hub: &str,
     ask: Ask,
-    change: Change,
     sane: bool,
     resumes: u32,
 ) -> Result<Contract> {
@@ -208,7 +185,7 @@ async fn open_once<T: Transport, C: Chain>(
     if let Some(why) = fees::abusive(&now.fees, range.as_ref()).filter(|_| sane) {
         bail!("{hub} charges more than is sane, {why}: no contract opens there unless asked all the same");
     }
-    let offer = offer(wallet, &hub, chosen).await?;
+    let offer = offer(wallet, &hub, chosen, ask.funded).await?;
     let keysets = info
         .keysets()
         .map_err(|e| anyhow!("{hub}'s keysets: {e:?}"))?;
@@ -232,7 +209,12 @@ async fn open_once<T: Transport, C: Chain>(
     let checkpoint = chain.checkpoint(at).await.map_err(|e| anyhow!(e))?;
     let wanted = wanted(&offer, tip, ask.blocks)?;
     let store = Store::open(dir)?;
-    let least = least(info.contracts.and_then(|c| c.range), offer.quote.cap, price);
+    let funded = offer.funded();
+    let least = least(
+        info.contracts.and_then(|c| c.range),
+        offer.quote.cap,
+        price + funded,
+    );
     let free = free(wallet, &store)?;
     let coin = match ask.deposit {
         Some(named) => {
@@ -253,26 +235,9 @@ async fn open_once<T: Transport, C: Chain>(
     let coin = wallet
         .silent_coin_output(&deposit)?
         .context("a coin gone")?;
-    let left = coin.value.to_sat() - price;
-    // A hub whose deposits are paid within fewer blocks would answer
-    // one too short to pay in F: not asked.
-    let window = info.deposits.as_ref().map_or(0, |d| d.window);
-    let into = match change {
-        Change::Notes if left >= offer.quote.graph.dust => {
-            let cap = u64::from(offer.quote.cap);
-            ensure!(
-                left <= cap,
-                "{deposit}: {left} sat left over the price, more than the {cap} sat protected: \
-                 choose a smaller coin or a larger cap"
-            );
-            ensure!(
-                window >= 2 * DEPOSIT_MARGIN,
-                "{hub} takes deposits for too short a while to pay {left} sat in F: \
-                 choose a coin of the price"
-            );
-            Some(deposit_for_change(wallet, &hub, left, tip).await?)
-        }
-        _ => None,
+    let funded_notes = match funded {
+        0 => None,
+        _ => Some(funded_notes(wallet, &offer.quote, funded)?),
     };
     let secrets = wallet.contract_secrets();
     let start = Start {
@@ -280,32 +245,16 @@ async fn open_once<T: Transport, C: Chain>(
         quote: offer.quote.clone(),
         deposit,
         coin: coin.clone(),
-        change: match &into {
-            Some((_, script)) => script.clone(),
-            None => wallet.fallback_address()?.script_pubkey(),
-        },
+        change: wallet.fallback_address()?.script_pubkey(),
         // Her reserve back at the close, or after a corrected payout: to
         // her wallet, which finds it as any payment.
         payout: wallet.fallback_address()?.script_pubkey(),
         wanted,
         checkpoint,
+        funded: funded_notes,
     };
     let ctx = licash_contract::opening::Context { tip, trust };
-    // Its deposit given up should the opening not start.
-    let give_up = |why: &str| {
-        if let Some((hash, _)) = &into {
-            if let Err(e) = wallet.give_up_deposit(hash, why) {
-                tracing::warn!(%hash, "giving the deposit of F's change up: {e}");
-            }
-        }
-    };
-    let (holder, outs) = match Holder::start(start, &ctx) {
-        Ok(started) => started,
-        Err(e) => {
-            give_up("its opening never started");
-            return Err(e);
-        }
-    };
+    let (holder, outs) = Holder::start(start, &ctx)?;
     let id = holder.id();
     let new = New {
         id,
@@ -320,13 +269,8 @@ async fn open_once<T: Transport, C: Chain>(
         since: tip,
         state: &holder.to_bytes(),
     };
-    let inserted = store.insert_under(&new, &now.fees);
-    if let Err(e) = inserted {
-        give_up("its opening never started");
-        return Err(e);
-    }
-    let into_notes = into.as_ref().map(|(hash, _)| hash.as_str());
-    tracing::info!(id = %crate::hex_id(&id), %hub, %deposit, price, mock = trust.mock, ?into_notes, "opening a contract");
+    store.insert_under(&new, &now.fees, funded)?;
+    tracing::info!(id = %crate::hex_id(&id), %hub, %deposit, price, funded, mock = trust.mock, "opening a contract");
     let mut driver = Driver {
         wallet,
         chain,
@@ -441,6 +385,7 @@ pub async fn resume<T: Transport, C: Chain>(
             tracing::warn!(id = %crate::hex_id(&id), "watching F: {e:#}");
         }
     }
+    funded::collect(wallet, &store, tip).await;
     let all = store.list()?;
     drop(store);
     // As they stand now: one newly buried, or past its time.
@@ -696,53 +641,6 @@ fn coverage_order<'a>(
     live
 }
 
-/// The output of a contract's F in `dir`, confirmed, paying `pays` sat
-/// to `script`: a deposit she had F pay her change into
-/// ([`Change::Notes`]), to take back should its notes never come, its
-/// hub not having seen it in time. None if no F does. Only the contracts
-/// whose change is so much are read whole, at `tip`.
-pub fn paid_into<T: Transport>(
-    wallet: &Wallet<T>,
-    dir: &Path,
-    script: &bitcoin::Script,
-    pays: u64,
-    tip: u32,
-) -> Result<Option<OutPoint>> {
-    let Some(store) = Store::existing(dir)? else {
-        return Ok(None);
-    };
-    let trust = crate::trust(wallet.network())?;
-    for contract in store.list()? {
-        let live = contract.fate == Some(Fate::Live);
-        if !live || contract.value.checked_sub(contract.price) != Some(pays) {
-            continue;
-        }
-        let (state, _) = store.state(&contract.id)?;
-        let secrets = wallet.contract_secrets();
-        let ctx = licash_contract::opening::Context { tip, trust };
-        let holder = match Holder::load(&state, &secrets.seed, &ctx) {
-            Ok(holder) => holder,
-            Err(e) => {
-                tracing::warn!(id = %crate::hex_id(&contract.id), "loading a contract: {e:#}");
-                continue;
-            }
-        };
-        let Some(f) = holder.funding().filter(|_| holder.change() == script) else {
-            continue;
-        };
-        let txid = f.tx.compute_txid();
-        let paying =
-            f.tx.output
-                .iter()
-                .position(|o| o.script_pubkey == *script && o.value.to_sat() == pays);
-        if let Some(vout) = paying {
-            let vout = u32::try_from(vout)?;
-            return Ok(Some(OutPoint { txid, vout }));
-        }
-    }
-    Ok(None)
-}
-
 /// The coin of `wallet`'s that [`open`] would deposit of `least` sat at
 /// least ([`least`]), with the contracts in `dir`: the smallest free.
 /// None if no coin does.
@@ -780,27 +678,36 @@ pub fn least(range: Option<licash_api::ContractRange>, cap: u32, price: u64) -> 
 }
 
 /// The offer of `hub` now: of `chosen` terms, a cap in sat over blocks,
-/// if any, else its fixed ones. Refused unless of those terms exactly,
-/// as a hub offering no others answers.
+/// if any, else its fixed ones, `funded` sat of it hers. Refused unless
+/// of those terms exactly, as a hub offering no others answers.
 pub async fn offer<T: Transport>(
     wallet: &Wallet<T>,
     hub: &str,
     chosen: Option<(u32, u32)>,
+    funded: u64,
 ) -> Result<Offer> {
     let mut url = format!("{}{QUOTE}", hub.trim_end_matches('/'));
+    let mut asked = Vec::new();
     if let Some((cap, blocks)) = chosen {
-        url.push_str(&format!("?cap={cap}&blocks={blocks}"));
+        asked.push(format!("cap={cap}&blocks={blocks}"));
+    }
+    if funded > 0 {
+        asked.push(format!("funded={funded}"));
+    }
+    if !asked.is_empty() {
+        url.push_str(&format!("?{}", asked.join("&")));
     }
     let response = wallet.transport().request(&url, None).await;
     let response = response.map_err(|e| anyhow!("{hub}: {e}"))?;
     ensure!(
         response.status == 200,
-        "{hub} offers no contracts{}: status {}",
+        "{hub} offers no contracts{}: status {}: {}",
         match chosen {
             Some((cap, blocks)) => format!(" of {cap} sat over {blocks} blocks"),
             None => String::new(),
         },
-        response.status
+        response.status,
+        String::from_utf8_lossy(&response.body[..response.body.len().min(500)])
     );
     let offer = Offer::decode(&response.body).with_context(|| format!("{hub}'s offer"))?;
     if let Some((cap, blocks)) = chosen {
@@ -810,6 +717,11 @@ pub async fn offer<T: Transport>(
             "{hub} offers contracts of {quoted} sat over {lock} blocks, not {cap} over {blocks}"
         );
     }
+    ensure!(
+        offer.funded() == funded,
+        "{hub} offers contracts {} sat of which she funds, not {funded}",
+        offer.funded()
+    );
     Ok(offer)
 }
 
@@ -841,38 +753,27 @@ fn wanted(offer: &Offer, tip: u32, blocks: u32) -> Result<Wanted> {
     })
 }
 
-/// A deposit at `hub` paid `left` exactly, F's change, the hub's fee in
-/// it, to pay in F at `tip`: its hash and the script F pays. Fails if
-/// the hub takes none so (its fee changed since its info was read, say),
-/// or leaves too little time to sign F and have it confirm
-/// ([`DEPOSIT_MARGIN`]).
-async fn deposit_for_change<T: Transport>(
+/// The notes she funds `funded` sat of a contract on `quote` with: refused
+/// unless as few as a claim names, should the hub never issue them.
+fn funded_notes<T: Transport>(
     wallet: &Wallet<T>,
-    hub: &str,
-    left: u64,
-    tip: u32,
-) -> Result<(String, ScriptBuf)> {
-    let asked = (wallet.deposit_paying(hub, left).await)
-        .with_context(|| format!("{left} sat left over the price, not to be notes at {hub}"))?;
-    let script = asked.terms.as_ref().and_then(|terms| {
-        let time = terms.fund_by >= tip.saturating_add(2 * DEPOSIT_MARGIN);
-        (time && terms.pays == left).then(|| script_of(&terms.address))?
-    });
-    match script {
-        Some(script) => Ok((asked.hash, script)),
-        None => {
-            let why = "not to be paid in F: too little time, or paid another amount";
-            let _ = wallet.give_up_deposit(&asked.hash, why);
-            bail!("{left} sat left over the price, not to be notes at {hub}: {why}")
-        }
-    }
-}
-
-/// The output script of `address`, a deposit's, as the wallet recorded
-/// it: on its network.
-pub(crate) fn script_of(address: &str) -> Option<ScriptBuf> {
-    let address: bitcoin::Address<bitcoin::address::NetworkUnchecked> = address.parse().ok()?;
-    Some(address.assume_checked().script_pubkey())
+    quote: &Quote,
+    funded: u64,
+) -> Result<licash_contract::wire::FundedNotes> {
+    ensure!(
+        funded <= u64::from(quote.cap),
+        "{funded} sat funded, more than the {} sat contract",
+        quote.cap
+    );
+    let (ephemeral, outputs) = wallet.funded_outputs(&quote.keyset, funded)?;
+    let most = claims::ClaimTerms::new(*quote.keyset.id(), quote.limits.max_authorizations).max;
+    ensure!(
+        outputs.len() <= most,
+        "{funded} sat are {} notes at the hub, more than the {most} a claim names: fund a \
+         rounder amount",
+        outputs.len()
+    );
+    Ok(licash_contract::wire::FundedNotes { ephemeral, outputs })
 }
 
 /// The coins of `wallet` free to deposit: unspent and no other
@@ -1068,6 +969,8 @@ mod tests {
             abandoned: None,
             created_at: 0,
             folded: None,
+            funded: 0,
+            funded_received: false,
         };
         let mut other = contract(5, 320, Fate::Live);
         other.hub = "http://other.example".into();

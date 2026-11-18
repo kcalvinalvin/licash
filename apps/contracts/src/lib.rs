@@ -66,6 +66,10 @@ pub const FOLD_CLAIM: &str = "/v1/contracts/openings/{id}/fold/claim";
 /// signed by both and broadcast, in consensus bytes.
 pub const FOLD_SIGN: &str = "/v1/contracts/openings/{id}/fold/sign";
 
+/// POST (no body) once F of contract `id` (hex) is buried: her funded
+/// notes issued, the hub's [`FundedIssued`]; 409 until it issues them.
+pub const FUNDED: &str = "/v1/contracts/openings/{id}/funded";
+
 /// The most bytes a request or an answer of an opening holds.
 pub const MAX_BODY: usize = 64 << 20;
 
@@ -104,6 +108,12 @@ impl Offer {
         q.graph
             .reserve_alice
             .saturating_add(q.fees.opening_fee_quote)
+    }
+
+    /// What she funds of the contract herself, in sat: paid in F beside
+    /// the price, and issued her back as notes once F is buried.
+    pub fn funded(&self) -> u64 {
+        u64::from(self.quote.graph.deposit_units)
     }
 }
 
@@ -174,6 +184,30 @@ impl FoldAsk {
             amount,
             notes,
         })
+    }
+}
+
+/// The hub's own lock, settled, that issued the notes she funded a
+/// contract with, and the preimage she claims them with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FundedIssued {
+    pub lock: [u8; 32],
+    pub preimage: [u8; 32],
+}
+
+impl FundedIssued {
+    pub fn encode(&self) -> Vec<u8> {
+        [self.lock, self.preimage].concat()
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut r = Reader(bytes);
+        let issued = Self {
+            lock: r.array()?,
+            preimage: r.array()?,
+        };
+        r.end()?;
+        Ok(issued)
     }
 }
 
@@ -388,6 +422,19 @@ mod tests {
             ..ask
         };
         assert!(FoldAsk::decode(&many.encode()).is_err());
+    }
+
+    #[test]
+    fn a_funded_issuance_reads_as_written_and_nothing_else() {
+        let issued = FundedIssued {
+            lock: [4; 32],
+            preimage: [5; 32],
+        };
+        let bytes = issued.encode();
+        assert_eq!(bytes.len(), 64);
+        assert_eq!(FundedIssued::decode(&bytes).unwrap(), issued);
+        assert!(FundedIssued::decode(&bytes[..63]).is_err());
+        assert!(FundedIssued::decode(&[bytes.as_slice(), &[0]].concat()).is_err());
     }
 
     #[test]

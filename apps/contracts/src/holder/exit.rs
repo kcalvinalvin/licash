@@ -187,7 +187,8 @@ pub struct Exit {
     /// Her notes at its hub the others there do not recover.
     pub uncovered: u64,
     /// The locks owed to her that it alone claims on Bitcoin
-    /// ([`super::activation`]): what only its forced close recovers.
+    /// ([`super::activation`]), and the notes she funded it with that her
+    /// wallet was never issued: what only its forced close recovers.
     pub owed: u64,
     /// Why its step failed this round, if it did.
     pub error: Option<String>,
@@ -203,7 +204,8 @@ pub struct View {
     pub since: u32,
     pub consented: bool,
     pub uncovered: u64,
-    /// The locks owed to her it claims, which no payout recovers.
+    /// The locks owed to her it claims, and the notes she funded it with
+    /// herself that her wallet was never issued: what no payout recovers.
     pub owed: u64,
     /// Her notes at its hub held by payments and locks under way.
     pub pending: u64,
@@ -239,8 +241,8 @@ pub fn plan(v: View) -> Step {
     if v.paying {
         return Step::Paying;
     }
-    // Only what a forced close claims is at risk: not folded, forced
-    // closed in time.
+    // Only what a forced close claims is at risk: not folded, issued yet
+    // or forced closed in time.
     if v.uncovered <= FLOOR {
         return Step::Waiting;
     }
@@ -315,18 +317,20 @@ pub async fn drive<T: Transport, C: Chain>(
         });
         let cashed = (store.exit_payouts(&c.id)?.iter())
             .any(|t| states.get(t.as_str()) == Some(&&PayoutState::Done));
-        let view = View {
-            tip,
-            cash_at,
-            force_at,
-            since: c.since,
-            consented: consent.is_some(),
-            uncovered: held(|b| b.available).saturating_sub(covered),
-            owed: stake.get(&c.id).copied().unwrap_or(0),
-            pending: held(|b| b.pending),
-            paying,
-            cashed,
-        };
+        let view =
+            View {
+                tip,
+                cash_at,
+                force_at,
+                since: c.since,
+                consented: consent.is_some(),
+                uncovered: held(|b| b.available).saturating_sub(covered),
+                owed: (stake.get(&c.id).copied().unwrap_or(0))
+                    .saturating_add(if c.funded_received { 0 } else { c.funded }),
+                pending: held(|b| b.pending),
+                paying,
+                cashed,
+            };
         let step = plan(view);
         let mut exit = Exit {
             id: c.id,
@@ -427,6 +431,32 @@ mod tests {
             paying: false,
             cashed: false,
         }
+    }
+
+    #[test]
+    fn notes_she_funded_never_issued_are_waited_for_then_forced_closed() {
+        let v = View {
+            uncovered: 0,
+            owed: 65_535,
+            ..view()
+        };
+        // No payout reaches them, nor does a fold give them up.
+        assert_eq!(plan(v), Step::Waiting);
+        assert_eq!(plan(View { cashed: true, ..v }), Step::Waiting);
+        assert_eq!(plan(View { tip: 1_188, ..v }), Step::ForceClosing);
+        let unconsented = View {
+            consented: false,
+            ..v
+        };
+        assert_eq!(plan(unconsented), Step::NeedsConsent);
+        // Her other notes there are paid out meanwhile.
+        assert_eq!(
+            plan(View {
+                uncovered: 50_000,
+                ..v
+            }),
+            Step::CashingOut
+        );
     }
 
     #[test]
