@@ -63,7 +63,27 @@ and the help/quit keys; `?` shows the error detail.
 the chain `--chain` must follow: the hub scans no other. The signets are for
 testing only: header checks cannot tell their blocks from forged ones.
 
-`<data>/seed` is the hub's only secret: keep a copy offline. Never replace
+`<data>/seed` makes every key of the hub: those its notes are issued
+under, its own address, its Nostr key and its deposits' keys. Keep a copy
+offline. Whoever else reads it makes notes the hub takes for its own, and
+spends them at the hub for what it pays out, over Lightning or from its
+contracts' collateral. It is not all there is to guard. Worth funds to
+whoever reads them too: `openings.sqlite` and `responses.sqlite` (what the
+hub signs its contracts with), the LND macaroon, the login of the Bitcoin
+Core wallet that funds contracts (it spends that wallet),
+`swaps/wallet.sqlite` (the provider's notes at other hubs) and `tor/state`
+(the onion address). `init` makes `<data>` its user's alone: keep it so, on
+an encrypted disk, and keep on this host only what the hub needs there:
+
+- Channels that hold what the hub pays out in days, not its reserves.
+  `--ln-max-pay` bounds an invoice and `--ln-max-pay-day` a day's (below).
+- A Core wallet of its own for contracts (`--contracts-wallet`), funded
+  with what the hub may lock, and what contracts return paid to a wallet
+  whose keys are offline (`--contracts-payout-wallet`, below).
+- A macaroon and a Core login that do only what the hub does (below).
+
+Back up the files of `<data>` together, as of one moment: each paragraph
+below says what an older copy of a file loses. Never replace
 `<data>/hub.sqlite` while the hub runs: the hub halts, and `/health` answers
 503, until it is restarted. A newer hub upgrades its schema when it opens it,
 once its seed matches, and an older one then refuses it. A database of the
@@ -102,6 +122,47 @@ LND's certificate. The gateway keeps its invoices in
 LND's channels can no longer pay or receive the most it takes.
 `--ln-max-receipts` bounds open and locked receipts (1024 by default).
 Lowering it blocks new receipts, not retries or following existing ones.
+
+`--ln-max-pay-day SAT` bounds what the gateway pays out over the node in
+any 24 hours: the sum of what the locks of the invoices paid, or under way,
+pay the hub, the gateway's fee in it. Past it an invoice is refused and its
+lock refunded, until earlier payments are a day old, and an alert says so
+once a day. Without it there is no limit. It bounds what leaves over
+Lightning in a day whoever asks, a thief of the seed too: set it to a few
+times a busy day's payments.
+
+The hub watches for notes made with its seed outside its ledger. It cannot
+tell one from its own, but it counts: once it retired more notes of a
+denomination than it ever issued to holders, some were forged. It looks
+every 30 seconds. On more such notes than it knows of, it alerts the
+operator and the Lightning gateway pays no more invoices: each is refused
+and its lock refunded, `/v1/info` says it pays none, and payments under way
+and receipts go on. The dashboard's health shows it. Treat the seed as
+stolen: look at the alert and the ledger, then `licash-hub resume-payouts`
+resumes, beside the running hub (within 30 seconds) or without it, taking
+what the ledger shows then as known. This tells late, only once forged
+notes outnumber all the outstanding notes of a denomination, and stops
+only what leaves over Lightning, not swaps or contract claims: it limits a
+theft under way, and is no reason to keep the seed less safe. What it knows
+is in `<data>/payouts.json` (`baseline`, and `paused` with the reason). A
+hub upgraded to this version has none: it takes what its ledger shows at
+its first look as known, alerts if that is any, and pauses nothing. A file
+that does not read pauses, and is left as it is.
+
+The gateway calls eight of LND's RPCs: bake it a macaroon for those
+rather than give it `admin.macaroon`.
+
+```sh
+lncli bakemacaroon --save_to=hub.macaroon \
+  uri:/lnrpc.Lightning/GetInfo uri:/lnrpc.Lightning/ChannelBalance \
+  uri:/routerrpc.Router/SendPaymentV2 uri:/routerrpc.Router/TrackPaymentV2 \
+  uri:/invoicesrpc.Invoices/AddHoldInvoice uri:/lnrpc.Lightning/LookupInvoice \
+  uri:/invoicesrpc.Invoices/SettleInvoice uri:/invoicesrpc.Invoices/CancelInvoice
+```
+
+It still pays invoices, so whoever reads it empties the channels' outbound
+side, but it sends no coin on Bitcoin, opens or closes no channel, makes
+no address and bakes no other macaroon.
 
 With `--tweaks` (and `--chain`), the hub indexes the silent payment
 (BIP352) tweaks of the chain's blocks from `--tweaks-from` (by default, the
@@ -196,6 +257,44 @@ builds one instance, at a time, the others waiting their turn: each opening
 takes about 30 CPU seconds over a few threads, and the hub holds about
 700 MB once it has opened a few: allow it 2 GB of memory.
 
+With `--contracts-payout-wallet URL` (a wallet's JSON-RPC, as
+`--contracts-wallet` takes one), each contract opened from then on pays the
+hub's share to a new address of that wallet instead of the one that funds
+it: what a contract returns at its close, its fold or a default. Make it a
+wallet without private keys watching a descriptor whose keys are offline,
+on this node or another of the same network:
+
+```sh
+bitcoin-cli -named createwallet wallet_name=payout disable_private_keys=true blank=true
+bitcoin-cli -rpcwallet=payout importdescriptors \
+  '[{"desc": "tr([FINGERPRINT/86h/0h/0h]XPUB/0/*)#CHECKSUM", "active": true, "timestamp": "now"}]'
+```
+
+The hub asks it `getnewaddress "" bech32m` for each opening, so it needs
+an active ranged `tr()` descriptor; a wallet that holds private keys is
+taken with a warning. Spend from it with a PSBT signed where the keys are
+(`walletcreatefundedpsbt`, the signer, `finalizepsbt`). What this leaves
+on this host: the funding wallet's balance, the collateral of contracts
+opened before the option (they keep the address they were signed with),
+and the fee coins' change, the outputs a dispute leaves the hub and coins
+spent back, which the funding wallet signs for. What contracts return no
+longer refills the wallet that funds new ones: top it up from the payout
+wallet by hand, or the largest cap `/v1/info` names shrinks with its
+balance. No contract opens while the payout wallet gives no address, and
+none is ever paid to the funding wallet instead. An opening never funded
+leaves its address unused: a signer that looks only 20 addresses past the
+last one used may need a wider gap to find them all.
+
+A Core login of the hub's own (`-rpcauth`) can be limited to the calls it
+makes with `-rpcwhitelist=USER:CALLS`. Without contracts:
+`getblockchaininfo,getblockhash,getblockheader,getblock,estimatesmartfee,sendrawtransaction`.
+With `--contracts`, also
+`submitpackage,gettxout,getbalances,fundrawtransaction,signrawtransactionwithwallet,gettransaction,lockunspent,sendtoaddress,getnewaddress`.
+The payout wallet's login, if another:
+`getwalletinfo,getnewaddress,getblockchaininfo,getblockhash`. A call left
+out is refused by the node (HTTP 403). This limits the calls, not the wallet: a login that funds contracts still spends its
+wallet, which is why that wallet holds no more than contracts need.
+
 Every live contract (signed and not ended, or under way) is an exit the hub
 may have to prove at once, should all its holders force their contracts
 closed together. `--contracts-max-live` (32 by default, sized for a prover
@@ -232,7 +331,10 @@ evidence against any other claim of the same notes, in any contract. Then
 it decides what the claim is owed against its ledger: the spends it retired
 the claimed notes for (owner-signed, a granted one with its unlock), other
 claims of them, and, for each timed lock the claim names, the branch it did
-not settle it on (its preimage, or its expiry). Owed all it asks, the hub lets
+not settle it on (its preimage, or its expiry). While its ledger gives it
+no evidence (its scan behind the claim's block, a halt), it responds
+nothing and tries again at each poll; once half the blocks it may respond
+in are gone, an alert names the contract and why. Owed all it asks, the hub lets
 the holder's timeout pay her. Owed less (a claim of notes that are not the
 keyset's, or spent), it responds with what is owed, publishes in the
 response's disclose slot what that evidence needs public (a granted spend's
@@ -252,7 +354,18 @@ to its wallet. The fee coins its wallet funds for these transactions are
 kept in `openings.sqlite` before use, and a contract ended 6 blocks deep is
 not looked at again. Keep `<data>/responses.sqlite` with `openings.sqlite`:
 it pins the evidence each response is decided on and each one-time
-signature (the response, the assertion) before it is made.
+signature (the response, the assertion) before it is made. Back them up
+together, `responses.sqlite` never older than `openings.sqlite`: a second
+answer signed with a one-time key over other evidence gives the holder the
+hub's outputs. So the hub signs none where it cannot tell: `openings.sqlite`
+keeps each answer before it is signed, and one kept with nothing pinned for
+it, as when `responses.sqlite` was lost or restored older, is not decided
+anew. Nor is one neither file keeps (both restored older, or an answer
+signed before this version) while a transaction in the mempool already
+spends what only that answer can. The operator is alerted, and her timeout
+pays her what she claims: restoring the newer `responses.sqlite` is the
+only way back. A hub upgraded to this version keeps the answers it has
+pinned as it posts them again, and plays every other contract as before.
 
 A dispute's links are presigned at 1 sat/vB, each with a 330 sat anchor
 only its poster spends. The hub posts its response and its assertion with
