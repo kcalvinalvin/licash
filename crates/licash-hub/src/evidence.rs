@@ -32,7 +32,8 @@ impl Hub {
     /// one unsettled the preimage if the hub saw it, else its expiry, which
     /// the statement checks against the chain. Ordered by proposal, then
     /// source. A spend the ledger can no longer read back (its keyset gone)
-    /// is left out.
+    /// is left out. Then each other claim on Bitcoin of any of its notes
+    /// ([`Hub::hold_claimed`]).
     pub fn evidence(&self, claim: &UnsignedClaim) -> Result<Vec<Evidence>, Error> {
         let parts = claim.parts();
         let mut ys = Vec::new();
@@ -70,6 +71,7 @@ impl Hub {
                 let seen = preimage(c, terms.hash())?;
                 evidence.extend(against_timed(id, settled.as_deref(), seen));
             }
+            evidence.extend(crate::claims::second_claims(c, &ys, &claim.hold_context())?);
             Ok(evidence)
         })
     }

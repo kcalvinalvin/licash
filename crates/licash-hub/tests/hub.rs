@@ -255,9 +255,9 @@ fn init_never_replaces_a_seed_or_ledger_and_open_needs_both_matching() {
     let why = setup_error(Hub::open(&a.seed, &a.db, Policy::default()));
     assert!(why.contains("another hub"), "{why}");
     drop(hub);
-    sql(&a.db).pragma_update(None, "user_version", 2).unwrap();
+    sql(&a.db).pragma_update(None, "user_version", 3).unwrap();
     let why = setup_error(Hub::open(&a.seed, &a.db, Policy::default()));
-    assert!(why.contains("schema 2"), "{why}");
+    assert!(why.contains("schema 3"), "{why}");
 }
 
 #[test]
@@ -365,6 +365,11 @@ fn a_spend_is_offered_once_released_once_and_pays_the_hub() {
 
 /// A claim of `coins`, as a holder files it in a contract at the hub.
 fn claim_of(keyset: &Keyset, coins: &[&Coin]) -> licash::claim::UnsignedClaim {
+    claim_in([7; 32], keyset, coins)
+}
+
+/// A claim of `coins` in the contract of Base digest `base`.
+fn claim_in(base: [u8; 32], keyset: &Keyset, coins: &[&Coin]) -> licash::claim::UnsignedClaim {
     use licash::claim::{Context, Item, Parts, UnsignedClaim};
     let items: Vec<_> = coins
         .iter()
@@ -373,7 +378,7 @@ fn claim_of(keyset: &Keyset, coins: &[&Coin]) -> licash::claim::UnsignedClaim {
     let mut authorizations: Vec<_> = items.iter().map(|i| i.message().clone()).collect();
     authorizations.sort_by_key(|m| m.identifier().unwrap());
     let context = Context {
-        base: [7; 32],
+        base,
         deposit: [8; 36],
         cap: 1_000,
     };
@@ -1223,4 +1228,131 @@ fn the_ledger_reads_back_the_notes_it_moved_and_the_unlinks_it_answered() {
             retired: 1
         }]
     );
+}
+
+/// The claim of `coins` in the contract of Base digest `base`, as filed on
+/// Bitcoin: signed by each note's hold key.
+fn filed(base: [u8; 32], keyset: &Keyset, coins: &[&Coin]) -> licash::recovery::Publication {
+    let holds: Vec<_> = coins
+        .iter()
+        .map(|c| {
+            (
+                c.note.message().clone(),
+                c.derivation.hold_key(c.owner.hold_root()).unwrap(),
+            )
+        })
+        .collect();
+    licash::recovery::Publication::sign(claim_in(base, keyset, coins), &holds, 16).unwrap()
+}
+
+#[test]
+fn a_note_a_claim_on_bitcoin_names_is_retired_for_good() {
+    let files = files();
+    let hub = open(&files, Policy::default());
+    let (_, keyset) = issuer(&files);
+    let (alice, bob) = (owner(1), owner(2));
+    let (claimed, other) = (mint(&files, &alice, 8), mint(&files, &alice, 4));
+    // A spend offered before the claim is read is not released after it.
+    let early = Spend::new(
+        &keyset,
+        std::slice::from_ref(&claimed),
+        &[(bob.address(), 8)],
+    );
+    let grant = early.offer(&hub).unwrap();
+    let y = claimed.note.message().identifier().unwrap();
+    assert_eq!(hub.spent(&[y]).unwrap(), [false]);
+    let contract = [1; 32];
+    hub.retire_claimed(&contract, &filed([7; 32], &keyset, &[&claimed]))
+        .unwrap();
+    // Read again, as after a restart: the same.
+    hub.retire_claimed(&contract, &filed([7; 32], &keyset, &[&claimed]))
+        .unwrap();
+    assert_eq!(hub.spent(&[y]).unwrap(), [true]);
+    let signed = early.sign(&keyset, Authorization::Granted(Box::new(grant)));
+    assert_eq!(
+        refused(hub.release(&signed, &early.notes())),
+        Refusal::Spent
+    );
+    let late = Spend::new(
+        &keyset,
+        std::slice::from_ref(&claimed),
+        &[(bob.address(), 8)],
+    );
+    assert_eq!(refused(late.offer(&hub)), Refusal::Spent);
+    // A note the claim does not name is spent as ever.
+    Spend::new(&keyset, &[other], &[(bob.address(), 4)]).complete(&hub, &keyset);
+    // Across a restart, still retired.
+    drop(hub);
+    let hub = open(&files, Policy::default());
+    assert_eq!(refused(late.offer(&hub)), Refusal::Spent);
+    assert_eq!(hub.spent(&[y]).unwrap(), [true]);
+}
+
+#[test]
+fn a_note_claimed_in_one_contract_is_cited_against_its_claim_in_another() {
+    use licash::recovery::Evidence as Against;
+    let files = files();
+    let hub = open(&files, Policy::default());
+    let (_, keyset) = issuer(&files);
+    let alice = owner(1);
+    let (twice, once) = (mint(&files, &alice, 8), mint(&files, &alice, 4));
+    let first = filed([7; 32], &keyset, &[&twice, &once]);
+    hub.retire_claimed(&[1; 32], &first).unwrap();
+    // Not against the claim itself.
+    assert!(hub.evidence(first.claim()).unwrap().is_empty());
+    // Against another claim of one of its notes: that note's signature of
+    // the first claim.
+    let second = filed([9; 32], &keyset, &[&twice]);
+    let found = hub.evidence(second.claim()).unwrap();
+    let [Against::SecondClaim { context, record }] = &found[..] else {
+        panic!("not the first claim alone");
+    };
+    assert_eq!(*context, first.claim().hold_context());
+    assert_eq!(record.message.to_bytes(), twice.note.message().to_bytes());
+}
+
+#[test]
+fn a_ledger_of_the_first_schema_is_read_and_upgraded_once_its_hub_opens() {
+    let files = files();
+    let hub = open(&files, Policy::default());
+    let (_, keyset) = issuer(&files);
+    let (alice, bob) = (owner(1), owner(2));
+    let spend = Spend::new(&keyset, &[mint(&files, &alice, 8)], &[(bob.address(), 8)]);
+    spend.complete(&hub, &keyset);
+    drop(hub);
+    // As the previous release left it.
+    let db = sql(&files.db);
+    db.execute_batch("DROP TABLE claimed; PRAGMA user_version = 1;")
+        .unwrap();
+    drop(db);
+    let version = |db: &Path| -> i64 {
+        sql(db)
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap()
+    };
+    // Read beside it, not upgraded; nor by a hub of another seed.
+    assert_eq!(Ledger::open(&files.db).unwrap().stats().unwrap().spent, 1);
+    let other = files_beside(&files);
+    setup_error(Hub::open(&other, &files.db, Policy::default()));
+    assert_eq!(version(&files.db), 1);
+    let hub = open(&files, Policy::default());
+    assert_eq!(version(&files.db), 2);
+    let claimed = mint(&files, &alice, 4);
+    hub.retire_claimed(&[1; 32], &filed([7; 32], &keyset, &[&claimed]))
+        .unwrap();
+    let late = Spend::new(&keyset, &[claimed], &[(bob.address(), 4)]);
+    assert_eq!(refused(late.offer(&hub)), Refusal::Spent);
+    // What was spent before stays spent.
+    let again = Spend::new(&keyset, &spend.inputs, &[(bob.address(), 8)]);
+    assert_eq!(refused(again.offer(&hub)), Refusal::Spent);
+    drop(hub);
+    assert_eq!(Ledger::open(&files.db).unwrap().stats().unwrap().spent, 1);
+}
+
+/// The seed of another hub, beside `files`.
+fn files_beside(of: &Files) -> PathBuf {
+    let other = files();
+    let seed = of.db.parent().unwrap().join("other-seed");
+    std::fs::copy(&other.seed, &seed).unwrap();
+    seed
 }

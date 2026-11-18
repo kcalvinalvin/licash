@@ -17,7 +17,29 @@ use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior};
 use crate::Error;
 
 /// The schema this hub reads and writes, as SQLite's `user_version`.
-pub(crate) const VERSION: i64 = 1;
+/// A ledger of schema 1 is upgraded once its seed matched
+/// ([`Store::upgrade`]) by adding [`CLAIMED`], empty. The hub then retires
+/// the notes of every claim of a dispute it still plays
+/// ([`crate::Hub::retire_claimed`]), but not of disputes that ended before:
+/// it no longer reads them.
+pub(crate) const VERSION: i64 = 2;
+
+/// Schema 2: what holders' claims on Bitcoin name.
+const CLAIMED: &str = "
+-- Each note a holder's claim on Bitcoin names, by contract, with its hold
+-- key's signature of the claim: retired, spent by nothing else, and cited
+-- against any other claim of it. Never deleted.
+CREATE TABLE claimed (
+    contract BLOB NOT NULL,
+    y BLOB NOT NULL,
+    context BLOB NOT NULL,
+    message BLOB NOT NULL,
+    sig BLOB NOT NULL,
+    at INTEGER NOT NULL,
+    PRIMARY KEY (contract, y)
+) STRICT;
+CREATE INDEX claimed_y ON claimed (y);
+";
 
 const SCHEMA: &str = "
 CREATE TABLE meta (
@@ -185,6 +207,7 @@ impl Store {
             let mut conn = connect(path)?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             tx.execute_batch(SCHEMA)?;
+            tx.execute_batch(CLAIMED)?;
             tx.pragma_update(None, "user_version", VERSION)?;
             tx.execute(
                 "INSERT INTO meta (one, seq, created_at) VALUES (1, 0, ?1)",
@@ -231,7 +254,10 @@ impl Store {
             Err(TryLockError::Error(e)) => return Err(e.into()),
         }
         let conn = connect(path)?;
-        check_version(&conn)?;
+        // Schema 1 is upgraded once its seed is known to match.
+        if schema(&conn)? != 1 {
+            check_version(&conn)?;
+        }
         let seq = conn.query_row("SELECT seq FROM meta", [], |r| r.get(0))?;
         Ok(Self {
             inner: Mutex::new(Inner { conn, seq }),
@@ -260,6 +286,23 @@ impl Store {
         tx.commit()?;
         *seq += 1;
         Ok(value)
+    }
+
+    /// Bring a ledger of schema 1 to [`VERSION`], in one transaction:
+    /// either upgraded whole or left as it was.
+    pub(crate) fn upgrade(&self) -> Result<(), Error> {
+        let mut inner = self.lock()?;
+        if schema(&inner.conn)? != 1 {
+            return Ok(());
+        }
+        let tx = inner
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute_batch(CLAIMED)?;
+        tx.pragma_update(None, "user_version", VERSION)?;
+        tx.commit()?;
+        tracing::info!("the hub's database upgraded to schema {VERSION}");
+        Ok(())
     }
 
     pub(crate) fn read<T>(
@@ -319,12 +362,20 @@ pub(crate) fn inspect(path: &Path) -> Result<Connection, Error> {
     )?;
     conn.busy_timeout(Duration::from_secs(10))?;
     conn.pragma_update(None, "query_only", true)?;
-    check_version(&conn)?;
+    // Schema 1 lacks only what no read here looks at: readable until the
+    // hub upgrades it.
+    if schema(&conn)? != 1 {
+        check_version(&conn)?;
+    }
     Ok(conn)
 }
 
+fn schema(conn: &Connection) -> Result<i64, Error> {
+    Ok(conn.pragma_query_value(None, "user_version", |r| r.get(0))?)
+}
+
 fn check_version(conn: &Connection) -> Result<(), Error> {
-    let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    let version = schema(conn)?;
     if version != VERSION {
         return Err(Error::Setup(format!(
             "database schema {version}, this hub reads {VERSION}"

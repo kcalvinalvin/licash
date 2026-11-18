@@ -26,6 +26,7 @@
 //!
 //! [`Ledger`] reads the database beside a running hub, for monitoring.
 
+mod claims;
 mod evidence;
 mod forwards;
 mod locks;
@@ -500,6 +501,7 @@ impl Hub {
         if keysets.is_empty() {
             return Err(Error::Setup("the database has no keyset".into()));
         }
+        store.upgrade()?;
         let newest = store.read(locks::newest_checkpoint)?;
         let (mut boot, mut drawn) = ([0; 16], [0; 32]);
         OsRng.fill_bytes(&mut boot);
@@ -738,6 +740,9 @@ impl Hub {
         // Held over the write: racing offers of a note count to the most.
         let mut offers = self.offers.lock().unwrap_or_else(PoisonError::into_inner);
         let (grant, new) = self.store.write(|tx| {
+            if claims::claimed(tx, &ys)? {
+                return Err(Refusal::Spent.into());
+            }
             for y in &ys {
                 let spent: Option<[u8; 32]> = tx
                     .query_row("SELECT proposal FROM spent WHERE y = ?1", [&y.0], |r| {
@@ -960,13 +965,13 @@ impl Hub {
     }
 
     /// Whether each of the notes with these identifiers is spent: retired
-    /// by a released spend or a lock.
+    /// by a released spend, a lock or a claim on Bitcoin.
     pub fn spent(&self, identifiers: &[Point]) -> Result<Vec<bool>, Error> {
         self.store.read(|c| {
             let mut stmt = c.prepare_cached("SELECT 1 FROM spent WHERE y = ?1")?;
             identifiers
                 .iter()
-                .map(|y| Ok(stmt.exists([&y.0])?))
+                .map(|y| Ok(stmt.exists([&y.0])? || claims::is_claimed(c, y)?))
                 .collect()
         })
     }
@@ -1062,13 +1067,18 @@ fn issued(tx: &Transaction<'_>, keyset: &[u8; 32], output: &Output) -> Result<bo
 }
 
 /// Retire the inputs `ys` of proposal `id`, spent by `notes`: none, or
-/// the proposal that retired one of them first.
+/// the proposal that retired one of them first. Refused if a claim on
+/// Bitcoin holds one of them.
 fn retire(
     tx: &Transaction<'_>,
     id: &ProposalId,
     ys: &[Point],
     notes: &[Note],
 ) -> Result<Option<[u8; 32]>, Error> {
+    if claims::claimed(tx, ys)? {
+        tracing::warn!(proposal = %hex::encode(id.as_bytes()), "a spend of claimed notes refused");
+        return Err(Refusal::Spent.into());
+    }
     for (position, (y, note)) in (0i64..).zip(ys.iter().zip(notes)) {
         let inserted = tx.execute(
             "INSERT INTO spent (y, proposal, position, note) VALUES (?1, ?2, ?3, ?4)
