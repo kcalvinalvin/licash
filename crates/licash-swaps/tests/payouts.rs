@@ -66,9 +66,15 @@ struct Pool {
     net: Arc<Net>,
     view: View,
     txs: Arc<Mutex<Vec<Transaction>>>,
+    /// The fee rate the chain estimates, for any blocks.
+    estimate: Arc<Mutex<Option<FeeRate>>>,
 }
 
 impl Pool {
+    fn estimate(&self, rate: Option<FeeRate>) {
+        *self.estimate.lock().unwrap() = rate;
+    }
+
     /// Mine what waits, but what `keep` refuses, in one block.
     fn mine_if(&self, keep: impl Fn(&Transaction) -> bool) -> Vec<Transaction> {
         let txs: Vec<Transaction> = std::mem::take(&mut *self.txs.lock().unwrap());
@@ -121,9 +127,25 @@ impl Chain for Pool {
     ) -> impl std::future::Future<Output = Result<(), String>> + Send {
         let mut txs = self.txs.lock().unwrap();
         if !txs.iter().any(|t| t.compute_txid() == tx.compute_txid()) {
+            // In place of those spending a coin it spends.
+            let spends = |t: &Transaction| {
+                t.input.iter().any(|i| {
+                    tx.input
+                        .iter()
+                        .any(|o| o.previous_output == i.previous_output)
+                })
+            };
+            txs.retain(|t| !spends(t));
             txs.push(tx.clone());
         }
         std::future::ready(Ok(()))
+    }
+
+    fn fee_rate(
+        &self,
+        _blocks: u16,
+    ) -> impl std::future::Future<Output = Result<Option<FeeRate>, String>> + Send {
+        std::future::ready(Ok(*self.estimate.lock().unwrap()))
     }
 }
 
@@ -234,6 +256,7 @@ impl Eco {
             net: net.clone(),
             view: net.view(A),
             txs: Arc::default(),
+            estimate: Arc::new(Mutex::new(Some(ONE_SAT))),
         };
         let desk = Arc::new(Desk {
             provider: Mutex::new(Some(Arc::new(provider))),
@@ -486,6 +509,153 @@ async fn a_claim_mined_late_still_pays_the_provider_inside_the_claim_margin() {
     eco.follow().await;
     assert_eq!(eco.stage(), Stage::Done);
     assert!(eco.provider_held() > 1_000);
+}
+
+fn rate(vb: u32) -> FeeRate {
+    FeeRate::from_sat_per_vb_u32(vb)
+}
+
+/// What `tx` pays, all its outputs.
+fn pays(tx: &Transaction) -> u64 {
+    tx.output.iter().map(|o| o.value.to_sat()).sum()
+}
+
+#[tokio::test]
+async fn a_payouts_coin_pays_the_chains_estimate_or_else_the_operators_rate() {
+    let eco = Eco::new(STOCK, TERMS).await;
+    eco.pool.estimate(Some(rate(3)));
+    eco.pay_out(1_000).await;
+    let coin = eco.pool.waiting().remove(0);
+    let (fee, vsize) = (STOCK - pays(&coin), coin.vsize() as u64);
+    assert!(fee >= 3 * vsize && fee < 4 * vsize, "{fee} for {vsize}");
+    // No estimate, on regtest: the operator's.
+    let eco = Eco::new(STOCK, TERMS).await;
+    eco.pool.estimate(None);
+    eco.pay_out(1_000).await;
+    let coin = eco.pool.waiting().remove(0);
+    let (fee, vsize) = (STOCK - pays(&coin), coin.vsize() as u64);
+    assert!(fee >= vsize && fee < 2 * vsize, "{fee} for {vsize}");
+}
+
+#[tokio::test]
+async fn a_coin_left_out_of_the_blocks_is_canceled_before_it_times_out() {
+    let eco = Eco::new(STOCK, TERMS).await;
+    let payout = eco.pay_out(1_000).await;
+    let coin = eco.pool.waiting().remove(0);
+    let timeout = timeout(&eco);
+    // Broadcast as it is until 12 blocks before its timeout.
+    eco.mine_to(timeout - 13);
+    eco.follow().await;
+    assert_eq!(eco.pool.waiting(), std::slice::from_ref(&coin));
+    // Then its coins paid back to the provider in its place, paying more.
+    eco.mine_to(timeout - 12);
+    eco.follow().await;
+    let cancel = eco.pool.waiting().remove(0);
+    assert_eq!(eco.pool.waiting().len(), 1);
+    let spent = |tx: &Transaction| -> Vec<OutPoint> {
+        let mut spent: Vec<OutPoint> = tx.input.iter().map(|i| i.previous_output).collect();
+        spent.sort();
+        spent
+    };
+    assert_eq!(spent(&cancel), spent(&coin));
+    assert_eq!(cancel.output.len(), 1);
+    let fee = STOCK - pays(&cancel);
+    assert!(fee >= STOCK - pays(&coin) + cancel.vsize() as u64, "{fee}");
+    // Not again within the block, nor while its rate stands.
+    eco.follow().await;
+    eco.mine_to(timeout - 11);
+    eco.follow().await;
+    assert_eq!(eco.pool.waiting(), std::slice::from_ref(&cancel));
+    // Made again as the blocks left run out, at a rising rate: four times
+    // the estimate 8 blocks before.
+    eco.mine_to(timeout - 8);
+    eco.follow().await;
+    let higher = eco.pool.waiting().remove(0);
+    let higher_fee = STOCK - pays(&higher);
+    assert!(higher_fee >= 4 * higher.vsize() as u64, "{higher_fee}");
+    assert!(higher_fee > fee, "{higher_fee}");
+    assert_eq!(eco.stage(), Stage::Accepted);
+    // Mined: the payout failed, the provider's coins back less the fee.
+    eco.pool.mine();
+    eco.follow().await;
+    let record = eco.provider().records(1).unwrap().remove(0);
+    assert_eq!(record.stage, Stage::Failed);
+    assert!(
+        record.reason.as_deref().unwrap_or("").contains("canceled"),
+        "{record:?}"
+    );
+    assert_eq!(eco.provider_coins(), STOCK - higher_fee);
+    assert!(eco.pool.waiting().is_empty());
+    // The client's lock is the client's again once expired.
+    assert!(matches!(
+        eco.client_follows(&payout).await.state,
+        PayoutState::Failed(_)
+    ));
+}
+
+#[tokio::test]
+async fn a_coin_mined_after_all_while_canceled_is_followed_as_ever() {
+    let eco = Eco::new(STOCK, TERMS).await;
+    let payout = eco.pay_out(1_000).await;
+    let coin = eco.pool.waiting().remove(0);
+    eco.mine_to(timeout(&eco) - 12);
+    eco.follow().await;
+    assert_ne!(eco.pool.waiting(), std::slice::from_ref(&coin));
+    eco.pool.txs.lock().unwrap().clear();
+    eco.net.confirm(A, vec![coin]);
+    eco.follow().await;
+    assert_eq!(eco.stage(), Stage::Locked);
+    // Its cancel given up, broadcast no more.
+    assert!(eco.pool.waiting().is_empty(), "{:?}", eco.pool.waiting());
+    // Too late for its client to claim, it is taken back once timed out.
+    let state = eco.client_follows(&payout).await.state;
+    assert!(matches!(state, PayoutState::Failed(_)), "{state:?}");
+    eco.mine_to(timeout(&eco));
+    eco.follow().await;
+    assert_eq!(eco.pool.waiting().len(), 1);
+    eco.pool.mine();
+    eco.follow().await;
+    assert_eq!(eco.stage(), Stage::Refunded);
+}
+
+#[tokio::test]
+async fn a_refund_left_out_of_the_blocks_is_made_again_at_a_rising_rate() {
+    let eco = Eco::new(STOCK, TERMS).await;
+    eco.pay_out(1_000).await;
+    let coin = eco.pool.mine().remove(0);
+    eco.follow().await;
+    let timeout = timeout(&eco);
+    eco.mine_to(timeout);
+    eco.follow().await;
+    let refund = eco.pool.waiting().remove(0);
+    let value = coin.output[refund.input[0].previous_output.vout as usize]
+        .value
+        .to_sat();
+    let fee = value - pays(&refund);
+    assert!(fee >= refund.vsize() as u64 && fee < 2 * refund.vsize() as u64);
+    // Not again while the rate stands.
+    eco.follow().await;
+    assert_eq!(eco.pool.waiting(), std::slice::from_ref(&refund));
+    // The chain's estimate risen: made again at it.
+    eco.pool.estimate(Some(rate(2)));
+    eco.follow().await;
+    let again = eco.pool.waiting().remove(0);
+    assert_eq!(again.lock_time, refund.lock_time);
+    let again_fee = value - pays(&again);
+    assert!(again_fee >= 2 * again.vsize() as u64, "{again_fee}");
+    assert!(again_fee >= fee + again.vsize() as u64, "{again_fee}");
+    // Close to the client's lock's expiry, past which the client's claim
+    // would pay the provider nothing: all of it but dust, if the rate
+    // takes more.
+    let lock = eco.client.locks().unwrap().remove(0);
+    eco.mine_to(lock.expiry - licash_wallet::CLAIM_MARGIN - 2);
+    eco.follow().await;
+    let last = eco.pool.waiting().remove(0);
+    let dust = last.output[0].script_pubkey.minimal_non_dust().to_sat();
+    assert_eq!(pays(&last), dust);
+    eco.pool.mine();
+    eco.follow().await;
+    assert_eq!(eco.stage(), Stage::Refunded);
 }
 
 #[tokio::test]

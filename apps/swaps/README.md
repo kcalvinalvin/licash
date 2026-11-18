@@ -73,12 +73,17 @@ out on Bitcoin: a client locks the coin's value and the fees to it at a hub,
 the provider pays a coin of its own to an HTLC under the lock's hash, timed
 out `--payout-margin` blocks before the lock expires, and claims the lock
 with the preimage the client's claim of the coin reveals on chain. A coin
-never claimed comes back to the provider once timed out. Fund it on chain at
+never claimed comes back to the provider once timed out. Each coin is paid at
+the chain's estimate when taken (no payout on mainnet without one); a coin in
+no block 12 blocks before its timeout is canceled, its coins paid back to the
+provider in its place, and a refund in no block is made again at a higher rate
+as the client's lock's expiry nears, all of the coin at most. Fund it on chain at
 the address `licash-swaps --data ./swaps address --chain URL` prints: its
 wallet watches the chain from its tip when first started with `--chain`, or
 from `--chain-from`. `--payout-fee-base`, `--payout-fee-ppm`,
-`--payout-miner` (the coin's miners, on top), `--payout-rate` (sat/vB, else
-the chain's estimate at start), `--payout-min` and `--payout-max` set the
+`--payout-miner` (the coin's miners, on top), `--payout-rate` (sat/vB, the
+least its transactions pay and the hint its clients budget claims at, else the
+chain's estimate at start), `--payout-min` and `--payout-max` set the
 terms; `status` shows the coins, and an alert says when they pay out less
 than `--payout-min`, once a start until they pay enough again. A provider
 with payouts under way refuses to start without `--chain`.

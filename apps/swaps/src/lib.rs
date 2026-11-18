@@ -64,6 +64,10 @@ impl Chain for ChainView {
     async fn broadcast(&self, tx: &Transaction) -> Result<(), String> {
         self.0.broadcast(tx).await.map(|_| ()).map_err(text)
     }
+
+    async fn fee_rate(&self, blocks: u16) -> Result<Option<bitcoin::FeeRate>, String> {
+        self.0.fee_rate(blocks).await.map_err(text)
+    }
 }
 
 struct Served<T: Transport, C> {

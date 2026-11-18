@@ -13,6 +13,15 @@
 //! client's lock with it. Unclaimed, the provider takes the coin back once
 //! timed out.
 //!
+//! Each transaction races a deadline, past which the provider could lose
+//! the coin to a client who also keeps its lock: so each is paid at the
+//! chain's estimate, made again at a higher rate as the deadline nears
+//! ([`deadline`]). The coin is paid at the estimate when taken (declined on
+//! mainnet without one); in no block [`CANCEL_LEFT`] blocks before its
+//! timeout, it is canceled ([`Wallet::replace_silent`]) lest it be mined
+//! after the client's lock expires; its refund is made again until it is
+//! mined before the client's lock expires, all of the coin at most.
+//!
 //! The provider's wallet watches the chain for its coins from a block its
 //! operator chose ([`Wallet::watch_silent`], without a hub): coins paid to
 //! its fallback addresses ([`Wallet::fallback_address`]), the change of its
@@ -23,6 +32,7 @@
 //! [`Wallet::spend_silent`]: licash_wallet::Wallet::spend_silent
 //! [`Wallet::watch_silent`]: licash_wallet::Wallet::watch_silent
 //! [`Wallet::fallback_address`]: licash_wallet::Wallet::fallback_address
+//! [`Wallet::replace_silent`]: licash_wallet::Wallet::replace_silent
 
 use std::{future::Future, sync::PoisonError};
 
@@ -32,12 +42,12 @@ use bitcoin::{
     secp256k1::{Secp256k1, SecretKey, XOnlyPublicKey},
     Amount, FeeRate, OutPoint, ScriptBuf, Transaction,
 };
-use licash::spend::ProposalId;
+use licash::spend::{ChainProfile, ProposalId};
 use licash_api::{
     swaps::{self, ChainRequest, ChainSwap},
     Funding, Hex, Problem,
 };
-use licash_onchain::deposit::Htlc;
+use licash_onchain::{deadline, deposit::Htlc};
 use licash_wallet::{first_spend, payout_depth, Blocks, Payee, Transport};
 use rand_core::{OsRng, RngCore};
 use rusqlite::{params, OptionalExtension};
@@ -51,11 +61,37 @@ pub const PAYOUT_ROOM: u32 = 18;
 /// Blocks scanned for the wallet's coins at once.
 const SCAN_BATCH: u32 = 100;
 
+/// Blocks before a payout's coin times out from which, in no block yet, it
+/// is canceled: its coins paid back to the provider in its place, before
+/// it could be mined too late for the provider.
+pub const CANCEL_LEFT: u32 = 12;
+
 /// Bitcoin, as a provider paying out on it sees it: the blocks a wallet
-/// reads ([`Blocks`]), and a way to broadcast.
+/// reads ([`Blocks`]), a way to broadcast, and the fee rates it estimates.
 pub trait Chain: Blocks + Sync {
     /// Hand `tx` to the network.
     fn broadcast(&self, tx: &Transaction) -> impl Future<Output = Result<(), String>> + Send;
+
+    /// The fee rate a transaction confirms at within `blocks` blocks, as
+    /// the chain estimates it, if it does.
+    fn fee_rate(&self, blocks: u16)
+        -> impl Future<Output = Result<Option<FeeRate>, String>> + Send;
+}
+
+/// The rate to pay a payout's coin at, `left` blocks before it would be
+/// canceled ([`deadline::rate`]), at the operator's rate `floor` at least:
+/// none without the chain's `estimate` on mainnet, where a rate fixed
+/// beforehand could leave it unmined, to be canceled at a loss.
+fn funding_rate(
+    estimate: Option<FeeRate>,
+    floor: FeeRate,
+    left: u32,
+    network: ChainProfile,
+) -> Option<FeeRate> {
+    if estimate.is_none() && network == ChainProfile::Core30Mainnet {
+        return None;
+    }
+    Some(deadline::rate(estimate, floor, left))
 }
 
 /// A payout's coin as recorded.
@@ -121,6 +157,29 @@ impl<T: Transport> Provider<T> {
             max: terms.max.min(self.free_on_chain(&terms)?),
             ..terms
         }))
+    }
+
+    /// The operator's rate: the least the provider pays its transactions.
+    fn floor(&self) -> FeeRate {
+        rate(self.payouts.map_or(1_000, |t| t.rate))
+    }
+
+    /// The fee rate `chain` estimates for [`deadline::target`] of `left`
+    /// blocks, if it does.
+    async fn estimate(&self, chain: &impl Chain, left: u32) -> Option<FeeRate> {
+        chain
+            .fee_rate(deadline::target(left))
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!("no fee estimate: {e}");
+                None
+            })
+    }
+
+    /// The rate to pay a transaction at, `left` blocks before its deadline
+    /// ([`deadline::rate`]).
+    async fn deadline_rate(&self, chain: &impl Chain, left: u32) -> FeeRate {
+        deadline::rate(self.estimate(chain, left).await, self.floor(), left)
     }
 
     /// What the wallet's coins no transaction spends pay, less the fee of
@@ -202,6 +261,12 @@ impl<T: Transport> Provider<T> {
                 incoming.expiry, terms.margin
             )));
         }
+        // To confirm before it would be canceled.
+        let left = timeout.saturating_sub(CANCEL_LEFT).saturating_sub(tip);
+        let estimate = self.estimate(chain, left).await;
+        let Some(rate) = funding_rate(estimate, self.floor(), left, self.wallet.network()) else {
+            return Err(declined("no fee estimate now"));
+        };
         let refund_key = random_key();
         let htlc = Htlc {
             hash: incoming.hash,
@@ -216,7 +281,7 @@ impl<T: Transport> Provider<T> {
             paid: incoming.amount,
             expiry_from: incoming.expiry,
         };
-        let funding = self.fund(&key, &taken, &htlc, &refund_key, &terms)?;
+        let funding = self.fund(&key, &taken, &htlc, &refund_key, &terms, rate)?;
         if let Some(tx) = funding {
             if let Err(e) = chain.broadcast(&tx).await {
                 tracing::warn!(id = %hex::encode(key), "payout's coin not broadcast yet: {e}");
@@ -249,9 +314,9 @@ impl<T: Transport> Provider<T> {
     }
 
     /// Record the payout `id` on `taken`, its coin `htlc`, and pay the coin
-    /// of the wallet's coins, if they pay enough: the coin, for the caller
-    /// to broadcast, unless the payout failed. Recorded before the coin is
-    /// made, which is recorded once made.
+    /// of the wallet's coins at `rate`, if they pay enough: the coin, for
+    /// the caller to broadcast, unless the payout failed. Recorded before
+    /// the coin is made, which is recorded once made.
     fn fund(
         &self,
         id: &[u8; 32],
@@ -259,6 +324,7 @@ impl<T: Transport> Provider<T> {
         htlc: &Htlc,
         refund_key: &SecretKey,
         terms: &swaps::Chain,
+        rate: FeeRate,
     ) -> Result<Option<Transaction>, Problem> {
         let _taking = self.taking.lock().unwrap_or_else(PoisonError::into_inner);
         self.admit(taken.from, taken.paid)?;
@@ -313,11 +379,9 @@ impl<T: Transport> Provider<T> {
             id = %hex::encode(id), from = taken.from, value = taken.value, fee = taken.fee,
             timeout = htlc.timeout, "payout accepted"
         );
-        let paid = self.wallet.spend_silent(
-            Payee::Script(script.clone()),
-            Some(taken.value),
-            rate(terms.rate),
-        );
+        let paid = self
+            .wallet
+            .spend_silent(Payee::Script(script.clone()), Some(taken.value), rate);
         let row = self.row(id).map_err(unavailable)?.expect("recorded");
         let tx = match paid {
             Ok(tx) => tx,
@@ -558,7 +622,7 @@ impl<T: Transport> Provider<T> {
             }
             Stage::Accepted => {
                 if self.funding_height(&coin)?.is_none() {
-                    return Ok(());
+                    return self.cancel_late(id, &row, &coin, chain).await;
                 }
                 self.advance(id, Stage::Accepted, Stage::Locked, None, None)?;
                 tracing::info!(id = %hex::encode(id), "payout's coin confirmed");
@@ -567,6 +631,68 @@ impl<T: Transport> Provider<T> {
             Stage::Locked => self.watch_coin(id, &row, &coin, chain).await,
             _ => Ok(()),
         }
+    }
+
+    /// Cancel the coin of the payout `row`, in no block yet, once
+    /// [`CANCEL_LEFT`] blocks or fewer are left before it times out: mined
+    /// later, its client could claim it once the provider can no longer
+    /// claim the client's lock. Its coins are paid back to the provider in
+    /// its place ([`Wallet::replace_silent`]), made again at a higher rate
+    /// as the blocks left to the timeout run out. The payout fails once the
+    /// cancel is buried; mined after all, the coin is taken on as ever.
+    ///
+    /// [`Wallet::replace_silent`]: licash_wallet::Wallet::replace_silent
+    async fn cancel_late(
+        &self,
+        id: &[u8; 32],
+        row: &Row,
+        coin: &Coin,
+        chain: &impl Chain,
+    ) -> Result<(), Error> {
+        let Some((funding, _)) = &coin.funding else {
+            return Ok(());
+        };
+        let Some(input) = funding.input.first() else {
+            return Ok(());
+        };
+        let Some((by, at)) = self.wallet.silent_spender(&input.previous_output)? else {
+            // Its coins' block replaced: waited for.
+            return Ok(());
+        };
+        let txid = funding.compute_txid();
+        let tip = chain.height().await.map_err(licash_wallet::Error::Chain)?;
+        if let Some(at) = at {
+            let need = payout_depth(self.wallet.network());
+            if by != txid && tip + 1 - at >= need {
+                tracing::info!(id = %hex::encode(id), %by, "payout's coin canceled");
+                return self.fail(id, row, "its coin was canceled, in no block in time");
+            }
+            return Ok(());
+        }
+        let left = coin.htlc.timeout.saturating_sub(tip);
+        if left > CANCEL_LEFT {
+            return Ok(());
+        }
+        let rate = self.deadline_rate(chain, left).await;
+        if by != txid {
+            // Canceled already: made again once the rate rises past its.
+            let paid = self.wallet.silent_spend(&by)?.and_then(|s| {
+                let fee = Amount::from_sat(s.fee?);
+                Some(fee >= rate.fee_wu(s.tx.weight())?)
+            });
+            if paid != Some(false) {
+                return Ok(());
+            }
+        }
+        let cancel = self.wallet.replace_silent(&by, rate)?;
+        tracing::info!(
+            id = %hex::encode(id), txid = %cancel.compute_txid(), left,
+            "canceling a payout's coin in no block yet"
+        );
+        if let Err(e) = chain.broadcast(&cancel).await {
+            tracing::debug!(id = %hex::encode(id), "cancel not broadcast: {e}");
+        }
+        Ok(())
     }
 
     /// Follow the coin of the payout `row`, confirmed, until spent: by its
@@ -590,7 +716,7 @@ impl<T: Transport> Provider<T> {
         let Some((at, spend)) = first_spend(chain, outpoint, &script, first..=tip).await? else {
             self.set_scanned(id, tip)?;
             if tip >= coin.htlc.timeout {
-                self.refund(id, coin, chain).await?;
+                self.refund(id, row, coin, chain).await?;
             }
             return Ok(());
         };
@@ -606,7 +732,10 @@ impl<T: Transport> Provider<T> {
         if tip + 1 - at < need {
             // Looked for again next time, to count its confirmations.
             self.set_scanned(id, at - 1)?;
-            return self.refund(id, coin, chain).await;
+            if let Some(tx) = &coin.refund {
+                self.broadcast_refund(id, tx, chain).await;
+            }
+            return Ok(());
         }
         self.set_scanned(id, tip)?;
         tracing::info!(id = %hex::encode(id), "refunded: the client never claimed the coin");
@@ -624,37 +753,76 @@ impl<T: Transport> Provider<T> {
         Ok(())
     }
 
-    /// Take the coin of the payout `id` back, timed out: to the wallet's
-    /// fallback address, at the terms' rate. Recorded once made, broadcast
-    /// each time.
-    async fn refund(&self, id: &[u8; 32], coin: &Coin, chain: &impl Chain) -> Result<(), Error> {
-        let tx = match (&coin.refund, &coin.funding) {
-            (Some(tx), _) => tx.clone(),
-            (None, Some((funding, vout))) => {
-                let outpoint = OutPoint::new(funding.compute_txid(), *vout);
-                let value = funding.output[*vout as usize].value;
-                let to = self.wallet.fallback_address()?.script_pubkey();
-                let per_kvb = self.payouts.map_or(1_000, |t| t.rate);
-                let tx = coin
-                    .htlc
-                    .refund_tx(outpoint, value, to, rate(per_kvb), &coin.refund_key)
-                    .map_err(|e| licash_wallet::Error::Invalid(e.to_string()))?;
+    /// Take the coin of the payout `row` back, timed out, to the wallet's
+    /// fallback address: before the client's lock expires, after which the
+    /// client's claim would pay the provider nothing. At the rate the
+    /// blocks left before then call for ([`deadline::rate`]), all of the
+    /// coin but dust at most, and made again in place of the one before as
+    /// that rate rises. Recorded once made, broadcast each time.
+    async fn refund(
+        &self,
+        id: &[u8; 32],
+        row: &Row,
+        coin: &Coin,
+        chain: &impl Chain,
+    ) -> Result<(), Error> {
+        let Some((funding, vout)) = &coin.funding else {
+            return Ok(());
+        };
+        let outpoint = OutPoint::new(funding.compute_txid(), *vout);
+        let value = funding.output[*vout as usize].value;
+        let to = match &coin.refund {
+            Some(old) => old.output[0].script_pubkey.clone(),
+            None => self.wallet.fallback_address()?.script_pubkey(),
+        };
+        let tip = chain.height().await.map_err(licash_wallet::Error::Chain)?;
+        let left = row
+            .expiry_from
+            .saturating_sub(licash_wallet::CLAIM_MARGIN)
+            .saturating_sub(tip);
+        let rate = self.deadline_rate(chain, left).await;
+        let build = |rate| {
+            coin.htlc
+                .refund_capped(outpoint, value, to.clone(), rate, &coin.refund_key)
+                .map_err(|e| licash_wallet::Error::Invalid(e.to_string()))
+        };
+        let fee = |tx: &Transaction| value - tx.output[0].value;
+        let mut tx = build(rate)?;
+        if let Some(old) = &coin.refund {
+            let vsize = tx.vsize() as u64;
+            if fee(old) < fee(&tx) && !deadline::replaces(fee(&tx), vsize, fee(old)) {
+                // Paying past its rate, but too little to replace it: what
+                // does, if it can.
+                let least = fee(old).to_sat() + vsize;
+                let wu = tx.weight().to_wu();
+                tx = build(FeeRate::from_sat_per_kwu((least * 1000).div_ceil(wu)))?;
+            }
+        }
+        let tx = match &coin.refund {
+            Some(old) if !deadline::replaces(fee(&tx), tx.vsize() as u64, fee(old)) => old.clone(),
+            _ => {
                 self.store.write(|t| {
                     t.execute(
-                        "UPDATE payouts SET refund_tx = ?2 WHERE id = ?1 AND refund_tx IS NULL",
+                        "UPDATE payouts SET refund_tx = ?2 WHERE id = ?1",
                         params![id, serialize(&tx)],
                     )?;
                     Ok(())
                 })?;
-                tracing::info!(id = %hex::encode(id), txid = %tx.compute_txid(), "taking a payout's coin back");
+                tracing::info!(
+                    id = %hex::encode(id), txid = %tx.compute_txid(), fee = %fee(&tx), left,
+                    "taking a payout's coin back"
+                );
                 tx
             }
-            (None, None) => return Ok(()),
         };
-        if let Err(e) = chain.broadcast(&tx).await {
+        self.broadcast_refund(id, &tx, chain).await;
+        Ok(())
+    }
+
+    async fn broadcast_refund(&self, id: &[u8; 32], tx: &Transaction, chain: &impl Chain) {
+        if let Err(e) = chain.broadcast(tx).await {
             tracing::debug!(id = %hex::encode(id), "refund not broadcast: {e}");
         }
-        Ok(())
     }
 
     fn set_scanned(&self, id: &[u8; 32], height: u32) -> Result<(), Error> {
@@ -677,7 +845,21 @@ fn first_to_scan(scanned: Option<u32>, funding: u32) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::first_to_scan;
+    use super::*;
+
+    #[test]
+    fn a_coin_is_paid_on_mainnet_only_at_the_chains_estimate() {
+        let (one, three) = (rate(1_000), rate(3_000));
+        let mainnet = ChainProfile::Core30Mainnet;
+        assert_eq!(funding_rate(None, one, 50, mainnet), None);
+        assert_eq!(funding_rate(Some(three), one, 50, mainnet), Some(three));
+        // Elsewhere the operator's rate stands in for it.
+        let regtest = ChainProfile::Core30DefaultRegtest;
+        assert_eq!(funding_rate(None, three, 50, regtest), Some(three));
+        assert_eq!(funding_rate(Some(one), three, 50, regtest), Some(three));
+        // Paying more as the blocks left to confirm in run out.
+        assert_eq!(funding_rate(Some(one), one, 8, mainnet), Some(rate(4_000)));
+    }
 
     #[test]
     fn a_coins_own_block_is_looked_in_for_its_spend() {

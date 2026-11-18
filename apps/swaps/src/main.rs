@@ -300,9 +300,10 @@ struct PayoutTerms {
     /// satoshis.
     #[arg(long, env = "LICASH_SWAPS_PAYOUT_MINER", default_value_t = 500)]
     payout_miner: u64,
-    /// The fee rate its coins are paid at, and its clients' claims
-    /// budgeted at least, in sat/vB [default: the chain's estimate within
-    /// 6 blocks at start, at least 1].
+    /// The least fee rate its coins, cancels and refunds are paid at (the
+    /// chain's estimate when higher), and its clients' claims budgeted at
+    /// least, in sat/vB [default: the chain's estimate within 6 blocks at
+    /// start, at least 1].
     #[arg(long, env = "LICASH_SWAPS_PAYOUT_RATE",
           value_parser = clap::value_parser!(u64).range(1..))]
     payout_rate: Option<u64>,
