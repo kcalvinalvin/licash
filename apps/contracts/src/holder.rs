@@ -605,9 +605,12 @@ fn inspection(
 /// them ([`claims`]), from the terms they opened with rather than current
 /// hub offers. One under recovery shows none: its recovery fixes its notes
 /// once, and it cannot also protect those left over or received after.
-/// It still takes its share, which the others then cannot claim. One whose
-/// opening cannot be read or is of an untrusted holder program covers
-/// nothing; this never triggers recovery or reserves notes.
+/// It still takes its share, which the others then cannot claim. Each
+/// claims the lock branches owed first, which leave less of its cap to
+/// notes: the refunds owed, and the pays owed that it is the one to
+/// claim. One whose opening cannot be read or is of
+/// an untrusted holder program covers nothing; this never triggers
+/// recovery or reserves notes.
 pub fn coverage<T: Transport>(
     wallet: &Wallet<T>,
     dir: &Path,
@@ -624,8 +627,16 @@ pub fn coverage<T: Transport>(
     for (url, _) in wallet.hubs()? {
         hubs.push(wallet.hub_urls(&url)?);
     }
+    let mut claimants = std::collections::BTreeMap::new();
+    for o in wallet.owed_locks()? {
+        if let Some(id) = activation::claimant(wallet, &store, dir, &o, tip)? {
+            claimants.insert(o.id, id);
+        }
+    }
+    let pays =
+        |slot: &[u8; 32], pay: &licash_wallet::LockClaim| claimants.get(&pay.id) == Some(slot);
     let mut amounts = claims::shared_out(&live, &terms, &hubs, |slots| {
-        Ok::<_, anyhow::Error>(wallet.recoverable(slots)?)
+        Ok::<_, anyhow::Error>(wallet.recoverable(slots, tip, Some(&pays))?)
     })?;
     let recovering: HashSet<_> = store.recoveries()?.into_iter().map(|r| r.id).collect();
     amounts.retain(|id, _| !recovering.contains(id));

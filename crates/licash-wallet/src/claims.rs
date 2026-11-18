@@ -24,7 +24,7 @@
 //! its id, given back with them.
 
 use std::cmp::Reverse;
-use std::collections::HashMap;
+use std::collections::{hash_map::Entry, BTreeSet, HashMap};
 
 use licash::{
     chain::{Activation, Checkpoint},
@@ -184,14 +184,46 @@ fn recovered(slot: &ClaimSlot, notes: &[([u8; 32], u64)], picked: &[usize]) -> u
 
 impl<T: Transport> Wallet<T> {
     /// What each of `slots`, the contracts at a hub with the one asserting
-    /// first first, would recover of the wallet's notes now, by id: what
-    /// [`Wallet::claim_notes`] would take for it, its cap at most. A
+    /// first first, would recover of the wallet's notes at `tip`, by id:
+    /// what [`Wallet::claim_with_locks`] would take for it, each in turn,
+    /// of notes, its cap at most. The lock branches it takes first leave
+    /// it less of its cap and count for its notes: those `pays` keeps for
+    /// it of the pay branches owed (by its id), and the refunds owed. A
     /// contract whose recovery took its notes already recovers none of
     /// those left, nor keeps any from the others.
-    pub fn recoverable(&self, slots: &[ClaimSlot]) -> Result<HashMap<[u8; 32], u64>, Error> {
+    pub fn recoverable(
+        &self,
+        slots: &[ClaimSlot],
+        tip: u32,
+        pays: Option<&SlotPays<'_>>,
+    ) -> Result<HashMap<[u8; 32], u64>, Error> {
+        let mut keysets = HashMap::new();
+        for slot in slots {
+            // A keyset the wallet never held: no notes nor locks under it.
+            if let (Entry::Vacant(e), Ok(keyset)) =
+                (keysets.entry(slot.keyset), self.keyset_of(&slot.keyset))
+            {
+                e.insert(keyset);
+            }
+        }
         self.store.read(|c| {
             let (open, _, notes) = claimable(c, slots)?;
-            let amounts = ClaimSlot::recoverable(&open, &notes);
+            let mut taken = BTreeSet::new();
+            let mut left = Vec::with_capacity(open.len());
+            for slot in &open {
+                let Some(keyset) = keysets.get(&slot.keyset) else {
+                    left.push(*slot);
+                    continue;
+                };
+                let keep = |l: &LockClaim| pays.is_some_and(|p| p(&slot.id, l));
+                let keep: Option<&dyn Fn(&LockClaim) -> bool> = pays.is_some().then_some(&keep);
+                let mut due = self.due_locks(c, keyset, tip, keep)?;
+                due.retain(|l| !taken.contains(&l.id));
+                let (cap, max, locks) = fit(slot, due);
+                taken.extend(locks.into_iter().map(|l| l.id));
+                left.push(ClaimSlot { cap, max, ..*slot });
+            }
+            let amounts = ClaimSlot::recoverable(&left, &notes);
             let mut all: HashMap<_, _> = slots.iter().map(|s| (s.id, 0)).collect();
             all.extend(open.iter().map(|s| s.id).zip(amounts));
             Ok(all)
@@ -241,53 +273,8 @@ impl<T: Transport> Wallet<T> {
                     "this recovery took its notes already".into(),
                 ));
             }
-            let mut stmt = t.prepare(
-                "SELECT id, request, certificate, expiry FROM locks
-                 WHERE certificate IS NOT NULL AND settled IS NULL AND done_at IS NULL
-                    AND abandoned IS NULL AND claimed_by IS NULL AND expiry <= ?1",
-            )?;
-            let rows = stmt
-                .query_map([tip], |r| {
-                    Ok((
-                        r.get::<_, [u8; 32]>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, Vec<u8>>(2)?,
-                    ))
-                })?
-                .collect::<Result<Vec<_>, _>>()?;
-            drop(stmt);
-            let mut due = Vec::new();
-            for (lock, request, certificate) in rows {
-                // One the wallet can't read back is left to its hub.
-                match self.lock_refund(&keyset, &request, &certificate) {
-                    Ok(Some((refund, expired))) if expired <= tip => due.push(refund),
-                    Ok(_) => {}
-                    Err(e) => tracing::warn!(
-                        lock = %hex::encode(lock), "a lock's refund not claimable: {e}"
-                    ),
-                }
-            }
-            if let Some(keep) = pays {
-                for (lock, row) in owed_rows(t, OWED_DUE, params![keyset.id(), tip])? {
-                    match self.lock_pay(&keyset, &row) {
-                        Ok(Some(pay)) if keep(&pay) => due.push(pay),
-                        Ok(_) => {}
-                        Err(e) => tracing::warn!(
-                            lock = %hex::encode(lock), "a lock's pay not claimable: {e}"
-                        ),
-                    }
-                }
-            }
-            due.sort_by_key(|r| (Reverse(r.value), *r.id.as_bytes()));
-            let (mut cap, mut max) = (slot.cap, slot.max);
-            let mut locks = Vec::new();
-            for lock in due {
-                if lock.value <= cap && lock.keys.len() <= max {
-                    cap -= lock.value;
-                    max -= lock.keys.len();
-                    locks.push(lock);
-                }
-            }
+            let due = self.due_locks(t, &keyset, tip, pays)?;
+            let (cap, max, locks) = fit(&slot, due);
             let left: Vec<_> = (slots.iter())
                 .map(|s| match s.id == *id {
                     true => ClaimSlot { cap, max, ..*s },
@@ -316,6 +303,56 @@ impl<T: Transport> Wallet<T> {
             }
             Ok((notes, locks))
         })
+    }
+
+    /// The lock branches under `keyset` owed by `tip`, unclaimed, the
+    /// largest first, as [`Wallet::claim_with_locks`] reads them.
+    fn due_locks(
+        &self,
+        c: &rusqlite::Connection,
+        keyset: &Keyset,
+        tip: u32,
+        pays: Option<&dyn Fn(&LockClaim) -> bool>,
+    ) -> Result<Vec<LockClaim>, Error> {
+        let mut stmt = c.prepare(
+            "SELECT id, request, certificate, expiry FROM locks
+             WHERE certificate IS NOT NULL AND settled IS NULL AND done_at IS NULL
+                AND abandoned IS NULL AND claimed_by IS NULL AND expiry <= ?1",
+        )?;
+        let rows = stmt
+            .query_map([tip], |r| {
+                Ok((
+                    r.get::<_, [u8; 32]>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Vec<u8>>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(stmt);
+        let mut due = Vec::new();
+        for (lock, request, certificate) in rows {
+            // One the wallet can't read back is left to its hub.
+            match self.lock_refund(keyset, &request, &certificate) {
+                Ok(Some((refund, expired))) if expired <= tip => due.push(refund),
+                Ok(_) => {}
+                Err(e) => tracing::warn!(
+                    lock = %hex::encode(lock), "a lock's refund not claimable: {e}"
+                ),
+            }
+        }
+        if let Some(keep) = pays {
+            for (lock, row) in owed_rows(c, OWED_DUE, params![keyset.id(), tip])? {
+                match self.lock_pay(keyset, &row) {
+                    Ok(Some(pay)) if keep(&pay) => due.push(pay),
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(
+                        lock = %hex::encode(lock), "a lock's pay not claimable: {e}"
+                    ),
+                }
+            }
+        }
+        due.sort_by_key(|r| (Reverse(r.value), *r.id.as_bytes()));
+        Ok(due)
     }
 
     /// The lock branches the recovery of contract `id` took
@@ -677,6 +714,24 @@ impl<T: Transport> Wallet<T> {
         })?;
         Ok(Keyset::from_bytes(&bytes)?)
     }
+}
+
+/// Whether the contract of an id claims a pay branch owed.
+pub type SlotPays<'a> = dyn Fn(&[u8; 32], &LockClaim) -> bool + 'a;
+
+/// Of `due`, the largest first, those `slot` claims, each as fits what is
+/// left of its cap and its count, and what is left of both.
+fn fit(slot: &ClaimSlot, due: Vec<LockClaim>) -> (u64, usize, Vec<LockClaim>) {
+    let (mut cap, mut max) = (slot.cap, slot.max);
+    let mut locks = Vec::new();
+    for lock in due {
+        if lock.value <= cap && lock.keys.len() <= max {
+            cap -= lock.value;
+            max -= lock.keys.len();
+            locks.push(lock);
+        }
+    }
+    (cap, max, locks)
 }
 
 fn slot_of<'s>(id: &[u8; 32], slots: &'s [ClaimSlot]) -> Result<&'s ClaimSlot, Error> {

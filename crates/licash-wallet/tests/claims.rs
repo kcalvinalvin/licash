@@ -83,7 +83,7 @@ async fn a_claim_takes_the_notes_recovering_its_cap_out_of_every_payment() {
     // A contract alone recovers its whole cap: of 64 + 4 + 4, 2 sat lost,
     // rather than 68 of 64 + 4 (or 26 lost of 64 + 32).
     let slots = [slot(&p, ID, 70, 32)];
-    assert_eq!(w.recoverable(&slots).unwrap()[&ID], 70);
+    assert_eq!(w.recoverable(&slots, 0, None).unwrap()[&ID], 70);
     let claimed = w.claim_notes(&ID, &slots).unwrap();
     assert_eq!(denominations(&claimed), [64, 4, 4]);
     assert_eq!(available(w), 32);
@@ -113,7 +113,7 @@ async fn contracts_at_a_hub_recover_the_most_together_each_claiming_its_share() 
     // The first alone would claim 64 + 4 + 4 for 70: together, all 104,
     // the most to the first.
     let slots = [slot(&p, ID, 70, 32), slot(&p, other, 40, 32)];
-    let recoverable = w.recoverable(&slots).unwrap();
+    let recoverable = w.recoverable(&slots, 0, None).unwrap();
     assert_eq!((recoverable[&ID], recoverable[&other]), (68, 36));
     // Reading it took nothing.
     assert_eq!(available(w), 104);
@@ -121,7 +121,7 @@ async fn contracts_at_a_hub_recover_the_most_together_each_claiming_its_share() 
     let mine = w.claim_notes(&ID, &slots).unwrap();
     assert_eq!(denominations(&mine), [64, 4]);
     // Its recovery took its notes: it holds none back from the other.
-    let recoverable = w.recoverable(&slots).unwrap();
+    let recoverable = w.recoverable(&slots, 0, None).unwrap();
     assert_eq!((recoverable[&ID], recoverable[&other]), (0, 36));
     let theirs = w.claim_notes(&other, &slots).unwrap();
     assert_eq!(denominations(&theirs), [32, 4]);
@@ -176,7 +176,7 @@ async fn coverage_previews_whole_notes_once_without_reserving_them() {
     let other = [8; 32];
     let slots = [slot(&p, ID, 70, 32), slot(&p, other, 70, 32)];
     let shares = |w: &Wallet<Link>| {
-        let recoverable = w.recoverable(&slots).unwrap();
+        let recoverable = w.recoverable(&slots, 0, None).unwrap();
         (recoverable[&ID], recoverable[&other])
     };
     assert_eq!(shares(&p.wallet), (68, 36));
@@ -193,7 +193,7 @@ async fn coverage_previews_whole_notes_once_without_reserving_them() {
 async fn coverage_obeys_note_limits_caps_and_exact_keysets() {
     let net = network();
     let p = party(&net, 1, &[64]).await;
-    let alone = |slot: ClaimSlot| p.wallet.recoverable(&[slot]).unwrap()[&slot.id];
+    let alone = |slot: ClaimSlot| p.wallet.recoverable(&[slot], 0, None).unwrap()[&slot.id];
     // A note above the cap recovers the cap, its excess lost.
     assert_eq!(alone(slot(&p, ID, 60, 32)), 60);
     assert_eq!(alone(slot(&p, ID, 128, 0)), 0);
@@ -204,7 +204,7 @@ async fn coverage_obeys_note_limits_caps_and_exact_keysets() {
     assert_eq!(alone(elsewhere), 0);
     let p = party(&net, 2, &[100]).await;
     let slots = [slot(&p, ID, 1_000, 2), slot(&p, [8; 32], 1_000, 1)];
-    let recoverable = p.wallet.recoverable(&slots).unwrap();
+    let recoverable = p.wallet.recoverable(&slots, 0, None).unwrap();
     assert_eq!((recoverable[&ID], recoverable[&[8; 32]]), (96, 4));
 }
 
@@ -226,7 +226,7 @@ async fn coverage_excludes_notes_reserved_by_payments_unlinks_or_another_copy() 
     )
     .unwrap();
     let slots = [slot(&p, [8; 32], 1_000, 32)];
-    assert_eq!(p.wallet.recoverable(&slots).unwrap()[&[8; 32]], 4);
+    assert_eq!(p.wallet.recoverable(&slots, 0, None).unwrap()[&[8; 32]], 4);
     assert_eq!(
         denominations(&p.wallet.claim_notes(&[8; 32], &slots).unwrap()),
         [4]

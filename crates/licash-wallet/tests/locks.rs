@@ -190,6 +190,46 @@ async fn a_recovery_claims_an_unsettled_locks_refund_once_expired_at_depth() {
     assert_eq!(available(&alice), (62, 0));
 }
 
+/// What a recovery would recover of the notes leaves out what the refunds
+/// it claims first take of its cap, as it would claim them, once owed:
+/// those left to the contracts after it.
+#[tokio::test]
+async fn a_refund_owed_takes_its_part_of_a_recoverys_cap_before_notes() {
+    let (net, alice, bob) = parties().await;
+    alice
+        .lock(HUB, &bob.address(), 10, hash(), Some(8))
+        .await
+        .unwrap();
+    alice.receive(&net.pay(HUB, &alice.address(), 32)).unwrap();
+    let keyset = *net.hub(HUB).info().keysets[0].id();
+    let slot = |id: [u8; 32], cap: u64| ClaimSlot {
+        id,
+        keyset,
+        cap,
+        max: 32,
+    };
+    let (first, second) = ([7; 32], [8; 32]);
+    let alone = [slot(first, 70)];
+    let recoverable = |slots: &[ClaimSlot], tip| alice.recoverable(slots, tip, None).unwrap();
+    // Not owed yet: its notes alone.
+    assert_eq!(recoverable(&alone, 8)[&first], 32);
+    // Owed, its refund of 62 takes all but 8 of the cap.
+    assert_eq!(recoverable(&alone, 100)[&first], 8);
+    // Another contract after it there recovers the note in full, the
+    // refund claimed once.
+    let both = [slot(first, 70), slot(second, 100)];
+    let each = recoverable(&both, 100);
+    assert_eq!((each[&first], each[&second]), (0, 32));
+    // As the recovery takes them.
+    let (notes, refunds) = alice.claim_with_locks(&first, &alone, 100, None).unwrap();
+    let face: u64 = notes.iter().map(|n| n.note.message().denomination()).sum();
+    assert_eq!((refunds.len(), refunds[0].value), (1, 62));
+    assert_eq!(face.min(70 - 62), 8);
+    // Taken: none left to the others, nor the first anymore.
+    let each = recoverable(&both, 100);
+    assert_eq!((each[&first], each[&second]), (0, 0));
+}
+
 /// A lock paying the wallet that its hub never issued, its preimage
 /// revealed, is recorded as owed before the hub learns it, and its pay
 /// branch claimed on Bitcoin once activated at depth, by one recovery
