@@ -14,6 +14,7 @@ use licash_contract::{
     keys::HolderKeys,
     opening::{Context, Holder, Opening},
 };
+use licash_onchain::deadline;
 use licash_wallet::{first_spend, ClaimNote, ClaimSlot, Transport, Wallet};
 use lichen_contract::Role;
 use serde::{Deserialize, Serialize};
@@ -27,6 +28,43 @@ const FORMAT: i64 = 2;
 const TIMEOUT_FEE_MARGIN: u64 = 2;
 const OVERLAP: u32 = 3;
 const DUST: Amount = Amount::from_sat(330);
+/// About a challenge's virtual size, its revealed secrets among it (20,717
+/// vB measured), and its fee child's.
+const CHALLENGE_VB: u64 = 21_000;
+
+/// The coin of hers to set aside, at the forced close of a contract, for
+/// a challenge's fee child should the hub's assertion be false: for twice
+/// the challenge's fee at `rate`, her rate, the rate rising meanwhile.
+pub fn challenge_reserve(rate: FeeRate) -> Amount {
+    rate.fee_vb(CHALLENGE_VB * 2).unwrap_or(Amount::MAX)
+}
+
+/// The txid of no transaction her coin for the challenge of contract `id`
+/// is set aside under ([`Wallet::reserve_silent`]), until its fee child
+/// takes it or no challenge is left to make: a coin of hers spending
+/// nothing else under it is that coin, set aside.
+pub fn challenge_marker(id: &[u8; 32]) -> Txid {
+    use bitcoin::hashes::{sha256, Hash};
+    let hash = sha256::Hash::hash(&[b"licash/challenge-coin/".as_slice(), id].concat());
+    Txid::from_byte_array(hash.to_byte_array())
+}
+
+/// Whether her coins hold one to set aside for a challenge at `rate`
+/// ([`challenge_reserve`]): the least it must hold if not, for her to be
+/// told before she forces a close.
+pub fn challenge_shortfall<T: Transport>(
+    wallet: &Wallet<T>,
+    dir: &std::path::Path,
+    rate: FeeRate,
+) -> Result<Option<Amount>> {
+    let need = challenge_reserve(rate);
+    let coins = super::coins(wallet, dir)?;
+    // Her publication may need one of her coins too, the smallest that
+    // pays its fee: one besides it.
+    let enough = coins.iter().filter(|c| c.value >= need.to_sat()).count();
+    let held = enough >= 2 || (enough == 1 && coins.len() >= 2);
+    Ok((!held).then_some(need))
+}
 
 fn rescan(from: u32, tip: u32) -> u32 {
     tip.saturating_add(1).saturating_sub(OVERLAP).max(from)
@@ -183,6 +221,11 @@ struct State {
     #[serde(with = "consensus")]
     challenge: Option<Transaction>,
     challenge_height: Option<u32>,
+    /// The challenge's fee child, the last made, its inputs of her wallet
+    /// with a placeholder signature: signed again at each broadcast,
+    /// which sets its coins aside again.
+    #[serde(with = "consensus", skip_serializing_if = "Option::is_none")]
+    challenge_child: Option<Transaction>,
     #[serde(with = "consensus")]
     payout: Option<Transaction>,
     payout_name: Option<String>,
@@ -357,6 +400,8 @@ pub fn give_up<T: Transport>(
 }
 fn finish_giving_up<T: Transport>(wallet: &Wallet<T>, store: &Store, id: &[u8; 32]) -> Result<()> {
     wallet.unclaim_notes(id)?;
+    // Nothing set aside under it, or freed already: no error.
+    let _ = wallet.abandon_silent(&challenge_marker(id));
     store.drop_recovery(id)?;
     Ok(())
 }
@@ -482,6 +527,7 @@ impl<'a, T: Transport, C: Chain> Run<'a, T, C> {
             ensure!(stage != Stage::GivingUp, "given up");
             let mut state = State::decode(&row)?;
             let tip = self.chain.height().await.map_err(|e| anyhow!(e))?;
+            self.hold_challenge_coin(stage, &state)?;
             let next = match stage {
                 Stage::Claiming => self.claim(&mut state, tip)?,
                 Stage::Claimed => self.commit(&mut state, tip).await?,
@@ -1187,8 +1233,7 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
         state.from = Some(rescan(from, tip));
         if stage == Stage::Challenging {
             if state.next_at.is_none_or(|due| tip.saturating_add(1) >= due) {
-                self.broadcast(state.challenge.as_ref().context("no pinned challenge")?)
-                    .await;
+                return self.post_challenge(state, height, tip).await;
             }
             return Ok(Next::Save);
         }
@@ -1229,6 +1274,330 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
         }
         self.plan_terminal(state, name, due)
     }
+    /// Her coin for a challenge's fee child set aside while a false
+    /// assertion may still call for one: from her publication until the
+    /// hub's assertion verifies, or the child takes it. Set aside again at
+    /// each round, as a reorganization frees it; freed otherwise, and the
+    /// child's coins once the challenge is over. Without such a coin, she
+    /// is told.
+    fn hold_challenge_coin(&self, stage: Stage, state: &State) -> Result<()> {
+        let marker = challenge_marker(&self.id);
+        let possible = match stage {
+            Stage::Published | Stage::Requested | Stage::Answered => true,
+            Stage::Asserted => state.verified != Some(true),
+            Stage::Challenging => state.challenge_child.is_none(),
+            _ => false,
+        };
+        if !possible {
+            // Nothing under it, or freed already: no error.
+            let _ = self.wallet.abandon_silent(&marker);
+            if let Some(child) = state.challenge_child.as_ref() {
+                if stage != Stage::Challenging {
+                    let _ = self.wallet.abandon_silent(&child.compute_txid());
+                }
+            }
+            return Ok(());
+        }
+        let coins = self.wallet.silent_coins()?;
+        if coins.iter().any(|c| c.spending == Some(marker)) {
+            return Ok(());
+        }
+        let need = challenge_reserve(self.rate);
+        let free = super::coins(self.wallet, self.dir)?;
+        match free
+            .iter()
+            .filter(|c| c.value >= need.to_sat())
+            .min_by_key(|c| c.value)
+        {
+            // Taken meanwhile by a spend of hers: set aside next round.
+            Some(coin) => match self.wallet.reserve_silent(&coin.outpoint, &marker) {
+                Ok(()) => tracing::info!(
+                    id = %crate::hex_id(&self.id), coin = %coin.outpoint, value = coin.value,
+                    "a coin set aside for a challenge's fee"
+                ),
+                Err(e) => tracing::warn!(
+                    id = %crate::hex_id(&self.id), coin = %coin.outpoint,
+                    "a coin not set aside for a challenge's fee: {e}"
+                ),
+            },
+            // Not what stops a step: she was told before forcing the close
+            // ([`challenge_shortfall`]).
+            None => tracing::warn!(
+                id = %crate::hex_id(&self.id), need = need.to_sat(),
+                "no coin of hers to set aside for a challenge's fee: a challenge pays what her coins hold"
+            ),
+        }
+        Ok(())
+    }
+
+    /// What her challenge wins, its fee child's fee at most: her claim
+    /// past the hub's response, and the hub's reserve.
+    fn challenge_stake(&self, state: &State) -> Result<Amount> {
+        let (b, _) = HubProves::requested_b(state.r.as_ref().context("no R")?)?;
+        let (responded, _) =
+            HubProves::responded_b(state.response.as_ref().context("no response")?)?;
+        let unit = Amount::from_sat(self.o.base.parts().graph.unit_sats);
+        Ok(unit * u64::from(b.saturating_sub(responded)) + self.o.babe.spec.terms.reserve_hub)
+    }
+
+    /// Her challenge, once valid, posted with a fee child as one package:
+    /// at the rate [`deadline::rate`] gives for the blocks left until the
+    /// hub's `success` is valid, made again at a higher one while it is in
+    /// no block, its fee at most what the challenge wins
+    /// ([`Self::challenge_stake`]), she told above that. Its coins: the
+    /// one set aside, else her smallest that pays; a replacement spends
+    /// the last child's, and one more of hers if short (her coins are in
+    /// blocks: BIP125 takes them). A child made is kept, its coins freed
+    /// of the last, before a signature of them leaves; the next round
+    /// signs and broadcasts it.
+    async fn post_challenge(&self, state: &mut State, asserted_at: u32, tip: u32) -> Result<Next> {
+        let challenge = state.challenge.clone().context("no pinned challenge")?;
+        let g = &self.o.base.parts().graph;
+        let wait = blocks(presign(&self.o.set, "success")?.tx.input[0].sequence)?;
+        let deadline = asserted_at
+            .saturating_add(wait)
+            .saturating_sub(1)
+            .saturating_sub(g.deadline_margin);
+        let left = deadline.saturating_sub(tip);
+        let opened = state.next_at.unwrap_or(asserted_at);
+        if tip >= opened.saturating_add(deadline.saturating_sub(opened) / 2) {
+            self.trouble(format!(
+                "her challenge is in no block halfway to block {deadline}, when the hub's \
+                 payout becomes valid: its fee rises as that nears"
+            ));
+        }
+        let estimate = self
+            .chain
+            .fee_rate(deadline::target(left))
+            .await
+            .ok()
+            .flatten();
+        let one = FeeRate::from_sat_per_vb_u32(1);
+        let mut rate = deadline::rate(
+            estimate,
+            if estimate.is_some() { one } else { self.rate },
+            left,
+        );
+        let old = state.challenge_child.clone();
+        if rate <= one && old.is_none() {
+            self.broadcast(&challenge).await;
+            return Ok(Next::Save);
+        }
+        let presigned = presign(&self.o.set, "challenge_assert")?;
+        let paid: Amount = challenge.output.iter().map(|o| o.value).sum();
+        let link_fee = presigned
+            .prevout
+            .value
+            .checked_sub(paid)
+            .context("a challenge paying out more")?;
+        let fee_script = dispute::fee_script(&self.keys.party.payment)?;
+        let anchor = challenge
+            .output
+            .get(dispute::ANCHOR_VOUT as usize)
+            .context("a challenge without an anchor")?;
+        ensure!(
+            anchor.script_pubkey == fee_script,
+            "the challenge's anchor is not hers"
+        );
+        let output = |op: &OutPoint| -> Result<Option<(OutPoint, TxOut)>> {
+            Ok(self.wallet.silent_coin_output(op)?.map(|out| (*op, out)))
+        };
+        // Its coins: the last child's still hers, else the one set aside.
+        let mut coins = Vec::new();
+        match &old {
+            Some(old) => {
+                for input in old.input.iter().skip(1) {
+                    coins.extend(output(&input.previous_output)?);
+                }
+            }
+            None => {
+                let marker = challenge_marker(&self.id);
+                let held = self.wallet.silent_coins()?;
+                if let Some(c) = held.iter().find(|c| c.spending == Some(marker)) {
+                    coins.extend(output(&c.outpoint)?);
+                }
+            }
+        }
+        let change = match &old {
+            Some(old) => old.output[0].script_pubkey.clone(),
+            None => self.wallet.fallback_address()?.script_pubkey(),
+        };
+        let key = &self.keys.party.payment;
+        let sign = |tx: &mut Transaction, prevouts: &[TxOut]| {
+            for i in 0..tx.input.len() {
+                if prevouts[i].script_pubkey == fee_script {
+                    dispute::sign_fee_input(key, tx, i, prevouts)?;
+                } else {
+                    // Her wallet's signature, of a key spend, at broadcast.
+                    tx.input[i].witness = Witness::from_slice(&[[0u8; 64]]);
+                }
+            }
+            Ok(())
+        };
+        let pair_vb = |child: &Transaction| challenge.vsize() as u64 + child.vsize() as u64;
+        let build = |coins: &[(OutPoint, TxOut)], rate| {
+            dispute::link_child(&challenge, link_fee, coins, change.clone(), rate, sign)
+        };
+        // Short: one coin more of hers, the smallest that pays, else her
+        // largest.
+        if build(&coins, rate).is_err() {
+            let have: Amount = coins.iter().map(|c| c.1.value).sum();
+            let need = rate
+                .fee_vb(challenge.vsize() as u64 + 200)
+                .context("fee overflow")?
+                .checked_sub(link_fee + have)
+                .unwrap_or(Amount::ZERO)
+                + DUST;
+            let mut free = super::coins(self.wallet, self.dir)?;
+            free.sort_by_key(|c| c.value);
+            let pick = (free.iter().find(|c| c.value >= need.to_sat())).or(free.last());
+            if let Some(c) = pick {
+                coins.extend(output(&c.outpoint)?);
+            }
+        }
+        // Its rate the stake's at most, and what her coins pay at most:
+        // weighed at the floor, its size the same at any rate.
+        let stake = self.challenge_stake(state)?;
+        let child = build(&coins, one).and_then(|sized| {
+            let pair = (pair_vb(&sized) * 4).max(1);
+            let per_kwu = |sat: Amount| FeeRate::from_sat_per_kwu(sat.to_sat() * 1_000 / pair);
+            let most = per_kwu(stake + link_fee);
+            if rate > most {
+                self.trouble(format!(
+                    "her challenge would pay {rate} to be in a block by block {deadline}, \
+                     more than the {stake} it wins: it pays {most}"
+                ));
+                rate = most;
+            }
+            let have: Amount = coins.iter().map(|c| c.1.value).sum::<Amount>() + anchor.value;
+            let dust = change.minimal_non_dust();
+            let afford = per_kwu((have + link_fee).checked_sub(dust).unwrap_or(Amount::ZERO));
+            if rate > afford {
+                self.trouble(format!(
+                    "too little of hers on Bitcoin for her challenge to pay {rate} to be in a \
+                     block by block {deadline}: it pays {afford}"
+                ));
+                rate = afford;
+            }
+            build(&coins, rate)
+        });
+        let child = match child {
+            Ok(child) => child,
+            Err(e) => {
+                self.trouble(format!(
+                    "too little of hers on Bitcoin to pay her challenge's fee: {e:#}"
+                ));
+                return self.post_child(state, &challenge).await;
+            }
+        };
+        let fee = |tx: &Transaction| {
+            let value: Amount = tx
+                .input
+                .iter()
+                .filter_map(|i| {
+                    let op = i.previous_output;
+                    let anchor = (op.txid == challenge.compute_txid()).then(|| anchor.clone());
+                    anchor.or_else(|| coins.iter().find(|c| c.0 == op).map(|c| c.1.clone()))
+                })
+                .map(|o| o.value)
+                .sum();
+            let paid: Amount = tx.output.iter().map(|o| o.value).sum();
+            value.checked_sub(paid).unwrap_or(Amount::ZERO)
+        };
+        let child = match &old {
+            None => Some(child),
+            Some(old) => {
+                let (new, before) = (fee(&child), fee(old));
+                if new <= before {
+                    None
+                } else if deadline::replaces(new, child.vsize() as u64, before) {
+                    Some(child)
+                } else {
+                    // The least that replaces it, as a rate of the pair.
+                    let least = before.to_sat() + child.vsize() as u64 + link_fee.to_sat();
+                    let least =
+                        FeeRate::from_sat_per_kwu((least * 1_000).div_ceil(pair_vb(&child) * 4));
+                    build(&coins, least).ok().filter(|c| {
+                        fee(c) <= stake && deadline::replaces(fee(c), c.vsize() as u64, before)
+                    })
+                }
+            }
+        };
+        let Some(child) = child else {
+            return self.post_child(state, &challenge).await;
+        };
+        // Its coins freed of the last child, or of being set aside, and the
+        // new one kept: signed and broadcast next round.
+        if let Some(old) = &old {
+            let _ = self.wallet.abandon_silent(&old.compute_txid());
+        }
+        let _ = self.wallet.abandon_silent(&challenge_marker(&self.id));
+        tracing::info!(
+            id = %crate::hex_id(&self.id), txid = %child.compute_txid(), %rate,
+            "her challenge's fee child made"
+        );
+        state.challenge_child = Some(child);
+        Ok(Next::To(Stage::Challenging))
+    }
+
+    /// Her challenge broadcast with its last fee child, if any, as one
+    /// package: the child's coins of her wallet signed again, which sets
+    /// them aside again. A coin of it taken meanwhile, the child is made
+    /// again (once a run).
+    async fn post_child(&self, state: &mut State, challenge: &Transaction) -> Result<Next> {
+        let Some(mut child) = state.challenge_child.clone() else {
+            self.broadcast(challenge).await;
+            return Ok(Next::Save);
+        };
+        let fee_script = dispute::fee_script(&self.keys.party.payment)?;
+        let mut prevouts = Vec::new();
+        for input in &child.input {
+            let op = input.previous_output;
+            let out = match op.txid == challenge.compute_txid() {
+                true => challenge.output.get(op.vout as usize).cloned(),
+                false => self.wallet.silent_coin_output(&op)?,
+            };
+            prevouts.push(out);
+        }
+        let prevouts: Option<Vec<TxOut>> = prevouts.into_iter().collect();
+        let mut taken = prevouts.is_none();
+        if let Some(prevouts) = &prevouts {
+            for i in 0..child.input.len() {
+                if prevouts[i].script_pubkey == fee_script {
+                    continue;
+                }
+                match self.wallet.sign_input(&child, prevouts, i) {
+                    Ok(signed) => child.input[i].witness = signed.input[i].witness.clone(),
+                    Err(
+                        e @ (licash_wallet::Error::Invalid(_) | licash_wallet::Error::NoteTaken),
+                    ) => {
+                        tracing::warn!(id = %crate::hex_id(&self.id), "a coin of her challenge's child taken: {e}");
+                        taken = true;
+                        break;
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        }
+        if taken {
+            ensure!(
+                !self.rebuilt.swap(true, Ordering::SeqCst),
+                "a coin of her challenge's child taken again"
+            );
+            let _ = self.wallet.abandon_silent(&child.compute_txid());
+            state.challenge_child = None;
+            return Ok(Next::To(Stage::Challenging));
+        }
+        if let Err(e) = self
+            .chain
+            .broadcast_package(&[challenge.clone(), child.clone()])
+            .await
+        {
+            self.trouble(format!("{} and its child: {e}", challenge.compute_txid()));
+        }
+        Ok(Next::Save)
+    }
+
     async fn finishing(&self, state: &mut State, tip: u32) -> Result<Next> {
         let name = state.payout_name.as_deref().context("no pinned terminal")?;
         let stage = match name {

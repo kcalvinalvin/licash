@@ -1505,6 +1505,19 @@ async fn a_holder_challenges_a_false_assertion_and_its_failure_pays_her_whole_cl
 {
     let s = stale_claim([13; 32]).await?;
     s.openings.assert_false_proofs();
+    // A coin for a challenge's fee, as one she held at her forced close:
+    // set aside from her next round.
+    let reserve = 100_000;
+    let to = s.wallet.fallback_address()?.script_pubkey();
+    s.rt.fund(&to, Amount::from_sat(reserve))?;
+    s.rt.mine(1)?;
+    scan(&s.wallet, &s.chain).await?;
+    let coins = s.wallet.silent_coins()?;
+    let coin = coins
+        .iter()
+        .find(|c| c.value == reserve)
+        .context("no coin")?;
+    let coin = coin.outpoint;
     let done = played(&s, |_| true).await?;
     ensure!(done.assertion.is_some() && !done.proved, "{done:?}");
     ensure!(done.challenge.is_some(), "not challenged: {done:?}");
@@ -1517,7 +1530,15 @@ async fn a_holder_challenges_a_false_assertion_and_its_failure_pays_her_whole_cl
     ensure!(received > 5_000, "{received} of a claim of 5000: {done:?}");
     // Her challenge and the hub's assertion, each at its presigned fee.
     paid_its_way(&s.rt, &done.assertion.context("no assertion")?)?;
-    paid_its_way(&s.rt, &done.challenge.context("no challenge")?)?;
+    let challenge = done.challenge.context("no challenge")?;
+    paid_its_way(&s.rt, &challenge)?;
+    // With a fee child, of the coin set aside, at her 2 sat/vB without an
+    // estimate, as on regtest; nothing left set aside.
+    paid_with_child(&s.rt, &challenge, 2)?;
+    ensure!(!s.rt.is_unspent(&coin)?, "the coin set aside unspent");
+    let marker = licash_contracts::holder::recovery::challenge_marker(&done.id);
+    let held = s.wallet.silent_coins()?;
+    ensure!(held.iter().all(|c| c.spending != Some(marker)), "{held:?}");
     Ok(())
 }
 
