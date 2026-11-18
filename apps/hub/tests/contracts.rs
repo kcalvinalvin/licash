@@ -2157,6 +2157,59 @@ async fn a_hub_that_responds_and_never_asserts_pays_her_whole_claim() -> Result<
     Ok(())
 }
 
+/// A hub whose ledger gives no evidence against the stale claim, as one
+/// halted, responds nothing on evidence it cannot read: the operator is
+/// alerted of that contract once, and her timeout pays her all she
+/// claimed.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs bitcoind and a release build"]
+async fn a_hub_whose_ledger_gives_no_evidence_alerts_and_pays_her_whole_claim() -> Result<()> {
+    use licash_contracts::holder::recovery::{self, Stage};
+
+    let s = stale_claim([20; 32]).await?;
+    let told = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let alerts = told.clone();
+    s.openings.alert_with(Arc::new(move |message: &str| {
+        alerts.lock().unwrap().push(message.to_owned())
+    }));
+    let undecided = || {
+        let told = told.lock().unwrap();
+        told.iter()
+            .filter(|m| m.contains("cannot decide its answer"))
+            .count()
+    };
+    // Its ledger changed under it: halted, it reads nothing more.
+    let db = rusqlite::Connection::open(s._dir.path().join("hub").join("hub.sqlite"))?;
+    db.execute("UPDATE meta SET seq = seq + 1", [])?;
+    drop(db);
+    ensure!(s.hub.alert("halt").is_err() && s.hub.halted());
+
+    let (mut failed, mut done) = (0, None);
+    for _ in 0..800 {
+        s.rt.mine(1)?;
+        let round = s.openings.answer_requests().await?;
+        ensure!(round.answered == 0, "{round:?}");
+        failed += round.failed;
+        // Never told before it failed to decide.
+        ensure!(failed > 0 || undecided() == 0, "{:?}", told.lock().unwrap());
+        let r = recovery::advance(&s.wallet, &s.chain, &s.mine, s.rate).await?[0].clone();
+        ensure!(r.stage != Stage::Lost, "{r:?}");
+        if r.stage == Stage::Done {
+            done = Some(r);
+            break;
+        }
+    }
+    let done = done.context("never paid")?;
+    ensure!(failed > 0, "the hub decided");
+    ensure!(undecided() == 1, "{:?}", told.lock().unwrap());
+    ensure!(
+        done.response.is_none() && done.timeout.is_some(),
+        "{done:?}"
+    );
+    ensure!(done.claimed == 5_000, "{done:?}");
+    Ok(())
+}
+
 /// A hub that signed its response and lost `responses.sqlite` signs no
 /// other, decided anew: its openings tell it began that answer, and where
 /// they tell nothing either, as of a response signed by a build before

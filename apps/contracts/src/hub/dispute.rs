@@ -531,7 +531,13 @@ impl Openings {
         }
         let evidence = match pins.evidence(id)? {
             Some(pinned) => pinned_evidence(o, &pinned)?,
-            None => self.select(o, &filed, p_at, owed)?,
+            None => match self.select(o, &filed, p_at, owed) {
+                Ok(evidence) => evidence,
+                Err(e) => {
+                    self.undecided(id, &e, r_at, respond_deadline(o, r_at), tip);
+                    return Err(e);
+                }
+            },
         };
         let mut decided = owed(&evidence)?;
         if decided.owed >= b {
@@ -637,6 +643,24 @@ impl Openings {
             }
         }
         Ok(kept)
+    }
+
+    /// The hub could not decide its answer to her request of `r_at`, for
+    /// `why`: no response is made on evidence it cannot read, and it tries
+    /// again every round. While its ledger's scan is a few blocks behind
+    /// her claim's that passes; once half the blocks to `deadline`, the
+    /// last at which a response still confirms in time, are gone, the
+    /// operator is alerted, once.
+    fn undecided(&self, id: &[u8; 32], why: &anyhow::Error, r_at: u32, deadline: u32, tip: u32) {
+        if !half_gone(r_at, deadline, tip) || !self.once(id, "undecided") {
+            return;
+        }
+        self.alert(&format!(
+            "contract {}: the hub cannot decide its answer to her claim ({why:#}), and {} \
+             blocks are left to respond in. Unanswered, her timeout pays her all she claims.",
+            crate::hex_id(id),
+            deadline.saturating_sub(tip)
+        ));
     }
 
     /// Post the disclosure of `disclosures` in the response's disclose
@@ -1811,6 +1835,12 @@ fn child_fee(child: &Transaction, outputs: &[TxOut], coins: &[(OutPoint, TxOut)]
     (anchor + spent).checked_sub(paid).unwrap_or(Amount::ZERO)
 }
 
+/// Whether at `tip` half the blocks are gone from her request at `r_at`
+/// to `deadline`, the last tip at which the hub's answer still confirms.
+fn half_gone(r_at: u32, deadline: u32, tip: u32) -> bool {
+    tip >= r_at.saturating_add(deadline.saturating_sub(r_at) / 2)
+}
+
 /// The last tip at which the hub's response, broadcast, still confirms
 /// before her `request_timeout`, `w_h` blocks after her request at `r_at`:
 /// `deadline_margin` blocks to confirm in.
@@ -1956,6 +1986,21 @@ mod tests {
             terminal_coin(first, &extra, sat(3_000), stake),
             (coin(2, 6_000), None)
         );
+    }
+
+    /// A ledger a few blocks behind her claim is no alert; one still
+    /// giving nothing half way to the last block to respond at is.
+    #[test]
+    fn an_answer_undecided_is_told_once_half_its_blocks_are_gone() {
+        // Requested at 100, a response confirming in time until 140.
+        assert!(!half_gone(100, 140, 100));
+        assert!(!half_gone(100, 140, 119));
+        assert!(half_gone(100, 140, 120));
+        assert!(half_gone(100, 140, 500));
+        // No room left, as when the hub was away: at once.
+        assert!(half_gone(100, 100, 100));
+        assert!(half_gone(100, 90, 100));
+        assert!(half_gone(100, 101, 100));
     }
 
     #[test]
