@@ -1398,11 +1398,10 @@ mod tests {
             .answering((&others[..], &route, "regtest"), &none, answers, named)
             .await
             .is_err());
-        // Failing to find them again, those kept stay.
-        assert!(announced
-            .refresh(&relays, &Route::Direct, "regtest")
-            .await
-            .is_err());
+        // Failing to find them again, those kept stay: the watch answers
+        // with them.
+        let found = announced.refresh(&relays, &Route::Direct, "regtest");
+        assert_eq!(found.await.unwrap(), 1);
         assert_eq!(announced.kept(&relays, "regtest").unwrap().len(), 1);
     }
 
