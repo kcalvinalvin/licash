@@ -121,6 +121,9 @@ impl Wallet {
                 return Err(last);
             }
         };
+        // The chosen provider's fee rising is the user's to accept, said
+        // over whatever failed after.
+        let rose = matches!(last, LicashError::FeeRose { .. });
         for offer in others {
             if offer.fee > most || tried.contains(&offer.provider) {
                 continue;
@@ -128,7 +131,8 @@ impl Wallet {
             tried.push(offer.provider.clone());
             match self.try_pay_out(&offer)? {
                 Ok(paying) => return Ok(paying),
-                Err(e) => last = e,
+                Err(e) if !rose => last = e,
+                Err(e) => tracing::info!(provider = %offer.provider, "paying out failed: {e}"),
             }
         }
         Err(last)

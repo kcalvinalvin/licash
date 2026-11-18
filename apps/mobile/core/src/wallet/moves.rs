@@ -116,7 +116,12 @@ impl Wallet {
                         Some(swap) if swap.lock.is_some() => return Err(e.into()),
                         _ => {
                             tracing::info!(provider = %offer.provider, "moving failed, nothing locked: {e}");
-                            last = Some(e);
+                            // The chosen provider's fee rising is the
+                            // user's to accept, said over what failed after.
+                            let rose = matches!(last, Some(licash_wallet::Error::FeeRose { .. }));
+                            if !rose {
+                                last = Some(e);
+                            }
                         }
                     }
                 }

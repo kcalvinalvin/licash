@@ -1106,7 +1106,7 @@ class Engine(context: Context) {
     suspend fun payInvoice(text: String, quote: InvoiceQuote): Result<Activity> = io {
         val provider = quote.provider
         val paid = locked {
-            if (provider == null) it.payInvoice(text, quote.hub)
+            if (provider == null) it.payInvoiceWithin(text, quote.hub, quote.fee)
             else it.payInvoiceVia(text, quote.hub, provider.url, provider.fee)
         }
         refresh()

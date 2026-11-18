@@ -369,6 +369,14 @@ fun shown(contract: Contract, now: Long): Boolean = when (contract.state) {
     else -> true
 }
 
+/**
+ * What a swap provider's or a gateway's fee rising since its quote means:
+ * nothing was paid, and it is the owner's to accept at the new price.
+ */
+fun feeRose(agreed: ULong, asked: ULong): String =
+    "The fee went up from ${sat(agreed)} to ${sat(asked)} since it was quoted. Nothing was paid: " +
+        "see the new price to accept it."
+
 /** `amount` sat in bitcoin, as a payment link says it: `0.00033000`. */
 fun btc(amount: ULong): String =
     "%d.%08d".format(Locale.US, (amount / 100_000_000uL).toLong(), (amount % 100_000_000uL).toLong())

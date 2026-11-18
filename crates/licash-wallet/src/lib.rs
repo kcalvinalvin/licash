@@ -175,6 +175,16 @@ pub enum Error {
     /// ([`Wallet::set_fee_ceilings`]): its owner's to approve.
     #[error("hub {hub} charges more than agreed: approve its fees to pay there")]
     FeesRaised { hub: String },
+    /// A swap provider, or a hub's gateway, `who`, asks `asked` sat in
+    /// fees where the quote agreed to at most `agreed`: nothing was
+    /// locked. Its owner's to accept, asking for a quote again.
+    #[error("{reason}")]
+    FeeRose {
+        who: String,
+        agreed: u64,
+        asked: u64,
+        reason: String,
+    },
     /// Another payment took a note meanwhile: nothing was paid.
     #[error("another payment took a note meanwhile: try again")]
     NoteTaken,

@@ -197,9 +197,17 @@ impl<T: Transport> Wallet<T> {
         let msat = self.payable(&invoice)?;
         let (hub, info) = self.hub(&url)?;
         let (lock, _) = gateway_lock(&url, &info, &invoice, msat)?;
+        self.gateway_fee((&url, hub), lock, msat)
+    }
+
+    /// What a lock of `lock` sat at the hub at `url`, paying an invoice of
+    /// `msat` through its gateway, costs on top of the invoice: the
+    /// gateway's fee in it, and the hub's fee on a payment to this wallet
+    /// making notes worth it exactly, if it holds none.
+    fn gateway_fee(&self, (url, hub): (&str, i64), lock: u64, msat: u64) -> Result<u64, Error> {
         let exact = match self.exact(hub, lock)? {
             Some(_) => 0,
-            None => self.send_fee(&url, lock)?,
+            None => self.send_fee(url, lock)?,
         };
         Ok(lock - msat.div_ceil(1000) + exact)
     }
@@ -271,6 +279,18 @@ impl<T: Transport> Wallet<T> {
     /// [`crate::LockState::Locked`] while it is under way, which
     /// [`Wallet::follow_lock`] follows.
     pub async fn pay_invoice(&self, url: &str, request: &str) -> Result<Lock, Error> {
+        self.pay_invoice_within(url, request, None).await
+    }
+
+    /// [`Wallet::pay_invoice`], refused as [`Error::FeeRose`] if it costs
+    /// more than `max_fee` on top of what the invoice asks
+    /// ([`Wallet::invoice_fee`]), as the hub says now: what was quoted.
+    pub async fn pay_invoice_within(
+        &self,
+        url: &str,
+        request: &str,
+        max_fee: Option<u64>,
+    ) -> Result<Lock, Error> {
         let url = hub_url(url)?;
         let invoice = decode(request)?;
         let msat = self.payable(&invoice)?;
@@ -283,6 +303,19 @@ impl<T: Transport> Wallet<T> {
         }
         let (hub, info) = self.refresh(&url).await?;
         let (amount, expiry) = gateway_lock(&url, &info, &invoice, msat)?;
+        if let Some(agreed) = max_fee {
+            let asked = self.gateway_fee((&url, hub), amount, msat)?;
+            if asked > agreed {
+                return Err(Error::FeeRose {
+                    who: url.clone(),
+                    agreed,
+                    asked,
+                    reason: format!(
+                        "hub {url} asks {asked} sat to pay the invoice, more than {agreed}"
+                    ),
+                });
+            }
+        }
         let request = invoice.to_string();
         tracing::info!(%url, msat, amount, "paying an invoice");
         self.lock_paying(
@@ -398,7 +431,12 @@ fn via_terms(
     let amount = terms.pays(msat);
     let fee = amount - msat.div_ceil(1000);
     if fee > max_fee {
-        return refuse(format!("asks a fee of {fee} sat, more than {max_fee}"));
+        return Err(Error::FeeRose {
+            who: provider.into(),
+            agreed: max_fee,
+            asked: fee,
+            reason: format!("provider {provider} asks a fee of {fee} sat, more than {max_fee}"),
+        });
     }
     let expiry = via_expiry(url, info, terms, invoice)?;
     Ok((amount, fee, expiry))

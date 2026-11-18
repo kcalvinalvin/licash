@@ -29,6 +29,7 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
 import org.licash.core.Holding
+import org.licash.core.LicashException
 import org.licash.core.MoveQuote
 import org.licash.wallet.Engine
 import org.licash.wallet.explain
@@ -118,7 +119,18 @@ fun MoveSheet(engine: Engine, from: Holding, hubs: List<Holding>, moved: () -> U
                 } else if (shown != null) {
                     // The chosen first, then the rest as preferred.
                     val order = listOf(shown[chosen]) + shown.filterIndexed { i, _ -> i != chosen }
-                    engine.moveNotes(order).onSuccess { moved() }.onFailure { error = explain(it) }
+                    engine.moveNotes(order).onSuccess { moved() }.onFailure { e ->
+                        error = explain(e)
+                        // Its fee rose: offered again at the new price, to accept or not.
+                        if (e is LicashException.FeeRose) {
+                            val amount = text.toULongOrNull()?.takeIf { it > 0uL }
+                            engine.moveOffers(from.hub, shown[chosen].to, amount).onSuccess {
+                                offers = it
+                                chosen = 0
+                                error = feeRose(e.agreed, e.asked)
+                            }
+                        }
+                    }
                 }
                 busy = false
             }

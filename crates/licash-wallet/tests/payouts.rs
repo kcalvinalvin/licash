@@ -98,7 +98,7 @@ async fn a_payout_whose_signed_lock_fee_passes_its_ceiling_locks_nothing() {
         .await
         .unwrap();
     let error = eco.client.payout(&quote).await.unwrap_err();
-    assert!(matches!(error, Error::Invalid(_)), "{error}");
+    assert!(matches!(error, Error::FeeRose { .. }), "{error}");
     assert!(
         error
             .to_string()
@@ -927,7 +927,9 @@ async fn a_payout_is_refused_beyond_its_terms_before_any_lock() {
         }
     };
     let refused = |result: Result<_, Error>, why: &str| match result {
-        Err(Error::Invalid(reason)) => assert!(reason.contains(why), "{reason}"),
+        Err(Error::Invalid(reason) | Error::FeeRose { reason, .. }) => {
+            assert!(reason.contains(why), "{reason}")
+        }
         other => panic!("{other:?}"),
     };
     let costs = quote(PAYEE, 1000, MAX_FEE).await.unwrap().costs();

@@ -386,11 +386,16 @@ impl<T: Transport> Wallet<T> {
         {
             // Its fee as the hub's lock signs it, not as estimated.
             Ok(prepared) if quote.signed_costs(prepared.fee) > quote.max_fee => {
-                Err(Error::Invalid(format!(
-                    "provider {provider} and hub {from} ask {} sat to pay out {amount}, more than {}",
-                    quote.signed_costs(prepared.fee),
-                    quote.max_fee
-                )))
+                let asked = quote.signed_costs(prepared.fee);
+                Err(Error::FeeRose {
+                    who: provider.clone(),
+                    agreed: quote.max_fee,
+                    asked,
+                    reason: format!(
+                        "provider {provider} and hub {from} ask {asked} sat to pay out {amount}, more than {}",
+                        quote.max_fee
+                    ),
+                })
             }
             Ok(prepared) => self
                 .store
@@ -1132,12 +1137,17 @@ impl Terms<'_> {
             preimage,
         };
         if quote.costs() > self.max_fee {
-            return refuse(format!(
-                "asks {} sat to pay out {}, more than {}",
-                quote.costs(),
-                self.amount,
-                self.max_fee
-            ));
+            return Err(Error::FeeRose {
+                who: provider.into(),
+                agreed: self.max_fee,
+                asked: quote.costs(),
+                reason: format!(
+                    "provider {provider} asks {} sat to pay out {}, more than {}",
+                    quote.costs(),
+                    self.amount,
+                    self.max_fee
+                ),
+            });
         }
         Ok(quote)
     }

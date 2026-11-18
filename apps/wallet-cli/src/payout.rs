@@ -42,9 +42,13 @@ pub async fn pay(
     let max_fee = max_fee.unwrap_or(amount / 100 + USUAL_MAX_FEE);
     let quote = match provider {
         Provider::At(url) => {
-            wallet
-                .payout_quote(&url, from, to, amount, max_fee, rate)
-                .await?
+            let quoting = |max_fee| wallet.payout_quote(&url, from, to, amount, max_fee, rate);
+            match quoting(max_fee).await {
+                Err(e @ licash_wallet::Error::FeeRose { .. }) => {
+                    quoting(crate::accept_raise(e, json)?).await?
+                }
+                quote => quote?,
+            }
         }
         Provider::Announced(relays, route) => {
             let relays = match relays {
@@ -64,7 +68,16 @@ pub async fn pay(
             found.quote
         }
     };
-    let payout = wallet.payout(&quote).await?;
+    let payout = match wallet.payout(&quote).await {
+        // Asked again, its fee risen: quoted again within it, if accepted.
+        Err(e @ licash_wallet::Error::FeeRose { .. }) => {
+            let max_fee = crate::accept_raise(e, json)?;
+            let (provider, from) = (&quote.provider, &quote.from);
+            let again = wallet.payout_quote(provider, from, to, amount, max_fee, rate);
+            wallet.payout(&again.await?).await?
+        }
+        payout => payout?,
+    };
     if let PayoutState::Failed(reason) = &payout.state {
         show(json, payout_json(&payout), payout_line(&payout));
         bail!("the payout failed ({reason}): its lock, if made, returns once expired");

@@ -246,9 +246,11 @@ enum Command {
         /// node, rather than through the hub.
         #[arg(long, value_name = "URL")]
         via: Option<String>,
-        /// The provider's fee at most, in sat, with --via [default: 1% and
-        /// 100].
-        #[arg(long, requires = "via")]
+        /// The fee at most, in sat: the provider's with --via [default: 1%
+        /// and 100], else the hub's, with the exact notes it may make
+        /// [default: none]. Asking more, it is asked on a terminal whether
+        /// to pay that, else refused.
+        #[arg(long)]
         max_fee: Option<u64>,
         /// Seconds to wait for the payment to end; `resume` follows it
         /// after.
@@ -981,11 +983,23 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 Some(provider) => {
                     let amount = Payable::read(&invoice)?.amount;
                     let max_fee = max_fee.unwrap_or(SwapLimits::usual(amount).fee);
-                    wallet
-                        .pay_invoice_via(&provider, &hub, &invoice, max_fee)
-                        .await?
+                    let paying = |max_fee| wallet.pay_invoice_via(&provider, &hub, &invoice, max_fee);
+                    match paying(max_fee).await {
+                        Err(e @ licash_wallet::Error::FeeRose { .. }) => {
+                            paying(accept_raise(e, json)?).await?
+                        }
+                        paid => paid?,
+                    }
                 }
-                None => wallet.pay_invoice(&hub, &invoice).await?,
+                None => {
+                    let paying = |max_fee| wallet.pay_invoice_within(&hub, &invoice, max_fee);
+                    match paying(max_fee).await {
+                        Err(e @ licash_wallet::Error::FeeRose { .. }) => {
+                            paying(Some(accept_raise(e, json)?)).await?
+                        }
+                        paid => paid?,
+                    }
+                }
             };
             return pay_invoice(&wallet, lock, wait, json).await;
         }
@@ -1083,7 +1097,14 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                     (found.await?, true)
                 }
             };
-            let swap = wallet.swap(&provider, &from, &to, amount, limits).await?;
+            let swap = match wallet.swap(&provider, &from, &to, amount, limits).await {
+                Err(e @ licash_wallet::Error::FeeRose { .. }) => {
+                    let fee = accept_raise(e, json)?;
+                    let limits = SwapLimits { fee, ..limits };
+                    wallet.swap(&provider, &from, &to, amount, limits).await?
+                }
+                swap => swap?,
+            };
             let unlinked = unlink(&wallet).await;
             let mut shown = swap_json(&swap);
             shown["unlinked"] = json!(unlinked);
@@ -1189,6 +1210,26 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// A fee risen past `--max-fee`, as `e` ([`licash_wallet::Error::FeeRose`])
+/// says: on a terminal, the user asked whether to pay it, the fee to allow
+/// then if so; else refused, saying how to accept it.
+pub(crate) fn accept_raise(e: licash_wallet::Error, json: bool) -> anyhow::Result<u64> {
+    let licash_wallet::Error::FeeRose { asked, reason, .. } = e else {
+        return Err(e.into());
+    };
+    let terminal = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
+    if !json && terminal {
+        eprint!("{reason}. Pay {asked} sat in fees? [y/N] ");
+        std::io::stderr().flush()?;
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        if matches!(answer.trim(), "y" | "Y" | "yes") {
+            return Ok(asked);
+        }
+    }
+    bail!("{reason}: --max-fee {asked} accepts it")
 }
 
 /// Follow `lock`, paying an invoice, for up to `wait` seconds: done once

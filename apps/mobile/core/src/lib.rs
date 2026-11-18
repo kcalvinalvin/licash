@@ -86,6 +86,16 @@ pub enum LicashError {
     /// [`Wallet::approve_fees`]).
     #[error("hub {hub} charges more than agreed: approve its fees to pay there")]
     FeesRaised { hub: String },
+    /// A swap provider, or a hub's gateway, at `who`, asks `asked` sat in
+    /// fees where the quote said `agreed`: nothing was paid. Quote again,
+    /// and pay at the new fee only once the user accepts it.
+    #[error("{reason}")]
+    FeeRose {
+        who: String,
+        agreed: u64,
+        asked: u64,
+        reason: String,
+    },
     /// The wallet's own storage failed.
     #[error("{reason}")]
     Failed { reason: String },
@@ -101,6 +111,14 @@ impl From<licash_wallet::Error> for LicashError {
             E::Insufficient { needed, available } => Self::Insufficient { needed, available },
             E::UnknownHub(url) => Self::UnknownHub { url },
             E::FeesRaised { hub } => Self::FeesRaised { hub },
+            E::FeeRose {
+                who, agreed, asked, ..
+            } => Self::FeeRose {
+                who,
+                agreed,
+                asked,
+                reason,
+            },
             E::Setup(_) | E::Storage(_) => Self::Failed { reason },
             _ => Self::Invalid { reason },
         }

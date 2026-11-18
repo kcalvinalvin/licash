@@ -682,6 +682,23 @@ impl Wallet {
         Ok(lightning_activity(&lock, &invoice.request))
     }
 
+    /// [`Wallet::pay_invoice`], refused as [`LicashError::FeeRose`],
+    /// nothing paid, if its hub now asks more than `max_fee`, its quote's
+    /// fee ([`Wallet::invoice_offers`]).
+    pub fn pay_invoice_within(
+        &self,
+        text: String,
+        hub: String,
+        max_fee: u64,
+    ) -> Result<Activity, LicashError> {
+        let invoice = self.wallet.read_invoice(&text)?;
+        let pay = self
+            .wallet
+            .pay_invoice_within(&hub, &invoice.request, Some(max_fee));
+        let lock = self.runtime.block_on(pay)?;
+        Ok(lightning_activity(&lock, &invoice.request))
+    }
+
     /// Ask the hub trusted taking `amount` over Lightning for least for an
     /// invoice paying the wallet `amount` in notes, its fee on top for the
     /// payer. Followed by [`Wallet::follow_invoice`] while shown, and by

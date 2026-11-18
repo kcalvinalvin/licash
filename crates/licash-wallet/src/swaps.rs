@@ -539,10 +539,15 @@ fn terms(
     }
     let fee = offer.fee.due(amount);
     if fee > limits.fee {
-        return Err(Error::Invalid(format!(
-            "provider {provider} asks {fee} sat to swap {amount}, more than {}",
-            limits.fee
-        )));
+        return Err(Error::FeeRose {
+            who: provider.into(),
+            agreed: limits.fee,
+            asked: fee,
+            reason: format!(
+                "provider {provider} asks {fee} sat to swap {amount}, more than {}",
+                limits.fee
+            ),
+        });
     }
     let margin = offer.margin_at(at_to);
     if margin > limits.margin {

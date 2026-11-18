@@ -637,7 +637,12 @@ async fn a_wallet_locks_nothing_for_a_provider_asking_too_much() {
     let request = node.invoice(1_000_000, lock_hash(&[4; 32]), DELTA, Outcome::Hang);
     // Its fee is 2 sat and 1%: 12.
     match client.pay_invoice_via(PROVIDER, A, &request, 11).await {
-        Err(Error::Invalid(why)) => assert!(why.contains("fee of 12 sat"), "{why}"),
+        Err(Error::FeeRose {
+            agreed: 11,
+            asked: 12,
+            reason,
+            ..
+        }) => assert!(reason.contains("fee of 12 sat"), "{reason}"),
         other => panic!("{other:?}"),
     }
     // Nor for an invoice whose final delta outlasts the hub's locks.

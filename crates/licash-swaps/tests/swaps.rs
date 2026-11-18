@@ -518,7 +518,9 @@ async fn a_client_locks_nothing_for_a_swap_costing_more_than_it_allows() {
     for (limits, says) in [(cheaper, "more than"), (sooner, "locked")] {
         let e = eco.client.swap(PROVIDER, A, B, 20, limits).await;
         match e {
-            Err(Error::Invalid(why)) => assert!(why.contains(says), "{why}"),
+            Err(Error::Invalid(why) | Error::FeeRose { reason: why, .. }) => {
+                assert!(why.contains(says), "{why}")
+            }
             other => panic!("{other:?}"),
         }
     }
@@ -575,7 +577,10 @@ async fn a_client_asks_what_a_swap_costs_and_what_it_would_refuse() {
         (A, B, 20, sooner),
     ] {
         let e = quote(from, to, amount, limits).await.unwrap_err();
-        assert!(matches!(e, Error::Invalid(_)), "{e}");
+        assert!(
+            matches!(e, Error::Invalid(_) | Error::FeeRose { .. }),
+            "{e}"
+        );
     }
     let unknown = quote(A, "http://c.test", 10, usual).await;
     assert!(matches!(unknown, Err(Error::UnknownHub(_))), "{unknown:?}");

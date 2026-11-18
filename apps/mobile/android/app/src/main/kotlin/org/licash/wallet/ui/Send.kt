@@ -92,6 +92,8 @@ private sealed interface Step {
     data object Later : Step
     data class Received(val amount: ULong) : Step
     data class Trust(val payment: String, val hub: String) : Step
+    /** A provider's or gateway's fee risen since its quote: `requote` to see the new price. */
+    class FeeRose(val agreed: ULong, val asked: ULong, val requote: () -> Unit) : Step
     /** A hub charging more than agreed, in the way of a payment: made `again` once approved. */
     class Approve(val raised: FeesRaised, val again: () -> Unit) : Step
     data class Failed(val why: String, val title: String = "Couldn't pay") : Step
@@ -205,8 +207,10 @@ fun Send(
     }
 
     // Why a payment failed: its hub's fees to approve first, if it charges
-    // more than agreed, and the payment made `again` then.
-    suspend fun unpaid(e: Throwable, again: () -> Unit): Step {
+    // more than agreed, and the payment made `again` then; a fee risen since
+    // quoted, to `requote` and confirm at the new price.
+    suspend fun unpaid(e: Throwable, requote: (() -> Unit)? = null, again: () -> Unit): Step {
+        if (e is LicashException.FeeRose && requote != null) return Step.FeeRose(e.agreed, e.asked, requote)
         val hub = (e as? LicashException.FeesRaised)?.hub
         val raised = hub?.let { engine.feesRaised(it).getOrNull() }
         return if (raised == null) Step.Failed(explain(e)) else Step.Approve(raised, again)
@@ -218,7 +222,7 @@ fun Send(
             { e ->
                 when (e) {
                     is LicashException.Pending -> Step.Later
-                    else -> unpaid(e) {
+                    else -> unpaid(e, { step = Step.Paying(code, amount) }) {
                         step = Step.Busy
                         scope.launch { step = paying(code, amount) }
                     }
@@ -258,12 +262,19 @@ fun Send(
         }
     }
 
+    fun requoteInvoice(text: String) {
+        step = Step.Busy
+        scope.launch {
+            step = engine.invoiceQuote(text).fold({ Step.Invoice(text, it) }, { Step.Failed(explain(it)) })
+        }
+    }
+
     fun payInvoice(text: String, quote: InvoiceQuote) {
         step = Step.Busy
         scope.launch {
             step = engine.payInvoice(text, quote).fold(
                 { if (it.state == State.DONE) Step.Paid(it.amount, it.fee) else Step.Later },
-                { e -> unpaid(e) { payInvoice(text, quote) } },
+                { e -> unpaid(e, { requoteInvoice(text) }) { payInvoice(text, quote) } },
             )
         }
     }
@@ -273,10 +284,11 @@ fun Send(
         scope.launch {
             step = engine.payOut(quote, asked).fold(
                 { Step.PayingOut(it.amount, quote.depth) },
-                { e -> unpaid(e) { payOut(quote, asked) } },
+                { e -> unpaid(e, { quote(quote.address, asked) }) { payOut(quote, asked) } },
             )
         }
     }
+
 
     LaunchedEffect(link) { link?.let { read(it) } }
     Column(Modifier.fillMaxSize().padding(horizontal = 24.dp)) {
@@ -445,6 +457,7 @@ fun Send(
                     },
                     back,
                 )
+                is Step.FeeRose -> Ask("The fee went up", feeRose(s.agreed, s.asked), "See new price", s.requote, back)
                 is Step.Failed -> Ask(s.title, s.why, "Try again", { step = Step.Looking }, back, failed = true)
                 is Step.ProtectFirst -> Ask(
                     "Protect your bitcoin first",
