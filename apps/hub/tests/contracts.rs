@@ -1340,6 +1340,29 @@ async fn a_hub_that_responds_and_never_asserts_pays_her_whole_claim() -> Result<
     Ok(())
 }
 
+/// Transaction `txid` of a dispute, confirmed on `rt`'s standard node at
+/// the fee its graph presigned: at least 1 sat/vB of its actual size,
+/// what a node relays by default, with nothing to bump it.
+fn paid_its_way(rt: &Regtest, txid: &bitcoin::Txid) -> Result<()> {
+    let tx = rt.get_tx(txid)?;
+    let mut spent = 0;
+    for input in &tx.input {
+        let prev = rt.get_tx(&input.previous_output.txid)?;
+        spent += prev.output[input.previous_output.vout as usize]
+            .value
+            .to_sat();
+    }
+    let made: u64 = tx.output.iter().map(|o| o.value.to_sat()).sum();
+    let (fee, vsize) = (spent - made, tx.vsize() as u64);
+    eprintln!(
+        "{txid}: {vsize} vB, {fee} sat, {:.3} sat/vB",
+        fee as f64 / vsize as f64
+    );
+    ensure!(fee >= vsize, "{txid} pays {fee} sat for {vsize} vB");
+    ensure!(rt.confirmations(txid)?.is_some(), "{txid} unconfirmed");
+    Ok(())
+}
+
 /// The stale claim's request and publication buried, the hub not playing
 /// and her timeout not posted: the block her response timeout is valid
 /// from, then mined past, her wallet offline.
@@ -1388,6 +1411,8 @@ async fn a_hubs_answer_can_confirm_after_its_response_window() -> Result<()> {
     ensure!(done.assertion.is_some() && done.proved, "{done:?}");
     ensure!(done.corrected == Some(4_096), "{done:?}");
     ensure!(done.payout.is_some() && done.timeout.is_none(), "{done:?}");
+    // The hub's assertion relayed and confirmed at its presigned fee.
+    paid_its_way(&s.rt, &done.assertion.context("no assertion")?)?;
     Ok(())
 }
 
@@ -1431,6 +1456,9 @@ async fn a_holder_challenges_a_false_assertion_and_its_failure_pays_her_whole_cl
     );
     let received = done.received.context("nothing received")?;
     ensure!(received > 5_000, "{received} of a claim of 5000: {done:?}");
+    // Her challenge and the hub's assertion, each at its presigned fee.
+    paid_its_way(&s.rt, &done.assertion.context("no assertion")?)?;
+    paid_its_way(&s.rt, &done.challenge.context("no challenge")?)?;
     Ok(())
 }
 
