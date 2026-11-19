@@ -2135,7 +2135,7 @@ mod tests {
         let slot = crate::dispute::presign(&ao.set, "request")
             .unwrap()
             .tx
-            .output[lichen_statement::SLOT_VOUT as usize]
+            .output[licash_statement::SLOT_VOUT as usize]
             .clone();
         let fee = TxOut {
             value: Amount::from_sat(5_000),
@@ -2174,7 +2174,7 @@ mod tests {
         let disclose = crate::dispute::presign(&ho.set, "respond")
             .unwrap()
             .tx
-            .output[lichen_statement::SLOT_VOUT as usize]
+            .output[licash_statement::SLOT_VOUT as usize]
             .clone();
         for (mut tx, spent, tree, name) in [
             (
@@ -2251,6 +2251,39 @@ mod tests {
         let asserted = ho.assert(&h.keys, &proof).unwrap();
         assert!(ao.verify_assertion(&asserted).unwrap());
         let challenge = ao.challenge(&a.keys, &asserted).unwrap();
+        // A contract opened before Lichen bound her dealing to the
+        // journal: the hub pre-signed for the dealing of her garbler seed
+        // alone, and her challenge reveals that one's secrets, valid
+        // signatures under the hub's adaptor keys. Pre-signatures for
+        // neither, no challenge.
+        let r = &ao.base.parts().recipe;
+        let unbound = |seed: [u8; 32]| {
+            lichen_babe::vsss::deal(
+                lichen_babe::setup::DIGITS,
+                (r.instances - r.kept) as usize,
+                &mut <rand_chacha::ChaCha20Rng as rand_core::SeedableRng>::from_seed(seed),
+            )
+            .1
+        };
+        let sighash = HubProves::challenge_sighash(&ao.set).unwrap();
+        let mut legacy = a.signed().unwrap();
+        legacy.offer.presigs = h.keys.adaptor.presign(
+            &sighash,
+            &points(&unbound(a.keys.garbler.derive_bytes("dealing"))),
+        );
+        let c = legacy.challenge(&a.keys, &asserted).unwrap();
+        let args = graph::link_args(&c);
+        let digits = legacy.assertion(&asserted).unwrap().digits;
+        for (j, v) in digits.iter().enumerate() {
+            let sig =
+                lichen_btc::bitcoin::secp256k1::schnorr::Signature::from_slice(&args[2 * j + 1])
+                    .unwrap();
+            SECP256K1
+                .verify_schnorr(&sig, &sighash, &ao.hub.adaptor[j][*v as usize])
+                .unwrap();
+        }
+        legacy.offer.presigs = h.keys.adaptor.presign(&sighash, &points(&unbound([7; 32])));
+        assert!(legacy.challenge(&a.keys, &asserted).is_err());
         let (i, bytes) = &stored_instance[0];
         assert!(ho
             .answer(&asserted, &challenge, *i, bytes)

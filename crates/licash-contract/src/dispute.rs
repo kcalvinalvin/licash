@@ -8,8 +8,9 @@ use lichen_babe::{
     gadget,
     opening::{self, Garbler},
     reveal,
-    setup::Instance,
+    setup::{Instance, Secret, DIGITS},
     statement,
+    vsss::{deal, Dealing},
 };
 use lichen_btc::{
     bitcoin::{
@@ -23,6 +24,8 @@ use lichen_btc::{
 };
 use lichen_contract::{anchor_tree_for, Owned, Presign, Role};
 use lichen_wots::WotsPublic;
+use rand_chacha::ChaCha20Rng;
+use rand_core::SeedableRng;
 use std::collections::HashMap;
 
 use crate::{
@@ -130,7 +133,7 @@ impl Opening {
         let request = presign(&self.set, "request")?;
         let slot = OutPoint {
             txid: request.tx.compute_txid(),
-            vout: lichen_statement::SLOT_VOUT,
+            vout: licash_statement::SLOT_VOUT,
         };
         let prevout = &request.tx.output[slot.vout as usize];
         let tx = self.babe.publication(&keys.claim, slot, prevout, bytes)?;
@@ -193,19 +196,53 @@ impl Opening {
     pub fn challenge(&self, keys: &HolderKeys, asserted: &Transaction) -> Result<Transaction> {
         ensure!(keys.public() == self.holder, "another holder's keys");
         let a = self.assertion(asserted)?;
-        let r = &self.base.parts().recipe;
-        let garbler = Garbler::new(
-            &keys.garbler,
-            r.instances as u32,
-            r.kept as u32,
-            &graph::kind(&self.base, self.mock),
-            &graph::journal(&self.base),
-        );
-        let secrets = garbler.reveal(&a.digits);
+        let secrets = self.revealed(keys, &a.digits)?;
         self.finish(
             "challenge_assert",
             a.challenge_wire(&self.offer.presigs, &secrets),
         )
+    }
+    /// The secrets of π1's `digits`, as her challenge reveals them: of the
+    /// dealing bound to the contract's journal (`Garbler`) or, for a
+    /// contract opened before Lichen bound it, of the one from her
+    /// garbler seed alone; whichever the hub's pre-signatures on
+    /// `challenge_assert` are adapted to.
+    fn revealed(&self, keys: &HolderKeys, digits: &[u8]) -> Result<Vec<Secret>> {
+        let r = &self.base.parts().recipe;
+        let (n, m) = (r.instances as u32, r.kept as u32);
+        let garbler = Garbler::new(
+            &keys.garbler,
+            n,
+            m,
+            &graph::kind(&self.base, self.mock),
+            &graph::journal(&self.base),
+        );
+        let sighash = HubProves::challenge_sighash(&self.set)?;
+        let adapted = |d: &Dealing| {
+            reveal::check_presigs(
+                &self.hub.adaptor,
+                &sighash,
+                &reveal::points(d),
+                &self.offer.presigs,
+            )
+        };
+        if adapted(garbler.dealing()) {
+            return Ok(garbler.reveal(digits));
+        }
+        let (dealer, dealing) = deal(
+            DIGITS,
+            (n - m) as usize,
+            &mut ChaCha20Rng::from_seed(keys.garbler.derive_bytes("dealing")),
+        );
+        ensure!(
+            adapted(&dealing),
+            "the hub's pre-signatures are adapted to neither of her dealings"
+        );
+        Ok(digits
+            .iter()
+            .enumerate()
+            .map(|(j, v)| dealer.reveal(j, *v))
+            .collect())
     }
 }
 impl HubOpening {
@@ -243,7 +280,7 @@ impl HubOpening {
         let respond = presign(&self.set, "respond")?;
         let slot = OutPoint {
             txid: respond.tx.compute_txid(),
-            vout: lichen_statement::SLOT_VOUT,
+            vout: licash_statement::SLOT_VOUT,
         };
         let prevout = &respond.tx.output[slot.vout as usize];
         let tx = self
@@ -298,14 +335,27 @@ impl HubOpening {
         let Some(proof) = &a.proof else {
             return Ok(None);
         };
-        let msg = opening::msg(&inst, i, &self.opened.opened, &a.bits, &secrets, proof);
-        msg.map(|m| {
-            self.finish(
-                &format!("wrongly_challenged_{k}"),
-                HubProves::wrongly_wire(&m),
-            )
-        })
-        .transpose()
+        // a malformed instance, or one whose evaluation panics, answers
+        // nothing: the caller tries the next
+        let mut failed = None;
+        let answered = opening::answer(
+            [(i, Ok(bytes.to_vec()))],
+            &self.opened.opened,
+            &a.bits,
+            &secrets,
+            proof,
+            |_, e| failed = Some(format!("{e:#}")),
+        );
+        match (answered, failed) {
+            (Some((_, m)), _) => self
+                .finish(
+                    &format!("wrongly_challenged_{k}"),
+                    HubProves::wrongly_wire(&m),
+                )
+                .map(Some),
+            (None, Some(why)) => anyhow::bail!("kept instance {i} doesn't answer: {why}"),
+            (None, None) => Ok(None),
+        }
     }
     /// The hub's disclosure or reclaim, its inputs final (`prevouts`, in
     /// order, its fee coin's too): its slot's input signed again over
@@ -320,7 +370,7 @@ impl HubOpening {
         let slot_of = |name| -> Result<OutPoint> {
             Ok(OutPoint {
                 txid: presign(&self.set, name)?.tx.compute_txid(),
-                vout: lichen_statement::SLOT_VOUT,
+                vout: licash_statement::SLOT_VOUT,
             })
         };
         let spent = tx.input[0].previous_output;
@@ -344,10 +394,10 @@ impl HubOpening {
         ensure!(keys.public() == self.hub, "another hub's keys");
         let r = presign(&self.set, "request")?;
         let slot = self.babe.slot()?;
-        let prevout = &r.tx.output[lichen_statement::SLOT_VOUT as usize];
+        let prevout = &r.tx.output[licash_statement::SLOT_VOUT as usize];
         let op = OutPoint {
             txid: r.tx.compute_txid(),
-            vout: lichen_statement::SLOT_VOUT,
+            vout: licash_statement::SLOT_VOUT,
         };
         let mut tx = build_spend(
             op,
@@ -582,14 +632,14 @@ pub fn exit(
     publish: (&Block, &Txid),
     respond: (&Block, &Txid),
     disclosure: Option<(&Block, &Txid)>,
-) -> Result<lichen_statement::Exit> {
-    Ok(lichen_statement::Exit {
+) -> Result<licash_statement::Exit> {
+    Ok(licash_statement::Exit {
         headers,
-        request: lichen_babe::exit::request(funding, request.0, request.1)?,
-        publish: lichen_babe::exit::slot_spend(publish.0, publish.1)?,
-        respond: lichen_babe::exit::respond(respond.0, respond.1)?,
+        request: crate::exit::request(funding, request.0, request.1)?,
+        publish: crate::exit::slot_spend(publish.0, publish.1)?,
+        respond: crate::exit::respond(respond.0, respond.1)?,
         disclosure: disclosure
-            .map(|(b, t)| lichen_babe::exit::slot_spend(b, t))
+            .map(|(b, t)| crate::exit::slot_spend(b, t))
             .transpose()?,
     })
 }
@@ -609,10 +659,10 @@ pub fn disclosed(response: &Transaction, disclosure: &Block, txid: &Txid) -> Res
 
 /// What the spend `txid` in `block` of `link`'s slot carries.
 fn carried(link: &Transaction, block: &Block, txid: &Txid) -> Option<Vec<u8>> {
-    let spend = lichen_babe::exit::slot_spend(block, txid).ok()?;
-    let slot = lichen_statement::btc::OutPoint {
+    let spend = crate::exit::slot_spend(block, txid).ok()?;
+    let slot = licash_statement::btc::OutPoint {
         txid: lichen_btc::bitcoin::hashes::Hash::to_byte_array(link.compute_txid()),
-        vout: lichen_statement::SLOT_VOUT,
+        vout: licash_statement::SLOT_VOUT,
     };
     spend.carrying(&slot)
 }

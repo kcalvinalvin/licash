@@ -1818,7 +1818,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2024,7 +2024,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3340,11 +3340,12 @@ dependencies = [
  "k256",
  "licash",
  "licash-hp",
+ "licash-statement",
  "lichen-babe",
  "lichen-btc",
  "lichen-contract",
- "lichen-statement",
  "lichen-wots",
+ "rand_chacha 0.3.1",
  "rand_core 0.6.4",
 ]
 
@@ -3424,7 +3425,7 @@ version = "0.0.1"
 dependencies = [
  "bitcoin",
  "licash",
- "lichen-statement",
+ "licash-statement",
  "sha2 0.10.9",
 ]
 
@@ -3588,6 +3589,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "licash-statement"
+version = "0.0.1"
+dependencies = [
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "licash-swaps"
 version = "0.0.1"
 dependencies = [
@@ -3738,7 +3746,7 @@ dependencies = [
 [[package]]
 name = "lichen-babe"
 version = "0.4.5"
-source = "git+https://github.com/lichenbtc-org/lichen?branch=feat%2Fhub-proves-exit#f5c606114158897b05a1117f8f0e7de69c57df5a"
+source = "git+https://github.com/lichenbtc-org/lichen?branch=licash#20953ae02d585073298d5e6792abb0e8f46dd32e"
 dependencies = [
  "anyhow",
  "ark-bn254",
@@ -3755,7 +3763,6 @@ dependencies = [
  "lichen-btc",
  "lichen-contract",
  "lichen-risc0",
- "lichen-statement",
  "lichen-wots",
  "rand_chacha 0.3.1",
  "rand_core 0.6.4",
@@ -3785,7 +3792,7 @@ dependencies = [
 [[package]]
 name = "lichen-contract"
 version = "0.4.5"
-source = "git+https://github.com/lichenbtc-org/lichen?branch=feat%2Fhub-proves-exit#f5c606114158897b05a1117f8f0e7de69c57df5a"
+source = "git+https://github.com/lichenbtc-org/lichen?branch=licash#20953ae02d585073298d5e6792abb0e8f46dd32e"
 dependencies = [
  "anyhow",
  "bitcoin",
@@ -3804,14 +3811,6 @@ dependencies = [
  "ark-ec",
  "ark-ff",
  "hex",
- "sha2 0.10.9",
-]
-
-[[package]]
-name = "lichen-statement"
-version = "0.1.0"
-source = "git+https://github.com/lichenbtc-org/lichen?branch=feat%2Fhub-proves-exit#f5c606114158897b05a1117f8f0e7de69c57df5a"
-dependencies = [
  "sha2 0.10.9",
 ]
 
@@ -4151,7 +4150,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4686,7 +4685,7 @@ dependencies = [
  "derive-deftly",
  "libc",
  "paste",
- "thiserror 2.0.21",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -5149,7 +5148,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5206,7 +5205,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -6056,10 +6055,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -8117,7 +8116,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

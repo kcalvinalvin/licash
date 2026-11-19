@@ -28,7 +28,7 @@
 //! each party keeps its own. Each value is read from the chain, signed under a one-time key
 //! in a link's witness: `b` under the holder's in `request`'s, `b′` under
 //! the hub's in `respond`'s, so the statement reads `b′` from Bitcoin as it
-//! reads the claim (`lichen_statement`).
+//! reads the claim (`licash_statement`).
 //!
 //! The contract output (F's output [`FUNDING_VOUT`]) depends only on
 //! Base and the one-time keys for `b` and `E`, not on the hub's prover
@@ -41,6 +41,7 @@ use anyhow::{bail, ensure, Context, Result};
 use ark_bn254::Bn254;
 use ark_groth16::Proof;
 use licash::base::{Base, GraphTerms, Party};
+use licash_statement::{script_digit, JOURNAL_LEN, SLOT_VOUT};
 use lichen_babe::graph::{link_leaf, verify_drop, Front, FrontLink, Graph, Payout, Tail};
 use lichen_babe::reveal::{complete, reveal_args, LamportPub, Preimage};
 use lichen_babe::setup::{Hash, Secret, DIGITS, VALUES};
@@ -57,10 +58,9 @@ use lichen_btc::taptree::{Leaf, TapTree};
 use lichen_btc::tx::{build_spend, Timelock};
 use lichen_btc::witness::tapscript_witness;
 use lichen_contract::{
-    anchor_tree, payout_less, wots_shape, ContractParams, Core, PartyPubKeys, Presign, Role, Terms,
-    POST_CSV,
+    anchor_tree, payout_less_signed, wots_shape, ContractParams, Core, PartyPubKeys, Presign, Role,
+    Terms, POST_CSV,
 };
-use lichen_statement::{script_digit, JOURNAL_LEN, SLOT_VOUT};
 use lichen_wots::{WotsParams, WotsPublic, WotsSig};
 
 pub use lichen_babe::graph::link_args;
@@ -449,7 +449,7 @@ impl Front for Spec {
                     ..self.terms
                 };
                 let ctx = self.view().ctx();
-                payout_less(
+                payout_less_signed(
                     &ctx,
                     &terms,
                     &self.b_key,
@@ -464,6 +464,15 @@ impl Front for Spec {
     }
 
     fn success(&self) -> Payout {
+        REDUCED
+    }
+
+    /// A valid proof challenged pays as `success` does, not everything to
+    /// the hub (Lichen's default): a holder's challenge may be her
+    /// wallet's mistake (a proof it failed to check, a stale view of the
+    /// chain), which shouldn't cost her her balance. Every contract open
+    /// was signed so: another choice is another graph version.
+    fn wrongly_challenged(&self) -> Payout {
         REDUCED
     }
 }
@@ -702,7 +711,7 @@ impl HubProves {
         posted: &[u8],
     ) -> Result<Transaction> {
         let script =
-            lichen_statement::claim_script(posted).context("the claim is too large to publish")?;
+            licash_statement::claim_script(posted).context("the claim is too large to publish")?;
         nulldata_spend(&self.slot()?, "publish", key, slot, out, script)
     }
     /// The hub's disclosure of `bytes` (what its proof cites): the spend
@@ -716,7 +725,7 @@ impl HubProves {
         out: &TxOut,
         bytes: &[u8],
     ) -> Result<Transaction> {
-        let script = lichen_statement::claim_script(bytes)
+        let script = licash_statement::claim_script(bytes)
             .context("the disclosure is too large to publish")?;
         nulldata_spend(&self.disclose()?, "disclose", key, slot, out, script)
     }
@@ -770,7 +779,7 @@ impl Assertion {
 
 /// A one-time signature from a link's arguments (consumption order: each
 /// digit, then its hash), each digit read as the verifying script reads it
-/// (`lichen_statement::script_digit`): Bitcoin accepts a 15 written as 16,
+/// (`licash_statement::script_digit`): Bitcoin accepts a 15 written as 16,
 /// so the hub and holder must read it as the statement does.
 fn script_signature(params: WotsParams, args: &[Vec<u8>]) -> Result<WotsSig> {
     let items = args
@@ -813,5 +822,43 @@ mod tests {
             draft,
             contract_output(&build(&base, &theirs, &hub, draft_hmsg(2)).unwrap()).unwrap()
         );
+    }
+
+    /// A valid proof challenged pays as `success` does (Lichen's default
+    /// would pay the hub everything): the graph every open contract
+    /// signed. Only the hub's reserve is less, by what `challenge_assert`
+    /// took (its floor and anchor).
+    #[test]
+    fn wrongly_challenged_pays_as_success() {
+        let base = crate::opening::testing::base(&[3; 32]);
+        let holder = HolderKeys::derive(&[1; 32], &[3; 32]).public();
+        let hub = HubKeys::from_secret(&[2; 32]).public();
+        let set = build(&base, &holder, &hub, draft_hmsg(2))
+            .unwrap()
+            .presign(OutPoint::null())
+            .unwrap();
+        let named = |name: &str| set.iter().find(|p| p.name == name).unwrap();
+        let success = named("success");
+        for k in 0..2 {
+            let w = named(&format!("wrongly_challenged_{k}"));
+            let (wo, so) = (&w.tx.output, &success.tx.output);
+            let scripts = |o: &[TxOut]| {
+                o.iter()
+                    .map(|o| o.script_pubkey.clone())
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(scripts(wo), scripts(so));
+            // her bits and reserve, and the rest, as success; the hub's
+            // reserve less what the challenge took
+            let differ: Vec<usize> = (0..so.len())
+                .filter(|i| wo[*i].value != so[*i].value)
+                .collect();
+            assert_eq!(differ, [so.len() - 2]);
+            let i = differ[0];
+            assert_eq!(
+                so[i].value - wo[i].value,
+                success.prevout.value - w.prevout.value
+            );
+        }
     }
 }

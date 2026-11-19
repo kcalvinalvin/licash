@@ -808,11 +808,12 @@ dependencies = [
  "k256",
  "licash",
  "licash-hp",
+ "licash-statement",
  "lichen-babe",
  "lichen-btc",
  "lichen-contract",
- "lichen-statement",
  "lichen-wots",
+ "rand_chacha",
  "rand_core",
 ]
 
@@ -823,14 +824,21 @@ dependencies = [
  "bitcoin",
  "k256",
  "licash",
- "lichen-statement",
+ "licash-statement",
+ "sha2",
+]
+
+[[package]]
+name = "licash-statement"
+version = "0.0.1"
+dependencies = [
  "sha2",
 ]
 
 [[package]]
 name = "lichen-babe"
 version = "0.4.5"
-source = "git+https://github.com/lichenbtc-org/lichen?branch=feat%2Fhub-proves-exit#f5c606114158897b05a1117f8f0e7de69c57df5a"
+source = "git+https://github.com/lichenbtc-org/lichen?branch=licash#20953ae02d585073298d5e6792abb0e8f46dd32e"
 dependencies = [
  "anyhow",
  "ark-bn254",
@@ -847,7 +855,6 @@ dependencies = [
  "lichen-btc",
  "lichen-contract",
  "lichen-risc0",
- "lichen-statement",
  "lichen-wots",
  "rand_chacha",
  "rand_core",
@@ -877,7 +884,7 @@ dependencies = [
 [[package]]
 name = "lichen-contract"
 version = "0.4.5"
-source = "git+https://github.com/lichenbtc-org/lichen?branch=feat%2Fhub-proves-exit#f5c606114158897b05a1117f8f0e7de69c57df5a"
+source = "git+https://github.com/lichenbtc-org/lichen?branch=licash#20953ae02d585073298d5e6792abb0e8f46dd32e"
 dependencies = [
  "anyhow",
  "bitcoin",
@@ -896,14 +903,6 @@ dependencies = [
  "ark-ec",
  "ark-ff",
  "hex",
- "sha2",
-]
-
-[[package]]
-name = "lichen-statement"
-version = "0.1.0"
-source = "git+https://github.com/lichenbtc-org/lichen?branch=feat%2Fhub-proves-exit#f5c606114158897b05a1117f8f0e7de69c57df5a"
-dependencies = [
  "sha2",
 ]
 
