@@ -171,9 +171,9 @@ impl Tree {
             count,
             ..Tree::default()
         };
-        for level in 0..DEPTH {
+        for (level, filled) in tree.filled.iter_mut().enumerate().take(DEPTH) {
             if count >> level & 1 == 1 {
-                tree.filled[level] = r.take().map_err(|_| bad("input"))?;
+                *filled = r.take().map_err(|_| bad("input"))?;
             }
         }
         Ok(tree)
