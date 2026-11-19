@@ -111,6 +111,8 @@ pub(super) struct PendingFold {
     sec: lichen_btc::musig::SecNonce,
     nonces: [lichen_btc::musig::PubNonce; 2],
     fee: Amount,
+    /// What it pays her besides her reserve, if she asked a claim paid.
+    claim: Option<super::fold::Claim>,
 }
 
 /// What a poll of one opening did.
@@ -269,9 +271,44 @@ impl Openings {
         nonce: &[u8],
     ) -> Result<FoldOffer, Refused> {
         let hers = lichen_btc::musig::PubNonce::from_slice(nonce).map_err(Refused::bad)?;
+        self.offered(id, hers, None).await
+    }
+
+    /// The first round of a fold that pays her claim: as [`Self::offer_fold`],
+    /// once the ledger holds nothing against the notes she names (it
+    /// retires none yet: that waits for her signature).
+    pub(super) async fn offer_fold_claim(
+        &self,
+        id: &[u8; 32],
+        body: &[u8],
+    ) -> Result<FoldOffer, Refused> {
+        let ask = crate::FoldAsk::decode(body).map_err(Refused::bad)?;
+        let hers = lichen_btc::musig::PubNonce::from_slice(&ask.nonce).map_err(Refused::bad)?;
+        self.offered(id, hers, Some((ask.amount, ask.notes))).await
+    }
+
+    async fn offered(
+        &self,
+        id: &[u8; 32],
+        hers: lichen_btc::musig::PubNonce,
+        asked: Option<(u32, Vec<licash::crypto::Point>)>,
+    ) -> Result<FoldOffer, Refused> {
         let (hub, o) = self.standing(id).await?;
+        let claim = match asked {
+            None => None,
+            Some((amount, notes)) => {
+                let ledger = self.fold_ledger.get().ok_or_else(|| {
+                    Refused::unavailable("this hub's ledger holds no claims for folds")
+                })?;
+                let claim = super::fold::Claim::asked(&o, amount, notes).map_err(Refused::bad)?;
+                (ledger.claimable)(id, &claim.notes)
+                    .map_err(|e| Refused::bad(format!("her notes: {e:#}")))?;
+                Some(claim)
+            }
+        };
+        let paid = claim.as_ref().map_or(Amount::ZERO, |claim| claim.sats(&o));
         let fee = fold_fee(&o, self.fee_rate().await).map_err(Refused::unavailable)?;
-        let fold = crate::fold(&o.babe, &o.funding, fee).map_err(Refused::bad)?;
+        let fold = crate::fold(&o.babe, &o.funding, paid, fee).map_err(Refused::bad)?;
         // Its share above dust, or the fee would take it whole.
         if fold.tx.output.len() != 2 {
             return Err(Refused::unavailable("fees too high to fold now: later"));
@@ -283,9 +320,11 @@ impl Openings {
             sec,
             nonces: [hers, mine],
             fee,
+            claim,
         };
+        let claimed = pending.claim.as_ref().map(|c| c.amount);
         self.folds().insert(*id, pending);
-        tracing::info!(id = %crate::hex_id(id), %fee, "a fold offered");
+        tracing::info!(id = %crate::hex_id(id), %fee, ?claimed, "a fold offered");
         Ok(FoldOffer {
             nonce: mine.0,
             fee: fee.to_sat(),
@@ -299,8 +338,11 @@ impl Openings {
     pub(super) async fn sign_fold(
         &self,
         id: &[u8; 32],
-        partial: &[u8],
+        body: &[u8],
     ) -> Result<Transaction, Refused> {
+        let (partial, filed) = body
+            .split_at_checked(32)
+            .ok_or_else(|| Refused::bad("a partial signature is 32 bytes"))?;
         let partial: lichen_btc::musig::Partial = partial
             .try_into()
             .map_err(|_| Refused::bad("a partial signature is 32 bytes"))?;
@@ -308,11 +350,31 @@ impl Openings {
         let Some(pending) = self.folds().remove(id) else {
             return Err(Refused::bad("no fold offered: POST a nonce first"));
         };
-        let fold = crate::fold(&o.babe, &o.funding, pending.fee).map_err(Refused::bad)?;
+        let paid = pending
+            .claim
+            .as_ref()
+            .map_or(Amount::ZERO, |claim| claim.sats(&o));
+        let fold = crate::fold(&o.babe, &o.funding, paid, pending.fee).map_err(Refused::bad)?;
         let holder = &o.babe.core().pubs[0].payment;
         let nonces = &pending.nonces;
         fold.verify_partial(holder, &nonces[0], nonces, &partial)
             .map_err(|e| Refused::bad(format!("her partial signature: {e:#}")))?;
+        // Her claim's notes retired before the hub signs, none that anything
+        // spent: it holds her signature, so it may fold from here on.
+        match (&pending.claim, filed) {
+            (None, []) => {}
+            (None, _) => return Err(Refused::bad("a fold asked without a claim takes none")),
+            (Some(claim), filed) => {
+                let ledger = self.fold_ledger.get().ok_or_else(|| {
+                    Refused::unavailable("this hub's ledger holds no claims for folds")
+                })?;
+                let publication = claim
+                    .filed(&o, filed)
+                    .map_err(|e| Refused::bad(format!("her claim: {e:#}")))?;
+                (ledger.retire)(id, &publication)
+                    .map_err(|e| Refused::bad(format!("her notes: {e:#}")))?;
+            }
+        }
         let signed = fold
             .sign(&hub.keys().party.payment, pending.sec, nonces)
             .and_then(|mine| fold.finish(nonces, &[partial, mine]))
@@ -1945,7 +2007,7 @@ const SLOT: u32 = 2;
 /// The fee of `o`'s fold at `rate`: of its size signed, one key-path
 /// signature its witness.
 fn fold_fee(o: &HubOpening, rate: FeeRate) -> Result<Amount> {
-    let mut tx = crate::fold(&o.babe, &o.funding, Amount::ZERO)?.tx;
+    let mut tx = crate::fold(&o.babe, &o.funding, Amount::ZERO, Amount::ZERO)?.tx;
     tx.input[0].witness = bitcoin::Witness::from_slice(&[[0u8; 64]]);
     rate.fee_vb(tx.vsize() as u64).context("fee overflow")
 }

@@ -9,6 +9,7 @@
 //! effects cut short by a restart run again then.
 
 mod dispute;
+mod fold;
 mod node;
 mod prover;
 mod responses;
@@ -30,6 +31,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
 pub use dispute::{Claims, Evidencer, LockCheckpoints, Played};
+pub use fold::FoldLedger;
 /// How the hub tells its operator what needs them ([`Openings::alert_with`]).
 pub type Alert = dyn Fn(&str) + Send + Sync;
 use futures_util::StreamExt;
@@ -40,7 +42,7 @@ use licash_chain_client::Source;
 pub use licash_contract::opening::HubPhase;
 use licash_contract::opening::{Context, Hub, Trust};
 
-use crate::{Frame, Offer, FOLD, FOLD_SIGN, INSTANCE, MAX_BODY, OPEN, QUOTE, STEP};
+use crate::{Frame, Offer, FOLD, FOLD_CLAIM, FOLD_SIGN, INSTANCE, MAX_BODY, OPEN, QUOTE, STEP};
 use store::Store;
 use terms::{Range, Timing};
 
@@ -107,6 +109,9 @@ pub struct Openings {
     evidencer: std::sync::OnceLock<Arc<Evidencer>>,
     /// Where the responder retires the notes a filing names.
     claims: std::sync::OnceLock<Arc<Claims>>,
+    /// Where a fold finds whether the notes of her claim are open to it,
+    /// and retires them.
+    fold_ledger: std::sync::OnceLock<Arc<FoldLedger>>,
     /// The ledger's lock checkpoints, which new contracts open on.
     checkpoints: std::sync::OnceLock<LockCheckpoints>,
     /// The prover of the hub's statement: none where proofs are the mock
@@ -345,6 +350,7 @@ impl Openings {
             watch: dispute::Watch::default(),
             evidencer: std::sync::OnceLock::new(),
             claims: std::sync::OnceLock::new(),
+            fold_ledger: std::sync::OnceLock::new(),
             checkpoints: std::sync::OnceLock::new(),
             prover: (!trust.mock).then(|| {
                 let before = crate::programs_before(profile);
@@ -629,6 +635,14 @@ impl Openings {
         let _ = self.claims.set(f);
     }
 
+    /// Fold contracts on the claims of their holders from now on, their
+    /// notes read and retired in `ledger`: the hub's. Without, it answers
+    /// a fold that asks a claim paid with 503, and folds only as it
+    /// always did, her reserve alone.
+    pub fn folds_with(&self, ledger: Arc<FoldLedger>) {
+        let _ = self.fold_ledger.set(ledger);
+    }
+
     /// Tell the operator through `f` from now on (the hub's notifications):
     /// its prover is not ready or fails, a claim is answered with no
     /// response for want of it, an assertion's deadline nears unproven.
@@ -803,6 +817,10 @@ pub fn router(openings: Arc<Openings>) -> Router {
         // A holder uploads three at a time: two holders at once.
         .route(INSTANCE, post(instance).layer(budget(6, INSTANCE_TIME)))
         .route(FOLD, post(offer_fold).layer(budget(2, REQUEST_TIME)))
+        .route(
+            FOLD_CLAIM,
+            post(offer_fold_claim).layer(budget(2, REQUEST_TIME)),
+        )
         .route(FOLD_SIGN, post(sign_fold).layer(budget(2, REQUEST_TIME)))
         .layer(DefaultBodyLimit::max(MAX_BODY))
         .with_state(openings)
@@ -904,7 +922,19 @@ async fn offer_fold(
     Ok(openings.offer_fold(&id, &body).await?.encode())
 }
 
-/// Her partial signature on contract `id`'s fold: the fold, broadcast.
+/// Her nonce, the claim she asks paid and its notes, for contract `id`'s
+/// fold: the hub's nonce, and the fee.
+async fn offer_fold_claim(
+    State(openings): State<Arc<Openings>>,
+    UrlPath(id): UrlPath<String>,
+    body: Bytes,
+) -> Result<Vec<u8>, Refused> {
+    let id = crate::parse_id(&id).map_err(Refused::bad)?;
+    Ok(openings.offer_fold_claim(&id, &body).await?.encode())
+}
+
+/// Her partial signature on contract `id`'s fold, with her claim's filing
+/// if she asked it paid: the fold, broadcast.
 async fn sign_fold(
     State(openings): State<Arc<Openings>>,
     UrlPath(id): UrlPath<String>,
@@ -992,6 +1022,7 @@ mod tests {
             watch: dispute::Watch::default(),
             evidencer: std::sync::OnceLock::new(),
             claims: std::sync::OnceLock::new(),
+            fold_ledger: std::sync::OnceLock::new(),
             checkpoints: std::sync::OnceLock::new(),
             prover: None,
             alert: std::sync::OnceLock::new(),

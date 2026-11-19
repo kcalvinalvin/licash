@@ -352,12 +352,26 @@ challenged, it answers with a kept instance. On regtest the proof is the
 mock authority's; on signet the hub proves with `licash-r0` (r0/README.md,
 `LICASH_HP_PROVER` names another), as described below. It sweeps its outputs of each payout to its
 wallet; a payout's rest and the holder's reserve pay each party's wallet
-directly. A holder may close her contract early: at
-`/v1/contracts/openings/{id}/fold` and `.../fold/sign` the hub signs the
-fold with her (MuSig2, its nonce kept in memory and used at most once),
-paying her reserve back and the rest to the hub less the fee at its fee
-rate, and broadcasts it; any key-path spend of a contract output is such a
-fold, and ends the contract. A contract no one exited ends at its close: the hub posts its
+directly. A holder may close her contract early, and be paid her claim in
+the same transaction: she POSTs her nonce, the amount she claims and the
+notes it is made of to `/v1/contracts/openings/{id}/fold/claim`, and the
+hub answers its nonce and its fee at its fee rate if its ledger holds
+nothing against those notes (none spent, none claimed in another claim).
+She then POSTs her partial signature and the filing of her claim (settled
+notes of its keyset alone, worth the amount exactly) to `.../fold/sign`.
+The hub retires the notes in its ledger, all or none, and only then signs
+the fold with her (MuSig2, its nonce kept in memory and used at most once),
+paying her the claim and her reserve back and the rest to the hub less the
+fee, and broadcasts it. A note anything spent is refused, not disputed: no
+dispute follows a fold to cite the spend in. Should a fold not confirm
+after the hub retired the notes, she files the same claim on Bitcoin by a
+forced close, which the hub pays as ever; a contract that ends by its
+default or by a fold that pays no claim leaves them retired, as it leaves
+the claims of any dispute. The same routes without a claim
+(`.../fold` with her nonce alone, `.../fold/sign` with her signature alone)
+fold paying her reserve back only, for the wallets that close that way. Any
+key-path spend of a contract output is such a fold, and ends the contract.
+A contract no one exited ends at its close: the hub posts its
 default, which pays the holder her reserve and the hub its collateral back,
 to its wallet. The fee coins its wallet funds for these transactions are
 kept in `openings.sqlite` before use, and a contract ended 6 blocks deep is

@@ -75,12 +75,18 @@ pub async fn close<T: Transport, C: Chain>(
     let url = |route: &str| format!("{hub}{}", route.replace("{id}", &crate::hex_id(id)));
 
     // Her nonce, of the key both sign with: the fee does not change it.
-    let (sec, mine) = crate::fold(&o.babe, &o.funding, Amount::ZERO)?.nonce(&key, id)?;
+    let (sec, mine) =
+        crate::fold(&o.babe, &o.funding, Amount::ZERO, Amount::ZERO)?.nonce(&key, id)?;
     let offer = post(wallet, hub, &url(FOLD), mine.0.to_vec()).await?;
     let offer = FoldOffer::decode(&offer).context("the hub's fold offer")?;
     // Her output is her reserve, to her wallet, whatever the fee: the hub
     // pays it from its own.
-    let fold = crate::fold(&o.babe, &o.funding, Amount::from_sat(offer.fee))?;
+    let fold = crate::fold(
+        &o.babe,
+        &o.funding,
+        Amount::ZERO,
+        Amount::from_sat(offer.fee),
+    )?;
     let nonces = [mine, PubNonce::from_slice(&offer.nonce)?];
     let partial = fold.sign(&key, sec, &nonces)?;
     let txid = fold.tx.compute_txid();

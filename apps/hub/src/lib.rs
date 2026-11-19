@@ -58,8 +58,16 @@ pub fn answer_from(openings: &licash_contracts::hub::Openings, hub: Arc<Hub>) {
         scanned_for(timed, top, published_at)?;
         Ok(ledger.evidence(claim)?)
     }));
+    let ledger = hub.clone();
     openings.claims_with(Arc::new(move |contract, publication| {
         Ok(hub.retire_claimed(contract, publication)?)
+    }));
+    let reader = ledger.clone();
+    openings.folds_with(Arc::new(licash_contracts::hub::FoldLedger {
+        claimable: Box::new(move |contract, notes| Ok(reader.fold_claimable(contract, notes)?)),
+        retire: Box::new(move |contract, publication| {
+            Ok(ledger.claim_for_fold(contract, publication)?)
+        }),
     }));
 }
 

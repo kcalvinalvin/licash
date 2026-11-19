@@ -10,11 +10,22 @@
 //! the hub's that takes long (funding, checking opened instances) answers
 //! 202 until done: she sends the same message again, and gets the answer.
 //!
-//! Once open, she may close it early with the hub, cooperatively: she
-//! POSTs her MuSig2 nonce for the fold of its output at [`FOLD`], and gets
-//! the hub's [`FoldOffer`]; then her partial signature at [`FOLD_SIGN`],
-//! and gets the fold, signed and broadcast. It pays her reserve back, the
-//! hub the rest less the fee, taken from the hub's share.
+//! Once open, she may close it early with the hub, cooperatively, and be
+//! paid her claim on it: the settled notes she holds at the hub, up to its
+//! cap, as a forced close would claim them. She POSTs her MuSig2 nonce for
+//! the fold of its output, the amount she claims and the notes it is made
+//! of (a [`FoldAsk`]) at [`FOLD_CLAIM`], and gets the hub's [`FoldOffer`],
+//! its answer that it would retire them (none is yet); then her partial
+//! signature and her claim's filing at [`FOLD_SIGN`], and gets the fold,
+//! signed and broadcast. It pays her the claim and her reserve back, the
+//! hub the rest less the fee, taken from the hub's share. The hub retires
+//! the notes of her claim before it signs, and only of notes nothing
+//! spent: should the fold not confirm, she files that claim on Bitcoin.
+//!
+//! Without claim, [`FOLD`] takes her nonce alone and [`FOLD_SIGN`] her
+//! partial signature alone: the fold pays her reserve back and nothing
+//! more. Hubs keep it for wallets that close that way, which no longer
+//! offer to.
 //!
 //! Openings under the mock authority (anyone "proves" anything) are for
 //! regtest only, and say so; on signet they are under the genuine programs
@@ -44,11 +55,15 @@ pub const OPEN: &str = "/v1/contracts/open";
 pub const STEP: &str = "/v1/contracts/openings/{id}";
 /// POST a committed kept instance, as a versioned opening envelope.
 pub const INSTANCE: &str = "/v1/contracts/openings/{id}/instances";
-/// POST her public nonce (66 bytes) for the fold of contract `id`: the
-/// hub's [`FoldOffer`].
+/// POST her public nonce (66 bytes) for the fold of contract `id`, paying
+/// her reserve back alone: the hub's [`FoldOffer`].
 pub const FOLD: &str = "/v1/contracts/openings/{id}/fold";
-/// POST her partial signature (32 bytes) on the fold last offered: the
-/// fold, signed by both and broadcast, in consensus bytes.
+/// POST a [`FoldAsk`] for the fold of contract `id` that pays her claim as
+/// well as her reserve: the hub's [`FoldOffer`], its fee and nonce.
+pub const FOLD_CLAIM: &str = "/v1/contracts/openings/{id}/fold/claim";
+/// POST her partial signature (32 bytes) on the fold last offered, then, of
+/// a fold asked at [`FOLD_CLAIM`], the filing of her claim: the fold,
+/// signed by both and broadcast, in consensus bytes.
 pub const FOLD_SIGN: &str = "/v1/contracts/openings/{id}/fold/sign";
 
 /// The most bytes a request or an answer of an opening holds.
@@ -119,20 +134,63 @@ impl FoldOffer {
     }
 }
 
+/// What a holder asks the hub of a fold that pays her claim ([`FOLD_CLAIM`]):
+/// her nonce, the amount she claims, in units, and the notes it is made of,
+/// each by its identifier. The hub says whether it would retire them; she
+/// files them only with her signature.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FoldAsk {
+    pub nonce: [u8; 66],
+    pub amount: u32,
+    pub notes: Vec<licash::crypto::Point>,
+}
+
+impl FoldAsk {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = Writer(Vec::new());
+        w.bytes(&self.nonce);
+        w.u32(self.amount);
+        w.u16(self.notes.len() as u16);
+        for note in &self.notes {
+            w.bytes(&note.0);
+        }
+        w.0
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut r = Reader(bytes);
+        let nonce = r.array()?;
+        let amount = r.u32()?;
+        let count = usize::from(r.u16()?);
+        if count == 0 || count > licash::claim::MAX_ITEMS {
+            bail!("a claim of {count} notes");
+        }
+        let notes = (0..count)
+            .map(|_| Ok(licash::crypto::Point(r.array()?)))
+            .collect::<Result<Vec<_>>>()?;
+        r.end()?;
+        Ok(Self {
+            nonce,
+            amount,
+            notes,
+        })
+    }
+}
+
 /// The fold of the contract output of `babe`, funded by `funding`: its
-/// cooperative close, paying the holder her reserve back and the hub the
-/// rest less `fee`.
+/// cooperative close, paying the holder `b` of her claim and her reserve
+/// back, the hub the rest less `fee`.
 pub(crate) fn fold(
     babe: &licash_contract::graph::HubProves,
     funding: &bitcoin::Transaction,
+    b: bitcoin::Amount,
     fee: bitcoin::Amount,
 ) -> Result<lichen_contract::Fold> {
     let contract = bitcoin::OutPoint {
         txid: funding.compute_txid(),
         vout: 0,
     };
-    babe.core()
-        .fold(&babe.tree()?, contract, bitcoin::Amount::ZERO, fee)
+    babe.core().fold(&babe.tree()?, contract, b, fee)
 }
 
 /// What a holder POSTs to open: the quote she opens on, and her Open.
@@ -302,6 +360,34 @@ mod tests {
         assert_eq!(FoldOffer::decode(&bytes).unwrap(), offer);
         assert!(FoldOffer::decode(&bytes[..73]).is_err());
         assert!(FoldOffer::decode(&[bytes.as_slice(), &[0]].concat()).is_err());
+    }
+
+    #[test]
+    fn a_fold_ask_reads_as_written_and_nothing_else() {
+        let ask = FoldAsk {
+            nonce: [3; 66],
+            amount: 12,
+            notes: vec![
+                licash::crypto::Point([4; 33]),
+                licash::crypto::Point([5; 33]),
+            ],
+        };
+        let bytes = ask.encode();
+        assert_eq!(bytes.len(), 66 + 4 + 2 + 2 * 33);
+        assert_eq!(FoldAsk::decode(&bytes).unwrap(), ask);
+        assert!(FoldAsk::decode(&bytes[..bytes.len() - 1]).is_err());
+        assert!(FoldAsk::decode(&[bytes.as_slice(), &[0]].concat()).is_err());
+        // Of no notes, or more than a claim holds.
+        let none = FoldAsk {
+            notes: vec![],
+            ..ask.clone()
+        };
+        assert!(FoldAsk::decode(&none.encode()).is_err());
+        let many = FoldAsk {
+            notes: vec![licash::crypto::Point([4; 33]); licash::claim::MAX_ITEMS + 1],
+            ..ask
+        };
+        assert!(FoldAsk::decode(&many.encode()).is_err());
     }
 
     #[test]
