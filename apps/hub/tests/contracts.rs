@@ -1228,6 +1228,258 @@ async fn a_holder_closes_her_contract_early_with_the_hub_and_gets_her_reserve_ba
     Ok(())
 }
 
+/// A holder's wallet of `seed` over `transport` with a contract of a cap of
+/// 5 000 sat at a hub, and three notes of 2 048 there, the hub's largest:
+/// more than its cap, so that a claim of them lets 1 144 sat of their face
+/// value go, as a forced close's does.
+struct Notes<T: licash_wallet::Transport> {
+    rt: Regtest,
+    dir: tempfile::TempDir,
+    url: String,
+    hub: Arc<Hub>,
+    openings: Arc<Openings>,
+    chain: Node,
+    wallet: Wallet<T>,
+    mine: std::path::PathBuf,
+    contract: Contract,
+}
+
+async fn with_notes<T: licash_wallet::Transport>(seed: [u8; 32], transport: T) -> Result<Notes<T>> {
+    let rt = Regtest::start_standard()?;
+    let dir = tempfile::tempdir()?;
+    let at = dir.path().join("hub");
+    let range = Range {
+        max_cap: 50_000_000,
+        max_blocks: 5_000,
+        per_coin: 2,
+        ppm_year: 10_000,
+    };
+    let (url, source, hub, openings) = hub_answering_with(&rt, &at, Some(range)).await?;
+    let chain = Node(source);
+    let (mine, wallet) = holder_wallet_over(
+        &rt,
+        &chain,
+        &dir.path().join("wallet"),
+        &url,
+        seed,
+        &[60_000, 50_000],
+        transport,
+    )
+    .await?;
+    let chosen = Ask {
+        cap: Some(5_000),
+        ..ask()
+    };
+    let contract = holder::open(&wallet, &chain, &mine, &url, chosen).await?;
+    ensure!(contract.cap == 5_000, "{contract:?}");
+    for _ in 0..3 {
+        let payment = pay(&hub, &at.join("seed"), &url, &wallet.address(), 2_048)?;
+        wallet.receive(&payment)?;
+    }
+    rt.mine(1)?;
+    holder::resume(&wallet, &chain, &mine).await?;
+    ensure!(available(&wallet)? == 6_144);
+    Ok(Notes {
+        rt,
+        dir,
+        url,
+        hub,
+        openings,
+        chain,
+        wallet,
+        mine,
+        contract,
+    })
+}
+
+/// Closed early with the hub, a contract is paid her claim by the fold: her
+/// cap in her notes there, and her reserve, on Bitcoin, the notes gone from
+/// her balance and retired in the hub's ledger.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs bitcoind and a release build"]
+async fn a_holder_closes_her_contract_on_her_notes_and_its_fold_pays_them_to_her() -> Result<()> {
+    use bitcoin::FeeRate;
+    use licash_contracts::holder::recovery::{self, Stage};
+
+    let n = with_notes([31; 32], Http::new(None)?).await?;
+    let (rt, wallet, chain, mine) = (&n.rt, &n.wallet, &n.chain, &n.mine);
+    let id = n.contract.id;
+    let before = scan(wallet, chain).await?;
+    let keyset = *n.hub.info().keysets[0].id();
+    let notes = wallet.claimed_notes(&id, &keyset)?;
+    ensure!(notes.is_empty(), "claimed before she closed");
+
+    let txid = holder::close(wallet, chain, mine, &id).await?;
+    // Her notes left her balance and are claimed in a close awaiting its
+    // fold; the contract counts as closed.
+    ensure!(available(wallet)? == 0);
+    let rows = recovery::recoveries(mine)?;
+    ensure!(rows.len() == 1, "{rows:?}");
+    let row = &rows[0];
+    ensure!(
+        row.stage == Stage::Folding && row.irrevocable && (row.claimed, row.notes) == (5_000, 3),
+        "{row:?}"
+    );
+    ensure!(holder::list(mine)?[0].folded == Some(txid));
+    // Asked again with its fold in the mempool: the hub refuses before she
+    // signs another, and nothing of hers changes.
+    let again = holder::close(wallet, chain, mine, &id).await;
+    ensure!(
+        again
+            .as_ref()
+            .is_err_and(|e| format!("{e:#}").contains("spent")),
+        "{again:?}"
+    );
+    ensure!(recovery::recoveries(mine)?[0].stage == Stage::Folding);
+
+    // The hub retired her notes before it signed.
+    let claimed = wallet.claimed_notes(&id, &keyset)?;
+    let ys = (claimed.iter())
+        .map(|c| c.note.message().identifier())
+        .collect::<Result<Vec<_>, _>>()?;
+    ensure!(n.hub.spent(&ys)? == vec![true; 3]);
+
+    rt.mine(1)?;
+    // Her claim and her reserve at her wallet, the rest the hub's less the
+    // fee: her notes' value beyond her cap is not paid.
+    let fold = rt.get_tx(&txid)?;
+    ensure!(fold.output.len() == 2, "{fold:?}");
+    ensure!(fold.output[0].value.to_sat() == 5_000 + 20_000, "{fold:?}");
+    ensure!(scan(wallet, chain).await? == before + 25_000);
+    let rate = FeeRate::from_sat_per_vb(2).context("a rate")?;
+    let done = recovery::advance(wallet, chain, mine, rate).await?;
+    ensure!(
+        done.len() == 1
+            && done[0].stage == Stage::Done
+            && done[0].fold == Some(txid)
+            && done[0].received == Some(25_000)
+            && done[0].claimed == 5_000,
+        "{done:?}"
+    );
+    // Her notes stay out of her balance for good.
+    ensure!(available(wallet)? == 0);
+    // The hub posts no default, now or at the close.
+    let round = n.openings.answer_requests().await?;
+    ensure!(round == Default::default(), "{round:?}");
+    rt.mine(u64::from(n.contract.close_height) - u64::from(rt.height()?) + 1)?;
+    let round = n.openings.answer_requests().await?;
+    ensure!(round == Default::default(), "{round:?}");
+    ensure!(scan(wallet, chain).await? == before + 25_000);
+    Ok(())
+}
+
+/// A note of the claim the hub spent is not paid by a fold, which has no
+/// dispute to cite the spend in: refused before she signs, her notes back
+/// in her balance, her contract open.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs bitcoind and a release build"]
+async fn a_fold_is_refused_on_a_claim_of_a_note_the_hub_spent() -> Result<()> {
+    use licash_contracts::holder::recovery;
+
+    let Notes {
+        rt,
+        dir,
+        url,
+        chain,
+        wallet,
+        mine,
+        contract,
+        ..
+    } = with_notes([32; 32], Http::new(None)?).await?;
+    let id = contract.id;
+
+    // Her wallet as it was, copied; then a note of it paid away.
+    drop(wallet);
+    let stale = dir.path().join("stale");
+    copy_dir(&mine, &stale)?;
+    let wallet = Wallet::open(&mine.join("wallet.sqlite"), Http::new(None)?)?;
+    let bob = licash::address::OwnerKeys::from_seed(&[0xbb; 32])?.address();
+    wallet.send(&url, &bob, 2_048).await?;
+    drop(wallet);
+
+    // The copy claims the note paid away too.
+    let wallet = Wallet::open(&stale.join("wallet.sqlite"), Http::new(None)?)?;
+    ensure!(available(&wallet)? == 6_144);
+    let closed = holder::close(&wallet, &chain, &stale, &id).await;
+    ensure!(
+        closed
+            .as_ref()
+            .is_err_and(|e| format!("{e:#}").contains("spent")),
+        "{closed:?}"
+    );
+    ensure!(available(&wallet)? == 6_144, "notes not given back");
+    ensure!(recovery::recoveries(&stale)?.is_empty());
+    ensure!(holder::list(&stale)?[0].folded.is_none());
+    ensure!(holder::list(&stale)?[0].live(rt.height()?));
+    Ok(())
+}
+
+/// [`Http`], but the request to sign a fold lost: the hub is never told
+/// of her signature, as a hub that took her claim and does not fold.
+struct NoFoldSign(Http);
+
+impl licash_wallet::Transport for NoFoldSign {
+    async fn request(
+        &self,
+        url: &str,
+        body: Option<Vec<u8>>,
+    ) -> Result<licash_wallet::Response, String> {
+        if body.is_some() && url.ends_with("/fold/sign") {
+            return Err("lost".into());
+        }
+        self.0.request(url, body).await
+    }
+}
+
+/// A fold the hub never signs leaves her claim to file: her recovery waits
+/// for the fold, then forces the contract closed on the same notes by
+/// itself, before it is too late, and is paid as a forced close is.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs bitcoind and a release build"]
+async fn a_fold_the_hub_never_signs_gives_way_to_her_request_on_the_same_claim() -> Result<()> {
+    use bitcoin::FeeRate;
+    use licash_contracts::holder::recovery::{self, Stage};
+
+    let n = with_notes([33; 32], NoFoldSign(Http::new(None)?)).await?;
+    let (rt, wallet, chain, mine) = (&n.rt, &n.wallet, &n.chain, &n.mine);
+    let id = n.contract.id;
+    let rate = FeeRate::from_sat_per_vb(2).context("a rate")?;
+
+    let closed = holder::close(wallet, chain, mine, &id).await;
+    ensure!(closed.is_err(), "{closed:?}");
+    let rows = recovery::recoveries(mine)?;
+    ensure!(
+        rows.len() == 1 && rows[0].stage == Stage::Folding && rows[0].irrevocable,
+        "{rows:?}"
+    );
+    ensure!((rows[0].claimed, rows[0].notes) == (5_000, 3), "{rows:?}");
+    ensure!(available(wallet)? == 0);
+
+    // Block by block: waiting for the fold, then her request, the hub's
+    // timeout paying her, the claim she pinned the same.
+    let mut now = rows[0].clone();
+    let mut forced = false;
+    for _ in 0..600 {
+        if now.stage == Stage::Done {
+            break;
+        }
+        rt.mine(1)?;
+        let round = n.openings.answer_requests().await?;
+        ensure!(round.failed == 0, "{round:?}");
+        now = recovery::advance(wallet, chain, mine, rate).await?[0].clone();
+        ensure!(now.stage != Stage::Lost, "{now:?}");
+        forced |= now.stage != Stage::Folding;
+    }
+    ensure!(forced, "never forced closed");
+    ensure!(
+        now.stage == Stage::Done && now.claimed == 5_000 && now.fold.is_none(),
+        "{now:?}"
+    );
+    let swept = rt.get_tx(&now.sweep.context("no sweep")?)?.output[0].value;
+    ensure!(swept.to_sat() > 5_000, "{swept} swept");
+    Ok(())
+}
+
 /// The JSON-RPC of `rt`'s node: of its wallet `wallet`, if any.
 fn rpc_of(rt: &Regtest, wallet: Option<&str>) -> Result<Source> {
     let wallet = wallet.map(|w| format!("/wallet/{w}")).unwrap_or_default();

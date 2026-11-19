@@ -97,9 +97,13 @@ pub enum Stage {
     Challenging,
     Challenged,
     Paid,
+    /// Closed cooperatively on her claim ([`super::fold`]): a fold she
+    /// signed may confirm, paying it. Until then it holds the claim her
+    /// forced close would file, the same.
+    Folding,
 }
 impl Stage {
-    const ALL: [Self; 18] = [
+    const ALL: [Self; 19] = [
         Self::Claiming,
         Self::Claimed,
         Self::Irrevocable,
@@ -118,6 +122,7 @@ impl Stage {
         Self::Challenging,
         Self::Challenged,
         Self::Paid,
+        Self::Folding,
     ];
     pub fn as_str(self) -> &'static str {
         match self {
@@ -139,6 +144,7 @@ impl Stage {
             Self::Challenging => "challenging",
             Self::Challenged => "challenged",
             Self::Paid => "paid",
+            Self::Folding => "folding",
         }
     }
     fn parse(text: &str) -> Result<Self> {
@@ -194,6 +200,10 @@ pub struct Recovery {
     pub challenge: Option<Txid>,
     pub payout: Option<Txid>,
     pub paid_at: Option<u32>,
+    /// The last fold she signed of her claim, and the block it confirmed
+    /// in, once it did ([`Stage::Folding`]).
+    pub fold: Option<Txid>,
+    pub folded_at: Option<u32>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -246,6 +256,17 @@ struct State {
     /// ([`allow_publication_fee`]): absent, what its reserve hands it.
     #[serde(skip_serializing_if = "Option::is_none")]
     p_allowance: Option<u64>,
+    /// The folds she signed of her claim, each by its txid in hex: every
+    /// one pays her the claim and her reserve, and any may confirm, even
+    /// after she forced the close on the same claim. None for a recovery
+    /// that was never a fold: written only by one that was.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    folds: Vec<String>,
+    /// The last fold the hub signed, broadcast again until it is deep.
+    #[serde(with = "consensus", skip_serializing_if = "Option::is_none")]
+    fold: Option<Transaction>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fold_height: Option<u32>,
 }
 impl State {
     fn encode(&self) -> Vec<u8> {
@@ -325,6 +346,26 @@ pub async fn force_close<T: Transport, C: Chain>(
         .is_some_and(|r| r.stage == Stage::GivingUp.as_str())
     {
         finish_giving_up(wallet, &store, id)?;
+    }
+    if let Some(row) = (store.recovery(id)?).filter(|r| r.stage == Stage::Folding.as_str()) {
+        if row.irrevocable {
+            // Closed on her claim, and not folded: the same claim, filed
+            // on Bitcoin by her request. Any fold she signed may still
+            // confirm first, and then pays the same.
+            ensure!(
+                store.save_recovery(
+                    id,
+                    (&row.stage, &row.state),
+                    Stage::Claimed.as_str(),
+                    true,
+                    &row.state
+                )?,
+                "the recovery kept moving on: try again"
+            );
+        } else if store.revoke_recovery(id, Stage::GivingUp.as_str(), Some("a close not signed"))? {
+            // A close that never signed its fold: nothing of hers is spent.
+            finish_giving_up(wallet, &store, id)?;
+        }
     }
     if store.recovery(id)?.is_none() {
         let tip = chain.height().await.map_err(|e| anyhow!(e))?;
@@ -420,6 +461,139 @@ fn finish_giving_up<T: Transport>(wallet: &Wallet<T>, store: &Store, id: &[u8; 3
     store.drop_recovery(id)?;
     Ok(())
 }
+/// The claim a cooperative close folds the contract on ([`super::fold`]).
+pub(super) struct FoldClaim {
+    pub filing: Filing,
+    pub amount: u32,
+    /// The notes it names, each by its identifier.
+    pub notes: Vec<licash::crypto::Point>,
+    /// Taken by this close, not by one before: given back should it not
+    /// go on to sign its fold ([`give_up`]).
+    pub fresh: bool,
+}
+
+/// The rate her recovery's fees are planned at when it is not one of a
+/// forced close: none is spent, only a challenge's coin set aside.
+const FOLD_RATE: u64 = 2;
+
+/// The block from which a fold of contract `id` not seen on Bitcoin gives
+/// way to her request, filing the claim the hub took: the last height her
+/// request may confirm at, less a twelfth of a day (two hours), for it, her
+/// publication and a fee bumped. None of the room a day the exit keeps: a
+/// contract on a chain of fast blocks is shorter than that.
+pub(super) fn fold_by(
+    seed: &[u8; 32],
+    network: licash::spend::ChainProfile,
+    dir: &std::path::Path,
+    id: &[u8; 32],
+    tip: u32,
+) -> Result<u32> {
+    let terms = (0, super::exit::TIMEOUT_SLACK);
+    let safety = super::safety::of_seed(seed, network, dir, id, tip, terms)?;
+    let room = super::exit::blocks_a_day(network) / 12;
+    Ok(safety.request_by.unwrap_or(0).saturating_sub(room))
+}
+
+/// Her notes at the hub of contract `id` taken, so far as it can claim
+/// them, and her claim of them pinned, for its fold to pay: or the claim a
+/// close pinned before, asked again. None if she holds none there. Her
+/// close stays one she may give up, notes back in her balance, until
+/// [`fold_signing`]; refused for a contract being forced closed.
+pub(super) async fn fold_claim<T: Transport, C: Chain>(
+    wallet: &Wallet<T>,
+    chain: &C,
+    dir: &std::path::Path,
+    id: &[u8; 32],
+) -> Result<Option<FoldClaim>> {
+    let store = Store::existing(dir)?.context("no contracts")?;
+    let rate = FeeRate::from_sat_per_vb(FOLD_RATE).expect("a rate");
+    if let Some(row) = store.recovery(id)? {
+        ensure!(
+            row.stage == Stage::Folding.as_str(),
+            "forced closed already: its recovery goes on"
+        );
+        if row.irrevocable {
+            let run = Run::load(wallet, chain, &store, dir, id, rate).await?;
+            return run.claim_of_fold(&State::decode(&row)?).map(Some);
+        }
+        // A close that never signed its fold: its notes back first.
+        ensure!(
+            store.revoke_recovery(id, Stage::GivingUp.as_str(), Some("a close not signed"))?,
+            "closing already: try again in a moment"
+        );
+        finish_giving_up(wallet, &store, id)?;
+    }
+    ensure!(
+        store.start_recovery(
+            id,
+            FORMAT,
+            Stage::Folding.as_str(),
+            &State::default().encode()
+        )?,
+        "closing already: try again in a moment"
+    );
+    let run = Run::load(wallet, chain, &store, dir, id, rate).await?;
+    match run.take_for_fold().await {
+        Ok(Some(claim)) => Ok(Some(claim)),
+        Ok(None) => {
+            store.drop_recovery(id)?;
+            Ok(None)
+        }
+        Err(e) => {
+            run.give_back(&format!("{e:#}"))?;
+            Err(e)
+        }
+    }
+}
+
+/// Her fold of the claim of contract `id`, `txid`, kept before her partial
+/// signature leaves: the hub may sign and broadcast it from then on, so her
+/// close is past giving up, and the contract counts as closed for good.
+/// Refused once the recovery was given up or moved on.
+pub(super) fn fold_signing(store: &Store, id: &[u8; 32], txid: &Txid) -> Result<()> {
+    let row = store.recovery(id)?.context("the close was given up")?;
+    ensure!(
+        row.stage == Stage::Folding.as_str(),
+        "the contract's recovery moved on: {}",
+        row.stage
+    );
+    let mut state = State::decode(&row)?;
+    let hex = txid.to_string();
+    if !state.folds.contains(&hex) {
+        state.folds.push(hex);
+    }
+    ensure!(
+        store.save_recovery(
+            id,
+            (&row.stage, &row.state),
+            Stage::Folding.as_str(),
+            true,
+            &state.encode()
+        )?,
+        "the close kept moving on: try again"
+    );
+    store.fold(id, txid)
+}
+
+/// The fold the hub signed, kept to be broadcast again until it is deep.
+/// Not an error to fail: it is looked for on the chain all the same.
+pub(super) fn fold_signed(store: &Store, id: &[u8; 32], fold: &Transaction) -> Result<()> {
+    let row = store.recovery(id)?.context("no recovery")?;
+    if row.stage != Stage::Folding.as_str() {
+        return Ok(());
+    }
+    let mut state = State::decode(&row)?;
+    state.fold = Some(fold.clone());
+    store.save_recovery(
+        id,
+        (&row.stage, &row.state),
+        Stage::Folding.as_str(),
+        true,
+        &state.encode(),
+    )?;
+    Ok(())
+}
+
 fn list(store: &Store) -> Result<Vec<Recovery>> {
     Ok(store
         .recoveries()?
@@ -448,10 +622,13 @@ fn view(row: &RecoveryRow) -> Result<Recovery> {
         claimed: state.amount as u64,
         corrected: state.reduced.map(u64::from),
         received: if stage == Stage::Done {
+            // Her sweep's output, or of a fold, the claim and her reserve
+            // as it paid them.
             Some(
                 state
                     .sweep
                     .as_ref()
+                    .or_else(|| state.fold_height.and(state.fold.as_ref()))
                     .and_then(|t| t.output.first())
                     .map_or(0, |o| o.value.to_sat()),
             )
@@ -476,6 +653,8 @@ fn view(row: &RecoveryRow) -> Result<Recovery> {
         challenge: txid(&state.challenge),
         payout: txid(&state.payout),
         paid_at: state.payout_height,
+        fold: txid(&state.fold),
+        folded_at: state.fold_height,
     })
 }
 
@@ -540,6 +719,12 @@ impl<'a, T: Transport, C: Chain> Run<'a, T, C> {
             let row = self.store.recovery(&self.id)?.context("given up")?;
             let stage = Stage::parse(&row.stage)?;
             ensure!(stage != Stage::GivingUp, "given up");
+            if stage == Stage::Folding && !row.irrevocable {
+                // A close that did not sign its fold before it stopped:
+                // nothing of hers is spent, and her notes come back.
+                self.give_back("a close that did not finish")?;
+                return Ok(());
+            }
             let mut state = State::decode(&row)?;
             let tip = self.chain.height().await.map_err(|e| anyhow!(e))?;
             if let Some(stood) = self.reorganized(stage, tip).await? {
@@ -575,6 +760,7 @@ impl<'a, T: Transport, C: Chain> Run<'a, T, C> {
                 Stage::TimingOut | Stage::Succeeding => self.finishing(&mut state, tip).await?,
                 Stage::TimedOut | Stage::Paid => self.sweep(&mut state, tip)?,
                 Stage::Sweeping => self.swept(&mut state, tip).await?,
+                Stage::Folding => self.folding(&mut state, tip).await?,
                 Stage::Done | Stage::Lost | Stage::GivingUp => Next::Wait,
             };
             let to = match next {
@@ -847,6 +1033,11 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
             first_spend(self.chain, coin, &p.prevout.script_pubkey, from..=tip).await?
         {
             if tx.compute_txid() != p.tx.compute_txid() {
+                // A fold she signed of this claim, confirmed after all:
+                // her notes are paid for, not given back.
+                if !state.folds.is_empty() {
+                    return self.folded(state, &tx, height, tip);
+                }
                 let why = format!(
                     "its collateral is spent already, by {}: closed otherwise",
                     tx.compute_txid()
@@ -1153,6 +1344,12 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
                     state.r = Some(tx);
                     state.r_height = Some(height);
                 }
+                // A fold she signed of this claim confirmed before her
+                // request: it pays the claim, and her publication is moot.
+                Some((height, tx)) if !state.folds.is_empty() => {
+                    let _ = self.wallet.abandon_silent(&p.compute_txid());
+                    return self.folded(state, &tx, height, tip);
+                }
                 Some((_, tx)) => {
                     let _ = self.wallet.abandon_silent(&p.compute_txid());
                     self.trouble(format!("collateral went to {} instead", tx.compute_txid()));
@@ -1392,6 +1589,7 @@ fn watched(stage: Stage) -> bool {
             | Stage::Irrevocable
             | Stage::Signing
             | Stage::GivingUp
+            | Stage::Folding
             | Stage::Done
             | Stage::Lost
     )
@@ -2123,6 +2321,158 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
     }
 }
 
+/// Her close on a fold of her claim ([`Stage::Folding`]).
+impl<T: Transport, C: Chain> Run<'_, T, C> {
+    /// Her notes taken as a forced close would take them, her contract's
+    /// slot alone, the claim of them filed and pinned: settled notes only,
+    /// the locks left to a forced close. None if the wallet holds none.
+    async fn take_for_fold(&self) -> Result<Option<FoldClaim>> {
+        // The close it falls back to must be one she can make.
+        self.o.forcible()?;
+        let parts = self.o.base.parts();
+        let slot = self.own_slot()?;
+        let notes = self.wallet.claim_notes(&self.id, &[slot])?;
+        self.took.store(!notes.is_empty(), Ordering::SeqCst);
+        if notes.is_empty() {
+            return Ok(None);
+        }
+        let held: u64 = (notes.iter())
+            .map(|n| n.note.message().denomination())
+            .sum();
+        let mut state = State {
+            amount: parts.cap.min(u32::try_from(held).unwrap_or(u32::MAX)),
+            ..State::default()
+        };
+        let filing = self.filing(&notes, &[], state.amount)?;
+        state.notes = notes.iter().map(|n| hex::encode(n.to_bytes())).collect();
+        state.filing = Some(hex::encode(filing.to_bytes()));
+        let row = self.store.recovery(&self.id)?.context("given up")?;
+        ensure!(
+            self.store.save_recovery(
+                &self.id,
+                (&row.stage, &row.state),
+                Stage::Folding.as_str(),
+                false,
+                &state.encode()
+            )?,
+            "the close kept moving on: try again"
+        );
+        let mut claim = self.claim_of_fold(&state)?;
+        claim.fresh = true;
+        Ok(Some(claim))
+    }
+
+    /// The claim pinned in `state`.
+    fn claim_of_fold(&self, state: &State) -> Result<FoldClaim> {
+        let filing = self.filing_of(state)?;
+        let notes = (filing.publication().claim().parts().items.iter())
+            .map(|item| item.message().identifier())
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(FoldClaim {
+            filing,
+            amount: state.amount,
+            notes,
+            fresh: false,
+        })
+    }
+
+    /// The slot her contract claims in, its own: a fold takes what it can
+    /// of her notes, not leaving them to the others she holds there.
+    fn own_slot(&self) -> Result<ClaimSlot> {
+        let all = self.store.list()?;
+        let this = (all.iter().find(|c| c.id == self.id)).context("a contract not stored")?;
+        let mut terms = std::collections::HashMap::new();
+        terms.insert(self.id, ClaimTerms::of(&self.o));
+        (claims::claim_slots([this], &terms).into_iter().next()).context("a contract with no slot")
+    }
+
+    /// What the fold of her claim pays her: its first output, her claim and
+    /// her reserve, to her wallet. The fee comes of the hub's share.
+    fn fold_output(&self, state: &State) -> Result<TxOut> {
+        let b = Amount::from_sat(u64::from(state.amount) * self.o.base.parts().graph.unit_sats);
+        let fold = crate::fold(&self.o.babe, &self.o.funding, b, Amount::ZERO)?;
+        fold.tx
+            .output
+            .first()
+            .cloned()
+            .context("a fold of no output")
+    }
+
+    /// The block from which a fold not seen on Bitcoin gives way to her
+    /// request. The hub holds her claim's notes retired: filing it is all
+    /// that pays her then.
+    fn force_at(&self, tip: u32) -> Result<u32> {
+        let seed = self.wallet.contract_secrets().seed;
+        fold_by(&seed, self.wallet.network(), self.dir, &self.id, tip)
+    }
+
+    /// Her contract's collateral still unspent: the hub folds it, or the
+    /// claim is filed on Bitcoin at the block a forced close is planned
+    /// for, before the contract's default would pay the hub all.
+    async fn folding(&self, state: &mut State, tip: u32) -> Result<Next> {
+        let p = presign(&self.o.set, "request")?;
+        let coin = p.tx.input[0].previous_output;
+        let f_height = match state.f_height {
+            Some(height) => height,
+            None => confirmed_at(
+                self.chain,
+                coin.txid,
+                &p.prevout.script_pubkey,
+                self.since..=tip,
+            )
+            .await?
+            .context("F in no block")?,
+        };
+        state.f_height = Some(f_height);
+        let from = state.from.unwrap_or(f_height);
+        if let Some((height, tx)) =
+            first_spend(self.chain, coin, &p.prevout.script_pubkey, from..=tip).await?
+        {
+            return self.folded(state, &tx, height, tip);
+        }
+        state.from = Some(rescan(from, tip));
+        if tip.saturating_add(1) >= self.force_at(tip)? {
+            self.trouble(
+                "the hub did not fold her contract in time: her claim is filed on Bitcoin".into(),
+            );
+            return Ok(Next::To(Stage::Claimed));
+        }
+        // Signed by both: broadcast again, as it may have left the mempool.
+        if let Some(fold) = &state.fold {
+            self.broadcast(fold).await;
+        }
+        Ok(Next::Save)
+    }
+
+    /// Her contract's collateral spent by `tx`, mined at `height`, while
+    /// she held a claim of notes the hub retired: the fold of her claim if
+    /// it pays what she claimed, else her notes are paid for by none. Done
+    /// once as deep as F had to be.
+    fn folded(&self, state: &mut State, tx: &Transaction, height: u32, tip: u32) -> Result<Next> {
+        let p = presign(&self.o.set, "request")?;
+        let coin = p.tx.input[0].previous_output;
+        let key_path = tx
+            .input
+            .first()
+            .is_some_and(|i| i.previous_output == coin && i.witness.len() == 1);
+        if !key_path || tx.output.first() != Some(&self.fold_output(state)?) {
+            self.trouble(format!(
+                "her contract's collateral went to {}, which does not pay what she claimed",
+                tx.compute_txid()
+            ));
+            return Ok(Next::To(Stage::Lost));
+        }
+        state.fold = Some(tx.clone());
+        state.from = Some(height);
+        if !deep(height, tip, self.o.base.parts().chain.funding_depth) {
+            return Ok(Next::Save);
+        }
+        state.fold_height = Some(height);
+        state.next_at = None;
+        Ok(Next::To(Stage::Done))
+    }
+}
+
 fn blocks(sequence: Sequence) -> Result<u32> {
     match sequence.to_relative_lock_time() {
         Some(bitcoin::relative::LockTime::Blocks(h)) => Ok(h.value() as u32),
@@ -2254,6 +2604,37 @@ mod tests {
         assert!(State::decode(&row).is_err());
         row.state = vec![];
         assert!(State::decode(&row).is_err());
+    }
+    #[test]
+    fn a_fold_is_written_only_once_signed_so_a_forced_close_reads_as_before() {
+        let row = |stage: Stage, state: Vec<u8>| RecoveryRow {
+            id: [1; 32],
+            format: FORMAT,
+            stage: stage.as_str().into(),
+            irrevocable: true,
+            error: None,
+            state,
+            created_at: 0,
+        };
+        // None of its fields in a recovery that was never a fold: a build
+        // before this one reads it, and one of before reads as none.
+        let plain = String::from_utf8(State::default().encode()).unwrap();
+        for key in ["folds", "fold", "fold_height"] {
+            assert!(!plain.contains(&format!("\"{key}\"")), "{plain}");
+        }
+        let old = row(Stage::Claimed, br#"{"amount":5}"#.to_vec());
+        let state = State::decode(&old).unwrap();
+        assert!(state.folds.is_empty() && state.fold.is_none() && state.fold_height.is_none());
+        // One of a fold keeps what it signed, read again as written.
+        let signed = State {
+            amount: 5_000,
+            folds: vec!["ab".repeat(32), "cd".repeat(32)],
+            fold_height: Some(100),
+            ..State::default()
+        };
+        let back = State::decode(&row(Stage::Folding, signed.encode())).unwrap();
+        assert_eq!((back.amount, back.fold_height), (5_000, Some(100)));
+        assert_eq!(back.folds, signed.folds);
     }
     #[test]
     fn a_publication_fee_allowed_is_written_only_once_set() {

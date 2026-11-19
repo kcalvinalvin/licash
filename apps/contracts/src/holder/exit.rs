@@ -167,7 +167,8 @@ pub enum Step {
     CashingOut,
     /// A payout from its hub under way: waited for.
     Paying,
-    /// Paid out, closed early with its hub: her reserve back.
+    /// Paid out, closed early with its hub: her reserve back, and any
+    /// notes left (a fold claims them).
     Folding,
     /// Not paid out in time: forced closed.
     ForceClosing,
