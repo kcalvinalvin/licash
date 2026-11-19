@@ -436,6 +436,12 @@ async fn used(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     ensure!(next.address != code.address, "paid at, and shown again");
     ensure!(next.silent == code.silent, "another silent payment address");
 
+    let bob = eco.wallet("bob")?;
+    bob.add_hub(hub).await?;
+    let bobs = bob.payment_code(&[hub.to_owned()], false)?;
+    // Check refusals before later payments build up enough notes to optimize.
+    refused(eco, phone, &bobs).await?;
+
     // Paid at its silent payment address: found and moved in too.
     eco.pay_silent(&silent.to_string(), 20_000).await?;
     eco.mine(1).await?;
@@ -450,9 +456,6 @@ async fn used(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     silently(phone, &silent.to_string()).await?;
 
     // It pays Bob at the hub, an amount it enters, to his mailbox.
-    let bob = eco.wallet("bob")?;
-    bob.add_hub(hub).await?;
-    let bobs = bob.payment_code(&[hub.to_owned()], false)?;
     phone.link(&bobs.to_string()).await?;
     // Typed straight in: the field has the focus, untouched.
     until("the amount to type in", 10, || async {
@@ -520,7 +523,6 @@ async fn used(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     lightning(eco, phone).await?;
     paid_through_provider(eco, phone).await?;
     donated(eco, phone).await?;
-    refused(eco, phone, &bobs).await?;
     hub_down(eco, phone, &bob, &bobs).await?;
     found_hubs(phone).await?;
     cashed_out(eco, phone).await?;
