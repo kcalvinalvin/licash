@@ -90,6 +90,11 @@ pub const NOTES_REFUSED: &str = "her notes";
 /// notes issued, the hub's [`FundedIssued`]; 409 until it issues them.
 pub const FUNDED: &str = "/v1/contracts/openings/{id}/funded";
 
+/// Blocks after a contract's `close_height` at which the deposit that its
+/// default pays her reserve to times out, and she may take the coins back
+/// herself: some two weeks, in which she must come back for her notes.
+pub const CLOSE_BLOCKS: u32 = 2_016;
+
 /// The most bytes a request or an answer of an opening holds.
 pub const MAX_BODY: usize = 64 << 20;
 

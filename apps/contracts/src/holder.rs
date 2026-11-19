@@ -244,6 +244,27 @@ async fn open_once<T: Transport, C: Chain>(
         0 => None,
         _ => Some(funded_notes(wallet, &offer.quote, funded)?),
     };
+    // Her reserve returns at the close to a deposit of the hub's that swaps
+    // it for notes, not to a coin of hers that the close would link to her
+    // wallet: the hub holds her to its fee, and she takes the coins back
+    // herself if she never comes for the notes. It needs her part funded,
+    // which the hub issues her as notes too.
+    let close = match (now.deposits, funded) {
+        (Some(_), funded) if funded > 0 => {
+            let timeout = wanted
+                .close_height
+                .checked_add(crate::CLOSE_BLOCKS)
+                .context("the close deposit's timeout overflows")?;
+            let reserve = offer.quote.graph.reserve_alice;
+            let deposit = wallet.close_deposit(&hub, reserve, timeout).await;
+            let deposit = deposit.map_err(|e| anyhow!("{hub}'s deposit for her reserve: {e}"))?;
+            Some(licash_contract::wire::CloseOffer {
+                script: deposit.script,
+                fee: deposit.fee,
+            })
+        }
+        _ => None,
+    };
     let secrets = wallet.contract_secrets();
     let start = Start {
         seed: secrets.seed,
@@ -257,6 +278,7 @@ async fn open_once<T: Transport, C: Chain>(
         wanted,
         checkpoint,
         funded: funded_notes,
+        close,
     };
     let ctx = licash_contract::opening::Context { tip, trust };
     let (holder, outs) = Holder::start(start, &ctx)?;
