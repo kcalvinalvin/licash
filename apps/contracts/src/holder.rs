@@ -990,6 +990,7 @@ mod tests {
             fee: 3_000,
             ppm_year: 20_000,
             ppm_year_funded: 0,
+            year_blocks: licash_api::YEAR_BLOCKS,
         };
         let wide: Vec<u64> = (0..32).map(|i| 1 << i).collect();
         let most = |cap, coin| most_funded(&range, (cap, 52_560), coin, (&wide, 32));
@@ -1228,23 +1229,26 @@ mod tests {
     #[cfg(feature = "node")]
     #[test]
     fn her_deadlines_leave_each_window_whole_on_the_hubs_terms() {
-        use crate::hub::terms::{Timing, LOCK};
+        use crate::hub::terms::Timing;
         let keyset = licash::note::IssuerKeys::from_seed(&[1; 32], 0, 4).unwrap();
         let keyset = keyset.keyset().unwrap();
         let regtest = ChainProfile::Core30DefaultRegtest;
         let signet = ChainProfile::Core30Signet;
+        let mutinynet = ChainProfile::Mutinynet;
         // At the floor's work and at the most a hub asks beyond it.
         let deepest = |profile| {
             let floor = licash_contract::opening::Floors::of(profile).work_depth;
             let timing = Timing::of(profile, None).unwrap();
             (timing.with_work_depth(floor + crate::hub::terms::MAX_EXTRA_WORK)).unwrap()
         };
-        let timings = [regtest, signet].into_iter().flat_map(|profile| {
-            [
-                (profile, Timing::of(profile, None).unwrap()),
-                (profile, deepest(profile)),
-            ]
-        });
+        let timings = [regtest, signet, mutinynet]
+            .into_iter()
+            .flat_map(|profile| {
+                [
+                    (profile, Timing::of(profile, None).unwrap()),
+                    (profile, deepest(profile)),
+                ]
+            });
         for (profile, timing) in timings {
             let checkpoint = Checkpoint::genesis(profile).unwrap();
             let tip = checkpoint.height();
@@ -1254,7 +1258,7 @@ mod tests {
                 quote,
             };
             offer.quote.check(profile).unwrap();
-            let wanted = wanted(&offer, tip, LOCK).unwrap();
+            let wanted = wanted(&offer, tip, timing.lock()).unwrap();
             offer.bounds.check(&wanted, tip).unwrap();
             let (g, c) = (&offer.quote.graph, &offer.quote.chain);
             let window = u32::from(wanted.response_window);
@@ -1273,7 +1277,8 @@ mod tests {
             assert!(window > u32::from(g.publication_window) + 1, "{profile}");
         }
         // Regtest's as before; signet's 180 blocks after asserting, of
-        // its 1 000, and 12 to respond.
+        // its 1 000, and 12 to respond; Mutinynet's the same blocks, of
+        // its 1 912.
         let gap = |profile| {
             let timing = Timing::of(profile, None).unwrap();
             let quote = timing.quote(keyset.clone(), Checkpoint::genesis(profile).unwrap());
@@ -1281,9 +1286,8 @@ mod tests {
         };
         assert_eq!(gap(regtest), (AFTER_ASSERT, 2));
         assert_eq!(gap(signet), (180, 12));
-        for profile in [ChainProfile::Core30Mainnet, ChainProfile::Mutinynet] {
-            assert!(Timing::of(profile, None).is_err());
-        }
+        assert_eq!(gap(mutinynet), (180, 12));
+        assert!(Timing::of(ChainProfile::Core30Mainnet, None).is_err());
     }
 
     /// Of terms she chose within the hub's range, the fewest blocks it
@@ -1305,6 +1309,7 @@ mod tests {
         for profile in [
             ChainProfile::Core30DefaultRegtest,
             ChainProfile::Core30Signet,
+            ChainProfile::Mutinynet,
         ] {
             let timing = Timing::of(profile, Some(range)).unwrap();
             let r = timing.range().unwrap();

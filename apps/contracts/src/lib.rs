@@ -317,16 +317,20 @@ impl Frame {
 }
 
 /// Who a party of an opening on `profile` trusts for proofs: the mock
-/// authority on regtest, labeled as such; on signet the genuine programs
-/// [`SIGNET`], under RISC Zero's shared Groth16 setup. None elsewhere yet.
+/// authority on regtest, labeled as such; on signet and Mutinynet the
+/// genuine programs [`SIGNET`], under RISC Zero's shared Groth16 setup.
+/// None elsewhere yet.
 ///
-/// Signet's are a trial: its headers are checked by their work alone, not
-/// by the network's signature of each block, so headers that fool the
-/// programs cost little to make.
+/// The signets' are a trial: their headers are checked by their work alone,
+/// not by the network's signature of each block, so headers that fool the
+/// programs cost little to make. One program serves both: it reads the
+/// profile of the checkpoint it is given (Mutinynet's retargets every
+/// 40 320 blocks), which its proof binds, so that a proof for one network
+/// is none for the other.
 pub fn trust(profile: ChainProfile) -> Result<Trust> {
     match profile {
         ChainProfile::Core30DefaultRegtest => Ok(Trust::mock()),
-        ChainProfile::Core30Signet => Ok(Trust {
+        ChainProfile::Core30Signet | ChainProfile::Mutinynet => Ok(Trust {
             program: SIGNET,
             mock: false,
             compact: SIGNET_COMPACT,
@@ -336,7 +340,7 @@ pub fn trust(profile: ChainProfile) -> Result<Trust> {
     }
 }
 
-/// The genuine program contracts open under on signet, as built by
+/// The genuine program contracts open under on signet and Mutinynet, as built by
 /// `r0/build-guest.sh` with the toolchains it pins, from the commit
 /// `r0/README.md` names. Each program contracts opened under is kept as
 /// `r0/programs/<image id>.bin`: the contracts opened under one are
@@ -357,7 +361,7 @@ pub const SIGNET_COMPACT: bool = true;
 /// quote a graph of id [`licash::recovery::LEAN_FROM`] only when it is.
 pub const SIGNET_LEAN: bool = true;
 
-/// The programs signet contracts opened under before [`SIGNET`], newest
+/// The programs signet's (and Mutinynet's) contracts opened under before [`SIGNET`], newest
 /// first: no contract opens under them, those that did are played still.
 /// `a2458fdb…` decides the compact filing and not the lean one (graph id
 /// 10 on): its contracts, of graph id 9, file the compact one.
@@ -383,7 +387,7 @@ pub const SIGNET_BEFORE: [[u8; 32]; 6] = [
 /// open under now ([`trust`]): played still.
 pub fn programs_before(profile: ChainProfile) -> &'static [[u8; 32]] {
     match profile {
-        ChainProfile::Core30Signet => &SIGNET_BEFORE,
+        ChainProfile::Core30Signet | ChainProfile::Mutinynet => &SIGNET_BEFORE,
         _ => &[],
     }
 }
@@ -521,13 +525,17 @@ mod tests {
     #[test]
     fn mock_proofs_are_for_regtest_only() {
         assert!(trust(ChainProfile::Core30DefaultRegtest).unwrap().mock);
-        // Signet's are genuine; none elsewhere yet.
-        let signet = trust(ChainProfile::Core30Signet).unwrap();
-        assert!(!signet.mock);
-        assert_eq!(signet.program, SIGNET);
-        for profile in [ChainProfile::Core30Mainnet, ChainProfile::Mutinynet] {
-            assert!(trust(profile).is_err());
+        // The signets' are genuine, and one program's; none elsewhere yet.
+        for profile in [ChainProfile::Core30Signet, ChainProfile::Mutinynet] {
+            let trusted = trust(profile).unwrap();
+            assert!(!trusted.mock);
+            assert_eq!(trusted.program, SIGNET);
+            assert_eq!(
+                (trusted.compact, trusted.lean),
+                (SIGNET_COMPACT, SIGNET_LEAN)
+            );
         }
+        assert!(trust(ChainProfile::Core30Mainnet).is_err());
     }
 
     #[test]
@@ -542,12 +550,13 @@ mod tests {
 
     #[test]
     fn contracts_of_the_programs_before_are_played_but_none_opens_under_them() {
-        let signet = ChainProfile::Core30Signet;
-        assert!(plays(signet, &SIGNET));
-        for before in SIGNET_BEFORE {
-            assert!(plays(signet, &before) && before != SIGNET);
+        for signet in [ChainProfile::Core30Signet, ChainProfile::Mutinynet] {
+            assert!(plays(signet, &SIGNET));
+            for before in SIGNET_BEFORE {
+                assert!(plays(signet, &before) && before != SIGNET);
+            }
+            assert!(!plays(signet, &[9; 32]));
         }
-        assert!(!plays(signet, &[9; 32]));
         assert!(plays(ChainProfile::Core30DefaultRegtest, &[9; 32]));
         assert!(!plays(ChainProfile::Core30Mainnet, &SIGNET));
     }

@@ -2688,7 +2688,7 @@ async fn a_force_close_claims_a_lock_paying_her_once_activated_at_depth() -> Res
     // Not yet near its expiry: nothing done.
     let kept = activation::keep(&bob, &chain, &mine.join("wallet.sqlite"), rate).await?;
     ensure!(kept.is_empty(), "{kept:?}");
-    let lead = activation::lead(ChainProfile::Core30DefaultRegtest);
+    let lead = activation::lead();
     rt.mine_to_height(expiry - lead)?;
     let kept = activation::keep(&bob, &chain, &mine.join("wallet.sqlite"), rate).await?;
     ensure!(kept.len() == 1 && kept[0].step == "activated", "{kept:?}");
@@ -2834,7 +2834,7 @@ async fn an_activation_whose_block_leaves_the_chain_is_found_again_and_claimed()
     ensure!(bob.claim(&url, &lock.id, &preimage).await.is_err());
     let depth = bob.owed_locks()?[0].depth;
 
-    let lead = activation::lead(ChainProfile::Core30DefaultRegtest);
+    let lead = activation::lead();
     rt.mine_to_height(expiry - lead)?;
     let kept = activation::keep(&bob, &chain, &mine.join("wallet.sqlite"), rate).await?;
     ensure!(kept.len() == 1 && kept[0].step == "activated", "{kept:?}");
@@ -3751,7 +3751,7 @@ async fn a_providers_keeper_opens_the_first_contract_at_a_hub_where_told_to() ->
         max_price: Some(30_000),
         open_cap: Some(131_071),
         scan: true,
-        ..Settings::new(regtest, 0, 0, "open-contract {hub}".into())
+        ..Settings::new(0, 0, "open-contract {hub}".into())
     };
     let mut keeper = Keeper::new(provider.clone(), Node(source), mine.clone(), settings);
     let limited = |most: u64| Some(HashMap::from([(url.clone(), most)]));
@@ -4008,7 +4008,7 @@ async fn a_providers_keeper_holds_its_intake_to_its_contracts_and_replaces_them(
         successor_lead: lead,
         max_price: Some(30_000),
         scan: true,
-        ..Settings::new(regtest, 0, 0, "open-contract {hub}".into())
+        ..Settings::new(0, 0, "open-contract {hub}".into())
     };
     let chain = Node(source.clone());
     let mut keeper = Keeper::new(provider.clone(), Node(source), mine.clone(), settings);
@@ -4208,7 +4208,7 @@ async fn a_force_close_claims_a_deposit_its_hub_kept_once_activated_at_depth() -
     ensure!(hub.locked(&owed[0].id)?.own);
     let (expiry, depth) = (owed[0].expiry, owed[0].depth);
 
-    let lead = activation::lead(ChainProfile::Core30DefaultRegtest);
+    let lead = activation::lead();
     rt.mine_to_height(expiry - lead)?;
     followed(&hub, &source, &deposits).await?;
     let kept = activation::keep(&bob, &chain, &mine.join("wallet.sqlite"), rate).await?;

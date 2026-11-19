@@ -20,7 +20,6 @@ use std::{
 
 use anyhow::{anyhow, Result};
 use bitcoin::FeeRate;
-use licash::spend::ChainProfile;
 use licash_contracts::holder::{
     self,
     recovery::{self, Stage},
@@ -28,15 +27,6 @@ use licash_contracts::holder::{
 };
 use licash_swaps::Provider;
 use licash_wallet::{Blocks as _, PayoutState, Transport};
-
-/// Blocks a day on `network`: Mutinynet's every 30 seconds, as the
-/// wallet apps count them.
-pub fn blocks_a_day(network: ChainProfile) -> u32 {
-    match network {
-        ChainProfile::Mutinynet => 2_880,
-        _ => 144,
-    }
-}
 
 /// When the keeper acts on a live contract.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -338,7 +328,8 @@ pub struct Settings {
     /// to confirm ([`safety::of`]).
     pub exit_margin: u32,
     pub timeout_slack: u32,
-    /// Blocks a day on its chain ([`blocks_a_day`]).
+    /// Blocks it counts as a day, the same on every network
+    /// ([`holder::exit::DAY`]).
     pub day: u32,
     /// Blocks from a contract's successor opening to its `claim_at`.
     pub successor_lead: u32,
@@ -362,19 +353,14 @@ pub struct Settings {
 }
 
 impl Settings {
-    /// On `network`, every hub the provider's wallet knows kept, with
-    /// `exit_days` for a forced close to play out in and a successor opened
-    /// `successor_days` before its predecessor's safe deadline, each a
-    /// day of its blocks; told to open a first contract at a hub with
-    /// `open_hint`. Its successors cost a quarter more than their
-    /// predecessors at most, it drains nothing, and looks for no coins.
-    pub fn new(
-        network: ChainProfile,
-        exit_days: u32,
-        successor_days: u32,
-        open_hint: String,
-    ) -> Self {
-        let day = blocks_a_day(network);
+    /// Every hub the provider's wallet knows kept, with `exit_days` for a
+    /// forced close to play out in and a successor opened `successor_days`
+    /// before its predecessor's safe deadline, each [`holder::exit::DAY`]
+    /// blocks; told to open a first contract at a hub with `open_hint`. Its
+    /// successors cost a quarter more than their predecessors at most, it
+    /// drains nothing, and looks for no coins.
+    pub fn new(exit_days: u32, successor_days: u32, open_hint: String) -> Self {
+        let day = holder::exit::DAY;
         Self {
             hubs: None,
             exit_margin: exit_days.saturating_mul(day),
@@ -1181,6 +1167,7 @@ mod tests {
             fee: 3_000,
             ppm_year: 10_000,
             ppm_year_funded: 0,
+            year_blocks: licash_api::YEAR_BLOCKS,
         };
         assert_eq!(
             Sizes::of(range, 1_000_000),
@@ -1251,8 +1238,17 @@ mod tests {
         let d = Deadlines::new(None, DAY, LEAD);
         assert_eq!((d.claim_at, d.renew_at), (0, 0));
         assert_eq!(Deadlines::new(Some(100), DAY, LEAD).renew_at, 0);
-        assert_eq!(blocks_a_day(ChainProfile::Mutinynet), 2_880);
-        assert_eq!(blocks_a_day(ChainProfile::Core30Signet), 144);
+    }
+
+    #[test]
+    fn a_day_is_the_same_blocks_on_every_network() {
+        // Counted in blocks, Mutinynet's too: its quicker blocks are for
+        // its tests to meet reorganizations with.
+        let settings = Settings::new(2, 1, String::new());
+        assert_eq!(
+            (settings.day, settings.exit_margin, settings.successor_lead),
+            (DAY, 2 * DAY, DAY)
+        );
     }
 
     #[test]

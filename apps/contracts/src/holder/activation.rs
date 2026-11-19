@@ -24,7 +24,7 @@ use licash::spend::ProposalId;
 use licash_contract::opening::{Context, Holder};
 use licash_wallet::{LockClaim, OwedLock, Transport, Wallet};
 
-use super::exit::{self, blocks_a_day};
+use super::exit;
 use super::store::Store;
 use super::Chain;
 
@@ -36,10 +36,11 @@ const MAX_BLOCK_BYTES: usize = 4_000_000;
 const ACTIVATION_VB: u64 = 160;
 
 /// Blocks before a lock's expiry its activation is made from, its hub not
-/// having paid it: about two hours, for it to confirm in at the rate of a
-/// forced close, rebroadcast each round.
-pub fn lead(network: licash::spend::ChainProfile) -> u32 {
-    (blocks_a_day(network) / 12).max(6)
+/// having paid it: 12 (two hours of Bitcoin's), for it to confirm in at the rate of a
+/// forced close, rebroadcast each round. Counted in blocks, the same on
+/// every network.
+pub fn lead() -> u32 {
+    (exit::DAY / 12).max(6)
 }
 
 /// What a round did of an owed lock ([`keep`]).
@@ -136,7 +137,7 @@ async fn step<T: Transport, C: Chain>(
         return Ok(None);
     };
     let script = ScriptBuf::from_bytes(activation_script(&o.preimage));
-    let lead = lead(wallet.network());
+    let lead = lead();
     let last = o.expiry.saturating_sub(1);
     let spends = wallet.silent_spends_paying(&script)?;
     if let Some(first) = spends.first() {

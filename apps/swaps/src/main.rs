@@ -262,7 +262,6 @@ impl ContractArgs {
         })?;
         let wallet = data.join("wallet.sqlite");
         let settings = keeper::Settings::new(
-            network,
             self.contract_exit_days,
             self.contract_successor_days,
             format!(
@@ -1237,6 +1236,11 @@ fn show(data: &Path, args: licash_dashboard::Args, url: Option<String>) -> anyho
         format!("http://{}", listen.as_deref().unwrap_or("127.0.0.1:8340"))
     });
     let probe = licash_dashboard::Probe::new(&url, licash_swaps_service::HEALTH)?;
+    // Blocks are told in the time of the provider's network's.
+    let network = open(data, Http::new(None)?, Config::default())?
+        .wallet()
+        .network();
+    licash_dashboard::set_block_seconds(network.block_seconds());
     let data = data.to_owned();
     args.run(move || licash_swaps_service::dashboard::report(&data, Some(&probe)))
 }

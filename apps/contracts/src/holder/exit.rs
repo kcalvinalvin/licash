@@ -33,13 +33,12 @@ pub const FLOOR: u64 = 1_000;
 /// Blocks allowed for a timeout to confirm, as the apps plan with.
 pub const TIMEOUT_SLACK: u32 = 6;
 
-/// Blocks a day on `network`: Mutinynet's every 30 seconds.
-pub fn blocks_a_day(network: ChainProfile) -> u32 {
-    match network {
-        ChainProfile::Mutinynet => 2_880,
-        _ => 144,
-    }
-}
+/// Blocks the exit counts as a day: Bitcoin's, on every network. Its
+/// margins are counted in blocks, so that a test network's quicker blocks
+/// (Mutinynet's, 20 times as quick) leave it as little time as mainnet's
+/// do; what a count of blocks takes is said by
+/// [`ChainProfile::blocks_a_day`].
+pub const DAY: u32 = 144;
 
 /// Her consent to exit contracts ending.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -140,7 +139,7 @@ pub(super) fn planned_force_at(
 ) -> Result<u32> {
     let margin = consent(wallet_file)?.map_or(0, |c| c.exit_margin);
     let s = safety::of_seed(seed, network, wallet_file, id, tip, (margin, TIMEOUT_SLACK))?;
-    Ok(deadlines(s.request_by.unwrap_or(0), blocks_a_day(network)).1)
+    Ok(deadlines(s.request_by.unwrap_or(0), DAY).1)
 }
 
 /// Revoke her consent: no step more is taken. Those under way go on.
@@ -285,7 +284,6 @@ pub async fn drive<T: Transport, C: Chain>(
     ensure!(tip > 0, "no chain height");
     let consent = consent(wallet_file)?;
     let margin = consent.as_ref().map_or(exit_margin, |c| c.exit_margin);
-    let day = blocks_a_day(wallet.network());
     let recovering: HashSet<[u8; 32]> = store.recoveries()?.iter().map(|r| r.id).collect();
     let live: Vec<Contract> = (store.list()?.into_iter())
         .filter(|c| c.live(tip) && !recovering.contains(&c.id))
@@ -293,7 +291,7 @@ pub async fn drive<T: Transport, C: Chain>(
     let mut due = HashMap::new();
     for c in &live {
         let s = safety::of(wallet, wallet_file, &c.id, tip, margin, TIMEOUT_SLACK)?;
-        due.insert(c.id, deadlines(s.request_by.unwrap_or(0), day));
+        due.insert(c.id, deadlines(s.request_by.unwrap_or(0), DAY));
     }
     let balance = wallet.balance()?;
     let payouts = wallet.payouts()?;

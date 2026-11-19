@@ -1,6 +1,19 @@
 //! How values read, alike in every panel.
 
+use std::sync::atomic::{AtomicI64, Ordering};
+
 use crate::series::Unit;
+
+/// The seconds a block takes on the chain the service follows, which the
+/// time of a count of blocks is told in.
+static BLOCK_SECONDS: AtomicI64 = AtomicI64::new(600);
+
+/// Tell the time of blocks at `seconds` a block, as the service's chain has
+/// them (600 on Bitcoin's, 30 on Mutinynet's): set once, as the dashboard
+/// starts, from the network of the service it shows.
+pub fn set_block_seconds(seconds: u32) {
+    BLOCK_SECONDS.store(i64::from(seconds.max(1)), Ordering::Relaxed);
+}
 
 /// `value` with commas between thousands: `-12,345`.
 pub fn grouped(value: i64) -> String {
@@ -158,12 +171,18 @@ pub fn when(at: i64, now: i64) -> String {
     }
 }
 
-/// Blocks from now with the time they take: `144 · ~1d`, `3 past`.
+/// Blocks from now with the time they take ([`set_block_seconds`]):
+/// `144 · ~1d`, `3 past`.
 pub fn blocks(blocks: i64) -> String {
+    blocks_at(blocks, BLOCK_SECONDS.load(Ordering::Relaxed))
+}
+
+/// [`blocks`], of blocks of `seconds` each.
+pub fn blocks_at(blocks: i64, seconds: i64) -> String {
     if blocks < 0 {
         format!("{} past", grouped(-blocks))
     } else {
-        format!("{} · ~{}", grouped(blocks), span(blocks * 600))
+        format!("{} · ~{}", grouped(blocks), span(blocks * seconds))
     }
 }
 
@@ -346,6 +365,10 @@ mod tests {
         assert_eq!(blocks(144), "144 · ~24h");
         assert_eq!(blocks(1_008), "1,008 · ~7d");
         assert_eq!(blocks(-3), "3 past");
+        // The same blocks on Mutinynet's, 30 seconds each.
+        assert_eq!(blocks_at(144, 30), "144 · ~1h");
+        assert_eq!(blocks_at(2_880, 30), "2,880 · ~24h");
+        assert_eq!(blocks_at(-3, 30), "3 past");
     }
 
     #[test]

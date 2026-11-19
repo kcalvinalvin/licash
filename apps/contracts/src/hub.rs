@@ -493,7 +493,7 @@ impl Openings {
     /// quote of `cap` sat over `blocks` she chose, if within its terms,
     /// else its fixed one; `funded` sat of it hers, the rest the hub's.
     pub async fn offer(&self, chosen: Option<(u32, u32)>, funded: u32) -> Result<Offer, Refused> {
-        let (cap, blocks) = chosen.unwrap_or((terms::CAP, terms::LOCK));
+        let (cap, blocks) = chosen.unwrap_or((terms::CAP, self.timing().lock()));
         self.timing().allows(cap, blocks).map_err(Refused::bad)?;
         if funded > cap {
             return Err(Refused::bad(format!(
@@ -536,9 +536,9 @@ impl Openings {
         });
         licash_api::Contracts {
             cap: terms::CAP,
-            price: timing.price(terms::CAP, terms::LOCK, 0),
+            price: timing.price(terms::CAP, timing.lock(), 0),
             reserve: terms::RESERVE_ALICE,
-            blocks: terms::LOCK,
+            blocks: timing.lock(),
             mock: self.trust.mock,
             range,
         }

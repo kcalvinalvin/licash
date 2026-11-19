@@ -139,8 +139,12 @@ impl Floors {
         let (challenge_window, publication_window, to_self_delay, funding_depth, work_depth) =
             match profile {
                 ChainProfile::Core30DefaultRegtest => (6, 6, 6, 1, 1),
-                ChainProfile::Core30Mainnet | ChainProfile::Core30Signet => (144, 6, 144, 3, 6),
-                ChainProfile::Mutinynet => (2880, 24, 2880, 6, 24),
+                // Counted in blocks, the same on every network that is not
+                // regtest: Mutinynet's blocks are 20 times as quick, which
+                // is for its tests to meet reorganizations with.
+                ChainProfile::Core30Mainnet
+                | ChainProfile::Core30Signet
+                | ChainProfile::Mutinynet => (144, 6, 144, 3, 6),
             };
         // Mainnet: 10 sat/vB, so that a forced close of the filing at its
         // widest gets confirmed in a fee market short of a spike. A bug or

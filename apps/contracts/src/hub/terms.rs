@@ -108,6 +108,9 @@ pub struct Timing {
     /// The fewest blocks a contract chosen lasts: her deadlines leave
     /// time to recover in after a quote a few blocks old.
     min_blocks: u32,
+    /// The blocks the fixed terms last ([`LOCK`] where the proof's window
+    /// is signet's).
+    lock: u32,
     /// The terms holders may choose, if any.
     range: Option<Range>,
     /// The step of the hub's surcharge: its fee, of its fixed terms and
@@ -127,25 +130,33 @@ impl Timing {
     /// signet, the least its floors allow ([`Quote::check`]), a day to
     /// answer and to wait, 3 blocks deep, and 12 blocks at least to
     /// respond to a request, for the publication to confirm 3 deep in
-    /// them. None elsewhere yet. Holders choose their terms within
-    /// `range`, if any, the fixed terms among them.
+    /// them. Mutinynet's are signet's, counted in blocks as on every network
+    /// but regtest, but for what its quicker blocks cannot hold: the hub's
+    /// proof takes as long in hours as on signet, so its assert window is
+    /// 20 times the blocks ([`assert_window`]), and the fewest blocks a
+    /// contract lasts and the fixed terms' as many more. None elsewhere
+    /// yet. Holders choose their terms within `range`, if any, the fixed
+    /// terms among them.
     pub fn of(profile: ChainProfile, range: Option<Range>) -> Result<Self> {
-        let (challenge_window, to_self_delay, depth, response_window, min_blocks) = match profile {
-            ChainProfile::Core30DefaultRegtest => (6, 6, 1, 2, 200),
-            // Four days: her deadlines 180 blocks before the close, her
-            // day to contest a response before them.
-            ChainProfile::Core30Signet => (144, 144, 3, 12, 576),
-            // Mainnet waits for windows set from a measured proof time and
-            // a real proof played on Bitcoin; its hub reserve must then
-            // cover the hub's answer to a challenge at some 25 sat/vB,
-            // about 520 000 sat, not RESERVE_HUB's 100 000. And her reserve
-            // must afford a forced close of the widest filing at its floor
-            // (`licash_contract::reserve::reserve_for`: some 162 000 sat at
-            // 10 sat/vB, the hub's at least twice that, her purse being at
-            // most half of it), not RESERVE_ALICE's 20 000: quotes below
-            // the floor are refused (`Quote::check`).
-            _ => bail!("the hub offers no contracts on {profile} yet"),
-        };
+        let (challenge_window, to_self_delay, depth, response_window, min_blocks, lock) =
+            match profile {
+                ChainProfile::Core30DefaultRegtest => (6, 6, 1, 2, 200, LOCK),
+                // Four days: her deadlines 180 blocks before the close, her
+                // day to contest a response before them.
+                ChainProfile::Core30Signet => (144, 144, 3, 12, 576, LOCK),
+                // Signet's, and the 912 blocks more its assert window has.
+                ChainProfile::Mutinynet => (144, 144, 3, 12, 576 + 912, LOCK + 912),
+                // Mainnet waits for windows set from a measured proof time and
+                // a real proof played on Bitcoin; its hub reserve must then
+                // cover the hub's answer to a challenge at some 25 sat/vB,
+                // about 520 000 sat, not RESERVE_HUB's 100 000. And her reserve
+                // must afford a forced close of the widest filing at its floor
+                // (`licash_contract::reserve::reserve_for`: some 162 000 sat at
+                // 10 sat/vB, the hub's at least twice that, her purse being at
+                // most half of it), not RESERVE_ALICE's 20 000: quotes below
+                // the floor are refused (`Quote::check`).
+                _ => bail!("the hub offers no contracts on {profile} yet"),
+            };
         if let Some(r) = range {
             ensure!(
                 (CAP..=MAX_CAP).contains(&r.max_cap),
@@ -153,8 +164,8 @@ impl Timing {
                 r.max_cap
             );
             ensure!(
-                r.max_blocks >= LOCK,
-                "contracts of {} blocks at most: not {LOCK} at least",
+                r.max_blocks >= lock,
+                "contracts of {} blocks at most: not {lock} at least",
                 r.max_blocks
             );
             ensure!(r.per_coin >= 1, "a contract's cap of no times her coin");
@@ -170,6 +181,7 @@ impl Timing {
             depth,
             response_window,
             min_blocks,
+            lock,
             range,
             step: 0,
             work_depth: Floors::of(profile).work_depth,
@@ -240,6 +252,7 @@ impl Timing {
             fee: OPENING_FEE * u64::from(self.surcharge()),
             ppm_year: r.ppm_year.saturating_mul(self.surcharge()),
             ppm_year_funded: r.ppm_year_funded.saturating_mul(self.surcharge()),
+            year_blocks: self.profile.blocks_a_year(),
         })
     }
 
@@ -249,13 +262,14 @@ impl Timing {
         self.range().unwrap_or(licash_api::ContractRange {
             min_cap: CAP,
             max_cap: CAP,
-            min_blocks: LOCK,
-            max_blocks: LOCK,
+            min_blocks: self.lock,
+            max_blocks: self.lock,
             per_coin: 1,
             reserve: RESERVE_ALICE,
             fee: OPENING_FEE * u64::from(self.surcharge()),
             ppm_year: 0,
             ppm_year_funded: 0,
+            year_blocks: self.profile.blocks_a_year(),
         })
     }
 
@@ -263,11 +277,14 @@ impl Timing {
     /// fixed terms, or terms within the hub's range, its cap one of the
     /// sizes ([`licash_api::sizes`]).
     pub fn allows(&self, cap: u32, blocks: u32) -> Result<()> {
-        if (cap, blocks) == (CAP, LOCK) {
+        if (cap, blocks) == (CAP, self.lock) {
             return Ok(());
         }
         let Some(range) = self.range() else {
-            bail!("the hub offers contracts of {CAP} sat over {LOCK} blocks only");
+            bail!(
+                "the hub offers contracts of {CAP} sat over {} blocks only",
+                self.lock
+            );
         };
         ensure!(
             (range.min_cap..=range.max_cap).contains(&cap) && licash_api::is_size(cap),
@@ -336,7 +353,13 @@ impl Timing {
     }
 
     pub fn quote(&self, keyset: Keyset, checkpoint: Checkpoint) -> Quote {
-        self.quote_for(keyset, checkpoint, CAP, LOCK, 0)
+        self.quote_for(keyset, checkpoint, CAP, self.lock, 0)
+    }
+
+    /// The blocks the fixed terms last: [`LOCK`], and the blocks more its
+    /// proof's window has where that is longer than signet's.
+    pub fn lock(&self) -> u32 {
+        self.lock
     }
 
     /// The id of the graphs it quotes: those of the compact filing if the
@@ -428,9 +451,12 @@ impl Timing {
 /// assertion confirmed. Regtest's proof is the mock authority's, made at
 /// once; elsewhere `hp-prove` took about 3.4 hours on a CPU (some 21
 /// signet blocks), so 48 leave as many again for a slow prover or blocks.
+/// Mutinynet's blocks come 20 times as quick, and a proof takes the hours
+/// it takes: 960. It is the one window counted in time, not in blocks.
 fn assert_window(profile: ChainProfile) -> u16 {
     match profile {
         ChainProfile::Core30DefaultRegtest => 12,
+        ChainProfile::Mutinynet => 960,
         _ => 48,
     }
 }
@@ -520,6 +546,7 @@ mod tests {
         for profile in [
             ChainProfile::Core30DefaultRegtest,
             ChainProfile::Core30Signet,
+            ChainProfile::Mutinynet,
         ] {
             let trust = crate::trust(profile).unwrap();
             let timing = Timing::of(profile, None).unwrap();
@@ -640,7 +667,8 @@ mod tests {
                 assert_eq!(range.price(cap, blocks, funded), RESERVE_ALICE + fee);
             }
             let chosen = at.quote_for(keyset.clone(), checkpoint.clone(), 16_777_215, 26_280, 0);
-            let interest = licash_api::rate(10_000 * m as u32, 16_777_215, 26_280);
+            let year = licash_api::YEAR_BLOCKS;
+            let interest = licash_api::rate(10_000 * m as u32, 16_777_215, 26_280, year);
             assert_eq!(chosen.fees.opening_fee_quote, OPENING_FEE * m + interest);
         }
         // Step 0, the quote as it always was.
@@ -659,6 +687,7 @@ mod tests {
         for profile in [
             ChainProfile::Core30DefaultRegtest,
             ChainProfile::Core30Signet,
+            ChainProfile::Mutinynet,
         ] {
             let timing = Timing::of(profile, Some(RANGE)).unwrap();
             let floor = Floors::of(profile).work_depth;
@@ -739,5 +768,56 @@ mod tests {
             per_coin: 0,
             ..RANGE
         }));
+    }
+
+    /// Mutinynet's terms are signet's blocks but for its proof's window,
+    /// which is counted in time: 960 of its blocks are as many hours as
+    /// signet's 48, and the fixed contract and the shortest chosen are as
+    /// many blocks longer. Its interest counts a year of its own blocks.
+    #[test]
+    fn mutinynets_terms_are_signets_in_blocks_but_for_the_proofs_window_and_its_year() {
+        let parts = Hub::peek(funded()).unwrap().base.parts().clone();
+        let (keyset, checkpoint) = (parts.keyset, parts.chain.checkpoint);
+        let signet = Timing::of(ChainProfile::Core30Signet, Some(RANGE)).unwrap();
+        let mutinynet = Timing::of(ChainProfile::Mutinynet, Some(RANGE)).unwrap();
+        let (s, m) = (
+            signet.quote(keyset.clone(), checkpoint.clone()),
+            mutinynet.quote(keyset, checkpoint),
+        );
+        m.check(ChainProfile::Mutinynet).unwrap();
+        let windows = |q: &Quote| {
+            let (g, c) = (&q.graph, &q.chain);
+            let (challenge, delay) = (g.challenge_window, g.to_self_delay);
+            (challenge, delay, g.publication_window, c.funding_depth)
+        };
+        assert_eq!(windows(&m), windows(&s));
+        assert_eq!((s.graph.assert_window, m.graph.assert_window), (48, 960));
+        assert!(
+            f64::from(mutinynet.proof_blocks()) * 30.0 >= f64::from(signet.proof_blocks()) * 600.0
+        );
+        let longer = 960 - 48;
+        assert_eq!(mutinynet.lock(), signet.lock() + longer);
+        let (a, b) = (signet.range().unwrap(), mutinynet.range().unwrap());
+        assert_eq!(b.min_blocks, a.min_blocks + longer);
+        assert_eq!((a.year_blocks, b.year_blocks), (52_560, 1_051_200));
+        for timing in [&signet, &mutinynet] {
+            let range = timing.range().unwrap();
+            assert!(timing.allows(CAP, timing.lock()).is_ok());
+            assert!(timing.allows(CAP, range.min_blocks).is_ok());
+            assert!(timing.allows(CAP, range.min_blocks - 1).is_err());
+        }
+        // The same half year of interest, in 20 times the blocks.
+        assert_eq!(
+            a.fee(16_777_215, 26_280, 0),
+            b.fee(16_777_215, 26_280 * 20, 0)
+        );
+        assert!(Timing::of(
+            ChainProfile::Mutinynet,
+            Some(Range {
+                max_blocks: mutinynet.lock() - 1,
+                ..RANGE
+            })
+        )
+        .is_err());
     }
 }

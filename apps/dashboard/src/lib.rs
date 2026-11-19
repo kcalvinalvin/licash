@@ -35,7 +35,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 
-pub use format::{fee, fee_share, grouped, span};
+pub use format::{fee, fee_share, grouped, set_block_seconds, span};
 pub use page::{
     Better, Card, Cell, Check, Column, Measure, Page, Panel, Ref, Row, Table, Tone, Value,
 };

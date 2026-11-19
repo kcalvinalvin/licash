@@ -692,7 +692,7 @@ const FOLD_RATE: u64 = 2;
 
 /// The block from which a fold of contract `id` not seen on Bitcoin gives
 /// way to her request, filing the claim the hub took: the last height her
-/// request may confirm at, less a twelfth of a day (two hours), for it, her
+/// request may confirm at, less a twelfth of a day's blocks (12), for it, her
 /// publication and a fee bumped. None of the room a day the exit keeps: a
 /// contract on a chain of fast blocks is shorter than that.
 pub(super) fn fold_by(
@@ -704,7 +704,7 @@ pub(super) fn fold_by(
 ) -> Result<u32> {
     let terms = (0, super::exit::TIMEOUT_SLACK);
     let safety = super::safety::of_seed(seed, network, wallet_file, id, tip, terms)?;
-    let room = super::exit::blocks_a_day(network) / 12;
+    let room = super::exit::DAY / 12;
     Ok(safety.request_by.unwrap_or(0).saturating_sub(room))
 }
 

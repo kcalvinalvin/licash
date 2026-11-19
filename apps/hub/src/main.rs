@@ -178,7 +178,8 @@ struct Chain {
     /// Let holders choose a contract's cap up to this many sat, taken
     /// down to a size (2^n - 1 sat, 131 071 the least), and how long it
     /// lasts up to `--contracts-max-blocks`, besides the fixed terms
-    /// (131 071 sat over 1 000 blocks). By default, the fixed terms only.
+    /// (131 071 sat over 1 000 blocks, 1 912 on Mutinynet). By default, the
+    /// fixed terms only.
     #[arg(
         long = "contracts-max-cap",
         value_name = "SAT",
@@ -187,7 +188,7 @@ struct Chain {
     )]
     contracts_max_cap: Option<u32>,
     /// The most blocks a contract a holder chooses lasts, with
-    /// `--contracts-max-cap`.
+    /// `--contracts-max-cap`: the fixed terms' at least (1 912 on Mutinynet).
     #[arg(
         long = "contracts-max-blocks",
         value_name = "BLOCKS",
@@ -208,8 +209,8 @@ struct Chain {
     )]
     contracts_per_coin: u32,
     /// What a contract costs over the fixed price, in millionths of the
-    /// part of its cap the hub funds for each year (52 560 blocks) it
-    /// lasts, with `--contracts-max-cap`: 10 000 is 1% a year.
+    /// part of its cap the hub funds for each year it lasts (52 560
+    /// blocks, Mutinynet's 1 051 200), with `--contracts-max-cap`: 10 000 is 1% a year.
     #[arg(
         long = "contracts-rate",
         value_name = "PPM",
@@ -837,12 +838,11 @@ impl SwapsArgs {
     }
 
     /// The keeper of the contracts of `provider`, whose files are in `dir`,
-    /// on `chain` of `network`, protecting the notes of the hubs `from`.
+    /// on `chain`, protecting the notes of the hubs `from`.
     fn keeper(
         &self,
         provider: &Arc<Provider<Http>>,
         chain: Source,
-        network: ChainProfile,
         dir: &Path,
         from: &[Capped],
     ) -> Keeper<Http> {
@@ -852,7 +852,6 @@ impl SwapsArgs {
             wallet.display()
         );
         let settings = keeper::Settings::new(
-            network,
             self.swaps_contract_exit_days,
             self.swaps_contract_successor_days,
             hint,
@@ -981,6 +980,10 @@ enum Command {
         /// and `LICASH_HUB_LISTEN`, or 127.0.0.1:8338].
         #[arg(long)]
         url: Option<String>,
+        /// The hub's network, for the time blocks take: bitcoin, regtest,
+        /// signet or mutinynet.
+        #[arg(long, env = "LICASH_HUB_NETWORK", default_value_t = ChainProfile::Core30Mainnet)]
+        network: ChainProfile,
     },
     /// Resume the Lightning payments out the hub paused on finding notes
     /// retired that its ledger never issued, beside the running hub (which
@@ -1301,9 +1304,8 @@ fn command(cli: Cli) -> anyhow::Result<()> {
                         swap_provider(&swaps_dir, *profile, config, issuer, transport, cli.log)?;
                     let provider = Arc::new(provider);
                     // Before it serves: nothing is taken in unprotected.
-                    let keeper = swaps_protected.then(|| {
-                        swaps.keeper(&provider, source.clone(), *profile, &swaps_dir, &from)
-                    });
+                    let keeper = swaps_protected
+                        .then(|| swaps.keeper(&provider, source.clone(), &swaps_dir, &from));
                     let notifier = match swaps_targets.is_empty() {
                         true => None,
                         false => {
@@ -1389,7 +1391,11 @@ fn command(cli: Cli) -> anyhow::Result<()> {
         Command::TestNotify { notify } => test_notify(&notify),
         Command::Status { json, details } => status(&db, json, details),
         Command::ResumePayouts => resume_payouts(&cli.data),
-        Command::Dashboard { dashboard, url } => show(&cli.data, dashboard, url),
+        Command::Dashboard {
+            dashboard,
+            url,
+            network,
+        } => show(&cli.data, network, dashboard, url),
         Command::Events {
             after,
             limit,
@@ -1911,7 +1917,14 @@ async fn shutdown() {
     tracing::info!("stopping: finishing the requests in flight");
 }
 
-fn show(data: &Path, args: licash_dashboard::Args, url: Option<String>) -> anyhow::Result<()> {
+fn show(
+    data: &Path,
+    network: ChainProfile,
+    args: licash_dashboard::Args,
+    url: Option<String>,
+) -> anyhow::Result<()> {
+    // Blocks are told in the time of its network's.
+    licash_dashboard::set_block_seconds(network.block_seconds());
     let url = url.unwrap_or_else(|| {
         let listen = std::env::var("LICASH_HUB_LISTEN");
         format!("http://{}", listen.as_deref().unwrap_or("127.0.0.1:8338"))

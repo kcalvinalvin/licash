@@ -158,10 +158,7 @@ pub(super) fn input_cycles(bytes: &[u8], graph: u32) -> u64 {
 
 /// The target time between blocks of `profile`, in seconds.
 pub(super) fn spacing(profile: ChainProfile) -> f64 {
-    match profile {
-        ChainProfile::Mutinynet => 30.0,
-        _ => 600.0,
-    }
+    f64::from(profile.block_seconds())
 }
 
 /// A proof to plan: the last tip at which it must exist (its assertion
