@@ -1339,6 +1339,68 @@ fn a_note_claimed_in_one_contract_is_cited_against_its_claim_in_another() {
 }
 
 #[test]
+fn a_fold_retires_the_notes_of_its_claim_once_and_for_the_same_claim_only() {
+    let files = files();
+    let hub = open(&files, Policy::default());
+    let (_, keyset) = issuer(&files);
+    let (alice, bob) = (owner(1), owner(2));
+    let (a, b) = (mint(&files, &alice, 8), mint(&files, &alice, 4));
+    let ys: Vec<_> = [&a, &b]
+        .iter()
+        .map(|c| c.note.message().identifier().unwrap())
+        .collect();
+    let contract = [1; 32];
+    let claim = filed([7; 32], &keyset, &[&a, &b]);
+    // Asking retires nothing.
+    hub.fold_claimable(&contract, &ys).unwrap();
+    assert_eq!(hub.spent(&ys).unwrap(), [false, false]);
+    hub.claim_for_fold(&contract, &claim).unwrap();
+    assert_eq!(hub.spent(&ys).unwrap(), [true, true]);
+    // The same claim again, as after a fold that never confirmed: the same.
+    hub.fold_claimable(&contract, &ys).unwrap();
+    hub.claim_for_fold(&contract, &claim).unwrap();
+    // Not by a spend any longer, nor by another claim of them.
+    let late = Spend::new(&keyset, std::slice::from_ref(&a), &[(bob.address(), 8)]);
+    assert_eq!(refused(late.offer(&hub)), Refusal::Spent);
+    assert_eq!(
+        refused(hub.claim_for_fold(&[2; 32], &filed([9; 32], &keyset, &[&a]))),
+        Refusal::Spent
+    );
+    assert_eq!(refused(hub.fold_claimable(&[2; 32], &ys)), Refusal::Spent);
+    // Nor by a different claim in the same contract.
+    assert_eq!(
+        refused(hub.claim_for_fold(&contract, &filed([9; 32], &keyset, &[&a]))),
+        Refusal::Spent
+    );
+    // The claim on Bitcoin of the same claim is not cited against itself.
+    assert!(hub.evidence(claim.claim()).unwrap().is_empty());
+}
+
+#[test]
+fn a_fold_refuses_a_claim_of_a_spent_note_and_retires_none_of_it() {
+    let files = files();
+    let hub = open(&files, Policy::default());
+    let (_, keyset) = issuer(&files);
+    let (alice, bob) = (owner(1), owner(2));
+    let (spent, kept) = (mint(&files, &alice, 8), mint(&files, &alice, 4));
+    let kept_y = kept.note.message().identifier().unwrap();
+    let spend = Spend::new(&keyset, std::slice::from_ref(&spent), &[(bob.address(), 8)]);
+    spend.complete(&hub, &keyset);
+    let ys = [spent.note.message().identifier().unwrap(), kept_y];
+    let contract = [1; 32];
+    assert_eq!(refused(hub.fold_claimable(&contract, &ys)), Refusal::Spent);
+    assert_eq!(
+        refused(hub.claim_for_fold(&contract, &filed([7; 32], &keyset, &[&spent, &kept]))),
+        Refusal::Spent
+    );
+    // All or nothing: the note it did not spend is free still.
+    assert_eq!(hub.spent(&[kept_y]).unwrap(), [false]);
+    hub.claim_for_fold(&contract, &filed([7; 32], &keyset, &[&kept]))
+        .unwrap();
+    assert_eq!(hub.spent(&[kept_y]).unwrap(), [true]);
+}
+
+#[test]
 fn a_ledger_of_the_first_schema_is_read_and_upgraded_once_its_hub_opens() {
     let files = files();
     let hub = open(&files, Policy::default());
