@@ -1942,7 +1942,8 @@ mod tests {
         }
         let mut other = default.clone();
         assert!(
-            ho.seal(h.keys(), &mut other, &[fee.clone()]).is_err(),
+            ho.seal(h.keys(), &mut other, std::slice::from_ref(&fee))
+                .is_err(),
             "not a slot's spend"
         );
         // Bitcoin accepts a digit of 15 written as 16 (the script clamps it
