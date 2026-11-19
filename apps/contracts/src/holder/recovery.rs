@@ -332,7 +332,13 @@ pub struct Recovery {
     /// in, once it did ([`Stage::Folding`]).
     pub fold: Option<Txid>,
     pub folded_at: Option<u32>,
+    /// Her publication held back by the fee it may pay: more allowed
+    /// with [`allow_publication_fee`] gets it on.
+    pub fee_capped: bool,
 }
+
+/// What every refusal for want of a publication fee she allows names.
+const ALLOW_FEE: &str = "allow-publication-fee";
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -848,6 +854,7 @@ fn view(row: &RecoveryRow) -> Result<Recovery> {
         swept_at: state.swept_height,
         next_at: state.next_at,
         error: row.error.clone(),
+        fee_capped: !stage.over() && (row.error.as_deref()).is_some_and(|e| e.contains(ALLOW_FEE)),
         response: txid(&state.response),
         deadline: state.deadline,
         proved: state.verified == Some(true),
@@ -1539,7 +1546,7 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
             ensure!(
                 fee <= limit,
                 "her publication would pay {fee} in fees, more than the {limit} {}: \
-                 allow more with `licash-wallet allow-publication-fee {} <sat>`",
+                 allow more with `licash-wallet {ALLOW_FEE} {} <sat>`",
                 match allowance {
                     Some(_) => "she allowed",
                     None => "its reserve holds",
@@ -1833,7 +1840,7 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
             let pinnable = p.input[0].witness.nth(0).is_some_and(|s| s.len() == 65);
             self.trouble(format!(
                 "her publication {} is in no block, {} blocks left to it, paying {paid} of the \
-                 {limit} it may: allow more with `licash-wallet allow-publication-fee {} <sat>`{}",
+                 {limit} it may: allow more with `licash-wallet {ALLOW_FEE} {} <sat>`{}",
                 p.compute_txid(),
                 end.saturating_sub(tip),
                 crate::hex_id(&self.id),
@@ -3263,6 +3270,31 @@ mod tests {
             created_at: 0,
         };
         assert_eq!(State::decode(&row).unwrap().p_allowance, Some(40_000));
+    }
+    #[test]
+    fn a_recovery_held_back_by_its_publication_fee_says_so_while_not_over() {
+        let row = |stage: Stage, error: Option<&str>| RecoveryRow {
+            id: [1; 32],
+            format: FORMAT,
+            stage: stage.as_str().into(),
+            irrevocable: true,
+            error: error.map(str::to_owned),
+            state: State::default().encode(),
+            created_at: 0,
+        };
+        let capped = format!("her publication would pay 9 in fees, more than the 8: allow more with `licash-wallet {ALLOW_FEE} 00 <sat>`");
+        assert!(
+            view(&row(Stage::Published, Some(&capped)))
+                .unwrap()
+                .fee_capped
+        );
+        assert!(
+            !view(&row(Stage::Published, Some("offline")))
+                .unwrap()
+                .fee_capped
+        );
+        assert!(!view(&row(Stage::Published, None)).unwrap().fee_capped);
+        assert!(!view(&row(Stage::Lost, Some(&capped))).unwrap().fee_capped);
     }
     #[test]
     fn a_rewind_forgets_what_she_saw_above_the_block_that_stood_and_keeps_what_she_signed() {
