@@ -357,7 +357,12 @@ pub fn check_with(
         Some(input.invalid),
         mark,
     )?;
-    verdict(&owed, read.b2, read.disclosed.as_deref())?;
+    verdict(
+        &owed,
+        read.b2,
+        read.disclosed.as_deref(),
+        Format::of(&input.base).lean(),
+    )?;
     licash_statement::holds(&contract(&input.base), &read, owed.owed).map_err(|_| Refusal::Owed)
 }
 
@@ -365,9 +370,9 @@ pub fn check_with(
 /// claim is owed: the response disclosed what its evidence uses, and the
 /// claim is owed at most `b2`. The statement's own test of a response, which
 /// a holder makes too before she lets one stand ([`bears_out`]).
-pub fn verdict(owed: &Owed, b2: u32, disclosed: Option<&[u8]>) -> Result<(), Refusal> {
+pub fn verdict(owed: &Owed, b2: u32, disclosed: Option<&[u8]>, lean: bool) -> Result<(), Refusal> {
     if owed.disclosures != Disclosures::empty()
-        && disclosed != Some(&owed.disclosures.to_bytes()[..])
+        && disclosed != Some(&owed.disclosures.encode(lean)[..])
     {
         return Err(Refusal::Undisclosed);
     }
@@ -397,5 +402,5 @@ pub fn bears_out(
     let chain = chain(base, headers)?;
     let owed = recovery::owed(base, request, filed, evidence, &chain)
         .map_err(|e| Refusal::Evidence(e.to_string()))?;
-    verdict(&owed, b2, disclosed)
+    verdict(&owed, b2, disclosed, Format::of(base).lean())
 }

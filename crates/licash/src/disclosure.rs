@@ -17,12 +17,16 @@ pub struct Disclosures {
     /// Raw secrets, not scalars. Hash preimages may be zero or noncanonical
     /// scalars, so consumers must inspect all slots, including padding.
     pub values: [[u8; 32]; SLOTS],
+    /// How many of the slots, from the first, hold a secret: what a lean
+    /// format writes ([`Disclosures::encode`]), where the rest is padding.
+    pub used: usize,
 }
 
 impl Disclosures {
     pub fn empty() -> Self {
         Self {
             values: [[0; 32]; SLOTS],
+            used: 0,
         }
     }
 
@@ -33,6 +37,7 @@ impl Disclosures {
             return Err(Error::Protocol("disclosure vector length".into()));
         }
         let mut out = Self::empty();
+        out.used = SLOTS;
         for (slot, bytes) in out.values.iter_mut().zip(bytes.as_chunks::<32>().0) {
             *slot = *bytes;
         }
@@ -45,6 +50,16 @@ impl Disclosures {
             *slot = *value;
         }
         bytes
+    }
+
+    /// What the response's disclosure carries: all 32 slots, padded
+    /// ([`Disclosures::to_bytes`]), or, if `lean`, only the secrets
+    /// disclosed, as many 32-byte slots as there are.
+    pub fn encode(&self, lean: bool) -> Vec<u8> {
+        match lean {
+            false => self.to_bytes().to_vec(),
+            true => self.values[..self.used].concat(),
+        }
     }
 
     pub fn digest(&self) -> [u8; 32] {

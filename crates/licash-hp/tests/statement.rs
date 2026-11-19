@@ -773,24 +773,27 @@ fn a_response_is_borne_out_when_owed_at_most_what_it_says_and_what_it_uses_is_di
         ineligible: None,
     };
     let none = Disclosures::empty();
-    assert_eq!(verdict(&owed(10, none.clone()), 10, None), Ok(()));
+    assert_eq!(verdict(&owed(10, none.clone()), 10, None, false), Ok(()));
     assert_eq!(
-        verdict(&owed(11, none.clone()), 10, None),
+        verdict(&owed(11, none.clone()), 10, None, false),
         Err(Refusal::Owed)
     );
     // Disclosures it uses are published whole, or the response is not borne out.
     let mut used = Disclosures::empty();
     used.values[0] = [9; 32];
     let bytes = used.to_bytes();
-    assert_eq!(verdict(&owed(5, used.clone()), 10, Some(&bytes)), Ok(()));
     assert_eq!(
-        verdict(&owed(5, used.clone()), 10, None),
+        verdict(&owed(5, used.clone()), 10, Some(&bytes), false),
+        Ok(())
+    );
+    assert_eq!(
+        verdict(&owed(5, used.clone()), 10, None, false),
         Err(Refusal::Undisclosed)
     );
     let mut other = bytes;
     other[0] ^= 1;
     assert_eq!(
-        verdict(&owed(5, used), 10, Some(&other)),
+        verdict(&owed(5, used), 10, Some(&other), false),
         Err(Refusal::Undisclosed)
     );
 }
@@ -850,4 +853,36 @@ fn a_lean_statement_proves_a_claim_owed_less_by_the_items_the_hub_flags() {
         i.invalid = wrong;
         assert!(check(&i).is_err(), "flags {wrong:#b}");
     }
+}
+
+/// A lean format's disclosure carries the secrets used and no padding, the
+/// other formats' all 32 slots: each only its own bytes.
+#[test]
+fn a_lean_disclosure_is_the_secrets_it_uses_and_no_padding() {
+    use licash::recovery::Owed;
+    use licash_hp::verdict;
+
+    let mut used = licash::disclosure::Disclosures::empty();
+    used.values[0] = [9; 32];
+    used.values[1] = [8; 32];
+    used.used = 2;
+    let owed = Owed {
+        owed: 5,
+        mask: 0,
+        invalid: 0,
+        disclosures: used.clone(),
+        ineligible: None,
+    };
+    let (padded, lean) = (used.encode(false), used.encode(true));
+    assert_eq!((padded.len(), lean.len()), (1_024, 64));
+    assert_eq!(verdict(&owed, 10, Some(&lean), true), Ok(()));
+    assert_eq!(verdict(&owed, 10, Some(&padded), false), Ok(()));
+    assert_eq!(
+        verdict(&owed, 10, Some(&padded), true),
+        Err(Refusal::Undisclosed)
+    );
+    assert_eq!(
+        verdict(&owed, 10, Some(&lean), false),
+        Err(Refusal::Undisclosed)
+    );
 }

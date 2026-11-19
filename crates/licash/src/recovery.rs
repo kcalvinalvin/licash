@@ -712,6 +712,7 @@ pub fn disclosures(evidence: &[Evidence]) -> Result<Disclosures, Error> {
     for (slot, value) in disclosures.values.iter_mut().zip(by_source.values()) {
         *slot = *value;
     }
+    disclosures.used = by_source.len();
     Ok(disclosures)
 }
 

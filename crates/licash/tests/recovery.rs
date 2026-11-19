@@ -2336,8 +2336,13 @@ fn a_contract_files_the_format_its_graph_id_names() {
         Format::Compact
     );
     assert_eq!(
-        Format::of(&open_at(recovery::COMPACT_FROM + 1).base),
+        Format::of(&open_at(recovery::LEAN_FROM - 1).base),
         Format::Compact
+    );
+    assert_eq!(Format::of(&open_at(recovery::LEAN_FROM).base), Format::Lean);
+    assert_eq!(
+        Format::of(&open_at(recovery::LEAN_FROM + 1).base),
+        Format::Lean
     );
 }
 

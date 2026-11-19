@@ -824,7 +824,8 @@ impl Openings {
         }
         let respond = presign(&o.set, "respond")?;
         let prevout = respond.tx.output[SLOT as usize].clone();
-        let tx = o.disclosure(hub.keys(), &disclosures.to_bytes(), vec![])?;
+        let bytes = disclosures.encode(licash::recovery::Format::of(&o.base).lean());
+        let tx = o.disclosure(hub.keys(), &bytes, vec![])?;
         let tx = self
             .with_fee(id, hub, "disclose", tx, prevout.clone())
             .await?;
