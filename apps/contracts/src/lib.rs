@@ -352,7 +352,7 @@ pub fn trust(profile: ChainProfile) -> Result<Trust> {
 /// proven with it alone, so none named here or in [`SIGNET_BEFORE`] is
 /// ever to go. A contract keeps its program when this one changes.
 pub const SIGNET: [u8; 32] =
-    hex!("ce4d7a006e422b7e73a37b6f5d9c9290a2af7e7c0451662504ce4799bfadcf2c");
+    hex!("836428422619ff8ad43d37899a7206396ae13115a67df459e0a4b748768d9d11");
 
 /// Whether [`SIGNET`] decides the compact filing: true only for a program
 /// built from a tree whose `licash::recovery` reads it, and set in the
@@ -368,6 +368,10 @@ pub const SIGNET_LEAN: bool = true;
 
 /// The programs signet's (and Mutinynet's) contracts opened under before [`SIGNET`], newest
 /// first: no contract opens under them, those that did are played still.
+/// `ce4d7a00…` reads the Bases of earlier forms too (v3 to v5), and judges a
+/// lock's activation unanchored under v3: the program after it reads the
+/// sixth form of a Base only, whose default returns her reserve to a script
+/// of its own (the hub's deposit that swaps it for notes).
 /// `a2458fdb…` decides the compact filing and not the lean one (graph id
 /// 10 on): its contracts, of graph id 9, file the compact one.
 /// `531b465d…` is the statement before it moved into this repository's
@@ -379,7 +383,8 @@ pub const SIGNET_LEAN: bool = true;
 /// statement (of v3 Bases) checks no signature of her request, reads a
 /// request's digits above 15 as Bitcoin doesn't, and owes a lock's Refund
 /// before it expired: a trial's exposure, left to its contracts' end.
-pub const SIGNET_BEFORE: [[u8; 32]; 6] = [
+pub const SIGNET_BEFORE: [[u8; 32]; 7] = [
+    hex!("ce4d7a006e422b7e73a37b6f5d9c9290a2af7e7c0451662504ce4799bfadcf2c"),
     hex!("a2458fdbd126c100b82bb50e8934fe4f5f4c2a5a80e981f4ca63c6f189dfab8d"),
     hex!("531b465ddc59b1a1f2295c97b54d7e090e0ced23b443084ba9e51dad1524dc64"),
     hex!("7214a5393e19298874c6a864efd9e0c9beb221e68440df52b5a949f4b0f87734"),
@@ -493,12 +498,13 @@ mod tests {
     fn the_hub_statement_image_is_pinned() {
         assert_eq!(
             SIGNET,
-            hex!("ce4d7a006e422b7e73a37b6f5d9c9290a2af7e7c0451662504ce4799bfadcf2c"),
+            hex!("836428422619ff8ad43d37899a7206396ae13115a67df459e0a4b748768d9d11"),
             "keep every funded contract's pinned guest available when changing opening trust"
         );
         assert_eq!(
             SIGNET_BEFORE,
             [
+                hex!("ce4d7a006e422b7e73a37b6f5d9c9290a2af7e7c0451662504ce4799bfadcf2c"),
                 hex!("a2458fdbd126c100b82bb50e8934fe4f5f4c2a5a80e981f4ca63c6f189dfab8d"),
                 hex!("531b465ddc59b1a1f2295c97b54d7e090e0ced23b443084ba9e51dad1524dc64"),
                 hex!("7214a5393e19298874c6a864efd9e0c9beb221e68440df52b5a949f4b0f87734"),
