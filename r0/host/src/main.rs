@@ -23,6 +23,7 @@
 //! usable GPU, and on the CPU otherwise: one command, whichever the device.
 
 mod bench;
+mod chain;
 mod groth16;
 mod hp;
 mod probe;
@@ -107,6 +108,30 @@ fn export(bin: &[u8], receipt: &Receipt, expected: &[u8]) -> Result<Vec<u8>> {
     Ok(serde_json::to_vec_pretty(&data)?)
 }
 
+/// `args` as `count` positionals, then at most one program, then any number of
+/// `--assume <receipt>`: the receipts of other programs the guest verifies.
+fn with_assumptions<'a>(
+    args: &[&'a str],
+    count: usize,
+) -> Result<(Vec<&'a str>, Option<&'a str>, Vec<String>)> {
+    let mut positional = Vec::new();
+    let mut assume = Vec::new();
+    let mut rest = args.iter().copied();
+    while let Some(arg) = rest.next() {
+        match arg {
+            "--assume" => assume.push(rest.next().context("--assume needs a receipt")?.to_string()),
+            _ => positional.push(arg),
+        }
+    }
+    ensure!(
+        positional.len() == count || positional.len() == count + 1,
+        "usage: <{count} arguments> [program] [--assume <receipt>]..."
+    );
+    let program = positional.get(count).copied();
+    positional.truncate(count);
+    Ok((positional, program, assume))
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -125,16 +150,35 @@ fn main() -> Result<()> {
             println!("{}", compute_image_id(&read(bin)?)?);
             Ok(())
         }
-        ["hp-exec", input, program @ ..] if program.len() <= 1 => {
-            hp::exec(input, program.first().copied())
+        ["hp-exec", rest @ ..] => {
+            let (input, program, assume) = with_assumptions(rest, 1)?;
+            hp::exec(input[0], program, &assume)
         }
-        ["hp-prove", input, work, program @ ..] if program.len() <= 1 => {
-            hp::prove(input, work.as_ref(), program.first().copied())
+        ["hp-prove", rest @ ..] => {
+            let (args, program, assume) = with_assumptions(rest, 2)?;
+            hp::prove(args[0], args[1].as_ref(), program, &assume)
         }
         // The CUDA build's part of hp-prove: the succinct receipt and its
         // identity_p254 seal, in segments of 2^po2.
-        ["hp-stark", input, work, po2, program @ ..] if program.len() <= 1 => {
-            hp::stark_command(input, work.as_ref(), po2, program.first().copied())
+        ["hp-stark", rest @ ..] => {
+            let (args, program, assume) = with_assumptions(rest, 3)?;
+            hp::stark_command(args[0], args[1].as_ref(), args[2], program, &assume)
+        }
+        // A batch of the chain program (`licash_chain::Batch::to_bytes`):
+        // its succinct receipt, kept as <work-dir>/receipt, which the next
+        // batch and the statements of chained contracts verify. No Groth16:
+        // nothing outside the zkVM reads it.
+        ["chain-prove", rest @ ..] => {
+            let (args, program, assume) = with_assumptions(rest, 2)?;
+            chain::prove(args[0], args[1].as_ref(), program, &assume)
+        }
+        // For measurements: a receipt of the batch's journal that proves
+        // nothing, which `hp-exec` runs a chained statement against.
+        ["chain-fake", batch, out] => chain::fake(batch, out),
+        // The CUDA build's part of chain-prove.
+        ["chain-stark", rest @ ..] => {
+            let (args, program, assume) = with_assumptions(rest, 3)?;
+            chain::stark_command(args[0], args[1].as_ref(), args[2], program, &assume)
         }
         ["bench", out, program @ ..] if program.len() <= 1 => {
             bench::bench(out.as_ref(), program.first().copied())
@@ -150,13 +194,37 @@ fn main() -> Result<()> {
         }
         // The CUDA build's own check of its GPU, for the CPU build's probe.
         ["probe-gpu"] => probe::gpu(),
-        _ => bail!("usage: licash-r0 pack <elf> <out.bin> | id <program.bin> | hp-exec <input.bin> [program] | hp-prove <input.bin> <work-dir> [program] | probe | bench <out.json> [program]"),
+        _ => bail!("usage: licash-r0 pack <elf> <out.bin> | id <program.bin> | hp-exec <input.bin> [program] [--assume <receipt>].. | hp-prove <input.bin> <work-dir> [program] [--assume <receipt>].. | chain-prove <batch.bin> <work-dir> [--assume <receipt>] | probe | bench <out.json> [program]"),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_command_takes_a_program_and_the_receipts_its_guest_verifies() {
+        let args = |a: &[&'static str]| with_assumptions(a, 2);
+        assert_eq!(
+            args(&["in", "work"]).unwrap(),
+            (vec!["in", "work"], None, vec![])
+        );
+        assert_eq!(
+            args(&["in", "work", "id", "--assume", "a", "--assume", "b"]).unwrap(),
+            (vec!["in", "work"], Some("id"), vec!["a".into(), "b".into()])
+        );
+        assert_eq!(
+            args(&["in", "work", "--assume", "a"]).unwrap().2,
+            vec!["a".to_string()]
+        );
+        for bad in [
+            &["in"][..],
+            &["a", "b", "c", "d"],
+            &["in", "work", "--assume"],
+        ] {
+            assert!(args(bad).is_err(), "{bad:?}");
+        }
+    }
 
     #[test]
     fn segmentation_is_optional_and_bounded() {

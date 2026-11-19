@@ -1,0 +1,25 @@
+# The chain program: one batch of the hub's header chain (`licash_chain::extend`)
+# in the RISC Zero zkVM, built with r0/build-guest.sh chain. Each batch
+# verifies the receipt of the one before, so a receipt of the last proves every
+# header of the chain from its start. The statements of contracts of graph id
+# 11 on verify its receipts, by the image id kept in r0/hp-guest/chain.id.
+[package]
+name = "licash-chain-guest"
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+rust-version = "1.97"
+
+[workspace]
+resolver = "3"
+
+[dependencies]
+licash-chain = { path = "../../crates/licash-chain" }
+risc0-zkvm = { version = "=3.1.0", default-features = false, features = ["std"] }
+
+# RISC Zero's accelerated SHA-256, which the chain's hashes are: as the
+# statement's guest has it.
+[patch.crates-io]
+sha2 = { git = "https://github.com/risc0/RustCrypto-hashes", tag = "sha2-v0.10.9-risczero.0" }
+k256 = { git = "https://github.com/risc0/RustCrypto-elliptic-curves", tag = "k256/v0.13.4-risczero.1" }
+crypto-bigint = { git = "https://github.com/risc0/RustCrypto-crypto-bigint", tag = "v0.5.5-risczero.0" }

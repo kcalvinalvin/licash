@@ -38,7 +38,9 @@ case "$name" in
     hp) dir=hp-guest ;;
     # Its steps' cycles printed, for measurements: never a program to keep.
     hp-profile) dir=hp-guest; features="--features profile" ;;
-    *) echo 'usage: r0/build-guest.sh hp | hp-profile' >&2; exit 2 ;;
+    # The chain program the statements of chained contracts verify receipts of.
+    chain) dir=chain-guest ;;
+    *) echo 'usage: r0/build-guest.sh hp | hp-profile | chain' >&2; exit 2 ;;
 esac
 # The guests link libsecp256k1 (taproot control blocks): compile its C with
 # rzup's RISC-V gcc.
@@ -53,7 +55,7 @@ fi
 # The guest's sources as the checkout has them, uncommitted changes and
 # all: the root manifest (crates/licash inherits from it), the crates the
 # guest depends on, and the guest.
-sources=(Cargo.toml crates/licash crates/licash-hp crates/licash-statement "r0/$dir")
+sources=(Cargo.toml crates/licash crates/licash-chain crates/licash-hp crates/licash-statement "r0/$dir")
 if [ -n "$(git status --porcelain -- "${sources[@]}")" ]; then
     echo "uncommitted changes in the guest's sources: not a guest to keep" >&2
 fi
@@ -72,3 +74,10 @@ elf="$build/target/riscv32im-risc0-zkvm-elf/release/licash-$dir"
 sha256sum "$elf"
 cargo run --locked --release --manifest-path r0/host/Cargo.toml -- pack "$elf" "r0/guests/$name.bin" > "r0/guests/$name.id"
 cat "r0/guests/$name.id"
+# The statements verify receipts of the chain program by the id kept in
+# r0/hp-guest/chain.id: a chain built to another is a chain no statement
+# verifies, so it is named, never silently taken.
+if [ "$name" = chain ] && [ "$(cat r0/guests/chain.id)" != "$(cat r0/hp-guest/chain.id 2>/dev/null)" ]; then
+    echo "the chain program's id is not the one in r0/hp-guest/chain.id: a new chain, which the statements built with that id do not verify" >&2
+    [ "${LICASH_CHAIN_ID_UPDATE:-}" = 1 ] || exit 1
+fi

@@ -842,8 +842,12 @@ mod chained {
     const ON: u32 = licash::recovery::CHAINED_FROM;
 
     fn program() -> Program<'static> {
+        program_of(CHAIN)
+    }
+
+    fn program_of(id: [u8; 32]) -> Program<'static> {
         Program {
-            id: CHAIN,
+            id,
             verify: &|_, _| {},
         }
     }
@@ -877,8 +881,20 @@ mod chained {
     /// its headers those after, the chain's proof opened to what the
     /// judgment reads.
     fn on(base: &Base, exit: &Exit, evidence: &[Evidence], through: u32) -> (HubInput, Lineage) {
+        on_chain(CHAIN, base, exit, evidence, through)
+    }
+
+    /// [`on`], the chain program's image id `chain`.
+    fn on_chain(
+        chain: [u8; 32],
+        base: &Base,
+        exit: &Exit,
+        evidence: &[Evidence],
+        through: u32,
+    ) -> (HubInput, Lineage) {
+        let program = || program_of(chain);
         let lineage = lineage(base, exit);
-        let (journal, tip) = lineage.through(CHAIN, through).unwrap();
+        let (journal, tip) = lineage.through(chain, through).unwrap();
         let mut shown = exit.clone();
         shown.headers = exit.headers[through as usize..].to_vec();
         let proven = Proven {
@@ -1158,5 +1174,66 @@ mod chained {
         let (mut input, _) = on(&f.base, &x, evidence, 9);
         input.exit.headers[2][4] ^= 1;
         assert!(matches!(decided(&input), Err(Refusal::Chain(_))));
+    }
+
+    /// The inputs the chain program and the statement's guest run on, for
+    /// `licash-r0 chain-prove` and `hp-prove` (`LICASH_HP_INPUTS`, and the
+    /// chain program's image id from `LICASH_CHAIN_ID` or r0/hp-guest/chain.id):
+    /// the chain proven in two batches, `batch-1.bin` and `batch-2.bin`, then
+    /// the answered claim on it, `answered-chained.bin`.
+    #[test]
+    fn export_chained_inputs() {
+        use licash_hp::headers::{Batch, Builder, Origin};
+        let Ok(dir) = std::env::var("LICASH_HP_INPUTS") else {
+            return;
+        };
+        let hex = std::env::var("LICASH_CHAIN_ID").unwrap_or_else(|_| {
+            let kept = format!("{}/../../r0/hp-guest/chain.id", env!("CARGO_MANIFEST_DIR"));
+            std::fs::read_to_string(kept).unwrap()
+        });
+        let hex = hex.trim();
+        let mut chain = [0u8; 32];
+        for (i, byte) in chain.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap();
+        }
+        let (f, spent) = stale_on(Version::V3, ON);
+        let x = exit(&f.base, f.b, &f.e, &f.bytes, 64);
+        let evidence = std::slice::from_ref(&spent);
+        // the chain through the response's block, in two batches
+        let through = Lineage::new(f.base.parts().chain.checkpoint.clone())
+            .map(|mut l| {
+                x.headers.iter().for_each(|h| l.push(*h).unwrap());
+                l.height_of(&x.respond.header).unwrap()
+            })
+            .unwrap();
+        let cut = (through / 2) as usize;
+        let cp = f.base.parts().chain.checkpoint.clone();
+        let first = Batch {
+            chain,
+            from: Origin::Start(cp.clone()),
+            headers: x.headers[..cut].to_vec(),
+        };
+        let mut early = Builder::start(cp).unwrap();
+        for header in &x.headers[..cut] {
+            early.push(*header).unwrap();
+        }
+        let second = Batch {
+            chain,
+            from: Origin::Resume {
+                journal: early.journal(chain),
+                tip: early.tip().clone(),
+                tree: early.tree().clone(),
+            },
+            headers: x.headers[cut..through as usize].to_vec(),
+        };
+        let (input, _) = on_chain(chain, &f.base, &x, evidence, through);
+        for (name, bytes) in [
+            ("batch-1", first.to_bytes()),
+            ("batch-2", second.to_bytes()),
+            ("answered-chained", input.to_bytes()),
+        ] {
+            println!("{name}: {} bytes", bytes.len());
+            std::fs::write(format!("{dir}/{name}.bin"), bytes).unwrap();
+        }
     }
 }

@@ -36,18 +36,46 @@ pub const GPU_PO2: [u32; 2] = [18, 17];
 /// and is faster than 2^18.
 pub const CPU_PO2: u32 = 19;
 
-/// The journal the library computes for this input, or its refusal.
+/// The journal the library computes for this input, or its refusal. Of a
+/// chained contract's input, with the chain program its own receipt's journal
+/// names: the guest is built with one id, and refuses an input whose receipt
+/// is of another, which the library does not (so `hp-exec` says so).
 fn expected(bytes: &[u8]) -> Result<Vec<u8>> {
     let input = HubInput::from_bytes(bytes)?;
-    Ok(licash_hp::check(&input)?.to_vec())
+    match &input.chain {
+        None => Ok(licash_hp::check(&input)?.to_vec()),
+        Some(chain) => {
+            let id = *chain
+                .journal
+                .first_chunk::<32>()
+                .context("the chain's journal")?;
+            let program = licash_hp::Program {
+                id,
+                verify: &|_, _| {},
+            };
+            Ok(licash_hp::check_on(&input, &program)?.to_vec())
+        }
+    }
 }
 
-pub fn exec(path: &str, program: Option<&str>) -> Result<()> {
+/// The receipts the guest may verify, read from `paths`.
+pub fn receipts(paths: &[String]) -> Result<Vec<Receipt>> {
+    paths
+        .iter()
+        .map(|path| {
+            let bytes = read(path).with_context(|| format!("the receipt {path}"))?;
+            bincode::deserialize(&bytes).with_context(|| format!("the receipt {path}"))
+        })
+        .collect()
+}
+
+pub fn exec(path: &str, program: Option<&str>, assume: &[String]) -> Result<()> {
     let bytes = read(path)?;
     let bin = probe::program(program)?;
     let expected = expected(&bytes);
     let t = Instant::now();
-    let run = default_executor().execute(super::env_for(&bytes, super::segment_override()?)?, &bin);
+    let env = super::env_with(&bytes, super::segment_override()?, &receipts(assume)?)?;
+    let run = default_executor().execute(env, &bin);
     let ms = t.elapsed().as_millis();
     match (run, expected) {
         (Ok(s), Ok(j)) => {
@@ -73,8 +101,9 @@ pub fn exec(path: &str, program: Option<&str>) -> Result<()> {
 /// Prove the input at `path` with `program` in `work`, and export the
 /// proof to `work/proof.json`: on the GPU through the CUDA build if one is
 /// usable (a smaller segment size if the larger fails), else on the CPU.
-/// The Groth16 wrap runs on the CPU either way.
-pub fn prove(path: &str, work: &Path, program: Option<&str>) -> Result<()> {
+/// The Groth16 wrap runs on the CPU either way. `assume` are the receipts of
+/// other programs the guest verifies, each resolved before the wrap.
+pub fn prove(path: &str, work: &Path, program: Option<&str>, assume: &[String]) -> Result<()> {
     let bytes = read(path)?;
     let bin = probe::program(program)?;
     let expected = expected(&bytes)?;
@@ -86,38 +115,10 @@ pub fn prove(path: &str, work: &Path, program: Option<&str>) -> Result<()> {
     }
     let start = Instant::now();
     if !work.join("p254").exists() {
-        match probe::cuda_build().filter(|_| probe::gpu_usable()) {
-            Some(cuda) => {
-                let sizes = super::segment_override()?.map_or(GPU_PO2.to_vec(), |p| vec![p]);
-                let mut failed = None;
-                for po2 in sizes {
-                    let status = Command::new(&cuda)
-                        .arg("hp-stark")
-                        .arg(path)
-                        .arg(work)
-                        .arg(po2.to_string())
-                        .args(program)
-                        .status()
-                        .context("run the CUDA prover")?;
-                    if status.success() {
-                        failed = None;
-                        break;
-                    }
-                    println!("{NAME}: the GPU failed at segments of 2^{po2}: {status}");
-                    failed = Some(status);
-                }
-                if let Some(status) = failed {
-                    bail!("the GPU prover failed: {status}");
-                }
-            }
-            None => stark(
-                &bin,
-                &bytes,
-                &expected,
-                work,
-                super::segment_override()?.unwrap_or(CPU_PO2),
-            )?,
-        }
+        let receipts = receipts(assume)?;
+        on_device("hp-stark", path, work, program, assume, |po2| {
+            stark(&bin, &bytes, &receipts, &expected, work, po2)
+        })?;
     }
     let succinct: Receipt = bincode::deserialize(&read(work.join("receipt"))?)?;
     let claim = succinct
@@ -144,10 +145,77 @@ pub fn prove(path: &str, work: &Path, program: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-/// The succinct receipt of `bin` on `bytes` in segments of 2^`po2`, kept
-/// as `work/receipt`, then its `identity_p254` seal, kept as `work/p254`,
-/// on this build's device.
-pub fn stark(bin: &[u8], bytes: &[u8], expected: &[u8], work: &Path, po2: u32) -> Result<()> {
+/// `cpu` at the CPU's segment size, or, if a CUDA build is beside this one
+/// and a GPU usable, that build's `command` (`hp-stark`, `chain-stark`) on
+/// `path` and `work`, at the largest segment size that fits (a smaller one if
+/// it fails, each attempt a process of its own).
+pub fn on_device(
+    command: &str,
+    path: &str,
+    work: &Path,
+    program: Option<&str>,
+    assume: &[String],
+    cpu: impl FnOnce(u32) -> Result<()>,
+) -> Result<()> {
+    let Some(cuda) = probe::cuda_build().filter(|_| probe::gpu_usable()) else {
+        return cpu(super::segment_override()?.unwrap_or(CPU_PO2));
+    };
+    let sizes = super::segment_override()?.map_or(GPU_PO2.to_vec(), |p| vec![p]);
+    let mut failed = None;
+    for po2 in sizes {
+        let mut run = Command::new(&cuda);
+        run.arg(command).arg(path).arg(work).arg(po2.to_string());
+        run.args(program);
+        for receipt in assume {
+            run.arg("--assume").arg(receipt);
+        }
+        let status = run.status().context("run the CUDA prover")?;
+        if status.success() {
+            return Ok(());
+        }
+        println!("{NAME}: the GPU failed at segments of 2^{po2}: {status}");
+        failed = Some(status);
+    }
+    match failed {
+        Some(status) => bail!("the GPU prover failed: {status}"),
+        None => Ok(()),
+    }
+}
+
+/// The succinct receipt of `bin` on `bytes` (verifying `assumptions`) in
+/// segments of 2^`po2`, kept as `work/receipt`, then its `identity_p254`
+/// seal, kept as `work/p254`, on this build's device.
+pub fn stark(
+    bin: &[u8],
+    bytes: &[u8],
+    assumptions: &[Receipt],
+    expected: &[u8],
+    work: &Path,
+    po2: u32,
+) -> Result<()> {
+    let succinct = succinct(NAME, bin, bytes, assumptions, expected, work, po2)?;
+    let t = Instant::now();
+    let inner = succinct.inner.succinct().context("a succinct receipt")?;
+    let ident = get_prover_server(&ProverOpts::succinct())?.identity_p254(inner)?;
+    keep(&work.join("p254"), &ident.get_seal_bytes())?;
+    println!(
+        "{NAME}: identity_p254 in {:.1} s",
+        t.elapsed().as_secs_f64()
+    );
+    Ok(())
+}
+
+/// The succinct receipt of `bin` on `bytes` that `work/receipt` keeps, made
+/// (resumably) if it is not there, its journal `expected`.
+pub fn succinct(
+    name: &str,
+    bin: &[u8],
+    bytes: &[u8],
+    assumptions: &[Receipt],
+    expected: &[u8],
+    work: &Path,
+    po2: u32,
+) -> Result<Receipt> {
     let id = compute_image_id(bin)?;
     let kept = work.join("receipt");
     let succinct: Receipt = match read(&kept) {
@@ -159,7 +227,8 @@ pub fn stark(bin: &[u8], bytes: &[u8], expected: &[u8], work: &Path, po2: u32) -
                 "cpu"
             };
             let dir = work.join(format!("stark-{device}-{po2}"));
-            let r = crate::resumable::prove(bin, NAME, bytes, expected, &dir, Some(po2))?;
+            let r =
+                crate::resumable::prove(bin, name, bytes, assumptions, expected, &dir, Some(po2))?;
             keep(&kept, &bincode::serialize(&r)?)?;
             // Its segments' work, and that of sizes that failed before.
             for entry in std::fs::read_dir(work)? {
@@ -175,22 +244,20 @@ pub fn stark(bin: &[u8], bytes: &[u8], expected: &[u8], work: &Path, po2: u32) -
     };
     succinct.verify(id).context("the kept receipt")?;
     ensure!(succinct.journal.bytes == expected, "journal");
-    let t = Instant::now();
-    let inner = succinct.inner.succinct().context("a succinct receipt")?;
-    let ident = get_prover_server(&ProverOpts::succinct())?.identity_p254(inner)?;
-    keep(&work.join("p254"), &ident.get_seal_bytes())?;
-    println!(
-        "{NAME}: identity_p254 in {:.1} s",
-        t.elapsed().as_secs_f64()
-    );
-    Ok(())
+    Ok(succinct)
 }
 
 /// `hp-stark`, the CUDA build's part of [`prove`].
-pub fn stark_command(path: &str, work: &Path, po2: &str, program: Option<&str>) -> Result<()> {
+pub fn stark_command(
+    path: &str,
+    work: &Path,
+    po2: &str,
+    program: Option<&str>,
+    assume: &[String],
+) -> Result<()> {
     let bytes = read(path)?;
     let bin = probe::program(program)?;
     let expected = expected(&bytes)?;
     let po2 = super::segment_limit(Some(po2))?.context("a segment size")?;
-    stark(&bin, &bytes, &expected, work, po2)
+    stark(&bin, &bytes, &receipts(assume)?, &expected, work, po2)
 }

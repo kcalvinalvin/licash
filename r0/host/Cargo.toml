@@ -15,6 +15,7 @@ resolver = "3"
 cuda = ["risc0-zkvm/cuda", "dep:risc0-zkp", "risc0-zkp/cuda"]
 
 [dependencies]
+licash-chain = { path = "../../crates/licash-chain" }
 licash-hp = { path = "../../crates/licash-hp" }
 risc0-zkvm = { version = "=3.1.0", default-features = false, features = ["prove", "std"] }
 risc0-binfmt = "=3.0.6"

@@ -241,22 +241,11 @@ fn rss() -> String {
 
 /// Prove `bin` on `input`, its journal `expected`, in segments of 2^`po2`
 /// cycles, carrying on the work kept in `dir`: the verified succinct
-/// receipt, also written to `dir/receipt`.
+/// receipt, also written to `dir/receipt`. The guest may verify the receipts
+/// `assumptions` (of other programs, each the succinct receipt of an
+/// unconditional proof): the proof is unconditional once each is resolved,
+/// before it is wrapped.
 pub fn prove(
-    bin: &[u8],
-    name: &str,
-    input: &[u8],
-    expected: &[u8],
-    dir: &Path,
-    po2: Option<u32>,
-) -> Result<Receipt> {
-    prove_with(bin, name, input, &[], expected, dir, po2)
-}
-
-/// [`prove`] of a guest that verifies the receipts `assumptions` (of other
-/// programs, each the succinct receipt of an unconditional proof): the
-/// proof is unconditional once each is resolved, before it is wrapped.
-pub fn prove_with(
     bin: &[u8],
     name: &str,
     input: &[u8],
