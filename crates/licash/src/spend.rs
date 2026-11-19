@@ -556,8 +556,8 @@ fn count<T>(items: &[T]) -> Result<u32, Error> {
     u32::try_from(items.len()).map_err(|_| bad("proposal count overflow"))
 }
 
-/// The commitment a v5 Base makes to the outputs its holder funds, in
-/// order ([`crate::base::Version::V5`]): refused if there are none.
+/// The commitment a Base makes to the outputs its holder funds, in
+/// order: refused if there are none.
 pub fn funded_root(outputs: &[Output]) -> Result<[u8; 32], Error> {
     count(outputs)?;
     let mut bytes = Vec::new();

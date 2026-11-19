@@ -701,7 +701,7 @@ fn coverage_order<'a>(
 }
 
 /// The coin of `wallet`'s that [`open`] would deposit of `least` sat at
-/// least ([`least`]), with the contracts in `wallet_file`: the smallest free.
+/// least (`least`), with the contracts in `wallet_file`: the smallest free.
 /// None if no coin does.
 pub fn coin<T: Transport>(
     wallet: &Wallet<T>,

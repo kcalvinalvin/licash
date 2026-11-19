@@ -21,7 +21,7 @@ pub struct KeyAgg {
 }
 
 /// SHA256 tagged with `tag`, as BIP340 defines it.
-fn tagged(tag: &str, parts: &[&[u8]]) -> [u8; 32] {
+pub(crate) fn tagged(tag: &str, parts: &[&[u8]]) -> [u8; 32] {
     let tag = sha256::Hash::hash(tag.as_bytes());
     let mut engine = sha256::Hash::engine();
     engine.input(tag.as_ref());
@@ -40,7 +40,7 @@ const N: [u8; 32] = [
 
 /// `bytes`, a 256-bit number, modulo the group's order: at most once
 /// past it, as 2^256 < 2n.
-fn reduce(bytes: [u8; 32]) -> Scalar {
+pub(crate) fn reduce(bytes: [u8; 32]) -> Scalar {
     if let Ok(scalar) = Scalar::from_be_bytes(bytes) {
         return scalar;
     }

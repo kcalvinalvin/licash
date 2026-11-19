@@ -2122,6 +2122,7 @@ mod tests {
             lock: None,
             state: DepositState::Open,
             created_at: 0,
+            close: false,
         };
         // Its payment unseen: nothing moves yet.
         assert!(!seen_paid(&deposit, &[]));

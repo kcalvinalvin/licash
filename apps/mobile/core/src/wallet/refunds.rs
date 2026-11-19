@@ -42,7 +42,11 @@ impl Wallet {
             let Some(terms) = &deposit.terms else {
                 continue;
             };
-            if !self.refund_turn(&deposit.hash, terms.timeout, tip) {
+            if !self.refund_turn(
+                &deposit.hash,
+                deposit.refund_height().unwrap_or(terms.timeout),
+                tip,
+            ) {
                 continue;
             }
             let Some(funding) = self.deposit_paid(&deposit) else {
@@ -129,7 +133,9 @@ impl Wallet {
             return;
         };
         let refunded = deposits.iter().filter_map(|d| match (&d.state, &d.terms) {
-            (DepositState::Refunded(txid), Some(terms)) => Some((d, *txid, terms.timeout)),
+            (DepositState::Refunded(txid), Some(terms)) => {
+                Some((d, *txid, d.refund_height().unwrap_or(terms.timeout)))
+            }
             _ => None,
         });
         for (deposit, txid, timeout) in refunded {

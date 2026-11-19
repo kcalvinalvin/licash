@@ -555,6 +555,14 @@ impl Hub {
         tagged_hash("licash-hub/deposit-key", &[&self.deposit, hash])
     }
 
+    /// The secret of the hub's deposit root, from which it claims the
+    /// deposits that return a contract's reserve, each under a key
+    /// derived from the root's public key, which it publishes: not a valid
+    /// key, by chance of about one in 2^128, is the caller's to refuse.
+    pub fn deposit_root_secret(&self) -> [u8; 32] {
+        tagged_hash("licash-hub/deposit-root", &[&self.deposit])
+    }
+
     /// What the hub publishes of itself.
     pub fn info(&self) -> Info {
         Info {

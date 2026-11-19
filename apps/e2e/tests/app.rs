@@ -1002,32 +1002,32 @@ async fn contracted(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     phone.scroll_to_id("close-contract").await?;
     phone.back_to("onchain").await?;
 
-    // All its notes protected, fewer than it covers; nothing left on
-    // Bitcoin, its coin the price exactly. A claim names so many notes at
-    // most: the few small ones past them are on credit until the wallet
-    // shapes its notes again, once they have rested (at most ten minutes).
-    until("its notes protected", 900, || async {
-        mine(eco).await?;
+    // Its notes protected; nothing left on Bitcoin, its coin the price
+    // exactly.
+    let protected = until("its notes protected", 30, || async {
         let views = phone.views().await?;
         let of = |id: &str| views.iter().find(|v| v.id == id).map(|v| amount(&v.text));
-        let (protected, onchain, credit) = (of("protected"), of("onchain"), of("credit"));
-        Ok(
-            (protected.is_some_and(|p| p > 0) && onchain == Some(0) && credit == Some(0))
-                .then_some(()),
-        )
+        let (protected, onchain) = (of("protected"), of("onchain"));
+        Ok(protected.filter(|&p| p > 0 && onchain == Some(0)))
     })
     .await?;
     let now = amount(&phone.by_id("credit", 10).await?.text);
     phone.back_to("receive").await?;
     let after = phone.balance().await?;
     // Less its price, and what keeping its notes few may have cost meanwhile
-    // (a few sat, at times): none of it on credit now.
+    // (a few sat, at times).
     let upkeep = (before - paid).checked_sub(after);
     ensure!(
         upkeep.is_some_and(|fee| fee <= NOTES_UPKEEP),
         "{after} held, {before} before"
     );
-    ensure!(now == 0, "{now} on credit, {credit} before");
+    // A claim names so many notes at most, 32 or more: the smallest past
+    // them are on credit, which the many payments before leave a few of.
+    // Nearly all of it is protected, then.
+    ensure!(
+        now * 100 <= protected,
+        "{now} on credit, {protected} protected, {credit} on credit before"
+    );
     // Home says it is protected.
     let share = phone.by_id("protection", 10).await?;
     ensure!(
@@ -1115,9 +1115,13 @@ async fn hub_down(
         collected(bob, 180).await? == 1_000,
         "Bob got other than 1000"
     );
+    // Resuming can also charge a note optimization fee, a few sat.
+    const NOTES_UPKEEP: u64 = 50;
     let spent = until("the payment done", 60, || async {
         let spent = held - phone.balance().await?;
-        Ok((1_000..=1_000 + fee).contains(&spent).then_some(spent))
+        Ok((1_000..=1_000 + fee + NOTES_UPKEEP)
+            .contains(&spent)
+            .then_some(spent))
     })
     .await?;
     eprintln!("{spent} spent paying 1000 while its hub was down");

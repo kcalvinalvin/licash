@@ -12,14 +12,14 @@
 //! owed ([`Htlc::claim_exact`]), and the provider reads the preimage from
 //! the claim ([`Htlc::preimage_in`]).
 
-use crate::key_agg::{key_agg, KeyAgg};
+use crate::key_agg::{key_agg, reduce, tagged, KeyAgg};
 use bitcoin::{
     absolute::LockTime,
     hashes::Hash,
     key::Secp256k1,
     opcodes::all::{OP_CHECKSIG, OP_CLTV, OP_CSV, OP_DROP, OP_EQUALVERIFY, OP_SHA256},
     script::Builder,
-    secp256k1::{Keypair, Message, Parity, SecretKey, XOnlyPublicKey},
+    secp256k1::{Keypair, Message, Parity, Scalar, SecretKey, XOnlyPublicKey},
     sighash::{Prevouts, SighashCache},
     taproot::{LeafVersion, Signature, TaprootBuilder, TaprootSpendInfo},
     transaction, Address, Amount, FeeRate, Network, OutPoint, ScriptBuf, Sequence, TapLeafHash,
@@ -59,6 +59,57 @@ pub struct Htlc {
     /// so that the script depends on no height, and a wallet knowing only its
     /// keys and the hub's can rebuild it. None: the refund is by `timeout`.
     pub wait: Option<u16>,
+}
+
+/// How many blocks after its payment a deposit that returns a contract's
+/// reserve may be taken back by its payer ([`Htlc::wait`]): some two weeks.
+pub const CLOSE_WAIT: u16 = 2_016;
+
+/// The tweak of the claim key of the hub whose deposit root is `root`, for
+/// the deposit under `hash` that its payer takes back with `refund`. Of the
+/// refund key too, which no claim shows, so that none who holds the root
+/// can tell which deposits one hub's claims are.
+fn close_tweak(root: &XOnlyPublicKey, hash: &[u8; 32], refund: &XOnlyPublicKey) -> Scalar {
+    reduce(tagged(
+        "licash/deposit/close-claim",
+        &[&root.serialize(), hash, &refund.serialize()],
+    ))
+}
+
+/// The key a hub claims the deposit under `hash` with, that returns a
+/// contract's reserve to its payer, who takes it back with `refund`: the hub's
+/// deposit root `root` and the tweak of that deposit, as the hub
+/// publishes the root and anyone derives the key. So a wallet restored from
+/// its seed, and the root, knows every address it may have paid.
+pub fn close_claim_key(
+    root: &XOnlyPublicKey,
+    hash: &[u8; 32],
+    refund: &XOnlyPublicKey,
+) -> XOnlyPublicKey {
+    let secp = Secp256k1::verification_only();
+    let tweaked = root
+        .public_key(Parity::Even)
+        .add_exp_tweak(&secp, &close_tweak(root, hash, refund))
+        .expect("a root tweaked to infinity: not found but by breaking SHA256");
+    tweaked.x_only_public_key().0
+}
+
+/// The secret key of [`close_claim_key`], of the hub whose deposit root's
+/// secret is `root_secret` (whichever the parity of its point: the root is
+/// the point of even y of its x coordinate).
+pub fn close_claim_secret(
+    root_secret: &SecretKey,
+    hash: &[u8; 32],
+    refund: &XOnlyPublicKey,
+) -> SecretKey {
+    let secp = Secp256k1::new();
+    let (root, parity) = root_secret.x_only_public_key(&secp);
+    let even = match parity {
+        Parity::Even => *root_secret,
+        Parity::Odd => root_secret.negate(),
+    };
+    even.add_tweak(&close_tweak(&root, hash, refund))
+        .expect("a secret tweaked to zero: not found but by breaking SHA256")
 }
 
 /// How a deposit is spent.

@@ -30,13 +30,13 @@ use bitcoin::{
 use licash::spend::{ChainProfile, ProposalId, TimedTerms};
 use licash_api::{
     Code, Deposit, DepositStatus, Depositing, Deposits, Fee, Funding, Hex, Problem, Receive,
-    ReceiveState, ReceiveStatus,
+    ReceiveState, ReceiveStatus, XOnly,
 };
 use licash_chain_client::{Follow, Source};
 use licash_hub::{Error, Hub, Refusal, Settled, Timing};
 use licash_onchain::{
     deadline,
-    deposit::{self, Htlc},
+    deposit::{self, close_claim_key, close_claim_secret, Htlc, CLOSE_WAIT},
 };
 use licash_store::Kind;
 use rusqlite::{params, Connection, OptionalExtension, Row};
@@ -245,6 +245,9 @@ struct Record {
     amount: u64,
     pays: u64,
     htlc: Htlc,
+    /// The `timeout_height` column: its refund's height, or for a deposit
+    /// that returns a contract's reserve, the block it is watched for until.
+    until: u32,
     fund_by: u32,
     funding: Option<(OutPoint, u32)>,
     lock: Option<ProposalId>,
@@ -256,12 +259,29 @@ struct Record {
     close: Option<CloseState>,
 }
 
+impl Record {
+    /// The height after which its payer may take the coins back: its
+    /// timeout, or for a deposit that returns a contract's reserve a wait
+    /// after its payment confirmed, none until it did.
+    fn refund_height(&self) -> Option<u32> {
+        match self.htlc.wait {
+            None => Some(self.htlc.timeout),
+            Some(_) => self
+                .funding
+                .map(|(_, height)| self.htlc.refund_height(height)),
+        }
+    }
+}
+
 /// A deposit asked for, to record.
 struct New<'a> {
     body: &'a str,
     amount: u64,
     pays: u64,
     htlc: &'a Htlc,
+    /// What its `timeout_height` is: its refund's height, or the block a
+    /// deposit that returns a contract's reserve is watched for until.
+    until: u32,
     /// The last block its payment may confirm in.
     fund_by: u32,
     /// Whether it returns a contract's reserve.
@@ -329,9 +349,12 @@ fn record(r: &Row<'_>) -> rusqlite::Result<Record> {
             hash,
             claim: key(4)?,
             refund: key(5)?,
-            timeout: r.get(6)?,
-            wait: None,
+            // A deposit that returns a contract's reserve is taken back
+            // a wait after its payment, whatever the height.
+            timeout: if close.is_some() { 0 } else { r.get(6)? },
+            wait: close.as_ref().map(|_| CLOSE_WAIT),
         },
+        until: r.get(6)?,
         fund_by: r.get(7)?,
         funding,
         lock: r
@@ -390,6 +413,7 @@ impl Store {
             amount,
             pays,
             htlc,
+            until,
             fund_by,
             close,
         } = *new;
@@ -411,7 +435,7 @@ impl Store {
                 sql(pays)?,
                 htlc.claim.serialize(),
                 htlc.refund.serialize(),
-                htlc.timeout,
+                until,
                 fund_by,
                 htlc.script_pubkey().as_bytes(),
                 sql(now())?,
@@ -777,6 +801,7 @@ impl Gateway {
             depth: c.depth,
             window: c.window,
             timeout: c.timeout_blocks(self.lock_depth()).unwrap_or(u32::MAX),
+            close_root: self.root().ok().map(|root| XOnly(root.serialize())),
         }
     }
 
@@ -836,11 +861,18 @@ impl Gateway {
                     "the hub follows no chain yet",
                 ))
             })?;
-            let claim = self
-                .claim_key(&hash)?
-                .x_only_public_key(&Secp256k1::new())
-                .0;
-            let timeout = match &body.close {
+            // A deposit that returns a contract's reserve is claimed with a key
+            // anyone derives from the hub's root: so a wallet restored from its
+            // seed rebuilds its address.
+            let claim = match &body.close {
+                None => {
+                    self.claim_key(&hash)?
+                        .x_only_public_key(&Secp256k1::new())
+                        .0
+                }
+                Some(_) => close_claim_key(&self.root()?, &hash, &refund),
+            };
+            let until = match &body.close {
                 None => c
                     .timeout_blocks(self.lock_depth())
                     .and_then(|blocks| from.checked_add(blocks))
@@ -853,20 +885,20 @@ impl Gateway {
                         .checked_add(c.window)
                         .ok_or_else(|| Failure(Problem::invalid("the timeout overflows")))?;
                     let last = from.saturating_add(MAX_CLOSE_BLOCKS);
-                    if close.timeout <= first || close.timeout > last {
+                    if close.until <= first || close.until > last {
                         return Err(refused(
-                            "a timeout outside what the hub keeps a deposit for",
+                            "a block to watch until outside what the hub keeps a deposit for",
                         ));
                     }
-                    close.timeout
+                    close.until
                 }
             };
             let htlc = Htlc {
                 hash,
                 claim,
                 refund,
-                timeout,
-                wait: None,
+                timeout: if body.close.is_some() { 0 } else { until },
+                wait: body.close.as_ref().map(|_| CLOSE_WAIT),
             };
             let fund_by = from.saturating_add(c.window);
             let new = New {
@@ -874,6 +906,7 @@ impl Gateway {
                 amount,
                 pays,
                 htlc: &htlc,
+                until,
                 fund_by,
                 close: body.close.is_some(),
             };
@@ -884,7 +917,7 @@ impl Gateway {
                     "too many deposits asked and not paid: retry later",
                 )));
             }
-            tracing::info!(hash = %hex::encode(hash), amount, pays, fund_by, timeout, "deposit asked");
+            tracing::info!(hash = %hex::encode(hash), amount, pays, fund_by, until, "deposit asked");
         }
         drop(turn);
         let record = self
@@ -907,7 +940,7 @@ impl Gateway {
                 .to_string(),
             amount: record.pays,
             claim: Hex(record.htlc.claim.serialize().to_vec()),
-            timeout: record.htlc.timeout,
+            timeout: record.until,
             fund_by: record.fund_by,
         }
     }
@@ -962,7 +995,7 @@ impl Gateway {
             return Err("the deposit is another contract's".into());
         }
         if record.pays != pays
-            || record.htlc.timeout != timeout
+            || record.until != timeout
             || record.amount.checked_add(fee) != Some(pays)
         {
             return Err("the deposit is not as the contract's close names it".into());
@@ -1019,6 +1052,32 @@ impl Gateway {
             return Err(refused("a deposit no contract of the hub's names"));
         }
         self.deposit_status(hash)
+    }
+
+    /// The secret of the hub's deposit root, which it claims the deposits that
+    /// return a contract's reserve with, each under the root tweaked.
+    fn root_secret(&self) -> Result<SecretKey, Failure> {
+        SecretKey::from_slice(&self.hub.deposit_root_secret()).map_err(|_| {
+            tracing::error!("no deposit root");
+            Failure(Problem::new(Code::Unavailable, "the hub cannot serve now"))
+        })
+    }
+
+    /// The hub's deposit root, as it publishes it.
+    fn root(&self) -> Result<XOnlyPublicKey, Failure> {
+        Ok(self.root_secret()?.x_only_public_key(&Secp256k1::new()).0)
+    }
+
+    /// The secret the hub claims `record`'s deposit with.
+    fn claim_secret(&self, record: &Record) -> Result<SecretKey, Failure> {
+        match record.close {
+            None => self.claim_key(&record.hash),
+            Some(_) => Ok(close_claim_secret(
+                &self.root_secret()?,
+                &record.hash,
+                &record.htlc.refund,
+            )),
+        }
     }
 
     /// The key the hub claims the deposit under `hash` with.
@@ -1160,7 +1219,7 @@ impl Gateway {
         // A contract's close waits for its wallet, which comes back after the
         // close: no lock is made for it, nor is it given up, till it asks.
         if record.close.as_ref().is_some_and(|close| !close.asked) {
-            if record.spent_by.is_some() || scanned > record.htlc.timeout {
+            if record.spent_by.is_some() || record.refund_height().is_some_and(|h| scanned > h) {
                 tracing::info!(hash = %name, "a contract's close never asked for: its payer takes the coins back");
                 return self.finish(record, "canceled");
             }
@@ -1168,7 +1227,10 @@ impl Gateway {
         }
         let body: Deposit = serde_json::from_str(&record.body).map_err(|_| store_gone())?;
         let ((keyset, ephemeral, _), outputs) = (body.receive.terms()?, body.receive.outputs()?);
-        let (lock_depth, timeout) = (self.lock_depth(), record.htlc.timeout);
+        let (lock_depth, timeout) = (
+            self.lock_depth(),
+            record.refund_height().ok_or_else(store_gone)?,
+        );
         // Until the lock under the hash is recorded.
         let _turn = self.peer.turn().await;
         // A lock made before the gateway stopped, or for a receipt under
@@ -1318,7 +1380,10 @@ impl Gateway {
             Some(raw) => Some(deserialize::<Transaction>(raw).map_err(|_| store_gone())?),
             None => None,
         };
-        let left = record.htlc.timeout.saturating_sub(scanned);
+        let left = record
+            .refund_height()
+            .ok_or_else(store_gone)?
+            .saturating_sub(scanned);
         let tx = match self.make_claim(record, old.as_ref(), left).await? {
             Some(tx) => {
                 self.store
@@ -1370,7 +1435,7 @@ impl Gateway {
             None
         });
         let rate = deadline::rate(estimated, c.min_fee_rate, left);
-        let secret = self.claim_key(&record.hash)?;
+        let secret = self.claim_secret(record)?;
         let value = Amount::from_sat(record.pays);
         let build = |rate| {
             record.htlc.claim_capped(

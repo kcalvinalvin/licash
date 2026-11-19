@@ -191,6 +191,59 @@ fn a_relative_refund_waits_blocks_after_the_payment_and_names_no_height() {
     assert!(!relative.claimed_by(&tx, funding()));
 }
 
+/// A hub publishes a deposit root; the claim key of a close deposit is the
+/// root tweaked by the deposit's hash and its payer's refund key, which the
+/// hub signs with the root's secret tweaked the same: whichever the parity of
+/// the root's point.
+#[test]
+fn a_close_deposits_claim_key_is_derived_from_the_hubs_root_and_signed_by_its_secret() {
+    use licash_onchain::deposit::{close_claim_key, close_claim_secret};
+    let (mut odd, mut even) = (0, 0);
+    for seed in 1..=40u8 {
+        let root_secret = secret(seed);
+        let root = key(&root_secret);
+        let hash = [seed; 32];
+        let refund = key(&secret(seed.wrapping_add(100)));
+        let public = close_claim_key(&root, &hash, &refund);
+        let claim = close_claim_secret(&root_secret, &hash, &refund);
+        assert_eq!(key(&claim), public, "root {seed}");
+        let parity = root_secret
+            .public_key(&Secp256k1::new())
+            .x_only_public_key()
+            .1;
+        match parity {
+            bitcoin::secp256k1::Parity::Odd => odd += 1,
+            _ => even += 1,
+        }
+    }
+    assert!(odd > 0 && even > 0, "{odd} odd roots, {even} even");
+    // Of the hash, of the refund key, and of the root: each its own key.
+    let root = key(&secret(1));
+    let (hash, refund) = ([9; 32], key(&secret(2)));
+    let base = close_claim_key(&root, &hash, &refund);
+    assert_ne!(base, close_claim_key(&root, &[10; 32], &refund));
+    assert_ne!(base, close_claim_key(&root, &hash, &key(&secret(3))));
+    assert_ne!(base, close_claim_key(&key(&secret(4)), &hash, &refund));
+    // A claim signed with it spends the deposit it keys.
+    let htlc = Htlc {
+        hash: sha256::Hash::hash(&[7; 32]).to_byte_array(),
+        claim: close_claim_key(
+            &root,
+            &sha256::Hash::hash(&[7; 32]).to_byte_array(),
+            &refund,
+        ),
+        refund,
+        timeout: 0,
+        wait: Some(licash_onchain::deposit::CLOSE_WAIT),
+    };
+    let claim = close_claim_secret(&secret(1), &htlc.hash, &refund);
+    let rate = FeeRate::from_sat_per_vb(1).unwrap();
+    let tx = htlc
+        .claim_tx(funding(), VALUE, to(), rate, &claim, &[7; 32])
+        .unwrap();
+    verify(&htlc, &tx, &htlc.claim_script(), &htlc.claim);
+}
+
 #[test]
 fn a_deposit_too_small_for_its_fee_is_not_spent() {
     let htlc = htlc();

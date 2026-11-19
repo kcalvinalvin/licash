@@ -1624,7 +1624,7 @@ async fn a_close_deposit_is_the_reserve_exactly_for_the_most_notes_it_covers() {
         body.close,
         Some(licash_api::CloseTerms {
             pays: 3_000,
-            timeout
+            until: timeout
         })
     );
     // Notes other than the most it covers, a timeout too soon or too far
@@ -1632,7 +1632,7 @@ async fn a_close_deposit_is_the_reserve_exactly_for_the_most_notes_it_covers() {
     let mut fewer = body.clone();
     fewer.close = Some(licash_api::CloseTerms {
         pays: 3_100,
-        timeout,
+        until: timeout,
     });
     let refused = net.deposits.deposit(&fewer).await.unwrap_err();
     assert_eq!(refused.0.code, Code::Forward);
@@ -1640,7 +1640,7 @@ async fn a_close_deposit_is_the_reserve_exactly_for_the_most_notes_it_covers() {
         let mut asked = body.clone();
         asked.close = Some(licash_api::CloseTerms {
             pays: 3_000,
-            timeout: bad,
+            until: bad,
         });
         // Another hash: the same notes under a timeout of its own.
         asked.receive = licash_api::Receive::new(
@@ -1756,13 +1756,14 @@ async fn a_close_deposit_is_locked_when_its_wallet_asks_not_when_it_is_paid() {
 }
 
 #[tokio::test]
-async fn a_close_deposit_never_asked_for_is_given_up_at_its_timeout_and_refunded() {
+async fn a_close_deposit_never_asked_for_is_given_up_a_wait_after_its_payment_and_refunded() {
+    use licash_onchain::deposit::CLOSE_WAIT;
     let net = Net::new().await;
     let alice = net.wallet("alice");
-    let (close, timeout) = close_deposit(&net, &alice).await;
+    let (close, until) = close_deposit(&net, &alice).await;
     let hash = bytes(&close.hash);
     net.deposits
-        .bind_close(close.script.as_bytes(), [1; 32], 3_000, 100, timeout)
+        .bind_close(close.script.as_bytes(), [1; 32], 3_000, 100, until)
         .unwrap();
     let address = alice
         .deposit_of(&close.hash)
@@ -1771,25 +1772,47 @@ async fn a_close_deposit_never_asked_for_is_given_up_at_its_timeout_and_refunded
         .unwrap()
         .address;
     net.mine(1, vec![payment(&address, 3_000, 1)]);
+    let paid_at = net.height();
     net.mine(3, Vec::new());
     net.deposits.round().await;
-    // Not asked for: kept, locked to no one.
-    assert_eq!(
-        net.deposits.deposit_status(&hash).unwrap().status.state,
-        ReceiveState::Open
-    );
-    // Past its timeout: given up, and the wallet takes the coins back.
-    let to_go = timeout.saturating_sub(net.height()) + 1;
-    net.mine(to_go, Vec::new());
+    // Not asked for: kept, locked to no one, well past the block it was
+    // watched for until, a wait counted from its payment.
+    let state = || net.deposits.deposit_status(&hash).unwrap().status.state;
+    assert_eq!(state(), ReceiveState::Open);
+    let wait = u32::from(CLOSE_WAIT);
+    net.mine(paid_at + wait - 2 - net.height(), Vec::new());
     net.deposits.round().await;
-    assert_eq!(
-        net.deposits.deposit_status(&hash).unwrap().status.state,
-        ReceiveState::Canceled
-    );
-    let funded = alice.follow_deposit(&close.hash).await;
-    assert!(funded.is_err() || funded.unwrap().state != DepositState::Received);
+    assert_eq!(state(), ReceiveState::Open);
+    // Her payer may take it back from block paid_at + wait: given up as it
+    // can be, and the wallet takes the coins back.
+    net.mine(2, Vec::new());
+    net.deposits.round().await;
+    assert_eq!(state(), ReceiveState::Canceled);
+    let funded = alice.follow_deposit(&close.hash).await.unwrap();
+    assert_ne!(funded.state, DepositState::Received);
+    assert_eq!(funded.refund_height(), Some(paid_at + wait - 1));
     let due = alice.deposits_to_refund(net.height()).unwrap();
     assert_eq!(due.len(), 1, "{due:?}");
+    assert!(alice
+        .deposits_to_refund(paid_at + wait - 2)
+        .unwrap()
+        .is_empty());
+    // Its refund waits on the payment's depth, not on a height.
+    let (outpoint, _) = funded.funding.unwrap();
+    let refund = alice
+        .refund_deposit(
+            &close.hash,
+            outpoint,
+            Amount::from_sat(3_000),
+            sweep_to(),
+            FeeRate::from_sat_per_vb_u32(1),
+        )
+        .unwrap();
+    assert_eq!(refund.lock_time, bitcoin::absolute::LockTime::ZERO);
+    assert_eq!(
+        refund.input[0].sequence,
+        bitcoin::Sequence::from_height(CLOSE_WAIT)
+    );
 }
 
 #[tokio::test]

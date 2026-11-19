@@ -86,6 +86,9 @@ async fn hub_serving(
     let openings = Openings::with_wallet(dir, source.clone(), source.clone(), keyset, range);
     let openings = openings.await?;
     let deposits = deposits_for(&hub, &source, dir, &openings)?;
+    // An opening takes a deposit of the hub's for her reserve, which it
+    // gives only once it follows a chain.
+    followed(&hub, &source, &deposits).await?;
     let services = Services {
         contracts: Some(openings),
         deposits: Some(deposits),

@@ -2179,8 +2179,12 @@ async fn refund(
         .parse::<bitcoin::Address<_>>()?
         .assume_checked();
     let tip = source.tip().await?.height;
-    if tip < terms.timeout {
-        bail!("refundable after block {}, the tip is {tip}", terms.timeout);
+    // A deposit that returns a contract's reserve is refundable a wait after
+    // its payment, which its hub may never have seen: the network judges it.
+    if let Some(due) = deposit.refund_height() {
+        if tip < due {
+            bail!("refundable after block {due}, the tip is {tip}");
+        }
     }
     let found = source.unspent(&address).await?;
     let Some(paid) = found.first() else {

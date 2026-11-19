@@ -1017,6 +1017,39 @@ pub struct Deposits {
     /// Blocks from the request to its timeout, after which its payer may
     /// take the coins back.
     pub timeout: u32,
+    /// Its deposit root, an x-only key, from which anyone derives the key it
+    /// claims a deposit that returns a contract's reserve with
+    /// (`licash_onchain::deposit::close_claim_key`): a hub with none opens
+    /// no contract, and a wallet restored from its seed rebuilds every
+    /// address of such a deposit from the root alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub close_root: Option<XOnly>,
+}
+
+/// An x-only public key, as hex in JSON.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct XOnly(pub [u8; 32]);
+
+impl std::fmt::Debug for XOnly {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "XOnly({})", hex::encode(self.0))
+    }
+}
+
+impl Serialize for XOnly {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&hex::encode(self.0))
+    }
+}
+
+impl<'de> Deserialize<'de> for XOnly {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        let mut key = [0; 32];
+        hex::decode_to_slice(&text, &mut key)
+            .map_err(|_| serde::de::Error::custom("an x-only key is 32 bytes of hex"))?;
+        Ok(Self(key))
+    }
 }
 
 impl Deposits {
@@ -1070,17 +1103,19 @@ pub struct Deposit {
 
 /// What a deposit asks besides when a contract's default close returns the
 /// holder's reserve to it. Its payment is that reserve exactly, the notes
-/// it locks the most that covers (`Deposits::most_for`), and it times out
-/// where the contract's Base says, not a window after the request. Its
-/// notes are locked once she asks, when she comes back after the close,
-/// not when the payment confirms. Until the hub's contracts bind it to the
-/// contract that names it, the hub keeps it for the deposit window only.
+/// it locks the most that covers (`Deposits::most_for`), and she takes the
+/// coins back `licash_onchain::deposit::CLOSE_WAIT` blocks after it confirms,
+/// whenever the default is posted. Its notes are locked once she asks, when
+/// she comes back after the close, not when the payment confirms. Until the
+/// hub's contracts bind it to the contract that names it, the hub keeps it
+/// for the deposit window only, and then until `until`, the block the
+/// contract's Base gives, for the default's payment.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CloseTerms {
     /// What its payment is.
     pub pays: u64,
-    /// The block after which she may take the coins back.
-    pub timeout: u32,
+    /// The block the hub gives up watching for its payment at.
+    pub until: u32,
 }
 
 /// A deposit's terms: pay exactly `amount` to `address`, in a block up to

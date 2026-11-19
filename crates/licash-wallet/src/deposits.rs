@@ -30,7 +30,7 @@ use licash::{
     spend::{lock_hash, ProposalId},
 };
 use licash_api::{CloseTerms, Code, DepositStatus, Depositing, Hex, Info, Receive, ReceiveState};
-use licash_onchain::deposit::Htlc;
+use licash_onchain::deposit::{close_claim_key, Htlc, CLOSE_WAIT};
 use rand_core::{OsRng, RngCore};
 use rusqlite::{params, OptionalExtension, Row};
 
@@ -79,6 +79,28 @@ pub struct Deposit {
     pub lock: Option<String>,
     pub state: DepositState,
     pub created_at: i64,
+    /// Whether it returns a contract's reserve, which its payer takes back
+    /// [`CLOSE_WAIT`] blocks after its payment, not at a height.
+    pub close: bool,
+}
+
+impl Deposit {
+    /// The height after which its payer may take its coins back: its
+    /// timeout, or for a deposit that returns a contract's reserve a wait
+    /// after its payment confirmed, none until the hub saw it. None if
+    /// its terms were never answered.
+    pub fn refund_height(&self) -> Option<u32> {
+        match (self.close, &self.funding, &self.terms) {
+            (true, Some((_, height)), _) => Some(
+                height
+                    .saturating_add(u32::from(CLOSE_WAIT))
+                    .saturating_sub(1),
+            ),
+            (true, None, _) => None,
+            (false, _, Some(terms)) => Some(terms.timeout),
+            (false, _, None) => None,
+        }
+    }
 }
 
 /// A deposit that a contract's default close pays her reserve to
@@ -115,6 +137,25 @@ pub enum DepositState {
     Canceled(String),
     /// Taken back by the refund of this id.
     Refunded(Txid),
+}
+
+/// The deposit that returns a contract's reserve, under the hash and refund
+/// key her seed gives, of the hub whose deposit root is `root`: its claim key
+/// derived from it, its refund [`CLOSE_WAIT`] blocks after its payment.
+pub(crate) fn close_htlc(root: &XOnlyPublicKey, hash: &[u8; 32], refund: &XOnlyPublicKey) -> Htlc {
+    Htlc {
+        hash: *hash,
+        claim: close_claim_key(root, hash, refund),
+        refund: *refund,
+        timeout: 0,
+        wait: Some(CLOSE_WAIT),
+    }
+}
+
+/// Whether a deposit's stored request (`body`) is of one that returns a
+/// contract's reserve: one a stored request that does not read is not.
+fn closes(body: &str) -> bool {
+    serde_json::from_str::<licash_api::Deposit>(body).is_ok_and(|asked| asked.close.is_some())
 }
 
 fn hash_id(hash: &str) -> Result<[u8; 32], Error> {
@@ -196,13 +237,17 @@ impl<T: Transport> Wallet<T> {
     /// payment covers, the rest, `fee`, the hub's if it swaps. Recorded only
     /// with the terms its hub answered, checked. The wallet asks for its
     /// lock, and claims the notes, once the close is paid
-    /// ([`Wallet::follow_deposit`]); else takes the coins back after the
-    /// timeout ([`Wallet::deposits_to_refund`]).
+    /// ([`Wallet::follow_deposit`]); else takes the coins back
+    /// [`CLOSE_WAIT`] blocks after the close paid it
+    /// ([`Wallet::deposits_to_refund`]). Its address is of her keys and the
+    /// hub's published root alone, as is the key that claims it, so a wallet
+    /// restored from its seed finds it again ([`Wallet::find_close_deposits`]);
+    /// `until` is the block the hub gives up watching for the close's payment.
     pub async fn close_deposit(
         &self,
         url: &str,
         pays: u64,
-        timeout: u32,
+        until: u32,
     ) -> Result<CloseDeposit, Error> {
         let url = hub_url(url)?;
         self.not_visited(&url)?;
@@ -219,7 +264,7 @@ impl<T: Transport> Wallet<T> {
                     "hub {url} takes no deposit of the notes {pays} sat pays for"
                 ))
             })?;
-        let close = CloseTerms { pays, timeout };
+        let close = CloseTerms { pays, until };
         let deposit = self
             .deposit_answered(hub, &info, amount, Some(close))
             .await?;
@@ -409,6 +454,9 @@ impl<T: Transport> Wallet<T> {
         info: &Info,
     ) -> Result<Vec<Deposit>, Error> {
         let address = info.address.to_bytes();
+        let root = (info.deposits.as_ref())
+            .and_then(|d| d.close_root)
+            .and_then(|r| XOnlyPublicKey::from_slice(&r.0).ok());
         let (mut number, mut unknown, mut next) = (0u32, 0u32, 0u32);
         let mut found = Vec::new();
         while unknown < GAP {
@@ -423,7 +471,7 @@ impl<T: Transport> Wallet<T> {
                 || match self.get(url, &licash_api::deposit_state(&hash)).await {
                     Ok(status) => {
                         let drawn = (preimage, refund, ephemeral.public());
-                        match self.found_deposit(hub, url, drawn, status) {
+                        match self.found_deposit(hub, url, drawn, status, root) {
                             Ok(()) => found.push(self.deposit_record(&hash)?),
                             Err(Error::Invalid(reason)) => {
                                 tracing::warn!(hash = %hex::encode(hash), %url, %reason, "a deposit found not this wallet's");
@@ -466,6 +514,7 @@ impl<T: Transport> Wallet<T> {
         url: &str,
         drawn: ([u8; 32], SecretKey, licash::crypto::Point),
         status: DepositStatus,
+        root: Option<XOnlyPublicKey>,
     ) -> Result<(), Error> {
         let (preimage, refund_key, mine) = drawn;
         let wrong = |why: &str| Error::Invalid(format!("hub {url} found a deposit {why}"));
@@ -482,14 +531,23 @@ impl<T: Transport> Wallet<T> {
             .iter()
             .try_fold(0u64, |sum, o| sum.checked_add(o.denomination()))
             .ok_or_else(|| wrong("of outputs overflowing"))?;
-        let claim =
-            XOnlyPublicKey::from_slice(&terms.claim.0).map_err(|_| wrong("claimed by no key"))?;
-        let htlc = Htlc {
-            hash,
-            claim,
-            refund: x_only(&refund_key),
-            timeout: terms.timeout,
-            wait: None,
+        let htlc = match (&request.close, root) {
+            // Of her keys and the hub's root, as when it was asked.
+            (Some(_), Some(root)) => close_htlc(&root, &hash, &x_only(&refund_key)),
+            (Some(_), None) => {
+                return Err(wrong("that returns a contract's reserve, no root named"))
+            }
+            (None, _) => {
+                let claim = XOnlyPublicKey::from_slice(&terms.claim.0)
+                    .map_err(|_| wrong("claimed by no key"))?;
+                Htlc {
+                    hash,
+                    claim,
+                    refund: x_only(&refund_key),
+                    timeout: terms.timeout,
+                    wait: None,
+                }
+            }
         };
         let network = licash_onchain::network(self.network());
         if htlc.address(network).to_string() != terms.address {
@@ -561,7 +619,7 @@ fn keep_terms(
         params![
             hash,
             htlc.claim.serialize(),
-            htlc.timeout,
+            terms.timeout,
             sql(terms.amount)?,
             terms.fund_by,
             htlc.address(network).to_string(),
@@ -742,14 +800,31 @@ impl<T: Transport> Wallet<T> {
             .ok_or_else(|| wrong("but takes none".into()))?;
         let height = info.locks.as_ref().map(|l| l.height);
         let height = height.ok_or_else(|| wrong("but follows no chain".into()))?;
-        let claim = XOnlyPublicKey::from_slice(&terms.claim.0)
-            .map_err(|_| wrong("claimed by no key".into()))?;
-        let htlc = Htlc {
-            hash: *hash,
-            claim,
-            refund: x_only(refund),
-            timeout: terms.timeout,
-            wait: None,
+        let htlc = match close {
+            // Of her keys and the hub's root: the hub's word names no claim
+            // key or timeout of it.
+            Some(_) => {
+                let root = deposits.close_root.ok_or_else(|| {
+                    wrong(
+                        "that returns a contract's reserve, but it publishes no deposit root"
+                            .into(),
+                    )
+                })?;
+                let root = XOnlyPublicKey::from_slice(&root.0)
+                    .map_err(|_| wrong("under no root key".into()))?;
+                close_htlc(&root, hash, &x_only(refund))
+            }
+            None => {
+                let claim = XOnlyPublicKey::from_slice(&terms.claim.0)
+                    .map_err(|_| wrong("claimed by no key".into()))?;
+                Htlc {
+                    hash: *hash,
+                    claim,
+                    refund: x_only(refund),
+                    timeout: terms.timeout,
+                    wait: None,
+                }
+            }
         };
         let network = licash_onchain::network(self.network());
         let address = terms
@@ -761,16 +836,12 @@ impl<T: Transport> Wallet<T> {
             return Err(wrong(format!("at {}, not its terms", terms.address)));
         }
         match close {
-            // Her contract's reserve exactly, for the most notes it covers,
-            // timing out where her Base says.
+            // Her contract's reserve exactly, for the most notes it covers.
             Some(close) => {
-                if terms.amount != close.pays
-                    || deposits.most_for(close.pays) != Some(amount)
-                    || terms.timeout != close.timeout
-                {
+                if terms.amount != close.pays || deposits.most_for(close.pays) != Some(amount) {
                     return Err(wrong(format!(
-                        "of {} timing out at block {}, not as her contract's close",
-                        terms.amount, terms.timeout
+                        "of {} for {amount}, not as her contract's close",
+                        terms.amount
                     )));
                 }
             }
@@ -820,18 +891,18 @@ impl<T: Transport> Wallet<T> {
         rate: FeeRate,
     ) -> Result<Transaction, Error> {
         let hash = hash_id(hash)?;
-        type Row = ([u8; 32], Option<[u8; 32]>, Option<u32>, bool);
+        type Row = ([u8; 32], Option<[u8; 32]>, Option<u32>, bool, String);
         let row: Option<Row> = self.store.read(|c| {
             Ok(c.query_row(
-                "SELECT d.refund_key, t.claim_key, t.timeout_height, d.done_at IS NOT NULL
+                "SELECT d.refund_key, t.claim_key, t.timeout_height, d.done_at IS NOT NULL, d.body
                  FROM deposits d LEFT JOIN deposit_terms t ON t.hash = d.hash
                  WHERE d.hash = ?1",
                 [hash],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )
             .optional()?)
         })?;
-        let (refund_key, claim, timeout, received) =
+        let (refund_key, claim, timeout, received, body) =
             row.ok_or_else(|| Error::UnknownPayment(hex::encode(hash)))?;
         if received {
             return Err(Error::Invalid(
@@ -849,7 +920,8 @@ impl<T: Transport> Wallet<T> {
             claim: XOnlyPublicKey::from_slice(&claim).map_err(invalid)?,
             refund: x_only(&secret),
             timeout,
-            wait: None,
+            // A close deposit waits after its payment, and names no height.
+            wait: closes(&body).then_some(CLOSE_WAIT),
         };
         let tx = htlc
             .refund_tx(funding, value, to, rate, &secret)
@@ -881,7 +953,7 @@ impl<T: Transport> Wallet<T> {
     pub fn deposits_to_refund(&self, tip: u32) -> Result<Vec<Deposit>, Error> {
         let mut due = self.deposits()?;
         due.retain(|d| {
-            let past = d.terms.as_ref().is_some_and(|t| tip >= t.timeout);
+            let past = d.refund_height().is_some_and(|height| tip >= height);
             let never_locked = d.state == DepositState::Open && d.lock.is_none();
             past && (matches!(d.state, DepositState::Canceled(_)) || never_locked)
         });
@@ -945,7 +1017,7 @@ impl<T: Transport> Wallet<T> {
 
 const DEPOSITS: &str = "SELECT d.hash, r.url, d.amount, t.address, t.timeout_height, t.pays,
     t.fund_by_height, f.txid, f.vout, f.height, d.done_at IS NOT NULL, d.canceled, d.refund,
-    d.created_at, d.lock
+    d.created_at, d.lock, d.body
     FROM deposits d JOIN reach r ON r.hub = d.hub
     LEFT JOIN deposit_terms t ON t.hash = d.hash
     LEFT JOIN deposit_fundings f ON f.hash = d.hash";
@@ -998,5 +1070,6 @@ fn deposit_of(r: &Row<'_>) -> rusqlite::Result<Deposit> {
         lock: r.get::<_, Option<Vec<u8>>>(14)?.map(hex::encode),
         state,
         created_at: r.get(13)?,
+        close: closes(&r.get::<_, String>(15)?),
     })
 }
