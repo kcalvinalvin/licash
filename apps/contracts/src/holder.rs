@@ -390,7 +390,7 @@ pub async fn resume<T: Transport, C: Chain>(
         // Live: carried on, F broadcast again and its fate found anew, only
         // once its block left the chain.
         if contract.fate == Some(Fate::Live) {
-            match unburied_f(&store, chain, &id, tip).await {
+            match unburied_f(&store, chain, &id).await {
                 Ok(true) => {}
                 Ok(false) => continue,
                 Err(e) => {
@@ -450,22 +450,18 @@ pub async fn resume<T: Transport, C: Chain>(
     Ok(all)
 }
 
-/// Whether F of the live contract `id` left the chain, at `tip`, since
-/// found buried: the block it was found in, followed until
-/// [`store::BURIED`] deep, replaced. Its fate is then open again, to be
-/// found anew. One found live by a build before is not followed: trusted
-/// as it stands.
-async fn unburied_f(store: &Store, chain: &impl Chain, id: &[u8; 32], tip: u32) -> Result<bool> {
+/// Whether F of the live contract `id` left the chain since found buried:
+/// the block it was found in, followed for as long as the contract lasts
+/// however deep (a reorganization deeper than any expected takes it out
+/// all the same), replaced. Its fate is then open again, to be found
+/// anew. One found live by a build before, or buried deep under one, is
+/// not followed: trusted as it stands.
+async fn unburied_f(store: &Store, chain: &impl Chain, id: &[u8; 32]) -> Result<bool> {
     let Some((height, hash)) = store.fate_block(id)? else {
         return Ok(false);
     };
     match chain.hash(height).await {
-        Ok(now) if now == hash => {
-            if tip.saturating_add(1).saturating_sub(height) >= store::BURIED {
-                store.buried(id)?;
-            }
-            Ok(false)
-        }
+        Ok(now) if now == hash => Ok(false),
         Ok(_) => {
             tracing::warn!(id = %crate::hex_id(id), height, "F's block left the chain: its fate found again");
             store.unbury(id)?;
@@ -914,7 +910,7 @@ fn found(store: &Store, id: &[u8; 32]) -> Result<Contract> {
 
 #[cfg(test)]
 mod tests {
-    use bitcoin::{hashes::Hash as _, Block, BlockHash, Transaction, Txid};
+    use bitcoin::{hashes::Hash as _, Block, BlockHash, Transaction, TxOut, Txid};
     use licash::{chain::Checkpoint, spend::ChainProfile};
     use licash_wallet::{Blocks, Response};
 
@@ -1297,6 +1293,9 @@ mod tests {
         f: Option<(u32, Transaction)>,
         asked: std::sync::atomic::AtomicU32,
         sent: std::sync::Mutex<Vec<Transaction>>,
+        /// Its blocks' filters, of the coins `spends` its F spends.
+        filters: Option<Vec<TxOut>>,
+        fetched: std::sync::atomic::AtomicU32,
     }
 
     impl Fork {
@@ -1307,7 +1306,14 @@ mod tests {
                 f: f.map(|(at, tx)| (at, tx.clone())),
                 asked: Default::default(),
                 sent: Default::default(),
+                filters: None,
+                fetched: Default::default(),
             }
+        }
+
+        fn filtered(mut self, spends: &[TxOut]) -> Self {
+            self.filters = Some(spends.to_vec());
+            self
         }
 
         fn at(&self, height: u32) -> Block {
@@ -1332,10 +1338,26 @@ mod tests {
                 false => Err(format!("no block {height}")),
             }
         }
-        async fn filter(&self, _: &BlockHash) -> Result<Option<Vec<u8>>, String> {
-            Ok(None)
+        async fn filter(&self, hash: &BlockHash) -> Result<Option<Vec<u8>>, String> {
+            let Some(spends) = &self.filters else {
+                return Ok(None);
+            };
+            let block = (0..=self.tip)
+                .map(|h| self.at(h))
+                .find(|b| b.block_hash() == *hash);
+            let block = block.ok_or_else(|| format!("no block {hash}"))?;
+            let filter = bitcoin::bip158::BlockFilter::new_script_filter(&block, |o| {
+                let i = (self.f.iter().flat_map(|(_, tx)| &tx.input))
+                    .position(|i| i.previous_output == *o)
+                    .ok_or(bitcoin::bip158::Error::UtxoMissing(*o))?;
+                Ok(spends[i].script_pubkey.clone())
+            })
+            .map_err(|e| e.to_string())?;
+            Ok(Some(filter.content))
         }
         async fn block(&self, hash: &BlockHash) -> Result<Block, String> {
+            self.fetched
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             (0..=self.tip)
                 .map(|h| self.at(h))
                 .find(|b| b.block_hash() == *hash)
@@ -1354,7 +1376,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_live_f_whose_block_leaves_the_chain_is_watched_again_until_buried() {
+    async fn a_live_f_whose_block_leaves_the_chain_however_deep_is_watched_again() {
         let dir = tempfile::tempdir().unwrap();
         let regtest = ChainProfile::Core30DefaultRegtest;
         let path = dir.path().join("wallet.sqlite");
@@ -1403,8 +1425,16 @@ mod tests {
         assert_eq!(fate(&chain).await, Some(Fate::Live));
         assert_eq!(chain.asked.load(std::sync::atomic::Ordering::SeqCst), 0);
 
-        // Found live in its block: followed while that block stands,
-        // until buried.
+        // Found live in its block: followed while that block stands. Of
+        // a chain serving filters, only the block spending her coins read.
+        store.set_fate(&id, Fate::Open).unwrap();
+        let spends = holder.funding().unwrap().prevouts.to_vec();
+        let filtered = Fork::new(250, 0, Some((247, &f))).filtered(&spends);
+        assert_eq!(fate(&filtered).await, Some(Fate::Live));
+        assert_eq!(
+            filtered.fetched.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
         store.set_fate(&id, Fate::Open).unwrap();
         assert_eq!(fate(&chain).await, Some(Fate::Live));
         let block = (247, chain.at(247).block_hash());
@@ -1421,18 +1451,19 @@ mod tests {
         assert_eq!(store.fate_block(&id).unwrap(), None);
         assert_eq!(*replaced.sent.lock().unwrap(), std::slice::from_ref(&f));
 
-        // Mined again in another block: live, followed there; buried six
-        // deep, no longer.
+        // Mined again in another block: live, followed there, however
+        // deep.
         let again = Fork::new(250, 1, Some((249, &f)));
         assert_eq!(fate(&again).await, Some(Fate::Live));
         let block = (249, again.at(249).block_hash());
         assert_eq!(store.fate_block(&id).unwrap(), Some(block));
-        let buried = Fork::new(254, 1, Some((249, &f)));
+        let buried = Fork::new(270, 1, Some((249, &f)));
         assert_eq!(fate(&buried).await, Some(Fate::Live));
+        assert_eq!(store.fate_block(&id).unwrap(), Some(block));
+        // A reorganization deeper than any expected: open again, found
+        // anew.
+        let deep = Fork::new(280, 2, None);
+        assert_eq!(fate(&deep).await, Some(Fate::Open));
         assert_eq!(store.fate_block(&id).unwrap(), None);
-        // Then never looked at again.
-        let deep = Fork::new(260, 2, None);
-        assert_eq!(fate(&deep).await, Some(Fate::Live));
-        assert_eq!(deep.asked.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 }

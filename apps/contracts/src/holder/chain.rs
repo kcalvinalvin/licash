@@ -91,9 +91,10 @@ pub fn fee_rate_of(block: &Block, height: u32) -> Option<FeeRate> {
 }
 
 /// Where `holder`'s F stands on `chain`, its inputs looked up in the
-/// blocks from `since` to the tip: none before she knows F. Once live,
-/// with the block F is in, its height and hash: while the chain keeps
-/// that block, F stays buried.
+/// blocks from `since` to the tip, only those whose filter (where the
+/// chain serves them) matches a coin they spend: none before she knows F.
+/// Once live, with the block F is in, its height and hash: while the
+/// chain keeps that block, F stays buried.
 pub async fn fate(
     holder: &Holder,
     chain: &impl Chain,
@@ -104,12 +105,28 @@ pub async fn fate(
     };
     let txid = funding.tx.compute_txid();
     let inputs: Vec<OutPoint> = funding.tx.input.iter().map(|i| i.previous_output).collect();
+    let scripts: Vec<&[u8]> = (funding.prevouts.iter())
+        .map(|o| o.script_pubkey.as_bytes())
+        .collect();
     let tip = chain.height().await.map_err(|e| anyhow!(e))?;
     let mut spent: HashMap<OutPoint, (Txid, u32)> = HashMap::new();
     let mut found = None;
     for height in since..=tip {
         let hash = chain.hash(height).await.map_err(|e| anyhow!(e))?;
+        // A filter that matches none of the coins F spends: no block of
+        // them, F's or another's.
+        if let Some(filter) = chain.filter(&hash).await.map_err(|e| anyhow!(e))? {
+            if !bitcoin::bip158::BlockFilter::new(&filter)
+                .match_any(&hash, scripts.iter().copied())?
+            {
+                continue;
+            }
+        }
         let block = chain.block(&hash).await.map_err(|e| anyhow!(e))?;
+        anyhow::ensure!(
+            block.block_hash() == hash,
+            "block {hash} does not match its header"
+        );
         for tx in &block.txdata {
             for input in &tx.input {
                 if inputs.contains(&input.previous_output) {

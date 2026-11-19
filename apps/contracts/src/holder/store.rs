@@ -122,10 +122,10 @@ CREATE TABLE IF NOT EXISTS folds (
 ";
 
 /// The block each contract's F was found buried in, its height and hash,
-/// while not [`BURIED`] deep: once the chain no longer has it there, F's
-/// fate is to be found again. A contract live without one was found so
-/// by a build before it, or is buried: trusted as it stands. Made with the
-/// first.
+/// for as long as the contract lasts: once the chain no longer has it
+/// there, F's fate is to be found again. A contract live without one was
+/// found so by a build before it, or buried six deep under one that
+/// stopped following it there: trusted as it stands. Made with the first.
 const FATE_BLOCKS: &str = "
 CREATE TABLE IF NOT EXISTS fate_blocks (
     id BLOB PRIMARY KEY REFERENCES contracts (id),
@@ -133,10 +133,6 @@ CREATE TABLE IF NOT EXISTS fate_blocks (
     hash BLOB NOT NULL
 ) STRICT;
 ";
-
-/// How deep F's block is followed, after which no reorganization is
-/// expected to take it out of the chain.
-pub const BURIED: u32 = 6;
 
 /// The instances of each opening its hub answered as had, by the index
 /// of each: not sent again when the opening resumes. Made with the first.
@@ -580,7 +576,7 @@ impl Store {
     }
 
     /// F of contract `id` found to be `fate`: if live, in `block`, its
-    /// height and hash, followed until buried ([`FATE_BLOCKS`]).
+    /// height and hash, followed from then on ([`FATE_BLOCKS`]).
     pub fn settle_fate(
         &self,
         id: &[u8; 32],
@@ -627,11 +623,6 @@ impl Store {
                 <BlockHash as bitcoin::hashes::Hash>::from_byte_array(hash),
             )
         }))
-    }
-
-    /// F of contract `id` buried, its block no longer followed.
-    pub fn buried(&self, id: &[u8; 32]) -> Result<()> {
-        unfollow(&self.c, id)
     }
 
     /// The block F of contract `id` was found buried in left the chain:
