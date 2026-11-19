@@ -834,6 +834,15 @@ async fn contracted(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     let price = |cap: u64, blocks: u32| {
         FIXED + licash_api::rate(10_000, u32::try_from(cap).unwrap_or(u32::MAX), blocks)
     };
+    const MIN_CAP: u64 = 4_096;
+    let choose_minimum = || async {
+        until("the minimum contract cap", 20, || async {
+            phone.slide_id("contract-cap", 0.0).await?;
+            let cap = phone.by_id("quote-cap", 5).await?;
+            Ok((amount(&cap.text) == MIN_CAP).then_some(()))
+        })
+        .await
+    };
     /// What a mock contract is worth, said wherever one shows.
     const MOCK: &str = "Test only: protects nothing";
     // Enough in notes to pay for it, and to pay with after.
@@ -861,8 +870,7 @@ async fn contracted(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     // here the least.
     let all = amount(&phone.by_id("quote-cap", 60).await?.text);
     ensure!(all > 90_000, "a cap of {all} offered on the notes held");
-    phone.slide_id("contract-cap", 0.0).await?;
-    phone.tagged("quote-cap", "4,096 sat", 10).await?;
+    choose_minimum().await?;
     phone.tagged("quote-price", "23,000 sat", 10).await?;
     phone.tagged("worth", MOCK, 10).await?;
     phone.tap_id("cash-out-first").await?;
@@ -937,9 +945,8 @@ async fn contracted(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
         "the longest costs more"
     );
     // The least, the coin's price exactly: it turns whole into it.
-    phone.slide_id("contract-cap", 0.0).await?;
-    phone.tagged("quote-cap", "4,096 sat", 10).await?;
-    let cap = 4_096;
+    choose_minimum().await?;
+    let cap = MIN_CAP;
     costs(cap, 1_000).await?;
     let paid = price(cap, 1_000);
     ensure!(paid == coin, "{paid} for {cap} of a coin of {coin}");
