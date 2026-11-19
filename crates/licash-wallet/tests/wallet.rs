@@ -551,7 +551,7 @@ fn a_wallet_file_of_version_5_trusts_every_hub_it_had() {
     let version: i64 = db
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 13);
+    assert_eq!(version, 14);
     assert_eq!(wallet.hubs().unwrap().len(), 1);
     assert_eq!(wallet.balance().unwrap().len(), 1);
     assert!(wallet.visited().unwrap().is_empty());
@@ -572,7 +572,7 @@ async fn a_wallet_file_of_version_6_renews_nothing_unasked() {
     let version: i64 = db
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 13);
+    assert_eq!(version, 14);
     assert_eq!(wallet.unlink().await.unwrap(), 0);
     assert!(wallet.sends().unwrap().is_empty());
     assert_eq!(wallet.hubs().unwrap().len(), 1);
@@ -604,6 +604,8 @@ async fn a_wallet_file_of_version_8_starts_a_privacy_rest_without_reminting() {
     // their unlink flags, and an old receipt timestamp.
     db.execute_batch(
         "ALTER TABLE notes DROP COLUMN unlinked_at;
+         ALTER TABLE payouts DROP COLUMN blind;
+         ALTER TABLE payouts DROP COLUMN share;
          DROP INDEX sends_key;
          ALTER TABLE sends DROP COLUMN key;
          ALTER TABLE locks DROP COLUMN via;
@@ -699,7 +701,7 @@ async fn a_wallet_file_of_version_7_mails_nothing_unasked() {
     let version: i64 = db
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 13);
+    assert_eq!(version, 14);
     // Its payments were mailed, or handed over, as they were made.
     assert_eq!(wallet.delivering().unwrap(), 0);
     assert!(wallet.due().await.unwrap().is_empty());

@@ -845,9 +845,10 @@ pub enum Scanned {
     /// one named, if the owner agrees ([`Wallet::pay_quote`]); `amount` if
     /// it says.
     Visit { amount: Option<u64> },
-    /// An address on Bitcoin, or a `bitcoin:` code naming one: to pay out
-    /// to from notes, through a swap provider ([`Wallet::payout_quote`]),
-    /// `amount` if it says.
+    /// An address on Bitcoin, a silent payment address, or a `bitcoin:`
+    /// code naming either (the silent payment address first, as
+    /// `address`): to pay out to from notes, through a swap provider
+    /// ([`Wallet::payout_quote`]), `amount` if it says.
     Bitcoin {
         address: String,
         amount: Option<u64>,

@@ -29,7 +29,8 @@ use bitcoin::{
     bip158::BlockFilter,
     consensus::{deserialize, serialize},
     hashes::Hash,
-    secp256k1::{SecretKey, XOnlyPublicKey},
+    key::TweakedPublicKey,
+    secp256k1::{PublicKey, SecretKey, XOnlyPublicKey},
     Amount, Block, FeeRate, OutPoint, ScriptBuf, Transaction, Txid,
 };
 use licash::spend::{lock_hash, ChainProfile, ProposalId};
@@ -40,6 +41,8 @@ use licash_api::{
 use licash_onchain::{
     deadline,
     deposit::{self, Htlc},
+    silent::SpAddress,
+    silent_claim::{self, Share},
 };
 use rand_core::{OsRng, RngCore};
 use rusqlite::{params, OptionalExtension, Row};
@@ -48,8 +51,19 @@ use crate::{
     deposits::{random_key, x_only},
     hub_url, invalid,
     locks::Pays,
-    now, sql, unavailable, Blocks, Error, LockState, Transport, Wallet,
+    now, sql, unavailable, Blocks, Error, LockState, PaymentCode, Transport, Wallet,
 };
+
+/// `share`, as the provider answered it, if a share of `blinded` proven
+/// of the secret of `refund`.
+fn proven_share(share: &swaps::Share, refund: &XOnlyPublicKey, blinded: &PublicKey) -> Option<Share> {
+    let share = Share {
+        point: PublicKey::from_slice(&share.point.0).ok()?,
+        e: share.e.0.as_slice().try_into().ok()?,
+        s: share.s.0.as_slice().try_into().ok()?,
+    };
+    share.verify(refund, blinded).then_some(share)
+}
 
 /// Blocks a payout's coin must have left before its timeout when the
 /// wallet claims it, for its claim to confirm before the provider may take
@@ -234,6 +248,9 @@ struct Record {
     claim_key: [u8; 32],
     from: (i64, String),
     script: ScriptBuf,
+    /// Paying a silent payment address: it, the secret its scan key is
+    /// blinded by, and the provider's share of it once proven.
+    silent: Option<(SpAddress, SecretKey, Option<PublicKey>)>,
     amount: u64,
     budget: u64,
     refund: Option<([u8; 32], u32)>,
@@ -290,7 +307,7 @@ impl<T: Transport> Wallet<T> {
     ) -> Result<PayoutQuote, Error> {
         let provider = hub_url(provider)?;
         let from = hub_url(from)?;
-        let (script, address) = self.payout_payee(to)?;
+        let (script, address, _) = self.payout_payee(to)?;
         self.hub(&from)?;
         let (_, from_info) = self.refresh(&from).await?;
         let info: swaps::Info = self.get(&provider, swaps::SWAPS_INFO).await?;
@@ -334,7 +351,8 @@ impl<T: Transport> Wallet<T> {
                 quote.ticket
             )));
         }
-        let (script, address) = self.payout_payee(&quote.address)?;
+        let (script, address, silent) = self.payout_payee(&quote.address)?;
+        let blind = silent.map(|_| random_key().secret_bytes());
         let from_hub = self.hub(from)?.0;
         let (_, from_info) = self.refresh(from).await?;
         let info: swaps::Info = self.get(provider, swaps::SWAPS_INFO).await?;
@@ -358,8 +376,8 @@ impl<T: Transport> Wallet<T> {
         let insert = |tx: &rusqlite::Transaction<'_>| -> Result<(), Error> {
             tx.execute(
                 "INSERT INTO payouts (hash, provider, preimage, claim_key, from_hub, address,
-                    script, amount, budget, fee, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                    script, amount, budget, fee, created_at, blind)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 params![
                     hash,
                     provider,
@@ -371,7 +389,8 @@ impl<T: Transport> Wallet<T> {
                     sql(amount),
                     sql(quote.budget),
                     sql(quote.fee),
-                    now()
+                    now(),
+                    blind
                 ],
             )?;
             Ok(())
@@ -657,7 +676,11 @@ impl<T: Transport> Wallet<T> {
         // Its identity, as kept: its height is asked once a coin is named.
         let (_, from_info) = self.hub(&record.from.1)?;
         let claim = x_only(&record.claim_key()?).serialize();
-        let request = swaps::ChainRequest::new(&from_info.address, &id, claim, record.value());
+        let mut request = swaps::ChainRequest::new(&from_info.address, &id, claim, record.value());
+        if let Some((address, rho, _)) = &record.silent {
+            let blinded = silent_claim::blind(&address.scan, rho).map_err(invalid)?;
+            request = request.with_scan(blinded.serialize());
+        }
         let answer: swaps::ChainSwap = match self.post(provider, swaps::CHAIN_SWAPS, &request).await
         {
             Ok(answer) => answer,
@@ -700,8 +723,24 @@ impl<T: Transport> Wallet<T> {
             return Ok(None);
         }
         let refund = answer.refund().map_err(|p| unavailable(provider, p))?;
-        XOnlyPublicKey::from_slice(&refund)
+        let refund_key = XOnlyPublicKey::from_slice(&refund)
             .map_err(|_| unavailable(provider, "its refund key is no key"))?;
+        // Paying a silent payment address: the provider's share of its
+        // scan key, proven of its refund key, or nothing claimed.
+        let share = match &record.silent {
+            None => None,
+            Some((address, rho, _)) => {
+                let blinded = silent_claim::blind(&address.scan, rho).map_err(invalid)?;
+                match answer.share.as_ref().and_then(|s| proven_share(s, &refund_key, &blinded)) {
+                    Some(share) => Some(share.unblind(rho, &refund_key).map_err(invalid)?.serialize()),
+                    None => {
+                        let reason = "the provider's share of the payee's scan key is missing or false";
+                        self.fail_payout(hash, reason)?;
+                        return Ok(None);
+                    }
+                }
+            }
+        };
         // A time, not a height, under OP_CHECKLOCKTIMEVERIFY: refundable at
         // once.
         if answer.timeout >= LOCK_TIME_THRESHOLD || answer.timeout > ours.expiry {
@@ -715,9 +754,9 @@ impl<T: Transport> Wallet<T> {
         // Its first terms stand: a coin on others is not taken.
         self.store.write(|tx| {
             tx.execute(
-                "UPDATE payouts SET refund_key = ?2, timeout = ?3
+                "UPDATE payouts SET refund_key = ?2, timeout = ?3, share = ?4
                  WHERE hash = ?1 AND refund_key IS NULL",
-                params![hash, refund, answer.timeout],
+                params![hash, refund, answer.timeout, share],
             )?;
             Ok(())
         })?;
@@ -801,11 +840,23 @@ impl<T: Transport> Wallet<T> {
             txid,
             vout: hint.vout,
         };
+        // To a silent payment address: its output, of the coin's key, the
+        // claim key's secret and the provider's share.
+        let script = match &record.silent {
+            None => record.script.clone(),
+            Some((address, _, share)) => {
+                let share = share.ok_or_else(|| invalid("a silent payout of no share"))?;
+                let key = &record.claim_key()?;
+                let output = silent_claim::claim_output(&htlc, key, &share, funding, address)
+                    .map_err(invalid)?;
+                ScriptBuf::new_p2tr_tweaked(TweakedPublicKey::dangerous_assume_tweaked(output))
+            }
+        };
         let claim = htlc
             .claim_exact(
                 funding,
                 output.value,
-                record.script.clone(),
+                script.clone(),
                 Amount::from_sat(record.amount),
                 &record.claim_key()?,
                 &record.preimage,
@@ -814,7 +865,7 @@ impl<T: Transport> Wallet<T> {
         self.store.write(|tx| {
             tx.execute(
                 "UPDATE payouts SET funding_txid = ?2, funding_vout = ?3, funding_height = ?4,
-                    value = ?5, claim_tx = ?6, revealed_at = ?7, scanned = ?4
+                    value = ?5, claim_tx = ?6, revealed_at = ?7, scanned = ?4, script = ?8
                  WHERE hash = ?1 AND claim_tx IS NULL AND failed IS NULL",
                 params![
                     hash,
@@ -823,7 +874,8 @@ impl<T: Transport> Wallet<T> {
                     hint.height,
                     sql(value),
                     serialize(&claim),
-                    now()
+                    now(),
+                    script.as_bytes()
                 ],
             )?;
             Ok(())
@@ -1005,7 +1057,7 @@ impl<T: Transport> Wallet<T> {
                 "SELECT p.provider, p.preimage, p.claim_key, p.from_hub, r.url, p.script,
                     p.amount, p.budget, p.refund_key, p.timeout, p.funding_txid,
                     p.funding_vout, p.funding_height, p.value, p.claim_tx, p.scanned,
-                    p.done_at IS NULL AND p.failed IS NULL
+                    p.done_at IS NULL AND p.failed IS NULL, p.address, p.blind, p.share
                  FROM payouts p JOIN reach r ON r.hub = p.from_hub WHERE p.hash = ?1",
                 [hash],
                 |r| {
@@ -1021,7 +1073,15 @@ impl<T: Transport> Wallet<T> {
                         }
                         _ => None,
                     };
-                    Ok(Record {
+                    let silent = match r.get::<_, Option<[u8; 32]>>(18)? {
+                        Some(blind) => Some((
+                            r.get::<_, String>(17)?,
+                            blind,
+                            r.get::<_, Option<[u8; 33]>>(19)?,
+                        )),
+                        None => None,
+                    };
+                    Ok((Record {
                         provider: r.get(0)?,
                         preimage: r.get(1)?,
                         claim_key: r.get(2)?,
@@ -1034,24 +1094,45 @@ impl<T: Transport> Wallet<T> {
                         claim: r.get(14)?,
                         scanned: r.get(15)?,
                         open: r.get(16)?,
-                    })
+                        silent: None,
+                    }, silent))
                 },
             )
             .optional()?)
         })?;
-        record.ok_or_else(|| Error::UnknownPayment(hex::encode(hash)))
+        let (mut record, silent) =
+            record.ok_or_else(|| Error::UnknownPayment(hex::encode(hash)))?;
+        if let Some((address, blind, share)) = silent {
+            let address = SpAddress::from_str(&address).map_err(invalid)?;
+            let blind = SecretKey::from_slice(&blind).map_err(invalid)?;
+            let share = share.map(|s| PublicKey::from_slice(&s)).transpose().map_err(invalid)?;
+            record.silent = Some((address, blind, share));
+        }
+        Ok(record)
     }
 
-    /// The output script of `to`, an address on the wallet's network, and
-    /// the address as shown.
-    fn payout_payee(&self, to: &str) -> Result<(ScriptBuf, String), Error> {
-        let address = bitcoin::Address::from_str(to.trim())
-            .map_err(|e| Error::Invalid(format!("not an address on Bitcoin: {e}")))?;
+    /// The output script of `to`, an address on the wallet's network, a
+    /// silent payment address, or a code naming either (the silent payment
+    /// address first), and the address as shown. Of a silent payment
+    /// address, its output is known once the coin claimed is: a taproot
+    /// script of no key stands for it, to weigh the claim, with the address.
+    fn payout_payee(&self, to: &str) -> Result<(ScriptBuf, String, Option<SpAddress>), Error> {
         let network = self.network();
+        let code = PaymentCode::from_str(to.trim())
+            .map_err(|e| Error::Invalid(format!("not an address on Bitcoin: {e}")))?;
+        code.check(network)
+            .map_err(|_| Error::Invalid(format!("an address not on {network}")))?;
+        if let Some(silent) = code.silent {
+            let any = ScriptBuf::from_bytes([&[0x51, 0x20][..], &[0; 32]].concat());
+            return Ok((any, silent.to_string(), Some(silent)));
+        }
+        let Some(address) = code.address else {
+            return Err(Error::Invalid("not an address on Bitcoin: no address it names".into()));
+        };
         let address = address
             .require_network(licash_onchain::network(network))
             .map_err(|_| Error::Invalid(format!("an address not on {network}")))?;
-        Ok((address.script_pubkey(), address.to_string()))
+        Ok((address.script_pubkey(), address.to_string(), None))
     }
 }
 

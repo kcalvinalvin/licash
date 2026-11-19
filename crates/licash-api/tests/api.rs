@@ -657,6 +657,17 @@ fn payout_bodies_name_their_fields_on_the_wire() {
     names.sort();
     assert_eq!(names, ["claim", "from", "lock", "value"]);
     assert_eq!(value["claim"], json!("ab".repeat(32)));
+    // Paying a silent payment address: its scan key blinded, 33 bytes.
+    let silent = request.clone().with_scan([0x02; 33]);
+    assert_eq!(json(&silent), silent);
+    assert_eq!(silent.scan().unwrap(), Some([0x02; 33]));
+    assert_eq!(serde_json::to_value(&silent).unwrap()["scan"], json!("02".repeat(33)));
+    assert_eq!(request.scan().unwrap(), None);
+    let short = ChainRequest {
+        scan: Some(Hex(vec![2; 32])),
+        ..request.clone()
+    };
+    assert!(short.scan().is_err());
 
     let answer = ChainSwap {
         id: Hex(id.as_bytes().to_vec()),
@@ -671,6 +682,7 @@ fn payout_bodies_name_their_fields_on_the_wire() {
         }),
         txid: None,
         reason: None,
+        share: None,
     };
     assert_eq!(json(&answer), answer);
     assert_eq!(answer.refund().unwrap(), [0xef; 32]);
@@ -701,6 +713,19 @@ fn payout_bodies_name_their_fields_on_the_wire() {
     let value = serde_json::to_value(&broadcast).unwrap();
     assert_eq!(value["txid"], json!("22".repeat(32)));
     assert_eq!(json(&broadcast), broadcast);
+    let shared = ChainSwap {
+        share: Some(swaps::Share {
+            point: Hex(vec![3; 33]),
+            e: Hex(vec![4; 32]),
+            s: Hex(vec![5; 32]),
+        }),
+        ..broadcast.clone()
+    };
+    assert_eq!(
+        serde_json::to_value(&shared).unwrap()["share"],
+        json!({"point": "03".repeat(33), "e": "04".repeat(32), "s": "05".repeat(32)})
+    );
+    assert_eq!(json(&shared), shared);
     let mut old = value;
     old.as_object_mut().unwrap().remove("txid");
     let old: ChainSwap = serde_json::from_value(old).unwrap();

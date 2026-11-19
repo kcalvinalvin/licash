@@ -72,7 +72,11 @@ Esplora, `esplora+https://esplora.example/api`), the provider also pays notes
 out on Bitcoin: a client locks the coin's value and the fees to it at a hub,
 the provider pays a coin of its own to an HTLC under the lock's hash, timed
 out `--payout-margin` blocks before the lock expires, and claims the lock
-with the preimage the client's claim of the coin reveals on chain. A coin
+with the preimage the client's claim of the coin reveals on chain. A client
+paying out to a silent payment address sends its scan key blinded, and the
+provider answers its share of it by the coin's refund key, with a proof: the
+client's claim then pays the output its payee finds by the claim's tweak,
+while the provider never learns the address. A coin
 never claimed comes back to the provider once timed out. Each coin is paid at
 the chain's estimate when taken (no payout on mainnet without one); a coin in
 no block 12 blocks before its timeout is canceled, its coins paid back to the

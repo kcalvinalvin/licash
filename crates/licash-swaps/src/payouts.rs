@@ -40,7 +40,7 @@ use bitcoin::{
     absolute::LOCK_TIME_THRESHOLD,
     consensus::{deserialize, serialize},
     hashes::Hash,
-    secp256k1::{Secp256k1, SecretKey, XOnlyPublicKey},
+    secp256k1::{PublicKey, Secp256k1, SecretKey, XOnlyPublicKey},
     Amount, BlockHash, FeeRate, OutPoint, ScriptBuf, Transaction,
 };
 use licash::spend::{ChainProfile, ProposalId};
@@ -48,7 +48,7 @@ use licash_api::{
     swaps::{self, ChainRequest, ChainSwap},
     Funding, Hex, Problem,
 };
-use licash_onchain::{deadline, deposit::Htlc};
+use licash_onchain::{deadline, deposit::Htlc, silent_claim::Share};
 use licash_wallet::{first_spend, payout_depth, Blocks, Payee, Transport};
 use rand_core::{OsRng, RngCore};
 use rusqlite::{params, OptionalExtension};
@@ -269,8 +269,9 @@ impl<T: Transport> Provider<T> {
     ) -> Result<ChainSwap, Problem> {
         let id = request.lock()?;
         let key = *id.as_bytes();
+        let scan = blinded_scan(request)?;
         if let Some(row) = self.row(&key).map_err(unavailable)? {
-            return self.payout_again(&row, request);
+            return self.payout_again(&row, request, scan.as_ref());
         }
         let Some(terms) = self.chain_info().map_err(unavailable)? else {
             return Err(declined("no payouts on Bitcoin"));
@@ -363,30 +364,41 @@ impl<T: Transport> Provider<T> {
                 tracing::warn!(id = %hex::encode(key), "payout's coin not broadcast yet: {e}");
             }
         }
-        self.payout_answer(&key)
+        let answer = self
+            .payout_answer(&key)
             .map_err(unavailable)?
-            .ok_or_else(|| unavailable("the payout is not recorded"))
+            .ok_or_else(|| unavailable("the payout is not recorded"))?;
+        with_share(answer, scan.as_ref(), &refund_key)
     }
 
     /// The payout `row` asked for again: where it stands, if it is the
     /// same.
-    fn payout_again(&self, row: &Row, request: &ChainRequest) -> Result<ChainSwap, Problem> {
+    fn payout_again(
+        &self,
+        row: &Row,
+        request: &ChainRequest,
+        scan: Option<&PublicKey>,
+    ) -> Result<ChainSwap, Problem> {
         let hubs = self.wallet.hubs().map_err(unavailable)?;
         let from = hubs
             .iter()
             .find(|(u, _)| *u == row.from)
             .map(|(_, i)| i.address);
         let coin = self.coin(&row.id).map_err(unavailable)?;
-        let same = row.chain
-            && from == Some(request.from)
-            && row.amount == request.value
-            && coin.is_some_and(|c| Some(c.htlc.claim.serialize()) == request.claim().ok());
-        if !same {
+        let coin = coin.filter(|c| Some(c.htlc.claim.serialize()) == request.claim().ok());
+        let (true, true, true, Some(coin)) = (
+            row.chain,
+            from == Some(request.from),
+            row.amount == request.value,
+            coin,
+        ) else {
             return Err(declined("another swap of this lock"));
-        }
-        self.payout_answer(&row.id)
+        };
+        let answer = self
+            .payout_answer(&row.id)
             .map_err(unavailable)?
-            .ok_or_else(|| unavailable("the payout is not recorded"))
+            .ok_or_else(|| unavailable("the payout is not recorded"))?;
+        with_share(answer, scan, &coin.refund_key)
     }
 
     /// Record the payout `id` on `taken`, its coin `htlc`, and pay the coin
@@ -523,6 +535,32 @@ struct Taken<'a> {
     expiry_from: u32,
 }
 
+/// The blinded scan key `request` asks the provider's share of, if any.
+fn blinded_scan(request: &ChainRequest) -> Result<Option<PublicKey>, Problem> {
+    request
+        .scan()?
+        .map(|s| PublicKey::from_slice(&s).map_err(|_| Problem::invalid("the scan key is no key")))
+        .transpose()
+}
+
+/// `answer` with the share of `scan` by `refund_key`, if asked: the same
+/// each time asked, of the same key.
+fn with_share(
+    mut answer: ChainSwap,
+    scan: Option<&PublicKey>,
+    refund_key: &SecretKey,
+) -> Result<ChainSwap, Problem> {
+    if let Some(scan) = scan {
+        let share = Share::new(refund_key, scan).map_err(|e| Problem::invalid(e.to_string()))?;
+        answer.share = Some(swaps::Share {
+            point: Hex(share.point.serialize().to_vec()),
+            e: Hex(share.e.to_vec()),
+            s: Hex(share.s.to_vec()),
+        });
+    }
+    Ok(answer)
+}
+
 /// What the provider recorded of payouts.
 impl<T: Transport> Provider<T> {
     /// The payout of the client's lock `id`, as its client is told.
@@ -557,6 +595,7 @@ impl<T: Transport> Provider<T> {
                 .as_ref()
                 .map(|(tx, _)| tx.compute_txid().to_string()),
             reason: row.reason.clone(),
+            share: None,
         }))
     }
 

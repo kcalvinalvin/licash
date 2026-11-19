@@ -30,7 +30,18 @@ const MIGRATIONS: &[&str] = &[
     KEYED,
     LOCK_CLAIMS,
     OWED_LOCKS,
+    SILENT_PAYOUTS,
 ];
+
+/// Version 14: payouts to silent payment addresses. `blind` is the secret
+/// the payee's scan key is blinded by before the provider is asked its
+/// share of it, `share` that share unblinded, 33 bytes, kept as first
+/// proven: both NULL for a payout to an address, as every one of an older
+/// file. A payout's `script` is its payee's output once claimed.
+const SILENT_PAYOUTS: &str = "
+ALTER TABLE payouts ADD COLUMN blind BLOB;
+ALTER TABLE payouts ADD COLUMN share BLOB;
+";
 
 /// Version 13: the locks paying the wallet whose preimage it revealed to
 /// their hub, with what proves them on Bitcoin should the hub not issue

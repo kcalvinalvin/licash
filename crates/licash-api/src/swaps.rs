@@ -317,13 +317,28 @@ pub enum State {
 /// Pay the client's `lock` at hub `from`, which pays the provider, out on
 /// Bitcoin: lock a coin worth `value` under the lock's hash, claimed with
 /// the client's key `claim`, x-only. The same request again answers where
-/// the payout stands.
+/// the payout stands. For a claim paying a silent payment address, `scan`,
+/// its scan key blinded (33 bytes), which the provider answers its
+/// [`Share`] of.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChainRequest {
     pub from: Address,
     pub lock: Hex,
     pub claim: Hex,
     pub value: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scan: Option<Hex>,
+}
+
+/// The provider's share of a client's blinded scan key `B'`: `x_r B'`,
+/// `x_r` the secret of its refund key (that of even y), with a proof of it,
+/// `(e, s)` (see `licash_onchain::silent_claim::Share`), each 32 bytes but
+/// the point's 33.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Share {
+    pub point: Hex,
+    pub e: Hex,
+    pub s: Hex,
 }
 
 impl ChainRequest {
@@ -333,7 +348,18 @@ impl ChainRequest {
             lock: Hex(lock.as_bytes().to_vec()),
             claim: Hex(claim.to_vec()),
             value,
+            scan: None,
         }
+    }
+
+    /// Asking the provider's share of `scan`, a blinded scan key.
+    pub fn with_scan(mut self, scan: [u8; 33]) -> Self {
+        self.scan = Some(Hex(scan.to_vec()));
+        self
+    }
+
+    pub fn scan(&self) -> Result<Option<[u8; 33]>, Problem> {
+        self.scan.as_ref().map(|s| s.array("scan")).transpose()
     }
 
     pub fn lock(&self) -> Result<ProposalId, Problem> {
@@ -371,6 +397,9 @@ pub struct ChainSwap {
     /// Why it failed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Its share of the request's `scan`, if it asked one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub share: Option<Share>,
 }
 
 impl ChainSwap {

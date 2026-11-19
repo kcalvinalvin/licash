@@ -160,3 +160,61 @@ async fn notes_are_paid_out_to_a_bitcoin_address_through_the_provider() -> anyho
     assert!(found[0].known, "{found:?}");
     Ok(())
 }
+
+/// Notes paid out to a silent payment address: the provider's coin claimed
+/// to the output only its payee finds, by the tweak its hub serves of the
+/// claim as of any spend.
+#[tokio::test]
+#[ignore = "needs the stack of apps/e2e/run.sh"]
+async fn notes_are_paid_out_to_a_silent_payment_address() -> anyhow::Result<()> {
+    let eco = Eco::up().await?;
+    let hub1 = eco.hub(1);
+    funded(&eco, 20_000).await?;
+    let alice = eco.wallet("silent-payer")?;
+    eco.pay_in(&alice, hub1, 30_000).await?;
+    let bob = eco.wallet("silent-payee")?;
+    bob.add_hub(hub1).await?;
+    let from = eco.height().await?;
+    bob.watch_silent(hub1, from)?;
+    let to = bob.silent_keys().address().to_string();
+    let rate = FeeRate::from_sat_per_vb_u32(1);
+    let quote = alice
+        .payout_quote(eco.swaps(), hub1, &to, 10_000, 3_000, rate)
+        .await?;
+    let payout = alice.payout(&quote).await?;
+    assert_eq!(payout.address, to);
+    let lock = payout.lock.clone().context("a lock")?;
+
+    eco.mine(1).await?;
+    until("the payout claimed", 120, || async {
+        let followed = alice.follow_payout(&payout.hash, &eco).await;
+        for claim in alice.payout_claims()? {
+            eco.broadcast(&claim).await?;
+        }
+        match followed {
+            Ok(p) if p.state == PayoutState::Claimed => Ok(Some(p)),
+            Ok(p) if p.state == PayoutState::Open => Ok(None),
+            Ok(p) => anyhow::bail!("{p:?}"),
+            Err(licash_wallet::Error::Pending { .. }) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    })
+    .await?;
+    eco.mine(1).await?;
+    let done = alice.follow_payout(&payout.hash, &eco).await?;
+    assert_eq!(done.state, PayoutState::Done, "{done:?}");
+
+    // Bob finds exactly the amount, of his hub's tweaks.
+    let found = until("the payee's coin found", 120, || async {
+        let scanned = bob.scan_silent(hub1, &eco, u32::MAX).await?;
+        Ok((!scanned.found.is_empty()).then_some(scanned.found))
+    })
+    .await?;
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].value, 10_000);
+    until("the provider paid", 120, || async {
+        Ok((eco.payout_state(&lock).await?.state == State::Done).then_some(()))
+    })
+    .await?;
+    Ok(())
+}

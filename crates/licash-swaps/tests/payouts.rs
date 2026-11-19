@@ -1283,3 +1283,44 @@ async fn a_swaps_file_of_version_4_gains_donations() {
     assert!(licash_swaps::holds_hash(&path, &[0xcd; 32]).unwrap());
     assert!(!licash_swaps::holds_hash(&path, &[0xef; 32]).unwrap());
 }
+
+/// A payout to a silent payment address through the provider: asked its
+/// share of the payee's scan key blinded, it answers one proven of its
+/// refund key, the same each time asked; the client's claim pays the
+/// output its payee finds, and the provider claims its lock as any.
+#[tokio::test]
+async fn a_payout_to_a_silent_payment_address_pays_what_its_payee_finds() {
+    use bitcoin::{secp256k1::SecretKey, NetworkKind};
+    use licash_onchain::silent::{self, Keys};
+    let eco = Eco::new(STOCK, TERMS).await;
+    let secret = |b: u8| SecretKey::from_slice(&[b; 32]).unwrap();
+    let payee = Keys::new(secret(0x71), secret(0x72), NetworkKind::Test);
+    let to = payee.address().to_string();
+    let quote = eco
+        .client
+        .payout_quote(PROVIDER, A, &to, 1_000, MAX_FEE, ONE_SAT)
+        .await
+        .unwrap();
+    let payout = eco.client.payout(&quote).await.unwrap();
+    assert_eq!(eco.client_follows(&payout).await.state, PayoutState::Open);
+    let coin_tx = eco.pool.waiting().remove(0);
+    eco.pool.mine();
+    eco.follow().await;
+    let claimed = eco.client_follows(&payout).await;
+    assert_eq!(claimed.state, PayoutState::Claimed);
+    let mined = eco.pool.mine();
+    let claim = mined.iter().find(|tx| is_claim(tx)).expect("the claim mined");
+    assert_eq!(claim.output.len(), 1);
+    assert_eq!(claim.output[0].value.to_sat(), 1_000);
+    let coin = claimed.funding.unwrap();
+    assert_eq!(coin.txid, coin_tx.compute_txid());
+    let funding = coin_tx.output[coin.vout as usize].script_pubkey.clone();
+    let tweak = silent::tweak(claim, &[funding.as_script()]).expect("a claim counted");
+    assert_eq!(
+        payee.scanner([]).scan(&tweak, &silent::taproot_outputs(claim)).len(),
+        1
+    );
+    eco.follow().await;
+    assert_eq!(eco.provider().records(1).unwrap()[0].stage, Stage::Done);
+    assert_eq!(eco.client_follows(&payout).await.state, PayoutState::Done);
+}

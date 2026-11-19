@@ -1075,7 +1075,7 @@ fn a_phone_pays_out_to_bitcoin_addresses_and_codes_of_hubs_it_does_not_trust() {
     assert_eq!(asked.unwrap(), asked_for);
     // A code of a wallet at a hub she does not trust, saying where to
     // reach it: paid in notes there if a swap brings them. Its code on
-    // Bitcoin is an address to pay out to.
+    // Bitcoin is paid out to its silent payment address, not the fallback.
     let other = Net::new(true);
     let bob = other.wallet("bob", other.height());
     let code = bob.payment_code(None).unwrap();
@@ -1084,12 +1084,12 @@ fn a_phone_pays_out_to_bitcoin_addresses_and_codes_of_hubs_it_does_not_trust() {
         Scanned::Visit { amount: None }
     );
     let onchain = bob.bitcoin_code(None).unwrap();
-    let fallback = onchain.address.clone().unwrap();
+    let silent = onchain.silent.clone().unwrap();
     match alice.scanned(onchain.qr).unwrap() {
         Scanned::Bitcoin {
             amount: None,
             address,
-        } => assert_eq!(address.to_lowercase(), fallback),
+        } => assert_eq!(address.to_lowercase(), silent),
         other => panic!("{other:?}"),
     }
     // No provider to swap there with: not in notes, nothing held there.

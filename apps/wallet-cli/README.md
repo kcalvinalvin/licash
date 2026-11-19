@@ -170,7 +170,9 @@ swap is refused before anything is locked unless the source hub admits a
 lock that outlasts the provider's by that margin.
 
 `payout <amount> --to <address> --chain <url>` pays
-`amount` to an address on Bitcoin from notes at a hub, through a provider
+`amount` to an address on Bitcoin, a silent payment address, or a
+`bitcoin:` code naming either (its silent payment address first), from
+notes at a hub, through a provider
 paying out on chain: the wallet locks the amount and the fees to the
 provider, which locks a coin under the lock's hash, and the wallet claims
 that coin, paying the address exactly `amount`, once it finds it confirmed

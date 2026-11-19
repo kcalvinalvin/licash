@@ -23,7 +23,7 @@ use licash_api::{
     Code, Fee, Funding, Hex, Problem, INFO,
 };
 use licash_hub::Timing;
-use licash_onchain::deposit::Htlc;
+use licash_onchain::{deposit::Htlc, silent_claim::Share};
 use licash_wallet::{
     Error, LockState, Payout, PayoutState, Response, Transport, Wallet, CLAIM_ROOM, PAYOUT_WINDOW,
 };
@@ -290,6 +290,8 @@ struct Desk {
     key: SecretKey,
     terms: Mutex<Option<swaps::Chain>>,
     decline: AtomicBool,
+    /// Whether it answers a share of a scan key not its refund key's.
+    false_share: AtomicBool,
     /// The timeout it names, if not the lock's expiry less its margin.
     timeout: Mutex<Option<u32>>,
     taken: Mutex<HashMap<Vec<u8>, Taken>>,
@@ -349,6 +351,19 @@ impl Desk {
             funding: None,
             txid: None,
             reason: None,
+            share: request.scan().unwrap().map(|scan| {
+                let scan = bitcoin::secp256k1::PublicKey::from_slice(&scan).unwrap();
+                let key = match self.false_share.load(Ordering::Relaxed) {
+                    true => SecretKey::from_slice(&[0x5f; 32]).unwrap(),
+                    false => self.key,
+                };
+                let share = Share::new(&key, &scan).unwrap();
+                swaps::Share {
+                    point: Hex(share.point.serialize().to_vec()),
+                    e: Hex(share.e.to_vec()),
+                    s: Hex(share.s.to_vec()),
+                }
+            }),
         };
         let taken = Taken {
             answer: answer.clone(),
@@ -510,6 +525,7 @@ impl Eco {
             key: SecretKey::from_slice(&[0x5e; 32]).unwrap(),
             terms: Mutex::new(Some(TERMS)),
             decline: AtomicBool::new(false),
+            false_share: AtomicBool::new(false),
             timeout: Mutex::default(),
             taken: Mutex::default(),
         });
@@ -992,7 +1008,7 @@ async fn a_wallet_file_of_version_4_gains_payouts() {
         .unwrap();
     assert_eq!(version(&path), 4);
     let wallet = Wallet::open(&path, Link(Net::new())).unwrap();
-    assert_eq!(version(&path), 13);
+    assert_eq!(version(&path), 14);
     // Trusted, as every hub of an older file.
     assert_eq!(wallet.hubs().unwrap().len(), 1);
     assert!(wallet.visited().unwrap().is_empty());
@@ -1040,4 +1056,72 @@ async fn a_public_preimage_is_claimed_with_inside_the_claim_margin() {
         .unwrap();
     let lock = eco.client.follow_lock(&lock.id).await.unwrap();
     assert!(matches!(lock.state, LockState::Paid(_)), "{lock:?}");
+}
+
+/// A payout to a silent payment address: the provider asked its share of
+/// the payee's scan key blinded, never the key itself; the claim pays the
+/// output the payee finds of the claim's own input, exactly the amount.
+#[tokio::test]
+async fn a_payout_pays_a_silent_payment_address_its_payee_finds() {
+    use bitcoin::NetworkKind;
+    use licash_onchain::silent::{self, Keys};
+    let eco = Eco::new().await;
+    let secret = |b: u8| SecretKey::from_slice(&[b; 32]).unwrap();
+    let payee = Keys::new(secret(0x71), secret(0x72), NetworkKind::Test);
+    let to = payee.address().to_string();
+    assert!(to.starts_with("tsp1"), "{to}");
+    let quote = eco
+        .client
+        .payout_quote(PROVIDER, A, &to, 1000, MAX_FEE, ONE_SAT)
+        .await
+        .unwrap();
+    let payout = eco.client.payout(&quote).await.unwrap();
+    assert_eq!(payout.address, to);
+    pending(eco.follow(&payout).await, "not confirmed yet");
+    let coin = eco.desk.fund(None, None);
+    let claimed = eco.follow(&payout).await.unwrap();
+    assert_eq!(claimed.state, PayoutState::Claimed);
+    let claims = eco.client.payout_claims().unwrap();
+    let claim = &claims[0];
+    assert_eq!((claim.input.len(), claim.output.len()), (1, 1));
+    assert_eq!(claim.output[0].value, Amount::from_sat(1000));
+    // The payee finds it of the claim's tweak, as any spend's.
+    let htlc = eco.desk.with(|t| t.htlc);
+    let prevout = htlc.script_pubkey();
+    let tweak = silent::tweak(claim, &[prevout.as_script()]).expect("a claim counted");
+    let found = payee
+        .scanner([])
+        .scan(&tweak, &silent::taproot_outputs(claim));
+    assert_eq!(found.len(), 1);
+    // Asked again, the same claim: the share kept as first proven.
+    eco.net.confirm(A, claims.clone());
+    assert_eq!(eco.follow(&payout).await.unwrap().state, PayoutState::Done);
+    assert_eq!(eco.client.payout_claims().unwrap(), vec![]);
+    eco.desk.settle(claim, coin).await;
+}
+
+/// A provider answering a share not of its refund key: nothing claimed,
+/// the payout failed, its lock refunded once expired.
+#[tokio::test]
+async fn a_payout_to_a_silent_payment_address_of_a_false_share_claims_nothing() {
+    use bitcoin::NetworkKind;
+    use licash_onchain::silent::Keys;
+    let eco = Eco::new().await;
+    eco.desk.false_share.store(true, Ordering::Relaxed);
+    let secret = |b: u8| SecretKey::from_slice(&[b; 32]).unwrap();
+    let to = Keys::new(secret(0x71), secret(0x72), NetworkKind::Test)
+        .address()
+        .to_string();
+    let quote = eco
+        .client
+        .payout_quote(PROVIDER, A, &to, 1000, MAX_FEE, ONE_SAT)
+        .await
+        .unwrap();
+    let payout = eco.client.payout(&quote).await.unwrap();
+    let followed = eco.settled(&payout).await;
+    failed(&followed, "share of the payee's scan key");
+    eco.desk.fund(None, None);
+    let after = eco.settled(&payout).await;
+    failed(&after, "share");
+    assert!(eco.client.payout_claims().unwrap().is_empty());
 }

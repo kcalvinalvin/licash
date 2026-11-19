@@ -340,10 +340,12 @@ enum Command {
     },
     /// The swaps made, newest first.
     Swaps,
-    /// Pay AMOUNT to TO, an address on Bitcoin, from notes at a hub
-    /// through a swap provider: the wallet locks the amount and the fees to
-    /// the provider, which locks a coin on chain the wallet claims, paying
-    /// TO exactly AMOUNT. `payouts` takes it on until done.
+    /// Pay AMOUNT to TO, an address on Bitcoin, a silent payment address,
+    /// or a `bitcoin:` code naming either (the silent payment address
+    /// first), from notes at a hub through a swap provider: the wallet
+    /// locks the amount and the fees to the provider, which locks a coin on
+    /// chain the wallet claims, paying TO exactly AMOUNT. `payouts` takes
+    /// it on until done.
     Payout {
         amount: u64,
         #[arg(long)]
