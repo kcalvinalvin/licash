@@ -176,7 +176,7 @@ a handful of headers):
 | the input decoded: Base, and every note and signature of the evidence | 25.9 M |
 | the exit read: headers' work and transactions | 0.2 M |
 | her request's one-time signatures (v4 and later Bases) | 5.2 M |
-| the Licash header chain through her publication | 0.02 M (28 k a header) |
+| the Licash header chain through her publication | 0.02 M (4.4 k a header) |
 | her filing decoded and judged: each settled note's issuance proof and hold signature | 41.3 M |
 | total | 67.6 M |
 
@@ -195,3 +195,10 @@ transactions weigh (`a_dispute_is_made_of_transactions_of_known_size`):
 
 An uncontested response is a `request`, her publication, a `respond` and
 its terminal; the proof and its 28 kvB are for a contest alone.
+
+A header costs the statement about 7.2 k cycles (measured with 1 000 more:
+2.8 k in the exit read, one hash each, and 4.4 k in the Licash chain's
+checks), where the filing and evidence cost about 1.4 M cycles a note. A
+contract of half a year (26 280 headers) adds about 190 M cycles to the
+statement's 68 M: its age, not its claim, is then most of a proof, which a
+recursive proof of the header chain would take out.

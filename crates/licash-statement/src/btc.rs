@@ -57,12 +57,15 @@ impl Header {
     }
     /// Its hash is within the target its bits claim.
     pub fn pow_ok(&self) -> bool {
+        self.pow_met_by(self.hash())
+    }
+    /// [`Header::pow_ok`] of its hash `hash`, made once by the caller.
+    pub fn pow_met_by(&self, mut hash: Hash) -> bool {
         let Some(target) = target(self.bits()) else {
             return false;
         };
-        let mut h = self.hash();
-        h.reverse();
-        h <= target
+        hash.reverse();
+        hash <= target
     }
 }
 

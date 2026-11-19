@@ -160,6 +160,9 @@ pub struct Checkpoint {
     hash: [u8; 32],
     times: Vec<u32>,
     period_start: Option<u32>,
+    /// The strict target of the bits of the last header pushed: the same
+    /// for a whole retarget period, so made once for it.
+    target: Option<(CompactTarget, Target)>,
 }
 
 impl std::fmt::Debug for Checkpoint {
@@ -210,6 +213,7 @@ impl Checkpoint {
             hash: sha256d(&bytes),
             times,
             period_start,
+            target: None,
         })
     }
 
@@ -320,12 +324,24 @@ impl Checkpoint {
         // `Header::validate_pow` of the strict target, on the hash made
         // once: Bitcoin's own SHA-256 costs the statement's prover several
         // times what the accelerated one does.
-        if !strict_target(self.profile, h.bits)?.is_met_by(BlockHash::from_byte_array(hash)) {
+        let target = match self.target {
+            Some((bits, target)) if bits == h.bits => target,
+            _ => {
+                let target = strict_target(self.profile, h.bits)?;
+                self.target = Some((h.bits, target));
+                target
+            }
+        };
+        if !target.is_met_by(BlockHash::from_byte_array(hash)) {
             return Err(bad("header proof of work"));
         }
-        let mut sorted = self.times.clone();
-        sorted.sort_unstable();
-        if h.time <= sorted[sorted.len() / 2]
+        // The median of the last 11 times, on the stack: a checkpoint's
+        // context holds at most as many ([`Checkpoint::new`]).
+        let n = self.times.len();
+        let mut sorted = [0u32; 11];
+        sorted[..n].copy_from_slice(&self.times);
+        sorted[..n].sort_unstable();
+        if h.time <= sorted[n / 2]
             || h.version.to_consensus() < version_floor(self.profile, height)
         {
             return Err(bad("header MTP or version"));

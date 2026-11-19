@@ -493,11 +493,12 @@ pub fn work_on(from: &Hash, headers: &[[u8; 80]]) -> Option<u128> {
     let mut sum = 0u128;
     for h in headers {
         let h = Header(*h);
-        if h.prev() != prev || !h.pow_ok() {
+        let hash = h.hash();
+        if h.prev() != prev || !h.pow_met_by(hash) {
             return None;
         }
         sum = sum.saturating_add(work(h.bits()));
-        prev = h.hash();
+        prev = hash;
     }
     Some(sum)
 }
