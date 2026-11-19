@@ -26,7 +26,7 @@ use axum::{
 };
 use inbox::Inbox;
 use licash_api::{
-    Check, Checked, Code, Deposit, DepositStatus, Depositing, Info, Issued, Lock, LockState,
+    Code, Deposit, DepositStatus, Depositing, Evidenced, Info, Inquire, Issued, Lock, LockState,
     Locked, Offer, Offered, Pay, Paying, Problem, Receive, ReceiveStatus, Receiving, Refund,
     Released, Settle, TweaksQuery, Unlink, Unlinked,
 };
@@ -210,7 +210,7 @@ pub fn router(hub: Arc<Hub>, services: Services) -> Router {
     let mut api = Router::new()
         .route(licash_api::OFFER, post(offer))
         .route(licash_api::UNLINK, post(unlink))
-        .route(licash_api::CHECK, post(check))
+        .route(licash_api::INQUIRE, post(inquire))
         .route(licash_api::LOCK, post(lock))
         .route(licash_api::LOCK_STATE, get(lock_state))
         .route(licash_api::SETTLE, post(settle))
@@ -410,14 +410,14 @@ async fn unlink(
     .await
 }
 
-async fn check(
+async fn inquire(
     State(hub): State<Arc<Hub>>,
-    body: Result<Json<Check>, JsonRejection>,
-) -> Answer<Checked> {
+    body: Result<Json<Inquire>, JsonRejection>,
+) -> Answer<Evidenced> {
     let Json(body) = body?;
     blocking(hub, move |hub| {
-        let spent = hub.spent(&body.decode()?)?;
-        Ok(Checked { spent })
+        let (keyset, at, notes) = body.decode()?;
+        Ok(Evidenced::new(&hub.inquire(&keyset, at, &notes)?))
     })
     .await
 }

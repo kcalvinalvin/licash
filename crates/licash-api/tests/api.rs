@@ -2,16 +2,16 @@ use licash::{
     address::{Ephemeral, OwnerKeys},
     authorization::{Authorization, PreparedGrant, SignedProposal},
     claim::Branch,
-    crypto::{schnorr_sign, tagged_hash},
+    crypto::{schnorr_sign, tagged_hash, Signature},
     note::{Derivation, Evidence, IssuerKeys, Keyset, Note},
     source::Certificate,
     spend::{lock_hash, ChainProfile, Output, Proposal, ProposalId, TimedLock, TimedTerms},
     unlink::{Nonce, Session},
 };
 use licash_api::{
-    rate, Check, Code, ContractRange, Contracts, Fee, Fees, Hex, Info, Issued, Lock, LockState,
-    Locked, Offer, Offered, Payment, Problem, Refund, Release, Released, Settle, Settled, Unlink,
-    Unlinked,
+    rate, Code, ContractRange, Contracts, Fee, Fees, Hex, Info, Inquire, Inquired, Issued, Lock,
+    LockState, Locked, Offer, Offered, Payment, Problem, Refund, Release, Released, Settle,
+    Settled, Unlink, Unlinked,
 };
 use serde::{de::DeserializeOwned, Serialize};
 
@@ -164,30 +164,37 @@ fn bodies_carry_the_canonical_bytes_through_json() {
     let answer = json(&Unlinked::new(&answer)).decode().unwrap();
     session.finish(&f.keyset, &answer).unwrap();
 
-    let y = f.input.0.message().identifier().unwrap();
-    let check = json(&Check::new(&[y]));
-    assert_eq!(
-        serde_json::to_string(&check).unwrap(),
-        format!(r#"{{"identifiers":["{}"]}}"#, hex::encode(y.0))
-    );
-    assert_eq!(check.decode().unwrap(), vec![y]);
+    let note = f.input.0.message().clone();
+    let signature = Signature([3; 64]);
+    let asked = json(&Inquire::new(
+        &[1; 32],
+        1_700_000_000,
+        &[(note.clone(), signature)],
+    ));
+    let (keyset, at, notes) = asked.decode().unwrap();
+    assert_eq!((keyset, at), ([1; 32], 1_700_000_000));
+    assert!(notes == vec![(note, signature)]);
 }
 
 #[test]
-fn a_check_asks_of_whole_identifiers_and_a_bounded_number() {
-    let y = Hex(vec![2; 33]);
-    let check = Check {
-        identifiers: vec![y.clone(); licash_api::MAX_CHECK],
+fn an_inquiry_asks_of_whole_notes_and_a_bounded_number() {
+    let f = fixture();
+    let ask = |notes: usize, signature: usize| Inquire {
+        keyset: Hex(vec![1; 32]),
+        at: 1,
+        notes: vec![
+            Inquired {
+                note: Hex(f.input.0.message().to_bytes().to_vec()),
+                signature: Hex(vec![2; signature]),
+            };
+            notes
+        ],
     };
-    assert_eq!(check.decode().unwrap().len(), licash_api::MAX_CHECK);
-    let many = Check {
-        identifiers: vec![y; licash_api::MAX_CHECK + 1],
-    };
-    assert_eq!(many.decode().unwrap_err().code, Code::Invalid);
-    let short = Check {
-        identifiers: vec![Hex(vec![2; 32])],
-    };
-    assert_eq!(short.decode().unwrap_err().code, Code::Invalid);
+    let most = licash::inquiry::MAX_NOTES;
+    assert_eq!(ask(most, 64).decode().unwrap().2.len(), most);
+    for refused in [ask(most + 1, 64), ask(1, 63)] {
+        assert_eq!(refused.decode().err().map(|p| p.code), Some(Code::Invalid));
+    }
 }
 
 #[test]

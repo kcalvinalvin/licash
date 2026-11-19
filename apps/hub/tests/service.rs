@@ -21,7 +21,7 @@ use licash::{
     unlink::{Nonce, Session},
 };
 use licash_api::{
-    Check, Checked, Code, Hex, Info, Issued, Lock, LockState, Locked, Locks, Offer, Offered,
+    Code, Evidenced, Hex, Info, Inquire, Issued, Lock, LockState, Locked, Locks, Offer, Offered,
     Problem, Refund, Release, Released, Settle, Settled, Unlink, Unlinked,
 };
 use licash_hub::{Fee, Hub, Policy};
@@ -245,9 +245,39 @@ async fn a_wallet_spends_and_unlinks_through_the_api() {
     let paid = signed
         .open_granted_output(keyset, &notes, 0, &outputs[0], &unlock)
         .unwrap();
-    let ys = [&coin.note, &paid].map(|n| n.message().identifier().unwrap());
-    let checked: Checked = service.post(licash_api::CHECK, &Check::new(&ys)).await;
-    assert_eq!(checked.spent, [true, false]);
+    // The hub proves the spend to the holder who signs for the note: the
+    // spent coin shows its spend, the new note nothing; a signature of
+    // another's note shows nothing, and is refused.
+    let at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let asked = |note: &Note, derivation: &Derivation, at: u64| {
+        let message = note.message();
+        let key = derivation.hold_key(alice.hold_root()).unwrap();
+        let signature = licash::inquiry::sign(keyset.id(), at, message, &key).unwrap();
+        Inquire::new(keyset.id(), at, &[(message.clone(), signature)])
+    };
+    let evidenced: Evidenced = service
+        .post(
+            licash_api::INQUIRE,
+            &asked(&coin.note, &coin.derivation, at),
+        )
+        .await;
+    let evidence = evidenced.decode(keyset, 1).unwrap();
+    assert!(
+        matches!(&evidence[0][..], [licash::recovery::Evidence::Spend { .. }]),
+        "the spend shows"
+    );
+    let proven = licash::recovery::voids_note(keyset, coin.note.message(), &evidence[0][0]);
+    assert!(proven.unwrap());
+    let late = service
+        .problem(
+            licash_api::INQUIRE,
+            json(&asked(&coin.note, &coin.derivation, at - 3600)),
+        )
+        .await;
+    assert_eq!(late.code, Code::Invalid);
 
     let session = Session::start(keyset, &paid, &outputs[0]).unwrap();
     let unlinked: Unlinked = service

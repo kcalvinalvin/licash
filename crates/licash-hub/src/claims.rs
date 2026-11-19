@@ -183,14 +183,42 @@ pub(crate) fn second_claims(
         })?;
         for row in rows {
             let (context, message, sig) = row?;
-            evidence.push(Evidence::SecondClaim {
-                context: hold::Context::from_bytes(&context),
-                record: Record {
-                    message: Message::from_bytes(&message)?,
-                    sig: Signature(sig),
-                },
-            });
+            evidence.push(second_claim(&context, &message, sig)?);
         }
     }
     Ok(evidence)
+}
+
+/// Each claim of the note `y`, whichever: its hold key's signature of it.
+pub(crate) fn claims_of(c: &Connection, y: &Point) -> Result<Vec<Evidence>, Error> {
+    let mut stmt = c.prepare_cached(
+        "SELECT context, message, sig FROM claimed WHERE y = ?1 ORDER BY contract",
+    )?;
+    let rows = stmt.query_map([&y.0], |r| {
+        Ok((
+            r.get::<_, [u8; hold::CONTEXT_BYTES]>(0)?,
+            r.get::<_, Vec<u8>>(1)?,
+            r.get::<_, [u8; 64]>(2)?,
+        ))
+    })?;
+    let mut evidence = Vec::new();
+    for row in rows {
+        let (context, message, sig) = row?;
+        evidence.push(second_claim(&context, &message, sig)?);
+    }
+    Ok(evidence)
+}
+
+fn second_claim(
+    context: &[u8; hold::CONTEXT_BYTES],
+    message: &[u8],
+    sig: [u8; 64],
+) -> Result<Evidence, Error> {
+    Ok(Evidence::SecondClaim {
+        context: hold::Context::from_bytes(context),
+        record: Record {
+            message: Message::from_bytes(message)?,
+            sig: Signature(sig),
+        },
+    })
 }

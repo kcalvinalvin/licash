@@ -14,8 +14,9 @@ use std::collections::BTreeSet;
 use licash::{
     authorization::{Authorization, SignedProposal},
     claim::UnsignedClaim,
-    crypto::Point,
-    note::Note,
+    crypto::{Point, Signature},
+    inquiry,
+    note::{Message, Note},
     recovery::Evidence,
     spend::ProposalId,
 };
@@ -75,6 +76,54 @@ impl Hub {
             }
             evidence.extend(crate::claims::second_claims(c, &ys, &claim.hold_context())?);
             Ok(evidence)
+        })
+    }
+
+    /// What the ledger holds against each of the notes `asked`, in order,
+    /// for the holder who signed the inquiry of each (`licash::inquiry`): the
+    /// owner-signed spend that retired it, with its unlock if granted, and
+    /// each claim of it on Bitcoin or for a cooperative close, as its hold
+    /// key signed it. Evidence the asker made herself or has already, so it
+    /// shows her nothing new, and only a signer of a note's hold key learns of
+    /// the note: an inquiry that does not verify is refused whole. Nothing
+    /// is written. None for a note the ledger holds nothing against, which
+    /// is not shown to be unspent.
+    pub fn inquire(
+        &self,
+        keyset: &[u8; 32],
+        at: u64,
+        asked: &[(Message, Signature)],
+    ) -> Result<Vec<Vec<Evidence>>, Error> {
+        if asked.len() > inquiry::MAX_NOTES {
+            return Err(Error::Invalid(licash::Error::Protocol(
+                "too many notes in an inquiry".into(),
+            )));
+        }
+        self.keys(keyset)?;
+        let now = u64::try_from(crate::store::now()).unwrap_or(0);
+        for (note, sig) in asked {
+            inquiry::verify(keyset, at, note, sig, now)?;
+        }
+        self.store.read(|c| {
+            asked
+                .iter()
+                .map(|(note, _)| {
+                    let y = note.identifier()?;
+                    let mut evidence = Vec::new();
+                    for id in spenders(c, &[y])? {
+                        match self.spend(c, &id) {
+                            Ok(Some(spend)) => evidence.push(spend),
+                            Ok(None) => {}
+                            Err(e) => tracing::warn!(
+                                proposal = %hex::encode(id.as_bytes()),
+                                "a retired spend not shown to its holder: {e}"
+                            ),
+                        }
+                    }
+                    evidence.extend(crate::claims::claims_of(c, &y)?);
+                    Ok(evidence)
+                })
+                .collect()
         })
     }
 

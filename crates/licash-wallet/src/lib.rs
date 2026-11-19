@@ -38,6 +38,7 @@ mod coins;
 mod cold;
 mod delivery;
 mod deposits;
+mod inquiry;
 mod lightning;
 mod locks;
 mod payouts;
@@ -69,10 +70,7 @@ use licash::{
     spend::{ChainProfile, Output, Proposal, ProposalId},
     unlink::Session,
 };
-use licash_api::{
-    Check, Checked, Code, Info, Offer, Offered, Payment, Problem, Release, Unlink, Unlinked,
-    MAX_CHECK,
-};
+use licash_api::{Code, Info, Offer, Offered, Payment, Problem, Release, Unlink, Unlinked};
 use rand_core::{OsRng, RngCore};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{de::DeserializeOwned, Serialize};
@@ -85,6 +83,7 @@ pub use coins::MAX_INPUTS;
 pub use cold::{Cold, ColdRules, ColdScript, ColdWithdrawal, GAP as COLD_GAP};
 pub use delivery::{Delivery, Due, Inboxed, ACK_WITHIN, PAGES_AT_ONCE};
 pub use deposits::{Deposit, DepositState, DepositTerms};
+pub use inquiry::Checked;
 pub use lightning::{refund_blocks, Invoice, InvoiceState, Payable, ViaQuote, ROUTE_BLOCKS};
 pub use locks::{Incoming, Lock, LockState, Via, CLAIM_MARGIN, PROTECTED_MARGIN};
 pub use payouts::{
@@ -1645,7 +1644,7 @@ impl<T: Transport> Wallet<T> {
         })
     }
 
-    /// The inputs of payment `id` its hub shows spent: none if it cannot
+    /// The inputs of payment `id` its hub proves spent: none if it cannot
     /// tell.
     async fn spent_inputs(&self, url: &str, id: &ProposalId) -> Vec<[u8; 33]> {
         let inputs = self.store.read(|c| {
@@ -1654,27 +1653,13 @@ impl<T: Transport> Wallet<T> {
             Ok(rows.collect::<Result<Vec<_>, _>>()?)
         });
         match inputs {
-            Ok(inputs) => self.spent(url, &inputs).await,
+            Ok(inputs) => self.shown(url, &inputs).await.map(|shown| shown.spent),
             Err(e) => Err(e),
         }
         .unwrap_or_else(|e| {
             tracing::warn!(%url, error = %e, "cannot tell which notes are spent");
             Vec::new()
         })
-    }
-
-    /// Those of the notes `ys` the hub at `url` shows spent.
-    async fn spent(&self, url: &str, ys: &[[u8; 33]]) -> Result<Vec<[u8; 33]>, Error> {
-        let mut spent = Vec::new();
-        for ys in ys.chunks(MAX_CHECK) {
-            let check = Check::new(&ys.iter().map(|y| Point(*y)).collect::<Vec<_>>());
-            let checked: Checked = self.post(url, licash_api::CHECK, &check).await?;
-            if checked.spent.len() != ys.len() {
-                return Err(unavailable(url, "it checked other notes than asked"));
-            }
-            spent.extend(ys.iter().zip(checked.spent).filter(|s| s.1).map(|s| *s.0));
-        }
-        Ok(spent)
     }
 
     /// Give payment `id` up at `step`, unless it went past it, and free its
@@ -2176,48 +2161,6 @@ impl<T: Transport> Wallet<T> {
             })?;
             Ok(rows.collect::<Result<_, _>>()?)
         })
-    }
-
-    /// Ask each hub which notes held are spent, and drop those: after
-    /// restoring an old copy of the wallet file, whose notes a newer copy
-    /// may have spent. A hub learns that one party holds the notes asked
-    /// about. The amount dropped.
-    pub async fn check(&self) -> Result<u64, Error> {
-        let held: Vec<(String, [u8; 33])> = self.store.read(|c| {
-            let mut stmt = c.prepare(
-                "SELECT r.url, n.y FROM notes n
-                 JOIN keysets k ON k.id = n.keyset JOIN reach r ON r.hub = k.hub
-                 WHERE n.spent_by IS NULL AND n.gone_at IS NULL ORDER BY r.url",
-            )?;
-            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
-            Ok(rows.collect::<Result<_, _>>()?)
-        })?;
-        let mut dropped = 0;
-        for at in held.chunk_by(|a, b| a.0 == b.0) {
-            let url = &at[0].0;
-            let ys: Vec<[u8; 33]> = at.iter().map(|(_, y)| *y).collect();
-            let spent = self.spent(url, &ys).await?;
-            dropped += self.store.write(|tx| {
-                let mut dropped = 0;
-                for y in &spent {
-                    let denom: Option<i64> = tx
-                        .query_row(
-                            "UPDATE notes SET gone_at = ?2, session = NULL
-                             WHERE y = ?1 AND spent_by IS NULL AND gone_at IS NULL
-                             RETURNING denom",
-                            params![y, now()],
-                            |r| r.get(0),
-                        )
-                        .optional()?;
-                    dropped += denom.map_or(0, |d| d as u64);
-                }
-                Ok(dropped)
-            })?;
-            if !spent.is_empty() {
-                tracing::warn!(%url, notes = spent.len(), "notes spent by a copy of the wallet dropped");
-            }
-        }
-        Ok(dropped)
     }
 
     /// Unlink the notes held linked to their issuance, so that their hub

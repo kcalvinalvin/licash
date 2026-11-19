@@ -24,7 +24,9 @@ A payment is JSON that only its payee can open: hand it over by any
 channel. `send` and `resume` exit with 75 when a payment is recorded but its
 hub has not answered; `resume` finishes it. Back up the wallet file: its
 seed alone does not restore its notes. After restoring an old copy, `check`
-drops the notes spent since.
+drops the notes its hub proves spent since (it shows the spend, which the
+wallet verifies: a hub's word alone drops nothing) and takes the change
+those spends paid the wallet. Only the notes' own holder can ask.
 
 Notes are unlinked from the payment that made them as they are received,
 and a payment's change as it is sent, so that their hub cannot tell where
@@ -274,8 +276,13 @@ transaction: the wallet asks the hub, which says whether anything spent
 those notes, then signs a claim of them and the hub's fold together
 (MuSig2). The hub retires the notes and signs: the fold pays the wallet the
 claim and its reserve on Bitcoin and the rest to the hub, less the fee,
-which the hub pays from its share. A hub that finds a note spent refuses,
-and nothing leaves the wallet; one that took the claim and does not fold
+which the hub pays from its share. A hub that finds a note spent refuses
+it before anything leaves the wallet, which then asks the hub for its
+evidence: the owner-signed spend, or the claim the note's hold key signed
+elsewhere. The wallet checks that itself, drops the notes it proves spent,
+takes the change those spends paid it, and makes its claim again without
+them. A note the hub calls spent without proof stays in the claim: `close`
+stops, and `force-close` claims it. One that took the claim and does not fold
 leaves it to `recoveries`, which files the same claim on Bitcoin by itself
 a little before its last block, as a forced close would (`force-close`
 does it at once). The claim takes settled notes only: a contract that locks

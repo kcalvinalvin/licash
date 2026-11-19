@@ -22,7 +22,7 @@ use licash::{
     unlink::Nonce,
 };
 use licash_api::{
-    Check, Checked, Code, Fee, Hex, Issued, Lock, LockState, Locked, Offer, Offered, Payment,
+    Code, Evidenced, Fee, Hex, Inquire, Issued, Lock, LockState, Locked, Offer, Offered, Payment,
     Problem, Refund, Released, Settle, Unlink, Unlinked,
 };
 use licash_hub::{Error, Hub, Policy, Settled, Timing};
@@ -39,6 +39,9 @@ pub enum Fault {
     Dropped,
     /// The hub does not serve it, and answers with this problem.
     Refused(Code),
+    /// An inquiry the hub answers with no evidence of any note, as a hub
+    /// that says nothing and shows nothing would.
+    Hushed,
 }
 
 struct Site {
@@ -234,6 +237,14 @@ impl Net {
                     body: serde_json::to_vec(&problem).unwrap(),
                 });
             }
+            Some(Fault::Hushed) => {
+                let asked: Inquire = serde_json::from_slice(&body.unwrap()).unwrap();
+                let none = vec![Vec::new(); asked.notes.len()];
+                return Ok(Response {
+                    status: 200,
+                    body: serde_json::to_vec(&Evidenced::new(&none)).unwrap(),
+                });
+            }
             _ => {}
         }
         let (hub, kept) = {
@@ -306,10 +317,11 @@ fn post(hub: &Hub, path: &str, body: &[u8]) -> Result<Vec<u8>, Problem> {
             let answer = hub.unlink(&unlink.decode()?).map_err(problem)?;
             serde_json::to_vec(&Unlinked::new(&answer))
         }
-        licash_api::CHECK => {
-            let check: Check = serde_json::from_slice(body).map_err(json)?;
-            let spent = hub.spent(&check.decode()?).map_err(problem)?;
-            serde_json::to_vec(&Checked { spent })
+        licash_api::INQUIRE => {
+            let inquire: Inquire = serde_json::from_slice(body).map_err(json)?;
+            let (keyset, at, notes) = inquire.decode()?;
+            let evidence = hub.inquire(&keyset, at, &notes).map_err(problem)?;
+            serde_json::to_vec(&Evidenced::new(&evidence))
         }
         licash_api::LOCK => {
             let lock: Lock = serde_json::from_slice(body).map_err(json)?;

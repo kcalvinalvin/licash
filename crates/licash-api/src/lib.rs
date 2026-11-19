@@ -8,7 +8,7 @@
 //! | `POST /v1/offer`   | [`Offer`]   | [`Offered`]  |
 //! | `POST /v1/release` | [`Release`] | [`Released`] |
 //! | `POST /v1/unlink`  | [`Unlink`]  | [`Unlinked`] |
-//! | `POST /v1/check`   | [`Check`]   | [`Checked`]  |
+//! | `POST /v1/inquire` | [`Inquire`] | [`Evidenced`] |
 //! | `POST /v1/lock`    | [`Lock`]    | [`Locked`]   |
 //! | `GET /v1/lock/{id}` |            | [`LockState`] |
 //! | `POST /v1/settle`  | [`Settle`]  | [`Issued`]   |
@@ -35,7 +35,8 @@ use licash::{
     authorization::{Authorization, Grant, SignedProposal, Unlock},
     chain::Checkpoint,
     crypto::{schnorr_verify, tagged_hash, Point, Signature},
-    note::{Keyset, MintResponse, Note},
+    note::{Keyset, Message, MintResponse, Note},
+    recovery::Evidence,
     source::Certificate,
     spend::{lock_hash, ChainProfile, Output, Proposal, ProposalId},
     unlink::{Answer, Request},
@@ -46,7 +47,8 @@ pub const INFO: &str = "/v1/info";
 pub const OFFER: &str = "/v1/offer";
 pub const RELEASE: &str = "/v1/release";
 pub const UNLINK: &str = "/v1/unlink";
-pub const CHECK: &str = "/v1/check";
+/// What the hub holds against notes a holder names ([`Inquire`]).
+pub const INQUIRE: &str = "/v1/inquire";
 pub const LOCK: &str = "/v1/lock";
 /// A lock's state, at [`lock_state`] for a lock's identifier.
 pub const LOCK_STATE: &str = "/v1/lock/{id}";
@@ -470,20 +472,33 @@ pub struct Unlinked {
     pub answer: Hex,
 }
 
-/// The most notes one [`Check`] asks about.
-pub const MAX_CHECK: usize = 1000;
-
-/// Ask which of the notes with these identifiers are spent: at most
-/// [`MAX_CHECK`]. The hub learns that one party holds them all.
+/// Ask what the hub holds against notes of one keyset, at most
+/// [`licash::inquiry::MAX_NOTES`]: each named by its public fields and
+/// asked about under its hold key's signature, so that only a holder who
+/// can sign for a note learns anything of it ([`licash::inquiry`]). The hub
+/// learns that one party holds them all.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Check {
-    pub identifiers: Vec<Hex>,
+pub struct Inquire {
+    pub keyset: Hex,
+    /// When it was signed, in unix seconds.
+    pub at: u64,
+    pub notes: Vec<Inquired>,
 }
 
-/// Whether each note asked about is spent, in the order asked.
+/// A note an [`Inquire`] asks about, and its hold key's signature.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Checked {
-    pub spent: Vec<bool>,
+pub struct Inquired {
+    pub note: Hex,
+    pub signature: Hex,
+}
+
+/// What the hub holds against each note asked about, in the order asked: its
+/// evidence, as [`licash::recovery::evidence_to_bytes`] writes it, none for a
+/// note nothing is held against. The asker verifies it
+/// ([`licash::recovery::voids_note`]) and takes no word of the hub's.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Evidenced {
+    pub evidence: Vec<Hex>,
 }
 
 /// Lock `notes` as `signed`, a plainly authorized timed spend, makes them.
@@ -1184,22 +1199,70 @@ impl Unlinked {
     }
 }
 
-impl Check {
-    pub fn new(identifiers: &[Point]) -> Self {
+impl Inquire {
+    /// An inquiry of `keyset` at `at`, of `notes` each with its signature.
+    pub fn new(keyset: &[u8; 32], at: u64, notes: &[(Message, Signature)]) -> Self {
         Self {
-            identifiers: identifiers.iter().map(|y| Hex(y.0.to_vec())).collect(),
+            keyset: Hex(keyset.to_vec()),
+            at,
+            notes: notes
+                .iter()
+                .map(|(note, signature)| Inquired {
+                    note: Hex(note.to_bytes().to_vec()),
+                    signature: Hex(signature.0.to_vec()),
+                })
+                .collect(),
         }
     }
 
-    pub fn decode(&self) -> Result<Vec<Point>, Problem> {
-        if self.identifiers.len() > MAX_CHECK {
+    /// The keyset, the time and each note with its signature, unchecked.
+    #[allow(clippy::type_complexity)]
+    pub fn decode(&self) -> Result<([u8; 32], u64, Vec<(Message, Signature)>), Problem> {
+        if self.notes.len() > licash::inquiry::MAX_NOTES {
             return Err(Problem::invalid(format!(
-                "at most {MAX_CHECK} notes a check"
+                "at most {} notes an inquiry",
+                licash::inquiry::MAX_NOTES
             )));
         }
-        self.identifiers
+        let notes = self
+            .notes
             .iter()
-            .map(|y| Ok(Point(y.array("identifier")?)))
+            .map(|n| {
+                Ok((
+                    Message::from_bytes(&n.note.0)?,
+                    Signature(n.signature.array("signature")?),
+                ))
+            })
+            .collect::<Result<_, Problem>>()?;
+        Ok((self.keyset.array("keyset")?, self.at, notes))
+    }
+}
+
+impl Evidenced {
+    pub fn new(evidence: &[Vec<Evidence>]) -> Self {
+        Self {
+            evidence: evidence
+                .iter()
+                .map(|e| Hex(licash::recovery::evidence_to_bytes(e)))
+                .collect(),
+        }
+    }
+
+    /// The evidence of each of `asked` notes under `keyset`, each piece
+    /// decoded and its notes and signatures checked, not yet what it shows.
+    pub fn decode(&self, keyset: &Keyset, asked: usize) -> Result<Vec<Vec<Evidence>>, Problem> {
+        if self.evidence.len() != asked {
+            return Err(Problem::invalid("it answered other notes than asked"));
+        }
+        self.evidence
+            .iter()
+            .map(|e| {
+                Ok(licash::recovery::evidence_from_bytes(
+                    keyset,
+                    licash::recovery::MAX_EVIDENCE,
+                    &e.0,
+                )?)
+            })
             .collect()
     }
 }

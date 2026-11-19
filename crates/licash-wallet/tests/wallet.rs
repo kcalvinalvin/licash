@@ -4,7 +4,7 @@ use std::{path::Path, sync::Arc};
 
 use licash::spend::ChainProfile;
 use licash_api::{Code, Fee, Hex, Payment};
-use licash_wallet::{Balance, Error, HubId, NoteRecord, PartTo, State, Unlinking, Wallet};
+use licash_wallet::{Balance, Checked, Error, HubId, NoteRecord, PartTo, State, Unlinking, Wallet};
 use net::{Fault, Link, Net, HUB};
 
 const FEE: Fee = Fee { base: 2, ppm: 0 };
@@ -271,7 +271,7 @@ async fn a_send_refused_as_spent_is_given_up_and_drops_the_spent_notes() {
         let paid = copy.send(HUB, &bob.address(), 10).await.unwrap();
         assert_eq!(bob.receive(&paid.payment).unwrap().amount, 10);
         assert_eq!(available(&copy), (20, 0));
-        assert_eq!(copy.check().await.unwrap(), 0);
+        assert_eq!(copy.check().await.unwrap(), Checked::default());
     }
 }
 
@@ -288,13 +288,45 @@ async fn a_restored_copy_drops_the_notes_spent_since() {
     copy.receive(&funds).unwrap();
     alice.send(HUB, &bob.address(), 60).await.unwrap();
     assert_eq!(available(&copy), (100, 0));
-    assert_eq!(copy.check().await.unwrap(), 64);
-    assert_eq!(available(&copy), (36, 0));
-    assert_eq!(copy.check().await.unwrap(), 0);
-    assert_eq!(alice.check().await.unwrap(), 0);
+    // The hub proves the spend of the 64 note, and the change it paid
+    // Alice comes back with it (the 60 paid to Bob no scan key of the copy
+    // opens): the copy is what Alice is.
+    let checked = copy.check().await.unwrap();
+    assert_eq!(
+        checked,
+        Checked {
+            dropped: 64,
+            recovered: 2
+        }
+    );
+    assert_eq!(available(&copy), (38, 0));
+    assert_eq!(copy.check().await.unwrap(), Checked::default());
+    assert_eq!(alice.check().await.unwrap(), Checked::default());
     assert_eq!(available(&alice), (38, 0));
-    // A note dropped is not unlinked either.
-    assert_eq!(copy.unlink().await.unwrap(), 2);
+    // A note dropped is not unlinked either: the two held and the two notes
+    // of the change (1 and 1) are.
+    assert_eq!(copy.unlink().await.unwrap(), 4);
+}
+
+#[tokio::test]
+async fn a_hub_that_shows_no_proof_of_a_spend_drops_nothing() {
+    let net = network();
+    let (alice, copy, bob) = (
+        party(&net, 1).await,
+        party(&net, 1).await,
+        party(&net, 2).await,
+    );
+    let funds = net.pay(HUB, &alice.address(), 100);
+    alice.receive(&funds).unwrap();
+    copy.receive(&funds).unwrap();
+    alice.send(HUB, &bob.address(), 60).await.unwrap();
+    // The hub knows the spend, and says nothing of it: the copy takes no
+    // one's word, and keeps the notes it was asked to drop.
+    net.fail(licash_api::INQUIRE, Fault::Hushed);
+    assert_eq!(copy.check().await.unwrap(), Checked::default());
+    assert_eq!(available(&copy), (100, 0));
+    // Shown the spend, it drops what it proves.
+    assert_eq!(copy.check().await.unwrap().dropped, 64);
 }
 
 #[tokio::test]

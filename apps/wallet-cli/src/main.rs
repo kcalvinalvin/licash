@@ -898,12 +898,19 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             show(json, rows.collect(), lines.collect::<Vec<_>>().join("\n"));
         }
         Command::Check => {
-            let dropped = wallet.check().await?;
-            let text = match dropped {
-                0 => "no note was spent elsewhere".into(),
-                d => format!("dropped {d} spent by a copy of this wallet"),
+            let checked = wallet.check().await?;
+            let text = match (checked.dropped, checked.recovered) {
+                (0, 0) => "no note was spent elsewhere".into(),
+                (d, 0) => format!("dropped {d} spent by a copy of this wallet, as its hub proved"),
+                (d, r) => format!(
+                    "dropped {d} spent by a copy of this wallet, as its hub proved, and took {r} of the change those spends paid it"
+                ),
             };
-            show(json, json!({ "dropped": dropped }), text);
+            show(
+                json,
+                json!({ "dropped": checked.dropped, "recovered": checked.recovered }),
+                text,
+            );
         }
         Command::Payment { id, out } => write_payment(&wallet.payment(&id)?, out.as_deref())?,
         Command::Abandon { id } => {

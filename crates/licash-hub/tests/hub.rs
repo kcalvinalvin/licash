@@ -1315,6 +1315,94 @@ fn a_note_a_claim_on_bitcoin_names_is_retired_for_good() {
     assert_eq!(hub.spent(&[y]).unwrap(), [true]);
 }
 
+fn unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+/// `coin`'s hold key's signature of an inquiry of `keyset` at `at`.
+fn ask(
+    keyset: &Keyset,
+    at: u64,
+    coin: &Coin,
+) -> (licash::note::Message, licash::crypto::Signature) {
+    let key = coin.derivation.hold_key(coin.owner.hold_root()).unwrap();
+    let message = coin.note.message().clone();
+    let sig = licash::inquiry::sign(keyset.id(), at, &message, &key).unwrap();
+    (message, sig)
+}
+
+#[test]
+fn a_holder_is_shown_what_the_hub_holds_against_her_notes_and_no_one_else() {
+    use licash::recovery::{voids_note, Evidence as Against};
+    let files = files();
+    let hub = open(&files, Policy::default());
+    let (_, keyset) = issuer(&files);
+    let (alice, bob) = (owner(1), owner(2));
+    let (spent, kept, claimed) = (
+        mint(&files, &alice, 8),
+        mint(&files, &alice, 8),
+        mint(&files, &alice, 4),
+    );
+    Spend::new(&keyset, std::slice::from_ref(&spent), &[(bob.address(), 8)])
+        .complete(&hub, &keyset);
+    hub.retire_claimed(&[1; 32], &filed([7; 32], &keyset, &[&claimed]))
+        .unwrap();
+    let at = unix();
+    let asked: Vec<_> = [&spent, &kept, &claimed]
+        .into_iter()
+        .map(|c| ask(&keyset, at, c))
+        .collect();
+    let shown = hub.inquire(keyset.id(), at, &asked).unwrap();
+    assert_eq!(shown.len(), 3);
+    // The spend, with its unlock, and the claim, each proving its note spent
+    // to whoever checks them; the note held against nothing shows nothing.
+    assert!(matches!(
+        &shown[0][..],
+        [Against::Spend {
+            unlock: Some(_),
+            ..
+        }]
+    ));
+    assert!(shown[1].is_empty());
+    assert!(matches!(&shown[2][..], [Against::SecondClaim { .. }]));
+    for (coin, shown) in [&spent, &claimed].into_iter().zip([&shown[0], &shown[2]]) {
+        assert!(voids_note(&keyset, coin.note.message(), &shown[0]).unwrap());
+    }
+    assert!(!voids_note(&keyset, kept.note.message(), &shown[0][0]).unwrap());
+
+    // Nobody who cannot sign for a note learns its state: a signature of
+    // another note's key, of another time, or of another keyset is refused
+    // whole, though it asks of other notes besides.
+    let key = kept.derivation.hold_key(kept.owner.hold_root()).unwrap();
+    let message = spent.note.message().clone();
+    let borrowed = licash::crypto::schnorr_sign(
+        key.to_nonzero().unwrap().as_ref(),
+        &licash::inquiry::digest(keyset.id(), at, &message),
+    )
+    .unwrap();
+    let wrong = [asked[1].clone(), (message, borrowed)];
+    assert!(matches!(
+        hub.inquire(keyset.id(), at, &wrong),
+        Err(Error::Invalid(_))
+    ));
+    assert!(matches!(
+        hub.inquire(keyset.id(), at + 3_600, &asked),
+        Err(Error::Invalid(_))
+    ));
+    assert!(matches!(
+        hub.inquire(&[9; 32], at, &asked),
+        Err(Error::Refused(Refusal::UnknownKeyset))
+    ));
+    let many = vec![asked[0].clone(); licash::inquiry::MAX_NOTES + 1];
+    assert!(matches!(
+        hub.inquire(keyset.id(), at, &many),
+        Err(Error::Invalid(_))
+    ));
+}
+
 #[test]
 fn a_note_claimed_in_one_contract_is_cited_against_its_claim_in_another() {
     use licash::recovery::Evidence as Against;

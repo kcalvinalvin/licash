@@ -768,7 +768,7 @@ impl<T: Transport> Wallet<T> {
     }
 
     /// The wallet's keyset of id `id`.
-    fn keyset_of(&self, id: &[u8; 32]) -> Result<Keyset, Error> {
+    pub(crate) fn keyset_of(&self, id: &[u8; 32]) -> Result<Keyset, Error> {
         let bytes: Option<Vec<u8>> = self.store.read(|c| {
             Ok(
                 c.query_row("SELECT bytes FROM keysets WHERE id = ?1", [id], |r| {

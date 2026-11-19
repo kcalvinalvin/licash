@@ -979,7 +979,10 @@ impl Hub {
     }
 
     /// Whether each of the notes with these identifiers is spent: retired
-    /// by a released spend, a lock or a claim on Bitcoin.
+    /// by a released spend, a lock or a claim on Bitcoin. For the operator
+    /// and for tests: the hub serves it to no one, since anyone who knew a
+    /// note's identifier could learn its state. A holder is shown only
+    /// evidence of her own notes ([`Hub::inquire`]).
     pub fn spent(&self, identifiers: &[Point]) -> Result<Vec<bool>, Error> {
         self.store.read(|c| {
             let mut stmt = c.prepare_cached("SELECT 1 FROM spent WHERE y = ?1")?;
