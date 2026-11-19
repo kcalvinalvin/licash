@@ -2,7 +2,7 @@
 //! the wallet's hubs, kept beside its file, each paid from a coin of the
 //! wallet's on Bitcoin. `approve-fees`: more than a hub charged as they
 //! opened, agreed to. `force-close`, `recoveries` and
-//! `give-up-recovery`: one its hub left silent, closed by the wallet.
+//! `give-up-recovery`, `allow-publication-fee`: one its hub left silent, closed by the wallet.
 //! `recovery-statement` and `import-proof`: one its hub answered, proved
 //! on another machine.
 
@@ -343,6 +343,11 @@ pub async fn recoveries(
 pub fn give_up(wallet: &Wallet<Http>, path: &Path, id: &str) -> anyhow::Result<()> {
     let id = contract_id(path, id)?;
     recovery::give_up(wallet, dir(path), &id)
+}
+
+pub fn allow_publication_fee(path: &Path, id: &str, sats: u64) -> anyhow::Result<()> {
+    let id = contract_id(path, id)?;
+    recovery::allow_publication_fee(dir(path), &id, sats)
 }
 
 fn recovery_line(r: &Recovery) -> String {

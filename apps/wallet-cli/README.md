@@ -236,7 +236,12 @@ nothing else recovers as much: its excess is lost. Until its request may be in t
 after the contract's funding on signet), `give-up-recovery <id>` gives
 them back; from then on it is irrevocable. The wallet pays its fees from
 its coins on Bitcoin at `--fee-rate` sat/vB (by default the chain's
-estimate). `recoveries --chain <url>` carries every forced close on as
+estimate), but the publication of its claim only from the contract's
+reserve: never more than it holds, whatever the rate, starting at a
+quarter of it and paying more as its window runs out while no block
+holds it. Should all of it fall short, `recoveries` says so, and
+`allow-publication-fee <id> <sats>` lets it pay that much in all, its
+coins on Bitcoin paying the rest. `recoveries --chain <url>` carries every forced close on as
 far as the chain lets it and shows the block its next step waits for: run
 it until it is `done`, when the claimed notes' value and the wallet's
 reserve are back in it on Bitcoin (with the hub's reserve too on a

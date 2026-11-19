@@ -486,6 +486,12 @@ enum Command {
     /// Give up forcing contract ID closed, its notes back to the wallet:
     /// only before its request is signed.
     GiveUpRecovery { id: String },
+    /// Let the forced close of contract ID pay SATS in all for its
+    /// publication's fees, more than its reserve holds: its coins on
+    /// Bitcoin pay the rest. Without it, its publication pays at most what
+    /// its reserve holds, however high the chain says fees are, and
+    /// `recoveries` says when that falls short.
+    AllowPublicationFee { id: String, sats: u64 },
     /// Hubs announced on Nostr relays, at the URLs that answer as the hub
     /// that announced them. Needs no wallet.
     Discover {
@@ -1157,6 +1163,9 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             return contract::recoveries(&wallet, &path, chain.as_deref(), fee_rate, json).await;
         }
         Command::GiveUpRecovery { id } => contract::give_up(&wallet, &path, &id)?,
+        Command::AllowPublicationFee { id, sats } => {
+            contract::allow_publication_fee(&path, &id, sats)?
+        }
         Command::Swaps => {
             let swaps = wallet.swaps()?;
             let lines = swaps.iter().map(swap_line).collect::<Vec<_>>();
