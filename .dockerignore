@@ -15,6 +15,7 @@
 !crates/licash-contract
 # The hub's statement, of the contract and of its recovery.
 !crates/licash-hp
+!crates/licash-statement
 # Its prover, and the programs contracts open under.
 !r0/host
 !r0/programs
