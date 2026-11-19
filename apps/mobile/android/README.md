@@ -146,11 +146,13 @@ week while another can. Tapping a hub in Settings lists its fees. Silent payment
 before the first block the hub indexed are not found; payments to the
 fallback address are, from the day before the wallet was made.
 
-Send pays Bitcoin addresses from notes too, and codes naming no hub the app
-trusts at their address, through a swap provider paying out on Bitcoin
-(`licash-swaps run --chain URL`) announced on a relay a hub of the app names
-(`--nostr-relay URL --announce-url URL`); a hub's page, behind the balance,
-cashes out all the notes there to an address that way.
+Send pays Bitcoin addresses and silent payment addresses from notes too (a
+`bitcoin:` code at its `sp=` address first), through a swap provider paying
+out on Bitcoin (`licash-swaps run --chain URL`) announced on a relay a hub of
+the app names (`--nostr-relay URL --announce-url URL`); a hub's page, behind
+the balance, cashes out notes there to an address that way, all of them or
+an amount chosen. A `licash:` code is paid in notes only, through a swap to
+a hub it names if the app trusts none.
 
 Lightning invoices are paid the cheapest way found: through a trusted hub's
 gateway, or through a swap provider announced the same way that pays
