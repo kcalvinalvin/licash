@@ -305,6 +305,39 @@ fn swap_record(net: &Net, hash: [u8; 32], state: &str, lock: Option<licash::spen
     .unwrap();
 }
 
+/// One snapshot of the hub's database holds its ledger and its deposits
+/// alike, as of one moment: a hub restored from it, with its seed, answers
+/// a deposit asked before as it did, and records no other.
+#[tokio::test]
+async fn one_snapshot_of_the_hubs_database_restores_its_deposits_with_its_ledger() {
+    let net = Net::new().await;
+    let alice = net.wallet("alice");
+    let deposit = alice.deposit(HUB, 3_000).await.unwrap();
+    let (_, body) = net.asked("alice", &deposit.hash);
+    let answered = net.deposits.deposit(&body).await.unwrap();
+
+    // A connection of its own to the running hub's file: its snapshot.
+    let conn =
+        licash_store::open(&net.dir.path().join("hub.sqlite"), licash_store::Kind::Hub).unwrap();
+    let copy = tempfile::tempdir().unwrap();
+    let snapshot = copy.path().join("hub.sqlite");
+    licash_store::backup(&conn, &snapshot).unwrap();
+    std::fs::copy(net.dir.path().join("seed"), copy.path().join("seed")).unwrap();
+
+    let policy = Policy {
+        timing: TIMING,
+        ..Policy::default()
+    };
+    let hub = Arc::new(Hub::open(&copy.path().join("seed"), &snapshot, policy).unwrap());
+    let restored = gateway(&hub, &net.source, &snapshot);
+    assert_eq!(restored.deposit(&body).await.unwrap(), answered);
+    let held = rusqlite::Connection::open(&snapshot)
+        .unwrap()
+        .query_row("SELECT count(*) FROM deposits", [], |r| r.get::<_, i64>(0))
+        .unwrap();
+    assert_eq!(held, 1);
+}
+
 #[tokio::test]
 async fn gateways_refuse_every_hash_reserved_by_a_swap_even_when_swaps_are_off() {
     for state in ["accepted", "locked", "failed", "done"] {
