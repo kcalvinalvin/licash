@@ -105,91 +105,189 @@ impl Chain for Ledger {
     }
 }
 
+/// A contract opened, its hub's and her machines loaded, no recovery yet,
+/// on a chain of its genesis alone.
+struct World {
+    dir: tempfile::TempDir,
+    wallet: Wallet<Offline>,
+    holder: Holder,
+    hub: Hub,
+    keys: HolderKeys,
+    store: Store,
+    chain: Ledger,
+    id: [u8; 32],
+}
+impl World {
+    fn new() -> Self {
+        use super::super::store::New;
+        let dir = tempfile::tempdir().unwrap();
+        let wallet = Wallet::create(
+            &dir.path().join("wallet.sqlite"),
+            &[7; 32],
+            ChainProfile::Core30DefaultRegtest,
+            Offline,
+        )
+        .unwrap();
+        let saved = crate::testing::opened();
+        assert_eq!(wallet.contract_secrets().seed, saved.seed);
+        let ctx = Context {
+            tip: 0,
+            trust: Trust::mock(),
+        };
+        let holder = Holder::load(&saved.holder, &saved.seed, &ctx).unwrap();
+        let hub = Hub::load(&saved.hub, &ctx).unwrap();
+        let id = holder.id();
+        let keys = HolderKeys::derive(&saved.seed, &id);
+        let store = Store::open(dir.path()).unwrap();
+        let o = holder.signed().unwrap();
+        let deposit = o.base.deposit_outpoint();
+        store
+            .insert(&New {
+                id,
+                hub: "http://hub.example",
+                mock: true,
+                deposit: OutPoint {
+                    txid: Txid::from_byte_array(deposit.txid),
+                    vout: deposit.index,
+                },
+                value: 60000,
+                price: 23000,
+                cap: o.base.parts().cap,
+                assert_height: o.base.parts().graph.request_height,
+                close_height: o.base.parts().graph.close_height,
+                since: 0,
+                state: &saved.holder,
+            })
+            .unwrap();
+        Self {
+            dir,
+            wallet,
+            holder,
+            hub,
+            keys,
+            store,
+            chain: Ledger::new(),
+            id,
+        }
+    }
+    /// Her publication, as it reads: its claim, then her fee coin.
+    fn p(&self) -> Transaction {
+        Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![TxIn::default()],
+            output: vec![
+                TxOut {
+                    value: Amount::ZERO,
+                    script_pubkey: ScriptBuf::new(),
+                },
+                TxOut {
+                    value: Amount::from_sat(20000),
+                    script_pubkey: dispute::fee_script(&self.keys.party.payment).unwrap(),
+                },
+            ],
+        }
+    }
+    /// Her request of 4096, in the genesis block, as the chain reads.
+    fn r(&self) -> Transaction {
+        let o = self.holder.signed().unwrap();
+        o.request(&self.keys, 4096, &[22; 32]).unwrap()
+    }
+    /// Her recovery at `stage` with `state`, irrevocable.
+    fn start(&self, stage: Stage, state: &State) {
+        let bytes = state.encode();
+        (self.store)
+            .start_recovery(&self.id, FORMAT, stage.as_str(), &bytes)
+            .unwrap();
+        assert!(self
+            .store
+            .save_recovery(
+                &self.id,
+                (stage.as_str(), &bytes),
+                stage.as_str(),
+                true,
+                &bytes
+            )
+            .unwrap());
+    }
+    fn state(&self) -> State {
+        State::decode(&self.store.recovery(&self.id).unwrap().unwrap()).unwrap()
+    }
+    /// Her state edited by `edit`, at the stage it is at.
+    fn edit(&self, edit: impl FnOnce(&mut State)) {
+        let row = self.store.recovery(&self.id).unwrap().unwrap();
+        let mut state = State::decode(&row).unwrap();
+        edit(&mut state);
+        assert!(self
+            .store
+            .save_recovery(
+                &self.id,
+                (&row.stage, &row.state),
+                &row.stage,
+                true,
+                &state.encode()
+            )
+            .unwrap());
+    }
+    async fn advance(&self) -> Vec<Recovery> {
+        let rate = FeeRate::from_sat_per_vb(2).unwrap();
+        advance(&self.wallet, &self.chain, self.dir.path(), rate)
+            .await
+            .unwrap()
+    }
+    fn tip(&self) -> u32 {
+        *self
+            .chain
+            .blocks
+            .lock()
+            .unwrap()
+            .last_key_value()
+            .unwrap()
+            .0
+    }
+}
+
+/// `tx` with its first input's witness told apart from any made anew,
+/// its txid the same.
+fn marked(tx: &Transaction) -> Transaction {
+    let mut tx = tx.clone();
+    let mut items: Vec<Vec<u8>> = tx.input[0].witness.iter().map(<[u8]>::to_vec).collect();
+    items.push(vec![0xee; 3]);
+    tx.input[0].witness = Witness::from_slice(&items);
+    tx
+}
+
 async fn lifecycle(amount: u32, altered: bool, answer: bool, reorged: bool) {
-    use super::super::store::New;
-    let dir = tempfile::tempdir().unwrap();
-    let wallet = Wallet::create(
-        &dir.path().join("wallet.sqlite"),
-        &[7; 32],
-        ChainProfile::Core30DefaultRegtest,
-        Offline,
-    )
-    .unwrap();
-    let saved = crate::testing::opened();
-    assert_eq!(wallet.contract_secrets().seed, saved.seed);
-    let ctx = Context {
-        tip: 0,
-        trust: Trust::mock(),
-    };
-    let holder = Holder::load(&saved.holder, &saved.seed, &ctx).unwrap();
+    let w = World::new();
+    let World {
+        dir,
+        wallet,
+        holder,
+        hub,
+        keys: _,
+        store,
+        chain,
+        id,
+    } = &w;
+    let id = *id;
     let o = holder.signed().unwrap();
-    let hub = Hub::load(&saved.hub, &ctx).unwrap();
     let ho = hub.signed().unwrap();
-    let id = holder.id();
-    let keys = HolderKeys::derive(&saved.seed, &id);
     let response = ho.respond(hub.keys(), amount).unwrap();
     let proof = lichen_babe::statement::mock_prove(&licash_contract::graph::journal(&o.base));
     let assertion = ho.assert(hub.keys(), &proof).unwrap();
-    let store = Store::open(dir.path()).unwrap();
-    let deposit = o.base.deposit_outpoint();
-    store
-        .insert(&New {
-            id,
-            hub: "http://hub.example",
-            mock: true,
-            deposit: OutPoint {
-                txid: Txid::from_byte_array(deposit.txid),
-                vout: deposit.index,
-            },
-            value: 60000,
-            price: 23000,
-            cap: o.base.parts().cap,
-            assert_height: o.base.parts().graph.request_height,
-            close_height: o.base.parts().graph.close_height,
-            since: 0,
-            state: &saved.holder,
-        })
-        .unwrap();
-    let chain = Ledger::new();
     chain.mine(Some(response.clone()));
-    let p = Transaction {
-        version: bitcoin::transaction::Version::TWO,
-        lock_time: bitcoin::absolute::LockTime::ZERO,
-        input: vec![TxIn::default()],
-        output: vec![
-            TxOut {
-                value: Amount::ZERO,
-                script_pubkey: ScriptBuf::new(),
-            },
-            TxOut {
-                value: Amount::from_sat(20000),
-                script_pubkey: dispute::fee_script(&keys.party.payment).unwrap(),
-            },
-        ],
-    };
     let state = State {
         amount: 4096,
         reduced: Some(amount),
-        r: Some(o.request(&keys, 4096, &[22; 32]).unwrap()),
+        r: Some(w.r()),
         r_height: Some(0),
         response: Some(response),
         response_height: Some(1),
-        p: Some(p),
+        p: Some(w.p()),
         from: Some(1),
         ..State::default()
     };
-    store
-        .start_recovery(&id, FORMAT, Stage::Answered.as_str(), &state.encode())
-        .unwrap();
-    assert!(store
-        .save_recovery(
-            &id,
-            (Stage::Answered.as_str(), &state.encode()),
-            Stage::Answered.as_str(),
-            true,
-            &state.encode()
-        )
-        .unwrap());
+    w.start(Stage::Answered, &state);
     let rate = FeeRate::from_sat_per_vb(2).unwrap();
     let mut mined = assertion.clone();
     if altered {
@@ -199,7 +297,7 @@ async fn lifecycle(amount: u32, altered: bool, answer: bool, reorged: bool) {
         mined.input[0].witness = Witness::from_slice(&witness);
     }
     let asserted_at = chain.mine(Some(mined.clone()));
-    let progressed = advance(&wallet, &chain, dir.path(), rate).await.unwrap();
+    let progressed = advance(wallet, chain, dir.path(), rate).await.unwrap();
     let observed = State::decode(&store.recovery(&id).unwrap().unwrap()).unwrap();
     assert_eq!(observed.verified, Some(!altered));
     let initial = if altered {
@@ -209,7 +307,7 @@ async fn lifecycle(amount: u32, altered: bool, answer: bool, reorged: bool) {
     };
     assert_eq!(progressed[0].stage, initial, "{progressed:?}");
     let pinned = observed.assertion.clone();
-    advance(&wallet, &chain, dir.path(), rate).await.unwrap();
+    advance(wallet, chain, dir.path(), rate).await.unwrap();
     assert_eq!(
         State::decode(&store.recovery(&id).unwrap().unwrap())
             .unwrap()
@@ -218,24 +316,26 @@ async fn lifecycle(amount: u32, altered: bool, answer: bool, reorged: bool) {
         "retry must not select a different assertion or amount"
     );
     let paid_at = if altered {
-        let challenge = observed_challenge(&store, &id);
+        let challenge = observed_challenge(store, &id);
         let mut challenged_at = chain.mine(Some(challenge.clone()));
-        let progressed = advance(&wallet, &chain, dir.path(), rate).await.unwrap();
+        let progressed = advance(wallet, chain, dir.path(), rate).await.unwrap();
         assert_eq!(progressed[0].stage, Stage::Challenged, "{progressed:?}");
         if reorged {
             // The assertion's block and her challenge's replaced, the
             // assertion in a later one: her challenge the same again,
             // nothing revealed anew.
-            let tip = chain.blocks.lock().unwrap().len() as u32 - 1;
+            // Told apart from one made anew: kept, not made again.
+            w.edit(|s| s.challenge = Some(marked(&challenge)));
+            let tip = w.tip();
             chain.reorg(asserted_at - 1);
             chain.mine(None);
             chain.mine(Some(mined.clone()));
             chain.to(tip);
-            let progressed = advance(&wallet, &chain, dir.path(), rate).await.unwrap();
+            let progressed = advance(wallet, chain, dir.path(), rate).await.unwrap();
             assert_eq!(progressed[0].stage, Stage::Challenging, "{progressed:?}");
-            assert_eq!(observed_challenge(&store, &id), challenge);
+            assert_eq!(observed_challenge(store, &id), marked(&challenge));
             challenged_at = chain.mine(Some(challenge.clone()));
-            let progressed = advance(&wallet, &chain, dir.path(), rate).await.unwrap();
+            let progressed = advance(wallet, chain, dir.path(), rate).await.unwrap();
             assert_eq!(progressed[0].stage, Stage::Challenged, "{progressed:?}");
         }
         if answer {
@@ -251,21 +351,21 @@ async fn lifecycle(amount: u32, altered: bool, answer: bool, reorged: bool) {
         } else {
             let delay = blocks(presign(&o.set, "failure").unwrap().tx.input[0].sequence).unwrap();
             chain.to(challenged_at + delay - 1);
-            let progressed = advance(&wallet, &chain, dir.path(), rate).await.unwrap();
+            let progressed = advance(wallet, chain, dir.path(), rate).await.unwrap();
             assert_eq!(progressed[0].stage, Stage::TimingOut, "{progressed:?}");
             chain.mine(Some(chain.last()))
         }
     } else {
         let delay = blocks(presign(&o.set, "success").unwrap().tx.input[0].sequence).unwrap();
         chain.to(asserted_at + delay - 1);
-        let progressed = advance(&wallet, &chain, dir.path(), rate).await.unwrap();
+        let progressed = advance(wallet, chain, dir.path(), rate).await.unwrap();
         assert_eq!(progressed[0].stage, Stage::Succeeding, "{progressed:?}");
         chain.mine(Some(chain.last()))
     };
-    let progressed = advance(&wallet, &chain, dir.path(), rate).await.unwrap();
+    let progressed = advance(wallet, chain, dir.path(), rate).await.unwrap();
     if amount == 0 && !altered {
         // A corrected zero leaves her nothing of the payout to collect.
-        let done = advance(&wallet, &chain, dir.path(), rate).await.unwrap();
+        let done = advance(wallet, chain, dir.path(), rate).await.unwrap();
         assert_eq!(done[0].stage, Stage::Done, "{progressed:?} {done:?}");
         assert_eq!(done[0].received, Some(0));
         return;
@@ -279,37 +379,40 @@ async fn lifecycle(amount: u32, altered: bool, answer: bool, reorged: bool) {
             .next_at
             .unwrap_or(paid_at + 6)
             .saturating_sub(1));
-        let progressed = advance(&wallet, &chain, dir.path(), rate).await.unwrap();
+        let progressed = advance(wallet, chain, dir.path(), rate).await.unwrap();
         assert_eq!(progressed[0].stage, Stage::Sweeping, "{progressed:?}");
     }
     let sweep = chain.last();
     if reorged {
         // The payout's block replaced, the payout in a later one: found
         // there again, and the same sweep posted.
-        let pinned = State::decode(&store.recovery(&id).unwrap().unwrap()).unwrap();
+        let pinned = w.state();
         assert_eq!(pinned.sweep.as_ref(), Some(&sweep));
         let payout = pinned.payout.clone().unwrap();
-        let tip = chain.blocks.lock().unwrap().len() as u32 - 1;
+        // Told apart from one made anew: kept, not made again.
+        w.edit(|s| s.sweep = Some(marked(&sweep)));
+        let tip = w.tip();
         chain.reorg(paid_at - 1);
         chain.mine(None);
         let again = chain.mine(Some(payout.clone()));
         // As long as the chain she saw, at least: no sign till then.
         chain.to(tip);
-        let mut progressed = advance(&wallet, &chain, dir.path(), rate).await.unwrap();
+        let mut progressed = advance(wallet, chain, dir.path(), rate).await.unwrap();
         let state = State::decode(&store.recovery(&id).unwrap().unwrap()).unwrap();
         assert_eq!(state.payout_height, Some(again), "{progressed:?}");
         assert_eq!(state.payout, Some(payout));
         if progressed[0].stage != Stage::Sweeping {
             chain.to(progressed[0].next_at.unwrap() - 1);
-            progressed = advance(&wallet, &chain, dir.path(), rate).await.unwrap();
+            progressed = advance(wallet, chain, dir.path(), rate).await.unwrap();
         }
         assert_eq!(progressed[0].stage, Stage::Sweeping, "{progressed:?}");
-        assert_eq!(chain.last(), sweep);
+        assert_eq!(chain.last(), marked(&sweep));
+        assert_eq!(w.state().sweep, Some(marked(&sweep)));
     }
     assert!(sweep.output[0].value >= sweep.output[0].script_pubkey.minimal_non_dust());
     let received = sweep.output[0].value.to_sat();
     chain.mine(Some(sweep));
-    let done = advance(&wallet, &chain, dir.path(), rate).await.unwrap();
+    let done = advance(wallet, chain, dir.path(), rate).await.unwrap();
     assert_eq!(done[0].stage, Stage::Done, "{done:?}");
     assert_eq!(done[0].corrected, Some(amount as u64));
     assert_eq!(done[0].received, Some(received));
@@ -320,6 +423,90 @@ async fn lifecycle(amount: u32, altered: bool, answer: bool, reorged: bool) {
             .reduced,
         Some(amount)
     );
+}
+
+/// Her timeout in a block, then that block replaced by one of the hub's
+/// answer: followed as answered, her payout forgotten.
+#[tokio::test]
+async fn a_timeout_a_reorganization_swaps_for_the_hubs_answer_is_followed_as_answered() {
+    let w = World::new();
+    let o = w.holder.signed().unwrap();
+    let ho = w.hub.signed().unwrap();
+    let response = ho.respond(w.hub.keys(), 4096).unwrap();
+    w.start(
+        Stage::Requested,
+        &State {
+            amount: 4096,
+            r: Some(w.r()),
+            r_height: Some(0),
+            p: Some(w.p()),
+            p_height: Some(0),
+            from: Some(0),
+            ..State::default()
+        },
+    );
+    let delay = blocks(presign(&o.set, "request_timeout").unwrap().tx.input[0].sequence).unwrap();
+    w.chain.to(delay - 1);
+    let progressed = w.advance().await;
+    assert_eq!(progressed[0].stage, Stage::TimingOut, "{progressed:?}");
+    let paid_at = w.chain.mine(Some(w.chain.last()));
+    let progressed = w.advance().await;
+    assert_eq!(progressed[0].stage, Stage::TimedOut, "{progressed:?}");
+    let tip = w.tip() + 1;
+    w.chain.reorg(paid_at - 1);
+    w.chain.mine(Some(response.clone()));
+    w.chain.to(tip);
+    let progressed = w.advance().await;
+    assert_eq!(progressed[0].stage, Stage::Answered, "{progressed:?}");
+    let state = w.state();
+    assert_eq!((state.payout, state.payout_name), (None, None));
+    assert_eq!(state.response_height, Some(paid_at));
+    assert_eq!(state.response, Some(response));
+}
+
+/// A reorganization deeper than her scan looks back puts the hub's
+/// assertion below where she scanned to, her request's answer standing:
+/// found all the same.
+#[tokio::test]
+async fn an_assertion_a_reorganization_puts_below_her_scan_is_found() {
+    let w = World::new();
+    let o = w.holder.signed().unwrap();
+    let ho = w.hub.signed().unwrap();
+    let response = ho.respond(w.hub.keys(), 4096).unwrap();
+    let proof = lichen_babe::statement::mock_prove(&licash_contract::graph::journal(&o.base));
+    let assertion = ho.assert(w.hub.keys(), &proof).unwrap();
+    w.chain.mine(Some(response.clone()));
+    w.start(
+        Stage::Answered,
+        &State {
+            amount: 4096,
+            reduced: Some(4096),
+            r: Some(w.r()),
+            r_height: Some(0),
+            response: Some(response),
+            response_height: Some(1),
+            p: Some(w.p()),
+            from: Some(1),
+            ..State::default()
+        },
+    );
+    assert_eq!(w.advance().await[0].stage, Stage::Answered);
+    // As far as she waits for it, her answer's timeout not yet due.
+    let due = 1 + blocks(presign(&o.set, "respond_timeout").unwrap().tx.input[0].sequence).unwrap();
+    let tip = due - 2;
+    assert!(tip > 2 + OVERLAP + 1, "a timeout of {due} leaves no room");
+    w.chain.to(tip);
+    assert_eq!(w.advance().await[0].stage, Stage::Answered);
+    assert!(
+        w.state().from > Some(2 + OVERLAP),
+        "scanned past where it lands"
+    );
+    w.chain.reorg(1);
+    let asserted_at = w.chain.mine(Some(assertion));
+    w.chain.to(tip);
+    let progressed = w.advance().await;
+    assert_eq!(progressed[0].stage, Stage::Asserted, "{progressed:?}");
+    assert_eq!(w.state().assertion_height, Some(asserted_at));
 }
 
 fn observed_challenge(store: &Store, id: &[u8; 32]) -> Transaction {
