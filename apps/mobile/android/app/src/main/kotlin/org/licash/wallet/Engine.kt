@@ -1429,6 +1429,8 @@ class Engine(context: Context) {
     /** The wallet `w` opened, as its owner set it: what its renewals may cost. */
     private fun configured(w: Wallet): Wallet {
         prefs.renewPpm?.let { w.setRenewLimit(it) }
+        // Its coins on Bitcoin looked for while the phone rests, too.
+        ScanJob.schedule(app)
         return w
     }
 
@@ -1476,6 +1478,7 @@ class Engine(context: Context) {
             seen = null
             looking = false
             WatchJob.cancel(app)
+            ScanJob.cancel(app)
         }
         // Through Tor, its way closed with the wallet.
         lightLock.withLock { startLight() }

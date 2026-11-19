@@ -29,7 +29,8 @@ pub enum Onchain {
         #[arg(long)]
         from: Option<u32>,
     },
-    /// The coins found, not spent in a block yet.
+    /// The coins found, not spent in a block yet: with --chain, looked for
+    /// first up to the chain's height, as `scan` does.
     Coins,
     /// Pay AMOUNT to TO, a Bitcoin address, a silent payment address or a
     /// payment code naming either, the fee on top, from one coin alone,
@@ -105,6 +106,13 @@ pub async fn run(
         )?;
         chain.parse().context("--chain")
     };
+    // Caught up first, implicitly, with a chain to read: the coins as
+    // the chain has them, without a scan asked for.
+    if chain.is_some() && !matches!(command, Onchain::Scan { .. }) {
+        if let Err(e) = catch_up(wallet, &source()?, None).await {
+            tracing::warn!("coins not looked for: {e:#}");
+        }
+    }
     match command {
         Onchain::Scan { from } => scan(wallet, &source()?, from, json).await,
         Onchain::Coins => {

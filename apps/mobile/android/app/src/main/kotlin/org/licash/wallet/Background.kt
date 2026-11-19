@@ -228,3 +228,51 @@ class WatchJob : JobService() {
         }
     }
 }
+
+/**
+ * A look every [PERIOD_MS] or so while the phone rests (idle, with a
+ * network), whatever is under way: a round in sync with Bitcoin, which
+ * looks for the wallet's coins up to the chain's height, so that coins
+ * paid to it are found without the app being opened. At most [ROUNDS_MS].
+ */
+class ScanJob : JobService() {
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private var looking: Job? = null
+
+    override fun onStartJob(params: JobParameters): Boolean {
+        val engine = (application as LicashApp).engine
+        looking = scope.launch {
+            engine.round(ROUNDS_MS)
+            jobFinished(params, false)
+        }
+        return true
+    }
+
+    override fun onStopJob(params: JobParameters): Boolean {
+        looking?.cancel()
+        return true
+    }
+
+    companion object {
+        private const val ID = 2
+        private const val PERIOD_MS = 4 * 3600 * 1000L
+        private const val ROUNDS_MS = 10 * 60 * 1000L
+
+        /** Look while the phone rests, across its restarts, if not yet. */
+        fun schedule(context: Context) {
+            val jobs = context.getSystemService(JobScheduler::class.java) ?: return
+            if (jobs.getPendingJob(ID) != null) return
+            val job = JobInfo.Builder(ID, ComponentName(context, ScanJob::class.java))
+                .setPeriodic(PERIOD_MS)
+                .setRequiresDeviceIdle(true)
+                .setRequiredNetworkType(JobInfo.NETWORK_TYPE_ANY)
+                .setPersisted(true)
+                .build()
+            runCatching { jobs.schedule(job) }.onFailure { AppLog.warn("scheduling a look while resting", it) }
+        }
+
+        fun cancel(context: Context) {
+            context.getSystemService(JobScheduler::class.java)?.cancel(ID)
+        }
+    }
+}

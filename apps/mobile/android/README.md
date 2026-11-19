@@ -118,7 +118,10 @@ receives, within the same fee authority and the rolling 1% daily budget
 out their privacy rest, a periodic job (about every 15 minutes, as Android
 allows) keeps looking after the app is closed, without the foreground
 service; it stops once nothing is left to do, or when what is left is
-beyond the fee authority. History shows each remint as "Optimized notes",
+beyond the fee authority. Apart from it, a job every 4 hours or so while
+the phone rests (idle, with a network) syncs a round with Bitcoin, so coins
+paid to the wallet are found without opening the app. History shows each
+remint as "Optimized notes",
 its fee alone. In advanced mode, a hub's sheet in Settings offers "Optimize
 notes": a preview, then a remint within the fee shown, bypassing the rests
 and the daily budget but never the contract ceilings.

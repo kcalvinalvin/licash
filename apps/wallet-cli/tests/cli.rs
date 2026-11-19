@@ -1753,6 +1753,24 @@ fn coins_paid_on_bitcoin_are_found_spent_and_moved_to_notes() {
     assert_eq!(values(&json(&alice, &["onchain", "coins"])), [change]);
 }
 
+/// The coins listed with a chain to read are looked for first: no scan
+/// asked for, as the app looks while idle.
+#[test]
+fn coins_listed_with_a_chain_are_looked_for_first() {
+    let hub = Server::with_tweaks(FEE);
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, _) = party(dir.path(), "alice", Some(&hub));
+    let chain = hub.esplora().to_owned();
+    let (_, sp, _) = on_bitcoin(&alice);
+    hub.pay_silent(&sp, 2_500, 1);
+    hub.round();
+    // Without a chain, only what was found before.
+    assert_eq!(json(&alice, &["onchain", "coins"]), serde_json::json!([]));
+    let coins = json(&alice, &["onchain", "--chain", &chain, "coins"]);
+    assert_eq!(values(&coins), [2_500]);
+    assert_eq!(json(&alice, &["onchain", "coins"]), coins);
+}
+
 #[test]
 fn coins_paid_at_a_fallback_address_are_found_with_no_hub_serving_tweaks() {
     let hub = Server::with_deposits(FEE);
