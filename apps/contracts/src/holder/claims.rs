@@ -271,7 +271,7 @@ mod tests {
             }
         }
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
+        let store = Store::open(&crate::testing::wallet_file(dir.path())).unwrap();
         for id in 1..=4 {
             let deposit = OutPoint {
                 txid: bitcoin::Txid::from_byte_array([9; 32]),

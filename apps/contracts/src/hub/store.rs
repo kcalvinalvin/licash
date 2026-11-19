@@ -1,13 +1,9 @@
-//! The hub's openings, in `openings.sqlite` of its data directory: each
-//! as its machine stored itself at its last step, the digest of the
-//! holder's message that step took, and the hub's own coins F spends,
-//! which its node keeps locked while the opening lives.
+//! The hub's openings, the component `openings` of `hub.sqlite`: each as
+//! its machine stored itself at its last step, the digest of the holder's
+//! message that step took, and the hub's own coins F spends, which its node
+//! keeps locked while the opening lives.
 //!
-//! The file's version tells which of its tables a build must know to
-//! read it right. The `fees` are none of them: made with the first kept,
-//! whatever the version, and ignored by a build before them, which opens
-//! the file all the same. A migration to come must make them
-//! `IF NOT EXISTS` too.
+//! The tables are made with the first opening; reading finds none before.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -16,96 +12,100 @@ use anyhow::{bail, ensure, Context, Result};
 use bitcoin::consensus::{deserialize, serialize};
 use bitcoin::{OutPoint, Transaction, TxOut};
 use licash_api::Fees;
-use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use licash_store::Kind;
+use rusqlite::{params, Connection, OptionalExtension};
 
 /// The format of the rows: a machine's stored bytes, of
 /// `licash_contract`'s format 3. Older rows are retained, not reinterpreted:
 /// no exit of theirs is played.
 pub(super) const FORMAT: i64 = 3;
 
+/// The component the openings' tables are, and its version.
+const COMPONENT: &str = "openings";
+const VERSION: i64 = 1;
+
+/// A stage an opening reaches is a table of its own, one row of it a fact.
 const SCHEMA: &str = "
-CREATE TABLE IF NOT EXISTS openings (
+-- Each opening. `fees` is what the hub charged as it started, as JSON, the
+-- most its holder agreed to pay: for the operator to know whom fees raised
+-- since leave to agree again. Nothing is done by it. None where the hub was
+-- told not to charge.
+CREATE TABLE openings (
     id BLOB PRIMARY KEY,
     format INTEGER NOT NULL,
     phase INTEGER NOT NULL,
-    mock INTEGER NOT NULL,
-    irrevocable INTEGER NOT NULL,
+    mock INTEGER NOT NULL CHECK (mock IN (0, 1)),
+    irrevocable INTEGER NOT NULL CHECK (irrevocable IN (0, 1)),
     deposit BLOB NOT NULL,
     coins BLOB NOT NULL,
     last BLOB NOT NULL,
     state BLOB NOT NULL,
-    abandoned INTEGER NOT NULL DEFAULT 0,
+    abandoned INTEGER NOT NULL DEFAULT 0 CHECK (abandoned IN (0, 1)),
+    fees TEXT,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
 ) STRICT;
-CREATE UNIQUE INDEX IF NOT EXISTS openings_deposit ON openings (deposit) WHERE abandoned = 0;
-";
+CREATE UNIQUE INDEX openings_deposit ON openings (deposit) WHERE abandoned = 0;
 
-/// What the hub charged as each opening started, as JSON: what its
-/// holder agreed to pay at most, for the operator to know whom fees
-/// raised since leave to agree again. Nothing is done by it. No row, of an
-/// opening started before these were kept, tells nothing: nor does no
-/// table.
-const FEES: &str = "
-CREATE TABLE IF NOT EXISTS fees (
-    id BLOB PRIMARY KEY REFERENCES openings (id),
-    fees TEXT NOT NULL,
-    created_at INTEGER NOT NULL
-) STRICT;
-";
-
-/// What the responder keeps across restarts, made with the first kept,
-/// as `fees`, and ignored by a build before them:
-/// - `fee_coins`: each coin its wallet funded to pay a terminal's fee
-///   (opening, terminal), made once: another made after a restart would
-///   be lost to the hub, as only that terminal spends it;
-/// - `ended`: the contracts whose exit or default left nothing of the
-///   hub's to play, deep enough not to look again. None ended (no table)
-///   only means each is looked at again;
-/// - `unfunded`: the signed openings whose F the responder saw in no
-///   block, and the block it first did: given up once F can never
-///   confirm, and made so by the hub some blocks after
-///   ([`Store::unfunded`]). None (or no table), of a row signed before
-///   these were kept, proves nothing: its blocks count from the first
-///   seen;
-/// - `signing`: each answer of a one-time key (opening, `respond` or
-///   `assert`) the hub was about to sign, or had signed: kept once what
-///   it answers on is pinned in `responses.sqlite`, and before it signs
-///   ([`Store::begin_signing`]). One with nothing pinned there any more
-///   tells that file was lost, or restored older than this one: an answer
-///   decided anew could differ from the one signed. None (or no table),
-///   of an answer signed before these were kept, proves nothing.
-const RESPONDER: &str = "
-CREATE TABLE IF NOT EXISTS fee_coins (
+-- Each coin its wallet funded to pay a terminal's fee (opening, terminal),
+-- made once: another made after a restart would be lost to the hub, as only
+-- that terminal spends it.
+CREATE TABLE opening_fee_coins (
     id BLOB NOT NULL REFERENCES openings (id),
     name TEXT NOT NULL,
     outpoint BLOB NOT NULL,
     output BLOB NOT NULL,
     PRIMARY KEY (id, name)
 ) STRICT;
-CREATE TABLE IF NOT EXISTS children (
+-- The fee child of each link last made, kept before it is broadcast.
+CREATE TABLE opening_children (
     id BLOB NOT NULL REFERENCES openings (id),
     name TEXT NOT NULL,
     tx BLOB NOT NULL,
     PRIMARY KEY (id, name)
 ) STRICT;
-CREATE TABLE IF NOT EXISTS ended (
+-- The contracts whose exit or default left nothing of the hub's to play,
+-- deep enough not to look again.
+CREATE TABLE opening_ended (
     id BLOB PRIMARY KEY REFERENCES openings (id),
     height INTEGER NOT NULL,
     created_at INTEGER NOT NULL
 ) STRICT;
-CREATE TABLE IF NOT EXISTS unfunded (
+-- The signed openings whose F the responder saw in no block, and the block
+-- it first did: given up once F can never confirm, and made so by the hub
+-- some blocks after.
+CREATE TABLE opening_unfunded (
     id BLOB PRIMARY KEY REFERENCES openings (id),
     height INTEGER NOT NULL,
     created_at INTEGER NOT NULL
 ) STRICT;
-CREATE TABLE IF NOT EXISTS signing (
+-- Each answer of a one-time key (opening, `respond` or `assert`) the hub
+-- was about to sign, or had signed: kept once what it answers on is pinned
+-- in `response_pins`, and before it signs ([`Store::begin_signing`]). One
+-- with nothing pinned there any more tells those rows were lost, or
+-- restored older than these: an answer decided anew could differ from the
+-- one signed.
+CREATE TABLE opening_signing (
     id BLOB NOT NULL REFERENCES openings (id),
     name TEXT NOT NULL,
     created_at INTEGER NOT NULL,
     PRIMARY KEY (id, name)
 ) STRICT;
 ";
+
+/// The hub's connection to the openings' tables, read only, in the hub's
+/// data directory `data`: none if the hub has no database there or never
+/// stored an opening.
+fn reader(data: &Path) -> Result<Option<Connection>> {
+    let Some(c) = licash_store::inspect(&crate::hub_db(data), Kind::Hub)? else {
+        return Ok(None);
+    };
+    match licash_store::component_version(&c, COMPONENT)? {
+        Some(VERSION) => Ok(Some(c)),
+        Some(v) => bail!("the openings are of version {v}, newer than this hub knows"),
+        None => Ok(None),
+    }
+}
 
 /// The name of extra fee coin `n` of transaction `name`, beside the first
 /// kept under `name` itself.
@@ -149,11 +149,9 @@ impl Store {
     /// How many openings in `dir` the hub signed and did not give up,
     /// read only: none if no opening was ever stored there.
     pub fn signed(dir: &Path) -> Result<u64> {
-        let path = dir.join("openings.sqlite");
-        if !path.exists() {
+        let Some(c) = reader(dir)? else {
             return Ok(0);
-        }
-        let c = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        };
         let n: i64 = c.query_row(
             "SELECT count(*) FROM openings WHERE irrevocable = 1 AND abandoned = 0",
             [],
@@ -165,17 +163,9 @@ impl Store {
     /// Every opening in `dir`, oldest first, read only: none if no
     /// opening was ever stored there.
     pub fn listed(dir: &Path) -> Result<Vec<Listed>> {
-        let path = dir.join("openings.sqlite");
-        if !path.exists() {
+        let Some(c) = reader(dir)? else {
             return Ok(Vec::new());
-        }
-        let c = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        let version: i64 = c.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        match version {
-            0 => return Ok(Vec::new()),
-            1 => {}
-            v => bail!("openings.sqlite is of version {v}, newer than this hub knows"),
-        }
+        };
         let mut stmt = c.prepare(LISTED)?;
         let rows = stmt.query_map([], |r| {
             let at: (i64, i64) = (r.get(6)?, r.get(9)?);
@@ -198,17 +188,10 @@ impl Store {
         Ok(rows.into_iter().map(|(_, listed)| listed).collect())
     }
 
+    /// The openings in the hub's data directory `dir`, made if none were.
     pub fn open(dir: &Path) -> Result<Self> {
-        let c = crate::private_db(&dir.join("openings.sqlite"))?;
-        let version: i64 = c.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        match version {
-            0 => {
-                c.execute_batch(SCHEMA)?;
-                c.pragma_update(None, "user_version", 1)?;
-            }
-            1 => {}
-            v => bail!("openings.sqlite is of version {v}, newer than this hub knows"),
-        }
+        let mut c = licash_store::open(&crate::hub_db(dir), Kind::Hub)?;
+        licash_store::component(&mut c, COMPONENT, VERSION, SCHEMA)?;
         Ok(Self(c, None, dir.to_path_buf()))
     }
 
@@ -273,27 +256,15 @@ impl Store {
     }
 
     /// What the hub charged as each opening in `dir` it signed and did
-    /// not give up started, read only: none of those started before these
-    /// were kept, nor of one whose own cannot be read.
+    /// not give up started, read only: none of one that started with the
+    /// hub told not to charge, nor of one whose own cannot be read.
     pub fn charged(dir: &Path) -> Result<Vec<Fees>> {
-        let path = dir.join("openings.sqlite");
-        if !path.exists() {
+        let Some(c) = reader(dir)? else {
             return Ok(Vec::new());
-        }
-        let c = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        let made: Option<i64> = c
-            .query_row(
-                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'fees'",
-                [],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if made.is_none() {
-            return Ok(Vec::new());
-        }
+        };
         let mut stmt = c.prepare(
-            "SELECT f.fees FROM fees f JOIN openings o ON o.id = f.id
-             WHERE o.irrevocable = 1 AND o.abandoned = 0",
+            "SELECT fees FROM openings
+             WHERE fees IS NOT NULL AND irrevocable = 1 AND abandoned = 0",
         )?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
         let mut all = Vec::new();
@@ -312,14 +283,10 @@ impl Store {
     /// The signed openings not given up nor ended, of this format: those
     /// whose exit the hub plays.
     pub fn signed_ids(&self) -> Result<Vec<[u8; 32]>> {
-        let ended = match self.has("ended")? {
-            true => "AND id NOT IN (SELECT id FROM ended)",
-            false => "",
-        };
-        let mut stmt = self.0.prepare(&format!(
+        let mut stmt = self.0.prepare(
             "SELECT id FROM openings WHERE irrevocable = 1 AND abandoned = 0 AND format = ?1
-             {ended} ORDER BY created_at, rowid"
-        ))?;
+             AND id NOT IN (SELECT id FROM opening_ended) ORDER BY created_at, rowid",
+        )?;
         let rows = stmt.query_map([FORMAT], |r| r.get(0))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
@@ -328,15 +295,11 @@ impl Store {
     /// may yet have to prove an exit of: funded or signed, of this format,
     /// not the mock authority's, not given up nor ended.
     pub fn committed(&self, except: &[u8; 32]) -> Result<Vec<Vec<u8>>> {
-        let ended = match self.has("ended")? {
-            true => "AND id NOT IN (SELECT id FROM ended)",
-            false => "",
-        };
-        let mut stmt = self.0.prepare(&format!(
+        let mut stmt = self.0.prepare(
             "SELECT state FROM openings
              WHERE (irrevocable = 1 OR length(coins) > 0) AND abandoned = 0 AND mock = 0
-               AND format = ?1 AND id != ?2 {ended}"
-        ))?;
+               AND format = ?1 AND id != ?2 AND id NOT IN (SELECT id FROM opening_ended)",
+        )?;
         let rows = stmt.query_map(params![FORMAT, except], |r| r.get(0))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
@@ -344,9 +307,8 @@ impl Store {
     /// Opening `id`'s contract ended at block `height`: nothing of the
     /// hub's left in it to play.
     pub fn end(&self, id: &[u8; 32], height: u32) -> Result<()> {
-        self.0.execute_batch(RESPONDER)?;
         self.0.execute(
-            "INSERT INTO ended (id, height, created_at) VALUES (?1, ?2, ?3)
+            "INSERT INTO opening_ended (id, height, created_at) VALUES (?1, ?2, ?3)
              ON CONFLICT DO NOTHING",
             params![id, height, crate::now()],
         )?;
@@ -355,13 +317,10 @@ impl Store {
 
     /// The fee coin kept for terminal `name` of opening `id`, if one was.
     pub fn fee_coin(&self, id: &[u8; 32], name: &str) -> Result<Option<(OutPoint, TxOut)>> {
-        if !self.has("fee_coins")? {
-            return Ok(None);
-        }
         let row: Option<(Vec<u8>, Vec<u8>)> = self
             .0
             .query_row(
-                "SELECT outpoint, output FROM fee_coins WHERE id = ?1 AND name = ?2",
+                "SELECT outpoint, output FROM opening_fee_coins WHERE id = ?1 AND name = ?2",
                 params![id, name],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
@@ -378,9 +337,8 @@ impl Store {
         name: &str,
         coin: &(OutPoint, TxOut),
     ) -> Result<(OutPoint, TxOut)> {
-        self.0.execute_batch(RESPONDER)?;
         self.0.execute(
-            "INSERT INTO fee_coins (id, name, outpoint, output) VALUES (?1, ?2, ?3, ?4)
+            "INSERT INTO opening_fee_coins (id, name, outpoint, output) VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT DO NOTHING",
             params![id, name, serialize(&coin.0), serialize(&coin.1)],
         )?;
@@ -391,11 +349,8 @@ impl Store {
     /// the order kept ([`Store::keep_extra_coin`]): a link's child's, or a
     /// terminal's larger ones.
     pub fn extra_coins(&self, id: &[u8; 32], name: &str) -> Result<Vec<(OutPoint, TxOut)>> {
-        if !self.has("fee_coins")? {
-            return Ok(Vec::new());
-        }
         let mut stmt = self.0.prepare(
-            "SELECT outpoint, output FROM fee_coins
+            "SELECT outpoint, output FROM opening_fee_coins
              WHERE id = ?1 AND substr(name, 1, length(?2)) = ?2 ORDER BY rowid",
         )?;
         let rows = stmt.query_map(params![id, extra_coin(name, "")], |r| {
@@ -423,13 +378,10 @@ impl Store {
 
     /// The fee child of link `name` of opening `id` last made, if any.
     pub fn child(&self, id: &[u8; 32], name: &str) -> Result<Option<Transaction>> {
-        if !self.has("children")? {
-            return Ok(None);
-        }
         let tx: Option<Vec<u8>> = self
             .0
             .query_row(
-                "SELECT tx FROM children WHERE id = ?1 AND name = ?2",
+                "SELECT tx FROM opening_children WHERE id = ?1 AND name = ?2",
                 params![id, name],
                 |r| r.get(0),
             )
@@ -440,9 +392,8 @@ impl Store {
     /// Keep `tx` as link `name`'s fee child, in place of the one before:
     /// kept before it is broadcast.
     pub fn keep_child(&self, id: &[u8; 32], name: &str, tx: &Transaction) -> Result<()> {
-        self.0.execute_batch(RESPONDER)?;
         self.0.execute(
-            "INSERT INTO children (id, name, tx) VALUES (?1, ?2, ?3)
+            "INSERT INTO opening_children (id, name, tx) VALUES (?1, ?2, ?3)
              ON CONFLICT (id, name) DO UPDATE SET tx = excluded.tx",
             params![id, name, serialize(tx)],
         )?;
@@ -451,11 +402,10 @@ impl Store {
 
     /// The hub is about to sign answer `name` of opening `id` with its
     /// one-time key, or has: kept before it signs, once what it answers
-    /// on is pinned in `responses.sqlite`.
+    /// on is pinned in `response_pins`.
     pub fn begin_signing(&self, id: &[u8; 32], name: &str) -> Result<()> {
-        self.0.execute_batch(RESPONDER)?;
         self.0.execute(
-            "INSERT INTO signing (id, name, created_at) VALUES (?1, ?2, ?3)
+            "INSERT INTO opening_signing (id, name, created_at) VALUES (?1, ?2, ?3)
              ON CONFLICT DO NOTHING",
             params![id, name, crate::now()],
         )?;
@@ -463,16 +413,12 @@ impl Store {
     }
 
     /// Whether the hub was about to sign answer `name` of opening `id`, or
-    /// had ([`Store::begin_signing`]): not of one signed before these were
-    /// kept.
+    /// had ([`Store::begin_signing`]).
     pub fn began_signing(&self, id: &[u8; 32], name: &str) -> Result<bool> {
-        if !self.has("signing")? {
-            return Ok(false);
-        }
         Ok(self
             .0
             .query_row(
-                "SELECT 1 FROM signing WHERE id = ?1 AND name = ?2",
+                "SELECT 1 FROM opening_signing WHERE id = ?1 AND name = ?2",
                 params![id, name],
                 |r| r.get::<_, i64>(0),
             )
@@ -484,27 +430,23 @@ impl Store {
     /// if it was not before. Its holder may refresh `updated_at` at will,
     /// by sending a message again: not this.
     pub fn unfunded(&self, id: &[u8; 32], tip: u32) -> Result<u32> {
-        self.0.execute_batch(RESPONDER)?;
         self.0.execute(
-            "INSERT INTO unfunded (id, height, created_at) VALUES (?1, ?2, ?3)
+            "INSERT INTO opening_unfunded (id, height, created_at) VALUES (?1, ?2, ?3)
              ON CONFLICT DO NOTHING",
             params![id, tip, crate::now()],
         )?;
-        Ok(self
-            .0
-            .query_row("SELECT height FROM unfunded WHERE id = ?1", [id], |r| {
-                r.get(0)
-            })?)
+        Ok(self.0.query_row(
+            "SELECT height FROM opening_unfunded WHERE id = ?1",
+            [id],
+            |r| r.get(0),
+        )?)
     }
 
     /// Whether opening `id`'s F was seen in no block, and not since in one.
     pub fn was_unfunded(&self, id: &[u8; 32]) -> Result<bool> {
-        if !self.has("unfunded")? {
-            return Ok(false);
-        }
         Ok(self
             .0
-            .query_row("SELECT 1 FROM unfunded WHERE id = ?1", [id], |r| {
+            .query_row("SELECT 1 FROM opening_unfunded WHERE id = ?1", [id], |r| {
                 r.get::<_, i64>(0)
             })
             .optional()?
@@ -513,20 +455,17 @@ impl Store {
 
     /// Opening `id`'s F is in a block: its count of blocks unfunded over.
     pub fn funded(&self, id: &[u8; 32]) -> Result<()> {
-        if self.has("unfunded")? {
-            self.0.execute("DELETE FROM unfunded WHERE id = ?1", [id])?;
-        }
+        self.0
+            .execute("DELETE FROM opening_unfunded WHERE id = ?1", [id])?;
         Ok(())
     }
 
     /// How many signed openings not given up have their F in no block, as
     /// the responder last saw.
     pub fn unfunded_count(&self) -> Result<usize> {
-        if !self.has("unfunded")? {
-            return Ok(0);
-        }
         Ok(self.0.query_row(
-            "SELECT count(*) FROM unfunded u JOIN openings o ON o.id = u.id WHERE o.abandoned = 0",
+            "SELECT count(*) FROM opening_unfunded u JOIN openings o ON o.id = u.id
+             WHERE o.abandoned = 0",
             [],
             |r| r.get::<_, i64>(0),
         )? as usize)
@@ -550,19 +489,6 @@ impl Store {
         coins.map(|coins| outpoints(&coins)).transpose()
     }
 
-    /// Whether table `name` was made.
-    fn has(&self, name: &str) -> Result<bool> {
-        Ok(self
-            .0
-            .query_row(
-                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
-                [name],
-                |r| r.get::<_, i64>(0),
-            )
-            .optional()?
-            .is_some())
-    }
-
     /// The signed openings not given up stored in another format, which
     /// this build neither reads nor plays.
     pub fn unreadable_signed(&self) -> Result<Vec<([u8; 32], i64)>> {
@@ -576,7 +502,7 @@ impl Store {
 
     /// A new opening, of the holder's deposit `deposit`: false if another
     /// opening not given up spends it. What the hub charges, if told, is
-    /// kept with it in the same write.
+    /// kept with it.
     pub fn insert(
         &self,
         id: &[u8; 32],
@@ -587,11 +513,11 @@ impl Store {
         state: &[u8],
     ) -> Result<bool> {
         let now = crate::now();
-        let t = rusqlite::Transaction::new_unchecked(&self.0, TransactionBehavior::Immediate)?;
-        let inserted = t.execute(
+        let fees = (self.1.as_ref().map(serde_json::to_string)).transpose()?;
+        let inserted = self.0.execute(
             "INSERT INTO openings (id, format, phase, mock, irrevocable, deposit, coins, last,
-                                   state, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, 0, ?5, x'', ?6, ?7, ?8, ?8)
+                                   state, fees, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, 0, ?5, x'', ?6, ?7, ?8, ?9, ?9)
              ON CONFLICT DO NOTHING",
             params![
                 id,
@@ -601,17 +527,10 @@ impl Store {
                 serialize(deposit),
                 last,
                 state,
+                fees,
                 now
             ],
         )?;
-        if let Some(fees) = self.1.as_ref().filter(|_| inserted == 1) {
-            t.execute_batch(FEES)?;
-            t.execute(
-                "INSERT INTO fees (id, fees, created_at) VALUES (?1, ?2, ?3)",
-                params![id, serde_json::to_string(fees)?, now],
-            )?;
-        }
-        t.commit()?;
         Ok(inserted == 1)
     }
 
@@ -729,7 +648,7 @@ mod tests {
     #[test]
     fn a_fee_coin_is_kept_once_and_an_ended_contract_is_played_no_more() -> Result<()> {
         let data = tempfile::tempdir()?;
-        let store = Store::open(data.path())?;
+        let store = Store::open(&crate::testing::hub_data(data.path()))?;
         let deposit = |n| OutPoint {
             txid: bitcoin::hashes::Hash::from_byte_array([n; 32]),
             vout: 0,
@@ -755,7 +674,7 @@ mod tests {
         store.end(&[1; 32], 100)?;
         store.end(&[1; 32], 101)?;
         drop(store);
-        let store = Store::open(data.path())?;
+        let store = Store::open(&crate::testing::hub_data(data.path()))?;
         ensure!(store.fee_coin(&[1; 32], "default")? == Some(coin(7)));
         ensure!(store.signed_ids()? == vec![[2; 32]]);
         Ok(())
@@ -765,7 +684,7 @@ mod tests {
     fn a_signed_opening_unfunded_counts_its_blocks_from_first_seen_and_is_given_up_once(
     ) -> Result<()> {
         let data = tempfile::tempdir()?;
-        let store = Store::open(data.path())?;
+        let store = Store::open(&crate::testing::hub_data(data.path()))?;
         let outpoint = |n| OutPoint {
             txid: bitcoin::hashes::Hash::from_byte_array([n; 32]),
             vout: 0,
@@ -804,7 +723,7 @@ mod tests {
     #[test]
     fn extra_fee_coins_add_up_and_a_links_child_is_the_last_made() -> Result<()> {
         let data = tempfile::tempdir()?;
-        let store = Store::open(data.path())?;
+        let store = Store::open(&crate::testing::hub_data(data.path()))?;
         let id = [1; 32];
         let coin = |n: u8| {
             (
@@ -836,7 +755,7 @@ mod tests {
         store.keep_child(&id, "assert", &tx(1))?;
         store.keep_child(&id, "assert", &tx(2))?;
         drop(store);
-        let store = Store::open(data.path())?;
+        let store = Store::open(&crate::testing::hub_data(data.path()))?;
         ensure!(store.child(&id, "assert")? == Some(tx(2)));
         ensure!(store.child(&id, "respond")?.is_none());
         ensure!(store.extra_coins(&id, "assert")? == vec![coin(1), coin(2)]);
@@ -845,13 +764,11 @@ mod tests {
     }
 
     /// Each one-time answer the hub began signing is kept, apart from the
-    /// other of its opening and across a restart. Openings kept by a build
-    /// before these were tell nothing, and the table is made with the
-    /// first kept.
+    /// other of its opening and across a restart.
     #[test]
-    fn answers_begun_are_kept_and_openings_from_before_tell_nothing() -> Result<()> {
+    fn answers_begun_are_kept_apart_per_opening_and_across_a_restart() -> Result<()> {
         let data = tempfile::tempdir()?;
-        let store = Store::open(data.path())?;
+        let store = Store::open(&crate::testing::hub_data(data.path()))?;
         let deposit = |n| OutPoint {
             txid: bitcoin::hashes::Hash::from_byte_array([n; 32]),
             vout: 0,
@@ -860,9 +777,7 @@ mod tests {
         for id in [id, other] {
             ensure!(store.insert(&id, 0, true, &deposit(id[0]), &[0; 32], b"state")?);
         }
-        // As a build before made its responder's tables: without this one.
         store.end(&other, 100)?;
-        store.0.execute_batch("DROP TABLE signing")?;
         ensure!(!store.began_signing(&id, "respond")?);
 
         store.begin_signing(&id, "respond")?;
@@ -872,7 +787,7 @@ mod tests {
         ensure!(!store.began_signing(&other, "respond")?);
         store.begin_signing(&id, "assert")?;
         drop(store);
-        let store = Store::open(data.path())?;
+        let store = Store::open(&crate::testing::hub_data(data.path()))?;
         ensure!(store.began_signing(&id, "respond")? && store.began_signing(&id, "assert")?);
         ensure!(!store.began_signing(&other, "assert")?);
         Ok(())
@@ -881,7 +796,7 @@ mod tests {
     #[test]
     fn openings_are_listed_oldest_first_without_sorting_their_states_on_disk() -> Result<()> {
         let data = tempfile::tempdir()?;
-        let store = Store::open(data.path())?;
+        let store = Store::open(&crate::testing::hub_data(data.path()))?;
         let deposit = |n| OutPoint {
             txid: bitcoin::hashes::Hash::from_byte_array([n; 32]),
             vout: 0,
@@ -916,7 +831,7 @@ mod tests {
     #[test]
     fn uploaded_instances_are_durable_private_and_isolated() -> Result<()> {
         let data = tempfile::tempdir()?;
-        let store = Store::open(data.path())?;
+        let store = Store::open(&crate::testing::hub_data(data.path()))?;
         store.keep(&[1; 32], 1, b"first")?;
         store.keep(&[1; 32], 2, b"second")?;
         store.keep(&[2; 32], 1, b"another opening")?;
@@ -924,7 +839,7 @@ mod tests {
         assert!(store.keep(&[1; 32], 1, b"different").is_err());
         assert!(store.keep(&[1; 32], 0, b"zero").is_err());
         drop(store);
-        let store = Store::open(data.path())?;
+        let store = Store::open(&crate::testing::hub_data(data.path()))?;
         assert_eq!(store.kept_instance(&[1; 32], 1)?, b"first");
         assert_eq!(store.kept_instance(&[1; 32], 2)?, b"second");
         assert_eq!(store.kept_instance(&[2; 32], 1)?, b"another opening");
@@ -950,7 +865,7 @@ mod tests {
     #[test]
     fn partial_artifacts_are_not_state_and_are_not_removed() -> Result<()> {
         let data = tempfile::tempdir()?;
-        let store = Store::open(data.path())?;
+        let store = Store::open(&crate::testing::hub_data(data.path()))?;
         store.keep(&[1; 32], 1, b"complete")?;
         let dir = data
             .path()
@@ -963,7 +878,7 @@ mod tests {
         assert_eq!(store.kept_instance(&[1; 32], 2)?, b"whole");
         assert_eq!(std::fs::read(partial)?, b"partial");
         let blocked = tempfile::tempdir()?;
-        let store = Store::open(blocked.path())?;
+        let store = Store::open(&crate::testing::hub_data(blocked.path()))?;
         std::fs::write(blocked.path().join("opening-instances"), b"not a directory")?;
         assert!(store.keep(&[1; 32], 1, b"cannot save").is_err());
         assert!(store.row(&[1; 32])?.is_none());
@@ -976,7 +891,7 @@ mod tests {
     fn signed_openings_of_another_format_are_kept_but_not_played() -> Result<()> {
         use bitcoin::hashes::Hash as _;
         let data = tempfile::tempdir()?;
-        let store = Store::open(data.path())?;
+        let store = Store::open(&crate::testing::hub_data(data.path()))?;
         for (n, id) in [[1; 32], [2; 32], [3; 32]].iter().enumerate() {
             let deposit = OutPoint {
                 txid: bitcoin::Txid::from_byte_array([n as u8 + 1; 32]),

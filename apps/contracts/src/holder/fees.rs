@@ -80,7 +80,7 @@ pub fn abusive(fees: &Fees, range: Option<&ContractRange>) -> Option<String> {
 }
 
 /// Tell `wallet` the most each hub it trusts may charge
-/// ([`Wallet::set_fee_ceilings`]), by the contracts in `dir`: of those at
+/// ([`Wallet::set_fee_ceilings`]), by the contracts in `wallet_file`: of those at
 /// a hub that protect notes at `tip` (all whose F is buried, if the tip is
 /// not known), the least of each fee they opened under or she approved
 /// since. No ceilings at a hub with no such contract, or whose contracts
@@ -88,10 +88,10 @@ pub fn abusive(fees: &Fees, range: Option<&ContractRange>) -> Option<String> {
 /// kept claimable as [`super::exit::guard_locks`] says. To call as
 /// the wallet opens, and whenever its contracts changed ([`super::resume`]
 /// and [`approve`] do).
-pub fn agree<T: Transport>(wallet: &Wallet<T>, dir: &Path, tip: Option<u32>) -> Result<()> {
+pub fn agree<T: Transport>(wallet: &Wallet<T>, wallet_file: &Path, tip: Option<u32>) -> Result<()> {
     // Its locks too: what keeps them claimable reads the contracts afresh.
-    super::exit::guard_locks(wallet, dir);
-    let (contracts, ceilings) = match Store::existing(dir)? {
+    super::exit::guard_locks(wallet, wallet_file);
+    let (contracts, ceilings) = match Store::existing(wallet_file)? {
         Some(store) => (store.list()?, store.ceilings()?),
         None => return Ok(()),
     };
@@ -104,19 +104,19 @@ pub fn agree<T: Transport>(wallet: &Wallet<T>, dir: &Path, tip: Option<u32>) -> 
 
 /// Agree to `fees` at `hub`, a hub `wallet` trusts: what it charges now,
 /// as she was shown. The ceilings of each of her contracts there in
-/// `dir`, but those given up or whose F never confirms, are raised to
+/// `wallet_file`, but those given up or whose F never confirms, are raised to
 /// them, fee by fee, none lowered: those still opening too, not to refuse
 /// the same fees again once they protect. Then as [`agree`].
 pub fn approve<T: Transport>(
     wallet: &Wallet<T>,
-    dir: &Path,
+    wallet_file: &Path,
     hub: &str,
     fees: &Fees,
     tip: Option<u32>,
 ) -> Result<()> {
     let urls = wallet.hub_urls(hub)?;
     ensure!(!urls.is_empty(), "{hub} is no hub this wallet trusts");
-    let Some(store) = Store::existing(dir)? else {
+    let Some(store) = Store::existing(wallet_file)? else {
         return Ok(());
     };
     let ids: Vec<[u8; 32]> = store
@@ -128,7 +128,7 @@ pub fn approve<T: Transport>(
     let raised = store.raise_ceilings(&ids, fees)?;
     tracing::info!(%hub, contracts = ids.len(), raised, "fees approved");
     drop(store);
-    agree(wallet, dir, tip)
+    agree(wallet, wallet_file, tip)
 }
 
 /// The least of each fee in the `ceilings` of the `contracts` at the hub
@@ -340,13 +340,20 @@ mod tests {
         let agreed = |hub: &str| wallet.fee_ceilings(hub).unwrap();
 
         // No contract ever opened: nothing agreed, nothing made.
-        agree(&wallet, dir.path(), None).unwrap();
-        approve(&wallet, dir.path(), a, &fees(9, 9, 9), None).unwrap();
+        agree(&wallet, &dir.path().join("wallet.sqlite"), None).unwrap();
+        approve(
+            &wallet,
+            &dir.path().join("wallet.sqlite"),
+            a,
+            &fees(9, 9, 9),
+            None,
+        )
+        .unwrap();
         assert_eq!((agreed(a), agreed(b)), (None, None));
-        assert!(!dir.path().join("contracts.sqlite").exists());
+        assert!(Store::existing(&path).unwrap().is_none());
         assert!(approve(
             &wallet,
-            dir.path(),
+            &dir.path().join("wallet.sqlite"),
             "http://c.example",
             &fees(9, 9, 9),
             None
@@ -369,10 +376,12 @@ mod tests {
             since: 200,
             state: b"state",
         };
-        let store = Store::open(dir.path()).unwrap();
-        // One opened before any were kept, one buried, one still opening
-        // and one given up, at the first hub; one never to be, at the other.
-        store.insert(&new(1, a)).unwrap();
+        let store = Store::open(&crate::testing::wallet_file(dir.path())).unwrap();
+        // Two buried, one still opening and one given up, at the first hub;
+        // one never to be, at the other.
+        store
+            .insert_under(&new(1, a), &fees(1, 100, 100), 0)
+            .unwrap();
         store.set_fate(&[1; 32], Fate::Live).unwrap();
         store
             .insert_under(&new(2, a), &fees(1, 100, 100), 0)
@@ -391,12 +400,12 @@ mod tests {
         store.set_fate(&[5; 32], Fate::Dead).unwrap();
         drop(store);
 
-        agree(&wallet, dir.path(), Some(250)).unwrap();
+        agree(&wallet, &dir.path().join("wallet.sqlite"), Some(250)).unwrap();
         assert_eq!((agreed(a), agreed(b)), (Some(fees(1, 100, 100)), None));
         // Past the time of the one that protected: nothing agreed.
-        agree(&wallet, dir.path(), Some(360)).unwrap();
+        agree(&wallet, &dir.path().join("wallet.sqlite"), Some(360)).unwrap();
         assert_eq!(agreed(a), None);
-        agree(&wallet, dir.path(), None).unwrap();
+        agree(&wallet, &dir.path().join("wallet.sqlite"), None).unwrap();
         assert_eq!(agreed(a), Some(fees(1, 100, 100)));
 
         // It charges more, in one fee and less in another: hers to approve,
@@ -404,26 +413,44 @@ mod tests {
         hubs.charge(a, 1, fees(0, 150, 100));
         let charged = wallet.add_hub(a).await.unwrap().fees;
         assert!(charged.above(&agreed(a).unwrap()));
-        approve(&wallet, dir.path(), a, &charged, Some(250)).unwrap();
+        approve(
+            &wallet,
+            &dir.path().join("wallet.sqlite"),
+            a,
+            &charged,
+            Some(250),
+        )
+        .unwrap();
         assert_eq!(agreed(a), Some(fees(1, 150, 100)));
         assert!(!charged.above(&agreed(a).unwrap()));
         // Of each of her contracts there that may yet protect, and no
         // other: kept, as a wallet opened again finds them.
-        let kept = Store::open(dir.path()).unwrap().ceilings().unwrap();
-        assert_eq!(kept.len(), 4);
+        let kept = Store::open(&crate::testing::wallet_file(dir.path()))
+            .unwrap()
+            .ceilings()
+            .unwrap();
+        assert_eq!(kept.len(), 5);
+        assert_eq!(kept[&[1; 32]], fees(1, 150, 100));
         assert_eq!(kept[&[2; 32]], fees(1, 150, 100));
         assert_eq!(kept[&[3; 32]], fees(1, 150, 100));
         assert_eq!(kept[&[4; 32]], fees(1, 100, 100));
         assert_eq!(kept[&[5; 32]], fees(1, 100, 100));
         wallet.set_fee_ceilings(a, None).unwrap();
-        agree(&wallet, dir.path(), Some(250)).unwrap();
+        agree(&wallet, &dir.path().join("wallet.sqlite"), Some(250)).unwrap();
         assert_eq!(agreed(a), Some(fees(1, 150, 100)));
 
         // The hub changes fees after they were shown: approving the
         // snapshot never approves a higher schedule learned meanwhile.
         hubs.charge(a, 1, fees(0, 300, 100));
         let later = wallet.add_hub(a).await.unwrap().fees;
-        approve(&wallet, dir.path(), a, &charged, Some(250)).unwrap();
+        approve(
+            &wallet,
+            &dir.path().join("wallet.sqlite"),
+            a,
+            &charged,
+            Some(250),
+        )
+        .unwrap();
         assert_eq!(agreed(a), Some(fees(1, 150, 100)));
         assert!(later.above(&agreed(a).unwrap()));
     }

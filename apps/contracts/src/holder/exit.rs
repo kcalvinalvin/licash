@@ -53,8 +53,8 @@ pub struct Consent {
 
 /// Her consent, if given and not revoked: none where no contract was
 /// ever opened.
-pub fn consent(dir: &Path) -> Result<Option<Consent>> {
-    let Some(store) = Store::existing(dir)? else {
+pub fn consent(wallet_file: &Path) -> Result<Option<Consent>> {
+    let Some(store) = Store::existing(wallet_file)? else {
         return Ok(None);
     };
     Ok(store
@@ -71,11 +71,11 @@ pub fn consent(dir: &Path) -> Result<Option<Consent>> {
 /// before. Refused where no contract was ever opened.
 pub fn consent_to<T: Transport>(
     wallet: &Wallet<T>,
-    dir: &Path,
+    wallet_file: &Path,
     address: &str,
     exit_margin: u32,
 ) -> Result<Consent> {
-    let store = Store::existing(dir)?.context("no contracts to exit")?;
+    let store = Store::existing(wallet_file)?.context("no contracts to exit")?;
     let network = licash_onchain::network(wallet.network());
     let address = bitcoin::Address::from_str(address.trim())
         .map_err(|e| anyhow!("not an address on Bitcoin: {e}"))?
@@ -84,33 +84,33 @@ pub fn consent_to<T: Transport>(
         .to_string();
     ensure!(exit_margin > 0, "an exit margin of no blocks");
     store.consent_to_exit(&address, exit_margin)?;
-    consent(dir)?.context("consent not kept")
+    consent(wallet_file)?.context("consent not kept")
 }
 
 /// Keep the locks `wallet` makes at a hub claimable on Bitcoin by her
-/// contracts there in `dir` ([`Wallet::guard_locks`]).
-pub fn guard_locks<T: Transport>(wallet: &Wallet<T>, dir: &Path) {
+/// contracts there in `wallet_file` ([`Wallet::guard_locks`]).
+pub fn guard_locks<T: Transport>(wallet: &Wallet<T>, wallet_file: &Path) {
     let (seed, network) = (wallet.contract_secrets().seed, wallet.network());
-    let dir = dir.to_path_buf();
+    let wallet_file = wallet_file.to_path_buf();
     wallet.guard_locks(Arc::new(move |urls: &[String], tip: u32| {
-        lock_horizon(&seed, network, &dir, urls, tip).map_err(|e| format!("{e:#}"))
+        lock_horizon(&seed, network, &wallet_file, urls, tip).map_err(|e| format!("{e:#}"))
     }));
 }
 
 /// The block by which a lock at the hub of `urls` must have expired at
 /// depth, at `tip`, for the forced close of one of her contracts there in
-/// `dir` to claim its refund: the latest of those her exit plans ([`drive`],
+/// `wallet_file` to claim its refund: the latest of those her exit plans ([`drive`],
 /// a close takes only the refunds owed as it starts). Planned with her
 /// consent's margin, or none without it: she forces it herself then, as
 /// late as she may. None if no contract protects notes there.
 fn lock_horizon(
     seed: &[u8; 32],
     network: ChainProfile,
-    dir: &Path,
+    wallet_file: &Path,
     urls: &[String],
     tip: u32,
 ) -> Result<Option<u32>> {
-    let Some(store) = Store::existing(dir)? else {
+    let Some(store) = Store::existing(wallet_file)? else {
         return Ok(None);
     };
     let recovering: HashSet<[u8; 32]> = store.recoveries()?.iter().map(|r| r.id).collect();
@@ -118,28 +118,34 @@ fn lock_horizon(
     for c in
         (store.list()?.iter()).filter(|c| c.at(urls) && c.live(tip) && !recovering.contains(&c.id))
     {
-        horizon = horizon.max(Some(planned_force_at(seed, network, dir, &c.id, tip)?));
+        horizon = horizon.max(Some(planned_force_at(
+            seed,
+            network,
+            wallet_file,
+            &c.id,
+            tip,
+        )?));
     }
     Ok(horizon)
 }
 
-/// The block from which her exit forces contract `id` in `dir` closed, as
+/// The block from which her exit forces contract `id` in `wallet_file` closed, as
 /// planned at `tip` with her consent's margin, or none without it.
 pub(super) fn planned_force_at(
     seed: &[u8; 32],
     network: ChainProfile,
-    dir: &Path,
+    wallet_file: &Path,
     id: &[u8; 32],
     tip: u32,
 ) -> Result<u32> {
-    let margin = consent(dir)?.map_or(0, |c| c.exit_margin);
-    let s = safety::of_seed(seed, network, dir, id, tip, (margin, TIMEOUT_SLACK))?;
+    let margin = consent(wallet_file)?.map_or(0, |c| c.exit_margin);
+    let s = safety::of_seed(seed, network, wallet_file, id, tip, (margin, TIMEOUT_SLACK))?;
     Ok(deadlines(s.request_by.unwrap_or(0), blocks_a_day(network)).1)
 }
 
 /// Revoke her consent: no step more is taken. Those under way go on.
-pub fn revoke(dir: &Path) -> Result<()> {
-    match Store::existing(dir)? {
+pub fn revoke(wallet_file: &Path) -> Result<()> {
+    match Store::existing(wallet_file)? {
         Some(store) => store.revoke_exit_consent(),
         None => Ok(()),
     }
@@ -266,18 +272,18 @@ fn deadlines(request_by: u32, day: u32) -> (u32, u32) {
 pub async fn drive<T: Transport, C: Chain>(
     wallet: &Wallet<T>,
     chain: &C,
-    dir: &Path,
+    wallet_file: &Path,
     cash_out: &impl CashOut,
     exit_margin: u32,
     rate: FeeRate,
 ) -> Result<Vec<Exit>> {
-    let Some(store) = Store::existing(dir)? else {
+    let Some(store) = Store::existing(wallet_file)? else {
         return Ok(vec![]);
     };
     let tip = chain.height().await.map_err(|e| anyhow!(e))?;
     // Nothing reads as covered at no height.
     ensure!(tip > 0, "no chain height");
-    let consent = consent(dir)?;
+    let consent = consent(wallet_file)?;
     let margin = consent.as_ref().map_or(exit_margin, |c| c.exit_margin);
     let day = blocks_a_day(wallet.network());
     let recovering: HashSet<[u8; 32]> = store.recoveries()?.iter().map(|r| r.id).collect();
@@ -286,7 +292,7 @@ pub async fn drive<T: Transport, C: Chain>(
         .collect();
     let mut due = HashMap::new();
     for c in &live {
-        let s = safety::of(wallet, dir, &c.id, tip, margin, TIMEOUT_SLACK)?;
+        let s = safety::of(wallet, wallet_file, &c.id, tip, margin, TIMEOUT_SLACK)?;
         due.insert(c.id, deadlines(s.request_by.unwrap_or(0), day));
     }
     let balance = wallet.balance()?;
@@ -295,7 +301,7 @@ pub async fn drive<T: Transport, C: Chain>(
         .iter()
         .map(|p| (p.hash.as_str(), &p.state))
         .collect();
-    let stake = super::activation::at_stake(wallet, &store, dir, tip)?;
+    let stake = super::activation::at_stake(wallet, &store, wallet_file, tip)?;
     let mut acted: HashSet<String> = HashSet::new();
     let mut exits = Vec::new();
     for c in &live {
@@ -311,7 +317,9 @@ pub async fn drive<T: Transport, C: Chain>(
             .filter(|o| o.id != c.id && o.at(&urls) && due[&o.id].1 > tip)
             .cloned()
             .collect();
-        let covered: u64 = super::coverage(wallet, dir, &others, tip)?.values().sum();
+        let covered: u64 = super::coverage(wallet, wallet_file, &others, tip)?
+            .values()
+            .sum();
         let paying = (payouts.iter()).any(|p| {
             urls.contains(&p.from) && matches!(p.state, PayoutState::Open | PayoutState::Claimed)
         });
@@ -354,8 +362,10 @@ pub async fn drive<T: Transport, C: Chain>(
                 Step::CashingOut => {
                     pay_out(wallet, &store, cash_out, consent, c, &urls, force_at, tip).await
                 }
-                Step::Folding => super::close(wallet, chain, dir, &c.id).await.map(|_| ()),
-                _ => recovery::force_close(wallet, chain, dir, &c.id, rate)
+                Step::Folding => super::close(wallet, chain, wallet_file, &c.id)
+                    .await
+                    .map(|_| ()),
+                _ => recovery::force_close(wallet, chain, wallet_file, &c.id, rate)
                     .await
                     .map(|_| ()),
             };

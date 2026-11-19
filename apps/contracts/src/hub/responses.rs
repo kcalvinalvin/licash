@@ -9,37 +9,33 @@ use std::path::Path;
 use anyhow::{ensure, Context, Result};
 use bitcoin::consensus::{deserialize, serialize};
 use bitcoin::Transaction;
-use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use licash_store::Kind;
+use rusqlite::{params, Connection, OptionalExtension};
+
+/// The component the pins are, and its version.
+const COMPONENT: &str = "responses";
+const VERSION: i64 = 1;
+
+/// Per opening, or per assertion's tag: the request committed before
+/// signing, the evidence its decision was made on, and once signed its
+/// response. A pin is never rewritten: what is pinned first is what the
+/// hub answers on.
+const SCHEMA: &str = "
+CREATE TABLE response_pins (
+    id BLOB PRIMARY KEY,
+    request BLOB NOT NULL,
+    response BLOB,
+    evidence BLOB
+) STRICT;
+";
 
 pub(super) struct Responses(Connection);
 
 impl Responses {
+    /// The pins in the hub's data directory `data`, made if none were.
     pub fn open(data: &Path) -> Result<Self> {
-        let mut c = crate::private_db(&data.join("responses.sqlite"))?;
-        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let version: i64 = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        match version {
-            0 => {
-                tx.execute_batch(
-                    "CREATE TABLE responses (
-                        id BLOB PRIMARY KEY,
-                        request BLOB NOT NULL,
-                        response BLOB,
-                        evidence BLOB
-                    ) STRICT;",
-                )?;
-                tx.pragma_update(None, "user_version", 2)?;
-            }
-            // Version 1 pinned no evidence: its responses were all decided
-            // on none.
-            1 => {
-                tx.execute_batch("ALTER TABLE responses ADD COLUMN evidence BLOB;")?;
-                tx.pragma_update(None, "user_version", 2)?;
-            }
-            2 => {}
-            v => anyhow::bail!("responses.sqlite is of version {v}, unknown"),
-        }
-        tx.commit()?;
+        let mut c = licash_store::open(&crate::hub_db(data), Kind::Hub)?;
+        licash_store::component(&mut c, COMPONENT, VERSION, SCHEMA)?;
         Ok(Self(c))
     }
 
@@ -48,12 +44,12 @@ impl Responses {
     /// be validated before this call.
     pub fn pin(&self, id: &[u8; 32], request: &Transaction, evidence: &[u8]) -> Result<Vec<u8>> {
         self.0.execute(
-            "INSERT INTO responses (id, request, evidence) VALUES (?1, ?2, ?3)
+            "INSERT INTO response_pins (id, request, evidence) VALUES (?1, ?2, ?3)
              ON CONFLICT DO NOTHING",
             params![id, serialize(request), evidence],
         )?;
         let (pinned, evidence): (Vec<u8>, Option<Vec<u8>>) = self.0.query_row(
-            "SELECT request, evidence FROM responses WHERE id = ?1",
+            "SELECT request, evidence FROM response_pins WHERE id = ?1",
             [id],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
@@ -70,9 +66,11 @@ impl Responses {
     pub fn evidence(&self, id: &[u8; 32]) -> Result<Option<Vec<u8>>> {
         let row: Option<Option<Vec<u8>>> = self
             .0
-            .query_row("SELECT evidence FROM responses WHERE id = ?1", [id], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT evidence FROM response_pins WHERE id = ?1",
+                [id],
+                |r| r.get(0),
+            )
             .optional()?;
         Ok(row.map(Option::unwrap_or_default))
     }
@@ -81,9 +79,11 @@ impl Responses {
     pub fn response(&self, id: &[u8; 32]) -> Result<Option<Transaction>> {
         let row: Option<Option<Vec<u8>>> = self
             .0
-            .query_row("SELECT response FROM responses WHERE id = ?1", [id], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT response FROM response_pins WHERE id = ?1",
+                [id],
+                |r| r.get(0),
+            )
             .optional()?;
         row.flatten()
             .map(|b| deserialize(&b).context("pinned response"))
@@ -101,16 +101,16 @@ impl Responses {
         proof: &[u8],
     ) -> Result<Option<Vec<u8>>> {
         self.0.execute(
-            "INSERT INTO responses (id, request) VALUES (?1, ?2) ON CONFLICT DO NOTHING",
+            "INSERT INTO response_pins (id, request) VALUES (?1, ?2) ON CONFLICT DO NOTHING",
             params![id, serialize(request)],
         )?;
         self.0.execute(
-            "UPDATE responses SET evidence = ?2
+            "UPDATE response_pins SET evidence = ?2
              WHERE id = ?1 AND evidence IS NULL AND response IS NULL",
             params![id, proof],
         )?;
         let (pinned, proof): (Vec<u8>, Option<Vec<u8>>) = self.0.query_row(
-            "SELECT request, evidence FROM responses WHERE id = ?1",
+            "SELECT request, evidence FROM response_pins WHERE id = ?1",
             [id],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
@@ -132,11 +132,11 @@ impl Responses {
         sign: impl FnOnce() -> Result<Transaction>,
     ) -> Result<Transaction> {
         self.0.execute(
-            "INSERT INTO responses (id, request) VALUES (?1, ?2) ON CONFLICT DO NOTHING",
+            "INSERT INTO response_pins (id, request) VALUES (?1, ?2) ON CONFLICT DO NOTHING",
             params![id, serialize(request)],
         )?;
         let (pinned, response): (Vec<u8>, Option<Vec<u8>>) = self.0.query_row(
-            "SELECT request, response FROM responses WHERE id = ?1",
+            "SELECT request, response FROM response_pins WHERE id = ?1",
             [id],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
@@ -150,14 +150,14 @@ impl Responses {
         }
         let response = sign()?;
         self.0.execute(
-            "UPDATE responses SET response = ?2 WHERE id = ?1 AND response IS NULL",
+            "UPDATE response_pins SET response = ?2 WHERE id = ?1 AND response IS NULL",
             params![id, serialize(&response)],
         )?;
-        let kept: Vec<u8> =
-            self.0
-                .query_row("SELECT response FROM responses WHERE id = ?1", [id], |r| {
-                    r.get(0)
-                })?;
+        let kept: Vec<u8> = self.0.query_row(
+            "SELECT response FROM response_pins WHERE id = ?1",
+            [id],
+            |r| r.get(0),
+        )?;
         ensure!(
             kept == serialize(&response),
             "a different response was pinned"
@@ -169,7 +169,11 @@ impl Responses {
     fn contains(&self, id: &[u8; 32]) -> Result<bool> {
         Ok(self
             .0
-            .query_row("SELECT 1 FROM responses WHERE id = ?1", [id], |_| Ok(()))
+            .query_row(
+                "SELECT 1 FROM response_pins WHERE id = ?1",
+                [id],
+                |_| Ok(()),
+            )
             .optional()?
             .is_some())
     }
@@ -195,13 +199,13 @@ mod tests {
     #[test]
     fn a_restart_returns_the_pinned_answer_without_signing() -> Result<()> {
         let dir = tempfile::tempdir()?;
-        let pins = Responses::open(dir.path())?;
+        let pins = Responses::open(&crate::testing::hub_data(dir.path()))?;
         let r = request(1);
         let answer = request(2);
         assert!(!pins.contains(&[1; 32])?);
         assert_eq!(pins.answer(&[1; 32], &r, || Ok(answer.clone()))?, answer);
         drop(pins);
-        let pins = Responses::open(dir.path())?;
+        let pins = Responses::open(&crate::testing::hub_data(dir.path()))?;
         assert_eq!(
             pins.answer(&[1; 32], &r, || panic!("signed twice"))?,
             answer
@@ -212,7 +216,7 @@ mod tests {
     #[test]
     fn the_pin_survives_a_failed_signer_and_rejects_another_witness() -> Result<()> {
         let dir = tempfile::tempdir()?;
-        let pins = Responses::open(dir.path())?;
+        let pins = Responses::open(&crate::testing::hub_data(dir.path()))?;
         let r = request(1);
         let other = request(2);
         assert_eq!(r.compute_txid(), other.compute_txid());
@@ -220,7 +224,7 @@ mod tests {
             .answer(&[1; 32], &r, || anyhow::bail!("stopped"))
             .is_err());
         drop(pins);
-        let pins = Responses::open(dir.path())?;
+        let pins = Responses::open(&crate::testing::hub_data(dir.path()))?;
         let err = pins
             .answer(&[1; 32], &other, || panic!("signed another claim"))
             .unwrap_err();
@@ -232,8 +236,8 @@ mod tests {
     #[test]
     fn another_connection_obeys_the_same_pin_and_another_opening_is_independent() -> Result<()> {
         let dir = tempfile::tempdir()?;
-        let a = Responses::open(dir.path())?;
-        let b = Responses::open(dir.path())?;
+        let a = Responses::open(&crate::testing::hub_data(dir.path()))?;
+        let b = Responses::open(&crate::testing::hub_data(dir.path()))?;
         a.answer(&[1; 32], &request(1), || Ok(request(3)))?;
         assert!(b
             .answer(&[1; 32], &request(2), || panic!("signed twice"))
@@ -248,10 +252,15 @@ mod tests {
     #[test]
     fn a_newer_pin_format_is_refused() -> Result<()> {
         let dir = tempfile::tempdir()?;
-        let pins = Responses::open(dir.path())?;
-        pins.0.pragma_update(None, "user_version", 3)?;
-        drop(pins);
-        assert!(Responses::open(dir.path())
+        let data = crate::testing::hub_data(dir.path());
+        drop(Responses::open(&data)?);
+        let c = Connection::open(crate::hub_db(&data))?;
+        c.execute(
+            "UPDATE schema_versions SET version = 3 WHERE component = 'responses'",
+            [],
+        )?;
+        drop(c);
+        assert!(Responses::open(&data)
             .err()
             .unwrap()
             .to_string()
@@ -259,40 +268,16 @@ mod tests {
         Ok(())
     }
 
-    /// Evidence is pinned once, with the request; a response of version 1
-    /// reads back as decided on none, its answer kept.
+    /// Evidence is pinned once, with the request.
     #[test]
-    fn evidence_is_pinned_once_and_a_version_1_response_had_none() -> Result<()> {
+    fn evidence_is_pinned_once() -> Result<()> {
         let dir = tempfile::tempdir()?;
-        let pins = Responses::open(dir.path())?;
+        let pins = Responses::open(&crate::testing::hub_data(dir.path()))?;
         assert_eq!(pins.evidence(&[1; 32])?, None);
         assert_eq!(pins.pin(&[1; 32], &request(1), b"first")?, b"first");
         assert_eq!(pins.pin(&[1; 32], &request(1), b"later")?, b"first");
         assert!(pins.pin(&[1; 32], &request(9), b"first").is_err());
         assert_eq!(pins.evidence(&[1; 32])?, Some(b"first".to_vec()));
-        drop(pins);
-
-        let old = tempfile::tempdir()?;
-        let c = Connection::open(old.path().join("responses.sqlite"))?;
-        c.execute_batch(
-            "CREATE TABLE responses (
-                id BLOB PRIMARY KEY,
-                request BLOB NOT NULL,
-                response BLOB
-            ) STRICT;
-            PRAGMA user_version = 1;",
-        )?;
-        c.execute(
-            "INSERT INTO responses (id, request, response) VALUES (?1, ?2, ?3)",
-            params![[2u8; 32], serialize(&request(1)), serialize(&request(2))],
-        )?;
-        drop(c);
-        let pins = Responses::open(old.path())?;
-        assert_eq!(pins.evidence(&[2; 32])?, Some(vec![]));
-        assert_eq!(
-            pins.answer(&[2; 32], &request(1), || panic!("signed again"))?,
-            request(2)
-        );
         Ok(())
     }
 
@@ -302,7 +287,7 @@ mod tests {
     #[test]
     fn a_proof_is_pinned_once_and_not_after_its_answer() -> Result<()> {
         let dir = tempfile::tempdir()?;
-        let pins = Responses::open(dir.path())?;
+        let pins = Responses::open(&crate::testing::hub_data(dir.path()))?;
         assert_eq!(pins.response(&[1; 32])?, None);
         assert_eq!(
             pins.pin_proof(&[1; 32], &request(1), b"first")?,

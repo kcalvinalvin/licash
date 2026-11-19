@@ -17,6 +17,26 @@ use licash_contract::{
 };
 use licash_wallet::{Response, Transport, Wallet};
 
+/// A hub's data directory `dir`: its database made, holding no component
+/// yet, for the hub's tables to be made in: made once.
+pub(crate) fn hub_data(dir: &std::path::Path) -> std::path::PathBuf {
+    let file = crate::hub_db(dir);
+    if !file.exists() {
+        drop(licash_store::create(&file, licash_store::Kind::Hub).unwrap());
+    }
+    dir.to_path_buf()
+}
+
+/// A file of a wallet's kind in `dir`, holding no wallet and no contracts
+/// yet, for the holder's tables to be made in: made once.
+pub(crate) fn wallet_file(dir: &std::path::Path) -> std::path::PathBuf {
+    let file = dir.join("wallet.sqlite");
+    if !file.exists() {
+        drop(licash_store::create(&file, licash_store::Kind::Wallet).unwrap());
+    }
+    file
+}
+
 struct Offline;
 impl Transport for Offline {
     async fn request(&self, _: &str, _: Option<Vec<u8>>) -> Result<Response, String> {

@@ -37,7 +37,7 @@ use super::store::Store;
 use super::{activation, Chain, Fate};
 use crate::{FoldAsk, FoldOffer, FOLD, FOLD_CLAIM, FOLD_SIGN};
 
-/// Close contract `id` early with its hub, in `dir`, its fold paying her
+/// Close contract `id` early with its hub, in `wallet_file`, its fold paying her
 /// notes there (up to its cap) as well as her reserve: its fold's txid,
 /// broadcast by the hub and by her. Asked again of one closed already,
 /// another fold paying her the same. Refused once forced closed, before F
@@ -55,11 +55,11 @@ use crate::{FoldAsk, FoldOffer, FOLD, FOLD_CLAIM, FOLD_SIGN};
 pub async fn close<T: Transport, C: Chain>(
     wallet: &Wallet<T>,
     chain: &C,
-    dir: &std::path::Path,
+    wallet_file: &std::path::Path,
     id: &[u8; 32],
 ) -> Result<Txid> {
     for _ in 0..RETRIES {
-        let e = match close_once(wallet, chain, dir, id).await {
+        let e = match close_once(wallet, chain, wallet_file, id).await {
             Ok(txid) => return Ok(txid),
             Err(e) => e,
         };
@@ -120,10 +120,10 @@ fn notes_refused(error: anyhow::Error, claim: &recovery::FoldClaim) -> anyhow::E
 async fn close_once<T: Transport, C: Chain>(
     wallet: &Wallet<T>,
     chain: &C,
-    dir: &std::path::Path,
+    wallet_file: &std::path::Path,
     id: &[u8; 32],
 ) -> Result<Txid> {
-    let store = Store::existing(dir)?.context("no contracts")?;
+    let store = Store::existing(wallet_file)?.context("no contracts")?;
     let contract = store
         .list()?
         .into_iter()
@@ -147,7 +147,7 @@ async fn close_once<T: Transport, C: Chain>(
         "past its close: the hub's default pays her reserve"
     );
     if !resuming {
-        let stake = activation::at_stake(wallet, &store, dir, tip)?;
+        let stake = activation::at_stake(wallet, &store, wallet_file, tip)?;
         ensure!(
             stake.get(id).copied().unwrap_or(0) == 0,
             "locks owed to her depend on this contract, which only a forced close claims: force it closed"
@@ -186,11 +186,11 @@ async fn close_once<T: Transport, C: Chain>(
     // Time to file her claim should the hub take it and not fold.
     let near_end = !resuming
         && tip.saturating_add(1)
-            >= recovery::fold_by(&secrets.seed, wallet.network(), dir, id, tip)?;
+            >= recovery::fold_by(&secrets.seed, wallet.network(), wallet_file, id, tip)?;
 
     // Her claim: her notes there, taken now or by a close before. None if
     // she holds none: the fold then pays her reserve back, and no more.
-    let claim = recovery::fold_claim(wallet, chain, dir, id).await?;
+    let claim = recovery::fold_claim(wallet, chain, wallet_file, id).await?;
     if claim.as_ref().is_some_and(|c| c.fresh) {
         // Her notes back before she is told why not: nothing is spent.
         let why = if near_end {
@@ -203,7 +203,7 @@ async fn close_once<T: Transport, C: Chain>(
             None
         };
         if let Some(why) = why {
-            recovery::give_up(wallet, dir, id)?;
+            recovery::give_up(wallet, wallet_file, id)?;
             anyhow::bail!(why);
         }
     }
@@ -257,7 +257,7 @@ async fn close_once<T: Transport, C: Chain>(
         Err(e) => {
             // Not signed: nothing of hers is spent, and her notes come back.
             if claim.as_ref().is_some_and(|c| c.fresh) {
-                let _ = recovery::give_up(wallet, dir, id);
+                let _ = recovery::give_up(wallet, wallet_file, id);
             }
             return Err(e);
         }

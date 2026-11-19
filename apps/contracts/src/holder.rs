@@ -92,7 +92,7 @@ pub struct Ask {
 /// Open a contract at `hub`, a hub `wallet` trusts, on its offer now:
 /// its keyset one the hub shows the wallet, its terms as `ask`ed, its
 /// price within it, her deposit the coin she names or else the smallest
-/// free that pays it ([`coin`]). Kept in `dir`, the wallet's directory,
+/// free that pays it ([`coin`]). Kept in `wallet_file`, the wallet's directory,
 /// from her first message on, with the fees the hub charges now: the most
 /// it may charge her since ([`fees`]). Refused at a hub charging more
 /// than is sane ([`fees::abusive`]).
@@ -100,11 +100,11 @@ pub struct Ask {
 pub async fn open<T: Transport, C: Chain>(
     wallet: &Wallet<T>,
     chain: &C,
-    dir: &Path,
+    wallet_file: &Path,
     hub: &str,
     ask: Ask,
 ) -> Result<Contract> {
-    open_at(wallet, chain, dir, hub, ask, true, 0).await
+    open_at(wallet, chain, wallet_file, hub, ask, true, 0).await
 }
 
 /// How many times [`open_with`] resumes an opening that failed short of
@@ -117,11 +117,11 @@ const RESUMES: u32 = 2;
 pub async fn open_with<T: Transport, C: Chain>(
     wallet: &Wallet<T>,
     chain: &C,
-    dir: &Path,
+    wallet_file: &Path,
     hub: &str,
     ask: Ask,
 ) -> Result<Contract> {
-    open_at(wallet, chain, dir, hub, ask, true, RESUMES).await
+    open_at(wallet, chain, wallet_file, hub, ask, true, RESUMES).await
 }
 
 /// [`open_with`], at a hub charging more than is sane too
@@ -129,11 +129,11 @@ pub async fn open_with<T: Transport, C: Chain>(
 pub async fn open_anyway<T: Transport, C: Chain>(
     wallet: &Wallet<T>,
     chain: &C,
-    dir: &Path,
+    wallet_file: &Path,
     hub: &str,
     ask: Ask,
 ) -> Result<Contract> {
-    open_at(wallet, chain, dir, hub, ask, false, RESUMES).await
+    open_at(wallet, chain, wallet_file, hub, ask, false, RESUMES).await
 }
 
 /// One opening as [`open_once`], or, refused as the hub quotes otherwise
@@ -142,17 +142,17 @@ pub async fn open_anyway<T: Transport, C: Chain>(
 async fn open_at<T: Transport, C: Chain>(
     wallet: &Wallet<T>,
     chain: &C,
-    dir: &Path,
+    wallet_file: &Path,
     hub: &str,
     ask: Ask,
     sane: bool,
     resumes: u32,
 ) -> Result<Contract> {
-    let opened = open_once(wallet, chain, dir, hub, ask, sane, resumes).await;
+    let opened = open_once(wallet, chain, wallet_file, hub, ask, sane, resumes).await;
     match opened {
         Err(e) if e.downcast_ref::<driver::Requote>().is_some() => {
             tracing::info!(%hub, "its quote refused as the hub's no longer: asked again: {e:#}");
-            open_once(wallet, chain, dir, hub, ask, sane, resumes).await
+            open_once(wallet, chain, wallet_file, hub, ask, sane, resumes).await
         }
         opened => opened,
     }
@@ -161,7 +161,7 @@ async fn open_at<T: Transport, C: Chain>(
 async fn open_once<T: Transport, C: Chain>(
     wallet: &Wallet<T>,
     chain: &C,
-    dir: &Path,
+    wallet_file: &Path,
     hub: &str,
     ask: Ask,
     sane: bool,
@@ -213,7 +213,7 @@ async fn open_once<T: Transport, C: Chain>(
     // Hers: the hub's quote is checked against it.
     let checkpoint = chain.checkpoint(at).await.map_err(|e| anyhow!(e))?;
     let wanted = wanted(&offer, tip, ask.blocks)?;
-    let store = Store::open(dir)?;
+    let store = Store::open(wallet_file)?;
     let funded = offer.funded();
     let least = least(
         info.contracts.and_then(|c| c.range),
@@ -315,15 +315,15 @@ fn overdue(phase: Phase, began: i64, now: i64) -> bool {
     phase < Phase::Signing && now - began > OPENS_WITHIN
 }
 
-/// Carry on with the openings in `dir` under way, and see where the F
+/// Carry on with the openings in `wallet_file` under way, and see where the F
 /// of each signed stands: every contract, the newest first. Nothing is
-/// made in `dir` if none was ever opened there.
+/// made in `wallet_file` if none was ever opened there.
 pub async fn resume<T: Transport, C: Chain>(
     wallet: &Wallet<T>,
     chain: &C,
-    dir: &Path,
+    wallet_file: &Path,
 ) -> Result<Vec<Contract>> {
-    let Some(store) = Store::existing(dir)? else {
+    let Some(store) = Store::existing(wallet_file)? else {
         return Ok(Vec::new());
     };
     let tip = chain.height().await.map_err(|e| anyhow!(e))?;
@@ -394,7 +394,7 @@ pub async fn resume<T: Transport, C: Chain>(
     let all = store.list()?;
     drop(store);
     // As they stand now: one newly buried, or past its time.
-    if let Err(e) = fees::agree(wallet, dir, Some(tip)) {
+    if let Err(e) = fees::agree(wallet, wallet_file, Some(tip)) {
         tracing::warn!("what her contracts' hubs may charge: {e:#}");
     }
     Ok(all)
@@ -425,22 +425,26 @@ async fn unburied_f(store: &Store, chain: &impl Chain, id: &[u8; 32]) -> Result<
     }
 }
 
-/// The contracts in `dir`, the newest first: none if none was ever
+/// The contracts in `wallet_file`, the newest first: none if none was ever
 /// opened there.
-pub fn list(dir: &Path) -> Result<Vec<Contract>> {
-    match Store::existing(dir)? {
+pub fn list(wallet_file: &Path) -> Result<Vec<Contract>> {
+    match Store::existing(wallet_file)? {
         Some(store) => store.list(),
         None => Ok(Vec::new()),
     }
 }
 
 /// The hubs `wallet` trusts in the order its payment codes name them: those
-/// whose contracts in `dir`, live at `tip`, have the most room to protect
+/// whose contracts in `wallet_file`, live at `tip`, have the most room to protect
 /// more than is held there first, then those holding the least, so that
 /// what payers pay is protected and does not pile up at one hub; then by
 /// URL.
-pub fn code_hubs<T: Transport>(wallet: &Wallet<T>, dir: &Path, tip: u32) -> Result<Vec<String>> {
-    let contracts = list(dir)?;
+pub fn code_hubs<T: Transport>(
+    wallet: &Wallet<T>,
+    wallet_file: &Path,
+    tip: u32,
+) -> Result<Vec<String>> {
+    let contracts = list(wallet_file)?;
     let balance = wallet.balance()?;
     let mut hubs = Vec::new();
     for (url, _) in wallet.hubs()? {
@@ -470,23 +474,13 @@ fn rank_code_hubs(mut hubs: Vec<(String, u64, u64)>) -> Vec<String> {
     hubs.into_iter().map(|(url, ..)| url).collect()
 }
 
-/// Snapshot the contract database while the caller holds its driver lock.
-/// Instance files are copied under the same lock by the bundle writer.
-pub fn snapshot_database(dir: &Path, to: &Path) -> Result<bool> {
-    let Some(store) = Store::existing(dir)? else {
-        return Ok(false);
-    };
-    store.snapshot(to)?;
-    Ok(true)
-}
-
 /// Check a restored store before installing it, without advancing a driver
 /// or touching the chain: every recovery row must be one this build carries
 /// on, and every signed opening it can read must have the instances its
 /// recovery needs. An opening this build cannot read is carried as it was,
 /// as on the phone it came from; it covers nothing here either.
-pub fn validate_backup<T: Transport>(wallet: &Wallet<T>, dir: &Path) -> Result<()> {
-    let Some(store) = Store::existing(dir)? else {
+pub fn validate_backup<T: Transport>(wallet: &Wallet<T>, wallet_file: &Path) -> Result<()> {
+    let Some(store) = Store::existing(wallet_file)? else {
         return Ok(());
     };
     recovery::validate_backup(&store).context("this backup needs a newer version of the app")?;
@@ -528,11 +522,11 @@ pub struct Inspection {
 /// graph yet, in which case these details are unavailable rather than guessed.
 pub fn inspect<T: Transport>(
     wallet: &Wallet<T>,
-    dir: &Path,
+    wallet_file: &Path,
     id: &[u8; 32],
     tip: u32,
 ) -> Result<Inspection> {
-    let store = Store::existing(dir)?.context("no contracts")?;
+    let store = Store::existing(wallet_file)?.context("no contracts")?;
     let (state, _) = store.state(id)?;
     let secrets = wallet.contract_secrets();
     let ctx = licash_contract::opening::Context {
@@ -599,11 +593,11 @@ fn inspection(
 /// recovery or reserves notes.
 pub fn coverage<T: Transport>(
     wallet: &Wallet<T>,
-    dir: &Path,
+    wallet_file: &Path,
     contracts: &[Contract],
     tip: u32,
 ) -> Result<std::collections::HashMap<[u8; 32], u64>> {
-    let Some(store) = Store::existing(dir)?.filter(|_| tip > 0) else {
+    let Some(store) = Store::existing(wallet_file)?.filter(|_| tip > 0) else {
         return Ok(std::collections::HashMap::new());
     };
     let held = wallet.balance()?;
@@ -615,7 +609,7 @@ pub fn coverage<T: Transport>(
     }
     let mut claimants = std::collections::BTreeMap::new();
     for o in wallet.owed_locks()? {
-        if let Some(id) = activation::claimant(wallet, &store, dir, &o, tip)? {
+        if let Some(id) = activation::claimant(wallet, &store, wallet_file, &o, tip)? {
             claimants.insert(o.id, id);
         }
     }
@@ -651,21 +645,21 @@ fn coverage_order<'a>(
 }
 
 /// The coin of `wallet`'s that [`open`] would deposit of `least` sat at
-/// least ([`least`]), with the contracts in `dir`: the smallest free.
+/// least ([`least`]), with the contracts in `wallet_file`: the smallest free.
 /// None if no coin does.
 pub fn coin<T: Transport>(
     wallet: &Wallet<T>,
-    dir: &Path,
+    wallet_file: &Path,
     least: u64,
 ) -> Result<Option<SilentCoin>> {
-    Ok(smallest(coins(wallet, dir)?, least))
+    Ok(smallest(coins(wallet, wallet_file)?, least))
 }
 
-/// The coins of `wallet`'s free to deposit, with the contracts in `dir`:
+/// The coins of `wallet`'s free to deposit, with the contracts in `wallet_file`:
 /// confirmed on Bitcoin, unspent and no other contract's deposit, the
 /// largest first.
-pub fn coins<T: Transport>(wallet: &Wallet<T>, dir: &Path) -> Result<Vec<SilentCoin>> {
-    let mut coins = match Store::existing(dir)? {
+pub fn coins<T: Transport>(wallet: &Wallet<T>, wallet_file: &Path) -> Result<Vec<SilentCoin>> {
+    let mut coins = match Store::existing(wallet_file)? {
         Some(store) => free(wallet, &store)?,
         None => free_of(wallet, &[])?,
     };
@@ -1125,7 +1119,7 @@ mod tests {
         )
         .unwrap();
         // No contracts kept at all: nothing to check.
-        validate_backup(&wallet, dir.path()).unwrap();
+        validate_backup(&wallet, &dir.path().join("wallet.sqlite")).unwrap();
         let keys = wallet.contract_secrets();
         let ctx = licash_contract::opening::Context {
             tip: 0,
@@ -1137,7 +1131,7 @@ mod tests {
             .signed()
             .unwrap();
         let id = o.base.parts().nonce;
-        let store = Store::open(dir.path()).unwrap();
+        let store = Store::open(&crate::testing::wallet_file(dir.path())).unwrap();
         let insert = |id: [u8; 32], vout: u32, state: &[u8]| {
             store
                 .insert(&New {
@@ -1161,10 +1155,10 @@ mod tests {
         };
         insert(id, 0, bytes);
         // The backed-up wallet seed regenerates the holder's circuits.
-        validate_backup(&wallet, dir.path()).unwrap();
+        validate_backup(&wallet, &dir.path().join("wallet.sqlite")).unwrap();
         // One this build cannot read is restored as it was, not refused.
         insert([9; 32], 1, b"of a later version");
-        validate_backup(&wallet, dir.path()).unwrap();
+        validate_backup(&wallet, &dir.path().join("wallet.sqlite")).unwrap();
     }
 
     /// No hub to reach.
@@ -1323,7 +1317,7 @@ mod tests {
         let regtest = ChainProfile::Core30DefaultRegtest;
         let path = dir.path().join("wallet.sqlite");
         let wallet = Wallet::create(&path, &[7; 32], regtest, Nowhere).unwrap();
-        let store = Store::open(dir.path()).unwrap();
+        let store = Store::open(&crate::testing::wallet_file(dir.path())).unwrap();
         let new = |id: u8, vout: u32| New {
             id: [id; 32],
             hub: "http://hub.example",
@@ -1346,7 +1340,9 @@ mod tests {
         let f = Some(Txid::from_byte_array([8; 32]));
         store.save(&[2; 32], Phase::Funded, f, b"nor this").unwrap();
 
-        let contracts = resume(&wallet, &Tip, dir.path()).await.unwrap();
+        let contracts = resume(&wallet, &Tip, &dir.path().join("wallet.sqlite"))
+            .await
+            .unwrap();
         let of = |id: u8| contracts.iter().find(|c| c.id == [id; 32]).unwrap();
         // The first given up, its coin free again; the other kept as it is.
         let reason = of(1).abandoned.as_deref().unwrap();
@@ -1359,7 +1355,9 @@ mod tests {
         assert!(unreadable().contains(&[2; 32]));
         store.insert(&new(3, 2)).unwrap();
         unreadable().insert([3; 32]);
-        let again = resume(&wallet, &Tip, dir.path()).await.unwrap();
+        let again = resume(&wallet, &Tip, &dir.path().join("wallet.sqlite"))
+            .await
+            .unwrap();
         assert_eq!(
             again.iter().find(|c| c.id == [3; 32]).unwrap().abandoned,
             None
@@ -1470,7 +1468,7 @@ mod tests {
         let holder = Holder::load(bytes, &wallet.contract_secrets().seed, &ctx).unwrap();
         let f = holder.funding().unwrap().tx.clone();
         let id = holder.signed().unwrap().base.parts().nonce;
-        let store = Store::open(dir.path()).unwrap();
+        let store = Store::open(&crate::testing::wallet_file(dir.path())).unwrap();
         store
             .insert(&New {
                 id,
@@ -1498,7 +1496,8 @@ mod tests {
             let all = resume(wallet, chain, dir).await.unwrap();
             all.iter().find(|c| c.id == id).unwrap().fate
         }
-        let fate = |chain| fate_of(&wallet, chain, dir.path(), id);
+        let file = dir.path().join("wallet.sqlite");
+        let fate = |chain| fate_of(&wallet, chain, &file, id);
 
         // Found live by a build before: trusted, its chain not asked.
         store.set_fate(&id, Fate::Live).unwrap();

@@ -58,11 +58,11 @@ pub fn challenge_marker(id: &[u8; 32]) -> Txid {
 /// told before she forces a close.
 pub fn challenge_shortfall<T: Transport>(
     wallet: &Wallet<T>,
-    dir: &std::path::Path,
+    wallet_file: &std::path::Path,
     rate: FeeRate,
 ) -> Result<Option<Amount>> {
     let need = challenge_reserve(rate);
-    let coins = super::coins(wallet, dir)?;
+    let coins = super::coins(wallet, wallet_file)?;
     // Her publication may need one of her coins too, the smallest that
     // pays its fee: one besides it.
     let enough = coins.iter().filter(|c| c.value >= need.to_sat()).count();
@@ -484,11 +484,11 @@ pub(super) fn validate_backup(store: &Store) -> Result<()> {
 pub async fn force_close<T: Transport, C: Chain>(
     wallet: &Wallet<T>,
     chain: &C,
-    dir: &std::path::Path,
+    wallet_file: &std::path::Path,
     id: &[u8; 32],
     rate: FeeRate,
 ) -> Result<Recovery> {
-    let store = Store::existing(dir)?.context("no contracts")?;
+    let store = Store::existing(wallet_file)?.context("no contracts")?;
     let contract = store
         .list()?
         .into_iter()
@@ -540,7 +540,7 @@ pub async fn force_close<T: Transport, C: Chain>(
             &State::default().encode(),
         )?;
     }
-    Run::load(wallet, chain, &store, dir, id, rate)
+    Run::load(wallet, chain, &store, wallet_file, id, rate)
         .await?
         .steps()
         .await?;
@@ -549,14 +549,14 @@ pub async fn force_close<T: Transport, C: Chain>(
 pub async fn advance<T: Transport, C: Chain>(
     wallet: &Wallet<T>,
     chain: &C,
-    dir: &std::path::Path,
+    wallet_file: &std::path::Path,
     rate: FeeRate,
 ) -> Result<Vec<Recovery>> {
-    let Some(store) = Store::existing(dir)? else {
+    let Some(store) = Store::existing(wallet_file)? else {
         return Ok(vec![]);
     };
     // Before a recovery claims them: as provable as they can be.
-    if let Err(e) = activation::keep(wallet, chain, dir, rate).await {
+    if let Err(e) = activation::keep(wallet, chain, wallet_file, rate).await {
         tracing::warn!("keeping the locks owed to her provable: {e:#}");
     }
     for row in store.recoveries()? {
@@ -569,7 +569,7 @@ pub async fn advance<T: Transport, C: Chain>(
             }
             continue;
         }
-        let result = match Run::load(wallet, chain, &store, dir, &row.id, rate).await {
+        let result = match Run::load(wallet, chain, &store, wallet_file, &row.id, rate).await {
             Ok(run) => run.steps().await,
             Err(e) => Err(e),
         };
@@ -580,7 +580,7 @@ pub async fn advance<T: Transport, C: Chain>(
     }
     list(&store)
 }
-/// The coins her recoveries in `dir` need of hers on Bitcoin now, each to
+/// The coins her recoveries in `wallet_file` need of hers on Bitcoin now, each to
 /// be paid out of her notes to an address of her own, through a swap
 /// provider, and recorded with [`expect_fee`]: for her publication, should
 /// her purse and no coin of hers alone pay its fees, time left for a
@@ -589,10 +589,10 @@ pub async fn advance<T: Transport, C: Chain>(
 pub async fn fee_needs<T: Transport, C: Chain>(
     wallet: &Wallet<T>,
     chain: &C,
-    dir: &std::path::Path,
+    wallet_file: &std::path::Path,
     rate: FeeRate,
 ) -> Result<Vec<FeeNeed>> {
-    let Some(store) = Store::existing(dir)? else {
+    let Some(store) = Store::existing(wallet_file)? else {
         return Ok(vec![]);
     };
     let tip = chain.height().await.map_err(|e| anyhow!(e))?;
@@ -605,7 +605,7 @@ pub async fn fee_needs<T: Transport, C: Chain>(
             continue;
         }
         let state = State::decode(&row)?;
-        let run = Run::load(wallet, chain, &store, dir, &row.id, rate).await?;
+        let run = Run::load(wallet, chain, &store, wallet_file, &row.id, rate).await?;
         needs.extend(run.fee_need(stage, &state, tip)?);
     }
     Ok(needs)
@@ -613,8 +613,13 @@ pub async fn fee_needs<T: Transport, C: Chain>(
 
 /// Record `hash`, a payout of her notes to an address of her own, as the
 /// one recovery `id` awaits for `purpose` ([`fee_needs`]).
-pub fn expect_fee(dir: &std::path::Path, id: &[u8; 32], purpose: FeeFor, hash: &str) -> Result<()> {
-    let store = Store::existing(dir)?.context("no contracts")?;
+pub fn expect_fee(
+    wallet_file: &std::path::Path,
+    id: &[u8; 32],
+    purpose: FeeFor,
+    hash: &str,
+) -> Result<()> {
+    let store = Store::existing(wallet_file)?.context("no contracts")?;
     // Saved only over the state read: a step meanwhile is read again.
     for _ in 0..3 {
         let row = store.recovery(id)?.context("no such recovery")?;
@@ -636,18 +641,18 @@ pub fn expect_fee(dir: &std::path::Path, id: &[u8; 32], purpose: FeeFor, hash: &
     bail!("the recovery kept changing meanwhile")
 }
 
-pub fn recoveries(dir: &std::path::Path) -> Result<Vec<Recovery>> {
-    match Store::existing(dir)? {
+pub fn recoveries(wallet_file: &std::path::Path) -> Result<Vec<Recovery>> {
+    match Store::existing(wallet_file)? {
         Some(store) => list(&store),
         None => Ok(vec![]),
     }
 }
 pub fn give_up<T: Transport>(
     wallet: &Wallet<T>,
-    dir: &std::path::Path,
+    wallet_file: &std::path::Path,
     id: &[u8; 32],
 ) -> Result<()> {
-    let store = Store::existing(dir)?.context("no contracts")?;
+    let store = Store::existing(wallet_file)?.context("no contracts")?;
     if store.recovery(id)?.is_none() {
         // Given up already, asked twice (a second tap waiting behind the
         // first, say): nothing left to give back.
@@ -693,12 +698,12 @@ const FOLD_RATE: u64 = 2;
 pub(super) fn fold_by(
     seed: &[u8; 32],
     network: licash::spend::ChainProfile,
-    dir: &std::path::Path,
+    wallet_file: &std::path::Path,
     id: &[u8; 32],
     tip: u32,
 ) -> Result<u32> {
     let terms = (0, super::exit::TIMEOUT_SLACK);
-    let safety = super::safety::of_seed(seed, network, dir, id, tip, terms)?;
+    let safety = super::safety::of_seed(seed, network, wallet_file, id, tip, terms)?;
     let room = super::exit::blocks_a_day(network) / 12;
     Ok(safety.request_by.unwrap_or(0).saturating_sub(room))
 }
@@ -711,10 +716,10 @@ pub(super) fn fold_by(
 pub(super) async fn fold_claim<T: Transport, C: Chain>(
     wallet: &Wallet<T>,
     chain: &C,
-    dir: &std::path::Path,
+    wallet_file: &std::path::Path,
     id: &[u8; 32],
 ) -> Result<Option<FoldClaim>> {
-    let store = Store::existing(dir)?.context("no contracts")?;
+    let store = Store::existing(wallet_file)?.context("no contracts")?;
     let rate = FeeRate::from_sat_per_vb(FOLD_RATE).expect("a rate");
     if let Some(row) = store.recovery(id)? {
         ensure!(
@@ -722,7 +727,7 @@ pub(super) async fn fold_claim<T: Transport, C: Chain>(
             "forced closed already: its recovery goes on"
         );
         if row.irrevocable {
-            let run = Run::load(wallet, chain, &store, dir, id, rate).await?;
+            let run = Run::load(wallet, chain, &store, wallet_file, id, rate).await?;
             return run.claim_of_fold(&State::decode(&row)?).map(Some);
         }
         // A close that never signed its fold: its notes back first.
@@ -741,7 +746,7 @@ pub(super) async fn fold_claim<T: Transport, C: Chain>(
         )?,
         "closing already: try again in a moment"
     );
-    let run = Run::load(wallet, chain, &store, dir, id, rate).await?;
+    let run = Run::load(wallet, chain, &store, wallet_file, id, rate).await?;
     match run.take_for_fold().await {
         Ok(Some(claim)) => Ok(Some(claim)),
         Ok(None) => {
@@ -894,7 +899,7 @@ struct Run<'a, T: Transport, C: Chain> {
     wallet: &'a Wallet<T>,
     chain: &'a C,
     store: &'a Store,
-    dir: &'a std::path::Path,
+    wallet_file: &'a std::path::Path,
     id: [u8; 32],
     rate: FeeRate,
     o: Opening,
@@ -909,7 +914,7 @@ impl<'a, T: Transport, C: Chain> Run<'a, T, C> {
         wallet: &'a Wallet<T>,
         chain: &'a C,
         store: &'a Store,
-        dir: &'a std::path::Path,
+        wallet_file: &'a std::path::Path,
         id: &[u8; 32],
         rate: FeeRate,
     ) -> Result<Self> {
@@ -930,7 +935,7 @@ impl<'a, T: Transport, C: Chain> Run<'a, T, C> {
             wallet,
             chain,
             store,
-            dir,
+            wallet_file,
             id: *id,
             rate,
             o,
@@ -1484,7 +1489,7 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
             );
             base.push((at(PURSE_VOUT), purse.clone()));
         }
-        let coins = super::coins(self.wallet, self.dir)?;
+        let coins = super::coins(self.wallet, self.wallet_file)?;
         let most = coins.first().map_or(0, |c| c.value);
         let paid = self.payout_claim(state.fee_payout.as_deref())?;
         let input_fee = self.rate.fee_vb(58).context("input fee")?;
@@ -1641,7 +1646,7 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
             return Ok(None);
         }
         let need = challenge_reserve(self.rate);
-        let free = super::coins(self.wallet, self.dir)?;
+        let free = super::coins(self.wallet, self.wallet_file)?;
         if free.iter().any(|c| c.value >= need.to_sat()) {
             return Ok(None);
         }
@@ -1986,12 +1991,16 @@ fn watched(stage: Stage) -> bool {
     )
 }
 
-/// Let the recovery of contract `id` in `dir` pay `sats` in all for its
+/// Let the recovery of contract `id` in `wallet_file` pay `sats` in all for its
 /// publication's fees, more than its reserve holds: her call, once told it
 /// falls short, or before. Refused above what her contract holds, a typo
 /// as like as not.
-pub fn allow_publication_fee(dir: &std::path::Path, id: &[u8; 32], sats: u64) -> Result<()> {
-    let store = Store::existing(dir)?.context("no contracts")?;
+pub fn allow_publication_fee(
+    wallet_file: &std::path::Path,
+    id: &[u8; 32],
+    sats: u64,
+) -> Result<()> {
+    let store = Store::existing(wallet_file)?.context("no contracts")?;
     let contract = (store.list()?.into_iter().find(|c| &c.id == id)).context("no such contract")?;
     ensure!(
         sats <= contract.value,
@@ -2444,7 +2453,7 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
             return Ok(());
         }
         let need = challenge_reserve(self.rate);
-        let free = super::coins(self.wallet, self.dir)?;
+        let free = super::coins(self.wallet, self.wallet_file)?;
         match free
             .iter()
             .filter(|c| c.value >= need.to_sat())
@@ -2632,7 +2641,7 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
                 .checked_sub(link_fee + have)
                 .unwrap_or(Amount::ZERO)
                 + DUST;
-            let mut free = super::coins(self.wallet, self.dir)?;
+            let mut free = super::coins(self.wallet, self.wallet_file)?;
             free.sort_by_key(|c| c.value);
             let pick = (free.iter().find(|c| c.value >= need.to_sat())).or(free.last());
             if let Some(c) = pick {
@@ -3025,7 +3034,13 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
     /// that pays her then.
     fn force_at(&self, tip: u32) -> Result<u32> {
         let seed = self.wallet.contract_secrets().seed;
-        fold_by(&seed, self.wallet.network(), self.dir, &self.id, tip)
+        fold_by(
+            &seed,
+            self.wallet.network(),
+            self.wallet_file,
+            &self.id,
+            tip,
+        )
     }
 
     /// Her contract's collateral still unspent: the hub folds it, or the

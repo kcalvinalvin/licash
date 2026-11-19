@@ -10,7 +10,7 @@
 //! ([`licash_hp::check`]) and asserts the proof. Challenged, it answers
 //! with a kept instance whose circuit opens on the proof. Its evidence and
 //! one-time signatures (`b′`, the proof's digits) are pinned in
-//! `responses.sqlite` before they are made. Outputs of a payout that are
+//! the response pins before they are made. Outputs of a payout that are
 //! the hub's are swept to its wallet.
 //!
 //! Once her publication is as deep as the hub decides on, the hub's ledger
@@ -902,15 +902,16 @@ impl Openings {
     }
 
     /// Whether the hub signed answer `name` of opening `id`, or was about
-    /// to: asked while `responses.sqlite` holds nothing it answered on, as
-    /// once that file is lost, or restored older. Another answer, decided
+    /// to: asked while the response pins hold nothing it answered on, as
+    /// once their rows are lost, or the database restored older. Another
+    /// answer, decided
     /// anew, could differ from the one signed with the same one-time key,
     /// which gives her the hub's outputs: then none is signed, her timeout
     /// pays her what she claims, and the operator is told, once a run.
     ///
-    /// Told by `openings.sqlite`, which keeps each answer before it is
-    /// signed ([`Store::begin_signing`]). Where it keeps none (signed by a
-    /// build before it did, or restored older too), by the mempool while
+    /// Told by the openings' signing marks, which keep each answer before it
+    /// is signed ([`Store::begin_signing`]). Where they keep none (the
+    /// database restored older, marks and pins together), by the mempool while
     /// `lone`: nothing but this answer can spend `coin` yet, her timeout
     /// being some blocks away, so a transaction spending it there is one
     /// the hub signed. Kept then, to stand past her timeout's first block,
@@ -930,11 +931,10 @@ impl Openings {
         if lost && self.once(id, "pin lost") {
             self.alert(&format!(
                 "contract {}: the hub signed its {name} with a one-time key, or was about \
-                 to, and responses.sqlite no longer holds what it answered on, as when that \
-                 file is lost or restored older than openings.sqlite. It signs no other: \
-                 her timeout pays her what she claims, and the hub's reserve once a \
-                 response is in a block. Restore responses.sqlite as recent as \
-                 openings.sqlite.",
+                 to, and its response pins no longer hold what it answered on, as when \
+                 their rows are lost. It signs no other: her timeout pays her what she \
+                 claims, and the hub's reserve once a response is in a block. Restore \
+                 hub.sqlite as recent as the hub's last answer.",
                 crate::hex_id(id)
             ));
         }
@@ -1004,11 +1004,11 @@ impl Openings {
                     // Its response is in a block: no answer of another
                     // kept tells of this, and nothing else alerts.
                     self.alert(&format!(
-                        "contract {}: the hub responded, and responses.sqlite no longer holds \
-                         the evidence it responded on, as when that file is lost or restored \
-                         older than openings.sqlite. It asserts nothing without it: her \
-                         timeout pays her what she claims and the hub's reserve. Restore \
-                         responses.sqlite as recent as openings.sqlite.",
+                        "contract {}: the hub responded, and its response pins no longer hold \
+                         the evidence it responded on, as when their rows are lost. It asserts \
+                         nothing without it: her timeout pays her what she claims and the \
+                         hub's reserve. Restore hub.sqlite as recent as the hub's last \
+                         response.",
                         crate::hex_id(id)
                     ));
                 }
@@ -1244,7 +1244,7 @@ impl Openings {
 
     /// The one-input `tx` named `name`, spending `prevout`, with an exact
     /// fee coin of the hub's wallet appended: made once, kept in
-    /// `openings.sqlite` before it is used.
+    /// the hub's database before it is used.
     async fn with_fee(
         &self,
         id: &[u8; 32],

@@ -57,7 +57,7 @@ impl Safety {
 /// Existing state is unchanged, including a recovery already under way.
 pub fn of<T: Transport>(
     wallet: &Wallet<T>,
-    dir: &std::path::Path,
+    wallet_file: &std::path::Path,
     id: &[u8; 32],
     tip: u32,
     exit_margin: u32,
@@ -65,7 +65,7 @@ pub fn of<T: Transport>(
 ) -> Result<Safety> {
     let seed = wallet.contract_secrets().seed;
     let terms = (exit_margin, timeout_slack);
-    of_seed(&seed, wallet.network(), dir, id, tip, terms)
+    of_seed(&seed, wallet.network(), wallet_file, id, tip, terms)
 }
 
 /// As [`of`], by the wallet's contract seed and network: its exit margin
@@ -73,12 +73,12 @@ pub fn of<T: Transport>(
 pub(super) fn of_seed(
     seed: &[u8; 32],
     network: ChainProfile,
-    dir: &std::path::Path,
+    wallet_file: &std::path::Path,
     id: &[u8; 32],
     tip: u32,
     (exit_margin, timeout_slack): (u32, u32),
 ) -> Result<Safety> {
-    let store = Store::existing(dir)?.context("no contracts")?;
+    let store = Store::existing(wallet_file)?.context("no contracts")?;
     let (state, _) = store.state(id)?;
     let ctx = Context {
         tip,

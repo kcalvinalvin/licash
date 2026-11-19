@@ -1,14 +1,13 @@
-//! The holder's contracts, in `contracts.sqlite` of the wallet's
-//! directory, and the instances each keeps, in `contracts/` beside it:
-//! each opening as its machine stored itself at its last step, with what
-//! a list shows of it. Neither is made until a first contract opens.
+//! The holder's contracts, the component `contracts` of the wallet's file,
+//! and the instances each keeps, in `contracts/` beside it: each opening as
+//! its machine stored itself at its last step, with what a list shows of
+//! it. The tables are made with the first contract opened; the directory
+//! when one first keeps an instance. A wallet that never opened one holds
+//! neither, and reading them finds none.
 //!
-//! The file's version tells which of its tables a build must know to
-//! read it right. The `ceilings`, `claim_terms`, `folds`, `exit_consent`,
-//! `exit_payouts`, `fate_blocks`, `recovery_tips` and `funded` are none of
-//! them: each made with the first kept, whatever the version, and ignored
-//! by a build before them, which opens the file all the same. A migration
-//! to come must make them `IF NOT EXISTS` too.
+//! The wallet's own connection and this one are two of one file: a backup
+//! of the wallet's file is a backup of its contracts too, but for the
+//! instances, which the caller copies while the holder driver is frozen.
 
 use std::collections::HashMap;
 #[cfg(test)]
@@ -20,150 +19,136 @@ use bitcoin::consensus::{deserialize, serialize};
 use bitcoin::{BlockHash, OutPoint, Txid};
 use licash_api::Fees;
 use licash_contract::opening::{Fate, Phase};
+use licash_store::Kind;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
 /// The format of the rows: a machine's stored bytes, of
 /// `licash_contract`'s format 3.
 const FORMAT: i64 = 3;
 
+/// The component the holder's tables are, and its version.
+const COMPONENT: &str = "contracts";
+const VERSION: i64 = 1;
+
+/// A stage a contract reaches is a table of its own, one row of it a fact:
+/// its recovery, its claim terms, its fold, the block its F was buried in,
+/// what she funded of it, the instances its hub answered. A contract of no
+/// such row never reached it.
 const SCHEMA: &str = "
-CREATE TABLE IF NOT EXISTS contracts (
+-- Each opening as its machine stored itself, with what a list shows of it:
+-- `phase` its machine's, `fate` where F stands once she signed it (live,
+-- dead, or open again), `abandoned` why she gave it up short of that. Her
+-- `ceiling_fees`, as JSON, are the most its hub may charge her: its fees as
+-- the contract opened, raised since by her only.
+CREATE TABLE contracts (
     id BLOB PRIMARY KEY,
     hub TEXT NOT NULL,
     format INTEGER NOT NULL,
     phase INTEGER NOT NULL,
-    mock INTEGER NOT NULL,
-    irrevocable INTEGER NOT NULL,
+    mock INTEGER NOT NULL CHECK (mock IN (0, 1)),
+    irrevocable INTEGER NOT NULL CHECK (irrevocable IN (0, 1)),
     deposit BLOB NOT NULL,
-    value INTEGER NOT NULL,
-    price INTEGER NOT NULL,
+    value INTEGER NOT NULL CHECK (value >= 0),
+    price INTEGER NOT NULL CHECK (price >= 0),
     cap INTEGER NOT NULL,
     assert_height INTEGER NOT NULL,
     close_height INTEGER NOT NULL,
     funding BLOB,
     since INTEGER NOT NULL,
-    fate TEXT,
+    fate TEXT CHECK (fate IN ('live', 'dead', 'open')),
     abandoned TEXT,
+    ceiling_fees TEXT NOT NULL,
+    ceiling_updated_at INTEGER NOT NULL,
     state BLOB NOT NULL,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
 ) STRICT;
-CREATE UNIQUE INDEX IF NOT EXISTS contracts_deposit ON contracts (deposit)
+CREATE UNIQUE INDEX contracts_deposit ON contracts (deposit)
     WHERE abandoned IS NULL AND (fate IS NULL OR fate != 'dead');
-";
 
-/// Contracts she forced closed, each a recovery's stage and state in a
-/// format of `recovery`'s: made at her first, the file of version 2 from
-/// then on. A wallet that never forced a contract closed keeps version 1,
-/// which builds before readily open.
-const RECOVERIES: &str = "
-CREATE TABLE recoveries (
+-- Contracts she forced closed, each a recovery's stage and state in a
+-- format of `recovery`'s. Dropped only while revocable.
+CREATE TABLE contract_recoveries (
     id BLOB PRIMARY KEY REFERENCES contracts (id),
     format INTEGER NOT NULL,
     stage TEXT NOT NULL,
-    irrevocable INTEGER NOT NULL,
+    irrevocable INTEGER NOT NULL CHECK (irrevocable IN (0, 1)),
     state BLOB NOT NULL,
     error TEXT,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
 ) STRICT;
-";
 
-/// The most each contract's hub may charge her, as JSON: its fees as the
-/// contract opened, raised since by her only. No row, of a contract opened
-/// before these were kept, tells nothing: nor does no table.
-const CEILINGS: &str = "
-CREATE TABLE IF NOT EXISTS ceilings (
-    id BLOB PRIMARY KEY REFERENCES contracts (id),
-    fees TEXT NOT NULL,
-    updated_at INTEGER NOT NULL
-) STRICT;
-";
-
-/// Of each contract, the keyset whose notes its claim holds, the most
-/// authorizations it may and the holder program it opened under: read
-/// from its state, kept so as not to read it whole again. No row tells
-/// nothing: its state tells.
-const CLAIM_TERMS: &str = "
-CREATE TABLE IF NOT EXISTS claim_terms (
+-- Of each contract, the keyset whose notes its claim holds, the most
+-- authorizations it may and the holder program it opened under: read from
+-- its state, kept so as not to read it whole again. No row tells nothing:
+-- its state tells.
+CREATE TABLE contract_claim_terms (
     id BLOB PRIMARY KEY REFERENCES contracts (id),
     keyset BLOB NOT NULL,
     authorizations INTEGER NOT NULL,
     program BLOB NOT NULL
 ) STRICT;
-";
 
-/// The contracts she closed early with their hub, each by its last fold's
-/// txid: kept before the hub can sign it, and never dropped: whatever the
-/// hub answers, it may have signed.
-/// Her consent to exit contracts ending ([`super::exit`]), a row at most,
-/// and the payouts the exit made, by ticket, before each was paid.
-const EXITS: &str = "
-CREATE TABLE IF NOT EXISTS exit_consent (
+-- Her consent to exit contracts ending ([`super::exit`]), a row at most,
+-- and the payouts the exit made, by ticket, before each was paid, from the
+-- hub at `hub` (a URL it may be reached at) at block `height`.
+CREATE TABLE contract_exit_consent (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     address TEXT NOT NULL,
     exit_margin INTEGER NOT NULL,
     given_at INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS exit_payouts (
+) STRICT;
+CREATE TABLE contract_exit_payouts (
     ticket TEXT PRIMARY KEY,
-    contract BLOB NOT NULL,
+    contract BLOB NOT NULL REFERENCES contracts (id),
     hub TEXT NOT NULL,
-    at INTEGER NOT NULL
-);
-";
+    height INTEGER NOT NULL
+) STRICT;
 
-const FOLDS: &str = "
-CREATE TABLE IF NOT EXISTS folds (
+-- The contracts she closed early with their hub, each by its last fold's
+-- txid: kept before the hub can sign it, and never dropped: whatever the
+-- hub answers, it may have signed.
+CREATE TABLE contract_folds (
     id BLOB PRIMARY KEY REFERENCES contracts (id),
     txid BLOB NOT NULL,
     created_at INTEGER NOT NULL
 ) STRICT;
-";
 
-/// The tips each recovery saw from her publication on: a height and hash
-/// each, thinned to about one per power of two blocks back, the newest
-/// and the first kept. One whose block the chain no longer has tells what
-/// it saw since may be gone ([`Store::recovery_tips`]). None, as of a
-/// build before it, proves nothing. Made with the first.
-const RECOVERY_TIPS: &str = "
-CREATE TABLE IF NOT EXISTS recovery_tips (
+-- The tips each recovery saw from her publication on: a height and hash
+-- each, thinned to about one per power of two blocks back, the newest and
+-- the first kept. One whose block the chain no longer has tells what it saw
+-- since may be gone ([`Store::recovery_tips`]).
+CREATE TABLE contract_recovery_tips (
     id BLOB NOT NULL REFERENCES contracts (id),
     height INTEGER NOT NULL,
     hash BLOB NOT NULL,
     PRIMARY KEY (id, height)
 ) STRICT;
-";
 
-/// The block each contract's F was found buried in, its height and hash,
-/// for as long as the contract lasts: once the chain no longer has it
-/// there, F's fate is to be found again. A contract live without one was
-/// found so by a build before it, or buried six deep under one that
-/// stopped following it there: trusted as it stands. Made with the first.
-const FATE_BLOCKS: &str = "
-CREATE TABLE IF NOT EXISTS fate_blocks (
+-- The block each contract's F was found buried in, its height and hash, for
+-- as long as the contract lasts: once the chain no longer has it there,
+-- F's fate is to be found again. A contract live without one was buried six
+-- deep under one that stopped following it there: trusted as it stands.
+CREATE TABLE contract_fate_blocks (
     id BLOB PRIMARY KEY REFERENCES contracts (id),
     height INTEGER NOT NULL,
     hash BLOB NOT NULL
 ) STRICT;
-";
 
-/// What she funded of each contract herself, in sat, of those funding
-/// some, and once her wallet received the notes its hub issues her for
-/// it ([`super::funded`]). Made with the first.
-const FUNDED: &str = "
-CREATE TABLE IF NOT EXISTS funded (
+-- What she funded of each contract herself, in sat, of those funding some,
+-- and once her wallet received the notes its hub issues her for it
+-- ([`super::funded`]).
+CREATE TABLE contract_funded (
     id BLOB PRIMARY KEY REFERENCES contracts (id),
-    amount INTEGER NOT NULL,
+    amount INTEGER NOT NULL CHECK (amount > 0),
     received_at INTEGER
 ) STRICT;
-";
 
-/// The instances of each opening its hub answered as had, by the index
-/// of each: not sent again when the opening resumes. Made with the first.
-const SERVED: &str = "
-CREATE TABLE IF NOT EXISTS served (
-    id BLOB NOT NULL,
+-- The instances of each opening its hub answered as had, by the index of
+-- each: not sent again when the opening resumes.
+CREATE TABLE contract_served (
+    id BLOB NOT NULL REFERENCES contracts (id),
     i INTEGER NOT NULL,
     PRIMARY KEY (id, i)
 ) STRICT;
@@ -191,17 +176,19 @@ pub(super) struct RecoveryRow {
     pub created_at: i64,
 }
 
-/// Where beside `contracts.sqlite` the instances each opening keeps are,
-/// in a directory of its id each.
+/// Where beside the wallet's file the instances each opening keeps are, in
+/// a directory of its id each.
 const KEPT_DIR: &str = "contracts";
 
 /// Beside a contract's kept instances, her statement's input once she
 /// forced it closed and the hub answered: what her proof is of.
 const STATEMENT: &str = "statement.input";
 
-/// Of the instances opening `id` in `dir` keeps, how many are on disk:
-/// those `Store::keep` finished writing. None if it keeps none there.
-pub fn kept(dir: &Path, id: &[u8; 32]) -> usize {
+/// Of the instances opening `id` of the wallet at `wallet_file` keeps, how
+/// many are on disk: those `Store::keep` finished writing. None if it keeps
+/// none there.
+pub fn kept(wallet_file: &Path, id: &[u8; 32]) -> usize {
+    let dir = wallet_file.parent().unwrap_or_else(|| Path::new(""));
     let Ok(entries) = std::fs::read_dir(dir.join(KEPT_DIR).join(crate::hex_id(id))) else {
         return 0;
     };
@@ -297,69 +284,49 @@ pub(super) struct Store {
 }
 
 impl Store {
-    /// Snapshot committed rows, including the WAL. The caller freezes the
-    /// holder driver while also copying its kept instance files.
-    pub fn snapshot(&self, to: &Path) -> Result<()> {
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600);
-        }
-        let file = options.open(to)?;
-        self.c.backup(rusqlite::MAIN_DB, to, None)?;
-        file.sync_all()?;
-        Ok(())
-    }
-
-    /// The contracts in `dir`, if any were ever opened there.
-    pub fn existing(dir: &Path) -> Result<Option<Self>> {
-        if !dir.join("contracts.sqlite").exists() {
+    /// The contracts in the wallet's file `wallet_file`, if any were ever
+    /// opened there: none in a wallet that never opened one, which this
+    /// leaves as it is.
+    pub fn existing(wallet_file: &Path) -> Result<Option<Self>> {
+        if !wallet_file.is_file() {
             return Ok(None);
         }
-        Self::open(dir).map(Some)
-    }
-
-    /// The contracts in `dir`, made if none were.
-    pub fn open(dir: &Path) -> Result<Self> {
-        let c = crate::private_db(&dir.join("contracts.sqlite"))?;
-        let version: i64 = c.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        match version {
-            0 => {
-                c.execute_batch(SCHEMA)?;
-                c.pragma_update(None, "user_version", 1)?;
-            }
-            1 | 2 => {}
-            v => bail!("contracts.sqlite is of version {v}, newer than this wallet knows"),
+        let Some(c) = licash_store::inspect(wallet_file, Kind::Wallet)? else {
+            return Ok(None);
+        };
+        if licash_store::component_version(&c, COMPONENT)?.is_none() {
+            return Ok(None);
         }
-        Ok(Self {
-            c,
-            kept: dir.join(KEPT_DIR),
-        })
+        drop(c);
+        Self::open(wallet_file).map(Some)
     }
 
+    /// The contracts in the wallet's file `wallet_file`, made if none were.
+    pub fn open(wallet_file: &Path) -> Result<Self> {
+        let mut c = licash_store::open(wallet_file, Kind::Wallet)?;
+        licash_store::component(&mut c, COMPONENT, VERSION, SCHEMA)?;
+        let kept = wallet_file
+            .parent()
+            .unwrap_or_else(|| Path::new(""))
+            .join(KEPT_DIR);
+        Ok(Self { c, kept })
+    }
+
+    /// [`Store::insert_under`] of a hub that charges nothing, for tests.
     #[cfg(test)]
     pub fn insert(&self, new: &New<'_>) -> Result<()> {
-        insert(&self.c, new)
+        self.insert_under(new, &Fees::default(), 0)
     }
 
-    /// Insert a contract and `fees`, the most its hub may charge her, in
+    /// Insert a contract with the ceilings of its hub's `fees`, the most it
+    /// may charge her, and the sat she `funded` of it herself, if any, in
     /// the same write.
-    /// [`Store::insert`], with the ceilings of its hub's `fees`, and the
-    /// sat she `funded` of it herself, if any.
     pub fn insert_under(&self, new: &New<'_>, fees: &Fees, funded: u64) -> Result<()> {
         let t = rusqlite::Transaction::new_unchecked(&self.c, TransactionBehavior::Immediate)?;
-        t.execute_batch(CEILINGS)?;
-        insert(&t, new)?;
-        t.execute(
-            "INSERT INTO ceilings (id, fees, updated_at) VALUES (?1, ?2, ?3)",
-            params![new.id, serde_json::to_string(fees)?, crate::now()],
-        )?;
+        insert(&t, new, fees)?;
         if funded > 0 {
-            t.execute_batch(FUNDED)?;
             t.execute(
-                "INSERT INTO funded (id, amount) VALUES (?1, ?2)",
+                "INSERT INTO contract_funded (id, amount) VALUES (?1, ?2)",
                 params![new.id, i64::try_from(funded)?],
             )?;
         }
@@ -369,12 +336,9 @@ impl Store {
 
     /// The contracts whose funded notes her wallet has not received yet.
     pub fn funded_unreceived(&self) -> Result<Vec<[u8; 32]>> {
-        if !self.has("funded")? {
-            return Ok(vec![]);
-        }
         let mut stmt = self
             .c
-            .prepare("SELECT id FROM funded WHERE received_at IS NULL")?;
+            .prepare("SELECT id FROM contract_funded WHERE received_at IS NULL")?;
         let ids = stmt.query_map([], |r| r.get(0))?;
         Ok(ids.collect::<rusqlite::Result<_>>()?)
     }
@@ -382,69 +346,45 @@ impl Store {
     /// The funded notes of contract `id`, all received by her wallet.
     pub fn funded_received(&self, id: &[u8; 32]) -> Result<()> {
         self.c.execute(
-            "UPDATE funded SET received_at = ?2 WHERE id = ?1 AND received_at IS NULL",
+            "UPDATE contract_funded SET received_at = ?2 WHERE id = ?1 AND received_at IS NULL",
             params![id, crate::now()],
         )?;
         Ok(())
     }
 
-    /// Whether any contract's ceilings were ever kept here.
-    fn keeps_ceilings(&self) -> Result<bool> {
-        self.has("ceilings")
-    }
-
-    /// Whether table `name` was ever made here.
-    fn has(&self, name: &str) -> Result<bool> {
-        let made: Option<i64> = self
-            .c
-            .query_row(
-                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
-                [name],
-                |r| r.get(0),
-            )
-            .optional()?;
-        Ok(made.is_some())
-    }
-
     /// Opening `id`'s instance `i`, answered by its hub as had.
     pub fn served(&self, id: &[u8; 32], i: u32) -> Result<()> {
-        self.c.execute_batch(SERVED)?;
         self.c.execute(
-            "INSERT INTO served (id, i) VALUES (?1, ?2) ON CONFLICT DO NOTHING",
+            "INSERT INTO contract_served (id, i) VALUES (?1, ?2) ON CONFLICT DO NOTHING",
             params![id, i],
         )?;
         Ok(())
     }
 
     /// The instances of opening `id` its hub answered as had: none if
-    /// none was ever kept here.
+    /// none was.
     pub fn served_of(&self, id: &[u8; 32]) -> Result<std::collections::BTreeSet<u32>> {
-        if !self.has("served")? {
-            return Ok(Default::default());
-        }
-        let mut stmt = self.c.prepare("SELECT i FROM served WHERE id = ?1")?;
+        let mut stmt = self
+            .c
+            .prepare("SELECT i FROM contract_served WHERE id = ?1")?;
         let rows = stmt.query_map([id], |r| r.get(0))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     /// Opening `id`'s instances to be sent again, all of them.
     pub fn unserve(&self, id: &[u8; 32]) -> Result<()> {
-        if self.has("served")? {
-            self.c.execute("DELETE FROM served WHERE id = ?1", [id])?;
-        }
+        self.c
+            .execute("DELETE FROM contract_served WHERE id = ?1", [id])?;
         Ok(())
     }
 
     /// Her consent to exit, if given: where to pay out, and the exit
     /// margin she gave with it. None if never given or revoked.
     pub fn exit_consent(&self) -> Result<Option<(String, u32, i64)>> {
-        if !self.has("exit_consent")? {
-            return Ok(None);
-        }
         Ok(self
             .c
             .query_row(
-                "SELECT address, exit_margin, given_at FROM exit_consent WHERE id = 1",
+                "SELECT address, exit_margin, given_at FROM contract_exit_consent WHERE id = 1",
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
@@ -454,9 +394,9 @@ impl Store {
     /// Her consent to exit, paying out to `address`, with `exit_margin`:
     /// in place of any given before.
     pub fn consent_to_exit(&self, address: &str, exit_margin: u32) -> Result<()> {
-        self.c.execute_batch(EXITS)?;
         self.c.execute(
-            "INSERT INTO exit_consent (id, address, exit_margin, given_at) VALUES (1, ?1, ?2, ?3)
+            "INSERT INTO contract_exit_consent (id, address, exit_margin, given_at)
+             VALUES (1, ?1, ?2, ?3)
              ON CONFLICT (id) DO UPDATE SET address = ?1, exit_margin = ?2, given_at = ?3",
             params![address, exit_margin, crate::now()],
         )?;
@@ -465,18 +405,16 @@ impl Store {
 
     /// Her consent to exit revoked, if given.
     pub fn revoke_exit_consent(&self) -> Result<()> {
-        if self.has("exit_consent")? {
-            self.c.execute("DELETE FROM exit_consent", [])?;
-        }
+        self.c.execute("DELETE FROM contract_exit_consent", [])?;
         Ok(())
     }
 
     /// The exit's payout `ticket`, for contract `id` from the hub at `hub`,
     /// at block `at`: kept before it is paid.
     pub fn exit_payout(&self, ticket: &str, id: &[u8; 32], hub: &str, at: u32) -> Result<()> {
-        self.c.execute_batch(EXITS)?;
         self.c.execute(
-            "INSERT INTO exit_payouts (ticket, contract, hub, at) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO contract_exit_payouts (ticket, contract, hub, height)
+             VALUES (?1, ?2, ?3, ?4)",
             params![ticket, id, hub, at],
         )?;
         Ok(())
@@ -484,12 +422,9 @@ impl Store {
 
     /// The tickets of the payouts the exit made for contract `id`.
     pub fn exit_payouts(&self, id: &[u8; 32]) -> Result<Vec<String>> {
-        if !self.has("exit_payouts")? {
-            return Ok(vec![]);
-        }
-        let mut stmt = self
-            .c
-            .prepare("SELECT ticket FROM exit_payouts WHERE contract = ?1 ORDER BY at")?;
+        let mut stmt = self.c.prepare(
+            "SELECT ticket FROM contract_exit_payouts WHERE contract = ?1 ORDER BY height",
+        )?;
         let tickets = stmt.query_map([id], |r| r.get(0))?;
         Ok(tickets.collect::<rusqlite::Result<_>>()?)
     }
@@ -497,23 +432,18 @@ impl Store {
     /// Contract `id` closed early by the fold `txid`, before the hub can
     /// sign it.
     pub fn fold(&self, id: &[u8; 32], txid: &Txid) -> Result<()> {
-        self.c.execute_batch(FOLDS)?;
         self.c.execute(
-            "INSERT INTO folds (id, txid, created_at) VALUES (?1, ?2, ?3)
+            "INSERT INTO contract_folds (id, txid, created_at) VALUES (?1, ?2, ?3)
              ON CONFLICT (id) DO UPDATE SET txid = ?2, created_at = ?3",
             params![id, serialize(txid), crate::now()],
         )?;
         Ok(())
     }
 
-    /// The most the hub of each contract may charge her: none of a
-    /// contract opened before these were kept, nor of one whose own
-    /// cannot be read.
+    /// The most the hub of each contract may charge her: none of one whose
+    /// own cannot be read.
     pub fn ceilings(&self) -> Result<HashMap<[u8; 32], Fees>> {
-        if !self.keeps_ceilings()? {
-            return Ok(HashMap::new());
-        }
-        let mut stmt = self.c.prepare("SELECT id, fees FROM ceilings")?;
+        let mut stmt = self.c.prepare("SELECT id, ceiling_fees FROM contracts")?;
         let rows = stmt.query_map([], |r| {
             Ok((r.get::<_, [u8; 32]>(0)?, r.get::<_, String>(1)?))
         })?;
@@ -533,20 +463,18 @@ impl Store {
         Ok(all)
     }
 
-    /// Raise the ceilings of each of `ids` that keeps some to `fees`, fee
-    /// by fee: none lowered, and none made for a contract that keeps
-    /// none. How many were raised.
+    /// Raise the ceilings of each of `ids` to `fees`, fee by fee: none
+    /// lowered. How many were raised.
     pub fn raise_ceilings(&self, ids: &[[u8; 32]], fees: &Fees) -> Result<usize> {
-        if !self.keeps_ceilings()? {
-            return Ok(0);
-        }
         let t = rusqlite::Transaction::new_unchecked(&self.c, TransactionBehavior::Immediate)?;
         let mut raised = 0;
         for id in ids {
             let kept: Option<String> = t
-                .query_row("SELECT fees FROM ceilings WHERE id = ?1", [id], |r| {
-                    r.get(0)
-                })
+                .query_row(
+                    "SELECT ceiling_fees FROM contracts WHERE id = ?1",
+                    [id],
+                    |r| r.get(0),
+                )
                 .optional()?;
             let Some(was) = kept.and_then(|text| serde_json::from_str::<Fees>(&text).ok()) else {
                 continue;
@@ -557,7 +485,7 @@ impl Store {
             }
             let (from, to) = (serde_json::to_string(&was)?, serde_json::to_string(&now)?);
             t.execute(
-                "UPDATE ceilings SET fees = ?2, updated_at = ?3 WHERE id = ?1",
+                "UPDATE contracts SET ceiling_fees = ?2, ceiling_updated_at = ?3 WHERE id = ?1",
                 params![id, to, crate::now()],
             )?;
             tracing::info!(id = %crate::hex_id(id), %from, %to, "a contract's fee ceilings raised");
@@ -569,18 +497,8 @@ impl Store {
 
     /// Each contract's claim terms kept, by id.
     pub(super) fn claim_terms(&self) -> Result<HashMap<[u8; 32], KeptTerms>> {
-        let made: Option<i64> = (self.c)
-            .query_row(
-                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'claim_terms'",
-                [],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if made.is_none() {
-            return Ok(HashMap::new());
-        }
-        let mut stmt =
-            (self.c).prepare("SELECT id, keyset, authorizations, program FROM claim_terms")?;
+        let mut stmt = (self.c)
+            .prepare("SELECT id, keyset, authorizations, program FROM contract_claim_terms")?;
         let rows = stmt.query_map([], |r| {
             let terms = KeptTerms {
                 keyset: r.get(1)?,
@@ -595,9 +513,8 @@ impl Store {
     /// Keep the claim terms of `id`, as its state has them: of a contract
     /// it keeps only, once.
     pub(super) fn keep_claim_terms(&self, id: &[u8; 32], terms: &KeptTerms) -> Result<()> {
-        self.c.execute_batch(CLAIM_TERMS)?;
         self.c.execute(
-            "INSERT OR IGNORE INTO claim_terms (id, keyset, authorizations, program)
+            "INSERT OR IGNORE INTO contract_claim_terms (id, keyset, authorizations, program)
              SELECT ?1, ?2, ?3, ?4 WHERE EXISTS (SELECT 1 FROM contracts WHERE id = ?1)",
             params![id, terms.keyset, terms.authorizations, terms.program],
         )?;
@@ -636,7 +553,7 @@ impl Store {
     }
 
     /// F of contract `id` found to be `fate`: if live, in `block`, its
-    /// height and hash, followed from then on ([`FATE_BLOCKS`]).
+    /// height and hash, followed from then on ([`SCHEMA`]'s `contract_fate_blocks`).
     pub fn settle_fate(
         &self,
         id: &[u8; 32],
@@ -650,9 +567,8 @@ impl Store {
         )?;
         match block.filter(|_| fate == Fate::Live) {
             Some((height, hash)) => {
-                t.execute_batch(FATE_BLOCKS)?;
                 t.execute(
-                    "INSERT INTO fate_blocks (id, height, hash) VALUES (?1, ?2, ?3)
+                    "INSERT INTO contract_fate_blocks (id, height, hash) VALUES (?1, ?2, ?3)
                      ON CONFLICT (id) DO UPDATE SET height = ?2, hash = ?3",
                     params![id, height, bitcoin::hashes::Hash::as_byte_array(&hash)],
                 )?;
@@ -666,13 +582,10 @@ impl Store {
     /// The block F of contract `id` was found buried in, its height and
     /// hash, while followed.
     pub fn fate_block(&self, id: &[u8; 32]) -> Result<Option<(u32, BlockHash)>> {
-        if !self.has("fate_blocks")? {
-            return Ok(None);
-        }
         let row: Option<(u32, [u8; 32])> = self
             .c
             .query_row(
-                "SELECT height, hash FROM fate_blocks WHERE id = ?1",
+                "SELECT height, hash FROM contract_fate_blocks WHERE id = ?1",
                 [id],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
@@ -736,22 +649,15 @@ impl Store {
 
     /// Every contract, the newest first.
     pub fn list(&self) -> Result<Vec<Contract>> {
-        let folds = match self.has("folds")? {
-            true => "(SELECT txid FROM folds WHERE folds.id = contracts.id)",
-            false => "NULL",
-        };
-        let funded = match self.has("funded")? {
-            true => {
-                "(SELECT amount FROM funded WHERE funded.id = contracts.id),
-                 (SELECT received_at IS NOT NULL FROM funded WHERE funded.id = contracts.id)"
-            }
-            false => "NULL, NULL",
-        };
-        let mut stmt = self.c.prepare(&format!(
+        let mut stmt = self.c.prepare(
             "SELECT id, hub, phase, mock, deposit, value, price, cap, assert_height,
-                    close_height, funding, fate, abandoned, created_at, since, {folds}, {funded}
-             FROM contracts ORDER BY created_at DESC, id"
-        ))?;
+                    close_height, funding, fate, abandoned, created_at, since,
+                    (SELECT txid FROM contract_folds WHERE contract_folds.id = contracts.id),
+                    (SELECT amount FROM contract_funded WHERE contract_funded.id = contracts.id),
+                    (SELECT received_at IS NOT NULL FROM contract_funded
+                     WHERE contract_funded.id = contracts.id)
+             FROM contracts ORDER BY created_at DESC, id",
+        )?;
         let rows = stmt.query_map([], |r| {
             Ok((
                 r.get::<_, [u8; 32]>(0)?,
@@ -840,15 +746,8 @@ impl Store {
         Ok(())
     }
 
-    fn version(&self) -> Result<i64> {
-        Ok(self
-            .c
-            .pragma_query_value(None, "user_version", |r| r.get(0))?)
-    }
-
     /// Start recovering contract `id`, at `stage` with `state`, made
-    /// revocable: false if it is recovering already. The file of version 2
-    /// from the first on, in the same write.
+    /// revocable: false if it is recovering already.
     pub fn start_recovery(
         &self,
         id: &[u8; 32],
@@ -857,22 +756,13 @@ impl Store {
         state: &[u8],
     ) -> Result<bool> {
         let t = rusqlite::Transaction::new_unchecked(&self.c, TransactionBehavior::Immediate)?;
-        let version: i64 = t.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        match version {
-            1 => {
-                t.execute_batch(RECOVERIES)?;
-                t.pragma_update(None, "user_version", 2)?;
-            }
-            2 => {}
-            v => bail!("contracts.sqlite of version {v} keeps no recoveries"),
-        }
         let known: Option<i64> = t
             .query_row("SELECT 1 FROM contracts WHERE id = ?1", [id], |r| r.get(0))
             .optional()?;
         ensure!(known.is_some(), "no contract {}", crate::hex_id(id));
         let now = crate::now();
         let started = t.execute(
-            "INSERT OR IGNORE INTO recoveries (id, format, stage, irrevocable, state, created_at,
+            "INSERT OR IGNORE INTO contract_recoveries (id, format, stage, irrevocable, state, created_at,
                                                updated_at)
              VALUES (?1, ?2, ?3, 0, ?4, ?5, ?5)",
             params![id, format, stage, state, now],
@@ -894,7 +784,7 @@ impl Store {
         state: &[u8],
     ) -> Result<bool> {
         let saved = self.c.execute(
-            "UPDATE recoveries SET stage = ?4, state = ?5, irrevocable = max(irrevocable, ?6),
+            "UPDATE contract_recoveries SET stage = ?4, state = ?5, irrevocable = max(irrevocable, ?6),
                                    error = NULL, updated_at = ?7
              WHERE id = ?1 AND stage = ?2 AND state = ?3",
             params![id, from, was, to, state, irrevocable, crate::now()],
@@ -906,11 +796,8 @@ impl Store {
     /// while revocable: giving it up, before its notes are given back.
     /// False if it is irrevocable, or none is.
     pub fn revoke_recovery(&self, id: &[u8; 32], to: &str, error: Option<&str>) -> Result<bool> {
-        if self.version()? < 2 {
-            return Ok(false);
-        }
         let revoked = self.c.execute(
-            "UPDATE recoveries SET stage = ?2, error = ?3, updated_at = ?4
+            "UPDATE contract_recoveries SET stage = ?2, error = ?3, updated_at = ?4
              WHERE id = ?1 AND irrevocable = 0",
             params![id, to, error, crate::now()],
         )?;
@@ -920,7 +807,7 @@ impl Store {
     /// What stopped recovery `id`'s last step, or none.
     pub fn recovery_error(&self, id: &[u8; 32], error: Option<&str>) -> Result<()> {
         self.c.execute(
-            "UPDATE recoveries SET error = ?2, updated_at = ?3 WHERE id = ?1",
+            "UPDATE contract_recoveries SET error = ?2, updated_at = ?3 WHERE id = ?1",
             params![id, error, crate::now()],
         )?;
         Ok(())
@@ -929,11 +816,8 @@ impl Store {
     /// Forget recovery `id`, given up: never one irrevocable. False if it
     /// is, or none was.
     pub fn drop_recovery(&self, id: &[u8; 32]) -> Result<bool> {
-        if self.version()? < 2 {
-            return Ok(false);
-        }
         let dropped = self.c.execute(
-            "DELETE FROM recoveries WHERE id = ?1 AND irrevocable = 0",
+            "DELETE FROM contract_recoveries WHERE id = ?1 AND irrevocable = 0",
             [id],
         )?;
         Ok(dropped == 1)
@@ -942,12 +826,9 @@ impl Store {
     /// The tips recovery `id` saw, each its height and hash, the newest
     /// first ([`RECOVERY_TIPS`]).
     pub fn recovery_tips(&self, id: &[u8; 32]) -> Result<Vec<(u32, BlockHash)>> {
-        if !self.has("recovery_tips")? {
-            return Ok(Vec::new());
-        }
-        let mut q = self
-            .c
-            .prepare("SELECT height, hash FROM recovery_tips WHERE id = ?1 ORDER BY height DESC")?;
+        let mut q = self.c.prepare(
+            "SELECT height, hash FROM contract_recovery_tips WHERE id = ?1 ORDER BY height DESC",
+        )?;
         let rows = q.query_map([id], |r| {
             Ok((r.get::<_, u32>(0)?, r.get::<_, [u8; 32]>(1)?))
         })?;
@@ -967,10 +848,9 @@ impl Store {
     /// one shows of the chain stays to be looked at.
     pub fn see_recovery_tip(&self, id: &[u8; 32], height: u32, hash: BlockHash) -> Result<()> {
         let t = rusqlite::Transaction::new_unchecked(&self.c, TransactionBehavior::Immediate)?;
-        t.execute_batch(RECOVERY_TIPS)?;
         let higher: Option<i64> = t
             .query_row(
-                "SELECT 1 FROM recovery_tips WHERE id = ?1 AND height >= ?2",
+                "SELECT 1 FROM contract_recovery_tips WHERE id = ?1 AND height >= ?2",
                 params![id, height],
                 |r| r.get(0),
             )
@@ -979,7 +859,7 @@ impl Store {
             return Ok(());
         }
         t.execute(
-            "INSERT INTO recovery_tips (id, height, hash) VALUES (?1, ?2, ?3)",
+            "INSERT INTO contract_recovery_tips (id, height, hash) VALUES (?1, ?2, ?3)",
             params![
                 id,
                 height,
@@ -987,7 +867,7 @@ impl Store {
             ],
         )?;
         let heights: Vec<u32> = t
-            .prepare("SELECT height FROM recovery_tips WHERE id = ?1 ORDER BY height")?
+            .prepare("SELECT height FROM contract_recovery_tips WHERE id = ?1 ORDER BY height")?
             .query_map([id], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?;
         let mut last = None;
@@ -996,7 +876,7 @@ impl Store {
             let band = u64::BITS - back.leading_zeros();
             if last == Some(band) {
                 t.execute(
-                    "DELETE FROM recovery_tips WHERE id = ?1 AND height = ?2",
+                    "DELETE FROM contract_recovery_tips WHERE id = ?1 AND height = ?2",
                     params![id, h],
                 )?;
             }
@@ -1009,12 +889,10 @@ impl Store {
     /// The tips recovery `id` saw above `height` forgotten: of a chain
     /// replaced since.
     pub fn forget_recovery_tips(&self, id: &[u8; 32], height: u32) -> Result<()> {
-        if self.has("recovery_tips")? {
-            self.c.execute(
-                "DELETE FROM recovery_tips WHERE id = ?1 AND height > ?2",
-                params![id, height],
-            )?;
-        }
+        self.c.execute(
+            "DELETE FROM contract_recovery_tips WHERE id = ?1 AND height > ?2",
+            params![id, height],
+        )?;
         Ok(())
     }
 
@@ -1023,14 +901,11 @@ impl Store {
         Ok(self.recoveries()?.into_iter().find(|r| &r.id == id))
     }
 
-    /// Every recovery, the oldest first: none in a file of version 1.
+    /// Every recovery, the oldest first.
     pub fn recoveries(&self) -> Result<Vec<RecoveryRow>> {
-        if self.version()? < 2 {
-            return Ok(Vec::new());
-        }
         let mut stmt = self.c.prepare(
             "SELECT id, format, stage, irrevocable, state, error, created_at
-             FROM recoveries ORDER BY created_at, id",
+             FROM contract_recoveries ORDER BY created_at, id",
         )?;
         let rows = stmt.query_map([], |r| {
             Ok(RecoveryRow {
@@ -1047,27 +922,28 @@ impl Store {
     }
 }
 
-fn insert(c: &Connection, new: &New<'_>) -> Result<()> {
+fn insert(c: &Connection, new: &New<'_>, fees: &Fees) -> Result<()> {
     let now = crate::now();
     c.execute(
         "INSERT INTO contracts (id, hub, format, phase, mock, irrevocable, deposit, value, price, cap,
                                 assert_height, close_height, since, state, created_at,
-                                updated_at)
-         VALUES (?1, ?2, ?3, 0, ?4, 0, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13)",
+                                updated_at, ceiling_fees, ceiling_updated_at)
+         VALUES (?1, ?2, ?3, 0, ?4, 0, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13, ?14, ?13)",
         params![
             new.id,
             new.hub,
             FORMAT,
             new.mock,
             serialize(&new.deposit),
-            new.value as i64,
-            new.price as i64,
+            i64::try_from(new.value)?,
+            i64::try_from(new.price)?,
             new.cap,
             new.assert_height,
             new.close_height,
             new.since,
             new.state,
-            now
+            now,
+            serde_json::to_string(fees)?
         ],
     )?;
     Ok(())
@@ -1075,16 +951,7 @@ fn insert(c: &Connection, new: &New<'_>) -> Result<()> {
 
 /// The block of contract `id`'s F no longer followed, if it was.
 fn unfollow(c: &Connection, id: &[u8; 32]) -> Result<()> {
-    let made: Option<i64> = c
-        .query_row(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'fate_blocks'",
-            [],
-            |r| r.get(0),
-        )
-        .optional()?;
-    if made.is_some() {
-        c.execute("DELETE FROM fate_blocks WHERE id = ?1", [id])?;
-    }
+    c.execute("DELETE FROM contract_fate_blocks WHERE id = ?1", [id])?;
     Ok(())
 }
 
@@ -1137,17 +1004,21 @@ mod tests {
     #[test]
     fn nothing_is_made_until_a_contract_opens() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(Store::existing(dir.path()).unwrap().is_none());
+        assert!(Store::existing(&crate::testing::wallet_file(dir.path()))
+            .unwrap()
+            .is_none());
         assert!(!dir.path().join("contracts.sqlite").exists());
-        let store = Store::open(dir.path()).unwrap();
+        let store = Store::open(&crate::testing::wallet_file(dir.path())).unwrap();
         assert!(store.list().unwrap().is_empty());
-        assert!(Store::existing(dir.path()).unwrap().is_some());
+        assert!(Store::existing(&crate::testing::wallet_file(dir.path()))
+            .unwrap()
+            .is_some());
     }
 
     #[test]
     fn contracts_list_as_stored_the_newest_first() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
+        let store = Store::open(&crate::testing::wallet_file(dir.path())).unwrap();
         store.insert(&new(1, coin(0))).unwrap();
         store.insert(&new(2, coin(1))).unwrap();
         let f = Txid::from_byte_array([5; 32]);
@@ -1177,11 +1048,10 @@ mod tests {
     #[test]
     fn a_contract_folded_protects_nothing_and_is_over_by_its_last_fold() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
+        let store = Store::open(&crate::testing::wallet_file(dir.path())).unwrap();
         store.insert(&new(1, coin(0))).unwrap();
         store.set_fate(&[1; 32], Fate::Live).unwrap();
-        // No table yet: none folded.
-        assert!(!store.has("folds").unwrap());
+        // None folded.
         assert_eq!(store.list().unwrap()[0].folded, None);
         let fold = Txid::from_byte_array([7; 32]);
         store.fold(&[1; 32], &fold).unwrap();
@@ -1198,7 +1068,7 @@ mod tests {
     #[test]
     fn a_coin_is_the_deposit_of_one_live_contract_at_most() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
+        let store = Store::open(&crate::testing::wallet_file(dir.path())).unwrap();
         store.insert(&new(1, coin(0))).unwrap();
         assert!(store.insert(&new(2, coin(0))).is_err());
         store.abandon(&[1; 32], "refused").unwrap();
@@ -1213,7 +1083,7 @@ mod tests {
     #[test]
     fn a_contract_she_signed_is_never_given_up() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
+        let store = Store::open(&crate::testing::wallet_file(dir.path())).unwrap();
         store.insert(&new(1, coin(0))).unwrap();
         store.keep(&[1; 32], 0, 2, b"instance").unwrap();
         store
@@ -1232,7 +1102,7 @@ mod tests {
     #[test]
     fn what_a_contract_given_up_kept_goes() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
+        let store = Store::open(&crate::testing::wallet_file(dir.path())).unwrap();
         store.insert(&new(1, coin(0))).unwrap();
         store.keep(&[1; 32], 1, 3, b"instance").unwrap();
         let kept = dir.path().join("contracts").join(crate::hex_id(&[1; 32]));
@@ -1247,16 +1117,21 @@ mod tests {
         store.forget(&[1; 32]).unwrap();
     }
 
-    fn user_version(dir: &Path) -> i64 {
-        let c = Connection::open(dir.join("contracts.sqlite")).unwrap();
-        c.pragma_query_value(None, "user_version", |r| r.get(0))
-            .unwrap()
-    }
-
     #[test]
-    fn a_file_stays_of_version_1_until_she_forces_a_contract_closed() {
+    fn nothing_is_made_by_reading_and_a_recovery_starts_once_for_a_known_contract() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
+        let file = crate::testing::wallet_file(dir.path());
+        // A wallet's file that never opened a contract holds none, and
+        // reading it makes none.
+        assert!(Store::existing(&file).unwrap().is_none());
+        let c = licash_store::open(&file, Kind::Wallet).unwrap();
+        assert_eq!(
+            licash_store::component_version(&c, COMPONENT).unwrap(),
+            None
+        );
+        drop(c);
+
+        let store = Store::open(&file).unwrap();
         store.insert(&new(1, coin(0))).unwrap();
         store
             .save(&[1; 32], Phase::Funded, None, b"funded")
@@ -1265,15 +1140,12 @@ mod tests {
         let before = store.list().unwrap();
         drop(store);
         // Opened, listed, read: as it was.
-        let store = Store::open(dir.path()).unwrap();
+        let store = Store::existing(&file).unwrap().unwrap();
         assert!(store.recoveries().unwrap().is_empty());
         assert!(store.recovery(&[1; 32]).unwrap().is_none());
         assert!(!store.drop_recovery(&[1; 32]).unwrap());
-        assert_eq!(user_version(dir.path()), 1);
 
-        // Her first: version 2, the contracts as they were.
         assert!(store.start_recovery(&[1; 32], 1, "claiming", b"s").unwrap());
-        assert_eq!(user_version(dir.path()), 2);
         assert_eq!(store.list().unwrap(), before);
         assert_eq!(store.state(&[1; 32]).unwrap(), (b"funded".to_vec(), 200));
         let row = store.recovery(&[1; 32]).unwrap().unwrap();
@@ -1284,8 +1156,8 @@ mod tests {
         assert_eq!(store.recovery(&[1; 32]).unwrap().unwrap().state, b"s");
         drop(store);
 
-        // Reopened, of version 2.
-        let store = Store::open(dir.path()).unwrap();
+        // Reopened.
+        let store = Store::open(&file).unwrap();
         assert_eq!(store.recoveries().unwrap().len(), 1);
         // Of a contract it does not know: refused.
         assert!(store.start_recovery(&[2; 32], 1, "claiming", b"s").is_err());
@@ -1302,16 +1174,9 @@ mod tests {
     }
 
     #[test]
-    fn ceilings_are_kept_with_a_contract_and_leave_the_file_as_older_builds_open_it() {
+    fn ceilings_are_kept_with_a_contract_and_a_refused_one_keeps_neither() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
-        // Opened before they were kept: none, nothing made, none raised.
-        store.insert(&new(1, coin(0))).unwrap();
-        assert!(store.ceilings().unwrap().is_empty());
-        assert!(!store.keeps_ceilings().unwrap());
-        assert_eq!(store.raise_ceilings(&[[1; 32]], &fees(9, 9, 9)).unwrap(), 0);
-        assert!(!store.keeps_ceilings().unwrap());
-
+        let store = Store::open(&crate::testing::wallet_file(dir.path())).unwrap();
         let agreed = fees(1, 100, 100);
         store.insert_under(&new(2, coin(1)), &agreed, 0).unwrap();
         assert_eq!(
@@ -1322,25 +1187,19 @@ mod tests {
         assert!(store
             .insert_under(&new(3, coin(1)), &fees(0, 0, 0), 0)
             .is_err());
-        assert_eq!(store.list().unwrap().len(), 2);
+        assert_eq!(store.list().unwrap().len(), 1);
         assert_eq!(store.ceilings().unwrap().len(), 1);
-        // Of the version it was, and of the next at her first recovery.
-        assert_eq!(user_version(dir.path()), 1);
-        drop(store);
-        let store = Store::open(dir.path()).unwrap();
-        assert!(store.start_recovery(&[2; 32], 1, "claiming", b"s").unwrap());
-        assert_eq!(user_version(dir.path()), 2);
         assert_eq!(store.ceilings().unwrap()[&[2; 32]], agreed);
         store.insert_under(&new(4, coin(2)), &agreed, 0).unwrap();
         assert_eq!(store.ceilings().unwrap().len(), 2);
     }
 
     #[test]
-    fn claim_terms_are_kept_once_beside_a_file_of_the_version_it_was() {
+    fn claim_terms_are_kept_once_for_a_contract_it_knows() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
+        let store = Store::open(&crate::testing::wallet_file(dir.path())).unwrap();
         store.insert(&new(1, coin(0))).unwrap();
-        // None kept: no table made by reading.
+        // None kept.
         assert!(store.claim_terms().unwrap().is_empty());
         let terms = |keyset, authorizations, program| KeptTerms {
             keyset,
@@ -1361,17 +1220,18 @@ mod tests {
             .keep_claim_terms(&[2; 32], &terms([7; 32], 1, [5; 32]))
             .unwrap();
         assert_eq!(store.claim_terms().unwrap(), kept);
-        assert_eq!(user_version(dir.path()), 1);
         drop(store);
-        let store = Store::open(dir.path()).unwrap();
+        let store = Store::open(&crate::testing::wallet_file(dir.path())).unwrap();
         assert_eq!(store.claim_terms().unwrap(), kept);
     }
 
     #[test]
     fn ceilings_are_raised_fee_by_fee_and_never_lowered() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
-        store.insert(&new(1, coin(0))).unwrap();
+        let store = Store::open(&crate::testing::wallet_file(dir.path())).unwrap();
+        store
+            .insert_under(&new(1, coin(0)), &fees(2, 80, 100), 0)
+            .unwrap();
         store
             .insert_under(&new(2, coin(1)), &fees(1, 100, 100), 0)
             .unwrap();
@@ -1381,12 +1241,13 @@ mod tests {
         store
             .insert_under(&new(4, coin(3)), &fees(0, 0, 0), 0)
             .unwrap();
-        // Of those named only, and only those it raises: the one that
-        // kept none keeps none.
+        // Of those named only, and only those it raises: the first holds
+        // as much already.
         let all = [[1; 32], [2; 32], [3; 32]];
         assert_eq!(store.raise_ceilings(&all, &fees(2, 80, 100)).unwrap(), 2);
         let kept = store.ceilings().unwrap();
-        assert_eq!(kept.len(), 3);
+        assert_eq!(kept.len(), 4);
+        assert_eq!(kept[&[1; 32]], fees(2, 80, 100));
         assert_eq!(kept[&[2; 32]], fees(2, 100, 100));
         assert_eq!(kept[&[3; 32]], fees(5, 80, 100));
         assert_eq!(kept[&[4; 32]], fees(0, 0, 0));
@@ -1398,7 +1259,7 @@ mod tests {
     #[test]
     fn ceilings_that_cannot_be_read_are_as_none_kept() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
+        let store = Store::open(&crate::testing::wallet_file(dir.path())).unwrap();
         store
             .insert_under(&new(1, coin(0)), &fees(1, 100, 100), 0)
             .unwrap();
@@ -1408,7 +1269,7 @@ mod tests {
         store
             .c
             .execute(
-                "UPDATE ceilings SET fees = 'not fees' WHERE id = ?1",
+                "UPDATE contracts SET ceiling_fees = 'not fees' WHERE id = ?1",
                 [[1u8; 32]],
             )
             .unwrap();
@@ -1422,23 +1283,30 @@ mod tests {
     }
 
     #[test]
-    fn a_file_of_a_version_newer_than_it_knows_is_refused() {
+    fn contracts_of_a_version_newer_than_it_knows_are_refused() {
         let dir = tempfile::tempdir().unwrap();
-        drop(Store::open(dir.path()).unwrap());
-        let c = Connection::open(dir.path().join("contracts.sqlite")).unwrap();
-        c.pragma_update(None, "user_version", 3).unwrap();
+        let file = crate::testing::wallet_file(dir.path());
+        drop(Store::open(&file).unwrap());
+        let c = Connection::open(&file).unwrap();
+        c.execute(
+            "UPDATE schema_versions SET version = 3 WHERE component = 'contracts'",
+            [],
+        )
+        .unwrap();
         drop(c);
-        let refused = Store::open(dir.path()).err().unwrap();
+        let refused = Store::open(&file).err().unwrap();
         assert!(format!("{refused:#}").contains("version 3"), "{refused:#}");
+        // The file is not the holder's to make again.
+        assert!(Store::existing(&file).is_err());
     }
 
     #[test]
     fn a_recovery_keeps_the_tips_it_saw_thinned_out_and_none_past_one_higher() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
+        let store = Store::open(&crate::testing::wallet_file(dir.path())).unwrap();
         store.insert(&new(1, coin(0))).unwrap();
         let id = [1; 32];
-        // None kept, as of a build before: no table, nothing forgotten.
+        // None kept, nothing forgotten.
         assert!(store.recovery_tips(&id).unwrap().is_empty());
         store.forget_recovery_tips(&id, 0).unwrap();
         let hash = |h: u32| <BlockHash as bitcoin::hashes::Hash>::hash(&h.to_le_bytes());
@@ -1475,7 +1343,7 @@ mod tests {
     #[test]
     fn a_recovery_moves_on_one_stage_at_a_time_and_is_dropped_only_while_revocable() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
+        let store = Store::open(&crate::testing::wallet_file(dir.path())).unwrap();
         store.insert(&new(1, coin(0))).unwrap();
         store.start_recovery(&[1; 32], 1, "a", b"0").unwrap();
         store.recovery_error(&[1; 32], Some("offline")).unwrap();
@@ -1520,10 +1388,11 @@ mod tests {
     }
 
     #[test]
-    fn a_snapshot_preserves_the_selected_mode_pinned_proof_and_irrevocable_row() {
+    fn a_snapshot_of_the_wallets_file_preserves_the_selected_mode_pinned_proof_and_irrevocable_row()
+    {
         let dir = tempfile::tempdir().unwrap();
         let copy = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
+        let store = Store::open(&crate::testing::wallet_file(dir.path())).unwrap();
         store.insert(&new(1, coin(0))).unwrap();
         let state = br#"{"amount":4096,"reduced":0}"#;
         store.start_recovery(&[1; 32], 2, "signing", state).unwrap();
@@ -1531,22 +1400,20 @@ mod tests {
             .save_recovery(&[1; 32], ("signing", state), "signing", true, state)
             .unwrap());
         super::super::recovery::validate_backup(&store).unwrap();
-        store
-            .snapshot(&copy.path().join("contracts.sqlite"))
-            .unwrap();
-        let copied = Store::existing(copy.path()).unwrap().unwrap();
+        // One snapshot of the wallet's file is the contracts' too.
+        let to = copy.path().join("snapshot.sqlite");
+        licash_store::backup(&store.c, &to).unwrap();
+        let copied = Store::existing(&to).unwrap().unwrap();
         let row = copied.recovery(&[1; 32]).unwrap().unwrap();
         assert_eq!(row.state, state);
         assert!(row.irrevocable);
         assert_eq!(row.stage, "signing");
         assert!(!copied.drop_recovery(&[1; 32]).unwrap());
-        assert!(store
-            .snapshot(&copy.path().join("contracts.sqlite"))
-            .is_err());
+        assert!(licash_store::backup(&store.c, &to).is_err());
         store
             .c
             .execute(
-                "UPDATE recoveries SET state = ?1",
+                "UPDATE contract_recoveries SET state = ?1",
                 [br#"{"future_field":1}"#.as_slice()],
             )
             .unwrap();
@@ -1557,17 +1424,17 @@ mod tests {
     #[test]
     fn the_instances_an_opening_kept_are_counted_once_written_whole() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
+        let store = Store::open(&crate::testing::wallet_file(dir.path())).unwrap();
         store.insert(&new(1, coin(0))).unwrap();
-        assert_eq!(kept(dir.path(), &[1; 32]), 0);
+        assert_eq!(kept(&crate::testing::wallet_file(dir.path()), &[1; 32]), 0);
         store.keep(&[1; 32], 0, 1, b"instance").unwrap();
         store.keep(&[1; 32], 1, 3, b"instance").unwrap();
         // One being written, as a stop leaves it: not yet.
         let aside = dir.path().join("contracts").join(crate::hex_id(&[1; 32]));
         std::fs::write(aside.join("1-0.new"), b"inst").unwrap();
-        assert_eq!(kept(dir.path(), &[1; 32]), 2);
-        assert_eq!(kept(dir.path(), &[2; 32]), 0);
+        assert_eq!(kept(&crate::testing::wallet_file(dir.path()), &[1; 32]), 2);
+        assert_eq!(kept(&crate::testing::wallet_file(dir.path()), &[2; 32]), 0);
         store.forget(&[1; 32]).unwrap();
-        assert_eq!(kept(dir.path(), &[1; 32]), 0);
+        assert_eq!(kept(&crate::testing::wallet_file(dir.path()), &[1; 32]), 0);
     }
 }

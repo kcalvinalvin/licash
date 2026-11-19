@@ -60,15 +60,15 @@ pub struct Kept {
 /// Take each lock owed to the wallet ([`OwedLock`]) a step on, at the
 /// tip of `chain`: as it nears its expiry unpaid, ask its hub once more,
 /// then activate it on Bitcoin with a coin of hers free of contracts in
-/// `dir`, at `rate`; record its activation once confirmed, and forget it
+/// `wallet_file`, at `rate`; record its activation once confirmed, and forget it
 /// should its block leave the chain.
 pub async fn keep<T: Transport, C: Chain>(
     wallet: &Wallet<T>,
     chain: &C,
-    dir: &Path,
+    wallet_file: &Path,
     rate: FeeRate,
 ) -> Result<Vec<Kept>> {
-    let Some(store) = Store::existing(dir)? else {
+    let Some(store) = Store::existing(wallet_file)? else {
         return Ok(vec![]);
     };
     let owed: Vec<OwedLock> = (wallet.owed_locks()?.into_iter())
@@ -81,7 +81,7 @@ pub async fn keep<T: Transport, C: Chain>(
     let mut kept = Vec::new();
     for o in &owed {
         let id = hex::encode(o.id.as_bytes());
-        match step(wallet, chain, &store, dir, o, tip, rate).await {
+        match step(wallet, chain, &store, wallet_file, o, tip, rate).await {
             Ok(Some(step)) => {
                 tracing::info!(lock = %id, step, "a lock owed to her");
                 kept.push(Kept {
@@ -108,7 +108,7 @@ async fn step<T: Transport, C: Chain>(
     wallet: &Wallet<T>,
     chain: &C,
     store: &Store,
-    dir: &Path,
+    wallet_file: &Path,
     o: &OwedLock,
     tip: u32,
     rate: FeeRate,
@@ -195,7 +195,7 @@ async fn step<T: Transport, C: Chain>(
     if tip >= last {
         return Ok(Some("late"));
     }
-    if claimant(wallet, store, dir, o, tip)?.is_none() {
+    if claimant(wallet, store, wallet_file, o, tip)?.is_none() {
         return Ok(Some("unprotected"));
     }
     // Its hub knows the preimage already: it may pay it still.
@@ -211,7 +211,7 @@ async fn step<T: Transport, C: Chain>(
     if fee.to_sat() >= value {
         return Ok(Some("unworthy"));
     }
-    let coin = (super::coin(wallet, dir, fee.to_sat())?)
+    let coin = (super::coin(wallet, wallet_file, fee.to_sat())?)
         .context("no coin of hers free to activate the lock with")?;
     let tx = wallet.spend_silent_coin(script, coin.outpoint, Some(0), rate)?;
     if let Err(e) = chain.broadcast(&tx).await {
@@ -312,24 +312,24 @@ pub const PROTECTING: u32 = 36;
 
 /// Whether a Lightning receipt of `amount` at the hub at `url` is worth
 /// protecting at `tip` ([`Wallet::invoice_protected`]): a contract of hers
-/// in `dir` at that hub would claim its lock's notes should the hub keep
+/// in `wallet_file` at that hub would claim its lock's notes should the hub keep
 /// them (one live, not under recovery, of a Base valuing a pay branch by
 /// its activation, whose forced close her exit plans [`PROTECTING`]
 /// blocks on at the earliest), and a coin of hers free of contracts
 /// activates the lock at `rate` for less than `amount`.
 pub fn protects<T: Transport>(
     wallet: &Wallet<T>,
-    dir: &Path,
+    wallet_file: &Path,
     url: &str,
     amount: u64,
     rate: FeeRate,
     tip: u32,
 ) -> Result<bool> {
-    let Some(store) = Store::existing(dir)? else {
+    let Some(store) = Store::existing(wallet_file)? else {
         return Ok(false);
     };
     let fee = (rate.fee_vb(ACTIVATION_VB)).context("an activation's fee overflows")?;
-    if amount <= fee.to_sat() || super::coin(wallet, dir, fee.to_sat())?.is_none() {
+    if amount <= fee.to_sat() || super::coin(wallet, wallet_file, fee.to_sat())?.is_none() {
         return Ok(false);
     }
     let urls = wallet.hub_urls(url)?;
@@ -346,7 +346,7 @@ pub fn protects<T: Transport>(
         let (state, _) = store.state(&c.id)?;
         let opening = Holder::load(&state, &seed, &ctx)?.signed()?;
         if opening.base.version().anchored()
-            && exit::planned_force_at(&seed, network, dir, &c.id, tip)?
+            && exit::planned_force_at(&seed, network, wallet_file, &c.id, tip)?
                 >= tip.saturating_add(PROTECTING)
         {
             return Ok(true);
@@ -355,7 +355,7 @@ pub fn protects<T: Transport>(
     Ok(false)
 }
 
-/// The contract of hers in `dir` that claims owed lock `o` once
+/// The contract of hers in `wallet_file` that claims owed lock `o` once
 /// activated, at `tip`: of those at its hub protecting notes, not under
 /// recovery, of a Base of its keyset valuing a pay branch by its
 /// activation, whose checkpoint is no later than its anchor (its claim's
@@ -365,7 +365,7 @@ pub fn protects<T: Transport>(
 pub(super) fn claimant<T: Transport>(
     wallet: &Wallet<T>,
     store: &Store,
-    dir: &Path,
+    wallet_file: &Path,
     o: &OwedLock,
     tip: u32,
 ) -> Result<Option<[u8; 32]>> {
@@ -394,7 +394,7 @@ pub(super) fn claimant<T: Transport>(
         {
             continue;
         }
-        let force_at = exit::planned_force_at(&seed, network, dir, &c.id, tip)?;
+        let force_at = exit::planned_force_at(&seed, network, wallet_file, &c.id, tip)?;
         if force_at >= after && last.is_none_or(|(at, _)| force_at > at) {
             last = Some((force_at, c.id));
         }
@@ -408,7 +408,7 @@ pub(super) fn claimant<T: Transport>(
 pub(super) fn at_stake<T: Transport>(
     wallet: &Wallet<T>,
     store: &Store,
-    dir: &Path,
+    wallet_file: &Path,
     tip: u32,
 ) -> Result<HashMap<[u8; 32], u64>> {
     let mut stake = HashMap::new();
@@ -416,7 +416,7 @@ pub(super) fn at_stake<T: Transport>(
         if o.claimed || (o.activated_at.is_none() && tip >= o.expiry) {
             continue;
         }
-        let Some(id) = claimant(wallet, store, dir, &o, tip)? else {
+        let Some(id) = claimant(wallet, store, wallet_file, &o, tip)? else {
             continue;
         };
         let Some(claim) = wallet.owed_claim(&o.id, &o.keyset)? else {

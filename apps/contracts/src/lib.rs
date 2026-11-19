@@ -397,22 +397,10 @@ pub fn plays(profile: ChainProfile, program: &[u8; 32]) -> bool {
     })
 }
 
-/// The SQLite file at `path`, readable by its owner only, made so before
-/// anything is written to it.
-pub(crate) fn private_db(path: &std::path::Path) -> Result<rusqlite::Connection> {
-    if !path.exists() {
-        let mut file = std::fs::OpenOptions::new();
-        file.write(true).create_new(true);
-        #[cfg(unix)]
-        std::os::unix::fs::OpenOptionsExt::mode(&mut file, 0o600);
-        file.open(path)
-            .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
-    }
-    let c = rusqlite::Connection::open(path)?;
-    c.pragma_update(None, "journal_mode", "WAL")?;
-    c.pragma_update(None, "synchronous", "FULL")?;
-    c.busy_timeout(std::time::Duration::from_secs(5))?;
-    Ok(c)
+/// The hub's database in its data directory `data`: where the hub's
+/// ledger and the tables of its modules are.
+pub fn hub_db(data: &std::path::Path) -> std::path::PathBuf {
+    data.join("hub.sqlite")
 }
 
 /// Seconds since 1970.

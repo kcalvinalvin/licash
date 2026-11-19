@@ -1,5 +1,5 @@
 //! The hub's side of openings: its [`Offer`], each opening kept in
-//! `openings.sqlite`, F funded and signed by its node's wallet, and the
+//! the hub's database, F funded and signed by its node's wallet, and the
 //! routes a holder reaches it at ([`router`]).
 //!
 //! Each opening is one machine, stepped by one task at a time. A step is
@@ -1061,7 +1061,7 @@ mod tests {
         let source: Source = "http://127.0.0.1:1".parse().unwrap();
         Openings {
             data: dir.to_owned(),
-            store: Mutex::new(Store::open(dir).unwrap()),
+            store: Mutex::new(Store::open(&crate::testing::hub_data(dir)).unwrap()),
             source: source.clone(),
             wallet: source,
             payout: std::sync::OnceLock::new(),
@@ -1320,7 +1320,10 @@ mod tests {
         assert_eq!(openings.store().locked().unwrap(), vec![deposit(1)]);
         drop(openings);
         assert_eq!(
-            Store::open(dir.path()).unwrap().locked().unwrap(),
+            Store::open(&crate::testing::hub_data(dir.path()))
+                .unwrap()
+                .locked()
+                .unwrap(),
             vec![deposit(1)]
         );
     }
@@ -1328,13 +1331,13 @@ mod tests {
     #[test]
     fn abandonment_rechecks_activity_and_returns_only_the_coins_actually_abandoned() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
+        let store = Store::open(&crate::testing::hub_data(dir.path())).unwrap();
         let id = [4; 32];
         store
             .insert(&id, 0, true, &deposit(0), &[0; 32], funded())
             .unwrap();
         store.set_coins(&id, &[deposit(1)]).unwrap();
-        let db = rusqlite::Connection::open(dir.path().join("openings.sqlite")).unwrap();
+        let db = rusqlite::Connection::open(dir.path().join("hub.sqlite")).unwrap();
         db.execute("UPDATE openings SET updated_at = 0", [])
             .unwrap();
         let before = crate::now() - 1;
@@ -1364,7 +1367,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let now = fees(1, 100, 100);
         assert_eq!(opened_for_less(dir.path(), &now).unwrap(), 0);
-        assert!(!dir.path().join("openings.sqlite").exists());
+        assert!(!dir.path().join("hub.sqlite").exists());
         let openings = test_openings(dir.path());
         let sign = |id: u8| {
             let store = openings.store();
@@ -1382,23 +1385,23 @@ mod tests {
                 .save(&[id; 32], HubPhase::Funded as u8, true, &[0; 32], funded())
                 .unwrap();
         };
-        // Not told what it charges: nothing kept, and the file as it was.
+        // Not told what it charges: nothing kept.
         sign(1);
         assert_eq!(opened_for_less(dir.path(), &now).unwrap(), 0);
-        let tables = || -> i64 {
-            let db = rusqlite::Connection::open(dir.path().join("openings.sqlite")).unwrap();
+        let kept = || -> i64 {
+            let db = rusqlite::Connection::open(dir.path().join("hub.sqlite")).unwrap();
             db.query_row(
-                "SELECT count(*) FROM sqlite_master WHERE type = 'table'",
+                "SELECT count(*) FROM openings WHERE fees IS NOT NULL",
                 [],
                 |r| r.get(0),
             )
             .unwrap()
         };
-        assert_eq!(tables(), 1);
+        assert_eq!(kept(), 0);
 
         openings.charging(fees(1, 50, 100));
         sign(2);
-        assert_eq!(tables(), 2);
+        assert_eq!(kept(), 1);
         // One never signed, one whose deposit is another's, one given up.
         assert!(openings
             .store()
@@ -1428,8 +1431,8 @@ mod tests {
     fn openings_read_as_stored_with_their_terms_and_none_are_made() {
         let dir = tempfile::tempdir().unwrap();
         assert!(openings(dir.path()).unwrap().is_empty());
-        assert!(!dir.path().join("openings.sqlite").exists());
-        let store = Store::open(dir.path()).unwrap();
+        assert!(!dir.path().join("hub.sqlite").exists());
+        let store = Store::open(&crate::testing::hub_data(dir.path())).unwrap();
         assert!(openings(dir.path()).unwrap().is_empty());
         store
             .insert(&[1; 32], 0, true, &deposit(0), &[0; 32], funded())

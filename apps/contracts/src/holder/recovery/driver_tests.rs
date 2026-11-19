@@ -138,7 +138,7 @@ impl World {
         let hub = Hub::load(&saved.hub, &ctx).unwrap();
         let id = holder.id();
         let keys = HolderKeys::derive(&saved.seed, &id);
-        let store = Store::open(dir.path()).unwrap();
+        let store = Store::open(&crate::testing::wallet_file(dir.path())).unwrap();
         let o = holder.signed().unwrap();
         let deposit = o.base.deposit_outpoint();
         store
@@ -231,9 +231,14 @@ impl World {
     }
     async fn advance(&self) -> Vec<Recovery> {
         let rate = FeeRate::from_sat_per_vb(2).unwrap();
-        advance(&self.wallet, &self.chain, self.dir.path(), rate)
-            .await
-            .unwrap()
+        advance(
+            &self.wallet,
+            &self.chain,
+            &self.dir.path().join("wallet.sqlite"),
+            rate,
+        )
+        .await
+        .unwrap()
     }
     fn tip(&self) -> u32 {
         *self
@@ -295,7 +300,13 @@ async fn lifecycle(amount: u32, altered: bool, answer: bool, reorged: bool) {
     w.start(Stage::Contested, &state);
     // A fee payout awaited, of no payout of the wallet's: nothing waits on
     // it, the stage and the rest of the state as they were.
-    expect_fee(dir.path(), &id, FeeFor::Challenge, "cd").unwrap();
+    expect_fee(
+        &dir.path().join("wallet.sqlite"),
+        &id,
+        FeeFor::Challenge,
+        "cd",
+    )
+    .unwrap();
     let row = store.recovery(&id).unwrap().unwrap();
     assert_eq!(row.stage, Stage::Contested.as_str());
     let expected = State::decode(&row).unwrap();
@@ -303,7 +314,9 @@ async fn lifecycle(amount: u32, altered: bool, answer: bool, reorged: bool) {
     assert_eq!(expected.fee_payout, None);
     assert_eq!(expected.r, state.r);
     let rate = FeeRate::from_sat_per_vb(2).unwrap();
-    let needs = fee_needs(wallet, chain, dir.path(), rate).await.unwrap();
+    let needs = fee_needs(wallet, chain, &dir.path().join("wallet.sqlite"), rate)
+        .await
+        .unwrap();
     // No coin of hers for a challenge, none under way: one to pay out.
     assert_eq!(
         needs,
@@ -322,7 +335,9 @@ async fn lifecycle(amount: u32, altered: bool, answer: bool, reorged: bool) {
         mined.input[0].witness = Witness::from_slice(&witness);
     }
     let asserted_at = chain.mine(Some(mined.clone()));
-    let progressed = advance(wallet, chain, dir.path(), rate).await.unwrap();
+    let progressed = advance(wallet, chain, &dir.path().join("wallet.sqlite"), rate)
+        .await
+        .unwrap();
     let observed = State::decode(&store.recovery(&id).unwrap().unwrap()).unwrap();
     assert_eq!(observed.verified, Some(!altered));
     let initial = if altered {
@@ -332,7 +347,9 @@ async fn lifecycle(amount: u32, altered: bool, answer: bool, reorged: bool) {
     };
     assert_eq!(progressed[0].stage, initial, "{progressed:?}");
     let pinned = observed.assertion.clone();
-    advance(wallet, chain, dir.path(), rate).await.unwrap();
+    advance(wallet, chain, &dir.path().join("wallet.sqlite"), rate)
+        .await
+        .unwrap();
     assert_eq!(
         State::decode(&store.recovery(&id).unwrap().unwrap())
             .unwrap()
@@ -343,7 +360,9 @@ async fn lifecycle(amount: u32, altered: bool, answer: bool, reorged: bool) {
     let paid_at = if altered {
         let challenge = observed_challenge(store, &id);
         let mut challenged_at = chain.mine(Some(challenge.clone()));
-        let progressed = advance(wallet, chain, dir.path(), rate).await.unwrap();
+        let progressed = advance(wallet, chain, &dir.path().join("wallet.sqlite"), rate)
+            .await
+            .unwrap();
         assert_eq!(progressed[0].stage, Stage::Challenged, "{progressed:?}");
         if reorged {
             // The assertion's block and her challenge's replaced, the
@@ -356,11 +375,15 @@ async fn lifecycle(amount: u32, altered: bool, answer: bool, reorged: bool) {
             chain.mine(None);
             chain.mine(Some(mined.clone()));
             chain.to(tip);
-            let progressed = advance(wallet, chain, dir.path(), rate).await.unwrap();
+            let progressed = advance(wallet, chain, &dir.path().join("wallet.sqlite"), rate)
+                .await
+                .unwrap();
             assert_eq!(progressed[0].stage, Stage::Challenging, "{progressed:?}");
             assert_eq!(observed_challenge(store, &id), marked(&challenge));
             challenged_at = chain.mine(Some(challenge.clone()));
-            let progressed = advance(wallet, chain, dir.path(), rate).await.unwrap();
+            let progressed = advance(wallet, chain, &dir.path().join("wallet.sqlite"), rate)
+                .await
+                .unwrap();
             assert_eq!(progressed[0].stage, Stage::Challenged, "{progressed:?}");
         }
         if answer {
@@ -376,21 +399,29 @@ async fn lifecycle(amount: u32, altered: bool, answer: bool, reorged: bool) {
         } else {
             let delay = blocks(presign(&o.set, "failure").unwrap().tx.input[0].sequence).unwrap();
             chain.to(challenged_at + delay - 1);
-            let progressed = advance(wallet, chain, dir.path(), rate).await.unwrap();
+            let progressed = advance(wallet, chain, &dir.path().join("wallet.sqlite"), rate)
+                .await
+                .unwrap();
             assert_eq!(progressed[0].stage, Stage::TimingOut, "{progressed:?}");
             chain.mine(Some(chain.last()))
         }
     } else {
         let delay = blocks(presign(&o.set, "success").unwrap().tx.input[0].sequence).unwrap();
         chain.to(asserted_at + delay - 1);
-        let progressed = advance(wallet, chain, dir.path(), rate).await.unwrap();
+        let progressed = advance(wallet, chain, &dir.path().join("wallet.sqlite"), rate)
+            .await
+            .unwrap();
         assert_eq!(progressed[0].stage, Stage::Succeeding, "{progressed:?}");
         chain.mine(Some(chain.last()))
     };
-    let progressed = advance(wallet, chain, dir.path(), rate).await.unwrap();
+    let progressed = advance(wallet, chain, &dir.path().join("wallet.sqlite"), rate)
+        .await
+        .unwrap();
     if amount == 0 && !altered {
         // A corrected zero leaves her nothing of the payout to collect.
-        let done = advance(wallet, chain, dir.path(), rate).await.unwrap();
+        let done = advance(wallet, chain, &dir.path().join("wallet.sqlite"), rate)
+            .await
+            .unwrap();
         assert_eq!(done[0].stage, Stage::Done, "{progressed:?} {done:?}");
         assert_eq!(done[0].received, Some(0));
         return;
@@ -404,7 +435,9 @@ async fn lifecycle(amount: u32, altered: bool, answer: bool, reorged: bool) {
             .next_at
             .unwrap_or(paid_at + 6)
             .saturating_sub(1));
-        let progressed = advance(wallet, chain, dir.path(), rate).await.unwrap();
+        let progressed = advance(wallet, chain, &dir.path().join("wallet.sqlite"), rate)
+            .await
+            .unwrap();
         assert_eq!(progressed[0].stage, Stage::Sweeping, "{progressed:?}");
     }
     let sweep = chain.last();
@@ -422,13 +455,17 @@ async fn lifecycle(amount: u32, altered: bool, answer: bool, reorged: bool) {
         let again = chain.mine(Some(payout.clone()));
         // As long as the chain she saw, at least: no sign till then.
         chain.to(tip);
-        let mut progressed = advance(wallet, chain, dir.path(), rate).await.unwrap();
+        let mut progressed = advance(wallet, chain, &dir.path().join("wallet.sqlite"), rate)
+            .await
+            .unwrap();
         let state = State::decode(&store.recovery(&id).unwrap().unwrap()).unwrap();
         assert_eq!(state.payout_height, Some(again), "{progressed:?}");
         assert_eq!(state.payout, Some(payout));
         if progressed[0].stage != Stage::Sweeping {
             chain.to(progressed[0].next_at.unwrap() - 1);
-            progressed = advance(wallet, chain, dir.path(), rate).await.unwrap();
+            progressed = advance(wallet, chain, &dir.path().join("wallet.sqlite"), rate)
+                .await
+                .unwrap();
         }
         assert_eq!(progressed[0].stage, Stage::Sweeping, "{progressed:?}");
         assert_eq!(chain.last(), marked(&sweep));
@@ -437,7 +474,9 @@ async fn lifecycle(amount: u32, altered: bool, answer: bool, reorged: bool) {
     assert!(sweep.output[0].value >= sweep.output[0].script_pubkey.minimal_non_dust());
     let received = sweep.output[0].value.to_sat();
     chain.mine(Some(sweep));
-    let done = advance(wallet, chain, dir.path(), rate).await.unwrap();
+    let done = advance(wallet, chain, &dir.path().join("wallet.sqlite"), rate)
+        .await
+        .unwrap();
     assert_eq!(done[0].stage, Stage::Done, "{done:?}");
     assert_eq!(done[0].corrected, Some(amount as u64));
     assert_eq!(done[0].received, Some(received));
