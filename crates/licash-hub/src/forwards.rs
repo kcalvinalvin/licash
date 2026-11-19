@@ -186,7 +186,7 @@ impl Hub {
     pub fn live_forward(&self, hash: &[u8; 32]) -> Result<Option<Forward>, Error> {
         self.store.read(|c| {
             Ok(c.query_row(
-                &format!("{FORWARDS} WHERE hash = ?1 AND state IN ('pending', 'paid')"),
+                &format!("{FORWARDS} WHERE f.hash = ?1 AND f.state IN ('pending', 'paid')"),
                 [hash],
                 forward,
             )
@@ -214,7 +214,7 @@ impl Hub {
     pub fn forwards(&self) -> Result<Vec<Forward>, Error> {
         self.store.read(|c| {
             let mut stmt = c.prepare(&format!(
-                "{FORWARDS} WHERE state = 'pending' ORDER BY created_at, rowid"
+                "{FORWARDS} WHERE f.state = 'pending' ORDER BY f.created_at, f.rowid"
             ))?;
             let rows = stmt.query_map([], forward)?;
             Ok(rows.collect::<Result<_, _>>()?)
@@ -271,15 +271,14 @@ pub(crate) fn record(tx: &rusqlite::Transaction<'_>, new: &New<'_>) -> Result<Fo
         return Err(Refusal::Forward("a payment of this hash is under way or made").into());
     }
     tx.execute(
-        "INSERT INTO forwards (lock, hash, request, node, amount, expiry, state, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7)",
+        "INSERT INTO forwards (lock, hash, request, node, amount, state, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6)",
         params![
             id.as_bytes(),
             new.hash,
             new.request,
             new.node,
-            sql(new.amount),
-            new.expiry,
+            sql(new.amount)?,
             now()
         ],
     )?;
@@ -351,12 +350,12 @@ pub(crate) fn fail(
     )
 }
 
-const FORWARDS: &str = "SELECT lock, hash, request, node, amount, expiry, state, preimage,
-    reason, created_at FROM forwards";
+const FORWARDS: &str = "SELECT f.lock, f.hash, f.request, f.node, f.amount, l.expiry, f.state,
+    f.preimage, f.reason, f.created_at FROM forwards f JOIN locks l ON l.id = f.lock";
 
 fn forward_of(c: &Connection, id: &ProposalId) -> Result<Option<Forward>, Error> {
     Ok(c.query_row(
-        &format!("{FORWARDS} WHERE lock = ?1"),
+        &format!("{FORWARDS} WHERE f.lock = ?1"),
         [id.as_bytes()],
         forward,
     )

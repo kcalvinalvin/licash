@@ -3437,6 +3437,7 @@ dependencies = [
  "hex",
  "licash",
  "licash-api",
+ "licash-store",
  "rand_core 0.6.4",
  "rusqlite",
  "serde",
@@ -3596,6 +3597,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "licash-store"
+version = "0.0.1"
+dependencies = [
+ "rusqlite",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "licash-swaps"
 version = "0.0.1"
 dependencies = [
@@ -3606,6 +3615,7 @@ dependencies = [
  "licash-hub",
  "licash-lightning",
  "licash-onchain",
+ "licash-store",
  "licash-wallet",
  "lightning-invoice",
  "rand_core 0.6.4",
@@ -3698,6 +3708,7 @@ dependencies = [
  "licash",
  "licash-api",
  "licash-onchain",
+ "licash-store",
  "lightning-invoice",
  "rand_core 0.6.4",
  "rusqlite",

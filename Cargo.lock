@@ -854,6 +854,7 @@ dependencies = [
  "hex",
  "licash",
  "licash-api",
+ "licash-store",
  "rand_core",
  "rusqlite",
  "serde",

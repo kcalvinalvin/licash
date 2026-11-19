@@ -394,7 +394,7 @@ const LAST_EVENT: &str = "SELECT coalesce(max(seq), 0) FROM events";
 fn events(conn: &Connection, after: u64, limit: u32) -> Result<Vec<Event>, Error> {
     let mut rows = conn
         .prepare("SELECT seq, at, kind, json FROM events WHERE seq > ?1 ORDER BY seq LIMIT ?2")?;
-    let rows = rows.query_map(params![sql(after), limit], |r| {
+    let rows = rows.query_map(params![sql(after)?, limit], |r| {
         Ok((
             r.get::<_, i64>(0)?,
             r.get::<_, i64>(1)?,
@@ -506,7 +506,6 @@ impl Hub {
         if keysets.is_empty() {
             return Err(Error::Setup("the database has no keyset".into()));
         }
-        store.upgrade()?;
         let newest = store.read(locks::newest_checkpoint)?;
         let (mut boot, mut drawn) = ([0; 16], [0; 32]);
         OsRng.fill_bytes(&mut boot);
@@ -662,9 +661,10 @@ fn notify(tx: &Transaction<'_>, notice: &Notice) -> Result<(), Error> {
     Ok(())
 }
 
-/// `value` as an SQLite integer. Denominations fit by [`MAX_POW`].
-fn sql(value: u64) -> i64 {
-    i64::try_from(value).unwrap_or(i64::MAX)
+/// `value` as an SQLite integer: an error beyond it, not a lesser amount.
+/// Denominations fit by [`MAX_POW`].
+fn sql(value: u64) -> Result<i64, Error> {
+    Ok(licash_store::sat(value)?)
 }
 
 /// `secret`, and its x-only public key in hex, as Nostr names keys.
@@ -907,7 +907,7 @@ impl Hub {
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) ON CONFLICT DO NOTHING",
                     params![
                         keyset.id(),
-                        sql(output.denomination()),
+                        sql(output.denomination())?,
                         &output.blinded().0,
                         output.unlink_commitment(),
                         id.as_bytes(),
@@ -925,7 +925,7 @@ impl Hub {
                     params![
                         id.as_bytes(),
                         position,
-                        sql(note.message().denomination()),
+                        sql(note.message().denomination())?,
                         note.to_bytes()
                     ],
                 )?;
@@ -999,7 +999,7 @@ impl Hub {
     pub fn unlink(&self, request: &Request) -> Result<Answer, Error> {
         let (keys, keyset) = self.keys(request.keyset())?;
         keyset.key(request.denomination())?;
-        let denom = sql(request.denomination());
+        let denom = sql(request.denomination())?;
         let blinded = request.blinded();
         let output_hash = tagged_hash(
             "licash-hub/issued",
@@ -1076,7 +1076,7 @@ fn issued(tx: &Transaction<'_>, keyset: &[u8; 32], output: &Output) -> Result<bo
     Ok(tx
         .query_row(
             "SELECT 1 FROM issued WHERE keyset = ?1 AND denom = ?2 AND blinded = ?3",
-            params![keyset, sql(output.denomination()), &output.blinded().0],
+            params![keyset, sql(output.denomination())?, &output.blinded().0],
             |_| Ok(()),
         )
         .optional()?

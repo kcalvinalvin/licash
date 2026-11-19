@@ -778,7 +778,7 @@ impl Hub {
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT DO NOTHING",
                     params![
                         proposal.keyset_id(),
-                        sql(output.denomination()),
+                        sql(output.denomination())?,
                         &output.blinded().0,
                         output.unlink_commitment(),
                         id.as_bytes(),
@@ -811,7 +811,7 @@ impl Hub {
                 proposal.commitment_bytes(),
                 signed.to_bytes(),
                 certificate.to_bytes(),
-                sql(amount),
+                sql(amount)?,
                 own,
                 preimage,
             ],
@@ -899,7 +899,7 @@ impl Hub {
                    AND boot IS NULL",
                 params![
                     keyset.id(),
-                    sql(output.denomination()),
+                    sql(output.denomination())?,
                     &output.blinded().0,
                     id.as_bytes(),
                     self.boot,
@@ -916,7 +916,7 @@ impl Hub {
                 params![
                     id.as_bytes(),
                     position,
-                    sql(note.message().denomination()),
+                    sql(note.message().denomination())?,
                     note.to_bytes()
                 ],
             )?;

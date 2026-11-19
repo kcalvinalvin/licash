@@ -255,7 +255,12 @@ fn init_never_replaces_a_seed_or_ledger_and_open_needs_both_matching() {
     let why = setup_error(Hub::open(&a.seed, &a.db, Policy::default()));
     assert!(why.contains("another hub"), "{why}");
     drop(hub);
-    sql(&a.db).pragma_update(None, "user_version", 3).unwrap();
+    sql(&a.db)
+        .execute(
+            "UPDATE schema_versions SET version = 3 WHERE component = 'ledger'",
+            [],
+        )
+        .unwrap();
     let why = setup_error(Hub::open(&a.seed, &a.db, Policy::default()));
     assert!(why.contains("schema 3"), "{why}");
 }
@@ -1007,7 +1012,7 @@ fn an_empty_database_beside_a_seed_is_no_hub() {
     let empty = files.db.with_file_name("empty.sqlite");
     std::fs::File::create(&empty).unwrap();
     let why = setup_error(Hub::open(&files.seed, &empty, Policy::default()));
-    assert!(why.contains("schema 0"), "{why}");
+    assert!(why.contains("not made by this layout"), "{why}");
     let other = files.db.with_file_name("other-seed");
     setup_error(Hub::init(&other, &empty, MAX_POW));
     assert!(!other.exists());
@@ -1489,47 +1494,79 @@ fn a_fold_refuses_a_claim_of_a_spent_note_and_retires_none_of_it() {
 }
 
 #[test]
-fn a_ledger_of_the_first_schema_is_read_and_upgraded_once_its_hub_opens() {
+fn the_ledger_is_a_component_of_a_hub_file_and_its_rows_hold_to_their_states() {
     let files = files();
-    let hub = open(&files, Policy::default());
-    let (_, keyset) = issuer(&files);
-    let (alice, bob) = (owner(1), owner(2));
-    let spend = Spend::new(&keyset, &[mint(&files, &alice, 8)], &[(bob.address(), 8)]);
-    spend.complete(&hub, &keyset);
-    drop(hub);
-    // As the previous release left it.
+    drop(open(&files, Policy::default()));
     let db = sql(&files.db);
-    db.execute_batch("DROP TABLE claimed; PRAGMA user_version = 1;")
+    let id: i64 = db
+        .pragma_query_value(None, "application_id", |r| r.get(0))
         .unwrap();
-    drop(db);
-    let version = |db: &Path| -> i64 {
-        sql(db)
-            .pragma_query_value(None, "user_version", |r| r.get(0))
-            .unwrap()
-    };
-    // Read beside it, not upgraded; nor by a hub of another seed.
-    assert_eq!(Ledger::open(&files.db).unwrap().stats().unwrap().spent, 1);
-    let other = files_beside(&files);
-    setup_error(Hub::open(&other, &files.db, Policy::default()));
-    assert_eq!(version(&files.db), 1);
-    let hub = open(&files, Policy::default());
-    assert_eq!(version(&files.db), 2);
-    let claimed = mint(&files, &alice, 4);
-    hub.retire_claimed(&[1; 32], &filed([7; 32], &keyset, &[&claimed]))
+    assert_eq!(id, 0x4C48_5542);
+    let version: i64 = db
+        .query_row(
+            "SELECT version FROM schema_versions WHERE component = 'ledger'",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
-    let late = Spend::new(&keyset, &[claimed], &[(bob.address(), 4)]);
-    assert_eq!(refused(late.offer(&hub)), Refusal::Spent);
-    // What was spent before stays spent.
-    let again = Spend::new(&keyset, &spend.inputs, &[(bob.address(), 8)]);
-    assert_eq!(refused(again.offer(&hub)), Refusal::Spent);
-    drop(hub);
-    assert_eq!(Ledger::open(&files.db).unwrap().stats().unwrap().spent, 1);
-}
+    assert_eq!(version, 1);
+    // Rows by themselves: what each refers to is not under test.
+    db.pragma_update(None, "foreign_keys", false).unwrap();
 
-/// The seed of another hub, beside `files`.
-fn files_beside(of: &Files) -> PathBuf {
-    let other = files();
-    let seed = of.db.parent().unwrap().join("other-seed");
-    std::fs::copy(&other.seed, &seed).unwrap();
-    seed
+    let lock = |own: i64, amount: i64, preimage: &str, settled: &str, at: &str| {
+        db.execute(
+            &format!(
+                "INSERT INTO locks (id, hash, checkpoint, expiry, depth, decide_by, proposal,
+                    signed, certificate, amount, own, preimage, settled, settled_at)
+                 VALUES (randomblob(32), randomblob(32), x'00', 1, 1, 1, x'00', x'00', x'00',
+                    {amount}, {own}, {preimage}, {settled}, {at})"
+            ),
+            [],
+        )
+    };
+    let preimage = "x'1111111111111111111111111111111111111111111111111111111111111111'";
+    assert!(lock(0, 5, "NULL", "NULL", "NULL").is_ok());
+    assert!(lock(0, 5, "NULL", "'refund'", "1").is_ok());
+    assert!(lock(0, 5, preimage, "'pay'", "1").is_ok());
+    // Settled on a branch and at a time, or neither; a pay with its preimage.
+    assert!(lock(0, 5, preimage, "'pay'", "NULL").is_err());
+    assert!(lock(0, 5, "NULL", "NULL", "1").is_err());
+    assert!(lock(0, 5, "NULL", "'pay'", "1").is_err());
+    assert!(lock(0, 5, "NULL", "'paid'", "1").is_err());
+    assert!(lock(2, 5, "NULL", "NULL", "NULL").is_err());
+    assert!(lock(0, -5, "NULL", "NULL", "NULL").is_err());
+
+    let forward = |state: &str, preimage: &str, reason: &str, resolved: &str| {
+        db.execute(
+            &format!(
+                "INSERT INTO forwards (lock, hash, request, node, amount, state, preimage,
+                    reason, created_at, resolved_at)
+                 VALUES (randomblob(32), randomblob(32), 'r', 'n', 5, '{state}', {preimage},
+                    {reason}, 0, {resolved})"
+            ),
+            [],
+        )
+    };
+    assert!(forward("pending", "NULL", "NULL", "NULL").is_ok());
+    assert!(forward("paid", preimage, "NULL", "1").is_ok());
+    assert!(forward("failed", "NULL", "'no route'", "1").is_ok());
+    assert!(forward("pending", "NULL", "NULL", "1").is_err());
+    assert!(forward("paid", "NULL", "NULL", "1").is_err());
+    assert!(forward("paid", preimage, "NULL", "NULL").is_err());
+    assert!(forward("failed", "NULL", "NULL", "1").is_err());
+
+    // A grant is released once signed: both or neither.
+    let grant = |signed: &str, released: &str| {
+        db.execute(
+            &format!(
+                "INSERT INTO grants (id, offer, salt, boot, signed, released_at)
+                 VALUES (randomblob(32), x'00', x'00', x'00', {signed}, {released})"
+            ),
+            [],
+        )
+    };
+    assert!(grant("NULL", "NULL").is_ok());
+    assert!(grant("x'00'", "1").is_ok());
+    assert!(grant("x'00'", "NULL").is_err());
+    assert!(grant("NULL", "1").is_err());
 }
