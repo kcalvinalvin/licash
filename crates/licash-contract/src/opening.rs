@@ -1900,7 +1900,51 @@ mod tests {
         verify(&p, &prevouts).unwrap();
         let mut pinned = p.clone();
         pinned.input.push(TxIn::default());
-        assert!(verify(&pinned, &[slot, fee.clone(), fee]).is_err());
+        assert!(verify(&pinned, &[slot.clone(), fee.clone(), fee.clone()]).is_err());
+        // The hub's reclaim and disclosure alike, sealed once their fee
+        // coin is in.
+        let hub_key = h.keys().party.payment.x_only_public_key().0;
+        let disclose = crate::dispute::presign(&ho.set, "respond")
+            .unwrap()
+            .tx
+            .output[lichen_statement::SLOT_VOUT as usize]
+            .clone();
+        for (mut tx, spent, tree, name) in [
+            (
+                ho.reclaim(h.keys()).unwrap(),
+                slot,
+                ho.babe.slot().unwrap(),
+                "reclaim",
+            ),
+            (
+                ho.disclosure(h.keys(), &[4, 5, 6], vec![]).unwrap(),
+                disclose,
+                ho.babe.disclose().unwrap(),
+                "disclose",
+            ),
+        ] {
+            tx.input.push(TxIn::default());
+            let prevouts = [spent, fee.clone()];
+            ho.seal(h.keys(), &mut tx, &prevouts).unwrap();
+            let sig = tx.input[0].witness.nth(0).unwrap();
+            assert_eq!(sig.len(), 64, "{name}: SIGHASH_DEFAULT");
+            let sig = lichen_btc::bitcoin::secp256k1::schnorr::Signature::from_slice(sig).unwrap();
+            let leaf = tree.leaf(name).unwrap().script.clone();
+            let verify = |tx: &Transaction, prevouts: &[TxOut]| {
+                lichen_btc::sighash::verify_tapscript(&hub_key, &sig, tx, 0, prevouts, &leaf)
+            };
+            verify(&tx, &prevouts).unwrap();
+            let mut pinned = tx.clone();
+            pinned.input.push(TxIn::default());
+            let more = [prevouts[0].clone(), fee.clone(), fee.clone()];
+            assert!(verify(&pinned, &more).is_err(), "{name}");
+            assert!(ho.seal(h.keys(), &mut tx, &prevouts[..1]).is_err());
+        }
+        let mut other = default.clone();
+        assert!(
+            ho.seal(h.keys(), &mut other, &[fee.clone()]).is_err(),
+            "not a slot's spend"
+        );
         // Bitcoin accepts a digit of 15 written as 16 (the script clamps it
         // with OP_MIN): read as 15, as the statement does. A negative
         // digit fails the script, and the read.

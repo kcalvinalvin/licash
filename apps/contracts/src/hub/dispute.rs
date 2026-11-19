@@ -488,7 +488,10 @@ impl Openings {
                 // Its slot's value alone pays no fee: a fee coin with it.
                 let prevout = r.output[slot.vout as usize].clone();
                 let tx = o.reclaim(hub.keys())?;
-                let tx = self.with_fee(id, hub, "reclaim", tx, prevout).await?;
+                let tx = self
+                    .with_fee(id, hub, "reclaim", tx, prevout.clone())
+                    .await?;
+                let tx = self.sealed(id, hub, o, "reclaim", tx, prevout)?;
                 if self.post(&tx).await {
                     return Ok(Played::Posted("reclaim"));
                 }
@@ -679,7 +682,10 @@ impl Openings {
         let respond = presign(&o.set, "respond")?;
         let prevout = respond.tx.output[SLOT as usize].clone();
         let tx = o.disclosure(hub.keys(), &disclosures.to_bytes(), vec![])?;
-        let tx = self.with_fee(id, hub, "disclose", tx, prevout).await?;
+        let tx = self
+            .with_fee(id, hub, "disclose", tx, prevout.clone())
+            .await?;
+        let tx = self.sealed(id, hub, o, "disclose", tx, prevout)?;
         Ok(self.post(&tx).await)
     }
 
@@ -1104,6 +1110,23 @@ impl Openings {
             }
         };
         dispute::add_fee(tx, prevout, coin, key)
+    }
+
+    /// `tx` named `name`, its slot's input spending `prevout`, its fee coin
+    /// added ([`Self::with_fee`]): sealed, none other to be added
+    /// ([`HubOpening::seal`]).
+    fn sealed(
+        &self,
+        id: &[u8; 32],
+        hub: &Hub,
+        o: &HubOpening,
+        name: &str,
+        mut tx: Transaction,
+        prevout: TxOut,
+    ) -> Result<Transaction> {
+        let (_, coin) = self.store().fee_coin(id, name)?.context("no fee coin")?;
+        o.seal(hub.keys(), &mut tx, &[prevout, coin])?;
+        Ok(tx)
     }
 
     /// [`Self::with_fee`], for a terminal to be in a block by `deadline`,

@@ -300,6 +300,39 @@ impl HubOpening {
         })
         .transpose()
     }
+    /// The hub's disclosure or reclaim, its inputs final (`prevouts`, in
+    /// order, its fee coin's too): its slot's input signed again over
+    /// every input and output (SIGHASH_DEFAULT), so that none can be added
+    /// to hold it out of blocks at a lower rate.
+    pub fn seal(&self, keys: &HubKeys, tx: &mut Transaction, prevouts: &[TxOut]) -> Result<()> {
+        ensure!(keys.public() == self.hub, "another hub's keys");
+        ensure!(
+            !tx.input.is_empty() && tx.input.len() == prevouts.len(),
+            "a spend's inputs and their coins differ"
+        );
+        let slot_of = |name| -> Result<OutPoint> {
+            Ok(OutPoint {
+                txid: presign(&self.set, name)?.tx.compute_txid(),
+                vout: lichen_statement::SLOT_VOUT,
+            })
+        };
+        let spent = tx.input[0].previous_output;
+        let (tree, name) = if spent == slot_of("respond")? {
+            (self.babe.disclose()?, "disclose")
+        } else if spent == slot_of("request")? {
+            (self.babe.slot()?, "reclaim")
+        } else {
+            anyhow::bail!("not a spend of a slot of the hub's");
+        };
+        let leaf = tree.leaf(name)?;
+        let sig = sign_tapscript(&keys.party.payment, tx, 0, prevouts, &leaf.script)?;
+        tx.input[0].witness = tapscript_witness(
+            &[sig.as_ref().to_vec()],
+            &leaf.script,
+            &tree.control_block(name)?,
+        );
+        Ok(())
+    }
     pub fn reclaim(&self, keys: &HubKeys) -> Result<Transaction> {
         ensure!(keys.public() == self.hub, "another hub's keys");
         let r = presign(&self.set, "request")?;
