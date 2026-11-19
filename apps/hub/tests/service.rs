@@ -796,7 +796,7 @@ async fn a_payment_kept_for_its_payee_is_taken_and_acknowledged_through_the_api(
     use licash_api::inbox::{self, Acknowledge, Acknowledgment, AskAcks, Keep, Kept, Take};
 
     let mut service = service(1);
-    let path = service.dir.path().join("inbox.sqlite");
+    let path = service.dir.path().join("hub.sqlite");
     let kept = Arc::new(licash_hub_service::inbox::Inbox::open(&path).unwrap());
     let services = licash_hub_service::Services {
         inbox: Some(kept),

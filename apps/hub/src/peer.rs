@@ -9,12 +9,12 @@ use std::{
     collections::HashSet,
     path::{Path, PathBuf},
     sync::{Arc, OnceLock},
-    time::Duration,
 };
 
 use licash::spend::ProposalId;
 use licash_api::{Code, Problem};
-use rusqlite::{Connection, OpenFlags, OptionalExtension};
+use licash_store::Kind;
+use rusqlite::OptionalExtension;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use crate::{deposit, lightning, Failure};
@@ -73,18 +73,19 @@ fn unreadable(error: String) -> Failure {
     Failure(Problem::new(Code::Unavailable, "the hub cannot serve now"))
 }
 
-fn recorded_file(path: Option<&Path>, table: &str, hash: &[u8; 32]) -> Result<Recorded, String> {
-    let Some(path) = path else { return Ok(None) };
-    if !path.try_exists().map_err(|e| e.to_string())? {
+/// What the component `component` of the hub's database at `db` recorded
+/// under `hash` in its `table`, if the gateway ever ran there: read only,
+/// beside the gateway running or without it.
+fn recorded_file(
+    db: Option<&Path>,
+    component: &str,
+    table: &str,
+    hash: &[u8; 32],
+) -> Result<Recorded, String> {
+    let Some(db) = db else { return Ok(None) };
+    let Some(conn) = reader(db, component).map_err(|e| e.to_string())? else {
         return Ok(None);
-    }
-    let conn = Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(|e| e.to_string())?;
-    conn.busy_timeout(Duration::from_secs(10))
-        .map_err(|e| e.to_string())?;
+    };
     let row: Option<Option<[u8; 32]>> = conn
         .query_row(
             &format!("SELECT lock FROM {table} WHERE hash = ?1"),
@@ -96,26 +97,32 @@ fn recorded_file(path: Option<&Path>, table: &str, hash: &[u8; 32]) -> Result<Re
     Ok(row.map(|lock| lock.map(ProposalId::from_bytes)))
 }
 
-/// Which of `hashes` `query`, of a hash, finds in the file at `path`, if
-/// there is one: opened to read only, beside the gateway running on it or
-/// without it.
+/// A read only connection to the hub's database at `db`, if it has one and
+/// the gateway of `component` made its tables in it.
+pub fn reader(db: &Path, component: &str) -> anyhow::Result<Option<rusqlite::Connection>> {
+    let Some(conn) = licash_store::inspect(db, Kind::Hub)? else {
+        return Ok(None);
+    };
+    match licash_store::component_version(&conn, component)? {
+        Some(1) => Ok(Some(conn)),
+        Some(v) => anyhow::bail!("{component} of version {v}, this hub reads 1"),
+        None => Ok(None),
+    }
+}
+
+/// Which of `hashes` `query`, of a hash, finds among the tables of the
+/// gateway `component` in the hub's database at `db`, if the gateway ever
+/// ran there: read only, beside it running or without it.
 pub(crate) fn recorded_in(
-    path: &Path,
+    db: &Path,
+    component: &str,
     query: &str,
     hashes: &[[u8; 32]],
-) -> rusqlite::Result<HashSet<[u8; 32]>> {
+) -> anyhow::Result<HashSet<[u8; 32]>> {
     let mut found = HashSet::new();
-    if !path
-        .try_exists()
-        .map_err(|_| rusqlite::Error::InvalidPath(path.to_owned()))?
-    {
+    let Some(conn) = reader(db, component)? else {
         return Ok(found);
-    }
-    let conn = Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )?;
-    conn.busy_timeout(Duration::from_secs(10))?;
+    };
     let mut stmt = conn.prepare(query)?;
     for hash in hashes {
         if stmt.exists([hash])? {
@@ -153,16 +160,17 @@ fn link(
     turn: Arc<Mutex<()>>,
     data: Option<&Path>,
 ) {
-    let swaps = data.map(|d| d.join("swaps/swaps.sqlite"));
+    // The swap provider's tables are in its wallet's file.
+    let swaps = data.map(|d| d.join("swaps/wallet.sqlite"));
     if let Some(receipts) = receipts {
         let other = deposits.map(Arc::downgrade);
-        let file = data.map(|d| d.join("deposits.sqlite"));
+        let file = data.map(licash_contracts::hub_db);
         let recorded = move |hash: &[u8; 32]| match &other {
             Some(other) => other
                 .upgrade()
                 .ok_or_else(|| "the deposits stopped".to_owned())?
                 .recorded(hash),
-            None => recorded_file(file.as_deref(), "deposits", hash),
+            None => recorded_file(file.as_deref(), "deposits", "deposits", hash),
         };
         let paired = Paired {
             turn: turn.clone(),
@@ -173,13 +181,13 @@ fn link(
     }
     if let Some(deposits) = deposits {
         let other = receipts.map(Arc::downgrade);
-        let file = data.map(|d| d.join("lightning.sqlite"));
+        let file = data.map(licash_contracts::hub_db);
         let recorded = move |hash: &[u8; 32]| match &other {
             Some(other) => other
                 .upgrade()
                 .ok_or_else(|| "the Lightning gateway stopped".to_owned())?
                 .recorded(hash),
-            None => recorded_file(file.as_deref(), "receipts", hash),
+            None => recorded_file(file.as_deref(), "lightning", "lightning_receipts", hash),
         };
         let paired = Paired {
             turn,

@@ -8,13 +8,12 @@ mod pages;
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::time::Duration;
 
-use anyhow::{bail, Context as _, Result};
+use anyhow::{Context as _, Result};
 use licash_contracts::hub::Summary;
 use licash_dashboard::{grouped, Probe, Report, Series, Unit};
 use licash_hub::{Event, ForwardRecord, Ledger, LockRecord, Notes, Notice, Settled};
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::Connection;
 
 /// The kinds of payment, as the dashboard labels them.
 const TRANSFER: &str = "transfers";
@@ -97,42 +96,28 @@ fn read(data: &Path) -> Result<Records> {
         locks: ledger.locks()?,
         forwards: ledger.forwards()?,
         events,
-        receipts: receipts(&data.join("lightning.sqlite"))?,
-        deposits: deposits(&data.join("deposits.sqlite"))?,
+        receipts: receipts(&data.join("hub.sqlite"))?,
+        deposits: deposits(&data.join("hub.sqlite"))?,
         openings: licash_contracts::hub::openings(data).context("read the openings")?,
     })
 }
 
-/// The SQLite file at `path`, of schema 1, read only: none if there is
-/// none, or it is still empty.
-fn read_only(path: &Path) -> Result<Option<Connection>> {
-    if !path.is_file() {
-        return Ok(None);
-    }
-    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
-        .with_context(|| format!("open {}", path.display()))?;
-    conn.busy_timeout(Duration::from_secs(10))?;
-    conn.pragma_update(None, "query_only", true)?;
-    match conn.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))? {
-        0 => Ok(None),
-        1 => Ok(Some(conn)),
-        v => bail!(
-            "{} is of version {v}, newer than this hub reads",
-            path.display()
-        ),
-    }
+/// The tables of the gateway `component` in the hub's database at `db`, read
+/// only: none if there is no database, or the gateway never ran in it.
+fn read_only(db: &Path, component: &str) -> Result<Option<Connection>> {
+    crate::peer::reader(db, component)
 }
 
 fn lock_id(bytes: Option<Vec<u8>>) -> Option<[u8; 32]> {
     bytes.and_then(|b| b.try_into().ok())
 }
 
-fn receipts(path: &Path) -> Result<Option<Vec<Receipt>>> {
-    let Some(conn) = read_only(path)? else {
+fn receipts(db: &Path) -> Result<Option<Vec<Receipt>>> {
+    let Some(conn) = read_only(db, "lightning")? else {
         return Ok(None);
     };
     let mut stmt = conn.prepare(
-        "SELECT amount, msat, lock, state, created_at, done_at FROM receipts
+        "SELECT amount, msat, lock, state, created_at, done_at FROM lightning_receipts
          ORDER BY created_at, rowid",
     )?;
     let rows = stmt.query_map([], |r| {
@@ -148,13 +133,15 @@ fn receipts(path: &Path) -> Result<Option<Vec<Receipt>>> {
     Ok(Some(rows.collect::<Result<_, _>>()?))
 }
 
-fn deposits(path: &Path) -> Result<Option<Vec<Deposit>>> {
-    let Some(conn) = read_only(path)? else {
+fn deposits(db: &Path) -> Result<Option<Vec<Deposit>>> {
+    let Some(conn) = read_only(db, "deposits")? else {
         return Ok(None);
     };
     let mut stmt = conn.prepare(
-        "SELECT amount, pays, txid IS NOT NULL, lock, state, created_at, done_at FROM deposits
-         ORDER BY created_at, rowid",
+        "SELECT amount, pays,
+            EXISTS (SELECT 1 FROM deposit_fundings f WHERE f.hash = d.hash),
+            lock, state, created_at, done_at
+         FROM deposits d ORDER BY created_at, rowid",
     )?;
     let rows = stmt.query_map([], |r| {
         Ok(Deposit {

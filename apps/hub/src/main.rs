@@ -1039,6 +1039,19 @@ fn logging(format: Log) {
 
 fn command(cli: Cli) -> anyhow::Result<()> {
     let db = cli.data.join("hub.sqlite");
+    // Whatever the command: files of an earlier layout are never read, nor
+    // replaced.
+    licash_store::refuse_legacy(
+        &cli.data,
+        &[
+            "deposits.sqlite",
+            "lightning.sqlite",
+            "inbox.sqlite",
+            "openings.sqlite",
+            "responses.sqlite",
+        ],
+        "hub.sqlite",
+    )?;
     let seed = cli.seed.unwrap_or_else(|| cli.data.join("seed"));
     match cli.command {
         Command::Init { max_pow } => init(&cli.data, &seed, &db, max_pow, cli.log),
@@ -1145,17 +1158,16 @@ fn command(cli: Cli) -> anyhow::Result<()> {
             let hub = Hub::open(&seed, &db, policy).context("open the hub")?;
             let hub = Arc::new(hub);
             if lightning.is_none() {
-                check_gateway_idle(&hub, &cli.data.join("lightning.sqlite"), false)?;
+                check_gateway_idle(&hub, &db, false)?;
             }
             if depositing.is_none() {
-                check_gateway_idle(&hub, &cli.data.join("deposits.sqlite"), true)?;
+                check_gateway_idle(&hub, &db, true)?;
             }
             // Paused as it was when the hub stopped, before anything is paid.
             let guard = payouts::Guard::open(&cli.data);
             let gateway = match lightning {
                 Some((lnd, config)) => {
-                    let path = cli.data.join("lightning.sqlite");
-                    let gateway = Gateway::open(hub.clone(), Arc::new(lnd), config, &path)
+                    let gateway = Gateway::open(hub.clone(), Arc::new(lnd), config, &db)
                         .context("open the Lightning gateway")?;
                     gateway.guard_with(guard.clone());
                     Some(Arc::new(gateway))
@@ -1164,9 +1176,8 @@ fn command(cli: Cli) -> anyhow::Result<()> {
             };
             let deposits = match depositing {
                 Some((source, profile, config)) => {
-                    let path = cli.data.join("deposits.sqlite");
                     let deposits =
-                        deposit::Gateway::open(hub.clone(), source, profile, config, &path)
+                        deposit::Gateway::open(hub.clone(), source, profile, config, &db)
                             .context("open the deposits")?;
                     Some(Arc::new(deposits))
                 }
@@ -1182,7 +1193,7 @@ fn command(cli: Cli) -> anyhow::Result<()> {
                 }
                 false => None,
             };
-            let inbox = Inbox::open(&cli.data.join("inbox.sqlite")).context("open the inbox")?;
+            let inbox = Inbox::open(&db).context("open the inbox")?;
             let inbox = Some(Arc::new(inbox));
             let runtime = tokio::runtime::Runtime::new()?;
             let _entered = runtime.enter();
@@ -1239,9 +1250,9 @@ fn command(cli: Cli) -> anyhow::Result<()> {
                         Ok(0) => {}
                         Ok(signed) => tracing::warn!(
                             signed,
-                            "contracts signed in openings.sqlite, and --contracts is off"
+                            "contracts signed in the hub's database, and --contracts is off"
                         ),
-                        Err(e) => tracing::warn!("the contracts in openings.sqlite: {e:#}"),
+                        Err(e) => tracing::warn!("the contracts in the hub's database: {e:#}"),
                     }
                     None
                 }
@@ -1253,7 +1264,7 @@ fn command(cli: Cli) -> anyhow::Result<()> {
                     contracts,
                     "contracts were opened while the hub charged less: their holders pay it nothing more until they agree to its fees now"
                 ),
-                Err(e) => tracing::warn!("the fees kept in openings.sqlite: {e:#}"),
+                Err(e) => tracing::warn!("the fees kept in the hub's database: {e:#}"),
             }
             // One Tor client for the onion service and the swaps' wallet
             // alike, since its state directory takes only one.
@@ -1420,14 +1431,13 @@ fn issuer(
         .fold(Issuer::new(hub.clone(), url), |issuer, (from, cap)| {
             issuer.cap(from, *cap)
         });
-    let receipts_file = data.join("lightning.sqlite");
-    let deposits_file = data.join("deposits.sqlite");
+    let db = data.join("hub.sqlite");
     issuer.guard(turn, move |hash| {
         if let Some(gateway) = &receipts {
             if gateway.holds(hash)? {
                 return Ok(true);
             }
-        } else if Gateway::holding(&receipts_file, &[*hash])
+        } else if Gateway::holding(&db, &[*hash])
             .map_err(|e| e.to_string())?
             .contains(hash)
         {
@@ -1435,7 +1445,7 @@ fn issuer(
         }
         match &deposits {
             Some(deposits) => deposits.holds(hash),
-            None => deposit::Gateway::holding(&deposits_file, &[*hash])
+            None => deposit::Gateway::holding(&db, &[*hash])
                 .map(|found| found.contains(hash))
                 .map_err(|e| e.to_string()),
         }
@@ -1447,40 +1457,32 @@ fn issuer(
 /// are backed once the provider claims the clients' locks, which it then
 /// would not.
 fn check_idle(dir: &Path) -> anyhow::Result<()> {
-    let (wallet, swaps) = (dir.join("wallet.sqlite"), dir.join("swaps.sqlite"));
-    if !swaps.exists() {
+    licash_store::refuse_legacy(dir, &["swaps.sqlite", "contracts.sqlite"], "wallet.sqlite")?;
+    let wallet = dir.join("wallet.sqlite");
+    if !wallet.exists() {
         return Ok(());
     }
     let off = "--swaps is off";
     let wallet = Wallet::open(&wallet, Http::new(None)?).context(off)?;
-    Provider::open(&swaps, wallet, SwapsConfig::default()).context(off)?;
+    Provider::open(wallet, SwapsConfig::default()).context(off)?;
     tracing::warn!(dir = %dir.display(), "{off}: the swap provider takes no swaps");
     Ok(())
 }
 
 /// Backing on disk is not enough: a disabled gateway cannot collect it.
-/// Read without creating or upgrading files. Open records alone cost no
+/// Read without creating or upgrading anything: a gateway that never ran in
+/// the hub's database `db` has nothing to collect. Open records alone cost no
 /// notes, except when a crash left their own lock recorded only in the hub.
-fn check_gateway_idle(hub: &Hub, path: &Path, deposits: bool) -> anyhow::Result<()> {
-    if !path
-        .try_exists()
-        .with_context(|| format!("read {}", path.display()))?
-    {
-        return Ok(());
-    }
-    let (table, flag) = if deposits {
-        ("deposits", "--deposit-sweep-address")
+fn check_gateway_idle(hub: &Hub, db: &Path, deposits: bool) -> anyhow::Result<()> {
+    let (component, table, flag) = if deposits {
+        ("deposits", "deposits", "--deposit-sweep-address")
     } else {
-        ("receipts", "--lnd")
+        ("lightning", "lightning_receipts", "--lnd")
     };
     let check = || -> anyhow::Result<(usize, usize)> {
-        let conn = rusqlite::Connection::open_with_flags(
-            path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )?;
-        conn.busy_timeout(Duration::from_secs(10))?;
-        let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        anyhow::ensure!(version == 1, "unsupported {table} schema {version}");
+        let Some(conn) = peer::reader(db, component)? else {
+            return Ok((0, 0));
+        };
         let mut stmt = conn.prepare(&format!("SELECT hash, lock, state, done_at FROM {table}"))?;
         let rows = stmt.query_map([], |r| {
             Ok((
@@ -1512,23 +1514,24 @@ fn check_gateway_idle(hub: &Hub, path: &Path, deposits: bool) -> anyhow::Result<
     };
     let (required, open) = check().with_context(|| {
         format!(
-            "{flag} is off: cannot establish that {} is idle",
-            path.display()
+            "{flag} is off: cannot establish that the {component} are idle in {}",
+            db.display()
         )
     })?;
-    anyhow::ensure!(required == 0, "{flag} is off but {required} obligations in {} still need its gateway; enable {flag} to follow them", path.display());
+    anyhow::ensure!(required == 0, "{flag} is off but {required} obligations in {} still need its gateway; enable {flag} to follow them", db.display());
     if open > 0 {
-        tracing::warn!(file = %path.display(), open, "{flag} is off: open payments wait for its gateway");
+        tracing::warn!(file = %db.display(), open, "{flag} is off: open payments wait for its gateway");
     }
     Ok(())
 }
 
 /// Refuse to run, unless `allow`ed, while own locks of `hub` it may yet pay
 /// are backed by no deposit, Lightning receipt or swap under way in `data`:
-/// each was recorded before its lock, so such a file was restored older
-/// than `hub.sqlite`, or lost, and the hub would pay the notes it locked
-/// without collecting what was paid for them. Allowed, the operator is
-/// alerted. Opens no file while no own lock is live.
+/// each was recorded before its lock, so such a record was lost, or the
+/// swap provider's file restored older than `hub.sqlite` (the deposits and
+/// receipts are in it, restored as one), and the hub would pay the notes it
+/// locked without collecting what was paid for them. Allowed, the operator
+/// is alerted. Opens no file while no own lock is live.
 fn check_backed(hub: &Hub, data: &Path, allow: bool) -> anyhow::Result<()> {
     let live = hub.live_own_locks().context("read the hub's own locks")?;
     if live.is_empty() {
@@ -1538,18 +1541,18 @@ fn check_backed(hub: &Hub, data: &Path, allow: bool) -> anyhow::Result<()> {
         .iter()
         .filter_map(|lock| Some(*lock.proposal.lock()?.terms().hash()))
         .collect();
-    let (deposits, receipts) = (data.join("deposits.sqlite"), data.join("lightning.sqlite"));
-    let swaps = data.join("swaps").join("swaps.sqlite");
+    let db = data.join("hub.sqlite");
+    let swaps = data.join("swaps").join("wallet.sqlite");
     let mut backed = std::collections::HashSet::new();
     let mut unreadable = Vec::new();
     let mut read = |path: &Path, found: Result<_, String>| match found {
         Ok(found) => backed.extend(found),
         Err(e) => unreadable.push(format!("{} ({e})", path.display())),
     };
-    let held = deposit::Gateway::holding(&deposits, &hashes).map_err(|e| e.to_string());
-    read(&deposits, held);
-    let held = Gateway::holding(&receipts, &hashes).map_err(|e| e.to_string());
-    read(&receipts, held);
+    let held = deposit::Gateway::holding(&db, &hashes).map_err(|e| e.to_string());
+    read(&db, held);
+    let held = Gateway::holding(&db, &hashes).map_err(|e| e.to_string());
+    read(&db, held);
     let held = licash_swaps::backing_own(&swaps, &hashes).map_err(|e| e.to_string());
     read(&swaps, held);
     let unbacked: Vec<String> = live
@@ -1578,8 +1581,8 @@ fn check_backed(hub: &Hub, data: &Path, allow: bool) -> anyhow::Result<()> {
     }
     let mut message = format!(
         "{} own locks of the hub, which it may yet pay, are backed by no deposit, Lightning \
-         receipt or swap under way in {}: {}. Restore deposits.sqlite, lightning.sqlite and \
-         swaps/swaps.sqlite as recent as hub.sqlite.",
+         receipt or swap under way in {}: {}. Restore hub.sqlite and \
+         swaps/wallet.sqlite as recent as each other.",
         unbacked.len(),
         data.display(),
         unbacked.join("; ")
@@ -1606,47 +1609,40 @@ fn swap_provider(
     transport: Http,
     log: Log,
 ) -> anyhow::Result<Provider<Http>> {
-    let (wallet, swaps) = (dir.join("wallet.sqlite"), dir.join("swaps.sqlite"));
-    match (wallet.exists(), swaps.exists()) {
-        (true, true) => {
-            let wallet = Wallet::open(&wallet, transport).context("open the swaps' wallet")?;
-            anyhow::ensure!(
-                wallet.network() == network,
-                "the swaps' wallet is of {}, the hub of {network}",
-                wallet.network()
-            );
-            Provider::open_issuing(&swaps, wallet, config, issuer).context("open the swaps file")
-        }
-        (false, false) => {
-            let mut builder = std::fs::DirBuilder::new();
-            builder.recursive(true);
-            #[cfg(unix)]
-            std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
-            builder
-                .create(dir)
-                .with_context(|| format!("create {}", dir.display()))?;
-            let mut seed = [0; 32];
-            OsRng.fill_bytes(&mut seed);
-            let wallet = Wallet::create(&wallet, &seed, network, transport)
-                .context("create the swaps' wallet")?;
-            let address = hex::encode(wallet.address().to_bytes());
-            let provider = Provider::create_issuing(&swaps, wallet, config, issuer)
-                .context("create the swaps file")?;
-            if matches!(log, Log::Json) {
-                tracing::info!(dir = %dir.display(), %address, "swap provider created: back up its wallet file");
-            } else {
-                eprintln!(
-                    "swap provider created: back up wallet.sqlite and swaps.sqlite in {}.",
-                    dir.display()
-                );
-            }
-            Ok(provider)
-        }
-        _ => anyhow::bail!(
-            "{}: wallet.sqlite and swaps.sqlite go together, and one is missing: restore it",
-            dir.display()
-        ),
+    licash_store::refuse_legacy(dir, &["swaps.sqlite", "contracts.sqlite"], "wallet.sqlite")?;
+    let wallet = dir.join("wallet.sqlite");
+    if wallet.exists() {
+        let wallet = Wallet::open(&wallet, transport).context("open the swaps' wallet")?;
+        anyhow::ensure!(
+            wallet.network() == network,
+            "the swaps' wallet is of {}, the hub of {network}",
+            wallet.network()
+        );
+        return Provider::open_issuing(wallet, config, issuer).context("open the swap provider");
     }
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder
+        .create(dir)
+        .with_context(|| format!("create {}", dir.display()))?;
+    let mut seed = [0; 32];
+    OsRng.fill_bytes(&mut seed);
+    let wallet =
+        Wallet::create(&wallet, &seed, network, transport).context("create the swaps' wallet")?;
+    let address = hex::encode(wallet.address().to_bytes());
+    let provider =
+        Provider::create_issuing(wallet, config, issuer).context("create the swap provider")?;
+    if matches!(log, Log::Json) {
+        tracing::info!(dir = %dir.display(), %address, "swap provider created: back up its wallet file");
+    } else {
+        eprintln!(
+            "swap provider created: back up wallet.sqlite in {}.",
+            dir.display()
+        );
+    }
+    Ok(provider)
 }
 
 /// What runs beside the API, if configured.

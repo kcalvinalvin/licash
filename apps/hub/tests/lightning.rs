@@ -85,7 +85,7 @@ impl Net {
         let chain = chain::Chain::new();
         hub.add_checkpoint(&chain.checkpoint(0)).unwrap();
         let node = Arc::new(Fake::new());
-        let path = dir.path().join("lightning.sqlite");
+        let path = dir.path().join("hub.sqlite");
         let gateway = Gateway::open(hub.clone(), node.clone(), config, &path).unwrap();
         let gateway = Arc::new(gateway);
         let net = Self {
@@ -258,10 +258,10 @@ async fn a_short_receipt_lock_does_not_receive_the_invoices_preimage() {
     let net = Net::new().await;
     let alice = net.wallet("alice");
     let invoice = alice.invoice(HUB, 10).await.unwrap();
-    let db = rusqlite::Connection::open(net.dir.path().join("lightning.sqlite")).unwrap();
+    let db = rusqlite::Connection::open(net.dir.path().join("hub.sqlite")).unwrap();
     let body: String = db
         .query_row(
-            "SELECT body FROM receipts WHERE hash = ?1",
+            "SELECT body FROM lightning_receipts WHERE hash = ?1",
             [bytes(&invoice.hash)],
             |r| r.get(0),
         )
@@ -284,7 +284,7 @@ async fn a_short_receipt_lock_does_not_receive_the_invoices_preimage() {
         .unwrap();
     let id = lock.proposal.id();
     db.execute(
-        "UPDATE receipts SET lock = ?1, state = 'locked' WHERE hash = ?2",
+        "UPDATE lightning_receipts SET lock = ?1, state = 'locked' WHERE hash = ?2",
         rusqlite::params![id.as_bytes(), hash],
     )
     .unwrap();
@@ -529,8 +529,8 @@ async fn an_invoice_of_the_hubs_own_node_but_no_receipt_is_refused() {
     let invoice = bob.invoice(HUB, 10).await.unwrap();
     // Another invoice of the receipt's hash, by the same node.
     let hash = bytes(&invoice.hash);
-    let db = rusqlite::Connection::open(net.dir.path().join("lightning.sqlite")).unwrap();
-    db.execute("DELETE FROM receipts WHERE hash = ?1", [hash])
+    let db = rusqlite::Connection::open(net.dir.path().join("hub.sqlite")).unwrap();
+    db.execute("DELETE FROM lightning_receipts WHERE hash = ?1", [hash])
         .unwrap();
     let lock = alice
         .pay_invoice(HUB, invoice.request.as_deref().unwrap())
@@ -614,9 +614,9 @@ async fn a_lock_made_inside_the_hub_before_a_crash_is_taken_for_its_receipt() {
     let locked = net.gateway.receive_status(&hash).unwrap().lock;
     assert!(locked.is_some());
     // As if the gateway stopped between locking and recording the lock.
-    let db = rusqlite::Connection::open(net.dir.path().join("lightning.sqlite")).unwrap();
+    let db = rusqlite::Connection::open(net.dir.path().join("hub.sqlite")).unwrap();
     db.execute(
-        "UPDATE receipts SET state = 'open', lock = NULL WHERE hash = ?1",
+        "UPDATE lightning_receipts SET state = 'open', lock = NULL WHERE hash = ?1",
         [hash],
     )
     .unwrap();
@@ -997,10 +997,10 @@ async fn a_lock_made_before_a_crash_is_taken_for_its_receipt() {
     net.gateway.round().await;
     let locked = net.gateway.receive_status(&hash).unwrap().lock;
     // As if the gateway stopped between locking and recording the lock.
-    let db = rusqlite::Connection::open(net.dir.path().join("lightning.sqlite")).unwrap();
+    let db = rusqlite::Connection::open(net.dir.path().join("hub.sqlite")).unwrap();
     let reset = db
         .execute(
-            "UPDATE receipts SET state = 'open', lock = NULL WHERE hash = ?1",
+            "UPDATE lightning_receipts SET state = 'open', lock = NULL WHERE hash = ?1",
             [hash],
         )
         .unwrap();

@@ -462,13 +462,17 @@ fn serving(data: &Path, port: u16, args: &[&str]) -> Running {
 }
 
 fn gateway_file(data: &Path, deposits: bool, hash: [u8; 32]) -> rusqlite::Connection {
-    let (file, table) = if deposits {
-        ("deposits.sqlite", "deposits")
+    let (component, table) = if deposits {
+        ("deposits", "deposits")
     } else {
-        ("lightning.sqlite", "receipts")
+        ("lightning", "lightning_receipts")
     };
-    let conn = rusqlite::Connection::open(data.join(file)).unwrap();
-    conn.execute_batch(&format!("PRAGMA user_version = 1; CREATE TABLE {table} (hash BLOB PRIMARY KEY, lock BLOB, state TEXT, done_at INTEGER);")).unwrap();
+    let conn = rusqlite::Connection::open(data.join("hub.sqlite")).unwrap();
+    conn.execute_batch(&format!(
+        "CREATE TABLE {table} (hash BLOB PRIMARY KEY, lock BLOB, state TEXT, done_at INTEGER);
+         INSERT INTO schema_versions (component, version, created_at) VALUES ('{component}', 1, 0);"
+    ))
+    .unwrap();
     conn.execute(
         &format!("INSERT INTO {table} (hash, state) VALUES (?1, 'locked')"),
         [hash],
@@ -484,9 +488,9 @@ fn disabled_gateways_refuse_outstanding_obligations_but_allow_idle_files() {
         let data = dir.path().join("hub");
         stdout(&data, &["init", "--max-pow", "6"]);
         let (file, table, flag) = if deposits {
-            ("deposits.sqlite", "deposits", "--deposit-sweep-address")
+            ("hub.sqlite", "deposits", "--deposit-sweep-address")
         } else {
-            ("lightning.sqlite", "receipts", "--lnd")
+            ("hub.sqlite", "lightning_receipts", "--lnd")
         };
         let conn = gateway_file(&data, deposits, [6; 32]);
         let stderr = refused(
@@ -532,7 +536,11 @@ fn disabled_gateways_detect_a_lock_made_before_the_gateway_recorded_it() {
         let hash = [7; 32];
         own_lock(&data, hash);
         let conn = gateway_file(&data, deposits, hash);
-        let table = if deposits { "deposits" } else { "receipts" };
+        let table = if deposits {
+            "deposits"
+        } else {
+            "lightning_receipts"
+        };
         conn.execute(&format!("UPDATE {table} SET state = 'open'"), [])
             .unwrap();
         let stderr = refused(
@@ -548,18 +556,51 @@ fn unreadable_gateway_state_is_not_assumed_idle() {
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("hub");
     stdout(&data, &["init", "--max-pow", "6"]);
-    let file = data.join("deposits.sqlite");
-    std::fs::write(&file, b"partial or invalid state").unwrap();
+    // Tables of a version this hub does not read.
+    let db = rusqlite::Connection::open(data.join("hub.sqlite")).unwrap();
+    db.execute(
+        "INSERT INTO schema_versions (component, version, created_at) VALUES ('deposits', 9, 0)",
+        [],
+    )
+    .unwrap();
+    drop(db);
     let stderr = refused(
         &data,
         &["run", "--listen", &format!("127.0.0.1:{}", free_port())],
     );
     assert!(
-        stderr.contains("cannot establish") && stderr.contains("deposits.sqlite"),
+        stderr.contains("cannot establish") && stderr.contains("hub.sqlite"),
         "{stderr}"
     );
-    assert_eq!(std::fs::read(file).unwrap(), b"partial or invalid state");
     assert!(!data.join("lightning.sqlite").exists());
+}
+
+#[test]
+fn a_data_directory_of_an_earlier_layout_is_refused_by_name_and_left_as_it_is() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("hub");
+    stdout(&data, &["init", "--max-pow", "6"]);
+    for file in [
+        "deposits.sqlite",
+        "lightning.sqlite",
+        "inbox.sqlite",
+        "openings.sqlite",
+        "responses.sqlite",
+    ] {
+        let path = data.join(file);
+        std::fs::write(&path, b"an earlier layout's file").unwrap();
+        let stderr = refused(
+            &data,
+            &["run", "--listen", &format!("127.0.0.1:{}", free_port())],
+        );
+        assert!(
+            stderr.contains("earlier layout") && stderr.contains(file),
+            "{file}: {stderr}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"an earlier layout's file");
+        std::fs::remove_file(path).unwrap();
+    }
+    drop(serving(&data, free_port(), &[]));
 }
 
 #[test]
@@ -577,24 +618,26 @@ fn a_disabled_gateway_reads_real_receipts_in_wal_without_mutating_them() {
         )
         .unwrap(),
     );
-    let path = data.join("lightning.sqlite");
+    let path = data.join("hub.sqlite");
     let _gateway =
         Gateway::open(live_hub, Arc::new(Fake::new()), Config::default(), &path).unwrap();
     let writer = rusqlite::Connection::open(&path).unwrap();
     // Keep the WAL connection, not a second running hub's ledger lock.
     drop(_gateway);
-    writer.execute("INSERT INTO receipts (hash, body, amount, msat, state, created_at) VALUES (?1, '{}', 5, 5000, 'locked', 0)", [[8u8; 32]]).unwrap();
+    writer.execute("INSERT INTO lightning_receipts (hash, body, amount, msat, state, created_at) VALUES (?1, '{}', 5, 5000, 'locked', 0)", [[8u8; 32]]).unwrap();
     let stderr = refused(
         &data,
         &["run", "--listen", &format!("127.0.0.1:{}", free_port())],
     );
     assert!(
-        stderr.contains("lightning.sqlite") && stderr.contains("1 obligations"),
+        stderr.contains("hub.sqlite") && stderr.contains("1 obligations"),
         "{stderr}"
     );
     assert_eq!(
         writer
-            .query_row("SELECT state FROM receipts", [], |r| r.get::<_, String>(0))
+            .query_row("SELECT state FROM lightning_receipts", [], |r| {
+                r.get::<_, String>(0)
+            })
             .unwrap(),
         "locked"
     );
@@ -607,8 +650,9 @@ fn a_hub_refuses_to_run_with_own_locks_nothing_backs() {
     stdout(&data, &["init", "--max-pow", "6"]);
     let hash = [5; 32];
     let lock = own_lock(&data, hash);
-    // Its deposit, receipt or swap is in no file, as once one was restored
-    // older than hub.sqlite: the hub would pay notes nothing backs.
+    // Its deposit, receipt or swap is recorded nowhere, as once the provider's
+    // file was restored older than hub.sqlite: the hub would pay notes
+    // nothing backs.
     let listen = format!("127.0.0.1:{}", free_port());
     let stderr = refused(&data, &["run", "--listen", &listen]);
     assert!(
@@ -628,8 +672,8 @@ fn a_hub_refuses_to_run_with_own_locks_nothing_backs() {
 
     // Presence of a backing record and whether its gateway still has
     // work are separate checks. An idle record needs no running gateway.
-    let deposits = rusqlite::Connection::open(data.join("deposits.sqlite")).unwrap();
-    deposits.execute_batch("PRAGMA user_version = 1; CREATE TABLE deposits (hash BLOB PRIMARY KEY, lock BLOB, state TEXT, done_at INTEGER)").unwrap();
+    let deposits = rusqlite::Connection::open(data.join("hub.sqlite")).unwrap();
+    deposits.execute_batch("CREATE TABLE deposits (hash BLOB PRIMARY KEY, lock BLOB, state TEXT, done_at INTEGER); INSERT INTO schema_versions (component, version, created_at) VALUES ('deposits', 1, 0)").unwrap();
     let row = "INSERT INTO deposits (hash, state, done_at) VALUES (?1, 'settled', 1)";
     deposits.execute(row, [hash]).unwrap();
     drop(deposits);
@@ -669,9 +713,8 @@ fn a_hub_provides_the_swaps_into_it_from_a_wallet_of_its_own() {
     let own = info.hub(&hub_info.address).unwrap();
     assert_eq!(own.max, 0);
     let swaps_dir = data.join("swaps");
-    for file in ["wallet.sqlite", "swaps.sqlite"] {
-        assert!(swaps_dir.join(file).exists(), "{file}");
-    }
+    assert!(swaps_dir.join("wallet.sqlite").exists());
+    assert!(!swaps_dir.join("swaps.sqlite").exists());
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -736,11 +779,11 @@ fn a_hub_provides_the_swaps_into_it_from_a_wallet_of_its_own() {
     assert!(logs.contains("--swaps is off"), "{logs}");
     // Nor at all while a swap into it is under way: its notes are backed
     // once the provider claims the client's lock.
-    let db = rusqlite::Connection::open(swaps_dir.join("swaps.sqlite")).unwrap();
+    let db = rusqlite::Connection::open(swaps_dir.join("wallet.sqlite")).unwrap();
     db.execute(
-        "INSERT INTO swaps (id, hash, from_url, to_url, address, amount, fee, paid,
+        "INSERT INTO provider_swaps (id, hash, from_url, to_url, address, amount, fee, paid,
             expiry_from, expiry, state, created_at, updated_at, kind)
-         VALUES (x'01', x'02', 'http://a.example', 'http://hub', x'03', 10, 1, 11,
+         VALUES (x'01', zeroblob(32), 'http://a.example', 'http://hub', x'03', 10, 1, 11,
             50, 40, 'locked', 0, 0, 'own')",
         [],
     )
@@ -754,12 +797,15 @@ fn a_hub_provides_the_swaps_into_it_from_a_wallet_of_its_own() {
         "{stderr}"
     );
 
-    // Its wallet and its swaps go together.
-    std::fs::remove_file(swaps_dir.join("swaps.sqlite")).unwrap();
+    // A file of an earlier layout beside its wallet is refused by name.
+    std::fs::write(swaps_dir.join("swaps.sqlite"), b"an earlier provider's").unwrap();
     let out = run(free_port(), &swaps).output().unwrap();
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("one is missing"), "{stderr}");
+    assert!(
+        stderr.contains("earlier layout") && stderr.contains("swaps.sqlite"),
+        "{stderr}"
+    );
 }
 
 #[test]

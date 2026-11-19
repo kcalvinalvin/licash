@@ -5,13 +5,13 @@ use std::{
     collections::HashSet,
     path::Path,
     sync::{Mutex, MutexGuard},
-    time::Duration,
 };
 
 use licash::spend::{ProposalId, TimedTerms};
 use licash_api::{Code, Hex, Paying, Problem, Receive, ReceiveState, ReceiveStatus, Receiving};
 use licash_hub::{Error, Forward, Forwarded, Refusal, Settled, LOCAL};
 use licash_lightning::expires;
+use licash_store::Kind;
 use lightning_invoice::Bolt11Invoice;
 use rusqlite::{params, Connection, OptionalExtension, Row};
 
@@ -21,27 +21,31 @@ use crate::{
     Failure,
 };
 
+/// The component the receipts' table is, and its version.
+const COMPONENT: &str = "lightning";
 const VERSION: i64 = 1;
 
 const SCHEMA: &str = "
 -- Notes asked for over Lightning: recorded before their invoice exists,
--- locked once it is paid, and settled or canceled with their lock.
-CREATE TABLE receipts (
-    hash BLOB PRIMARY KEY,
+-- locked once it is paid, and settled or canceled with their lock, which
+-- is when they are done.
+CREATE TABLE lightning_receipts (
+    hash BLOB PRIMARY KEY CHECK (length(hash) = 32),
     -- The receipt asked for, as JSON.
     body TEXT NOT NULL,
-    amount INTEGER NOT NULL,
-    msat INTEGER NOT NULL,
+    amount INTEGER NOT NULL CHECK (amount >= 0),
+    msat INTEGER NOT NULL CHECK (msat >= 0),
     request TEXT,
     lock BLOB,
     state TEXT NOT NULL CHECK (state IN ('open', 'locked', 'settled', 'canceled')),
     created_at INTEGER NOT NULL,
-    done_at INTEGER
+    done_at INTEGER,
+    CHECK ((state IN ('settled', 'canceled')) = (done_at IS NOT NULL))
 ) STRICT;
-CREATE INDEX live_receipts ON receipts (state) WHERE state IN ('open', 'locked');
+CREATE INDEX live_receipts ON lightning_receipts (state) WHERE state IN ('open', 'locked');
 ";
 
-/// The gateway's receipts, in a SQLite file of their own.
+/// The gateway's receipts, in the hub's database.
 pub(super) struct Store(Mutex<Connection>);
 
 /// A receipt as recorded.
@@ -58,31 +62,11 @@ pub(super) struct Receipt {
 }
 
 impl Store {
-    /// The receipts at `path`, a new file or one this gateway wrote.
+    /// The receipts in the hub's database at `path`, made if the gateway
+    /// never ran there.
     pub(super) fn open(path: &Path) -> anyhow::Result<Self> {
-        let mut conn = Connection::open(path)?;
-        conn.busy_timeout(Duration::from_secs(5))?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.pragma_update(None, "synchronous", "FULL")?;
-        let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if version == 0 {
-            let tables: i64 =
-                conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get(0))?;
-            anyhow::ensure!(
-                tables == 0,
-                "{} is not the gateway's receipts",
-                path.display()
-            );
-            let tx = conn.transaction()?;
-            tx.execute_batch(SCHEMA)?;
-            tx.pragma_update(None, "user_version", VERSION)?;
-            tx.commit()?;
-        } else {
-            anyhow::ensure!(
-                version == VERSION,
-                "receipts schema {version}, this gateway reads {VERSION}"
-            );
-        }
+        let mut conn = licash_store::open(path, Kind::Hub)?;
+        licash_store::component(&mut conn, COMPONENT, VERSION, SCHEMA)?;
         Ok(Self(Mutex::new(conn)))
     }
 
@@ -121,17 +105,17 @@ impl Store {
         let conn = self.conn();
         let inserted = conn
             .execute(
-                "INSERT INTO receipts (hash, body, amount, msat, state, created_at)
+                "INSERT INTO lightning_receipts (hash, body, amount, msat, state, created_at)
                  SELECT ?1, ?2, ?3, ?4, 'open', ?5
-                 WHERE (SELECT count(*) FROM receipts WHERE state IN ('open', 'locked')) < ?6
+                 WHERE (SELECT count(*) FROM lightning_receipts WHERE state IN ('open', 'locked')) < ?6
                  ON CONFLICT DO NOTHING",
-                params![hash, body, sql(amount), sql(msat), sql(now()), most],
+                params![hash, body, sql(amount)?, sql(msat)?, sql(now())?, most],
             )
             .map_err(store_down)?;
         if inserted == 0
             && !conn
                 .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM receipts WHERE hash = ?1)",
+                    "SELECT EXISTS(SELECT 1 FROM lightning_receipts WHERE hash = ?1)",
                     [hash],
                     |r| r.get::<_, bool>(0),
                 )
@@ -153,7 +137,7 @@ impl Store {
     ) -> Result<(), Failure> {
         self.conn()
             .execute(
-                &format!("UPDATE receipts SET {set} = ?2 WHERE hash = ?1"),
+                &format!("UPDATE lightning_receipts SET {set} = ?2 WHERE hash = ?1"),
                 params![hash, value],
             )
             .map(drop)
@@ -163,8 +147,8 @@ impl Store {
     fn finish(&self, hash: &[u8; 32], state: &str) -> Result<(), Failure> {
         self.conn()
             .execute(
-                "UPDATE receipts SET state = ?2, done_at = ?3 WHERE hash = ?1",
-                params![hash, state, sql(now())],
+                "UPDATE lightning_receipts SET state = ?2, done_at = ?3 WHERE hash = ?1",
+                params![hash, state, sql(now())?],
             )
             .map(drop)
             .map_err(store_down)
@@ -172,7 +156,7 @@ impl Store {
 }
 
 const RECEIPTS: &str =
-    "SELECT hash, body, amount, msat, request, lock, state, created_at FROM receipts";
+    "SELECT hash, body, amount, msat, request, lock, state, created_at FROM lightning_receipts";
 
 fn receipt(r: &Row<'_>) -> rusqlite::Result<Receipt> {
     let state = match r.get::<_, String>(6)?.as_str() {
@@ -193,8 +177,8 @@ fn receipt(r: &Row<'_>) -> rusqlite::Result<Receipt> {
     })
 }
 
-fn sql(n: u64) -> i64 {
-    i64::try_from(n).unwrap_or(i64::MAX)
+fn sql(n: u64) -> Result<i64, Failure> {
+    licash_store::sat(n).map_err(store_down)
 }
 
 fn store_down(e: rusqlite::Error) -> Failure {
@@ -212,9 +196,15 @@ impl Gateway {
         Ok(self.recorded(hash)?.is_some())
     }
 
-    /// Which of `hashes` the receipts file at `path` holds, if there is one.
-    pub fn holding(path: &Path, hashes: &[[u8; 32]]) -> rusqlite::Result<HashSet<[u8; 32]>> {
-        peer::recorded_in(path, "SELECT 1 FROM receipts WHERE hash = ?1", hashes)
+    /// Which of `hashes` the receipts in the hub's database at `db` hold, if
+    /// the gateway ever ran there.
+    pub fn holding(db: &Path, hashes: &[[u8; 32]]) -> anyhow::Result<HashSet<[u8; 32]>> {
+        peer::recorded_in(
+            db,
+            COMPONENT,
+            "SELECT 1 FROM lightning_receipts WHERE hash = ?1",
+            hashes,
+        )
     }
 
     /// The receipt under `hash`, if any, and the lock it backs once
@@ -892,7 +882,7 @@ mod tests {
     #[test]
     fn receipt_admission_is_atomic_and_never_blocks_existing_obligations() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("lightning.sqlite");
+        let path = crate::testing::hub_file(dir.path());
         let store = std::sync::Arc::new(Store::open(&path).unwrap());
         let admitted = std::thread::scope(|scope| {
             let requests: Vec<_> = (0u8..32)
@@ -923,9 +913,9 @@ mod tests {
     }
 
     #[test]
-    fn the_receipts_file_is_new_or_the_gateways() {
+    fn the_receipts_are_kept_across_a_reopening_and_refused_where_not_the_hubs() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("lightning.sqlite");
+        let path = crate::testing::hub_file(dir.path());
         let store = Store::open(&path).unwrap();
         store.insert(&[1; 32], "{}", 5, 6000, 1024).unwrap();
         store
@@ -949,11 +939,14 @@ mod tests {
         conn.execute_batch("CREATE TABLE t (x INTEGER)").unwrap();
         drop(conn);
         assert!(Store::open(&other).is_err());
-        let newer = dir.path().join("newer.sqlite");
-        let conn = Connection::open(&newer).unwrap();
-        conn.pragma_update(None, "user_version", VERSION + 1)
-            .unwrap();
+        // Tables of a version this gateway does not read.
+        let conn = Connection::open(&path).unwrap();
+        conn.execute(
+            "UPDATE schema_versions SET version = ?1 WHERE component = 'lightning'",
+            [VERSION + 1],
+        )
+        .unwrap();
         drop(conn);
-        assert!(Store::open(&newer).is_err());
+        assert!(Store::open(&path).is_err());
     }
 }

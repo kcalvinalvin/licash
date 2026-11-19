@@ -11,7 +11,7 @@
 //! notes. A lock refunded unclaimed leaves the coins to their payer.
 //!
 //! The deposits, and the blocks the gateway scanned for their payments and
-//! claims, are kept in its own SQLite file.
+//! claims, are kept in the hub's database, the component `deposits`.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -38,6 +38,7 @@ use licash_onchain::{
     deadline,
     deposit::{self, Htlc},
 };
+use licash_store::Kind;
 use rusqlite::{params, Connection, OptionalExtension, Row};
 
 use crate::{
@@ -150,42 +151,58 @@ impl Config {
     }
 }
 
+/// The component the deposits' tables are, and its version.
+const COMPONENT: &str = "deposits";
 const VERSION: i64 = 1;
 
+/// A stage a deposit reaches is a table of its own, one row of it a fact.
 const SCHEMA: &str = "
 -- Deposits asked for, recorded before their address is answered: paid
 -- once a payment confirms, locked, then settled and claimed, or canceled.
--- Live until done.
+-- Live until done. `lock` is the proposal of the hub's lock to the wallet,
+-- `preimage` the one the wallet revealed claiming its notes.
 CREATE TABLE deposits (
-    hash BLOB PRIMARY KEY,
+    hash BLOB PRIMARY KEY CHECK (length(hash) = 32),
     -- The deposit asked for, as JSON.
     body TEXT NOT NULL,
-    amount INTEGER NOT NULL,
-    pays INTEGER NOT NULL,
-    claim BLOB NOT NULL,
-    refund BLOB NOT NULL,
-    timeout INTEGER NOT NULL,
-    fund_by INTEGER NOT NULL,
+    amount INTEGER NOT NULL CHECK (amount >= 0),
+    pays INTEGER NOT NULL CHECK (pays >= 0),
+    claim_key BLOB NOT NULL,
+    refund_key BLOB NOT NULL,
+    timeout_height INTEGER NOT NULL,
+    fund_by_height INTEGER NOT NULL,
     script BLOB NOT NULL,
-    -- Its payment, once confirmed.
-    txid BLOB,
-    vout INTEGER,
-    height INTEGER,
     lock BLOB,
     preimage BLOB,
-    -- The hub's claim, once made, and the spend of the payment, once
-    -- confirmed.
-    sweep BLOB,
-    sweep_txid BLOB,
-    spent INTEGER,
-    spent_by BLOB,
     state TEXT NOT NULL CHECK (state IN ('open', 'locked', 'settled', 'canceled')),
     created_at INTEGER NOT NULL,
     done_at INTEGER
 ) STRICT;
 CREATE INDEX live_deposits ON deposits (state) WHERE done_at IS NULL;
+-- Its payment, once confirmed: forgotten again if its block leaves the best
+-- chain before the deposit is locked.
+CREATE TABLE deposit_fundings (
+    hash BLOB PRIMARY KEY REFERENCES deposits (hash),
+    txid BLOB NOT NULL,
+    vout INTEGER NOT NULL,
+    height INTEGER NOT NULL
+) STRICT;
+-- The hub's claim of the payment, once made, before it is broadcast, and its
+-- id: made again at a higher fee as the timeout nears.
+CREATE TABLE deposit_sweeps (
+    hash BLOB PRIMARY KEY REFERENCES deposits (hash),
+    tx BLOB NOT NULL,
+    txid BLOB NOT NULL
+) STRICT;
+-- The spend of the payment, once confirmed, by the hub's claim or by its
+-- payer taking it back: forgotten again if its block leaves the best chain.
+CREATE TABLE deposit_spends (
+    hash BLOB PRIMARY KEY REFERENCES deposits (hash),
+    txid BLOB NOT NULL,
+    height INTEGER NOT NULL
+) STRICT;
 -- The blocks of the best chain scanned, of late.
-CREATE TABLE blocks (
+CREATE TABLE deposit_blocks (
     height INTEGER PRIMARY KEY,
     hash BLOB NOT NULL
 ) STRICT;
@@ -195,7 +212,7 @@ CREATE TABLE blocks (
 /// forked.
 const KEPT_BLOCKS: u32 = 1_000;
 
-/// The gateway's deposits, in a SQLite file of their own.
+/// The gateway's deposits, in the hub's database.
 struct Store(Mutex<Connection>);
 
 /// A deposit as recorded.
@@ -215,8 +232,13 @@ struct Record {
     state: ReceiveState,
 }
 
-const RECORDS: &str = "SELECT hash, body, amount, pays, claim, refund, timeout, fund_by, txid,
-    vout, height, lock, preimage, sweep, spent_by, state FROM deposits";
+const RECORDS: &str = "SELECT d.hash, d.body, d.amount, d.pays, d.claim_key, d.refund_key,
+    d.timeout_height, d.fund_by_height, f.txid, f.vout, f.height, d.lock, d.preimage, w.tx,
+    p.txid, d.state
+    FROM deposits d
+    LEFT JOIN deposit_fundings f ON f.hash = d.hash
+    LEFT JOIN deposit_sweeps w ON w.hash = d.hash
+    LEFT JOIN deposit_spends p ON p.hash = d.hash";
 
 /// The key in column `i` of `r`.
 fn x_only(r: &Row<'_>, i: usize) -> rusqlite::Result<XOnlyPublicKey> {
@@ -268,32 +290,17 @@ fn record(r: &Row<'_>) -> rusqlite::Result<Record> {
     })
 }
 
-fn sql(n: u64) -> i64 {
-    i64::try_from(n).unwrap_or(i64::MAX)
+/// `n` as a database integer: an amount beyond it is an error, not a lesser one.
+fn sql(n: u64) -> rusqlite::Result<i64> {
+    licash_store::sat(n)
 }
 
 impl Store {
-    /// The deposits at `path`, a new file or one this gateway wrote.
+    /// The deposits in the hub's database at `path`, made if the gateway
+    /// never ran there.
     fn open(path: &Path) -> anyhow::Result<Self> {
-        let mut conn = Connection::open(path)?;
-        conn.busy_timeout(Duration::from_secs(5))?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.pragma_update(None, "synchronous", "FULL")?;
-        let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if version == 0 {
-            let tables: i64 =
-                conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get(0))?;
-            anyhow::ensure!(tables == 0, "{} is not the hub's deposits", path.display());
-            let tx = conn.transaction()?;
-            tx.execute_batch(SCHEMA)?;
-            tx.pragma_update(None, "user_version", VERSION)?;
-            tx.commit()?;
-        } else {
-            anyhow::ensure!(
-                version == VERSION,
-                "deposits schema {version}, this hub reads {VERSION}"
-            );
-        }
+        let mut conn = licash_store::open(path, Kind::Hub)?;
+        licash_store::component(&mut conn, COMPONENT, VERSION, SCHEMA)?;
         Ok(Self(Mutex::new(conn)))
     }
 
@@ -303,7 +310,7 @@ impl Store {
 
     fn get(&self, hash: &[u8; 32]) -> rusqlite::Result<Option<Record>> {
         let conn = self.conn();
-        conn.query_row(&format!("{RECORDS} WHERE hash = ?1"), [hash], record)
+        conn.query_row(&format!("{RECORDS} WHERE d.hash = ?1"), [hash], record)
             .optional()
     }
 
@@ -311,7 +318,7 @@ impl Store {
     fn live(&self) -> rusqlite::Result<Vec<Record>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(&format!(
-            "{RECORDS} WHERE done_at IS NULL ORDER BY created_at, rowid"
+            "{RECORDS} WHERE d.done_at IS NULL ORDER BY d.created_at, d.rowid"
         ))?;
         let live = stmt.query_map([], record)?.collect();
         live
@@ -330,22 +337,22 @@ impl Store {
     ) -> rusqlite::Result<bool> {
         let conn = self.conn();
         let inserted = conn.execute(
-            "INSERT INTO deposits (hash, body, amount, pays, claim, refund, timeout, fund_by,
-                 script, state, created_at)
+            "INSERT INTO deposits (hash, body, amount, pays, claim_key, refund_key,
+                 timeout_height, fund_by_height, script, state, created_at)
              SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'open', ?10
              WHERE (SELECT count(*) FROM deposits WHERE state = 'open' AND done_at IS NULL) < ?11
              ON CONFLICT DO NOTHING",
             params![
                 htlc.hash,
                 body,
-                sql(amount),
-                sql(pays),
+                sql(amount)?,
+                sql(pays)?,
                 htlc.claim.serialize(),
                 htlc.refund.serialize(),
                 htlc.timeout,
                 fund_by,
                 htlc.script_pubkey().as_bytes(),
-                sql(now()),
+                sql(now())?,
                 most,
             ],
         )?;
@@ -371,14 +378,14 @@ impl Store {
             "UPDATE deposits SET state = ?2,
                  done_at = CASE WHEN ?2 IN ('locked', 'settled') THEN NULL ELSE ?3 END
              WHERE hash = ?1",
-            params![hash, state, sql(now())],
+            params![hash, state, sql(now())?],
         )?;
         Ok(())
     }
 
     /// Done with a deposit as it stands.
     fn done(&self, hash: &[u8; 32]) -> rusqlite::Result<()> {
-        self.set(hash, "done_at", &sql(now()))
+        self.set(hash, "done_at", &sql(now())?)
     }
 
     /// The newest block scanned.
@@ -386,7 +393,7 @@ impl Store {
         let conn = self.conn();
         let top = conn
             .query_row(
-                "SELECT height, hash FROM blocks ORDER BY height DESC LIMIT 1",
+                "SELECT height, hash FROM deposit_blocks ORDER BY height DESC LIMIT 1",
                 [],
                 |r| Ok((r.get(0)?, r.get::<_, [u8; 32]>(1)?)),
             )
@@ -397,9 +404,11 @@ impl Store {
     fn hash_at(&self, height: u32) -> rusqlite::Result<Option<BlockHash>> {
         let conn = self.conn();
         let hash = conn
-            .query_row("SELECT hash FROM blocks WHERE height = ?1", [height], |r| {
-                r.get::<_, [u8; 32]>(0)
-            })
+            .query_row(
+                "SELECT hash FROM deposit_blocks WHERE height = ?1",
+                [height],
+                |r| r.get::<_, [u8; 32]>(0),
+            )
             .optional()?;
         Ok(hash.map(BlockHash::from_byte_array))
     }
@@ -410,11 +419,12 @@ impl Store {
     /// deposits in it and the spends of those paid.
     fn scanned(&self, height: u32, block: &Block) -> rusqlite::Result<()> {
         let mut conn = self.conn();
-        let tx = conn.transaction()?;
+        let tx = licash_store::begin(&mut conn)?;
         let mut unpaid: HashMap<Vec<u8>, ([u8; 32], u64, u32)> = tx
             .prepare(
-                "SELECT script, hash, pays, fund_by FROM deposits
-                 WHERE done_at IS NULL AND txid IS NULL",
+                "SELECT script, hash, pays, fund_by_height FROM deposits d
+                 WHERE d.done_at IS NULL
+                   AND NOT EXISTS (SELECT 1 FROM deposit_fundings f WHERE f.hash = d.hash)",
             )?
             .query_map([], |r| {
                 Ok((
@@ -425,8 +435,10 @@ impl Store {
             .collect::<rusqlite::Result<_>>()?;
         let mut paid: HashMap<OutPoint, Htlc> = tx
             .prepare(
-                "SELECT txid, vout, hash, claim, refund, timeout FROM deposits
-                 WHERE done_at IS NULL AND txid IS NOT NULL AND spent IS NULL",
+                "SELECT f.txid, f.vout, d.hash, d.claim_key, d.refund_key, d.timeout_height
+                 FROM deposits d JOIN deposit_fundings f ON f.hash = d.hash
+                 WHERE d.done_at IS NULL
+                   AND NOT EXISTS (SELECT 1 FROM deposit_spends s WHERE s.hash = d.hash)",
             )?
             .query_map([], |r| {
                 let txid = Txid::from_byte_array(r.get(0)?);
@@ -455,10 +467,15 @@ impl Store {
                 // else the payer took it back.
                 let ours = htlc.claimed_by(t, input.previous_output);
                 tx.execute(
-                    "UPDATE deposits SET spent = ?2, spent_by = ?3,
-                         done_at = CASE WHEN ?4 THEN ?5 ELSE done_at END
+                    "INSERT INTO deposit_spends (hash, txid, height) VALUES (?1, ?2, ?3)
+                     ON CONFLICT (hash) DO UPDATE SET txid = excluded.txid,
+                        height = excluded.height",
+                    params![hash, txid.to_byte_array(), height],
+                )?;
+                tx.execute(
+                    "UPDATE deposits SET done_at = CASE WHEN ?2 THEN ?3 ELSE done_at END
                      WHERE hash = ?1",
-                    params![hash, height, txid.to_byte_array(), ours, sql(now())],
+                    params![hash, ours, sql(now())?],
                 )?;
                 let hash = hex::encode(hash);
                 tracing::info!(%hash, %txid, height, ours, "a deposit's payment spent");
@@ -476,18 +493,21 @@ impl Store {
                 }
                 unpaid.remove(script);
                 tx.execute(
-                    "UPDATE deposits SET txid = ?2, vout = ?3, height = ?4 WHERE hash = ?1",
+                    "INSERT INTO deposit_fundings (hash, txid, vout, height)
+                     VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT (hash) DO UPDATE SET txid = excluded.txid,
+                        vout = excluded.vout, height = excluded.height",
                     params![hash, txid.to_byte_array(), vout, height],
                 )?;
                 tracing::info!(hash = %name, %txid, vout, height, "deposit paid");
             }
         }
         tx.execute(
-            "INSERT INTO blocks (height, hash) VALUES (?1, ?2)",
+            "INSERT INTO deposit_blocks (height, hash) VALUES (?1, ?2)",
             params![height, block.block_hash().to_byte_array()],
         )?;
         tx.execute(
-            "DELETE FROM blocks WHERE height < ?1",
+            "DELETE FROM deposit_blocks WHERE height < ?1",
             [height.saturating_sub(KEPT_BLOCKS)],
         )?;
         tx.commit()
@@ -496,7 +516,7 @@ impl Store {
     /// The oldest block kept.
     fn oldest(&self) -> rusqlite::Result<Option<u32>> {
         self.conn()
-            .query_row("SELECT MIN(height) FROM blocks", [], |r| r.get(0))
+            .query_row("SELECT MIN(height) FROM deposit_blocks", [], |r| r.get(0))
     }
 
     /// Forget the blocks from `height` up, which left the best chain, and
@@ -506,30 +526,32 @@ impl Store {
     /// should none older be: the scan goes on from `height`.
     fn rewind(&self, height: u32, below: Option<BlockHash>) -> rusqlite::Result<Vec<[u8; 32]>> {
         let mut conn = self.conn();
-        let tx = conn.transaction()?;
-        tx.execute("DELETE FROM blocks WHERE height >= ?1", [height])?;
+        let tx = licash_store::begin(&mut conn)?;
+        tx.execute("DELETE FROM deposit_blocks WHERE height >= ?1", [height])?;
         if let (Some(hash), Some(at)) = (below, height.checked_sub(1)) {
             tx.execute(
-                "INSERT INTO blocks (height, hash) VALUES (?1, ?2)
+                "INSERT INTO deposit_blocks (height, hash) VALUES (?1, ?2)
                  ON CONFLICT (height) DO UPDATE SET hash = excluded.hash",
                 params![at, hash.to_byte_array()],
             )?;
         }
         tx.execute(
-            "UPDATE deposits SET txid = NULL, vout = NULL, height = NULL
-             WHERE height >= ?1 AND state = 'open' AND done_at IS NULL",
+            "DELETE FROM deposit_fundings WHERE height >= ?1 AND hash IN
+                (SELECT hash FROM deposits WHERE state = 'open' AND done_at IS NULL)",
             [height],
         )?;
         tx.execute(
-            "UPDATE deposits SET spent = NULL, spent_by = NULL,
-                 done_at = CASE WHEN state = 'settled' THEN NULL ELSE done_at END
-             WHERE spent >= ?1",
+            "UPDATE deposits SET done_at = NULL
+             WHERE state = 'settled'
+               AND hash IN (SELECT hash FROM deposit_spends WHERE height >= ?1)",
             [height],
         )?;
+        tx.execute("DELETE FROM deposit_spends WHERE height >= ?1", [height])?;
         let unbacked = tx
             .prepare(
-                "SELECT hash FROM deposits
-                 WHERE height >= ?1 AND state IN ('locked', 'settled') AND spent IS NULL",
+                "SELECT d.hash FROM deposits d JOIN deposit_fundings f ON f.hash = d.hash
+                 WHERE f.height >= ?1 AND d.state IN ('locked', 'settled')
+                   AND NOT EXISTS (SELECT 1 FROM deposit_spends s WHERE s.hash = d.hash)",
             )?
             .query_map([height], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?;
@@ -563,7 +585,8 @@ impl Store {
     /// Record the hub's claim of a deposit, before it is broadcast.
     fn set_sweep(&self, hash: &[u8; 32], tx: &Transaction) -> rusqlite::Result<()> {
         self.conn().execute(
-            "UPDATE deposits SET sweep = ?2, sweep_txid = ?3 WHERE hash = ?1",
+            "INSERT INTO deposit_sweeps (hash, tx, txid) VALUES (?1, ?2, ?3)
+             ON CONFLICT (hash) DO UPDATE SET tx = excluded.tx, txid = excluded.txid",
             params![hash, serialize(tx), tx.compute_txid().to_byte_array()],
         )?;
         Ok(())
@@ -763,8 +786,13 @@ impl Gateway {
     }
 
     /// Which of `hashes` the deposits file at `path` holds, if there is one.
-    pub fn holding(path: &Path, hashes: &[[u8; 32]]) -> rusqlite::Result<HashSet<[u8; 32]>> {
-        peer::recorded_in(path, "SELECT 1 FROM deposits WHERE hash = ?1", hashes)
+    pub fn holding(db: &Path, hashes: &[[u8; 32]]) -> anyhow::Result<HashSet<[u8; 32]>> {
+        peer::recorded_in(
+            db,
+            COMPONENT,
+            "SELECT 1 FROM deposits WHERE hash = ?1",
+            hashes,
+        )
     }
 
     /// The deposit under `hash`, if any, and the lock it backs once

@@ -12,6 +12,20 @@ pub mod peer;
 pub mod tweaks;
 pub mod watch;
 
+/// Fixtures of the hub's database for unit tests.
+#[cfg(test)]
+pub(crate) mod testing {
+    /// The hub's database in `dir`: made once, of the hub's kind, holding no
+    /// component yet, for a module's tables to be made in.
+    pub(crate) fn hub_file(dir: &std::path::Path) -> std::path::PathBuf {
+        let file = dir.join("hub.sqlite");
+        if !file.exists() {
+            drop(licash_store::create(&file, licash_store::Kind::Hub).unwrap());
+        }
+        file
+    }
+}
+
 use std::sync::Arc;
 
 use axum::{

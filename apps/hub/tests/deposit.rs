@@ -99,7 +99,7 @@ impl Net {
         hub.add_checkpoint(&chain.checkpoint(0)).unwrap();
         let backend = esplora::backend(chain);
         let source: Source = esplora::serve(backend.clone()).parse().unwrap();
-        let deposits = Arc::new(gateway(&hub, &source, &dir.path().join("deposits.sqlite")));
+        let deposits = Arc::new(gateway(&hub, &source, &dir.path().join("hub.sqlite")));
         let services = Services {
             deposits: Some(deposits.clone()),
             ..Default::default()
@@ -277,7 +277,7 @@ fn lightning(net: &Net) -> (Arc<Fake>, Arc<lightning::Gateway>) {
         net.hub.clone(),
         node.clone(),
         config,
-        &net.dir.path().join("lightning.sqlite"),
+        &net.dir.path().join("hub.sqlite"),
     )
     .unwrap();
     (node, Arc::new(gateway))
@@ -286,11 +286,20 @@ fn lightning(net: &Net) -> (Arc<Fake>, Arc<lightning::Gateway>) {
 fn swap_record(net: &Net, hash: [u8; 32], state: &str, lock: Option<licash::spend::ProposalId>) {
     let dir = net.dir.path().join("swaps");
     std::fs::create_dir(&dir).unwrap();
-    let db = rusqlite::Connection::open(dir.join("swaps.sqlite")).unwrap();
-    db.execute_batch("CREATE TABLE swaps (hash BLOB PRIMARY KEY, state TEXT, lock BLOB)")
-        .unwrap();
+    // As the swap provider keeps its swaps, in its wallet's file: but for
+    // the columns these gateways read.
+    let mut db =
+        licash_store::create(&dir.join("wallet.sqlite"), licash_store::Kind::Wallet).unwrap();
+    licash_store::component(
+        &mut db,
+        "provider",
+        1,
+        "CREATE TABLE provider_swaps (hash BLOB PRIMARY KEY, state TEXT, lock BLOB) STRICT;
+         CREATE TABLE provider_donations (hash BLOB PRIMARY KEY) STRICT;",
+    )
+    .unwrap();
     db.execute(
-        "INSERT INTO swaps (hash, state, lock) VALUES (?1, ?2, ?3)",
+        "INSERT INTO provider_swaps (hash, state, lock) VALUES (?1, ?2, ?3)",
         rusqlite::params![hash, state, lock.map(|id| *id.as_bytes())],
     )
     .unwrap();
@@ -305,7 +314,7 @@ async fn gateways_refuse_every_hash_reserved_by_a_swap_even_when_swaps_are_off()
         let (_, body) = net.asked("alice", &deposit.hash);
         let hash = bytes(&deposit.hash);
         // Reuse the request, but no gateway has reserved it yet.
-        let db = rusqlite::Connection::open(net.dir.path().join("deposits.sqlite")).unwrap();
+        let db = rusqlite::Connection::open(net.dir.path().join("hub.sqlite")).unwrap();
         db.execute("DELETE FROM deposits WHERE hash = ?1", [hash])
             .unwrap();
         swap_record(&net, hash, state, None);
@@ -341,7 +350,7 @@ async fn a_disabled_receipt_gateway_still_reserves_its_hashes() {
     let deposit = alice.deposit(HUB, 3_000).await.unwrap();
     let (_, body) = net.asked("alice", &deposit.hash);
     let hash = bytes(&deposit.hash);
-    let db = rusqlite::Connection::open(net.dir.path().join("deposits.sqlite")).unwrap();
+    let db = rusqlite::Connection::open(net.dir.path().join("hub.sqlite")).unwrap();
     db.execute("DELETE FROM deposits WHERE hash = ?1", [hash])
         .unwrap();
     let (_, lightning) = lightning(&net);
@@ -371,7 +380,7 @@ async fn a_gateway_waits_for_the_issuers_turn_and_then_sees_its_reservation() {
     let deposit = alice.deposit(HUB, 3_000).await.unwrap();
     let (_, body) = net.asked("alice", &deposit.hash);
     let hash = bytes(&deposit.hash);
-    let db = rusqlite::Connection::open(net.dir.path().join("deposits.sqlite")).unwrap();
+    let db = rusqlite::Connection::open(net.dir.path().join("hub.sqlite")).unwrap();
     db.execute("DELETE FROM deposits WHERE hash = ?1", [hash])
         .unwrap();
     let turn = Arc::new(tokio::sync::Mutex::new(()));
@@ -491,7 +500,7 @@ async fn short_deposit_lock(claimed_paid: bool) {
         .lock_own(&keyset, ephemeral, vec![outputs[0]], terms)
         .unwrap();
     let id = lock.proposal.id();
-    let db = rusqlite::Connection::open(net.dir.path().join("deposits.sqlite")).unwrap();
+    let db = rusqlite::Connection::open(net.dir.path().join("hub.sqlite")).unwrap();
     db.execute(
         "UPDATE deposits SET lock = ?1, state = 'locked' WHERE hash = ?2",
         rusqlite::params![id.as_bytes(), hash],
@@ -1080,6 +1089,8 @@ async fn deposits_asked_and_not_paid_are_bounded_retries_aside() {
         bodies.push(net.asked(name, &deposit.hash).1);
     }
     let path = net.dir.path().join("bounded.sqlite");
+    // Its own database: it counts the deposits it holds, and no others.
+    drop(licash_store::create(&path, licash_store::Kind::Hub).unwrap());
     let bounded = deposit::Config {
         max_open: 1,
         ..config()
@@ -1103,6 +1114,7 @@ async fn deposits_outside_the_hubs_terms_are_refused() {
     let (_, body) = net.asked("alice", &deposit.hash);
     // Of more than another gateway takes.
     let path = net.dir.path().join("other.sqlite");
+    drop(licash_store::create(&path, licash_store::Kind::Hub).unwrap());
     let mut other = config();
     other.max = 2_000;
     let profile = ChainProfile::Core30DefaultRegtest;
@@ -1143,7 +1155,7 @@ async fn deposits_outside_the_hubs_terms_are_refused() {
 }
 
 #[tokio::test]
-async fn deposits_are_kept_in_a_file_of_their_own_and_timed_within_the_hubs_locks() {
+async fn deposits_are_kept_in_the_hubs_database_and_timed_within_the_hubs_locks() {
     let net = Net::new().await;
     let profile = ChainProfile::Core30DefaultRegtest;
     let open = |config, path: &std::path::Path| {
@@ -1151,23 +1163,29 @@ async fn deposits_are_kept_in_a_file_of_their_own_and_timed_within_the_hubs_lock
             .err()
             .map(|e| e.to_string())
     };
-    // Not a file of deposits, nor of a schema this hub reads.
+    // Not the hub's database, nor of a version of the deposits this hub
+    // reads.
     let foreign = net.dir.path().join("foreign.sqlite");
     let db = rusqlite::Connection::open(&foreign).unwrap();
     db.execute_batch("CREATE TABLE t (x)").unwrap();
     assert!(open(config(), &foreign)
         .unwrap()
-        .contains("not the hub's deposits"));
+        .contains("not made by this layout"));
     let path = net.dir.path().join("old.sqlite");
+    drop(licash_store::create(&path, licash_store::Kind::Hub).unwrap());
     assert_eq!(open(config(), &path), None);
     rusqlite::Connection::open(&path)
         .unwrap()
-        .pragma_update(None, "user_version", 2)
+        .execute(
+            "UPDATE schema_versions SET version = 2 WHERE component = 'deposits'",
+            [],
+        )
         .unwrap();
-    assert!(open(config(), &path).unwrap().contains("deposits schema 2"));
+    assert!(open(config(), &path).unwrap().contains("is of version 2"));
     // A lock lasting beyond the window of the hub's, with its depth and
     // reaction; nothing locked; no confirmation asked; fewer than none.
     let fresh = net.dir.path().join("fresh.sqlite");
+    drop(licash_store::create(&fresh, licash_store::Kind::Hub).unwrap());
     let long = deposit::Config {
         lock_blocks: 38,
         ..config()
@@ -1190,7 +1208,13 @@ async fn deposits_are_kept_in_a_file_of_their_own_and_timed_within_the_hubs_lock
         ..config()
     };
     assert!(open(empty, &fresh).unwrap().contains("at most the largest"));
-    assert!(!fresh.exists());
+    // Nothing was made by the refused configurations.
+    let conn = licash_store::open(&fresh, licash_store::Kind::Hub).unwrap();
+    assert_eq!(
+        licash_store::component_version(&conn, "deposits").unwrap(),
+        None
+    );
+    drop(conn);
     let fits = deposit::Config {
         lock_blocks: 37,
         ..config()

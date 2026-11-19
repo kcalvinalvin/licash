@@ -1,33 +1,35 @@
 //! The hub's inbox ([`licash_api::inbox`]): the payments it released that
 //! their payers asked it to keep for their payees, for
-//! [`inbox::KEPT_FOR`], in a SQLite file of its own. Nothing in it is
-//! secret, and deleting it loses only the payments kept: their payers mail
-//! them once no ack comes. Its sequence numbers start, at each opening,
-//! above the time of day in microseconds, so that they only grow even when
-//! the file is lost or an older copy restored.
+//! [`inbox::KEPT_FOR`], in the hub's database, the component `inbox`.
+//! Nothing in it is secret, and losing it loses only the payments kept:
+//! their payers mail them once no ack comes. Its sequence numbers start, at
+//! each opening, above the time of day in microseconds, so that they only
+//! grow even when the rows are lost or an older copy restored.
 
 use std::{
     path::Path,
     sync::{Mutex, MutexGuard},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{ensure, Context};
+use anyhow::Context;
 use licash::spend::ProposalId;
 use licash_api::{
     inbox::{self, Entry, Feed, Receipt},
     Hex,
 };
+use licash_store::Kind;
 use rusqlite::{params, Connection, OptionalExtension};
 
-/// The schema this inbox reads and writes, as SQLite's `user_version`.
+/// The component the inbox's table is, and its version.
+const COMPONENT: &str = "inbox";
 const VERSION: i64 = 1;
 
 const SCHEMA: &str = "
 -- Each payment kept, by its proposal, as its payer asked: the tag its
 -- payee finds it by, the key it takes it with, the commitment to its ack,
 -- and the ack once told. The payment is a Receipt, in JSON.
-CREATE TABLE kept (
+CREATE TABLE inbox_kept (
     seq INTEGER PRIMARY KEY,
     proposal BLOB NOT NULL UNIQUE,
     ephemeral BLOB NOT NULL,
@@ -38,8 +40,8 @@ CREATE TABLE kept (
     payment TEXT NOT NULL,
     kept_at INTEGER NOT NULL
 ) STRICT;
-CREATE INDEX kept_by_key ON kept (key);
-CREATE INDEX kept_by_time ON kept (kept_at);
+CREATE INDEX inbox_kept_by_key ON inbox_kept (key);
+CREATE INDEX inbox_kept_by_time ON inbox_kept (kept_at);
 ";
 
 /// The inbox, in its file.
@@ -50,28 +52,11 @@ pub struct Inbox {
 }
 
 impl Inbox {
-    /// The inbox at `path`, a new file or one a hub wrote.
+    /// The inbox in the hub's database at `path`, made if the hub never
+    /// kept one there.
     pub fn open(path: &Path) -> anyhow::Result<Self> {
-        let mut conn = Connection::open(path)?;
-        conn.busy_timeout(Duration::from_secs(5))?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
-        // A payment answered kept is kept.
-        conn.pragma_update(None, "synchronous", "FULL")?;
-        let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if version == 0 {
-            let tables: i64 =
-                conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get(0))?;
-            ensure!(tables == 0, "{} is not an inbox", path.display());
-            let tx = conn.transaction()?;
-            tx.execute_batch(SCHEMA)?;
-            tx.pragma_update(None, "user_version", VERSION)?;
-            tx.commit()?;
-        } else {
-            ensure!(
-                version == VERSION,
-                "inbox schema {version}, this hub reads {VERSION}"
-            );
-        }
+        let mut conn = licash_store::open(path, Kind::Hub)?;
+        licash_store::component(&mut conn, COMPONENT, VERSION, SCHEMA)?;
         let micros = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .context("the clock")?
@@ -100,15 +85,16 @@ impl Inbox {
         let payment = serde_json::to_string(receipt)?;
         let now = now();
         let mut conn = self.conn();
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = licash_store::begin(&mut conn)?;
         tx.execute(
-            "DELETE FROM kept WHERE kept_at < ?1",
+            "DELETE FROM inbox_kept WHERE kept_at < ?1",
             [now - inbox::KEPT_FOR],
         )?;
-        let last: Option<i64> = tx.query_row("SELECT max(seq) FROM kept", [], |r| r.get(0))?;
+        let last: Option<i64> =
+            tx.query_row("SELECT max(seq) FROM inbox_kept", [], |r| r.get(0))?;
         let seq = last.map_or(self.floor, |last| (last + 1).max(self.floor));
         tx.execute(
-            "INSERT INTO kept (seq, proposal, ephemeral, tag, key, commitment, payment, kept_at)
+            "INSERT INTO inbox_kept (seq, proposal, ephemeral, tag, key, commitment, payment, kept_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) ON CONFLICT (proposal) DO NOTHING",
             params![
                 seq,
@@ -129,8 +115,9 @@ impl Inbox {
     pub fn feed(&self, after: u64) -> anyhow::Result<Feed> {
         let after = i64::try_from(after).unwrap_or(i64::MAX);
         let conn = self.conn();
-        let mut query = conn
-            .prepare("SELECT seq, ephemeral, tag FROM kept WHERE seq > ?1 ORDER BY seq LIMIT ?2")?;
+        let mut query = conn.prepare(
+            "SELECT seq, ephemeral, tag FROM inbox_kept WHERE seq > ?1 ORDER BY seq LIMIT ?2",
+        )?;
         let limit = inbox::MAX_ENTRIES as i64 + 1;
         let rows = query.query_map(params![after, limit], |r| {
             Ok(Entry {
@@ -149,7 +136,8 @@ impl Inbox {
     /// kept under its key.
     pub fn take(&self, asked: &[(u64, [u8; 32])]) -> anyhow::Result<Vec<Option<Receipt>>> {
         let conn = self.conn();
-        let mut query = conn.prepare("SELECT payment FROM kept WHERE seq = ?1 AND key = ?2")?;
+        let mut query =
+            conn.prepare("SELECT payment FROM inbox_kept WHERE seq = ?1 AND key = ?2")?;
         asked
             .iter()
             .map(|(seq, key)| {
@@ -169,12 +157,12 @@ impl Inbox {
     /// whether it is that payment's, which then tells its payer.
     pub fn acknowledge(&self, acks: &[([u8; 32], [u8; 32])]) -> anyhow::Result<Vec<bool>> {
         let mut conn = self.conn();
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let tx = licash_store::begin(&mut conn)?;
         let mut acked = Vec::with_capacity(acks.len());
         for (key, ack) in acks {
             let commitment = inbox::commitment(ack);
             let changed = tx.execute(
-                "UPDATE kept SET ack = ?3 WHERE key = ?1 AND commitment = ?2",
+                "UPDATE inbox_kept SET ack = ?3 WHERE key = ?1 AND commitment = ?2",
                 params![key, commitment, ack],
             )?;
             acked.push(changed > 0);
@@ -187,7 +175,7 @@ impl Inbox {
     pub fn acks(&self, keys: &[[u8; 32]]) -> anyhow::Result<Vec<Option<[u8; 32]>>> {
         let conn = self.conn();
         let mut query = conn.prepare(
-            "SELECT ack FROM kept WHERE key = ?1 AND ack IS NOT NULL ORDER BY seq LIMIT 1",
+            "SELECT ack FROM inbox_kept WHERE key = ?1 AND ack IS NOT NULL ORDER BY seq LIMIT 1",
         )?;
         keys.iter()
             .map(|key| {
@@ -226,7 +214,7 @@ mod tests {
     #[test]
     fn a_payment_is_kept_once_taken_with_its_key_and_acknowledged_with_its_ack() {
         let dir = tempfile::tempdir().unwrap();
-        let inbox = Inbox::open(&dir.path().join("inbox.sqlite")).unwrap();
+        let inbox = Inbox::open(&crate::testing::hub_file(dir.path())).unwrap();
         let (asked, ack) = keep(1);
         let id = ProposalId::from_bytes([1; 32]);
         inbox.keep(&id, &[2; 33], &asked, &receipt(1)).unwrap();
@@ -255,9 +243,9 @@ mod tests {
     }
 
     #[test]
-    fn its_numbers_only_grow_though_the_file_is_lost_or_restored() {
+    fn its_numbers_only_grow_though_its_rows_are_lost_or_the_database_restored() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("inbox.sqlite");
+        let path = crate::testing::hub_file(dir.path());
         let inbox = Inbox::open(&path).unwrap();
         for n in 1..=3 {
             let id = ProposalId::from_bytes([n; 32]);
@@ -268,8 +256,11 @@ mod tests {
         assert!(seen.windows(2).all(|w| w[0].seq < w[1].seq));
         drop(inbox);
 
-        // Lost: a new file goes on above what payees saw.
-        std::fs::remove_file(&path).unwrap();
+        // Lost: it goes on above what payees saw.
+        Connection::open(&path)
+            .unwrap()
+            .execute("DELETE FROM inbox_kept", [])
+            .unwrap();
         let inbox = Inbox::open(&path).unwrap();
         let id = ProposalId::from_bytes([4; 32]);
         inbox.keep(&id, &[2; 33], &keep(4).0, &receipt(4)).unwrap();
@@ -281,14 +272,14 @@ mod tests {
     #[test]
     fn the_feed_comes_in_pages() {
         let dir = tempfile::tempdir().unwrap();
-        let inbox = Inbox::open(&dir.path().join("inbox.sqlite")).unwrap();
+        let inbox = Inbox::open(&crate::testing::hub_file(dir.path())).unwrap();
         {
             // In one transaction, rather than a sync each.
             let mut conn = inbox.conn();
             let tx = conn.transaction().unwrap();
             for n in 1..=inbox::MAX_ENTRIES as i64 + 1 {
                 tx.execute(
-                    "INSERT INTO kept (seq, proposal, ephemeral, tag, key, commitment, payment,
+                    "INSERT INTO inbox_kept (seq, proposal, ephemeral, tag, key, commitment, payment,
                         kept_at) VALUES (?1, ?2, x'02', x'00', x'00', x'00', '{}', ?3)",
                     params![n, n.to_be_bytes(), now()],
                 )
@@ -305,7 +296,7 @@ mod tests {
     }
 
     #[test]
-    fn a_file_of_another_kind_is_refused() {
+    fn a_file_that_is_not_a_hubs_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("other.sqlite");
         Connection::open(&path)
@@ -313,5 +304,9 @@ mod tests {
             .execute_batch("CREATE TABLE t (x INTEGER)")
             .unwrap();
         assert!(Inbox::open(&path).is_err());
+        // Nor a wallet's.
+        let wallet = dir.path().join("wallet.sqlite");
+        drop(licash_store::create(&wallet, licash_store::Kind::Wallet).unwrap());
+        assert!(Inbox::open(&wallet).is_err());
     }
 }
