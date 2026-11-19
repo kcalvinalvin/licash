@@ -6,6 +6,7 @@ members = [
     "crates/licash-hub",
     "crates/licash-lightning",
     "crates/licash-onchain",
+    "crates/licash-store",
     "crates/licash-swaps",
     "crates/licash-wallet",
 ]

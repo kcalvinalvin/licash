@@ -20,6 +20,7 @@ license = "MIT"
 licash = { path = "../crates/licash" }
 licash-api = { path = "../crates/licash-api" }
 licash-hub = { path = "../crates/licash-hub" }
+licash-store = { path = "../crates/licash-store" }
 licash-swaps = { path = "../crates/licash-swaps" }
 licash-wallet = { path = "../crates/licash-wallet" }
 licash-onchain = { path = "../crates/licash-onchain" }

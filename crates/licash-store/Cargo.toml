@@ -1,0 +1,13 @@
+[package]
+name = "licash-store"
+description = "The SQLite file each Licash actor keeps: how it is made, opened, versioned by component and written"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rusqlite = { version = "0.40", features = ["bundled", "backup"] }
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile = "3.27"

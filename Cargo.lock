@@ -889,6 +889,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "licash-store"
+version = "0.0.1"
+dependencies = [
+ "rusqlite",
+ "tempfile",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "licash-swaps"
 version = "0.0.1"
 dependencies = [
