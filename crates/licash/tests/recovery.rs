@@ -1487,6 +1487,70 @@ fn the_hub_decides_what_a_filed_claim_is_owed() {
 }
 
 #[test]
+fn a_wallet_tests_a_note_against_evidence_as_the_statement_does() {
+    let o = open();
+    let keyset = o.base.parts().keyset.clone();
+    let hold = hold();
+    let ds: Vec<_> = (0..32).map(|i| derive(SPEND, &hold, 4, 23, i)).collect();
+    let notes: Vec<_> = ds.iter().map(|d| mint(&o.issuer, &keyset, d)).collect();
+    let owners: Vec<_> = (0..16).map(|i| owner(SPEND, 23, i)).collect();
+    let payment = spend(
+        &o,
+        &notes[..16],
+        &owners,
+        (0..8).map(|i| bob(8, i)).collect(),
+    );
+    let spent = Evidence::Spend {
+        signed: payment,
+        notes: notes[..16].to_vec(),
+        unlock: None,
+    };
+    let message = |i: usize| ds[i].message();
+    // A spend shows the notes it consumed spent, and no other.
+    assert!(recovery::voids_note(&keyset, message(0), &spent).unwrap());
+    assert!(recovery::voids_note(&keyset, message(15), &spent).unwrap());
+    assert!(!recovery::voids_note(&keyset, message(16), &spent).unwrap());
+    // The hold key's signature of another claim shows that note claimed, and
+    // only that one.
+    let other = hold::Context {
+        base: [1; 32],
+        deposit: [2; 36],
+        amount: 4,
+        claim_digest: [3; 32],
+    };
+    let record = hold::Envelope::sign(other, &hold_keys(&ds[20..21]), LIMIT)
+        .unwrap()
+        .records()[0]
+        .clone();
+    let second = Evidence::SecondClaim {
+        context: other,
+        record: record.clone(),
+    };
+    assert!(recovery::voids_note(&keyset, message(20), &second).unwrap());
+    assert!(!recovery::voids_note(&keyset, message(21), &second).unwrap());
+    // Proof, not assertion: a signature that is not the hold key's, or of
+    // another context than it says, shows nothing and is an error.
+    let mut forged = record.clone();
+    forged.sig.0[63] ^= 1;
+    let forged = Evidence::SecondClaim {
+        context: other,
+        record: forged,
+    };
+    assert!(recovery::voids_note(&keyset, message(20), &forged).is_err());
+    let misdated = Evidence::SecondClaim {
+        context: hold::Context { amount: 5, ..other },
+        record,
+    };
+    assert!(recovery::voids_note(&keyset, message(20), &misdated).is_err());
+    // A hub's preimage or expiry speaks of no single note.
+    let preimage = Evidence::PayPreimage {
+        source: licash::spend::ProposalId::from_bytes([9; 32]),
+        preimage: [8; 32],
+    };
+    assert!(!recovery::voids_note(&keyset, message(0), &preimage).unwrap());
+}
+
+#[test]
 fn a_note_is_claimed_in_any_contract_its_hold_key_designates() {
     let o = open();
     let keyset = o.base.parts().keyset.clone();

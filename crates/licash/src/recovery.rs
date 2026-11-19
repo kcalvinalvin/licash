@@ -581,6 +581,59 @@ pub fn disclosures(evidence: &[Evidence]) -> Result<Disclosures, Error> {
     Ok(disclosures)
 }
 
+/// The identifiers an owner-signed spend consumes, once verified: its
+/// owners' signatures, and for a granted spend its unlock. The owners
+/// committed to the grant, so a granted spend cannot be cited as a plain
+/// one to keep its unlock private.
+fn spent_by(
+    keyset: &Keyset,
+    signed: &SignedProposal,
+    notes: &[Note],
+    unlock: Option<&Unlock>,
+) -> Result<BTreeSet<Point>, Error> {
+    let spent = signed.verify(keyset, notes)?.into_iter().collect();
+    match (signed.authorization(), unlock) {
+        (Authorization::Plain, None) => {}
+        (Authorization::Granted(grant), Some(unlock)) => grant.verify_unlock(keyset, unlock)?,
+        _ => return Err(bad("a granted spend is cited with its unlock")),
+    }
+    Ok(spent)
+}
+
+/// A hold authorization of a claim of context `context`, as the Hub cites
+/// it against another claim of the same note: signed by the note's hold key.
+fn verify_second_claim(context: &hold::Context, record: &Record) -> Result<(), Error> {
+    crypto::schnorr_verify(
+        record.message.hold(),
+        &context.signing_digest(&record.message),
+        &record.sig,
+    )
+}
+
+/// Whether `evidence`, verified, shows `note` spent or claimed elsewhere,
+/// which is what voids it in any claim of it: an owner-signed spend that
+/// consumes it, or its hold key's signature of another claim of it. An
+/// error if the evidence does not verify. Only these two kinds speak of a
+/// single note; the others are false.
+///
+/// This is [`owed`]'s own test of an item, so that a wallet that closes
+/// without the Hub's proof drops exactly the notes the statement would void,
+/// and only on evidence it checked itself.
+pub fn voids_note(keyset: &Keyset, note: &Message, evidence: &Evidence) -> Result<bool, Error> {
+    match evidence {
+        Evidence::Spend {
+            signed,
+            notes,
+            unlock,
+        } => Ok(spent_by(keyset, signed, notes, unlock.as_ref())?.contains(&note.identifier()?)),
+        Evidence::SecondClaim { context, record } => {
+            verify_second_claim(context, record)?;
+            Ok(&record.message == note)
+        }
+        Evidence::PayPreimage { .. } | Evidence::Expired { .. } => Ok(false),
+    }
+}
+
 /// The items `evidence` voids (bit i for item i) and the sources it shows
 /// executed. Each evidence must void an item, or show a Plain source
 /// executed, which values its fallbacks. `chain` must be verified from the
@@ -612,16 +665,7 @@ fn void(
                 notes,
                 unlock,
             } => {
-                let spent: BTreeSet<_> = signed.verify(keyset, notes)?.into_iter().collect();
-                // The owners committed to the grant, so a granted spend cannot
-                // be cited as a plain one to keep its unlock private.
-                match (signed.authorization(), unlock) {
-                    (Authorization::Plain, None) => {}
-                    (Authorization::Granted(grant), Some(unlock)) => {
-                        grant.verify_unlock(keyset, unlock)?;
-                    }
-                    _ => return Err(bad("a granted spend is cited with its unlock")),
-                }
+                let spent = spent_by(keyset, signed, notes, unlock.as_ref())?;
                 let id = signed.proposal().id();
                 values_fallback = matches!(sources.get(&id), Some(Source::Plain { .. }));
                 executed.insert(id);
@@ -644,11 +688,7 @@ fn void(
                 if *context == claim.hold_context() {
                     return Err(bad("second claim must be a different claim"));
                 }
-                crypto::schnorr_verify(
-                    record.message.hold(),
-                    &context.signing_digest(&record.message),
-                    &record.sig,
-                )?;
+                verify_second_claim(context, record)?;
                 let claimed = record.message.identifier()?;
                 for (i, item) in items.iter().enumerate() {
                     let locked = match item {

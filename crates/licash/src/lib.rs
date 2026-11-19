@@ -4,7 +4,7 @@
 //! section: the model's notes, owner keys, unlinking and contracts (`note`,
 //! `address`, `crypto`, `ec`, `unlink`, `base`); payments and grants
 //! (`spend`, `authorization`); recovery and reading Bitcoin (`request`,
-//! `chain`, `claim`, `hold`, `recovery`, `disclosure`); interoperability
+//! `chain`, `claim`, `hold`, `recovery`, `disclosure`, `inquiry`); interoperability
 //! (`source`, `route`). The Hub's statement over [`recovery::owed`] is
 //! `licash-hp`'s.
 //! `codec` holds the canonical bytes of what parties exchange.
@@ -19,6 +19,7 @@ pub mod crypto;
 pub mod disclosure;
 pub mod ec;
 pub mod hold;
+pub mod inquiry;
 pub mod note;
 pub mod recovery;
 pub mod request;
