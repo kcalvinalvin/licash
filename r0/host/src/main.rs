@@ -47,9 +47,22 @@ fn words(bytes: &[u8]) -> Vec<u32> {
 /// The guest's environment for `input`, in segments of 2^`po2` cycles (or
 /// the zkVM's default). The segment size does not change what is proven.
 fn env_for(input: &[u8], po2: Option<u32>) -> Result<ExecutorEnv<'static>> {
+    env_with(input, po2, &[])
+}
+
+/// [`env_for`] with the receipts `assumptions`, which the guest may
+/// verify (`env::verify`) of other programs.
+fn env_with(
+    input: &[u8],
+    po2: Option<u32>,
+    assumptions: &[Receipt],
+) -> Result<ExecutorEnv<'static>> {
     let mut env = ExecutorEnv::builder();
     if let Some(po2) = po2 {
         env.segment_limit_po2(po2);
+    }
+    for receipt in assumptions {
+        env.add_assumption(receipt.clone());
     }
     // What a profile build of the guest prints (`r0/build-guest.sh hp-profile`).
     env.stdout(std::io::stdout());

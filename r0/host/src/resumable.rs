@@ -6,17 +6,20 @@
 //!
 //! The same proof as [`risc0_zkvm::Prover::prove_with_opts`] with
 //! [`risc0_zkvm::ProverOpts::succinct`]: lift each segment's receipt, join
-//! them in order. For a guest that needs no assumptions only.
+//! them in order, then resolve each assumption the guest made (a receipt of
+//! another program it verified, `env::verify`) with the succinct receipt the
+//! host gave for it, as `composite_to_succinct` does.
 
 use std::fs::{create_dir_all, read, read_to_string, remove_file, rename, write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use anyhow::{ensure, Context, Result};
-use risc0_zkvm::sha::{Impl, Sha256};
+use anyhow::{bail, ensure, Context, Result};
+use risc0_zkvm::sha::{Digestible, Impl, Sha256};
 use risc0_zkvm::{
-    compute_image_id, get_prover_server, ExecutorImpl, InnerReceipt, ProverOpts, Receipt,
-    ReceiptClaim, Segment, SegmentRef, SuccinctReceipt, VerifierContext,
+    compute_image_id, get_prover_server, AssumptionReceipt, ExecutorImpl, InnerAssumptionReceipt,
+    InnerReceipt, MaybePruned, Output, ProverOpts, Receipt, ReceiptClaim, Segment, SegmentRef,
+    SuccinctReceipt, VerifierContext,
 };
 
 type Lifted = SuccinctReceipt<ReceiptClaim>;
@@ -42,6 +45,42 @@ struct Executed {
     user_cycles: u64,
 }
 
+/// The assumptions the guest made, with the receipts that prove them,
+/// kept beside `executed` (written before it, so an `executed` whose
+/// assumptions are missing is never carried on). A work directory
+/// without the file is one of a guest with none, as every one was before
+/// this prover resolved any.
+fn assumptions_path(dir: &Path) -> PathBuf {
+    dir.join("assumptions")
+}
+
+type Made = Vec<(risc0_zkvm::Assumption, AssumptionReceipt)>;
+
+fn kept_assumptions(dir: &Path) -> Result<Made> {
+    match read(assumptions_path(dir)) {
+        Ok(bytes) => Ok(bincode::deserialize(&bytes)?),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// The succinct receipt that proves `assumption`, as `resolve` takes it. A
+/// proof that is not succinct is refused: it is the only kind the
+/// recursion resolves.
+fn proving(
+    assumption: &AssumptionReceipt,
+) -> Result<risc0_zkvm::SuccinctReceipt<risc0_zkvm::Unknown>> {
+    match assumption {
+        AssumptionReceipt::Proven(InnerAssumptionReceipt::Succinct(s)) => Ok(s.clone()),
+        AssumptionReceipt::Proven(_) => {
+            bail!("an assumption is proven by a succinct receipt alone")
+        }
+        AssumptionReceipt::Unresolved(a) => {
+            bail!("no receipt was given for the assumption {:?}", a.claim)
+        }
+    }
+}
+
 /// `bytes` to `path` whole or not at all.
 pub fn keep(path: &Path, bytes: &[u8]) -> Result<()> {
     let part = path.with_extension("part");
@@ -52,13 +91,27 @@ pub fn keep(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 /// What the work directory proves: refused if it was another proof's.
-fn claim_dir(dir: &Path, image: &str, input: &[u8], po2: Option<u32>) -> Result<()> {
+fn claim_dir(
+    dir: &Path,
+    image: &str,
+    input: &[u8],
+    assumptions: &[Receipt],
+    po2: Option<u32>,
+) -> Result<()> {
     create_dir_all(dir)?;
-    let what = format!(
+    let mut what = format!(
         "image {image}\ninput {}\npo2 {}\n",
         hex::encode(Impl::hash_bytes(input).as_bytes()),
         po2.map_or("default".into(), |p| p.to_string())
     );
+    // The receipts it assumes are part of what it proves; none adds no line,
+    // so a directory of a proof without any is as it was.
+    for receipt in assumptions {
+        what.push_str(&format!(
+            "assumes {}\n",
+            hex::encode(Impl::hash_bytes(&receipt.journal.bytes).as_bytes())
+        ));
+    }
     let meta = dir.join("proving");
     match read_to_string(&meta) {
         Ok(had) => ensure!(
@@ -87,7 +140,15 @@ fn forget(dir: &Path) -> Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let path = entry?.path();
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        let work = ["segment-", "lifted-", "joined", "executed", "receipt"];
+        let work = [
+            "segment-",
+            "lifted-",
+            "joined",
+            "resolved",
+            "assumptions",
+            "executed",
+            "receipt",
+        ];
         if work.iter().any(|w| name.starts_with(w)) {
             remove_file(&path)?;
         }
@@ -101,25 +162,34 @@ fn execute(
     bin: &[u8],
     name: &str,
     input: &[u8],
+    assumptions: &[Receipt],
     expected: &[u8],
     dir: &Path,
     po2: Option<u32>,
 ) -> Result<Executed> {
     let start = Instant::now();
     forget(dir)?;
-    let session = ExecutorImpl::from_elf(super::env_for(input, po2)?, bin)?.run_with_callback(
-        |segment| -> Result<Box<dyn SegmentRef>> {
+    let session = ExecutorImpl::from_elf(super::env_with(input, po2, assumptions)?, bin)?
+        .run_with_callback(|segment| -> Result<Box<dyn SegmentRef>> {
             let path = segment_path(dir, segment.index as usize);
             keep(&path, &bincode::serialize(&segment)?)?;
             Ok(Box::new(OnDisk(path)))
-        },
-    )?;
+        })?;
     let journal = session.journal.clone().unwrap_or_default().bytes;
     ensure!(journal == expected, "journal");
     ensure!(
-        session.assumptions.is_empty(),
-        "{name} needs assumptions, which this prover does not resolve"
+        session.mmr_assumptions.is_empty(),
+        "{name} makes assumptions of a kind this prover does not resolve"
     );
+    // Every assumption must have been proven by the host: one left
+    // unresolved would stay in the receipt's claim.
+    for (_, receipt) in &session.assumptions {
+        proving(receipt)?;
+    }
+    keep(
+        &assumptions_path(dir),
+        &bincode::serialize(&session.assumptions)?,
+    )?;
     let executed = Executed {
         segments: session.segments.len(),
         journal,
@@ -180,8 +250,23 @@ pub fn prove(
     dir: &Path,
     po2: Option<u32>,
 ) -> Result<Receipt> {
+    prove_with(bin, name, input, &[], expected, dir, po2)
+}
+
+/// [`prove`] of a guest that verifies the receipts `assumptions` (of other
+/// programs, each the succinct receipt of an unconditional proof): the
+/// proof is unconditional once each is resolved, before it is wrapped.
+pub fn prove_with(
+    bin: &[u8],
+    name: &str,
+    input: &[u8],
+    assumptions: &[Receipt],
+    expected: &[u8],
+    dir: &Path,
+    po2: Option<u32>,
+) -> Result<Receipt> {
     let id = compute_image_id(bin)?;
-    claim_dir(dir, &id.to_string(), input, po2)?;
+    claim_dir(dir, &id.to_string(), input, assumptions, po2)?;
     let start = Instant::now();
     let executed = match executed(dir)? {
         Some(executed) => {
@@ -194,10 +279,11 @@ pub fn prove(
             );
             executed
         }
-        None => execute(bin, name, input, expected, dir, po2)?,
+        None => execute(bin, name, input, assumptions, expected, dir, po2)?,
     };
     ensure!(executed.journal == expected, "journal");
     let n = executed.segments;
+    let made = kept_assumptions(dir)?;
 
     let prover = get_prover_server(&ProverOpts::succinct())?;
     let ctx = VerifierContext::default();
@@ -209,8 +295,30 @@ pub fn prove(
         }
         let t = Instant::now();
         let segment = OnDisk(segment_path(dir, i)).resolve()?;
-        let receipt = prover.prove_segment(&ctx, &segment)?;
+        let mut receipt = prover.prove_segment(&ctx, &segment)?;
         drop(segment);
+        // The last segment's claim carries the journal's digest and the
+        // assumptions the guest made, which the recursion resolves one by
+        // one: as `prove_session` merges them in, before the lift.
+        if i + 1 == n && !made.is_empty() {
+            let output = Output {
+                journal: MaybePruned::Pruned(executed.journal.digest()),
+                assumptions: made
+                    .iter()
+                    .map(|(assumption, _)| assumption.clone())
+                    .collect::<Vec<_>>()
+                    .into(),
+            };
+            // `merge_with` is the zkVM's own, and private to it: the output
+            // replaces the segment's pruned one only if it is the same
+            // output, by digest.
+            let output: MaybePruned<Option<Output>> = Some(output).into();
+            ensure!(
+                output.digest() == receipt.claim.output.digest(),
+                "the final segment's output is not the journal and assumptions the execution made"
+            );
+            receipt.claim.output = output;
+        }
         let up = prover.lift(&receipt)?;
         keep(&lifted, &bincode::serialize(&up)?)?;
         let _ = remove_file(segment_path(dir, i));
@@ -244,6 +352,28 @@ pub fn prove(
         );
     }
 
+    // Each assumption resolved in the order the guest made them, the
+    // running result kept after each: a succinct receipt per assumption, one
+    // recursion proof each.
+    let resolved_path = dir.join("resolved");
+    let (mut done, mut acc): (usize, Lifted) = match read(&resolved_path) {
+        Ok(bytes) => bincode::deserialize(&bytes)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (0, acc),
+        Err(e) => return Err(e.into()),
+    };
+    while done < made.len() {
+        let t = Instant::now();
+        acc = prover.resolve(&acc, &proving(&made[done].1)?)?;
+        done += 1;
+        keep(&resolved_path, &bincode::serialize(&(done, &acc))?)?;
+        println!(
+            "{name}: assumption {done}/{} resolved in {:.1} s ({})",
+            made.len(),
+            t.elapsed().as_secs_f64(),
+            rss()
+        );
+    }
+
     let receipt = Receipt::new(InnerReceipt::Succinct(acc), executed.journal);
     receipt.verify(id).context("the joined receipt")?;
     let out = dir.join("receipt");
@@ -266,16 +396,16 @@ mod tests {
     fn a_work_directory_is_one_proofs() {
         let dir = tempfile::tempdir().unwrap();
         let work = dir.path().join("work");
-        claim_dir(&work, "program", b"input", Some(18)).unwrap();
+        claim_dir(&work, "program", b"input", &[], Some(18)).unwrap();
         // The same proof carries on.
-        claim_dir(&work, "program", b"input", Some(18)).unwrap();
+        claim_dir(&work, "program", b"input", &[], Some(18)).unwrap();
         for (image, input, po2) in [
             ("program", &b"input"[..], Some(19)),
             ("program", b"input", None),
             ("program", b"other", Some(18)),
             ("other", b"input", Some(18)),
         ] {
-            let e = claim_dir(&work, image, input, po2).unwrap_err();
+            let e = claim_dir(&work, image, input, &[], po2).unwrap_err();
             assert!(format!("{e}").contains("another proof's work"), "{e}");
         }
     }
@@ -306,6 +436,79 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(left, ["proving"]);
+    }
+
+    fn assumed(journal: &[u8]) -> Receipt {
+        let claim = ReceiptClaim::ok(risc0_zkvm::sha::Digest::ZERO, journal.to_vec());
+        Receipt::new(
+            InnerReceipt::Fake(risc0_zkvm::FakeReceipt::new(claim)),
+            journal.to_vec(),
+        )
+    }
+
+    #[test]
+    fn a_work_directory_is_the_proof_of_what_it_assumes() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        let (a, b) = (assumed(b"one"), assumed(b"two"));
+        claim_dir(
+            &work,
+            "program",
+            b"input",
+            std::slice::from_ref(&a),
+            Some(18),
+        )
+        .unwrap();
+        claim_dir(
+            &work,
+            "program",
+            b"input",
+            std::slice::from_ref(&a),
+            Some(18),
+        )
+        .unwrap();
+        // another receipt assumed, or none, or more, is another proof
+        for other in [vec![b.clone()], vec![], vec![a.clone(), b]] {
+            let e = claim_dir(&work, "program", b"input", &other, Some(18)).unwrap_err();
+            assert!(format!("{e}").contains("another proof's work"), "{e}");
+        }
+    }
+
+    #[test]
+    fn a_directory_without_assumptions_is_of_a_guest_that_made_none() {
+        let dir = tempfile::tempdir().unwrap();
+        // work kept before this prover resolved any carries on as it did
+        assert!(kept_assumptions(dir.path()).unwrap().is_empty());
+        keep(
+            &assumptions_path(dir.path()),
+            &bincode::serialize(&Made::new()).unwrap(),
+        )
+        .unwrap();
+        assert!(kept_assumptions(dir.path()).unwrap().is_empty());
+        // and the assumptions and their resolution are the work forgotten with the rest
+        keep(&dir.path().join("resolved"), b"resolved").unwrap();
+        keep(&dir.path().join("proving"), b"image").unwrap();
+        forget(dir.path()).unwrap();
+        let left: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(left, ["proving"]);
+    }
+
+    #[test]
+    fn an_assumption_is_resolved_by_a_succinct_receipt_alone() {
+        use risc0_zkvm::Assumption;
+        let claim = Assumption {
+            claim: risc0_zkvm::sha::Digest::ZERO,
+            control_root: risc0_zkvm::sha::Digest::ZERO,
+        };
+        let e = proving(&AssumptionReceipt::Unresolved(claim)).unwrap_err();
+        assert!(format!("{e}").contains("no receipt was given"), "{e}");
+        let claim = MaybePruned::<risc0_zkvm::Unknown>::Pruned(risc0_zkvm::sha::Digest::ZERO);
+        let fake = InnerAssumptionReceipt::Fake(risc0_zkvm::FakeReceipt::new(claim));
+        let e = proving(&AssumptionReceipt::Proven(fake)).unwrap_err();
+        assert!(format!("{e}").contains("succinct receipt alone"), "{e}");
     }
 
     #[test]
