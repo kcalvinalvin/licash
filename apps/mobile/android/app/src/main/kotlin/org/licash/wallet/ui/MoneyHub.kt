@@ -27,8 +27,6 @@ import org.licash.core.ContractQuote
 import org.licash.core.ContractState
 import org.licash.core.Holding
 import org.licash.core.Notes
-import org.licash.core.contractLeastCoin
-import org.licash.core.contractMaxCap
 import org.licash.wallet.Engine
 import org.licash.wallet.Ui
 import org.licash.wallet.carriedOn
@@ -184,35 +182,19 @@ internal fun HubPage(
 
     if (fees && hub != null) HubFees(hub) { fees = false }
     quote?.let { q ->
-        // Of terms chosen, if the hub lets them be: paid from a coin held
-        // that pays within them, or from one cashed out to pay them first.
+        // Of terms chosen, if the hub lets them be: paid, whole, from a coin
+        // held that a contract takes.
         val range = q.range
         if (range != null) {
-            val cashFirst: (ULong) -> Unit = { amount ->
-                quote = null
-                scope.launch {
-                    engine.bitcoinAddress().fold(
-                        { payOwn("bitcoin:$it?amount=${btc(amount)}", it) },
-                        { fail(explain(it)) },
-                    )
-                }
-            }
             ChooseSheet(
                 q,
                 range,
-                // The least size takes any coin that pays its price, as its hub
-                // holds it ([contractMaxCap] has none for a coin under half of it).
-                q.coins.filter {
-                    contractMaxCap(range, it.value) != null ||
-                        contractLeastCoin(range, range.minCap, range.minBlocks, 0uL) <= it.value
-                },
+                q.coins,
                 open = { chosen, price ->
                     quote = null
                     engine.openContract(q.hub, price, chosen)
                 },
                 dismiss = { quote = null },
-                held = holding.available,
-                cashOutFirst = cashFirst,
             )
         } else {
             ProtectSheet(
@@ -225,7 +207,7 @@ internal fun HubPage(
                     quote = null
                     scope.launch {
                         engine.bitcoinAddress().fold(
-                            { payOwn("bitcoin:$it?amount=${btc(q.price)}", it) },
+                            { payOwn("bitcoin:$it?amount=${btc(q.price + FIXED_PART)}", it) },
                             { fail(explain(it)) },
                         )
                     }

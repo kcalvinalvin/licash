@@ -385,8 +385,16 @@ internal fun Worth(mock: Boolean) {
 }
 
 /**
+ * What a hub of one contract asks of the coin that pays for it besides its
+ * price, when the coin is cashed out to pay it: her part of the contract,
+ * which the hub issues back to her as notes.
+ */
+internal const val FIXED_PART = 1_000uL
+
+/**
  * What protecting at a hub covers, lasts and costs, before it is paid:
- * to pay it, or to get a coin on Bitcoin that pays it first.
+ * to pay it, or to get a coin on Bitcoin that pays it first. A coin is spent
+ * whole: it pays the price, and the rest of it is her part of the contract.
  */
 @Composable
 internal fun ProtectSheet(q: ContractQuote, open: () -> Unit, cashOutFirst: () -> Unit, dismiss: () -> Unit) {
@@ -400,16 +408,16 @@ internal fun ProtectSheet(q: ContractQuote, open: () -> Unit, cashOutFirst: () -
         Spacer(Modifier.height(8.dp))
         val coin = q.coin
         if (coin != null) {
-            // Paid from a coin of the price at least, the rest back on Bitcoin.
-            val left = if (coin > q.price) coin - q.price else 0uL
-            if (left >= q.dust) Line("Back to your Bitcoin", "About ${sat(left)}", tag = "contract-change")
+            // The coin is spent whole: the price, and the rest is hers, issued back as notes.
+            val part = if (coin > q.price) coin - q.price else 0uL
+            Line("You fund", sat(part), tag = "contract-funded")
             BigButton(
                 "Protect for ${sat(q.price)}",
                 Modifier.fillMaxWidth().testTag("protect"),
             ) { open() }
         } else {
-            Say("Paid from Bitcoin you hold, and you hold too little. Cash out to yourself first, then protect.")
-            BigButton("Cash out ${sat(q.price)}", Modifier.fillMaxWidth().testTag("cash-out-first")) {
+            Say("Paid from one coin on Bitcoin you hold, spent whole, and none you hold pays for it. Cash out to yourself first, then protect.")
+            BigButton("Cash out ${sat(q.price + FIXED_PART)}", Modifier.fillMaxWidth().testTag("cash-out-first")) {
                 cashOutFirst()
             }
         }

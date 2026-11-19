@@ -159,7 +159,7 @@ data class Event(val text: String, val received: ULong? = null)
  * funded by her from that coin, issued back to her balance once its
  * funding confirms; the rest of the coin back on Bitcoin.
  */
-data class Chosen(val cap: ULong, val blocks: UInt, val coin: String, val funded: ULong = 0uL)
+data class Chosen(val cap: ULong, val blocks: UInt, val coin: String)
 
 /**
  * The wallet and the light client, and the loop keeping them in step while
@@ -1267,7 +1267,7 @@ class Engine(context: Context) {
             if (started) it.copy(opening = hub, offer = null) else it
         }
         if (!started) return
-        AppLog.info("opening a contract at $hub${chosen?.let { " of ${it.cap} sat over ${it.blocks} blocks, ${it.funded} funded" } ?: ""}")
+        AppLog.info("opening a contract at $hub${chosen?.let { " of ${it.cap} sat over ${it.blocks} blocks" } ?: ""}")
         scope.launch {
             try {
                 val chain = GoChain(light)
@@ -1276,7 +1276,7 @@ class Engine(context: Context) {
                         it.openContract(chain, hub, null, maxPrice)
                     } else {
                         it.openChosenContract(
-                            chain, hub, chosen.cap, chosen.blocks, chosen.funded, maxPrice, chosen.coin,
+                            chain, hub, chosen.cap, chosen.blocks, maxPrice, chosen.coin,
                         )
                     }
                 }
