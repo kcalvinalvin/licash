@@ -975,7 +975,6 @@ impl<T: Transport + 'static> Keeper<T> {
             max_price,
             cap,
             deposit: None,
-            funded: 0,
         };
         holder::open_with(wallet, &self.chain, &self.wallet_file, hub, ask).await
     }

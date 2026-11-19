@@ -423,8 +423,8 @@ enum Command {
     },
     /// Open a recovery contract at HUB, a hub the wallet trusts: its
     /// collateral protects the wallet's notes there, up to its cap, until
-    /// the contract's deadline. Paid from a coin of the wallet's on
-    /// Bitcoin, its change back to it. On regtest under the mock authority,
+    /// the contract's deadline. Paid from one coin of the wallet's on
+    /// Bitcoin, spent whole. On regtest under the mock authority,
     /// protecting nothing; on signet under the genuine programs, a trial:
     /// `force-close` recovers from it, not yet tried on signet itself. No
     /// other network for now.
@@ -434,25 +434,24 @@ enum Command {
         /// allows].
         #[arg(long)]
         blocks: Option<u32>,
-        /// The most to pay to open it, in sat [default: the price the
-        /// hub's info said].
+        /// The most to pay to open it, in sat, its reserve and the hub's
+        /// fee [default: no more than sane fees make it, --any-fees
+        /// aside].
         #[arg(long)]
         max_price: Option<u64>,
-        /// The most notes it protects, in sat, if the hub lets holders
-        /// choose (its info's range), over --blocks [default: the hub's
-        /// fixed terms].
+        /// The least notes it protects, in sat, if the hub lets holders
+        /// choose (its info's range), over --blocks [default: the
+        /// smallest that takes the coin whole].
         #[arg(long, requires = "blocks")]
         cap: Option<u32>,
         /// The coin on Bitcoin to pay it from, as TXID:VOUT [default: the
-        /// smallest free that pays it].
+        /// smallest free that a contract takes whole]. The coin is spent
+        /// whole: it pays the reserve and the hub's fee, and all the rest
+        /// of it funds your part of the contract, issued back to you as
+        /// notes at the hub once its funding is buried. No change comes
+        /// back from it.
         #[arg(long)]
         coin: Option<bitcoin::OutPoint>,
-        /// Sat of the contract to fund yourself, at most its cap: paid
-        /// from the coin beside the price, the hub's interest charged on
-        /// the rest only, and issued back as notes at the hub once its
-        /// funding is buried [default: none].
-        #[arg(long, default_value_t = 0)]
-        funded: u32,
         /// Open it at a hub charging more than is sane too: over 10 sat
         /// or 1% a payment, lock or refund, a sat for each note made, or
         /// 20% of the cap chosen a year.
@@ -1239,7 +1238,6 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             max_price,
             cap,
             coin,
-            funded,
             any_fees,
             chain,
         } => {
@@ -1248,7 +1246,6 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 max_price,
                 cap,
                 coin,
-                funded,
                 any_fees,
             };
             return contract::open(&wallet, &path, chain.as_deref(), &hub, ask, json).await;

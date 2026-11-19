@@ -312,42 +312,43 @@ pub fn contract_max_cap(range: ContractRange, coin: u64) -> Option<u64> {
     range.api().max_cap_for(coin).map(u64::from)
 }
 
-/// The least a coin paying for a contract within `range` of `cap` sat
-/// over `blocks`, `funded` of it hers, holds: its price and her part,
-/// and the coin the hub takes for so large a cap. What is left of it
-/// comes back on Bitcoin.
-#[uniffi::export]
-pub fn contract_least_coin(range: ContractRange, cap: u64, blocks: u32, funded: u64) -> u64 {
-    let price = contract_price(range, cap, blocks, funded);
-    licash_contracts::holder::least(Some(range.api()), sat32(cap), price.saturating_add(funded))
+/// The contract a coin pays for whole: its cap, and her part of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct ContractFit {
+    pub cap: u64,
+    pub funded: u64,
 }
 
-/// The most of a contract within `range` of `cap` sat over `blocks` its
-/// holder funds herself from a coin of `coin` sat, beside its price:
-/// rounded down to what its hub's `denominations` make in `notes` notes
-/// ([`contract_fundable`]). None of a coin paying no more than the price.
+/// The contract within `range` over `blocks` that a coin of `coin` sat
+/// pays for whole, of `least_cap` sat at least: the smallest cap, and in it
+/// her part the most the coin pays beside the price, as many notes of her
+/// hub's `denominations` as a claim names (`notes`) making it exactly, and
+/// leaving less than `dust`. No change comes back from a coin, so what its
+/// contract does not take, it does not take. None if no contract does.
 #[uniffi::export]
-pub fn contract_most_funded(
+pub fn contract_fit(
     range: ContractRange,
-    cap: u64,
     blocks: u32,
     coin: u64,
+    least_cap: u64,
+    dust: u64,
     denominations: Vec<u64>,
     notes: u32,
-) -> u64 {
+) -> Option<ContractFit> {
     let notes = usize::try_from(notes).unwrap_or(usize::MAX);
     let range = range.api();
-    let most = licash_contracts::holder::most_funded(
-        &range,
-        (sat32(cap), blocks),
+    let fitted = licash_contracts::holder::fit(
+        &licash_contracts::holder::Pricing::Range(&range),
+        blocks,
         coin,
+        dust,
         (&denominations, notes),
-    );
-    // Nor less than the coin the hub takes for so large a cap.
-    match coin >= licash_contracts::holder::least(Some(range), sat32(cap), 0) {
-        true => most,
-        false => 0,
-    }
+        sat32(least_cap),
+    )?;
+    Some(ContractFit {
+        cap: u64::from(fitted.cap),
+        funded: u64::from(fitted.funded),
+    })
 }
 
 /// What a holder's funding of `wanted` sat rounds down to: as much as her
@@ -357,22 +358,6 @@ pub fn contract_most_funded(
 pub fn contract_fundable(denominations: Vec<u64>, notes: u32, wanted: u64) -> u64 {
     let notes = usize::try_from(notes).unwrap_or(usize::MAX);
     licash_contracts::holder::fundable(&denominations, notes, wanted)
-}
-
-/// The size a contract within `range` over `blocks` paid from a coin of
-/// `coin` sat starts at, none of it funded by her: the largest size up to
-/// `start` (the least, below it) if the coin pays it, else the largest it
-/// pays. None if the coin pays none.
-#[uniffi::export]
-pub fn payable_size(range: ContractRange, coin: u64, start: u64, blocks: u32) -> Option<u64> {
-    let pays = |cap| contract_least_coin(range, cap, blocks, 0) <= coin;
-    let sizes = contract_sizes(range);
-    let asked = sizes.iter().rev().find(|&&s| s <= start).copied();
-    let asked = asked.unwrap_or(range.min_cap);
-    if pays(asked) {
-        return Some(asked);
-    }
-    sizes.into_iter().rev().find(|&s| pays(s))
 }
 
 /// `sat` as a contract's terms count it: none past a `u32` is offered.

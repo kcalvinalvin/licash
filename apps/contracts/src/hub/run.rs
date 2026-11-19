@@ -95,24 +95,22 @@ impl Openings {
         }
         // Her reserve returns to a deposit of the hub's that swaps it for
         // notes: bound to this contract, or refused, before she garbles.
-        if let Some(close) = &open.close {
-            let bind = self
-                .closer
-                .get()
-                .ok_or_else(|| Refused::bad("this hub takes no deposit for her reserve"))?;
-            let timeout = (open.wanted.close_height)
-                .checked_add(crate::CLOSE_BLOCKS)
-                .ok_or_else(|| Refused::bad("the close deposit's timeout overflows"))?;
-            let reserve = opening.quote.graph.reserve_alice;
-            bind(
-                close.script.as_bytes(),
-                envelope.id,
-                reserve,
-                close.fee,
-                timeout,
-            )
-            .map_err(Refused::bad)?;
-        }
+        let (bind, _) = self
+            .closer
+            .get()
+            .ok_or_else(|| Refused::bad("this hub takes no deposit for her reserve"))?;
+        let timeout = (open.wanted.close_height)
+            .checked_add(crate::CLOSE_BLOCKS)
+            .ok_or_else(|| Refused::bad("the close deposit's timeout overflows"))?;
+        let reserve = opening.quote.graph.reserve_alice;
+        bind(
+            open.close.script.as_bytes(),
+            envelope.id,
+            reserve,
+            open.close.fee,
+            timeout,
+        )
+        .map_err(Refused::bad)?;
         let start = Start::New {
             quote: Box::new(opening.quote),
             deposit: open.deposit,

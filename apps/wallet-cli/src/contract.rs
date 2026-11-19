@@ -101,17 +101,17 @@ pub struct Asked {
     pub max_price: Option<u64>,
     pub cap: Option<u32>,
     pub coin: Option<bitcoin::OutPoint>,
-    /// What she funds of it herself, in sat.
-    pub funded: u32,
     /// At a hub charging more than is sane too.
     pub any_fees: bool,
 }
 
 /// Open a contract at `hub` closing `blocks` from now [default: as late
-/// as the hub allows], paying at most `max_price` [default: what its info
-/// said, or its range prices the terms chosen at], protecting `cap` sat
-/// if chosen [default: the hub's fixed terms], `funded` sat of it hers,
-/// paid from `coin` [default: the smallest free that pays it and that].
+/// as the hub allows], paying at most `max_price` [default: no ceiling
+/// beyond sane fees], protecting at least `cap` sat if chosen [default: the
+/// smallest contract that takes the coin whole], paid from `coin` [default:
+/// the smallest free that a contract takes whole]. Her coin is spent whole:
+/// what the reserve and the hub's fee leave of it is her part of the
+/// contract, issued back to her as notes.
 pub async fn open(
     wallet: &Wallet<Http>,
     path: &Path,
@@ -131,19 +131,20 @@ pub async fn open(
         .contracts
         .with_context(|| format!("{hub} opens no contracts"))?;
     let blocks = asked.blocks.unwrap_or(offered.blocks);
-    let terms = Terms::of(hub, &offered, asked.cap, Some(blocks), asked.funded)?;
-    let price = terms.price;
     let ask = Ask {
         blocks,
-        max_price: asked.max_price.unwrap_or(price),
+        max_price: asked.max_price.unwrap_or(u64::MAX),
         cap: asked.cap,
         deposit: asked.coin,
-        funded: u64::from(asked.funded),
     };
     let contract = match asked.any_fees {
         true => holder::open_anyway(wallet, &chain, path, hub, ask).await,
         false => holder::open_with(wallet, &chain, path, hub, ask).await,
     }?;
+    // Its terms as they came of her coin: the cap and her part.
+    let chosen = offered.range.map(|_| contract.cap);
+    let funded = u32::try_from(contract.funded).unwrap_or(u32::MAX);
+    let terms = Terms::of(hub, &offered, chosen, Some(blocks), funded)?;
     let mut value = contract_json(&contract);
     value["terms"] = terms.json();
     let day = wallet.network().blocks_a_day();
@@ -227,14 +228,14 @@ impl Terms {
         };
         let Some(range) = offered.range else {
             anyhow::ensure!(
-                cap.is_none() && funded == 0,
-                "{hub} offers no contracts but of {} sat, none co-funded",
+                cap.is_none(),
+                "{hub} offers no contracts but of {} sat",
                 crate::say::grouped(offered.cap.into()),
             );
             return Ok(Self {
                 cap: offered.cap,
                 blocks,
-                funded: 0,
+                funded,
                 reserve: offered.reserve,
                 price: offered.price,
                 fee: None,

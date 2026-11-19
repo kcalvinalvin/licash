@@ -490,23 +490,17 @@ pub struct Open {
     pub claim_key: XOnlyPublicKey,
     pub deposit: OutPoint,
     pub coin: TxOut,
-    pub change: ScriptBuf,
     pub wanted: Wanted,
     pub mock: bool,
     /// The digest of her request's one-time keys
-    /// ([`HolderPub::request_keys`]), which a v4 Base binds. Written last,
-    /// and only if present: an Open stored before it reads as none. Such
-    /// an opening past binding (the hub's Signed, her Funded) goes on
-    /// under v3 and its own program; one before binding no longer loads
-    /// once the program contracts open under changes, before any funding.
-    pub request_keys: Option<[u8; 32]>,
-    /// What she funds of the contract herself, which a v5 Base commits
-    /// to: written after her request keys, which it needs, if any.
-    pub funded: Option<FundedNotes>,
+    /// ([`HolderPub::request_keys`]), which Base binds: unbound, the
+    /// statement could be proved of an exit she never started.
+    pub request_keys: [u8; 32],
+    /// What she funds of the contract herself, which Base commits to.
+    pub funded: FundedNotes,
     /// Where the default returns her reserve and what the Hub keeps of it,
-    /// which a v6 Base commits to ([`licash::base::Close`]): written after
-    /// her funded notes, which it needs. Without it the Base is v5 at most.
-    pub close: Option<CloseOffer>,
+    /// which Base commits to ([`licash::base::Close`]).
+    pub close: CloseOffer,
 }
 
 /// The Hub's deposit that swaps her reserve for notes, as she names it: the
@@ -537,32 +531,24 @@ message!(
         w.bytes(&self.claim_key.serialize());
         w.outpoint(&self.deposit);
         w.txout(&self.coin);
-        w.blob(self.change.as_bytes());
         w.u32(self.wanted.request_height);
         w.u32(self.wanted.close_height);
         w.u16(self.wanted.response_window);
         w.u8(self.mock as u8);
-        if let Some(digest) = &self.request_keys {
-            w.bytes(digest);
-            if let Some(funded) = &self.funded {
-                w.bytes(&funded.ephemeral.0);
-                w.count(funded.outputs.len());
-                for output in &funded.outputs {
-                    w.bytes(&output.to_bytes());
-                }
-                if let Some(close) = &self.close {
-                    w.blob(close.script.as_bytes());
-                    w.u64(close.fee);
-                }
-            }
+        w.bytes(&self.request_keys);
+        w.bytes(&self.funded.ephemeral.0);
+        w.count(self.funded.outputs.len());
+        for output in &self.funded.outputs {
+            w.bytes(&output.to_bytes());
         }
+        w.blob(self.close.script.as_bytes());
+        w.u64(self.close.fee);
     },
     {
         let party = r.party()?;
         let claim_key = r.xonly()?;
         let deposit = r.outpoint()?;
         let coin = r.txout()?;
-        let change = ScriptBuf::from_bytes(r.blob()?.to_vec());
         let wanted = Wanted {
             request_height: r.u32()?,
             close_height: r.u32()?,
@@ -570,44 +556,29 @@ message!(
         };
         let mock = r.u8()?;
         ensure!(mock <= 1, "invalid mock flag");
-        let request_keys = if r.0.is_empty() {
-            None
-        } else {
-            Some(r.array()?)
-        };
-        let funded = if r.0.is_empty() {
-            None
-        } else {
-            let ephemeral = licash::crypto::Point(r.array()?);
-            ephemeral.to_projective()?;
-            let n = r.count(licash::spend::OUTPUT_BYTES)?;
-            ensure!(n > 0, "an empty funded list");
-            let mut outputs = Vec::with_capacity(n);
-            for _ in 0..n {
-                let bytes = r.take(licash::spend::OUTPUT_BYTES)?;
-                outputs.push(licash::spend::Output::from_bytes(bytes)?);
-            }
-            Some(FundedNotes { ephemeral, outputs })
-        };
-        let close = if r.0.is_empty() {
-            None
-        } else {
-            ensure!(funded.is_some(), "a close without funded notes");
-            Some(CloseOffer {
-                script: ScriptBuf::from_bytes(r.blob()?.to_vec()),
-                fee: r.u64()?,
-            })
+        let request_keys = r.array()?;
+        let ephemeral = licash::crypto::Point(r.array()?);
+        ephemeral.to_projective()?;
+        let n = r.count(licash::spend::OUTPUT_BYTES)?;
+        ensure!(n > 0, "an empty funded list");
+        let mut outputs = Vec::with_capacity(n);
+        for _ in 0..n {
+            let bytes = r.take(licash::spend::OUTPUT_BYTES)?;
+            outputs.push(licash::spend::Output::from_bytes(bytes)?);
+        }
+        let close = CloseOffer {
+            script: ScriptBuf::from_bytes(r.blob()?.to_vec()),
+            fee: r.u64()?,
         };
         Self {
             party,
             claim_key,
             deposit,
             coin,
-            change,
             wanted,
             mock: mock == 1,
             request_keys,
-            funded,
+            funded: FundedNotes { ephemeral, outputs },
             close,
         }
     }
@@ -851,47 +822,15 @@ mod tests {
         assert_eq!(original.0, decoded.0);
         r.end().unwrap();
     }
-    /// An Open stored before it bound her request's keys still reads, as
-    /// binding none; one binding them reads back whole.
+    /// An Open carries her request's keys, her funded notes and the script
+    /// her default pays her reserve to, all of them: any less is no Open.
     #[test]
-    fn an_open_binds_her_request_keys_or_reads_as_before() {
+    fn an_open_carries_her_keys_her_funded_notes_and_her_close_and_reads_back_whole() {
         let keys = crate::keys::HolderKeys::derive(&[1; 32], &[2; 32]);
         let coin = TxOut {
             value: lichen_btc::bitcoin::Amount::from_sat(1000),
             script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
         };
-        let unbound = Open {
-            party: keys.party.public(),
-            claim_key: keys.claim_key(),
-            deposit: OutPoint::null(),
-            coin: coin.clone(),
-            change: coin.script_pubkey,
-            wanted: Wanted {
-                request_height: 100,
-                close_height: 1000,
-                response_window: 24,
-            },
-            mock: false,
-            request_keys: None,
-            funded: None,
-            close: None,
-        };
-        let digest = keys.public().request_keys().unwrap().digest();
-        let bound = Open {
-            request_keys: Some(digest),
-            ..unbound.clone()
-        };
-        let old = unbound.encode();
-        let new = bound.encode();
-        assert_eq!(new, [old.as_slice(), &digest].concat());
-        assert_eq!(Open::decode(&old).unwrap(), unbound);
-        assert_eq!(Open::decode(&new).unwrap(), bound);
-        for cut in [1, 31] {
-            assert!(Open::decode(&new[..new.len() - cut]).is_err());
-        }
-        assert!(Open::decode(&[new.as_slice(), &[0]].concat()).is_err());
-
-        // Her funded outputs follow her keys, and need them.
         let output = |n: u64| {
             let point = licash::crypto::generator_mul(&n.into());
             licash::spend::Output::new(
@@ -901,19 +840,38 @@ mod tests {
             )
             .unwrap()
         };
-        let funding = Open {
-            funded: Some(FundedNotes {
+        let open = Open {
+            party: keys.party.public(),
+            claim_key: keys.claim_key(),
+            deposit: OutPoint::null(),
+            coin,
+            wanted: Wanted {
+                request_height: 100,
+                close_height: 1000,
+                response_window: 24,
+            },
+            mock: false,
+            request_keys: keys.public().request_keys().unwrap().digest(),
+            funded: FundedNotes {
                 ephemeral: output(3).blinded(),
                 outputs: vec![output(4), output(8)],
-            }),
-            ..bound.clone()
+            },
+            close: CloseOffer {
+                script: ScriptBuf::from_bytes(vec![0x51, 0x20, 7, 7]),
+                fee: 700,
+            },
         };
-        let encoded = funding.encode();
-        assert_eq!(Open::decode(&encoded).unwrap(), funding);
-        for cut in [1, 73] {
-            assert!(Open::decode(&encoded[..encoded.len() - cut]).is_err());
+        let encoded = open.encode();
+        assert_eq!(Open::decode(&encoded).unwrap(), open);
+        // Cut anywhere in the keys, the notes or the close, or extended:
+        // no Open.
+        for cut in [1, 8, 9, 20, 73, 150] {
+            assert!(Open::decode(&encoded[..encoded.len() - cut]).is_err(), "{cut}");
         }
-        let empty = [new.as_slice(), &output(3).blinded().0, &0u32.to_be_bytes()].concat();
-        assert!(Open::decode(&empty).is_err());
+        assert!(Open::decode(&[encoded.as_slice(), &[0]].concat()).is_err());
+        // No funded notes at all.
+        let mut empty = open.clone();
+        empty.funded.outputs.clear();
+        assert!(Open::decode(&empty.encode()).is_err());
     }
 }

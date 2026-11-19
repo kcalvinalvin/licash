@@ -18,7 +18,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 /// The format of the rows: a machine's stored bytes, of
 /// `licash_contract`'s format 3. Older rows are retained, not reinterpreted:
 /// no exit of theirs is played.
-pub(super) const FORMAT: i64 = 3;
+pub(super) const FORMAT: i64 = 4;
 
 /// The component the openings' tables are, and its version.
 const COMPONENT: &str = "openings";

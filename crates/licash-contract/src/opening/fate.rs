@@ -1,6 +1,6 @@
 //! Funding remains binding until it confirms or a conflicting spend does.
 use super::{at, Holder, Hub};
-use lichen_btc::bitcoin::{OutPoint, ScriptBuf, Transaction, TxOut, Txid};
+use lichen_btc::bitcoin::{OutPoint, Transaction, TxOut, Txid};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Fate {
@@ -51,9 +51,6 @@ impl Holder {
             prevouts: &o.prevouts,
             deposit: at(&o.funding, self.open.deposit),
         })
-    }
-    pub fn change(&self) -> &ScriptBuf {
-        &self.open.change
     }
     pub fn lapsed(&self, tip: u32) -> bool {
         self.base().is_some_and(|b| !b.fundable_at(tip))

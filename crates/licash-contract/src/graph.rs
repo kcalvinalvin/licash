@@ -235,12 +235,9 @@ pub fn build(base: &Base, holder: &HolderPub, hub: &HubPub, hmsg: Vec<Hash>) -> 
     HubProves::new(
         Spec {
             terms: terms(g),
-            // A v6 Base names the script of its own, the others' return the
-            // reserve to her payout script.
-            close_spk: match &p.close {
-                Some(close) => ScriptBuf::from_bytes(close.script.clone()),
-                None => pubs[0].payout_spk.clone(),
-            },
+            // The default returns her reserve to the script her Base names,
+            // not her payout script.
+            close_spk: ScriptBuf::from_bytes(p.close.script.clone()),
             // The graph reads neither the contract's funding amount nor its
             // deadline margin (Base's, for the request's latest height).
             params: ContractParams {

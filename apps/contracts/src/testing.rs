@@ -94,7 +94,7 @@ fn build(id: u32) -> Opened {
     quote.graph.bits = 17;
     quote.graph.reserve_alice = 20000;
     quote.graph.reserve_hub = 100000;
-    quote.graph.deposit_units = 0;
+    quote.graph.deposit_units = 12;
     quote.graph.request_height = 360;
     quote.graph.close_height = 504;
     quote.fees.opening_fee_quote = 3000;
@@ -106,7 +106,8 @@ fn build(id: u32) -> Opened {
     };
     let key = Keypair::from_secret_key(SECP256K1, &SecretKey::from_slice(&[12; 32]).unwrap());
     let coin = TxOut {
-        value: Amount::from_sat(60000),
+        // Her reserve, the fee and her part of the contract: no change.
+        value: Amount::from_sat(20000 + 3000 + 12),
         script_pubkey: ScriptBuf::new_p2tr(SECP256K1, key.x_only_public_key().0, None),
     };
     let ctx = Context {
@@ -123,10 +124,10 @@ fn build(id: u32) -> Opened {
                 vout: 0,
             },
             coin: coin.clone(),
-            change: coin.script_pubkey.clone(),
             payout: coin.script_pubkey.clone(),
             wanted,
-            funded: None,
+            funded: opening::testing::funded(),
+            close: opening::testing::close(),
         },
         &ctx,
     )
@@ -173,7 +174,7 @@ fn build(id: u32) -> Opened {
                 };
                 let total: u64 = outputs.iter().map(|o| o.value.to_sat()).sum();
                 outputs.push(TxOut {
-                    value: Amount::from_sat(5060000 - total - 100),
+                    value: Amount::from_sat(5_000_000 + coin.value.to_sat() - total - 100),
                     script_pubkey: hub.keys().party.public().payout_spk,
                 });
                 let funding = Transaction {

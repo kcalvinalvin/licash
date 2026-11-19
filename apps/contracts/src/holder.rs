@@ -75,24 +75,22 @@ pub struct Ask {
     pub blocks: u32,
     /// The most she pays to open, in sat.
     pub max_price: u64,
-    /// The most notes it protects, in sat, of terms she chooses within
-    /// the hub's range (its info's), over `blocks` from the hub's quote:
-    /// none for its fixed terms.
+    /// The least notes it protects, in sat, of terms she chooses within
+    /// the hub's range (its info's), over `blocks` from the hub's quote: the
+    /// smallest contract that absorbs her coin ([`fit`]) if none, and its
+    /// fixed terms at a hub with no range.
     pub cap: Option<u32>,
-    /// The coin she deposits: none for the smallest free that pays the
-    /// price and what she funds, and is large enough for the cap.
+    /// The coin she deposits: none for the smallest free that a contract
+    /// absorbs whole ([`fit`]). Her coin pays the price and all the rest
+    /// she funds of the contract herself, issued her as notes at the hub
+    /// once F is buried: no change comes back from it.
     pub deposit: Option<OutPoint>,
-    /// What she funds of the contract herself, in sat, at most its cap:
-    /// paid in F with the price, the hub's interest charged on the rest
-    /// only, and issued her as notes at the hub once F is buried. None
-    /// for 0.
-    pub funded: u64,
 }
 
 /// Open a contract at `hub`, a hub `wallet` trusts, on its offer now:
 /// its keyset one the hub shows the wallet, its terms as `ask`ed, its
 /// price within it, her deposit the coin she names or else the smallest
-/// free that pays it ([`coin`]). Kept in `wallet_file`, the wallet's directory,
+/// free that a contract absorbs whole ([`fit`]). Kept in `wallet_file`, the wallet's directory,
 /// from her first message on, with the fees the hub charges now: the most
 /// it may charge her since ([`fees`]). Refused at a hub charging more
 /// than is sane ([`fees::abusive`]).
@@ -174,18 +172,52 @@ async fn open_once<T: Transport, C: Chain>(
         .iter()
         .find(|(url, _)| *url == hub)
         .with_context(|| format!("{hub} is no hub this wallet trusts"))?;
-    let chosen = ask.cap.map(|cap| (cap, ask.blocks));
     // What it charges now, not as the wallet last heard: her ceilings.
     let now = wallet.hub_info(&hub).await;
     let now = now.map_err(|e| anyhow!("{hub}'s fees: {e}"))?;
-    let range = now
-        .contracts
-        .and_then(|c| c.range)
-        .filter(|_| chosen.is_some());
+    let range = now.contracts.and_then(|c| c.range);
     if let Some(why) = fees::abusive(&now.fees, range.as_ref()).filter(|_| sane) {
         bail!("{hub} charges more than is sane, {why}: no contract opens there unless asked all the same");
     }
-    let offer = offer(wallet, &hub, chosen, ask.funded).await?;
+    // Her reserve returns at the close to a deposit of the hub's that swaps
+    // it for notes, not to a coin of hers that the close would link to her
+    // wallet: no contract opens where the hub takes none.
+    ensure!(
+        now.deposits.is_some(),
+        "{hub} takes no deposits, which her reserve returns to: no contract opens there"
+    );
+    let store = Store::open(wallet_file)?;
+    // Its fixed quote prices a contract where the hub has no range, and
+    // tells the notes her part is funded in.
+    let fixed = offer(wallet, &hub, None, 0).await?;
+    let (denominations, notes) = funding_notes(&fixed.quote);
+    let pricing = match &range {
+        Some(range) => Pricing::Range(range),
+        None => Pricing::Fixed {
+            cap: fixed.quote.cap,
+            price: fixed.price(),
+        },
+    };
+    let dust = fixed.quote.graph.dust;
+    let least = ask.cap.unwrap_or(0);
+    let free = free(wallet, &store)?;
+    let (coin, fitted) = match ask.deposit {
+        Some(named) => {
+            let coin = free.into_iter().find(|c| c.outpoint == named);
+            let coin = coin.with_context(|| format!("{named}: no coin free to deposit"))?;
+            let notes = (&denominations[..], notes);
+            let fitted = fit(&pricing, ask.blocks, coin.value, dust, notes, least)
+                .with_context(|| format!("{named}: {NO_FIT}"))?;
+            (coin, fitted)
+        }
+        None => {
+            let notes = (&denominations[..], notes);
+            smallest_fit(free, &pricing, ask.blocks, dust, notes, least)
+                .with_context(|| format!("no coin free to deposit: {NO_FIT}"))?
+        }
+    };
+    let chosen = range.map(|_| (fitted.cap, ask.blocks));
+    let offer = offer(wallet, &hub, chosen, u64::from(fitted.funded)).await?;
     let keysets = info
         .keysets()
         .map_err(|e| anyhow!("{hub}'s keysets: {e:?}"))?;
@@ -198,6 +230,15 @@ async fn open_once<T: Transport, C: Chain>(
         price <= ask.max_price,
         "{hub} asks {price} sat to open, more than {}",
         ask.max_price
+    );
+    let funded = u64::from(fitted.funded);
+    // Quoted as she priced it: her coin is spent whole.
+    let left = coin.value.checked_sub(price + funded);
+    ensure!(
+        left.is_some_and(|left| left < dust),
+        "{hub} quotes {price} sat and her part of {funded} for a coin of {}, not what it \
+         absorbs: ask again",
+        coin.value
     );
     tracing::info!(
         %hub,
@@ -213,57 +254,23 @@ async fn open_once<T: Transport, C: Chain>(
     // Hers: the hub's quote is checked against it.
     let checkpoint = chain.checkpoint(at).await.map_err(|e| anyhow!(e))?;
     let wanted = wanted(&offer, tip, ask.blocks)?;
-    let store = Store::open(wallet_file)?;
-    let funded = offer.funded();
-    let least = least(
-        info.contracts.and_then(|c| c.range),
-        offer.quote.cap,
-        price + funded,
-    );
-    let free = free(wallet, &store)?;
-    let coin = match ask.deposit {
-        Some(named) => {
-            let coin = free.into_iter().find(|c| c.outpoint == named);
-            let coin = coin.with_context(|| format!("{named}: no coin free to deposit"))?;
-            ensure!(
-                coin.value >= least,
-                "{named}: {} sat, not {least} at least",
-                coin.value
-            );
-            coin
-        }
-        None => smallest(free, least).with_context(|| {
-            format!("no coin on Bitcoin of {least} sat at least, free, to deposit")
-        })?,
-    };
     let deposit = coin.outpoint;
     let coin = wallet
         .silent_coin_output(&deposit)?
         .context("a coin gone")?;
-    let funded_notes = match funded {
-        0 => None,
-        _ => Some(funded_notes(wallet, &offer.quote, funded)?),
-    };
-    // Her reserve returns at the close to a deposit of the hub's that swaps
-    // it for notes, not to a coin of hers that the close would link to her
-    // wallet: the hub holds her to its fee, and she takes the coins back
-    // herself if she never comes for the notes. It needs her part funded,
-    // which the hub issues her as notes too.
-    let close = match (now.deposits, funded) {
-        (Some(_), funded) if funded > 0 => {
-            let timeout = wanted
-                .close_height
-                .checked_add(crate::CLOSE_BLOCKS)
-                .context("the close deposit's timeout overflows")?;
-            let reserve = offer.quote.graph.reserve_alice;
-            let deposit = wallet.close_deposit(&hub, reserve, timeout).await;
-            let deposit = deposit.map_err(|e| anyhow!("{hub}'s deposit for her reserve: {e}"))?;
-            Some(licash_contract::wire::CloseOffer {
-                script: deposit.script,
-                fee: deposit.fee,
-            })
-        }
-        _ => None,
+    let funded_notes = funded_notes(wallet, &offer.quote, funded)?;
+    let timeout = wanted
+        .close_height
+        .checked_add(crate::CLOSE_BLOCKS)
+        .context("the close deposit's timeout overflows")?;
+    let deposit_for_reserve = wallet
+        .close_deposit(&hub, offer.quote.graph.reserve_alice, timeout)
+        .await;
+    let deposit_for_reserve =
+        deposit_for_reserve.map_err(|e| anyhow!("{hub}'s deposit for her reserve: {e}"))?;
+    let close = licash_contract::wire::CloseOffer {
+        script: deposit_for_reserve.script,
+        fee: deposit_for_reserve.fee,
     };
     let secrets = wallet.contract_secrets();
     let start = Start {
@@ -271,9 +278,8 @@ async fn open_once<T: Transport, C: Chain>(
         quote: offer.quote.clone(),
         deposit,
         coin: coin.clone(),
-        change: wallet.fallback_address()?.script_pubkey(),
-        // Her reserve back at the close, or after a corrected payout: to
-        // her wallet, which finds it as any payment.
+        // Her reserve back after a corrected payout, and what her claim
+        // pays: to her wallet, which finds it as any payment.
         payout: wallet.fallback_address()?.script_pubkey(),
         wanted,
         checkpoint,
@@ -717,19 +723,6 @@ pub fn coins<T: Transport>(wallet: &Wallet<T>, wallet_file: &Path) -> Result<Vec
     Ok(coins)
 }
 
-/// The least a coin she deposits holds: the price, and for a cap she
-/// chose within a hub's `range` larger than its least (the fixed terms'),
-/// the cap over the times her coin it may be
-/// ([`licash_api::ContractRange::per_coin`]).
-pub fn least(range: Option<licash_api::ContractRange>, cap: u32, price: u64) -> u64 {
-    match range {
-        Some(r) if r.per_coin > 0 && cap > r.min_cap => {
-            price.max(u64::from(cap).div_ceil(u64::from(r.per_coin)))
-        }
-        _ => price,
-    }
-}
-
 /// The most of `wanted` sat a contract can be funded with by its holder,
 /// in `notes` notes at most of `denominations` (a keyset's, the fewest
 /// notes largest first): what a funding of `wanted` rounds down to, that
@@ -756,30 +749,108 @@ pub fn funding_notes(quote: &Quote) -> (Vec<u64>, usize) {
     (quote.keyset.denominations().collect(), terms.max)
 }
 
-/// The most of a contract within `range` of `cap` sat over `blocks` its
-/// holder funds from a coin of `coin` sat, her part and the price it then
-/// has paid from it, rounded down to what `denominations` make in `notes`
-/// notes ([`fundable`]): none if the coin pays no more than the price.
-pub fn most_funded(
-    range: &licash_api::ContractRange,
-    (cap, blocks): (u32, u32),
+/// What a hub charges for a contract, as her coin is fitted to one.
+#[derive(Clone, Copy, Debug)]
+pub enum Pricing<'a> {
+    /// Terms she chooses within its range.
+    Range(&'a licash_api::ContractRange),
+    /// Its fixed terms only: its cap, and its price, which her part of the
+    /// contract changes not at all.
+    Fixed { cap: u32, price: u64 },
+}
+
+/// A contract that absorbs a coin whole: its cap and her part of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Fit {
+    pub cap: u32,
+    pub funded: u32,
+}
+
+/// Why no contract absorbs a coin.
+pub const NO_FIT: &str = "no contract of this hub absorbs it whole: a coin pays the price and funds \
+     the rest of its part of the contract, leaving less than dust, and is not below the price or \
+     beyond what its largest contract takes";
+
+/// The smallest of `coins` that a contract absorbs whole ([`fit`]), with
+/// the contract.
+pub fn smallest_fit(
+    mut coins: Vec<SilentCoin>,
+    pricing: &Pricing,
+    blocks: u32,
+    dust: u64,
+    notes: (&[u64], usize),
+    least: u32,
+) -> Option<(SilentCoin, Fit)> {
+    coins.sort_by_key(|c| c.value);
+    coins.into_iter().find_map(|coin| {
+        let fitted = fit(pricing, blocks, coin.value, dust, notes, least)?;
+        Some((coin, fitted))
+    })
+}
+
+/// The contract that absorbs a coin of `coin` sat whole, over `blocks`, of
+/// `least` sat at least: the smallest cap, and in it her part the most her
+/// coin pays beyond the price, that its keyset's notes make exactly in
+/// `notes` notes at most (`denominations`, [`fundable`]), leaving less than
+/// `dust`. No change comes back from her coin, so what is left of it is
+/// below what an output is worth. None if no contract does.
+pub fn fit(
+    pricing: &Pricing,
+    blocks: u32,
     coin: u64,
+    dust: u64,
     (denominations, notes): (&[u64], usize),
-) -> u64 {
-    // What the coin pays grows with her part, never by more than it.
-    let pays = |funded: u32| u64::from(funded) + range.price(cap, blocks, funded);
-    let (mut low, mut high) = (0, cap);
-    if pays(0) > coin {
-        return 0;
-    }
-    while low < high {
-        let mid = low + (high - low).div_ceil(2);
-        match pays(mid) <= coin {
-            true => low = mid,
-            false => high = mid - 1,
+    least: u32,
+) -> Option<Fit> {
+    let (caps, price): (Vec<u32>, Box<dyn Fn(u32, u32) -> u64>) = match *pricing {
+        Pricing::Fixed { cap, price } => (vec![cap], Box::new(move |_, _| price)),
+        Pricing::Range(range) => {
+            let caps = range
+                .sizes()
+                .into_iter()
+                .filter(|cap| *cap >= least)
+                // Its cap at most so many times her coin, but the least
+                // size, which any coin may take.
+                .filter(|cap| {
+                    *cap == range.min_cap
+                        || u64::from(*cap) <= coin.saturating_mul(u64::from(range.per_coin))
+                })
+                .collect();
+            let range = *range;
+            (
+                caps,
+                Box::new(move |cap, funded| range.price(cap, blocks, funded)),
+            )
+        }
+    };
+    // What her coin pays for her part, `funded`, of a contract of `cap`: it
+    // grows with it, by no more than 2 sat for each, the interest on the
+    // hub's part falling as it rises and rounded down.
+    for cap in caps {
+        let pays = |funded: u32| u64::from(funded) + price(cap, funded);
+        if pays(1) > coin {
+            return None;
+        }
+        let (mut low, mut high) = (1, cap);
+        while low < high {
+            let mid = low + (high - low).div_ceil(2);
+            match pays(mid) <= coin {
+                true => low = mid,
+                false => high = mid - 1,
+            }
+        }
+        for funded in (1..=low).rev() {
+            if coin - pays(funded) >= dust {
+                // Less of her part leaves more of her coin: a larger
+                // contract may take what is left.
+                break;
+            }
+            if fundable(denominations, notes, u64::from(funded)) == u64::from(funded) {
+                return Some(Fit { cap, funded });
+            }
         }
     }
-    fundable(denominations, notes, u64::from(low))
+    None
 }
 
 /// The offer of `hub` now: of `chosen` terms, a cap in sat over blocks,
@@ -1000,9 +1071,8 @@ mod tests {
         assert_eq!(fundable(&wide, 16, 1_000_000), 1_000_000);
     }
 
-    #[test]
-    fn she_funds_what_her_coin_pays_beside_the_price_of_the_rest() {
-        let range = licash_api::ContractRange {
+    fn range() -> licash_api::ContractRange {
+        licash_api::ContractRange {
             min_cap: 131_071,
             max_cap: 16_777_215,
             min_blocks: 300,
@@ -1013,19 +1083,95 @@ mod tests {
             ppm_year: 20_000,
             ppm_year_funded: 0,
             year_blocks: licash_api::YEAR_BLOCKS,
-        };
+        }
+    }
+
+    /// What her coin pays in a contract: her part and the price.
+    fn pays(range: &licash_api::ContractRange, fit: Fit) -> u64 {
+        u64::from(fit.funded) + range.price(fit.cap, 52_560, fit.funded)
+    }
+
+    #[test]
+    fn a_coin_is_absorbed_whole_by_the_smallest_contract_that_takes_it() {
+        let range = range();
         let wide: Vec<u64> = (0..32).map(|i| 1 << i).collect();
-        let most = |cap, coin| most_funded(&range, (cap, 52_560), coin, (&wide, 32));
-        // 1 M sat: the price of the rest of 1 048 575, and her part.
-        let funded = most(1_048_575, 1_000_000);
-        let pays = funded + range.price(1_048_575, 52_560, funded as u32);
-        assert!(pays <= 1_000_000 && pays + 2 > 1_000_000, "{funded} {pays}");
-        // All of it hers, at most; none of a coin short of the price.
-        assert_eq!(most(131_071, 10_000_000), 131_071);
-        assert_eq!(most(131_071, 25_000), 0);
+        let fits = |coin| fit(&Pricing::Range(&range), 52_560, coin, 330, (&wide, 32), 0);
+        // 1 M sat: 131 071 and the sizes up to 524 287 are all hers and
+        // leave it most unspent; 1 048 575 funds the rest of it.
+        let fitted = fits(1_000_000).unwrap();
+        assert_eq!(fitted.cap, 1_048_575);
+        let left = 1_000_000 - pays(&range, fitted);
+        assert!(left < 330, "{left} sat left over");
+        // The least size is the first tried: a smaller coin than it takes.
+        let small = fits(150_000).unwrap();
+        assert_eq!(small.cap, 131_071);
+        assert!(150_000 - pays(&range, small) < 330);
+        // A coin short of the price, and one beyond the largest contract.
+        assert_eq!(fits(25_000), None);
+        assert_eq!(fits(100_000_000), None);
+        // Or of the cap she asks at least.
+        let asked = fit(&Pricing::Range(&range), 52_560, 1_000_000, 330, (&wide, 32), 2_000_000);
+        assert_eq!(asked, None);
+    }
+
+    #[test]
+    fn every_coin_between_the_price_and_what_the_largest_contract_takes_is_absorbed() {
+        let range = range();
+        let wide: Vec<u64> = (0..32).map(|i| 1 << i).collect();
+        for coin in (26_000..8_000_000).step_by(99_991) {
+            let fitted = fit(&Pricing::Range(&range), 52_560, coin, 330, (&wide, 32), 0)
+                .unwrap_or_else(|| panic!("no contract absorbs {coin}"));
+            let paid = pays(&range, fitted);
+            assert!(paid <= coin && coin - paid < 330, "{coin}: {fitted:?} pays {paid}");
+            assert!(fitted.funded >= 1 && fitted.funded <= fitted.cap);
+            assert!(licash_api::is_size(fitted.cap));
+            // Her coin at most so many times what the cap needs: the hub's.
+            assert!(fitted.cap == range.min_cap || u64::from(fitted.cap) <= coin * 4);
+        }
+    }
+
+    #[test]
+    fn her_part_is_made_of_notes_a_claim_names() {
+        let range = range();
+        // 2 048 at most a note: not every amount is as few as 32 notes of it.
         let twos: Vec<u64> = (0..12).map(|i| 1 << i).collect();
-        let rounded = most_funded(&range, (1_048_575, 52_560), 1_000_000, (&twos, 32));
-        assert_eq!(rounded, 2_048 * 32);
+        for coin in (26_000..400_000).step_by(7_919) {
+            let Some(fitted) = fit(&Pricing::Range(&range), 52_560, coin, 330, (&twos, 32), 0)
+            else {
+                continue;
+            };
+            let funded = u64::from(fitted.funded);
+            assert_eq!(fundable(&twos, 32, funded), funded, "{coin}: {fitted:?}");
+            assert!(coin - pays(&range, fitted) < 330);
+        }
+        // A coin that only a part too large for them takes fits none.
+        assert_eq!(
+            fit(&Pricing::Range(&range), 52_560, 8_000_000, 330, (&twos, 32), 0),
+            None
+        );
+    }
+
+    #[test]
+    fn a_hub_of_one_contract_takes_the_coins_that_contract_absorbs() {
+        let wide: Vec<u64> = (0..32).map(|i| 1 << i).collect();
+        let fixed = Pricing::Fixed {
+            cap: 3_584,
+            price: 21_000,
+        };
+        let fits = |coin| fit(&fixed, 1_000, coin, 330, (&wide, 32), 0);
+        assert_eq!(
+            fits(24_000),
+            Some(Fit {
+                cap: 3_584,
+                funded: 3_000
+            })
+        );
+        // The price is not paid, or more than the cap takes is left.
+        assert_eq!(fits(21_000), None);
+        assert_eq!(fits(30_000), None);
+        // The most it takes, and the dust that may stay unspent.
+        assert!(fits(21_000 + 3_584 + 329).is_some());
+        assert_eq!(fits(21_000 + 3_584 + 330), None);
     }
 
     #[test]

@@ -8,7 +8,7 @@ use crate::wire::{Reader, Writer};
 use lichen_btc::bitcoin::hashes::sha256;
 
 const MAGIC: [u8; 4] = *b"LCOS";
-pub const FORMAT: u16 = 3;
+pub const FORMAT: u16 = 4;
 
 #[derive(Clone, Debug)]
 pub struct Peek {
