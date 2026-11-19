@@ -13,6 +13,8 @@
 !crates/licash-wallet
 # The recovery contract, on Lichen (from git).
 !crates/licash-contract
+# The hub's header chain, proven in batches by the chain program.
+!crates/licash-chain
 # The hub's statement, of the contract and of its recovery.
 !crates/licash-hp
 !crates/licash-statement
