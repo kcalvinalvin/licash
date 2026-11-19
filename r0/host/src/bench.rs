@@ -156,6 +156,18 @@ pub fn stark(dir: &Path, po2: u32, program: Option<&str>) -> Result<Value> {
 mod tests {
     use super::*;
 
+    /// The kept input is a statement today's library proves: the Base and the
+    /// statement's input have changed since it was last made, and a benchmark
+    /// that fails to decode its input leaves a hub's prover not ready.
+    /// Made again by `export_inputs` (docs/r0.md): `answered.bin`.
+    #[test]
+    fn the_benchmarks_input_is_a_statement_the_library_proves() {
+        let bytes = std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("bench.bin")).unwrap();
+        let input = licash_hp::HubInput::from_bytes(&bytes).expect("it decodes");
+        assert!(input.chain.is_none(), "a program of any graph reads it");
+        licash_hp::check(&input).expect("it is proven");
+    }
+
     #[test]
     fn it_measures_beside_where_it_keeps_its_measure() {
         let kept = tempfile::tempdir().unwrap();
