@@ -1,4 +1,4 @@
-# Android app
+# Android app reference
 
 The Licash wallet for Android: the wallet core (`apps/mobile/core`, Rust
 over UniFFI) and the light client (`apps/mobile/chain`, Go over gomobile)
@@ -47,7 +47,7 @@ of the key never used before, one withdrawal at a time; the page shows
 what the key's addresses hold from the birthday (found with block filters),
 the next address, and how to bring funds back: send them to a Bitcoin
 address shown in Receive. How the app looks and speaks, and the shared parts to build a screen of, are in
-[../../DESIGN.md](../../DESIGN.md).
+[apps/DESIGN.md](../apps/DESIGN.md).
 
 ## Backup and restore
 
@@ -127,7 +127,7 @@ heights and providers.
 
 Like the CLI, each sync reshapes the notes of a wallet that mostly
 receives, within the same fee authority and the rolling 1% daily budget
-(see [the wallet's README](../../wallet-cli/README.md)). While notes wait
+(see [the wallet CLI reference](wallet-cli.md)). While notes wait
 out their privacy rest, a periodic job (about every 15 minutes, as Android
 allows) keeps looking after the app is closed, without the foreground
 service; it stops once nothing is left to do, or when what is left is

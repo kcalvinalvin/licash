@@ -1,4 +1,4 @@
-# Hub service
+# Hub service reference
 
 `licash-hub` serves a hub (`crates/licash-hub`) over the HTTP API of
 `crates/licash-api`. `licash-hub --help` lists the commands, flags and
@@ -396,7 +396,7 @@ alone if it bears out, which pays her what it says once her contest window
 has passed and which the hub posts itself, no proof made. Contested, the
 hub proves that statement and asserts the proof; challenged, it answers
 with a kept instance. On regtest the proof is the
-mock authority's; on signet the hub proves with `licash-r0` (r0/README.md,
+mock authority's; on signet the hub proves with `licash-r0` (docs/r0.md,
 `LICASH_HP_PROVER` names another), as described below. It sweeps its outputs of each payout to its
 wallet; a payout's rest and the holder's reserve pay each party's wallet
 directly. A holder may close her contract early, and be paid her claim in
@@ -528,7 +528,7 @@ swaps from that hub are declined. A cap holds for every URL the provider's
 wallet knows the hub by, such as the URL given and the `https` one it
 moves to, and counts the swaps recorded at each of them. By default it
 also takes in only what recovery contracts at that hub protect, keeping
-them as a standalone provider does (see `apps/swaps/README.md`): the first
+them as a standalone provider does (see `docs/swaps.md`): the first
 at each hub opened by the operator with `licash-wallet --wallet
 <data>/swaps/wallet.sqlite open-contract URL --chain URL`, then replaced
 before they end and forced closed at their safe deadline if needed, the
@@ -547,7 +547,7 @@ wallet and swaps are kept in `<data>/swaps/wallet.sqlite`, one file made on
 the first start: back it up with `hub.sqlite`, since an older copy loses
 the claims backing notes the hub locked. The hub refuses to start without `--swaps` while swaps are under
 way. Each round, the provider's wallet also reshapes the notes it was paid,
-as a standalone provider's does (see `apps/swaps/README.md`). To move the provider's notes out, stop the hub and run `licash-wallet
+as a standalone provider's does (see `docs/swaps.md`). To move the provider's notes out, stop the hub and run `licash-wallet
 --wallet <data>/swaps/wallet.sqlite`. The provider's wallet reaches hubs
 directly, so it cannot swap from a hub at an onion service only, unless
 with `--swaps-tor`: then through a Tor client of the hub's own, that of

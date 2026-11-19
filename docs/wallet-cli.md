@@ -1,4 +1,4 @@
-# Wallet CLI
+# Wallet CLI reference
 
 `licash-wallet` keeps a wallet (`crates/licash-wallet`) in one file and
 pays through the hubs it trusts. `licash-wallet --help` lists the commands.
@@ -268,7 +268,7 @@ notes at a hub are shared out among the contracts there so that together
 they recover the most, the one ending first served first. On regtest, contracts are
 under a mock proof authority: such a contract protects nothing. On signet
 and Mutinynet they are under the genuine programs, a trial: `force-close`
-below recovers from them, not yet tried on signet itself (the hub's README
+below recovers from them, not yet tried on signet itself (docs/hub.md
 says what else it lacks). No other network for now. A contract's length is
 told in the days of its network's blocks (144 a day, Mutinynet's 2,880).
 
