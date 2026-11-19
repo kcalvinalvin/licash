@@ -851,10 +851,7 @@ mod tests {
         // The 10 M sat coin, spent whole: 16 777 215 sat protected where it
         // can be, for 106 886 sat at the cheaper. Where 1 M sat is the most
         // a contract protects, none takes so large a coin.
-        assert_eq!(
-            best(&hubs, 10_000_000),
-            ["https://cheap", "https://dear"]
-        );
+        assert_eq!(best(&hubs, 10_000_000), ["https://cheap", "https://dear"]);
         // A coin of 500 k sat is taken whole there too.
         assert_eq!(best(&hubs[..1], 500_000), ["https://small"]);
         // And 800 k sat is too much for the 524 287 sat it is suggested.

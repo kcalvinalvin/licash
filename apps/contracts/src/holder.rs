@@ -759,6 +759,36 @@ pub enum Pricing<'a> {
     Fixed { cap: u32, price: u64 },
 }
 
+impl Pricing<'_> {
+    /// What a contract of `cap` sat over `blocks` costs besides her part of
+    /// it, `funded` sat, which her coin pays too.
+    fn price(&self, cap: u32, blocks: u32, funded: u32) -> u64 {
+        match self {
+            Self::Fixed { price, .. } => *price,
+            Self::Range(range) => range.price(cap, blocks, funded),
+        }
+    }
+
+    /// The caps a contract of a coin of `coin` sat may have, of `least` at
+    /// least, smallest first.
+    fn caps(&self, coin: u64, least: u32) -> Vec<u32> {
+        match self {
+            Self::Fixed { cap, .. } => vec![*cap],
+            Self::Range(range) => range
+                .sizes()
+                .into_iter()
+                .filter(|cap| *cap >= least)
+                // Its cap at most so many times her coin, but the least
+                // size, which any coin may take.
+                .filter(|cap| {
+                    *cap == range.min_cap
+                        || u64::from(*cap) <= coin.saturating_mul(u64::from(range.per_coin))
+                })
+                .collect(),
+        }
+    }
+}
+
 /// A contract that absorbs a coin whole: its cap and her part of it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Fit {
@@ -803,31 +833,11 @@ pub fn fit(
     (denominations, notes): (&[u64], usize),
     least: u32,
 ) -> Option<Fit> {
-    let (caps, price): (Vec<u32>, Box<dyn Fn(u32, u32) -> u64>) = match *pricing {
-        Pricing::Fixed { cap, price } => (vec![cap], Box::new(move |_, _| price)),
-        Pricing::Range(range) => {
-            let caps = range
-                .sizes()
-                .into_iter()
-                .filter(|cap| *cap >= least)
-                // Its cap at most so many times her coin, but the least
-                // size, which any coin may take.
-                .filter(|cap| {
-                    *cap == range.min_cap
-                        || u64::from(*cap) <= coin.saturating_mul(u64::from(range.per_coin))
-                })
-                .collect();
-            let range = *range;
-            (
-                caps,
-                Box::new(move |cap, funded| range.price(cap, blocks, funded)),
-            )
-        }
-    };
+    let price = |cap, funded| pricing.price(cap, blocks, funded);
     // What her coin pays for her part, `funded`, of a contract of `cap`: it
     // grows with it, by no more than 2 sat for each, the interest on the
     // hub's part falling as it rises and rounded down.
-    for cap in caps {
+    for cap in pricing.caps(coin, least) {
         let pays = |funded: u32| u64::from(funded) + price(cap, funded);
         if pays(1) > coin {
             return None;

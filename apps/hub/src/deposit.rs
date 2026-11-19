@@ -256,6 +256,18 @@ struct Record {
     close: Option<CloseState>,
 }
 
+/// A deposit asked for, to record.
+struct New<'a> {
+    body: &'a str,
+    amount: u64,
+    pays: u64,
+    htlc: &'a Htlc,
+    /// The last block its payment may confirm in.
+    fund_by: u32,
+    /// Whether it returns a contract's reserve.
+    close: bool,
+}
+
 /// Where a deposit that returns a contract's reserve stands.
 #[derive(Clone, Debug)]
 struct CloseState {
@@ -370,17 +382,16 @@ impl Store {
     /// Record a deposit unless one under its hash is, or `most` are
     /// asked and not paid: false then. Those bound to a contract are not
     /// counted: a contract limits them. One that returns a contract's
-    /// reserve (`close`) is recorded as such, in the same write.
-    fn insert(
-        &self,
-        body: &str,
-        amount: u64,
-        pays: u64,
-        htlc: &Htlc,
-        fund_by: u32,
-        most: u32,
-        close: bool,
-    ) -> rusqlite::Result<bool> {
+    /// reserve (`new.close`) is recorded as such, in the same write.
+    fn insert(&self, new: &New, most: u32) -> rusqlite::Result<bool> {
+        let New {
+            body,
+            amount,
+            pays,
+            htlc,
+            fund_by,
+            close,
+        } = *new;
         let mut conn = self.conn();
         let tx = licash_store::begin(&mut conn)?;
         let inserted = tx.execute(
@@ -855,18 +866,15 @@ impl Gateway {
                 timeout,
             };
             let fund_by = from.saturating_add(c.window);
-            let inserted = self
-                .store
-                .insert(
-                    &canonical,
-                    amount,
-                    pays,
-                    &htlc,
-                    fund_by,
-                    c.max_open,
-                    body.close.is_some(),
-                )
-                .map_err(store_down)?;
+            let new = New {
+                body: &canonical,
+                amount,
+                pays,
+                htlc: &htlc,
+                fund_by,
+                close: body.close.is_some(),
+            };
+            let inserted = self.store.insert(&new, c.max_open).map_err(store_down)?;
             if !inserted && self.store.get(&hash).map_err(store_down)?.is_none() {
                 return Err(Failure(Problem::new(
                     Code::Unavailable,

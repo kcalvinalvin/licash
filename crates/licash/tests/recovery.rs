@@ -12,7 +12,7 @@ use bitcoin::{
 use k256::Scalar;
 use licash::{
     authorization::{Authorization, PreparedGrant, SignedProposal},
-    base::{self, Base, ChainTerms, Close, Fees, GraphTerms, Limits, Parts, Party, Recipe},
+    base::{Base, ChainTerms, Close, Fees, GraphTerms, Limits, Parts, Party, Recipe},
     chain::{self, Activation, ActivationRef, Chain, Checkpoint, Inclusion},
     claim::{self, ActivationRecord, Branch, Item, Source, UnsignedClaim},
     crypto::{self, Point},
