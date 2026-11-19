@@ -5,10 +5,12 @@
 //!
 //! `graph` builds the graph from Base and both parties' keys (`keys`);
 //! `opening` opens it between a holder and a hub over `wire`'s messages;
-//! `dispute` is each side's moves on the chain. The regtest suite
+//! `dispute` is each side's moves on the chain, `exit` what its statement
+//! (`licash_statement`) reads of the exit's blocks. The regtest suite
 //! (`regtest/`) plays it on Bitcoin Core.
 
 pub mod dispute;
+pub mod exit;
 pub mod graph;
 pub mod keys;
 pub mod opening;
