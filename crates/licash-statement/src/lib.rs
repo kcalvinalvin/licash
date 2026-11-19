@@ -647,19 +647,69 @@ pub struct Read {
     pub heights: Heights,
 }
 
+/// The blocks an exit's transactions are in, as the statement reads them:
+/// a chain from the contract's checkpoint, shown in full ([`Dense`]) or
+/// proven beforehand and opened where the exit needs it (`licash-hp`'s
+/// `headers`). What it holds of them is the same: where a block is, and the
+/// work above it.
+pub trait Blocks {
+    /// Whether the blocks are a chain from the contract's checkpoint, each
+    /// within its own target.
+    fn linked(&self, contract: &Contract) -> bool;
+    /// The height of the block of `header` on the chain, if it is on it
+    /// and above the checkpoint.
+    fn height_of(&self, contract: &Contract, header: &[u8; 80]) -> Option<u32>;
+    /// The work of the chain above the block at `height`, which
+    /// `height_of` found.
+    fn work_above(&self, contract: &Contract, height: u32) -> Option<u128>;
+}
+
+/// Every header of the exit, after the checkpoint.
+pub struct Dense<'a>(pub &'a [[u8; 80]]);
+
+impl Blocks for Dense<'_> {
+    fn linked(&self, contract: &Contract) -> bool {
+        work_on(&contract.checkpoint.hash, self.0).is_some()
+    }
+
+    fn height_of(&self, contract: &Contract, header: &[u8; 80]) -> Option<u32> {
+        let at = self.0.iter().position(|x| x == header)?;
+        Some(
+            contract
+                .checkpoint
+                .height
+                .saturating_add(1)
+                .saturating_add(at as u32),
+        )
+    }
+
+    fn work_above(&self, contract: &Contract, height: u32) -> Option<u128> {
+        let at = height
+            .checked_sub(contract.checkpoint.height)?
+            .checked_sub(1)?;
+        let after = self.0.get(at as usize + 1..)?;
+        Some(
+            after
+                .iter()
+                .fold(0u128, |s, h| s.saturating_add(work(Header(*h).bits()))),
+        )
+    }
+}
+
 /// Read `exit` for `contract`: its transactions, each in a block among
 /// the headers, which follow the checkpoint, with the contract's work on
 /// top of the last of those blocks.
 pub fn read(contract: &Contract, exit: &Exit) -> Result<Read, Reject> {
-    if work_on(&contract.checkpoint.hash, &exit.headers).is_none() {
+    read_on(contract, exit, &Dense(&exit.headers))
+}
+
+/// [`read`] with the blocks `blocks` (which the exit's own `headers` are
+/// not, or not all of, under a chain proven beforehand).
+pub fn read_on(contract: &Contract, exit: &Exit, blocks: &impl Blocks) -> Result<Read, Reject> {
+    if !blocks.linked(contract) {
         return Err(Reject::Depth);
     }
-    let position = |h: &[u8; 80]| {
-        exit.headers
-            .iter()
-            .position(|x| x == h)
-            .ok_or(Reject::Depth)
-    };
+    let position = |h: &[u8; 80]| blocks.height_of(contract, h).ok_or(Reject::Depth);
     let witness = exit
         .request
         .spending(&contract.deposit)
@@ -715,25 +765,14 @@ pub fn read(contract: &Contract, exit: &Exit) -> Result<Read, Reject> {
         .chain(disclosure)
         .max()
         .expect("three blocks");
-    if exit.headers[last + 1..]
-        .iter()
-        .fold(0u128, |s, h| s.saturating_add(work(Header(*h).bits())))
-        < contract.work
-    {
+    if blocks.work_above(contract, last).ok_or(Reject::Depth)? < contract.work {
         return Err(Reject::Depth);
     }
-    let height = |p: usize| {
-        contract
-            .checkpoint
-            .height
-            .saturating_add(1)
-            .saturating_add(p as u32)
-    };
     let heights = Heights {
-        request: height(at[0]),
-        publish: height(at[1]),
-        respond: height(at[2]),
-        disclosure: disclosure.map(height),
+        request: at[0],
+        publish: at[1],
+        respond: at[2],
+        disclosure,
     };
     Ok(Read {
         b,
