@@ -66,6 +66,7 @@ internal fun CoverRow(
     end: () -> Unit,
     forceClose: () -> Unit,
     giveUp: () -> Unit,
+    allowFee: () -> Unit = {},
     safety: suspend () -> ContractSafety? = { null },
     inspection: suspend () -> ContractInspection? = { null },
     explorer: (String) -> String? = { null },
@@ -145,7 +146,7 @@ internal fun CoverRow(
         AnimatedVisibility(open) {
             Column {
                 if (recovery != null) {
-                    Forced(recovery, developer, giveUp, height)
+                    Forced(recovery, developer, giveUp, allowFee, height)
                 } else {
                     Unfolded(c, cover, developer, end, forceClose, plan, height, network)
                 }
@@ -239,9 +240,13 @@ private fun Unfolded(c: Contract, cover: Cover, developer: Boolean, end: () -> U
     }
 }
 
-/** A protection forced closed, unfolded: what it claimed, what stopped it, and giving it up while it may be. */
+/**
+ * A protection forced closed, unfolded: what it claimed, what stopped it,
+ * giving it up while it may be, and allowing its claim a higher fee once
+ * the reserve's falls short.
+ */
 @Composable
-private fun Forced(r: Recovery, developer: Boolean, giveUp: () -> Unit, height: Int) {
+private fun Forced(r: Recovery, developer: Boolean, giveUp: () -> Unit, allowFee: () -> Unit, height: Int) {
     Line("Claimed", sat(r.claimed), tag = "recovery-claimed")
     r.corrected?.let {
         Line("Owed, the hub says", sat(it), tag = "recovery-corrected")
@@ -251,7 +256,12 @@ private fun Forced(r: Recovery, developer: Boolean, giveUp: () -> Unit, height: 
     if (r.stage == RecoveryStage.ANSWERED && height > 0) r.deadline?.let {
         Line("Hub's time left to prove", "${it.toLong().minus(height).coerceAtLeast(0)} blocks")
     }
-    r.error?.let { Line("Stopped by", it) }
+    if (r.feeCapped) {
+        Line("Stopped by", "The fee its reserve pays", tag = "recovery-fee-capped")
+        if (developer) r.error?.let { Say(it) }
+    } else {
+        r.error?.let { Line("Stopped by", it) }
+    }
     if (developer) {
         r.nextAt?.let { Line("Next step at", "block $it") }
         r.request?.let { Line("Request", it.take(16) + "…") }
@@ -264,8 +274,42 @@ private fun Forced(r: Recovery, developer: Boolean, giveUp: () -> Unit, height: 
         r.sweep?.let { Line("Sweep", it.take(16) + "…") }
         r.fold?.let { Line("Fold", it.take(16) + "…") }
     }
+    if (r.feeCapped) {
+        TextButton(onClick = allowFee, modifier = Modifier.testTag("allow-publication-fee")) { Text("Allow a higher fee") }
+    }
     if (forcing(r, height).revocable) {
         TextButton(onClick = giveUp, modifier = Modifier.testTag("give-up-recovery")) { Text("Cancel closing") }
+    }
+}
+
+/**
+ * Let a forced close's claim pay up to a total fee she types, past what
+ * its reserve pays, the rest from her coins on Bitcoin. Her claim must be
+ * in a block within its window, about an hour, or what it claimed is lost.
+ */
+@Composable
+internal fun AllowFeeSheet(recovery: Recovery?, busy: Boolean, allow: (ULong) -> Unit, dismiss: () -> Unit) {
+    var amount by remember { mutableStateOf<Long?>(null) }
+    Sheet("Allow a higher fee", dismiss) {
+        if (recovery?.feeCapped == true) {
+            Say(
+                "Fees on Bitcoin are higher than this contract's reserve pays for publishing its claim. " +
+                    "Allow a total fee for it: what the reserve does not cover comes from your coins on Bitcoin.",
+            )
+            Say("It must be in a block soon, within about an hour, or the close fails and the notes it claimed are lost.")
+            AmountField(amount, { amount = it })
+            if (busy) Say("Waiting for the contract sync under way to finish first.")
+            BigButton(
+                if (busy) "Allowing…" else "Allow",
+                Modifier.fillMaxWidth().testTag("allow-publication-fee-confirm"),
+                enabled = !busy && amount != null,
+                onClick = { amount?.let { allow(it.toULong()) } },
+            )
+            TextButton(onClick = dismiss, enabled = !busy, modifier = Modifier.fillMaxWidth()) { Text("Not now") }
+        } else {
+            Say("Its claim no longer waits for a higher fee.")
+            BigButton("Done", Modifier.fillMaxWidth(), onClick = dismiss)
+        }
     }
 }
 

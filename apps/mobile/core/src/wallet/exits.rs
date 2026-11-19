@@ -64,6 +64,10 @@ pub struct ContractExit {
     pub uncovered: u64,
     /// Why its step failed this round, if it did.
     pub error: Option<String>,
+    /// The locks owed to her only its forced close claims on Bitcoin,
+    /// which no payout recovers.
+    #[uniffi(default = 0)]
+    pub owed: u64,
 }
 
 fn step(s: Step) -> ExitStep {
@@ -163,6 +167,7 @@ impl Wallet {
                 force_at: e.force_at,
                 uncovered: e.uncovered,
                 error: e.error,
+                owed: e.owed,
             })
             .collect())
     }

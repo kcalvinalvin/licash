@@ -114,6 +114,10 @@ pub struct Recovery {
     /// hex, once it did ([`RecoveryStage::Folding`]).
     #[uniffi(default = None)]
     pub fold: Option<String>,
+    /// Its claim held out of blocks by the fee her contract's reserve
+    /// pays: on once she allows more ([`Wallet::allow_publication_fee`]).
+    #[uniffi(default = false)]
+    pub fee_capped: bool,
 }
 
 /// Where a forced close, or a close on a fold of her claim, stands.
@@ -195,6 +199,7 @@ fn shown(r: &recovery::Recovery) -> Recovery {
         corrected: r.corrected,
         received: r.received,
         fold: txid(r.fold),
+        fee_capped: r.fee_capped,
     }
 }
 
@@ -293,6 +298,20 @@ impl Wallet {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         recovery::give_up(&self.wallet, &self.dir, &id).map_err(failed)
+    }
+
+    /// Let forcing contract `id` closed pay up to `sats` in all for
+    /// publishing its claim, past its reserve, the rest from her coins on
+    /// Bitcoin: refused above what the contract holds.
+    pub fn allow_publication_fee(&self, id: String, sats: u64) -> Result<(), LicashError> {
+        let id = contract_id(&id)?;
+        let _contracting = self
+            .contracting
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        recovery::allow_publication_fee(&self.dir, &id, sats).map_err(failed)?;
+        tracing::info!(id = %hex::encode(id), sats, "publication fee allowed");
+        Ok(())
     }
 }
 

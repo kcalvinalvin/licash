@@ -1349,6 +1349,14 @@ class Engine(context: Context) {
         }
     }
 
+    /** Let forcing contract `id` closed pay up to `sats` in all to publish its claim, then carry it on. */
+    suspend fun allowPublicationFee(id: String, sats: ULong): Result<Unit> = io {
+        local { it.allowPublicationFee(id, sats) }
+        AppLog.info("forcing contract $id closed may pay $sats sat to publish")
+        refresh()
+        poke()
+    }
+
     /** Give up forcing contract `id` closed, its notes back: only until its request is final. */
     suspend fun giveUpRecovery(id: String): Result<Unit> = io {
         local { it.giveUpRecovery(id) }

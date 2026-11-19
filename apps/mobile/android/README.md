@@ -266,6 +266,14 @@ releases the notes reserved by that attempt. It does not close the contract
 or recover Bitcoin; another attempt is possible while the contract permits
 it. Once signed, even an unconfirmed request cannot be canceled.
 
+A forced close's claim pays its fee from the contract's reserve, never
+more on its own. Should fees on Bitcoin outrun it, the row says so, a
+notification asks her to act, and Allow a higher fee lets her set a total
+fee for the claim, the rest from her coins on Bitcoin: it must be in a
+block within its window, about an hour, or the notes it claimed are lost.
+A protection ending soon without her consent to exit also tells of the
+payments owed to her that only forcing it closed recovers.
+
 Advanced settings has a holder-owned recovery planning margin (14 estimated
 days by default). An unfolded contract reads the signed terms to show when
 its request should confirm. The margin alone authorizes nothing.

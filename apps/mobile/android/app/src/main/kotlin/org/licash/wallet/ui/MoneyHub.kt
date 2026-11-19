@@ -73,6 +73,8 @@ internal fun HubPage(
     var shortfall by remember { mutableStateOf<ULong?>(null) }
     var canceling by remember { mutableStateOf<String?>(null) }
     var cancelingBusy by remember { mutableStateOf(false) }
+    var allowing by remember { mutableStateOf<String?>(null) }
+    var allowingBusy by remember { mutableStateOf(false) }
     var fees by remember { mutableStateOf(false) }
     var moving by remember { mutableStateOf(false) }
     val cover = hubCover(holding.hub, holding, ui.contracts, notes)
@@ -152,6 +154,7 @@ internal fun HubPage(
                     end = { ending = c },
                     forceClose = { forcing = c },
                     giveUp = { canceling = c.id },
+                    allowFee = { allowing = c.id },
                 )
             }
             if (opening && !stepping) {
@@ -273,6 +276,23 @@ internal fun HubPage(
                 }
             },
             dismiss = { if (!cancelingBusy) canceling = null },
+        )
+    }
+    allowing?.let { id ->
+        AllowFeeSheet(
+            recovery = ui.recoveries.find { it.id == id },
+            busy = allowingBusy,
+            allow = { sats ->
+                allowingBusy = true
+                scope.launch {
+                    engine.allowPublicationFee(id, sats).fold(
+                        { allowing = null },
+                        { allowing = null; fail("Couldn't allow the fee: ${explain(it)}") },
+                    )
+                    allowingBusy = false
+                }
+            },
+            dismiss = { if (!allowingBusy) allowing = null },
         )
     }
     if (moving) {

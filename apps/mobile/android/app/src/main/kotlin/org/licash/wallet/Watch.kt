@@ -73,8 +73,9 @@ internal data class ExitNotice(val key: String, val urgent: Boolean, val text: S
 
 /**
  * What to tell of the contracts' `exits` this round and of the forced
- * closes `recoveries` disputed: what the exit did, what she must do, and
- * when to keep the app online. Amounts only, never a hub's name.
+ * closes `recoveries` disputed or held back by their claim's fee: what the
+ * exit did, what she must do, and when to keep the app online. Amounts
+ * only, never a hub's name.
  */
 internal fun exitNotices(exits: List<ContractExit>, recoveries: List<Recovery>): List<ExitNotice> {
     val told = exits.mapNotNull { e ->
@@ -84,8 +85,13 @@ internal fun exitNotices(exits: List<ContractExit>, recoveries: List<Recovery>):
             ExitStep.NEEDS_CONSENT -> ExitNotice(
                 key,
                 true,
-                "Protection of ${sat(e.uncovered)} ends soon. Allow exits in Settings, Recovery safety, " +
-                    "or pay those notes out yourself.",
+                if (e.owed == 0uL) {
+                    "Protection of ${sat(e.uncovered)} ends soon. Allow exits in Settings, Recovery safety, " +
+                        "or pay those notes out yourself."
+                } else {
+                    "Protection of ${sat(e.uncovered)}, and ${sat(e.owed)} of payments owed to you that only " +
+                        "forcing it closed recovers, ends soon. Allow exits in Settings, Recovery safety."
+                },
             )
             ExitStep.NEVER_FITTED -> ExitNotice(
                 key,
@@ -110,7 +116,16 @@ internal fun exitNotices(exits: List<ContractExit>, recoveries: List<Recovery>):
                 "so a false proof is challenged in time.",
         )
     }
-    return told + disputed
+    // Its claim's window short: told at once.
+    val capped = recoveries.filter { it.feeCapped && carriedOn(it) }.map {
+        ExitNotice(
+            "fee ${it.id}",
+            true,
+            "A forced close needs a higher fee than its reserve pays to get its claim on Bitcoin. " +
+                "Open Licash and allow it within the hour.",
+        )
+    }
+    return told + disputed + capped
 }
 
 /** Whether `recovery` still has steps to carry on. */

@@ -2208,6 +2208,10 @@ fn a_phone_with_no_contract_forces_none_closed_and_keeps_no_file_for_it() {
     assert!(none.contains("no contracts"), "{none}");
     let none = failed(alice.give_up_recovery("00".repeat(32)));
     assert!(none.contains("no contracts"), "{none}");
+    let none = failed(alice.allow_publication_fee("00".repeat(32), 1_000));
+    assert!(none.contains("no contracts"), "{none}");
+    let bad = invalid(alice.allow_publication_fee("zz".into(), 1_000));
+    assert!(bad.contains("no contract id"), "{bad}");
     // Carried on with the others: nothing.
     assert!(alice.resume_contracts(light.clone()).unwrap().is_empty());
     assert!(alice.recoveries().unwrap().is_empty());

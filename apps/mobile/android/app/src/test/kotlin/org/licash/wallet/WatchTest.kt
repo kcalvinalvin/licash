@@ -148,6 +148,22 @@ class WatchTest {
         assertEquals(listOf(true, false, true), told.map { it.urgent })
         assertTrue(told[0].text, told[0].text.contains("3,000 sat") && told[0].text.contains("Allow exits"))
         assertTrue(told.none { it.text.contains("hub.example") })
+        // Locks owed to her only its forced close recovers: told apart.
+        val owed = exitNotices(listOf(exit(ExitStep.NEEDS_CONSENT).copy(owed = 1_000uL)), emptyList())
+        assertTrue(owed[0].text, owed[0].text.contains("1,000 sat") && owed[0].text.contains("forcing it closed"))
+    }
+
+    @Test
+    fun a_forced_close_held_back_by_its_fee_asks_her_to_allow_more() {
+        fun forced(capped: Boolean, stage: RecoveryStage = RecoveryStage.REQUESTING) = Recovery(
+            id = "c0", stage = stage, irrevocable = true, claimed = 3_000uL, notes = 7u, request = null,
+            publication = null, timeout = null, sweep = null, nextAt = null, error = null, feeCapped = capped,
+        )
+        assertTrue(exitNotices(emptyList(), listOf(forced(false))).isEmpty())
+        assertTrue(exitNotices(emptyList(), listOf(forced(true, RecoveryStage.LOST))).isEmpty())
+        val told = exitNotices(emptyList(), listOf(forced(true)))
+        assertEquals(listOf("fee c0"), told.map { it.key })
+        assertTrue(told[0].urgent && told[0].text.contains("allow it"))
     }
 
     @Test
