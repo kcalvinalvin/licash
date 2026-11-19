@@ -358,7 +358,7 @@ notes it is made of to `/v1/contracts/openings/{id}/fold/claim`, and the
 hub answers its nonce and its fee at its fee rate if its ledger holds
 nothing against those notes (none spent, none claimed in another claim).
 She then POSTs her partial signature and the filing of her claim (settled
-notes of its keyset alone, worth the amount exactly) to `.../fold/sign`.
+notes of its keyset alone, worth the amount or more) to `.../fold/sign`.
 The hub retires the notes in its ledger, all or none, and only then signs
 the fold with her (MuSig2, its nonce kept in memory and used at most once),
 paying her the claim and her reserve back and the rest to the hub less the

@@ -4,10 +4,11 @@
 //! A fold has no dispute: nothing is proven after it and no spend is cited,
 //! so the hub pays out of the contract's collateral only for notes it
 //! retires first and that nothing spent. Of the claim it takes settled
-//! notes alone, the sum of their face values the amount it pays, as the
-//! ledger's own claim of them ([`FoldLedger`]) is all it holds against
-//! them: a note beyond what the cap holds would be retired and not paid.
-//! Locks and fallbacks it leaves to a forced close.
+//! notes alone, worth the amount it pays or more (the cap leaves a note
+//! beyond it paid for what it has room for, as in a forced close), and
+//! owed all of it by the statement the dispute would decide on, with no
+//! evidence: what the ledger holds against the notes is its own to say
+//! ([`FoldLedger`]). Locks and fallbacks it leaves to a forced close.
 
 use std::collections::BTreeSet;
 
@@ -64,7 +65,7 @@ impl Claim {
     /// Her claim as filed in `bytes` ([`Filing::to_bytes`]), if it is the
     /// one asked and owed all of it: of settled notes of the hub's
     /// keyset, nothing else, naming the notes asked and worth the amount
-    /// exactly, eligible under her opening. The statement's own decision
+    /// or more, eligible under her opening. The statement's own decision
     /// ([`recovery::owed`]), with no evidence: whether the ledger holds
     /// any is the ledger's to say ([`FoldLedger`]).
     pub(super) fn filed(&self, o: &HubOpening, bytes: &[u8]) -> Result<Publication> {
@@ -94,9 +95,11 @@ impl Claim {
         }
         let asked: BTreeSet<_> = self.notes.iter().map(|y| y.0).collect();
         ensure!(named == asked, "her claim names other notes than asked");
+        // As a forced close claims: a note beyond what is left of the cap is
+        // retired whole and paid for what the cap has room for.
         ensure!(
-            worth == u64::from(self.amount),
-            "her notes are worth {worth} sat, not the {} claimed: a fold retires no note it does not pay",
+            worth >= u64::from(self.amount),
+            "her notes are worth {worth} sat, less than the {} claimed",
             self.amount
         );
         let request = Request {
