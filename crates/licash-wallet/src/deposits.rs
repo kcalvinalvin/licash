@@ -599,8 +599,10 @@ impl<T: Transport> Wallet<T> {
             )?;
             Ok(())
         })?;
+        // Its deposit's coin buys the notes: revealed only while the
+        // wallet can still activate the lock, should the hub keep them.
         match self
-            .claim_paying(
+            .claim_protected(
                 &url,
                 &hex::encode(lock.as_bytes()),
                 &preimage,

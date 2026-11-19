@@ -88,7 +88,7 @@ impl Config {
             max: 5_000_000,
             depth: 3,
             window: 144,
-            lock_blocks: 12,
+            lock_blocks: 36,
             downtime: 6,
             sweep_blocks: 36,
             min_fee_rate: FeeRate::from_sat_per_vb_u32(2),

@@ -66,6 +66,9 @@ pub struct Invoice {
     pub lock: Option<String>,
     /// When its notes were taken, if they were.
     pub received_at: Option<i64>,
+    /// Its lock's preimage revealed only with [`crate::PROTECTED_MARGIN`]
+    /// blocks left ([`Wallet::invoice_protected`]).
+    pub protected: bool,
 }
 
 /// Where an invoice the wallet is paid with stands.
@@ -649,6 +652,27 @@ impl<T: Transport> Wallet<T> {
     /// fee on top, to hand the payer. [`Wallet::follow_invoice`] claims the
     /// payment once made.
     pub async fn invoice(&self, url: &str, amount: u64) -> Result<Invoice, Error> {
+        self.invoice_with(url, amount, false).await
+    }
+
+    /// [`Wallet::invoice`], its lock's preimage revealed only with
+    /// [`crate::PROTECTED_MARGIN`] blocks left at the higher of its hub's
+    /// height and the wallet's own: should the hub keep the notes, the
+    /// wallet activates the lock on Bitcoin in time for a contract's
+    /// recovery at the hub to claim them; a lock shown later is left to
+    /// expire, the payment failing back to its payer. Only worth asking
+    /// with such a contract, and a coin to activate with: without, a
+    /// protected invoice only fails more often.
+    pub async fn invoice_protected(&self, url: &str, amount: u64) -> Result<Invoice, Error> {
+        self.invoice_with(url, amount, true).await
+    }
+
+    async fn invoice_with(
+        &self,
+        url: &str,
+        amount: u64,
+        protected: bool,
+    ) -> Result<Invoice, Error> {
         let url = hub_url(url)?;
         self.not_visited(&url)?;
         let (hub, info) = self.refresh(&url).await?;
@@ -678,13 +702,13 @@ impl<T: Transport> Wallet<T> {
         let body = serde_json::to_string(&body).map_err(invalid)?;
         self.store.write(|tx| {
             tx.execute(
-                "INSERT INTO invoices (hash, hub, preimage, amount, body, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![hash, hub, preimage, sql(amount), body, now()],
+                "INSERT INTO invoices (hash, hub, preimage, amount, body, created_at, protected)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![hash, hub, preimage, sql(amount), body, now(), protected],
             )?;
             Ok(())
         })?;
-        tracing::info!(hash = %hex::encode(hash), %url, amount, "asking for an invoice");
+        tracing::info!(hash = %hex::encode(hash), %url, amount, protected, "asking for an invoice");
         self.advance_invoice(&hash).await
     }
 
@@ -707,11 +731,11 @@ impl<T: Transport> Wallet<T> {
     }
 
     async fn advance_invoice_from(&self, hash: &[u8; 32]) -> Result<(), Error> {
-        type Row = (String, [u8; 32], i64, String, Option<String>, bool);
+        type Row = (String, [u8; 32], i64, String, Option<String>, bool, bool);
         let row: Option<Row> = self.store.read(|c| {
             Ok(c.query_row(
                 "SELECT r.url, i.preimage, i.amount, i.body, i.request,
-                    i.done_at IS NULL AND i.canceled IS NULL
+                    i.done_at IS NULL AND i.canceled IS NULL, i.protected
                  FROM invoices i JOIN reach r ON r.hub = i.hub WHERE i.hash = ?1",
                 [hash],
                 |r| {
@@ -722,12 +746,13 @@ impl<T: Transport> Wallet<T> {
                         r.get(3)?,
                         r.get(4)?,
                         r.get(5)?,
+                        r.get(6)?,
                     ))
                 },
             )
             .optional()?)
         })?;
-        let (url, preimage, amount, body, request, open) =
+        let (url, preimage, amount, body, request, open, protected) =
             row.ok_or_else(|| Error::UnknownPayment(hex::encode(hash)))?;
         if !open {
             return Ok(());
@@ -782,15 +807,12 @@ impl<T: Transport> Wallet<T> {
             )?;
             Ok(())
         })?;
-        match self
-            .claim_paying(
-                &url,
-                &hex::encode(lock.as_bytes()),
-                &preimage,
-                amount as u64,
-            )
-            .await
-        {
+        let (lock, least) = (hex::encode(lock.as_bytes()), amount as u64);
+        let claimed = match protected {
+            true => self.claim_protected(&url, &lock, &preimage, least).await,
+            false => self.claim_paying(&url, &lock, &preimage, least).await,
+        };
+        match claimed {
             Ok(_) | Err(Error::AlreadyReceived) => {}
             // Refunded, too late to claim, or not a lock to this wallet.
             Err(Error::Invalid(reason)) => return self.cancel_invoice(hash, &reason),
@@ -855,7 +877,7 @@ impl<T: Transport> Wallet<T> {
 }
 
 const INVOICES: &str = "SELECT i.hash, r.url, i.amount, i.request, i.done_at IS NOT NULL,
-    i.canceled, i.created_at, i.lock, i.done_at
+    i.canceled, i.created_at, i.lock, i.done_at, i.protected
     FROM invoices i JOIN reach r ON r.hub = i.hub";
 
 fn invoice_of(r: &Row<'_>) -> rusqlite::Result<Invoice> {
@@ -873,5 +895,6 @@ fn invoice_of(r: &Row<'_>) -> rusqlite::Result<Invoice> {
         created_at: r.get(6)?,
         lock: r.get::<_, Option<[u8; 32]>>(7)?.map(hex::encode),
         received_at: r.get(8)?,
+        protected: r.get(9)?,
     })
 }

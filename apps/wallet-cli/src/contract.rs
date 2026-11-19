@@ -9,6 +9,7 @@
 use std::path::Path;
 
 use anyhow::Context;
+use licash_contracts::holder::activation;
 use licash_contracts::holder::recovery::{self, Recovery};
 use licash_contracts::holder::{self, Ask, Contract, Node};
 use licash_transport::Http;
@@ -582,6 +583,27 @@ pub async fn close(
         format!("{}  closed early by {txid}", &hex[..16]),
     );
     Ok(())
+}
+
+/// An invoice paying the wallet `amount` through `hub`, protected where a
+/// contract of the wallet's at the hub would claim its lock's notes should
+/// the hub keep them, and a coin of the wallet's activates the lock on
+/// `chain` for less ([`activation::protects`]); else trusting the hub.
+pub async fn invoice(
+    wallet: &Wallet<Http>,
+    path: &Path,
+    chain: &str,
+    hub: &str,
+    amount: u64,
+) -> anyhow::Result<licash_wallet::Invoice> {
+    let node = node(Some(chain))?;
+    let tip = node.height().await.map_err(|e| anyhow::anyhow!(e))?;
+    let rate = crate::onchain::rate(&node.0, None).await?;
+    if !activation::protects(wallet, dir(path), hub, amount, rate, tip)? {
+        tracing::info!(%hub, amount, "no contract at the hub protects the invoice's lock");
+        return Ok(wallet.invoice(hub, amount).await?);
+    }
+    Ok(wallet.invoice_protected(hub, amount).await?)
 }
 
 /// The contracts the wallet forced closed: with --chain, each carried on

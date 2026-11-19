@@ -574,6 +574,18 @@ fn pay(
     to: &licash::address::Address,
     amount: u64,
 ) -> Result<licash_api::Payment> {
+    pay_at(hub, seed, url, to, amount, NOTE_POW)
+}
+
+/// [`pay`] at a hub of notes up to 2^`pow` sat.
+fn pay_at(
+    hub: &Hub,
+    seed: &Path,
+    url: &str,
+    to: &licash::address::Address,
+    amount: u64,
+    pow: u32,
+) -> Result<licash_api::Payment> {
     use licash::address::{Ephemeral, OwnerKeys};
     use licash::authorization::{Authorization, SignedProposal};
     use licash::claim::Branch;
@@ -593,7 +605,7 @@ fn pay(
     let text = std::fs::read_to_string(seed)?;
     let mut bytes = [0; 32];
     hex::decode_to_slice(text.trim(), &mut bytes)?;
-    let keys = IssuerKeys::from_seed(&bytes, 0, NOTE_POW)?;
+    let keys = IssuerKeys::from_seed(&bytes, 0, pow)?;
     let keyset = keys.keyset()?;
     let info = hub.info();
     let mut total = amount;
@@ -3257,11 +3269,17 @@ async fn her_contracts_at_a_hub_each_claim_their_share_of_her_notes() -> Result<
 
 /// A hub service opening contracts as [`hub_serving`], of notes up to
 /// 2^30 sat, taking deposits of up to 2 M sat for 1000 sat each, scanning
-/// `rt` once [`followed`]: its URL, chain, it and its deposits.
+/// `rt` once [`followed`]: its URL, chain, it, its deposits and contracts.
 async fn hub_taking_deposits(
     rt: &Regtest,
     dir: &Path,
-) -> Result<(String, Source, Arc<Hub>, Arc<deposit::Gateway>)> {
+) -> Result<(
+    String,
+    Source,
+    Arc<Hub>,
+    Arc<deposit::Gateway>,
+    Arc<Openings>,
+)> {
     std::fs::create_dir_all(dir)?;
     let (seed, db) = (dir.join("seed"), dir.join("hub.sqlite"));
     Hub::init(&seed, &db, 30)?;
@@ -3295,7 +3313,7 @@ async fn hub_taking_deposits(
     licash_hub_service::open_on_lock_checkpoints(&openings, hub.clone());
     licash_hub_service::answer_from(&openings, hub.clone());
     let services = Services {
-        contracts: Some(openings),
+        contracts: Some(openings.clone()),
         deposits: Some(deposits.clone()),
         ..Default::default()
     };
@@ -3303,7 +3321,7 @@ async fn hub_taking_deposits(
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let url = format!("http://{}", listener.local_addr()?);
     tokio::spawn(async move { axum::serve(listener, app).await });
-    Ok((url, source, hub, deposits))
+    Ok((url, source, hub, deposits, openings))
 }
 
 /// `hub` scanned to the tip of `source`, then its `deposits`.
@@ -3323,7 +3341,7 @@ async fn a_holder_funds_part_of_her_contract_and_is_issued_its_notes_once_f_is_b
 {
     let rt = Regtest::start_standard()?;
     let dir = tempfile::tempdir()?;
-    let (url, source, hub, deposits) = hub_taking_deposits(&rt, &dir.path().join("hub")).await?;
+    let (url, source, hub, deposits, _) = hub_taking_deposits(&rt, &dir.path().join("hub")).await?;
     let chain = Node(source.clone());
     followed(&hub, &source, &deposits).await?;
     let mine = dir.path().join("wallet");
@@ -3388,6 +3406,12 @@ async fn a_holder_funds_part_of_her_contract_and_is_issued_its_notes_once_f_is_b
     ensure!(received, "her funded notes never came");
     let held: u64 = wallet.balance()?.iter().map(|b| b.available).sum();
     ensure!(held == u64::from(funded), "{held}");
+    // Not owed to her: her claim names them as funded notes already.
+    ensure!(
+        wallet.owed_locks()?.is_empty(),
+        "{:?}",
+        wallet.owed_locks()?
+    );
     // F paid the price and her part from her coin, her change back.
     let left = scan(&wallet, &chain).await?;
     ensure!(
@@ -3804,6 +3828,117 @@ async fn a_providers_keeper_holds_its_intake_to_its_contracts_and_replaces_them(
     ensure!(
         plan.force_close.is_empty() && plan.successors.is_empty(),
         "{plan:?}"
+    );
+    Ok(())
+}
+
+/// A deposit whose settle never reaches its hub is owed to her on Bitcoin
+/// as a payer's lock is, its lock of the hub's own notes proven by their
+/// owner signatures: activated with a coin of hers as its expiry nears,
+/// its pay branch claimed by her forced close beside her notes, and the
+/// hub, finding it owed all she asks, lets her timeout pay it.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs bitcoind and a release build"]
+async fn a_force_close_claims_a_deposit_its_hub_kept_once_activated_at_depth() -> Result<()> {
+    use licash_contracts::holder::activation;
+    use licash_contracts::holder::recovery::{self, Stage};
+
+    let rt = Regtest::start_standard()?;
+    let dir = tempfile::tempdir()?;
+    let at = dir.path().join("hub");
+    let (url, source, hub, deposits, openings) = hub_taking_deposits(&rt, &at).await?;
+    followed(&hub, &source, &deposits).await?;
+    let chain = Node(source.clone());
+    let rate = bitcoin::FeeRate::from_sat_per_vb(2).context("a rate")?;
+    let (mine, bob) = holder_wallet_over(
+        &rt,
+        &chain,
+        &dir.path().join("bob"),
+        &url,
+        [18; 32],
+        &[60_000, 50_000],
+        NoSettle(Http::new(None)?),
+    )
+    .await?;
+    followed(&hub, &source, &deposits).await?;
+    let chosen = Ask {
+        cap: Some(131_071),
+        blocks: 1_000,
+        ..ask()
+    };
+    let opened = holder::open(&bob, &chain, &mine, &url, chosen).await?;
+    let payment = pay_at(&hub, &at.join("seed"), &url, &bob.address(), 2_048, 30)?;
+    bob.receive(&payment)?;
+    rt.mine(1)?;
+    followed(&hub, &source, &deposits).await?;
+    holder::resume(&bob, &chain, &mine).await?;
+    ensure!(available(&bob)? == 2_048);
+
+    // A deposit paid and buried: the hub locks its own notes to him.
+    let deposit = bob.deposit(&url, 10_000).await?;
+    let terms = deposit.terms.clone().context("no terms")?;
+    let address: bitcoin::Address<_> = terms.address.parse()?;
+    rt.fund(
+        &address.assume_checked().script_pubkey(),
+        Amount::from_sat(terms.pays),
+    )?;
+    for _ in 0..3 {
+        rt.mine(1)?;
+        followed(&hub, &source, &deposits).await?;
+    }
+    // His settle never reaches the hub: owed to him, provable.
+    let kept = bob.follow_deposit(&deposit.hash).await;
+    ensure!(
+        kept.as_ref()
+            .map_or(true, |d| d.state == licash_wallet::DepositState::Open),
+        "{kept:?}"
+    );
+    let owed = bob.owed_locks()?;
+    ensure!(owed.len() == 1 && owed[0].anchor.is_some(), "{owed:?}");
+    ensure!(hub.locked(&owed[0].id)?.own);
+    let (expiry, depth) = (owed[0].expiry, owed[0].depth);
+
+    let lead = activation::lead(ChainProfile::Core30DefaultRegtest);
+    rt.mine_to_height(expiry - lead)?;
+    followed(&hub, &source, &deposits).await?;
+    let kept = activation::keep(&bob, &chain, &mine, rate).await?;
+    ensure!(kept.len() == 1 && kept[0].step == "activated", "{kept:?}");
+    rt.mine(1)?;
+    let kept = activation::keep(&bob, &chain, &mine, rate).await?;
+    ensure!(kept.len() == 1 && kept[0].step == "confirmed", "{kept:?}");
+    let activated = (bob.owed_locks()?[0].activated_at).context("not recorded")?;
+    ensure!(
+        activated < expiry,
+        "activated at {activated}, expiring at {expiry}"
+    );
+
+    rt.mine_to_height(expiry.max(activated + depth) + 1)?;
+    followed(&hub, &source, &deposits).await?;
+    let forced = recovery::force_close(&bob, &chain, &mine, &opened.id, rate).await?;
+    // His note, and the deposit lock's pay branch.
+    let paid = forced.claimed - 2_048;
+    ensure!(
+        forced.notes == 1 && paid > 0 && paid <= 10_000,
+        "{forced:?}"
+    );
+    ensure!(bob.owed_locks()?[0].claimed);
+    let mut done = None;
+    for _ in 0..800 {
+        rt.mine(1)?;
+        followed(&hub, &source, &deposits).await?;
+        let round = openings.answer_requests().await?;
+        ensure!(round.failed == 0, "{round:?}");
+        let r = recovery::advance(&bob, &chain, &mine, rate).await?[0].clone();
+        ensure!(r.stage != Stage::Lost, "{r:?}");
+        if r.stage == Stage::Done {
+            done = Some(r);
+            break;
+        }
+    }
+    let done = done.context("never paid")?;
+    ensure!(
+        done.response.is_none() && done.timeout.is_some() && done.payout == done.timeout,
+        "{done:?}"
     );
     Ok(())
 }

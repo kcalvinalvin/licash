@@ -1481,3 +1481,62 @@ async fn a_deposit_its_hub_never_answered_is_abandoned_and_a_silent_one_never_ke
         "{unknown:?}"
     );
 }
+
+/// The hub behind a front that, while `.1` is set, passes each claim of a
+/// lock on to it but answers the wallet an error: a hub taking the
+/// preimage and keeping the notes.
+struct Withholding(Local, Arc<AtomicBool>);
+
+impl Transport for Withholding {
+    async fn request(
+        &self,
+        url: &str,
+        body: Option<Vec<u8>>,
+    ) -> Result<licash_wallet::Response, String> {
+        let kept = url.ends_with(licash_api::SETTLE) && self.1.load(Ordering::SeqCst);
+        let response = self.0.request(url, body).await?;
+        if kept {
+            let body = br#"{"code":"unavailable","message":"later"}"#.to_vec();
+            return Ok(licash_wallet::Response { status: 503, body });
+        }
+        Ok(response)
+    }
+}
+
+#[tokio::test]
+async fn a_deposit_whose_notes_its_hub_keeps_is_owed_and_claimed_again_inside_the_margin() {
+    use licash_wallet::PROTECTED_MARGIN;
+    let net = Net::new().await;
+    let keeping = Arc::new(AtomicBool::new(true));
+    let front = Withholding(Local(net.app.clone()), keeping.clone());
+    let path = net.dir.path().join("alice.sqlite");
+    let network = ChainProfile::Core30DefaultRegtest;
+    let alice = Wallet::create(&path, &[1; 32], network, front).unwrap();
+    let deposit = alice.deposit(HUB, 3_000).await.unwrap();
+    let terms = deposit.terms.clone().unwrap();
+    net.mine(2, vec![payment(&terms.address, 3_100, 1)]);
+    net.deposits.round().await;
+    // Its preimage revealed, its notes kept: owed, with what proves its
+    // lock on Bitcoin (its hub's own notes, as a payer's).
+    let kept = alice.follow_deposit(&deposit.hash).await;
+    assert!(
+        kept.as_ref().is_ok_and(|d| d.state == DepositState::Open) || kept.is_err(),
+        "{kept:?}"
+    );
+    let owed = alice.owed_locks().unwrap();
+    assert_eq!(owed.len(), 1, "{owed:?}");
+    assert!(owed[0].anchor.is_some());
+    let lock = net.hub.locked(&owed[0].id).unwrap();
+    assert!(lock.own);
+    assert_eq!(lock.preimage, Some(owed[0].preimage));
+    // Inside the margin a fresh preimage needs, its hub answering again:
+    // revealed already, so claimed rather than given up.
+    let left = owed[0].expiry - net.height();
+    net.mine(left - PROTECTED_MARGIN + 2, vec![]);
+    assert!(net.height() + PROTECTED_MARGIN > owed[0].expiry);
+    keeping.store(false, Ordering::SeqCst);
+    let received = alice.follow_deposit(&deposit.hash).await.unwrap();
+    assert_eq!(received.state, DepositState::Received, "{received:?}");
+    let held: u64 = alice.balance().unwrap().iter().map(|b| b.available).sum();
+    assert_eq!(held, 3_000);
+}

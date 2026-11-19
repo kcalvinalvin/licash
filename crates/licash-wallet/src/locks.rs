@@ -30,6 +30,30 @@ use crate::{
 /// lock: its hub pays a claim only before the lock expires.
 pub const CLAIM_MARGIN: u32 = 3;
 
+/// Blocks before its expiry within which the wallet reveals no preimage of
+/// a protected lock (a deposit's, or a protected invoice's,
+/// [`Wallet::invoice_protected`]), at the higher of its hub's height and
+/// the wallet's own: should the hub not issue its notes, the wallet still
+/// activates the lock on Bitcoin in time for a contract's recovery to
+/// claim them. A lock shown later is left to expire.
+pub const PROTECTED_MARGIN: u32 = 6;
+
+/// How a claim reveals its preimage to the lock's hub.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Reveal {
+    /// Only with [`CLAIM_MARGIN`] blocks left, at the hub's height.
+    Margin,
+    /// Only with [`PROTECTED_MARGIN`] blocks left, at the wallet's height
+    /// too.
+    Protected,
+    /// Public already: as late as the hub pays.
+    Public,
+    /// Settled by its hub with a preimage it made, its notes claimed
+    /// otherwise should they never come: as late as the hub pays, and
+    /// never owed ([`Wallet::claim_issued`]).
+    Issued,
+}
+
 /// A lock made, and where it stands.
 #[derive(Clone, Debug)]
 pub struct Lock {
@@ -659,7 +683,8 @@ impl<T: Transport> Wallet<T> {
     /// revealing it within [`CLAIM_MARGIN`] blocks of the lock's expiry, as
     /// the hub could then refund the lock and keep what the preimage buys.
     pub async fn claim(&self, url: &str, id: &str, preimage: &[u8; 32]) -> Result<Received, Error> {
-        self.claim_with(url, id, preimage, false, None).await
+        self.claim_with(url, id, preimage, Reveal::Margin, None)
+            .await
     }
 
     /// Claim only if this verified proposal pays at least the promised
@@ -672,7 +697,22 @@ impl<T: Transport> Wallet<T> {
         preimage: &[u8; 32],
         least: u64,
     ) -> Result<Received, Error> {
-        self.claim_with(url, id, preimage, false, Some(least)).await
+        self.claim_with(url, id, preimage, Reveal::Margin, Some(least))
+            .await
+    }
+
+    /// [`Wallet::claim_paying`], revealing the preimage only with
+    /// [`PROTECTED_MARGIN`] blocks left at the higher of its hub's height
+    /// and the last block the wallet scanned for silent payments.
+    pub(crate) async fn claim_protected(
+        &self,
+        url: &str,
+        id: &str,
+        preimage: &[u8; 32],
+        least: u64,
+    ) -> Result<Received, Error> {
+        self.claim_with(url, id, preimage, Reveal::Protected, Some(least))
+            .await
     }
 
     /// [`Wallet::claim`], within [`CLAIM_MARGIN`] blocks of the lock's
@@ -685,7 +725,23 @@ impl<T: Transport> Wallet<T> {
         id: &str,
         preimage: &[u8; 32],
     ) -> Result<Received, Error> {
-        self.claim_with(url, id, preimage, true, None).await
+        self.claim_with(url, id, preimage, Reveal::Public, None)
+            .await
+    }
+
+    /// [`Wallet::claim_revealed`] of a lock its hub settled itself with a
+    /// preimage it made, whose notes a claim of the wallet's names
+    /// otherwise should the hub never issue them (a contract's funded
+    /// notes): not recorded as owed, for a recovery not to claim them
+    /// twice.
+    pub async fn claim_issued(
+        &self,
+        url: &str,
+        id: &str,
+        preimage: &[u8; 32],
+    ) -> Result<Received, Error> {
+        self.claim_with(url, id, preimage, Reveal::Issued, None)
+            .await
     }
 
     async fn claim_with(
@@ -693,7 +749,7 @@ impl<T: Transport> Wallet<T> {
         url: &str,
         id: &str,
         preimage: &[u8; 32],
-        revealed: bool,
+        reveal: Reveal,
         least: Option<u64>,
     ) -> Result<Received, Error> {
         let url = hub_url(url)?;
@@ -727,12 +783,23 @@ impl<T: Transport> Wallet<T> {
             }
             // Revealed already.
             Some(Settled::Pay) => {}
-            None if revealed => {}
+            None if matches!(reveal, Reveal::Public | Reveal::Issued) => {}
+            // Revealed to it already, its answer lost: no one new learns it.
+            None if self.owes(&id)? => {}
             None => {
-                let height = info.locks.as_ref().map_or(u32::MAX, |l| l.height);
-                if height.saturating_add(CLAIM_MARGIN) >= terms.expiry() {
+                let hub = info.locks.as_ref().map_or(u32::MAX, |l| l.height);
+                let (height, too_late) = match reveal {
+                    Reveal::Protected => {
+                        let own = self.silent_next()?.unwrap_or(0).saturating_sub(1);
+                        let height = hub.max(own);
+                        let too_late = height.saturating_add(PROTECTED_MARGIN) > terms.expiry();
+                        (height, too_late)
+                    }
+                    _ => (hub, hub.saturating_add(CLAIM_MARGIN) >= terms.expiry()),
+                };
+                if too_late {
                     return Err(Error::Invalid(format!(
-                        "too late to claim: the lock expires at {}, its hub is at {height}",
+                        "too late to claim: the lock expires at {}, the chain is at {height}",
                         terms.expiry()
                     )));
                 }
@@ -740,7 +807,7 @@ impl<T: Transport> Wallet<T> {
         }
         // Before its hub learns the preimage: what proves the lock on
         // Bitcoin, should it not issue it.
-        if let Some(signatures) = &view.signatures {
+        if let Some(signatures) = (view.signatures.as_ref()).filter(|_| reveal != Reveal::Issued) {
             let anchor = (info.locks.as_ref())
                 .and_then(|l| l.checkpoint().ok())
                 .filter(|c| c.commitment() == *terms.checkpoint());
@@ -752,6 +819,19 @@ impl<T: Transport> Wallet<T> {
         let issued = issued.decode(keyset).map_err(|p| unavailable(&url, p))?;
         let ours = self.opened_branch(&url, keyset, proposal, Branch::Pay, &issued)?;
         self.keep(keyset, url, proposal, &ours)
+    }
+
+    /// Whether the lock `id` is owed to the wallet, its preimage revealed.
+    fn owes(&self, id: &ProposalId) -> Result<bool, Error> {
+        self.store.read(|c| {
+            Ok(c.query_row(
+                "SELECT 1 FROM owed_locks WHERE id = ?1",
+                [id.as_bytes()],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+        })
     }
 
     /// Record the lock of `view` at hub `hub` owed to the wallet, as its

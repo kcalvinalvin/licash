@@ -78,10 +78,14 @@ ALTER TABLE payouts ADD COLUMN share BLOB;
 /// added since, until its deposits are looked for there, those asked of a
 /// wallet of the same seed that lost its file. A hub of an older file
 /// holds none of them, its deposits' secrets drawn at random: the first
-/// number is next there, and none is looked for.
+/// number is next there, and none is looked for. Invoices whose lock's
+/// preimage is revealed with [`crate::PROTECTED_MARGIN`] blocks left
+/// ([`crate::Wallet::invoice_protected`]) are marked: none of an older
+/// file is.
 const DEPOSIT_NUMBERS: &str = "
 ALTER TABLE hubs ADD COLUMN deposit_next INTEGER;
 UPDATE hubs SET deposit_next = 0;
+ALTER TABLE invoices ADD COLUMN protected INTEGER NOT NULL DEFAULT 0;
 ";
 
 /// Version 13: the locks paying the wallet whose preimage it revealed to

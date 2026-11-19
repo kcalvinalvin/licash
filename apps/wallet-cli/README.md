@@ -115,6 +115,14 @@ runs `lock <address> <amount> <hash>`, and the payee runs `claim <id>
 Through a hub with a Lightning gateway, `pay-invoice <bolt11>` pays an
 invoice with a lock refunded if the payment fails, and `invoice <amount>`
 prints an invoice paying the wallet; `resume` takes the payment once made.
+With `--chain <url>`, `invoice` protects the payment where it can: with a
+contract of the wallet's at the hub (v4 or later) whose forced close is
+planned 36 blocks on or later, a coin to activate the lock with, and an
+amount worth more than the activation, the lock's preimage is revealed
+only with 6 blocks left, so a hub keeping the notes is met on Bitcoin
+(`recoveries --chain` activates the lock and the contract's recovery claims
+it); a lock shown later is left to expire and the payment fails back.
+Without `--chain`, or where it can't, the hub is trusted with the notes.
 An invoice another wallet asked the same hub for is paid inside the hub,
 for its amount alone, with no gateway fee.
 `pay-invoice <bolt11> --via <provider>` has a swap provider that pays
@@ -133,7 +141,9 @@ another, with no notes of the provider at the other.
 Through a hub taking deposits, `deposit <amount>` prints a BIP21 URI to pay
 on Bitcoin, the hub's fee on top; `resume` takes the notes once the payment
 confirmed. A deposit never received is taken back after its timeout with
-`refund <hash> --to <address> --chain <url>`. A deposit's secrets derive
+`refund <hash> --to <address> --chain <url>`. A deposit's lock's preimage
+is revealed only with 6 blocks left, at the higher of its hub's height and
+the last block the wallet scanned. A deposit's secrets derive
 from the seed, the hub and its number there: a wallet restored from its
 seed finds the deposits it asked at a hub as it adds it (until 20 numbers
 in a row are unknown there), then takes them on or refunds them as any.

@@ -736,8 +736,7 @@ impl Wallet {
                 false => "no hub you trust takes payments over Lightning".into(),
             })
         })?;
-        let asked = self.runtime.block_on(self.wallet.invoice(&url, amount));
-        self.invoice_now(asked)
+        self.invoice_now(self.invoice_at(&url, amount))
     }
 
     /// [`Wallet::ask_invoice`], for an invoice asking the payer `invoiced`,
@@ -767,8 +766,7 @@ impl Wallet {
                 false => "no hub you trust takes payments over Lightning".into(),
             })
         })?;
-        let asked = self.runtime.block_on(self.wallet.invoice(&url, amount));
-        self.invoice_now(asked)
+        self.invoice_now(self.invoice_at(&url, amount))
     }
 
     /// Take on the invoice of `hash`, as [`Wallet::ask_invoice`] asked for

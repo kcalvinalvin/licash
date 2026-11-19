@@ -50,8 +50,9 @@ pub struct Kept {
     /// "paid" by its hub at last, "activated" (broadcast), "bumped" (its
     /// fee raised as its expiry nears), "confirmed" (its activation
     /// recorded), "forgotten" (its block left the chain), "late"
-    /// (no activation can confirm before its expiry), or "unprotected" (no
-    /// contract of hers at its hub could claim it).
+    /// (no activation can confirm before its expiry), "unprotected" (no
+    /// contract of hers at its hub could claim it), or "unworthy" (its
+    /// activation would cost what it pays, or more).
     pub step: &'static str,
     pub error: Option<String>,
 }
@@ -206,6 +207,10 @@ async fn step<T: Transport, C: Chain>(
         return Ok(Some("paid"));
     }
     let fee = (rate.fee_vb(ACTIVATION_VB)).context("an activation's fee overflows")?;
+    let value = (wallet.owed_claim(&o.id, &o.keyset)?).map_or(0, |c| c.value);
+    if fee.to_sat() >= value {
+        return Ok(Some("unworthy"));
+    }
     let coin = (super::coin(wallet, dir, fee.to_sat())?)
         .context("no coin of hers free to activate the lock with")?;
     let tx = wallet.spend_silent_coin(script, coin.outpoint, Some(0), rate)?;
@@ -298,6 +303,56 @@ async fn activation_of<C: Chain>(
         },
         inclusion: Inclusion::capture(&bytes, index, MAX_BLOCK_BYTES)?,
     })
+}
+
+/// Blocks past the tip a contract's forced close must be planned after for
+/// it to protect a Lightning receipt's lock made at the tip: the lock, its
+/// activation buried at its depth, and a margin.
+pub const PROTECTING: u32 = 36;
+
+/// Whether a Lightning receipt of `amount` at the hub at `url` is worth
+/// protecting at `tip` ([`Wallet::invoice_protected`]): a contract of hers
+/// in `dir` at that hub would claim its lock's notes should the hub keep
+/// them (one live, not under recovery, of a Base valuing a pay branch by
+/// its activation, whose forced close her exit plans [`PROTECTING`]
+/// blocks on at the earliest), and a coin of hers free of contracts
+/// activates the lock at `rate` for less than `amount`.
+pub fn protects<T: Transport>(
+    wallet: &Wallet<T>,
+    dir: &Path,
+    url: &str,
+    amount: u64,
+    rate: FeeRate,
+    tip: u32,
+) -> Result<bool> {
+    let Some(store) = Store::existing(dir)? else {
+        return Ok(false);
+    };
+    let fee = (rate.fee_vb(ACTIVATION_VB)).context("an activation's fee overflows")?;
+    if amount <= fee.to_sat() || super::coin(wallet, dir, fee.to_sat())?.is_none() {
+        return Ok(false);
+    }
+    let urls = wallet.hub_urls(url)?;
+    let recovering: HashSet<[u8; 32]> = store.recoveries()?.iter().map(|r| r.id).collect();
+    let (seed, network) = (wallet.contract_secrets().seed, wallet.network());
+    let ctx = Context {
+        tip,
+        trust: crate::trust(network)?,
+    };
+    for c in store.list()? {
+        if !c.at(&urls) || !c.live(tip) || recovering.contains(&c.id) {
+            continue;
+        }
+        let (state, _) = store.state(&c.id)?;
+        let opening = Holder::load(&state, &seed, &ctx)?.signed()?;
+        if opening.base.version().anchored()
+            && exit::planned_force_at(&seed, network, dir, &c.id, tip)?
+                >= tip.saturating_add(PROTECTING)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// The contract of hers in `dir` that claims owed lock `o` once

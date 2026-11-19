@@ -890,6 +890,62 @@ async fn htlcs_expiring_too_soon_cancel_the_invoice() {
     assert_eq!(available(&wallet), 0);
 }
 
+/// The expiry of the lock paying the invoice of `hash`.
+fn expiry_of(net: &Net, hash: &str) -> u32 {
+    let status = net.gateway.receive_status(&bytes(hash)).unwrap();
+    let id = status.lock().unwrap().unwrap();
+    let lock = net.hub.locked(&id).unwrap();
+    lock.proposal.lock().unwrap().terms().expiry()
+}
+
+#[tokio::test]
+async fn a_protected_invoice_lets_a_lock_shown_late_expire_where_a_trusting_one_claims() {
+    use licash_wallet::PROTECTED_MARGIN;
+    let net = Net::new().await;
+    let alice = net.wallet("alice");
+    // Shown in time: claimed as any.
+    let invoice = alice.invoice_protected(HUB, 20).await.unwrap();
+    assert!(invoice.protected);
+    net.pay_held(&invoice.hash);
+    net.gateway.round().await;
+    let received = alice.follow_invoice(&invoice.hash).await.unwrap();
+    assert_eq!(received.state, InvoiceState::Received);
+    assert_eq!(available(&alice), 20);
+
+    // A lock shown with fewer blocks left than an activation needs: its
+    // preimage kept, the lock left to expire and the payment to fail back,
+    // where an invoice trusting the hub still claims.
+    let late = alice.invoice_protected(HUB, 20).await.unwrap();
+    let trusted = alice.invoice(HUB, 20).await.unwrap();
+    assert!(!trusted.protected);
+    net.pay_held(&late.hash);
+    net.pay_held(&trusted.hash);
+    net.gateway.round().await;
+    let expiry = expiry_of(&net, &late.hash);
+    assert_eq!(expiry_of(&net, &trusted.hash), expiry);
+    net.mine(expiry - PROTECTED_MARGIN + 1 - net.height(), None);
+    let refused = alice.follow_invoice(&late.hash).await.unwrap();
+    assert!(
+        matches!(&refused.state, InvoiceState::Canceled(r) if r.contains("too late")),
+        "{refused:?}"
+    );
+    let id = proposal_id(refused.lock.as_ref().unwrap());
+    let lock = net.hub.locked(&id).unwrap();
+    assert_eq!((lock.preimage, lock.settled), (None, None));
+    let claimed = alice.follow_invoice(&trusted.hash).await.unwrap();
+    assert_eq!(claimed.state, InvoiceState::Received);
+    assert_eq!(available(&alice), 40);
+    // Expired at depth: refunded, the payment failed back.
+    net.mine(PROTECTED_MARGIN + 1, None);
+    net.gateway.round().await;
+    assert_eq!(
+        net.node.held(bytes(&late.hash)).unwrap().0,
+        HeldState::Canceled
+    );
+    let listed = alice.invoices().unwrap();
+    assert!(listed.iter().any(|i| i.hash == late.hash && i.protected));
+}
+
 #[tokio::test]
 async fn a_lock_unclaimed_is_refunded_and_cancels_its_invoice() {
     let net = Net::new().await;

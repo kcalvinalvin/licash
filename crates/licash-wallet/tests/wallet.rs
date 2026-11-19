@@ -615,6 +615,7 @@ async fn a_wallet_file_of_version_8_starts_a_privacy_rest_without_reminting() {
          ALTER TABLE locks DROP COLUMN claimed_by;
          DROP TABLE owed_locks;
          ALTER TABLE hubs DROP COLUMN deposit_next;
+         ALTER TABLE invoices DROP COLUMN protected;
          UPDATE notes SET added_at = 1;
          PRAGMA user_version = 8;",
     )

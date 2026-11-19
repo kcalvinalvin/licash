@@ -73,7 +73,8 @@ async fn collect_one<T: Transport>(
     let answer = post(wallet, hub, &url, Vec::new()).await?;
     let issued = FundedIssued::decode(&answer).context("the hub's issuance")?;
     let lock = hex::encode(issued.lock);
-    match wallet.claim(hub, &lock, &issued.preimage).await {
+    // Not owed: her claim names them as funded notes already.
+    match wallet.claim_issued(hub, &lock, &issued.preimage).await {
         Ok(_) | Err(WalletError::AlreadyReceived) => {}
         Err(e) => return Err(e).context("claiming her funded notes"),
     }

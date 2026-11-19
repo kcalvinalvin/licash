@@ -271,6 +271,13 @@ enum Command {
         /// Also draw it as a QR code, on a terminal.
         #[arg(long)]
         qr: bool,
+        /// The chain, to protect the payment where a contract of the
+        /// wallet's at the hub can: its lock's preimage revealed only with
+        /// 6 blocks left, for the wallet to activate the lock on Bitcoin
+        /// should the hub keep the notes (`recoveries --chain`), the payment
+        /// failing back otherwise. Without, the hub is trusted with them.
+        #[arg(long, env = "LICASH_WALLET_CHAIN")]
+        chain: Option<String>,
     },
     /// The Lightning invoices asked for, newest first.
     Invoices,
@@ -1053,12 +1060,20 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             };
             return pay_invoice(&wallet, lock, wait, json).await;
         }
-        Command::Invoice { amount, hub, qr } => {
+        Command::Invoice {
+            amount,
+            hub,
+            qr,
+            chain,
+        } => {
             let hub = match hub {
                 Some(hub) => hub,
                 None => only_hub(&wallet)?,
             };
-            let invoice = wallet.invoice(&hub, amount).await?;
+            let invoice = match chain {
+                Some(chain) => contract::invoice(&wallet, &path, &chain, &hub, amount).await?,
+                None => wallet.invoice(&hub, amount).await?,
+            };
             eprintln!("invoice {}", invoice.hash);
             let request = invoice.request.clone().unwrap_or_default();
             show_qr(qr && !json && !request.is_empty(), &request);
@@ -2058,17 +2073,22 @@ fn invoice_json(invoice: &Invoice) -> serde_json::Value {
     json!({
         "hash": invoice.hash, "hub": invoice.hub, "amount": invoice.amount,
         "request": invoice.request, "state": invoice_state(&invoice.state),
-        "created_at": invoice.created_at,
+        "created_at": invoice.created_at, "protected": invoice.protected,
     })
 }
 
 fn invoice_line(invoice: &Invoice) -> String {
     format!(
-        "{}  invoice {}  {}  via {}  {}",
+        "{}  invoice {}  {}  via {}{}  {}",
         say::when(invoice.created_at),
         invoice_state(&invoice.state),
         say::sat(invoice.amount),
         invoice.hub,
+        if invoice.protected {
+            " (protected)"
+        } else {
+            ""
+        },
         invoice.hash
     )
 }
