@@ -895,6 +895,7 @@ fn deposit_bodies_are_receipts_with_a_refund_key_and_a_payment() {
     let deposit = Deposit {
         receive: receive.clone(),
         refund: Hex(vec![2; 32]),
+        close: None,
     };
     // The receipt's fields, and the refund key beside them.
     let wire = serde_json::to_value(&deposit).unwrap();
@@ -1192,6 +1193,72 @@ fn a_deposit_paying_an_amount_exactly_locks_what_its_fee_leaves() {
         }
     }
     assert_eq!(deposits(0, 0).paid_by(u64::MAX), Some(u64::MAX));
+}
+
+/// A payment fixed beforehand, a contract's reserve, locks the most notes
+/// it covers; the gap to it is the hub's.
+#[test]
+fn a_fixed_payment_locks_the_most_notes_it_covers() {
+    use licash_api::Deposits;
+    let deposits = |base, ppm| Deposits {
+        fee: Fee { base, ppm },
+        min: 10_000,
+        max: 1_000_000,
+        depth: 3,
+        window: 144,
+        timeout: 288,
+    };
+    let flat = deposits(1_000, 0);
+    assert_eq!(flat.most_for(20_000), Some(19_000));
+    assert_eq!(flat.most_for(1_000), Some(0));
+    assert_eq!(flat.most_for(999), None);
+    // Its fee rounded up leaves gaps that `paid_by` refuses, never this.
+    let rate = deposits(0, 10);
+    assert_eq!(rate.paid_by(100_002), None);
+    assert_eq!(rate.most_for(100_002), Some(100_000));
+    let both = deposits(500, 1_000);
+    for pays in [500, 501, 10_510, 20_000, 1_000_000] {
+        let notes = both.most_for(pays).unwrap();
+        assert!(both.pays(notes).unwrap() <= pays, "{pays}");
+        assert!(both.pays(notes + 1).unwrap() > pays, "{pays}");
+        if let Some(exact) = both.paid_by(pays) {
+            assert_eq!(exact, notes, "{pays}");
+        }
+    }
+    assert_eq!(both.most_for(499), None);
+    assert_eq!(deposits(0, 0).most_for(u64::MAX), Some(u64::MAX));
+}
+
+/// A deposit that returns a contract's reserve says so, and the hub reads
+/// the terms back; an ordinary one's wire has no trace of it.
+#[test]
+fn a_close_deposit_names_its_payment_and_timeout() {
+    use licash_api::{CloseTerms, Deposit, Receive};
+    let f = fixture();
+    let outputs: Vec<Output> = f
+        .outputs
+        .iter()
+        .map(|d| Output::from_derivation(d).unwrap())
+        .collect();
+    let ephemeral = Ephemeral::random().public();
+    let receive = Receive::new(f.keyset.id(), &ephemeral, &outputs, &[5; 32]);
+    let close = Deposit {
+        receive,
+        refund: Hex(vec![2; 32]),
+        close: Some(CloseTerms {
+            pays: 20_000,
+            timeout: 5_000,
+        }),
+    };
+    let wire = serde_json::to_value(&close).unwrap();
+    assert_eq!(wire["close"], serde_json::json!({"pays": 20_000, "timeout": 5_000}));
+    assert_eq!(json(&close), close);
+    let ordinary = Deposit {
+        close: None,
+        ..close
+    };
+    assert!(serde_json::to_value(&ordinary).unwrap().get("close").is_none());
+    assert_eq!(json(&ordinary), ordinary);
 }
 
 #[test]

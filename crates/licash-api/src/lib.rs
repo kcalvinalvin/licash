@@ -1019,8 +1019,17 @@ impl Deposits {
     /// in it: none if none does, rounding the fee up leaving a gap there,
     /// whatever the limits.
     pub fn paid_by(&self, pays: u64) -> Option<u64> {
+        self.most_for(pays).filter(|amount| self.pays(*amount) == Some(pays))
+    }
+
+    /// The most notes a deposit locks that a payment of `pays` on Bitcoin
+    /// covers, its fee in it: what a payment fixed beforehand, a contract's
+    /// reserve, locks, the rest of it the hub's. None if not even none are
+    /// covered.
+    pub fn most_for(&self, pays: u64) -> Option<u64> {
         // It and its fee only grow with it: the last at most `pays`, found
-        // halving, then the one if it comes to `pays` exactly.
+        // halving.
+        self.pays(0).filter(|paid| *paid <= pays)?;
         let (mut low, mut high) = (0, pays);
         while low < high {
             let mid = low + (high - low).div_ceil(2);
@@ -1029,7 +1038,7 @@ impl Deposits {
                 _ => high = mid - 1,
             }
         }
-        (self.pays(low) == Some(pays)).then_some(low)
+        Some(low)
     }
 }
 
@@ -1042,6 +1051,25 @@ pub struct Deposit {
     #[serde(flatten)]
     pub receive: Receive,
     pub refund: Hex,
+    /// Set for the deposit a contract's default pays her reserve to
+    /// ([`CloseTerms`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub close: Option<CloseTerms>,
+}
+
+/// What a deposit asks besides when a contract's default close returns the
+/// holder's reserve to it. Its payment is that reserve exactly, the notes
+/// it locks the most that covers (`Deposits::most_for`), and it times out
+/// where the contract's Base says, not a window after the request. Its
+/// notes are locked once she asks, when she comes back after the close,
+/// not when the payment confirms. Until the hub's contracts bind it to the
+/// contract that names it, the hub keeps it for the deposit window only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloseTerms {
+    /// What its payment is.
+    pub pays: u64,
+    /// The block after which she may take the coins back.
+    pub timeout: u32,
 }
 
 /// A deposit's terms: pay exactly `amount` to `address`, in a block up to
