@@ -28,6 +28,7 @@ import org.licash.core.Notes
 import org.licash.core.contractMaxCap
 import org.licash.wallet.Engine
 import org.licash.wallet.Ui
+import org.licash.wallet.carriedOn
 import org.licash.wallet.digits
 import org.licash.wallet.explain
 import org.licash.wallet.sat
@@ -53,7 +54,11 @@ internal fun HubPage(
     val scope = rememberCoroutineScope()
     val hub = ui.hubs.find { sameHub(it.url, holding.hub) }
     val now = System.currentTimeMillis() / 1000
-    val covers = ui.contracts.filter { sameHub(it.hub, holding.hub) && (ui.developer || shown(it, now)) }
+    // One closed with its hub still shows while its fold is awaited: her notes are out of her balance.
+    val covers = ui.contracts.filter {
+        sameHub(it.hub, holding.hub) &&
+            (ui.developer || shown(it, now) || ui.recoveries.any { r -> r.id == it.id && carriedOn(r) })
+    }
     val opening = ui.opening?.let { sameHub(it, holding.hub) } == true
     // One being set up shows the step it is at in its own row, once it has one.
     val stepping = covers.any { it.state == ContractState.Opening && it.step != null }
@@ -192,7 +197,7 @@ internal fun HubPage(
                 ending = null
                 cashOut(c.hub)
             },
-            endNow = {
+            close = {
                 ending = null
                 engine.closeContract(c.id)
             },

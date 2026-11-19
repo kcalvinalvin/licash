@@ -193,7 +193,7 @@ private fun ContractLayout(info: ContractInspection, explorer: (String) -> Strin
     }
 }
 
-/** A protection's row unfolded: what it covers and costs; ending it, forcing it closed in advanced mode. */
+/** A protection's row unfolded: what it covers and costs; closing it with its hub, forcing it closed in advanced mode. */
 @Composable
 private fun Unfolded(c: Contract, cover: Cover, developer: Boolean, end: () -> Unit, forceClose: () -> Unit, safety: ContractSafety?, height: Int, network: Network) {
     val state = c.state
@@ -225,7 +225,7 @@ private fun Unfolded(c: Contract, cover: Cover, developer: Boolean, end: () -> U
     }
     if (cover.held) {
         Row {
-            TextButton(onClick = end, modifier = Modifier.testTag("close-contract")) { Text("End") }
+            TextButton(onClick = end, modifier = Modifier.testTag("close-contract")) { Text("Close") }
             // Its hub silent: what it holds claimed on Bitcoin, unilaterally.
             if (developer && cover.on) {
                 TextButton(onClick = forceClose, modifier = Modifier.testTag("force-close")) {
@@ -259,6 +259,7 @@ private fun Forced(r: Recovery, developer: Boolean, giveUp: () -> Unit, height: 
         r.assertion?.let { Line("Hub's proof", it.take(16) + "…") }
         r.payout?.let { Line("Payout", it.take(16) + "…") }
         r.sweep?.let { Line("Sweep", it.take(16) + "…") }
+        r.fold?.let { Line("Fold", it.take(16) + "…") }
     }
     if (forcing(r, height).revocable) {
         TextButton(onClick = giveUp, modifier = Modifier.testTag("give-up-recovery")) { Text("Cancel closing") }
@@ -301,7 +302,7 @@ internal fun ForceSheet(c: Contract, held: ULong, shortfall: ULong?, force: () -
     val claimed = if (held < c.cap) held else c.cap
     Sheet("Force close", dismiss) {
         Say(
-            "Only if ${name(c.hub)} stopped answering: while it answers, cash out instead. " +
+            "Only if ${name(c.hub)} stopped answering: while it answers, close with it instead, which pays the same. " +
                 "Your ${sat(claimed)} there leave your balance and are claimed on Bitcoin, " +
                 "back on Bitcoin in a few days if the hub stays silent. Its fees come from your reserve in the contract.",
         )
@@ -373,27 +374,48 @@ internal fun ProtectSheet(q: ContractQuote, open: () -> Unit, cashOutFirst: () -
     }
 }
 
-/** Why a protection does not end at once, and what to do instead: cash out what its hub holds. */
+/**
+ * Closing a protection early with its hub: the hub folds it with you, and
+ * what you hold there comes to you on Bitcoin, up to what it covers, with
+ * your reserve. Never without what it covers: a protection that ends
+ * leaves nothing unclaimed that it could have paid. What is held beyond
+ * its cap stays at the hub, unprotected, and cashing it out first is what
+ * takes it too.
+ */
 @Composable
 internal fun EndSheet(
     c: Contract,
     height: Int,
     held: ULong,
     cashOut: () -> Unit,
-    endNow: () -> Unit,
+    close: () -> Unit,
     dismiss: () -> Unit,
 ) {
     val ends = cover(c, height).ends
-    Sheet("Ends by itself", dismiss) {
-        Say(
-            (if (ends != null) "In $ends. " else "") +
-                "Or end it now with ${name(c.hub)}: your part of its cost comes back on Bitcoin, and it protects nothing from then on. " +
-                "To stop relying on ${name(c.hub)}, cash out what you hold there.",
-        )
-        if (held > 0uL) {
-            BigButton("Cash out ${sat(held)}", Modifier.fillMaxWidth().testTag("end-cash-out")) { cashOut() }
-            Spacer(Modifier.height(12.dp))
+    val claimed = if (held < c.cap) held else c.cap
+    Sheet("Close with ${name(c.hub)}", dismiss) {
+        if (claimed > 0uL) {
+            Say(
+                "${name(c.hub)} pays you what you hold there, up to ${sat(c.cap)}, and your part of the protection's cost " +
+                    "comes back with it: about ${sat(claimed)} on Bitcoin, in one transaction. It protects nothing from then on.",
+            )
+        } else {
+            Say(
+                "You hold nothing at ${name(c.hub)}: closing brings your part of the protection's cost back on Bitcoin, " +
+                    "and it protects nothing from then on.",
+            )
         }
-        BigButton("End now", Modifier.fillMaxWidth().testTag("end-now"), quiet = true) { endNow() }
+        if (held > claimed) {
+            Say(
+                "${sat(held - claimed)} of what you hold there is beyond what it covers: it stays at ${name(c.hub)}, " +
+                    "unprotected. Cash out first to take it too.",
+            )
+        }
+        if (ends != null) Say("Otherwise it ends by itself in $ends.")
+        BigButton("Close and receive", Modifier.fillMaxWidth().testTag("end-close")) { close() }
+        if (held > 0uL) {
+            Spacer(Modifier.height(12.dp))
+            BigButton("Cash out ${sat(held)} first", Modifier.fillMaxWidth().testTag("end-cash-out"), quiet = true) { cashOut() }
+        }
     }
 }

@@ -198,8 +198,18 @@ wherever one shows. The fees a hub charges as a contract opens there are
 the most the app pays it from then on: a hub that raised them since is not
 paid, and its notes not renewed, until the owner approves the new fees,
 asked when a payment there is refused for it (old beside new, then paid)
-and on the hub's page in Settings. A contract ends no sooner: End says to cash out the
-hub's notes instead. In advanced mode, a contract whose hub stopped
+and on the hub's page in Settings. A contract may be closed early with its
+hub, never without what it covers: Close says what the hub pays, the notes
+held there up to its cap and the reserve, in one transaction on Bitcoin,
+and how much beyond the cap stays at the hub unprotected, which cashing out
+first takes too. The hub is asked whether anything spent those notes, then
+retires them as it signs the fold; they leave the balance as the close is
+signed, and the row says it is closing until the fold is in a block. Should
+the hub not fold, the app files the same claim on Bitcoin by itself a little
+before its request's last block: a forced close on the notes already
+claimed. A contract that locks owed to the app depend on, or one too near
+its end, is forced closed instead; so is one whose hub does not take a claim
+with its fold yet. In advanced mode, a contract whose hub stopped
 answering can be forced closed: the notes it covers are claimed on Bitcoin
 (a note worth more than its cap for the cap, its excess lost) and paid back
 there once the hub's window to answer passed. A hub that answers instead

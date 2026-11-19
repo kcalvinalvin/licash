@@ -93,7 +93,7 @@ internal fun exitNotices(exits: List<ContractExit>, recoveries: List<Recovery>):
                 "A contract ends sooner than your exit margin allows. Pay its notes out or force close it yourself.",
             )
             ExitStep.CASHING_OUT -> if (done) ExitNotice(key, false, "Paying out ${sat(e.uncovered)} to your address as protection ends") else null
-            ExitStep.FOLDING -> if (done) ExitNotice(key, false, "Paid out, a contract closed early: its reserve back") else null
+            ExitStep.FOLDING -> if (done) ExitNotice(key, false, "Paid out, a contract closed with its hub: what was left of your notes and its reserve are on their way back") else null
             ExitStep.FORCE_CLOSING -> if (done) {
                 ExitNotice(key, true, "Not paid out in time: a contract forced closed. Keep Licash online until it is done.")
             } else {

@@ -266,7 +266,8 @@ fun cover(contract: Contract, height: Int): Cover {
 }
 
 /**
- * A protection forced closed, as its row says it: where it `stands`, in a
+ * A protection forced closed, or closed with its hub and awaiting the
+ * fold that pays it, as its row says it: where it `stands`, in a
  * word, and what it waits for (`says`), at the chain's `height`, 0 while
  * unknown; whether it may still be given up, and whether it failed.
  */
@@ -277,6 +278,7 @@ fun forcing(recovery: Recovery, height: Int): Forcing {
     val wait = recovery.nextAt?.takeIf { height > 0 }?.let { span(it.toLong() - height) }
     val revocable = recovery.stage == RecoveryStage.CLAIMED && !recovery.irrevocable
     val (stands, says) = when (recovery.stage) {
+        RecoveryStage.FOLDING -> "Closing" to "Waiting for the hub's transaction: your notes and reserve come back on Bitcoin together"
         RecoveryStage.CLAIMED -> "Forcing closed" to wait?.let { "Final in $it: it can be given up until then" }
         RecoveryStage.REQUESTING -> "Requesting" to "Asking on Bitcoin for what the hub holds"
         RecoveryStage.REQUESTED -> "Requested" to (wait?.let { "The hub has $it to answer" } ?: "The hub may answer")

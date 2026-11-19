@@ -135,6 +135,10 @@ class CoverTest {
         assertNull(forcing(recovery(RecoveryStage.CLAIMED), height = 0).says)
         assertEquals("3,000 sat back on Bitcoin", forcing(recovery(RecoveryStage.DONE, true, null), 1_000).says)
         assertTrue(forcing(recovery(RecoveryStage.LOST, true), 1_000).failed)
+        // Closed with the hub, its fold awaited: signed, so not to be given up.
+        val closing = forcing(recovery(RecoveryStage.FOLDING, irrevocable = true), 1_000)
+        assertEquals("Closing", closing.stands)
+        assertFalse(closing.revocable || closing.failed)
     }
 
     @Test

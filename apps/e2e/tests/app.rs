@@ -977,7 +977,9 @@ async fn contracted(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     phone.scroll_to_id("force-close").await?;
     let end = phone.scroll_to_id("close-contract").await?;
     phone.tap_view(&end).await?;
-    // It ends by itself: to stop relying on the hub, cash out.
+    // Closing pays what is held there, up to its cap; cashing out first
+    // takes what is beyond it too. Neither pressed: the contract stays.
+    phone.by_id("end-close", 10).await?;
     phone.by_id("end-cash-out", 10).await?;
     phone.back().await?;
     phone.gone("end-cash-out", 10).await?;

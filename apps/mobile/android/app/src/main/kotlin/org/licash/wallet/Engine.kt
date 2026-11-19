@@ -1305,8 +1305,9 @@ class Engine(context: Context) {
     }
 
     /**
-     * Close contract `id` early with its hub, in the background: its
-     * reserve back on Bitcoin. Told once done, or why not.
+     * Close contract `id` early with its hub, in the background: what it
+     * holds at the hub, up to its cap, and its reserve, back on Bitcoin
+     * in the hub's transaction. Told once it is signed, or why not.
      */
     fun closeContract(id: String) {
         val light = light
@@ -1319,10 +1320,10 @@ class Engine(context: Context) {
             try {
                 val fold = local { it.closeContract(GoChain(light), id) }
                 AppLog.info("contract $id closed early by $fold")
-                notices.tryEmit(Event("Protection ended: your part comes back on Bitcoin"))
+                notices.tryEmit(Event("Closed with the hub: your notes and reserve come back on Bitcoin once its transaction confirms"))
             } catch (e: Exception) {
                 AppLog.warn("closing contract $id early", e)
-                notices.tryEmit(Event("Not ended. ${explain(e)}"))
+                notices.tryEmit(Event("Not closed. ${explain(e)}"))
             } finally {
                 refresh()
                 poke()

@@ -105,7 +105,7 @@ class WatchTest {
             id = "c0", stage = stage, irrevocable = true, claimed = 3_000uL, notes = 7u, request = null,
             publication = null, timeout = null, sweep = null, nextAt = null, error = null,
         )
-        for (stage in listOf(RecoveryStage.CLAIMED, RecoveryStage.REQUESTED, RecoveryStage.SWEEPING)) {
+        for (stage in listOf(RecoveryStage.CLAIMED, RecoveryStage.FOLDING, RecoveryStage.REQUESTED, RecoveryStage.SWEEPING)) {
             assertEquals(stage.name, Watch.LATER, watchOf(Ui(recoveries = listOf(forced(stage))), now))
         }
         for (stage in listOf(RecoveryStage.DONE, RecoveryStage.LOST)) {
