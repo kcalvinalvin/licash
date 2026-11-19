@@ -378,7 +378,7 @@ pub const SIGNET_CHAINED: bool = false;
 /// must give (`r0/build-guest.sh chain`). The hub proves the header chain with
 /// it, and keeps the program in `r0/programs/` as it keeps the statements.
 pub const CHAIN: [u8; 32] =
-    hex!("0000000000000000000000000000000000000000000000000000000000000000");
+    hex!("746b6836d319091b004c2590412b84bef6961694e02ba45dbf3ecbc2ad6dfc2e");
 
 /// The programs signet's (and Mutinynet's) contracts opened under before [`SIGNET`], newest
 /// first: no contract opens under them, those that did are played still.
