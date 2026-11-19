@@ -17,7 +17,7 @@ use std::path::Path;
 use anyhow::{anyhow, ensure, Context as _, Result};
 use bitcoin::hashes::Hash as _;
 use bitcoin::{FeeRate, ScriptBuf};
-use licash::base::{Base, Version};
+use licash::base::Base;
 use licash::chain::{activation_script, Activation, ActivationRef, Chain as Headers, Inclusion};
 use licash::recovery::SourceWitness;
 use licash::spend::ProposalId;
@@ -333,7 +333,7 @@ pub(super) fn claimant<T: Transport>(
         let (state, _) = store.state(&c.id)?;
         let opening = Holder::load(&state, &seed, &ctx)?.signed()?;
         let parts = opening.base.parts();
-        if !matches!(opening.base.version(), Version::V4 { .. })
+        if !opening.base.version().anchored()
             || parts.chain.checkpoint.height() > anchor.height()
             || *parts.keyset.id() != o.keyset
         {
@@ -383,7 +383,7 @@ pub(super) async fn shown<T: Transport, C: Chain>(
     tip: u32,
 ) -> Result<BTreeSet<ProposalId>> {
     let mut shown = BTreeSet::new();
-    if !matches!(base.version(), Version::V4 { .. }) {
+    if !base.version().anchored() {
         return Ok(shown);
     }
     let parts = base.parts();
