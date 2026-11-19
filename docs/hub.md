@@ -566,17 +566,19 @@ enough), RISC Zero's Groth16 setup and the programs contracts open and
 opened under: the prover is not ready without the one they open under,
 and responds to no claim of a contract whose program it lacks (alerting
 the operator).
-On an RTX 2060 a proof takes about 20 minutes (the Groth16 wrap about 3 of
-them, on the CPU) plus about 7 minutes for each 1,000 headers since the
-contract's checkpoint for contracts of the programs before the compact
-filing's (graph id 8 and below): one of signet's most, 26,280 headers
-(half a year), about 3.3 hours, so a hub proves only two such in an assert
-window. The newest program takes a third of the cycles of a header (9.4 k,
-measured with `hp-exec`), so about 2.5 minutes for each 1,000 headers,
-projected by cycles and not yet measured on a GPU. On a CPU alone
-a proof takes hours, too slow for signet's window but for the smallest
-contracts. Give it 10 GB of memory or more. ARM images have no
-prover: their hubs respond to no contested claim on signet.
+On an RTX 2060 (measured, under the load of a shared machine) a chained
+contract's proof takes about 12 minutes whatever its age (the Groth16 wrap about
+1 of them, on the CPU), and a batch of the header chain of 1,500 headers about
+4.5 minutes. A contract of an earlier graph (id 10 and below) takes the same
+and about 1.6 minutes more for each 1,000 headers since its checkpoint (17 minutes
+with 3,015): one of signet's longest, 26,280 headers (half a year), about 55
+minutes, and two years of them (105,120) about 3 hours, so a hub proves only
+a few such in an assert window, where chained contracts of any length cost it
+12 minutes each. The programs before the compact filing's (graph id 8 and
+below) took three times the cycles of a header. On a CPU alone a proof takes
+hours, too slow for signet's window but for the smallest contracts. Give it
+10 GB of memory or more. ARM images have no prover: their hubs respond to no
+contested claim on signet.
 
 The hub stops, with an error, when one of its loops stops: the chain's
 watch, the tweaks' index, the gateways, the contracts' responder and
