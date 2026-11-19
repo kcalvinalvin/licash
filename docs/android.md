@@ -194,20 +194,22 @@ them (`licash-hub run --contracts`: under the mock authority on regtest,
 where such a contract protects nothing, and of genuine programs on signet and Mutinynet).
 A contract locks the hub's collateral on Bitcoin behind the notes there, up
 to its cap, until its last block to recover in, then closes by itself, its
-collateral back to the hub. Its price is paid from a coin of the wallet's on
-Bitcoin, its change kept there; with none, the quote offers to cash notes
-out to the wallet first. At a hub that lets the wallet choose
-(`--contracts-max-cap`), sliders choose its cap among the hub's sizes
-(`2^n - 1` sat; at first the size up to half again the largest coin, at
-most the hub's `--contracts-per-coin` times the coin paying), how long it
-lasts (at first half a year) and how much of it the owner funds herself
-(at first all the coin pays beside the price): the hub charges its
-interest on its own part only, and her part joins her balance at that hub
-once its funding is 3 blocks deep, or is claimed by a recovery should the
-hub never issue it. Priced live as the hub prices them, itemized (the
-hub's opening fee, its yearly interest on each part, her reserve), and
-paid from the coin chosen, if there are several; what is left of it stays
-on Bitcoin. Opening downloads about 100 MB and takes minutes to an hour,
+collateral back to the hub, and its reserve to a deposit of the hub's that
+swaps it for notes, not to a coin of the wallet's. Its price is paid from one
+coin of the wallet's on Bitcoin, spent whole: it pays the reserve and the hub's
+fee, and all the rest of it is the owner's part of the contract, issued back
+to her as notes at that hub once its funding is 3 blocks deep (or claimed by a
+recovery should the hub never issue it), the hub charging its interest on its
+own part only. No change comes back from the coin, so the sheet shows, for the
+coin chosen (at first the smallest that a contract takes), the contract it
+takes: the smallest cover the hub allows that does (at a hub that lets the
+wallet choose, `--contracts-max-cap`, among its sizes, `2^n - 1` sat, at most
+the hub's `--contracts-per-coin` times the coin paying), her part, and why none
+does, a coin short of the price or beyond what the hub's largest contract
+takes; a slider chooses how long it lasts (at first half a year). With no coin
+on Bitcoin, the sheet says to cash out to the wallet first. Priced live as the
+hub prices it, itemized (the hub's opening fee, its yearly interest on each
+part, her reserve). Opening downloads about 100 MB and takes minutes to an hour,
 in the background, one at a time, the step it is at shown; several
 contracts at a hub, and at several hubs, add up. Each says what it covers
 now of the hub's notes once unfolded: what its recovery would claim of them
