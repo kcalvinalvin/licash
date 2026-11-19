@@ -469,7 +469,7 @@ mod tests {
     /// byte for byte as the hub quotes it, on each network. A hub letting
     /// holders choose prices the fixed terms by its rate as well, at 1% a
     /// year 24 sat more; one that doesn't, at its fixed fee alone. Regtest's
-    /// mock decides the lean filing, so it quotes the graph of its id (10): signet's program
+    /// mock decides the lean filing, so it quotes the graph of its id (10), as signet's program does now.
     /// still decides the compact one, and it quotes 9.
     #[test]
     fn the_fixed_quote_is_pinned() {
@@ -480,7 +480,7 @@ mod tests {
                 None,
                 [
                     "324adaaaaa576156dbafdd687f717e2396057dd0fa17a3e420b08a0b00edffe0",
-                    "59e452a0dd8380cd7e63777bba55291e0a55b3b286cff43580d09fb3e89cc46d",
+                    "c29dd8e8984ca9fbf28540cb7c8bdfac1dc4bd317954ec14576a960c665f5a17",
                 ],
                 3_000,
             ),
@@ -488,7 +488,7 @@ mod tests {
                 Some(RANGE),
                 [
                     "a78b216fcd816f1412c2f31088579ac25c7c019ab834445041e3de8b7c046e61",
-                    "abfa0b5917d0e307914309daa82f0ef05f4e68818412a61c6bd309832db02f5a",
+                    "30a8eb34552f4442556c6ac61e1aaaac29d5f3166ac2c56d8e20787bbcd0ed9e",
                 ],
                 3_024,
             ),
