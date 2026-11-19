@@ -1481,12 +1481,13 @@ async fn a_holder_closes_her_contract_on_her_notes_and_its_fold_pays_them_to_her
 }
 
 /// A note of the claim the hub spent is not paid by a fold, which has no
-/// dispute to cite the spend in: refused before she signs, her notes back
-/// in her balance, her contract open.
+/// dispute to cite the spend in: the hub refuses it before she signs, and
+/// her wallet, shown the spend, checks it, drops the note, takes the change
+/// the spend paid and closes on the rest.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs bitcoind and a release build"]
-async fn a_fold_is_refused_on_a_claim_of_a_note_the_hub_spent() -> Result<()> {
-    use licash_contracts::holder::recovery;
+async fn a_fold_the_hub_refuses_for_a_spent_note_is_made_again_on_what_it_proves() -> Result<()> {
+    use licash_contracts::holder::recovery::{self, Stage};
 
     let Notes {
         rt,
@@ -1509,17 +1510,90 @@ async fn a_fold_is_refused_on_a_claim_of_a_note_the_hub_spent() -> Result<()> {
     wallet.send(&url, &bob, 2_048).await?;
     drop(wallet);
 
-    // The copy claims the note paid away too.
+    // The copy claims the note paid away too: the hub refuses it, and the
+    // copy proves it spent, takes the change and folds on what is left.
     let wallet = Wallet::open(&stale.join("wallet.sqlite"), Http::new(None)?)?;
+    ensure!(available(&wallet)? == 196_608);
+    let txid = holder::close(&wallet, &chain, &stale, &id).await?;
+    let rows = recovery::recoveries(&stale)?;
+    ensure!(rows.len() == 1, "{rows:?}");
+    ensure!(
+        rows[0].stage == Stage::Folding && rows[0].irrevocable && rows[0].claimed == 131_071,
+        "{:?}",
+        rows[0]
+    );
+    ensure!(holder::list(&stale)?[0].folded == Some(txid));
+    // What she holds still, past her cap, the hub holds nothing against.
+    let spent = wallet.check().await?;
+    ensure!(spent == Default::default(), "{spent:?}");
+    rt.mine(1)?;
+    Ok(())
+}
+
+/// [`Http`], but the hub shows no evidence of any note asked about, as a hub
+/// that refuses notes it calls spent and proves nothing would.
+struct Hushed(Http);
+
+impl licash_wallet::Transport for Hushed {
+    async fn request(
+        &self,
+        url: &str,
+        body: Option<Vec<u8>>,
+    ) -> Result<licash_wallet::Response, String> {
+        if url.ends_with(licash_api::INQUIRE) {
+            let asked: licash_api::Inquire =
+                serde_json::from_slice(&body.ok_or("no body")?).map_err(|e| e.to_string())?;
+            let none = vec![Vec::new(); asked.notes.len()];
+            return Ok(licash_wallet::Response {
+                status: 200,
+                body: serde_json::to_vec(&licash_api::Evidenced::new(&none))
+                    .map_err(|e| e.to_string())?,
+            });
+        }
+        self.0.request(url, body).await
+    }
+}
+
+/// A hub that calls a note spent and shows no spend of it is not believed:
+/// nothing is dropped, the close stops before she signs, her notes are back
+/// in her balance and her contract is open, to force closed on them all.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs bitcoind and a release build"]
+async fn a_fold_refused_for_a_note_the_hub_does_not_prove_spent_stops() -> Result<()> {
+    use licash_contracts::holder::recovery;
+
+    let Notes {
+        rt,
+        dir,
+        url,
+        chain,
+        wallet,
+        mine,
+        contract,
+        ..
+    } = with_notes([34; 32], Http::new(None)?).await?;
+    let id = contract.id;
+    drop(wallet);
+    let stale = dir.path().join("stale");
+    copy_dir(&mine, &stale)?;
+    let wallet = Wallet::open(&mine.join("wallet.sqlite"), Http::new(None)?)?;
+    let bob = licash::address::OwnerKeys::from_seed(&[0xbb; 32])?.address();
+    wallet.send(&url, &bob, 2_048).await?;
+    drop(wallet);
+
+    let wallet = Wallet::open(&stale.join("wallet.sqlite"), Hushed(Http::new(None)?))?;
     ensure!(available(&wallet)? == 196_608);
     let closed = holder::close(&wallet, &chain, &stale, &id).await;
     ensure!(
         closed
             .as_ref()
-            .is_err_and(|e| format!("{e:#}").contains("spent")),
+            .is_err_and(|e| format!("{e:#}").contains("no proof")),
         "{closed:?}"
     );
-    ensure!(available(&wallet)? == 196_608, "notes not given back");
+    ensure!(
+        available(&wallet)? == 196_608,
+        "notes dropped or not given back"
+    );
     ensure!(recovery::recoveries(&stale)?.is_empty());
     ensure!(holder::list(&stale)?[0].folded.is_none());
     ensure!(holder::list(&stale)?[0].live(rt.height()?));

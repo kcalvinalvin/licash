@@ -65,6 +65,10 @@ pub const FOLD_CLAIM: &str = "/v1/contracts/openings/{id}/fold/claim";
 /// a fold asked at [`FOLD_CLAIM`], the filing of her claim: the fold,
 /// signed by both and broadcast, in consensus bytes.
 pub const FOLD_SIGN: &str = "/v1/contracts/openings/{id}/fold/sign";
+/// What the hub's refusal of a fold's notes starts with ([`FOLD_CLAIM`]):
+/// a note it holds something against. She asks it for its evidence
+/// (`licash_api::INQUIRE`), drops what it proves and asks again.
+pub const NOTES_REFUSED: &str = "her notes";
 
 /// POST (no body) once F of contract `id` (hex) is buried: her funded
 /// notes issued, the hub's [`FundedIssued`]; 409 until it issues them.

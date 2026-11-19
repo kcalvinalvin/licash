@@ -22,7 +22,7 @@
 //! A contract holding no notes of hers has none to claim: its fold pays her
 //! reserve back, as it always did.
 
-use anyhow::{anyhow, ensure, Context as _, Result};
+use anyhow::{anyhow, bail, ensure, Context as _, Result};
 use bitcoin::consensus::deserialize;
 use bitcoin::secp256k1::{schnorr, Message, Secp256k1};
 use bitcoin::{Amount, Transaction, Txid};
@@ -31,7 +31,7 @@ use licash_contract::opening::{Context, Holder};
 use licash_wallet::{Transport, Wallet};
 use lichen_btc::musig::PubNonce;
 
-use super::driver::failed;
+use super::driver::{failed, Refusal};
 use super::recovery::{self, Stage};
 use super::store::Store;
 use super::{activation, Chain, Fate};
@@ -46,7 +46,78 @@ use crate::{FoldAsk, FoldOffer, FOLD, FOLD_CLAIM, FOLD_SIGN};
 /// protection, when only a forced close leaves time to file her claim
 /// should the hub not fold; and where locks owed to her depend on it, which
 /// a forced close claims.
+///
+/// Notes the hub refuses to retire, as spent or claimed elsewhere, are asked
+/// about at its ledger: what it proves of them she drops and her claim is
+/// made again without them, and with the change those spends paid her; what
+/// it only says, she keeps, and the close stops for her to force the
+/// contract closed on the claim of them all.
 pub async fn close<T: Transport, C: Chain>(
+    wallet: &Wallet<T>,
+    chain: &C,
+    dir: &std::path::Path,
+    id: &[u8; 32],
+) -> Result<Txid> {
+    for _ in 0..RETRIES {
+        let e = match close_once(wallet, chain, dir, id).await {
+            Ok(txid) => return Ok(txid),
+            Err(e) => e,
+        };
+        let Some(refused) = e.downcast_ref::<NotesRefused>() else {
+            return Err(e);
+        };
+        // Her notes are back in her balance: a claim signed past here
+        // could not be made again, the hub holding her authorizations.
+        let found = wallet.check_notes(&refused.notes).await?;
+        ensure!(
+            found.dropped + found.recovered > 0,
+            "{}: it shows no proof that her notes are spent. Her claim of them all is a forced close's: force the contract closed",
+            refused.reason
+        );
+        tracing::info!(
+            id = %crate::hex_id(id), dropped = found.dropped, recovered = found.recovered,
+            "notes the hub proved spent dropped: her close asked again"
+        );
+    }
+    bail!("the hub kept refusing notes of hers: force the contract closed")
+}
+
+/// Most times a close is made again, her claim made anew each time.
+const RETRIES: usize = 4;
+
+/// The hub refused notes of a fresh claim ([`crate::NOTES_REFUSED`]): which
+/// it names, her claim not signed and her notes back in her balance.
+#[derive(Debug)]
+struct NotesRefused {
+    reason: String,
+    notes: Vec<[u8; 33]>,
+}
+
+impl std::fmt::Display for NotesRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.reason)
+    }
+}
+
+impl std::error::Error for NotesRefused {}
+
+/// `error` of the hub's answer to `claim`'s ask, as [`NotesRefused`] where
+/// it refused the notes of a claim made afresh.
+fn notes_refused(error: anyhow::Error, claim: &recovery::FoldClaim) -> anyhow::Error {
+    let refused = claim.fresh
+        && error
+            .downcast_ref::<Refusal>()
+            .is_some_and(|r| r.0.contains(crate::NOTES_REFUSED));
+    if !refused {
+        return error;
+    }
+    anyhow::Error::new(NotesRefused {
+        reason: format!("{error:#}"),
+        notes: claim.notes.iter().map(|y| y.0).collect(),
+    })
+}
+
+async fn close_once<T: Transport, C: Chain>(
     wallet: &Wallet<T>,
     chain: &C,
     dir: &std::path::Path,
@@ -159,7 +230,9 @@ pub async fn close<T: Transport, C: Chain>(
                     amount: c.amount,
                     notes: c.notes.clone(),
                 };
-                post(wallet, hub, &url(FOLD_CLAIM), ask.encode()).await?
+                post(wallet, hub, &url(FOLD_CLAIM), ask.encode())
+                    .await
+                    .map_err(|e| notes_refused(e, c))?
             }
         };
         let offer = FoldOffer::decode(&offer).context("the hub's fold offer")?;

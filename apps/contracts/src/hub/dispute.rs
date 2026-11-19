@@ -302,7 +302,7 @@ impl Openings {
                 })?;
                 let claim = super::fold::Claim::asked(&o, amount, notes).map_err(Refused::bad)?;
                 (ledger.claimable)(id, &claim.notes)
-                    .map_err(|e| Refused::bad(format!("her notes: {e:#}")))?;
+                    .map_err(|e| Refused::bad(format!("{}: {e:#}", crate::NOTES_REFUSED)))?;
                 Some(claim)
             }
         };
@@ -372,7 +372,7 @@ impl Openings {
                     .filed(&o, filed)
                     .map_err(|e| Refused::bad(format!("her claim: {e:#}")))?;
                 (ledger.retire)(id, &publication)
-                    .map_err(|e| Refused::bad(format!("her notes: {e:#}")))?;
+                    .map_err(|e| Refused::bad(format!("{}: {e:#}", crate::NOTES_REFUSED)))?;
             }
         }
         let signed = fold
