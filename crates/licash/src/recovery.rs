@@ -28,6 +28,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
 const P_MAGIC: &[u8] = b"LICASH-P\x02";
+const P_MAGIC_COMPACT: &[u8] = b"LICASH-P\x03";
 /// A filing's magic: its activations unanchored (v3's), or each with the
 /// lock checkpoint it is anchored to (v4's).
 const F_MAGIC: &[u8] = b"LICASH-F\x01";
@@ -35,6 +36,39 @@ const F_MAGIC_ANCHORED: &[u8] = b"LICASH-F\x02";
 /// Its activations anchored, and the outputs a v5 Base's holder funded
 /// listed after them, which its funded items open.
 const F_MAGIC_FUNDED: &[u8] = b"LICASH-F\x03";
+/// The compact format's: unanchored, anchored, and funded as [`F_MAGIC_FUNDED`].
+const F_MAGIC_COMPACT: &[u8] = b"LICASH-F\x11";
+const F_MAGIC_COMPACT_ANCHORED: &[u8] = b"LICASH-F\x12";
+const F_MAGIC_COMPACT_FUNDED: &[u8] = b"LICASH-F\x13";
+
+/// The first graph id whose contracts file [`Format::Compact`].
+pub const COMPACT_FROM: u32 = 9;
+
+/// How a contract's filing is written, a function of its Base alone: the
+/// holder writes it, the Hub reads it and the statement decides on it all
+/// by [`Format::of`], so that a contract is decided by the codec it was
+/// opened under for as long as it lives. Each format has its own magics
+/// and the other's bytes don't decode.
+///
+/// `Compact` writes nothing a decoder can take from elsewhere in the
+/// filing: a record that authorizes an item names it by its index, and a
+/// settled note's witness leaves out its keyset and public fields, which
+/// are its item's. Everything decoded is the same, so every check after
+/// decoding is the same.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Format {
+    Legacy,
+    Compact,
+}
+
+impl Format {
+    pub fn of(base: &Base) -> Self {
+        match base.parts().graph.id >= COMPACT_FROM {
+            true => Self::Compact,
+            false => Self::Legacy,
+        }
+    }
+}
 /// A filing's limit: its bytes fit Lichen's claim carrier
 /// (`lichen_statement::claim_script`), which Core relays under default
 /// policy.
@@ -126,11 +160,15 @@ impl Publication {
         &self.envelope
     }
 
-    pub fn to_bytes(&self) -> Vec<u8> {
+    pub fn to_bytes(&self, format: Format) -> Vec<u8> {
         let claim = &self.claim;
         let context = claim.context();
         let parts = claim.parts();
-        let mut bytes = P_MAGIC.to_vec();
+        let mut bytes = match format {
+            Format::Legacy => P_MAGIC,
+            Format::Compact => P_MAGIC_COMPACT,
+        }
+        .to_vec();
         bytes.extend(context.base);
         bytes.extend(context.deposit);
         bytes.extend(context.cap.to_be_bytes());
@@ -207,7 +245,25 @@ impl Publication {
         let records = self.envelope.records();
         put_count(&mut bytes, records.len());
         for record in records {
-            bytes.extend(record.message.public_fields());
+            match format {
+                Format::Legacy => bytes.extend(record.message.public_fields()),
+                // An item's own record is its index: the item names the
+                // message, and it is the first and only one that does.
+                Format::Compact => match parts
+                    .items
+                    .iter()
+                    .position(|i| i.message() == &record.message)
+                {
+                    Some(index) => {
+                        bytes.push(0);
+                        bytes.push(u8::try_from(index).expect("at most 32 items"));
+                    }
+                    None => {
+                        bytes.push(1);
+                        bytes.extend(record.message.public_fields());
+                    }
+                },
+            }
             bytes.extend(record.sig.0);
         }
         bytes
@@ -215,11 +271,20 @@ impl Publication {
 
     /// Strict canonical decoding. The keyset and authorization limit are the
     /// opening's authenticated terms, never taken from the payload.
-    pub fn from_bytes(keyset: &Keyset, limit: usize, bytes: &[u8]) -> Result<Self, Error> {
-        if bytes.len() > MAX_PUBLICATION_BYTES || !bytes.starts_with(P_MAGIC) {
+    pub fn from_bytes(
+        format: Format,
+        keyset: &Keyset,
+        limit: usize,
+        bytes: &[u8],
+    ) -> Result<Self, Error> {
+        let magic = match format {
+            Format::Legacy => P_MAGIC,
+            Format::Compact => P_MAGIC_COMPACT,
+        };
+        if bytes.len() > MAX_PUBLICATION_BYTES || !bytes.starts_with(magic) {
             return Err(bad("native publication framing"));
         }
-        let mut r = Reader(&bytes[P_MAGIC.len()..]);
+        let mut r = Reader(&bytes[magic.len()..]);
         let context = claim::Context {
             base: r.array()?,
             deposit: r.array()?,
@@ -303,7 +368,25 @@ impl Publication {
         }
         let mut records = Vec::new();
         for _ in 0..r.count(limit)? {
-            let message = Message::from_public_fields(r.take(PUBLIC_FIELDS_BYTES)?)?;
+            let own = match format {
+                Format::Legacy => false,
+                Format::Compact => match r.byte()? {
+                    0 => true,
+                    1 => false,
+                    _ => return Err(bad("native publication record tag")),
+                },
+            };
+            let message = match own {
+                true => {
+                    let index = usize::from(r.byte()?);
+                    items
+                        .get(index)
+                        .ok_or_else(|| bad("native publication record index"))?
+                        .message()
+                        .clone()
+                }
+                false => Message::from_public_fields(r.take(PUBLIC_FIELDS_BYTES)?)?,
+            };
             records.push(Record {
                 message,
                 sig: Signature(r.array()?),
@@ -331,7 +414,7 @@ impl Publication {
         let envelope =
             Envelope::from_records(claim.hold_context(), claim.hold_root(), records, limit)?;
         let publication = Self { claim, envelope };
-        if publication.to_bytes() != bytes {
+        if publication.to_bytes(format) != bytes {
             return Err(bad("noncanonical native publication"));
         }
         Ok(publication)
@@ -913,18 +996,24 @@ impl Filing {
         self.witness.activations.iter().any(|a| a.anchor.is_some())
     }
 
-    pub fn to_bytes(&self) -> Vec<u8> {
+    pub fn to_bytes(&self, format: Format) -> Vec<u8> {
         let w = &self.witness;
-        let magic = match (self.anchored(), w.funded.is_empty()) {
-            (_, false) => F_MAGIC_FUNDED,
-            (false, true) => F_MAGIC,
-            (true, true) => F_MAGIC_ANCHORED,
+        let magic = match (format, self.anchored(), w.funded.is_empty()) {
+            (Format::Legacy, _, false) => F_MAGIC_FUNDED,
+            (Format::Legacy, false, true) => F_MAGIC,
+            (Format::Legacy, true, true) => F_MAGIC_ANCHORED,
+            (Format::Compact, _, false) => F_MAGIC_COMPACT_FUNDED,
+            (Format::Compact, false, true) => F_MAGIC_COMPACT,
+            (Format::Compact, true, true) => F_MAGIC_COMPACT_ANCHORED,
         };
         let mut bytes = magic.to_vec();
-        put_blob(&mut bytes, &self.publication.to_bytes());
+        put_blob(&mut bytes, &self.publication.to_bytes(format));
         put_count(&mut bytes, w.notes.len());
         for note in &w.notes {
-            put_blob(&mut bytes, &note.to_bytes());
+            match format {
+                Format::Legacy => put_blob(&mut bytes, &note.to_bytes()),
+                Format::Compact => put_blob(&mut bytes, &note.to_compact_bytes()),
+            }
         }
         put_count(&mut bytes, w.sources.len());
         for source in &w.sources {
@@ -979,20 +1068,51 @@ impl Filing {
     /// Strict canonical decoding: P as [`Publication::from_bytes`] decodes
     /// it, every note verified under `keyset` and every signed source against
     /// its notes. The keyset and authorization limit are the opening's.
-    pub fn from_bytes(keyset: &Keyset, limit: usize, bytes: &[u8]) -> Result<Self, Error> {
-        let funded = bytes.starts_with(F_MAGIC_FUNDED);
-        let anchored = funded || bytes.starts_with(F_MAGIC_ANCHORED);
-        if bytes.len() > MAX_PUBLICATION_BYTES || !(anchored || bytes.starts_with(F_MAGIC)) {
+    pub fn from_bytes(
+        format: Format,
+        keyset: &Keyset,
+        limit: usize,
+        bytes: &[u8],
+    ) -> Result<Self, Error> {
+        let (plain, anchored_magic, funded_magic) = match format {
+            Format::Legacy => (F_MAGIC, F_MAGIC_ANCHORED, F_MAGIC_FUNDED),
+            Format::Compact => (
+                F_MAGIC_COMPACT,
+                F_MAGIC_COMPACT_ANCHORED,
+                F_MAGIC_COMPACT_FUNDED,
+            ),
+        };
+        let funded = bytes.starts_with(funded_magic);
+        let anchored = funded || bytes.starts_with(anchored_magic);
+        if bytes.len() > MAX_PUBLICATION_BYTES || !(anchored || bytes.starts_with(plain)) {
             return Err(bad("filing framing"));
         }
-        let mut r = Reader(&bytes[F_MAGIC.len()..]);
-        let publication = Publication::from_bytes(keyset, limit, r.blob()?)?;
+        let mut r = Reader(&bytes[plain.len()..]);
+        let publication = Publication::from_bytes(format, keyset, limit, r.blob()?)?;
         let notes = |r: &mut Reader, limit| -> Result<Vec<Note>, Error> {
             (0..r.count(limit)?)
                 .map(|_| Note::from_bytes(keyset, r.blob()?))
                 .collect()
         };
-        let settled = notes(&mut r, MAX_ITEMS)?;
+        let settled = match format {
+            Format::Legacy => notes(&mut r, MAX_ITEMS)?,
+            // Each settled note is its item's, in order, with no more or
+            // fewer than the items settled.
+            Format::Compact => {
+                let items = publication.claim().parts().items.iter();
+                let messages: Vec<_> = items
+                    .filter(|item| matches!(item, Item::Settled(_)))
+                    .map(Item::message)
+                    .collect();
+                if r.count(MAX_ITEMS)? != messages.len() {
+                    return Err(bad("filing settled notes"));
+                }
+                messages
+                    .into_iter()
+                    .map(|message| Note::from_compact_bytes(keyset, message.clone(), r.blob()?))
+                    .collect::<Result<_, _>>()?
+            }
+        };
         let mut sources = Vec::new();
         for _ in 0..r.count(MAX_ITEMS)? {
             sources.push(match r.byte()? {
@@ -1047,7 +1167,7 @@ impl Filing {
                 funded: outputs,
             },
         )?;
-        if filing.to_bytes() != bytes {
+        if filing.to_bytes(format) != bytes {
             return Err(bad("noncanonical filing"));
         }
         Ok(filing)
@@ -1215,7 +1335,7 @@ pub fn owed(
         return Err(bad("the chain is not from Base's checkpoint"));
     }
     let limit = parts.limits.max_authorizations as usize;
-    let filing = Filing::from_bytes(&parts.keyset, limit, filed)
+    let filing = Filing::from_bytes(Format::of(base), &parts.keyset, limit, filed)
         .and_then(|filing| eligible(&filing, base, request, chain).map(|()| filing));
     let filing = match filing {
         Ok(filing) => filing,

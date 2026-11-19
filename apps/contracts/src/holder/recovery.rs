@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use anyhow::{anyhow, bail, ensure, Context as _, Result};
 use bitcoin::{Amount, FeeRate, OutPoint, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
 use licash::claim::{self, Branch, Item, UnsignedClaim};
-use licash::recovery::{Filing, Publication, Witness as FilingWitness};
+use licash::recovery::{Filing, Format, Publication, Witness as FilingWitness};
 use licash::request::Request;
 use licash::spend::ChainProfile;
 use licash_contract::graph::{link_args, HubProves, PURSE_VOUT};
@@ -1135,7 +1135,7 @@ impl<'a, T: Transport, C: Chain> Run<'a, T, C> {
             }
         };
         state.notes = notes.iter().map(|n| hex::encode(n.to_bytes())).collect();
-        state.filing = Some(hex::encode(filing.to_bytes()));
+        state.filing = Some(hex::encode(filing.to_bytes(Format::of(&self.o.base))));
         Ok(Next::To(Stage::Claimed))
     }
 
@@ -1244,7 +1244,8 @@ impl<'a, T: Transport, C: Chain> Run<'a, T, C> {
             },
         )?;
         ensure!(
-            filing.to_bytes().len() <= p.limits.max_publication_bytes as usize,
+            filing.to_bytes(Format::of(&self.o.base)).len()
+                <= p.limits.max_publication_bytes as usize,
             "the whole filing exceeds the publication limit"
         );
         Ok(filing)
@@ -1252,7 +1253,13 @@ impl<'a, T: Transport, C: Chain> Run<'a, T, C> {
     fn filing_of(&self, state: &State) -> Result<Filing> {
         let p = self.o.base.parts();
         let bytes = hex::decode(state.filing.as_deref().context("no filing")?)?;
-        let filing = Filing::from_bytes(&p.keyset, p.limits.max_authorizations as usize, &bytes)?;
+        let format = Format::of(&self.o.base);
+        let filing = Filing::from_bytes(
+            format,
+            &p.keyset,
+            p.limits.max_authorizations as usize,
+            &bytes,
+        )?;
         let claim = filing.publication().claim();
         ensure!(
             claim.context()
@@ -1462,7 +1469,7 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
             .value
             .checked_sub(r_total)
             .context("R creates money")?;
-        let bytes = filing.to_bytes();
+        let bytes = filing.to_bytes(Format::of(&self.o.base));
         let at = |vout| OutPoint {
             txid: r.compute_txid(),
             vout,
@@ -2226,7 +2233,7 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
             amount,
             claim_digest,
         };
-        let filed = self.filing_of(state)?.to_bytes();
+        let filed = self.filing_of(state)?.to_bytes(Format::of(&self.o.base));
         let parts = self.o.base.parts();
 
         // What the hub responded on.
@@ -2960,7 +2967,7 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
         };
         let filing = self.filing(&notes, &[], &[], state.amount)?;
         state.notes = notes.iter().map(|n| hex::encode(n.to_bytes())).collect();
-        state.filing = Some(hex::encode(filing.to_bytes()));
+        state.filing = Some(hex::encode(filing.to_bytes(Format::of(&self.o.base))));
         let row = self.store.recovery(&self.id)?.context("given up")?;
         ensure!(
             self.store.save_recovery(

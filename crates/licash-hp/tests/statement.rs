@@ -12,7 +12,7 @@ use licash::{
     crypto::{self, Point},
     note::Evidence as Issuance,
     note::{Derivation, HoldRoot, IssuerKeys, Keyset, Note},
-    recovery::{disclosures, Evidence, Filing, Publication, SourceWitness, Witness},
+    recovery::{disclosures, Evidence, Filing, Format, Publication, SourceWitness, Witness},
     spend::{ChainProfile, Output, Proposal},
 };
 use licash_hp::{check, contract, decide, HubInput, Refusal, RequestKeys, C};
@@ -43,6 +43,11 @@ fn party(value: u64) -> Party {
         payout_script: script,
     }
 }
+/// The graph id the contracts are opened on: `LICASH_HP_GRAPH` if set,
+/// to run the suite under the compact filing's (`recovery::COMPACT_FROM`).
+fn graph() -> u32 {
+    std::env::var("LICASH_HP_GRAPH").map_or(7, |n| n.parse().expect("LICASH_HP_GRAPH"))
+}
 fn base(keyset: Keyset, nonce: u8) -> Base {
     base_of(keyset, nonce, Version::V3)
 }
@@ -58,7 +63,7 @@ fn base_of(keyset: Keyset, nonce: u8, version: Version) -> Base {
         cap: 128,
         parties: [party(23), party(29)],
         graph: GraphTerms {
-            id: 7,
+            id: graph(),
             unit_sats: 1,
             bits: 21,
             low_bits: 9,
@@ -91,7 +96,7 @@ fn base_of(keyset: Keyset, nonce: u8, version: Version) -> Base {
             checkpoint: Checkpoint::genesis(ChainProfile::Core30DefaultRegtest).unwrap(),
             funding_depth: 1,
             work_depth: 6,
-            max_headers: 1_000,
+            max_headers: 1_000 + pad() as u32,
         },
         limits: Limits {
             max_transaction_bytes: 100_000,
@@ -175,7 +180,9 @@ fn file(
     .unwrap();
     let publication = Publication::sign(unsigned, &hold_keys(signers), LIMIT).unwrap();
     let e = *publication.claim().digest();
-    let bytes = Filing::new(publication, witness).unwrap().to_bytes();
+    let bytes = Filing::new(publication, witness)
+        .unwrap()
+        .to_bytes(Format::of(&base));
     Filed {
         issuer,
         base,
@@ -309,16 +316,25 @@ fn exit(base: &Base, b: u32, e: &Hash, claim: &[u8], b2: u32) -> Exit {
     signed_exit(base, &request_witness(e, b), claim, b2)
 }
 
-/// [`exit`] with her request's witness `witness`.
+/// Empty headers between the checkpoint and her request, for measuring
+/// what a header costs the statement: `LICASH_HP_PAD`, none if unset.
+fn pad() -> usize {
+    std::env::var("LICASH_HP_PAD").map_or(0, |n| n.parse().expect("LICASH_HP_PAD"))
+}
+
+/// [`exit`] with her request's witness `witness`, on [`pad`] headers.
 fn signed_exit(base: &Base, witness: &[Vec<u8>], claim: &[u8], b2: u32) -> Exit {
     let c = contract(base);
-    let (rh, request) = request_on(&c.checkpoint.hash, &c.deposit, witness);
+    let padding = headers_on(&c.checkpoint.hash, pad());
+    let tip = padding.last().map_or(c.checkpoint.hash, |h| sha256d(h));
+    let (rh, request) = request_on(&tip, &c.deposit, witness);
     let slot = OutPoint {
         txid: request.txid().unwrap(),
         vout: SLOT_VOUT,
     };
     let publish = published(&sha256d(&rh), &slot, claim);
-    let mut headers = vec![rh, publish.header];
+    let mut headers = padding;
+    headers.extend([rh, publish.header]);
     headers.extend(headers_on(&sha256d(&publish.header), 6));
     let (h, respond) = respond_block(&sha256d(headers.last().unwrap()), &request.tx, b2);
     headers.push(h);

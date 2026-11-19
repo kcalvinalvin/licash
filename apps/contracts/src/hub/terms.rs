@@ -4,6 +4,7 @@ use anyhow::{bail, ensure, Result};
 use licash::base::{ChainTerms, Fees, GraphTerms, Limits, Recipe};
 use licash::chain::Checkpoint;
 use licash::note::Keyset;
+use licash::recovery::COMPACT_FROM;
 use licash::spend::ChainProfile;
 use licash_contract::graph::RETURNING;
 use licash_contract::opening::{Bounds, Floors, Quote};
@@ -333,6 +334,15 @@ impl Timing {
         self.quote_for(keyset, checkpoint, CAP, LOCK, 0)
     }
 
+    /// The id of the graphs it quotes: those of the compact filing if the
+    /// program contracts open under decides it, else the last before.
+    fn graph_id(&self) -> u32 {
+        match crate::trust(self.profile).is_ok_and(|t| t.compact) {
+            true => COMPACT_FROM,
+            false => RETURNING,
+        }
+    }
+
     /// The hub's quote on `keyset` at `checkpoint` of `cap` sat over
     /// `blocks`, `funded` of them by its holder: a graph of 1-sat units
     /// as wide as the cap needs, 17 bits at least, its headers reaching the
@@ -358,7 +368,7 @@ impl Timing {
             keyset,
             cap,
             graph: GraphTerms {
-                id: RETURNING,
+                id: self.graph_id(),
                 unit_sats: 1,
                 bits: bits.max(MIN_BITS),
                 low_bits: 9,
@@ -452,7 +462,8 @@ mod tests {
     /// The quote every app asking without terms of its own opens on:
     /// byte for byte as the hub quotes it, on each network. A hub letting
     /// holders choose prices the fixed terms by its rate as well, at 1% a
-    /// year 24 sat more; one that doesn't, at its fixed fee alone.
+    /// year 24 sat more; one that doesn't, at its fixed fee alone. Regtest's
+    /// mock decides the compact filing, so it quotes the graph of its id (9).
     #[test]
     fn the_fixed_quote_is_pinned() {
         let parts = Hub::peek(funded()).unwrap().base.parts().clone();

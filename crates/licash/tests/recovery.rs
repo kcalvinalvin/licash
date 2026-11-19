@@ -21,7 +21,7 @@ use licash::{
     note::{Derivation, HoldRoot, IssuerKeys, Keyset, Note},
     recovery::{
         self, disclosures, evidence_from_bytes, evidence_to_bytes, ActivationWitness, Evidence,
-        Filing, Owed, Publication, SourceWitness, Witness,
+        Filing, Format, Owed, Publication, SourceWitness, Witness,
     },
     request::Request,
     source::Certificate,
@@ -51,6 +51,9 @@ fn base(keyset: Keyset) -> Base {
     base_of(keyset, base::Version::V3)
 }
 fn base_of(keyset: Keyset, version: base::Version) -> Base {
+    base_at(keyset, version, 7)
+}
+fn base_at(keyset: Keyset, version: base::Version, id: u32) -> Base {
     let mut deposit = [31; 36];
     deposit[32..].copy_from_slice(&7u32.to_le_bytes());
     Base::new(Parts {
@@ -62,7 +65,7 @@ fn base_of(keyset: Keyset, version: base::Version) -> Base {
         cap: 128,
         parties: [party(23), party(29)],
         graph: GraphTerms {
-            id: 7,
+            id,
             unit_sats: 1,
             bits: 21,
             low_bits: 9,
@@ -175,7 +178,13 @@ fn decide(
 ) -> Result<Owed, licash::Error> {
     let filing = Filing::new(p.clone(), witness.clone()).unwrap();
     let chain = chain.cloned().unwrap_or_else(checkpoint_chain);
-    recovery::owed(&o.base, request, &filing.to_bytes(), evidence, &chain)
+    recovery::owed(
+        &o.base,
+        request,
+        &filing.to_bytes(Format::of(&o.base)),
+        evidence,
+        &chain,
+    )
 }
 
 fn claim(
@@ -240,19 +249,19 @@ fn publication_codec_is_strict() {
         LIMIT,
     )
     .unwrap();
-    let bytes = publication.to_bytes();
-    assert!(Publication::from_bytes(&keyset, LIMIT, &bytes).is_ok());
+    let bytes = publication.to_bytes(Format::Legacy);
+    assert!(Publication::from_bytes(Format::Legacy, &keyset, LIMIT, &bytes).is_ok());
     for n in 0..bytes.len() {
-        assert!(Publication::from_bytes(&keyset, LIMIT, &bytes[..n]).is_err());
+        assert!(Publication::from_bytes(Format::Legacy, &keyset, LIMIT, &bytes[..n]).is_err());
     }
     let mut trailing = bytes.clone();
     trailing.push(0);
-    assert!(Publication::from_bytes(&keyset, LIMIT, &trailing).is_err());
+    assert!(Publication::from_bytes(Format::Legacy, &keyset, LIMIT, &trailing).is_err());
     let mut forged = bytes.clone();
     let last = forged.len() - 1;
     forged[last] ^= 1; // a Q signature byte
-    assert!(Publication::from_bytes(&keyset, LIMIT, &forged).is_err());
-    assert!(Publication::from_bytes(&keyset, 2, &bytes).is_err());
+    assert!(Publication::from_bytes(Format::Legacy, &keyset, LIMIT, &forged).is_err());
+    assert!(Publication::from_bytes(Format::Legacy, &keyset, 2, &bytes).is_err());
 }
 
 const Z: [u8; 32] = [83; 32];
@@ -478,7 +487,9 @@ fn pending_sources_follow_activation_refund_and_preimage_rules() {
             12,
         );
         let p = Publication::sign(unsigned, &hold_keys(&signers), LIMIT).unwrap();
-        let p = Publication::from_bytes(&keyset, LIMIT, &p.to_bytes()).unwrap();
+        let p =
+            Publication::from_bytes(Format::Legacy, &keyset, LIMIT, &p.to_bytes(Format::Legacy))
+                .unwrap();
         let request = Request {
             amount: 12,
             claim_digest: *p.claim().digest(),
@@ -696,12 +707,14 @@ fn v4_owes_a_locks_pay_only_on_an_activation_anchored_to_its_checkpoint() {
     let error = decide(&o, &request, &p, &full, &[expired], Some(&chain)).unwrap_err();
     assert!(error.to_string().contains("under v4"), "{error}");
     // The anchored filing has its own magic, and decodes as it was.
-    let bytes = Filing::new(p.clone(), full.clone()).unwrap().to_bytes();
+    let bytes = Filing::new(p.clone(), full.clone())
+        .unwrap()
+        .to_bytes(Format::Legacy);
     assert!(bytes.starts_with(b"LICASH-F\x02"));
-    let decoded = Filing::from_bytes(&keyset, LIMIT, &bytes).unwrap();
-    assert_eq!(decoded.to_bytes(), bytes);
+    let decoded = Filing::from_bytes(Format::Legacy, &keyset, LIMIT, &bytes).unwrap();
+    assert_eq!(decoded.to_bytes(Format::Legacy), bytes);
     for n in [bytes.len() - 1, bytes.len() - 40] {
-        assert!(Filing::from_bytes(&keyset, LIMIT, &bytes[..n]).is_err());
+        assert!(Filing::from_bytes(Format::Legacy, &keyset, LIMIT, &bytes[..n]).is_err());
     }
     // Unanchored (as v3 files it), or anchored to another block than the
     // lock names, the activation makes the claim ineligible.
@@ -1414,7 +1427,7 @@ fn the_hub_decides_what_a_filed_claim_is_owed() {
         },
     )
     .unwrap();
-    let bytes = filing.to_bytes();
+    let bytes = filing.to_bytes(Format::Legacy);
     assert!(bytes.len() < 25_000, "{} bytes", bytes.len());
     let owed = |request: &Request, bytes: &[u8], evidence: &[Evidence]| {
         recovery::owed(&o.base, request, bytes, evidence, &chain)
@@ -1581,7 +1594,7 @@ fn a_note_is_claimed_in_any_contract_its_hold_key_designates() {
         },
     )
     .unwrap();
-    let bytes = filing.to_bytes();
+    let bytes = filing.to_bytes(Format::Legacy);
     let owed = |bytes: &[u8]| recovery::owed(&o.base, &request, bytes, &[], &chain).unwrap();
     assert_eq!((owed(&bytes).owed, owed(&bytes).ineligible), (8, None));
 
@@ -1635,7 +1648,7 @@ fn fabricated_or_malformed_filings_are_owed_nothing() {
             },
         )
     };
-    let bytes = file(notes.clone()).unwrap().to_bytes();
+    let bytes = file(notes.clone()).unwrap().to_bytes(Format::Legacy);
     let owed = |bytes: &[u8], evidence: &[Evidence]| {
         recovery::owed(&o.base, &request, bytes, evidence, &chain)
     };
@@ -1650,7 +1663,7 @@ fn fabricated_or_malformed_filings_are_owed_nothing() {
     let other = IssuerKeys::random(3).unwrap();
     let mut fake = notes.clone();
     fake[1] = mint(&other, &other.keyset().unwrap(), &ds[1]);
-    nothing(&file(fake).unwrap().to_bytes());
+    nothing(&file(fake).unwrap().to_bytes(Format::Legacy));
     nothing(&flip(&bytes, &notes[1].signature().0));
     let borrowed = swap(&bytes, &notes[1].signature().0, &notes[0].signature().0);
     let reason = owed(&borrowed, &[]).unwrap().ineligible.unwrap();
@@ -1664,7 +1677,7 @@ fn fabricated_or_malformed_filings_are_owed_nothing() {
     let mut trailing = bytes.clone();
     trailing.push(0);
     nothing(&trailing);
-    nothing(&p.to_bytes());
+    nothing(&p.to_bytes(Format::Legacy));
     // A witness that doesn't line up with P can't be filed.
     assert!(file(notes[..2].to_vec()).is_err());
     assert!(file(vec![notes[1].clone(), notes[0].clone(), notes[2].clone()]).is_err());
@@ -1807,7 +1820,7 @@ fn pending_items_are_eligible_by_their_sources_public_bodies() {
             },
         )
         .unwrap();
-        (filing.to_bytes(), request)
+        (filing.to_bytes(Format::Legacy), request)
     };
     let owed = |(bytes, request): &(Vec<u8>, Request), evidence: &[Evidence], chain: &Chain| {
         recovery::owed(&o.base, request, bytes, evidence, chain)
@@ -1936,7 +1949,14 @@ fn a_filed_pay_of_a_lock_timed_on_another_checkpoint_is_owed_nothing() {
             },
         )
         .unwrap();
-        recovery::owed(&o.base, &request, &filing.to_bytes(), &[], &chain).unwrap()
+        recovery::owed(
+            &o.base,
+            &request,
+            &filing.to_bytes(Format::of(&o.base)),
+            &[],
+            &chain,
+        )
+        .unwrap()
     };
     let here = terms();
     assert_eq!(
@@ -1956,7 +1976,13 @@ fn a_filed_pay_of_a_lock_timed_on_another_checkpoint_is_owed_nothing() {
 
 /// A v5 Base of `issuer`'s keyset whose holder funds it with `outputs`.
 fn funded_base(issuer: &IssuerKeys, outputs: &[Output], amount: u32) -> Base {
+    funded_base_at(issuer, outputs, amount, 7)
+}
+
+/// [`funded_base`] of a graph of `id`.
+fn funded_base_at(issuer: &IssuerKeys, outputs: &[Output], amount: u32, id: u32) -> Base {
     let mut parts = base(issuer.keyset().unwrap()).parts().clone();
+    parts.graph.id = id;
     parts.version = base::Version::V5 {
         holder_wots: [5; 32],
         funded: licash::spend::funded_root(outputs).unwrap(),
@@ -2024,16 +2050,18 @@ fn v5_owes_her_funded_notes_unless_spent_or_claimed_elsewhere() {
         funded: outputs.clone(),
     };
     let filing = Filing::new(p.clone(), witness.clone()).unwrap();
-    let bytes = filing.to_bytes();
+    let bytes = filing.to_bytes(Format::Legacy);
     assert!(bytes.starts_with(b"LICASH-F\x03"));
     assert_eq!(
-        Filing::from_bytes(&o.base.parts().keyset, LIMIT, &bytes)
+        Filing::from_bytes(Format::Legacy, &o.base.parts().keyset, LIMIT, &bytes)
             .unwrap()
-            .to_bytes(),
+            .to_bytes(Format::Legacy),
         bytes
     );
     for n in 0..bytes.len() {
-        assert!(Filing::from_bytes(&o.base.parts().keyset, LIMIT, &bytes[..n]).is_err());
+        assert!(
+            Filing::from_bytes(Format::Legacy, &o.base.parts().keyset, LIMIT, &bytes[..n]).is_err()
+        );
     }
     let whole = decide(&o, &request, &p, &witness, &[], None).unwrap();
     assert_eq!((whole.owed, whole.mask, whole.ineligible), (12, 0, None));
@@ -2255,4 +2283,252 @@ fn funded_outputs_worth_other_than_she_funded_are_owed_nothing() {
         let decided = decide(&o, &request, &p, &witness, &[], None).unwrap();
         assert_eq!(decided.owed, owed, "{amount}");
     }
+}
+
+// ----- the compact filing -----
+
+fn open_at(id: u32) -> Opened {
+    let issuer = IssuerKeys::random(3).unwrap();
+    let base = base_at(issuer.keyset().unwrap(), base::Version::V3, id);
+    Opened { issuer, base }
+}
+
+/// `n` settled notes of 4 filed under `o`, with the request that signs them.
+fn settled(o: &Opened, n: u32) -> (Filing, Request, Vec<Derivation>) {
+    let keyset = o.base.parts().keyset.clone();
+    let ds: Vec<_> = (0..n).map(|i| derive(SPEND, &hold(), 4, 23, i)).collect();
+    let notes: Vec<_> = ds.iter().map(|d| mint(&o.issuer, &keyset, d)).collect();
+    let items = ds
+        .iter()
+        .map(|d| Item::Settled(d.message().clone()))
+        .collect();
+    let p = Publication::sign(
+        claim(o, items, vec![], vec![], &ds, 4 * n),
+        &hold_keys(&ds),
+        LIMIT,
+    )
+    .unwrap();
+    let request = Request {
+        amount: 4 * n,
+        claim_digest: *p.claim().digest(),
+    };
+    let witness = Witness {
+        notes,
+        sources: vec![],
+        activations: vec![],
+        funded: vec![],
+    };
+    (Filing::new(p, witness).unwrap(), request, ds)
+}
+
+fn owed_of(o: &Opened, request: &Request, bytes: &[u8]) -> Owed {
+    recovery::owed(&o.base, request, bytes, &[], &checkpoint_chain()).unwrap()
+}
+
+#[test]
+fn a_contract_files_the_format_its_graph_id_names() {
+    assert_eq!(
+        Format::of(&open_at(recovery::COMPACT_FROM - 1).base),
+        Format::Legacy
+    );
+    assert_eq!(
+        Format::of(&open_at(recovery::COMPACT_FROM).base),
+        Format::Compact
+    );
+    assert_eq!(
+        Format::of(&open_at(recovery::COMPACT_FROM + 1).base),
+        Format::Compact
+    );
+}
+
+#[test]
+fn a_compact_filing_is_owed_what_a_legacy_one_is_and_is_smaller() {
+    let (legacy, compact) = (open_at(7), open_at(recovery::COMPACT_FROM));
+    let (lf, lr, _) = settled(&legacy, 7);
+    let (cf, cr, _) = settled(&compact, 7);
+    let (lb, cb) = (lf.to_bytes(Format::Legacy), cf.to_bytes(Format::Compact));
+    // The same claim of the same notes, decided the same.
+    let (l, c) = (owed_of(&legacy, &lr, &lb), owed_of(&compact, &cr, &cb));
+    assert_eq!((l.owed, l.ineligible), (28, None));
+    assert_eq!((c.owed, c.ineligible), (28, None));
+    // A settled note saves its item's fields repeated as its record (104
+    // of 168, for 66) and its witness's keyset and fields (146): 248 of
+    // 619, to 371.
+    assert_eq!(lb.len() - cb.len(), 7 * 248);
+    assert!(cb.starts_with(b"LICASH-F\x11"));
+    // It decodes to what it was filed as, and encodes to the same bytes.
+    let keyset = compact.base.parts().keyset.clone();
+    let decoded = Filing::from_bytes(Format::Compact, &keyset, LIMIT, &cb).unwrap();
+    assert_eq!(decoded.to_bytes(Format::Compact), cb);
+    assert_eq!(
+        decoded.publication().claim().digest(),
+        cf.publication().claim().digest()
+    );
+}
+
+/// A contract is decided by its own format: the other's bytes aren't a
+/// filing under it, so that a holder that files the wrong one is owed
+/// nothing, as for any bytes that don't decode.
+#[test]
+fn the_other_formats_bytes_are_no_filing() {
+    let (legacy, compact) = (open_at(7), open_at(recovery::COMPACT_FROM));
+    let (lf, lr, _) = settled(&legacy, 2);
+    let (cf, cr, _) = settled(&compact, 2);
+    let wrong = owed_of(&legacy, &lr, &lf.to_bytes(Format::Compact));
+    assert_eq!(wrong.owed, 0);
+    assert!(wrong.ineligible.is_some());
+    let wrong = owed_of(&compact, &cr, &cf.to_bytes(Format::Legacy));
+    assert_eq!(wrong.owed, 0);
+    assert!(wrong.ineligible.is_some());
+    let keyset = compact.base.parts().keyset.clone();
+    assert!(Filing::from_bytes(
+        Format::Legacy,
+        &keyset,
+        LIMIT,
+        &cf.to_bytes(Format::Compact)
+    )
+    .is_err());
+    assert!(Filing::from_bytes(
+        Format::Compact,
+        &keyset,
+        LIMIT,
+        &cf.to_bytes(Format::Legacy)
+    )
+    .is_err());
+}
+
+#[test]
+fn the_compact_publication_has_one_encoding() {
+    let o = open_at(recovery::COMPACT_FROM);
+    let keyset = o.base.parts().keyset.clone();
+    let (filing, _, ds) = settled(&o, 3);
+    let p = filing.publication();
+    let bytes = p.to_bytes(Format::Compact);
+    assert!(Publication::from_bytes(Format::Compact, &keyset, LIMIT, &bytes).is_ok());
+    for n in 0..bytes.len() {
+        assert!(Publication::from_bytes(Format::Compact, &keyset, LIMIT, &bytes[..n]).is_err());
+    }
+    // The records close P: a count, then each a tag, an index, a signature.
+    let record = 1 + 1 + 64;
+    let head = bytes.len() - 3 * record;
+    let with = |records: Vec<Vec<u8>>| {
+        let mut changed = bytes[..head].to_vec();
+        changed.extend(records.concat());
+        Publication::from_bytes(Format::Compact, &keyset, LIMIT, &changed)
+    };
+    let own: Vec<Vec<u8>> = bytes[head..].chunks(record).map(<[u8]>::to_vec).collect();
+    assert!(with(own.clone()).is_ok());
+    // An item's record spelled out in full, which has a shorter spelling.
+    let mut spelled = own.clone();
+    let message = ds
+        .iter()
+        .map(|d| d.message().clone())
+        .find(|m| {
+            let index = usize::from(own[0][1]);
+            p.claim().parts().items[index].message() == m
+        })
+        .unwrap();
+    let mut full = vec![1];
+    full.extend(message.public_fields());
+    full.extend(&own[0][2..]);
+    spelled[0] = full;
+    assert!(with(spelled).is_err());
+    // An index past the items, a tag that isn't one, the same item twice.
+    let mut past = own.clone();
+    past[0][1] = 200;
+    assert!(with(past).is_err());
+    let mut tag = own.clone();
+    tag[0][0] = 2;
+    assert!(with(tag).is_err());
+    let mut twice = own.clone();
+    twice[1][1] = twice[0][1];
+    assert!(with(twice).is_err());
+    // Legacy's magic isn't compact's.
+    let mut old = bytes.clone();
+    old[8] = 2;
+    assert!(Publication::from_bytes(Format::Compact, &keyset, LIMIT, &old).is_err());
+}
+
+#[test]
+fn a_compact_filing_names_each_settled_note_once_and_no_other() {
+    let o = open_at(recovery::COMPACT_FROM);
+    let keyset = o.base.parts().keyset.clone();
+    let (filing, _, _) = settled(&o, 3);
+    let bytes = filing.to_bytes(Format::Compact);
+    for n in 0..bytes.len() {
+        assert!(Filing::from_bytes(Format::Compact, &keyset, LIMIT, &bytes[..n]).is_err());
+    }
+    // The count of notes after P, one short and one over.
+    let publication = filing.publication().to_bytes(Format::Compact);
+    let at = F_MAGIC_LEN + 4 + publication.len();
+    for count in [2u32, 4] {
+        let mut changed = bytes.clone();
+        changed[at..at + 4].copy_from_slice(&count.to_be_bytes());
+        assert!(Filing::from_bytes(Format::Compact, &keyset, LIMIT, &changed).is_err());
+    }
+    // A note of the issuer's for another message than its item's.
+    let mut swapped = bytes.clone();
+    let note = filing.witness().notes[0].to_compact_bytes();
+    let other = filing.witness().notes[1].to_compact_bytes();
+    let first = bytes
+        .windows(note.len())
+        .position(|w| w == note.as_slice())
+        .unwrap();
+    swapped[first..first + note.len()].copy_from_slice(&other);
+    assert!(Filing::from_bytes(Format::Compact, &keyset, LIMIT, &swapped).is_err());
+}
+
+const F_MAGIC_LEN: usize = 9;
+
+/// A v5 Base's funded filing is compact too, under its graph id: its own
+/// magic, the same claim owed.
+#[test]
+fn a_funded_filing_is_compact_under_a_graph_of_the_compact_format() {
+    let issuer = IssuerKeys::random(3).unwrap();
+    let ds: Vec<_> = (0..4).map(|i| derive(SPEND, &hold(), 4, 24, i)).collect();
+    let outputs: Vec<_> = ds
+        .iter()
+        .map(|d| Output::from_derivation(d).unwrap())
+        .collect();
+    let o = Opened {
+        base: funded_base_at(&issuer, &outputs, 16, recovery::COMPACT_FROM),
+        issuer,
+    };
+    let claimed = [ds[0].clone(), ds[1].clone(), ds[3].clone()];
+    let p = Publication::sign(
+        claim(
+            &o,
+            funded_items(&ds, &[0, 1, 3]),
+            vec![],
+            vec![],
+            &claimed,
+            12,
+        ),
+        &hold_keys(&claimed),
+        LIMIT,
+    )
+    .unwrap();
+    let request = Request {
+        amount: 12,
+        claim_digest: *p.claim().digest(),
+    };
+    let witness = Witness {
+        notes: vec![],
+        sources: vec![],
+        activations: vec![],
+        funded: outputs,
+    };
+    let keyset = o.base.parts().keyset.clone();
+    let bytes = Filing::new(p.clone(), witness.clone())
+        .unwrap()
+        .to_bytes(Format::Compact);
+    assert!(bytes.starts_with(b"LICASH-F\x13"));
+    let decoded = Filing::from_bytes(Format::Compact, &keyset, LIMIT, &bytes).unwrap();
+    assert_eq!(decoded.to_bytes(Format::Compact), bytes);
+    assert!(Filing::from_bytes(Format::Legacy, &keyset, LIMIT, &bytes).is_err());
+    for n in 0..bytes.len() {
+        assert!(Filing::from_bytes(Format::Compact, &keyset, LIMIT, &bytes[..n]).is_err());
+    }
+    let whole = decide(&o, &request, &p, &witness, &[], None).unwrap();
+    assert_eq!((whole.owed, whole.mask, whole.ineligible), (12, 0, None));
 }

@@ -73,6 +73,7 @@ fn stored_context(base: Option<&Base>, binding: bool, ctx: &Context) -> Context 
                 ctx.trust.program
             },
             mock: ctx.trust.mock,
+            compact: ctx.trust.compact,
         },
     }
 }

@@ -34,7 +34,7 @@ use bitcoin::block::Header;
 use bitcoin::{Amount, Block, BlockHash, FeeRate, OutPoint, ScriptBuf, Transaction, TxOut};
 use licash::claim::UnsignedClaim;
 use licash::disclosure::Disclosures;
-use licash::recovery::{self, Evidence, Filing, Publication};
+use licash::recovery::{self, Evidence, Filing, Format, Publication};
 use licash::request::Request;
 use licash_contract::dispute::{self, presign, Payout};
 use licash_contract::graph;
@@ -590,6 +590,7 @@ impl Openings {
             .ok()
             .and_then(|filed| {
                 Filing::from_bytes(
+                    Format::of(&o.base),
                     &parts.keyset,
                     parts.limits.max_authorizations as usize,
                     &filed,
@@ -772,8 +773,14 @@ impl Openings {
             return Ok(Vec::new());
         }
         let p = o.base.parts();
-        let filing = Filing::from_bytes(&p.keyset, p.limits.max_authorizations as usize, filed)
-            .map_err(|e| anyhow!("{e}"))?;
+        let format = Format::of(&o.base);
+        let filing = Filing::from_bytes(
+            format,
+            &p.keyset,
+            p.limits.max_authorizations as usize,
+            filed,
+        )
+        .map_err(|e| anyhow!("{e}"))?;
         let mut kept = Vec::new();
         for candidate in ledger(filing.publication().claim(), published_at)? {
             kept.push(candidate);

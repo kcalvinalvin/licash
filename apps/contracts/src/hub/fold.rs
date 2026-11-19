@@ -15,7 +15,7 @@ use std::collections::BTreeSet;
 use anyhow::{ensure, Context as _, Result};
 use licash::claim::Item;
 use licash::crypto::Point;
-use licash::recovery::{self, Filing, Publication};
+use licash::recovery::{self, Filing, Format, Publication};
 use licash::request::Request;
 use licash_contract::opening::HubOpening;
 
@@ -71,7 +71,8 @@ impl Claim {
     pub(super) fn filed(&self, o: &HubOpening, bytes: &[u8]) -> Result<Publication> {
         let parts = o.base.parts();
         let limit = parts.limits.max_authorizations as usize;
-        let filing = Filing::from_bytes(&parts.keyset, limit, bytes).context("her filing")?;
+        let filing = Filing::from_bytes(Format::of(&o.base), &parts.keyset, limit, bytes)
+            .context("her filing")?;
         let publication = filing.publication();
         let claim = publication.claim();
         ensure!(

@@ -40,12 +40,18 @@ pub use state::Peek;
 pub struct Trust {
     pub program: [u8; 32],
     pub mock: bool,
+    /// Whether its program decides the compact filing
+    /// ([`licash::recovery::Format`]), which a contract of graph id
+    /// [`licash::recovery::COMPACT_FROM`] on files: under one that doesn't,
+    /// her claim would decode to nothing, and be owed nothing.
+    pub compact: bool,
 }
 impl Trust {
     pub fn mock() -> Self {
         Self {
             program: [11; 32],
             mock: true,
+            compact: true,
         }
     }
 }
@@ -630,6 +636,11 @@ impl Holder {
     }
     fn start_with_id(s: Start, id: [u8; 32], ctx: &Context) -> Result<(Self, Vec<Out>)> {
         s.quote.check(s.checkpoint.profile())?;
+        ensure!(
+            s.quote.graph.id < licash::recovery::COMPACT_FROM || ctx.trust.compact,
+            "a graph of id {} files a compact claim, which the program trusted doesn't decide",
+            s.quote.graph.id
+        );
         let keys = HolderKeys::derive(&s.seed, &id);
         let open = wire::Open {
             party: PartyPubKeys {
@@ -1555,6 +1566,55 @@ mod tests {
         assert!(bounds.check(&wanted(1_100, 7), 1_000).is_ok());
     }
 
+    /// A compact filing under a program that doesn't decode it is owed
+    /// nothing, and a hub could answer so: holders refuse such a quote.
+    #[test]
+    fn a_graph_of_the_compact_filing_opens_only_under_a_program_that_decodes_it() {
+        let id = [3; 32];
+        let mut q = Quote::from_base(&testing::base(&id));
+        let key = HolderKeys::derive(&[1; 32], &id).party.funding;
+        let coin = TxOut {
+            value: Amount::from_sat(1002000),
+            script_pubkey: ScriptBuf::new_p2tr(SECP256K1, key.x_only_public_key().0, None),
+        };
+        let start = |q: &Quote| Start {
+            seed: [1; 32],
+            quote: q.clone(),
+            checkpoint: q.chain.checkpoint.clone(),
+            deposit: OutPoint {
+                txid: Txid::from_byte_array([4; 32]),
+                vout: 0,
+            },
+            coin: coin.clone(),
+            change: coin.script_pubkey.clone(),
+            payout: wallet_script(5),
+            wanted: wire::Wanted {
+                request_height: q.graph.request_height,
+                close_height: q.graph.close_height,
+                response_window: q.graph.response_window,
+            },
+            funded: None,
+        };
+        let trust = |compact| Context {
+            tip: 1,
+            trust: Trust {
+                program: [11; 32],
+                mock: true,
+                compact,
+            },
+        };
+        for (graph, compact, opens) in [
+            (licash::recovery::COMPACT_FROM - 1, false, true),
+            (licash::recovery::COMPACT_FROM, false, false),
+            (licash::recovery::COMPACT_FROM, true, true),
+            (licash::recovery::COMPACT_FROM + 1, false, false),
+        ] {
+            q.graph.id = graph;
+            let started = Holder::start(start(&q), &trust(compact));
+            assert_eq!(started.is_ok(), opens, "graph {graph}, compact {compact}");
+        }
+    }
+
     #[test]
     fn each_party_is_paid_to_a_native_segwit_script() {
         let id = [3; 32];
@@ -2194,6 +2254,7 @@ mod tests {
             trust: Trust {
                 program: [99; 32],
                 mock: true,
+                compact: true,
             },
         };
         assert!(Holder::load(&a.to_bytes(), &[1; 32], &rotated).is_ok());
@@ -2210,7 +2271,8 @@ mod tests {
                 tip: 1,
                 trust: Trust {
                     program: [11; 32],
-                    mock: false
+                    mock: false,
+                    compact: false,
                 }
             }
         )

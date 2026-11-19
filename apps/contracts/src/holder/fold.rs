@@ -270,7 +270,7 @@ async fn close_once<T: Transport, C: Chain>(
     // Whatever the hub answers, it may have signed: the fold stands.
     let mut body = partial.to_vec();
     if let Some(c) = &claim {
-        body.extend(c.filing.to_bytes());
+        body.extend(c.filing.to_bytes(licash::recovery::Format::of(&o.base)));
     }
     let answer = post(wallet, hub, &url(FOLD_SIGN), body).await;
     let answer = answer.context("the fold may be signed: it counts as closed, ask again")?;

@@ -320,6 +320,7 @@ pub fn trust(profile: ChainProfile) -> Result<Trust> {
         ChainProfile::Core30Signet => Ok(Trust {
             program: SIGNET,
             mock: false,
+            compact: SIGNET_COMPACT,
         }),
         _ => bail!("contracts are not opened on {profile} yet"),
     }
@@ -333,6 +334,13 @@ pub fn trust(profile: ChainProfile) -> Result<Trust> {
 /// ever to go. A contract keeps its program when this one changes.
 pub const SIGNET: [u8; 32] =
     hex!("7214a5393e19298874c6a864efd9e0c9beb221e68440df52b5a949f4b0f87734");
+
+/// Whether [`SIGNET`] decides the compact filing: true only for a program
+/// built from a tree whose `licash::recovery` reads it, and set in the
+/// same change as [`SIGNET`]. Hubs quote a graph of the compact filing's
+/// id only when it is ([`Trust::compact`]), and holders refuse one that
+/// is quoted otherwise.
+pub const SIGNET_COMPACT: bool = false;
 
 /// The programs signet contracts opened under before [`SIGNET`], newest
 /// first: no contract opens under them, those that did are played still.

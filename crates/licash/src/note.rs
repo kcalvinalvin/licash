@@ -395,7 +395,19 @@ impl Note {
         let mut bytes = NOTE_TAG.to_vec();
         bytes.extend(self.keyset);
         bytes.extend(self.message.public_fields());
-        bytes.extend(self.signature.0);
+        bytes.extend(self.compact_tail());
+        bytes
+    }
+
+    /// `C ‖ evidence`: what a note's bytes say beyond what its holder
+    /// already has, its keyset and its message, as a filing's witness of a
+    /// settled item ([`Note::from_compact_bytes`]).
+    pub fn to_compact_bytes(&self) -> Vec<u8> {
+        self.compact_tail()
+    }
+
+    fn compact_tail(&self) -> Vec<u8> {
+        let mut bytes = self.signature.0.to_vec();
         let put_dleq = |bytes: &mut Vec<u8>, d: &Dleq| {
             bytes.extend(d.e.0);
             bytes.extend(d.s.0);
@@ -453,10 +465,28 @@ impl Note {
         })
     }
 
+    /// Decode `to_compact_bytes` as the note of `message` under `keyset`,
+    /// and verify it. Its keyset and message are the caller's, so no
+    /// bytes can name another.
+    pub fn from_compact_bytes(
+        keyset: &Keyset,
+        message: Message,
+        bytes: &[u8],
+    ) -> Result<Self, Error> {
+        let r = Reader::new(bytes, "note", &[])?;
+        let note = Self::decode_tail(r, *keyset.id(), message)?;
+        note.verify(keyset)?;
+        Ok(note)
+    }
+
     fn decode(bytes: &[u8]) -> Result<Self, Error> {
         let mut r = Reader::new(bytes, "note", NOTE_TAG)?;
         let claimed = r.array()?;
         let message = Message::from_public_fields(r.take(PUBLIC_FIELDS_BYTES)?)?;
+        Self::decode_tail(r, claimed, message)
+    }
+
+    fn decode_tail(mut r: Reader, claimed: [u8; 32], message: Message) -> Result<Self, Error> {
         let signature = Point(r.array()?);
         let dleq = |r: &mut Reader| -> Result<Dleq, Error> {
             Ok(Dleq {
