@@ -351,7 +351,7 @@ async fn a_wallet_opens_contracts_at_a_hub_and_sees_them_confirm() -> Result<()>
     ensure!(first.phase == Phase::Funded, "{first:?}");
     ensure!(first.mock && first.cap == 131_071 && first.price == 23_000);
     ensure!(first.value == 60_000 && first.abandoned.is_none());
-    ensure!((first.close_height, first.assert_height) == (tip + 300, tip + 140));
+    ensure!((first.close_height, first.assert_height) == (tip + 300, tip + 134));
     let f = first.funding.context("no F")?;
     ensure!(first.fate == Some(Fate::Open), "{first:?}");
     let reserved = wallet.silent_coins()?;
@@ -526,7 +526,7 @@ async fn a_wallet_opens_a_contract_of_terms_it_chose_on_its_large_coin() -> Resu
     let first = holder::open(&wallet, &chain, &mine, &url, ask).await?;
     ensure!(first.phase == Phase::Funded, "{first:?}");
     ensure!(first.cap == 16_777_215 && first.price == price && first.value == 10_000_000);
-    ensure!((first.close_height, first.assert_height) == (tip + 2_000, tip + 1_840));
+    ensure!((first.close_height, first.assert_height) == (tip + 2_000, tip + 1_834));
 
     // Of the fixed terms beside it, on her small coin, as an app
     // installed asks.
@@ -1345,9 +1345,8 @@ async fn a_holder_closes_her_contract_early_with_the_hub_and_gets_her_reserve_ba
 
 /// A holder's wallet of `seed` over `transport` with a contract of a cap of
 /// 131 071 sat at a hub, and three notes of 65 536 there, the largest
-/// [`pay`] makes:
-/// more than its cap, so that a claim of them lets 65 537 sat of their face
-/// value go, as a forced close's does.
+/// [`pay`] makes: more than its cap, so that a claim takes two of them,
+/// 131 072 sat of face value for its cap of 131 071, and leaves the third.
 struct Notes<T: licash_wallet::Transport> {
     rt: Regtest,
     _dir: tempfile::TempDir,
@@ -1427,12 +1426,12 @@ async fn a_holder_closes_her_contract_on_her_notes_and_its_fold_pays_them_to_her
     let txid = holder::close(wallet, chain, mine, &id).await?;
     // Her notes left her balance and are claimed in a close awaiting its
     // fold; the contract counts as closed.
-    ensure!(available(wallet)? == 0);
+    ensure!(available(wallet)? == 65_536);
     let rows = recovery::recoveries(mine)?;
     ensure!(rows.len() == 1, "{rows:?}");
     let row = &rows[0];
     ensure!(
-        row.stage == Stage::Folding && row.irrevocable && (row.claimed, row.notes) == (131_071, 3),
+        row.stage == Stage::Folding && row.irrevocable && (row.claimed, row.notes) == (131_071, 2),
         "{row:?}"
     );
     ensure!(holder::list(mine)?[0].folded == Some(txid));
@@ -1452,7 +1451,7 @@ async fn a_holder_closes_her_contract_on_her_notes_and_its_fold_pays_them_to_her
     let ys = (claimed.iter())
         .map(|c| c.note.message().identifier())
         .collect::<Result<Vec<_>, _>>()?;
-    ensure!(n.hub.spent(&ys)? == vec![true; 3]);
+    ensure!(n.hub.spent(&ys)? == vec![true; 2]);
 
     rt.mine(1)?;
     // Her claim and her reserve at her wallet, the rest the hub's less the
@@ -1475,7 +1474,7 @@ async fn a_holder_closes_her_contract_on_her_notes_and_its_fold_pays_them_to_her
         "{done:?}"
     );
     // Her notes stay out of her balance for good.
-    ensure!(available(wallet)? == 0);
+    ensure!(available(wallet)? == 65_536);
     // The hub posts no default, now or at the close.
     let round = n.openings.answer_requests().await?;
     ensure!(round == Default::default(), "{round:?}");
@@ -1614,8 +1613,8 @@ async fn a_fold_the_hub_never_signs_gives_way_to_her_request_on_the_same_claim()
         rows.len() == 1 && rows[0].stage == Stage::Folding && rows[0].irrevocable,
         "{rows:?}"
     );
-    ensure!((rows[0].claimed, rows[0].notes) == (131_071, 3), "{rows:?}");
-    ensure!(available(wallet)? == 0);
+    ensure!((rows[0].claimed, rows[0].notes) == (131_071, 2), "{rows:?}");
+    ensure!(available(wallet)? == 65_536);
 
     // Block by block: waiting for the fold, then her request, the hub's
     // timeout paying her, the claim she pinned the same.
