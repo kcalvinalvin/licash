@@ -224,34 +224,47 @@ address of `code --onchain` from the cold wallet: the coin is found by
 `onchain scan` and moved to notes or a contract from there.
 
 `open-contract <hub> --chain <url>` opens a recovery contract at a hub the
-wallet trusts that opens them: its collateral protects the wallet's notes
-there, up to its cap, until the contract's deadline. The wallet pays the
-hub's price from its smallest coin on Bitcoin that covers it, its change
-back to the wallet on Bitcoin. It downloads about 100 MB of instances, kept
-in `contracts/` next to the wallet file; the contracts themselves are in
-the wallet file: back them up together (a snapshot of the wallet file, such
-as `sqlite3 wallet.sqlite ".backup FILE"`, holds the wallet and its contracts
-as one). `--blocks` sets the blocks to its close (by default the most
-the hub allows), `--max-price` the most to pay (by default the price the
-hub's info says). At a hub that lets wallets choose (its info names a
-range), `--cap` with `--blocks` sets the most the contract protects, one of
+wallet trusts that opens them and takes deposits: its collateral protects
+the wallet's notes there, up to its cap, until the contract's deadline. The
+wallet spends one coin on Bitcoin whole, the smallest that a contract of the
+hub takes (`--coin TXID:VOUT` names another): the coin pays the hub's price
+(the reserve and the hub's fee) and all the rest of it funds your part of the
+contract, issued back to the wallet as notes at the hub once the contract's
+funding is 3 blocks deep (`contracts --chain` collects them), the hub's
+interest charged on its own part only (and its rate for yours, often none).
+No change comes back from the coin, so what the contract takes of it is all
+of it but less than dust: a coin short of the price, or beyond what the hub's
+largest contract takes, opens none, and says so. Until the notes come the
+contract can't be closed early, and should the hub never issue them, forcing
+it closed claims them. It downloads about 100 MB of instances, kept in
+`contracts/` next to the wallet file; the contracts themselves are in the
+wallet file: back them up together (a snapshot of the wallet file, such as
+`sqlite3 wallet.sqlite ".backup FILE"`, holds the wallet and its contracts as
+one). `--blocks` sets the blocks to its close (by default the most the hub
+allows), `--max-price` the most to pay besides your part (by default no more
+than sane fees make it). At a hub that lets wallets choose (its info names a
+range), `--cap` with `--blocks` sets the least the contract protects, one of
 the hub's sizes (`2^n - 1` sat, 131,071 to 2,147,483,647, those the hub
-allows), at the price the range gives; `--coin TXID:VOUT` names the coin to
-pay from. `--funded <sat>` funds that much of the contract yourself: paid
-from the coin beside the price, the hub's interest charged on its own part
-only (and its rate for yours, often none), and issued back to the wallet as
-notes at the hub once the contract's funding is 3 blocks deep (`contracts
---chain` collects them). Until then the contract can't be closed early, and
-should the hub never issue them, forcing it closed claims them.
+allows): the contract is the smallest of them at least that large that takes
+the coin, at the price the range gives.
 `contract-terms <hub> [--cap <sat>] [--blocks <n>] [--funded <sat>]` shows
-what a contract costs before opening it, itemized: the hub's opening fee,
-its yearly interest on its part and on yours, your reserve (returned as it
-closes) and your part, with the sizes and durations the hub allows;
-`open-contract` prints the same as it opens. Several contracts, at one hub
-or several, each take their
-own coin. No contract opens at a hub charging more than is sane (over 10 sat
-or 1% on a payment, lock or refund, over 1 sat for each note made, or over
-20% of a chosen cap a year) unless `--any-fees` asks all the same.
+what a contract costs before opening it, itemized: the hub's opening fee, its
+yearly interest on its part and on yours, your reserve (returned as it
+closes, as notes) and your part for the `--funded` you name, with the sizes
+and durations the hub allows; `open-contract` prints the same, of the
+contract that opened. Several contracts, at one hub or several, each take
+their own coin. No contract opens at a hub charging more than is sane (over
+10 sat or 1% on a payment, lock or refund, over 1 sat for each note made, or
+over 20% of a chosen cap a year) unless `--any-fees` asks all the same.
+
+A contract that runs out with no claim ends by default, and your reserve goes
+to a deposit of the hub's that the contract names, not to a coin of yours:
+the contract's end then pays your wallet nothing that links it to your other
+coins. The wallet finds the deposit paid when it next resumes after the
+close, asks the hub for notes worth the reserve less the fee the contract
+agreed to, and claims them. A close deposit nobody asked for within 2016
+blocks of the close is taken back like any deposit, with `refund <hash> --to
+<address> --chain <url>`, and the hub is paid nothing.
 
 The fees a hub charges as a contract opens there are the most the wallet
 agreed to pay it, kept with the contract in the wallet file. A hub may

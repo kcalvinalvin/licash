@@ -212,6 +212,20 @@ unavailable, never retries or deposits under way. A deposit's status
 (`/v1/deposit/{hash}`) also answers what was asked and the terms answered,
 so that a wallet restored from its seed, its deposits' secrets derived from
 it, finds them again by their hashes. Deposits are kept in `hub.sqlite`.
+
+A contract's default close pays the holder's reserve to a deposit asked with
+`close` terms (`CloseTerms`: the reserve as the payment, and the timeout the
+contract's Base gives, `CLOSE_BLOCKS` after its close): its notes are the most
+the payment covers beside the deposit fee, its timeout its own, not a window
+after the request, and the hub keeps it for a deposit window only until an
+opening names its script and binds it to the contract (`bind_close`, with the
+fee the deposit asked, else the opening is refused); one whose opening is
+given up is given up too, unless a payment was seen. The hub locks the notes
+only when the wallet asks (`POST /v1/deposit/{hash}/lock`, once the payment is
+seen), when it comes back after the close, and a deposit nobody asked for is
+given up at its timeout, its payer taking the coins back. These are rows of
+`deposit_closes` in `hub.sqlite`, a table of its own that a file made before
+it creates on first use: the deposits before are ordinary ones.
 A claim left unmined is made again at a
 higher fee rate as the timeout nears (twice the estimate once fewer than 12 blocks
 are left, doubling every 3 blocks, all of the coin but dust at most), and
@@ -255,13 +269,17 @@ largest rounded down to one) and at most `--contracts-per-coin` times (2 by
 default) the coin the wallet deposits, at the reserve and opening fee plus
 `--contracts-rate` millionths of the part of the cap the hub funds a year
 (of its network's blocks, 52,560 or Mutinynet's 1,051,200; 10,000, 1% a
-year, by default). A wallet may fund part of the cap itself
-(`&funded=SAT`, a v5 contract): it pays that much more from its coin in F,
-`--contracts-rate-funded` millionths of it a year (none by default), and
-once F is 3 blocks deep (and as deep as the hub's funding depth) the hub
-issues it notes of that value at `/v1/contracts/openings/{id}/funded`,
-through a lock of its own settled at once; never issued, the wallet's
-claim names them, and a recovery pays them. `/v1/info` then names that range,
+year, by default). A wallet funds part of the cap itself
+(`&funded=SAT`, every contract): its coin is spent whole in F, paying the
+price and, as that part, all the rest of it but less than dust (no change
+comes back), `--contracts-rate-funded` millionths of it a year (none by
+default), and once F is 3 blocks deep (and as deep as the hub's funding
+depth) the hub issues it notes of that value at
+`/v1/contracts/openings/{id}/funded`, through a lock of its own settled at
+once; never issued, the wallet's claim names them, and a recovery pays
+them. A hub that takes no deposits (`--deposit-sweep-address`) opens no
+contract and says so at startup: every contract's default returns the
+holder's reserve to a deposit of the hub's (below). `/v1/info` then names that range,
 its largest cap no more than the contracts' wallet funds (its confirmed
 balance, asked each minute with `getbalances`, less the hub's 100,000 sat
 reserve and 50,000 for fees): a larger cap is refused as unavailable. A
