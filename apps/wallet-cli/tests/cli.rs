@@ -371,11 +371,20 @@ fn a_restored_backup_drops_the_notes_spent_since() {
 
     ok(wallet(&alice, &["send", &bob_at, "60"], None));
     assert_eq!(available(&backup), (100, 0));
-    // Consolidation consumed every original note. A stale backup knows
-    // none of the new change and must not count those old notes twice.
-    assert_eq!(json(&backup, &["check"])["dropped"], 100);
-    assert_eq!(available(&backup), (0, 0));
-    assert_eq!(json(&backup, &["check"])["dropped"], 0);
+    // Consolidation consumed every original note. The hub proves it, and
+    // the change it paid Alice comes back with it: the backup is what
+    // Alice is, and does not count those old notes twice.
+    let checked = json(&backup, &["check"]);
+    assert_eq!(
+        (&checked["dropped"], &checked["recovered"]),
+        (&100.into(), &39.into())
+    );
+    assert_eq!(available(&backup), (39, 0));
+    let checked = json(&backup, &["check"]);
+    assert_eq!(
+        (&checked["dropped"], &checked["recovered"]),
+        (&0.into(), &0.into())
+    );
     assert_eq!(available(&alice), (39, 0));
 
     // A fresh copy sees the change. Notes spent from it are dropped by
@@ -393,8 +402,11 @@ fn a_restored_backup_drops_the_notes_spent_since() {
         )
         .unwrap() as u64;
     assert!((31..=39).contains(&spent));
-    assert_eq!(json(&alice, &["check"])["dropped"], spent);
-    assert_eq!(available(&alice), (39 - spent, 0));
+    // And the change the copy was paid comes back to the first file.
+    let checked = json(&alice, &["check"]);
+    assert_eq!(checked["dropped"], spent, "{checked}");
+    assert_eq!(checked["recovered"], spent - 31, "{checked}");
+    assert_eq!(available(&alice), (8, 0), "{checked}");
     assert_eq!(available(&backup), (8, 0));
 }
 
