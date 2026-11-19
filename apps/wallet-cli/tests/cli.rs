@@ -1753,6 +1753,54 @@ fn coins_paid_on_bitcoin_are_found_spent_and_moved_to_notes() {
     assert_eq!(values(&json(&alice, &["onchain", "coins"])), [change]);
 }
 
+/// Cold storage set by a tpub of segwit addresses: shown with its next
+/// address, looked for in the chain's blocks from its birthday, cleared.
+#[test]
+fn cold_storage_is_set_shown_looked_for_and_cleared() {
+    use bitcoin::bip32::{Xpriv, Xpub};
+    let hub = Server::with_tweaks(FEE);
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, _) = party(dir.path(), "alice", Some(&hub));
+    let chain = hub.esplora().to_owned();
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    let master = Xpriv::new_master(bitcoin::NetworkKind::Test, &[0xc0; 32]).unwrap();
+    let tpub = Xpub::from_priv(&secp, &master).to_string();
+    failed(wallet(&alice, &["cold", "show"], None), 1, "cold set");
+    let set = [
+        "cold",
+        "set",
+        &tpub,
+        "--threshold",
+        "100000",
+        "--keep",
+        "5000",
+    ];
+    failed(wallet(&alice, &set, None), 1, "--birthday or --chain");
+    let mut chosen = set.to_vec();
+    chosen.extend(["--birthday", "0"]);
+    failed(wallet(&alice, &chosen, None), 1, "wpkh or tr");
+    chosen.extend(["--script", "tr"]);
+    let shown = json(&alice, &chosen);
+    assert_eq!(shown["script"], "tr");
+    assert_eq!(shown["next_index"], 0);
+    assert!(
+        shown["next"].as_str().unwrap().starts_with("bcrt1p"),
+        "{shown}"
+    );
+    assert_eq!(shown["scanned"], serde_json::Value::Null);
+    let looked = json(&alice, &["cold", "--chain", &chain, "show"]);
+    assert_eq!(looked["scanned"], hub.height());
+    assert_eq!(
+        (looked["balance"].as_u64(), looked["coins"].as_u64()),
+        (Some(0), Some(0))
+    );
+    // Nothing due under the threshold: nothing withdrawn.
+    let ran = json(&alice, &["cold", "--chain", &chain, "run"]);
+    assert_eq!(ran["withdrawn"], serde_json::Value::Null);
+    ok(wallet(&alice, &["cold", "clear"], None));
+    failed(wallet(&alice, &["cold", "show"], None), 1, "cold set");
+}
+
 /// The coins listed with a chain to read are looked for first: no scan
 /// asked for, as the app looks while idle.
 #[test]

@@ -31,7 +31,36 @@ const MIGRATIONS: &[&str] = &[
     LOCK_CLAIMS,
     OWED_LOCKS,
     SILENT_PAYOUTS,
+    COLD,
 ];
+
+/// Version 15: cold storage ([`crate::Wallet::set_cold`]), at most one: the
+/// external wallet's extended public key as given, the kind of its
+/// addresses, the rules of withdrawing to it, the block looked for its
+/// coins from and the last looked in; and the coins found at its
+/// addresses, by the index of each. None in a file of an older version:
+/// nothing withdrawn.
+const COLD: &str = "
+CREATE TABLE cold (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    key TEXT NOT NULL,
+    script TEXT NOT NULL,
+    threshold INTEGER NOT NULL,
+    keep INTEGER NOT NULL,
+    max_fee_percent REAL NOT NULL,
+    birthday INTEGER NOT NULL,
+    scanned INTEGER
+) STRICT;
+CREATE TABLE cold_coins (
+    txid BLOB NOT NULL,
+    vout INTEGER NOT NULL,
+    idx INTEGER NOT NULL,
+    value INTEGER NOT NULL,
+    height INTEGER NOT NULL,
+    spent_height INTEGER,
+    PRIMARY KEY (txid, vout)
+) STRICT;
+";
 
 /// Version 14: payouts to silent payment addresses. `blind` is the secret
 /// the payee's scan key is blinded by before the provider is asked its

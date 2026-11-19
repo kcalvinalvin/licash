@@ -24,6 +24,7 @@ use rand_core::{OsRng, RngCore};
 use serde_json::json;
 use tracing_subscriber::EnvFilter;
 
+mod cold;
 mod contract;
 mod onchain;
 mod payout;
@@ -401,6 +402,18 @@ enum Command {
         #[command(subcommand)]
         command: onchain::Onchain,
     },
+    /// Cold storage: notes withdrawn now and then to an external wallet by
+    /// its extended public key, never to an address twice, and what it
+    /// holds.
+    Cold {
+        /// The chain to read: a Bitcoin Core node as
+        /// `http://user:password@127.0.0.1:8332`, or Esplora as
+        /// `esplora+https://esplora.example/api`.
+        #[arg(long, global = true, env = "LICASH_WALLET_CHAIN")]
+        chain: Option<String>,
+        #[command(subcommand)]
+        command: cold::ColdCommand,
+    },
     /// Open a recovery contract at HUB, a hub the wallet trusts: its
     /// collateral protects the wallet's notes there, up to its cap, until
     /// the contract's deadline. Paid from a coin of the wallet's on
@@ -625,7 +638,9 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             show_qr(qr && !json, &address);
             show(json, json!({ "address": address }), address.clone());
         }
-        Command::Code { onchain: true, qr, .. } => {
+        Command::Code {
+            onchain: true, qr, ..
+        } => {
             let code = wallet.onchain_code(true)?;
             let text = if qr { code.qr() } else { code.to_string() };
             show_qr(qr && !json, &text);
@@ -994,7 +1009,8 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 Some(provider) => {
                     let amount = Payable::read(&invoice)?.amount;
                     let max_fee = max_fee.unwrap_or(SwapLimits::usual(amount).fee);
-                    let paying = |max_fee| wallet.pay_invoice_via(&provider, &hub, &invoice, max_fee);
+                    let paying =
+                        |max_fee| wallet.pay_invoice_via(&provider, &hub, &invoice, max_fee);
                     match paying(max_fee).await {
                         Err(e @ licash_wallet::Error::FeeRose { .. }) => {
                             paying(accept_raise(e, json)?).await?
@@ -1145,6 +1161,10 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         }
         Command::Onchain { chain, command } => {
             return onchain::run(&wallet, chain, command, json).await;
+        }
+        Command::Cold { chain, command } => {
+            let route = route(tor, cli.proxy.as_deref())?;
+            return cold::run(&wallet, chain, route, command, json).await;
         }
         Command::Payout {
             amount,

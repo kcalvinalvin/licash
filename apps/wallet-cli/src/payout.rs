@@ -147,16 +147,31 @@ pub async fn for_fees(
     amount: u64,
     rate: bitcoin::FeeRate,
 ) -> anyhow::Result<Payout> {
+    let from = crate::richest_but(wallet, "")?;
+    let to = wallet.silent_keys().address().to_string();
+    let max_fee = amount / 100 + USUAL_MAX_FEE;
+    announced(wallet, route, (&from, &to), amount, (max_fee, rate)).await
+}
+
+/// Pay `amount` out of notes at `from` to `to` through the provider
+/// announced on the wallet's hubs' relays, reached through `route`, asking
+/// least within `max_fee`, its claim budgeted at `rate`; refused if it
+/// failed at once. Its claim made as the payouts are followed.
+pub async fn announced(
+    wallet: &Wallet<Http>,
+    route: &Route,
+    (from, to): (&str, &str),
+    amount: u64,
+    (max_fee, rate): (u64, bitcoin::FeeRate),
+) -> anyhow::Result<Payout> {
     let relays = licash_nostr::wallet::hub_relays(wallet)?;
     if relays.is_empty() {
         bail!("no hub trusted names relays to find a swap provider on");
     }
-    let from = crate::richest_but(wallet, "")?;
-    let to = wallet.silent_keys().address().to_string();
-    let limits = (amount / 100 + USUAL_MAX_FEE, rate);
-    let found = payout_providers(wallet, &relays, route, (&from, &to), amount, limits);
+    let limits = (max_fee, rate);
+    let found = payout_providers(wallet, &relays, route, (from, to), amount, limits);
     let found = found.await?.into_iter().next().with_context(|| {
-        format!("no provider announced pays {amount} out from {from} within the usual fees")
+        format!("no provider announced pays {amount} out from {from} within {max_fee} sat of fees")
     })?;
     let payout = wallet.payout(&found.quote).await?;
     if let PayoutState::Failed(reason) = &payout.state {

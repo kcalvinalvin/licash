@@ -1008,7 +1008,7 @@ async fn a_wallet_file_of_version_4_gains_payouts() {
         .unwrap();
     assert_eq!(version(&path), 4);
     let wallet = Wallet::open(&path, Link(Net::new())).unwrap();
-    assert_eq!(version(&path), 14);
+    assert_eq!(version(&path), 15);
     // Trusted, as every hub of an older file.
     assert_eq!(wallet.hubs().unwrap().len(), 1);
     assert!(wallet.visited().unwrap().is_empty());
@@ -1124,4 +1124,88 @@ async fn a_payout_to_a_silent_payment_address_of_a_false_share_claims_nothing() 
     let after = eco.settled(&payout).await;
     failed(&after, "share");
     assert!(eco.client.payout_claims().unwrap().is_empty());
+}
+
+/// Cold storage of a tpub's segwit addresses: once the notes exceed its
+/// threshold, a withdrawal of all but what it keeps is due to its first
+/// address, one at a time; paid out, the next is another, and the coin is
+/// found at the first, counted in its balance.
+#[tokio::test]
+async fn notes_past_the_threshold_are_withdrawn_to_cold_storage_never_to_an_address_twice() {
+    use bitcoin::bip32::{Xpriv, Xpub};
+    use licash_wallet::{ColdRules, ColdScript};
+    let eco = Eco::new().await;
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    let master = Xpriv::new_master(bitcoin::NetworkKind::Test, &[0xc0; 32]).unwrap();
+    let tpub = Xpub::from_priv(&secp, &master).to_string();
+    assert!(tpub.starts_with("tpub"), "{tpub}");
+    let rules = ColdRules {
+        threshold: 2_000,
+        keep: 1_000,
+        max_fee_percent: 30.0,
+    };
+    let birthday = eco.view.height();
+    // An xpub's kind of address is chosen.
+    assert!(eco.client.set_cold(&tpub, None, rules, birthday).is_err());
+    let cold = eco
+        .client
+        .set_cold(&tpub, Some(ColdScript::Wpkh), rules, birthday)
+        .unwrap();
+    assert_eq!((cold.next_index, cold.balance, cold.pending), (0, 0, None));
+    assert!(cold.next.starts_with("bcrt1q"), "{}", cold.next);
+    let due = eco.client.cold_due().unwrap().expect("due past 2,000");
+    assert_eq!(
+        (due.to.as_str(), due.amount, due.max_fee),
+        (cold.next.as_str(), 2_000, 600)
+    );
+    let quote = eco
+        .client
+        .payout_quote(
+            PROVIDER,
+            &due.from,
+            &due.to,
+            due.amount,
+            due.max_fee,
+            ONE_SAT,
+        )
+        .await
+        .unwrap();
+    let payout = eco.client.payout(&quote).await.unwrap();
+    // Under way: none other due, the next address another.
+    let cold = eco.client.cold().unwrap().unwrap();
+    assert_eq!(cold.pending.as_deref(), Some(payout.hash.as_str()));
+    assert_eq!(cold.next_index, 1);
+    assert_ne!(cold.next, due.to);
+    assert_eq!(eco.client.cold_due().unwrap(), None);
+
+    pending(eco.follow(&payout).await, "not confirmed yet");
+    let coin = eco.desk.fund(None, None);
+    assert_eq!(
+        eco.follow(&payout).await.unwrap().state,
+        PayoutState::Claimed
+    );
+    let claims = eco.client.payout_claims().unwrap();
+    eco.net.confirm(A, claims.clone());
+    assert_eq!(eco.follow(&payout).await.unwrap().state, PayoutState::Done);
+    eco.desk.settle(&claims[0], coin).await;
+    let cold = eco
+        .client
+        .scan_cold(&eco.view, 1_000)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((cold.balance, cold.coins, &cold.pending), (2_000, 1, &None));
+    assert_eq!(cold.scanned, Some(eco.view.height()));
+    // Looked in again: counted once.
+    let again = eco
+        .client
+        .scan_cold(&eco.view, 1_000)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(again, cold);
+    // Below the threshold now: nothing due.
+    assert_eq!(eco.client.cold_due().unwrap(), None);
+    eco.client.clear_cold().unwrap();
+    assert_eq!(eco.client.cold().unwrap(), None);
 }

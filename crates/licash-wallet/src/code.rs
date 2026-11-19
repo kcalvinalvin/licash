@@ -421,7 +421,10 @@ impl FromStr for PaymentCode {
             silent: None,
             licash: None,
         };
-        let scheme = |name: &str| s.get(..name.len()).is_some_and(|p| p.eq_ignore_ascii_case(name));
+        let scheme = |name: &str| {
+            s.get(..name.len())
+                .is_some_and(|p| p.eq_ignore_ascii_case(name))
+        };
         if scheme("licash:") {
             let (path, query) = s[7..].split_once('?').unwrap_or((&s[7..], ""));
             code.licash = Some(path.parse()?);

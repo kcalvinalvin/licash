@@ -162,10 +162,15 @@ fn bip21_uris_and_bare_addresses_are_read() {
     assert_eq!((code.licash, code.silent), (None, Some(sp)));
     refused(&format!("bitcoin:?licash={licash}"), "nothing to pay");
     // Its own URI's amount in satoshis, any parameter not required skipped.
-    let code: PaymentCode = format!("LICASH:{licash}?Amount=21&label=x").parse().unwrap();
+    let code: PaymentCode = format!("LICASH:{licash}?Amount=21&label=x")
+        .parse()
+        .unwrap();
     assert_eq!((code.licash, code.amount), (Some(licash.clone()), Some(21)));
     refused(&format!("licash:{licash}?amount=0.1"), "");
-    refused(&format!("licash:{licash}?amount=1&amount=2"), "amount twice");
+    refused(
+        &format!("licash:{licash}?amount=1&amount=2"),
+        "amount twice",
+    );
     refused(&format!("licash:{licash}?req-x=1"), "requires req-x");
     refused("licash:", "");
 }
@@ -561,7 +566,9 @@ async fn a_code_given_out_for_donations_stays_while_it_pays_the_wallet() {
         bob.donation_code(None, &trusted(&bob)).unwrap()
     };
     for other in [unknown, mailed, bobs] {
-        let kept = alice.donation_code(Some(&other.to_string()), &hubs).unwrap();
+        let kept = alice
+            .donation_code(Some(&other.to_string()), &hubs)
+            .unwrap();
         assert_eq!(kept, now, "{other:?}");
     }
     assert_eq!(alice.donation_code(Some("nonsense"), &hubs).unwrap(), now);

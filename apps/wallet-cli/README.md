@@ -60,10 +60,11 @@ one refused for its fee is not retried at a higher one. `optimize <hub>`
 previews a remint with its fee; `optimize <hub> --max-fee SAT` makes it
 now, within that fee and the contract ceilings, bypassing the rests and the
 daily budget. `history` lists a remint as `optimized notes`, with its fee.
-A wallet file is upgraded to version 13 when first opened by this version,
+A wallet file is upgraded to version 15 when first opened by this version,
 which older versions refuse: notes unlinked before version 8 begin their
 rest then, no lock reads as claimed by a recovery or owed to the wallet
-on Bitcoin, and nothing is reminted or asked of a hub by the upgrade
+on Bitcoin, no payout as paying a silent payment address, no cold storage
+is configured, and nothing is reminted or asked of a hub by the upgrade
 itself.
 
 `code` prints a payment code (a BIP321 URI, `--qr` for a QR code) naming the
@@ -189,6 +190,22 @@ than 12 blocks before the provider may take its coin back is made again at
 twice its fee, doubling every 3 blocks (16 times at most), the address paid
 that much less: the preimage is out by then, and the provider's refund would
 lose the whole amount.
+
+`cold set <key> --threshold <sat>` withdraws to cold storage, an external
+wallet named by the extended public key of its account: a `zpub` (`vpub`
+off mainnet) for native segwit addresses, or an `xpub` (`tpub`) with
+`--script wpkh` or `--script tr` (taproot, BIP86). Each withdrawal pays an
+address of the key's receiving chain (`0/i`) never paid before nor found
+holding a coin. `cold --chain <url> run` looks in the blocks from
+`--birthday` (by default the chain's height when set) for what its
+addresses hold, follows the payouts, and once the notes exceed the
+threshold pays all but `--keep` out from the hub holding the most, through
+the provider announced asking least within `--max-fee-percent` of it (1% by
+default), one withdrawal at a time: run it now and then, as with `cron`.
+`cold show` prints the balance found and the next address (looked for first
+with `--chain`), `cold clear` stops withdrawing. To bring funds back, pay an
+address of `code --onchain` from the cold wallet: the coin is found by
+`onchain scan` and moved to notes or a contract from there.
 
 `open-contract <hub> --chain <url>` opens a recovery contract at a hub the
 wallet trusts that opens them: its collateral protects the wallet's notes

@@ -459,11 +459,7 @@ async fn a_payment_under_a_key_refused_for_its_fee_is_given_up_not_made_again() 
     *net.stale.lock().unwrap() = None;
     bob.add_hub(HUB).await.unwrap();
     alice.receive(&net.pay(HUB, &alice.address(), 50)).unwrap();
-    let code = bob
-        .payment_code(&[HUB.into()])
-        .unwrap()
-        .licash
-        .unwrap();
+    let code = bob.payment_code(&[HUB.into()]).unwrap().licash.unwrap();
     let key = [7; 32];
     let refused = alice.pay_code_keyed(HUB, &code, 8, key).await;
     assert!(

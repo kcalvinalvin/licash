@@ -35,6 +35,7 @@ mod backup;
 mod claims;
 mod code;
 mod coins;
+mod cold;
 mod delivery;
 mod deposits;
 mod lightning;
@@ -81,6 +82,7 @@ pub use code::{
     ContractSecrets, DonationAddress, HubId, LicashCode, PaymentCode, CODE_HUBS, MAX_HUBS,
 };
 pub use coins::MAX_INPUTS;
+pub use cold::{Cold, ColdRules, ColdScript, ColdWithdrawal, GAP as COLD_GAP};
 pub use delivery::{Delivery, Due, Inboxed, ACK_WITHIN, PAGES_AT_ONCE};
 pub use deposits::{Deposit, DepositState, DepositTerms};
 pub use lightning::{refund_blocks, Invoice, InvoiceState, Payable, ViaQuote, ROUTE_BLOCKS};

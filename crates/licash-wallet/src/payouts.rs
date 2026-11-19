@@ -56,7 +56,11 @@ use crate::{
 
 /// `share`, as the provider answered it, if a share of `blinded` proven
 /// of the secret of `refund`.
-fn proven_share(share: &swaps::Share, refund: &XOnlyPublicKey, blinded: &PublicKey) -> Option<Share> {
+fn proven_share(
+    share: &swaps::Share,
+    refund: &XOnlyPublicKey,
+    blinded: &PublicKey,
+) -> Option<Share> {
     let share = Share {
         point: PublicKey::from_slice(&share.point.0).ok()?,
         e: share.e.0.as_slice().try_into().ok()?,
@@ -400,7 +404,14 @@ impl<T: Transport> Wallet<T> {
         // Its lock prepared first, then the payout, its lock and its notes
         // taken at once: no follower ever sees the payout without its lock.
         let admitted = match self
-            .prepare_lock(at, &quote.info.address, total, hash, Some(quote.expiry), Pays::Nothing)
+            .prepare_lock(
+                at,
+                &quote.info.address,
+                total,
+                hash,
+                Some(quote.expiry),
+                Pays::Nothing,
+            )
             .await
         {
             // Its fee as the hub's lock signs it, not as estimated.
@@ -731,10 +742,20 @@ impl<T: Transport> Wallet<T> {
             None => None,
             Some((address, rho, _)) => {
                 let blinded = silent_claim::blind(&address.scan, rho).map_err(invalid)?;
-                match answer.share.as_ref().and_then(|s| proven_share(s, &refund_key, &blinded)) {
-                    Some(share) => Some(share.unblind(rho, &refund_key).map_err(invalid)?.serialize()),
+                match answer
+                    .share
+                    .as_ref()
+                    .and_then(|s| proven_share(s, &refund_key, &blinded))
+                {
+                    Some(share) => Some(
+                        share
+                            .unblind(rho, &refund_key)
+                            .map_err(invalid)?
+                            .serialize(),
+                    ),
                     None => {
-                        let reason = "the provider's share of the payee's scan key is missing or false";
+                        let reason =
+                            "the provider's share of the payee's scan key is missing or false";
                         self.fail_payout(hash, reason)?;
                         return Ok(None);
                     }
@@ -1081,21 +1102,24 @@ impl<T: Transport> Wallet<T> {
                         )),
                         None => None,
                     };
-                    Ok((Record {
-                        provider: r.get(0)?,
-                        preimage: r.get(1)?,
-                        claim_key: r.get(2)?,
-                        from: (r.get(3)?, r.get(4)?),
-                        script: ScriptBuf::from_bytes(r.get(5)?),
-                        amount: r.get::<_, i64>(6)? as u64,
-                        budget: r.get::<_, i64>(7)? as u64,
-                        refund,
-                        funding,
-                        claim: r.get(14)?,
-                        scanned: r.get(15)?,
-                        open: r.get(16)?,
-                        silent: None,
-                    }, silent))
+                    Ok((
+                        Record {
+                            provider: r.get(0)?,
+                            preimage: r.get(1)?,
+                            claim_key: r.get(2)?,
+                            from: (r.get(3)?, r.get(4)?),
+                            script: ScriptBuf::from_bytes(r.get(5)?),
+                            amount: r.get::<_, i64>(6)? as u64,
+                            budget: r.get::<_, i64>(7)? as u64,
+                            refund,
+                            funding,
+                            claim: r.get(14)?,
+                            scanned: r.get(15)?,
+                            open: r.get(16)?,
+                            silent: None,
+                        },
+                        silent,
+                    ))
                 },
             )
             .optional()?)
@@ -1105,7 +1129,10 @@ impl<T: Transport> Wallet<T> {
         if let Some((address, blind, share)) = silent {
             let address = SpAddress::from_str(&address).map_err(invalid)?;
             let blind = SecretKey::from_slice(&blind).map_err(invalid)?;
-            let share = share.map(|s| PublicKey::from_slice(&s)).transpose().map_err(invalid)?;
+            let share = share
+                .map(|s| PublicKey::from_slice(&s))
+                .transpose()
+                .map_err(invalid)?;
             record.silent = Some((address, blind, share));
         }
         Ok(record)
@@ -1127,7 +1154,9 @@ impl<T: Transport> Wallet<T> {
             return Ok((any, silent.to_string(), Some(silent)));
         }
         let Some(address) = code.address else {
-            return Err(Error::Invalid("not an address on Bitcoin: no address it names".into()));
+            return Err(Error::Invalid(
+                "not an address on Bitcoin: no address it names".into(),
+            ));
         };
         let address = address
             .require_network(licash_onchain::network(network))
@@ -1301,7 +1330,10 @@ async fn block_at(chain: &impl Blocks, height: u32) -> Result<Block, Error> {
     checked_block(chain, &hash).await
 }
 
-async fn checked_block(chain: &impl Blocks, hash: &bitcoin::BlockHash) -> Result<Block, Error> {
+pub(crate) async fn checked_block(
+    chain: &impl Blocks,
+    hash: &bitcoin::BlockHash,
+) -> Result<Block, Error> {
     let block = chain.block(hash).await.map_err(Error::Chain)?;
     if block.block_hash() != *hash || !block.check_merkle_root() {
         return Err(Error::Chain(format!(

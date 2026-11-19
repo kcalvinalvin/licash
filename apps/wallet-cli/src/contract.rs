@@ -240,7 +240,9 @@ pub fn unprotected(wallet: &Wallet<Http>, path: &Path) -> anyhow::Result<Vec<Unp
         let tip = info.locks.as_ref().map_or(0, |l| l.height);
         let urls = wallet.hub_urls(&url)?;
         let here: Vec<Contract> = contracts.iter().filter(|c| c.at(&urls)).cloned().collect();
-        let covered: u64 = holder::coverage(wallet, dir(path), &here, tip)?.values().sum();
+        let covered: u64 = holder::coverage(wallet, dir(path), &here, tip)?
+            .values()
+            .sum();
         let one = Unprotected {
             hub: url,
             held,
@@ -388,7 +390,10 @@ pub async fn recoveries(
         Some(_) => {
             let chain = node(chain)?;
             let rate = crate::onchain::rate(&chain.0, fee_rate).await?;
-            if recovery::recoveries(dir(path))?.iter().any(|r| !r.stage.over()) {
+            if recovery::recoveries(dir(path))?
+                .iter()
+                .any(|r| !r.stage.over())
+            {
                 paying = fund(wallet, path, &chain, route, rate).await;
             }
             recovery::advance(wallet, &chain, dir(path), rate).await?
@@ -434,7 +439,9 @@ async fn fund(
         let amount = need.amount.to_sat().max(FEE_PAYOUT_FLOOR);
         match crate::payout::for_fees(wallet, route, amount, rate).await {
             Ok(payout) => {
-                if let Err(e) = recovery::expect_fee(dir(path), &need.id, need.purpose, &payout.hash) {
+                if let Err(e) =
+                    recovery::expect_fee(dir(path), &need.id, need.purpose, &payout.hash)
+                {
                     tracing::warn!(id, "a fee payout not recorded: {e:#}");
                 }
                 lines.push(format!(
