@@ -29,7 +29,9 @@ use licash::{
     crypto::{scalar_from_hash, tagged_hash},
     spend::{lock_hash, ProposalId},
 };
-use licash_api::{Code, DepositStatus, Depositing, Hex, Info, Receive, ReceiveState};
+use licash_api::{
+    CloseTerms, Code, DepositStatus, Depositing, Hex, Info, Receive, ReceiveState,
+};
 use licash_onchain::deposit::Htlc;
 use rand_core::{OsRng, RngCore};
 use rusqlite::{params, OptionalExtension, Row};
@@ -79,6 +81,17 @@ pub struct Deposit {
     pub lock: Option<String>,
     pub state: DepositState,
     pub created_at: i64,
+}
+
+/// A deposit that a contract's default close pays her reserve to
+/// ([`Wallet::close_deposit`]): its script, for her Base to commit to, and
+/// the fee the hub keeps of the reserve if it swaps it for notes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CloseDeposit {
+    /// Its hash, in hex.
+    pub hash: String,
+    pub script: ScriptBuf,
+    pub fee: u64,
 }
 
 /// Pay exactly `pays` to `address`, confirmed by block `fund_by`: the
@@ -148,7 +161,7 @@ impl<T: Transport> Wallet<T> {
             )));
         }
         let number = self.deposit_number(hub, &url, &info).await?;
-        let asked = self.draw_deposit(&url, &info, amount, number)?;
+        let asked = self.draw_deposit(&url, &info, amount, number, None)?;
         self.store.write(|tx| asked.keep(tx, hub))?;
         tracing::info!(hash = %hex::encode(asked.hash), %url, amount, "asking for a deposit");
         self.advance_deposit(&asked.hash).await
@@ -176,7 +189,57 @@ impl<T: Transport> Wallet<T> {
                     "hub {url} takes no deposit paid {pays} sat exactly, its fee in it"
                 ))
             })?;
-        self.deposit_answered(hub, &info, amount).await
+        self.deposit_answered(hub, &info, amount, None).await
+    }
+
+    /// Ask the hub at `url` for the deposit that a contract's default close
+    /// pays her reserve to, `pays` sat, to time out at block `timeout`
+    /// where the contract's Base puts it: the notes it locks the most that
+    /// payment covers, the rest, `fee`, the hub's if it swaps. Recorded only
+    /// with the terms its hub answered, checked. The wallet asks for its
+    /// lock, and claims the notes, once the close is paid
+    /// ([`Wallet::follow_deposit`]); else takes the coins back after the
+    /// timeout ([`Wallet::deposits_to_refund`]).
+    pub async fn close_deposit(
+        &self,
+        url: &str,
+        pays: u64,
+        timeout: u32,
+    ) -> Result<CloseDeposit, Error> {
+        let url = hub_url(url)?;
+        self.not_visited(&url)?;
+        let (hub, info) = self.refresh(&url).await?;
+        let deposits = info
+            .deposits
+            .as_ref()
+            .ok_or_else(|| Error::Invalid(format!("hub {url} takes no deposits")))?;
+        let amount = deposits
+            .most_for(pays)
+            .filter(|a| (deposits.min..=deposits.max).contains(a))
+            .ok_or_else(|| {
+                Error::Invalid(format!(
+                    "hub {url} takes no deposit of the notes {pays} sat pays for"
+                ))
+            })?;
+        let close = CloseTerms { pays, timeout };
+        let deposit = self.deposit_answered(hub, &info, amount, Some(close)).await?;
+        let network = licash_onchain::network(self.network());
+        let script = deposit
+            .terms
+            .as_ref()
+            .and_then(|t| {
+                t.address
+                    .parse::<bitcoin::Address<bitcoin::address::NetworkUnchecked>>()
+                    .ok()
+                    .and_then(|a| a.require_network(network).ok())
+            })
+            .map(|a| a.script_pubkey())
+            .ok_or_else(|| Error::Invalid(format!("hub {url} named no address to pay")))?;
+        Ok(CloseDeposit {
+            hash: deposit.hash,
+            script,
+            fee: pays - amount,
+        })
     }
 
     /// Give up the deposit of `hash`, answered but never to be paid: the
@@ -212,15 +275,16 @@ impl<T: Transport> Wallet<T> {
         hub: i64,
         info: &Info,
         amount: u64,
+        close: Option<CloseTerms>,
     ) -> Result<Deposit, Error> {
         let url = self.reached(hub)?;
         let number = self.deposit_number(hub, &url, info).await?;
-        let asked = self.draw_deposit(&url, info, amount, number)?;
+        let asked = self.draw_deposit(&url, info, amount, number, close)?;
         let hash = asked.hash;
         tracing::info!(hash = %hex::encode(hash), %url, amount, "asking for a deposit");
         let terms: Depositing = self.post(&url, licash_api::DEPOSIT, &asked.body).await?;
         let htlc = self
-            .check_terms(&url, &hash, &asked.refund_key, amount, &terms)
+            .check_terms(&url, &hash, &asked.refund_key, amount, close, &terms)
             .await?;
         let network = licash_onchain::network(self.network());
         self.store.write(|tx| {
@@ -261,6 +325,7 @@ impl<T: Transport> Wallet<T> {
         info: &Info,
         amount: u64,
         number: u32,
+        close: Option<CloseTerms>,
     ) -> Result<Asked, Error> {
         let keysets = info.keysets().map_err(|p| unavailable(url, p))?;
         let address = info.address.to_bytes();
@@ -277,6 +342,7 @@ impl<T: Transport> Wallet<T> {
         let body = licash_api::Deposit {
             receive: Receive::new(keyset.id(), &ephemeral.public(), &outputs, &hash),
             refund: Hex(x_only(&refund_key).serialize().to_vec()),
+            close,
         };
         Ok(Asked {
             hash,
@@ -552,8 +618,8 @@ impl<T: Transport> Wallet<T> {
         if !open {
             return Ok(());
         }
+        let body: licash_api::Deposit = serde_json::from_str(&body).map_err(invalid)?;
         if !answered {
-            let body: licash_api::Deposit = serde_json::from_str(&body).map_err(invalid)?;
             let asked = self
                 .post::<Depositing>(&url, licash_api::DEPOSIT, &body)
                 .await;
@@ -567,7 +633,7 @@ impl<T: Transport> Wallet<T> {
             };
             let refund = SecretKey::from_slice(&refund_key).map_err(invalid)?;
             let htlc = match self
-                .check_terms(&url, hash, &refund, amount as u64, &terms)
+                .check_terms(&url, hash, &refund, amount as u64, body.close, &terms)
                 .await
             {
                 Ok(htlc) => htlc,
@@ -595,7 +661,16 @@ impl<T: Transport> Wallet<T> {
         }
         let lock = status.status.lock().map_err(|p| unavailable(&url, p))?;
         let lock: ProposalId = match (status.status.state, lock) {
-            (ReceiveState::Open, _) => return Ok(()),
+            (ReceiveState::Open, _) => {
+                // A contract's close is locked when the wallet asks, now it
+                // is back and its payment seen, not at the block it was
+                // paid in.
+                if body.close.is_some() && status.funding.is_some() {
+                    self.post::<DepositStatus>(&url, &licash_api::deposit_lock(hash), &())
+                        .await?;
+                }
+                return Ok(());
+            }
             (ReceiveState::Canceled, _) => {
                 return self.cancel_deposit(hash, "canceled by its hub");
             }
@@ -652,6 +727,7 @@ impl<T: Transport> Wallet<T> {
         hash: &[u8; 32],
         refund: &SecretKey,
         amount: u64,
+        close: Option<CloseTerms>,
         terms: &Depositing,
     ) -> Result<Htlc, Error> {
         let (_, info) = self.refresh(url).await?;
@@ -678,17 +754,36 @@ impl<T: Transport> Wallet<T> {
         if address.is_none_or(|a| a.script_pubkey() != htlc.script_pubkey()) {
             return Err(wrong(format!("at {}, not its terms", terms.address)));
         }
-        if deposits.pays(amount) != Some(terms.amount) {
-            return Err(wrong(format!("of {} for {amount}", terms.amount)));
-        }
-        let latest = height
-            .saturating_add(deposits.timeout)
-            .saturating_add(TIP_MARGIN);
-        if terms.timeout > latest || terms.fund_by.saturating_add(deposits.depth) > terms.timeout {
-            return Err(wrong(format!(
-                "timing out at block {}, paid by {}",
-                terms.timeout, terms.fund_by
-            )));
+        match close {
+            // Her contract's reserve exactly, for the most notes it covers,
+            // timing out where her Base says.
+            Some(close) => {
+                if terms.amount != close.pays
+                    || deposits.most_for(close.pays) != Some(amount)
+                    || terms.timeout != close.timeout
+                {
+                    return Err(wrong(format!(
+                        "of {} timing out at block {}, not as her contract's close",
+                        terms.amount, terms.timeout
+                    )));
+                }
+            }
+            None => {
+                if deposits.pays(amount) != Some(terms.amount) {
+                    return Err(wrong(format!("of {} for {amount}", terms.amount)));
+                }
+                let latest = height
+                    .saturating_add(deposits.timeout)
+                    .saturating_add(TIP_MARGIN);
+                if terms.timeout > latest
+                    || terms.fund_by.saturating_add(deposits.depth) > terms.timeout
+                {
+                    return Err(wrong(format!(
+                        "timing out at block {}, paid by {}",
+                        terms.timeout, terms.fund_by
+                    )));
+                }
+            }
         }
         Ok(htlc)
     }

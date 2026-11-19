@@ -1407,7 +1407,7 @@ impl<T: Transport> Wallet<T> {
                 offer.max
             )));
         }
-        let deposit = self.deposit_answered(hub, &info, amount).await?;
+        let deposit = self.deposit_answered(hub, &info, amount, None).await?;
         let terms = match (&deposit.state, &deposit.terms) {
             (DepositState::Open, Some(terms)) => terms,
             (state, _) => {
