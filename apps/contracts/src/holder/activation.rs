@@ -115,8 +115,16 @@ async fn step<T: Transport, C: Chain>(
     if let Some(at) = o.activated_at {
         let claim = wallet.owed_claim(&o.id, &o.keyset)?.context("not owed")?;
         let (record, _) = claim.activation.as_ref().context("no activation")?;
-        let hash = chain.hash(at).await.map_err(|e| anyhow!(e))?;
-        if hash.to_byte_array() != record.reference.block_hash {
+        // Above the tip, as a chain shorter than the one replaced may
+        // be: its block in none.
+        let stands = at <= tip
+            && chain
+                .hash(at)
+                .await
+                .map_err(|e| anyhow!(e))?
+                .to_byte_array()
+                == record.reference.block_hash;
+        if !stands {
             wallet.record_activation(&o.id, None)?;
             return Ok(Some("forgotten"));
         }

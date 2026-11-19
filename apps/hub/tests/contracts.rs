@@ -2187,6 +2187,129 @@ async fn a_force_close_claims_a_lock_paying_her_once_activated_at_depth() -> Res
     Ok(())
 }
 
+/// His activation's block replaced, the chain shorter for a while: the
+/// activation forgotten, then found again in the block that holds it now,
+/// and his forced close claims the lock with that one.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs bitcoind and a release build"]
+async fn an_activation_whose_block_leaves_the_chain_is_found_again_and_claimed() -> Result<()> {
+    use bitcoincore_rpc::RpcApi as _;
+    use licash_contracts::holder::recovery::{self, Stage};
+    use licash_contracts::holder::{activation, exit};
+
+    let rt = Regtest::start_standard()?;
+    let dir = tempfile::tempdir()?;
+    let at = dir.path().join("hub");
+    let range = Range {
+        max_cap: 50_000_000,
+        max_blocks: 5_000,
+        per_coin: 2,
+        ppm_year: 10_000,
+    };
+    let (url, source, hub, openings) = hub_answering_with(&rt, &at, Some(range)).await?;
+    licash_hub_service::open_on_lock_checkpoints(&openings, hub.clone());
+    while !watch::step(&hub, &source).await? {}
+    let chain = Node(source.clone());
+    let rate = bitcoin::FeeRate::from_sat_per_vb(2).context("a rate")?;
+    let (mine, bob) = holder_wallet_over(
+        &rt,
+        &chain,
+        &dir.path().join("bob"),
+        &url,
+        [18; 32],
+        &[60_000, 50_000],
+        NoSettle(Http::new(None)?),
+    )
+    .await?;
+    let chosen = Ask {
+        cap: Some(10_000),
+        blocks: 1_000,
+        ..ask()
+    };
+    let opened = holder::open(&bob, &chain, &mine, &url, chosen).await?;
+    let payment = pay(&hub, &at.join("seed"), &url, &bob.address(), 2_048)?;
+    bob.receive(&payment)?;
+    rt.mine(1)?;
+    holder::resume(&bob, &chain, &mine).await?;
+
+    let (_, alice) = holder_wallet(&rt, &chain, dir.path(), &url, [17; 32], &[]).await?;
+    for _ in 0..2 {
+        let payment = pay(&hub, &at.join("seed"), &url, &alice.address(), 2_048)?;
+        alice.receive(&payment)?;
+    }
+    while !watch::step(&hub, &source).await? {}
+    let preimage = [9; 32];
+    let expiry = rt.height()? + 40;
+    let lock = (alice.lock(
+        &url,
+        &bob.address(),
+        1_000,
+        licash::spend::lock_hash(&preimage),
+        Some(expiry),
+    ))
+    .await?;
+    ensure!(lock.state == licash_wallet::LockState::Locked, "{lock:?}");
+    ensure!(bob.claim(&url, &lock.id, &preimage).await.is_err());
+    let depth = bob.owed_locks()?[0].depth;
+
+    let lead = activation::lead(ChainProfile::Core30DefaultRegtest);
+    rt.mine_to_height(expiry - lead)?;
+    let kept = activation::keep(&bob, &chain, &mine, rate).await?;
+    ensure!(kept.len() == 1 && kept[0].step == "activated", "{kept:?}");
+    rt.mine(1)?;
+    let kept = activation::keep(&bob, &chain, &mine, rate).await?;
+    ensure!(kept.len() == 1 && kept[0].step == "confirmed", "{kept:?}");
+    let first = (bob.owed_locks()?[0].activated_at).context("not recorded")?;
+
+    // Its block replaced, nothing yet in its place: forgotten, not an
+    // error, and still what only this contract's forced close claims.
+    let replaced = rt.rpc.get_block_hash(u64::from(first))?;
+    rt.rpc.invalidate_block(&replaced)?;
+    ensure!(rt.height()? == first - 1);
+    let kept = activation::keep(&bob, &chain, &mine, rate).await?;
+    ensure!(kept.len() == 1 && kept[0].step == "forgotten", "{kept:?}");
+    ensure!(bob.owed_locks()?[0].activated_at.is_none());
+    let exits = exit::drive(&bob, &chain, &mine, &NoProvider, 144, rate).await?;
+    ensure!(
+        exits.len() == 1 && exits[0].owed > 0 && exits[0].owed <= 1_000,
+        "{exits:?}"
+    );
+    // A block of none of it, then one of it: found again there.
+    rt.mine_with(&[])?;
+    let kept = activation::keep(&bob, &chain, &mine, rate).await?;
+    ensure!(kept.iter().all(|k| k.error.is_none()), "{kept:?}");
+    ensure!(bob.owed_locks()?[0].activated_at.is_none());
+    rt.mine(1)?;
+    let kept = activation::keep(&bob, &chain, &mine, rate).await?;
+    ensure!(kept.len() == 1 && kept[0].step == "confirmed", "{kept:?}");
+    let again = (bob.owed_locks()?[0].activated_at).context("not found again")?;
+    ensure!(again == first + 1 && again < expiry, "{first} then {again}");
+    let kept = activation::keep(&bob, &chain, &mine, rate).await?;
+    ensure!(kept.is_empty(), "{kept:?}");
+
+    rt.mine_to_height(expiry.max(again + depth) + 1)?;
+    while !watch::step(&hub, &source).await? {}
+    let forced = recovery::force_close(&bob, &chain, &mine, &opened.id, rate).await?;
+    let paid = forced.claimed - 2_048;
+    ensure!(forced.notes == 1 && paid > 0 && paid <= 1_000, "{forced:?}");
+    let mut done = None;
+    for _ in 0..800 {
+        rt.mine(1)?;
+        while !watch::step(&hub, &source).await? {}
+        let round = openings.answer_requests().await?;
+        ensure!(round.failed == 0, "{round:?}");
+        let r = recovery::advance(&bob, &chain, &mine, rate).await?[0].clone();
+        ensure!(r.stage != Stage::Lost, "{r:?}");
+        if r.stage == Stage::Done {
+            done = Some(r);
+            break;
+        }
+    }
+    let done = done.context("never paid")?;
+    ensure!(done.payout.is_some(), "{done:?}");
+    Ok(())
+}
+
 /// A hub whose ledger follows the chain, its scan stopped before her
 /// request, still meets a claim of no lock with the spend it holds: only
 /// a claim of a lock waits for the scan of its block.

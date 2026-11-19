@@ -45,6 +45,7 @@ tracing-subscriber.workspace = true
 fake = ["licash-lightning/fake"]
 
 [dev-dependencies]
+bitcoincore-rpc = "0.19"
 licash-dashboard = { workspace = true, features = ["test-support"] }
 licash-hub-service = { path = ".", features = ["fake"] }
 licash-contracts = { path = "../contracts", features = ["faults"] }
