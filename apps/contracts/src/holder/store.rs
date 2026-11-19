@@ -5,7 +5,7 @@
 //!
 //! The file's version tells which of its tables a build must know to
 //! read it right. The `ceilings`, `claim_terms`, `folds`, `exit_consent`,
-//! `exit_payouts` and `fate_blocks` are none of them: each
+//! `exit_payouts`, `fate_blocks` and `recovery_tips` are none of them: each
 //! made with the first kept, whatever the version, and ignored by a build
 //! before them, which opens the file all the same. A migration to come
 //! must make them `IF NOT EXISTS` too.
@@ -118,6 +118,20 @@ CREATE TABLE IF NOT EXISTS folds (
     id BLOB PRIMARY KEY REFERENCES contracts (id),
     txid BLOB NOT NULL,
     created_at INTEGER NOT NULL
+) STRICT;
+";
+
+/// The tips each recovery saw from her publication on: a height and hash
+/// each, thinned to about one per power of two blocks back, the newest
+/// and the first kept. One whose block the chain no longer has tells what
+/// it saw since may be gone ([`Store::recovery_tips`]). None, as of a
+/// build before it, proves nothing. Made with the first.
+const RECOVERY_TIPS: &str = "
+CREATE TABLE IF NOT EXISTS recovery_tips (
+    id BLOB NOT NULL REFERENCES contracts (id),
+    height INTEGER NOT NULL,
+    hash BLOB NOT NULL,
+    PRIMARY KEY (id, height)
 ) STRICT;
 ";
 
@@ -868,6 +882,85 @@ impl Store {
         Ok(dropped == 1)
     }
 
+    /// The tips recovery `id` saw, each its height and hash, the newest
+    /// first ([`RECOVERY_TIPS`]).
+    pub fn recovery_tips(&self, id: &[u8; 32]) -> Result<Vec<(u32, BlockHash)>> {
+        if !self.has("recovery_tips")? {
+            return Ok(Vec::new());
+        }
+        let mut q = self
+            .c
+            .prepare("SELECT height, hash FROM recovery_tips WHERE id = ?1 ORDER BY height DESC")?;
+        let rows = q.query_map([id], |r| {
+            Ok((r.get::<_, u32>(0)?, r.get::<_, [u8; 32]>(1)?))
+        })?;
+        rows.map(|row| {
+            let (height, hash) = row?;
+            Ok((
+                height,
+                <BlockHash as bitcoin::hashes::Hash>::from_byte_array(hash),
+            ))
+        })
+        .collect()
+    }
+
+    /// Recovery `id` saw `hash` at the tip, `height`: kept, those below
+    /// thinned out to the lowest of each power of two blocks back, so that
+    /// the first stays. Not kept should one at or above it be: what that
+    /// one shows of the chain stays to be looked at.
+    pub fn see_recovery_tip(&self, id: &[u8; 32], height: u32, hash: BlockHash) -> Result<()> {
+        let t = rusqlite::Transaction::new_unchecked(&self.c, TransactionBehavior::Immediate)?;
+        t.execute_batch(RECOVERY_TIPS)?;
+        let higher: Option<i64> = t
+            .query_row(
+                "SELECT 1 FROM recovery_tips WHERE id = ?1 AND height >= ?2",
+                params![id, height],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if higher.is_some() {
+            return Ok(());
+        }
+        t.execute(
+            "INSERT INTO recovery_tips (id, height, hash) VALUES (?1, ?2, ?3)",
+            params![
+                id,
+                height,
+                <BlockHash as bitcoin::hashes::Hash>::to_byte_array(hash)
+            ],
+        )?;
+        let heights: Vec<u32> = t
+            .prepare("SELECT height FROM recovery_tips WHERE id = ?1 ORDER BY height")?
+            .query_map([id], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut last = None;
+        for h in heights {
+            let back = u64::from(height - h) + 1;
+            let band = u64::BITS - back.leading_zeros();
+            if last == Some(band) {
+                t.execute(
+                    "DELETE FROM recovery_tips WHERE id = ?1 AND height = ?2",
+                    params![id, h],
+                )?;
+            }
+            last = Some(band);
+        }
+        t.commit()?;
+        Ok(())
+    }
+
+    /// The tips recovery `id` saw above `height` forgotten: of a chain
+    /// replaced since.
+    pub fn forget_recovery_tips(&self, id: &[u8; 32], height: u32) -> Result<()> {
+        if self.has("recovery_tips")? {
+            self.c.execute(
+                "DELETE FROM recovery_tips WHERE id = ?1 AND height > ?2",
+                params![id, height],
+            )?;
+        }
+        Ok(())
+    }
+
     /// Recovery `id`, if she forced it closed.
     pub fn recovery(&self, id: &[u8; 32]) -> Result<Option<RecoveryRow>> {
         Ok(self.recoveries()?.into_iter().find(|r| &r.id == id))
@@ -1280,6 +1373,46 @@ mod tests {
         drop(c);
         let refused = Store::open(dir.path()).err().unwrap();
         assert!(format!("{refused:#}").contains("version 3"), "{refused:#}");
+    }
+
+    #[test]
+    fn a_recovery_keeps_the_tips_it_saw_thinned_out_and_none_past_one_higher() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store.insert(&new(1, coin(0))).unwrap();
+        let id = [1; 32];
+        // None kept, as of a build before: no table, nothing forgotten.
+        assert!(store.recovery_tips(&id).unwrap().is_empty());
+        store.forget_recovery_tips(&id, 0).unwrap();
+        let hash = |h: u32| <BlockHash as bitcoin::hashes::Hash>::hash(&h.to_le_bytes());
+        for h in 100..=200 {
+            store.see_recovery_tip(&id, h, hash(h)).unwrap();
+        }
+        let heights: Vec<u32> = (store.recovery_tips(&id).unwrap().iter())
+            .map(|&(h, _)| h)
+            .collect();
+        assert_eq!(heights, [200, 198, 196, 188, 180, 164, 100]);
+        assert!(store
+            .recovery_tips(&id)
+            .unwrap()
+            .iter()
+            .all(|&(h, b)| b == hash(h)));
+        // The tip seen again, of another block, or one lower: the one kept
+        // stays, to tell the chain was replaced.
+        store.see_recovery_tip(&id, 200, hash(0)).unwrap();
+        store.see_recovery_tip(&id, 199, hash(0)).unwrap();
+        assert_eq!(
+            store.recovery_tips(&id).unwrap()[..2],
+            [(200, hash(200)), (198, hash(198))]
+        );
+        store.forget_recovery_tips(&id, 190).unwrap();
+        let heights: Vec<u32> = (store.recovery_tips(&id).unwrap().iter())
+            .map(|&(h, _)| h)
+            .collect();
+        assert_eq!(heights, [188, 180, 164, 100]);
+        store.see_recovery_tip(&id, 191, hash(191)).unwrap();
+        // Of another recovery: none of its.
+        assert!(store.recovery_tips(&[2; 32]).unwrap().is_empty());
     }
 
     #[test]

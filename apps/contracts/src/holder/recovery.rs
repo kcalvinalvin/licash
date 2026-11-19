@@ -542,6 +542,24 @@ impl<'a, T: Transport, C: Chain> Run<'a, T, C> {
             ensure!(stage != Stage::GivingUp, "given up");
             let mut state = State::decode(&row)?;
             let tip = self.chain.height().await.map_err(|e| anyhow!(e))?;
+            if let Some(stood) = self.reorganized(stage, tip).await? {
+                let to = rewind(stage, &mut state, stood);
+                tracing::warn!(
+                    id = %crate::hex_id(&self.id), stood, from = stage.as_str(), to = to.as_str(),
+                    "blocks she saw left the chain: what she saw in them found again"
+                );
+                if !self.store.save_recovery(
+                    &self.id,
+                    (stage.as_str(), &row.state),
+                    to.as_str(),
+                    true,
+                    &state.encode(),
+                )? {
+                    return self.outrun();
+                }
+                self.store.forget_recovery_tips(&self.id, stood)?;
+                continue;
+            }
             self.hold_challenge_coin(stage, &state)?;
             let next = match stage {
                 Stage::Claiming => self.claim(&mut state, tip).await?,
@@ -592,6 +610,40 @@ impl<'a, T: Transport, C: Chain> Run<'a, T, C> {
             self.wallet.unclaim_notes(&self.id)?;
         }
         Ok(())
+    }
+    /// Whether blocks she saw since she published left the chain: the
+    /// height of the newest she saw that stands, if so. Each round the tip
+    /// she sees is kept ([`Store::see_recovery_tip`]), the first once she
+    /// published ([`watched`]); none kept, as of a build before, tells
+    /// nothing. Should none she kept stand, the oldest is taken to be the
+    /// last that did. A tip lower than one she saw is no sign yet: looked
+    /// at again once the chain is as long.
+    async fn reorganized(&self, stage: Stage, tip: u32) -> Result<Option<u32>> {
+        if !watched(stage) {
+            return Ok(None);
+        }
+        // Read before the others: a chain replaced meanwhile shows as one
+        // of them gone, never as a tip of it kept above them.
+        let at_tip = self.chain.hash(tip).await.map_err(|e| anyhow!(e))?;
+        let seen = self.store.recovery_tips(&self.id)?;
+        let mut gone = false;
+        for &(height, hash) in &seen {
+            if height > tip {
+                continue;
+            }
+            if self.chain.hash(height).await.map_err(|e| anyhow!(e))? == hash {
+                if gone {
+                    return Ok(Some(height));
+                }
+                break;
+            }
+            gone = true;
+        }
+        if gone {
+            return Ok(seen.last().map(|(height, _)| height.saturating_sub(1)));
+        }
+        self.store.see_recovery_tip(&self.id, tip, at_tip)?;
+        Ok(None)
     }
     fn trouble(&self, why: String) {
         tracing::warn!(id = %crate::hex_id(&self.id), "recovering a contract: {why}");
@@ -1260,6 +1312,91 @@ fn rung(start: u32, end: u32, tip: u32) -> u32 {
     (gone * 4 / len).min(3) as u32
 }
 
+/// Her recovery at `stage` taken back to what blocks up to `stood` show,
+/// those above it replaced: what she saw in a block above it forgotten
+/// (each link the hub or she posted, from the first, and all after it),
+/// the stage that watches for the first of them again, and her scan from
+/// the block after `stood` at the latest. What she signed or revealed is
+/// kept, to be posted again as it was: her request and publication, her
+/// challenge and its child, her sweep.
+fn rewind(stage: Stage, state: &mut State, stood: u32) -> Stage {
+    let gone = |height: Option<u32>| height.is_some_and(|h| h > stood);
+    state.from = state.from.map(|from| from.min(stood.saturating_add(1)));
+    let (to, first) = if gone(state.r_height) {
+        (Stage::Published, 0)
+    } else if gone(state.p_height) || state.reclaimed {
+        // The hub's reclaim, its height not kept: found again too.
+        (Stage::Published, 1)
+    } else if gone(state.response_height) {
+        (Stage::Requested, 2)
+    } else if gone(state.assertion_height) {
+        (Stage::Answered, 3)
+    } else if gone(state.challenge_height) {
+        (Stage::Asserted, 4)
+    } else if gone(state.payout_height) {
+        let watching = if state.challenge_height.is_some() {
+            Stage::Challenged
+        } else if state.assertion_height.is_some() {
+            Stage::Asserted
+        } else if state.response_height.is_some() {
+            Stage::Answered
+        } else {
+            Stage::Requested
+        };
+        (watching, 5)
+    } else {
+        return stage;
+    };
+    if first == 0 {
+        state.r_height = None;
+    }
+    if first <= 1 {
+        state.p_height = None;
+        state.reclaimed = false;
+    }
+    if first <= 2 {
+        state.response = None;
+        state.response_height = None;
+        state.reduced = None;
+        state.deadline = None;
+    }
+    if first <= 3 {
+        state.assertion = None;
+        state.assertion_height = None;
+        state.verified = None;
+    }
+    if first <= 4 {
+        state.challenge_height = None;
+    }
+    state.payout = None;
+    state.payout_name = None;
+    state.payout_height = None;
+    state.swept_height = None;
+    state.next_at = None;
+    if first == 0 {
+        // Her request in no block now, nor any before the next: her
+        // publication's fee climbs again from there.
+        state.from = Some(stood.saturating_add(1));
+        state.next_at = Some(stood.saturating_add(1));
+    }
+    to
+}
+
+/// Whether her recovery at `stage` follows the tips it sees: from her
+/// publication's on, while not over, but while it is signed again.
+fn watched(stage: Stage) -> bool {
+    !matches!(
+        stage,
+        Stage::Claiming
+            | Stage::Claimed
+            | Stage::Irrevocable
+            | Stage::Signing
+            | Stage::GivingUp
+            | Stage::Done
+            | Stage::Lost
+    )
+}
+
 /// Let the recovery of contract `id` in `dir` pay `sats` in all for its
 /// publication's fees, more than its reserve holds: her call, once told it
 /// falls short, or before. Refused above what her contract holds, a typo
@@ -1462,10 +1599,15 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
             return Ok(Next::Save);
         }
         if stage == Stage::Asserted && state.verified == Some(false) {
-            let challenge = self.o.challenge(
-                &self.keys,
-                state.assertion.as_ref().context("no assertion")?,
-            )?;
+            // One made before, its assertion's block since replaced: the
+            // same again, never revealed anew.
+            let challenge = match state.challenge.take() {
+                Some(made) => made,
+                None => self.o.challenge(
+                    &self.keys,
+                    state.assertion.as_ref().context("no assertion")?,
+                )?,
+            };
             state.next_at = Some(height + blocks(challenge.input[0].sequence)?);
             state.challenge = Some(challenge);
             return Ok(Next::To(Stage::Challenging));
@@ -1856,6 +1998,7 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
     }
     fn sweep(&self, state: &mut State, tip: u32) -> Result<Next> {
         let payout = state.payout.as_ref().context("no payout")?;
+        let paid = payout.compute_txid();
         let height = state.payout_height.context("payout is unconfirmed")?;
         let name = state
             .payout_name
@@ -1928,7 +2071,11 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
         if tip.saturating_add(1) < due {
             return Ok(Next::Save);
         }
-        state.sweep = Some(sweep);
+        // One made before of the same payout, its block since replaced:
+        // the same again, as a block may hold it.
+        let made = (state.sweep.take())
+            .filter(|old| (old.input.iter()).any(|i| i.previous_output.txid == paid));
+        state.sweep = Some(made.unwrap_or(sweep));
         state.from = Some(height);
         state.next_at = None;
         Ok(Next::To(Stage::Sweeping))
@@ -2126,6 +2273,150 @@ mod tests {
             created_at: 0,
         };
         assert_eq!(State::decode(&row).unwrap().p_allowance, Some(40_000));
+    }
+    #[test]
+    fn a_rewind_forgets_what_she_saw_above_the_block_that_stood_and_keeps_what_she_signed() {
+        let tx = |n: u8| Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::from_consensus(u32::from(n)),
+            input: vec![],
+            output: vec![],
+        };
+        let paid = State {
+            r: Some(tx(1)),
+            r_height: Some(100),
+            p: Some(tx(2)),
+            p_height: Some(101),
+            response: Some(tx(3)),
+            response_height: Some(105),
+            reduced: Some(7),
+            deadline: Some(150),
+            assertion: Some(tx(4)),
+            assertion_height: Some(110),
+            verified: Some(false),
+            challenge: Some(tx(5)),
+            challenge_child: Some(tx(6)),
+            challenge_height: Some(115),
+            payout: Some(tx(7)),
+            payout_name: Some("failure".into()),
+            payout_height: Some(120),
+            sweep: Some(tx(8)),
+            from: Some(125),
+            next_at: Some(126),
+            ..State::default()
+        };
+        let signed = |s: &State| {
+            assert_eq!((&s.r, &s.p), (&paid.r, &paid.p));
+            assert_eq!(
+                (&s.challenge, &s.challenge_child),
+                (&paid.challenge, &paid.challenge_child)
+            );
+            assert_eq!(&s.sweep, &paid.sweep);
+        };
+        // All she saw stands: her scan only looks again from there.
+        let mut s = paid.clone();
+        assert_eq!(rewind(Stage::Sweeping, &mut s, 122), Stage::Sweeping);
+        assert_eq!(
+            (s.from, s.payout_height, s.next_at),
+            (Some(123), Some(120), Some(126))
+        );
+        // Its payout's block replaced: watched for again from its challenge.
+        let mut s = paid.clone();
+        assert_eq!(rewind(Stage::Sweeping, &mut s, 119), Stage::Challenged);
+        assert_eq!(
+            (&s.payout, &s.payout_name, s.payout_height),
+            (&None, &None, None)
+        );
+        assert_eq!(
+            (s.challenge_height, s.from, s.next_at),
+            (Some(115), Some(120), None)
+        );
+        signed(&s);
+        // Its challenge's: watched for from the assertion, kept to post.
+        let mut s = paid.clone();
+        assert_eq!(rewind(Stage::Sweeping, &mut s, 112), Stage::Asserted);
+        assert_eq!((s.challenge_height, s.assertion_height), (None, Some(110)));
+        signed(&s);
+        // The assertion's: what it verified to forgotten too.
+        let mut s = paid.clone();
+        assert_eq!(rewind(Stage::Challenged, &mut s, 107), Stage::Answered);
+        assert_eq!(
+            (&s.assertion, s.verified, s.response_height),
+            (&None, None, Some(105))
+        );
+        signed(&s);
+        // The answer's: what it said she is owed.
+        let mut s = paid.clone();
+        assert_eq!(rewind(Stage::Asserted, &mut s, 104), Stage::Requested);
+        assert_eq!(
+            (&s.response, s.reduced, s.deadline, s.p_height),
+            (&None, None, None, Some(101))
+        );
+        signed(&s);
+        // Her publication's, or her request's: published again.
+        let mut s = paid.clone();
+        assert_eq!(rewind(Stage::Answered, &mut s, 100), Stage::Published);
+        assert_eq!((s.r_height, s.p_height), (Some(100), None));
+        let mut s = State {
+            reclaimed: true,
+            ..paid.clone()
+        };
+        assert_eq!(rewind(Stage::Requested, &mut s, 99), Stage::Published);
+        assert_eq!((s.r_height, s.reclaimed, s.from), (None, false, Some(100)));
+        assert_eq!(s.next_at, Some(100));
+        signed(&s);
+        // Her slot reclaimed, at a height not kept: found again however
+        // little was replaced.
+        let mut s = State {
+            reclaimed: true,
+            p_height: None,
+            ..paid.clone()
+        };
+        assert_eq!(rewind(Stage::Asserted, &mut s, 130), Stage::Published);
+        assert_eq!(
+            (s.r_height, s.reclaimed, s.next_at),
+            (Some(100), false, None)
+        );
+        // Her request's own block replaced, her scan not started: from the
+        // block after the one that stood, not from F.
+        let mut s = State {
+            from: None,
+            ..paid.clone()
+        };
+        assert_eq!(rewind(Stage::Requested, &mut s, 90), Stage::Published);
+        assert_eq!((s.from, s.next_at), (Some(91), Some(91)));
+        // Paid with no answer: watched for from her request.
+        let mut s = State {
+            r: Some(tx(1)),
+            r_height: Some(100),
+            p_height: Some(101),
+            payout: Some(tx(7)),
+            payout_name: Some("request_timeout".into()),
+            payout_height: Some(120),
+            ..State::default()
+        };
+        assert_eq!(rewind(Stage::TimedOut, &mut s, 110), Stage::Requested);
+        assert_eq!((s.payout_height, s.from), (None, None));
+    }
+    #[test]
+    fn only_a_recovery_published_and_not_over_follows_its_tips() {
+        let follows: Vec<_> = (Stage::ALL.into_iter()).filter(|&s| watched(s)).collect();
+        assert_eq!(
+            follows,
+            [
+                Stage::Published,
+                Stage::Requested,
+                Stage::TimingOut,
+                Stage::TimedOut,
+                Stage::Sweeping,
+                Stage::Answered,
+                Stage::Asserted,
+                Stage::Succeeding,
+                Stage::Challenging,
+                Stage::Challenged,
+                Stage::Paid,
+            ]
+        );
     }
     #[test]
     fn a_publication_climbs_a_rung_a_quarter_of_its_window() {

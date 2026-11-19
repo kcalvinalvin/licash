@@ -16,6 +16,8 @@ impl Transport for Offline {
 struct Ledger {
     blocks: Mutex<BTreeMap<u32, Block>>,
     sent: Mutex<Vec<Transaction>>,
+    /// Told apart, the blocks of each branch.
+    branch: std::sync::atomic::AtomicU32,
 }
 impl Ledger {
     fn new() -> Self {
@@ -25,7 +27,14 @@ impl Ledger {
                 bitcoin::blockdata::constants::genesis_block(Network::Regtest),
             )])),
             sent: Mutex::new(vec![]),
+            branch: Default::default(),
         }
+    }
+    /// The blocks above `height` replaced by none, for others to be mined.
+    fn reorg(&self, height: u32) {
+        self.blocks.lock().unwrap().retain(|&h, _| h <= height);
+        self.branch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
     fn mine(&self, tx: Option<Transaction>) -> u32 {
         let mut blocks = self.blocks.lock().unwrap();
@@ -43,6 +52,7 @@ impl Ledger {
             header: block::Header {
                 prev_blockhash: previous.block_hash(),
                 time: previous.header.time + 600,
+                nonce: self.branch.load(std::sync::atomic::Ordering::SeqCst),
                 ..previous.header
             },
             txdata: vec![tx],
@@ -95,7 +105,7 @@ impl Chain for Ledger {
     }
 }
 
-async fn lifecycle(amount: u32, altered: bool, answer: bool) {
+async fn lifecycle(amount: u32, altered: bool, answer: bool, reorged: bool) {
     use super::super::store::New;
     let dir = tempfile::tempdir().unwrap();
     let wallet = Wallet::create(
@@ -188,7 +198,7 @@ async fn lifecycle(amount: u32, altered: bool, answer: bool) {
         witness[1] = vec![];
         mined.input[0].witness = Witness::from_slice(&witness);
     }
-    let asserted_at = chain.mine(Some(mined));
+    let asserted_at = chain.mine(Some(mined.clone()));
     let progressed = advance(&wallet, &chain, dir.path(), rate).await.unwrap();
     let observed = State::decode(&store.recovery(&id).unwrap().unwrap()).unwrap();
     assert_eq!(observed.verified, Some(!altered));
@@ -208,10 +218,26 @@ async fn lifecycle(amount: u32, altered: bool, answer: bool) {
         "retry must not select a different assertion or amount"
     );
     let paid_at = if altered {
-        let challenge = chain.last();
-        let challenged_at = chain.mine(Some(challenge.clone()));
+        let challenge = observed_challenge(&store, &id);
+        let mut challenged_at = chain.mine(Some(challenge.clone()));
         let progressed = advance(&wallet, &chain, dir.path(), rate).await.unwrap();
         assert_eq!(progressed[0].stage, Stage::Challenged, "{progressed:?}");
+        if reorged {
+            // The assertion's block and her challenge's replaced, the
+            // assertion in a later one: her challenge the same again,
+            // nothing revealed anew.
+            let tip = chain.blocks.lock().unwrap().len() as u32 - 1;
+            chain.reorg(asserted_at - 1);
+            chain.mine(None);
+            chain.mine(Some(mined.clone()));
+            chain.to(tip);
+            let progressed = advance(&wallet, &chain, dir.path(), rate).await.unwrap();
+            assert_eq!(progressed[0].stage, Stage::Challenging, "{progressed:?}");
+            assert_eq!(observed_challenge(&store, &id), challenge);
+            challenged_at = chain.mine(Some(challenge.clone()));
+            let progressed = advance(&wallet, &chain, dir.path(), rate).await.unwrap();
+            assert_eq!(progressed[0].stage, Stage::Challenged, "{progressed:?}");
+        }
         if answer {
             // Pi2/Pi3 are not signed. Even if a miner alters them, the hub
             // retains its original proof and can answer the challenge.
@@ -257,6 +283,29 @@ async fn lifecycle(amount: u32, altered: bool, answer: bool) {
         assert_eq!(progressed[0].stage, Stage::Sweeping, "{progressed:?}");
     }
     let sweep = chain.last();
+    if reorged {
+        // The payout's block replaced, the payout in a later one: found
+        // there again, and the same sweep posted.
+        let pinned = State::decode(&store.recovery(&id).unwrap().unwrap()).unwrap();
+        assert_eq!(pinned.sweep.as_ref(), Some(&sweep));
+        let payout = pinned.payout.clone().unwrap();
+        let tip = chain.blocks.lock().unwrap().len() as u32 - 1;
+        chain.reorg(paid_at - 1);
+        chain.mine(None);
+        let again = chain.mine(Some(payout.clone()));
+        // As long as the chain she saw, at least: no sign till then.
+        chain.to(tip);
+        let mut progressed = advance(&wallet, &chain, dir.path(), rate).await.unwrap();
+        let state = State::decode(&store.recovery(&id).unwrap().unwrap()).unwrap();
+        assert_eq!(state.payout_height, Some(again), "{progressed:?}");
+        assert_eq!(state.payout, Some(payout));
+        if progressed[0].stage != Stage::Sweeping {
+            chain.to(progressed[0].next_at.unwrap() - 1);
+            progressed = advance(&wallet, &chain, dir.path(), rate).await.unwrap();
+        }
+        assert_eq!(progressed[0].stage, Stage::Sweeping, "{progressed:?}");
+        assert_eq!(chain.last(), sweep);
+    }
     assert!(sweep.output[0].value >= sweep.output[0].script_pubkey.minimal_non_dust());
     let received = sweep.output[0].value.to_sat();
     chain.mine(Some(sweep));
@@ -273,21 +322,33 @@ async fn lifecycle(amount: u32, altered: bool, answer: bool) {
     );
 }
 
+fn observed_challenge(store: &Store, id: &[u8; 32]) -> Transaction {
+    State::decode(&store.recovery(id).unwrap().unwrap())
+        .unwrap()
+        .challenge
+        .unwrap()
+}
+
 #[tokio::test]
 async fn hub_receipts_collect_the_selected_amount_including_zero() {
-    lifecycle(0, false, false).await;
-    lifecycle(4096, false, false).await;
+    lifecycle(0, false, false, false).await;
+    lifecycle(4096, false, false, false).await;
 }
 #[tokio::test]
 async fn an_invalid_assertion_pays_the_claim_when_no_answer_arrives() {
-    lifecycle(15, true, false).await;
+    lifecycle(15, true, false, false).await;
+}
+#[tokio::test]
+async fn a_payout_whose_block_leaves_the_chain_is_found_again_and_swept_alike() {
+    lifecycle(4096, false, false, true).await;
+    lifecycle(15, true, false, true).await;
 }
 #[tokio::test]
 #[ignore = "reconstructs garbled instances; run in release mode"]
 async fn a_retained_hub_receipt_answers_a_challenge_and_collects() {
     // Not 15: corrected to that, her payout rounds down to no output of
     // hers, nothing to collect.
-    lifecycle(4096, true, true).await;
+    lifecycle(4096, true, true, false).await;
 }
 
 fn signed() -> (Opening, HolderKeys) {
