@@ -27,6 +27,7 @@ import org.licash.core.ContractQuote
 import org.licash.core.ContractState
 import org.licash.core.Holding
 import org.licash.core.Notes
+import org.licash.core.contractLeastCoin
 import org.licash.core.contractMaxCap
 import org.licash.wallet.Engine
 import org.licash.wallet.Ui
@@ -199,7 +200,12 @@ internal fun HubPage(
             ChooseSheet(
                 q,
                 range,
-                q.coins.filter { contractMaxCap(range, it.value) != null },
+                // The least size takes any coin that pays its price, as its hub
+                // holds it ([contractMaxCap] has none for a coin under half of it).
+                q.coins.filter {
+                    contractMaxCap(range, it.value) != null ||
+                        contractLeastCoin(range, range.minCap, range.minBlocks, 0uL) <= it.value
+                },
                 open = { chosen, price ->
                     quote = null
                     engine.openContract(q.hub, price, chosen)
