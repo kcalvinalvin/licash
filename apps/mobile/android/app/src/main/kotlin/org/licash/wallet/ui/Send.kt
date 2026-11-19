@@ -407,7 +407,7 @@ fun Send(
                         }
                     }
                 }
-                is Step.PayingOut -> Told("Sending ${sat(s.amount)}", "Arrives in ${arrives(s.depth)}", back)
+                is Step.PayingOut -> Told("Sending ${sat(s.amount)}", "Arrives in ${arrives(s.depth, LocalBlockSeconds.current)}", back)
                 is Step.Paid -> Done("Paid ${sat(s.amount)}", back, if (s.fee > 0uL) "Fee ${feeOf(s.fee, s.amount)}" else null)
                 is Step.Sent -> {
                     Sent(s, back)
@@ -469,8 +469,9 @@ private fun costs(
     Fact("Arrives", arrives, "arrives"),
 )
 
-/** How long a payment on Bitcoin takes to count, `depth` blocks deep. */
-internal fun arrives(depth: UInt): String = "about ${(depth.toInt() + 1) * 10} min"
+/** How long a payment on Bitcoin takes to count, `depth` blocks deep, of `blockSecs` each. */
+internal fun arrives(depth: UInt, blockSecs: UInt = BITCOIN_BLOCK_SECONDS): String =
+    "about ${minutes(depth.toLong() + 1, blockSecs)} min"
 
 /**
  * A payment to confirm: how much, then what there is to know before
@@ -673,7 +674,7 @@ private fun Invoice(quote: InvoiceQuote, several: Boolean, pay: () -> Unit, more
         more = {
             provider?.let {
                 Text(
-                    refundWait(it.refundBlocks),
+                    refundWait(it.refundBlocks, LocalBlockSeconds.current),
                     modifier = Modifier.fillMaxWidth().padding(top = 12.dp).testTag("refund-wait"),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -734,7 +735,7 @@ private fun Payout(quote: PayoutQuote, own: Boolean, several: Boolean, pay: () -
             costs(
                 quote.amount,
                 quote.fee,
-                arrives(quote.depth).replaceFirstChar { it.uppercase() },
+                arrives(quote.depth, LocalBlockSeconds.current).replaceFirstChar { it.uppercase() },
                 payoutFee(quote.amount, quote.fee, quote.lockFee, quote.providerFee, quote.claimFee, quoted = true),
             ) +
             listOfNotNull(if (several) Fact("From", name(quote.hub), "from") else null),

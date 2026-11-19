@@ -55,6 +55,14 @@ class CoverTest {
     }
 
     @Test
+    fun the_same_blocks_leave_a_twentieth_of_the_time_on_mutinynet() {
+        // 861 blocks to go: 6 days at 10 minutes a block, 7 hours at 30 seconds (the close, 1 005, 8).
+        val on = cover(contract(ContractState.Protecting), height = 1_000, blockSecs = 30u)
+        assertEquals("7 hours left", on.left)
+        assertEquals("8 hours", on.ends)
+    }
+
+    @Test
     fun a_genuine_one_is_live_never_protecting() {
         val live = cover(contract(ContractState.Protecting, mock = false), height = 1_000)
         assertEquals("Live", live.stands)

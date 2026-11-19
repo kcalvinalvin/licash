@@ -62,7 +62,7 @@ class CoverageTest {
     @Test
     fun protecting_is_suggested_from_the_smallest_contract_until_dismissed() {
         val fixed = hub(ContractTerms(4_096uL, 23_000uL, 1_005u, false, null))
-        val ranged = hub(ContractTerms(4_096uL, 23_000uL, 1_005u, false, ContractRange(10_000uL, 1_000_000uL, 432u, 52_560u, 2u, 1_000uL, 5_000u)))
+        val ranged = hub(ContractTerms(4_096uL, 23_000uL, 1_005u, false, ContractRange(10_000uL, 1_000_000uL, 432u, 52_560u, 2u, 20_000uL, 1_000uL, 5_000u, 0u, 52_560u)))
         val cover = { missing: ULong -> HubCover(missing + 1_000uL, 1_000uL, 4_096uL, 3uL) }
         assertEquals(4_096uL, smallestContract(fixed))
         assertEquals(10_000uL, smallestContract(ranged))

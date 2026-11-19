@@ -36,7 +36,7 @@ class ChooseContractTest {
     @Test
     fun a_coin_that_cannot_pay_says_why() {
         // A cover at most 2 times its coin, as the signet hubs take.
-        val range = ContractRange(131_071uL, 33_554_431uL, 432u, 52_560u, 2u, 20_000uL, 3_000uL, 5_000u, 0u)
+        val range = ContractRange(131_071uL, 33_554_431uL, 432u, 52_560u, 2u, 20_000uL, 3_000uL, 5_000u, 0u, 52_560u)
         assertEquals("Costs more than this coin holds", whyNot(range, 131_071uL, 20_000uL))
         assertTrue(whyNot(range, 1_048_575uL, 500_000uL).contains("too small for so large a cover"))
         assertEquals("Costs more than this coin holds", whyNot(range, 1_048_575uL, 600_000uL))

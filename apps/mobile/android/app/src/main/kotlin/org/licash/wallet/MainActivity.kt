@@ -21,6 +21,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -34,9 +35,11 @@ import androidx.compose.ui.semantics.testTagsAsResourceId
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import org.licash.core.Activity
+import org.licash.core.blockSeconds
 import org.licash.wallet.ui.ActivityDetails
 import org.licash.wallet.ui.History
 import org.licash.wallet.ui.Home
+import org.licash.wallet.ui.LocalBlockSeconds
 import org.licash.wallet.ui.LicashTheme
 import org.licash.wallet.ui.Money
 import org.licash.wallet.ui.Onboarding
@@ -134,47 +137,50 @@ private fun App(engine: Engine, link: String?, linkShown: () -> Unit) {
         }
     }
     BackHandler(enabled = screen != Screen.Home) { screen = parent(screen) }
-    Scaffold(
-        containerColor = MaterialTheme.colorScheme.background,
-        snackbarHost = { SnackbarHost(snackbar) },
-    ) { padding ->
-        // Test tags as resource ids, for the end-to-end tests to find.
-        // Above the keyboard, as it shows: what a screen asks to type and its button in sight.
-        Box(
-            Modifier.fillMaxSize().padding(padding).consumeWindowInsets(padding).imePadding()
-                .semantics { testTagsAsResourceId = true },
-        ) {
-            when {
-                !ui.loaded -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                    Wordmark(size = 40)
-                }
-                !ui.wallet -> Onboarding(engine, ui)
-                else -> when (val s = screen) {
-                    Screen.Home -> Home(
-                        engine,
-                        ui,
-                        receive = { screen = Screen.Receive },
-                        send = { screen = Screen.Send(null) },
-                        settings = { screen = Screen.Settings },
-                        money = { screen = Screen.Money(at = it) },
-                        history = { screen = Screen.History },
-                        open = { screen = Screen.Details(it, Screen.Home) },
-                    )
-                    Screen.History -> History(ui, open = { screen = Screen.Details(it) }) { screen = Screen.Home }
-                    Screen.Receive -> Receive(engine) { screen = Screen.Home }
-                    is Screen.Send -> Send(engine, ui, s.link, s.cashOut, s.own, s.amount) { screen = s.from }
-                    Screen.Settings -> Settings(engine, ui, balance = { screen = Screen.Money(Screen.Settings) }) {
-                        screen = Screen.Home
+    // Counts of blocks are told in the time of the wallet's network.
+    CompositionLocalProvider(LocalBlockSeconds provides blockSeconds(ui.network)) {
+        Scaffold(
+            containerColor = MaterialTheme.colorScheme.background,
+            snackbarHost = { SnackbarHost(snackbar) },
+        ) { padding ->
+            // Test tags as resource ids, for the end-to-end tests to find.
+            // Above the keyboard, as it shows: what a screen asks to type and its button in sight.
+            Box(
+                Modifier.fillMaxSize().padding(padding).consumeWindowInsets(padding).imePadding()
+                    .semantics { testTagsAsResourceId = true },
+            ) {
+                when {
+                    !ui.loaded -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                        Wordmark(size = 40)
                     }
-                    is Screen.Money -> Money(
-                        engine,
-                        ui,
-                        at = s.at,
-                        go = { screen = s.copy(at = it) },
-                        cashOut = { hub, amount -> screen = Screen.Send(null, hub, s, amount = amount) },
-                        payOwn = { link, own -> screen = Screen.Send(link, from = s, own = own) },
-                    ) { screen = s.from }
-                    is Screen.Details -> ActivityDetails(engine, ui, s.activity) { screen = s.from }
+                    !ui.wallet -> Onboarding(engine, ui)
+                    else -> when (val s = screen) {
+                        Screen.Home -> Home(
+                            engine,
+                            ui,
+                            receive = { screen = Screen.Receive },
+                            send = { screen = Screen.Send(null) },
+                            settings = { screen = Screen.Settings },
+                            money = { screen = Screen.Money(at = it) },
+                            history = { screen = Screen.History },
+                            open = { screen = Screen.Details(it, Screen.Home) },
+                        )
+                        Screen.History -> History(ui, open = { screen = Screen.Details(it) }) { screen = Screen.Home }
+                        Screen.Receive -> Receive(engine) { screen = Screen.Home }
+                        is Screen.Send -> Send(engine, ui, s.link, s.cashOut, s.own, s.amount) { screen = s.from }
+                        Screen.Settings -> Settings(engine, ui, balance = { screen = Screen.Money(Screen.Settings) }) {
+                            screen = Screen.Home
+                        }
+                        is Screen.Money -> Money(
+                            engine,
+                            ui,
+                            at = s.at,
+                            go = { screen = s.copy(at = it) },
+                            cashOut = { hub, amount -> screen = Screen.Send(null, hub, s, amount = amount) },
+                            payOwn = { link, own -> screen = Screen.Send(link, from = s, own = own) },
+                        ) { screen = s.from }
+                        is Screen.Details -> ActivityDetails(engine, ui, s.activity) { screen = s.from }
+                    }
                 }
             }
         }

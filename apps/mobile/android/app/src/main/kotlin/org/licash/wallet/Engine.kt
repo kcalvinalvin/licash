@@ -697,7 +697,7 @@ class Engine(context: Context) {
             try {
                 // As she consented, else only told: nothing done without.
                 if (protecting) {
-                    val margin = exitMarginBlocks(prefs.exitMarginDays, ui.network)
+                    val margin = exitMarginBlocks(prefs.exitMarginDays)
                     val exits = local { it.driveExits(chain, margin) }
                     for (e in exits) e.error?.let { AppLog.warn("exit of contract ${e.id}, ${e.step}: $it") }
                     state.update { it.copy(exits = exits) }
@@ -1246,7 +1246,7 @@ class Engine(context: Context) {
 
     /** Planning from this wallet's signed terms; never starts a close. */
     suspend fun contractSafety(id: String): Result<org.licash.core.ContractSafety> = io {
-        local { it.contractSafety(id, exitMarginBlocks(prefs.exitMarginDays, state.value.network), 6u) }
+        local { it.contractSafety(id, exitMarginBlocks(prefs.exitMarginDays), 6u) }
     }
 
     /**
@@ -1429,7 +1429,7 @@ class Engine(context: Context) {
      * `address`, with the exit margin set now.
      */
     suspend fun consentToExit(address: String): Result<ExitConsent> = io {
-        val margin = exitMarginBlocks(prefs.exitMarginDays, state.value.network)
+        val margin = exitMarginBlocks(prefs.exitMarginDays)
         val given = local { it.consentToExit(address, margin) }
         AppLog.info("consented to exit contracts ending, margin $margin blocks")
         poke()
@@ -1473,7 +1473,7 @@ class Engine(context: Context) {
     /** The exit margin set to `days`, her consent to exit given again with it if given. */
     suspend fun setExitMargin(days: Int): Result<Unit> = io {
         prefs.exitMarginDays = days
-        local { it.exitConsent() }?.let { local { w -> w.consentToExit(it.address, exitMarginBlocks(days, state.value.network)) } }
+        local { it.exitConsent() }?.let { local { w -> w.consentToExit(it.address, exitMarginBlocks(days)) } }
         Unit
     }
 

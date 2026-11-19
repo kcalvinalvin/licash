@@ -72,6 +72,23 @@ class WordsTest {
     }
 
     @Test
+    fun blocks_are_told_in_the_time_of_their_network() {
+        // Mutinynet's take 30 seconds: the same blocks, a twentieth of the time.
+        assertEquals("now", span(0, 30u))
+        assertEquals("30 sec", span(1, 30u))
+        assertEquals("5 min", span(10, 30u))
+        assertEquals("1 hour", span(144, 30u))
+        assertEquals("24 hours", span(2_880, 30u))
+        assertEquals("3 days", span(8_640, 30u))
+        assertEquals("10 min", span(1, 600u))
+        assertEquals("33 hours", span(200, 600u))
+        assertEquals(
+            "If the provider declines or fails the payment, your sats come back by themselves, in about 2 hours.",
+            refundWait(200u, 30u),
+        )
+    }
+
+    @Test
     fun a_day_is_said_as_short_as_today_lets_it() {
         val zone = java.time.ZoneId.of("UTC")
         val us = java.util.Locale.US

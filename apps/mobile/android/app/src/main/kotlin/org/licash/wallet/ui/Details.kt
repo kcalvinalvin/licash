@@ -107,7 +107,7 @@ fun ActivityDetails(engine: Engine, ui: Ui, shown: Activity, back: () -> Unit) {
             style = Heading,
         )
         Text(
-            status(activity, coming != null, details),
+            status(activity, coming != null, details, LocalBlockSeconds.current),
             modifier = Modifier.padding(horizontal = 4.dp).testTag("state"),
             style = MaterialTheme.typography.bodyLarge,
             color = if (activity.state == State.FAILED) {
@@ -117,7 +117,7 @@ fun ActivityDetails(engine: Engine, ui: Ui, shown: Activity, back: () -> Unit) {
             },
         )
         // What it needs of its owner, never folded away.
-        (details as? Details.Payout)?.let { needs(activity, it.progress, ui.developer) }?.let {
+        (details as? Details.Payout)?.let { needs(activity, it.progress, ui.developer, LocalBlockSeconds.current) }?.let {
             Text(
                 it,
                 modifier = Modifier.padding(horizontal = 4.dp, vertical = 4.dp).testTag("needs"),
@@ -182,7 +182,12 @@ private const val CONFIRMING = "Confirming, about 10 min"
  * Where it stands, in a few words: what a newcomer asks of a payment, not
  * how it is made. Never a block's height, nor who makes it happen.
  */
-internal fun status(activity: Activity, coming: Boolean, details: Details?): String = when {
+internal fun status(
+    activity: Activity,
+    coming: Boolean,
+    details: Details?,
+    blockSecs: UInt = BITCOIN_BLOCK_SECONDS,
+): String = when {
     coming -> CONFIRMING
     activity.state == State.FAILED && details is Details.Payout -> when (details.progress.lock) {
         LockStep.LOCKED -> "${activity.detail}. Your money comes back by itself."
@@ -195,7 +200,7 @@ internal fun status(activity: Activity, coming: Boolean, details: Details?): Str
     activity.state == State.FAILED -> activity.detail
     // A swap provider declined or failed it: its lock returns the sats once expired.
     activity.state == State.PENDING && details is Details.Lightning && details.provider != null &&
-        details.failure != null -> notPaid(details.refundBlocks)
+        details.failure != null -> notPaid(details.refundBlocks, blockSecs)
     else -> when (details) {
         is Details.Payout -> when {
             activity.state == State.DONE -> "Arrived"
@@ -203,7 +208,7 @@ internal fun status(activity: Activity, coming: Boolean, details: Details?): Str
             else -> "On its way"
         }
         is Details.Swap -> if (activity.state == State.DONE) "Done" else "Moving"
-        is Details.Moved -> moving(activity, details)
+        is Details.Moved -> moving(activity, details, blockSecs)
         is Details.Coin -> if (details.moving != null) "Being added to your balance" else "Yours, on Bitcoin"
         is Details.Invoice -> if (activity.state == State.DONE) "In your balance" else "Paid, arriving"
         is Details.Contract -> if (activity.state == State.DONE) "Set up" else CONFIRMING
@@ -216,12 +221,12 @@ internal fun status(activity: Activity, coming: Boolean, details: Details?): Str
 }
 
 /** Where bitcoin coming into the balance stands: the blocks its hub waits for, as time. */
-private fun moving(activity: Activity, move: Details.Moved): String {
+private fun moving(activity: Activity, move: Details.Moved, blockSecs: UInt): String {
     if (activity.state == State.DONE) return "In your balance"
     val paid = move.payment ?: return "Waiting for its payment"
     val depth = (move.depth ?: 1u).toInt()
     val left = depth - paid.confirmations.toInt()
-    return if (left > 0) "Confirming, about ${left * 10} min" else "Almost there"
+    return if (left > 0) "Confirming, about ${minutes(left.toLong(), blockSecs)} min" else "Almost there"
 }
 
 /**
@@ -229,14 +234,19 @@ private fun moving(activity: Activity, move: Details.Moved): String {
  * before its time runs out, this phone finishing it. In advanced mode,
  * the block it runs out at too.
  */
-internal fun needs(activity: Activity, p: PayoutSteps, developer: Boolean): String? {
+internal fun needs(
+    activity: Activity,
+    p: PayoutSteps,
+    developer: Boolean,
+    blockSecs: UInt = BITCOIN_BLOCK_SECONDS,
+): String? {
     val by = p.claimBy ?: return null
     if (activity.state != State.PENDING || p.claim != null) return null
     val block = if (developer) " (block $by)" else ""
     return when {
         p.tip == 0u -> "Keep the app open to finish it$block"
         p.tip > by -> "Too late to finish$block: your money comes back by itself"
-        else -> "Open the app within ${span((by - p.tip).toLong())} to finish it$block"
+        else -> "Open the app within ${span((by - p.tip).toLong(), blockSecs)} to finish it$block"
     }
 }
 

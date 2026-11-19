@@ -3,19 +3,20 @@ package org.licash.wallet
 import org.junit.Assert.assertEquals
 import org.junit.Test
 import org.licash.core.ContractSafety
-import org.licash.core.Network
 
 class SafetyTest {
     @Test fun aPhoneOwnsItsMarginAndDaysAreOnlyAnEstimate() {
-        assertEquals(2_016u, exitMarginBlocks(14, Network.SIGNET))
-        assertEquals(1_008u, exitMarginBlocks(7, Network.BITCOIN))
-        assertEquals(40_320u, exitMarginBlocks(14, Network.MUTINYNET))
+        // Counted in blocks, 144 a day on every network: Mutinynet's too.
+        assertEquals(2_016u, exitMarginBlocks(14))
+        assertEquals(1_008u, exitMarginBlocks(7))
     }
 
     @Test fun theSignedChallengeWindowIsShownAsEstimatedHours() {
-        assertEquals(24u, checkInHours(144u, Network.SIGNET))
-        assertEquals(1u, checkInHours(6u, Network.SIGNET))
-        assertEquals(1u, checkInHours(144u, Network.MUTINYNET))
+        assertEquals(24u, checkInHours(144u, 600u))
+        assertEquals(1u, checkInHours(6u, 600u))
+        // The same blocks on Mutinynet, 30 seconds each: 72 minutes.
+        assertEquals(1u, checkInHours(144u, 30u))
+        assertEquals(24u, checkInHours(2_880u, 30u))
     }
 
     @Test fun equalityStillFitsAndOneBlockLaterIsInsideTheMargin() {

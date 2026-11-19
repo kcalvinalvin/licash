@@ -132,7 +132,7 @@ internal fun ChooseSheet(
                 modifier = Modifier.testTag("contract-cap"),
             )
         }
-        Line("For", span(protectsFor.toLong()), tag = "quote-for")
+        Line("For", span(protectsFor.toLong(), LocalBlockSeconds.current), tag = "quote-for")
         if (range.maxBlocks > range.minBlocks) {
             Slider(
                 value = blocks.toFloat(),

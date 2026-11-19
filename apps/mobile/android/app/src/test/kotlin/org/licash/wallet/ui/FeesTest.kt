@@ -54,7 +54,7 @@ class FeesTest {
 
     @Test
     fun a_contract_costs_its_opening_fee_the_interest_on_each_part_and_a_reserve() {
-        val range = ContractRange(131_071uL, 16_777_215uL, 432u, 52_560u, 2u, 20_000uL, 3_000uL, 10_000u, 5_000u)
+        val range = ContractRange(131_071uL, 16_777_215uL, 432u, 52_560u, 2u, 20_000uL, 3_000uL, 10_000u, 5_000u, 52_560u)
         val fee = ContractFee(opening = 3_000uL, interest = 41_943uL, interestFunded = 20_971uL)
         val cost = contractCost(range, 16_777_215uL, 85_914uL, fee, 8_388_607uL)
         assertEquals(

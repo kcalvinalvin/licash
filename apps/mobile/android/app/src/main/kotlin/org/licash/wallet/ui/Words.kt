@@ -90,33 +90,43 @@ const val NOT_PROTECTED_MEANS =
  * decline or fail the payment, the sats wait `blocks` for their lock to
  * expire.
  */
-fun refundWait(blocks: UInt): String =
-    "If the provider declines or fails the payment, your sats come back by themselves, in about ${span(blocks.toLong())}."
+fun refundWait(blocks: UInt, blockSecs: UInt = BITCOIN_BLOCK_SECONDS): String =
+    "If the provider declines or fails the payment, your sats come back by themselves, in about ${span(blocks.toLong(), blockSecs)}."
 
 /**
  * Where a payment through a swap provider that it declined or failed
  * stands: its sats back once its lock expires, `blocks` from now if known.
  */
-fun notPaid(blocks: UInt?): String = when {
+fun notPaid(blocks: UInt?, blockSecs: UInt = BITCOIN_BLOCK_SECONDS): String = when {
     blocks == null || blocks == 0u -> "Not paid. Your money comes back by itself."
-    else -> "Not paid. Your money comes back by itself in about ${span(blocks.toLong())}."
+    else -> "Not paid. Your money comes back by itself in about ${span(blocks.toLong(), blockSecs)}."
 }
 
+/** Seconds a block takes on Bitcoin's networks, 10 minutes: Mutinynet's take 30. */
+const val BITCOIN_BLOCK_SECONDS = 600u
+
 /**
- * How long `blocks` take, ten minutes each, as a clock would say it: `6
- * days`. Never a block height: what a block is, nobody needs to know.
+ * How long `blocks` take, `blockSecs` each (those of the wallet's network),
+ * as a clock would say it: `6 days`. Never a block height: what a block is,
+ * nobody needs to know.
  */
-fun span(blocks: Long): String {
-    val minutes = blocks * 10
-    val hours = (minutes + 30) / 60
-    val days = (minutes + 720) / 1440
+fun span(blocks: Long, blockSecs: UInt = BITCOIN_BLOCK_SECONDS): String {
+    val seconds = blocks * blockSecs.toLong()
+    val minutes = (seconds + 30) / 60
+    val hours = (seconds + 1800) / 3600
+    val days = (seconds + 43200) / 86400
     return when {
         blocks <= 0 -> "now"
-        minutes < 60 -> "$minutes min"
+        seconds < 60 -> "$seconds sec"
+        seconds < 3600 -> "$minutes min"
         hours < 48 -> if (hours == 1L) "1 hour" else "$hours hours"
         else -> "$days days"
     }
 }
+
+/** The minutes `blocks` take, `blockSecs` each, rounded and at least one. */
+fun minutes(blocks: Long, blockSecs: UInt = BITCOIN_BLOCK_SECONDS): Long =
+    maxOf(1L, (blocks * blockSecs.toLong() + 30) / 60)
 
 /**
  * When `seconds` since 1970 was, as short as `now` lets it be said: the
@@ -240,7 +250,7 @@ data class Cover(
 )
 
 /** `contract`, in words, at the chain's `height`: 0 while unknown. */
-fun cover(contract: Contract, height: Int): Cover {
+fun cover(contract: Contract, height: Int, blockSecs: UInt = BITCOIN_BLOCK_SECONDS): Cover {
     val state = contract.state
     val on = state == ContractState.Protecting
     val runs = on || state == ContractState.Opening || state == ContractState.Confirming
@@ -260,8 +270,8 @@ fun cover(contract: Contract, height: Int): Cover {
         runs = runs,
         failed = state is ContractState.Failed,
         held = held,
-        left = if (runs && known) "${span(contract.protectsUntil.toLong() - height)} left" else null,
-        ends = if ((runs || held) && known) span(contract.closesAt.toLong() - height) else null,
+        left = if (runs && known) "${span(contract.protectsUntil.toLong() - height, blockSecs)} left" else null,
+        ends = if ((runs || held) && known) span(contract.closesAt.toLong() - height, blockSecs) else null,
     )
 }
 
@@ -274,8 +284,8 @@ fun cover(contract: Contract, height: Int): Cover {
 data class Forcing(val stands: String, val says: String?, val revocable: Boolean, val failed: Boolean)
 
 /** `recovery`, in words, at the chain's `height`. */
-fun forcing(recovery: Recovery, height: Int): Forcing {
-    val wait = recovery.nextAt?.takeIf { height > 0 }?.let { span(it.toLong() - height) }
+fun forcing(recovery: Recovery, height: Int, blockSecs: UInt = BITCOIN_BLOCK_SECONDS): Forcing {
+    val wait = recovery.nextAt?.takeIf { height > 0 }?.let { span(it.toLong() - height, blockSecs) }
     val revocable = recovery.stage == RecoveryStage.CLAIMED && !recovery.irrevocable
     val (stands, says) = when (recovery.stage) {
         RecoveryStage.FOLDING -> "Closing" to "Waiting for the hub's transaction: your notes and reserve come back on Bitcoin together"
@@ -285,7 +295,7 @@ fun forcing(recovery: Recovery, height: Int): Forcing {
         RecoveryStage.TIMING_OUT -> "Paying back" to (wait?.let { "Back on Bitcoin in $it" } ?: "The hub did not answer")
         RecoveryStage.SWEEPING -> "Sweeping" to "To your Bitcoin, once in a block"
         RecoveryStage.DONE -> "Recovered" to "${sat(recovery.received ?: recovery.claimed)} back on Bitcoin"
-        RecoveryStage.ANSWERED -> "Answered" to answered(recovery, height)
+        RecoveryStage.ANSWERED -> "Answered" to answered(recovery, height, blockSecs)
         RecoveryStage.LOST -> "Lost" to "Its bitcoin went elsewhere"
         RecoveryStage.ASSERTED -> "Hub proved" to (wait?.let { "${owed(recovery)}: paid in $it" } ?: "Being paid")
         RecoveryStage.CHALLENGING -> "Challenging" to "The hub's proof does not check: challenging it on Bitcoin"
@@ -301,9 +311,9 @@ private fun owed(recovery: Recovery): String =
     recovery.corrected?.let { "The hub says ${sat(it)} is owed" } ?: "The hub answered"
 
 /** A forced close the hub answered: its proof awaited, by its deadline. */
-private fun answered(recovery: Recovery, height: Int): String {
+private fun answered(recovery: Recovery, height: Int, blockSecs: UInt): String {
     val deadline = recovery.deadline ?: return owed(recovery)
-    val left = span(deadline.toLong() - height).takeIf { height > 0 }
+    val left = span(deadline.toLong() - height, blockSecs).takeIf { height > 0 }
     return left?.let { "${owed(recovery)}: it must prove so within $it, or you are paid your claim" }
         ?: "${owed(recovery)}: it must prove so, or you are paid your claim"
 }

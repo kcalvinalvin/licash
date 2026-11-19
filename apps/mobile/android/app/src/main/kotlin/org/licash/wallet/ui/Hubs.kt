@@ -77,6 +77,7 @@ internal fun HubFees(
     optimize: (() -> Unit)? = null,
     dismiss: () -> Unit,
 ) {
+    val blockSecs = LocalBlockSeconds.current
     Sheet(if (full) name(hub.url) else "Fees and limits", dismiss) {
         if (full) {
             SelectionContainer {
@@ -152,7 +153,7 @@ internal fun HubFees(
                     Divider()
                     Entry(
                         "For",
-                        value = "${span(range.minBlocks.toLong())} to ${span(range.maxBlocks.toLong())}",
+                        value = "${span(range.minBlocks.toLong(), blockSecs)} to ${span(range.maxBlocks.toLong(), blockSecs)}",
                         tag = "protection-for",
                     )
                 } else {
@@ -160,7 +161,7 @@ internal fun HubFees(
                     Divider()
                     Entry("Covers up to", value = sat(it.cap), tag = "protection-cap")
                     Divider()
-                    Entry("For", value = span(it.blocks.toLong()))
+                    Entry("For", value = span(it.blocks.toLong(), blockSecs))
                 }
             }
         }

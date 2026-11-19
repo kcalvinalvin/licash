@@ -44,6 +44,7 @@ import org.licash.core.ContractState
 import org.licash.core.Network
 import org.licash.core.Recovery
 import org.licash.core.RecoveryStage
+import org.licash.core.blockSeconds
 import org.licash.wallet.digits
 import org.licash.wallet.sat
 import org.licash.wallet.share
@@ -72,8 +73,9 @@ internal fun CoverRow(
     explorer: (String) -> String? = { null },
 ) {
     val colors = MaterialTheme.colorScheme
-    val cover = cover(c, height)
-    val forcing = recovery?.let { forcing(it, height) }
+    val blockSecs = LocalBlockSeconds.current
+    val cover = cover(c, height, blockSecs)
+    val forcing = recovery?.let { forcing(it, height, blockSecs) }
     var open by rememberSaveable(c.id) { mutableStateOf(false) }
     var plan by remember(c.id) { mutableStateOf<ContractSafety?>(null) }
     var details by remember(c.id) { mutableStateOf<ContractInspection?>(null) }
@@ -214,7 +216,7 @@ private fun Unfolded(c: Contract, cover: Cover, developer: Boolean, end: () -> U
             if (planning) {
                 Sheet("Recovery planning", dismiss = { planning = false }) {
                     Line("Your exit margin", "${it.exitMargin} blocks")
-                    Line("During a forced close", "Come online at least every ${checkInHours(it.challengeWindow, network)} hours")
+                    Line("During a forced close", "Come online at least every ${checkInHours(it.challengeWindow, blockSeconds(network))} hours")
                     Say("Planning only. Start earlier for confirmation time. Stay online: the wallet checks the hub's proof and must challenge a bad one within ${it.challengeWindow} blocks.")
                 }
             }
@@ -391,7 +393,7 @@ internal fun ProtectSheet(q: ContractQuote, open: () -> Unit, cashOutFirst: () -
     val download = android.text.format.Formatter.formatShortFileSize(LocalContext.current, q.download.toLong())
     Sheet("Protect at ${name(q.hub)}", dismiss) {
         Line("Covers up to", sat(q.cap), tag = "quote-cap")
-        Line("For", span(q.protectsFor.toLong()), tag = "quote-for")
+        Line("For", span(q.protectsFor.toLong(), LocalBlockSeconds.current), tag = "quote-for")
         FeeLine("Cost", q.price, q.cap, tag = "quote-price", value = sat(q.price), breakdown = setupCost(q.cap, q.price))
         Line("Takes", "Up to an hour, $download")
         Worth(q.mock)
@@ -431,7 +433,7 @@ internal fun EndSheet(
     close: () -> Unit,
     dismiss: () -> Unit,
 ) {
-    val ends = cover(c, height).ends
+    val ends = cover(c, height, LocalBlockSeconds.current).ends
     val claimed = if (held < c.cap) held else c.cap
     Sheet("Close with ${name(c.hub)}", dismiss) {
         if (claimed > 0uL) {

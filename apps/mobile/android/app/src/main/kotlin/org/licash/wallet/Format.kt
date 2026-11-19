@@ -108,9 +108,9 @@ fun host(url: String): String = runCatching {
     if (uri.port == -1) host else "$host:${uri.port}"
 }.getOrNull() ?: url
 
-/** About how long `blocks` take, ten minutes each: `about 6 days`. */
-fun duration(blocks: Long): String {
-    val minutes = blocks * 10
+/** About how long `blocks` take, `blockSecs` each (ten minutes on Bitcoin's networks): `about 6 days`. */
+fun duration(blocks: Long, blockSecs: Long = 600): String {
+    val minutes = blocks * blockSecs / 60
     return when {
         blocks <= 0 -> "now"
         minutes < 90 -> "about $minutes minutes"

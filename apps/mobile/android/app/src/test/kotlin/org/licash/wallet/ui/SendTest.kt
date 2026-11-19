@@ -10,4 +10,11 @@ class SendTest {
         assertEquals("about 20 min", arrives(1u))
         assertEquals("about 70 min", arrives(6u))
     }
+
+    @Test
+    fun the_same_blocks_take_a_twentieth_of_the_time_on_mutinynet() {
+        assertEquals("about 1 min", arrives(0u, 30u))
+        assertEquals("about 1 min", arrives(1u, 30u))
+        assertEquals("about 4 min", arrives(6u, 30u))
+    }
 }

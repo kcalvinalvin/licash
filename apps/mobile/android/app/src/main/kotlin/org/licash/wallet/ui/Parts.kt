@@ -50,6 +50,7 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.compositionLocalOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.rememberUpdatedState
@@ -86,6 +87,12 @@ fun Wordmark(modifier: Modifier = Modifier, size: Int = 22) {
         color = MaterialTheme.colorScheme.primary,
     )
 }
+
+/**
+ * The seconds a block takes on the wallet's network, for screens to tell a
+ * count of blocks in: set once at the root, Bitcoin's until then.
+ */
+val LocalBlockSeconds = compositionLocalOf { BITCOIN_BLOCK_SECONDS }
 
 /** The network, unless it is Bitcoin's own. */
 @Composable
