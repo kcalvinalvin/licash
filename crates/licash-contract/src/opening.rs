@@ -51,6 +51,13 @@ pub struct Trust {
     /// that doesn't would owe her claim nothing, or the Hub could not prove
     /// it owed less. A program that does decides the compact one too.
     pub lean: bool,
+    /// The chain program whose receipts its statement verifies, if it reads
+    /// a contract's exit through the hub's header chain
+    /// ([`licash::recovery::chained`]), which a contract of graph id
+    /// [`licash::recovery::CHAINED_FROM`] on does: under one that doesn't, it
+    /// would read no exit, and the hub could not prove her claim owed less.
+    /// A program that does decides the lean filing too.
+    pub chained: Option<[u8; 32]>,
 }
 impl Trust {
     pub fn mock() -> Self {
@@ -59,6 +66,7 @@ impl Trust {
             mock: true,
             compact: true,
             lean: true,
+            chained: None,
         }
     }
 }
@@ -663,6 +671,12 @@ impl Holder {
         ensure!(
             s.quote.graph.id < licash::recovery::LEAN_FROM || ctx.trust.lean,
             "a graph of id {} files a lean claim, which the program trusted doesn't decide",
+            s.quote.graph.id
+        );
+        ensure!(
+            !licash::recovery::chained(s.quote.graph.id) || ctx.trust.chained.is_some(),
+            "a graph of id {} reads the exit on the hub's header chain, which the program \
+             trusted doesn't",
             s.quote.graph.id
         );
         let keys = HolderKeys::derive(&s.seed, &id);
@@ -1651,6 +1665,7 @@ mod tests {
                 mock: true,
                 compact,
                 lean,
+                chained: None,
             },
         };
         // A program that decides the lean filing decides the compact too.
@@ -1670,6 +1685,25 @@ mod tests {
                 opens,
                 "graph {graph}, compact {compact}, lean {lean}"
             );
+        }
+        // A graph that reads the exit on the hub's header chain is opened only
+        // under a program that does, whatever else it decides.
+        let chained = |chain| Context {
+            trust: Trust {
+                chained: chain,
+                ..trust(true, true).trust
+            },
+            ..trust(true, true)
+        };
+        for (graph, chain, opens) in [
+            (licash::recovery::CHAINED_FROM - 1, None, true),
+            (licash::recovery::CHAINED_FROM, None, false),
+            (licash::recovery::CHAINED_FROM, Some([7; 32]), true),
+            (licash::recovery::CHAINED_FROM + 1, None, false),
+        ] {
+            q.graph.id = graph;
+            let started = Holder::start(start(&q), &chained(chain));
+            assert_eq!(started.is_ok(), opens, "graph {graph}, chain {chain:?}");
         }
     }
 
@@ -2402,6 +2436,7 @@ mod tests {
                 mock: true,
                 compact: true,
                 lean: true,
+                chained: None,
             },
         };
         assert!(Holder::load(&a.to_bytes(), &[1; 32], &rotated).is_ok());
@@ -2421,6 +2456,7 @@ mod tests {
                     mock: false,
                     compact: false,
                     lean: false,
+                    chained: None,
                 }
             }
         )

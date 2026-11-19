@@ -75,6 +75,7 @@ fn stored_context(base: Option<&Base>, binding: bool, ctx: &Context) -> Context 
             mock: ctx.trust.mock,
             compact: ctx.trust.compact,
             lean: ctx.trust.lean,
+            chained: ctx.trust.chained,
         },
     }
 }

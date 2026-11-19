@@ -340,6 +340,7 @@ pub fn trust(profile: ChainProfile) -> Result<Trust> {
             mock: false,
             compact: SIGNET_COMPACT,
             lean: SIGNET_LEAN,
+            chained: SIGNET_CHAINED.then_some(CHAIN),
         }),
         _ => bail!("contracts are not opened on {profile} yet"),
     }
@@ -365,6 +366,19 @@ pub const SIGNET_COMPACT: bool = true;
 /// the compact one: set in the same change as the program that does. Hubs
 /// quote a graph of id [`licash::recovery::LEAN_FROM`] only when it is.
 pub const SIGNET_LEAN: bool = true;
+
+/// Whether [`SIGNET`] reads a contract's exit on the hub's header chain, as
+/// [`SIGNET_LEAN`] says of the lean filing: set in the same change as the
+/// program that does, which verifies receipts of [`CHAIN`] alone. Hubs quote a
+/// graph of id [`licash::recovery::CHAINED_FROM`] only when it is.
+pub const SIGNET_CHAINED: bool = false;
+
+/// The chain program (`r0/chain-guest`) whose receipts [`SIGNET`]'s statement
+/// verifies: the image id kept in `r0/hp-guest/chain.id`, which a build of it
+/// must give (`r0/build-guest.sh chain`). The hub proves the header chain with
+/// it, and keeps the program in `r0/programs/` as it keeps the statements.
+pub const CHAIN: [u8; 32] =
+    hex!("0000000000000000000000000000000000000000000000000000000000000000");
 
 /// The programs signet's (and Mutinynet's) contracts opened under before [`SIGNET`], newest
 /// first: no contract opens under them, those that did are played still.
@@ -545,8 +559,28 @@ mod tests {
                 (trusted.compact, trusted.lean),
                 (SIGNET_COMPACT, SIGNET_LEAN)
             );
+            assert_eq!(trusted.chained, SIGNET_CHAINED.then_some(CHAIN));
         }
         assert!(trust(ChainProfile::Core30Mainnet).is_err());
+        assert_eq!(
+            trust(ChainProfile::Core30DefaultRegtest).unwrap().chained,
+            None
+        );
+    }
+
+    /// The statement verifies receipts of the chain program by the id kept
+    /// in its guest's directory, compiled in: the hub proves the chain with
+    /// the program of that id alone, kept as the statements are.
+    #[test]
+    fn the_chain_program_is_the_one_the_statements_are_built_with() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../r0");
+        let kept = std::fs::read_to_string(root.join("hp-guest/chain.id")).unwrap();
+        assert_eq!(kept.trim().len(), 64, "an image id");
+        if SIGNET_CHAINED {
+            assert_eq!(hex::encode(CHAIN), kept.trim());
+            let program = root.join(format!("programs/{}.bin", kept.trim()));
+            assert!(std::fs::metadata(&program).is_ok_and(|m| m.len() > 0));
+        }
     }
 
     #[test]

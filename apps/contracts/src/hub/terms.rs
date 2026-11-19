@@ -4,7 +4,7 @@ use anyhow::{bail, ensure, Result};
 use licash::base::{ChainTerms, Fees, GraphTerms, Limits, Recipe};
 use licash::chain::Checkpoint;
 use licash::note::Keyset;
-use licash::recovery::{COMPACT_FROM, LEAN_FROM};
+use licash::recovery::{CHAINED_FROM, COMPACT_FROM, LEAN_FROM};
 use licash::spend::ChainProfile;
 use licash_contract::graph::RETURNING;
 use licash_contract::opening::{Bounds, Floors, Quote};
@@ -366,6 +366,7 @@ impl Timing {
     /// program contracts open under decides it, else the last before.
     fn graph_id(&self) -> u32 {
         match crate::trust(self.profile) {
+            Ok(t) if t.chained.is_some() => CHAINED_FROM,
             Ok(t) if t.lean => LEAN_FROM,
             Ok(t) if t.compact => COMPACT_FROM,
             _ => RETURNING,
