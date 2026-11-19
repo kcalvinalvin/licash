@@ -484,6 +484,39 @@ pub fn list(dir: &Path) -> Result<Vec<Contract>> {
     }
 }
 
+/// The hubs `wallet` trusts in the order its payment codes name them: those
+/// whose contracts in `dir`, live at `tip`, have the most room to protect
+/// more than is held there first, then those holding the least, so that
+/// what payers pay is protected and does not pile up at one hub; then by
+/// URL.
+pub fn code_hubs<T: Transport>(wallet: &Wallet<T>, dir: &Path, tip: u32) -> Result<Vec<String>> {
+    let contracts = list(dir)?;
+    let balance = wallet.balance()?;
+    let mut hubs = Vec::new();
+    for (url, _) in wallet.hubs()? {
+        let urls = wallet.hub_urls(&url)?;
+        let at = |hub: &str| urls.iter().any(|u| u.trim_end_matches('/') == hub.trim_end_matches('/'));
+        let held = |b: &licash_wallet::Balance| at(&b.hub).then_some(b.available + b.pending);
+        let held: u64 = balance.iter().filter_map(held).sum();
+        let live = contracts.iter().filter(|c| c.live(tip) && c.at(&urls));
+        let caps: u64 = live.map(|c| u64::from(c.cap)).sum();
+        hubs.push((url, held, caps));
+    }
+    Ok(rank_code_hubs(hubs))
+}
+
+/// `hubs`, each with what is held there and the caps of its live
+/// contracts, as [`code_hubs`] orders them.
+fn rank_code_hubs(mut hubs: Vec<(String, u64, u64)>) -> Vec<String> {
+    hubs.sort_by(|(a, held_a, caps_a), (b, held_b, caps_b)| {
+        let room = |held: &u64, caps: &u64| caps.saturating_sub(*held);
+        (room(held_b, caps_b).cmp(&room(held_a, caps_a)))
+            .then(held_a.cmp(held_b))
+            .then(a.cmp(b))
+    });
+    hubs.into_iter().map(|(url, ..)| url).collect()
+}
+
 /// Snapshot the contract database while the caller holds its driver lock.
 /// Instance files are copied under the same lock by the bundle writer.
 pub fn snapshot_database(dir: &Path, to: &Path) -> Result<bool> {
@@ -915,6 +948,26 @@ mod tests {
     use licash_wallet::{Blocks, Response};
 
     use super::*;
+
+    #[test]
+    fn codes_name_the_hubs_with_room_to_protect_more_then_the_least_held() {
+        let hub = |url: &str, held: u64, caps: u64| (url.to_owned(), held, caps);
+        let hubs = vec![
+            // Room for 50 more: first.
+            hub("http://d.test", 50, 100),
+            // Unprotected, or full: by what they hold, the least first.
+            hub("http://c.test", 300, 0),
+            hub("http://b.test", 10, 0),
+            hub("http://e.test", 100, 100),
+            // Room for 10 more: after the room for 50.
+            hub("http://a.test", 0, 10),
+            // As much as another: by URL.
+            hub("http://f.test", 10, 0),
+        ];
+        let ranked = rank_code_hubs(hubs);
+        let wanted = ["d", "a", "b", "f", "e", "c"].map(|h| format!("http://{h}.test"));
+        assert_eq!(ranked, wanted);
+    }
 
     #[test]
     fn an_opening_short_of_her_signing_f_a_day_on_is_given_up() {

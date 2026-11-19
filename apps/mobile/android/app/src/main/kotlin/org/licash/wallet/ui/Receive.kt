@@ -60,10 +60,10 @@ internal enum class Way(val label: String, val says: String, val tag: String) {
     /** A Lightning invoice a hub makes, for an amount: any wallet pays it. */
     LIGHTNING("Lightning invoice", "Any Lightning wallet, for an amount", "way-lightning"),
 
-    /** The wallet's code: in Licash, or at its silent payment address. */
+    /** The wallet's code, paid in notes. */
     CODE("Licash code", "Licash wallets, cheaper and more private", "way-code"),
 
-    /** The code with an address on Bitcoin any wallet pays, handed out once asked for. */
+    /** The code on Bitcoin: an address any wallet pays, handed out once asked for, and the silent payment address. */
     BITCOIN("Bitcoin address", "Any Bitcoin wallet, on Bitcoin", "way-bitcoin"),
 
     /** The silent payment address alone, for wallets paying those only. */
@@ -123,8 +123,8 @@ internal fun invoiceWords(amount: ULong, asks: ULong, gets: ULong): String? = li
  * What to be paid at, as a QR code and one Copy, picked for the payer: for
  * an amount, a Lightning invoice any wallet pays, from a hub taking
  * payments over Lightning; for any amount, the wallet's code, paid in
- * Licash or at its silent payment address. The other ways, an address on
- * Bitcoin any wallet pays among them, one tap away in a sheet. Under it,
+ * notes. The other ways, an address on Bitcoin any wallet pays among them,
+ * one tap away in a sheet. Under it,
  * what it is and the amount asked, and nothing else.
  */
 @Composable
@@ -161,7 +161,13 @@ fun Receive(engine: Engine, back: () -> Unit) {
     // An invoice, made by a hub: for an amount, paid once.
     var invoice by remember { mutableStateOf<LightningInvoice?>(null) }
     val request = invoice?.request?.takeIf { lightning }
-    val silent = code?.silent?.takeIf { way == Way.SILENT }
+    var silentAddress by remember { mutableStateOf<String?>(null) }
+    val silent = silentAddress?.takeIf { way == Way.SILENT }
+    LaunchedEffect(way == Way.SILENT) {
+        if (way == Way.SILENT && silentAddress == null) {
+            engine.silentAddress().onSuccess { silentAddress = it }.onFailure { error = explain(it) }
+        }
+    }
     // No amount, as a silent payment address.
     val anyAmount = way == Way.SILENT || way == Way.DONATIONS
     val shown = when (way) {

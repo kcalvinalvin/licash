@@ -31,7 +31,7 @@ fn an_accepted_spend_with_a_lost_response_keeps_its_inputs_and_retries_identical
     let file = dir.path().join("wallet.sqlite");
     ok(wallet(&file, &["init"], None));
     ok(wallet(&file, &["add-hub", &hub.url()], None));
-    let code = json(&file, &["code", "--sp"]);
+    let code = json(&file, &["code", "--onchain"]);
     let code: licash_wallet::PaymentCode = code["code"].as_str().unwrap().parse().unwrap();
     let funded = hub.pay_silent(&code.silent.unwrap().to_string(), 3_000, 1);
     hub.round();

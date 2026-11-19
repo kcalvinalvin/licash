@@ -195,6 +195,16 @@ pub async fn list(
     Ok(())
 }
 
+/// The hubs the wallet's codes name, preferred first
+/// ([`holder::code_hubs`]): its contracts judged live at the highest tip
+/// its hubs last said.
+pub fn code_hubs(wallet: &Wallet<Http>, path: &Path) -> anyhow::Result<Vec<String>> {
+    let hubs = wallet.hubs()?;
+    let tips = hubs.iter().filter_map(|(_, info)| info.locks.as_ref());
+    let tip = tips.map(|l| l.height).max().unwrap_or(0);
+    holder::code_hubs(wallet, dir(path), tip)
+}
+
 /// What is not protected at a hub: `held` there, of which its live
 /// contracts cover `covered`.
 pub struct Unprotected {

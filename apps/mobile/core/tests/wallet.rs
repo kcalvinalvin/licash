@@ -512,7 +512,7 @@ fn coins_found_on_bitcoin_take_their_blocks_time_in_the_history() {
     let net = Net::new(true);
     let light = Light::new(&net);
     let alice = net.wallet("alice", net.height());
-    let code = alice.payment_code(None).unwrap();
+    let code = alice.bitcoin_code(None).unwrap();
     net.mine(2, Vec::new());
     let payment = net.pay_silent(&code.qr, 3_000, 1);
     net.mine(1, vec![payment]);
@@ -547,16 +547,17 @@ fn a_phone_paid_on_bitcoin_moves_it_to_notes_and_pays_in_them() {
     );
     assert!(hubs[0].silent && hubs[0].mailbox);
 
-    // Paid at the silent payment address in her code: found in the one
-    // block whose filter matches, and shown first in her history.
-    // No address on Bitcoin for any wallet, unless asked for.
-    let code = alice.payment_code(None).unwrap();
-    assert!(code.qr.starts_with("BITCOIN:?SP=TSP1Q"), "{}", code.qr);
-    assert_eq!(code.address, None);
-    let asked = alice.bitcoin_code(None).unwrap().qr;
-    assert!(asked.starts_with("BITCOIN:BCRT1P"), "{asked}");
-    assert!(asked.contains("?SP=TSP1Q"), "{asked}");
-    assert!(code.qr.contains("&LICASH=TLICASH1Q"), "{}", code.qr);
+    // Paid at the silent payment address in her code on Bitcoin: found in
+    // the one block whose filter matches, and shown first in her history.
+    // Her code in notes says nothing of Bitcoin, nor her code on Bitcoin
+    // of notes.
+    let in_notes = alice.payment_code(None).unwrap();
+    assert!(in_notes.qr.starts_with("LICASH:TLICASH1Q"), "{}", in_notes.qr);
+    assert_eq!((&in_notes.address, &in_notes.silent), (&None, &None));
+    let code = alice.bitcoin_code(None).unwrap();
+    assert!(code.qr.starts_with("BITCOIN:BCRT1P"), "{}", code.qr);
+    assert!(code.qr.contains("?SP=TSP1Q"), "{}", code.qr);
+    assert!(!code.qr.contains("LICASH"), "{}", code.qr);
     // The silent payment address on its own, as in the code.
     let silent = code.silent.clone().expect("a silent payment address");
     assert!(silent.starts_with("tsp1q"), "{silent}");
@@ -745,15 +746,17 @@ fn a_phone_refuses_what_it_cannot_do_and_retries_an_uncertain_broadcast() {
     assert!(invalid(alice.pay(asking.text.clone(), Some(400))).contains("asks for 500, not 400"));
     let open = bob.payment_code(None).unwrap();
     assert!(invalid(alice.pay(open.text.clone(), None)).contains("does not say"));
-    // No notes to pay with: the payee's Bitcoin address instead.
+    // No notes to pay with, and no Bitcoin address to fall back to: a
+    // code pays in notes only.
     let unfunded = invalid(alice.pay(open.text, Some(10)));
-    assert!(unfunded.contains("on Bitcoin"), "{unfunded}");
+    assert!(unfunded.contains("holding 10 and the fee"), "{unfunded}");
+    assert!(!unfunded.contains("on Bitcoin"), "{unfunded}");
     assert!(invalid(alice.receive("{}".into(), false)).contains("not a payment"));
     assert!(alice.history().unwrap().is_empty());
 
     // A generic broadcast error cannot prove the signed spend was never
     // relayed. Its inputs stay reserved and scanning retries that spend.
-    let code = alice.payment_code(None).unwrap();
+    let code = alice.bitcoin_code(None).unwrap();
     let payment = net.pay_silent(&code.text, 3_000, 1);
     net.mine(1, vec![payment]);
     assert_eq!(scan(&alice, &light), (1, 3_000));
@@ -780,7 +783,7 @@ fn a_move_accepted_before_an_error_is_kept_and_rebroadcast_after_restart() {
     let net = Net::new(false);
     let light = Light::new(&net);
     let alice = net.wallet("alice", 0);
-    let code = alice.payment_code(None).unwrap();
+    let code = alice.bitcoin_code(None).unwrap();
     let payment = net.pay_silent(&code.text, 3_000, 1);
     net.mine(1, vec![payment]);
     assert_eq!(scan(&alice, &light), (1, 3_000));
@@ -820,8 +823,8 @@ fn a_phone_looks_for_payments_from_its_birthday_or_all_the_hub_indexed() {
     let unsure = net.wallet("unsure", born);
     std::fs::remove_file(net.dir.path().join("unsure/app.json")).unwrap();
     let pay = |n: u8| {
-        let to_young = net.pay_silent(&young.payment_code(None).unwrap().text, 2_000, n);
-        let to_unsure = net.pay_silent(&unsure.payment_code(None).unwrap().text, 2_000, n + 1);
+        let to_young = net.pay_silent(&young.bitcoin_code(None).unwrap().text, 2_000, n);
+        let to_unsure = net.pay_silent(&unsure.bitcoin_code(None).unwrap().text, 2_000, n + 1);
         net.mine(1, vec![to_young, to_unsure]);
         net.height()
     };
@@ -1071,16 +1074,21 @@ fn a_phone_pays_out_to_bitcoin_addresses_and_codes_of_hubs_it_does_not_trust() {
     };
     assert_eq!(asked.unwrap(), asked_for);
     // A code of a wallet at a hub she does not trust, saying where to
-    // reach it: paid in notes there if a swap brings them, else on Bitcoin
-    // at its fallback address.
+    // reach it: paid in notes there if a swap brings them. Its code on
+    // Bitcoin is an address to pay out to.
     let other = Net::new(true);
     let bob = other.wallet("bob", other.height());
-    let code = bob.bitcoin_code(None).unwrap();
-    let fallback = code.address.clone().unwrap();
-    match alice.scanned(code.qr.clone()).unwrap() {
-        Scanned::Visit {
+    let code = bob.payment_code(None).unwrap();
+    assert_eq!(
+        alice.scanned(code.qr.clone()).unwrap(),
+        Scanned::Visit { amount: None }
+    );
+    let onchain = bob.bitcoin_code(None).unwrap();
+    let fallback = onchain.address.clone().unwrap();
+    match alice.scanned(onchain.qr).unwrap() {
+        Scanned::Bitcoin {
             amount: None,
-            address: Some(address),
+            address,
         } => assert_eq!(address.to_lowercase(), fallback),
         other => panic!("{other:?}"),
     }
@@ -1352,7 +1360,7 @@ fn held(hash: &str) -> [u8; 32] {
 
 fn funded(net: &Net, light: &Arc<Light>, name: &str) -> Arc<Wallet> {
     let wallet = net.wallet(name, net.height());
-    let code = wallet.payment_code(None).unwrap();
+    let code = wallet.bitcoin_code(None).unwrap();
     let payment = net.pay_silent(&code.qr, 3_000, 1);
     net.mine(1, vec![payment]);
     assert_eq!(scan(&wallet, light), (1, 3_000));
@@ -1508,14 +1516,13 @@ fn a_phone_keeps_contacts_by_name_one_to_each_wallet() {
     let carol = net.wallet("carol", net.height());
     assert!(alice.contacts().unwrap().is_empty());
 
-    // Bob's code asking 500: kept asking nothing, paid at his silent
-    // payment address on Bitcoin rather than at a fallback address reused.
+    // Bob's code asking 500: kept asking nothing, paid in notes.
     let asking = bob.payment_code(Some(500)).unwrap();
     let kept = alice.save_contact(" Bob ".into(), asking.text).unwrap();
     assert_eq!(kept.name, "Bob");
     let code: PaymentCode = kept.code.parse().unwrap();
     assert_eq!((code.amount, &code.address), (None, &None));
-    assert!(code.silent.is_some() && code.licash.is_some(), "{code:?}");
+    assert!(code.silent.is_none() && code.licash.is_some(), "{code:?}");
     assert!(matches!(
         alice.scanned(kept.code.clone()).unwrap(),
         Scanned::Code {
@@ -1818,7 +1825,7 @@ fn a_phone_keeps_no_move_its_hub_never_answered_and_gives_up_those_kept_before()
     let net = Net::new(false);
     let light = Light::new(&net);
     let alice = net.wallet("alice", 0);
-    let code = alice.payment_code(None).unwrap();
+    let code = alice.bitcoin_code(None).unwrap();
     net.mine(1, vec![net.pay_silent(&code.text, 3_000, 1)]);
     assert_eq!(scan(&alice, &light), (1, 3_000));
     let moves = |wallet: &Wallet| {
@@ -1877,7 +1884,7 @@ fn a_move_whose_payment_is_in_a_block_is_moving_until_its_notes_arrive() {
     let net = Net::new(false);
     let light = Light::new(&net);
     let alice = net.wallet("alice", 0);
-    let code = alice.payment_code(None).unwrap();
+    let code = alice.bitcoin_code(None).unwrap();
     net.mine(1, vec![net.pay_silent(&code.text, 3_000, 1)]);
     assert_eq!(scan(&alice, &light), (1, 3_000));
     let moving = alice.move_to_licash(light.clone()).unwrap();
@@ -1926,7 +1933,7 @@ fn a_phone_shows_what_a_move_cost_and_how_deep_its_payment_is() {
     let light = Light::new(&net);
     let alice = net.wallet("alice", net.height());
     let url = alice.hubs().unwrap()[0].url.clone();
-    let code = alice.payment_code(None).unwrap();
+    let code = alice.bitcoin_code(None).unwrap();
     net.mine(2, Vec::new());
     let paying = net.pay_silent(&code.qr, 3_000, 1);
     net.mine(1, vec![paying.clone()]);
@@ -2276,7 +2283,7 @@ fn a_phone_takes_back_the_coins_of_a_move_whose_notes_it_never_claimed() {
     let net = Net::new(false);
     let light = Light::new(&net);
     let alice = net.wallet("alice", net.height());
-    let code = alice.payment_code(None).unwrap();
+    let code = alice.bitcoin_code(None).unwrap();
     net.mine(2, Vec::new());
     let payment = net.pay_silent(&code.qr, 3_000, 1);
     net.mine(1, vec![payment]);
@@ -2345,7 +2352,7 @@ fn a_phone_takes_back_the_coins_of_a_move_whose_notes_it_never_claimed() {
 /// her payment spends, pays and times out at, and the move's id. She
 /// never asked her hub since, and knows none of it.
 fn moved_unclaimed(net: &Net, light: &Arc<Light>, alice: &Wallet) -> (OutPoint, u64, u32, String) {
-    let code = alice.payment_code(None).unwrap();
+    let code = alice.bitcoin_code(None).unwrap();
     net.mine(2, Vec::new());
     let payment = net.pay_silent(&code.qr, 3_000, 1);
     net.mine(1, vec![payment]);

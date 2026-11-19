@@ -66,21 +66,21 @@ fn save(dir: &Path, contacts: &[Contact]) -> Result<(), LicashError> {
 }
 
 /// `text` as a contact keeps it: a code paying in notes on `network`,
-/// asking no amount. Its fallback address left out where a silent payment
-/// address takes its place: paid again, it would be reused.
+/// asking no amount.
 fn kept_code(text: &str, network: ChainProfile) -> Result<PaymentCode, LicashError> {
-    let mut code: PaymentCode = text.trim().parse().map_err(LicashError::invalid)?;
+    let code: PaymentCode = text.trim().parse().map_err(LicashError::invalid)?;
     code.check(network)?;
-    if code.licash.is_none() {
+    let Some(licash) = code.licash else {
         return Err(LicashError::invalid(
             "not a Licash code: a contact is paid in notes",
         ));
-    }
-    code.amount = None;
-    if code.silent.is_some() {
-        code.address = None;
-    }
-    Ok(code)
+    };
+    Ok(PaymentCode {
+        address: None,
+        amount: None,
+        silent: None,
+        licash: Some(licash),
+    })
 }
 
 /// Whether the code `text` pays the same Licash wallet as `code`.
@@ -194,7 +194,7 @@ mod tests {
         assert_eq!(load(dir.path()).unwrap(), Vec::new());
         let bob = Contact {
             name: "Bob".into(),
-            code: "bitcoin:?licash=x".into(),
+            code: "licash:x".into(),
         };
         save(dir.path(), std::slice::from_ref(&bob)).unwrap();
         assert_eq!(load(dir.path()).unwrap(), vec![bob]);

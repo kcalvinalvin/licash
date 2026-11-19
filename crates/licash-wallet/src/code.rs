@@ -1,12 +1,13 @@
-//! Payment codes: one text, or QR code, a payer scans to pay a wallet in
-//! notes or on Bitcoin, whichever it can.
+//! Payment codes: one text, or QR code, a payer scans to pay a wallet, in
+//! notes or on Bitcoin, one or the other.
 //!
-//! A code is a BIP321 URI,
-//! `bitcoin:<address>?sp=<silent payment address>&licash=<code>`, which any
-//! wallet can pay on Bitcoin: at the silent payment address if it pays
-//! them, else at the address, the wallet's fallback address. Its
-//! `licash` parameter is bech32m (BIP350), at most 1023 characters, under
-//! `licash` on mainnet and `tlicash` on the other networks, of version 0:
+//! A code to pay in notes is `licash:<code>[?amount=<sat>]`, its amount in
+//! satoshis. A code to pay on Bitcoin is a BIP321 URI,
+//! `bitcoin:<address>?sp=<silent payment address>`, which any wallet pays:
+//! at the silent payment address if it pays them, else at the address, the
+//! wallet's fallback address. A Licash code is bech32m (BIP350), at most
+//! 1023 characters, under `licash` on mainnet and `tlicash` on the other
+//! networks, of version 0:
 //! the network's byte, the 99 bytes of the wallet's [`Address`], then
 //! records of a type byte, a length byte and the value, in non-decreasing
 //! order of type:
@@ -14,7 +15,8 @@
 //! - 1, once at most: the x-only Nostr key of the wallet's mailbox, where
 //!   payers send it payments (NIP-17), on the relays its hubs name.
 //! - 2, any number up to [`MAX_HUBS`]: a hub the wallet is paid at
-//!   ([`HubId`]), in its order of preference.
+//!   ([`HubId`]), in its order of preference. A wallet names
+//!   [`CODE_HUBS`] at most.
 //! - 3, once at most for each hub of type 2: where to reach it, its
 //!   position among them (one byte), its URL's scheme (0 `https://`, 1
 //!   `http://`, of an onion service but on regtest) and the rest of its
@@ -22,7 +24,7 @@
 //!   whole stays within 260 bytes.
 //!
 //! Records of other types are skipped, and locations that are not; a code
-//! of a later version is ignored, leaving its payer the rest of the URI. A
+//! of a later version is refused. A
 //! hub named in a code is no reason to trust it: a payer pays at a hub it
 //! trusts already, or at one whose info proves it the hub named
 //! ([`licash_api::Info::proved`]) wherever it was reached.
@@ -48,6 +50,9 @@ use crate::{Error, Transport, Wallet};
 
 /// The most hubs a code names that a payer reads.
 pub const MAX_HUBS: usize = 8;
+/// The most hubs a wallet names in its codes: its few preferred, which
+/// keeps codes short and says little of where else it holds notes.
+pub const CODE_HUBS: usize = 3;
 
 const MAILBOX: u8 = 1;
 const HUB: u8 = 2;
@@ -74,7 +79,8 @@ impl HubId {
     }
 }
 
-/// What a payment code asks to be paid with.
+/// What a payment code asks to be paid with: in notes, if `licash`, else
+/// on Bitcoin.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PaymentCode {
     /// An address on Bitcoin, as in any BIP21 URI.
@@ -83,6 +89,8 @@ pub struct PaymentCode {
     pub amount: Option<u64>,
     /// A silent payment address (BIP352).
     pub silent: Option<SpAddress>,
+    /// The wallet to pay in notes: a code with it is written as a
+    /// `licash:` URI, without `address` or `silent`.
     pub licash: Option<LicashCode>,
 }
 
@@ -370,6 +378,13 @@ impl PaymentCode {
 
 impl fmt::Display for PaymentCode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(licash) = &self.licash {
+            write!(f, "licash:{licash}")?;
+            if let Some(amount) = self.amount {
+                write!(f, "?amount={amount}")?;
+            }
+            return Ok(());
+        }
         write!(f, "bitcoin:")?;
         if let Some(address) = &self.address {
             write!(f, "{}", address.assume_checked_ref())?;
@@ -387,9 +402,6 @@ impl fmt::Display for PaymentCode {
         if let Some(silent) = &self.silent {
             param(f, "sp", silent)?;
         }
-        if let Some(licash) = &self.licash {
-            param(f, "licash", licash)?;
-        }
         Ok(())
     }
 }
@@ -397,9 +409,10 @@ impl fmt::Display for PaymentCode {
 impl FromStr for PaymentCode {
     type Err = Error;
 
-    /// A BIP321 URI, or a bare address: a silent payment address, a Licash
-    /// code or an address on Bitcoin. Refused if it asks for something
-    /// this does not know (a `req-` parameter) or for nothing it can pay.
+    /// A `licash:` URI, a BIP321 URI, or a bare address: a silent payment
+    /// address, a Licash code or an address on Bitcoin. Refused if it asks
+    /// for something this does not know (a `req-` parameter) or for
+    /// nothing it can pay.
     fn from_str(s: &str) -> Result<Self, Error> {
         let s = s.trim();
         let mut code = Self {
@@ -408,10 +421,27 @@ impl FromStr for PaymentCode {
             silent: None,
             licash: None,
         };
-        let uri = s
-            .get(..8)
-            .is_some_and(|p| p.eq_ignore_ascii_case("bitcoin:"));
-        if !uri {
+        let scheme = |name: &str| s.get(..name.len()).is_some_and(|p| p.eq_ignore_ascii_case(name));
+        if scheme("licash:") {
+            let (path, query) = s[7..].split_once('?').unwrap_or((&s[7..], ""));
+            code.licash = Some(path.parse()?);
+            for pair in query.split('&').filter(|p| !p.is_empty()) {
+                let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+                let key = key.to_lowercase();
+                match key.as_str() {
+                    "amount" if code.amount.is_some() => {
+                        return Err(invalid(format!("{key} twice")))
+                    }
+                    "amount" => code.amount = Some(value.parse().map_err(invalid)?),
+                    _ if key.starts_with("req-") => {
+                        return Err(invalid(format!("it requires {key}")));
+                    }
+                    _ => {}
+                }
+            }
+            return Ok(code);
+        }
+        if !scheme("bitcoin:") {
             let lower = s.to_lowercase();
             if lower.starts_with("sp1") || lower.starts_with("tsp1") {
                 code.silent = Some(s.parse().map_err(invalid)?);
@@ -438,15 +468,13 @@ impl FromStr for PaymentCode {
                 }
                 "sp" if code.silent.is_some() => return Err(twice()),
                 "sp" => code.silent = Some(value.parse().map_err(invalid)?),
-                "licash" if code.licash.is_some() => return Err(twice()),
-                "licash" => code.licash = LicashCode::decode(value)?,
                 _ if key.starts_with("req-") => {
                     return Err(invalid(format!("it requires {key}")));
                 }
                 _ => {}
             }
         }
-        if code.address.is_none() && code.silent.is_none() && code.licash.is_none() {
+        if code.address.is_none() && code.silent.is_none() {
             return Err(invalid("nothing to pay"));
         }
         Ok(code)
@@ -497,17 +525,18 @@ impl CodeKeys {
 }
 
 impl<T: Transport> Wallet<T> {
-    /// The code payers pay this wallet with: at the hubs of `hubs`, which
-    /// it trusts, preferred first, each once, reached at those URLs, and its
-    /// mailbox if one of them names relays; on Bitcoin if `silent`, for
-    /// wallets that scan for it: at its silent payment address, and at a
-    /// fallback address for payers of no silent payments, handed out and
-    /// watched from then on, the next once it is paid.
-    pub fn payment_code(&self, hubs: &[String], silent: bool) -> Result<PaymentCode, Error> {
+    /// The code payers pay this wallet in notes with: at the first
+    /// [`CODE_HUBS`] of `hubs`, which it trusts, preferred first, each
+    /// once, reached at those URLs, and its mailbox if one of them names
+    /// relays.
+    pub fn payment_code(&self, hubs: &[String]) -> Result<PaymentCode, Error> {
         let trusted = self.hubs()?;
         let (mut ids, mut locations) = (Vec::new(), Vec::new());
         let mut relays = false;
         for url in hubs {
+            if ids.len() == CODE_HUBS {
+                break;
+            }
             let url = crate::hub_url(url)?;
             let (_, info) = trusted
                 .iter()
@@ -521,14 +550,10 @@ impl<T: Transport> Wallet<T> {
             relays |= !info.relays.is_empty();
         }
         let mailbox = relays.then(|| self.keys.mailbox.x_only_public_key(&Secp256k1::new()).0);
-        let address = match silent {
-            true => Some(self.fallback_address()?.as_unchecked().clone()),
-            false => None,
-        };
         Ok(PaymentCode {
-            address,
+            address: None,
             amount: None,
-            silent: silent.then(|| self.keys.silent.address()),
+            silent: None,
             licash: Some(LicashCode {
                 network: self.network,
                 address: self.address(),
@@ -539,11 +564,24 @@ impl<T: Transport> Wallet<T> {
         })
     }
 
+    /// The code payers pay this wallet on Bitcoin with, for wallets that
+    /// scan for it: at a fallback address for payers of no silent
+    /// payments, handed out and watched from then on, the next once it is
+    /// paid, and at its silent payment address if `silent`.
+    pub fn onchain_code(&self, silent: bool) -> Result<PaymentCode, Error> {
+        Ok(PaymentCode {
+            address: Some(self.fallback_address()?.as_unchecked().clone()),
+            amount: None,
+            silent: silent.then(|| self.keys.silent.address()),
+            licash: None,
+        })
+    }
+
     /// The code to take donations at: `kept`, a code given out before, as
     /// long as it still pays this wallet, at hubs it all trusts, so that
-    /// an address handed out stays as hubs are added; else its code at the
-    /// hubs it trusts, the first [`MAX_HUBS`], as it shows it.
-    pub fn donation_code(&self, kept: Option<&str>) -> Result<LicashCode, Error> {
+    /// an address handed out stays as hubs are added; else its code at
+    /// `hubs`, those it trusts in its order of preference, as it shows it.
+    pub fn donation_code(&self, kept: Option<&str>, hubs: &[String]) -> Result<LicashCode, Error> {
         let trusted: Vec<HubId> = (self.hubs()?.iter())
             .map(|(_, info)| HubId::of(&info.address))
             .collect();
@@ -560,14 +598,10 @@ impl<T: Transport> Wallet<T> {
                 return Ok(code);
             }
         }
-        let hubs: Vec<String> = (self.hubs()?.into_iter())
-            .map(|(url, _)| url)
-            .take(MAX_HUBS)
-            .collect();
         if hubs.is_empty() {
             return Err(Error::Invalid("no donations without a hub".into()));
         }
-        let code = self.payment_code(&hubs, false)?.licash;
+        let code = self.payment_code(hubs)?.licash;
         Ok(code.expect("a Licash code"))
     }
 

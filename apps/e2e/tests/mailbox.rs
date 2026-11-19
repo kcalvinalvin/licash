@@ -28,7 +28,7 @@ async fn a_payment_code_is_paid_through_the_payees_mailbox() -> anyhow::Result<(
     // Bob's code names the hub, which names the relay, and his mailbox.
     let info = bob.add_hub(hub).await?;
     ensure!(!info.relays.is_empty(), "the hub names no mailbox relay");
-    let code: PaymentCode = bob.payment_code(&[hub.to_owned()], false)?.qr().parse()?;
+    let code: PaymentCode = bob.payment_code(&[hub.to_owned()])?.qr().parse()?;
     code.check(alice.network())?;
     let licash = code.licash.context("a Licash code")?;
     let to = licash.mailbox.context("a mailbox")?;

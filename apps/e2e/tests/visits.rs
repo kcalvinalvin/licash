@@ -21,7 +21,7 @@ async fn a_wallet_pays_a_code_at_a_hub_it_does_not_trust_once_it_proves_it_is_th
     eco.pay_in(&alice, hub1, 30_000).await?;
     let bob = eco.wallet("visited")?;
     bob.add_hub(hub2).await?;
-    let code = bob.payment_code(&[hub2.to_owned()], false)?;
+    let code = bob.payment_code(&[hub2.to_owned()])?;
     let licash = code.licash.as_ref().context("a Licash code")?;
     assert_eq!(licash.locations.len(), 1, "{code}");
 

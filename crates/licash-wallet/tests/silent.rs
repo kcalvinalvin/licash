@@ -397,7 +397,7 @@ impl Setup {
 
     /// The fallback address a payment code hands out now, as a script.
     fn fallback(&self) -> ScriptBuf {
-        let code = self.wallet.payment_code(&[HUB.into()], true).unwrap();
+        let code = self.wallet.onchain_code(true).unwrap();
         code.address.unwrap().assume_checked().script_pubkey()
     }
 }
@@ -1345,7 +1345,7 @@ async fn a_fallback_address_is_watched_once_handed_out_and_the_next_once_paid() 
     s.wallet.watch_silent(HUB, 1).unwrap();
     let first = fallback_of(&s.wallet, 0);
     // None handed out: none watched, blocks without tweaks not even filtered.
-    let plain = s.wallet.payment_code(&[HUB.into()], false).unwrap();
+    let plain = s.wallet.payment_code(&[HUB.into()]).unwrap();
     assert_eq!(plain.address, None);
     let early = s.pay_plain(&first, 10_000);
     let paid = s.mine(vec![early]);
@@ -1354,7 +1354,7 @@ async fn a_fallback_address_is_watched_once_handed_out_and_the_next_once_paid() 
     assert_eq!(s.chain.lock().unwrap().filtered, 0);
 
     // Handed out in a code, its QR's too, and the same until paid.
-    let code = s.wallet.payment_code(&[HUB.into()], true).unwrap();
+    let code = s.wallet.onchain_code(true).unwrap();
     assert!(code.qr().starts_with("BITCOIN:BCRT1P"), "{}", code.qr());
     assert!(code.qr().contains("?SP=TSP1Q"), "{}", code.qr());
     assert_eq!(code.to_string().parse::<PaymentCode>().unwrap(), code);
@@ -1432,7 +1432,7 @@ async fn a_wallet_file_of_version_2_watches_no_fallback_until_it_hands_one_out()
     assert_eq!(scanned.next, 3);
     assert_eq!(chain.lock().unwrap().filtered, 0);
     // Handed out, then watched.
-    let code = wallet.payment_code(&[HUB.into()], true).unwrap();
+    let code = wallet.onchain_code(true).unwrap();
     let script = code.address.unwrap().assume_checked().script_pubkey();
     assert_eq!(script, fallback_of(&wallet, 0));
     let paying = chain.lock().unwrap().pay_plain(&script, 10_000);
@@ -1722,7 +1722,7 @@ async fn a_wallet_file_of_version_3_never_watching_finds_its_fallback_payment() 
     let wallet = Wallet::open(&path, Via(hub.clone())).unwrap();
     assert_eq!(wallet.silent_next().unwrap(), None);
     // The address it handed out, still.
-    let code = wallet.payment_code(&[HUB.into()], true).unwrap();
+    let code = wallet.onchain_code(true).unwrap();
     let script = code.address.unwrap().assume_checked().script_pubkey();
     assert_eq!(script, fallback_of(&wallet, 0));
     let paying = chain.lock().unwrap().pay_plain(&script, 10_000);

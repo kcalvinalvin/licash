@@ -538,7 +538,7 @@ async fn a_static_lnurl_takes_donations_for_a_wallet_offline() -> anyhow::Result
     // Quinn hands out her code's static LNURL once, then goes offline.
     let quinn = eco.wallet("quinn")?;
     quinn.add_hub(hub2).await?;
-    let code = quinn.payment_code(&[hub2.to_owned()], false)?;
+    let code = quinn.payment_code(&[hub2.to_owned()])?;
     let code = code.licash.expect("a Licash code").to_string();
     let lnurl = eco
         .exec(

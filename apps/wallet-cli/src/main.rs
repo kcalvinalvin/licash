@@ -94,18 +94,20 @@ enum Command {
         #[arg(long)]
         qr: bool,
     },
-    /// A payment code to show as text or a QR code: payers pay it in notes
-    /// at a hub it names that they trust, else on Bitcoin to its silent
-    /// payment address, if it has one.
+    /// A payment code to show as text or a QR code, `licash:...`: payers
+    /// pay it in notes at a hub it names that they trust, else once a swap
+    /// brought their notes there.
     Code {
-        /// A hub it is paid at, preferred first; repeat it for more
-        /// [default: the two trusted holding the most].
-        #[arg(long)]
+        /// A hub it is paid at, preferred first; repeat it for more, the
+        /// first three named [default: those whose contracts have the most
+        /// room to protect more, then those holding the least].
+        #[arg(long, conflicts_with = "onchain")]
         hub: Vec<String>,
-        /// With the wallet's silent payment address and a fallback address,
-        /// for payers to pay on Bitcoin: `onchain scan` finds what they pay.
+        /// Instead, the code to pay on Bitcoin, `bitcoin:...`: the wallet's
+        /// silent payment address and a fallback address. `onchain scan`
+        /// finds what they pay.
         #[arg(long)]
-        sp: bool,
+        onchain: bool,
         /// In upper case, which a QR code holds in fewer modules, and drawn
         /// as one on a terminal.
         #[arg(long)]
@@ -618,30 +620,34 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             show_qr(qr && !json, &address);
             show(json, json!({ "address": address }), address.clone());
         }
-        Command::Code { hub, sp, qr } => {
+        Command::Code { onchain: true, qr, .. } => {
+            let code = wallet.onchain_code(true)?;
+            let text = if qr { code.qr() } else { code.to_string() };
+            show_qr(qr && !json, &text);
+            show(json, json!({ "code": text, "onchain": true }), text.clone());
+        }
+        Command::Code { hub, qr, .. } => {
             let hubs = match hub.is_empty() {
                 false => hub,
-                true => {
-                    let mut balance = wallet.balance()?;
-                    balance.sort_by_key(|b| std::cmp::Reverse(b.available));
-                    balance.into_iter().take(2).map(|b| b.hub).collect()
-                }
+                true => contract::code_hubs(&wallet, &path)?,
             };
             if hubs.is_empty() {
                 bail!("no hub: `licash-wallet add-hub URL` trusts one");
             }
-            let code = wallet.payment_code(&hubs, sp)?;
-            let mailbox = code.licash.as_ref().is_some_and(|c| c.mailbox.is_some());
+            let code = wallet.payment_code(&hubs)?;
+            let licash = code.licash.as_ref().expect("a Licash code");
+            let mailbox = licash.mailbox.is_some();
             let text = if qr { code.qr() } else { code.to_string() };
             if !mailbox {
                 eprintln!(
                     "warning: none of its hubs names mailbox relays: payments they do not keep are handed over"
                 );
             }
+            let named: Vec<&String> = licash.locations.iter().map(|(_, url)| url).collect();
             show_qr(qr && !json, &text);
             show(
                 json,
-                json!({ "code": text, "hubs": hubs, "mailbox": mailbox, "sp": sp }),
+                json!({ "code": text, "hubs": named, "mailbox": mailbox, "onchain": false }),
                 text.clone(),
             );
         }

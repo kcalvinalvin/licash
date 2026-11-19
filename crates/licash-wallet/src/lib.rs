@@ -77,7 +77,9 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{de::DeserializeOwned, Serialize};
 
 pub use claims::{ClaimNote, ClaimSlot, LockClaim, OwedLock, SlotPays};
-pub use code::{ContractSecrets, DonationAddress, HubId, LicashCode, PaymentCode, MAX_HUBS};
+pub use code::{
+    ContractSecrets, DonationAddress, HubId, LicashCode, PaymentCode, CODE_HUBS, MAX_HUBS,
+};
 pub use coins::MAX_INPUTS;
 pub use delivery::{Delivery, Due, Inboxed, ACK_WITHIN, PAGES_AT_ONCE};
 pub use deposits::{Deposit, DepositState, DepositTerms};

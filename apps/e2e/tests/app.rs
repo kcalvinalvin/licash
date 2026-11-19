@@ -395,21 +395,21 @@ async fn used(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     phone.onboard().await?;
     phone.connect(hub).await?;
 
-    // Its code names the hub and its mailbox, and a silent payment
-    // address, the hub serving tweaks: no address on Bitcoin for any
-    // wallet until asked for, among the other ways.
+    // Its code names the hub and its mailbox, nothing on Bitcoin; its
+    // code on Bitcoin, among the other ways, an address for any wallet and
+    // a silent payment address, the hub serving tweaks, nothing in notes.
     let shown: PaymentCode = phone.code().await?.parse()?;
-    ensure!(shown.address.is_none(), "an address in {shown}");
-    let code: PaymentCode = phone.bitcoin_code().await?.parse()?;
     ensure!(
-        code.silent == shown.silent,
-        "another silent payment address"
+        shown.address.is_none() && shown.silent.is_none(),
+        "Bitcoin in {shown}"
     );
+    let licash = shown.licash.clone().context("a Licash code")?;
+    ensure!(licash.mailbox.is_some(), "no mailbox in {shown}");
+    let code: PaymentCode = phone.bitcoin_code().await?.parse()?;
+    ensure!(code.licash.is_none(), "a Licash code in {code}");
     let fallback = code.address.clone().context("a fallback address")?;
     let fallback = fallback.assume_checked().to_string();
     let silent = code.silent.context("a silent payment address")?;
-    let licash = code.licash.clone().context("a Licash code")?;
-    ensure!(licash.mailbox.is_some(), "no mailbox in {code}");
     // Paid at the fallback address: Home says it is on its way, then it
     // is found in a block and moved into the balance once asked, the next
     // address shown from then on.
@@ -438,7 +438,7 @@ async fn used(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
 
     let bob = eco.wallet("bob")?;
     bob.add_hub(hub).await?;
-    let bobs = bob.payment_code(&[hub.to_owned()], false)?;
+    let bobs = bob.payment_code(&[hub.to_owned()])?;
     // Check refusals before later payments build up enough notes to optimize.
     refused(eco, phone, &bobs).await?;
 
@@ -627,14 +627,14 @@ async fn refused(eco: &Eco, phone: &Phone, bobs: &PaymentCode) -> anyhow::Result
     asked(phone, "Not enough", 60).await?;
     phone.tap_id("cancel").await?;
 
-    phone.link("bitcoin:?licash=nonsense").await?;
+    phone.link("licash:nonsense").await?;
     asked(phone, "Neither a payment code", 30).await?;
     phone.tap_id("cancel").await?;
 
     // A code naming only a hub it does not use.
     let carol = eco.wallet("carol")?;
     carol.add_hub(eco.hub(2)).await?;
-    let carols = carol.payment_code(&[eco.hub(2).to_owned()], false)?;
+    let carols = carol.payment_code(&[eco.hub(2).to_owned()])?;
     phone.link(&carols.to_string()).await?;
     asked(phone, "Their hub is not one of yours", 30).await?;
     phone.tap_id("cancel").await?;
@@ -669,7 +669,7 @@ async fn visited(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     let held = phone.balance().await?;
     let dave = eco.wallet("dave")?;
     dave.add_hub(eco.hub(2)).await?;
-    let mut daves = dave.payment_code(&[eco.hub(2).to_owned()], false)?;
+    let mut daves = dave.payment_code(&[eco.hub(2).to_owned()])?;
     // Less than the provider swaps at least: some is left there.
     daves.amount = Some(800);
     phone.link(&daves.to_string()).await?;

@@ -1,5 +1,6 @@
 //! Payment codes: written and read back, as text and for QR codes, with
-//! the BIP321 URIs and bare addresses payers scan, and the wallet's.
+//! the `licash:` and BIP321 URIs and bare addresses payers scan, and the
+//! wallet's.
 
 #[allow(dead_code)]
 mod net;
@@ -15,7 +16,7 @@ use bitcoin::{
 use licash::{address::OwnerKeys, spend::ChainProfile};
 use licash_api::Fee;
 use licash_onchain::silent::Keys;
-use licash_wallet::{Error, HubId, LicashCode, PaymentCode, Wallet, MAX_HUBS};
+use licash_wallet::{Error, HubId, LicashCode, PaymentCode, Wallet, CODE_HUBS, MAX_HUBS};
 use net::{Link, Net, HUB};
 
 const REGTEST: ChainProfile = ChainProfile::Core30DefaultRegtest;
@@ -73,22 +74,18 @@ fn codes_read_back_as_written_in_text_and_for_qr_codes() {
         };
         let code = PaymentCode {
             address: None,
-            amount: None,
-            silent: Some(silent(kind)),
+            amount: Some(500),
+            silent: None,
             licash: Some(licash(network, 2)),
         };
         let text = code.to_string();
         let prefix = match kind {
-            NetworkKind::Main => "bitcoin:?sp=sp1q",
-            NetworkKind::Test => "bitcoin:?sp=tsp1q",
+            NetworkKind::Main => "licash:licash1q",
+            NetworkKind::Test => "licash:tlicash1q",
         };
         assert!(text.starts_with(prefix), "{text}");
-        let hrp = if kind == NetworkKind::Main {
-            "&licash=licash1q"
-        } else {
-            "&licash=tlicash1q"
-        };
-        assert!(text.contains(hrp), "{text}");
+        // Its amount in satoshis.
+        assert!(text.ends_with("?amount=500"), "{text}");
         assert_eq!(text.parse::<PaymentCode>().unwrap(), code);
         let qr = code.qr();
         assert_eq!(qr, text.to_uppercase());
@@ -96,6 +93,21 @@ fn codes_read_back_as_written_in_text_and_for_qr_codes() {
         code.check(network).unwrap();
         // Small enough for a QR code of version 13 at level M.
         assert!(qr.len() < 440, "{} characters", qr.len());
+        // On Bitcoin: its silent payment address, no Licash code.
+        let onchain = PaymentCode {
+            silent: Some(silent(kind)),
+            licash: None,
+            ..code.clone()
+        };
+        let text = onchain.to_string();
+        let prefix = match kind {
+            NetworkKind::Main => "bitcoin:?amount=0.000005&sp=sp1q",
+            NetworkKind::Test => "bitcoin:?amount=0.000005&sp=tsp1q",
+        };
+        assert!(text.starts_with(prefix), "{text}");
+        assert!(!text.contains("licash"), "{text}");
+        assert_eq!(text.parse::<PaymentCode>().unwrap(), onchain);
+        assert_eq!(onchain.qr().parse::<PaymentCode>().unwrap(), onchain);
         // Bare, the parts read alone.
         let bare = code.licash.as_ref().unwrap().to_string();
         assert_eq!(bare.parse::<LicashCode>().unwrap(), licash(network, 2));
@@ -144,6 +156,18 @@ fn bip21_uris_and_bare_addresses_are_read() {
     let sp = silent(NetworkKind::Test);
     refused(&format!("bitcoin:?sp={sp}&SP={sp}"), "sp twice");
     refused("hello", "");
+    // A Licash code is no Bitcoin URI's: one there is not read.
+    let licash = licash(REGTEST, 1);
+    let code: PaymentCode = format!("bitcoin:?sp={sp}&licash={licash}").parse().unwrap();
+    assert_eq!((code.licash, code.silent), (None, Some(sp)));
+    refused(&format!("bitcoin:?licash={licash}"), "nothing to pay");
+    // Its own URI's amount in satoshis, any parameter not required skipped.
+    let code: PaymentCode = format!("LICASH:{licash}?Amount=21&label=x").parse().unwrap();
+    assert_eq!((code.licash, code.amount), (Some(licash.clone()), Some(21)));
+    refused(&format!("licash:{licash}?amount=0.1"), "");
+    refused(&format!("licash:{licash}?amount=1&amount=2"), "amount twice");
+    refused(&format!("licash:{licash}?req-x=1"), "requires req-x");
+    refused("licash:", "");
 }
 
 #[test]
@@ -161,20 +185,13 @@ fn later_versions_and_records_are_skipped_and_malformed_codes_refused() {
         (read.mailbox, read.hubs),
         (Some([7; 32]), vec![HubId([0; 16])])
     );
-    // A later version: refused alone, ignored next to a silent payment
-    // address.
+    // A later version: refused.
     let later = encoded("tlicash", Fe32::P, &bytes(1, &[]));
     assert!(later.parse::<LicashCode>().is_err());
-    let sp = silent(NetworkKind::Test);
-    let code: PaymentCode = format!("bitcoin:?licash={later}&sp={sp}").parse().unwrap();
-    assert_eq!((code.licash, code.silent), (None, Some(sp)));
-    refused(&format!("bitcoin:?licash={later}"), "nothing to pay");
+    refused(&format!("licash:{later}"), "a later version");
     // Malformed.
     let bad = |hrp: &str, bytes: Vec<u8>, says: &str| {
-        refused(
-            &format!("bitcoin:?licash={}", encoded(hrp, Fe32::Q, &bytes)),
-            says,
-        )
+        refused(&format!("licash:{}", encoded(hrp, Fe32::Q, &bytes)), says)
     };
     bad(
         "tlicash",
@@ -292,7 +309,7 @@ fn locations_not_understood_are_skipped_and_the_rest_read() {
     // Before the hubs, as any record out of order: refused.
     let early = bytes(1, &[location(0, 0, b"hub.example"), hub(0)]);
     refused(
-        &format!("bitcoin:?licash={}", encoded("tlicash", Fe32::Q, &early)),
+        &format!("licash:{}", encoded("tlicash", Fe32::Q, &early)),
         "out of order",
     );
 }
@@ -354,11 +371,9 @@ async fn payers_pay_at_a_hub_the_code_names_that_they_trust_and_hold_enough_at()
     bob.add_hub(HUB2).await.unwrap();
     bob.receive(&net.pay(HUB2, &bob.address(), 50)).unwrap();
 
-    // Alice's code: her hubs, preferred first, her mailbox on their relays
-    // and her silent payment address.
-    let code = alice
-        .payment_code(&[HUB.into(), HUB2.into()], true)
-        .unwrap();
+    // Alice's code: her hubs, preferred first, her mailbox on their relays,
+    // nothing on Bitcoin.
+    let code = alice.payment_code(&[HUB.into(), HUB2.into()]).unwrap();
     let licash = code.licash.clone().unwrap();
     assert_eq!(licash.address, alice.address());
     let ids: Vec<HubId> = alice
@@ -372,26 +387,29 @@ async fn payers_pay_at_a_hub_the_code_names_that_they_trust_and_hold_enough_at()
     let mailbox = SecretKey::from_slice(&alice.mailbox_secret()).unwrap();
     let key = mailbox.x_only_public_key(&Secp256k1::new()).0.serialize();
     assert_eq!(licash.mailbox, Some(key));
-    assert_eq!(code.silent, Some(alice.silent_keys().address()));
+    assert_eq!((&code.silent, &code.address), (&None, &None));
     assert_eq!(code.to_string().parse::<PaymentCode>().unwrap(), code);
+    // On Bitcoin: her silent payment address and a fallback address.
+    let onchain = alice.onchain_code(true).unwrap();
+    assert_eq!(onchain.silent, Some(alice.silent_keys().address()));
+    assert!(onchain.address.is_some() && onchain.licash.is_none());
+    assert_eq!(onchain.to_string().parse::<PaymentCode>().unwrap(), onchain);
+    assert_eq!(alice.onchain_code(false).unwrap().silent, None);
     // Of her seed alone, the same once reopened.
     drop(alice);
     let path = dir.path().join("1.sqlite");
     let alice = Wallet::open(&path, Link(net.clone())).unwrap();
     assert_eq!(
-        alice
-            .payment_code(&[HUB.into(), HUB2.into()], true)
-            .unwrap(),
+        alice.payment_code(&[HUB.into(), HUB2.into()]).unwrap(),
         code
     );
     // A hub named twice is named once.
     let twice = [HUB.into(), HUB2.into(), HUB2.into()];
-    assert_eq!(alice.payment_code(&twice, true).unwrap(), code);
-    let plain = alice.payment_code(&[HUB2.into()], false).unwrap();
-    assert_eq!(plain.silent, None);
+    assert_eq!(alice.payment_code(&twice).unwrap(), code);
+    let plain = alice.payment_code(&[HUB2.into()]).unwrap();
     assert_eq!(plain.licash.unwrap().hubs, vec![HubId::of(&info2.address)]);
     // Hubs she does not trust are not hers to name.
-    let unknown = alice.payment_code(&["http://other.test".into()], true);
+    let unknown = alice.payment_code(&["http://other.test".into()]);
     assert!(matches!(unknown, Err(Error::UnknownHub(_))), "{unknown:?}");
 
     // Bob pays at the hub he trusts and holds enough at, its fee on top;
@@ -408,8 +426,33 @@ async fn payers_pay_at_a_hub_the_code_names_that_they_trust_and_hold_enough_at()
     // No relays named: no mailbox.
     net.relays.lock().unwrap().clear();
     carol.add_hub(HUB).await.unwrap();
-    let code = carol.payment_code(&[HUB.into()], false).unwrap();
+    let code = carol.payment_code(&[HUB.into()]).unwrap();
     assert_eq!(code.licash.unwrap().mailbox, None);
+}
+
+#[tokio::test]
+async fn a_wallet_names_its_few_preferred_hubs_in_its_code() {
+    let net = Net::new();
+    let urls: Vec<String> = (0..CODE_HUBS + 2)
+        .map(|n| format!("http://hub{n}.test"))
+        .collect();
+    let dir = tempfile::tempdir().unwrap();
+    let alice = wallet(&net, &dir, 1);
+    let mut ids = Vec::new();
+    for url in &urls {
+        net.start(url, Fee { base: 0, ppm: 0 });
+        ids.push(HubId::of(&alice.add_hub(url).await.unwrap().address));
+    }
+    // The first named, preferred first; the last, the others in reverse.
+    let code = alice.payment_code(&urls).unwrap().licash.unwrap();
+    assert_eq!(code.hubs, ids[..CODE_HUBS]);
+    let reversed: Vec<String> = urls.iter().rev().cloned().collect();
+    let code = alice.payment_code(&reversed).unwrap().licash.unwrap();
+    let wanted: Vec<HubId> = ids.iter().rev().take(CODE_HUBS).copied().collect();
+    assert_eq!(code.hubs, wanted);
+    // Written as such, the hubs and their locations within reach.
+    let read: LicashCode = code.to_string().parse().unwrap();
+    assert_eq!(read, code);
 }
 
 #[tokio::test]
@@ -458,7 +501,7 @@ async fn a_wallet_code_says_where_it_reaches_its_hubs() {
     let info = alice.add_hub(HUB).await.unwrap();
     let info2 = alice.add_hub(HUB2).await.unwrap();
     let hubs = [format!("{HUB2}/"), HUB.into(), HUB2.into()];
-    let code = alice.payment_code(&hubs, false).unwrap().licash.unwrap();
+    let code = alice.payment_code(&hubs).unwrap().licash.unwrap();
     let read: LicashCode = code.to_string().parse().unwrap();
     let wanted = vec![
         (HubId::of(&info2.address), HUB2.to_owned()),
@@ -492,17 +535,22 @@ async fn a_code_given_out_for_donations_stays_while_it_pays_the_wallet() {
     net.start(HUB2, Fee { base: 0, ppm: 0 });
     let dir = tempfile::tempdir().unwrap();
     let (alice, bob) = (wallet(&net, &dir, 1), wallet(&net, &dir, 2));
+    let trusted = |w: &Wallet<Link>| -> Vec<String> {
+        w.hubs().unwrap().into_iter().map(|(url, _)| url).collect()
+    };
     // No hub, no donations.
-    assert!(matches!(alice.donation_code(None), Err(Error::Invalid(_))));
+    let none = alice.donation_code(None, &trusted(&alice));
+    assert!(matches!(none, Err(Error::Invalid(_))));
     alice.add_hub(HUB).await.unwrap();
-    let given = alice.donation_code(None).unwrap();
+    let given = alice.donation_code(None, &trusted(&alice)).unwrap();
     assert_eq!(given.hubs.len(), 1);
     // A hub added: the code shown names it, the one given out stays.
     alice.add_hub(HUB2).await.unwrap();
-    let now = alice.donation_code(None).unwrap();
+    let hubs = trusted(&alice);
+    let now = alice.donation_code(None, &hubs).unwrap();
     assert_eq!(now.hubs.len(), 2);
     let text = given.to_string();
-    assert_eq!(alice.donation_code(Some(&text)).unwrap(), given);
+    assert_eq!(alice.donation_code(Some(&text), &hubs).unwrap(), given);
     // Not one paying her, at hubs she trusts: the code shown instead.
     let mut unknown = given.clone();
     unknown.hubs.push(HubId([9; 16]));
@@ -510,11 +558,11 @@ async fn a_code_given_out_for_donations_stays_while_it_pays_the_wallet() {
     mailed.mailbox = Some([7; 32]);
     let bobs = {
         bob.add_hub(HUB).await.unwrap();
-        bob.donation_code(None).unwrap()
+        bob.donation_code(None, &trusted(&bob)).unwrap()
     };
     for other in [unknown, mailed, bobs] {
-        let kept = alice.donation_code(Some(&other.to_string())).unwrap();
+        let kept = alice.donation_code(Some(&other.to_string()), &hubs).unwrap();
         assert_eq!(kept, now, "{other:?}");
     }
-    assert_eq!(alice.donation_code(Some("nonsense")).unwrap(), now);
+    assert_eq!(alice.donation_code(Some("nonsense"), &hubs).unwrap(), now);
 }

@@ -842,15 +842,12 @@ pub enum Scanned {
     },
     /// A payment code naming no hub the wallet trusts that says where to
     /// reach its hubs: to pay in notes at one, visited, proving it is the
-    /// one named, if the owner agrees ([`Wallet::pay_quote`]), else on
-    /// Bitcoin at `address`, if it names one; `amount` if it says.
-    Visit {
-        amount: Option<u64>,
-        address: Option<String>,
-    },
-    /// An address on Bitcoin, or a code naming one and no hub the wallet
-    /// trusts: to pay out to from notes, through a swap provider
-    /// ([`Wallet::payout_quote`]), `amount` if it says.
+    /// one named, if the owner agrees ([`Wallet::pay_quote`]); `amount` if
+    /// it says.
+    Visit { amount: Option<u64> },
+    /// An address on Bitcoin, or a `bitcoin:` code naming one: to pay out
+    /// to from notes, through a swap provider ([`Wallet::payout_quote`]),
+    /// `amount` if it says.
     Bitcoin {
         address: String,
         amount: Option<u64>,

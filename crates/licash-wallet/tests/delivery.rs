@@ -40,7 +40,7 @@ async fn pair(conduct: Conduct) -> Pair {
     alice.add_hub(HUB).await.unwrap();
     bob.add_hub(HUB).await.unwrap();
     alice.receive(&net.pay(HUB, &alice.address(), 50)).unwrap();
-    let code = bob.payment_code(&[HUB.into()], false).unwrap();
+    let code = bob.payment_code(&[HUB.into()]).unwrap();
     let code = code.licash.unwrap();
     assert!(code.mailbox.is_some());
     Pair {
@@ -460,7 +460,7 @@ async fn a_payment_under_a_key_refused_for_its_fee_is_given_up_not_made_again() 
     bob.add_hub(HUB).await.unwrap();
     alice.receive(&net.pay(HUB, &alice.address(), 50)).unwrap();
     let code = bob
-        .payment_code(&[HUB.into()], false)
+        .payment_code(&[HUB.into()])
         .unwrap()
         .licash
         .unwrap();

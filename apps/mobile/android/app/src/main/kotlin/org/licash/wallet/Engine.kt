@@ -1014,8 +1014,11 @@ class Engine(context: Context) {
 
     suspend fun code(amount: ULong?): Result<Code> = io { local { it.paymentCode(amount) } }
 
-    /** [code], with an address on Bitcoin any wallet pays: handed out, and watched from then on. */
+    /** The code on Bitcoin: an address any wallet pays, handed out, and watched from then on. */
     suspend fun bitcoinCode(amount: ULong?): Result<Code> = io { local { it.bitcoinCode(amount) } }
+
+    /** The silent payment address alone. */
+    suspend fun silentAddress(): Result<String> = io { local { it.silentAddress() } }
 
     /**
      * The wallet's static address of donations, through a swap provider

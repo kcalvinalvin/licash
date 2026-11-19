@@ -195,7 +195,8 @@ impl Wallet {
     pub fn donation_address(&self) -> Result<Option<DonationAddress>, LicashError> {
         let pinned = self.kept().donations;
         let kept_code = pinned.as_ref().and_then(|p| p.code.clone());
-        let code = match self.wallet.donation_code(kept_code.as_deref()) {
+        let hubs = self.code_hubs()?;
+        let code = match self.wallet.donation_code(kept_code.as_deref(), &hubs) {
             Ok(code) => code,
             // No hub, no donations.
             Err(licash_wallet::Error::Invalid(_)) => return Ok(None),
@@ -206,7 +207,7 @@ impl Wallet {
         // None at the hubs of the code kept: the one the wallet shows now.
         let mut code = code;
         if choice.shown.is_none() && kept_code.is_some() {
-            let now = self.wallet.donation_code(None)?;
+            let now = self.wallet.donation_code(None, &hubs)?;
             if now != code {
                 choice = self.offer(None, &now);
                 code = now;

@@ -1262,23 +1262,25 @@ fn owners_pay_payment_codes_through_mailboxes_or_by_hand() {
     ok(wallet(&alice, &["receive"], Some(&funding)));
 
     // Bob's code names his hub and his mailbox on its relays; as a QR
-    // code, in upper case, with his silent payment address.
+    // code, in upper case. His code on Bitcoin, his silent payment address
+    // and a fallback address, names no hub.
     let code = json(&bob, &["code"]);
     assert_eq!(
-        (code["mailbox"].as_bool(), code["sp"].as_bool()),
+        (code["mailbox"].as_bool(), code["onchain"].as_bool()),
         (Some(true), Some(false))
     );
     let text = code["code"].as_str().unwrap().to_owned();
-    assert!(text.starts_with("bitcoin:?licash=tlicash1q"), "{text}");
-    let qr = ok(wallet(&bob, &["code", "--qr", "--sp"], None))
-        .trim()
-        .to_owned();
+    assert!(text.starts_with("licash:tlicash1q"), "{text}");
+    let onchain = ok(wallet(&bob, &["code", "--qr", "--onchain"], None));
+    let onchain = onchain.trim();
     assert!(
-        qr.starts_with("BITCOIN:BCRT1P")
-            && qr.contains("?SP=TSP1Q")
-            && qr.contains("&LICASH=TLICASH1Q"),
-        "{qr}"
+        onchain.starts_with("BITCOIN:BCRT1P")
+            && onchain.contains("?SP=TSP1Q")
+            && !onchain.contains("LICASH"),
+        "{onchain}"
     );
+    let qr = ok(wallet(&bob, &["code", "--qr"], None)).trim().to_owned();
+    assert!(qr.starts_with("LICASH:TLICASH1Q"), "{qr}");
 
     // Alice pays it: sent to his mailbox, nothing to hand over. Of her
     // three notes received, it is well within what the relay takes.
@@ -1302,8 +1304,9 @@ fn owners_pay_payment_codes_through_mailboxes_or_by_hand() {
     assert_eq!(ok(wallet(&bob, &["mailbox"], None)).trim(), "nothing new");
 
     // What the code asks for, unless told otherwise; more than she holds
-    // and its fee is for Bitcoin, at the silent payment address.
-    let asking = text.replacen("bitcoin:?", "bitcoin:?amount=0.0000002&", 1);
+    // and its fee is not paid: the code says nothing of Bitcoin.
+    assert!(!text.contains('?'), "{text}");
+    let asking = format!("{text}?amount=20");
     let output = wallet(&alice, &["pay", &asking], None);
     let handed = match too_large_to_mail(&output) {
         None => {
@@ -1339,13 +1342,9 @@ fn owners_pay_payment_codes_through_mailboxes_or_by_hand() {
         1,
         "the code does not say",
     );
-    failed(wallet(&alice, &["pay", &qr, "49"], None), 1, "on Bitcoin");
-    let sp = qr.split(['=', '&']).nth(1).unwrap().to_lowercase();
-    failed(
-        wallet(&alice, &["pay", &qr, "49"], None),
-        1,
-        &format!("pay {sp} on Bitcoin"),
-    );
+    let unpaid = wallet(&alice, &["pay", &qr, "49"], None);
+    failed(unpaid.clone(), 1, "holding 49 and the fee");
+    assert!(!String::from_utf8_lossy(&unpaid.stderr).contains("on Bitcoin"));
     match handed {
         None => assert_eq!(json(&bob, &["mailbox"])["received"][0]["amount"], 20),
         Some(payment) => {
@@ -1626,7 +1625,7 @@ fn a_wallet_watching_collects_what_it_is_paid_and_mails_what_is_due() {
 
 /// The fallback and silent payment addresses of `file`'s code.
 fn on_bitcoin(file: &Path) -> (String, String, String) {
-    let text = json(file, &["code", "--sp"])["code"]
+    let text = json(file, &["code", "--onchain"])["code"]
         .as_str()
         .unwrap()
         .to_owned();

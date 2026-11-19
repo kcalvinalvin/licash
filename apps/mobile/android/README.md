@@ -274,7 +274,8 @@ A counterpart on the command line:
 ```sh
 export LICASH_WALLET_NETWORK=signet LICASH_WALLET_CHAIN=URL
 licash-wallet init && licash-wallet add-hub HUB_URL
-licash-wallet code --sp           # for the app to scan and pay
+licash-wallet code                # for the app to scan and pay in notes
+licash-wallet code --onchain      # for the app to pay on Bitcoin
 licash-wallet mailbox             # the payments it sent
 licash-wallet pay 'CODE' 1000     # pay the code the app shows
 licash-wallet onchain scan        # coins paid on Bitcoin

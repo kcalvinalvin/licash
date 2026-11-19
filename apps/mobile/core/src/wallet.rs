@@ -13,7 +13,7 @@ use licash_nostr::{
     Route,
 };
 use licash_transport::Http;
-use licash_wallet::{DepositState, PartTo, PaymentCode, Unlinking, MAX_HUBS};
+use licash_wallet::{DepositState, PartTo, PaymentCode, Unlinking};
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 
@@ -254,25 +254,27 @@ impl Wallet {
 }
 
 impl Wallet {
-    /// The wallet's code, `amount` if given, with its fallback address on
-    /// Bitcoin if `fallback`.
-    fn code(&self, amount: Option<u64>, fallback: bool) -> Result<Code, LicashError> {
-        let trusted = self.wallet.hubs()?;
-        let hubs: Vec<String> = trusted
-            .iter()
-            .map(|(url, _)| url.clone())
-            .take(MAX_HUBS)
-            .collect();
-        let mut code = self.wallet.payment_code(&hubs, false)?;
+    /// The hubs the wallet's codes name, preferred first
+    /// ([`licash_contracts::holder::code_hubs`]).
+    pub(crate) fn code_hubs(&self) -> Result<Vec<String>, LicashError> {
+        licash_contracts::holder::code_hubs(&self.wallet, &self.dir, self.tip())
+            .map_err(LicashError::failed)
+    }
+
+    /// The wallet's code, `amount` if given: in notes, else on Bitcoin if
+    /// `onchain`.
+    fn code(&self, amount: Option<u64>, onchain: bool) -> Result<Code, LicashError> {
+        let mut code = match onchain {
+            // Payers pay a silent payment address rather than the
+            // fallback: only if a hub's tweaks find those payments.
+            true => {
+                let trusted = self.wallet.hubs()?;
+                let tweaks = trusted.iter().any(|(_, info)| info.tweaks.is_some());
+                self.wallet.onchain_code(tweaks)?
+            }
+            false => self.wallet.payment_code(&self.code_hubs()?)?,
+        };
         code.amount = amount.filter(|a| *a > 0);
-        // Payers pay a silent payment address rather than the fallback:
-        // only if a hub's tweaks find those payments.
-        if trusted.iter().any(|(_, info)| info.tweaks.is_some()) {
-            code.silent = Some(self.wallet.silent_keys().address());
-        }
-        if fallback {
-            code.address = Some(self.wallet.fallback_address()?.as_unchecked().clone());
-        }
         Ok(Code {
             text: code.to_string(),
             qr: code.qr(),
@@ -578,19 +580,25 @@ impl Wallet {
         Ok(self.wallet.fallback_address()?.to_string())
     }
 
-    /// The code to be paid at, `amount` if given: in notes at the hubs
-    /// trusted, and at the wallet's silent payment address while a hub's
-    /// tweaks find payments to it. No address on Bitcoin for any wallet:
-    /// that is [`Wallet::bitcoin_code`], on request.
+    /// The code to be paid at in notes, `amount` if given, at the few hubs
+    /// it prefers of those trusted. Nothing on Bitcoin: that is
+    /// [`Wallet::bitcoin_code`].
     pub fn payment_code(&self, amount: Option<u64>) -> Result<Code, LicashError> {
         self.code(amount, false)
     }
 
-    /// [`Wallet::payment_code`], with an address on Bitcoin any wallet
-    /// pays: handed out and watched from then on, the next once it is
-    /// paid.
+    /// The code to be paid at on Bitcoin, `amount` if given: an address
+    /// any wallet pays, handed out and watched from then on, the next once
+    /// it is paid, and the wallet's silent payment address while a hub's
+    /// tweaks find payments to it.
     pub fn bitcoin_code(&self, amount: Option<u64>) -> Result<Code, LicashError> {
         self.code(amount, true)
+    }
+
+    /// The wallet's silent payment address alone, for wallets paying
+    /// those only: found paid while a hub's tweaks find payments to it.
+    pub fn silent_address(&self) -> String {
+        self.wallet.silent_keys().address().to_string()
     }
 
     /// What `text`, scanned or pasted, is: a code to pay in notes if it
@@ -639,10 +647,6 @@ impl Wallet {
             {
                 return Ok(Scanned::Visit {
                     amount: code.amount,
-                    address: code
-                        .address
-                        .as_ref()
-                        .map(|a| a.assume_checked_ref().to_string()),
                 });
             }
             if let Some(address) = &code.address {

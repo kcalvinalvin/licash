@@ -78,7 +78,7 @@ impl Eco {
         .unwrap();
         payee.add_hub(A).await.unwrap();
         let code = payee
-            .payment_code(&[A.into()], false)
+            .payment_code(&[A.into()])
             .unwrap()
             .licash
             .unwrap()
@@ -506,7 +506,8 @@ impl Transport for Via {
 async fn donation(
     wallet: Wallet<Via>,
 ) -> Result<licash_wallet::DonationAddress, licash_wallet::Error> {
-    let code = wallet.donation_code(None)?;
+    let hubs: Vec<String> = wallet.hubs()?.into_iter().map(|(url, _)| url).collect();
+    let code = wallet.donation_code(None, &hubs)?;
     wallet.donation_address(PROVIDER, &code).await
 }
 

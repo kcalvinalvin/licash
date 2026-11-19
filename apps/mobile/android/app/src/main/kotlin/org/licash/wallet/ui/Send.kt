@@ -62,11 +62,10 @@ import org.licash.wallet.share
 
 private sealed interface Step {
     data object Looking : Step
-    /** A code to pay in notes; on Bitcoin at `address` if it cannot be. */
+    /** A code to pay in notes. */
     data class Paying(
         val code: String,
         val asked: ULong?,
-        val address: String? = null,
         val visit: Boolean = false,
     ) : Step
     data object Planning : Step
@@ -78,8 +77,7 @@ private sealed interface Step {
         val provider: String? = null,
         val through: String? = null,
     ) : Step
-    data class Visit(val code: String, val asked: ULong?, val address: String?) : Step
-    data class Unpayable(val why: String, val address: String, val amount: ULong?) : Step
+    data class Visit(val code: String, val asked: ULong?) : Step
     data class Invoice(val text: String, val quote: InvoiceQuote) : Step
     data class Address(val address: String) : Step
     data class Payout(val quote: PayoutQuote, val asked: ULong? = null) : Step
@@ -188,7 +186,7 @@ fun Send(
                             scanned.notes -> Step.Paying(text, scanned.amount)
                             else -> Step.Failed("This code names no hub you use, and no Bitcoin address to pay.", "Can't pay this")
                         }
-                        scanned is Scanned.Visit -> Step.Visit(text, scanned.amount, scanned.address)
+                        scanned is Scanned.Visit -> Step.Visit(text, scanned.amount)
                         scanned is Scanned.Bitcoin -> when (val asked = scanned.amount) {
                             null -> Step.Address(scanned.address)
                             else -> quoting(scanned.address, asked)
@@ -250,14 +248,7 @@ fun Send(
                         Step.Review(s.code, amount, quote)
                     }
                 },
-                { e ->
-                    val address = s.address
-                    if (address == null || e is LicashException.Insufficient) {
-                        tooLittle(e)
-                    } else {
-                        Step.Unpayable(explain(e), address, amount ?: s.asked)
-                    }
-                },
+                { e -> tooLittle(e) },
             )
         }
     }
@@ -373,20 +364,8 @@ fun Send(
                     "Their hub is not one of yours.",
                     "Pay there",
                     {
-                        val paying = Step.Paying(s.code, s.asked, s.address, visit = true)
+                        val paying = Step.Paying(s.code, s.asked, visit = true)
                         if (s.asked != null) plan(paying, null, null) else step = paying
-                    },
-                    back,
-                )
-                is Step.Unpayable -> Ask(
-                    "Pay on Bitcoin instead?",
-                    s.why,
-                    "Pay on Bitcoin",
-                    {
-                        when (val amount = s.amount) {
-                            null -> step = Step.Address(s.address)
-                            else -> quote(s.address, amount)
-                        }
                     },
                     back,
                 )

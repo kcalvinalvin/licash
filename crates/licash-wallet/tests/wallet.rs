@@ -484,7 +484,7 @@ async fn a_hub_visited_proves_it_is_the_one_a_code_names_and_is_not_trusted() {
         pending: 0,
     };
     assert_eq!(bob.visited_balance().unwrap(), [apart]);
-    let code = bob.payment_code(&[OTHER.into()], false);
+    let code = bob.payment_code(&[OTHER.into()]);
     assert!(matches!(code, Err(Error::UnknownHub(_))), "{code:?}");
     // Nor asked for what its proof does not cover.
     refused(bob.deposit(OTHER, 1_000).await, "only visited");
