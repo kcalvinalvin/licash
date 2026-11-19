@@ -41,7 +41,7 @@ async fn hub(rt: &Regtest, dir: &Path) -> Result<(String, Source)> {
 
 /// The hub's deposits, which every contract's reserve returns to, scanning
 /// the chain of `source` and bound to the contracts in `openings`.
-fn deposits_for(
+async fn deposits_for(
     hub: &Arc<Hub>,
     source: &Source,
     dir: &Path,
@@ -57,6 +57,9 @@ fn deposits_for(
     let deposits = Arc::new(deposits);
     licash_hub_service::close_with_deposits(openings, deposits.clone());
     tokio::spawn(deposits.clone().run());
+    // An opening takes a deposit of the hub's for her reserve, which it
+    // gives only once it follows a chain.
+    followed(hub, source, &deposits).await?;
     Ok(deposits)
 }
 
@@ -85,10 +88,7 @@ async fn hub_serving(
     let keyset = hub.info().keysets[0].clone();
     let openings = Openings::with_wallet(dir, source.clone(), source.clone(), keyset, range);
     let openings = openings.await?;
-    let deposits = deposits_for(&hub, &source, dir, &openings)?;
-    // An opening takes a deposit of the hub's for her reserve, which it
-    // gives only once it follows a chain.
-    followed(&hub, &source, &deposits).await?;
+    let deposits = deposits_for(&hub, &source, dir, &openings).await?;
     let services = Services {
         contracts: Some(openings),
         deposits: Some(deposits),
@@ -1948,7 +1948,7 @@ async fn hub_answering_through(
     let openings = openings.await?;
     // Its ledger against holders' claims, as the hub service's.
     licash_hub_service::answer_from(&openings, hub.clone());
-    let deposits = deposits_for(&hub, &source, dir, &openings)?;
+    let deposits = deposits_for(&hub, &source, dir, &openings).await?;
     let services = Services {
         contracts: Some(openings.clone()),
         deposits: Some(deposits),
