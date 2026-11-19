@@ -330,6 +330,7 @@ pub fn trust(profile: ChainProfile) -> Result<Trust> {
             program: SIGNET,
             mock: false,
             compact: SIGNET_COMPACT,
+            lean: SIGNET_LEAN,
         }),
         _ => bail!("contracts are not opened on {profile} yet"),
     }
@@ -350,6 +351,11 @@ pub const SIGNET: [u8; 32] =
 /// id only when it is ([`Trust::compact`]), and holders refuse one that
 /// is quoted otherwise.
 pub const SIGNET_COMPACT: bool = true;
+
+/// Whether [`SIGNET`] decides the lean filing, as [`SIGNET_COMPACT`] says of
+/// the compact one: set in the same change as the program that does. Hubs
+/// quote a graph of id [`licash::recovery::LEAN_FROM`] only when it is.
+pub const SIGNET_LEAN: bool = false;
 
 /// The programs signet contracts opened under before [`SIGNET`], newest
 /// first: no contract opens under them, those that did are played still.

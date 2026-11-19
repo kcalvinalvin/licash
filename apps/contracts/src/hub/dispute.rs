@@ -1145,11 +1145,16 @@ impl Openings {
             (&x_block, &x.compute_txid()),
             disclosure.as_ref().map(|(block, txid)| (block, txid)),
         )?;
+        let keys = Some(o.holder.request_keys()?);
+        // The items of her filing it proves invalid, which it finds itself.
+        let invalid = licash_hp::flagged(&o.base, keys.as_ref(), &exit, &evidence)
+            .map_err(|e| anyhow!("{e}"))?;
         let input = licash_hp::HubInput {
             base: o.base.clone(),
             exit,
             evidence,
-            keys: Some(o.holder.request_keys()?),
+            keys,
+            invalid,
         };
         match licash_hp::check(&input) {
             Ok(j) if j == graph::journal(&o.base) => Ok(Ok(input)),

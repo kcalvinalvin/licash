@@ -35,7 +35,7 @@ use licash::{
     chain::Chain,
     crypto::tagged_hash,
     disclosure::Disclosures,
-    recovery::{self, Evidence, Owed},
+    recovery::{self, Evidence, Format, Owed},
     request::Request,
 };
 use licash_statement::{
@@ -215,6 +215,10 @@ pub struct HubInput {
     pub exit: Exit,
     pub evidence: Vec<Evidence>,
     pub keys: Option<RequestKeys>,
+    /// Under a lean format, the items of her filing the Hub says are invalid
+    /// ([`recovery::owed_flagged`]): none, else, unless they are the items
+    /// that are not, no proof. Zero under another.
+    pub invalid: u32,
 }
 
 impl HubInput {
@@ -226,6 +230,9 @@ impl HubInput {
         w.bytes(&recovery::evidence_to_bytes(&self.evidence));
         if let (Some(_), Some(keys)) = (self.base.version().holder_wots(), &self.keys) {
             keys.write(&mut w);
+        }
+        if Format::of(&self.base).lean() {
+            w.put(&self.invalid.to_be_bytes());
         }
         w.0
     }
@@ -248,12 +255,17 @@ impl HubInput {
             None => None,
             Some(_) => Some(RequestKeys::read(&mut r).ok_or(Refusal::Input)?),
         };
+        let invalid = match Format::of(&base).lean() {
+            true => u32::from_be_bytes(r.take::<4>().map_err(|_| Refusal::Input)?),
+            false => 0,
+        };
         r.end().map_err(|_| Refusal::Input)?;
         Ok(Self {
             base,
             exit,
             evidence,
             keys,
+            invalid,
         })
     }
 }
@@ -267,7 +279,19 @@ pub fn decide(
     exit: &Exit,
     evidence: &[Evidence],
 ) -> Result<(Owed, Read), Refusal> {
-    decide_with(base, keys, exit, evidence, &mut |_| {})
+    decide_with(base, keys, exit, evidence, None, &mut |_| {})
+}
+
+/// The items of her filing the statement must flag as invalid, to prove the
+/// claim owed what it is: what a Hub finds natively, and puts in its
+/// input ([`HubInput::invalid`]). None under a format that does not flag.
+pub fn flagged(
+    base: &Base,
+    keys: Option<&RequestKeys>,
+    exit: &Exit,
+    evidence: &[Evidence],
+) -> Result<u32, Refusal> {
+    Ok(decide(base, keys, exit, evidence)?.0.invalid)
 }
 
 /// [`decide`], calling `mark` with the name of each step as it ends: the
@@ -277,6 +301,7 @@ pub fn decide_with(
     keys: Option<&RequestKeys>,
     exit: &Exit,
     evidence: &[Evidence],
+    invalid: Option<u32>,
     mark: &mut dyn FnMut(&'static str),
 ) -> Result<(Owed, Read), Refusal> {
     let contract = contract(base);
@@ -301,8 +326,13 @@ pub fn decide_with(
         amount: read.b,
         claim_digest: read.e,
     };
-    let owed = recovery::owed(base, &request, &read.claim, evidence, &chain)
-        .map_err(|e| Refusal::Evidence(e.to_string()))?;
+    let owed = match invalid {
+        None => recovery::owed(base, &request, &read.claim, evidence, &chain),
+        Some(invalid) => {
+            recovery::owed_flagged(base, &request, &read.claim, evidence, &chain, invalid)
+        }
+    }
+    .map_err(|e| Refusal::Evidence(e.to_string()))?;
     mark("her filing decoded and judged against the evidence");
     Ok((owed, read))
 }
@@ -324,6 +354,7 @@ pub fn check_with(
         input.keys.as_ref(),
         &input.exit,
         &input.evidence,
+        Some(input.invalid),
         mark,
     )?;
     verdict(&owed, read.b2, read.disclosed.as_deref())?;

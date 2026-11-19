@@ -44,6 +44,9 @@ const F_MAGIC_COMPACT_FUNDED: &[u8] = b"LICASH-F\x13";
 /// The first graph id whose contracts file [`Format::Compact`].
 pub const COMPACT_FROM: u32 = 9;
 
+/// The first graph id whose contracts are decided as [`Format::Lean`].
+pub const LEAN_FROM: u32 = 10;
+
 /// How a contract's filing is written, a function of its Base alone: the
 /// holder writes it, the Hub reads it and the statement decides on it all
 /// by [`Format::of`], so that a contract is decided by the codec it was
@@ -55,22 +58,40 @@ pub const COMPACT_FROM: u32 = 9;
 /// settled note's witness leaves out its keyset and public fields, which
 /// are its item's. Everything decoded is the same, so every check after
 /// decoding is the same.
+///
+/// `Lean` files as `Compact` and judges differently: not every item is
+/// verified, only those the Hub cites as invalid ([`owed_flagged`]), so that
+/// a proof costs what it contests and not the whole claim. The statement
+/// takes every other item as valid, which can only raise what the claim is
+/// owed: the Hub cites the invalid ones, and an invalid item is worth
+/// nothing rather than voiding the claim.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Format {
     Legacy,
     Compact,
+    Lean,
 }
 
 impl Format {
+    /// Whether it writes the compact encoding: `Compact` and `Lean` do.
+    pub fn compact(self) -> bool {
+        self != Self::Legacy
+    }
+
+    pub fn lean(self) -> bool {
+        self == Self::Lean
+    }
+
     pub fn of(base: &Base) -> Self {
         Self::at(base.parts().graph.id)
     }
 
     /// The format of the contracts of graph `id`.
     pub fn at(id: u32) -> Self {
-        match id >= COMPACT_FROM {
-            true => Self::Compact,
-            false => Self::Legacy,
+        match id {
+            id if id >= LEAN_FROM => Self::Lean,
+            id if id >= COMPACT_FROM => Self::Compact,
+            _ => Self::Legacy,
         }
     }
 }
@@ -169,9 +190,9 @@ impl Publication {
         let claim = &self.claim;
         let context = claim.context();
         let parts = claim.parts();
-        let mut bytes = match format {
-            Format::Legacy => P_MAGIC,
-            Format::Compact => P_MAGIC_COMPACT,
+        let mut bytes = match format.compact() {
+            false => P_MAGIC,
+            true => P_MAGIC_COMPACT,
         }
         .to_vec();
         bytes.extend(context.base);
@@ -250,11 +271,11 @@ impl Publication {
         let records = self.envelope.records();
         put_count(&mut bytes, records.len());
         for record in records {
-            match format {
-                Format::Legacy => bytes.extend(record.message.public_fields()),
+            match format.compact() {
+                false => bytes.extend(record.message.public_fields()),
                 // An item's own record is its index: the item names the
                 // message, and it is the first and only one that does.
-                Format::Compact => match parts
+                true => match parts
                     .items
                     .iter()
                     .position(|i| i.message() == &record.message)
@@ -282,9 +303,25 @@ impl Publication {
         limit: usize,
         bytes: &[u8],
     ) -> Result<Self, Error> {
-        let magic = match format {
-            Format::Legacy => P_MAGIC,
-            Format::Compact => P_MAGIC_COMPACT,
+        Self::decode(format, keyset, limit, bytes, true)
+    }
+
+    /// [`Publication::from_bytes`], each hold signature verified only if
+    /// `checked` (of a lean format alone: [`owed_flagged`] verifies those of
+    /// the items it is shown to be wrong about).
+    fn decode(
+        format: Format,
+        keyset: &Keyset,
+        limit: usize,
+        bytes: &[u8],
+        checked: bool,
+    ) -> Result<Self, Error> {
+        if !checked && !format.lean() {
+            return Err(bad("signatures are skipped of a lean filing alone"));
+        }
+        let magic = match format.compact() {
+            false => P_MAGIC,
+            true => P_MAGIC_COMPACT,
         };
         if bytes.len() > MAX_PUBLICATION_BYTES || !bytes.starts_with(magic) {
             return Err(bad("native publication framing"));
@@ -373,9 +410,9 @@ impl Publication {
         }
         let mut records = Vec::new();
         for _ in 0..r.count(limit)? {
-            let own = match format {
-                Format::Legacy => false,
-                Format::Compact => match r.byte()? {
+            let own = match format.compact() {
+                false => false,
+                true => match r.byte()? {
                     0 => true,
                     1 => false,
                     _ => return Err(bad("native publication record tag")),
@@ -416,8 +453,17 @@ impl Publication {
             },
             limit,
         )?;
-        let envelope =
-            Envelope::from_records(claim.hold_context(), claim.hold_root(), records, limit)?;
+        let envelope = match checked {
+            true => {
+                Envelope::from_records(claim.hold_context(), claim.hold_root(), records, limit)?
+            }
+            false => Envelope::from_records_unchecked(
+                claim.hold_context(),
+                claim.hold_root(),
+                records,
+                limit,
+            )?,
+        };
         let publication = Self { claim, envelope };
         if publication.to_bytes(format) != bytes {
             return Err(bad("noncanonical native publication"));
@@ -1003,21 +1049,21 @@ impl Filing {
 
     pub fn to_bytes(&self, format: Format) -> Vec<u8> {
         let w = &self.witness;
-        let magic = match (format, self.anchored(), w.funded.is_empty()) {
-            (Format::Legacy, _, false) => F_MAGIC_FUNDED,
-            (Format::Legacy, false, true) => F_MAGIC,
-            (Format::Legacy, true, true) => F_MAGIC_ANCHORED,
-            (Format::Compact, _, false) => F_MAGIC_COMPACT_FUNDED,
-            (Format::Compact, false, true) => F_MAGIC_COMPACT,
-            (Format::Compact, true, true) => F_MAGIC_COMPACT_ANCHORED,
+        let magic = match (format.compact(), self.anchored(), w.funded.is_empty()) {
+            (false, _, false) => F_MAGIC_FUNDED,
+            (false, false, true) => F_MAGIC,
+            (false, true, true) => F_MAGIC_ANCHORED,
+            (true, _, false) => F_MAGIC_COMPACT_FUNDED,
+            (true, false, true) => F_MAGIC_COMPACT,
+            (true, true, true) => F_MAGIC_COMPACT_ANCHORED,
         };
         let mut bytes = magic.to_vec();
         put_blob(&mut bytes, &self.publication.to_bytes(format));
         put_count(&mut bytes, w.notes.len());
         for note in &w.notes {
-            match format {
-                Format::Legacy => put_blob(&mut bytes, &note.to_bytes()),
-                Format::Compact => put_blob(&mut bytes, &note.to_compact_bytes()),
+            match format.compact() {
+                false => put_blob(&mut bytes, &note.to_bytes()),
+                true => put_blob(&mut bytes, &note.to_compact_bytes()),
             }
         }
         put_count(&mut bytes, w.sources.len());
@@ -1079,9 +1125,29 @@ impl Filing {
         limit: usize,
         bytes: &[u8],
     ) -> Result<Self, Error> {
-        let (plain, anchored_magic, funded_magic) = match format {
-            Format::Legacy => (F_MAGIC, F_MAGIC_ANCHORED, F_MAGIC_FUNDED),
-            Format::Compact => (
+        Self::decode(format, keyset, limit, bytes, true)
+    }
+
+    /// [`Filing::from_bytes`], the issuance proof of each settled note and
+    /// each hold signature verified only if `checked`: of a lean format
+    /// alone, whose statement verifies those of the items it is shown to be
+    /// wrong about ([`owed_flagged`]). What it decodes is never to rely on
+    /// but through [`owed_flagged`].
+    fn decode(
+        format: Format,
+        keyset: &Keyset,
+        limit: usize,
+        bytes: &[u8],
+        checked: bool,
+    ) -> Result<Self, Error> {
+        if !checked && !format.lean() {
+            return Err(bad(
+                "a filing is skipped of its checks of a lean format alone",
+            ));
+        }
+        let (plain, anchored_magic, funded_magic) = match format.compact() {
+            false => (F_MAGIC, F_MAGIC_ANCHORED, F_MAGIC_FUNDED),
+            true => (
                 F_MAGIC_COMPACT,
                 F_MAGIC_COMPACT_ANCHORED,
                 F_MAGIC_COMPACT_FUNDED,
@@ -1093,17 +1159,17 @@ impl Filing {
             return Err(bad("filing framing"));
         }
         let mut r = Reader(&bytes[plain.len()..]);
-        let publication = Publication::from_bytes(format, keyset, limit, r.blob()?)?;
+        let publication = Publication::decode(format, keyset, limit, r.blob()?, checked)?;
         let notes = |r: &mut Reader, limit| -> Result<Vec<Note>, Error> {
             (0..r.count(limit)?)
                 .map(|_| Note::from_bytes(keyset, r.blob()?))
                 .collect()
         };
-        let settled = match format {
-            Format::Legacy => notes(&mut r, MAX_ITEMS)?,
+        let settled = match format.compact() {
+            false => notes(&mut r, MAX_ITEMS)?,
             // Each settled note is its item's, in order, with no more or
             // fewer than the items settled.
-            Format::Compact => {
+            true => {
                 let items = publication.claim().parts().items.iter();
                 let messages: Vec<_> = items
                     .filter(|item| matches!(item, Item::Settled(_)))
@@ -1114,7 +1180,10 @@ impl Filing {
                 }
                 messages
                     .into_iter()
-                    .map(|message| Note::from_compact_bytes(keyset, message.clone(), r.blob()?))
+                    .map(|message| match checked {
+                        true => Note::from_compact_bytes(keyset, message.clone(), r.blob()?),
+                        false => Note::from_compact_unverified(keyset, message.clone(), r.blob()?),
+                    })
                     .collect::<Result<_, _>>()?
             }
         };
@@ -1300,6 +1369,11 @@ pub struct Owed {
     pub owed: u32,
     /// Bit i: item i voided by the Hub's evidence.
     pub mask: u32,
+    /// Bit i: item i invalid (its note not issued, its hold signature not
+    /// its note's), under a lean format ([`Format::Lean`]): worth nothing,
+    /// the others as ever. The Hub's statement takes it as an input and
+    /// verifies the items it flags, and only those ([`owed_flagged`]).
+    pub invalid: u32,
     /// What the Hub's response must disclose ([`disclosures`]): nothing if
     /// every slot is empty.
     pub disclosures: Disclosures,
@@ -1335,12 +1409,48 @@ pub fn owed(
     evidence: &[Evidence],
     chain: &Chain,
 ) -> Result<Owed, Error> {
+    judged(base, request, filed, evidence, chain, None)
+}
+
+/// [`owed`] as the Hub's statement computes it under a lean format
+/// ([`Format::Lean`]): the items `invalid` flags verified, as the Hub says
+/// they are not valid, and no others, which are taken as they are. A flagged
+/// item that verifies is the Hub's error, as is a flag beyond the claim's
+/// items; under another format, any flag is. Of a claim the Hub found fully
+/// valid, [`owed`] is this with no flags, and the same amount: what it
+/// skips can only raise it, so the Hub must flag what is invalid to prove
+/// the claim owed less, and the holder checks only what it flags.
+pub fn owed_flagged(
+    base: &Base,
+    request: &Request,
+    filed: &[u8],
+    evidence: &[Evidence],
+    chain: &Chain,
+    invalid: u32,
+) -> Result<Owed, Error> {
+    judged(base, request, filed, evidence, chain, Some(invalid))
+}
+
+/// [`owed`] if `flagged` is none, which finds the invalid items of a lean
+/// filing itself, else [`owed_flagged`].
+fn judged(
+    base: &Base,
+    request: &Request,
+    filed: &[u8],
+    evidence: &[Evidence],
+    chain: &Chain,
+    flagged: Option<u32>,
+) -> Result<Owed, Error> {
     let parts = base.parts();
+    let format = Format::of(base);
+    if flagged.is_some_and(|flags| flags != 0) && !format.lean() {
+        return Err(bad("items are flagged of a lean filing alone"));
+    }
     if chain.checkpoint().commitment() != parts.chain.checkpoint.commitment() {
         return Err(bad("the chain is not from Base's checkpoint"));
     }
     let limit = parts.limits.max_authorizations as usize;
-    let filing = Filing::from_bytes(Format::of(base), &parts.keyset, limit, filed)
+    let filing = Filing::decode(format, &parts.keyset, limit, filed, !format.lean())
         .and_then(|filing| eligible(&filing, base, request, chain).map(|()| filing));
     let filing = match filing {
         Ok(filing) => filing,
@@ -1351,17 +1461,93 @@ pub fn owed(
             return Ok(Owed {
                 owed: 0,
                 mask: 0,
+                invalid: 0,
                 disclosures: Disclosures::empty(),
                 ineligible: Some(e.to_string()),
             })
         }
     };
     let claim = filing.publication.claim();
+    let invalid = match format.lean() {
+        true => invalid_items(&filing, &parts.keyset, flagged)?,
+        false => 0,
+    };
     let (mask, executed) = void(base.version(), &parts.keyset, claim, evidence, Some(chain))?;
     Ok(Owed {
-        owed: live(base.version(), claim, mask, &executed, chain.tip_height()),
+        owed: live(
+            base.version(),
+            claim,
+            mask | invalid,
+            &executed,
+            chain.tip_height(),
+        ),
         mask,
+        invalid,
         disclosures: disclosures(evidence)?,
         ineligible: None,
     })
+}
+
+/// The items of a lean filing that are invalid, as a mask: those `flagged`,
+/// each verified to be, or, if none, every one that is.
+fn invalid_items(filing: &Filing, keyset: &Keyset, flagged: Option<u32>) -> Result<u32, Error> {
+    let items = filing.publication.claim().parts().items.len();
+    let invalid = |i: usize| item_valid(filing, keyset, i).is_err();
+    match flagged {
+        None => Ok((0..items)
+            .filter(|&i| invalid(i))
+            .fold(0, |mask, i| mask | 1 << i)),
+        Some(flags) => {
+            if items < 32 && flags >> items != 0 {
+                return Err(bad("an item flagged that the claim has not"));
+            }
+            for i in (0..items).filter(|i| flags & (1 << i) != 0) {
+                if !invalid(i) {
+                    return Err(bad("an item flagged invalid that is valid"));
+                }
+            }
+            Ok(flags)
+        }
+    }
+}
+
+/// Whether item `i` of a lean filing is valid: its hold key signed the
+/// claim and, settled, its note is the issuer's, and, of a lock of her own
+/// inputs, so are the notes it spent, which the lock's outputs stand on.
+fn item_valid(filing: &Filing, keyset: &Keyset, i: usize) -> Result<(), Error> {
+    let claim = filing.publication.claim();
+    let items = &claim.parts().items;
+    let check = |k: usize| -> Result<(), Error> {
+        filing
+            .publication
+            .envelope()
+            .verify_record(items[k].message())?;
+        if let Item::Settled(_) = &items[k] {
+            let at = items[..k]
+                .iter()
+                .filter(|item| matches!(item, Item::Settled(_)))
+                .count();
+            filing.witness.notes[at].verify(keyset)?;
+        }
+        Ok(())
+    };
+    check(i)?;
+    if let Item::Pending { source, .. } = &items[i] {
+        let spent = claim.parts().sources.iter().find_map(|s| match s {
+            Source::OwnInputs { id, inputs, .. } if id == source => Some(inputs),
+            _ => None,
+        });
+        for (k, item) in items.iter().enumerate() {
+            let on = matches!(item, Item::Settled(_))
+                && spent.is_some_and(|inputs| {
+                    item.message()
+                        .identifier()
+                        .is_ok_and(|y| inputs.contains(&y))
+                });
+            if on {
+                check(k)?;
+            }
+        }
+    }
+    Ok(())
 }

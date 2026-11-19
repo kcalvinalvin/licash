@@ -202,3 +202,25 @@ checks), where the filing and evidence cost about 1.4 M cycles a note. A
 contract of half a year (26 280 headers) adds about 190 M cycles to the
 statement's 68 M: its age, not its claim, is then most of a proof, which a
 recursive proof of the header chain would take out.
+
+## The lean filing
+
+A contract of graph id 10 on (`licash::recovery::Format::Lean`) files as the
+compact one does and is judged item by item: the statement verifies the
+issuance proof and hold signature of the items its input flags as invalid
+(`HubInput::invalid`) and no others, and takes the rest as valid, which can
+only raise what her claim is owed. The Hub finds the invalid items natively
+(`licash_hp::flagged`) and a flag on a valid item is no proof; an invalid item
+is worth nothing and the rest of the claim is owed, where under the compact
+filing one voids it whole. On the answered input:
+
+| | compact | lean |
+|---|---|---|
+| her filing decoded and judged | 37.3 M | 19.1 M |
+| total | 63.5 M | 45.3 M |
+
+What is left is the evidence's decoding (25.9 M: every note and signature of
+a spend the Hub cites) and, for each item, its hash to the curve. A signet
+program that decides it is built with `r0/build-guest.sh hp` and set with
+`SIGNET_LEAN` in `apps/contracts`; until then signet quotes the compact
+filing's graph.

@@ -2532,3 +2532,200 @@ fn a_funded_filing_is_compact_under_a_graph_of_the_compact_format() {
     let whole = decide(&o, &request, &p, &witness, &[], None).unwrap();
     assert_eq!((whole.owed, whole.mask, whole.ineligible), (12, 0, None));
 }
+
+/// A claim of `count` settled notes of 4 sat, filed under `o`: what the Hub
+/// decides it on.
+struct Plain {
+    request: Request,
+    p: Publication,
+    witness: Witness,
+    notes: Vec<Note>,
+    ds: Vec<Derivation>,
+}
+
+fn plain(o: &Opened, count: u32) -> Plain {
+    let keyset = o.base.parts().keyset.clone();
+    let ds: Vec<_> = (0..count)
+        .map(|i| derive(SPEND, &hold(), 4, 23, i))
+        .collect();
+    let notes: Vec<_> = ds.iter().map(|d| mint(&o.issuer, &keyset, d)).collect();
+    let items = ds
+        .iter()
+        .map(|d| Item::Settled(d.message().clone()))
+        .collect();
+    let amount = 4 * count;
+    let p = Publication::sign(
+        claim(o, items, vec![], vec![], &ds, amount),
+        &hold_keys(&ds),
+        LIMIT,
+    )
+    .unwrap();
+    let request = Request {
+        amount,
+        claim_digest: *p.claim().digest(),
+    };
+    let witness = Witness {
+        notes: notes.clone(),
+        sources: vec![],
+        activations: vec![],
+        funded: vec![],
+    };
+    Plain {
+        request,
+        p,
+        witness,
+        notes,
+        ds,
+    }
+}
+
+fn lean_open() -> Opened {
+    let issuer = IssuerKeys::random(3).unwrap();
+    let base = base_at(
+        issuer.keyset().unwrap(),
+        base::Version::V3,
+        recovery::LEAN_FROM,
+    );
+    Opened { issuer, base }
+}
+
+/// What the Hub proves of a lean claim, which it flags itself
+/// ([`recovery::owed`]), is what the statement decides on its flags
+/// ([`recovery::owed_flagged`]), and of a claim all valid, what the same
+/// claim is owed under the compact filing, whole.
+#[test]
+fn a_lean_claim_all_valid_is_owed_what_the_compact_filing_is() {
+    let lean = lean_open();
+    let compact = Opened {
+        issuer: lean.issuer.clone(),
+        base: base_at(
+            lean.issuer.keyset().unwrap(),
+            base::Version::V3,
+            recovery::COMPACT_FROM,
+        ),
+    };
+    assert_eq!(Format::of(&lean.base), Format::Lean);
+    assert_eq!(Format::of(&compact.base), Format::Compact);
+    let chain = checkpoint_chain();
+    let owed = |o: &Opened| {
+        let s = plain(o, 8);
+        let owners: Vec<_> = (0..2).map(|i| owner(SPEND, 23, i)).collect();
+        let payment = spend(o, &s.notes[..2], &owners, vec![bob(8, 0)]);
+        let spent = Evidence::Spend {
+            signed: payment,
+            notes: s.notes[..2].to_vec(),
+            unlock: None,
+        };
+        let filing = Filing::new(s.p.clone(), s.witness.clone()).unwrap();
+        let bytes = filing.to_bytes(Format::of(&o.base));
+        let found = recovery::owed(
+            &o.base,
+            &s.request,
+            &bytes,
+            std::slice::from_ref(&spent),
+            &chain,
+        )
+        .unwrap();
+        let flagged = recovery::owed_flagged(
+            &o.base,
+            &s.request,
+            &bytes,
+            std::slice::from_ref(&spent),
+            &chain,
+            0,
+        )
+        .unwrap();
+        (found, flagged)
+    };
+    let (found, flagged) = owed(&lean);
+    // Two of eight notes spent: six owed, as under the compact filing.
+    assert_eq!((found.owed, found.mask, found.invalid), (24, 0b11, 0));
+    assert_eq!(found, flagged);
+    let (compact_found, _) = owed(&compact);
+    assert_eq!(
+        (compact_found.owed, compact_found.mask),
+        (found.owed, found.mask)
+    );
+    // Flags are for a lean filing alone, and for items that are there.
+    let s = plain(&compact, 2);
+    let bytes = Filing::new(s.p, s.witness)
+        .unwrap()
+        .to_bytes(Format::Compact);
+    assert!(recovery::owed_flagged(&compact.base, &s.request, &bytes, &[], &chain, 1).is_err());
+}
+
+/// A note the issuer did not sign, or a signature that is not its hold key's,
+/// is worth nothing in a lean claim, and the rest of the claim is owed: the
+/// Hub flags it, and proves it. Under the compact filing it voids the whole
+/// claim. Unflagged, it is taken as valid, which is the Hub's loss alone, and
+/// a flag on a valid item is no proof.
+#[test]
+fn an_invalid_item_of_a_lean_claim_is_worth_nothing_and_the_rest_is_owed() {
+    let o = lean_open();
+    let chain = checkpoint_chain();
+    let s = plain(&o, 4);
+    let bytes = Filing::new(s.p.clone(), s.witness.clone())
+        .unwrap()
+        .to_bytes(Format::Lean);
+    let owed = |bytes: &[u8], flags: Option<u32>| match flags {
+        None => recovery::owed(&o.base, &s.request, bytes, &[], &chain),
+        Some(flags) => recovery::owed_flagged(&o.base, &s.request, bytes, &[], &chain, flags),
+    };
+    assert_eq!(owed(&bytes, None).unwrap().owed, 16);
+
+    // The second note's proof of issuance forged.
+    let tail = s.notes[1].to_compact_bytes();
+    let mut bad = tail.clone();
+    // C, the evidence's tag, then its DLEQ's e and s: the last byte of s.
+    bad[33 + 1 + 63] ^= 1;
+    let forged_note = swap(&bytes, &tail, &bad);
+    let found = owed(&forged_note, None).unwrap();
+    assert_eq!((found.owed, found.invalid, found.mask), (12, 0b10, 0));
+    assert!(found.ineligible.is_none());
+    // As the statement decides on what the Hub flags.
+    assert_eq!(owed(&forged_note, Some(0b10)).unwrap(), found);
+    // Unflagged, the note is taken as valid: the whole claim.
+    assert_eq!(owed(&forged_note, Some(0)).unwrap().owed, 16);
+    // A flag on what is valid, or beyond the claim, is no proof.
+    assert!(owed(&forged_note, Some(0b11)).is_err());
+    assert!(owed(&forged_note, Some(0b1_0000)).is_err());
+    assert!(owed(&bytes, Some(0b1)).is_err());
+
+    // The third item's hold signature not its note's.
+    let sig =
+        s.p.envelope()
+            .records()
+            .iter()
+            .find(|r| &r.message == s.ds[2].message())
+            .unwrap();
+    let forged_hold = flip(&bytes, &sig.sig.0);
+    let found = owed(&forged_hold, None).unwrap();
+    assert_eq!((found.owed, found.invalid), (12, 0b100));
+    assert_eq!(owed(&forged_hold, Some(0b100)).unwrap(), found);
+    assert_eq!(owed(&forged_hold, Some(0)).unwrap().owed, 16);
+
+    // Both, as the claim of a holder who cannot be trusted with any.
+    let both = flip(&forged_note, &sig.sig.0);
+    assert_eq!(owed(&both, None).unwrap().owed, 8);
+
+    // Under the compact filing, the same forgery voids the whole claim.
+    let compact = Opened {
+        issuer: o.issuer.clone(),
+        base: base_at(
+            o.issuer.keyset().unwrap(),
+            base::Version::V3,
+            recovery::COMPACT_FROM,
+        ),
+    };
+    let s = plain(&compact, 4);
+    let bytes = Filing::new(s.p, s.witness.clone())
+        .unwrap()
+        .to_bytes(Format::Compact);
+    let tail = s.notes[1].to_compact_bytes();
+    let mut bad = tail.clone();
+    bad[33 + 1 + 63] ^= 1;
+    let forged = swap(&bytes, &tail, &bad);
+    let whole = recovery::owed(&compact.base, &s.request, &forged, &[], &chain).unwrap();
+    assert_eq!(whole.owed, 0);
+    assert!(whole.ineligible.is_some());
+}

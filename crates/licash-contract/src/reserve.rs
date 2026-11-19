@@ -32,7 +32,7 @@ const ANCHOR: Amount = Amount::from_sat(330);
 pub fn publication_vsize(format: Format, notes: u32) -> u64 {
     let (fixed, each) = match format {
         Format::Legacy => (526, 619),
-        Format::Compact => (520, 371),
+        Format::Compact | Format::Lean => (520, 371),
     };
     fixed + each * u64::from(notes)
 }

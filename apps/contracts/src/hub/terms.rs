@@ -4,7 +4,7 @@ use anyhow::{bail, ensure, Result};
 use licash::base::{ChainTerms, Fees, GraphTerms, Limits, Recipe};
 use licash::chain::Checkpoint;
 use licash::note::Keyset;
-use licash::recovery::COMPACT_FROM;
+use licash::recovery::{COMPACT_FROM, LEAN_FROM};
 use licash::spend::ChainProfile;
 use licash_contract::graph::RETURNING;
 use licash_contract::opening::{Bounds, Floors, Quote};
@@ -342,9 +342,10 @@ impl Timing {
     /// The id of the graphs it quotes: those of the compact filing if the
     /// program contracts open under decides it, else the last before.
     fn graph_id(&self) -> u32 {
-        match crate::trust(self.profile).is_ok_and(|t| t.compact) {
-            true => COMPACT_FROM,
-            false => RETURNING,
+        match crate::trust(self.profile) {
+            Ok(t) if t.lean => LEAN_FROM,
+            Ok(t) if t.compact => COMPACT_FROM,
+            _ => RETURNING,
         }
     }
 
@@ -468,7 +469,8 @@ mod tests {
     /// byte for byte as the hub quotes it, on each network. A hub letting
     /// holders choose prices the fixed terms by its rate as well, at 1% a
     /// year 24 sat more; one that doesn't, at its fixed fee alone. Regtest's
-    /// mock decides the compact filing, so it quotes the graph of its id (9).
+    /// mock decides the lean filing, so it quotes the graph of its id (10): signet's program
+    /// still decides the compact one, and it quotes 9.
     #[test]
     fn the_fixed_quote_is_pinned() {
         let parts = Hub::peek(funded()).unwrap().base.parts().clone();
@@ -477,7 +479,7 @@ mod tests {
             (
                 None,
                 [
-                    "9d002d75d0586724692f78c10f0b33bea02e659abfd358d25192ccd3c0808379",
+                    "324adaaaaa576156dbafdd687f717e2396057dd0fa17a3e420b08a0b00edffe0",
                     "59e452a0dd8380cd7e63777bba55291e0a55b3b286cff43580d09fb3e89cc46d",
                 ],
                 3_000,
@@ -485,7 +487,7 @@ mod tests {
             (
                 Some(RANGE),
                 [
-                    "74f95a5960386363248963bc9db88b57125777c3c04683fd18e401387a8b5a03",
+                    "a78b216fcd816f1412c2f31088579ac25c7c019ab834445041e3de8b7c046e61",
                     "abfa0b5917d0e307914309daa82f0ef05f4e68818412a61c6bd309832db02f5a",
                 ],
                 3_024,

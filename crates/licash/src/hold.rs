@@ -151,7 +151,24 @@ impl Envelope {
         &self.context
     }
 
-    pub fn verify(
+    /// As [`Envelope::from_records`], its signatures not verified: for a
+    /// statement that verifies those of the items it is shown to be wrong
+    /// about ([`Envelope::verify_record`]) and no others. Its context and
+    /// set are checked, as ever.
+    pub fn from_records_unchecked(
+        context: Context,
+        expected_root: &[u8; 32],
+        records: Vec<Record>,
+        limit: usize,
+    ) -> Result<Self, Error> {
+        let envelope = Self { context, records };
+        envelope.check_set(&context, expected_root, limit)?;
+        Ok(envelope)
+    }
+
+    /// The envelope is for this context and holds exactly the authorizations
+    /// the claim requires, in order: not what they say.
+    fn check_set(
         &self,
         expected_context: &Context,
         expected_root: &[u8; 32],
@@ -168,12 +185,32 @@ impl Envelope {
         if &authorization_root(&messages, limit)? != expected_root {
             return Err(bad("hold set differs from claim"));
         }
+        Ok(())
+    }
+
+    /// The signature of the record of `note`, under its hold key.
+    pub fn verify_record(&self, note: &Message) -> Result<(), Error> {
+        let record = self
+            .records
+            .iter()
+            .find(|record| &record.message == note)
+            .ok_or_else(|| bad("no hold record of the note"))?;
+        crypto::schnorr_verify(
+            record.message.hold(),
+            &self.context.signing_digest(note),
+            &record.sig,
+        )
+    }
+
+    pub fn verify(
+        &self,
+        expected_context: &Context,
+        expected_root: &[u8; 32],
+        limit: usize,
+    ) -> Result<(), Error> {
+        self.check_set(expected_context, expected_root, limit)?;
         for record in &self.records {
-            crypto::schnorr_verify(
-                record.message.hold(),
-                &expected_context.signing_digest(&record.message),
-                &record.sig,
-            )?;
+            self.verify_record(&record.message)?;
         }
         Ok(())
     }

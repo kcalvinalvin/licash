@@ -52,6 +52,9 @@ fn base(keyset: Keyset, nonce: u8) -> Base {
     base_of(keyset, nonce, Version::V3)
 }
 fn base_of(keyset: Keyset, nonce: u8, version: Version) -> Base {
+    base_on(keyset, nonce, version, graph())
+}
+fn base_on(keyset: Keyset, nonce: u8, version: Version, id: u32) -> Base {
     let mut deposit = [31; 36];
     deposit[32..].copy_from_slice(&7u32.to_le_bytes());
     Base::new(Parts {
@@ -63,7 +66,7 @@ fn base_of(keyset: Keyset, nonce: u8, version: Version) -> Base {
         cap: 128,
         parties: [party(23), party(29)],
         graph: GraphTerms {
-            id: graph(),
+            id,
             unit_sats: 1,
             bits: 21,
             low_bits: 9,
@@ -198,9 +201,13 @@ fn stale() -> (Filed, Evidence) {
     stale_under(Version::V3)
 }
 fn stale_under(version: Version) -> (Filed, Evidence) {
+    stale_on(version, graph())
+}
+/// [`stale_under`] on a contract of graph id `id`.
+fn stale_on(version: Version, id: u32) -> (Filed, Evidence) {
     let issuer = IssuerKeys::random(3).unwrap();
     let keyset = issuer.keyset().unwrap();
-    let base = base_of(keyset.clone(), 53, version);
+    let base = base_on(keyset.clone(), 53, version, id);
     let ds: Vec<_> = (0..32).map(|i| derive(SPEND, &hold(), 4, 23, i)).collect();
     let notes: Vec<_> = ds.iter().map(|d| mint(&issuer, &keyset, d)).collect();
     let owners: Vec<_> = (0..16).map(|i| owner(SPEND, 23, i)).collect();
@@ -367,6 +374,7 @@ fn input(base: &Base, exit: Exit, evidence: Vec<Evidence>) -> HubInput {
         exit,
         evidence,
         keys: None,
+        invalid: 0,
     }
 }
 
@@ -760,6 +768,7 @@ fn a_response_is_borne_out_when_owed_at_most_what_it_says_and_what_it_uses_is_di
     let owed = |owed, disclosures| Owed {
         owed,
         mask: 0,
+        invalid: 0,
         disclosures,
         ineligible: None,
     };
@@ -784,4 +793,61 @@ fn a_response_is_borne_out_when_owed_at_most_what_it_says_and_what_it_uses_is_di
         verdict(&owed(5, used), 10, Some(&other)),
         Err(Refusal::Undisclosed)
     );
+}
+
+/// The statement under a lean filing: the Hub flags the items of her claim
+/// that are not valid and proves the claim owed what is left; with none
+/// flagged, a forged note is taken as valid, and the claim owed its value; a
+/// flag on a valid item proves nothing. Its input carries the flags.
+#[test]
+fn a_lean_statement_proves_a_claim_owed_less_by_the_items_the_hub_flags() {
+    let (f, spent) = stale_on(Version::V3, licash::recovery::LEAN_FROM);
+    let filing = Filing::from_bytes(Format::Lean, &f.base.parts().keyset, LIMIT, &f.bytes).unwrap();
+    // The proof of issuance of a note she did not spend forged (the 32nd of
+    // her notes: she spent the first 16).
+    let forged = derive(SPEND, &hold(), 4, 23, 31);
+    let note = filing
+        .witness()
+        .notes
+        .iter()
+        .find(|n| n.message() == forged.message())
+        .unwrap();
+    let tail = note.to_compact_bytes();
+    let mut bad = tail.clone();
+    // C, the evidence's tag, then its DLEQ's e and s: the last byte of s.
+    bad[33 + 1 + 63] ^= 1;
+    let at = f
+        .bytes
+        .windows(tail.len())
+        .position(|w| w == tail.as_slice())
+        .unwrap();
+    let mut bytes = f.bytes.clone();
+    bytes[at..at + tail.len()].copy_from_slice(&bad);
+
+    // Of 32 notes of 4, she spent 16 and forged one: owed 60 of her 128.
+    let evidence = vec![spent];
+    let x = exit(&f.base, f.b, &f.e, &bytes, 60);
+    let invalid = licash_hp::flagged(&f.base, None, &x, &evidence).unwrap();
+    assert_eq!(invalid.count_ones(), 1);
+    let (owed, _) = decide(&f.base, None, &x, &evidence).unwrap();
+    assert_eq!((owed.owed, owed.invalid), (60, invalid));
+    let mut i = input(&f.base, x, evidence);
+    // Unflagged, the forged note is taken as valid: owed 64, more than the
+    // Hub responded, so no proof.
+    assert_eq!(check(&i), Err(Refusal::Owed));
+    // Flagged, it proves the response.
+    i.invalid = invalid;
+    check(&i).unwrap();
+    // The flags travel with the input.
+    let bytes = i.to_bytes();
+    let back = HubInput::from_bytes(&bytes).unwrap();
+    assert_eq!(back.invalid, invalid);
+    assert_eq!(back.to_bytes(), bytes);
+    // A flag on an item that is valid proves nothing, nor does the flag
+    // of the wrong item alone.
+    let valid = (0..32).find(|b| invalid & (1 << b) == 0).unwrap();
+    for wrong in [invalid | 1 << valid, 1 << valid] {
+        i.invalid = wrong;
+        assert!(check(&i).is_err(), "flags {wrong:#b}");
+    }
 }

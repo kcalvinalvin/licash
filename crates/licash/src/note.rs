@@ -479,6 +479,19 @@ impl Note {
         Ok(note)
     }
 
+    /// [`Note::from_compact_bytes`], the note not verified: only for the
+    /// statement's decoding of a filing whose uncited notes it takes as
+    /// they are, and verifies those the Hub cites as invalid
+    /// ([`Note::verify`]). Never a note to rely on.
+    pub(crate) fn from_compact_unverified(
+        keyset: &Keyset,
+        message: Message,
+        bytes: &[u8],
+    ) -> Result<Self, Error> {
+        let r = Reader::new(bytes, "note", &[])?;
+        Self::decode_tail(r, *keyset.id(), message)
+    }
+
     fn decode(bytes: &[u8]) -> Result<Self, Error> {
         let mut r = Reader::new(bytes, "note", NOTE_TAG)?;
         let claimed = r.array()?;

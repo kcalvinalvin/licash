@@ -45,6 +45,12 @@ pub struct Trust {
     /// [`licash::recovery::COMPACT_FROM`] on files: under one that doesn't,
     /// her claim would decode to nothing, and be owed nothing.
     pub compact: bool,
+    /// Whether its program decides the lean filing
+    /// ([`licash::recovery::Format::Lean`]), which a contract of graph id
+    /// [`licash::recovery::LEAN_FROM`] on files, and judges item by item: one
+    /// that doesn't would owe her claim nothing, or the Hub could not prove
+    /// it owed less. A program that does decides the compact one too.
+    pub lean: bool,
 }
 impl Trust {
     pub fn mock() -> Self {
@@ -52,6 +58,7 @@ impl Trust {
             program: [11; 32],
             mock: true,
             compact: true,
+            lean: true,
         }
     }
 }
@@ -658,6 +665,11 @@ impl Holder {
         ensure!(
             s.quote.graph.id < licash::recovery::COMPACT_FROM || ctx.trust.compact,
             "a graph of id {} files a compact claim, which the program trusted doesn't decide",
+            s.quote.graph.id
+        );
+        ensure!(
+            s.quote.graph.id < licash::recovery::LEAN_FROM || ctx.trust.lean,
+            "a graph of id {} files a lean claim, which the program trusted doesn't decide",
             s.quote.graph.id
         );
         let keys = HolderKeys::derive(&s.seed, &id);
@@ -1614,23 +1626,32 @@ mod tests {
             },
             funded: None,
         };
-        let trust = |compact| Context {
+        let trust = |compact, lean| Context {
             tip: 1,
             trust: Trust {
                 program: [11; 32],
                 mock: true,
                 compact,
+                lean,
             },
         };
-        for (graph, compact, opens) in [
-            (licash::recovery::COMPACT_FROM - 1, false, true),
-            (licash::recovery::COMPACT_FROM, false, false),
-            (licash::recovery::COMPACT_FROM, true, true),
-            (licash::recovery::COMPACT_FROM + 1, false, false),
+        // A program that decides the lean filing decides the compact too.
+        for (graph, compact, lean, opens) in [
+            (licash::recovery::COMPACT_FROM - 1, false, false, true),
+            (licash::recovery::COMPACT_FROM, false, false, false),
+            (licash::recovery::COMPACT_FROM, true, false, true),
+            (licash::recovery::LEAN_FROM - 1, true, false, true),
+            (licash::recovery::LEAN_FROM, true, false, false),
+            (licash::recovery::LEAN_FROM, true, true, true),
+            (licash::recovery::LEAN_FROM + 1, true, false, false),
         ] {
             q.graph.id = graph;
-            let started = Holder::start(start(&q), &trust(compact));
-            assert_eq!(started.is_ok(), opens, "graph {graph}, compact {compact}");
+            let started = Holder::start(start(&q), &trust(compact, lean));
+            assert_eq!(
+                started.is_ok(),
+                opens,
+                "graph {graph}, compact {compact}, lean {lean}"
+            );
         }
     }
 
@@ -2307,6 +2328,7 @@ mod tests {
                 program: [99; 32],
                 mock: true,
                 compact: true,
+                lean: true,
             },
         };
         assert!(Holder::load(&a.to_bytes(), &[1; 32], &rotated).is_ok());
@@ -2325,6 +2347,7 @@ mod tests {
                     program: [11; 32],
                     mock: false,
                     compact: false,
+                    lean: false,
                 }
             }
         )

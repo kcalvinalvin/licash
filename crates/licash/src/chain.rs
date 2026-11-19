@@ -341,8 +341,7 @@ impl Checkpoint {
         let mut sorted = [0u32; 11];
         sorted[..n].copy_from_slice(&self.times);
         sorted[..n].sort_unstable();
-        if h.time <= sorted[n / 2]
-            || h.version.to_consensus() < version_floor(self.profile, height)
+        if h.time <= sorted[n / 2] || h.version.to_consensus() < version_floor(self.profile, height)
         {
             return Err(bad("header MTP or version"));
         }
