@@ -865,7 +865,7 @@ impl SwapsArgs {
             ..settings
         };
         let chain = licash_contracts::holder::Node(chain);
-        Keeper::new(provider.clone(), chain, dir.to_owned(), settings)
+        Keeper::new(provider.clone(), chain, wallet.to_owned(), settings)
     }
 }
 

@@ -276,12 +276,7 @@ impl ContractArgs {
             ..settings
         };
         let node = Node(chain.parse().context("--chain")?);
-        Ok(Some(Keeper::new(
-            provider.clone(),
-            node,
-            data.to_owned(),
-            settings,
-        )))
+        Ok(Some(Keeper::new(provider.clone(), node, wallet, settings)))
     }
 }
 

@@ -3753,7 +3753,12 @@ async fn a_providers_keeper_opens_the_first_contract_at_a_hub_where_told_to() ->
         scan: true,
         ..Settings::new(0, 0, "open-contract {hub}".into())
     };
-    let mut keeper = Keeper::new(provider.clone(), Node(source), mine.clone(), settings);
+    let mut keeper = Keeper::new(
+        provider.clone(),
+        Node(source),
+        mine.join("wallet.sqlite"),
+        settings,
+    );
     let limited = |most: u64| Some(HashMap::from([(url.clone(), most)]));
 
     // None at the hub: it opens one, taking nothing in meanwhile.
@@ -4011,7 +4016,12 @@ async fn a_providers_keeper_holds_its_intake_to_its_contracts_and_replaces_them(
         ..Settings::new(0, 0, "open-contract {hub}".into())
     };
     let chain = Node(source.clone());
-    let mut keeper = Keeper::new(provider.clone(), Node(source), mine.clone(), settings);
+    let mut keeper = Keeper::new(
+        provider.clone(),
+        Node(source),
+        mine.join("wallet.sqlite"),
+        settings,
+    );
     let limited = |most: u64| Some(HashMap::from([(url.clone(), most)]));
     let alerted = |says: &str| -> Result<bool> {
         let events = provider.events(0, 1_000)?;
@@ -4055,7 +4065,14 @@ async fn a_providers_keeper_holds_its_intake_to_its_contracts_and_replaces_them(
     );
 
     let tip = rt.height()?;
-    let safety = safety::of(provider.wallet(), &mine, &first.id, tip, margin, slack)?;
+    let safety = safety::of(
+        provider.wallet(),
+        &mine.join("wallet.sqlite"),
+        &first.id,
+        tip,
+        margin,
+        slack,
+    )?;
     let Deadlines { renew_at, claim_at } = Deadlines::new(safety.request_by, day, lead);
     ensure!(renew_at > tip + 1, "{safety:?}");
     rt.mine_to_height(renew_at - 1)?;

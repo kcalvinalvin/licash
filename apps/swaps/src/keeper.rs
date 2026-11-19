@@ -434,11 +434,11 @@ impl Failure {
     }
 }
 
-/// The keeper of a provider's contracts, in `dir`, beside its wallet.
+/// The keeper of a provider's contracts, kept in its wallet's file `wallet_file`.
 pub struct Keeper<T: Transport> {
     provider: Arc<Provider<T>>,
     chain: Node,
-    dir: PathBuf,
+    wallet_file: PathBuf,
     settings: Settings,
     /// Each live contract's [`safety::Safety::request_by`]: its signed
     /// terms never change.
@@ -457,15 +457,20 @@ pub struct Keeper<T: Transport> {
 }
 
 impl<T: Transport + 'static> Keeper<T> {
-    /// The keeper of `provider`'s contracts in `dir`, on `chain`: from now
+    /// The keeper of `provider`'s contracts in `wallet_file`, on `chain`: from now
     /// on, the provider takes no notes in at any hub until the keeper
     /// says what its contracts there protect.
-    pub fn new(provider: Arc<Provider<T>>, chain: Node, dir: PathBuf, settings: Settings) -> Self {
+    pub fn new(
+        provider: Arc<Provider<T>>,
+        chain: Node,
+        wallet_file: PathBuf,
+        settings: Settings,
+    ) -> Self {
         provider.limit_intake(Some(HashMap::new()));
         Self {
             provider,
             chain,
-            dir,
+            wallet_file,
             settings,
             request_by: HashMap::new(),
             failures: HashMap::new(),
@@ -528,11 +533,11 @@ impl<T: Transport + 'static> Keeper<T> {
             }
         }
         // Read from the contracts alone: nothing here stops a forced close.
-        if let Err(e) = holder::fees::agree(wallet, &self.dir, Some(tip)) {
+        if let Err(e) = holder::fees::agree(wallet, &self.wallet_file, Some(tip)) {
             tracing::warn!("agreeing to the fees the contracts opened under: {e:#}");
         }
         let rate = self.rate().await;
-        match recovery::advance(wallet, &self.chain, &self.dir, rate).await {
+        match recovery::advance(wallet, &self.chain, &self.wallet_file, rate).await {
             Ok(recoveries) => {
                 for r in recoveries.iter().filter(|r| r.stage == Stage::Lost) {
                     let id = licash_contracts::hex_id(&r.id);
@@ -548,7 +553,7 @@ impl<T: Transport + 'static> Keeper<T> {
             Err(e) => tracing::warn!("carrying the recoveries on: {e:#}"),
         }
 
-        let contracts = holder::list(&self.dir)?;
+        let contracts = holder::list(&self.wallet_file)?;
         let kept = self.read(&contracts, tip, &mut alerts)?;
         let hubs = self.hubs()?;
         let kept = self.others_recover(kept, &hubs, tip)?;
@@ -572,7 +577,7 @@ impl<T: Transport + 'static> Keeper<T> {
         self.provider.limit_intake(Some(plan.limits.clone()));
         for id in &plan.force_close {
             let hex = licash_contracts::hex_id(id);
-            let told = match recovery::force_close(wallet, &self.chain, &self.dir, id, rate).await
+            let told = match recovery::force_close(wallet, &self.chain, &self.wallet_file, id, rate).await
             {
                 Ok(r) => format!(
                     "forced contract {hex} closed at its safe deadline: claiming {} sat in {} notes \
@@ -591,7 +596,7 @@ impl<T: Transport + 'static> Keeper<T> {
         }
         tell(&self.provider, &mut self.told, alerts);
 
-        if let Err(e) = holder::resume(wallet, &self.chain, &self.dir).await {
+        if let Err(e) = holder::resume(wallet, &self.chain, &self.wallet_file).await {
             tracing::warn!("carrying the contracts being opened on: {e:#}");
         }
         let mut alerts = Vec::new();
@@ -640,7 +645,7 @@ impl<T: Transport + 'static> Keeper<T> {
         alerts: &mut Vec<(String, String)>,
     ) -> Result<Vec<Kept>> {
         let wallet = self.provider.wallet();
-        let recovering: HashSet<[u8; 32]> = (recovery::recoveries(&self.dir)?.into_iter())
+        let recovering: HashSet<[u8; 32]> = (recovery::recoveries(&self.wallet_file)?.into_iter())
             .map(|r| r.id)
             .collect();
         let (margin, slack) = (self.settings.exit_margin, self.settings.timeout_slack);
@@ -652,8 +657,10 @@ impl<T: Transport + 'static> Keeper<T> {
                 true => {
                     let request_by = match self.request_by.get(&contract.id) {
                         Some(by) => Ok(*by),
-                        None => safety::of(wallet, &self.dir, &contract.id, tip, margin, slack)
-                            .map(|s| s.request_by),
+                        None => {
+                            safety::of(wallet, &self.wallet_file, &contract.id, tip, margin, slack)
+                                .map(|s| s.request_by)
+                        }
                     };
                     match request_by {
                         Ok(by) => {
@@ -702,7 +709,7 @@ impl<T: Transport + 'static> Keeper<T> {
         };
         let balance = wallet.balance()?;
         let stored: HashMap<String, licash_api::Info> = wallet.hubs()?.into_iter().collect();
-        let largest = holder::coins(wallet, &self.dir)?
+        let largest = holder::coins(wallet, &self.wallet_file)?
             .first()
             .map_or(0, |c| c.value);
         let mut hubs = Vec::new();
@@ -749,7 +756,7 @@ impl<T: Transport + 'static> Keeper<T> {
                 .filter(|k| k.deadlines().claim_at > tip)
                 .map(|k| k.contract.clone())
                 .collect();
-            let each = holder::coverage(self.provider.wallet(), &self.dir, &others, tip)?;
+            let each = holder::coverage(self.provider.wallet(), &self.wallet_file, &others, tip)?;
             kept[i].others_recover = each.values().sum();
         }
         Ok(kept)
@@ -951,7 +958,7 @@ impl<T: Transport + 'static> Keeper<T> {
         let offered = (info.contracts).ok_or_else(|| anyhow!("{hub} opens no contracts now"))?;
         let (blocks, cap) = match offered.range {
             Some(range) => {
-                let largest = holder::coins(wallet, &self.dir)?
+                let largest = holder::coins(wallet, &self.wallet_file)?
                     .first()
                     .map_or(0, |c| c.value);
                 let sizes = Sizes::of(range, largest)
@@ -970,7 +977,7 @@ impl<T: Transport + 'static> Keeper<T> {
             deposit: None,
             funded: 0,
         };
-        holder::open_with(wallet, &self.chain, &self.dir, hub, ask).await
+        holder::open_with(wallet, &self.chain, &self.wallet_file, hub, ask).await
     }
 
     /// Open `successor`, of the longest term its hub offers: a failure
