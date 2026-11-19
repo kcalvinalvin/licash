@@ -697,6 +697,12 @@ impl<T: Transport> Wallet<T> {
         &self.transport
     }
 
+    /// The file the wallet is kept in, which the modules of the same actor
+    /// (a swap provider's, a holder's contracts) keep their tables in too.
+    pub fn path(&self) -> &Path {
+        self.store.path()
+    }
+
     /// When the wallet file was made, in seconds since the Unix epoch: of
     /// a new seed, no payment to it is older.
     pub fn created_at(&self) -> Result<i64, Error> {

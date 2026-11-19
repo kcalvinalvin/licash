@@ -1,151 +1,148 @@
-//! The provider's file: its swaps and its events, in one SQLite database
-//! beside its wallet's, written in IMMEDIATE transactions.
+//! The provider's tables, the component `provider` of its wallet's file:
+//! its swaps and its events, written in IMMEDIATE transactions through a
+//! connection of their own. The wallet is the provider's, so the file is
+//! too: one copy of it is the provider whole.
+//!
+//! The file is of one layout: a version other than [`VERSION`] is refused,
+//! and nothing is migrated.
 
 use std::{
     path::Path,
     sync::{Mutex, MutexGuard, PoisonError},
-    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior};
+use licash_store::Kind;
+use rusqlite::{Connection, Transaction};
 
 use crate::Error;
 
-/// The schema this provider reads and writes, as SQLite's `user_version`.
-const VERSION: i64 = 5;
+pub(crate) use licash_store::now;
 
-/// Version 5: donations taken over Lightning (`crate::donations`). Each is
-/// a held invoice of the provider's node under `hash`, whose `preimage` the
-/// provider chose, asking `sat`, recorded before the node makes it, then
-/// its `request`. Once paid, the provider pays `amount` to the wallet of
-/// the Licash code `code` under the key `hash` (`licash_wallet::Wallet::
-/// pay_code_keyed`), then settles. `state` is open, owed (settled before
-/// that payment was released, which the provider still follows), settled,
-/// canceled or lost (paid and not settled, or settled and the payment
-/// given up).
-const DONATIONS: &str = "
-CREATE TABLE donations (
-    hash BLOB PRIMARY KEY,
-    preimage BLOB NOT NULL,
-    code TEXT NOT NULL,
-    sat INTEGER NOT NULL,
-    amount INTEGER NOT NULL,
-    request TEXT,
-    state TEXT NOT NULL,
-    reason TEXT,
-    created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL
-) STRICT;
-CREATE INDEX donations_state ON donations (state);
-";
+/// The component the provider's tables are, and its version.
+pub(crate) const COMPONENT: &str = "provider";
+pub(crate) const VERSION: i64 = 1;
 
-/// The block a payout's coin was looked through to (`payouts.scanned`),
-/// by its hash: while the chain still has it there, so are the blocks
-/// before, and what they held stands. Made at open whatever the schema
-/// version, so that a provider of a version before still reads the file:
-/// one at `scanned` is to be trusted, and none, or one at another height
-/// (`scanned` written since by a provider without it), tells nothing.
-const ANCHORS: &str = "
-CREATE TABLE IF NOT EXISTS payout_anchors (
-    id BLOB PRIMARY KEY,
-    height INTEGER NOT NULL,
-    hash BLOB NOT NULL
-) STRICT;
-";
-
-/// Version 4: Lightning invoices paid. A swap of kind `lightning` pays an
-/// invoice from the provider's node: its `to_url` is
-/// `lightning:<network>`, `address` the invoice's payee, a public key,
-/// `amount` the invoice's satoshis, rounded up, and `expiry` the height its
-/// routes' timelock ends by at the latest.
-const INVOICES: &str = "
--- The invoices, by their swaps' ids, recorded before the node pays them:
--- `node` is the public key, in hex, of the provider's node that pays it,
--- which alone knows how its payment ends.
-CREATE TABLE invoices (
-    id BLOB PRIMARY KEY REFERENCES swaps (id),
-    request TEXT NOT NULL,
-    node TEXT NOT NULL
-) STRICT;
-";
-
-/// Version 3: swaps into the provider's own hub. A swap of kind `own` has
-/// hub `to_url`, which the provider is, lock notes it issues itself
-/// (`licash_hub::Hub::lock_own`) rather than notes its wallet holds there.
-const ISSUES: &str = "
--- The own swaps' locks, by their swaps' ids: their notes pay the client's
--- address as derived from the ephemeral secret, recorded with the swap,
--- before the hub locks.
-CREATE TABLE issues (
-    id BLOB PRIMARY KEY REFERENCES swaps (id),
-    ephemeral BLOB NOT NULL
-) STRICT;
-";
-
-/// Version 2: payouts on Bitcoin. A swap's kind is `notes`, a swap of notes
-/// at one hub for notes at another, or `chain`, a payout: its `to_url` is
-/// `bitcoin:<network>`, `address` the output script of the provider's coin,
-/// `amount` its value and `expiry` its timeout, a block height.
-const PAYOUTS: &str = "
-ALTER TABLE swaps ADD COLUMN kind TEXT NOT NULL DEFAULT 'notes';
--- The payouts' coins, by their swaps' ids: claimed with the client's key
--- claim_key and the preimage, taken back after the timeout with the
--- provider's refund_key, a secret key, recorded before the coin is made.
--- funding_tx is the wallet's transaction paying it, at output
--- funding_vout, once made; refund_tx the provider's taking it back once
--- timed out unclaimed. scanned is the last block looked in for its spend.
-CREATE TABLE payouts (
-    id BLOB PRIMARY KEY REFERENCES swaps (id),
-    claim_key BLOB NOT NULL,
-    refund_key BLOB NOT NULL,
-    funding_tx BLOB,
-    funding_vout INTEGER,
-    refund_tx BLOB,
-    scanned INTEGER
-) STRICT;
-";
-
-/// Version 1, as providers in the field hold it
-/// (`tests/fixtures/swaps-v1.sql`): never change it, add a migration.
 const SCHEMA: &str = "
-CREATE TABLE meta (
+-- The provider's identity.
+CREATE TABLE provider_meta (
     one INTEGER PRIMARY KEY CHECK (one = 1),
     -- The secret key the provider announces itself under on Nostr.
     nostr BLOB NOT NULL,
     created_at INTEGER NOT NULL
 ) STRICT;
+
 -- Swaps by the client's lock at `from_url`, which pays the provider `paid`
 -- under `hash` until `expiry_from`: recorded before the provider's lock of
 -- `amount` to the client's `address` at `to_url` is made, then that lock,
 -- then the preimage the client revealed claiming it. `state` is accepted,
 -- locked, paid, done, refunded, failed or lost (paid at `to_url` but not
 -- claimed at `from_url`).
-CREATE TABLE swaps (
+--
+-- `kind` is `notes`, a swap of notes at one hub for notes at another;
+-- `own`, into the provider's own hub, which the provider is, whose lock
+-- notes it issues itself (`licash_hub::Hub::lock_own`) rather than notes
+-- its wallet holds there (it has an `issues` row); `chain`, a payout: its
+-- `to_url` is `bitcoin:<network>`, `address` the output script of the
+-- provider's coin, `amount` its value and `expiry` its timeout, a block
+-- height (it has a `payouts` row); or `lightning`, an invoice paid from the
+-- provider's node: its `to_url` is `lightning:<network>`, `address` the
+-- invoice's payee, a public key, `amount` the invoice's satoshis, rounded
+-- up, and `expiry` the height its routes' timelock ends by at the latest
+-- (it has an `invoices` row).
+CREATE TABLE provider_swaps (
     id BLOB PRIMARY KEY,
-    hash BLOB NOT NULL UNIQUE,
+    hash BLOB NOT NULL UNIQUE CHECK (length(hash) = 32),
     from_url TEXT NOT NULL,
     to_url TEXT NOT NULL,
     address BLOB NOT NULL,
-    amount INTEGER NOT NULL,
-    fee INTEGER NOT NULL,
-    paid INTEGER NOT NULL,
+    amount INTEGER NOT NULL CHECK (amount >= 0),
+    fee INTEGER NOT NULL CHECK (fee >= 0),
+    paid INTEGER NOT NULL CHECK (paid >= 0),
     expiry_from INTEGER NOT NULL,
     expiry INTEGER NOT NULL,
     lock BLOB,
-    preimage BLOB,
-    state TEXT NOT NULL,
+    preimage BLOB CHECK (preimage IS NULL OR length(preimage) = 32),
+    state TEXT NOT NULL
+        CHECK (state IN ('accepted', 'locked', 'paid', 'done', 'refunded', 'failed', 'lost')),
+    reason TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'notes' CHECK (kind IN ('notes', 'own', 'chain', 'lightning'))
+) STRICT;
+CREATE INDEX provider_swaps_state ON provider_swaps (state);
+
+-- What the operator is told of, in order.
+CREATE TABLE provider_events (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    at INTEGER NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('accepted', 'done', 'refunded', 'failed', 'lost', 'alert')),
+    json TEXT NOT NULL
+) STRICT;
+
+-- The own swaps' locks, by their swaps' ids: their notes pay the client's
+-- address as derived from the ephemeral secret, recorded with the swap,
+-- before the hub locks.
+CREATE TABLE provider_issues (
+    id BLOB PRIMARY KEY REFERENCES provider_swaps (id),
+    ephemeral BLOB NOT NULL
+) STRICT;
+
+-- The invoices, by their swaps' ids, recorded before the node pays them:
+-- `node` is the public key of the provider's node that pays it, which
+-- alone knows how its payment ends.
+CREATE TABLE provider_invoices (
+    id BLOB PRIMARY KEY REFERENCES provider_swaps (id),
+    request TEXT NOT NULL,
+    node BLOB NOT NULL
+) STRICT;
+
+-- The payouts' coins, by their swaps' ids: claimed with the client's key
+-- claim_key and the preimage, taken back after the timeout with the
+-- provider's refund_key, a secret key, recorded before the coin is made.
+-- refund_tx is the provider's taking it back once timed out unclaimed.
+CREATE TABLE provider_payouts (
+    id BLOB PRIMARY KEY REFERENCES provider_swaps (id),
+    claim_key BLOB NOT NULL,
+    refund_key BLOB NOT NULL,
+    refund_tx BLOB
+) STRICT;
+-- The wallet's transaction paying the coin, at output `vout`, once made.
+CREATE TABLE provider_payout_fundings (
+    id BLOB PRIMARY KEY REFERENCES provider_payouts (id),
+    tx BLOB NOT NULL,
+    vout INTEGER NOT NULL
+) STRICT;
+-- The block a payout's coin was looked through to, by its height: while
+-- the chain still has the block of `hash` there, so are the blocks before,
+-- and what they held stands. A refund buried deep clears the hash: the
+-- height alone then tells REORG blocks less.
+CREATE TABLE provider_payout_scans (
+    id BLOB PRIMARY KEY REFERENCES provider_payouts (id),
+    height INTEGER NOT NULL,
+    hash BLOB CHECK (hash IS NULL OR length(hash) = 32)
+) STRICT;
+
+-- Donations taken over Lightning (`crate::donations`). Each is a held
+-- invoice of the provider's node under `hash`, whose `preimage` the provider
+-- chose, asking `sat`, recorded before the node makes it, then its
+-- `request`. Once paid, the provider pays `amount` to the wallet of the
+-- Licash code `code` under the key `hash` (`licash_wallet::Wallet::
+-- pay_code_keyed`), then settles. `state` is open, owed (settled before that
+-- payment was released, which the provider still follows), settled, canceled
+-- or lost (paid and not settled, or settled and the payment given up).
+CREATE TABLE provider_donations (
+    hash BLOB PRIMARY KEY CHECK (length(hash) = 32),
+    preimage BLOB NOT NULL CHECK (length(preimage) = 32),
+    code TEXT NOT NULL,
+    sat INTEGER NOT NULL CHECK (sat >= 0),
+    amount INTEGER NOT NULL CHECK (amount >= 0),
+    request TEXT,
+    state TEXT NOT NULL CHECK (state IN ('open', 'owed', 'settled', 'canceled', 'lost')),
     reason TEXT,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
 ) STRICT;
-CREATE INDEX swaps_state ON swaps (state);
--- What the operator is told of, in order.
-CREATE TABLE events (
-    seq INTEGER PRIMARY KEY AUTOINCREMENT,
-    at INTEGER NOT NULL,
-    kind TEXT NOT NULL,
-    json TEXT NOT NULL
-) STRICT;
+CREATE INDEX provider_donations_state ON provider_donations (state);
 ";
 
 pub(crate) struct Store {
@@ -156,84 +153,56 @@ impl Store {
     pub(crate) fn set_lock(&self, id: &[u8; 32], lock: &[u8; 32]) -> Result<(), Error> {
         self.write(|tx| {
             tx.execute(
-                "UPDATE swaps SET lock = ?2, updated_at = ?3 WHERE id = ?1 AND lock IS NULL",
+                "UPDATE provider_swaps SET lock = ?2, updated_at = ?3
+                 WHERE id = ?1 AND lock IS NULL",
                 rusqlite::params![id, lock, now()],
             )?;
             Ok(())
         })
     }
-    /// A new file at `path`, readable by its owner only. Never over an
-    /// existing file.
+
+    /// The provider's tables, new in the wallet's file at `path`: refused
+    /// where it holds them already.
     pub(crate) fn create(path: &Path, nostr: &[u8; 32]) -> Result<Self, Error> {
-        let mut file = std::fs::OpenOptions::new();
-        file.write(true).create_new(true);
-        #[cfg(unix)]
-        std::os::unix::fs::OpenOptionsExt::mode(&mut file, 0o600);
-        file.open(path).map_err(|e| setup(path, e))?;
-        let store = Self::connect(path)?;
-        store.write(|tx| {
-            tx.execute_batch(SCHEMA)?;
-            tx.execute_batch(PAYOUTS)?;
-            tx.execute_batch(ISSUES)?;
-            tx.execute_batch(INVOICES)?;
-            tx.execute_batch(DONATIONS)?;
-            tx.execute_batch(ANCHORS)?;
-            tx.pragma_update(None, "user_version", VERSION)?;
+        let mut conn = licash_store::open(path, Kind::Wallet).map_err(setup)?;
+        if licash_store::component_version(&conn, COMPONENT)
+            .map_err(setup)?
+            .is_some()
+        {
+            return Err(Error::Setup(format!(
+                "{} holds a swap provider already",
+                path.display()
+            )));
+        }
+        licash_store::write(&mut conn, |tx| {
+            licash_store::component_in(tx, COMPONENT, VERSION, SCHEMA)
+                .map_err(|e| Error::Setup(e.to_string()))?;
             tx.execute(
-                "INSERT INTO meta (one, nostr, created_at) VALUES (1, ?1, ?2)",
+                "INSERT INTO provider_meta (one, nostr, created_at) VALUES (1, ?1, ?2)",
                 rusqlite::params![nostr, now()],
             )?;
-            Ok(())
+            Ok::<_, Error>(())
         })?;
-        Ok(store)
-    }
-
-    pub(crate) fn open(path: &Path) -> Result<Self, Error> {
-        if !path.exists() {
-            return Err(Error::Setup(format!("no swaps file at {}", path.display())));
-        }
-        let store = Self::connect(path)?;
-        // Checked and migrated in one transaction: a provider of another
-        // version opening it meanwhile sees it whole, either way.
-        store.write(|tx| {
-            let version: i64 = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
-            match version {
-                VERSION => {}
-                1..=4 => {
-                    if version < 2 {
-                        tx.execute_batch(PAYOUTS)?;
-                    }
-                    if version < 3 {
-                        tx.execute_batch(ISSUES)?;
-                    }
-                    if version < 4 {
-                        tx.execute_batch(INVOICES)?;
-                    }
-                    tx.execute_batch(DONATIONS)?;
-                    tx.pragma_update(None, "user_version", VERSION)?;
-                    tracing::info!("swaps file migrated to schema {VERSION}");
-                }
-                _ => {
-                    return Err(Error::Setup(format!(
-                        "swaps schema {version}, this version reads 1 to {VERSION}"
-                    )))
-                }
-            }
-            tx.execute_batch(ANCHORS)?;
-            Ok(())
-        })?;
-        Ok(store)
-    }
-
-    fn connect(path: &Path) -> Result<Self, Error> {
-        let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-        let conn = Connection::open_with_flags(path, flags).map_err(|e| setup(path, e))?;
-        conn.busy_timeout(Duration::from_secs(10))?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.pragma_update(None, "synchronous", "FULL")?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
+    }
+
+    /// The provider's tables in the wallet's file at `path`.
+    pub(crate) fn open(path: &Path) -> Result<Self, Error> {
+        let conn = licash_store::open(path, Kind::Wallet).map_err(setup)?;
+        match licash_store::component_version(&conn, COMPONENT).map_err(setup)? {
+            Some(VERSION) => Ok(Self {
+                conn: Mutex::new(conn),
+            }),
+            Some(v) => Err(Error::Setup(format!(
+                "swaps schema {v}, this version reads {VERSION}"
+            ))),
+            None => Err(Error::Setup(format!(
+                "no swap provider in {}",
+                path.display()
+            ))),
+        }
     }
 
     fn conn(&self) -> MutexGuard<'_, Connection> {
@@ -252,20 +221,13 @@ impl Store {
         &self,
         op: impl FnOnce(&Transaction<'_>) -> Result<T, Error>,
     ) -> Result<T, Error> {
-        let mut conn = self.conn();
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let value = op(&tx)?;
-        tx.commit()?;
-        Ok(value)
+        licash_store::write(&mut self.conn(), op)
     }
 }
 
-fn setup(path: &Path, e: impl std::fmt::Display) -> Error {
-    Error::Setup(format!("swaps {}: {e}", path.display()))
-}
-
-pub(crate) fn now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs() as i64)
+pub(crate) fn setup(e: licash_store::Error) -> Error {
+    match e {
+        licash_store::Error::Sqlite(e) => Error::Storage(e),
+        e => Error::Setup(e.to_string()),
+    }
 }

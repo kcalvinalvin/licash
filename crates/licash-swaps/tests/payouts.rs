@@ -249,9 +249,7 @@ impl Eco {
             };
             net.confirm(A, vec![made_up(output)]);
         }
-        let provider = Provider::create(&dir.path().join("swaps.sqlite"), wallet, CONFIG)
-            .unwrap()
-            .pay_out(terms);
+        let provider = Provider::create(wallet, CONFIG).unwrap().pay_out(terms);
         let pool = Pool {
             net: net.clone(),
             view: net.view(A),
@@ -298,9 +296,7 @@ impl Eco {
             Link(self.net.clone()),
         )
         .unwrap();
-        let provider = Provider::open(&self.dir.path().join("swaps.sqlite"), wallet, CONFIG)
-            .unwrap()
-            .pay_out(TERMS);
+        let provider = Provider::open(wallet, CONFIG).unwrap().pay_out(TERMS);
         *self.desk.provider.lock().unwrap() = Some(Arc::new(provider));
     }
 
@@ -313,7 +309,7 @@ impl Eco {
             Link(self.net.clone()),
         )
         .unwrap();
-        let provider = Provider::open(&self.dir.path().join("swaps.sqlite"), wallet, CONFIG)
+        let provider = Provider::open(wallet, CONFIG)
             .unwrap()
             .pay_out(TERMS)
             .limit_payouts(limits);
@@ -696,9 +692,9 @@ async fn claimed_in_blocks_replacing_those_looked_through(legacy: bool) {
     eco.follow().await;
     assert_eq!(eco.stage(), Stage::Locked);
     if legacy {
-        rusqlite::Connection::open(eco.dir.path().join("swaps.sqlite"))
+        rusqlite::Connection::open(eco.dir.path().join("wallet.sqlite"))
             .unwrap()
-            .execute("DELETE FROM payout_anchors", [])
+            .execute("UPDATE provider_payout_scans SET hash = NULL", [])
             .unwrap();
     }
     eco.net.reorg(A, coin_at);
@@ -1100,188 +1096,6 @@ async fn the_operator_is_alerted_once_when_its_coins_pay_out_too_little() {
     eco.follow().await;
     assert!(eco.provider().check_payouts().unwrap());
     assert_eq!(alerts(&eco), 2);
-}
-
-#[tokio::test]
-async fn a_swaps_file_of_version_1_gains_payouts() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("swaps.sqlite");
-    let version = |path: &std::path::Path| -> i64 {
-        let c = rusqlite::Connection::open(path).unwrap();
-        c.pragma_query_value(None, "user_version", |r| r.get(0))
-            .unwrap()
-    };
-    rusqlite::Connection::open(&path)
-        .unwrap()
-        .execute_batch(include_str!("fixtures/swaps-v1.sql"))
-        .unwrap();
-    assert_eq!(version(&path), 1);
-    let net = Net::new();
-    net.start_timed(A, FEE, TIMED);
-    let wallet = Wallet::create(
-        &dir.path().join("wallet.sqlite"),
-        &[0x50; 32],
-        ChainProfile::Core30DefaultRegtest,
-        Link(net.clone()),
-    )
-    .unwrap();
-    let provider = Provider::open(&path, wallet, CONFIG).unwrap();
-    assert_eq!(version(&path), 5);
-    let records = provider.records(10).unwrap();
-    assert_eq!(records.len(), 1);
-    assert_eq!(
-        (records[0].stage, records[0].amount),
-        (Stage::Accepted, 1000)
-    );
-    assert_eq!(provider.last_event().unwrap(), 1);
-    let id = licash::spend::ProposalId::from_bytes([0xab; 32]);
-    assert!(provider.swap(&id).unwrap().is_some());
-    assert!(provider.payout(&id).unwrap().is_none());
-    // A swap of notes still, taken on as one: stopped before its lock.
-    provider.step().await.unwrap();
-    assert_eq!(provider.records(1).unwrap()[0].stage, Stage::Failed);
-    drop(provider);
-    // A newer file is refused untouched.
-    rusqlite::Connection::open(&path)
-        .unwrap()
-        .pragma_update(None, "user_version", 6)
-        .unwrap();
-    let wallet = Wallet::open(&dir.path().join("wallet.sqlite"), Link(net)).unwrap();
-    match Provider::open(&path, wallet, CONFIG) {
-        Err(licash_swaps::Error::Setup(why)) => assert!(why.contains("schema 6"), "{why}"),
-        Err(e) => panic!("{e}"),
-        Ok(_) => panic!("opened"),
-    }
-    assert_eq!(version(&path), 6);
-}
-
-#[tokio::test]
-async fn a_swaps_file_of_version_2_gains_the_locks_a_hub_issues() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("swaps.sqlite");
-    let db = || rusqlite::Connection::open(&path).unwrap();
-    db().execute_batch(include_str!("fixtures/swaps-v1.sql"))
-        .unwrap();
-    let net = Net::new();
-    net.start_timed(A, FEE, TIMED);
-    let wallet = Wallet::create(
-        &dir.path().join("wallet.sqlite"),
-        &[0x50; 32],
-        ChainProfile::Core30DefaultRegtest,
-        Link(net.clone()),
-    )
-    .unwrap();
-    drop(Provider::open(&path, wallet, CONFIG).unwrap());
-    // As a provider of version 2 left it: its swaps and payouts, no
-    // issues nor invoices nor donations.
-    db().execute_batch(
-        "DROP TABLE donations; DROP TABLE invoices; DROP TABLE issues;
-         PRAGMA user_version = 2;",
-    )
-    .unwrap();
-    let wallet = Wallet::open(&dir.path().join("wallet.sqlite"), Link(net)).unwrap();
-    let provider = Provider::open(&path, wallet, CONFIG).unwrap();
-    let version: i64 = db()
-        .pragma_query_value(None, "user_version", |r| r.get(0))
-        .unwrap();
-    assert_eq!(version, 5);
-    for table in ["issues", "invoices", "donations"] {
-        let count: i64 = db()
-            .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(count, 0, "{table}");
-    }
-    let records = provider.records(10).unwrap();
-    assert_eq!(
-        (records.len(), records[0].stage, records[0].amount),
-        (1, Stage::Accepted, 1000)
-    );
-    assert_eq!(provider.last_event().unwrap(), 1);
-}
-
-#[tokio::test]
-async fn a_swaps_file_of_version_3_gains_invoices() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("swaps.sqlite");
-    let db = || rusqlite::Connection::open(&path).unwrap();
-    db().execute_batch(include_str!("fixtures/swaps-v1.sql"))
-        .unwrap();
-    let net = Net::new();
-    net.start_timed(A, FEE, TIMED);
-    let wallet = Wallet::create(
-        &dir.path().join("wallet.sqlite"),
-        &[0x50; 32],
-        ChainProfile::Core30DefaultRegtest,
-        Link(net.clone()),
-    )
-    .unwrap();
-    drop(Provider::open(&path, wallet, CONFIG).unwrap());
-    // As a provider of version 3 left it: no invoices nor donations.
-    db().execute_batch("DROP TABLE donations; DROP TABLE invoices; PRAGMA user_version = 3;")
-        .unwrap();
-    let wallet = Wallet::open(&dir.path().join("wallet.sqlite"), Link(net)).unwrap();
-    let provider = Provider::open(&path, wallet, CONFIG).unwrap();
-    let version: i64 = db()
-        .pragma_query_value(None, "user_version", |r| r.get(0))
-        .unwrap();
-    assert_eq!(version, 5);
-    let invoices: i64 = db()
-        .query_row("SELECT count(*) FROM invoices", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(invoices, 0);
-    // Its swap untouched, and nothing paid over Lightning under way.
-    let records = provider.records(10).unwrap();
-    assert_eq!(
-        (records.len(), records[0].stage, records[0].amount),
-        (1, Stage::Accepted, 1000)
-    );
-    assert_eq!(provider.open_invoices().unwrap(), 0);
-    assert_eq!(provider.last_event().unwrap(), 1);
-}
-
-#[tokio::test]
-async fn a_swaps_file_of_version_4_gains_donations() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("swaps.sqlite");
-    let db = || rusqlite::Connection::open(&path).unwrap();
-    db().execute_batch(include_str!("fixtures/swaps-v1.sql"))
-        .unwrap();
-    let net = Net::new();
-    net.start_timed(A, FEE, TIMED);
-    let wallet = Wallet::create(
-        &dir.path().join("wallet.sqlite"),
-        &[0x50; 32],
-        ChainProfile::Core30DefaultRegtest,
-        Link(net.clone()),
-    )
-    .unwrap();
-    drop(Provider::open(&path, wallet, CONFIG).unwrap());
-    // As a provider of version 4 left it: its invoices, no donations.
-    db().execute_batch("DROP TABLE donations; PRAGMA user_version = 4;")
-        .unwrap();
-    // Read before it is migrated: its swap's hash reserved, no other.
-    assert!(licash_swaps::holds_hash(&path, &[0xcd; 32]).unwrap());
-    assert!(!licash_swaps::holds_hash(&path, &[0xef; 32]).unwrap());
-    let wallet = Wallet::open(&dir.path().join("wallet.sqlite"), Link(net)).unwrap();
-    let provider = Provider::open(&path, wallet, CONFIG).unwrap();
-    let version: i64 = db()
-        .pragma_query_value(None, "user_version", |r| r.get(0))
-        .unwrap();
-    assert_eq!(version, 5);
-    let donations: i64 = db()
-        .query_row("SELECT count(*) FROM donations", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(donations, 0);
-    // Its swap untouched, and no donation under way nor taken.
-    let records = provider.records(10).unwrap();
-    assert_eq!(
-        (records.len(), records[0].stage, records[0].amount),
-        (1, Stage::Accepted, 1000)
-    );
-    assert!(provider.donation_terms().is_none());
-    assert!(provider.follow_donations().await.unwrap().is_empty());
-    assert!(licash_swaps::holds_hash(&path, &[0xcd; 32]).unwrap());
-    assert!(!licash_swaps::holds_hash(&path, &[0xef; 32]).unwrap());
 }
 
 /// A payout to a silent payment address through the provider: asked its

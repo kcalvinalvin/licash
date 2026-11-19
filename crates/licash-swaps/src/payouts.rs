@@ -448,7 +448,7 @@ impl<T: Transport> Provider<T> {
         let recorded = self.store.write(|tx| {
             let at = now();
             let inserted = tx.execute(
-                "INSERT INTO swaps (id, hash, from_url, to_url, address, amount, fee, paid,
+                "INSERT INTO provider_swaps (id, hash, from_url, to_url, address, amount, fee, paid,
                     expiry_from, expiry, state, kind, created_at, updated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'accepted', 'chain', ?11, ?11)
                  ON CONFLICT DO NOTHING",
@@ -468,7 +468,7 @@ impl<T: Transport> Provider<T> {
             )?;
             if inserted == 1 {
                 tx.execute(
-                    "INSERT INTO payouts (id, claim_key, refund_key) VALUES (?1, ?2, ?3)",
+                    "INSERT INTO provider_payouts (id, claim_key, refund_key) VALUES (?1, ?2, ?3)",
                     params![id, htlc.claim.serialize(), refund_key.secret_bytes()],
                 )?;
                 emit(tx, &notice)?;
@@ -517,8 +517,8 @@ impl<T: Transport> Provider<T> {
             .ok_or_else(|| licash_wallet::Error::Invalid("a coin paying no payout".into()))?;
         self.store.write(|t| {
             t.execute(
-                "UPDATE payouts SET funding_tx = ?2, funding_vout = ?3
-                 WHERE id = ?1 AND funding_tx IS NULL",
+                "INSERT INTO provider_payout_fundings (id, tx, vout) VALUES (?1, ?2, ?3)
+                 ON CONFLICT (id) DO NOTHING",
                 params![id, serialize(tx), vout as u32],
             )?;
             Ok(())
@@ -627,9 +627,12 @@ impl<T: Transport> Provider<T> {
         );
         let raw: Option<Raw> = self.store.read(|c| {
             Ok(c.query_row(
-                "SELECT s.hash, s.expiry, p.claim_key, p.refund_key, p.funding_tx,
-                    p.funding_vout, p.refund_tx, p.scanned
-                 FROM payouts p JOIN swaps s ON s.id = p.id WHERE p.id = ?1",
+                "SELECT s.hash, s.expiry, p.claim_key, p.refund_key, f.tx,
+                    f.vout, p.refund_tx, c.height
+                 FROM provider_payouts p JOIN provider_swaps s ON s.id = p.id
+                 LEFT JOIN provider_payout_fundings f ON f.id = p.id
+                 LEFT JOIN provider_payout_scans c ON c.id = p.id
+                 WHERE p.id = ?1",
                 [id],
                 |r| {
                     Ok((
@@ -696,7 +699,7 @@ impl<T: Transport> Provider<T> {
         }
         let open: Vec<[u8; 32]> = self.store.read(|c| {
             let mut stmt = c.prepare(
-                "SELECT id FROM swaps WHERE kind = 'chain' AND state IN ('accepted', 'locked')
+                "SELECT id FROM provider_swaps WHERE kind = 'chain' AND state IN ('accepted', 'locked')
                  ORDER BY created_at, rowid",
             )?;
             let rows = stmt.query_map([], |r| r.get(0))?;
@@ -714,8 +717,8 @@ impl<T: Transport> Provider<T> {
         // Refunded lately: until their refunds are buried.
         let refunded: Vec<[u8; 32]> = self.store.read(|c| {
             let mut stmt = c.prepare(
-                "SELECT s.id FROM swaps s JOIN payouts p ON p.id = s.id
-                    JOIN payout_anchors a ON a.id = s.id AND a.height = p.scanned
+                "SELECT s.id FROM provider_swaps s
+                    JOIN provider_payout_scans a ON a.id = s.id AND a.hash IS NOT NULL
                  WHERE s.kind = 'chain' AND s.state = 'refunded'
                  ORDER BY s.created_at, s.rowid",
             )?;
@@ -741,7 +744,7 @@ impl<T: Transport> Provider<T> {
         let listed = serde_json::to_string(&urls).map_err(|e| Error::Setup(e.to_string()))?;
         self.store.read(|c| {
             Ok(c.query_row(
-                "SELECT count(*) FROM swaps WHERE kind = 'chain' AND state = 'refunded'
+                "SELECT count(*) FROM provider_swaps WHERE kind = 'chain' AND state = 'refunded'
                     AND updated_at >= ?2 AND from_url IN (SELECT value FROM json_each(?1))",
                 params![listed, now() - NO_SHOW_FOR],
                 |r| r.get::<_, i64>(0),
@@ -753,7 +756,7 @@ impl<T: Transport> Provider<T> {
     pub fn open_payouts(&self) -> Result<u64, Error> {
         self.store.read(|c| {
             Ok(c.query_row(
-                "SELECT count(*) FROM swaps WHERE kind = 'chain'
+                "SELECT count(*) FROM provider_swaps WHERE kind = 'chain'
                  AND state IN ('accepted', 'locked')",
                 [],
                 |r| r.get::<_, i64>(0),
@@ -965,7 +968,7 @@ impl<T: Transport> Provider<T> {
             Some(tx) => {
                 self.store.write(|t| {
                     t.execute(
-                        "UPDATE payouts SET refund_tx = ?2 WHERE id = ?1",
+                        "UPDATE provider_payouts SET refund_tx = ?2 WHERE id = ?1",
                         params![id, serialize(&tx)],
                     )?;
                     Ok(())
@@ -994,11 +997,7 @@ impl<T: Transport> Provider<T> {
     fn set_scanned(&self, id: &[u8; 32], (height, hash): (u32, BlockHash)) -> Result<(), Error> {
         self.store.write(|t| {
             t.execute(
-                "UPDATE payouts SET scanned = ?2 WHERE id = ?1",
-                params![id, height],
-            )?;
-            t.execute(
-                "INSERT INTO payout_anchors (id, height, hash) VALUES (?1, ?2, ?3)
+                "INSERT INTO provider_payout_scans (id, height, hash) VALUES (?1, ?2, ?3)
                  ON CONFLICT (id) DO UPDATE SET height = ?2, hash = ?3",
                 params![id, height, hash.as_byte_array()],
             )?;
@@ -1006,13 +1005,13 @@ impl<T: Transport> Provider<T> {
         })
     }
 
-    /// The block of payout `id` to be anchored at, its height and hash, if
-    /// recorded at `scanned`: none at another height was written before
-    /// `scanned` was by a provider of a version before.
+    /// The block of payout `id` to be anchored at, its hash, if recorded at
+    /// `scanned`: none once a refund buried deep cleared it.
     fn anchor(&self, id: &[u8; 32], scanned: u32) -> Result<Option<BlockHash>, Error> {
         let hash: Option<[u8; 32]> = self.store.read(|c| {
             Ok(c.query_row(
-                "SELECT hash FROM payout_anchors WHERE id = ?1 AND height = ?2",
+                "SELECT hash FROM provider_payout_scans
+                 WHERE id = ?1 AND height = ?2 AND hash IS NOT NULL",
                 params![id, scanned],
                 |r| r.get(0),
             )
@@ -1088,7 +1087,10 @@ impl<T: Transport> Provider<T> {
         if now == hash {
             if tip >= scanned + REORG {
                 self.store.write(|t| {
-                    t.execute("DELETE FROM payout_anchors WHERE id = ?1", [id])?;
+                    t.execute(
+                        "UPDATE provider_payout_scans SET hash = NULL WHERE id = ?1",
+                        [id],
+                    )?;
                     Ok(())
                 })?;
             }
@@ -1109,8 +1111,7 @@ impl<T: Transport> Provider<T> {
         let name = hex::encode(id);
         tracing::warn!(id = %name, "payout's refund out of the chain: taken on again");
         self.store.write(|t| {
-            t.execute("DELETE FROM payout_anchors WHERE id = ?1", [id])?;
-            t.execute("UPDATE payouts SET scanned = NULL WHERE id = ?1", [id])?;
+            t.execute("DELETE FROM provider_payout_scans WHERE id = ?1", [id])?;
             Ok(())
         })?;
         if self.advance(id, Stage::Refunded, Stage::Locked, None, None)? {

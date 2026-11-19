@@ -908,6 +908,7 @@ dependencies = [
  "licash-hub",
  "licash-lightning",
  "licash-onchain",
+ "licash-store",
  "licash-wallet",
  "lightning-invoice",
  "rand_core",

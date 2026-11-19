@@ -205,7 +205,7 @@ impl<T: Transport> Provider<T> {
     pub fn open_invoices(&self) -> Result<u64, Error> {
         self.store.read(|c| {
             Ok(c.query_row(
-                "SELECT count(*) FROM swaps WHERE kind = 'lightning' AND state = 'accepted'",
+                "SELECT count(*) FROM provider_swaps WHERE kind = 'lightning' AND state = 'accepted'",
                 [],
                 |r| r.get::<_, i64>(0),
             )? as u64)
@@ -350,10 +350,12 @@ impl<T: Transport> Provider<T> {
             from: taken.from.to_owned(),
             to: to.clone(),
         };
+        let node = hex::decode(taken.node)
+            .map_err(|e| unavailable(format!("the node's key is no hex: {e}")))?;
         let recorded = self.store.write(|tx| {
             let at = now();
             let inserted = tx.execute(
-                "INSERT INTO swaps (id, hash, from_url, to_url, address, amount, fee, paid,
+                "INSERT INTO provider_swaps (id, hash, from_url, to_url, address, amount, fee, paid,
                     expiry_from, expiry, state, kind, created_at, updated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'accepted', 'lightning', ?11, ?11)
                  ON CONFLICT DO NOTHING",
@@ -373,8 +375,8 @@ impl<T: Transport> Provider<T> {
             )?;
             if inserted == 1 {
                 tx.execute(
-                    "INSERT INTO invoices (id, request, node) VALUES (?1, ?2, ?3)",
-                    params![id, taken.request, taken.node],
+                    "INSERT INTO provider_invoices (id, request, node) VALUES (?1, ?2, ?3)",
+                    params![id, taken.request, node],
                 )?;
                 emit(tx, &notice)?;
             }
@@ -430,12 +432,12 @@ impl<T: Transport> Provider<T> {
     fn invoice_record(&self, id: &[u8; 32]) -> Result<Option<Invoice>, Error> {
         self.store.read(|c| {
             Ok(c.query_row(
-                "SELECT request, node FROM invoices WHERE id = ?1",
+                "SELECT request, node FROM provider_invoices WHERE id = ?1",
                 [id],
                 |r| {
                     Ok(Invoice {
                         request: r.get(0)?,
-                        node: r.get(1)?,
+                        node: hex::encode(r.get::<_, Vec<u8>>(1)?),
                     })
                 },
             )
@@ -457,7 +459,7 @@ impl<T: Transport> Provider<T> {
         };
         let open: Vec<([u8; 32], String)> = self.store.read(|c| {
             let mut stmt = c.prepare(
-                "SELECT id, state FROM swaps WHERE kind = 'lightning'
+                "SELECT id, state FROM provider_swaps WHERE kind = 'lightning'
                     AND state IN ('accepted', 'paid')
                  ORDER BY created_at, rowid",
             )?;

@@ -77,7 +77,7 @@ impl Eco {
         .unwrap();
         wallet.add_hub(A).await.unwrap();
         let node = Arc::new(Fake::new());
-        let provider = Provider::create(&dir.path().join("swaps.sqlite"), wallet, CONFIG)
+        let provider = Provider::create(wallet, CONFIG)
             .unwrap()
             .pay_lightning(node.clone(), terms(&node))
             .unwrap();
@@ -115,7 +115,7 @@ impl Eco {
             Link(self.net.clone()),
         )
         .unwrap();
-        let provider = Provider::open(&self.dir.path().join("swaps.sqlite"), wallet, CONFIG)
+        let provider = Provider::open(wallet, CONFIG)
             .unwrap()
             .pay_lightning(self.node.clone(), terms(&self.node))
             .unwrap();
@@ -443,8 +443,7 @@ async fn a_provider_without_lightning_terms_pays_no_invoice() {
         )
         .unwrap()
     };
-    let provider =
-        Provider::create(&dir.path().join("swaps.sqlite"), wallet("w.sqlite"), CONFIG).unwrap();
+    let provider = Provider::create(wallet("w.sqlite"), CONFIG).unwrap();
     assert_eq!(provider.info().unwrap().lightning, None);
     let node = Arc::new(Fake::new());
     let request = node.invoice(1_000, [1; 32], DELTA, Outcome::Hang);
@@ -461,8 +460,7 @@ async fn a_provider_without_lightning_terms_pays_no_invoice() {
         slack,
         ..terms(&node)
     };
-    let other =
-        Provider::create(&dir.path().join("other.sqlite"), wallet("o.sqlite"), CONFIG).unwrap();
+    let other = Provider::create(wallet("o.sqlite"), CONFIG).unwrap();
     assert!(matches!(
         other.pay_lightning(node, too_little),
         Err(licash_swaps::Error::Setup(_))
@@ -551,7 +549,7 @@ async fn via() -> (
     wallet.add_hub(A).await.unwrap();
     let node = Arc::new(Fake::new());
     node.tip(net.view(A).height(), [0; 32]);
-    let provider = Provider::create(&dir.path().join("swaps.sqlite"), wallet, CONFIG)
+    let provider = Provider::create(wallet, CONFIG)
         .unwrap()
         .pay_lightning(node.clone(), terms(&node))
         .unwrap();

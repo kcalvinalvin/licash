@@ -435,6 +435,7 @@ pub(crate) struct Owner {
 
 pub(crate) struct Store {
     conn: Mutex<Connection>,
+    path: std::path::PathBuf,
 }
 
 impl Store {
@@ -471,6 +472,7 @@ impl Store {
         }
         Ok(Self {
             conn: Mutex::new(conn),
+            path: path.to_path_buf(),
         })
     }
 
@@ -496,6 +498,7 @@ impl Store {
         }
         let store = Self {
             conn: Mutex::new(conn),
+            path: path.to_path_buf(),
         };
         let owner = store.read(|c| {
             Ok(
@@ -509,6 +512,11 @@ impl Store {
             )
         })?;
         Ok((store, owner))
+    }
+
+    /// The file the wallet is kept in.
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
     }
 
     fn conn(&self) -> MutexGuard<'_, Connection> {

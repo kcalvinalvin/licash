@@ -266,7 +266,7 @@ impl<T: Transport> Provider<T> {
         self.store
             .write(|tx| {
                 let open: i64 = tx.query_row(
-                    "SELECT count(*) FROM donations WHERE state = 'open'",
+                    "SELECT count(*) FROM provider_donations WHERE state = 'open'",
                     [],
                     |r| r.get(0),
                 )?;
@@ -274,7 +274,7 @@ impl<T: Transport> Provider<T> {
                     return Ok(false);
                 }
                 tx.execute(
-                    "INSERT INTO donations
+                    "INSERT INTO provider_donations
                         (hash, preimage, code, sat, amount, state, created_at, updated_at)
                      VALUES (?1, ?2, ?3, ?4, ?5, 'open', ?6, ?6)",
                     params![hash, preimage, code, sql(sat), sql(amount), at],
@@ -301,7 +301,7 @@ impl<T: Transport> Provider<T> {
         self.store
             .write(|tx| {
                 tx.execute(
-                    "UPDATE donations SET request = ?2, updated_at = ?3 WHERE hash = ?1",
+                    "UPDATE provider_donations SET request = ?2, updated_at = ?3 WHERE hash = ?1",
                     params![hash, request, now()],
                 )?;
                 Ok(())
@@ -317,7 +317,7 @@ impl<T: Transport> Provider<T> {
     pub fn open_donations(&self) -> Result<u64, Error> {
         self.store.read(|c| {
             Ok(c.query_row(
-                "SELECT count(*) FROM donations WHERE state IN ('open', 'owed')",
+                "SELECT count(*) FROM provider_donations WHERE state IN ('open', 'owed')",
                 [],
                 |r| r.get::<_, i64>(0),
             )? as u64)
@@ -329,7 +329,7 @@ impl<T: Transport> Provider<T> {
         self.store.read(|c| {
             Ok(c.query_row(
                 "SELECT hash, sat, amount, code, request, state, reason, created_at
-                 FROM donations WHERE hash = ?1",
+                 FROM provider_donations WHERE hash = ?1",
                 [hash],
                 |r| {
                     Ok(Donation {
@@ -357,7 +357,7 @@ impl<T: Transport> Provider<T> {
         };
         let open: Vec<([u8; 32], String)> = self.store.read(|c| {
             let mut stmt = c.prepare(
-                "SELECT hash, state FROM donations WHERE state IN ('open', 'owed')
+                "SELECT hash, state FROM provider_donations WHERE state IN ('open', 'owed')
                  ORDER BY created_at, rowid",
             )?;
             let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
@@ -578,7 +578,7 @@ impl<T: Transport> Provider<T> {
         let hash = &donation.hash;
         let preimage: [u8; 32] = self.store.read(|c| {
             Ok(c.query_row(
-                "SELECT preimage FROM donations WHERE hash = ?1",
+                "SELECT preimage FROM provider_donations WHERE hash = ?1",
                 [hash],
                 |r| r.get(0),
             )?)
@@ -643,7 +643,7 @@ impl<T: Transport> Provider<T> {
     fn finish(&self, hash: &[u8; 32], state: DonationState, why: &str) -> Result<(), Error> {
         self.store.write(|tx| {
             tx.execute(
-                "UPDATE donations SET state = ?2, reason = ?3, updated_at = ?4 WHERE hash = ?1",
+                "UPDATE provider_donations SET state = ?2, reason = ?3, updated_at = ?4 WHERE hash = ?1",
                 params![hash, state.name(), why, now()],
             )?;
             Ok(())

@@ -62,24 +62,150 @@ type Guard = Box<dyn Fn(&[u8; 32]) -> Result<bool, String> + Send + Sync>;
 #[test]
 fn a_hash_reservation_is_not_proof_of_lock_ownership() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("swaps.sqlite");
+    let path = dir.path().join("wallet.sqlite");
     let hash = [1; 32];
     let id = ProposalId::from_bytes([2; 32]);
     assert!(!licash_swaps::holds_hash(&path, &hash).unwrap());
     assert!(!licash_swaps::owns_hash_lock(&path, &hash, &id).unwrap());
     assert!(!path.exists());
+    // A wallet's file that holds no provider's tables reserves nothing.
+    let net = Net::new();
+    let wallet = Wallet::create(
+        &path,
+        &[0x50; 32],
+        ChainProfile::Core30DefaultRegtest,
+        Link(net),
+    )
+    .unwrap();
+    assert!(!licash_swaps::holds_hash(&path, &hash).unwrap());
+    let _provider = Provider::create(wallet, Config::default()).unwrap();
+    assert!(!licash_swaps::holds_hash(&path, &hash).unwrap());
     let db = rusqlite::Connection::open(&path).unwrap();
-    db.execute_batch("CREATE TABLE swaps (hash BLOB PRIMARY KEY, lock BLOB)")
-        .unwrap();
-    db.execute("INSERT INTO swaps (hash) VALUES (?1)", [hash])
-        .unwrap();
+    db.execute(
+        "INSERT INTO provider_swaps (id, hash, from_url, to_url, address, amount, fee, paid,
+            expiry_from, expiry, state, created_at, updated_at)
+         VALUES (?1, ?2, 'a', 'b', x'00', 1, 0, 1, 1, 1, 'accepted', 0, 0)",
+        rusqlite::params![[9u8; 32], hash],
+    )
+    .unwrap();
     assert!(licash_swaps::holds_hash(&path, &hash).unwrap());
     assert!(!licash_swaps::owns_hash_lock(&path, &hash, &id).unwrap());
-    db.execute("UPDATE swaps SET lock = ?1", [[3; 32]]).unwrap();
+    db.execute("UPDATE provider_swaps SET lock = ?1", [[3; 32]])
+        .unwrap();
     assert!(!licash_swaps::owns_hash_lock(&path, &hash, &id).unwrap());
-    db.execute("UPDATE swaps SET lock = ?1", [id.as_bytes()])
+    db.execute("UPDATE provider_swaps SET lock = ?1", [id.as_bytes()])
         .unwrap();
     assert!(licash_swaps::owns_hash_lock(&path, &hash, &id).unwrap());
+}
+
+/// A provider on a new wallet at `path`.
+fn bare_provider(path: &std::path::Path) -> Provider<Link> {
+    let wallet = Wallet::create(
+        path,
+        &[0x50; 32],
+        ChainProfile::Core30DefaultRegtest,
+        Link(Net::new()),
+    )
+    .unwrap();
+    Provider::create(wallet, Config::default()).unwrap()
+}
+
+#[test]
+fn the_provider_keeps_its_tables_in_its_wallets_file_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("wallet.sqlite");
+    let wallet = Wallet::create(
+        &path,
+        &[0x50; 32],
+        ChainProfile::Core30DefaultRegtest,
+        Link(Net::new()),
+    )
+    .unwrap();
+    // A wallet alone has no provider to open.
+    let refused = Provider::open(wallet, Config::default()).err().unwrap();
+    assert!(
+        refused.to_string().contains("no swap provider"),
+        "{refused}"
+    );
+    let wallet = Wallet::open(&path, Link(Net::new())).unwrap();
+    let provider = Provider::create(wallet, Config::default()).unwrap();
+    drop(provider);
+    let db = rusqlite::Connection::open(&path).unwrap();
+    let versions: Vec<(String, i64)> = db
+        .prepare("SELECT component, version FROM schema_versions ORDER BY component")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        versions,
+        [("provider".to_owned(), 1), ("wallet".to_owned(), 1)]
+    );
+    let wallet = Wallet::open(&path, Link(Net::new())).unwrap();
+    let again = Provider::create(wallet, Config::default()).err().unwrap();
+    assert!(again.to_string().contains("already"), "{again}");
+    // Opened again, it is the same provider: its Nostr key stays.
+    let wallet = Wallet::open(&path, Link(Net::new())).unwrap();
+    assert!(Provider::open(wallet, Config::default()).is_ok());
+}
+
+#[test]
+fn the_providers_rows_hold_to_their_kinds_and_states() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("wallet.sqlite");
+    let _provider = bare_provider(&path);
+    let db = rusqlite::Connection::open(&path).unwrap();
+    db.pragma_update(None, "foreign_keys", true).unwrap();
+    let swap = |state: &str, kind: &str, amount: i64| {
+        db.execute(
+            "INSERT INTO provider_swaps (id, hash, from_url, to_url, address, amount, fee, paid,
+                expiry_from, expiry, state, kind, created_at, updated_at)
+             VALUES (randomblob(32), randomblob(32), 'a', 'b', x'00', ?3, 0, 1, 1, 1, ?1, ?2, 0, 0)",
+            rusqlite::params![state, kind, amount],
+        )
+    };
+    assert!(swap("accepted", "notes", 1).is_ok());
+    assert!(swap("accepted", "lightning", 1).is_ok());
+    assert!(swap("begun", "notes", 1).is_err());
+    assert!(swap("accepted", "barter", 1).is_err());
+    assert!(swap("accepted", "notes", -1).is_err());
+    let event = |kind: &str| {
+        db.execute(
+            "INSERT INTO provider_events (at, kind, json) VALUES (0, ?1, '{}')",
+            [kind],
+        )
+    };
+    assert!(event("alert").is_ok());
+    assert!(event("gossip").is_err());
+    // A payout's coin is recorded for a payout only, and a scan keeps a
+    // hash of a block's length or none.
+    let orphan = db.execute(
+        "INSERT INTO provider_payout_fundings (id, tx, vout) VALUES (randomblob(32), x'00', 0)",
+        [],
+    );
+    assert!(orphan.is_err());
+}
+
+#[test]
+fn one_snapshot_of_a_providers_wallet_file_is_the_provider_whole() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("wallet.sqlite");
+    let wallet = Wallet::create(
+        &path,
+        &[0x50; 32],
+        ChainProfile::Core30DefaultRegtest,
+        Link(Net::new()),
+    )
+    .unwrap();
+    let to = dir.path().join("snapshot.sqlite");
+    let provider = Provider::create(wallet, Config::default()).unwrap();
+    let nostr = provider.nostr_secret().unwrap();
+    provider.wallet().backup_to(&to).unwrap();
+    drop(provider);
+    let wallet = Wallet::open(&to, Link(Net::new())).unwrap();
+    let restored = Provider::open(wallet, Config::default()).unwrap();
+    assert_eq!(restored.nostr_secret().unwrap(), nostr);
 }
 
 /// The provider, as its clients reach it.
@@ -227,7 +353,6 @@ impl Eco {
         for hub in [A, B] {
             wallet.add_hub(hub).await.unwrap();
         }
-        let swaps = dir.path().join("swaps.sqlite");
         let cap = issuing.as_ref().map(|&(cap, _)| cap);
         let turn = Arc::new(tokio::sync::Mutex::new(()));
         let provider = match issuing {
@@ -235,13 +360,13 @@ impl Eco {
                 let issuer = Issuer::new(net.hub(B), B)
                     .cap(A, cap)
                     .guard(turn.clone(), guard);
-                Provider::create_issuing(&swaps, wallet, config, issuer).unwrap()
+                Provider::create_issuing(wallet, config, issuer).unwrap()
             }
             None => {
                 wallet
                     .receive(&net.pay(B, &wallet.address(), stock))
                     .unwrap();
-                Provider::create(&swaps, wallet, config).unwrap()
+                Provider::create(wallet, config).unwrap()
             }
         };
         let desk = Arc::new(Desk::default());
@@ -291,13 +416,12 @@ impl Eco {
     fn reopen(&self, cap: Option<u64>) -> Result<Provider<Link>, licash_swaps::Error> {
         let path = self.dir.path().join("provider.sqlite");
         let wallet = Wallet::open(&path, Link(self.net.clone())).unwrap();
-        let swaps = self.dir.path().join("swaps.sqlite");
         match cap {
             Some(cap) => {
                 let issuer = Issuer::new(self.net.hub(B), B).cap(A, cap);
-                Provider::open_issuing(&swaps, wallet, self.config, issuer)
+                Provider::open_issuing(wallet, self.config, issuer)
             }
-            None => Provider::open(&swaps, wallet, self.config),
+            None => Provider::open(wallet, self.config),
         }
     }
 
@@ -1098,11 +1222,11 @@ impl Eco {
     /// recorded the lock.
     fn lock_own(&self, id: &str, recorded: bool) {
         use licash::{address::Ephemeral, crypto::ScalarBytes, spend::TimedTerms};
-        let c = rusqlite::Connection::open(self.dir.path().join("swaps.sqlite")).unwrap();
+        let c = rusqlite::Connection::open(self.dir.path().join("provider.sqlite")).unwrap();
         let (address, amount, hash, expiry, secret) = c
             .query_row(
                 "SELECT s.address, s.amount, s.hash, s.expiry, i.ephemeral
-                 FROM swaps s JOIN issues i ON i.id = s.id WHERE s.id = ?1",
+                 FROM provider_swaps s JOIN provider_issues i ON i.id = s.id WHERE s.id = ?1",
                 [hex::decode(id).unwrap()],
                 |r| {
                     Ok((
@@ -1287,8 +1411,7 @@ async fn a_hub_caps_a_hub_it_swaps_from_at_every_url_its_wallet_knows_it_by() {
     let path = eco.dir.path().join("provider.sqlite");
     let wallet = Wallet::open(&path, Link(eco.net.clone())).unwrap();
     let issuer = Issuer::new(eco.net.hub(B), B).cap(SECURE_A, 30);
-    let swaps = eco.dir.path().join("swaps.sqlite");
-    let provider = Provider::open_issuing(&swaps, wallet, CONFIG, issuer).unwrap();
+    let provider = Provider::open_issuing(wallet, CONFIG, issuer).unwrap();
     let provider = Arc::new(provider);
     *eco.desk.provider.lock().unwrap() = Some(provider.clone());
     assert_eq!(left(&eco), 30 - 20 - fee);
@@ -1472,12 +1595,14 @@ async fn a_hub_restarted_adopts_the_lock_it_made_and_never_locks_again() {
         ["accepted", "accepted", "accepted", "failed", "alert", "failed"]
     );
     // Read beside the provider: only the second swap backs a lock of B's.
-    let swaps = eco.dir.path().join("swaps.sqlite");
+    let swaps = eco.dir.path().join("provider.sqlite");
     let hashes: Vec<[u8; 32]> = {
         let c = rusqlite::Connection::open(&swaps).unwrap();
         let hash = |id: &String| {
             let id = hex::decode(id).unwrap();
-            c.query_row("SELECT hash FROM swaps WHERE id = ?1", [id], |r| r.get(0))
+            c.query_row("SELECT hash FROM provider_swaps WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
         };
         ids.iter().map(hash).collect::<Result<_, _>>().unwrap()
     };
@@ -1503,8 +1628,7 @@ async fn a_hub_restarted_adopts_the_lock_it_made_and_never_locks_again() {
         Link(eco.net.clone()),
     );
     let issuer = Issuer::new(eco.net.hub(B), "http://b.renamed.test").cap(A, 100);
-    let swaps = eco.dir.path().join("swaps.sqlite");
-    let provider = Provider::open_issuing(&swaps, wallet.unwrap(), CONFIG, issuer).unwrap();
+    let provider = Provider::open_issuing(wallet.unwrap(), CONFIG, issuer).unwrap();
     assert!(provider.step().await.unwrap().is_empty());
     let records = provider.records(10).unwrap();
     let second = records.iter().find(|r| r.id == ids[1]).unwrap();

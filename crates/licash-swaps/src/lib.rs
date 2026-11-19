@@ -402,12 +402,12 @@ impl Row {
     }
 }
 
-const LAST_EVENT: &str = "SELECT coalesce(max(seq), 0) FROM events";
+const LAST_EVENT: &str = "SELECT coalesce(max(seq), 0) FROM provider_events";
 
 const ROWS: &str = "SELECT id, hash, from_url, to_url, address, amount, fee, paid, expiry,
     lock, preimage, state, reason, created_at, updated_at, kind = 'chain', expiry_from,
     kind = 'own', kind = 'lightning'
-    FROM swaps";
+    FROM provider_swaps";
 
 fn row_of(r: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
     Ok(Row {
@@ -528,17 +528,17 @@ pub struct Provider<T: Transport> {
 /// back the hub's: those the provider follows until it claimed them.
 const OWN_UNDER_WAY: &str = "kind = 'own' AND state IN ('accepted', 'locked', 'paid')";
 
-/// Which of `hashes` the swaps file at `path`, if there is one, holds swaps
-/// into the provider's own hub under way of: the hub's locks under them are
-/// backed by the clients' locks the provider claims. Read only, beside the
-/// provider running on the file or without it.
+/// Which of `hashes` the provider in the wallet's file at `path`, if there
+/// is one, holds swaps into its own hub under way of: the hub's locks under
+/// them are backed by the clients' locks the provider claims. Read only,
+/// beside the provider running on the file or without it.
 pub fn backing_own(path: &Path, hashes: &[[u8; 32]]) -> Result<HashSet<[u8; 32]>, Error> {
     let mut found = HashSet::new();
     let Some(conn) = read_swaps(path)? else {
         return Ok(found);
     };
     let mut stmt = conn.prepare(&format!(
-        "SELECT 1 FROM swaps WHERE hash = ?1 AND {OWN_UNDER_WAY}"
+        "SELECT 1 FROM provider_swaps WHERE hash = ?1 AND {OWN_UNDER_WAY}"
     ))?;
     for hash in hashes {
         if stmt.exists([hash])? {
@@ -548,39 +548,38 @@ pub fn backing_own(path: &Path, hashes: &[[u8; 32]]) -> Result<HashSet<[u8; 32]>
     Ok(found)
 }
 
+/// The provider's tables in the wallet's file at `path`, read only: none
+/// if there is no file, or the provider never made its tables in it.
 fn read_swaps(path: &Path) -> Result<Option<rusqlite::Connection>, Error> {
-    if !path
-        .try_exists()
-        .map_err(|e| Error::Setup(format!("{}: {e}", path.display())))?
-    {
+    let Some(conn) =
+        licash_store::inspect(path, licash_store::Kind::Wallet).map_err(store::setup)?
+    else {
         return Ok(None);
+    };
+    match licash_store::component_version(&conn, store::COMPONENT).map_err(store::setup)? {
+        Some(store::VERSION) => Ok(Some(conn)),
+        Some(v) => Err(Error::Setup(format!(
+            "swaps schema {v}, this version reads {}",
+            store::VERSION
+        ))),
+        None => Ok(None),
     }
-    let conn = rusqlite::Connection::open_with_flags(
-        path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )?;
-    conn.busy_timeout(std::time::Duration::from_secs(10))?;
-    Ok(Some(conn))
 }
 
 /// Any recorded swap or donation reserves its hash, even terminal or not
 /// yet locked: a donation's invoice, public, must never back a receipt of
 /// a gateway sharing the provider's node, whose notes its settling would
-/// pay. A file of before donations, not yet migrated, holds none.
+/// pay.
 pub fn holds_hash(path: &Path, hash: &[u8; 32]) -> Result<bool, Error> {
     let Some(conn) = read_swaps(path)? else {
         return Ok(false);
     };
     let swap = conn
-        .prepare("SELECT 1 FROM swaps WHERE hash = ?1")?
+        .prepare("SELECT 1 FROM provider_swaps WHERE hash = ?1")?
         .exists([hash])?;
-    let donations = conn
-        .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'donations'")?
-        .exists([])?;
-    let donation = donations
-        && conn
-            .prepare("SELECT 1 FROM donations WHERE hash = ?1")?
-            .exists([hash])?;
+    let donation = conn
+        .prepare("SELECT 1 FROM provider_donations WHERE hash = ?1")?
+        .exists([hash])?;
     Ok(swap || donation)
 }
 
@@ -595,65 +594,60 @@ pub fn owns_hash_lock(
         return Ok(false);
     };
     let owns = conn
-        .prepare("SELECT 1 FROM swaps WHERE hash = ?1 AND lock = ?2")?
+        .prepare("SELECT 1 FROM provider_swaps WHERE hash = ?1 AND lock = ?2")?
         .exists(params![hash, lock.as_bytes()])?;
     Ok(owns)
 }
 
 /// Setup and what the provider says of itself.
 impl<T: Transport> Provider<T> {
-    /// A new swaps file at `path`, for the provider of `wallet`.
-    pub fn create(path: &Path, wallet: Wallet<T>, config: Config) -> Result<Self, Error> {
-        Ok(Self::with(Self::created(path)?, wallet, config, None))
+    /// A new provider on `wallet`: its tables made in the wallet's file,
+    /// which holds them as one with the wallet's own.
+    pub fn create(wallet: Wallet<T>, config: Config) -> Result<Self, Error> {
+        Ok(Self::with(Self::created(&wallet)?, wallet, config, None))
     }
 
-    /// The swaps file at `path`. Refused while swaps into a hub's own
-    /// notes are under way: only that hub takes them on
-    /// ([`Provider::open_issuing`]).
-    pub fn open(path: &Path, wallet: Wallet<T>, config: Config) -> Result<Self, Error> {
-        let provider = Self::with(Store::open(path)?, wallet, config, None);
+    /// The provider of `wallet`, whose file holds its tables. Refused while
+    /// swaps into a hub's own notes are under way: only that hub takes them
+    /// on ([`Provider::open_issuing`]).
+    pub fn open(wallet: Wallet<T>, config: Config) -> Result<Self, Error> {
+        let store = Store::open(wallet.path())?;
+        let provider = Self::with(store, wallet, config, None);
         let open = provider.open_own()?;
         if open > 0 {
             return Err(Error::Setup(format!(
                 "{open} swaps into a hub's own notes are under way in {}: only that hub takes \
                  them on",
-                path.display()
+                provider.wallet.path().display()
             )));
         }
         Ok(provider)
     }
 
-    /// A new swaps file at `path`, for the provider of `wallet` that is the
-    /// hub of `issuer`.
+    /// A new provider on `wallet` that is the hub of `issuer`.
     pub fn create_issuing(
-        path: &Path,
         wallet: Wallet<T>,
         config: Config,
         issuer: Issuer,
     ) -> Result<Self, Error> {
         Ok(Self::with(
-            Self::created(path)?,
+            Self::created(&wallet)?,
             wallet,
             config,
             Some(issuer),
         ))
     }
 
-    /// The swaps file at `path`, of the provider of `wallet` that is the
-    /// hub of `issuer`.
-    pub fn open_issuing(
-        path: &Path,
-        wallet: Wallet<T>,
-        config: Config,
-        issuer: Issuer,
-    ) -> Result<Self, Error> {
-        Ok(Self::with(Store::open(path)?, wallet, config, Some(issuer)))
+    /// The provider of `wallet` that is the hub of `issuer`.
+    pub fn open_issuing(wallet: Wallet<T>, config: Config, issuer: Issuer) -> Result<Self, Error> {
+        let store = Store::open(wallet.path())?;
+        Ok(Self::with(store, wallet, config, Some(issuer)))
     }
 
-    fn created(path: &Path) -> Result<Store, Error> {
+    fn created(wallet: &Wallet<T>) -> Result<Store, Error> {
         let mut nostr = [0; 32];
         OsRng.fill_bytes(&mut nostr);
-        Store::create(path, &nostr)
+        Store::create(wallet.path(), &nostr)
     }
 
     fn with(store: Store, wallet: Wallet<T>, config: Config, issuer: Option<Issuer>) -> Self {
@@ -681,7 +675,7 @@ impl<T: Transport> Provider<T> {
     fn open_own(&self) -> Result<u64, Error> {
         self.store.read(|c| {
             Ok(c.query_row(
-                &format!("SELECT count(*) FROM swaps WHERE {OWN_UNDER_WAY}"),
+                &format!("SELECT count(*) FROM provider_swaps WHERE {OWN_UNDER_WAY}"),
                 [],
                 |r| r.get::<_, i64>(0),
             )? as u64)
@@ -706,7 +700,7 @@ impl<T: Transport> Provider<T> {
     /// The secret key the provider announces itself under on Nostr.
     pub fn nostr_secret(&self) -> Result<[u8; 32], Error> {
         self.store
-            .read(|c| Ok(c.query_row("SELECT nostr FROM meta", [], |r| r.get(0))?))
+            .read(|c| Ok(c.query_row("SELECT nostr FROM provider_meta", [], |r| r.get(0))?))
     }
 
     /// What the provider swaps now, as its hubs last said of themselves:
@@ -906,7 +900,7 @@ impl<T: Transport> Provider<T> {
         // never not at all.
         let owed = self.store.read(|c| {
             Ok(c.query_row(
-                "SELECT coalesce(sum(paid), 0) FROM swaps
+                "SELECT coalesce(sum(paid), 0) FROM provider_swaps
                  WHERE state IN ('accepted', 'locked', 'paid')
                     AND from_url IN (SELECT value FROM json_each(?1))",
                 [listed],
@@ -981,7 +975,7 @@ impl<T: Transport> Provider<T> {
     fn reserved(&self, url: &str) -> Result<u64, Error> {
         self.store.read(|c| {
             Ok(c.query_row(
-                "SELECT coalesce(sum(amount), 0) FROM swaps
+                "SELECT coalesce(sum(amount), 0) FROM provider_swaps
                  WHERE to_url = ?1 AND state = 'accepted'",
                 [url],
                 |r| r.get::<_, i64>(0),
@@ -1184,7 +1178,7 @@ impl<T: Transport> Provider<T> {
         let recorded = self.store.write(|tx| {
             let at = now();
             let inserted = tx.execute(
-                "INSERT INTO swaps (id, hash, from_url, to_url, address, amount, fee, paid,
+                "INSERT INTO provider_swaps (id, hash, from_url, to_url, address, amount, fee, paid,
                     expiry_from, expiry, state, created_at, updated_at, kind)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'accepted', ?11, ?11, ?12)
                  ON CONFLICT DO NOTHING",
@@ -1206,7 +1200,7 @@ impl<T: Transport> Provider<T> {
             if inserted == 1 {
                 if own {
                     tx.execute(
-                        "INSERT INTO issues (id, ephemeral) VALUES (?1, ?2)",
+                        "INSERT INTO provider_issues (id, ephemeral) VALUES (?1, ?2)",
                         params![id, Issue::new_ephemeral()],
                     )?;
                 }
@@ -1309,11 +1303,11 @@ impl<T: Transport> Provider<T> {
     /// The own lock of the swap `row`, as recorded.
     fn issue_of(&self, id: &[u8; 32], row: &Row) -> Result<Issue, Error> {
         let ephemeral = self.store.read(|c| {
-            Ok(
-                c.query_row("SELECT ephemeral FROM issues WHERE id = ?1", [id], |r| {
-                    r.get(0)
-                })?,
-            )
+            Ok(c.query_row(
+                "SELECT ephemeral FROM provider_issues WHERE id = ?1",
+                [id],
+                |r| r.get(0),
+            )?)
         })?;
         Ok(Issue {
             address: Address::from_bytes(&row.address).map_err(licash_wallet::Error::from)?,
@@ -1336,7 +1330,7 @@ impl<T: Transport> Provider<T> {
     ) -> Result<bool, Error> {
         self.store.write(|tx| {
             let moved = tx.execute(
-                "UPDATE swaps SET state = ?3, preimage = coalesce(?4, preimage),
+                "UPDATE provider_swaps SET state = ?3, preimage = coalesce(?4, preimage),
                     reason = coalesce(?5, reason), updated_at = ?6
                  WHERE id = ?1 AND state = ?2",
                 params![
@@ -1389,7 +1383,7 @@ fn refused_for_good(e: &licash_wallet::Error) -> bool {
 fn emit(tx: &rusqlite::Transaction<'_>, notice: &Notice) -> Result<(), Error> {
     let json = serde_json::to_string(notice).expect("a notice serializes");
     tx.execute(
-        "INSERT INTO events (at, kind, json) VALUES (?1, ?2, ?3)",
+        "INSERT INTO provider_events (at, kind, json) VALUES (?1, ?2, ?3)",
         params![now(), notice.kind(), json],
     )?;
     Ok(())
@@ -1430,7 +1424,7 @@ impl<T: Transport> Provider<T> {
         // follow the chain (Provider::follow_payouts).
         let open: Vec<[u8; 32]> = self.store.read(|c| {
             let mut stmt = c.prepare(
-                "SELECT id FROM swaps WHERE state IN ('accepted', 'locked', 'paid')
+                "SELECT id FROM provider_swaps WHERE state IN ('accepted', 'locked', 'paid')
                     AND (kind IN ('notes', 'own') OR state = 'paid')
                  ORDER BY created_at, rowid",
             )?;
@@ -1798,7 +1792,7 @@ impl<T: Transport> Provider<T> {
                 ..Stats::default()
             };
             let mut stmt = c.prepare(
-                "SELECT state, count(*), sum(fee), sum(amount) FROM swaps GROUP BY state",
+                "SELECT state, count(*), sum(fee), sum(amount) FROM provider_swaps GROUP BY state",
             )?;
             let rows = stmt.query_map([], |r| {
                 Ok((
@@ -1833,7 +1827,7 @@ impl<T: Transport> Provider<T> {
     pub fn events(&self, after: u64, limit: u32) -> Result<Vec<Event>, Error> {
         self.store.read(|c| {
             let mut stmt = c.prepare(
-                "SELECT seq, at, kind, json FROM events WHERE seq > ?1 ORDER BY seq LIMIT ?2",
+                "SELECT seq, at, kind, json FROM provider_events WHERE seq > ?1 ORDER BY seq LIMIT ?2",
             )?;
             let rows = stmt.query_map(params![after as i64, limit], |r| {
                 Ok((

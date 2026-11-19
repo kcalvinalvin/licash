@@ -64,11 +64,10 @@ impl Eco {
             .receive(&net.pay(A, &wallet.address(), HELD))
             .unwrap();
         let node = Arc::new(Fake::new());
-        let provider =
-            Provider::create(&dir.path().join("swaps.sqlite"), wallet, Config::default())
-                .unwrap()
-                .take_donations(node.clone(), TERMS, URL)
-                .unwrap();
+        let provider = Provider::create(wallet, Config::default())
+            .unwrap()
+            .take_donations(node.clone(), TERMS, URL)
+            .unwrap();
         let payee = Wallet::create(
             &dir.path().join("payee.sqlite"),
             &[0xd0; 32],
@@ -107,14 +106,10 @@ impl Eco {
             Link(self.net.clone()),
         )
         .unwrap();
-        let provider = Provider::open(
-            &self.dir.path().join("swaps.sqlite"),
-            wallet,
-            Config::default(),
-        )
-        .unwrap()
-        .take_donations(self.node.clone(), TERMS, URL)
-        .unwrap();
+        let provider = Provider::open(wallet, Config::default())
+            .unwrap()
+            .take_donations(self.node.clone(), TERMS, URL)
+            .unwrap();
         self.provider = Some(provider);
     }
 
@@ -183,9 +178,9 @@ impl Eco {
 
     /// Make the donation `hash` as old as `secs`.
     fn age(&self, hash: &[u8; 32], secs: i64) {
-        let db = rusqlite::Connection::open(self.dir.path().join("swaps.sqlite")).unwrap();
+        let db = rusqlite::Connection::open(self.dir.path().join("wallet.sqlite")).unwrap();
         db.execute(
-            "UPDATE donations SET created_at = created_at - ?2 WHERE hash = ?1",
+            "UPDATE provider_donations SET created_at = created_at - ?2 WHERE hash = ?1",
             rusqlite::params![hash, secs],
         )
         .unwrap();
@@ -220,7 +215,7 @@ async fn a_donation_paid_is_settled_once_its_payee_is_paid() {
     );
     assert_eq!(eco.node.held_cltv(hash), Some(INVOICE_CLTV.into()));
     // Its hash is reserved, as a swap's is.
-    let swaps = eco.dir.path().join("swaps.sqlite");
+    let swaps = eco.dir.path().join("wallet.sqlite");
     assert!(licash_swaps::holds_hash(&swaps, &hash).unwrap());
     // Nothing is paid until its invoice is.
     eco.follow().await;
@@ -286,14 +281,10 @@ async fn donations_are_asked_within_the_terms_and_what_the_provider_holds() {
         fee: Fee { base: 0, ppm: 0 },
         ..TERMS
     };
-    let provider = Provider::open(
-        &cheap.dir.path().join("swaps.sqlite"),
-        wallet,
-        Config::default(),
-    )
-    .unwrap()
-    .take_donations(cheap.node.clone(), free, URL)
-    .unwrap();
+    let provider = Provider::open(wallet, Config::default())
+        .unwrap()
+        .take_donations(cheap.node.clone(), free, URL)
+        .unwrap();
     let refused = provider.donate(&cheap.code, 100_000).await.unwrap_err();
     assert_eq!(refused.code, Code::Declined, "{refused:?}");
     cheap.provider = Some(provider);
@@ -311,12 +302,7 @@ async fn donations_are_asked_within_the_terms_and_what_the_provider_holds() {
         Link(eco.net.clone()),
     )
     .unwrap();
-    let none = Provider::create(
-        &eco.dir.path().join("none-swaps.sqlite"),
-        wallet,
-        Config::default(),
-    )
-    .unwrap();
+    let none = Provider::create(wallet, Config::default()).unwrap();
     assert_eq!(
         none.donate(&eco.code, 100_000).await.unwrap_err().code,
         Code::Declined
@@ -342,9 +328,9 @@ async fn a_donation_unpaid_or_never_made_an_invoice_of_is_canceled() {
     // Recorded, then stopped before the node made its invoice: the payer
     // never had one.
     let unmade = [0x77; 32];
-    let db = rusqlite::Connection::open(eco.dir.path().join("swaps.sqlite")).unwrap();
+    let db = rusqlite::Connection::open(eco.dir.path().join("wallet.sqlite")).unwrap();
     db.execute(
-        "INSERT INTO donations (hash, preimage, code, sat, amount, state, created_at, updated_at)
+        "INSERT INTO provider_donations (hash, preimage, code, sat, amount, state, created_at, updated_at)
          VALUES (?1, ?2, ?3, 100, 98, 'open', unixepoch(), unixepoch())",
         rusqlite::params![unmade, [0x78u8; 32], eco.code],
     )
