@@ -312,6 +312,25 @@ pub fn outputs(
     Ok(paid)
 }
 
+/// The output paying `to`, the only one paying it, of a transaction
+/// whose one input counted is of key `key` and spends `outpoint`, of
+/// shared point `d`: that input's secret key (of `key`) times `to`'s scan
+/// key. For a spender knowing the shared point, not the secret key whole.
+pub fn output_of_shared(
+    d: &PublicKey,
+    key: &PublicKey,
+    outpoint: OutPoint,
+    to: &SpAddress,
+) -> Result<XOnlyPublicKey, Error> {
+    let hash = input_hash(&[outpoint], key)?;
+    let t = shared(&mul(d, &hash), 0)?;
+    let output = to
+        .spend
+        .add_exp_tweak(secp(), &Scalar::from(t))
+        .map_err(|_| Error::Key)?;
+    Ok(output.x_only_public_key().0)
+}
+
 /// An output found paying the receiver, with what its spend key needs
 /// adding to spend it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

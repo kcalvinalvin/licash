@@ -5,7 +5,9 @@
 
 pub mod deadline;
 pub mod deposit;
+pub mod key_agg;
 pub mod silent;
+pub mod silent_claim;
 
 use bitcoin::Network;
 use licash::spend::ChainProfile;

@@ -280,3 +280,72 @@ fn a_claim_is_told_from_a_refund_whatever_it_pays() {
         .unwrap();
     assert!(!htlc.claimed_by(&refund, funding()));
 }
+
+/// BIP327's vectors of `KeyAgg`: each list's aggregate, x-only.
+#[test]
+fn key_agg_meets_bip327s_vectors() {
+    use bitcoin::secp256k1::PublicKey;
+    use licash_onchain::key_agg::key_agg;
+    let vectors: serde_json::Value =
+        serde_json::from_str(include_str!("data/key_agg_vectors.json")).unwrap();
+    let pubkeys: Vec<Option<PublicKey>> = vectors["pubkeys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|k| PublicKey::from_slice(&hex::decode(k.as_str().unwrap()).unwrap()).ok())
+        .collect();
+    for case in vectors["valid_test_cases"].as_array().unwrap() {
+        let keys: Vec<PublicKey> = case["key_indices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| pubkeys[i.as_u64().unwrap() as usize].unwrap())
+            .collect();
+        let agg = key_agg(&keys).unwrap();
+        let expected = case["expected"].as_str().unwrap().to_lowercase();
+        assert_eq!(hex::encode(agg.point.x_only_public_key().0.serialize()), expected);
+        assert_eq!(agg.coefficients.len(), keys.len());
+    }
+    // Lists of a key BIP327 refuses: not keys to aggregate at all.
+    for case in vectors["error_test_cases"].as_array().unwrap() {
+        if case["tweak_indices"].as_array().is_some_and(|t| !t.is_empty()) {
+            continue;
+        }
+        let parsed = case["key_indices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| pubkeys[i.as_u64().unwrap() as usize]);
+        assert!(parsed.into_iter().any(|k| k.is_none()), "{case}");
+    }
+}
+
+/// Its internal key is the aggregate of its claim key, then its refund
+/// key: not BIP341's point of no known secret, so a spend of it counts
+/// for silent payments; their order makes another output.
+#[test]
+fn a_deposits_internal_key_aggregates_its_claim_and_refund_keys() {
+    use bitcoin::secp256k1::{Parity, Scalar};
+    let htlc = htlc();
+    let secp = Secp256k1::new();
+    let agg = htlc.key_agg();
+    // The refund key, the list's second, of coefficient 1.
+    assert_eq!(agg.coefficients[1], Scalar::ONE);
+    let weighed = htlc
+        .claim
+        .public_key(Parity::Even)
+        .mul_tweak(&secp, &agg.coefficients[0])
+        .unwrap();
+    let sum = weighed.combine(&htlc.refund.public_key(Parity::Even)).unwrap();
+    assert_eq!(sum, agg.point);
+    let info = htlc.spend_info();
+    assert_eq!(info.internal_key(), agg.point.x_only_public_key().0);
+    let nums = "50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0";
+    assert_ne!(hex::encode(info.internal_key().serialize()), nums);
+    let swapped = Htlc {
+        claim: htlc.refund,
+        refund: htlc.claim,
+        ..htlc
+    };
+    assert_ne!(swapped.key_agg().point, agg.point);
+}

@@ -1,32 +1,30 @@
 //! Deposits: coins a payer locks on Bitcoin for a hub, in a taproot output
 //! of two scripts. The hub claims it with the preimage of a hash and its
 //! signature; the payer takes it back with its own signature once a block
-//! height passes. Its key path is unspendable: its internal key is the
-//! point of BIP341 that no one knows the secret of.
+//! height passes. Its internal key is the two keys' aggregate (BIP327's
+//! `KeyAgg` of the claim's and the refund's, in that order): spent by its
+//! scripts alone, as neither party signs for the other, but a spend of it
+//! counts as an input of silent payments (BIP352), which a payout's claim
+//! pays.
 //!
 //! The same terms pay a wallet out: a swap provider locks coins the
 //! wallet claims with the preimage, paying its payee exactly what it is
 //! owed ([`Htlc::claim_exact`]), and the provider reads the preimage from
 //! the claim ([`Htlc::preimage_in`]).
 
+use crate::key_agg::{key_agg, KeyAgg};
 use bitcoin::{
     absolute::LockTime,
     hashes::Hash,
     key::Secp256k1,
     opcodes::all::{OP_CHECKSIG, OP_CLTV, OP_DROP, OP_EQUALVERIFY, OP_SHA256},
     script::Builder,
-    secp256k1::{Keypair, Message, SecretKey, XOnlyPublicKey},
+    secp256k1::{Keypair, Message, Parity, SecretKey, XOnlyPublicKey},
     sighash::{Prevouts, SighashCache},
     taproot::{LeafVersion, Signature, TaprootBuilder, TaprootSpendInfo},
     transaction, Address, Amount, FeeRate, Network, OutPoint, ScriptBuf, Sequence, TapLeafHash,
     TapSighashType, Transaction, TxIn, TxOut, Witness,
 };
-
-/// The x coordinate of BIP341's point of unknown discrete logarithm.
-const NUMS: [u8; 32] = [
-    0x50, 0x92, 0x9b, 0x74, 0xc1, 0xa0, 0x49, 0x54, 0xb7, 0x8b, 0x4b, 0x60, 0x35, 0xe9, 0x7a, 0x5e,
-    0x07, 0x8a, 0x5a, 0x0f, 0x28, 0xec, 0x96, 0xd5, 0x47, 0xbf, 0xee, 0x9a, 0xce, 0x80, 0x3a, 0xc0,
-];
 
 /// Why a deposit cannot be spent as asked.
 #[derive(Debug, thiserror::Error)]
@@ -99,14 +97,24 @@ impl Htlc {
             .into_script()
     }
 
-    fn spend_info(&self) -> TaprootSpendInfo {
+    /// Its internal key's aggregate: of the claim key, then the refund
+    /// key, each the point of even y of its x coordinate.
+    pub fn key_agg(&self) -> KeyAgg {
+        let keys = [self.claim, self.refund].map(|k| k.public_key(Parity::Even));
+        // Infinity only if the claim key's coefficient, a hash, weighs it
+        // into the refund key's negation: not found but by breaking SHA256.
+        key_agg(&keys).expect("two keys of even y aggregate")
+    }
+
+    /// Its taproot tree: two leaves, the claim's and the refund's.
+    pub fn spend_info(&self) -> TaprootSpendInfo {
         let secp = Secp256k1::verification_only();
-        let nums = XOnlyPublicKey::from_slice(&NUMS).expect("BIP341's point");
+        let internal = self.key_agg().point.x_only_public_key().0;
         TaprootBuilder::new()
             .add_leaf(1, self.claim_script())
             .and_then(|tree| tree.add_leaf(1, self.refund_script()))
             .expect("two leaves of depth one")
-            .finalize(&secp, nums)
+            .finalize(&secp, internal)
             .expect("a complete tree")
     }
 
