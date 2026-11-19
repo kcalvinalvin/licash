@@ -18,17 +18,20 @@ research implementation; it has not had a security review.
   what a filed claim is owed). The crate docs map modules to paper sections.
 - `crates/licash-hp`: the hub's statement, which decides what a filed claim
   is owed from Bitcoin and the hub's evidence (built in regtest's workspace).
-- `crates/licash-hub`: a hub's operations over its own SQLite ledger, and
-  the evidence it holds against a holder's claim.
+- `crates/licash-store`: the one SQLite file an actor keeps, and the rules
+  every module sharing it follows (see Storage).
+- `crates/licash-hub`: a hub's operations over its ledger, a component of
+  the hub's SQLite database, and the evidence it holds against a holder's
+  claim.
 - `crates/licash-api`: the HTTP API bodies and error codes of hubs and swap
   providers.
-- `crates/licash-wallet`: a wallet over its own SQLite file: hubs, notes,
+- `crates/licash-wallet`: a wallet over its SQLite file: hubs, notes,
   payments made and taken, locks, Lightning, swaps, unlinking, silent
   payments found with a light client, and resuming after interruptions.
-- `crates/licash-swaps`: a swap provider over its own wallet: swaps of notes
-  at one hub for notes at another, with a timed lock at each, either
-  locking its notes at the destination or, run by the destination hub
-  itself, notes the hub issues.
+- `crates/licash-swaps`: a swap provider over its wallet, and in its
+  wallet's file: swaps of notes at one hub for notes at another, with a
+  timed lock at each, either locking its notes at the destination or, run
+  by the destination hub itself, notes the hub issues.
 - `crates/licash-onchain`: Bitcoin outside the protocol: silent payments
   (BIP352), and the hash-locked coins of deposits and payouts.
 - `crates/licash-contract`: the contract's transaction graph, Licash's
@@ -53,6 +56,34 @@ research implementation; it has not had a security review.
   Android app (`apps/mobile/android`). How every app looks and speaks is
   in [apps/DESIGN.md](apps/DESIGN.md).
 - `paper/`: the paper's source; `paper/build.sh` rebuilds the PDF (Docker).
+
+## Storage
+
+Each actor keeps one SQLite file, and its backup is one snapshot of it:
+
+| Actor | File | Components (owner) |
+|---|---|---|
+| Hub | `hub.sqlite` | `ledger` (licash-hub), `deposits`, `lightning`, `inbox` (hub service), `openings`, `responses` (contracts) |
+| Wallet (CLI, Android) | `wallet.sqlite` | `wallet` (licash-wallet), `contracts` (the holder's) |
+| Swap provider | `wallet.sqlite` | `wallet`, `provider` (licash-swaps), `contracts` |
+
+A module owns the tables of its *component* and keeps a connection of its
+own to the file; `schema_versions` says which components were made, and of
+which version, so that none is made, or assumed, before it is used. The file
+says what it is (`application_id`). There are no migrations: a file of
+another layout or version is refused, never read nor replaced. A stage an
+operation reaches (a deposit's payment, a lock's settlement, a payout's
+claim) is a table of its own, one row a fact; a single optional value is a
+nullable column. Everything is `STRICT`, with `CHECK`s for what is
+enumerated or non-negative. A write that must be followed by an act outside
+the database (a Lightning payment, a broadcast, a one-time signature) is
+recorded first, and recovery finds it again: no shared transaction spans
+modules or crates. `hub.sqlite` and `wallet.sqlite` are written in IMMEDIATE
+transactions; a thread that writes a file while it has a write open on
+another connection of it waits for itself, and debug builds panic at once.
+Beside them stay `tweaks.sqlite` (a hub's index, losing it loses nothing),
+the contracts' instances (`contracts/`, `opening-instances/`) and the
+seeds and Tor state.
 
 ## Quick start
 

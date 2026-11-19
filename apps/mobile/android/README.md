@@ -60,8 +60,10 @@ address shown in Receive. How the app looks and speaks, and the shared parts to 
   scan if not known when it was made); restoring with it scans from there,
   without it from block 1.
 - **Backup file**: everything the wallet holds as of when it is saved (the
-  wallet and contract databases, the birthday, the instances a contract's recovery needs,
-  contacts), in a checksummed, unencrypted tar the user saves through the
+  wallet's database, which holds its contracts too, the birthday, the
+  instances a contract's recovery needs, contacts), in a checksummed,
+  unencrypted tar (format 2: a backup of an earlier format, which kept the
+  contracts in a database of their own, is refused) the user saves through the
   system file picker. Tor state, proofs made on the phone and the light
   client's blocks are left out. Payments after it are not in it. Restore a
   backup on one phone only: two live copies can reuse one-time recovery

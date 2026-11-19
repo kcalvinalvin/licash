@@ -50,8 +50,13 @@ the error detail.
 `init --network` names the network of its hubs, `bitcoin` by default.
 The provider swaps between the hubs its wallet added, up to what it holds
 at the destination hub; an alert says when that falls below `--min`, once
-a start until it recovers. Back up `<data>/wallet.sqlite` and
-`<data>/swaps.sqlite` together. A stopped provider takes its swaps on when
+a start until it recovers. Back up `<data>/wallet.sqlite`: it holds
+the wallet's tables and the provider's swaps in one SQLite database, so that
+one snapshot of it (`sqlite3 wallet.sqlite ".backup FILE"`, or a copy with
+the provider stopped) is the whole of them, the contracts it keeps included
+(and `<data>/contracts`, their instances). A directory with a `swaps.sqlite`
+or a `contracts.sqlite` of an earlier layout is refused by name, never read
+nor replaced: there is no migration. A stopped provider takes its swaps on when
 started again, but a swap whose client lock expires before it claims it is
 lost (`status` counts it, and a high-priority notification says so):
 `--margin` sets the blocks it keeps for that. Its wallet unlinks the notes
@@ -63,9 +68,7 @@ Each round after the swaps it also reshapes the notes it was paid, as the
 wallet's README says: at most one remint per hub, after a privacy rest,
 within that fee authority and 1% of what it holds there a day. A failed
 remint is only logged and never holds a swap up. The same applies to the
-provider a hub embeds (`licash-hub run --swaps`). The first start under
-this version upgrades `wallet.sqlite` to version 8, which older versions
-refuse; the upgrade itself remints nothing and asks no hub.
+provider a hub embeds (`licash-hub run --swaps`).
 
 With `--chain URL` (Bitcoin Core's RPC, `http://user:password@host:8332`, or
 Esplora, `esplora+https://esplora.example/api`), the provider also pays notes
@@ -123,10 +126,8 @@ lock's expiry the provider cannot claim it, having paid. When the invoice is
 a hub's, asked for by a wallet under a hash of its own, notes at one hub pay
 notes at another with no notes of the provider at the other. A payment that
 fails leaves the client's lock to be refunded once expired. These locks
-count like swaps against what the contracts at the source hub protect. The
-first start under this version upgrades `swaps.sqlite` to schema 4, which
-older versions refuse; a provider with Lightning payments under way refuses
-to start without `--lnd`.
+count like swaps against what the contracts at the source hub protect. A
+provider with Lightning payments under way refuses to start without `--lnd`.
 
 With `--lnd` and `--lnurl-url URL`, the provider's public URL, it also
 takes donations to the wallets of Licash codes over LNURL-pay (LUD-06), for
@@ -146,8 +147,7 @@ canceled and the payer refunded: a donation whose fee does not cover the
 hub's, or paid too close to its HTLCs' expiry, is never paid on. A payment
 signed but not released 18 blocks before the HTLCs expire is settled all
 the same and followed until released; one given up after that alerts the
-operator. At most `--donation-max-open` invoices are open at once. The
-first start under this version upgrades `swaps.sqlite` to schema 5; a
+operator. At most `--donation-max-open` invoices are open at once. A
 provider with donations under way refuses to start without `--lnurl-url`
 and `--lnd`. The provider must stay up while donations are under way: down
 past an HTLC's expiry, it may have paid the payee and lose the donation.

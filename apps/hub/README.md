@@ -32,9 +32,9 @@ Fees may change at any restart, but a wallet holding a recovery contract
 agreed to those charged as it opened, and no more: it stops paying a hub
 that charges more, in any fee, until its owner approves the new fees by
 hand. With `--contracts`, the hub keeps what it charged with each opening
-(in `<data>/openings.sqlite`) and `run` warns, as it starts, of how many
+(in `<data>/hub.sqlite`) and `run` warns, as it starts, of how many
 contracts it signed opened for less than it charges now. Nothing else is
-done with it, and openings from before it was kept are not counted.
+done with it.
 
 `status` shows income, released payments and open locks. `status --details`
 adds the internal note and event counts; `status --json` keeps the full
@@ -68,8 +68,8 @@ under, its own address, its Nostr key and its deposits' keys. Keep a copy
 offline. Whoever else reads it makes notes the hub takes for its own, and
 spends them at the hub for what it pays out, over Lightning or from its
 contracts' collateral. It is not all there is to guard. Worth funds to
-whoever reads them too: `openings.sqlite` and `responses.sqlite` (what the
-hub signs its contracts with), the LND macaroon, the login of the Bitcoin
+whoever reads them too: `hub.sqlite` (the ledger, and the openings and the
+pinned responses the hub signs its contracts with), the LND macaroon, the login of the Bitcoin
 Core wallet that funds contracts (it spends that wallet),
 `swaps/wallet.sqlite` (the provider's notes at other hubs) and `tor/state`
 (the onion address). `init` makes `<data>` its user's alone: keep it so, on
@@ -82,13 +82,18 @@ an encrypted disk, and keep on this host only what the hub needs there:
   whose keys are offline (`--contracts-payout-wallet`, below).
 - A macaroon and a Core login that do only what the hub does (below).
 
-Back up the files of `<data>` together, as of one moment: each paragraph
-below says what an older copy of a file loses. Never replace
-`<data>/hub.sqlite` while the hub runs: the hub halts, and `/health` answers
-503, until it is restarted. A newer hub upgrades its schema when it opens it,
-once its seed matches, and an older one then refuses it. A database of the
-first schema gains the record of claimed notes empty: the claims of
-disputes that ended before the upgrade are not recorded.
+Back up `<data>` as of one moment: `hub.sqlite` holds the ledger, the
+deposits, the Lightning receipts, the inbox, the openings of contracts and
+the responses pinned, in one SQLite database, so that one snapshot of it
+(`sqlite3 hub.sqlite ".backup FILE"`, or a copy of its files with the hub
+stopped) is the whole of them, beside `seed` and the swap provider's
+`swaps/wallet.sqlite`. Each paragraph below says what an older copy loses.
+Never replace `<data>/hub.sqlite` while the hub runs: the hub halts, and
+`/health` answers 503, until it is restarted. There is no migration: a
+database or file of an earlier layout (`deposits.sqlite`, `lightning.sqlite`,
+`inbox.sqlite`, `openings.sqlite` or `responses.sqlite` in `<data>`, a
+`hub.sqlite` of an earlier schema) is refused by name, never read nor
+replaced, and a hub is made anew.
 
 A spend's offer (its grant) its payer never released within a day is
 deleted, so that offers never made into spends cost no row for good; a
@@ -96,12 +101,13 @@ wallet releasing it later offers the spend again. One note is offered in at
 most 8 spends not released per run of the hub.
 
 Notes the hub locks for a deposit, a Lightning receipt or a swap into it
-are backed by that payment, recorded in `deposits.sqlite`,
-`lightning.sqlite` or `swaps/swaps.sqlite`. The hub refuses to start while
-it may yet pay such a lock that none of these files records, as when one
-was restored older than `hub.sqlite`, and names the locks: restore the
-files as recent as `hub.sqlite`. `--allow-unbacked-locks` runs it anyway,
-alerting the operator: it would pay those notes unbacked.
+are backed by that payment, recorded in `hub.sqlite` (the deposits and
+the receipts) or in the provider's `swaps/wallet.sqlite`. The hub refuses
+to start while it may yet pay such a lock that none of these records, as
+when the provider's file was restored older than `hub.sqlite`, and names
+the locks: restore `swaps/wallet.sqlite` as recent as `hub.sqlite`.
+`--allow-unbacked-locks` runs it anyway, alerting the operator: it would pay
+those notes unbacked.
 
 It also refuses to run with `--lnd` or `--deposit-sweep-address` disabled
 while that gateway still has obligations to collect, including deposits
@@ -118,7 +124,7 @@ own node, a receipt still open, is paid inside the hub for its amount
 alone: the payer's lock backs the receipt instead of an HTLC, and its
 invoice is canceled. `--lnd-cert` pins
 LND's certificate. The gateway keeps its invoices in
-`<data>/lightning.sqlite`: back it up with `hub.sqlite`. An alert says when
+`hub.sqlite`, with the ledger's records. An alert says when
 LND's channels can no longer pay or receive the most it takes.
 `--ln-max-receipts` bounds open and locked receipts (1024 by default).
 Lowering it blocks new receipts, not retries or following existing ones.
@@ -179,10 +185,10 @@ tip at the first start) in `<data>/tweaks.sqlite`, and serves them to light
 wallets at `/v1/chain/tweaks`. Deleting the file only loses the index.
 
 The hub keeps the payments it releases for their payees when their payers
-ask, for 14 days, in `<data>/inbox.sqlite`: payees collect them at
+ask, for 14 days, in `hub.sqlite`: payees collect them at
 `/v1/inbox` and tell their payers they have them, through the hub, without
 Nostr. Anyone sees the inbox's feed, which tells how many payments were
-kept, not whom they pay or how much. Deleting the file only loses the
+kept, not whom they pay or how much. Losing the inbox's rows only loses the
 payments kept: their payers send them to the payees' mailboxes on Nostr
 once no acknowledgment comes.
 
@@ -198,8 +204,8 @@ not yet paid (1024 by default): past it, new ones are refused as
 unavailable, never retries or deposits under way. A deposit's status
 (`/v1/deposit/{hash}`) also answers what was asked and the terms answered,
 so that a wallet restored from its seed, its deposits' secrets derived from
-it, finds them again by their hashes. Deposits are kept in `<data>/deposits.sqlite`:
-back it up with `hub.sqlite`. A claim left unmined is made again at a
+it, finds them again by their hashes. Deposits are kept in `hub.sqlite`.
+A claim left unmined is made again at a
 higher fee rate as the timeout nears (twice the estimate once fewer than 12 blocks
 are left, doubling every 3 blocks, all of the coin but dust at most), and
 whichever of them is mined is the hub's. Alerts say when a claim is late or lost. With
@@ -272,8 +278,8 @@ like this; past that, new openings are refused as unavailable, and the
 operator is alerted once. This version quotes contracts of graph id 8,
 whose graph returns the hub its reserve if it never responds: apps older
 than this version open no contract at an upgraded hub until they are
-updated, while contracts opened before keep their terms. Openings are kept in `<data>/openings.sqlite`, as sensitive as the
-seed: back it up with `hub.sqlite`. Each opening receives the kept garbled instances from
+updated, while contracts opened before keep their terms. Openings are kept in `hub.sqlite`, as sensitive as the seed. Each
+opening receives the kept garbled instances from
 the holder's wallet, kept in `<data>/opening-instances/`. The hub takes one opening's step, or
 builds one instance, at a time, the others waiting their turn: each opening
 takes about 30 CPU seconds over a few threads, and the hub holds about
@@ -408,25 +414,22 @@ key-path spend of a contract output is such a fold, and ends the contract.
 A contract no one exited ends at its close: the hub posts its
 default, which pays the holder her reserve and the hub its collateral back,
 to its wallet. The fee coins its wallet funds for these transactions are
-kept in `openings.sqlite` before use, and a contract ended 6 blocks deep is
-not looked at again. Keep `<data>/responses.sqlite` with `openings.sqlite`:
-it pins the evidence each response is decided on and each one-time
-signature (the response, the assertion) before it is made. Back them up
-together, `responses.sqlite` never older than `openings.sqlite`: a second
-answer signed with a one-time key over other evidence gives the holder the
-hub's outputs. So the hub signs none where it can tell one was:
-`openings.sqlite` keeps each answer before it is signed, and one kept with
-nothing pinned for it, as when `responses.sqlite` was lost or restored
-older, is not decided anew. Nor is one neither file keeps (both restored
-older, or an answer signed before this version) while a transaction in the
-node's mempool already spends what only that answer can. Where neither
-tells (both files older and that transaction gone from the mempool) it
-decides anew: nothing replaces the backup. A response in a block whose
-evidence is lost is not asserted on. Where it signs none the operator is
-alerted, and her timeout pays her what she claims, with the hub's reserve
-once a response is in a block: restoring the newer `responses.sqlite` is
-the only way back. A hub upgraded to this version keeps the answers it has pinned
-as it posts them again, and plays every other contract as before.
+kept in `hub.sqlite` before use, and a contract ended 6 blocks deep is
+not looked at again. The same database pins the evidence each response is
+decided on and each one-time signature (the response, the assertion) before
+it is made, with the openings, so that one copy holds both as of one moment:
+a second answer signed with a one-time key over other evidence gives the
+holder the hub's outputs. So the hub signs none where it can tell one was:
+the openings keep each answer before it is signed, and one kept with nothing
+pinned for it, as when the pins' rows were lost, is not decided anew. Nor is
+one neither keeps (the whole database restored older) while a transaction in
+the node's mempool already spends what only that answer can. Where neither
+tells (the database restored older and that transaction gone from the
+mempool) it decides anew: nothing replaces the backup. A response in a block
+whose evidence is lost is not asserted on. Where it signs none the operator
+is alerted, and her timeout pays her what she claims, with the hub's reserve
+once a response is in a block: restoring the newer `hub.sqlite` is the only
+way back.
 
 A dispute's links are presigned at 1 sat/vB, each with a 330 sat anchor
 only its poster spends. The hub posts its response and its assertion with
@@ -439,7 +442,7 @@ deadline costs the hub (the claim it would pay beyond what it responded,
 and its reserve for the assertion); the hub alerts once above that, and
 once a link is in no block halfway to its deadline. Its answer to a
 challenge and its terminals take a larger fee coin the same way. Its
-children and their coins are kept in `openings.sqlite` before broadcast.
+children and their coins are kept in `hub.sqlite` before broadcast.
 
 A response commits the hub to a proof: its assertion must confirm within
 the assert window (48 blocks on signet, 2 of them to confirm in), or the
@@ -471,7 +474,7 @@ than proofs of the smallest one its prover makes in an assert window (the
 exits it can contest at once). Each proof's work is
 in `<data>/hp-proofs/<id>/`: its input, frozen once it first holds, the
 prover's progress, carried on across restarts, its `prover.log` and
-`proof.json`. The proof is pinned in `responses.sqlite` before the assertion
+`proof.json`. The proof is pinned in `hub.sqlite` before the assertion
 is signed.
 
 The image of apps/hub/Dockerfile (x86-64) has the prover: its CPU build,
@@ -524,17 +527,14 @@ provider's. The hub's own notes, which it issues, need no contract. With
 and signet do for now) refuses to start, unless `--swaps-no-contracts`
 runs it unprotected, which is reckless; a hub upgraded to this version
 takes nothing more in from a hub until a contract there is live. Back up
-the contracts (`<data>/swaps/contracts.sqlite` and `<data>/swaps/contracts`)
-with the provider's wallet. The
+the contracts (kept in `<data>/swaps/wallet.sqlite`, their instances in
+`<data>/swaps/contracts`) with the provider's wallet. The
 hub locks no hash its Lightning receipts or deposits hold. The provider's
-wallet and swaps are kept in `<data>/swaps` (`wallet.sqlite` and
-`swaps.sqlite`, made on the first start): back them up with `hub.sqlite`,
-since an older `swaps.sqlite` loses the claims backing notes the hub
-locked. The hub refuses to start without `--swaps` while swaps are under
+wallet and swaps are kept in `<data>/swaps/wallet.sqlite`, one file made on
+the first start: back it up with `hub.sqlite`, since an older copy loses
+the claims backing notes the hub locked. The hub refuses to start without `--swaps` while swaps are under
 way. Each round, the provider's wallet also reshapes the notes it was paid,
-as a standalone provider's does (see `apps/swaps/README.md`); its first
-start under this version upgrades `wallet.sqlite` to version 8, which older
-versions refuse. To move the provider's notes out, stop the hub and run `licash-wallet
+as a standalone provider's does (see `apps/swaps/README.md`). To move the provider's notes out, stop the hub and run `licash-wallet
 --wallet <data>/swaps/wallet.sqlite`. The provider's wallet reaches hubs
 directly, so it cannot swap from a hub at an onion service only, unless
 with `--swaps-tor`: then through a Tor client of the hub's own, that of
