@@ -164,6 +164,10 @@ fn main() -> Result<()> {
             let (args, program, assume) = with_assumptions(rest, 3)?;
             hp::stark_command(args[0], args[1].as_ref(), args[2], program, &assume)
         }
+        ["chain-exec", rest @ ..] => {
+            let (args, program, assume) = with_assumptions(rest, 1)?;
+            chain::exec(args[0], program, &assume)
+        }
         // A batch of the chain program (`licash_chain::Batch::to_bytes`):
         // its succinct receipt, kept as <work-dir>/receipt, which the next
         // batch and the statements of chained contracts verify. No Groth16:

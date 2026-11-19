@@ -25,6 +25,30 @@ fn expected(bytes: &[u8]) -> Result<Vec<u8>> {
     Ok(extend(&batch, &|_, _| {})?.to_bytes())
 }
 
+/// Execute the batch at `path` (resuming the batch whose receipt `assume`
+/// names, if it does): its journal and cycles, as `hp-exec` says them of a
+/// statement. A guest that disagrees with the library is an error.
+pub fn exec(path: &str, program: Option<&str>, assume: &[String]) -> Result<()> {
+    let bytes = read(path)?;
+    let bin = probe::program(program)?;
+    let expected = expected(&bytes)?;
+    let env = super::env_with(&bytes, super::segment_override()?, &receipts(assume)?)?;
+    let t = std::time::Instant::now();
+    let run = risc0_zkvm::default_executor().execute(env, &bin)?;
+    anyhow::ensure!(
+        run.journal.bytes == expected,
+        "the guest's journal differs from the library's"
+    );
+    let cycles: u64 = run.segments.iter().map(|g| g.cycles as u64).sum();
+    let headers = Batch::from_bytes(&bytes)?.headers.len();
+    println!(
+        "{NAME}: {headers} headers, {cycles} cycles, {} segments, {} ms",
+        run.segments.len(),
+        t.elapsed().as_millis()
+    );
+    Ok(())
+}
+
 /// Prove the batch at `path` in `work`, on the GPU through the CUDA build if
 /// one is usable, else on the CPU.
 pub fn prove(path: &str, work: &Path, program: Option<&str>, assume: &[String]) -> Result<()> {

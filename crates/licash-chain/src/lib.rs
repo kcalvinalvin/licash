@@ -251,7 +251,7 @@ impl Journal {
             return None;
         }
         let mut r = R(bytes);
-        Some(Self {
+        let journal = Self {
             chain: r.take().ok()?,
             start: u32::from_be_bytes(r.take().ok()?),
             count: u32::from_be_bytes(r.take().ok()?),
@@ -259,7 +259,10 @@ impl Journal {
             frontier: r.take().ok()?,
             tip: r.take().ok()?,
             work: u128::from_be_bytes(r.take().ok()?),
-        })
+        };
+        // a chain has its start, and its last block's height is a height
+        let last = journal.start.checked_add(journal.count.checked_sub(1)?);
+        last.map(|_| journal)
     }
 
     /// The height of the last block.
@@ -567,6 +570,36 @@ impl Lineage {
         Ok((builder.journal(chain), builder.tip().clone()))
     }
 
+    /// The leaf of the block at `height`, if it is on the chain.
+    pub fn leaf(&self, height: u32) -> Option<&Leaf> {
+        self.leaves
+            .get(height.checked_sub(self.start.height())? as usize)
+    }
+
+    /// The headers after the chain's start from height `from` through `to`,
+    /// as many as it has.
+    pub fn headers(&self, from: u32, to: u32) -> &[[u8; 80]] {
+        let first = from.max(self.start.height() + 1) - self.start.height() - 1;
+        let end = to.saturating_sub(self.start.height());
+        self.headers
+            .get(first as usize..(end as usize).min(self.headers.len()))
+            .unwrap_or_default()
+    }
+
+    /// The chain through `height` alone: what it was then, as a reorg back to
+    /// that block leaves it. By replaying it.
+    pub fn truncated(&self, height: u32) -> Result<Self, Error> {
+        let n = height
+            .checked_sub(self.start.height())
+            .filter(|n| *n as usize <= self.headers.len())
+            .ok_or_else(|| bad("a height beyond the chain"))?;
+        let mut chain = Self::new(self.start.clone())?;
+        for header in &self.headers[..n as usize] {
+            chain.push(*header)?;
+        }
+        Ok(chain)
+    }
+
     /// The height of the block of `header`, if it is on the chain.
     pub fn height_of(&self, header: &[u8; 80]) -> Option<u32> {
         let at = match self.start.header() == header {
@@ -750,6 +783,18 @@ mod tests {
     }
 
     #[test]
+    fn a_journal_of_no_chain_is_none() {
+        let mut bytes = lineage(3).builder().journal(CHAIN).to_bytes();
+        assert!(Journal::from_bytes(&bytes).is_some());
+        // no blocks, and a last block past the heights there are
+        bytes[36..40].copy_from_slice(&0u32.to_be_bytes());
+        assert_eq!(Journal::from_bytes(&bytes), None);
+        bytes[32..36].copy_from_slice(&u32::MAX.to_be_bytes());
+        bytes[36..40].copy_from_slice(&5u32.to_be_bytes());
+        assert_eq!(Journal::from_bytes(&bytes), None);
+    }
+
+    #[test]
     fn a_header_that_does_not_follow_is_refused_and_leaves_the_chain_as_it_was() {
         let mut all = lineage(4);
         let before = all.builder().journal(CHAIN);
@@ -764,6 +809,38 @@ mod tests {
         assert_eq!(bytes.len(), JOURNAL_LEN);
         assert_eq!(Journal::from_bytes(&bytes), Some(before));
         assert_eq!(Journal::from_bytes(&bytes[1..]), None);
+    }
+
+    #[test]
+    fn a_range_of_headers_and_a_leaf_are_those_of_their_heights() {
+        let all = lineage(8);
+        assert_eq!(all.headers(3, 5).len(), 3);
+        assert_eq!(all.headers(3, 5)[0], *all.header(3).unwrap());
+        assert_eq!(all.headers(3, 5)[2], *all.header(5).unwrap());
+        // before the first, past the last, and empty
+        assert_eq!(all.headers(0, 2).len(), 2);
+        assert_eq!(all.headers(7, 99).len(), 2);
+        assert!(all.headers(9, 99).is_empty());
+        assert!(all.headers(5, 4).is_empty());
+        assert_eq!(all.leaf(6).unwrap().hash, sha256d(all.header(6).unwrap()));
+        assert_eq!(all.leaf(6).unwrap().height, 6);
+        assert!(all.leaf(9).is_none());
+    }
+
+    #[test]
+    fn a_chain_cut_back_is_the_chain_as_it_was() {
+        let all = lineage(9);
+        let cut = all.truncated(4).unwrap();
+        let (journal, tip) = all.through(CHAIN, 4).unwrap();
+        assert_eq!(cut.builder().journal(CHAIN), journal);
+        assert_eq!(cut.builder().tip().commitment(), tip.commitment());
+        assert_eq!(cut.tip_height(), 4);
+        assert_eq!(
+            all.truncated(9).unwrap().builder().journal(CHAIN),
+            all.builder().journal(CHAIN)
+        );
+        assert_eq!(all.truncated(0).unwrap().tip_height(), 0);
+        assert!(all.truncated(10).is_err());
     }
 
     #[test]
