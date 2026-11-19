@@ -197,16 +197,73 @@ pub async fn run(
     }
 }
 
-/// Scan from the next block to the chain's height, with the tweaks of the
-/// hubs trusted serving them, the next after one that is unavailable, and
-/// without in blocks none serves tweaks of; then broadcast again the spends
-/// in no block yet.
+/// Scan from the next block to the chain's height, as [`catch_up`], and
+/// say what was found.
 async fn scan(
     wallet: &Wallet<Http>,
     source: &Source,
     from: Option<u32>,
     json: bool,
 ) -> anyhow::Result<()> {
+    let CaughtUp {
+        found,
+        spent,
+        fetched,
+        scanned,
+        without,
+    } = catch_up(wallet, source, from).await?;
+    let value: u64 = found.iter().map(|c| c.value).sum();
+    let behind = match scanned.next > scanned.height {
+        true => String::new(),
+        false => format!(
+            " (the hub's tweaks stop there, the chain is at {})",
+            scanned.height
+        ),
+    };
+    let without_text = match without {
+        true => " (some without tweaks: the fallback addresses only)",
+        false => "",
+    };
+    show(
+        json,
+        json!({
+            "next": scanned.next, "height": scanned.height, "fetched": fetched,
+            "found": found.iter().map(coin_json).collect::<Vec<_>>(),
+            "spent": spent.iter().map(|o| o.to_string()).collect::<Vec<_>>(),
+            "tweaks": !without,
+        }),
+        format!(
+            "found {} {} of {}, {} spent; looked up to block {}{behind}{without_text}",
+            found.len(),
+            if found.len() == 1 { "coin" } else { "coins" },
+            crate::say::sat(value),
+            spent.len(),
+            scanned.next.saturating_sub(1)
+        ),
+    );
+    Ok(())
+}
+
+/// What [`catch_up`] found: the coins found and spent, the blocks fetched,
+/// the last batch, and whether some blocks were looked in without tweaks.
+pub struct CaughtUp {
+    pub found: Vec<licash_wallet::SilentCoin>,
+    pub spent: Vec<bitcoin::OutPoint>,
+    pub fetched: u32,
+    pub scanned: licash_wallet::Scanned,
+    pub without: bool,
+}
+
+/// Scan from the next block (`from` if named) to the chain's height, with
+/// the tweaks of the hubs trusted serving them, the next after one that is
+/// unavailable, and without in blocks none serves tweaks of; then
+/// broadcast again the spends in no block yet. Refused for a wallet
+/// watching nothing yet, no hub serving tweaks, `from` not named.
+pub async fn catch_up(
+    wallet: &Wallet<Http>,
+    source: &Source,
+    from: Option<u32>,
+) -> anyhow::Result<CaughtUp> {
     let trusted = wallet.hubs()?.into_iter();
     let mut hubs: Vec<(String, u32)> = trusted.filter_map(|(u, i)| Some((u, i.tweaks?))).collect();
     hubs.sort_by_key(|(_, first)| *first);
@@ -244,36 +301,13 @@ async fn scan(
             tracing::warn!(txid = %tx.compute_txid(), "broadcasting again: {e:#}");
         }
     }
-    let value: u64 = found.iter().map(|c| c.value).sum();
-    let behind = match scanned.next > scanned.height {
-        true => String::new(),
-        false => format!(
-            " (the hub's tweaks stop there, the chain is at {})",
-            scanned.height
-        ),
-    };
-    let without_text = match without {
-        true => " (some without tweaks: the fallback addresses only)",
-        false => "",
-    };
-    show(
-        json,
-        json!({
-            "next": scanned.next, "height": scanned.height, "fetched": fetched,
-            "found": found.iter().map(coin_json).collect::<Vec<_>>(),
-            "spent": spent.iter().map(|o| o.to_string()).collect::<Vec<_>>(),
-            "tweaks": !without,
-        }),
-        format!(
-            "found {} {} of {}, {} spent; looked up to block {}{behind}{without_text}",
-            found.len(),
-            if found.len() == 1 { "coin" } else { "coins" },
-            crate::say::sat(value),
-            spent.len(),
-            scanned.next.saturating_sub(1)
-        ),
-    );
-    Ok(())
+    Ok(CaughtUp {
+        found,
+        spent,
+        fetched,
+        scanned,
+        without,
+    })
 }
 
 /// A batch of blocks from `next`, with the tweaks of the first of `hubs`

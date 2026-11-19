@@ -217,7 +217,11 @@ answering can be forced closed: the notes it covers are claimed on Bitcoin
 there once the hub's window to answer passed. A hub that answers instead
 says what the claim is owed, and must prove it on Bitcoin by a deadline the
 row shows: the app checks the hub's proof, challenges one that does not
-verify, and is paid what the outcome says. The phone proves nothing, and no
+verify, and is paid what the outcome says. Its publication's
+fees come from the contract's reserve alone (paying more past it is allowed
+on the command line only). A coin for a challenge's fee, when the wallet
+holds none to set aside, is cashed out of notes at the richest hub to the
+wallet's own silent payment address through a swap provider. The phone proves nothing, and no
 root key of the wallet is revealed: the claim's notes are tied to no key
 that owns the contract. The contracts are kept beside the wallet's file, made
 only once one is asked for.

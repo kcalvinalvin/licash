@@ -15,7 +15,8 @@ use licash_contract::{
     opening::{Context, Holder, Opening},
 };
 use licash_onchain::deadline;
-use licash_wallet::{first_spend, ClaimNote, ClaimSlot, LockClaim, Transport, Wallet};
+use licash::spend::ChainProfile;
+use licash_wallet::{first_spend, ClaimNote, ClaimSlot, LockClaim, PayoutState, Transport, Wallet};
 use lichen_contract::Role;
 use serde::{Deserialize, Serialize};
 
@@ -65,6 +66,113 @@ pub fn challenge_shortfall<T: Transport>(
     let enough = coins.iter().filter(|c| c.value >= need.to_sat()).count();
     let held = enough >= 2 || (enough == 1 && coins.len() >= 2);
     Ok((!held).then_some(need))
+}
+
+/// Blocks before the request's deadline her request is no longer held
+/// back for her fee payout ([`FeeNeed`]): its coin late, her coins pay as
+/// they can.
+const FEE_WAIT_MARGIN: u32 = 6;
+
+/// Blocks a payout of her notes takes at most, as asked for her fees: its
+/// provider's coin confirmed, and her claim of it.
+fn payout_blocks(profile: ChainProfile) -> u32 {
+    match profile {
+        ChainProfile::Core30DefaultRegtest | ChainProfile::Core30Signet => 6,
+        _ => 12,
+    }
+}
+
+/// What a fee payout is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FeeFor {
+    /// Her publication of her claim, should her purse and any one coin of
+    /// hers pay too little of its fees.
+    Publication,
+    /// A challenge's fee child, should the hub's assertion be false and
+    /// no coin of hers be set aside for it ([`challenge_reserve`]).
+    Challenge,
+}
+
+/// A coin a recovery needs of hers on Bitcoin: to be paid out of her notes
+/// to an address of her own, through a swap provider, worth `amount` at
+/// least, in a block by `by` if that bounds it. Recorded with
+/// [`expect_fee`] once asked for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FeeNeed {
+    pub id: [u8; 32],
+    pub purpose: FeeFor,
+    pub amount: Amount,
+    pub by: Option<u32>,
+}
+
+/// Her coins hold too little, alone, to pay her request's fees.
+#[derive(Debug)]
+struct Short {
+    needed: u64,
+    most: u64,
+}
+
+impl std::fmt::Display for Short {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "too little of hers on Bitcoin to pay her request's fees: \
+             about {} sat needed in one coin, her largest {} sat",
+            self.needed, self.most
+        )
+    }
+}
+
+impl std::error::Error for Short {}
+
+/// The coins to try, in order, beside her purse to pay her publication's
+/// fees, of `free`, her coins and their values: none; then each alone, the
+/// coin of `paid` (her fee payout's claim) first, then the smallest first;
+/// then, if `joined`, more and more of them together, the coin of `paid`
+/// first, then the largest, until one adds no more than `input_fee`, its
+/// input's fee.
+fn fee_inputs(
+    free: &[(OutPoint, u64)],
+    paid: Option<Txid>,
+    input_fee: u64,
+    joined: bool,
+) -> Vec<Vec<OutPoint>> {
+    let other = |c: &(OutPoint, u64)| Some(c.0.txid) != paid;
+    let mut alone = free.to_vec();
+    alone.sort_by_key(|c| (other(c), c.1));
+    let mut tries = vec![vec![]];
+    tries.extend(alone.iter().map(|c| vec![c.0]));
+    if joined {
+        let mut most = free.to_vec();
+        most.sort_by_key(|c| (other(c), std::cmp::Reverse(c.1)));
+        let mut together = Vec::new();
+        for (coin, value) in most {
+            if value <= input_fee {
+                break;
+            }
+            together.push(coin);
+            if together.len() > 1 {
+                tries.push(together.clone());
+            }
+        }
+    }
+    tries
+}
+
+/// Whether a challenge may still be hers to make, its coin not taken yet.
+fn challenge_possible(stage: Stage, state: &State) -> bool {
+    match stage {
+        Stage::Published | Stage::Requested | Stage::Answered => true,
+        Stage::Asserted => state.verified != Some(true),
+        Stage::Challenging => state.challenge_child.is_none(),
+        _ => false,
+    }
+}
+
+/// Whether her request waits on her fee payout: under way, and more than
+/// a block left before the margin before the request's deadline.
+fn waits_for_payout(pending: bool, tip: u32, request_height: u32) -> bool {
+    pending && tip.saturating_add(1) < request_height.saturating_sub(FEE_WAIT_MARGIN)
 }
 
 fn rescan(from: u32, tip: u32) -> u32 {
@@ -267,6 +375,14 @@ struct State {
     fold: Option<Transaction>,
     #[serde(skip_serializing_if = "Option::is_none")]
     fold_height: Option<u32>,
+    /// Her payout of notes, by its hash, to a coin of hers paying her
+    /// publication's fees ([`expect_fee`]): waited for while under way and
+    /// time is left, its coin tried first. None of an older state.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fee_payout: Option<String>,
+    /// Her payout of notes to a coin of hers for a challenge's fee.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    challenge_payout: Option<String>,
 }
 impl State {
     fn encode(&self) -> Vec<u8> {
@@ -427,6 +543,56 @@ pub async fn advance<T: Transport, C: Chain>(
     }
     list(&store)
 }
+/// The coins her recoveries in `dir` need of hers on Bitcoin now, each to
+/// be paid out of her notes to an address of her own, through a swap
+/// provider, and recorded with [`expect_fee`]: for her publication, should
+/// her purse and no coin of hers alone pay its fees, time left for a
+/// payout; for a challenge, should no coin of hers be set aside for it.
+/// None for a recovery whose payout for it is under way.
+pub async fn fee_needs<T: Transport, C: Chain>(
+    wallet: &Wallet<T>,
+    chain: &C,
+    dir: &std::path::Path,
+    rate: FeeRate,
+) -> Result<Vec<FeeNeed>> {
+    let Some(store) = Store::existing(dir)? else {
+        return Ok(vec![]);
+    };
+    let tip = chain.height().await.map_err(|e| anyhow!(e))?;
+    let mut needs = Vec::new();
+    for row in store.recoveries()? {
+        let Ok(stage) = Stage::parse(&row.stage) else {
+            continue;
+        };
+        if stage.over() || stage == Stage::GivingUp {
+            continue;
+        }
+        let state = State::decode(&row)?;
+        let run = Run::load(wallet, chain, &store, dir, &row.id, rate).await?;
+        needs.extend(run.fee_need(stage, &state, tip)?);
+    }
+    Ok(needs)
+}
+
+/// Record `hash`, a payout of her notes to an address of her own, as the
+/// one recovery `id` awaits for `purpose` ([`fee_needs`]).
+pub fn expect_fee(dir: &std::path::Path, id: &[u8; 32], purpose: FeeFor, hash: &str) -> Result<()> {
+    let store = Store::existing(dir)?.context("no contracts")?;
+    // Saved only over the state read: a step meanwhile is read again.
+    for _ in 0..3 {
+        let row = store.recovery(id)?.context("no such recovery")?;
+        let mut state = State::decode(&row)?;
+        match purpose {
+            FeeFor::Publication => state.fee_payout = Some(hash.to_owned()),
+            FeeFor::Challenge => state.challenge_payout = Some(hash.to_owned()),
+        }
+        if store.save_recovery(id, (&row.stage, &row.state), &row.stage, false, &state.encode())? {
+            return Ok(());
+        }
+    }
+    bail!("the recovery kept changing meanwhile")
+}
+
 pub fn recoveries(dir: &std::path::Path) -> Result<Vec<Recovery>> {
     match Store::existing(dir)? {
         Some(store) => list(&store),
@@ -1067,7 +1233,27 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
         let r = self
             .o
             .request(&self.keys, request.amount, &request.claim_digest)?;
-        self.build_p(&r, &self.filing_of(state)?, None, state.p_allowance)?;
+        let filing = self.filing_of(state)?;
+        if let Err(e) = self.build_p(&r, &filing, None, state, false) {
+            // Past what she allowed, or failing otherwise: she is told.
+            if e.downcast_ref::<Short>().is_none() {
+                return Err(e);
+            }
+            // Her purse and no coin of hers alone pay what she allowed:
+            // the coin of her fee payout awaited while under way, time
+            // left; else her coins joined.
+            let pending = self.payout_pending(state.fee_payout.as_deref())?;
+            let deadline = self.o.base.parts().graph.request_height;
+            if waits_for_payout(pending, tip, deadline) {
+                self.trouble(format!(
+                    "waiting for her payout of notes to pay her request's fees, \
+                     until block {}",
+                    deadline.saturating_sub(FEE_WAIT_MARGIN)
+                ));
+                return Ok(Next::Save);
+            }
+            self.build_p(&r, &filing, None, state, true)?;
+        }
         Ok(Next::To(Stage::Irrevocable))
     }
     fn request(&self, state: &mut State) -> Result<Next> {
@@ -1086,7 +1272,7 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
             self.request_matches(state, &r)?,
             "pinned R reads another claim"
         );
-        let (p, prevouts) = self.build_p(&r, &self.filing_of(state)?, None, state.p_allowance)?;
+        let (p, prevouts) = self.build_p(&r, &self.filing_of(state)?, None, state, true)?;
         state.r = Some(r);
         state.p = Some(p);
         state.prevouts = prevouts;
@@ -1116,19 +1302,24 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
             .max(DUST))
     }
     /// Her publication of `filing`, spending `r`'s slot, its anchor and her
-    /// purse, its fee within `allowance` in all, else what those hold
-    /// besides the fee coin it pays her terminals (her reserve's, so a
-    /// wrong rate or a bug spends no more): a quarter of that at most at
-    /// the round's rate, or, `bump`ing one made before, exactly the fee
-    /// given, its fee coin kept. One coin of hers too only should an
-    /// allowance ask more than they hold.
+    /// purse, its fee within her allowance in all (`state`'s), else what
+    /// those hold besides the fee coin it pays her terminals (her reserve's,
+    /// so a wrong rate or a bug spends no more): a quarter of that at most
+    /// at the round's rate, or, `bump`ing one made before, exactly the fee
+    /// given, its fee coin kept. Coins of hers too only should an allowance
+    /// ask more than they hold ([`fee_inputs`]): the coin of her fee payout
+    /// first, then one alone, the smallest that pays; joined only if
+    /// `joined`, as an exception, funds mattering more than her coins not
+    /// being tied together on Bitcoin.
     fn build_p(
         &self,
         r: &Transaction,
         filing: &Filing,
         bump: Option<(&Transaction, Amount)>,
-        allowance: Option<u64>,
+        state: &State,
+        joined: bool,
     ) -> Result<(Transaction, Vec<TxOut>)> {
+        let allowance = state.p_allowance;
         let request = presign(&self.o.set, "request")?;
         let slot = request.tx.output.get(2).context("no claim slot")?.clone();
         let anchor = r.output.get(1).context("no request anchor")?.clone();
@@ -1176,26 +1367,29 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
             );
             base.push((at(PURSE_VOUT), purse.clone()));
         }
-        // Else one coin of hers alone too, the smallest that pays: coins
-        // are never joined, not to tie them together on Bitcoin.
-        let mut coins = super::coins(self.wallet, self.dir)?;
-        coins.reverse();
-        let most = coins.last().map_or(0, |c| c.value);
-        let coins = coins.into_iter().map(|coin| -> Result<_> {
-            let output = self
-                .wallet
-                .silent_coin_output(&coin.outpoint)?
-                .context("unknown fee coin")?;
-            Ok(Some((coin.outpoint, output)))
-        });
+        let coins = super::coins(self.wallet, self.dir)?;
+        let most = coins.first().map_or(0, |c| c.value);
+        let paid = self.payout_claim(state.fee_payout.as_deref())?;
+        let input_fee = self.rate.fee_vb(58).context("input fee")?;
+        let free: Vec<_> = coins.iter().map(|c| (c.outpoint, c.value)).collect();
+        let mut outputs = std::collections::HashMap::new();
         // What one coin more must hold, of R's own paying too little: its
         // shortfall, the coin's input's fee and its change's dust limit.
         let mut needed = None;
-        for coin in std::iter::once(Ok(None)).chain(coins) {
-            let coin = coin?;
-            let alone = coin.is_none();
+        for chosen in fee_inputs(&free, paid, input_fee.to_sat(), joined) {
+            let alone = chosen.is_empty();
             let mut inputs = base.clone();
-            inputs.extend(coin);
+            for coin in chosen {
+                let output = match outputs.get(&coin) {
+                    Some(output) => output,
+                    None => {
+                        let output = (self.wallet.silent_coin_output(&coin)?)
+                            .context("unknown fee coin")?;
+                        outputs.entry(coin).or_insert(output)
+                    }
+                };
+                inputs.push((coin, output.clone()));
+            }
             let prevouts: Vec<_> = inputs.iter().map(|(_, out)| out.clone()).collect();
             let total: Amount = prevouts.iter().map(|out| out.value).sum();
             let mut p = self.o.publication(
@@ -1251,11 +1445,14 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
             );
             let Some(left) = total.checked_sub(fee_coin.value + fee) else {
                 if alone {
-                    let input = self.rate.fee_vb(58).context("input fee")?;
-                    needed = Some(fee_coin.value + fee + input - total + DUST);
+                    needed = Some(fee_coin.value + fee + input_fee - total + DUST);
                 }
                 continue;
             };
+            let max_bytes = self.o.base.parts().limits.max_transaction_bytes;
+            if weighed.total_size() > max_bytes as usize {
+                continue;
+            }
             if left >= DUST {
                 p.output[2].value = left;
             } else {
@@ -1266,10 +1463,74 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
             return Ok((p, prevouts));
         }
         let needed = needed.map_or(0, |n| n.to_sat());
-        bail!(
-            "too little of hers on Bitcoin to pay her request's fees: \
-             about {needed} sat needed in one coin, her largest {most} sat"
-        )
+        Err(Short { needed, most }.into())
+    }
+
+    /// The claim of her fee payout of `hash`, if claimed.
+    fn payout_claim(&self, hash: Option<&str>) -> Result<Option<Txid>> {
+        let Some(hash) = hash else { return Ok(None) };
+        let payouts = self.wallet.payouts()?;
+        Ok(payouts.into_iter().find(|p| p.hash == hash).and_then(|p| p.claim))
+    }
+
+    /// Whether her payout of `hash` is under way: neither done nor failed.
+    fn payout_pending(&self, hash: Option<&str>) -> Result<bool> {
+        let Some(hash) = hash else { return Ok(false) };
+        let payouts = self.wallet.payouts()?;
+        Ok(payouts
+            .iter()
+            .find(|p| p.hash == hash)
+            .is_some_and(|p| matches!(p.state, PayoutState::Open | PayoutState::Claimed)))
+    }
+
+    /// What of [`fee_needs`] this recovery, at `stage` of `state`, needs.
+    fn fee_need(&self, stage: Stage, state: &State, tip: u32) -> Result<Option<FeeNeed>> {
+        if stage == Stage::Claimed {
+            if self.payout_pending(state.fee_payout.as_deref())? {
+                return Ok(None);
+            }
+            let deadline = self.o.base.parts().graph.request_height;
+            let by = deadline.saturating_sub(FEE_WAIT_MARGIN);
+            if tip.saturating_add(payout_blocks(self.wallet.network())) > by {
+                return Ok(None);
+            }
+            let request = self.requested(state)?;
+            let r = self
+                .o
+                .request(&self.keys, request.amount, &request.claim_digest)?;
+            let Err(e) = self.build_p(&r, &self.filing_of(state)?, None, state, false) else {
+                return Ok(None);
+            };
+            let Some(short) = e.downcast_ref::<Short>() else {
+                return Err(e);
+            };
+            return Ok(Some(FeeNeed {
+                id: self.id,
+                purpose: FeeFor::Publication,
+                amount: Amount::from_sat(short.needed),
+                by: Some(by),
+            }));
+        }
+        if !challenge_possible(stage, state)
+            || self.payout_pending(state.challenge_payout.as_deref())?
+        {
+            return Ok(None);
+        }
+        let marker = challenge_marker(&self.id);
+        if (self.wallet.silent_coins()?.iter()).any(|c| c.spending == Some(marker)) {
+            return Ok(None);
+        }
+        let need = challenge_reserve(self.rate);
+        let free = super::coins(self.wallet, self.dir)?;
+        if free.iter().any(|c| c.value >= need.to_sat()) {
+            return Ok(None);
+        }
+        Ok(Some(FeeNeed {
+            id: self.id,
+            purpose: FeeFor::Challenge,
+            amount: need,
+            by: None,
+        }))
     }
     fn sign(&self, state: &mut State) -> Result<Next> {
         let mut p = state.p.clone().context("no publication transaction")?;
@@ -1486,7 +1747,7 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
         }
         let filing = self.filing_of(state)?;
         let (bumped, prevouts) =
-            match self.build_p(r, &filing, Some((p, target)), state.p_allowance) {
+            match self.build_p(r, &filing, Some((p, target)), state, true) {
                 Ok(made) => made,
                 Err(e) => {
                     self.trouble(format!("{e:#}"));
@@ -1851,13 +2112,7 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
             return Ok(());
         }
         let marker = challenge_marker(&self.id);
-        let possible = match stage {
-            Stage::Published | Stage::Requested | Stage::Answered => true,
-            Stage::Asserted => state.verified != Some(true),
-            Stage::Challenging => state.challenge_child.is_none(),
-            _ => false,
-        };
-        if !possible {
+        if !challenge_possible(stage, state) {
             // Nothing under it, or freed already: no error.
             let _ = self.wallet.abandon_silent(&marker);
             if let Some(child) = state.challenge_child.as_ref() {
@@ -2559,6 +2814,7 @@ mod driver_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bitcoin::hashes::Hash as _;
     #[test]
     fn a_watch_looks_again_at_the_last_blocks_it_saw() {
         assert_eq!(rescan(100, 200), 198);
@@ -2814,5 +3070,68 @@ mod tests {
         assert_eq!(rung(100, 100, 100), 0);
         assert_eq!(rung(100, 100, 101), 3);
         assert_eq!(rung(108, 100, 101), 0);
+    }
+
+    #[test]
+    fn a_state_of_no_fee_payout_reads_as_awaiting_none_and_writes_none() {
+        let old = State::default().encode();
+        assert!(!String::from_utf8_lossy(&old).contains("fee_payout"));
+        let row = RecoveryRow {
+            id: [1; 32],
+            format: FORMAT,
+            stage: Stage::Claimed.as_str().into(),
+            irrevocable: false,
+            error: None,
+            state: old,
+            created_at: 0,
+        };
+        let state = State::decode(&row).unwrap();
+        assert_eq!((state.fee_payout, state.challenge_payout), (None, None));
+        let awaiting = State {
+            fee_payout: Some("ab".into()),
+            ..State::default()
+        };
+        let row = RecoveryRow {
+            state: awaiting.encode(),
+            ..row
+        };
+        assert_eq!(State::decode(&row).unwrap().fee_payout.as_deref(), Some("ab"));
+    }
+
+    #[test]
+    fn fees_are_paid_by_the_purse_then_one_coin_the_payouts_first_then_coins_joined() {
+        let coin = |n: u8| OutPoint::new(Txid::from_byte_array([n; 32]), 0);
+        let free = [(coin(1), 5_000), (coin(2), 900), (coin(3), 40), (coin(4), 2_000)];
+        // Each alone, the smallest first; never two together unless asked.
+        assert_eq!(
+            fee_inputs(&free, None, 100, false),
+            vec![vec![], vec![coin(3)], vec![coin(2)], vec![coin(4)], vec![coin(1)]]
+        );
+        // The payout's coin first, alone and joined; then the largest, until
+        // one adds no more than its input's fee.
+        let paid = Some(coin(2).txid);
+        assert_eq!(
+            fee_inputs(&free, paid, 100, true),
+            vec![
+                vec![],
+                vec![coin(2)],
+                vec![coin(3)],
+                vec![coin(4)],
+                vec![coin(1)],
+                vec![coin(2), coin(1)],
+                vec![coin(2), coin(1), coin(4)],
+            ]
+        );
+        assert_eq!(fee_inputs(&[], paid, 100, true), vec![Vec::<OutPoint>::new()]);
+    }
+
+    #[test]
+    fn a_request_waits_on_its_fee_payout_only_while_under_way_and_time_is_left() {
+        let deadline = 100;
+        assert!(waits_for_payout(true, 90, deadline));
+        assert!(waits_for_payout(true, 92, deadline));
+        assert!(!waits_for_payout(true, 93, deadline));
+        assert!(!waits_for_payout(false, 10, deadline));
+        assert!(!waits_for_payout(true, 0, 5));
     }
 }

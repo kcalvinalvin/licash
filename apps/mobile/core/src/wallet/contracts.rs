@@ -253,7 +253,9 @@ impl Wallet {
         let all = holder::resume(&self.wallet, &chain, &self.dir);
         let all = self.runtime.block_on(all);
         // Carried on even if the others could not be: a forced close
-        // has deadlines of its own.
+        // has deadlines of its own. Its fees paid out of notes first, if
+        // its coins pay too little.
+        self.fund_recoveries(&chain);
         self.advance_recoveries(&chain);
         self.listed(&all.map_err(unavailable)?)
     }

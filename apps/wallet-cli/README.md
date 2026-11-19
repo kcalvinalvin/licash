@@ -258,9 +258,17 @@ estimate), but the publication of its claim only from the contract's
 reserve: never more than it holds, whatever the rate, starting at a
 quarter of it and paying more as its window runs out while no block
 holds it. Should all of it fall short, `recoveries` says so, and
-`allow-publication-fee <id> <sats>` lets it pay that much in all, its
-coins on Bitcoin paying the rest. `recoveries --chain <url>` carries every forced close on as
-far as the chain lets it and shows the block its next step waits for: run
+`allow-publication-fee <id> <sats>` lets it pay that much in all, the rest
+from one coin of the wallet's, never two together; if none holds enough,
+`recoveries --chain` pays a coin out of notes (at the richest hub) to the
+wallet's own silent payment address through a swap provider announced on
+its hubs' relays, the request waiting for it until six blocks before its
+deadline. Only as an exception, no payout made in time, are the wallet's
+coins joined to pay. The same pays out a coin for a challenge's fee when
+the wallet holds none to set aside. `recoveries --chain <url>` carries
+every forced close on as far as the chain lets it, following payouts and
+looking for the wallet's coins first, and shows the block its next step
+waits for: run
 it until it is `done`, when the claimed notes' value and the wallet's
 reserve are back in it on Bitcoin (with the hub's reserve too on a
 contract opened before graph id 8, or once the hub answered and failed to

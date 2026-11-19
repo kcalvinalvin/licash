@@ -126,18 +126,50 @@ async fn broadcast(wallet: &Wallet<Http>, source: &Source) -> anyhow::Result<()>
     Ok(())
 }
 
+/// Take the payouts under way on, on `source`, and broadcast their claims.
+pub async fn follow_all(wallet: &Wallet<Http>, source: &Source) -> anyhow::Result<()> {
+    let (_, pending) = wallet
+        .follow_payouts(&onchain::Blocks(source.clone()))
+        .await?;
+    for (hash, reason) in pending {
+        tracing::info!(hash, reason, "payout pending");
+    }
+    broadcast(wallet, source).await
+}
+
+/// Pay `amount` out of notes at the richest hub to the wallet's own silent
+/// payment address, through the provider announced on its hubs' relays,
+/// reached through `route`, asking least within the usual fees: a coin for
+/// a forced close's fees. Its claim made as the payouts are followed.
+pub async fn for_fees(
+    wallet: &Wallet<Http>,
+    route: &Route,
+    amount: u64,
+    rate: bitcoin::FeeRate,
+) -> anyhow::Result<Payout> {
+    let relays = licash_nostr::wallet::hub_relays(wallet)?;
+    if relays.is_empty() {
+        bail!("no hub trusted names relays to find a swap provider on");
+    }
+    let from = crate::richest_but(wallet, "")?;
+    let to = wallet.silent_keys().address().to_string();
+    let limits = (amount / 100 + USUAL_MAX_FEE, rate);
+    let found = payout_providers(wallet, &relays, route, (&from, &to), amount, limits);
+    let found = found.await?.into_iter().next().with_context(|| {
+        format!("no provider announced pays {amount} out from {from} within the usual fees")
+    })?;
+    let payout = wallet.payout(&found.quote).await?;
+    if let PayoutState::Failed(reason) = &payout.state {
+        bail!("the payout failed ({reason}): its lock, if made, returns once expired");
+    }
+    Ok(payout)
+}
+
 /// The payouts, newest first: taken on first with `chain`, their claims
 /// broadcast.
 pub async fn list(wallet: &Wallet<Http>, chain: Option<&str>, json: bool) -> anyhow::Result<()> {
     if let Some(chain) = chain {
-        let source = source(chain)?;
-        let (_, pending) = wallet
-            .follow_payouts(&onchain::Blocks(source.clone()))
-            .await?;
-        for (hash, reason) in pending {
-            tracing::info!(hash, reason, "payout pending");
-        }
-        broadcast(wallet, &source).await?;
+        follow_all(wallet, &source(chain)?).await?;
     }
     let payouts = wallet.payouts()?;
     let lines: Vec<String> = payouts.iter().map(payout_line).collect();

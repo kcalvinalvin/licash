@@ -288,7 +288,27 @@ async fn lifecycle(amount: u32, altered: bool, answer: bool, reorged: bool) {
         ..State::default()
     };
     w.start(Stage::Answered, &state);
+    // A fee payout awaited, of no payout of the wallet's: nothing waits on
+    // it, the stage and the rest of the state as they were.
+    expect_fee(dir.path(), &id, FeeFor::Challenge, "cd").unwrap();
+    let row = store.recovery(&id).unwrap().unwrap();
+    assert_eq!(row.stage, Stage::Answered.as_str());
+    let expected = State::decode(&row).unwrap();
+    assert_eq!(expected.challenge_payout.as_deref(), Some("cd"));
+    assert_eq!(expected.fee_payout, None);
+    assert_eq!(expected.r, state.r);
     let rate = FeeRate::from_sat_per_vb(2).unwrap();
+    let needs = fee_needs(wallet, chain, dir.path(), rate).await.unwrap();
+    // No coin of hers for a challenge, none under way: one to pay out.
+    assert_eq!(
+        needs,
+        vec![FeeNeed {
+            id,
+            purpose: FeeFor::Challenge,
+            amount: challenge_reserve(rate),
+            by: None,
+        }]
+    );
     let mut mined = assertion.clone();
     if altered {
         let mut witness: Vec<_> = mined.input[0].witness.iter().map(|v| v.to_vec()).collect();

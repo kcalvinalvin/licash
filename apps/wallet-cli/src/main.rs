@@ -481,7 +481,10 @@ enum Command {
         chain: Option<String>,
     },
     /// The contracts the wallet forced closed. With --chain, each carried
-    /// on as far as the chain lets it.
+    /// on as far as the chain lets it: the payouts followed and the coins
+    /// looked for first, and a coin one needs for its fees, should its
+    /// purse and no coin alone pay them, paid out of notes to the wallet
+    /// through a swap provider announced on its hubs' relays.
     Recoveries {
         /// Its fees' rate, in sat/vB [default: the chain's estimate].
         #[arg(long)]
@@ -1201,7 +1204,9 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 .await;
         }
         Command::Recoveries { fee_rate, chain } => {
-            return contract::recoveries(&wallet, &path, chain.as_deref(), fee_rate, json).await;
+            let route = route(tor, cli.proxy.as_deref())?;
+            let chain = (chain.as_deref(), &route);
+            return contract::recoveries(&wallet, &path, chain, fee_rate, json).await;
         }
         Command::GiveUpRecovery { id } => contract::give_up(&wallet, &path, &id)?,
         Command::AllowPublicationFee { id, sats } => {

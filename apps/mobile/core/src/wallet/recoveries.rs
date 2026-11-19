@@ -285,7 +285,53 @@ impl Wallet {
     }
 }
 
+/// The least a payout for a forced close's fees asks: swap providers pay
+/// out no smaller coin by default (`licash-swaps --payout-min`), and what
+/// it holds beyond the fees comes back to her as change.
+const FEE_PAYOUT_FLOOR: u64 = 10_000;
+
 impl Wallet {
+    /// Pay out of her notes, to her own silent payment address, each coin
+    /// her forced closes need of hers on Bitcoin to pay their fees
+    /// ([`recovery::fee_needs`]): from her richest hub, through the
+    /// provider preferred, recorded as awaited. One not paid out is left
+    /// to her coins, as are its fees; nothing else held up.
+    pub(super) fn fund_recoveries(&self, chain: &Chain) {
+        let active =
+            recovery::recoveries(&self.dir).is_ok_and(|all| all.iter().any(|r| !r.stage.over()));
+        if !active {
+            return;
+        }
+        let needs = async {
+            let rate = rate(chain).await;
+            recovery::fee_needs(&self.wallet, chain, &self.dir, rate).await
+        };
+        let needs = match self.runtime.block_on(needs) {
+            Ok(needs) => needs,
+            Err(e) => {
+                tracing::warn!("forced closes' fees not looked at: {e:#}");
+                return;
+            }
+        };
+        let to = self.wallet.silent_keys().address().to_string();
+        for need in needs {
+            let amount = need.amount.to_sat().max(FEE_PAYOUT_FLOOR);
+            let paid = self
+                .payout_quote(to.clone(), Some(amount), None)
+                .and_then(|quote| self.pay_out_or_another(quote, Some(amount)));
+            let id = hex::encode(need.id);
+            match paid {
+                Ok(paying) => {
+                    tracing::info!(%id, hash = %paying.id, amount, "notes paid out for a forced close's fees");
+                    if let Err(e) = recovery::expect_fee(&self.dir, &need.id, need.purpose, &paying.id) {
+                        tracing::warn!(%id, "a fee payout not recorded: {e:#}");
+                    }
+                }
+                Err(e) => tracing::warn!(%id, amount, "no payout for a forced close's fees: {e}"),
+            }
+        }
+    }
+
     /// Carry every forced close on as far as `chain` lets it, the wallet
     /// contracting: one that cannot go on holds up nothing else.
     pub(super) fn advance_recoveries(&self, chain: &Chain) {

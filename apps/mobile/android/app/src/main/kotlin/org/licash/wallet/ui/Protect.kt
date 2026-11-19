@@ -310,7 +310,8 @@ internal fun ForceSheet(c: Contract, held: ULong, shortfall: ULong?, force: () -
             Say(
                 "Keep a coin of at least ${sat(shortfall)} on Bitcoin besides your others first: should the hub " +
                     "prove falsely, your challenge's fee comes from it, set aside until the close is over. " +
-                    "Without it, a challenge pays what your coins hold, and may come too late.",
+                    "Without it, notes of yours are cashed out for it while you are online, " +
+                    "else a challenge pays what your coins hold, and may come too late.",
             )
         }
         Say("Once its request is signed, it cannot be canceled, even before it is on Bitcoin.")

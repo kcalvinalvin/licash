@@ -372,23 +372,31 @@ pub async fn close(
 }
 
 /// The contracts the wallet forced closed: with --chain, each carried on
-/// as far as the chain lets it.
+/// as far as the chain lets it, the payouts followed and the wallet's
+/// coins looked for first, and the coins they need for their fees paid out
+/// of notes to the wallet's own address, through a provider found through
+/// `route` ([`recovery::fee_needs`]).
 pub async fn recoveries(
     wallet: &Wallet<Http>,
     path: &Path,
-    chain: Option<&str>,
+    (chain, route): (Option<&str>, &licash_nostr::Route),
     fee_rate: Option<u64>,
     json: bool,
 ) -> anyhow::Result<()> {
+    let mut paying = Vec::new();
     let all = match chain {
         Some(_) => {
             let chain = node(chain)?;
             let rate = crate::onchain::rate(&chain.0, fee_rate).await?;
+            if recovery::recoveries(dir(path))?.iter().any(|r| !r.stage.over()) {
+                paying = fund(wallet, path, &chain, route, rate).await;
+            }
             recovery::advance(wallet, &chain, dir(path), rate).await?
         }
         None => recovery::recoveries(dir(path))?,
     };
-    let lines: Vec<String> = all.iter().map(recovery_line).collect();
+    let mut lines: Vec<String> = all.iter().map(recovery_line).collect();
+    lines.extend(paying);
     show(
         json,
         all.iter().map(recovery_json).collect(),
@@ -396,6 +404,60 @@ pub async fn recoveries(
     );
     Ok(())
 }
+
+/// Follow the payouts and look for the wallet's coins, then pay out of
+/// notes each coin the forced closes need for their fees: what is paid
+/// out, as lines to show. Nothing here holds the recoveries up.
+async fn fund(
+    wallet: &Wallet<Http>,
+    path: &Path,
+    chain: &Node,
+    route: &licash_nostr::Route,
+    rate: bitcoin::FeeRate,
+) -> Vec<String> {
+    if let Err(e) = crate::payout::follow_all(wallet, &chain.0).await {
+        tracing::warn!("payouts not followed: {e:#}");
+    }
+    if let Err(e) = crate::onchain::catch_up(wallet, &chain.0, None).await {
+        tracing::warn!("coins not looked for: {e:#}");
+    }
+    let needs = match recovery::fee_needs(wallet, chain, dir(path), rate).await {
+        Ok(needs) => needs,
+        Err(e) => {
+            tracing::warn!("forced closes' fees not looked at: {e:#}");
+            return Vec::new();
+        }
+    };
+    let mut lines = Vec::new();
+    for need in needs {
+        let id = licash_contracts::hex_id(&need.id);
+        let amount = need.amount.to_sat().max(FEE_PAYOUT_FLOOR);
+        match crate::payout::for_fees(wallet, route, amount, rate).await {
+            Ok(payout) => {
+                if let Err(e) = recovery::expect_fee(dir(path), &need.id, need.purpose, &payout.hash) {
+                    tracing::warn!(id, "a fee payout not recorded: {e:#}");
+                }
+                lines.push(format!(
+                    "{}  fees: {} paid out of notes to the wallet by payout {}",
+                    &id[..16],
+                    crate::say::sat(amount),
+                    payout.hash
+                ));
+            }
+            Err(e) => eprintln!(
+                "warning: {}: no payout of {} for its fees ({e:#}): its coins pay as they can",
+                &id[..16],
+                crate::say::sat(amount)
+            ),
+        }
+    }
+    lines
+}
+
+/// The least a payout for a forced close's fees asks: swap providers pay
+/// out no smaller coin by default (`licash-swaps --payout-min`), and what
+/// it holds beyond the fees comes back as change.
+const FEE_PAYOUT_FLOOR: u64 = 10_000;
 
 /// Give up forcing contract `id` closed, the wallet's notes back to it:
 /// only before its request is signed.
