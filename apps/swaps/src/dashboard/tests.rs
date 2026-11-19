@@ -91,18 +91,13 @@ fn table<'a>(report: &'a Report, title: &str) -> &'a licash_dashboard::Table {
     tables.into_iter().find(|t| t.title == title).unwrap()
 }
 
-/// What the files hold, byte for byte, to show none was written.
+/// What the file holds, byte for byte, its log included, to show none was
+/// written.
 fn contents(dir: &Path) -> Vec<Vec<u8>> {
-    ["swaps.sqlite", "wallet.sqlite"]
+    ["wallet.sqlite", "wallet.sqlite-wal"]
         .iter()
-        .map(|f| std::fs::read(dir.join(f)).unwrap())
+        .map(|f| std::fs::read(dir.join(f)).unwrap_or_default())
         .collect()
-}
-
-fn version(path: &Path) -> i64 {
-    let conn = Connection::open(path).unwrap();
-    conn.pragma_query_value(None, "user_version", |r| r.get(0))
-        .unwrap()
 }
 
 /// A hub's Info, following Bitcoin at `height` unless none.
@@ -120,7 +115,9 @@ fn info(height: Option<u32>) -> String {
 }
 
 /// A provider as this version creates it, of two hubs, `a.test` and
-/// `b.test`, both at height 1000, `b.test` not heard from in two hours.
+/// `b.test`, both at height 1000, `b.test` not heard from in two hours: two
+/// connections of its one file, the first for what its provider records, the
+/// second for what its wallet does.
 fn provider(dir: &Path) -> (Connection, Connection) {
     let wallet = Wallet::create(
         &dir.join("wallet.sqlite"),
@@ -129,7 +126,7 @@ fn provider(dir: &Path) -> (Connection, Connection) {
         Offline,
     )
     .unwrap();
-    drop(Provider::create(&dir.join("swaps.sqlite"), wallet, Config::default()).unwrap());
+    drop(Provider::create(wallet, Config::default()).unwrap());
     let wallet = Connection::open(dir.join("wallet.sqlite")).unwrap();
     for (id, url, heard) in [
         (1, "http://a.test", NOW - 60),
@@ -154,7 +151,7 @@ fn provider(dir: &Path) -> (Connection, Connection) {
             )
             .unwrap();
     }
-    let swaps = Connection::open(dir.join("swaps.sqlite")).unwrap();
+    let swaps = Connection::open(dir.join("wallet.sqlite")).unwrap();
     (swaps, wallet)
 }
 
@@ -172,8 +169,8 @@ fn note(
     wallet
         .execute(
             "INSERT INTO notes (y, keyset, denom, note, proposal, ephemeral, branch, position,
-                spent_by, unlinked, gone_at, added_at)
-             VALUES (?1, ?2, ?3, X'00', X'00', X'00', 0, 0, ?4, ?5, ?6, ?7)",
+                spent_by, spent_kind, unlinked, gone_at, added_at)
+             VALUES (?1, ?2, ?3, X'00', X'00', X'00', 0, 0, ?4, ?8, ?5, ?6, ?7)",
             params![
                 format!("{hub} {denom}").into_bytes(),
                 vec![hub; 32],
@@ -181,7 +178,8 @@ fn note(
                 spent_by.map(|s| s.to_vec()),
                 unlinked,
                 gone,
-                added
+                added,
+                spent_by.map(|_| "send")
             ],
         )
         .unwrap();
@@ -208,7 +206,7 @@ fn swap(
     };
     swaps
         .execute(
-            "INSERT INTO swaps (id, hash, from_url, to_url, address, amount, fee, paid,
+            "INSERT INTO provider_swaps (id, hash, from_url, to_url, address, amount, fee, paid,
                 expiry_from, expiry, state, reason, created_at, updated_at, kind)
              VALUES (?1, ?2, ?3, ?4, X'02', ?5, ?6, ?5 + ?6, ?7, 1100, ?8, ?9, ?10, ?11, ?12)",
             params![
@@ -345,7 +343,7 @@ fn the_dashboard_reads_swaps_fees_losses_and_notes_from_the_records() {
     );
     swaps
         .execute(
-            "INSERT INTO events (at, kind, json) VALUES (?1, 'alert', ?2)",
+            "INSERT INTO provider_events (at, kind, json) VALUES (?1, 'alert', ?2)",
             params![
                 NOW - HOUR,
                 r#"{"kind":"alert","message":"No swaps to b.test for now"}"#
@@ -418,50 +416,6 @@ fn the_dashboard_reads_swaps_fees_losses_and_notes_from_the_records() {
     assert_eq!(contents(dir.path()), before);
 }
 
-/// The files of each older version, read as they are and left so: no
-/// migration, nothing written.
-#[test]
-fn files_of_older_versions_are_read_as_they_are() {
-    let wallets = [
-        include_str!("../../../../crates/licash-wallet/tests/fixtures/wallet-v1.sql"),
-        include_str!("../../../../crates/licash-wallet/tests/fixtures/wallet-v2.sql"),
-        include_str!("../../../../crates/licash-wallet/tests/fixtures/wallet-v3.sql"),
-        include_str!("../../../../crates/licash-wallet/tests/fixtures/wallet-v4.sql"),
-        include_str!("../../../../crates/licash-wallet/tests/fixtures/wallet-v5.sql"),
-        include_str!("../../../../crates/licash-wallet/tests/fixtures/wallet-v6.sql"),
-        include_str!("../../../../crates/licash-wallet/tests/fixtures/wallet-v7.sql"),
-    ];
-    for (i, fixture) in wallets.iter().enumerate() {
-        let dir = tempfile::tempdir().unwrap();
-        let swaps = include_str!("../../../../crates/licash-swaps/tests/fixtures/swaps-v1.sql");
-        Connection::open(dir.path().join("swaps.sqlite"))
-            .unwrap()
-            .execute_batch(swaps)
-            .unwrap();
-        Connection::open(dir.path().join("wallet.sqlite"))
-            .unwrap()
-            .execute_batch(fixture)
-            .unwrap();
-        let before = contents(dir.path());
-
-        let report = dashboard(dir.path());
-        // The one swap of version 1, of notes, taken and not locked yet.
-        assert_eq!(summed(&report, "taken", "a.test → b.test"), (1, 1000));
-        assert_eq!(table(&report, "Under way").rows.len(), 1);
-        assert_eq!(
-            texts(&table(&report, "Recent events").rows[0]),
-            ["taken", "a.test → b.test", "1000", "fee 11 sat (1.1%)"]
-        );
-        let stock = report.series.iter().find(|s| s.id == "stock").unwrap();
-        assert_eq!(stock.labels, ["hub.test"], "wallet v{}", i + 1);
-        let on_chain = now_card(&report, "On chain").0;
-        assert_eq!(on_chain, (i > 0).then_some(0), "wallet v{}", i + 1);
-        assert_eq!(contents(dir.path()), before, "wallet v{}", i + 1);
-        assert_eq!(version(&dir.path().join("swaps.sqlite")), 1);
-        assert_eq!(version(&dir.path().join("wallet.sqlite")), i as i64 + 1);
-    }
-}
-
 /// A row's cells but its time, as text: amounts in sat.
 fn texts(row: &licash_dashboard::Row) -> Vec<String> {
     use licash_dashboard::Cell;
@@ -477,7 +431,7 @@ fn event(swaps: &Connection, at: i64, json: &str) {
     let kind: serde_json::Value = serde_json::from_str(json).unwrap();
     swaps
         .execute(
-            "INSERT INTO events (at, kind, json) VALUES (?1, ?2, ?3)",
+            "INSERT INTO provider_events (at, kind, json) VALUES (?1, ?2, ?3)",
             params![at, kind["kind"].as_str().unwrap(), json],
         )
         .unwrap();
@@ -615,18 +569,35 @@ fn recent_events_are_the_latest_only() {
 }
 
 #[test]
-fn files_of_newer_versions_or_none_are_not_read() {
+fn a_wallet_file_of_none_or_of_newer_components_is_not_read() {
     let dir = tempfile::tempdir().unwrap();
     let err = read(dir.path()).err().unwrap().to_string();
-    assert!(err.starts_with("no swaps file at"), "{err}");
+    assert!(err.starts_with("no wallet at"), "{err}");
     drop(provider(dir.path()));
-    let conn = Connection::open(dir.path().join("swaps.sqlite")).unwrap();
-    conn.pragma_update(None, "user_version", 6).unwrap();
+    let conn = Connection::open(dir.path().join("wallet.sqlite")).unwrap();
+    conn.execute(
+        "UPDATE schema_versions SET version = 2 WHERE component = 'provider'",
+        [],
+    )
+    .unwrap();
     let err = read(dir.path()).err().unwrap().to_string();
     assert!(
-        err.ends_with("is of version 6, newer than this provider reads"),
+        err.ends_with("holds the provider of version 2, newer than this provider reads"),
         "{err}"
     );
+    conn.execute(
+        "UPDATE schema_versions SET version = 1 WHERE component = 'provider'",
+        [],
+    )
+    .unwrap();
+    // A wallet that holds no provider has no swaps to show.
+    conn.execute(
+        "DELETE FROM schema_versions WHERE component = 'provider'",
+        [],
+    )
+    .unwrap();
+    let err = read(dir.path()).err().unwrap().to_string();
+    assert!(err.starts_with("no swaps in"), "{err}");
 }
 
 #[test]

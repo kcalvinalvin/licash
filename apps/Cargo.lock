@@ -3646,6 +3646,7 @@ dependencies = [
  "licash-lightning",
  "licash-nostr",
  "licash-notify",
+ "licash-store",
  "licash-swaps",
  "licash-tor",
  "licash-transport",

@@ -25,8 +25,8 @@ const STALE: i64 = 15 * 60;
 /// What is true of the provider now, beside its series.
 struct Now<'a> {
     stock: Vec<Stock<'a>>,
-    /// None if the wallet does not follow Bitcoin.
-    coins: Option<(i64, usize)>,
+    /// What the wallet's unspent coins on Bitcoin pay, and how many.
+    coins: (i64, usize),
     under_way: Vec<&'a Swap>,
 }
 
@@ -85,10 +85,7 @@ impl<'a> Now<'a> {
             .collect();
         Self {
             stock,
-            coins: r
-                .coins
-                .as_ref()
-                .map(|coins| (coins.iter().sum(), coins.len())),
+            coins: (r.coins.iter().sum(), r.coins.len()),
             under_way: r.swaps.iter().filter(|s| s.open()).collect(),
         }
     }
@@ -426,15 +423,13 @@ fn liquidity(state: &Now) -> Page {
         .iter()
         .filter(|s| s.state == "accepted")
         .count();
-    let on_chain = match state.coins {
-        Some((value, coins)) => now_card(
-            "On chain",
-            Some(value),
-            Unit::Sat,
-            format!("{coins} coins unspent"),
-        ),
-        None => now_card("On chain", None, Unit::Sat, "the wallet follows no chain"),
-    };
+    let (value, coins) = state.coins;
+    let on_chain = now_card(
+        "On chain",
+        Some(value),
+        Unit::Sat,
+        format!("{coins} coins unspent"),
+    );
     let (notes, unlinked) = (
         state.stock.iter().map(|s| s.notes).sum::<usize>(),
         state.stock.iter().map(|s| s.unlinked).sum::<usize>(),

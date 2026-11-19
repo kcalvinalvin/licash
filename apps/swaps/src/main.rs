@@ -37,8 +37,8 @@ use tracing_subscriber::EnvFilter;
     about = "Create, run and watch a Licash swap provider"
 )]
 struct Cli {
-    /// The provider's directory: its wallet `wallet.sqlite` and its swaps
-    /// `swaps.sqlite`.
+    /// The provider's directory: its wallet `wallet.sqlite`, which holds its
+    /// swaps too.
     #[arg(long, global = true, env = "LICASH_SWAPS_DATA", default_value = "data")]
     data: PathBuf,
     /// Log lines on stderr as text or JSON, filtered by RUST_LOG.
@@ -791,6 +791,8 @@ fn logging(format: Log) {
 
 fn command(cli: Cli) -> anyhow::Result<()> {
     let data = cli.data;
+    // Whatever the command: an earlier layout is never read, nor replaced.
+    refuse_legacy(&data)?;
     match cli.command {
         Command::Init { network } => init(&data, network, cli.log),
         Command::Run {
@@ -818,11 +820,11 @@ fn command(cli: Cli) -> anyhow::Result<()> {
             }
             let targets = notify.targets()?;
             // Before the Tor client creates its directory.
-            let swaps = data.join("swaps.sqlite");
+            let wallet = data.join("wallet.sqlite");
             anyhow::ensure!(
-                swaps.exists(),
+                wallet.exists(),
                 "{}: no provider, `init` creates one",
-                swaps.display()
+                wallet.display()
             );
             let runtime = tokio::runtime::Runtime::new()?;
             let _entered = runtime.enter();
@@ -978,23 +980,23 @@ fn init(data: &Path, network: ChainProfile, log: Log) -> anyhow::Result<()> {
     std::os::unix::fs::DirBuilderExt::mode(&mut dir, 0o700);
     dir.create(data)
         .with_context(|| format!("create {}", data.display()))?;
-    let (wallet, swaps) = (data.join("wallet.sqlite"), data.join("swaps.sqlite"));
+    let wallet = data.join("wallet.sqlite");
     anyhow::ensure!(
-        !swaps.exists(),
+        !wallet.exists(),
         "{} exists already: never replaced",
-        swaps.display()
+        wallet.display()
     );
     let mut seed = [0; 32];
     OsRng.fill_bytes(&mut seed);
     let wallet =
         Wallet::create(&wallet, &seed, network, Http::new(None)?).context("create the wallet")?;
     let address = hex::encode(wallet.address().to_bytes());
-    Provider::create(&swaps, wallet, Config::default()).context("create the swaps file")?;
+    Provider::create(wallet, Config::default()).context("create the provider")?;
     if matches!(log, Log::Json) {
         tracing::info!(data = %data.display(), %address, %network, "provider created: back up its wallet file");
     } else {
         eprintln!(
-            "Provider created. Back up wallet.sqlite and swaps.sqlite in {}.",
+            "Provider created. Back up wallet.sqlite in {}.",
             data.display()
         );
     }
@@ -1014,7 +1016,14 @@ fn address(data: &Path, chain: &ChainArgs) -> anyhow::Result<()> {
 
 fn open(data: &Path, transport: Http, config: Config) -> anyhow::Result<Provider<Http>> {
     let wallet = Wallet::open(&data.join("wallet.sqlite"), transport).context("open the wallet")?;
-    Provider::open(&data.join("swaps.sqlite"), wallet, config).context("open the swaps file")
+    Provider::open(wallet, config).context("open the swap provider")
+}
+
+/// The files an earlier layout kept beside the wallet's, which this version
+/// never reads: refused by name, and left for the operator to move away.
+fn refuse_legacy(data: &Path) -> anyhow::Result<()> {
+    licash_store::refuse_legacy(data, &["swaps.sqlite", "contracts.sqlite"], "wallet.sqlite")?;
+    Ok(())
 }
 
 // Each an explicit part of what it serves: no bundle would say more.
@@ -1460,8 +1469,7 @@ mod tests {
             Http::new(None).unwrap(),
         )
         .unwrap();
-        let swaps = dir.path().join("swaps.sqlite");
-        let provider = Arc::new(Provider::create(&swaps, wallet, Config::default()).unwrap());
+        let provider = Arc::new(Provider::create(wallet, Config::default()).unwrap());
         let chain = Some("http://user:password@127.0.0.1:1");
 
         let defaults = contracts(&[]);

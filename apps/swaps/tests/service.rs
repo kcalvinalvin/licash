@@ -41,7 +41,7 @@ fn router(dir: &tempfile::TempDir) -> (Router, Arc<Provider<Offline>>) {
         Offline,
     )
     .unwrap();
-    let provider = Provider::create(&dir.path().join("swaps.sqlite"), wallet, Config::default());
+    let provider = Provider::create(wallet, Config::default());
     let provider = Arc::new(provider.unwrap());
     let router = licash_swaps_service::router(provider.clone(), Some("ab".repeat(32)));
     (router, provider)
@@ -151,7 +151,7 @@ async fn a_provider_paying_over_lightning_says_so_and_takes_invoices_from_its_hu
         max: 100_000,
         slack: 80,
     };
-    let provider = Provider::create(&dir.path().join("swaps.sqlite"), wallet, Config::default())
+    let provider = Provider::create(wallet, Config::default())
         .unwrap()
         .pay_lightning(node.clone(), terms.clone())
         .unwrap();
@@ -192,6 +192,25 @@ fn licash_swaps(dir: &tempfile::TempDir, args: &[&str]) -> std::process::Output 
 }
 
 #[test]
+fn a_directory_of_an_earlier_layout_is_refused_by_name_and_left_as_it_is() {
+    let dir = tempfile::tempdir().unwrap();
+    let init = licash_swaps(&dir, &["init"]);
+    assert!(init.status.success(), "{init:?}");
+    let old = dir.path().join("data/swaps.sqlite");
+    std::fs::write(&old, b"an earlier provider's file").unwrap();
+    for args in [&["status"][..], &["init"], &["address"]] {
+        let out = licash_swaps(&dir, args);
+        assert!(!out.status.success(), "{args:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("earlier layout") && stderr.contains("swaps.sqlite"),
+            "{args:?}: {stderr}"
+        );
+    }
+    assert_eq!(std::fs::read(&old).unwrap(), b"an earlier provider's file");
+}
+
+#[test]
 fn init_creates_the_provider_once_and_status_reads_it() {
     let dir = tempfile::tempdir().unwrap();
     let init = licash_swaps(&dir, &["init"]);
@@ -199,7 +218,7 @@ fn init_creates_the_provider_once_and_status_reads_it() {
     let address = String::from_utf8(init.stdout).unwrap();
     let message = String::from_utf8_lossy(&init.stderr);
     assert!(
-        message.starts_with("Provider created. Back up wallet.sqlite and swaps.sqlite in "),
+        message.starts_with("Provider created. Back up wallet.sqlite in "),
         "{message}"
     );
     assert!(
@@ -370,14 +389,14 @@ fn lightning_payments_need_their_node_and_enough_slack() {
 
     // A payment under way, recorded by a provider with a node: refused
     // without one, before it serves.
-    let swaps = rusqlite::Connection::open(dir.path().join("data/swaps.sqlite")).unwrap();
+    let swaps = rusqlite::Connection::open(dir.path().join("data/wallet.sqlite")).unwrap();
     swaps
         .execute_batch(
-            "INSERT INTO swaps (id, hash, from_url, to_url, address, amount, fee, paid,
+            "INSERT INTO provider_swaps (id, hash, from_url, to_url, address, amount, fee, paid,
                 expiry_from, expiry, state, kind, created_at, updated_at)
-             VALUES (x'01', x'02', 'http://a.test', 'lightning:regtest', x'03', 1000, 7,
+             VALUES (x'01', zeroblob(32), 'http://a.test', 'lightning:regtest', x'03', 1000, 7,
                 1007, 300, 200, 'accepted', 'lightning', 0, 0);
-             INSERT INTO invoices (id, request, node) VALUES (x'01', 'lnbcrt', '02');",
+             INSERT INTO provider_invoices (id, request, node) VALUES (x'01', 'lnbcrt', x'02');",
         )
         .unwrap();
     drop(swaps);
@@ -468,7 +487,7 @@ async fn donations_over_lnurl_answer_as_lnurl_asks() {
     .unwrap();
     let code = a_code(&wallet);
     let node = Arc::new(Fake::new());
-    let provider = Provider::create(&dir.path().join("swaps.sqlite"), wallet, Config::default())
+    let provider = Provider::create(wallet, Config::default())
         .unwrap()
         .take_donations(
             node.clone(),
@@ -546,12 +565,12 @@ fn donations_need_a_node_and_the_lnurl_of_a_code_is_printed() {
 
     // A donation under way, recorded by a provider taking them: refused
     // without its node, before it serves.
-    let swaps = rusqlite::Connection::open(dir.path().join("data/swaps.sqlite")).unwrap();
+    let swaps = rusqlite::Connection::open(dir.path().join("data/wallet.sqlite")).unwrap();
     swaps
         .execute_batch(
-            "INSERT INTO donations (hash, preimage, code, sat, amount, request, state,
+            "INSERT INTO provider_donations (hash, preimage, code, sat, amount, request, state,
                 created_at, updated_at)
-             VALUES (x'01', x'02', 'licash1', 100, 98, 'lnbcrt', 'open', 0, 0);",
+             VALUES (zeroblob(32), zeroblob(32), 'licash1', 100, 98, 'lnbcrt', 'open', 0, 0);",
         )
         .unwrap();
     drop(swaps);

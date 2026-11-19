@@ -18,6 +18,7 @@ licash-dashboard.workspace = true
 licash-lightning.workspace = true
 licash-nostr = { workspace = true, features = ["tor", "wallet"] }
 licash-notify.workspace = true
+licash-store.workspace = true
 licash-swaps.workspace = true
 licash-tor.workspace = true
 licash-transport = { workspace = true, features = ["tor"] }

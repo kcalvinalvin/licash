@@ -176,8 +176,9 @@ fn the_providers_rows_hold_to_their_kinds_and_states() {
             [kind],
         )
     };
+    // A notice of a kind this version does not know is kept as it is.
     assert!(event("alert").is_ok());
-    assert!(event("gossip").is_err());
+    assert!(event("gossip").is_ok());
     // A payout's coin is recorded for a payout only, and a scan keeps a
     // hash of a block's length or none.
     let orphan = db.execute(

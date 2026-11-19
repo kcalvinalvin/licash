@@ -1,32 +1,25 @@
-//! The provider's dashboard (`licash-swaps dashboard`): what its swaps file
-//! and its wallet's recorded, read only, beside the running provider or
-//! without it, into a [`Report`] for its operator. History comes from the
-//! records themselves: the swaps, dated by when each was taken and when it
-//! ended, and the wallet's notes, by when each came and went. Nothing is
-//! written anywhere: files of older versions are read as they are, never
-//! migrated.
+//! The provider's dashboard (`licash-swaps dashboard`): what its swaps and
+//! its wallet recorded in the one file they share, read only, beside the
+//! running provider or without it, into a [`Report`] for its operator.
+//! History comes from the records themselves: the swaps, dated by when each
+//! was taken and when it ended, and the wallet's notes, by when each came
+//! and went. Everything is read in one transaction: what it shows is of one
+//! moment. Nothing is written anywhere.
 
 mod pages;
 #[cfg(test)]
 mod tests;
 
 use std::path::Path;
-use std::time::Duration;
 
-use anyhow::{bail, Context as _, Result};
+use anyhow::{bail, Result};
 use licash_dashboard::{Probe, Report, Series, Unit};
-use rusqlite::{Connection, OpenFlags};
+use licash_store::Kind;
+use rusqlite::Connection;
 
-/// The newest schemas read, as each file's `user_version`. Swaps versions
-/// 4 and 5 only add the invoices paid and the donations taken, which the
-/// dashboard does not read.
-const SWAPS_VERSION: i64 = 5;
-/// Versions 8 to 16 only add payment deliveries, the notes' unlink time,
-/// the providers paying invoices, payment keys, the recoveries claiming
-/// locks' refunds, the locks owed to the wallet, silent payouts, cold
-/// storage and the hubs' next deposit numbers, which the dashboard does not
-/// read.
-const WALLET_VERSION: i64 = 16;
+/// The versions of the components read: the wallet's and the provider's.
+const WALLET_VERSION: i64 = 1;
+const PROVIDER_VERSION: i64 = 1;
 
 /// Why a swap ended without paying, beside a reason recorded.
 const NEVER_CLAIMED: &str = "never claimed";
@@ -124,9 +117,8 @@ struct Records {
     events: Vec<Logged>,
     hubs: Vec<Hub>,
     notes: Vec<Note>,
-    /// What the wallet's unspent coins on Bitcoin pay: none before its
-    /// schema followed Bitcoin.
-    coins: Option<Vec<i64>>,
+    /// What the wallet's unspent coins on Bitcoin pay.
+    coins: Vec<i64>,
 }
 
 /// The provider's dashboard of its data directory `data` as of now, its
@@ -144,58 +136,45 @@ fn now() -> i64 {
         .unwrap_or_default()
 }
 
-/// The SQLite file at `path` read only, and its schema: none if there is
-/// none, or it is still empty. Never one newer than `newest`.
-fn read_only(path: &Path, newest: i64) -> Result<Option<(Connection, i64)>> {
-    if !path.is_file() {
-        return Ok(None);
-    }
-    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
-        .with_context(|| format!("open {}", path.display()))?;
-    conn.busy_timeout(Duration::from_secs(10))?;
-    conn.pragma_update(None, "query_only", true)?;
-    match conn.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))? {
-        0 => Ok(None),
-        v if v <= newest => Ok(Some((conn, v))),
-        v => bail!(
-            "{} is of version {v}, newer than this provider reads",
-            path.display()
-        ),
-    }
-}
-
+/// The wallet's file in `data` read only, in one transaction: none of it
+/// is written, and none is read newer than this provider reads.
 fn read(data: &Path) -> Result<Records> {
-    let path = data.join("swaps.sqlite");
-    let Some((swaps, version)) = read_only(&path, SWAPS_VERSION)? else {
-        bail!("no swaps file at {}: create it with init", path.display());
-    };
     let path = data.join("wallet.sqlite");
-    let Some((wallet, wallet_version)) = read_only(&path, WALLET_VERSION)? else {
+    let Some(db) = licash_store::inspect(&path, Kind::Wallet)? else {
         bail!("no wallet at {}: create it with init", path.display());
     };
-    // Each file read in one transaction: what it says is whole.
-    swaps.execute_batch("BEGIN")?;
-    wallet.execute_batch("BEGIN")?;
+    for (component, newest) in [("wallet", WALLET_VERSION), ("provider", PROVIDER_VERSION)] {
+        match licash_store::component_version(&db, component)? {
+            Some(v) if v <= newest => {}
+            Some(v) => bail!(
+                "{} holds the {component} of version {v}, newer than this provider reads",
+                path.display()
+            ),
+            None if component == "provider" => {
+                bail!("no swaps in {}: create them with init", path.display())
+            }
+            None => bail!("no wallet in {}: create it with init", path.display()),
+        }
+    }
+    db.execute_batch("BEGIN")?;
     Ok(Records {
-        created_at: swaps.query_row("SELECT created_at FROM meta", [], |r| r.get(0))?,
-        network: wallet.query_row("SELECT network FROM meta", [], |r| r.get(0))?,
-        swaps: read_swaps(&swaps, version)?,
-        alerts: read_alerts(&swaps)?,
-        events: read_events(&swaps, RECENT)?,
-        hubs: read_hubs(&wallet, wallet_version)?,
-        notes: read_notes(&wallet)?,
-        coins: read_coins(&wallet, wallet_version)?,
+        created_at: db.query_row("SELECT created_at FROM provider_meta", [], |r| r.get(0))?,
+        network: db.query_row("SELECT network FROM meta", [], |r| r.get(0))?,
+        swaps: read_swaps(&db)?,
+        alerts: read_alerts(&db)?,
+        events: read_events(&db, RECENT)?,
+        hubs: read_hubs(&db)?,
+        notes: read_notes(&db)?,
+        coins: read_coins(&db)?,
     })
 }
 
-fn read_swaps(c: &Connection, version: i64) -> Result<Vec<Swap>> {
-    // Version 1 swapped notes only.
-    let kind = if version >= 2 { "kind" } else { "'notes'" };
-    let mut stmt = c.prepare(&format!(
-        "SELECT {kind}, from_url, to_url, amount, fee, expiry_from, expiry, state, reason,
+fn read_swaps(c: &Connection) -> Result<Vec<Swap>> {
+    let mut stmt = c.prepare(
+        "SELECT kind, from_url, to_url, amount, fee, expiry_from, expiry, state, reason,
             created_at, updated_at, lower(hex(id))
-         FROM swaps ORDER BY created_at, rowid"
-    ))?;
+         FROM provider_swaps ORDER BY created_at, rowid",
+    )?;
     let rows = stmt.query_map([], |r| {
         Ok(Swap {
             chain: r.get::<_, String>(0)? == "chain",
@@ -218,7 +197,8 @@ fn read_swaps(c: &Connection, version: i64) -> Result<Vec<Swap>> {
 
 /// The latest `limit` notices the provider recorded, newest first.
 fn read_events(c: &Connection, limit: usize) -> Result<Vec<Logged>> {
-    let mut stmt = c.prepare("SELECT at, kind, json FROM events ORDER BY seq DESC LIMIT ?1")?;
+    let mut stmt =
+        c.prepare("SELECT at, kind, json FROM provider_events ORDER BY seq DESC LIMIT ?1")?;
     let rows = stmt.query_map([limit as i64], |r| {
         Ok(Logged {
             at: r.get(0)?,
@@ -230,7 +210,8 @@ fn read_events(c: &Connection, limit: usize) -> Result<Vec<Logged>> {
 }
 
 fn read_alerts(c: &Connection) -> Result<Vec<(i64, String)>> {
-    let mut stmt = c.prepare("SELECT at, json FROM events WHERE kind = 'alert' ORDER BY seq")?;
+    let mut stmt =
+        c.prepare("SELECT at, json FROM provider_events WHERE kind = 'alert' ORDER BY seq")?;
     let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get::<_, String>(1)?)))?;
     let mut alerts = Vec::new();
     for row in rows {
@@ -244,13 +225,11 @@ fn read_alerts(c: &Connection) -> Result<Vec<(i64, String)>> {
     Ok(alerts)
 }
 
-fn read_hubs(c: &Connection, version: i64) -> Result<Vec<Hub>> {
-    // Every hub of a file before version 6 was added.
-    let trusted = if version >= 6 { "h.trusted" } else { "1" };
-    let mut stmt = c.prepare(&format!(
-        "SELECT h.id, r.url, h.info, h.updated_at, {trusted}
-         FROM hubs h JOIN reach r ON r.hub = h.id ORDER BY r.url"
-    ))?;
+fn read_hubs(c: &Connection) -> Result<Vec<Hub>> {
+    let mut stmt = c.prepare(
+        "SELECT h.id, r.url, h.info, h.updated_at, h.trusted
+         FROM hubs h JOIN reach r ON r.hub = h.id ORDER BY r.url",
+    )?;
     let rows = stmt.query_map([], |r| {
         Ok(Hub {
             id: r.get(0)?,
@@ -270,8 +249,8 @@ fn read_notes(c: &Connection) -> Result<Vec<Note>> {
         "SELECT k.hub, n.denom, n.added_at, coalesce(s.created_at, l.created_at, n.gone_at),
             n.unlinked = 1
          FROM notes n JOIN keysets k ON k.id = n.keyset
-         LEFT JOIN sends s ON s.id = n.spent_by
-         LEFT JOIN locks l ON l.id = n.spent_by
+         LEFT JOIN sends s ON s.id = n.spent_by AND n.spent_kind = 'send'
+         LEFT JOIN locks l ON l.id = n.spent_by AND n.spent_kind = 'lock'
          ORDER BY n.added_at, n.rowid",
     )?;
     let rows = stmt.query_map([], |r| {
@@ -286,14 +265,11 @@ fn read_notes(c: &Connection) -> Result<Vec<Note>> {
     Ok(rows.collect::<Result<_, _>>()?)
 }
 
-fn read_coins(c: &Connection, version: i64) -> Result<Option<Vec<i64>>> {
-    if version < 2 {
-        return Ok(None);
-    }
+fn read_coins(c: &Connection) -> Result<Vec<i64>> {
     let mut stmt =
         c.prepare("SELECT value FROM silent_coins WHERE spent_by IS NULL AND spent_at IS NULL")?;
     let rows = stmt.query_map([], |r| r.get(0))?;
-    Ok(Some(rows.collect::<Result<_, _>>()?))
+    Ok(rows.collect::<Result<_, _>>()?)
 }
 
 /// A hub's URL as a label: its host, an onion's shortened.

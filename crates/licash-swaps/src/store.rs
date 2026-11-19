@@ -71,11 +71,12 @@ CREATE TABLE provider_swaps (
 ) STRICT;
 CREATE INDEX provider_swaps_state ON provider_swaps (state);
 
--- What the operator is told of, in order.
+-- What the operator is told of, in order. `kind` is the notice's, free: a
+-- notice of a kind this version does not know is read as stored.
 CREATE TABLE provider_events (
     seq INTEGER PRIMARY KEY AUTOINCREMENT,
     at INTEGER NOT NULL,
-    kind TEXT NOT NULL CHECK (kind IN ('accepted', 'done', 'refunded', 'failed', 'lost', 'alert')),
+    kind TEXT NOT NULL,
     json TEXT NOT NULL
 ) STRICT;
 
