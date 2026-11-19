@@ -101,11 +101,20 @@ pub struct Recovery {
     pub corrected: Option<u64>,
     #[uniffi(default = None)]
     pub received: Option<u64>,
+    /// The last fold of a close on her claim the hub signed, its id in
+    /// hex, once it did ([`RecoveryStage::Folding`]).
+    #[uniffi(default = None)]
+    pub fold: Option<String>,
 }
 
-/// Where a forced close stands.
+/// Where a forced close, or a close on a fold of her claim, stands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum RecoveryStage {
+    /// Closed with the hub, cooperatively: her claim's notes are out of her
+    /// balance, and its fold, which pays them and her reserve on Bitcoin,
+    /// awaited. The claim is filed on Bitcoin by a forced close, by itself
+    /// should the fold be late; any fold signed may still confirm.
+    Folding,
     /// The notes claimed: it may still be given up, until its request may
     /// be in the next block.
     Claimed,
@@ -149,6 +158,7 @@ fn stage(s: Stage) -> RecoveryStage {
         Stage::Challenged => RecoveryStage::Challenged,
         Stage::Paid => RecoveryStage::Paid,
         Stage::Lost => RecoveryStage::Lost,
+        Stage::Folding => RecoveryStage::Folding,
     }
 }
 
@@ -173,6 +183,7 @@ fn shown(r: &recovery::Recovery) -> Recovery {
         payout: txid(r.payout),
         corrected: r.corrected,
         received: r.received,
+        fold: txid(r.fold),
     }
 }
 
@@ -230,10 +241,15 @@ impl Wallet {
         Ok(short.map(|a| a.to_sat()))
     }
 
-    /// Close contract `id` (in hex) early with its hub, cooperatively:
-    /// her reserve back to the wallet on Bitcoin at once, the protection
-    /// over. The fold's txid. Refused for a contract not protecting yet,
-    /// forced closed, or past its close, when its reserve comes back anyway.
+    /// Close contract `id` (in hex) early with its hub, cooperatively, and
+    /// claim what her notes there come to, up to its cap: they leave her
+    /// balance and come to the wallet on Bitcoin with her reserve in the
+    /// fold the hub signs, the protection over. The fold's txid; its
+    /// recovery follows it ([`RecoveryStage::Folding`]), and files her claim
+    /// on Bitcoin should the hub not fold. Refused for a contract not
+    /// protecting yet, forced closed, or past its close, when its reserve
+    /// comes back anyway; and for one too near its end to leave time for
+    /// that, or whose lock owed to her only a forced close claims.
     pub fn close_contract(
         &self,
         chain: Arc<dyn ChainSource>,
@@ -304,6 +320,7 @@ mod tests {
             (Stage::Challenged, RecoveryStage::Challenged),
             (Stage::Paid, RecoveryStage::Paid),
             (Stage::TimedOut, RecoveryStage::TimingOut),
+            (Stage::Folding, RecoveryStage::Folding),
         ];
         for (s, shown) in cases {
             assert_eq!(stage(s), shown, "{}", s.as_str());
