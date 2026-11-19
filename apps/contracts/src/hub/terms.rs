@@ -477,16 +477,16 @@ mod tests {
             (
                 None,
                 [
-                    "494eda9365c2f6d04b169e06bf699d78e981558614287109b22f6a5214267812",
-                    "7c34257f9e2d1e280fb964b9010c576c6e95126fc09c4f40c45137ef60fb3d60",
+                    "9d002d75d0586724692f78c10f0b33bea02e659abfd358d25192ccd3c0808379",
+                    "59e452a0dd8380cd7e63777bba55291e0a55b3b286cff43580d09fb3e89cc46d",
                 ],
                 3_000,
             ),
             (
                 Some(RANGE),
                 [
-                    "49e1652d15b0603546f1484597b77d1c9a7ec0a72304a3f809906172caf66b7d",
-                    "74f1c960a38e1bdef3e9089b5261609c3e0279fb711a255d9b7087b31fa9dc69",
+                    "74f95a5960386363248963bc9db88b57125777c3c04683fd18e401387a8b5a03",
+                    "abfa0b5917d0e307914309daa82f0ef05f4e68818412a61c6bd309832db02f5a",
                 ],
                 3_024,
             ),
@@ -506,6 +506,27 @@ mod tests {
             let (signet, bounds) = quoted(ChainProfile::Core30Signet);
             assert_eq!(signet, signet_digest);
             assert_eq!((bounds.lock, bounds.response_window), (1_000, 12));
+        }
+    }
+
+    /// A graph of the compact filing is quoted where the program trusted
+    /// decides it, and only there: under one that doesn't, her claim would
+    /// be owed nothing.
+    #[test]
+    fn a_hub_quotes_the_compact_filing_only_under_a_program_that_decodes_it() {
+        let parts = Hub::peek(funded()).unwrap().base.parts().clone();
+        for profile in [
+            ChainProfile::Core30DefaultRegtest,
+            ChainProfile::Core30Signet,
+        ] {
+            let trust = crate::trust(profile).unwrap();
+            let timing = Timing::of(profile, None).unwrap();
+            let quote = timing.quote(parts.keyset.clone(), parts.chain.checkpoint.clone());
+            let compact = quote.graph.id >= COMPACT_FROM;
+            assert_eq!(compact, trust.compact, "{profile}");
+            // No program that decodes only the legacy filing is the one
+            // contracts open under.
+            assert!(!crate::programs_before(profile).contains(&trust.program));
         }
     }
 

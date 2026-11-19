@@ -484,8 +484,12 @@ and responds to no claim of a contract whose program it lacks (alerting
 the operator).
 On an RTX 2060 a proof takes about 20 minutes (the Groth16 wrap about 3 of
 them, on the CPU) plus about 7 minutes for each 1,000 headers since the
-contract's checkpoint: one of signet's most, 26,280 headers (half a year),
-about 3.3 hours, so a hub proves only two such in an assert window. On a CPU alone
+contract's checkpoint for contracts of the programs before the compact
+filing's (graph id 8 and below): one of signet's most, 26,280 headers
+(half a year), about 3.3 hours, so a hub proves only two such in an assert
+window. The newest program takes a third of the cycles of a header (9.4 k,
+measured with `hp-exec`), so about 2.5 minutes for each 1,000 headers,
+projected by cycles and not yet measured on a GPU. On a CPU alone
 a proof takes hours, too slow for signet's window but for the smallest
 contracts. Give it 10 GB of memory or more. ARM images have no
 prover: their hubs respond to no contested claim on signet.
