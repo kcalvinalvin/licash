@@ -63,6 +63,7 @@ import org.licash.wallet.storage
 private enum class Page(val title: String) {
     Hubs("Hubs"),
     Backup("Backup"),
+    Cold("Cold storage"),
     Bitcoin("Bitcoin"),
     Tor("Tor"),
     About("About"),
@@ -98,6 +99,7 @@ fun Settings(engine: Engine, ui: Ui, balance: () -> Unit, back: () -> Unit) {
                 when (p) {
                     Page.Hubs -> HubsPage(engine, ui)
                     Page.Backup -> BackupPage(engine, ui)
+                    Page.Cold -> ColdPage(engine, ui)
                     Page.Bitcoin -> BitcoinPage(engine, ui)
                     Page.Tor -> TorPage(engine, ui)
                     Page.About -> About(ui)
@@ -119,6 +121,18 @@ private fun Overview(engine: Engine, ui: Ui, open: (Page) -> Unit) {
         if (ui.wallet) {
             Divider()
             Entry("Backup", icon = Glyphs.key, tag = "backup") { open(Page.Backup) }
+        }
+        // An advanced feature: shown in advanced mode, or once set up.
+        val cold = ui.cold
+        if (ui.wallet && (ui.developer || cold != null)) {
+            Divider()
+            Entry(
+                "Cold storage",
+                value = cold?.let { org.licash.wallet.sat(it.balance) } ?: "Off",
+                sub = cold?.let { "Withdraws past ${org.licash.wallet.sat(it.threshold)}" },
+                icon = Icons.Filled.Lock,
+                tag = "cold",
+            ) { open(Page.Cold) }
         }
     }
     Group("") {

@@ -852,6 +852,42 @@ fn a_phone_looks_for_payments_from_its_birthday_or_all_the_hub_indexed() {
     assert_eq!(light.fetched(), [next]);
 }
 
+/// Cold storage of a tpub's taproot addresses: what its first address is
+/// paid is found from its birthday, the next withdrawal going to another;
+/// nothing withdrawn with no notes held.
+#[test]
+fn a_phone_counts_what_cold_storage_holds_and_withdraws_to_a_new_address() {
+    use bitcoin::bip32::{Xpriv, Xpub};
+    let net = Net::new(true);
+    let light = Light::new(&net);
+    let alice = net.wallet("alice", net.height());
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    let master = Xpriv::new_master(bitcoin::NetworkKind::Test, &[0xc0; 32]).unwrap();
+    let tpub = Xpub::from_priv(&secp, &master).to_string();
+    assert_eq!(alice.cold().unwrap(), None);
+    assert!(
+        invalid(alice.set_cold(tpub.clone(), None, 50_000, 0, 1.0, None)).contains("wpkh or tr")
+    );
+    let birthday = net.height();
+    let cold = alice
+        .set_cold(tpub, Some("tr".into()), 50_000, 0, 1.0, Some(birthday))
+        .unwrap();
+    assert!(cold.next.starts_with("bcrt1p"), "{}", cold.next);
+    let payment = net.pay_plain(&cold.next, 4_000, 1);
+    net.mine(1, vec![payment]);
+    let looked = alice.run_cold(light.clone()).unwrap().unwrap();
+    assert_eq!(
+        (looked.balance, looked.coins, &looked.pending),
+        (4_000, 1, &None)
+    );
+    assert_eq!(looked.scanned, Some(net.height()));
+    assert_ne!(looked.next, cold.next);
+    assert_eq!(alice.cold().unwrap(), Some(looked));
+    alice.clear_cold().unwrap();
+    assert_eq!(alice.cold().unwrap(), None);
+    assert_eq!(alice.run_cold(light).unwrap(), None);
+}
+
 #[test]
 fn a_phone_paid_at_its_fallback_address_finds_it_and_shows_the_next() {
     let net = Net::new(true);

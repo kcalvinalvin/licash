@@ -34,8 +34,19 @@ why it seems stuck, and a confirmed reset forgetting only its state and
 directory cache), About (the
 version, the storage used and the logs to export) and advanced mode, whose
 own page holds the notes, the log, the limit for renewing notes, the light
-client's settings, resetting its chain state and deleting the wallet. How
-the app looks and speaks, and the shared parts to build a screen of, are in
+client's settings, resetting its chain state and deleting the wallet.
+
+Cold storage, in advanced mode (or once set up), is a page of its own in
+Settings: the extended public key of an external wallet's account (a zpub,
+or an xpub with native segwit or taproot addresses chosen), a threshold,
+an amount kept and a fee limit in percent, and an optional wallet birthday
+(by default the chain's height then). On each sync, once the notes exceed
+the threshold, all but what is kept is paid out from the hub holding the
+most, through the provider preferred within the fee limit, to an address
+of the key never used before, one withdrawal at a time; the page shows
+what the key's addresses hold from the birthday (found with block filters),
+the next address, and how to bring funds back: send them to a Bitcoin
+address shown in Receive. How the app looks and speaks, and the shared parts to build a screen of, are in
 [../../DESIGN.md](../../DESIGN.md).
 
 ## Backup and restore

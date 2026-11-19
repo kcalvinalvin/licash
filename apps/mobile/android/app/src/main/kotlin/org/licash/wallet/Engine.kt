@@ -57,6 +57,7 @@ import org.licash.core.PayQuote
 import org.licash.core.PayoutQuote
 import org.licash.core.HubsFound
 import org.licash.core.PayOffer
+import org.licash.core.ColdStorage
 import org.licash.core.Scan
 import org.licash.core.Scanned
 import org.licash.core.State
@@ -113,6 +114,8 @@ data class Ui(
     val asked: Long? = null,
     /** Payments made still on their way to their payees: kept at their hubs, or to mail. */
     val onTheirWay: UInt = 0u,
+    /** Cold storage, if configured: notes withdrawn to an external wallet. */
+    val cold: ColdStorage? = null,
 )
 
 /** A line of the history's own key: lines of different kinds can share an id. */
@@ -504,6 +507,12 @@ class Engine(context: Context) {
                 failed("paying out on Bitcoin", e)
             }
             resumeContracts(chain)
+            // Its balance looked for, and a withdrawal made if due.
+            try {
+                locked { it.runCold(chain) }
+            } catch (e: LicashException) {
+                AppLog.info("cold storage deferred: ${explain(e)}")
+            }
         }
         if (hubs.any { it.mailbox }) {
             try {
@@ -739,9 +748,12 @@ class Engine(context: Context) {
                 val onTheirWay = runCatching { it.onTheirWay() }
                     .onFailure { e -> AppLog.warn("reading the payments on their way", e) }
                     .getOrDefault(state.value.onTheirWay)
+                val cold = runCatching { it.cold() }
+                    .onFailure { e -> AppLog.warn("reading cold storage", e) }
+                    .getOrDefault(state.value.cold)
                 Shown(
                     it.network(), it.balance(), history, it.hubs(), raised, it.tor(), contracts, recoveries, under,
-                    noteMaintenance, onTheirWay,
+                    noteMaintenance, onTheirWay, cold,
                 )
             }
         }.onFailure { AppLog.warn("reading the wallet", it) }.getOrNull()
@@ -770,6 +782,7 @@ class Engine(context: Context) {
                     noteMaintenance = shown.noteMaintenance,
                     asked = prefs.askedAt,
                     onTheirWay = shown.onTheirWay,
+                    cold = shown.cold,
                 )
             }
         }
@@ -832,6 +845,7 @@ class Engine(context: Context) {
         val under: Map<String, Details>,
         val noteMaintenance: Boolean,
         val onTheirWay: UInt,
+        val cold: ColdStorage?,
     )
 
     /** A new wallet of the network chosen, born at the chain's height if known. */
@@ -1411,6 +1425,34 @@ class Engine(context: Context) {
         AppLog.info("consented to exit contracts ending, margin $margin blocks")
         poke()
         given
+    }
+
+    /**
+     * Withdraw to cold storage, the wallet of `key` (a zpub, or an xpub of
+     * `script` "wpkh" or "tr"), as the rules say, its coins looked for
+     * from `birthday`, by default the chain's height now: looked for and
+     * withdrawn to on the next round.
+     */
+    suspend fun setCold(
+        key: String,
+        script: String?,
+        threshold: ULong,
+        keep: ULong,
+        maxFeePercent: Double,
+        birthday: UInt?,
+    ): Result<ColdStorage> = io {
+        val cold = locked { it.setCold(key, script, threshold, keep, maxFeePercent, birthday) }
+        AppLog.info("cold storage set: past $threshold sat, keeping $keep, at most $maxFeePercent% in fees")
+        state.update { it.copy(cold = cold) }
+        poke()
+        cold
+    }
+
+    /** Stop withdrawing to cold storage: what it holds stays there. */
+    suspend fun clearCold(): Result<Unit> = io {
+        locked { it.clearCold() }
+        AppLog.info("cold storage cleared")
+        state.update { it.copy(cold = null) }
     }
 
     /** Revoke her consent to exit: no step more taken. */

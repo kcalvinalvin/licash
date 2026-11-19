@@ -34,6 +34,7 @@ const SCAN_BATCH: u32 = 144;
 const DAY: i64 = 86_400;
 
 mod backup;
+mod cold;
 mod contacts;
 mod contracts;
 mod donations;
