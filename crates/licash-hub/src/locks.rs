@@ -231,7 +231,7 @@ impl Hub {
                     .prepare(
                         "SELECT l.id, l.settled IS 'refund' FROM locks l
                          JOIN checkpoints c ON c.commitment = l.checkpoint
-                         WHERE l.hash = ?1 AND c.height < ?2 AND ?2 < l.expiry
+                         WHERE l.hash = ?1 AND c.height < ?2 AND ?2 < l.expiry_height
                            AND l.settled IS NOT 'pay'
                            AND NOT EXISTS (SELECT 1 FROM forwards f
                                            WHERE f.lock = l.id AND f.state = 'failed')",
@@ -661,7 +661,7 @@ impl Hub {
     pub fn live_own_locks(&self) -> Result<Vec<Lock>, Error> {
         self.store.read(|c| {
             let mut stmt = c.prepare(
-                "SELECT id FROM locks WHERE own = 1 AND settled IS NULL ORDER BY expiry, id",
+                "SELECT id FROM locks WHERE own = 1 AND settled IS NULL ORDER BY expiry_height, id",
             )?;
             let ids = stmt.query_map([], |r| r.get::<_, [u8; 32]>(0))?;
             let ids: Vec<[u8; 32]> = ids.collect::<Result<_, _>>()?;
@@ -798,7 +798,7 @@ impl Hub {
             )
             .optional()?;
         tx.execute(
-            "INSERT INTO locks (id, hash, checkpoint, expiry, depth, decide_by, proposal, signed,
+            "INSERT INTO locks (id, hash, checkpoint, expiry_height, depth, decide_by_height, proposal, signed,
                                 certificate, amount, own, preimage)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![

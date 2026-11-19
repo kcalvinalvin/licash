@@ -393,7 +393,7 @@ fn lightning_payments_need_their_node_and_enough_slack() {
     swaps
         .execute_batch(
             "INSERT INTO provider_swaps (id, hash, from_url, to_url, address, amount, fee, paid,
-                expiry_from, expiry, state, kind, created_at, updated_at)
+                expiry_from_height, expiry_height, state, kind, created_at, updated_at)
              VALUES (x'01', zeroblob(32), 'http://a.test', 'lightning:regtest', x'03', 1000, 7,
                 1007, 300, 200, 'accepted', 'lightning', 0, 0);
              INSERT INTO provider_invoices (id, request, node) VALUES (x'01', 'lnbcrt', x'02');",

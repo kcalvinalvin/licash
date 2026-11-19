@@ -171,7 +171,7 @@ fn read(data: &Path) -> Result<Records> {
 
 fn read_swaps(c: &Connection) -> Result<Vec<Swap>> {
     let mut stmt = c.prepare(
-        "SELECT kind, from_url, to_url, amount, fee, expiry_from, expiry, state, reason,
+        "SELECT kind, from_url, to_url, amount, fee, expiry_from_height, expiry_height, state, reason,
             created_at, updated_at, lower(hex(id))
          FROM provider_swaps ORDER BY created_at, rowid",
     )?;
@@ -266,8 +266,9 @@ fn read_notes(c: &Connection) -> Result<Vec<Note>> {
 }
 
 fn read_coins(c: &Connection) -> Result<Vec<i64>> {
-    let mut stmt =
-        c.prepare("SELECT value FROM silent_coins WHERE spent_by IS NULL AND spent_at IS NULL")?;
+    let mut stmt = c.prepare(
+        "SELECT value FROM silent_coins WHERE spent_by IS NULL AND spent_height IS NULL",
+    )?;
     let rows = stmt.query_map([], |r| r.get(0))?;
     Ok(rows.collect::<Result<_, _>>()?)
 }

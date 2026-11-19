@@ -404,8 +404,8 @@ impl Row {
 
 const LAST_EVENT: &str = "SELECT coalesce(max(seq), 0) FROM provider_events";
 
-const ROWS: &str = "SELECT id, hash, from_url, to_url, address, amount, fee, paid, expiry,
-    lock, preimage, state, reason, created_at, updated_at, kind = 'chain', expiry_from,
+const ROWS: &str = "SELECT id, hash, from_url, to_url, address, amount, fee, paid, expiry_height,
+    lock, preimage, state, reason, created_at, updated_at, kind = 'chain', expiry_from_height,
     kind = 'own', kind = 'lightning'
     FROM provider_swaps";
 
@@ -1179,7 +1179,7 @@ impl<T: Transport> Provider<T> {
             let at = now();
             let inserted = tx.execute(
                 "INSERT INTO provider_swaps (id, hash, from_url, to_url, address, amount, fee, paid,
-                    expiry_from, expiry, state, created_at, updated_at, kind)
+                    expiry_from_height, expiry_height, state, created_at, updated_at, kind)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'accepted', ?11, ?11, ?12)
                  ON CONFLICT DO NOTHING",
                 params![

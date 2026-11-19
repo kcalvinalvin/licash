@@ -356,7 +356,7 @@ impl<T: Transport> Provider<T> {
             let at = now();
             let inserted = tx.execute(
                 "INSERT INTO provider_swaps (id, hash, from_url, to_url, address, amount, fee, paid,
-                    expiry_from, expiry, state, kind, created_at, updated_at)
+                    expiry_from_height, expiry_height, state, kind, created_at, updated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'accepted', 'lightning', ?11, ?11)
                  ON CONFLICT DO NOTHING",
                 params![

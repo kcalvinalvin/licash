@@ -1516,7 +1516,7 @@ fn the_ledger_is_a_component_of_a_hub_file_and_its_rows_hold_to_their_states() {
     let lock = |own: i64, amount: i64, preimage: &str, settled: &str, at: &str| {
         db.execute(
             &format!(
-                "INSERT INTO locks (id, hash, checkpoint, expiry, depth, decide_by, proposal,
+                "INSERT INTO locks (id, hash, checkpoint, expiry_height, depth, decide_by_height, proposal,
                     signed, certificate, amount, own, preimage, settled, settled_at)
                  VALUES (randomblob(32), randomblob(32), x'00', 1, 1, 1, x'00', x'00', x'00',
                     {amount}, {own}, {preimage}, {settled}, {at})"

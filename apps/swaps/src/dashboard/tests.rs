@@ -207,7 +207,7 @@ fn swap(
     swaps
         .execute(
             "INSERT INTO provider_swaps (id, hash, from_url, to_url, address, amount, fee, paid,
-                expiry_from, expiry, state, reason, created_at, updated_at, kind)
+                expiry_from_height, expiry_height, state, reason, created_at, updated_at, kind)
              VALUES (?1, ?2, ?3, ?4, X'02', ?5, ?6, ?5 + ?6, ?7, 1100, ?8, ?9, ?10, ?11, ?12)",
             params![
                 vec![n; 32],

@@ -168,7 +168,7 @@ impl PreparedLock {
     pub(crate) fn record(&self, tx: &rusqlite::Transaction<'_>) -> Result<(), Error> {
         tx.execute(
             "INSERT INTO locks
-                (id, hub, payee, hash, expiry, amount, fee, request, invoice, created_at)
+                (id, hub, payee, hash, expiry_height, amount, fee, request, invoice, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 self.id.as_bytes(),
@@ -857,7 +857,7 @@ impl<T: Transport> Wallet<T> {
         self.store.write(|t| {
             t.execute(
                 "INSERT INTO owed_locks (id, hub, keyset, proposal, certificate, signatures,
-                    preimage, expiry, depth, anchor, created_at)
+                    preimage, expiry_height, depth, anchor, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) ON CONFLICT DO NOTHING",
                 rusqlite::params![
                     proposal.id().as_bytes(),
@@ -914,7 +914,7 @@ impl<T: Transport> Wallet<T> {
     }
 }
 
-const LOCKS: &str = "SELECT l.id, r.url, l.payee, l.hash, l.amount, l.fee, l.expiry,
+const LOCKS: &str = "SELECT l.id, r.url, l.payee, l.hash, l.amount, l.fee, l.expiry_height,
     l.certificate IS NOT NULL, s.branch, s.preimage, s.id IS NOT NULL, l.abandoned,
     l.created_at, l.invoice, l.failure, v.provider, v.invoice,
     (SELECT SUM(n.denom) FROM notes n WHERE n.spent_by = l.id),

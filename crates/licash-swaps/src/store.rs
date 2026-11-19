@@ -37,7 +37,7 @@ CREATE TABLE provider_meta (
 ) STRICT;
 
 -- Swaps by the client's lock at `from_url`, which pays the provider `paid`
--- under `hash` until `expiry_from`: recorded before the provider's lock of
+-- under `hash` until `expiry_from_height`: recorded before the provider's lock of
 -- `amount` to the client's `address` at `to_url` is made, then that lock,
 -- then the preimage the client revealed claiming it. `state` is accepted,
 -- locked, paid, done, refunded, failed or lost (paid at `to_url` but not
@@ -48,11 +48,11 @@ CREATE TABLE provider_meta (
 -- notes it issues itself (`licash_hub::Hub::lock_own`) rather than notes
 -- its wallet holds there (it has an `issues` row); `chain`, a payout: its
 -- `to_url` is `bitcoin:<network>`, `address` the output script of the
--- provider's coin, `amount` its value and `expiry` its timeout, a block
+-- provider's coin, `amount` its value and `expiry_height` its timeout, a block
 -- height (it has a `payouts` row); or `lightning`, an invoice paid from the
 -- provider's node: its `to_url` is `lightning:<network>`, `address` the
 -- invoice's payee, a public key, `amount` the invoice's satoshis, rounded
--- up, and `expiry` the height its routes' timelock ends by at the latest
+-- up, and `expiry_height` the height its routes' timelock ends by at the latest
 -- (it has an `invoices` row).
 CREATE TABLE provider_swaps (
     id BLOB PRIMARY KEY,
@@ -63,8 +63,8 @@ CREATE TABLE provider_swaps (
     amount INTEGER NOT NULL CHECK (amount >= 0),
     fee INTEGER NOT NULL CHECK (fee >= 0),
     paid INTEGER NOT NULL CHECK (paid >= 0),
-    expiry_from INTEGER NOT NULL,
-    expiry INTEGER NOT NULL,
+    expiry_from_height INTEGER NOT NULL,
+    expiry_height INTEGER NOT NULL,
     lock BLOB,
     preimage BLOB CHECK (preimage IS NULL OR length(preimage) = 32),
     state TEXT NOT NULL

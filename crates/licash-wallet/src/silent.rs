@@ -197,7 +197,7 @@ fn raced() -> Error {
 /// `next`.
 fn rewind(t: &Sql<'_>, next: u32, from: u32) -> Result<bool, Error> {
     if t.execute(
-        "UPDATE silent_scan SET next = ?2 WHERE next = ?1",
+        "UPDATE silent_scan SET next_height = ?2 WHERE next_height = ?1",
         [next, from],
     )? == 0
     {
@@ -205,7 +205,7 @@ fn rewind(t: &Sql<'_>, next: u32, from: u32) -> Result<bool, Error> {
     }
     t.execute("DELETE FROM silent_coins WHERE height >= ?1", [from])?;
     let unspent: Vec<OutPoint> = {
-        let mut stmt = t.prepare("SELECT txid, vout FROM silent_coins WHERE spent_at >= ?1")?;
+        let mut stmt = t.prepare("SELECT txid, vout FROM silent_coins WHERE spent_height >= ?1")?;
         let rows = stmt.query_map([from], |r| {
             Ok(OutPoint::new(Txid::from_byte_array(r.get(0)?), r.get(1)?))
         })?;
@@ -214,7 +214,7 @@ fn rewind(t: &Sql<'_>, next: u32, from: u32) -> Result<bool, Error> {
     let pending = pending_inputs(t)?;
     for outpoint in unspent {
         t.execute(
-            "UPDATE silent_coins SET spent_at = NULL, spent_by = ?3
+            "UPDATE silent_coins SET spent_height = NULL, spent_by = ?3
              WHERE txid = ?1 AND vout = ?2",
             params![
                 outpoint.txid.to_byte_array(),
@@ -225,7 +225,7 @@ fn rewind(t: &Sql<'_>, next: u32, from: u32) -> Result<bool, Error> {
     }
     t.execute("DELETE FROM silent_blocks WHERE height >= ?1", [from])?;
     t.execute(
-        "UPDATE silent_scan SET untweaked = NULL WHERE untweaked >= ?1",
+        "UPDATE silent_scan SET untweaked_height = NULL WHERE untweaked_height >= ?1",
         [from],
     )?;
     Ok(true)
@@ -235,7 +235,7 @@ fn rewind(t: &Sql<'_>, next: u32, from: u32) -> Result<bool, Error> {
 /// no block spends: how many.
 fn give_up(t: &Sql<'_>, txid: &Txid) -> Result<usize, Error> {
     let freed = t.execute(
-        "UPDATE silent_coins SET spent_by = NULL WHERE spent_by = ?1 AND spent_at IS NULL",
+        "UPDATE silent_coins SET spent_by = NULL WHERE spent_by = ?1 AND spent_height IS NULL",
         [txid.to_byte_array()],
     )?;
     let known = t.execute(
@@ -331,11 +331,14 @@ impl<T: Transport> Wallet<T> {
         }
         self.store.write(|t| {
             let next: Option<u32> = t
-                .query_row("SELECT next FROM silent_scan", [], |r| r.get(0))
+                .query_row("SELECT next_height FROM silent_scan", [], |r| r.get(0))
                 .optional()?;
             match next {
                 None => {
-                    t.execute("INSERT INTO silent_scan (one, next) VALUES (1, ?1)", [from])?;
+                    t.execute(
+                        "INSERT INTO silent_scan (one, next_height) VALUES (1, ?1)",
+                        [from],
+                    )?;
                 }
                 Some(next) if from < next => {
                     rewind(t, next, from)?;
@@ -360,7 +363,7 @@ impl<T: Transport> Wallet<T> {
     pub fn silent_next(&self) -> Result<Option<u32>, Error> {
         self.store.read(|c| {
             Ok(
-                c.query_row("SELECT next FROM silent_scan", [], |r| r.get(0))
+                c.query_row("SELECT next_height FROM silent_scan", [], |r| r.get(0))
                     .optional()?,
             )
         })
@@ -489,7 +492,7 @@ impl<T: Transport> Wallet<T> {
         }
         let from = self.store.write(|t| {
             let untweaked: Option<u32> =
-                t.query_row("SELECT untweaked FROM silent_scan", [], |r| r.get(0))?;
+                t.query_row("SELECT untweaked_height FROM silent_scan", [], |r| r.get(0))?;
             let Some(from) = untweaked.map(|u| u.max(first)) else {
                 return Ok(next);
             };
@@ -497,7 +500,7 @@ impl<T: Transport> Wallet<T> {
                 return Err(raced());
             }
             let cleared = t.execute(
-                "UPDATE silent_scan SET untweaked = NULL WHERE next = ?1",
+                "UPDATE silent_scan SET untweaked_height = NULL WHERE next_height = ?1",
                 [from.min(next)],
             )?;
             if cleared == 0 {
@@ -635,7 +638,7 @@ impl<T: Transport> Wallet<T> {
     /// height `height`, held: the next block to look in.
     async fn unwind(&self, chain: &impl Blocks, height: u32) -> Result<u32, Error> {
         let (next, kept) = self.store.read(|c| {
-            let next: u32 = c.query_row("SELECT next FROM silent_scan", [], |r| r.get(0))?;
+            let next: u32 = c.query_row("SELECT next_height FROM silent_scan", [], |r| r.get(0))?;
             let mut stmt =
                 c.prepare("SELECT height, hash FROM silent_blocks ORDER BY height DESC")?;
             let rows =
@@ -691,7 +694,7 @@ impl<T: Transport> Wallet<T> {
         };
         self.store.write(|t| {
             let moved = t.execute(
-                "UPDATE silent_scan SET next = ?2 WHERE next = ?1",
+                "UPDATE silent_scan SET next_height = ?2 WHERE next_height = ?1",
                 [from, last + 1],
             )?;
             if moved == 0 {
@@ -699,7 +702,7 @@ impl<T: Transport> Wallet<T> {
             }
             if untweaked {
                 t.execute(
-                    "UPDATE silent_scan SET untweaked = coalesce(untweaked, ?1)",
+                    "UPDATE silent_scan SET untweaked_height = coalesce(untweaked_height, ?1)",
                     [from],
                 )?;
             }
@@ -727,7 +730,7 @@ impl<T: Transport> Wallet<T> {
             }
             for (outpoint, by, height) in &batch.spent {
                 t.execute(
-                    "UPDATE silent_coins SET spent_by = ?3, spent_at = ?4
+                    "UPDATE silent_coins SET spent_by = ?3, spent_height = ?4
                      WHERE txid = ?1 AND vout = ?2",
                     params![
                         outpoint.txid.to_byte_array(),
@@ -760,8 +763,9 @@ impl<T: Transport> Wallet<T> {
     /// The output keys of the coins not spent in a block, by outpoint.
     fn held_outputs(&self) -> Result<HashMap<OutPoint, XOnlyPublicKey>, Error> {
         self.store.read(|c| {
-            let mut stmt =
-                c.prepare("SELECT txid, vout, output FROM silent_coins WHERE spent_at IS NULL")?;
+            let mut stmt = c.prepare(
+                "SELECT txid, vout, output FROM silent_coins WHERE spent_height IS NULL",
+            )?;
             let rows = stmt.query_map([], |r| {
                 Ok((
                     r.get::<_, [u8; 32]>(0)?,
@@ -809,7 +813,7 @@ impl<T: Transport> Wallet<T> {
         self.store.read(|c| {
             let mut stmt = c.prepare(
                 "SELECT txid, vout, value, height, label, spent_by FROM silent_coins
-                 WHERE spent_at IS NULL ORDER BY height, txid, vout",
+                 WHERE spent_height IS NULL ORDER BY height, txid, vout",
             )?;
             let rows = stmt.query_map([], |r| {
                 Ok(SilentCoin {
@@ -874,7 +878,7 @@ impl<T: Transport> Wallet<T> {
             let mut stmt = c.prepare(
                 "SELECT tx FROM silent_spends s
                  WHERE EXISTS (SELECT 1 FROM silent_coins c
-                               WHERE c.spent_by = s.txid AND c.spent_at IS NULL)
+                               WHERE c.spent_by = s.txid AND c.spent_height IS NULL)
                  ORDER BY created_at, txid",
             )?;
             let rows = stmt.query_map([], |r| r.get::<_, Vec<u8>>(0))?;
@@ -940,7 +944,7 @@ impl<T: Transport> Wallet<T> {
         self.store.read(|c| {
             let at = c
                 .query_row(
-                    "SELECT spent_at FROM silent_coins WHERE txid = ?1 AND vout = ?2",
+                    "SELECT spent_height FROM silent_coins WHERE txid = ?1 AND vout = ?2",
                     params![outpoint.txid.to_byte_array(), outpoint.vout],
                     |r| r.get::<_, Option<u32>>(0),
                 )
@@ -999,7 +1003,7 @@ impl<T: Transport> Wallet<T> {
             let signature = key_spend(tx, prevouts, index, &held, &secret)?;
             t.execute(
                 "UPDATE silent_coins SET spent_by = ?3
-                 WHERE txid = ?1 AND vout = ?2 AND spent_at IS NULL",
+                 WHERE txid = ?1 AND vout = ?2 AND spent_height IS NULL",
                 params![
                     outpoint.txid.to_byte_array(),
                     outpoint.vout,
@@ -1033,7 +1037,7 @@ impl<T: Transport> Wallet<T> {
             }
             t.execute(
                 "UPDATE silent_coins SET spent_by = ?3
-                 WHERE txid = ?1 AND vout = ?2 AND spent_at IS NULL",
+                 WHERE txid = ?1 AND vout = ?2 AND spent_height IS NULL",
                 params![
                     outpoint.txid.to_byte_array(),
                     outpoint.vout,
@@ -1172,7 +1176,7 @@ impl<T: Transport> Wallet<T> {
                 params![new, bitcoin::consensus::serialize(&tx), now()],
             )?;
             t.execute(
-                "UPDATE silent_coins SET spent_by = ?2 WHERE spent_by = ?1 AND spent_at IS NULL",
+                "UPDATE silent_coins SET spent_by = ?2 WHERE spent_by = ?1 AND spent_height IS NULL",
                 params![txid.to_byte_array(), new],
             )?;
             Ok(tx)
@@ -1190,7 +1194,7 @@ impl<T: Transport> Wallet<T> {
         self.store.read(|c| {
             let row = c
                 .query_row(
-                    "SELECT spent_by, spent_at FROM silent_coins WHERE txid = ?1 AND vout = ?2",
+                    "SELECT spent_by, spent_height FROM silent_coins WHERE txid = ?1 AND vout = ?2",
                     params![outpoint.txid.to_byte_array(), outpoint.vout],
                     |r| {
                         Ok((
@@ -1490,7 +1494,7 @@ fn coin(
     let row = t
         .query_row(
             "SELECT value, output, tweak, label, spent_by FROM silent_coins
-             WHERE txid = ?1 AND vout = ?2 AND spent_at IS NULL",
+             WHERE txid = ?1 AND vout = ?2 AND spent_height IS NULL",
             params![outpoint.txid.to_byte_array(), outpoint.vout],
             |r| {
                 Ok((
@@ -1521,7 +1525,7 @@ fn coin(
 /// The wallet's spend `tx`, its fee and its block as its coins tell.
 fn described(c: &rusqlite::Connection, tx: Transaction) -> Result<SilentSpend, Error> {
     let mut coin = c.prepare_cached(
-        "SELECT value, spent_by, spent_at FROM silent_coins WHERE txid = ?1 AND vout = ?2",
+        "SELECT value, spent_by, spent_height FROM silent_coins WHERE txid = ?1 AND vout = ?2",
     )?;
     let txid = tx.compute_txid().to_byte_array();
     let (mut held, mut height) = (Some(0u64), None);
@@ -1551,7 +1555,7 @@ fn described(c: &rusqlite::Connection, tx: Transaction) -> Result<SilentSpend, E
 fn free_coins(t: &rusqlite::Connection) -> Result<Vec<Held>, Error> {
     let mut stmt = t.prepare(
         "SELECT txid, vout, value, output, tweak, label FROM silent_coins
-         WHERE spent_by IS NULL AND spent_at IS NULL ORDER BY value DESC, txid, vout",
+         WHERE spent_by IS NULL AND spent_height IS NULL ORDER BY value DESC, txid, vout",
     )?;
     let rows = stmt.query_map([], |r| {
         Ok((

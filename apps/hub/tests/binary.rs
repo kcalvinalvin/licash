@@ -782,7 +782,7 @@ fn a_hub_provides_the_swaps_into_it_from_a_wallet_of_its_own() {
     let db = rusqlite::Connection::open(swaps_dir.join("wallet.sqlite")).unwrap();
     db.execute(
         "INSERT INTO provider_swaps (id, hash, from_url, to_url, address, amount, fee, paid,
-            expiry_from, expiry, state, created_at, updated_at, kind)
+            expiry_from_height, expiry_height, state, created_at, updated_at, kind)
          VALUES (x'01', zeroblob(32), 'http://a.example', 'http://hub', x'03', 10, 1, 11,
             50, 40, 'locked', 0, 0, 'own')",
         [],

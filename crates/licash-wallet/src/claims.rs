@@ -386,9 +386,9 @@ impl<T: Transport> Wallet<T> {
         pays: Option<&dyn Fn(&LockClaim) -> bool>,
     ) -> Result<Vec<LockClaim>, Error> {
         let mut stmt = c.prepare(
-            "SELECT id, request, certificate, expiry FROM locks
+            "SELECT id, request, certificate, expiry_height FROM locks
              WHERE certificate IS NOT NULL AND id NOT IN (SELECT id FROM lock_settlements)
-                AND abandoned IS NULL AND claimed_by IS NULL AND expiry <= ?1",
+                AND abandoned IS NULL AND claimed_by IS NULL AND expiry_height <= ?1",
         )?;
         let rows = stmt
             .query_map([tip], |r| {
@@ -458,12 +458,12 @@ impl<T: Transport> Wallet<T> {
     pub fn owed_locks(&self) -> Result<Vec<OwedLock>, Error> {
         self.store.read(|c| {
             let mut stmt = c.prepare(
-                "SELECT o.id, r.url, o.keyset, o.proposal, o.preimage, o.expiry, o.depth,
+                "SELECT o.id, r.url, o.keyset, o.proposal, o.preimage, o.expiry_height, o.depth,
                     o.anchor, a.height, o.claimed_by IS NOT NULL
                  FROM owed_locks o JOIN reach r ON r.hub = o.hub
                  LEFT JOIN owed_lock_activations a ON a.id = o.id
                  WHERE NOT EXISTS (SELECT 1 FROM notes n WHERE n.proposal = o.id AND n.branch = 0)
-                 ORDER BY o.expiry, o.id",
+                 ORDER BY o.expiry_height, o.id",
             )?;
             let rows = stmt.query_map([], |r| {
                 Ok((

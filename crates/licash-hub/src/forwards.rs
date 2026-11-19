@@ -350,7 +350,8 @@ pub(crate) fn fail(
     )
 }
 
-const FORWARDS: &str = "SELECT f.lock, f.hash, f.request, f.node, f.amount, l.expiry, f.state,
+const FORWARDS: &str =
+    "SELECT f.lock, f.hash, f.request, f.node, f.amount, l.expiry_height, f.state,
     f.preimage, f.reason, f.created_at FROM forwards f JOIN locks l ON l.id = f.lock";
 
 fn forward_of(c: &Connection, id: &ProposalId) -> Result<Option<Forward>, Error> {

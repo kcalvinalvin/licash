@@ -225,7 +225,7 @@ impl<T: Transport> Wallet<T> {
         let key = key.trim();
         self.store.write(|tx| {
             let before: Option<(String, String, u32)> = tx
-                .query_row("SELECT key, script, birthday FROM cold", [], |r| {
+                .query_row("SELECT key, script, birthday_height FROM cold", [], |r| {
                     Ok((r.get(0)?, r.get(1)?, r.get(2)?))
                 })
                 .optional()?;
@@ -236,11 +236,11 @@ impl<T: Transport> Wallet<T> {
                 tx.execute("DELETE FROM cold_coins", [])?;
             }
             tx.execute(
-                "INSERT INTO cold (id, key, script, threshold, keep, max_fee_percent, birthday)
+                "INSERT INTO cold (id, key, script, threshold, keep, max_fee_percent, birthday_height)
                  VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6)
                  ON CONFLICT (id) DO UPDATE SET key = ?1, script = ?2, threshold = ?3,
-                    keep = ?4, max_fee_percent = ?5, birthday = ?6,
-                    scanned = CASE WHEN ?7 THEN scanned ELSE NULL END",
+                    keep = ?4, max_fee_percent = ?5, birthday_height = ?6,
+                    scanned_height = CASE WHEN ?7 THEN scanned_height ELSE NULL END",
                 params![
                     key,
                     script.as_str(),
@@ -268,7 +268,7 @@ impl<T: Transport> Wallet<T> {
     fn cold_config(&self) -> Result<Option<Config>, Error> {
         let row = self.store.read(|c| {
             Ok(c.query_row(
-                "SELECT key, script, threshold, keep, max_fee_percent, birthday, scanned FROM cold",
+                "SELECT key, script, threshold, keep, max_fee_percent, birthday_height, scanned_height FROM cold",
                 [],
                 |r| {
                     Ok((
@@ -475,7 +475,7 @@ impl<T: Transport> Wallet<T> {
             }
         }
         self.store.write(|tx| {
-            tx.execute("UPDATE cold SET scanned = ?1", [end])?;
+            tx.execute("UPDATE cold SET scanned_height = ?1", [end])?;
             Ok(())
         })?;
         self.cold()

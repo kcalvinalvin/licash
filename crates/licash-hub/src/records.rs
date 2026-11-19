@@ -256,7 +256,7 @@ impl Ledger {
     /// Every lock, oldest first.
     pub fn locks(&self) -> Result<Vec<LockRecord>, Error> {
         let mut stmt = self.conn.prepare(
-            "SELECT l.id, l.amount, l.own, l.expiry, p.created_at, l.settled, l.settled_at
+            "SELECT l.id, l.amount, l.own, l.expiry_height, p.created_at, l.settled, l.settled_at
              FROM locks l JOIN proposals p ON p.id = l.id ORDER BY p.created_at, l.rowid",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -286,7 +286,7 @@ impl Ledger {
     /// Every payment outside the ledger, oldest first.
     pub fn forwards(&self) -> Result<Vec<ForwardRecord>, Error> {
         let mut stmt = self.conn.prepare(
-            "SELECT f.lock, f.request, f.amount, l.expiry, f.state, f.reason, f.created_at,
+            "SELECT f.lock, f.request, f.amount, l.expiry_height, f.state, f.reason, f.created_at,
                 f.resolved_at
              FROM forwards f JOIN locks l ON l.id = f.lock ORDER BY f.created_at, f.rowid",
         )?;

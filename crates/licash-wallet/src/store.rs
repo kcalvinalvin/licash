@@ -130,7 +130,7 @@ CREATE TABLE notes (
 ) STRICT;
 CREATE INDEX notes_spent_by ON notes (spent_by);
 
--- Notes locked to a payee on the preimage of `hash` until `expiry`, else
+-- Notes locked to a payee on the preimage of `hash` until `expiry_height`, else
 -- refunded: the lock asked for (a Lock body), then the hub's certificate,
 -- then its settlement, once the wallet kept its notes of the branch its hub
 -- settled. An uncertified lock is given up only once its hub refused it,
@@ -143,7 +143,7 @@ CREATE TABLE locks (
     hub INTEGER NOT NULL REFERENCES hubs (id),
     payee BLOB NOT NULL,
     hash BLOB NOT NULL CHECK (length(hash) = 32),
-    expiry INTEGER NOT NULL,
+    expiry_height INTEGER NOT NULL,
     amount INTEGER NOT NULL CHECK (amount >= 0),
     fee INTEGER NOT NULL CHECK (fee >= 0),
     request TEXT NOT NULL,
@@ -342,7 +342,7 @@ CREATE TABLE owed_locks (
     -- Its payer's owner signatures, 64 bytes each.
     signatures BLOB NOT NULL,
     preimage BLOB NOT NULL CHECK (length(preimage) = 32),
-    expiry INTEGER NOT NULL,
+    expiry_height INTEGER NOT NULL,
     depth INTEGER NOT NULL,
     anchor BLOB,
     claimed_by BLOB,
@@ -356,14 +356,15 @@ CREATE TABLE owed_lock_activations (
     height INTEGER NOT NULL
 ) STRICT;
 
--- The next block to look in for silent payments, from a first block the
--- owner chose: none until it chose one. `untweaked` is the first of the
--- blocks up to the next looked in without tweaks, to look in again for
+-- The next block to look in for silent payments (`next_height`), from a
+-- first block the owner chose: none until it chose one. `untweaked_height`
+-- is the first of the blocks up to the next looked in without tweaks, to
+-- look in again for
 -- silent payments once a hub serves them: none if none was.
 CREATE TABLE silent_scan (
     one INTEGER PRIMARY KEY CHECK (one = 1),
-    next INTEGER NOT NULL,
-    untweaked INTEGER
+    next_height INTEGER NOT NULL,
+    untweaked_height INTEGER
 ) STRICT;
 -- The blocks looked in lately, by height, to notice a reorganization.
 CREATE TABLE silent_blocks (
@@ -372,7 +373,7 @@ CREATE TABLE silent_blocks (
 ) STRICT;
 -- Outputs paying the silent payment address, in a block of the best chain,
 -- with what spends each (its key's tweak and label); spent_by names the
--- transaction spending it, the wallet's own or seen, and spent_at the
+-- transaction spending it, the wallet's own or seen, and spent_height the
 -- block it is in, once in one.
 CREATE TABLE silent_coins (
     txid BLOB NOT NULL,
@@ -383,7 +384,7 @@ CREATE TABLE silent_coins (
     label INTEGER,
     height INTEGER NOT NULL,
     spent_by BLOB,
-    spent_at INTEGER,
+    spent_height INTEGER,
     PRIMARY KEY (txid, vout)
 ) STRICT;
 -- The transactions the wallet made of its coins, to broadcast.
@@ -411,8 +412,8 @@ CREATE TABLE cold (
     threshold INTEGER NOT NULL CHECK (threshold >= 0),
     keep INTEGER NOT NULL CHECK (keep >= 0),
     max_fee_percent REAL NOT NULL CHECK (max_fee_percent >= 0),
-    birthday INTEGER NOT NULL,
-    scanned INTEGER
+    birthday_height INTEGER NOT NULL,
+    scanned_height INTEGER
 ) STRICT;
 CREATE TABLE cold_coins (
     txid BLOB NOT NULL,

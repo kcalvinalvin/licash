@@ -54,7 +54,7 @@ CREATE TABLE contracts (
     assert_height INTEGER NOT NULL,
     close_height INTEGER NOT NULL,
     funding BLOB,
-    since INTEGER NOT NULL,
+    since_height INTEGER NOT NULL,
     fate TEXT CHECK (fate IN ('live', 'dead', 'open')),
     abandoned TEXT,
     ceiling_fees TEXT NOT NULL,
@@ -635,7 +635,7 @@ impl Store {
         let row = self
             .c
             .query_row(
-                "SELECT format, state, since FROM contracts WHERE id = ?1",
+                "SELECT format, state, since_height FROM contracts WHERE id = ?1",
                 [id],
                 |r| Ok((r.get::<_, i64>(0)?, r.get(1)?, r.get(2)?)),
             )
@@ -651,7 +651,7 @@ impl Store {
     pub fn list(&self) -> Result<Vec<Contract>> {
         let mut stmt = self.c.prepare(
             "SELECT id, hub, phase, mock, deposit, value, price, cap, assert_height,
-                    close_height, funding, fate, abandoned, created_at, since,
+                    close_height, funding, fate, abandoned, created_at, since_height,
                     (SELECT txid FROM contract_folds WHERE contract_folds.id = contracts.id),
                     (SELECT amount FROM contract_funded WHERE contract_funded.id = contracts.id),
                     (SELECT received_at IS NOT NULL FROM contract_funded
@@ -926,7 +926,7 @@ fn insert(c: &Connection, new: &New<'_>, fees: &Fees) -> Result<()> {
     let now = crate::now();
     c.execute(
         "INSERT INTO contracts (id, hub, format, phase, mock, irrevocable, deposit, value, price, cap,
-                                assert_height, close_height, since, state, created_at,
+                                assert_height, close_height, since_height, state, created_at,
                                 updated_at, ceiling_fees, ceiling_updated_at)
          VALUES (?1, ?2, ?3, 0, ?4, 0, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13, ?14, ?13)",
         params![

@@ -83,7 +83,7 @@ fn a_hash_reservation_is_not_proof_of_lock_ownership() {
     let db = rusqlite::Connection::open(&path).unwrap();
     db.execute(
         "INSERT INTO provider_swaps (id, hash, from_url, to_url, address, amount, fee, paid,
-            expiry_from, expiry, state, created_at, updated_at)
+            expiry_from_height, expiry_height, state, created_at, updated_at)
          VALUES (?1, ?2, 'a', 'b', x'00', 1, 0, 1, 1, 1, 'accepted', 0, 0)",
         rusqlite::params![[9u8; 32], hash],
     )
@@ -160,7 +160,7 @@ fn the_providers_rows_hold_to_their_kinds_and_states() {
     let swap = |state: &str, kind: &str, amount: i64| {
         db.execute(
             "INSERT INTO provider_swaps (id, hash, from_url, to_url, address, amount, fee, paid,
-                expiry_from, expiry, state, kind, created_at, updated_at)
+                expiry_from_height, expiry_height, state, kind, created_at, updated_at)
              VALUES (randomblob(32), randomblob(32), 'a', 'b', x'00', ?3, 0, 1, 1, 1, ?1, ?2, 0, 0)",
             rusqlite::params![state, kind, amount],
         )
@@ -1226,7 +1226,7 @@ impl Eco {
         let c = rusqlite::Connection::open(self.dir.path().join("provider.sqlite")).unwrap();
         let (address, amount, hash, expiry, secret) = c
             .query_row(
-                "SELECT s.address, s.amount, s.hash, s.expiry, i.ephemeral
+                "SELECT s.address, s.amount, s.hash, s.expiry_height, i.ephemeral
                  FROM provider_swaps s JOIN provider_issues i ON i.id = s.id WHERE s.id = ?1",
                 [hex::decode(id).unwrap()],
                 |r| {

@@ -95,11 +95,11 @@ CREATE TABLE locks (
     id BLOB PRIMARY KEY REFERENCES proposals (id),
     hash BLOB NOT NULL CHECK (length(hash) = 32),
     checkpoint BLOB NOT NULL REFERENCES checkpoints (commitment),
-    expiry INTEGER NOT NULL,
+    expiry_height INTEGER NOT NULL,
     depth INTEGER NOT NULL,
     -- Height by which the hub answers a refund request: expiry, depth and
     -- its reaction at the time it was admitted.
-    decide_by INTEGER NOT NULL,
+    decide_by_height INTEGER NOT NULL,
     proposal BLOB NOT NULL,
     signed BLOB NOT NULL,
     certificate BLOB NOT NULL,
@@ -114,7 +114,7 @@ CREATE TABLE locks (
 CREATE INDEX locks_hash ON locks (hash);
 CREATE UNIQUE INDEX own_locks ON locks (hash) WHERE own = 1;
 -- The own locks not settled yet, by expiry: those the hub may yet pay.
-CREATE INDEX live_own_locks ON locks (expiry, id) WHERE own = 1 AND settled IS NULL;
+CREATE INDEX live_own_locks ON locks (expiry_height, id) WHERE own = 1 AND settled IS NULL;
 -- Each retired input, by its identifier, with the note that spent it.
 CREATE TABLE spent (
     y BLOB PRIMARY KEY,
