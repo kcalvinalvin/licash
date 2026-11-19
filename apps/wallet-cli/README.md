@@ -267,9 +267,10 @@ would claim of the wallet's notes now (`claims`, also in `--json`): the
 notes at a hub are shared out among the contracts there so that together
 they recover the most, the one ending first served first. On regtest, contracts are
 under a mock proof authority: such a contract protects nothing. On signet
-they are under the genuine programs, a trial: `force-close` below recovers
-from them, not yet tried on signet itself (the hub's README says what else
-it lacks). No other network for now.
+and Mutinynet they are under the genuine programs, a trial: `force-close`
+below recovers from them, not yet tried on signet itself (the hub's README
+says what else it lacks). No other network for now. A contract's length is
+told in the days of its network's blocks (144 a day, Mutinynet's 2,880).
 
 `close <id> --chain <url>` closes a live contract early with its hub,
 cooperatively, and claims what the wallet's notes at the hub come to, the

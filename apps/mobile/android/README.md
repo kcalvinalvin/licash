@@ -191,7 +191,7 @@ hub counts it.
 
 A hub's page sets up protection, a recovery contract, at the hubs that open
 them (`licash-hub run --contracts`: under the mock authority on regtest,
-where such a contract protects nothing, and of genuine programs on signet).
+where such a contract protects nothing, and of genuine programs on signet and Mutinynet).
 A contract locks the hub's collateral on Bitcoin behind the notes there, up
 to its cap, until its last block to recover in, then closes by itself, its
 collateral back to the hub. Its price is paid from a coin of the wallet's on

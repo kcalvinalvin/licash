@@ -191,7 +191,7 @@ the hubs without contracts, notes beyond what is protected, recoveries
 whose collateral was lost, hubs silent for
 an hour, and fees raised beyond what the contracts agreed to
 (`approve-fees`). Contracts open on regtest, under the mock authority, and
-signet only for now: on other networks, or without `--chain`, `run` refuses
+on signet and Mutinynet only for now: on other networks, or without `--chain`, `run` refuses
 to start unless `--no-contracts` runs it unprotected, which is reckless. A
 provider upgraded to this version takes nothing more in at a hub until a
 contract there is live; what it holds stays, and its payouts go on. The

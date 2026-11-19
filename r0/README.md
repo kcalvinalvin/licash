@@ -71,6 +71,13 @@ done
 | signet | `hp`, contracts opened before (v3 and v4 Bases) | `aa7f2d19079b339b1fee1e7666f445232f012965dc7c0ab8c35fb560a4d68a73` | 9d0f04f |
 | signet | `hp`, contracts opened before (v3 Bases) | `6bf78e6092f9c0959cee4908b449a032e575d527c5c889d8b9f3813b888f0d0c` | 0f86cc6 |
 
+Mutinynet's contracts open under the same programs: the statement reads
+the profile of the checkpoint it is given (Mutinynet retargets every 40,320
+blocks), the Base's digest binds it, and a proof for one network is none
+for the other. Its blocks come every 30 seconds, so a contract's headers
+(and with them its proof's cycles) grow 20 times as quick in time: contracts
+there are as long in blocks as signet's, not in time.
+
 The newest program reads co-funded (v5) Bases as well, whose claims name
 the notes she funded her contract with, and both filings, each by its
 contract's graph id (`licash::recovery::Format`). It checks each header

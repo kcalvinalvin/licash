@@ -62,6 +62,13 @@ and the help/quit keys; `?` shows the error detail.
 `--network` (`bitcoin` by default, or `regtest`, `signet`, `mutinynet`) is
 the chain `--chain` must follow: the hub scans no other. The signets are for
 testing only: header checks cannot tell their blocks from forged ones.
+Mutinynet's blocks come every 30 seconds, 20 times as quick as signet's.
+The hub counts every window, depth and margin in blocks all the same, as on
+signet, so that they last a twentieth of the time there: for its tests to
+meet reorganizations with. What is told in time is told in its blocks':
+the dashboard (give it `--network`, or `LICASH_HUB_NETWORK`), and a
+contract's interest by the year, which counts the year of its blocks
+(1,051,200 on Mutinynet, 52,560 elsewhere).
 
 `<data>/seed` makes every key of the hub: those its notes are issued
 under, its own address, its Nostr key and its deposits' keys. Keep a copy
@@ -247,7 +254,8 @@ one of the sizes (`2^n - 1` sat, 131,071 to 2,147,483,647; the operator's
 largest rounded down to one) and at most `--contracts-per-coin` times (2 by
 default) the coin the wallet deposits, at the reserve and opening fee plus
 `--contracts-rate` millionths of the part of the cap the hub funds a year
-(10,000, 1% a year, by default). A wallet may fund part of the cap itself
+(of its network's blocks, 52,560 or Mutinynet's 1,051,200; 10,000, 1% a
+year, by default). A wallet may fund part of the cap itself
 (`&funded=SAT`, a v5 contract): it pays that much more from its coin in F,
 `--contracts-rate-funded` millionths of it a year (none by default), and
 once F is 3 blocks deep (and as deep as the hub's funding depth) the hub
@@ -339,15 +347,20 @@ the surcharge rises or the hub is full. An upgraded hub already past the
 maximum keeps its contracts and opens no new ones until some end.
 
 On regtest, contracts are under a mock proof authority: such a contract
-protects nothing. On signet they are under the genuine programs kept in
-`r0/programs/` (new contracts under the newest, those opened before under
-theirs, each played to its end), a trial: RISC Zero's shared Groth16 setup, signet's headers
-checked by their work alone and not the network's signature of each block.
-The hub's terms there are signet's least: a day
-for the wallet to answer a challenge and for each party's outputs to wait,
-3 blocks deep, 12 blocks at least to respond to a request, a day for the
-holder to contest a response and 48 for the hub to prove and assert it once
-contested (a proof takes hours on a CPU). No other network yet.
+protects nothing. On signet and Mutinynet they are under the genuine programs
+kept in `r0/programs/` (new contracts under the newest, those opened before
+under theirs, each played to its end), a trial: RISC Zero's shared Groth16
+setup, the signets' headers checked by their work alone and not the
+network's signature of each block. The hub's terms there are signet's least:
+144 blocks (a day, on signet) for the wallet to answer a challenge and for
+each party's outputs to wait, 3 blocks deep, 12 blocks at least to respond to
+a request, 144 for the holder to contest a response and 48 for the hub to
+prove and assert it once contested (a proof takes hours on a CPU). On
+Mutinynet the same blocks, a twentieth of the time, but for what a proof
+takes: 960 blocks to prove and assert, hours as signet's 48 are, with the
+fixed contract and the shortest chosen as many blocks longer (1,912 and
+1,488). A proof's cost follows the contract's blocks (7.2 k cycles each), so
+a contract's length is chosen in blocks, not in time. No other network yet.
 
 A proof reads Bitcoin through block headers, so a hub's statement asks for
 work on top of a holder's request's response: a chain mined in private
@@ -523,8 +536,8 @@ provider's wallet looking for its coins on the hub's chain. The
 `--swaps-contract-successor-days`, `--swaps-contract-exit-days`,
 `--swaps-contract-max-price` and `--swaps-drain-via` flags match the
 provider's. The hub's own notes, which it issues, need no contract. With
-`--swaps-from`, a hub on a network where no contract opens (only regtest
-and signet do for now) refuses to start, unless `--swaps-no-contracts`
+`--swaps-from`, a hub on a network where no contract opens (only regtest,
+signet and Mutinynet do for now) refuses to start, unless `--swaps-no-contracts`
 runs it unprotected, which is reckless; a hub upgraded to this version
 takes nothing more in from a hub until a contract there is live. Back up
 the contracts (kept in `<data>/swaps/wallet.sqlite`, their instances in
