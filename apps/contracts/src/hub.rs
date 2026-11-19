@@ -8,6 +8,7 @@
 //! again gets the answer the stored machine gives ([`Hub::pending`]), and
 //! effects cut short by a restart run again then.
 
+mod chain;
 mod dispute;
 mod fold;
 mod funded;
@@ -87,6 +88,11 @@ pub const HEAVY: usize = 1;
 /// holder's next message before it is given up, its coins freed.
 pub const IDLE: Duration = Duration::from_secs(3_600);
 
+/// How deep a block is buried before the hub's header chain takes it: a
+/// batch proven is of the chain as it was, and one that a reorg takes back
+/// is a chain cut back, its receipts with it (`chain::HubChain`).
+const CHAIN_BURY: u32 = 6;
+
 /// How long a request waits for its step before answering 202.
 const WAIT: Duration = Duration::from_secs(20);
 
@@ -139,6 +145,10 @@ pub struct Openings {
     /// The prover of the hub's statement: none where proofs are the mock
     /// authority's.
     prover: Option<prover::Prover>,
+    /// The hub's header chain, which contracts of a graph that reads their
+    /// exit on it are quoted on and proven with: none where the program
+    /// trusted reads every header.
+    chain: Option<Arc<chain::HubChain>>,
     /// How the operator is told what needs them.
     alert: std::sync::OnceLock<Arc<Alert>>,
     /// The claims given no response this round, for want of the prover.
@@ -357,6 +367,18 @@ impl Openings {
                 "a signed contract stored in a format this build doesn't read: its exit isn't played"
             );
         }
+        // The chain program's headers are the hub's, kept from the first
+        // contract's checkpoint.
+        let chain = match (trust.mock, trust.chained) {
+            (false, Some(program)) => {
+                let (chain, told) = chain::HubChain::open(data, program, profile)?;
+                if let Some(why) = told {
+                    tracing::warn!("a receipt of the hub's header chain is not kept: {why}");
+                }
+                Some(Arc::new(chain))
+            }
+            _ => None,
+        };
         let openings = Arc::new(Self {
             data: data.to_owned(),
             store: Mutex::new(store),
@@ -378,8 +400,11 @@ impl Openings {
             checkpoints: std::sync::OnceLock::new(),
             prover: (!trust.mock).then(|| {
                 let before = crate::programs_before(profile);
-                prover::Prover::start(data, trust.program, before, prover::spacing(profile))
+                let spacing = prover::spacing(profile);
+                let chain = chain.clone().zip(trust.chained);
+                prover::Prover::start(data, trust.program, before, spacing, chain)
             }),
+            chain,
             alert: std::sync::OnceLock::new(),
             withheld: Mutex::default(),
             proof_scale: std::sync::OnceLock::new(),
@@ -501,6 +526,38 @@ impl Openings {
         })
     }
 
+    /// Of a contract that reads its exit on the hub's header chain: the chain
+    /// started at `checkpoint` if it has not, followed through it, and the
+    /// checkpoint a block of it in the state it binds, which the statement
+    /// opens (else refused as unavailable). Nothing of another.
+    pub(crate) async fn on_chain(&self, checkpoint: &Checkpoint) -> Result<(), Refused> {
+        let Some(chain) = &self.chain else {
+            return Ok(());
+        };
+        chain.begin(checkpoint).map_err(Refused::unavailable)?;
+        chain
+            .follow(&self.source, checkpoint.height())
+            .await
+            .map_err(Refused::unavailable)?;
+        chain.covers(checkpoint).map_err(Refused::unavailable)
+    }
+
+    /// Follow the node's chain with the hub's header chain, through the blocks
+    /// buried [`CHAIN_BURY`] deep: what a reorg that deep alone could take
+    /// back, which no batch proven is of.
+    async fn follow_chain(&self) {
+        let Some(chain) = &self.chain else { return };
+        let followed = async {
+            let tip = self.source.tip().await?;
+            chain
+                .follow(&self.source, tip.height.saturating_sub(CHAIN_BURY))
+                .await
+        };
+        if let Err(e) = followed.await {
+            tracing::warn!("following the chain for the hub's header chain: {e:#}");
+        }
+    }
+
     /// The hub's offer now, checkpointed at the block the ledger would
     /// take as its newest lock checkpoint ([`Openings::checkpoints_with`]),
     /// kept as one once a contract opens on it, else at its tip: its
@@ -524,6 +581,7 @@ impl Openings {
         let height = self.opening_height(tip.height)?;
         let checkpoint = self.source.checkpoint(height).await;
         let checkpoint = checkpoint.map_err(Refused::unavailable)?;
+        self.on_chain(&checkpoint).await?;
         let timing = self.timing().at_step(self.step_now()?);
         let quote = timing.quote_for(self.keyset.clone(), checkpoint, cap, blocks, funded);
         let bounds = self.timing().bounds(&quote);
@@ -733,6 +791,7 @@ impl Openings {
     /// Play each signed opening's exit, if any, one step
     /// (`dispute`). Each opening's error is reported independently.
     pub async fn answer_requests(&self) -> Result<ResponseRound> {
+        self.follow_chain().await;
         let ids = self.store().signed_ids()?;
         self.keep_loaded(&ids);
         let round_open = ids.len();
@@ -1105,6 +1164,7 @@ mod tests {
             closer: std::sync::OnceLock::new(),
             checkpoints: std::sync::OnceLock::new(),
             prover: None,
+            chain: None,
             alert: std::sync::OnceLock::new(),
             withheld: Mutex::default(),
             proof_scale: std::sync::OnceLock::new(),

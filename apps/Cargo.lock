@@ -3311,6 +3311,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "licash-chain"
+version = "0.0.1"
+dependencies = [
+ "licash",
+ "licash-statement",
+]
+
+[[package]]
 name = "licash-chain-client"
 version = "0.0.1"
 dependencies = [
@@ -3364,10 +3372,12 @@ dependencies = [
  "k256",
  "licash",
  "licash-api",
+ "licash-chain",
  "licash-chain-client",
  "licash-contract",
  "licash-hp",
  "licash-onchain",
+ "licash-statement",
  "licash-store",
  "licash-wallet",
  "lichen-babe",
@@ -3426,6 +3436,7 @@ version = "0.0.1"
 dependencies = [
  "bitcoin",
  "licash",
+ "licash-chain",
  "licash-statement",
  "sha2 0.10.9",
 ]

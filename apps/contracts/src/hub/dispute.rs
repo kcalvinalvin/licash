@@ -1023,7 +1023,7 @@ impl Openings {
                 if tip < release {
                     return Ok(Err(Played::Idle));
                 }
-                let input = match self
+                let (input, receipt) = match self
                     .input(id, hub, o, r, r_at, x, x_at, tip, &pinned)
                     .await?
                 {
@@ -1032,7 +1032,7 @@ impl Openings {
                 };
                 let bytes = input.to_bytes();
                 match prover {
-                    Some(prover) => prover.freeze(id, &bytes)?,
+                    Some(prover) => prover.freeze(id, &bytes, receipt.as_deref())?,
                     None => bytes,
                 }
             }
@@ -1096,7 +1096,8 @@ impl Openings {
         x_at: u32,
         tip: u32,
         pinned: &[u8],
-    ) -> Result<std::result::Result<licash_hp::HubInput, Played>> {
+    ) -> Result<std::result::Result<(licash_hp::HubInput, Option<std::path::PathBuf>), Played>>
+    {
         let depth = o.base.parts().chain.work_depth;
         let slot = OutPoint {
             txid: r.compute_txid(),
@@ -1129,7 +1130,7 @@ impl Openings {
                 Some((d_at, _)) if tip < d_at.saturating_add(depth) => {
                     return Ok(Err(Played::Idle))
                 }
-                Some((d_at, d)) => Some((self.block_at(d_at).await?, d.compute_txid())),
+                Some((d_at, d)) => Some((self.block_at(d_at).await?, d.compute_txid(), d_at)),
             }
         };
         let (r_block, p_block, x_block) = (
@@ -1137,6 +1138,27 @@ impl Openings {
             self.block_at(p_at).await?,
             self.block_at(x_at).await?,
         );
+        let keys = o.holder.request_keys()?;
+        let disclosure_block = disclosure.as_ref().map(|(block, txid, _)| (block, txid));
+        if recovery::chained(o.base.parts().graph.id) {
+            let last = [r_at, p_at, x_at]
+                .into_iter()
+                .chain(disclosure.as_ref().map(|(_, _, at)| *at))
+                .max()
+                .expect("three blocks");
+            return self
+                .chained_input(
+                    o,
+                    keys,
+                    evidence,
+                    (&r_block, &r.compute_txid()),
+                    (&p_block, &p.compute_txid()),
+                    (&x_block, &x.compute_txid()),
+                    disclosure_block,
+                    (last, tip),
+                )
+                .await;
+        }
         let headers = self.headers(o, tip).await?;
         let exit = dispute::exit(
             headers,
@@ -1144,9 +1166,8 @@ impl Openings {
             (&r_block, &r.compute_txid()),
             (&p_block, &p.compute_txid()),
             (&x_block, &x.compute_txid()),
-            disclosure.as_ref().map(|(block, txid)| (block, txid)),
+            disclosure_block,
         )?;
-        let keys = o.holder.request_keys()?;
         // The items of her filing it proves invalid, which it finds itself.
         let invalid =
             licash_hp::flagged(&o.base, &keys, &exit, &evidence).map_err(|e| anyhow!("{e}"))?;
@@ -1159,7 +1180,80 @@ impl Openings {
             chain: None,
         };
         match licash_hp::check(&input) {
-            Ok(j) if j == graph::journal(&o.base) => Ok(Ok(input)),
+            Ok(j) if j == graph::journal(&o.base) => Ok(Ok((input, None))),
+            Ok(_) => bail!("the statement's journal is not the contract's"),
+            Err(e) => bail!("the hub's statement does not hold: {e}"),
+        }
+    }
+
+    /// The statement's input of a contract that reads its exit on the hub's
+    /// header chain: the receipt of the chain through the exit's last block
+    /// (`last`; the hub's prover makes it, if it has not, and the dispute
+    /// waits), the few headers after that carry the work the contract asks on
+    /// it, and openings of the blocks the exit and the claim's judgment read.
+    /// With the file of the receipt, which the proof verifies.
+    #[allow(clippy::too_many_arguments)]
+    async fn chained_input(
+        &self,
+        o: &HubOpening,
+        keys: licash_hp::RequestKeys,
+        evidence: Vec<Evidence>,
+        request: (&Block, &bitcoin::Txid),
+        publish: (&Block, &bitcoin::Txid),
+        respond: (&Block, &bitcoin::Txid),
+        disclosure: Option<(&Block, &bitcoin::Txid)>,
+        (last, tip): (u32, u32),
+    ) -> Result<std::result::Result<(licash_hp::HubInput, Option<std::path::PathBuf>), Played>>
+    {
+        let chain = self
+            .chain
+            .as_ref()
+            .context("a chained contract, and the hub keeps no header chain")?;
+        let depth = o.base.parts().chain.work_depth;
+        // the blocks the work on top of the last one comes from, then
+        chain
+            .follow(&self.source, tip.min(last.saturating_add(depth)))
+            .await?;
+        chain.demand(last);
+        let Some(receipt) = chain.receipt_through(last) else {
+            // the hub's prover makes it, with no dispute to prove before
+            return Ok(Err(Played::Idle));
+        };
+        let contract = licash_hp::contract(&o.base);
+        let tail = chain.tail(&receipt, last, contract.work);
+        let exit = dispute::exit(tail, &o.funding, request, publish, respond, disclosure)?;
+        let program = licash_hp::Program {
+            id: chain.program(),
+            verify: &|_, _| {},
+        };
+        let proof = chain
+            .with(|lineage| {
+                let proven = licash_hp::headers::Proven {
+                    lineage,
+                    journal: &receipt.journal,
+                    tip: &receipt.tip,
+                };
+                licash_hp::open_chain(proven, &o.base, &keys, &exit, &evidence, &program)
+            })
+            .context("the hub's header chain is gone")?
+            .map_err(|e| anyhow!("the chain's openings: {e}"))?;
+        let chained = licash_hp::Chained {
+            proof: &proof,
+            program: &program,
+        };
+        // The items of her filing it proves invalid, which it finds itself.
+        let invalid = licash_hp::flagged_on(&o.base, &keys, &exit, &evidence, chained)
+            .map_err(|e| anyhow!("{e}"))?;
+        let input = licash_hp::HubInput {
+            base: o.base.clone(),
+            exit,
+            evidence,
+            keys,
+            invalid,
+            chain: Some(proof),
+        };
+        match licash_hp::check_on(&input, &program) {
+            Ok(j) if j == graph::journal(&o.base) => Ok(Ok((input, Some(receipt.file)))),
             Ok(_) => bail!("the statement's journal is not the contract's"),
             Err(e) => bail!("the hub's statement does not hold: {e}"),
         }
@@ -2073,6 +2167,15 @@ fn assert_deadline(o: &HubOpening, c_at: u32) -> u32 {
 /// and its size (the exit's transactions and proofs about 8 kB).
 fn estimated_cycles(o: &HubOpening, evidence: usize, at: u32) -> u64 {
     let chain = &o.base.parts().chain;
+    if recovery::chained(o.base.parts().graph.id) {
+        // not of the contract's age: its tail, openings and receipt
+        let other = o.base.to_bytes().len() + evidence + 8_192;
+        let per_header = prover::header_cycles(o.base.parts().graph.id);
+        return prover::cycles(per_header, prover::TAIL_HEADERS, other as u64)
+            + prover::SIGNATURE_CYCLES
+            + prover::OPENING_CYCLES
+            + prover::RESOLVE_CYCLES;
+    }
     let from = chain.checkpoint.height().saturating_add(1);
     let headers = at
         .saturating_sub(from)

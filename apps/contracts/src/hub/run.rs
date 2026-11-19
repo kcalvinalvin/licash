@@ -170,6 +170,8 @@ impl Openings {
             let ours =
                 timing.quote_for(self.keyset.clone(), checkpoint.clone(), cap, blocks, funded);
             if bytes(&ours) == theirs {
+                // the node's block, as the hub quoted it: of its header chain too
+                self.on_chain(&ours.chain.checkpoint).await?;
                 return self.keep_checkpoint(&ours.chain.checkpoint);
             }
         }
@@ -360,6 +362,11 @@ impl Openings {
         };
         let states = self.store().committed(id).map_err(Refused::unavailable)?;
         let mut all = vec![cycles];
+        // The header chain's batch a dispute may wait for, made once for all
+        // of them: the blocks since the last receipt are at most a day's.
+        if let Some(chain) = &self.chain {
+            all.push(prover::chain_batch_cycles(chain.batch_blocks()));
+        }
         for state in states {
             let peek = Hub::peek(&state).map_err(|e| {
                 Refused::unavailable(format!("a contract the hub committed to is unread: {e:#}"))

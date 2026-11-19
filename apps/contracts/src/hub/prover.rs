@@ -28,7 +28,7 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context as _, Result};
+use anyhow::{bail, ensure, Context as _, Result};
 use licash::recovery::COMPACT_FROM;
 use licash::spend::ChainProfile;
 
@@ -44,6 +44,34 @@ pub(super) const HEADER_CYCLES: u64 = 28_000;
 /// cycles on 73.0 M (9.4 k each), 10 k with a margin of its own.
 pub(super) const COMPACT_HEADER_CYCLES: u64 = 10_000;
 pub(super) const BYTE_CYCLES: u64 = 2_000;
+
+/// Cycles a chained statement takes beyond its filing, signatures and the
+/// headers it reads itself: the openings of the blocks the exit and the
+/// claim's judgment read (32 levels of hashes each, 70 at most; 0.3 M
+/// measured with a handful), the receipt's journal, and its resolution.
+pub(super) const OPENING_CYCLES: u64 = 1_000_000;
+
+/// What resolving the receipt a statement verifies costs: a recursion proof,
+/// as a join is, which each segment's seconds count ([`Speed`]): one more
+/// segment's cycles (2^18, a GPU's).
+pub(super) const RESOLVE_CYCLES: u64 = 262_144;
+
+/// The headers after the chain's receipt that a chained statement reads
+/// itself, at most: the blocks that carry the work asked on the last one,
+/// whose depth is the network's floor and a day's more at the most
+/// (`terms::MAX_EXTRA_WORK`), and a few.
+pub(super) const TAIL_HEADERS: u64 = 160;
+
+/// Cycles each header costs the chain program, measured with `chain-exec`: 12.5 k
+/// on 1,504 headers, 14 k with a margin.
+pub(super) const CHAIN_HEADER_CYCLES: u64 = 14_000;
+
+/// The cycles of a batch of `blocks` headers of the chain: its headers, and
+/// the segments that make a batch's fixed cost (measured 0.2 M) and its
+/// resolution.
+pub(super) fn chain_batch_cycles(blocks: u32) -> u64 {
+    CHAIN_HEADER_CYCLES * u64::from(blocks) + 500_000 + RESOLVE_CYCLES
+}
 
 /// The cycles of each header of a contract of graph `graph`, by the program
 /// it was opened under: that of the compact filing's id on
@@ -73,6 +101,7 @@ const FORGET_POLLS: u64 = 10;
 const RETRY: Duration = Duration::from_secs(60);
 const REPROBE: Duration = Duration::from_secs(15 * 60);
 
+use super::chain::HubChain;
 use super::Alert;
 
 /// The prover's speed, as benchmarked: the cycles a segment holds, the
@@ -138,8 +167,16 @@ pub(super) fn cycles(per_header: u64, headers: u64, other: u64) -> u64 {
 /// its Base (`base` bytes), its publication (`publication` bytes at most),
 /// as much evidence again and its exit's transactions (8 kB), and of her
 /// request's signatures.
+///
+/// Of a chained contract ([`licash::recovery::chained`]) not of its age: the
+/// headers it reads itself, the work it asks on the last block of its exit,
+/// and what its openings and their receipt's resolution take.
 pub(super) fn worst_cycles(headers: u32, publication: u32, base: usize, graph: u32) -> u64 {
     let other = base as u64 + 2 * u64::from(publication) + 8_192;
+    if licash::recovery::chained(graph) {
+        let tail = cycles(header_cycles(graph), TAIL_HEADERS, other);
+        return tail + SIGNATURE_CYCLES + OPENING_CYCLES + RESOLVE_CYCLES;
+    }
     cycles(header_cycles(graph), u64::from(headers), other) + SIGNATURE_CYCLES
 }
 
@@ -153,7 +190,11 @@ pub(super) fn input_cycles(bytes: &[u8], graph: u32) -> u64 {
     };
     let headers = word(4 + word(0)) as u64;
     let other = (bytes.len() as u64).saturating_sub(80 * headers);
-    cycles(header_cycles(graph), headers, other)
+    let chained = match licash::recovery::chained(graph) && !bytes.is_empty() {
+        true => OPENING_CYCLES + RESOLVE_CYCLES,
+        false => 0,
+    };
+    cycles(header_cycles(graph), headers, other) + chained
 }
 
 /// The target time between blocks of `profile`, in seconds.
@@ -238,6 +279,8 @@ struct State {
     /// a contract under any other are withheld, whatever program this
     /// build knows it by.
     installed: Option<Vec<[u8; 32]>>,
+    /// After a failed batch of the header chain: when to try again.
+    chain_retry: Option<Instant>,
 }
 
 struct Inner {
@@ -248,6 +291,11 @@ struct Inner {
     /// Those contracts opened under before, proven with still.
     before: Vec<[u8; 32]>,
     spacing: f64,
+    /// The hub's header chain, whose batches it proves when no dispute's
+    /// proof can run: none for a program that reads every header.
+    chain: Option<Arc<HubChain>>,
+    /// The chain program its batches are proven with.
+    chain_program: Option<[u8; 32]>,
     state: Mutex<State>,
     wake: Condvar,
     alert: OnceLock<Arc<Alert>>,
@@ -283,9 +331,18 @@ impl Prover {
     /// opened under `before` before, on a chain of a block every
     /// `spacing` seconds: probed and benchmarked, then proving, on a
     /// thread of its own.
-    pub fn start(data: &Path, program: [u8; 32], before: &[[u8; 32]], spacing: f64) -> Self {
+    ///
+    /// With `chain`, the hub's header chain and the chain program its
+    /// batches are proven with, whose receipts the statement verifies.
+    pub fn start(
+        data: &Path,
+        program: [u8; 32],
+        before: &[[u8; 32]],
+        spacing: f64,
+        chain: Option<(Arc<HubChain>, [u8; 32])>,
+    ) -> Self {
         let command = std::env::var("LICASH_HP_PROVER").unwrap_or_else(|_| "licash-r0".into());
-        Self::start_with(data, command, program, before, spacing)
+        Self::start_with(data, command, program, before, spacing, chain)
     }
 
     fn start_with(
@@ -294,13 +351,20 @@ impl Prover {
         program: [u8; 32],
         before: &[[u8; 32]],
         spacing: f64,
+        chain: Option<(Arc<HubChain>, [u8; 32])>,
     ) -> Self {
+        let (chain, chain_program) = match chain {
+            Some((chain, program)) => (Some(chain), Some(program)),
+            None => (None, None),
+        };
         let inner = Arc::new(Inner {
             dir: data.join("hp-proofs"),
             command,
             program,
             before: before.to_vec(),
             spacing,
+            chain,
+            chain_program,
             state: Mutex::default(),
             wake: Condvar::new(),
             alert: OnceLock::new(),
@@ -362,6 +426,8 @@ impl Prover {
             program: [0; 32],
             before: Vec::new(),
             spacing: 600.0,
+            chain: None,
+            chain_program: None,
             state: Mutex::default(),
             wake: Condvar::new(),
             alert: OnceLock::new(),
@@ -381,14 +447,22 @@ impl Prover {
     }
 
     /// The input of `id`'s proof, frozen as `input` unless it was before:
-    /// its bytes.
-    pub fn freeze(&self, id: &[u8; 32], input: &[u8]) -> Result<Vec<u8>> {
+    /// its bytes. A statement that verifies a receipt of the chain program
+    /// freezes it with `input`, before it: the proof is made of that receipt
+    /// alone, whatever the chain proves later.
+    pub fn freeze(&self, id: &[u8; 32], input: &[u8], receipt: Option<&Path>) -> Result<Vec<u8>> {
         let dir = self.dir(id);
         let path = dir.join("input.bin");
         if let Ok(frozen) = std::fs::read(&path) {
             return Ok(frozen);
         }
         std::fs::create_dir_all(&dir)?;
+        if let Some(receipt) = receipt {
+            let part = dir.join("chain.part");
+            std::fs::copy(receipt, &part)?;
+            std::fs::File::open(&part)?.sync_all()?;
+            std::fs::rename(&part, dir.join("chain.receipt"))?;
+        }
         let part = dir.join("input.part");
         std::fs::write(&part, input)?;
         std::fs::File::open(&part)?.sync_all()?;
@@ -681,6 +755,14 @@ impl Inner {
                 "the program contracts open under, {program}, is not installed"
             ));
         }
+        if let Some(chain) = self.chain_program {
+            if !uninstalled(&probe, &[chain]).is_empty() {
+                problems.push(format!(
+                    "the chain program its statement verifies, {}, is not installed",
+                    hex::encode(chain)
+                ));
+            }
+        }
         if !problems.is_empty() {
             bail!("{}", problems.join("; "));
         }
@@ -772,10 +854,22 @@ impl Inner {
         loop {
             let (id, program) = {
                 let mut s = self.state();
+                let mut chained = false;
                 loop {
                     if let Some(next) = self.next(&s) {
                         break next;
                     }
+                    // Nothing to contest: the header chain's batches, once.
+                    // The lock is not held while one runs, so the next
+                    // check is of what was committed meanwhile.
+                    if self.chain.is_some() && !chained {
+                        chained = true;
+                        drop(s);
+                        self.background();
+                        s = self.state();
+                        continue;
+                    }
+                    chained = false;
                     s = self
                         .wake
                         .wait_timeout(s, RETRY)
@@ -814,6 +908,85 @@ impl Inner {
         }
     }
 
+    /// The next batch of the header chain, if one is due and the prover is
+    /// free of disputes: proven, or stopped (to carry on from the segments it
+    /// kept) the moment a dispute's proof can run. Whether it ran.
+    fn background(&self) -> bool {
+        let (Some(chain), Some(program)) = (&self.chain, self.chain_program) else {
+            return false;
+        };
+        if self.state().chain_retry.is_some_and(|r| r > Instant::now()) {
+            return false;
+        }
+        let pending = match chain.next_batch() {
+            Ok(Some(pending)) => pending,
+            Ok(None) => return false,
+            Err(e) => {
+                tracing::error!("the header chain's next batch: {e:#}");
+                self.state().chain_retry = Some(Instant::now() + RETRY);
+                return false;
+            }
+        };
+        let ran = (|| -> Result<bool> {
+            let log = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(pending.work.join("prover.log"))?;
+            let mut command = self.command();
+            command
+                .arg("chain-prove")
+                .arg(&pending.input)
+                .arg(&pending.work)
+                .arg(hex::encode(program));
+            if let Some(receipt) = &pending.assume {
+                command.arg("--assume").arg(receipt);
+            }
+            let mut child = command
+                .stdout(log.try_clone()?)
+                .stderr(log)
+                .spawn()
+                .with_context(|| format!("run {}", self.command))?;
+            let started = Instant::now();
+            tracing::info!(
+                through = pending.through,
+                "proving a batch of the hub's header chain"
+            );
+            loop {
+                if let Some(status) = child.try_wait()? {
+                    ensure!(status.success(), "{status}");
+                    chain.done(&pending)?;
+                    tracing::info!(
+                        through = pending.through,
+                        seconds = started.elapsed().as_secs(),
+                        "a batch of the hub's header chain proved"
+                    );
+                    return Ok(true);
+                }
+                let dispute = {
+                    let s = self.state();
+                    s.cancel || self.next(&s).is_some()
+                };
+                if dispute {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    tracing::info!("a batch of the header chain stopped for a dispute's proof");
+                    return Ok(false);
+                }
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        })();
+        if let Err(e) = ran {
+            self.state().chain_retry = Some(Instant::now() + RETRY);
+            tracing::error!(
+                through = pending.through,
+                "a batch of the hub's header chain failed, trying again \
+                 (see {}/prover.log): {e:#}",
+                pending.work.display()
+            );
+        }
+        true
+    }
+
     /// Prove `id`'s frozen input with `program`: whether it was proved, or
     /// stopped as no longer needed.
     fn prove(&self, id: &[u8; 32], program: &[u8; 32]) -> Result<bool> {
@@ -822,12 +995,18 @@ impl Inner {
             .create(true)
             .append(true)
             .open(dir.join("prover.log"))?;
-        let mut child = self
-            .command()
+        let mut command = self.command();
+        command
             .arg("hp-prove")
             .arg(dir.join("input.bin"))
             .arg(&dir)
-            .arg(hex::encode(program))
+            .arg(hex::encode(program));
+        // the receipt of the chain its statement verifies, frozen with it
+        let chain = dir.join("chain.receipt");
+        if chain.exists() {
+            command.arg("--assume").arg(&chain);
+        }
+        let mut child = command
             .stdout(log.try_clone()?)
             .stderr(log)
             .spawn()
@@ -924,6 +1103,45 @@ mod tests {
         assert!(
             (estimated / 151_639_658.0 - 1.0).abs() < 0.01,
             "{estimated}"
+        );
+    }
+
+    #[test]
+    fn a_chained_contracts_worst_proof_is_not_of_its_age() {
+        use licash::recovery::{CHAINED_FROM, LEAN_FROM};
+        let publication = 64_000;
+        let lean = |headers| worst_cycles(headers, publication, 4_000, LEAN_FROM);
+        let chained = |headers| worst_cycles(headers, publication, 4_000, CHAINED_FROM);
+        // a half year and two years of signet's blocks cost a chained contract
+        // the same, which a lean one's cost grows with
+        assert_eq!(chained(26_280), chained(105_120));
+        assert!(lean(105_120) > 3 * lean(26_280) / 2);
+        assert!(lean(26_280) > chained(26_280));
+        // and what it costs is the filing's, with the tail and the openings
+        let filing = BYTE_CYCLES * (4_000 + 2 * publication as u64 + 8_192);
+        assert_eq!(
+            chained(1),
+            filing
+                + COMPACT_HEADER_CYCLES * TAIL_HEADERS
+                + SIGNATURE_CYCLES
+                + OPENING_CYCLES
+                + RESOLVE_CYCLES
+        );
+        // a statement's input counts its tail's headers and the same extras
+        let mut bytes = Vec::new();
+        bytes.extend(3u32.to_be_bytes());
+        bytes.extend([7; 3]);
+        bytes.extend(2u32.to_be_bytes());
+        bytes.extend([0; 160]);
+        let other = bytes.len() as u64 - 160;
+        assert_eq!(
+            input_cycles(&bytes, CHAINED_FROM),
+            cycles(COMPACT_HEADER_CYCLES, 2, other) + OPENING_CYCLES + RESOLVE_CYCLES
+        );
+        // a batch of a day's blocks, on a network of 144 a day
+        assert_eq!(
+            chain_batch_cycles(144),
+            14_000 * 144 + 500_000 + RESOLVE_CYCLES
         );
     }
 
@@ -1145,8 +1363,8 @@ mod tests {
             },
         );
         assert_eq!(p.frozen(&[1; 32]), None);
-        assert_eq!(p.freeze(&[1; 32], b"first").unwrap(), b"first");
-        assert_eq!(p.freeze(&[1; 32], b"later").unwrap(), b"first");
+        assert_eq!(p.freeze(&[1; 32], b"first", None).unwrap(), b"first");
+        assert_eq!(p.freeze(&[1; 32], b"later", None).unwrap(), b"first");
         assert_eq!(p.frozen(&[1; 32]).as_deref(), Some(&b"first"[..]));
     }
 
@@ -1173,11 +1391,24 @@ mod tests {
 
     /// A prover of `script`'s, in `dir`, for program [7; 32].
     fn fake(dir: &Path, script: &str) -> Prover {
+        fake_with(dir, script, None)
+    }
+
+    /// [`fake`], with a header chain it proves the batches of, by the chain
+    /// program [9; 32].
+    fn fake_with(dir: &Path, script: &str, chain: Option<Arc<HubChain>>) -> Prover {
         let path = dir.join("prover.sh");
         std::fs::write(&path, format!("#!/bin/sh\nset -e\n{script}")).unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        Prover::start_with(dir, path.display().to_string(), [7; 32], &[], 600.0)
+        Prover::start_with(
+            dir,
+            path.display().to_string(),
+            [7; 32],
+            &[],
+            600.0,
+            chain.map(|chain| (chain, [9; 32])),
+        )
     }
 
     fn until(what: &str, f: impl Fn() -> bool) {
@@ -1222,7 +1453,7 @@ esac
         assert!(p.commit(&[1; 32], [7; 32], 110, 100, 1_000, false, false, 100));
         std::thread::sleep(Duration::from_millis(200));
         assert_eq!(p.proof(&[1; 32], &[7; 32]).unwrap(), None);
-        p.freeze(&[1; 32], b"input").unwrap();
+        p.freeze(&[1; 32], b"input", None).unwrap();
         p.commit(&[1; 32], [7; 32], 110, 100, 1_000, true, false, 100);
         until("proved", || p.dir(&[1; 32]).join("proof.json").exists());
         until("its seal", || {
@@ -1253,6 +1484,115 @@ esac
         });
         let calls = std::fs::read_to_string(dir.path().join("calls")).unwrap();
         assert_eq!(calls, "probe\n");
+    }
+
+    /// A hub's header chain of 20 blocks the node has, a dispute asking
+    /// for the first 8 of them proven.
+    async fn chained(dir: &Path) -> Arc<HubChain> {
+        use super::super::chain::fixtures::{genesis, Node};
+        let (chain, _) = HubChain::open(
+            &crate::testing::hub_data(dir),
+            [9; 32],
+            licash::spend::ChainProfile::Core30DefaultRegtest,
+        )
+        .unwrap();
+        chain.begin(&genesis()).unwrap();
+        chain.follow(&Node::new(20), 20).await.unwrap();
+        Arc::new(chain)
+    }
+
+    const CHAIN_SCRIPT: &str = r#"echo "$@" >> "$(dirname "$0")/calls"
+case "$1" in
+probe) echo '{"device":"cuda","programs":["0707070707070707070707070707070707070707070707070707070707070707","0909090909090909090909090909090909090909090909090909090909090909"],"problems":[]}' ;;
+bench) echo '{"device":"cuda","segment_cycles":1000000,"segment":1.0,"tail":60.0}' > "$2" ;;
+chain-prove)
+    [ -e "$(dirname "$0")/slow" ] && sleep 60
+    echo receipt > "$3/receipt" ;;
+hp-prove) echo "{\"image_id\":\"$4\",\"seal\":\"0a0b\"}" > "$3/proof.json" ;;
+esac
+"#;
+
+    /// With no dispute to prove, the prover proves the header chain's batches
+    /// the hub's chain makes due, each resuming the receipt before it.
+    #[tokio::test]
+    async fn a_prover_proves_the_header_chains_batches_when_no_dispute_is_to_be_proven() {
+        let dir = tempfile::tempdir().unwrap();
+        let chain = chained(dir.path()).await;
+        let p = fake_with(dir.path(), CHAIN_SCRIPT, Some(chain.clone()));
+        until("ready", || {
+            matches!(readiness(&p), Some(Readiness::Ready(_)))
+        });
+        // nothing is due until a dispute needs a receipt
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(chain.receipt_through(1).is_none());
+        chain.demand(8);
+        p.0.wake.notify_all();
+        until("the first batch", || chain.receipt_through(8).is_some());
+        chain.demand(15);
+        p.0.wake.notify_all();
+        until("the second batch", || chain.receipt_through(15).is_some());
+        let calls = std::fs::read_to_string(dir.path().join("calls")).unwrap();
+        let program = hex::encode([9u8; 32]);
+        let batches: Vec<_> = calls
+            .lines()
+            .filter(|l| l.starts_with("chain-prove"))
+            .collect();
+        assert_eq!(batches.len(), 2, "{calls}");
+        assert!(batches[0].ends_with(&program), "{calls}");
+        assert!(!batches[0].contains("--assume"), "{calls}");
+        // the first receipt's file: 9 blocks, of the chain through block 8
+        let first = dir
+            .path()
+            .join("header-chain")
+            .join(hex::encode([9u8; 32]))
+            .join("receipt-9");
+        let kept = chain.receipt_through(15).unwrap();
+        assert_eq!(tip_of(&kept), 15);
+        assert!(
+            batches[1].ends_with(&format!("--assume {}", first.display())),
+            "{calls}"
+        );
+        // the program it needs is among those it requires installed
+        assert!(p.0.chain_program == Some([9; 32]));
+    }
+
+    fn tip_of(r: &super::super::chain::Receipt) -> u32 {
+        r.journal.tip_height()
+    }
+
+    /// A dispute's proof can run: the batch being proven is stopped, and
+    /// proven again after it, from the segments it kept.
+    #[tokio::test]
+    async fn a_dispute_stops_a_batch_of_the_header_chain_which_is_proven_after() {
+        let dir = tempfile::tempdir().unwrap();
+        let chain = chained(dir.path()).await;
+        std::fs::write(dir.path().join("slow"), b"").unwrap();
+        let p = fake_with(dir.path(), CHAIN_SCRIPT, Some(chain.clone()));
+        until("ready", || {
+            matches!(readiness(&p), Some(Readiness::Ready(_)))
+        });
+        chain.demand(8);
+        p.0.wake.notify_all();
+        let calls = || std::fs::read_to_string(dir.path().join("calls")).unwrap_or_default();
+        until("the batch under way", || calls().contains("chain-prove"));
+        assert!(chain.receipt_through(8).is_none());
+        // a dispute whose input is frozen: it runs first
+        p.freeze(&[1; 32], b"input", None).unwrap();
+        p.commit(&[1; 32], [7; 32], 110, 100, 1_000, true, false, 100);
+        until("the dispute proved", || {
+            p.dir(&[1; 32]).join("proof.json").exists()
+        });
+        assert!(chain.receipt_through(8).is_none(), "{}", calls());
+        // no longer slow: the batch is made again, and done
+        std::fs::remove_file(dir.path().join("slow")).unwrap();
+        p.0.wake.notify_all();
+        until("the batch proven", || chain.receipt_through(8).is_some());
+        let proving: Vec<_> = calls()
+            .lines()
+            .filter(|l| l.starts_with("chain-prove"))
+            .map(str::to_owned)
+            .collect();
+        assert!(proving.len() >= 2, "stopped and made again: {proving:?}");
     }
 
     /// A program contracts opened under before, not installed: the prover
@@ -1357,7 +1697,7 @@ esac
         until("ready", || {
             matches!(readiness(&p), Some(Readiness::Ready(_)))
         });
-        p.freeze(&[1; 32], b"input").unwrap();
+        p.freeze(&[1; 32], b"input", None).unwrap();
         p.commit(&[1; 32], [7; 32], 110, 100, 1, true, false, 100);
         until("alerted", || !told.lock().unwrap().is_empty());
         assert!(told.lock().unwrap()[0].contains("the prover failed"));
