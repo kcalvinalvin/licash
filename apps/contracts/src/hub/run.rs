@@ -393,7 +393,7 @@ impl Openings {
 pub(super) fn base_cycles(base: &Base) -> u64 {
     let p = base.parts();
     let (headers, publication) = (p.chain.max_headers, p.limits.max_publication_bytes);
-    prover::worst_cycles(headers, publication, base.to_bytes().len())
+    prover::worst_cycles(headers, publication, base.to_bytes().len(), p.graph.id)
 }
 
 /// As [`base_cycles`], of a contract on `quote`, before its Base is: the
@@ -403,7 +403,7 @@ pub(super) fn quote_cycles(quote: &Quote) -> u64 {
     w.quote(quote);
     let base = w.0.len() + 4_096;
     let (headers, publication) = (quote.chain.max_headers, quote.limits.max_publication_bytes);
-    prover::worst_cycles(headers, publication, base)
+    prover::worst_cycles(headers, publication, base, quote.graph.id)
 }
 
 fn phase(hub: &Hub) -> u8 {

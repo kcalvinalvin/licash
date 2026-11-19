@@ -1045,7 +1045,12 @@ impl Openings {
                 let proof = match seal {
                     Some(seal) => lichen_babe::risc0::proof_from_seal(&seal)?,
                     None => {
-                        commit(tip, prover::input_cycles(&bytes), true, false);
+                        commit(
+                            tip,
+                            prover::input_cycles(&bytes, o.base.parts().graph.id),
+                            true,
+                            false,
+                        );
                         return Ok(Err(Played::Idle));
                     }
                 };
@@ -1053,7 +1058,12 @@ impl Openings {
                     prover.reject(id, "it does not verify for this contract")?;
                     return Ok(Err(Played::Idle));
                 }
-                commit(tip, prover::input_cycles(&bytes), true, true);
+                commit(
+                    tip,
+                    prover::input_cycles(&bytes, o.base.parts().graph.id),
+                    true,
+                    true,
+                );
                 proof
             }
         };
@@ -2062,7 +2072,8 @@ fn estimated_cycles(o: &HubOpening, evidence: usize, at: u32) -> u64 {
         .saturating_add(1)
         .min(chain.max_headers);
     let other = o.base.to_bytes().len() + evidence + 8_192;
-    prover::cycles(u64::from(headers), other as u64) + prover::SIGNATURE_CYCLES
+    let per_header = prover::header_cycles(o.base.parts().graph.id);
+    prover::cycles(per_header, u64::from(headers), other as u64) + prover::SIGNATURE_CYCLES
 }
 
 /// The evidence pinned as `bytes`: none for empty bytes (a response pinned

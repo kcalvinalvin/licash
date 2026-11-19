@@ -164,6 +164,32 @@ fn real_mainnet_headers_cross_the_same_core30_retarget_boundary() {
     assert_eq!(chain.confirmations(32_257), None);
 }
 
+/// The statement's headers are each checked once against the hash of the
+/// last: one outside its target, or not on the last, is no chain.
+#[test]
+fn a_header_is_on_the_last_and_within_its_target() {
+    let (cp, blocks, _) = fixture(1);
+    let bytes = |h: &Header| -> chain::HeaderBytes { serialize(h).try_into().unwrap() };
+    let verify =
+        |headers: Vec<chain::HeaderBytes>| Chain::verify(cp.clone(), &cp.commitment(), headers, 3);
+    let all: Vec<_> = blocks.iter().map(|b| bytes(&b.header)).collect();
+    assert!(verify(all.clone()).is_ok());
+    // A later header whose nonce leaves it outside its target.
+    let mut weak = blocks[1].header;
+    while weak.validate_pow(weak.target()).is_ok() {
+        weak.nonce += 1;
+    }
+    let error = verify(vec![all[0], bytes(&weak)]).err().unwrap();
+    assert!(error.to_string().contains("proof of work"), "{error}");
+    // One that is on the first rather than the second, after it.
+    let error = verify(vec![all[0], all[1], all[1]]).err().unwrap();
+    assert!(error.to_string().contains("ancestry"), "{error}");
+    let error = verify(vec![all[1]]).err().unwrap();
+    assert!(error.to_string().contains("ancestry"), "{error}");
+    // The checkpoint's own successor, tried from a later state.
+    assert!(verify(vec![all[0], all[0]]).is_err());
+}
+
 #[test]
 fn checkpoints_and_header_limits_are_opening_context_not_prover_choices() {
     let (cp, blocks, _) = fixture(1);

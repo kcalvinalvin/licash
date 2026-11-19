@@ -10,7 +10,7 @@ use bitcoin::{
     consensus::{deserialize, serialize},
     hashes::Hash,
     pow::{CompactTarget, Target},
-    Block, Network,
+    Block, BlockHash, Network,
 };
 use sha2::{Digest, Sha256};
 
@@ -155,6 +155,9 @@ pub struct Checkpoint {
     profile: ChainProfile,
     height: u32,
     header: HeaderBytes,
+    /// `header` decoded and hashed once, for the headers that follow it.
+    decoded: Header,
+    hash: [u8; 32],
     times: Vec<u32>,
     period_start: Option<u32>,
 }
@@ -203,6 +206,8 @@ impl Checkpoint {
             profile,
             height,
             header: bytes,
+            decoded: h,
+            hash: sha256d(&bytes),
             times,
             period_start,
         })
@@ -300,19 +305,24 @@ impl Checkpoint {
     }
 
     fn push(&mut self, bytes: HeaderBytes) -> Result<(), Error> {
-        let previous = header(&self.header)?;
+        let previous = self.decoded;
         let h = header(&bytes)?;
+        let hash = sha256d(&bytes);
         let height = self
             .height
             .checked_add(1)
             .ok_or_else(|| bad("header height overflow"))?;
-        if h.prev_blockhash.to_byte_array() != sha256d(&self.header)
+        if h.prev_blockhash.to_byte_array() != self.hash
             || h.bits != expected_bits(self.profile, self.height, &previous, self.period_start)?
         {
             return Err(bad("header ancestry or difficulty"));
         }
-        h.validate_pow(strict_target(self.profile, h.bits)?)
-            .map_err(|_| bad("header proof of work"))?;
+        // `Header::validate_pow` of the strict target, on the hash made
+        // once: Bitcoin's own SHA-256 costs the statement's prover several
+        // times what the accelerated one does.
+        if !strict_target(self.profile, h.bits)?.is_met_by(BlockHash::from_byte_array(hash)) {
+            return Err(bad("header proof of work"));
+        }
         let mut sorted = self.times.clone();
         sorted.sort_unstable();
         if h.time <= sorted[sorted.len() / 2]
@@ -330,6 +340,8 @@ impl Checkpoint {
             self.times.remove(0);
         }
         self.header = bytes;
+        self.decoded = h;
+        self.hash = hash;
         self.height = height;
         Ok(())
     }

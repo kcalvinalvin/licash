@@ -29,14 +29,31 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context as _, Result};
+use licash::recovery::COMPACT_FROM;
 use licash::spend::ChainProfile;
 
 /// Cycles the statement takes for each header of an input, and for each
 /// other byte (its filing, evidence and transactions): measured with
 /// `licash-r0 hp-exec` on the statement's test inputs, 15 headers and
-/// 33.6 kB (67.7 M cycles), then 3,000 headers more (151.6 M).
+/// 33.6 kB (67.7 M cycles), then 3,000 headers more (151.6 M). Of the
+/// programs before the compact filing's, which hash each header in
+/// software and more than once.
 pub(super) const HEADER_CYCLES: u64 = 28_000;
+/// Of the program that decides the compact filing, which hashes each
+/// header once, on the zkVM's accelerator: 3,000 headers more took 28.2 M
+/// cycles on 73.0 M (9.4 k each), 10 k with a margin of its own.
+pub(super) const COMPACT_HEADER_CYCLES: u64 = 10_000;
 pub(super) const BYTE_CYCLES: u64 = 2_000;
+
+/// The cycles of each header of a contract of graph `graph`, by the program
+/// it was opened under: that of the compact filing's id on
+/// ([`COMPACT_FROM`]), the one before's below.
+pub(super) fn header_cycles(graph: u32) -> u64 {
+    match graph >= COMPACT_FROM {
+        true => COMPACT_HEADER_CYCLES,
+        false => HEADER_CYCLES,
+    }
+}
 
 /// Cycles the check of her request's signatures takes under a v4 Base,
 /// beyond its keys' bytes: the answered input under a v4 Base took 5.8 M
@@ -110,10 +127,10 @@ fn not_ready(why: &str) -> String {
     )
 }
 
-/// The cycles of a statement's input of `headers` headers and `other`
-/// bytes besides.
-pub(super) fn cycles(headers: u64, other: u64) -> u64 {
-    HEADER_CYCLES * headers + BYTE_CYCLES * other
+/// The cycles of a statement's input of `headers` headers of `per_header`
+/// cycles each ([`header_cycles`]) and `other` bytes besides.
+pub(super) fn cycles(per_header: u64, headers: u64, other: u64) -> u64 {
+    per_header * headers + BYTE_CYCLES * other
 }
 
 /// The cycles of the largest proof of an exit a contract commits the hub
@@ -121,14 +138,14 @@ pub(super) fn cycles(headers: u64, other: u64) -> u64 {
 /// its Base (`base` bytes), its publication (`publication` bytes at most),
 /// as much evidence again and its exit's transactions (8 kB), and of her
 /// request's signatures.
-pub(super) fn worst_cycles(headers: u32, publication: u32, base: usize) -> u64 {
+pub(super) fn worst_cycles(headers: u32, publication: u32, base: usize, graph: u32) -> u64 {
     let other = base as u64 + 2 * u64::from(publication) + 8_192;
-    cycles(u64::from(headers), other) + SIGNATURE_CYCLES
+    cycles(header_cycles(graph), u64::from(headers), other) + SIGNATURE_CYCLES
 }
 
 /// The cycles of the statement's input `bytes` (`HubInput::to_bytes`):
-/// Base, then the exit's headers.
-pub(super) fn input_cycles(bytes: &[u8]) -> u64 {
+/// Base, then the exit's headers; of a contract of graph `graph`.
+pub(super) fn input_cycles(bytes: &[u8], graph: u32) -> u64 {
     let word = |at: usize| {
         bytes.get(at..at + 4).map_or(0, |w| {
             u32::from_be_bytes(w.try_into().unwrap_or_default()) as usize
@@ -136,7 +153,7 @@ pub(super) fn input_cycles(bytes: &[u8]) -> u64 {
     };
     let headers = word(4 + word(0)) as u64;
     let other = (bytes.len() as u64).saturating_sub(80 * headers);
-    cycles(headers, other)
+    cycles(header_cycles(graph), headers, other)
 }
 
 /// The target time between blocks of `profile`, in seconds.
@@ -321,7 +338,7 @@ impl Prover {
         let Some(Readiness::Ready(speed)) = &self.0.state().readiness else {
             return None;
         };
-        let seconds = speed.seconds(cycles(15, 33_600));
+        let seconds = speed.seconds(cycles(HEADER_CYCLES, 15, 33_600));
         Some((f64::from(blocks) * self.0.spacing / seconds) as u64)
     }
 
@@ -903,10 +920,10 @@ mod tests {
         assert_eq!(speed.seconds(500_001), MARGIN * (3.0 * 3.0 + 100.0));
         // The statement's test input: 67.7 M cycles measured.
         let measured: f64 = 67_652_388.0;
-        let estimated = cycles(15, 34_780 - 1_200) as f64;
+        let estimated = cycles(HEADER_CYCLES, 15, 34_780 - 1_200) as f64;
         assert!((estimated / measured - 1.0).abs() < 0.01, "{estimated}");
         // With 3,000 headers more: 151.6 M.
-        let estimated = cycles(3_015, 274_776 - 3_015 * 80) as f64;
+        let estimated = cycles(HEADER_CYCLES, 3_015, 274_776 - 3_015 * 80) as f64;
         assert!(
             (estimated / 151_639_658.0 - 1.0).abs() < 0.01,
             "{estimated}"
@@ -922,8 +939,12 @@ mod tests {
         bytes.extend([0; 160]);
         bytes.extend([1; 10]);
         let other = bytes.len() as u64 - 160;
-        assert_eq!(input_cycles(&bytes), cycles(2, other));
-        assert_eq!(input_cycles(&[]), 0);
+        assert_eq!(input_cycles(&bytes, 8), cycles(HEADER_CYCLES, 2, other));
+        assert_eq!(
+            input_cycles(&bytes, COMPACT_FROM),
+            cycles(COMPACT_HEADER_CYCLES, 2, other)
+        );
+        assert_eq!(input_cycles(&[], 8), 0);
     }
 
     fn ready(dir: &Path, speed: Speed) -> Prover {
@@ -1061,7 +1082,7 @@ mod tests {
         let segment = 1_000.0 / MARGIN / 335.0;
         let speed = Speed {
             device: "cuda".into(),
-            segment_cycles: cycles(15, 33_600).div_ceil(335),
+            segment_cycles: cycles(HEADER_CYCLES, 15, 33_600).div_ceil(335),
             segment,
             tail: 0.0,
         };
