@@ -339,9 +339,9 @@ theirs, each played to its end), a trial: RISC Zero's shared Groth16 setup, sign
 checked by their work alone and not the network's signature of each block.
 The hub's terms there are signet's least: a day
 for the wallet to answer a challenge and for each party's outputs to wait,
-3 blocks deep, 12 blocks at least to respond to a request and 48 for the
-hub to prove and assert its response (a proof takes hours on a CPU). No other
-network yet.
+3 blocks deep, 12 blocks at least to respond to a request, a day for the
+holder to contest a response and 48 for the hub to prove and assert it once
+contested (a proof takes hours on a CPU). No other network yet.
 
 A proof reads Bitcoin through block headers, so a hub's statement asks for
 work on top of a holder's request's response: a chain mined in private
@@ -370,8 +370,13 @@ in are gone, an alert names the contract and why. Owed all it asks, the hub lets
 the holder's timeout pay her. Owed less (a claim of notes that are not the
 keyset's, or spent), it responds with what is owed, publishes in the
 response's disclose slot what that evidence needs public (a granted spend's
-unlock, a preimage), proves that statement and asserts the proof;
-challenged, it answers with a kept instance. On regtest the proof is the
+unlock, a preimage), and waits: the holder, shown that evidence at
+`/v1/contracts/openings/{id}/evidence` under a signature of the contract's
+claim key (nobody else is), checks it herself, and leaves the response
+alone if it bears out, which pays her what it says once her contest window
+has passed and which the hub posts itself, no proof made. Contested, the
+hub proves that statement and asserts the proof; challenged, it answers
+with a kept instance. On regtest the proof is the
 mock authority's; on signet the hub proves with `licash-r0` (r0/README.md,
 `LICASH_HP_PROVER` names another), as described below. It sweeps its outputs of each payout to its
 wallet; a payout's rest and the holder's reserve pay each party's wallet
@@ -386,7 +391,13 @@ The hub retires the notes in its ledger, all or none, and only then signs
 the fold with her (MuSig2, its nonce kept in memory and used at most once),
 paying her the claim and her reserve back and the rest to the hub less the
 fee, and broadcasts it. A note anything spent is refused, not disputed: no
-dispute follows a fold to cite the spend in. Should a fold not confirm
+dispute follows a fold to cite the spend in. The holder then asks the
+ledger, at `/v1/inquire` (notes of one keyset, each signed for by its hold
+key, so that only its holder learns anything of it), for what it holds
+against them: the owner-signed spend, with its unlock, or the claim signed
+elsewhere. She checks that herself, drops the notes it proves spent, takes
+the change of those spends and folds again on the rest; the ledger is
+read, nothing retired. Should a fold not confirm
 after the hub retired the notes, she files the same claim on Bitcoin by a
 forced close, which the hub pays as ever; a contract that ends by its
 default or by a fold that pays no claim leaves them retired, as it leaves
