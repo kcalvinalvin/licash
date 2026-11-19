@@ -43,8 +43,14 @@ impl Wallet {
         if self.wallet.hub_urls(hub)?.is_empty() {
             return Err(LicashError::invalid(format!("{hub} is no hub you use")));
         }
-        holder::fees::approve(&self.wallet, &self.dir, hub, &fees, self.known_tip())
-            .map_err(|e| LicashError::from_any(e, |reason| LicashError::Failed { reason }))
+        holder::fees::approve(
+            &self.wallet,
+            self.wallet.path(),
+            hub,
+            &fees,
+            self.known_tip(),
+        )
+        .map_err(|e| LicashError::from_any(e, |reason| LicashError::Failed { reason }))
     }
 }
 
@@ -53,7 +59,7 @@ impl Wallet {
     /// under, or approved since: as the wallet opens. Contracts that
     /// cannot be read hold no hub to any, as none do.
     pub(super) fn agree_fees(&self) {
-        if let Err(e) = holder::fees::agree(&self.wallet, &self.dir, self.known_tip()) {
+        if let Err(e) = holder::fees::agree(&self.wallet, self.wallet.path(), self.known_tip()) {
             tracing::warn!("what the contracts' hubs may charge: {e:#}");
         }
     }

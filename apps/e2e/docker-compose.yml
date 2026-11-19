@@ -222,7 +222,7 @@ services:
     entrypoint: ["sh", "-c"]
     command:
       - >-
-        [ -f /data/swaps.sqlite ] || licash-swaps init;
+        [ -f /data/wallet.sqlite ] || licash-swaps init;
         for hub in http://hub1:8338 http://hub2:8338; do
         until licash-wallet add-hub $$hub >/dev/null; do sleep 1; done; done;
         exec licash-swaps run --step 1 --fee-base 1 --fee-ppm 5000 --max 200000

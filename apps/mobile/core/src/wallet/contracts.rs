@@ -5,7 +5,7 @@
 //! There is no closing one sooner: the notes it protects are cashed out
 //! instead, and it lapses.
 //!
-//! Kept in the wallet's directory, `contracts.sqlite` and `contracts/`,
+//! Kept in the wallet's file, `wallet.sqlite`, and in `contracts/` beside it,
 //! made only once a first contract is asked for.
 
 use std::sync::{atomic::Ordering, Arc, PoisonError};
@@ -42,7 +42,8 @@ impl Wallet {
         let mut bytes = [0; 32];
         hex::decode_to_slice(id, &mut bytes)
             .map_err(|_| LicashError::invalid("not a contract id"))?;
-        let info = holder::inspect(&self.wallet, &self.dir, &bytes, self.tip()).map_err(failed)?;
+        let info = holder::inspect(&self.wallet, self.wallet.path(), &bytes, self.tip())
+            .map_err(failed)?;
         Ok(crate::ContractInspection {
             address: info.address,
             locked: info.locked,
@@ -67,8 +68,8 @@ impl Wallet {
         let offer = holder::offer(&self.wallet, &hub, None, 0);
         let offer = self.runtime.block_on(offer).map_err(unavailable)?;
         let price = offer.price();
-        let coin = holder::coin(&self.wallet, &self.dir, price).map_err(failed)?;
-        let coins = holder::coins(&self.wallet, &self.dir).map_err(failed)?;
+        let coin = holder::coin(&self.wallet, self.wallet.path(), price).map_err(failed)?;
+        let coins = holder::coins(&self.wallet, self.wallet.path()).map_err(failed)?;
         let blocks = offer.bounds.lock;
         let after_assert = holder::after_assert(&offer.quote);
         let largest = coins.first().map(|c| c.value);
@@ -111,7 +112,7 @@ impl Wallet {
     /// if no hub offers one, no coin pays one for a tenth of it at most
     /// (`SHARE`), or no hub answers.
     pub fn contract_offer(&self) -> Result<Option<ContractQuote>, LicashError> {
-        let all = holder::list(&self.dir).map_err(failed)?;
+        let all = holder::list(self.wallet.path()).map_err(failed)?;
         let tip = self.tip();
         let busy: Vec<&str> = all
             .iter()
@@ -123,7 +124,7 @@ impl Wallet {
             })
             .map(|c| c.hub.trim_end_matches('/'))
             .collect();
-        let coins = holder::coins(&self.wallet, &self.dir).map_err(failed)?;
+        let coins = holder::coins(&self.wallet, self.wallet.path()).map_err(failed)?;
         let Some(coin) = coins.first().map(|c| c.value) else {
             return Ok(None);
         };
@@ -212,7 +213,7 @@ impl Wallet {
                 .map_err(|e| LicashError::invalid(format!("a coin {coin}: {e}")))?,
             None => {
                 let least = holder::least(Some(range), cap, max_price.saturating_add(funded));
-                let coin = holder::coin(&self.wallet, &self.dir, least).map_err(failed)?;
+                let coin = holder::coin(&self.wallet, self.wallet.path(), least).map_err(failed)?;
                 let coin = coin.ok_or_else(|| {
                     LicashError::invalid(format!(
                         "no coin on Bitcoin of {least} sat at least to pay for it"
@@ -233,7 +234,7 @@ impl Wallet {
 
     /// The contracts, the newest first, as last seen.
     pub fn contracts(&self) -> Result<Vec<Contract>, LicashError> {
-        let all = holder::list(&self.dir).map_err(failed)?;
+        let all = holder::list(self.wallet.path()).map_err(failed)?;
         self.listed(&all)
     }
 
@@ -252,7 +253,7 @@ impl Wallet {
         if let Ok(tip) = self.runtime.block_on(licash_wallet::Blocks::height(&chain)) {
             self.saw(tip);
         }
-        let all = holder::resume(&self.wallet, &chain, &self.dir);
+        let all = holder::resume(&self.wallet, &chain, self.wallet.path());
         let all = self.runtime.block_on(all);
         // Carried on even if the others could not be: a forced close
         // has deadlines of its own. Its fees paid out of notes first, if
@@ -275,7 +276,7 @@ impl Wallet {
         let chain = Chain(chain, self.wallet.network());
         let tip = self.runtime.block_on(licash_wallet::Blocks::height(&chain));
         self.saw(tip.map_err(|reason| LicashError::Unavailable { reason })?);
-        let opened = holder::open_with(&self.wallet, &chain, &self.dir, hub, ask);
+        let opened = holder::open_with(&self.wallet, &chain, self.wallet.path(), hub, ask);
         let opened = self.runtime.block_on(opened).map_err(unavailable)?;
         // Protecting nothing before its funding is buried.
         Ok(self.contract(&opened, 0))
@@ -325,8 +326,14 @@ impl Wallet {
         amount: u64,
     ) -> Result<licash_wallet::Invoice, licash_wallet::Error> {
         let rate = super::recoveries::last_rate();
-        let protects =
-            holder::activation::protects(&self.wallet, &self.dir, url, amount, rate, self.tip());
+        let protects = holder::activation::protects(
+            &self.wallet,
+            self.wallet.path(),
+            url,
+            amount,
+            rate,
+            self.tip(),
+        );
         let protected = protects.unwrap_or_else(|e| {
             tracing::warn!("whether a contract protects an invoice: {e:#}");
             false
@@ -339,7 +346,8 @@ impl Wallet {
 
     /// `all`, each with what it protects of the notes held now.
     fn listed(&self, all: &[holder::Contract]) -> Result<Vec<Contract>, LicashError> {
-        let covers = holder::coverage(&self.wallet, &self.dir, all, self.tip()).map_err(failed)?;
+        let covers =
+            holder::coverage(&self.wallet, self.wallet.path(), all, self.tip()).map_err(failed)?;
         let covered = |c: &holder::Contract| covers.get(&c.id).copied().unwrap_or(0);
         Ok(all.iter().map(|c| self.contract(c, covered(c))).collect())
     }
@@ -402,10 +410,10 @@ impl Wallet {
         _held: &[licash_wallet::Balance],
         reserved: &[(Txid, u64)],
     ) -> Result<(), LicashError> {
-        let all = holder::list(&self.dir).map_err(failed)?;
+        let all = holder::list(self.wallet.path()).map_err(failed)?;
         if !all.is_empty() {
-            let covered =
-                holder::coverage(&self.wallet, &self.dir, &all, self.tip()).map_err(failed)?;
+            let covered = holder::coverage(&self.wallet, self.wallet.path(), &all, self.tip())
+                .map_err(failed)?;
             contracted(balance, &all, covered.values().sum(), reserved);
         }
         Ok(())
@@ -414,13 +422,13 @@ impl Wallet {
     /// The contracts signed, as lines of the history: what each cost,
     /// under way until its funding is in a block.
     pub(super) fn contract_activities(&self) -> Result<Vec<Activity>, LicashError> {
-        let all = holder::list(&self.dir).map_err(failed)?;
+        let all = holder::list(self.wallet.path()).map_err(failed)?;
         Ok(all.iter().filter_map(activity).collect())
     }
 
     /// More of the line of the history of the contract `id`, if any.
     pub(super) fn contract_details(&self, id: &str) -> Result<Option<Details>, LicashError> {
-        let all = holder::list(&self.dir).map_err(failed)?;
+        let all = holder::list(self.wallet.path()).map_err(failed)?;
         let found = all.into_iter().find(|c| hex(&c.id) == id);
         Ok(found.and_then(|c| {
             Some(Details::Contract {
@@ -433,7 +441,7 @@ impl Wallet {
     /// The transactions funding contracts, those signed: their change is
     /// the wallet's, to keep on Bitcoin.
     pub(super) fn fundings(&self) -> Result<Vec<Txid>, LicashError> {
-        let all = holder::list(&self.dir).map_err(failed)?;
+        let all = holder::list(self.wallet.path()).map_err(failed)?;
         Ok(all.iter().filter_map(|c| c.funding).collect())
     }
 
@@ -441,7 +449,7 @@ impl Wallet {
     /// their funding yet: no move is to take them. Those older than an
     /// opening may take ([`holder::OPENS_WITHIN`]), given up, keep none.
     pub(super) fn opening_coins(&self) -> Result<Vec<OutPoint>, LicashError> {
-        let all = holder::list(&self.dir).map_err(failed)?;
+        let all = holder::list(self.wallet.path()).map_err(failed)?;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs() as i64);

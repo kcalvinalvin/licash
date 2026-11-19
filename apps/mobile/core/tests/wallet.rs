@@ -131,7 +131,7 @@ impl Net {
             ..deposit::Config::new(sweep())
         };
         let profile = licash::spend::ChainProfile::Core30DefaultRegtest;
-        let path = dir.path().join("deposits.sqlite");
+        let path = dir.path().join("hub.sqlite");
         let gateway = deposit::Gateway::open(hub.clone(), source.clone(), profile, config, &path);
         let deposits = Arc::new(gateway.unwrap());
         let tweaks = Arc::new(Tweaks::open(&dir.path().join("tweaks.sqlite")).unwrap());
@@ -146,7 +146,7 @@ impl Net {
             downtime: 2,
             ..lightning::Config::default()
         };
-        let path = dir.path().join("lightning.sqlite");
+        let path = dir.path().join("hub.sqlite");
         let gateway = lightning::Gateway::open(hub.clone(), node.clone(), config, &path);
         let mut net = Self {
             runtime,
@@ -174,7 +174,7 @@ impl Net {
             gateway: Some(net.lightning.clone()),
             tweaks: serves_tweaks.then(|| net.tweaks.clone()),
             inbox: keeps.then(|| {
-                let path = net.dir.path().join("inbox.sqlite");
+                let path = net.dir.path().join("hub.sqlite");
                 Arc::new(licash_hub_service::inbox::Inbox::open(&path).unwrap())
             }),
             relays,
@@ -2090,42 +2090,29 @@ fn a_phone_whose_hub_opens_no_contracts_has_none_and_keeps_no_file_for_them() {
     alice.revoke_exit_consent().unwrap();
     let dir = std::path::Path::new(&net.dir("alice")).to_owned();
     assert!(dir.join("wallet.sqlite").exists());
-    assert!(!dir.join("contracts.sqlite").exists() && !dir.join("contracts").exists());
+    assert!(!holds_contracts(&dir));
 }
 
 /// A contract at `hub` in the wallet's directory `dir`, its F buried, as
 /// one opened there leaves it: its hub held to `fees`, as JSON.
 fn contract_under(dir: &str, hub: &str, fees: &str) {
-    let db = rusqlite::Connection::open(std::path::Path::new(dir).join("contracts.sqlite"));
-    let db = db.unwrap();
-    db.execute_batch(
-        "CREATE TABLE contracts (
-             id BLOB PRIMARY KEY, hub TEXT NOT NULL, format INTEGER NOT NULL,
-             phase INTEGER NOT NULL, mock INTEGER NOT NULL, irrevocable INTEGER NOT NULL,
-             deposit BLOB NOT NULL, value INTEGER NOT NULL, price INTEGER NOT NULL,
-             cap INTEGER NOT NULL, assert_height INTEGER NOT NULL,
-             close_height INTEGER NOT NULL, funding BLOB, since INTEGER NOT NULL, fate TEXT,
-             abandoned TEXT, state BLOB NOT NULL, created_at INTEGER NOT NULL,
-             updated_at INTEGER NOT NULL
-         ) STRICT;
-         CREATE TABLE ceilings (
-             id BLOB PRIMARY KEY REFERENCES contracts (id), fees TEXT NOT NULL,
-             updated_at INTEGER NOT NULL
-         ) STRICT;
-         PRAGMA user_version = 1;",
-    )
-    .unwrap();
-    db.execute(
-        "INSERT INTO contracts VALUES (?2, ?1, 1, 0, 1, 1, zeroblob(36), 60000, 23000, 4096,
-                                       360, 500, NULL, 200, 'live', NULL, x'', 0, 0)",
-        rusqlite::params![hub, [1u8; 32]],
-    )
-    .unwrap();
-    db.execute(
-        "INSERT INTO ceilings VALUES (?1, ?2, 0)",
-        rusqlite::params![[1u8; 32], fees],
-    )
-    .unwrap();
+    let fees: licash_api::Fees = serde_json::from_str(fees).unwrap();
+    let wallet = std::path::Path::new(dir).join("wallet.sqlite");
+    licash_contracts::holder::seed_contract(&wallet, hub, &fees).unwrap();
+}
+
+/// Whether the wallet's directory `dir` holds the holder's contracts: made
+/// with the first contract, and by no reading of them.
+fn holds_contracts(dir: &std::path::Path) -> bool {
+    let db = rusqlite::Connection::open(dir.join("wallet.sqlite")).unwrap();
+    let n: i64 = db
+        .query_row(
+            "SELECT count(*) FROM schema_versions WHERE component = 'contracts'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    n > 0 || dir.join("contracts").exists()
 }
 
 #[test]
@@ -2147,7 +2134,7 @@ fn a_phone_pays_a_hub_charging_more_than_its_contract_opened_under_once_approved
     };
     alice.approve_fees(hub.url.clone(), charged).unwrap();
     let dir = net.dir("alice");
-    assert!(!std::path::Path::new(&dir).join("contracts.sqlite").exists());
+    assert!(!holds_contracts(std::path::Path::new(&dir)));
     let other = invalid(alice.approve_fees("https://other.example".into(), charged));
     assert!(other.contains("no hub you use"), "{other}");
     drop(alice);
@@ -2216,7 +2203,7 @@ fn a_phone_with_no_contract_forces_none_closed_and_keeps_no_file_for_it() {
     assert!(alice.resume_contracts(light.clone()).unwrap().is_empty());
     assert!(alice.recoveries().unwrap().is_empty());
     let dir = std::path::Path::new(&net.dir("alice")).to_owned();
-    assert!(!dir.join("contracts.sqlite").exists());
+    assert!(!holds_contracts(&dir));
 }
 
 #[test]

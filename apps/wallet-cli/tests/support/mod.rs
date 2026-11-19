@@ -138,7 +138,7 @@ impl Server {
     /// for their payees, as hubs do.
     pub fn keeping(fee: Fee, relays: Vec<String>) -> Self {
         let mut server = Self::with_relays(fee, relays);
-        let path = server._dir.path().join("inbox.sqlite");
+        let path = server._dir.path().join("hub.sqlite");
         server.inbox = Some(Arc::new(
             licash_hub_service::inbox::Inbox::open(&path).unwrap(),
         ));
@@ -202,7 +202,7 @@ impl Server {
                 ..Config::default()
             };
             let node = Arc::new(Fake::new());
-            let path = dir.path().join("lightning.sqlite");
+            let path = dir.path().join("hub.sqlite");
             let gateway = Gateway::open(hub.clone(), node.clone(), config, &path).unwrap();
             (Arc::new(gateway), node)
         });
@@ -221,7 +221,7 @@ impl Server {
                 min_fee_rate: bitcoin::FeeRate::from_sat_per_vb_u32(1),
                 ..deposit::Config::new(sweep())
             };
-            let (source, path) = (url.parse().unwrap(), dir.path().join("deposits.sqlite"));
+            let (source, path) = (url.parse().unwrap(), dir.path().join("hub.sqlite"));
             let profile = licash::spend::ChainProfile::Core30DefaultRegtest;
             let gateway = deposit::Gateway::open(hub.clone(), source, profile, config, &path);
             (Arc::new(gateway.unwrap()), url)

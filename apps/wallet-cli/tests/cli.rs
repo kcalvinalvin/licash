@@ -59,44 +59,25 @@ fn available(file: &Path) -> (u64, u64) {
     })
 }
 
-/// A contract at `hub` beside the wallet `file`, its F buried, as
-/// `open-contract` leaves one in a file of version `version`: its hub
-/// held to `fees`, if any were kept with it.
-fn contract_at(file: &Path, hub: &str, fees: Option<&Value>, version: i64) {
-    let db = rusqlite::Connection::open(file.parent().unwrap().join("contracts.sqlite")).unwrap();
-    db.execute_batch(
-        "CREATE TABLE contracts (
-             id BLOB PRIMARY KEY, hub TEXT NOT NULL, format INTEGER NOT NULL,
-             phase INTEGER NOT NULL, mock INTEGER NOT NULL, irrevocable INTEGER NOT NULL,
-             deposit BLOB NOT NULL, value INTEGER NOT NULL, price INTEGER NOT NULL,
-             cap INTEGER NOT NULL, assert_height INTEGER NOT NULL,
-             close_height INTEGER NOT NULL, funding BLOB, since INTEGER NOT NULL, fate TEXT,
-             abandoned TEXT, state BLOB NOT NULL, created_at INTEGER NOT NULL,
-             updated_at INTEGER NOT NULL
-         ) STRICT;",
-    )
-    .unwrap();
-    db.execute(
-        "INSERT INTO contracts VALUES (?2, ?1, 1, 0, 1, 1, zeroblob(36), 60000, 23000, 4096,
-                                       360, 500, NULL, 200, 'live', NULL, x'', 0, 0)",
-        rusqlite::params![hub, [1u8; 32]],
-    )
-    .unwrap();
-    if let Some(fees) = fees {
-        db.execute_batch(
-            "CREATE TABLE ceilings (
-                 id BLOB PRIMARY KEY REFERENCES contracts (id), fees TEXT NOT NULL,
-                 updated_at INTEGER NOT NULL
-             ) STRICT;",
+/// A contract at `hub` in the wallet `file`, its F buried, as
+/// `open-contract` leaves one: its hub held to `fees`.
+fn contract_at(file: &Path, hub: &str, fees: &Value) {
+    let fees: licash_api::Fees = serde_json::from_value(fees.clone()).unwrap();
+    licash_contracts::holder::seed_contract(file, hub, &fees).unwrap();
+}
+
+/// Whether the wallet `file` holds the holder's contracts: made with the
+/// first contract, and by no reading of them.
+fn holds_contracts(file: &Path) -> bool {
+    let db = rusqlite::Connection::open(file).unwrap();
+    let n: i64 = db
+        .query_row(
+            "SELECT count(*) FROM schema_versions WHERE component = 'contracts'",
+            [],
+            |r| r.get(0),
         )
         .unwrap();
-        db.execute(
-            "INSERT INTO ceilings VALUES (?2, ?1, 0)",
-            rusqlite::params![fees.to_string(), [1u8; 32]],
-        )
-        .unwrap();
-    }
-    db.pragma_update(None, "user_version", version).unwrap();
+    n > 0
 }
 
 #[test]
@@ -118,7 +99,7 @@ fn a_hub_charging_more_than_its_contracts_opened_under_is_paid_once_its_fees_are
         (&false.into(), &false.into())
     );
     assert_eq!(asked["charged"], charged);
-    assert!(!alice.with_file_name("contracts.sqlite").exists());
+    assert!(!holds_contracts(&alice));
     failed(
         wallet(&alice, &["approve-fees", "http://127.0.0.1:1"], None),
         1,
@@ -128,7 +109,7 @@ fn a_hub_charging_more_than_its_contracts_opened_under_is_paid_once_its_fees_are
     // Her contract there opened while a payment was free.
     let mut agreed = charged.clone();
     agreed["spend"]["base"] = 0.into();
-    contract_at(&alice, &url, Some(&agreed), 1);
+    contract_at(&alice, &url, &agreed);
     let refused = "charges more than agreed";
     failed(wallet(&alice, &["send", &bob_at, "10"], None), 1, refused);
     assert_eq!(available(&alice), (100, 0));
@@ -167,26 +148,6 @@ fn a_hub_charging_more_than_its_contracts_opened_under_is_paid_once_its_fees_are
     );
     let text = ok(wallet(&alice, &["hubs"], None));
     assert!(!text.contains("more than agreed"), "{text}");
-
-    // Contracts opened before any fees were kept, or kept by a build this
-    // one cannot read: no hub is held to anything.
-    for (name, version) in [("carol", 1), ("dave", 9)] {
-        let (wallet_file, _) = party(dir.path(), name, Some(&hub));
-        let at = alice_at(&wallet_file);
-        let funds = serde_json::to_string(&hub.pay(&address(&at), 100)).unwrap();
-        ok(wallet(&wallet_file, &["receive"], Some(&funds)));
-        contract_at(
-            &wallet_file,
-            &url,
-            (version == 9).then_some(&agreed),
-            version,
-        );
-        assert_eq!(
-            json(&wallet_file, &["approve-fees", &url])["agreed"],
-            Value::Null
-        );
-        ok(wallet(&wallet_file, &["send", &bob_at, "10"], None));
-    }
 }
 
 /// The address of the wallet `file`.

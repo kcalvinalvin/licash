@@ -474,6 +474,34 @@ fn rank_code_hubs(mut hubs: Vec<(String, u64, u64)>) -> Vec<String> {
     hubs.into_iter().map(|(url, ..)| url).collect()
 }
 
+/// A live contract of hers at `hub`, F buried, its hub held to `fees`, kept
+/// in the wallet's file `wallet_file` as opening one leaves it: for tests of
+/// what such a contract holds a wallet to, which need none opened.
+#[cfg(feature = "testing")]
+#[doc(hidden)]
+pub fn seed_contract(wallet_file: &Path, hub: &str, fees: &licash_api::Fees) -> Result<()> {
+    use bitcoin::hashes::Hash as _;
+    let store = Store::open(wallet_file)?;
+    let new = New {
+        id: [1; 32],
+        hub,
+        mock: true,
+        deposit: OutPoint {
+            txid: bitcoin::Txid::all_zeros(),
+            vout: 0,
+        },
+        value: 60_000,
+        price: 23_000,
+        cap: 4_096,
+        assert_height: 360,
+        close_height: 500,
+        since: 200,
+        state: b"",
+    };
+    store.insert_under(&new, fees, 0)?;
+    store.settle_fate(&new.id, Fate::Live, None)
+}
+
 /// Check a restored store before installing it, without advancing a driver
 /// or touching the chain: every recovery row must be one this build carries
 /// on, and every signed opening it can read must have the instances its
@@ -1139,7 +1167,7 @@ mod tests {
                     hub: "http://hub.example",
                     mock: true,
                     deposit: OutPoint {
-                        txid: Txid::all_zeros(),
+                        txid: bitcoin::Txid::all_zeros(),
                         vout,
                     },
                     value: 60_000,

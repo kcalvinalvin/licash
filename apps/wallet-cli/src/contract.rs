@@ -26,16 +26,11 @@ fn node(chain: Option<&str>) -> anyhow::Result<Node> {
     Ok(Node(chain.parse().context("--chain")?))
 }
 
-/// The directory of the wallet's file, where its contracts are kept.
-fn dir(path: &Path) -> &Path {
-    path.parent().unwrap_or(Path::new("."))
-}
-
 /// Hold each hub to the fees the wallet's contracts there opened under,
 /// or its owner approved since. A wallet whose contracts cannot be read
 /// holds no hub to any, as one with none.
 pub fn agree(wallet: &Wallet<Http>, path: &Path) {
-    if let Err(e) = holder::fees::agree(wallet, dir(path), None) {
+    if let Err(e) = holder::fees::agree(wallet, path, None) {
         tracing::warn!("what the contracts' hubs may charge: {e:#}");
     }
 }
@@ -63,7 +58,7 @@ pub async fn approve_fees(
     };
     let raised = agreed.is_some_and(|agreed| charged.above(&agreed));
     if yes && raised {
-        holder::fees::approve(wallet, dir(path), hub, &charged, None)?;
+        holder::fees::approve(wallet, path, hub, &charged, None)?;
     }
     let now = wallet.fee_ceilings(hub)?;
     let said = |fees: &licash_api::Fees| crate::say::fees(fees);
@@ -145,10 +140,9 @@ pub async fn open(
         deposit: asked.coin,
         funded: u64::from(asked.funded),
     };
-    let dir = dir(path);
     let contract = match asked.any_fees {
-        true => holder::open_anyway(wallet, &chain, dir, hub, ask).await,
-        false => holder::open_with(wallet, &chain, dir, hub, ask).await,
+        true => holder::open_anyway(wallet, &chain, path, hub, ask).await,
+        false => holder::open_with(wallet, &chain, path, hub, ask).await,
     }?;
     let mut value = contract_json(&contract);
     value["terms"] = terms.json();
@@ -370,15 +364,15 @@ pub async fn list(
     let (contracts, claims) = match chain {
         Some(_) => {
             let node = node(chain)?;
-            let contracts = holder::resume(wallet, &node, dir(path)).await?;
+            let contracts = holder::resume(wallet, &node, path).await?;
             let tip = node.height().await.map_err(|e| anyhow::anyhow!(e))?;
-            let each = holder::coverage(wallet, dir(path), &contracts, tip)?;
+            let each = holder::coverage(wallet, path, &contracts, tip)?;
             let claims = |c: &Contract| c.live(tip).then(|| each.get(&c.id).copied().unwrap_or(0));
             let claims: Vec<_> = contracts.iter().map(claims).collect();
             (contracts, claims)
         }
         None => {
-            let contracts = holder::list(dir(path))?;
+            let contracts = holder::list(path)?;
             let none = vec![None; contracts.len()];
             (contracts, none)
         }
@@ -407,7 +401,7 @@ pub fn code_hubs(wallet: &Wallet<Http>, path: &Path) -> anyhow::Result<Vec<Strin
     let hubs = wallet.hubs()?;
     let tips = hubs.iter().filter_map(|(_, info)| info.locks.as_ref());
     let tip = tips.map(|l| l.height).max().unwrap_or(0);
-    holder::code_hubs(wallet, dir(path), tip)
+    holder::code_hubs(wallet, path, tip)
 }
 
 /// What is not protected at a hub: `held` there, of which its live
@@ -429,7 +423,7 @@ impl Unprotected {
 /// Judged at the tip each hub last said, read from the contracts kept by
 /// the wallet at `path`, never driving them.
 pub fn unprotected(wallet: &Wallet<Http>, path: &Path) -> anyhow::Result<Vec<Unprotected>> {
-    let contracts = holder::list(dir(path))?;
+    let contracts = holder::list(path)?;
     let mut found = Vec::new();
     for (url, info) in wallet.hubs()? {
         let Some(terms) = &info.contracts else {
@@ -445,9 +439,7 @@ pub fn unprotected(wallet: &Wallet<Http>, path: &Path) -> anyhow::Result<Vec<Unp
         let tip = info.locks.as_ref().map_or(0, |l| l.height);
         let urls = wallet.hub_urls(&url)?;
         let here: Vec<Contract> = contracts.iter().filter(|c| c.at(&urls)).cloned().collect();
-        let covered: u64 = holder::coverage(wallet, dir(path), &here, tip)?
-            .values()
-            .sum();
+        let covered: u64 = holder::coverage(wallet, path, &here, tip)?.values().sum();
         let one = Unprotected {
             hub: url,
             held,
@@ -524,7 +516,7 @@ fn contract_json(c: &Contract) -> serde_json::Value {
 /// The contract of the wallet's whose id is or starts with `id`, in hex.
 fn contract_id(path: &Path, id: &str) -> anyhow::Result<[u8; 32]> {
     let id = id.to_lowercase();
-    let mut found = holder::list(dir(path))?
+    let mut found = holder::list(path)?
         .into_iter()
         .map(|c| c.id)
         .filter(|c| licash_contracts::hex_id(c).starts_with(&id));
@@ -547,9 +539,9 @@ pub async fn force_close(
     let chain = node(chain)?;
     let id = contract_id(path, id)?;
     let rate = crate::onchain::rate(&chain.0, fee_rate).await?;
-    let forcing = recovery::recoveries(dir(path))?.iter().all(|r| r.id != id);
+    let forcing = recovery::recoveries(path)?.iter().all(|r| r.id != id);
     if forcing {
-        if let Some(need) = recovery::challenge_shortfall(wallet, dir(path), rate)? {
+        if let Some(need) = recovery::challenge_shortfall(wallet, path, rate)? {
             eprintln!(
                 "warning: no coin of {} sat on Bitcoin besides the others to set aside for a \
                  challenge's fee: should the hub prove falsely, a challenge pays what the \
@@ -558,7 +550,7 @@ pub async fn force_close(
             );
         }
     }
-    let forced = recovery::force_close(wallet, &chain, dir(path), &id, rate).await?;
+    let forced = recovery::force_close(wallet, &chain, path, &id, rate).await?;
     show(json, recovery_json(&forced), recovery_line(&forced));
     Ok(())
 }
@@ -575,7 +567,7 @@ pub async fn close(
 ) -> anyhow::Result<()> {
     let chain = node(chain)?;
     let id = contract_id(path, id)?;
-    let txid = licash_contracts::holder::close(wallet, &chain, dir(path), &id).await?;
+    let txid = licash_contracts::holder::close(wallet, &chain, path, &id).await?;
     let hex = licash_contracts::hex_id(&id);
     show(
         json,
@@ -599,7 +591,7 @@ pub async fn invoice(
     let node = node(Some(chain))?;
     let tip = node.height().await.map_err(|e| anyhow::anyhow!(e))?;
     let rate = crate::onchain::rate(&node.0, None).await?;
-    if !activation::protects(wallet, dir(path), hub, amount, rate, tip)? {
+    if !activation::protects(wallet, path, hub, amount, rate, tip)? {
         tracing::info!(%hub, amount, "no contract at the hub protects the invoice's lock");
         return Ok(wallet.invoice(hub, amount).await?);
     }
@@ -623,15 +615,12 @@ pub async fn recoveries(
         Some(_) => {
             let chain = node(chain)?;
             let rate = crate::onchain::rate(&chain.0, fee_rate).await?;
-            if recovery::recoveries(dir(path))?
-                .iter()
-                .any(|r| !r.stage.over())
-            {
+            if recovery::recoveries(path)?.iter().any(|r| !r.stage.over()) {
                 paying = fund(wallet, path, &chain, route, rate).await;
             }
-            recovery::advance(wallet, &chain, dir(path), rate).await?
+            recovery::advance(wallet, &chain, path, rate).await?
         }
-        None => recovery::recoveries(dir(path))?,
+        None => recovery::recoveries(path)?,
     };
     let mut lines: Vec<String> = all.iter().map(recovery_line).collect();
     lines.extend(paying);
@@ -659,7 +648,7 @@ async fn fund(
     if let Err(e) = crate::onchain::catch_up(wallet, &chain.0, None).await {
         tracing::warn!("coins not looked for: {e:#}");
     }
-    let needs = match recovery::fee_needs(wallet, chain, dir(path), rate).await {
+    let needs = match recovery::fee_needs(wallet, chain, path, rate).await {
         Ok(needs) => needs,
         Err(e) => {
             tracing::warn!("forced closes' fees not looked at: {e:#}");
@@ -672,9 +661,7 @@ async fn fund(
         let amount = need.amount.to_sat().max(FEE_PAYOUT_FLOOR);
         match crate::payout::for_fees(wallet, route, amount, rate).await {
             Ok(payout) => {
-                if let Err(e) =
-                    recovery::expect_fee(dir(path), &need.id, need.purpose, &payout.hash)
-                {
+                if let Err(e) = recovery::expect_fee(path, &need.id, need.purpose, &payout.hash) {
                     tracing::warn!(id, "a fee payout not recorded: {e:#}");
                 }
                 lines.push(format!(
@@ -703,12 +690,12 @@ const FEE_PAYOUT_FLOOR: u64 = 10_000;
 /// only before its request is signed.
 pub fn give_up(wallet: &Wallet<Http>, path: &Path, id: &str) -> anyhow::Result<()> {
     let id = contract_id(path, id)?;
-    recovery::give_up(wallet, dir(path), &id)
+    recovery::give_up(wallet, path, &id)
 }
 
 pub fn allow_publication_fee(path: &Path, id: &str, sats: u64) -> anyhow::Result<()> {
     let id = contract_id(path, id)?;
-    recovery::allow_publication_fee(dir(path), &id, sats)
+    recovery::allow_publication_fee(path, &id, sats)
 }
 
 fn recovery_line(r: &Recovery) -> String {

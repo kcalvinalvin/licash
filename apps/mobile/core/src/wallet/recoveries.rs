@@ -235,7 +235,7 @@ impl Wallet {
         let chain = Chain(chain, self.wallet.network());
         let forced = async {
             let rate = rate(&chain).await;
-            recovery::force_close(&self.wallet, &chain, &self.dir, &id, rate).await
+            recovery::force_close(&self.wallet, &chain, self.wallet.path(), &id, rate).await
         };
         let forced = self.runtime.block_on(forced).map_err(failed)?;
         tracing::warn!(id = %hex::encode(id), stage = forced.stage.as_str(), "contract forced closed");
@@ -253,7 +253,8 @@ impl Wallet {
     ) -> Result<Option<u64>, LicashError> {
         let chain = Chain(chain, self.wallet.network());
         let rate = self.runtime.block_on(rate(&chain));
-        let short = recovery::challenge_shortfall(&self.wallet, &self.dir, rate).map_err(failed)?;
+        let short = recovery::challenge_shortfall(&self.wallet, self.wallet.path(), rate)
+            .map_err(failed)?;
         Ok(short.map(|a| a.to_sat()))
     }
 
@@ -277,7 +278,7 @@ impl Wallet {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         let chain = Chain(chain, self.wallet.network());
-        let closed = licash_contracts::holder::close(&self.wallet, &chain, &self.dir, &id);
+        let closed = licash_contracts::holder::close(&self.wallet, &chain, self.wallet.path(), &id);
         let txid = self.runtime.block_on(closed).map_err(failed)?;
         tracing::info!(id = %hex::encode(id), %txid, "contract closed early");
         Ok(txid.to_string())
@@ -285,7 +286,7 @@ impl Wallet {
 
     /// The contracts forced closed, the oldest first, as last seen.
     pub fn recoveries(&self) -> Result<Vec<Recovery>, LicashError> {
-        let all = recovery::recoveries(&self.dir).map_err(failed)?;
+        let all = recovery::recoveries(self.wallet.path()).map_err(failed)?;
         Ok(all.iter().map(shown).collect())
     }
 
@@ -297,7 +298,7 @@ impl Wallet {
             .contracting
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        recovery::give_up(&self.wallet, &self.dir, &id).map_err(failed)
+        recovery::give_up(&self.wallet, self.wallet.path(), &id).map_err(failed)
     }
 
     /// Let forcing contract `id` closed pay up to `sats` in all for
@@ -309,7 +310,7 @@ impl Wallet {
             .contracting
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        recovery::allow_publication_fee(&self.dir, &id, sats).map_err(failed)?;
+        recovery::allow_publication_fee(self.wallet.path(), &id, sats).map_err(failed)?;
         tracing::info!(id = %hex::encode(id), sats, "publication fee allowed");
         Ok(())
     }
@@ -327,14 +328,14 @@ impl Wallet {
     /// provider preferred, recorded as awaited. One not paid out is left
     /// to her coins, as are its fees; nothing else held up.
     pub(super) fn fund_recoveries(&self, chain: &Chain) {
-        let active =
-            recovery::recoveries(&self.dir).is_ok_and(|all| all.iter().any(|r| !r.stage.over()));
+        let active = recovery::recoveries(self.wallet.path())
+            .is_ok_and(|all| all.iter().any(|r| !r.stage.over()));
         if !active {
             return;
         }
         let needs = async {
             let rate = rate(chain).await;
-            recovery::fee_needs(&self.wallet, chain, &self.dir, rate).await
+            recovery::fee_needs(&self.wallet, chain, self.wallet.path(), rate).await
         };
         let needs = match self.runtime.block_on(needs) {
             Ok(needs) => needs,
@@ -354,7 +355,7 @@ impl Wallet {
                 Ok(paying) => {
                     tracing::info!(%id, hash = %paying.id, amount, "notes paid out for a forced close's fees");
                     if let Err(e) =
-                        recovery::expect_fee(&self.dir, &need.id, need.purpose, &paying.id)
+                        recovery::expect_fee(self.wallet.path(), &need.id, need.purpose, &paying.id)
                     {
                         tracing::warn!(%id, "a fee payout not recorded: {e:#}");
                     }
@@ -367,14 +368,14 @@ impl Wallet {
     /// Carry every forced close on as far as `chain` lets it, the wallet
     /// contracting: one that cannot go on holds up nothing else.
     pub(super) fn advance_recoveries(&self, chain: &Chain) {
-        let active =
-            recovery::recoveries(&self.dir).is_ok_and(|all| all.iter().any(|r| !r.stage.over()));
+        let active = recovery::recoveries(self.wallet.path())
+            .is_ok_and(|all| all.iter().any(|r| !r.stage.over()));
         if !active {
             return;
         }
         let advanced = async {
             let rate = rate(chain).await;
-            recovery::advance(&self.wallet, chain, &self.dir, rate).await
+            recovery::advance(&self.wallet, chain, self.wallet.path(), rate).await
         };
         if let Err(e) = self.runtime.block_on(advanced) {
             tracing::warn!("forced closes not carried on: {e:#}");

@@ -323,7 +323,6 @@ impl Swaps {
         let stocked = hubs.pay(1, &wallet.address(), 3_000);
         let urls = vec![hubs.url(0), hubs.url(1)];
         let relays = hubs.relays();
-        let swaps = dir.path().join("swaps.sqlite");
         let (down, refuse) = (
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
@@ -341,7 +340,7 @@ impl Swaps {
                     wallet.add_hub(url).await.unwrap();
                 }
                 wallet.receive(&stocked).unwrap();
-                let provider = Provider::create(&swaps, wallet, terms).unwrap();
+                let provider = Provider::create(wallet, terms).unwrap();
                 let paying = lightning.is_some();
                 let provider = match lightning {
                     Some((node, lightning)) => provider.pay_lightning(node, lightning).unwrap(),

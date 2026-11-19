@@ -1,6 +1,8 @@
 //! Explicit backups. Existing wallets and startup behavior are unchanged.
 //! A phrase encodes the original 256-bit seed as BIP39 entropy, not the
-//! BIP39 PBKDF seed. Only a state bundle also preserves notes and contracts.
+//! BIP39 PBKDF seed. Only a state bundle also preserves notes and contracts:
+//! one snapshot of `wallet.sqlite`, which holds the wallet's tables and the
+//! holder's contracts, and the files kept beside it.
 
 use std::{
     collections::BTreeMap,
@@ -18,7 +20,10 @@ use sha2::{Digest, Sha256};
 use super::{kept_file, wallet_file, Kept, Wallet};
 use crate::{ChainSource, LicashError, Network};
 
-const FORMAT: u32 = 1;
+/// The bundle's format: 2 keeps the contracts in `wallet.sqlite`, where
+/// format 1 kept them in a `contracts.sqlite` of their own, which this
+/// version restores no more.
+const FORMAT: u32 = 2;
 const MAX_FILES: usize = 100_000;
 const MAX_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 
@@ -125,18 +130,16 @@ impl Wallet {
                 .tempdir_in(parent)?;
             let manifest = extract(Path::new(&bundle), staged.path())?;
             validate_database(&wallet_file(staged.path()))?;
-            if staged.path().join("contracts.sqlite").exists() {
-                validate_database(&staged.path().join("contracts.sqlite"))?;
-            }
             let http = licash_transport::Http::new(None)?;
             let wallet = licash_wallet::Wallet::open(&wallet_file(staged.path()), http)?;
             ensure!(
                 wallet.network().name() == manifest.network,
                 "bundle network disagrees with its wallet"
             );
-            licash_contracts::holder::validate_backup(&wallet, staged.path())?;
+            let staged_wallet = wallet_file(staged.path());
+            licash_contracts::holder::validate_backup(&wallet, &staged_wallet)?;
             // Consent to exit is given on the phone it acts on, not restored.
-            licash_contracts::holder::exit::revoke(staged.path())?;
+            licash_contracts::holder::exit::revoke(&staged_wallet)?;
             drop(wallet);
             ensure!(
                 !holds_state(&dir),
@@ -198,15 +201,9 @@ impl Wallet {
         let snapshots = tempfile::Builder::new()
             .prefix(".wallet-snapshot-")
             .tempdir_in(self.dir.parent().context("no wallet parent")?)?;
+        // One snapshot holds the wallet's tables and the contracts' alike.
         self.wallet.backup_to(&wallet_file(snapshots.path()))?;
-        licash_contracts::holder::snapshot_database(
-            &self.dir,
-            &snapshots.path().join("contracts.sqlite"),
-        )?;
         let mut paths = vec!["wallet.sqlite".to_owned()];
-        if snapshots.path().join("contracts.sqlite").exists() {
-            paths.push("contracts.sqlite".into());
-        }
         for name in ["app.json", "contacts.json", "contracts-change"] {
             let source = self.dir.join(name);
             if source.exists() {
@@ -299,7 +296,6 @@ fn holds_state(dir: &Path) -> bool {
     [
         "wallet.sqlite",
         "wallet.sqlite-wal",
-        "contracts.sqlite",
         "contracts",
         "contacts.json",
     ]
@@ -316,8 +312,7 @@ fn allowed(path: &Path) -> bool {
     }
     let parts = path.iter().filter_map(|p| p.to_str()).collect::<Vec<_>>();
     match parts.as_slice() {
-        ["wallet.sqlite" | "contracts.sqlite" | "app.json" | "contacts.json"
-        | "contracts-change"] => true,
+        ["wallet.sqlite" | "app.json" | "contacts.json" | "contracts-change"] => true,
         ["contracts", id, file] => {
             id.len() == 64
                 && id.bytes().all(|b| b.is_ascii_hexdigit())
@@ -532,8 +527,15 @@ mod tests {
         assert!(original.bundle(&bundle).is_err());
         assert!(!bundle.exists());
         fs::write(original.dir.join("contacts.json"), b"[]").unwrap();
-        // Her consent to exit, given on this phone only.
-        File::create(original.dir.join("contracts.sqlite")).unwrap();
+        // A contract of hers, which one snapshot of the wallet's file holds
+        // beside the notes, and her consent to exit it, given on this phone
+        // only.
+        licash_contracts::holder::seed_contract(
+            &wallet_file(&original.dir),
+            "http://hub.example",
+            &licash_api::Fees::default(),
+        )
+        .unwrap();
         let address = original.bitcoin_address().unwrap();
         let wrong = "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx".to_owned();
         assert!(original.consent_to_exit(wrong, 2_016).is_err());
@@ -562,6 +564,9 @@ mod tests {
         assert_eq!(restored.wallet.silent_next().unwrap(), Some(100));
         assert_eq!(fs::read(restored.dir.join("contacts.json")).unwrap(), b"[]");
         assert_eq!(restored.birthday(), Some(42));
+        let kept = licash_contracts::holder::list(restored.wallet.path()).unwrap();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].hub, "http://hub.example");
         assert_eq!(restored.exit_consent().unwrap(), None);
         assert_eq!(original.exit_consent().unwrap(), Some(given));
         let aside = fs::read_dir(dir.path())
@@ -614,8 +619,14 @@ mod tests {
 
     #[test]
     fn bad_checksums_duplicates_and_future_formats_never_install_partial_state() {
-        for (format, duplicate, bad_hash) in [(1, false, true), (1, true, false), (2, false, false)]
-        {
+        // Of the format before this one, which kept the contracts in a file
+        // of their own, and of one after it.
+        for (format, duplicate, bad_hash) in [
+            (2, false, true),
+            (2, true, false),
+            (1, false, false),
+            (3, false, false),
+        ] {
             let dir = tempfile::tempdir().unwrap();
             let bundle = dir.path().join("input.tar");
             archive(&bundle, format, duplicate, bad_hash);
@@ -647,6 +658,7 @@ mod tests {
             "contracts/../../wallet.sqlite",
             "tor/state",
             "wallet.sqlite-wal",
+            "contracts.sqlite",
         ] {
             assert!(!allowed(Path::new(path)), "{path}");
         }

@@ -33,7 +33,7 @@ impl Wallet {
         })?;
         let s = licash_contracts::holder::safety::of(
             &self.wallet,
-            &self.dir,
+            self.wallet.path(),
             &id,
             self.tip.load(Ordering::Relaxed),
             exit_margin,

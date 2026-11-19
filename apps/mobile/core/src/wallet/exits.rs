@@ -100,7 +100,9 @@ fn failed(e: anyhow::Error) -> LicashError {
 impl Wallet {
     /// Her consent to exit contracts ending, if given and not revoked.
     pub fn exit_consent(&self) -> Result<Option<ExitConsent>, LicashError> {
-        Ok(exit::consent(&self.dir).map_err(failed)?.map(shown))
+        Ok(exit::consent(self.wallet.path())
+            .map_err(failed)?
+            .map(shown))
     }
 
     /// Consent to exit contracts ending, her notes paid out to `address`
@@ -115,7 +117,7 @@ impl Wallet {
             .contracting
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let given = exit::consent_to(&self.wallet, &self.dir, &address, exit_margin)
+        let given = exit::consent_to(&self.wallet, self.wallet.path(), &address, exit_margin)
             .map_err(|e| LicashError::invalid(format!("{e:#}")))?;
         tracing::info!(exit_margin, "consented to exit contracts ending");
         Ok(shown(given))
@@ -128,7 +130,7 @@ impl Wallet {
             .contracting
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        exit::revoke(&self.dir).map_err(failed)?;
+        exit::revoke(self.wallet.path()).map_err(failed)?;
         tracing::info!("consent to exit contracts revoked");
         Ok(())
     }
@@ -151,7 +153,7 @@ impl Wallet {
         let driven = exit::drive(
             &self.wallet,
             &chain,
-            &self.dir,
+            self.wallet.path(),
             &cash_out,
             exit_margin,
             rate,

@@ -258,7 +258,7 @@ impl Wallet {
     /// The hubs the wallet's codes name, preferred first
     /// ([`licash_contracts::holder::code_hubs`]).
     pub(crate) fn code_hubs(&self) -> Result<Vec<String>, LicashError> {
-        licash_contracts::holder::code_hubs(&self.wallet, &self.dir, self.tip())
+        licash_contracts::holder::code_hubs(&self.wallet, self.wallet.path(), self.tip())
             .map_err(LicashError::failed)
     }
 
@@ -1587,8 +1587,10 @@ impl Wallet {
     /// one for each of its contracts: the txid of no transaction
     /// ([`licash_contracts::holder::recovery::challenge_marker`]).
     fn set_aside(&self) -> Result<Vec<bitcoin::Txid>, LicashError> {
-        let all = licash_contracts::holder::list(&self.dir).map_err(|e| LicashError::Failed {
-            reason: format!("{e:#}"),
+        let all = licash_contracts::holder::list(self.wallet.path()).map_err(|e| {
+            LicashError::Failed {
+                reason: format!("{e:#}"),
+            }
         })?;
         Ok(all
             .iter()

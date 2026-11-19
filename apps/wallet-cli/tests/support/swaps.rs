@@ -68,7 +68,6 @@ impl Swaps {
         .unwrap();
         let stocked = hubs.last().unwrap().pay(&wallet.address(), stock);
         let urls: Vec<String> = hubs.iter().map(|hub| hub.url()).collect();
-        let swaps = dir.path().join("swaps.sqlite");
         let refuse = Arc::new(AtomicBool::new(false));
         let refusing = refuse.clone();
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
@@ -83,7 +82,7 @@ impl Swaps {
                     wallet.add_hub(url).await.unwrap();
                 }
                 wallet.receive(&stocked).unwrap();
-                let provider = Arc::new(Provider::create(&swaps, wallet, config).unwrap());
+                let provider = Arc::new(Provider::create(wallet, config).unwrap());
                 let nostr = licash_nostr::public_key(&provider.nostr_secret().unwrap()).unwrap();
                 let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                 ready
