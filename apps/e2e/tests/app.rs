@@ -1003,12 +1003,18 @@ async fn contracted(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     phone.back_to("onchain").await?;
 
     // All its notes protected, fewer than it covers; nothing left on
-    // Bitcoin, its coin the price exactly.
-    until("its notes protected", 30, || async {
+    // Bitcoin, its coin the price exactly. A claim names so many notes at
+    // most: the few small ones past them are on credit until the wallet
+    // shapes its notes again, once they have rested (at most ten minutes).
+    until("its notes protected", 900, || async {
+        mine(eco).await?;
         let views = phone.views().await?;
         let of = |id: &str| views.iter().find(|v| v.id == id).map(|v| amount(&v.text));
-        let (protected, onchain) = (of("protected"), of("onchain"));
-        Ok((protected.is_some_and(|p| p > 0) && onchain == Some(0)).then_some(()))
+        let (protected, onchain, credit) = (of("protected"), of("onchain"), of("credit"));
+        Ok(
+            (protected.is_some_and(|p| p > 0) && onchain == Some(0) && credit == Some(0))
+                .then_some(()),
+        )
     })
     .await?;
     let now = amount(&phone.by_id("credit", 10).await?.text);
