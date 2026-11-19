@@ -167,8 +167,8 @@ impl<T: Transport> Wallet<T> {
                     preimage,
                     from_hub,
                     to_hub,
-                    sql(amount),
-                    sql(fee),
+                    sql(amount)?,
+                    sql(fee)?,
                     now()
                 ],
             )?;

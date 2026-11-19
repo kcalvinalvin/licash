@@ -208,13 +208,13 @@ impl<T: Transport> Wallet<T> {
                     id.as_bytes(),
                     hub,
                     me.to_bytes(),
-                    sql(total - fee),
-                    sql(fee),
+                    sql(total - fee)?,
+                    sql(fee)?,
                     offer,
                     now()
                 ],
             )?;
-            take(tx, &id, ys)
+            take(tx, &id, crate::Spender::Send, ys)
         });
         match started {
             Ok(()) => Ok(Some(id)),

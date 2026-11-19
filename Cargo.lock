@@ -931,6 +931,7 @@ dependencies = [
  "licash-api",
  "licash-hub",
  "licash-onchain",
+ "licash-store",
  "lightning-invoice",
  "rand_core",
  "rusqlite",

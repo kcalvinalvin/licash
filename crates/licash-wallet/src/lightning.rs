@@ -704,7 +704,7 @@ impl<T: Transport> Wallet<T> {
             tx.execute(
                 "INSERT INTO invoices (hash, hub, preimage, amount, body, created_at, protected)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![hash, hub, preimage, sql(amount), body, now(), protected],
+                params![hash, hub, preimage, sql(amount)?, body, now(), protected],
             )?;
             Ok(())
         })?;

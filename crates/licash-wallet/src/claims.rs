@@ -387,7 +387,7 @@ impl<T: Transport> Wallet<T> {
     ) -> Result<Vec<LockClaim>, Error> {
         let mut stmt = c.prepare(
             "SELECT id, request, certificate, expiry FROM locks
-             WHERE certificate IS NOT NULL AND settled IS NULL AND done_at IS NULL
+             WHERE certificate IS NOT NULL AND id NOT IN (SELECT id FROM lock_settlements)
                 AND abandoned IS NULL AND claimed_by IS NULL AND expiry <= ?1",
         )?;
         let rows = stmt
@@ -459,8 +459,9 @@ impl<T: Transport> Wallet<T> {
         self.store.read(|c| {
             let mut stmt = c.prepare(
                 "SELECT o.id, r.url, o.keyset, o.proposal, o.preimage, o.expiry, o.depth,
-                    o.anchor, o.activated_at, o.claimed_by IS NOT NULL
+                    o.anchor, a.height, o.claimed_by IS NOT NULL
                  FROM owed_locks o JOIN reach r ON r.hub = o.hub
+                 LEFT JOIN owed_lock_activations a ON a.id = o.id
                  WHERE NOT EXISTS (SELECT 1 FROM notes n WHERE n.proposal = o.id AND n.branch = 0)
                  ORDER BY o.expiry, o.id",
             )?;
@@ -549,12 +550,27 @@ impl<T: Transport> Wallet<T> {
             None => (None, None, None),
         };
         let changed = self.store.write(|t| {
-            Ok(t.execute(
-                "UPDATE owed_locks SET activation = ?2, activated_at = ?3,
-                    anchor = COALESCE(?4, anchor)
+            let changed = t.execute(
+                "UPDATE owed_locks SET anchor = COALESCE(?2, anchor)
                  WHERE id = ?1 AND claimed_by IS NULL",
-                params![id.as_bytes(), json, at, anchor],
-            )?)
+                params![id.as_bytes(), anchor],
+            )?;
+            if changed == 1 {
+                match (json, at) {
+                    (Some(json), Some(at)) => t.execute(
+                        "INSERT INTO owed_lock_activations (id, activation, height)
+                         VALUES (?1, ?2, ?3)
+                         ON CONFLICT (id) DO UPDATE
+                         SET activation = excluded.activation, height = excluded.height",
+                        params![id.as_bytes(), json, at],
+                    )?,
+                    _ => t.execute(
+                        "DELETE FROM owed_lock_activations WHERE id = ?1",
+                        [id.as_bytes()],
+                    )?,
+                };
+            }
+            Ok(changed)
         })?;
         if changed != 1 {
             return Err(Error::Invalid(format!(
@@ -719,7 +735,10 @@ impl<T: Transport> Wallet<T> {
     /// The lock refunds it took are given back too.
     pub fn unclaim_notes(&self, id: &[u8; 32]) -> Result<usize, Error> {
         let (freed, locks) = self.store.write(|t| {
-            let freed = t.execute("UPDATE notes SET spent_by = NULL WHERE spent_by = ?1", [id])?;
+            let freed = t.execute(
+                "UPDATE notes SET spent_by = NULL, spent_kind = NULL WHERE spent_by = ?1",
+                [id],
+            )?;
             let locks = t.execute(
                 "UPDATE locks SET claimed_by = NULL WHERE claimed_by = ?1",
                 [id],
@@ -836,9 +855,9 @@ fn take_notes(
     let mut notes = Vec::with_capacity(picked.len());
     for y in picked.iter().map(|&i| &ys[i]) {
         let taken = t.execute(
-            "UPDATE notes SET spent_by = ?1
+            "UPDATE notes SET spent_by = ?1, spent_kind = ?3
              WHERE y = ?2 AND spent_by IS NULL AND session IS NULL AND gone_at IS NULL",
-            params![id, y],
+            params![id, y, crate::Spender::Recovery.name()],
         )?;
         if taken != 1 {
             return Err(Error::NoteTaken);
@@ -1179,8 +1198,8 @@ struct OwedRow {
 /// (no note of its pay branch kept), unclaimed, not a lock of the wallet's
 /// own (its refund is claimed, not both branches), activated at depth.
 const OWED_DUE: &str = "WHERE o.keyset = ?1 AND o.claimed_by IS NULL
-    AND o.activated_at IS NOT NULL AND o.anchor IS NOT NULL
-    AND o.activated_at + o.depth <= ?2 + 1
+    AND a.id IS NOT NULL AND o.anchor IS NOT NULL
+    AND a.height + o.depth <= ?2 + 1
     AND NOT EXISTS (SELECT 1 FROM notes n WHERE n.proposal = o.id AND n.branch = 0)
     AND NOT EXISTS (SELECT 1 FROM locks l WHERE l.id = o.id)";
 
@@ -1194,8 +1213,9 @@ fn owed_rows(
 ) -> Result<Vec<([u8; 32], OwedRow)>, Error> {
     let mut stmt = c.prepare(&format!(
         "SELECT o.id, o.keyset, o.proposal, o.certificate, o.signatures, o.preimage, o.anchor,
-            o.activation
-         FROM owed_locks o {filter} ORDER BY o.id"
+            a.activation
+         FROM owed_locks o LEFT JOIN owed_lock_activations a ON a.id = o.id
+         {filter} ORDER BY o.id"
     ))?;
     let rows = stmt.query_map(params, |r| {
         Ok((

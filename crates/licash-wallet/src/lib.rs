@@ -801,13 +801,14 @@ impl<T: Transport> Wallet<T> {
                     COALESCE(SUM(CASE WHEN n.spent_by IS NULL AND n.gone_at IS NULL
                         THEN n.denom END), 0),
                     COALESCE(SUM(CASE WHEN (s.id IS NOT NULL AND s.done_at IS NULL)
-                        OR (l.id IS NOT NULL AND l.done_at IS NULL) THEN n.denom END), 0)
+                        OR (l.id IS NOT NULL AND ls.id IS NULL) THEN n.denom END), 0)
                  FROM hubs h
                  JOIN reach r ON r.hub = h.id
                  LEFT JOIN keysets k ON k.hub = h.id
                  LEFT JOIN notes n ON n.keyset = k.id
-                 LEFT JOIN sends s ON s.id = n.spent_by
-                 LEFT JOIN locks l ON l.id = n.spent_by
+                 LEFT JOIN sends s ON s.id = n.spent_by AND n.spent_kind = 'send'
+                 LEFT JOIN locks l ON l.id = n.spent_by AND n.spent_kind = 'lock'
+                 LEFT JOIN lock_settlements ls ON ls.id = l.id
                  WHERE h.trusted = ?1
                  GROUP BY h.id ORDER BY r.url",
             )?;
@@ -1286,8 +1287,8 @@ impl<T: Transport> Wallet<T> {
                     id.as_bytes(),
                     hub,
                     payee.to_bytes(),
-                    sql(amount),
-                    sql(selection.fee),
+                    sql(amount)?,
+                    sql(selection.fee)?,
                     offer,
                     now(),
                     key
@@ -1296,7 +1297,7 @@ impl<T: Transport> Wallet<T> {
             if let (Some(mailbox), Some(shared)) = (delivered, shared) {
                 delivery::record(tx, &id, mailbox, &shared)?;
             }
-            take(tx, &id, &selection.inputs)
+            take(tx, &id, Spender::Send, &selection.inputs)
         })?;
         let key = hex::encode(id.as_bytes());
         tracing::info!(id = %key, %url, amount, fee = selection.fee, "sending");
@@ -1681,7 +1682,7 @@ impl<T: Transport> Wallet<T> {
                     )?;
                 }
                 tx.execute(
-                    "UPDATE notes SET spent_by = NULL WHERE spent_by = ?1",
+                    "UPDATE notes SET spent_by = NULL, spent_kind = NULL WHERE spent_by = ?1",
                     [id.as_bytes()],
                 )?;
             }
@@ -1724,7 +1725,8 @@ impl<T: Transport> Wallet<T> {
         }
         let ids: Vec<[u8; 32]> = self.store.read(|c| {
             let mut stmt = c.prepare(
-                "SELECT id FROM locks WHERE done_at IS NULL AND abandoned IS NULL
+                "SELECT id FROM locks
+                 WHERE abandoned IS NULL AND id NOT IN (SELECT id FROM lock_settlements)
                  ORDER BY created_at",
             )?;
             let rows = stmt.query_map([], |r| r.get(0))?;
@@ -1984,7 +1986,7 @@ impl<T: Transport> Wallet<T> {
             tx.execute(
                 "INSERT INTO receipts (id, keyset, amount, received_at) VALUES (?1, ?2, ?3, ?4)
                  ON CONFLICT DO NOTHING",
-                params![pid.as_bytes(), keyset.id(), sql(amount), received_at],
+                params![pid.as_bytes(), keyset.id(), sql(amount)?, received_at],
             )?;
             Ok(amount)
         })?;
@@ -2073,12 +2075,18 @@ impl<T: Transport> Wallet<T> {
                 ))
             };
             let of = |table: &str| {
-                let sql = format!(
-                    "SELECT payee, amount, fee, {}, {} FROM {table} WHERE id = ?1 AND abandoned IS NULL",
-                    if table == "locks" { "settled" } else { "NULL" },
-                    if table == "sends" { "offer" } else { "NULL" },
-                );
-                c.query_row(&sql, [id], row).optional()
+                let sql = match table {
+                    "locks" => {
+                        "SELECT l.payee, l.amount, l.fee, s.branch, NULL FROM locks l
+                         LEFT JOIN lock_settlements s ON s.id = l.id
+                         WHERE l.id = ?1 AND l.abandoned IS NULL"
+                    }
+                    _ => {
+                        "SELECT payee, amount, fee, NULL, offer FROM sends
+                         WHERE id = ?1 AND abandoned IS NULL"
+                    }
+                };
+                c.query_row(sql, [id], row).optional()
             };
             let operation = match of("sends")? {
                 Some(send) => Some(send),
@@ -2120,7 +2128,10 @@ impl<T: Transport> Wallet<T> {
                 // The refund branch: what came back is known, the rest the fee.
                 Some("refund") => {
                     let kept = sum("proposal")?;
-                    vec![(PartTo::Hub, spent.saturating_sub(kept)), (PartTo::Kept, kept)]
+                    vec![
+                        (PartTo::Hub, spent.saturating_sub(kept)),
+                        (PartTo::Kept, kept),
+                    ]
                 }
                 _ => vec![
                     (PartTo::Payee(Address::from_bytes(&payee)?), amount),
@@ -2360,14 +2371,33 @@ impl<T: Transport> Wallet<T> {
     }
 }
 
-/// Take the notes `ys` for payment `id`: none taken if another payment
-/// took one meanwhile.
-fn take(tx: &Transaction<'_>, id: &ProposalId, ys: &[[u8; 33]]) -> Result<(), Error> {
+/// What spends a note: the kind of the id its `spent_by` holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Spender {
+    Send,
+    Lock,
+    /// The recovery of a contract, which claims it.
+    Recovery,
+}
+
+impl Spender {
+    fn name(self) -> &'static str {
+        match self {
+            Spender::Send => "send",
+            Spender::Lock => "lock",
+            Spender::Recovery => "recovery",
+        }
+    }
+}
+
+/// Take the notes `ys` for payment `id`, which `by` says what is: none
+/// taken if another payment took one meanwhile.
+fn take(tx: &Transaction<'_>, id: &ProposalId, by: Spender, ys: &[[u8; 33]]) -> Result<(), Error> {
     for y in ys {
         let taken = tx.execute(
-            "UPDATE notes SET spent_by = ?1
+            "UPDATE notes SET spent_by = ?1, spent_kind = ?3
              WHERE y = ?2 AND spent_by IS NULL AND session IS NULL AND gone_at IS NULL",
-            params![id.as_bytes(), y],
+            params![id.as_bytes(), y, by.name()],
         )?;
         if taken != 1 {
             return Err(Error::NoteTaken);
@@ -2476,7 +2506,7 @@ fn insert_note(
         params![
             note.message().identifier()?.0,
             keyset.id(),
-            sql(note.message().denomination()),
+            sql(note.message().denomination())?,
             note.to_bytes(),
             proposal.as_bytes(),
             ephemeral.0,

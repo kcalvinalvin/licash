@@ -146,33 +146,43 @@ pub fn component(conn: &mut Connection, name: &str, version: i64, ddl: &str) -> 
     if component_version(conn, name)? == Some(version) {
         return Ok(());
     }
-    write(conn, |tx| {
-        match tx
-            .query_row(
-                "SELECT version FROM schema_versions WHERE component = ?1",
-                [name],
-                |r| r.get::<_, i64>(0),
-            )
-            .map(Some)
-            .or_else(|e| match e {
-                rusqlite::Error::QueryReturnedNoRows => Ok(None),
-                e => Err(e),
-            })? {
-            Some(v) if v == version => Ok(()),
-            Some(v) => Err(Error::Setup(format!(
-                "{name} is of version {v}, this build reads {version}"
-            ))),
-            None => {
-                tx.execute_batch(ddl)?;
-                tx.execute(
-                    "INSERT INTO schema_versions (component, version, created_at)
-                     VALUES (?1, ?2, ?3)",
-                    rusqlite::params![name, version, now()],
-                )?;
-                Ok(())
-            }
+    write(conn, |tx| component_in(tx, name, version, ddl))
+}
+
+/// [`component`] in the transaction `tx`, for a creator that fills the
+/// tables in the same one it makes them in.
+pub fn component_in(
+    tx: &Transaction<'_>,
+    name: &str,
+    version: i64,
+    ddl: &str,
+) -> Result<(), Error> {
+    let found: Option<i64> = tx
+        .query_row(
+            "SELECT version FROM schema_versions WHERE component = ?1",
+            [name],
+            |r| r.get(0),
+        )
+        .map(Some)
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+            e => Err(e),
+        })?;
+    match found {
+        Some(v) if v == version => Ok(()),
+        Some(v) => Err(Error::Setup(format!(
+            "{name} is of version {v}, this build reads {version}"
+        ))),
+        None => {
+            tx.execute_batch(ddl)?;
+            tx.execute(
+                "INSERT INTO schema_versions (component, version, created_at)
+                 VALUES (?1, ?2, ?3)",
+                rusqlite::params![name, version, now()],
+            )?;
+            Ok(())
         }
-    })
+    }
 }
 
 /// The version of `name`'s tables: none if they were never made, as of a

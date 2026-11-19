@@ -242,12 +242,12 @@ impl<T: Transport> Wallet<T> {
                     id.as_bytes(),
                     hub,
                     me.to_bytes(),
-                    sql(remint.quote.fee),
+                    sql(remint.quote.fee)?,
                     offer,
                     recorded
                 ],
             )?;
-            take(tx, &id, &remint.plan.selection.inputs)?;
+            take(tx, &id, crate::Spender::Send, &remint.plan.selection.inputs)?;
             Ok(true)
         });
         match started {

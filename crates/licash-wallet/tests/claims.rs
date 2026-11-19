@@ -221,7 +221,8 @@ async fn coverage_excludes_notes_reserved_by_payments_unlinks_or_another_copy() 
     db.execute("UPDATE notes SET gone_at = 1 WHERE denom = 32", [])
         .unwrap();
     db.execute(
-        "UPDATE notes SET spent_by = ?1 WHERE y IN (SELECT y FROM notes WHERE denom = 4 LIMIT 1)",
+        "UPDATE notes SET spent_by = ?1, spent_kind = 'send'
+         WHERE y IN (SELECT y FROM notes WHERE denom = 4 LIMIT 1)",
         [&ID[..]],
     )
     .unwrap();

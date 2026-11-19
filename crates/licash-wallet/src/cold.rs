@@ -244,8 +244,8 @@ impl<T: Transport> Wallet<T> {
                 params![
                     key,
                     script.as_str(),
-                    sql(rules.threshold),
-                    sql(rules.keep),
+                    sql(rules.threshold)?,
+                    sql(rules.keep)?,
                     rules.max_fee_percent,
                     birthday,
                     same
@@ -460,7 +460,7 @@ impl<T: Transport> Wallet<T> {
                                     txid.to_byte_array(),
                                     vout as u32,
                                     index,
-                                    sql(out.value.to_sat()),
+                                    sql(out.value.to_sat())?,
                                     height
                                 ],
                             )?;

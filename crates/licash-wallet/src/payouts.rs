@@ -390,9 +390,9 @@ impl<T: Transport> Wallet<T> {
                     from_hub,
                     address,
                     script.as_bytes(),
-                    sql(amount),
-                    sql(quote.budget),
-                    sql(quote.fee),
+                    sql(amount)?,
+                    sql(quote.budget)?,
+                    sql(quote.fee)?,
                     now(),
                     blind
                 ],
@@ -489,7 +489,10 @@ impl<T: Transport> Wallet<T> {
         type Heights = (Option<u32>, Option<u32>, Option<u32>);
         let (timeout, found_height, spent_height): Heights = self.store.read(|c| {
             Ok(c.query_row(
-                "SELECT timeout, funding_height, spent_height FROM payouts WHERE hash = ?1",
+                "SELECT t.timeout_height, c.funding_height, c.spent_height FROM payouts p
+                 LEFT JOIN payout_terms t ON t.hash = p.hash
+                 LEFT JOIN payout_claims c ON c.hash = p.hash
+                 WHERE p.hash = ?1",
                 [bytes],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )?)
@@ -559,8 +562,8 @@ impl<T: Transport> Wallet<T> {
     pub fn payout_claims(&self) -> Result<Vec<Transaction>, Error> {
         let claims: Vec<Vec<u8>> = self.store.read(|c| {
             let mut stmt = c.prepare(
-                "SELECT claim_tx FROM payouts WHERE claim_tx IS NOT NULL
-                 AND done_at IS NULL AND failed IS NULL ORDER BY created_at, rowid",
+                "SELECT c.claim_tx FROM payout_claims c JOIN payouts p ON p.hash = c.hash
+                 WHERE p.done_at IS NULL AND p.failed IS NULL ORDER BY p.created_at, p.rowid",
             )?;
             let rows = stmt.query_map([], |r| r.get(0))?;
             Ok(rows.collect::<Result<_, _>>()?)
@@ -775,8 +778,8 @@ impl<T: Transport> Wallet<T> {
         // Its first terms stand: a coin on others is not taken.
         self.store.write(|tx| {
             tx.execute(
-                "UPDATE payouts SET refund_key = ?2, timeout = ?3, share = ?4
-                 WHERE hash = ?1 AND refund_key IS NULL",
+                "INSERT INTO payout_terms (hash, refund_key, timeout_height, share)
+                 VALUES (?1, ?2, ?3, ?4) ON CONFLICT (hash) DO NOTHING",
                 params![hash, refund, answer.timeout, share],
             )?;
             Ok(())
@@ -884,21 +887,28 @@ impl<T: Transport> Wallet<T> {
             )
             .map_err(invalid)?;
         self.store.write(|tx| {
-            tx.execute(
-                "UPDATE payouts SET funding_txid = ?2, funding_vout = ?3, funding_height = ?4,
-                    value = ?5, claim_tx = ?6, revealed_at = ?7, scanned = ?4, script = ?8
-                 WHERE hash = ?1 AND claim_tx IS NULL AND failed IS NULL",
+            let claimed = tx.execute(
+                "INSERT INTO payout_claims (hash, funding_txid, funding_vout, funding_height,
+                    value, claim_tx, revealed_at, scanned_height)
+                 SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?4
+                 WHERE EXISTS (SELECT 1 FROM payouts WHERE hash = ?1 AND failed IS NULL)
+                 ON CONFLICT (hash) DO NOTHING",
                 params![
                     hash,
                     txid.to_byte_array(),
                     hint.vout,
                     hint.height,
-                    sql(value),
+                    sql(value)?,
                     serialize(&claim),
-                    now(),
-                    script.as_bytes()
+                    now()
                 ],
             )?;
+            if claimed == 1 {
+                tx.execute(
+                    "UPDATE payouts SET script = ?2 WHERE hash = ?1",
+                    params![hash, script.as_bytes()],
+                )?;
+            }
             Ok(())
         })?;
         tracing::info!(
@@ -951,11 +961,18 @@ impl<T: Transport> Wallet<T> {
             ),
             Some((height, true)) if tip + 1 - height >= need => {
                 self.store.write(|tx| {
-                    tx.execute(
-                        "UPDATE payouts SET spent_height = ?2, scanned = ?3, done_at = ?4
+                    let done = tx.execute(
+                        "UPDATE payouts SET done_at = ?2
                          WHERE hash = ?1 AND done_at IS NULL AND failed IS NULL",
-                        params![hash, height, tip, now()],
+                        params![hash, now()],
                     )?;
+                    if done == 1 {
+                        tx.execute(
+                            "UPDATE payout_claims SET spent_height = ?2, scanned_height = ?3
+                             WHERE hash = ?1",
+                            params![hash, height, tip],
+                        )?;
+                    }
                     Ok(())
                 })?;
                 tracing::info!(hash = %hex::encode(hash), height, "paid out");
@@ -973,7 +990,7 @@ impl<T: Transport> Wallet<T> {
         };
         self.store.write(|tx| {
             tx.execute(
-                "UPDATE payouts SET scanned = ?2, spent_height = ?3 WHERE hash = ?1",
+                "UPDATE payout_claims SET scanned_height = ?2, spent_height = ?3 WHERE hash = ?1",
                 params![hash, scanned, spent.map(|(height, _)| height)],
             )?;
             Ok(())
@@ -1030,8 +1047,10 @@ impl<T: Transport> Wallet<T> {
         };
         self.store.write(|tx| {
             tx.execute(
-                "UPDATE payouts SET claim_tx = ?2
-                 WHERE hash = ?1 AND done_at IS NULL AND failed IS NULL",
+                "UPDATE payout_claims SET claim_tx = ?2
+                 WHERE hash = ?1 AND EXISTS (
+                    SELECT 1 FROM payouts p
+                    WHERE p.hash = ?1 AND p.done_at IS NULL AND p.failed IS NULL)",
                 params![hash, serialize(&remade)],
             )?;
             Ok(())
@@ -1051,7 +1070,8 @@ impl<T: Transport> Wallet<T> {
         self.store.write(|tx| {
             tx.execute(
                 "UPDATE payouts SET failed = ?2
-                 WHERE hash = ?1 AND done_at IS NULL AND failed IS NULL AND claim_tx IS NULL",
+                 WHERE hash = ?1 AND done_at IS NULL AND failed IS NULL
+                    AND NOT EXISTS (SELECT 1 FROM payout_claims c WHERE c.hash = payouts.hash)",
                 params![hash, reason],
             )?;
             Ok(())
@@ -1076,10 +1096,13 @@ impl<T: Transport> Wallet<T> {
         let record = self.store.read(|c| {
             Ok(c.query_row(
                 "SELECT p.provider, p.preimage, p.claim_key, p.from_hub, r.url, p.script,
-                    p.amount, p.budget, p.refund_key, p.timeout, p.funding_txid,
-                    p.funding_vout, p.funding_height, p.value, p.claim_tx, p.scanned,
-                    p.done_at IS NULL AND p.failed IS NULL, p.address, p.blind, p.share
-                 FROM payouts p JOIN reach r ON r.hub = p.from_hub WHERE p.hash = ?1",
+                    p.amount, p.budget, t.refund_key, t.timeout_height, c.funding_txid,
+                    c.funding_vout, c.funding_height, c.value, c.claim_tx, c.scanned_height,
+                    p.done_at IS NULL AND p.failed IS NULL, p.address, p.blind, t.share
+                 FROM payouts p JOIN reach r ON r.hub = p.from_hub
+                 LEFT JOIN payout_terms t ON t.hash = p.hash
+                 LEFT JOIN payout_claims c ON c.hash = p.hash
+                 WHERE p.hash = ?1",
                 [hash],
                 |r| {
                     let refund = match (r.get(8)?, r.get(9)?) {
@@ -1346,8 +1369,9 @@ pub(crate) async fn checked_block(
 const PAYOUTS: &str = "SELECT p.hash, p.provider, r.url, p.address, p.amount, p.budget, p.fee,
     (SELECT l.id FROM locks l WHERE l.hash = p.hash AND l.hub = p.from_hub
         ORDER BY l.created_at DESC, l.rowid DESC LIMIT 1),
-    p.funding_txid, p.funding_vout, p.claim_tx, p.done_at IS NOT NULL, p.failed, p.created_at
-    FROM payouts p JOIN reach r ON r.hub = p.from_hub";
+    c.funding_txid, c.funding_vout, c.claim_tx, p.done_at IS NOT NULL, p.failed, p.created_at
+    FROM payouts p JOIN reach r ON r.hub = p.from_hub
+    LEFT JOIN payout_claims c ON c.hash = p.hash";
 
 fn payout_of(r: &Row<'_>) -> rusqlite::Result<Payout> {
     let claim: Option<Vec<u8>> = r.get(10)?;

@@ -188,7 +188,8 @@ impl<T: Transport> Wallet<T> {
         let given_up = self.store.write(|tx| {
             Ok(tx.execute(
                 "UPDATE deposits SET canceled = ?2
-                 WHERE hash = ?1 AND txid IS NULL AND lock IS NULL
+                 WHERE hash = ?1 AND lock IS NULL
+                    AND NOT EXISTS (SELECT 1 FROM deposit_fundings f WHERE f.hash = deposits.hash)
                     AND done_at IS NULL AND canceled IS NULL AND refund IS NULL",
                 params![key, why],
             )?)
@@ -237,7 +238,8 @@ impl<T: Transport> Wallet<T> {
         let given_up = self.store.write(|tx| {
             Ok(tx.execute(
                 "UPDATE deposits SET canceled = 'abandoned before its hub answered'
-                 WHERE hash = ?1 AND claim IS NULL AND done_at IS NULL AND canceled IS NULL",
+                 WHERE hash = ?1 AND done_at IS NULL AND canceled IS NULL
+                    AND NOT EXISTS (SELECT 1 FROM deposit_terms t WHERE t.hash = deposits.hash)",
                 [key],
             )?)
         })?;
@@ -463,7 +465,7 @@ impl Asked {
                 hub,
                 self.preimage,
                 self.refund_key.secret_bytes(),
-                sql(self.amount),
+                sql(self.amount)?,
                 body,
                 now()
             ],
@@ -482,13 +484,18 @@ fn keep_terms(
     network: bitcoin::Network,
 ) -> Result<(), Error> {
     tx.execute(
-        "UPDATE deposits SET claim = ?2, timeout = ?3, pays = ?4, fund_by = ?5, address = ?6
-         WHERE hash = ?1 AND canceled IS NULL",
+        "INSERT INTO deposit_terms (hash, claim_key, timeout_height, pays, fund_by_height, address)
+         SELECT ?1, ?2, ?3, ?4, ?5, ?6
+         WHERE EXISTS (SELECT 1 FROM deposits WHERE hash = ?1 AND canceled IS NULL)
+         ON CONFLICT (hash) DO UPDATE SET
+            claim_key = excluded.claim_key, timeout_height = excluded.timeout_height,
+            pays = excluded.pays, fund_by_height = excluded.fund_by_height,
+            address = excluded.address",
         params![
             hash,
             htlc.claim.serialize(),
             htlc.timeout,
-            sql(terms.amount),
+            sql(terms.amount)?,
             terms.fund_by,
             htlc.address(network).to_string(),
         ],
@@ -521,7 +528,8 @@ impl<T: Transport> Wallet<T> {
         type Row = (String, [u8; 32], [u8; 32], i64, String, bool, bool);
         let row: Option<Row> = self.store.read(|c| {
             Ok(c.query_row(
-                "SELECT r.url, d.preimage, d.refund_key, d.amount, d.body, d.claim IS NOT NULL,
+                "SELECT r.url, d.preimage, d.refund_key, d.amount, d.body,
+                    EXISTS (SELECT 1 FROM deposit_terms t WHERE t.hash = d.hash),
                     d.done_at IS NULL AND d.canceled IS NULL AND d.refund IS NULL
                  FROM deposits d JOIN reach r ON r.hub = d.hub WHERE d.hash = ?1",
                 [hash],
@@ -577,7 +585,9 @@ impl<T: Transport> Wallet<T> {
             let txid: Txid = funding.txid.parse().map_err(|e| unavailable(&url, e))?;
             self.store.write(|tx| {
                 tx.execute(
-                    "UPDATE deposits SET txid = ?2, vout = ?3, height = ?4 WHERE hash = ?1",
+                    "INSERT INTO deposit_fundings (hash, txid, vout, height) VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT (hash) DO UPDATE SET
+                        txid = excluded.txid, vout = excluded.vout, height = excluded.height",
                     params![hash, txid.to_byte_array(), funding.vout, funding.height],
                 )?;
                 Ok(())
@@ -712,8 +722,9 @@ impl<T: Transport> Wallet<T> {
         type Row = ([u8; 32], Option<[u8; 32]>, Option<u32>, bool);
         let row: Option<Row> = self.store.read(|c| {
             Ok(c.query_row(
-                "SELECT refund_key, claim, timeout, done_at IS NOT NULL FROM deposits
-                 WHERE hash = ?1",
+                "SELECT d.refund_key, t.claim_key, t.timeout_height, d.done_at IS NOT NULL
+                 FROM deposits d LEFT JOIN deposit_terms t ON t.hash = d.hash
+                 WHERE d.hash = ?1",
                 [hash],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
@@ -830,10 +841,12 @@ impl<T: Transport> Wallet<T> {
     }
 }
 
-const DEPOSITS: &str = "SELECT d.hash, r.url, d.amount, d.address, d.timeout, d.pays,
-    d.fund_by, d.txid, d.vout, d.height, d.done_at IS NOT NULL, d.canceled, d.refund,
+const DEPOSITS: &str = "SELECT d.hash, r.url, d.amount, t.address, t.timeout_height, t.pays,
+    t.fund_by_height, f.txid, f.vout, f.height, d.done_at IS NOT NULL, d.canceled, d.refund,
     d.created_at, d.lock
-    FROM deposits d JOIN reach r ON r.hub = d.hub";
+    FROM deposits d JOIN reach r ON r.hub = d.hub
+    LEFT JOIN deposit_terms t ON t.hash = d.hash
+    LEFT JOIN deposit_fundings f ON f.hash = d.hash";
 
 fn deposit_of(r: &Row<'_>) -> rusqlite::Result<Deposit> {
     let terms = match (r.get(3)?, r.get(4)?, r.get::<_, Option<i64>>(5)?, r.get(6)?) {

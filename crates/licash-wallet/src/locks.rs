@@ -168,25 +168,28 @@ impl PreparedLock {
     pub(crate) fn record(&self, tx: &rusqlite::Transaction<'_>) -> Result<(), Error> {
         tx.execute(
             "INSERT INTO locks
-                (id, hub, payee, hash, expiry, amount, fee, request, invoice, via,
-                    via_invoice, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                (id, hub, payee, hash, expiry, amount, fee, request, invoice, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 self.id.as_bytes(),
                 self.hub,
                 self.payee,
                 self.hash,
                 self.expiry,
-                sql(self.amount),
-                sql(self.fee),
+                sql(self.amount)?,
+                sql(self.fee)?,
                 self.request,
                 self.invoice,
-                self.via.as_ref().map(|v| &v.provider),
-                self.via.as_ref().map(|v| &v.invoice),
                 now()
             ],
         )?;
-        crate::take(tx, &self.id, &self.inputs)
+        if let Some(via) = &self.via {
+            tx.execute(
+                "INSERT INTO lock_routes (id, provider, invoice) VALUES (?1, ?2, ?3)",
+                params![self.id.as_bytes(), via.provider, via.invoice],
+            )?;
+        }
+        crate::take(tx, &self.id, crate::Spender::Lock, &self.inputs)
     }
 }
 
@@ -446,10 +449,13 @@ impl<T: Transport> Wallet<T> {
         let row: Row = self.store.read(|c| {
             Ok(c.query_row(
                 "SELECT l.hub, r.url, l.request, l.certificate IS NOT NULL,
-                    l.done_at IS NOT NULL, l.abandoned,
+                    s.id IS NOT NULL, l.abandoned,
                     CASE WHEN l.failure IS NULL THEN l.invoice END,
-                    CASE WHEN l.failure IS NULL THEN l.via END, l.via_invoice
-                 FROM locks l JOIN reach r ON r.hub = l.hub WHERE l.id = ?1",
+                    CASE WHEN l.failure IS NULL THEN v.provider END, v.invoice
+                 FROM locks l JOIN reach r ON r.hub = l.hub
+                 LEFT JOIN lock_settlements s ON s.id = l.id
+                 LEFT JOIN lock_routes v ON v.id = l.id
+                 WHERE l.id = ?1",
                 [id.as_bytes()],
                 |r| {
                     Ok((
@@ -551,8 +557,8 @@ impl<T: Transport> Wallet<T> {
                 insert_note(tx, keyset, note, id, &ephemeral, r.branch, r.position)?;
             }
             tx.execute(
-                "UPDATE locks SET settled = ?2, preimage = ?3, done_at = ?4
-                 WHERE id = ?1 AND done_at IS NULL",
+                "INSERT INTO lock_settlements (id, branch, preimage, settled_at)
+                 VALUES (?1, ?2, ?3, ?4) ON CONFLICT DO NOTHING",
                 params![id.as_bytes(), settled, preimage, now()],
             )?;
             Ok(())
@@ -909,11 +915,13 @@ impl<T: Transport> Wallet<T> {
 }
 
 const LOCKS: &str = "SELECT l.id, r.url, l.payee, l.hash, l.amount, l.fee, l.expiry,
-    l.certificate IS NOT NULL, l.settled, l.preimage, l.done_at IS NOT NULL, l.abandoned,
-    l.created_at, l.invoice, l.failure, l.via, l.via_invoice,
+    l.certificate IS NOT NULL, s.branch, s.preimage, s.id IS NOT NULL, l.abandoned,
+    l.created_at, l.invoice, l.failure, v.provider, v.invoice,
     (SELECT SUM(n.denom) FROM notes n WHERE n.spent_by = l.id),
     (SELECT COALESCE(SUM(n.denom), 0) FROM notes n WHERE n.proposal = l.id)
-    FROM locks l JOIN reach r ON r.hub = l.hub";
+    FROM locks l JOIN reach r ON r.hub = l.hub
+    LEFT JOIN lock_settlements s ON s.id = l.id
+    LEFT JOIN lock_routes v ON v.id = l.id";
 
 fn lock_of(r: &Row<'_>) -> rusqlite::Result<Result<Lock, Error>> {
     let id: [u8; 32] = r.get(0)?;

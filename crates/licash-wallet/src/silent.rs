@@ -716,7 +716,7 @@ impl<T: Transport> Wallet<T> {
                     params![
                         outpoint.txid.to_byte_array(),
                         outpoint.vout,
-                        crate::store::sql(*value),
+                        crate::store::sql(*value)?,
                         found.output.serialize(),
                         found.tweak.secret_bytes(),
                         found.label,

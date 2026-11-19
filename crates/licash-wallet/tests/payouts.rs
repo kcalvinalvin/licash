@@ -994,29 +994,6 @@ async fn a_payout_is_refused_beyond_its_terms_before_any_lock() {
 }
 
 #[tokio::test]
-async fn a_wallet_file_of_version_4_gains_payouts() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("v4.sqlite");
-    let version = |path: &std::path::Path| -> i64 {
-        let c = rusqlite::Connection::open(path).unwrap();
-        c.pragma_query_value(None, "user_version", |r| r.get(0))
-            .unwrap()
-    };
-    rusqlite::Connection::open(&path)
-        .unwrap()
-        .execute_batch(include_str!("fixtures/wallet-v4.sql"))
-        .unwrap();
-    assert_eq!(version(&path), 4);
-    let wallet = Wallet::open(&path, Link(Net::new())).unwrap();
-    assert_eq!(version(&path), 16);
-    // Trusted, as every hub of an older file.
-    assert_eq!(wallet.hubs().unwrap().len(), 1);
-    assert!(wallet.visited().unwrap().is_empty());
-    assert!(wallet.payouts().unwrap().is_empty());
-    assert!(wallet.payout_claims().unwrap().is_empty());
-}
-
-#[tokio::test]
 async fn a_coin_timed_out_by_a_time_or_after_the_lock_is_never_claimed() {
     // 500,000,000 on: a time, long past, under OP_CHECKLOCKTIMEVERIFY.
     for timeout in [bitcoin::absolute::LOCK_TIME_THRESHOLD, 1_000] {

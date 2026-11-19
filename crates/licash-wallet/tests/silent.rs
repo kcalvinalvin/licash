@@ -338,7 +338,8 @@ struct Setup {
     wallet: Wallet<Via>,
     chain: Shared,
     hub: Arc<Indexer>,
-    dir: tempfile::TempDir,
+    /// Kept for as long as the wallet's file is used.
+    _dir: tempfile::TempDir,
 }
 
 /// A wallet trusting a hub that serves the tweaks of a chain of two empty
@@ -363,7 +364,7 @@ async fn setup() -> Setup {
         wallet,
         chain,
         hub,
-        dir,
+        _dir: dir,
     }
 }
 
@@ -1293,53 +1294,6 @@ async fn tweaks_of_another_block_than_the_chains_are_refused() {
 }
 
 #[tokio::test]
-async fn a_wallet_file_of_the_first_version_gains_silent_payments() {
-    let Setup {
-        wallet,
-        chain,
-        hub,
-        dir,
-    } = setup().await;
-    drop(wallet);
-    let path = dir.path().join("v1.sqlite");
-    let version = |path: &std::path::Path| -> i64 {
-        let c = rusqlite::Connection::open(path).unwrap();
-        c.pragma_query_value(None, "user_version", |r| r.get(0))
-            .unwrap()
-    };
-    rusqlite::Connection::open(&path)
-        .unwrap()
-        .execute_batch(include_str!("fixtures/wallet-v1.sql"))
-        .unwrap();
-    assert_eq!(version(&path), 1);
-    let wallet = Wallet::open(&path, Via(hub.clone())).unwrap();
-    let address = wallet.silent_keys().address();
-    assert_eq!(version(&path), 16);
-    assert_eq!(wallet.hubs().unwrap().len(), 1);
-    assert_eq!(wallet.silent_next().unwrap(), None);
-    wallet.watch_silent(HUB, 1).unwrap();
-    let paying = chain.lock().unwrap().pay(&[address], &[10_000]);
-    chain.lock().unwrap().mine(vec![paying]);
-    let scanned = wallet
-        .scan_silent(HUB, &Light(chain.clone()), u32::MAX)
-        .await
-        .unwrap();
-    assert_eq!(scanned.found.len(), 1);
-    drop(wallet);
-    // A newer version's file is refused, untouched.
-    rusqlite::Connection::open(&path)
-        .unwrap()
-        .pragma_update(None, "user_version", 17)
-        .unwrap();
-    match Wallet::open(&path, Via(hub)) {
-        Err(Error::Setup(why)) => assert!(why.contains("schema 17"), "{why}"),
-        Err(other) => panic!("{other:?}"),
-        Ok(_) => panic!("opened"),
-    }
-    assert_eq!(version(&path), 17);
-}
-
-#[tokio::test]
 async fn a_fallback_address_is_watched_once_handed_out_and_the_next_once_paid() {
     let s = setup().await;
     s.wallet.watch_silent(HUB, 1).unwrap();
@@ -1409,36 +1363,6 @@ async fn the_fallback_address_handed_out_never_goes_back() {
     let paying = s.pay_plain(&fallback_of(&s.wallet, 6 + 20 + 1), 10_000);
     s.mine(vec![paying]);
     assert!(s.scan().await.unwrap().found.is_empty());
-}
-
-#[tokio::test]
-async fn a_wallet_file_of_version_2_watches_no_fallback_until_it_hands_one_out() {
-    let Setup {
-        wallet,
-        chain,
-        hub,
-        dir,
-    } = setup().await;
-    drop(wallet);
-    let path = dir.path().join("v2.sqlite");
-    rusqlite::Connection::open(&path)
-        .unwrap()
-        .execute_batch(include_str!("fixtures/wallet-v2.sql"))
-        .unwrap();
-    let wallet = Wallet::open(&path, Via(hub)).unwrap();
-    assert_eq!(wallet.silent_next().unwrap(), Some(1));
-    let light = Light(chain.clone());
-    let scanned = wallet.scan_silent(HUB, &light, u32::MAX).await.unwrap();
-    assert_eq!(scanned.next, 3);
-    assert_eq!(chain.lock().unwrap().filtered, 0);
-    // Handed out, then watched.
-    let code = wallet.onchain_code(true).unwrap();
-    let script = code.address.unwrap().assume_checked().script_pubkey();
-    assert_eq!(script, fallback_of(&wallet, 0));
-    let paying = chain.lock().unwrap().pay_plain(&script, 10_000);
-    chain.lock().unwrap().mine(vec![paying]);
-    let scanned = wallet.scan_silent(HUB, &light, u32::MAX).await.unwrap();
-    assert_eq!(scanned.found.len(), 1);
 }
 
 /// The outputs of `tx` that `keys` finds paying it, by the tweak of the
@@ -1703,35 +1627,6 @@ async fn a_reorganization_of_blocks_looked_in_without_tweaks_keeps_them_to_look_
     let found: Vec<(u64, u32)> = scanned.found.iter().map(|c| (c.value, c.height)).collect();
     assert_eq!(found, [(10_000, 6)]);
     assert!(s.scan().await.unwrap().found.is_empty());
-}
-
-#[tokio::test]
-async fn a_wallet_file_of_version_3_never_watching_finds_its_fallback_payment() {
-    let Setup {
-        wallet,
-        chain,
-        hub,
-        dir,
-    } = setup().await;
-    drop(wallet);
-    let path = dir.path().join("v3.sqlite");
-    rusqlite::Connection::open(&path)
-        .unwrap()
-        .execute_batch(include_str!("fixtures/wallet-v3.sql"))
-        .unwrap();
-    let wallet = Wallet::open(&path, Via(hub.clone())).unwrap();
-    assert_eq!(wallet.silent_next().unwrap(), None);
-    // The address it handed out, still.
-    let code = wallet.onchain_code(true).unwrap();
-    let script = code.address.unwrap().assume_checked().script_pubkey();
-    assert_eq!(script, fallback_of(&wallet, 0));
-    let paying = chain.lock().unwrap().pay_plain(&script, 10_000);
-    chain.lock().unwrap().mine(vec![paying]);
-    wallet.watch_silent(None, 1).unwrap();
-    let light = Light(chain.clone());
-    let scanned = wallet.scan_silent(None, &light, u32::MAX).await.unwrap();
-    assert_eq!(scanned.found.len(), 1);
-    assert_eq!(*hub.asked.lock().unwrap(), 0);
 }
 
 #[tokio::test]

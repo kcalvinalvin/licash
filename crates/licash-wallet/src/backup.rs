@@ -1,6 +1,6 @@
 //! Explicit secret export and a consistent SQLite snapshot, including WAL.
 
-use std::{fs::OpenOptions, path::Path};
+use std::path::Path;
 
 use crate::{Error, Transport, Wallet};
 
@@ -16,32 +16,18 @@ impl<T: Transport> Wallet<T> {
         })
     }
 
-    /// Snapshot all committed wallet state under the connection lock. This
-    /// includes pending payments and note reservations, not just the seed.
-    /// The destination must not exist. This never checkpoints or copies a
-    /// live main file without its WAL.
+    /// Snapshot all committed state of the wallet's file under the
+    /// connection lock: the wallet's own, pending payments and note
+    /// reservations included, and the tables other components keep in the
+    /// same file (contracts, a swap provider's), so that one copy is the
+    /// whole of it. The destination must not exist. This never checkpoints
+    /// or copies a live main file without its WAL.
     pub fn backup_to(&self, to: &Path) -> Result<(), Error> {
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600);
-        }
-        let file = options
-            .open(to)
-            .map_err(|e| Error::Setup(format!("creating a private backup: {e}")))?;
-        let result = self.store.read(|c| {
-            c.backup(rusqlite::MAIN_DB, to, None)?;
-            Ok(())
-        });
-        if result.is_err() {
-            drop(file);
-            let _ = std::fs::remove_file(to);
-        } else {
-            file.sync_all()
-                .map_err(|e| Error::Setup(format!("syncing a private backup: {e}")))?;
-        }
-        result
+        self.store.read(|c| {
+            licash_store::backup(c, to).map_err(|e| match e {
+                licash_store::Error::Sqlite(e) => Error::Storage(e),
+                e => Error::Setup(format!("a private backup: {e}")),
+            })
+        })
     }
 }
