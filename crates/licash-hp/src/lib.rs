@@ -18,7 +18,7 @@
 //! every claim's context binds, so a proof for one contract is useless for
 //! any other.
 //!
-//! Under a v4 or v5 Base the statement also checks her request's one-time
+//! The statement also checks her request's one-time
 //! signatures on `b` and `E` against the keys Base binds
 //! ([`RequestKeys`]): only she can sign a request, so no proof can be made
 //! of an exit she didn't start, on any chain, however long before.
@@ -62,7 +62,7 @@ pub enum Refusal {
     Chain(String),
     /// The Hub's evidence doesn't prove what it says (licash's reason).
     Evidence(String),
-    /// Her request isn't signed under the one-time keys a v4 Base binds,
+    /// Her request isn't signed under the one-time keys her Base binds,
     /// or the input's keys aren't those.
     Unsigned,
     /// The response didn't disclose what the evidence needs.
@@ -131,7 +131,7 @@ pub fn through_publication<'a>(contract: &Contract, exit: &'a Exit, read: &Read)
 
 /// Her request's one-time public keys, each digit's chain end (HASH160
 /// chains, as `lichen_wots`'s `WotsPublic`): `b`'s 8 message digits and 2
-/// checksum digits, `E`'s 64 and 3. A v4 Base binds their digest.
+/// checksum digits, `E`'s 64 and 3. Her Base binds their digest.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RequestKeys {
     b: Vec<[u8; 20]>,
@@ -148,7 +148,7 @@ impl RequestKeys {
         (b.len() == digits(4) && e.len() == digits(32)).then_some(Self { b, e })
     }
 
-    /// What a v4 or v5 Base binds of them (`Version::holder_wots`).
+    /// What her Base binds of them (`Parts::holder_wots`).
     pub fn digest(&self) -> [u8; 32] {
         tagged_hash(
             "licash/hp/request-keys",
@@ -208,13 +208,13 @@ fn signs(items: &[&[u8]], keys: &[[u8; 20]], bytes: usize) -> bool {
 }
 
 /// The statement's input: Base, the exit as the Hub shows it, its
-/// evidence against the claim and, under a v4 Base, her request's keys.
+/// evidence against the claim and her request's keys.
 #[derive(Clone)]
 pub struct HubInput {
     pub base: Base,
     pub exit: Exit,
     pub evidence: Vec<Evidence>,
-    pub keys: Option<RequestKeys>,
+    pub keys: RequestKeys,
     /// Under a lean format, the items of her filing the Hub says are invalid
     /// ([`recovery::owed_flagged`]): none, else, unless they are the items
     /// that are not, no proof. Zero under another.
@@ -222,15 +222,12 @@ pub struct HubInput {
 }
 
 impl HubInput {
-    /// Under v3, the bytes v3's program reads: the keys aren't written.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut w = W(Vec::new());
         w.bytes(&self.base.to_bytes());
         self.exit.write(&mut w);
         w.bytes(&recovery::evidence_to_bytes(&self.evidence));
-        if let (Some(_), Some(keys)) = (self.base.version().holder_wots(), &self.keys) {
-            keys.write(&mut w);
-        }
+        self.keys.write(&mut w);
         if Format::of(&self.base).lean() {
             w.put(&self.invalid.to_be_bytes());
         }
@@ -251,10 +248,7 @@ impl HubInput {
             &r.bytes().map_err(|_| Refusal::Input)?,
         )
         .map_err(|_| Refusal::Input)?;
-        let keys = match base.version().holder_wots() {
-            None => None,
-            Some(_) => Some(RequestKeys::read(&mut r).ok_or(Refusal::Input)?),
-        };
+        let keys = RequestKeys::read(&mut r).ok_or(Refusal::Input)?;
         let invalid = match Format::of(&base).lean() {
             true => u32::from_be_bytes(r.take::<4>().map_err(|_| Refusal::Input)?),
             false => 0,
@@ -271,11 +265,11 @@ impl HubInput {
 }
 
 /// What the statement decides of `exit` under `base` against `evidence`:
-/// what the claim is owed, and what Bitcoin shows of the exit. Under a v4
-/// Base, her request must be signed under `keys`, the keys Base binds.
+/// what the claim is owed, and what Bitcoin shows of the exit. Her request
+/// must be signed under `keys`, the keys Base binds.
 pub fn decide(
     base: &Base,
-    keys: Option<&RequestKeys>,
+    keys: &RequestKeys,
     exit: &Exit,
     evidence: &[Evidence],
 ) -> Result<(Owed, Read), Refusal> {
@@ -287,7 +281,7 @@ pub fn decide(
 /// input ([`HubInput::invalid`]). None under a format that does not flag.
 pub fn flagged(
     base: &Base,
-    keys: Option<&RequestKeys>,
+    keys: &RequestKeys,
     exit: &Exit,
     evidence: &[Evidence],
 ) -> Result<u32, Refusal> {
@@ -298,7 +292,7 @@ pub fn flagged(
 /// guest's profile build counts the cycles between them.
 pub fn decide_with(
     base: &Base,
-    keys: Option<&RequestKeys>,
+    keys: &RequestKeys,
     exit: &Exit,
     evidence: &[Evidence],
     invalid: Option<u32>,
@@ -307,17 +301,15 @@ pub fn decide_with(
     let contract = contract(base);
     let read = licash_statement::read(&contract, exit).map_err(Refusal::Exit)?;
     mark("the exit read: its headers' work, its transactions");
-    if let Some(holder_wots) = base.version().holder_wots() {
-        let keys = keys
-            .filter(|k| k.digest() == holder_wots)
-            .ok_or(Refusal::Unsigned)?;
-        let witness = exit
-            .request
-            .spending(&contract.deposit)
-            .ok_or(Refusal::Exit(Reject::Posted))?;
-        if !keys.signed(&witness) {
-            return Err(Refusal::Unsigned);
-        }
+    if keys.digest() != base.parts().holder_wots {
+        return Err(Refusal::Unsigned);
+    }
+    let witness = exit
+        .request
+        .spending(&contract.deposit)
+        .ok_or(Refusal::Exit(Reject::Posted))?;
+    if !keys.signed(&witness) {
+        return Err(Refusal::Unsigned);
     }
     mark("her request's one-time signatures");
     let chain = chain(base, through_publication(&contract, exit, &read))?;
@@ -351,7 +343,7 @@ pub fn check_with(
 ) -> Result<[u8; JOURNAL_LEN], Refusal> {
     let (owed, read) = decide_with(
         &input.base,
-        input.keys.as_ref(),
+        &input.keys,
         &input.exit,
         &input.evidence,
         Some(input.invalid),

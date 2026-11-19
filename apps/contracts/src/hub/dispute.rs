@@ -1146,9 +1146,9 @@ impl Openings {
             (&x_block, &x.compute_txid()),
             disclosure.as_ref().map(|(block, txid)| (block, txid)),
         )?;
-        let keys = Some(o.holder.request_keys()?);
+        let keys = o.holder.request_keys()?;
         // The items of her filing it proves invalid, which it finds itself.
-        let invalid = licash_hp::flagged(&o.base, keys.as_ref(), &exit, &evidence)
+        let invalid = licash_hp::flagged(&o.base, &keys, &exit, &evidence)
             .map_err(|e| anyhow!("{e}"))?;
         let input = licash_hp::HubInput {
             base: o.base.clone(),

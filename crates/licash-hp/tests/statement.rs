@@ -6,7 +6,7 @@ use bitcoin::hashes::{hash160, Hash as _};
 use k256::Scalar;
 use licash::{
     authorization::{Authorization, PreparedGrant, SignedProposal},
-    base::{Base, ChainTerms, Fees, GraphTerms, Limits, Parts, Party, Recipe, Version},
+    base::{Base, ChainTerms, Close, Fees, GraphTerms, Limits, Parts, Party, Recipe},
     chain::Checkpoint,
     claim::{self, Branch, Item, Source, UnsignedClaim},
     crypto::{self, Point},
@@ -49,17 +49,20 @@ fn graph() -> u32 {
     std::env::var("LICASH_HP_GRAPH").map_or(7, |n| n.parse().expect("LICASH_HP_GRAPH"))
 }
 fn base(keyset: Keyset, nonce: u8) -> Base {
-    base_of(keyset, nonce, Version::V3)
+    base_on(keyset, nonce, graph())
 }
-fn base_of(keyset: Keyset, nonce: u8, version: Version) -> Base {
-    base_on(keyset, nonce, version, graph())
+
+/// Her request's one-time keys, which every Base here binds.
+fn keys() -> RequestKeys {
+    signed_request(3, &[0; 32], 0).0
 }
-fn base_on(keyset: Keyset, nonce: u8, version: Version, id: u32) -> Base {
+fn base_on(keyset: Keyset, nonce: u8, id: u32) -> Base {
     let mut deposit = [31; 36];
     deposit[32..].copy_from_slice(&7u32.to_le_bytes());
     Base::new(Parts {
-        version,
         nonce: [nonce; 32],
+        holder_wots: keys().digest(),
+        funded: [1; 32],
         claim_key: point(19).x_only(),
         keyset,
         deposit,
@@ -70,7 +73,7 @@ fn base_on(keyset: Keyset, nonce: u8, version: Version, id: u32) -> Base {
             unit_sats: 1,
             bits: 21,
             low_bits: 9,
-            deposit_units: 500_000,
+            deposit_units: 4,
             close_height: 1_000,
             reserve_alice: 20_000,
             reserve_hub: 100_000,
@@ -111,7 +114,10 @@ fn base_on(keyset: Keyset, nonce: u8, version: Version, id: u32) -> Base {
             max_rate_sat_per_kvb: 10_000,
             opening_fee_quote: 3_000,
         },
-        close: None,
+        close: Close {
+            script: vec![0x51, 0x20, 3, 3, 3],
+            fee: 1_000,
+        },
     })
     .unwrap()
 }
@@ -199,16 +205,13 @@ fn file(
 /// 32 notes of 4, of which the holder paid 16 to Bob after her backup;
 /// she claims all 32, b = 128. The Hub's evidence: the spend.
 fn stale() -> (Filed, Evidence) {
-    stale_under(Version::V3)
+    stale_on(graph())
 }
-fn stale_under(version: Version) -> (Filed, Evidence) {
-    stale_on(version, graph())
-}
-/// [`stale_under`] on a contract of graph id `id`.
-fn stale_on(version: Version, id: u32) -> (Filed, Evidence) {
+/// [`stale`] on a contract of graph id `id`.
+fn stale_on(id: u32) -> (Filed, Evidence) {
     let issuer = IssuerKeys::random(3).unwrap();
     let keyset = issuer.keyset().unwrap();
-    let base = base_on(keyset.clone(), 53, version, id);
+    let base = base_on(keyset.clone(), 53, id);
     let ds: Vec<_> = (0..32).map(|i| derive(SPEND, &hold(), 4, 23, i)).collect();
     let notes: Vec<_> = ds.iter().map(|d| mint(&issuer, &keyset, d)).collect();
     let owners: Vec<_> = (0..16).map(|i| owner(SPEND, 23, i)).collect();
@@ -249,10 +252,10 @@ fn stale_on(version: Version, id: u32) -> (Filed, Evidence) {
     (filed, spent)
 }
 
-/// Under a v5 Base on `keys`, she funded 32 notes of 4 herself, which the
-/// Hub issued her; she spent 16 of them to Bob after her backup and claims
-/// all 32 as funded, b = 128. The Hub's evidence: the spend.
-fn funded_under(keys: &RequestKeys) -> (Filed, Evidence) {
+/// Under a Base that funds her part with 32 notes of 4, which the Hub
+/// issued her; she spent 16 of them to Bob after her backup and claims all
+/// 32 as funded, b = 128. The Hub's evidence: the spend.
+fn funded_notes() -> (Filed, Evidence) {
     let issuer = IssuerKeys::random(3).unwrap();
     let keyset = issuer.keyset().unwrap();
     let ds: Vec<_> = (0..32).map(|i| derive(SPEND, &hold(), 4, 23, i)).collect();
@@ -261,10 +264,7 @@ fn funded_under(keys: &RequestKeys) -> (Filed, Evidence) {
         .map(|d| Output::from_derivation(d).unwrap())
         .collect();
     let mut parts = base(keyset.clone(), 53).parts().clone();
-    parts.version = Version::V5 {
-        holder_wots: keys.digest(),
-        funded: licash::spend::funded_root(&outputs).unwrap(),
-    };
+    parts.funded = licash::spend::funded_root(&outputs).unwrap();
     parts.graph.deposit_units = 128;
     let base = Base::new(parts).unwrap();
     let notes: Vec<_> = ds.iter().map(|d| mint(&issuer, &keyset, d)).collect();
@@ -321,7 +321,7 @@ fn sorted(ds: &[Derivation]) -> Vec<licash::note::Message> {
 /// her publication carrying `claim` (block 2), six blocks, the Hub's
 /// response of `b2` (block 9), six blocks.
 fn exit(base: &Base, b: u32, e: &Hash, claim: &[u8], b2: u32) -> Exit {
-    signed_exit(base, &request_witness(e, b), claim, b2)
+    signed_exit(base, &signed_request(3, e, b).1, claim, b2)
 }
 
 /// Empty headers between the checkpoint and her request, for measuring
@@ -374,7 +374,7 @@ fn input(base: &Base, exit: Exit, evidence: Vec<Evidence>) -> HubInput {
         base: base.clone(),
         exit,
         evidence,
-        keys: None,
+        keys: keys(),
         invalid: 0,
     }
 }
@@ -417,9 +417,8 @@ fn signed_request(seed: u8, e: &Hash, b: u32) -> (RequestKeys, Vec<Vec<u8>>) {
 
 /// The inputs r0/host measures the guest on (`licash-r0 hp-exec`),
 /// written to `LICASH_HP_INPUTS` if set: the 32-item claim the Hub
-/// answers with a 16-note spend, the same claim unanswered, the answered
-/// one under a v4 Base, her request's signatures checked, and its like of
-/// notes she funded a v5 Base with.
+/// answers with a 16-note spend, the same claim unanswered, and its like of
+/// notes she funded her part of the contract with.
 #[test]
 fn export_inputs() {
     let Ok(dir) = std::env::var("LICASH_HP_INPUTS") else {
@@ -429,34 +428,12 @@ fn export_inputs() {
     println!("filing: {} bytes", f.bytes.len());
     let answered = input(&f.base, exit(&f.base, f.b, &f.e, &f.bytes, 64), vec![spent]);
     let unanswered = input(&f.base, exit(&f.base, f.b, &f.e, &f.bytes, 127), vec![]);
-    let (keys, _) = signed_request(3, &[0; 32], 0);
-    let (f, spent) = stale_under(Version::V4 {
-        holder_wots: keys.digest(),
-    });
-    let (_, witness) = signed_request(3, &f.e, f.b);
-    let signed = HubInput {
-        keys: Some(keys.clone()),
-        ..input(
-            &f.base,
-            signed_exit(&f.base, &witness, &f.bytes, 64),
-            vec![spent],
-        )
-    };
-    let (f, spent) = funded_under(&keys);
-    let (_, witness) = signed_request(3, &f.e, f.b);
-    let funded = HubInput {
-        keys: Some(keys),
-        ..input(
-            &f.base,
-            signed_exit(&f.base, &witness, &f.bytes, 64),
-            vec![spent],
-        )
-    };
+    let (f, spent) = funded_notes();
+    let funded = input(&f.base, exit(&f.base, f.b, &f.e, &f.bytes, 64), vec![spent]);
     let inputs = [
         ("answered", answered),
         ("unanswered", unanswered),
-        ("answered-v4", signed),
-        ("answered-v5", funded),
+        ("answered-funded", funded),
     ];
     for (name, i) in inputs {
         let bytes = i.to_bytes();
@@ -490,7 +467,7 @@ fn the_hub_proves_what_its_evidence_leaves_owed() {
     let journal = contract(&f.base).journal();
     // The spend leaves half owed: the Hub responds 64 and proves it.
     let x = exit(&f.base, f.b, &f.e, &f.bytes, 64);
-    let (owed, read) = decide(&f.base, None, &x, std::slice::from_ref(&spent)).unwrap();
+    let (owed, read) = decide(&f.base, &keys(), &x, std::slice::from_ref(&spent)).unwrap();
     assert_eq!(
         (owed.owed, owed.mask, read.b, read.b2),
         (64, 0xffff, 128, 64)
@@ -525,27 +502,22 @@ fn the_hub_proves_what_its_evidence_leaves_owed() {
     ));
 }
 
-/// Under a v4 Base the statement holds only of a request signed under the
-/// keys Base binds: the Hub can't prove of an exit she didn't start, on a
-/// chain of its own, however long before.
+/// The statement holds only of a request signed under the keys Base binds:
+/// the Hub can't prove of an exit she didn't start, on a chain of its own,
+/// however long before.
 #[test]
-fn under_v4_her_request_must_be_signed_under_the_keys_base_binds() {
-    let (keys, _) = signed_request(3, &[0; 32], 0);
-    let (f, spent) = stale_under(Version::V4 {
-        holder_wots: keys.digest(),
-    });
+fn her_request_must_be_signed_under_the_keys_base_binds() {
+    let keys = keys();
+    let (f, spent) = stale();
     let journal = contract(&f.base).journal();
     let (_, witness) = signed_request(3, &f.e, f.b);
     let x = signed_exit(&f.base, &witness, &f.bytes, 64);
-    let signed = HubInput {
-        keys: Some(keys.clone()),
-        ..input(&f.base, x.clone(), vec![spent.clone()])
-    };
+    let signed = input(&f.base, x.clone(), vec![spent.clone()]);
     assert_eq!(check(&signed).unwrap(), journal);
     // Its keys travel with the input, after the evidence.
     let bytes = signed.to_bytes();
     let decoded = HubInput::from_bytes(&bytes).unwrap();
-    assert_eq!(decoded.keys.as_ref(), Some(&keys));
+    assert_eq!(decoded.keys, keys);
     assert_eq!(check(&decoded).unwrap(), journal);
     for n in [bytes.len() - 1, bytes.len() - 20 * 77] {
         assert_eq!(
@@ -561,26 +533,22 @@ fn under_v4_her_request_must_be_signed_under_the_keys_base_binds() {
     assert_ne!(loose, witness);
     let x = signed_exit(&f.base, &loose, &f.bytes, 64);
     assert_eq!(
-        check(&HubInput {
-            keys: Some(keys.clone()),
-            ..input(&f.base, x, vec![spent.clone()])
-        })
-        .unwrap(),
+        check(&input(&f.base, x, vec![spent.clone()])).unwrap(),
         journal
     );
     // Her (b, E) signed under other keys, or a request no key signed, or
-    // the input's keys not those Base binds, or none: no proof.
+    // the input's keys not those Base binds: no proof.
     let (other, forged) = signed_request(5, &f.e, f.b);
     for (keys, witness) in [
-        (Some(&keys), forged.clone()),
-        (Some(&keys), request_witness(&f.e, f.b)),
-        (Some(&other), forged),
-        (None, witness.clone()),
+        (&keys, forged.clone()),
+        (&keys, request_witness(&f.e, f.b)),
+        (&other, forged),
+        (&other, witness.clone()),
     ] {
         let x = signed_exit(&f.base, &witness, &f.bytes, 64);
         assert_eq!(
             check(&HubInput {
-                keys: keys.cloned(),
+                keys: keys.clone(),
                 ..input(&f.base, x, vec![spent.clone()])
             }),
             Err(Refusal::Unsigned)
@@ -591,59 +559,27 @@ fn under_v4_her_request_must_be_signed_under_the_keys_base_binds() {
     let at = changed.iter().position(|i| i.as_slice() == [15]).unwrap();
     changed[at] = vec![14];
     let x = signed_exit(&f.base, &changed, &f.bytes, 64);
-    assert!(check(&HubInput {
-        keys: Some(keys),
-        ..input(&f.base, x, vec![spent])
-    })
-    .is_err());
+    assert!(check(&input(&f.base, x, vec![spent])).is_err());
 }
 
-/// Under a v5 Base her funded notes are owed as the outputs it commits to,
-/// those spent void: the Hub proves the rest owed, on her signed request.
+/// Her funded notes are owed as the outputs her Base commits to, those
+/// spent void: the Hub proves the rest owed, on her signed request.
 #[test]
-fn under_v5_her_funded_notes_are_owed_unless_spent() {
-    let (keys, _) = signed_request(3, &[0; 32], 0);
-    let (f, spent) = funded_under(&keys);
+fn her_funded_notes_are_owed_unless_spent() {
+    let keys = keys();
+    let (f, spent) = funded_notes();
     let journal = contract(&f.base).journal();
     let (_, witness) = signed_request(3, &f.e, f.b);
     let x = signed_exit(&f.base, &witness, &f.bytes, 64);
-    let (owed, _) = decide(&f.base, Some(&keys), &x, std::slice::from_ref(&spent)).unwrap();
+    let (owed, _) = decide(&f.base, &keys, &x, std::slice::from_ref(&spent)).unwrap();
     assert_eq!((owed.owed, owed.mask, owed.ineligible), (64, 0xffff, None));
-    let signed = HubInput {
-        keys: Some(keys.clone()),
-        ..input(&f.base, x, vec![spent.clone()])
-    };
+    let signed = input(&f.base, x, vec![spent.clone()]);
     assert_eq!(check(&signed).unwrap(), journal);
     let decoded = HubInput::from_bytes(&signed.to_bytes()).unwrap();
     assert_eq!(check(&decoded).unwrap(), journal);
     // Without the spend all 128 stay owed: a response of 64 proves nothing.
     let x = signed_exit(&f.base, &witness, &f.bytes, 64);
-    assert_eq!(
-        check(&HubInput {
-            keys: Some(keys),
-            ..input(&f.base, x, vec![])
-        }),
-        Err(Refusal::Owed)
-    );
-}
-
-/// Under v3 the input is what v3's program reads: no keys, whatever the
-/// Hub holds.
-#[test]
-fn under_v3_the_input_carries_no_keys() {
-    let (f, spent) = stale();
-    let (keys, _) = signed_request(3, &f.e, f.b);
-    let x = exit(&f.base, f.b, &f.e, &f.bytes, 64);
-    let plain = input(&f.base, x, vec![spent]);
-    let with = HubInput {
-        keys: Some(keys),
-        ..plain.clone()
-    };
-    assert_eq!(with.to_bytes(), plain.to_bytes());
-    assert!(HubInput::from_bytes(&plain.to_bytes())
-        .unwrap()
-        .keys
-        .is_none());
+    assert_eq!(check(&input(&f.base, x, vec![])), Err(Refusal::Owed));
 }
 
 #[test]
@@ -805,7 +741,7 @@ fn a_response_is_borne_out_when_owed_at_most_what_it_says_and_what_it_uses_is_di
 /// flag on a valid item proves nothing. Its input carries the flags.
 #[test]
 fn a_lean_statement_proves_a_claim_owed_less_by_the_items_the_hub_flags() {
-    let (f, spent) = stale_on(Version::V3, licash::recovery::LEAN_FROM);
+    let (f, spent) = stale_on(licash::recovery::LEAN_FROM);
     let filing = Filing::from_bytes(Format::Lean, &f.base.parts().keyset, LIMIT, &f.bytes).unwrap();
     // The proof of issuance of a note she did not spend forged (the 32nd of
     // her notes: she spent the first 16).
@@ -831,9 +767,9 @@ fn a_lean_statement_proves_a_claim_owed_less_by_the_items_the_hub_flags() {
     // Of 32 notes of 4, she spent 16 and forged one: owed 60 of her 128.
     let evidence = vec![spent];
     let x = exit(&f.base, f.b, &f.e, &bytes, 60);
-    let invalid = licash_hp::flagged(&f.base, None, &x, &evidence).unwrap();
+    let invalid = licash_hp::flagged(&f.base, &keys(), &x, &evidence).unwrap();
     assert_eq!(invalid.count_ones(), 1);
-    let (owed, _) = decide(&f.base, None, &x, &evidence).unwrap();
+    let (owed, _) = decide(&f.base, &keys(), &x, &evidence).unwrap();
     assert_eq!((owed.owed, owed.invalid), (60, invalid));
     let mut i = input(&f.base, x, evidence);
     // Unflagged, the forged note is taken as valid: owed 64, more than the

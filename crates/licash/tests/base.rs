@@ -1,6 +1,6 @@
 use k256::Scalar;
 use licash::{
-    base::{Base, ChainTerms, Close, Fees, GraphTerms, Limits, Parts, Party, Recipe, Version},
+    base::{Base, ChainTerms, Close, Fees, GraphTerms, Limits, Parts, Party, Recipe},
     chain::Checkpoint,
     crypto::{self, tagged_hash, Point},
     note::IssuerKeys,
@@ -123,8 +123,9 @@ fn parts() -> Parts {
     let mut deposit = [31; 36];
     deposit[32..].copy_from_slice(&7u32.to_le_bytes());
     Parts {
-        version: Version::V3,
         nonce: [53; 32],
+        holder_wots: [9; 32],
+        funded: [7; 32],
         claim_key: point(19).x_only(),
         keyset: IssuerKeys::random(2).unwrap().keyset().unwrap(),
         deposit,
@@ -135,7 +136,7 @@ fn parts() -> Parts {
             unit_sats: 1,
             bits: 21,
             low_bits: 9,
-            deposit_units: 500_000,
+            deposit_units: 100,
             close_height: 1_000,
             reserve_alice: 20_000,
             reserve_hub: 100_000,
@@ -176,7 +177,10 @@ fn parts() -> Parts {
             max_rate_sat_per_kvb: 10_000,
             opening_fee_quote: 3_000,
         },
-        close: None,
+        close: Close {
+            script: vec![0x51, 0x20, 3, 3, 3],
+            fee: 1_000,
+        },
     }
 }
 
@@ -187,7 +191,7 @@ fn complete_base_roundtrips_with_explicit_keyset_checkpoint_and_fee_preimages() 
     assert!(bytes.len() < licash::base::MAX_BASE_BYTES);
     let restored = Base::from_bytes(&bytes).unwrap();
     assert_eq!(restored.to_bytes(), bytes);
-    assert_eq!(restored.digest(), tagged_hash("licash/base/v3", &[&bytes]));
+    assert_eq!(restored.digest(), tagged_hash("licash/base/v6", &[&bytes]));
     assert_eq!(restored.parts().keyset.id(), base.parts().keyset.id());
     assert_eq!(
         restored.parts().chain.checkpoint.commitment(),
@@ -207,106 +211,68 @@ fn complete_base_roundtrips_with_explicit_keyset_checkpoint_and_fee_preimages() 
     assert!(Base::from_bytes(&flipped).is_err());
 }
 
-/// A v4 Base carries her request keys' digest after the v3 fields, under
-/// its own tag and digest domain; v3's bytes and digest are unchanged.
+/// A Base carries her request keys' digest, her funded outputs' root and the
+/// script the default returns her reserve to with what the Hub keeps of it
+/// for the swap, after the terms, under its tag and digest domain.
 #[test]
-fn a_v4_base_binds_her_request_keys_and_keeps_v3_as_it_was() {
-    let mut p = parts();
-    let v3 = Base::new(p.clone()).unwrap();
-    p.version = Version::V4 {
-        holder_wots: [9; 32],
-    };
-    let v4 = Base::new(p.clone()).unwrap();
-    let (old, new) = (v3.to_bytes(), v4.to_bytes());
-    assert!(old.starts_with(b"LICASH-BASE\x03"));
-    assert!(new.starts_with(b"LICASH-BASE\x04"));
-    assert_eq!(new[12..new.len() - 32], old[12..]);
-    assert_eq!(new[new.len() - 32..], [9; 32]);
-    assert_eq!(v4.digest(), tagged_hash("licash/base/v4", &[&new]));
-    assert_eq!(v3.digest(), tagged_hash("licash/base/v3", &[&old]));
-    let restored = Base::from_bytes(&new).unwrap();
-    assert_eq!(restored.version(), p.version);
-    assert_eq!(Base::from_bytes(&old).unwrap().version(), Version::V3);
-    // A v4 Base without its keys, or v3's bytes under v4's tag, is refused.
-    let mut short = new.clone();
-    short.truncate(new.len() - 1);
-    assert!(Base::from_bytes(&short).is_err());
-    let mut retagged = old.clone();
-    retagged[11] = 4;
-    assert!(Base::from_bytes(&retagged).is_err());
-    let mut extended = old;
-    extended.extend([9; 32]);
-    assert!(Base::from_bytes(&extended).is_err());
-    // Each key digest is its own contract.
-    p.version = Version::V4 {
-        holder_wots: [8; 32],
-    };
-    assert_ne!(Base::new(p.clone()).unwrap().digest(), v4.digest());
-    p.version = Version::V4 {
-        holder_wots: [0; 32],
-    };
-    assert!(Base::new(p).is_err());
-}
-
-/// A v6 Base carries the script the default returns her reserve to, and
-/// what the Hub keeps of it for the swap, after v5's fields; no other
-/// version carries them.
-#[test]
-fn a_v6_base_commits_to_where_the_default_returns_her_reserve() {
-    let mut p = parts();
-    p.graph.deposit_units = 100;
-    p.version = Version::V6 {
-        holder_wots: [9; 32],
-        funded: [7; 32],
-    };
-    let close = Close {
-        script: vec![0x51, 0x20, 3, 3, 3],
-        fee: 1_000,
-    };
-    p.close = Some(close.clone());
-    let v6 = Base::new(p.clone()).unwrap();
-    let bytes = v6.to_bytes();
+fn a_base_commits_to_her_keys_her_funded_part_and_where_the_default_pays_her_reserve() {
+    let p = parts();
+    let base = Base::new(p.clone()).unwrap();
+    let bytes = base.to_bytes();
     assert!(bytes.starts_with(b"LICASH-BASE\x06"));
-    assert_eq!(v6.digest(), tagged_hash("licash/base/v6", &[&bytes]));
+    assert_eq!(base.digest(), tagged_hash("licash/base/v6", &[&bytes]));
     let restored = Base::from_bytes(&bytes).unwrap();
-    assert_eq!(restored.parts().close, Some(close));
+    assert_eq!(restored.parts().holder_wots, [9; 32]);
+    assert_eq!(restored.parts().funded, [7; 32]);
+    assert_eq!(restored.parts().close, p.close);
     assert_eq!(restored.to_bytes(), bytes);
-    // The script and the fee are each part of the contract.
-    for change in 0..2 {
+    // Each is part of the contract.
+    for change in 0..4 {
         let mut other = p.clone();
         match change {
-            0 => other.close.as_mut().unwrap().script[2] ^= 1,
-            _ => other.close.as_mut().unwrap().fee += 1,
+            0 => other.holder_wots[0] ^= 1,
+            1 => other.funded[0] ^= 1,
+            2 => other.close.script[2] ^= 1,
+            _ => other.close.fee += 1,
         }
-        assert_ne!(Base::new(other).unwrap().digest(), v6.digest());
+        assert_ne!(Base::new(other).unwrap().digest(), base.digest());
     }
-    // Truncated or extended bytes are refused.
+    // Truncated or extended bytes are refused, and so is any other tag: the
+    // forms of a Base before this one are no longer read.
     assert!(Base::from_bytes(&bytes[..bytes.len() - 1]).is_err());
     let mut longer = bytes.clone();
     longer.push(0);
     assert!(Base::from_bytes(&longer).is_err());
-    // A v6 Base without its close, or another version with one, is refused.
+    for tag in 3..6u8 {
+        let mut old = bytes.clone();
+        old[11] = tag;
+        assert!(Base::from_bytes(&old).is_err(), "tag {tag}");
+    }
+    // Her keys and funded part are bound, and she funds some.
+    let mut unbound = p.clone();
+    unbound.holder_wots = [0; 32];
+    assert!(Base::new(unbound).is_err());
+    let mut unfunded = p.clone();
+    unfunded.funded = [0; 32];
+    assert!(Base::new(unfunded).is_err());
     let mut none = p.clone();
-    none.close = None;
+    none.graph.deposit_units = 0;
     assert!(Base::new(none).is_err());
-    let mut v5 = p.clone();
-    v5.version = Version::V5 {
-        holder_wots: [9; 32],
-        funded: [7; 32],
-    };
-    assert!(Base::new(v5).is_err());
+    let mut over = p.clone();
+    over.graph.deposit_units = over.cap + 1;
+    assert!(Base::new(over).is_err());
     // The default's script is never her payout script, and the swap's fee
     // leaves the notes worth a dust output at least.
     let mut payout = p.clone();
-    payout.close.as_mut().unwrap().script = payout.parties[0].payout_script.clone();
+    payout.close.script = payout.parties[0].payout_script.clone();
     assert!(Base::new(payout).is_err());
     for fee in [20_000 - 329, 20_001, u64::MAX] {
         let mut dear = p.clone();
-        dear.close.as_mut().unwrap().fee = fee;
+        dear.close.fee = fee;
         assert!(Base::new(dear).is_err(), "a fee of {fee}");
     }
     let mut cheapest = p.clone();
-    cheapest.close.as_mut().unwrap().fee = 20_000 - 330;
+    cheapest.close.fee = 20_000 - 330;
     assert!(Base::new(cheapest).is_ok());
 }
 
@@ -314,7 +280,7 @@ fn a_v6_base_commits_to_where_the_default_returns_her_reserve() {
 fn every_agreed_base_field_changes_the_independent_key_context() {
     let original = parts();
     let digest = Base::new(original.clone()).unwrap().digest();
-    for field in 0..55 {
+    for field in 0..59 {
         let mut p = original.clone();
         match field {
             0 => p.nonce[0] ^= 1,
@@ -365,6 +331,10 @@ fn every_agreed_base_field_changes_the_independent_key_context() {
             51 => p.parties[1].delayed = point(67).x_only(),
             52 => p.parties[1].payout_script[2] ^= 1,
             53 => p.graph.contest_window += 1,
+            55 => p.holder_wots[0] ^= 1,
+            56 => p.funded[0] ^= 1,
+            57 => p.close.script[2] ^= 1,
+            58 => p.close.fee += 1,
             _ => p.deposit[32..].copy_from_slice(&8u32.to_le_bytes()),
         }
         let changed = Base::new(p).unwrap();

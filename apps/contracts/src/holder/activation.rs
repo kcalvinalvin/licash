@@ -336,19 +336,12 @@ pub fn protects<T: Transport>(
     let urls = wallet.hub_urls(url)?;
     let recovering: HashSet<[u8; 32]> = store.recoveries()?.iter().map(|r| r.id).collect();
     let (seed, network) = (wallet.contract_secrets().seed, wallet.network());
-    let ctx = Context {
-        tip,
-        trust: crate::trust(network)?,
-    };
     for c in store.list()? {
         if !c.at(&urls) || !c.live(tip) || recovering.contains(&c.id) {
             continue;
         }
-        let (state, _) = store.state(&c.id)?;
-        let opening = Holder::load(&state, &seed, &ctx)?.signed()?;
-        if opening.base.version().anchored()
-            && exit::planned_force_at(&seed, network, wallet_file, &c.id, tip)?
-                >= tip.saturating_add(PROTECTING)
+        if exit::planned_force_at(&seed, network, wallet_file, &c.id, tip)?
+            >= tip.saturating_add(PROTECTING)
         {
             return Ok(true);
         }
@@ -389,8 +382,7 @@ pub(super) fn claimant<T: Transport>(
         let (state, _) = store.state(&c.id)?;
         let opening = Holder::load(&state, &seed, &ctx)?.signed()?;
         let parts = opening.base.parts();
-        if !opening.base.version().anchored()
-            || parts.chain.checkpoint.height() > anchor.height()
+        if parts.chain.checkpoint.height() > anchor.height()
             || *parts.keyset.id() != o.keyset
         {
             continue;
@@ -439,9 +431,6 @@ pub(super) async fn shown<T: Transport, C: Chain>(
     tip: u32,
 ) -> Result<BTreeSet<ProposalId>> {
     let mut shown = BTreeSet::new();
-    if !base.version().anchored() {
-        return Ok(shown);
-    }
     let parts = base.parts();
     let keyset = *parts.keyset.id();
     let from = parts.chain.checkpoint.height();

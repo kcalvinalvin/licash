@@ -16,11 +16,9 @@ use crate::{
     Error,
 };
 
-/// The tags of the Base's versions: each names its own statement rules.
-const BASE_TAG_V3: &[u8] = b"LICASH-BASE\x03";
-const BASE_TAG_V4: &[u8] = b"LICASH-BASE\x04";
-const BASE_TAG_V5: &[u8] = b"LICASH-BASE\x05";
-const BASE_TAG_V6: &[u8] = b"LICASH-BASE\x06";
+/// The Base's tag and digest domain: the sixth form of it, the only one
+/// read, whose rules the statement judges by.
+const BASE_TAG: &[u8] = b"LICASH-BASE\x06";
 pub const MAX_BASE_BYTES: usize = 128_000;
 const MAX_MONEY: u64 = 2_100_000_000_000_000;
 /// The one graph a Base can name: Lichen's hub-proves graph.
@@ -142,7 +140,7 @@ pub struct Limits {
     pub max_source_inputs: u32,
 }
 
-/// Where the default close returns the holder's reserve (v6): a script of
+/// Where the default close returns the holder's reserve: a script of
 /// its own, never her payout script, so that the contract's end by default
 /// pays no coin of hers and is not linked to her wallet. It is the Hub's
 /// deposit that swaps the reserve for notes: the Hub locks its notes to her
@@ -164,72 +162,18 @@ pub struct Fees {
     pub opening_fee_quote: u64,
 }
 
-/// A Base's version, and with it the rules its statement judges by. A
-/// contract keeps its version's rules for its life: v3's for those opened
-/// under it, v4's for every new one.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Version {
-    /// The first rules: a claim's chain evidence is judged only up to its
-    /// publication, and her request's keys are not bound.
-    V3,
-    /// Her request's one-time keys are bound (`holder_wots`, the digest of
-    /// her keys on `b` and `E`), a lock's chain evidence is anchored to
-    /// its lock checkpoint, and a pending Pay counts only with an
-    /// activation.
-    V4 { holder_wots: [u8; 32] },
-    /// As v4, and the holder funds part of the contract herself: her
-    /// `deposit_units` of it, owed to her as notes the Hub issues for her
-    /// blinded outputs, whose ordered list `funded` commits to
-    /// ([`crate::spend::funded_root`]). She may claim those of them it
-    /// never issued her ([`crate::claim::Item::Funded`]).
-    V5 {
-        holder_wots: [u8; 32],
-        funded: [u8; 32],
-    },
-    /// As v5, and the default close returns her reserve to a script of its
-    /// own ([`Close`], in [`Parts::close`]).
-    V6 {
-        holder_wots: [u8; 32],
-        funded: [u8; 32],
-    },
-}
-
-impl Version {
-    /// Her request's one-time keys, bound from v4 on.
-    pub fn holder_wots(&self) -> Option<[u8; 32]> {
-        match *self {
-            Self::V3 => None,
-            Self::V4 { holder_wots }
-            | Self::V5 { holder_wots, .. }
-            | Self::V6 { holder_wots, .. } => Some(holder_wots),
-        }
-    }
-
-    /// The commitment to her funded outputs, of v5 and v6.
-    pub fn funded(&self) -> Option<[u8; 32]> {
-        match *self {
-            Self::V5 { funded, .. } | Self::V6 { funded, .. } => Some(funded),
-            _ => None,
-        }
-    }
-
-    /// Whether the default close returns her reserve to a script of its
-    /// own ([`Parts::close`]): of v6.
-    pub fn closes_apart(&self) -> bool {
-        matches!(self, Self::V6 { .. })
-    }
-
-    /// Whether v4's rules hold: a lock anchored to its own checkpoint, a
-    /// Pay owed only with an activation. Of v4 on.
-    pub fn anchored(&self) -> bool {
-        !matches!(self, Self::V3)
-    }
-}
-
 #[derive(Clone)]
 pub struct Parts {
-    pub version: Version,
     pub nonce: [u8; 32],
+    /// The digest of her request's one-time keys
+    /// (`licash_hp::RequestKeys::digest`): only she can sign a request, so
+    /// no proof can be made of an exit she never started.
+    pub holder_wots: [u8; 32],
+    /// The commitment to her funded outputs ([`crate::spend::funded_root`]):
+    /// her `deposit_units` of the contract, owed to her as notes the Hub
+    /// issues for her blinded outputs, of which she may claim those it never
+    /// issued her ([`crate::claim::Item::Funded`]).
+    pub funded: [u8; 32],
     /// The holder's key authorizing her claim's publication.
     pub claim_key: [u8; 32],
     pub keyset: Keyset,
@@ -242,9 +186,8 @@ pub struct Parts {
     pub chain: ChainTerms,
     pub limits: Limits,
     pub fees: Fees,
-    /// Where her reserve returns by default: set under v6, and under no
-    /// other version.
-    pub close: Option<Close>,
+    /// Where her reserve returns by default.
+    pub close: Close,
 }
 
 /// An unsigned canonical preimage, NOT an accepted/prepared opening, a trusted
@@ -294,15 +237,11 @@ impl Base {
         ) {
             k256::schnorr::VerifyingKey::from_bytes(key).map_err(|_| Error::InvalidPoint)?;
         }
-        let funded_bad = match p.version.funded() {
-            Some(root) => {
-                root == [0; 32] || p.graph.deposit_units == 0 || p.graph.deposit_units > p.cap
-            }
-            None => false,
-        };
         if p.nonce == [0; 32]
-            || p.version.holder_wots() == Some([0; 32])
-            || funded_bad
+            || p.holder_wots == [0; 32]
+            || p.funded == [0; 32]
+            || p.graph.deposit_units == 0
+            || p.graph.deposit_units > p.cap
             || p.deposit[..32] == [0; 32]
             || p.parties[0].payment == p.parties[1].payment
             || p.cap == 0
@@ -316,20 +255,15 @@ impl Base {
             }
         }
         let g = &p.graph;
-        match (&p.close, p.version.closes_apart()) {
-            (None, false) => {}
-            (Some(close), true) => {
-                // Her reserve less the fee is what the Hub locks to her:
-                // at least a dust output's worth.
-                if close.script.len() < 2
-                    || close.script.len() > 10_000
-                    || close.script == p.parties[0].payout_script
-                    || g.reserve_alice.checked_sub(close.fee) < Some(g.dust)
-                {
-                    return Err(bad("native default close"));
-                }
-            }
-            _ => return Err(bad("native default close of another version")),
+        // Her reserve less the fee is what the Hub locks to her: at least a
+        // dust output's worth.
+        let close = &p.close;
+        if close.script.len() < 2
+            || close.script.len() > 10_000
+            || close.script == p.parties[0].payout_script
+            || g.reserve_alice.checked_sub(close.fee) < Some(g.dust)
+        {
+            return Err(bad("native default close"));
         }
         g.graph_value()?;
         let c = &p.chain;
@@ -405,13 +339,7 @@ impl Base {
 
     pub fn to_bytes(&self) -> Vec<u8> {
         let p = &self.0;
-        let mut bytes = match p.version {
-            Version::V3 => BASE_TAG_V3,
-            Version::V4 { .. } => BASE_TAG_V4,
-            Version::V5 { .. } => BASE_TAG_V5,
-            Version::V6 { .. } => BASE_TAG_V6,
-        }
-        .to_vec();
+        let mut bytes = BASE_TAG.to_vec();
         bytes.extend(p.nonce);
         bytes.extend(p.claim_key);
         put_blob(&mut bytes, &p.keyset.to_bytes());
@@ -471,16 +399,10 @@ impl Base {
         for value in [p.fees.max_rate_sat_per_kvb, p.fees.opening_fee_quote] {
             bytes.extend(value.to_be_bytes());
         }
-        if let Some(holder_wots) = p.version.holder_wots() {
-            bytes.extend(holder_wots);
-        }
-        if let Some(funded) = p.version.funded() {
-            bytes.extend(funded);
-        }
-        if let Some(close) = &p.close {
-            put_blob(&mut bytes, &close.script);
-            bytes.extend(close.fee.to_be_bytes());
-        }
+        bytes.extend(p.holder_wots);
+        bytes.extend(p.funded);
+        put_blob(&mut bytes, &p.close.script);
+        bytes.extend(p.close.fee.to_be_bytes());
         bytes
     }
 
@@ -489,13 +411,9 @@ impl Base {
             return Err(bad("native Base byte limit"));
         }
         let mut reader = Reader(bytes);
-        let tag = match reader.take(BASE_TAG_V3.len())? {
-            tag if tag == BASE_TAG_V3 => 3,
-            tag if tag == BASE_TAG_V4 => 4,
-            tag if tag == BASE_TAG_V5 => 5,
-            tag if tag == BASE_TAG_V6 => 6,
-            _ => return Err(bad("native Base tag")),
-        };
+        if reader.take(BASE_TAG.len())? != BASE_TAG {
+            return Err(bad("native Base tag"));
+        }
         let nonce = reader.array()?;
         let claim_key = reader.array()?;
         let keyset = Keyset::from_bytes(reader.blob(4_096)?)?;
@@ -556,33 +474,19 @@ impl Base {
             max_rate_sat_per_kvb: reader.u64()?,
             opening_fee_quote: reader.u64()?,
         };
-        let version = match tag {
-            3 => Version::V3,
-            4 => Version::V4 {
-                holder_wots: reader.array()?,
-            },
-            5 => Version::V5 {
-                holder_wots: reader.array()?,
-                funded: reader.array()?,
-            },
-            _ => Version::V6 {
-                holder_wots: reader.array()?,
-                funded: reader.array()?,
-            },
-        };
-        let close = match version.closes_apart() {
-            true => Some(Close {
-                script: reader.blob(10_000)?.to_vec(),
-                fee: reader.u64()?,
-            }),
-            false => None,
+        let holder_wots = reader.array()?;
+        let funded = reader.array()?;
+        let close = Close {
+            script: reader.blob(10_000)?.to_vec(),
+            fee: reader.u64()?,
         };
         if !reader.0.is_empty() {
             return Err(bad("trailing native Base bytes"));
         }
         Self::new(Parts {
-            version,
             nonce,
+            holder_wots,
+            funded,
             claim_key,
             keyset,
             deposit,
@@ -598,17 +502,7 @@ impl Base {
     }
 
     pub fn digest(&self) -> [u8; 32] {
-        let domain = match self.0.version {
-            Version::V3 => "licash/base/v3",
-            Version::V4 { .. } => "licash/base/v4",
-            Version::V5 { .. } => "licash/base/v5",
-            Version::V6 { .. } => "licash/base/v6",
-        };
-        crypto::tagged_hash(domain, &[&self.to_bytes()])
-    }
-
-    pub fn version(&self) -> Version {
-        self.0.version
+        crypto::tagged_hash("licash/base/v6", &[&self.to_bytes()])
     }
 
     /// What each party checks of agreed terms before it garbles or funds:

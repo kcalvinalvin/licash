@@ -12,7 +12,7 @@
 
 use crate::{
     authorization::{Authorization, SignedProposal, Unlock},
-    base::{Base, Version},
+    base::Base,
     chain::{Activation, ActivationRef, Chain, Checkpoint, Inclusion},
     claim::{self, ActivationRecord, Branch, Item, Source, UnsignedClaim, MAX_ITEMS},
     crypto::{self, generator_mul, Point, ScalarBytes, Signature},
@@ -29,11 +29,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 const P_MAGIC: &[u8] = b"LICASH-P\x02";
 const P_MAGIC_COMPACT: &[u8] = b"LICASH-P\x03";
-/// A filing's magic: its activations unanchored (v3's), or each with the
-/// lock checkpoint it is anchored to (v4's).
+/// A filing's magic: with no activation, or each with the lock checkpoint
+/// it is anchored to.
 const F_MAGIC: &[u8] = b"LICASH-F\x01";
 const F_MAGIC_ANCHORED: &[u8] = b"LICASH-F\x02";
-/// Its activations anchored, and the outputs a v5 Base's holder funded
+/// Its activations anchored, and the outputs her Base's funded part names
 /// listed after them, which its funded items open.
 const F_MAGIC_FUNDED: &[u8] = b"LICASH-F\x03";
 /// The compact format's: unanchored, anchored, and funded as [`F_MAGIC_FUNDED`].
@@ -578,9 +578,9 @@ pub enum Evidence {
         source: ProposalId,
         preimage: [u8; 32],
     },
-    /// The source expired at depth with no activation referenced by the claim:
-    /// its Pay items are void (the refund branch holds). v3 only: under v4 a
-    /// lock's Pay is owed only with an activation, so expiry voids nothing.
+    /// The source expired at depth with no activation referenced by the claim.
+    /// It voids nothing: a lock's Pay is owed only with an activation, so a
+    /// claim with evidence of it is refused.
     Expired { source: ProposalId },
 }
 
@@ -771,15 +771,11 @@ pub fn voids_note(keyset: &Keyset, note: &Message, evidence: &Evidence) -> Resul
 
 /// The items `evidence` voids (bit i for item i) and the sources it shows
 /// executed. Each evidence must void an item, or show a Plain source
-/// executed, which values its fallbacks. `chain` must be verified from the
-/// source terms' checkpoint; it is needed only for `Expired`, which only
-/// v3 admits.
+/// executed, which values its fallbacks.
 fn void(
-    version: Version,
     keyset: &Keyset,
     claim: &UnsignedClaim,
     evidence: &[Evidence],
-    chain: Option<&Chain>,
 ) -> Result<(u32, BTreeSet<ProposalId>), Error> {
     let items = &claim.parts().items;
     let sources: BTreeMap<_, _> = claim.parts().sources.iter().map(|s| (s.id(), s)).collect();
@@ -853,37 +849,9 @@ fn void(
                     }
                 }
             }
-            Evidence::Expired { source } => {
-                if version.anchored() {
-                    return Err(bad("expiry voids nothing under v4"));
-                }
-                let terms = sources
-                    .get(source)
-                    .and_then(|s| s.terms())
-                    .ok_or_else(|| bad("expiry of an untimed or unclaimed source"))?;
-                let chain = chain.ok_or_else(|| bad("expiry needs a chain"))?;
-                let mature = terms
-                    .expiry()
-                    .checked_add(terms.depth())
-                    .ok_or_else(|| bad("expiry horizon"))?;
-                if chain.checkpoint().commitment() != *terms.checkpoint()
-                    || chain.tip_height() < mature
-                {
-                    return Err(bad("source expiry is not mature on the agreed chain"));
-                }
-                for (i, item) in items.iter().enumerate() {
-                    if let Item::Pending {
-                        source: s,
-                        branch: Branch::Pay,
-                        ..
-                    } = item
-                    {
-                        if s == source && !immune(s, &Branch::Pay) {
-                            mask |= 1 << i;
-                        }
-                    }
-                }
-            }
+            // A lock's activation is what shows it paid, not its expiry: the
+            // statement can't see one.
+            Evidence::Expired { .. } => return Err(bad("expiry voids nothing")),
         }
         if mask == before && !values_fallback {
             return Err(bad("evidence voids nothing"));
@@ -901,7 +869,6 @@ fn void(
 /// `judged`, reaches its expiry at depth: any activation is buried by
 /// then, so the Hub holds its preimage, and can't be owed the Pay later.
 fn live(
-    version: Version,
     claim: &UnsignedClaim,
     mask: u32,
     executed: &BTreeSet<ProposalId>,
@@ -918,13 +885,12 @@ fn live(
             Item::Settled(_) | Item::Funded { .. } => true,
             Item::Pending { source, branch, .. } => match sources[source].terms() {
                 None => executed.contains(source),
-                Some(terms) => match (version.anchored(), branch) {
-                    (true, Branch::Pay) => activated.contains(source),
-                    (true, Branch::Refund) => terms
+                Some(terms) => match branch {
+                    Branch::Pay => activated.contains(source),
+                    Branch::Refund => terms
                         .expiry()
                         .checked_add(terms.depth())
                         .is_some_and(|settled| judged >= settled),
-                    (false, _) => true,
                 },
             },
         };
@@ -953,9 +919,8 @@ pub struct Witness {
 }
 
 /// An advertised activation's public evidence: its transaction's inclusion
-/// and, under a v4 Base, the lock checkpoint it is anchored to (the one the
-/// lock's terms name), which must be a block of the chain the statement
-/// reads. Under v3 the lock's checkpoint must be Base's, and none is filed.
+/// and the lock checkpoint it is anchored to (the one the lock's terms
+/// name), which must be a block of the chain the statement reads.
 #[derive(Clone)]
 pub struct ActivationWitness {
     pub inclusion: Inclusion,
@@ -1252,13 +1217,9 @@ impl Filing {
 /// Whether a decoded filing is eligible under this opening and request: an
 /// error is the holder's, and leaves the claim owed nothing.
 ///
-/// Under v3, the Pay outputs of a timed lock are eligible only under a Base
-/// opened on the checkpoint that the lock's terms name: the statement reads
-/// Bitcoin from Base's checkpoint, so under any other the Hub could never
-/// show that the lock expired, and an expired, refunded lock would be paid
-/// twice. Under v4 a lock may name any checkpoint on the chain the
-/// statement reads, its activation anchored to it, and a Pay is owed only
-/// with an activation ([`live`]).
+/// A lock may name any checkpoint on the chain the statement reads, its
+/// activation anchored to it, and a Pay is owed only with an activation
+/// ([`live`]).
 fn eligible(filing: &Filing, base: &Base, request: &Request, chain: &Chain) -> Result<(), Error> {
     let publication = &filing.publication;
     publication.bind(base, request)?;
@@ -1278,7 +1239,7 @@ fn eligible(filing: &Filing, base: &Base, request: &Request, chain: &Chain) -> R
     let funded = &filing.witness.funded;
     if !funded.is_empty() {
         let root = crate::spend::funded_root(funded)?;
-        if base.version().funded() != Some(root) {
+        if base.parts().funded != root {
             return Err(bad("funded outputs not those Base commits to"));
         }
         // What she funded is what the outputs are worth: no more is owed.
@@ -1305,8 +1266,6 @@ fn eligible(filing: &Filing, base: &Base, request: &Request, chain: &Chain) -> R
             return Err(bad("funded item does not open its output"));
         }
     }
-    let checkpoint = &parts.chain.checkpoint;
-    let agreed = (checkpoint.profile(), checkpoint.commitment());
     for item in &claim.parts().items {
         let Item::Pending {
             message,
@@ -1319,12 +1278,6 @@ fn eligible(filing: &Filing, base: &Base, request: &Request, chain: &Chain) -> R
         else {
             continue;
         };
-        let timed_elsewhere = metadata[source]
-            .terms()
-            .is_some_and(|t| (t.profile(), *t.checkpoint()) != agreed);
-        if *branch == Branch::Pay && timed_elsewhere && base.version() == Version::V3 {
-            return Err(bad("pay output of a lock timed on another checkpoint"));
-        }
         let outputs = match branch {
             Branch::Pay => bodies[source].outputs(),
             Branch::Refund => bodies[source]
@@ -1349,11 +1302,10 @@ fn eligible(filing: &Filing, base: &Base, request: &Request, chain: &Chain) -> R
         let terms = metadata[&record.source]
             .terms()
             .expect("admitted source is timed");
-        let anchor = match (base.version().anchored(), &w.anchor) {
-            (false, None) => chain.checkpoint(),
-            (true, Some(anchor)) => anchor,
-            _ => return Err(bad("activation anchor of another Base version")),
-        };
+        let anchor = w
+            .anchor
+            .as_ref()
+            .ok_or_else(|| bad("an activation without its lock checkpoint"))?;
         Activation {
             reference: record.reference,
             inclusion: w.inclusion.clone(),
@@ -1388,12 +1340,11 @@ pub struct Owed {
 /// A claim the holder got wrong is ineligible, and owed 0: bytes that don't
 /// decode, a P for another opening or request, a note the issuer didn't
 /// sign, a source body that doesn't authenticate or an output it doesn't
-/// open, a funded item that doesn't open an output its v5 Base commits to,
-/// under v3 a Pay of a lock timed on another checkpoint, an activation
-/// `chain` doesn't bury at its terms' depth (under v4, after the lock's
-/// checkpoint, which must be a block of `chain`). Otherwise the claim is
+/// open, a funded item that doesn't open an output her Base commits to, an
+/// activation `chain` doesn't bury at its terms' depth, after the lock's
+/// checkpoint, which must be a block of `chain`. Otherwise the claim is
 /// owed what the Hub's evidence leaves live, capped at its amount: with no
-/// evidence, its amount, less under v4 any lock's Pay it advertises no
+/// evidence, its amount, less any lock's Pay it advertises no
 /// activation of and any lock's Refund `chain` doesn't reach the expiry of
 /// at depth.
 ///
@@ -1473,10 +1424,9 @@ fn judged(
         true => invalid_items(&filing, &parts.keyset, flagged)?,
         false => 0,
     };
-    let (mask, executed) = void(base.version(), &parts.keyset, claim, evidence, Some(chain))?;
+    let (mask, executed) = void(&parts.keyset, claim, evidence)?;
     Ok(Owed {
         owed: live(
-            base.version(),
             claim,
             mask | invalid,
             &executed,

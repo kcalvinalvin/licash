@@ -12,7 +12,7 @@ use bitcoin::{
 use k256::Scalar;
 use licash::{
     authorization::{Authorization, PreparedGrant, SignedProposal},
-    base::{self, Base, ChainTerms, Fees, GraphTerms, Limits, Parts, Party, Recipe},
+    base::{self, Base, ChainTerms, Close, Fees, GraphTerms, Limits, Parts, Party, Recipe},
     chain::{self, Activation, ActivationRef, Chain, Checkpoint, Inclusion},
     claim::{self, ActivationRecord, Branch, Item, Source, UnsignedClaim},
     crypto::{self, Point},
@@ -48,17 +48,15 @@ fn party(value: u64) -> Party {
     }
 }
 fn base(keyset: Keyset) -> Base {
-    base_of(keyset, base::Version::V3)
+    base_at(keyset, 7)
 }
-fn base_of(keyset: Keyset, version: base::Version) -> Base {
-    base_at(keyset, version, 7)
-}
-fn base_at(keyset: Keyset, version: base::Version, id: u32) -> Base {
+fn base_at(keyset: Keyset, id: u32) -> Base {
     let mut deposit = [31; 36];
     deposit[32..].copy_from_slice(&7u32.to_le_bytes());
     Base::new(Parts {
-        version,
         nonce: [53; 32],
+        holder_wots: [5; 32],
+        funded: [1; 32],
         claim_key: point(19).x_only(),
         keyset,
         deposit,
@@ -69,7 +67,7 @@ fn base_at(keyset: Keyset, version: base::Version, id: u32) -> Base {
             unit_sats: 1,
             bits: 21,
             low_bits: 9,
-            deposit_units: 500_000,
+            deposit_units: 4,
             close_height: 1_000,
             reserve_alice: 20_000,
             reserve_hub: 100_000,
@@ -110,7 +108,10 @@ fn base_at(keyset: Keyset, version: base::Version, id: u32) -> Base {
             max_rate_sat_per_kvb: 10_000,
             opening_fee_quote: 3_000,
         },
-        close: None,
+        close: Close {
+            script: vec![0x51, 0x20, 3, 3, 3],
+            fee: 1_000,
+        },
     })
     .unwrap()
 }
@@ -593,11 +594,8 @@ fn pending_sources_follow_activation_refund_and_preimage_rules() {
 #[test]
 fn v4_owes_a_locks_pay_only_on_an_activation_anchored_to_its_checkpoint() {
     let issuer = IssuerKeys::random(3).unwrap();
-    let version = base::Version::V4 {
-        holder_wots: [5; 32],
-    };
     let o = Opened {
-        base: base_of(issuer.keyset().unwrap(), version),
+        base: base(issuer.keyset().unwrap()),
         issuer,
     };
     let keyset = o.base.parts().keyset.clone();
@@ -754,11 +752,8 @@ fn v4_owes_a_locks_pay_only_on_an_activation_anchored_to_its_checkpoint() {
 #[test]
 fn v4_owes_a_locks_refund_only_once_it_expired_at_depth() {
     let issuer = IssuerKeys::random(3).unwrap();
-    let version = base::Version::V4 {
-        holder_wots: [5; 32],
-    };
     let o = Opened {
-        base: base_of(issuer.keyset().unwrap(), version),
+        base: base(issuer.keyset().unwrap()),
         issuer,
     };
     let keyset = o.base.parts().keyset.clone();
@@ -1984,10 +1979,7 @@ fn funded_base(issuer: &IssuerKeys, outputs: &[Output], amount: u32) -> Base {
 fn funded_base_at(issuer: &IssuerKeys, outputs: &[Output], amount: u32, id: u32) -> Base {
     let mut parts = base(issuer.keyset().unwrap()).parts().clone();
     parts.graph.id = id;
-    parts.version = base::Version::V5 {
-        holder_wots: [5; 32],
-        funded: licash::spend::funded_root(outputs).unwrap(),
-    };
+    parts.funded = licash::spend::funded_root(outputs).unwrap();
     parts.graph.deposit_units = amount;
     Base::new(parts).unwrap()
 }
@@ -2019,12 +2011,11 @@ fn v5_owes_her_funded_notes_unless_spent_or_claimed_elsewhere() {
         issuer,
     };
     assert_eq!(
-        o.base.version().funded(),
-        Some(licash::spend::funded_root(&outputs).unwrap())
+        o.base.parts().funded,
+        licash::spend::funded_root(&outputs).unwrap()
     );
     let decoded = Base::from_bytes(&o.base.to_bytes()).unwrap();
     assert_eq!(decoded.digest(), o.base.digest());
-    assert_eq!(decoded.version(), o.base.version());
 
     // Three of the four claimed: 12 sat.
     let p = Publication::sign(
@@ -2231,22 +2222,18 @@ fn funded_items_under_a_base_of_no_funding_are_owed_nothing() {
 }
 
 #[test]
-fn a_v5_base_funds_at_most_its_cap_and_something() {
+fn a_base_funds_at_most_its_cap_and_something() {
     let issuer = IssuerKeys::random(3).unwrap();
     let outputs = vec![bob(4, 0)];
     let mut parts = funded_base(&issuer, &outputs, 4).parts().clone();
     for (units, funded) in [(0, [1; 32]), (129, [1; 32]), (4, [0; 32])] {
         parts.graph.deposit_units = units;
-        parts.version = base::Version::V5 {
-            holder_wots: [5; 32],
-            funded,
-        };
+        parts.funded = funded;
         assert!(Base::new(parts.clone()).is_err(), "{units}");
     }
-    parts.version = base::Version::V5 {
-        holder_wots: [0; 32],
-        funded: [1; 32],
-    };
+    parts.graph.deposit_units = 4;
+    parts.funded = [1; 32];
+    parts.holder_wots = [0; 32];
     assert!(Base::new(parts).is_err());
     assert!(licash::spend::funded_root(&[]).is_err());
 }
@@ -2290,7 +2277,7 @@ fn funded_outputs_worth_other_than_she_funded_are_owed_nothing() {
 
 fn open_at(id: u32) -> Opened {
     let issuer = IssuerKeys::random(3).unwrap();
-    let base = base_at(issuer.keyset().unwrap(), base::Version::V3, id);
+    let base = base_at(issuer.keyset().unwrap(), id);
     Opened { issuer, base }
 }
 
@@ -2589,7 +2576,6 @@ fn lean_open() -> Opened {
     let issuer = IssuerKeys::random(3).unwrap();
     let base = base_at(
         issuer.keyset().unwrap(),
-        base::Version::V3,
         recovery::LEAN_FROM,
     );
     Opened { issuer, base }
@@ -2606,7 +2592,6 @@ fn a_lean_claim_all_valid_is_owed_what_the_compact_filing_is() {
         issuer: lean.issuer.clone(),
         base: base_at(
             lean.issuer.keyset().unwrap(),
-            base::Version::V3,
             recovery::COMPACT_FROM,
         ),
     };
@@ -2719,7 +2704,6 @@ fn an_invalid_item_of_a_lean_claim_is_worth_nothing_and_the_rest_is_owed() {
         issuer: o.issuer.clone(),
         base: base_at(
             o.issuer.keyset().unwrap(),
-            base::Version::V3,
             recovery::COMPACT_FROM,
         ),
     };
