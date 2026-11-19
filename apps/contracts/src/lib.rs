@@ -65,6 +65,22 @@ pub const FOLD_CLAIM: &str = "/v1/contracts/openings/{id}/fold/claim";
 /// a fold asked at [`FOLD_CLAIM`], the filing of her claim: the fold,
 /// signed by both and broadcast, in consensus bytes.
 pub const FOLD_SIGN: &str = "/v1/contracts/openings/{id}/fold/sign";
+/// POST her signature (64 bytes) as the contract's claim key, over
+/// [`evidence_digest`]: what the hub's response to her claim was decided on
+/// (`licash::recovery::evidence_to_bytes`), for her to check before she
+/// leaves the response uncontested.
+pub const EVIDENCE: &str = "/v1/contracts/openings/{id}/evidence";
+
+/// What she signs, as the contract's claim key, to be shown the evidence
+/// of the hub's response `response` to contract `id`'s claim.
+pub fn evidence_digest(id: &[u8; 32], response: &bitcoin::Txid) -> [u8; 32] {
+    use bitcoin::hashes::Hash as _;
+    licash::crypto::tagged_hash(
+        "licash/contracts/evidence/v1",
+        &[id, &response.to_byte_array()],
+    )
+}
+
 /// What the hub's refusal of a fold's notes starts with ([`FOLD_CLAIM`]):
 /// a note it holds something against. She asks it for its evidence
 /// (`licash_api::INQUIRE`), drops what it proves and asks again.

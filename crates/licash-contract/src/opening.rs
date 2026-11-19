@@ -109,6 +109,9 @@ pub struct Quote {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Floors {
     pub challenge_window: u16,
+    /// Her window to contest a response: as long as she has to challenge
+    /// a false assertion, for it is the same duty to be online.
+    pub contest_window: u16,
     pub publication_window: u16,
     pub to_self_delay: u16,
     pub funding_depth: u32,
@@ -124,6 +127,7 @@ impl Floors {
             };
         Self {
             challenge_window,
+            contest_window: challenge_window,
             publication_window,
             to_self_delay,
             funding_depth,
@@ -149,6 +153,10 @@ impl Quote {
         ensure!(
             self.graph.challenge_window >= f.challenge_window,
             "challenge window below floor"
+        );
+        ensure!(
+            self.graph.contest_window >= f.contest_window,
+            "contest window below floor"
         );
         ensure!(
             self.graph.publication_window >= f.publication_window,
@@ -1447,6 +1455,7 @@ pub mod testing {
                 request_height: 100,
                 response_window: 24,
                 publication_window: 6,
+                contest_window: 12,
                 assert_window: 12,
                 challenge_window: 12,
                 answer_window: 12,

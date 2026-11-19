@@ -273,9 +273,12 @@ async fn lifecycle(amount: u32, altered: bool, answer: bool, reorged: bool) {
     let o = holder.signed().unwrap();
     let ho = hub.signed().unwrap();
     let response = ho.respond(hub.keys(), amount).unwrap();
+    let contest = o.contest(&w.keys).unwrap();
     let proof = lichen_babe::statement::mock_prove(&licash_contract::graph::journal(&o.base));
     let assertion = ho.assert(hub.keys(), &proof).unwrap();
     chain.mine(Some(response.clone()));
+    // She contested: only a contested response is proven.
+    chain.mine(Some(contest.clone()));
     let state = State {
         amount: 4096,
         reduced: Some(amount),
@@ -283,16 +286,18 @@ async fn lifecycle(amount: u32, altered: bool, answer: bool, reorged: bool) {
         r_height: Some(0),
         response: Some(response),
         response_height: Some(1),
+        contest: Some(contest),
+        contest_height: Some(2),
         p: Some(w.p()),
-        from: Some(1),
+        from: Some(2),
         ..State::default()
     };
-    w.start(Stage::Answered, &state);
+    w.start(Stage::Contested, &state);
     // A fee payout awaited, of no payout of the wallet's: nothing waits on
     // it, the stage and the rest of the state as they were.
     expect_fee(dir.path(), &id, FeeFor::Challenge, "cd").unwrap();
     let row = store.recovery(&id).unwrap().unwrap();
-    assert_eq!(row.stage, Stage::Answered.as_str());
+    assert_eq!(row.stage, Stage::Contested.as_str());
     let expected = State::decode(&row).unwrap();
     assert_eq!(expected.challenge_payout.as_deref(), Some("cd"));
     assert_eq!(expected.fee_payout, None);
@@ -477,7 +482,9 @@ async fn a_timeout_a_reorganization_swaps_for_the_hubs_answer_is_followed_as_ans
     w.chain.mine(Some(response.clone()));
     w.chain.to(tip);
     let progressed = w.advance().await;
-    assert_eq!(progressed[0].stage, Stage::Answered, "{progressed:?}");
+    // Offline she cannot check what it responded on, and her window gone
+    // she contests it.
+    assert_eq!(progressed[0].stage, Stage::Contesting, "{progressed:?}");
     let state = w.state();
     assert_eq!((state.payout, state.payout_name), (None, None));
     assert_eq!(state.response_height, Some(paid_at));
@@ -493,11 +500,13 @@ async fn an_assertion_a_reorganization_puts_below_her_scan_is_found() {
     let o = w.holder.signed().unwrap();
     let ho = w.hub.signed().unwrap();
     let response = ho.respond(w.hub.keys(), 4096).unwrap();
+    let contest = o.contest(&w.keys).unwrap();
     let proof = lichen_babe::statement::mock_prove(&licash_contract::graph::journal(&o.base));
     let assertion = ho.assert(w.hub.keys(), &proof).unwrap();
     w.chain.mine(Some(response.clone()));
+    w.chain.mine(Some(contest.clone()));
     w.start(
-        Stage::Answered,
+        Stage::Contested,
         &State {
             amount: 4096,
             reduced: Some(4096),
@@ -505,23 +514,25 @@ async fn an_assertion_a_reorganization_puts_below_her_scan_is_found() {
             r_height: Some(0),
             response: Some(response),
             response_height: Some(1),
+            contest: Some(contest),
+            contest_height: Some(2),
             p: Some(w.p()),
-            from: Some(1),
+            from: Some(2),
             ..State::default()
         },
     );
-    assert_eq!(w.advance().await[0].stage, Stage::Answered);
-    // As far as she waits for it, her answer's timeout not yet due.
-    let due = 1 + blocks(presign(&o.set, "respond_timeout").unwrap().tx.input[0].sequence).unwrap();
+    assert_eq!(w.advance().await[0].stage, Stage::Contested);
+    // As far as she waits for it, her contest's timeout not yet due.
+    let due = 2 + blocks(presign(&o.set, "contest_timeout").unwrap().tx.input[0].sequence).unwrap();
     let tip = due - 2;
-    assert!(tip > 2 + OVERLAP + 1, "a timeout of {due} leaves no room");
+    assert!(tip > 3 + OVERLAP + 1, "a timeout of {due} leaves no room");
     w.chain.to(tip);
-    assert_eq!(w.advance().await[0].stage, Stage::Answered);
+    assert_eq!(w.advance().await[0].stage, Stage::Contested);
     assert!(
-        w.state().from > Some(2 + OVERLAP),
+        w.state().from > Some(3 + OVERLAP),
         "scanned past where it lands"
     );
-    w.chain.reorg(1);
+    w.chain.reorg(2);
     let asserted_at = w.chain.mine(Some(assertion));
     w.chain.to(tip);
     let progressed = w.advance().await;
@@ -598,13 +609,14 @@ fn a_request_pays_her_purse_of_her_reserve_and_each_ends_with_what_it_would() {
     };
     // Her claim stands: both reserves less what the links took, her purse
     // among it, which she has.
-    for name in ["request_timeout", "respond_timeout", "failure"] {
+    for name in ["request_timeout", "contest_timeout", "failure"] {
         let (outs, taken) = paid(name);
         assert_eq!(outs[bits].value.to_sat(), r_a + r_h - taken, "{name}");
     }
-    // The hub's proof stands: her reserve less her purse, to her payout
-    // script; the hub's less the links' floors alone.
-    for name in ["success", "wrongly_challenged_0"] {
+    // The hub's response stands, uncontested or proven: her reserve less
+    // her purse, to her payout script; the hub's less the links' floors
+    // alone.
+    for name in ["respond_timeout", "success", "wrongly_challenged_0"] {
         let (outs, taken) = paid(name);
         assert_eq!(outs[bits].value.to_sat(), r_a - purse, "{name}");
         assert_eq!(outs[bits].script_pubkey, o.babe.core().pubs[0].payout_spk);
@@ -635,7 +647,7 @@ fn a_silent_hub_of_a_returning_graph_pays_her_claim_and_gets_its_reserve_back() 
         (p.tx.clone(), value - p.prevout.value.to_sat())
     };
     let (timeout, taken) = paid("request_timeout");
-    let (responded, _) = paid("respond_timeout");
+    let (responded, _) = paid("contest_timeout");
     assert_eq!(timeout.output[..bits], responded.output[..bits]);
     assert_eq!(timeout.output[bits].value.to_sat(), r_a);
     assert_eq!(
@@ -661,7 +673,7 @@ fn a_silent_hub_of_a_returning_graph_pays_her_claim_and_gets_its_reserve_back() 
     assert_eq!(reserve.out.value.to_sat(), r_a);
     assert!(taken > purse);
     // Her claim stands on the others: both reserves, as before.
-    for name in ["respond_timeout", "failure"] {
+    for name in ["contest_timeout", "failure"] {
         let (tx, taken) = paid(name);
         assert_eq!(tx.output[bits].value.to_sat(), r_a + r_h - taken, "{name}");
     }

@@ -80,6 +80,7 @@ fn base_of(keyset: Keyset, version: base::Version) -> Base {
             request_height: 800,
             response_window: 12,
             publication_window: 3,
+            contest_window: 12,
             assert_window: 12,
             challenge_window: 24,
             answer_window: 12,

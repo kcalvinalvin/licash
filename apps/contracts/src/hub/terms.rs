@@ -131,8 +131,9 @@ impl Timing {
     pub fn of(profile: ChainProfile, range: Option<Range>) -> Result<Self> {
         let (challenge_window, to_self_delay, depth, response_window, min_blocks) = match profile {
             ChainProfile::Core30DefaultRegtest => (6, 6, 1, 2, 200),
-            // Three days: her deadlines 180 blocks before the close.
-            ChainProfile::Core30Signet => (144, 144, 3, 12, 432),
+            // Four days: her deadlines 180 blocks before the close, her
+            // day to contest a response before them.
+            ChainProfile::Core30Signet => (144, 144, 3, 12, 576),
             // Mainnet waits for windows set from a measured proof time and
             // a real proof played on Bitcoin; its hub reserve must then
             // cover the hub's answer to a challenge at some 25 sat/vB,
@@ -375,6 +376,7 @@ impl Timing {
                 response_window: 0,
                 request_height: 0,
                 publication_window: floors.publication_window,
+                contest_window: floors.contest_window,
                 assert_window: self.assert_window(),
                 challenge_window: self.challenge_window,
                 answer_window: 12,
@@ -459,16 +461,16 @@ mod tests {
             (
                 None,
                 [
-                    "2c5c06322bc2f1f2a7204e29bf9e8522a5655793d75a420c68759c952e07a71b",
-                    "7a3bb29210972cecce0ce249c1fd973597fee3302a11e866190b41801acff9ca",
+                    "494eda9365c2f6d04b169e06bf699d78e981558614287109b22f6a5214267812",
+                    "7c34257f9e2d1e280fb964b9010c576c6e95126fc09c4f40c45137ef60fb3d60",
                 ],
                 3_000,
             ),
             (
                 Some(RANGE),
                 [
-                    "7796f933a82d4437733e80fa2bf4e0b50b38bc9a456be2b00b7b078825a855a6",
-                    "1095fc4791f9367941e7c3a76db8f6ca94d7ff6ea1eaee67d576bc1fc67c7922",
+                    "49e1652d15b0603546f1484597b77d1c9a7ec0a72304a3f809906172caf66b7d",
+                    "74f1c960a38e1bdef3e9089b5261609c3e0279fb711a255d9b7087b31fa9dc69",
                 ],
                 3_024,
             ),
@@ -657,21 +659,21 @@ mod tests {
         let range = timing.range().unwrap();
         // Its largest cap the operator's, down to a size.
         assert_eq!((range.min_cap, range.max_cap), (CAP, 67_108_863));
-        assert_eq!((range.min_blocks, range.max_blocks), (432, 26_280));
+        assert_eq!((range.min_blocks, range.max_blocks), (576, 26_280));
         assert_eq!(
             (range.per_coin, range.reserve, range.fee, range.ppm_year),
             (2, 20_000, 3_000, 10_000)
         );
         assert!(timing.allows(CAP, LOCK).is_ok());
         assert!(timing.allows(67_108_863, 26_280).is_ok());
-        assert!(timing.allows(1_048_575, 432).is_ok());
+        assert!(timing.allows(1_048_575, 576).is_ok());
         for (cap, blocks) in [
             (CAP - 1, LOCK),
             (CAP + 1, LOCK),
             (1_048_576, LOCK),
             (15_000_000, LOCK),
             (134_217_727, LOCK),
-            (CAP, 431),
+            (CAP, 575),
             (CAP, 26_281),
         ] {
             assert!(timing.allows(cap, blocks).is_err(), "{cap} {blocks}");

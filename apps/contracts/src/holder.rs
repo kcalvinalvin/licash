@@ -778,7 +778,8 @@ pub async fn offer<T: Transport>(
 }
 
 /// Her deadlines on `offer` at `tip`: the close `blocks` ahead, no later
-/// than the hub's bounds allow, the assertion deadline before it.
+/// than the hub's bounds allow, the assertion deadline before it, her
+/// window to contest the hub's response before that.
 fn wanted(offer: &Offer, tip: u32, blocks: u32) -> Result<Wanted> {
     let bounds = &offer.bounds;
     ensure!(
@@ -795,6 +796,7 @@ fn wanted(offer: &Offer, tip: u32, blocks: u32) -> Result<Wanted> {
     let request_height = close_height
         .checked_sub(after_assert(&offer.quote))
         .and_then(|h| h.checked_sub(u32::from(response_window)))
+        .and_then(|h| h.checked_sub(u32::from(offer.quote.graph.contest_window)))
         .and_then(|h| h.checked_sub(u32::from(offer.quote.graph.assert_window)))
         .filter(|a| *a > tip)
         .with_context(|| format!("{blocks} blocks leave no time to recover in"))?;

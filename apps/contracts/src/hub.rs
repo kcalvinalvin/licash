@@ -45,7 +45,8 @@ pub use licash_contract::opening::HubPhase;
 use licash_contract::opening::{Context, Hub, Trust};
 
 use crate::{
-    Frame, Offer, FOLD, FOLD_CLAIM, FOLD_SIGN, FUNDED, INSTANCE, MAX_BODY, OPEN, QUOTE, STEP,
+    Frame, Offer, EVIDENCE, FOLD, FOLD_CLAIM, FOLD_SIGN, FUNDED, INSTANCE, MAX_BODY, OPEN, QUOTE,
+    STEP,
 };
 use store::Store;
 use terms::{Range, Timing};
@@ -851,6 +852,7 @@ pub fn router(openings: Arc<Openings>) -> Router {
             post(offer_fold_claim).layer(budget(2, REQUEST_TIME)),
         )
         .route(FOLD_SIGN, post(sign_fold).layer(budget(2, REQUEST_TIME)))
+        .route(EVIDENCE, post(show_evidence).layer(budget(2, REQUEST_TIME)))
         .route(FUNDED, post(funded).layer(budget(2, REQUEST_TIME)))
         .layer(DefaultBodyLimit::max(MAX_BODY))
         .with_state(openings)
@@ -970,6 +972,17 @@ async fn offer_fold_claim(
 ) -> Result<Vec<u8>, Refused> {
     let id = crate::parse_id(&id).map_err(Refused::bad)?;
     Ok(openings.offer_fold_claim(&id, &body).await?.encode())
+}
+
+/// Her signature as the contract's claim key, for contract `id`'s evidence:
+/// what the hub responded to her claim on.
+async fn show_evidence(
+    State(openings): State<Arc<Openings>>,
+    UrlPath(id): UrlPath<String>,
+    body: Bytes,
+) -> Result<Vec<u8>, Refused> {
+    let id = crate::parse_id(&id).map_err(Refused::bad)?;
+    openings.show_evidence(&id, &body).await
 }
 
 /// Her partial signature on contract `id`'s fold, with her claim's filing

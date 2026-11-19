@@ -70,6 +70,16 @@ impl HolderKeys {
     pub fn claim_key(&self) -> XOnlyPublicKey {
         xonly(&self.claim)
     }
+
+    /// Her BIP340 signature of `digest` with the claim key: what asks the
+    /// hub for the evidence of its response, which only she is shown.
+    pub fn sign_as_claim(&self, digest: &[u8; 32]) -> [u8; 64] {
+        use lichen_btc::bitcoin::secp256k1::{Message, Secp256k1};
+        let message = Message::from_digest(*digest);
+        Secp256k1::signing_only()
+            .sign_schnorr_no_aux_rand(&message, &self.claim)
+            .serialize()
+    }
 }
 
 /// The hub's secrets for one contract.

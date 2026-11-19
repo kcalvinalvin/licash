@@ -8,13 +8,19 @@
 //!  │         her purse, of her reserve, for her fees)
 //!  ├─ request_timeout (after w_H)          → the holder: b
 //!  └─ respond (the hub: b′; its disclose slot)
-//!      ├─ respond_timeout (after w_A)      → the holder: b
-//!      └─ assert (the hub: π1, Lamport)
-//!          ├─ success (after Δ2)           → the holder: b′, the rest the hub's
-//!          └─ challenge_assert (the holder)
-//!              ├─ wrongly_challenged_k     → as success (the proof was valid)
-//!              └─ failure (after Δ1)       → the holder: b
+//!      ├─ respond_timeout (after w_X)      → the holder: b′, the rest the hub's
+//!      └─ contest (the holder: she does not accept b′)
+//!          ├─ contest_timeout (after w_A)  → the holder: b
+//!          └─ assert (the hub: π1, Lamport)
+//!              ├─ success (after Δ2)       → the holder: b′, the rest the hub's
+//!              └─ challenge_assert (the holder)
+//!                  ├─ wrongly_challenged_k → as success (the proof was valid)
+//!                  └─ failure (after Δ1)   → the holder: b
 //! ```
+//!
+//! A response she leaves alone pays what it says, and nobody proves
+//! anything: she contests only a response her own check of the hub's
+//! evidence does not bear out, and the hub then proves it or pays her `b`.
 //!
 //! Paying `b`, the hub forfeits its reserve, but on `request_timeout` of
 //! graphs from id [`RETURNING`] on, where the hub only kept silent, it
@@ -186,12 +192,14 @@ pub fn terms(g: &GraphTerms) -> Terms {
 
 /// The dispute's windows, relative, in blocks: `w_H` for the hub's
 /// response, `k` for her claim's publication (after it the hub may reclaim
-/// an unspent slot), `w_A` for the hub's assertion after its response; and
-/// BABE's tail's, `Δ2` her challenge, `Δ1` its answer.
+/// an unspent slot), `w_X` for her contest of the response, `w_A` for the
+/// hub's assertion after her contest; and BABE's tail's, `Δ2` her
+/// challenge, `Δ1` its answer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Windows {
     pub w_h: u16,
     pub k: u16,
+    pub w_x: u16,
     pub w_a: u16,
     pub tail: lichen_babe::graph::Windows,
 }
@@ -201,6 +209,7 @@ pub fn windows(g: &GraphTerms) -> Windows {
     Windows {
         w_h: g.response_window,
         k: g.publication_window,
+        w_x: g.contest_window,
         w_a: g.assert_window,
         tail: lichen_babe::graph::Windows {
             delta2: g.challenge_window,
@@ -386,6 +395,16 @@ impl Front for Spec {
                 shape: wots_shape([&self.hub_b]),
                 extra: vec![slot(self.disclose()?)],
                 terminal: "respond_timeout",
+                window: self.windows.w_x,
+                pays: REDUCED,
+            },
+            FrontLink {
+                name: "contest",
+                poster: Role::User,
+                leaf: link_leaf(&ctx, "contest", false, |b| b),
+                shape: vec![],
+                extra: vec![],
+                terminal: "contest_timeout",
                 window: self.windows.w_a,
                 pays: Payout::User,
             },
@@ -465,6 +484,10 @@ impl HubProves {
             w.k > POST_CSV && u32::from(w.w_h) > u32::from(w.k) + u32::from(POST_CSV),
             "publication must precede reclaim and the response deadline"
         );
+        ensure!(
+            w.w_x > POST_CSV,
+            "her contest window must outlast a link's lock"
+        );
         let graph = Graph::new(Box::new(spec.clone()), tail)?;
         Ok(HubProves { spec, graph })
     }
@@ -535,7 +558,7 @@ impl HubProves {
     /// Who posts link `name`.
     pub fn poster(name: &str) -> Role {
         match name {
-            "request" | "challenge_assert" => Role::User,
+            "request" | "contest" | "challenge_assert" => Role::User,
             _ => Role::Hub,
         }
     }

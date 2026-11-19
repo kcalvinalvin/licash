@@ -1342,8 +1342,7 @@ async fn a_holder_closes_her_contract_early_with_the_hub_and_gets_her_reserve_ba
 /// value go, as a forced close's does.
 struct Notes<T: licash_wallet::Transport> {
     rt: Regtest,
-    dir: tempfile::TempDir,
-    url: String,
+    _dir: tempfile::TempDir,
     hub: Arc<Hub>,
     openings: Arc<Openings>,
     chain: Node,
@@ -1390,8 +1389,7 @@ async fn with_notes<T: licash_wallet::Transport>(seed: [u8; 32], transport: T) -
     ensure!(available(&wallet)? == 196_608);
     Ok(Notes {
         rt,
-        dir,
-        url,
+        _dir: dir,
         hub,
         openings,
         chain,
@@ -1489,41 +1487,29 @@ async fn a_holder_closes_her_contract_on_her_notes_and_its_fold_pays_them_to_her
 async fn a_fold_the_hub_refuses_for_a_spent_note_is_made_again_on_what_it_proves() -> Result<()> {
     use licash_contracts::holder::recovery::{self, Stage};
 
-    let Notes {
-        rt,
-        dir,
-        url,
-        chain,
-        wallet,
-        mine,
-        contract,
-        ..
-    } = with_notes([32; 32], Http::new(None)?).await?;
-    let id = contract.id;
-
-    // Her wallet as it was, copied; then a note of it paid away.
-    drop(wallet);
-    let stale = dir.path().join("stale");
-    copy_dir(&mine, &stale)?;
-    let wallet = Wallet::open(&mine.join("wallet.sqlite"), Http::new(None)?)?;
-    let bob = licash::address::OwnerKeys::from_seed(&[0xbb; 32])?.address();
-    wallet.send(&url, &bob, 2_048).await?;
-    drop(wallet);
-
-    // The copy claims the note paid away too: the hub refuses it, and the
-    // copy proves it spent, takes the change and folds on what is left.
-    let wallet = Wallet::open(&stale.join("wallet.sqlite"), Http::new(None)?)?;
-    ensure!(available(&wallet)? == 196_608);
-    let txid = holder::close(&wallet, &chain, &stale, &id).await?;
-    let rows = recovery::recoveries(&stale)?;
+    // The copy claims four notes, the one paid away among them: the hub
+    // refuses it, and the copy proves it spent, takes the change and folds
+    // on what is left.
+    let s = stale_copy([32; 32], Http::new(None)?).await?;
+    let (rt, wallet, chain, mine, id) = (&s.rt, &s.wallet, &s.chain, &s.mine, s.id);
+    ensure!(available(wallet)? == 131_072);
+    let txid = holder::close(wallet, chain, mine, &id).await?;
+    let rows = recovery::recoveries(mine)?;
     ensure!(rows.len() == 1, "{rows:?}");
     ensure!(
-        rows[0].stage == Stage::Folding && rows[0].irrevocable && rows[0].claimed == 131_071,
+        rows[0].stage == Stage::Folding && rows[0].irrevocable,
         "{:?}",
         rows[0]
     );
-    ensure!(holder::list(&stale)?[0].folded == Some(txid));
-    // What she holds still, past her cap, the hub holds nothing against.
+    // Three of the four notes held and the change of the spend that
+    // retired the fourth, less than the cap of them all.
+    ensure!(
+        rows[0].claimed < 131_071 && rows[0].claimed >= 98_304,
+        "{:?}",
+        rows[0]
+    );
+    ensure!(holder::list(mine)?[0].folded == Some(txid));
+    // Nothing the hub holds anything against is left held.
     let spent = wallet.check().await?;
     ensure!(spent == Default::default(), "{spent:?}");
     rt.mine(1)?;
@@ -1562,28 +1548,10 @@ impl licash_wallet::Transport for Hushed {
 async fn a_fold_refused_for_a_note_the_hub_does_not_prove_spent_stops() -> Result<()> {
     use licash_contracts::holder::recovery;
 
-    let Notes {
-        rt,
-        dir,
-        url,
-        chain,
-        wallet,
-        mine,
-        contract,
-        ..
-    } = with_notes([34; 32], Http::new(None)?).await?;
-    let id = contract.id;
-    drop(wallet);
-    let stale = dir.path().join("stale");
-    copy_dir(&mine, &stale)?;
-    let wallet = Wallet::open(&mine.join("wallet.sqlite"), Http::new(None)?)?;
-    let bob = licash::address::OwnerKeys::from_seed(&[0xbb; 32])?.address();
-    wallet.send(&url, &bob, 2_048).await?;
-    drop(wallet);
-
-    let wallet = Wallet::open(&stale.join("wallet.sqlite"), Hushed(Http::new(None)?))?;
-    ensure!(available(&wallet)? == 196_608);
-    let closed = holder::close(&wallet, &chain, &stale, &id).await;
+    let s = stale_copy([34; 32], Hushed(Http::new(None)?)).await?;
+    let (rt, wallet, chain, mine, id) = (&s.rt, &s.wallet, &s.chain, &s.mine, s.id);
+    ensure!(available(wallet)? == 131_072);
+    let closed = holder::close(wallet, chain, mine, &id).await;
     ensure!(
         closed
             .as_ref()
@@ -1591,12 +1559,12 @@ async fn a_fold_refused_for_a_note_the_hub_does_not_prove_spent_stops() -> Resul
         "{closed:?}"
     );
     ensure!(
-        available(&wallet)? == 196_608,
+        available(wallet)? == 131_072,
         "notes dropped or not given back"
     );
-    ensure!(recovery::recoveries(&stale)?.is_empty());
-    ensure!(holder::list(&stale)?[0].folded.is_none());
-    ensure!(holder::list(&stale)?[0].live(rt.height()?));
+    ensure!(recovery::recoveries(mine)?.is_empty());
+    ensure!(holder::list(mine)?[0].folded.is_none());
+    ensure!(holder::list(mine)?[0].live(rt.height()?));
     Ok(())
 }
 
@@ -2254,6 +2222,59 @@ async fn stale_claim(seed: [u8; 32]) -> Result<Stale> {
 async fn stale_claim_scanned(seed: [u8; 32], scanned: bool) -> Result<Stale> {
     use licash_contracts::holder::recovery;
 
+    let StaleCopy {
+        rt,
+        dir,
+        hub,
+        openings,
+        source,
+        chain,
+        wallet,
+        mine,
+        id,
+        rate,
+    } = stale_copy(seed, Http::new(None)?).await?;
+    if scanned {
+        while !watch::step(&hub, &source).await? {}
+    }
+    let forced = recovery::force_close(&wallet, &chain, &mine, &id, rate).await?;
+    ensure!((forced.claimed, forced.notes) == (131_071, 4), "{forced:?}");
+    rt.mine_to_height(forced.next_at.context("no lock")? - 1)?;
+    recovery::advance(&wallet, &chain, &mine, rate).await?;
+    rt.mine(1)?;
+    Ok(Stale {
+        rt,
+        _dir: dir,
+        hub,
+        openings,
+        chain,
+        wallet,
+        mine,
+        rate,
+    })
+}
+
+/// A contract of cap 131 071 sat at a hub that answers, four notes of 32 768
+/// in a wallet, and a copy of that wallet made before one was paid away,
+/// restored over `transport`: it claims, as it holds, the note paid away
+/// too, which the hub knows spent. Nothing is closed.
+struct StaleCopy<T: licash_wallet::Transport> {
+    rt: Regtest,
+    dir: tempfile::TempDir,
+    hub: Arc<Hub>,
+    openings: Arc<Openings>,
+    source: Source,
+    chain: Node,
+    wallet: Wallet<T>,
+    mine: std::path::PathBuf,
+    id: [u8; 32],
+    rate: bitcoin::FeeRate,
+}
+
+async fn stale_copy<T: licash_wallet::Transport>(
+    seed: [u8; 32],
+    transport: T,
+) -> Result<StaleCopy<T>> {
     let rt = Regtest::start_standard()?;
     let dir = tempfile::tempdir()?;
     let at = dir.path().join("hub");
@@ -2294,24 +2315,17 @@ async fn stale_claim_scanned(seed: [u8; 32], scanned: bool) -> Result<Stale> {
     drop(wallet);
 
     // Restored, the copy claims the note paid away too.
-    let wallet = Wallet::open(&stale.join("wallet.sqlite"), Http::new(None)?)?;
-    let mine = stale;
-    if scanned {
-        while !watch::step(&hub, &source).await? {}
-    }
-    let forced = recovery::force_close(&wallet, &chain, &mine, &opened.id, rate).await?;
-    ensure!((forced.claimed, forced.notes) == (131_071, 4), "{forced:?}");
-    rt.mine_to_height(forced.next_at.context("no lock")? - 1)?;
-    recovery::advance(&wallet, &chain, &mine, rate).await?;
-    rt.mine(1)?;
-    Ok(Stale {
+    let wallet = Wallet::open(&stale.join("wallet.sqlite"), transport)?;
+    Ok(StaleCopy {
         rt,
-        _dir: dir,
+        dir,
         hub,
         openings,
+        source,
         chain,
         wallet,
-        mine,
+        mine: stale,
+        id: opened.id,
         rate,
     })
 }
@@ -2342,23 +2356,15 @@ async fn played(
 }
 
 /// The hub meets the stale claim with the spend it released, discloses
-/// that spend's unlock, responds what is left, proves it and asserts; her
-/// payout is that.
+/// that spend's unlock and responds what is left. Her wallet, shown what it
+/// responded on, checks it, finds it borne out and lets it stand: nothing
+/// is contested or proven, and her payout is what the response says.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs bitcoind and a release build"]
 async fn a_hub_meets_a_stale_claim_with_the_spend_it_released_and_pays_what_is_left() -> Result<()>
 {
-    use licash_contracts::holder::recovery::Stage;
-
     let s = stale_claim([11; 32]).await?;
-    let done = played(&s, |r| {
-        assert!(
-            !matches!(r.stage, Stage::TimingOut | Stage::TimedOut),
-            "{r:?}"
-        );
-        true
-    })
-    .await?;
+    let done = played(&s, |_| true).await?;
     let x = done.response.context("no response")?;
     ensure!(s.rt.confirmations(&x)?.is_some(), "{done:?}");
     // Its disclose slot spent: the unlock published.
@@ -2366,6 +2372,11 @@ async fn a_hub_meets_a_stale_claim_with_the_spend_it_released_and_pays_what_is_l
     // Her notes less the one paid away: three of 32 768.
     let corrected = done.corrected.context("no response")?;
     ensure!(corrected == 98_304, "{done:?}");
+    // Paid by the response's own terminal: no contest, no proof.
+    ensure!(
+        done.assertion.is_none() && done.challenge.is_none(),
+        "{done:?}"
+    );
     ensure!(done.payout.is_some() && done.timeout.is_none(), "{done:?}");
     let received = done.received.context("nothing received")?;
     eprintln!("a stale claim of 131071 paid {corrected}, {received} swept to her wallet");
@@ -2775,12 +2786,14 @@ async fn a_hub_meets_a_claim_of_no_lock_while_its_ledgers_scan_lags() -> Result<
     Ok(())
 }
 
-/// The hub responds to the stale claim and stops: its assertion window
-/// passes, and her response timeout pays her all she claimed.
+/// The hub responds to the stale claim and shows her no evidence of it, so
+/// that she contests, and stops: its assertion window passes, and her
+/// contest's timeout pays her all she claimed.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs bitcoind and a release build"]
 async fn a_hub_that_responds_and_never_asserts_pays_her_whole_claim() -> Result<()> {
     let s = stale_claim([12; 32]).await?;
+    s.openings.refuse_evidence();
     // The hub plays until she sees its response, then no more.
     let done = played(&s, |r| r.response.is_none()).await?;
     ensure!(done.assertion.is_none(), "{done:?}");
@@ -2967,14 +2980,19 @@ async fn a_hub_that_lost_what_it_responded_on_is_told_it_asserts_nothing() -> Re
         s.rt.mine(1)?;
     }
     ensure!(responded && lost() == 0, "{:?}", told.lock().unwrap());
-    // Its response in a block, then the file lost.
+    // Its response in a block, then the file lost: her wallet is shown no
+    // evidence, and contests, which the hub cannot answer.
     s.rt.mine(1)?;
     for end in ["", "-wal", "-shm"] {
         let _ = std::fs::remove_file(data.join(format!("responses.sqlite{end}")));
     }
-    for _ in 0..3 {
+    for _ in 0..40 {
         let round = s.openings.answer_requests().await?;
         ensure!(round.answered == 0, "{round:?}");
+        licash_contracts::holder::recovery::advance(&s.wallet, &s.chain, &s.mine, s.rate).await?;
+        if lost() > 0 {
+            break;
+        }
         s.rt.mine(1)?;
     }
     let told = told.lock().unwrap();
@@ -3071,14 +3089,17 @@ async fn past_the_response_window(s: &Stale) -> Result<u32> {
 
 /// The response window makes her timeout valid, but does not expire the
 /// hub's answer: one confirming after it, before her timeout, still gets
-/// a fresh assertion window, and her a fresh challenge window after the
-/// assertion. Here the hub proves and asserts, and pays what is left.
+/// a fresh contest window, a fresh assertion window after her contest and
+/// her a fresh challenge window after the assertion. Here the hub shows her
+/// no evidence, she contests, and the hub proves and asserts, and pays what
+/// is left.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs bitcoind and a release build"]
 async fn a_hubs_answer_can_confirm_after_its_response_window() -> Result<()> {
     use licash_contracts::holder::recovery;
 
     let s = stale_claim([15; 32]).await?;
+    s.openings.refuse_evidence();
     let window_end = past_the_response_window(&s).await?;
     // The hub plays first: its response confirms strictly after the
     // earliest timeout block.
@@ -3086,7 +3107,14 @@ async fn a_hubs_answer_can_confirm_after_its_response_window() -> Result<()> {
     ensure!(round.failed == 0 && round.answered == 1, "{round:?}");
     s.rt.mine(1)?;
     let observed = recovery::advance(&s.wallet, &s.chain, &s.mine, s.rate).await?[0].clone();
-    ensure!(observed.error.is_none(), "{observed:?}");
+    // Told only that she cannot check the response: the hub shows her none.
+    ensure!(
+        observed
+            .error
+            .as_deref()
+            .is_none_or(|e| e.contains("her check of the hub's response")),
+        "{observed:?}"
+    );
     ensure!(observed.stage.disputed(), "{observed:?}");
     let x = observed.response.context("no response")?;
     let confirmed_at = s.rt.confirmations(&x)?.context("unconfirmed")?;
@@ -3138,6 +3166,7 @@ async fn her_timeout_wins_over_a_late_answer_that_confirms_after_it() -> Result<
 async fn a_holder_challenges_a_false_assertion_and_its_failure_pays_her_whole_claim() -> Result<()>
 {
     let s = stale_claim([13; 32]).await?;
+    s.openings.refuse_evidence();
     s.openings.assert_false_proofs();
     // A coin for a challenge's fee, as one she held at her forced close:
     // set aside from her next round.

@@ -173,6 +173,13 @@ impl Opening {
         );
         Ok(())
     }
+    /// Her contest of the hub's response: the link that makes it prove
+    /// what it says she is owed. It carries nothing of hers but the
+    /// signatures made when the contract opened; its fee is its child's.
+    pub fn contest(&self, keys: &HolderKeys) -> Result<Transaction> {
+        ensure!(keys.public() == self.holder, "another holder's keys");
+        self.finish("contest", vec![])
+    }
     pub fn assertion(&self, tx: &Transaction) -> Result<Assertion> {
         check_link(&self.set, "assert", tx)?;
         self.babe.assertion(tx)
@@ -589,14 +596,25 @@ pub fn exit(
 
 /// The claim bytes `publication` carries in the request's slot.
 pub fn published(request: &Transaction, publication: &Block, txid: &Txid) -> Result<Vec<u8>> {
-    let spend = lichen_babe::exit::slot_spend(publication, txid)?;
+    carried(request, publication, txid)
+        .context("the publication carries no claim in the request's slot")
+}
+
+/// The bytes `disclosure` carries in the response's disclose slot: what
+/// the hub made public of its evidence.
+pub fn disclosed(response: &Transaction, disclosure: &Block, txid: &Txid) -> Result<Vec<u8>> {
+    carried(response, disclosure, txid)
+        .context("the disclosure carries nothing in the response's slot")
+}
+
+/// What the spend `txid` in `block` of `link`'s slot carries.
+fn carried(link: &Transaction, block: &Block, txid: &Txid) -> Option<Vec<u8>> {
+    let spend = lichen_babe::exit::slot_spend(block, txid).ok()?;
     let slot = lichen_statement::btc::OutPoint {
-        txid: lichen_btc::bitcoin::hashes::Hash::to_byte_array(request.compute_txid()),
+        txid: lichen_btc::bitcoin::hashes::Hash::to_byte_array(link.compute_txid()),
         vout: lichen_statement::SLOT_VOUT,
     };
-    spend
-        .carrying(&slot)
-        .context("the publication carries no claim in the request's slot")
+    spend.carrying(&slot)
 }
 
 #[cfg(test)]

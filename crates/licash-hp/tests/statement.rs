@@ -76,6 +76,7 @@ fn base_of(keyset: Keyset, nonce: u8, version: Version) -> Base {
             request_height: 800,
             response_window: 12,
             publication_window: 3,
+            contest_window: 12,
             assert_window: 12,
             challenge_window: 24,
             answer_window: 12,
@@ -729,5 +730,42 @@ fn evidence_that_needs_a_disclosure_proves_only_with_it() {
     assert_eq!(
         check(&input(&f.base, x, vec![cite])).unwrap(),
         contract(&f.base).journal()
+    );
+}
+
+/// What a holder makes of a response is the statement's own test: owed at
+/// most `b′`, and what the evidence uses disclosed, whole.
+#[test]
+fn a_response_is_borne_out_when_owed_at_most_what_it_says_and_what_it_uses_is_disclosed() {
+    use licash::disclosure::Disclosures;
+    use licash::recovery::Owed;
+    use licash_hp::verdict;
+
+    let owed = |owed, disclosures| Owed {
+        owed,
+        mask: 0,
+        disclosures,
+        ineligible: None,
+    };
+    let none = Disclosures::empty();
+    assert_eq!(verdict(&owed(10, none.clone()), 10, None), Ok(()));
+    assert_eq!(
+        verdict(&owed(11, none.clone()), 10, None),
+        Err(Refusal::Owed)
+    );
+    // Disclosures it uses are published whole, or the response is not borne out.
+    let mut used = Disclosures::empty();
+    used.values[0] = [9; 32];
+    let bytes = used.to_bytes();
+    assert_eq!(verdict(&owed(5, used.clone()), 10, Some(&bytes)), Ok(()));
+    assert_eq!(
+        verdict(&owed(5, used.clone()), 10, None),
+        Err(Refusal::Undisclosed)
+    );
+    let mut other = bytes;
+    other[0] ^= 1;
+    assert_eq!(
+        verdict(&owed(5, used), 10, Some(&other)),
+        Err(Refusal::Undisclosed)
     );
 }

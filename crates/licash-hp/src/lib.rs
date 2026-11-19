@@ -301,10 +301,45 @@ pub fn check(input: &HubInput) -> Result<[u8; JOURNAL_LEN], Refusal> {
         &input.exit,
         &input.evidence,
     )?;
+    verdict(&owed, read.b2, read.disclosed.as_deref())?;
+    lichen_statement::holds(&contract(&input.base), &read, owed.owed).map_err(|_| Refusal::Owed)
+}
+
+/// Whether a response of `b2` that disclosed `disclosed` bears out what the
+/// claim is owed: the response disclosed what its evidence uses, and the
+/// claim is owed at most `b2`. The statement's own test of a response, which
+/// a holder makes too before she lets one stand ([`bears_out`]).
+pub fn verdict(owed: &Owed, b2: u32, disclosed: Option<&[u8]>) -> Result<(), Refusal> {
     if owed.disclosures != Disclosures::empty()
-        && read.disclosed.as_deref() != Some(&owed.disclosures.to_bytes()[..])
+        && disclosed != Some(&owed.disclosures.to_bytes()[..])
     {
         return Err(Refusal::Undisclosed);
     }
-    lichen_statement::holds(&contract(&input.base), &read, owed.owed).map_err(|_| Refusal::Owed)
+    match owed.owed > b2 {
+        true => Err(Refusal::Owed),
+        false => Ok(()),
+    }
+}
+
+/// What a holder makes of the Hub's response to her claim, as its statement
+/// would: whether the claim `filed` (her filing's bytes) under `request` is
+/// owed at most `b2` against `evidence`, on the headers from Base's
+/// checkpoint through her publication's block, and the response disclosed
+/// what the evidence uses (`disclosed`, the bytes of its disclosure, if it
+/// made one). The statement is a deterministic function of these, so a
+/// holder for whom this holds may leave the response uncontested: nothing
+/// the Hub could prove would say otherwise.
+pub fn bears_out(
+    base: &Base,
+    request: &Request,
+    filed: &[u8],
+    evidence: &[Evidence],
+    headers: &[[u8; 80]],
+    b2: u32,
+    disclosed: Option<&[u8]>,
+) -> Result<(), Refusal> {
+    let chain = chain(base, headers)?;
+    let owed = recovery::owed(base, request, filed, evidence, &chain)
+        .map_err(|e| Refusal::Evidence(e.to_string()))?;
+    verdict(&owed, b2, disclosed)
 }

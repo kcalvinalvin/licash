@@ -134,6 +134,7 @@ fn parts() -> Parts {
             request_height: 800,
             response_window: 12,
             publication_window: 3,
+            contest_window: 12,
             assert_window: 12,
             challenge_window: 24,
             answer_window: 12,
@@ -235,7 +236,7 @@ fn a_v4_base_binds_her_request_keys_and_keeps_v3_as_it_was() {
 fn every_agreed_base_field_changes_the_independent_key_context() {
     let original = parts();
     let digest = Base::new(original.clone()).unwrap().digest();
-    for field in 0..54 {
+    for field in 0..55 {
         let mut p = original.clone();
         match field {
             0 => p.nonce[0] ^= 1,
@@ -285,6 +286,7 @@ fn every_agreed_base_field_changes_the_independent_key_context() {
             50 => p.parties[0].payment = point(61).x_only(),
             51 => p.parties[1].delayed = point(67).x_only(),
             52 => p.parties[1].payout_script[2] ^= 1,
+            53 => p.graph.contest_window += 1,
             _ => p.deposit[32..].copy_from_slice(&8u32.to_le_bytes()),
         }
         let changed = Base::new(p).unwrap();
@@ -298,7 +300,7 @@ fn every_agreed_base_field_changes_the_independent_key_context() {
 
 #[test]
 fn absent_or_unsupported_base_terms_are_rejected_not_defaulted() {
-    for field in 0..17 {
+    for field in 0..18 {
         let mut p = parts();
         match field {
             0 => p.nonce = [0; 32],
@@ -317,6 +319,7 @@ fn absent_or_unsupported_base_terms_are_rejected_not_defaulted() {
             13 => p.recipe.kept = p.recipe.instances,
             14 => p.recipe.program = [0; 32],
             15 => p.limits.max_authorizations = 31,
+            16 => p.graph.contest_window = 1,
             _ => p.fees.max_rate_sat_per_kvb = 0,
         }
         assert!(Base::new(p).is_err(), "field {field}");
@@ -343,6 +346,7 @@ fn the_dispute_windows_end_by_the_close() {
     let g = &p.graph;
     let span = [
         g.response_window,
+        g.contest_window,
         g.assert_window,
         g.challenge_window,
         g.answer_window,

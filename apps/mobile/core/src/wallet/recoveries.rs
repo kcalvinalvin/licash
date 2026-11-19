@@ -138,7 +138,9 @@ pub enum RecoveryStage {
     Sweeping,
     /// Its value back in the wallet on Bitcoin.
     Done,
-    /// The hub answered that the claim is owed less: its proof awaited.
+    /// The hub answered that the claim is owed less: the wallet checks its
+    /// evidence and lets the answer stand, or contests it, and its proof is
+    /// awaited.
     Answered,
     /// The contract's collateral went elsewhere.
     Lost,
@@ -161,7 +163,7 @@ fn stage(s: Stage) -> RecoveryStage {
         Stage::TimingOut | Stage::TimedOut => RecoveryStage::TimingOut,
         Stage::Sweeping => RecoveryStage::Sweeping,
         Stage::Done => RecoveryStage::Done,
-        Stage::Answered => RecoveryStage::Answered,
+        Stage::Answered | Stage::Contesting | Stage::Contested => RecoveryStage::Answered,
         Stage::Asserted | Stage::Succeeding => RecoveryStage::Asserted,
         Stage::Challenging => RecoveryStage::Challenging,
         Stage::Challenged => RecoveryStage::Challenged,

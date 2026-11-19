@@ -102,6 +102,11 @@ pub(super) struct Watch {
     /// statement ([`Openings::assert_false_proofs`]).
     #[cfg(feature = "faults")]
     false_proofs: std::sync::atomic::AtomicBool,
+    /// A hub shows no one the evidence of its responses, so that holders
+    /// cannot check them and contest every one
+    /// ([`Openings::refuse_evidence`]).
+    #[cfg(feature = "faults")]
+    no_evidence: std::sync::atomic::AtomicBool,
 }
 
 /// A fold offered a holder: the hub's secret nonce, its holder's public
@@ -221,8 +226,22 @@ impl Openings {
         if x.compute_txid() != respond.tx.compute_txid() {
             return self.collect(id, hub, o, &r, None, (x_at, &x), tip).await;
         }
-        let Some((y_at, y)) = self.spend(main(&x), &x.output[0], x_at, tip).await? else {
-            return self.assert(id, hub, o, &r, r_at, &x, x_at, tip).await;
+        // Left alone for `w_X` blocks, her response pays what it says: the
+        // hub posts that, and proves nothing.
+        let Some((c_at, c)) = self.spend(main(&x), &x.output[0], x_at, tip).await? else {
+            return self.settle(id, hub, o, "respond_timeout", x_at, tip).await;
+        };
+        let contest = presign(&o.set, "contest")?;
+        if c.compute_txid() != contest.tx.compute_txid() {
+            return self
+                .collect(id, hub, o, &r, Some(&x), (c_at, &c), tip)
+                .await;
+        }
+        // She contested: the hub proves, from her contest on.
+        let Some((y_at, y)) = self.spend(main(&c), &c.output[0], c_at, tip).await? else {
+            return self
+                .assert(id, hub, o, &r, r_at, (&x, x_at), (&c, c_at), tip)
+                .await;
         };
         let assert = presign(&o.set, "assert")?;
         if y.compute_txid() != assert.tx.compute_txid() {
@@ -231,7 +250,7 @@ impl Openings {
                 .await;
         }
         let Some((z_at, z)) = self.spend(main(&y), &y.output[0], y_at, tip).await? else {
-            return self.succeed(id, hub, o, y_at, tip).await;
+            return self.settle(id, hub, o, "success", y_at, tip).await;
         };
         let challenge = presign(&o.set, "challenge_assert")?;
         if z.compute_txid() != challenge.tx.compute_txid() {
@@ -386,9 +405,8 @@ impl Openings {
         Ok(signed)
     }
 
-    /// Opening `id`, signed, its contract output unspent, even by the
-    /// mempool: one to fold.
-    async fn standing(&self, id: &[u8; 32]) -> Result<(Hub, HubOpening), Refused> {
+    /// Opening `id`, signed, as the hub holds it.
+    async fn signed_opening(&self, id: &[u8; 32]) -> Result<(Hub, HubOpening), Refused> {
         let ctx = self.context().await?;
         let row = self.store().row(id).map_err(Refused::unavailable)?;
         let row = row.ok_or_else(|| Refused::bad("no such contract"))?;
@@ -399,6 +417,53 @@ impl Openings {
         let o = hub
             .signed()
             .map_err(|_| Refused::bad("not a signed contract"))?;
+        Ok((hub, o))
+    }
+
+    /// What the hub's response to contract `id`'s claim was decided on,
+    /// for the holder who signs for the contract's claim key
+    /// ([`crate::evidence_digest`]) and so can check it: its evidence,
+    /// pinned before the response was signed, as
+    /// [`recovery::evidence_to_bytes`] writes it. Nobody else is shown it:
+    /// it holds the spends of her notes.
+    pub(super) async fn show_evidence(
+        &self,
+        id: &[u8; 32],
+        body: &[u8],
+    ) -> Result<Vec<u8>, Refused> {
+        #[cfg(feature = "faults")]
+        if self
+            .watch
+            .no_evidence
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(Refused::unavailable("no evidence to show"));
+        }
+        let (_, o) = self.signed_opening(id).await?;
+        let pins = Responses::open(&self.data).map_err(Refused::unavailable)?;
+        let response = pins
+            .response(id)
+            .map_err(Refused::unavailable)?
+            .ok_or_else(|| Refused::bad("no response to show the evidence of"))?;
+        let signature = licash::crypto::Signature(
+            body.try_into()
+                .map_err(|_| Refused::bad("a signature is 64 bytes"))?,
+        );
+        licash::crypto::schnorr_verify(
+            &o.base.parts().claim_key,
+            &crate::evidence_digest(id, &response.compute_txid()),
+            &signature,
+        )
+        .map_err(|_| Refused::bad("not signed with the contract's claim key"))?;
+        pins.evidence(id)
+            .map_err(Refused::unavailable)?
+            .ok_or_else(|| Refused::bad("no evidence pinned"))
+    }
+
+    /// Opening `id`, signed, its contract output unspent, even by the
+    /// mempool: one to fold.
+    async fn standing(&self, id: &[u8; 32]) -> Result<(Hub, HubOpening), Refused> {
+        let (hub, o) = self.signed_opening(id).await?;
         let contract = OutPoint {
             txid: o.funding.compute_txid(),
             vout: 0,
@@ -417,6 +482,15 @@ impl Openings {
 
     fn folds(&self) -> std::sync::MutexGuard<'_, HashMap<[u8; 32], PendingFold>> {
         self.folds.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Show holders no evidence of its responses from now on, as a hub
+    /// would that cannot back them: for tests of the holder's contest.
+    #[cfg(feature = "faults")]
+    pub fn refuse_evidence(&self) {
+        self.watch
+            .no_evidence
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Assert proofs of another statement from now on, as a dishonest hub
@@ -751,10 +825,11 @@ impl Openings {
         Ok(self.post(&tx).await)
     }
 
-    /// The hub responded: its proof that her claim is owed no more, once
-    /// the response is deep enough, then its assertion. What it decides
-    /// on, first found first: the assertion signed, the proof pinned for
-    /// it, the proof made of the input frozen for it.
+    /// She contested the hub's response, `x` in a block at `x_at`, with `c`
+    /// at `c_at`: its proof that her claim is owed no more, once the
+    /// response is deep enough, then its assertion. What it decides on,
+    /// first found first: the assertion signed, the proof pinned for it,
+    /// the proof made of the input frozen for it.
     #[allow(clippy::too_many_arguments)]
     async fn assert(
         &self,
@@ -763,8 +838,8 @@ impl Openings {
         o: &HubOpening,
         r: &Transaction,
         r_at: u32,
-        x: &Transaction,
-        x_at: u32,
+        (x, x_at): (&Transaction, u32),
+        (c, c_at): (&Transaction, u32),
         tip: u32,
     ) -> Result<Played> {
         let tag = tagged(id, b"assert");
@@ -774,13 +849,13 @@ impl Openings {
         let (responded, _) = HubProves::responded_b(x)?;
         let unit = Amount::from_sat(o.base.parts().graph.unit_sats);
         let stake = unit * u64::from(b.saturating_sub(responded)) + o.babe.spec.terms.reserve_hub;
-        let window = (x_at, assert_deadline(o, x_at));
+        let window = (c_at, assert_deadline(o, c_at));
         let post = |tx: Transaction| async move {
-            self.post_link(id, hub, "assert", &tx, &x.output[0], window, stake, tip)
+            self.post_link(id, hub, "assert", &tx, &c.output[0], window, stake, tip)
                 .await
         };
         let spends = OutPoint {
-            txid: x.compute_txid(),
+            txid: c.compute_txid(),
             vout: 0,
         };
         if let Some(tx) = pins.response(&tag)? {
@@ -789,7 +864,7 @@ impl Openings {
             return Ok(Played::Posted("assert"));
         }
         // Hers after `w_A` blocks: until then only an assertion spends it.
-        let hers_at = x_at.saturating_add(u32::from(o.base.parts().graph.assert_window));
+        let hers_at = c_at.saturating_add(u32::from(o.base.parts().graph.assert_window));
         let lone = tip.saturating_add(1) < hers_at;
         let pinned = pins.evidence(&tag)?.is_some();
         if !pinned && self.pin_lost(id, "assert", spends, lone).await? {
@@ -800,7 +875,10 @@ impl Openings {
         let proof = match pins.evidence(&tag)?.filter(|p| !p.is_empty()) {
             Some(pinned) => lichen_babe::statement::proof_from_bytes(&pinned)
                 .context("the pinned proof does not decode")?,
-            None => match self.prove(id, o, r, r_at, x, x_at, tip, hub).await? {
+            None => match self
+                .prove(id, o, r, r_at, (x, x_at), c_at, tip, hub)
+                .await?
+            {
                 Ok(proof) => proof,
                 Err(played) => return Ok(played),
             },
@@ -869,7 +947,8 @@ impl Openings {
     /// The proof of the hub's statement for its assertion, pinned: once its
     /// response is deep enough, its disclosure too (else what it played
     /// instead), its input frozen, and its prover made it (the mock
-    /// authority's at once).
+    /// authority's at once), by the deadline her contest, in a block at
+    /// `c_at`, gives.
     #[allow(clippy::too_many_arguments)]
     async fn prove(
         &self,
@@ -877,15 +956,15 @@ impl Openings {
         o: &HubOpening,
         r: &Transaction,
         r_at: u32,
-        x: &Transaction,
-        x_at: u32,
+        (x, x_at): (&Transaction, u32),
+        c_at: u32,
         tip: u32,
         hub: &Hub,
     ) -> Result<std::result::Result<ark_groth16::Proof<ark_bn254::Bn254>, Played>> {
         let parts = o.base.parts();
         let depth = parts.chain.work_depth;
         let prover = self.prover.as_ref().filter(|_| !o.mock);
-        let deadline = assert_deadline(o, x_at);
+        let deadline = assert_deadline(o, c_at);
         let program = parts.recipe.program;
         let commit = |release: u32, cycles: u64, frozen: bool, proven: bool| {
             let Some(prover) = prover else { return };
@@ -1062,31 +1141,34 @@ impl Openings {
         }
     }
 
-    /// Its assertion unchallenged past `success`'s wait: `success`, with a
-    /// fee coin, paying the hub its reserve. She may post it too, but need
-    /// not: with no claim published (the slot reclaimed), she has no fee
-    /// coin of her own for it.
-    async fn succeed(
+    /// Her response left uncontested past `respond_timeout`'s wait, or its
+    /// assertion unchallenged past `success`'s: that terminal, `name`, with
+    /// a fee coin, paying her `b′` and the hub its reserve, `parent_at` the
+    /// block of the link it waits on. She may post it too, but need not:
+    /// with no claim published (the slot reclaimed), she has no fee coin of
+    /// her own for it.
+    async fn settle(
         &self,
         id: &[u8; 32],
         hub: &Hub,
         o: &HubOpening,
-        asserted_at: u32,
+        name: &'static str,
+        parent_at: u32,
         tip: u32,
     ) -> Result<Played> {
-        let success = presign(&o.set, "success")?;
-        let wait = match success.tx.input[0].sequence.to_relative_lock_time() {
+        let terminal = presign(&o.set, name)?;
+        let wait = match terminal.tx.input[0].sequence.to_relative_lock_time() {
             Some(bitcoin::relative::LockTime::Blocks(h)) => u32::from(h.value()),
-            _ => bail!("success waits for no number of blocks"),
+            _ => bail!("{name} waits for no number of blocks"),
         };
-        if tip.saturating_add(1) < asserted_at.saturating_add(wait) {
+        if tip.saturating_add(1) < parent_at.saturating_add(wait) {
             return Ok(Played::Idle);
         }
-        let prevout = success.prevout.clone();
-        let tx = o.finish("success", vec![])?;
-        let tx = self.with_fee(id, hub, "success", tx, prevout).await?;
-        if self.post(&tx).await && self.once(id, "success") {
-            return Ok(Played::Posted("success"));
+        let prevout = terminal.prevout.clone();
+        let tx = o.finish(name, vec![])?;
+        let tx = self.with_fee(id, hub, name, tx, prevout).await?;
+        if self.post(&tx).await && self.once(id, name) {
+            return Ok(Played::Posted(name));
         }
         Ok(Played::Idle)
     }
@@ -1477,12 +1559,15 @@ impl Openings {
             .map(|p| p.name.clone())
             .context("the exit went to an unknown transaction")?;
         let (amount, wire, value_key, signer) = match terminal.as_str() {
-            "request_timeout" | "respond_timeout" | "failure" => {
+            "request_timeout" | "contest_timeout" | "failure" => {
                 let (b, _) = HubProves::read_request(&link_args(r))?;
                 let (amount, _) = o.requested_b(r)?;
                 (amount, HubProves::b_wire(&b), &o.holder.b_key, Role::User)
             }
-            n if n == "success" || n.starts_with("wrongly_challenged_") => {
+            n if n == "success"
+                || n == "respond_timeout"
+                || n.starts_with("wrongly_challenged_") =>
+            {
                 let (b, wire) = HubProves::responded_b(response.context("no response")?)?;
                 (b, wire, &o.hub.b_key, Role::Hub)
             }
@@ -1949,11 +2034,12 @@ fn respond_deadline(o: &HubOpening, r_at: u32) -> u32 {
 }
 
 /// The last tip at which the hub's assertion, broadcast, still confirms
-/// before her `respond_timeout`, `w_a` blocks after its response at
-/// `x_at`: `deadline_margin` blocks to confirm in.
-fn assert_deadline(o: &HubOpening, x_at: u32) -> u32 {
+/// before her `contest_timeout`, `w_a` blocks after her contest at `c_at`
+/// (or, as a plan, after the response it would answer at the earliest):
+/// `deadline_margin` blocks to confirm in.
+fn assert_deadline(o: &HubOpening, c_at: u32) -> u32 {
     let g = &o.base.parts().graph;
-    x_at.saturating_add(u32::from(g.assert_window))
+    c_at.saturating_add(u32::from(g.assert_window))
         .saturating_sub(1)
         .saturating_sub(g.deadline_margin)
 }

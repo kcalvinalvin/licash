@@ -164,7 +164,11 @@ fn fee_inputs(
 /// Whether a challenge may still be hers to make, its coin not taken yet.
 fn challenge_possible(stage: Stage, state: &State) -> bool {
     match stage {
-        Stage::Published | Stage::Requested | Stage::Answered => true,
+        Stage::Published
+        | Stage::Requested
+        | Stage::Answered
+        | Stage::Contesting
+        | Stage::Contested => true,
         Stage::Asserted => state.verified != Some(true),
         Stage::Challenging => state.challenge_child.is_none(),
         _ => false,
@@ -199,6 +203,8 @@ pub enum Stage {
     TimedOut,
     Sweeping,
     Done,
+    /// The hub responded: she checks its evidence, and leaves the response
+    /// alone, paid what it says by its terminal, or contests it.
     Answered,
     Lost,
     GivingUp,
@@ -211,9 +217,15 @@ pub enum Stage {
     /// signed may confirm, paying it. Until then it holds the claim her
     /// forced close would file, the same.
     Folding,
+    /// Her contest of the hub's response is made, and posted until it is in
+    /// a block.
+    Contesting,
+    /// Her contest is in a block: the hub asserts its proof, or her
+    /// timeout pays her claim.
+    Contested,
 }
 impl Stage {
-    const ALL: [Self; 19] = [
+    const ALL: [Self; 21] = [
         Self::Claiming,
         Self::Claimed,
         Self::Irrevocable,
@@ -233,6 +245,8 @@ impl Stage {
         Self::Challenged,
         Self::Paid,
         Self::Folding,
+        Self::Contesting,
+        Self::Contested,
     ];
     pub fn as_str(self) -> &'static str {
         match self {
@@ -255,6 +269,8 @@ impl Stage {
             Self::Challenged => "challenged",
             Self::Paid => "paid",
             Self::Folding => "folding",
+            Self::Contesting => "contesting",
+            Self::Contested => "contested",
         }
     }
     fn parse(text: &str) -> Result<Self> {
@@ -270,6 +286,8 @@ impl Stage {
         matches!(
             self,
             Self::Answered
+                | Self::Contesting
+                | Self::Contested
                 | Self::Asserted
                 | Self::Succeeding
                 | Self::Challenging
@@ -341,6 +359,17 @@ struct State {
     response_height: Option<u32>,
     reduced: Option<u32>,
     deadline: Option<u32>,
+    /// What her check of the hub's response came to: it bore out her
+    /// claim's reduction (true), or she contests it (false). None while she
+    /// cannot tell.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    accepted: Option<bool>,
+    /// Her contest of the response, made once and posted as it was, and
+    /// the block it is in.
+    #[serde(with = "consensus", skip_serializing_if = "Option::is_none")]
+    contest: Option<Transaction>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    contest_height: Option<u32>,
     #[serde(with = "consensus")]
     assertion: Option<Transaction>,
     assertion_height: Option<u32>,
@@ -788,7 +817,7 @@ fn view(row: &RecoveryRow) -> Result<Recovery> {
     let timed = state
         .payout_name
         .as_deref()
-        .is_some_and(|n| matches!(n, "request_timeout" | "respond_timeout" | "failure"));
+        .is_some_and(|n| matches!(n, "request_timeout" | "contest_timeout" | "failure"));
     Ok(Recovery {
         id: row.id,
         stage,
@@ -836,6 +865,23 @@ enum Next {
     Wait,
     Save,
     To(Stage),
+}
+
+/// A link of hers posted with a fee child ([`Run::post_link`]): her
+/// challenge, or her contest.
+struct Link {
+    name: &'static str,
+    tx: Transaction,
+    /// The stage that posts it again, round after round.
+    stage: Stage,
+    /// The block its window opened at, and the last tip it confirms in
+    /// time from.
+    opened: u32,
+    deadline: u32,
+    /// What missing the deadline costs her: its fee at most.
+    stake: Amount,
+    /// Whether it takes the coin set aside for a challenge's fee.
+    set_aside: bool,
 }
 struct Run<'a, T: Transport, C: Chain> {
     wallet: &'a Wallet<T>,
@@ -928,9 +974,11 @@ impl<'a, T: Transport, C: Chain> Run<'a, T, C> {
                 Stage::Published => self.publish(&mut state, tip).await?,
                 Stage::Requested
                 | Stage::Answered
+                | Stage::Contested
                 | Stage::Asserted
                 | Stage::Challenging
                 | Stage::Challenged => self.watch(stage, &mut state, tip).await?,
+                Stage::Contesting => self.contesting(&mut state, tip).await?,
                 Stage::TimingOut | Stage::Succeeding => self.finishing(&mut state, tip).await?,
                 Stage::TimedOut | Stage::Paid => self.sweep(&mut state, tip)?,
                 Stage::Sweeping => self.swept(&mut state, tip).await?,
@@ -1334,7 +1382,13 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
             script_pubkey: dispute::fee_script(&self.keys.party.payment)?,
         };
         let mut max_vsize = 0;
-        for name in ["request_timeout", "respond_timeout", "failure", "success"] {
+        for name in [
+            "request_timeout",
+            "respond_timeout",
+            "contest_timeout",
+            "failure",
+            "success",
+        ] {
             let p = presign(&self.o.set, name)?;
             let tx = dispute::add_fee(
                 self.o.finish(name, vec![])?,
@@ -1838,21 +1892,25 @@ fn rewind(stage: Stage, state: &mut State, stood: u32) -> Stage {
         (Stage::Published, 1)
     } else if gone(state.response_height) {
         (Stage::Requested, 2)
-    } else if gone(state.assertion_height) {
+    } else if gone(state.contest_height) {
         (Stage::Answered, 3)
+    } else if gone(state.assertion_height) {
+        (Stage::Contested, 4)
     } else if gone(state.challenge_height) {
-        (Stage::Asserted, 4)
+        (Stage::Asserted, 5)
     } else if gone(state.payout_height) {
         let watching = if state.challenge_height.is_some() {
             Stage::Challenged
         } else if state.assertion_height.is_some() {
             Stage::Asserted
+        } else if state.contest_height.is_some() {
+            Stage::Contested
         } else if state.response_height.is_some() {
             Stage::Answered
         } else {
             Stage::Requested
         };
-        (watching, 5)
+        (watching, 6)
     } else {
         return stage;
     };
@@ -1868,13 +1926,20 @@ fn rewind(stage: Stage, state: &mut State, stood: u32) -> Stage {
         state.response_height = None;
         state.reduced = None;
         state.deadline = None;
+        // What she made of a response in a block gone: of the one found
+        // again, not this.
+        state.accepted = None;
     }
+    // Her contest is kept, to be posted again as it was.
     if first <= 3 {
+        state.contest_height = None;
+    }
+    if first <= 4 {
         state.assertion = None;
         state.assertion_height = None;
         state.verified = None;
     }
-    if first <= 4 {
+    if first <= 5 {
         state.challenge_height = None;
     }
     state.payout = None;
@@ -1940,7 +2005,8 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
     fn parent(&self, stage: Stage, state: &State) -> Result<(Transaction, u32)> {
         let pair = match stage {
             Stage::Requested => (&state.r, state.r_height),
-            Stage::Answered => (&state.response, state.response_height),
+            Stage::Answered | Stage::Contesting => (&state.response, state.response_height),
+            Stage::Contested => (&state.contest, state.contest_height),
             Stage::Asserted | Stage::Challenging => (&state.assertion, state.assertion_height),
             Stage::Challenged => (&state.challenge, state.challenge_height),
             _ => bail!("no parent to watch at {}", stage.as_str()),
@@ -1974,7 +2040,7 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
         state.from = Some(height);
         state.next_at = None;
         Next::To(
-            if matches!(name, "request_timeout" | "respond_timeout" | "failure") {
+            if matches!(name, "request_timeout" | "contest_timeout" | "failure") {
                 Stage::TimedOut
             } else {
                 Stage::Paid
@@ -2008,7 +2074,26 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
                     return Ok(self.paid(state, "request_timeout", tx, height));
                 }
             }
-            Stage::Answered => {
+            Stage::Answered | Stage::Contesting => {
+                if self.is_link("contest", &tx)? {
+                    state.contest = Some(tx);
+                    state.contest_height = Some(height);
+                    state.challenge_child = None;
+                    state.payout = None;
+                    state.payout_name = None;
+                    state.payout_height = None;
+                    state.from = Some(height);
+                    let due = height
+                        + blocks(presign(&self.o.set, "contest_timeout")?.tx.input[0].sequence)?;
+                    state.deadline = Some(due);
+                    state.next_at = Some(due);
+                    return Ok(Next::To(Stage::Contested));
+                }
+                if self.is_terminal("respond_timeout", &tx)? {
+                    return Ok(self.paid(state, "respond_timeout", tx, height));
+                }
+            }
+            Stage::Contested => {
                 if self.is_link("assert", &tx)? {
                     state.verified = Some(self.o.verify_assertion(&tx)?);
                     state.assertion = Some(tx);
@@ -2020,8 +2105,8 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
                     state.next_at = None;
                     return Ok(Next::To(Stage::Asserted));
                 }
-                if self.is_terminal("respond_timeout", &tx)? {
-                    return Ok(self.paid(state, "respond_timeout", tx, height));
+                if self.is_terminal("contest_timeout", &tx)? {
+                    return Ok(self.paid(state, "contest_timeout", tx, height));
                 }
             }
             Stage::Asserted | Stage::Challenging => {
@@ -2070,6 +2155,170 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
         ));
         Ok(Next::To(Stage::Lost))
     }
+    /// The hub responded, `height` the response's block: she checks what it
+    /// responded on, and leaves it alone, to pay her what it says at its
+    /// terminal once her contest window has passed, if it bears out her
+    /// claim's reduction, else contests it before that terminal can be
+    /// posted. A response she cannot check in time she contests.
+    async fn answered(&self, state: &mut State, height: u32, tip: u32) -> Result<Next> {
+        let g = &self.o.base.parts().graph;
+        let due = height
+            .checked_add(blocks(
+                presign(&self.o.set, "respond_timeout")?.tx.input[0].sequence,
+            )?)
+            .context("deadline overflow")?;
+        // The last tip her contest still confirms in before the terminal.
+        let by = due.saturating_sub(1).saturating_sub(g.deadline_margin);
+        if state.accepted.is_none() {
+            let may_wait = tip.saturating_add(1) < by;
+            match self.check_response(state, may_wait).await {
+                Ok(verdict) => state.accepted = verdict,
+                Err(e) => self.trouble(format!("her check of the hub's response failed: {e:#}")),
+            }
+            if state.accepted.is_none() && !may_wait {
+                self.trouble("the hub's response is not borne out in time: she contests it".into());
+                state.accepted = Some(false);
+            }
+        }
+        match state.accepted {
+            Some(false) => {
+                let contest = match state.contest.clone() {
+                    Some(contest) => contest,
+                    None => self.o.contest(&self.keys)?,
+                };
+                state.contest = Some(contest);
+                state.next_at = Some(by);
+                Ok(Next::To(Stage::Contesting))
+            }
+            Some(true) => {
+                state.next_at = Some(due);
+                if tip.saturating_add(1) < due {
+                    return Ok(Next::Save);
+                }
+                self.plan_terminal(state, "respond_timeout", due)
+            }
+            None => {
+                state.next_at = Some(by);
+                Ok(Next::Save)
+            }
+        }
+    }
+
+    /// Whether the hub's response bears out the reduction of her claim,
+    /// from the evidence it shows her under her claim key and what Bitcoin
+    /// shows of the claim and the response's disclosure: the statement's
+    /// own test ([`licash_hp::bears_out`]), so that none the hub could
+    /// prove says otherwise. None if it cannot be told yet, and `may_wait`:
+    /// the disclosure its evidence needs not in a block.
+    async fn check_response(&self, state: &State, may_wait: bool) -> Result<Option<bool>> {
+        let response = state.response.as_ref().context("no response")?;
+        let response_height = state.response_height.context("no response height")?;
+        let (reduced, _) = HubProves::responded_b(response)?;
+        let (amount, claim_digest) = HubProves::requested_b(state.r.as_ref().context("no R")?)?;
+        let request = Request {
+            amount,
+            claim_digest,
+        };
+        let filed = self.filing_of(state)?.to_bytes();
+        let parts = self.o.base.parts();
+
+        // What the hub responded on.
+        let contract = (self.store.list()?.into_iter().find(|c| c.id == self.id))
+            .context("no such contract")?;
+        let hub = contract.hub.trim_end_matches('/');
+        let digest = crate::evidence_digest(&self.id, &response.compute_txid());
+        let url = format!(
+            "{hub}{}",
+            crate::EVIDENCE.replace("{id}", &crate::hex_id(&self.id))
+        );
+        let body = self.keys.sign_as_claim(&digest).to_vec();
+        let bytes = super::fold::post(self.wallet, hub, &url, body).await?;
+        let evidence = match bytes.is_empty() {
+            true => Vec::new(),
+            false => licash::recovery::evidence_from_bytes(
+                &parts.keyset,
+                parts.limits.max_authorizations as usize,
+                &bytes,
+            )?,
+        };
+
+        // The headers through her publication's block, from Base's checkpoint.
+        let published = state.p_height.context("no publication height")?;
+        let from = parts.chain.checkpoint.height().saturating_add(1);
+        let mut headers = Vec::new();
+        for height in from..=published.min(from.saturating_add(parts.chain.max_headers)) {
+            let header = self.chain.header(height).await.map_err(|e| anyhow!(e))?;
+            let bytes: [u8; 80] = bitcoin::consensus::serialize(&header)
+                .try_into()
+                .map_err(|_| anyhow!("a header of 80 bytes"))?;
+            headers.push(bytes);
+        }
+
+        // What the response disclosed, once its block is known.
+        let tip = self.chain.height().await.map_err(|e| anyhow!(e))?;
+        let slot = OutPoint {
+            txid: response.compute_txid(),
+            // Lichen's `SLOT_VOUT`: the response's disclose slot.
+            vout: 2,
+        };
+        let out = response
+            .output
+            .get(slot.vout as usize)
+            .context("no disclose slot")?;
+        let disclosed =
+            match first_spend(self.chain, slot, &out.script_pubkey, response_height..=tip).await? {
+                None => None,
+                Some((at, spend)) => {
+                    let hash = self.chain.hash(at).await.map_err(|e| anyhow!(e))?;
+                    let block = self.chain.block(&hash).await.map_err(|e| anyhow!(e))?;
+                    Some(dispute::disclosed(response, &block, &spend.compute_txid())?)
+                }
+            };
+
+        match licash_hp::bears_out(
+            &self.o.base,
+            &request,
+            &filed,
+            &evidence,
+            &headers,
+            reduced,
+            disclosed.as_deref(),
+        ) {
+            Ok(()) => Ok(Some(true)),
+            Err(licash_hp::Refusal::Undisclosed) if disclosed.is_none() && may_wait => Ok(None),
+            Err(refusal) => {
+                tracing::warn!(
+                    id = %crate::hex_id(&self.id),
+                    "the hub's response is not borne out by its evidence: {refusal}"
+                );
+                Ok(Some(false))
+            }
+        }
+    }
+
+    /// Her contest is made: posted, with its fee child, until it is in a
+    /// block, or the hub's terminal is first.
+    async fn contesting(&self, state: &mut State, tip: u32) -> Result<Next> {
+        let (parent, height) = self.parent(Stage::Contesting, state)?;
+        let op = OutPoint {
+            txid: parent.compute_txid(),
+            vout: 0,
+        };
+        let from = state.from.unwrap_or(height).max(height);
+        if let Some((at, tx)) =
+            first_spend(self.chain, op, &parent.output[0].script_pubkey, from..=tip).await?
+        {
+            return self.observed(Stage::Contesting, state, at, tx);
+        }
+        state.from = Some(rescan(from, tip));
+        let due = height
+            .checked_add(blocks(
+                presign(&self.o.set, "respond_timeout")?.tx.input[0].sequence,
+            )?)
+            .context("deadline overflow")?;
+        self.post_contest(state, due, tip).await
+    }
+
     fn plan_terminal(&self, state: &mut State, name: &str, due: u32) -> Result<Next> {
         let p = presign(&self.o.set, name)?;
         let tx = dispute::add_fee(
@@ -2102,6 +2351,9 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
             return self.observed(stage, state, height, tx);
         }
         state.from = Some(rescan(from, tip));
+        if stage == Stage::Answered {
+            return self.answered(state, height, tip).await;
+        }
         if stage == Stage::Challenging {
             if state.next_at.is_none_or(|due| tip.saturating_add(1) >= due) {
                 return self.post_challenge(state, height, tip).await;
@@ -2124,7 +2376,7 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
         }
         let name = match stage {
             Stage::Requested => "request_timeout",
-            Stage::Answered => "respond_timeout",
+            Stage::Contested => "contest_timeout",
             Stage::Asserted => {
                 ensure!(
                     state.verified == Some(true),
@@ -2233,11 +2485,52 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
             .saturating_add(wait)
             .saturating_sub(1)
             .saturating_sub(g.deadline_margin);
+        let link = Link {
+            name: "challenge_assert",
+            tx: challenge,
+            stage: Stage::Challenging,
+            opened: state.next_at.unwrap_or(asserted_at),
+            deadline,
+            stake: self.challenge_stake(state)?,
+            set_aside: true,
+        };
+        self.post_link(state, link, tip).await
+    }
+
+    /// Her contest, once decided on, posted as her challenge is
+    /// ([`Self::post_link`]): in a block before the hub's terminal can be,
+    /// `due` blocks after the response, which her check of its evidence
+    /// did not bear out. It costs her only its fee, and the hub a proof.
+    async fn post_contest(&self, state: &mut State, due: u32, tip: u32) -> Result<Next> {
+        let g = &self.o.base.parts().graph;
+        let link = Link {
+            name: "contest",
+            tx: state.contest.clone().context("no pinned contest")?,
+            stage: Stage::Contesting,
+            opened: state.response_height.unwrap_or(tip),
+            deadline: due.saturating_sub(1).saturating_sub(g.deadline_margin),
+            stake: self.challenge_stake(state)?,
+            set_aside: false,
+        };
+        self.post_link(state, link, tip).await
+    }
+
+    /// `link` broadcast with a fee child, as [`Self::post_challenge`]
+    /// describes of her challenge.
+    async fn post_link(&self, state: &mut State, link: Link, tip: u32) -> Result<Next> {
+        let Link {
+            name,
+            tx: challenge,
+            stage,
+            opened,
+            deadline,
+            stake,
+            set_aside,
+        } = link;
         let left = deadline.saturating_sub(tip);
-        let opened = state.next_at.unwrap_or(asserted_at);
         if tip >= opened.saturating_add(deadline.saturating_sub(opened) / 2) {
             self.trouble(format!(
-                "her challenge is in no block halfway to block {deadline}, when the hub's \
+                "her {name} is in no block halfway to block {deadline}, when the hub's \
                  payout becomes valid: its fee rises as that nears"
             ));
         }
@@ -2258,21 +2551,21 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
             self.broadcast(&challenge).await;
             return Ok(Next::Save);
         }
-        let presigned = presign(&self.o.set, "challenge_assert")?;
+        let presigned = presign(&self.o.set, name)?;
         let paid: Amount = challenge.output.iter().map(|o| o.value).sum();
         let link_fee = presigned
             .prevout
             .value
             .checked_sub(paid)
-            .context("a challenge paying out more")?;
+            .with_context(|| format!("a {name} paying out more"))?;
         let fee_script = dispute::fee_script(&self.keys.party.payment)?;
         let anchor = challenge
             .output
             .get(dispute::ANCHOR_VOUT as usize)
-            .context("a challenge without an anchor")?;
+            .with_context(|| format!("a {name} without an anchor"))?;
         ensure!(
             anchor.script_pubkey == fee_script,
-            "the challenge's anchor is not hers"
+            "the {name}'s anchor is not hers"
         );
         let output = |op: &OutPoint| -> Result<Option<(OutPoint, TxOut)>> {
             Ok(self.wallet.silent_coin_output(op)?.map(|out| (*op, out)))
@@ -2285,13 +2578,15 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
                     coins.extend(output(&input.previous_output)?);
                 }
             }
-            None => {
+            // The coin set aside is a challenge's: a contest takes another.
+            None if set_aside => {
                 let marker = challenge_marker(&self.id);
                 let held = self.wallet.silent_coins()?;
                 if let Some(c) = held.iter().find(|c| c.spending == Some(marker)) {
                     coins.extend(output(&c.outpoint)?);
                 }
             }
+            None => {}
         }
         let change = match &old {
             Some(old) => old.output[0].script_pubkey.clone(),
@@ -2332,14 +2627,13 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
         }
         // Its rate the stake's at most, and what her coins pay at most:
         // weighed at the floor, its size the same at any rate.
-        let stake = self.challenge_stake(state)?;
         let child = build(&coins, one).and_then(|sized| {
             let pair = (pair_vb(&sized) * 4).max(1);
             let per_kwu = |sat: Amount| FeeRate::from_sat_per_kwu(sat.to_sat() * 1_000 / pair);
             let most = per_kwu(stake + link_fee);
             if rate > most {
                 self.trouble(format!(
-                    "her challenge would pay {rate} to be in a block by block {deadline}, \
+                    "her {name} would pay {rate} to be in a block by block {deadline}, \
                      more than the {stake} it wins: it pays {most}"
                 ));
                 rate = most;
@@ -2349,7 +2643,7 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
             let afford = per_kwu((have + link_fee).checked_sub(dust).unwrap_or(Amount::ZERO));
             if rate > afford {
                 self.trouble(format!(
-                    "too little of hers on Bitcoin for her challenge to pay {rate} to be in a \
+                    "too little of hers on Bitcoin for her {name} to pay {rate} to be in a \
                      block by block {deadline}: it pays {afford}"
                 ));
                 rate = afford;
@@ -2360,9 +2654,9 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
             Ok(child) => child,
             Err(e) => {
                 self.trouble(format!(
-                    "too little of hers on Bitcoin to pay her challenge's fee: {e:#}"
+                    "too little of hers on Bitcoin to pay her {name}'s fee: {e:#}"
                 ));
-                return self.post_child(state, &challenge).await;
+                return self.post_child(state, &challenge, stage).await;
             }
         };
         let fee = |tx: &Transaction| {
@@ -2399,27 +2693,34 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
             }
         };
         let Some(child) = child else {
-            return self.post_child(state, &challenge).await;
+            return self.post_child(state, &challenge, stage).await;
         };
         // Its coins freed of the last child, or of being set aside, and the
         // new one kept: signed and broadcast next round.
         if let Some(old) = &old {
             let _ = self.wallet.abandon_silent(&old.compute_txid());
         }
-        let _ = self.wallet.abandon_silent(&challenge_marker(&self.id));
+        if set_aside {
+            let _ = self.wallet.abandon_silent(&challenge_marker(&self.id));
+        }
         tracing::info!(
             id = %crate::hex_id(&self.id), txid = %child.compute_txid(), %rate,
-            "her challenge's fee child made"
+            "her {name}'s fee child made"
         );
         state.challenge_child = Some(child);
-        Ok(Next::To(Stage::Challenging))
+        Ok(Next::To(stage))
     }
 
-    /// Her challenge broadcast with its last fee child, if any, as one
-    /// package: the child's coins of her wallet signed again, which sets
-    /// them aside again. A coin of it taken meanwhile, the child is made
-    /// again (once a run).
-    async fn post_child(&self, state: &mut State, challenge: &Transaction) -> Result<Next> {
+    /// Her link `link` (a challenge, or her contest) broadcast with its last
+    /// fee child, if any, as one package: the child's coins of her wallet
+    /// signed again, which sets them aside again. A coin of it taken
+    /// meanwhile, the child is made again (once a run), at `stage`.
+    async fn post_child(
+        &self,
+        state: &mut State,
+        challenge: &Transaction,
+        stage: Stage,
+    ) -> Result<Next> {
         let Some(mut child) = state.challenge_child.clone() else {
             self.broadcast(challenge).await;
             return Ok(Next::Save);
@@ -2461,7 +2762,7 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
             );
             let _ = self.wallet.abandon_silent(&child.compute_txid());
             state.challenge_child = None;
-            return Ok(Next::To(Stage::Challenging));
+            return Ok(Next::To(stage));
         }
         if let Err(e) = self
             .chain
@@ -2478,6 +2779,7 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
         let stage = match name {
             "request_timeout" => Stage::Requested,
             "respond_timeout" => Stage::Answered,
+            "contest_timeout" => Stage::Contested,
             "failure" => Stage::Challenged,
             "success" => Stage::Asserted,
             _ => bail!("not a locally posted terminal"),
@@ -2509,7 +2811,7 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
             .as_deref()
             .context("payout provenance is unknown")?;
         let (amount, wire, value_key, signer) = match name {
-            "request_timeout" | "respond_timeout" | "failure" => {
+            "request_timeout" | "contest_timeout" | "failure" => {
                 let r = state.r.as_ref().context("no R")?;
                 let (b, _) = HubProves::read_request(&link_args(r))?;
                 (
@@ -2519,7 +2821,7 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
                     Role::User,
                 )
             }
-            "success" => {
+            "success" | "respond_timeout" => {
                 let (b, wire) =
                     HubProves::responded_b(state.response.as_ref().context("no response")?)?;
                 (b, wire, &self.o.hub.b_key, Role::Hub)
@@ -2979,6 +3281,8 @@ mod tests {
             response_height: Some(105),
             reduced: Some(7),
             deadline: Some(150),
+            contest: Some(tx(9)),
+            contest_height: Some(107),
             assertion: Some(tx(4)),
             assertion_height: Some(110),
             verified: Some(false),
@@ -3027,11 +3331,24 @@ mod tests {
         signed(&s);
         // The assertion's: what it verified to forgotten too.
         let mut s = paid.clone();
-        assert_eq!(rewind(Stage::Challenged, &mut s, 107), Stage::Answered);
+        assert_eq!(rewind(Stage::Challenged, &mut s, 107), Stage::Contested);
         assert_eq!(
-            (&s.assertion, s.verified, s.response_height),
-            (&None, None, Some(105))
+            (&s.assertion, s.verified, s.contest_height),
+            (&None, None, Some(107))
         );
+        signed(&s);
+        // Her contest's: watched for from the response, kept to post again,
+        // and what she made of the response stands.
+        let mut s = State {
+            accepted: Some(false),
+            ..paid.clone()
+        };
+        assert_eq!(rewind(Stage::Contested, &mut s, 106), Stage::Answered);
+        assert_eq!(
+            (s.contest_height, s.assertion_height, s.response_height),
+            (None, None, Some(105))
+        );
+        assert_eq!((&s.contest, s.accepted), (&paid.contest, Some(false)));
         signed(&s);
         // The answer's: what it said she is owed.
         let mut s = paid.clone();
@@ -3103,6 +3420,8 @@ mod tests {
                 Stage::Challenging,
                 Stage::Challenged,
                 Stage::Paid,
+                Stage::Contesting,
+                Stage::Contested,
             ]
         );
     }

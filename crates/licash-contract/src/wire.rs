@@ -226,6 +226,7 @@ impl Writer {
         for n in [
             g.response_window,
             g.publication_window,
+            g.contest_window,
             g.assert_window,
             g.challenge_window,
             g.answer_window,
@@ -434,6 +435,7 @@ impl<'a> Reader<'a> {
                 request_height: self.u32()?,
                 response_window: self.u16()?,
                 publication_window: self.u16()?,
+                contest_window: self.u16()?,
                 assert_window: self.u16()?,
                 challenge_window: self.u16()?,
                 answer_window: self.u16()?,

@@ -73,6 +73,9 @@ pub struct GraphTerms {
     pub challenge_window: u16,
     /// `Δ1`: the Hub's answer to her challenge.
     pub answer_window: u16,
+    /// `w_X`: her contest of the Hub's response, after it. Left alone, the
+    /// response pays her what it says, and nobody proves anything.
+    pub contest_window: u16,
 }
 
 impl GraphTerms {
@@ -88,6 +91,7 @@ impl GraphTerms {
     fn dispute_blocks(&self) -> u32 {
         [
             self.response_window,
+            self.contest_window,
             self.assert_window,
             self.challenge_window,
             self.answer_window,
@@ -294,6 +298,7 @@ impl Base {
             || g.publication_window <= 1
             || g.response_window <= g.publication_window + 1
             || u32::from(g.assert_window) <= c.work_depth + 1
+            || g.contest_window <= 1
             || g.challenge_window <= 1
             || g.answer_window <= 1
             || g.request_height <= c.checkpoint.height()
@@ -389,6 +394,7 @@ impl Base {
         for window in [
             g.response_window,
             g.publication_window,
+            g.contest_window,
             g.assert_window,
             g.challenge_window,
             g.answer_window,
@@ -469,6 +475,7 @@ impl Base {
             request_height: reader.u32()?,
             response_window: reader.u16()?,
             publication_window: reader.u16()?,
+            contest_window: reader.u16()?,
             assert_window: reader.u16()?,
             challenge_window: reader.u16()?,
             answer_window: reader.u16()?,
