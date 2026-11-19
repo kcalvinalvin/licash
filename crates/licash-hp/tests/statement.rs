@@ -218,9 +218,11 @@ fn stale_on(id: u32) -> (Filed, Evidence) {
     stale_with(id, checkpoint)
 }
 /// [`stale_on`] of a contract whose checkpoint is `checkpoint`.
-fn stale_with(id: u32, checkpoint: Checkpoint) -> (Filed, Evidence) {    let issuer = IssuerKeys::random(3).unwrap();
+fn stale_with(id: u32, checkpoint: Checkpoint) -> (Filed, Evidence) {
+    let issuer = IssuerKeys::random(3).unwrap();
     let keyset = issuer.keyset().unwrap();
-    let base = base_with(keyset.clone(), 53, id, checkpoint);    let ds: Vec<_> = (0..32).map(|i| derive(SPEND, &hold(), 4, 23, i)).collect();
+    let base = base_with(keyset.clone(), 53, id, checkpoint);
+    let ds: Vec<_> = (0..32).map(|i| derive(SPEND, &hold(), 4, 23, i)).collect();
     let notes: Vec<_> = ds.iter().map(|d| mint(&issuer, &keyset, d)).collect();
     let owners: Vec<_> = (0..16).map(|i| owner(SPEND, 23, i)).collect();
     let bob = HoldRoot::from_seed(&[9; 32]).unwrap();
@@ -924,17 +926,17 @@ mod chained {
             journal: &journal,
             tip: &tip,
         };
-        let proof = open_chain(proven, base, None, &shown, evidence, &program()).unwrap();
+        let proof = open_chain(proven, base, &keys(), &shown, evidence, &program()).unwrap();
         let chained = Chained {
             proof: &proof,
             program: &program(),
         };
-        let invalid = flagged_on(base, None, &shown, evidence, chained).unwrap();
+        let invalid = flagged_on(base, &keys(), &shown, evidence, chained).unwrap();
         let input = HubInput {
             base: base.clone(),
             exit: shown,
             evidence: evidence.to_vec(),
-            keys: None,
+            keys: keys(),
             invalid,
             chain: Some(proof),
         };
@@ -948,7 +950,7 @@ mod chained {
         };
         decide_with(
             &input.base,
-            None,
+            &keys(),
             &input.exit,
             &input.evidence,
             None,
@@ -961,7 +963,7 @@ mod chained {
     /// blocks follow each.
     #[test]
     fn a_chained_statement_decides_what_the_dense_one_does_wherever_the_chain_ends() {
-        let (f, spent) = stale_on(Version::V3, ON);
+        let (f, spent) = stale_on(ON);
         assert!(chained(f.base.parts().graph.id));
         let x = exit(&f.base, f.b, &f.e, &f.bytes, 64);
         let evidence = std::slice::from_ref(&spent);
@@ -1005,7 +1007,7 @@ mod chained {
         let mut checkpoint = genesis.clone();
         below.iter().for_each(|h| checkpoint.push(*h).unwrap());
         assert_eq!(checkpoint.height(), 4);
-        let (f, spent) = stale_with(Version::V3, ON, checkpoint.clone());
+        let (f, spent) = stale_with(ON, checkpoint.clone());
         let x = exit(&f.base, f.b, &f.e, &f.bytes, 64);
         let evidence = std::slice::from_ref(&spent);
         let want = dense(&f.base, &x, evidence);
@@ -1048,7 +1050,7 @@ mod chained {
             base: f.base.clone(),
             exit: shown,
             evidence: evidence.to_vec(),
-            keys: None,
+            keys: keys(),
             invalid: 0,
             chain: Some(proof),
         };
@@ -1069,7 +1071,7 @@ mod chained {
     /// graph id, and never the other.
     #[test]
     fn a_contract_is_decided_on_its_chain_or_its_headers_by_its_graph_id() {
-        let (f, spent) = stale_on(Version::V3, ON);
+        let (f, spent) = stale_on(ON);
         let x = exit(&f.base, f.b, &f.e, &f.bytes, 64);
         let evidence = std::slice::from_ref(&spent);
         let (input, _) = on(&f.base, &x, evidence, 9);
@@ -1087,7 +1089,7 @@ mod chained {
             Err(Refusal::Chain(_))
         ));
         // a graph before the chain's, which has no chain to carry
-        let (g, spent) = stale_on(Version::V3, ON - 1);
+        let (g, spent) = stale_on(ON - 1);
         let x = exit(&g.base, g.b, &g.e, &g.bytes, 64);
         let carried = HubInput {
             chain: input.chain.clone(),
@@ -1103,7 +1105,7 @@ mod chained {
     /// exit sits in.
     #[test]
     fn a_block_the_statement_needs_that_is_not_opened_is_no_proof() {
-        let (f, spent) = stale_on(Version::V3, ON);
+        let (f, spent) = stale_on(ON);
         let x = exit(&f.base, f.b, &f.e, &f.bytes, 64);
         let evidence = std::slice::from_ref(&spent);
         let (input, _) = on(&f.base, &x, evidence, 12);
@@ -1138,7 +1140,7 @@ mod chained {
     /// statement verified.
     #[test]
     fn an_opening_the_journals_tree_doesnt_hold_is_refused() {
-        let (f, spent) = stale_on(Version::V3, ON);
+        let (f, spent) = stale_on(ON);
         let x = exit(&f.base, f.b, &f.e, &f.bytes, 64);
         let evidence = std::slice::from_ref(&spent);
         let (input, _) = on(&f.base, &x, evidence, 12);
@@ -1197,7 +1199,7 @@ mod chained {
     /// it, or on a state that was not its own, proves nothing of it.
     #[test]
     fn the_chain_must_pass_through_the_state_base_binds() {
-        let (f, spent) = stale_on(Version::V3, ON);
+        let (f, spent) = stale_on(ON);
         let x = exit(&f.base, f.b, &f.e, &f.bytes, 64);
         let evidence = std::slice::from_ref(&spent);
         // a chain that starts after the checkpoint, at block 1
@@ -1245,7 +1247,7 @@ mod chained {
     /// and the tail's, and no less than the contract's.
     #[test]
     fn the_work_on_the_last_block_is_the_chains_and_the_tails() {
-        let (f, spent) = stale_on(Version::V3, ON);
+        let (f, spent) = stale_on(ON);
         let x = exit(&f.base, f.b, &f.e, &f.bytes, 64);
         let evidence = std::slice::from_ref(&spent);
         // six blocks on the response are the contract's work (6 blocks deep)
@@ -1288,7 +1290,7 @@ mod chained {
         for (i, byte) in chain.iter_mut().enumerate() {
             *byte = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap();
         }
-        let (f, spent) = stale_on(Version::V3, ON);
+        let (f, spent) = stale_on(ON);
         let x = exit(&f.base, f.b, &f.e, &f.bytes, 64);
         let evidence = std::slice::from_ref(&spent);
         // the chain through the response's block, in two batches

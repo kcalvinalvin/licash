@@ -327,7 +327,7 @@ pub struct Chained<'a> {
 /// [`flagged`] of a chained contract.
 pub fn flagged_on(
     base: &Base,
-    keys: Option<&RequestKeys>,
+    keys: &RequestKeys,
     exit: &Exit,
     evidence: &[Evidence],
     chained: Chained,
@@ -346,7 +346,7 @@ pub fn flagged_on(
 pub fn open_chain(
     proven: headers::Proven,
     base: &Base,
-    keys: Option<&RequestKeys>,
+    keys: &RequestKeys,
     exit: &Exit,
     evidence: &[Evidence],
     program: &Program,
