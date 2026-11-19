@@ -3676,8 +3676,7 @@ async fn a_holder_funds_part_of_her_contract_and_is_issued_its_notes_once_f_is_b
         cap: None,
         deposit: Some(coin),
     };
-    let opened =
-        holder::open_with(&wallet, &chain, &mine.join("wallet.sqlite"), &url, ask).await?;
+    let opened = holder::open_with(&wallet, &chain, &mine.join("wallet.sqlite"), &url, ask).await?;
     ensure!(
         opened.phase == Phase::Funded
             && opened.price == price

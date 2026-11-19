@@ -1669,7 +1669,9 @@ async fn a_close_deposit_no_contract_binds_is_given_up_after_its_window() {
         net.deposits.deposit_status(&hash).unwrap().status.state,
         ReceiveState::Canceled
     );
-    let late = net.deposits.bind_close(close.script.as_bytes(), [1; 32], 3_000, 100, timeout);
+    let late = net
+        .deposits
+        .bind_close(close.script.as_bytes(), [1; 32], 3_000, 100, timeout);
     assert!(late.is_err(), "{late:?}");
 }
 

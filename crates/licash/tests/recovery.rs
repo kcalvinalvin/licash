@@ -293,13 +293,15 @@ fn merkle(mut hashes: Vec<[u8; 32]>) -> [u8; 32] {
     hashes[0]
 }
 
-/// v3's activation witnesses: their inclusions, unanchored.
-fn v3_activations(inclusions: Vec<Inclusion>) -> Vec<ActivationWitness> {
+/// Activation witnesses of locks that name Base's own checkpoint, the
+/// genesis block: their inclusions, anchored to it.
+fn base_activations(inclusions: Vec<Inclusion>) -> Vec<ActivationWitness> {
+    let genesis = Checkpoint::genesis(ChainProfile::Core30DefaultRegtest).unwrap();
     inclusions
         .into_iter()
         .map(|inclusion| ActivationWitness {
             inclusion,
-            anchor: None,
+            anchor: Some(genesis.clone()),
         })
         .collect()
 }
@@ -522,7 +524,7 @@ fn pending_sources_follow_activation_refund_and_preimage_rules() {
         Witness {
             notes: vec![settled_note.clone()],
             sources,
-            activations: v3_activations(activations),
+            activations: base_activations(activations),
             funded: vec![],
         }
     };
@@ -566,33 +568,25 @@ fn pending_sources_follow_activation_refund_and_preimage_rules() {
     assert_eq!((posted.values[0], &c.disclosures), (Z, &posted));
     assert!(counter(&p, &request, &activated, preimage([0; 32])).is_err());
 
-    // Without an advertised activation, expiry or input sharing voids the Pay.
+    // Without an advertised activation, input sharing voids the Pay, and
+    // expiry is no evidence: the statement can't see one, and a Pay with no
+    // activation is owed nothing as it stands.
     let (p, request) = publish(vec![]);
     let plain = witness(vec![]);
-    let c = counter(&p, &request, &plain, expired()).unwrap();
-    assert_eq!((c.mask, c.owed), (0b010, 8));
+    assert!(counter(&p, &request, &plain, expired()).is_err());
     assert_eq!(counter(&p, &request, &plain, shared).unwrap().mask, 0b010);
-    // The Hub can't shorten the chain to show an expiry it doesn't bury.
-    let short = Chain::verify(
-        chain.checkpoint().clone(),
-        &chain.checkpoint().commitment(),
-        (1..=5).map(|h| *chain.header(h).unwrap()).collect(),
-        100,
-    )
-    .unwrap();
-    assert!(decide(&o, &request, &p, &plain, &[expired()], Some(&short)).is_err());
 
     // An advertised activation must come with its inclusion.
     let (p, _) = publish(vec![record]);
     assert!(Filing::new(p, witness(vec![])).is_err());
 }
 
-/// Under v4 a lock's Pay is owed only with an activation, anchored to the
+/// A lock's Pay is owed only with an activation, anchored to the
 /// checkpoint the lock names: any block of the chain the statement reads,
 /// after Base's. Expiry is no evidence: without an activation the Pay is
 /// owed nothing, whether or not the lock expired.
 #[test]
-fn v4_owes_a_locks_pay_only_on_an_activation_anchored_to_its_checkpoint() {
+fn a_locks_pay_is_owed_only_on_an_activation_anchored_to_its_checkpoint() {
     let issuer = IssuerKeys::random(3).unwrap();
     let o = Opened {
         base: base(issuer.keyset().unwrap()),
@@ -704,7 +698,7 @@ fn v4_owes_a_locks_pay_only_on_an_activation_anchored_to_its_checkpoint() {
     assert_eq!((c.owed, c.ineligible), (8, None));
     let expired = Evidence::Expired { source: bob_id };
     let error = decide(&o, &request, &p, &full, &[expired], Some(&chain)).unwrap_err();
-    assert!(error.to_string().contains("under v4"), "{error}");
+    assert!(error.to_string().contains("voids nothing"), "{error}");
     // The anchored filing has its own magic, and decodes as it was.
     let bytes = Filing::new(p.clone(), full.clone())
         .unwrap()
@@ -715,7 +709,7 @@ fn v4_owes_a_locks_pay_only_on_an_activation_anchored_to_its_checkpoint() {
     for n in [bytes.len() - 1, bytes.len() - 40] {
         assert!(Filing::from_bytes(Format::Legacy, &keyset, LIMIT, &bytes[..n]).is_err());
     }
-    // Unanchored (as v3 files it), or anchored to another block than the
+    // Unanchored, or anchored to another block than the
     // lock names, the activation makes the claim ineligible.
     let ineligible = |w: &Witness| {
         decide(&o, &request, &p, w, &[], Some(&chain))
@@ -724,7 +718,7 @@ fn v4_owes_a_locks_pay_only_on_an_activation_anchored_to_its_checkpoint() {
     };
     assert!(ineligible(&witness(anchored(None)))
         .unwrap()
-        .contains("another Base version"));
+        .contains("without its lock checkpoint"));
     assert!(ineligible(&witness(anchored(Some(anchor(2))))).is_some());
     // On a chain that doesn't bury the activation at the lock's depth, too.
     let short = Chain::verify(
@@ -746,11 +740,11 @@ fn v4_owes_a_locks_pay_only_on_an_activation_anchored_to_its_checkpoint() {
     assert_eq!((c.owed, c.ineligible), (4, None));
 }
 
-/// Under v4 a lock's Refund is owed only once the chain judged reaches its
+/// A lock's Refund is owed only once the chain judged reaches its
 /// expiry at depth: before, she could take it and her payee activate the
 /// lock later, both owed. Then, as ever, its preimage voids it.
 #[test]
-fn v4_owes_a_locks_refund_only_once_it_expired_at_depth() {
+fn a_locks_refund_is_owed_only_once_it_expired_at_depth() {
     let issuer = IssuerKeys::random(3).unwrap();
     let o = Opened {
         base: base(issuer.keyset().unwrap()),
@@ -1121,7 +1115,9 @@ fn second_claim_of_an_input_voids_the_outputs_of_a_lock_of_the_holders_own_notes
         activations: vec![],
         funded: vec![],
     };
-    let owed = |e: &[Evidence]| decide(&o, &request, &p, &witness, e, None);
+    // Its refund is owed once the chain reaches the lock's expiry at depth.
+    let (chain, _) = activated_chain();
+    let owed = |e: &[Evidence]| decide(&o, &request, &p, &witness, e, Some(&chain));
     assert_eq!(owed(&[]).unwrap().owed, 8);
 
     // The locked note was claimed in another contract.
@@ -1313,7 +1309,7 @@ fn input_claim_conflicts_preserve_certified_outputs_but_retire_all_own_outputs()
         let witness = Witness {
             notes: vec![mint(&o.issuer, &keyset, &settled)],
             sources: vec![body],
-            activations: v3_activations(inclusions),
+            activations: base_activations(inclusions),
             funded: vec![],
         };
         (p, request, witness)
@@ -1811,7 +1807,7 @@ fn pending_items_are_eligible_by_their_sources_public_bodies() {
             Witness {
                 notes: vec![settled_note.clone()],
                 sources: bodies.clone(),
-                activations: v3_activations(inclusions),
+                activations: base_activations(inclusions),
                 funded: vec![],
             },
         )
@@ -1848,10 +1844,9 @@ fn pending_items_are_eligible_by_their_sources_public_bodies() {
     let c = owed(&activated, std::slice::from_ref(&preimage), &chain).unwrap();
     assert_eq!((c.mask, c.owed), (0b100, 8));
     assert_eq!(c.disclosures, disclosures(&[preimage]).unwrap());
-    // Without an advertised activation, expiry voids the Pay.
+    // Without an advertised activation, expiry is no evidence.
     let plain = file(items(*refund.blinding()), sources(terms()), vec![], vec![]);
-    let c = owed(&plain, &[Evidence::Expired { source: bob_id }], &chain).unwrap();
-    assert_eq!((c.mask, c.owed), (0b010, 8));
+    assert!(owed(&plain, &[Evidence::Expired { source: bob_id }], &chain).is_err());
 
     // What the holder can get wrong of a pending item leaves the claim owed
     // nothing: an activation the statement's chain doesn't bury at its
@@ -1898,76 +1893,6 @@ fn pending_items_are_eligible_by_their_sources_public_bodies() {
         &file(items(*refund.blinding()), sources(later), vec![], vec![]),
         &chain,
     );
-}
-
-#[test]
-fn a_filed_pay_of_a_lock_timed_on_another_checkpoint_is_owed_nothing() {
-    let o = open();
-    let keyset = o.base.parts().keyset.clone();
-    let (chain, _) = activated_chain();
-    let owed = |terms: TimedTerms| {
-        let payer = HoldRoot::from_seed(&[9; 32]).unwrap();
-        let note = mint(&o.issuer, &keyset, &derive(41, &payer, 4, 29, 0));
-        let notes = std::slice::from_ref(&note);
-        let pay = derive(SPEND, &hold(), 4, 61, 0);
-        let lock = TimedLock::new(terms, vec![bob(4, 1)]).unwrap();
-        let outputs = vec![Output::from_derivation(&pay).unwrap()];
-        let body = Proposal::new(&keyset, notes, point(43), outputs, Some(lock)).unwrap();
-        let owners = [owner(41, 29, 0)];
-        let signed =
-            SignedProposal::sign(&keyset, body, notes, Authorization::Plain, &owners).unwrap();
-        let cert = Certificate::attest(&o.issuer, &signed, notes).unwrap();
-        let items = vec![Item::Pending {
-            message: pay.message().clone(),
-            source: signed.proposal().id(),
-            branch: Branch::Pay,
-            index: 0,
-            blinding: *pay.blinding(),
-            preimage: Some(Z),
-        }];
-        let signers = [pay.clone()];
-        let unsigned = claim(&o, items, vec![Source::Admitted(cert)], vec![], &signers, 4);
-        let p = Publication::sign(unsigned, &hold_keys(&signers), LIMIT).unwrap();
-        let request = Request {
-            amount: 4,
-            claim_digest: *p.claim().digest(),
-        };
-        let filing = Filing::new(
-            p,
-            Witness {
-                notes: vec![],
-                sources: vec![SourceWitness::Certified {
-                    proposal: signed.proposal().clone(),
-                    signatures: signed.signatures().to_vec(),
-                }],
-                activations: vec![],
-                funded: vec![],
-            },
-        )
-        .unwrap();
-        recovery::owed(
-            &o.base,
-            &request,
-            &filing.to_bytes(Format::of(&o.base)),
-            &[],
-            &chain,
-        )
-        .unwrap()
-    };
-    let here = terms();
-    assert_eq!(
-        (owed(here.clone()).owed, owed(here.clone()).ineligible),
-        (4, None)
-    );
-    let hash = *here.hash();
-    let elsewhere = TimedTerms::new(here.profile(), [7; 32], 4, 3, hash).unwrap();
-    let mainnet = TimedTerms::new(ChainProfile::Core30Mainnet, *here.checkpoint(), 4, 3, hash);
-    for terms in [elsewhere, mainnet.unwrap()] {
-        let refused = owed(terms);
-        assert_eq!(refused.owed, 0);
-        let reason = refused.ineligible.unwrap();
-        assert!(reason.contains("another checkpoint"), "{reason}");
-    }
 }
 
 /// A v5 Base of `issuer`'s keyset whose holder funds it with `outputs`.
@@ -2574,10 +2499,7 @@ fn plain(o: &Opened, count: u32) -> Plain {
 
 fn lean_open() -> Opened {
     let issuer = IssuerKeys::random(3).unwrap();
-    let base = base_at(
-        issuer.keyset().unwrap(),
-        recovery::LEAN_FROM,
-    );
+    let base = base_at(issuer.keyset().unwrap(), recovery::LEAN_FROM);
     Opened { issuer, base }
 }
 
@@ -2590,10 +2512,7 @@ fn a_lean_claim_all_valid_is_owed_what_the_compact_filing_is() {
     let lean = lean_open();
     let compact = Opened {
         issuer: lean.issuer.clone(),
-        base: base_at(
-            lean.issuer.keyset().unwrap(),
-            recovery::COMPACT_FROM,
-        ),
+        base: base_at(lean.issuer.keyset().unwrap(), recovery::COMPACT_FROM),
     };
     assert_eq!(Format::of(&lean.base), Format::Lean);
     assert_eq!(Format::of(&compact.base), Format::Compact);
@@ -2702,10 +2621,7 @@ fn an_invalid_item_of_a_lean_claim_is_worth_nothing_and_the_rest_is_owed() {
     // Under the compact filing, the same forgery voids the whole claim.
     let compact = Opened {
         issuer: o.issuer.clone(),
-        base: base_at(
-            o.issuer.keyset().unwrap(),
-            recovery::COMPACT_FROM,
-        ),
+        base: base_at(o.issuer.keyset().unwrap(), recovery::COMPACT_FROM),
     };
     let s = plain(&compact, 4);
     let bytes = Filing::new(s.p, s.witness.clone())

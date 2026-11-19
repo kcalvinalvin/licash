@@ -767,7 +767,8 @@ pub struct Fit {
 }
 
 /// Why no contract absorbs a coin.
-pub const NO_FIT: &str = "no contract of this hub absorbs it whole: a coin pays the price and funds \
+pub const NO_FIT: &str =
+    "no contract of this hub absorbs it whole: a coin pays the price and funds \
      the rest of its part of the contract, leaving less than dust, and is not below the price or \
      beyond what its largest contract takes";
 
@@ -1109,9 +1110,19 @@ mod tests {
         // A coin short of the price, and one beyond the largest contract.
         assert_eq!(fits(25_000), None);
         assert_eq!(fits(100_000_000), None);
-        // Or of the cap she asks at least.
-        let asked = fit(&Pricing::Range(&range), 52_560, 1_000_000, 330, (&wide, 32), 2_000_000);
-        assert_eq!(asked, None);
+        // Or of the cap she asks at least: a cover at most 4 times the coin.
+        let asked = |least| {
+            fit(
+                &Pricing::Range(&range),
+                52_560,
+                1_000_000,
+                330,
+                (&wide, 32),
+                least,
+            )
+        };
+        assert_eq!(asked(2_000_000).map(|f| f.cap), Some(2_097_151));
+        assert_eq!(asked(5_000_000), None);
     }
 
     #[test]
@@ -1122,7 +1133,10 @@ mod tests {
             let fitted = fit(&Pricing::Range(&range), 52_560, coin, 330, (&wide, 32), 0)
                 .unwrap_or_else(|| panic!("no contract absorbs {coin}"));
             let paid = pays(&range, fitted);
-            assert!(paid <= coin && coin - paid < 330, "{coin}: {fitted:?} pays {paid}");
+            assert!(
+                paid <= coin && coin - paid < 330,
+                "{coin}: {fitted:?} pays {paid}"
+            );
             assert!(fitted.funded >= 1 && fitted.funded <= fitted.cap);
             assert!(licash_api::is_size(fitted.cap));
             // Her coin at most so many times what the cap needs: the hub's.
@@ -1146,7 +1160,14 @@ mod tests {
         }
         // A coin that only a part too large for them takes fits none.
         assert_eq!(
-            fit(&Pricing::Range(&range), 52_560, 8_000_000, 330, (&twos, 32), 0),
+            fit(
+                &Pricing::Range(&range),
+                52_560,
+                8_000_000,
+                330,
+                (&twos, 32),
+                0
+            ),
             None
         );
     }
@@ -1599,8 +1620,16 @@ mod tests {
         fn at(&self, height: u32) -> Block {
             let mut header = bitcoin::constants::genesis_block(bitcoin::Network::Regtest).header;
             (header.nonce, header.time) = (height, self.fork);
+            // A filter reads the coins a block spends but for its first
+            // transaction's, a coinbase's: F comes after one.
+            let coinbase = Transaction {
+                version: bitcoin::transaction::Version::TWO,
+                lock_time: bitcoin::absolute::LockTime::ZERO,
+                input: vec![bitcoin::TxIn::default()],
+                output: vec![],
+            };
             let txdata = match &self.f {
-                Some((at, tx)) if *at == height => vec![tx.clone()],
+                Some((at, tx)) if *at == height => vec![coinbase, tx.clone()],
                 _ => vec![],
             };
             Block { header, txdata }

@@ -1148,8 +1148,8 @@ impl Openings {
         )?;
         let keys = o.holder.request_keys()?;
         // The items of her filing it proves invalid, which it finds itself.
-        let invalid = licash_hp::flagged(&o.base, &keys, &exit, &evidence)
-            .map_err(|e| anyhow!("{e}"))?;
+        let invalid =
+            licash_hp::flagged(&o.base, &keys, &exit, &evidence).map_err(|e| anyhow!("{e}"))?;
         let input = licash_hp::HubInput {
             base: o.base.clone(),
             exit,

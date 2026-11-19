@@ -1251,13 +1251,19 @@ fn a_close_deposit_names_its_payment_and_timeout() {
         }),
     };
     let wire = serde_json::to_value(&close).unwrap();
-    assert_eq!(wire["close"], serde_json::json!({"pays": 20_000, "timeout": 5_000}));
+    assert_eq!(
+        wire["close"],
+        serde_json::json!({"pays": 20_000, "timeout": 5_000})
+    );
     assert_eq!(json(&close), close);
     let ordinary = Deposit {
         close: None,
         ..close
     };
-    assert!(serde_json::to_value(&ordinary).unwrap().get("close").is_none());
+    assert!(serde_json::to_value(&ordinary)
+        .unwrap()
+        .get("close")
+        .is_none());
     assert_eq!(json(&ordinary), ordinary);
 }
 

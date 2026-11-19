@@ -1029,7 +1029,8 @@ impl Deposits {
     /// in it: none if none does, rounding the fee up leaving a gap there,
     /// whatever the limits.
     pub fn paid_by(&self, pays: u64) -> Option<u64> {
-        self.most_for(pays).filter(|amount| self.pays(*amount) == Some(pays))
+        self.most_for(pays)
+            .filter(|amount| self.pays(*amount) == Some(pays))
     }
 
     /// The most notes a deposit locks that a payment of `pays` on Bitcoin

@@ -910,7 +910,7 @@ mod tests {
         assert!(store
             .row(&[2; 32])
             .err()
-            .is_some_and(|e| e.to_string().contains("format 2")));
+            .is_some_and(|e| e.to_string().contains(&format!("format {}", FORMAT - 1))));
         Ok(())
     }
 }

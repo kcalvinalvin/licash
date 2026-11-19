@@ -1820,8 +1820,13 @@ mod tests {
         // The default pays her reserve to the script she named, the hub its
         // share to its own.
         let (holder, hub_pub) = (keys.public(), hub_keys.public());
-        let babe = graph::build(&b, &holder, &hub_pub, graph::draft_hmsg(b.parts().recipe.kept))
-            .unwrap();
+        let babe = graph::build(
+            &b,
+            &holder,
+            &hub_pub,
+            graph::draft_hmsg(b.parts().recipe.kept),
+        )
+        .unwrap();
         let set = babe.presign(OutPoint::null()).unwrap();
         let default = set.iter().find(|p| p.name == "default").unwrap();
         assert_eq!(default.tx.output.len(), 2);
@@ -2200,11 +2205,12 @@ mod tests {
         let ao = a.signed().unwrap();
         let ho = h.signed().unwrap();
         assert_eq!(ao.funding, ho.funding);
-        // Ended with no exit, the default pays each its wallet's script,
-        // signed by both: the hub adds a fee coin to it.
+        // Ended with no exit, the default pays her reserve to the script her
+        // Base names and the hub its wallet's, signed by both: the hub adds
+        // a fee coin to it.
         let default = ho.default_close().unwrap();
         let reserve = Amount::from_sat(ao.base.parts().graph.reserve_alice);
-        assert_eq!(default.output[0].script_pubkey, wallet_script(5));
+        assert_eq!(default.output[0].script_pubkey, testing::close().script);
         assert_eq!(default.output[0].value, reserve);
         assert_eq!(default.output[1].script_pubkey, wallet_script(6));
         assert_eq!(

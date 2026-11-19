@@ -866,7 +866,10 @@ mod tests {
         // Cut anywhere in the keys, the notes or the close, or extended:
         // no Open.
         for cut in [1, 8, 9, 20, 73, 150] {
-            assert!(Open::decode(&encoded[..encoded.len() - cut]).is_err(), "{cut}");
+            assert!(
+                Open::decode(&encoded[..encoded.len() - cut]).is_err(),
+                "{cut}"
+            );
         }
         assert!(Open::decode(&[encoded.as_slice(), &[0]].concat()).is_err());
         // No funded notes at all.

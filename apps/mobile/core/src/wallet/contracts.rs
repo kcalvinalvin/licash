@@ -866,9 +866,9 @@ mod tests {
     fn a_contract_chosen_is_the_smallest_its_coin_takes_whole() {
         let range = crate::ContractRange::from(range());
         let wide: Vec<u64> = (0..32).map(|i| 1 << i).collect();
-        let fit = |coin, least| crate::contract_fit(range, 26_280, coin, least, 330, wide.clone(), 32);
-        let pays =
-            |cap, funded: u64| funded + crate::contract_price(range, cap, 26_280, funded);
+        let fit =
+            |coin, least| crate::contract_fit(range, 26_280, coin, least, 330, wide.clone(), 32);
+        let pays = |cap, funded: u64| funded + crate::contract_price(range, cap, 26_280, funded);
         // A coin of 70 k sat takes the least, 131 071 sat, all but the
         // price hers, and none of it left over.
         let small = fit(70_000, 131_071).unwrap();

@@ -841,7 +841,9 @@ impl Gateway {
                         .ok_or_else(|| Failure(Problem::invalid("the timeout overflows")))?;
                     let last = from.saturating_add(MAX_CLOSE_BLOCKS);
                     if close.timeout <= first || close.timeout > last {
-                        return Err(refused("a timeout outside what the hub keeps a deposit for"));
+                        return Err(refused(
+                            "a timeout outside what the hub keeps a deposit for",
+                        ));
                     }
                     close.timeout
                 }
@@ -954,13 +956,21 @@ impl Gateway {
         {
             return Err("the deposit is not as the contract's close names it".into());
         }
-        let scanned = self.store.top().map_err(store_err)?.map(|(height, _)| height);
+        let scanned = self
+            .store
+            .top()
+            .map_err(store_err)?
+            .map(|(height, _)| height);
         if record.state != ReceiveState::Open
             || scanned.is_none_or(|height| height > record.fund_by)
         {
             return Err("the deposit was kept for its window only, which is over".into());
         }
-        match self.store.bind(&record.hash, &contract).map_err(store_err)? {
+        match self
+            .store
+            .bind(&record.hash, &contract)
+            .map_err(store_err)?
+        {
             true => Ok(()),
             false => Err("the deposit is another contract's".into()),
         }
@@ -971,8 +981,12 @@ impl Gateway {
     pub fn release_close(&self, contract: &[u8; 32]) {
         match self.store.release(contract) {
             Ok(0) => {}
-            Ok(_) => tracing::info!(contract = %hex::encode(contract), "a contract's close deposit given up"),
-            Err(e) => tracing::warn!(contract = %hex::encode(contract), "cannot give up a close deposit: {e}"),
+            Ok(_) => {
+                tracing::info!(contract = %hex::encode(contract), "a contract's close deposit given up")
+            }
+            Err(e) => {
+                tracing::warn!(contract = %hex::encode(contract), "cannot give up a close deposit: {e}")
+            }
         }
     }
 

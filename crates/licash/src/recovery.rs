@@ -868,12 +868,7 @@ fn void(
 /// refunded. And its Refund item counts only once the chain judged, to
 /// `judged`, reaches its expiry at depth: any activation is buried by
 /// then, so the Hub holds its preimage, and can't be owed the Pay later.
-fn live(
-    claim: &UnsignedClaim,
-    mask: u32,
-    executed: &BTreeSet<ProposalId>,
-    judged: u32,
-) -> u32 {
+fn live(claim: &UnsignedClaim, mask: u32, executed: &BTreeSet<ProposalId>, judged: u32) -> u32 {
     let sources: BTreeMap<_, _> = claim.parts().sources.iter().map(|s| (s.id(), s)).collect();
     let activated: BTreeSet<_> = claim.parts().activations.iter().map(|a| a.source).collect();
     let mut live = 0u128;
@@ -1426,12 +1421,7 @@ fn judged(
     };
     let (mask, executed) = void(&parts.keyset, claim, evidence)?;
     Ok(Owed {
-        owed: live(
-            claim,
-            mask | invalid,
-            &executed,
-            chain.tip_height(),
-        ),
+        owed: live(claim, mask | invalid, &executed, chain.tip_height()),
         mask,
         invalid,
         disclosures: disclosures(evidence)?,

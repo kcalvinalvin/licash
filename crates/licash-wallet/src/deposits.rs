@@ -29,9 +29,7 @@ use licash::{
     crypto::{scalar_from_hash, tagged_hash},
     spend::{lock_hash, ProposalId},
 };
-use licash_api::{
-    CloseTerms, Code, DepositStatus, Depositing, Hex, Info, Receive, ReceiveState,
-};
+use licash_api::{CloseTerms, Code, DepositStatus, Depositing, Hex, Info, Receive, ReceiveState};
 use licash_onchain::deposit::Htlc;
 use rand_core::{OsRng, RngCore};
 use rusqlite::{params, OptionalExtension, Row};
@@ -222,7 +220,9 @@ impl<T: Transport> Wallet<T> {
                 ))
             })?;
         let close = CloseTerms { pays, timeout };
-        let deposit = self.deposit_answered(hub, &info, amount, Some(close)).await?;
+        let deposit = self
+            .deposit_answered(hub, &info, amount, Some(close))
+            .await?;
         let network = licash_onchain::network(self.network());
         let script = deposit
             .terms

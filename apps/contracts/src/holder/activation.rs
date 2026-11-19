@@ -382,9 +382,7 @@ pub(super) fn claimant<T: Transport>(
         let (state, _) = store.state(&c.id)?;
         let opening = Holder::load(&state, &seed, &ctx)?.signed()?;
         let parts = opening.base.parts();
-        if parts.chain.checkpoint.height() > anchor.height()
-            || *parts.keyset.id() != o.keyset
-        {
+        if parts.chain.checkpoint.height() > anchor.height() || *parts.keyset.id() != o.keyset {
             continue;
         }
         let force_at = exit::planned_force_at(&seed, network, wallet_file, &c.id, tip)?;

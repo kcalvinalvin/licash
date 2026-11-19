@@ -1235,8 +1235,14 @@ fn command(cli: Cli) -> anyhow::Result<()> {
                     licash_hub_service::open_on_lock_checkpoints(&openings, hub.clone());
                     // The deposits her reserve returns to, bound to her
                     // contract, where the hub takes deposits.
-                    if let Some(deposits) = &deposits {
-                        licash_hub_service::close_with_deposits(&openings, deposits.clone());
+                    match &deposits {
+                        Some(deposits) => {
+                            licash_hub_service::close_with_deposits(&openings, deposits.clone())
+                        }
+                        None => tracing::warn!(
+                            "contracts are on and deposits are not (--deposit-sweep-address): no \
+                             contract opens, for none has a deposit to return its holder's reserve to"
+                        ),
                     }
                     // Its prover not ready, failing or short of time, a
                     // notification.
