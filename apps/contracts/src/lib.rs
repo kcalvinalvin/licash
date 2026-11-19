@@ -93,6 +93,8 @@ pub const FUNDED: &str = "/v1/contracts/openings/{id}/funded";
 /// The most bytes a request or an answer of an opening holds.
 pub const MAX_BODY: usize = 64 << 20;
 
+pub use licash_contract::reserve;
+
 /// What a hub opens contracts on: its quote, whose checkpoint is a recent
 /// block of its chain, and how far beyond it a holder may ask.
 #[derive(Clone)]
@@ -119,6 +121,13 @@ impl Offer {
         };
         r.end()?;
         Ok(Self { quote, bounds })
+    }
+
+    /// The rate her reserve affords a forced close of the most notes a
+    /// claim files, in sat/vB ([`licash_contract::reserve`]): what is held
+    /// to a floor on mainnet, and what she may weigh anywhere.
+    pub fn forced_close_rate(&self) -> f64 {
+        licash_contract::reserve::affordable_rate_at_most(&self.quote.graph) as f64 / 1_000.0
     }
 
     /// What opening on it costs the holder, in sat: her reserve and the

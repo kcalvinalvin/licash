@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use anyhow::{ensure, Context, Result};
 use bitcoin::Amount;
+use licash::recovery::Format;
 use licash::spend::ChainProfile;
 use licash_chain_client::Source;
 use licash_contracts::holder::{self, Ask, Contract, Fate, Node, Phase};
@@ -778,11 +779,18 @@ async fn a_holder_forces_her_contract_closed_on_a_silent_hub_and_takes_her_notes
         vout,
     };
     ensure!(spent == [of_r(2), of_r(1), of_r(3)], "{p:?}");
-    eprintln!(
-        "R {} vB, P {} vB, purse {} sat",
-        r.vsize(),
-        p.vsize(),
-        r.output[3].value
+    // The reserve's model weighs them as measured (7 notes, compact): a
+    // forced close the quote's reserve affords is one that confirms.
+    let model = licash_contracts::reserve::publication_vsize(Format::Compact, 7);
+    ensure!(
+        r.vsize() as u64 <= licash_contracts::reserve::R_VSIZE,
+        "R weighs {} vB",
+        r.vsize()
+    );
+    ensure!(
+        (model - 20..=model).contains(&(p.vsize() as u64)),
+        "P weighs {} vB, the model {model}",
+        p.vsize()
     );
 
     // Nothing to do until it passes; then request_timeout, paid of P's

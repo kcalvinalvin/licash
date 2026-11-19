@@ -199,6 +199,11 @@ async fn open_once<T: Transport, C: Chain>(
         "{hub} asks {price} sat to open, more than {}",
         ask.max_price
     );
+    tracing::info!(
+        %hub,
+        rate = offer.forced_close_rate(),
+        "her reserve affords a forced close of the most notes at this rate (sat/vB)"
+    );
     let tip = chain.height().await.map_err(|e| anyhow!(e))?;
     let at = offer.quote.chain.checkpoint.height();
     ensure!(
@@ -509,6 +514,8 @@ pub struct Inspection {
     pub payout_pool: u64,
     pub holder_reserve: u64,
     pub hub_reserve: u64,
+    /// What her reserve affords a forced close of the most notes, sat/vB.
+    pub forced_close_rate: f64,
     pub claim_limit: u32,
     pub note_limit: u32,
     pub denominations: Vec<u64>,
@@ -565,6 +572,8 @@ fn inspection(
         payout_pool: u64::from(parts.graph.maximum_amount()?),
         holder_reserve: parts.graph.reserve_alice,
         hub_reserve: parts.graph.reserve_hub,
+        forced_close_rate: licash_contract::reserve::affordable_rate_at_most(&parts.graph) as f64
+            / 1_000.0,
         claim_limit: parts.cap,
         note_limit: parts
             .limits

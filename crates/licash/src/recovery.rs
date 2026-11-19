@@ -63,7 +63,12 @@ pub enum Format {
 
 impl Format {
     pub fn of(base: &Base) -> Self {
-        match base.parts().graph.id >= COMPACT_FROM {
+        Self::at(base.parts().graph.id)
+    }
+
+    /// The format of the contracts of graph `id`.
+    pub fn at(id: u32) -> Self {
+        match id >= COMPACT_FROM {
             true => Self::Compact,
             false => Self::Legacy,
         }

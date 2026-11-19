@@ -122,6 +122,10 @@ pub struct Floors {
     pub to_self_delay: u16,
     pub funding_depth: u32,
     pub work_depth: u32,
+    /// The rate in sat per 1,000 vB her reserve must afford a forced close
+    /// of the most notes a claim files ([`crate::reserve`]); none asked on
+    /// the test networks, whose fees are what they are.
+    pub reserve_rate: u64,
 }
 impl Floors {
     pub fn of(profile: ChainProfile) -> Self {
@@ -131,6 +135,13 @@ impl Floors {
                 ChainProfile::Core30Mainnet | ChainProfile::Core30Signet => (144, 6, 144, 3, 6),
                 ChainProfile::Mutinynet => (2880, 24, 2880, 6, 24),
             };
+        // Mainnet: 10 sat/vB, so that a forced close of the filing at its
+        // widest gets confirmed in a fee market short of a spike. A bug or
+        // a wrong estimate can spend no more than the reserve in any case.
+        let reserve_rate = match profile {
+            ChainProfile::Core30Mainnet => 10_000,
+            _ => 0,
+        };
         Self {
             challenge_window,
             contest_window: challenge_window,
@@ -138,6 +149,7 @@ impl Floors {
             to_self_delay,
             funding_depth,
             work_depth,
+            reserve_rate,
         }
     }
 }
@@ -183,6 +195,13 @@ impl Quote {
         ensure!(
             self.recipe.instances <= MAX_INSTANCES,
             "too many garbled instances"
+        );
+        let afforded = crate::reserve::affordable_rate_at_most(&self.graph);
+        ensure!(
+            afforded >= f.reserve_rate,
+            "her reserve affords a forced close {:.1} sat/vB, not {:.1} at least",
+            afforded as f64 / 1_000.0,
+            f.reserve_rate as f64 / 1_000.0
         );
         Ok(())
     }

@@ -12,6 +12,7 @@ pub mod dispute;
 pub mod graph;
 pub mod keys;
 pub mod opening;
+pub mod reserve;
 pub mod wire;
 
 /// The most instances a holder garbles for an opening: what the hub may

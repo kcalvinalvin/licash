@@ -88,6 +88,13 @@ const RETURNED: Payout = Payout::Other("returned");
 /// were signed.
 pub const RETURNING: u32 = 8;
 
+/// The purse of a graph with these reserves ([`Spec::purse`]): her reserve
+/// less the dust limit, half of the hub's at most; none if it would be dust.
+pub fn purse(reserve_alice: Amount, reserve_hub: Amount, dust: Amount) -> Option<Amount> {
+    let purse = (reserve_alice.checked_sub(dust)?).min(reserve_hub / 2);
+    (purse >= dust).then_some(purse)
+}
+
 /// Where `request` pays the holder her purse ([`Spec::purse`]), after its
 /// slot.
 pub const PURSE_VOUT: u32 = SLOT_VOUT + 1;
@@ -313,9 +320,11 @@ impl Spec {
     /// for the links' floors (on [`RETURNED`] too, which refunds it of the
     /// hub's reserve). None if it would be dust.
     fn purse(&self) -> Option<Amount> {
-        let dust = self.params.dust;
-        let purse = (self.terms.reserve_alice.checked_sub(dust)?).min(self.terms.reserve_hub / 2);
-        (purse >= dust).then_some(purse)
+        purse(
+            self.terms.reserve_alice,
+            self.terms.reserve_hub,
+            self.params.dust,
+        )
     }
 
     /// `request`'s slot: the holder's `publish`, any time, a transaction
