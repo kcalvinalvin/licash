@@ -247,6 +247,7 @@ pub fn router(hub: Arc<Hub>, services: Services) -> Router {
             Router::new()
                 .route(licash_api::DEPOSIT, post(deposit))
                 .route(licash_api::DEPOSIT_STATE, get(deposit_state))
+                .route(licash_api::DEPOSIT_LOCK, post(deposit_lock))
                 .with_state(deposits),
         );
     }
@@ -518,6 +519,14 @@ async fn deposit_state(
 ) -> Answer<DepositStatus> {
     let hash = licash_api::hash_of(&hash)?;
     Ok(Json(deposits.deposit_status(&hash)?))
+}
+
+async fn deposit_lock(
+    State(deposits): State<Arc<deposit::Gateway>>,
+    Path(hash): Path<String>,
+) -> Answer<DepositStatus> {
+    let hash = licash_api::hash_of(&hash)?;
+    Ok(Json(deposits.ask_lock(&hash)?))
 }
 
 /// The tweaks of the blocks asked for, answered as never changing once

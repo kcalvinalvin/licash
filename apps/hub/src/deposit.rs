@@ -208,9 +208,31 @@ CREATE TABLE deposit_blocks (
 ) STRICT;
 ";
 
+/// The deposits that return a contract's reserve, a component of their own
+/// so that a file made before them takes it as a table not yet made, and its
+/// deposits as the ordinary ones they were.
+const CLOSES: &str = "deposit_closes";
+const CLOSES_VERSION: i64 = 1;
+
+const CLOSES_SCHEMA: &str = "
+-- A deposit that a contract's default close pays her reserve to
+-- (`licash_api::CloseTerms`), one row each: its contract once the hub's
+-- contracts bound it (until then the hub keeps it for a window only), and
+-- when its wallet asked for the lock, which no payment starts.
+CREATE TABLE deposit_closes (
+    hash BLOB PRIMARY KEY REFERENCES deposits (hash),
+    contract BLOB UNIQUE CHECK (length(contract) = 32),
+    asked_at INTEGER
+) STRICT;
+";
+
 /// Scanned blocks kept below the newest, to find where a reorganization
 /// forked.
 const KEPT_BLOCKS: u32 = 1_000;
+
+/// The most blocks ahead of the hub's tip the timeout of a deposit that
+/// returns a contract's reserve may be: some two years.
+const MAX_CLOSE_BLOCKS: u32 = 105_120;
 
 /// The gateway's deposits, in the hub's database.
 struct Store(Mutex<Connection>);
@@ -230,15 +252,27 @@ struct Record {
     sweep: Option<Vec<u8>>,
     spent_by: Option<Txid>,
     state: ReceiveState,
+    /// Set if it returns a contract's reserve.
+    close: Option<CloseState>,
+}
+
+/// Where a deposit that returns a contract's reserve stands.
+#[derive(Clone, Debug)]
+struct CloseState {
+    /// The contract that names it, once the hub's contracts bound it.
+    contract: Option<[u8; 32]>,
+    /// Whether its wallet asked for the lock.
+    asked: bool,
 }
 
 const RECORDS: &str = "SELECT d.hash, d.body, d.amount, d.pays, d.claim_key, d.refund_key,
     d.timeout_height, d.fund_by_height, f.txid, f.vout, f.height, d.lock, d.preimage, w.tx,
-    p.txid, d.state
+    p.txid, d.state, c.hash, c.contract, c.asked_at
     FROM deposits d
     LEFT JOIN deposit_fundings f ON f.hash = d.hash
     LEFT JOIN deposit_sweeps w ON w.hash = d.hash
-    LEFT JOIN deposit_spends p ON p.hash = d.hash";
+    LEFT JOIN deposit_spends p ON p.hash = d.hash
+    LEFT JOIN deposit_closes c ON c.hash = d.hash";
 
 /// The key in column `i` of `r`.
 fn x_only(r: &Row<'_>, i: usize) -> rusqlite::Result<XOnlyPublicKey> {
@@ -267,6 +301,13 @@ fn record(r: &Row<'_>) -> rusqlite::Result<Record> {
         "settled" => ReceiveState::Settled,
         _ => ReceiveState::Canceled,
     };
+    let close = match r.get::<_, Option<[u8; 32]>>(16)? {
+        None => None,
+        Some(_) => Some(CloseState {
+            contract: r.get(17)?,
+            asked: r.get::<_, Option<i64>>(18)?.is_some(),
+        }),
+    };
     Ok(Record {
         hash,
         body: r.get(1)?,
@@ -287,6 +328,7 @@ fn record(r: &Row<'_>) -> rusqlite::Result<Record> {
         sweep: r.get(13)?,
         spent_by: r.get::<_, Option<[u8; 32]>>(14)?.map(Txid::from_byte_array),
         state,
+        close,
     })
 }
 
@@ -301,6 +343,7 @@ impl Store {
     fn open(path: &Path) -> anyhow::Result<Self> {
         let mut conn = licash_store::open(path, Kind::Hub)?;
         licash_store::component(&mut conn, COMPONENT, VERSION, SCHEMA)?;
+        licash_store::component(&mut conn, CLOSES, CLOSES_VERSION, CLOSES_SCHEMA)?;
         Ok(Self(Mutex::new(conn)))
     }
 
@@ -325,7 +368,9 @@ impl Store {
     }
 
     /// Record a deposit unless one under its hash is, or `most` are
-    /// asked and not paid: false then.
+    /// asked and not paid: false then. Those bound to a contract are not
+    /// counted: a contract limits them. One that returns a contract's
+    /// reserve (`close`) is recorded as such, in the same write.
     fn insert(
         &self,
         body: &str,
@@ -334,13 +379,18 @@ impl Store {
         htlc: &Htlc,
         fund_by: u32,
         most: u32,
+        close: bool,
     ) -> rusqlite::Result<bool> {
-        let conn = self.conn();
-        let inserted = conn.execute(
+        let mut conn = self.conn();
+        let tx = licash_store::begin(&mut conn)?;
+        let inserted = tx.execute(
             "INSERT INTO deposits (hash, body, amount, pays, claim_key, refund_key,
                  timeout_height, fund_by_height, script, state, created_at)
              SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'open', ?10
-             WHERE (SELECT count(*) FROM deposits WHERE state = 'open' AND done_at IS NULL) < ?11
+             WHERE (SELECT count(*) FROM deposits d
+                    WHERE d.state = 'open' AND d.done_at IS NULL
+                      AND NOT EXISTS (SELECT 1 FROM deposit_closes c
+                                      WHERE c.hash = d.hash AND c.contract IS NOT NULL)) < ?11
              ON CONFLICT DO NOTHING",
             params![
                 htlc.hash,
@@ -356,7 +406,58 @@ impl Store {
                 most,
             ],
         )?;
+        if inserted == 1 && close {
+            tx.execute(
+                "INSERT INTO deposit_closes (hash) VALUES (?1)",
+                params![htlc.hash],
+            )?;
+        }
+        tx.commit()?;
         Ok(inserted == 1)
+    }
+
+    /// The deposit paid to `script`, live.
+    fn by_script(&self, script: &[u8]) -> rusqlite::Result<Option<Record>> {
+        let conn = self.conn();
+        conn.query_row(
+            &format!("{RECORDS} WHERE d.script = ?1 AND d.done_at IS NULL"),
+            [script],
+            record,
+        )
+        .optional()
+    }
+
+    /// Bind the deposit under `hash` that returns a contract's reserve to
+    /// `contract`, and keep it till its timeout, a payment being its
+    /// default's: false if it is not one, or another contract's.
+    fn bind(&self, hash: &[u8; 32], contract: &[u8; 32]) -> rusqlite::Result<bool> {
+        let mut conn = self.conn();
+        let tx = licash_store::begin(&mut conn)?;
+        let bound = tx.execute(
+            "UPDATE deposit_closes SET contract = ?2
+             WHERE hash = ?1 AND (contract IS NULL OR contract = ?2)",
+            params![hash, contract],
+        )?;
+        if bound == 1 {
+            tx.execute(
+                "UPDATE deposits SET fund_by_height = timeout_height WHERE hash = ?1",
+                params![hash],
+            )?;
+        }
+        tx.commit()?;
+        Ok(bound == 1)
+    }
+
+    /// Record that the wallet of the deposit under `hash` that returns a
+    /// contract's reserve asked for the lock: false if it is none, or not
+    /// bound.
+    fn ask(&self, hash: &[u8; 32]) -> rusqlite::Result<bool> {
+        let asked = self.conn().execute(
+            "UPDATE deposit_closes SET asked_at = coalesce(asked_at, ?2)
+             WHERE hash = ?1 AND contract IS NOT NULL",
+            params![hash, sql(now())?],
+        )?;
+        Ok(asked == 1)
     }
 
     fn set(
@@ -663,15 +764,26 @@ impl Gateway {
         if outputs.is_empty() || amount < c.min || amount > c.max {
             return Err(refused("outside the amounts the hub takes in deposits"));
         }
-        let pays = amount
-            .checked_add(c.fee.due(amount))
-            .filter(|pays| Amount::from_sat(*pays) <= Amount::MAX_MONEY)
-            .ok_or_else(|| Failure(Problem::invalid("the amount overflows")))?;
+        let pays = match &body.close {
+            None => amount
+                .checked_add(c.fee.due(amount))
+                .filter(|pays| Amount::from_sat(*pays) <= Amount::MAX_MONEY)
+                .ok_or_else(|| Failure(Problem::invalid("the amount overflows")))?,
+            // The reserve exactly, the notes the most it covers: the rest
+            // is the hub's, which she agreed to in her contract.
+            Some(close) => {
+                if self.advertise().most_for(close.pays) != Some(amount) {
+                    return Err(refused("not the most notes this payment covers"));
+                }
+                close.pays
+            }
+        };
         let refund = XOnlyPublicKey::from_slice(&body.refund.0)
             .map_err(|_| Failure(Problem::invalid("refund: not an x-only public key")))?;
         let canonical = Deposit {
             receive: Receive::new(&keyset, &ephemeral, &outputs, &hash),
             refund: Hex(refund.serialize().to_vec()),
+            close: body.close,
         };
         let canonical = serde_json::to_string(&canonical).expect("a deposit serializes");
         let turn = self.peer.turn().await;
@@ -696,10 +808,25 @@ impl Gateway {
                 .claim_key(&hash)?
                 .x_only_public_key(&Secp256k1::new())
                 .0;
-            let timeout = c
-                .timeout_blocks(self.lock_depth())
-                .and_then(|blocks| from.checked_add(blocks))
-                .ok_or_else(|| Failure(Problem::invalid("the deposit's timeout overflows")))?;
+            let timeout = match &body.close {
+                None => c
+                    .timeout_blocks(self.lock_depth())
+                    .and_then(|blocks| from.checked_add(blocks))
+                    .ok_or_else(|| Failure(Problem::invalid("the deposit's timeout overflows")))?,
+                // Where her contract's Base puts it: beyond the window the
+                // hub gives it to be bound, and not so far as to be kept
+                // for years.
+                Some(close) => {
+                    let first = from
+                        .checked_add(c.window)
+                        .ok_or_else(|| Failure(Problem::invalid("the timeout overflows")))?;
+                    let last = from.saturating_add(MAX_CLOSE_BLOCKS);
+                    if close.timeout <= first || close.timeout > last {
+                        return Err(refused("a timeout outside what the hub keeps a deposit for"));
+                    }
+                    close.timeout
+                }
+            };
             let htlc = Htlc {
                 hash,
                 claim,
@@ -709,7 +836,15 @@ impl Gateway {
             let fund_by = from.saturating_add(c.window);
             let inserted = self
                 .store
-                .insert(&canonical, amount, pays, &htlc, fund_by, c.max_open)
+                .insert(
+                    &canonical,
+                    amount,
+                    pays,
+                    &htlc,
+                    fund_by,
+                    c.max_open,
+                    body.close.is_some(),
+                )
                 .map_err(store_down)?;
             if !inserted && self.store.get(&hash).map_err(store_down)?.is_none() {
                 return Err(Failure(Problem::new(
@@ -767,6 +902,69 @@ impl Gateway {
             request: serde_json::from_str(&record.body).ok(),
             terms: Some(self.terms(&record)),
         })
+    }
+
+    /// Bind the deposit paid to `script` to the contract `contract`, whose
+    /// default pays it `pays` (the reserve) at `timeout`, the hub keeping
+    /// `fee` of it: refused unless it is a deposit that returns a contract's
+    /// reserve, asked for just so, still open within its window, and not
+    /// another contract's. The same again for the same contract.
+    pub fn bind_close(
+        &self,
+        script: &[u8],
+        contract: [u8; 32],
+        pays: u64,
+        fee: u64,
+        timeout: u32,
+    ) -> Result<(), String> {
+        let store_err = |e: rusqlite::Error| e.to_string();
+        let record = self
+            .store
+            .by_script(script)
+            .map_err(store_err)?
+            .ok_or("no such deposit of the hub's")?;
+        let Some(close) = &record.close else {
+            return Err("the hub's deposit is no contract's close".into());
+        };
+        if close.contract.is_some_and(|bound| bound != contract) {
+            return Err("the deposit is another contract's".into());
+        }
+        if record.pays != pays
+            || record.htlc.timeout != timeout
+            || record.amount.checked_add(fee) != Some(pays)
+        {
+            return Err("the deposit is not as the contract's close names it".into());
+        }
+        let scanned = self.store.top().map_err(store_err)?.map(|(height, _)| height);
+        if record.state != ReceiveState::Open
+            || scanned.is_none_or(|height| height > record.fund_by)
+        {
+            return Err("the deposit was kept for its window only, which is over".into());
+        }
+        match self.store.bind(&record.hash, &contract).map_err(store_err)? {
+            true => Ok(()),
+            false => Err("the deposit is another contract's".into()),
+        }
+    }
+
+    /// Ask for the lock of the deposit under `hash` that returns a contract's
+    /// reserve, bound to its contract: once its payment is buried, the hub
+    /// locks its notes to its wallet, if that leaves it time to claim the
+    /// coins before the timeout. The same again for the same.
+    pub fn ask_lock(&self, hash: &[u8; 32]) -> Result<DepositStatus, Failure> {
+        let record = self.store.get(hash).map_err(store_down)?.ok_or_else(|| {
+            Failure(Problem::new(
+                Code::UnknownLock,
+                "no deposit under this hash",
+            ))
+        })?;
+        if record.close.is_none() {
+            return Err(refused("a deposit that returns no contract's reserve"));
+        }
+        if !self.store.ask(hash).map_err(store_down)? {
+            return Err(refused("a deposit no contract of the hub's names"));
+        }
+        self.deposit_status(hash)
     }
 
     /// The key the hub claims the deposit under `hash` with.
@@ -903,6 +1101,15 @@ impl Gateway {
             return Ok(());
         };
         if scanned.saturating_sub(height).saturating_add(1) < self.config.depth {
+            return Ok(());
+        }
+        // A contract's close waits for its wallet, which comes back after the
+        // close: no lock is made for it, nor is it given up, till it asks.
+        if record.close.as_ref().is_some_and(|close| !close.asked) {
+            if record.spent_by.is_some() || scanned > record.htlc.timeout {
+                tracing::info!(hash = %name, "a contract's close never asked for: its payer takes the coins back");
+                return self.finish(record, "canceled");
+            }
             return Ok(());
         }
         let body: Deposit = serde_json::from_str(&record.body).map_err(|_| store_gone())?;
