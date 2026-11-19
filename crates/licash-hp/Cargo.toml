@@ -1,5 +1,5 @@
 # The Hub's statement on Lichen's hub-proves exit: what Bitcoin shows of
-# the exit (lichen-statement) and what the claim it carries is owed
+# the exit (licash-statement) and what the claim it carries is owed
 # (licash::recovery::owed). The guest r0/hp-guest proves it; the Hub
 # evaluates it natively to decide its response.
 [package]
@@ -17,10 +17,10 @@ workspace = "../../regtest"
 # HASH160, her request's one-time signatures' chains (licash's own version)
 bitcoin = { version = "=0.32.102", default-features = false, features = ["std"] }
 licash = { path = "../licash" }
-lichen-statement = { git = "https://github.com/lichenbtc-org/lichen", branch = "feat/hub-proves-exit" }
+licash-statement = { path = "../licash-statement" }
 sha2 = "0.10"
 
 [dev-dependencies]
 bitcoin = { version = "=0.32.102", default-features = false, features = ["std"] }
 k256 = { version = "0.13", features = ["hash2curve"] }
-lichen-statement = { git = "https://github.com/lichenbtc-org/lichen", branch = "feat/hub-proves-exit", features = ["testing"] }
+licash-statement = { path = "../licash-statement", features = ["testing"] }

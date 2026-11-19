@@ -1,7 +1,7 @@
 //! The Hub's statement guest (`licash_hp::check`): "the claim the
 //! holder's publication carries is owed at most the response's `b′`". Its
 //! input, read raw: `HubInput::to_bytes`. Its journal
-//! (`lichen_statement::Contract::journal`), fixed at the contract's
+//! (`licash_statement::Contract::journal`), fixed at the contract's
 //! opening: `c ‖ H("licash/hp/word" ‖ Base digest) ‖ H(O_D ‖ checkpoint ‖ W)`.
 
 use licash_hp::{check, HubInput};

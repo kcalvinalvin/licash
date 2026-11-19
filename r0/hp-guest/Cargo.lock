@@ -980,7 +980,7 @@ version = "0.0.1"
 dependencies = [
  "bitcoin",
  "licash",
- "lichen-statement",
+ "licash-statement",
  "sha2",
 ]
 
@@ -993,9 +993,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "lichen-statement"
-version = "0.1.0"
-source = "git+https://github.com/lichenbtc-org/lichen?branch=feat%2Fhub-proves-exit#f5c606114158897b05a1117f8f0e7de69c57df5a"
+name = "licash-statement"
+version = "0.0.1"
 dependencies = [
  "sha2",
 ]

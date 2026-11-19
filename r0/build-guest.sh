@@ -49,9 +49,8 @@ if [ "$rustc_commit" != "$pinned_rustc" ] || [ "$gcc_version" != "$pinned_gcc" ]
 fi
 # The guest's sources as the checkout has them, uncommitted changes and
 # all: the root manifest (crates/licash inherits from it), the crates the
-# guest depends on, and the guest. Lichen's statement crate comes from git,
-# at the revision the guest's Cargo.lock pins, under cargo's directory.
-sources=(Cargo.toml crates/licash crates/licash-hp "r0/$dir")
+# guest depends on, and the guest.
+sources=(Cargo.toml crates/licash crates/licash-hp crates/licash-statement "r0/$dir")
 if [ -n "$(git status --porcelain -- "${sources[@]}")" ]; then
     echo "uncommitted changes in the guest's sources: not a guest to keep" >&2
 fi

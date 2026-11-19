@@ -8,8 +8,9 @@
 - `host/`: packs, executes and proves it. Every command also runs
   `licash_hp::check` natively and fails when the guest disagrees with it.
 
-Each is a workspace of its own. The guest takes Lichen's statement crate
-from git, at the revision its `Cargo.lock` pins.
+Each is a workspace of its own. The guest reads the exit with
+`crates/licash-statement` (what Bitcoin shows of it on Lichen's hub-proves
+graph), a path dependency as `crates/licash-hp` is.
 
 ## Prerequisites
 

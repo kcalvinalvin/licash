@@ -75,7 +75,7 @@ impl Format {
     }
 }
 /// A filing's limit: its bytes fit Lichen's claim carrier
-/// (`lichen_statement::claim_script`), which Core relays under default
+/// (`licash_statement::claim_script`), which Core relays under default
 /// policy.
 pub const MAX_PUBLICATION_BYTES: usize = 64_000;
 const MAX_CERTIFICATE_BYTES: usize = 8_192;
@@ -917,7 +917,7 @@ pub struct ActivationWitness {
 
 /// A claim as filed on Bitcoin under the hub-proves model: P and its public
 /// witness W, `LICASH-F\x01 ‖ P ‖ W`, which the holder's publication
-/// carries after R (Lichen's claim slot, `lichen_statement::claim_script`).
+/// carries after R (Lichen's claim slot, `licash_statement::claim_script`).
 /// Its activations anchored, `LICASH-F\x02 ‖ P ‖ W`, each activation's
 /// inclusion followed by its anchor; and of a claim of funded items,
 /// `LICASH-F\x03 ‖ P ‖ W`, anchored so, the funded outputs last.

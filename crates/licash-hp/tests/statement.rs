@@ -16,7 +16,7 @@ use licash::{
     spend::{ChainProfile, Output, Proposal},
 };
 use licash_hp::{check, contract, decide, HubInput, Refusal, RequestKeys, C};
-use lichen_statement::{
+use licash_statement::{
     btc::{bare_tx, sha256d, Header, OutPoint},
     checksum_digits,
     testing::{headers_on, published, request_on, request_witness, respond_block},

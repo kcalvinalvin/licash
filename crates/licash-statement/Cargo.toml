@@ -1,0 +1,19 @@
+# What Bitcoin shows of a recovery's exit on Lichen's hub-proves graph,
+# read in the Hub's guest (r0/hp-guest, through licash-hp) and natively.
+# no_std, on sha2 alone, so the guest builds it.
+[package]
+name = "licash-statement"
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "What Bitcoin shows of a Licash recovery's exit where the Hub proves, read in its guest"
+# A member of regtest's workspace, as licash-hp.
+workspace = "../../regtest"
+
+[features]
+# Fixtures for tests: blocks, headers and the exit's transactions.
+testing = []
+
+[dependencies]
+sha2 = { version = "0.10", default-features = false }

@@ -3,7 +3,7 @@
 //!
 //! What Bitcoin shows of the exit (her `request` of `b` and `E`, her
 //! publication of the claim, the Hub's `respond` of `b′` and its
-//! disclosure) is `lichen_statement`'s to read ([`lichen_statement::read`]).
+//! disclosure) is `licash_statement`'s to read ([`licash_statement::read`]).
 //! What the claim is owed is Licash's: [`licash::recovery::owed`] of the
 //! publication's bytes (a [`licash::recovery::Filing`]) under the request
 //! `(b, E)`, against the Hub's evidence, on the Licash chain from Base's
@@ -12,7 +12,7 @@
 //! evidence needs (the unlocks and preimages it cites).
 //!
 //! The statement is fixed when the contract opens ([`contract`]): its
-//! journal is `lichen_statement`'s, `c ‖ word ‖ H(O_D ‖ checkpoint ‖ W)`,
+//! journal is `licash_statement`'s, `c ‖ word ‖ H(O_D ‖ checkpoint ‖ W)`,
 //! with Licash's word `H("licash/hp/word" ‖ Base digest)`. Base fixes the
 //! keyset, the limits, the checkpoint and the work, and its digest is what
 //! every claim's context binds, so a proof for one contract is useless for
@@ -38,7 +38,7 @@ use licash::{
     recovery::{self, Evidence, Owed},
     request::Request,
 };
-use lichen_statement::{
+use licash_statement::{
     btc::{self, Header, OutPoint},
     checksum_digits,
     codec::{R, W},
@@ -55,7 +55,7 @@ pub const C: u32 = 0;
 pub enum Refusal {
     /// The input doesn't decode.
     Input,
-    /// Bitcoin doesn't show the exit, as `lichen_statement` reads it.
+    /// Bitcoin doesn't show the exit, as `licash_statement` reads it.
     Exit(Reject),
     /// The headers through the publication aren't a Licash chain from
     /// Base's checkpoint.
@@ -268,7 +268,7 @@ pub fn decide(
     evidence: &[Evidence],
 ) -> Result<(Owed, Read), Refusal> {
     let contract = contract(base);
-    let read = lichen_statement::read(&contract, exit).map_err(Refusal::Exit)?;
+    let read = licash_statement::read(&contract, exit).map_err(Refusal::Exit)?;
     if let Some(holder_wots) = base.version().holder_wots() {
         let keys = keys
             .filter(|k| k.digest() == holder_wots)
@@ -302,7 +302,7 @@ pub fn check(input: &HubInput) -> Result<[u8; JOURNAL_LEN], Refusal> {
         &input.evidence,
     )?;
     verdict(&owed, read.b2, read.disclosed.as_deref())?;
-    lichen_statement::holds(&contract(&input.base), &read, owed.owed).map_err(|_| Refusal::Owed)
+    licash_statement::holds(&contract(&input.base), &read, owed.owed).map_err(|_| Refusal::Owed)
 }
 
 /// Whether a response of `b2` that disclosed `disclosed` bears out what the

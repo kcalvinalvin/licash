@@ -33,7 +33,7 @@ RUN --mount=type=cache,id=licash-r0-registry,target=/root/.cargo/registry,sharin
     set -eu; \
     # Built again whatever the cached target's times: a source edited while
     # an earlier build ran is older than what that build left.
-    find r0/host/src crates/licash-hp/src -name '*.rs' -exec touch {} +; \
+    find r0/host/src crates/licash-hp/src crates/licash-statement/src -name '*.rs' -exec touch {} +; \
     flags=; for a in $CUDA_ARCHS; do flags="$flags -gencode arch=compute_$a,code=sm_$a"; done; \
     newest=${CUDA_ARCHS##* }; \
     export NVCC_APPEND_FLAGS="$flags -gencode arch=compute_$newest,code=compute_$newest"; \

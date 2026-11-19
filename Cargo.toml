@@ -11,7 +11,7 @@ members = [
 ]
 # r0/ (RISC Zero guests and host), regtest/ (the contract's crates, which
 # need Lichen) and apps/ (the applications) are workspaces of their own.
-exclude = ["r0", "regtest", "apps", "crates/licash-contract", "crates/licash-hp"]
+exclude = ["r0", "regtest", "apps", "crates/licash-contract", "crates/licash-hp", "crates/licash-statement"]
 
 [profile.dev]
 debug = 0
