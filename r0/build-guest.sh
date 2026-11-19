@@ -10,7 +10,7 @@
 # use the zkVM's randomness syscall.
 #
 # The programs contracts open under are kept by image id in r0/programs/
-# (r0/README.md): rebuilt from the same commit with the pinned toolchains
+# (docs/r0.md): rebuilt from the same commit with the pinned toolchains
 # below, from any checkout, each comes out the same, image id and all.
 set -euo pipefail
 cd "$(dirname "$0")/.."

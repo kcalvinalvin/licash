@@ -3,7 +3,7 @@
 #   docker build -f apps/hub/Dockerfile -t licash-hub .
 # --platform linux/arm64 or linux/arm/v7 cross-compiles (apps/image-build.sh),
 # without a prover: such a hub responds to no contested exit on a network
-# with genuine proofs (see the README).
+# with genuine proofs (see docs/hub.md).
 ARG TARGETARCH
 
 FROM --platform=$BUILDPLATFORM rust:1-slim-trixie AS build
@@ -72,7 +72,7 @@ USER 10001
 ENV LICASH_HUB_DATA=/data LICASH_HUB_LISTEN=0.0.0.0:8338 NVIDIA_DRIVER_CAPABILITIES=compute,utility
 VOLUME /data
 EXPOSE 8338
-# Unhealthy once the hub halts (see the README).
+# Unhealthy once the hub halts (see docs/hub.md).
 HEALTHCHECK --interval=30s --timeout=5s \
     CMD ["bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/${LICASH_HUB_LISTEN##*:} && printf 'GET /health HTTP/1.0\\r\\n\\r\\n' >&3 && head -n1 <&3 | grep -q ' 200 '"]
 ENTRYPOINT ["licash-hub"]

@@ -395,7 +395,7 @@ jobs:
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
         run: |
           if [ -z "$ANDROID_KEYSTORE" ] || [ -z "$ANDROID_KEYSTORE_PASSWORD" ]; then
-            echo "::error::No signing key: set the ANDROID_KEYSTORE and ANDROID_KEYSTORE_PASSWORD secrets (apps/mobile/android/README.md)."
+            echo "::error::No signing key: set the ANDROID_KEYSTORE and ANDROID_KEYSTORE_PASSWORD secrets (docs/android.md)."
             exit 1
           fi
           tools=$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 | sort -V | tail -n1)

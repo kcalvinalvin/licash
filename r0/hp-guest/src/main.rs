@@ -17,7 +17,7 @@ fn main() {
         .take(n as usize)
         .collect();
     // The `profile` build (never a kept program) prints the cycles each
-    // step took, which the host shows: `r0/README.md`.
+    // step took, which the host shows: `docs/r0.md`.
     #[cfg(feature = "profile")]
     let mut last = env::cycle_count();
     #[cfg(feature = "profile")]

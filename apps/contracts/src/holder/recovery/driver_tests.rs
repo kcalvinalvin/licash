@@ -757,7 +757,7 @@ fn a_request_the_hub_signed_under_another_graph_is_refused() {
 }
 
 /// What each transaction of a dispute weighs, as the chain would see it,
-/// from the graph's own builders: the table `r0/README.md` quotes, and
+/// from the graph's own builders: the table `docs/r0.md` quotes, and
 /// bounds that keep it from growing unnoticed. The publication's claim is
 /// not here (its size is its filing's), nor the hub's disclosure (1 024
 /// bytes of nulldata).

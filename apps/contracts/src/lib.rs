@@ -342,7 +342,7 @@ pub fn trust(profile: ChainProfile) -> Result<Trust> {
 
 /// The genuine program contracts open under on signet and Mutinynet, as built by
 /// `r0/build-guest.sh` with the toolchains it pins, from the commit
-/// `r0/README.md` names. Each program contracts opened under is kept as
+/// `docs/r0.md` names. Each program contracts opened under is kept as
 /// `r0/programs/<image id>.bin`: the contracts opened under one are
 /// proven with it alone, so none named here or in [`SIGNET_BEFORE`] is
 /// ever to go. A contract keeps its program when this one changes.

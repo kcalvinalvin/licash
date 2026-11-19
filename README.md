@@ -2,120 +2,72 @@
 
 ![Licash](assets/brand/banner.png)
 
-Owner-bound ecash with local Bitcoin recovery. Payments are private, offchain
-reissuances by a hub; every holder keeps an individual, collateralized right
-to recover her own notes on Bitcoin. A claim is paid in full unless the hub
-proves, with a spend the holder signed, that she is owed less: only the hub
-proves, so a wallet never does.
+**A private Bitcoin checking account that you can always take back on
+Bitcoin.**
 
-The [paper](paper/licash.pdf) specifies the protocol and is the reference
-for its design, security, privacy and limitations. This repository is its
-research implementation; it has not had a security review.
+Licash is ecash with an exit. A hub issues notes that you pay with
+instantly, privately and almost for free. Unlike ordinary ecash, you hold an
+individual Bitcoin contract with the hub. It lets you recover your notes on
+Bitcoin without the hub's cooperation, up to a limit you choose, like
+insurance. You never prove anything to recover: the hub must prove,
+with a payment you signed, that you are owed less.
 
-## Layout
+It is not meant for your savings. Keep those in cold storage, and use Licash
+for day-to-day spending, as a checking account.
 
-- `crates/licash`: the protocol library (notes, spends, grants, claims and
-  what a filed claim is owed). The crate docs map modules to paper sections.
-- `crates/licash-hp`: the hub's statement, which decides what a filed claim
-  is owed from Bitcoin and the hub's evidence (built in regtest's workspace).
-- `crates/licash-store`: the one SQLite file an actor keeps, and the rules
-  every module sharing it follows (see Storage).
-- `crates/licash-hub`: a hub's operations over its ledger, a component of
-  the hub's SQLite database, and the evidence it holds against a holder's
-  claim.
-- `crates/licash-api`: the HTTP API bodies and error codes of hubs and swap
-  providers.
-- `crates/licash-wallet`: a wallet over its SQLite file: hubs, notes,
-  payments made and taken, locks, Lightning, swaps, unlinking, silent
-  payments found with a light client, and resuming after interruptions.
-- `crates/licash-swaps`: a swap provider over its wallet, and in its
-  wallet's file: swaps of notes at one hub for notes at another, with a
-  timed lock at each, either locking its notes at the destination or, run
-  by the destination hub itself, notes the hub issues.
-- `crates/licash-onchain`: Bitcoin outside the protocol: silent payments
-  (BIP352), and the hash-locked coins of deposits and payouts.
-- `crates/licash-contract`: the contract's transaction graph, Licash's
-  front on Lichen's BABE graph, and its opening between a holder and a hub
-  as two message-driven state machines (built in regtest's workspace).
-- `r0/`: the hub's statement as a RISC Zero zkVM program, and a host that
-  executes and proves it. See [r0/README.md](r0/README.md).
-- `regtest/`: the contract crates' workspace, and the contracts played
-  between a wallet and the hub service on Bitcoin Core. See
-  [regtest/README.md](regtest/README.md).
-- `apps/`: the applications, a workspace of their own: the hub service
-  (`apps/hub`), the swap provider service (`apps/swaps`), the wallet CLI
-  (`apps/wallet-cli`), recovery contracts opened between them over HTTP
-  (`apps/contracts`), their HTTP transport (`apps/transport`), Tor
-  through Arti (`apps/tor`), chain sources (`apps/chain-client`), operator
-  notifications (`apps/notify`), operators' dashboards in the terminal
-  (`apps/dashboard`), announcements on Nostr (`apps/nostr`), end-to-end
-  tests of hubs, their Lightning gateways, swap providers and
-  wallets on a regtest ecosystem in Docker (`apps/e2e`), and the mobile
-  apps' wallet core (`apps/mobile/core`), light client in Go
-  (`apps/mobile/chain`) and
-  Android app (`apps/mobile/android`). How every app looks and speaks is
-  in [apps/DESIGN.md](apps/DESIGN.md).
-- `paper/`: the paper's source; `paper/build.sh` rebuilds the PDF (Docker).
+## Why
 
-## Storage
+- **No consolidation, no toxic change.** Each coin you receive is swapped in
+  on its own, and you pay out onchain exactly the amount you need. Your
+  coins never get spent together, so they can't be clustered.
+- **Lightning without a node.** Pay and receive over Lightning with no
+  channels, no inbound liquidity and no watchtower.
+- **Private payments.** The hub cannot link a note's spending to its
+  issuance, and payments leave nothing on Bitcoin.
+- **Receive while offline.** Within a hub, a payer can pay you while your
+  phone is off.
+- **Fast and cheap.** Payments within a hub are instant and use no
+  blockspace.
+- **You keep custody, up to your limit.** Value within your contracts can
+  always be recovered on Bitcoin. A stale backup is paid exactly what is
+  still unspent, never punished.
 
-Each actor keeps one SQLite file, and its backup is one snapshot of it:
+The [paper](paper/licash.pdf) describes the protocol, its security and its
+privacy.
 
-| Actor | File | Components (owner) |
-|---|---|---|
-| Hub | `hub.sqlite` | `ledger` (licash-hub), `deposits`, `lightning`, `inbox` (hub service), `openings`, `responses` (contracts) |
-| Wallet (CLI, Android) | `wallet.sqlite` | `wallet` (licash-wallet), `contracts` (the holder's) |
-| Swap provider | `wallet.sqlite` | `wallet`, `provider` (licash-swaps), `contracts` |
+## Try it
 
-A module owns the tables of its *component* and keeps a connection of its
-own to the file; `schema_versions` says which components were made, and of
-which version, so that none is made, or assumed, before it is used. The file
-says what it is (`application_id`). There are no migrations: a file of
-another layout or version is refused, never read nor replaced. A stage an
-operation reaches (a deposit's payment, a lock's settlement, a payout's
-claim) is a table of its own, one row a fact; a single optional value is a
-nullable column. Everything is `STRICT`, with `CHECK`s for what is
-enumerated or non-negative. A write that must be followed by an act outside
-the database (a Lightning payment, a broadcast, a one-time signature) is
-recorded first, and recovery finds it again: no shared transaction spans
-modules or crates. `hub.sqlite` and `wallet.sqlite` are written in IMMEDIATE
-transactions; a thread that writes a file while it has a write open on
-another connection of it waits for itself, and debug builds panic at once.
-Beside them stay `tweaks.sqlite` (a hub's index, losing it loses nothing),
-the contracts' instances (`contracts/`, `opening-instances/`) and the
-seeds and Tor state.
+Licash runs on signet and Mutinynet. Contracts there are a trial: the
+code has not had a security review, so do not use real funds.
 
-## Quick start
+- **Android:** install `licash-main.apk` from the
+  [`main-build` release](https://github.com/lichenbtc-org/licash/releases/tag/main-build),
+  turn on advanced mode, pick signet and choose a hub announced on Nostr.
+- **Command line:**
 
-The library needs only Rust:
+  ```sh
+  docker run --rm -it -v licash:/data ghcr.io/lichenbtc-org/licash-wallet init --network signet
+  docker run --rm -it -v licash:/data ghcr.io/lichenbtc-org/licash-wallet \
+    discover --relay wss://relay.primal.net
+  docker run --rm -it -v licash:/data ghcr.io/lichenbtc-org/licash-wallet add-hub <URL>
+  ```
 
-```sh
-cargo test --locked
-```
+  See [apps/wallet-cli](apps/wallet-cli/README.md) for receiving and paying.
+- **Everything locally**, with Docker: `apps/e2e/run.sh` brings up a regtest
+  network with hubs, a Lightning gateway, swap providers and wallets, and
+  runs the end-to-end tests against it.
 
-The applications build the contract on Lichen, which Cargo fetches from
-git at the revision `apps/Cargo.lock` pins (see
-[regtest/README.md](regtest/README.md)):
+## Components
 
-```sh
-cargo test --locked --manifest-path apps/Cargo.toml   # the applications
-apps/e2e/run.sh                                       # the ecosystem (Docker)
-```
+[Wallet CLI](apps/wallet-cli/README.md) ·
+[Android app](apps/mobile/android/README.md) ·
+[Hub](apps/hub/README.md) ·
+[Swap provider](apps/swaps/README.md) ·
+[Proving](r0/README.md) ·
+[Contracts on regtest](regtest/README.md)
 
-The library and applications omit debug information and incremental build
-artifacts in dev and test builds to save disk space. These builds still enable
-development checks. To enable debug information for a build or test, set
-`CARGO_PROFILE_DEV_DEBUG=2`; set `CARGO_PROFILE_DEV_INCREMENTAL=true` to
-enable incremental builds. These settings may increase disk usage.
-
-## Releases
-
-Once CI passes on main, it publishes the hub's, the wallet's and the swap
-provider's images for amd64, arm64 and arm/v7 to
-`ghcr.io/licash-org/licash-hub`, `licash-wallet` and `licash-swaps` (tagged
-`main` and `sha-<commit>`), and the signed Android app to the `main-build`
-prerelease (see
-[apps/mobile/android/README.md](apps/mobile/android/README.md#releases)).
+To build and test the library, run `cargo test --locked`. For the
+applications, run `cargo test --locked --manifest-path apps/Cargo.toml`.
 
 ## License
 

@@ -30,7 +30,7 @@ impl SegmentRef for Unused {
 }
 
 /// The kept input: the statement's tests' answered claim
-/// (`export_inputs`, r0/README.md).
+/// (`export_inputs`, docs/r0.md).
 fn input() -> Result<Vec<u8>> {
     let installed = probe::share().join("bench.bin");
     let path = match installed.exists() {

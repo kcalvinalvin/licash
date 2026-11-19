@@ -39,7 +39,7 @@ x-lnd: &lnd
 
 # The macaroon a hub's gateway needs of its LND node, and no more: baked
 # beside the node, in its network and data, for the eight calls it makes
-# (apps/hub/README.md). A hub given it could not run on a call left out.
+# (docs/hub.md). A hub given it could not run on a call left out.
 x-macaroon: &macaroon
   <<: *lnd
   healthcheck:

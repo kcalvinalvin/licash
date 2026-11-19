@@ -63,7 +63,7 @@ struct Cli {
 #[derive(Args)]
 struct Notify {
     /// Notify of the hub's events at this Apprise-style URL: gotify://,
-    /// tgram://, ntfy://, json:// or apprise:// (see the README). Repeat it,
+    /// tgram://, ntfy://, json:// or apprise:// (see docs/hub.md). Repeat it,
     /// or separate URLs with commas, for more targets.
     #[arg(
         long = "notify",
