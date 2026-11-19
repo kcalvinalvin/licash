@@ -377,8 +377,9 @@ prove and assert it once contested (a proof takes hours on a CPU). On
 Mutinynet the same blocks, a twentieth of the time, but for what a proof
 takes: 960 blocks to prove and assert, hours as signet's 48 are, with the
 fixed contract and the shortest chosen as many blocks longer (1,912 and
-1,488). A proof's cost follows the contract's blocks (7.2 k cycles each), so
-a contract's length is chosen in blocks, not in time. No other network yet.
+1,488). A proof's cost follows the contract's blocks (7.2 k cycles each) in
+the graphs before id 11, so a contract's length is chosen in blocks, not in time;
+in id 11 on it does not (below). No other network yet.
 
 A proof reads Bitcoin through block headers, so a hub's statement asks for
 work on top of a holder's request's response: a chain mined in private
@@ -490,13 +491,15 @@ changing the GPU). So that no claim it could reduce is paid by a timeout,
 it opens a contract only if its prover could make, one after another in an
 assert window, the largest proof of an exit of every contract it is
 committed to and of the new one (all its headers to the close, and the
-most its publication and evidence may carry): its holders may all exit at
-once. It checks this as a holder opens and again, holding its funding lock,
+most its publication and evidence may carry; of a chained contract, its
+tail and openings, and not its age), and the one batch of its header chain
+a dispute may wait for: its holders may all exit at once. It checks this as a holder opens and again, holding its funding lock,
 as it funds F, and refuses an opening with 503 when there is no room, or
 while its prover is not ready. `--contracts-proof-scale` scales each
 proof's estimate (1 by default): above 1 for a prover slower than its
 benchmark, below 1 to admit more than it can surely defend. Long contracts
-take the most room, as a proof grows with the headers it checks. A prover not ready (none installed, no
+take the most room, as a proof grows with the headers it checks, but those
+of a chained graph, which take no more than short ones. A prover not ready (none installed, no
 Groth16 setup, under 8.5 GB of memory, a failed benchmark) responds to no
 contested claim. The hub's notifications alert it, a prover that fails, a
 proof the plan would make late, an assertion's deadline 6 blocks away
@@ -507,6 +510,53 @@ in `<data>/hp-proofs/<id>/`: its input, frozen once it first holds, the
 prover's progress, carried on across restarts, its `prover.log` and
 `proof.json`. The proof is pinned in `hub.sqlite` before the assertion
 is signed.
+
+### The header chain
+
+A contract of graph id 11 on is decided on the hub's header chain, proven once
+(docs/r0.md, The header chain), so that its proof does not grow with its age:
+contracts of 6 to 24 months cost the hub what a new one does. The hub keeps
+the chain in `hub.sqlite` (the component `header_chain`: its start, every header
+after it, the receipts of the chain program) and the receipts' files in
+`<data>/header-chain/<chain program's image id>/`, beside it.
+
+- **Start.** At the first quote of a chained contract, 144 blocks below its
+  checkpoint (a holder can name a block near the tip, which a reorg could take
+  back, and nothing authenticates a start). A hub quotes a checkpoint only if
+  it is a block of the chain in the state its Base binds (it follows the node's
+  as it quotes), and refuses with 503 otherwise.
+- **Following.** Each poll of the responder follows the node's chain through
+  the blocks 6 deep, in the hub's process, with no proof. A reorg cuts the chain
+  back to the last block it and the node agree on, and the receipts, and the work
+  kept of batches, beyond it; the chain is cut back only on what the node says of
+  its blocks, never on what it fails to say. Its operator is told of a chain that
+  cannot follow the node's (a start no longer on it, a reorg of 1,000 blocks).
+- **Proving.** A batch is proven by the hub's prover when no dispute's proof
+  can run, for a day of blocks since the last receipt, or for the blocks a
+  dispute asks for at once, which is made before another dispute's proof, as that
+  one cannot start without it. A batch of the day is stopped for a dispute, and
+  proven again from the segments it kept. A receipt is kept only if the chain still
+  commits it and its file is the one that was made (a digest is kept); the newest
+  four are, and the newest that is 100 blocks below the tip, so that a reorg
+  does not leave the chain to be proven again from its start. The prover is not
+  ready without the chain program installed (`r0/programs/<image id>.bin`).
+- **A dispute** asks for the receipt through the last block of its exit (its
+  request, publication, response and disclosure), takes the few headers after
+  it that carry the work its contract asks, and opens what the judgment reads. Its
+  proof is frozen with that receipt (`<data>/hp-proofs/<id>/chain.receipt`) and
+  proves it alone. Behind by more than a day (the hub down for days), a
+  dispute waits for the batches that catch up, which no admission has reserved
+  for: keep the hub running, and its chain proven.
+
+Back up `hub.sqlite` as ever. A hub without its header chain (its component
+lost, a restore older than the chain) cannot prove a chained dispute and is
+told so; its holders' claims are then paid by their timeouts. Upgrading from a
+release before graph id 11 starts no chain until the first chained quote and
+changes no contract opened before: they keep their programs and their
+reserves. A release that changes the chain program (a change to `licash-chain`,
+or to the zkVM's recursion) is a new chain, proven from its start, and its
+statement a new program; the receipts of the old chain are for the contracts
+opened under it.
 
 The image of apps/hub/Dockerfile (x86-64) has the prover: its CPU build,
 its CUDA build, which it proves on when the container has a GPU (`--gpus
