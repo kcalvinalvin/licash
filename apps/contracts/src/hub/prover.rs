@@ -962,9 +962,11 @@ impl Inner {
                     );
                     return Ok(true);
                 }
+                // A batch a dispute waits for is not stopped for another's
+                // proof: that dispute could not start without it.
                 let dispute = {
                     let s = self.state();
-                    s.cancel || self.next(&s).is_some()
+                    s.cancel || (!pending.demanded && self.next(&s).is_some())
                 };
                 if dispute {
                     let _ = child.kill();
@@ -1488,7 +1490,7 @@ esac
 
     /// A hub's header chain of 20 blocks the node has, a dispute asking
     /// for the first 8 of them proven.
-    async fn chained(dir: &Path) -> Arc<HubChain> {
+    async fn chained(dir: &Path, batch: Option<u32>) -> Arc<HubChain> {
         use super::super::chain::fixtures::{genesis, Node};
         let (chain, _) = HubChain::open(
             &crate::testing::hub_data(dir),
@@ -1496,6 +1498,10 @@ esac
             licash::spend::ChainProfile::Core30DefaultRegtest,
         )
         .unwrap();
+        let chain = match batch {
+            Some(blocks) => chain.with_batch(blocks),
+            None => chain,
+        };
         chain.begin(&genesis()).unwrap();
         chain.follow(&Node::new(20), 20).await.unwrap();
         Arc::new(chain)
@@ -1517,7 +1523,7 @@ esac
     #[tokio::test]
     async fn a_prover_proves_the_header_chains_batches_when_no_dispute_is_to_be_proven() {
         let dir = tempfile::tempdir().unwrap();
-        let chain = chained(dir.path()).await;
+        let chain = chained(dir.path(), None).await;
         let p = fake_with(dir.path(), CHAIN_SCRIPT, Some(chain.clone()));
         until("ready", || {
             matches!(readiness(&p), Some(Readiness::Ready(_)))
@@ -1560,14 +1566,52 @@ esac
         r.journal.tip_height()
     }
 
-    /// A dispute's proof can run: the batch being proven is stopped, and
-    /// proven again after it, from the segments it kept.
+    /// A dispute's proof can run: a batch nobody waits for (a day of blocks
+    /// since the last receipt) is stopped, and proven again after it, from the
+    /// segments it kept.
     #[tokio::test]
-    async fn a_dispute_stops_a_batch_of_the_header_chain_which_is_proven_after() {
+    async fn a_dispute_stops_a_batch_nobody_waits_for_which_is_proven_after() {
         let dir = tempfile::tempdir().unwrap();
-        let chain = chained(dir.path()).await;
+        // a day is 5 blocks here, and 20 are behind
+        let chain = chained(dir.path(), Some(5)).await;
         std::fs::write(dir.path().join("slow"), b"").unwrap();
         let p = fake_with(dir.path(), CHAIN_SCRIPT, Some(chain.clone()));
+        until("ready", || {
+            matches!(readiness(&p), Some(Readiness::Ready(_)))
+        });
+        let calls = || std::fs::read_to_string(dir.path().join("calls")).unwrap_or_default();
+        until("the batch under way", || calls().contains("chain-prove"));
+        assert!(chain.receipt_through(1).is_none());
+        // a dispute whose input is frozen: it runs first
+        p.freeze(&[1; 32], b"input", None).unwrap();
+        p.commit(&[1; 32], [7; 32], 110, 100, 1_000, true, false, 100);
+        until("the dispute proved", || {
+            p.dir(&[1; 32]).join("proof.json").exists()
+        });
+        assert!(chain.receipt_through(1).is_none(), "{}", calls());
+        // no longer slow: the batch is made again, and done
+        std::fs::remove_file(dir.path().join("slow")).unwrap();
+        p.0.wake.notify_all();
+        until("the batch proven", || chain.receipt_through(1).is_some());
+        let proving: Vec<_> = calls()
+            .lines()
+            .filter(|l| l.starts_with("chain-prove"))
+            .map(str::to_owned)
+            .collect();
+        assert!(proving.len() >= 2, "stopped and made again: {proving:?}");
+    }
+
+    /// A batch a dispute waits for is proven before another dispute's proof
+    /// runs: that dispute can't start without it, and would wait for the
+    /// others' as well.
+    #[tokio::test]
+    async fn a_batch_a_dispute_waits_for_is_not_stopped_for_another() {
+        let dir = tempfile::tempdir().unwrap();
+        let chain = chained(dir.path(), None).await;
+        std::fs::write(dir.path().join("slow"), b"").unwrap();
+        // slow for a moment, not for good
+        let script = CHAIN_SCRIPT.replace("sleep 60", "sleep 2");
+        let p = fake_with(dir.path(), &script, Some(chain.clone()));
         until("ready", || {
             matches!(readiness(&p), Some(Readiness::Ready(_)))
         });
@@ -1575,24 +1619,17 @@ esac
         p.0.wake.notify_all();
         let calls = || std::fs::read_to_string(dir.path().join("calls")).unwrap_or_default();
         until("the batch under way", || calls().contains("chain-prove"));
-        assert!(chain.receipt_through(8).is_none());
-        // a dispute whose input is frozen: it runs first
         p.freeze(&[1; 32], b"input", None).unwrap();
         p.commit(&[1; 32], [7; 32], 110, 100, 1_000, true, false, 100);
         until("the dispute proved", || {
             p.dir(&[1; 32]).join("proof.json").exists()
         });
-        assert!(chain.receipt_through(8).is_none(), "{}", calls());
-        // no longer slow: the batch is made again, and done
-        std::fs::remove_file(dir.path().join("slow")).unwrap();
-        p.0.wake.notify_all();
-        until("the batch proven", || chain.receipt_through(8).is_some());
-        let proving: Vec<_> = calls()
+        assert!(chain.receipt_through(8).is_some(), "the batch came first");
+        let proving = calls()
             .lines()
             .filter(|l| l.starts_with("chain-prove"))
-            .map(str::to_owned)
-            .collect();
-        assert!(proving.len() >= 2, "stopped and made again: {proving:?}");
+            .count();
+        assert_eq!(proving, 1, "never stopped: {}", calls());
     }
 
     /// A program contracts opened under before, not installed: the prover

@@ -93,6 +93,10 @@ pub const IDLE: Duration = Duration::from_secs(3_600);
 /// is a chain cut back, its receipts with it (`chain::HubChain`).
 const CHAIN_BURY: u32 = 6;
 
+/// How many blocks below the checkpoint of the first contract the hub's header
+/// chain starts.
+const CHAIN_START_BELOW: u32 = 144;
+
 /// How long a request waits for its step before answering 202.
 const WAIT: Duration = Duration::from_secs(20);
 
@@ -145,6 +149,9 @@ pub struct Openings {
     /// The prover of the hub's statement: none where proofs are the mock
     /// authority's.
     prover: Option<prover::Prover>,
+    /// What the operator is told of the hub's header chain, once there is a
+    /// way to tell them, and again only when it changes.
+    chain_told: Mutex<Option<String>>,
     /// The hub's header chain, which contracts of a graph that reads their
     /// exit on it are quoted on and proven with: none where the program
     /// trusted reads every header.
@@ -369,12 +376,12 @@ impl Openings {
         }
         // The chain program's headers are the hub's, kept from the first
         // contract's checkpoint.
+        let mut chain_told = None;
         let chain = match (trust.mock, trust.chained) {
             (false, Some(program)) => {
                 let (chain, told) = chain::HubChain::open(data, program, profile)?;
-                if let Some(why) = told {
-                    tracing::warn!("a receipt of the hub's header chain is not kept: {why}");
-                }
+                chain_told = told
+                    .map(|why| format!("a receipt of the hub's header chain is not kept: {why}"));
                 Some(Arc::new(chain))
             }
             _ => None,
@@ -405,6 +412,7 @@ impl Openings {
                 prover::Prover::start(data, trust.program, before, spacing, chain)
             }),
             chain,
+            chain_told: Mutex::new(chain_told),
             alert: std::sync::OnceLock::new(),
             withheld: Mutex::default(),
             proof_scale: std::sync::OnceLock::new(),
@@ -534,7 +542,16 @@ impl Openings {
         let Some(chain) = &self.chain else {
             return Ok(());
         };
-        chain.begin(checkpoint).map_err(Refused::unavailable)?;
+        // Started well below the first checkpoint: a holder may name a block
+        // near the tip, which a reorg could take back, and a chain whose start
+        // is gone can't be followed. Nothing authenticates a start.
+        if chain.tip().is_none() {
+            let below = checkpoint.height().saturating_sub(CHAIN_START_BELOW);
+            let start = self.source.checkpoint(below).await;
+            chain
+                .begin(&start.map_err(Refused::unavailable)?)
+                .map_err(Refused::unavailable)?;
+        }
         chain
             .follow(&self.source, checkpoint.height())
             .await
@@ -554,7 +571,16 @@ impl Openings {
                 .await
         };
         if let Err(e) = followed.await {
-            tracing::warn!("following the chain for the hub's header chain: {e:#}");
+            let message = format!("the hub's header chain can't follow the node's: {e:#}");
+            let told = self
+                .chain_told
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .replace(message.clone());
+            match told.as_deref() == Some(&message) {
+                true => tracing::warn!("{message}"),
+                false => self.alert(&message),
+            }
         }
     }
 
@@ -763,6 +789,15 @@ impl Openings {
     pub fn alert_with(&self, f: Arc<Alert>) {
         if let Some(prover) = &self.prover {
             prover.alert_with(f.clone());
+        }
+        // what was found at startup, as the prover's not-ready is
+        if let Some(message) = self
+            .chain_told
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+        {
+            f(&message);
         }
         let _ = self.alert.set(f);
     }
@@ -1165,6 +1200,7 @@ mod tests {
             checkpoints: std::sync::OnceLock::new(),
             prover: None,
             chain: None,
+            chain_told: Mutex::default(),
             alert: std::sync::OnceLock::new(),
             withheld: Mutex::default(),
             proof_scale: std::sync::OnceLock::new(),

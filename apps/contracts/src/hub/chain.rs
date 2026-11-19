@@ -25,13 +25,14 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use anyhow::{anyhow, ensure, Context, Result};
+use anyhow::{anyhow, bail, ensure, Context, Result};
 use licash::chain::{sha256d, Checkpoint};
 use licash::spend::ChainProfile;
 use licash_chain::{Batch, Builder, Journal, Lineage, Origin, Tree};
 use licash_statement::codec::{R, W};
 use licash_store::Kind;
 use rusqlite::{params, Connection};
+use sha2::{Digest, Sha256};
 
 /// The component the chain is, and its version.
 const COMPONENT: &str = "header_chain";
@@ -54,6 +55,7 @@ CREATE TABLE chain_receipts (
     journal BLOB NOT NULL,
     tip BLOB NOT NULL,
     tree BLOB NOT NULL,
+    digest BLOB NOT NULL,
     PRIMARY KEY (program, count)
 ) STRICT, WITHOUT ROWID;
 ";
@@ -62,12 +64,20 @@ CREATE TABLE chain_receipts (
 /// resumes the newest of them its blocks still hold.
 const KEPT: usize = 3;
 
+/// How far below the chain's tip the newest receipt kept that is that deep
+/// is: receipts made for disputes are a few blocks apart, so those kept alone
+/// could all be taken back by a reorg, and the chain proven again from its
+/// start.
+const DEEP: u32 = 100;
+
 /// The most blocks a reorg may take back before the chain is given up.
 const REORG: u32 = 1_000;
 
 /// The headers of the chain being followed: a node's, or a test's.
 #[allow(async_fn_in_trait)]
 pub(super) trait Headers {
+    /// The height of the chain's tip.
+    async fn tip(&self) -> Result<u32>;
     /// The hash (internal order) of the block at `height`.
     async fn hash(&self, height: u32) -> Result<[u8; 32]>;
     /// The header of the block `hash`.
@@ -76,6 +86,10 @@ pub(super) trait Headers {
 
 #[cfg(feature = "node")]
 impl Headers for licash_chain_client::Source {
+    async fn tip(&self) -> Result<u32> {
+        Ok(licash_chain_client::Source::tip(self).await?.height)
+    }
+
     async fn hash(&self, height: u32) -> Result<[u8; 32]> {
         use bitcoin::hashes::Hash;
         Ok(licash_chain_client::Source::hash(self, height)
@@ -100,6 +114,7 @@ struct Row {
     journal: Vec<u8>,
     tip: Vec<u8>,
     tree: Vec<u8>,
+    digest: Vec<u8>,
 }
 
 /// A receipt of the chain program that is kept: what its journal commits and
@@ -122,6 +137,8 @@ pub(super) struct Pending {
     pub input: PathBuf,
     pub work: PathBuf,
     pub assume: Option<PathBuf>,
+    /// A dispute waits for it: not stopped for another's proof.
+    pub demanded: bool,
     receipt: Receipt,
 }
 
@@ -166,7 +183,7 @@ impl HubChain {
         let mut receipts = Vec::new();
         if let Some(lineage) = &lineage {
             let mut rows = conn.prepare(
-                "SELECT count, journal, tip, tree FROM chain_receipts WHERE program = ?1
+                "SELECT count, journal, tip, tree, digest FROM chain_receipts WHERE program = ?1
                  ORDER BY count",
             )?;
             let rows: Vec<Row> = rows
@@ -176,6 +193,7 @@ impl HubChain {
                         journal: r.get(1)?,
                         tip: r.get(2)?,
                         tree: r.get(3)?,
+                        digest: r.get(4)?,
                     })
                 })?
                 .collect::<rusqlite::Result<_>>()?;
@@ -242,7 +260,11 @@ impl HubChain {
 
     /// A receipt as a row has it, if the chain `lineage` commits it.
     fn kept(lineage: &Lineage, program: &[u8; 32], row: Row, file: PathBuf) -> Result<Receipt> {
-        ensure!(file.exists(), "its file is gone");
+        let bytes = std::fs::read(&file).map_err(|e| anyhow!("its file: {e}"))?;
+        ensure!(
+            Sha256::digest(&bytes)[..] == row.digest[..],
+            "its file is not the one that was made"
+        );
         let journal = Journal::from_bytes(&row.journal).context("its journal")?;
         let tip = Checkpoint::from_bytes(&row.tip).map_err(|e| anyhow!("its tip: {e}"))?;
         let tree = Tree::read(&mut R(&row.tree)).map_err(|e| anyhow!("its tree: {e}"))?;
@@ -257,6 +279,13 @@ impl HubChain {
             tree,
             file,
         })
+    }
+
+    /// A chain proven in batches of `blocks`, for tests of when one is due.
+    #[cfg(test)]
+    pub(super) fn with_batch(mut self, blocks: u32) -> Self {
+        self.batch = blocks;
+        self
     }
 
     /// The blocks a batch is proven for, a day's.
@@ -315,7 +344,6 @@ impl HubChain {
     }
 
     /// The chain's last block, if it has started.
-    #[cfg(test)]
     pub fn tip(&self) -> Option<u32> {
         self.state().lineage.as_ref().map(Lineage::tip_height)
     }
@@ -331,9 +359,12 @@ impl HubChain {
         }) else {
             return Ok(());
         };
-        let tip = match source.hash(tip).await {
-            Ok(h) if h == hash => tip,
-            _ => self.reorg(source, tip).await?,
+        // A failure to ask is no reorg: the chain is cut back only on what the
+        // node says of its blocks, never on what it fails to say.
+        let node = source.tip().await?;
+        let tip = match tip <= node && source.hash(tip).await? == hash {
+            true => tip,
+            false => self.reorg(source, tip, node).await?,
         };
         if to <= tip {
             return Ok(());
@@ -374,10 +405,12 @@ impl HubChain {
     /// The chain's tip is no longer the source's block at its height: cut it
     /// back to the last block they agree on, and the receipts with it that
     /// went beyond. The height it is cut back to.
-    async fn reorg(&self, source: &impl Headers, tip: u32) -> Result<u32> {
+    async fn reorg(&self, source: &impl Headers, tip: u32, node: u32) -> Result<u32> {
         let start = self.state().lineage.as_ref().map(|l| l.start().height());
         let start = start.context("no chain")?;
-        let mut at = tip;
+        // from the node's tip down if it is lower than the chain's: it has no
+        // block above it to agree on
+        let mut at = tip.min(node.saturating_add(1));
         let agreed = loop {
             ensure!(
                 at > start && tip - at < REORG,
@@ -423,6 +456,14 @@ impl HubChain {
         tx.commit()?;
         for count in &gone {
             let _ = std::fs::remove_file(self.dir.join(format!("receipt-{count}")));
+        }
+        // the work kept of batches the blocks taken back were in
+        if let Ok(entries) = std::fs::read_dir(&self.dir) {
+            for entry in entries.flatten() {
+                if entry.file_name().to_string_lossy().starts_with("batch-") {
+                    let _ = std::fs::remove_dir_all(entry.path());
+                }
+            }
         }
         s.receipts.retain(|r| tip_height(&r.journal) <= agreed);
         s.lineage = Some(cut);
@@ -487,16 +528,20 @@ impl HubChain {
             builder.push(*header).map_err(|e| anyhow!("{e}"))?;
         }
         let work = self.dir.join(format!("batch-{through}"));
-        std::fs::create_dir_all(&work)?;
         let batch = Batch {
             chain: self.program,
             from: origin,
             headers,
         };
+        // The work kept of a batch stopped is of this input alone: a reorg may
+        // have made another of the same height.
         let input = work.join("batch.bin");
-        if !input.exists() {
+        let bytes = batch.to_bytes();
+        if std::fs::read(&input).ok().as_deref() != Some(&bytes[..]) {
+            let _ = std::fs::remove_dir_all(&work);
+            std::fs::create_dir_all(&work)?;
             let part = work.join("batch.part");
-            std::fs::write(&part, batch.to_bytes())?;
+            std::fs::write(&part, &bytes)?;
             std::fs::rename(&part, &input)?;
         }
         let journal = builder.journal(self.program);
@@ -505,6 +550,7 @@ impl HubChain {
             input,
             work,
             assume: last.map(|r| r.file.clone()),
+            demanded: asked >= from,
             receipt: Receipt {
                 journal,
                 tip: builder.tip().clone(),
@@ -518,15 +564,28 @@ impl HubChain {
     /// beyond [`KEPT`] not.
     pub fn done(&self, pending: &Pending) -> Result<()> {
         let made = pending.work.join("receipt");
-        ensure!(made.exists(), "the prover left no receipt");
         let receipt = pending.receipt.clone();
         let count = receipt.journal.count;
-        // the file before the row: a row is of a receipt that is there
-        std::fs::rename(&made, &receipt.file)?;
         let mut s = self.state();
+        // A reorg while it was proven may have taken its blocks back: a
+        // receipt the chain does not commit is none.
+        let committed = s
+            .lineage
+            .as_ref()
+            .and_then(|l| l.through(self.program, pending.through).ok())
+            .is_some_and(|(journal, _)| journal == receipt.journal);
+        if !committed {
+            let _ = std::fs::remove_dir_all(&pending.work);
+            bail!("the chain was reorganized while the batch was proven: its receipt is not kept");
+        }
+        ensure!(made.exists(), "the prover left no receipt");
+        // the file before the row: a row is of a receipt that is there
+        let bytes = std::fs::read(&made)?;
+        std::fs::rename(&made, &receipt.file)?;
+        let digest = Sha256::digest(&bytes);
         s.conn.execute(
-            "INSERT OR REPLACE INTO chain_receipts (program, count, journal, tip, tree)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT OR REPLACE INTO chain_receipts (program, count, journal, tip, tree, digest)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 &self.program[..],
                 count,
@@ -536,14 +595,31 @@ impl HubChain {
                     let mut w = W::default();
                     receipt.tree.write(&mut w);
                     w.0
-                }
+                },
+                &digest[..]
             ],
         )?;
         s.receipts.retain(|r| r.journal.count != count);
         s.receipts.push(receipt);
         s.receipts.sort_by_key(|r| r.journal.count);
-        let drop = s.receipts.len().saturating_sub(KEPT + 1);
-        let old: Vec<Receipt> = s.receipts.drain(..drop).collect();
+        // the newest KEPT, and the newest that is DEEP: a reorg that takes the
+        // others back leaves that
+        let tip = s.lineage.as_ref().map_or(0, Lineage::tip_height);
+        let deep = s
+            .receipts
+            .iter()
+            .rposition(|r| tip_height(&r.journal) + DEEP <= tip);
+        let newest = s.receipts.len().saturating_sub(KEPT + 1);
+        let mut old = Vec::new();
+        let mut at = 0;
+        s.receipts.retain(|r| {
+            let keep = at >= newest || Some(at) == deep;
+            at += 1;
+            if !keep {
+                old.push(r.clone());
+            }
+            keep
+        });
         for r in &old {
             s.conn.execute(
                 "DELETE FROM chain_receipts WHERE program = ?1 AND count = ?2",
@@ -633,6 +709,10 @@ pub(super) mod fixtures {
     }
 
     impl Headers for Node {
+        async fn tip(&self) -> Result<u32> {
+            Ok(self.0.len() as u32)
+        }
+
         async fn hash(&self, height: u32) -> Result<[u8; 32]> {
             match height {
                 0 => Ok(self.1.unwrap_or_else(|| sha256d(genesis().header()))),
@@ -895,6 +975,94 @@ mod tests {
             .map(|r| r.journal.count)
             .collect();
         assert_eq!(counts, [21, 41, 51]);
+    }
+
+    /// A reorg while a batch is being proven takes its blocks back: its
+    /// receipt is not kept, and the batch of the same height that follows is
+    /// made of the blocks that are there, not of the input kept for the others.
+    #[tokio::test]
+    async fn a_batch_a_reorg_took_back_is_not_kept_and_its_work_is_not_taken_up_again() {
+        let data = tempfile::tempdir().unwrap();
+        let mut node = Node::new(20);
+        let chain = chain(data.path());
+        chain.begin(&genesis()).unwrap();
+        chain.follow(&node, 20).await.unwrap();
+        chain.demand(12);
+        let pending = chain.next_batch().unwrap().unwrap();
+        let old = std::fs::read(&pending.input).unwrap();
+        // proven, but not yet kept, as a prover takes time: the node reorganizes
+        std::fs::write(pending.work.join("receipt"), b"of the old blocks").unwrap();
+        node.fork(10, 8);
+        chain.follow(&node, 18).await.unwrap();
+        let e = chain.done(&pending).unwrap_err();
+        assert!(format!("{e:#}").contains("reorganized"), "{e:#}");
+        assert!(chain.receipt_through(12).is_none());
+        let dir = data.path().join("header-chain").join(hex::encode(PROGRAM));
+        assert!(!dir.join("receipt-13").exists());
+        // the same batch, of the same height, is of the blocks now there
+        let again = chain.next_batch().unwrap().unwrap();
+        assert_eq!(again.through, pending.through);
+        assert_ne!(std::fs::read(&again.input).unwrap(), old);
+        assert!(!again.work.join("receipt").exists(), "stale work is gone");
+        let batch = Batch::from_bytes(&std::fs::read(&again.input).unwrap()).unwrap();
+        assert_eq!(batch.headers[..], node.0[..12]);
+        std::fs::write(again.work.join("receipt"), b"of the new").unwrap();
+        chain.done(&again).unwrap();
+        assert!(chain.receipt_through(12).is_some());
+    }
+
+    /// A reorg that goes back past the receipts made for disputes, a few
+    /// blocks apart, leaves the one kept far below the tip.
+    #[tokio::test]
+    async fn a_receipt_far_below_the_tip_is_kept_past_the_newest() {
+        let data = tempfile::tempdir().unwrap();
+        let node = Node::new(130);
+        let chain = chain(data.path());
+        chain.begin(&genesis()).unwrap();
+        chain.follow(&node, 130).await.unwrap();
+        for through in [5, 50, 51, 52, 53, 54] {
+            chain.demand(through);
+            let pending = chain.next_batch().unwrap().unwrap();
+            std::fs::write(pending.work.join("receipt"), b"r").unwrap();
+            chain.done(&pending).unwrap();
+        }
+        // the newest four, and the deep one, not the one between
+        let tips: Vec<_> = chain
+            .state()
+            .receipts
+            .iter()
+            .map(|r| tip_height(&r.journal))
+            .collect();
+        assert_eq!(tips, [5, 51, 52, 53, 54]);
+        let dir = data.path().join("header-chain").join(hex::encode(PROGRAM));
+        assert!(dir.join("receipt-6").exists() && !dir.join("receipt-51").exists());
+    }
+
+    /// A receipt's file is the one that was made: another, or a damaged one,
+    /// is not kept, and the operator is told.
+    #[tokio::test]
+    async fn a_receipts_file_that_is_not_the_one_made_is_not_kept() {
+        let data = tempfile::tempdir().unwrap();
+        let node = Node::new(20);
+        let chain = chain(data.path());
+        chain.begin(&genesis()).unwrap();
+        chain.follow(&node, 20).await.unwrap();
+        chain.demand(10);
+        let pending = chain.next_batch().unwrap().unwrap();
+        std::fs::write(pending.work.join("receipt"), b"the receipt").unwrap();
+        chain.done(&pending).unwrap();
+        let file = chain.receipt_through(10).unwrap().file;
+        drop(chain);
+        let (again, told) =
+            HubChain::open(data.path(), PROGRAM, ChainProfile::Core30DefaultRegtest).unwrap();
+        assert_eq!(told, None);
+        assert!(again.receipt_through(10).is_some());
+        drop(again);
+        std::fs::write(&file, b"the receipt, damaged").unwrap();
+        let (again, told) =
+            HubChain::open(data.path(), PROGRAM, ChainProfile::Core30DefaultRegtest).unwrap();
+        assert!(told.unwrap().contains("not the one that was made"));
+        assert!(again.receipt_through(10).is_none());
     }
 
     #[tokio::test]

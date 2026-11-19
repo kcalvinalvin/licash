@@ -104,13 +104,12 @@ fn claim_dir(
         hex::encode(Impl::hash_bytes(input).as_bytes()),
         po2.map_or("default".into(), |p| p.to_string())
     );
-    // The receipts it assumes are part of what it proves; none adds no line,
-    // so a directory of a proof without any is as it was.
+    // The receipts it assumes are part of what it proves, by the claim each
+    // makes (its program and its journal); none adds no line, so a directory of
+    // a proof without any is as it was.
     for receipt in assumptions {
-        what.push_str(&format!(
-            "assumes {}\n",
-            hex::encode(Impl::hash_bytes(&receipt.journal.bytes).as_bytes())
-        ));
+        let claim = receipt.claim().context("an assumed receipt's claim")?;
+        what.push_str(&format!("assumes {}\n", claim.digest()));
     }
     let meta = dir.join("proving");
     match read_to_string(&meta) {
