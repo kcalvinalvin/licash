@@ -61,6 +61,10 @@ pub const LN_RECEIVE_STATE: &str = "/v1/ln/receive/{hash}";
 pub const DEPOSIT: &str = "/v1/deposit";
 /// The path of [`deposit_state`], as a route.
 pub const DEPOSIT_STATE: &str = "/v1/deposit/{hash}";
+/// Ask the hub to lock its notes to the deposit under `hash` that returns a
+/// contract's reserve ([`CloseTerms`]), as a route: POST, answered with its
+/// [`DepositStatus`].
+pub const DEPOSIT_LOCK: &str = "/v1/deposit/{hash}/lock";
 /// The [`BlockTweaks`] of the blocks a [`TweaksQuery`] names, as a list,
 /// up to the newest the hub indexed.
 pub const TWEAKS: &str = "/v1/chain/tweaks";
@@ -70,6 +74,12 @@ pub const MAX_TWEAK_BLOCKS: u32 = 144;
 /// Where the deposit under `hash` stands.
 pub fn deposit_state(hash: &[u8; 32]) -> String {
     format!("{DEPOSIT}/{}", hex::encode(hash))
+}
+
+/// Where to ask for the lock of the deposit under `hash` that returns a
+/// contract's reserve.
+pub fn deposit_lock(hash: &[u8; 32]) -> String {
+    format!("{DEPOSIT}/{}/lock", hex::encode(hash))
 }
 
 /// Where a receipt over Lightning of `hash` stands.
