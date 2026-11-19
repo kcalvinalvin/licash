@@ -140,9 +140,12 @@ The answered input (a 20 kB filing, 32 settled notes, a 16-note spend as
 evidence) executes in about 68 M cycles (71 segments of 2^20). Each header
 of the exit adds about 28 k cycles: 3,000 more headers, 152 M cycles. Cycles grow
 with the signatures and DLEQ proofs a filing carries, so a filing at the
-64 kB limit is roughly three times that. The Hub proves only when it
-contests a claim: it responds with less than the claim, and asserts the
-proof within the graph's assert window.
+64 kB limit is roughly three times that. The Hub proves only when a holder
+contests its response: it responds with less than the claim, the holder
+checks the evidence it responded on (`licash_hp::bears_out`, the same test
+as the statement's) and leaves a response that bears out alone, which then
+pays what it says with no proof, and the Hub asserts the proof within the
+graph's assert window of her contest otherwise.
 
 A hub proves on signet through `licash-r0` (`LICASH_HP_PROVER` names
 another), one proof at a time (apps/hub/README.md); no test plays a real
