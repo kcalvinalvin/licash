@@ -1843,12 +1843,12 @@ async fn an_ordinary_deposit_is_no_contracts_to_lock_or_bind() {
 struct Gone;
 
 impl Transport for Gone {
-    fn request(
+    async fn request(
         &self,
         _: &str,
         _: Option<Vec<u8>>,
-    ) -> impl std::future::Future<Output = Result<licash_wallet::Response, String>> + Send {
-        async { Err("the hub is gone".to_owned()) }
+    ) -> Result<licash_wallet::Response, String> {
+        Err("the hub is gone".to_owned())
     }
 }
 

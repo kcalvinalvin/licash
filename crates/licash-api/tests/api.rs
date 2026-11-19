@@ -961,9 +961,29 @@ fn deposit_bodies_are_receipts_with_a_refund_key_and_a_payment() {
         depth: 3,
         window: 144,
         timeout: 288,
+        close_root: None,
     };
     assert_eq!(deposits.pays(100_000), Some(100_600));
     assert_eq!(deposits.pays(u64::MAX), None);
+    // A hub's deposit root is hex in its info, and none is left out.
+    assert!(serde_json::to_value(deposits)
+        .unwrap()
+        .get("close_root")
+        .is_none());
+    let rooted = Deposits {
+        close_root: Some(licash_api::XOnly([7; 32])),
+        ..deposits
+    };
+    assert_eq!(
+        serde_json::to_value(rooted).unwrap()["close_root"],
+        serde_json::json!("07".repeat(32))
+    );
+    assert_eq!(json(&rooted), rooted);
+    let short: Result<Deposits, _> = serde_json::from_value(
+        serde_json::json!({"fee": {"base": 0, "ppm": 0}, "min": 1, "max": 2, "depth": 1,
+                           "window": 1, "timeout": 1, "close_root": "0707"}),
+    );
+    assert!(short.is_err());
     let mut info = Info::new(
         std::slice::from_ref(&f.keyset),
         f.owner.address(),
@@ -1174,6 +1194,7 @@ fn a_deposit_paying_an_amount_exactly_locks_what_its_fee_leaves() {
         depth: 3,
         window: 144,
         timeout: 288,
+        close_root: None,
     };
     let flat = deposits(1_000, 0);
     assert_eq!(flat.paid_by(9_981_000), Some(9_980_000));
@@ -1207,6 +1228,7 @@ fn a_fixed_payment_locks_the_most_notes_it_covers() {
         depth: 3,
         window: 144,
         timeout: 288,
+        close_root: None,
     };
     let flat = deposits(1_000, 0);
     assert_eq!(flat.most_for(20_000), Some(19_000));
@@ -1232,7 +1254,7 @@ fn a_fixed_payment_locks_the_most_notes_it_covers() {
 /// A deposit that returns a contract's reserve says so, and the hub reads
 /// the terms back; an ordinary one's wire has no trace of it.
 #[test]
-fn a_close_deposit_names_its_payment_and_timeout() {
+fn a_close_deposit_names_its_payment_and_the_block_it_is_watched_until() {
     use licash_api::{CloseTerms, Deposit, Receive};
     let f = fixture();
     let outputs: Vec<Output> = f
@@ -1247,13 +1269,13 @@ fn a_close_deposit_names_its_payment_and_timeout() {
         refund: Hex(vec![2; 32]),
         close: Some(CloseTerms {
             pays: 20_000,
-            timeout: 5_000,
+            until: 5_000,
         }),
     };
     let wire = serde_json::to_value(&close).unwrap();
     assert_eq!(
         wire["close"],
-        serde_json::json!({"pays": 20_000, "timeout": 5_000})
+        serde_json::json!({"pays": 20_000, "until": 5_000})
     );
     assert_eq!(json(&close), close);
     let ordinary = Deposit {
