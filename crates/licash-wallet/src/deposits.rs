@@ -241,7 +241,7 @@ impl<T: Transport> Wallet<T> {
     /// [`CLOSE_WAIT`] blocks after the close paid it
     /// ([`Wallet::deposits_to_refund`]). Its address is of her keys and the
     /// hub's published root alone, as is the key that claims it, so a wallet
-    /// restored from its seed finds it again ([`Wallet::find_close_deposits`]);
+    /// restored from its seed finds it again (`Wallet::find_close_deposits`);
     /// `until` is the block the hub gives up watching for the close's payment.
     pub async fn close_deposit(
         &self,
