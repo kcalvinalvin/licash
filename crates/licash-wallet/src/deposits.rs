@@ -618,10 +618,13 @@ impl<T: Transport> Wallet<T> {
         if !open {
             return Ok(());
         }
-        let body: licash_api::Deposit = serde_json::from_str(&body).map_err(invalid)?;
+        // What was asked, which a deposit answered need not read again: of a
+        // body it cannot, it is no contract's close.
+        let parsed = serde_json::from_str::<licash_api::Deposit>(&body);
         if !answered {
+            let body = parsed.as_ref().map_err(|e| invalid(e.to_string()))?;
             let asked = self
-                .post::<Depositing>(&url, licash_api::DEPOSIT, &body)
+                .post::<Depositing>(&url, licash_api::DEPOSIT, body)
                 .await;
             let terms = match asked {
                 Ok(terms) => terms,
@@ -665,7 +668,8 @@ impl<T: Transport> Wallet<T> {
                 // A contract's close is locked when the wallet asks, now it
                 // is back and its payment seen, not at the block it was
                 // paid in.
-                if body.close.is_some() && status.funding.is_some() {
+                let close = parsed.as_ref().is_ok_and(|body| body.close.is_some());
+                if close && status.funding.is_some() {
                     self.post::<DepositStatus>(&url, &licash_api::deposit_lock(hash), &())
                         .await?;
                 }

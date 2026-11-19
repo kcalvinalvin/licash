@@ -42,6 +42,10 @@ pub type Alert = dyn Fn(&str) + Send + Sync;
 /// `(script, contract, reserve, fee, timeout)`. Refused, with why, unless
 /// it is the hub's, asked for just so.
 pub type Closer = dyn Fn(&[u8], [u8; 32], u64, u64, u32) -> Result<(), String> + Send + Sync;
+
+/// Gives up the deposit bound to a contract whose opening was given up,
+/// unless a payment was seen for it.
+pub type Releaser = dyn Fn(&[u8; 32]) + Send + Sync;
 use futures_util::StreamExt;
 use licash::chain::Checkpoint;
 use licash::note::Keyset;
@@ -129,7 +133,7 @@ pub struct Openings {
     issuer: std::sync::OnceLock<Arc<Issuer>>,
     /// Where the deposit her default pays her reserve to is bound to the
     /// contract ([`Openings::close_with`]).
-    closer: std::sync::OnceLock<Arc<Closer>>,
+    closer: std::sync::OnceLock<(Arc<Closer>, Arc<Releaser>)>,
     /// The ledger's lock checkpoints, which new contracts open on.
     checkpoints: std::sync::OnceLock<LockCheckpoints>,
     /// The prover of the hub's statement: none where proofs are the mock
@@ -577,7 +581,11 @@ impl Openings {
         if busy.contains(id) {
             return Ok(None);
         }
-        self.store().abandon(id, before)
+        let coins = self.store().abandon(id, before)?;
+        if let (Some(_), Some((_, release))) = (&coins, self.closer.get()) {
+            release(id);
+        }
+        Ok(coins)
     }
 
     /// `most`, or less if the node's wallet, as it last said, funds no F
@@ -686,8 +694,9 @@ impl Openings {
     /// Bind the deposit that a contract's default pays her reserve to,
     /// through `f` from now on, when an opening names one: without, an
     /// opening that names one is refused, the hub taking no such deposit.
-    pub fn close_with(&self, f: Arc<Closer>) {
-        let _ = self.closer.set(f);
+    /// `release` gives the deposit up again if the opening is.
+    pub fn close_with(&self, bind: Arc<Closer>, release: Arc<Releaser>) {
+        let _ = self.closer.set((bind, release));
     }
 
     /// Tell the operator through `f` from now on (the hub's notifications):

@@ -433,9 +433,13 @@ impl Store {
     fn bind(&self, hash: &[u8; 32], contract: &[u8; 32]) -> rusqlite::Result<bool> {
         let mut conn = self.conn();
         let tx = licash_store::begin(&mut conn)?;
+        // Of a deposit still open, in the same write: one given up in between
+        // is bound to nothing.
         let bound = tx.execute(
             "UPDATE deposit_closes SET contract = ?2
-             WHERE hash = ?1 AND (contract IS NULL OR contract = ?2)",
+             WHERE hash = ?1 AND (contract IS NULL OR contract = ?2)
+               AND EXISTS (SELECT 1 FROM deposits d
+                           WHERE d.hash = ?1 AND d.state = 'open' AND d.done_at IS NULL)",
             params![hash, contract],
         )?;
         if bound == 1 {
@@ -449,15 +453,30 @@ impl Store {
     }
 
     /// Record that the wallet of the deposit under `hash` that returns a
-    /// contract's reserve asked for the lock: false if it is none, or not
-    /// bound.
+    /// contract's reserve asked for the lock: false if it is none, not
+    /// bound, or its payment not seen yet. The lock is made once, and lasts
+    /// a few blocks: asked before the payment, it would run out before the
+    /// wallet came back.
     fn ask(&self, hash: &[u8; 32]) -> rusqlite::Result<bool> {
         let asked = self.conn().execute(
             "UPDATE deposit_closes SET asked_at = coalesce(asked_at, ?2)
-             WHERE hash = ?1 AND contract IS NOT NULL",
+             WHERE hash = ?1 AND contract IS NOT NULL
+               AND EXISTS (SELECT 1 FROM deposit_fundings f WHERE f.hash = ?1)",
             params![hash, sql(now())?],
         )?;
         Ok(asked == 1)
+    }
+
+    /// Give up the deposits bound to `contract` that no payment was seen
+    /// for: its opening was given up, and none will pay them.
+    fn release(&self, contract: &[u8; 32]) -> rusqlite::Result<usize> {
+        self.conn().execute(
+            "UPDATE deposits SET state = 'canceled', done_at = ?2
+             WHERE state = 'open' AND done_at IS NULL
+               AND hash IN (SELECT hash FROM deposit_closes WHERE contract = ?1)
+               AND NOT EXISTS (SELECT 1 FROM deposit_fundings f WHERE f.hash = deposits.hash)",
+            params![contract, sql(now())?],
+        )
     }
 
     fn set(
@@ -944,6 +963,16 @@ impl Gateway {
         match self.store.bind(&record.hash, &contract).map_err(store_err)? {
             true => Ok(()),
             false => Err("the deposit is another contract's".into()),
+        }
+    }
+
+    /// Give up the deposit bound to `contract`, whose opening was given up,
+    /// unless a payment was seen for it.
+    pub fn release_close(&self, contract: &[u8; 32]) {
+        match self.store.release(contract) {
+            Ok(0) => {}
+            Ok(_) => tracing::info!(contract = %hex::encode(contract), "a contract's close deposit given up"),
+            Err(e) => tracing::warn!(contract = %hex::encode(contract), "cannot give up a close deposit: {e}"),
         }
     }
 

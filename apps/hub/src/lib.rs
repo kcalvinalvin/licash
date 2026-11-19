@@ -96,9 +96,13 @@ pub fn close_with_deposits(
     openings: &licash_contracts::hub::Openings,
     deposits: Arc<deposit::Gateway>,
 ) {
-    openings.close_with(Arc::new(move |script, contract, pays, fee, timeout| {
-        deposits.bind_close(script, contract, pays, fee, timeout)
-    }));
+    let release = deposits.clone();
+    openings.close_with(
+        Arc::new(move |script, contract, pays, fee, timeout| {
+            deposits.bind_close(script, contract, pays, fee, timeout)
+        }),
+        Arc::new(move |contract| release.release_close(contract)),
+    );
 }
 
 /// Her funded notes `issue` on `hub`'s ledger, by its own lock under the

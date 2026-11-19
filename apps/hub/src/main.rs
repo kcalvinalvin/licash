@@ -1494,6 +1494,15 @@ fn check_gateway_idle(hub: &Hub, db: &Path, deposits: bool) -> anyhow::Result<()
         let Some(conn) = peer::reader(db, component)? else {
             return Ok((0, 0));
         };
+        // A deposit bound to a contract is a promise of months: owed, though
+        // nothing is paid to it yet. None where the table was never made.
+        let bound: std::collections::HashSet<[u8; 32]> = match deposits {
+            true => conn
+                .prepare("SELECT hash FROM deposit_closes WHERE contract IS NOT NULL")
+                .and_then(|mut s| s.query_map([], |r| r.get(0))?.collect())
+                .unwrap_or_default(),
+            false => Default::default(),
+        };
         let mut stmt = conn.prepare(&format!("SELECT hash, lock, state, done_at FROM {table}"))?;
         let rows = stmt.query_map([], |r| {
             Ok((
@@ -1513,6 +1522,7 @@ fn check_gateway_idle(hub: &Hub, db: &Path, deposits: bool) -> anyhow::Result<()
                 "open" => {
                     open += 1;
                     lock.is_some()
+                        || bound.contains(&hash)
                         || hub
                             .own_lock_of(&hash)?
                             .is_some_and(|l| l.settled != Some(licash_hub::Settled::Refund))
