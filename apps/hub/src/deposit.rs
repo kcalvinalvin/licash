@@ -330,6 +330,7 @@ fn record(r: &Row<'_>) -> rusqlite::Result<Record> {
             claim: key(4)?,
             refund: key(5)?,
             timeout: r.get(6)?,
+            wait: None,
         },
         fund_by: r.get(7)?,
         funding,
@@ -583,6 +584,7 @@ impl Store {
                         claim: x_only(r, 3)?,
                         refund: x_only(r, 4)?,
                         timeout: r.get(5)?,
+                        wait: None,
                     },
                 ))
             })?
@@ -864,6 +866,7 @@ impl Gateway {
                 claim,
                 refund,
                 timeout,
+                wait: None,
             };
             let fund_by = from.saturating_add(c.window);
             let new = New {

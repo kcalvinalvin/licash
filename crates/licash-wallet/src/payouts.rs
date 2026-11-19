@@ -284,6 +284,7 @@ impl Record {
             claim: x_only(&self.claim_key()?),
             refund: XOnlyPublicKey::from_slice(&refund).map_err(invalid)?,
             timeout,
+            wait: None,
         }))
     }
 }
@@ -1296,6 +1297,7 @@ fn claim_vsize(script: &ScriptBuf, amount: u64) -> Result<u64, Error> {
         claim: x_only(&key),
         refund: x_only(&key),
         timeout: 0,
+        wait: None,
     };
     let to = script.clone();
     let paid = Amount::from_sat(amount);

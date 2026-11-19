@@ -226,6 +226,7 @@ mod tests {
                 claim: x_c.x_only_public_key(secp()).0,
                 refund: x_r.x_only_public_key(secp()).0,
                 timeout: 100 + n,
+                wait: None,
             };
             let agg = htlc.key_agg();
             let info = htlc.spend_info();
@@ -317,6 +318,7 @@ mod tests {
             claim: x_c.x_only_public_key(secp()).0,
             refund: x_r.x_only_public_key(secp()).0,
             timeout: 1,
+            wait: None,
         };
         let to = Keys::new(secret(3), secret(4), NetworkKind::Test).address();
         let funding = OutPoint::null();

@@ -341,6 +341,7 @@ impl Desk {
                 .lock()
                 .unwrap()
                 .unwrap_or(incoming.expiry - TERMS.margin),
+            wait: None,
         };
         let answer = ChainSwap {
             id: request.lock.clone(),

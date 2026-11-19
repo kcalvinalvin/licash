@@ -28,6 +28,7 @@ fn htlc() -> Htlc {
         claim: key(&secret(1)),
         refund: key(&secret(2)),
         timeout: 850_000,
+        wait: None,
     }
 }
 
@@ -136,6 +137,58 @@ fn the_payer_refunds_after_the_timeout_with_its_key() {
     verify(&htlc, &tx, &htlc.refund_script(), &htlc.refund);
     let wrong = htlc.refund_tx(funding(), VALUE, to(), rate, &secret(1));
     assert!(matches!(wrong, Err(Error::Key)));
+}
+
+/// A refund leaf that waits blocks after the payment, not for a height: its
+/// script is of the keys and the wait alone, and the refund's input enforces
+/// the wait.
+#[test]
+fn a_relative_refund_waits_blocks_after_the_payment_and_names_no_height() {
+    let absolute = htlc();
+    let relative = Htlc {
+        wait: Some(2016),
+        // Not in the script: any height is the same deposit.
+        timeout: 7,
+        ..absolute
+    };
+    let script = relative.refund_script();
+    let mut want = vec![0x02, 0xe0, 0x07, 0xb2, 0x75, 0x20];
+    want.extend(relative.refund.serialize());
+    want.push(0xac);
+    assert_eq!(script.as_bytes(), want);
+    assert_eq!(
+        relative.script_pubkey(),
+        Htlc {
+            timeout: 8,
+            ..relative
+        }
+        .script_pubkey()
+    );
+    // Not the absolute deposit's, whatever its timeout.
+    assert_ne!(relative.script_pubkey(), absolute.script_pubkey());
+    // Its refund confirms 2016 blocks on at the earliest.
+    assert_eq!(relative.refund_height(100), 2_115);
+    assert_eq!(absolute.refund_height(100), absolute.timeout);
+
+    let rate = FeeRate::from_sat_per_vb(1).unwrap();
+    let tx = relative
+        .refund_tx(funding(), VALUE, to(), rate, &secret(2))
+        .unwrap();
+    assert_eq!(tx.version, bitcoin::transaction::Version::TWO);
+    assert_eq!(tx.lock_time, bitcoin::absolute::LockTime::ZERO);
+    assert_eq!(tx.input[0].sequence, bitcoin::Sequence::from_height(2016));
+    assert!(tx.input[0].sequence.is_relative_lock_time());
+    verify(&relative, &tx, &relative.refund_script(), &relative.refund);
+    let wrong = relative.refund_tx(funding(), VALUE, to(), rate, &secret(1));
+    assert!(matches!(wrong, Err(Error::Key)));
+    // The hub's claim is not held up by the wait.
+    let claim = relative
+        .claim_tx(funding(), VALUE, to(), rate, &secret(1), &[7; 32])
+        .unwrap();
+    assert!(!claim.input[0].sequence.is_relative_lock_time());
+    verify(&relative, &claim, &relative.claim_script(), &relative.claim);
+    assert!(relative.claimed_by(&claim, funding()));
+    assert!(!relative.claimed_by(&tx, funding()));
 }
 
 #[test]

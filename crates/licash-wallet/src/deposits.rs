@@ -489,6 +489,7 @@ impl<T: Transport> Wallet<T> {
             claim,
             refund: x_only(&refund_key),
             timeout: terms.timeout,
+            wait: None,
         };
         let network = licash_onchain::network(self.network());
         if htlc.address(network).to_string() != terms.address {
@@ -748,6 +749,7 @@ impl<T: Transport> Wallet<T> {
             claim,
             refund: x_only(refund),
             timeout: terms.timeout,
+            wait: None,
         };
         let network = licash_onchain::network(self.network());
         let address = terms
@@ -847,6 +849,7 @@ impl<T: Transport> Wallet<T> {
             claim: XOnlyPublicKey::from_slice(&claim).map_err(invalid)?,
             refund: x_only(&secret),
             timeout,
+            wait: None,
         };
         let tx = htlc
             .refund_tx(funding, value, to, rate, &secret)

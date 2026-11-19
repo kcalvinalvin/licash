@@ -350,6 +350,7 @@ impl<T: Transport> Provider<T> {
             claim,
             refund: x_only(&refund_key),
             timeout,
+            wait: None,
         };
         let taken = Taken {
             from,
@@ -659,6 +660,7 @@ impl<T: Transport> Provider<T> {
             claim: XOnlyPublicKey::from_slice(&claim).map_err(|_| bad("claim key"))?,
             refund: x_only(&refund_key),
             timeout,
+            wait: None,
         };
         let tx = |raw: Option<Vec<u8>>| -> Result<Option<Transaction>, Error> {
             raw.map(|raw| deserialize(&raw).map_err(|_| bad("transaction").into()))

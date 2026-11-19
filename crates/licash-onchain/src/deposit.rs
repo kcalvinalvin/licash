@@ -17,7 +17,7 @@ use bitcoin::{
     absolute::LockTime,
     hashes::Hash,
     key::Secp256k1,
-    opcodes::all::{OP_CHECKSIG, OP_CLTV, OP_DROP, OP_EQUALVERIFY, OP_SHA256},
+    opcodes::all::{OP_CHECKSIG, OP_CLTV, OP_CSV, OP_DROP, OP_EQUALVERIFY, OP_SHA256},
     script::Builder,
     secp256k1::{Keypair, Message, Parity, SecretKey, XOnlyPublicKey},
     sighash::{Prevouts, SighashCache},
@@ -51,8 +51,14 @@ pub struct Htlc {
     /// The payer's key.
     pub refund: XOnlyPublicKey,
     /// The height after which the payer may take it back: its refund
-    /// confirms in block `timeout + 1` at the earliest.
+    /// confirms in block `timeout + 1` at the earliest. Ignored (and none
+    /// of the script's) where `wait` is set.
     pub timeout: u32,
+    /// Blocks after the deposit's payment confirms that the payer may take
+    /// it back, in place of `timeout`: a refund leaf of `OP_CHECKSEQUENCEVERIFY`,
+    /// so that the script depends on no height, and a wallet knowing only its
+    /// keys and the hub's can rebuild it. None: the refund is by `timeout`.
+    pub wait: Option<u16>,
 }
 
 /// How a deposit is spent.
@@ -86,15 +92,31 @@ impl Htlc {
             .into_script()
     }
 
-    /// `<timeout> OP_CHECKLOCKTIMEVERIFY OP_DROP <refund> OP_CHECKSIG`
+    /// `<timeout> OP_CHECKLOCKTIMEVERIFY OP_DROP <refund> OP_CHECKSIG`, or
+    /// `<wait> OP_CHECKSEQUENCEVERIFY OP_DROP <refund> OP_CHECKSIG` where
+    /// `wait` is set.
     pub fn refund_script(&self) -> ScriptBuf {
+        let (delay, check) = match self.wait {
+            Some(wait) => (i64::from(wait), OP_CSV),
+            None => (i64::from(self.timeout), OP_CLTV),
+        };
         Builder::new()
-            .push_int(i64::from(self.timeout))
-            .push_opcode(OP_CLTV)
+            .push_int(delay)
+            .push_opcode(check)
             .push_opcode(OP_DROP)
             .push_x_only_key(&self.refund)
             .push_opcode(OP_CHECKSIG)
             .into_script()
+    }
+
+    /// The height after which the payer may take it back, its payment
+    /// having confirmed in block `funded`: `timeout`, or `wait` blocks after
+    /// it, the first block the refund confirms in being `wait` after it.
+    pub fn refund_height(&self, funded: u32) -> u32 {
+        match self.wait {
+            Some(wait) => funded.saturating_add(u32::from(wait)).saturating_sub(1),
+            None => self.timeout,
+        }
     }
 
     /// Its internal key's aggregate: of the claim key, then the refund
@@ -269,12 +291,26 @@ impl Htlc {
     ) -> Result<Transaction, Error> {
         let secp = Secp256k1::new();
         let keypair = Keypair::from_secret_key(&secp, secret);
-        let (key, script, lock_time) = match path {
-            Path::Claim(_) => (self.claim, self.claim_script(), LockTime::ZERO),
-            Path::Refund => (
+        // A claim's input is replaceable and enforces no time; a refund's
+        // enforces its lock time, or its relative wait.
+        let (key, script, lock_time, sequence) = match (path, self.wait) {
+            (Path::Claim(_), _) => (
+                self.claim,
+                self.claim_script(),
+                LockTime::ZERO,
+                Sequence::ENABLE_RBF_NO_LOCKTIME,
+            ),
+            (Path::Refund, None) => (
                 self.refund,
                 self.refund_script(),
                 LockTime::from_consensus(self.timeout),
+                Sequence::ENABLE_RBF_NO_LOCKTIME,
+            ),
+            (Path::Refund, Some(wait)) => (
+                self.refund,
+                self.refund_script(),
+                LockTime::ZERO,
+                Sequence::from_height(wait),
             ),
         };
         if keypair.x_only_public_key().0 != key {
@@ -301,8 +337,7 @@ impl Htlc {
             input: vec![TxIn {
                 previous_output: funding,
                 script_sig: ScriptBuf::new(),
-                // Replaceable, and its lock time enforced.
-                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                sequence,
                 // Sized with a signature's 64 bytes.
                 witness: witness(&[0; 64]),
             }],
