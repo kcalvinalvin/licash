@@ -326,23 +326,27 @@ impl Builder {
     /// The next block of the chain: checked as a header of a chain from a
     /// checkpoint is, and added. Its leaf. On error the chain is unchanged.
     pub fn push(&mut self, header: [u8; 80]) -> Result<Leaf, Error> {
-        let mut state = self.state.clone();
-        state.push(header)?;
+        // What can fail but the header's own checks, before them: the state's
+        // push leaves it as it was on an error, so nothing is copied to be
+        // put back.
         let work = self
             .work
             .checked_add(work(u32::from_le_bytes(
                 header[72..76].try_into().expect("four bytes"),
             )))
             .ok_or_else(|| bad("work overflows"))?;
+        if self.tree.count() == u32::MAX {
+            return Err(bad("full tree"));
+        }
+        self.state.push(header)?;
         let leaf = Leaf {
-            height: state.height(),
-            hash: sha256d(&header),
-            state: state.commitment(),
+            height: self.state.height(),
+            hash: *self.state.block_hash(),
+            state: self.state.commitment(),
             work,
         };
-        let mut tree = self.tree.clone();
-        tree.push(leaf.digest())?;
-        (self.state, self.tree, self.work) = (state, tree, work);
+        self.tree.push(leaf.digest()).expect("room was checked");
+        self.work = work;
         Ok(leaf)
     }
 

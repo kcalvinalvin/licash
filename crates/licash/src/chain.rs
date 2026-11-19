@@ -235,6 +235,10 @@ impl Checkpoint {
     pub fn height(&self) -> u32 {
         self.height
     }
+    /// The hash of its header, made once.
+    pub fn block_hash(&self) -> &[u8; 32] {
+        &self.hash
+    }
     pub fn header(&self) -> &HeaderBytes {
         &self.header
     }
