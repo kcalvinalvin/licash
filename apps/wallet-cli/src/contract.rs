@@ -840,7 +840,9 @@ mod tests {
             "{}",
             only.lines(144)
         );
-        assert!(Terms::of("hub", &offered(None), None, None, 1).is_err());
+        // Her part of its one contract changes its price not at all.
+        let part = Terms::of("hub", &offered(None), None, None, 1).unwrap();
+        assert_eq!((part.price, part.funded), (only.price, 1));
         assert!(Terms::of("hub", &offered(None), Some(131_071), Some(9), 0).is_err());
     }
 
