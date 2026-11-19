@@ -495,7 +495,10 @@ pub fn code_hubs<T: Transport>(wallet: &Wallet<T>, dir: &Path, tip: u32) -> Resu
     let mut hubs = Vec::new();
     for (url, _) in wallet.hubs()? {
         let urls = wallet.hub_urls(&url)?;
-        let at = |hub: &str| urls.iter().any(|u| u.trim_end_matches('/') == hub.trim_end_matches('/'));
+        let at = |hub: &str| {
+            urls.iter()
+                .any(|u| u.trim_end_matches('/') == hub.trim_end_matches('/'))
+        };
         let held = |b: &licash_wallet::Balance| at(&b.hub).then_some(b.available + b.pending);
         let held: u64 = balance.iter().filter_map(held).sum();
         let live = contracts.iter().filter(|c| c.live(tip) && c.at(&urls));
@@ -1202,7 +1205,10 @@ mod tests {
             (timing.with_work_depth(floor + crate::hub::terms::MAX_EXTRA_WORK)).unwrap()
         };
         let timings = [regtest, signet].into_iter().flat_map(|profile| {
-            [(profile, Timing::of(profile, None).unwrap()), (profile, deepest(profile))]
+            [
+                (profile, Timing::of(profile, None).unwrap()),
+                (profile, deepest(profile)),
+            ]
         });
         for (profile, timing) in timings {
             let checkpoint = Checkpoint::genesis(profile).unwrap();

@@ -552,7 +552,10 @@ mod tests {
     fn more_work_lengthens_the_assertion_window_by_as_much() {
         let parts = Hub::peek(funded()).unwrap().base.parts().clone();
         let (keyset, checkpoint) = (parts.keyset, parts.chain.checkpoint);
-        for profile in [ChainProfile::Core30DefaultRegtest, ChainProfile::Core30Signet] {
+        for profile in [
+            ChainProfile::Core30DefaultRegtest,
+            ChainProfile::Core30Signet,
+        ] {
             let timing = Timing::of(profile, Some(RANGE)).unwrap();
             let floor = Floors::of(profile).work_depth;
             let quote = |t: &Timing| t.quote(keyset.clone(), checkpoint.clone());

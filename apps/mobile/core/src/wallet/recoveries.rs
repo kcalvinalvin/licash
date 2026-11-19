@@ -323,7 +323,9 @@ impl Wallet {
             match paid {
                 Ok(paying) => {
                     tracing::info!(%id, hash = %paying.id, amount, "notes paid out for a forced close's fees");
-                    if let Err(e) = recovery::expect_fee(&self.dir, &need.id, need.purpose, &paying.id) {
+                    if let Err(e) =
+                        recovery::expect_fee(&self.dir, &need.id, need.purpose, &paying.id)
+                    {
                         tracing::warn!(%id, "a fee payout not recorded: {e:#}");
                     }
                 }

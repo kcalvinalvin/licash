@@ -143,7 +143,10 @@ impl Share {
             let minus_e = Scalar::from(e.negate());
             // R1 = s G - e X_r, R2 = s B' - e S'.
             let r1 = add(&s.public_key(secp()), &mul(&key, &minus_e)?)?;
-            let r2 = add(&mul(blinded, &Scalar::from(s))?, &mul(&self.point, &minus_e)?)?;
+            let r2 = add(
+                &mul(blinded, &Scalar::from(s))?,
+                &mul(&self.point, &minus_e)?,
+            )?;
             Ok(challenge(&r1, &r2, refund, blinded, &self.point)? == e)
         };
         check().unwrap_or(false)
@@ -184,7 +187,10 @@ pub fn claim_output(
     let inner = add(&mul(&mul(&scan, &Scalar::from(x_c))?, &a_c)?, share)?;
     // g_Q (g_P inner + t B_scan)
     let d = signed(add(&signed(inner, p_parity), &mul(&scan, &t)?)?, q_parity);
-    let key = info.output_key().to_x_only_public_key().public_key(Parity::Even);
+    let key = info
+        .output_key()
+        .to_x_only_public_key()
+        .public_key(Parity::Even);
     output_of_shared(&d, &key, funding, to)
 }
 
@@ -259,7 +265,10 @@ mod tests {
             assert_eq!(got, expected, "{parities:?}");
 
             // The payee finds it, of the claim's tweak.
-            let key = info.output_key().to_x_only_public_key().public_key(Parity::Even);
+            let key = info
+                .output_key()
+                .to_x_only_public_key()
+                .public_key(Parity::Even);
             let tweak = {
                 let hash = tagged(
                     "BIP0352/Inputs",
@@ -293,7 +302,10 @@ mod tests {
         let wrong = Share::new(&other, &blinded).unwrap();
         assert!(!wrong.verify(&refund, &blinded));
         // Its proof's scalars, not scalars: refused, not a panic.
-        let zero = Share { e: [0; 32], ..share };
+        let zero = Share {
+            e: [0; 32],
+            ..share
+        };
         assert!(!zero.verify(&refund, &blinded));
     }
 

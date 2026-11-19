@@ -1309,7 +1309,10 @@ async fn a_payout_to_a_silent_payment_address_pays_what_its_payee_finds() {
     let claimed = eco.client_follows(&payout).await;
     assert_eq!(claimed.state, PayoutState::Claimed);
     let mined = eco.pool.mine();
-    let claim = mined.iter().find(|tx| is_claim(tx)).expect("the claim mined");
+    let claim = mined
+        .iter()
+        .find(|tx| is_claim(tx))
+        .expect("the claim mined");
     assert_eq!(claim.output.len(), 1);
     assert_eq!(claim.output[0].value.to_sat(), 1_000);
     let coin = claimed.funding.unwrap();
@@ -1317,7 +1320,10 @@ async fn a_payout_to_a_silent_payment_address_pays_what_its_payee_finds() {
     let funding = coin_tx.output[coin.vout as usize].script_pubkey.clone();
     let tweak = silent::tweak(claim, &[funding.as_script()]).expect("a claim counted");
     assert_eq!(
-        payee.scanner([]).scan(&tweak, &silent::taproot_outputs(claim)).len(),
+        payee
+            .scanner([])
+            .scan(&tweak, &silent::taproot_outputs(claim))
+            .len(),
         1
     );
     eco.follow().await;

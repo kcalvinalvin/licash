@@ -303,12 +303,18 @@ fn key_agg_meets_bip327s_vectors() {
             .collect();
         let agg = key_agg(&keys).unwrap();
         let expected = case["expected"].as_str().unwrap().to_lowercase();
-        assert_eq!(hex::encode(agg.point.x_only_public_key().0.serialize()), expected);
+        assert_eq!(
+            hex::encode(agg.point.x_only_public_key().0.serialize()),
+            expected
+        );
         assert_eq!(agg.coefficients.len(), keys.len());
     }
     // Lists of a key BIP327 refuses: not keys to aggregate at all.
     for case in vectors["error_test_cases"].as_array().unwrap() {
-        if case["tweak_indices"].as_array().is_some_and(|t| !t.is_empty()) {
+        if case["tweak_indices"]
+            .as_array()
+            .is_some_and(|t| !t.is_empty())
+        {
             continue;
         }
         let parsed = case["key_indices"]
@@ -336,7 +342,9 @@ fn a_deposits_internal_key_aggregates_its_claim_and_refund_keys() {
         .public_key(Parity::Even)
         .mul_tweak(&secp, &agg.coefficients[0])
         .unwrap();
-    let sum = weighed.combine(&htlc.refund.public_key(Parity::Even)).unwrap();
+    let sum = weighed
+        .combine(&htlc.refund.public_key(Parity::Even))
+        .unwrap();
     assert_eq!(sum, agg.point);
     let info = htlc.spend_info();
     assert_eq!(info.internal_key(), agg.point.x_only_public_key().0);

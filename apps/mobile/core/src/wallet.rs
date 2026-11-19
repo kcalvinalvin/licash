@@ -652,7 +652,10 @@ impl Wallet {
             // Its silent payment address first: paid out to as any, of
             // an output no one else learns is its.
             let silent = code.silent.map(|s| s.to_string());
-            let address = code.address.as_ref().map(|a| a.assume_checked_ref().to_string());
+            let address = code
+                .address
+                .as_ref()
+                .map(|a| a.assume_checked_ref().to_string());
             if let Some(address) = silent.or(address) {
                 return Ok(Scanned::Bitcoin {
                     address,

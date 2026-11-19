@@ -552,7 +552,11 @@ fn a_phone_paid_on_bitcoin_moves_it_to_notes_and_pays_in_them() {
     // Her code in notes says nothing of Bitcoin, nor her code on Bitcoin
     // of notes.
     let in_notes = alice.payment_code(None).unwrap();
-    assert!(in_notes.qr.starts_with("LICASH:TLICASH1Q"), "{}", in_notes.qr);
+    assert!(
+        in_notes.qr.starts_with("LICASH:TLICASH1Q"),
+        "{}",
+        in_notes.qr
+    );
     assert_eq!((&in_notes.address, &in_notes.silent), (&None, &None));
     let code = alice.bitcoin_code(None).unwrap();
     assert!(code.qr.starts_with("BITCOIN:BCRT1P"), "{}", code.qr);

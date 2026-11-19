@@ -1194,9 +1194,7 @@ fn command(cli: Cli) -> anyhow::Result<()> {
                     }
                     openings.limit_live(max_live);
                     if let Some(depth) = work_depth {
-                        openings
-                            .ask_work(depth)
-                            .context("--contracts-work-depth")?;
+                        openings.ask_work(depth).context("--contracts-work-depth")?;
                     }
                     openings
                         .scale_proofs(proof_scale)

@@ -8,6 +8,7 @@ use bitcoin::{Amount, FeeRate, OutPoint, Sequence, Transaction, TxIn, TxOut, Txi
 use licash::claim::{self, Branch, Item, UnsignedClaim};
 use licash::recovery::{Filing, Publication, Witness as FilingWitness};
 use licash::request::Request;
+use licash::spend::ChainProfile;
 use licash_contract::graph::{link_args, HubProves, PURSE_VOUT};
 use licash_contract::{
     dispute::{self, presign, Payout},
@@ -15,7 +16,6 @@ use licash_contract::{
     opening::{Context, Holder, Opening},
 };
 use licash_onchain::deadline;
-use licash::spend::ChainProfile;
 use licash_wallet::{first_spend, ClaimNote, ClaimSlot, LockClaim, PayoutState, Transport, Wallet};
 use lichen_contract::Role;
 use serde::{Deserialize, Serialize};
@@ -586,7 +586,13 @@ pub fn expect_fee(dir: &std::path::Path, id: &[u8; 32], purpose: FeeFor, hash: &
             FeeFor::Publication => state.fee_payout = Some(hash.to_owned()),
             FeeFor::Challenge => state.challenge_payout = Some(hash.to_owned()),
         }
-        if store.save_recovery(id, (&row.stage, &row.state), &row.stage, false, &state.encode())? {
+        if store.save_recovery(
+            id,
+            (&row.stage, &row.state),
+            &row.stage,
+            false,
+            &state.encode(),
+        )? {
             return Ok(());
         }
     }
@@ -1383,8 +1389,8 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
                 let output = match outputs.get(&coin) {
                     Some(output) => output,
                     None => {
-                        let output = (self.wallet.silent_coin_output(&coin)?)
-                            .context("unknown fee coin")?;
+                        let output =
+                            (self.wallet.silent_coin_output(&coin)?).context("unknown fee coin")?;
                         outputs.entry(coin).or_insert(output)
                     }
                 };
@@ -1470,7 +1476,10 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
     fn payout_claim(&self, hash: Option<&str>) -> Result<Option<Txid>> {
         let Some(hash) = hash else { return Ok(None) };
         let payouts = self.wallet.payouts()?;
-        Ok(payouts.into_iter().find(|p| p.hash == hash).and_then(|p| p.claim))
+        Ok(payouts
+            .into_iter()
+            .find(|p| p.hash == hash)
+            .and_then(|p| p.claim))
     }
 
     /// Whether her payout of `hash` is under way: neither done nor failed.
@@ -1746,14 +1755,13 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
             return Ok(None);
         }
         let filing = self.filing_of(state)?;
-        let (bumped, prevouts) =
-            match self.build_p(r, &filing, Some((p, target)), state, true) {
-                Ok(made) => made,
-                Err(e) => {
-                    self.trouble(format!("{e:#}"));
-                    return Ok(None);
-                }
-            };
+        let (bumped, prevouts) = match self.build_p(r, &filing, Some((p, target)), state, true) {
+            Ok(made) => made,
+            Err(e) => {
+                self.trouble(format!("{e:#}"));
+                return Ok(None);
+            }
+        };
         tracing::info!(id = %crate::hex_id(&self.id), from = %paid, to = %target, "her publication bumped");
         let _ = self.wallet.abandon_silent(&p.compute_txid());
         state.p = Some(bumped);
@@ -3095,17 +3103,31 @@ mod tests {
             state: awaiting.encode(),
             ..row
         };
-        assert_eq!(State::decode(&row).unwrap().fee_payout.as_deref(), Some("ab"));
+        assert_eq!(
+            State::decode(&row).unwrap().fee_payout.as_deref(),
+            Some("ab")
+        );
     }
 
     #[test]
     fn fees_are_paid_by_the_purse_then_one_coin_the_payouts_first_then_coins_joined() {
         let coin = |n: u8| OutPoint::new(Txid::from_byte_array([n; 32]), 0);
-        let free = [(coin(1), 5_000), (coin(2), 900), (coin(3), 40), (coin(4), 2_000)];
+        let free = [
+            (coin(1), 5_000),
+            (coin(2), 900),
+            (coin(3), 40),
+            (coin(4), 2_000),
+        ];
         // Each alone, the smallest first; never two together unless asked.
         assert_eq!(
             fee_inputs(&free, None, 100, false),
-            vec![vec![], vec![coin(3)], vec![coin(2)], vec![coin(4)], vec![coin(1)]]
+            vec![
+                vec![],
+                vec![coin(3)],
+                vec![coin(2)],
+                vec![coin(4)],
+                vec![coin(1)]
+            ]
         );
         // The payout's coin first, alone and joined; then the largest, until
         // one adds no more than its input's fee.
@@ -3122,7 +3144,10 @@ mod tests {
                 vec![coin(2), coin(1), coin(4)],
             ]
         );
-        assert_eq!(fee_inputs(&[], paid, 100, true), vec![Vec::<OutPoint>::new()]);
+        assert_eq!(
+            fee_inputs(&[], paid, 100, true),
+            vec![Vec::<OutPoint>::new()]
+        );
     }
 
     #[test]

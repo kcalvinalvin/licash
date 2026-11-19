@@ -1013,7 +1013,16 @@ mod tests {
         for i in found {
             match admit(i) {
                 Admission::Admit => {
-                    p.commit(&[i; 32], [0; 32], deadline(i), 100, 2_000_000, true, false, 100);
+                    p.commit(
+                        &[i; 32],
+                        [0; 32],
+                        deadline(i),
+                        100,
+                        2_000_000,
+                        true,
+                        false,
+                        100,
+                    );
                     answered.push(i);
                 }
                 Admission::Withhold(why) => assert!(
@@ -1031,7 +1040,16 @@ mod tests {
             let next = p.0.next(&p.0.state());
             let Some((id, _)) = next else { break };
             proved.push(id[0]);
-            p.commit(&id, [0; 32], deadline(id[0]), 100, 2_000_000, true, true, 100);
+            p.commit(
+                &id,
+                [0; 32],
+                deadline(id[0]),
+                100,
+                2_000_000,
+                true,
+                true,
+                100,
+            );
         }
         assert_eq!(proved, [8, 6, 7, 5]);
     }

@@ -661,7 +661,10 @@ fn payout_bodies_name_their_fields_on_the_wire() {
     let silent = request.clone().with_scan([0x02; 33]);
     assert_eq!(json(&silent), silent);
     assert_eq!(silent.scan().unwrap(), Some([0x02; 33]));
-    assert_eq!(serde_json::to_value(&silent).unwrap()["scan"], json!("02".repeat(33)));
+    assert_eq!(
+        serde_json::to_value(&silent).unwrap()["scan"],
+        json!("02".repeat(33))
+    );
     assert_eq!(request.scan().unwrap(), None);
     let short = ChainRequest {
         scan: Some(Hex(vec![2; 32])),
