@@ -111,6 +111,7 @@ fn base_on(keyset: Keyset, nonce: u8, version: Version, id: u32) -> Base {
             max_rate_sat_per_kvb: 10_000,
             opening_fee_quote: 3_000,
         },
+        close: None,
     })
     .unwrap()
 }

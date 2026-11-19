@@ -1,6 +1,6 @@
 use k256::Scalar;
 use licash::{
-    base::{Base, ChainTerms, Fees, GraphTerms, Limits, Parts, Party, Recipe, Version},
+    base::{Base, ChainTerms, Close, Fees, GraphTerms, Limits, Parts, Party, Recipe, Version},
     chain::Checkpoint,
     crypto::{self, tagged_hash, Point},
     note::IssuerKeys,
@@ -176,6 +176,7 @@ fn parts() -> Parts {
             max_rate_sat_per_kvb: 10_000,
             opening_fee_quote: 3_000,
         },
+        close: None,
     }
 }
 
@@ -245,6 +246,68 @@ fn a_v4_base_binds_her_request_keys_and_keeps_v3_as_it_was() {
         holder_wots: [0; 32],
     };
     assert!(Base::new(p).is_err());
+}
+
+/// A v6 Base carries the script the default returns her reserve to, and
+/// what the Hub keeps of it for the swap, after v5's fields; no other
+/// version carries them.
+#[test]
+fn a_v6_base_commits_to_where_the_default_returns_her_reserve() {
+    let mut p = parts();
+    p.graph.deposit_units = 100;
+    p.version = Version::V6 {
+        holder_wots: [9; 32],
+        funded: [7; 32],
+    };
+    let close = Close {
+        script: vec![0x51, 0x20, 3, 3, 3],
+        fee: 1_000,
+    };
+    p.close = Some(close.clone());
+    let v6 = Base::new(p.clone()).unwrap();
+    let bytes = v6.to_bytes();
+    assert!(bytes.starts_with(b"LICASH-BASE\x06"));
+    assert_eq!(v6.digest(), tagged_hash("licash/base/v6", &[&bytes]));
+    let restored = Base::from_bytes(&bytes).unwrap();
+    assert_eq!(restored.parts().close, Some(close));
+    assert_eq!(restored.to_bytes(), bytes);
+    // The script and the fee are each part of the contract.
+    for change in 0..2 {
+        let mut other = p.clone();
+        match change {
+            0 => other.close.as_mut().unwrap().script[2] ^= 1,
+            _ => other.close.as_mut().unwrap().fee += 1,
+        }
+        assert_ne!(Base::new(other).unwrap().digest(), v6.digest());
+    }
+    // Truncated or extended bytes are refused.
+    assert!(Base::from_bytes(&bytes[..bytes.len() - 1]).is_err());
+    let mut longer = bytes.clone();
+    longer.push(0);
+    assert!(Base::from_bytes(&longer).is_err());
+    // A v6 Base without its close, or another version with one, is refused.
+    let mut none = p.clone();
+    none.close = None;
+    assert!(Base::new(none).is_err());
+    let mut v5 = p.clone();
+    v5.version = Version::V5 {
+        holder_wots: [9; 32],
+        funded: [7; 32],
+    };
+    assert!(Base::new(v5).is_err());
+    // The default's script is never her payout script, and the swap's fee
+    // leaves the notes worth a dust output at least.
+    let mut payout = p.clone();
+    payout.close.as_mut().unwrap().script = payout.parties[0].payout_script.clone();
+    assert!(Base::new(payout).is_err());
+    for fee in [20_000 - 329, 20_001, u64::MAX] {
+        let mut dear = p.clone();
+        dear.close.as_mut().unwrap().fee = fee;
+        assert!(Base::new(dear).is_err(), "a fee of {fee}");
+    }
+    let mut cheapest = p.clone();
+    cheapest.close.as_mut().unwrap().fee = 20_000 - 330;
+    assert!(Base::new(cheapest).is_ok());
 }
 
 #[test]

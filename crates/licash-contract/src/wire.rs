@@ -503,6 +503,19 @@ pub struct Open {
     /// What she funds of the contract herself, which a v5 Base commits
     /// to: written after her request keys, which it needs, if any.
     pub funded: Option<FundedNotes>,
+    /// Where the default returns her reserve and what the Hub keeps of it,
+    /// which a v6 Base commits to ([`licash::base::Close`]): written after
+    /// her funded notes, which it needs. Without it the Base is v5 at most.
+    pub close: Option<CloseOffer>,
+}
+
+/// The Hub's deposit that swaps her reserve for notes, as she names it: the
+/// script the default pays her reserve to, and the fee the Hub keeps of it
+/// if the swap happens. The Hub holds her to the fee its deposits ask.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CloseOffer {
+    pub script: ScriptBuf,
+    pub fee: u64,
 }
 
 /// The notes she funds her part of a contract with: the outputs, in
@@ -536,6 +549,10 @@ message!(
                 w.count(funded.outputs.len());
                 for output in &funded.outputs {
                     w.bytes(&output.to_bytes());
+                }
+                if let Some(close) = &self.close {
+                    w.blob(close.script.as_bytes());
+                    w.u64(close.fee);
                 }
             }
         }
@@ -572,6 +589,15 @@ message!(
             }
             Some(FundedNotes { ephemeral, outputs })
         };
+        let close = if r.0.is_empty() {
+            None
+        } else {
+            ensure!(funded.is_some(), "a close without funded notes");
+            Some(CloseOffer {
+                script: ScriptBuf::from_bytes(r.blob()?.to_vec()),
+                fee: r.u64()?,
+            })
+        };
         Self {
             party,
             claim_key,
@@ -582,6 +608,7 @@ message!(
             mock: mock == 1,
             request_keys,
             funded,
+            close,
         }
     }
 );
@@ -847,6 +874,7 @@ mod tests {
             mock: false,
             request_keys: None,
             funded: None,
+            close: None,
         };
         let digest = keys.public().request_keys().unwrap().digest();
         let bound = Open {

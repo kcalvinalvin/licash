@@ -20,6 +20,7 @@ use crate::{
 const BASE_TAG_V3: &[u8] = b"LICASH-BASE\x03";
 const BASE_TAG_V4: &[u8] = b"LICASH-BASE\x04";
 const BASE_TAG_V5: &[u8] = b"LICASH-BASE\x05";
+const BASE_TAG_V6: &[u8] = b"LICASH-BASE\x06";
 pub const MAX_BASE_BYTES: usize = 128_000;
 const MAX_MONEY: u64 = 2_100_000_000_000_000;
 /// The one graph a Base can name: Lichen's hub-proves graph.
@@ -141,6 +142,21 @@ pub struct Limits {
     pub max_source_inputs: u32,
 }
 
+/// Where the default close returns the holder's reserve (v6): a script of
+/// its own, never her payout script, so that the contract's end by default
+/// pays no coin of hers and is not linked to her wallet. It is the Hub's
+/// deposit that swaps the reserve for notes: the Hub locks its notes to her
+/// under the deposit's hash, worth the reserve less `fee`, and takes the
+/// coins when she claims them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Close {
+    pub script: Vec<u8>,
+    /// What the Hub keeps of the reserve for the swap, agreed here and
+    /// paid only if the swap happens: after the deposit's timeout she takes
+    /// the whole reserve back on Bitcoin.
+    pub fee: u64,
+}
+
 /// Fee terms: the quote's rate ceiling and the opening's fee.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Fees {
@@ -170,6 +186,12 @@ pub enum Version {
         holder_wots: [u8; 32],
         funded: [u8; 32],
     },
+    /// As v5, and the default close returns her reserve to a script of its
+    /// own ([`Close`], in [`Parts::close`]).
+    V6 {
+        holder_wots: [u8; 32],
+        funded: [u8; 32],
+    },
 }
 
 impl Version {
@@ -177,20 +199,28 @@ impl Version {
     pub fn holder_wots(&self) -> Option<[u8; 32]> {
         match *self {
             Self::V3 => None,
-            Self::V4 { holder_wots } | Self::V5 { holder_wots, .. } => Some(holder_wots),
+            Self::V4 { holder_wots }
+            | Self::V5 { holder_wots, .. }
+            | Self::V6 { holder_wots, .. } => Some(holder_wots),
         }
     }
 
-    /// The commitment to her funded outputs, of v5.
+    /// The commitment to her funded outputs, of v5 and v6.
     pub fn funded(&self) -> Option<[u8; 32]> {
         match *self {
-            Self::V5 { funded, .. } => Some(funded),
+            Self::V5 { funded, .. } | Self::V6 { funded, .. } => Some(funded),
             _ => None,
         }
     }
 
+    /// Whether the default close returns her reserve to a script of its
+    /// own ([`Parts::close`]): of v6.
+    pub fn closes_apart(&self) -> bool {
+        matches!(self, Self::V6 { .. })
+    }
+
     /// Whether v4's rules hold: a lock anchored to its own checkpoint, a
-    /// Pay owed only with an activation. Of v4 and v5.
+    /// Pay owed only with an activation. Of v4 on.
     pub fn anchored(&self) -> bool {
         !matches!(self, Self::V3)
     }
@@ -212,6 +242,9 @@ pub struct Parts {
     pub chain: ChainTerms,
     pub limits: Limits,
     pub fees: Fees,
+    /// Where her reserve returns by default: set under v6, and under no
+    /// other version.
+    pub close: Option<Close>,
 }
 
 /// An unsigned canonical preimage, NOT an accepted/prepared opening, a trusted
@@ -283,6 +316,21 @@ impl Base {
             }
         }
         let g = &p.graph;
+        match (&p.close, p.version.closes_apart()) {
+            (None, false) => {}
+            (Some(close), true) => {
+                // Her reserve less the fee is what the Hub locks to her:
+                // at least a dust output's worth.
+                if close.script.len() < 2
+                    || close.script.len() > 10_000
+                    || close.script == p.parties[0].payout_script
+                    || g.reserve_alice.checked_sub(close.fee) < Some(g.dust)
+                {
+                    return Err(bad("native default close"));
+                }
+            }
+            _ => return Err(bad("native default close of another version")),
+        }
         g.graph_value()?;
         let c = &p.chain;
         if g.unit_sats != 1
@@ -361,6 +409,7 @@ impl Base {
             Version::V3 => BASE_TAG_V3,
             Version::V4 { .. } => BASE_TAG_V4,
             Version::V5 { .. } => BASE_TAG_V5,
+            Version::V6 { .. } => BASE_TAG_V6,
         }
         .to_vec();
         bytes.extend(p.nonce);
@@ -428,6 +477,10 @@ impl Base {
         if let Some(funded) = p.version.funded() {
             bytes.extend(funded);
         }
+        if let Some(close) = &p.close {
+            put_blob(&mut bytes, &close.script);
+            bytes.extend(close.fee.to_be_bytes());
+        }
         bytes
     }
 
@@ -440,6 +493,7 @@ impl Base {
             tag if tag == BASE_TAG_V3 => 3,
             tag if tag == BASE_TAG_V4 => 4,
             tag if tag == BASE_TAG_V5 => 5,
+            tag if tag == BASE_TAG_V6 => 6,
             _ => return Err(bad("native Base tag")),
         };
         let nonce = reader.array()?;
@@ -507,10 +561,21 @@ impl Base {
             4 => Version::V4 {
                 holder_wots: reader.array()?,
             },
-            _ => Version::V5 {
+            5 => Version::V5 {
                 holder_wots: reader.array()?,
                 funded: reader.array()?,
             },
+            _ => Version::V6 {
+                holder_wots: reader.array()?,
+                funded: reader.array()?,
+            },
+        };
+        let close = match version.closes_apart() {
+            true => Some(Close {
+                script: reader.blob(10_000)?.to_vec(),
+                fee: reader.u64()?,
+            }),
+            false => None,
         };
         if !reader.0.is_empty() {
             return Err(bad("trailing native Base bytes"));
@@ -528,6 +593,7 @@ impl Base {
             chain,
             limits,
             fees,
+            close,
         })
     }
 
@@ -536,6 +602,7 @@ impl Base {
             Version::V3 => "licash/base/v3",
             Version::V4 { .. } => "licash/base/v4",
             Version::V5 { .. } => "licash/base/v5",
+            Version::V6 { .. } => "licash/base/v6",
         };
         crypto::tagged_hash(domain, &[&self.to_bytes()])
     }

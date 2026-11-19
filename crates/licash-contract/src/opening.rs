@@ -2,7 +2,7 @@
 //! every `Keep` artifact, then state, then sends, signatures, or broadcasts.
 use anyhow::{bail, ensure, Context as _, Result};
 use licash::{
-    base::{Base, ChainTerms, Fees, GraphTerms, Limits, Parts, Recipe, Version},
+    base::{Base, ChainTerms, Close, Fees, GraphTerms, Limits, Parts, Recipe, Version},
     chain::Checkpoint,
     note::Keyset,
     spend::ChainProfile,
@@ -255,19 +255,40 @@ fn offer(
     recipe.program = program;
     let mut chain = quote.chain.clone();
     chain.checkpoint = checkpoint.clone();
-    let version = match (open.request_keys, graph.deposit_units, &open.funded) {
-        (None, 0, None) => Version::V3,
-        (Some(holder_wots), 0, None) => Version::V4 { holder_wots },
-        (_, 0, Some(_)) => bail!("funded outputs of an unfunded quote"),
-        (Some(holder_wots), units, Some(funded)) => {
+    let (version, close) = match (
+        open.request_keys,
+        graph.deposit_units,
+        &open.funded,
+        &open.close,
+    ) {
+        (None, 0, None, None) => (Version::V3, None),
+        (Some(holder_wots), 0, None, None) => (Version::V4 { holder_wots }, None),
+        (_, 0, Some(_), _) | (_, 0, _, Some(_)) => bail!("funded outputs of an unfunded quote"),
+        (Some(holder_wots), units, Some(funded), close) => {
             check_funded(&funded.outputs, &quote.keyset, &quote.limits, units)?;
-            Version::V5 {
-                holder_wots,
-                funded: licash::spend::funded_root(&funded.outputs)?,
+            let funded = licash::spend::funded_root(&funded.outputs)?;
+            match close {
+                None => (
+                    Version::V5 {
+                        holder_wots,
+                        funded,
+                    },
+                    None,
+                ),
+                Some(close) => (
+                    Version::V6 {
+                        holder_wots,
+                        funded,
+                    },
+                    Some(Close {
+                        script: close.script.to_bytes(),
+                        fee: close.fee,
+                    }),
+                ),
             }
         }
-        (Some(_), _, None) => bail!("1 to 32 funded outputs, none given"),
-        (None, _, _) => bail!("funding her part needs her request's keys"),
+        (Some(_), _, None, _) => bail!("1 to 32 funded outputs, none given"),
+        (None, _, _, _) => bail!("funding her part needs her request's keys"),
     };
     Ok(Base::new(Parts {
         version,
@@ -282,6 +303,7 @@ fn offer(
         chain,
         limits: quote.limits.clone(),
         fees: quote.fees.clone(),
+        close,
     })?)
 }
 
@@ -604,6 +626,10 @@ pub struct Start {
     /// The notes she funds her part of the contract with, worth the
     /// quote's `deposit_units`: none unless she funds some.
     pub funded: Option<wire::FundedNotes>,
+    /// Where the default returns her reserve instead of `payout`: the Hub's
+    /// deposit that swaps it for notes. A v6 Base, which needs her funded
+    /// notes.
+    pub close: Option<wire::CloseOffer>,
 }
 
 /// What the holder keeps to play a funded contract. She needs no uploaded
@@ -690,6 +716,7 @@ impl Holder {
             mock: ctx.trust.mock,
             request_keys: Some(keys.public().request_keys()?.digest()),
             funded: s.funded,
+            close: s.close,
         };
         check_deposit(&open, &s.quote.graph, &s.quote.fees)?;
         let h = Self {
@@ -1528,6 +1555,7 @@ pub mod testing {
                 max_rate_sat_per_kvb: 10000,
                 opening_fee_quote: 1000,
             },
+            close: None,
         })
         .unwrap()
     }
@@ -1629,6 +1657,7 @@ mod tests {
                 response_window: q.graph.response_window,
             },
             funded: None,
+            close: None,
         };
         let trust = |compact, lean| Context {
             tip: 1,
@@ -1687,6 +1716,7 @@ mod tests {
             mock: true,
             request_keys: None,
             funded: None,
+            close: None,
         };
         assert!(check_deposit(&open, &q.graph, &q.fees).is_ok());
         // A bare script relays no payout of hers.
@@ -1749,6 +1779,7 @@ mod tests {
                 ephemeral: output(3).blinded(),
                 outputs: vec![output(8), output(4)],
             }),
+            close: None,
         };
         let hub = graph::party(&HubKeys::from_secret(&[2; 32]).party.public());
         let checkpoint = q.chain.checkpoint.clone();
@@ -1809,6 +1840,117 @@ mod tests {
         assert!(e.to_string().contains("unfunded"), "{e}");
     }
 
+    /// With a close script she names, a funded quote opens v6: the Base
+    /// commits to the script and to the fee the quote asks of the swap, and
+    /// the graph's default returns her reserve there, the hub's share and
+    /// every dispute payout still to the payout scripts.
+    #[test]
+    fn a_close_script_opens_v6_and_the_default_pays_her_reserve_there() {
+        let id = [3; 32];
+        let mut q = Quote::from_base(&testing::base(&id));
+        q.graph.deposit_units = 12;
+        let keys = HolderKeys::derive(&[1; 32], &id);
+        let output = |n: u64| {
+            let point = licash::crypto::generator_mul(&n.into());
+            licash::spend::Output::new(
+                n,
+                licash::crypto::Point::from_projective(&point),
+                [n as u8; 32],
+            )
+            .unwrap()
+        };
+        let digest = keys.public().request_keys().unwrap().digest();
+        let close = wallet_script(9);
+        let offer_close = wire::CloseOffer {
+            script: close.clone(),
+            fee: 700,
+        };
+        let open = wire::Open {
+            party: keys.party.public(),
+            claim_key: keys.claim_key(),
+            deposit: OutPoint {
+                txid: Txid::from_byte_array([4; 32]),
+                vout: 0,
+            },
+            coin: TxOut {
+                value: Amount::from_sat(1_002_000),
+                script_pubkey: ScriptBuf::new_p2tr(SECP256K1, keys.claim_key(), None),
+            },
+            change: wallet_script(5),
+            wanted: wire::Wanted {
+                request_height: 100,
+                close_height: 1000,
+                response_window: 24,
+            },
+            mock: true,
+            request_keys: Some(digest),
+            funded: Some(wire::FundedNotes {
+                ephemeral: output(3).blinded(),
+                outputs: vec![output(8), output(4)],
+            }),
+            close: Some(offer_close.clone()),
+        };
+        let hub_keys = HubKeys::from_secret(&[2; 32]);
+        let hub = graph::party(&hub_keys.party.public());
+        let checkpoint = q.chain.checkpoint.clone();
+        let b = offer(&q, id, &open, [11; 32], &checkpoint, hub.clone()).unwrap();
+        assert!(matches!(b.version(), Version::V6 { .. }));
+        let committed = b.parts().close.clone().unwrap();
+        assert_eq!(committed.script, close.to_bytes());
+        assert_eq!(committed.fee, 700);
+        // Her payout script is not what she named, and the open survives the
+        // wire.
+        assert_ne!(open.party.payout_spk, close);
+        assert_eq!(wire::Open::decode(&open.encode()).unwrap(), open);
+
+        // The default pays her reserve to the script she named, the hub its
+        // share to its own.
+        let (holder, hub_pub) = (keys.public(), hub_keys.public());
+        let babe = graph::build(&b, &holder, &hub_pub, graph::draft_hmsg(b.parts().recipe.kept))
+            .unwrap();
+        let set = babe.presign(OutPoint::null()).unwrap();
+        let default = set.iter().find(|p| p.name == "default").unwrap();
+        assert_eq!(default.tx.output.len(), 2);
+        assert_eq!(default.tx.output[0].script_pubkey, close);
+        assert_eq!(
+            default.tx.output[0].value.to_sat(),
+            b.parts().graph.reserve_alice
+        );
+        assert_eq!(
+            default.tx.output[1].script_pubkey,
+            graph::party_pub(&hub).unwrap().payout_spk
+        );
+        // A Base without it (v5) returns her reserve to her payout script.
+        let v5 = offer(
+            &q,
+            id,
+            &wire::Open {
+                close: None,
+                ..open.clone()
+            },
+            [11; 32],
+            &checkpoint,
+            hub,
+        )
+        .unwrap();
+        let babe = graph::build(&v5, &holder, &hub_pub, graph::draft_hmsg(v5.parts().recipe.kept))
+            .unwrap();
+        let set = babe.presign(OutPoint::null()).unwrap();
+        let default = set.iter().find(|p| p.name == "default").unwrap();
+        assert_eq!(default.tx.output[0].script_pubkey, open.party.payout_spk);
+        // A fee that leaves no notes worth a dust output is refused.
+        let dear = wire::Open {
+            close: Some(wire::CloseOffer {
+                fee: b.parts().graph.reserve_alice,
+                ..offer_close
+            }),
+            ..open.clone()
+        };
+        let e = offer(&q, id, &dear, [11; 32], &checkpoint, graph::party(&hub_keys.party.public()))
+            .unwrap_err();
+        assert!(e.to_string().contains("default close"), "{e}");
+    }
+
     #[test]
     fn funding_preserves_the_deposit_change_and_segwit_txid() {
         let id = [3; 32];
@@ -1836,6 +1978,7 @@ mod tests {
             mock: true,
             request_keys: None,
             funded: None,
+            close: None,
         };
         let graph =
             graph::build(&base, &keys.public(), &hub.public(), graph::draft_hmsg(2)).unwrap();
@@ -1922,6 +2065,7 @@ mod tests {
                 payout: wallet_script(5),
                 wanted,
                 funded: None,
+                close: None,
             },
             id,
             &ctx,
