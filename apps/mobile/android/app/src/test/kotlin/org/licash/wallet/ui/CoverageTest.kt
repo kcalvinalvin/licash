@@ -20,7 +20,7 @@ class CoverageTest {
 
     private fun contract(hub: String, cap: ULong, covers: ULong, state: ContractState = ContractState.Protecting) =
         Contract(
-            id = "c$cap", hub = hub, state = state, mock = false, cap = cap, price = 1_000uL, paidFrom = 50_000uL,
+            id = "c$cap", hub = hub, state = state, mock = false, cap = cap, price = 1_000uL, funded = 0uL, fundedReceived = false, paidFrom = 50_000uL,
             protectsUntil = 2_000u, closesAt = 2_100u, funding = null, createdAt = 0L, covers = covers, step = null,
             transfer = null,
         )
