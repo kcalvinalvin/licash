@@ -376,6 +376,7 @@ fn input(base: &Base, exit: Exit, evidence: Vec<Evidence>) -> HubInput {
         evidence,
         keys: keys(),
         invalid: 0,
+        chain: None,
     }
 }
 
@@ -822,4 +823,340 @@ fn a_lean_disclosure_is_the_secrets_it_uses_and_no_padding() {
         verdict(&owed, 10, Some(&lean), false),
         Err(Refusal::Undisclosed)
     );
+}
+
+// ----- a chained contract: the exit's blocks opened from a chain proven beforehand -----
+
+mod chained {
+    use super::*;
+    use licash::recovery::{chained, Owed};
+    use licash_hp::{
+        decide_with, flagged_on,
+        headers::{Lineage, Proven},
+        open_chain, Chained, Program,
+    };
+    use licash_statement::Read;
+
+    /// The chain program's image id, as a test has it.
+    const CHAIN: [u8; 32] = [0xc1; 32];
+    const ON: u32 = licash::recovery::CHAINED_FROM;
+
+    fn program() -> Program<'static> {
+        Program {
+            id: CHAIN,
+            verify: &|_, _| {},
+        }
+    }
+
+    /// The chain a hub keeps: Base's checkpoint, then every header of `exit`.
+    fn lineage(base: &Base, exit: &Exit) -> Lineage {
+        let mut lineage = Lineage::new(base.parts().chain.checkpoint.clone()).unwrap();
+        for header in &exit.headers {
+            lineage.push(*header).unwrap();
+        }
+        lineage
+    }
+
+    /// What the statement decided before there were chains: every header from
+    /// the checkpoint, the claim's judgment on a dense chain through her
+    /// publication.
+    fn dense(base: &Base, exit: &Exit, evidence: &[Evidence]) -> (Owed, Read) {
+        let contract = contract(base);
+        let read = licash_statement::read(&contract, exit).unwrap();
+        let chain =
+            licash_hp::chain(base, licash_hp::through_publication(&contract, exit, &read)).unwrap();
+        let request = licash::request::Request {
+            amount: read.b,
+            claim_digest: read.e,
+        };
+        let owed = licash::recovery::owed(base, &request, &read.claim, evidence, &chain).unwrap();
+        (owed, read)
+    }
+
+    /// `exit` as a hub shows it on a chain proven through height `through`:
+    /// its headers those after, the chain's proof opened to what the
+    /// judgment reads.
+    fn on(base: &Base, exit: &Exit, evidence: &[Evidence], through: u32) -> (HubInput, Lineage) {
+        let lineage = lineage(base, exit);
+        let (journal, tip) = lineage.through(CHAIN, through).unwrap();
+        let mut shown = exit.clone();
+        shown.headers = exit.headers[through as usize..].to_vec();
+        let proven = Proven {
+            lineage: &lineage,
+            journal: &journal,
+            tip: &tip,
+        };
+        let proof = open_chain(proven, base, None, &shown, evidence, &program()).unwrap();
+        let chained = Chained {
+            proof: &proof,
+            program: &program(),
+        };
+        let invalid = flagged_on(base, None, &shown, evidence, chained).unwrap();
+        let input = HubInput {
+            base: base.clone(),
+            exit: shown,
+            evidence: evidence.to_vec(),
+            keys: None,
+            invalid,
+            chain: Some(proof),
+        };
+        (input, lineage)
+    }
+
+    fn decided(input: &HubInput) -> Result<(Owed, Read), Refusal> {
+        let chained = Chained {
+            proof: input.chain.as_ref().unwrap(),
+            program: &program(),
+        };
+        decide_with(
+            &input.base,
+            None,
+            &input.exit,
+            &input.evidence,
+            None,
+            Some(chained),
+            &mut |_| {},
+        )
+    }
+
+    /// Her request is block 1, her publication 2, the response 9, and six
+    /// blocks follow each.
+    #[test]
+    fn a_chained_statement_decides_what_the_dense_one_does_wherever_the_chain_ends() {
+        let (f, spent) = stale_on(Version::V3, ON);
+        assert!(chained(f.base.parts().graph.id));
+        let x = exit(&f.base, f.b, &f.e, &f.bytes, 64);
+        let evidence = std::slice::from_ref(&spent);
+        let want = dense(&f.base, &x, evidence);
+        assert_eq!((want.0.owed, want.1.b2), (64, 64));
+        // The chain ends at the response, among the six after it, and at the
+        // exit's last block: the work on top comes from the chain and its tail.
+        for through in [9, 10, 12, 15] {
+            let (input, _) = on(&f.base, &x, evidence, through);
+            assert_eq!(decided(&input).unwrap(), want, "through {through}");
+            assert_eq!(
+                licash_hp::check_on(&input, &program()).unwrap(),
+                contract(&f.base).journal(),
+                "through {through}"
+            );
+            // It travels as bytes, decoded strictly.
+            let bytes = input.to_bytes();
+            let back = HubInput::from_bytes(&bytes).unwrap();
+            assert_eq!(
+                licash_hp::check_on(&back, &program()).unwrap(),
+                contract(&f.base).journal()
+            );
+            assert_eq!(
+                HubInput::from_bytes(&bytes[..bytes.len() - 1]).err(),
+                Some(Refusal::Input)
+            );
+        }
+        // Of a claim the evidence leaves owed more than the response says, as ever.
+        let short = exit(&f.base, f.b, &f.e, &f.bytes, 63);
+        let (input, _) = on(&f.base, &short, evidence, 9);
+        assert_eq!(licash_hp::check_on(&input, &program()), Err(Refusal::Owed));
+    }
+
+    /// A contract is decided on its chain or on its exit's headers, by its
+    /// graph id, and never the other.
+    #[test]
+    fn a_contract_is_decided_on_its_chain_or_its_headers_by_its_graph_id() {
+        let (f, spent) = stale_on(Version::V3, ON);
+        let x = exit(&f.base, f.b, &f.e, &f.bytes, 64);
+        let evidence = std::slice::from_ref(&spent);
+        let (input, _) = on(&f.base, &x, evidence, 9);
+        // headers instead of the chain
+        let dense_input = HubInput {
+            chain: None,
+            ..input.clone()
+        };
+        assert!(matches!(check(&dense_input), Err(Refusal::Chain(_))));
+        // a chain, and no program to verify its receipt
+        let mut w = licash_statement::codec::W::default();
+        input.chain.as_ref().unwrap().write(&mut w);
+        assert!(matches!(
+            licash_hp::check_with(&input, None, &mut |_| {}),
+            Err(Refusal::Chain(_))
+        ));
+        // a graph before the chain's, which has no chain to carry
+        let (g, spent) = stale_on(Version::V3, ON - 1);
+        let x = exit(&g.base, g.b, &g.e, &g.bytes, 64);
+        let carried = HubInput {
+            chain: input.chain.clone(),
+            ..self::super::input(&g.base, x, vec![spent])
+        };
+        assert!(matches!(
+            licash_hp::check_with(&carried, Some(&program()), &mut |_| {}),
+            Err(Refusal::Chain(_))
+        ));
+    }
+
+    /// What a hub can't leave out: the block at the checkpoint, and each the
+    /// exit sits in.
+    #[test]
+    fn a_block_the_statement_needs_that_is_not_opened_is_no_proof() {
+        let (f, spent) = stale_on(Version::V3, ON);
+        let x = exit(&f.base, f.b, &f.e, &f.bytes, 64);
+        let evidence = std::slice::from_ref(&spent);
+        let (input, _) = on(&f.base, &x, evidence, 12);
+        let proof = input.chain.clone().unwrap();
+        let heights: Vec<u32> = proof.openings.iter().map(|o| o.height).collect();
+        assert_eq!(heights, [0, 1, 2, 9]);
+        for (left_out, want) in [
+            (0, Some(Refusal::Openings(vec![0]))),
+            (1, None),
+            (2, None),
+            (9, None),
+        ] {
+            let mut left = proof.clone();
+            left.openings.retain(|o| o.height != left_out);
+            let input = HubInput {
+                chain: Some(left),
+                ..input.clone()
+            };
+            let got = decided(&input).err();
+            match want {
+                Some(want) => assert_eq!(got, Some(want)),
+                // an exit block that is not a leaf of the chain is no exit
+                None => assert!(
+                    matches!(got, Some(Refusal::Exit(licash_statement::Reject::Depth))),
+                    "{left_out}: {got:?}"
+                ),
+            }
+        }
+    }
+
+    /// Whatever the hub says of the chain is checked against the journal the
+    /// statement verified.
+    #[test]
+    fn an_opening_the_journals_tree_doesnt_hold_is_refused() {
+        let (f, spent) = stale_on(Version::V3, ON);
+        let x = exit(&f.base, f.b, &f.e, &f.bytes, 64);
+        let evidence = std::slice::from_ref(&spent);
+        let (input, _) = on(&f.base, &x, evidence, 12);
+        let refused = |proof: licash_hp::headers::ChainProof| {
+            let input = HubInput {
+                chain: Some(proof),
+                ..input.clone()
+            };
+            decided(&input).err()
+        };
+        let proof = input.chain.clone().unwrap();
+        let at = |height: u32| {
+            proof
+                .openings
+                .iter()
+                .position(|o| o.height == height)
+                .unwrap()
+        };
+        // each field of a leaf and each sibling is bound
+        for field in 0..5 {
+            let mut p = proof.clone();
+            let o = &mut p.openings[at(9)];
+            match field {
+                0 => o.work += 1,
+                1 => o.state[0] ^= 1,
+                2 => o.header[40] ^= 1,
+                3 => o.path[5][0] ^= 1,
+                _ => o.height += 1,
+            }
+            assert!(
+                matches!(refused(p), Some(Refusal::Chain(_))),
+                "field {field}"
+            );
+        }
+        // the journal's fields the view reads against what it is given (its
+        // program, start, root and tip); a forged count, frontier or work is
+        // the receipt's to refuse, which the zkVM verifies and a test does not
+        for byte in [0, 33, 45, 110] {
+            let mut p = proof.clone();
+            p.journal[byte] ^= 1;
+            assert!(matches!(refused(p), Some(Refusal::Chain(_))), "byte {byte}");
+        }
+        let mut p = proof.clone();
+        p.tip[20] ^= 1;
+        assert!(matches!(refused(p), Some(Refusal::Chain(_))));
+        // a journal of another program
+        let mut p = proof.clone();
+        p.journal[..32].copy_from_slice(&[0xc2; 32]);
+        assert!(matches!(refused(p), Some(Refusal::Chain(_))));
+        // the unaltered
+        assert!(refused(proof).is_none());
+    }
+
+    /// The chain may start anywhere, but the leaf at the contract's
+    /// checkpoint must hold the state Base binds: a chain that began after
+    /// it, or on a state that was not its own, proves nothing of it.
+    #[test]
+    fn the_chain_must_pass_through_the_state_base_binds() {
+        let (f, spent) = stale_on(Version::V3, ON);
+        let x = exit(&f.base, f.b, &f.e, &f.bytes, 64);
+        let evidence = std::slice::from_ref(&spent);
+        // a chain that starts after the checkpoint, at block 1
+        let time_of = |h: &[u8; 80]| u32::from_le_bytes(h[68..72].try_into().unwrap());
+        let genesis = *Checkpoint::genesis(ChainProfile::Core30DefaultRegtest)
+            .unwrap()
+            .header();
+        let mut late = Lineage::new(
+            Checkpoint::new(
+                ChainProfile::Core30DefaultRegtest,
+                1,
+                x.headers[0],
+                vec![time_of(&genesis), time_of(&x.headers[0])],
+                None,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        for header in &x.headers[1..] {
+            late.push(*header).unwrap();
+        }
+        let (journal, tip) = late.through(CHAIN, 15).unwrap();
+        let (good, _) = on(&f.base, &x, evidence, 12);
+        let mut shown = x.clone();
+        shown.headers = vec![];
+        let mut proof = good.chain.clone().unwrap();
+        proof.journal = journal.to_bytes();
+        proof.tip = tip.to_bytes();
+        proof.openings = [1, 2, 9, 15]
+            .into_iter()
+            .map(|h| late.open(h, journal.count).unwrap())
+            .collect();
+        let input = HubInput {
+            exit: shown,
+            chain: Some(proof),
+            ..good.clone()
+        };
+        assert!(matches!(
+            decided(&input),
+            Err(Refusal::Chain(_)) | Err(Refusal::Openings(_))
+        ));
+    }
+
+    /// The work on top of the last block of the exit is the chain's after it
+    /// and the tail's, and no less than the contract's.
+    #[test]
+    fn the_work_on_the_last_block_is_the_chains_and_the_tails() {
+        let (f, spent) = stale_on(Version::V3, ON);
+        let x = exit(&f.base, f.b, &f.e, &f.bytes, 64);
+        let evidence = std::slice::from_ref(&spent);
+        // six blocks on the response are the contract's work (6 blocks deep)
+        let (input, _) = on(&f.base, &x, evidence, 9);
+        assert_eq!(input.exit.headers.len(), 6);
+        assert!(decided(&input).is_ok());
+        // one fewer: in the tail, or among the chain's
+        for through in [9, 10] {
+            let (mut input, _) = on(&f.base, &x, evidence, through);
+            input.exit.headers.pop();
+            assert_eq!(
+                decided(&input).err(),
+                Some(Refusal::Exit(licash_statement::Reject::Depth)),
+                "through {through}"
+            );
+        }
+        // a header in the tail that isn't one: a block off the chain's tip
+        let (mut input, _) = on(&f.base, &x, evidence, 9);
+        input.exit.headers[2][4] ^= 1;
+        assert!(matches!(decided(&input), Err(Refusal::Chain(_))));
+    }
 }

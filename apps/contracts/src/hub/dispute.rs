@@ -1156,6 +1156,7 @@ impl Openings {
             evidence,
             keys,
             invalid,
+            chain: None,
         };
         match licash_hp::check(&input) {
             Ok(j) if j == graph::journal(&o.base) => Ok(Ok(input)),

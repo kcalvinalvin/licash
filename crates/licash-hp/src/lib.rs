@@ -29,7 +29,10 @@
 //! only when it contests the claim, for the assertion that follows its
 //! response.
 
+pub mod headers;
+
 use bitcoin::hashes::{hash160, Hash};
+use headers::{ChainProof, View};
 use licash::{
     base::Base,
     chain::Chain,
@@ -69,6 +72,10 @@ pub enum Refusal {
     Undisclosed,
     /// The claim is owed more than `b′`.
     Owed,
+    /// The claim's judgment reads blocks of the chain that the input does not
+    /// open (their heights): the Hub can't prove with it, and the claim is
+    /// not owed nothing for it.
+    Openings(Vec<u32>),
 }
 
 impl std::fmt::Display for Refusal {
@@ -81,6 +88,7 @@ impl std::fmt::Display for Refusal {
             Refusal::Unsigned => f.write_str("her request isn't signed under the keys Base binds"),
             Refusal::Undisclosed => f.write_str("the response didn't disclose what is needed"),
             Refusal::Owed => f.write_str("the claim is owed more than the response says"),
+            Refusal::Openings(h) => write!(f, "blocks of the chain are not opened: {h:?}"),
         }
     }
 }
@@ -219,6 +227,11 @@ pub struct HubInput {
     /// ([`recovery::owed_flagged`]): none, else, unless they are the items
     /// that are not, no proof. Zero under another.
     pub invalid: u32,
+    /// Of a chained contract ([`licash::recovery::chained`]) the proof of the
+    /// chain its exit's blocks are in, and the exit's headers are those
+    /// after the chain's tip; of another, none and the exit's headers are
+    /// every one from the checkpoint.
+    pub chain: Option<ChainProof>,
 }
 
 impl HubInput {
@@ -230,6 +243,9 @@ impl HubInput {
         self.keys.write(&mut w);
         if Format::of(&self.base).lean() {
             w.put(&self.invalid.to_be_bytes());
+        }
+        if let Some(chain) = &self.chain {
+            chain.write(&mut w);
         }
         w.0
     }
@@ -253,6 +269,10 @@ impl HubInput {
             true => u32::from_be_bytes(r.take::<4>().map_err(|_| Refusal::Input)?),
             false => 0,
         };
+        let chain = match recovery::chained(p.graph.id) {
+            true => Some(ChainProof::read(&mut r)?),
+            false => None,
+        };
         r.end().map_err(|_| Refusal::Input)?;
         Ok(Self {
             base,
@@ -260,8 +280,17 @@ impl HubInput {
             evidence,
             keys,
             invalid,
+            chain,
         })
     }
+}
+
+/// The chain program a chained contract's statement is built with: its image
+/// id, and how a receipt of it is verified, which the zkVM does for its
+/// guest (`env::verify`) and the Hub, holding the receipt, need not.
+pub struct Program<'a> {
+    pub id: [u8; 32],
+    pub verify: &'a dyn Fn(&[u8; 32], &[u8]),
 }
 
 /// What the statement decides of `exit` under `base` against `evidence`:
@@ -273,7 +302,7 @@ pub fn decide(
     exit: &Exit,
     evidence: &[Evidence],
 ) -> Result<(Owed, Read), Refusal> {
-    decide_with(base, keys, exit, evidence, None, &mut |_| {})
+    decide_with(base, keys, exit, evidence, None, None, &mut |_| {})
 }
 
 /// The items of her filing the statement must flag as invalid, to prove the
@@ -288,18 +317,127 @@ pub fn flagged(
     Ok(decide(base, keys, exit, evidence)?.0.invalid)
 }
 
+/// The chain of a chained contract's exit, as its statement is given it.
+#[derive(Clone, Copy)]
+pub struct Chained<'a> {
+    pub proof: &'a ChainProof,
+    pub program: &'a Program<'a>,
+}
+
+/// [`flagged`] of a chained contract.
+pub fn flagged_on(
+    base: &Base,
+    keys: Option<&RequestKeys>,
+    exit: &Exit,
+    evidence: &[Evidence],
+    chained: Chained,
+) -> Result<u32, Refusal> {
+    let decided = decide_with(base, keys, exit, evidence, None, Some(chained), &mut |_| {})?;
+    Ok(decided.0.invalid)
+}
+
+/// The proof of the chain `proven` has for `exit`, as a Hub puts it in its
+/// input: openings, in the tree of the journal of the receipt the statement
+/// verifies, of the checkpoint's block, the exit's and every one the judgment
+/// of the claim reads. Which those are only the
+/// judgment knows: it is run, and the blocks it finds it was not shown are
+/// opened and it is run again, until it asks for none. `exit`'s headers are
+/// those after the chain's tip.
+pub fn open_chain(
+    proven: headers::Proven,
+    base: &Base,
+    keys: Option<&RequestKeys>,
+    exit: &Exit,
+    evidence: &[Evidence],
+    program: &Program,
+) -> Result<ChainProof, Refusal> {
+    let headers::Proven {
+        lineage,
+        journal,
+        tip,
+    } = proven;
+    let mut heights = std::collections::BTreeSet::from([base.parts().chain.checkpoint.height()]);
+    let blocks = [
+        &exit.request.header,
+        &exit.publish.header,
+        &exit.respond.header,
+    ]
+    .into_iter()
+    .chain(exit.disclosure.as_ref().map(|d| &d.header));
+    heights.extend(blocks.filter_map(|header| lineage.height_of(header)));
+    loop {
+        let openings = heights
+            .iter()
+            .map(|h| {
+                lineage.open(*h, journal.count).ok_or_else(|| {
+                    Refusal::Chain(format!("block {h} is not in the receipt's chain"))
+                })
+            })
+            .collect::<Result<_, _>>()?;
+        let proof = ChainProof {
+            journal: journal.to_bytes(),
+            tip: tip.to_bytes(),
+            openings,
+        };
+        let chained = Chained {
+            proof: &proof,
+            program,
+        };
+        match decide_with(base, keys, exit, evidence, None, Some(chained), &mut |_| {}) {
+            Err(Refusal::Openings(more)) => {
+                let before = heights.len();
+                heights.extend(more);
+                if heights.len() == before {
+                    return Err(Refusal::Chain("a block asked for is already opened".into()));
+                }
+            }
+            Err(e) => return Err(e),
+            Ok(_) => return Ok(proof),
+        }
+    }
+}
+
 /// [`decide`], calling `mark` with the name of each step as it ends: the
 /// guest's profile build counts the cycles between them.
+///
+/// Of a chained contract the exit's blocks are read from `chained` (and only
+/// then): its chain's receipt verified, the blocks the exit and the claim's
+/// judgment look up opened from it. A block the judgment needs that the
+/// input does not open leaves the Hub unable to prove ([`Refusal::Openings`]),
+/// and never leaves the claim owed nothing, which the Hub could otherwise
+/// choose by leaving it out.
 pub fn decide_with(
     base: &Base,
     keys: &RequestKeys,
     exit: &Exit,
     evidence: &[Evidence],
     invalid: Option<u32>,
+    chained: Option<Chained>,
     mark: &mut dyn FnMut(&'static str),
 ) -> Result<(Owed, Read), Refusal> {
     let contract = contract(base);
-    let read = licash_statement::read(&contract, exit).map_err(Refusal::Exit)?;
+    if recovery::chained(base.parts().graph.id) != chained.is_some() {
+        return Err(Refusal::Chain(
+            "a chained contract is decided on its chain, and no other is".into(),
+        ));
+    }
+    let (read, view) = match chained {
+        None => (
+            licash_statement::read(&contract, exit).map_err(Refusal::Exit)?,
+            None,
+        ),
+        Some(c) => {
+            (c.program.verify)(&c.program.id, &c.proof.journal);
+            let view = View::new(
+                &c.program.id,
+                c.proof,
+                &base.parts().chain.checkpoint,
+                &exit.headers,
+            )?;
+            let read = licash_statement::read_on(&contract, exit, &view).map_err(Refusal::Exit)?;
+            (read, Some(view))
+        }
+    };
     mark("the exit read: its headers' work, its transactions");
     if keys.digest() != base.parts().holder_wots {
         return Err(Refusal::Unsigned);
@@ -312,7 +450,18 @@ pub fn decide_with(
         return Err(Refusal::Unsigned);
     }
     mark("her request's one-time signatures");
-    let chain = chain(base, through_publication(&contract, exit, &read))?;
+    let terms = &base.parts().chain;
+    let chain = match &view {
+        None => chain(base, through_publication(&contract, exit, &read))?,
+        Some(view) => {
+            // the budget `Chain::verify` holds a dense chain to
+            if read.heights.publish - terms.checkpoint.height() > terms.max_headers {
+                return Err(Refusal::Chain("header budget".into()));
+            }
+            view.chain(&terms.checkpoint, read.heights.publish)
+                .map_err(|e| Refusal::Chain(e.to_string()))?
+        }
+    };
     mark("the Licash header chain through her publication");
     let request = Request {
         amount: read.b,
@@ -323,8 +472,15 @@ pub fn decide_with(
         Some(invalid) => {
             recovery::owed_flagged(base, &request, &read.claim, evidence, &chain, invalid)
         }
+    };
+    // Before what the judgment made of them: a block it was not shown, found
+    // missing, may have made it a claim owed nothing, which only the holder
+    // is to bring on herself.
+    let unshown = chain.unshown();
+    if !unshown.is_empty() {
+        return Err(Refusal::Openings(unshown));
     }
-    .map_err(|e| Refusal::Evidence(e.to_string()))?;
+    let owed = owed.map_err(|e| Refusal::Evidence(e.to_string()))?;
     mark("her filing decoded and judged against the evidence");
     Ok((owed, read))
 }
@@ -333,20 +489,38 @@ pub fn decide_with(
 /// response's `b′`, and the response disclosed what the evidence needs.
 /// On success, the journal fixed at opening.
 pub fn check(input: &HubInput) -> Result<[u8; JOURNAL_LEN], Refusal> {
-    check_with(input, &mut |_| {})
+    check_with(input, None, &mut |_| {})
 }
 
-/// [`check`], calling `mark` as [`decide_with`] does.
+/// [`check`] of an input of a chained contract, whose statement is built
+/// with `program`, the chain program it verifies receipts of.
+pub fn check_on(input: &HubInput, program: &Program) -> Result<[u8; JOURNAL_LEN], Refusal> {
+    check_with(input, Some(program), &mut |_| {})
+}
+
+/// [`check`], calling `mark` as [`decide_with`] does, with the chain program
+/// of a chained contract.
 pub fn check_with(
     input: &HubInput,
+    program: Option<&Program>,
     mark: &mut dyn FnMut(&'static str),
 ) -> Result<[u8; JOURNAL_LEN], Refusal> {
+    let chained = match (&input.chain, program) {
+        (Some(proof), Some(program)) => Some(Chained { proof, program }),
+        (None, None) => None,
+        _ => {
+            return Err(Refusal::Chain(
+                "a chained contract's input holds its chain, and its statement its program".into(),
+            ))
+        }
+    };
     let (owed, read) = decide_with(
         &input.base,
         &input.keys,
         &input.exit,
         &input.evidence,
         Some(input.invalid),
+        chained,
         mark,
     )?;
     verdict(

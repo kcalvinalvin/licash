@@ -30,6 +30,6 @@ fn main() {
     let mut mark = |_: &'static str| {};
     let input = HubInput::from_bytes(&bytes).expect("the statement's input");
     mark("the input decoded: Base, notes and spends of the evidence verified");
-    let journal = check_with(&input, &mut mark).expect("the Hub's statement");
+    let journal = check_with(&input, None, &mut mark).expect("the Hub's statement");
     env::commit_slice(&journal);
 }
