@@ -57,6 +57,11 @@ fn keys() -> RequestKeys {
     signed_request(3, &[0; 32], 0).0
 }
 fn base_on(keyset: Keyset, nonce: u8, id: u32) -> Base {
+    let checkpoint = Checkpoint::genesis(ChainProfile::Core30DefaultRegtest).unwrap();
+    base_with(keyset, nonce, id, checkpoint)
+}
+/// [`base_on`] of a contract whose checkpoint is `checkpoint`.
+fn base_with(keyset: Keyset, nonce: u8, id: u32, checkpoint: Checkpoint) -> Base {
     let mut deposit = [31; 36];
     deposit[32..].copy_from_slice(&7u32.to_le_bytes());
     Base::new(Parts {
@@ -99,7 +104,7 @@ fn base_on(keyset: Keyset, nonce: u8, id: u32) -> Base {
             kept: 2,
         },
         chain: ChainTerms {
-            checkpoint: Checkpoint::genesis(ChainProfile::Core30DefaultRegtest).unwrap(),
+            checkpoint,
             funding_depth: 1,
             work_depth: 6,
             max_headers: 1_000 + pad() as u32,
@@ -209,10 +214,13 @@ fn stale() -> (Filed, Evidence) {
 }
 /// [`stale`] on a contract of graph id `id`.
 fn stale_on(id: u32) -> (Filed, Evidence) {
-    let issuer = IssuerKeys::random(3).unwrap();
+    let checkpoint = Checkpoint::genesis(ChainProfile::Core30DefaultRegtest).unwrap();
+    stale_with(id, checkpoint)
+}
+/// [`stale_on`] of a contract whose checkpoint is `checkpoint`.
+fn stale_with(id: u32, checkpoint: Checkpoint) -> (Filed, Evidence) {    let issuer = IssuerKeys::random(3).unwrap();
     let keyset = issuer.keyset().unwrap();
-    let base = base_on(keyset.clone(), 53, id);
-    let ds: Vec<_> = (0..32).map(|i| derive(SPEND, &hold(), 4, 23, i)).collect();
+    let base = base_with(keyset.clone(), 53, id, checkpoint);    let ds: Vec<_> = (0..32).map(|i| derive(SPEND, &hold(), 4, 23, i)).collect();
     let notes: Vec<_> = ds.iter().map(|d| mint(&issuer, &keyset, d)).collect();
     let owners: Vec<_> = (0..16).map(|i| owner(SPEND, 23, i)).collect();
     let bob = HoldRoot::from_seed(&[9; 32]).unwrap();
@@ -892,11 +900,25 @@ mod chained {
         evidence: &[Evidence],
         through: u32,
     ) -> (HubInput, Lineage) {
-        let program = || program_of(chain);
         let lineage = lineage(base, exit);
+        on_lineage(lineage, chain, base, exit, evidence, through)
+    }
+
+    /// [`on_chain`] on `lineage`, which may start below the contract's
+    /// checkpoint: `exit`'s headers are those after it.
+    fn on_lineage(
+        lineage: Lineage,
+        chain: [u8; 32],
+        base: &Base,
+        exit: &Exit,
+        evidence: &[Evidence],
+        through: u32,
+    ) -> (HubInput, Lineage) {
+        let program = || program_of(chain);
         let (journal, tip) = lineage.through(chain, through).unwrap();
+        let checkpoint = base.parts().chain.checkpoint.height();
         let mut shown = exit.clone();
-        shown.headers = exit.headers[through as usize..].to_vec();
+        shown.headers = exit.headers[(through - checkpoint) as usize..].to_vec();
         let proven = Proven {
             lineage: &lineage,
             journal: &journal,
@@ -971,6 +993,76 @@ mod chained {
         let short = exit(&f.base, f.b, &f.e, &f.bytes, 63);
         let (input, _) = on(&f.base, &short, evidence, 9);
         assert_eq!(licash_hp::check_on(&input, &program()), Err(Refusal::Owed));
+    }
+
+    /// The chain may start below the contract's checkpoint: it is a block of
+    /// it, and what the statement opens there is the state Base binds.
+    #[test]
+    fn a_chain_that_started_below_the_contracts_checkpoint_decides_as_the_dense_one() {
+        let genesis = Checkpoint::genesis(ChainProfile::Core30DefaultRegtest).unwrap();
+        // the contract's checkpoint is block 4, reached from the genesis
+        let below = headers_on(&sha256d(genesis.header()), 4);
+        let mut checkpoint = genesis.clone();
+        below.iter().for_each(|h| checkpoint.push(*h).unwrap());
+        assert_eq!(checkpoint.height(), 4);
+        let (f, spent) = stale_with(Version::V3, ON, checkpoint.clone());
+        let x = exit(&f.base, f.b, &f.e, &f.bytes, 64);
+        let evidence = std::slice::from_ref(&spent);
+        let want = dense(&f.base, &x, evidence);
+        assert_eq!(want.1.heights.request, 5);
+        // a chain from the genesis, through the contract's checkpoint, the exit
+        // and beyond: its tail, and where its receipt ends, are as before
+        for through in [13, 14, 19] {
+            let mut lineage = Lineage::new(genesis.clone()).unwrap();
+            below.iter().for_each(|h| lineage.push(*h).unwrap());
+            x.headers.iter().for_each(|h| lineage.push(*h).unwrap());
+            let (input, _) = on_lineage(lineage, CHAIN, &f.base, &x, evidence, through);
+            assert_eq!(decided(&input).unwrap(), want, "through {through}");
+            assert_eq!(
+                licash_hp::check_on(&input, &program()).unwrap(),
+                contract(&f.base).journal()
+            );
+            let opened: Vec<u32> = input
+                .chain
+                .as_ref()
+                .unwrap()
+                .openings
+                .iter()
+                .map(|o| o.height)
+                .collect();
+            assert!(opened.contains(&4) && !opened.contains(&0), "{opened:?}");
+        }
+        // a chain from the same blocks that began after the checkpoint has no
+        // block there to open
+        let mut late = Lineage::new(x_start_checkpoint(&checkpoint, &x)).unwrap();
+        x.headers[1..].iter().for_each(|h| late.push(*h).unwrap());
+        let (journal, tip) = late.through(CHAIN, late.tip_height()).unwrap();
+        let proof = licash_hp::headers::ChainProof {
+            journal: journal.to_bytes(),
+            tip: tip.to_bytes(),
+            openings: vec![late.open(late.tip_height(), journal.count).unwrap()],
+        };
+        let mut shown = x.clone();
+        shown.headers = vec![];
+        let input = HubInput {
+            base: f.base.clone(),
+            exit: shown,
+            evidence: evidence.to_vec(),
+            keys: None,
+            invalid: 0,
+            chain: Some(proof),
+        };
+        assert!(matches!(
+            decided(&input),
+            Err(Refusal::Chain(_) | Refusal::Openings(_))
+        ));
+    }
+
+    /// The state after the first block of `exit`, from `checkpoint`.
+    fn x_start_checkpoint(checkpoint: &Checkpoint, exit: &Exit) -> Checkpoint {
+        let mut state = checkpoint.clone();
+        state.push(exit.headers[0]).unwrap();
+        state
     }
 
     /// A contract is decided on its chain or on its exit's headers, by its

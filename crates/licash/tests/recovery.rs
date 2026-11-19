@@ -740,6 +740,159 @@ fn a_locks_pay_is_owed_only_on_an_activation_anchored_to_its_checkpoint() {
     assert_eq!((c.owed, c.ineligible), (4, None));
 }
 
+/// A chain that shows only some of its blocks judges a claim as the whole
+/// chain does when it shows those the judgment reads, and records the ones it
+/// was not shown, so that a block left out is never taken for a claim owed
+/// nothing: a lock's activation, in the block that holds it and the block its
+/// lock's checkpoint is.
+#[test]
+fn a_sparse_chain_judges_an_anchored_activation_as_the_dense_one_and_records_what_it_lacks() {
+    let issuer = IssuerKeys::random(3).unwrap();
+    let o = Opened {
+        base: base(issuer.keyset().unwrap()),
+        issuer,
+    };
+    let keyset = o.base.parts().keyset.clone();
+    let hold = hold();
+    let (dense, activation) = activated_chain_at(3);
+    let header = |h: u32| *dense.header(h).unwrap();
+    let times = (0..=1)
+        .map(|h| u32::from_le_bytes(header(h)[68..72].try_into().unwrap()))
+        .collect();
+    let lock_cp = Checkpoint::new(
+        ChainProfile::Core30DefaultRegtest,
+        1,
+        header(1),
+        times,
+        None,
+    )
+    .unwrap();
+    let terms = TimedTerms::new(
+        lock_cp.profile(),
+        lock_cp.commitment(),
+        5,
+        3,
+        sha256::Hash::hash(&Z).to_byte_array(),
+    )
+    .unwrap();
+    let bob_hold = HoldRoot::from_seed(&[9; 32]).unwrap();
+    let bob_note = mint(&o.issuer, &keyset, &derive(41, &bob_hold, 4, 29, 0));
+    let pay = derive(SPEND, &hold, 4, 61, 0);
+    let body = Proposal::new(
+        &keyset,
+        std::slice::from_ref(&bob_note),
+        point(43),
+        vec![Output::from_derivation(&pay).unwrap()],
+        Some(TimedLock::new(terms, vec![bob(4, 1)]).unwrap()),
+    )
+    .unwrap();
+    let bob_signed = SignedProposal::sign(
+        &keyset,
+        body,
+        std::slice::from_ref(&bob_note),
+        Authorization::Plain,
+        &[owner(41, 29, 0)],
+    )
+    .unwrap();
+    let cert =
+        Certificate::attest(&o.issuer, &bob_signed, std::slice::from_ref(&bob_note)).unwrap();
+    let bob_id = bob_signed.proposal().id();
+    let settled = derive(SPEND, &hold, 4, 23, 0);
+    let settled_note = mint(&o.issuer, &keyset, &settled);
+    let items = vec![
+        Item::Settled(settled.message().clone()),
+        Item::Pending {
+            message: pay.message().clone(),
+            source: bob_id,
+            branch: Branch::Pay,
+            index: 0,
+            blinding: *pay.blinding(),
+            preimage: Some(Z),
+        },
+    ];
+    let signers = [settled.clone(), pay.clone()];
+    let record = ActivationRecord {
+        source: bob_id,
+        reference: activation.reference,
+    };
+    let unsigned = claim(
+        &o,
+        items,
+        vec![Source::Admitted(cert)],
+        vec![record],
+        &signers,
+        8,
+    );
+    let p = Publication::sign(unsigned, &hold_keys(&signers), LIMIT).unwrap();
+    let request = Request {
+        amount: 8,
+        claim_digest: *p.claim().digest(),
+    };
+    let witness = Witness {
+        notes: vec![settled_note],
+        sources: vec![SourceWitness::Certified {
+            proposal: bob_signed.proposal().clone(),
+            signatures: bob_signed.signatures().to_vec(),
+        }],
+        activations: vec![ActivationWitness {
+            inclusion: activation.inclusion.clone(),
+            anchor: Some(lock_cp),
+        }],
+        funded: vec![],
+    };
+    let sparse = |tip: u32, shown: &[u32]| {
+        let shown = shown.iter().map(|h| (*h, header(*h))).collect();
+        Chain::sparse(dense.checkpoint().clone(), tip, shown).unwrap()
+    };
+    let judged = |chain: &Chain| decide(&o, &request, &p, &witness, &[], Some(chain)).unwrap();
+
+    // The dense chain: owed in full.
+    let want = judged(&dense);
+    assert_eq!((want.owed, want.ineligible.as_deref()), (8, None));
+    // Shown the activation's block and the lock's checkpoint: as dense, and
+    // nothing asked for that was not shown, wherever its tip is that dense's is.
+    let shown = sparse(7, &[1, 3]);
+    assert_eq!(judged(&shown), want);
+    assert!(shown.unshown().is_empty());
+    // Blocks shown that the judgment does not read change nothing.
+    let more = sparse(7, &[1, 2, 3, 6]);
+    assert_eq!(judged(&more), want);
+    assert!(more.unshown().is_empty());
+    // The activation's block left out: owed what the judgment makes of a claim
+    // with an activation that is not there, which is 0, but the height asked
+    // for is recorded: it is the hub that omitted it, not the holder.
+    let no_block = sparse(7, &[1]);
+    let judged_without = judged(&no_block);
+    assert_eq!(judged_without.owed, 0);
+    assert!(judged_without.ineligible.is_some());
+    assert_eq!(no_block.unshown(), vec![3]);
+    // The lock's checkpoint left out, as well.
+    let no_anchor = sparse(7, &[3]);
+    assert_eq!(judged(&no_anchor).owed, 0);
+    assert_eq!(no_anchor.unshown(), vec![1]);
+    // Neither: the judgment stops at the first it lacks, so the second is
+    // asked for once the first is shown (a hub opens until none is asked for).
+    let neither = sparse(7, &[]);
+    assert_eq!(judged(&neither).owed, 0);
+    assert_eq!(neither.unshown(), vec![1]);
+    // The holder's own error is not the hub's omission: a chain that does not
+    // bury the activation at the lock's depth, or that ends before its block,
+    // is as ineligible on a sparse chain as on a dense one, and nothing was
+    // left out of it.
+    for tip in [4, 2] {
+        let short = sparse(tip, &[1, 3.min(tip)]);
+        let short = judged(&short);
+        assert!(short.ineligible.is_some(), "tip {tip}");
+        let again = sparse(tip, &[1, 3.min(tip)]);
+        judged(&again);
+        assert!(
+            again.unshown().is_empty(),
+            "tip {tip}: {:?}",
+            again.unshown()
+        );
+    }
+}
+
 /// A lock's Refund is owed only once the chain judged reaches its
 /// expiry at depth: before, she could take it and her payee activate the
 /// lock later, both owed. Then, as ever, its preimage voids it.
