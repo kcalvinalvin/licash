@@ -63,7 +63,7 @@ done
 
 | Network | Program | Image id | Built from |
 |---|---|---|---|
-| signet | `hp` (the Hub's statement), new contracts (graph id 10: the lean filing) | `4b68d99155c57c1c7b94717899d4db9f791bc8a3ecd6aaec5d98c7d3a4384164` | def1dc1 |
+| signet | `hp` (the Hub's statement), new contracts (graph id 10: the lean filing) | `ce4d7a006e422b7e73a37b6f5d9c9290a2af7e7c0451662504ce4799bfadcf2c` | 2215561 |
 | signet | `hp`, contracts opened before (graph id 9: the compact filing) | `a2458fdbd126c100b82bb50e8934fe4f5f4c2a5a80e981f4ca63c6f189dfab8d` | 16d35e8 |
 | signet | `hp`, contracts opened before (graph id 9: the compact filing, Lichen's statement crate) | `531b465ddc59b1a1f2295c97b54d7e090e0ced23b443084ba9e51dad1524dc64` | b8d8292 |
 | signet | `hp`, contracts opened before (graph id 8, legacy filing, her contest window) | `7214a5393e19298874c6a864efd9e0c9beb221e68440df52b5a949f4b0f87734` | 72748a0 |

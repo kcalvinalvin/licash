@@ -343,7 +343,7 @@ pub fn trust(profile: ChainProfile) -> Result<Trust> {
 /// proven with it alone, so none named here or in [`SIGNET_BEFORE`] is
 /// ever to go. A contract keeps its program when this one changes.
 pub const SIGNET: [u8; 32] =
-    hex!("4b68d99155c57c1c7b94717899d4db9f791bc8a3ecd6aaec5d98c7d3a4384164");
+    hex!("ce4d7a006e422b7e73a37b6f5d9c9290a2af7e7c0451662504ce4799bfadcf2c");
 
 /// Whether [`SIGNET`] decides the compact filing: true only for a program
 /// built from a tree whose `licash::recovery` reads it, and set in the
@@ -496,7 +496,7 @@ mod tests {
     fn the_hub_statement_image_is_pinned() {
         assert_eq!(
             SIGNET,
-            hex!("4b68d99155c57c1c7b94717899d4db9f791bc8a3ecd6aaec5d98c7d3a4384164"),
+            hex!("ce4d7a006e422b7e73a37b6f5d9c9290a2af7e7c0451662504ce4799bfadcf2c"),
             "keep every funded contract's pinned guest available when changing opening trust"
         );
         assert_eq!(
