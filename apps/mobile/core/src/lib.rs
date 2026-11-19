@@ -59,6 +59,14 @@ pub fn chain_name(network: Network) -> String {
     .into()
 }
 
+/// The seconds a block of `network` takes: what the app says a count of
+/// blocks lasts in. 600 on Bitcoin's networks, 30 on Mutinynet. Protocol
+/// windows and margins are counted in blocks, the same on each.
+#[uniffi::export]
+pub fn block_seconds(network: Network) -> u32 {
+    network.profile().block_seconds()
+}
+
 /// What went wrong, as the app tells its user.
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum LicashError {
@@ -218,6 +226,9 @@ pub struct ContractRange {
     /// each year it lasts, and of the part its holder funds.
     pub ppm_year: u32,
     pub ppm_year_funded: u32,
+    /// The blocks in the year of its interest: its network's, 144 a day on
+    /// Bitcoin ([`block_seconds`] says the time they take).
+    pub year_blocks: u32,
 }
 
 impl From<licash_api::ContractRange> for ContractRange {
@@ -232,6 +243,7 @@ impl From<licash_api::ContractRange> for ContractRange {
             fee: r.fee,
             ppm_year: r.ppm_year,
             ppm_year_funded: r.ppm_year_funded,
+            year_blocks: r.year_blocks,
         }
     }
 }
@@ -250,6 +262,7 @@ impl ContractRange {
             fee: self.fee,
             ppm_year: self.ppm_year,
             ppm_year_funded: self.ppm_year_funded,
+            year_blocks: self.year_blocks,
         }
     }
 }

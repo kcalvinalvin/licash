@@ -29,9 +29,6 @@ fn upload(kept: u16) -> u64 {
     u64::from(kept) * INSTANCE
 }
 
-/// Blocks a contract chosen lasts at first: half a year.
-const HALF_YEAR: u32 = 26_280;
-
 /// Recovery contracts.
 #[uniffi::export]
 impl Wallet {
@@ -473,10 +470,10 @@ fn check_range(range: &licash_api::ContractRange) -> Result<(), LicashError> {
 }
 
 /// What a contract chosen within the checked `range` is at first: half
-/// again `coin`, up to a size, over half a year, within the advertised
-/// bounds.
+/// again `coin`, up to a size, over half a year of its network's blocks,
+/// within the advertised bounds.
 fn suggested(range: &licash_api::ContractRange, coin: Option<u64>) -> (u32, u32) {
-    let blocks = HALF_YEAR.clamp(range.min_blocks, range.max_blocks);
+    let blocks = (range.year_blocks / 2).clamp(range.min_blocks, range.max_blocks);
     let most = coin.and_then(|c| range.max_cap_for(c).map(|most| (c, most)));
     let cap = match most {
         Some((coin, most)) => {
@@ -788,6 +785,7 @@ mod tests {
             fee: 3_000,
             ppm_year: 10_000,
             ppm_year_funded: 0,
+            year_blocks: licash_api::YEAR_BLOCKS,
         }
     }
 
@@ -808,6 +806,19 @@ mod tests {
             ..range()
         };
         assert_eq!(suggested(&short, Some(10_000_000)).1, 4_000);
+        // Half a year of Mutinynet's blocks, 20 times as many, as far as
+        // the hub lets.
+        let quick = licash_api::ContractRange {
+            max_blocks: 1_000_000,
+            year_blocks: licash::spend::ChainProfile::Mutinynet.blocks_a_year(),
+            ..range()
+        };
+        assert_eq!(suggested(&quick, Some(10_000_000)).1, 525_600);
+        let capped = licash_api::ContractRange {
+            max_blocks: 52_560,
+            ..quick
+        };
+        assert_eq!(suggested(&capped, Some(10_000_000)).1, 52_560);
     }
 
     #[test]

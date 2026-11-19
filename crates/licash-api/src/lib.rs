@@ -861,8 +861,17 @@ pub struct Contracts {
     pub range: Option<ContractRange>,
 }
 
-/// Blocks in a year, as a contract's price counts them: 144 a day.
-pub const YEAR_BLOCKS: u64 = 144 * 365;
+/// Blocks in a year of Bitcoin's, 144 a day: what a contract's price counts
+/// a year by, unless its hub says another ([`ContractRange::year_blocks`]).
+pub const YEAR_BLOCKS: u32 = 144 * 365;
+
+fn bitcoins_year() -> u32 {
+    YEAR_BLOCKS
+}
+
+fn is_bitcoins_year(year: &u32) -> bool {
+    *year == YEAR_BLOCKS
+}
 
 /// The fewest and most bits of a contract's size (size ([`sizes`])).
 pub const MIN_SIZE_BITS: u32 = 17;
@@ -925,10 +934,16 @@ pub struct ContractRange {
     /// The hub's fixed fee for an opening, from her deposit.
     pub fee: u64,
     /// Millionths of the part of its cap the hub funds for each year of
-    /// blocks ([`YEAR_BLOCKS`]) it lasts, rounded down.
+    /// blocks ([`year_blocks`](Self::year_blocks)) it lasts, rounded down.
     pub ppm_year: u32,
     /// Millionths of the part she funds herself, likewise.
     pub ppm_year_funded: u32,
+    /// The blocks in the year its interest counts by, those of its
+    /// network's time: [`YEAR_BLOCKS`] on Bitcoin's, and left out of its
+    /// info then, as hubs before it said none. The same real year of
+    /// interest is many more blocks on a chain of quicker ones.
+    #[serde(default = "bitcoins_year", skip_serializing_if = "is_bitcoins_year")]
+    pub year_blocks: u32,
 }
 
 impl ContractRange {
@@ -938,8 +953,8 @@ impl ContractRange {
         let funded = funded.min(cap);
         ContractFee {
             opening: self.fee,
-            interest: rate(self.ppm_year, cap - funded, blocks),
-            interest_funded: rate(self.ppm_year_funded, funded, blocks),
+            interest: rate(self.ppm_year, cap - funded, blocks, self.year_blocks),
+            interest_funded: rate(self.ppm_year_funded, funded, blocks, self.year_blocks),
         }
     }
 
@@ -968,10 +983,11 @@ impl ContractRange {
     }
 }
 
-/// `ppm` millionths of `cap` for each year of `blocks`, rounded down.
-pub fn rate(ppm: u32, cap: u32, blocks: u32) -> u64 {
+/// `ppm` millionths of `cap` for each year of `blocks`, a year being
+/// `year_blocks` of them, rounded down.
+pub fn rate(ppm: u32, cap: u32, blocks: u32, year_blocks: u32) -> u64 {
     let n = u128::from(ppm) * u128::from(cap) * u128::from(blocks);
-    let year = 1_000_000 * u128::from(YEAR_BLOCKS);
+    let year = 1_000_000 * u128::from(year_blocks.max(1));
     u64::try_from(n / year).unwrap_or(u64::MAX)
 }
 

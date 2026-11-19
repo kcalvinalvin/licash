@@ -1109,6 +1109,7 @@ fn a_hubs_contract_range_is_left_out_when_none_and_prices_the_hubs_part_by_the_y
         fee: 3_000,
         ppm_year: 10_000,
         ppm_year_funded: 0,
+        year_blocks: licash_api::YEAR_BLOCKS,
     };
     let offered = Contracts {
         range: Some(range),
@@ -1138,7 +1139,10 @@ fn a_hubs_contract_range_is_left_out_when_none_and_prices_the_hubs_part_by_the_y
         8_388
     );
     assert_eq!(funded.fee(131_071, 1_000, u32::MAX).interest, 0);
-    assert_eq!(rate(10_000, u32::MAX, u32::MAX), 3_509_654_502_496);
+    assert_eq!(
+        rate(10_000, u32::MAX, u32::MAX, licash_api::YEAR_BLOCKS),
+        3_509_654_502_496
+    );
 
     // Its sizes: 2^n - 1 sat within its bounds, 131 071 the least.
     let sizes = range.sizes();
@@ -1208,4 +1212,50 @@ fn a_later_versions_codes_states_and_features_read_as_unknown_or_ignored() {
     info.features = vec!["prepay".into()];
     let read: Info = serde_json::from_str(&serde_json::to_string(&info).unwrap()).unwrap();
     assert_eq!(read.features, ["prepay"]);
+}
+
+#[test]
+fn a_contracts_interest_counts_the_year_its_hub_says() {
+    // Bitcoin's year (144 blocks a day) is left out of the info, as hubs
+    // before it said none, and read as it when absent.
+    let bitcoin = ContractRange {
+        min_cap: 131_071,
+        max_cap: 134_217_727,
+        min_blocks: 432,
+        max_blocks: 26_280,
+        per_coin: 2,
+        reserve: 20_000,
+        fee: 3_000,
+        ppm_year: 10_000,
+        ppm_year_funded: 0,
+        year_blocks: licash_api::YEAR_BLOCKS,
+    };
+    let sent = serde_json::to_value(bitcoin).unwrap();
+    assert!(sent.get("year_blocks").is_none(), "{sent}");
+    let read: ContractRange = serde_json::from_value(sent).unwrap();
+    assert_eq!(read, bitcoin);
+    assert_eq!(read.year_blocks, 144 * 365);
+
+    // Mutinynet's, 2 880 blocks a day: said, and read back.
+    let quick = ContractRange {
+        year_blocks: ChainProfile::Mutinynet.blocks_a_year(),
+        ..bitcoin
+    };
+    assert_eq!(quick.year_blocks, 2_880 * 365);
+    let sent = serde_json::to_value(quick).unwrap();
+    assert_eq!(sent["year_blocks"], 1_051_200);
+    assert_eq!(json(&quick), quick);
+    // The same half year costs the same interest in 20 times the blocks,
+    // and the same blocks a twentieth.
+    let fee = |range: &ContractRange, blocks| range.fee(16_777_215, blocks, 0);
+    assert_eq!(fee(&bitcoin, 26_280).interest, 83_886);
+    assert_eq!(fee(&quick, 26_280 * 20), fee(&bitcoin, 26_280));
+    assert_eq!(fee(&quick, 26_280).interest, 4_194);
+    assert_eq!(quick.price(16_777_215, 26_280, 0), 20_000 + 3_000 + 4_194);
+    // A year said as none cannot divide by zero.
+    let none = ContractRange {
+        year_blocks: 0,
+        ..bitcoin
+    };
+    assert_eq!(rate(1, 1, 1, none.year_blocks), 0);
 }

@@ -249,6 +249,7 @@ mod tests {
             fee: 1_000_000,
             ppm_year,
             ppm_year_funded: 0,
+            year_blocks: licash_api::YEAR_BLOCKS,
         };
         assert_eq!(abusive(&Fees::default(), None), None);
         assert_eq!(abusive(&fees(1, 100, 100), Some(&range(10_000))), None);

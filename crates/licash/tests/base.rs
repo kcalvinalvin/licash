@@ -66,6 +66,21 @@ fn the_signets_share_a_genesis_block_but_not_a_checkpoint() {
 }
 
 #[test]
+fn a_chains_day_and_year_in_blocks_follow_its_block_time() {
+    let days = ChainProfile::ALL.map(|p| (p, p.blocks_a_day(), p.blocks_a_year()));
+    for (profile, day, year) in days {
+        assert_eq!(day * profile.block_seconds(), 86_400, "{profile}");
+        assert_eq!(year, day * 365, "{profile}");
+    }
+    // 144 a day where blocks take 10 minutes, 2 880 on Mutinynet.
+    assert_eq!(ChainProfile::Core30Mainnet.blocks_a_day(), 144);
+    assert_eq!(ChainProfile::Core30DefaultRegtest.blocks_a_day(), 144);
+    assert_eq!(ChainProfile::Core30Signet.blocks_a_year(), 52_560);
+    assert_eq!(ChainProfile::Mutinynet.blocks_a_day(), 2_880);
+    assert_eq!(ChainProfile::Mutinynet.blocks_a_year(), 1_051_200);
+}
+
+#[test]
 fn checkpoint_codec_has_no_missing_timestamp_or_retarget_context_fallback() {
     let bytes = Checkpoint::genesis(ChainProfile::Core30Mainnet)
         .unwrap()

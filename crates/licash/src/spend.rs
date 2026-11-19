@@ -110,6 +110,20 @@ impl ChainProfile {
             _ => 600,
         }
     }
+
+    /// Blocks a day at its block time: 144 on Bitcoin, 2,880 on Mutinynet.
+    /// For the time a count of blocks takes, and for interest by the year.
+    /// The protocol's windows, depths and margins are counted in blocks, the
+    /// same on every network: this is not their unit.
+    pub fn blocks_a_day(self) -> u32 {
+        86_400 / self.block_seconds()
+    }
+
+    /// Blocks a year at its block time: what a contract's interest by the
+    /// year counts ([`blocks_a_day`](Self::blocks_a_day) of 365 days).
+    pub fn blocks_a_year(self) -> u32 {
+        self.blocks_a_day() * 365
+    }
 }
 
 impl std::fmt::Display for ChainProfile {

@@ -845,7 +845,13 @@ async fn contracted(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     // Its sizes, 2^n - 1 sat: the least.
     const LEAST: u64 = 131_071;
     let price = |cap: u64, blocks: u32| {
-        FIXED + licash_api::rate(10_000, u32::try_from(cap).unwrap_or(u32::MAX), blocks)
+        FIXED
+            + licash_api::rate(
+                10_000,
+                u32::try_from(cap).unwrap_or(u32::MAX),
+                blocks,
+                licash_api::YEAR_BLOCKS,
+            )
     };
     let choose_minimum = || async {
         until("the minimum contract cap", 20, || async {

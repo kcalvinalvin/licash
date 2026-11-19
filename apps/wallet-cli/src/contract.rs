@@ -146,7 +146,8 @@ pub async fn open(
     }?;
     let mut value = contract_json(&contract);
     value["terms"] = terms.json();
-    let line = format!("{}\n{}", terms.lines(), contract_line(&contract));
+    let day = wallet.network().blocks_a_day();
+    let line = format!("{}\n{}", terms.lines(day), contract_line(&contract));
     show(json, value, line);
     Ok(())
 }
@@ -173,7 +174,7 @@ pub fn terms(
     let (cap, blocks) = chosen;
     let terms = Terms::of(hub, &offered, cap, blocks, funded)?;
     let mut value = terms.json();
-    let mut lines = terms.lines();
+    let mut lines = terms.lines(wallet.network().blocks_a_day());
     if let Some(range) = offered.range {
         let sizes = range.sizes();
         value["sizes"] = json!(sizes);
@@ -285,7 +286,9 @@ impl Terms {
         value
     }
 
-    fn lines(&self) -> String {
+    /// The terms in words, a day being `blocks_a_day` blocks of the
+    /// wallet's network ([`licash::spend::ChainProfile::blocks_a_day`]).
+    fn lines(&self, blocks_a_day: u32) -> String {
         use crate::say::{grouped, percent, sat};
         let hubs = self.cap - self.funded;
         let mut lines = vec![
@@ -304,7 +307,7 @@ impl Terms {
             format!(
                 "over         {} blocks (about {} days)",
                 grouped(self.blocks.into()),
-                grouped(u64::from(self.blocks).div_ceil(144))
+                grouped(u64::from(self.blocks).div_ceil(blocks_a_day.max(1).into()))
             ),
         ];
         let fee = self.price - self.reserve;
@@ -755,6 +758,7 @@ fn recovery_json(r: &Recovery) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use licash::spend::ChainProfile;
 
     fn offered(range: Option<licash_api::ContractRange>) -> licash_api::Contracts {
         licash_api::Contracts {
@@ -778,6 +782,7 @@ mod tests {
             fee: 3_000,
             ppm_year: 20_000,
             ppm_year_funded: 5_000,
+            year_blocks: licash_api::YEAR_BLOCKS,
         }
     }
 
@@ -799,7 +804,7 @@ mod tests {
         assert_eq!(value["fee"], 7_310);
         assert_eq!(value["price"], 27_310);
         assert_eq!(value["pays"], 27_310 + 62_143);
-        let lines = t.lines();
+        let lines = t.lines(144);
         for said in [
             "covers       262,143 sat, 200,000 funded by the hub, 62,143 by you",
             "opening fee  3,000 sat",
@@ -830,11 +835,30 @@ mod tests {
         // A hub of fixed terms only: its fee in one.
         let only = Terms::of("hub", &offered(None), None, None, 0).unwrap();
         assert!(
-            only.lines().contains("hub's fee    3,002 sat"),
+            only.lines(144).contains("hub's fee    3,002 sat"),
             "{}",
-            only.lines()
+            only.lines(144)
         );
         assert!(Terms::of("hub", &offered(None), None, None, 1).is_err());
         assert!(Terms::of("hub", &offered(None), Some(131_071), Some(9), 0).is_err());
+    }
+
+    #[test]
+    fn a_contracts_length_is_told_in_the_days_of_its_network() {
+        let t = Terms::of(
+            "hub",
+            &offered(Some(range())),
+            Some(131_071),
+            Some(5_760),
+            0,
+        )
+        .unwrap();
+        let (bitcoin, mutinynet) = (ChainProfile::Core30Signet, ChainProfile::Mutinynet);
+        assert!(t
+            .lines(bitcoin.blocks_a_day())
+            .contains("5,760 blocks (about 40 days)"));
+        assert!(t
+            .lines(mutinynet.blocks_a_day())
+            .contains("5,760 blocks (about 2 days)"));
     }
 }
