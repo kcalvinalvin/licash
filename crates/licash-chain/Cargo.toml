@@ -1,0 +1,19 @@
+# The hub's header chain proven once: the chain program (r0/chain-guest runs
+# `licash_chain::extend`) and what the hub does to keep and open the chain.
+# Its own crate, so that the program's image id changes with this alone.
+[package]
+name = "licash-chain"
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "The hub's Bitcoin header chain, proven in batches and opened by the statements that read it"
+# A member of regtest's workspace, as licash-hp.
+workspace = "../../regtest"
+
+[dependencies]
+licash = { path = "../licash" }
+licash-statement = { path = "../licash-statement" }
+
+[dev-dependencies]
+licash-statement = { path = "../licash-statement", features = ["testing"] }

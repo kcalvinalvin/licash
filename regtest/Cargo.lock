@@ -799,6 +799,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "licash-chain"
+version = "0.0.1"
+dependencies = [
+ "licash",
+ "licash-statement",
+]
+
+[[package]]
 name = "licash-contract"
 version = "0.0.1"
 dependencies = [
@@ -824,6 +832,7 @@ dependencies = [
  "bitcoin",
  "k256",
  "licash",
+ "licash-chain",
  "licash-statement",
  "sha2",
 ]

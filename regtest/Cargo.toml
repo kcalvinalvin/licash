@@ -4,7 +4,7 @@
 # (apps/hub/tests/contracts.rs, run.sh here).
 [workspace]
 resolver = "2"
-members = ["../crates/licash-contract", "../crates/licash-hp", "../crates/licash-statement"]
+members = ["../crates/licash-chain", "../crates/licash-contract", "../crates/licash-hp", "../crates/licash-statement"]
 
 # Dependencies optimized in tests as Lichen's workspace does: BABE's
 # garbling takes half a minute an instance at opt-level 0.

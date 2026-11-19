@@ -17,6 +17,7 @@ workspace = "../../regtest"
 # HASH160, her request's one-time signatures' chains (licash's own version)
 bitcoin = { version = "=0.32.102", default-features = false, features = ["std"] }
 licash = { path = "../licash" }
+licash-chain = { path = "../licash-chain" }
 licash-statement = { path = "../licash-statement" }
 sha2 = "0.10"
 
