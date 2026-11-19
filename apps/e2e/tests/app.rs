@@ -1054,7 +1054,7 @@ async fn hub_down(
     bobs: &PaymentCode,
 ) -> anyhow::Result<()> {
     let held = phone.balance().await?;
-    let fee = eco.info(eco.hub(1)).await?.fees.spend.due(held);
+    let fee = eco.info(eco.hub(1)).await?.fees.spending().at_most(held);
     let mut asking = bobs.clone();
     asking.amount = Some(1_000);
     eco.stop("hub1").await?;
