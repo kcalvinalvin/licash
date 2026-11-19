@@ -47,6 +47,17 @@ pub const COMPACT_FROM: u32 = 9;
 /// The first graph id whose contracts are decided as [`Format::Lean`].
 pub const LEAN_FROM: u32 = 10;
 
+/// The first graph id whose contracts' statement reads Bitcoin's headers
+/// from a receipt of the hub's header chain, not from every header of the
+/// exit ([`chained`]). Their filing is [`Format::Lean`].
+pub const CHAINED_FROM: u32 = 11;
+
+/// Whether a contract of graph `id` is decided on a header chain proven
+/// beforehand: a function of its Base alone, as its [`Format`] is.
+pub fn chained(id: u32) -> bool {
+    id >= CHAINED_FROM
+}
+
 /// How a contract's filing is written, a function of its Base alone: the
 /// holder writes it, the Hub reads it and the statement decides on it all
 /// by [`Format::of`], so that a contract is decided by the codec it was

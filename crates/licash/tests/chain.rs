@@ -492,6 +492,82 @@ fn activation_checks_real_inclusion_exact_reference_shared_context_and_mature_de
     assert_eq!(activation.reference.to_bytes().len(), 72);
 }
 
+/// A sparse chain answers a lookup of a block it shows as the dense one
+/// does, finds nothing outside the chain without a word, and records a block
+/// inside it that it was not shown: so that the judgment can tell a block the
+/// hub left out from one that is not there.
+#[test]
+fn a_sparse_chain_records_the_blocks_inside_it_that_it_was_not_shown() {
+    let (cp, blocks, dense) = fixture(1);
+    let header =
+        |i: usize| -> chain::HeaderBytes { serialize(&blocks[i].header).try_into().unwrap() };
+    let shown = std::collections::BTreeMap::from([(1, header(0)), (3, header(2))]);
+    let sparse = Chain::sparse(cp.clone(), 3, shown).unwrap();
+    assert_eq!(sparse.tip_height(), 3);
+    assert_eq!(sparse.checkpoint().commitment(), cp.commitment());
+    for height in [0, 1, 3] {
+        assert_eq!(sparse.header(height), dense.header(height));
+        assert_eq!(sparse.confirmations(height), dense.confirmations(height));
+    }
+    // outside the chain, as in a dense one: below the checkpoint, above the tip
+    assert_eq!(sparse.header(4), None);
+    assert_eq!(sparse.confirmations(4), None);
+    assert!(sparse.unshown().is_empty());
+    // inside it, not shown: nothing found, and the height recorded, once
+    assert_eq!(sparse.header(2), None);
+    assert_eq!(sparse.block_hash(2), None);
+    assert_eq!(sparse.unshown(), vec![2]);
+    // a clone's record is the same one, which a judgment on either leaves
+    assert_eq!(sparse.clone().unshown(), vec![2]);
+    // a dense chain has none to record
+    assert_eq!(dense.header(9), None);
+    assert!(dense.unshown().is_empty());
+    // heights a sparse chain can't hold are refused
+    for (tip, height) in [(3, 0), (3, 4), (0, 1)] {
+        let shown = std::collections::BTreeMap::from([(height, header(0))]);
+        assert!(Chain::sparse(cp.clone(), tip, shown).is_err());
+    }
+    assert!(Chain::sparse(cp, 3, Default::default()).is_ok());
+}
+
+/// An activation verifies on a sparse chain showing its blocks as on a dense
+/// one; one that is not shown fails, and the height asked for is recorded.
+#[test]
+fn an_activation_on_a_sparse_chain_needs_the_blocks_it_reads_shown() {
+    let (cp, blocks, dense) = fixture(1);
+    let raw = serialize(&blocks[0]);
+    let activation = Activation {
+        reference: ActivationRef {
+            height: 1,
+            block_hash: blocks[0].block_hash().to_byte_array(),
+            txid: blocks[0].txdata[1].compute_txid().to_byte_array(),
+            output: 0,
+        },
+        inclusion: Inclusion::capture(&raw, 1, raw.len()).unwrap(),
+    };
+    let terms = TimedTerms::new(
+        cp.profile(),
+        cp.commitment(),
+        4,
+        3,
+        sha256::Hash::hash(&[83; 32]).to_byte_array(),
+    )
+    .unwrap();
+    let header =
+        |i: usize| -> chain::HeaderBytes { serialize(&blocks[i].header).try_into().unwrap() };
+    // the activation's block and the tip, depth 3 from block 1
+    let shown = std::collections::BTreeMap::from([(1, header(0))]);
+    let sparse = Chain::sparse(cp.clone(), 3, shown).unwrap();
+    assert_eq!(
+        activation.verify(&sparse, &cp, &terms, 100_000).unwrap(),
+        activation.verify(&dense, &cp, &terms, 100_000).unwrap()
+    );
+    assert!(sparse.unshown().is_empty());
+    let none = Chain::sparse(cp.clone(), 3, Default::default()).unwrap();
+    assert!(activation.verify(&none, &cp, &terms, 100_000).is_err());
+    assert_eq!(none.unshown(), vec![1]);
+}
+
 /// A lock's checkpoint as of `header`, the block after the genesis one.
 fn second_block_checkpoint(cp: &Checkpoint, header: &Header) -> Checkpoint {
     let genesis: Header = deserialize(cp.header()).unwrap();

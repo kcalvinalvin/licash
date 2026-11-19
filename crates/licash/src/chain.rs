@@ -13,6 +13,8 @@ use bitcoin::{
     Block, BlockHash, Network,
 };
 use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Mutex};
 
 use crate::{
     crypto::tagged_hash,
@@ -308,7 +310,10 @@ impl Checkpoint {
         Self::new(profile, height, header, times, period_start)
     }
 
-    fn push(&mut self, bytes: HeaderBytes) -> Result<(), Error> {
+    /// This state after `bytes`, the next block of the chain: its ancestry,
+    /// difficulty, proof of work, median time and version, as every header
+    /// of a [`Chain`] is checked. On error the state is unchanged.
+    pub fn push(&mut self, bytes: HeaderBytes) -> Result<(), Error> {
         let previous = self.decoded;
         let h = header(&bytes)?;
         let hash = sha256d(&bytes);
@@ -362,14 +367,69 @@ impl Checkpoint {
     }
 }
 
+/// The blocks of a [`Chain`] that can be looked up.
+#[derive(Clone)]
+enum Blocks {
+    /// Every header from the checkpoint, each checked.
+    Dense(Vec<HeaderBytes>),
+    /// The blocks through `tip` of which only `shown` are: each was
+    /// authenticated by whoever built the chain ([`Chain::sparse`]). A
+    /// height inside the chain that is not shown is recorded in
+    /// `unshown` when it is asked for.
+    Sparse {
+        tip: u32,
+        shown: BTreeMap<u32, HeaderBytes>,
+        unshown: Arc<Mutex<BTreeSet<u32>>>,
+    },
+}
+
 /// One immutable checked ancestry, not an active-chain or current-time oracle.
 #[derive(Clone)]
 pub struct Chain {
     checkpoint: Checkpoint,
-    headers: Vec<HeaderBytes>,
+    blocks: Blocks,
 }
 
 impl Chain {
+    /// A chain from `checkpoint` through height `tip` of which only the
+    /// blocks `shown` (by height, between the checkpoint's and `tip`) can be
+    /// looked up, each already authenticated as the block of its height on a
+    /// chain checked from the checkpoint: a lookup of any other height inside
+    /// it finds nothing and is recorded ([`Chain::unshown`]), so that whoever
+    /// judges with it can tell a block it was not shown from one that is not
+    /// there. A lookup outside the chain finds nothing, as in a dense one.
+    pub fn sparse(
+        checkpoint: Checkpoint,
+        tip: u32,
+        shown: BTreeMap<u32, HeaderBytes>,
+    ) -> Result<Self, Error> {
+        if tip < checkpoint.height || shown.keys().any(|h| *h <= checkpoint.height || *h > tip) {
+            return Err(bad("sparse chain heights"));
+        }
+        Ok(Self {
+            checkpoint,
+            blocks: Blocks::Sparse {
+                tip,
+                shown,
+                unshown: Arc::default(),
+            },
+        })
+    }
+
+    /// The heights inside a sparse chain that were looked up and not shown,
+    /// in order. Always empty of a dense one.
+    pub fn unshown(&self) -> Vec<u32> {
+        match &self.blocks {
+            Blocks::Dense(_) => Vec::new(),
+            Blocks::Sparse { unshown, .. } => unshown
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .copied()
+                .collect(),
+        }
+    }
+
     pub fn verify(
         checkpoint: Checkpoint,
         expected_checkpoint: &[u8; 32],
@@ -388,25 +448,54 @@ impl Chain {
         }
         Ok(Self {
             checkpoint,
-            headers,
+            blocks: Blocks::Dense(headers),
         })
     }
     pub fn checkpoint(&self) -> &Checkpoint {
         &self.checkpoint
     }
+    /// The headers after the checkpoint of a dense chain; none of a sparse
+    /// one, which shows only some of its blocks.
     pub fn headers(&self) -> &[HeaderBytes] {
-        &self.headers
+        match &self.blocks {
+            Blocks::Dense(headers) => headers,
+            Blocks::Sparse { .. } => &[],
+        }
     }
     pub fn tip_height(&self) -> u32 {
-        self.checkpoint.height
-            + u32::try_from(self.headers.len()).expect("validated header heights")
+        match &self.blocks {
+            Blocks::Dense(headers) => {
+                self.checkpoint.height
+                    + u32::try_from(headers.len()).expect("validated header heights")
+            }
+            Blocks::Sparse { tip, .. } => *tip,
+        }
     }
     pub fn header(&self, height: u32) -> Option<&HeaderBytes> {
         if height == self.checkpoint.height {
             return Some(&self.checkpoint.header);
         }
         let offset = height.checked_sub(self.checkpoint.height)?.checked_sub(1)?;
-        self.headers.get(usize::try_from(offset).ok()?)
+        match &self.blocks {
+            Blocks::Dense(headers) => headers.get(usize::try_from(offset).ok()?),
+            Blocks::Sparse {
+                tip,
+                shown,
+                unshown,
+            } => {
+                if height > *tip {
+                    return None;
+                }
+                let found = shown.get(&height);
+                if found.is_none() {
+                    unshown
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(height);
+                }
+                found
+            }
+        }
     }
     pub fn block_hash(&self, height: u32) -> Option<[u8; 32]> {
         self.header(height).map(|h| sha256d(h))
