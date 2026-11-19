@@ -262,7 +262,7 @@ impl Wallet {
     /// claim what her notes there come to, up to its cap: they leave her
     /// balance and come to the wallet on Bitcoin with her reserve in the
     /// fold the hub signs, the protection over. The fold's txid; its
-    /// recovery follows it ([`RecoveryStage::Folding`]), and files her claim
+    /// recovery follows it (`RecoveryStage::Folding`), and files her claim
     /// on Bitcoin should the hub not fold. Refused for a contract not
     /// protecting yet, forced closed, or past its close, when its reserve
     /// comes back anyway; and for one too near its end to leave time for

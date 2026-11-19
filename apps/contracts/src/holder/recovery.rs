@@ -213,7 +213,7 @@ pub enum Stage {
     Challenging,
     Challenged,
     Paid,
-    /// Closed cooperatively on her claim ([`super::fold`]): a fold she
+    /// Closed cooperatively on her claim (`super::fold`): a fold she
     /// signed may confirm, paying it. Until then it holds the claim her
     /// forced close would file, the same.
     Folding,

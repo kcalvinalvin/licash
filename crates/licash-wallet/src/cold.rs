@@ -394,7 +394,7 @@ impl<T: Transport> Wallet<T> {
     }
 
     /// Look in the blocks of `chain` for what cold storage's addresses hold,
-    /// from the block after the last looked in (the last [`AGAIN`] again,
+    /// from the block after the last looked in (the last `AGAIN` again,
     /// as a reorganization may have changed them), at most `max` blocks,
     /// if the chain has new ones: where it stands then. None if not
     /// configured.

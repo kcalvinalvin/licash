@@ -133,7 +133,7 @@ impl Timing {
     /// them. Mutinynet's are signet's, counted in blocks as on every network
     /// but regtest, but for what its quicker blocks cannot hold: the hub's
     /// proof takes as long in hours as on signet, so its assert window is
-    /// 20 times the blocks ([`assert_window`]), and the fewest blocks a
+    /// 20 times the blocks (`assert_window`), and the fewest blocks a
     /// contract lasts and the fixed terms' as many more. None elsewhere
     /// yet. Holders choose their terms within `range`, if any, the fixed
     /// terms among them.

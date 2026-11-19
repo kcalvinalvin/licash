@@ -324,7 +324,7 @@ impl<T: Transport> Wallet<T> {
     }
 
     /// Look for the deposits the wallet's seed asked of the hub at `url`,
-    /// by number from the first, until [`GAP`] in a row are unknown there:
+    /// by number from the first, until `GAP` in a row are unknown there:
     /// those it kept no record of, as a wallet restored from its seed,
     /// kept as the hub answers them, checked to be the wallet's, then
     /// taken on as any other ([`Wallet::follow_deposit`], refunded if
