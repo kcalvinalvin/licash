@@ -716,3 +716,52 @@ fn a_request_the_hub_signed_under_another_graph_is_refused() {
         "{refused:#}"
     );
 }
+
+/// What each transaction of a dispute weighs, as the chain would see it,
+/// from the graph's own builders: the table `r0/README.md` quotes, and
+/// bounds that keep it from growing unnoticed. The publication's claim is
+/// not here (its size is its filing's), nor the hub's disclosure (1 024
+/// bytes of nulldata).
+#[test]
+fn a_dispute_is_made_of_transactions_of_known_size() {
+    let (o, keys) = signed();
+    let w = World::new();
+    let ho = w.hub.signed().unwrap();
+    let proof = lichen_babe::statement::mock_prove(&licash_contract::graph::journal(&o.base));
+    let r = o.request(&keys, 4096, &[22; 32]).unwrap();
+    let respond = ho.respond(w.hub.keys(), 2048).unwrap();
+    let contest = o.contest(&keys).unwrap();
+    let assertion = ho.assert(w.hub.keys(), &proof).unwrap();
+    let challenge = o.challenge(&keys, &assertion).unwrap();
+    // Each terminal with its fee coin, as its poster broadcasts it.
+    let fee = |name: &str| {
+        let p = presign(&o.set, name).unwrap();
+        let coin = TxOut {
+            value: DUST,
+            script_pubkey: dispute::fee_script(&keys.party.payment).unwrap(),
+        };
+        dispute::add_fee(
+            o.finish(name, vec![]).unwrap(),
+            p.prevout.clone(),
+            (OutPoint::null(), coin),
+            &keys.party.payment,
+        )
+        .unwrap()
+    };
+    let table: Vec<(&str, usize, usize)> = vec![
+        ("request", r.vsize(), 2_300),
+        ("respond", respond.vsize(), 600),
+        ("contest", contest.vsize(), 300),
+        ("assert", assertion.vsize(), 8_000),
+        ("challenge_assert", challenge.vsize(), 21_500),
+        ("respond_timeout", fee("respond_timeout").vsize(), 800),
+        ("contest_timeout", fee("contest_timeout").vsize(), 800),
+        ("request_timeout", fee("request_timeout").vsize(), 800),
+        ("success", fee("success").vsize(), 800),
+        ("failure", fee("failure").vsize(), 800),
+    ];
+    for (name, vsize, most) in table {
+        eprintln!("{name:>18}: {vsize:>6} vB");
+        assert!(vsize <= most, "{name} weighs {vsize} vB, more than {most}");
+    }
+}

@@ -33,9 +33,12 @@ flags="$(printf '%s\x1f--remap-path-prefix=%s=licash\x1f--remap-path-prefix=%s=c
 # rzup installs the toolchain under rustup's directory, with or without rustup itself.
 tc="${RISC0_TOOLCHAIN:-$HOME/.rustup/toolchains/risc0}"
 name="${1:-}"
+features=
 case "$name" in
     hp) dir=hp-guest ;;
-    *) echo 'usage: r0/build-guest.sh hp' >&2; exit 2 ;;
+    # Its steps' cycles printed, for measurements: never a program to keep.
+    hp-profile) dir=hp-guest; features="--features profile" ;;
+    *) echo 'usage: r0/build-guest.sh hp | hp-profile' >&2; exit 2 ;;
 esac
 # The guests link libsecp256k1 (taproot control blocks): compile its C with
 # rzup's RISC-V gcc.
@@ -64,7 +67,7 @@ git ls-files -z --cached --others --exclude-standard -- "${sources[@]}" |
 export CC_riscv32im_risc0_zkvm_elf="$cc" AR_riscv32im_risc0_zkvm_elf="${cc%gcc}ar"
 export CFLAGS_riscv32im_risc0_zkvm_elf="-march=rv32im -nostdlib -ffile-prefix-map=$src=licash -ffile-prefix-map=$cargo_home=cargo"
 CARGO_ENCODED_RUSTFLAGS="$flags" RISC0_FEATURE_bigint2= RUSTC="$tc/bin/rustc" CARGO_TARGET_DIR="$build/target" \
-    "$tc/bin/cargo" build --locked --release --target riscv32im-risc0-zkvm-elf --manifest-path "$src/r0/$dir/Cargo.toml"
+    "$tc/bin/cargo" build --locked --release --target riscv32im-risc0-zkvm-elf $features --manifest-path "$src/r0/$dir/Cargo.toml"
 elf="$build/target/riscv32im-risc0-zkvm-elf/release/licash-$dir"
 sha256sum "$elf"
 cargo run --locked --release --manifest-path r0/host/Cargo.toml -- pack "$elf" "r0/guests/$name.bin" > "r0/guests/$name.id"

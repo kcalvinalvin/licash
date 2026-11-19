@@ -163,3 +163,35 @@ graph's assert window of her contest otherwise.
 A hub proves on signet through `licash-r0` (`LICASH_HP_PROVER` names
 another), one proof at a time (apps/hub/README.md); no test plays a real
 proof on Bitcoin yet.
+
+## Measured
+
+`r0/build-guest.sh hp-profile` builds the statement with its steps'
+cycles printed (never a program to keep); `hp-exec` with it shows them. On
+the answered input above (32 settled notes, a 16-note spend as evidence,
+a handful of headers):
+
+| Step | Cycles |
+|---|---|
+| the input decoded: Base, and every note and signature of the evidence | 25.9 M |
+| the exit read: headers' work and transactions | 0.2 M |
+| her request's one-time signatures (v4 and later Bases) | 5.2 M |
+| the Licash header chain through her publication | 0.02 M (28 k a header) |
+| her filing decoded and judged: each settled note's issuance proof and hold signature | 41.3 M |
+| total | 67.6 M |
+
+So proving cost is the notes' signatures and DLEQs (about 1.4 M cycles a
+note), then the headers, and almost none of it is Bitcoin's. A dispute's
+transactions weigh (`a_dispute_is_made_of_transactions_of_known_size`):
+
+| Transaction | vB |
+|---|---|
+| `request` | 2 154 |
+| `respond` | 491 |
+| `contest` | 206 |
+| `assert` | 7 725 |
+| `challenge_assert` | 20 717 |
+| a terminal with its fee coin | 625 to 668 |
+
+An uncontested response is a `request`, her publication, a `respond` and
+its terminal; the proof and its 28 kvB are for a contest alone.

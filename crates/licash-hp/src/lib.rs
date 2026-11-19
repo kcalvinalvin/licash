@@ -267,8 +267,21 @@ pub fn decide(
     exit: &Exit,
     evidence: &[Evidence],
 ) -> Result<(Owed, Read), Refusal> {
+    decide_with(base, keys, exit, evidence, &mut |_| {})
+}
+
+/// [`decide`], calling `mark` with the name of each step as it ends: the
+/// guest's profile build counts the cycles between them.
+pub fn decide_with(
+    base: &Base,
+    keys: Option<&RequestKeys>,
+    exit: &Exit,
+    evidence: &[Evidence],
+    mark: &mut dyn FnMut(&'static str),
+) -> Result<(Owed, Read), Refusal> {
     let contract = contract(base);
     let read = licash_statement::read(&contract, exit).map_err(Refusal::Exit)?;
+    mark("the exit read: its headers' work, its transactions");
     if let Some(holder_wots) = base.version().holder_wots() {
         let keys = keys
             .filter(|k| k.digest() == holder_wots)
@@ -281,13 +294,16 @@ pub fn decide(
             return Err(Refusal::Unsigned);
         }
     }
+    mark("her request's one-time signatures");
     let chain = chain(base, through_publication(&contract, exit, &read))?;
+    mark("the Licash header chain through her publication");
     let request = Request {
         amount: read.b,
         claim_digest: read.e,
     };
     let owed = recovery::owed(base, &request, &read.claim, evidence, &chain)
         .map_err(|e| Refusal::Evidence(e.to_string()))?;
+    mark("her filing decoded and judged against the evidence");
     Ok((owed, read))
 }
 
@@ -295,11 +311,20 @@ pub fn decide(
 /// response's `b′`, and the response disclosed what the evidence needs.
 /// On success, the journal fixed at opening.
 pub fn check(input: &HubInput) -> Result<[u8; JOURNAL_LEN], Refusal> {
-    let (owed, read) = decide(
+    check_with(input, &mut |_| {})
+}
+
+/// [`check`], calling `mark` as [`decide_with`] does.
+pub fn check_with(
+    input: &HubInput,
+    mark: &mut dyn FnMut(&'static str),
+) -> Result<[u8; JOURNAL_LEN], Refusal> {
+    let (owed, read) = decide_with(
         &input.base,
         input.keys.as_ref(),
         &input.exit,
         &input.evidence,
+        mark,
     )?;
     verdict(&owed, read.b2, read.disclosed.as_deref())?;
     licash_statement::holds(&contract(&input.base), &read, owed.owed).map_err(|_| Refusal::Owed)

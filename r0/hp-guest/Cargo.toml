@@ -12,6 +12,11 @@ rust-version = "1.97"
 [workspace]
 resolver = "3"
 
+[features]
+# Print the cycles each step of the statement takes, for measurements: not
+# a program to keep (r0/build-guest.sh hp-profile).
+profile = []
+
 [dependencies]
 licash-hp = { path = "../../crates/licash-hp" }
 risc0-zkvm = { version = "=3.1.0", default-features = false, features = ["std"] }

@@ -51,6 +51,8 @@ fn env_for(input: &[u8], po2: Option<u32>) -> Result<ExecutorEnv<'static>> {
     if let Some(po2) = po2 {
         env.segment_limit_po2(po2);
     }
+    // What a profile build of the guest prints (`r0/build-guest.sh hp-profile`).
+    env.stdout(std::io::stdout());
     env.write(&(input.len() as u32))?.write_slice(&words(input));
     env.build()
 }

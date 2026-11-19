@@ -4,7 +4,7 @@
 //! (`licash_statement::Contract::journal`), fixed at the contract's
 //! opening: `c ‖ H("licash/hp/word" ‖ Base digest) ‖ H(O_D ‖ checkpoint ‖ W)`.
 
-use licash_hp::{check, HubInput};
+use licash_hp::{check_with, HubInput};
 use risc0_zkvm::guest::env;
 
 fn main() {
@@ -16,7 +16,20 @@ fn main() {
         .flat_map(|w| w.to_le_bytes())
         .take(n as usize)
         .collect();
+    // The `profile` build (never a kept program) prints the cycles each
+    // step took, which the host shows: `r0/README.md`.
+    #[cfg(feature = "profile")]
+    let mut last = env::cycle_count();
+    #[cfg(feature = "profile")]
+    let mut mark = |what: &'static str| {
+        let now = env::cycle_count();
+        println!("cycles {:>12}  {what}", now - last);
+        last = now;
+    };
+    #[cfg(not(feature = "profile"))]
+    let mut mark = |_: &'static str| {};
     let input = HubInput::from_bytes(&bytes).expect("the statement's input");
-    let journal = check(&input).expect("the Hub's statement");
+    mark("the input decoded: Base, notes and spends of the evidence verified");
+    let journal = check_with(&input, &mut mark).expect("the Hub's statement");
     env::commit_slice(&journal);
 }
