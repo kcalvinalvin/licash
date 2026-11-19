@@ -222,10 +222,23 @@ from them, not yet tried on signet itself (the hub's README says what else
 it lacks). No other network for now.
 
 `close <id> --chain <url>` closes a live contract early with its hub,
-cooperatively: the hub and the wallet sign its fold together (MuSig2), which
-pays the wallet's reserve back to it on Bitcoin at once and the rest to the
-hub, less the fee, which the hub pays from its share. The contract protects
-nothing from then on (`contracts` shows it `closed early`).
+cooperatively, and claims what the wallet's notes at the hub come to, the
+contract's cap at most, as `force-close` would (below), but paid in the same
+transaction: the wallet asks the hub, which says whether anything spent
+those notes, then signs a claim of them and the hub's fold together
+(MuSig2). The hub retires the notes and signs: the fold pays the wallet the
+claim and its reserve on Bitcoin and the rest to the hub, less the fee,
+which the hub pays from its share. A hub that finds a note spent refuses,
+and nothing leaves the wallet; one that took the claim and does not fold
+leaves it to `recoveries`, which files the same claim on Bitcoin by itself
+a little before its last block, as a forced close would (`force-close`
+does it at once). The claim takes settled notes only: a contract that locks
+owed to the wallet depend on must be forced closed, and so must one too
+near its end for that. A wallet holding no notes at the hub gets its
+reserve back and no more. The contract protects nothing from then on
+(`contracts` shows it `closed early`); `recoveries` shows the close as
+`folding` until the fold is in a block, then `done`. Hubs that do not yet
+take a claim with their fold refuse `close`: `force-close` stays.
 
 `force-close <id> --chain <url>` forces a live contract closed when its hub
 stopped answering (`<id>` is the contract's id, or its start): its share

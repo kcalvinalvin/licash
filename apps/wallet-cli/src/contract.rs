@@ -292,7 +292,8 @@ pub async fn force_close(
 }
 
 /// Close contract `id` early with its hub, cooperatively: the wallet's
-/// reserve back on Bitcoin at once, the protection over.
+/// notes there, its cap at most, and its reserve back on Bitcoin in the
+/// hub's fold, the protection over.
 pub async fn close(
     wallet: &Wallet<Http>,
     path: &Path,
