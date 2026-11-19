@@ -2483,3 +2483,25 @@ fn a_phone_hands_its_refund_on_long_after_its_timeout() {
     let value = refunded[0].output[0].value.to_sat();
     assert_eq!(alice.balance().unwrap().onchain, value);
 }
+
+#[test]
+fn a_phone_names_what_a_restore_needs_of_its_hub_and_refuses_what_it_is_not() {
+    let net = Net::new(true);
+    let light = Light::new(&net);
+    let alice = net.wallet("alice", net.height());
+    let keys = alice.hub_keys().unwrap();
+    assert_eq!(keys.len(), 1);
+    let (address, root) = (keys[0].address.clone(), keys[0].close_root.clone());
+    let root = root.expect("a deposit root");
+    assert_eq!(root.len(), 64, "{root}");
+    // Nothing paid its close deposits: nothing found, nothing sent.
+    let none = alice
+        .recover_closes(light.clone(), address.clone(), root.clone(), 0, 10)
+        .unwrap();
+    assert!(none.is_empty(), "{none:?}");
+    let refused = |address: &str, root: &str| {
+        invalid(alice.recover_closes(light.clone(), address.into(), root.into(), 0, 10))
+    };
+    assert!(refused("zz", &root).contains("hex"));
+    assert!(refused(&address, "0707").contains("32 bytes"));
+}

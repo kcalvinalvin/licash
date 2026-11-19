@@ -170,6 +170,13 @@ the balance, cashes out notes there to an address that way, all of them or
 an amount chosen. A `licash:` code is paid in notes only, through a swap to
 a hub it names if the app trusts none.
 
+The core can find a contract's reserve with only the seed when the wallet
+file and the hub are both gone: `hub_keys` lists each hub's address and
+deposit root (keep them with the seed), and `recover_closes(chain, address,
+root, from, numbers)` finds the payments of defaults to the wallet's close
+deposits and hands the network a refund of each 2016 blocks old, paid to the
+fallback address. The app has no screen for it yet.
+
 Lightning invoices are paid the cheapest way found: through a trusted hub's
 gateway, or through a swap provider announced the same way that pays
 invoices from its own node (`licash-swaps run --lnd URL --lnd-macaroon
