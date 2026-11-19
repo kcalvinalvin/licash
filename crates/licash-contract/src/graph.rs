@@ -231,9 +231,11 @@ pub fn build(base: &Base, holder: &HolderPub, hub: &HubPub, hmsg: Vec<Hash>) -> 
     let p = base.parts();
     let g = &p.graph;
     let windows = windows(g);
+    let pubs = [party_pub(&p.parties[0])?, party_pub(&p.parties[1])?];
     HubProves::new(
         Spec {
             terms: terms(g),
+            close_spk: pubs[0].payout_spk.clone(),
             // The graph reads neither the contract's funding amount nor its
             // deadline margin (Base's, for the request's latest height).
             params: ContractParams {
@@ -246,7 +248,7 @@ pub fn build(base: &Base, holder: &HolderPub, hub: &HubPub, hmsg: Vec<Hash>) -> 
                 delta_prime: g.delta_prime,
                 deadline_margin: 0,
             },
-            pubs: [party_pub(&p.parties[0])?, party_pub(&p.parties[1])?],
+            pubs,
             b_key: holder.b_key.clone(),
             e_key: holder.e_key.clone(),
             claim_key: XOnlyPublicKey::from_slice(&p.claim_key)?,
@@ -284,6 +286,8 @@ pub struct Spec {
     pub params: ContractParams,
     /// The holder's keys, then the hub's.
     pub pubs: [PartyPubKeys; 2],
+    /// Where the default returns the holder's reserve.
+    pub close_spk: ScriptBuf,
     /// The holder's one-time keys for `b` (the payout's bit outputs read
     /// it) and for `E`.
     pub b_key: WotsPublic,
@@ -302,6 +306,7 @@ impl Spec {
             terms: &self.terms,
             params: &self.params,
             pubs: &self.pubs,
+            close_spk: &self.close_spk,
         }
     }
 

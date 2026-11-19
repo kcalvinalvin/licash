@@ -3760,7 +3760,7 @@ dependencies = [
 [[package]]
 name = "lichen-babe"
 version = "0.4.5"
-source = "git+https://github.com/lichenbtc-org/lichen?branch=licash#20953ae02d585073298d5e6792abb0e8f46dd32e"
+source = "git+https://github.com/lichenbtc-org/lichen?branch=licash#0ed3fa09cd30827d35bb303cb5c7e68bd265a20f"
 dependencies = [
  "anyhow",
  "ark-bn254",
@@ -3806,7 +3806,7 @@ dependencies = [
 [[package]]
 name = "lichen-contract"
 version = "0.4.5"
-source = "git+https://github.com/lichenbtc-org/lichen?branch=licash#20953ae02d585073298d5e6792abb0e8f46dd32e"
+source = "git+https://github.com/lichenbtc-org/lichen?branch=licash#0ed3fa09cd30827d35bb303cb5c7e68bd265a20f"
 dependencies = [
  "anyhow",
  "bitcoin",
