@@ -510,8 +510,8 @@ pub struct LockState {
     pub settled: Option<Settled>,
     pub preimage: Option<Hex>,
     /// Its payer's owner signatures, which with its certificate prove it on
-    /// Bitcoin to its payee: none from a hub older than them, or of a lock
-    /// the hub made of its own notes.
+    /// Bitcoin to its payee, the hub's own for a lock of its own notes:
+    /// none from a hub older than them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub signatures: Vec<Hex>,
 }

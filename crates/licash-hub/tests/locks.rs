@@ -721,6 +721,13 @@ fn own_locks_pay_the_payee_and_refund_nothing() {
     let id = lock.proposal.id();
     lock.certificate.verify(&keyset).unwrap();
     assert_eq!(lock.certificate.metadata().source_id(), id);
+    // Its owner signatures prove it on Bitcoin with its certificate, as a
+    // payer's lock: its payee activates it should the hub keep its notes.
+    let signatures = hub.lock_signatures(&id).unwrap();
+    assert!(!signatures.is_empty());
+    (lock.certificate)
+        .authenticate_source(&keyset, &lock.proposal, &signatures)
+        .unwrap();
     // The same request gets the same lock; another under the hash none.
     let again = hub
         .lock_own(

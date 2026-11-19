@@ -691,20 +691,20 @@ impl Hub {
     }
 
     /// The owner signatures the lock `id` was made with, for its payee to
-    /// prove it on Bitcoin with its certificate: none for the hub's own.
+    /// prove it on Bitcoin with its certificate: the hub's own too (a
+    /// deposit's or a Lightning receipt's, [`Hub::lock_own`]), Plain as
+    /// any, for its payee to activate it should the hub keep its notes.
     pub fn lock_signatures(&self, id: &ProposalId) -> Result<Vec<Signature>, Error> {
-        let signed: Option<(Vec<u8>, bool)> = self.store.read(|c| {
+        let signed: Option<Vec<u8>> = self.store.read(|c| {
             Ok(c.query_row(
-                "SELECT signed, own FROM locks WHERE id = ?1",
+                "SELECT signed FROM locks WHERE id = ?1",
                 [id.as_bytes()],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| r.get(0),
             )
             .optional()?)
         })?;
-        match signed.ok_or(Refusal::UnknownLock)? {
-            (_, true) => Ok(vec![]),
-            (signed, false) => Ok(SignedProposal::plain_signatures(&signed)?),
-        }
+        let signed = signed.ok_or(Refusal::UnknownLock)?;
+        Ok(SignedProposal::plain_signatures(&signed)?)
     }
 
     /// The hub's own lock under `hash`, if any ([`Hub::lock_own`]).
