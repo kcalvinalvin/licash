@@ -276,7 +276,9 @@ fn a_hub_issues_under_its_keyset_of_the_lowest_index() {
     let mut seed = [0; 32];
     let text = std::fs::read_to_string(&files.seed).unwrap();
     hex::decode_to_slice(text.trim(), &mut seed).unwrap();
-    let (index, later) = (1..64)
+    // The seed is random, and 63 indexes held an id below the first's only
+    // 63 times in 64: any index will do, so look until one does.
+    let (index, later) = (1..)
         .map(|index| (index, IssuerKeys::from_seed(&seed, index, MAX_POW).unwrap()))
         .find(|(_, keys)| keys.id() < first.id())
         .unwrap();
