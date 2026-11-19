@@ -1233,6 +1233,11 @@ fn command(cli: Cli) -> anyhow::Result<()> {
                     // Contracts open on its lock checkpoints, so that every
                     // later lock is judged on their chain.
                     licash_hub_service::open_on_lock_checkpoints(&openings, hub.clone());
+                    // The deposits her reserve returns to, bound to her
+                    // contract, where the hub takes deposits.
+                    if let Some(deposits) = &deposits {
+                        licash_hub_service::close_with_deposits(&openings, deposits.clone());
+                    }
                     // Its prover not ready, failing or short of time, a
                     // notification.
                     let notify = hub.clone();

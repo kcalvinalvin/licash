@@ -89,6 +89,18 @@ pub fn answer_from(openings: &licash_contracts::hub::Openings, hub: Arc<Hub>) {
     }));
 }
 
+/// The deposit a contract's default pays her reserve to bound to the
+/// contract in `openings`, from `deposits`: the hub's own, asked for as the
+/// contract names it, else the opening is refused.
+pub fn close_with_deposits(
+    openings: &licash_contracts::hub::Openings,
+    deposits: Arc<deposit::Gateway>,
+) {
+    openings.close_with(Arc::new(move |script, contract, pays, fee, timeout| {
+        deposits.bind_close(script, contract, pays, fee, timeout)
+    }));
+}
+
 /// Her funded notes `issue` on `hub`'s ledger, by its own lock under the
 /// hash of her issue's preimage, settled at once: the lock's id. Of a lock
 /// under that hash already, that one, settled; else none unless `new`.

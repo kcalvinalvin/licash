@@ -36,6 +36,12 @@ pub use fold::FoldLedger;
 pub use funded::{FundedIssue, Issuer, FUNDED_DEPTH};
 /// How the hub tells its operator what needs them ([`Openings::alert_with`]).
 pub type Alert = dyn Fn(&str) + Send + Sync;
+
+/// Binds the deposit paid to a script to a contract, whose default pays it
+/// the reserve, the hub keeping a fee of it, timing out at a height:
+/// `(script, contract, reserve, fee, timeout)`. Refused, with why, unless
+/// it is the hub's, asked for just so.
+pub type Closer = dyn Fn(&[u8], [u8; 32], u64, u64, u32) -> Result<(), String> + Send + Sync;
 use futures_util::StreamExt;
 use licash::chain::Checkpoint;
 use licash::note::Keyset;
@@ -121,6 +127,9 @@ pub struct Openings {
     fold_ledger: std::sync::OnceLock<Arc<FoldLedger>>,
     /// Where her funded notes are issued ([`Openings::issue_with`]).
     issuer: std::sync::OnceLock<Arc<Issuer>>,
+    /// Where the deposit her default pays her reserve to is bound to the
+    /// contract ([`Openings::close_with`]).
+    closer: std::sync::OnceLock<Arc<Closer>>,
     /// The ledger's lock checkpoints, which new contracts open on.
     checkpoints: std::sync::OnceLock<LockCheckpoints>,
     /// The prover of the hub's statement: none where proofs are the mock
@@ -361,6 +370,7 @@ impl Openings {
             claims: std::sync::OnceLock::new(),
             fold_ledger: std::sync::OnceLock::new(),
             issuer: std::sync::OnceLock::new(),
+            closer: std::sync::OnceLock::new(),
             checkpoints: std::sync::OnceLock::new(),
             prover: (!trust.mock).then(|| {
                 let before = crate::programs_before(profile);
@@ -671,6 +681,13 @@ impl Openings {
     /// always did, her reserve alone.
     pub fn folds_with(&self, ledger: Arc<FoldLedger>) {
         let _ = self.fold_ledger.set(ledger);
+    }
+
+    /// Bind the deposit that a contract's default pays her reserve to,
+    /// through `f` from now on, when an opening names one: without, an
+    /// opening that names one is refused, the hub taking no such deposit.
+    pub fn close_with(&self, f: Arc<Closer>) {
+        let _ = self.closer.set(f);
     }
 
     /// Tell the operator through `f` from now on (the hub's notifications):
@@ -1076,6 +1093,7 @@ mod tests {
             claims: std::sync::OnceLock::new(),
             fold_ledger: std::sync::OnceLock::new(),
             issuer: std::sync::OnceLock::new(),
+            closer: std::sync::OnceLock::new(),
             checkpoints: std::sync::OnceLock::new(),
             prover: None,
             alert: std::sync::OnceLock::new(),

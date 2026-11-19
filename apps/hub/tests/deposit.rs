@@ -1597,3 +1597,219 @@ async fn a_deposit_whose_notes_its_hub_keeps_is_owed_and_claimed_again_inside_th
     let held: u64 = alice.balance().unwrap().iter().map(|b| b.available).sum();
     assert_eq!(held, 3_000);
 }
+
+/// A deposit that returns a contract's reserve, asked by `wallet` for
+/// 3 000 sat, timing out 100 blocks on: its script and fee, and the
+/// contract a hub of ours binds it to.
+async fn close_deposit(net: &Net, wallet: &Wallet<Local>) -> (licash_wallet::CloseDeposit, u32) {
+    let timeout = net.height() + 100;
+    let close = wallet.close_deposit(HUB, 3_000, timeout).await.unwrap();
+    (close, timeout)
+}
+
+#[tokio::test]
+async fn a_close_deposit_is_the_reserve_exactly_for_the_most_notes_it_covers() {
+    let net = Net::new().await;
+    let alice = net.wallet("alice");
+    let (close, timeout) = close_deposit(&net, &alice).await;
+    // The reserve exactly; the hub's fee is what its notes leave of it.
+    assert_eq!(close.fee, 100);
+    let deposit = alice.deposit_of(&close.hash).unwrap();
+    let terms = deposit.terms.clone().unwrap();
+    assert_eq!((terms.pays, terms.timeout), (3_000, timeout));
+    assert_eq!(deposit.amount, 2_900);
+    // Kept as a contract's close, which her seed finds again.
+    let (_, body) = net.asked("alice", &close.hash);
+    assert_eq!(
+        body.close,
+        Some(licash_api::CloseTerms {
+            pays: 3_000,
+            timeout
+        })
+    );
+    // Notes other than the most it covers, a timeout too soon or too far
+    // for the hub to keep it: refused.
+    let mut fewer = body.clone();
+    fewer.close = Some(licash_api::CloseTerms {
+        pays: 3_100,
+        timeout,
+    });
+    let refused = net.deposits.deposit(&fewer).await.unwrap_err();
+    assert_eq!(refused.0.code, Code::Forward);
+    for bad in [net.height() + 5, net.height() + 200_000] {
+        let mut asked = body.clone();
+        asked.close = Some(licash_api::CloseTerms {
+            pays: 3_000,
+            timeout: bad,
+        });
+        // Another hash: the same notes under a timeout of its own.
+        asked.receive = licash_api::Receive::new(
+            &body.receive.terms().unwrap().0,
+            &body.receive.terms().unwrap().1,
+            &body.receive.outputs().unwrap(),
+            &[77; 32],
+        );
+        let refused = net.deposits.deposit(&asked).await.unwrap_err();
+        assert_eq!(refused.0.code, Code::Forward, "a timeout at {bad}");
+    }
+}
+
+#[tokio::test]
+async fn a_close_deposit_no_contract_binds_is_given_up_after_its_window() {
+    let net = Net::new().await;
+    let alice = net.wallet("alice");
+    let (close, timeout) = close_deposit(&net, &alice).await;
+    let hash = bytes(&close.hash);
+    // Nothing is locked to a deposit no contract binds, and nothing asks.
+    let refused = net.deposits.ask_lock(&hash).unwrap_err();
+    assert_eq!(refused.0.code, Code::Forward);
+    net.mine(11, Vec::new());
+    net.deposits.round().await;
+    assert_eq!(
+        net.deposits.deposit_status(&hash).unwrap().status.state,
+        ReceiveState::Canceled
+    );
+    let late = net.deposits.bind_close(close.script.as_bytes(), [1; 32], 3_000, 100, timeout);
+    assert!(late.is_err(), "{late:?}");
+}
+
+#[tokio::test]
+async fn a_contract_binds_its_close_deposit_once_and_as_asked() {
+    let net = Net::new().await;
+    let alice = net.wallet("alice");
+    let (close, timeout) = close_deposit(&net, &alice).await;
+    let bind = |contract: u8, pays: u64, fee: u64, timeout: u32| {
+        net.deposits
+            .bind_close(close.script.as_bytes(), [contract; 32], pays, fee, timeout)
+    };
+    // As the contract names it, nothing else.
+    assert!(bind(1, 3_001, 100, timeout).is_err());
+    assert!(bind(1, 3_000, 101, timeout).is_err());
+    assert!(bind(1, 3_000, 100, timeout + 1).is_err());
+    let unknown = net
+        .deposits
+        .bind_close(&[0x51; 34], [1; 32], 3_000, 100, timeout);
+    assert!(unknown.is_err());
+    bind(1, 3_000, 100, timeout).unwrap();
+    // The same again for the same contract, another's refused.
+    bind(1, 3_000, 100, timeout).unwrap();
+    assert!(bind(2, 3_000, 100, timeout).is_err());
+    // Kept past its window, till its timeout.
+    net.mine(15, Vec::new());
+    net.deposits.round().await;
+    assert_eq!(
+        net.deposits
+            .deposit_status(&bytes(&close.hash))
+            .unwrap()
+            .status
+            .state,
+        ReceiveState::Open
+    );
+}
+
+#[tokio::test]
+async fn a_close_deposit_is_locked_when_its_wallet_asks_not_when_it_is_paid() {
+    let net = Net::new().await;
+    let alice = net.wallet("alice");
+    let (close, timeout) = close_deposit(&net, &alice).await;
+    let hash = bytes(&close.hash);
+    net.deposits
+        .bind_close(close.script.as_bytes(), [1; 32], 3_000, 100, timeout)
+        .unwrap();
+    let address = alice
+        .deposit_of(&close.hash)
+        .unwrap()
+        .terms
+        .unwrap()
+        .address;
+    // The contract's default pays it, long after its window, and it is
+    // buried: nothing is locked, and no one is given up on.
+    net.mine(15, Vec::new());
+    net.mine(1, vec![payment(&address, 3_000, 1)]);
+    net.mine(3, Vec::new());
+    net.deposits.round().await;
+    net.deposits.round().await;
+    assert_eq!(
+        net.deposits.deposit_status(&hash).unwrap().status.state,
+        ReceiveState::Open
+    );
+    // She comes back: seen paid, she asks, and the hub locks.
+    let followed = alice.follow_deposit(&close.hash).await.unwrap();
+    assert_eq!(followed.state, DepositState::Open);
+    assert!(followed.funding.is_some());
+    net.deposits.round().await;
+    assert_eq!(
+        net.deposits.deposit_status(&hash).unwrap().status.state,
+        ReceiveState::Locked
+    );
+    let received = alice.follow_deposit(&close.hash).await.unwrap();
+    assert_eq!(received.state, DepositState::Received, "{received:?}");
+    // Her notes are the reserve less the hub's fee; its coins its own.
+    assert_eq!(available(&alice), 2_900);
+    net.deposits.round().await;
+    net.deposits.round().await;
+    let sent = net.sent();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].output[0].script_pubkey, sweep_to());
+}
+
+#[tokio::test]
+async fn a_close_deposit_never_asked_for_is_given_up_at_its_timeout_and_refunded() {
+    let net = Net::new().await;
+    let alice = net.wallet("alice");
+    let (close, timeout) = close_deposit(&net, &alice).await;
+    let hash = bytes(&close.hash);
+    net.deposits
+        .bind_close(close.script.as_bytes(), [1; 32], 3_000, 100, timeout)
+        .unwrap();
+    let address = alice
+        .deposit_of(&close.hash)
+        .unwrap()
+        .terms
+        .unwrap()
+        .address;
+    net.mine(1, vec![payment(&address, 3_000, 1)]);
+    net.mine(3, Vec::new());
+    net.deposits.round().await;
+    // Not asked for: kept, locked to no one.
+    assert_eq!(
+        net.deposits.deposit_status(&hash).unwrap().status.state,
+        ReceiveState::Open
+    );
+    // Past its timeout: given up, and the wallet takes the coins back.
+    let to_go = timeout.saturating_sub(net.height()) + 1;
+    net.mine(to_go, Vec::new());
+    net.deposits.round().await;
+    assert_eq!(
+        net.deposits.deposit_status(&hash).unwrap().status.state,
+        ReceiveState::Canceled
+    );
+    let funded = alice.follow_deposit(&close.hash).await;
+    assert!(funded.is_err() || funded.unwrap().state != DepositState::Received);
+    let due = alice.deposits_to_refund(net.height()).unwrap();
+    assert_eq!(due.len(), 1, "{due:?}");
+}
+
+#[tokio::test]
+async fn an_ordinary_deposit_is_no_contracts_to_lock_or_bind() {
+    let net = Net::new().await;
+    let alice = net.wallet("alice");
+    let deposit = alice.deposit(HUB, 3_000).await.unwrap();
+    let hash = bytes(&deposit.hash);
+    let refused = net.deposits.ask_lock(&hash).unwrap_err();
+    assert_eq!(refused.0.code, Code::Forward);
+    let script = alice
+        .deposit_of(&deposit.hash)
+        .unwrap()
+        .terms
+        .unwrap()
+        .address
+        .parse::<Address<_>>()
+        .unwrap()
+        .assume_checked()
+        .script_pubkey();
+    let bound = net
+        .deposits
+        .bind_close(script.as_bytes(), [1; 32], 3_100, 100, net.height() + 100);
+    assert!(bound.is_err(), "{bound:?}");
+}
