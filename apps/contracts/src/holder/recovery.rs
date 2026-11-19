@@ -242,6 +242,10 @@ struct State {
     swept_height: Option<u32>,
     from: Option<u32>,
     next_at: Option<u32>,
+    /// What her publication may pay in fees in all, set by her
+    /// ([`allow_publication_fee`]): absent, what its reserve hands it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    p_allowance: Option<u64>,
 }
 impl State {
     fn encode(&self) -> Vec<u8> {
@@ -820,7 +824,7 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
         let r = self
             .o
             .request(&self.keys, request.amount, &request.claim_digest)?;
-        self.build_p(&r, &self.filing_of(state)?)?;
+        self.build_p(&r, &self.filing_of(state)?, None, state.p_allowance)?;
         Ok(Next::To(Stage::Irrevocable))
     }
     fn request(&self, state: &mut State) -> Result<Next> {
@@ -839,7 +843,7 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
             self.request_matches(state, &r)?,
             "pinned R reads another claim"
         );
-        let (p, prevouts) = self.build_p(&r, &self.filing_of(state)?)?;
+        let (p, prevouts) = self.build_p(&r, &self.filing_of(state)?, None, state.p_allowance)?;
         state.r = Some(r);
         state.p = Some(p);
         state.prevouts = prevouts;
@@ -868,7 +872,20 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
             .context("terminal fee overflow")?
             .max(DUST))
     }
-    fn build_p(&self, r: &Transaction, filing: &Filing) -> Result<(Transaction, Vec<TxOut>)> {
+    /// Her publication of `filing`, spending `r`'s slot, its anchor and her
+    /// purse, its fee within `allowance` in all, else what those hold
+    /// besides the fee coin it pays her terminals (her reserve's, so a
+    /// wrong rate or a bug spends no more): a quarter of that at most at
+    /// the round's rate, or, `bump`ing one made before, exactly the fee
+    /// given, its fee coin kept. One coin of hers too only should an
+    /// allowance ask more than they hold.
+    fn build_p(
+        &self,
+        r: &Transaction,
+        filing: &Filing,
+        bump: Option<(&Transaction, Amount)>,
+        allowance: Option<u64>,
+    ) -> Result<(Transaction, Vec<TxOut>)> {
         let request = presign(&self.o.set, "request")?;
         let slot = request.tx.output.get(2).context("no claim slot")?.clone();
         let anchor = r.output.get(1).context("no request anchor")?.clone();
@@ -877,9 +894,22 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
             anchor.script_pubkey == fee_script,
             "request anchor is not hers"
         );
-        let fee_coin = TxOut {
-            value: self.terminal_fee()?,
-            script_pubkey: fee_script,
+        let held = slot.value + anchor.value + self.o.babe.purse().unwrap_or(Amount::ZERO);
+        let fee_coin = match bump {
+            Some((old, _)) => {
+                let kept = old.output.get(1).context("no fee coin to keep")?;
+                ensure!(kept.script_pubkey == fee_script, "a fee coin not hers");
+                kept.clone()
+            }
+            // Half of what R hands her at most, whatever the rate says.
+            None => TxOut {
+                value: self.terminal_fee()?.min(held / 2).max(DUST),
+                script_pubkey: fee_script,
+            },
+        };
+        let limit = match allowance {
+            Some(sats) => Amount::from_sat(sats),
+            None => held.checked_sub(fee_coin.value).unwrap_or(Amount::ZERO),
         };
         let change = self.wallet.fallback_address()?.script_pubkey();
         let r_total: Amount = r.output.iter().map(|o| o.value).sum();
@@ -957,7 +987,25 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
                 .rate
                 .fee_vb(weighed.vsize() as u64 + r.vsize() as u64)
                 .context("request package fee")?;
-            let fee = own.max(package.checked_sub(r_fee).unwrap_or(Amount::ZERO));
+            let least = FeeRate::from_sat_per_vb_u32(1)
+                .fee_vb(weighed.vsize() as u64)
+                .context("publication fee")?;
+            let fee = match bump {
+                Some((_, fee)) => fee,
+                None => (own.max(package.checked_sub(r_fee).unwrap_or(Amount::ZERO)))
+                    .min(limit / 4)
+                    .max(least),
+            };
+            ensure!(
+                fee <= limit,
+                "her publication would pay {fee} in fees, more than the {limit} {}: \
+                 allow more with `licash-wallet allow-publication-fee {} <sat>`",
+                match allowance {
+                    Some(_) => "she allowed",
+                    None => "its reserve holds",
+                },
+                crate::hex_id(&self.id)
+            );
             let Some(left) = total.checked_sub(fee_coin.value + fee) else {
                 if alone {
                     let input = self.rate.fee_vb(58).context("input fee")?;
@@ -1065,6 +1113,9 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
         }
         let Some(r_height) = state.r_height else {
             if state.next_at.is_none_or(|due| tip.saturating_add(1) >= due) {
+                if let Some(next) = self.bump(state, &r, &p, tip)? {
+                    return Ok(next);
+                }
                 self.keep_p(&p, &state.prevouts);
                 self.broadcast(&r).await;
                 self.broadcast(&p).await;
@@ -1075,8 +1126,21 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
             txid: r.compute_txid(),
             vout: 2,
         };
-        match first_spend(self.chain, slot, &r.output[2].script_pubkey, r_height..=tip).await? {
-            Some((height, tx)) if tx.compute_txid() == p.compute_txid() => {
+        let spent =
+            first_spend(self.chain, slot, &r.output[2].script_pubkey, r_height..=tip).await?;
+        // A version of hers, the last or one it took the place of: what she
+        // publishes, whichever spends the slot, carries her claim and pays
+        // her fee coin alike.
+        let hers = match &spent {
+            Some((_, tx)) => !self.reclaimed(tx)? && tx.output.get(..2) == p.output.get(..2),
+            None => false,
+        };
+        match spent {
+            Some((height, tx)) if hers => {
+                if tx.compute_txid() != p.compute_txid() {
+                    let _ = self.wallet.abandon_silent(&p.compute_txid());
+                    state.p = Some(tx);
+                }
                 state.p_height = Some(height);
                 state.from = Some(r_height);
                 state.next_at = Some(
@@ -1104,12 +1168,125 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
             }
             Some((_, tx)) => bail!("claim slot spent by {}, not P", tx.compute_txid()),
             None => {
+                if let Some(next) = self.bump(state, &r, &p, tip)? {
+                    return Ok(next);
+                }
                 self.keep_p(&p, &state.prevouts);
                 self.broadcast(&p).await;
                 Ok(Next::Save)
             }
         }
     }
+
+    /// Her publication `p`, in no block at `tip`, made again to pay more
+    /// as its window runs out, then signed ([`Stage::Signing`]): its fee
+    /// the limit [`Self::build_p`] keeps to, a quarter of it once a quarter
+    /// of its window passed, half at half, all of it at three quarters,
+    /// whatever the chain says fees are (a hub serving the chain could say
+    /// anything). Told then, if still in no block, so that she may allow
+    /// more ([`allow_publication_fee`]). Its window: until the request
+    /// deadline while `r` is in no block, else its publication window from
+    /// `r`'s block. None if it pays enough already.
+    fn bump(
+        &self,
+        state: &mut State,
+        r: &Transaction,
+        p: &Transaction,
+        tip: u32,
+    ) -> Result<Option<Next>> {
+        let graph = &self.o.base.parts().graph;
+        let (start, end) = match state.r_height {
+            Some(at) => (at, at.saturating_add(u32::from(graph.publication_window))),
+            None => (state.next_at.unwrap_or(tip), graph.request_height),
+        };
+        let paid = (state.prevouts.iter().map(|o| o.value).sum::<Amount>())
+            .checked_sub(p.output.iter().map(|o| o.value).sum())
+            .context("her publication creates money")?;
+        let held: Amount = (p.input.iter().zip(&state.prevouts))
+            .filter(|(i, _)| i.previous_output.txid == r.compute_txid())
+            .map(|(_, o)| o.value)
+            .sum();
+        let limit = match state.p_allowance {
+            Some(sats) => Amount::from_sat(sats),
+            None => held.checked_sub(p.output[1].value).unwrap_or(Amount::ZERO),
+        };
+        let rung = rung(start, end, tip);
+        if rung == 3 {
+            // Signed so that others could add inputs to it, by a release
+            // before: one of more fee at a lower rate may hold it out.
+            let pinnable = p.input[0].witness.nth(0).is_some_and(|s| s.len() == 65);
+            self.trouble(format!(
+                "her publication {} is in no block, {} blocks left to it, paying {paid} of the \
+                 {limit} it may: allow more with `licash-wallet allow-publication-fee {} <sat>`{}",
+                p.compute_txid(),
+                end.saturating_sub(tip),
+                crate::hex_id(&self.id),
+                if pinnable {
+                    " (signed by an older release, others may hold it out)"
+                } else {
+                    ""
+                },
+            ));
+        }
+        let target = match rung {
+            0 => return Ok(None),
+            rung => Amount::from_sat(limit.to_sat() >> (3 - rung)),
+        };
+        if !deadline::replaces(target, p.vsize() as u64, paid) {
+            return Ok(None);
+        }
+        let filing = self.filing_of(state)?;
+        let (bumped, prevouts) =
+            match self.build_p(r, &filing, Some((p, target)), state.p_allowance) {
+                Ok(made) => made,
+                Err(e) => {
+                    self.trouble(format!("{e:#}"));
+                    return Ok(None);
+                }
+            };
+        tracing::info!(id = %crate::hex_id(&self.id), from = %paid, to = %target, "her publication bumped");
+        let _ = self.wallet.abandon_silent(&p.compute_txid());
+        state.p = Some(bumped);
+        state.prevouts = prevouts;
+        Ok(Some(Next::To(Stage::Signing)))
+    }
+}
+
+/// The rung of a window from `start` to `end` at `tip`: 0 in its first
+/// quarter, then 1, 2 and 3 in its last, and after.
+fn rung(start: u32, end: u32, tip: u32) -> u32 {
+    let len = u64::from(end.saturating_sub(start).max(1));
+    let gone = u64::from(tip.saturating_sub(start));
+    (gone * 4 / len).min(3) as u32
+}
+
+/// Let the recovery of contract `id` in `dir` pay `sats` in all for its
+/// publication's fees, more than its reserve holds: her call, once told it
+/// falls short, or before. Refused above what her contract holds, a typo
+/// as like as not.
+pub fn allow_publication_fee(dir: &std::path::Path, id: &[u8; 32], sats: u64) -> Result<()> {
+    let store = Store::existing(dir)?.context("no contracts")?;
+    let contract = (store.list()?.into_iter().find(|c| &c.id == id)).context("no such contract")?;
+    ensure!(
+        sats <= contract.value,
+        "{sats} sat is more than the contract holds ({} sat)",
+        contract.value
+    );
+    for _ in 0..8 {
+        let row = store.recovery(id)?.context("not forced closed")?;
+        let mut state = State::decode(&row)?;
+        state.p_allowance = Some(sats);
+        if store.save_recovery(
+            id,
+            (&row.stage, &row.state),
+            &row.stage,
+            false,
+            &state.encode(),
+        )? {
+            return Ok(());
+        }
+    }
+    bail!("the recovery kept moving on: try again")
 }
 
 impl<T: Transport, C: Chain> Run<'_, T, C> {
@@ -1326,8 +1503,13 @@ impl<T: Transport, C: Chain> Run<'_, T, C> {
     /// hub's assertion verifies, or the child takes it. Set aside again at
     /// each round, as a reorganization frees it; freed otherwise, and the
     /// child's coins once the challenge is over. Without such a coin, she
-    /// is told.
+    /// is told. Left as it is while her publication is signed, the first
+    /// time or bumped: neither set aside nor freed for her publication to
+    /// take.
     fn hold_challenge_coin(&self, stage: Stage, state: &State) -> Result<()> {
+        if stage == Stage::Signing {
+            return Ok(());
+        }
         let marker = challenge_marker(&self.id);
         let possible = match stage {
             Stage::Published | Stage::Requested | Stage::Answered => true,
@@ -1925,5 +2107,40 @@ mod tests {
         assert!(State::decode(&row).is_err());
         row.state = vec![];
         assert!(State::decode(&row).is_err());
+    }
+    #[test]
+    fn a_publication_fee_allowed_is_written_only_once_set() {
+        let plain = String::from_utf8(State::default().encode()).unwrap();
+        assert!(!plain.contains("p_allowance"));
+        let state = State {
+            p_allowance: Some(40_000),
+            ..State::default()
+        };
+        let row = RecoveryRow {
+            id: [1; 32],
+            format: FORMAT,
+            stage: Stage::Published.as_str().into(),
+            irrevocable: true,
+            error: None,
+            state: state.encode(),
+            created_at: 0,
+        };
+        assert_eq!(State::decode(&row).unwrap().p_allowance, Some(40_000));
+    }
+    #[test]
+    fn a_publication_climbs_a_rung_a_quarter_of_its_window() {
+        // Window 100..=108: quarters at 102, 104 and 106.
+        assert_eq!(rung(100, 108, 100), 0);
+        assert_eq!(rung(100, 108, 101), 0);
+        assert_eq!(rung(100, 108, 102), 1);
+        assert_eq!(rung(100, 108, 104), 2);
+        assert_eq!(rung(100, 108, 106), 3);
+        assert_eq!(rung(100, 108, 200), 3);
+        // A tip before it, or a window of nothing: at once the last rung,
+        // or none, never a panic.
+        assert_eq!(rung(100, 108, 90), 0);
+        assert_eq!(rung(100, 100, 100), 0);
+        assert_eq!(rung(100, 100, 101), 3);
+        assert_eq!(rung(108, 100, 101), 0);
     }
 }

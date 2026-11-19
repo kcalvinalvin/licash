@@ -851,11 +851,15 @@ async fn empty(rt: &Regtest, wallet: &Wallet<Http>, chain: &Node) -> Result<()> 
 }
 
 /// A forced close at a fee rate her purse falls short of, no coin of hers
-/// on Bitcoin: put off, said why, revocable still. Then paid of one coin
-/// of hers more, once she has one.
+/// on Bitcoin: published within her reserve all the same, its fee a
+/// quarter of what it may pay, whatever the rate. Held out of blocks, it
+/// is bumped as its window passes, up to all her reserve, then she is
+/// told; once she allows more, one coin of hers pays the rest. Whichever
+/// version a block holds is hers.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs bitcoind and a release build"]
-async fn a_holder_adds_one_coin_to_her_purse_where_fees_run_past_it() -> Result<()> {
+async fn a_holder_publishes_within_her_reserve_and_bumps_it_then_adds_a_coin_she_allows(
+) -> Result<()> {
     use bitcoin::FeeRate;
     use licash_contracts::holder::recovery::{self, Stage};
 
@@ -880,56 +884,117 @@ async fn a_holder_adds_one_coin_to_her_purse_where_fees_run_past_it() -> Result<
     rt.mine(1)?;
     ensure!(scan(&wallet, &chain).await? == 60_000);
     let opened = holder::open(&wallet, &chain, &mine, &url, ask()).await?;
-    let payment = pay(&hub, &at.join("seed"), &url, &wallet.address(), 3_000)?;
+    let payment = pay(&hub, &at.join("seed"), &url, &wallet.address(), 2_048)?;
     wallet.receive(&payment)?;
     rt.mine(2)?;
     holder::resume(&wallet, &chain, &mine).await?;
     empty(&rt, &wallet, &chain).await?;
+    // Coins of hers, one to be set aside for a challenge: none to be
+    // spent on her publication's fee until she allows it.
+    let mut funded = Vec::new();
+    for _ in 0..2 {
+        let (coin, _) = rt.fund(
+            &wallet.fallback_address()?.script_pubkey(),
+            Amount::from_sat(100_000),
+        )?;
+        funded.push(coin);
+    }
+    ensure!(scan(&wallet, &chain).await? == 200_000);
 
     // 20 sat/vB: R's package alone is past her purse.
     let rate = FeeRate::from_sat_per_vb(20).context("a rate")?;
     let forced = recovery::force_close(&wallet, &chain, &mine, &opened.id, rate).await?;
     let lock_end = forced.next_at.context("no lock")?;
     rt.mine_to_height(lock_end - 1)?;
-    let short = &recovery::advance(&wallet, &chain, &mine, rate).await?[0];
-    ensure!(
-        short.stage == Stage::Claimed && !short.irrevocable,
-        "{short:?}"
-    );
-    let why = short.error.clone().context("no error")?;
-    ensure!(why.contains("too little of hers on Bitcoin"), "{why}");
-    // How much more, in sats: some, and less than the coin she gets next.
-    let needed: u64 = why
-        .split("about ")
-        .nth(1)
-        .and_then(|rest| rest.split(' ').next())
-        .and_then(|n| n.parse().ok())
-        .context("no sats needed said")?;
-    ensure!(needed > 0 && needed < 200_000, "{why}");
-
-    // A coin of hers: R's slot, anchor and purse, and that coin alone.
-    let (coin, _) = rt.fund(
-        &wallet.fallback_address()?.script_pubkey(),
-        Amount::from_sat(200_000),
-    )?;
-    rt.mine(1)?;
-    ensure!(scan(&wallet, &chain).await? == 200_000);
-    let sent = &recovery::advance(&wallet, &chain, &mine, rate).await?[0];
+    let advance = || recovery::advance(&wallet, &chain, &mine, rate);
+    let sent = advance().await?.remove(0);
     ensure!(
         sent.stage == Stage::Published && sent.irrevocable && sent.error.is_none(),
         "{sent:?}"
     );
-    let p = rt.get_tx(&sent.publication.context("no P")?)?;
+    let first = rt.get_tx(&sent.publication.context("no P")?)?;
     let r = rt.get_tx(&sent.request.context("no R")?)?;
-    let spent: Vec<_> = p.input.iter().map(|i| i.previous_output).collect();
     let of_r = |vout| bitcoin::OutPoint {
         txid: r.compute_txid(),
         vout,
     };
-    ensure!(spent == [of_r(2), of_r(1), of_r(3), coin], "{p:?}");
-    rt.mine(1)?;
-    let requested = &recovery::advance(&wallet, &chain, &mine, rate).await?[0];
+    let spent = |p: &bitcoin::Transaction| -> Vec<_> {
+        p.input.iter().map(|i| i.previous_output).collect()
+    };
+    ensure!(
+        spent(&first) == [of_r(2), of_r(1), of_r(3)],
+        "first spends {:?}",
+        spent(&first)
+    );
+    // What R hands her for it, less the fee coin her terminals need.
+    let held: u64 = [1, 2, 3].iter().map(|&v| r.output[v].value.to_sat()).sum();
+    let limit = held - first.output[1].value.to_sat();
+    ensure!(
+        fee_of(&rt, &first)? <= limit / 4,
+        "first fee {} limit {limit}",
+        fee_of(&rt, &first)?
+    );
+
+    // R in a block, P held out: at half its window, bumped to half.
+    let r_at = rt.mine_with(std::slice::from_ref(&r))?;
+    advance().await?;
+    for _ in 0..3 {
+        rt.mine_with(&[])?;
+    }
+    let bumped = advance().await?.remove(0);
+    ensure!(bumped.stage == Stage::Published, "{bumped:?}");
+    let half = rt.get_tx(&bumped.publication.context("no P")?)?;
+    ensure!(half.compute_txid() != first.compute_txid());
+    ensure!(half.output[..2] == first.output[..2] && spent(&half) == spent(&first));
+    ensure!(
+        fee_of(&rt, &half)? == limit / 2,
+        "half fee {} limit {limit}",
+        fee_of(&rt, &half)?
+    );
+
+    // At three quarters: all of it, and she is told.
+    for _ in 0..2 {
+        rt.mine_with(&[])?;
+    }
+    let all = advance().await?.remove(0);
+    let why = all.error.clone().context("not told")?;
+    ensure!(why.contains("allow-publication-fee"), "{why}");
+    let whole = rt.get_tx(&all.publication.context("no P")?)?;
+    ensure!(
+        fee_of(&rt, &whole)? == limit,
+        "whole fee {} limit {limit}",
+        fee_of(&rt, &whole)?
+    );
+    ensure!(rt.height()? == r_at + 5);
+
+    // She allows twice that: one coin of hers pays the rest.
+    let value = (holder::list(&mine)?.into_iter())
+        .find(|c| c.id == opened.id)
+        .context("no contract")?
+        .value;
+    ensure!(recovery::allow_publication_fee(&mine, &opened.id, value + 1).is_err());
+    recovery::allow_publication_fee(&mine, &opened.id, 2 * limit)?;
+    let allowed = advance().await?.remove(0);
+    ensure!(allowed.stage == Stage::Published, "{allowed:?}");
+    let paid = rt.get_tx(&allowed.publication.context("no P")?)?;
+    let inputs = spent(&paid);
+    ensure!(
+        inputs[..3] == [of_r(2), of_r(1), of_r(3)]
+            && inputs.len() == 4
+            && funded.contains(&inputs[3]),
+        "paid spends {inputs:?}"
+    );
+    ensure!(
+        fee_of(&rt, &paid)? == 2 * limit,
+        "paid fee {} limit {limit}",
+        fee_of(&rt, &paid)?
+    );
+
+    // The first, a block holds: hers all the same.
+    rt.mine_with(std::slice::from_ref(&first))?;
+    let requested = advance().await?.remove(0);
     ensure!(requested.stage == Stage::Requested, "{requested:?}");
+    ensure!(requested.publication == Some(first.compute_txid()));
     Ok(())
 }
 
