@@ -48,7 +48,7 @@ pub const GAP: u32 = 20;
 /// The secrets of the deposit numbered `number` at the hub of `address`,
 /// of the wallet whose deposit seed is `seed`: its preimage, refund key and
 /// outputs' ephemeral key.
-fn secrets(
+pub(crate) fn secrets(
     seed: &[u8; 32],
     address: &[u8],
     number: u32,

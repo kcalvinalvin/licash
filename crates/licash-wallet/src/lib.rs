@@ -33,6 +33,7 @@
 
 mod backup;
 mod claims;
+mod closes;
 mod code;
 mod coins;
 mod cold;
@@ -76,6 +77,7 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{de::DeserializeOwned, Serialize};
 
 pub use claims::{ClaimNote, ClaimSlot, FundedNote, LockClaim, OwedLock, SlotPays};
+pub use closes::ClosePayment;
 pub use code::{
     ContractSecrets, DonationAddress, HubId, LicashCode, PaymentCode, CODE_HUBS, MAX_HUBS,
 };

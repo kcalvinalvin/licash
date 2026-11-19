@@ -214,18 +214,30 @@ so that a wallet restored from its seed, its deposits' secrets derived from
 it, finds them again by their hashes. Deposits are kept in `hub.sqlite`.
 
 A contract's default close pays the holder's reserve to a deposit asked with
-`close` terms (`CloseTerms`: the reserve as the payment, and the timeout the
-contract's Base gives, `CLOSE_BLOCKS` after its close): its notes are the most
-the payment covers beside the deposit fee, its timeout its own, not a window
-after the request, and the hub keeps it for a deposit window only until an
-opening names its script and binds it to the contract (`bind_close`, with the
-fee the deposit asked, else the opening is refused); one whose opening is
-given up is given up too, unless a payment was seen. The hub locks the notes
-only when the wallet asks (`POST /v1/deposit/{hash}/lock`, once the payment is
-seen), when it comes back after the close, and a deposit nobody asked for is
-given up at its timeout, its payer taking the coins back. These are rows of
-`deposit_closes` in `hub.sqlite`, a table of its own that a file made before
-it creates on first use: the deposits before are ordinary ones.
+`close` terms (`CloseTerms`: the reserve as the payment, and `until`, the
+block the hub watches for the close's payment until, `CLOSE_BLOCKS` after the
+contract's close): its notes are the most the payment covers beside the
+deposit fee. The hub keeps it for a deposit window only until an opening
+names its script and binds it to the contract (`bind_close`, with the fee the
+deposit asked, else the opening is refused); one whose opening is given up is
+given up too, unless a payment was seen. The hub locks the notes only when
+the wallet asks (`POST /v1/deposit/{hash}/lock`, once the payment is seen),
+when it comes back after the close, and a deposit nobody asked for is given
+up once its payer may take the coins back.
+
+Its address is of the payer's seed and the hub's published root alone. The
+hub's info names a deposit root (`deposits.close_root`, an x-only key; none,
+and no contract opens), the hub claims such a deposit under that root tweaked
+by the deposit's hash and its payer's refund key (`close_claim_key`), and the
+refund leaf waits `CLOSE_WAIT` (2016) blocks after the payment confirms, a
+relative lock (`OP_CHECKSEQUENCEVERIFY`) naming no height, which holds
+however late the default is posted. So a wallet restored from its seed, with
+the hub's address and root (`licash-wallet hubs --json`), finds its payments
+on Bitcoin and takes them back with no word from the hub
+(`licash-wallet recover`). The hub's claims and deadlines count from the
+payment's block. The deposit's rows are in `deposit_closes` in `hub.sqlite`,
+a table of its own that a file made before it creates on first use: the
+deposits before are ordinary ones, claimed under the keys they were.
 A claim left unmined is made again at a
 higher fee rate as the timeout nears (twice the estimate once fewer than 12 blocks
 are left, doubling every 3 blocks, all of the coin but dust at most), and

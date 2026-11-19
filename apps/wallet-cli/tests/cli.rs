@@ -1822,3 +1822,69 @@ fn coins_paid_at_a_fallback_address_are_found_with_no_hub_serving_tweaks() {
     let coins = ok(wallet(&alice, &["onchain", "coins"], None));
     assert!(coins.ends_with("total  3,000 sat\n"), "{coins}");
 }
+
+/// A hub's address and deposit root are in `hubs --json`, to be kept with the
+/// seed; `recover` takes them by the hub's URL as the file records it, or
+/// named alone, and finds the wallet no payment of a contract's default where
+/// it paid none.
+#[test]
+fn recover_takes_a_hubs_address_and_deposit_root_by_url_or_by_name() {
+    let hub = Server::with_deposits(FEE);
+    let dir = tempfile::tempdir().unwrap();
+    let (alice, _) = party(dir.path(), "alice", Some(&hub));
+    let hubs = json(&alice, &["hubs"]);
+    let url = hubs[0]["url"].as_str().unwrap().to_owned();
+    let address = hubs[0]["address"].as_str().unwrap().to_owned();
+    let root = hubs[0]["deposits"]["close_root"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(root.len(), 64, "{root}");
+    assert!(!address.is_empty());
+    let chain = hub.esplora().to_owned();
+    let none = "no payment to the wallet's close deposits found";
+    let by_url = ["recover", "--hub", &url, "--chain", &chain];
+    assert!(ok(wallet(&alice, &by_url, None)).contains(none));
+    let named = [
+        "recover",
+        "--hub-address",
+        &address,
+        "--claim-root",
+        &root,
+        "--chain",
+        &chain,
+    ];
+    assert!(ok(wallet(&alice, &named, None)).contains(none));
+    assert_eq!(json(&alice, &named), serde_json::json!([]));
+    // A hub the file does not record, a root that is not one, both ways of
+    // naming a hub at once, or neither: refused.
+    let unknown = ["recover", "--hub", "http://other.test", "--chain", &chain];
+    failed(
+        wallet(&alice, &unknown, None),
+        1,
+        "no hub the wallet's file records",
+    );
+    let bad_root = [
+        "recover",
+        "--hub-address",
+        &address,
+        "--claim-root",
+        "zz",
+        "--chain",
+        &chain,
+    ];
+    failed(wallet(&alice, &bad_root, None), 1, "--claim-root");
+    let both = [
+        "recover",
+        "--hub",
+        &url,
+        "--hub-address",
+        &address,
+        "--chain",
+        &chain,
+    ];
+    assert!(!wallet(&alice, &both, None).status.success());
+    assert!(!wallet(&alice, &["recover", "--chain", &chain], None)
+        .status
+        .success());
+}

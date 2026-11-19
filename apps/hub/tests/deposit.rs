@@ -1838,3 +1838,139 @@ async fn an_ordinary_deposit_is_no_contracts_to_lock_or_bind() {
         .bind_close(script.as_bytes(), [1; 32], 3_100, 100, net.height() + 100);
     assert!(bound.is_err(), "{bound:?}");
 }
+
+/// A transport to no hub at all: the hub is gone.
+struct Gone;
+
+impl Transport for Gone {
+    fn request(
+        &self,
+        _: &str,
+        _: Option<Vec<u8>>,
+    ) -> impl std::future::Future<Output = Result<licash_wallet::Response, String>> + Send {
+        async { Err("the hub is gone".to_owned()) }
+    }
+}
+
+/// The chain `source` reads, as a wallet reads Bitcoin: no filters.
+struct Blocks(Source);
+
+impl licash_wallet::Blocks for Blocks {
+    async fn height(&self) -> Result<u32, String> {
+        Ok(self.0.tip().await.map_err(|e| format!("{e:#}"))?.height)
+    }
+    async fn hash(&self, height: u32) -> Result<bitcoin::BlockHash, String> {
+        self.0.hash(height).await.map_err(|e| format!("{e:#}"))
+    }
+    async fn filter(&self, _: &bitcoin::BlockHash) -> Result<Option<Vec<u8>>, String> {
+        Ok(None)
+    }
+    async fn block(&self, hash: &bitcoin::BlockHash) -> Result<bitcoin::Block, String> {
+        self.0.block(hash).await.map_err(|e| format!("{e:#}"))
+    }
+}
+
+/// The wallet file and the hub are both gone: its seed, the hub's public
+/// address and deposit root, and a chain, find the payment of a contract's
+/// default to its close deposit and take it back a wait after, with no word
+/// from the hub.
+#[tokio::test]
+async fn a_wallet_restored_from_its_seed_alone_takes_back_a_close_deposit_the_hub_never_answers_for(
+) {
+    use licash_onchain::deposit::CLOSE_WAIT;
+    let net = Net::new().await;
+    let alice = net.wallet("alice");
+    let (close, until) = close_deposit(&net, &alice).await;
+    net.deposits
+        .bind_close(close.script.as_bytes(), [1; 32], 3_000, 100, until)
+        .unwrap();
+    let address = alice
+        .deposit_of(&close.hash)
+        .unwrap()
+        .terms
+        .unwrap()
+        .address;
+    // Another deposit's payment, which a seed's scan is not to take for hers.
+    let other = alice.deposit(HUB, 2_000).await.unwrap();
+    let other_address = other.terms.unwrap().address;
+    net.mine(
+        1,
+        vec![
+            payment(&address, 3_000, 1),
+            payment(&other_address, 2_100, 2),
+        ],
+    );
+    let paid_at = net.height();
+
+    // What a hub publishes, kept by her or read from it while it answered.
+    let info = net.info().await;
+    let hub_address = info.address.to_bytes();
+    let root = info.deposits.unwrap().close_root.expect("a deposit root");
+    let root = bitcoin::secp256k1::XOnlyPublicKey::from_slice(&root.0).unwrap();
+
+    // The same seed, no file of the first and no hub.
+    let mut seed = [0; 32];
+    seed[.."alice".len()].copy_from_slice(b"alice");
+    let path = net.dir.path().join("restored.sqlite");
+    let regtest = ChainProfile::Core30DefaultRegtest;
+    let restored = Wallet::create(&path, &seed, regtest, Gone).unwrap();
+    let chain = Blocks(net.source.clone());
+    let found = restored
+        .find_close_payments(&hub_address, &root, 10, &chain, 0)
+        .await
+        .unwrap();
+    assert_eq!(found.len(), 1, "{found:?}");
+    let payment_found = &found[0];
+    assert_eq!(
+        (
+            payment_found.hash,
+            payment_found.value,
+            payment_found.height
+        ),
+        (bytes(&close.hash), 3_000, paid_at)
+    );
+    assert_eq!(payment_found.spent_by, None);
+    assert_eq!(
+        payment_found.refund_height(),
+        paid_at + u32::from(CLOSE_WAIT) - 1
+    );
+    // Another seed's scan finds nothing: the keys are hers.
+    let stranger = Wallet::create(
+        &net.dir.path().join("stranger.sqlite"),
+        &[7; 32],
+        regtest,
+        Gone,
+    )
+    .unwrap();
+    assert!(stranger
+        .find_close_payments(&hub_address, &root, 10, &chain, 0)
+        .await
+        .unwrap()
+        .is_empty());
+    // Nor does another hub's root name her deposit's address.
+    let wrong = bitcoin::secp256k1::XOnlyPublicKey::from_slice(&[2; 32]).unwrap();
+    assert!(restored
+        .find_close_payments(&hub_address, &wrong, 10, &chain, 0)
+        .await
+        .unwrap()
+        .is_empty());
+
+    // A wait after the payment it takes the coins back, the transaction the
+    // wallet built enforcing it, and a scan later finds it spent.
+    let rate = FeeRate::from_sat_per_vb_u32(1);
+    let refund = restored
+        .refund_close_payment(&hub_address, &root, payment_found, sweep_to(), rate)
+        .unwrap();
+    assert_eq!(refund.input[0].previous_output, payment_found.outpoint);
+    assert_eq!(
+        refund.input[0].sequence,
+        bitcoin::Sequence::from_height(CLOSE_WAIT)
+    );
+    assert_eq!(refund.lock_time, bitcoin::absolute::LockTime::ZERO);
+    net.mine(u32::from(CLOSE_WAIT), vec![refund.clone()]);
+    let after = restored
+        .find_close_payments(&hub_address, &root, 10, &chain, 0)
+        .await
+        .unwrap();
+    assert_eq!(after[0].spent_by, Some(refund.compute_txid()));
+}

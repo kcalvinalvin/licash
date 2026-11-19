@@ -313,6 +313,42 @@ enum Command {
         #[arg(long)]
         fee_rate: Option<u64>,
     },
+    /// Find on Bitcoin the payments of contracts' defaults to the deposits
+    /// that return their reserves, which this wallet's seed asked of a hub,
+    /// and take back those whose wait passed: with the seed, the hub's
+    /// address and its deposit root alone, its file and the hub both gone.
+    /// A hub's address and root are in `hubs --json`: keep them with the
+    /// seed.
+    Recover {
+        /// The hub, by its URL as the wallet's file records it (its address and
+        /// deposit root as last heard) [or --hub-address and --claim-root].
+        #[arg(long, conflicts_with_all = ["hub_address", "claim_root"])]
+        hub: Option<String>,
+        /// The hub's address bytes, hex (`hubs --json`'s `address`).
+        #[arg(long, requires = "claim_root")]
+        hub_address: Option<String>,
+        /// The hub's deposit root, hex (`hubs --json`'s `deposits.close_root`).
+        #[arg(long, requires = "hub_address")]
+        claim_root: Option<String>,
+        /// The chain to read and broadcast to: Esplora as
+        /// `esplora+https://esplora.example/api`, or a Bitcoin Core node
+        /// as `http://user:password@127.0.0.1:8332`.
+        #[arg(long, env = "LICASH_WALLET_CHAIN")]
+        chain: String,
+        /// The block to look from [default: the first].
+        #[arg(long, default_value_t = 0)]
+        from: u32,
+        /// How many of the hub's deposit numbers to look for.
+        #[arg(long, default_value_t = 100)]
+        numbers: u32,
+        /// Take back what is due to this address [default: only look].
+        #[arg(long)]
+        to: Option<String>,
+        /// In sat/vB [default: the chain's estimate within 6 blocks, at
+        /// least 1].
+        #[arg(long)]
+        fee_rate: Option<u64>,
+    },
     /// Swap notes at one hub for AMOUNT at another through a swap provider,
     /// its fee and the hub's on top. `resume` takes a pending swap on.
     Swap {
@@ -744,6 +780,8 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 json!({
                     "url": url, "fees": info.fees, "locks": info.locks.is_some(),
                     "lightning": info.lightning, "deposits": info.deposits,
+                    // What `recover` needs of it, to be kept with the seed.
+                    "address": hex::encode(info.address.to_bytes()),
                 })
             });
             let lines = hubs.iter().map(|(url, info)| {
@@ -1128,6 +1166,23 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 deposits.iter().map(deposit_json).collect(),
                 lines.join("\n"),
             );
+        }
+        Command::Recover {
+            hub,
+            hub_address,
+            claim_root,
+            chain,
+            from,
+            numbers,
+            to,
+            fee_rate,
+        } => {
+            let keys = match (hub, hub_address, claim_root) {
+                (Some(url), _, _) => HubKeys::Recorded(url),
+                (None, Some(address), Some(root)) => HubKeys::Named(address, root),
+                _ => bail!("--hub, or --hub-address with --claim-root"),
+            };
+            return recover(&wallet, keys, &chain, from, numbers, to, fee_rate, json).await;
         }
         Command::Refund {
             hash,
@@ -2148,6 +2203,112 @@ fn deposit_line(deposit: &Deposit) -> String {
 fn bip21(address: &str, sat: u64) -> String {
     let btc = bitcoin::Amount::from_sat(sat).to_string_in(bitcoin::Denomination::Bitcoin);
     format!("bitcoin:{address}?amount={btc}")
+}
+
+/// A hub's address and deposit root, as `recover` is given them.
+enum HubKeys {
+    /// By the hub's URL, from the wallet's record of its info.
+    Recorded(String),
+    /// Hex: its address bytes, and its deposit root.
+    Named(String, String),
+}
+
+/// Look for the payments of contracts' defaults to close deposits that the
+/// wallet's seed asked of a hub, on `chain` from block `from`, and take
+/// back to `to`, if given, those whose wait passed.
+#[allow(clippy::too_many_arguments)]
+async fn recover(
+    wallet: &Wallet<Http>,
+    hub: HubKeys,
+    chain: &str,
+    from: u32,
+    numbers: u32,
+    to: Option<String>,
+    fee_rate: Option<u64>,
+    json: bool,
+) -> anyhow::Result<()> {
+    let (address, root) = match hub {
+        HubKeys::Recorded(url) => {
+            let url = url.trim_end_matches('/');
+            let hubs = wallet.hubs()?;
+            let info = hubs
+                .iter()
+                .find(|(known, _)| known.trim_end_matches('/') == url)
+                .map(|(_, info)| info)
+                .with_context(|| format!("{url} is no hub the wallet's file records"))?;
+            let root = info
+                .deposits
+                .as_ref()
+                .and_then(|d| d.close_root)
+                .with_context(|| format!("{url} published no deposit root"))?;
+            (info.address.to_bytes().to_vec(), root.0)
+        }
+        HubKeys::Named(address, root) => {
+            let mut key = [0; 32];
+            hex::decode_to_slice(&root, &mut key).context("--claim-root: 32 bytes of hex")?;
+            (hex::decode(&address).context("--hub-address: hex")?, key)
+        }
+    };
+    let root = bitcoin::secp256k1::XOnlyPublicKey::from_slice(&root).context("the deposit root")?;
+    let source: licash_chain_client::Source = chain.parse().context("--chain")?;
+    let blocks = onchain::Blocks(source.clone());
+    let tip = source.tip().await?.height;
+    let payments = wallet
+        .find_close_payments(&address, &root, numbers, &blocks, from)
+        .await?;
+    let network = licash_chain_client::network(wallet.network());
+    let to = match &to {
+        Some(to) => Some(
+            to.parse::<bitcoin::Address<bitcoin::address::NetworkUnchecked>>()
+                .context("--to")?
+                .require_network(network)
+                .with_context(|| format!("--to: not an address on {}", wallet.network()))?,
+        ),
+        None => None,
+    };
+    let mut rows = Vec::new();
+    let mut lines = Vec::new();
+    for payment in &payments {
+        let due = payment.refund_height();
+        let (status, refund) = match (payment.spent_by, &to) {
+            (Some(by), _) => (format!("spent by {by}"), None),
+            (None, _) if tip < due => (
+                format!("refundable after block {due}, the tip is {tip}"),
+                None,
+            ),
+            (None, None) => ("refundable now: --to takes it back".to_owned(), None),
+            (None, Some(to)) => {
+                let rate = onchain::rate(&source, fee_rate).await?;
+                let tx = wallet.refund_close_payment(
+                    &address,
+                    &root,
+                    payment,
+                    to.script_pubkey(),
+                    rate,
+                )?;
+                let txid = source.broadcast(&tx).await?;
+                (format!("refunded by {txid}"), Some(txid))
+            }
+        };
+        rows.push(json!({
+            "number": payment.number, "hash": hex::encode(payment.hash),
+            "outpoint": payment.outpoint.to_string(), "value": payment.value,
+            "height": payment.height, "refundable_after": due,
+            "spent_by": payment.spent_by.map(|t| t.to_string()),
+            "refund": refund.map(|t| t.to_string()), "status": status,
+        }));
+        lines.push(format!(
+            "#{}  {}  block {}  {status}",
+            payment.number,
+            say::sat(payment.value),
+            payment.height
+        ));
+    }
+    if lines.is_empty() {
+        lines.push("no payment to the wallet's close deposits found".to_owned());
+    }
+    show(json, json!(rows), lines.join("\n"));
+    Ok(())
 }
 
 /// Refund deposit `hash` to `to` from what `chain` shows paid to it, once

@@ -182,7 +182,7 @@ struct Held {
     found: Found,
 }
 
-fn chain_error(reason: impl std::fmt::Display) -> Error {
+pub(crate) fn chain_error(reason: impl std::fmt::Display) -> Error {
     Error::Chain(reason.to_string())
 }
 
