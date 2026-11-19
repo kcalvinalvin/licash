@@ -277,7 +277,7 @@ impl<T: Transport> Provider<T> {
                     "INSERT INTO provider_donations
                         (hash, preimage, code, sat, amount, state, created_at, updated_at)
                      VALUES (?1, ?2, ?3, ?4, ?5, 'open', ?6, ?6)",
-                    params![hash, preimage, code, sql(sat), sql(amount), at],
+                    params![hash, preimage, code, sql(sat)?, sql(amount)?, at],
                 )?;
                 Ok(true)
             })
@@ -651,8 +651,8 @@ impl<T: Transport> Provider<T> {
     }
 }
 
-fn sql(amount: u64) -> i64 {
-    i64::try_from(amount).unwrap_or(i64::MAX)
+fn sql(amount: u64) -> Result<i64, Error> {
+    crate::store::sat(amount)
 }
 
 /// A problem with what the provider recorded, as an error of its own.

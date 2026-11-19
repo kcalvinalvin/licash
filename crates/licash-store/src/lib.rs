@@ -13,7 +13,7 @@
 //! none: such a file is never opened, written or deleted here.
 //!
 //! Every connection is in WAL mode with `synchronous=FULL` and foreign keys
-//! enforced, and every write is one IMMEDIATE transaction ([`write`]).
+//! enforced, and every write is one IMMEDIATE transaction ([`write()`]).
 
 use std::{
     fs::{File, OpenOptions},
@@ -212,7 +212,7 @@ pub fn write<T, E: From<rusqlite::Error>>(
 }
 
 /// An IMMEDIATE transaction, rolled back unless committed: for a writer
-/// that does more in it than [`write`] lets it.
+/// that does more in it than [`write()`] lets it.
 pub struct Tx<'c> {
     tx: Transaction<'c>,
     _held: Held,

@@ -365,9 +365,9 @@ impl<T: Transport> Provider<T> {
                     taken.from,
                     to,
                     taken.payee.as_slice(),
-                    taken.sat as i64,
-                    taken.fee as i64,
-                    taken.paid as i64,
+                    crate::store::sat(taken.sat)?,
+                    crate::store::sat(taken.fee)?,
+                    crate::store::sat(taken.paid)?,
                     taken.expiry_from,
                     taken.deadline,
                     at

@@ -18,6 +18,11 @@ use crate::Error;
 
 pub(crate) use licash_store::now;
 
+/// `value` as a database integer: an error beyond it, not a lesser amount.
+pub(crate) fn sat(value: u64) -> Result<i64, crate::Error> {
+    Ok(licash_store::sat(value)?)
+}
+
 /// The component the provider's tables are, and its version.
 pub(crate) const COMPONENT: &str = "provider";
 pub(crate) const VERSION: i64 = 1;
