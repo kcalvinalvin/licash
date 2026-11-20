@@ -58,6 +58,13 @@ pub struct Trust {
     /// would read no exit, and the hub could not prove her claim owed less.
     /// A program that does decides the lean filing too.
     pub chained: Option<[u8; 32]>,
+    /// Whether its statement leaves a claim of the same contract no
+    /// evidence against another ([`licash::recovery::own_claims_void`]),
+    /// which a contract of graph id [`licash::recovery::OWN_CLAIMS_FROM`] on
+    /// does: under one that doesn't, her claim made again in place of one
+    /// before would be owed less by the notes both hold. A program that
+    /// does reads the exit on the header chain too.
+    pub own_claims: bool,
 }
 impl Trust {
     pub fn mock() -> Self {
@@ -67,6 +74,7 @@ impl Trust {
             compact: true,
             lean: true,
             chained: None,
+            own_claims: false,
         }
     }
 }
@@ -677,6 +685,12 @@ impl Holder {
             !licash::recovery::chained(s.quote.graph.id) || ctx.trust.chained.is_some(),
             "a graph of id {} reads the exit on the hub's header chain, which the program \
              trusted doesn't",
+            s.quote.graph.id
+        );
+        ensure!(
+            licash::recovery::own_claims_void(s.quote.graph.id) || ctx.trust.own_claims,
+            "a graph of id {} owes a claim all its notes, though another claim of the contract \
+             holds them, which the program trusted doesn't",
             s.quote.graph.id
         );
         let keys = HolderKeys::derive(&s.seed, &id);
@@ -1665,6 +1679,7 @@ mod tests {
                 compact,
                 lean,
                 chained: None,
+                own_claims: false,
             },
         };
         // A program that decides the lean filing decides the compact too.
@@ -1703,6 +1718,39 @@ mod tests {
             q.graph.id = graph;
             let started = Holder::start(start(&q), &chained(chain));
             assert_eq!(started.is_ok(), opens, "graph {graph}, chain {chain:?}");
+        }
+        // A graph whose claims no claim of the same contract voids is opened
+        // only under a program that decides so, which reads the chain too.
+        let own = |chain, own_claims| Context {
+            trust: Trust {
+                own_claims,
+                ..chained(chain).trust
+            },
+            ..chained(chain)
+        };
+        for (graph, chain, own_claims, opens) in [
+            (
+                licash::recovery::OWN_CLAIMS_FROM - 1,
+                Some([7; 32]),
+                false,
+                true,
+            ),
+            (
+                licash::recovery::OWN_CLAIMS_FROM,
+                Some([7; 32]),
+                false,
+                false,
+            ),
+            (licash::recovery::OWN_CLAIMS_FROM, None, true, false),
+            (licash::recovery::OWN_CLAIMS_FROM, Some([7; 32]), true, true),
+        ] {
+            q.graph.id = graph;
+            let started = Holder::start(start(&q), &own(chain, own_claims));
+            assert_eq!(
+                started.is_ok(),
+                opens,
+                "graph {graph}, chain {chain:?}, own claims {own_claims}"
+            );
         }
     }
 
@@ -2441,6 +2489,7 @@ mod tests {
                 compact: true,
                 lean: true,
                 chained: None,
+                own_claims: false,
             },
         };
         assert!(Holder::load(&a.to_bytes(), &[1; 32], &rotated).is_ok());
@@ -2461,6 +2510,7 @@ mod tests {
                     compact: false,
                     lean: false,
                     chained: None,
+                    own_claims: false,
                 }
             }
         )

@@ -2788,3 +2788,77 @@ fn an_invalid_item_of_a_lean_claim_is_worth_nothing_and_the_rest_is_owed() {
     assert_eq!(whole.owed, 0);
     assert!(whole.ineligible.is_some());
 }
+
+/// Her claim of a contract made again in place of one she made before (a
+/// cooperative close's, never published, say): from graph id 12 on, the
+/// one before, of the same contract, voids none of her notes; before it,
+/// it voids those both hold, as any other claim does. A claim of another
+/// contract voids them under either.
+#[test]
+fn a_claim_of_the_same_contract_voids_her_notes_only_before_graph_id_12() {
+    for id in [recovery::OWN_CLAIMS_FROM - 1, recovery::OWN_CLAIMS_FROM] {
+        let o = open_at(id);
+        let keyset = o.base.parts().keyset.clone();
+        let ds: Vec<_> = (0..2).map(|i| derive(SPEND, &hold(), 4, 23, i)).collect();
+        let notes: Vec<_> = ds.iter().map(|d| mint(&o.issuer, &keyset, d)).collect();
+        let items = |ds: &[Derivation]| -> Vec<Item> {
+            ds.iter()
+                .map(|d| Item::Settled(d.message().clone()))
+                .collect()
+        };
+        let first = Publication::sign(
+            claim(&o, items(&ds[..1]), vec![], vec![], &ds[..1], 4),
+            &hold_keys(&ds[..1]),
+            LIMIT,
+        )
+        .unwrap();
+        let p = Publication::sign(
+            claim(&o, items(&ds), vec![], vec![], &ds, 8),
+            &hold_keys(&ds),
+            LIMIT,
+        )
+        .unwrap();
+        let request = Request {
+            amount: 8,
+            claim_digest: *p.claim().digest(),
+        };
+        let witness = Witness {
+            notes,
+            sources: vec![],
+            activations: vec![],
+            funded: vec![],
+        };
+        assert_eq!(
+            decide(&o, &request, &p, &witness, &[], None).unwrap().owed,
+            8
+        );
+        let context = *first.envelope().context();
+        assert!(context.base == p.envelope().context().base);
+        assert!(context.deposit == p.envelope().context().deposit);
+        let record = first.envelope().records()[0].clone();
+        let own = Evidence::SecondClaim {
+            context,
+            record: record.clone(),
+        };
+        let decided = decide(&o, &request, &p, &witness, &[own], None);
+        match recovery::own_claims_void(id) {
+            true => assert_eq!(decided.unwrap().owed, 4, "{id}"),
+            false => assert!(decided.is_err(), "{id}"),
+        }
+        // Another contract's claim of the same note voids it under both.
+        let other = hold::Context {
+            base: [1; 32],
+            ..context
+        };
+        let record = hold::Envelope::sign(other, &hold_keys(&ds[..1]), LIMIT)
+            .unwrap()
+            .records()[0]
+            .clone();
+        let elsewhere = Evidence::SecondClaim {
+            context: other,
+            record,
+        };
+        let decided = decide(&o, &request, &p, &witness, &[elsewhere], None);
+        assert_eq!(decided.unwrap().owed, 4, "{id}");
+    }
+}

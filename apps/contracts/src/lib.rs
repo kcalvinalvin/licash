@@ -354,6 +354,7 @@ pub fn trust(profile: ChainProfile) -> Result<Trust> {
             compact: SIGNET_COMPACT,
             lean: SIGNET_LEAN,
             chained: SIGNET_CHAINED.then_some(CHAIN),
+            own_claims: SIGNET_OWN_CLAIMS,
         }),
         _ => bail!("contracts are not opened on {profile} yet"),
     }
@@ -385,6 +386,15 @@ pub const SIGNET_LEAN: bool = true;
 /// program that does, which verifies receipts of [`CHAIN`] alone. Hubs quote a
 /// graph of id [`licash::recovery::CHAINED_FROM`] only when it is.
 pub const SIGNET_CHAINED: bool = true;
+
+/// Whether [`SIGNET`] leaves a claim of the same contract no evidence
+/// against another ([`licash::recovery::own_claims_void`]), as
+/// [`SIGNET_CHAINED`] says of the chain: set in the same change as the
+/// program that does, rebuilt from a tree whose `licash::recovery` has the
+/// rule, and the old program moved to [`SIGNET_BEFORE`]. Hubs quote a graph
+/// of id [`licash::recovery::OWN_CLAIMS_FROM`] only when it is. False until
+/// then: the program in use judges the rule as graph id 11 did.
+pub const SIGNET_OWN_CLAIMS: bool = false;
 
 /// The chain program (`r0/chain-guest`) whose receipts [`SIGNET`]'s statement
 /// verifies: the image id kept in `r0/hp-guest/chain.id`, which a build of it

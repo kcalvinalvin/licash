@@ -76,6 +76,7 @@ fn stored_context(base: Option<&Base>, binding: bool, ctx: &Context) -> Context 
             compact: ctx.trust.compact,
             lean: ctx.trust.lean,
             chained: ctx.trust.chained,
+            own_claims: ctx.trust.own_claims,
         },
     }
 }

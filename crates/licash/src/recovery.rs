@@ -52,6 +52,18 @@ pub const LEAN_FROM: u32 = 10;
 /// exit ([`chained`]). Their filing is [`Format::Lean`].
 pub const CHAINED_FROM: u32 = 11;
 
+/// The first graph id whose claims no other claim of the same contract
+/// voids ([`Evidence::SecondClaim`]): her own claim made before, which a
+/// claim she makes again in its place may hold notes of, is no evidence
+/// against it. Before it, any claim but the one judged is.
+pub const OWN_CLAIMS_FROM: u32 = 12;
+
+/// Whether, in a contract of graph `id`, another claim of the same
+/// contract voids the notes it holds ([`OWN_CLAIMS_FROM`]).
+pub fn own_claims_void(id: u32) -> bool {
+    id < OWN_CLAIMS_FROM
+}
+
 /// Whether a contract of graph `id` is decided on a header chain proven
 /// beforehand: a function of its Base alone, as its [`Format`] is.
 pub fn chained(id: u32) -> bool {
@@ -781,10 +793,12 @@ pub fn voids_note(keyset: &Keyset, note: &Message, evidence: &Evidence) -> Resul
 }
 
 /// The items `evidence` voids (bit i for item i) and the sources it shows
-/// executed. Each evidence must void an item, or show a Plain source
-/// executed, which values its fallbacks.
+/// executed, in a contract of graph `graph`. Each evidence must void an
+/// item, or show a Plain source executed, which values its fallbacks; a
+/// claim of the same contract voids none from [`OWN_CLAIMS_FROM`] on.
 fn void(
     keyset: &Keyset,
+    graph: u32,
     claim: &UnsignedClaim,
     evidence: &[Evidence],
 ) -> Result<(u32, BTreeSet<ProposalId>), Error> {
@@ -827,8 +841,13 @@ fn void(
                 }
             }
             Evidence::SecondClaim { context, record } => {
-                if *context == claim.hold_context() {
+                let own = claim.hold_context();
+                if *context == own {
                     return Err(bad("second claim must be a different claim"));
+                }
+                let same = context.base == own.base && context.deposit == own.deposit;
+                if same && !own_claims_void(graph) {
+                    return Err(bad("a claim of the same contract voids nothing"));
                 }
                 verify_second_claim(context, record)?;
                 let claimed = record.message.identifier()?;
@@ -1430,7 +1449,7 @@ fn judged(
         true => invalid_items(&filing, &parts.keyset, flagged)?,
         false => 0,
     };
-    let (mask, executed) = void(&parts.keyset, claim, evidence)?;
+    let (mask, executed) = void(&parts.keyset, parts.graph.id, claim, evidence)?;
     Ok(Owed {
         owed: live(claim, mask | invalid, &executed, chain.tip_height()),
         mask,
