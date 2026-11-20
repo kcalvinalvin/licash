@@ -154,7 +154,7 @@ impl Config {
 
 /// The component the deposits' tables are, and its version.
 pub(crate) const COMPONENT: &str = "deposits";
-pub(crate) const VERSION: i64 = 2;
+pub(crate) const VERSION: i64 = 3;
 
 /// A stage a deposit reaches is a table of its own, one row of it a fact.
 const SCHEMA: &str = "
@@ -178,9 +178,12 @@ CREATE TABLE deposits (
     preimage BLOB,
     state TEXT NOT NULL CHECK (state IN ('open', 'locked', 'settled', 'canceled')),
     created_at INTEGER NOT NULL,
-    done_at INTEGER
+    done_at INTEGER,
+    -- The connection it was asked over (crate::Socket), if any.
+    source BLOB
 ) STRICT;
 CREATE INDEX live_deposits ON deposits (state) WHERE done_at IS NULL;
+CREATE INDEX deposit_sources ON deposits (source) WHERE done_at IS NULL;
 -- Its payment, once confirmed: forgotten again if its block leaves the best
 -- chain before the hub's claim of it confirms, to be found again in the
 -- block it confirms in next, perhaps another transaction.
@@ -289,6 +292,8 @@ struct New<'a> {
     fund_by: u32,
     /// Whether it returns a contract's reserve.
     close: bool,
+    /// The connection it is asked over, if any.
+    source: Option<&'a crate::Socket>,
 }
 
 /// Where a deposit that returns a contract's reserve stands.
@@ -318,6 +323,41 @@ enum Kept {
     RefundTaken,
     /// As many as the hub takes are asked and not paid.
     Full,
+    /// As many as the hub takes over one connection are asked over its
+    /// own and not paid.
+    SocketFull,
+}
+
+/// The deposits asked and not paid, as many as `--deposit-max-open`
+/// bounds: over `source` alone, if any. Those bound to a contract are paid
+/// for by it.
+fn unpaid(conn: &Connection, source: Option<&crate::Socket>) -> rusqlite::Result<u32> {
+    conn.query_row(
+        "SELECT count(*) FROM deposits d
+         WHERE d.state = 'open' AND d.done_at IS NULL
+           AND (?1 IS NULL OR d.source = ?1)
+           AND NOT EXISTS (SELECT 1 FROM deposit_closes c
+                           WHERE c.hash = d.hash AND c.contract IS NOT NULL)",
+        [source.map(crate::Socket::as_bytes)],
+        |r| r.get(0),
+    )
+}
+
+/// Why a new deposit asked over `source` is refused, if as one too many:
+/// past `most` asked and not paid, or past [`crate::PER_SOCKET`] over
+/// `source`.
+fn full(
+    conn: &Connection,
+    most: u32,
+    source: Option<&crate::Socket>,
+) -> rusqlite::Result<Option<Kept>> {
+    if unpaid(conn, None)? >= most {
+        return Ok(Some(Kept::Full));
+    }
+    if source.is_some() && unpaid(conn, source)? >= crate::PER_SOCKET {
+        return Ok(Some(Kept::SocketFull));
+    }
+    Ok(None)
 }
 
 /// The key in column `i` of `r`.
@@ -441,6 +481,7 @@ impl Store {
             until,
             fund_by,
             close,
+            source,
         } = *new;
         let mut conn = self.conn();
         let tx = licash_store::begin(&mut conn)?;
@@ -457,14 +498,13 @@ impl Store {
             Some(_) => return Ok(Kept::RefundTaken),
             None => {}
         }
-        let inserted = tx.execute(
+        if let Some(full) = full(&tx, most, source)? {
+            return Ok(full);
+        }
+        tx.execute(
             "INSERT INTO deposits (hash, body, amount, pays, claim_key, refund_key,
-                 timeout_height, fund_by_height, script, state, created_at)
-             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'open', ?10
-             WHERE (SELECT count(*) FROM deposits d
-                    WHERE d.state = 'open' AND d.done_at IS NULL
-                      AND NOT EXISTS (SELECT 1 FROM deposit_closes c
-                                      WHERE c.hash = d.hash AND c.contract IS NOT NULL)) < ?11",
+                 timeout_height, fund_by_height, script, state, created_at, source)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'open', ?10, ?11)",
             params![
                 htlc.hash,
                 body,
@@ -476,20 +516,23 @@ impl Store {
                 fund_by,
                 htlc.script_pubkey().as_bytes(),
                 sql(now())?,
-                most,
+                source.map(crate::Socket::as_bytes),
             ],
         )?;
-        if inserted == 1 && close {
+        if close {
             tx.execute(
                 "INSERT INTO deposit_closes (hash) VALUES (?1)",
                 params![htlc.hash],
             )?;
         }
         tx.commit()?;
-        Ok(match inserted {
-            1 => Kept::Recorded,
-            _ => Kept::Full,
-        })
+        Ok(Kept::Recorded)
+    }
+
+    /// Whether a new deposit asked over `source` would be refused as one
+    /// too many: checked again as it is recorded.
+    fn full(&self, most: u32, source: Option<&crate::Socket>) -> rusqlite::Result<Option<Kept>> {
+        full(&self.conn(), most, source)
     }
 
     /// The deposit paid to `script`, live.
@@ -782,6 +825,17 @@ fn store_gone() -> Failure {
     Failure(Problem::new(Code::Unavailable, "the hub cannot serve now"))
 }
 
+/// The refusal of a deposit `kept` as one too many.
+fn unkept(kept: Kept) -> Failure {
+    let detail = match kept {
+        Kept::SocketFull => {
+            "too many deposits asked over this connection and not paid: retry later"
+        }
+        _ => "too many deposits asked and not paid: retry later",
+    };
+    Failure(Problem::new(Code::Unavailable, detail))
+}
+
 fn refused(detail: &str) -> Failure {
     Failure(Problem::new(Code::Forward, detail))
 }
@@ -855,7 +909,11 @@ impl Gateway {
 
     /// The address and amount whose payment locks the hub's notes to the
     /// outputs of `body`: the same again for the same deposit.
-    pub async fn deposit(&self, body: &Deposit) -> Result<Depositing, Failure> {
+    pub async fn deposit(
+        &self,
+        body: &Deposit,
+        source: Option<&crate::Socket>,
+    ) -> Result<Depositing, Failure> {
         let outputs = body.receive.outputs()?;
         let (keyset, ephemeral, hash) = body.receive.terms()?;
         if self.hub.keyset(&keyset).is_none() {
@@ -893,6 +951,10 @@ impl Gateway {
         let canonical = serde_json::to_string(&canonical).expect("a deposit serializes");
         let turn = self.peer.turn().await;
         if self.store.get(&hash).map_err(store_down)?.is_none() {
+            // Refused before any work, if it would be at the end.
+            if let Some(kept) = self.store.full(c.max_open, source).map_err(store_down)? {
+                return Err(unkept(kept));
+            }
             if self.peer.recorded(&hash)?.is_some() || self.peer.holds_swap(&hash)? {
                 return Err(refused("the hub holds this hash for another payment"));
             }
@@ -957,6 +1019,7 @@ impl Gateway {
                 until,
                 fund_by,
                 close: body.close.is_some(),
+                source,
             };
             match self.store.insert(&new, c.max_open).map_err(store_down)? {
                 Kept::Recorded => {
@@ -968,12 +1031,7 @@ impl Gateway {
                 Kept::RefundTaken => {
                     return Err(refused("another deposit under this refund key"));
                 }
-                Kept::Full => {
-                    return Err(Failure(Problem::new(
-                        Code::Unavailable,
-                        "too many deposits asked and not paid: retry later",
-                    )));
-                }
+                kept @ (Kept::Full | Kept::SocketFull) => return Err(unkept(kept)),
             }
         }
         drop(turn);

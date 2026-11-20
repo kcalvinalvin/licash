@@ -106,7 +106,8 @@ pub fn reader(db: &Path, component: &str) -> anyhow::Result<Option<rusqlite::Con
     // The layout of each gateway's tables this hub reads.
     let reads = match component {
         deposit::COMPONENT => deposit::VERSION,
-        _ => 1,
+        crate::lightning::COMPONENT => crate::lightning::VERSION,
+        _ => anyhow::bail!("no gateway {component}"),
     };
     match licash_store::component_version(&conn, component)? {
         Some(v) if v == reads => Ok(Some(conn)),

@@ -31,7 +31,7 @@ use licash_hub::{Hub, Policy, Timing};
 use licash_hub_service::{
     deposit,
     lightning::{self, fake::Fake, HeldState},
-    peer, Services,
+    peer, Services, Socket, PER_SOCKET,
 };
 use licash_wallet::{DepositState, Transport, Wallet};
 use serde_json::json;
@@ -314,7 +314,7 @@ async fn one_snapshot_of_the_hubs_database_restores_its_deposits_with_its_ledger
     let alice = net.wallet("alice");
     let deposit = alice.deposit(HUB, 3_000).await.unwrap();
     let (_, body) = net.asked("alice", &deposit.hash);
-    let answered = net.deposits.deposit(&body).await.unwrap();
+    let answered = net.deposits.deposit(&body, None).await.unwrap();
 
     // A connection of its own to the running hub's file: its snapshot.
     let conn =
@@ -330,7 +330,7 @@ async fn one_snapshot_of_the_hubs_database_restores_its_deposits_with_its_ledger
     };
     let hub = Arc::new(Hub::open(&copy.path().join("seed"), &snapshot, policy).unwrap());
     let restored = gateway(&hub, &net.source, &snapshot);
-    assert_eq!(restored.deposit(&body).await.unwrap(), answered);
+    assert_eq!(restored.deposit(&body, None).await.unwrap(), answered);
     let held = rusqlite::Connection::open(&snapshot)
         .unwrap()
         .query_row("SELECT count(*) FROM deposits", [], |r| r.get::<_, i64>(0))
@@ -360,14 +360,14 @@ async fn gateways_refuse_every_hash_reserved_by_a_swap_even_when_swaps_are_off()
         );
         assert!(net
             .deposits
-            .deposit(&body)
+            .deposit(&body, None)
             .await
             .unwrap_err()
             .0
             .message
             .contains("another payment"));
         assert!(lightning
-            .receive(&body.receive)
+            .receive(&body.receive, None)
             .await
             .unwrap_err()
             .0
@@ -387,7 +387,7 @@ async fn a_disabled_receipt_gateway_still_reserves_its_hashes() {
     db.execute("DELETE FROM deposits WHERE hash = ?1", [hash])
         .unwrap();
     let (_, lightning) = lightning(&net);
-    lightning.receive(&body.receive).await.unwrap();
+    lightning.receive(&body.receive, None).await.unwrap();
     drop(lightning);
     peer::coordinate(
         None,
@@ -397,7 +397,7 @@ async fn a_disabled_receipt_gateway_still_reserves_its_hashes() {
     );
     assert!(net
         .deposits
-        .deposit(&body)
+        .deposit(&body, None)
         .await
         .unwrap_err()
         .0
@@ -420,7 +420,7 @@ async fn a_gateway_waits_for_the_issuers_turn_and_then_sees_its_reservation() {
     peer::coordinate(None, Some(&net.deposits), net.dir.path(), turn.clone());
     let held = turn.lock_owned().await;
     let gateway = net.deposits.clone();
-    let receiving = tokio::spawn(async move { gateway.deposit(&body).await });
+    let receiving = tokio::spawn(async move { gateway.deposit(&body, None).await });
     tokio::task::yield_now().await;
     assert!(!receiving.is_finished());
     swap_record(&net, hash, "accepted", None);
@@ -585,13 +585,13 @@ async fn deposits_and_receipts_refuse_hashes_held_by_the_other_gateway() {
     let (_, body) = net.asked("alice", &deposit.hash);
     let (_, lightning) = lightning(&net);
     peer::pair(&lightning, &net.deposits);
-    let refused = lightning.receive(&body.receive).await.unwrap_err().0;
+    let refused = lightning.receive(&body.receive, None).await.unwrap_err().0;
     assert_eq!(refused.code, Code::Forward);
     assert!(refused.message.contains("another payment"));
     let mut other = body.clone();
     other.receive.hash = licash_api::Hex(vec![42; 32]);
-    lightning.receive(&other.receive).await.unwrap();
-    let refused = net.deposits.deposit(&other).await.unwrap_err().0;
+    lightning.receive(&other.receive, None).await.unwrap();
+    let refused = net.deposits.deposit(&other, None).await.unwrap_err().0;
     assert_eq!(refused.code, Code::Forward);
     assert!(refused.message.contains("another payment"));
 }
@@ -604,7 +604,7 @@ async fn a_duplicate_deposit_is_canceled_when_its_receipt_locked_first() {
     let (_, body) = net.asked("alice", &deposit.hash);
     let hash = bytes(&deposit.hash);
     let (node, lightning) = lightning(&net);
-    lightning.receive(&body.receive).await.unwrap();
+    lightning.receive(&body.receive, None).await.unwrap();
     peer::pair(&lightning, &net.deposits);
     let cltv = node.held_cltv(hash).unwrap() as u32;
     node.pay_held(hash, net.height() + cltv);
@@ -634,7 +634,7 @@ async fn a_duplicate_receipt_is_canceled_when_its_deposit_locked_first() {
     let (_, body) = net.asked("alice", &deposit.hash);
     let hash = bytes(&deposit.hash);
     let (node, lightning) = lightning(&net);
-    lightning.receive(&body.receive).await.unwrap();
+    lightning.receive(&body.receive, None).await.unwrap();
     peer::pair(&lightning, &net.deposits);
     net.mine(2, vec![payment(&deposit.terms.unwrap().address, 3_100, 1)]);
     net.deposits.round().await;
@@ -691,14 +691,14 @@ async fn a_deposit_paid_at_depth_is_received_and_its_coins_claimed() {
     // The same deposit asked again: the same terms; another under its
     // hash, refused.
     let (preimage, body) = net.asked("alice", &deposit.hash);
-    let again = net.deposits.deposit(&body).await.unwrap();
+    let again = net.deposits.deposit(&body, None).await.unwrap();
     assert_eq!(
         (again.address.as_str(), again.amount),
         (terms.address.as_str(), 3_100)
     );
     let mut other = body.clone();
     other.refund = licash_api::Hex(vec![2; 32]);
-    let refused = net.deposits.deposit(&other).await.unwrap_err();
+    let refused = net.deposits.deposit(&other, None).await.unwrap_err();
     assert_eq!(refused.0.code, Code::Forward);
 
     // Paid: seen, but not at depth.
@@ -1325,20 +1325,20 @@ async fn a_hub_takes_one_deposit_under_a_refund_key_and_answers_for_it_by_that_k
     let path = net.dir.path().join("other.sqlite");
     drop(licash_store::create(&path, licash_store::Kind::Hub).unwrap());
     let other = gateway(&net.hub, &net.source, &path);
-    let first = other.deposit(&bodies[0]).await.unwrap();
+    let first = other.deposit(&bodies[0], None).await.unwrap();
     // Another deposit, under the first's refund key: refused, and the
     // first still the one that key names.
     let mut second = bodies[1].clone();
     second.refund = bodies[0].refund.clone();
-    let refused = other.deposit(&second).await.unwrap_err().0;
+    let refused = other.deposit(&second, None).await.unwrap_err().0;
     assert_eq!(refused.code, Code::Forward, "{refused:?}");
     assert!(refused.message.contains("refund key"), "{refused:?}");
     let refund: [u8; 32] = bodies[0].refund.0.clone().try_into().unwrap();
     let (_, _, hash) = bodies[0].receive.terms().unwrap();
     assert_eq!(other.deposit_of(&refund).unwrap(), hash);
-    assert_eq!(other.deposit(&bodies[0]).await.unwrap(), first);
+    assert_eq!(other.deposit(&bodies[0], None).await.unwrap(), first);
     // Under its own, taken; a key no deposit is under names none.
-    other.deposit(&bodies[1]).await.unwrap();
+    other.deposit(&bodies[1], None).await.unwrap();
     let unknown = other.deposit_of(&[3; 32]).unwrap_err().0;
     assert_eq!(unknown.code, Code::UnknownLock);
 }
@@ -1476,11 +1476,48 @@ async fn deposits_asked_and_not_paid_are_bounded_retries_aside() {
     let gateway =
         deposit::Gateway::open(net.hub.clone(), net.source.clone(), profile, bounded, &path)
             .unwrap();
-    let first = gateway.deposit(&bodies[0]).await.unwrap();
-    let refused = gateway.deposit(&bodies[1]).await.unwrap_err().0;
+    let first = gateway.deposit(&bodies[0], None).await.unwrap();
+    let refused = gateway.deposit(&bodies[1], None).await.unwrap_err().0;
     assert_eq!(refused.code, Code::Unavailable, "{refused:?}");
     // The one asked, asked again: the same.
-    assert_eq!(gateway.deposit(&bodies[0]).await.unwrap(), first);
+    assert_eq!(gateway.deposit(&bodies[0], None).await.unwrap(), first);
+}
+
+/// Over one connection, only so many deposits are asked and not paid:
+/// over another, more.
+#[tokio::test]
+async fn deposits_asked_and_not_paid_over_one_connection_are_bounded() {
+    let net = Net::new().await;
+    let alice = net.wallet("alice");
+    let mut bodies = Vec::new();
+    for _ in 0..=PER_SOCKET {
+        let deposit = alice.deposit(HUB, 3_000).await.unwrap();
+        bodies.push(net.asked("alice", &deposit.hash).1);
+    }
+    let path = net.dir.path().join("sockets.sqlite");
+    // Its own database: it counts the deposits it holds, and no others.
+    drop(licash_store::create(&path, licash_store::Kind::Hub).unwrap());
+    let profile = ChainProfile::Core30DefaultRegtest;
+    let gateway = deposit::Gateway::open(
+        net.hub.clone(),
+        net.source.clone(),
+        profile,
+        config(),
+        &path,
+    )
+    .unwrap();
+    let peer = |port: u16| Socket::of_peer(([127, 0, 0, 1], port).into());
+    let (one, other) = (peer(1), peer(2));
+    let (last, asked) = bodies.split_last().unwrap();
+    for body in asked {
+        gateway.deposit(body, Some(&one)).await.unwrap();
+    }
+    let refused = gateway.deposit(last, Some(&one)).await.unwrap_err().0;
+    assert_eq!(refused.code, Code::Unavailable, "{refused:?}");
+    assert!(refused.message.contains("connection"), "{refused:?}");
+    // One asked, asked again over it: the same.
+    gateway.deposit(&asked[0], Some(&one)).await.unwrap();
+    gateway.deposit(last, Some(&other)).await.unwrap();
 }
 
 #[tokio::test]
@@ -1498,14 +1535,14 @@ async fn deposits_outside_the_hubs_terms_are_refused() {
     let smaller =
         deposit::Gateway::open(net.hub.clone(), net.source.clone(), profile, other, &path).unwrap();
     assert_eq!(
-        smaller.deposit(&body).await.unwrap_err().0.code,
+        smaller.deposit(&body, None).await.unwrap_err().0.code,
         Code::Forward
     );
     // Not a key to refund with, or of no keyset of the hub's.
     let mut wrong = body.clone();
     wrong.refund = licash_api::Hex(vec![0xff; 32]);
     assert_eq!(
-        net.deposits.deposit(&wrong).await.unwrap_err().0.code,
+        net.deposits.deposit(&wrong, None).await.unwrap_err().0.code,
         Code::Invalid
     );
     let mut wire = serde_json::to_value(&body).unwrap();
@@ -1554,11 +1591,11 @@ async fn deposits_are_kept_in_the_hubs_database_and_timed_within_the_hubs_locks(
     rusqlite::Connection::open(&path)
         .unwrap()
         .execute(
-            "UPDATE schema_versions SET version = 3 WHERE component = 'deposits'",
+            "UPDATE schema_versions SET version = 4 WHERE component = 'deposits'",
             [],
         )
         .unwrap();
-    assert!(open(config(), &path).unwrap().contains("is of version 3"));
+    assert!(open(config(), &path).unwrap().contains("is of version 4"));
     // A lock lasting beyond the window of the hub's, with its depth and
     // reaction; nothing locked; no confirmation asked; fewer than none.
     let fresh = net.dir.path().join("fresh.sqlite");
@@ -1984,7 +2021,7 @@ async fn a_close_deposit_is_the_reserve_exactly_for_the_most_notes_it_covers() {
         pays: 3_100,
         until: timeout,
     });
-    let refused = net.deposits.deposit(&fewer).await.unwrap_err();
+    let refused = net.deposits.deposit(&fewer, None).await.unwrap_err();
     assert_eq!(refused.0.code, Code::Forward);
     for bad in [net.height() + 5, net.height() + 200_000] {
         let mut asked = body.clone();
@@ -1999,7 +2036,7 @@ async fn a_close_deposit_is_the_reserve_exactly_for_the_most_notes_it_covers() {
             &body.receive.outputs().unwrap(),
             &[77; 32],
         );
-        let refused = net.deposits.deposit(&asked).await.unwrap_err();
+        let refused = net.deposits.deposit(&asked, None).await.unwrap_err();
         assert_eq!(refused.0.code, Code::Forward, "a timeout at {bad}");
     }
 }

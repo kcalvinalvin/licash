@@ -24,6 +24,7 @@
 
 mod pay;
 mod receive;
+pub(crate) use receive::{COMPONENT, VERSION};
 
 use std::{
     collections::{HashMap, HashSet},

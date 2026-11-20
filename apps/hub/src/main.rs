@@ -1832,9 +1832,14 @@ async fn serve(
             }
         }
     };
-    axum::serve(listener, router)
-        .with_graceful_shutdown(stop)
-        .await?;
+    // Each request knows its connection: deposits and receipts are capped
+    // by it (licash_hub_service::Socket).
+    axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(stop)
+    .await?;
     for task in announcing.into_iter().chain(swaps) {
         task.abort();
     }

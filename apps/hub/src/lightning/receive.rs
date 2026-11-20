@@ -22,8 +22,8 @@ use crate::{
 };
 
 /// The component the receipts' table is, and its version.
-const COMPONENT: &str = "lightning";
-const VERSION: i64 = 1;
+pub(crate) const COMPONENT: &str = "lightning";
+pub(crate) const VERSION: i64 = 2;
 
 const SCHEMA: &str = "
 -- Notes asked for over Lightning: recorded before their invoice exists,
@@ -40,10 +40,49 @@ CREATE TABLE lightning_receipts (
     state TEXT NOT NULL CHECK (state IN ('open', 'locked', 'settled', 'canceled')),
     created_at INTEGER NOT NULL,
     done_at INTEGER,
+    -- The connection it was asked over (crate::Socket), if any.
+    source BLOB,
     CHECK ((state IN ('settled', 'canceled')) = (done_at IS NOT NULL))
 ) STRICT;
 CREATE INDEX live_receipts ON lightning_receipts (state) WHERE state IN ('open', 'locked');
+CREATE INDEX receipt_sources ON lightning_receipts (source) WHERE state = 'open';
 ";
+
+/// Refused as one too many, if a new receipt asked over `source` would
+/// be: past `most` open or locked, or past [`crate::PER_SOCKET`] asked
+/// over `source` and not paid.
+fn full(conn: &Connection, most: u32, source: Option<&crate::Socket>) -> Result<(), Failure> {
+    let live: u32 = conn
+        .query_row(
+            "SELECT count(*) FROM lightning_receipts WHERE state IN ('open', 'locked')",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(store_down)?;
+    if live >= most {
+        return Err(Failure(Problem::new(
+            Code::Unavailable,
+            "too many receipts under way: retry later",
+        )));
+    }
+    let Some(source) = source else {
+        return Ok(());
+    };
+    let unpaid: u32 = conn
+        .query_row(
+            "SELECT count(*) FROM lightning_receipts WHERE state = 'open' AND source = ?1",
+            [source.as_bytes()],
+            |r| r.get(0),
+        )
+        .map_err(store_down)?;
+    if unpaid >= crate::PER_SOCKET {
+        return Err(Failure(Problem::new(
+            Code::Unavailable,
+            "too many receipts asked over this connection and not paid: retry later",
+        )));
+    }
+    Ok(())
+}
 
 /// The gateway's receipts, in the hub's database.
 pub(super) struct Store(Mutex<Connection>);
@@ -93,7 +132,7 @@ impl Store {
         live.map_err(store_down)
     }
 
-    /// Record a receipt unless one under its hash is.
+    /// Record a receipt asked over `source` unless one under its hash is.
     fn insert(
         &self,
         hash: &[u8; 32],
@@ -101,32 +140,40 @@ impl Store {
         amount: u64,
         msat: u64,
         most: u32,
+        source: Option<&crate::Socket>,
     ) -> Result<(), Failure> {
         let conn = self.conn();
-        let inserted = conn
-            .execute(
-                "INSERT INTO lightning_receipts (hash, body, amount, msat, state, created_at)
-                 SELECT ?1, ?2, ?3, ?4, 'open', ?5
-                 WHERE (SELECT count(*) FROM lightning_receipts WHERE state IN ('open', 'locked')) < ?6
-                 ON CONFLICT DO NOTHING",
-                params![hash, body, sql(amount)?, sql(msat)?, sql(now())?, most],
+        let known = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM lightning_receipts WHERE hash = ?1)",
+                [hash],
+                |r| r.get::<_, bool>(0),
             )
             .map_err(store_down)?;
-        if inserted == 0
-            && !conn
-                .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM lightning_receipts WHERE hash = ?1)",
-                    [hash],
-                    |r| r.get::<_, bool>(0),
-                )
-                .map_err(store_down)?
-        {
-            return Err(Failure(Problem::new(
-                Code::Unavailable,
-                "too many receipts under way: retry later",
-            )));
+        if known {
+            return Ok(());
         }
+        full(&conn, most, source)?;
+        conn.execute(
+            "INSERT INTO lightning_receipts (hash, body, amount, msat, state, created_at, source)
+             VALUES (?1, ?2, ?3, ?4, 'open', ?5, ?6)",
+            params![
+                hash,
+                body,
+                sql(amount)?,
+                sql(msat)?,
+                sql(now())?,
+                source.map(crate::Socket::as_bytes)
+            ],
+        )
+        .map_err(store_down)?;
         Ok(())
+    }
+
+    /// Refused as one too many, if a new receipt asked over `source`
+    /// would be: checked again as it is recorded.
+    fn full(&self, most: u32, source: Option<&crate::Socket>) -> Result<(), Failure> {
+        full(&self.conn(), most, source)
     }
 
     fn update(
@@ -218,7 +265,11 @@ impl Gateway {
 
     /// The invoice whose payment locks the hub's notes to the outputs of
     /// `body`: the same again for the same receipt.
-    pub async fn receive(&self, body: &Receive) -> Result<Receiving, Failure> {
+    pub async fn receive(
+        &self,
+        body: &Receive,
+        source: Option<&crate::Socket>,
+    ) -> Result<Receiving, Failure> {
         let outputs = body.outputs()?;
         let (keyset, ephemeral, hash) = body.terms()?;
         if self.hub.keyset(&keyset).is_none() {
@@ -240,6 +291,8 @@ impl Gateway {
         let canonical = serde_json::to_string(&canonical).expect("a receipt serializes");
         let turn = self.peer.turn().await;
         if self.receipts.get(&hash)?.is_none() {
+            // Refused before any work, if it would be at the end.
+            self.receipts.full(c.max_receipts, source)?;
             if self.peer.recorded(&hash)?.is_some() || self.peer.holds_swap(&hash)? {
                 return Err(refused("the hub holds this hash for another payment"));
             }
@@ -251,7 +304,7 @@ impl Gateway {
                 return Err(refused("the hub locked notes under this hash before"));
             }
             self.receipts
-                .insert(&hash, &canonical, amount, msat, c.max_receipts)?;
+                .insert(&hash, &canonical, amount, msat, c.max_receipts, source)?;
         }
         drop(turn);
         let receipt = self.receipts.get(&hash)?.ok_or_else(store_gone)?;
@@ -888,7 +941,7 @@ mod tests {
             let requests: Vec<_> = (0u8..32)
                 .map(|n| {
                     let store = store.clone();
-                    scope.spawn(move || (n, store.insert(&[n; 32], "{}", 5, 5000, 2).is_ok()))
+                    scope.spawn(move || (n, store.insert(&[n; 32], "{}", 5, 5000, 2, None).is_ok()))
                 })
                 .collect();
             requests
@@ -900,16 +953,43 @@ mod tests {
         });
         assert_eq!(admitted.len(), 2);
         // Lowering the limit does not discard old receipts or prevent retries.
-        store.insert(&[admitted[0]; 32], "{}", 5, 5000, 1).unwrap();
+        store
+            .insert(&[admitted[0]; 32], "{}", 5, 5000, 1, None)
+            .unwrap();
         store
             .update(&[admitted[0]; 32], "state", &"locked")
             .unwrap();
         assert_eq!(store.live().unwrap().len(), 2);
-        assert!(store.insert(&[99; 32], "{}", 5, 5000, 2).is_err());
+        assert!(store.insert(&[99; 32], "{}", 5, 5000, 2, None).is_err());
         store.finish(&[admitted[0]; 32], "settled").unwrap();
-        store.insert(&[99; 32], "{}", 5, 5000, 2).unwrap();
+        store.insert(&[99; 32], "{}", 5, 5000, 2, None).unwrap();
         drop(store);
         assert_eq!(Store::open(&path).unwrap().live().unwrap().len(), 2);
+    }
+
+    /// Over one connection, only so many receipts are asked and not paid:
+    /// over another, or once one is paid, more.
+    #[test]
+    fn receipts_asked_and_not_paid_over_one_connection_are_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&crate::testing::hub_file(dir.path())).unwrap();
+        let peer = |port: u16| crate::Socket::of_peer(([127, 0, 0, 1], port).into());
+        let (one, other) = (peer(1), peer(2));
+        let insert = |n: u8, source: Option<&crate::Socket>| {
+            store.insert(&[n; 32], "{}", 5, 5000, 1024, source)
+        };
+        for n in 0..crate::PER_SOCKET as u8 {
+            insert(n, Some(&one)).unwrap();
+        }
+        let refused = insert(100, Some(&one)).unwrap_err().0;
+        assert_eq!(refused.code, Code::Unavailable);
+        assert!(refused.message.contains("connection"), "{refused:?}");
+        // One recorded, asked again: the same.
+        insert(0, Some(&one)).unwrap();
+        insert(100, Some(&other)).unwrap();
+        insert(101, None).unwrap();
+        store.update(&[0; 32], "state", &"locked").unwrap();
+        insert(102, Some(&one)).unwrap();
     }
 
     #[test]
@@ -917,9 +997,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = crate::testing::hub_file(dir.path());
         let store = Store::open(&path).unwrap();
-        store.insert(&[1; 32], "{}", 5, 6000, 1024).unwrap();
+        store.insert(&[1; 32], "{}", 5, 6000, 1024, None).unwrap();
         store
-            .insert(&[1; 32], "{\"other\":1}", 7, 8000, 1024)
+            .insert(&[1; 32], "{\"other\":1}", 7, 8000, 1024, None)
             .unwrap();
         drop(store);
         let store = Store::open(&path).unwrap();
