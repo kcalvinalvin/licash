@@ -1859,6 +1859,44 @@ fn a_shown_lock_the_ledger_cannot_read_back_is_left_out_alone() {
 }
 
 #[test]
+fn a_claim_the_ledger_cannot_read_back_is_left_out_alone() {
+    use licash::recovery::Evidence as Against;
+    let files = files();
+    let hub = open(&files, Policy::default());
+    let (_, keyset) = issuer(&files);
+    let alice = owner(1);
+    let (one, other) = (mint(&files, &alice, 8), mint(&files, &alice, 4));
+    hub.retire_claimed(
+        &[1; 32],
+        &filed([7; 32], &keyset, &[&one, &other]).held(),
+        &[],
+    )
+    .unwrap();
+    let second = filed([9; 32], &keyset, &[&one, &other]);
+    assert_eq!(hub.evidence(second.claim()).unwrap().len(), 2);
+    drop(hub);
+    // One row's message no longer a note's: the other's claim is cited all
+    // the same, to the dispute and to its holder, and both stay retired.
+    let y = one.note.message().identifier().unwrap();
+    sql(&files.db)
+        .execute("UPDATE claimed SET message = x'00' WHERE y = ?1", [&y.0])
+        .unwrap();
+    let hub = open(&files, Policy::default());
+    let found = hub.evidence(second.claim()).unwrap();
+    let [Against::SecondClaim { record, .. }] = &found[..] else {
+        panic!("not the other claim alone");
+    };
+    assert_eq!(record.message.to_bytes(), other.note.message().to_bytes());
+    let at = unix();
+    let asked = [ask(&keyset, at, &one), ask(&keyset, at, &other)];
+    let told = hub.inquire(keyset.id(), at, &asked).unwrap();
+    assert!(told[0].is_empty());
+    assert!(matches!(&told[1][..], [Against::SecondClaim { .. }]));
+    let ys = [y, other.note.message().identifier().unwrap()];
+    assert_eq!(hub.spent(&ys).unwrap(), [true, true]);
+}
+
+#[test]
 fn a_hub_file_of_before_claims_showed_locks_gains_none_shown_when_opened() {
     let files = files();
     let (_, keyset) = issuer(&files);

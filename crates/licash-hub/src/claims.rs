@@ -289,7 +289,9 @@ pub(crate) fn claimed(c: &Connection, ys: &[Point]) -> Result<bool, Error> {
 }
 
 /// Each other claim of any of `ys` than the one of `context`: its hold
-/// key's signature of that claim, by note then contract.
+/// key's signature of that claim, by note then contract. A row that is not
+/// as it was kept is left out alone, with a warning: one claim the ledger
+/// cannot cite is no reason to cite none.
 pub(crate) fn second_claims(
     c: &Connection,
     ys: &[Point],
@@ -310,8 +312,7 @@ pub(crate) fn second_claims(
             ))
         })?;
         for row in rows {
-            let (context, message, sig) = row?;
-            evidence.push(second_claim(&context, &message, sig)?);
+            evidence.extend(cited(y, row));
         }
     }
     Ok(evidence)
@@ -329,12 +330,25 @@ pub(crate) fn claims_of(c: &Connection, y: &Point) -> Result<Vec<Evidence>, Erro
             r.get::<_, [u8; 64]>(2)?,
         ))
     })?;
-    let mut evidence = Vec::new();
-    for row in rows {
-        let (context, message, sig) = row?;
-        evidence.push(second_claim(&context, &message, sig)?);
+    Ok(rows.filter_map(|row| cited(y, row)).collect())
+}
+
+/// A row of `claimed` of the note `y` as evidence: none, with a warning, of
+/// one that does not read back.
+fn cited(
+    y: &Point,
+    row: rusqlite::Result<([u8; hold::CONTEXT_BYTES], Vec<u8>, [u8; 64])>,
+) -> Option<Evidence> {
+    let read = row
+        .map_err(Error::from)
+        .and_then(|(context, message, sig)| second_claim(&context, &message, sig));
+    match read {
+        Ok(evidence) => Some(evidence),
+        Err(e) => {
+            tracing::warn!(note = %hex::encode(y.0), "a claim of a note not cited: {e}");
+            None
+        }
     }
-    Ok(evidence)
 }
 
 fn second_claim(

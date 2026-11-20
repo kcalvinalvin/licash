@@ -707,11 +707,24 @@ impl Openings {
             }
             return Ok(Played::Idle);
         }
-        let block = self.block_at(p_at).await?;
-        let filed = dispute::published(&request.tx, &block, &p.compute_txid())?;
-        let (b, e) = o.requested_b(r)?;
-        let headers = self.headers(o, p_at).await?;
-        let chain = licash_hp::chain(&o.base, &headers).map_err(|e| anyhow!("{e}"))?;
+        // Her claim as filed and the chain it is judged on. Whatever keeps
+        // the hub from reading them keeps it from answering: told, as a
+        // ledger that gives no evidence is, while there is time to mend it.
+        let read = async {
+            let block = self.block_at(p_at).await?;
+            let filed = dispute::published(&request.tx, &block, &p.compute_txid())?;
+            let (b, e) = o.requested_b(r)?;
+            let headers = self.headers(o, p_at).await?;
+            let chain = licash_hp::chain(&o.base, &headers).map_err(|e| anyhow!("{e}"))?;
+            anyhow::Ok((filed, b, e, chain))
+        };
+        let (filed, b, e, chain) = match read.await {
+            Ok(read) => read,
+            Err(e) => {
+                self.undecided(id, &e, r_at, respond_deadline(o, r_at), tip);
+                return Err(e);
+            }
+        };
         let request = Request {
             amount: b,
             claim_digest: e,
@@ -795,7 +808,24 @@ impl Openings {
             let program = &o.base.parts().recipe.program;
             match prover.admit(id, program, stake, cycles, deadline, release, tip) {
                 Admission::Admit => {}
-                Admission::Wait => return Ok(Played::Idle),
+                Admission::Wait => {
+                    // A poll's wait as a rule. A prover that never says
+                    // whether it can prove leaves her claim unanswered as
+                    // surely as one that says it cannot: told as that is.
+                    let respond_by = respond_deadline(o, r_at);
+                    if half_gone(r_at, respond_by, tip) && self.once(id, "unadmitted") {
+                        self.alert(&format!(
+                            "contract {}: her claim is owed {} of the {b} she asks, and the \
+                             hub's prover has not said whether it can prove that: no response \
+                             yet, and {} blocks are left to respond in. Unanswered, her \
+                             timeout pays her all she claims.",
+                            crate::hex_id(id),
+                            decided.owed,
+                            respond_by.saturating_sub(tip)
+                        ));
+                    }
+                    return Ok(Played::Idle);
+                }
                 Admission::Withhold(why) => {
                     if self.once(id, "withheld") {
                         self.withheld(id, b, decided.owed, &why);

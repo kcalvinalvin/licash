@@ -469,7 +469,9 @@ nothing and tries again at each poll; once half the blocks it may respond
 in are gone, an alert names the contract and why, and the hub answers on
 what its statement decides with no evidence at all, if that is less than
 she asks (an item not valid, a refund not yet expired): less than its
-ledger would have saved it, more than no answer. Owed all it asks, the hub lets
+ledger would have saved it, more than no answer. The same alert tells of a
+publication or headers the hub cannot read, and another of a prover that by
+then has not said whether it can prove the answer. Owed all it asks, the hub lets
 the holder's timeout pay her. Owed less (a claim of notes that are not the
 keyset's, or spent), it responds with what is owed, publishes in the
 response's disclose slot what that evidence needs public (a granted spend's
