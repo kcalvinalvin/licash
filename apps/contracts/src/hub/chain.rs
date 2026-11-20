@@ -508,6 +508,10 @@ impl HubChain {
             return Ok(None);
         }
         let from = proven.map_or(lineage.start().height() + 1, |p| p + 1);
+        // No block followed past it yet: nothing to prove.
+        if from > tip {
+            return Ok(None);
+        }
         let through = tip.min(from + self.batch - 1).max(from);
         let through = if asked >= from {
             through.min(asked.max(from))
@@ -884,6 +888,12 @@ mod tests {
         chain.begin(&genesis()).unwrap();
         chain.follow(&node, 40).await.unwrap();
         assert!(chain.next_batch().unwrap().is_none());
+        // asked before a block past its start is followed: none to prove
+        let empty = tempfile::tempdir().unwrap();
+        let unfollowed = self::chain(empty.path());
+        unfollowed.begin(&genesis()).unwrap();
+        unfollowed.demand(12);
+        assert!(unfollowed.next_batch().unwrap().is_none());
         // a dispute needs the blocks through 12: a batch from the start
         chain.demand(12);
         let first = chain.next_batch().unwrap().unwrap();
