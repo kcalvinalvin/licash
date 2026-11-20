@@ -20,7 +20,7 @@ pub(crate) use licash_store::now;
 
 /// The component the wallet's tables are, and its version.
 const COMPONENT: &str = "wallet";
-const VERSION: i64 = 1;
+const VERSION: i64 = 2;
 
 /// A stage of an operation is a table of its own where its columns are
 /// known together (the terms of a deposit, the claim of a payout, a lock's
@@ -204,6 +204,8 @@ CREATE TABLE deposits (
     preimage BLOB NOT NULL CHECK (length(preimage) = 32),
     refund_key BLOB NOT NULL,
     amount INTEGER NOT NULL CHECK (amount >= 0),
+    -- What its payment is to be, as asked: the hub's terms are held to it.
+    pays INTEGER NOT NULL CHECK (pays >= 0),
     body TEXT NOT NULL,
     lock BLOB,
     refund BLOB,
@@ -211,13 +213,12 @@ CREATE TABLE deposits (
     done_at INTEGER,
     canceled TEXT
 ) STRICT;
--- The hub's terms: its claim key, the block it times out at, what to pay
--- to which address and by which block.
+-- The hub's terms: its claim key, the block it times out at, the address
+-- to pay and by which block.
 CREATE TABLE deposit_terms (
     hash BLOB PRIMARY KEY REFERENCES deposits (hash),
     claim_key BLOB NOT NULL,
     timeout_height INTEGER NOT NULL,
-    pays INTEGER NOT NULL CHECK (pays >= 0),
     address TEXT NOT NULL,
     fund_by_height INTEGER NOT NULL
 ) STRICT;

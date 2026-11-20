@@ -145,10 +145,13 @@ on Bitcoin, the hub's fee on top; `resume` takes the notes once the payment
 confirmed. A deposit never received is taken back after its timeout with
 `refund <hash> --to <address> --chain <url>`. A deposit's lock's preimage
 is revealed only with 6 blocks left, at the higher of its hub's height and
-the last block the wallet scanned. A deposit's secrets derive
-from the seed, the hub and its number there: a wallet restored from its
-seed finds the deposits it asked at a hub as it adds it (until 20 numbers
-in a row are unknown there), then takes them on or refunds them as any.
+the last block the wallet scanned. A deposit's refund key derives
+from the seed, the hub and its number there, and its preimage from those,
+a key drawn for it, the notes asked and the payment: a wallet restored from
+its seed finds the deposits it asked at a hub by their refund keys as it
+adds it (until 20 numbers in a row are unknown there), keeps those the hub
+answers as they were asked (other notes or another payment are another
+hash, and not kept), then takes them on or refunds them as any.
 
 `code` prints `licash:<code>`, naming the wallet's mailbox and at most three
 of its hubs: by default those whose contracts have the most room to protect

@@ -16,7 +16,7 @@ use licash::spend::lock_hash;
 use licash_onchain::deposit::{Htlc, CLOSE_WAIT};
 
 use crate::{
-    deposits::{close_htlc, secrets, x_only},
+    deposits::{close_htlc, close_preimage, refund_secret, x_only},
     silent::chain_error,
     Blocks, Error, Transport, Wallet,
 };
@@ -60,7 +60,8 @@ impl<T: Transport> Wallet<T> {
     ) -> Result<Vec<(u32, Htlc)>, Error> {
         (0..numbers)
             .map(|number| {
-                let (preimage, refund, _) = secrets(&self.keys.deposit, address, number)?;
+                let preimage = close_preimage(&self.keys.deposit, address, number);
+                let refund = refund_secret(&self.keys.deposit, address, number)?;
                 let htlc = close_htlc(root, &lock_hash(&preimage), &x_only(&refund));
                 Ok((number, htlc))
             })
@@ -149,7 +150,8 @@ impl<T: Transport> Wallet<T> {
         to: ScriptBuf,
         rate: FeeRate,
     ) -> Result<Transaction, Error> {
-        let (preimage, refund, _) = secrets(&self.keys.deposit, address, payment.number)?;
+        let preimage = close_preimage(&self.keys.deposit, address, payment.number);
+        let refund = refund_secret(&self.keys.deposit, address, payment.number)?;
         let htlc = close_htlc(root, &lock_hash(&preimage), &x_only(&refund));
         if htlc.hash != payment.hash {
             return Err(Error::Invalid(

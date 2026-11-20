@@ -462,15 +462,16 @@ fn serving(data: &Path, port: u16, args: &[&str]) -> Running {
 }
 
 fn gateway_file(data: &Path, deposits: bool, hash: [u8; 32]) -> rusqlite::Connection {
-    let (component, table) = if deposits {
-        ("deposits", "deposits")
+    // Each of the version of its tables this hub reads.
+    let (component, table, version) = if deposits {
+        ("deposits", "deposits", 2)
     } else {
-        ("lightning", "lightning_receipts")
+        ("lightning", "lightning_receipts", 1)
     };
     let conn = rusqlite::Connection::open(data.join("hub.sqlite")).unwrap();
     conn.execute_batch(&format!(
         "CREATE TABLE {table} (hash BLOB PRIMARY KEY, lock BLOB, state TEXT, done_at INTEGER);
-         INSERT INTO schema_versions (component, version, created_at) VALUES ('{component}', 1, 0);"
+         INSERT INTO schema_versions (component, version, created_at) VALUES ('{component}', {version}, 0);"
     ))
     .unwrap();
     conn.execute(
@@ -673,7 +674,7 @@ fn a_hub_refuses_to_run_with_own_locks_nothing_backs() {
     // Presence of a backing record and whether its gateway still has
     // work are separate checks. An idle record needs no running gateway.
     let deposits = rusqlite::Connection::open(data.join("hub.sqlite")).unwrap();
-    deposits.execute_batch("CREATE TABLE deposits (hash BLOB PRIMARY KEY, lock BLOB, state TEXT, done_at INTEGER); INSERT INTO schema_versions (component, version, created_at) VALUES ('deposits', 1, 0)").unwrap();
+    deposits.execute_batch("CREATE TABLE deposits (hash BLOB PRIMARY KEY, lock BLOB, state TEXT, done_at INTEGER); INSERT INTO schema_versions (component, version, created_at) VALUES ('deposits', 2, 0)").unwrap();
     let row = "INSERT INTO deposits (hash, state, done_at) VALUES (?1, 'settled', 1)";
     deposits.execute(row, [hash]).unwrap();
     drop(deposits);

@@ -152,15 +152,16 @@ impl Config {
 }
 
 /// The component the deposits' tables are, and its version.
-const COMPONENT: &str = "deposits";
-const VERSION: i64 = 1;
+pub(crate) const COMPONENT: &str = "deposits";
+pub(crate) const VERSION: i64 = 2;
 
 /// A stage a deposit reaches is a table of its own, one row of it a fact.
 const SCHEMA: &str = "
 -- Deposits asked for, recorded before their address is answered: paid
 -- once a payment confirms, locked, then settled and claimed, or canceled.
 -- Live until done. `lock` is the proposal of the hub's lock to the wallet,
--- `preimage` the one the wallet revealed claiming its notes.
+-- `preimage` the one the wallet revealed claiming its notes. One under a
+-- refund key, which its wallet asks after it by.
 CREATE TABLE deposits (
     hash BLOB PRIMARY KEY CHECK (length(hash) = 32),
     -- The deposit asked for, as JSON.
@@ -168,7 +169,7 @@ CREATE TABLE deposits (
     amount INTEGER NOT NULL CHECK (amount >= 0),
     pays INTEGER NOT NULL CHECK (pays >= 0),
     claim_key BLOB NOT NULL,
-    refund_key BLOB NOT NULL,
+    refund_key BLOB NOT NULL UNIQUE,
     timeout_height INTEGER NOT NULL,
     fund_by_height INTEGER NOT NULL,
     script BLOB NOT NULL,
@@ -306,6 +307,17 @@ const RECORDS: &str = "SELECT d.hash, d.body, d.amount, d.pays, d.claim_key, d.r
     LEFT JOIN deposit_spends p ON p.hash = d.hash
     LEFT JOIN deposit_closes c ON c.hash = d.hash";
 
+/// What became of a deposit to record.
+enum Kept {
+    Recorded,
+    /// Recorded before, under its hash.
+    Known,
+    /// Its refund key is another deposit's.
+    RefundTaken,
+    /// As many as the hub takes are asked and not paid.
+    Full,
+}
+
 /// The key in column `i` of `r`.
 fn x_only(r: &Row<'_>, i: usize) -> rusqlite::Result<XOnlyPublicKey> {
     let bytes: [u8; 32] = r.get(i)?;
@@ -403,11 +415,22 @@ impl Store {
         live
     }
 
-    /// Record a deposit unless one under its hash is, or `most` are
-    /// asked and not paid: false then. Those bound to a contract are not
+    /// The hash of the deposit whose refund key is `refund`.
+    fn hash_of(&self, refund: &[u8; 32]) -> rusqlite::Result<Option<[u8; 32]>> {
+        let conn = self.conn();
+        conn.query_row(
+            "SELECT hash FROM deposits WHERE refund_key = ?1",
+            [refund],
+            |r| r.get(0),
+        )
+        .optional()
+    }
+
+    /// Record a deposit unless one under its hash or its refund key is, or
+    /// `most` are asked and not paid. Those bound to a contract are not
     /// counted: a contract limits them. One that returns a contract's
     /// reserve (`new.close`) is recorded as such, in the same write.
-    fn insert(&self, new: &New, most: u32) -> rusqlite::Result<bool> {
+    fn insert(&self, new: &New, most: u32) -> rusqlite::Result<Kept> {
         let New {
             body,
             amount,
@@ -419,6 +442,19 @@ impl Store {
         } = *new;
         let mut conn = self.conn();
         let tx = licash_store::begin(&mut conn)?;
+        let taken: Option<[u8; 32]> = tx
+            .query_row(
+                "SELECT hash FROM deposits WHERE hash = ?1 OR refund_key = ?2
+                 ORDER BY hash = ?1 DESC LIMIT 1",
+                params![htlc.hash, htlc.refund.serialize()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match taken {
+            Some(hash) if hash == htlc.hash => return Ok(Kept::Known),
+            Some(_) => return Ok(Kept::RefundTaken),
+            None => {}
+        }
         let inserted = tx.execute(
             "INSERT INTO deposits (hash, body, amount, pays, claim_key, refund_key,
                  timeout_height, fund_by_height, script, state, created_at)
@@ -426,8 +462,7 @@ impl Store {
              WHERE (SELECT count(*) FROM deposits d
                     WHERE d.state = 'open' AND d.done_at IS NULL
                       AND NOT EXISTS (SELECT 1 FROM deposit_closes c
-                                      WHERE c.hash = d.hash AND c.contract IS NOT NULL)) < ?11
-             ON CONFLICT DO NOTHING",
+                                      WHERE c.hash = d.hash AND c.contract IS NOT NULL)) < ?11",
             params![
                 htlc.hash,
                 body,
@@ -449,7 +484,10 @@ impl Store {
             )?;
         }
         tx.commit()?;
-        Ok(inserted == 1)
+        Ok(match inserted {
+            1 => Kept::Recorded,
+            _ => Kept::Full,
+        })
     }
 
     /// The deposit paid to `script`, live.
@@ -910,14 +948,23 @@ impl Gateway {
                 fund_by,
                 close: body.close.is_some(),
             };
-            let inserted = self.store.insert(&new, c.max_open).map_err(store_down)?;
-            if !inserted && self.store.get(&hash).map_err(store_down)?.is_none() {
-                return Err(Failure(Problem::new(
-                    Code::Unavailable,
-                    "too many deposits asked and not paid: retry later",
-                )));
+            match self.store.insert(&new, c.max_open).map_err(store_down)? {
+                Kept::Recorded => {
+                    tracing::info!(hash = %hex::encode(hash), amount, pays, fund_by, until, "deposit asked");
+                }
+                Kept::Known => {}
+                // Its wallet asks after a deposit by its refund key: under
+                // one, a second would hide the first from it.
+                Kept::RefundTaken => {
+                    return Err(refused("another deposit under this refund key"));
+                }
+                Kept::Full => {
+                    return Err(Failure(Problem::new(
+                        Code::Unavailable,
+                        "too many deposits asked and not paid: retry later",
+                    )));
+                }
             }
-            tracing::info!(hash = %hex::encode(hash), amount, pays, fund_by, until, "deposit asked");
         }
         drop(turn);
         let record = self
@@ -947,6 +994,21 @@ impl Gateway {
 
     /// Where the deposit under `hash` stands, with what was asked and the
     /// terms answered: whoever knows its hash, its wallet, finds it again.
+    /// The hash of the deposit whose refund key, x-only, is `refund`: how
+    /// its wallet names it, which derives the key from its seed before it
+    /// knows the hash.
+    pub fn deposit_of(&self, refund: &[u8; 32]) -> Result<[u8; 32], Failure> {
+        self.store
+            .hash_of(refund)
+            .map_err(store_down)?
+            .ok_or_else(|| {
+                Failure(Problem::new(
+                    Code::UnknownLock,
+                    "no deposit under this refund key",
+                ))
+            })
+    }
+
     pub fn deposit_status(&self, hash: &[u8; 32]) -> Result<DepositStatus, Failure> {
         let record = self.store.get(hash).map_err(store_down)?.ok_or_else(|| {
             Failure(Problem::new(

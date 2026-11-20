@@ -103,9 +103,14 @@ pub fn reader(db: &Path, component: &str) -> anyhow::Result<Option<rusqlite::Con
     let Some(conn) = licash_store::inspect(db, Kind::Hub)? else {
         return Ok(None);
     };
+    // The layout of each gateway's tables this hub reads.
+    let reads = match component {
+        deposit::COMPONENT => deposit::VERSION,
+        _ => 1,
+    };
     match licash_store::component_version(&conn, component)? {
-        Some(1) => Ok(Some(conn)),
-        Some(v) => anyhow::bail!("{component} of version {v}, this hub reads 1"),
+        Some(v) if v == reads => Ok(Some(conn)),
+        Some(v) => anyhow::bail!("{component} of version {v}, this hub reads {reads}"),
         None => Ok(None),
     }
 }

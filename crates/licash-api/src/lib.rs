@@ -60,26 +60,28 @@ pub const LN_RECEIVE: &str = "/v1/ln/receive";
 pub const LN_RECEIVE_STATE: &str = "/v1/ln/receive/{hash}";
 pub const DEPOSIT: &str = "/v1/deposit";
 /// The path of [`deposit_state`], as a route.
-pub const DEPOSIT_STATE: &str = "/v1/deposit/{hash}";
-/// Ask the hub to lock its notes to the deposit under `hash` that returns a
-/// contract's reserve ([`CloseTerms`]), as a route: POST, answered with its
-/// [`DepositStatus`].
-pub const DEPOSIT_LOCK: &str = "/v1/deposit/{hash}/lock";
+pub const DEPOSIT_STATE: &str = "/v1/deposit/{refund}";
+/// Ask the hub to lock its notes to the deposit of the refund key `refund`
+/// that returns a contract's reserve ([`CloseTerms`]), as a route: POST,
+/// answered with its [`DepositStatus`].
+pub const DEPOSIT_LOCK: &str = "/v1/deposit/{refund}/lock";
 /// The [`BlockTweaks`] of the blocks a [`TweaksQuery`] names, as a list,
 /// up to the newest the hub indexed.
 pub const TWEAKS: &str = "/v1/chain/tweaks";
 /// Most blocks a [`TweaksQuery`] names.
 pub const MAX_TWEAK_BLOCKS: u32 = 144;
 
-/// Where the deposit under `hash` stands.
-pub fn deposit_state(hash: &[u8; 32]) -> String {
-    format!("{DEPOSIT}/{}", hex::encode(hash))
+/// Where the deposit whose refund key, x-only, is `refund` stands: a hub
+/// takes one deposit under a refund key, which a wallet derives from its
+/// seed before it knows the deposit's hash.
+pub fn deposit_state(refund: &[u8; 32]) -> String {
+    format!("{DEPOSIT}/{}", hex::encode(refund))
 }
 
-/// Where to ask for the lock of the deposit under `hash` that returns a
-/// contract's reserve.
-pub fn deposit_lock(hash: &[u8; 32]) -> String {
-    format!("{DEPOSIT}/{}/lock", hex::encode(hash))
+/// Where to ask for the lock of the deposit of the refund key `refund`
+/// that returns a contract's reserve.
+pub fn deposit_lock(refund: &[u8; 32]) -> String {
+    format!("{DEPOSIT}/{}/lock", hex::encode(refund))
 }
 
 /// Where a receipt over Lightning of `hash` stands.
@@ -1090,7 +1092,9 @@ impl Deposits {
 /// Ask for a deposit: an address on Bitcoin whose payment locks the hub's
 /// own notes to the outputs of `receive`, as over Lightning, on the
 /// preimage of its hash. `refund`, an x-only key, takes the coins back
-/// after the deposit's timeout.
+/// after the deposit's timeout, and names the deposit at its hub
+/// ([`deposit_state`]): one a hub took a deposit under is refused for
+/// another.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Deposit {
     #[serde(flatten)]
@@ -1134,8 +1138,9 @@ pub struct Depositing {
 
 /// Where a deposit stands: as a receipt over Lightning, with its payment
 /// once confirmed. With what was asked, `request`, and the terms answered,
-/// `terms`: a wallet that lost its record of the deposit, its secrets
-/// derived from its seed, finds it again by its hash and takes it on.
+/// `terms`: a wallet that lost its record of the deposit finds it again by
+/// its refund key, derived from its seed, and takes it on if what is
+/// answered is under the hash its seed gives for just that.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DepositStatus {
     #[serde(flatten)]

@@ -6,7 +6,7 @@ mod chain;
 mod esplora;
 
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU32, Ordering},
     Arc,
 };
 
@@ -25,7 +25,7 @@ use bitcoin::{
 };
 use http_body_util::BodyExt;
 use licash::spend::ChainProfile;
-use licash_api::{Code, Fee, Info, Problem, ReceiveState};
+use licash_api::{Code, DepositStatus, Fee, Hex, Info, Problem, ReceiveState};
 use licash_chain_client::Source;
 use licash_hub::{Hub, Policy, Timing};
 use licash_hub_service::{
@@ -1027,6 +1027,227 @@ async fn a_wallet_restored_from_its_seed_finds_the_deposits_it_asked_and_takes_t
     assert!(bob.deposits().unwrap().is_empty());
 }
 
+/// What a hub answers of where a deposit stands, of what the hub behind it
+/// answered.
+type Stands = Box<dyn Fn(licash_wallet::Response) -> licash_wallet::Response + Send + Sync>;
+
+/// The hub behind a front that answers what it likes of where a deposit
+/// stands, counting the times it is asked: a hub lying to a wallet looking
+/// for the deposits of its seed.
+struct Lying {
+    hub: Local,
+    stands: Stands,
+    asked: Arc<AtomicU32>,
+}
+
+impl Transport for Lying {
+    async fn request(
+        &self,
+        url: &str,
+        body: Option<Vec<u8>>,
+    ) -> Result<licash_wallet::Response, String> {
+        let path = url.strip_prefix(HUB).unwrap_or(url);
+        let stands = body.is_none() && path.starts_with("/v1/deposit/");
+        let response = self.hub.request(url, body).await?;
+        if !stands {
+            return Ok(response);
+        }
+        // A wallet asking without end fails its test, rather than never
+        // ending it.
+        let asked = self.asked.fetch_add(1, Ordering::SeqCst);
+        assert!(asked < 1_000, "asked where a deposit stands without end");
+        Ok((self.stands)(response))
+    }
+}
+
+/// A wallet of the seed of the wallet `name`, its file lost, kept at `file`
+/// and reaching the hub through a front answering `stands` of where a
+/// deposit stands; and the times the front was asked that.
+fn restored_behind(
+    net: &Net,
+    name: &str,
+    file: &str,
+    stands: Stands,
+) -> (Wallet<Lying>, Arc<AtomicU32>) {
+    let mut seed = [0; 32];
+    seed[..name.len()].copy_from_slice(name.as_bytes());
+    let asked = Arc::new(AtomicU32::new(0));
+    let front = Lying {
+        hub: Local(net.app.clone()),
+        stands,
+        asked: asked.clone(),
+    };
+    let path = net.dir.path().join(file);
+    let network = ChainProfile::Core30DefaultRegtest;
+    let wallet = Wallet::create(&path, &seed, network, front).unwrap();
+    (wallet, asked)
+}
+
+/// A hub's answer of where a deposit stands, changed by `change` if it
+/// answered one.
+fn changed(change: impl Fn(&mut DepositStatus) + Send + Sync + 'static) -> Stands {
+    Box::new(move |response| {
+        let Ok(mut status) = serde_json::from_slice::<DepositStatus>(&response.body) else {
+            return response;
+        };
+        change(&mut status);
+        licash_wallet::Response {
+            status: response.status,
+            body: serde_json::to_vec(&status).unwrap(),
+        }
+    })
+}
+
+#[tokio::test]
+async fn a_deposit_answered_other_than_asked_is_not_taken_on_by_a_wallet_restored_from_its_seed() {
+    let net = Net::new().await;
+    let alice = net.wallet("alice");
+    let asked = alice.deposit(HUB, 3_000).await.unwrap();
+    let (close, _) = close_deposit(&net, &alice).await;
+    drop(alice);
+    let other = licash::address::Ephemeral::random().public();
+    let lies: Vec<(&str, Stands)> = vec![
+        // Fewer notes for the same payment: the rest of it its hub's.
+        (
+            "fewer notes",
+            changed(|s| {
+                s.request.as_mut().unwrap().receive.outputs.pop();
+            }),
+        ),
+        (
+            "a larger payment",
+            changed(|s| s.terms.as_mut().unwrap().amount += 1),
+        ),
+        (
+            "a smaller payment",
+            changed(|s| s.terms.as_mut().unwrap().amount -= 1),
+        ),
+        (
+            "outputs under another key",
+            changed(move |s| {
+                s.request.as_mut().unwrap().receive.ephemeral = Hex(other.0.to_vec());
+            }),
+        ),
+        // One a contract's close as one that is none, and the other way.
+        (
+            "another kind",
+            changed(|s| {
+                let request = s.request.as_mut().unwrap();
+                let pays = s.terms.as_ref().unwrap().amount;
+                request.close = match request.close {
+                    Some(_) => None,
+                    None => Some(licash_api::CloseTerms { pays, until: 500 }),
+                };
+            }),
+        ),
+        ("nothing asked", changed(|s| s.request = None)),
+    ];
+    for (n, (what, stands)) in lies.into_iter().enumerate() {
+        let (restored, _) = restored_behind(&net, "alice", &format!("lied{n}.sqlite"), stands);
+        restored.add_hub(HUB).await.unwrap();
+        assert_eq!(restored.deposits().unwrap(), Vec::new(), "{what}");
+    }
+    // As they were asked, both are found: the close, by its hub's root.
+    let (restored, _) = restored_behind(&net, "alice", "told.sqlite", changed(|_| ()));
+    restored.add_hub(HUB).await.unwrap();
+    let found = restored.deposits().unwrap();
+    let mut got: Vec<_> = found.iter().map(|d| (d.hash.clone(), d.amount)).collect();
+    got.sort();
+    let mut want = vec![(asked.hash.clone(), 3_000), (close.hash.clone(), 2_900)];
+    want.sort();
+    assert_eq!(got, want);
+    let pays = |hash: &str| restored.deposit_of(hash).unwrap().terms.unwrap().pays;
+    assert_eq!((pays(&asked.hash), pays(&close.hash)), (3_100, 3_000));
+}
+
+#[tokio::test]
+async fn a_number_asked_again_of_a_hub_that_hid_its_deposit_is_under_another_hash() {
+    let net = Net::new().await;
+    let alice = net.wallet("alice");
+    let first = alice.deposit(HUB, 3_000).await.unwrap();
+    drop(alice);
+    // Her file lost, her hub answers that it knows no deposit of hers.
+    let hidden: Stands = Box::new(|_| {
+        let problem = Problem::new(Code::UnknownLock, "no deposit under this refund key");
+        licash_wallet::Response {
+            status: problem.code.status(),
+            body: serde_json::to_vec(&problem).unwrap(),
+        }
+    });
+    let (restored, _) = restored_behind(&net, "alice", "restored.sqlite", hidden);
+    restored.add_hub(HUB).await.unwrap();
+    assert_eq!(restored.deposits().unwrap(), Vec::new());
+    // The same number, so the same refund key, and the same notes for the
+    // same payment: yet no hash of the first, whose preimage would claim
+    // the first's coins as it claims the second's notes.
+    let again = restored.deposit(HUB, 3_000).await.unwrap();
+    assert_ne!(again.hash, first.hash);
+    // A hub that hid nothing takes one deposit under a refund key.
+    assert!(
+        matches!(&again.state, DepositState::Canceled(why) if why.contains("refund key")),
+        "{again:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_hub_answering_for_every_deposit_looked_for_is_asked_a_bounded_number_of_times() {
+    let net = Net::new().await;
+    let alice = net.wallet("alice");
+    let first = alice.deposit(HUB, 3_000).await.unwrap();
+    let (_, body) = net.asked("alice", &first.hash);
+    drop(alice);
+    // Whatever the number asked after, its hub answers her first deposit.
+    let refund: [u8; 32] = body.refund.0.clone().try_into().unwrap();
+    let stands = Local(net.app.clone())
+        .request(&licash_api::deposit_state(&refund), None)
+        .await
+        .unwrap();
+    assert_eq!(stands.status, 200);
+    let stands: Stands = Box::new(move |_| licash_wallet::Response {
+        status: 200,
+        body: stands.body.clone(),
+    });
+    let (restored, asked) = restored_behind(&net, "alice", "restored.sqlite", stands);
+    restored.add_hub(HUB).await.unwrap();
+    // Her first found, under its own number alone: every other answer
+    // counts as none, and the hub is asked no more than for a hub that
+    // knows none of them.
+    let found = restored.deposits().unwrap();
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].hash, first.hash);
+    assert_eq!(asked.load(Ordering::SeqCst), 1 + licash_wallet::DEPOSIT_GAP);
+}
+
+#[tokio::test]
+async fn a_hub_takes_one_deposit_under_a_refund_key_and_answers_for_it_by_that_key() {
+    let net = Net::new().await;
+    let mut bodies = Vec::new();
+    for name in ["alice", "bob"] {
+        let deposit = net.wallet(name).deposit(HUB, 3_000).await.unwrap();
+        bodies.push(net.asked(name, &deposit.hash).1);
+    }
+    // A gateway of its own database, which knows neither yet.
+    let path = net.dir.path().join("other.sqlite");
+    drop(licash_store::create(&path, licash_store::Kind::Hub).unwrap());
+    let other = gateway(&net.hub, &net.source, &path);
+    let first = other.deposit(&bodies[0]).await.unwrap();
+    // Another deposit, under the first's refund key: refused, and the
+    // first still the one that key names.
+    let mut second = bodies[1].clone();
+    second.refund = bodies[0].refund.clone();
+    let refused = other.deposit(&second).await.unwrap_err().0;
+    assert_eq!(refused.code, Code::Forward, "{refused:?}");
+    assert!(refused.message.contains("refund key"), "{refused:?}");
+    let refund: [u8; 32] = bodies[0].refund.0.clone().try_into().unwrap();
+    let (_, _, hash) = bodies[0].receive.terms().unwrap();
+    assert_eq!(other.deposit_of(&refund).unwrap(), hash);
+    assert_eq!(other.deposit(&bodies[0]).await.unwrap(), first);
+    // Under its own, taken; a key no deposit is under names none.
+    other.deposit(&bodies[1]).await.unwrap();
+    let unknown = other.deposit_of(&[3; 32]).unwrap_err().0;
+    assert_eq!(unknown.code, Code::UnknownLock);
+}
+
 #[tokio::test]
 async fn a_payment_reorganized_away_locks_nothing_and_one_locked_alerts() {
     let net = Net::new().await;
@@ -1210,11 +1431,11 @@ async fn deposits_are_kept_in_the_hubs_database_and_timed_within_the_hubs_locks(
     rusqlite::Connection::open(&path)
         .unwrap()
         .execute(
-            "UPDATE schema_versions SET version = 2 WHERE component = 'deposits'",
+            "UPDATE schema_versions SET version = 3 WHERE component = 'deposits'",
             [],
         )
         .unwrap();
-    assert!(open(config(), &path).unwrap().contains("is of version 2"));
+    assert!(open(config(), &path).unwrap().contains("is of version 3"));
     // A lock lasting beyond the window of the hub's, with its depth and
     // reaction; nothing locked; no confirmation asked; fewer than none.
     let fresh = net.dir.path().join("fresh.sqlite");

@@ -208,10 +208,14 @@ the fee, amounts and timing (a deposit's lock lasts 36 blocks by
 default, room for the payer to activate it on Bitcoin should the hub keep
 its notes). `--deposit-max-open` bounds deposits asked and
 not yet paid (1024 by default): past it, new ones are refused as
-unavailable, never retries or deposits under way. A deposit's status
-(`/v1/deposit/{hash}`) also answers what was asked and the terms answered,
-so that a wallet restored from its seed, its deposits' secrets derived from
-it, finds them again by their hashes. Deposits are kept in `hub.sqlite`.
+unavailable, never retries or deposits under way. A deposit is named at
+its hub by its payer's refund key, x-only, under which the hub takes one
+deposit and refuses another: its status (`/v1/deposit/{refund}`) also
+answers what was asked and the terms answered, so that a wallet restored
+from its seed, which derives its deposits' refund keys from it, finds them
+again by those keys, and takes on only what is under the hash its seed
+gives for the notes and the payment answered. Deposits are kept in
+`hub.sqlite`.
 
 A contract's default close pays the holder's reserve to a deposit asked with
 `close` terms (`CloseTerms`: the reserve as the payment, and `until`, the
@@ -221,7 +225,7 @@ deposit fee. The hub keeps it for a deposit window only until an opening
 names its script and binds it to the contract (`bind_close`, with the fee the
 deposit asked, else the opening is refused); one whose opening is given up is
 given up too, unless a payment was seen. The hub locks the notes only when
-the wallet asks (`POST /v1/deposit/{hash}/lock`, once the payment is seen),
+the wallet asks (`POST /v1/deposit/{refund}/lock`, once the payment is seen),
 when it comes back after the close, and a deposit nobody asked for is given
 up once its payer may take the coins back.
 

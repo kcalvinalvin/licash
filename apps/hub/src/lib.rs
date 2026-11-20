@@ -531,17 +531,17 @@ async fn deposit(
 
 async fn deposit_state(
     State(deposits): State<Arc<deposit::Gateway>>,
-    Path(hash): Path<String>,
+    Path(refund): Path<String>,
 ) -> Answer<DepositStatus> {
-    let hash = licash_api::hash_of(&hash)?;
+    let hash = deposits.deposit_of(&licash_api::hash_of(&refund)?)?;
     Ok(Json(deposits.deposit_status(&hash)?))
 }
 
 async fn deposit_lock(
     State(deposits): State<Arc<deposit::Gateway>>,
-    Path(hash): Path<String>,
+    Path(refund): Path<String>,
 ) -> Answer<DepositStatus> {
-    let hash = licash_api::hash_of(&hash)?;
+    let hash = deposits.deposit_of(&licash_api::hash_of(&refund)?)?;
     Ok(Json(deposits.ask_lock(&hash)?))
 }
 

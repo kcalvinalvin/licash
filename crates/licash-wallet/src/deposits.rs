@@ -11,12 +11,24 @@
 //! never claimed returns to its payer after its timeout
 //! ([`Wallet::refund_deposit`]).
 //!
-//! A deposit's secrets (its preimage, refund key and outputs' ephemeral
-//! key) derive from the seed, its hub's address and its number there, the
-//! next of each hub's: a wallet of the same seed that lost its file finds
-//! the deposits it asked for there by their hashes, the hub answering what
-//! was asked and its terms, and takes them on, until [`GAP`] numbers in a
-//! row are unknown there ([`Wallet::find_deposits`]).
+//! A deposit's refund key derives from the seed, its hub's address and its
+//! number there, the next of each hub's, and its preimage from those and
+//! what is asked: the outputs' ephemeral key, drawn at random each time,
+//! the notes and the payment. A wallet of the same seed that lost its file
+//! so finds the deposits it asked for there by their refund keys, the hub
+//! answering what was asked and its terms, and takes on those whose hash is
+//! the one its seed gives for just that, until [`GAP`] numbers in a row are
+//! unknown there ([`Wallet::find_deposits`]): a hub answering other notes
+//! or another payment than were asked answers another hash. A number asked
+//! again, its hub having hidden the first from such a wallet, is under
+//! another hash, whose preimage claims nothing of the first.
+//!
+//! A deposit that returns a contract's reserve is paid by her contract's
+//! close, perhaps with her hub gone, so its hash and address are of the
+//! seed, the hub and the number alone ([`close_preimage`]), found on
+//! Bitcoin without the hub (`Wallet::find_close_payments`); its outputs'
+//! ephemeral key is of those and the notes asked, which a hub so cannot
+//! answer fewer of.
 
 use bitcoin::{
     hashes::Hash,
@@ -26,7 +38,7 @@ use bitcoin::{
 use licash::{
     address::Ephemeral,
     claim::Branch,
-    crypto::{scalar_from_hash, tagged_hash},
+    crypto::{scalar_from_hash, tagged_hash, Point},
     spend::{lock_hash, ProposalId},
 };
 use licash_api::{CloseTerms, Code, DepositStatus, Depositing, Hex, Info, Receive, ReceiveState};
@@ -45,20 +57,67 @@ const TIP_MARGIN: u32 = 6;
 /// leave gaps.
 pub const GAP: u32 = 20;
 
-/// The secrets of the deposit numbered `number` at the hub of `address`,
-/// of the wallet whose deposit seed is `seed`: its preimage, refund key and
-/// outputs' ephemeral key.
-pub(crate) fn secrets(
+/// The refund key of the deposit numbered `number` at the hub of `address`,
+/// of the wallet whose deposit seed is `seed`: what its hub knows it by.
+pub(crate) fn refund_secret(
     seed: &[u8; 32],
     address: &[u8],
     number: u32,
-) -> Result<([u8; 32], SecretKey, Ephemeral), Error> {
-    let part = |tag| tagged_hash(tag, &[seed, address, &number.to_be_bytes()]);
-    let preimage = part("licash/deposit/preimage");
-    let refund = SecretKey::from_slice(&part("licash/deposit/refund")).map_err(invalid)?;
-    let ephemeral = scalar_from_hash(&part("licash/deposit/ephemeral"));
-    let ephemeral = Ephemeral::from_scalar(ephemeral).map_err(invalid)?;
-    Ok((preimage, refund, ephemeral))
+) -> Result<SecretKey, Error> {
+    let key = tagged_hash(
+        "licash/deposit/refund",
+        &[seed, address, &number.to_be_bytes()],
+    );
+    SecretKey::from_slice(&key).map_err(invalid)
+}
+
+/// The preimage of the deposit numbered `number` at the hub of `address`
+/// that asks notes worth `amount` to outputs under `ephemeral` for a
+/// payment of `pays`: another for any other of them.
+fn preimage(
+    seed: &[u8; 32],
+    address: &[u8],
+    number: u32,
+    ephemeral: &Point,
+    amount: u64,
+    pays: u64,
+) -> [u8; 32] {
+    tagged_hash(
+        "licash/deposit/preimage",
+        &[
+            seed,
+            address,
+            &number.to_be_bytes(),
+            &ephemeral.0,
+            &amount.to_be_bytes(),
+            &pays.to_be_bytes(),
+        ],
+    )
+}
+
+/// The preimage of the deposit numbered `number` at the hub of `address`
+/// that returns a contract's reserve: of nothing its hub answers.
+pub(crate) fn close_preimage(seed: &[u8; 32], address: &[u8], number: u32) -> [u8; 32] {
+    tagged_hash(
+        "licash/deposit/close/preimage",
+        &[seed, address, &number.to_be_bytes()],
+    )
+}
+
+/// The ephemeral key of the outputs, worth `amount`, of the deposit
+/// numbered `number` at the hub of `address` that returns a contract's
+/// reserve.
+fn close_ephemeral(
+    seed: &[u8; 32],
+    address: &[u8],
+    number: u32,
+    amount: u64,
+) -> Result<Ephemeral, Error> {
+    let key = tagged_hash(
+        "licash/deposit/close/ephemeral",
+        &[seed, address, &number.to_be_bytes(), &amount.to_be_bytes()],
+    );
+    Ephemeral::from_scalar(scalar_from_hash(&key)).map_err(invalid)
 }
 
 /// A deposit asked for, and where it stands.
@@ -199,8 +258,11 @@ impl<T: Transport> Wallet<T> {
                 deposits.min, deposits.max
             )));
         }
+        let pays = deposits
+            .pays(amount)
+            .ok_or_else(|| Error::Invalid(format!("a deposit of {amount} overflows")))?;
         let number = self.deposit_number(hub, &url, &info).await?;
-        let asked = self.draw_deposit(&url, &info, amount, number, None)?;
+        let asked = self.draw_deposit(&url, &info, (amount, pays), number, None)?;
         self.store.write(|tx| asked.keep(tx, hub))?;
         tracing::info!(hash = %hex::encode(asked.hash), %url, amount, "asking for a deposit");
         self.advance_deposit(&asked.hash).await
@@ -228,7 +290,8 @@ impl<T: Transport> Wallet<T> {
                     "hub {url} takes no deposit paid {pays} sat exactly, its fee in it"
                 ))
             })?;
-        self.deposit_answered(hub, &info, amount, None).await
+        self.deposit_answered(hub, &info, (amount, pays), None)
+            .await
     }
 
     /// Ask the hub at `url` for the deposit that a contract's default close
@@ -266,7 +329,7 @@ impl<T: Transport> Wallet<T> {
             })?;
         let close = CloseTerms { pays, until };
         let deposit = self
-            .deposit_answered(hub, &info, amount, Some(close))
+            .deposit_answered(hub, &info, (amount, pays), Some(close))
             .await?;
         let network = licash_onchain::network(self.network());
         let script = deposit
@@ -313,23 +376,31 @@ impl<T: Transport> Wallet<T> {
     }
 
     /// Ask the hub `hub`, which says `info` of itself, for a deposit of
-    /// notes worth `amount`, to pay at once: recorded only with the terms
-    /// it answered, checked, as none pays a deposit its hub never answered.
+    /// notes worth `amount` for a payment of `pays`, to pay at once:
+    /// recorded only with the terms it answered, checked, as none pays a
+    /// deposit its hub never answered.
     pub(crate) async fn deposit_answered(
         &self,
         hub: i64,
         info: &Info,
-        amount: u64,
+        (amount, pays): (u64, u64),
         close: Option<CloseTerms>,
     ) -> Result<Deposit, Error> {
         let url = self.reached(hub)?;
         let number = self.deposit_number(hub, &url, info).await?;
-        let asked = self.draw_deposit(&url, info, amount, number, close)?;
+        let asked = self.draw_deposit(&url, info, (amount, pays), number, close)?;
         let hash = asked.hash;
         tracing::info!(hash = %hex::encode(hash), %url, amount, "asking for a deposit");
         let terms: Depositing = self.post(&url, licash_api::DEPOSIT, &asked.body).await?;
         let htlc = self
-            .check_terms(&url, &hash, &asked.refund_key, amount, close, &terms)
+            .check_terms(
+                &url,
+                &hash,
+                &asked.refund_key,
+                (amount, pays),
+                close,
+                &terms,
+            )
             .await?;
         let network = licash_onchain::network(self.network());
         self.store.write(|tx| {
@@ -362,19 +433,34 @@ impl<T: Transport> Wallet<T> {
         Ok(())
     }
 
-    /// A deposit of notes worth `amount` to ask the hub at `url`, which
-    /// says `info` of itself, for, numbered `number` there.
+    /// A deposit of notes worth `amount`, for a payment of `pays`, to ask
+    /// the hub at `url`, which says `info` of itself, for, numbered
+    /// `number` there.
     fn draw_deposit(
         &self,
         url: &str,
         info: &Info,
-        amount: u64,
+        (amount, pays): (u64, u64),
         number: u32,
         close: Option<CloseTerms>,
     ) -> Result<Asked, Error> {
         let keysets = info.keysets().map_err(|p| unavailable(url, p))?;
         let address = info.address.to_bytes();
-        let (preimage, refund_key, ephemeral) = secrets(&self.keys.deposit, &address, number)?;
+        let seed = &self.keys.deposit;
+        let refund_key = refund_secret(seed, &address, number)?;
+        let (preimage, ephemeral) = match close {
+            // Drawn anew each time: a number asked twice is two hashes.
+            None => {
+                let ephemeral = Ephemeral::random();
+                let public = ephemeral.public();
+                let preimage = preimage(seed, &address, number, &public, amount, pays);
+                (preimage, ephemeral)
+            }
+            Some(_) => (
+                close_preimage(seed, &address, number),
+                close_ephemeral(seed, &address, number, amount)?,
+            ),
+        };
         let me = self.address();
         let (keyset, outputs) = keysets
             .iter()
@@ -394,6 +480,7 @@ impl<T: Transport> Wallet<T> {
             preimage,
             refund_key,
             amount,
+            pays,
             body,
         })
     }
@@ -437,10 +524,10 @@ impl<T: Transport> Wallet<T> {
     /// Look for the deposits the wallet's seed asked of the hub at `url`,
     /// by number from the first, until `GAP` in a row are unknown there:
     /// those it kept no record of, as a wallet restored from its seed,
-    /// kept as the hub answers them, checked to be the wallet's, then
-    /// taken on as any other ([`Wallet::follow_deposit`], refunded if
-    /// paid and never received). Those found; the next number after them
-    /// from then on.
+    /// kept as the hub answers them, checked to be what the wallet's seed
+    /// asked, then taken on as any other ([`Wallet::follow_deposit`],
+    /// refunded if paid and never received). Those found; the next number
+    /// after them from then on.
     pub async fn find_deposits(&self, url: &str) -> Result<Vec<Deposit>, Error> {
         let url = hub_url(url)?;
         let (hub, info) = self.refresh(&url).await?;
@@ -459,26 +546,39 @@ impl<T: Transport> Wallet<T> {
             .and_then(|r| XOnlyPublicKey::from_slice(&r.0).ok());
         let (mut number, mut unknown, mut next) = (0u32, 0u32, 0u32);
         let mut found = Vec::new();
+        // A number counts as known only by a deposit that is the wallet's:
+        // a hub answering anything else to each is asked `GAP` times, not
+        // without end.
         while unknown < GAP {
-            let (preimage, refund, ephemeral) = secrets(&self.keys.deposit, &address, number)?;
-            let hash = lock_hash(&preimage);
+            let refund = refund_secret(&self.keys.deposit, &address, number)?;
+            let key = x_only(&refund).serialize();
             let kept = self.store.read(|c| {
-                let kept =
-                    c.query_row("SELECT 1 FROM deposits WHERE hash = ?1", [hash], |_| Ok(()));
+                let kept = c.query_row(
+                    "SELECT 1 FROM deposits WHERE refund_key = ?1 LIMIT 1",
+                    [refund.secret_bytes()],
+                    |_| Ok(()),
+                );
                 Ok(kept.optional()?.is_some())
             })?;
             let known = kept
-                || match self.get(url, &licash_api::deposit_state(&hash)).await {
+                || match self.get(url, &licash_api::deposit_state(&key)).await {
                     Ok(status) => {
-                        let drawn = (preimage, refund, ephemeral.public());
+                        let drawn = Drawn {
+                            address: &address,
+                            number,
+                            refund,
+                        };
                         match self.found_deposit(hub, url, drawn, status, root) {
-                            Ok(()) => found.push(self.deposit_record(&hash)?),
+                            Ok(hash) => {
+                                found.push(self.deposit_record(&hash)?);
+                                true
+                            }
                             Err(Error::Invalid(reason)) => {
-                                tracing::warn!(hash = %hex::encode(hash), %url, %reason, "a deposit found not this wallet's");
+                                tracing::warn!(number, %url, %reason, "a deposit found not this wallet's");
+                                false
                             }
                             Err(e) => return Err(e),
                         }
-                        true
                     }
                     Err(Error::Refused { problem, .. }) if problem.code == Code::UnknownLock => {
                         false
@@ -504,51 +604,68 @@ impl<T: Transport> Wallet<T> {
         Ok(found)
     }
 
-    /// Keep the deposit of this wallet's seed `drawn` (its preimage,
-    /// refund key and outputs' ephemeral key) as the hub `hub` at `url`
-    /// says it stands, `status`: what was asked and the terms answered
-    /// checked to be of its hash and keys. Refused as invalid otherwise.
+    /// Keep the deposit of this wallet's seed `drawn` as the hub `hub` at
+    /// `url` says it stands, `status`: what was asked and the terms
+    /// answered kept only under the hash the seed gives for them, which a
+    /// hub answering other notes, another payment or another kind of
+    /// deposit than was asked does not answer. Its hash; refused as
+    /// invalid otherwise.
     fn found_deposit(
         &self,
         hub: i64,
         url: &str,
-        drawn: ([u8; 32], SecretKey, licash::crypto::Point),
+        drawn: Drawn<'_>,
         status: DepositStatus,
         root: Option<XOnlyPublicKey>,
-    ) -> Result<(), Error> {
-        let (preimage, refund_key, mine) = drawn;
+    ) -> Result<[u8; 32], Error> {
+        let Drawn {
+            address,
+            number,
+            refund: refund_key,
+        } = drawn;
+        let seed = &self.keys.deposit;
         let wrong = |why: &str| Error::Invalid(format!("hub {url} found a deposit {why}"));
         let (Some(request), Some(terms)) = (status.request, status.terms) else {
             return Err(wrong("but not what was asked"));
         };
-        let (_, ephemeral, hash) = request.receive.terms().map_err(|p| unavailable(url, p))?;
-        let refund = Hex(x_only(&refund_key).serialize().to_vec());
-        if hash != lock_hash(&preimage) || ephemeral != mine || request.refund != refund {
-            return Err(wrong("asked by another"));
-        }
-        let outputs = request.receive.outputs().map_err(|p| unavailable(url, p))?;
+        let (_, ephemeral, hash) = request.receive.terms().map_err(invalid)?;
+        let outputs = request.receive.outputs().map_err(invalid)?;
         let amount = outputs
             .iter()
             .try_fold(0u64, |sum, o| sum.checked_add(o.denomination()))
             .ok_or_else(|| wrong("of outputs overflowing"))?;
-        let htlc = match (&request.close, root) {
+        let pays = terms.amount;
+        let refund = x_only(&refund_key);
+        let (preimage, htlc) = match (&request.close, root) {
             // Of her keys and the hub's root, as when it was asked.
-            (Some(_), Some(root)) => close_htlc(&root, &hash, &x_only(&refund_key)),
+            (Some(close), Some(root)) => {
+                let mine = close_ephemeral(seed, address, number, amount)?.public();
+                if ephemeral != mine || close.pays != pays {
+                    return Err(wrong("of other notes or another payment than asked"));
+                }
+                let preimage = close_preimage(seed, address, number);
+                (preimage, close_htlc(&root, &hash, &refund))
+            }
             (Some(_), None) => {
                 return Err(wrong("that returns a contract's reserve, no root named"))
             }
             (None, _) => {
                 let claim = XOnlyPublicKey::from_slice(&terms.claim.0)
                     .map_err(|_| wrong("claimed by no key"))?;
-                Htlc {
+                let htlc = Htlc {
                     hash,
                     claim,
-                    refund: x_only(&refund_key),
+                    refund,
                     timeout: terms.timeout,
                     wait: None,
-                }
+                };
+                let preimage = preimage(seed, address, number, &ephemeral, amount, pays);
+                (preimage, htlc)
             }
         };
+        if hash != lock_hash(&preimage) || request.refund.0 != refund.serialize() {
+            return Err(wrong("not as this wallet asked it"));
+        }
         let network = licash_onchain::network(self.network());
         if htlc.address(network).to_string() != terms.address {
             return Err(wrong(&format!("at {}, not its terms", terms.address)));
@@ -558,6 +675,7 @@ impl<T: Transport> Wallet<T> {
             preimage,
             refund_key,
             amount,
+            pays,
             body: request,
         };
         self.store.write(|tx| {
@@ -565,8 +683,16 @@ impl<T: Transport> Wallet<T> {
             keep_terms(tx, &hash, &htlc, &terms, network)
         })?;
         tracing::info!(hash = %hex::encode(hash), %url, amount, "deposit found");
-        Ok(())
+        Ok(hash)
     }
+}
+
+/// A deposit a wallet's seed may have asked the hub of `address` for, by
+/// its number there, to check what the hub answers of it against.
+struct Drawn<'a> {
+    address: &'a [u8],
+    number: u32,
+    refund: SecretKey,
 }
 
 /// A deposit drawn: what only the wallet knows of it, and what it asks.
@@ -575,6 +701,8 @@ struct Asked {
     preimage: [u8; 32],
     refund_key: SecretKey,
     amount: u64,
+    /// What its payment is to be: the terms answered are held to it.
+    pays: u64,
     body: licash_api::Deposit,
 }
 
@@ -583,14 +711,16 @@ impl Asked {
     fn keep(&self, tx: &rusqlite::Transaction, hub: i64) -> Result<(), Error> {
         let body = serde_json::to_string(&self.body).map_err(invalid)?;
         tx.execute(
-            "INSERT INTO deposits (hash, hub, preimage, refund_key, amount, body, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO deposits
+                 (hash, hub, preimage, refund_key, amount, pays, body, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 self.hash,
                 hub,
                 self.preimage,
                 self.refund_key.secret_bytes(),
                 sql(self.amount)?,
+                sql(self.pays)?,
                 body,
                 now()
             ],
@@ -609,18 +739,16 @@ fn keep_terms(
     network: bitcoin::Network,
 ) -> Result<(), Error> {
     tx.execute(
-        "INSERT INTO deposit_terms (hash, claim_key, timeout_height, pays, fund_by_height, address)
-         SELECT ?1, ?2, ?3, ?4, ?5, ?6
+        "INSERT INTO deposit_terms (hash, claim_key, timeout_height, fund_by_height, address)
+         SELECT ?1, ?2, ?3, ?4, ?5
          WHERE EXISTS (SELECT 1 FROM deposits WHERE hash = ?1 AND canceled IS NULL)
          ON CONFLICT (hash) DO UPDATE SET
             claim_key = excluded.claim_key, timeout_height = excluded.timeout_height,
-            pays = excluded.pays, fund_by_height = excluded.fund_by_height,
-            address = excluded.address",
+            fund_by_height = excluded.fund_by_height, address = excluded.address",
         params![
             hash,
             htlc.claim.serialize(),
             terms.timeout,
-            sql(terms.amount)?,
             terms.fund_by,
             htlc.address(network).to_string(),
         ],
@@ -650,10 +778,10 @@ impl<T: Transport> Wallet<T> {
 
 impl<T: Transport> Wallet<T> {
     async fn advance_deposit_from(&self, hash: &[u8; 32]) -> Result<(), Error> {
-        type Row = (String, [u8; 32], [u8; 32], i64, String, bool, bool);
+        type Row = (String, [u8; 32], [u8; 32], (i64, i64), String, bool, bool);
         let row: Option<Row> = self.store.read(|c| {
             Ok(c.query_row(
-                "SELECT r.url, d.preimage, d.refund_key, d.amount, d.body,
+                "SELECT r.url, d.preimage, d.refund_key, d.amount, d.pays, d.body,
                     EXISTS (SELECT 1 FROM deposit_terms t WHERE t.hash = d.hash),
                     d.done_at IS NULL AND d.canceled IS NULL AND d.refund IS NULL
                  FROM deposits d JOIN reach r ON r.hub = d.hub WHERE d.hash = ?1",
@@ -663,17 +791,20 @@ impl<T: Transport> Wallet<T> {
                         r.get(0)?,
                         r.get(1)?,
                         r.get(2)?,
-                        r.get(3)?,
-                        r.get(4)?,
+                        (r.get(3)?, r.get(4)?),
                         r.get(5)?,
                         r.get(6)?,
+                        r.get(7)?,
                     ))
                 },
             )
             .optional()?)
         })?;
-        let (url, preimage, refund_key, amount, body, answered, open) =
+        let (url, preimage, refund_key, (amount, pays), body, answered, open) =
             row.ok_or_else(|| Error::UnknownPayment(hex::encode(hash)))?;
+        let refund = SecretKey::from_slice(&refund_key).map_err(invalid)?;
+        // What its hub knows it by.
+        let key = x_only(&refund).serialize();
         if !open {
             return Ok(());
         }
@@ -693,9 +824,9 @@ impl<T: Transport> Wallet<T> {
                 }
                 Err(e) => return Err(e),
             };
-            let refund = SecretKey::from_slice(&refund_key).map_err(invalid)?;
+            let asked = (amount as u64, pays as u64);
             let htlc = match self
-                .check_terms(&url, hash, &refund, amount as u64, body.close, &terms)
+                .check_terms(&url, hash, &refund, asked, body.close, &terms)
                 .await
             {
                 Ok(htlc) => htlc,
@@ -708,7 +839,7 @@ impl<T: Transport> Wallet<T> {
             let (address, pays) = (&terms.address, terms.amount);
             tracing::info!(hash = %hex::encode(hash), %url, %address, pays, "deposit terms");
         }
-        let status: DepositStatus = self.get(&url, &licash_api::deposit_state(hash)).await?;
+        let status: DepositStatus = self.get(&url, &licash_api::deposit_state(&key)).await?;
         if let Some(funding) = &status.funding {
             let txid: Txid = funding.txid.parse().map_err(|e| unavailable(&url, e))?;
             self.store.write(|tx| {
@@ -729,7 +860,7 @@ impl<T: Transport> Wallet<T> {
                 // paid in.
                 let close = parsed.as_ref().is_ok_and(|body| body.close.is_some());
                 if close && status.funding.is_some() {
-                    self.post::<DepositStatus>(&url, &licash_api::deposit_lock(hash), &())
+                    self.post::<DepositStatus>(&url, &licash_api::deposit_lock(&key), &())
                         .await?;
                 }
                 return Ok(());
@@ -779,17 +910,18 @@ impl<T: Transport> Wallet<T> {
 }
 
 impl<T: Transport> Wallet<T> {
-    /// The deposit `terms` answers for `hash`, checked against what the
+    /// The deposit `terms` answers for `hash`, which asked notes worth
+    /// `amount` for a payment of `pays`, checked against that and what the
     /// hub at `url` says of its deposits: its address that of the hub's
-    /// claim and the wallet's `refund`, its amount the notes and the fee,
-    /// its timeout no later than the hub promises. A hub answering other
+    /// claim and the wallet's `refund`, its amount the payment asked, its
+    /// timeout no later than the hub promises. A hub answering other
     /// terms gets nothing paid to them: the deposit is canceled unpaid.
     async fn check_terms(
         &self,
         url: &str,
         hash: &[u8; 32],
         refund: &SecretKey,
-        amount: u64,
+        (amount, pays): (u64, u64),
         close: Option<CloseTerms>,
         terms: &Depositing,
     ) -> Result<Htlc, Error> {
@@ -838,7 +970,7 @@ impl<T: Transport> Wallet<T> {
         match close {
             // Her contract's reserve exactly, for the most notes it covers.
             Some(close) => {
-                if terms.amount != close.pays || deposits.most_for(close.pays) != Some(amount) {
+                if terms.amount != pays || close.pays != pays {
                     return Err(wrong(format!(
                         "of {} for {amount}, not as her contract's close",
                         terms.amount
@@ -846,7 +978,7 @@ impl<T: Transport> Wallet<T> {
                 }
             }
             None => {
-                if deposits.pays(amount) != Some(terms.amount) {
+                if terms.amount != pays {
                     return Err(wrong(format!("of {} for {amount}", terms.amount)));
                 }
                 let latest = height
@@ -1015,7 +1147,7 @@ impl<T: Transport> Wallet<T> {
     }
 }
 
-const DEPOSITS: &str = "SELECT d.hash, r.url, d.amount, t.address, t.timeout_height, t.pays,
+const DEPOSITS: &str = "SELECT d.hash, r.url, d.amount, t.address, t.timeout_height, d.pays,
     t.fund_by_height, f.txid, f.vout, f.height, d.done_at IS NOT NULL, d.canceled, d.refund,
     d.created_at, d.lock, d.body
     FROM deposits d JOIN reach r ON r.hub = d.hub
@@ -1023,10 +1155,10 @@ const DEPOSITS: &str = "SELECT d.hash, r.url, d.amount, t.address, t.timeout_hei
     LEFT JOIN deposit_fundings f ON f.hash = d.hash";
 
 fn deposit_of(r: &Row<'_>) -> rusqlite::Result<Deposit> {
-    let terms = match (r.get(3)?, r.get(4)?, r.get::<_, Option<i64>>(5)?, r.get(6)?) {
-        (Some(address), Some(timeout), Some(pays), Some(fund_by)) => Some(DepositTerms {
+    let terms = match (r.get(3)?, r.get(4)?, r.get(6)?) {
+        (Some(address), Some(timeout), Some(fund_by)) => Some(DepositTerms {
             address,
-            pays: pays as u64,
+            pays: r.get::<_, i64>(5)? as u64,
             fund_by,
             timeout,
         }),
@@ -1072,4 +1204,80 @@ fn deposit_of(r: &Row<'_>) -> rusqlite::Result<Deposit> {
         created_at: r.get(13)?,
         close: closes(&r.get::<_, String>(15)?),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SEED: [u8; 32] = [7; 32];
+    const HUB: [u8; 99] = [9; 99];
+
+    fn ephemeral(byte: u8) -> Point {
+        let scalar = scalar_from_hash(&[byte; 32]);
+        Ephemeral::from_scalar(scalar).unwrap().public()
+    }
+
+    #[test]
+    fn a_deposits_preimage_is_of_all_that_is_asked_and_its_refund_key_of_its_number_alone() {
+        let key = ephemeral(1);
+        let asked = preimage(&SEED, &HUB, 3, &key, 3_000, 3_100);
+        // Another for another seed, hub, number, key, notes or payment.
+        let others = [
+            preimage(&[8; 32], &HUB, 3, &key, 3_000, 3_100),
+            preimage(&SEED, &[8; 99], 3, &key, 3_000, 3_100),
+            preimage(&SEED, &HUB, 4, &key, 3_000, 3_100),
+            preimage(&SEED, &HUB, 3, &ephemeral(2), 3_000, 3_100),
+            preimage(&SEED, &HUB, 3, &key, 2_999, 3_100),
+            preimage(&SEED, &HUB, 3, &key, 3_000, 3_101),
+            // Notes and payment are told apart, not summed or joined.
+            preimage(&SEED, &HUB, 3, &key, 3_100, 3_000),
+            close_preimage(&SEED, &HUB, 3),
+        ];
+        for (n, other) in others.iter().enumerate() {
+            assert_ne!(*other, asked, "{n}");
+        }
+        // The refund key, by which its hub is asked after it, is of the
+        // seed, the hub and the number, whatever is asked.
+        let refund = refund_secret(&SEED, &HUB, 3).unwrap();
+        assert_ne!(refund, refund_secret(&SEED, &HUB, 4).unwrap());
+        assert_ne!(refund, refund_secret(&[8; 32], &HUB, 3).unwrap());
+        assert_ne!(refund, refund_secret(&SEED, &[8; 99], 3).unwrap());
+        // As a wallet restored from its seed must derive them again.
+        assert_eq!(
+            hex::encode(asked),
+            "689f3c1e132cc351ac2f25b590954119721cea3bb32b36f3c60e167c16e68560"
+        );
+        assert_eq!(
+            hex::encode(refund.secret_bytes()),
+            "9eba18c9ca7247242b4c033fda6cdeccb09d4cf37115bed630f3b46814d985e1"
+        );
+    }
+
+    #[test]
+    fn a_close_deposits_hash_is_of_its_number_and_its_outputs_key_of_its_notes() {
+        // Found on Bitcoin with its hub gone: of nothing a hub answers.
+        let preimage = close_preimage(&SEED, &HUB, 3);
+        assert_ne!(preimage, close_preimage(&SEED, &HUB, 4));
+        assert_ne!(preimage, close_preimage(&[8; 32], &HUB, 3));
+        assert_ne!(preimage, close_preimage(&SEED, &[8; 99], 3));
+        // A hub answering fewer notes answers another key than her seed's.
+        let key = close_ephemeral(&SEED, &HUB, 3, 2_900).unwrap().public();
+        assert_ne!(
+            key,
+            close_ephemeral(&SEED, &HUB, 3, 2_899).unwrap().public()
+        );
+        assert_ne!(
+            key,
+            close_ephemeral(&SEED, &HUB, 4, 2_900).unwrap().public()
+        );
+        assert_eq!(
+            hex::encode(preimage),
+            "2a559304eefd7e008e91fdcfd29474c589982da1da883c26eff01ee69dd8a241"
+        );
+        assert_eq!(
+            hex::encode(key.0),
+            "03bd5e782e89b47ae602fc83b967d1925752dc8e46e53a17fc87573a07a2c7c007"
+        );
+    }
 }
