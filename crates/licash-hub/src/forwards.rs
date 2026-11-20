@@ -144,20 +144,28 @@ impl Hub {
         if lock_hash(preimage) != forward.hash {
             return Err(Refusal::Preimage.into());
         }
+        let lost = || -> Result<(), Error> {
+            let proposal = hex::encode(id.as_bytes());
+            self.alert(&format!(
+                "a payment told failed was made: the lock {proposal} of {} was refunded",
+                forward.amount
+            ))?;
+            Err(Refusal::Forward("the payment failed before").into())
+        };
         match forward.state {
             Forwarded::Pending => {}
             Forwarded::Paid(_) => return Ok(()),
-            Forwarded::Failed(_) => {
-                let proposal = hex::encode(id.as_bytes());
-                self.alert(&format!(
-                    "a payment told failed was made: the lock {proposal} of {} was refunded",
-                    forward.amount
-                ))?;
-                return Err(Refusal::Forward("the payment failed before").into());
-            }
+            Forwarded::Failed(_) => return lost(),
         }
-        // Settling the lock resolves its forward.
-        self.settle(id, preimage)?;
+        // Settling the lock resolves its forward. Told failed since it was
+        // read, it was refunded: alerted all the same.
+        if let Err(e) = self.settle(id, preimage) {
+            let now = self.forward_of(id)?.map(|f| f.state);
+            if matches!(now, Some(Forwarded::Failed(_))) {
+                return lost();
+            }
+            return Err(e);
+        }
         tracing::info!(proposal = %hex::encode(id.as_bytes()), "forward paid");
         Ok(())
     }
