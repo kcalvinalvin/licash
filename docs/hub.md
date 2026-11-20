@@ -70,6 +70,14 @@ the dashboard (give it `--network`, or `LICASH_HUB_NETWORK`), and a
 contract's interest by the year, which counts the year of its blocks
 (1,051,200 on Mutinynet, 52,560 elsewhere).
 
+The hub takes the chain `--chain` serves as the best chain, and checks only
+that each block extends the last one it scanned (a reorganization is
+rewound). It does not check that the source is up to date: a node that is
+stalled, or on a minority chain, shows the hub a stale tip, and the hub
+times its locks, refunds and deposits by it. Keeping the node synced to
+the network, and well connected, is the operator's job: name a node you
+run, and watch its tip against others.
+
 `<data>/seed` makes every key of the hub: those its notes are issued
 under, its own address, its Nostr key and its deposits' keys. Keep a copy
 offline. Whoever else reads it makes notes the hub takes for its own, and
