@@ -41,9 +41,15 @@ type Config struct {
 	Mempool mempool.Limits
 	// CDN, if set, is the base URL of a block-dn server following the same
 	// chain: filters are fetched by the file and checked against filter
-	// headers obtained independently from peers. No headers are imported.
-	// The peers serve whatever it cannot.
+	// headers obtained independently from peers, or from Pin. The peers
+	// serve whatever it cannot.
 	CDN string
+	// Pin, if set with CDN, is the block a release vouches for: an empty
+	// store is filled to it from the CDN's import files, checked against
+	// it, before the node starts (pinned.go). Peers serve without.
+	Pin *Pin
+	// Progress, if set, is told the bytes of Pin's files downloaded.
+	Progress func(done, total int64)
 	// Proxy, if set, is the SOCKS5 proxy everything is reached through:
 	// the peers, the names resolved and the CDN.
 	Proxy *Proxy
@@ -81,6 +87,13 @@ type Node struct {
 // transactions from the first connection on, whether or not anything is
 // watched, so the handshake does not show when a wallet starts watching.
 func Start(cfg Config) (*Node, error) {
+	return StartContext(context.Background(), cfg)
+}
+
+// StartContext is Start, its download of pinned headers, if any, given up
+// once ctx is done: no node is started then.
+func StartContext(ctx context.Context, cfg Config) (*Node, error) {
+	began := time.Now()
 	log := cfg.Log
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
@@ -100,7 +113,28 @@ func Start(cfg Config) (*Node, error) {
 			log.Warn("block-dn unusable, syncing from peers", "err", err)
 		}
 	}
-	n, err := start(cfg, log)
+	imp := pinnedImport(ctx, dir, cfg.CDN, cfg.Pin, cfg.Proxy, cfg.Progress, log)
+	if err := ctx.Err(); err != nil {
+		// Given up on rather than failed: tried again on the next start.
+		_ = os.RemoveAll(filepath.Join(dir, "import"))
+		if cfg.Pin != nil {
+			_ = os.Remove(triedMark(dir, cfg.Pin))
+		}
+		return nil, err
+	}
+	n, err := start(cfg, imp, log, began)
+	if err != nil && imp != nil {
+		// Checked against the pin, the files should never fail to import:
+		// peers serve if they do.
+		log.Error("pinned headers not imported, syncing from peers", "err", err)
+		n, err = start(cfg, nil, log, began)
+	} else if err == nil && imp != nil {
+		log.Info("phase: pinned headers imported", "height", cfg.Pin.Height,
+			"after", time.Since(began).Round(time.Millisecond))
+	}
+	if imp != nil {
+		_ = os.RemoveAll(filepath.Dir(imp.BlockHeadersSource))
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -129,9 +163,9 @@ func peerDirectory(base string) (string, error) {
 	return dir, nil
 }
 
-// start runs the node using only the peers for block and filter headers.
-func start(cfg Config, log *slog.Logger) (*Node, error) {
-	began := time.Now()
+// start runs the node, its headers imported from imp first if set, from
+// the peers on.
+func start(cfg Config, imp *neutrino.HeadersImportConfig, log *slog.Logger, began time.Time) (*Node, error) {
 	db, err := walletdb.Create(
 		"bdb", filepath.Join(cfg.DataDir, "neutrino.db"), true,
 		time.Minute, false,
@@ -149,6 +183,7 @@ func start(cfg Config, log *slog.Logger) (*Node, error) {
 		MempoolEnabled: true,
 		Dialer:         dialer(cfg.Proxy),
 		NameResolver:   resolver(cfg.Proxy),
+		HeadersImport:  imp,
 	})
 	if err != nil {
 		_ = db.Close()

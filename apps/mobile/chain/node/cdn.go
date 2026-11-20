@@ -1,8 +1,9 @@
 package node
 
-// A block-dn server supplies only compact filter bodies. Block and filter
-// headers always come from peers; every CDN filter must match those headers
-// before any of its file is cached. CDN metadata is never a chain authority.
+// A block-dn server supplies compact filter bodies here, and the header
+// files of a release's pin (pinned.go), checked against it. Every CDN
+// filter must match the filter headers held, from peers or the pin, before
+// any of its file is cached. CDN metadata is never a chain authority.
 
 import (
 	"context"

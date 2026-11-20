@@ -6,12 +6,15 @@ package mobile
 
 import (
 	"bytes"
+	"context"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/url"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/btcsuite/btcd/chaincfg/v2"
@@ -40,14 +43,19 @@ type network struct {
 	peers []string
 	// seeds are reached when no other peer answers (cmd/seeds).
 	seeds []string
+	// pin is the block this release vouches for, an empty store filled to
+	// it from cdn (cmd/pin): none if nil.
+	pin *node.Pin
 }
 
 func networkOf(name string) (network, error) {
 	switch name {
 	case "bitcoin":
-		return network{params: chaincfg.MainNetParams, cdn: "https://block-dn.org", seeds: bitcoinSeeds}, nil
+		return network{params: chaincfg.MainNetParams, cdn: "https://block-dn.org", seeds: bitcoinSeeds,
+			pin: bitcoinPin}, nil
 	case "signet":
-		return network{params: chaincfg.SigNetParams, cdn: "https://signet.block-dn.org", seeds: signetSeeds}, nil
+		return network{params: chaincfg.SigNetParams, cdn: "https://signet.block-dn.org", seeds: signetSeeds,
+			pin: signetPin}, nil
 	case "mutinynet":
 		challenge, err := hex.DecodeString(mutinynetChallenge)
 		if err != nil {
@@ -63,10 +71,23 @@ func networkOf(name string) (network, error) {
 	return network{}, fmt.Errorf("unknown network %q: bitcoin, signet, mutinynet or regtest", name)
 }
 
-// Chain is a running light client.
+// Chain is a running light client: started, or downloading the headers
+// this release pins first (Importing), which takes a minute or more.
 type Chain struct {
+	mu   sync.Mutex
 	node *node.Node
+	// err is why a start in the background failed.
+	err error
+	// cancel gives up on a start in the background; done is closed once
+	// it ended.
+	cancel context.CancelFunc
+	done   chan struct{}
+	// The bytes of pinned headers downloaded, of all, while downloading.
+	downloaded, total atomic.Int64
 }
+
+// errImporting is what is asked of a client still downloading headers.
+var errImporting = errors.New("the light client is still downloading block headers")
 
 // Start runs a light client of network ("bitcoin", "signet", "mutinynet"
 // or "regtest") with its data in dataDir. Peers, comma separated, are then
@@ -97,19 +118,72 @@ func StartThrough(network, dataDir, peers, cdn, proxy string) (*Chain, error) {
 	if peers != "" {
 		connect = strings.Split(peers, ",")
 	}
-	n, err := node.Start(node.Config{
+	return start(node.Config{
 		DataDir:      dataDir,
 		Params:       net.params,
 		ConnectPeers: connect,
 		FixedSeeds:   net.seeds,
 		CDN:          cdn,
+		Pin:          net.pin,
 		Proxy:        through,
 		Log:          logger(),
 	})
-	if err != nil {
-		return nil, err
+}
+
+// start runs a light client of cfg: at once, or once the headers it
+// pins are downloaded, in the background.
+func start(cfg node.Config) (*Chain, error) {
+	c := &Chain{done: make(chan struct{})}
+	cfg.Progress = func(done, total int64) {
+		c.total.Store(total)
+		c.downloaded.Store(done)
 	}
-	return &Chain{node: n}, nil
+	if !node.ImportDue(cfg) {
+		defer close(c.done)
+		n, err := node.Start(cfg)
+		if err != nil {
+			return nil, err
+		}
+		c.node = n
+		return c, nil
+	}
+	// Downloading takes long: the caller carries on meanwhile.
+	ctx, cancel := context.WithCancel(context.Background())
+	c.cancel = cancel
+	c.total.Store(cfg.Pin.Bytes())
+	go func() {
+		defer close(c.done)
+		n, err := node.StartContext(ctx, cfg)
+		c.mu.Lock()
+		c.node, c.err = n, err
+		c.mu.Unlock()
+		c.total.Store(0)
+	}()
+	return c, nil
+}
+
+// running is the started node, or why there is none.
+func (c *Chain) running() (*node.Node, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.node != nil {
+		return c.node, nil
+	}
+	if c.err != nil {
+		return nil, c.err
+	}
+	return nil, errImporting
+}
+
+// Importing is how far the download of the headers this release pins is,
+// in percent, while the client downloads them before starting: -1 when
+// not downloading.
+func (c *Chain) Importing() int32 {
+	total := c.total.Load()
+	if total <= 0 {
+		return -1
+	}
+	return int32(c.downloaded.Load() * 100 / total)
 }
 
 // proxyOf is the SOCKS5 proxy of proxy, a URL with a username and
@@ -133,8 +207,15 @@ func proxyOf(proxy string) (*node.Proxy, error) {
 }
 
 // Height is the best chain's height.
+// Nothing while downloading headers.
 func (c *Chain) Height() (int32, error) {
-	height, _, err := c.node.Tip()
+	n, err := c.running()
+	if errors.Is(err, errImporting) {
+		return 0, nil
+	} else if err != nil {
+		return 0, err
+	}
+	height, _, err := n.Tip()
 	return height, err
 }
 
@@ -143,7 +224,11 @@ func (c *Chain) Hash(height int32) ([]byte, error) {
 	if height < 0 {
 		return nil, fmt.Errorf("no block %d", height)
 	}
-	hash, err := c.node.BlockHash(uint32(height))
+	n, err := c.running()
+	if err != nil {
+		return nil, err
+	}
+	hash, err := n.BlockHash(uint32(height))
 	if err != nil {
 		return nil, err
 	}
@@ -156,7 +241,11 @@ func (c *Chain) Time(height int32) (int64, error) {
 	if height < 0 {
 		return 0, fmt.Errorf("no block %d", height)
 	}
-	t, err := c.node.BlockTime(uint32(height))
+	n, err := c.running()
+	if err != nil {
+		return 0, err
+	}
+	t, err := n.BlockTime(uint32(height))
 	if err != nil {
 		return 0, err
 	}
@@ -169,7 +258,11 @@ func (c *Chain) Header(height int32) ([]byte, error) {
 	if height < 0 {
 		return nil, fmt.Errorf("no block %d", height)
 	}
-	header, err := c.node.Header(uint32(height))
+	n, err := c.running()
+	if err != nil {
+		return nil, err
+	}
+	header, err := n.Header(uint32(height))
 	if err != nil {
 		return nil, err
 	}
@@ -187,7 +280,11 @@ func (c *Chain) Filter(hash []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return c.node.Filter(*h)
+	n, err := c.running()
+	if err != nil {
+		return nil, err
+	}
+	return n.Filter(*h)
 }
 
 // Block is the block of hash, checked against its header.
@@ -196,7 +293,11 @@ func (c *Chain) Block(hash []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	block, err := c.node.Block(*h)
+	n, err := c.running()
+	if err != nil {
+		return nil, err
+	}
+	block, err := n.Block(*h)
 	if err != nil {
 		return nil, err
 	}
@@ -213,7 +314,11 @@ func (c *Chain) Broadcast(tx []byte) error {
 	if err := msg.Deserialize(bytes.NewReader(tx)); err != nil {
 		return fmt.Errorf("not a transaction: %w", err)
 	}
-	return c.node.Broadcast(msg)
+	n, err := c.running()
+	if err != nil {
+		return err
+	}
+	return n.Broadcast(msg)
 }
 
 // Unconfirmed is the transactions peers relayed that pay script, oldest
@@ -225,7 +330,11 @@ func (c *Chain) Unconfirmed(script []byte) ([]byte, error) {
 	if len(script) == 0 {
 		return nil, fmt.Errorf("no script")
 	}
-	pool := c.node.Mempool()
+	n, err := c.running()
+	if err != nil {
+		return nil, err
+	}
+	pool := n.Mempool()
 	pool.WatchScript(script)
 	seen := pool.Pays(script)
 	sort.Slice(seen, func(i, j int) bool { return seen[i].At.Before(seen[j].At) })
@@ -239,28 +348,53 @@ func (c *Chain) Unconfirmed(script []byte) ([]byte, error) {
 }
 
 // Headers is the height of the newest block header kept: ahead of Height
-// while the filter headers, which Height waits for, catch up.
+// while the filter headers, which Height waits for, catch up. Nothing
+// while downloading headers.
 func (c *Chain) Headers() (int32, error) {
-	return c.node.Headers()
+	n, err := c.running()
+	if errors.Is(err, errImporting) {
+		return 0, nil
+	} else if err != nil {
+		return 0, err
+	}
+	return n.Headers()
 }
 
 // PeerHeight is the highest block a connected peer told of, the height the
 // client catches up to: 0 with no peer.
 func (c *Chain) PeerHeight() int32 {
-	return c.node.PeerHeight()
+	if n, err := c.running(); err == nil {
+		return n.PeerHeight()
+	}
+	return 0
 }
 
 // Synced is whether the client believes it caught up with its peers.
 func (c *Chain) Synced() bool {
-	return c.node.Synced()
+	n, err := c.running()
+	return err == nil && n.Synced()
 }
 
 // Peers is the number of peers connected.
 func (c *Chain) Peers() int {
-	return c.node.Peers()
+	if n, err := c.running(); err == nil {
+		return n.Peers()
+	}
+	return 0
 }
 
-// Stop shuts the client down. It is safe to call twice.
+// Stop shuts the client down, giving up on downloading headers. It is
+// safe to call twice.
 func (c *Chain) Stop() error {
-	return c.node.Stop()
+	if c.cancel != nil {
+		c.cancel()
+	}
+	<-c.done
+	c.mu.Lock()
+	n := c.node
+	c.mu.Unlock()
+	if n == nil {
+		return nil
+	}
+	return n.Stop()
 }

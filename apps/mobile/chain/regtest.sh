@@ -15,8 +15,8 @@ name="licash-chain-$$"
 
 "$here/upstream/materialize.sh" --check >/dev/null 2>&1 || "$here/upstream/materialize.sh"
 
-docker run -d --rm --name "$name" -p 127.0.0.1::18444 "$IMAGE" \
-	-regtest -listen=1 -bind=0.0.0.0:18444 \
+docker run -d --rm --name "$name" -p 127.0.0.1::18444 -p 127.0.0.1::18443 "$IMAGE" \
+	-regtest -listen=1 -bind=0.0.0.0:18444 -rpcbind=0.0.0.0 -rpcallowip=0.0.0.0/0 \
 	-blockfilterindex=1 -peerblockfilters=1 -fallbackfee=0.0002 >/dev/null
 trap 'docker rm -f "$name" >/dev/null 2>&1 || true' EXIT INT TERM
 
@@ -36,6 +36,7 @@ cli createwallet chain >/dev/null
 cli -rpcwallet=chain generatetoaddress 101 "$(cli -rpcwallet=chain getnewaddress)" >/dev/null
 
 p2p=$(docker port "$name" 18444/tcp | head -1)
+rpc=$(docker port "$name" 18443/tcp | head -1)
 cd "$here"
-LICASH_BITCOIND_CONTAINER="$name" LICASH_BITCOIND_P2P="$p2p" \
-	go test -tags regtest -count=1 -p 1 -run '^TestRegtest' ./node/ ./mobile/ "$@"
+LICASH_BITCOIND_CONTAINER="$name" LICASH_BITCOIND_P2P="$p2p" LICASH_BITCOIND_RPC="http://$rpc" \
+	go test -tags regtest -count=1 -p 1 -run '^TestRegtest' ./node/ ./mobile/ ./cmd/pin/ "$@"

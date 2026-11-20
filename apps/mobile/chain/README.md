@@ -11,8 +11,18 @@ for `bitcoin`, `signet`, `mutinynet` and `regtest`.
 - `node/`: the light client. Given a [block-dn](https://github.com/guggero/block-dn)
   server, filters come from it by the file, each checked against filter
   headers fetched independently from peers before any of the file is
-  stored. Block and filter headers never come from the CDN; peers serve
-  missing or rejected filters too.
+  stored. Peers serve missing or rejected filters too. Block and filter
+  headers come from peers, with one exception: a release may pin a deep
+  block of each network (`mobile/pin_<network>.go`, made by `cmd/pin`),
+  and a store holding no header yet is then filled to it from the CDN's
+  import files before the node starts, both files downloaded through the
+  proxy and refused unless their length, SHA-256 and last entry are the
+  pinned ones (`node/pinned.go`). `cmd/pin` makes both files from Bitcoin
+  Core alone and pins nothing unless the CDN's are the same bytes, so the
+  CDN is only a transport. A store holding headers, as on any upgrade,
+  never imports; a download that fails is not tried again on that store;
+  peers serve whatever the import does not. No pin, no request for
+  header files.
 - Peers: neutrino's own discovery (DNS seeds filtered by service, then
   `addr`/`addrv2` gossip, onion addresses included through a proxy).
   Besides, `node/` remembers the peers it completed a handshake with in
@@ -44,6 +54,16 @@ Needs Go (see `go.mod`), and Docker for the regtest tests.
 upstream/materialize.sh          # once, and after changing the pin or patches
 go test -race ./...
 ./regtest.sh                     # against a throwaway Bitcoin Core
+```
+
+Before a release, pin each network with a synced Core node holding the
+basic block filter index:
+
+```sh
+go run ./cmd/pin -network bitcoin -rpc http://127.0.0.1:8332 \
+    -cookie ~/.bitcoin/.cookie > mobile/pin_bitcoin.go
+go run ./cmd/pin -network signet -rpc http://127.0.0.1:38332 \
+    -cookie ~/.bitcoin/signet/.cookie > mobile/pin_signet.go
 ```
 
 Before a release, refresh the fixed seeds (from the DNS seeds, and from a
