@@ -47,7 +47,7 @@ func networkOf(name string) (network, error) {
 			pin: signetPin}, nil
 	case "mutinynet":
 		// Its CDN is the only one there is, self-hosted.
-		return network{params: node.Mutinynet(), cdn: "https://mutinynet-blockdn.sgn.space",
+		return network{params: node.Mutinynet(), cdn: "https://mutinynet.block-dn.org",
 			peers: []string{node.MutinynetPeer}, pin: mutinynetPin}, nil
 	case "regtest":
 		return network{params: chaincfg.RegressionNetParams}, nil

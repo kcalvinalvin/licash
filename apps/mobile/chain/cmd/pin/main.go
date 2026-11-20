@@ -112,7 +112,7 @@ func paramsOf(network string) (*chaincfg.Params, string, error) {
 		return &chaincfg.SigNetParams, "https://signet.block-dn.org", nil
 	case "mutinynet":
 		params := node.Mutinynet()
-		return &params, "https://mutinynet-blockdn.sgn.space", nil
+		return &params, "https://mutinynet.block-dn.org", nil
 	case "regtest": // For its tests: a CDN given.
 		return &chaincfg.RegressionNetParams, "", nil
 	}
