@@ -1164,13 +1164,23 @@ pub fn bound_tweak(spend: &Point, seed: &[u8; 32]) -> ScalarBytes {
 
 /// Everything derived for output `j` of a spend addressed to `recipient`
 /// under shared secret `shared`.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Derived {
     pub secret: Secret,
     pub tweak: ScalarBytes,
     pub seed: [u8; 32],
     pub blinding: ScalarBytes,
     pub owner_point: Point,
+}
+
+/// Names the point alone: the seed and the nonce in the secret are keys,
+/// which no log or panic message may print.
+impl std::fmt::Debug for Derived {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Derived")
+            .field("owner_point", &self.owner_point)
+            .finish_non_exhaustive()
+    }
 }
 
 pub fn derive_output(recipient_spend: &Point, shared: &[u8; 32], j: u32) -> Result<Derived, Error> {

@@ -83,6 +83,21 @@ fn root_derivation_is_independent_and_secret_debug_output_is_redacted() {
 }
 
 #[test]
+fn what_is_derived_for_an_output_prints_no_key() {
+    let receipt = licash::note::derive_output(&point(17), &[23; 32], 1).unwrap();
+    let printed = format!("{receipt:?} {receipt:#?}");
+    for key in [&receipt.seed[..], &receipt.secret.nonce[..]] {
+        assert!(!printed.contains(&hex::encode(key)), "{printed}");
+        assert!(!printed.contains(&format!("{key:?}")), "{printed}");
+    }
+    assert!(
+        !printed.contains(&format!("{:?}", receipt.seed)),
+        "{printed}"
+    );
+    assert!(printed.starts_with("Derived"), "{printed}");
+}
+
+#[test]
 fn a_scan_agent_derives_hold_authority_without_the_spending_scalar() {
     let root = HoldRoot::from_seed(&[7; 32]).unwrap();
     let output = derive(1, &root);
