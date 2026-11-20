@@ -2462,6 +2462,53 @@ fn a_phone_takes_back_the_coins_of_a_move_its_hub_never_locked_to_it_as_far_as_i
     assert_eq!(alice.balance().unwrap().onchain, value);
 }
 
+/// A payment of a deposit the phone knows of only from its hub, as one
+/// made before a restore: taken back only once a block shows it paying the
+/// deposit, a refund of a coin that pays it not standing in for its own.
+#[test]
+fn a_phone_takes_back_only_a_deposit_payment_its_hub_names_that_a_block_shows() {
+    let net = Net::new(false);
+    let light = Light::new(&net);
+    let alice = net.wallet("alice", net.height());
+    let (funding, _, timeout, _) = moved_unclaimed(&net, &light, &alice);
+    while net.height() < timeout {
+        net.mine(1, Vec::new());
+    }
+    // Its own payment forgotten, which its hub names, as it would after a
+    // restore: first another output of it.
+    let paid_at = (0..=net.height())
+        .find(|&h| {
+            let block = light.block(light.hash(h).unwrap()).unwrap();
+            let block: Block = deserialize(&block).unwrap();
+            block
+                .txdata
+                .iter()
+                .any(|t| t.compute_txid() == funding.txid)
+        })
+        .unwrap();
+    let db = rusqlite::Connection::open(format!("{}/wallet.sqlite", net.dir("alice"))).unwrap();
+    db.execute("DELETE FROM silent_spends", []).unwrap();
+    let named = |vout: u32| {
+        db.execute("DELETE FROM deposit_fundings", []).unwrap();
+        db.execute(
+            "INSERT INTO deposit_fundings (hash, txid, vout, height)
+             SELECT hash, ?1, ?2, ?3 FROM deposits",
+            rusqlite::params![funding.txid.to_byte_array(), vout, paid_at],
+        )
+        .unwrap();
+    };
+    named(funding.vout + 1);
+    scan(&alice, &light);
+    let wrong = OutPoint::new(funding.txid, funding.vout + 1);
+    assert!(spending(&net, wrong).is_empty());
+    assert!(spending(&net, funding).is_empty());
+    // Named right, at its next look.
+    named(funding.vout);
+    net.mine(6, Vec::new());
+    scan(&alice, &light);
+    assert_eq!(spending(&net, funding).len(), 1);
+}
+
 #[test]
 fn a_phone_hands_its_refund_on_long_after_its_timeout() {
     let net = Net::new(false);

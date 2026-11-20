@@ -51,7 +51,7 @@ impl Wallet {
             ) {
                 continue;
             }
-            let Some(funding) = self.deposit_paid(&deposit) else {
+            let Some(funding) = self.deposit_paid(chain, &deposit) else {
                 continue;
             };
             let to = match self.wallet.fallback_address() {
@@ -97,8 +97,10 @@ impl Wallet {
 
     /// Where the payment of `deposit` is, as far as the wallet knows: a
     /// transaction of the wallet's in a block paying it, else the payment
-    /// its hub saw.
-    fn deposit_paid(&self, deposit: &Deposit) -> Option<OutPoint> {
+    /// its hub saw, found paying it in the block at the height it names:
+    /// a refund of one that pays it not could never confirm, and would
+    /// stand in for the deposit's own.
+    fn deposit_paid(&self, chain: &dyn ChainSource, deposit: &Deposit) -> Option<OutPoint> {
         let terms = deposit.terms.as_ref()?;
         let address: bitcoin::Address<bitcoin::address::NetworkUnchecked> =
             terms.address.parse().ok()?;
@@ -116,7 +118,23 @@ impl Wallet {
                 return Some(OutPoint::new(txid, vout as u32));
             }
         }
-        deposit.funding.map(|(funding, _)| funding)
+        let (funding, height) = deposit.funding?;
+        let block = chain
+            .hash(height)
+            .and_then(|hash| chain.block(hash))
+            .map_err(|e| tracing::warn!(%funding, %e, "the block of a deposit's payment"))
+            .ok()?;
+        let block: bitcoin::Block = bitcoin::consensus::deserialize(&block).ok()?;
+        let tx = block
+            .txdata
+            .iter()
+            .find(|tx| tx.compute_txid() == funding.txid);
+        let output = tx.and_then(|tx| tx.output.get(funding.vout as usize));
+        if !output.is_some_and(|o| o.script_pubkey == script && o.value.to_sat() == terms.pays) {
+            tracing::warn!(%funding, height, "its hub names a payment of a deposit no block shows");
+            return None;
+        }
+        Some(funding)
     }
 
     /// Whether the refund `txid` made of a deposit was found in a block:
