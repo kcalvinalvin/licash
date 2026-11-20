@@ -2,6 +2,9 @@
 //! code in the process that brings its own sockets, such as the light
 //! client: CONNECT, and Tor's RESOLVE extension, only with its own
 //! username and password, each destination host on circuits of its own.
+//! A username of its own followed by `.` and a lane, `0` to `255`, keeps
+//! streams to a host on circuits of the lane's own: several downloads from
+//! one host each on a circuit apart, as fast as each circuit goes.
 
 use std::{
     future::Future,
@@ -69,11 +72,13 @@ impl Drop for Socks {
 
 /// Where the proxy's streams go: Tor, or anything else in tests.
 pub(crate) trait Exit: Clone + Send + Sync + 'static {
-    /// A stream to `host`, a name or an address, at `port`.
+    /// A stream to `host`, a name or an address, at `port`, on the
+    /// circuits of `lane` if any, else those of the host.
     fn connect(
         &self,
         host: String,
         port: u16,
+        lane: Option<u8>,
     ) -> impl Future<Output = Result<Box<dyn Stream>, String>> + Send;
 
     /// The addresses of `host`.
@@ -124,7 +129,7 @@ fn random() -> String {
 /// What a client asked for.
 #[derive(Debug, PartialEq, Eq)]
 enum Request {
-    Connect(String, u16),
+    Connect(String, u16, Option<u8>),
     Resolve(String),
 }
 
@@ -138,8 +143,8 @@ async fn relay(
         .await
         .map_err(|_| "no request in time".to_owned())??;
     match request {
-        Request::Connect(host, port) => {
-            let stream = tokio::time::timeout(REACH, exit.connect(host.clone(), port))
+        Request::Connect(host, port, lane) => {
+            let stream = tokio::time::timeout(REACH, exit.connect(host.clone(), port, lane))
                 .await
                 .unwrap_or_else(|_| Err("no stream in time".into()));
             let mut stream = match stream {
@@ -196,7 +201,9 @@ async fn handshake(
     let name = read_vec(client, length).await?;
     let [length] = read::<1>(client).await?;
     let given = read_vec(client, length).await?;
-    let known = same(&name, username.as_bytes()) & same(&given, password.as_bytes());
+    let (name, lane) = lane(&name, username.len());
+    let known = same(name, username.as_bytes()) & same(&given, password.as_bytes());
+    let known = known && lane.is_some();
     write(client, &[1, if known { 0 } else { 1 }]).await?;
     if !known {
         return Err("wrong username or password".into());
@@ -220,13 +227,27 @@ async fn handshake(
     };
     let port = u16::from_be_bytes(read::<2>(client).await?);
     match command {
-        CONNECT => Ok(Request::Connect(host, port)),
+        CONNECT => Ok(Request::Connect(host, port, lane.flatten())),
         RESOLVE => Ok(Request::Resolve(host)),
         _ => {
             reply(client, COMMAND_UNSUPPORTED, None).await?;
             Err(format!("command {command}"))
         }
     }
+}
+
+/// `name`, a username, as its first `length` bytes and the lane after
+/// them: `None` if those name no lane, `Some(None)` if there are none.
+fn lane(name: &[u8], length: usize) -> (&[u8], Option<Option<u8>>) {
+    if name.len() <= length {
+        return (name, Some(None));
+    }
+    let (name, after) = name.split_at(length);
+    let lane = (after.strip_prefix(b"."))
+        .and_then(|digits| std::str::from_utf8(digits).ok())
+        .filter(|digits| !digits.starts_with('+'))
+        .and_then(|digits| digits.parse().ok());
+    (name, lane.map(Some))
 }
 
 /// Whether `a` is `b`, in time independent of where they differ.
@@ -280,12 +301,19 @@ async fn write(client: &mut TcpStream, bytes: &[u8]) -> Result<(), String> {
 mod tests {
     use super::*;
 
-    /// Streams straight to the loopback interface, and names it knows.
-    #[derive(Clone)]
-    struct Loopback;
+    /// Streams straight to the loopback interface, and names it knows: the
+    /// lanes of the streams asked for.
+    #[derive(Clone, Default)]
+    struct Loopback(Arc<std::sync::Mutex<Vec<Option<u8>>>>);
 
     impl Exit for Loopback {
-        async fn connect(&self, host: String, port: u16) -> Result<Box<dyn Stream>, String> {
+        async fn connect(
+            &self,
+            host: String,
+            port: u16,
+            lane: Option<u8>,
+        ) -> Result<Box<dyn Stream>, String> {
+            self.0.lock().unwrap().push(lane);
             let ip = match host.as_str() {
                 "echo.example" | "127.0.0.1" => Ipv4Addr::LOCALHOST,
                 _ => return Err(format!("no route to {host}")),
@@ -365,7 +393,7 @@ mod tests {
 
     #[tokio::test]
     async fn streams_go_through_it_by_name_or_address() {
-        let (socks, port) = (serve(Loopback).await.unwrap(), echo().await);
+        let (socks, port) = (serve(Loopback::default()).await.unwrap(), echo().await);
         assert!(socks.address().ip().is_loopback());
         let (user, password) = (socks.username().to_owned(), socks.password().to_owned());
         assert_eq!((user.len(), password.len()), (32, 32));
@@ -392,7 +420,7 @@ mod tests {
 
     #[tokio::test]
     async fn names_resolve_through_it_to_their_first_address() {
-        let socks = serve(Loopback).await.unwrap();
+        let socks = serve(Loopback::default()).await.unwrap();
         let (user, password) = (socks.username().to_owned(), socks.password().to_owned());
         let (_, code, bound) =
             ask(&socks, &user, &password, RESOLVE, &name("seed.example", 0)).await;
@@ -409,7 +437,7 @@ mod tests {
 
     #[tokio::test]
     async fn only_its_credentials_open_it() {
-        let (socks, port) = (serve(Loopback).await.unwrap(), echo().await);
+        let (socks, port) = (serve(Loopback::default()).await.unwrap(), echo().await);
         let (user, password) = (socks.username().to_owned(), socks.password().to_owned());
         let to = name("echo.example", port);
         for (user, password) in [
@@ -443,8 +471,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_username_naming_a_lane_keeps_streams_to_its_lane() {
+        let (exit, port) = (Loopback::default(), echo().await);
+        let socks = serve(exit.clone()).await.unwrap();
+        let (user, password) = (socks.username().to_owned(), socks.password().to_owned());
+        let to = name("echo.example", port);
+        for (lane, code) in [
+            ("", SUCCEEDED),
+            (".0", SUCCEEDED),
+            (".7", SUCCEEDED),
+            (".255", SUCCEEDED),
+        ] {
+            let (_, got, _) = ask(&socks, &format!("{user}{lane}"), &password, CONNECT, &to).await;
+            assert_eq!(got, code, "{lane}");
+        }
+        assert_eq!(*exit.0.lock().unwrap(), [None, Some(0), Some(7), Some(255)]);
+        // Anything else after its username, or another's, is refused.
+        for wrong in [".", ".256", ".-1", ".+1", ".x", "7", "x.1"] {
+            let (_, got, _) = ask(&socks, &format!("{user}{wrong}"), &password, CONNECT, &to).await;
+            assert_eq!(got, 0xff, "{wrong}");
+        }
+        let other = format!("{}.1", "0".repeat(user.len()));
+        let (_, got, _) = ask(&socks, &other, &password, CONNECT, &to).await;
+        assert_eq!(got, 0xff);
+        assert_eq!(exit.0.lock().unwrap().len(), 4);
+    }
+
+    #[tokio::test]
     async fn it_stops_once_dropped() {
-        let socks = serve(Loopback).await.unwrap();
+        let socks = serve(Loopback::default()).await.unwrap();
         let address = socks.address();
         drop(socks);
         tokio::time::sleep(Duration::from_millis(50)).await;

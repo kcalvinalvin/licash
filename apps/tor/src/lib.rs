@@ -309,12 +309,12 @@ impl Tor {
     /// A stream to `target`, within TLS if it asks: on new circuits once
     /// more should one fail, and next time should that one fail too.
     async fn stream(&self, target: Target) -> Result<Box<dyn Stream>, String> {
-        let renew = || self.isolation.renew(&target.host);
+        let renew = || self.isolation.renew(&target.isolated());
         twice(|| self.open(&target), renew).await
     }
 
     async fn open(&self, target: &Target) -> Result<Box<dyn Stream>, String> {
-        let prefs = self.isolation.prefs(&target.host);
+        let prefs = self.isolation.prefs(&target.isolated());
         let host = &target.host;
         let started = Instant::now();
         let stream = self
@@ -403,9 +403,20 @@ impl std::fmt::Display for Failed {
 }
 
 impl socks::Exit for Tor {
-    async fn connect(&self, host: String, port: u16) -> Result<Box<dyn Stream>, String> {
+    async fn connect(
+        &self,
+        host: String,
+        port: u16,
+        lane: Option<u8>,
+    ) -> Result<Box<dyn Stream>, String> {
         let tls = false;
-        self.stream(Target { host, port, tls }).await
+        self.stream(Target {
+            host,
+            port,
+            tls,
+            lane,
+        })
+        .await
     }
 
     async fn resolve(&self, host: String) -> Result<Vec<std::net::IpAddr>, String> {
@@ -429,6 +440,8 @@ struct Target {
     host: String,
     port: u16,
     tls: bool,
+    /// The circuits of a lane of the host's, apart from its others.
+    lane: Option<u8>,
 }
 
 impl Target {
@@ -445,7 +458,16 @@ impl Target {
             host: authority.host().to_owned(),
             port: authority.port_u16().unwrap_or(if tls { 443 } else { 80 }),
             tls,
+            lane: None,
         })
+    }
+
+    /// Which streams share its circuits: those to its host, in its lane.
+    fn isolated(&self) -> String {
+        match self.lane {
+            Some(lane) => format!("{}#{lane}", self.host),
+            None => self.host.clone(),
+        }
     }
 }
 
@@ -694,6 +716,7 @@ mod tests {
             host: host.into(),
             port,
             tls,
+            lane: None,
         }
     }
 
@@ -756,6 +779,28 @@ mod tests {
         assert_ne!(isolation.of("relay.example"), hub);
         assert_ne!(isolation.of("relay.example"), isolation.of("other.example"));
         assert_eq!(isolation.of("hub.example"), hub);
+    }
+
+    #[test]
+    fn each_lane_of_a_host_keeps_to_circuits_of_its_own() {
+        let isolation = Isolation::default();
+        let lane = |lane| Target {
+            lane,
+            ..target("cdn.example", 443, false)
+        };
+        let host = isolation.of(&lane(None).isolated());
+        let (first, second) = (
+            isolation.of(&lane(Some(1)).isolated()),
+            isolation.of(&lane(Some(2)).isolated()),
+        );
+        assert_ne!(first, host);
+        assert_ne!(first, second);
+        assert_eq!(isolation.of(&lane(Some(1)).isolated()), first);
+        // A lane's stream failing renews its lane alone.
+        isolation.renew(&lane(Some(1)).isolated());
+        assert_ne!(isolation.of(&lane(Some(1)).isolated()), first);
+        assert_eq!(isolation.of(&lane(Some(2)).isolated()), second);
+        assert_eq!(isolation.of(&lane(None).isolated()), host);
     }
 
     #[test]
