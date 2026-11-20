@@ -28,6 +28,19 @@ use crate::{mailbox, watch::Watch, Found, Role, Route, LIFETIME};
 /// one announcing URLs that never answer holds a look no longer.
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long the other swap providers asked for a quote have to answer once
+/// one did, at most: those slower are left out rather than hold up the
+/// owner, as one gone (say, the onion service of a provider redeployed
+/// under a new key, its old announcement still valid) never answers and
+/// would hold each quote [`ANSWER_TIMEOUT`]. At least [`QUOTE_GRACE_LEAST`],
+/// else as long again as the first took: providers reached the same way
+/// answer in comparable times.
+const QUOTE_GRACE: Duration = Duration::from_secs(4);
+
+/// How long the other swap providers asked have to answer once one did, at
+/// least ([`QUOTE_GRACE`]).
+const QUOTE_GRACE_LEAST: Duration = Duration::from_secs(1);
+
 /// The most services announced asked at once: hubs are all asked, and
 /// providers the wallet heard from besides [`STRANGERS`].
 const ASKED_AT_ONCE: usize = 32;
@@ -263,7 +276,7 @@ impl Announcements {
             }
         }
         let keys: Vec<String> = found.iter().map(|f| f.key.clone()).collect();
-        let answering = answering(found, ask, nostr).await?;
+        let answering = answering(found, ask, nostr, Some(QUOTE_GRACE_LEAST)).await?;
         let mut answered = lock();
         // Those heard from too long ago count for nothing: forgotten, so
         // that keys announcing once each are kept no longer.
@@ -1023,7 +1036,8 @@ pub async fn hubs_found<T: Transport>(
     let trusted: HashSet<_> = hubs_used.iter().map(|(_, info)| info.address).collect();
     let ask = |url: String| async move { wallet.hub_info(&url).await };
     let asked = few(found.clone(), HUBS_ASKED);
-    let answering = answering(asked, ask, |i: &Info| i.nostr.as_deref()).await?;
+    // Each hub waited for: all those answering are shown.
+    let answering = answering(asked, ask, |i: &Info| i.nostr.as_deref(), None).await?;
     let mut hubs: Vec<AnnouncedHub> = answering
         .into_iter()
         .filter(|(_, _, info)| !trusted.contains(&info.address))
@@ -1297,19 +1311,23 @@ fn known(service: &Found, used: &HashSet<String>) -> bool {
 /// answer: only then may its URL be used. The others are skipped, as are
 /// those not answering in time, [`ANSWER_TIMEOUT`] at all its URLs
 /// together, but [`Error::UnknownHub`] fails them all: no service is one
-/// to ask. [`ASKED_AT_ONCE`] are asked at once.
+/// to ask. [`ASKED_AT_ONCE`] are asked at once. Given `least`, those not
+/// answered once one did are waited for no longer than as long again as
+/// the first took, `least` to [`QUOTE_GRACE`]; else each is waited for.
+/// In the order found.
 async fn answering<Q, Fut>(
     found: Vec<Found>,
     ask: impl Fn(String) -> Fut,
     nostr: fn(&Q) -> Option<&str>,
+    least: Option<Duration>,
 ) -> Result<Vec<(Found, String, Q)>, Error>
 where
     Fut: Future<Output = Result<Q, Error>>,
 {
     let ask = &ask;
-    let started = Instant::now();
+    let started = tokio::time::Instant::now();
     let count = found.len();
-    let asked = found.into_iter().map(|service| async move {
+    let asked = found.into_iter().enumerate().map(|(i, service)| async move {
         let mut answered = None;
         let by = tokio::time::Instant::now() + ANSWER_TIMEOUT;
         for url in &service.announcement.urls {
@@ -1328,20 +1346,35 @@ where
                 }
             }
         }
-        Ok(answered.map(|(url, answer)| (service, url, answer)))
+        Ok((i, answered.map(|(url, answer)| (service, url, answer))))
     });
-    let mut asked = stream::iter(asked).buffered(ASKED_AT_ONCE);
+    let mut asked = stream::iter(asked).buffer_unordered(ASKED_AT_ONCE);
     let mut answering = Vec::new();
-    while let Some(asked) = asked.next().await {
-        answering.extend(asked?);
+    let mut until = None;
+    loop {
+        let next = match until {
+            None => asked.next().await,
+            Some(until) => match tokio::time::timeout_at(until, asked.next()).await {
+                Ok(next) => next,
+                Err(_) => break,
+            },
+        };
+        let Some(next) = next else { break };
+        let (i, Some(answer)) = next? else { continue };
+        if let (None, Some(least)) = (until, least) {
+            let now = tokio::time::Instant::now();
+            until = Some(now + (now - started).clamp(least, QUOTE_GRACE));
+        }
+        answering.push((i, answer));
     }
+    answering.sort_unstable_by_key(|(i, _)| *i);
     tracing::info!(
         asked = count,
         answered = answering.len(),
         took = ?started.elapsed(),
         "services announced asked"
     );
-    Ok(answering)
+    Ok(answering.into_iter().map(|(_, answer)| answer).collect())
 }
 
 #[cfg(test)]
@@ -1458,9 +1491,64 @@ mod tests {
             }
         };
         let started = tokio::time::Instant::now();
-        let answered = answering(found, ask, named).await.unwrap();
+        let answered = answering(found, ask, named, None).await.unwrap();
         assert_eq!(answered.len(), 2);
         assert_eq!(started.elapsed(), ANSWER_TIMEOUT);
+    }
+
+    /// Providers each answering after `ms` (never, if none) under its key,
+    /// at its URL: those that answered a quote, and how long it took.
+    async fn quoted(ms: &[Option<u64>]) -> (Vec<usize>, Duration) {
+        let found: Vec<Found> = (0..ms.len())
+            .map(|i| at(i, &format!("https://{i}.test")))
+            .collect();
+        let ask = |url: String| {
+            let i: usize = url["https://".len()..url.len() - ".test".len()]
+                .parse()
+                .unwrap();
+            let (key, after) = (found[i].key.clone(), ms[i]);
+            async move {
+                match after {
+                    Some(after) => tokio::time::sleep(Duration::from_millis(after)).await,
+                    None => std::future::pending::<()>().await,
+                }
+                Ok(Answer(key))
+            }
+        };
+        let started = tokio::time::Instant::now();
+        let answered = answering(found.clone(), ask, named, Some(QUOTE_GRACE_LEAST))
+            .await
+            .unwrap();
+        let order = (answered.iter())
+            .map(|(f, ..)| found.iter().position(|g| g.key == f.key).unwrap())
+            .collect();
+        (order, started.elapsed())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_quote_goes_on_without_a_provider_never_answering_once_others_did() {
+        // A provider gone, its announcement still valid, first and last.
+        let (order, took) = quoted(&[None, Some(2000), Some(3500), None]).await;
+        assert_eq!(order, [1, 2]);
+        // As long again as the first took.
+        assert_eq!(took, Duration::from_secs(4));
+        // The first quick: those answering within a second still heard.
+        let (order, took) = quoted(&[Some(900), None, Some(100)]).await;
+        assert_eq!(order, [0, 2]);
+        assert_eq!(took, Duration::from_millis(100) + QUOTE_GRACE_LEAST);
+        // The first slow: the others wait no longer than the grace.
+        let (order, took) = quoted(&[Some(20_000), Some(10_000), Some(13_000)]).await;
+        assert_eq!(order, [1, 2]);
+        assert_eq!(took, Duration::from_secs(10) + QUOTE_GRACE);
+        let (order, _) = quoted(&[Some(20_000), Some(10_000), Some(15_000)]).await;
+        assert_eq!(order, [1]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_quote_none_answered_is_given_up_on_no_sooner_than_before() {
+        let (order, took) = quoted(&[None, None]).await;
+        assert!(order.is_empty());
+        assert_eq!(took, ANSWER_TIMEOUT);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1488,7 +1576,7 @@ mod tests {
                 Ok(Answer(key))
             }
         };
-        let answered = answering(found.clone(), ask, named).await.unwrap();
+        let answered = answering(found.clone(), ask, named, None).await.unwrap();
         assert_eq!(answered.len(), found.len());
         assert_eq!(*most.lock().unwrap(), ASKED_AT_ONCE);
         // In the order found.
