@@ -1019,8 +1019,10 @@ async fn contracted(eco: &Eco, phone: &Phone) -> anyhow::Result<()> {
     eprintln!("contract {:?}", protecting.text);
     // What it is worth, in sight without a tap.
     phone.tagged("worth", MOCK, 10).await?;
-    // Unfolded: her part, issued back to her once its funding is buried.
+    // Unfolded: her part, issued back to her once its funding is buried,
+    // 3 blocks deep at hub1: mined, as nothing else waits to be.
     phone.tap_view(&protecting).await?;
+    eco.mine(3).await?;
     let issued = until("her part in the balance", 600, || async {
         mine(eco).await?;
         let views = phone.views().await?;
