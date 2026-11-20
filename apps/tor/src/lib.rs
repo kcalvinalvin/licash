@@ -43,8 +43,16 @@ pub const TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_ISOLATED: usize = 1024;
 
 /// How long a connection to a host stays open, idle, for the next request
-/// to it: a payment's few requests, one after the other, share one.
-const KEPT_FOR: Duration = Duration::from_secs(20);
+/// to it: a payment's few requests, one after the other, share one, and
+/// so do the app's rounds, 20 s apart and more, and the steps an owner
+/// takes a minute apart. A new one costs a stream and a TLS handshake over
+/// Tor, a second or two, and to an onion service several.
+const KEPT_FOR: Duration = Duration::from_secs(5 * 60);
+
+/// How long a connection is used at all, since it opened: as long as Tor
+/// gives a circuit new streams (its MaxCircuitDirtiness), so that a
+/// connection kept links no more requests than its circuit would.
+const OLDEST: Duration = Duration::from_secs(10 * 60);
 
 /// The most idle connections kept open at once.
 const MOST_KEPT: usize = 16;
@@ -127,7 +135,7 @@ impl Tor {
             client,
             tls: TlsConnector::from(Arc::new(tls)),
             isolation: Arc::default(),
-            kept: Arc::new(Kept::new(KEPT_FOR)),
+            kept: Arc::new(Kept::new(KEPT_FOR, OLDEST)),
             connecting: Arc::default(),
         })
     }
@@ -171,7 +179,7 @@ impl Tor {
             client: self.client.clone(),
             tls: self.tls.clone(),
             isolation: Arc::default(),
-            kept: Arc::new(Kept::new(KEPT_FOR)),
+            kept: Arc::new(Kept::new(KEPT_FOR, OLDEST)),
             connecting: self.connecting.clone(),
         }
     }
@@ -482,12 +490,15 @@ struct Kept {
     open: Mutex<Vec<(Target, Instant, Open)>>,
     /// How long a connection is kept, idle.
     keep: Duration,
+    /// How long a connection is used, since it opened.
+    oldest: Duration,
 }
 
 /// An HTTP/1.1 connection, its task ended as it is dropped.
 struct Open {
     sender: http1::SendRequest<Full<Bytes>>,
     task: tokio::task::AbortHandle,
+    opened: Instant,
 }
 
 impl Drop for Open {
@@ -523,7 +534,11 @@ impl Open {
             .await
             .map_err(|e| e.to_string())?;
         let task = tokio::spawn(connection).abort_handle();
-        Ok(Self { sender, task })
+        Ok(Self {
+            sender,
+            task,
+            opened: Instant::now(),
+        })
     }
 
     /// `request` on this connection: its answer, with a body of at most
@@ -558,19 +573,22 @@ impl Open {
 }
 
 impl Kept {
-    fn new(keep: Duration) -> Self {
+    fn new(keep: Duration, oldest: Duration) -> Self {
         Self {
             open: Mutex::default(),
             keep,
+            oldest,
         }
     }
 
-    /// The connections kept, those expired or closed let go.
+    /// The connections kept, those expired, too old or closed let go.
     fn kept(&self) -> std::sync::MutexGuard<'_, Vec<(Target, Instant, Open)>> {
         let mut kept = self.open.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
         kept.retain(|(_, at, open)| {
-            now.duration_since(*at) < self.keep && !open.sender.is_closed()
+            now.duration_since(*at) < self.keep
+                && now.duration_since(open.opened) < self.oldest
+                && !open.sender.is_closed()
         });
         kept
     }
@@ -921,7 +939,7 @@ mod tests {
     #[tokio::test]
     async fn a_hosts_requests_share_a_connection_kept_open() {
         let (at, count) = server().await;
-        let kept = Kept::new(KEPT_FOR);
+        let kept = Kept::new(KEPT_FOR, OLDEST);
         let hub = target("hub.example", at.port(), false);
         for _ in 0..3 {
             assert_eq!(
@@ -942,23 +960,28 @@ mod tests {
     async fn a_connection_idle_too_long_or_closed_is_not_used_again() {
         let (at, count) = server().await;
         let hub = target("hub.example", at.port(), false);
-        let expired = Kept::new(Duration::ZERO);
+        let expired = Kept::new(Duration::ZERO, OLDEST);
         get(&expired, at, &hub, "/").await;
         get(&expired, at, &hub, "/").await;
         assert_eq!(taken(&count), 2);
+        // Used as long as Tor gives its circuit new streams, no longer.
+        let old = Kept::new(KEPT_FOR, Duration::ZERO);
+        get(&old, at, &hub, "/").await;
+        get(&old, at, &hub, "/").await;
+        assert_eq!(taken(&count), 4);
 
-        let kept = Kept::new(KEPT_FOR);
+        let kept = Kept::new(KEPT_FOR, OLDEST);
         get(&kept, at, &hub, "/close").await;
         get(&kept, at, &hub, "/").await;
-        assert_eq!(taken(&count), 4);
+        assert_eq!(taken(&count), 6);
         get(&kept, at, &hub, "/").await;
-        assert_eq!(taken(&count), 4);
+        assert_eq!(taken(&count), 6);
     }
 
     #[tokio::test]
     async fn at_most_so_many_connections_are_kept() {
         let (at, count) = server().await;
-        let kept = Kept::new(KEPT_FOR);
+        let kept = Kept::new(KEPT_FOR, OLDEST);
         for i in 0..=MOST_KEPT {
             get(
                 &kept,
