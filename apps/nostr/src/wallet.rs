@@ -32,6 +32,13 @@ const ANSWER_TIMEOUT: Duration = Duration::from_secs(30);
 /// providers the wallet heard from besides [`STRANGERS`].
 const ASKED_AT_ONCE: usize = 32;
 
+/// The most hubs announced asked in one look for them, in an order of its
+/// own: announcing is free, so a flood of announcements, each naming URLs
+/// that never answer, holds a look [`ANSWER_TIMEOUT`] for each
+/// [`ASKED_AT_ONCE`] of these at most. The others are told of as not
+/// answering.
+const HUBS_ASKED: usize = 2 * ASKED_AT_ONCE;
+
 /// How long the swap providers announced, as last found, are used without
 /// looking for them again: well within an announcement's [`LIFETIME`].
 const KEPT_FOR: Duration = Duration::from_secs(30 * 60);
@@ -1015,7 +1022,8 @@ pub async fn hubs_found<T: Transport>(
     let hubs_used = wallet.hubs()?;
     let trusted: HashSet<_> = hubs_used.iter().map(|(_, info)| info.address).collect();
     let ask = |url: String| async move { wallet.hub_info(&url).await };
-    let answering = answering(found.clone(), ask, |i: &Info| i.nostr.as_deref()).await?;
+    let asked = few(found.clone(), HUBS_ASKED);
+    let answering = answering(asked, ask, |i: &Info| i.nostr.as_deref()).await?;
     let mut hubs: Vec<AnnouncedHub> = answering
         .into_iter()
         .filter(|(_, _, info)| !trusted.contains(&info.address))
@@ -1042,6 +1050,27 @@ pub async fn hubs_found<T: Transport>(
         })
         .collect();
     Ok(HubsFound { hubs, silent })
+}
+
+/// `most` of `found` at most, in an order of their own, as found.
+fn few(found: Vec<Found>, most: usize) -> Vec<Found> {
+    if found.len() <= most {
+        return found;
+    }
+    let order = RandomState::new();
+    let mut by: Vec<(u64, usize)> = (found.iter().enumerate())
+        .map(|(i, f)| (order.hash_one(&f.key), i))
+        .collect();
+    by.sort_unstable();
+    let ask: HashSet<usize> = by[..most].iter().map(|(_, i)| *i).collect();
+    tracing::debug!(
+        found = found.len(),
+        "{} hubs announced not asked",
+        found.len() - most
+    );
+    (found.into_iter().enumerate())
+        .filter_map(|(i, f)| ask.contains(&i).then_some(f))
+        .collect()
 }
 
 /// A swap provider announced on Nostr that pays notes out on Bitcoin, and
@@ -1374,6 +1403,22 @@ mod tests {
             keys(&announced.chosen(few.clone(), &HashSet::new())),
             keys(&few)
         );
+    }
+
+    #[test]
+    fn a_flood_of_hubs_announced_is_asked_a_few_of_at_most() {
+        let found: Vec<Found> = (0..3 * HUBS_ASKED)
+            .map(|i| at(i, &format!("https://{i}.test")))
+            .collect();
+        let asked = few(found.clone(), HUBS_ASKED);
+        assert_eq!(asked.len(), HUBS_ASKED);
+        // As found, each once.
+        let at_index = |f: &Found| found.iter().position(|g| g.key == f.key).unwrap();
+        let indices: Vec<usize> = asked.iter().map(at_index).collect();
+        assert!(indices.windows(2).all(|w| w[0] < w[1]), "{indices:?}");
+        // A few: all asked.
+        let some = found[..HUBS_ASKED].to_vec();
+        assert_eq!(few(some.clone(), HUBS_ASKED).len(), some.len());
     }
 
     #[tokio::test(start_paused = true)]
