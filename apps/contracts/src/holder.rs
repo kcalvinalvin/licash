@@ -1820,4 +1820,99 @@ mod tests {
         assert_eq!(fate(&deep).await, Some(Fate::Open));
         assert_eq!(store.fate_block(&id).unwrap(), None);
     }
+
+    /// The chain `from`, become `to` once a block spending a coin is read
+    /// from it: a reorganization in the middle of a scan.
+    struct Reorganizing {
+        from: Fork,
+        to: Fork,
+        moved: std::sync::atomic::AtomicBool,
+    }
+
+    impl Reorganizing {
+        fn now(&self) -> &Fork {
+            match self.moved.load(std::sync::atomic::Ordering::SeqCst) {
+                true => &self.to,
+                false => &self.from,
+            }
+        }
+    }
+
+    impl Blocks for Reorganizing {
+        async fn height(&self) -> Result<u32, String> {
+            self.now().height().await
+        }
+        async fn hash(&self, height: u32) -> Result<BlockHash, String> {
+            self.now().hash(height).await
+        }
+        async fn filter(&self, hash: &BlockHash) -> Result<Option<Vec<u8>>, String> {
+            self.now().filter(hash).await
+        }
+        async fn block(&self, hash: &BlockHash) -> Result<Block, String> {
+            let block = self.now().block(hash).await?;
+            if block.txdata.len() > 1 {
+                self.moved.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            Ok(block)
+        }
+    }
+
+    impl Chain for Reorganizing {
+        async fn checkpoint(&self, _: u32) -> Result<Checkpoint, String> {
+            Err("not asked".into())
+        }
+        async fn broadcast(&self, _: &Transaction) -> Result<(), String> {
+            Err("not asked".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_chain_reorganized_while_scanned_gives_f_no_fate() {
+        let dir = tempfile::tempdir().unwrap();
+        let regtest = ChainProfile::Core30DefaultRegtest;
+        let wallet = Wallet::create(
+            &dir.path().join("wallet.sqlite"),
+            &[7; 32],
+            regtest,
+            Nowhere,
+        )
+        .unwrap();
+        let ctx = licash_contract::opening::Context {
+            tip: 0,
+            trust: crate::trust(regtest).unwrap(),
+        };
+        let bytes = &crate::testing::opened().holder;
+        let holder = Holder::load(bytes, &wallet.contract_secrets().seed, &ctx).unwrap();
+        let f = holder.funding().unwrap().tx.clone();
+        // Another transaction spending F's coins.
+        let mut conflict = f.clone();
+        conflict.lock_time = bitcoin::absolute::LockTime::from_height(1).unwrap();
+        assert_ne!(conflict.compute_txid(), f.compute_txid());
+
+        // Each chain alone: dead on the one, live on the other.
+        let fate_on = |chain: Fork| {
+            let holder = &holder;
+            async move {
+                chain::fate(holder, &chain, 240)
+                    .await
+                    .unwrap()
+                    .map(|(f, _)| f)
+            }
+        };
+        let dead = Fork::new(250, 0, Some((247, &conflict)));
+        assert_eq!(fate_on(dead).await, Some(Fate::Dead));
+        let live = Fork::new(250, 1, Some((247, &f)));
+        assert_eq!(fate_on(live).await, Some(Fate::Live));
+
+        // The conflict read on the one, the rest on the other: no fate of
+        // either, refused, to be looked at again.
+        let chain = Reorganizing {
+            from: Fork::new(250, 0, Some((247, &conflict))),
+            to: Fork::new(250, 1, Some((247, &f))),
+            moved: Default::default(),
+        };
+        let e = chain::fate(&holder, &chain, 240).await.unwrap_err();
+        assert!(chain.moved.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(e.to_string().contains("reorganized"), "{e}");
+    }
 }
