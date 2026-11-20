@@ -120,6 +120,13 @@ pub struct Response {
 }
 
 /// How the wallet reaches its hubs.
+///
+/// A hub, and anyone on the path to one reached over plain HTTP, says what
+/// it answers: an implementation bounds the answers it reads, as it reads
+/// them, refusing one larger than a few MiB, far above any of the wallet's
+/// own (`licash-transport`'s takes 4 MiB), and one of a
+/// [`Transport::download`] larger than its `max`. The wallet holds what it
+/// is given.
 pub trait Transport: Send + Sync {
     /// GET `url`, or POST `body` to it as JSON. `Err` when no answer came,
     /// so that the request may or may not have taken effect.
@@ -131,8 +138,8 @@ pub trait Transport: Send + Sync {
 
     /// GET `url`, an answer far larger than any of the wallet's own: of up
     /// to `max` bytes, given the time a download of it takes. As
-    /// [`Transport::request`] unless the transport bounds such answers
-    /// apart.
+    /// [`Transport::request`], and bounded as it is, unless the transport
+    /// bounds such answers apart.
     fn download(
         &self,
         url: &str,

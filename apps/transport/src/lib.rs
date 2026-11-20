@@ -410,6 +410,42 @@ mod tests {
         assert!(sending(LARGE_BODY + 1).unwrap() > ANSWER_TIMEOUT);
     }
 
+    /// A server at a local port answering every request with `len` bytes,
+    /// as fast as they are read.
+    fn answering(len: usize) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let _ = stream.read(&mut [0; 4096]);
+                let head = format!("HTTP/1.1 200 OK\r\ncontent-length: {len}\r\n\r\n");
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(&vec![b'0'; len]);
+            }
+        });
+        url
+    }
+
+    /// Whatever a hub, or anyone on the path to it, answers, a wallet holds
+    /// at most [`MAX_ANSWER`] bytes of it, and a download at most its own.
+    #[tokio::test]
+    async fn an_answer_too_large_is_refused_before_it_is_held() {
+        let http = Http::new(None).unwrap();
+        let url = answering(MAX_ANSWER);
+        let answer = http.request(&url, None).await.unwrap();
+        assert_eq!(answer.body.len(), MAX_ANSWER);
+        let url = answering(MAX_ANSWER + 1);
+        let refused = http.request(&url, None).await.unwrap_err();
+        assert!(refused.contains("an answer over"), "{refused}");
+        let refused = http.request(&url, Some(b"{}".to_vec())).await.unwrap_err();
+        assert!(refused.contains("an answer over"), "{refused}");
+        let url = answering(1001);
+        let refused = http.download(&url, 1000).await.unwrap_err();
+        assert!(refused.contains("an answer over 1000 bytes"), "{refused}");
+    }
+
     #[test]
     fn a_direct_transport_takes_no_onion_service() {
         let http = Http::new(None).unwrap();

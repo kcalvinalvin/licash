@@ -14,6 +14,9 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 futures-util = { version = "0.3", default-features = false, features = ["alloc"], optional = true }
 licash-tor = { workspace = true, optional = true }
 
+[dev-dependencies]
+tokio.workspace = true
+
 [target.'cfg(target_os = "android")'.dependencies]
 webpki-roots = "1"
 

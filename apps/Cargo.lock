@@ -3711,6 +3711,7 @@ dependencies = [
  "licash-wallet",
  "reqwest",
  "rustls",
+ "tokio",
  "tracing",
  "webpki-roots 1.0.12",
 ]
