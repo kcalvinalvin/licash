@@ -2169,9 +2169,53 @@ fn a_phone_pays_a_hub_charging_more_than_its_contract_opened_under_once_approved
     assert_eq!(paid.amount, 500);
     assert_eq!(notes(&alice), held - 501);
     drop(alice);
-    let alice = Wallet::open(dir, None).unwrap();
+    let alice = Wallet::open(dir.clone(), None).unwrap();
     assert!(alice.fees_raised().unwrap().is_empty());
     let asked = bob.payment_code(Some(100)).unwrap();
+    assert_eq!(alice.pay(asked.qr, None).unwrap().amount, 100);
+    drop(alice);
+
+    // Her contracts unreadable: what they agreed unknown, a hub charging
+    // anything is paid nothing, and shown so.
+    let db = rusqlite::Connection::open(format!("{dir}/wallet.sqlite")).unwrap();
+    let version = |v: i64| {
+        db.execute(
+            "UPDATE schema_versions SET version = ?1 WHERE component = 'contracts'",
+            [v],
+        )
+        .unwrap()
+    };
+    let kept: i64 = db
+        .query_row(
+            "SELECT version FROM schema_versions WHERE component = 'contracts'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    version(kept + 1);
+    let alice = Wallet::open(dir.clone(), None).unwrap();
+    let nothing = Fees {
+        spend: Rate { base: 0, ppm: 0 },
+        lock: Rate { base: 0, ppm: 0 },
+        refund: Rate { base: 0, ppm: 0 },
+        output_msat: 0,
+    };
+    let raised = vec![FeesRaised {
+        hub: hub.url.clone(),
+        charged,
+        agreed: nothing,
+    }];
+    assert_eq!(alice.fees_raised().unwrap(), raised);
+    let asked = bob.payment_code(Some(100)).unwrap();
+    let refused = alice.pay(asked.qr.clone(), None).unwrap_err();
+    assert!(
+        matches!(refused, LicashError::FeesRaised { .. }),
+        "{refused:?}"
+    );
+    drop(alice);
+    // Readable again: paid.
+    version(kept);
+    let alice = Wallet::open(dir, None).unwrap();
     assert_eq!(alice.pay(asked.qr, None).unwrap().amount, 100);
 }
 

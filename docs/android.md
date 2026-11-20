@@ -154,7 +154,8 @@ its block-dn server, the block explorer transactions link to, the most the
 app pays, on its own, to renew notes a hub that restarted no longer unlinks
 (1000 parts per million of them unless set, or a spending schedule of at
 most 1 sat base, that rate and 0.1 sat per output; live contract ceilings
-take precedence, under Privacy), the notes of
+take precedence, and contracts that cannot be read hold every hub to no fee
+until they can, under Privacy), the notes of
 each denomination, and how each payment was made: its transactions, block
 heights and providers.
 

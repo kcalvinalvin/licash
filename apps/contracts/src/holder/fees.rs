@@ -87,13 +87,25 @@ pub fn abusive(fees: &Fees, range: Option<&ContractRange>) -> Option<String> {
 /// were opened before any were kept: nothing is refused there. Its locks
 /// kept claimable as [`super::exit::guard_locks`] says. To call as
 /// the wallet opens, and whenever its contracts changed ([`super::resume`]
-/// and [`approve`] do).
+/// and [`approve`] do). Contracts that cannot be read hold each hub to no
+/// fee at all, until they can: what they agreed is unknown, and a hub
+/// charging anything is paid nothing meanwhile.
 pub fn agree<T: Transport>(wallet: &Wallet<T>, wallet_file: &Path, tip: Option<u32>) -> Result<()> {
     // Its locks too: what keeps them claimable reads the contracts afresh.
     super::exit::guard_locks(wallet, wallet_file);
-    let (contracts, ceilings) = match Store::existing(wallet_file)? {
-        Some(store) => (store.list()?, store.ceilings()?),
-        None => return Ok(()),
+    let read = Store::existing(wallet_file).and_then(|store| match store {
+        Some(store) => Ok(Some((store.list()?, store.ceilings()?))),
+        None => Ok(None),
+    });
+    let (contracts, ceilings) = match read {
+        Ok(Some(read)) => read,
+        Ok(None) => return Ok(()),
+        Err(e) => {
+            for (url, _) in wallet.hubs()? {
+                wallet.set_fee_ceilings(&url, Some(Fees::default()))?;
+            }
+            return Err(e);
+        }
     };
     for (url, _) in wallet.hubs()? {
         let urls = wallet.hub_urls(&url)?;

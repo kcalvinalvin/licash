@@ -57,7 +57,7 @@ impl Wallet {
 impl Wallet {
     /// Hold each hub to the fees the wallet's contracts there opened
     /// under, or approved since: as the wallet opens. Contracts that
-    /// cannot be read hold no hub to any, as none do.
+    /// cannot be read hold every hub to none at all, until they can.
     pub(super) fn agree_fees(&self) {
         if let Err(e) = holder::fees::agree(&self.wallet, self.wallet.path(), self.known_tip()) {
             tracing::warn!("what the contracts' hubs may charge: {e:#}");
