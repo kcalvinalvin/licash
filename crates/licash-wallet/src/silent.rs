@@ -243,11 +243,55 @@ fn give_up(t: &Sql<'_>, txid: &Txid) -> Result<usize, Error> {
         "UPDATE silent_coins SET spent_by = NULL WHERE spent_by = ?1 AND spent_height IS NULL",
         [txid.to_byte_array()],
     )?;
+    // The spends of its coins it took the place of, given up with it: else
+    // the latest of them takes them again once looked in again.
+    let replaced = replaced_by(t, txid)?;
+    for old in &replaced {
+        t.execute("DELETE FROM silent_spends WHERE txid = ?1", [old])?;
+    }
     let known = t.execute(
         "DELETE FROM silent_spends WHERE txid = ?1",
         [txid.to_byte_array()],
     )?;
     Ok(freed.max(known))
+}
+
+/// The wallet's spends made before its spend `txid` of any coin it spends,
+/// in [`pending_inputs`]' order: those it took the place of, but for those
+/// in a block.
+fn replaced_by(t: &Sql<'_>, txid: &Txid) -> Result<Vec<[u8; 32]>, Error> {
+    let mut stmt = t.prepare(
+        "SELECT o.txid, o.tx FROM silent_spends o, silent_spends n
+         WHERE n.txid = ?1 AND o.txid != n.txid
+           AND (o.created_at < n.created_at
+                OR (o.created_at = n.created_at AND o.rowid < n.rowid))
+           AND NOT EXISTS (SELECT 1 FROM silent_coins c
+                           WHERE c.spent_by = o.txid AND c.spent_height IS NOT NULL)",
+    )?;
+    let rows = stmt.query_map([txid.to_byte_array()], |r| {
+        Ok((r.get::<_, [u8; 32]>(0)?, r.get::<_, Vec<u8>>(1)?))
+    })?;
+    let raw = rows.collect::<Result<Vec<_>, _>>()?;
+    let Some(new) = t
+        .query_row(
+            "SELECT tx FROM silent_spends WHERE txid = ?1",
+            [txid.to_byte_array()],
+            |r| r.get::<_, Vec<u8>>(0),
+        )
+        .optional()?
+    else {
+        return Ok(Vec::new());
+    };
+    let new: Transaction = bitcoin::consensus::deserialize(&new).map_err(invalid)?;
+    let spends: HashSet<OutPoint> = new.input.iter().map(|i| i.previous_output).collect();
+    let mut replaced = Vec::new();
+    for (old, tx) in raw {
+        let tx: Transaction = bitcoin::consensus::deserialize(&tx).map_err(invalid)?;
+        if tx.input.iter().any(|i| spends.contains(&i.previous_output)) {
+            replaced.push(old);
+        }
+    }
+    Ok(replaced)
 }
 
 /// The coins the wallet's own spends take, by the spend: the latest of

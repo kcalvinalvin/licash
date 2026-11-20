@@ -1117,6 +1117,48 @@ fn a_wallets_contract_secrets_are_its_own_and_its_spending_roots() {
     assert_eq!(format!("{a:?}"), "ContractSecrets(..)");
 }
 
+/// A spend given up takes those it took the place of with it: none comes
+/// back once looked in again. One it took the place of, given up, leaves
+/// it.
+#[tokio::test]
+async fn a_replacement_given_up_takes_what_it_replaced_with_it() {
+    let s = setup().await;
+    s.wallet.watch_silent(HUB, 1).unwrap();
+    let paying = s.pay(&[s.address()], &[20_000]);
+    s.mine(vec![paying]);
+    s.scan().await.unwrap();
+    let free = |s: &Setup| {
+        s.wallet
+            .silent_coins()
+            .unwrap()
+            .iter()
+            .all(|c| c.spending.is_none())
+    };
+    let spend = s
+        .wallet
+        .spend_silent(elsewhere(), Some(5_000), rate())
+        .unwrap();
+    let at = |sat| FeeRate::from_sat_per_vb(sat).unwrap();
+    let bumped = s.wallet.bump_silent(&spend.compute_txid(), at(10)).unwrap();
+    s.wallet.abandon_silent(&spend.compute_txid()).unwrap();
+    assert_eq!(
+        s.wallet.silent_spends().unwrap(),
+        std::slice::from_ref(&bumped)
+    );
+    let canceled = s
+        .wallet
+        .replace_silent(&bumped.compute_txid(), at(20))
+        .unwrap();
+    s.wallet.abandon_silent(&canceled.compute_txid()).unwrap();
+    assert!(free(&s));
+    // Looked in again from the first block: still free, nothing to send.
+    s.wallet.watch_silent(HUB, 1).unwrap();
+    s.scan().await.unwrap();
+    assert!(free(&s));
+    assert!(s.wallet.silent_spends().unwrap().is_empty());
+    assert_eq!(s.wallet.silent_spend(&bumped.compute_txid()).unwrap(), None);
+}
+
 #[tokio::test]
 async fn a_spend_a_block_conflicts_with_is_given_up() {
     let s = setup().await;
