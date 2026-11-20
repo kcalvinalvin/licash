@@ -300,6 +300,9 @@ impl Target {
     }
 }
 
+/// The most of a failed answer read, to say why it failed.
+const ERROR_BODY: usize = 4096;
+
 async fn check(request: RequestBuilder) -> anyhow::Result<()> {
     // Errors name the URL, which holds the token.
     let response = request.send().await.map_err(|e| {
@@ -312,9 +315,20 @@ async fn check(request: RequestBuilder) -> anyhow::Result<()> {
         }
         anyhow!(text)
     })?;
+    let mut response = response;
     let status = response.status();
     if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
+        // What it says of the failure, the first of it only: a target may
+        // answer without end.
+        let mut said = Vec::new();
+        while said.len() < ERROR_BODY {
+            match response.chunk().await {
+                Ok(Some(chunk)) => said.extend_from_slice(&chunk),
+                _ => break,
+            }
+        }
+        said.truncate(ERROR_BODY);
+        let body = String::from_utf8_lossy(&said);
         bail!(
             "answered {status}: {}",
             body.chars().take(200).collect::<String>()
@@ -865,5 +879,29 @@ mod tests {
         );
         assert!(!e.contains("SecretPart"), "{e}");
         assert!(e.to_lowercase().contains("connect"), "{e}");
+    }
+
+    /// A failure answered without end: its first bytes read, no more.
+    #[tokio::test]
+    async fn a_failure_answered_without_end_is_read_in_part() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            let _ = stream.read(&mut request).await;
+            let head = "HTTP/1.1 500 Internal Server Error\r\nTransfer-Encoding: chunked\r\n\r\n";
+            stream.write_all(head.as_bytes()).await.unwrap();
+            let chunk = format!("{:x}\r\n{}\r\n", 1 << 16, "x".repeat(1 << 16));
+            while stream.write_all(chunk.as_bytes()).await.is_ok() {}
+        });
+        let client = crate::client().unwrap();
+        let t = target(&format!("gotify://{addr}/AppToken"));
+        let low = message(Priority::Low);
+        let sent = t.send(&client, &low);
+        let sent = tokio::time::timeout(std::time::Duration::from_secs(10), sent).await;
+        let e = format!("{:#}", sent.expect("not read without end").unwrap_err());
+        assert!(e.contains("500") && e.contains("xxx"), "{e}");
     }
 }
