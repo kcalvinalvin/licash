@@ -202,6 +202,9 @@ async fn rpc(
         },
         "estimatesmartfee" => match params[0].as_u64() {
             Some(target @ 1..=144) => rpc_reply(json!({"feerate": 0.00012, "blocks": target})),
+            // No fee, and one past any fee market.
+            Some(200) => rpc_reply(json!({"feerate": -1, "blocks": 200})),
+            Some(300) => rpc_reply(json!({"feerate": 0.0101, "blocks": 300})),
             _ => {
                 rpc_reply(json!({"errors": ["Insufficient data or no feerate found"], "blocks": 0}))
             }
@@ -355,7 +358,8 @@ async fn esplora_package(
 }
 
 async fn esplora_fees() -> Json<Value> {
-    Json(json!({"1": 20.5, "6": 12.0, "144": 1.0}))
+    // Past the tests' others: none, then one past any fee market.
+    Json(json!({"1": 20.5, "6": 12.0, "144": 1.0, "2000": 0.0, "3000": 1010.0}))
 }
 
 async fn esplora_utxo(State(chain): State<Arc<Chain>>, Path(address): Path<String>) -> Response {
@@ -624,6 +628,19 @@ async fn both_broadcast_estimate_fees_and_find_what_pays_an_address() {
         esplora.fee_rate(1000).await.unwrap(),
         Some(FeeRate::from_sat_per_kwu(250))
     );
+    // An estimate of no fee is none, one past any fee market refused.
+    assert_eq!(node.fee_rate(200).await.unwrap(), None);
+    assert_eq!(
+        esplora.fee_rate(2000).await.unwrap(),
+        Some(FeeRate::from_sat_per_kwu(250))
+    );
+    for (source, blocks) in [(&node, 300), (&esplora, 3000)] {
+        let refused = source.fee_rate(blocks).await.unwrap_err();
+        assert!(
+            format!("{refused:#}").contains("above 1000 sat/vB"),
+            "{refused:#}"
+        );
+    }
 
     // A spend of the tip's coinbase, paying the address of many outputs.
     let spend = Transaction {

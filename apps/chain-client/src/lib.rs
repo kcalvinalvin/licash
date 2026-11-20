@@ -162,6 +162,10 @@ fn known(refusal: &str) -> bool {
 /// Transactions per page of an Esplora block's.
 const ESPLORA_PAGE: usize = 25;
 
+/// The most a fee rate estimated is believed: 1,000 sat/vB, above any
+/// fee market Bitcoin has known.
+pub const MAX_FEE_RATE: FeeRate = FeeRate::from_sat_per_vb_u32(1_000);
+
 fn client() -> anyhow::Result<reqwest::Client> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     Ok(reqwest::Client::builder()
@@ -505,12 +509,29 @@ impl Source {
 
     /// The fee rate the source estimates confirms a transaction within
     /// `blocks`: None while it has no estimate, as on a chain of few
-    /// transactions.
+    /// transactions, or one of no fee, or not a number. An estimate above
+    /// [`MAX_FEE_RATE`] is refused: no source sane says so.
     pub async fn fee_rate(&self, blocks: u16) -> anyhow::Result<Option<FeeRate>> {
-        // From satoshis per thousand virtual bytes, rounded up.
+        let rate = self.estimate(blocks).await?;
+        if let Some(rate) = rate.filter(|r| *r > MAX_FEE_RATE) {
+            anyhow::bail!(
+                "{self}: an estimate of {} sat/vB, above {} sat/vB",
+                rate.to_sat_per_vb_ceil(),
+                MAX_FEE_RATE.to_sat_per_vb_ceil()
+            );
+        }
+        Ok(rate)
+    }
+
+    /// [`Source::fee_rate`], unbounded above.
+    async fn estimate(&self, blocks: u16) -> anyhow::Result<Option<FeeRate>> {
+        // From satoshis per thousand virtual bytes, rounded up: none of no
+        // fee or not a number, as Core's -1 of none.
         let rate = |sat_per_kvb: f64| {
-            let sat_per_kvb = sat_per_kvb.round() as u64;
-            FeeRate::from_sat_per_kwu(sat_per_kvb.div_ceil(4))
+            (sat_per_kvb.is_finite() && sat_per_kvb > 0.0).then(|| {
+                let sat_per_kvb = sat_per_kvb.round().max(1.0) as u64;
+                FeeRate::from_sat_per_kwu(sat_per_kvb.div_ceil(4))
+            })
         };
         match &self.kind {
             Kind::Rpc { .. } => {
@@ -520,7 +541,7 @@ impl Source {
                     feerate: Option<f64>,
                 }
                 let estimate: Estimate = self.call("estimatesmartfee", json!([blocks])).await?;
-                Ok(estimate.feerate.map(|btc| rate(btc * 1e8)))
+                Ok(estimate.feerate.and_then(|btc| rate(btc * 1e8)))
             }
             Kind::Esplora { base } => {
                 let url = format!("{base}/fee-estimates");
@@ -531,22 +552,19 @@ impl Source {
                     .await
                     .map_err(|e| anyhow::anyhow!("{self}: {}", e.without_url()))?;
                 if response.status() == reqwest::StatusCode::NOT_FOUND {
-                    return self
-                        .recommended(base, blocks)
-                        .await
-                        .map(|r| Some(rate(r * 1e3)));
+                    return self.recommended(base, blocks).await.map(|r| rate(r * 1e3));
                 }
                 let status = response.status();
                 ensure!(status.is_success(), "{self}: {url}: HTTP {status}");
                 let estimates: HashMap<String, f64> = response.json().await?;
-                let mut estimates: Vec<(u16, f64)> = estimates
+                let mut estimates: Vec<(u16, FeeRate)> = estimates
                     .into_iter()
-                    .filter_map(|(target, r)| Some((target.parse().ok()?, r)))
+                    .filter_map(|(target, r)| Some((target.parse().ok()?, rate(r * 1e3)?)))
                     .collect();
                 estimates.sort_by_key(|(target, _)| *target);
                 // The latest within `blocks`, else the soonest.
                 let within = estimates.iter().rev().find(|(target, _)| *target <= blocks);
-                Ok(within.or(estimates.first()).map(|(_, r)| rate(r * 1e3)))
+                Ok(within.or(estimates.first()).map(|(_, r)| *r))
             }
         }
     }
