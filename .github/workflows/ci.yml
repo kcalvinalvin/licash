@@ -245,12 +245,12 @@ jobs:
         with:
           workspaces: licash/regtest
       - working-directory: licash
-        run: cargo fmt --manifest-path regtest/Cargo.toml -p licash-chain -p licash-contract -p licash-hp -- --check
+        run: cargo fmt --manifest-path regtest/Cargo.toml -p licash-chain -p licash-contract -p licash-hp -p licash-statement -- --check
       - working-directory: licash
         run: cargo clippy --locked --manifest-path regtest/Cargo.toml --workspace --all-targets --no-deps -- -D warnings
       - name: The contract's opening messages
         working-directory: licash
-        run: cargo test --release --locked --manifest-path regtest/Cargo.toml -p licash-chain -p licash-contract -p licash-hp
+        run: cargo test --release --locked --manifest-path regtest/Cargo.toml -p licash-chain -p licash-contract -p licash-hp -p licash-statement
       - name: Contracts on Bitcoin Core regtest (mock proofs)
         working-directory: licash
         run: regtest/run.sh
