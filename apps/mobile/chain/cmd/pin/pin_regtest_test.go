@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 func core(t *testing.T) *rpc {
@@ -104,5 +105,52 @@ func TestRegtestAPinIsMadeFromCoreAndTheSameServer(t *testing.T) {
 	broken = true
 	if err := sameAsServer(server.URL, files); err == nil {
 		t.Fatal("a server of other bytes agreed with")
+	}
+}
+
+// Without Core's RPC: the files from what Core serves a light client as a
+// peer, the pinned hash the one a (fake) Esplora server tells.
+func TestRegtestAPinIsMadeFromPeersAndAnEsploraServer(t *testing.T) {
+	c := core(t)
+	p2p := os.Getenv("LICASH_BITCOIND_P2P")
+	if p2p == "" {
+		t.Skip("regtest.sh sets LICASH_BITCOIND_P2P")
+	}
+	poll = 200 * time.Millisecond
+	params, _, _ := paramsOf("regtest")
+	fromRPC, err := fromCore(c, params, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lie := false
+	esplora := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var count int64
+		_ = c.call("getblockcount", nil, &count)
+		switch {
+		case r.URL.Path == "/blocks/tip/height":
+			fmt.Fprint(w, count)
+		case strings.HasPrefix(r.URL.Path, "/block-height/"):
+			h, _ := strconv.Atoi(strings.TrimPrefix(r.URL.Path, "/block-height/"))
+			var hash string
+			_ = c.call("getblockhash", []any{h}, &hash)
+			if lie {
+				hash = strings.Repeat("0", 64)
+			}
+			fmt.Fprint(w, hash)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer esplora.Close()
+	files, err := fromPeers(params, esplora.URL, -1, []string{p2p})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if files.pin != fromRPC.pin || !bytes.Equal(files.blocks, fromRPC.blocks) || !bytes.Equal(files.filters, fromRPC.filters) {
+		t.Fatalf("peers' pin %+v, Core's %+v", files.pin, fromRPC.pin)
+	}
+	lie = true
+	if _, err := fromPeers(params, esplora.URL, -1, []string{p2p}); err == nil {
+		t.Fatal("pinned a block the Esplora server does not know")
 	}
 }

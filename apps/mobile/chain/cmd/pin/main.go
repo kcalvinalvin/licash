@@ -4,13 +4,19 @@
 //	go run ./cmd/pin -network bitcoin -rpc http://127.0.0.1:8332 \
 //	    -cookie ~/.bitcoin/.cookie > mobile/pin_bitcoin.go
 //
+// or, without Core, from the network's peers and an Esplora server:
+//
+//	go run ./cmd/pin -network bitcoin \
+//	    -esplora https://esplora.example/api > mobile/pin_bitcoin.go
+//
 // Core must be out of its initial download with its basic block filter
 // index synced (-blockfilterindex=1). The pinned block is at least 1000
 // deep, at a multiple of 1000. Both import files, of block headers and of
 // filter headers, are made from Core alone, every entry from genesis to
-// the block, then the CDN's are downloaded and must be the same bytes, and
-// the files are imported into an empty store as the app would: no file is
-// written unless all of it holds.
+// the block, or from what peers serve a light client (fromPeers); then the
+// CDN's are downloaded and must be the same bytes, and the files are
+// imported into an empty store as the app would: no file is written
+// unless all of it holds.
 package main
 
 import (
@@ -47,15 +53,16 @@ func main() {
 	cookie := flag.String("cookie", "", "Core's .cookie file, or set -user")
 	user := flag.String("user", "", "RPC user:password, if no cookie")
 	cdn := flag.String("cdn", "", "block-dn server to compare with (the network's by default)")
+	esplora := flag.String("esplora", "", "without Core: an Esplora API telling the chain, such as https://esplora.example/api")
 	height := flag.Int64("height", -1, "the block to pin (by default the deepest multiple of 1000, at least 1000 deep)")
 	flag.Parse()
-	if err := run(*network, *rpc, *cookie, *user, *cdn, *height, os.Stdout); err != nil {
+	if err := run(*network, *rpc, *cookie, *user, *esplora, *cdn, *height, os.Stdout); err != nil {
 		fmt.Fprintln(os.Stderr, "pin:", err)
 		os.Exit(1)
 	}
 }
 
-func run(network, rpcURL, cookie, user, server string, height int64, out io.Writer) error {
+func run(network, rpcURL, cookie, user, esplora, server string, height int64, out io.Writer) error {
 	params, defaultCDN, err := paramsOf(network)
 	if err != nil {
 		return err
@@ -71,12 +78,19 @@ func run(network, rpcURL, cookie, user, server string, height int64, out io.Writ
 		}
 		auth = strings.TrimSpace(string(b))
 	}
-	core := &rpc{url: rpcURL, auth: auth}
-	files, err := fromCore(core, params, height)
+	var files *importFiles
+	switch {
+	case (rpcURL == "") == (esplora == ""):
+		return errors.New("-rpc or -esplora, one of them")
+	case esplora != "":
+		files, err = fromPeers(params, esplora, height, nil)
+	default:
+		files, err = fromCore(&rpc{url: rpcURL, auth: auth}, params, height)
+	}
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(os.Stderr, "pin: block %d %s from Core\n", files.pin.Height, files.pin.Block)
+	fmt.Fprintf(os.Stderr, "pin: block %d %s\n", files.pin.Height, files.pin.Block)
 	if err := sameAsServer(server, files); err != nil {
 		return err
 	}
@@ -288,8 +302,9 @@ import (
 )
 
 func init() {
-	// Block {{.Height}} of {{.Network}}, its import files made from Bitcoin
-	// Core and the same as block-dn's.
+	// Block {{.Height}} of {{.Network}}, its import files made apart from
+	// block-dn (from Bitcoin Core, or from peers and an Esplora server) and
+	// the same as block-dn's.
 	{{.Network}}Pin = &node.Pin{
 		Height:        {{.Height}},
 		Block:         {{.Block}},
