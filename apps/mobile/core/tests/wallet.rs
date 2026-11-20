@@ -348,6 +348,9 @@ struct Light {
     accepted_error: AtomicBool,
     /// Added to the times blocks claim.
     skew: AtomicI64,
+    /// The heights it says, in turn, in place of its chain's: the last
+    /// for good. Its chain's if none.
+    heights: Mutex<Vec<u32>>,
 }
 
 impl Light {
@@ -358,6 +361,7 @@ impl Light {
             failing: AtomicBool::new(false),
             accepted_error: AtomicBool::new(false),
             skew: AtomicI64::new(0),
+            heights: Mutex::default(),
         })
     }
 
@@ -378,7 +382,12 @@ impl Light {
 
 impl ChainSource for Light {
     fn height(&self) -> Result<u32, ChainError> {
-        Ok(self.backend.lock().unwrap().chain.height())
+        let mut heights = self.heights.lock().unwrap();
+        match heights.len() {
+            0 => Ok(self.backend.lock().unwrap().chain.height()),
+            1 => Ok(heights[0]),
+            _ => Ok(heights.remove(0)),
+        }
     }
 
     fn hash(&self, height: u32) -> Result<Vec<u8>, ChainError> {
@@ -882,7 +891,24 @@ fn a_phone_counts_what_cold_storage_holds_and_withdraws_to_a_new_address() {
     );
     assert_eq!(looked.scanned, Some(net.height()));
     assert_ne!(looked.next, cold.next);
-    assert_eq!(alice.cold().unwrap(), Some(looked));
+    assert_eq!(alice.cold().unwrap(), Some(looked.clone()));
+    // Said to be blocks on, then behind what was looked in: not looked in
+    // until it gets there, never waited on.
+    let at = net.height();
+    net.mine(5, vec![]);
+    *light.heights.lock().unwrap() = vec![at + 5, at - 1];
+    let (phone, chain) = (alice.clone(), light.clone());
+    let (done, ran) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = done.send(phone.run_cold(chain).unwrap().unwrap());
+    });
+    let behind = ran
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("not looked in without end");
+    assert_eq!(behind.scanned, Some(at));
+    light.heights.lock().unwrap().clear();
+    let caught_up = alice.run_cold(light.clone()).unwrap().unwrap();
+    assert_eq!(caught_up.scanned, Some(at + 5));
     alice.clear_cold().unwrap();
     assert_eq!(alice.cold().unwrap(), None);
     assert_eq!(alice.run_cold(light).unwrap(), None);

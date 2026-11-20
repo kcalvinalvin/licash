@@ -137,14 +137,18 @@ pub async fn run(
     Ok(())
 }
 
-/// Look for cold storage's coins up to the chain's height.
+/// Look for cold storage's coins up to the chain's height, as long as
+/// each look gets further.
 async fn scan(wallet: &Wallet<Http>, source: &Source) -> anyhow::Result<Option<Cold>> {
     let blocks = onchain::Blocks(source.clone());
     let tip = blocks.height().await.map_err(anyhow::Error::msg)?;
+    let mut before = None;
     loop {
         let cold = wallet.scan_cold(&blocks, BATCH).await?;
         match &cold {
-            Some(c) if c.scanned.is_some_and(|s| s < tip) => continue,
+            Some(c) if c.scanned.is_some_and(|s| s < tip) && c.scanned != before => {
+                before = c.scanned;
+            }
             _ => return Ok(cold),
         }
     }

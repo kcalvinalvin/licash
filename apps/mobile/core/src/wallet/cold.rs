@@ -105,12 +105,17 @@ impl Wallet {
             .runtime
             .block_on(licash_wallet::Blocks::height(&chain))
             .map_err(|reason| LicashError::Unavailable { reason })?;
+        // As long as each look gets further: a chain behind its tip
+        // meanwhile is looked in next time.
+        let mut before = None;
         let cold = loop {
             let cold = self
                 .runtime
                 .block_on(self.wallet.scan_cold(&chain, BATCH))?;
             match &cold {
-                Some(c) if c.scanned.is_some_and(|s| s < tip) => continue,
+                Some(c) if c.scanned.is_some_and(|s| s < tip) && c.scanned != before => {
+                    before = c.scanned;
+                }
                 _ => break cold,
             }
         };
