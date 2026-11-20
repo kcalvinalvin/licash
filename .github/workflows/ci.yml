@@ -412,7 +412,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          gh release delete main-build --cleanup-tag --yes 2>/dev/null || true
-          gh release create main-build --prerelease --target "$GITHUB_SHA" --title "main (rolling)" \
-            --notes "Built from $GITHUB_SHA on main, once CI passed. Replaced on each push to main." \
-            "$APK" SHA256SUMS
+          # Replace the assets of the release in place, so the download link
+          # never 404s between a delete and a create.
+          notes="Built from $GITHUB_SHA on main, once CI passed. Replaced on each push to main."
+          if gh release view main-build >/dev/null 2>&1; then
+            gh release upload main-build "$APK" SHA256SUMS --clobber
+            gh api -X PATCH "repos/$GH_REPO/git/refs/tags/main-build" -f sha="$GITHUB_SHA" -F force=true >/dev/null
+            gh release edit main-build --notes "$notes"
+          else
+            gh release create main-build --prerelease --target "$GITHUB_SHA" --title "main (rolling)" \
+              --notes "$notes" "$APK" SHA256SUMS
+          fi
