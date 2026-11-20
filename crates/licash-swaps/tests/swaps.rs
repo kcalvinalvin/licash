@@ -1009,7 +1009,7 @@ async fn a_provider_claims_the_clients_lock_in_its_last_blocks_the_preimage_out_
 
 #[tokio::test]
 async fn a_client_reveals_nothing_for_a_lock_that_does_not_pay_it_the_swap() {
-    for lie in 0..4 {
+    for lie in 0..5 {
         let eco = Eco::new(200).await;
         let provider = eco.provider();
         let payer = provider.wallet();
@@ -1029,6 +1029,13 @@ async fn a_client_reveals_nothing_for_a_lock_that_does_not_pay_it_the_swap() {
                 payer.lock(B, &payer.address(), 20, hash, Some(14)).await,
                 "nothing",
             ),
+            // The swap, but expiring too soon to claim: a provider's lock is
+            // claimed only with the blocks left that a claim needs.
+            3 => {
+                let height = eco.net.view(B).height();
+                let lock = payer.lock(B, &me, 20, hash, Some(height + 2)).await;
+                (lock, "too late to claim")
+            }
             _ => (Err(Error::PaysNothing), "does not hold"),
         };
         let lock = lock.map_or("00".repeat(32), |l| l.id);
@@ -1037,7 +1044,8 @@ async fn a_client_reveals_nothing_for_a_lock_that_does_not_pay_it_the_swap() {
             matches!(&lied.state, SwapState::Failed(reason) if reason.contains(why)),
             "{lied:?}"
         );
-        assert_eq!(lied.theirs, None);
+        // Only a lock that pays the swap is taken as the provider's.
+        assert_eq!(lied.theirs.is_some(), lie == 3);
 
         // No preimage was revealed: every lock is refunded once expired.
         assert!(payer
