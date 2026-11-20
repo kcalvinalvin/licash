@@ -138,6 +138,7 @@ pub struct Mailbox {
     done: Mutex<Done>,
     /// The payments the last look returned, not [`Mailbox::done`] since:
     /// returned again by the next, whether the relays are asked or not.
+    /// The newest [`MAX_MAIL`] at most ([`keep_newest`]).
     returned: Mutex<BTreeSet<Event>>,
     /// What the relays pushed since the last look, and which push.
     pushed: Arc<Mutex<Pushed>>,
@@ -275,6 +276,7 @@ impl Mailbox {
                 }
             }
         }
+        keep_newest(&mut returned);
         mail.sort_by(|a, b| a.at.cmp(&b.at).then_with(|| a.id.cmp(&b.id)));
         Ok(mail)
     }
@@ -335,6 +337,16 @@ impl Mailbox {
     }
 }
 
+/// The newest [`MAX_MAIL`] of `returned`: anyone may gift wrap to a
+/// mailbox a payment that is never taken. One forgotten is returned
+/// again only as the relays still hold it, not done with.
+fn keep_newest(returned: &mut BTreeSet<Event>) {
+    // Newest first, as nostr orders events.
+    while returned.len() > MAX_MAIL {
+        returned.pop_last();
+    }
+}
+
 fn connected(relay: &Relay) -> bool {
     relay.status() == RelayStatus::Connected
 }
@@ -385,6 +397,22 @@ mod tests {
         pushed.take(wrap(MAX_PUSHED));
         assert_eq!(pushed.events.len(), MAX_PUSHED);
         assert!(pushed.asked.is_none(), "the relays asked for all next");
+    }
+
+    #[test]
+    fn the_payments_returned_again_are_the_newest_only() {
+        let keys = Keys::generate();
+        let wrap = |n: u64| {
+            EventBuilder::new(Kind::GiftWrap, n.to_string())
+                .custom_created_at(nostr_sdk::prelude::Timestamp::from(1_000 + n))
+                .finalize(&keys)
+                .unwrap()
+        };
+        let mut returned: BTreeSet<Event> = (0..MAX_MAIL as u64 + 3).map(wrap).collect();
+        keep_newest(&mut returned);
+        assert_eq!(returned.len(), MAX_MAIL);
+        let oldest = returned.iter().map(|e| e.created_at.as_secs()).min();
+        assert_eq!(oldest, Some(1_003));
     }
 
     #[test]
