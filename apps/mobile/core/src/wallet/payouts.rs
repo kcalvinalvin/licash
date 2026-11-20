@@ -57,6 +57,7 @@ impl Wallet {
         amount: Option<u64>,
         hub: Option<String>,
     ) -> Result<PayoutQuote, LicashError> {
+        let _timed = crate::log::timed("payout_quote");
         let (asked, found) = self.payout_found(&address, amount, hub)?;
         let Some(best) = found.into_iter().next() else {
             return Err(no_provider(asked.first));
@@ -73,6 +74,7 @@ impl Wallet {
         amount: Option<u64>,
         hub: Option<String>,
     ) -> Result<Vec<PayoutQuote>, LicashError> {
+        let _timed = crate::log::timed("payout_offers");
         let (asked, found) = self.payout_found(&address, amount, hub)?;
         let mut offers = Vec::new();
         for provider in found {
@@ -93,6 +95,7 @@ impl Wallet {
     /// payout whose lock was made but which fails gets its notes back once
     /// the lock expires.
     pub fn pay_out(&self, quote: PayoutQuote) -> Result<Activity, LicashError> {
+        let _timed = crate::log::timed("pay_out");
         let ticketed = self.ticketed(&quote)?;
         self.pay_ticketed(&ticketed)
     }
@@ -107,6 +110,7 @@ impl Wallet {
         quote: PayoutQuote,
         asked: Option<u64>,
     ) -> Result<Activity, LicashError> {
+        let _timed = crate::log::timed("pay_out_or_another");
         self.pay_out_recorded(quote, asked, &|_| Ok(()))
     }
 
@@ -115,6 +119,7 @@ impl Wallet {
     /// those not done, again each time, as a claim dropped loses its coin
     /// once it times out. Whether any is under way still.
     pub fn follow_payouts(&self, chain: Arc<dyn ChainSource>) -> Result<bool, LicashError> {
+        let _timed = crate::log::timed("follow_payouts");
         let followed = self.runtime.block_on(
             self.wallet
                 .follow_payouts(&Chain(chain.clone(), self.wallet.network())),

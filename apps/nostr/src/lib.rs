@@ -341,6 +341,7 @@ pub async fn discover(
     role: Role,
     network: &str,
 ) -> anyhow::Result<Vec<Found>> {
+    let started = std::time::Instant::now();
     let client = client(relays, route, None).await?;
     let filter = Filter::new()
         .kind(Kind::Custom(KIND))
@@ -365,6 +366,7 @@ pub async fn discover(
     }
     let mut found: Vec<Found> = newest.into_values().collect();
     found.sort_by(|a, b| b.at.cmp(&a.at).then_with(|| a.key.cmp(&b.key)));
+    tracing::info!(role = role.id(), found = found.len(), took = ?started.elapsed(), "announcements looked for");
     Ok(found)
 }
 
@@ -409,8 +411,9 @@ where
         trying.spawn(async move {
             let answer = async {
                 relay.try_connect().timeout(timeout).await?;
+                let connected = started.elapsed();
                 match tokio::time::timeout(timeout, asked).await {
-                    Ok(answer) => answer,
+                    Ok(answer) => answer.map(|answer| (answer, connected)),
                     Err(_) => anyhow::bail!("no answer in {} s", timeout.as_secs()),
                 }
             };
@@ -429,15 +432,18 @@ where
         };
         match tried {
             None => break,
-            Some(Ok((url, Ok(answer)))) => {
-                tracing::debug!(%url, took = ?started.elapsed(), "a relay answered");
+            Some(Ok((url, Ok((answer, connected))))) => {
+                tracing::debug!(%url, ?connected, took = ?started.elapsed(), "a relay answered");
                 until.get_or_insert_with(|| {
                     let now = tokio::time::Instant::now();
                     now + (now - started).clamp(least, GRACE)
                 });
                 answers.push(answer);
             }
-            Some(Ok((url, Err(e)))) => failed.push(format!("{url}: {e:#}")),
+            Some(Ok((url, Err(e)))) => {
+                tracing::debug!(%url, took = ?started.elapsed(), "a relay failed: {e:#}");
+                failed.push(format!("{url}: {e:#}"));
+            }
             Some(Err(e)) => failed.push(format!("a relay: {e}")),
         }
     }

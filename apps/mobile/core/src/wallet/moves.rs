@@ -30,6 +30,7 @@ impl Wallet {
         to: String,
         amount: Option<u64>,
     ) -> Result<Vec<MoveQuote>, LicashError> {
+        let _timed = crate::log::timed("move_offers");
         if from == to {
             return Err(LicashError::invalid("a move is between two hubs"));
         }
@@ -83,6 +84,7 @@ impl Wallet {
     /// whose notes come back only once it expires. The move, under way
     /// until the wallet holds the notes at the other hub.
     pub fn move_notes(&self, offers: Vec<MoveQuote>) -> Result<Activity, LicashError> {
+        let _timed = crate::log::timed("move_notes");
         let Some(chosen) = offers.first() else {
             return Err(LicashError::invalid("no move offer to take"));
         };

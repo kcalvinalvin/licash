@@ -41,6 +41,7 @@ impl Wallet {
     /// Run after the app's regular sync round. Errors are returned to be
     /// logged, not to turn a completed payment or receipt into a failure.
     pub fn maintain_notes(&self) -> Result<u32, LicashError> {
+        let _timed = crate::log::timed("maintain_notes");
         self.agree_fees();
         let completed = self.runtime.block_on(self.wallet.maintain_notes())?;
         Ok(u32::try_from(completed).unwrap_or(u32::MAX))

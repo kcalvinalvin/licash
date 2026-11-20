@@ -193,6 +193,7 @@ impl Wallet {
     /// a hub the wallet trusts, and none is kept. Kept until shown
     /// ([`Wallet::keep_donation_address`]).
     pub fn donation_address(&self) -> Result<Option<DonationAddress>, LicashError> {
+        let _timed = crate::log::timed("donation_address");
         let pinned = self.kept().donations;
         let kept_code = pinned.as_ref().and_then(|p| p.code.clone());
         let hubs = self.code_hubs()?;

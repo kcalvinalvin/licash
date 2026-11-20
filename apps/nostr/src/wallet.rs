@@ -1307,19 +1307,25 @@ where
     Fut: Future<Output = Result<Q, Error>>,
 {
     let ask = &ask;
+    let started = Instant::now();
+    let count = found.len();
     let asked = found.into_iter().map(|service| async move {
         let mut answered = None;
         let by = tokio::time::Instant::now() + ANSWER_TIMEOUT;
         for url in &service.announcement.urls {
+            let asking = Instant::now();
             match tokio::time::timeout_at(by, ask(url.clone())).await {
                 Ok(Ok(answer)) if service.named_by(nostr(&answer)) => {
+                    tracing::debug!(%url, took = ?asking.elapsed(), "answered");
                     answered = Some((url.clone(), answer));
                     break;
                 }
                 Ok(Ok(_)) => tracing::warn!(%url, "skipped: not the provider that announced it"),
                 Ok(Err(e @ Error::UnknownHub(_))) => return Err(e),
-                Ok(Err(e)) => tracing::debug!(%url, "skipped: {e}"),
-                Err(_) => tracing::debug!(%url, "skipped: no answer in time"),
+                Ok(Err(e)) => tracing::debug!(%url, took = ?asking.elapsed(), "skipped: {e}"),
+                Err(_) => {
+                    tracing::debug!(%url, took = ?asking.elapsed(), "skipped: no answer in time")
+                }
             }
         }
         Ok(answered.map(|(url, answer)| (service, url, answer)))
@@ -1329,6 +1335,12 @@ where
     while let Some(asked) = asked.next().await {
         answering.extend(asked?);
     }
+    tracing::info!(
+        asked = count,
+        answered = answering.len(),
+        took = ?started.elapsed(),
+        "services announced asked"
+    );
     Ok(answering)
 }
 

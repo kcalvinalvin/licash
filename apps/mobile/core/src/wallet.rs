@@ -387,6 +387,7 @@ impl Wallet {
     /// Trust the hub at `url`: take its notes, and pay through it. A host
     /// alone is reached over HTTPS, or HTTP for an onion service.
     pub fn add_hub(&self, url: String) -> Result<Hub, LicashError> {
+        let _timed = crate::log::timed("add_hub");
         let url = url.trim();
         let host = url.split("://").nth(1).unwrap_or(url);
         let host = host.split(['/', ':']).next().unwrap_or(host);
@@ -421,6 +422,7 @@ impl Wallet {
     /// one without typing its URL. Each is at a URL that answered as the
     /// key announcing it.
     pub fn discover_hubs(&self) -> Result<Vec<FoundHub>, LicashError> {
+        let _timed = crate::log::timed("discover_hubs");
         let relays = hub_relays(&self.wallet)?;
         if relays.is_empty() {
             return Err(LicashError::invalid(
@@ -467,6 +469,7 @@ impl Wallet {
     /// hub yet finds some. Told also how many more were announced that did
     /// not answer.
     pub fn find_hubs(&self, relays: Vec<String>) -> Result<HubsFound, LicashError> {
+        let _timed = crate::log::timed("find_hubs");
         let mut asked = hub_relays(&self.wallet)?;
         for relay in relays {
             let relay = relay.trim().to_owned();
@@ -637,6 +640,7 @@ impl Wallet {
     /// with the notes held now: through the gateway of a hub trusted, or
     /// through a swap provider ([`Wallet::invoice_offers`]).
     pub fn invoice_quote(&self, text: String) -> Result<InvoiceQuote, LicashError> {
+        let _timed = crate::log::timed("invoice_quote");
         let offers = self.invoice_offers(text)?;
         let best = offers.into_iter().next();
         best.ok_or_else(|| LicashError::invalid("no hub you trust pays Lightning invoices"))
@@ -645,6 +649,7 @@ impl Wallet {
     /// Pay the Lightning invoice `text` through `hub`: done, or under way
     /// until [`Wallet::resume`] finds it paid or refunded.
     pub fn pay_invoice(&self, text: String, hub: String) -> Result<Activity, LicashError> {
+        let _timed = crate::log::timed("pay_invoice");
         let invoice = self.wallet.read_invoice(&text)?;
         let pay = self.wallet.pay_invoice(&hub, &invoice.request);
         let lock = self.runtime.block_on(pay)?;
@@ -660,6 +665,7 @@ impl Wallet {
         hub: String,
         max_fee: u64,
     ) -> Result<Activity, LicashError> {
+        let _timed = crate::log::timed("pay_invoice_within");
         let invoice = self.wallet.read_invoice(&text)?;
         let pay = self
             .wallet
@@ -673,6 +679,7 @@ impl Wallet {
     /// payer. Followed by [`Wallet::follow_invoice`] while shown, and by
     /// [`Wallet::resume`]: its notes are taken once it is paid.
     pub fn ask_invoice(&self, amount: u64) -> Result<LightningInvoice, LicashError> {
+        let _timed = crate::log::timed("ask_invoice");
         let (mut best, mut any): (Option<(u64, String)>, bool) = (None, false);
         for (url, info) in self.wallet.hubs()? {
             let Some(lightning) = &info.lightning else {
@@ -701,6 +708,7 @@ impl Wallet {
     /// less the fee, at the hub trusted leaving the most. A sat short,
     /// rarely, where no amount and its fee rounded up come to it exactly.
     pub fn ask_invoice_for(&self, invoiced: u64) -> Result<LightningInvoice, LicashError> {
+        let _timed = crate::log::timed("ask_invoice_for");
         let (mut best, mut any): (Option<(u64, String)>, bool) = (None, false);
         for (url, info) in self.wallet.hubs()? {
             let Some(lightning) = &info.lightning else {
@@ -730,6 +738,7 @@ impl Wallet {
     /// it: have its hub make it, and take its notes once it is paid. Where
     /// it stands.
     pub fn follow_invoice(&self, hash: String) -> Result<LightningInvoice, LicashError> {
+        let _timed = crate::log::timed("follow_invoice");
         let followed = self.runtime.block_on(self.wallet.follow_invoice(&hash));
         self.invoice_now(followed)
     }
@@ -783,6 +792,7 @@ impl Wallet {
     /// else so at a hub the code says where to reach, visited, proving it
     /// is the one the code names. [`Wallet::pay`] pays it so.
     pub fn pay_quote(&self, code: String, amount: Option<u64>) -> Result<PayQuote, LicashError> {
+        let _timed = crate::log::timed("pay_quote");
         let (text, mut plans) = self.plans(&code, amount)?;
         let plan = plans.remove(0);
         let quote = quoted(&plan);
@@ -799,6 +809,7 @@ impl Wallet {
         code: String,
         amount: Option<u64>,
     ) -> Result<Vec<PayOffer>, LicashError> {
+        let _timed = crate::log::timed("pay_offers");
         let (_, plans) = self.plans(&code, amount)?;
         Ok(plans
             .iter()
@@ -842,6 +853,7 @@ impl Wallet {
     /// the wallet trusts and holds enough at. To the payee's mailbox, or
     /// for them to receive by hand.
     pub fn pay(&self, code: String, amount: Option<u64>) -> Result<Paid, LicashError> {
+        let _timed = crate::log::timed("pay");
         self.paying(code, amount, true)
     }
 
@@ -856,6 +868,7 @@ impl Wallet {
         code: String,
         amount: Option<u64>,
     ) -> Result<Paid, LicashError> {
+        let _timed = crate::log::timed("pay_now");
         let paid = self.paying(code, amount, false)?;
         let after = std::thread::Builder::new()
             .name("licash-paid".into())
@@ -878,8 +891,10 @@ impl Wallet {
     /// [`Wallet::pay_now`]. Payments wait for it, as for a payment under
     /// way.
     pub fn collect_now(self: Arc<Self>) -> Result<Vec<Activity>, LicashError> {
+        let _timed = crate::log::timed("collect_now");
         let received = self.collecting()?;
         if !received.is_empty() {
+            tracing::info!(payments = received.len(), "received");
             let after = std::thread::Builder::new()
                 .name("licash-received".into())
                 .spawn(move || {
@@ -1030,6 +1045,7 @@ impl Wallet {
     /// the next looks take what they pushed at once, asking them for all
     /// of it again every 30 s.
     pub fn collect(&self) -> Result<Vec<Activity>, LicashError> {
+        let _timed = crate::log::timed("collect");
         let received = self.collecting()?;
         if !received.is_empty() {
             self.unlink();
@@ -1048,6 +1064,7 @@ impl Wallet {
     /// Finish what was under way: payments, and moves to notes; and mail
     /// the payments due to their payees.
     pub fn resume(&self) -> Result<(), LicashError> {
+        let _timed = crate::log::timed("resume");
         let delivering = self.delivering();
         // Moves kept before their hub answered, by earlier versions: none
         // paid them, as no address was named, and a move asks anew.
@@ -1359,6 +1376,7 @@ impl Wallet {
     /// trusted serves tweaks of, for the fallback addresses and the coins
     /// held only.
     pub fn scan(&self, chain: Arc<dyn ChainSource>) -> Result<Scan, LicashError> {
+        let _timed = crate::log::timed("scan");
         let hubs = self.wallet.hubs()?;
         if hubs.is_empty() {
             return Err(LicashError::invalid(
@@ -1467,6 +1485,7 @@ impl Wallet {
     /// out, as `chain`'s peers relay them: in no block the wallet looked
     /// in yet. Shown, never spent: only a scan finds coins.
     pub fn incoming(&self, chain: Arc<dyn ChainSource>) -> Result<Vec<Activity>, LicashError> {
+        let _timed = crate::log::timed("incoming");
         let mut txs = Vec::new();
         for script in self.wallet.fallback_scripts()? {
             let raw = chain

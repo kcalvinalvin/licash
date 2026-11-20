@@ -300,7 +300,9 @@ class Engine(context: Context) {
 
     init {
         AppLog.start(File(files, "logs"))
-        setLogger(AppLog, "info,nostr_sdk=warn,nostr_relay_pool=warn")
+        // A debug build logs what each request over Tor and each relay took.
+        val debug = if (BuildConfig.DEBUG) ",licash_tor=debug,licash_nostr=debug,licash_mobile=debug" else ""
+        setLogger(AppLog, "info,nostr_sdk=warn,nostr_relay_pool=warn$debug")
         // A backup found is shown until the app ends, never after: its
         // copied folder of a run before is of no use.
         scope.launch { restoreCopy.deleteRecursively() }

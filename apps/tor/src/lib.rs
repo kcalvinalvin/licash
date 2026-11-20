@@ -307,12 +307,19 @@ impl Tor {
 
     async fn open(&self, target: &Target) -> Result<Box<dyn Stream>, String> {
         let prefs = self.isolation.prefs(&target.host);
+        let host = &target.host;
+        let started = Instant::now();
         let stream = self
             .client
-            .connect_with_prefs((target.host.as_str(), target.port), &prefs)
+            .connect_with_prefs((host.as_str(), target.port), &prefs)
             .await
-            .map_err(|e| format!("over Tor: {e}"))?;
+            .map_err(|e| {
+                tracing::debug!(%host, ms = ms(started), "no stream over Tor: {e}");
+                format!("over Tor: {e}")
+            })?;
+        let circuit = ms(started);
         if !target.tls {
+            tracing::debug!(%host, circuit_ms = circuit, "stream over Tor opened");
             return Ok(Box::new(stream));
         }
         let name = rustls::pki_types::ServerName::try_from(target.host.clone())
@@ -322,8 +329,15 @@ impl Tor {
             .connect(name, stream)
             .await
             .map_err(|e| format!("TLS: {e}"))?;
+        let tls_ms = ms(started) - circuit;
+        tracing::debug!(%host, circuit_ms = circuit, tls_ms, "stream over Tor opened");
         Ok(Box::new(stream))
     }
+}
+
+/// The milliseconds since `started`, for the log.
+fn ms(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 /// How far a client is in connecting to the Tor network.
@@ -598,8 +612,10 @@ impl Kept {
         max: usize,
     ) -> Result<Result<Answer, String>, Box<Asked>> {
         while let Some(mut open) = self.take(target).await {
+            let started = Instant::now();
             match open.ask(request, max).await {
                 Ok(answer) => {
+                    tracing::debug!(host = %target.host, ms = ms(started), "asked on a connection kept");
                     self.put(target.clone(), open);
                     return Ok(Ok(answer));
                 }
@@ -620,11 +636,13 @@ impl Kept {
         request: Asked,
         max: usize,
     ) -> Result<Answer, String> {
+        let started = Instant::now();
         let mut open = Open::over(stream).await?;
         let answer = open.ask(request, max).await.map_err(|lost| match lost {
             Lost::Unsent(_) => "the connection closed".to_owned(),
             Lost::Sent(why) => why,
         })?;
+        tracing::debug!(host = %target.host, ms = ms(started), "asked on a new connection");
         self.put(target, open);
         Ok(answer)
     }

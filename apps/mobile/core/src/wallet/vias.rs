@@ -21,6 +21,7 @@ impl Wallet {
     /// enough. Among equals a hub's gateway first, whose failed payments
     /// return their notes at once. Refused if none can.
     pub fn invoice_offers(&self, text: String) -> Result<Vec<InvoiceQuote>, LicashError> {
+        let _timed = crate::log::timed("invoice_offers");
         let invoice = self.wallet.read_invoice(&text)?;
         let (mut offers, refused) = self.gateway_offers(&invoice)?;
         offers.extend(self.provider_offers(&invoice)?);
@@ -47,6 +48,7 @@ impl Wallet {
         provider: String,
         max_fee: u64,
     ) -> Result<Activity, LicashError> {
+        let _timed = crate::log::timed("pay_invoice_via");
         let invoice = self.wallet.read_invoice(&text)?;
         let pay = self
             .wallet

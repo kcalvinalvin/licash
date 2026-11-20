@@ -25,6 +25,26 @@ pub fn set_logger(logger: Arc<dyn Logger>, filter: String) {
         .try_init();
 }
 
+/// What a call the app makes took, logged as it returns: at INFO from a
+/// second on, where the owner may be waiting, at DEBUG otherwise.
+pub(crate) struct Timed(&'static str, std::time::Instant);
+
+/// A [`Timed`] for the call `what`, to keep until it returns.
+pub(crate) fn timed(what: &'static str) -> Timed {
+    Timed(what, std::time::Instant::now())
+}
+
+impl Drop for Timed {
+    fn drop(&mut self) {
+        let took = self.1.elapsed();
+        if took >= std::time::Duration::from_secs(1) {
+            tracing::info!(call = self.0, ?took, "took");
+        } else {
+            tracing::debug!(call = self.0, ?took, "took");
+        }
+    }
+}
+
 /// One event as it is written, handed over whole once done.
 struct Line(Arc<dyn Logger>, Vec<u8>);
 
