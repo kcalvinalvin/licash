@@ -957,14 +957,14 @@ impl<T: Transport> Wallet<T> {
             })?;
             Ok(rows.collect::<Result<_, _>>()?)
         })?;
-        let mut paying = Vec::new();
+        let (mut paying, mut seen) = (Vec::new(), HashSet::new());
         for tx in txs {
             let txid = tx.compute_txid();
             for (vout, output) in (0..).zip(&tx.output) {
                 let outpoint = OutPoint::new(txid, vout);
                 if scripts.contains(&output.script_pubkey)
                     && !found.contains(&outpoint)
-                    && !paying.iter().any(|(o, _)| *o == outpoint)
+                    && seen.insert(outpoint)
                 {
                     paying.push((outpoint, output.value.to_sat()));
                 }
