@@ -10,9 +10,9 @@ Tor) watches Bitcoin for you.
 
 Install `licash-main.apk` from the
 [`main-build` release](https://github.com/lichenbtc-org/licash/releases/tag/main-build).
-The app is for Bitcoin. To try it on signet or Mutinynet, tap the "licash"
-wordmark on the first screen seven times to turn on advanced mode, pick the
-network, and choose a hub announced on Nostr.
+The app is for Bitcoin. To try it on signet or Mutinynet, before doing
+anything else, tap the "licash" wordmark on the first screen 7 times, then
+pick the network and choose a hub announced on Nostr.
 
 ## Build
 

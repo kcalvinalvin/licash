@@ -44,8 +44,9 @@ each block, so headers that fool a contract's statement cost little to make,
 and a contract's recovery there is only as strong as that work.
 
 - **Android:** install `licash-main.apk` from the
-  [`main-build` release](https://github.com/lichenbtc-org/licash/releases/tag/main-build),
-  turn on advanced mode, pick signet and choose a hub announced on Nostr.
+  [`main-build` release](https://github.com/lichenbtc-org/licash/releases/tag/main-build).
+  Before doing anything else, tap the "licash" wordmark on the first screen
+  7 times, then pick signet and choose a hub announced on Nostr.
 - **Command line:**
 
   ```sh
