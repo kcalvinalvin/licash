@@ -440,13 +440,15 @@ mock authority's; on signet the hub proves with `licash-r0` (docs/r0.md,
 wallet; a payout's rest and the holder's reserve pay each party's wallet
 directly. A holder may close her contract early, and be paid her claim in
 the same transaction: she POSTs her nonce, the amount she claims and the
-notes it is made of to `/v1/contracts/openings/{id}/fold/claim`, and the
-hub answers its nonce and its fee at its fee rate if its ledger holds
+notes it is made of to `/v1/contracts/openings/{id}/fold/claim`, signed
+with her payment key in the contract (so that nobody else replaces or
+asks for the fold offered to her), and the hub answers its nonce and its fee at its fee rate if its ledger holds
 nothing against those notes (none spent, none claimed in another claim).
 She then POSTs her partial signature and the filing of her claim (settled
 notes of its keyset alone, worth the amount or more) to `.../fold/sign`.
 The hub retires the notes in its ledger, all or none, and only then signs
-the fold with her (MuSig2, its nonce kept in memory and used at most once),
+the fold with her (MuSig2, its nonce kept in memory and used at most once;
+a partial signature that does not check leaves it offered),
 paying her the claim and her reserve back and the rest to the hub less the
 fee, and broadcasts it. A note anything spent is refused, not disputed: no
 dispute follows a fold to cite the spend in. The holder then asks the
@@ -460,7 +462,8 @@ after the hub retired the notes, she files the same claim on Bitcoin by a
 forced close, which the hub pays as ever; a contract that ends by its
 default or by a fold that pays no claim leaves them retired, as it leaves
 the claims of any dispute. The same routes without a claim
-(`.../fold` with her nonce alone, `.../fold/sign` with her signature alone)
+(`.../fold` with her nonce alone, signed, `.../fold/sign` with her
+signature alone)
 fold paying her reserve back only, for the wallets that close that way. Any
 key-path spend of a contract output is such a fold, and ends the contract.
 A contract no one exited ends at its close: the hub posts its
