@@ -147,7 +147,14 @@ canceled and the payer refunded: a donation whose fee does not cover the
 hub's, or paid too close to its HTLCs' expiry, is never paid on. A payment
 signed but not released 18 blocks before the HTLCs expire is settled all
 the same and followed until released; one given up after that alerts the
-operator. At most `--donation-max-open` invoices are open at once. A
+operator. At most `--donation-max-open` invoices are open at once (100
+by default), whoever asked: anyone may ask for them, of any code naming a
+hub the provider holds notes at, and not pay, each holding its place for
+about 11 minutes, until its invoice expires and is canceled. Past them, new
+donations are refused, not those under way. An unpaid one holds none of
+the provider's notes, only its place: to keep places for paying donors,
+limit how often one client may call the callback, at a reverse proxy in
+front of it. A
 provider with donations under way refuses to start without `--lnurl-url`
 and `--lnd`. The provider must stay up while donations are under way: down
 past an HTLC's expiry, it may have paid the payee and lose the donation.
