@@ -50,7 +50,8 @@ func networkOf(name string) (network, error) {
 		return network{params: node.Mutinynet(), cdn: "https://mutinynet.block-dn.org",
 			peers: []string{node.MutinynetPeer}, pin: mutinynetPin}, nil
 	case "regtest":
-		return network{params: chaincfg.RegressionNetParams}, nil
+		// Bitcoin Core's on the device, or forwarded to it (adb reverse).
+		return network{params: chaincfg.RegressionNetParams, peers: []string{"127.0.0.1:18444"}}, nil
 	}
 	return network{}, fmt.Errorf("unknown network %q: bitcoin, signet, mutinynet or regtest", name)
 }

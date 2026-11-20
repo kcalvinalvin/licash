@@ -19,7 +19,7 @@ func TestNetworks(t *testing.T) {
 		{"bitcoin", chaincfg.MainNetParams.GenesisHash.String(), "https://block-dn.org", 0, 10 * time.Minute},
 		{"signet", signet.String(), "https://signet.block-dn.org", 0, 10 * time.Minute},
 		{"mutinynet", signet.String(), "https://mutinynet.block-dn.org", 1, 30 * time.Second},
-		{"regtest", chaincfg.RegressionNetParams.GenesisHash.String(), "", 0, 10 * time.Minute},
+		{"regtest", chaincfg.RegressionNetParams.GenesisHash.String(), "", 1, 10 * time.Minute},
 	} {
 		net, err := networkOf(c.name)
 		if err != nil {

@@ -14,7 +14,6 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -42,7 +41,6 @@ fun Onboarding(engine: Engine, ui: Ui) {
     var taps by remember { mutableIntStateOf(0) }
     var busy by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
-    var peers by remember { mutableStateOf(engine.prefs.peers) }
     var restoring by remember { mutableStateOf(false) }
     Column(
         Modifier.fillMaxSize().padding(horizontal = 32.dp),
@@ -80,13 +78,6 @@ fun Onboarding(engine: Engine, ui: Ui) {
                         )
                     }
                 }
-                OutlinedTextField(
-                    value = peers,
-                    onValueChange = { peers = it },
-                    modifier = Modifier.fillMaxWidth().testTag("peers"),
-                    singleLine = true,
-                    label = { Text("Peers (host:port, comma separated)") },
-                )
             }
         }
         Spacer(Modifier.height(16.dp))
@@ -99,7 +90,6 @@ fun Onboarding(engine: Engine, ui: Ui) {
             busy = true
             error = null
             scope.launch {
-                if (peers.trim() != engine.prefs.peers) engine.setChain(peers, engine.prefs.cdn)
                 engine.create().onFailure { error = explain(it) }
                 busy = false
             }

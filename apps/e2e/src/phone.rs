@@ -458,8 +458,8 @@ impl Phone {
         for _ in 0..7 {
             self.tap_view(&title).await?;
         }
+        // Regtest's node is 127.0.0.1:18444, Core's reversed to the phone.
         self.tap_id("network regtest").await?;
-        self.fill_id("peers", "127.0.0.1:18444").await?;
         self.tap_id("create").await?;
         // The light client of the network first chosen stops first.
         self.by_id("choose-hub", 180).await?;
