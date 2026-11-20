@@ -1592,11 +1592,25 @@ async fn looking_again_with_tweaks_starts_at_the_first_block_the_hub_serves() {
     assert_eq!(scanned.next, 10);
     let values: Vec<u64> = scanned.found.iter().map(|c| c.value).collect();
     assert_eq!(values, [20_000]);
-    // Once: the blocks before stay looked in without tweaks...
+    // Again with it: nothing more to look in.
+    s.chain.lock().unwrap().mine_empty(1);
+    assert!(s.scan().await.unwrap().found.is_empty());
+    // The blocks before, once a hub serves their tweaks: from the first
+    // looked in without them, once.
     *s.hub.first.lock().unwrap() = Some(1);
     s.wallet.add_hub(HUB).await.unwrap();
+    let mut values: Vec<u64> = s
+        .scan()
+        .await
+        .unwrap()
+        .found
+        .iter()
+        .map(|c| c.value)
+        .collect();
+    values.sort();
+    assert_eq!(values, [10_000, 20_000]);
     assert!(s.scan().await.unwrap().found.is_empty());
-    // ...unless looked in again from one.
+    // Looked in again from one, as asked.
     s.wallet.watch_silent(HUB, 1).unwrap();
     assert_eq!(s.scan().await.unwrap().found.len(), 2);
 }

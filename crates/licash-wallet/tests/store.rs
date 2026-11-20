@@ -33,7 +33,7 @@ fn a_wallet_file_says_what_it_is_and_is_whole() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(version, 2);
+    assert_eq!(version, 3);
     let broken: Option<String> = db
         .query_row("PRAGMA integrity_check", [], |r| r.get::<_, String>(0))
         .ok()
@@ -156,6 +156,6 @@ fn one_backup_holds_the_tables_of_every_component_in_the_file() {
     assert_eq!(n, 42);
     assert_eq!(
         licash_store::component_version(&copy, "wallet").unwrap(),
-        Some(2)
+        Some(3)
     );
 }

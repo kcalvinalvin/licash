@@ -20,7 +20,7 @@ pub(crate) use licash_store::now;
 
 /// The component the wallet's tables are, and its version.
 const COMPONENT: &str = "wallet";
-const VERSION: i64 = 2;
+const VERSION: i64 = 3;
 
 /// A stage of an operation is a table of its own where its columns are
 /// known together (the terms of a deposit, the claim of a payout, a lock's
@@ -358,14 +358,16 @@ CREATE TABLE owed_lock_activations (
 ) STRICT;
 
 -- The next block to look in for silent payments (`next_height`), from a
--- first block the owner chose: none until it chose one. `untweaked_height`
--- is the first of the blocks up to the next looked in without tweaks, to
--- look in again for
--- silent payments once a hub serves them: none if none was.
+-- first block the owner chose: none until it chose one. The blocks from
+-- `untweaked_height` up to `untweaked_until`, or up to the next if none, were
+-- looked in without tweaks, to look in again for silent payments once a hub
+-- serves them: none if none was.
 CREATE TABLE silent_scan (
     one INTEGER PRIMARY KEY CHECK (one = 1),
     next_height INTEGER NOT NULL,
-    untweaked_height INTEGER
+    untweaked_height INTEGER,
+    untweaked_until INTEGER,
+    CHECK (untweaked_until IS NULL OR untweaked_until > untweaked_height)
 ) STRICT;
 -- The blocks looked in lately, by height, to notice a reorganization.
 CREATE TABLE silent_blocks (

@@ -225,7 +225,12 @@ fn rewind(t: &Sql<'_>, next: u32, from: u32) -> Result<bool, Error> {
     }
     t.execute("DELETE FROM silent_blocks WHERE height >= ?1", [from])?;
     t.execute(
-        "UPDATE silent_scan SET untweaked_height = NULL WHERE untweaked_height >= ?1",
+        "UPDATE silent_scan SET untweaked_height = NULL, untweaked_until = NULL
+         WHERE untweaked_height >= ?1",
+        [from],
+    )?;
+    t.execute(
+        "UPDATE silent_scan SET untweaked_until = ?1 WHERE untweaked_until > ?1",
         [from],
     )?;
     Ok(true)
@@ -483,30 +488,46 @@ impl<T: Transport> Wallet<T> {
     /// Before looking on from `next` with a hub serving tweaks from block
     /// `first` on: look again from the first block looked in without them
     /// it serves tweaks of, forgetting what was found from it on until
-    /// found again. The next block to look in. Those before `first` stay
-    /// looked in without tweaks; none is looked in again if the hub serves
-    /// no block before `next`.
+    /// found again. The next block to look in. Those before `first` stay to
+    /// look in again once a hub serves their tweaks; none is looked in
+    /// again if the hub serves none of them.
     fn look_again(&self, next: u32, first: u32) -> Result<u32, Error> {
         if next < first {
             return Ok(next);
         }
         let from = self.store.write(|t| {
-            let untweaked: Option<u32> =
-                t.query_row("SELECT untweaked_height FROM silent_scan", [], |r| r.get(0))?;
-            let Some(from) = untweaked.map(|u| u.max(first)) else {
+            let (untweaked, until): (Option<u32>, Option<u32>) = t.query_row(
+                "SELECT untweaked_height, untweaked_until FROM silent_scan",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            let Some(untweaked) = untweaked else {
                 return Ok(next);
             };
-            if from < next && !rewind(t, next, from)? {
+            let from = untweaked.max(first);
+            if from >= until.unwrap_or(next).min(next) {
+                return Ok(next);
+            }
+            if !rewind(t, next, from)? {
                 return Err(raced());
             }
-            let cleared = t.execute(
-                "UPDATE silent_scan SET untweaked_height = NULL WHERE next_height = ?1",
-                [from.min(next)],
-            )?;
-            if cleared == 0 {
+            // What is left of them: those before `first`, if any.
+            let kept = if untweaked < from {
+                t.execute(
+                    "UPDATE silent_scan SET untweaked_until = ?1 WHERE next_height = ?1",
+                    [from],
+                )?
+            } else {
+                t.execute(
+                    "UPDATE silent_scan SET untweaked_height = NULL, untweaked_until = NULL
+                     WHERE next_height = ?1",
+                    [from],
+                )?
+            };
+            if kept == 0 {
                 return Err(raced());
             }
-            Ok(from.min(next))
+            Ok(from)
         })?;
         if from < next {
             tracing::info!(from, next, "silent payments looked for again with tweaks");
@@ -701,8 +722,17 @@ impl<T: Transport> Wallet<T> {
                 return Err(raced());
             }
             if untweaked {
+                // Those looked in with tweaks between are looked in again
+                // too: what is kept is one span.
                 t.execute(
-                    "UPDATE silent_scan SET untweaked_height = coalesce(untweaked_height, ?1)",
+                    "UPDATE silent_scan
+                     SET untweaked_height = coalesce(untweaked_height, ?1), untweaked_until = NULL",
+                    [from],
+                )?;
+            } else {
+                t.execute(
+                    "UPDATE silent_scan SET untweaked_until = ?1
+                     WHERE untweaked_height IS NOT NULL AND untweaked_until IS NULL",
                     [from],
                 )?;
             }
