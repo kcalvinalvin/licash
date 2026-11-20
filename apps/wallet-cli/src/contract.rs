@@ -212,6 +212,17 @@ struct Terms {
     fee: Option<(licash_api::ContractRange, licash_api::ContractFee)>,
 }
 
+/// Refused unless `funded` sat of a contract of `cap` sat are within it.
+fn funds_at_most(funded: u32, cap: u32) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        funded <= cap,
+        "{} sat funded is more than the contract's {}",
+        crate::say::grouped(funded.into()),
+        crate::say::sat(cap.into())
+    );
+    Ok(())
+}
+
 impl Terms {
     fn of(
         hub: &str,
@@ -232,6 +243,7 @@ impl Terms {
                 "{hub} offers no contracts but of {} sat",
                 crate::say::grouped(offered.cap.into()),
             );
+            funds_at_most(funded, offered.cap)?;
             return Ok(Self {
                 cap: offered.cap,
                 blocks,
@@ -251,12 +263,7 @@ impl Terms {
                 .collect::<Vec<_>>()
                 .join(", ")
         );
-        anyhow::ensure!(
-            funded <= cap,
-            "{} sat funded is more than the contract's {}",
-            crate::say::grouped(funded.into()),
-            crate::say::sat(cap.into())
-        );
+        funds_at_most(funded, cap)?;
         Ok(Self {
             cap,
             blocks,
@@ -818,6 +825,14 @@ mod tests {
         ] {
             assert!(lines.contains(said), "{said} not in\n{lines}");
         }
+    }
+
+    #[test]
+    fn more_funded_than_a_fixed_contract_holds_is_refused() {
+        let offered = offered(None);
+        let over = Terms::of("hub", &offered, None, None, offered.cap + 1);
+        let e = over.err().expect("refused").to_string();
+        assert!(e.contains("more than the contract's"), "{e}");
     }
 
     #[test]
