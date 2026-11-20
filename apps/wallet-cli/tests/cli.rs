@@ -966,7 +966,12 @@ fn a_provider_is_found_though_a_hub_was_last_asked_many_blocks_before() {
     let a = Server::swapping_from(FEE, relays.clone());
     let b = Server::with_relays(FEE, relays.clone());
     let swaps = Swaps::start(&[&a, &b], 200);
-    announce_provider(&runtime, &relays, swaps.provider.nostr_secret().unwrap(), swaps.url());
+    announce_provider(
+        &runtime,
+        &relays,
+        swaps.provider.nostr_secret().unwrap(),
+        swaps.url(),
+    );
     let dir = tempfile::tempdir().unwrap();
     let (alice, at) = party(dir.path(), "alice", Some(&a));
     ok(wallet(&alice, &["add-hub", &b.url()], None));
@@ -984,7 +989,14 @@ fn a_provider_is_found_though_a_hub_was_last_asked_many_blocks_before() {
         let wallet = licash_wallet::Wallet::open(&alice, transport).unwrap();
         let pair = (a.url(), b.url());
         let pair = (pair.0.as_str(), pair.1.as_str());
-        let found = swap_providers(&wallet, &relays, &Route::Direct, pair, 20, SwapLimits::usual(20));
+        let found = swap_providers(
+            &wallet,
+            &relays,
+            &Route::Direct,
+            pair,
+            20,
+            SwapLimits::usual(20),
+        );
         found.await.unwrap()
     });
     // It asked A again, and so found the provider.

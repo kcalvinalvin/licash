@@ -36,6 +36,10 @@ const ASKED_AT_ONCE: usize = 32;
 /// looking for them again: well within an announcement's [`LIFETIME`].
 const KEPT_FOR: Duration = Duration::from_secs(30 * 60);
 
+/// How long what a hub said of itself serves a quote: its height is the
+/// one a swap's lock is judged by, and a block comes in 30 s on Mutinynet.
+const HUB_FRESH: Duration = Duration::from_secs(60);
+
 /// The most providers asked at once that the wallet neither went through
 /// before nor heard answer within [`KEPT_FOR`]: announcing is free, so a
 /// flood of announcements, each naming URLs that never answer, costs each
@@ -67,6 +71,9 @@ pub struct Announcements {
     /// By the key that announced it, the URL each provider last answered
     /// at as that key, and since when.
     answered: Mutex<HashMap<String, (String, Instant)>>,
+    /// By URL, when each hub was last asked what it says of itself before
+    /// a quote ([`swap_providers_with`]).
+    hubs: Mutex<HashMap<String, Instant>>,
     /// The order the [`STRANGERS`] asked are taken in: this wallet's
     /// own, which no announcer can choose its keys to come first in.
     order: RandomState,
@@ -89,6 +96,18 @@ fn set_of(relays: &[String]) -> Vec<String> {
 }
 
 impl Announcements {
+    /// Whether the hub at `url` was not asked what it says of itself within
+    /// [`HUB_FRESH`], for a quote.
+    fn hub_stale(&self, url: &str) -> bool {
+        let hubs = self.hubs.lock().unwrap_or_else(|e| e.into_inner());
+        hubs.get(url).is_none_or(|at| at.elapsed() >= HUB_FRESH)
+    }
+
+    fn hub_asked(&self, url: &str) {
+        let mut hubs = self.hubs.lock().unwrap_or_else(|e| e.into_inner());
+        hubs.insert(url.to_owned(), Instant::now());
+    }
+
     /// Look for the swap providers announced on `relays` for `network`,
     /// through `route`, and keep them: how many. Those kept before stay,
     /// should none answer.
@@ -910,28 +929,28 @@ pub async fn swap_providers_with<T: Transport>(
         now(),
     );
     let ask = |url: String| async move { wallet.swap_quote(&url, from, to, amount, limits).await };
-    let on = (relays, route, network);
-    let mut answering = announced
-        .answering(on, &used, ask, |q: &SwapQuote| q.info.nostr.as_deref())
-        .await?;
-    if answering.is_empty() {
-        // A quote judges a lock by the height its hubs last said they
-        // followed, behind by the time it is asked on quick blocks, and so
-        // refuses what would go through: asked again what they say now,
-        // once. A hub that does not answer keeps what it said.
-        let again = |hub: &str| {
-            let hub = hub.to_owned();
-            async move {
-                if let Err(e) = wallet.refresh_hub(&hub).await {
-                    tracing::debug!(%hub, "not asked again before a swap: {e}");
-                }
+    // A quote judges a lock by the height its hubs last said they followed,
+    // behind by now on quick blocks, and so refuses what would go through:
+    // each asked again what it says, unless lately, before the providers
+    // are. Refused, every provider kept would fail, and the relays be
+    // looked in again for nothing. A hub that does not answer keeps what it
+    // said.
+    let again = |hub: &str| {
+        let hub = hub.to_owned();
+        async move {
+            if !announced.hub_stale(&hub) {
+                return;
             }
-        };
-        join(again(from), again(to)).await;
-        answering = announced
-            .answering(on, &used, ask, |q: &SwapQuote| q.info.nostr.as_deref())
-            .await?;
-    }
+            match wallet.refresh_hub(&hub).await {
+                Ok(()) => announced.hub_asked(&hub),
+                Err(e) => tracing::debug!(%hub, "not asked again before a swap: {e}"),
+            }
+        }
+    };
+    join(again(from), again(to)).await;
+    let on = (relays, route, network);
+    let answering = announced.answering(on, &used, ask, |q: &SwapQuote| q.info.nostr.as_deref());
+    let answering = answering.await?;
     let mut providers: Vec<(bool, SwapProvider)> = answering
         .into_iter()
         .map(|(service, url, quote)| {
