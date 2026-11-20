@@ -68,6 +68,9 @@ struct Pool {
     txs: Arc<Mutex<Vec<Transaction>>>,
     /// The fee rate the chain estimates, for any blocks.
     estimate: Arc<Mutex<Option<FeeRate>>>,
+    /// Blocks the chain's height is said to be behind its tip by, as a
+    /// lagging chain source says.
+    lag: Arc<Mutex<u32>>,
 }
 
 impl Pool {
@@ -95,7 +98,9 @@ impl Pool {
 
 impl Blocks for Pool {
     fn height(&self) -> impl std::future::Future<Output = Result<u32, String>> + Send {
-        Blocks::height(&self.view)
+        let lag = *self.lag.lock().unwrap();
+        let height = Blocks::height(&self.view);
+        async move { height.await.map(|h| h.saturating_sub(lag)) }
     }
 
     fn hash(
@@ -255,6 +260,7 @@ impl Eco {
             view: net.view(A),
             txs: Arc::default(),
             estimate: Arc::new(Mutex::new(Some(ONE_SAT))),
+            lag: Arc::default(),
         };
         let desk = Arc::new(Desk {
             provider: Mutex::new(Some(Arc::new(provider))),
@@ -603,6 +609,32 @@ async fn a_coin_left_out_of_the_blocks_is_canceled_before_it_times_out() {
         eco.client_follows(&payout).await.state,
         PayoutState::Failed(_)
     ));
+}
+
+/// A cancel the provider's wallet found in a block a chain source behind it
+/// does not reach yet: not counted buried, so the payout waits, and fails
+/// once the source catches up.
+#[tokio::test]
+async fn a_cancel_beyond_a_lagging_chains_tip_is_not_counted_buried() {
+    let eco = Eco::new(STOCK, TERMS).await;
+    eco.pay_out(1_000).await;
+    eco.pool.txs.lock().unwrap().clear();
+    eco.mine_to(timeout(&eco) - 12);
+    eco.follow().await;
+    assert_eq!(eco.pool.waiting().len(), 1);
+    eco.pool.mine();
+    let wallet = eco.provider();
+    let wallet = wallet.wallet();
+    while {
+        let scanned = wallet.scan_silent(None, &eco.pool, 100).await.unwrap();
+        scanned.next <= scanned.height
+    } {}
+    *eco.pool.lag.lock().unwrap() = 2;
+    eco.follow().await;
+    assert_eq!(eco.stage(), Stage::Accepted);
+    *eco.pool.lag.lock().unwrap() = 0;
+    eco.follow().await;
+    assert_eq!(eco.stage(), Stage::Failed);
 }
 
 #[tokio::test]

@@ -835,7 +835,7 @@ impl<T: Transport> Provider<T> {
         let tip = chain.height().await.map_err(licash_wallet::Error::Chain)?;
         if let Some(at) = at {
             let need = payout_depth(self.wallet.network());
-            if by != txid && tip + 1 - at >= need {
+            if by != txid && confirmations(tip, at) >= need {
                 tracing::info!(id = %hex::encode(id), %by, "payout's coin canceled");
                 return self.fail(id, row, "its coin was canceled, in no block in time");
             }
@@ -909,7 +909,7 @@ impl<T: Transport> Provider<T> {
         }
         // Its only other spend: the provider's.
         let need = payout_depth(self.wallet.network());
-        if tip + 1 - at < need {
+        if confirmations(tip, at) < need {
             // Looked for again next time, to count its confirmations.
             if let Some(tx) = &coin.refund {
                 self.broadcast_refund(id, tx, chain).await;
@@ -1136,6 +1136,13 @@ const REORG: u32 = 6;
 /// as a claim broadcast before the coin confirmed may be mined with it.
 fn first_to_scan(scanned: Option<u32>, funding: u32) -> u32 {
     scanned.map_or(funding, |scanned| (scanned + 1).max(funding))
+}
+
+/// The confirmations at `tip` of a transaction the wallet found in the
+/// block at `at`: none while the chain asked is behind the wallet, or
+/// replaced the block, whatever the wallet last saw.
+fn confirmations(tip: u32, at: u32) -> u32 {
+    tip.saturating_add(1).saturating_sub(at)
 }
 
 #[cfg(test)]
