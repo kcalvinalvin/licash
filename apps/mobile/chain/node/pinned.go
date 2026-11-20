@@ -78,14 +78,20 @@ const (
 	// too, the first whole kept.
 	importLanes = 4
 	// importStarts is how many starts in a row may download no file, and
-	// importFailures how many downloads in a row may fail in a start.
+	// importFailures how many downloads in a row may fail in a start, with
+	// no byte for importQuiet: a network changing, or Tor starting, is
+	// waited out.
 	importStarts   = 3
 	importFailures = 8
 )
 
 // importEntries is how many headers each of block-dn's files holds, of
-// block or of filter headers: a variable for tests.
-var importEntries uint32 = 100_000
+// block or of filter headers, and importQuiet as above: variables for
+// tests.
+var (
+	importEntries uint32 = 100_000
+	importQuiet          = 2 * time.Minute
+)
 
 // Size is the bytes of the import file of entries of size bytes from
 // genesis to the pinned block.
@@ -98,7 +104,7 @@ var (
 	errDigest    = errors.New("not the pinned file")
 	errNotServed = errors.New("not served")
 	errIdle      = fmt.Errorf("no file downloaded in %v", importIdle)
-	errFailing   = fmt.Errorf("%d downloads failed in a row", importFailures)
+	errFailing   = fmt.Errorf("%d downloads failed in a row, no byte for a while", importFailures)
 )
 
 // pinnedImport is what the node of a network of magic in dir imports from
@@ -142,7 +148,9 @@ func pinnedImport(ctx context.Context, dir, server string, magic wire.BitcoinNet
 		log.Warn("pinned headers unusable, syncing them from peers", "err", err)
 		return nil
 	}
+	progressed := false
 	kept := func() {
+		progressed = true
 		if state.Idle != 0 {
 			state.Idle = 0
 			_ = writeState(files, state)
@@ -161,8 +169,20 @@ func pinnedImport(ctx context.Context, dir, server string, magic wire.BitcoinNet
 		log.Error("pinned headers refused: the server's files are not the release's, syncing from peers",
 			"server", server, "err", err)
 	case ctx.Err() != nil:
-		// Given up on: resumed on the next start.
+		// Given up on, not idle: resumed on the next start.
+		if !progressed {
+			state.Idle--
+			_ = writeState(files, state)
+		}
 	default:
+		// Peers sync from here on: the store is no longer empty next time.
+		if entries, _ := os.ReadDir(files); entries != nil {
+			for _, entry := range entries {
+				if entry.Name() != "state" {
+					_ = os.Remove(filepath.Join(files, entry.Name()))
+				}
+			}
+		}
 		log.Warn("pinned headers not downloaded, syncing from peers", "err", err)
 	}
 	return nil
@@ -285,6 +305,12 @@ func downloadPinned(ctx context.Context, files, server string, magic wire.Bitcoi
 		{imp.FilterHeadersSource, "filter-headers", "filters", 32, pin.FilterHeaders,
 			func(entry []byte) bool { return bytes.Equal(entry, pin.FilterHeader[:]) }},
 	}
+	// Parts of a start killed mid-way.
+	if parts, _ := filepath.Glob(filepath.Join(files, "*.part")); parts != nil {
+		for _, part := range parts {
+			_ = os.Remove(part)
+		}
+	}
 	d := &download{server: server, total: pin.Bytes(), progress: progress, kept: kept,
 		wake: make(chan struct{})}
 	units := make([][]*unit, len(kinds))
@@ -311,6 +337,7 @@ func downloadPinned(ctx context.Context, files, server string, magic wire.Bitcoi
 			d.units = append(d.units, u)
 		}
 	}
+	d.report(nil, 0)
 	if err := d.run(ctx, proxy); err != nil {
 		return nil, err
 	}
@@ -359,7 +386,8 @@ type download struct {
 	units    []*unit
 	queue    []*unit // to ask for, first first
 	done     int64
-	failures int           // in a row
+	failures int // in a row
+	lastByte time.Time
 	wake     chan struct{} // closed as anything changes
 	idle     *time.Timer
 }
@@ -373,12 +401,12 @@ func (d *download) run(ctx context.Context, proxy *Proxy) error {
 	defer fail(nil)
 	d.mu.Lock()
 	d.idle = time.AfterFunc(importIdle, func() { fail(errIdle) })
+	d.lastByte = time.Now()
 	d.mu.Unlock()
 	defer d.idle.Stop()
 	var lanes sync.WaitGroup
 	for lane := range importLanes {
-		client := httpClient(proxy.lane(lane), 0)
-		lanes.Go(func() { d.work(ctx, fail, client, lane) })
+		lanes.Go(func() { d.work(ctx, fail, proxy, lane) })
 	}
 	lanes.Wait()
 	d.mu.Lock()
@@ -392,8 +420,12 @@ func (d *download) run(ctx context.Context, proxy *Proxy) error {
 }
 
 // work downloads units on one lane until none is left or ctx is done.
-func (d *download) work(ctx context.Context, fail context.CancelCauseFunc, client *http.Client, lane int) {
-	failed := 0
+// A lane failing goes on circuits of another, the proxy's lanes being
+// numbered up to 255.
+func (d *download) work(ctx context.Context, fail context.CancelCauseFunc, proxy *Proxy, lane int) {
+	failed, renewed := 0, 0
+	client := httpClient(proxy.lane(lane), 0)
+	defer func() { client.CloseIdleConnections() }()
 	for {
 		u, attempt, stop := d.next(ctx)
 		if u == nil {
@@ -418,6 +450,9 @@ func (d *download) work(ctx context.Context, fail context.CancelCauseFunc, clien
 			return
 		}
 		failed++
+		renewed++
+		client.CloseIdleConnections()
+		client = httpClient(proxy.lane((lane+importLanes*renewed)%256), 0)
 		select {
 		case <-ctx.Done():
 			return
@@ -521,13 +556,14 @@ func (d *download) ended(u *unit, part string, err error) error {
 func (d *download) failing() bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	return d.failures >= importFailures
+	return d.failures >= importFailures && time.Since(d.lastByte) >= importQuiet
 }
 
 // report is that a lane downloaded got bytes of u, or of none.
 func (d *download) report(u *unit, got int64) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	d.lastByte = time.Now()
 	if u == nil {
 		d.done += got
 	} else if got > u.got && !u.done {
@@ -555,6 +591,9 @@ func (d *download) fetch(ctx context.Context, client *http.Client, u *unit, part
 		return err
 	}
 	req.Header.Set("Range", fmt.Sprintf("bytes=0-%d", u.size-1))
+	// Cancelled if no answer comes, or then no byte for importStall.
+	stall := time.AfterFunc(2*proxyTimeout, cancel)
+	defer stall.Stop()
 	resp, err := client.Do(req)
 	if err != nil {
 		return err
@@ -568,9 +607,7 @@ func (d *download) fetch(ctx context.Context, client *http.Client, u *unit, part
 		return err
 	}
 	defer out.Close()
-	// A stalled download cancelled rather than waited on.
-	stall := time.AfterFunc(importStall, cancel)
-	defer stall.Stop()
+	stall.Reset(importStall)
 	body := io.LimitReader(resp.Body, u.size)
 	buf := make([]byte, 64<<10)
 	var read int64
@@ -606,13 +643,21 @@ func (u *unit) served(resp *http.Response) error {
 	case code == http.StatusPartialContent:
 		var first, last int64
 		served := resp.Header.Get("Content-Range")
-		if _, err := fmt.Sscanf(served, "bytes %d-%d/%d", &first, &last, &total); err != nil || first != 0 {
+		if _, err := fmt.Sscanf(served, "bytes %d-%d/%d", &first, &last, &total); err != nil {
+			total = -1
+			if _, err := fmt.Sscanf(served, "bytes %d-%d/*", &first, &last); err != nil {
+				return fmt.Errorf("%w: served as %q", errDigest, served)
+			}
+		}
+		if first != 0 {
 			return fmt.Errorf("%w: served as %q", errDigest, served)
 		}
-	case code == http.StatusRequestTimeout || code == http.StatusTooManyRequests || code >= 500:
-		return fmt.Errorf("HTTP %d", code)
-	default:
+	case code == http.StatusBadRequest || code == http.StatusNotFound || code == http.StatusGone:
+		// What block-dn answers for a file it does not have.
 		return fmt.Errorf("%w: HTTP %d", errNotServed, code)
+	default:
+		// Anything else, a CDN's 403 to a Tor exit say, may pass.
+		return fmt.Errorf("HTTP %d", code)
 	}
 	if total >= 0 && (total < u.size || u.full && total != u.size) {
 		return fmt.Errorf("%w: %d bytes, not %d", errDigest, total, u.size)

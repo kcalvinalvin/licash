@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -107,11 +108,26 @@ func smallFiles(t *testing.T, entries ...uint32) {
 	t.Cleanup(func() { importEntries = before })
 }
 
+// quickGiveUp has a start of the test at hand give up on failures at
+// once, not after importQuiet.
+func quickGiveUp(t *testing.T) {
+	before := importQuiet
+	importQuiet = 0
+	t.Cleanup(func() { importQuiet = before })
+}
+
 // asked is what of p's files were asked for, each once.
 func (p *pinnedServer) files() []string {
 	asked := p.taken()
 	slices.Sort(asked)
 	return slices.Compact(asked)
+}
+
+// serving has p serve as serve does from now on: nil for its files.
+func (p *pinnedServer) serving(serve func(w http.ResponseWriter, r *http.Request) bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.serve = serve
 }
 
 func (p *pinnedServer) taken() []string {
@@ -169,20 +185,31 @@ func TestAnEmptyStoreGetsThePinnedFilesChecked(t *testing.T) {
 	}
 }
 
-// A start that downloaded some files before failing leaves them for the
-// next, which asks for the rest only: not marked tried meanwhile.
+// A start given up on once some files were downloaded leaves them for the
+// next, which asks for the rest only: those cut short, or never asked for.
 func TestAStartResumesWhereTheLastLeftOff(t *testing.T) {
 	smallFiles(t)
 	p, server := newPinnedServer(t, 40)
-	p.serve = func(w http.ResponseWriter, r *http.Request) bool {
-		if strings.HasPrefix(r.URL.Path, "/filter-headers/") {
-			http.Error(w, "busy", http.StatusServiceUnavailable)
-			return true
-		}
-		return false
-	}
 	dir := t.TempDir()
-	if pinnedImport(context.Background(), dir, server.URL, wire.TestNet, &p.pin, nil, nil, quiet()) != nil {
+	files := filepath.Join(dir, "import")
+	ctx, cancel := context.WithCancel(context.Background())
+	p.serve = func(w http.ResponseWriter, r *http.Request) bool {
+		if !strings.HasPrefix(r.URL.Path, "/filter-headers/") {
+			return false
+		}
+		// Given up on once the block headers are kept.
+		for range 400 {
+			if whole(filepath.Join(files, "headers-0"), 16*80) && whole(filepath.Join(files, "headers-16"), 16*80) &&
+				whole(filepath.Join(files, "headers-32"), 9*80) {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		cancel()
+		<-r.Context().Done()
+		return true
+	}
+	if pinnedImport(ctx, dir, server.URL, wire.TestNet, &p.pin, nil, nil, quiet()) != nil {
 		t.Fatal("imported")
 	}
 	if _, err := os.Stat(triedMark(dir, &p.pin)); !os.IsNotExist(err) {
@@ -191,24 +218,86 @@ func TestAStartResumesWhereTheLastLeftOff(t *testing.T) {
 	if !importDue(dir, server.URL, &p.pin) {
 		t.Fatal("not due")
 	}
+	// One cut short, and a part a start killed mid-way left.
+	_ = os.Truncate(filepath.Join(files, "headers-16"), 100)
+	_ = os.WriteFile(filepath.Join(files, "headers-0.2.part"), nil, 0o600)
 	_ = p.taken()
-	p.serve = nil
+	p.serving(nil)
 	var told []int64
 	imp := pinnedImport(context.Background(), dir, server.URL, wire.TestNet, &p.pin, nil,
 		func(done, _ int64) { told = append(told, done) }, quiet())
 	if imp == nil {
 		t.Fatal("nothing to import")
 	}
-	if asked := p.files(); !slices.Equal(asked, []string{"/filter-headers/0", "/filter-headers/16", "/filter-headers/32"}) {
+	if asked := p.files(); !slices.Equal(asked, []string{"/filter-headers/0", "/filter-headers/16",
+		"/filter-headers/32", "/headers/16"}) {
 		t.Fatalf("asked %v", asked)
 	}
 	// Progress from the files kept on.
-	if len(told) == 0 || told[0] <= int64(len(p.blocks)-importMeta) {
+	if len(told) == 0 || told[0] != int64(25*80) {
 		t.Fatalf("progress %v", told)
 	}
 	got, err := os.ReadFile(imp.BlockHeadersSource)
 	if err != nil || !bytes.Equal(got, p.blocks) {
 		t.Fatalf("block headers: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(files, "headers-0.2.part")); !os.IsNotExist(err) {
+		t.Fatalf("a part left behind: %v", err)
+	}
+}
+
+// Failures for a while, as a network changing or a CDN refusing a Tor exit
+// cause, are waited out: the same start imports.
+func TestFailuresForAWhileAreWaitedOut(t *testing.T) {
+	smallFiles(t)
+	p, server := newPinnedServer(t, 40)
+	var failed sync.Map
+	p.serve = func(w http.ResponseWriter, r *http.Request) bool {
+		if _, done := failed.LoadOrStore(r.URL.Path, true); done {
+			return false
+		}
+		if strings.HasPrefix(r.URL.Path, "/headers/") {
+			http.Error(w, "forbidden", http.StatusForbidden)
+		} else {
+			http.Error(w, "busy", http.StatusServiceUnavailable)
+		}
+		return true
+	}
+	dir := t.TempDir()
+	var told [][2]int64
+	imp := pinnedImport(context.Background(), dir, server.URL, wire.TestNet, &p.pin, nil,
+		func(done, total int64) { told = append(told, [2]int64{done, total}) }, quiet())
+	if imp == nil {
+		t.Fatal("nothing to import")
+	}
+	for _, at := range told {
+		if at[0] > at[1] {
+			t.Fatalf("progress %v", told)
+		}
+	}
+	if _, err := os.Stat(triedMark(dir, &p.pin)); !os.IsNotExist(err) {
+		t.Fatalf("marked tried: %v", err)
+	}
+}
+
+// Starts given up on before downloading anything are not idle ones: due
+// on, however many.
+func TestStartsGivenUpOnStayDue(t *testing.T) {
+	p, server := newPinnedServer(t, 40)
+	dir := t.TempDir()
+	for range importStarts + 1 {
+		ctx, cancel := context.WithCancel(context.Background())
+		p.serving(func(w http.ResponseWriter, r *http.Request) bool {
+			cancel()
+			<-r.Context().Done()
+			return true
+		})
+		if pinnedImport(ctx, dir, server.URL, wire.TestNet, &p.pin, nil, nil, quiet()) != nil {
+			t.Fatal("imported")
+		}
+	}
+	if !importDue(dir, server.URL, &p.pin) {
+		t.Fatal("not due")
 	}
 }
 
@@ -232,9 +321,11 @@ func TestAFileStalledOnIsAskedForOnAnotherLane(t *testing.T) {
 		return first
 	}
 	began := time.Now()
-	imp := pinnedImport(context.Background(), t.TempDir(), server.URL, wire.TestNet, &p.pin, nil, nil, quiet())
-	if imp == nil {
-		t.Fatal("nothing to import")
+	var over atomic.Bool
+	imp := pinnedImport(context.Background(), t.TempDir(), server.URL, wire.TestNet, &p.pin, nil,
+		func(done, total int64) { over.CompareAndSwap(false, done > total) }, quiet())
+	if imp == nil || over.Load() {
+		t.Fatalf("nothing to import, or progress past all: %v", over.Load())
 	}
 	if took := time.Since(began); took > importStall/2 {
 		t.Fatalf("took %v", took)
@@ -419,7 +510,8 @@ func TestADownloadGivenUpOnStops(t *testing.T) {
 }
 
 // Given up on by the caller, the download is tried again on the next start;
-// failing, on importStarts starts in all, each counted as it begins.
+// failing, on importStarts starts in all, each counted as it begins, but
+// for those given up on before downloading anything.
 func TestOnlyADownloadGivenUpOnIsTriedAgain(t *testing.T) {
 	p, server := newPinnedServer(t, 40)
 	dir := t.TempDir()
@@ -442,19 +534,20 @@ func TestOnlyADownloadGivenUpOnIsTriedAgain(t *testing.T) {
 	if !ImportDue(cfg) {
 		t.Fatal("not due again")
 	}
-	p.serve = func(w http.ResponseWriter, r *http.Request) bool {
+	p.serving(func(w http.ResponseWriter, r *http.Request) bool {
 		http.Error(w, "gone", http.StatusServiceUnavailable)
 		return true
-	}
+	})
+	quickGiveUp(t)
 	store := filepath.Join(dir, "peer-headers-v1")
-	starts := 1
+	starts := 0
 	for ; ImportDue(cfg); starts++ {
 		if pinnedImport(context.Background(), store, server.URL, wire.TestNet, &p.pin, nil, nil, quiet()) != nil {
 			t.Fatal("imported")
 		}
 	}
 	if starts != importStarts {
-		t.Fatalf("tried on %d starts", starts)
+		t.Fatalf("tried on %d failing starts", starts)
 	}
 	_ = p.taken()
 	if pinnedImport(context.Background(), store, server.URL, wire.TestNet, &p.pin, nil, nil, quiet()) != nil {
