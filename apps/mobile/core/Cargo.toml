@@ -27,6 +27,8 @@ licash-transport = { workspace = true, features = ["tor"] }
 anyhow.workspace = true
 bitcoin = { version = "=0.32.102", default-features = false, features = ["std"] }
 bip39 = "2.2"
+chacha20poly1305 = "0.10"
+flate2 = "1"
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 hex = "0.4"
 rand_core = { version = "0.6", features = ["getrandom"] }

@@ -1,5 +1,6 @@
 package org.licash.wallet.ui
 
+import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
@@ -28,9 +29,12 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import java.time.LocalDate
 import kotlinx.coroutines.launch
+import org.licash.core.BackupFound
+import org.licash.wallet.AutoBackup
 import org.licash.wallet.Engine
 import org.licash.wallet.PHRASE_WORDS
 import org.licash.wallet.Ui
+import org.licash.wallet.at
 import org.licash.wallet.backupName
 import org.licash.wallet.digits
 import org.licash.wallet.explain
@@ -38,18 +42,77 @@ import org.licash.wallet.phraseWords
 
 private const val ONE_COPY = "Use it on one phone only: a wallet live on two phones can lose money."
 
-/** Settings' backup page: the recovery words, and a file of everything. */
+/** Settings' backup page: the recovery words, automatic backups, and a file of everything. */
 @Composable
 internal fun BackupPage(engine: Engine, ui: Ui) {
     var words by remember { mutableStateOf(false) }
+    var auto by remember { mutableStateOf(false) }
     var file by remember { mutableStateOf(false) }
     Group("") {
         Entry("Recovery words", sub = "Your keys, on paper", tag = "backup-words") { words = true }
         Divider()
+        Entry("Automatic backup", sub = autoBackupState(ui.backup), tag = "backup-auto") { auto = true }
+        Divider()
         Entry("Backup file", sub = "Everything, as of now", tag = "backup-file") { file = true }
     }
     if (words) Phrase(engine) { words = false }
+    if (auto) AutoBackupSheet(engine, ui) { auto = false }
     if (file) BackupFile(engine, ui) { file = false }
+}
+
+/** How automatic backups stand, in a line. */
+internal fun autoBackupState(backup: AutoBackup?): String = when {
+    backup == null -> "Off: everything, to a folder you sync"
+    backup.problem != null -> "Failing: ${backup.problem}"
+    backup.at == null -> "On, none written yet"
+    else -> "On, last ${at(backup.at / 1000)}"
+}
+
+/** Automatic backups: a folder chosen, written to whenever the wallet changes. */
+@Composable
+private fun AutoBackupSheet(engine: Engine, ui: Ui, dismiss: () -> Unit) {
+    val scope = rememberCoroutineScope()
+    var busy by remember { mutableStateOf(false) }
+    var error by remember { mutableStateOf<String?>(null) }
+    fun run(step: suspend () -> Result<Unit>) {
+        busy = true
+        error = null
+        scope.launch {
+            step().onFailure { error = explain(it) }
+            busy = false
+        }
+    }
+    val choosing = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+        if (uri != null) run { engine.startBackups(uri) }
+    }
+    val backup = ui.backup
+    Sheet("Automatic backup", dismiss, dismissable = !busy) {
+        Say(
+            "Everything this wallet holds, encrypted with your recovery words, saved to a folder each time it " +
+                "changes. Choose one a sync app (Syncthing, Nextcloud) copies off this phone.",
+        )
+        Say("Restoring needs the folder and your 24 words.")
+        if (backup != null) {
+            Line("Last backup", backup.at?.let { at(it / 1000) } ?: "None yet", tag = "backup-at")
+            backup.problem?.let { Problem(it) }
+        }
+        error?.let { Problem(it) }
+        Spacer(Modifier.height(8.dp))
+        if (backup == null) {
+            BigButton(if (busy) "Saving…" else "Choose folder", Modifier.fillMaxWidth().testTag("backup-choose"), enabled = !busy) {
+                choosing.launch(null)
+            }
+            return@Sheet
+        }
+        BigButton(if (busy) "Saving…" else "Back up now", Modifier.fillMaxWidth().testTag("backup-now"), enabled = !busy) {
+            run { engine.backupAgain() }
+        }
+        Spacer(Modifier.height(8.dp))
+        BigButton("Another folder", Modifier.fillMaxWidth(), quiet = true, enabled = !busy) { choosing.launch(null) }
+        BigButton("Turn off", Modifier.fillMaxWidth().testTag("backup-off"), quiet = true, enabled = !busy) {
+            engine.stopBackups()
+        }
+    }
 }
 
 /** The 24 words, behind a warning and a tap; out of screenshots while shown. */
@@ -152,6 +215,9 @@ internal fun Restore(engine: Engine, dismiss: () -> Unit) {
     var born by remember { mutableStateOf("") }
     var busy by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
+    // From a backup folder: the folder, then the words, then the backup found.
+    var folder by remember { mutableStateOf<Uri?>(null) }
+    var found by remember { mutableStateOf<BackupFound?>(null) }
     fun run(restore: suspend () -> Result<Unit>) {
         busy = true
         error = null
@@ -163,10 +229,20 @@ internal fun Restore(engine: Engine, dismiss: () -> Unit) {
     val opening = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) run { engine.restoreBackup(uri) }
     }
+    val choosing = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+        if (uri != null) {
+            folder = uri
+            typing = true
+        }
+    }
     Sheet("Restore a wallet", dismiss, dismissable = !busy, secure = typing) {
         if (!typing) {
             Say(ONE_COPY)
             error?.let { Problem(it) }
+            Entry("Backup folder", sub = "Everything, as last backed up", tag = "restore-folder") {
+                if (!busy) choosing.launch(null)
+            }
+            Divider()
             Entry("Backup file", sub = if (busy) "Restoring…" else "Everything, as saved", tag = "restore-file") {
                 if (!busy) opening.launch(arrayOf("*/*"))
             }
@@ -175,7 +251,38 @@ internal fun Restore(engine: Engine, dismiss: () -> Unit) {
             return@Sheet
         }
         val words = phraseWords(text)
-        Say("Brings back your keys and coins on Bitcoin, not money in hubs. Finding coins can take hours.")
+        val shown = found
+        val chosen = folder
+        if (chosen != null && shown != null) {
+            Say("Your backup of ${at(shown.madeAt.toLong())}: everything as it was then.")
+            if (shown.newerUnusable > 0u) {
+                Problem(
+                    "${shown.newerUnusable} newer backups there are incomplete, perhaps still syncing. " +
+                        "Wait for the sync to finish, or restore this older one.",
+                )
+            }
+            if (shown.writers > 1u) {
+                Problem(
+                    "Backups of ${shown.writers} phones are in this folder: this is the newest, " +
+                        "not necessarily the one holding the most.",
+                )
+            }
+            Say(ONE_COPY)
+            error?.let { Problem(it) }
+            BigButton(
+                if (busy) "Restoring…" else "Restore",
+                Modifier.fillMaxWidth().testTag("restore"),
+                enabled = !busy,
+            ) { run { engine.restoreFolder(chosen, words, shown.generation) } }
+            return@Sheet
+        }
+        Say(
+            if (chosen != null) {
+                "Your 24 words open the backups in the folder."
+            } else {
+                "Brings back your keys and coins on Bitcoin, not money in hubs. Finding coins can take hours."
+            },
+        )
         OutlinedTextField(
             value = text,
             onValueChange = { text = it; error = null },
@@ -190,6 +297,22 @@ internal fun Restore(engine: Engine, dismiss: () -> Unit) {
             ),
             shape = RoundedCornerShape(14.dp),
         )
+        if (chosen != null) {
+            error?.let { Problem(it) }
+            Spacer(Modifier.height(12.dp))
+            BigButton(
+                if (busy) "Looking…" else "Find backup",
+                Modifier.fillMaxWidth().testTag("find-backup"),
+                enabled = !busy && words.size == PHRASE_WORDS,
+            ) {
+                run {
+                    engine.findFolderBackup(chosen, words).mapCatching {
+                        found = it ?: throw IllegalStateException("No backup of these words there, on this network.")
+                    }
+                }
+            }
+            return@Sheet
+        }
         Spacer(Modifier.height(8.dp))
         val birthday = born.trim().takeIf { it.isNotEmpty() }?.toUIntOrNull()
         val badBirthday = born.isNotBlank() && (birthday == null || birthday == 0u)

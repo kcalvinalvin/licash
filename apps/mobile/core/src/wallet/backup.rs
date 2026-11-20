@@ -25,13 +25,13 @@ use crate::{ChainSource, LicashError, Network, TorClient};
 /// version restores no more.
 const FORMAT: u32 = 2;
 const MAX_FILES: usize = 100_000;
-const MAX_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+pub(super) const MAX_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 
 #[derive(Serialize, Deserialize, PartialEq, Eq, Debug)]
 #[serde(deny_unknown_fields)]
-struct Entry {
-    bytes: u64,
-    sha256: String,
+pub(super) struct Entry {
+    pub(super) bytes: u64,
+    pub(super) sha256: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -43,11 +43,11 @@ struct Manifest {
     files: BTreeMap<String, Entry>,
 }
 
-fn failed(e: anyhow::Error) -> LicashError {
+pub(super) fn failed(e: anyhow::Error) -> LicashError {
     LicashError::from_any(e, |reason| LicashError::Failed { reason })
 }
 
-fn seed_of(phrase: &str) -> Result<[u8; 32]> {
+pub(super) fn seed_of(phrase: &str) -> Result<[u8; 32]> {
     let words = Mnemonic::parse_in_normalized(
         Language::English,
         &phrase.split_whitespace().collect::<Vec<_>>().join(" "),
@@ -119,44 +119,9 @@ impl Wallet {
     ) -> Result<Arc<Self>, LicashError> {
         let dir = std::path::PathBuf::from(dir);
         let install = || -> Result<()> {
-            ensure!(
-                !holds_state(&dir),
-                "a wallet is there already; nothing was overwritten"
-            );
-            let parent = dir.parent().context("no wallet parent directory")?;
-            fs::create_dir_all(parent)?;
-            let staged = tempfile::Builder::new()
-                .prefix(".wallet-restore-")
-                .tempdir_in(parent)?;
+            let staged = staging(&dir)?;
             let manifest = extract(Path::new(&bundle), staged.path())?;
-            validate_database(&wallet_file(staged.path()))?;
-            let http = licash_transport::Http::new(None)?;
-            let wallet = licash_wallet::Wallet::open(&wallet_file(staged.path()), http)?;
-            ensure!(
-                wallet.network().name() == manifest.network,
-                "bundle network disagrees with its wallet"
-            );
-            let staged_wallet = wallet_file(staged.path());
-            licash_contracts::holder::validate_backup(&wallet, &staged_wallet)?;
-            // Consent to exit is given on the phone it acts on, not restored.
-            licash_contracts::holder::exit::revoke(&staged_wallet)?;
-            drop(wallet);
-            ensure!(
-                !holds_state(&dir),
-                "a wallet is there now; nothing was overwritten"
-            );
-            if dir.exists() {
-                // What a wallet's making left before it failed, no wallet's
-                // state: moved aside, never deleted.
-                let aside = tempfile::Builder::new()
-                    .prefix(".wallet-leftover-")
-                    .tempdir_in(parent)?
-                    .keep();
-                fs::rename(&dir, aside.join("wallet"))?;
-            }
-            fs::rename(staged.path(), &dir)?;
-            File::open(parent)?.sync_all()?;
-            Ok(())
+            install(&dir, staged, &manifest.network)
         };
         install().map_err(failed)?;
         Self::open(dir.display().to_string(), tor)
@@ -290,6 +255,54 @@ impl Wallet {
     }
 }
 
+/// A directory to unpack a wallet restored into `dir` in, beside it: an
+/// error if a wallet is there already.
+pub(super) fn staging(dir: &Path) -> Result<tempfile::TempDir> {
+    ensure!(
+        !holds_state(dir),
+        "a wallet is there already; nothing was overwritten"
+    );
+    let parent = dir.parent().context("no wallet parent directory")?;
+    fs::create_dir_all(parent)?;
+    Ok(tempfile::Builder::new()
+        .prefix(".wallet-restore-")
+        .tempdir_in(parent)?)
+}
+
+/// The wallet unpacked in `staged`, of `network`, checked as an imported
+/// database must be and installed at `dir`, never over a wallet there.
+pub(super) fn install(dir: &Path, staged: tempfile::TempDir, network: &str) -> Result<()> {
+    let parent = dir.parent().context("no wallet parent directory")?;
+    validate_database(&wallet_file(staged.path()))?;
+    let http = licash_transport::Http::new(None)?;
+    let wallet = licash_wallet::Wallet::open(&wallet_file(staged.path()), http)?;
+    ensure!(
+        wallet.network().name() == network,
+        "backup network disagrees with its wallet"
+    );
+    let staged_wallet = wallet_file(staged.path());
+    licash_contracts::holder::validate_backup(&wallet, &staged_wallet)?;
+    // Consent to exit is given on the phone it acts on, not restored.
+    licash_contracts::holder::exit::revoke(&staged_wallet)?;
+    drop(wallet);
+    ensure!(
+        !holds_state(dir),
+        "a wallet is there now; nothing was overwritten"
+    );
+    if dir.exists() {
+        // What a wallet's making left before it failed, no wallet's
+        // state: moved aside, never deleted.
+        let aside = tempfile::Builder::new()
+            .prefix(".wallet-leftover-")
+            .tempdir_in(parent)?
+            .keep();
+        fs::rename(dir, aside.join("wallet"))?;
+    }
+    fs::rename(staged.path(), dir)?;
+    File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
 /// Whether `dir` holds any wallet state, be it in part: a restore never
 /// lands over it.
 fn holds_state(dir: &Path) -> bool {
@@ -323,7 +336,7 @@ fn allowed(path: &Path) -> bool {
     }
 }
 
-fn collect_contracts(root: &Path, relative: &Path, out: &mut Vec<String>) -> Result<()> {
+pub(super) fn collect_contracts(root: &Path, relative: &Path, out: &mut Vec<String>) -> Result<()> {
     let source = root.join(relative);
     if !source.exists() {
         return Ok(());
@@ -351,7 +364,7 @@ fn collect_contracts(root: &Path, relative: &Path, out: &mut Vec<String>) -> Res
     Ok(())
 }
 
-fn hash(input: &mut impl Read, output: &mut impl Write) -> Result<Entry> {
+pub(super) fn hash(input: &mut impl Read, output: &mut impl Write) -> Result<Entry> {
     let mut digest = Sha256::new();
     let mut bytes = 0u64;
     let mut buffer = [0; 65_536];
@@ -376,7 +389,23 @@ fn extract(bundle: &Path, to: &Path) -> Result<Manifest> {
         fs::metadata(bundle)?.len() <= MAX_BYTES + 16 * 1024 * 1024,
         "state bundle is too large"
     );
-    let mut archive = tar::Archive::new(File::open(bundle)?);
+    let (manifest, actual) = unpack(File::open(bundle)?, to)?;
+    let manifest = serde_json::from_slice::<Manifest>(&manifest)?;
+    ensure!(
+        manifest.kind == "licash-state-bundle" && manifest.format == FORMAT,
+        "unknown state bundle format"
+    );
+    ensure!(
+        actual.contains_key("wallet.sqlite") && manifest.files == actual,
+        "state bundle checksum or file list mismatch"
+    );
+    Ok(manifest)
+}
+
+/// The files of a tar of wallet state unpacked `to`, as they hashed, and its
+/// `manifest.json`, unread; the JSON files checked readable.
+pub(super) fn unpack(tar: impl Read, to: &Path) -> Result<(Vec<u8>, BTreeMap<String, Entry>)> {
+    let mut archive = tar::Archive::new(tar);
     let (mut actual, mut manifest) = (BTreeMap::new(), None);
     let mut total = 0u64;
     for entry in archive.entries()? {
@@ -399,7 +428,7 @@ fn extract(bundle: &Path, to: &Path) -> Result<Manifest> {
             );
             let mut bytes = Vec::new();
             entry.read_to_end(&mut bytes)?;
-            manifest = Some(serde_json::from_slice::<Manifest>(&bytes)?);
+            manifest = Some(bytes);
             continue;
         }
         ensure!(allowed(&path), "unsafe or unsupported state path");
@@ -425,21 +454,13 @@ fn extract(bundle: &Path, to: &Path) -> Result<Manifest> {
         actual.insert(name, digest);
     }
     let manifest = manifest.context("not a Licash state bundle")?;
-    ensure!(
-        manifest.kind == "licash-state-bundle" && manifest.format == FORMAT,
-        "unknown state bundle format"
-    );
-    ensure!(
-        actual.contains_key("wallet.sqlite") && manifest.files == actual,
-        "state bundle checksum or file list mismatch"
-    );
     for name in ["app.json", "contacts.json"] {
         let path = to.join(name);
         if path.exists() {
             serde_json::from_slice::<serde_json::Value>(&fs::read(path)?)?;
         }
     }
-    Ok(manifest)
+    Ok((manifest, actual))
 }
 
 /// Bound records before opening an imported database through normal wallet

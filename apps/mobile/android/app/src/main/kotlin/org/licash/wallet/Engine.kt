@@ -1,6 +1,7 @@
 package org.licash.wallet
 
 import android.content.Context
+import android.content.Intent
 import android.net.Uri
 import android.os.SystemClock
 import androidx.lifecycle.DefaultLifecycleObserver
@@ -30,6 +31,8 @@ import kotlinx.coroutines.withTimeoutOrNull
 import org.licash.chain.mobile.Chain as LightClient
 import org.licash.chain.mobile.Mobile
 import org.licash.core.Activity
+import org.licash.core.BackupFound
+import org.licash.core.BackupStep
 import org.licash.core.Balance
 import org.licash.core.Code
 import org.licash.core.Contact
@@ -41,6 +44,7 @@ import org.licash.core.Details
 import org.licash.core.DonationAddress
 import org.licash.core.ExitConsent
 import org.licash.core.FeesRaised
+import org.licash.core.FolderFile
 import org.licash.core.Holding
 import org.licash.core.Hub
 import org.licash.core.InvoiceQuote
@@ -68,6 +72,8 @@ import org.licash.core.Wallet
 import org.licash.core.chainName
 import org.licash.core.defaultRelays
 import org.licash.core.explorer
+import org.licash.core.backupFolderName
+import org.licash.core.findBackup
 import org.licash.core.setLogger
 import org.licash.core.walletExists
 import org.licash.wallet.ui.Progress
@@ -120,6 +126,8 @@ data class Ui(
     val onTheirWay: UInt = 0u,
     /** Cold storage, if configured: notes withdrawn to an external wallet. */
     val cold: ColdStorage? = null,
+    /** Automatic backups, if a folder is chosen. */
+    val backup: AutoBackup? = null,
 )
 
 /** A line of the history's own key: lines of different kinds can share an id. */
@@ -156,6 +164,9 @@ private fun statusOf(light: LightClient): ChainStatus = ChainStatus(
     peerHeight = light.peerHeight(),
     importing = light.importing(),
 )
+
+/** Automatic backups to a folder: when last written whole, and what failed since, if anything. */
+data class AutoBackup(val at: Long?, val problem: String? = null)
 
 /** Something to tell the user once; `received` if it is money in. */
 data class Event(val text: String, val received: ULong? = null)
@@ -299,6 +310,8 @@ class Engine(context: Context) {
 
             override fun onStop(owner: LifecycleOwner) {
                 foreground = false
+                // Out of sight the app may stop soon: a change not backed up is now.
+                scope.launch { autoBackup() }
             }
         })
         scope.launch {
@@ -482,6 +495,148 @@ class Engine(context: Context) {
         if (now - since >= CATCH_UP_AFTER_MS) WatchService.start(app)
     }
 
+    /*
+     * Automatic backups. Each field below is read and written under
+     * [backupLock] only.
+     */
+
+    /** The wallet's files as last seen ([Wallet.backupStamp]), and as they were when last backed up. */
+    private var seenStamp: String? = null
+    private var backedStamp: String? = null
+
+    /** Since when, and when last, the wallet changed with no backup since ([SystemClock.elapsedRealtime]). */
+    private var changedFirst = 0L
+    private var changedLast = 0L
+
+    /** When a backup was last looked at, and none tried again before when, after a failure. */
+    private var backupLooked = 0L
+    private var backupRetry = 0L
+    private val backupLock = Mutex()
+
+    /**
+     * An automatic backup, if a folder is chosen: the wallet changed, once
+     * it rested for 30 seconds, or 5 minutes after a change at the latest,
+     * at once out of sight where the app may stop soon; else hourly, which
+     * writes one only if the last is a day old or gone from the folder.
+     * Rust tells whether a change is worth one.
+     */
+    private suspend fun autoBackup() {
+        val tree = prefs.backupFolder ?: return
+        val w = wallet ?: return
+        // One at a time: another under way sees this change too.
+        if (!backupLock.tryLock()) return
+        try {
+            val now = SystemClock.elapsedRealtime()
+            val stamp = runCatching { w.backupStamp() }.getOrNull() ?: return
+            if (stamp != seenStamp) {
+                if (seenStamp == backedStamp) changedFirst = now
+                seenStamp = stamp
+                changedLast = now
+            }
+            val due = when {
+                now < backupRetry -> false
+                stamp != backedStamp ->
+                    !foreground || now - changedLast >= BACKUP_REST_MS || now - changedFirst >= BACKUP_MOST_MS
+                else -> now - backupLooked >= BACKUP_LOOK_MS
+            }
+            if (due) backupLocked(tree, w, force = false)
+        } finally {
+            backupLock.unlock()
+        }
+    }
+
+    /** [backupLocked] under [backupLock], off the main thread. */
+    private suspend fun backupNow(tree: String, force: Boolean): Result<Unit> = withContext(Dispatchers.IO) {
+        backupLock.withLock {
+            val w = wallet ?: return@withLock Result.failure(LicashException.Invalid("there is no wallet yet"))
+            backupLocked(tree, w, force)
+        }
+    }
+
+    /**
+     * A backup of `w` written to the folder `tree` if it changed since the
+     * last, or if `force`: its files copied from the outbox, those of older
+     * ones deleted. Under [backupLock].
+     */
+    private suspend fun backupLocked(tree: String, w: Wallet, force: Boolean): Result<Unit> = io {
+        val now = SystemClock.elapsedRealtime()
+        backupLooked = now
+        // What this backup holds at least: changes after it are due still.
+        val stamp = w.backupStamp()
+        val outbox = File(app.noBackupFilesDir, "backup-outbox")
+        try {
+            val folder = backupDir(Uri.parse(tree), w.backupFolder())
+            val present = folder.children().filter { !it.dir }
+                .map { FolderFile(it.name, it.bytes.takeIf { b -> b >= 0 }?.toULong()) }
+            when (val step = w.prepareBackup(outbox.path, present, force)) {
+                // Contract work under way: the change still due.
+                is BackupStep.Busy -> return@io
+                is BackupStep.Unchanged -> {}
+                is BackupStep.Write -> {
+                    val run = step.run
+                    for (name in run.write) folder.write(name, File(outbox, name))
+                    for (name in run.delete) {
+                        runCatching { folder.delete(name) }.onFailure { AppLog.warn("an old backup's file", it) }
+                    }
+                    w.backupPublished(run.generation)
+                    prefs.backupAt = System.currentTimeMillis()
+                    AppLog.info("backup written: ${run.write.size} files, ${run.delete.size} deleted")
+                }
+            }
+        } finally {
+            outbox.listFiles()?.forEach { it.delete() }
+        }
+        backedStamp = stamp
+        backupRetry = 0L
+        state.update { it.copy(backup = AutoBackup(prefs.backupAt)) }
+    }.onFailure { e ->
+        AppLog.warn("an automatic backup", e)
+        // Tried again in a while, not every round.
+        backupRetry = SystemClock.elapsedRealtime() + BACKUP_RETRY_MS
+        state.update { it.copy(backup = AutoBackup(prefs.backupAt, explain(e))) }
+    }
+
+    /**
+     * The folder the wallet's backups are in: `tree` itself if the user
+     * chose that one, else the one of its name in it, made if not there.
+     * Backing up and restoring find the same.
+     */
+    private fun backupDir(tree: Uri, name: String): Folder {
+        val root = Folder.of(app, tree)
+        return if (root.name() == name) root else root.dir(name)
+    }
+
+    /** Automatic backups to the folder `tree` the user chose, the first one written now. */
+    suspend fun startBackups(tree: Uri): Result<Unit> {
+        val flags = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+        val kept = runCatching { app.contentResolver.takePersistableUriPermission(tree, flags) }
+        if (kept.isFailure) return Result.failure(kept.exceptionOrNull()!!)
+        prefs.backupFolder?.takeIf { it != tree.toString() }?.let { old ->
+            runCatching { app.contentResolver.releasePersistableUriPermission(Uri.parse(old), flags) }
+        }
+        prefs.backupFolder = tree.toString()
+        AppLog.info("automatic backups on")
+        return backupNow(tree.toString(), force = true)
+    }
+
+    /** A backup written now, changed or not. */
+    suspend fun backupAgain(): Result<Unit> {
+        val tree = prefs.backupFolder ?: return Result.failure(IllegalStateException("no backup folder chosen"))
+        return backupNow(tree, force = true)
+    }
+
+    /** No more automatic backups: those in the folder stay. */
+    fun stopBackups() {
+        prefs.backupFolder?.let { old ->
+            val flags = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+            runCatching { app.contentResolver.releasePersistableUriPermission(Uri.parse(old), flags) }
+        }
+        prefs.backupFolder = null
+        prefs.backupAt = null
+        state.update { it.copy(backup = null) }
+        AppLog.info("automatic backups off")
+    }
+
     /** A step of catching up logged, once a start, with the time it took since the light client started. */
     private fun phase(step: String) {
         val first = synchronized(phases) { phases.add(step.substringBefore(" to block")) }
@@ -505,6 +660,7 @@ class Engine(context: Context) {
                 prefetchQuotes()
                 if (state.value.chain.synced) rounds.update { it + 1 }
                 if (foreground) keepCatchingUp()
+                autoBackup()
             }
             // Out of sight, what is watched waits for blocks: no hurry,
             // unless catching up.
@@ -870,6 +1026,7 @@ class Engine(context: Context) {
                     asked = prefs.askedAt,
                     onTheirWay = shown.onTheirWay,
                     cold = shown.cold,
+                    backup = prefs.backupFolder?.let { _ -> it.backup ?: AutoBackup(prefs.backupAt) },
                 )
             }
         }
@@ -1038,6 +1195,40 @@ class Engine(context: Context) {
         } finally {
             copy.delete()
         }
+    }
+
+    /** Where a backup folder's files are copied to, to restore from. */
+    private val restoreCopy get() = File(app.noBackupFilesDir, "restore-folder")
+
+    /**
+     * The newest backup of the wallet of `words`, on the network chosen, in
+     * the folder `tree` or in its own folder in it: none if none restores.
+     * Its files are copied to the phone, kept for [restoreFolder].
+     */
+    suspend fun findFolderBackup(tree: Uri, words: List<String>): Result<BackupFound?> = io {
+        val phrase = words.joinToString(" ")
+        val name = backupFolderName(phrase, prefs.network)
+        val root = Folder.of(app, tree)
+        // As [backupDir] finds it, never made here.
+        val folder = if (root.name() == name) root else root.find(name)
+        val copy = restoreCopy.apply { deleteRecursively(); mkdirs() }
+        if (folder == null) return@io null
+        for (c in folder.children()) {
+            if (!c.dir && c.name.endsWith(".lcb")) folder.read(c, File(copy, c.name))
+        }
+        findBackup(phrase, prefs.network, copy.path)
+    }
+
+    /**
+     * The wallet of `words` from its backup of `generation` found by
+     * [findFolderBackup], its automatic backups going on to `tree`.
+     */
+    suspend fun restoreFolder(tree: Uri, words: List<String>, generation: ULong): Result<Unit> {
+        val phrase = words.joinToString(" ")
+        val done = restored { Wallet.fromBackup(walletDir, phrase, prefs.network, restoreCopy.path, generation, tor()) }
+        restoreCopy.deleteRecursively()
+        if (done.isSuccess) startBackups(tree).onFailure { AppLog.warn("backups after a restore", it) }
+        return done
     }
 
     /**
@@ -1630,6 +1821,8 @@ class Engine(context: Context) {
             looking = false
             WatchJob.cancel(app)
             ScanJob.cancel(app)
+            // The folder's backups stay hers; none of a wallet gone.
+            stopBackups()
         }
         // Its network may differ from the one chosen next.
         lightLock.withLock { startLight() }
@@ -1654,6 +1847,10 @@ class Engine(context: Context) {
         private const val MAIL_MS = 1_000L
         private const val AWAY_MS = 60_000L
         private const val CATCH_UP_AFTER_MS = 15_000L
+        private const val BACKUP_REST_MS = 30_000L
+        private const val BACKUP_MOST_MS = 5 * 60_000L
+        private const val BACKUP_LOOK_MS = 3600_000L
+        private const val BACKUP_RETRY_MS = 5 * 60_000L
         private const val PROVIDERS_MS = 15 * 60_000L
         private const val PROVIDERS_RETRY_MS = 2 * 60_000L
         private const val OFFER_MS = 30 * 60_000L

@@ -104,4 +104,14 @@ class Prefs(context: Context) {
     var askedAt: Long?
         get() = prefs.getLong("asked_at", -1L).takeIf { it >= 0 }
         set(at) = prefs.edit().putLong("asked_at", at ?: -1L).apply()
+
+    /** The folder (a document tree's URI) automatic backups go to: none if off. */
+    var backupFolder: String?
+        get() = prefs.getString("backup_folder", null)
+        set(uri) = prefs.edit().putString("backup_folder", uri).apply()
+
+    /** When an automatic backup was last written whole, in ms since the epoch, if ever. */
+    var backupAt: Long?
+        get() = prefs.getLong("backup_at", -1L).takeIf { it >= 0 }
+        set(at) = prefs.edit().putLong("backup_at", at ?: -1L).apply()
 }

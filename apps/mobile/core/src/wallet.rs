@@ -33,6 +33,7 @@ const SCAN_BATCH: u32 = 144;
 /// A day, in seconds.
 const DAY: i64 = 86_400;
 
+mod autobackup;
 mod backup;
 mod cold;
 mod contacts;

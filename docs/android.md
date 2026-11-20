@@ -72,7 +72,36 @@ address shown in Receive. How the app looks and speaks, and the shared parts to 
   client's blocks are left out. Payments after it are not in it. Restore a
   backup on one phone only: two live copies can reuse one-time recovery
   keys and lose money.
-- **Restore**, from the first screen: from a backup file (its network is
+- **Automatic backup**: off until the user chooses a folder (through the
+  system folder picker), meant for one a sync app such as Syncthing or
+  Nextcloud carries off the phone. From then on, each change worth a backup
+  (anything but the progress of looking through Bitcoin) is written once
+  the wallet rests for 30 seconds, 5 minutes after the change at the
+  latest, at once when the app leaves the screen, once a day if nothing
+  changed, and as soon as the folder no longer holds the last one. A
+  failed backup is tried again 5 minutes later. The backups are in `Licash-<id>/` in that folder, `id`
+  of the seed and network, telling nothing of the wallet; every file is
+  written once under a new name and never changed, so a sync app never
+  sees half a file nor two versions of one:
+  - `s-<generation>-<writer>.lcb`: a snapshot of everything the backup file
+    holds, gzipped, but the contract states of 64 KiB or more (each
+    megabytes that do not compress), which it names. The newest three of
+    the phone are kept.
+  - `b-<name>.lcb`: one such state, named by a keyed hash of its bytes,
+    written once however many snapshots name it.
+
+  Each file is sealed with XChaCha20-Poly1305 under a key of the seed and
+  network, its header (generation and writer included) authenticated: a
+  file cut short, renamed or of another wallet is refused whole. A
+  snapshot of a wallet without contracts is tens to hundreds of KB. The
+  phone records what it wrote in `autobackup.json` beside the wallet,
+  before writing, and deletes only its own files no kept snapshot names.
+  Contract work under way delays a backup until it is done.
+- **Restore**, from the first screen: from a backup folder (with the
+  recovery words, the newest snapshot that restores whole, its date shown,
+  and told when newer ones there do not, as when still syncing, or when
+  several phones backed up there; automatic
+  backups go on to that folder), from a backup file (its network is
   the wallet's) or from the recovery words (of the network chosen). It never
   lands over existing wallet state; a backup this build cannot carry on
   ("needs a newer version of the app") or one missing a file a recovery
