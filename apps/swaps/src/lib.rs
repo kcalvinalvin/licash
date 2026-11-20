@@ -35,6 +35,10 @@ pub const BODY_LIMIT: usize = 64 * 1024;
 /// `ok` while the service serves.
 pub const HEALTH: &str = "/health";
 
+/// The most requests it serves at once: those past it are answered
+/// unavailable at once, rather than queued without bound.
+pub const MAX_SERVING: usize = 256;
+
 /// A chain source, as the provider reads Bitcoin and broadcasts through it.
 pub struct ChainView(pub Source);
 
@@ -104,9 +108,31 @@ fn routes<T: Transport + 'static, C: Chain + Send + 'static>(
     nostr: Option<String>,
     chain: Option<Arc<C>>,
 ) -> Router {
-    paths(provider, nostr, chain)
-        .route(HEALTH, get(|| async { "ok" }))
-        .layer(TraceLayer::new_for_http())
+    let routes = paths(provider, nostr, chain).route(HEALTH, get(|| async { "ok" }));
+    shed(routes, MAX_SERVING).layer(TraceLayer::new_for_http())
+}
+
+/// `router`, serving at most `most` requests at once but its [`HEALTH`]:
+/// any past them answered unavailable (503) at once. A hub serving the
+/// swaps into it ([`api`]) bounds them with its own.
+pub fn shed(router: Router, most: usize) -> Router {
+    let serving = Arc::new(tokio::sync::Semaphore::new(most));
+    router.layer(axum::middleware::from_fn(
+        move |request: axum::extract::Request, next: axum::middleware::Next| {
+            let serving = serving.clone();
+            async move {
+                if request.uri().path() == HEALTH {
+                    return next.run(request).await;
+                }
+                let Ok(_serving) = serving.try_acquire_owned() else {
+                    tracing::warn!(path = %request.uri().path(), "too busy to serve");
+                    let busy = Problem::new(Code::Unavailable, "the provider is too busy now");
+                    return Failure(busy).into_response();
+                };
+                next.run(request).await
+            }
+        },
+    ))
 }
 
 fn paths<T: Transport + 'static, C: Chain + Send + 'static>(

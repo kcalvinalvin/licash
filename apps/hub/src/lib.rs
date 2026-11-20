@@ -56,6 +56,11 @@ pub const BODY_LIMIT: usize = 1 << 20;
 /// `ok`, or 503 once the hub halted.
 pub const HEALTH: &str = "/health";
 
+/// The most requests it serves at once: those past it are answered
+/// unavailable at once, rather than queued for the threads verifying
+/// proofs and waiting on fsyncs without bound.
+pub const MAX_SERVING: usize = 256;
+
 /// Blocks below the newest indexed from which tweaks are answered as
 /// never changing: no reorganization reaches so deep.
 pub const IMMUTABLE_DEPTH: u32 = 144;
@@ -292,8 +297,30 @@ pub fn router(hub: Arc<Hub>, services: Services) -> Router {
         // Its own body limit too, of a provider's requests.
         api = api.merge(swaps);
     }
-    api.layer(DefaultBodyLimit::max(BODY_LIMIT))
+    shed(api.layer(DefaultBodyLimit::max(BODY_LIMIT)), MAX_SERVING)
         .layer(TraceLayer::new_for_http())
+}
+
+/// `router`, serving at most `most` requests at once but its [`HEALTH`]:
+/// any past them answered unavailable (503) at once.
+pub fn shed(router: Router, most: usize) -> Router {
+    let serving = Arc::new(tokio::sync::Semaphore::new(most));
+    router.layer(axum::middleware::from_fn(
+        move |request: axum::extract::Request, next: axum::middleware::Next| {
+            let serving = serving.clone();
+            async move {
+                if request.uri().path() == HEALTH {
+                    return next.run(request).await;
+                }
+                let Ok(_serving) = serving.try_acquire_owned() else {
+                    tracing::warn!(path = %request.uri().path(), "too busy to serve");
+                    let busy = Problem::new(Code::Unavailable, "the hub is too busy now");
+                    return Failure(busy).into_response();
+                };
+                next.run(request).await
+            }
+        },
+    ))
 }
 
 /// A [`Problem`] answered with its status.

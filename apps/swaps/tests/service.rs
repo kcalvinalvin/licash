@@ -610,3 +610,41 @@ fn donations_need_a_node_and_the_lnurl_of_a_code_is_printed() {
         format!("https://swaps.test/v1/lnurlp/{code}")
     );
 }
+
+/// Requests past the most it serves at once are answered at once,
+/// unavailable, rather than queued without bound; its health is still
+/// told, and a request is served again once one ends.
+#[tokio::test]
+async fn requests_past_the_most_at_once_are_unavailable() {
+    use axum::routing::get;
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let held = gate.clone();
+    let app = Router::new()
+        .route(
+            "/slow",
+            get(move || {
+                let held = held.clone();
+                async move {
+                    held.notified().await;
+                    "done"
+                }
+            }),
+        )
+        .route("/fast", get(|| async { "fast" }))
+        .route(licash_swaps_service::HEALTH, get(|| async { "ok" }));
+    let app = licash_swaps_service::shed(app, 1);
+    let get = |path: &str| Request::builder().uri(path).body(Body::empty()).unwrap();
+    let slow = tokio::spawn(app.clone().oneshot(get("/slow")));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let busy = app.clone().oneshot(get("/fast")).await.unwrap();
+    assert_eq!(busy.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = busy.into_body().collect().await.unwrap().to_bytes();
+    let problem: Problem = serde_json::from_slice(&body).unwrap();
+    assert_eq!(problem.code, Code::Unavailable);
+    let health = app.clone().oneshot(get(licash_swaps_service::HEALTH)).await;
+    assert_eq!(health.unwrap().status(), StatusCode::OK);
+    gate.notify_one();
+    assert_eq!(slow.await.unwrap().unwrap().status(), StatusCode::OK);
+    let served = app.oneshot(get("/fast")).await.unwrap();
+    assert_eq!(served.status(), StatusCode::OK);
+}

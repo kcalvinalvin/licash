@@ -273,6 +273,11 @@ Reservations remain visible while a service is disabled. A swap's hash
 reservation is not by itself proof that it owns a gateway's existing lock:
 the recorded lock id decides ownership during recovery.
 
+The hub serves at most 256 requests at once (`/health` aside); any past
+them, of its own API, its contracts' or its swaps', receive 503 at once
+rather than wait in a queue. A swap provider serving on its own bounds
+its requests alike.
+
 Contract HTTP requests have separate admission budgets for new openings,
 progress and instance downloads; excess requests receive 503 before body
 buffering or node RPC. Four concurrent instance downloads remain supported.
