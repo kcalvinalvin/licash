@@ -374,6 +374,14 @@ fn absent_or_unsupported_base_terms_are_rejected_not_defaulted() {
     }
 }
 
+/// A work depth at the most a field holds is refused, never overflowed.
+#[test]
+fn a_work_depth_at_the_most_is_refused_without_overflow() {
+    let mut p = parts();
+    p.chain.work_depth = u32::MAX;
+    assert!(Base::new(p).is_err());
+}
+
 #[test]
 fn a_party_checks_the_program_it_trusts_and_the_time_left_to_request() {
     let base = Base::new(parts()).unwrap();

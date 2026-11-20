@@ -279,7 +279,9 @@ impl Base {
             || g.deadline_margin == 0
             || g.publication_window <= 1
             || g.response_window <= g.publication_window + 1
-            || u32::from(g.assert_window) <= c.work_depth + 1
+            || c.work_depth
+                .checked_add(1)
+                .is_none_or(|least| u32::from(g.assert_window) <= least)
             || g.contest_window <= 1
             || g.challenge_window <= 1
             || g.answer_window <= 1
