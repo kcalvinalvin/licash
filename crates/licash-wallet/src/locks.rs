@@ -166,6 +166,28 @@ pub(crate) struct PreparedLock {
 
 impl PreparedLock {
     pub(crate) fn record(&self, tx: &rusqlite::Transaction<'_>) -> Result<(), Error> {
+        // One lock pays an invoice, however often or concurrently asked: a
+        // second under its hash would pay it twice on its one preimage.
+        if self.invoice.is_some() || self.via.is_some() {
+            let paying: Option<[u8; 32]> = tx
+                .query_row(
+                    "SELECT l.id FROM locks l
+                     LEFT JOIN lock_settlements s ON s.id = l.id
+                     LEFT JOIN lock_routes v ON v.id = l.id
+                     WHERE l.hash = ?1 AND (l.invoice IS NOT NULL OR v.id IS NOT NULL)
+                        AND l.abandoned IS NULL AND s.branch IS NOT 'refund'
+                     LIMIT 1",
+                    [self.hash],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if let Some(id) = paying {
+                return Err(Error::Invalid(format!(
+                    "the invoice is being paid already, by lock {}",
+                    hex::encode(id)
+                )));
+            }
+        }
         tx.execute(
             "INSERT INTO locks
                 (id, hub, payee, hash, expiry_height, amount, fee, request, invoice, created_at)

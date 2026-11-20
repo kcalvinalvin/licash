@@ -304,6 +304,10 @@ impl<T: Transport> Wallet<T> {
                 lock.id
             )));
         }
+        // Asked again: the lock made before, live or paid, not another.
+        if let Some(lock) = self.live_lock(&hash, |l| l.invoice.is_some())? {
+            return self.follow_lock(&lock.id).await;
+        }
         let (hub, info) = self.refresh(&url).await?;
         let (amount, expiry) = gateway_lock(&url, &info, &invoice, msat)?;
         if let Some(agreed) = max_fee {

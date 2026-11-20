@@ -1015,6 +1015,38 @@ async fn a_lock_made_before_a_crash_is_taken_for_its_receipt() {
 }
 
 #[tokio::test]
+async fn an_invoice_asked_to_be_paid_again_is_paid_by_its_one_lock() {
+    let net = Net::new().await;
+    let wallet = net.funded("alice", 100).await;
+    let preimage = [12; 32];
+    let request = net
+        .node
+        .invoice(20_000, lock_hash(&preimage), 18, Outcome::Hang);
+    let first = wallet.pay_invoice(HUB, &request).await.unwrap();
+    // Asked again while it is under way, alone or twice at once: the same
+    // lock, as one preimage settles every lock of its hash.
+    let again = wallet.pay_invoice(HUB, &request).await.unwrap();
+    assert_eq!(again.id, first.id);
+    let (a, b) = tokio::join!(
+        wallet.pay_invoice(HUB, &request),
+        wallet.pay_invoice(HUB, &request)
+    );
+    for paid in [a, b] {
+        assert_eq!(paid.unwrap().id, first.id);
+    }
+    let hash = lock_hash(&preimage);
+    let locks = wallet.locks().unwrap();
+    assert_eq!(locks.iter().filter(|l| l.hash == hash).count(), 1);
+    assert_eq!(available(&wallet), 100 - 22);
+    // Paid, asked again: the same, paid.
+    net.node.resolve(hash, Outcome::Pay(preimage));
+    net.gateway.round().await;
+    let paid = wallet.pay_invoice(HUB, &request).await.unwrap();
+    assert_eq!((paid.id, paid.state), (first.id, LockState::Paid(preimage)));
+    assert_eq!(net.node.sent().len(), 1);
+}
+
+#[tokio::test]
 async fn a_failure_of_an_earlier_payment_of_its_hash_is_not_the_forwards() {
     let net = Net::new().await;
     let wallet = net.funded("alice", 60).await;
